@@ -1,7 +1,8 @@
 # sandvox — working rules
 
-3D falling-sand voxel engine. GPU-resident cellular automaton over a 256³ world,
-raymarched from the sim buffers. C++20 + WebGPU (Dawn) + WGSL.
+3D falling-sand voxel engine. GPU-resident cellular automaton over a 256³
+toroidal residency window into an infinite streamed world, raymarched from the
+sim buffers. C++20 + WebGPU (Dawn) + WGSL.
 
 **`DESIGN.md` is the source of truth for architecture and rationale.** Read the
 relevant section before changing a system; if a change contradicts DESIGN.md,
@@ -138,9 +139,15 @@ PostToolUse hook in `.claude/settings.json`.
 
 **Two invariants that have already cost debugging time — don't rediscover them:**
 
-- **The 3×3×3 color lattice is GLOBAL, not chunk-local.** Chunk-local dispatch must
-  offset by chunk coordinate, because 16 ≡ 1 (mod 3). Getting this wrong produces
-  a sim that looks right and is subtly race-y.
+- **The 3×3×3 color lattice is GLOBAL in WORLD coordinates, not chunk- or
+  slot-local.** Chunk-local dispatch must offset by the WORLD chunk coordinate
+  (16 ≡ 1 mod 3), and coloring by slot coords instead of world coords races at
+  the toroidal wrap (world-adjacent cells whose slots are WORLD_N apart share a
+  color). Getting this wrong produces a sim that looks right and is subtly race-y.
+- **Kernels think in world coords; memory is slot-indexed.** World cell → slot
+  is a bitmask (`cellIndexW`/`chunkIndexW`); every neighbor access must bounds-
+  check against the residency window (`inWindow` with the origin uniform), not
+  a fixed 0..N box. Unloaded space is solid and inert.
 - **`WORLD_N` in `common.wgsl` must match `world.h`.** They are two independent
   declarations of the same number.
 

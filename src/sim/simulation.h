@@ -26,6 +26,9 @@ class Simulation {
                     const std::vector<ReactionGpu>& reactions);
 
   void EncodeWorldgen(const wgpu::CommandEncoder& enc);
+  // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
+  // world.genList (and whose count + window origin are in tickUBO).
+  void EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count);
   // Post-load reset: clears transient state (hash/particles/claims) and
   // rebuilds occupancy over freshly uploaded voxels. Caller has already
   // written the voxel + dirty buffers (see worldio.cpp).
@@ -84,8 +87,8 @@ class Simulation {
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   wgpu::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_;
   wgpu::PipelineLayout simPL_, simPL2_, renderPL_;
-  wgpu::ComputePipeline worldgen_, mutate_, mutateCells_, compact_, compactNext_,
-      step_, occupancy_, occupancyDirty_, pick_;
+  wgpu::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
+      compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   wgpu::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pIntegrate_, pArgs2_,
       pResolve_;
   wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_;

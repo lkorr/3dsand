@@ -12,16 +12,23 @@ constexpr int kMaxRegionCells = 80;      // <= 5 chunks per axis (bounded fill)
 constexpr uint32_t kMaxIslandVoxels = 32000;  // DESIGN.md §7 abort threshold
 constexpr uint32_t kTerrainEvictTicks = 300;
 constexpr uint32_t kTerrainRefreshTicks = 8;
+// Support-loss events: a chunk re-flags constantly while sand pours or fire
+// burns, so rescans are rate-limited per chunk. The final flags after activity
+// stops always land (pendingSupport_ is never dropped), so the cooldown only
+// delays detection, never loses it.
+constexpr uint32_t kSupportCooldownTicks = 45;
+// Support events use a wider margin than blast events (24 -> 64^3 region):
+// the flagged chunk holds the support POINT, but the structure that may float
+// (a grown plant, a burnt-through pillar) extends well beyond it, and a
+// component touching the region boundary is conservatively kept.
+constexpr int kSupportMargin = 24;
+constexpr int kSupportDrainPerTick = 2;
 
-uint32_t ChunkIndexOfCell(int x, int y, int z) {
-  return (uint32_t)(((z / (int)kChunk) * (int)kNChunk + (y / (int)kChunk)) *
-                        (int)kNChunk +
-                    (x / (int)kChunk));
-}
+// world CHUNK coord of a world cell (floor shift: valid for negatives)
+IVec3 ChunkOfCell(int x, int y, int z) { return {x >> 4, y >> 4, z >> 4}; }
+// slot linear cell index (what cellOps / sim_mutate `cells` consume)
 uint32_t CellIndexOf(int x, int y, int z) {
-  uint32_t lx = (uint32_t)x % kChunk, ly = (uint32_t)y % kChunk,
-           lz = (uint32_t)z % kChunk;
-  return ChunkIndexOfCell(x, y, z) * kChunkVol + (lz * kChunk + ly) * kChunk + lx;
+  return World::SlotCellIndex({x, y, z});
 }
 
 int FindMaterialId(const std::vector<MaterialDef>& mats, const std::string& name) {
@@ -32,8 +39,9 @@ int FindMaterialId(const std::vector<MaterialDef>& mats, const std::string& name
 
 }  // namespace
 
-void DebrisSystem::Init(Physics* phys, const std::vector<MaterialDef>& mats) {
+void DebrisSystem::Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats) {
   phys_ = phys;
+  world_ = world;
   OnMaterialsReloaded(mats);
 }
 
@@ -64,17 +72,19 @@ void DebrisSystem::Reset() {
     if (t.handle) phys_->RemoveBody(t.handle);
   terrain_.clear();
   events_.clear();
+  pendingSupport_.clear();
+  supportPending_.clear();
+  supportCooldown_.clear();
   instancesDirty_ = true;
   instanceCount_ = 0;
 }
 
-void DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi) {
+bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int margin) {
   Event e;
   e.tick = tick;
   // expand for support context, clamp to the bounded region + world
-  constexpr int kMargin = 10;
-  e.lo = {lo.x - kMargin, lo.y - kMargin, lo.z - kMargin};
-  e.hi = {hi.x + kMargin, hi.y + kMargin, hi.z + kMargin};
+  e.lo = {lo.x - margin, lo.y - margin, lo.z - margin};
+  e.hi = {hi.x + margin, hi.y + margin, hi.z + margin};
   IVec3 c{(e.lo.x + e.hi.x) / 2, (e.lo.y + e.hi.y) / 2, (e.lo.z + e.hi.z) / 2};
   auto clampAxis = [&](int& lo, int& hi, int center) {
     if (hi - lo + 1 > kMaxRegionCells) {
@@ -85,22 +95,51 @@ void DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi) {
   clampAxis(e.lo.x, e.hi.x, c.x);
   clampAxis(e.lo.y, e.hi.y, c.y);
   clampAxis(e.lo.z, e.hi.z, c.z);
-  e.lo.x = std::max(e.lo.x, 0); e.lo.y = std::max(e.lo.y, 0); e.lo.z = std::max(e.lo.z, 0);
-  int n = (int)kWorldN - 1;
-  e.hi.x = std::min(e.hi.x, n); e.hi.y = std::min(e.hi.y, n); e.hi.z = std::min(e.hi.z, n);
-  if (e.lo.x > e.hi.x || e.lo.y > e.hi.y || e.lo.z > e.hi.z) return;
-  if (events_.size() < 64) events_.push_back(e);
+  // clamp to the residency window (world coords)
+  IVec3 wlo = world_->WindowOrigin();
+  wlo = {wlo.x * (int)kChunk, wlo.y * (int)kChunk, wlo.z * (int)kChunk};
+  IVec3 whi{wlo.x + (int)kWorldN - 1, wlo.y + (int)kWorldN - 1, wlo.z + (int)kWorldN - 1};
+  e.lo.x = std::max(e.lo.x, wlo.x); e.lo.y = std::max(e.lo.y, wlo.y); e.lo.z = std::max(e.lo.z, wlo.z);
+  e.hi.x = std::min(e.hi.x, whi.x); e.hi.y = std::min(e.hi.y, whi.y); e.hi.z = std::min(e.hi.z, whi.z);
+  if (e.lo.x > e.hi.x || e.lo.y > e.hi.y || e.lo.z > e.hi.z) return true;  // degenerate: done
+  if (events_.size() >= 64) return false;
+  events_.push_back(e);
+  return true;
+}
+
+void DebrisSystem::QueueSupportEvents(const WorldSnapshot& snap) {
+  if (!snap.valid || snap.tick == lastSupportSnapTick_) return;  // one pass per snapshot
+  lastSupportSnapTick_ = snap.tick;
+  int m = (int)kNChunk - 1;
+  for (uint32_t ci = 0; ci < (uint32_t)snap.supportFlags.size(); ci++) {
+    if (!snap.supportFlags[ci]) continue;
+    // slot -> world chunk under the origin the snapshot was captured at
+    IVec3 s{(int)(ci % kNChunk), (int)((ci / kNChunk) % kNChunk),
+            (int)(ci / (kNChunk * kNChunk))};
+    IVec3 o = snap.windowOrigin;
+    IVec3 wc{o.x + ((s.x - o.x) & m), o.y + ((s.y - o.y) & m),
+             o.z + ((s.z - o.z) & m)};
+    uint64_t key = World::PackChunkKey(wc);
+    if (supportPending_.count(key)) continue;
+    auto it = supportCooldown_.find(key);
+    if (it != supportCooldown_.end() && snap.tick < it->second + kSupportCooldownTicks)
+      continue;
+    supportCooldown_[key] = snap.tick;
+    supportPending_[key] = 1;
+    pendingSupport_.push_back(wc);
+  }
 }
 
 bool DebrisSystem::EventReady(const Event& e, World& world, uint32_t required) const {
   bool ready = true;
-  for (int cz = e.lo.z / (int)kChunk; cz <= e.hi.z / (int)kChunk; cz++)
-    for (int cy = e.lo.y / (int)kChunk; cy <= e.hi.y / (int)kChunk; cy++)
-      for (int cx = e.lo.x / (int)kChunk; cx <= e.hi.x / (int)kChunk; cx++) {
-        uint32_t ci = (uint32_t)((cz * (int)kNChunk + cy) * (int)kNChunk + cx);
-        const CachedChunk* cc = world.Cached(ci);
+  for (int cz = e.lo.z >> 4; cz <= (e.hi.z >> 4); cz++)
+    for (int cy = e.lo.y >> 4; cy <= (e.hi.y >> 4); cy++)
+      for (int cx = e.lo.x >> 4; cx <= (e.hi.x >> 4); cx++) {
+        IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) continue;  // streamed out: skip
+        const CachedChunk* cc = world.Cached(wc);
         if (!cc || cc->version < required) {
-          world.RequestChunkFetch(ci);
+          world.RequestChunkFetch(wc);
           ready = false;
         }
       }
@@ -125,10 +164,10 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     for (int y = 0; y < dy; y++)
       for (int x = 0; x < dx; x++) {
         int wx = e.lo.x + x, wy = e.lo.y + y, wz = e.lo.z + z;
-        const CachedChunk* cc = world.Cached(ChunkIndexOfCell(wx, wy, wz));
+        const CachedChunk* cc = world.Cached(ChunkOfCell(wx, wy, wz));
         if (!cc || cc->voxels.size() != kChunkVol) continue;
-        uint32_t lx = (uint32_t)wx % kChunk, ly = (uint32_t)wy % kChunk,
-                 lz = (uint32_t)wz % kChunk;
+        uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(wy & 15),
+                 lz = (uint32_t)(wz & 15);
         uint32_t w = cc->voxels[(lz * kChunk + ly) * kChunk + lx];
         uint32_t mat = w & 0xFFF;
         words[lidx(x, y, z)] = w;
@@ -159,6 +198,15 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       int x = (int)(i % dx), y = (int)((i / dx) % dy), z = (int)(i / ((size_t)dx * dy));
       if (x == 0 || y == 0 || z == 0 || x == dx - 1 || y == dy - 1 || z == dz - 1)
         comp.anchored = true;
+      // resting on powder = supported: without this, every slab on a sand
+      // pile would convert to a body the moment a support-loss scan runs.
+      // When the powder flows away the sim re-flags the chunk and the next
+      // scan sees air below.
+      if (y > 0) {
+        uint32_t bmat = words[lidx(x, y - 1, z)] & 0xFFF;
+        if (bmat != 0 && bmat < classOf_.size() && classOf_[bmat] == CLASS_POWDER)
+          comp.anchored = true;
+      }
       const int nb[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                             {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
       for (auto& d : nb) {
@@ -238,6 +286,18 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
 }
 
 void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps) {
+  // promote flagged support-loss chunks into events while there is queue room
+  for (int i = 0; i < kSupportDrainPerTick && !pendingSupport_.empty(); i++) {
+    IVec3 wc = pendingSupport_.front();
+    IVec3 lo{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
+    IVec3 hi{lo.x + (int)kChunk - 1, lo.y + (int)kChunk - 1, lo.z + (int)kChunk - 1};
+    if (world_->ChunkInWindow(wc)) {  // streamed out: forget it
+      if (!AddDestructionEvent(tick, lo, hi, kSupportMargin)) break;  // full: retry
+    }
+    pendingSupport_.pop_front();
+    supportPending_.erase(World::PackChunkKey(wc));
+  }
+
   // process at most one ready event per tick (bounded CPU)
   if (!events_.empty()) {
     Event e = events_.front();
@@ -249,8 +309,10 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       Vec3 c{(float)(e.lo.x + e.hi.x) * 0.5f, (float)(e.lo.y + e.hi.y) * 0.5f,
              (float)(e.lo.z + e.hi.z) * 0.5f};
       phys_->WakeNear(c, (float)kMaxRegionCells);
-    } else if (events_.size() > 1 && tick > events_.front().tick + 120) {
-      // stuck event (readback starvation): drop rather than stall the queue
+    } else if ((events_.size() > 1 && tick > events_.front().tick + 120) ||
+               tick > events_.front().tick + 300) {
+      // stuck event (readback starvation, or its region streamed out): drop
+      // rather than stall the queue
       events_.pop_front();
     }
   }
@@ -261,38 +323,41 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   const WorldSnapshot& snap = world.Snap();
 
   // which chunks need collision right now? (around every dynamic body)
-  std::vector<uint32_t> needed;
+  std::vector<IVec3> needed;
   for (const Body& b : bodies_) {
     float r = b.radiusVoxels + 6.0f;
-    int lo[3] = {(int)((b.xf.pos.x - r) / kChunk), (int)((b.xf.pos.y - r) / kChunk),
-                 (int)((b.xf.pos.z - r) / kChunk)};
-    int hi[3] = {(int)((b.xf.pos.x + r) / kChunk), (int)((b.xf.pos.y + r) / kChunk),
-                 (int)((b.xf.pos.z + r) / kChunk)};
-    for (int a = 0; a < 3; a++) {
-      lo[a] = std::clamp(lo[a], 0, (int)kNChunk - 1);
-      hi[a] = std::clamp(hi[a], 0, (int)kNChunk - 1);
-    }
+    int lo[3] = {ifloor(b.xf.pos.x - r) >> 4, ifloor(b.xf.pos.y - r) >> 4,
+                 ifloor(b.xf.pos.z - r) >> 4};
+    int hi[3] = {ifloor(b.xf.pos.x + r) >> 4, ifloor(b.xf.pos.y + r) >> 4,
+                 ifloor(b.xf.pos.z + r) >> 4};
     for (int cz = lo[2]; cz <= hi[2]; cz++)
       for (int cy = lo[1]; cy <= hi[1]; cy++)
         for (int cx = lo[0]; cx <= hi[0]; cx++)
-          needed.push_back((uint32_t)((cz * (int)kNChunk + cy) * (int)kNChunk + cx));
+          if (world.ChunkInWindow({cx, cy, cz})) needed.push_back({cx, cy, cz});
   }
-  std::sort(needed.begin(), needed.end());
-  needed.erase(std::unique(needed.begin(), needed.end()), needed.end());
+  auto keyLess = [](IVec3 a, IVec3 b) {
+    return World::PackChunkKey(a) < World::PackChunkKey(b);
+  };
+  auto keyEq = [](IVec3 a, IVec3 b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+  std::sort(needed.begin(), needed.end(), keyLess);
+  needed.erase(std::unique(needed.begin(), needed.end(), keyEq), needed.end());
 
-  for (uint32_t ci : needed) {
-    TerrainEntry& t = terrain_[ci];
+  for (IVec3 wc : needed) {
+    TerrainEntry& t = terrain_[World::PackChunkKey(wc)];
+    t.wc = wc;
     t.lastNeeded = tick;
-    const CachedChunk* cc = world.Cached(ci);
+    const CachedChunk* cc = world.Cached(wc);
     if (!cc) {
-      world.RequestChunkFetch(ci);
+      world.RequestChunkFetch(wc);
       continue;
     }
-    // refresh when the sim says the chunk changed (rate-limited)
-    if (ci < snap.dirtyFlags.size() && snap.dirtyFlags[ci] &&
+    // refresh when the sim says the chunk changed (rate-limited). dirtyFlags
+    // are slot-indexed under the CURRENT window origin.
+    uint32_t slot = World::SlotChunkIndex(wc);
+    if (slot < snap.dirtyFlags.size() && snap.dirtyFlags[slot] &&
         tick > t.lastRefreshReq + kTerrainRefreshTicks) {
       t.lastRefreshReq = tick;
-      world.RequestChunkFetch(ci);
+      world.RequestChunkFetch(wc);
     }
     if (t.builtVersion >= cc->version && t.handle != 0) continue;
     if (t.builtVersion >= cc->version && t.handle == 0 && t.builtVersion != 0)
@@ -302,20 +367,17 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // liquids don't (debris sinks). Missing neighbor chunks sample as empty —
     // transient until their fetch lands.
     auto solidAt = [&](int x, int y, int z) -> bool {
-      if (x < 0 || y < 0 || z < 0 || x >= (int)kWorldN || y >= (int)kWorldN ||
-          z >= (int)kWorldN)
-        return true;  // world edge is solid (matches sim rule)
-      const CachedChunk* n = world.Cached(ChunkIndexOfCell(x, y, z));
+      if (!world.CellInWindow({x, y, z}))
+        return true;  // residency edge is solid (matches sim rule)
+      const CachedChunk* n = world.Cached(ChunkOfCell(x, y, z));
       if (!n || n->voxels.size() != kChunkVol) return false;
-      uint32_t lx = (uint32_t)x % kChunk, ly = (uint32_t)y % kChunk,
-               lz = (uint32_t)z % kChunk;
+      uint32_t lx = (uint32_t)(x & 15), ly = (uint32_t)(y & 15),
+               lz = (uint32_t)(z & 15);
       uint32_t mat = n->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
       if (mat == 0 || mat >= classOf_.size()) return false;
       return classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER;
     };
-    IVec3 origin{(int)(ci % kNChunk) * (int)kChunk,
-                 (int)((ci / kNChunk) % kNChunk) * (int)kChunk,
-                 (int)(ci / (kNChunk * kNChunk)) * (int)kChunk};
+    IVec3 origin{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
     std::vector<float> verts;
     std::vector<uint32_t> indices;
     PolygonizeChunk(origin, solidAt, verts, indices);
@@ -341,10 +403,20 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
 }
 
 void DebrisSystem::PostStep() {
+  IVec3 wo = world_->WindowOrigin();
+  Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
+           (float)(wo.z * (int)kChunk)};
   for (size_t i = 0; i < bodies_.size();) {
     Body& b = bodies_[i];
     phys_->GetTransform(b.handle, b.xf);
-    bool dead = b.xf.pos.y < -64.0f || b.xf.pos.y > (float)kWorldN + 256.0f;
+    // bodies that leave the residency window despawn: there is no terrain to
+    // collide with out there (Noita despawns offscreen bodies the same way)
+    const float kPad = 32.0f;
+    bool dead = b.xf.pos.x < wlo.x - kPad || b.xf.pos.y < wlo.y - kPad ||
+                b.xf.pos.z < wlo.z - kPad ||
+                b.xf.pos.x > wlo.x + (float)kWorldN + kPad ||
+                b.xf.pos.y > wlo.y + (float)kWorldN + kPad ||
+                b.xf.pos.z > wlo.z + (float)kWorldN + kPad;
     if (dead) {
       phys_->RemoveBody(b.handle);
       bodies_[i] = std::move(bodies_.back());

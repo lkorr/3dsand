@@ -29,15 +29,17 @@
 
 const FALLOFF_PER_CELL : i32 = 6;   // power lost per cell of distance (in air)
 
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+
 fn hardnessAt(c : vec3<i32>) -> i32 {
-  if (!inBounds(c)) { return 100000; }  // world edge absorbs everything
-  let mat = voxMat(voxels[cellIndex(vec3<u32>(c))]);
+  if (!inBounds(c)) { return 100000; }  // residency edge absorbs everything
+  let mat = voxMat(voxels[cellIndexW(c)]);
   if (mat == MAT_AIR) { return 0; }
   return i32(materials[mat].hardness);
 }
 
-fn markBoth(c : vec3<i32>) {
-  let ci = chunkIndexOf(vec3<u32>(c));
+fn markBoth(c : vec3<i32>) {  // callers have bounds-checked c
+  let ci = chunkIndexW(c);
   atomicStore(&dirtyIn[ci], 1u);
   atomicStore(&dirtyOut[ci], 1u);
 }
@@ -72,7 +74,7 @@ fn mark(@builtin(workgroup_id) wg : vec3<u32>,
   }
   let remaining = op.power - occlusion - i32(isqrt(u32(d2))) * FALLOFF_PER_CELL;
 
-  let mat = voxMat(voxels[cellIndex(vec3<u32>(c))]);
+  let mat = voxMat(voxels[cellIndexW(c)]);
   if (mat == MAT_AIR) {
     // shockwave through open space: wake the chunk so settled piles at the
     // cavity edge re-check support this tick
@@ -114,7 +116,7 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
     if (destroyedBy(j, c) != 0u) { return; }
   }
 
-  let idx = cellIndex(vec3<u32>(c));
+  let idx = cellIndexW(c);
   let w = voxels[idx];
   voxels[idx] = 0u;
   markBoth(c);

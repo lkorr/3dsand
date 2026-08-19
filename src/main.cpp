@@ -21,6 +21,7 @@
 #include "phys/physics.h"
 #include "sim/materials.h"
 #include "sim/simulation.h"
+#include "sim/stream.h"
 #include "sim/world.h"
 #include "sim/worldio.h"
 #include "ui/overlay.h"
@@ -58,6 +59,8 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   rp.flags = shadows ? 1u : 0u;
   Vec3 sun = Vec3{0.45f, 0.78f, 0.32f}.normalized();
   rp.sunDir[0] = sun.x; rp.sunDir[1] = sun.y; rp.sunDir[2] = sun.z;
+  IVec3 o = world.WindowOrigin();
+  rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 
@@ -74,6 +77,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
+  IVec3 wo = world.WindowOrigin();
+  tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
@@ -105,6 +110,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
   TickParams tp{0, seed, 0, 0};
+  IVec3 wo = world.WindowOrigin();
+  tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeWorldgen(enc);
@@ -238,7 +245,7 @@ void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
 
 int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 const std::vector<MaterialDef>& mats, Physics& phys,
-                DebrisSystem& debris) {
+                DebrisSystem& debris, Stream& stream) {
   std::printf("=== selftest ===\n");
   constexpr int kTicks = 200;
 
@@ -501,6 +508,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
         debris.AddDestructionEvent(t + 1, {50, h, 50}, {84, h + 26, 70});
       }
 
+      debris.QueueSupportEvents(world.Snap());
       std::vector<CellOp> cellOps;
       debris.PreTick(t + 1, world, cellOps);
       ++t;
@@ -592,13 +600,13 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                  {8, 3, 8}, false, false);
     ctx.WaitIdle();
     uint32_t h1 = HashWorldNow(ctx, world, sim, kDefaultSeed);
-    bool saved = SaveWorld(ctx, world, kPath);
+    bool saved = SaveWorld(ctx, world, stream, kPath);
     for (int i = 100; i < 150; i++)
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i), {}, {}, false,
                  {8, 3, 8}, false, false);
     ctx.WaitIdle();
     uint32_t hDiverged = HashWorldNow(ctx, world, sim, kDefaultSeed);
-    bool loaded = LoadWorld(ctx, world, sim, kPath);
+    bool loaded = LoadWorld(ctx, world, sim, stream, kPath);
     uint32_t h2 = HashWorldNow(ctx, world, sim, kDefaultSeed);
     saveOk = saved && loaded && h1 == h2 && h1 != hDiverged;
     std::printf("save/load: %s (hash %08x -> diverged %08x -> restored %08x)\n",
@@ -606,9 +614,116 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     std::remove(kPath);
   }
 
+  // M2/M7 streaming: (a) slide the residency window +X across many shifts,
+  // twice — the per-tick hash sequences must match exactly (streaming +
+  // procgen are deterministic); (b) edit a far chunk, walk past its eviction,
+  // walk back, and verify the edit survived the store roundtrip.
+  bool streamOk = false;
+  {
+    std::vector<uint32_t> shash[2];
+    for (int run = 0; run < 2; run++) {
+      stream.OnRegen();
+      world.SetWindowOrigin({0, 0, 0});
+      SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      ctx.WaitIdle();
+      uint32_t t = 5000;
+      for (int i = 0; i < 300; i++) {
+        IVec3 pc{8 + i / 10, 8, 8};  // one chunk every 10 ticks -> 30 shifts
+        stream.Update(pc);
+        SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, true, pc,
+                   false, false);
+        shash[run].push_back(ReadHashSync(ctx, world));
+      }
+    }
+    bool sdet = shash[0] == shash[1];
+
+    // persistence roundtrip (live readbacks so eviction filters see reality)
+    stream.OnRegen();
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t t = 7000;
+    auto tickAt = [&](IVec3 pc, std::vector<BrushOp> ops) {
+      stream.Update(pc);
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, ops, {}, {}, false, pc,
+                 true, false);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+    };
+    const int ballX = 25 * 16 + 8, ballZ = 128;
+    int ballH = World::TerrainHeight(ballX, ballZ, kDefaultSeed);
+    IVec3 ballCell{ballX, ballH + 1, ballZ};
+    IVec3 ballChunk{ballCell.x >> 4, ballCell.y >> 4, ballCell.z >> 4};
+    auto walkTo = [&](int fromCx, int toCx) {
+      int step = toCx > fromCx ? 1 : -1;
+      for (int cx = fromCx; cx != toCx; cx += step)
+        for (int k = 0; k < 10; k++) tickAt({cx, 8, 8}, {});
+    };
+    walkTo(8, 25);
+    // glass ball half-buried at the surface (anchored: resting on the ground)
+    tickAt({25, 8, 8}, {{ballCell.x, ballCell.y, ballCell.z, 3, kMatGlass, 1, 0, 0}});
+    stream.MarkModifiedBox({ballCell.x - 3, ballCell.y - 3, ballCell.z - 3},
+                           {ballCell.x + 3, ballCell.y + 3, ballCell.z + 3});
+    for (int k = 0; k < 10; k++) tickAt({25, 8, 8}, {});
+    walkTo(25, 60);  // ball chunk streams out (origin.x reaches 52 > 25)
+    bool evicted = !world.ChunkInWindow(ballChunk);
+    walkTo(60, 25);  // and back in
+    world.RequestChunkFetch(ballChunk);
+    uint32_t glass = 0;
+    for (int k = 0; k < 90; k++) {
+      tickAt({25, 8, 8}, {});
+      const CachedChunk* cc = world.Cached(ballChunk);
+      if (cc && cc->version > t - 30 && cc->voxels.size() == kChunkVol) {
+        for (uint32_t w : cc->voxels)
+          if ((w & 0xFFFu) == kMatGlass) glass++;
+        break;
+      }
+      world.RequestChunkFetch(ballChunk);
+    }
+    // a REAL player (collision through the async mirror) flies +X far beyond
+    // the original 256-box — the literal M2 exit criterion. Catches any
+    // leftover fixed-world assumption in the player/collision path (a v0
+    // position clamp produced exactly this bug: an invisible wall at x=254).
+    bool crossed = false;
+    {
+      std::vector<uint32_t> classOf;
+      for (auto& m : mats) classOf.push_back(m.gpu.klass);
+      Player p2;
+      p2.fly = true;
+      p2.pos = Vec3{140.5f, 110.0f, 140.5f};  // above the tallest hills (~90)
+      auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
+      PlayerInput in{};
+      in.forward = 1.0f;
+      in.sprint = true;
+      for (int i = 0; i < 1200 && !crossed; i++) {
+        IVec3 pc{ifloor(p2.pos.x) >> 4, ifloor(p2.pos.y) >> 4,
+                 ifloor(p2.pos.z) >> 4};
+        stream.Update(pc);
+        SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, pc,
+                   true, false);
+        ctx.WaitIdle();
+        ctx.ProcessEvents();
+        p2.Update(1.0f / 30.0f, in, Vec3{1, 0, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 0},
+                  kindAt);
+        crossed = p2.pos.x > 600.0f;
+      }
+      std::printf("  player flight: %s (reached x=%.0f, window origin.x=%d)\n",
+                  crossed ? "crossed" : "BLOCKED", (double)p2.pos.x,
+                  world.WindowOrigin().x);
+    }
+
+    streamOk = sdet && evicted && glass > 0 && crossed;
+    std::printf("streaming: %s (hash sequences %s over %u shifts, ball chunk "
+                "evicted=%d, %u glass voxels after re-entry, player crossed=%d, "
+                "store %zu chunks)\n",
+                streamOk ? "PASS" : "FAIL", sdet ? "match" : "DIVERGE",
+                stream.ShiftCount(), evicted ? 1 : 0, glass, crossed ? 1 : 0,
+                stream.Store().Count());
+  }
+
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk && sleepOk && debrisOk && saveOk;
+  bool pass = deterministic && walkOk && sleepOk && debrisOk && saveOk && streamOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
@@ -706,9 +821,11 @@ int main(int argc, char** argv) {
   Physics phys;
   if (!phys.Init()) return 1;
   DebrisSystem debris;
-  debris.Init(&phys, mats);
+  debris.Init(&phys, &world, mats);
+  Stream stream;
+  stream.Init(&ctx, &world, &sim, kDefaultSeed);
 
-  if (selftest) return RunSelftest(ctx, world, sim, mats, phys, debris);
+  if (selftest) return RunSelftest(ctx, world, sim, mats, phys, debris, stream);
 
   Overlay overlay;
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
@@ -838,6 +955,8 @@ int main(int argc, char** argv) {
     }
     if (ui.regenWorld) {
       ui.regenWorld = false;
+      stream.OnRegen();
+      world.SetWindowOrigin({0, 0, 0});
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
       player.pos = Vec3{140, (float)(spawnH + 10), 140};
       tick = 0;
@@ -848,12 +967,12 @@ int main(int argc, char** argv) {
     if (ui.saveWorld) {
       ui.saveWorld = false;
       ctx.WaitIdle();
-      SaveWorld(ctx, world, "world.svx");
+      SaveWorld(ctx, world, stream, "world.svx");
     }
     if (ui.loadWorld) {
       ui.loadWorld = false;
       ctx.WaitIdle();
-      if (LoadWorld(ctx, world, sim, "world.svx")) {
+      if (LoadWorld(ctx, world, sim, stream, "world.svx")) {
         grenades.clear();
         everExploded = false;
         debris.Reset();
@@ -878,6 +997,11 @@ int main(int argc, char** argv) {
       tick++;
       ticksThisFrame++;
 
+      // recenter the residency window on the player (between ticks only; at
+      // most one 1-chunk shift per axis)
+      stream.Update({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
+                     ifloor(player.pos.z) >> 4});
+
       std::vector<BrushOp> ops;
       brush.radius = ui.brushRadius;
       brush.material = (uint32_t)ui.brushMaterial;
@@ -891,6 +1015,9 @@ int main(int argc, char** argv) {
                                    {op.x + op.radius, op.y + op.radius, op.z + op.radius});
       }
 
+      // support-loss flags from the sim (burnt stems, undermined slabs) feed
+      // the same island-check pipeline as explosions and brush erases
+      debris.QueueSupportEvents(world.Snap());
       // island detection results + terrain collision upkeep (may add cell ops)
       std::vector<CellOp> cellOps;
       debris.PreTick(tick, world, cellOps);
@@ -925,8 +1052,15 @@ int main(int argc, char** argv) {
                                      {e.x + e.radius, e.y + e.radius, e.z + e.radius});
           phys.ApplyRadialImpulse(Vec3{(float)e.x, (float)e.y, (float)e.z},
                                   (float)e.radius * 3.0f, (float)e.power * 0.15f);
+          stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
+                                 {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }
       }
+      // CPU-known writes mark chunks modified now — eviction can't wait for
+      // the latent dirty-flag snapshot
+      for (const BrushOp& b : ops)
+        stream.MarkModifiedBox({b.x - b.radius, b.y - b.radius, b.z - b.radius},
+                               {b.x + b.radius, b.y + b.radius, b.z + b.radius});
       bool particlesActive =
           everExploded &&
           (tick - lastExplosionTick < 400 || world.Snap().particleCount > 0);

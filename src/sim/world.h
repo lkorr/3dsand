@@ -8,13 +8,15 @@
 
 #include "math3d.h"
 
-// World constants — must match common.wgsl.
+// World constants. These are the SINGLE source of truth: the matching WGSL
+// consts are generated from them by ShaderConstantPrelude() (gpu/resources.cpp)
+// and prepended ahead of common.wgsl, so shaders cannot drift from C++.
 constexpr uint32_t kWorldN = 256;
 
 // Physical edge length of one voxel. The engine runs entirely in voxel units;
 // this is the single meters<->voxels conversion, and every physical constant
-// (player size, speeds, gravity, fog/media densities) derives from it. To
-// change voxel size, edit this and VOXEL_METERS in common.wgsl (must match).
+// (player size, speeds, gravity, fog/media densities) derives from it. Change
+// it here and here only — shaders pick it up automatically.
 // Note: at the same kWorldN, smaller voxels shrink the world's physical size.
 constexpr float kVoxelMeters = 0.125f;
 constexpr uint32_t kChunk = 16;
@@ -89,7 +91,9 @@ struct TickParams {
   uint32_t expCount;   // explosion ops this tick
   uint32_t page;       // particle read page (0/1)
   uint32_t cellCount;  // exact-cell ops this tick
-  uint32_t pad1 = 0;
+  uint32_t genCount = 0;   // chunks in genList (worldgen streaming dispatch)
+  int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
+  int32_t pad1 = 0;
 };
 
 // Must match RenderParams in common.wgsl (std140-ish: vec3 + pad pairs).
@@ -104,6 +108,8 @@ struct RenderParams {
   uint32_t flags;
   float sunDir[3];
   float pad1;
+  int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
+  int32_t pad2 = 0;
 };
 
 enum class CellKind { Unknown, Air, Solid, Liquid, Gas };
@@ -111,7 +117,8 @@ enum class CellKind { Unknown, Air, Solid, Liquid, Gas };
 // CPU-visible snapshot of GPU state, one tick latent by design (DESIGN.md §2).
 struct WorldSnapshot {
   bool valid = false;
-  IVec3 mirrorBase{};                 // chunk coord of the 3x3x3 mirror corner
+  IVec3 windowOrigin{};               // residency window origin AT CAPTURE (chunks)
+  IVec3 mirrorBase{};                 // WORLD chunk coord of the 3x3x3 mirror corner
   std::vector<uint32_t> mirror;       // 27 chunks of voxel words
   uint32_t activeChunks = 0;
   uint64_t voxelTotal = 0;
@@ -120,6 +127,11 @@ struct WorldSnapshot {
   uint32_t particleCount = 0;         // live particles (post-resolve that tick)
   uint32_t tick = 0;                  // sim tick this snapshot was captured at
   std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
+  // Per-chunk support-loss flags (kNumChunks): the sim saw a supporting voxel
+  // (solid/powder) vacate next to a solid there since the last readback.
+  // One-shot: the GPU buffer is cleared after each copy. Feeds island checks.
+  std::vector<uint8_t> supportFlags;
+  std::vector<uint32_t> occupancy;    // per-slot non-air counts (streaming evict)
 };
 
 // One CPU-cached chunk of voxel data, fetched on demand through the async
@@ -142,13 +154,53 @@ class World {
                        IVec3 playerChunkBase, uint32_t particleLivePage,
                        uint32_t tick);
 
+  // ---- toroidal residency window (DESIGN.md §3) ----
+  // The resident cube covers world chunks [origin, origin+kNChunk) per axis;
+  // world chunk c lives in slot (c mod kNChunk) per axis (bitmask — POT).
+  // Set by the streaming manager between ticks; every tick/render uses it.
+  void SetWindowOrigin(IVec3 o) { origin_ = o; }
+  IVec3 WindowOrigin() const { return origin_; }
+  bool ChunkInWindow(IVec3 wc) const {
+    IVec3 d{wc.x - origin_.x, wc.y - origin_.y, wc.z - origin_.z};
+    int n = (int)kNChunk;
+    return d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < n && d.y < n && d.z < n;
+  }
+  bool CellInWindow(IVec3 c) const {
+    return ChunkInWindow({c.x >> 4, c.y >> 4, c.z >> 4});
+  }
+  static uint32_t SlotChunkIndex(IVec3 wc) {
+    int m = (int)kNChunk - 1;
+    return (uint32_t)(((wc.z & m) * (int)kNChunk + (wc.y & m)) * (int)kNChunk +
+                      (wc.x & m));
+  }
+  // slot linear cell index of a world cell (caller checked CellInWindow)
+  static uint32_t SlotCellIndex(IVec3 c) {
+    uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+             lz = (uint32_t)(c.z & 15);
+    return SlotChunkIndex({c.x >> 4, c.y >> 4, c.z >> 4}) * kChunkVol +
+           (lz * kChunk + ly) * kChunk + lx;
+  }
+  IVec3 SlotToWorldChunk(uint32_t slotIdx) const {
+    IVec3 s{(int)(slotIdx % kNChunk), (int)((slotIdx / kNChunk) % kNChunk),
+            (int)(slotIdx / (kNChunk * kNChunk))};
+    int m = (int)kNChunk - 1;
+    return {origin_.x + ((s.x - origin_.x) & m), origin_.y + ((s.y - origin_.y) & m),
+            origin_.z + ((s.z - origin_.z) & m)};
+  }
+  static uint64_t PackChunkKey(IVec3 wc) {
+    auto u = [](int v) { return (uint64_t)(uint32_t)(v + (1 << 20)) & 0x1FFFFF; };
+    return u(wc.x) | (u(wc.y) << 21) | (u(wc.z) << 42);
+  }
+
   // ---- on-demand chunk fetches (island detection / terrain meshing) ----
-  // Queue a chunk for CPU readback; duplicates are coalesced. Up to
-  // kFetchPerTick chunks ride each tick's readback slot (bounded traffic).
-  void RequestChunkFetch(uint32_t chunkIdx);
-  // Cached copy of a chunk, or nullptr if never fetched. version is the tick
-  // whose post-sim state the data reflects.
-  const CachedChunk* Cached(uint32_t chunkIdx) const;
+  // Keyed by WORLD chunk coords: slots get recycled by streaming, world
+  // chunks don't. Queue a chunk for CPU readback; duplicates are coalesced;
+  // non-resident requests are ignored. Up to kFetchPerTick chunks ride each
+  // tick's readback slot (bounded traffic).
+  void RequestChunkFetch(IVec3 worldChunk);
+  // Cached copy of a world chunk, or nullptr if never fetched. version is the
+  // tick whose post-sim state the data reflects.
+  const CachedChunk* Cached(IVec3 worldChunk) const;
   static constexpr uint32_t kFetchPerTick = 64;  // 1 MB/tick ceiling
   // Copies the next-tick dirty buffer into the pending slot (caller knows
   // which of dirty[0]/dirty[1] that is this tick).
@@ -175,6 +227,8 @@ class World {
                             // bind groups (Dawn forbids indirect + bound-writable usage
                             // of one buffer in the same pass, even if statically unused)
   wgpu::Buffer occupancy;   // kNumChunks u32
+  wgpu::Buffer support;     // kNumChunks u32 — support-loss flags (sim_step writes,
+                            // readback consumes + clears; drives island checks)
   wgpu::Buffer hash;        // 4 u32 (only [0] used)
   wgpu::Buffer tickUBO;     // TickParams
   wgpu::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
@@ -195,22 +249,25 @@ class World {
   wgpu::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
   wgpu::Buffer bodyInstances;   // debris-body voxel instances (render)
   wgpu::Buffer bodyXforms;      // debris-body transforms (render)
+  wgpu::Buffer genList;         // worldgen streaming: slot indices to generate
 
  private:
   struct Slot {
     wgpu::Buffer buf;
     bool inFlight = false;
-    IVec3 base{};
+    IVec3 base{};      // world chunk coord of the mirror corner
+    IVec3 origin{};    // window origin at encode time
     uint32_t particleLivePage = 0;
     uint32_t tick = 0;
-    std::vector<uint32_t> fetchIds;  // chunk fetches riding this slot
+    std::vector<IVec3> fetchIds;  // world chunks riding this slot
   };
   static constexpr int kSlots = 3;
   Slot slots_[kSlots];
   int lastSlot_ = -1;
   WorldSnapshot snap_;
+  IVec3 origin_{0, 0, 0};
 
-  std::vector<uint32_t> fetchQueue_;
-  std::vector<uint8_t> fetchQueued_;              // per-chunk dedup bitmap
-  std::unordered_map<uint32_t, CachedChunk> cache_;
+  std::vector<IVec3> fetchQueue_;
+  std::unordered_map<uint64_t, uint8_t> fetchQueued_;   // dedup (packed key)
+  std::unordered_map<uint64_t, CachedChunk> cache_;     // packed world key
 };

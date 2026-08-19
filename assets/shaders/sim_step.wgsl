@@ -24,27 +24,59 @@
 // NOTE: binding 13 (dispatch args) must stay undeclared here — statically
 // unused bindings are excluded from the dispatch usage scope, which is what
 // makes the same buffer legal as the INDIRECT source in this compute pass.
+// Per-chunk support-loss flags: set when a supporting voxel (solid/powder)
+// vacates or transforms next to a solid. Side-channel only — read back by the
+// CPU to queue island checks (debris.cpp), never fed back into voxel state,
+// so determinism is unaffected (all writers store the same value 1).
+@group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
 
-// Mark the chunk containing c dirty for next tick, plus every neighbor chunk
-// c borders (so cross-chunk neighbors re-evaluate; sleeping is per-chunk).
+// Unloaded space is solid and inert (DESIGN.md §3): the sim's world edge is
+// the residency window, not a fixed cube.
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+
+// A supporting cell at c stopped supporting (its occupant left or became
+// non-solid/non-powder). If a CLASS_SOLID voxel rests on / hangs off it, flag
+// that solid's chunk so the CPU runs a bounded island check there.
+// oldKlass==POWDER checks up only (solids REST on powder; a solid merely
+// beside a shifting sand pile is not supported by it — checking laterals
+// would flag every wall next to settling sand).
+fn flagSupportLoss(c : vec3<i32>, oldKlass : u32, newMat : u32) {
+  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
+  let nm = newMat & 0xFFFu;  // 12-bit id; sentinel values land on a zeroed entry
+  if (nm != MAT_AIR) {
+    let nk = materials[nm].klass;
+    if (nk == CLASS_SOLID || nk == CLASS_POWDER) { return; }  // still supports
+  }
+  for (var i = 0u; i < 6u; i++) {
+    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    let n = c + faceDir(i);
+    if (!inBounds(n)) { continue; }
+    let nmat = voxMat(voxels[cellIndexW((n))]);
+    if (nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID) {
+      atomicStore(&supportOut[chunkIndexW(n)], 1u);
+      return;
+    }
+  }
+}
+
+// Mark the chunk containing world cell c dirty for next tick, plus every
+// neighbor chunk c borders (cross-chunk neighbors re-evaluate; sleeping is
+// per-chunk). Chunks outside the residency window don't exist to mark.
 fn markDirty(c : vec3<i32>) {
-  let cu = vec3<u32>(c);
-  let lo = cu % CHUNK;
-  let ch = vec3<i32>(cu / CHUNK);
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  let ch = worldChunkOf(c);
   var xs = array<i32, 2>(0, 0);
   var ys = array<i32, 2>(0, 0);
   var zs = array<i32, 2>(0, 0);
-  if (lo.x == 0u) { xs[1] = -1; } else if (lo.x == CHUNK - 1u) { xs[1] = 1; }
-  if (lo.y == 0u) { ys[1] = -1; } else if (lo.y == CHUNK - 1u) { ys[1] = 1; }
-  if (lo.z == 0u) { zs[1] = -1; } else if (lo.z == CHUNK - 1u) { zs[1] = 1; }
-  let nc = i32(NCHUNK);
+  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
+  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
+  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
   for (var i = 0; i < 2; i++) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (n.x >= 0 && n.y >= 0 && n.z >= 0 && n.x < nc && n.y < nc && n.z < nc) {
-          let ci = u32((n.z * nc + n.y) * nc + n.x);
-          atomicStore(&dirtyOut[ci], 1u);
+        if (chunkInWindow(n, T.origin)) {
+          atomicStore(&dirtyOut[chunkSlotIndex(n)], 1u);
         }
       }
     }
@@ -69,16 +101,19 @@ fn canDisplace(myDensity : i32, rising : bool, tw : u32) -> bool {
 
 fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, rising : bool) -> bool {
   if (!inBounds(dst)) { return false; }
-  let di = cellIndex(vec3<u32>(dst));
+  let di = cellIndexW((dst));
   let tw = voxels[di];
   if (!canDisplace(myDensity, rising, tw)) { return false; }
   let stamp = stampFor(T.tick, P.substep);
   voxels[di] = packVox(voxMat(myWord), voxState(myWord), stamp);
   // displaced fluid (or air) swaps into the source cell, stamped so it does
   // not act again this tick
-  voxels[cellIndex(vec3<u32>(src))] = packVox(voxMat(tw), voxState(tw), stamp);
+  voxels[cellIndexW((src))] = packVox(voxMat(tw), voxState(tw), stamp);
   markDirty(src);
   markDirty(dst);
+  // a powder sliding out from under a solid may leave it floating
+  let myKlass = materials[voxMat(myWord)].klass;
+  if (myKlass == CLASS_POWDER) { flagSupportLoss(src, myKlass, voxMat(tw)); }
   return true;
 }
 
@@ -87,8 +122,8 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
 fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
                   sf : u32, df : u32, t : u32) {
   let stamp = stampFor(T.tick, P.substep);
-  let si = cellIndex(vec3<u32>(src));
-  let di = cellIndex(vec3<u32>(dst));
+  let si = cellIndexW((src));
+  let di = cellIndexW((dst));
   if (t >= sf) { voxels[si] = 0u; }
   else { voxels[si] = packVox(mat, sf - t - 1u, stamp); }
   voxels[di] = packVox(mat, df + t - 1u, stamp);
@@ -151,6 +186,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
         else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
         markDirty(c);
+        flagSupportLoss(c, m.klass, rule.prodSelf);  // ember->ash drops the wood above
         return true;
       }
     } else if (kind == RK_EMIT) {
@@ -160,7 +196,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
-        let ni = cellIndex(vec3<u32>(n));
+        let ni = cellIndexW((n));
         if (voxMat(voxels[ni]) != MAT_AIR) { continue; }
         keepAwake = true;
         if ((rr % 1000u) < rule.chance) {
@@ -170,6 +206,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
           if (rule.prodSelf != PROD_KEEP) {
             if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
             else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
+            flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
           }
           return false;  // emitted; self unchanged, may still move
@@ -182,7 +219,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
-        let ni = cellIndex(vec3<u32>(n));
+        let ni = cellIndexW((n));
         let nw = voxels[ni];
         let nmat = voxMat(nw);
         if (nmat == MAT_AIR) { continue; }
@@ -193,11 +230,13 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
             if (rule.prodNbr == 0u) { voxels[ni] = 0u; }
             else { voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp); }
             markDirty(n);
+            flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
           }
           if (rule.prodSelf != PROD_KEEP) {
             if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
             else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
             markDirty(c);
+            flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
           }
           markDirty(c);
@@ -218,7 +257,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   // 1) below: fill a partial same-liquid cell, else whole-cell move/swap
   let below = c + vec3<i32>(0, -1, 0);
   if (inBounds(below)) {
-    let bw = voxels[cellIndex(vec3<u32>(below))];
+    let bw = voxels[cellIndexW((below))];
     let bmat = voxMat(bw);
     if (bmat == mat) {
       let bf = voxState(bw) + 1u;
@@ -246,7 +285,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     let d = lateralDir(i + r2);
     let n = c + vec3<i32>(d.x, 0, d.y);
     if (!inBounds(n)) { continue; }
-    let nw = voxels[cellIndex(vec3<u32>(n))];
+    let nw = voxels[cellIndexW((n))];
     let nmat = voxMat(nw);
     if (nmat == mat) {
       let nf = voxState(nw) + 1u;
@@ -269,19 +308,24 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
 @compute @workgroup_size(6, 6, 6)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
-  // one workgroup per compacted dirty chunk (indirect dispatch)
+  // one workgroup per compacted dirty chunk (indirect dispatch). The list
+  // holds SLOT indices; reconstruct the world chunk from the window origin.
   let ci = dirtyList[wg.x];
-  let cc = vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK, ci / (NCHUNK * NCHUNK));
-  // The color lattice is GLOBAL: cell ≡ colorPhase (mod 3). CHUNK=16 ≡ 1
-  // (mod 3), so each chunk's first colored local coord shifts by its chunk
-  // coord — without this correction, adjacent chunks would act on adjacent
-  // cells in the same pass and race (nondeterminism).
-  let start = (P.colorPhase + 3u - (cc % 3u)) % 3u;
-  let local = start + lid * 3u;
-  if (local.x >= CHUNK || local.y >= CHUNK || local.z >= CHUNK) { return; }
-  let cell = cc * CHUNK + local;
+  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
+                               ci / (NCHUNK * NCHUNK)));
+  let wc = slotToWorldChunk(sc, T.origin);
+  let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
+  // The color lattice is GLOBAL in WORLD coords: cell ≡ colorPhase (mod 3).
+  // Coloring by slot coords would race at the toroidal wrap (world-adjacent
+  // cells whose slots are WORLD_N apart would share a color); world coords
+  // keep same-color cells >=3 apart in the space movement happens in.
+  let bmod = ((base % vec3<i32>(3)) + vec3<i32>(3)) % vec3<i32>(3);
+  let start = (vec3<i32>(P.colorPhase) + vec3<i32>(3) - bmod) % vec3<i32>(3);
+  let local = start + vec3<i32>(lid) * 3;
+  if (local.x >= i32(CHUNK) || local.y >= i32(CHUNK) || local.z >= i32(CHUNK)) { return; }
+  let c = base + local;  // world cell this thread acts on
 
-  let idx = cellIndex(cell);
+  let idx = cellIndexW(c);
   let w = voxels[idx];
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return; }
@@ -289,7 +333,6 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   let m = materials[mat];
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, idx);
-  let c = vec3<i32>(cell);
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
   if (P.substep == 0u && m.reactCount > 0u) {

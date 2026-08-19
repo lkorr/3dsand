@@ -55,9 +55,10 @@ struct Hit {
   mediaSurf: f32,     // fullness (0..1) of the first media cell — surface term
 };
 
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
+
 fn chunkOcc(cell : vec3<i32>) -> u32 {
-  let ch = vec3<u32>(cell) / CHUNK;
-  return occupancy[(ch.z * NCHUNK + ch.y) * NCHUNK + ch.x];
+  return occupancy[chunkIndexW(cell)];
 }
 
 fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
@@ -73,10 +74,11 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
   let inv = 1.0 / rd;
 
-  // clip to world AABB
+  // clip to the residency window AABB (world coords)
   let nf = f32(WORLD_N);
-  let tt0 = (vec3f(0.0) - ro) * inv;
-  let tt1 = (vec3f(nf) - ro) * inv;
+  let wlo = vec3f(R.origin * i32(CHUNK));
+  let tt0 = (wlo - ro) * inv;
+  let tt1 = (wlo + vec3f(nf) - ro) * inv;
   let tmin = min(tt0, tt1);
   let tmax = max(tt0, tt1);
   let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
@@ -85,7 +87,8 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
 
   var t = tEnter + 1e-4;
   var p = ro + rd * t;
-  var cell = clamp(vec3<i32>(floor(p)), vec3<i32>(0), vec3<i32>(i32(WORLD_N) - 1));
+  let wloI = R.origin * i32(CHUNK);
+  var cell = clamp(vec3<i32>(floor(p)), wloI, wloI + vec3<i32>(i32(WORLD_N) - 1));
   let stepv = vec3<i32>(sign(rd));
   let tDelta = abs(inv);
   var tMax : vec3f;
@@ -103,14 +106,11 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
 
   for (var i = 0; i < 4096; i++) {
     if (i >= maxSteps) { break; }
-    if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
-        cell.x >= i32(WORLD_N) || cell.y >= i32(WORLD_N) || cell.z >= i32(WORLD_N)) {
-      break;
-    }
+    if (!inBounds(cell)) { break; }
 
     if (chunkOcc(cell) == 0u) {
       // empty chunk: jump straight to its exit face (air — no media to add)
-      let ch = cell / i32(CHUNK);
+      let ch = worldChunkOf(cell);
       let lo = vec3f(ch * i32(CHUNK));
       let hi = lo + f32(CHUNK);
       let e0 = (lo - ro) * inv;
@@ -144,7 +144,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       continue;
     }
 
-    let w = voxels[cellIndex(vec3<u32>(cell))];
+    let w = voxels[cellIndexW(cell)];
     let mat = voxMat(w);
     var weight = 0.0;  // this cell's media contribution per unit length
     if (mat != MAT_AIR) {

@@ -10,6 +10,8 @@
 @group(0) @binding(9)  var<storage, read_write> pick      : array<u32>;
 @group(0) @binding(10) var<uniform> R : RenderParams;
 
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
+
 @compute @workgroup_size(1)
 fn main() {
   let ro = R.camPos;
@@ -31,7 +33,7 @@ fn main() {
   var prev = cell;
   for (var i = 0; i < 640; i++) {
     if (inBounds(cell)) {
-      let w = voxels[cellIndex(vec3<u32>(cell))];
+      let w = voxels[cellIndexW(cell)];
       let mat = voxMat(w);
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         pick[0] = 1u;
@@ -50,11 +52,12 @@ fn main() {
     } else {
       cell.z += stepv.z; tMax.z += tDelta.z;
     }
-    let n = i32(WORLD_N);
-    if ((cell.x < 0 && rd.x <= 0.0) || (cell.x >= n && rd.x >= 0.0) ||
-        (cell.y < 0 && rd.y <= 0.0) || (cell.y >= n && rd.y >= 0.0) ||
-        (cell.z < 0 && rd.z <= 0.0) || (cell.z >= n && rd.z >= 0.0)) {
-      return;   // left the world for good
+    let lo = R.origin * i32(CHUNK);
+    let hi = lo + i32(WORLD_N);
+    if ((cell.x < lo.x && rd.x <= 0.0) || (cell.x >= hi.x && rd.x >= 0.0) ||
+        (cell.y < lo.y && rd.y <= 0.0) || (cell.y >= hi.y && rd.y >= 0.0) ||
+        (cell.z < lo.z && rd.z <= 0.0) || (cell.z >= hi.z && rd.z >= 0.0)) {
+      return;   // left the residency window for good
     }
   }
 }

@@ -19,23 +19,23 @@ struct CellOp {
 };
 @group(0) @binding(14) var<storage, read> cellOps : array<CellOp>;
 
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+
 fn markBoth(c : vec3<i32>) {
-  let cu = vec3<u32>(c);
-  let lo = cu % CHUNK;
-  let ch = vec3<i32>(cu / CHUNK);
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  let ch = worldChunkOf(c);
   var xs = array<i32, 2>(0, 0);
   var ys = array<i32, 2>(0, 0);
   var zs = array<i32, 2>(0, 0);
-  if (lo.x == 0u) { xs[1] = -1; } else if (lo.x == CHUNK - 1u) { xs[1] = 1; }
-  if (lo.y == 0u) { ys[1] = -1; } else if (lo.y == CHUNK - 1u) { ys[1] = 1; }
-  if (lo.z == 0u) { zs[1] = -1; } else if (lo.z == CHUNK - 1u) { zs[1] = 1; }
-  let nc = i32(NCHUNK);
+  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
+  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
+  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
   for (var i = 0; i < 2; i++) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (n.x >= 0 && n.y >= 0 && n.z >= 0 && n.x < nc && n.y < nc && n.z < nc) {
-          let ci = u32((n.z * nc + n.y) * nc + n.x);
+        if (chunkInWindow(n, T.origin)) {
+          let ci = chunkSlotIndex(n);
           atomicStore(&dirtyIn[ci], 1u);   // simulate this tick
           atomicStore(&dirtyOut[ci], 1u);  // and re-check next tick
         }
@@ -56,7 +56,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let c = vec3<i32>(op.cx, op.cy, op.cz) + local;
   if (!inBounds(c)) { return; }
 
-  let idx = cellIndex(vec3<u32>(c));
+  let idx = cellIndexW(c);
   if (op.mode == 0u && voxMat(voxels[idx]) != MAT_AIR) { return; }  // paint fills air only
 
   let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, idx);
@@ -81,9 +81,11 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
   voxels[op.cellIdx] = op.word;
 
+  // cellIdx is a SLOT index: reconstruct the world cell through the window
   let ci = op.cellIdx / CHUNK_VOL;
   let lo = op.cellIdx % CHUNK_VOL;
-  let cc = vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK, ci / (NCHUNK * NCHUNK));
-  let l = vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK));
-  markBoth(vec3<i32>(cc * CHUNK + l));
+  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
+                               ci / (NCHUNK * NCHUNK)));
+  let l = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
+  markBoth(slotToWorldChunk(sc, T.origin) * i32(CHUNK) + l);
 }

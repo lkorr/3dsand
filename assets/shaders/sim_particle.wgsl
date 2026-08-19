@@ -20,9 +20,11 @@
 @group(1) @binding(3) var<storage, read_write> claim  : array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read_write> pArgs  : array<u32>;
 
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+
 // Blocks flight: solids, powders and liquids (splash = plop onto the surface).
 fn blocksParticle(c : vec3<i32>) -> bool {
-  let w = voxels[cellIndex(vec3<u32>(c))];
+  let w = voxels[cellIndexW(c)];
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
   return materials[mat].klass != CLASS_GAS;
@@ -31,22 +33,20 @@ fn blocksParticle(c : vec3<i32>) -> bool {
 // Next-tick dirty mark incl. boundary neighbors (particles run post-CA, so
 // their writes are next tick's business).
 fn markDirtyNext(c : vec3<i32>) {
-  let cu = vec3<u32>(c);
-  let lo = cu % CHUNK;
-  let ch = vec3<i32>(cu / CHUNK);
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  let ch = worldChunkOf(c);
   var xs = array<i32, 2>(0, 0);
   var ys = array<i32, 2>(0, 0);
   var zs = array<i32, 2>(0, 0);
-  if (lo.x == 0u) { xs[1] = -1; } else if (lo.x == CHUNK - 1u) { xs[1] = 1; }
-  if (lo.y == 0u) { ys[1] = -1; } else if (lo.y == CHUNK - 1u) { ys[1] = 1; }
-  if (lo.z == 0u) { zs[1] = -1; } else if (lo.z == CHUNK - 1u) { zs[1] = 1; }
-  let nc = i32(NCHUNK);
+  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
+  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
+  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
   for (var i = 0; i < 2; i++) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (n.x >= 0 && n.y >= 0 && n.z >= 0 && n.x < nc && n.y < nc && n.z < nc) {
-          atomicStore(&dirtyOut[u32((n.z * nc + n.y) * nc + n.x)], 1u);
+        if (chunkInWindow(n, T.origin)) {
+          atomicStore(&dirtyOut[chunkSlotIndex(n)], 1u);
         }
       }
     }
@@ -121,8 +121,8 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       // propose reinsertion at the last empty position
       p.px = lastAir.x; p.py = lastAir.y; p.pz = lastAir.z;
       p.flags |= PFLAG_PENDING;
-      let tgt = vec3<u32>(vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u));
-      atomicMax(&claim[claimSlot(cellIndex(tgt))], particlePriority(p));
+      let tgt = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+      atomicMax(&claim[claimSlot(cellIndexW(tgt))], particlePriority(p));
       append(p);
       return;
     }
@@ -143,7 +143,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   let cell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
-  let tgt = cellIndex(vec3<u32>(cell));
+  let tgt = cellIndexW(cell);
   let won = atomicLoad(&claim[claimSlot(tgt)]) == particlePriority(p);
 
   if (won && voxMat(voxels[tgt]) == MAT_AIR) {

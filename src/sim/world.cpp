@@ -15,7 +15,9 @@ constexpr uint64_t kOccBytes = kNumChunks * 4;
 constexpr uint64_t kHashOff = kOccOff + kOccBytes;
 constexpr uint64_t kPickOff = kHashOff + 256;
 constexpr uint64_t kPCountOff = kPickOff + 256;
-constexpr uint64_t kFetchOff = kPCountOff + 256;
+constexpr uint64_t kSupportOff = kPCountOff + 256;
+constexpr uint64_t kSupportBytes = kNumChunks * 4;
+constexpr uint64_t kFetchOff = kSupportOff + kSupportBytes;
 constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
 
 void World::Init(const wgpu::Device& device) {
@@ -28,6 +30,8 @@ void World::Init(const wgpu::Device& device) {
   argsStage = CreateBuffer(device, 12, U::Storage | U::CopySrc | U::CopyDst, "argsStage");
   dispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "dispatchArgs");
   occupancy = CreateBuffer(device, kOccBytes, U::Storage | U::CopySrc | U::CopyDst, "occupancy");
+  support = CreateBuffer(device, kSupportBytes, U::Storage | U::CopySrc | U::CopyDst,
+                         "supportFlags");
   hash = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst, "worldHash");
   tickUBO = CreateBuffer(device, sizeof(TickParams), U::Uniform | U::CopyDst, "tickUBO");
   passUBO = CreateBuffer(device, 54 * 256, U::Uniform | U::CopyDst, "passUBO");
@@ -55,6 +59,7 @@ void World::Init(const wgpu::Device& device) {
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
                                "bodyInstances");
   bodyXforms = CreateBuffer(device, 256ull * 32, U::Storage | U::CopyDst, "bodyXforms");
+  genList = CreateBuffer(device, kNumChunks * 4, U::Storage | U::CopyDst, "genList");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
@@ -62,22 +67,21 @@ void World::Init(const wgpu::Device& device) {
   }
   snap_.mirror.assign(27 * kChunkVol, 0);
   snap_.dirtyFlags.assign(kNumChunks, 0);
-  fetchQueued_.assign(kNumChunks, 0);
+  snap_.supportFlags.assign(kNumChunks, 0);
+  snap_.occupancy.assign(kNumChunks, 0);
 }
 
-void World::RequestChunkFetch(uint32_t chunkIdx) {
-  if (chunkIdx >= kNumChunks || fetchQueued_[chunkIdx]) return;
-  fetchQueued_[chunkIdx] = 1;
-  fetchQueue_.push_back(chunkIdx);
+void World::RequestChunkFetch(IVec3 worldChunk) {
+  if (!ChunkInWindow(worldChunk)) return;  // not resident: nothing to read
+  uint64_t key = PackChunkKey(worldChunk);
+  if (fetchQueued_.count(key)) return;
+  fetchQueued_[key] = 1;
+  fetchQueue_.push_back(worldChunk);
 }
 
-const CachedChunk* World::Cached(uint32_t chunkIdx) const {
-  auto it = cache_.find(chunkIdx);
+const CachedChunk* World::Cached(IVec3 worldChunk) const {
+  auto it = cache_.find(PackChunkKey(worldChunk));
   return it == cache_.end() ? nullptr : &it->second;
-}
-
-static uint32_t ChunkIndex(int cx, int cy, int cz) {
-  return (uint32_t)((cz * (int)kNChunk + cy) * (int)kNChunk + cx);
 }
 
 bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc,
@@ -91,33 +95,37 @@ bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc
   Slot& s = slots_[slot];
   s.particleLivePage = particleLivePage;
   s.tick = tick;
+  s.origin = origin_;
 
-  // drain queued chunk fetches into this slot (bounded per tick)
+  // drain queued chunk fetches into this slot (bounded per tick); anything
+  // that streamed out since it was queued just drops
   s.fetchIds.clear();
   while (!fetchQueue_.empty() && s.fetchIds.size() < kFetchPerTick) {
-    uint32_t ci = fetchQueue_.front();
+    IVec3 wc = fetchQueue_.front();
     fetchQueue_.erase(fetchQueue_.begin());
-    fetchQueued_[ci] = 0;
-    s.fetchIds.push_back(ci);
+    fetchQueued_.erase(PackChunkKey(wc));
+    if (!ChunkInWindow(wc)) continue;
+    s.fetchIds.push_back(wc);
   }
   for (size_t i = 0; i < s.fetchIds.size(); i++) {
-    enc.CopyBufferToBuffer(voxels, (uint64_t)s.fetchIds[i] * kChunkBytes, s.buf,
-                           kFetchOff + i * kChunkBytes, kChunkBytes);
+    enc.CopyBufferToBuffer(voxels, (uint64_t)SlotChunkIndex(s.fetchIds[i]) * kChunkBytes,
+                           s.buf, kFetchOff + i * kChunkBytes, kChunkBytes);
   }
 
-  // clamp 3x3x3 window to the chunk grid
-  auto clampBase = [](int v) {
-    if (v < 0) v = 0;
-    if (v > (int)kNChunk - 3) v = (int)kNChunk - 3;
+  // clamp the 3x3x3 mirror to the residency window (world chunk coords)
+  auto clampBase = [&](int v, int lo) {
+    if (v < lo) v = lo;
+    if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
     return v;
   };
-  s.base = {clampBase(playerChunkBase.x), clampBase(playerChunkBase.y),
-            clampBase(playerChunkBase.z)};
+  s.base = {clampBase(playerChunkBase.x, origin_.x),
+            clampBase(playerChunkBase.y, origin_.y),
+            clampBase(playerChunkBase.z, origin_.z)};
 
   for (int dz = 0; dz < 3; dz++)
     for (int dy = 0; dy < 3; dy++)
       for (int dx = 0; dx < 3; dx++) {
-        uint32_t ci = ChunkIndex(s.base.x + dx, s.base.y + dy, s.base.z + dz);
+        uint32_t ci = SlotChunkIndex({s.base.x + dx, s.base.y + dy, s.base.z + dz});
         uint64_t dst = (uint64_t)((dz * 3 + dy) * 3 + dx) * kChunkBytes;
         enc.CopyBufferToBuffer(voxels, (uint64_t)ci * kChunkBytes, s.buf, dst,
                                kChunkBytes);
@@ -128,6 +136,10 @@ bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc
   enc.CopyBufferToBuffer(hash, 0, s.buf, kHashOff, 16);
   enc.CopyBufferToBuffer(pick, 0, s.buf, kPickOff, 32);
   enc.CopyBufferToBuffer(particleCounts, 0, s.buf, kPCountOff, 16);
+  // support-loss flags are one-shot: consume into this slot, then clear so the
+  // next window of ticks accumulates fresh flags (no readback = they persist)
+  enc.CopyBufferToBuffer(support, 0, s.buf, kSupportOff, kSupportBytes);
+  enc.ClearBuffer(support, 0, wgpu::kWholeSize);
   lastSlot_ = slot;
   return true;
 }
@@ -152,6 +164,7 @@ void World::KickReadback() {
           if (p) {
             std::memcpy(snap_.mirror.data(), p, kMirrorBytes);
             snap_.mirrorBase = sl.base;
+            snap_.windowOrigin = sl.origin;
             const uint32_t* dirtyW = (const uint32_t*)(p + kDirtyOff);
             const uint32_t* occW = (const uint32_t*)(p + kOccOff);
             uint32_t active = 0;
@@ -159,12 +172,16 @@ void World::KickReadback() {
             for (uint32_t i = 0; i < kNumChunks; i++) {
               snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
               active += snap_.dirtyFlags[i];
+              snap_.occupancy[i] = occW[i];
               total += occW[i];
             }
             snap_.activeChunks = active;
             snap_.voxelTotal = total;
             std::memcpy(&snap_.worldHash, p + kHashOff, 4);
             std::memcpy(snap_.pick, p + kPickOff, 32);
+            const uint32_t* supW = (const uint32_t*)(p + kSupportOff);
+            for (uint32_t i = 0; i < kNumChunks; i++)
+              snap_.supportFlags[i] = supW[i] != 0 ? 1 : 0;
             uint32_t pcounts[2];
             std::memcpy(pcounts, p + kPCountOff, 8);
             snap_.particleCount =
@@ -172,9 +189,10 @@ void World::KickReadback() {
             snap_.tick = sl.tick;
             snap_.valid = true;
 
-            // fetched chunks land in the CPU cache, stamped with their tick
+            // fetched chunks land in the CPU cache keyed by WORLD chunk,
+            // stamped with their tick
             for (size_t i = 0; i < sl.fetchIds.size(); i++) {
-              CachedChunk& cc = cache_[sl.fetchIds[i]];
+              CachedChunk& cc = cache_[PackChunkKey(sl.fetchIds[i])];
               if (cc.version <= sl.tick) {
                 cc.version = sl.tick;
                 cc.voxels.assign(
@@ -198,15 +216,19 @@ void World::KickReadback() {
 
 CellKind World::KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {
   if (!snap_.valid) return CellKind::Unknown;
-  if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= (int)kWorldN ||
-      cell.y >= (int)kWorldN || cell.z >= (int)kWorldN)
-    return CellKind::Solid;  // out of world = solid (matches sim rule)
-  int cx = cell.x / (int)kChunk - snap_.mirrorBase.x;
-  int cy = cell.y / (int)kChunk - snap_.mirrorBase.y;
-  int cz = cell.z / (int)kChunk - snap_.mirrorBase.z;
+  // outside the residency window = solid and inert (matches sim rule)
+  IVec3 lo{snap_.windowOrigin.x * (int)kChunk, snap_.windowOrigin.y * (int)kChunk,
+           snap_.windowOrigin.z * (int)kChunk};
+  if (cell.x < lo.x || cell.y < lo.y || cell.z < lo.z ||
+      cell.x >= lo.x + (int)kWorldN || cell.y >= lo.y + (int)kWorldN ||
+      cell.z >= lo.z + (int)kWorldN)
+    return CellKind::Solid;
+  int cx = (cell.x >> 4) - snap_.mirrorBase.x;
+  int cy = (cell.y >> 4) - snap_.mirrorBase.y;
+  int cz = (cell.z >> 4) - snap_.mirrorBase.z;
   if (cx < 0 || cy < 0 || cz < 0 || cx >= 3 || cy >= 3 || cz >= 3)
     return CellKind::Unknown;
-  int lx = cell.x % (int)kChunk, ly = cell.y % (int)kChunk, lz = cell.z % (int)kChunk;
+  int lx = cell.x & 15, ly = cell.y & 15, lz = cell.z & 15;
   uint32_t w = snap_.mirror[(size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol +
                             (lz * (int)kChunk + ly) * (int)kChunk + lx];
   uint32_t mat = w & 0xFFF;
@@ -228,9 +250,20 @@ static uint32_t pcg(uint32_t v) {
 static uint32_t hash3(uint32_t a, uint32_t b, uint32_t c) {
   return pcg(a ^ pcg(b ^ pcg(c)));
 }
+// floor division / positive modulo, matching worldgen.wgsl fdiv/fmodp (the
+// noise lattice must be seamless across negative world coordinates)
+static int fdiv(int a, int b) {
+  int q = a / b;
+  if ((a % b) != 0 && ((a < 0) != (b < 0))) q -= 1;
+  return q;
+}
+static int fmodp(int a, int b) {
+  int m = a % b;
+  return m < 0 ? m + b : m;
+}
 static int vnoise(int x, int z, int cs, uint32_t seed) {
-  int gx = x / cs, gz = z / cs;
-  int fx = x % cs, fz = z % cs;
+  int gx = fdiv(x, cs), gz = fdiv(z, cs);
+  int fx = fmodp(x, cs), fz = fmodp(z, cs);
   int h00 = (int)(hash3(seed, (uint32_t)gx, (uint32_t)gz) & 0xFFu);
   int h10 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)gz) & 0xFFu);
   int h01 = (int)(hash3(seed, (uint32_t)gx, (uint32_t)(gz + 1)) & 0xFFu);

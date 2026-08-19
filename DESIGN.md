@@ -120,6 +120,21 @@ grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
 - Chunks leaving the resident cube are compressed (RLE — falling-sand worlds are
   extremely runny) and written to a region file; incoming chunks load from disk or
   are generated in compute.
+- **Implemented (2026-08-19, v0.4):** toroidal addressing is live on all three
+  axes. World coords are unbounded i32; every kernel works in world coords and
+  masks to slots (sizes are powers of two, so `mod` is a bitmask even for
+  negatives); the window origin rides TickParams/RenderParams. The 3×3×3 color
+  lattice is computed in WORLD coords — coloring by slot would race at the
+  toroidal wrap. v1 simplifications, on purpose: the evicted-chunk store lives
+  in RAM behind a `ChunkStore` interface (region files can replace the map
+  without touching callers; the .svx save serializes the store wholesale), and
+  eviction readback is synchronous per shift (bounded: one 16×16 plane,
+  save-worthy chunks only — fresh terrain evicts almost nothing). Eviction
+  save-worthiness reads the snapshot's occupancy/dirty flags, which lag the GPU
+  by the readback ring: activity that starts on the trailing plane in those
+  last ~2 ticks can be lost on re-entry — accepted, revisit with async
+  eviction. CPU-known writes (brush/explosions) mark chunks modified
+  immediately to shrink that window.
 - **Unloaded space is treated as solid and inert** so liquids can't drain off the
   edge of the loaded world (Burkelbear's solution; adopt it verbatim).
 - Underground, darkness hides the streaming horizon. Overworld draw distance vs.
@@ -288,6 +303,16 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
 Destroying support must let disconnected terrain fall. CA rules only see immediate
 neighbors, so this needs an explicit connectivity pass:
 - Every destruction event queues an island check around the affected region.
+- **Support-loss triggers (2026-08-19):** explosions and brush erases are not the
+  only ways support disappears — the CA itself removes it (fire burns a stem,
+  ember decays to ash, acid dissolves rock, sand flows out from under a slab).
+  `sim_step` sets a per-chunk *support-loss flag* (side-channel buffer, never fed
+  back into voxel state) whenever a supporting voxel (solid/powder) vacates or
+  transforms next to a solid; the flags ride the async readback, are cleared on
+  consume, and become island-check events with a per-chunk cooldown. A solid
+  component with powder directly below counts as *resting* (anchored) — without
+  that rule every slab on a sand pile would convert to a rigidbody the moment a
+  grain shifted.
 - **Bounded 6-connected flood fill** outward from voxels adjacent to the removal.
   Meeting fronts merge. If a fill exceeds ~32,000 voxels (~8 chunks), abort and
   declare "not an island" — an unbounded check could collapse an entire dungeon
@@ -476,6 +501,31 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.4 (2026-08-19)** — M2 complete, M7 core complete, island-detection
+> support-loss triggers. All selftest-gated (new: streamed-walk determinism +
+> eviction/persistence roundtrip).
+> **M2/M7 streaming:** toroidal residency on all three axes (§3) — world
+> coords unbounded, window origin uniform, slot = chunk mod N by bitmask,
+> unloaded space solid+inert at the window faces, color lattice in world
+> coords. Streaming manager recenters one chunk per axis per tick with
+> hysteresis; leaving planes RLE into the in-RAM `ChunkStore` (occupancy/
+> modified-filtered), entering planes load from the store or generate on GPU
+> (`worldgen.wgsl:list` over a slot list). Save format v2 = the store +
+> window origin (chunk-coord-keyed), so streamed worlds round-trip.
+> **M7 procgen:** worldgen rewritten as a pure function of world coords +
+> seed (floor-div noise for negative coords, mirrored in C++): infinite
+> hills, two cave bands carved as 2D-noise column spans (3D-threshold carving
+> was rejected — it generates free-floating stone blobs that the island
+> detector then correctly-but-endlessly converts to debris), lava pools on
+> deep cavern floors, sparse ruin POIs per 256² tile, authored set pieces at
+> their absolute coords (cave-free under pool rims: a breached rim drains the
+> pool forever and the world never sleeps).
+> **Debris:** GPU support-loss flags (§7) — the CA reports supporting-voxel
+> removal next to solids (burnt stems, ember→ash, undermined slabs) through a
+> side-channel buffer; CPU turns flags into cooldown-limited island checks.
+> Powder-below now anchors islands (a slab resting on sand is supported).
+> Fixes plants/structures left floating after fire or erosion.
+>
 > **v0.3 (2026-08-19)** — M5 complete, M6 complete, M2 save/load core. All
 > selftest-gated (determinism hashes now cover explosions + particles).
 > **M5:** GPU particle system per §5 — fixed-point integer state (24.8), double-

@@ -65,6 +65,8 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(12, T::Storage),         // dirtyList (compact writes, step reads)
         entry(13, T::Storage),         // dispatch args (compact writes)
         entry(14, T::ReadOnlyStorage), // exact-cell ops (island removal)
+        entry(15, T::Storage),         // support-loss flags (sim_step writes)
+        entry(16, T::ReadOnlyStorage), // genList (worldgen streaming slots)
     };
     wgpu::BindGroupLayoutDescriptor d{};
     d.entryCount = std::size(entries);
@@ -173,6 +175,8 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(12, world_->dirtyList),
         b(13, world_->argsStage),
         b(14, world_->cellOps),
+        b(15, world_->support),
+        b(16, world_->genList),
     };
     wgpu::BindGroupDescriptor d{};
     d.layout = simBGL_;
@@ -271,6 +275,7 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   }
 
   worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
+  worldgenList_ = MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
   mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells");
   compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact");
@@ -315,22 +320,33 @@ void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
   enc.ClearBuffer(world_->dirty[0], 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->dirty[1], 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
+  enc.ClearBuffer(world_->support, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->particleCounts, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->drawArgs, 0, wgpu::kWholeSize);  // no ghost particles
   wgpu::ComputePassEncoder pass = enc.BeginComputePass();
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
+  // one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
   pass.SetPipeline(worldgen_);
-  pass.DispatchWorkgroups(kWorldN / 4, kWorldN / 4, kWorldN / 4);
-  pass.SetPipeline(occupancy_);
   pass.DispatchWorkgroups(kNumChunks, 1, 1);
+  pass.End();
+}
+
+void Simulation::EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count) {
+  if (count == 0) return;
+  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  uint32_t off = 0;
+  pass.SetBindGroup(0, simBG_[page_], 1, &off);
+  pass.SetPipeline(worldgenList_);
+  pass.DispatchWorkgroups(count, 1, 1);
   pass.End();
 }
 
 void Simulation::EncodeLoadReset(const wgpu::CommandEncoder& enc) {
   page_ = 0;
   enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
+  enc.ClearBuffer(world_->support, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->particleCounts, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->drawArgs, 0, wgpu::kWholeSize);

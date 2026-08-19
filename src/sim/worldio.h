@@ -3,16 +3,19 @@
 
 #include "gpu/context.h"
 #include "sim/simulation.h"
+#include "sim/stream.h"
 #include "sim/world.h"
 
-// Versioned RLE world serialization — the M2 disk-streaming core (DESIGN.md
-// §3). Chunk-granular (each 16^3 chunk RLE-compressed independently) so the
-// same format serves future toroidal region files; falling-sand worlds are
-// extremely runny, so RLE typically shrinks 64 MB of voxels to a few MB.
+// Versioned chunk-RLE world serialization (M2, DESIGN.md §3). v2 (SVX2) is
+// chunk-granular WITH world chunk coordinates: the file is simply the chunk
+// store (everything ever streamed out) plus the flushed resident window and
+// the window origin, so an infinite streamed world round-trips.
 //
-// Save blocks on a full GPU readback and Load re-uploads + wakes the world —
-// user-triggered whole-world snapshots, not per-frame paths. The stamp byte is
-// stripped on save (it is per-tick scratch, not world state).
+// Save flushes the resident window into the store (blocking readback) and
+// serializes the store; Load replaces the store, re-fills the window from it
+// (procgen for misses), and wakes the world. User-triggered whole-world
+// snapshots, not per-frame paths. Stamp bytes are stripped on save.
 
-bool SaveWorld(GpuContext& ctx, World& world, const std::string& path);
-bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, const std::string& path);
+bool SaveWorld(GpuContext& ctx, World& world, Stream& stream, const std::string& path);
+bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
+               const std::string& path);

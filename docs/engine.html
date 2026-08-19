@@ -163,6 +163,118 @@
   </div>
 </header>
 
+<h2>Tuning &amp; modding — where the knobs live</h2>
+<p class="note">
+  Two kinds of knobs. <strong>Data files</strong> (JSON, WGSL) hot-reload in the
+  running game — press <code>R</code> for materials/reactions, <code>F5</code>
+  for shaders. <strong>C++/WGSL constants</strong> need a rebuild
+  (<code>cmake --build build --config Release --target sandvox</code>), and the
+  paired ones must be changed in <em>both</em> places or the sim silently breaks.
+  After any sim-affecting change, run <code>--selftest</code> — it is the
+  acceptance gate.
+</p>
+
+<details class="stage" open>
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-render">json</span>
+    <span class="sname">Materials &amp; reactions</span>
+    <span class="sdesc">assets/materials/*.json — hot-reload with R, no recompile</span>
+    <span class="cost">live</span>
+  </summary>
+  <div class="body">
+    <p>
+      <code>assets/materials/materials.json</code> — one entry per material.
+      <strong>Order defines the 12-bit GPU material ID: append new materials at
+      the end, never reorder</strong> (worldgen and <code>world.h</code> assume
+      the existing IDs).
+    </p>
+    <table>
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td>class</td><td><code>solid | powder | liquid | gas</code> — picks the movement rule</td></tr>
+      <tr><td>density</td><td>displacement ordering (air = 10; sand 1600 sinks through water 1000, oil 900 floats)</td></tr>
+      <tr><td>hardness</td><td>0–255 blast/dig resistance (stone 90, wood 40; 255 ≈ indestructible)</td></tr>
+      <tr><td>colors</td><td>exactly 3 <code>#rrggbb</code> palette variants, picked per-voxel by the state nibble</td></tr>
+      <tr><td>emission</td><td>0–255 glow (fire 255, lava 215) — also feeds media glow</td></tr>
+      <tr><td>opacity</td><td>0–255 media absorbance for translucent liquids/gases (water 90, oil 235)</td></tr>
+      <tr><td>moveEvery</td><td>viscosity: only move every Nth tick (lava 3, oil 2)</td></tr>
+      <tr><td>tags</td><td>strings like <code>flammable</code>, <code>organic</code> — what reactions match against (max 32 distinct)</td></tr>
+      <tr><td>rubble</td><td>what sub-8-voxel debris islands crumble into (stone→gravel, wood→dust, ice→snow)</td></tr>
+      <tr><td>wanders / opaque</td><td>critter scuttle (mites) / liquid renders as surface instead of media (lava)</td></tr>
+    </table>
+    <p>
+      <code>assets/materials/reactions.json</code> — three rule shapes:
+      <strong>pair</strong> (<code>self</code> + <code>neighbor</code> →
+      <code>selfBecomes</code>/<code>neighborBecomes</code>), <strong>decay</strong>
+      (<code>"decay": true</code> → <code>becomes</code>), and <strong>emit</strong>
+      (<code>emit</code> material into adjacent air). <code>chance</code> is
+      per-mille per 30 Hz tick. Neighbors match by exact id, <code>tag:flammable</code>,
+      or <code>any</code>, optionally filtered by <code>dir</code>
+      (<code>up/down/side</code>) and <code>neighborClass</code>. First matching
+      rule wins, so put specific rules before tag rules.
+    </p>
+    <div class="limit">
+      <b>The one rule that bites</b>
+      <p>
+        Growth chains must stay decisively subcritical (expected offspring per
+        tick « 1) or their chunks never sleep and the world never settles — see
+        the stem note in <code>reactions.json</code>. The selftest's sleep
+        assertion catches this. Bad ids/tags/colors are reported with file
+        context at load; the reload is rejected, keeping the old tables.
+      </p>
+    </div>
+  </div>
+</details>
+
+<details class="stage">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-cpu">c++/wgsl</span>
+    <span class="sname">Engine hyperparameters</span>
+    <span class="sdesc">Rebuild required — paired constants must match across files</span>
+    <span class="cost">rebuild</span>
+  </summary>
+  <div class="body">
+    <h4>Paired constants (change BOTH or the sim breaks)</h4>
+    <table>
+      <tr><th>Knob</th><th>Where</th><th>Notes</th></tr>
+      <tr><td>voxel size</td><td><code>kVoxelMeters</code> in src/sim/world.h + <code>VOXEL_METERS</code> in assets/shaders/common.wgsl</td>
+          <td>0.125 m. The single meters↔voxels conversion — player size, speeds, gravity, fog all derive from it. Smaller voxels shrink the world's physical size.</td></tr>
+      <tr><td>world size</td><td><code>kWorldN</code> in world.h + <code>WORLD_N</code> in common.wgsl</td>
+          <td>256 (= 16.7M voxels, ~64 MB). Must be a multiple of 16; memory and full-scan costs scale cubically. Saved <code>.svx</code> files are size-locked.</td></tr>
+      <tr><td>particle capacity</td><td><code>kParticleCap</code>/<code>kClaimSize</code> in world.h + <code>PARTICLE_CAP</code>/<code>CLAIM_SIZE</code> in common.wgsl</td>
+          <td>262,144. Powers of two; overflow = ejecta vaporizes instead of flying.</td></tr>
+      <tr><td>max explosion radius</td><td><code>kMaxExplosionRadius</code>/<code>kExplosionWg</code> in world.h + <code>EXP_R_MAX</code>/<code>EXP_WG</code>/<code>EXP_MASK_STRIDE</code> in common.wgsl</td>
+          <td>20 voxels. Dispatch box and scratch stride are sized from it: EXP_WG = ⌈(2r+1)/4⌉, stride ≥ (2r+1)³.</td></tr>
+    </table>
+    <h4>Single-file knobs</h4>
+    <table>
+      <tr><th>Knob</th><th>Where</th><th>Notes</th></tr>
+      <tr><td>tick rate</td><td><code>kTickDt</code> in src/main.cpp</td>
+          <td>30 Hz. Per-tick constants (<code>PART_GRAVITY</code>, reaction chances) are authored per-tick — changing this changes the feel everywhere.</td></tr>
+      <tr><td>player feel</td><td>constants atop src/game/player.cpp</td>
+          <td>walk/sprint/fly speeds, jump, swim, step-up height — all in meters, converted via voxel size.</td></tr>
+      <tr><td>grenade / detonate power</td><td>src/main.cpp (spawn + detonate sites)</td>
+          <td>grenade: radius 13 power 380 fuse 2.2 s; X-detonate: radius 12 power 340. Power is a hardness budget: power / hardness ≈ cells destroyed in depth.</td></tr>
+      <tr><td>blast falloff / ejecta odds</td><td><code>FALLOFF_PER_CELL</code>, <code>ejectPerMille</code> in assets/shaders/sim_explode.wgsl</td>
+          <td>hot-reloads with F5. Liquids eject 50%, powders 35%, solids 25%.</td></tr>
+      <tr><td>particle physics</td><td><code>PART_GRAVITY</code>, <code>PART_MAX_VEL</code> in common.wgsl</td>
+          <td>fixed-point (256 = 1 voxel). Keep integer — determinism rule.</td></tr>
+      <tr><td>debris budgets</td><td><code>kMaxBodies</code>, <code>kMaxBodyVoxInstances</code> in src/phys/debris.h; region/island bounds in debris.cpp</td>
+          <td>200 bodies / 262k voxel instances; island fill aborts at 32k voxels in an 80³ region.</td></tr>
+      <tr><td>worldgen layout</td><td>assets/shaders/worldgen.wgsl</td>
+          <td>hills, pools, platform, seeds. The heightfield is mirrored in <code>World::TerrainHeight</code> (src/sim/world.cpp) — keep both in sync.</td></tr>
+      <tr><td>sun / fog / sky</td><td><code>WriteRenderParams</code> in main.cpp (sun dir); fog + sky in assets/shaders/raymarch.wgsl</td>
+          <td>render-only, F5 reloads shaders; floats allowed here.</td></tr>
+    </table>
+    <p>
+      Fast shader syntax check without a rebuild:
+      <code>bash scripts/check_shaders.sh</code> (validates every WGSL file the
+      way the engine concatenates them).
+    </p>
+  </div>
+</details>
+
 <h2>Per-tick pipeline</h2>
 <p class="note">
   Every tick runs these stages in order. The ordering is load-bearing:

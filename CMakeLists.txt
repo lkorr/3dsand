@@ -102,6 +102,7 @@ add_executable(sandvox
   src/gpu/resources.cpp
   src/sim/world.cpp
   src/sim/worldio.cpp
+  src/sim/stream.cpp
   src/sim/simulation.cpp
   src/sim/materials.cpp
   src/game/player.cpp

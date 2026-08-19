@@ -36,14 +36,23 @@ constexpr uint32_t kMaxBodies = 200;
 
 class DebrisSystem {
  public:
-  void Init(Physics* phys, const std::vector<MaterialDef>& mats);
+  void Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats);
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
   // Remove all bodies, terrain patches and pending events (world regen).
   void Reset();
 
-  // Register a destruction event; the box is expanded internally and clamped
-  // to the bounded fill region (DESIGN.md §7: ~32k voxel abort).
-  void AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi);
+  // Register a destruction event; the box is expanded by `margin` and clamped
+  // to the bounded fill region (DESIGN.md §7: ~32k voxel abort). Returns false
+  // if the event queue is full (caller may retry next tick).
+  bool AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int margin = 10);
+
+  // Convert the snapshot's GPU support-loss flags (sim_step saw a supporting
+  // voxel vacate next to a solid) into island-check events, per-chunk
+  // cooldown'd and drained a few per tick from PreTick. This is what catches
+  // floating structures whose support was removed by the CA itself — burnt
+  // stems, dissolved rock, sand flowing out from under a slab — which no
+  // explosion or brush event covers.
+  void QueueSupportEvents(const WorldSnapshot& snap);
 
   // Once per tick BEFORE SubmitTick: requests chunk fetches, runs any ready
   // island detections (appends exact-cell ops), maintains terrain collision
@@ -76,6 +85,7 @@ class DebrisSystem {
   };
   struct TerrainEntry {
     uint64_t handle = 0;
+    IVec3 wc{};          // world chunk (streaming recycles slots, not chunks)
     uint32_t builtVersion = 0;
     uint32_t lastNeeded = 0;
     uint32_t lastRefreshReq = 0;
@@ -87,12 +97,20 @@ class DebrisSystem {
   void ManageTerrain(uint32_t tick, World& world);
 
   Physics* phys_ = nullptr;
+  World* world_ = nullptr;
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;
   std::deque<Event> events_;
+  // support-loss plumbing: flagged chunks wait here until the event queue has
+  // room (never dropped — a missed final event is a floating island forever).
+  // Keyed by WORLD chunk: the window can shift before a flag drains.
+  std::deque<IVec3> pendingSupport_;
+  std::unordered_map<uint64_t, uint8_t> supportPending_;    // dedup (packed key)
+  std::unordered_map<uint64_t, uint32_t> supportCooldown_;  // chunk -> last tick
+  uint32_t lastSupportSnapTick_ = 0;
   std::vector<Body> bodies_;
-  std::unordered_map<uint32_t, TerrainEntry> terrain_;
+  std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   uint32_t lastCellWriteTick_ = 0;
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
