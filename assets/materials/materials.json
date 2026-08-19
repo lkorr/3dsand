@@ -1,0 +1,63 @@
+{
+  "comment": "v0 material set. Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). decayPerMille: chance per 30Hz tick for gases to vanish. colors: 3 palette variants picked by the voxel state nibble. tags are parsed and validated now, used by the reaction system at M3. Worldgen (worldgen.wgsl + world.cpp) assumes the first six IDs: stone=1 wood=2 sand=3 gravel=4 water=5 oil=6.",
+  "materials": [
+    {
+      "id": "stone",
+      "class": "solid",
+      "density": 2600,
+      "colors": ["#8a8a8f", "#7d7d84", "#94949a"],
+      "tags": ["mineral"]
+    },
+    {
+      "id": "wood",
+      "class": "solid",
+      "density": 600,
+      "colors": ["#7a5230", "#6e4829", "#835a36"],
+      "tags": ["flammable", "organic"]
+    },
+    {
+      "id": "sand",
+      "class": "powder",
+      "density": 1600,
+      "colors": ["#dcc178", "#d2b76e", "#e6cb84"],
+      "tags": ["mineral", "meltable"]
+    },
+    {
+      "id": "gravel",
+      "class": "powder",
+      "density": 1800,
+      "colors": ["#9b948c", "#8d8680", "#a8a198"],
+      "tags": ["mineral"]
+    },
+    {
+      "id": "water",
+      "class": "liquid",
+      "density": 1000,
+      "colors": ["#3a78e8", "#3570dc", "#4382f0"],
+      "tags": ["wet", "extinguisher", "conductive"]
+    },
+    {
+      "id": "oil",
+      "class": "liquid",
+      "density": 900,
+      "colors": ["#4a3b28", "#41341f", "#55442c"],
+      "tags": ["flammable"]
+    },
+    {
+      "id": "smoke",
+      "class": "gas",
+      "density": 2,
+      "decayPerMille": 4,
+      "colors": ["#55555c", "#4b4b52", "#606066"],
+      "tags": []
+    },
+    {
+      "id": "steam",
+      "class": "gas",
+      "density": 1,
+      "decayPerMille": 6,
+      "colors": ["#c8cdd4", "#bfc5cc", "#d2d6dc"],
+      "tags": ["wet"]
+    }
+  ]
+}

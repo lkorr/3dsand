@@ -1,0 +1,164 @@
+#include "sim/world.h"
+
+#include <cstring>
+
+#include "gpu/resources.h"
+
+// Readback slot layout (offsets in bytes).
+constexpr uint64_t kChunkBytes = kChunkVol * 4;                 // 16 KB
+constexpr uint64_t kMirrorBytes = 27 * kChunkBytes;             // 432 KB
+constexpr uint64_t kDirtyOff = kMirrorBytes;
+constexpr uint64_t kDirtyBytes = kNumChunks * 4;
+constexpr uint64_t kOccOff = kDirtyOff + kDirtyBytes;
+constexpr uint64_t kOccBytes = kNumChunks * 4;
+constexpr uint64_t kHashOff = kOccOff + kOccBytes;
+constexpr uint64_t kPickOff = kHashOff + 256;
+constexpr uint64_t kSlotBytes = kPickOff + 256;
+
+void World::Init(const wgpu::Device& device) {
+  using U = wgpu::BufferUsage;
+  voxels = CreateBuffer(device, kVoxelCount * 4, U::Storage | U::CopySrc, "voxels");
+  dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
+  dirty[1] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyB");
+  occupancy = CreateBuffer(device, kOccBytes, U::Storage | U::CopySrc | U::CopyDst, "occupancy");
+  hash = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst, "worldHash");
+  tickUBO = CreateBuffer(device, sizeof(TickParams), U::Uniform | U::CopyDst, "tickUBO");
+  passUBO = CreateBuffer(device, 54 * 256, U::Uniform | U::CopyDst, "passUBO");
+  opsBuf = CreateBuffer(device, kMaxOpsPerTick * sizeof(BrushOp),
+                        U::Storage | U::CopyDst, "brushOps");
+  renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
+  pick = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst, "pick");
+
+  for (auto& s : slots_) {
+    s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
+    s.inFlight = false;
+  }
+  snap_.mirror.assign(27 * kChunkVol, 0);
+}
+
+static uint32_t ChunkIndex(int cx, int cy, int cz) {
+  return (uint32_t)((cz * (int)kNChunk + cy) * (int)kNChunk + cx);
+}
+
+bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc,
+                            IVec3 playerChunkBase) {
+  int slot = -1;
+  for (int i = 0; i < kSlots; i++) {
+    if (!slots_[i].inFlight) { slot = i; break; }
+  }
+  if (slot < 0) return false;
+  Slot& s = slots_[slot];
+
+  // clamp 3x3x3 window to the chunk grid
+  auto clampBase = [](int v) {
+    if (v < 0) v = 0;
+    if (v > (int)kNChunk - 3) v = (int)kNChunk - 3;
+    return v;
+  };
+  s.base = {clampBase(playerChunkBase.x), clampBase(playerChunkBase.y),
+            clampBase(playerChunkBase.z)};
+
+  for (int dz = 0; dz < 3; dz++)
+    for (int dy = 0; dy < 3; dy++)
+      for (int dx = 0; dx < 3; dx++) {
+        uint32_t ci = ChunkIndex(s.base.x + dx, s.base.y + dy, s.base.z + dz);
+        uint64_t dst = (uint64_t)((dz * 3 + dy) * 3 + dx) * kChunkBytes;
+        enc.CopyBufferToBuffer(voxels, (uint64_t)ci * kChunkBytes, s.buf, dst,
+                               kChunkBytes);
+      }
+  // dirty buffer note: caller copies the *next-tick* dirty buffer; we take a
+  // buffer reference at encode time via these explicit copies instead.
+  enc.CopyBufferToBuffer(occupancy, 0, s.buf, kOccOff, kOccBytes);
+  enc.CopyBufferToBuffer(hash, 0, s.buf, kHashOff, 16);
+  enc.CopyBufferToBuffer(pick, 0, s.buf, kPickOff, 32);
+  lastSlot_ = slot;
+  return true;
+}
+
+void World::EncodeDirtyCopy(const wgpu::CommandEncoder& enc, const wgpu::Buffer& dirtyNext) {
+  if (lastSlot_ < 0) return;
+  enc.CopyBufferToBuffer(dirtyNext, 0, slots_[lastSlot_].buf, kDirtyOff, kDirtyBytes);
+}
+
+void World::KickReadback() {
+  if (lastSlot_ < 0) return;
+  Slot& s = slots_[lastSlot_];
+  s.inFlight = true;
+  int slot = lastSlot_;
+  lastSlot_ = -1;
+  s.buf.MapAsync(
+      wgpu::MapMode::Read, 0, kSlotBytes, wgpu::CallbackMode::AllowProcessEvents,
+      [this, slot](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        Slot& sl = slots_[slot];
+        if (status == wgpu::MapAsyncStatus::Success) {
+          const uint8_t* p = (const uint8_t*)sl.buf.GetConstMappedRange(0, kSlotBytes);
+          if (p) {
+            std::memcpy(snap_.mirror.data(), p, kMirrorBytes);
+            snap_.mirrorBase = sl.base;
+            const uint32_t* dirtyW = (const uint32_t*)(p + kDirtyOff);
+            const uint32_t* occW = (const uint32_t*)(p + kOccOff);
+            uint32_t active = 0;
+            uint64_t total = 0;
+            for (uint32_t i = 0; i < kNumChunks; i++) {
+              active += dirtyW[i] != 0 ? 1 : 0;
+              total += occW[i];
+            }
+            snap_.activeChunks = active;
+            snap_.voxelTotal = total;
+            std::memcpy(&snap_.worldHash, p + kHashOff, 4);
+            std::memcpy(snap_.pick, p + kPickOff, 32);
+            snap_.valid = true;
+          }
+          sl.buf.Unmap();
+        }
+        sl.inFlight = false;
+      });
+}
+
+CellKind World::KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {
+  if (!snap_.valid) return CellKind::Unknown;
+  if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= (int)kWorldN ||
+      cell.y >= (int)kWorldN || cell.z >= (int)kWorldN)
+    return CellKind::Solid;  // out of world = solid (matches sim rule)
+  int cx = cell.x / (int)kChunk - snap_.mirrorBase.x;
+  int cy = cell.y / (int)kChunk - snap_.mirrorBase.y;
+  int cz = cell.z / (int)kChunk - snap_.mirrorBase.z;
+  if (cx < 0 || cy < 0 || cz < 0 || cx >= 3 || cy >= 3 || cz >= 3)
+    return CellKind::Unknown;
+  int lx = cell.x % (int)kChunk, ly = cell.y % (int)kChunk, lz = cell.z % (int)kChunk;
+  uint32_t w = snap_.mirror[(size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol +
+                            (lz * (int)kChunk + ly) * (int)kChunk + lx];
+  uint32_t mat = w & 0xFFF;
+  if (mat == 0) return CellKind::Air;
+  if (mat >= classOf.size()) return CellKind::Air;
+  switch (classOf[mat]) {
+    case 0: case 1: return CellKind::Solid;  // solid + powder both carry weight
+    case 2: return CellKind::Liquid;
+    default: return CellKind::Gas;
+  }
+}
+
+// ---- exact CPU mirror of worldgen.wgsl (integer-only, keep in sync) ----
+static uint32_t pcg(uint32_t v) {
+  uint32_t s = v * 747796405u + 2891336453u;
+  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+static uint32_t hash3(uint32_t a, uint32_t b, uint32_t c) {
+  return pcg(a ^ pcg(b ^ pcg(c)));
+}
+static int vnoise(int x, int z, int cs, uint32_t seed) {
+  int gx = x / cs, gz = z / cs;
+  int fx = x % cs, fz = z % cs;
+  int h00 = (int)(hash3(seed, (uint32_t)gx, (uint32_t)gz) & 0xFFu);
+  int h10 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)gz) & 0xFFu);
+  int h01 = (int)(hash3(seed, (uint32_t)gx, (uint32_t)(gz + 1)) & 0xFFu);
+  int h11 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)(gz + 1)) & 0xFFu);
+  int v0 = h00 * (cs - fx) + h10 * fx;
+  int v1 = h01 * (cs - fx) + h11 * fx;
+  return (v0 * (cs - fz) + v1 * fz) / (cs * cs);
+}
+int World::TerrainHeight(int x, int z, uint32_t seed) {
+  return 44 + (vnoise(x, z, 64, seed ^ 1u) * 36) / 255 +
+         (vnoise(x, z, 16, seed ^ 2u) * 10) / 255;
+}

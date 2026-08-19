@@ -1,0 +1,5 @@
+build/
+*.log
+imgui.ini
+screenshot.bmp
+screenshot.png
