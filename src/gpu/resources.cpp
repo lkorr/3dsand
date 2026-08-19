@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "sim/world.h"
+
 wgpu::Buffer CreateBuffer(const wgpu::Device& device, uint64_t size,
                           wgpu::BufferUsage usage, const char* label) {
   wgpu::BufferDescriptor d{};
@@ -22,6 +24,35 @@ static bool ReadFileText(const std::string& path, std::string& out) {
   return true;
 }
 
+// World constants, emitted as WGSL from the C++ definitions in world.h so the
+// two can never disagree. Previously common.wgsl redeclared these by hand and a
+// mismatch was silent: kVoxelMeters drifting from VOXEL_METERS just meant the
+// renderer lit the world at a different physical scale than the one the player
+// walked in. Anything derived from world.h belongs here, not in common.wgsl.
+std::string ShaderConstantPrelude() {
+  std::ostringstream o;
+  o << "// GENERATED from src/sim/world.h by ShaderConstantPrelude() — do not\n"
+       "// edit, and do not redeclare these in common.wgsl.\n";
+  o << "const WORLD_N : u32 = " << kWorldN << "u;\n";
+  o << "const CHUNK : u32 = " << kChunk << "u;\n";
+  o << "const NCHUNK : u32 = " << kNChunk << "u;\n";
+  o << "const NUM_CHUNKS : u32 = " << kNumChunks << "u;\n";
+  o << "const CHUNK_VOL : u32 = " << kChunkVol << "u;\n";
+  // Toroidal addressing masks/shifts (DESIGN.md §3) — sizes are powers of two,
+  // so world->slot mapping is a bitmask even for negative world coords.
+  uint32_t chunkShift = 0;
+  while ((1u << chunkShift) < kChunk) chunkShift++;
+  o << "const CHUNK_SHIFT : u32 = " << chunkShift << "u;\n";
+  o << "const CHUNK_MASK : i32 = " << (kChunk - 1) << ";\n";
+  o << "const WORLD_MASK : i32 = " << (kWorldN - 1) << ";\n";
+  o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
+  // Render-only: the sim never reads it, so voxel state stays integer and
+  // scale-free. Emitted at full precision so it round-trips the f32 exactly.
+  o.precision(9);
+  o << "const VOXEL_METERS : f32 = " << kVoxelMeters << ";\n";
+  return o.str();
+}
+
 wgpu::ShaderModule LoadShader(const wgpu::Device& device, const std::string& shaderDir,
                               const std::string& name) {
   std::string common, body;
@@ -33,7 +64,7 @@ wgpu::ShaderModule LoadShader(const wgpu::Device& device, const std::string& sha
     std::fprintf(stderr, "cannot read %s/%s\n", shaderDir.c_str(), name.c_str());
     return {};
   }
-  std::string src = common + "\n" + body;
+  std::string src = ShaderConstantPrelude() + "\n" + common + "\n" + body;
 
   wgpu::ShaderSourceWGSL wgsl{};
   wgsl.code = src.c_str();

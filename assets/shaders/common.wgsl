@@ -3,14 +3,10 @@
 // invariant (DESIGN.md §2/§4). Do not introduce floats, atomics-ordering
 // dependence, or stateful RNG into anything that feeds voxel state.
 
-const WORLD_N   : u32 = 256u;   // voxels per axis (must match world.h)
-// Physical voxel edge length (must match kVoxelMeters in world.h). Render-only:
-// the sim never reads it — voxel state stays integer and scale-free.
-const VOXEL_METERS : f32 = 0.125;
-const CHUNK     : u32 = 16u;    // voxels per chunk axis
-const NCHUNK    : u32 = 16u;    // chunks per axis = WORLD_N / CHUNK
-const NUM_CHUNKS : u32 = 4096u; // NCHUNK^3
-const CHUNK_VOL : u32 = 4096u;  // CHUNK^3
+// WORLD_N, CHUNK, NCHUNK, NUM_CHUNKS, CHUNK_VOL and VOXEL_METERS are GENERATED
+// from src/sim/world.h and prepended ahead of this file by LoadShader
+// (see ShaderConstantPrelude in resources.cpp). world.h is the single source of
+// truth — do not redeclare them here.
 
 const MAT_AIR : u32 = 0u;
 
@@ -82,7 +78,9 @@ struct TickParams {
   expCount   : u32,  // explosion ops this tick
   page       : u32,  // particle read page (0/1) this tick
   cellCount  : u32,  // exact-cell ops this tick
-  _p1        : u32,
+  genCount   : u32,  // chunks in genList this dispatch (worldgen streaming)
+  origin     : vec3<i32>,  // residency window origin, CHUNK units (DESIGN.md §3)
+  _p1        : i32,
 };
 
 struct PassParams {
@@ -110,6 +108,7 @@ struct RenderParams {
   camUp      : vec3f,  time       : f32,
   camFwd     : vec3f,  flags      : u32,   // bit0 = sun shadows
   sunDir     : vec3f,  _p1        : f32,
+  origin     : vec3<i32>, _p2     : i32,   // residency window origin, CHUNK units
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -191,8 +190,18 @@ fn isqrt(v : u32) -> u32 {
   return res;
 }
 
-// Chunk-major addressing: each 16^3 chunk is one contiguous 16 KB block, so
-// chunk streaming/readback is a single buffer copy per chunk.
+// ---- toroidal residency addressing (DESIGN.md §3) ----
+// World cell coords are unbounded i32. The resident cube covers world chunks
+// [origin, origin + NCHUNK) per axis; world chunk c lives in slot c mod NCHUNK
+// (a bitmask — sizes are powers of two, so this is correct for negatives too).
+// Memory layout is chunk-major by SLOT and never shifts; moving the window
+// recycles slots in place. Every kernel does its logic in WORLD coords and
+// maps to slots only to touch memory. Cells outside the window are solid and
+// inert (unloaded space rule) — each shader wraps inWindow() as its inBounds()
+// against its own origin uniform (T.origin for sim, R.origin for render).
+
+// Chunk-major addressing over SLOT coords (0..WORLD_N-1): each 16^3 chunk is
+// one contiguous 16 KB block, so chunk streaming/readback is one copy each.
 fn chunkIndexOf(c : vec3<u32>) -> u32 {
   let ch = c / CHUNK;
   return (ch.z * NCHUNK + ch.y) * NCHUNK + ch.x;
@@ -202,9 +211,36 @@ fn cellIndex(c : vec3<u32>) -> u32 {
   let localIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
   return chunkIndexOf(c) * CHUNK_VOL + localIdx;
 }
-fn inBounds(c : vec3<i32>) -> bool {
+
+// World-coord variants: mask to the slot, then index. Callers must have
+// checked inWindow() first — two world cells WORLD_N apart alias one slot.
+fn cellIndexW(c : vec3<i32>) -> u32 {
+  return cellIndex(vec3<u32>(c & vec3<i32>(WORLD_MASK)));
+}
+fn chunkIndexW(c : vec3<i32>) -> u32 {
+  return chunkIndexOf(vec3<u32>(c & vec3<i32>(WORLD_MASK)));
+}
+fn inWindow(c : vec3<i32>, originChunk : vec3<i32>) -> bool {
+  let d = c - originChunk * i32(CHUNK);
   let n = i32(WORLD_N);
-  return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < n && c.y < n && c.z < n;
+  return d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < n && d.y < n && d.z < n;
+}
+// world CHUNK coord of a world cell (arithmetic shift = floor div, POT)
+fn worldChunkOf(c : vec3<i32>) -> vec3<i32> {
+  return c >> vec3<u32>(CHUNK_SHIFT);
+}
+fn chunkInWindow(wc : vec3<i32>, originChunk : vec3<i32>) -> bool {
+  let d = wc - originChunk;
+  let n = i32(NCHUNK);
+  return d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < n && d.y < n && d.z < n;
+}
+fn chunkSlotIndex(wc : vec3<i32>) -> u32 {
+  let s = vec3<u32>(wc & vec3<i32>(NCHUNK_MASK));
+  return (s.z * NCHUNK + s.y) * NCHUNK + s.x;
+}
+// world chunk resident in slot chunk sc under window origin o
+fn slotToWorldChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
+  return o + ((sc - o) & vec3<i32>(NCHUNK_MASK));
 }
 
 // Voxel word: bits 0..11 material, 12..15 state, 16..23 tick-stamp, 24..31 spare.

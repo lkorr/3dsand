@@ -35,4 +35,14 @@ class Player {
   static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
   static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall
   static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // eyes near the top
+
+  // Tallest ledge walked over without jumping, in meters. Because it is
+  // physical, shrinking kVoxelMeters turns the same real-world ledge into more
+  // (smaller) voxels rather than into an impassable wall. This is what makes
+  // finely-diced noisy ground read as a smooth floor: at 0.05 m voxels a
+  // 1-voxel bump is 5 cm of a 45 cm budget, so it is absorbed silently.
+  static constexpr float kStepUpM = 0.45f;
+  static constexpr int kMaxStepUpVoxels =
+      (int)(kStepUpM / kVoxelMeters + 0.5f) < 1 ? 1
+                                               : (int)(kStepUpM / kVoxelMeters + 0.5f);
 };

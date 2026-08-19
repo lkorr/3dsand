@@ -95,6 +95,16 @@ assertion, perf, a walk test, and writes `screenshot.bmp`. Run it after any sim,
 shader, or material change and report the actual result — never claim a sim change
 works without it.
 
+**A running `sandvox.exe` may be killed without asking.** The link step fails with
+`LNK1104: cannot open file ...sandvox.exe` whenever an instance still holds the
+binary. That instance is essentially always me poking at the build, and there is
+no unsaved state to lose — worlds live in `.svx` files written explicitly. So kill
+it and rebuild rather than stopping to ask:
+
+```bash
+taskkill //F //IM sandvox.exe   # git-bash needs the doubled slashes
+```
+
 Validate shaders without a full rebuild (seconds, not minutes):
 
 ```bash
@@ -134,7 +144,7 @@ PostToolUse hook in `.claude/settings.json`.
 | `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation |
 | `src/gpu/` | Dawn context, buffer/shader/pipeline helpers |
 | `src/game/` | player controller, camera, brush |
-| `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` — shared constants and helpers live there, and it is not a standalone module |
+| `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
 | `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game) |
 
 **Two invariants that have already cost debugging time — don't rediscover them:**
@@ -148,8 +158,11 @@ PostToolUse hook in `.claude/settings.json`.
   is a bitmask (`cellIndexW`/`chunkIndexW`); every neighbor access must bounds-
   check against the residency window (`inWindow` with the origin uniform), not
   a fixed 0..N box. Unloaded space is solid and inert.
-- **`WORLD_N` in `common.wgsl` must match `world.h`.** They are two independent
-  declarations of the same number.
+- **World constants are generated from `world.h`, never redeclared in WGSL.**
+  `ShaderConstantPrelude()` (`gpu/resources.cpp`) emits `WORLD_N`, `CHUNK`,
+  `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of
+  `common.wgsl`. `world.h` is the single source of truth — adding a constant
+  means adding it there and to the prelude, not to `common.wgsl`.
 
 ## Conventions
 

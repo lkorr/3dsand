@@ -15,6 +15,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHADER_DIR="$ROOT/assets/shaders"
 COMMON="$SHADER_DIR/common.wgsl"
+WORLD_H="$ROOT/src/sim/world.h"
 
 # Locate the tint CLI. Built by the `tint_cmd_tint_cmd` target once
 # TINT_BUILD_CMD_TOOLS is ON; may land in a few places depending on generator.
@@ -47,11 +48,43 @@ EOF
 }
 
 [ -f "$COMMON" ] || { echo "check_shaders: missing $COMMON" >&2; exit 1; }
+[ -f "$WORLD_H" ] || { echo "check_shaders: missing $WORLD_H" >&2; exit 1; }
 
-# Number of lines common.wgsl contributes, plus the "\n" LoadShader inserts.
+# Reproduce ShaderConstantPrelude() (src/gpu/resources.cpp): the world constants
+# are generated from world.h, not declared in common.wgsl. Values are scraped
+# from world.h rather than duplicated here, so this script cannot drift from the
+# engine the way common.wgsl used to drift from world.h.
+cpp_const() {  # cpp_const <name> -> literal, minus any type suffix
+  sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \([0-9.]*\)f\?;.*/\1/p" "$WORLD_H" | head -1
+}
+W_N="$(cpp_const kWorldN)"
+W_CHUNK="$(cpp_const kChunk)"
+W_VOX="$(cpp_const kVoxelMeters)"
+if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ]; then
+  echo "check_shaders: cannot parse kWorldN/kChunk/kVoxelMeters from $WORLD_H" >&2
+  exit 1
+fi
+W_NCHUNK=$((W_N / W_CHUNK))
+
+W_SHIFT=0
+while [ $((1 << W_SHIFT)) -lt "$W_CHUNK" ]; do W_SHIFT=$((W_SHIFT + 1)); done
+PRELUDE_TEXT="$(printf '%s\n' \
+  "const WORLD_N : u32 = ${W_N}u;" \
+  "const CHUNK : u32 = ${W_CHUNK}u;" \
+  "const NCHUNK : u32 = ${W_NCHUNK}u;" \
+  "const NUM_CHUNKS : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const CHUNK_VOL : u32 = $((W_CHUNK * W_CHUNK * W_CHUNK))u;" \
+  "const CHUNK_SHIFT : u32 = ${W_SHIFT}u;" \
+  "const CHUNK_MASK : i32 = $((W_CHUNK - 1));" \
+  "const WORLD_MASK : i32 = $((W_N - 1));" \
+  "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
+  "const VOXEL_METERS : f32 = ${W_VOX};")"
+
+# Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".
 # Error line L in the combined source maps to line L - OFFSET in the body file.
 COMMON_LINES="$(wc -l < "$COMMON" | tr -d ' ')"
-OFFSET=$((COMMON_LINES + 1))
+PRELUDE_LINES="$(printf '%s\n' "$PRELUDE_TEXT" | wc -l | tr -d ' ')"
+OFFSET=$((PRELUDE_LINES + 1 + COMMON_LINES + 1))
 
 if [ "$#" -gt 0 ]; then
   FILES=("$@")
@@ -81,7 +114,7 @@ for f in "${FILES[@]}"; do
   [ -f "$f" ] || { echo "check_shaders: no such file: $f" >&2; failed=1; continue; }
 
   combined="$TMP/$name"
-  { cat "$COMMON"; printf '\n'; cat "$f"; } > "$combined"
+  { printf '%s\n\n' "$PRELUDE_TEXT"; cat "$COMMON"; printf '\n'; cat "$f"; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.
   # (`-f none` is advertised in --help but rejected by this build.) A missing
