@@ -15,7 +15,8 @@ struct PlayerInput {
 };
 
 // AABB character vs the one-tick-latent voxel mirror (DESIGN.md v0 note).
-// All units are voxels (1 voxel = 0.125 m).
+// All units are voxels; sizes below are stated in meters and converted via
+// kVoxelMeters so voxel size can be tuned in one place (world.h).
 class Player {
  public:
   using KindFn = std::function<CellKind(IVec3)>;
@@ -31,7 +32,7 @@ class Player {
   bool grounded = false;
   bool inLiquid = false;
 
-  static constexpr float kHalfXZ = 2.4f;      // 0.3 m
-  static constexpr float kHalfY = 6.8f;       // 1.7 m tall
-  static constexpr float kEyeOffset = 5.2f;   // eyes near the top
+  static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
+  static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall
+  static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // eyes near the top
 };

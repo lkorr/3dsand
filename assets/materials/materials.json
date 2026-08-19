@@ -1,33 +1,33 @@
 {
-  "comment": "v0 material set. Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). decayPerMille: chance per 30Hz tick for gases to vanish. colors: 3 palette variants picked by the voxel state nibble. tags are parsed and validated now, used by the reaction system at M3. Worldgen (worldgen.wgsl + world.cpp) assumes the first six IDs: stone=1 wood=2 sand=3 gravel=4 water=5 oil=6.",
+  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here — append new materials at the end, never reorder.",
   "materials": [
     {
       "id": "stone",
       "class": "solid",
       "density": 2600,
       "colors": ["#8a8a8f", "#7d7d84", "#94949a"],
-      "tags": ["mineral"]
+      "tags": ["mineral", "dissolvable"]
     },
     {
       "id": "wood",
       "class": "solid",
       "density": 600,
       "colors": ["#7a5230", "#6e4829", "#835a36"],
-      "tags": ["flammable", "organic"]
+      "tags": ["flammable", "organic", "dissolvable"]
     },
     {
       "id": "sand",
       "class": "powder",
       "density": 1600,
       "colors": ["#dcc178", "#d2b76e", "#e6cb84"],
-      "tags": ["mineral", "meltable"]
+      "tags": ["mineral", "meltable", "dissolvable", "soil"]
     },
     {
       "id": "gravel",
       "class": "powder",
       "density": 1800,
       "colors": ["#9b948c", "#8d8680", "#a8a198"],
-      "tags": ["mineral"]
+      "tags": ["mineral", "dissolvable"]
     },
     {
       "id": "water",
@@ -41,13 +41,12 @@
       "class": "liquid",
       "density": 900,
       "colors": ["#4a3b28", "#41341f", "#55442c"],
-      "tags": ["flammable"]
+      "tags": ["flammable", "dissolvable"]
     },
     {
       "id": "smoke",
       "class": "gas",
       "density": 2,
-      "decayPerMille": 4,
       "colors": ["#55555c", "#4b4b52", "#606066"],
       "tags": []
     },
@@ -55,9 +54,182 @@
       "id": "steam",
       "class": "gas",
       "density": 1,
-      "decayPerMille": 6,
       "colors": ["#c8cdd4", "#bfc5cc", "#d2d6dc"],
       "tags": ["wet"]
+    },
+    {
+      "id": "fire",
+      "class": "gas",
+      "density": 3,
+      "emission": 255,
+      "colors": ["#ff9a2a", "#ffc93c", "#ff6b1a"],
+      "tags": ["hot"]
+    },
+    {
+      "id": "ember",
+      "class": "solid",
+      "density": 550,
+      "emission": 190,
+      "colors": ["#e8542a", "#c23a18", "#ff7a30"],
+      "tags": ["hot"]
+    },
+    {
+      "id": "ash",
+      "class": "powder",
+      "density": 700,
+      "colors": ["#b5b0a8", "#a39e96", "#c4bfb6"],
+      "tags": ["dissolvable", "soil"]
+    },
+    {
+      "id": "lava",
+      "class": "liquid",
+      "density": 2800,
+      "moveEvery": 3,
+      "emission": 215,
+      "opaque": true,
+      "colors": ["#ff5a1a", "#e83c0e", "#ffa030"],
+      "tags": ["hot"]
+    },
+    {
+      "id": "acid",
+      "class": "liquid",
+      "density": 1200,
+      "emission": 45,
+      "colors": ["#7cf03a", "#68d82c", "#93ff4e"],
+      "tags": []
+    },
+    {
+      "id": "ice",
+      "class": "solid",
+      "density": 917,
+      "colors": ["#bfe4f5", "#aed9ee", "#d2effc"],
+      "tags": ["dissolvable"]
+    },
+    {
+      "id": "snow",
+      "class": "powder",
+      "density": 300,
+      "colors": ["#f2f6fa", "#e8eef5", "#fbfdff"],
+      "tags": ["dissolvable"]
+    },
+    {
+      "id": "dirt",
+      "class": "powder",
+      "density": 1500,
+      "colors": ["#6e5236", "#61482e", "#7b5d3e"],
+      "tags": ["mineral", "dissolvable", "soil"]
+    },
+    {
+      "id": "plant",
+      "class": "solid",
+      "density": 400,
+      "colors": ["#3f9b32", "#358a2a", "#4cae3c"],
+      "tags": ["flammable", "organic", "dissolvable"]
+    },
+    {
+      "id": "seed",
+      "class": "powder",
+      "density": 500,
+      "colors": ["#a8873f", "#977736", "#b99748"],
+      "tags": ["flammable", "organic", "dissolvable"]
+    },
+    {
+      "id": "sprout",
+      "class": "solid",
+      "density": 400,
+      "colors": ["#77c54a", "#68b53e", "#87d558"],
+      "tags": ["flammable", "organic", "dissolvable"]
+    },
+    {
+      "id": "stem",
+      "class": "solid",
+      "density": 450,
+      "colors": ["#4f8f2e", "#458127", "#5a9e37"],
+      "tags": ["flammable", "organic", "dissolvable"]
+    },
+    {
+      "id": "flower",
+      "class": "solid",
+      "density": 300,
+      "colors": ["#f272b6", "#f5f2e8", "#b06ee8"],
+      "tags": ["flammable", "organic", "dissolvable"]
+    },
+    {
+      "id": "vine",
+      "class": "solid",
+      "density": 350,
+      "colors": ["#2f7031", "#286228", "#387e3a"],
+      "tags": ["flammable", "organic", "dissolvable"]
+    },
+    {
+      "id": "fungus",
+      "class": "solid",
+      "density": 400,
+      "colors": ["#b48ac2", "#9f77ad", "#c99dd6"],
+      "tags": ["flammable", "dissolvable"]
+    },
+    {
+      "id": "dust",
+      "class": "powder",
+      "density": 400,
+      "colors": ["#cbb457", "#bda54c", "#d9c464"],
+      "tags": ["flammable", "dissolvable"]
+    },
+    {
+      "id": "molten_glass",
+      "class": "liquid",
+      "density": 2200,
+      "moveEvery": 2,
+      "emission": 230,
+      "opaque": true,
+      "colors": ["#ffb45e", "#ff9840", "#ffd084"],
+      "tags": ["hot"]
+    },
+    {
+      "id": "glass",
+      "class": "solid",
+      "density": 2400,
+      "colors": ["#c9e6e2", "#bcdcd9", "#d8f0ec"],
+      "tags": ["meltable"]
+    },
+    {
+      "id": "source_water",
+      "class": "solid",
+      "density": 3000,
+      "emission": 60,
+      "colors": ["#1c4bbf", "#173fa6", "#2258d6"],
+      "tags": []
+    },
+    {
+      "id": "source_sand",
+      "class": "solid",
+      "density": 3000,
+      "colors": ["#c7a545", "#b8973c", "#d6b450"],
+      "tags": []
+    },
+    {
+      "id": "source_lava",
+      "class": "solid",
+      "density": 3000,
+      "emission": 110,
+      "colors": ["#8f2408", "#7c1d05", "#a32d0c"],
+      "tags": []
+    },
+    {
+      "id": "void",
+      "class": "solid",
+      "density": 3000,
+      "emission": 18,
+      "colors": ["#241631", "#1c1026", "#2d1c3d"],
+      "tags": []
+    },
+    {
+      "id": "mite",
+      "class": "powder",
+      "density": 600,
+      "wanders": true,
+      "colors": ["#c98a8a", "#b87a7a", "#d99a96"],
+      "tags": ["dissolvable"]
     }
   ]
 }

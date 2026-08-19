@@ -9,9 +9,31 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(7) var<storage, read_write> occupancy : array<u32>;
 @group(0) @binding(8) var<storage, read_write> worldHash : array<atomic<u32>>;
+@group(0) @binding(12) var<storage, read_write> dirtyList : array<u32>;
 
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgHash  : atomic<u32>;
+
+// mainDirty: occupancy update over only the chunks written this tick
+// (indirect over the compacted dirtyOut list) — the per-tick sim cost stays
+// proportional to activity, not world size (DESIGN.md §11). No hash: the
+// whole-world hash needs every chunk, so hash ticks use the full pass below.
+@compute @workgroup_size(64)
+fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
+             @builtin(local_invocation_index) li : u32) {
+  if (li == 0u) { atomicStore(&wgCount, 0u); }
+  workgroupBarrier();
+
+  let base = dirtyList[wg.x] * CHUNK_VOL;
+  var count = 0u;
+  for (var i = li; i < CHUNK_VOL; i += 64u) {
+    if ((voxels[base + i] & 0xFFFu) != MAT_AIR) { count += 1u; }
+  }
+  atomicAdd(&wgCount, count);
+  workgroupBarrier();
+
+  if (li == 0u) { occupancy[dirtyList[wg.x]] = atomicLoad(&wgCount); }
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,

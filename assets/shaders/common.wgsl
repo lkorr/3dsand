@@ -4,6 +4,9 @@
 // dependence, or stateful RNG into anything that feeds voxel state.
 
 const WORLD_N   : u32 = 256u;   // voxels per axis (must match world.h)
+// Physical voxel edge length (must match kVoxelMeters in world.h). Render-only:
+// the sim never reads it — voxel state stays integer and scale-free.
+const VOXEL_METERS : f32 = 0.125;
 const CHUNK     : u32 = 16u;    // voxels per chunk axis
 const NCHUNK    : u32 = 16u;    // chunks per axis = WORLD_N / CHUNK
 const NUM_CHUNKS : u32 = 4096u; // NCHUNK^3
@@ -20,15 +23,54 @@ const CLASS_GAS    : u32 = 3u;
 // gases rise through it.
 const AIR_DENSITY : i32 = 10;
 
+// Liquids use the state nibble as fullness: code 0..7 = 1..8 eighths
+// (mass-conserving flow, DESIGN.md §4). Solids/powders/gases keep the state
+// nibble as a palette variant.
+const LIQ_FULL_STATE : u32 = 7u;
+
+// Material flags (bitfield).
+const MATF_WANDER : u32 = 1u;  // powder scuttles laterally / hops (critters)
+const MATF_OPAQUE : u32 = 2u;  // liquid renders as a surface hit (lava), not media
+
 struct Material {
-  klass         : u32,
-  density       : i32,
-  color0        : u32,   // RGBA8 palette variants
-  color1        : u32,
-  color2        : u32,
-  decayPerMille : u32,   // gases: chance/tick to vanish
-  flags         : u32,
-  _pad          : u32,
+  klass       : u32,
+  density     : i32,
+  color0      : u32,   // RGBA8 palette variants
+  color1      : u32,
+  color2      : u32,
+  emission    : u32,   // 0..255 glow strength (render + media)
+  flags       : u32,   // MATF_*
+  tagMask     : u32,   // bit per tag (registry built at load from JSON)
+  reactOffset : u32,   // bucket into the reactions[] array
+  reactCount  : u32,
+  moveEvery   : u32,   // viscosity: only move on ticks where tick % moveEvery == 0
+  opacity     : u32,   // 0..255 media absorbance (translucent liquids/gases)
+  _p1 : u32, _p2 : u32, _p3 : u32, _p4 : u32,
+};
+
+// Reaction kinds (bits 0..1 of packed) — DESIGN.md §6, authored in
+// assets/materials/reactions.json and compiled per-material at load.
+const RK_PAIR  : u32 = 0u;  // self + matching neighbor -> products
+const RK_DECAY : u32 = 1u;  // self -> product after probabilistic time
+const RK_EMIT  : u32 = 2u;  // self emits product into an adjacent air cell
+// Direction mask (bits 2..4 of packed).
+const RDIR_DOWN : u32 = 1u;
+const RDIR_UP   : u32 = 2u;
+const RDIR_SIDE : u32 = 4u;
+// Product sentinel: "keep current material".
+const PROD_KEEP : u32 = 0xFFFFu;
+// nbrMat sentinel: "no exact-id match" (match by tags / class / any instead).
+const NBR_ANY : u32 = 0xFFFFu;
+
+struct Reaction {
+  packed   : u32,  // bits 0..1 kind, bits 2..4 dir mask
+  nbrMat   : u32,  // exact neighbor material id, or NBR_ANY
+  nbrTags  : u32,  // neighbor matches if (tagMask & nbrTags) != 0 (when nonzero)
+  nbrClass : u32,  // bit-per-class filter (1<<klass); 0 = any class
+  chance   : u32,  // per-mille per 30 Hz tick
+  prodSelf : u32,  // what self becomes (PROD_KEEP = unchanged, 0 = air)
+  prodNbr  : u32,  // pair: neighbor product; emit: emitted material
+  _pad     : u32,
 };
 
 struct TickParams {

@@ -5,10 +5,10 @@
 #include "gpu/resources.h"
 
 static constexpr uint32_t kPassStride = 256;  // min uniform dynamic-offset alignment
-static constexpr uint32_t kStepGroups = 22;   // ceil(ceil(256/3)/4)
 
 bool Simulation::Init(const wgpu::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
+                      const std::vector<ReactionGpu>& reactions,
                       const std::string& shaderDir) {
   world_ = &world;
   device_ = device;
@@ -18,7 +18,10 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
   materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
                               wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
                               "materials");
-  UploadMaterials(queue, mats);
+  reactionBuf_ = CreateBuffer(device, sizeof(ReactionGpu) * kMaxReactions,
+                              wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                              "reactions");
+  UploadTables(queue, mats, reactions);
 
   // 27 color-phase slices x 2 gravity substeps (54 total)
   {
@@ -58,6 +61,9 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(8, T::Storage),          // world hash
         entry(9, T::Storage),          // pick
         entry(10, T::Uniform),         // RenderParams (pick ray)
+        entry(11, T::ReadOnlyStorage), // reactions
+        entry(12, T::Storage),         // dirtyList (compact writes, step reads)
+        entry(13, T::Storage),         // dispatch args (compact writes)
     };
     wgpu::BindGroupLayoutDescriptor d{};
     d.entryCount = std::size(entries);
@@ -114,6 +120,9 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(8, world_->hash),
         b(9, world_->pick),
         b(10, world_->renderUBO),
+        b(11, reactionBuf_),
+        b(12, world_->dirtyList),
+        b(13, world_->argsStage),
     };
     wgpu::BindGroupDescriptor d{};
     d.layout = simBGL_;
@@ -150,30 +159,40 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
   return true;
 }
 
-void Simulation::UploadMaterials(const wgpu::Queue& queue,
-                                 const std::vector<MaterialDef>& mats) {
+void Simulation::UploadTables(const wgpu::Queue& queue,
+                              const std::vector<MaterialDef>& mats,
+                              const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
   for (size_t i = 0; i < mats.size() && i < 4096; i++) table[i] = mats[i].gpu;
   queue.WriteBuffer(materialBuf_, 0, table.data(), table.size() * sizeof(MaterialGpu));
+
+  std::vector<ReactionGpu> rtable(kMaxReactions, ReactionGpu{});
+  for (size_t i = 0; i < reactions.size() && i < kMaxReactions; i++)
+    rtable[i] = reactions[i];
+  queue.WriteBuffer(reactionBuf_, 0, rtable.data(), rtable.size() * sizeof(ReactionGpu));
 }
 
 bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   auto mod = [&](const char* name) { return LoadShader(device, shaderDir_, name); };
   wgpu::ShaderModule mWorldgen = mod("worldgen.wgsl");
   wgpu::ShaderModule mMutate = mod("sim_mutate.wgsl");
+  wgpu::ShaderModule mCompact = mod("sim_compact.wgsl");
   wgpu::ShaderModule mStep = mod("sim_step.wgsl");
   wgpu::ShaderModule mOcc = mod("sim_occupancy.wgsl");
   wgpu::ShaderModule mPick = mod("sim_pick.wgsl");
   wgpu::ShaderModule mRay = mod("raymarch.wgsl");
-  if (!mWorldgen || !mMutate || !mStep || !mOcc || !mPick || !mRay) {
+  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick || !mRay) {
     if (err) *err = "shader file read failure";
     return false;
   }
 
   worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
+  compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact");
+  compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext");
   step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step");
   occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy");
+  occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty");
   pick_ = MakeComputePipeline(device, simPL_, mPick, "main", "pick");
 
   raymarchModule_ = mRay;
@@ -216,30 +235,76 @@ void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
 void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable) {
   enc.ClearBuffer(world_->dirty[1 - page_], 0, wgpu::kWholeSize);
+  enc.ClearBuffer(world_->argsStage, 0, wgpu::kWholeSize);
   if (hashEnable) enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
 
-  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
   uint32_t off = 0;
-  pass.SetBindGroup(0, simBG_[page_], 1, &off);
 
-  if (opsCount > 0) {
-    pass.SetPipeline(mutate_);
-    pass.DispatchWorkgroups(4 * opsCount, 4, 4);
+  // Prep pass: mutate + compact (compact writes argsStage + dirtyList).
+  {
+    wgpu::ComputePassEncoder prep = enc.BeginComputePass();
+    prep.SetBindGroup(0, simBG_[page_], 1, &off);
+    if (opsCount > 0) {
+      prep.SetPipeline(mutate_);
+      prep.DispatchWorkgroups(4 * opsCount, 4, 4);
+    }
+    // compact dirtyIn -> dense chunk list + indirect args (after mutate so
+    // freshly painted chunks simulate this tick)
+    prep.SetPipeline(compact_);
+    prep.DispatchWorkgroups(kNumChunks / 64, 1, 1);
+    prep.End();
   }
 
-  pass.SetPipeline(step_);
-  for (uint32_t k = 0; k < 54; k++) {  // 27 colors x 2 gravity substeps
-    uint32_t offset = k * kPassStride;
-    pass.SetBindGroup(0, simBG_[page_], 1, &offset);
-    pass.DispatchWorkgroups(kStepGroups, kStepGroups, kStepGroups);
+  // Feed the indirect-only args buffer (never bound in any bind group; Dawn
+  // forbids indirect + bound-writable usage of one buffer in the same pass).
+  enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
+
+  {
+    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+    pass.SetBindGroup(0, simBG_[page_], 1, &off);
+
+    // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
+    // world dispatches zero workgroups here (DESIGN.md §11).
+    pass.SetPipeline(step_);
+    for (uint32_t k = 0; k < 54; k++) {
+      uint32_t offset = k * kPassStride;
+      pass.SetBindGroup(0, simBG_[page_], 1, &offset);
+      pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
+    }
+    pass.End();
   }
 
-  pass.SetBindGroup(0, simBG_[page_], 1, &off);
-  pass.SetPipeline(occupancy_);
-  pass.DispatchWorkgroups(kNumChunks, 1, 1);
-  pass.SetPipeline(pick_);
-  pass.DispatchWorkgroups(1, 1, 1);
-  pass.End();
+  if (hashEnable) {
+    // hash ticks need the whole-world scan anyway; it also refreshes occupancy
+    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+    pass.SetBindGroup(0, simBG_[page_], 1, &off);
+    pass.SetPipeline(occupancy_);
+    pass.DispatchWorkgroups(kNumChunks, 1, 1);
+    pass.SetPipeline(pick_);
+    pass.DispatchWorkgroups(1, 1, 1);
+    pass.End();
+  } else {
+    // occupancy update over only the chunks written this tick: compact the
+    // dirtyOut flags (superset of every voxel write) and dispatch indirect
+    enc.ClearBuffer(world_->argsStage, 0, wgpu::kWholeSize);
+    {
+      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      pass.SetBindGroup(0, simBG_[page_], 1, &off);
+      pass.SetPipeline(compactNext_);
+      pass.DispatchWorkgroups(kNumChunks / 64, 1, 1);
+      pass.End();
+    }
+    enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
+    {
+      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      pass.SetBindGroup(0, simBG_[page_], 1, &off);
+      pass.SetPipeline(occupancyDirty_);
+      pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
+      pass.SetPipeline(pick_);
+      pass.DispatchWorkgroups(1, 1, 1);
+      pass.End();
+    }
+  }
 }
 
 wgpu::RenderPassEncoder Simulation::BeginRenderPass(const wgpu::CommandEncoder& enc,

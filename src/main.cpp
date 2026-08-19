@@ -150,6 +150,17 @@ std::vector<BrushOp> SelftestOps(uint32_t tick) {
   if (tick >= 30 && tick < 90) {
     ops.push_back({64, 60, 72, 4, kMatSmoke, 0, 0, 0});
   }
+  // reaction-system coverage: lava boiling the pool, fire on the wood
+  // platform, seeds germinating — all feed the determinism hash check
+  if (tick >= 40 && tick < 100) {
+    ops.push_back({176, 120, 150, 4, kMatLava, 0, 0, 0});
+  }
+  if (tick >= 60 && tick < 120) {
+    ops.push_back({110, 80, 110, 3, kMatFire, 0, 0, 0});
+  }
+  if (tick >= 10 && tick < 16) {
+    ops.push_back({150, 90, 128, 2, kMatSeed, 0, 0, 0});
+  }
   return ops;
 }
 
@@ -181,6 +192,88 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       }
     }
   }
+
+  // sleep: a settled world must go (nearly) fully idle — the M2 exit
+  // criterion, and the guard against reaction rules that never stop matching
+  uint32_t sleepActive = 0;
+  {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t t = 0;
+    for (int i = 0; i < 500; i++)  // seeds sprout+harden, pools settle
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, false, {8, 3, 8}, false);
+    ctx.WaitIdle();
+    double s0 = NowSec();  // settled-world cost: the whole point of dirty dispatch
+    for (int i = 0; i < 100; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, false, {8, 3, 8}, false);
+    ctx.WaitIdle();
+    std::printf("sim settled: %.3f ms/tick\n", (NowSec() - s0) * 1000.0 / 100.0);
+
+    wgpu::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
+                                        wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                        "dirtyRead");
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumChunks * 4);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+    std::vector<uint32_t> awake;
+    wgpu::Future f = staging.MapAsync(
+        wgpu::MapMode::Read, 0, kNumChunks * 4, wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          if (status == wgpu::MapAsyncStatus::Success) {
+            const uint32_t* d =
+                (const uint32_t*)staging.GetConstMappedRange(0, kNumChunks * 4);
+            for (uint32_t i = 0; i < kNumChunks; i++) {
+              if (d[i] != 0) {
+                sleepActive++;
+                awake.push_back(i);
+              }
+            }
+            staging.Unmap();
+          }
+        });
+    ctx.instance.WaitAny(f, UINT64_MAX);
+
+    // diagnosis on failure: where are the awake chunks, and what's in them?
+    if (sleepActive >= 32 && !awake.empty()) {
+      for (size_t i = 0; i < awake.size() && i < 12; i++) {
+        uint32_t ci = awake[i];
+        std::printf("  awake chunk (%u,%u,%u)", ci % kNChunk, (ci / kNChunk) % kNChunk,
+                    ci / (kNChunk * kNChunk));
+        if (i % 4 == 3) std::printf("\n");
+      }
+      std::printf("\n");
+      // material histogram of the first awake chunks
+      wgpu::Buffer vstage = CreateBuffer(ctx.device, kChunkVol * 4 * 4,
+                                         wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                         "voxRead");
+      wgpu::CommandEncoder e2 = ctx.device.CreateCommandEncoder();
+      for (int k = 0; k < 4 && k < (int)awake.size(); k++)
+        e2.CopyBufferToBuffer(world.voxels, (uint64_t)awake[k] * kChunkVol * 4, vstage,
+                              (uint64_t)k * kChunkVol * 4, kChunkVol * 4);
+      wgpu::CommandBuffer c2 = e2.Finish();
+      ctx.queue.Submit(1, &c2);
+      uint32_t hist[64] = {};
+      wgpu::Future f2 = vstage.MapAsync(
+          wgpu::MapMode::Read, 0, kChunkVol * 4 * 4, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            if (status == wgpu::MapAsyncStatus::Success) {
+              const uint32_t* v =
+                  (const uint32_t*)vstage.GetConstMappedRange(0, kChunkVol * 4 * 4);
+              for (uint32_t i = 0; i < kChunkVol * 4; i++) hist[std::min(v[i] & 0xFFFu, 63u)]++;
+              vstage.Unmap();
+            }
+          });
+      ctx.instance.WaitAny(f2, UINT64_MAX);
+      std::printf("  first-4-chunk contents:");
+      for (uint32_t m = 1; m < 64; m++)
+        if (hist[m]) std::printf(" %s=%u", m < mats.size() ? mats[m].name.c_str() : "?", hist[m]);
+      std::printf("\n");
+    }
+  }
+  bool sleepOk = sleepActive < 32;
+  std::printf("sleep: %s (%u / 4096 chunks active after 600 settle ticks)\n",
+              sleepOk ? "PASS" : "FAIL", sleepActive);
 
   // sim perf: worst-case-ish activity, synchronous timing
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -293,7 +386,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk;
+  bool pass = deterministic && walkOk && sleepOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
@@ -311,17 +404,25 @@ struct KeyEdge {
 
 int main(int argc, char** argv) {
   bool selftest = false;
-  for (int i = 1; i < argc; i++)
-    if (std::string(argv[i]) == "--selftest") selftest = true;
+  bool lowPowerAdapter = false;
+  for (int i = 1; i < argc; i++) {
+    std::string a = argv[i];
+    if (a == "--selftest") selftest = true;
+    // `--adapter low` picks the LowPower adapter (iGPU) so the selftest hash
+    // can be compared across GPU vendors (DESIGN.md §14 risk 3).
+    if (a == "--adapter" && i + 1 < argc) lowPowerAdapter = std::string(argv[++i]) == "low";
+  }
 
   std::string assetDir = AssetDir();
   std::vector<MaterialDef> mats;
+  std::vector<ReactionGpu> reactions;
   std::string errors;
-  if (!LoadMaterials(assetDir + "/materials/materials.json", mats, errors)) {
-    std::fprintf(stderr, "material load failed:\n%s\n", errors.c_str());
+  if (!LoadAssets(assetDir + "/materials/materials.json",
+                  assetDir + "/materials/reactions.json", mats, reactions, errors)) {
+    std::fprintf(stderr, "asset load failed:\n%s\n", errors.c_str());
     return 1;
   }
-  std::printf("loaded %zu materials\n", mats.size());
+  std::printf("loaded %zu materials, %zu reactions\n", mats.size(), reactions.size());
 
   GLFWwindow* window = nullptr;
   if (!selftest) {
@@ -332,12 +433,12 @@ int main(int argc, char** argv) {
   }
 
   GpuContext ctx;
-  if (!ctx.Init(window, 1600, 900)) return 1;
+  if (!ctx.Init(window, 1600, 900, lowPowerAdapter)) return 1;
 
   World world;
   world.Init(ctx.device);
   Simulation sim;
-  if (!sim.Init(ctx.device, world, mats, assetDir + "/shaders")) return 1;
+  if (!sim.Init(ctx.device, world, mats, reactions, assetDir + "/shaders")) return 1;
 
   if (selftest) return RunSelftest(ctx, world, sim, mats);
 
@@ -345,7 +446,10 @@ int main(int argc, char** argv) {
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
 
   UIState ui;
-  for (auto& m : mats) ui.materialNames.push_back(m.name);
+  for (auto& m : mats) {
+    ui.materialNames.push_back(m.name);
+    ui.materialColors.push_back(m.gpu.color0);
+  }
 
   // material class LUT for the player's mirror queries
   std::vector<uint32_t> classOf;
@@ -426,16 +530,25 @@ int main(int argc, char** argv) {
     if (ui.reloadMaterials) {
       ui.reloadMaterials = false;
       std::vector<MaterialDef> newMats;
-      if (LoadMaterials(assetDir + "/materials/materials.json", newMats, errors)) {
+      std::vector<ReactionGpu> newReactions;
+      if (LoadAssets(assetDir + "/materials/materials.json",
+                     assetDir + "/materials/reactions.json", newMats, newReactions,
+                     errors)) {
         mats = std::move(newMats);
-        sim.UploadMaterials(ctx.queue, mats);
+        reactions = std::move(newReactions);
+        sim.UploadTables(ctx.queue, mats, reactions);
         classOf.clear();
         for (auto& m : mats) classOf.push_back(m.gpu.klass);
         ui.materialNames.clear();
-        for (auto& m : mats) ui.materialNames.push_back(m.name);
-        std::printf("materials reloaded (%zu)\n", mats.size());
+        ui.materialColors.clear();
+        for (auto& m : mats) {
+          ui.materialNames.push_back(m.name);
+          ui.materialColors.push_back(m.gpu.color0);
+        }
+        std::printf("materials reloaded (%zu, %zu reactions)\n", mats.size(),
+                    reactions.size());
       } else {
-        std::fprintf(stderr, "material reload failed:\n%s\n", errors.c_str());
+        std::fprintf(stderr, "asset reload failed:\n%s\n", errors.c_str());
       }
     }
     if (ui.regenWorld) {

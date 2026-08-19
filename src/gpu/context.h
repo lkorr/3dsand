@@ -10,7 +10,11 @@ struct GLFWwindow;
 // the Emscripten browser build targets later.
 class GpuContext {
  public:
-  bool Init(GLFWwindow* window, uint32_t width, uint32_t height);
+  // lowPowerAdapter selects the LowPower adapter (typically the iGPU) — used
+  // by `--adapter low` to verify cross-vendor bit-determinism (DESIGN.md §14
+  // risk 3: same seed + same ops must produce the same world hash everywhere).
+  bool Init(GLFWwindow* window, uint32_t width, uint32_t height,
+            bool lowPowerAdapter = false);
   void Resize(uint32_t width, uint32_t height);
 
   // Returns an invalid TextureView if the surface is temporarily unusable.

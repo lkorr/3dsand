@@ -9,16 +9,29 @@
 
 // World constants — must match common.wgsl.
 constexpr uint32_t kWorldN = 256;
+
+// Physical edge length of one voxel. The engine runs entirely in voxel units;
+// this is the single meters<->voxels conversion, and every physical constant
+// (player size, speeds, gravity, fog/media densities) derives from it. To
+// change voxel size, edit this and VOXEL_METERS in common.wgsl (must match).
+// Note: at the same kWorldN, smaller voxels shrink the world's physical size.
+constexpr float kVoxelMeters = 0.125f;
 constexpr uint32_t kChunk = 16;
 constexpr uint32_t kNChunk = kWorldN / kChunk;          // 16
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 4096
 constexpr uint32_t kChunkVol = kChunk * kChunk * kChunk;      // 4096
 constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
 
-// Worldgen material IDs (fixed by materials.json order).
+// Material IDs (fixed by materials.json order — append there, never reorder).
 constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatGravel = 4, kMatWater = 5, kMatOil = 6, kMatSmoke = 7,
-                   kMatSteam = 8;
+                   kMatSteam = 8, kMatFire = 9, kMatEmber = 10, kMatAsh = 11,
+                   kMatLava = 12, kMatAcid = 13, kMatIce = 14, kMatSnow = 15,
+                   kMatDirt = 16, kMatPlant = 17, kMatSeed = 18, kMatSprout = 19,
+                   kMatStem = 20, kMatFlower = 21, kMatVine = 22, kMatFungus = 23,
+                   kMatDust = 24, kMatMoltenGlass = 25, kMatGlass = 26,
+                   kMatSourceWater = 27, kMatSourceSand = 28, kMatSourceLava = 29,
+                   kMatVoid = 30, kMatMite = 31;
 
 // Must match BrushOp in common.wgsl (32 bytes).
 struct BrushOp {
@@ -93,6 +106,11 @@ class World {
 
   wgpu::Buffer voxels;      // kVoxelCount u32, chunk-major
   wgpu::Buffer dirty[2];    // kNumChunks u32
+  wgpu::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
+  wgpu::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)
+  wgpu::Buffer dispatchArgs;// 3 u32 — indirect-only copy of argsStage; kept out of all
+                            // bind groups (Dawn forbids indirect + bound-writable usage
+                            // of one buffer in the same pass, even if statically unused)
   wgpu::Buffer occupancy;   // kNumChunks u32
   wgpu::Buffer hash;        // 4 u32 (only [0] used)
   wgpu::Buffer tickUBO;     // TickParams

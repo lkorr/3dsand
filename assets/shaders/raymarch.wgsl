@@ -66,9 +66,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.mediaMat = 0u;
 
   var rd = rdIn;
-  if (abs(rd.x) < 1e-6) { rd.x = 1e-6; }
-  if (abs(rd.y) < 1e-6) { rd.y = 1e-6; }
-  if (abs(rd.z) < 1e-6) { rd.z = 1e-6; }
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
   let inv = 1.0 / rd;
 
   // clip to world AABB
@@ -116,11 +116,26 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       let e0 = (lo - ro) * inv;
       let e1 = (hi - ro) * inv;
       let ex = max(e0, e1);
-      let tOut = min(ex.x, min(ex.y, ex.z));
+      // The jump target must never sit behind the ray: a cell floor()ed onto a
+      // shared face belongs to a chunk the ray is already exiting, so the raw
+      // exit t can be <= tCur and the march would stall in place.
+      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
       t = tOut + 1e-4;
       if (t >= tExit) { break; }
       p = ro + rd * t;
-      cell = clamp(vec3<i32>(floor(p)), vec3<i32>(0), vec3<i32>(i32(WORLD_N) - 1));
+      var nc = vec3<i32>(floor(p));
+      // Force the crossing on the exit axis: float noise at a shared face can
+      // floor() back into the chunk just exited, which reads as a see-through
+      // seam along chunk boundaries.
+      if (ex.x <= ex.y && ex.x <= ex.z) {
+        nc.x = select(ch.x * i32(CHUNK) - 1, (ch.x + 1) * i32(CHUNK), rd.x > 0.0);
+      } else if (ex.y <= ex.z) {
+        nc.y = select(ch.y * i32(CHUNK) - 1, (ch.y + 1) * i32(CHUNK), rd.y > 0.0);
+      } else {
+        nc.z = select(ch.z * i32(CHUNK) - 1, (ch.z + 1) * i32(CHUNK), rd.z > 0.0);
+      }
+      if (!inBounds(nc)) { break; }
+      cell = nc;
       for (var a = 0; a < 3; a++) {
         let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
         tMax[a] = (boundary - ro[a]) * inv[a];
@@ -133,7 +148,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     let mat = voxMat(w);
     if (mat != MAT_AIR) {
       let k = materials[mat].klass;
-      if (k == CLASS_LIQUID || k == CLASS_GAS) {
+      // gases and translucent liquids are participating media; OPAQUE liquids
+      // (lava, molten glass) read as surfaces
+      if (k == CLASS_GAS ||
+          (k == CLASS_LIQUID && (materials[mat].flags & MATF_OPAQUE) == 0u)) {
         if (wantMedia) {
           if (mediaStart < 0.0) { mediaStart = tCur; }
           if (out.mediaMat == 0u) { out.mediaMat = mat; }
@@ -183,7 +201,12 @@ fn fs(in : VSOut) -> @location(0) vec4f {
   } else {
     let mat = voxMat(h.word);
     let m = materials[mat];
-    let albedo = paletteColor(m, voxState(h.word));
+    var albedo = paletteColor(m, voxState(h.word));
+    if (m.klass == CLASS_LIQUID) {
+      // liquid state nibble is fullness, not a palette variant: fuller = deeper
+      let fullness = f32(voxState(h.word) + 1u) / 8.0;
+      albedo = mix(unpackColor(m.color2), unpackColor(m.color0), fullness);
+    }
 
     var n = vec3f(0.0);
     n[h.axis] = -h.sgn;
@@ -201,8 +224,17 @@ fn fs(in : VSOut) -> @location(0) vec4f {
     }
     color = albedo * face * (0.38 + 0.72 * lambert * vec3f(1.0, 0.96, 0.88));
 
-    // distance fog
-    let fog = 1.0 - exp(-h.t * 0.0016);
+    // emissive materials glow through shadow, with a slow per-cell flicker
+    // (render-only floats: the sim never sees any of this)
+    let emis = f32(m.emission) / 255.0;
+    if (emis > 0.0) {
+      let ch = pcg(u32(h.cell.x * 7 + h.cell.y * 131 + h.cell.z * 2917));
+      let flick = 0.82 + 0.28 * sin(R.time * 9.0 + f32(ch & 0xFFu) * 0.0245);
+      color += albedo * emis * 1.7 * flick;
+    }
+
+    // distance fog (density per meter, so the look survives voxel-size changes)
+    let fog = 1.0 - exp(-h.t * VOXEL_METERS * 0.0128);
     color = mix(color, skyColor(rd) * 0.9, fog);
   }
 
@@ -210,9 +242,16 @@ fn fs(in : VSOut) -> @location(0) vec4f {
   if (h.mediaLen > 0.0 && h.mediaMat != 0u) {
     let mm = materials[h.mediaMat];
     let mc = (unpackColor(mm.color0) + unpackColor(mm.color1)) * 0.5;
-    let dens = select(0.10, 0.035, mm.klass == CLASS_GAS);
+    let memis = f32(mm.emission) / 255.0;
+    var dens = select(0.8, 0.28, mm.klass == CLASS_GAS) * VOXEL_METERS;
+    if (memis > 0.0) { dens = 1.0 * VOXEL_METERS; }  // fire reads as a dense volume
     let a = 1.0 - exp(-h.mediaLen * dens);
     color = mix(color, mc, a);
+    // emissive media (fire) glows additively — the flame is a light source
+    if (memis > 0.0) {
+      let mflick = 0.85 + 0.25 * sin(R.time * 11.0);
+      color += mc * memis * a * 1.6 * mflick;
+    }
   }
 
   // gamma-ish

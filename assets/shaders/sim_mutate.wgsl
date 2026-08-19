@@ -9,6 +9,7 @@
 @group(0) @binding(0) var<storage, read_write> voxels   : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dirtyIn  : array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(6) var<storage, read> ops : array<BrushOp>;
 
@@ -53,7 +54,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (op.mode == 0u && voxMat(voxels[idx]) != MAT_AIR) { return; }  // paint fills air only
 
   let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, idx);
-  // stamp 0xFF = "hasn't acted": painted voxels start falling this tick
-  voxels[idx] = packVox(op.material, rnd % 3u, 0xFFu);
+  // liquids are born full (their state nibble is fullness); everything else
+  // gets a palette variant. stamp 0xFF = "hasn't acted": falls this tick.
+  var state = rnd % 3u;
+  if (op.material != MAT_AIR && materials[op.material].klass == CLASS_LIQUID) {
+    state = LIQ_FULL_STATE;
+  }
+  voxels[idx] = packVox(op.material, state, 0xFFu);
   markBoth(c);
 }

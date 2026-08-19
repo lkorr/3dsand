@@ -57,11 +57,22 @@ void Overlay::Draw(UIState& s) {
   ImGui::Checkbox("fly (V)", &s.fly);
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
 
+  auto swatch = [&](int i) {
+    if (i >= (int)s.materialColors.size()) return;
+    uint32_t c = s.materialColors[i];  // 0xAABBGGRR
+    ImVec4 col(((c) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+               ((c >> 16) & 0xFF) / 255.0f, 1.0f);
+    ImGui::ColorButton(("##sw" + std::to_string(i)).c_str(), col,
+                       ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker,
+                       ImVec2(14, 14));
+    ImGui::SameLine();
+  };
   if (ImGui::BeginCombo("material",
                         s.brushMaterial < (int)s.materialNames.size()
                             ? s.materialNames[s.brushMaterial].c_str()
                             : "?")) {
     for (int i = 1; i < (int)s.materialNames.size(); i++) {
+      swatch(i);
       if (ImGui::Selectable(s.materialNames[i].c_str(), i == s.brushMaterial))
         s.brushMaterial = i;
     }

@@ -17,6 +17,9 @@ const M_SAND  : u32 = 3u;
 const M_GRAVEL: u32 = 4u;
 const M_WATER : u32 = 5u;
 const M_OIL   : u32 = 6u;
+const M_LAVA  : u32 = 12u;
+const M_SNOW  : u32 = 15u;
+const M_SEED  : u32 = 18u;
 
 fn vnoise(x : i32, z : i32, cs : i32, seed : u32) -> i32 {
   let gx = x / cs;
@@ -69,11 +72,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     h = max(h, 54);
   }
 
-  let inPoolFloor = pd2 < 34 * 34 || od2 < 16 * 16;
+  // Lava pool at (48,192) — stone-rimmed, feeds the melt/burn reaction chains
+  let ldx = x - 48; let ldz = z - 192;
+  let ld2 = ldx * ldx + ldz * ldz;
+  if (ld2 < 12 * 12) {
+    h = 42;
+    fluid = M_LAVA; fluidTop = 50;
+  } else if (ld2 < 17 * 17) {
+    h = max(h, 52);
+  }
+
+  let inPoolFloor = pd2 < 34 * 34 || od2 < 16 * 16 || ld2 < 12 * 12;
+  let inRim = pd2 < 40 * 40 || od2 < 21 * 21 || ld2 < 17 * 17;
 
   if (y <= h) {
     if (y < 3) {
       mat = M_STONE;                       // bedrock floor
+    } else if (!inPoolFloor && h >= 80 && y > h - 2) {
+      mat = M_SNOW;                        // snow caps on the high hills
     } else if (!inPoolFloor && y > h - 4) {
       mat = M_SAND;                        // loose cap — avalanches into repose piles
     } else {
@@ -81,6 +97,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
   } else if (fluidTop >= 0 && y <= fluidTop) {
     mat = fluid;
+  }
+
+  // Sparse seeds on open sandy ground: they fall one cell, germinate, and the
+  // world greens itself over the first minutes. Kept away from pools/rims,
+  // snowfields, and the spawn/selftest walk site at (140,140).
+  let sdx = x - 140; let sdz = z - 140;
+  if (y == h + 1 && !inRim && h < 80 && sdx * sdx + sdz * sdz > 12 * 12 &&
+      hash3(T.seed ^ 0xBEEFu, u32(x), u32(z)) % 1000u < 4u) {
+    mat = M_SEED;
   }
 
   // Wood platform on pillars near spawn
@@ -96,7 +121,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     return;
   }
   let rnd = hash3(T.seed ^ 0xC0FFEEu, gid.x ^ (gid.z << 12u), gid.y);
-  voxels[idx] = packVox(mat, rnd % 3u, 0xFFu);
+  // liquids are born full (state nibble = fullness); solids get palette jitter
+  var state = rnd % 3u;
+  if (mat == M_WATER || mat == M_OIL || mat == M_LAVA) { state = LIQ_FULL_STATE; }
+  voxels[idx] = packVox(mat, state, 0xFFu);
 
   let ci = chunkIndexOf(gid);
   atomicStore(&dirtyIn[ci], 1u);

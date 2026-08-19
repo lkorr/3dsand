@@ -13,13 +13,15 @@
 class Simulation {
  public:
   bool Init(const wgpu::Device& device, World& world,
-            const std::vector<MaterialDef>& mats, const std::string& shaderDir);
+            const std::vector<MaterialDef>& mats,
+            const std::vector<ReactionGpu>& reactions, const std::string& shaderDir);
 
   // Recompile all WGSL from disk; returns false (keeping old pipelines) on
   // compile error.
   bool ReloadShaders(const wgpu::Device& device, const wgpu::Instance& instance);
-  // Re-upload the material table (JSON hot reload).
-  void UploadMaterials(const wgpu::Queue& queue, const std::vector<MaterialDef>& mats);
+  // Re-upload the material + reaction tables (JSON hot reload).
+  void UploadTables(const wgpu::Queue& queue, const std::vector<MaterialDef>& mats,
+                    const std::vector<ReactionGpu>& reactions);
 
   void EncodeWorldgen(const wgpu::CommandEncoder& enc);
 
@@ -35,6 +37,9 @@ class Simulation {
 
   // Which dirty buffer the tick just encoded writes as "active next tick".
   const wgpu::Buffer& DirtyNext() const { return world_->dirty[1 - page_]; }
+  // The dirty buffer the NEXT tick will read (valid after FlipPage) — used by
+  // the selftest to count active chunks in a settled world.
+  const wgpu::Buffer& DirtyActive() const { return world_->dirty[page_]; }
   // Call once after each EncodeTick has been submitted.
   void FlipPage();
 
@@ -45,10 +50,12 @@ class Simulation {
   wgpu::Device device_;
   std::string shaderDir_;
   wgpu::Buffer materialBuf_;
+  wgpu::Buffer reactionBuf_;
 
   wgpu::BindGroupLayout simBGL_, renderBGL_;
   wgpu::PipelineLayout simPL_, renderPL_;
-  wgpu::ComputePipeline worldgen_, mutate_, step_, occupancy_, pick_;
+  wgpu::ComputePipeline worldgen_, mutate_, compact_, compactNext_, step_,
+      occupancy_, occupancyDirty_, pick_;
   wgpu::RenderPipeline raymarch_;
   wgpu::ShaderModule raymarchModule_;
   wgpu::TextureFormat raymarchFormat_ = wgpu::TextureFormat::Undefined;

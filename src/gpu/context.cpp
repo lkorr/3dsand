@@ -11,7 +11,8 @@ static void PrintDeviceError(const wgpu::Device&, wgpu::ErrorType type,
                message.data);
 }
 
-bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h) {
+bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
+                      bool lowPowerAdapter) {
   width = w;
   height = h;
 
@@ -35,7 +36,8 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h) {
 
   wgpu::RequestAdapterOptions opts{};
   opts.compatibleSurface = surface;  // null is fine for headless selftest
-  opts.powerPreference = wgpu::PowerPreference::HighPerformance;
+  opts.powerPreference = lowPowerAdapter ? wgpu::PowerPreference::LowPower
+                                         : wgpu::PowerPreference::HighPerformance;
   wgpu::Future af = instance.RequestAdapter(
       &opts, wgpu::CallbackMode::WaitAnyOnly,
       [this](wgpu::RequestAdapterStatus status, wgpu::Adapter a,
@@ -65,7 +67,7 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h) {
       clampTo(512ull * 1024 * 1024, supported.maxStorageBufferBindingSize);
   required.maxBufferSize = clampTo(512ull * 1024 * 1024, supported.maxBufferSize);
   required.maxStorageBuffersPerShaderStage =
-      clampTo(10, supported.maxStorageBuffersPerShaderStage);
+      clampTo(16, supported.maxStorageBuffersPerShaderStage);
   required.maxComputeInvocationsPerWorkgroup =
       clampTo(256, supported.maxComputeInvocationsPerWorkgroup);
 

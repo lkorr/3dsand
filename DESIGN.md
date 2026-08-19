@@ -476,6 +476,32 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.2 (2026-08-19)** — M3 complete + M2 core. Fullness liquids (state nibble =
+> eighths, mass-conserving fall/equalize/split; fullness-1 films never spread, so
+> pools settle flat and SLEEP — the v0 jiggle debt is paid). Dirty-chunk-list
+> compaction + `DispatchWorkgroupsIndirect` for all 54 CA passes and the occupancy
+> update (full-world scan only on hash ticks): per-tick sim cost now scales with
+> activity, not world size. The DESIGN hierarchical dirty tree is intentionally
+> replaced by a flat 4096-chunk compaction scan — the tree only pays at much larger
+> residencies. Selftest gained a sleep assertion (settled world must be <32 active
+> chunks; measures 4) and `--adapter low` for cross-vendor hash comparison (this
+> machine exposes only the RTX 3060 Ti — still untested on a second vendor, risk #3
+> stays open). Two hard-won invariants, now enforced in comments: the 3×3×3 color
+> lattice is GLOBAL (chunk-local dispatch must offset by chunk coord since 16 ≡ 1
+> mod 3), and reaction-driven growth must be decisively subcritical or chunks never
+> sleep (see reactions.json stem note). M2 still open: disk streaming + toroidal
+> residency.
+>
+> **v0.1 (2026-08-19)** — the M3 reaction system landed early, sandspiel-inspired:
+> JSON reactions (pair/decay/emit rules with tag matching and direction filters)
+> compiled to per-material GPU buckets, 31 materials, ~60 rules (fire/ember/ash,
+> lava→glass melting, acid erosion chain, ice/snow, plant/seed/stem/flower growth,
+> fungus, dust deflagration, sources/void, wandering mites), emissive rendering
+> with volumetric fire, hot reload. Reactions run inside the 27-color passes
+> (substep 0), write-reach ≤1, integer-only — determinism selftest still passes.
+> Still deferred to full M3: fullness-based liquids, per-material viscosity beyond
+> the tick-interval gate.
+>
 > **v0 (in progress, 2026-08-19)** — M0 + M1 + a deliberate slice of M3/M4 to get
 > a walkable demo immediately: JSON material table (no reactions yet), **binary
 > liquids** (no fullness nibble — accepted cost: pool surfaces jiggle and stay

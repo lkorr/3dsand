@@ -32,6 +32,7 @@ struct UIState {
   bool regenWorld = false;
 
   std::vector<std::string> materialNames;  // index == material id
+  std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
   bool visible = true;
 };
 
