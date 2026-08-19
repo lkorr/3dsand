@@ -476,6 +476,42 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.3 (2026-08-19)** — M5 complete, M6 complete, M2 save/load core. All
+> selftest-gated (determinism hashes now cover explosions + particles).
+> **M5:** GPU particle system per §5 — fixed-point integer state (24.8), double-
+> buffered with indirect dispatch, ballistic DDA flight, reinsertion via a
+> two-phase claim (atomicMax of a state-derived priority — order-independent,
+> so the grid stays bit-deterministic; slot order never leaks into sim state).
+> Explosions per §7: per-voxel occlusion DDA against material `hardness` (new
+> JSON field), class-scaled ejecta. **Hard-won invariant: destruction kernels
+> must be two-phase (mark reads pristine grid → apply writes)** — a
+> single-phase version raced its own occlusion rays and broke determinism.
+> Grenade projectile (G) + crosshair detonate (X) as the §8 projectile seed —
+> CPU floats, but the grid only sees their ExplosionOps (MutationQueue). New
+> render foundation: shared reversed-Z depth (raymarch writes frag_depth);
+> particles/grenades/debris draw as instanced lit cubes composited exactly.
+> **M6:** the full §7 debris pipeline — destruction events → bounded async
+> region readback (≤64 chunks/tick through the readback ring) → CPU island
+> detection (solid-only 6-connected components; touching the region boundary =
+> anchored; >32k = abort) → islands leave the grid via exact-cell MutationQueue
+> ops (`sim_mutate.wgsl:cells`) and become **Jolt** bodies (v5.3,
+> CROSS_PLATFORM_DETERMINISTIC, greedy-merged box compounds, mass = Σ voxel
+> density) carrying their voxel payload, rendered voxel-crisp as instanced
+> cubes with the body pose. Sub-8-voxel islands crumble to their JSON `rubble`
+> material. Terrain collision: localized marching cubes (Bourke tables) per
+> chunk near live bodies, cached, invalidated from the dirty-flag snapshot,
+> meshes as static Jolt bodies. Explosions impulse nearby bodies. Bodies are
+> CPU gameplay state by design (§2): their grid effects flow only through the
+> op stream. Selftest: pillar-blast scenario must produce ≥1 body that falls
+> and sleeps.
+> **M2:** versioned chunk-RLE world save/load (F9/F10, ~6x compression),
+> selftest-verified: save → diverge 50 ticks → load → world hash restores
+> exactly. Still open for M2/M7: toroidal residency + disk streaming beyond one
+> resident cube + procgen — the next major phase; the chunk-granular file
+> format and the chunk-fetch cache were built to serve it.
+> Deferred consciously: player↔body collision, destructible bodies (re-split on
+> damage), body re-fusion into the grid, particle↔media interactions.
+>
 > **v0.2 (2026-08-19)** — M3 complete + M2 core. Fullness liquids (state nibble =
 > eighths, mass-conserving fall/equalize/split; fullness-1 films never spread, so
 > pools settle flat and SLEEP — the v0 jiggle debt is paid). Dirty-chunk-list

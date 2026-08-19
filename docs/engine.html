@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sandvox — engine architecture</title>
+<style>
+  /* Palette: neutral dark, one accent per domain. Chosen to stay legible for
+     the telemetry phase, where each stage gets a stable hue in charts. */
+  :root {
+    --bg:#0e1116; --bg2:#151a22; --bg3:#1b222c;
+    --fg:#e6edf3; --fg-dim:#9aa7b6; --fg-faint:#6b7888;
+    --line:#232c38;
+    --gpu:#4c9aff;      /* GPU compute      */
+    --cpu:#f2a65a;      /* CPU work         */
+    --xfer:#c792ea;     /* CPU<->GPU        */
+    --render:#5ed3a5;   /* rendering        */
+    --warn:#f2726f;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  }
+  .wrap { max-width:1080px; margin:0 auto; padding:0 24px 96px; }
+
+  header { padding:56px 0 28px; border-bottom:1px solid var(--line); }
+  h1 { margin:0 0 6px; font-size:30px; letter-spacing:-.02em; }
+  .sub { color:var(--fg-dim); font-size:15px; max-width:66ch; }
+  .meta { margin-top:16px; display:flex; gap:20px; flex-wrap:wrap;
+          font:12px/1 var(--mono); color:var(--fg-faint); }
+  .meta b { color:var(--gpu); font-weight:600; }
+
+  /* ---- telemetry bar ------------------------------------------------ */
+  #tel {
+    position:sticky; top:0; z-index:50; margin:0 -24px 0; padding:10px 24px;
+    background:rgba(14,17,22,.92); backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--line); display:flex; align-items:center;
+    gap:14px; flex-wrap:wrap;
+  }
+  #tel .dot { width:8px; height:8px; border-radius:50%; background:var(--fg-faint);
+              flex:none; transition:background .2s; }
+  #tel.live .dot { background:var(--render); box-shadow:0 0 8px var(--render); }
+  #tel .lbl { font:12px/1 var(--mono); color:var(--fg-dim); }
+  #tel .spacer { flex:1; }
+  button {
+    font:12px/1 var(--mono); color:var(--fg); background:var(--bg3);
+    border:1px solid var(--line); border-radius:6px; padding:7px 12px;
+    cursor:pointer;
+  }
+  button:hover { border-color:var(--gpu); color:var(--gpu); }
+  button[disabled] { opacity:.4; cursor:not-allowed; }
+  button[disabled]:hover { border-color:var(--line); color:var(--fg); }
+  input[type=text] {
+    font:12px/1 var(--mono); color:var(--fg); background:var(--bg);
+    border:1px solid var(--line); border-radius:6px; padding:7px 10px; width:190px;
+  }
+
+  /* ---- pipeline flow ------------------------------------------------ */
+  h2 { margin:44px 0 4px; font-size:13px; letter-spacing:.09em;
+       text-transform:uppercase; color:var(--fg-faint); font-weight:600; }
+  .note { color:var(--fg-dim); font-size:14px; margin:0 0 18px; max-width:70ch; }
+
+  .stage {
+    border:1px solid var(--line); border-radius:10px; background:var(--bg2);
+    margin-bottom:10px; overflow:hidden;
+  }
+  .stage > summary {
+    list-style:none; cursor:pointer; padding:14px 18px; display:flex;
+    align-items:center; gap:14px; user-select:none;
+  }
+  .stage > summary::-webkit-details-marker { display:none; }
+  .stage > summary:hover { background:var(--bg3); }
+  .caret { color:var(--fg-faint); font:11px/1 var(--mono); width:10px; flex:none;
+           transition:transform .18s; }
+  .stage[open] .caret { transform:rotate(90deg); }
+  .tag {
+    font:10px/1 var(--mono); padding:4px 7px; border-radius:4px; flex:none;
+    text-transform:uppercase; letter-spacing:.06em; font-weight:600;
+  }
+  .t-gpu   { background:rgba(76,154,255,.14);  color:var(--gpu); }
+  .t-cpu   { background:rgba(242,166,90,.14);  color:var(--cpu); }
+  .t-xfer  { background:rgba(199,146,234,.14); color:var(--xfer); }
+  .t-render{ background:rgba(94,211,165,.14);  color:var(--render); }
+  .sname { font-weight:600; flex:none; }
+  .sdesc { color:var(--fg-dim); font-size:13px; flex:1; min-width:0;
+           overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cost {
+    font:12px/1 var(--mono); color:var(--fg-faint); flex:none;
+    padding:4px 8px; border:1px solid var(--line); border-radius:4px;
+  }
+  .cost.live { color:var(--render); border-color:rgba(94,211,165,.4); }
+
+  .body { padding:2px 18px 20px 42px; border-top:1px solid var(--line); }
+  .body p { margin:14px 0; color:var(--fg-dim); max-width:74ch; }
+  .body p strong { color:var(--fg); font-weight:600; }
+  .body h4 { margin:20px 0 6px; font-size:12px; letter-spacing:.07em;
+             text-transform:uppercase; color:var(--fg-faint); }
+  .body ul { margin:10px 0; padding-left:20px; color:var(--fg-dim); max-width:74ch; }
+  .body li { margin:5px 0; }
+  code { font:12.5px/1.4 var(--mono); background:var(--bg3); padding:2px 5px;
+         border-radius:3px; color:#a9c7ff; }
+  .body pre { background:var(--bg); border:1px solid var(--line); border-radius:7px;
+              padding:12px 14px; overflow-x:auto; font:12px/1.6 var(--mono);
+              color:var(--fg-dim); }
+
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:13px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--fg-faint); font:11px/1 var(--mono); text-transform:uppercase;
+       letter-spacing:.05em; font-weight:600; }
+  td { color:var(--fg-dim); }
+  td:first-child { color:var(--fg); font-family:var(--mono); font-size:12px; }
+
+  .limit { border-left:2px solid var(--warn); padding:2px 0 2px 14px; margin:14px 0; }
+  .limit b { color:var(--warn); font-size:11px; letter-spacing:.07em;
+             text-transform:uppercase; display:block; margin-bottom:3px; }
+  .limit p { margin:0; }
+
+  /* sparkline canvas, hidden until telemetry connects */
+  .spark { display:none; width:100%; height:44px; margin-top:14px;
+           background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+  body.live .spark { display:block; }
+
+  .flow { display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+          margin:14px 0 26px; font:11px/1 var(--mono); color:var(--fg-faint); }
+  .flow span { padding:5px 9px; border:1px solid var(--line); border-radius:5px;
+               background:var(--bg2); }
+  .flow i { font-style:normal; color:var(--line); }
+
+  footer { margin-top:52px; padding-top:22px; border-top:1px solid var(--line);
+           color:var(--fg-faint); font-size:13px; }
+  a { color:var(--gpu); }
+</style>
+</head>
+<body>
+
+<div id="tel">
+  <span class="dot"></span>
+  <span class="lbl" id="tel-status">telemetry offline — showing static reference values</span>
+  <span class="spacer"></span>
+  <input type="text" id="tel-url" value="ws://localhost:8080" spellcheck="false">
+  <button id="tel-btn">connect</button>
+  <button id="tel-demo">demo data</button>
+</div>
+
+<div class="wrap">
+<header>
+  <h1>sandvox — engine architecture</h1>
+  <p class="sub">
+    A 3D falling-sand voxel engine: a GPU-resident cellular automaton over a
+    256³ world, raymarched directly from the simulation buffers. This page walks
+    the per-tick pipeline stage by stage. Expand any stage for its mechanism,
+    computation counts, and limits.
+  </p>
+  <div class="meta">
+    <span>world <b>256³</b> = 16.7M voxels</span>
+    <span>chunks <b>4096</b> × 16³</span>
+    <span>tick <b>30 Hz</b></span>
+    <span>sim <b>0.25 ms</b> active</span>
+    <span>render <b>2.66 ms</b> @1080p</span>
+    <span>RTX 3060 Ti</span>
+  </div>
+</header>
+
+<h2>Per-tick pipeline</h2>
+<p class="note">
+  Every tick runs these stages in order. The ordering is load-bearing:
+  mutations must land before compaction (so newly-touched chunks are in the
+  active set), and compaction must precede the CA passes (which dispatch
+  indirectly off its output).
+</p>
+<div class="flow">
+  <span>mutate</span><i>→</i><span>explode</span><i>→</i><span>compact</span><i>→</i>
+  <span>54 × CA</span><i>→</i><span>particles</span><i>→</i><span>occupancy</span><i>→</i>
+  <span>readback</span><i>→</i><span>physics</span><i>→</i><span>render</span>
+</div>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="mutate">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">gpu</span>
+    <span class="sname">MutationQueue</span>
+    <span class="sdesc">All world writes — brush, explosions, island removal</span>
+    <span class="cost" data-metric="mutate">≤64 ops</span>
+  </summary>
+  <div class="body">
+    <p>
+      Every write to the world — brush strokes, explosions, worldgen, debris
+      leaving the grid — enters through this queue and lands via
+      <code>sim_mutate.wgsl</code>. Nothing else writes voxel memory.
+    </p>
+    <p>
+      <strong>This is the most important architectural rule in the engine</strong>,
+      and it is not primarily about rendering correctness. The op stream is
+      simultaneously the save format, the replay log, and the network replication
+      stream. Because every mutation is captured here, recording the stream
+      replays the world exactly.
+    </p>
+    <h4>Two op kinds</h4>
+    <table>
+      <tr><th>Op</th><th>Size</th><th>Cap / tick</th><th>Dispatch</th></tr>
+      <tr><td>BrushOp</td><td>32 B</td><td>64</td><td><code>(4×ops, 4, 4)</code> wg of 4³</td></tr>
+      <tr><td>CellOp</td><td>8 B</td><td>65,536</td><td><code>(ops+63)/64</code> wg of 64</td></tr>
+    </table>
+    <p>
+      <code>BrushOp</code> is a radius-based sphere paint; <code>CellOp</code>
+      writes one exact cell and is used by island removal, where the debris
+      system must vacate precisely the voxels that became a rigidbody.
+    </p>
+    <h4>Computation</h4>
+    <p>
+      A brush op dispatches 64 workgroups of 64 threads = <strong>4,096 threads
+      per op</strong>, covering a 16³ box around the stroke. At the 64-op cap
+      that is 262k threads, but typical interactive load is 1–2 ops per tick.
+      Cell ops are one thread each — 65,536 threads at the cap.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Caps are per tick, not per second: a tool wanting more than 64 brush ops
+        must spread them across ticks or batch into cell ops. Brush dispatch is
+        sized for a 16³ box, so a radius above 8 voxels silently clips — the
+        radius field is not validated against the dispatch size.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="explode">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">gpu</span>
+    <span class="sname">Explosions</span>
+    <span class="sdesc">Ray-cast destruction, hardness budget, particle ejection</span>
+    <span class="cost" data-metric="explode">≤8 / tick</span>
+  </summary>
+  <div class="body">
+    <p>
+      Two kernels, mark then apply. Rays cast from the blast center to every
+      voxel on the blast sphere's <em>surface</em>, DDA-traversing outward and
+      spending a hardness budget: harder material stops a ray, softer material
+      is flagged for removal. A fraction of removed voxels eject as particles.
+    </p>
+    <p>
+      The key scaling property: ray count grows as <strong>O(r²)</strong> while
+      destroyed volume grows as O(r³). Big explosions stay affordable because
+      work tracks surface area, not volume.
+    </p>
+    <h4>Computation</h4>
+    <p>
+      Each op dispatches <code>(11×n, 11, 11)</code> workgroups of 4³ threads —
+      1,331 workgroups × 64 = <strong>85,184 threads per explosion</strong>,
+      covering the 44³ voxel box that bounds the max radius of 20. Both mark and
+      apply pay this, so ~170k threads per explosion per tick. At the 8-op cap,
+      ~1.4M threads.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Radius is hard-capped at 20 voxels (<code>kMaxExplosionRadius</code>);
+        the dispatch geometry is sized for it at compile time, so raising the cap
+        means changing <code>EXP_WG</code> in lockstep. Cost is paid for the full
+        bounding box regardless of actual radius — a radius-2 explosion costs the
+        same dispatch as radius-20.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="compact">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">gpu</span>
+    <span class="sname">Dirty compaction</span>
+    <span class="sdesc">Scans 4096 chunk flags into a dense list + indirect args</span>
+    <span class="cost" data-metric="compact">64 wg</span>
+  </summary>
+  <div class="body">
+    <p>
+      The stage that makes the whole engine scale. It scans the per-chunk dirty
+      flags and compacts them into a dense index list, writing the workgroup
+      count directly into an indirect-dispatch args buffer. The 54 CA passes then
+      dispatch <em>exactly one workgroup per dirty chunk</em> — a settled world
+      dispatches nothing.
+    </p>
+    <p>
+      This is what DESIGN.md §11 means by <strong>cost must scale with activity,
+      not world size</strong>. Without it, every tick would dispatch over all
+      4,096 chunks whether or not anything moved.
+    </p>
+    <h4>Computation</h4>
+    <p>
+      <code>4096 / 64 = 64 workgroups</code> of 64 threads = 4,096 threads. This
+      is a fixed cost paid every tick regardless of activity — negligible, and
+      the reason the flat scan was chosen over DESIGN.md's hierarchical dirty
+      tree, which only pays off at much larger residency.
+    </p>
+    <h4>Determinism note</h4>
+    <p>
+      List <em>order</em> is scheduling-dependent — it is built with
+      <code>atomicAdd</code> append. This is safe because each dirty chunk appears
+      exactly once and the color scheme makes all same-pass writes disjoint, so
+      processing order cannot influence sim state. Order-dependence in the
+      dispatch list is fine; order-dependence in a <em>write</em> would not be.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        The flat scan is O(total chunks), not O(dirty chunks) — at 4,096 chunks
+        it is free, but a much larger resident region would make the hierarchical
+        tree worthwhile again.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="ca">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">gpu</span>
+    <span class="sname">Cellular automaton — 54 passes</span>
+    <span class="sdesc">27 color phases × 2 gravity substeps; movement + reactions</span>
+    <span class="cost" data-metric="ca">54 × dirty</span>
+  </summary>
+  <div class="body">
+    <p>
+      The core simulation, and the largest single cost. Each tick runs
+      <strong>27 color phases × 2 gravity substeps = 54 indirect dispatches</strong>,
+      each processing one workgroup of 6³ threads per dirty chunk.
+    </p>
+
+    <h4>Why 27 passes</h4>
+    <p>
+      Two threads must never claim the same destination cell, and the winner of
+      any conflict must not depend on GPU scheduling — or the sim stops being
+      reproducible, which kills lockstep networking and replay debugging.
+    </p>
+    <p>
+      The solution is a <strong>3×3×3 cell-coloring lattice</strong>. Pass
+      <em>k</em> updates only cells where <code>(x%3, y%3, z%3)</code> equals
+      color <em>k</em>. Same-color cells are ≥3 apart on every axis, and movement
+      reach is ≤1 cell, so destination writes are <em>provably disjoint</em>. The
+      result is race-free and bit-deterministic with no atomics on voxel data.
+    </p>
+    <p>
+      Chunk-level checkerboarding — the 3D analog of Noita's 4-pass scheme —
+      is <em>not</em> sufficient here, and this is a subtle trap. It makes
+      simultaneously-updated chunks non-adjacent, but all 4,096 cells
+      <em>within</em> a chunk still update in parallel on a GPU, so two movers in
+      one chunk can collide. Noita never hits this because its CPU update is
+      sequential inside each region.
+    </p>
+
+    <div class="limit">
+      <b>The global-lattice invariant</b>
+      <p>
+        The color lattice is <strong>global, not chunk-local</strong>. Because
+        <code>CHUNK = 16 ≡ 1 (mod 3)</code>, each chunk's first colored local
+        coordinate shifts by its chunk coordinate. Dispatch must correct for this
+        with <code>start = (colorPhase + 3 - (chunkCoord % 3)) % 3</code>.
+        Omitting the correction produces a simulation that looks completely
+        correct and is silently racy across chunk boundaries.
+      </p>
+    </div>
+
+    <h4>Computation</h4>
+    <p>
+      A 6³ workgroup = 216 threads covers a 16³ chunk's cells of one color
+      (⌈16/3⌉³ = 6³). Per tick:
+    </p>
+    <pre>54 dispatches × dirty_chunks workgroups × 216 threads
+settled  (4 dirty):        ~46,700 thread-launches
+moderate (200 dirty):     ~2.3M
+heavy    (2000 dirty):    ~23.3M
+all      (4096 dirty):    ~47.8M</pre>
+    <p>
+      Each cell is processed exactly once per substep, so total bandwidth is
+      unchanged by the pass count — the 54 dispatches cost ~µs of launch overhead
+      each, not 54× the work.
+    </p>
+
+    <h4>What each cell does</h4>
+    <ul>
+      <li><strong>Stamp check</strong> — an 8-bit tick-stamp per voxel prevents a
+        voxel that already moved from acting again in the same substep.</li>
+      <li><strong>Reactions</strong> (substep 0 only) — scans the material's
+        reaction bucket; pair, decay, and emit rules with tag matching.</li>
+      <li><strong>Movement</strong> — powder falls then tries 4 down-diagonals;
+        liquids add 4 lateral directions plus fullness equalization; gases invert.</li>
+      <li><strong>Density displacement</strong> — a mover entering a lighter
+        fluid swaps with it (sand sinks through water, oil floats).</li>
+    </ul>
+    <p>
+      All decisions use a stateless counter RNG, <code>hash3(seed, tick, index)</code>
+      — never thread or dispatch order.
+    </p>
+
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Write reach must stay ≤1 cell or the disjointness proof collapses.
+        Everything influencing voxel state must be integer — floats diverge
+        across vendors via FMA contraction and fast-math. Reaction-driven growth
+        must be decisively subcritical: a rule averaging ≥1 offspring per tick
+        means chunks never sleep, which presents as a performance bug but is a
+        content bug.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="particles">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">gpu</span>
+    <span class="sname">Particle system</span>
+    <span class="sdesc">Ballistic voxels in flight, DDA collision, claim-based reinsertion</span>
+    <span class="cost" data-metric="particles">≤262,144</span>
+  </summary>
+  <div class="body">
+    <p>
+      When a voxel should fly — splash, explosion ejecta, rigidbody displacement —
+      it leaves the grid and joins a GPU particle buffer carrying position,
+      velocity, and its 16-bit voxel payload. This is what makes liquids splash
+      instead of blob.
+    </p>
+    <p>
+      Note this is <strong>already a custom GPU solver</strong>, entirely separate
+      from Jolt. Jolt never sees particles; it handles only debris rigidbodies.
+    </p>
+
+    <h4>Three kernels, double-buffered</h4>
+    <table>
+      <tr><th>Kernel</th><th>Threads</th><th>Role</th></tr>
+      <tr><td>args1 / args2</td><td>1</td><td>Write indirect dispatch + draw args</td></tr>
+      <tr><td>integrate</td><td>64/wg, indirect</td><td>Gravity, path-sample, propose reinsert</td></tr>
+      <tr><td>resolve</td><td>64/wg, indirect</td><td>Settle claims, rejoin grid</td></tr>
+    </table>
+    <p>
+      Particles ping-pong between two pages; <code>integrate</code> reads page
+      <em>p</em> and appends survivors to page <em>1−p</em>, so death is simply
+      "not appended" — no compaction pass needed.
+    </p>
+
+    <h4>Sub-voxel integration</h4>
+    <p>
+      Positions are 24.8 fixed-point. Each tick the flight path is sampled at
+      <strong>≤ half-voxel intervals</strong>
+      (<code>n = max(1, (maxComponent + 127) / 128)</code>), so fast particles
+      cannot tunnel through thin walls. On hitting a blocking cell, the particle
+      proposes reinsertion at the last empty position.
+    </p>
+
+    <h4>Deterministic conflict resolution</h4>
+    <p>
+      Many particles may target one cell. Rather than first-come-CAS — which
+      would be scheduling-dependent — each writes <code>atomicMax</code> of a
+      priority value into a claim hash, and <code>resolve</code> admits only the
+      particle whose priority equals the winning value. <strong>atomicMax is
+      order-independent</strong>: the same set of contenders always yields the
+      same winner, preserving bit-determinism.
+    </p>
+
+    <h4>Computation</h4>
+    <pre>capacity   262,144 particles (32 B each = 8 MB × 2 pages)
+claim hash 262,144 u32 (1 MB)
+threads    2 × ceil(live / 64) workgroups × 64
+at cap     ~524k thread-launches/tick</pre>
+
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Overflow is silently dropped: <code>append</code> increments the count
+        atomically but discards writes past capacity, so an over-cap frame loses
+        particles rather than degrading gracefully. The claim hash can alias —
+        two distant cells sharing a slot means one particle loses a contest it
+        should have won, which is rare, deterministic, and self-correcting.
+        Buried particles rise one voxel per tick, which can look sluggish under
+        heavy burial.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="occupancy">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">gpu</span>
+    <span class="sname">Occupancy + pick</span>
+    <span class="sdesc">Per-chunk emptiness flags for render skipping; cursor raycast</span>
+    <span class="cost" data-metric="occupancy">dirty-only</span>
+  </summary>
+  <div class="body">
+    <p>
+      Recomputes per-chunk occupancy — whether a chunk holds any voxels — which
+      the renderer uses for empty-space skipping and the CPU uses for collision
+      routing. One workgroup of 64 threads per chunk, each thread folding 64
+      cells.
+    </p>
+    <p>
+      Critically, this runs over the <em>compacted next-tick dirty list</em>, not
+      all 4,096 chunks. A full-world occupancy scan happens only on hash ticks.
+      This was a deliberate optimization: a settled world updates ~4 chunks
+      instead of 4,096.
+    </p>
+    <p>
+      <code>sim_pick.wgsl</code> rides along as a single-thread dispatch,
+      raycasting the cursor ray through the grid for the brush preview.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Occupancy is binary per chunk — a chunk holding one voxel is as
+        "occupied" as a solid one, so empty-space skipping is coarse at 16³
+        granularity. Pick is one thread and therefore latency-bound rather than
+        throughput-bound; it costs a full serial DDA walk.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="readback">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-xfer">transfer</span>
+    <span class="sname">Async readback</span>
+    <span class="sdesc">3-slot ring, one tick latent — the CPU's window into GPU state</span>
+    <span class="cost" data-metric="readback">≤1 MB/tick</span>
+  </summary>
+  <div class="body">
+    <p>
+      The architecture stands or falls on this stage (DESIGN.md risk #2). The
+      player controller and physics need to know what voxels are where, but the
+      world lives in device memory and a synchronous read would stall the
+      pipeline.
+    </p>
+    <p>
+      The answer is a <strong>3-slot ring buffer with <code>mapAsync</code></strong>,
+      deliberately <strong>one tick latent</strong>. At 30 Hz, one tick of latency
+      on terrain collision is imperceptible. If every slot is still in flight, the
+      tick skips its copies rather than blocking — the sim never waits on the CPU.
+    </p>
+    <h4>What crosses the bus each tick</h4>
+    <table>
+      <tr><th>Payload</th><th>Size</th><th>Consumer</th></tr>
+      <tr><td>3×3×3 chunk mirror</td><td>432 KB</td><td>Player collision</td></tr>
+      <tr><td>On-demand fetches</td><td>≤64 chunks</td><td>Islands, terrain meshing</td></tr>
+      <tr><td>Dirty flags</td><td>4 KB</td><td>Mesh invalidation</td></tr>
+      <tr><td>Hash + counts</td><td>&lt;64 B</td><td>Determinism check, HUD</td></tr>
+    </table>
+    <p>
+      <code>kFetchPerTick = 64</code> is chosen precisely to hold total traffic at
+      the ~1 MB/tick ceiling — about 30 MB/s, trivial for PCIe.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        The mirror covers only 3×3×3 chunks (48³ voxels) around the player;
+        queries outside it return <code>Unknown</code>, so anything needing distant
+        voxel data must request a fetch and wait a tick. Under sustained demand
+        above 64 chunks/tick the fetch queue grows unboundedly — island detection
+        must therefore bound its own region requests. The one sanctioned
+        synchronous read is the selftest's hash.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="physics">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-cpu">cpu</span>
+    <span class="sname">Islands, debris, and Jolt</span>
+    <span class="sdesc">Bounded flood fill → marching cubes → rigidbodies</span>
+    <span class="cost" data-metric="physics">≤200 bodies</span>
+  </summary>
+  <div class="body">
+    <p>
+      Destroying support must let disconnected terrain fall. CA rules only see
+      immediate neighbors, so connectivity needs an explicit pass. This is
+      DESIGN.md's <strong>risk #1</strong> — flagged by the one team who has
+      shipped it as "hardest, not completely solved."
+    </p>
+    <h4>Pipeline</h4>
+    <ol style="color:var(--fg-dim); max-width:74ch; padding-left:20px;">
+      <li>A destruction event registers an expanded voxel box.</li>
+      <li>The region is fetched asynchronously through the readback ring.</li>
+      <li><strong>Bounded 6-connected flood fill</strong> runs outward. Exceeding
+        ~32,000 voxels aborts and declares "not an island."</li>
+      <li>Islands leave the grid via exact-cell ops and become Jolt bodies with
+        greedy-merged box compounds; mass sums per-voxel material density.</li>
+      <li>Islands under 8 voxels crumble to their powder form and stay in the CA.</li>
+    </ol>
+    <p>
+      The 32k bound is a <em>design</em> decision as much as a performance one.
+      An unbounded check could collapse an entire dungeon level — Noita's lesson
+      that "the world is simulated too much" kills level design.
+    </p>
+    <h4>Why Jolt, and what it actually does</h4>
+    <p>
+      Jolt handles ≤200 debris bodies and static terrain patches — nothing else.
+      At that count, narrow-phase resolution is microseconds of a 33 ms tick, so
+      a custom solver would optimize a non-bottleneck. The expensive parts of this
+      stage — flood fill, marching cubes, readback — are all custom code already.
+    </p>
+    <p>
+      Jolt is built with <code>CROSS_PLATFORM_DETERMINISTIC</code>, keeping
+      lockstep viable. But bodies are CPU float state deliberately
+      <strong>outside</strong> the hashed grid domain: they re-enter the world only
+      through the op stream, so the grid replays exactly regardless of solver
+      behavior.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Large floating sections can survive the bounded fill — a known, accepted
+        flaw. Body count caps at 200 and voxel instances at 262,144; excess bodies
+        are culled. Damaging a body means destroying and rebuilding it, losing
+        solver state. Terrain collision meshes are cached per chunk and rebuilt on
+        dirty, so a chunk churning every tick rebuilds its mesh every tick.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="render">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-render">render</span>
+    <span class="sname">Raymarched rendering</span>
+    <span class="sdesc">DDA through the voxel grid — no meshing, reads sim buffers directly</span>
+    <span class="cost" data-metric="render">2.66 ms @1080p</span>
+  </summary>
+  <div class="body">
+    <p>
+      Terrain geometry changes every tick, so meshing churn would dominate.
+      Instead a fullscreen pass raymarches the voxel grid directly, DDA-stepping
+      through chunks and using occupancy flags for empty-space skipping. The sim
+      already lives in GPU memory, so the renderer reads it at zero upload cost.
+    </p>
+    <h4>Passes</h4>
+    <ul>
+      <li><strong>raymarch</strong> — fullscreen terrain; primary ray plus a
+        secondary ray for sun shadows.</li>
+      <li><strong>particleDraw</strong> — instanced cubes, 36 verts each,
+        indirect off the GPU-written count.</li>
+      <li><strong>spriteDraw</strong> — CPU-authored markers, ≤64.</li>
+      <li><strong>bodyDraw</strong> — debris voxel instances transformed by body
+        quaternion.</li>
+    </ul>
+    <h4>Measured cost (RTX 3060 Ti, 1080p)</h4>
+    <table>
+      <tr><th>Configuration</th><th>Frame</th><th>FPS</th></tr>
+      <tr><td>shadows on</td><td>2.66 ms</td><td>376</td></tr>
+      <tr><td>shadows off</td><td>1.41 ms</td><td>709</td></tr>
+    </table>
+    <p>
+      Shadows nearly double frame cost — the secondary ray roughly doubles
+      traversal work. This is the single largest render lever.
+    </p>
+    <p>
+      Floats are correct here. The determinism rule binds only values that
+      influence voxel state; rendering is a pure consumer.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Cost scales with screen pixels and traversal depth, not world activity —
+        so unlike the sim, a settled world renders no cheaper. Empty-space
+        skipping is chunk-granular, making sparse scattered voxels the worst case.
+        There is no LOD: distant geometry costs the same per-step as near
+        geometry, which is the main obstacle to a larger view distance.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<h2>Cross-cutting invariants</h2>
+<p class="note">
+  These hold across every stage above. Each is cheap to maintain now and
+  near-impossible to retrofit.
+</p>
+
+<details class="stage" data-stage="determinism">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">invariant</span>
+    <span class="sname">Bit-determinism</span>
+    <span class="sdesc">Same seed + tick + inputs → same hash, on every GPU</span>
+    <span class="cost" data-metric="hash">hash 3dbdf3c1</span>
+  </summary>
+  <div class="body">
+    <p>
+      The property that keeps lockstep multiplayer and replay debugging viable.
+      A per-tick world hash is both the verification tool and, in multiplayer,
+      the desync detector.
+    </p>
+    <h4>Rules</h4>
+    <ul>
+      <li><strong>Integer-only sim math.</strong> No float may influence voxel
+        state; compilers diverge on FMA contraction and fast-math.</li>
+      <li><strong>Stateless counter RNG</strong> — <code>hash3(seed, tick, idx)</code>,
+        never a stateful stream.</li>
+      <li><strong>No scheduling-dependent outcomes.</strong> No CAS claims, no
+        subgroup ops, no order-dependent reductions. Order-independent atomics
+        (<code>atomicMax</code> for particle claims, <code>atomicAdd</code> for
+        list append) are fine — the outcome does not depend on arrival order.</li>
+      <li><strong>Write reach ≤1 cell</strong>, or the color-lattice disjointness
+        proof collapses.</li>
+    </ul>
+    <p>
+      Verified by <code>--selftest</code>, which runs the sim twice and compares
+      hashes over 200 ticks including explosions and particle activity.
+    </p>
+    <div class="limit">
+      <b>Open risk</b>
+      <p>
+        Determinism is currently verified on <strong>one vendor only</strong>
+        (RTX 3060 Ti). Cross-vendor validation — DESIGN.md risk #3 — remains open,
+        and it is the risk most likely to invalidate the lockstep plan.
+      </p>
+    </div>
+  </div>
+</details>
+
+<details class="stage" data-stage="sleep">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-gpu">invariant</span>
+    <span class="sname">Sleeping</span>
+    <span class="sdesc">Cost scales with activity, not world size</span>
+    <span class="cost" data-metric="dirty">4 / 4096 settled</span>
+  </summary>
+  <div class="body">
+    <p>
+      "Sleeping is the product." Every system needs a costs-nothing-when-idle
+      state. A settled 256³ world holds 16.7M voxels and simulates
+      <strong>4 chunks</strong> — 0.1% of the world.
+    </p>
+    <h4>Mechanism</h4>
+    <p>
+      Anything that changes marks its chunk dirty. A voxel moving across a chunk
+      boundary must also mark the <em>neighbor</em>. A chunk with no movement and
+      no active reactions clears its flag and sleeps. Compaction then reduces the
+      active set to an indirect dispatch count.
+    </p>
+    <p>
+      Liquids required specific care: fullness-1 films never spread, so pools
+      settle flat and sleep rather than jittering forever at the surface.
+    </p>
+    <div class="limit">
+      <b>The subcritical-growth trap</b>
+      <p>
+        Any reaction whose expected offspring per tick is ≥1 grows without bound,
+        so its chunks never sleep and the world never settles. This looks exactly
+        like a performance regression but is a content bug in
+        <code>reactions.json</code>. The selftest guards it: a settled world must
+        hold under 32 active chunks.
+      </p>
+    </div>
+  </div>
+</details>
+
+<!-- ============================================================ -->
+<h2>Measured baseline</h2>
+<p class="note">
+  From <code>--selftest</code> on an RTX 3060 Ti. These are the static reference
+  values shown above; connecting live telemetry replaces them with running
+  measurements.
+</p>
+<table>
+  <tr><th>Metric</th><th>Value</th><th>Notes</th></tr>
+  <tr><td>determinism</td><td>PASS</td><td>hash 3dbdf3c1 over 200 ticks</td></tr>
+  <tr><td>sim (active)</td><td>0.25 ms/tick</td><td>brushes + explosions + particles</td></tr>
+  <tr><td>sim (settled)</td><td>0.746 ms/tick</td><td>includes full-world hash scan</td></tr>
+  <tr><td>sleep</td><td>4 / 4096</td><td>after 600 settle ticks, 0 particles</td></tr>
+  <tr><td>render (shadows)</td><td>2.66 ms</td><td>376 fps @1080p</td></tr>
+  <tr><td>render (no shadows)</td><td>1.41 ms</td><td>709 fps @1080p</td></tr>
+  <tr><td>tick budget</td><td>33.3 ms</td><td>30 Hz — sim uses ~0.8%</td></tr>
+</table>
+<p class="note">
+  Read that last row carefully: the simulation consumes well under 1% of its tick
+  budget, and rendering ~8% of a 60 fps frame. <strong>Neither is currently the
+  bottleneck</strong> — which is exactly what the live telemetry layer is meant to
+  confirm or refute under real scenarios rather than synthetic ones.
+</p>
+
+<!-- ============================================================ -->
+<h2>Live telemetry (planned)</h2>
+<p class="note">
+  This page is built to become a measurement device. The bar at the top connects
+  to the running simulation; each stage's cost chip then shows live values and
+  reveals a sparkline of its recent history.
+</p>
+<p class="note">
+  The wire format is one JSON object per tick over a WebSocket. Stage keys match
+  the <code>data-stage</code> attributes on this page, so adding a stage to the
+  engine needs no page changes beyond a new <code>&lt;details&gt;</code> block:
+</p>
+<pre style="background:var(--bg); border:1px solid var(--line); border-radius:7px;
+            padding:14px 16px; overflow-x:auto; font:12px/1.6 var(--mono);
+            color:var(--fg-dim);">{
+  "tick": 4821,
+  "stages": {
+    "ca":        { "ms": 0.31, "dispatches": 54, "workgroups": 10800 },
+    "particles": { "ms": 0.08, "live": 12400 },
+    "render":    { "ms": 2.71, "pixels": 2073600 },
+    "physics":   { "ms": 0.44, "bodies": 12, "activeBodies": 3 }
+  }
+}</pre>
+<p class="note">
+  Click <b>demo data</b> above to see the live behavior with synthetic values —
+  the rendering path is fully implemented, so wiring the engine's emitter is the
+  only remaining work. GPU stage timings need
+  <code>wgpu::QuerySet</code> timestamp queries; CPU stages can report wall time
+  directly.
+</p>
+
+<footer>
+  <p>
+    Generated from the sandvox source tree. <code>DESIGN.md</code> remains the
+    source of truth for architecture and rationale; this page is a navigable view
+    of it plus measured behavior. Baseline figures from <code>--selftest</code>
+    on an RTX 3060 Ti.
+  </p>
+</footer>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- static fallbacks -------------------------------------------------
+  // Each cost chip keeps its authored text so disconnecting restores the
+  // documented reference value rather than a stale live reading.
+  var chips = {};
+  document.querySelectorAll('[data-metric]').forEach(function (el) {
+    chips[el.dataset.metric] = { el: el, base: el.textContent };
+  });
+
+  var history = {};   // stage -> array of ms samples
+  var HIST = 120;     // ~4 s at 30 Hz
+
+  function fmt(ms) { return ms.toFixed(2) + ' ms'; }
+
+  // Sparklines are created lazily: only stages that actually report data get
+  // a canvas, so the static page stays free of empty chart boxes.
+  function sparkFor(stage) {
+    var body = document.querySelector('[data-stage="' + stage + '"] .body');
+    if (!body) return null;
+    var c = body.querySelector('.spark');
+    if (!c) {
+      c = document.createElement('canvas');
+      c.className = 'spark';
+      body.appendChild(c);
+    }
+    return c;
+  }
+
+  function drawSpark(stage) {
+    var c = sparkFor(stage), data = history[stage];
+    if (!c || !data || !data.length) return;
+    var w = c.clientWidth, h = c.clientHeight, dpr = window.devicePixelRatio || 1;
+    if (c.width !== w * dpr || c.height !== h * dpr) {
+      c.width = w * dpr; c.height = h * dpr;
+    }
+    var g = c.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+
+    var max = Math.max.apply(null, data) || 1;
+    var pad = 4, iw = w - pad * 2, ih = h - pad * 2;
+    var step = iw / Math.max(HIST - 1, 1);
+
+    // area under the curve, then the curve itself
+    g.beginPath();
+    g.moveTo(pad, h - pad);
+    data.forEach(function (v, i) {
+      g.lineTo(pad + i * step, h - pad - (v / max) * ih);
+    });
+    g.lineTo(pad + (data.length - 1) * step, h - pad);
+    g.closePath();
+    g.fillStyle = 'rgba(94,211,165,.12)';
+    g.fill();
+
+    g.beginPath();
+    data.forEach(function (v, i) {
+      var x = pad + i * step, y = h - pad - (v / max) * ih;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.strokeStyle = '#5ed3a5';
+    g.lineWidth = 1.5;
+    g.stroke();
+
+    g.fillStyle = '#6b7888';
+    g.font = '10px ui-monospace, monospace';
+    g.fillText('peak ' + max.toFixed(2) + ' ms', pad + 2, pad + 9);
+  }
+
+  function applySample(msg) {
+    if (!msg || !msg.stages) return;
+    Object.keys(msg.stages).forEach(function (stage) {
+      var s = msg.stages[stage];
+      if (typeof s.ms !== 'number') return;
+
+      var chip = chips[stage];
+      if (chip) {
+        chip.el.textContent = fmt(s.ms);
+        chip.el.classList.add('live');
+      }
+      (history[stage] = history[stage] || []).push(s.ms);
+      if (history[stage].length > HIST) history[stage].shift();
+      drawSpark(stage);
+    });
+    var t = document.getElementById('tel-status');
+    if (typeof msg.tick === 'number') {
+      t.textContent = 'live — tick ' + msg.tick;
+    }
+  }
+
+  function setLive(on, label) {
+    document.body.classList.toggle('live', on);
+    document.getElementById('tel').classList.toggle('live', on);
+    document.getElementById('tel-status').textContent = label;
+    if (!on) {
+      // restore documented values so the page never shows stale live numbers
+      Object.keys(chips).forEach(function (k) {
+        chips[k].el.textContent = chips[k].base;
+        chips[k].el.classList.remove('live');
+      });
+    }
+  }
+
+  // ---- websocket --------------------------------------------------------
+  var sock = null, demoTimer = null;
+
+  function stopDemo() {
+    if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+    document.getElementById('tel-demo').textContent = 'demo data';
+  }
+
+  document.getElementById('tel-btn').addEventListener('click', function () {
+    if (sock) { sock.close(); return; }
+    stopDemo();
+    var url = document.getElementById('tel-url').value.trim();
+    var btn = this;
+    try { sock = new WebSocket(url); } catch (e) {
+      setLive(false, 'bad URL: ' + e.message);
+      return;
+    }
+    setLive(false, 'connecting to ' + url + '…');
+    btn.textContent = 'disconnect';
+
+    sock.onopen = function () { setLive(true, 'live — waiting for first tick'); };
+    sock.onmessage = function (ev) {
+      try { applySample(JSON.parse(ev.data)); }
+      catch (e) { /* ignore malformed frames rather than tearing down the view */ }
+    };
+    sock.onerror = function () { setLive(false, 'connection error — is the sim running with --telemetry?'); };
+    sock.onclose = function () {
+      sock = null;
+      btn.textContent = 'connect';
+      setLive(false, 'telemetry offline — showing static reference values');
+    };
+  });
+
+  // ---- demo generator ---------------------------------------------------
+  // Exercises the full render path without an engine, so the visualization can
+  // be evaluated before the emitter exists.
+  document.getElementById('tel-demo').addEventListener('click', function () {
+    if (demoTimer) {
+      stopDemo();
+      setLive(false, 'telemetry offline — showing static reference values');
+      return;
+    }
+    if (sock) { sock.close(); }
+    this.textContent = 'stop demo';
+    setLive(true, 'demo data — synthetic values, not measured');
+
+    var tick = 0, burst = 0;
+    demoTimer = setInterval(function () {
+      tick++;
+      // occasional activity bursts, so the sparklines show the bottleneck
+      // shifting between stages the way a real explosion would
+      if (burst <= 0 && Math.random() < 0.04) burst = 20 + Math.random() * 30;
+      var a = burst > 0 ? (burst-- / 50) : 0;
+      var jit = function (b, s) { return Math.max(0.01, b + (Math.random() - 0.5) * s); };
+      applySample({
+        tick: tick,
+        stages: {
+          mutate:    { ms: jit(0.02 + a * 0.05, 0.01) },
+          explode:   { ms: jit(a * 0.35, 0.02) },
+          compact:   { ms: jit(0.03, 0.01) },
+          ca:        { ms: jit(0.18 + a * 1.4, 0.06) },
+          particles: { ms: jit(a * 0.9, 0.05) },
+          occupancy: { ms: jit(0.04 + a * 0.08, 0.01) },
+          readback:  { ms: jit(0.06, 0.02) },
+          physics:   { ms: jit(0.1 + a * 0.7, 0.05) },
+          render:    { ms: jit(2.66 + a * 0.8, 0.25) }
+        }
+      });
+    }, 1000 / 30);
+  });
+
+  window.addEventListener('resize', function () {
+    Object.keys(history).forEach(drawSpark);
+  });
+
+  // Open the CA stage by default — it is the one most readers came for.
+  var ca = document.querySelector('[data-stage="ca"]');
+  if (ca) ca.open = true;
+})();
+</script>
+</body>
+</html>

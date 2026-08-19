@@ -1,5 +1,6 @@
 #include "sim/world.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "gpu/resources.h"
@@ -13,11 +14,14 @@ constexpr uint64_t kOccOff = kDirtyOff + kDirtyBytes;
 constexpr uint64_t kOccBytes = kNumChunks * 4;
 constexpr uint64_t kHashOff = kOccOff + kOccBytes;
 constexpr uint64_t kPickOff = kHashOff + 256;
-constexpr uint64_t kSlotBytes = kPickOff + 256;
+constexpr uint64_t kPCountOff = kPickOff + 256;
+constexpr uint64_t kFetchOff = kPCountOff + 256;
+constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
 
 void World::Init(const wgpu::Device& device) {
   using U = wgpu::BufferUsage;
-  voxels = CreateBuffer(device, kVoxelCount * 4, U::Storage | U::CopySrc, "voxels");
+  voxels = CreateBuffer(device, kVoxelCount * 4,
+                        U::Storage | U::CopySrc | U::CopyDst, "voxels");
   dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
   dirty[1] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyB");
   dirtyList = CreateBuffer(device, kNumChunks * 4, U::Storage, "dirtyList");
@@ -32,11 +36,44 @@ void World::Init(const wgpu::Device& device) {
   renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
   pick = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst, "pick");
 
+  particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");
+  particles[1] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesB");
+  particleCounts = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
+                                "particleCounts");
+  claim = CreateBuffer(device, (uint64_t)kClaimSize * 4, U::Storage | U::CopyDst, "claim");
+  pArgsStage = CreateBuffer(device, 32, U::Storage | U::CopySrc, "pArgsStage");
+  pDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "pDispatchArgs");
+  drawArgs = CreateBuffer(device, 16, U::Indirect | U::CopyDst, "drawArgs");
+  expOps = CreateBuffer(device, kMaxExplosionsPerTick * sizeof(ExplosionOp),
+                        U::Storage | U::CopyDst, "explosionOps");
+  expMask = CreateBuffer(device, (uint64_t)kMaxExplosionsPerTick * 68928 * 4,
+                         U::Storage | U::CopyDst, "explosionMask");
+  cellOps = CreateBuffer(device, kMaxCellOpsPerTick * sizeof(CellOp),
+                         U::Storage | U::CopyDst, "cellOps");
+  sprites = CreateBuffer(device, kMaxSprites * sizeof(Sprite), U::Storage | U::CopyDst,
+                         "sprites");
+  bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
+                               "bodyInstances");
+  bodyXforms = CreateBuffer(device, 256ull * 32, U::Storage | U::CopyDst, "bodyXforms");
+
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
     s.inFlight = false;
   }
   snap_.mirror.assign(27 * kChunkVol, 0);
+  snap_.dirtyFlags.assign(kNumChunks, 0);
+  fetchQueued_.assign(kNumChunks, 0);
+}
+
+void World::RequestChunkFetch(uint32_t chunkIdx) {
+  if (chunkIdx >= kNumChunks || fetchQueued_[chunkIdx]) return;
+  fetchQueued_[chunkIdx] = 1;
+  fetchQueue_.push_back(chunkIdx);
+}
+
+const CachedChunk* World::Cached(uint32_t chunkIdx) const {
+  auto it = cache_.find(chunkIdx);
+  return it == cache_.end() ? nullptr : &it->second;
 }
 
 static uint32_t ChunkIndex(int cx, int cy, int cz) {
@@ -44,13 +81,29 @@ static uint32_t ChunkIndex(int cx, int cy, int cz) {
 }
 
 bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc,
-                            IVec3 playerChunkBase) {
+                            IVec3 playerChunkBase, uint32_t particleLivePage,
+                            uint32_t tick) {
   int slot = -1;
   for (int i = 0; i < kSlots; i++) {
     if (!slots_[i].inFlight) { slot = i; break; }
   }
   if (slot < 0) return false;
   Slot& s = slots_[slot];
+  s.particleLivePage = particleLivePage;
+  s.tick = tick;
+
+  // drain queued chunk fetches into this slot (bounded per tick)
+  s.fetchIds.clear();
+  while (!fetchQueue_.empty() && s.fetchIds.size() < kFetchPerTick) {
+    uint32_t ci = fetchQueue_.front();
+    fetchQueue_.erase(fetchQueue_.begin());
+    fetchQueued_[ci] = 0;
+    s.fetchIds.push_back(ci);
+  }
+  for (size_t i = 0; i < s.fetchIds.size(); i++) {
+    enc.CopyBufferToBuffer(voxels, (uint64_t)s.fetchIds[i] * kChunkBytes, s.buf,
+                           kFetchOff + i * kChunkBytes, kChunkBytes);
+  }
 
   // clamp 3x3x3 window to the chunk grid
   auto clampBase = [](int v) {
@@ -74,6 +127,7 @@ bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc
   enc.CopyBufferToBuffer(occupancy, 0, s.buf, kOccOff, kOccBytes);
   enc.CopyBufferToBuffer(hash, 0, s.buf, kHashOff, 16);
   enc.CopyBufferToBuffer(pick, 0, s.buf, kPickOff, 32);
+  enc.CopyBufferToBuffer(particleCounts, 0, s.buf, kPCountOff, 16);
   lastSlot_ = slot;
   return true;
 }
@@ -103,14 +157,38 @@ void World::KickReadback() {
             uint32_t active = 0;
             uint64_t total = 0;
             for (uint32_t i = 0; i < kNumChunks; i++) {
-              active += dirtyW[i] != 0 ? 1 : 0;
+              snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
+              active += snap_.dirtyFlags[i];
               total += occW[i];
             }
             snap_.activeChunks = active;
             snap_.voxelTotal = total;
             std::memcpy(&snap_.worldHash, p + kHashOff, 4);
             std::memcpy(snap_.pick, p + kPickOff, 32);
+            uint32_t pcounts[2];
+            std::memcpy(pcounts, p + kPCountOff, 8);
+            snap_.particleCount =
+                std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
+            snap_.tick = sl.tick;
             snap_.valid = true;
+
+            // fetched chunks land in the CPU cache, stamped with their tick
+            for (size_t i = 0; i < sl.fetchIds.size(); i++) {
+              CachedChunk& cc = cache_[sl.fetchIds[i]];
+              if (cc.version <= sl.tick) {
+                cc.version = sl.tick;
+                cc.voxels.assign(
+                    (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
+                    (const uint32_t*)(p + kFetchOff + (i + 1) * kChunkBytes));
+              }
+            }
+            // bound the cache (drop chunks far in the past)
+            if (cache_.size() > 1024) {
+              for (auto it = cache_.begin(); it != cache_.end();) {
+                if (it->second.version + 600 < sl.tick) it = cache_.erase(it);
+                else ++it;
+              }
+            }
           }
           sl.buf.Unmap();
         }

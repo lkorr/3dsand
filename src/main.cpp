@@ -17,9 +17,12 @@
 #include "gpu/context.h"
 #include "gpu/resources.h"
 #include "math3d.h"
+#include "phys/debris.h"
+#include "phys/physics.h"
 #include "sim/materials.h"
 #include "sim/simulation.h"
 #include "sim/world.h"
+#include "sim/worldio.h"
 #include "ui/overlay.h"
 
 namespace {
@@ -59,21 +62,39 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
 }
 
 // Encode + submit one sim tick (uniform writes must precede the submit and
-// happen once per tick, hence submit-per-tick).
+// happen once per tick, hence submit-per-tick). particlesActive must be
+// derived only from tick-deterministic inputs (explosion history + a settled
+// particle count), never from frame timing — see DESIGN.md §2/§4.
 void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
-                uint32_t seed, const std::vector<BrushOp>& ops, bool hashEnable,
-                IVec3 playerChunk, bool wantReadback) {
-  TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u};
+                uint32_t seed, const std::vector<BrushOp>& ops,
+                const std::vector<ExplosionOp>& exps,
+                const std::vector<CellOp>& cells, bool hashEnable,
+                IVec3 playerChunk, bool wantReadback, bool particlesActive) {
+  particlesActive = particlesActive || !exps.empty();
+  uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
+  TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
+                (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
+  if (!exps.empty())
+    ctx.queue.WriteBuffer(world.expOps, 0, exps.data(), exps.size() * sizeof(ExplosionOp));
+  if (cellCount > 0)
+    ctx.queue.WriteBuffer(world.cellOps, 0, cells.data(), cellCount * sizeof(CellOp));
+  if (particlesActive) {
+    // the write page starts each tick empty; survivors + emissions repopulate
+    uint32_t zero = 0;
+    ctx.queue.WriteBuffer(world.particleCounts, (1 - sim.Page()) * 4, &zero, 4);
+  }
 
   wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable);
+  sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
+                 particlesActive, cellCount);
   bool doCopy = false;
   if (wantReadback) {
     doCopy = world.EncodeReadbacks(ctx.device, enc,
-                                   {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
+                                   {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
+                                   1 - sim.Page(), tick);
     if (doCopy) world.EncodeDirtyCopy(enc, sim.DirtyNext());
   }
   wgpu::CommandBuffer cmd = enc.Finish();
@@ -119,6 +140,9 @@ bool WriteBmp(const std::string& path, const std::vector<uint8_t>& rgba,
   return true;
 }
 
+// Whole-world hash of a quiescent world (no tick): save/load verification.
+uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed);
+
 // Synchronously read the 4-byte world hash (selftest only).
 uint32_t ReadHashSync(GpuContext& ctx, World& world) {
   wgpu::Buffer staging = CreateBuffer(ctx.device, 16,
@@ -139,6 +163,16 @@ uint32_t ReadHashSync(GpuContext& ctx, World& world) {
       });
   ctx.instance.WaitAny(f, UINT64_MAX);
   return result;
+}
+
+uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
+  TickParams tp{0, seed, 0, 1, 0, 0, 0, 0};
+  ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  sim.EncodeHashOnly(enc);
+  wgpu::CommandBuffer cmd = enc.Finish();
+  ctx.queue.Submit(1, &cmd);
+  return ReadHashSync(ctx, world);
 }
 
 std::vector<BrushOp> SelftestOps(uint32_t tick) {
@@ -164,8 +198,47 @@ std::vector<BrushOp> SelftestOps(uint32_t tick) {
   return ops;
 }
 
+// Explosion + particle coverage for the determinism hashes: a terrain blast
+// (solids/powder ejecta) and a pool blast (liquid splash).
+std::vector<ExplosionOp> SelftestExps(uint32_t tick, uint32_t seed) {
+  std::vector<ExplosionOp> exps;
+  if (tick == 60) {
+    int h = World::TerrainHeight(100, 100, seed);
+    exps.push_back({100, h, 100, 14, 400, 0, 0, 0});
+  }
+  if (tick == 90) {
+    exps.push_back({176, 50, 176, 10, 300, 0, 0, 0});
+  }
+  return exps;
+}
+constexpr uint32_t kSelftestFirstExp = 60;
+// particles are possible from the first scripted explosion until well after
+// the last ejecta has reinserted; must be a pure function of tick (§2/§4)
+bool SelftestParticlesActive(uint32_t tick) { return tick >= kSelftestFirstExp; }
+
+// Synchronously read both particle page counts (selftest only).
+void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
+  wgpu::Buffer staging = CreateBuffer(ctx.device, 16,
+                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                      "countsRead");
+  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.particleCounts, 0, staging, 0, 16);
+  wgpu::CommandBuffer cmd = enc.Finish();
+  ctx.queue.Submit(1, &cmd);
+  wgpu::Future f = staging.MapAsync(
+      wgpu::MapMode::Read, 0, 16, wgpu::CallbackMode::WaitAnyOnly,
+      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        if (status == wgpu::MapAsyncStatus::Success) {
+          std::memcpy(out, staging.GetConstMappedRange(0, 16), 8);
+          staging.Unmap();
+        }
+      });
+  ctx.instance.WaitAny(f, UINT64_MAX);
+}
+
 int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
-                const std::vector<MaterialDef>& mats) {
+                const std::vector<MaterialDef>& mats, Physics& phys,
+                DebrisSystem& debris) {
   std::printf("=== selftest ===\n");
   constexpr int kTicks = 200;
 
@@ -175,8 +248,9 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= kTicks; t++) {
-      SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t), true,
-                 {8, 3, 8}, false);
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t),
+                 SelftestExps(t, kDefaultSeed), {}, true, {8, 3, 8}, false,
+                 SelftestParticlesActive(t));
       hashes[run].push_back(ReadHashSync(ctx, world));
     }
   }
@@ -194,18 +268,29 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   }
 
   // sleep: a settled world must go (nearly) fully idle — the M2 exit
-  // criterion, and the guard against reaction rules that never stop matching
+  // criterion, and the guard against reaction rules that never stop matching.
+  // Includes an explosion: every ejected particle must reinsert and die.
   uint32_t sleepActive = 0;
+  uint32_t particlesLeft = 0;
   {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     uint32_t t = 0;
-    for (int i = 0; i < 500; i++)  // seeds sprout+harden, pools settle
-      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, false, {8, 3, 8}, false);
+    for (int i = 0; i < 500; i++) {  // seeds sprout+harden, pools settle
+      std::vector<ExplosionOp> exps;
+      if (i == 30) exps.push_back({110, 76, 110, 12, 350, 0, 0, 0});  // wood slab
+      bool pactive = i >= 30 && i < 460;
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, {8, 3, 8},
+                 false, pactive);
+    }
     ctx.WaitIdle();
+    uint32_t counts[2] = {};
+    ReadCountsSync(ctx, world, counts);
+    particlesLeft = std::min(counts[sim.Page()], kParticleCap);
     double s0 = NowSec();  // settled-world cost: the whole point of dirty dispatch
     for (int i = 0; i < 100; i++)
-      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, false, {8, 3, 8}, false);
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
     ctx.WaitIdle();
     std::printf("sim settled: %.3f ms/tick\n", (NowSec() - s0) * 1000.0 / 100.0);
 
@@ -271,19 +356,25 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       std::printf("\n");
     }
   }
-  bool sleepOk = sleepActive < 32;
-  std::printf("sleep: %s (%u / 4096 chunks active after 600 settle ticks)\n",
-              sleepOk ? "PASS" : "FAIL", sleepActive);
+  bool sleepOk = sleepActive < 32 && particlesLeft == 0;
+  std::printf("sleep: %s (%u / 4096 chunks active, %u particles alive after "
+              "600 settle ticks)\n",
+              sleepOk ? "PASS" : "FAIL", sleepActive, particlesLeft);
 
-  // sim perf: worst-case-ish activity, synchronous timing
+  // sim perf: worst-case-ish activity (brushes + explosions + particles),
+  // synchronous timing
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   for (uint32_t t = 1; t <= 60; t++)  // warm up with heavy activity
-    SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t), false, {8, 3, 8}, false);
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t),
+               SelftestExps(t, kDefaultSeed), {}, false, {8, 3, 8}, false,
+               SelftestParticlesActive(t));
   ctx.WaitIdle();
   double t0 = NowSec();
   for (uint32_t t = 61; t <= 160; t++)
-    SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t), false, {8, 3, 8}, false);
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t),
+               SelftestExps(t, kDefaultSeed), {}, false, {8, 3, 8}, false,
+               SelftestParticlesActive(t));
   ctx.WaitIdle();
   double simMs = (NowSec() - t0) * 1000.0 / 100.0;
   std::printf("sim: %.2f ms/tick (active scene, includes submit overhead)\n", simMs);
@@ -311,8 +402,9 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, shadows, 0);
       wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       wgpu::RenderPassEncoder rp =
-          sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm);
+          sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
       sim.DrawWorld(rp);
+      sim.DrawParticles(rp);
       rp.End();
       wgpu::CommandBuffer cmd = enc.Finish();
       ctx.queue.Submit(1, &cmd);
@@ -371,7 +463,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     for (int i = 0; i < 240; i++) {
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
-      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, false, pc, true);
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, pc, true, false);
       ctx.WaitIdle();
       ctx.ProcessEvents();  // deliver the mirror
       player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
@@ -384,9 +476,139 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 walkOk ? "PASS" : "FAIL", player.grounded ? 1 : 0, feet, h);
   }
 
+  // M6 debris: build a stone arm held up by one pillar, blast the pillar,
+  // and require the arm to (a) get detected as an island, (b) fall as a Jolt
+  // body onto marching-cubes terrain, (c) go to sleep.
+  bool debrisOk = false;
+  {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    int h = World::TerrainHeight(60, 60, kDefaultSeed);
+    uint32_t t = 2000;
+    uint32_t bodiesSeen = 0;
+
+    for (int i = 0; i < 420; i++) {
+      std::vector<BrushOp> ops;
+      if (i < 8) {
+        // pillar: stacked stone spheres; arm: a bar of spheres at the top
+        ops.push_back({60, h + 2 + i * 3, 60, 2, kMatStone, 1, 0, 0});
+        if (i < 3) ops.push_back({60 + 6 * (i + 1), h + 22, 60, 3, kMatStone, 1, 0, 0});
+        ops.push_back({60, h + 22, 60, 3, kMatStone, 1, 0, 0});
+      }
+      std::vector<ExplosionOp> exps;
+      if (i == 40) {
+        exps.push_back({60, h + 10, 60, 7, 500, 0, 0, 0});
+        debris.AddDestructionEvent(t + 1, {50, h, 50}, {84, h + 26, 70});
+      }
+
+      std::vector<CellOp> cellOps;
+      debris.PreTick(t + 1, world, cellOps);
+      ++t;
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, exps, cellOps, false,
+                 {3, (h + 10) / 16, 3}, true, i >= 40 && i < 380);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      bodiesSeen = std::max(bodiesSeen, debris.BodyCount());
+    }
+    uint32_t awake = debris.ActiveBodyCount();
+    debrisOk = bodiesSeen >= 1 && awake == 0;
+    std::printf("debris: %s (%u bodies spawned, %u awake after settling, "
+                "%u events pending)\n",
+                debrisOk ? "PASS" : "FAIL", bodiesSeen, awake,
+                debris.PendingEvents());
+
+    // visual proof: render the settled debris field to screenshot_debris.bmp
+    if (debris.BodyCount() > 0) {
+      std::vector<BodyVoxInst> inst;
+      debris.BuildInstances(inst);
+      ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                            inst.size() * sizeof(BodyVoxInst));
+      std::vector<BodyXformGpu> xf;
+      debris.BuildXforms(xf);
+      ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                            xf.size() * sizeof(BodyXformGpu));
+
+      const uint32_t W = 1280, H = 720;
+      wgpu::TextureDescriptor td{};
+      td.size = {W, H, 1};
+      td.format = wgpu::TextureFormat::RGBA8Unorm;
+      td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+      wgpu::Texture tex = ctx.device.CreateTexture(&td);
+      Camera cam2;
+      cam2.yaw = -2.356f;
+      cam2.pitch = -0.32f;
+      Vec3 eye{60.0f + 34, (float)h + 26, 60.0f + 34};
+      WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0);
+      wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
+          enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      sim.DrawParticles(rp);
+      sim.DrawBodies(rp, debris.InstanceCount());
+      rp.End();
+      wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                       wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                       "debrisShot");
+      wgpu::TexelCopyTextureInfo srcT{};
+      srcT.texture = tex;
+      wgpu::TexelCopyBufferInfo dstB{};
+      dstB.buffer = shot;
+      dstB.layout.bytesPerRow = W * 4;
+      dstB.layout.rowsPerImage = H;
+      wgpu::Extent3D ext{W, H, 1};
+      enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
+      wgpu::CommandBuffer cmd = enc.Finish();
+      ctx.queue.Submit(1, &cmd);
+      std::vector<uint8_t> pixels(W * H * 4);
+      bool got = false;
+      wgpu::Future f = shot.MapAsync(
+          wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            if (status == wgpu::MapAsyncStatus::Success) {
+              std::memcpy(pixels.data(), shot.GetConstMappedRange(0, pixels.size()),
+                          pixels.size());
+              shot.Unmap();
+              got = true;
+            }
+          });
+      ctx.instance.WaitAny(f, UINT64_MAX);
+      if (got && WriteBmp("screenshot_debris.bmp", pixels, W, H))
+        std::printf("wrote screenshot_debris.bmp\n");
+    }
+  }
+
+  // M2 save/load: snapshot at tick 100, diverge 50 ticks, load — the world
+  // hash must return exactly to the snapshot value (stamp bytes excluded).
+  bool saveOk = false;
+  {
+    const char* kPath = "selftest_world.svx";
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t t = 3000;
+    for (int i = 0; i < 100; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i), {}, {}, false,
+                 {8, 3, 8}, false, false);
+    ctx.WaitIdle();
+    uint32_t h1 = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    bool saved = SaveWorld(ctx, world, kPath);
+    for (int i = 100; i < 150; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i), {}, {}, false,
+                 {8, 3, 8}, false, false);
+    ctx.WaitIdle();
+    uint32_t hDiverged = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    bool loaded = LoadWorld(ctx, world, sim, kPath);
+    uint32_t h2 = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    saveOk = saved && loaded && h1 == h2 && h1 != hDiverged;
+    std::printf("save/load: %s (hash %08x -> diverged %08x -> restored %08x)\n",
+                saveOk ? "PASS" : "FAIL", h1, hDiverged, h2);
+    std::remove(kPath);
+  }
+
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk && sleepOk;
+  bool pass = deterministic && walkOk && sleepOk && debrisOk && saveOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
@@ -399,6 +621,47 @@ struct KeyEdge {
     return e;
   }
 };
+
+// Thrown bouncing bomb — the first CPU gameplay projectile (DESIGN.md §8).
+// Float math is fine here: the grid only ever sees the ExplosionOp it emits,
+// which travels through the deterministic MutationQueue path.
+struct Grenade {
+  Vec3 pos, vel;  // voxel units, voxels/s
+  float fuse;     // seconds
+};
+
+// Integrate one 30 Hz tick against the voxel mirror. Returns true on detonate.
+bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt) {
+  g.fuse -= dt;
+  if (g.fuse <= 0.0f) return true;
+  g.vel.y -= (9.81f / kVoxelMeters) * dt;
+  IVec3 at{ifloor(g.pos.x), ifloor(g.pos.y), ifloor(g.pos.z)};
+  if (kindAt(at) == CellKind::Liquid) g.vel = g.vel * 0.90f;  // water drag
+
+  for (int axis = 0; axis < 3; axis++) {
+    float& v = axis == 0 ? g.vel.x : axis == 1 ? g.vel.y : g.vel.z;
+    float d = v * dt;
+    if (d == 0) continue;
+    float* c = axis == 0 ? &g.pos.x : axis == 1 ? &g.pos.y : &g.pos.z;
+    float step = d > 0 ? 0.4f : -0.4f;
+    int n = (int)std::ceil(std::abs(d) / 0.4f);
+    for (int i = 0; i < n; i++) {
+      float prev = *c;
+      float next = (i == n - 1) ? *c + (d - step * i) : *c + step;
+      *c = next;
+      IVec3 cell{ifloor(g.pos.x), ifloor(g.pos.y), ifloor(g.pos.z)};
+      if (kindAt(cell) == CellKind::Solid) {
+        *c = prev;
+        v = -v * 0.45f;  // bounce with restitution
+        if (axis != 0) g.vel.x *= 0.8f;
+        if (axis != 1) g.vel.y *= 0.8f;
+        if (axis != 2) g.vel.z *= 0.8f;
+        break;
+      }
+    }
+  }
+  return false;
+}
 
 }  // namespace
 
@@ -440,7 +703,12 @@ int main(int argc, char** argv) {
   Simulation sim;
   if (!sim.Init(ctx.device, world, mats, reactions, assetDir + "/shaders")) return 1;
 
-  if (selftest) return RunSelftest(ctx, world, sim, mats);
+  Physics phys;
+  if (!phys.Init()) return 1;
+  DebrisSystem debris;
+  debris.Init(&phys, mats);
+
+  if (selftest) return RunSelftest(ctx, world, sim, mats, phys, debris);
 
   Overlay overlay;
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
@@ -468,7 +736,12 @@ int main(int argc, char** argv) {
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
 
-  KeyEdge eP, eN, eV, eF1, eF5, eR, eEsc, eLBracket, eRBracket, eJump;
+  KeyEdge eP, eN, eV, eF1, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+      eG, eX;
+  std::vector<Grenade> grenades;
+  // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
+  bool everExploded = false;
+  uint32_t lastExplosionTick = 0;
   uint32_t tick = 0;
   double lastTime = NowSec();
   double accumulator = 0;
@@ -506,6 +779,8 @@ int main(int argc, char** argv) {
     if (eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
     if (eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
     if (eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
+    if (eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
+    if (eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
     if (eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
       ui.brushRadius = std::max(1, ui.brushRadius - 1);
@@ -513,6 +788,15 @@ int main(int argc, char** argv) {
       ui.brushRadius = std::min(7, ui.brushRadius + 1);
     for (int i = 0; i < 8; i++)
       if (key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) ui.brushMaterial = i + 1;
+
+    if (captured && eG.Pressed(key(GLFW_KEY_G))) {
+      Grenade g;
+      g.pos = player.EyePos() + cam.Forward() * 2.0f;
+      g.vel = cam.Forward() * (20.0f / kVoxelMeters) + player.vel;
+      g.fuse = 2.2f;
+      grenades.push_back(g);
+    }
+    if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
 
     PlayerInput pin;
     pin.forward = (key(GLFW_KEY_W) ? 1.f : 0.f) - (key(GLFW_KEY_S) ? 1.f : 0.f);
@@ -537,6 +821,7 @@ int main(int argc, char** argv) {
         mats = std::move(newMats);
         reactions = std::move(newReactions);
         sim.UploadTables(ctx.queue, mats, reactions);
+        debris.OnMaterialsReloaded(mats);
         classOf.clear();
         for (auto& m : mats) classOf.push_back(m.gpu.klass);
         ui.materialNames.clear();
@@ -556,6 +841,23 @@ int main(int argc, char** argv) {
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
       player.pos = Vec3{140, (float)(spawnH + 10), 140};
       tick = 0;
+      grenades.clear();
+      everExploded = false;
+      debris.Reset();
+    }
+    if (ui.saveWorld) {
+      ui.saveWorld = false;
+      ctx.WaitIdle();
+      SaveWorld(ctx, world, "world.svx");
+    }
+    if (ui.loadWorld) {
+      ui.loadWorld = false;
+      ctx.WaitIdle();
+      if (LoadWorld(ctx, world, sim, "world.svx")) {
+        grenades.clear();
+        everExploded = false;
+        debris.Reset();
+      }
     }
 
     // ---- player (per frame, against the latest one-tick-latent mirror) ----
@@ -582,14 +884,60 @@ int main(int argc, char** argv) {
       BrushOp op;
       if (mouseL && brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), false, op))
         ops.push_back(op);
-      if (mouseR && brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), true, op))
+      if (mouseR && brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), true, op)) {
         ops.push_back(op);
+        // erasing can cut supports: queue an island check around the hole
+        debris.AddDestructionEvent(tick, {op.x - op.radius, op.y - op.radius, op.z - op.radius},
+                                   {op.x + op.radius, op.y + op.radius, op.z + op.radius});
+      }
+
+      // island detection results + terrain collision upkeep (may add cell ops)
+      std::vector<CellOp> cellOps;
+      debris.PreTick(tick, world, cellOps);
+
+      // explosions: X-detonate at the crosshair + grenade fuses
+      std::vector<ExplosionOp> exps;
+      if (ui.pendingDetonate) {
+        ui.pendingDetonate = false;
+        const WorldSnapshot& snap = world.Snap();
+        if (snap.valid && snap.pick[0] != 0) {
+          exps.push_back({(int)snap.pick[2], (int)snap.pick[3], (int)snap.pick[4],
+                          12, 340, 0, 0, 0});
+        }
+      }
+      for (size_t i = 0; i < grenades.size();) {
+        if (UpdateGrenade(grenades[i], kTickDt, kindAt)) {
+          if (exps.size() < kMaxExplosionsPerTick) {
+            exps.push_back({ifloor(grenades[i].pos.x), ifloor(grenades[i].pos.y),
+                            ifloor(grenades[i].pos.z), 13, 380, 0, 0, 0});
+          }
+          grenades[i] = grenades.back();
+          grenades.pop_back();
+        } else {
+          i++;
+        }
+      }
+      if (!exps.empty()) {
+        everExploded = true;
+        lastExplosionTick = tick;
+        for (const ExplosionOp& e : exps) {
+          debris.AddDestructionEvent(tick, {e.x - e.radius, e.y - e.radius, e.z - e.radius},
+                                     {e.x + e.radius, e.y + e.radius, e.z + e.radius});
+          phys.ApplyRadialImpulse(Vec3{(float)e.x, (float)e.y, (float)e.z},
+                                  (float)e.radius * 3.0f, (float)e.power * 0.15f);
+        }
+      }
+      bool particlesActive =
+          everExploded &&
+          (tick - lastExplosionTick < 400 || world.Snap().particleCount > 0);
 
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
       double t0 = NowSec();
-      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops,
-                 tick % 15 == 0 /*hash occasionally*/, pc, true);
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
+                 tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive);
+      phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
+      debris.PostStep();
       tickMsSmooth += ((float)((NowSec() - t0) * 1000.0) - tickMsSmooth) * 0.1f;
     }
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
@@ -610,6 +958,9 @@ int main(int argc, char** argv) {
       ui.voxelTotal = world.Snap().voxelTotal;
       ui.worldHash = world.Snap().worldHash;
       ui.mirrorValid = world.Snap().valid;
+      ui.particleCount = world.Snap().particleCount;
+      ui.bodyCount = debris.BodyCount();
+      ui.activeBodyCount = debris.ActiveBodyCount();
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
@@ -617,9 +968,46 @@ int main(int argc, char** argv) {
       overlay.BeginFrame();
       overlay.Draw(ui);
 
+      // grenades render as emissive sprite cubes (flash as the fuse runs out)
+      std::vector<Sprite> sprv;
+      for (const Grenade& g : grenades) {
+        float flash =
+            (g.fuse < 0.7f && std::fmod(g.fuse, 0.22f) < 0.11f) ? 0.9f : 0.05f;
+        Sprite s{};
+        s.pos[0] = g.pos.x; s.pos[1] = g.pos.y; s.pos[2] = g.pos.z;
+        s.halfSize = 1.3f;
+        s.color = 0xFF202038;  // dark, slightly red (0xAABBGGRR)
+        s.emission = flash;
+        sprv.push_back(s);
+      }
+      if (!sprv.empty()) {
+        if (sprv.size() > kMaxSprites) sprv.resize(kMaxSprites);
+        ctx.queue.WriteBuffer(world.sprites, 0, sprv.data(),
+                              sprv.size() * sizeof(Sprite));
+      }
+
+      // debris bodies: instances change on spawn/despawn, transforms per frame
+      if (debris.InstancesDirty()) {
+        std::vector<BodyVoxInst> inst;
+        debris.BuildInstances(inst);
+        if (!inst.empty())
+          ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                                inst.size() * sizeof(BodyVoxInst));
+      }
+      if (debris.BodyCount() > 0) {
+        std::vector<BodyXformGpu> xf;
+        debris.BuildXforms(xf);
+        ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                              xf.size() * sizeof(BodyXformGpu));
+      }
+
       wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-      wgpu::RenderPassEncoder rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat);
+      wgpu::RenderPassEncoder rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
+                                                       ctx.width, ctx.height);
       sim.DrawWorld(rp);
+      sim.DrawParticles(rp);
+      sim.DrawBodies(rp, debris.InstanceCount());
+      sim.DrawSprites(rp, (uint32_t)sprv.size());
       overlay.Render(rp);
       rp.End();
       wgpu::CommandBuffer cmd = enc.Finish();

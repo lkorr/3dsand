@@ -23,7 +23,9 @@ set(DAWN_ENABLE_OPENGLES   OFF CACHE BOOL "" FORCE)
 set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(DAWN_USE_GLFW ON CACHE BOOL "" FORCE)
 set(TINT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(TINT_BUILD_CMD_TOOLS OFF CACHE BOOL "" FORCE)
+# The `tint` CLI is our fast WGSL validator (scripts/check_shaders.sh) — seconds
+# of feedback on a shader edit instead of a full link + launch.
+set(TINT_BUILD_CMD_TOOLS ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   dawn
@@ -58,6 +60,29 @@ target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
 target_link_libraries(imgui_lib PUBLIC glfw dawn::webgpu_dawn)
 
 # ---------------------------------------------------------------------------
+# Jolt Physics (rigid bodies for debris islands, DESIGN.md §7)
+# ---------------------------------------------------------------------------
+set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+# DESIGN.md §10: keep lockstep viable — Jolt supports cross-platform determinism
+set(CROSS_PLATFORM_DETERMINISTIC ON CACHE BOOL "" FORCE)
+# match the rest of the project (/MD); Jolt defaults to /MT and the link fails
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+  JoltPhysics
+  GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+  GIT_TAG        v5.3.0
+  GIT_SHALLOW    TRUE
+  SOURCE_SUBDIR  Build
+)
+FetchContent_MakeAvailable(JoltPhysics)
+
+# ---------------------------------------------------------------------------
 # nlohmann/json
 # ---------------------------------------------------------------------------
 FetchContent_Declare(
@@ -76,11 +101,15 @@ add_executable(sandvox
   src/gpu/context.cpp
   src/gpu/resources.cpp
   src/sim/world.cpp
+  src/sim/worldio.cpp
   src/sim/simulation.cpp
   src/sim/materials.cpp
   src/game/player.cpp
   src/game/camera.cpp
   src/game/brush.cpp
+  src/phys/physics.cpp
+  src/phys/debris.cpp
+  src/phys/marching_cubes.cpp
   src/ui/overlay.cpp
 )
 target_include_directories(sandvox PRIVATE src)
@@ -92,6 +121,7 @@ target_link_libraries(sandvox PRIVATE
   glfw
   imgui_lib
   nlohmann_json::nlohmann_json
+  Jolt
 )
 
 # Run from any cwd: bake the asset dir absolute path for dev builds.

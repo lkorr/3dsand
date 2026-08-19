@@ -189,14 +189,26 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   return out;
 }
 
+struct FSOut {
+  @location(0) color : vec4f,
+  @builtin(frag_depth) depth : f32,
+};
+
 @fragment
-fn fs(in : VSOut) -> @location(0) vec4f {
+fn fs(in : VSOut) -> FSOut {
   let ndc = in.uv;
   let rd = normalize(R.camFwd
                    + R.camRight * (ndc.x * R.tanHalfFov * R.aspect)
                    + R.camUp    * (ndc.y * R.tanHalfFov));
 
   let h = trace(R.camPos, rd, 4096, true);
+
+  // reversed-Z depth so raster geometry (particles/debris) composites in
+  var depth = 0.0;  // sky = far
+  if (h.hit) {
+    let viewZ = h.t * dot(rd, R.camFwd);
+    depth = clamp(KNEAR / max(viewZ, KNEAR), 0.0, 1.0);
+  }
 
   var color : vec3f;
   if (!h.hit) {
@@ -265,5 +277,8 @@ fn fs(in : VSOut) -> @location(0) vec4f {
 
   // gamma-ish
   color = pow(max(color, vec3f(0.0)), vec3f(1.0 / 2.2));
-  return vec4f(color, 1.0);
+  var out : FSOut;
+  out.color = vec4f(color, 1.0);
+  out.depth = depth;
+  return out;
 }

@@ -26,7 +26,8 @@ struct MaterialGpu {
   uint32_t reactOffset, reactCount; // bucket into the flat reaction array
   uint32_t moveEvery;               // viscosity: move only when tick % moveEvery == 0
   uint32_t opacity;                 // 0..255 media absorbance (liquids/gases)
-  uint32_t pad1, pad2, pad3, pad4;
+  uint32_t hardness;                // 0..255 blast/dig resistance (DESIGN.md §7)
+  uint32_t pad2, pad3, pad4;
 };
 static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
 
@@ -55,6 +56,9 @@ struct MaterialDef {
   std::string name;
   MaterialGpu gpu{};
   std::vector<std::string> tags;
+  // What sub-8-voxel islands of this material crumble into (DESIGN.md §7).
+  // Empty = default (dust for organics/flammables, gravel otherwise).
+  std::string rubble;
 };
 
 // Loads materials.json + reactions.json and compiles them into GPU tables:

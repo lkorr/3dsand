@@ -15,7 +15,9 @@ bool Overlay::Init(GLFWwindow* window, const wgpu::Device& device,
   info.Device = device.Get();
   info.NumFramesInFlight = 3;
   info.RenderTargetFormat = (WGPUTextureFormat)format;
-  info.DepthStencilFormat = WGPUTextureFormat_Undefined;
+  // must match Simulation::kDepthFormat — the overlay draws into the same
+  // render pass as the raymarch + debris pipelines
+  info.DepthStencilFormat = WGPUTextureFormat_Depth32Float;
   return ImGui_ImplWGPU_Init(&info);
 }
 
@@ -42,8 +44,9 @@ void Overlay::Draw(UIState& s) {
   ImGui::Text("%.0f fps  (%.2f ms frame, %.2f ms tick cpu)", s.fps, s.frameMs,
               s.tickCpuMs);
   ImGui::Text("tick %u   active chunks %u / 4096", s.tick, s.activeChunks);
-  ImGui::Text("voxels %.2f M   hash %08x %s", s.voxelTotal / 1e6, s.worldHash,
-              s.mirrorValid ? "" : "(mirror pending)");
+  ImGui::Text("voxels %.2f M   particles %u   hash %08x %s", s.voxelTotal / 1e6,
+              s.particleCount, s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
+  ImGui::Text("debris bodies %u (%u awake)", s.bodyCount, s.activeBodyCount);
   ImGui::Text("pos %.0f %.0f %.0f  (%s)", s.playerPos[0], s.playerPos[1],
               s.playerPos[2], s.fly ? "fly" : "walk");
   ImGui::Separator();
@@ -85,7 +88,15 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   if (ImGui::Button("regen world")) s.regenWorld = true;
 
+  if (ImGui::Button("save world (F9)")) s.saveWorld = true;
+  ImGui::SameLine();
+  if (ImGui::Button("load world (F10)")) s.loadWorld = true;
+  ImGui::SameLine();
+
+  if (ImGui::Button("detonate at crosshair (X)")) s.pendingDetonate = true;
+
   ImGui::TextDisabled("LMB paint  RMB erase  1-8 material  Esc cursor  F1 UI");
+  ImGui::TextDisabled("G throw grenade  X detonate at crosshair");
   ImGui::End();
 }
 

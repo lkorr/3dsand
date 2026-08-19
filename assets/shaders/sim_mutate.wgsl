@@ -13,6 +13,12 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(6) var<storage, read> ops : array<BrushOp>;
 
+struct CellOp {
+  cellIdx : u32,
+  word    : u32,
+};
+@group(0) @binding(14) var<storage, read> cellOps : array<CellOp>;
+
 fn markBoth(c : vec3<i32>) {
   let cu = vec3<u32>(c);
   let lo = cu % CHUNK;
@@ -62,4 +68,22 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
   voxels[idx] = packVox(op.material, state, 0xFFu);
   markBoth(c);
+}
+
+// Exact-cell writes (island removal / rubble handoff, DESIGN.md §7). Same
+// MutationQueue discipline as the brush: the op stream is the only CPU->grid
+// path, so saves/replays/networking capture island events for free.
+// Dispatch: ceil(cellCount / 64) workgroups of 64.
+@compute @workgroup_size(64)
+fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= T.cellCount) { return; }
+  let op = cellOps[gid.x];
+  if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
+  voxels[op.cellIdx] = op.word;
+
+  let ci = op.cellIdx / CHUNK_VOL;
+  let lo = op.cellIdx % CHUNK_VOL;
+  let cc = vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK, ci / (NCHUNK * NCHUNK));
+  let l = vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK));
+  markBoth(vec3<i32>(cc * CHUNK + l));
 }

@@ -45,7 +45,8 @@ struct Material {
   reactCount  : u32,
   moveEvery   : u32,   // viscosity: only move on ticks where tick % moveEvery == 0
   opacity     : u32,   // 0..255 media absorbance (translucent liquids/gases)
-  _p1 : u32, _p2 : u32, _p3 : u32, _p4 : u32,
+  hardness    : u32,   // 0..255 blast/dig resistance (DESIGN.md §7)
+  _p2 : u32, _p3 : u32, _p4 : u32,
 };
 
 // Reaction kinds (bits 0..1 of packed) — DESIGN.md §6, authored in
@@ -78,6 +79,10 @@ struct TickParams {
   seed       : u32,
   opsCount   : u32,
   hashEnable : u32,
+  expCount   : u32,  // explosion ops this tick
+  page       : u32,  // particle read page (0/1) this tick
+  cellCount  : u32,  // exact-cell ops this tick
+  _p1        : u32,
 };
 
 struct PassParams {
@@ -106,6 +111,85 @@ struct RenderParams {
   camFwd     : vec3f,  flags      : u32,   // bit0 = sun shadows
   sunDir     : vec3f,  _p1        : f32,
 };
+
+// Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
+// Shared by the raymarcher (frag_depth) and every raster pipeline so raster
+// geometry (particles, debris bodies, sprites) composites exactly against the
+// raymarched terrain. KNEAR is in voxels.
+const KNEAR : f32 = 0.4;
+
+// Camera-basis projection for raster geometry — no matrices; identical math to
+// the raymarcher's ray construction, so depth agrees across both paths.
+fn projectView(rel : vec3f, R : RenderParams) -> vec4f {
+  let vx = dot(rel, R.camRight);
+  let vy = dot(rel, R.camUp);
+  let vz = dot(rel, R.camFwd);
+  return vec4f(vx / (R.tanHalfFov * R.aspect), vy / R.tanHalfFov, KNEAR, vz);
+}
+
+// ---- particles: voxels in flight (DESIGN.md §5) ----
+// All particle state is fixed-point integer (24.8, 1 voxel = 256): the
+// particle system is part of the deterministic sim, so the float ban applies.
+// Behavior is keyed ONLY on particle state + tick (never on buffer slot), so
+// the scheduling-dependent append ORDER of the ring cannot affect the grid.
+const PARTICLE_CAP  : u32 = 262144u;
+const CLAIM_SIZE    : u32 = 262144u;   // reinsertion claim hash (power of two)
+const PART_ONE      : i32 = 256;       // 1.0 voxel in fixed point
+const PART_GRAVITY  : i32 = 22;        // 9.81 m/s^2 in voxels/tick^2, fixed point
+const PART_MAX_VEL  : i32 = 1536;      // 6 voxels/tick terminal speed
+const PFLAG_ALIVE   : u32 = 1u;
+const PFLAG_PENDING : u32 = 2u;        // proposed a reinsertion this tick
+
+struct Particle {
+  px : i32, py : i32, pz : i32,   // position, fixed 24.8 voxels
+  vx : i32, vy : i32, vz : i32,   // velocity, fixed 24.8 voxels/tick
+  payload : u32,                  // bits 0..11 material, 12..15 state
+  flags   : u32,                  // PFLAG_*
+};
+
+// State-derived priority for reinsertion claims: atomicMax over these values
+// is order-independent, so the claim winner is bit-deterministic. Never mix
+// buffer slot indices into this.
+fn particlePriority(p : Particle) -> u32 {
+  let h = pcg(u32(p.px) ^ pcg(u32(p.py) ^ pcg(u32(p.pz) ^
+          pcg(u32(p.vx) ^ pcg(u32(p.vy) ^ pcg(u32(p.vz) ^ p.payload))))));
+  return h | 1u;  // nonzero (0 = empty claim slot)
+}
+fn claimSlot(cellIdx : u32) -> u32 {
+  return pcg(cellIdx) & (CLAIM_SIZE - 1u);
+}
+
+// Must match ExplosionOp in world.h (32 bytes).
+struct ExplosionOp {
+  cx : i32, cy : i32, cz : i32,
+  radius : i32,        // <= EXP_R_MAX
+  power  : i32,        // hardness budget at the center
+  _p0 : u32, _p1 : u32, _p2 : u32,
+};
+const EXP_R_MAX : i32 = 20;
+// dispatch box per op: (2*EXP_R_MAX+1)^3 cells in 4^3 workgroups
+const EXP_WG : u32 = 11u;  // ceil(41 / 4)
+const EXP_BOX : i32 = 41;  // 2*EXP_R_MAX + 1
+// per-op destruction scratch: one u32 per box cell holding (surviving power
+// + 1), 0 = not destroyed. Each mark thread writes only its own cell.
+const EXP_MASK_STRIDE : u32 = 68928u;  // 41^3 padded
+
+fn isqrt(v : u32) -> u32 {
+  var x = v;
+  var res = 0u;
+  var bit = 1u << 30u;
+  while (bit > v) { bit = bit >> 2u; }
+  while (bit != 0u) {
+    if (x >= res + bit) {
+      x -= res + bit;
+      res = (res >> 1u) + bit;
+    } else {
+      res = res >> 1u;
+    }
+    bit = bit >> 2u;
+  }
+  return res;
+}
 
 // Chunk-major addressing: each 16^3 chunk is one contiguous 16 KB block, so
 // chunk streaming/readback is a single buffer copy per chunk.

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <webgpu/webgpu_cpp.h>
@@ -43,12 +44,52 @@ struct BrushOp {
 };
 constexpr uint32_t kMaxOpsPerTick = 64;
 
+// Must match ExplosionOp in common.wgsl (32 bytes). Part of the MutationQueue
+// discipline: explosions enter the sim only through this op stream, so saves/
+// replays/networking capture them for free (DESIGN.md §2).
+struct ExplosionOp {
+  int32_t x, y, z;
+  int32_t radius;   // <= kMaxExplosionRadius
+  int32_t power;    // hardness budget at the center
+  uint32_t pad0 = 0, pad1 = 0, pad2 = 0;
+};
+constexpr uint32_t kMaxExplosionsPerTick = 8;
+constexpr int32_t kMaxExplosionRadius = 20;  // EXP_R_MAX in common.wgsl
+constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
+
+// Particle system sizes — must match common.wgsl.
+constexpr uint32_t kParticleCap = 262144;
+constexpr uint32_t kClaimSize = 262144;
+
+// CPU-authored render instance (grenades, markers) — must match Sprite in
+// debris.wgsl (32 bytes). Render-only: floats are fine here.
+struct Sprite {
+  float pos[3];
+  float halfSize;
+  uint32_t color;   // 0xAABBGGRR
+  float emission;
+  uint32_t pad0 = 0, pad1 = 0;
+};
+constexpr uint32_t kMaxSprites = 64;
+
+// Exact-cell MutationQueue op (8 bytes) — island removal / rubble handoff
+// (DESIGN.md §7). Must match sim_mutate.wgsl entry `cells`.
+struct CellOp {
+  uint32_t cellIdx;  // linear chunk-major cell index
+  uint32_t word;     // full voxel word to store (stamp byte included)
+};
+constexpr uint32_t kMaxCellOpsPerTick = 65536;
+
 // Must match TickParams in common.wgsl.
 struct TickParams {
   uint32_t tick;
   uint32_t seed;
   uint32_t opsCount;
   uint32_t hashEnable;
+  uint32_t expCount;   // explosion ops this tick
+  uint32_t page;       // particle read page (0/1)
+  uint32_t cellCount;  // exact-cell ops this tick
+  uint32_t pad1 = 0;
 };
 
 // Must match RenderParams in common.wgsl (std140-ish: vec3 + pad pairs).
@@ -76,6 +117,16 @@ struct WorldSnapshot {
   uint64_t voxelTotal = 0;
   uint32_t worldHash = 0;
   uint32_t pick[8] = {};
+  uint32_t particleCount = 0;         // live particles (post-resolve that tick)
+  uint32_t tick = 0;                  // sim tick this snapshot was captured at
+  std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
+};
+
+// One CPU-cached chunk of voxel data, fetched on demand through the async
+// readback ring (island detection, terrain collision meshing).
+struct CachedChunk {
+  uint32_t version = 0;               // tick whose end-state this data reflects
+  std::vector<uint32_t> voxels;       // kChunkVol words
 };
 
 // Owns every GPU buffer of the simulation plus the async readback ring.
@@ -85,8 +136,20 @@ class World {
 
   // Records the per-tick readback copies into the encoder. Call after the sim
   // passes. Returns false if all ring slots are still in flight (skip copies).
+  // particleLivePage: which particleCounts index holds the post-tick count.
+  // tick: the sim tick being encoded (stamps the snapshot + fetched chunks).
   bool EncodeReadbacks(const wgpu::Device& device, const wgpu::CommandEncoder& enc,
-                       IVec3 playerChunkBase);
+                       IVec3 playerChunkBase, uint32_t particleLivePage,
+                       uint32_t tick);
+
+  // ---- on-demand chunk fetches (island detection / terrain meshing) ----
+  // Queue a chunk for CPU readback; duplicates are coalesced. Up to
+  // kFetchPerTick chunks ride each tick's readback slot (bounded traffic).
+  void RequestChunkFetch(uint32_t chunkIdx);
+  // Cached copy of a chunk, or nullptr if never fetched. version is the tick
+  // whose post-sim state the data reflects.
+  const CachedChunk* Cached(uint32_t chunkIdx) const;
+  static constexpr uint32_t kFetchPerTick = 64;  // 1 MB/tick ceiling
   // Copies the next-tick dirty buffer into the pending slot (caller knows
   // which of dirty[0]/dirty[1] that is this tick).
   void EncodeDirtyCopy(const wgpu::CommandEncoder& enc, const wgpu::Buffer& dirtyNext);
@@ -119,14 +182,35 @@ class World {
   wgpu::Buffer renderUBO;   // RenderParams
   wgpu::Buffer pick;        // 8 u32
 
+  // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
+  wgpu::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered
+  wgpu::Buffer particleCounts;  // 4 u32: [0]/[1] = live count per page
+  wgpu::Buffer claim;           // kClaimSize u32 — reinsertion claim hash
+  wgpu::Buffer pArgsStage;      // 8 u32: [0..3] draw args, [4..6] dispatch args
+  wgpu::Buffer pDispatchArgs;   // 3 u32, indirect-only (see dispatchArgs note)
+  wgpu::Buffer drawArgs;        // 4 u32, indirect-only draw args for particles
+  wgpu::Buffer expOps;          // kMaxExplosionsPerTick ExplosionOp
+  wgpu::Buffer expMask;         // per-op destruction scratch (see sim_explode.wgsl)
+  wgpu::Buffer cellOps;         // kMaxCellOpsPerTick CellOp (island removal)
+  wgpu::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
+  wgpu::Buffer bodyInstances;   // debris-body voxel instances (render)
+  wgpu::Buffer bodyXforms;      // debris-body transforms (render)
+
  private:
   struct Slot {
     wgpu::Buffer buf;
     bool inFlight = false;
     IVec3 base{};
+    uint32_t particleLivePage = 0;
+    uint32_t tick = 0;
+    std::vector<uint32_t> fetchIds;  // chunk fetches riding this slot
   };
   static constexpr int kSlots = 3;
   Slot slots_[kSlots];
   int lastSlot_ = -1;
   WorldSnapshot snap_;
+
+  std::vector<uint32_t> fetchQueue_;
+  std::vector<uint8_t> fetchQueued_;              // per-chunk dedup bitmap
+  std::unordered_map<uint32_t, CachedChunk> cache_;
 };

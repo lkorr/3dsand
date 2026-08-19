@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(cat | sed -n 's/.*\"file_path\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -1); case \"$f\" in *.wgsl) cd \"$CLAUDE_PROJECT_DIR\" && bash scripts/check_shaders.sh \"$f\" ;; *) exit 0 ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

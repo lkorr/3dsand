@@ -110,6 +110,13 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.gpu.opacity > 255)
       errors += path + ": material \"" + d.name + "\": opacity > 255\n";
 
+    // blast/dig resistance; class defaults so unlisted materials behave sanely
+    d.gpu.hardness = m.value("hardness", d.gpu.klass == CLASS_SOLID ? 60
+                                         : d.gpu.klass == CLASS_POWDER ? 12
+                                         : d.gpu.klass == CLASS_LIQUID ? 4 : 0);
+    if (d.gpu.hardness > 255)
+      errors += path + ": material \"" + d.name + "\": hardness > 255\n";
+
     if (m.value("wanders", false)) d.gpu.flags |= kMatFlagWander;
     if (m.value("opaque", false)) d.gpu.flags |= kMatFlagOpaque;
 
@@ -129,6 +136,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       }
     }
 
+    d.rubble = m.value("rubble", "");
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
       uint32_t bit = tagReg.MaskOf(t, true);
@@ -285,6 +293,11 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
   TagRegistry tags;
   bool ok = LoadMaterialsJson(materialsPath, m, tags, errors);
   if (ok) LoadReactionsJson(reactionsPath, m, tags, r, errors);
+  for (auto& d : m) {
+    if (!d.rubble.empty() && FindMaterial(m, d.rubble) < 0)
+      errors += materialsPath + ": material \"" + d.name + "\": unknown rubble \"" +
+                d.rubble + "\"\n";
+  }
   if (!errors.empty()) return false;
   mats = std::move(m);
   reactions = std::move(r);

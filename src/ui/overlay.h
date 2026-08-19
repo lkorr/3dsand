@@ -17,6 +17,9 @@ struct UIState {
   uint32_t activeChunks = 0;
   uint64_t voxelTotal = 0;
   uint32_t worldHash = 0;
+  uint32_t particleCount = 0;
+  uint32_t bodyCount = 0;
+  uint32_t activeBodyCount = 0;
   float playerPos[3] = {};
   bool mirrorValid = false;
 
@@ -30,6 +33,9 @@ struct UIState {
   bool reloadShaders = false;
   bool reloadMaterials = false;
   bool regenWorld = false;
+  bool pendingDetonate = false;  // X key / UI button: explode at crosshair
+  bool saveWorld = false;        // F9
+  bool loadWorld = false;        // F10
 
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
