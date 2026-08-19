@@ -33,6 +33,7 @@
       "id": "water",
       "class": "liquid",
       "density": 1000,
+      "opacity": 90,
       "colors": ["#3a78e8", "#3570dc", "#4382f0"],
       "tags": ["wet", "extinguisher", "conductive"]
     },
@@ -40,6 +41,8 @@
       "id": "oil",
       "class": "liquid",
       "density": 900,
+      "moveEvery": 2,
+      "opacity": 235,
       "colors": ["#4a3b28", "#41341f", "#55442c"],
       "tags": ["flammable", "dissolvable"]
     },
@@ -47,6 +50,7 @@
       "id": "smoke",
       "class": "gas",
       "density": 2,
+      "opacity": 70,
       "colors": ["#55555c", "#4b4b52", "#606066"],
       "tags": []
     },
@@ -54,6 +58,7 @@
       "id": "steam",
       "class": "gas",
       "density": 1,
+      "opacity": 45,
       "colors": ["#c8cdd4", "#bfc5cc", "#d2d6dc"],
       "tags": ["wet"]
     },
@@ -62,6 +67,7 @@
       "class": "gas",
       "density": 3,
       "emission": 255,
+      "opacity": 150,
       "colors": ["#ff9a2a", "#ffc93c", "#ff6b1a"],
       "tags": ["hot"]
     },
@@ -95,6 +101,7 @@
       "class": "liquid",
       "density": 1200,
       "emission": 45,
+      "opacity": 170,
       "colors": ["#7cf03a", "#68d82c", "#93ff4e"],
       "tags": []
     },

@@ -104,6 +104,12 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.gpu.moveEvery < 1 || d.gpu.moveEvery > 16)
       errors += path + ": material \"" + d.name + "\": moveEvery must be 1..16\n";
 
+    // media absorbance; defaults give thin gases and moderately deep liquids
+    d.gpu.opacity = m.value("opacity", d.gpu.klass == CLASS_GAS ? 50
+                                       : d.gpu.klass == CLASS_LIQUID ? 110 : 255);
+    if (d.gpu.opacity > 255)
+      errors += path + ": material \"" + d.name + "\": opacity > 255\n";
+
     if (m.value("wanders", false)) d.gpu.flags |= kMatFlagWander;
     if (m.value("opaque", false)) d.gpu.flags |= kMatFlagOpaque;
 

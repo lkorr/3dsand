@@ -25,7 +25,8 @@ struct MaterialGpu {
   uint32_t tagMask;
   uint32_t reactOffset, reactCount; // bucket into the flat reaction array
   uint32_t moveEvery;               // viscosity: move only when tick % moveEvery == 0
-  uint32_t pad0, pad1, pad2, pad3, pad4;
+  uint32_t opacity;                 // 0..255 media absorbance (liquids/gases)
+  uint32_t pad1, pad2, pad3, pad4;
 };
 static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
 

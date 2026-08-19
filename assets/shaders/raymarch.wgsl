@@ -50,8 +50,9 @@ struct Hit {
   axis     : i32,     // axis stepped into the hit cell
   sgn      : f32,     // ray direction sign on that axis
   word     : u32,
-  mediaLen : f32,     // liquid/gas path length before the hit
-  mediaMat : u32,
+  mediaLen : f32,     // fullness-weighted liquid/gas path length before the hit
+  mediaMat : u32,     // first media material crossed
+  mediaSurf: f32,     // fullness (0..1) of the first media cell — surface term
 };
 
 fn chunkOcc(cell : vec3<i32>) -> u32 {
@@ -64,6 +65,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.hit = false;
   out.mediaLen = 0.0;
   out.mediaMat = 0u;
+  out.mediaSurf = 0.0;
 
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -97,7 +99,6 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
   else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
 
-  var mediaStart = -1.0;
   var tCur = t;
 
   for (var i = 0; i < 4096; i++) {
@@ -108,8 +109,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     }
 
     if (chunkOcc(cell) == 0u) {
-      // empty chunk: jump straight to its exit face
-      if (mediaStart >= 0.0) { out.mediaLen += tCur - mediaStart; mediaStart = -1.0; }
+      // empty chunk: jump straight to its exit face (air — no media to add)
       let ch = cell / i32(CHUNK);
       let lo = vec3f(ch * i32(CHUNK));
       let hi = lo + f32(CHUNK);
@@ -146,6 +146,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
 
     let w = voxels[cellIndex(vec3<u32>(cell))];
     let mat = voxMat(w);
+    var weight = 0.0;  // this cell's media contribution per unit length
     if (mat != MAT_AIR) {
       let k = materials[mat].klass;
       // gases and translucent liquids are participating media; OPAQUE liquids
@@ -153,12 +154,16 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       if (k == CLASS_GAS ||
           (k == CLASS_LIQUID && (materials[mat].flags & MATF_OPAQUE) == 0u)) {
         if (wantMedia) {
-          if (mediaStart < 0.0) { mediaStart = tCur; }
-          if (out.mediaMat == 0u) { out.mediaMat = mat; }
+          // liquids weight by fullness so a 1/8 film tints far less than a
+          // full cell; gases count whole
+          weight = select(1.0, f32(voxState(w) + 1u) / 8.0, k == CLASS_LIQUID);
+          if (out.mediaMat == 0u) {
+            out.mediaMat = mat;
+            out.mediaSurf = weight;
+          }
         }
         // fall through and keep marching
       } else {
-        if (mediaStart >= 0.0) { out.mediaLen += tCur - mediaStart; }
         out.hit = true;
         out.t = tCur;
         out.cell = cell;
@@ -167,12 +172,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         out.word = w;
         return out;
       }
-    } else if (mediaStart >= 0.0) {
-      out.mediaLen += tCur - mediaStart;
-      mediaStart = -1.0;
     }
 
-    // DDA step
+    // DDA step; accumulate the segment the ray spent inside this cell
+    let tPrev = tCur;
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
       cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
     } else if (tMax.y < tMax.z) {
@@ -180,9 +183,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     } else {
       cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
     }
+    out.mediaLen += (tCur - tPrev) * weight;
     if (tCur >= tExit) { break; }
   }
-  if (mediaStart >= 0.0) { out.mediaLen += tCur - mediaStart; }
   return out;
 }
 
@@ -239,13 +242,19 @@ fn fs(in : VSOut) -> @location(0) vec4f {
   }
 
   // liquid / gas tint along the ray
-  if (h.mediaLen > 0.0 && h.mediaMat != 0u) {
+  if (h.mediaMat != 0u) {
     let mm = materials[h.mediaMat];
     let mc = (unpackColor(mm.color0) + unpackColor(mm.color1)) * 0.5;
     let memis = f32(mm.emission) / 255.0;
-    var dens = select(0.8, 0.28, mm.klass == CLASS_GAS) * VOXEL_METERS;
-    if (memis > 0.0) { dens = 1.0 * VOXEL_METERS; }  // fire reads as a dense volume
-    let a = 1.0 - exp(-h.mediaLen * dens);
+    let kOp = f32(mm.opacity) / 255.0;
+    // per-meter absorption from the material's opacity (oil thick, water
+    // clearer, steam wispy); mediaLen is fullness-weighted in trace()
+    var tau = h.mediaLen * VOXEL_METERS * kOp * 6.4;
+    // surface term: entering a liquid at all contributes opacity, scaled by
+    // the entry cell's fullness — a shallow puddle still reads against the
+    // ground instead of vanishing at ~zero path length
+    if (mm.klass == CLASS_LIQUID) { tau += kOp * 1.2 * h.mediaSurf; }
+    let a = 1.0 - exp(-tau);
     color = mix(color, mc, a);
     // emissive media (fire) glows additively — the flame is a light source
     if (memis > 0.0) {
