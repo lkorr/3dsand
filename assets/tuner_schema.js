@@ -1,0 +1,330 @@
+/* ==========================================================================
+   tuning.json parameter schema — the single description of every knob.
+   ==========================================================================
+   tuner.html builds its entire Tuning UI from this table, and nothing else
+   knows the parameter list. Adding a knob means: add the field to
+   src/sim/tuning.{h,cpp}, add it to scripts/tuning_prelude.py (so shader
+   validation matches the engine), and add a row here.
+
+   Row fields:
+     k     key inside the group object in tuning.json
+     n     display name
+     d     what it changes, in plain terms — shown as help text
+     min   slider minimum        max  slider maximum
+     step  slider granularity (also decides how the value is rounded)
+     u     unit suffix shown next to the number
+     int   true  -> integer-only input (no decimals accepted)
+     type  'color' -> [r,g,b] 0..1 triple edited with a color picker
+           'vec3'  -> [x,y,z] triple edited as three numbers
+     warn  extra caution text rendered on the row
+
+   `apply` on each group says what the user has to do for an edit to show up:
+     'shader'   F5 in-game (reload shaders) — recompiles with the new consts
+     'cpu'      F5 in-game — read directly by C++ each frame
+     'worldgen' regen world / new seed — only affects newly generated chunks
+   The sim group additionally carries determinism:true, which turns on the
+   red styling and the --selftest reminder (CLAUDE.md rule 1).             */
+
+const TUNING_SCHEMA = [
+  {
+    id: 'player',
+    title: 'Player',
+    icon: '\u{1F3C3}',
+    apply: 'cpu',
+    blurb: 'Movement feel. Everything is stated in metres and m/s and converted to voxels at use, so these keep their meaning if the voxel size changes.',
+    params: [
+      {k:'walkSpeed', n:'walk speed', d:'Base ground speed. Quake is ~5.5, Minecraft ~4.3.', min:0.5, max:20, step:0.05, u:'m/s'},
+      {k:'sprintSpeed', n:'sprint speed', d:'Speed while holding shift on the ground.', min:0.5, max:30, step:0.05, u:'m/s'},
+      {k:'gravity', n:'gravity', d:'Fall acceleration. 9.81 is real gravity, which reads as floaty next to most shooters — raise it for snappier falls.', min:0, max:40, step:0.05, u:'m/s²'},
+      {k:'jumpSpeed', n:'jump speed', d:'Launch velocity. Apex height = jump²/(2·gravity), so 5.25 at 9.81 gives ~1.4 m.', min:0, max:15, step:0.05, u:'m/s'},
+      {k:'maxFall', n:'terminal velocity', d:'Downward speed cap while falling.', min:1, max:120, step:0.5, u:'m/s'},
+      {k:'groundAccel', n:'ground accel', d:'How fast you reach top speed on the ground, and how fast you stop. High = snappy and skate-free.', min:1, max:120, step:0.5, u:'/s'},
+      {k:'airAccel', n:'air control', d:'Steering authority while airborne. Low means jumps are committed.', min:0, max:60, step:0.1, u:'/s'},
+      {k:'coyoteTime', n:'coyote time', d:'A jump stays legal for this long after walking off a ledge.', min:0, max:0.5, step:0.01, u:'s'},
+      {k:'jumpBufferTime', n:'jump buffer', d:'A jump pressed this long before landing is remembered and fires on touchdown.', min:0, max:0.5, step:0.01, u:'s'},
+      {k:'stepUp', n:'step height', d:'Tallest ledge walked over without jumping. ~1/3 of body height is where most engines land.', min:0, max:2, step:0.01, u:'m'},
+      {k:'smoothBump', n:'free bump height', d:'Bumps at or below this cost no speed at all — what makes noisy ground feel like smooth floor.', min:0, max:1, step:0.01, u:'m'},
+      {k:'stepSpeedPenaltyPerM', n:'step speed penalty', d:'Speed shed per metre climbed above the free bump height.', min:0, max:10, step:0.05, u:'/m'},
+      {k:'minStepSpeedScale', n:'min climb speed', d:'Floor on the climb penalty, so climbing never fully stalls.', min:0.01, max:1, step:0.01},
+      {k:'nonJumpSpeed', n:'non-jump speed', d:'Upward speed above which ground-snap and step-up stand down, so a jump is never dragged back down.', min:0, max:5, step:0.05, u:'m/s'},
+      {k:'flySpeed', n:'fly speed', d:'Noclip cruise speed (V toggles fly).', min:1, max:80, step:0.25, u:'m/s'},
+      {k:'flySprint', n:'fly sprint', d:'Noclip speed with shift — the get-across-the-map speed.', min:1, max:200, step:0.5, u:'m/s'},
+      {k:'swimUp', n:'swim up', d:'Upward thrust while holding space in liquid.', min:0, max:60, step:0.25, u:'m/s²'},
+      {k:'swimDown', n:'swim down', d:'Downward thrust while holding ctrl in liquid.', min:0, max:60, step:0.25, u:'m/s²'},
+      {k:'liquidGravityScale', n:'buoyancy', d:'Gravity multiplier in liquid. 0.25 means you sink at a quarter weight; 0 floats.', min:0, max:1, step:0.01},
+      {k:'liquidSpeedScale', n:'wade speed', d:'Horizontal speed multiplier in liquid.', min:0.05, max:1, step:0.01},
+      {k:'liquidAccel', n:'liquid accel', d:'Steering authority in liquid — low is sluggish.', min:0.1, max:60, step:0.1, u:'/s'},
+      {k:'liquidDrag', n:'liquid drag', d:'Vertical damping in liquid. Higher sinks/rises more reluctantly.', min:0, max:40, step:0.1, u:'/s'},
+      {k:'halfWidth', n:'body half-width', d:'Half the AABB width — controls the tightest gap you fit through.', min:0.05, max:1.5, step:0.01, u:'m', warn:'Collision geometry: a large change can wedge the player in tight terrain.'},
+      {k:'halfHeight', n:'body half-height', d:'Half the body height (0.85 = a 1.7 m player).', min:0.2, max:3, step:0.01, u:'m', warn:'Collision geometry. Must stay well under 3 chunks or collision breaks.'},
+      {k:'eyeOffset', n:'eye height', d:'Camera offset above the AABB centre.', min:-1, max:2, step:0.01, u:'m'},
+    ],
+  },
+
+  {
+    id: 'camera',
+    title: 'Camera',
+    icon: '\u{1F3A5}',
+    apply: 'cpu',
+    blurb: 'Look controls.',
+    params: [
+      {k:'mouseSensitivity', n:'mouse sensitivity', d:'Radians of turn per pixel of mouse movement.', min:0.0002, max:0.01, step:0.0001},
+      {k:'fovY', n:'field of view', d:'Vertical FOV in radians. 1.2 rad ≈ 69°; 1.57 ≈ 90°.', min:0.5, max:2.6, step:0.01, u:'rad'},
+      {k:'pitchClamp', n:'pitch limit', d:'How far up/down you can look. 1.5708 is straight up — just under it avoids gimbal flip.', min:0.5, max:1.5707, step:0.001, u:'rad'},
+    ],
+  },
+
+  {
+    id: 'render',
+    title: 'Sky & Light',
+    icon: '☀',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'Sun, sky and the lighting model. Everything here is render-only and can never affect the simulation.',
+    params: [
+      {k:'sunDir', n:'sun direction', d:'Direction to the sun; normalized on use. Lower Y = longer shadows and a more raking light. This is your time-of-day control.', type:'vec3', min:-1, max:1, step:0.01},
+      {k:'sunColor', n:'sun colour', d:'Colour of direct sunlight on surfaces.', type:'color'},
+      {k:'sunIntensity', n:'sun intensity', d:'Direct sun brightness — the main exposure lever for the lit world.', min:0, max:5, step:0.01},
+      {k:'skyHorizon', n:'horizon colour', d:'Sky colour at the horizon.', type:'color'},
+      {k:'skyZenith', n:'zenith colour', d:'Sky colour straight overhead.', type:'color'},
+      {k:'skyGradient', n:'sky gradient', d:'How quickly sky goes from horizon colour to zenith colour. Lower spreads the gradient further up the dome.', min:0.1, max:5, step:0.01},
+      {k:'skyHorizonOffset', n:'horizon offset', d:'Shifts where the gradient starts, moving the haze band up or down.', min:-1, max:1, step:0.01},
+      {k:'sunTint', n:'sun disc tint', d:'Colour of the sun disc and its halo in the sky.', type:'color'},
+      {k:'sunDiscPower', n:'sun disc tightness', d:'Higher = smaller, sharper sun. Lower fattens it.', min:10, max:4000, step:10},
+      {k:'sunDiscGain', n:'sun disc brightness', d:'Brightness of the solar disc itself.', min:0, max:20, step:0.05},
+      {k:'sunHaloPower', n:'halo falloff', d:'Higher = tighter glow around the sun.', min:1, max:64, step:0.5},
+      {k:'sunHaloGain', n:'halo strength', d:'Brightness of the broad glow around the sun.', min:0, max:2, step:0.01},
+      {k:'ambSky', n:'ambient sky', d:'Cool ambient from above. Splitting sky and ground ambient is what gives voxel terrain its sense of shape.', type:'color'},
+      {k:'ambGround', n:'ambient bounce', d:'Warm ambient from below, standing in for light bounced off the ground.', type:'color'},
+      {k:'diffuseWrap', n:'diffuse wrap', d:'Softens the light falloff past the terminator. Wide values keep the vertical risers of a voxel staircase close in brightness to their tops, which is what stops hillsides reading as noise.', min:0, max:2, step:0.01},
+      {k:'faceX', n:'X face shade', d:'Brightness tweak for X-facing walls, so parallel walls do not fuse together.', min:0.5, max:1, step:0.005},
+      {k:'faceZ', n:'Z face shade', d:'Brightness tweak for Z-facing walls.', min:0.5, max:1, step:0.005},
+      {k:'fogOpticalDepths', n:'fog thickness', d:'Optical-depth budget: fog reaches ~99% opacity at the far-field horizon. Higher = thicker haze.', min:0.5, max:20, step:0.1},
+      {k:'fogLerpPerFrame', n:'fog settle speed', d:'How fast the horizon opens up as distant terrain finishes loading.', min:0.005, max:1, step:0.005},
+    ],
+  },
+
+  {
+    id: 'shading',
+    title: 'Surfaces',
+    icon: '\u{1F5FF}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'Ambient occlusion, shadows, and the surface grain that keeps voxel terrain from reading as confetti.',
+    params: [
+      {k:'aoStrength', n:'AO strength', d:'How dark a fully enclosed corner gets. 0 disables ambient occlusion.', min:0, max:1, step:0.01},
+      {k:'aoFar', n:'distant AO', d:'One-sample occlusion for far terrain — darkens cells with something directly above.', min:0, max:1, step:0.01},
+      {k:'shadowSoftNear', n:'shadow hard until', d:'Blockers closer than this cast a hard, dark contact shadow.', min:0, max:5, step:0.05, u:'m'},
+      {k:'shadowSoftFar', n:'shadow soft by', d:'Blockers this far away cast their softest, lightest shadow. The gap between the two is your shadow softness.', min:0.5, max:60, step:0.5, u:'m'},
+      {k:'shadowLift', n:'shadow lift', d:'How much sun a distant blocker still lets through. 0 = pitch black shadows everywhere.', min:0, max:1, step:0.01},
+      {k:'shadowFarLift', n:'distant shadow lift', d:'Shadow darkness out in the LOD cascades. Kept soft, because hard shadows on coarse cells speckle hillsides.', min:0, max:1, step:0.01},
+      {k:'shadowBias', n:'shadow bias', d:'How far off the surface a shadow ray starts. Too low self-shadows; too high detaches contact shadows.', min:0.001, max:0.5, step:0.001},
+      {k:'shadowSteps', n:'shadow ray budget', d:'Max steps a shadow ray marches. Lower is faster but truncates long shadows.', min:0, max:2048, step:16, int:true},
+      {k:'grainAmp', n:'surface grain', d:'Brightness variation across a surface. This is what turns per-voxel palette static into patches that read as material.', min:0, max:0.4, step:0.005},
+      {k:'grainAmpFar', n:'distant grain', d:'Surface grain out in the LOD cascades.', min:0, max:0.4, step:0.005},
+      {k:'grainBroadScale', n:'grain patch size', d:'Size of the broad mottling, in voxels.', min:1, max:64, step:0.5, u:'vox'},
+      {k:'grainFineScale', n:'grain detail size', d:'Size of the fine break-up, in voxels.', min:0.5, max:16, step:0.1, u:'vox'},
+      {k:'grainMix', n:'grain balance', d:'Blend of broad patches vs fine detail. 1 = all broad.', min:0, max:1, step:0.01},
+    ],
+  },
+
+  {
+    id: 'water',
+    title: 'Water',
+    icon: '\u{1F30A}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'Reflection, absorption, ripples, caustics and foam. Water absorbs red about nine times faster than blue, which is why shallow water reads cyan and deep water reads blue — that per-channel spread is the strongest depth cue you have.',
+    params: [
+      {k:'waterAbsorb', n:'absorption', d:'Per-channel absorption per metre of depth. Raise red for murkier, greener water.', type:'vec3', min:0, max:8, step:0.01},
+      {k:'waterScatter', n:'scatter colour', d:'Colour deep water tends toward instead of going black.', type:'color'},
+      {k:'waterF0', n:'reflectivity', d:'Head-on reflectance. Real water is 0.02 — only ~2% face-on but near 100% at grazing angles, and that spread is the look.', min:0, max:0.3, step:0.001},
+      {k:'waterFresnelPower', n:'fresnel falloff', d:'How quickly reflection ramps up toward grazing angles. 5 is physically standard.', min:1, max:10, step:0.1},
+      {k:'rippleAmpScale', n:'ripple height', d:'Scales all five wave bands. 0 gives mirror-flat water.', min:0, max:4, step:0.01},
+      {k:'rippleSpeedScale', n:'ripple speed', d:'Scales how fast the waves travel.', min:0, max:4, step:0.01},
+      {k:'reflectionCutoff', n:'reflection cutoff', d:'Below this reflectance, use a cheap sky sample instead of tracing a ray. Raising it is a solid perf win on water-heavy views.', min:0, max:1, step:0.005},
+      {k:'reflectionSteps', n:'reflection budget', d:'Max steps a reflection ray marches — a direct frame-time multiplier when looking at water.', min:0, max:512, step:8, int:true},
+      {k:'causticGain', n:'caustic strength', d:'Brightness of the focused light bands on the bed.', min:0, max:8, step:0.05},
+      {k:'causticCap', n:'caustic cap', d:'Ceiling on caustic brightening, so bright bands do not blow out.', min:0, max:4, step:0.05},
+      {k:'glintIntensity', n:'glint strength', d:'Brightness of the specular sparkle on the surface.', min:0, max:4, step:0.02},
+      {k:'glintPowerNear', n:'glint size (near)', d:'Specular tightness up close. Lower = broader sheen.', min:10, max:2000, step:10},
+      {k:'glintPowerFar', n:'glint size (far)', d:'Specular tightness at distance; narrows with range to stop distant water boiling.', min:10, max:4000, step:10},
+      {k:'foamDepth', n:'foam depth', d:'Water shallower than this grows foam at the shoreline.', min:0, max:3, step:0.01, u:'m'},
+      {k:'foamStrength', n:'foam strength', d:'How white the shoreline foam gets.', min:0, max:1, step:0.01},
+    ],
+  },
+
+  {
+    id: 'fire',
+    title: 'Fire & Lava',
+    icon: '\u{1F525}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'Emissive surfaces, smoke density, the lava crust field and ember sparks.',
+    params: [
+      {k:'mediaAbsorb', n:'smoke density', d:'Per-metre absorption applied to gas opacity — the strongest smoke-thickness knob.', min:0, max:40, step:0.1},
+      {k:'mediaTauMax', n:'smoke march cutoff', d:'Optical depth at which the ray gives up and stops marching. Lower is faster; too low makes thick smoke look flat.', min:1, max:20, step:0.1},
+      {k:'emissiveStrength', n:'glow strength', d:'Global multiplier on every emissive material.', min:0, max:8, step:0.05},
+      {k:'fireIntensity', n:'fire brightness', d:'Additive brightness of the fire glow.', min:0, max:10, step:0.05},
+      {k:'fireGlowRate', n:'fire saturation', d:'How quickly fire glow saturates toward white-hot with density.', min:0.1, max:8, step:0.05},
+      {k:'fireFlickerBase', n:'flame flicker base', d:'Baseline brightness of the per-cell flame flicker.', min:0, max:2, step:0.01},
+      {k:'fireFlickerAmp', n:'flame flicker depth', d:'How far the flicker swings. 0 gives steady flame.', min:0, max:2, step:0.01},
+      {k:'fireFlickerRate', n:'flame flicker speed', d:'Flicker frequency.', min:0, max:40, step:0.1, u:'Hz'},
+      {k:'fireBreatheAmp', n:'fire breathe depth', d:'Slow global pulse layered over the per-cell flicker.', min:0, max:1, step:0.01},
+      {k:'fireBreatheRate', n:'fire breathe speed', d:'Speed of that slow pulse.', min:0, max:20, step:0.1, u:'Hz'},
+      {k:'emissiveFlickerBase', n:'ember flicker base', d:'Baseline brightness for flickering emissive voxels.', min:0, max:2, step:0.01},
+      {k:'emissiveFlickerAmp', n:'ember flicker depth', d:'Flicker swing for emissive voxels.', min:0, max:2, step:0.01},
+      {k:'emissiveFlickerRate', n:'ember flicker speed', d:'Flicker frequency for emissive voxels.', min:0, max:40, step:0.1, u:'Hz'},
+      {k:'lavaCrackFreq', n:'crust plate size', d:'Crack frequency in cycles per metre. Low values give metre-wide marble; high gives fine crazing.', min:0.1, max:12, step:0.05, u:'/m'},
+      {k:'lavaCrackKneeLow', n:'crack knee low', d:'Where the crust starts turning molten. The gap to the high knee is the crack width.', min:0, max:1, step:0.01},
+      {k:'lavaCrackKneeHigh', n:'crack knee high', d:'Where the crack is fully molten. Narrow gap = crisp cracked tile; wide = soft channels.', min:0, max:1, step:0.01},
+      {k:'lavaWarmBias', n:'lava warmth', d:'Global temperature bias. The single knob furthest along the cold-crust to open-lava axis.', min:-0.3, max:0.6, step:0.005},
+      {k:'lavaEmissionGain', n:'lava glow', d:'Peak emissive intensity of the molten cracks.', min:0, max:8, step:0.05},
+      {k:'lavaPulseAmp', n:'lava pulse depth', d:'Slow convection pulse — lava breathing.', min:0, max:0.5, step:0.005},
+      {k:'lavaPulseRate', n:'lava pulse speed', d:'Speed of the convection pulse.', min:0, max:8, step:0.05, u:'Hz'},
+      {k:'heatSpillStrength', n:'heat spill', d:'Warm light lava casts onto nearby surfaces. Subtle by design — it is a contact cue.', min:0, max:2, step:0.01},
+      {k:'emberBrightness', n:'ember brightness', d:'Brightness of the rising spark particles over lava.', min:0, max:12, step:0.05},
+      {k:'emberDensity', n:'ember density', d:'Share of spark columns that emit, out of 255. Higher = more sparks.', min:0, max:255, step:1, int:true},
+      {k:'emberRise', n:'ember rise height', d:'How high a spark climbs before dying, in voxels.', min:1, max:200, step:1, u:'vox'},
+      {k:'emberRate', n:'ember rise speed', d:'How fast sparks climb.', min:0.1, max:40, step:0.1, u:'vox/s'},
+    ],
+  },
+
+  {
+    id: 'tonemap',
+    title: 'Tonemap',
+    icon: '\u{1F39A}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'The output curve. The renderer works in linear HDR and emissive surfaces legitimately exceed 1.0, so the curve has to compress highlights rather than clip them.',
+    params: [
+      {k:'exposureWhite', n:'white point', d:'Scene intensity that maps to display white. Lower = brighter, blown-out image; higher = darker with more highlight range. Your main exposure control.', min:0.2, max:32, step:0.05},
+      {k:'bleachAmount', n:'highlight bleach', d:'How far the hottest cores desaturate toward white. Hue is preserved through the midtones regardless; only genuinely hot cores bleach.', min:0, max:1, step:0.01},
+      {k:'gamma', n:'gamma', d:'Output gamma. 2.2 is standard sRGB — change only if the display pipeline demands it.', min:1, max:3.2, step:0.01},
+      {k:'primarySteps', n:'primary ray budget', d:'Max DDA steps for a camera ray. Lower is faster but clips distant geometry into the fog.', min:64, max:8192, step:64, int:true},
+      {k:'farSteps', n:'cascade ray budget', d:'Max steps per LOD cascade level.', min:16, max:2048, step:16, int:true},
+    ],
+  },
+
+  {
+    id: 'physics',
+    title: 'Physics',
+    icon: '⚙',
+    apply: 'cpu',
+    blurb: 'Jolt rigid bodies: debris chunks, ragdolls and the player proxy.',
+    params: [
+      {k:'gravity', n:'body gravity', d:'Gravity for rigid bodies. Kept separate from player gravity and from the particle sim, so all three can drift apart if you tune only one.', min:0, max:40, step:0.05, u:'m/s²', warn:'Tune alongside player gravity and sim particle gravity, or debris and ejecta will visibly fall at different rates.'},
+      {k:'debrisFriction', n:'debris friction', d:'How much debris grips surfaces. High values stop chunks sliding.', min:0, max:2, step:0.01},
+      {k:'debrisRestitution', n:'debris bounce', d:'Bounciness on impact. Near zero makes rubble thud rather than skitter.', min:0, max:1, step:0.01},
+      {k:'debrisLinearDamping', n:'linear damping', d:'Air drag on moving debris.', min:0, max:2, step:0.01, u:'/s'},
+      {k:'debrisAngularDamping', n:'angular damping', d:'How quickly tumbling debris stops spinning.', min:0, max:2, step:0.01, u:'/s'},
+      {k:'terrainFriction', n:'terrain friction', d:'Grip of static terrain collision surfaces.', min:0, max:2, step:0.01},
+      {k:'playerProxyFriction', n:'player friction', d:'Friction of the player capsule against bodies. Kept low so the player does not drag debris around.', min:0, max:2, step:0.01},
+      {k:'explosionImpulseScale', n:'blast impulse', d:'How hard an explosion throws debris — the how-far-does-a-plank-fly knob.', min:0, max:2, step:0.005},
+      {k:'explosionImpulseRadiusScale', n:'blast impulse reach', d:'Impulse radius as a multiple of the destruction radius, so bodies just outside the crater still get pushed.', min:0.5, max:10, step:0.1, u:'×'},
+      {k:'collisionSteps', n:'solver steps', d:'Jolt collision substeps per tick. Raising to 2 is the standard fix for jittery stacks, at roughly double the solver cost.', min:1, max:8, step:1, int:true},
+    ],
+  },
+
+  {
+    id: 'debris',
+    title: 'Debris',
+    icon: '\u{1F9F1}',
+    apply: 'cpu',
+    blurb: 'When loose voxels become rigid bodies, and when they turn back into grid voxels. These are also perf budgets — see the "cost scales with activity" rule.',
+    params: [
+      {k:'minBodyVoxels', n:'min body size', d:'Islands smaller than this crumble into rubble instead of becoming a physics body. The core does-it-read-as-an-object knob.', min:1, max:200, step:1, int:true},
+      {k:'minBurnFragmentVoxels', n:'min burn fragment', d:'A much higher bar for fragments breaking off a burning body — without it one burning tree spawns hundreds of bodies.', min:1, max:400, step:1, int:true, warn:'Lowering this a lot can cascade into hundreds of bodies from a single fire.'},
+      {k:'maxNewBodiesPerTick', n:'new bodies / tick', d:'Budget on how many bodies can spawn per tick.', min:1, max:32, step:1, int:true},
+      {k:'maxBodies', n:'max bodies', d:'Global rigid-body ceiling; the oldest despawn first.', min:8, max:512, step:8, int:true},
+      {k:'settleAfterTicks', n:'settle delay', d:'How long a body must sleep before it converts back into grid voxels. 30 ticks = 1 second.', min:5, max:600, step:5, int:true, u:'ticks'},
+      {k:'alignCos', n:'settle alignment', d:'How close to axis-aligned a body must be to settle back into the grid. 0.94 is about 20°; bodies at odd angles stay bodies.', min:0.5, max:0.9999, step:0.005},
+      {k:'burnOpsPerTick', n:'burn ops / tick', d:'Cap on fire/ash writes emitted by burning bodies per tick.', min:16, max:4096, step:16, int:true},
+    ],
+  },
+
+  {
+    id: 'tools',
+    title: 'Tools & Grenades',
+    icon: '\u{1F4A3}',
+    apply: 'cpu',
+    blurb: 'Brush, laser, detonate and grenade behaviour. Blast power is a hardness budget spent against material hardness, so a power of 340 digs much further through sand (hardness 12) than stone (90).',
+    params: [
+      {k:'detonateRadius', n:'detonate radius', g:'tools', d:'Radius of the X-key crosshair explosion.', min:1, max:20, step:1, int:true, u:'vox'},
+      {k:'detonatePower', n:'detonate power', g:'tools', d:'Hardness budget at the centre of an X-key explosion.', min:10, max:4000, step:10, int:true},
+      {k:'laserRange', n:'laser range', g:'tools', d:'How far the laser reaches.', min:10, max:1000, step:5, u:'vox'},
+      {k:'laserMeltRadius', n:'laser bore', g:'tools', d:'Radius of the hole the laser melts.', min:1, max:8, step:1, int:true, u:'vox'},
+      {k:'laserDamage', n:'laser damage', g:'tools', d:'Damage per hit against mob limbs.', min:0.1, max:20, step:0.1, u:'hp'},
+      {k:'brushAirDistance', n:'brush reach', g:'tools', d:'How far ahead you paint when the crosshair is pointing at open sky.', min:4, max:200, step:1, u:'vox'},
+      {k:'throwSpeed', n:'grenade throw speed', g:'grenade', d:'Launch speed; your own velocity is added on top.', min:1, max:80, step:0.5, u:'m/s'},
+      {k:'fuse', n:'grenade fuse', g:'grenade', d:'Seconds from throw to detonation.', min:0.1, max:15, step:0.1, u:'s'},
+      {k:'blastRadius', n:'grenade radius', g:'grenade', d:'Destruction radius when a grenade goes off.', min:1, max:20, step:1, int:true, u:'vox'},
+      {k:'blastPower', n:'grenade power', g:'grenade', d:'Hardness budget at the centre of a grenade blast.', min:10, max:4000, step:10, int:true},
+      {k:'restitution', n:'grenade bounce', g:'grenade', d:'How lively a grenade bounces off surfaces.', min:0, max:1, step:0.01},
+      {k:'friction', n:'grenade friction', g:'grenade', d:'Speed kept along the surface after a bounce. 1 = frictionless skid.', min:0, max:1, step:0.01},
+      {k:'waterDrag', n:'grenade water drag', g:'grenade', d:'Per-tick velocity retained in water. Lower sinks faster.', min:0.1, max:1, step:0.01},
+    ],
+  },
+
+  {
+    id: 'sim',
+    title: 'Simulation',
+    icon: '⚠',
+    apply: 'shader',
+    group: 'sim',
+    determinism: true,
+    blurb: 'Integer constants that feed voxel state. These are genuinely fun to tune — blast size, sand fall speed, how far liquids spread — but every one of them changes the world hash.',
+    params: [
+      {k:'falloffPerCell', n:'blast falloff', d:'Explosion power lost per cell of distance. Lower makes blasts reach much further; this is the primary blast-size knob.', min:1, max:64, step:1, int:true, warn:'Very low values make every blast reach the whole window — a guaranteed frame-time cliff.'},
+      {k:'ejectSolid', n:'solid ejecta', d:'Share of destroyed solid voxels that become flying particles, per mille.', min:0, max:1000, step:5, int:true, u:'‰'},
+      {k:'ejectLiquid', n:'liquid ejecta', d:'Share of destroyed liquid that becomes flying particles — the splashiest class.', min:0, max:1000, step:5, int:true, u:'‰'},
+      {k:'ejectPowder', n:'powder ejecta', d:'Share of destroyed powder that becomes flying particles.', min:0, max:1000, step:5, int:true, u:'‰'},
+      {k:'ejectGas', n:'gas ejecta', d:'Share of destroyed gas that becomes particles. Normally zero — gases just disperse.', min:0, max:1000, step:5, int:true, u:'‰'},
+      {k:'partGravity', n:'particle gravity', d:'Fall acceleration for flying voxels, in 1/256ths of a voxel per tick squared. 22 is about 9.81 m/s² — it sets the arc of every piece of ejecta.', min:0, max:256, step:1, int:true},
+      {k:'partMaxVel', n:'particle max speed', d:'Terminal speed for flying voxels, in 1/256ths of a voxel per tick. 1536 = 6 voxels per tick.', min:64, max:8192, step:64, int:true},
+      {k:'airDensity', n:'air density', d:'Anything denser than this sinks through air; anything lighter rises. Compared against the density values in materials.json.', min:0, max:2000, step:1, int:true, warn:'Raising this above a material’s density inverts whether it sinks or floats.'},
+      {k:'liquidEqualize', n:'liquid spread', d:'How many eighths emptier a neighbouring cell must be before liquid flows sideways into it. Low values spread water into thin films that never settle.', min:1, max:7, step:1, int:true, warn:'Below 2, pools spread thin and chunks may never sleep — that breaks the settled-world guarantee.'},
+      {k:'wanderHopMask', n:'critter hop rarity', d:'Chance a wandering powder hops is 1 in (this + 1) per tick. 7 means one in eight.', min:0, max:255, step:1, int:true},
+    ],
+  },
+
+  {
+    id: 'worldgen',
+    title: 'Worldgen',
+    icon: '\u{1F5FA}',
+    apply: 'worldgen',
+    group: 'worldgen',
+    blurb: 'Terrain shape, biomes, trees, ponds and caves. These only affect newly generated chunks — press "regen world" (or walk somewhere new) to see changes.',
+    params: [
+      {k:'baseHeight', n:'terrain floor', d:'Lowest terrain height in voxels; lake basins cut down from here.', min:0, max:200, step:1, int:true, u:'vox'},
+      {k:'hillAmplitude', n:'hill height', d:'Amplitude of the broad hill octave.', min:0, max:200, step:1, int:true, u:'vox'},
+      {k:'hillWavelength', n:'hill size', d:'Wavelength of the broad hills — larger means wider, gentler hills.', min:8, max:512, step:8, int:true, u:'vox'},
+      {k:'detailAmplitude', n:'detail height', d:'Amplitude of the fine relief octave.', min:0, max:100, step:1, int:true, u:'vox'},
+      {k:'detailWavelength', n:'detail size', d:'Wavelength of the fine relief.', min:4, max:128, step:4, int:true, u:'vox'},
+      {k:'treeline', n:'snow line', d:'Height above which terrain goes bare and snowy.', min:0, max:250, step:1, int:true, u:'vox'},
+      {k:'biomeScale', n:'biome size', d:'Size of a biome region. Keep this many tree-tiles wide, or a "meadow" holds one bush and the world reads as per-tree noise.', min:32, max:2048, step:32, int:true, u:'vox'},
+      {k:'desertThreshold', n:'desert threshold', d:'Biome noise above this becomes desert. Higher = rarer desert.', min:0, max:255, step:1, int:true},
+      {k:'pineThreshold', n:'pine threshold', d:'Biome noise above this (and below desert) becomes pine forest.', min:0, max:255, step:1, int:true},
+      {k:'meadowThreshold', n:'meadow threshold', d:'Biome noise below this becomes meadow. Everything between is forest.', min:0, max:255, step:1, int:true},
+      {k:'treeTile', n:'tree spacing', d:'Grid spacing between possible trunk sites — at most one tree per tile.', min:16, max:512, step:8, int:true, u:'vox'},
+      {k:'treeChanceForest', n:'forest density', d:'Percent of tiles that grow a tree in forest biome.', min:0, max:100, step:1, int:true, u:'%'},
+      {k:'treeChancePine', n:'pine density', d:'Percent of tiles that grow a tree in pine biome.', min:0, max:100, step:1, int:true, u:'%'},
+      {k:'treeChanceMeadow', n:'meadow density', d:'Percent of tiles that grow a tree in meadow.', min:0, max:100, step:1, int:true, u:'%'},
+      {k:'treeChanceDesert', n:'desert density', d:'Percent of tiles that grow a tree in desert.', min:0, max:100, step:1, int:true, u:'%'},
+      {k:'autumnFraction', n:'autumn rarity', d:'One in this many broadleaf trees turns autumn-coloured.', min:1, max:50, step:1, int:true},
+      {k:'pondTile', n:'pond spacing', d:'Grid spacing between possible pond sites.', min:32, max:1024, step:16, int:true, u:'vox'},
+      {k:'pondChance', n:'pond rarity', d:'One in this many pond tiles actually gets a pond.', min:1, max:32, step:1, int:true},
+      {k:'pondRadiusMin', n:'pond min radius', d:'Smallest pond radius.', min:2, max:100, step:1, int:true, u:'vox'},
+      {k:'pondRadiusSpan', n:'pond radius range', d:'Random radius added on top of the minimum.', min:1, max:100, step:1, int:true, u:'vox'},
+      {k:'ruinChance', n:'ruin rarity', d:'One in this many ruin tiles gets a stone ruin.', min:1, max:32, step:1, int:true},
+      {k:'caveThreshold1', n:'shallow cave rarity', d:'Cave noise must exceed this for a near-surface cavern. Higher = rarer caves.', min:0, max:255, step:1, int:true},
+      {k:'caveThreshold2', n:'deep cave rarity', d:'Same, for the deep cavern band where lava pools form.', min:0, max:255, step:1, int:true},
+    ],
+  },
+];
+
+// Groups whose params live under a different tuning.json key than the tab id.
+// (A tab can also override per-param with `g`, as Tools does for grenades.)
+const TUNING_GROUP_OF = tab => tab.group || tab.id;
+
+if (typeof module !== 'undefined') module.exports = {TUNING_SCHEMA, TUNING_GROUP_OF};

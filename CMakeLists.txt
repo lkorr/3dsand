@@ -107,6 +107,7 @@ add_executable(sandvox
   src/sim/chunkstore.cpp
   src/sim/simulation.cpp
   src/sim/materials.cpp
+  src/sim/tuning.cpp
   src/sim/voxload.cpp
   src/game/player.cpp
   src/game/camera.cpp
@@ -146,10 +147,11 @@ target_compile_definitions(sandvox PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR
 add_executable(movement_test
   tests/movement_test.cpp
   src/game/player.cpp
+  src/sim/tuning.cpp
 )
 target_include_directories(movement_test PRIVATE src)
 target_compile_definitions(movement_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(movement_test PRIVATE webgpu_cpp)
+target_link_libraries(movement_test PRIVATE webgpu_cpp nlohmann_json::nlohmann_json)
 
 # ---------------------------------------------------------------------------
 # voxload_test — CPU-only .vox parser harness (no GPU). Asserts the Z-up ->

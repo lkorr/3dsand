@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "gpu/resources.h"
+#include "sim/tuning.h"
 
 // Readback slot layout (offsets in bytes).
 constexpr uint64_t kChunkBytes = kChunkVol * 4;                 // 16 KB
@@ -292,6 +293,13 @@ static int vnoise(int x, int z, int cs, uint32_t seed) {
 // horizontal scale factor — kHScale here is that shader's HSCALE.
 static constexpr int kHScale = 1;
 int World::TerrainHeight(int x, int z, uint32_t seed) {
-  return 32 + (vnoise(x, z, 64 * kHScale, seed ^ 1u) * 42) / 255 +
-         (vnoise(x, z, 16 * kHScale, seed ^ 2u) * 12) / 255;
+  // Amplitudes/wavelengths come from tuning.json so this cannot drift from the
+  // shader when they are tuned: baseHeight() reads the same values through the
+  // generated TUNE_* prelude. Integer math throughout, matching the shader
+  // exactly — this feeds terrain collision, so a mismatch is a player falling
+  // through the ground they can see.
+  const auto& w = CurrentTuning().worldgen;
+  return w.baseHeight +
+         (vnoise(x, z, w.hillWavelength * kHScale, seed ^ 1u) * w.hillAmplitude) / 255 +
+         (vnoise(x, z, w.detailWavelength * kHScale, seed ^ 2u) * w.detailAmplitude) / 255;
 }

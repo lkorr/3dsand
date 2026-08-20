@@ -40,19 +40,20 @@ fn paletteColor(m : Material, state : u32) -> vec3f {
 }
 
 fn skyColor(rd : vec3f) -> vec3f {
-  let t = clamp(rd.y * 1.4 + 0.25, 0.0, 1.0);
-  var c = mix(vec3f(0.72, 0.80, 0.90), vec3f(0.25, 0.47, 0.85), t);
+  let t = clamp(rd.y * TUNE_SKY_GRADIENT + TUNE_SKY_HORIZON_OFFSET, 0.0, 1.0);
+  var c = mix(TUNE_SKY_HORIZON, TUNE_SKY_ZENITH, t);
   let s = max(dot(rd, R.sunDir), 0.0);
-  c += vec3f(1.0, 0.9, 0.7) * (pow(s, 800.0) * 3.0 + pow(s, 8.0) * 0.12);
+  c += TUNE_SUN_TINT * (pow(s, TUNE_SUN_DISC_POWER) * TUNE_SUN_DISC_GAIN
+                      + pow(s, TUNE_SUN_HALO_POWER) * TUNE_SUN_HALO_GAIN);
   return c;
 }
 
 // Per-meter absorption scale applied to material opacity — trace() (media
 // early-out) and fs() (final tint) must agree on it.
-const MEDIA_ABSORB : f32 = 6.4;
+const MEDIA_ABSORB : f32 = TUNE_MEDIA_ABSORB;
 // Optical depth past which the background is invisible (exp(-6) ~ 0.25%):
 // stop marching instead of walking the rest of a smoke plume voxel-by-voxel.
-const MEDIA_TAU_MAX : f32 = 6.0;
+const MEDIA_TAU_MAX : f32 = TUNE_MEDIA_TAU_MAX;
 
 struct Hit {
   hit      : bool,
@@ -236,7 +237,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           // beating in sync (render-only floats, same trick as ember surfaces)
           if (materials[mat].emission > 0u) {
             let fh = pcg(bitcast<u32>(cell.x * 7 + cell.y * 131 + cell.z * 2917));
-            let fl = 0.70 + 0.55 * sin(R.time * 13.0 + f32(fh & 0x3FFu) * 0.00614);
+            let fl = TUNE_FIRE_FLICKER_BASE + TUNE_FIRE_FLICKER_AMP * sin(R.time * TUNE_FIRE_FLICKER_RATE + f32(fh & 0x3FFu) * 0.00614);
             cellFire = (f32(materials[mat].emission) / 255.0) * fl;
             if (out.fireMat == 0u) { out.fireMat = mat; }
           }
@@ -426,7 +427,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
     var tCur = t;
 
-    for (var i = 0; i < 384; i++) {
+    for (var i = 0; i < TUNE_FAR_STEPS; i++) {
       if (!farInBox(cell, org)) { break; }
       if (farOcc[farOccIndex(level, cell)] == 0u) {
         // empty level chunk: jump to its exit face (same seam-safe jump as
@@ -595,8 +596,8 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
 // below, since sunlight that missed the surface hit the dirt first). Terrain
 // shaded this way gets its form back for free — north faces go blue-shifted,
 // undersides go earth-toned, and the eye reads that split as shape.
-const AMB_SKY    : vec3f = vec3f(0.40, 0.48, 0.62);   // zenith, cool
-const AMB_GROUND : vec3f = vec3f(0.25, 0.22, 0.17);   // bounce, warm
+const AMB_SKY    : vec3f = TUNE_AMB_SKY;   // zenith, cool
+const AMB_GROUND : vec3f = TUNE_AMB_GROUND;   // bounce, warm
 fn ambientAt(n : vec3f) -> vec3f {
   // n.y = -1 -> full bounce, n.y = +1 -> full sky
   return mix(AMB_GROUND, AMB_SKY, n.y * 0.5 + 0.5);
@@ -661,9 +662,9 @@ fn valueNoise(p : vec3f, scale : f32) -> f32 {
 fn surfaceGrain(cell : vec3<i32>, amp : f32) -> f32 {
   let p = vec3f(cell);
   // ~11 voxels (0.7 m) for the broad patches, ~2.5 voxels for the fine break-up.
-  let broad = valueNoise(p, 11.0);
-  let fine  = valueNoise(p, 2.5);
-  let n = broad * 0.68 + fine * 0.32;
+  let broad = valueNoise(p, TUNE_GRAIN_BROAD_SCALE);
+  let fine  = valueNoise(p, TUNE_GRAIN_FINE_SCALE);
+  let n = broad * TUNE_GRAIN_MIX + fine * (1.0 - TUNE_GRAIN_MIX);
   return 1.0 + (n - 0.5) * 2.0 * amp;
 }
 
@@ -718,7 +719,7 @@ fn voxelAO(cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32, uv : vec2f) -> f
 
   // 0.55 at a fully enclosed corner — deep enough to read, shallow enough that
   // interiors don't crush to black.
-  let ao = 1.0 - (occ / 3.0) * 0.45 * reach;
+  let ao = 1.0 - (occ / 3.0) * TUNE_AO_STRENGTH * reach;
   return clamp(ao, 0.0, 1.0);
 }
 
@@ -750,7 +751,7 @@ fn voxelAO(cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32, uv : vec2f) -> f
 // from far away goes soft. Same one-ray cost, no noise, and it is a closer
 // model of the real effect than a cone of one sample ever was.
 fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
-  let s = trace(hp + n * 0.02, R.sunDir, 384, false);
+  let s = trace(hp + n * TUNE_SHADOW_BIAS, R.sunDir, TUNE_SHADOW_STEPS, false);
   if (!s.hit) { return 1.0; }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
   // resting on the ground) keep a hard, dark contact shadow; distant ones (a
@@ -763,7 +764,7 @@ fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
   // under overhangs. The softening is in the EDGE, not in the depth: a distant
   // blocker only partially covers the solar disc, so its shadow lifts toward
   // ~0.45 of full sun, while a contact shadow stays at 0.
-  return clamp(smoothstep(0.6, 9.0, dM) * 0.45, 0.0, 1.0);
+  return clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) * TUNE_SHADOW_LIFT, 0.0, 1.0);
 }
 
 // ============================================================================
@@ -794,17 +795,17 @@ const WATER_IOR : f32 = 1.333;
 // Schlick F0 for that IOR: ((1-n)/(1+n))^2 = 0.0204. Water reflects only ~2%
 // head-on but ~100% at grazing — that spread IS the look, and it's exactly
 // what a constant tint cannot reproduce.
-const WATER_F0 : f32 = 0.0204;
+const WATER_F0 : f32 = TUNE_WATER_F0;
 
 // Per-channel absorption, per METRE of path, for clear water. Red is absorbed
 // roughly an order of magnitude faster than blue — that is why shallow water
 // reads cyan-green and deep water reads deep blue, and it's the single
 // strongest depth cue available. A scalar tint (what this shader used to do)
 // is flat by construction no matter how it's tuned.
-const WATER_ABSORB : vec3f = vec3f(1.85, 0.42, 0.20);
+const WATER_ABSORB : vec3f = TUNE_WATER_ABSORB;
 // Scattering back toward the eye — the color deep water TENDS toward rather
 // than going black. Without it, depth just crushes to black and reads as a pit.
-const WATER_SCATTER : vec3f = vec3f(0.045, 0.16, 0.20);
+const WATER_SCATTER : vec3f = TUNE_WATER_SCATTER;
 
 // ---- ripples ----
 // Sum of directional waves evaluated in world XZ. Cheap gradient-of-a-height
@@ -849,13 +850,15 @@ fn rippleSlope(pWorldM : vec2f, t : f32, footM : f32) -> vec2f {
   for (var i = 0; i < RIPPLE_BANDS; i++) {
     let w = waves[i];
     let k = 6.28318 / w.len;                 // angular wavenumber
-    let phase = dot(pWorldM, w.dir) * k + t * w.speed * k;
+    let amp = w.amp * TUNE_RIPPLE_AMP_SCALE;
+    let spd = w.speed * TUNE_RIPPLE_SPEED_SCALE;
+    let phase = dot(pWorldM, w.dir) * k + t * spd * k;
     // Per-band fade: full amplitude while the footprint is comfortably under
     // half a wavelength (Nyquist), gone by the time it exceeds it.
     var band = 1.0;
     if (footM > 0.0) { band = 1.0 - smoothstep(w.len * 0.28, w.len * 0.85, footM); }
     // d/dp of (amp * sin(phase)) = amp * k * cos(phase) * dir
-    slope += w.dir * (w.amp * k * cos(phase)) * band;
+    slope += w.dir * (amp * k * cos(phase)) * band;
   }
   return slope;
 }
@@ -994,7 +997,7 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   // a reflection grazing INTO dense canopy, where every step is a real voxel
   // step and the skip never fires. Media is off (`wantMedia = false`) so
   // reflected rays skip on the blocker count and smoke costs them nothing.
-  let h = trace(p + n * 0.05, rr, 96, false);
+  let h = trace(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, false);
   if (!h.hit) { return reflectionSky(rr); }
 
   // Shade the reflected hit with the same terms as a primary hit, minus the
@@ -1006,9 +1009,9 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   var rn = vec3f(0.0);
   rn[h.axis] = -h.sgn;
   var face = 1.0;
-  if (h.axis == 0) { face = 0.96; }
-  else if (h.axis == 2) { face = 0.92; }
-  if (m.klass != CLASS_LIQUID) { albedo *= surfaceGrain(h.cell, 0.065); }
+  if (h.axis == 0) { face = TUNE_FACE_X; }
+  else if (h.axis == 2) { face = TUNE_FACE_Z; }
+  if (m.klass != CLASS_LIQUID) { albedo *= surfaceGrain(h.cell, TUNE_GRAIN_AMP); }
   let lam = wrapDiffuse(dot(rn, R.sunDir), 0.55);
   // Same lighting model as a primary hit (minus AO and the shadow ray, which
   // are not resolvable in a reflection at this budget).
@@ -1046,7 +1049,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // The single most important term. At 2% head-on and ~100% at grazing, this
   // is what makes water look wet: you see THROUGH it at your feet and see the
   // SKY in it at the far shore, across one continuous surface.
-  var fres = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, 5.0);
+  var fres = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
   // Non-water liquids (oil, acid, blood) are dielectrics too but far more
   // absorbing; they get the same interface with a muted reflection so they
   // read as their own substance rather than all becoming "water".
@@ -1126,7 +1129,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // bright sand goes brighter, dark stone stays dark. Adding a constant
     // instead lights up the water itself, which reads as glowing blobs
     // floating in the volume rather than light playing over a surface.
-    lit *= 1.0 + min(caustic * 1.5, 0.85);
+    lit *= 1.0 + min(caustic * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
   }
 
   // What comes back up: the bed (plus its caustics), filtered by the water
@@ -1150,7 +1153,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // weight the difference between a real reflection and a sky sample is not
     // resolvable, and this is what stops a screenful of water from firing a
     // full-budget ray per pixel for no visible return.
-    if (fres > 0.06) {
+    if (fres > TUNE_REFLECTION_CUTOFF) {
       reflection = traceReflection(hitP, n, rd);
     } else {
       reflection = reflectionSky(reflect(rd, n));
@@ -1179,14 +1182,14 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // and a broad lobe over agreeing normals integrates into one blown-out
     // white slab across the sun track instead of a glitter path. A narrow lobe
     // on flat water gives a small bright highlight, which is correct.
-    let power = mix(180.0, 900.0, clamp(distM / 40.0, 0.0, 1.0));
+    let power = mix(TUNE_GLINT_POWER_NEAR, TUNE_GLINT_POWER_FAR, clamp(distM / 40.0, 0.0, 1.0));
     let spec = pow(max(dot(n, hv), 0.0), power);
     // Modulated by Fresnel so the glint follows the same angular law as the
     // reflection instead of floating on top of it. Capped: the highlight is a
     // bloom cue, not a light source, and letting it run to 2.6x saturates a
     // whole band of the lake to flat white and destroys the ripple detail
     // underneath it.
-    color += vec3f(1.0, 0.97, 0.88) * min(spec, 1.0) * 0.85 * (0.25 + fres);
+    color += vec3f(1.0, 0.97, 0.88) * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
   }
 
   // ---- shoreline foam ----
@@ -1196,7 +1199,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // ring, sells the boundary between water and land far better than the hard
   // color step it replaces.
   if (upFacing && !underwater) {
-    let shallow = 1.0 - smoothstep(0.0, 0.42, depthM);
+    let shallow = 1.0 - smoothstep(0.0, TUNE_FOAM_DEPTH, depthM);
     if (shallow > 0.0) {
       let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
       // reuse the ripple field as the foam mask so foam moves with the waves
@@ -1204,7 +1207,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
       // damping it would dissolve the far shore's foam line)
       let s = rippleSlope(pm, R.time, 0.0);
       let mask = smoothstep(0.010, 0.055, length(s));
-      color = mix(color, vec3f(0.92, 0.95, 0.97), shallow * mask * 0.55);
+      color = mix(color, vec3f(0.92, 0.95, 0.97), shallow * mask * TUNE_FOAM_STRENGTH);
     }
   }
 
@@ -1251,7 +1254,11 @@ fn moltenRamp(m : Material, temp : f32) -> vec3f {
   // Below the incandescence threshold the rock is genuinely dark — this is the
   // crust, and it must be allowed to go nearly black or there are no plates,
   // only a bright field with darker bits.
-  let dark = vec3f(0.055, 0.040, 0.038);
+  // Basalt, not mud. Cooled crust is near-black with only a slight warm cast;
+  // at 0.055/0.040/0.038 it came out mid-brown and the pool read as dried
+  // earth with glowing cracks. The plates need to be genuinely dark for the
+  // cracks to have anything to contrast against.
+  let dark = vec3f(0.020, 0.014, 0.014);
   let cool = unpackColor(m.color1);   // deep red
   let mid  = unpackColor(m.color0);   // orange
   let hot  = unpackColor(m.color2);   // yellow-orange
@@ -1269,7 +1276,12 @@ fn moltenRamp(m : Material, temp : f32) -> vec3f {
   // part of the ramp, which — compounded by the tonemap's per-channel
   // desaturation on the way up — renders the whole pool as glowing gold
   // honeycomb rather than molten rock.
-  var c = mix(dark, cool, smoothstep(0.00, 0.38, t));
+  // Hold pure dark across the low range. Starting the dark->cool blend at 0
+  // means a plate at t=0.15 is already a sixth of the way to red, and since
+  // most of the surface sits in that low band the whole pool washes to brown
+  // — the "dried mud" failure. The crust must stay crust until it is
+  // genuinely warming.
+  var c = mix(dark, cool, smoothstep(0.22, 0.46, t));
   c = mix(c, mid,   smoothstep(0.48, 0.78, t));
   c = mix(c, hot,   smoothstep(0.80, 0.94, t));
   c = mix(c, white, smoothstep(0.95, 1.00, t));
@@ -1309,16 +1321,31 @@ fn crustCracks(pm : vec2f, t : f32) -> f32 {
   // Base frequency in cycles per metre. Plates want to be roughly fist- to
   // head-sized; at 0.55 they came out metres across and the pool read as
   // polished marble rather than crust.
-  var p = pm * 2.4;
+  var p = pm * TUNE_LAVA_CRACK_FREQ;
   var drift = vec2f(0.031, -0.019);
+  // ROTATE THE DOMAIN PER OCTAVE. hashNoise2 samples a square lattice, and the
+  // ridge transform turns that lattice's axes into visible creases: without
+  // rotation every octave creases along the SAME x/y directions, they
+  // reinforce, and the crack network comes out full of right angles and long
+  // straight runs — it reads as cracked tile, not as rock. An irrational-ish
+  // angle per octave (~31.7 deg, chosen so no small multiple lands back on an
+  // axis) decorrelates them and the network turns organic.
+  let ca = 0.851; let sa = 0.525;   // cos/sin of ~31.7 degrees
   for (var i = 0; i < 4; i++) {
     let n = hashNoise2(p + drift * t);
-    // ridge transform: peaks become creases
+    // Ridge transform: peaks become creases. `pow` below 2 WIDENS the crease —
+    // squaring gives the thin, hard-edged filaments that read as fractured
+    // tile; a gentler exponent keeps a crack network but lets it bloom into
+    // the softer molten channels of classic lava.
     let ridge = 1.0 - abs(n * 2.0 - 1.0);
-    v += ridge * ridge * amp;
+    v += pow(ridge, 1.72) * amp;
     norm += amp;
-    amp *= 0.5;
-    p = p * 2.07 + vec2f(11.3, 7.7);   // non-integer lacunarity: no re-tiling
+    // Amplitude falls off FASTER than 0.5 so the fine octaves contribute
+    // texture without carving additional hard creases of their own — the
+    // high-frequency detail is what makes the network look busy and angular.
+    amp *= 0.42;
+    p = vec2f(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * 2.07 +
+        vec2f(11.3, 7.7);            // non-integer lacunarity: no re-tiling
     drift = vec2f(-drift.y, drift.x) * 1.35;
   }
   return v / max(norm, 1e-5);
@@ -1327,8 +1354,101 @@ fn crustCracks(pm : vec2f, t : f32) -> f32 {
 // ---- the full molten shade ----
 // Returns the emitted colour of a molten surface cell, in linear HDR (values
 // well above 1 are expected and are handled by the tonemap in fs()).
-fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f, n : vec3f,
-               rd : vec3f) -> vec3f {
+// ---- heat spill ----
+// Molten surfaces are bright light sources, and before this the rock one voxel
+// from a lava pool was lit purely by the sun — the pool sat in its basin like
+// a decal, casting nothing. Nothing else in the scene betrays "this glow is
+// painted on" as fast as an unlit surround.
+//
+// Rather than a light-propagation volume (DESIGN.md's eventual GI plan), this
+// takes a handful of taps along the surface normal and counts molten cells:
+// cheap, local, and enough to warm a rim convincingly. It runs ONLY for
+// surfaces that pass a cheap chunk-level test, so a world with no lava in view
+// pays almost nothing — the "costs nothing when idle" rule (CLAUDE.md #2)
+// applies to render work too.
+//
+// Returns a linear HDR colour to ADD to the surface shade.
+fn heatSpill(cell : vec3<i32>, n : vec3f) -> vec3f {
+  var glow = vec3f(0.0);
+  // Step outward along the normal; a molten cell found near contributes more.
+  // 4 taps at ~1.6-voxel spacing reaches ~6 voxels. Measured: at 6 taps this
+  // function cost ~13 ms/frame of a 30 ms frame — it runs on EVERY
+  // non-emissive surface pixel in the world, so its per-tap cost is paid by
+  // terrain that will never see lava. Keep the loop short; the falloff makes
+  // the far taps nearly worthless anyway.
+  for (var i = 1; i <= 4; i++) {
+    let s = f32(i) * 1.6;
+    // floor(), not a bare cast: WGSL's f32->i32 conversion truncates toward
+    // zero, so a negative offset like -1.5 becomes -1 instead of -2 and the
+    // tap lands on the wrong side of the surface. That asymmetry made
+    // up-facing rims sample sideways into the pool and glow pink.
+    let c = cell + vec3<i32>(floor(n * s + vec3f(0.5)));
+    if (!inBounds(c)) { break; }
+    // chunk-level reject first: an empty or lava-free chunk costs one read
+    if (occTotal(chunkOcc(c)) == 0u) { continue; }
+    let mm = materials[voxMat(voxels[cellIndexW(c)])];
+    if (mm.klass == CLASS_LIQUID && (mm.flags & MATF_OPAQUE) != 0u &&
+        mm.emission > 0u) {
+      // inverse-square-ish falloff, normalised so a touching cell gives ~1
+      let fall = 1.0 / (1.0 + s * s * 0.55);
+      glow += unpackColor(mm.color0) * (f32(mm.emission) / 255.0) * fall;
+    }
+  }
+  // Deliberately subtle. Heat spill should read as a warm lick along the rim
+  // nearest the pool, not as a pink wash over every surface in the basin —
+  // this is a contact cue, and once it covers a broad flat area it stops
+  // looking like light and starts looking like the wrong albedo.
+  return glow * TUNE_HEAT_SPILL_STRENGTH;
+}
+
+// ---- how "pooled" is this molten cell? ----
+// Returns 0 for an isolated blob and 1 for the interior of a body of lava.
+//
+// The crust model assumes a CONTINUOUS SURFACE: plates, cracks between them,
+// a skin that cools and shears. None of that means anything on a single voxel
+// of lava — a laser-melted speck or a splash droplet has no room for a plate,
+// so the crack field just paints an arbitrary slice of noise onto it and it
+// reads as a dirty smudge. Those cases looked better under the old flat
+// emissive shade, and this is the term that lets both coexist.
+//
+// Measured by sampling the horizontal neighbourhood at the hit: lava in a pool
+// is surrounded by lava, a droplet is not. Horizontal only, and deliberately:
+// what matters is whether there is EXTENT for a crust to form across, and a
+// one-voxel-deep sheet of lava spread over a floor is still a pool. A radius
+// of 3 (~0.4 m) is about the smallest patch that can show a plate.
+fn moltenPooling(cell : vec3<i32>, mat : u32) -> f32 {
+  var n = 0.0;
+  var total = 0.0;
+  for (var dx = -3; dx <= 3; dx += 3) {
+    for (var dz = -3; dz <= 3; dz += 3) {
+      total += 1.0;
+      let c = cell + vec3<i32>(dx, 0, dz);
+      if (!inBounds(c)) { continue; }
+      if (occTotal(chunkOcc(c)) == 0u) { continue; }
+      if (voxMat(voxels[cellIndexW(c)]) == mat) { n += 1.0; }
+    }
+  }
+  let frac = n / max(total, 1.0);
+  // THRESHOLD LOW. The interesting distinction is "isolated speck" vs
+  // "everything else", not "pool interior" vs "pool edge": a cell on a pool's
+  // rim has neighbours on only one side, so with a high threshold the entire
+  // boundary of every pool falls in the transition band and renders with the
+  // flat treatment — drawing a bright ring around the pool that is far more
+  // objectionable than either look on its own. Anything with even a couple of
+  // lava neighbours has enough surface to carry a crust, so the ramp is placed
+  // to catch only the genuinely isolated case.
+  return smoothstep(0.10, 0.42, frac);
+}
+
+
+fn shadeMolten(m : Material, mat : u32, cell : vec3<i32>, hitP : vec3f,
+               n : vec3f, rd : vec3f) -> vec3f {
+  // How much surface is there for a crust to form on? 0 = isolated speck,
+  // 1 = the middle of a pool. Everything crust-related below is scaled by
+  // this, so scattered lava keeps the simple emissive look it had before the
+  // crust model existed (see moltenPooling).
+  let pool = moltenPooling(cell, mat);
+
   // Plates live in the horizontal plane for a pool surface; for a wall of
   // lava, project onto whichever plane the face points out of, so a vertical
   // flow gets vertical structure instead of a smeared top-down pattern.
@@ -1344,11 +1464,28 @@ fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f, n : vec3f,
   // separates plate from crack: a soft ramp gives a uniformly warm surface
   // with no plate boundaries, which is the failure mode this whole function
   // exists to avoid.
-  // The knee sits HIGH so that most of the surface falls below it and stays
-  // crust. Lowering it floods the pool with melt and the plates stop reading
-  // as plates — the dark area between cracks is what gives the glow something
-  // to be brighter *than*.
-  var temp = smoothstep(0.52, 0.93, cracks);
+  // The knee still sits high enough that most of the surface stays crust —
+  // the dark area between cracks is what gives the glow something to be
+  // brighter *than*. But it is deliberately WIDE (0.30 of range, not 0.41 of
+  // a hard step): a narrow knee gives every crack a crisp edge, and a field
+  // of crisp-edged creases is what read as cracked tile. Widening it lets the
+  // cracks fade into their plates, which is most of the way back toward
+  // classic lava's soft molten channels while keeping the plate structure.
+  var temp = smoothstep(TUNE_LAVA_CRACK_KNEE_LOW, TUNE_LAVA_CRACK_KNEE_HIGH, cracks);
+  // Bias the whole field warm a touch: classic lava is a hot surface with dark
+  // skin on it, not dark rock with hot seams. This is the single knob that
+  // moves furthest along the classic<->crust axis, so it stays small — at 0.10
+  // it flooded the pool and the crust stopped reading as crust at all.
+  temp += TUNE_LAVA_WARM_BIAS;
+
+  // FADE THE CRUST OUT ON ISOLATED LAVA. A speck of lava — laser spatter, a
+  // splash droplet, a single melted voxel — has no room for plates, and the
+  // crack field just paints an arbitrary slice of noise across it, which reads
+  // as a dirty smudge rather than as molten rock. Below full pooling the
+  // temperature blends toward a uniform hot value, which is exactly the flat
+  // emissive look scattered lava had before the crust model and which suited
+  // it far better. Pools are unaffected (pool == 1 there).
+  temp = mix(0.86, temp, pool);
 
   // Per-cell variation so two adjacent plates are not the same temperature —
   // some crust is freshly congealed and still glowing, some is old and dark.
@@ -1356,19 +1493,35 @@ fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f, n : vec3f,
   // patches so it reads as plate-scale variation and not per-voxel noise.
   let pc = cell >> vec3<u32>(2u);
   let ph = pcg(u32(pc.x * 7 + pc.y * 131 + pc.z * 2917));
-  temp += (f32(ph & 0xFFu) / 255.0 - 0.5) * 0.22;
+  // Biased COOL: a symmetric jitter lifts as many plates as it drops, and
+  // since the ramp climbs steeply the lifted ones dominate the average and
+  // re-warm the whole crust. Most plates should be cooling, a few still hot.
+  // Kept small for the same reason as the face bias below: this is quantised
+  // per 4-voxel patch, so a large amplitude tiles the surface into visible
+  // rectangles rather than reading as variation within a continuous crust.
+  // Scaled by pooling for the same reason as the crack field: plate-to-plate
+  // temperature variation is meaningless on something that is not a plate.
+  temp += (f32(ph & 0xFFu) / 255.0 - 0.68) * 0.10 * pool;
 
   // Slow per-cell pulse: convection turning fresh melt over. Distinct phase
   // per patch so the pool does not beat in unison (same reasoning as the fire
   // flicker, which this deliberately does NOT reuse — fire flickers fast and
   // randomly, lava breathes).
-  temp += 0.06 * sin(R.time * 0.9 + f32(ph & 0x3FFu) * 0.0061);
+  temp += TUNE_LAVA_PULSE_AMP * sin(R.time * TUNE_LAVA_PULSE_RATE + f32(ph & 0x3FFu) * 0.0061);
 
   // Top faces are the coolest (they radiate to the sky and skin over first);
-  // the sides of a flow are freshly exposed melt and run hotter. This is a
-  // real effect and it also usefully breaks up the silhouette of a pool.
-  if (n.y > 0.5) { temp -= 0.10; }
-  else { temp += 0.12; }
+  // the sides of a flow are freshly exposed melt and run hotter.
+  //
+  // SMALL, and asymmetric on purpose. A pool surface is not flat: mass-
+  // conserving flow leaves partial cells, so the top of a settled pool is a
+  // field of one-voxel steps whose SIDE faces are exposed among their
+  // neighbours' top faces. A large split (this was -0.10 / +0.12, a 0.22 jump
+  // across a single voxel edge) therefore paints those risers as bright pale
+  // rectangles scattered over the surface — it reads as a shading bug, which
+  // is exactly what it is. Keep the difference under the width of one ramp
+  // band so a riser blends with its neighbours instead of banding away.
+  if (n.y > 0.5) { temp -= 0.015 * pool; }
+  else { temp += 0.030 * pool; }
 
   temp = clamp(temp, 0.0, 1.0);
 
@@ -1386,7 +1539,9 @@ fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f, n : vec3f,
   // interesting. ~1.9x peak keeps the cores inside the range where the
   // shoulder still discriminates colour.
   let power = temp * temp * (0.35 + 2.2 * temp);
-  c *= 0.16 + power * emis * 1.9;
+  // The constant term is the crust's own dim self-illumination, NOT an ambient
+  // light — it has to stay small or it lifts the dark plates back into brown.
+  c *= 0.055 + power * emis * TUNE_LAVA_EMISSION_GAIN;
 
   // Fresnel-ish rim: a glancing view of any surface catches more of its
   // emission, and on a pool this draws a hot lip around the far edge that
@@ -1409,7 +1564,7 @@ fn fs(in : VSOut) -> FSOut {
                    + R.camRight * (ndc.x * R.tanHalfFov * R.aspect)
                    + R.camUp    * (ndc.y * R.tanHalfFov));
 
-  let h = trace(R.camPos, rd, 4096, true);
+  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true);
 
   // Rays that leave the window without a surface hit (and weren't absorbed by
   // media) continue into the far-field cascades from the window's exit point.
@@ -1424,12 +1579,47 @@ fn fs(in : VSOut) -> FSOut {
   // reversed-Z depth so raster geometry (particles/debris) composites in.
   // A saturated media march writes depth at its stop point: the smoke is
   // opaque there, and raster geometry behind it must not draw through.
-  var depth = 0.0;  // sky = far
+  //
+  // ---- WHY MEDIA MUST WRITE DEPTH TOO ----
+  // Translucent liquids and gases never set `hit` — trace() accumulates them
+  // and keeps marching (see the CLASS_GAS / non-OPAQUE CLASS_LIQUID branch).
+  // Keying depth on `hit` alone therefore reports the SOLID BEHIND the water,
+  // or the far plane for a ray that crosses a lake and exits to sky. Raster
+  // geometry (debris bodies, particles, sprites) then passes the reversed-Z
+  // GreaterEqual test against that far value and draws ON TOP of water, lava
+  // glow and fire it is genuinely behind — a body sunk in a pool floats over
+  // the surface, and one on the far side of a plume punches through it.
+  //
+  // The fix is to take the NEAREST covering event along the ray. A liquid
+  // interface at liqT is shaded as a real surface (Fresnel + reflection, see
+  // shadeWater), so it covers whatever is behind it as far as raster geometry
+  // is concerned, even though the march continued past it to light the bed.
+  // Depth is a single value per pixel, so a partially transparent surface has
+  // to pick a side: putting it at the interface is right, because that is
+  // where the pixel's reflection and specular come from.
+  //
+  // KNOWN LIMIT — thin gas. Fire and smoke that never reach the saturation
+  // early-out still write far-plane depth, so debris inside a WISPY plume is
+  // not occluded by it. That is deliberate: a thin plume is genuinely
+  // see-through, and writing depth at its first cell would hard-CLIP any body
+  // standing in smoke instead of letting it show through — a worse artifact
+  // than the one it fixes. Dense plumes already resolve via `saturated`.
+  // Doing better needs order-independent transparency, not a depth tweak.
+  var tDepth = -1.0;
   if (h.hit || h.saturated) {
-    let viewZ = h.t * dot(rd, R.camFwd);
-    depth = clamp(KNEAR / max(viewZ, KNEAR), 0.0, 1.0);
+    tDepth = h.t;
   } else if (far.hit) {
-    let viewZ = far.t * dot(rd, R.camFwd);
+    tDepth = far.t;
+  }
+  // Liquid interface: nearest wins. `> 0.0` skips the underwater case (liqT
+  // ~0 means the camera is already submerged, so there is no interface in
+  // front of anything and depth belongs to whatever the ray actually found).
+  if (h.liqT > 0.05 && (tDepth < 0.0 || h.liqT < tDepth)) {
+    tDepth = h.liqT;
+  }
+  var depth = 0.0;  // sky = far
+  if (tDepth >= 0.0) {
+    let viewZ = tDepth * dot(rd, R.camFwd);
     depth = clamp(KNEAR / max(viewZ, KNEAR), 0.0, 1.0);
   }
 
@@ -1458,12 +1648,12 @@ fn fs(in : VSOut) -> FSOut {
       // Match the near field's face weights exactly — a different constant
       // here is a visible brightness step at the window seam.
       var face = 1.0;
-      if (far.axis == 0) { face = 0.96; }
-      else if (far.axis == 2) { face = 0.92; }
-      albedo *= surfaceGrain(far.cell << vec3<u32>(farCellShift(far.level)), 0.05);
+      if (far.axis == 0) { face = TUNE_FACE_X; }
+      else if (far.axis == 2) { face = TUNE_FACE_Z; }
+      albedo *= surfaceGrain(far.cell << vec3<u32>(farCellShift(far.level)), TUNE_GRAIN_AMP_FAR);
       // Same wrapped diffuse as the near field — a different falloff here is a
       // visible brightness step at the window seam.
-      var lambert = wrapDiffuse(dot(n, R.sunDir), 0.55);
+      var lambert = wrapDiffuse(dot(n, R.sunDir), TUNE_DIFFUSE_WRAP);
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         let hp = R.camPos + rd * (far.t - 1e-3) +
@@ -1472,20 +1662,20 @@ fn fs(in : VSOut) -> FSOut {
         // single-cell terrace steps and canopy rings, and a hard shadow term
         // turns them into high-frequency dark speckle ("ant trails") across
         // every hillside. 0.3 keeps the form cue without the noise.
-        if (farShadowed(far.level, hp)) { lambert *= 0.3; }
+        if (farShadowed(far.level, hp)) { lambert *= TUNE_SHADOW_FAR_LIFT; }
       }
       // one-sample AO: an occupied cell directly above darkens — valley floors
       // and ground under flattened canopy stop rendering at full sky ambient
       var ao = 1.0;
       let up = far.cell + vec3<i32>(0, 1, 0);
       if (farInBox(up, F.origins[far.level - 1u].xyz) &&
-          farMatAt(far.level, up) != 0u) { ao = 0.72; }
+          farMatAt(far.level, up) != 0u) { ao = TUNE_AO_FAR; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
-      let fsun = vec3f(1.0, 0.95, 0.86) * lambert * 1.35;
+      let fsun = TUNE_SUN_COLOR * lambert * TUNE_SUN_INTENSITY;
       color = albedo * face * (ambientAt(n) * ao + fsun);
       let emis = f32(m.emission) / 255.0;
-      if (emis > 0.0) { color += albedo * emis * 1.7; }
+      if (emis > 0.0) { color += albedo * emis * TUNE_EMISSIVE_STRENGTH; }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
     } else {
@@ -1509,7 +1699,7 @@ fn fs(in : VSOut) -> FSOut {
     // nibble is fullness, not a palette variant, and graining a lake surface
     // fights the ripple normals.
     if (m.klass != CLASS_LIQUID) {
-      albedo *= surfaceGrain(h.cell, 0.065);
+      albedo *= surfaceGrain(h.cell, TUNE_GRAIN_AMP);
     }
 
     // ---- ambient occlusion ----
@@ -1529,8 +1719,8 @@ fn fs(in : VSOut) -> FSOut {
     // directional term and this only breaks the tie between the two horizontal
     // axes so parallel walls don't fuse.
     var face = 1.0;
-    if (h.axis == 0) { face = 0.96; }
-    else if (h.axis == 2) { face = 0.92; }
+    if (h.axis == 0) { face = TUNE_FACE_X; }
+    else if (h.axis == 2) { face = TUNE_FACE_Z; }
 
     // Wrapped diffuse (see wrapDiffuse): keeps the risers of the terrain
     // staircase within a few percent of their tops instead of 1.8x apart.
@@ -1540,7 +1730,7 @@ fn fs(in : VSOut) -> FSOut {
     // range completely empty. Two disjoint populations interleaved at voxel
     // frequency is what the eye reports as "noise on the floor"; there was no
     // gradient between them to read as slope. Widening the wrap fills that gap.
-    var lambert = wrapDiffuse(dot(n, R.sunDir), 0.55);
+    var lambert = wrapDiffuse(dot(n, R.sunDir), TUNE_DIFFUSE_WRAP);
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       lambert *= sunShadow(R.camPos + rd * (h.t - 1e-3), n, in.pos.xy);
     }
@@ -1548,7 +1738,7 @@ fn fs(in : VSOut) -> FSOut {
     // light, and AO measures how much sky the point can see); direct sun is
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
-    let sun = vec3f(1.0, 0.95, 0.86) * lambert * 1.35;
+    let sun = TUNE_SUN_COLOR * lambert * TUNE_SUN_INTENSITY;
     color = albedo * face * (ambientAt(n) * ao + sun);
 
     // ---- emissive surfaces ----
@@ -1565,12 +1755,32 @@ fn fs(in : VSOut) -> FSOut {
     let isMolten = m.klass == CLASS_LIQUID &&
                    (m.flags & MATF_OPAQUE) != 0u && m.emission > 0u;
     if (isMolten) {
-      color = shadeMolten(m, h.cell, R.camPos + rd * h.t, n, rd);
+      color = shadeMolten(m, mat, h.cell, R.camPos + rd * h.t, n, rd);
     } else if (emis > 0.0) {
       // everything else emissive (fire, embers) keeps the fast random flicker
       let ch = pcg(u32(h.cell.x * 7 + h.cell.y * 131 + h.cell.z * 2917));
-      let flick = 0.82 + 0.28 * sin(R.time * 9.0 + f32(ch & 0xFFu) * 0.0245);
-      color += albedo * emis * 1.7 * flick;
+      let flick = TUNE_EMISSIVE_FLICKER_BASE + TUNE_EMISSIVE_FLICKER_AMP * sin(R.time * TUNE_EMISSIVE_FLICKER_RATE + f32(ch & 0xFFu) * 0.0245);
+      color += albedo * emis * TUNE_EMISSIVE_STRENGTH * flick;
+    } else {
+      // Non-emissive surfaces pick up nearby molten light. heatSpill() itself
+      // rejects per tap on the chunk occupancy, and the loop breaks the moment
+      // it leaves the window, so a surface with no lava near it costs at most
+      // a few reads and no arithmetic. Cheap enough to run unconditionally,
+      // and any earlier gate would have to answer the same "is lava near"
+      // question the taps already answer.
+      // EARLY REJECT, and this gate is load-bearing: heatSpill runs on every
+      // non-emissive surface pixel, and measured unguarded it cost ~13 ms of a
+      // 30 ms frame — paid overwhelmingly by terrain nowhere near lava. Lava
+      // is a liquid, so it is counted in a chunk's total but NOT in its
+      // blocker count (isRayBlocker excludes non-opaque liquids... but lava IS
+      // opaque, so it does count). The cheap discriminator that survives both
+      // cases is simply: does the chunk one step along the normal hold
+      // anything at all? Open air above a grass field does not, so the common
+      // case is one buffer read and out.
+      let probe = h.cell + vec3<i32>(floor(n * 3.0 + vec3f(0.5)));
+      if (inBounds(probe) && occTotal(chunkOcc(probe)) != 0u) {
+        color += albedo * heatSpill(h.cell, n);
+      }
     }
 
     // distance fog (density per meter, so the look survives voxel-size
@@ -1632,19 +1842,29 @@ fn fs(in : VSOut) -> FSOut {
     }
   }
 
+  // NOTE: rising embers over lava were attempted here and REMOVED. The
+  // approach (probe downward per ray step for a molten surface, then resolve
+  // analytic spark points above it) is sound in principle but was never made
+  // to render reliably, and it cost ~13 ms/frame at 1080p because the probe
+  // runs per step for every pixel on screen. If revisited, do NOT rebuild it
+  // as a per-pixel search: spawn real particles from a bounded event, or bake
+  // an emitter list the shader can index, so the cost scales with the number
+  // of pools rather than with screen area.
+
+
   // fire glow: additive, from the flicker-weighted emissive path. Intensity
   // drives a temperature ramp across the material palette — stray flame
   // voxels stay wispy deep-orange, plume cores saturate toward white-hot.
   if (h.fireMat != 0u && h.fireGlow > 0.0) {
     let fm = materials[h.fireMat];
-    let x = 1.0 - exp(-h.fireGlow * 1.4);
+    let x = 1.0 - exp(-h.fireGlow * TUNE_FIRE_GLOW_RATE);
     var fc = mix(unpackColor(fm.color2), unpackColor(fm.color0),
                  clamp(x * 2.0, 0.0, 1.0));
     fc = mix(fc, unpackColor(fm.color1) * 1.25 + vec3f(0.10, 0.06, 0.0),
              clamp(x * 2.0 - 1.0, 0.0, 1.0));
     // slow global breathing on top of the per-cell flicker baked into fireGlow
-    let breathe = 0.92 + 0.08 * sin(R.time * 5.3);
-    color += fc * x * 2.1 * breathe;
+    let breathe = (1.0 - TUNE_FIRE_BREATHE_AMP) + TUNE_FIRE_BREATHE_AMP * sin(R.time * TUNE_FIRE_BREATHE_RATE);
+    color += fc * x * TUNE_FIRE_INTENSITY * breathe;
   }
 
   // ---- tonemap ----
@@ -1671,7 +1891,7 @@ fn fs(in : VSOut) -> FSOut {
   // things get hotter. So blend a little of it back in, weighted by how far
   // into the shoulder the pixel sits: hue is preserved through the midtones,
   // and only the truly hot cores bleach.
-  const WHITE : f32 = 4.2;   // intensity that maps to display white
+  const WHITE : f32 = TUNE_EXPOSURE_WHITE;   // intensity that maps to display white
   color = max(color, vec3f(0.0));
   let lum = max(dot(color, vec3f(0.2126, 0.7152, 0.0722)), 1e-5);
   let mapped = (lum * (1.0 + lum / (WHITE * WHITE))) / (1.0 + lum);
@@ -1681,9 +1901,9 @@ fn fs(in : VSOut) -> FSOut {
   // percent and hue is essentially untouched, and only genuinely hot cores
   // (3x and up) bleach toward white. A linear weight starts desaturating in
   // the midtones, which is the gold-honeycomb failure this replaces.
-  let bleach = clamp(mapped * mapped * mapped * 0.9, 0.0, 0.9);
+  let bleach = clamp(mapped * mapped * mapped * TUNE_BLEACH_AMOUNT, 0.0, TUNE_BLEACH_AMOUNT);
   color = mix(hueKept, perCh, bleach);
-  color = pow(color, vec3f(1.0 / 2.2));
+  color = pow(color, vec3f(1.0 / TUNE_GAMMA));
   var out : FSOut;
   out.color = vec4f(color, 1.0);
   out.depth = depth;

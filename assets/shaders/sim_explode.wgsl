@@ -27,7 +27,7 @@
 @group(1) @binding(5) var<storage, read>       expOps   : array<ExplosionOp>;
 @group(1) @binding(6) var<storage, read_write> expMask  : array<u32>;
 
-const FALLOFF_PER_CELL : i32 = 6;   // power lost per cell of distance (in air)
+const FALLOFF_PER_CELL : i32 = TUNE_FALLOFF_PER_CELL;   // power lost per cell of distance (in air)
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
@@ -122,10 +122,10 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   markBoth(c);
 
   let m = materials[voxMat(w)];
-  var ejectPerMille = 250u;
-  if (m.klass == CLASS_LIQUID) { ejectPerMille = 500u; }
-  else if (m.klass == CLASS_POWDER) { ejectPerMille = 350u; }
-  else if (m.klass == CLASS_GAS) { ejectPerMille = 0u; }
+  var ejectPerMille = TUNE_EJECT_SOLID;
+  if (m.klass == CLASS_LIQUID) { ejectPerMille = TUNE_EJECT_LIQUID; }
+  else if (m.klass == CLASS_POWDER) { ejectPerMille = TUNE_EJECT_POWDER; }
+  else if (m.klass == CLASS_GAS) { ejectPerMille = TUNE_EJECT_GAS; }
 
   let rnd = hash3(T.seed ^ 0xB0011u, T.tick, idx);
   if (rnd % 1000u >= ejectPerMille) { return; }

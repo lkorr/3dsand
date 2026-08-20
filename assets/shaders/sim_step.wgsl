@@ -289,7 +289,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     let nmat = voxMat(nw);
     if (nmat == mat) {
       let nf = voxState(nw) + 1u;
-      if (nf + 2u <= f) {
+      if (nf + TUNE_LIQUID_EQUALIZE <= f) {
         transferLiquid(c, n, mat, f, nf, (f - nf) / 2u);
         return;
       }
@@ -378,7 +378,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // 4) wandering powders (mites): scuttle laterally, occasionally hop up.
   if (m.klass == CLASS_POWDER && (m.flags & MATF_WANDER) != 0u) {
     let r3 = rnd >> 18u;
-    if ((r3 & 7u) == 0u &&
+    if ((r3 & TUNE_WANDER_HOP_MASK) == 0u &&
         tryMove(c, c + vec3<i32>(0, 1, 0), w, m.density, false)) { return; }
     for (var i = 0u; i < 4u; i++) {
       let d = lateralDir(i + (r3 >> 3u));

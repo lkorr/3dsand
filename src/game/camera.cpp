@@ -2,11 +2,13 @@
 
 #include <algorithm>
 
+#include "sim/tuning.h"
+
 void Camera::ApplyMouse(float dx, float dy) {
-  const float sens = 0.0022f;
-  yaw += dx * sens;
-  pitch -= dy * sens;
-  pitch = std::clamp(pitch, -1.55f, 1.55f);
+  const auto& t = CurrentTuning().camera;
+  yaw += dx * t.mouseSensitivity;
+  pitch -= dy * t.mouseSensitivity;
+  pitch = std::clamp(pitch, -t.pitchClamp, t.pitchClamp);
 }
 
 Vec3 Camera::Forward() const {

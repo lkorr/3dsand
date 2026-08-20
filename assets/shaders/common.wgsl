@@ -17,7 +17,7 @@ const CLASS_GAS    : u32 = 3u;
 
 // Air participates in density ordering: powders/liquids sink through it,
 // gases rise through it.
-const AIR_DENSITY : i32 = 10;
+const AIR_DENSITY : i32 = TUNE_AIR_DENSITY;
 
 // Liquids use the state nibble as fullness: code 0..7 = 1..8 eighths
 // (mass-conserving flow, DESIGN.md §4). Solids/powders/gases keep the state
@@ -140,8 +140,8 @@ fn projectView(rel : vec3f, R : RenderParams) -> vec4f {
 const PARTICLE_CAP  : u32 = 262144u;
 const CLAIM_SIZE    : u32 = 262144u;   // reinsertion claim hash (power of two)
 const PART_ONE      : i32 = 256;       // 1.0 voxel in fixed point
-const PART_GRAVITY  : i32 = 22;        // 9.81 m/s^2 in voxels/tick^2, fixed point
-const PART_MAX_VEL  : i32 = 1536;      // 6 voxels/tick terminal speed
+const PART_GRAVITY  : i32 = TUNE_PART_GRAVITY;        // 9.81 m/s^2 in voxels/tick^2, fixed point
+const PART_MAX_VEL  : i32 = TUNE_PART_MAX_VEL;      // 6 voxels/tick terminal speed
 const PFLAG_ALIVE   : u32 = 1u;
 const PFLAG_PENDING : u32 = 2u;        // proposed a reinsertion this tick
 

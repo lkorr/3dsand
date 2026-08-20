@@ -25,6 +25,7 @@
 #include "sim/farfield.h"
 #include "sim/materials.h"
 #include "sim/simulation.h"
+#include "sim/tuning.h"
 #include "sim/stream.h"
 #include "sim/voxload.h"
 #include "sim/world.h"
@@ -64,7 +65,7 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   rp.camRight[0] = r.x; rp.camRight[1] = r.y; rp.camRight[2] = r.z;
   rp.camUp[0] = u.x; rp.camUp[1] = u.y; rp.camUp[2] = u.z;
   rp.camFwd[0] = f.x; rp.camFwd[1] = f.y; rp.camFwd[2] = f.z;
-  rp.tanHalfFov = std::tan(cam.fovY * 0.5f);
+  rp.tanHalfFov = std::tan(CurrentTuning().camera.fovY * 0.5f);
   rp.aspect = aspect;
   rp.time = time;
   rp.flags = shadows ? 1u : 0u;
@@ -73,7 +74,8 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   // that valleys aren't pits. The old 0.78 y put the sun ~52 deg up and
   // flattened the world — shadows were 1-2 cells long and the far field read
   // as unlit wallpaper.
-  Vec3 sun = Vec3{0.50f, 0.55f, 0.38f}.normalized();
+  const auto& rt = CurrentTuning().render;
+  Vec3 sun = Vec3{rt.sunDir[0], rt.sunDir[1], rt.sunDir[2]}.normalized();
   rp.sunDir[0] = sun.x; rp.sunDir[1] = sun.y; rp.sunDir[2] = sun.z;
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
@@ -368,6 +370,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   //           refraction, depth absorption and the visible bed have to carry it.
   // Just above the surface at the near rim, looking across the lake: the
   // grazing angle where Fresnel reflection and sun glint dominate.
+  // Birch look shot: the branching-skeleton species is the one tree whose
+  // silhouette can't be judged from the general shots — it needs a single
+  // specimen against the sky. Birch at (75,506), ground y=53, trunk 113.
+  render({75 - 115, 53 + 85, 506 - 115}, 0.785f, -0.18f, "screenshot_birch.bmp");
   render({372, 80, 372}, 0.785f, -0.30f, "screenshot_water.bmp");
   // Standing over the middle looking down: the low-Fresnel angle, where
   // refraction, per-channel depth absorption and the visible bed carry it.
@@ -376,7 +382,45 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
   // still render as a surface hit, untouched by any of the water work.
   render({236, 80, 276}, 0.785f, -0.45f, "screenshot_oil.bmp");
-  render({198, 78, 496}, 0.785f, -0.45f, "screenshot_lava.bmp");
+  // Lava pool (220,520), surface y=64, rim y=66: close and low, the angle
+  // where crust structure and the glow from the cracks have to carry the look.
+  render({196, 74, 496}, 0.785f, -0.30f, "screenshot_lava.bmp");
+  // Looking down INTO the lava pool: the crust plates and crack network fill
+  // the frame, which is the only way to judge them.
+  render({220, 86, 546}, -1.571f, -0.80f, "screenshot_lava_down.bmp");
+  // Low and close across the pool: the angle where embers rising off the
+  // surface read against the far rim, and where the crust is seen at a grazing
+  // angle rather than plan view.
+  render({242, 70, 542}, -2.36f, -0.10f, "screenshot_lava_close.bmp");
+
+  // ---- scattered lava: the laser-spatter case ----
+  // Single isolated lava voxels have no surface for a crust to form on, so
+  // shadeMolten's pooling term should fade them back to the simple emissive
+  // look. Paint some on open ground next to the pool and shoot them, so the
+  // two treatments can be compared in one pass.
+  {
+    std::vector<CellOp> spatter;
+    int gx = 300, gz = 470;
+    int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
+    for (int i = 0; i < 40; i++) {
+      // deterministic scatter — no rand(), so the shot is reproducible
+      int ox = ((i * 37) % 19) - 9;
+      int oz = ((i * 53) % 23) - 11;
+      int oy = ((i * 29) % 3);
+      IVec3 c{gx + ox * 2, gh + 1 + oy, gz + oz * 2};
+      if (!world.CellInWindow(c)) continue;
+      // same word rules as a brush paint: liquid born full, stamp 0xFF
+      uint32_t word = (kMatLava & 0xFFFu) | (7u << 12) | (0xFFu << 16);
+      spatter.push_back({World::SlotCellIndex(c), word});
+    }
+    for (uint32_t t = 121; t <= 124; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 t == 121 ? spatter : std::vector<CellOp>{}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    render({(float)(gx - 26), (float)(gh + 14), (float)(gz - 26)}, 0.785f,
+           -0.32f, "screenshot_lava_spatter.bmp");
+  }
   return 0;
 }
 
@@ -1481,6 +1525,15 @@ int main(int argc, char** argv) {
   }
 
   std::string assetDir = AssetDir();
+  // Tuning first: LoadShader() bakes these into every shader's constant
+  // prelude, so they have to be live before the first pipeline build.
+  {
+    Tuning tune;
+    LoadTuning(assetDir + "/materials/tuning.json", tune);
+    for (const std::string& w : tune.warnings)
+      std::fprintf(stderr, "tuning: %s\n", w.c_str());
+    SetCurrentTuning(tune);
+  }
   std::vector<MaterialDef> mats;
   std::vector<ReactionGpu> reactions;
   std::string errors;
@@ -1653,8 +1706,9 @@ int main(int argc, char** argv) {
     if (captured && eG.Pressed(key(GLFW_KEY_G))) {
       Grenade g;
       g.pos = player.EyePos() + cam.Forward() * 2.0f;
-      g.vel = cam.Forward() * (20.0f / kVoxelMeters) + player.vel;
-      g.fuse = 2.2f;
+      g.vel = cam.Forward() * (CurrentTuning().grenade.throwSpeed / kVoxelMeters) +
+              player.vel;
+      g.fuse = CurrentTuning().grenade.fuse;
       grenades.push_back(g);
     }
     if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
@@ -1678,6 +1732,16 @@ int main(int argc, char** argv) {
 
     if (ui.reloadShaders) {
       ui.reloadShaders = false;
+      // Tuning feeds the shader constant prelude, so re-read it first — this
+      // is what makes F5 a one-key apply for everything in tuning.json, both
+      // the WGSL constants and the CPU-side gameplay values.
+      {
+        Tuning tune;
+        LoadTuning(assetDir + "/materials/tuning.json", tune);
+        for (const std::string& w : tune.warnings)
+          std::fprintf(stderr, "tuning: %s\n", w.c_str());
+        SetCurrentTuning(tune);
+      }
       std::printf("reloading shaders... %s\n",
                   sim.ReloadShaders(ctx.device, ctx.instance) ? "ok" : "FAILED (kept old)");
     }
@@ -1812,7 +1876,7 @@ int main(int argc, char** argv) {
           gridDist = (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - eye).len();
         }
         float frac = 1.0f;
-        const float kLaserRange = 200.0f;
+        const float kLaserRange = CurrentTuning().tools.laserRange;
         uint64_t hitBody = phys.CastRayBody(eye, fwd, kLaserRange, frac);
         float bodyDist = frac * kLaserRange;
 
@@ -1904,14 +1968,17 @@ int main(int argc, char** argv) {
         const WorldSnapshot& snap = world.Snap();
         if (snap.valid && snap.pick[0] != 0) {
           exps.push_back({(int)snap.pick[2], (int)snap.pick[3], (int)snap.pick[4],
-                          12, 340, 0, 0, 0});
+                          CurrentTuning().tools.detonateRadius,
+                          CurrentTuning().tools.detonatePower, 0, 0, 0});
         }
       }
       for (size_t i = 0; i < grenades.size();) {
         if (UpdateGrenade(grenades[i], kTickDt, kindAt)) {
           if (exps.size() < kMaxExplosionsPerTick) {
             exps.push_back({ifloor(grenades[i].pos.x), ifloor(grenades[i].pos.y),
-                            ifloor(grenades[i].pos.z), 13, 380, 0, 0, 0});
+                            ifloor(grenades[i].pos.z),
+                            CurrentTuning().grenade.blastRadius,
+                            CurrentTuning().grenade.blastPower, 0, 0, 0});
           }
           grenades[i] = grenades.back();
           grenades.pop_back();
@@ -1925,8 +1992,10 @@ int main(int argc, char** argv) {
         for (const ExplosionOp& e : exps) {
           debris.AddDestructionEvent(tick, {e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                      {e.x + e.radius, e.y + e.radius, e.z + e.radius});
-          phys.ApplyRadialImpulse(Vec3{(float)e.x, (float)e.y, (float)e.z},
-                                  (float)e.radius * 3.0f, (float)e.power * 0.15f);
+          phys.ApplyRadialImpulse(
+              Vec3{(float)e.x, (float)e.y, (float)e.z},
+              (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
+              (float)e.power * CurrentTuning().physics.explosionImpulseScale);
           stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }

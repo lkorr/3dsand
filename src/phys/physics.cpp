@@ -35,6 +35,7 @@
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/RegisterTypes.h>
 
+#include "sim/tuning.h"
 #include "sim/world.h"  // kVoxelMeters
 
 namespace {
@@ -127,7 +128,7 @@ bool Physics::Init() {
   system_ = std::make_unique<JPH::PhysicsSystem>();
   system_->Init(4096 /*max bodies*/, 0, 4096, 2048, layers_->bpInterface,
                 layers_->objVsBp, layers_->objPair);
-  system_->SetGravity(JPH::Vec3(0, -9.81f, 0));
+  system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
   return true;
 }
 
@@ -141,7 +142,11 @@ void Physics::Shutdown() {
 
 void Physics::Step(float dt) {
   if (!system_) return;
-  system_->Update(dt, 1, tempAlloc_.get(), jobs_.get());
+  // Gravity is re-applied here rather than only at Init so a tuning reload
+  // takes effect without restarting the world.
+  system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
+  system_->Update(dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
+                  jobs_.get());
 }
 
 uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
@@ -239,10 +244,11 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
       q.Normalized(), JPH::EMotionType::Dynamic, Layers::MOVING);
   bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
   bcs.mMassPropertiesOverride.mMass = std::max(totalMass, 0.05f);
-  bcs.mFriction = 0.75f;
-  bcs.mRestitution = 0.05f;
-  bcs.mLinearDamping = 0.05f;
-  bcs.mAngularDamping = 0.15f;
+  const auto& pt = CurrentTuning().physics;
+  bcs.mFriction = pt.debrisFriction;
+  bcs.mRestitution = pt.debrisRestitution;
+  bcs.mLinearDamping = pt.debrisLinearDamping;
+  bcs.mAngularDamping = pt.debrisAngularDamping;
   bcs.mAllowDynamicOrKinematic = allowKinematic;
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
@@ -274,7 +280,7 @@ uint64_t Physics::CreateTerrainMesh(const std::vector<float>& vertsXYZ,
   JPH::BodyCreationSettings bcs(shapeResult.Get(), JPH::RVec3::sZero(),
                                 JPH::Quat::sIdentity(), JPH::EMotionType::Static,
                                 Layers::STATIC);
-  bcs.mFriction = 0.85f;
+  bcs.mFriction = CurrentTuning().physics.terrainFriction;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::DontActivate);
   return id.IsInvalid() ? 0 : FromBodyID(id);
@@ -287,7 +293,7 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   JPH::BodyCreationSettings bcs(new JPH::CapsuleShape(cylHalf, radius),
                                 JPH::RVec3::sZero(), JPH::Quat::sIdentity(),
                                 JPH::EMotionType::Kinematic, Layers::PLAYER);
-  bcs.mFriction = 0.3f;
+  bcs.mFriction = CurrentTuning().physics.playerProxyFriction;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
   // NOT in dynamicBodies_: the proxy takes no impulses and never despawns

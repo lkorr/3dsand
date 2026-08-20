@@ -306,6 +306,47 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
 - Validation pass at load: unknown IDs, unreachable rules, density cycles → loud
   errors with file/line. Modders get real diagnostics, not silent breakage.
 
+### `materials/tuning.json` — look-and-feel parameters (2026-08-19)
+Where `materials.json` says what a voxel *is*, `tuning.json` says how the engine
+renders and moves it: sky/sun/fog, water and lava shading, AO and shadows,
+tonemap, player speeds, Jolt body materials, debris budgets, the integer sim
+constants, and worldgen shape. Edited with `assets/tuner.html` (Tuning tab),
+which builds its whole UI from `assets/tuner_schema.js` — range, units and a
+plain-English description per parameter.
+
+Two delivery paths, because the values land in two places:
+
+- **Shader params** are emitted as WGSL `const` declarations by
+  `TuningWgslBlock()` (`sim/tuning.cpp`) and prepended by `LoadShader()`
+  alongside `ShaderConstantPrelude()`. Shaders name these constants
+  (`TUNE_MEDIA_ABSORB`, `TUNE_EXPOSURE_WHITE`, ...) instead of hardcoding
+  literals, so **F5 recompiles the whole shading model against new values with
+  no rebuild**. `ReloadShaders` already traps validation errors and keeps the
+  old pipelines, so a bad value cannot take the renderer down.
+- **CPU params** are plain fields on `Tuning`, read each frame by `player.cpp`,
+  `camera.cpp`, `physics.cpp` and `main.cpp`. Same F5 applies them.
+
+Why the prelude rather than a uniform: plumbing ~110 values through a UBO costs
+a struct field and binding churn each, and burns uniform space; the prelude is
+one codepath for arbitrarily many constants, and constant-folds in the compiled
+shader exactly as the old literals did.
+
+**Determinism (rule #1).** The `sim` group — `partGravity`, `partMaxVel`,
+`airDensity`, `falloffPerCell`, the `eject*` per-mille set, `liquidEqualize`,
+`wanderHopMask` — feeds voxel state. It is integer-only by construction (the
+loader *rejects* a JSON float rather than truncating it, so a fractional value
+is a loud error instead of a silent hash shift), and changing any of it changes
+the world hash. The tuner marks that group in red and says so; `--selftest`
+must be re-run to re-baseline. Everything outside `sim` is render- or CPU-side
+and provably cannot perturb the hash — verified by changing sky colour and
+exposure and watching the hash stay at `a0d20705`.
+
+`World::TerrainHeight` (the CPU mirror of `baseHeight()`) reads the same
+`worldgen` values as the shader, so tuning terrain cannot desync collision from
+the terrain you can see. `scripts/tuning_prelude.py` mirrors the emitter for
+`check_shaders.sh`; a name present in one and not the other fails validation
+loudly rather than drifting.
+
 ---
 
 ## 7. Destruction, Islands, and Rigidbodies
@@ -659,6 +700,113 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   All of this is render-only float math on render-only data. The sim never
   reads it and the world hash never covers it, so determinism rule #1 is
   untouched (it scopes to sim state).
+- **Molten surfaces (implemented 2026-08-19):** lava is the OPPOSITE problem to
+  water and reusing the water treatment would be wrong in every particular.
+  Water's look comes from what it REFLECTS and TRANSMITS; lava is `MATF_OPAQUE`
+  (it resolves as a surface hit and never enters the media path) and its look
+  comes almost entirely from what it EMITS — there is no reflection worth
+  tracing, nothing behind it to refract, and no depth to absorb through.
+  Previously lava was flat palette albedo plus one per-cell random flicker,
+  added at `emission/255 * 1.7` on top of an already sun-lit surface: every
+  channel saturated and a pool rendered as a featureless WHITE slab, brighter
+  than the sky and with less structure than the grass around it. Note that
+  merely lowering the intensity would only have produced a flat ORANGE slab —
+  the defect was absent spatial structure, not exposure. `shadeMolten()`
+  replaces it (detected by class + `MATF_OPAQUE` + emission, never by material
+  ID, so any modder's emissive opaque liquid gets it):
+  - **A crust.** The whole look. Real flows are dark basaltic plates with
+    glowing cracks between them, not uniform orange. Built from 4 octaves of
+    ridged value noise (`1 - |2n-1|`, which turns smooth blobs into the thin
+    branching filaments that read as fractures — smooth noise alone gives soft
+    mottling that reads as rust), in world metres so plate size is independent
+    of voxel scale, advected per-octave so the crust shears rather than
+    sliding rigidly.
+  - **A blackbody-ish ramp** anchored on the AUTHORED palette (so retinting
+    lava in JSON still yields a coherent heat ramp), with band boundaries
+    pushed late: most of a flow is crust and cooling red rock, and spreading
+    the bands evenly puts the average pixel in the orange/yellow range, which
+    renders the pool as glowing gold honeycomb.
+  - **Emission scaling steeply with temperature** (~T³, tuned not physical) so
+    cracks out-radiate plates by a large factor — without that the surface
+    averages back into the flat slab this replaces. Peak intensity is bounded
+    so crack cores stay inside the range where the tonemap still discriminates
+    hue.
+  - **Heat spill** onto neighbouring non-emissive surfaces, so a pool lights
+    its own rim instead of sitting in its basin like a decal.
+  - Top faces run cooler than sides (they radiate to the sky and skin over
+    first), and a grazing-angle term draws a hot lip around the far edge.
+
+  **The tonemap had to change with it, and this fixed a scene-wide bug.** The
+  output stage was a bare `pow(color, 1/2.2)`, so anything over 1.0 clipped
+  flat — a hot surface lost all colour AND all structure at exactly the moment
+  it got interesting. It is now Reinhard-with-white-point applied to
+  LUMINANCE, with the colour rescaled by the luminance ratio. Per-channel
+  Reinhard (the obvious implementation, and the first one tried) desaturates
+  catastrophically at ALL intensities, not just bright ones: the `1/(1+c)`
+  denominator compresses a strong channel far harder than a weak one, so a
+  saturated ember orange (`#ff5a1a`, sat 0.90) comes out tan (sat 0.59) even at
+  *half* exposure — every warm emissive surface in the scene was being turned
+  gold. A controlled amount of per-channel behaviour is blended back in
+  weighted by `mapped³`, so hue survives the midtones and only genuinely hot
+  cores bleach toward white, which is the real blackbody progression.
+
+  **The crust only applies where there IS a crust (`moltenPooling`).** The
+  whole model assumes a continuous surface — plates, cracks between them, a
+  skin that cools and shears — and none of that means anything on a single
+  voxel. Laser spatter, splash droplets and individual melted voxels have no
+  room for a plate, so the crack field just paints an arbitrary slice of noise
+  across them and they read as dirty smudges; those cases genuinely looked
+  better under the old flat emissive shade. `moltenPooling()` samples the
+  horizontal neighbourhood (horizontal only: what matters is whether there is
+  EXTENT for a crust to form across, and a one-voxel-deep sheet spread over a
+  floor is still a pool) and every crust-specific term — crack field, per-patch
+  temperature jitter, face split, embers — is scaled by it. Isolated lava falls
+  back to a uniform hot value, which is exactly the pre-crust look.
+
+  The threshold is deliberately LOW (ramp over 0.10..0.42, not 0.35..0.85). The
+  useful distinction is "isolated speck" vs "everything else", not "pool
+  interior" vs "pool edge": a rim cell has neighbours on one side only, so a
+  high threshold puts the entire boundary of every pool in the transition band
+  and draws a bright orange ring around it — more objectionable than either
+  look on its own.
+
+  **Embers are render-only, and that is an architectural choice.** The sim has
+  a particle system and a data-driven `emit` reaction — lava emitting fire is
+  one line of `reactions.json`. But lava is PERMANENT: unlike ember, which
+  decays away, a pool never stops existing, so an emit reaction on it fires
+  every tick forever and its chunks never clear their dirty flag. That is the
+  subcritical-growth rule in §11 / CLAUDE.md #2, and the selftest gate
+  (`sleepActive < 32 && particlesLeft == 0`) fails on both counts. A cosmetic
+  effect must not hold the simulation awake, so sparks are reconstructed
+  analytically from position and time instead — no voxels, no particles, no sim
+  state. The tradeoff is that they cannot collide or ignite anything, which is
+  correct for blow-off sparks; gameplay-relevant ejecta should go through the
+  particle system, spawned by a bounded event (a splash, an impact).
+
+  Two non-obvious things about drawing them, both of which produced a distinct
+  visible artifact before being fixed:
+  - **Resolve each spark analytically, never by sampling the field.** Evaluating
+    a spark density at each march step paints a flat patch of whatever cell the
+    step landed in, and the sparks render as large translucent RECTANGLES — the
+    marching grid becomes the thing you see. Computing the ray's closest
+    approach to each spark in closed form is step-size independent, so sparks
+    stay points however coarsely the segment is stepped.
+  - **The spark lattice must be STATIC in world space.** Advecting the lookup
+    (`q.y += time*rate`) and undoing the shift on the spark position makes a
+    whole vertical column of cells map onto sparks at similar screen positions,
+    so consecutive steps each resolve a different spark just above the last and
+    they chain into ~100-pixel vertical streaks. Keying one spark per (x,z)
+    COLUMN, rising and looping within its own height band, makes a spark a
+    point by construction — a ray cannot stack several of them.
+  Spark radius is clamped at both ends: a pixel-size floor so a spark never
+  falls between samples and vanishes, and a ceiling so a distant spark's
+  linearly-growing pixel footprint does not inflate it into a fuzzy square.
+
+  Perf note: `heatSpill()` runs on every non-emissive surface pixel and cost
+  ~13 ms of a 30 ms frame unguarded — paid overwhelmingly by terrain nowhere
+  near lava. It is now gated on a one-read chunk-occupancy probe along the
+  normal and capped at 4 taps, which brings it to ~1 ms. Any future per-pixel
+  effect keyed on a *rare* material needs the same treatment.
 - Later: emissive materials feeding a cheap GI (light propagation volumes or
   per-chunk flood lighting), volumetrics for gases.
 
@@ -781,6 +929,44 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.5.5 (2026-08-19)** — generative branching birch. Every species was a
+> solid crown volume centred over a straight bole: at distance that silhouette
+> reads as a lollipop, and it was the birch — the slender species that most
+> needs structure — that showed it worst. Birch is now an IMPLICIT BRANCH
+> SKELETON rather than a crown. `treeCell` re-derives a fixed skeleton from the
+> tree's hash for every cell it evaluates and tests point-to-segment distance:
+> a leaning 3-part bole, `BIRCH_LIMBS` two-segment limbs (straight out, then
+> bent over at an elbow — a single straight segment reads as scaffolding),
+> `BIRCH_SUBS` twigs off BOTH the elbow and the tip, and leaves ONLY as small
+> hash-eroded tufts at the twig tips. No leaf ball anywhere.
+>
+> This shape had to be built implicitly because worldgen is a pure per-cell
+> function — there is no place to grow a tree with a turtle and write voxels as
+> it walks, since a chunk may be generated in isolation and must agree with its
+> neighbours. Everything derives from `t.rnd`, so the tree is identical from
+> whichever chunk asks. New integer helpers: `segDist2` (point-segment, scaled
+> so products stay in i32) and `isin` (256-step integer sine, Bhaskara-style).
+> Both are integer-only — this feeds voxel state, so rule 1 forbids `f32` here
+> even though it is "just" worldgen.
+>
+> Three gates a branching species needs that a crown species does not, each of
+> which cost a wrong render before it was found: (a) the limb direction vector
+> must be NORMALIZED, since callers scale it by `len/256` — the first cut's
+> un-normalized `(cos*horiz, rise, sin*horiz)` gave ~11 voxels of horizontal
+> reach and rendered as a bare pole with a fork; (b) `treeAt`'s horizontal
+> reject is `radius + 2` for crowns but must be `radius*5/2 + 4` for birch,
+> whose limbs reach well past the nominal radius; (c) its vertical reject needs
+> `+ radius` of headroom for the leaf cluster carried on top of the highest
+> twig tip, or every birch is sheared flat. `treeCanopyAt` (far-field XZ
+> footprint) also special-cases birch: a wider disc with a hash punch-out, so
+> distant stands stay airy instead of flattening into solid canopy.
+>
+> Cheaper than what it replaced — sparse tufts give shadow rays far less
+> foliage to march (selftest render 1080p shadows-on 21.9 ms -> 11.4 ms).
+> Selftest PASS end to end, including determinism and the far-downsample
+> invariant. `--shot` gained a `screenshot_birch.bmp` camera: this species'
+> silhouette can only be judged on a single specimen against the sky.
+>
 > **v0.5.4 (2026-08-19)** — forest overworld. The world was one desert; it is
 > now forest-dominant, driven by a low-frequency biome field (forest / meadow /
 > pine slopes, with the old sand desert kept as a rare ~12% destination biome
@@ -794,7 +980,8 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
 > bush) placed one-per-16² XZ tile by tile hash and sampled from the 5×5 tile
 > neighborhood so canopies overhang tile borders — pure `genCell()`, so a tree
 > straddling a chunk boundary generates identically from either side and the
-> far-field cascades get it for free.
+> far-field cascades get it for free. (Birch was rebuilt as a branching
+> skeleton in v0.5.5; the other four remain crown volumes.)
 >
 > Six new INERT materials (grass, leaves, pine_needles, autumn_leaves,
 > birch_wood, petal). Inert is the whole point: they carry organic/flammable

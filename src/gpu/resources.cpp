@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "sim/tuning.h"
 #include "sim/world.h"
 
 wgpu::Buffer CreateBuffer(const wgpu::Device& device, uint64_t size,
@@ -77,7 +78,13 @@ wgpu::ShaderModule LoadShader(const wgpu::Device& device, const std::string& sha
     std::fprintf(stderr, "cannot read %s/%s\n", shaderDir.c_str(), name.c_str());
     return {};
   }
-  std::string src = ShaderConstantPrelude() + "\n" + common + "\n" + body;
+  // Tuning constants sit between the world prelude and common.wgsl: they may
+  // reference nothing, but common.wgsl and every shader body may reference
+  // them. Re-read from the live Tuning on every load, which is what makes F5
+  // (ReloadShaders) pick up an edited tuning.json without a rebuild.
+  std::string src = ShaderConstantPrelude() + "\n" +
+                    TuningWgslBlock(CurrentTuning()) + "\n" + common + "\n" +
+                    body;
 
   wgpu::ShaderSourceWGSL wgsl{};
   wgsl.code = src.c_str();

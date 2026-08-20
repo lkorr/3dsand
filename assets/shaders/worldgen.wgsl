@@ -108,7 +108,7 @@ const HSCALE : i32 = 1;
 // the range: high ridges go bare and white, everything below is forest. It was
 // a bare `80` in four places when the band was y44..y90 — retune it whenever
 // the band moves.
-const TREELINE : i32 = 72;
+const TREELINE : i32 = TUNE_TREELINE;
 
 fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
   // Two octaves. Wavelength and amplitude were both halved in the third scale
@@ -116,8 +116,9 @@ fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
   // the hills are the same shape, half the size. Band y32..y86: the low end
   // leaves room for lake basins to cut down into, and the low ceiling buys the
   // headroom that lets a 12 m great-oak crown on a ridge fit under y256.
-  return 32 + (vnoise(x, z, 64 * HSCALE, seed ^ 1u) * 42) / 255
-            + (vnoise(x, z, 16 * HSCALE, seed ^ 2u) * 12) / 255;
+  return TUNE_BASE_HEIGHT
+       + (vnoise(x, z, TUNE_HILL_WAVELENGTH * HSCALE, seed ^ 1u) * TUNE_HILL_AMPLITUDE) / 255
+       + (vnoise(x, z, TUNE_DETAIL_WAVELENGTH * HSCALE, seed ^ 2u) * TUNE_DETAIL_AMPLITUDE) / 255;
 }
 
 // ---- biome field ----
@@ -132,11 +133,11 @@ fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
 // holds one bush and the field reads as per-tree noise. The break-up octave
 // scales with it so edges stay proportionally ragged.
 fn biomeAt(x : i32, z : i32, seed : u32) -> u32 {
-  let b = vnoise(x, z, 384 * HSCALE, seed ^ 0x1Bu)
-        + (vnoise(x, z, 96 * HSCALE, seed ^ 0x1Cu) - 128) / 3;   // edge break-up
-  if (b > 214) { return B_DESERT; }
-  if (b > 176) { return B_PINE; }
-  if (b < 92)  { return B_MEADOW; }
+  let b = vnoise(x, z, TUNE_BIOME_SCALE * HSCALE, seed ^ 0x1Bu)
+        + (vnoise(x, z, (TUNE_BIOME_SCALE / 4) * HSCALE, seed ^ 0x1Cu) - 128) / 3;   // edge break-up
+  if (b > i32(TUNE_DESERT_THRESHOLD)) { return B_DESERT; }
+  if (b > i32(TUNE_PINE_THRESHOLD)) { return B_PINE; }
+  if (b < i32(TUNE_MEADOW_THRESHOLD))  { return B_MEADOW; }
   return B_FOREST;
 }
 
@@ -184,7 +185,7 @@ fn onFixturePad(x : i32, z : i32) -> bool {
 // around, and the bowl is carved into the terrain beneath it.
 // Still deliberately independent of the cave system (caves stop 40 voxels
 // under the surface, bowls reach ~10) — a pond can never drain into a tunnel.
-const POND_TILE : i32 = 224;   // 14 m between pond sites
+const POND_TILE : i32 = TUNE_POND_TILE;   // 14 m between pond sites
 // 24 rim directions, cos/sin in 1/256ths (15 degree steps). 24 samples on the
 // largest (r=36) pond puts one every ~9 voxels of arc — dense enough that the
 // 16-voxel fine terrain octave cannot hide a below-water notch between two
@@ -207,8 +208,8 @@ fn pondAt(x : i32, z : i32, seed : u32) -> vec2<i32> {
   let pt = fdiv(x, POND_TILE);
   let pz = fdiv(z, POND_TILE);
   let rh = hash3(seed ^ 0xB0A7u, bitcast<u32>(pt), bitcast<u32>(pz));
-  if (rh % 4u != 0u) { return none; }              // ~1 pond per 4 tiles
-  let r = 20 + i32((rh >> 4u) % 17u);              // radius 20..36 (2.5-4.5 m)
+  if (rh % TUNE_POND_CHANCE != 0u) { return none; }              // ~1 pond per 4 tiles
+  let r = TUNE_POND_RADIUS_MIN + i32((rh >> 4u) % TUNE_POND_RADIUS_SPAN);              // radius 20..36 (2.5-4.5 m)
   // Center insets by 60 > max radius + margin: the disc never leaves its own
   // tile, so callers only ever consult ONE tile (no neighborhood scan).
   let span = u32(POND_TILE - 120);
@@ -269,7 +270,7 @@ const VOX_PER_M : i32 = 16;
 // so trunks need ~9 m of spacing or every crown swallows its neighbours and
 // the forest becomes one undifferentiated green ceiling. Some overlap is good
 // — that is what closes the canopy — but it has to be overlap, not merger.
-const TREE_TILE : i32 = 144;         // 9 m between trunk sites
+const TREE_TILE : i32 = TUNE_TREE_TILE;         // 9 m between trunk sites
 // How many tiles out to search: a canopy can overhang its own tile by
 // (radius + in-tile jitter), here 67 + 72 = 139 voxels, just under one tile.
 const TREE_SCAN : i32 = 2;           // +-2 tiles, comfortably covers it
@@ -318,10 +319,10 @@ fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
   // desert gets the occasional dead bush.
   let roll = (hsh >> 17u) % 100u;
   var chance = 0u;
-  if (biome == B_FOREST)      { chance = 78u; }
-  else if (biome == B_PINE)   { chance = 70u; }
-  else if (biome == B_MEADOW) { chance = 22u; }
-  else                        { chance = 6u; }   // desert
+  if (biome == B_FOREST)      { chance = TUNE_TREE_CHANCE_FOREST; }
+  else if (biome == B_PINE)   { chance = TUNE_TREE_CHANCE_PINE; }
+  else if (biome == B_MEADOW) { chance = TUNE_TREE_CHANCE_MEADOW; }
+  else                        { chance = TUNE_TREE_CHANCE_DESERT; }   // desert
   if (roll >= chance) { return t; }
 
   // species by biome
@@ -353,7 +354,10 @@ fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
     //                        trunk           crown radius
     case 0u: { trunkDm = 55 + j * 5;  radDm = 28 + j * 2; }   // oak      5.5-7.5 m
     case 1u: { trunkDm = 70 + j * 8;  radDm = 24 + j * 2; }   // pine     7.0-10 m
-    case 2u: { trunkDm = 60 + j * 5;  radDm = 18; }           // birch    6.0-8.0 m
+    // Birch is a branch SKELETON, not a crown: `radius` here is the reach of a
+    // primary limb, not the extent of a leaf ball, so it can be generous
+    // without the canopy-merger problem that constrains the round species.
+    case 2u: { trunkDm = 65 + j * 6;  radDm = 22 + j * 2; }   // birch    6.5-9.0 m
     case 3u: { trunkDm = 95 + j * 6;  radDm = 42 + j * 3; }   // great oak 9.5-12 m
     default: { trunkDm = 8;           radDm = 9 + j; }        // bush     ~0.8 m
   }
@@ -361,6 +365,87 @@ fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
   t.radius = radDm * VOX_PER_M / 10;
   t.present = true;
   return t;
+}
+
+// Integer sine on a 256-step circle, returning -256..256. Bhaskara-style
+// parabolic approximation, exact in integers — NO f32, because this feeds voxel
+// placement and the whole sim/worldgen determinism argument (rule 1) rests on
+// avoiding vendor-divergent float math. Max error vs. true sine is ~1.5%, which
+// is a fraction of a voxel over a branch and identical on every machine.
+fn isin(a : i32) -> i32 {
+  let p = a & 255;                     // 0..255 == 0..2pi
+  let half = p & 127;                  // 0..127 == 0..pi
+  // parabola 4h(128-h)/128^2 peaks at 1 for h=64; scale to 256
+  let v = (4 * half * (128 - half) * 256) / (128 * 128);
+  return select(v, -v, p >= 128);
+}
+
+// ---- implicit branch skeleton (birch) ----
+// Worldgen is a PURE PER-CELL FUNCTION: there is no place to grow a tree with a
+// turtle and write voxels as it walks, because every voxel is evaluated on its
+// own and a chunk may be generated in isolation. So branching is implicit —
+// treeBranch() re-derives the same fixed skeleton from the tree's hash for
+// every cell, and the cell tests its distance to each segment. Cost is bounded
+// by construction (BIRCH_LIMBS * (1 + BIRCH_SUBS) segments, no recursion), and
+// the whole thing is integer-only so it stays deterministic across vendors.
+//
+// Squared distance from point p to the segment a->b, all in voxels, times
+// (len^2) to keep it integer: returns (d2 * denom, denom) so the caller can
+// compare against a radius without dividing. i64 isn't available, so segments
+// are kept short enough (< ~200 voxels) that the products stay inside i32:
+// the worst term is len2 * len2 ~ (3*200^2)^2 — too big, so we instead project
+// with a normalized-to-1024 parameter and accept the rounding. Rounding a
+// branch axis by a fraction of a voxel is invisible and, crucially, identical
+// on every machine.
+fn segDist2(px : i32, py : i32, pz : i32,
+            ax : i32, ay : i32, az : i32,
+            bx : i32, by : i32, bz : i32) -> i32 {
+  let vx = bx - ax; let vy = by - ay; let vz = bz - az;
+  let wx = px - ax; let wy = py - ay; let wz = pz - az;
+  let len2 = vx * vx + vy * vy + vz * vz;
+  if (len2 <= 0) { return wx * wx + wy * wy + wz * wz; }
+  // t in [0,1024]; dot can overflow only for absurdly long segments
+  var tq = ((wx * vx + wy * vy + wz * vz) * 1024) / len2;
+  tq = clamp(tq, 0, 1024);
+  let cx = ax + (vx * tq) / 1024;
+  let cy = ay + (vy * tq) / 1024;
+  let cz = az + (vz * tq) / 1024;
+  let ex = px - cx; let ey = py - cy; let ez = pz - cz;
+  return ex * ex + ey * ey + ez * ez;
+}
+
+// A birch carries BIRCH_LIMBS primary limbs off the upper bole, each of which
+// forks into BIRCH_SUBS twigs. Leaves live ONLY in a small blob at each twig
+// tip — that is the whole look: bare white bark structure, green only at the
+// extremities, nothing like a sphere on a stick.
+const BIRCH_LIMBS : i32 = 5;
+const BIRCH_SUBS  : i32 = 3;
+
+// Direction for limb `i` of tree `t`, normalized to length ~256. Spread around
+// the compass by golden-angle-ish stepping (integer approximation) so limbs
+// never stack, with per-tree and per-limb hash jitter on azimuth and pitch.
+//
+// The vector MUST be normalized: callers scale it by (length / 256), so an
+// un-normalized direction makes branch length depend on direction. The first
+// cut built (cos*horiz, rise, sin*horiz) with horiz = 256 - rise, which gave a
+// vector dominated by `rise` and a horizontal reach of ~11 voxels — the limbs
+// hugged the bole and the tree rendered as a bare pole with a fork on top.
+fn birchLimbDir(t : Tree, i : i32, gen : i32) -> vec3<i32> {
+  let h = hash3(t.rnd ^ 0x5B12u, bitcast<u32>(i), bitcast<u32>(gen));
+  // azimuth in 0..255 (a 256-step circle), stepped by ~137/360 of a turn
+  let az = (i * 97 + i32(h % 24u) + i32(t.rnd >> 19u) * 3 + gen * 41) & 255;
+  // Pitch as a 0..256 "how much of the direction is upward" weight. Primaries
+  // sit near 45 degrees (the angle that actually reads as a branch); twigs
+  // climb a bit more steeply so the crown gathers rather than splays flat.
+  var up = 110 + i32((h >> 7u) % 70u);       // ~0.43..0.70 of unit, ~25-45 deg
+  if (gen == 1) { up = 140 + i32((h >> 13u) % 80u); }
+  // horizontal magnitude = sqrt(256^2 - up^2), by integer Newton iteration
+  var hm = 256 - up / 2;                     // seed ('target' is reserved in WGSL)
+  let hm2 = 256 * 256 - up * up;
+  for (var it = 0; it < 4; it++) { hm = (hm + hm2 / max(hm, 1)) / 2; }
+  let c = isin((az + 64) & 255);   // cos = sin(az + 90deg), in -256..256
+  let s = isin(az);
+  return vec3<i32>((c * hm) / 256, up, (s * hm) / 256);
 }
 
 // Material this tree contributes at world cell (x,y,z), or MAT_AIR.
@@ -381,7 +466,7 @@ fn treeCell(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
   var leaf = M_LEAVES;
   if (t.species == 1u) { leaf = M_PINE; }
   // a slice of broadleaf stands go autumn, by tree not by voxel
-  else if ((t.rnd >> 5u) % 5u == 0u) { leaf = M_AUTUMN; }
+  else if ((t.rnd >> 5u) % TUNE_AUTUMN_FRACTION == 0u) { leaf = M_AUTUMN; }
   var bark = M_WOOD;
   if (t.species == 2u) { bark = M_BIRCH; }
 
@@ -398,7 +483,9 @@ fn treeCell(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
   var trNow = max(taper, select(1, 0, t.species == 4u));
   // flared root buttress on the great oaks
   if (t.species == 3u && dy < t.trunk / 6) { trNow = trNow + tr / 2; }
-  if (dy <= t.trunk && abs(dx) <= trNow && abs(dz) <= trNow) {
+  // Birch skips the straight box column: its bole is part of the branch
+  // skeleton below, so it can lean and taper as one continuous structure.
+  if (t.species != 2u && dy <= t.trunk && abs(dx) <= trNow && abs(dz) <= trNow) {
     // round off the corners so it isn't a visible square column
     if (abs(dx) + abs(dz) <= trNow + trNow / 2 + 1) { return bark; }
   }
@@ -443,15 +530,129 @@ fn treeCell(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
       if (md <= cr) { return leaf; }
       return MAT_AIR;
     }
-    // ---- birch: narrow, high, sparse crown ----
+    // ---- birch: generative branching structure ----
+    // Not a crown at all: a leaning bole that forks into limbs, each of which
+    // forks again into twigs, with leaves ONLY as small clusters at the twig
+    // tips. What you should see is white bark tracery with green confetti at
+    // the extremities — the deliberate opposite of the lollipop the round
+    // crown produced. Everything is re-derived from t.rnd per cell.
     case 2u: {
-      let cy = topY;
-      let vy = (dy - cy) * 2;
-      let d2 = dx * dx + dz * dz + vy * vy;
-      if (d2 <= r * r + 2) {
-        let n = hash3(seed ^ 0x81C4u, bitcast<u32>(x) ^ (bitcast<u32>(z) << 11u),
-                      bitcast<u32>(y)) % 10u;
-        if (n > 2u) { return leaf; }           // airy, see-through crown
+      // + r again for the leaf cluster carried on top of the highest twig tip
+      if (dy > t.trunk + r * 2) { return MAT_AIR; }
+
+      // Bole: a 3-segment polyline that drifts as it rises, so the trunk has a
+      // natural lean and slight S-curve instead of being a plumb column.
+      let leanH = hash3(t.rnd ^ 0xB01Eu, 1u, 0u);
+      let lx = i32(leanH % 17u) - 8;           // total drift, voxels, over the bole
+      let lz = i32((leanH >> 8u) % 17u) - 8;
+      // Fork height: where the bole stops being a single stem. Kept low (just
+      // under half) so the branch structure is most of the tree's visible mass
+      // — a high fork leaves a bare pole, which is the silhouette this whole
+      // rewrite exists to kill.
+      let forkY = t.trunk * 9 / 20;
+      let topBole = t.trunk;
+
+      var btr = max(t.trunk / 30, 1);          // birch is a slim tree
+      // bole point at height h (0..topBole), drifting quadratically
+      // p(h) = base + lean * (h/topBole)^2
+      let hq = (dy * 1024) / max(topBole, 1);
+      let bxAt = (lx * hq * hq) / (1024 * 1024);
+      let bzAt = (lz * hq * hq) / (1024 * 1024);
+      // bole radius tapers from btr at the ground to ~1 at the top
+      let boleR = max(btr - (btr * dy) / max(topBole, 1) + select(0, 1, dy < topBole / 8), 1);
+      if (dy <= topBole) {
+        let ex = dx - bxAt; let ez = dz - bzAt;
+        if (ex * ex + ez * ez <= boleR * boleR) { return bark; }
+      }
+
+      // Limbs branch off between forkY and the bole top, climbing outward.
+      // Each limb is one segment; each spawns BIRCH_SUBS twigs from its far
+      // end. Leaves are tested first at the twig tips, then the wood — so a
+      // tip cluster reads as foliage rather than bark poking through it.
+      // Limb length. r + r/2 made limbs that shot out like scaffolding poles,
+      // longer than the tree was wide; the crown has to stay narrower than its
+      // height or the birch stops reading as a slender tree.
+      let limbLen = r;
+      for (var i = 0; i < BIRCH_LIMBS; i++) {
+        let lh = hash3(t.rnd ^ 0xC0DEu, bitcast<u32>(i), 7u);
+        // attachment height, spread up the upper bole
+        let ah = forkY + ((topBole - forkY) * i) / BIRCH_LIMBS
+                 + i32(lh % u32(max((topBole - forkY) / BIRCH_LIMBS, 1)));
+        let ahq = (ah * 1024) / max(topBole, 1);
+        let ax = (lx * ahq * ahq) / (1024 * 1024);
+        let az = (lz * ahq * ahq) / (1024 * 1024);
+        let d0 = birchLimbDir(t, i, 0);
+        // limb length shrinks with attachment height: lower limbs are longest
+        let ll = limbLen - (limbLen * (ah - forkY)) / max((topBole - forkY) * 2, 1);
+        // A limb is TWO segments, not one: it leaves the bole climbing and then
+        // bends over toward horizontal at the elbow. A single straight segment
+        // is what made the first working version read as scaffolding poles —
+        // real branches curve, and the bend is most of what sells it.
+        let mx = ax + (d0.x * ll) / (256 * 2);
+        let my = ah + (d0.y * ll) / (256 * 2);
+        let mz = az + (d0.z * ll) / (256 * 2);
+        // outer half keeps the horizontal run but sheds most of the climb
+        let ex = mx + (d0.x * ll) / (256 * 2);
+        let ey = my + (d0.y * ll) / (256 * 5);
+        let ez = mz + (d0.z * ll) / (256 * 2);
+
+        // cheap AABB reject for the whole limb + its twigs before any distance
+        // work: twigs extend at most twigLen past the limb end, plus a cluster
+        let pad = ll * 3 / 4 + r / 5 + 4;
+        if (dx < min(ax, ex) - pad || dx > max(ax, ex) + pad ||
+            dz < min(az, ez) - pad || dz > max(az, ez) + pad ||
+            dy < min(ah, ey) - pad || dy > max(ah, ey) + pad) { continue; }
+
+        // Twigs. One set sprouts from the ELBOW and one from the TIP, so
+        // foliage is distributed along the limb instead of bunching in a knot
+        // at the far end and leaving a long bare arm behind it.
+        let twigLen = ll / 2 + ll / 4;
+        for (var k = 0; k < BIRCH_SUBS * 2; k++) {
+          let sub = k % BIRCH_SUBS;
+          let fromTip = k >= BIRCH_SUBS;
+          let d1 = birchLimbDir(t, i * 8 + sub + 1, 1);
+          // blend the twig direction toward the parent limb so it continues
+          // the branch rather than starting a new random spray
+          let tdx = (d1.x + d0.x) / 2;
+          let tdy = (d1.y + d0.y) / 2;
+          let tdz = (d1.z + d0.z) / 2;
+          // elbow twigs are shorter — they are lower-order branches
+          let tl = select(twigLen * 2 / 3, twigLen, fromTip);
+          let sx = select(mx, ex, fromTip);
+          let sy = select(my, ey, fromTip);
+          let sz = select(mz, ez, fromTip);
+          let tx2 = sx + (tdx * tl) / 256;
+          let ty2 = sy + (tdy * tl) / 256;
+          let tz2 = sz + (tdz * tl) / 256;
+
+          // Leaf cluster at the twig tip — a small hash-eroded blob, the ONLY
+          // place this species puts foliage. Kept SMALL on purpose: at r*2/5
+          // (~1 m) the fifteen clusters merged back into the solid ball this
+          // rewrite exists to avoid. ~0.4 m reads as a tuft on a branch tip.
+          let cr = max(r / 5, 4);
+          let ddx = dx - tx2; let ddy = dy - ty2; let ddz = dz - tz2;
+          let cd2 = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (cd2 <= cr * cr) {
+            let n = hash3(seed ^ 0x81C4u,
+                          bitcast<u32>(x) ^ (bitcast<u32>(z) << 11u),
+                          bitcast<u32>(y)) % 100u;
+            // Solid at the blob core, ragged only at its rim. Eroding the core
+            // too (the first cut cut ~25% everywhere) made the clusters read as
+            // green dust at any distance instead of as foliage.
+            let edge = (cd2 * 100) / max(cr * cr, 1);
+            if (edge < 45 || n > u32(edge - 20)) { return leaf; }
+          }
+          // The twig itself. A 1-voxel radius twig is a wire that aliases into
+          // a dotted line and disappears a few metres out; 2 keeps it readable.
+          if (segDist2(dx, dy, dz, sx, sy, sz, tx2, ty2, tz2) <= 4) {
+            return bark;
+          }
+        }
+
+        // The limb, as its two segments: thicker on the inner half near the
+        // bole, thinner past the elbow, so it visibly tapers outward.
+        if (segDist2(dx, dy, dz, ax, ah, az, mx, my, mz) <= 4) { return bark; }
+        if (segDist2(dx, dy, dz, mx, my, mz, ex, ey, ez) <= 4) { return bark; }
       }
       return MAT_AIR;
     }
@@ -475,14 +676,24 @@ fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
       let t = treeInfo(tx + ox, tz + oz, seed);
       if (!t.present) { continue; }
-      // cheap reject before the per-species shape test
-      if (abs(x - t.wx) > t.radius + 2 || abs(z - t.wz) > t.radius + 2) {
+      // cheap reject before the per-species shape test. Birch is a branching
+      // skeleton, not a crown: its limbs reach r + r/2 and their twigs extend
+      // past that, so it needs a wider gate than the round-crown species or
+      // the outer branches get sliced off at an invisible cylinder.
+      var reach = t.radius + 2;
+      if (t.species == 2u) { reach = t.radius * 5 / 2 + 4; }
+      if (abs(x - t.wx) > reach || abs(z - t.wz) > reach) {
         continue;
       }
       // Vertical extent must cover the tallest thing the species can put above
       // its bole: the pine tip overshoots the trunk by trunk/8, and round
       // crowns reach topY + r. Clipping this is how canopies get flat tops.
-      if (y < t.base || y > t.base + t.trunk + t.radius + 2) { continue; }
+      // Birch twig tips climb to ~trunk + r and then carry a leaf cluster on
+      // top of that, so it needs the extra cluster radius or every birch gets
+      // its uppermost foliage sheared off in a flat plane.
+      var vtop = t.base + t.trunk + t.radius + 2;
+      if (t.species == 2u) { vtop = vtop + t.radius; }
+      if (y < t.base || y > vtop) { continue; }
       let m = treeCell(t, x, y, z, seed);
       if (m != MAT_AIR) { return m; }
     }
@@ -505,7 +716,7 @@ fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
 fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
   // band 1: near-surface caverns following the terrain
   let m1 = vnoise(x, z, 40 * HSCALE, seed ^ 5u);
-  if (m1 > 150) {
+  if (m1 > i32(TUNE_CAVE_THRESHOLD1)) {
     let f1 = h - 40 - (vnoise(x, z, 32 * HSCALE, seed ^ 6u) * 60) / 255;
     let c1 = min(f1 + 10 + (vnoise(x, z, 12 * HSCALE, seed ^ 7u) * 20) / 255,
                  h - 40);
@@ -513,7 +724,7 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
   }
   // band 2: deep caverns at absolute depth (streamed depth is real terrain)
   let m2 = vnoise(x + 7717, z - 4177, 48 * HSCALE, seed ^ 8u);
-  if (m2 > 148) {
+  if (m2 > i32(TUNE_CAVE_THRESHOLD2)) {
     let f2 = -40 - (vnoise(x, z, 40 * HSCALE, seed ^ 9u) * 70) / 255;
     let c2 = f2 + 12 + (vnoise(x, z, 16 * HSCALE, seed ^ 10u) * 26) / 255;
     if (y >= f2 && y <= c2 && y <= h - 40) {
@@ -680,7 +891,7 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   let tx = fdiv(x, ruinTile); let tz = fdiv(z, ruinTile);
   if (tx != 0 || tz != 0) {
     let rh = hash3(seed ^ 0xA111CEu, bitcast<u32>(tx), bitcast<u32>(tz));
-    if (rh % 5u == 0u) {
+    if (rh % TUNE_RUIN_CHANCE == 0u) {
       let rw = 56;                        // 3.5 m footprint
       let rht = 48;                       // 3 m to the roof
       // keep the whole footprint inside the tile whatever HSCALE is
@@ -752,9 +963,19 @@ fn treeCanopyAt(x : i32, z : i32, seed : u32) -> u32 {
       let t = treeInfo(tx + ox, tz + oz, seed);
       if (!t.present || t.species == 4u) { continue; }   // bushes: too small
       let dx = x - t.wx; let dz = z - t.wz;
-      if (dx * dx + dz * dz > t.radius * t.radius) { continue; }
+      // Birch spreads its leaf clusters out at the twig tips rather than
+      // filling a disc, so its far-field footprint is a wider but sparser
+      // ring; approximated as a larger disc with a hash punch-out so distant
+      // birch stands stay airy instead of reading as solid canopy.
+      if (t.species == 2u) {
+        let br = t.radius * 2;
+        if (dx * dx + dz * dz > br * br) { continue; }
+        if (hash3(seed ^ 0x2B17u, bitcast<u32>(x), bitcast<u32>(z)) % 5u < 2u) {
+          continue;
+        }
+      } else if (dx * dx + dz * dz > t.radius * t.radius) { continue; }
       if (t.species == 1u) { return M_PINE; }
-      if ((t.rnd >> 5u) % 5u == 0u) { return M_AUTUMN; }
+      if ((t.rnd >> 5u) % TUNE_AUTUMN_FRACTION == 0u) { return M_AUTUMN; }
       return M_LEAVES;
     }
   }

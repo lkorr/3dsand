@@ -115,6 +115,13 @@ This concatenates `common.wgsl + <file>` exactly the way `LoadShader` does and r
 each through `tint --validate`. It runs automatically on WGSL edits via the
 PostToolUse hook in `.claude/settings.json`.
 
+Tuning by eye/ear is easiest through the served tuner — it finds `assets/`
+itself, and its Build/Play buttons run the two commands above:
+
+```bash
+python scripts/tuner_server.py   # http://127.0.0.1:8777, opens a browser
+```
+
 ### Build gotchas (learned the hard way)
 
 - Dawn needs `DAWN_FORCE_SYSTEM_COMPONENT_LOAD=ON` or its `vulkan-1.dll` load
@@ -146,7 +153,9 @@ PostToolUse hook in `.claude/settings.json`.
 | `src/game/` | player controller, camera, brush, prefab placer, mob system |
 | `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy) |
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
-| `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game) |
+| `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
+| `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params |
+| `scripts/tuner_server.py` | serves the tuner with auto-load + Build/Play (`python scripts/tuner_server.py`) |
 
 **Two invariants that have already cost debugging time — don't rediscover them:**
 
@@ -159,6 +168,14 @@ PostToolUse hook in `.claude/settings.json`.
   is a bitmask (`cellIndexW`/`chunkIndexW`); every neighbor access must bounds-
   check against the residency window (`inWindow` with the origin uniform), not
   a fixed 0..N box. Unloaded space is solid and inert.
+- **Look/feel constants belong in `tuning.json`, not as literals in shaders.**
+  `TuningWgslBlock()` (`sim/tuning.cpp`) emits them as `TUNE_*` WGSL consts into
+  the same prelude, so F5 re-tunes the renderer with no rebuild. Adding one means
+  touching four places: the struct + reader + emitter in `sim/tuning.{h,cpp}`,
+  `scripts/tuning_prelude.py` (or `check_shaders.sh` fails), a default in
+  `assets/materials/tuning.json`, and a row in `assets/tuner_schema.js`. Values
+  under `sim.*` are integer-only and change the world hash — rule 1 applies, and
+  `--selftest` must be re-run.
 - **World constants are generated from `world.h`, never redeclared in WGSL.**
   `ShaderConstantPrelude()` (`gpu/resources.cpp`) emits `WORLD_N`, `CHUNK`,
   `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of

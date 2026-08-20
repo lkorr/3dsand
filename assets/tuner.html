@@ -132,7 +132,7 @@
   }
   .rxnote textarea:focus{outline:none;border-left-color:var(--amber);color:#cbb98a}
   .rxrule{
-    display:grid;grid-template-columns:34px 128px 88px 1fr 118px auto;gap:8px;align-items:center;
+    display:grid;grid-template-columns:34px 152px 104px 1fr 118px auto;gap:8px;align-items:center;
     background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;
   }
   .rxrule.hidden,.rxnote.hidden{display:none}
@@ -146,7 +146,8 @@
     padding:3px 6px;font-size:12.5px;font-family:var(--mono);
   }
   .f input:focus,.f select:focus{outline:none;border-color:var(--acc)}
-  .f input.nb{width:130px}
+  .f input.nb{width:146px}
+  .f select,.f input{max-width:100%}
   .arrow{color:var(--faint);font-size:15px;padding-top:12px}
   .chancewrap{display:flex;flex-direction:column;gap:1px}
   .chancewrap .sub{font-size:10.5px;color:var(--faint);font-family:var(--mono)}
@@ -164,6 +165,46 @@
   .kind-pair{border-left:3px solid #3a6ea8}
   .kind-decay{border-left:3px solid #8a6ecf}
   .kind-emit{border-left:3px solid #4f9b4a}
+
+  /* ---------- material swatches (shared by reactions + overview) ---------- */
+  .msw{
+    display:inline-flex;flex-shrink:0;gap:0;border-radius:3px;overflow:hidden;
+    border:1px solid #00000060;box-shadow:0 0 0 1px #ffffff12;vertical-align:middle;
+  }
+  .msw i{width:5px;height:14px;display:block}
+  .msw.wide i{width:7px;height:15px}
+  /* non-material refs: air (hollow), tag (striped), any (question) */
+  .msw.air{box-shadow:none;border:1px dashed var(--line2);background:transparent}
+  .msw.air i{background:transparent}
+  .msw.tag{border-color:#2c5c34;box-shadow:0 0 0 1px #7cf03a24}
+  .msw.any{border-color:var(--line2);box-shadow:none}
+  .swlabel{display:inline-flex;align-items:center;gap:6px;min-width:0}
+  .swlabel .txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* swatch sitting next to a select/input */
+  .withsw{display:flex;align-items:center;gap:6px}
+  .withsw select,.withsw input{min-width:0}
+
+  /* ---------- sorting ---------- */
+  .sortbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .sortbar label{color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  select.sortsel{
+    background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--fg);
+    padding:5px 8px;font-size:12.5px;cursor:pointer;
+  }
+  select.sortsel:focus{outline:none;border-color:var(--acc)}
+  select.sortsel.on{border-color:var(--acc);color:var(--acc)}
+  .sortnote{
+    display:none;gap:8px;align-items:baseline;background:#2a2314;border:1px solid #57451e;color:#e8c477;
+    border-radius:8px;padding:6px 12px;margin-bottom:10px;font-size:12.5px;
+  }
+  .sortnote.show{display:flex}
+  .rxgrouphdr{
+    display:flex;align-items:center;gap:8px;margin:14px 0 2px;padding:0 2px;
+    color:var(--dim);font-family:var(--mono);font-size:12px;
+  }
+  .rxgrouphdr:first-child{margin-top:0}
+  .rxgrouphdr .line{flex:1;height:1px;background:var(--line)}
+  .rxgrouphdr .cnt{color:var(--faint);font-size:11px}
 
   /* ---------- overview ---------- */
   .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
@@ -209,6 +250,99 @@
   }
   #splash .big{font-size:15px;color:var(--fg)}
   kbd{background:var(--card2);border:1px solid var(--line2);border-radius:4px;padding:1px 6px;font-family:var(--mono);font-size:12px}
+
+  /* ---------- tuning ---------- */
+  nav.tabs .tabsep{width:1px;background:var(--line);margin:6px 8px}
+  .applybar{
+    display:flex;gap:6px;align-items:baseline;flex-wrap:wrap;background:var(--card);
+    border:1px solid var(--line);border-radius:8px;padding:7px 12px;margin-bottom:12px;
+    font-size:12.5px;color:var(--dim);
+  }
+  .ap{
+    display:inline-block;border-radius:4px;padding:0 6px;font-family:var(--mono);
+    font-size:11px;border:1px solid;
+  }
+  .ap-shader{color:#8fd0ff;border-color:#2d5a80;background:#16283a}
+  .ap-cpu{color:#9ee89a;border-color:#2f6030;background:#162a19}
+  .ap-worldgen{color:#e8c477;border-color:#57451e;background:#2a2314}
+  .ap-sim{color:#ff9d9d;border-color:#6d2b2b;background:#341818}
+
+  details.tgroup{border:1px solid var(--line);border-radius:10px;background:var(--card);margin-bottom:10px}
+  details.tgroup[open]{border-color:var(--line2)}
+  details.tgroup>summary{
+    padding:10px 14px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:10px;
+    font-size:14px;font-family:var(--mono);
+  }
+  details.tgroup>summary:hover{background:#1e2530}
+  details.tgroup>summary .ico{font-size:15px}
+  details.tgroup>summary .cnt{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  details.tgroup>summary .spacer{flex:1}
+  details.tgroup.det{border-color:#6d2b2b}
+  details.tgroup.det>summary{color:#ffb3b3}
+  .tblurb{padding:0 14px 8px;color:var(--dim);font-size:12.5px;line-height:1.55;max-width:82ch}
+  .detwarn{
+    margin:0 14px 10px;background:#341818;border:1px solid #6d2b2b;color:#ffb3b3;
+    border-radius:8px;padding:8px 12px;font-size:12.5px;line-height:1.5;
+  }
+  .trows{padding:2px 6px 10px}
+  .trow{
+    display:grid;grid-template-columns:210px 1fr 96px 30px;gap:12px;align-items:center;
+    padding:5px 8px;border-radius:6px;
+  }
+  .trow:hover{background:#1b222c}
+  .trow.hidden{display:none}
+  .trow.changed{background:#16202c}
+  .trow .nm{font-size:13px;display:flex;align-items:center;gap:6px;min-width:0}
+  .trow .nm .txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .trow .nm .dotc{width:6px;height:6px;border-radius:50%;background:var(--amber);flex:none;opacity:0}
+  .trow.changed .nm .dotc{opacity:1}
+  .trow input[type=range]{width:100%;accent-color:var(--acc);cursor:pointer}
+  .trow.det input[type=range]{accent-color:#ff6b6b}
+  .trow input.tnum{
+    background:#12161e;border:1px solid #262e3c;border-radius:5px;color:var(--fg);
+    padding:4px 6px;font-size:12.5px;font-family:var(--mono);width:100%;text-align:right;
+  }
+  .trow input.tnum:focus{outline:none;border-color:var(--acc)}
+  .trow .unit{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  .trow .rst{
+    background:none;border:none;color:var(--faint);cursor:pointer;font-size:13px;padding:2px 4px;
+    opacity:0;font-family:var(--mono);
+  }
+  .trow.changed .rst{opacity:1}
+  .trow .rst:hover{color:var(--fg);background:none}
+  .thelp{
+    grid-column:1/-1;color:var(--faint);font-size:11.5px;line-height:1.5;
+    padding:0 0 2px 2px;max-width:88ch;
+  }
+  .thelp b{color:#e8c477;font-weight:600}
+  .vecwrap{display:flex;gap:5px;align-items:center}
+  .vecwrap input.tnum{width:64px}
+  .vecwrap input[type=color]{width:26px;height:22px;flex:none}
+  .swatchpv{width:22px;height:22px;border-radius:4px;border:1px solid var(--line2);flex:none}
+
+  /* ---------- server mode: build / play ---------- */
+  .hsep{width:1px;align-self:stretch;background:var(--line);margin:0 4px}
+  button.busy{opacity:.6;cursor:progress}
+  #btnBuild.ok{border-color:#2f6030;color:#9ee89a}
+  #btnBuild.bad{border-color:var(--red);color:var(--red)}
+  #buildPanel{
+    position:fixed;right:14px;bottom:46px;z-index:70;width:640px;max-width:92vw;
+    background:#11151d;border:1px solid var(--line2);border-radius:10px;
+    box-shadow:0 8px 30px #000a;display:none;flex-direction:column;overflow:hidden;
+  }
+  #buildPanel.show{display:flex}
+  #buildPanel header{
+    position:static;display:flex;align-items:center;gap:8px;padding:7px 12px;
+    background:#161c26;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12.5px;
+  }
+  #buildPanel header .st{color:var(--dim)}
+  #buildPanel header .st.ok{color:var(--green)}
+  #buildPanel header .st.bad{color:var(--red)}
+  #buildPanel pre{
+    margin:0;padding:10px 12px;max-height:38vh;overflow:auto;white-space:pre-wrap;
+    font-family:var(--mono);font-size:11.5px;line-height:1.5;color:#aeb8c8;
+  }
+  #buildPanel pre .e{color:var(--red)}
 </style>
 </head>
 <body>
@@ -217,8 +351,12 @@
   <h1>&#9879; sandvox <span>tuner</span></h1>
   <button class="primary" id="btnOpen">Open assets folder</button>
   <button id="btnReload" disabled>Reload from disk</button>
+  <span class="hsep" id="runSep" hidden></span>
+  <button id="btnBuild" hidden>&#9874; Build</button>
+  <button id="btnPlay" hidden>&#9654; Play</button>
   <span class="pill" id="pillMat"><span class="dot"></span>materials.json</span>
   <span class="pill" id="pillRx"><span class="dot"></span>reactions.json</span>
+  <span class="pill" id="pillTune"><span class="dot"></span>tuning.json</span>
   <span class="spacer"></span>
   <button id="btnSave" disabled>Save <kbd>Ctrl+S</kbd></button>
   <button id="btnCopy" disabled>Save copy&hellip;</button>
@@ -228,6 +366,8 @@
   <button data-tab="overview" class="active">Overview</button>
   <button data-tab="materials">Materials</button>
   <button data-tab="reactions">Reactions</button>
+  <span class="tabsep"></span>
+  <button data-tab="tuning">Tuning</button>
 </nav>
 
 <main>
@@ -242,7 +382,7 @@
   </div>
 
   <!-- OVERVIEW -->
-  <section class="view" id="view-overview">
+  <section class="view active" id="view-overview">
     <div class="toolbar">
       <input type="search" id="ovFilter" placeholder="filter materials / tags&hellip;">
       <span class="hint">one card per voxel type: properties + every reaction that touches it. Click a name to edit it.</span>
@@ -286,13 +426,46 @@
   <section class="view" id="view-reactions">
     <details class="schema" id="rxSchema"><summary>schema notes (from reactions.json)</summary><div></div></details>
     <div class="toolbar">
-      <input type="search" id="rxFilter" placeholder="filter by material / tag&hellip;">
-      <span class="hint">file order matters: rules for the same <i>self</i> are tried top-down, at most one fires per cell per tick. chance is &permil; per 30&thinsp;Hz tick.</span>
+      <input type="search" id="rxFilter" placeholder="search: water, tag:flammable, &gt;smoke, self:fire&hellip;">
+      <div class="sortbar">
+        <label for="rxSort">sort</label>
+        <select class="sortsel" id="rxSort">
+          <option value="file">file order</option>
+          <option value="self">reacting (self)</option>
+          <option value="neighbor">reacting with (neighbor)</option>
+          <option value="product">turns into (product)</option>
+          <option value="kind">type</option>
+          <option value="chance">chance</option>
+        </select>
+        <select class="sortsel" id="rxGroup">
+          <option value="flat">flat list</option>
+          <option value="grouped">grouped</option>
+        </select>
+      </div>
       <span class="spacer"></span>
       <button id="btnAddNote">+ note</button>
       <button id="btnAddRule">+ rule</button>
     </div>
+    <div class="hint" style="margin:-4px 0 10px">file order matters: rules for the same <i>self</i> are tried top-down, at most one fires per cell per tick. chance is &permil; per 30&thinsp;Hz tick.</div>
+    <div class="sortnote" id="rxSortNote">&#9888; <div><b>Sorted view &mdash; display only.</b> The file is untouched and rule priority is unchanged. Reorder buttons are disabled here; switch back to <b>file order</b> to move rules.</div></div>
     <div class="rxlist" id="rxList"></div>
+  </section>
+
+  <!-- TUNING -->
+  <section class="view" id="view-tuning">
+    <div class="toolbar">
+      <input type="search" id="tuneFilter" placeholder="search every parameter&hellip;">
+      <span class="spacer"></span>
+      <span class="hint" id="tuneCount"></span>
+      <button id="btnTuneReset" class="danger">Reset visible to defaults</button>
+    </div>
+    <div class="applybar">
+      <b>How edits reach the game:</b>
+      <span class="ap ap-shader">shader</span> &amp; <span class="ap ap-cpu">runtime</span> apply on
+      <kbd>F5</kbd> in-game (reload shaders) &mdash; no rebuild.
+      <span class="ap ap-worldgen">worldgen</span> needs a fresh world (regen / new seed).
+    </div>
+    <div id="tuneGroups"></div>
   </section>
 </main>
 
@@ -304,15 +477,32 @@
   <div id="valbody"></div>
 </div>
 
+<div id="buildPanel">
+  <header>
+    <b>build</b><span class="st" id="buildSt">idle</span>
+    <span class="spacer" style="flex:1"></span>
+    <button class="icon" id="buildClose" title="hide">&#10005;</button>
+  </header>
+  <pre id="buildLog"></pre>
+</div>
+
 <div id="toast"></div>
 
+<script src="tuner_schema.js"></script>
 <script>
 'use strict';
 /* ================= state ================= */
-let mat=null, rx=null;                 // parsed JSON, mutated in place
-let matHandle=null, rxHandle=null;     // FS Access handles (null in fallback mode)
-let dirty={mat:false, rx:false};
-let eol={mat:'\r\n', rx:'\r\n'};       // detected per file at load, preserved on save
+let mat=null, rx=null, tune=null;      // parsed JSON, mutated in place
+let matHandle=null, rxHandle=null, tuneHandle=null;  // FS Access handles (null in fallback mode)
+let dirty={mat:false, rx:false, tune:false};
+let eol={mat:'\r\n', rx:'\r\n', tune:'\r\n'};       // detected per file at load, preserved on save
+// Values as first read from disk. "changed" and the reset buttons compare
+// against this, not a second copy of the defaults that could drift from the
+// engine's own compiled-in values.
+let tuneBase=null;
+// True when served by scripts/tuner_server.py (auto-load + Build/Play).
+// Declared here because updatePills() reads it well before the probe runs.
+let server=false;
 let activeTab='overview';
 const CLASSES=['solid','powder','liquid','gas'];
 const DIRS=['up','down','side'];       // absent = any
@@ -330,6 +520,41 @@ function el(tag,attrs={},...kids){
 }
 const ids=()=>mat?mat.materials.map(m=>m.id):[];
 function allTags(){const s=new Set();(mat?.materials||[]).forEach(m=>(m.tags||[]).forEach(t=>s.add(t)));return[...s].sort();}
+const matById=id=>(mat?.materials||[]).find(m=>m.id===id)||null;
+const matsWithTag=t=>(mat?.materials||[]).filter(m=>(m.tags||[]).includes(t));
+
+/* ================= material swatches ================= */
+// Renders the color icon for any reaction reference: a material id, "tag:x",
+// "air", "any", or an unknown/dangling ref. Tags show the blended colors of
+// every material carrying them, so "tag:flammable" reads as its real palette.
+function swatch(ref,{wide=false}={}){
+  const cls='msw'+(wide?' wide':'');
+  const box=(extra,colors,title)=>{
+    const e=el('span',{class:cls+(extra?' '+extra:''),title});
+    for(const c of colors){const i=el('i');i.style.background=c;e.append(i);}
+    if(!colors.length)e.append(el('i'),el('i'),el('i'));
+    return e;
+  };
+  if(ref==null||ref==='')return box('any',[],'(unset)');
+  if(ref==='air')return box('air',[],'air — empty space');
+  if(ref==='any')return box('any',['#3a4354','#4a5468','#3a4354'],'any neighbor');
+  if(typeof ref==='string'&&ref.startsWith('tag:')){
+    const t=ref.slice(4),ms=matsWithTag(t);
+    // up to 3 slots, one per tagged material, cycling if there are more
+    const cols=ms.slice(0,3).map(m=>(m.colors||[])[1]||(m.colors||[])[0]||'#444');
+    while(cols.length&&cols.length<3)cols.push(cols[cols.length-1]);
+    return box('tag',cols.length?cols:['#2a3a2c','#354a38','#2a3a2c'],
+      ms.length?`tag:${t} — ${ms.length} material(s): ${ms.map(m=>m.id).join(', ')}`:`tag:${t} — matches nothing`);
+  }
+  const m=matById(ref);
+  if(!m)return box('any',[],`"${ref}" — unknown reference`);
+  return box('',(m.colors||[]).length?m.colors:['#444','#444','#444'],
+    `${m.id} — ${m.class}${m.tags?.length?' ['+m.tags.join(', ')+']':''}`);
+}
+// swatch + text, for compact read-only display (overview lists, group headers)
+function swLabel(ref,text){
+  return el('span',{class:'swlabel'},swatch(ref),el('span',{class:'txt'},text??ref??'—'));
+}
 
 /* ================= toast / dirty ================= */
 let toastT=null;
@@ -343,11 +568,12 @@ function touch(which){
 function updatePills(){
   const set=(id,loaded,d)=>{const p=$(id);p.classList.toggle('loaded',loaded&&!d);p.classList.toggle('dirty',d);};
   set('#pillMat',!!mat,dirty.mat);set('#pillRx',!!rx,dirty.rx);
-  $('#btnSave').disabled=!(dirty.mat||dirty.rx);
-  $('#btnCopy').disabled=!(mat||rx);
-  $('#btnReload').disabled=!(matHandle&&rxHandle);
+  set('#pillTune',!!tune,dirty.tune);
+  $('#btnSave').disabled=!(dirty.mat||dirty.rx||dirty.tune);
+  $('#btnCopy').disabled=!(mat||rx||tune);
+  $('#btnReload').disabled=!(server||(matHandle&&rxHandle));
 }
-window.addEventListener('beforeunload',e=>{if(dirty.mat||dirty.rx){e.preventDefault();e.returnValue='';}});
+window.addEventListener('beforeunload',e=>{if(dirty.mat||dirty.rx||dirty.tune){e.preventDefault();e.returnValue='';}});
 
 /* ================= file I/O ================= */
 async function openFolder(){
@@ -364,6 +590,9 @@ async function openFolder(){
     matHandle=await dir.getFileHandle('materials.json');
     rxHandle=await dir.getFileHandle('reactions.json');
   }catch{toast('could not find both materials.json and reactions.json',true);return;}
+  // tuning.json is optional: older checkouts predate it, and the engine falls
+  // back to compiled-in defaults when it is missing.
+  try{tuneHandle=await dir.getFileHandle('tuning.json');}catch{tuneHandle=null;}
   await loadFromHandles();
   toast('loaded '+mat.materials.length+' materials, '+rx.reactions.filter(r=>r.self!==undefined).length+' reactions');
 }
@@ -373,7 +602,13 @@ async function loadFromHandles(){
   mat=JSON.parse(mt);rx=JSON.parse(rt);
   eol.mat=mt.includes('\r\n')?'\r\n':'\n';
   eol.rx=rt.includes('\r\n')?'\r\n':'\n';
-  dirty={mat:false,rx:false};
+  if(tuneHandle){
+    const tt=await (await tuneHandle.getFile()).text();
+    tune=JSON.parse(tt);
+    eol.tune=tt.includes('\r\n')?'\r\n':'\n';
+  }else tune=null;
+  tuneBase=tune?structuredClone(tune):null;
+  dirty={mat:false,rx:false,tune:false};
   onLoaded();
 }
 // match the on-disk style exactly (CRLF + \uXXXX escapes) so a no-op save is diff-clean
@@ -383,10 +618,13 @@ function serialize(data,eolStr){
   return (s+'\n').replace(/\n/g,eolStr);
 }
 async function saveAll(){
-  if(!dirty.mat&&!dirty.rx)return;
+  const dirty0={...dirty};
+  if(server)return void serverSave();
+  if(!dirty.mat&&!dirty.rx&&!dirty.tune)return;
   const jobs=[];
   if(dirty.mat)jobs.push(['mat',matHandle,mat,'materials.json']);
   if(dirty.rx)jobs.push(['rx',rxHandle,rx,'reactions.json']);
+  if(dirty.tune)jobs.push(['tune',tuneHandle,tune,'tuning.json']);
   for(const [which,handle,data,name] of jobs){
     const text=serialize(data,eol[which]);
     if(handle){
@@ -398,8 +636,10 @@ async function saveAll(){
       download(name,text);dirty[which]=false;
     }
   }
+  if(tune)tuneBase=structuredClone(tune);
   updatePills();
-  toast('saved — press R in-game to hot-reload');
+  toast(dirty0.tune?'saved — F5 in-game for tuning, R for materials'
+                   :'saved — press R in-game to hot-reload');
 }
 async function saveCopy(){
   const isMat=activeTab==='materials'||activeTab==='overview';
@@ -424,7 +664,11 @@ function fallbackLoad(files){
       const j=JSON.parse(t);
       if(j.materials){mat=j;eol.mat=t.includes('\r\n')?'\r\n':'\n';}
       else if(j.reactions){rx=j;eol.rx=t.includes('\r\n')?'\r\n':'\n';}
-      if(mat&&rx){dirty={mat:false,rx:false};onLoaded();toast('loaded (read-only mode: Save downloads new files)');}
+      else if(j.render||j.player||j.sim){
+        tune=j;tuneBase=structuredClone(j);eol.tune=t.includes('\r\n')?'\r\n':'\n';
+        dirty.tune=false;updatePills();if(mat&&rx)renderAll();
+      }
+      if(mat&&rx){dirty.mat=false;dirty.rx=false;onLoaded();toast('loaded (read-only mode: Save downloads new files)');}
     }).catch(()=>toast('could not parse '+f.name,true));
   }
 }
@@ -467,6 +711,17 @@ function matSelect(obj,key,which,{none=null,extra=[],structural=false}={}){
     touch(which);if(structural)renderAll();else validateSoon();
   });
   return s;
+}
+// matSelect with a color icon that follows the selection
+function matSelectSw(obj,key,which,opts={}){
+  const s=matSelect(obj,key,which,opts);
+  const wrap=el('div',{class:'withsw'});
+  let icon=swatch(obj[key]);
+  wrap.append(icon,s);
+  s.addEventListener('change',()=>{
+    const next=swatch(obj[key]);wrap.replaceChild(next,icon);icon=next;
+  });
+  return wrap;
 }
 
 /* ================= reference utilities ================= */
@@ -520,7 +775,7 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     activeTab=b.dataset.tab;
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
-    if(mat&&rx)renderAll();
+    if((mat&&rx)||activeTab==='tuning')renderAll();
   });
 });
 function gotoReactions(filter){
@@ -582,8 +837,8 @@ function matRow(m,i){
   tr.append(el('td',{},bindNum(m,'moveEvery','mat',{min:1,ph:'1'})));
   tr.append(el('td',{},bindCheck(m,'opaque','mat')));
   tr.append(el('td',{},bindCheck(m,'wanders','mat')));
-  tr.append(el('td',{},matSelect(m,'rubble','mat',{none:'—'})));
-  tr.append(el('td',{},matSelect(m,'molten','mat',{none:'(vapor)'})));
+  tr.append(el('td',{},matSelectSw(m,'rubble','mat',{none:'—'})));
+  tr.append(el('td',{},matSelectSw(m,'molten','mat',{none:'(vapor)'})));
 
   // tags
   const chips=el('div',{class:'chips'});
@@ -646,18 +901,138 @@ function matRow(m,i){
 
 /* ================= render: reactions ================= */
 function ruleKind(r){return r.decay?'decay':r.emit!==undefined?'emit':'pair';}
+// products = everything a rule can turn a cell into
+const ruleProducts=r=>[r.becomes,r.selfBecomes,r.neighborBecomes,r.emit].filter(v=>v!=null&&v!=='');
+const ruleInputs=r=>[r.self,r.neighbor].filter(v=>v!=null&&v!=='');
+
+/* ---- search ----
+   Plain terms match any reference, the kind, the note, and — for a bare
+   material id — the tags that material carries (so searching "wood" also
+   finds "tag:flammable" rules that wood participates in).
+   Prefixes narrow the field:  self:x  with:x/neighbor:x  >x / becomes:x
+   type:pair|decay|emit.  Multiple space-separated terms are ANDed;
+   quote a term to match it literally.                                     */
+function parseQuery(q){
+  const terms=[];
+  const re=/(\w+:)?"([^"]*)"|(\S+)/g;let m;
+  while((m=re.exec(q))!==null){
+    let raw=m[2]!==undefined?(m[1]||'')+m[2]:m[3];
+    if(!raw)continue;
+    let field=null,val=raw.toLowerCase();
+    const c=val.indexOf(':');
+    if(val.startsWith('>')){field='product';val=val.slice(1);}
+    else if(c>0){
+      const f=val.slice(0,c),rest=val.slice(c+1);
+      if(f==='self'){field='self';val=rest;}
+      else if(f==='with'||f==='neighbor'||f==='nbr'){field='neighbor';val=rest;}
+      else if(f==='becomes'||f==='product'||f==='into'){field='product';val=rest;}
+      else if(f==='type'||f==='kind'){field='kind';val=rest;}
+      // "tag:flammable" keeps its colon — it is a literal reference, not a field
+    }
+    if(val)terms.push({field,val});
+  }
+  return terms;
+}
+// every string a term can match against a rule, per field
+function ruleHaystack(r){
+  const expand=v=>{ // a material id also matches via its tags
+    const out=[String(v).toLowerCase()];
+    const m=matById(v);
+    if(m)for(const t of m.tags||[])out.push('tag:'+t.toLowerCase(),t.toLowerCase());
+    if(String(v).startsWith('tag:'))out.push(String(v).slice(4).toLowerCase());
+    return out;
+  };
+  const self=expand(r.self);
+  const neighbor=(r.neighbor!=null?expand(r.neighbor):[]);
+  const product=ruleProducts(r).flatMap(expand);
+  const kind=[ruleKind(r)];
+  return{self,neighbor,product,kind,any:[...self,...neighbor,...product,...kind,String(r.note||'').toLowerCase()]};
+}
+function ruleMatches(r,terms){
+  if(!terms.length)return true;
+  const hay=ruleHaystack(r);
+  return terms.every(t=>(hay[t.field||'any']||[]).some(s=>s.includes(t.val)));
+}
+
+/* ---- sorting (display only; never mutates rx.reactions) ---- */
+// Sort keys pick the primary reference for a mode; ties fall back to file
+// order so a sorted view stays stable and rule priority is still readable.
+const SORTKEY={
+  self:r=>r.self||'',
+  neighbor:r=>ruleKind(r)==='pair'?(r.neighbor||''):'￿',   // non-pair rules sink to the end
+  product:r=>ruleProducts(r)[0]||'￿',
+  kind:r=>({pair:'0pair',decay:'1decay',emit:'2emit'})[ruleKind(r)],
+  chance:r=>r.chance??0,
+};
+function sortedRuleEntries(entries,mode){
+  if(mode==='file'||!SORTKEY[mode])return entries;
+  const key=SORTKEY[mode],desc=mode==='chance';
+  return entries.slice().sort((a,b)=>{
+    const ka=key(a.r),kb=key(b.r);
+    let c=typeof ka==='number'?(desc?kb-ka:ka-kb):String(ka).localeCompare(String(kb));
+    if(c)return c;
+    // secondary: self, then original file position
+    if(mode!=='self'){c=String(a.r.self||'').localeCompare(String(b.r.self||''));if(c)return c;}
+    return a.i-b.i;
+  });
+}
+const GROUPLABEL={
+  self:r=>r.self||'(none)',
+  neighbor:r=>ruleKind(r)==='pair'?(r.neighbor||'(none)'):'(no neighbor — '+ruleKind(r)+')',
+  product:r=>ruleProducts(r)[0]||'(no product)',
+  kind:r=>({pair:'pair — self + neighbor',decay:'decay',emit:'emit'})[ruleKind(r)],
+  chance:r=>{const c=r.chance??0;return c>=500?'500–1000‰ (very likely)':c>=100?'100–499‰':c>=10?'10–99‰':'1–9‰ (rare)';},
+};
+
 function renderReactions(){
   const host=$('#rxList');host.innerHTML='';
-  const q=$('#rxFilter').value.trim().toLowerCase();
-  const qTags=q&&mat.materials.find(m=>m.id===q)?new Set((mat.materials.find(m=>m.id===q).tags||[]).map(t=>'tag:'+t)):null;
-  let shownRuleIdx=0;
+  const terms=parseQuery($('#rxFilter').value.trim());
+  const mode=$('#rxSort').value;
+  const grouped=$('#rxGroup').value==='grouped'&&mode!=='file';
+  const sorted=mode!=='file';
+  $('#rxSortNote').classList.toggle('show',sorted);
+  $('#rxSort').classList.toggle('on',sorted);
+  $('#rxGroup').disabled=!sorted;
+
+  // file-order numbering is assigned first so a rule keeps its number when sorted
+  const entries=[];let num=0;
   rx.reactions.forEach((r,i)=>{
-    if(r.self===undefined&&r.note!==undefined){host.append(noteRow(r,i,q));return;}
-    shownRuleIdx++;
-    const hay=[r.self,r.neighbor,r.becomes,r.selfBecomes,r.neighborBecomes,r.emit].filter(Boolean).join(' ').toLowerCase();
-    const match=!q||hay.includes(q)||(qTags&&(qTags.has(r.neighbor)));
-    host.append(ruleRow(r,i,shownRuleIdx,!match));
+    if(r.self===undefined&&r.note!==undefined){entries.push({note:true,r,i});return;}
+    entries.push({r,i,num:++num});
   });
+
+  if(!sorted){
+    // notes are section headers — they only make sense in file order
+    for(const e of entries){
+      if(e.note){host.append(noteRow(e.r,e.i,terms.length?'q':''));continue;}
+      host.append(ruleRow(e.r,e.i,e.num,!ruleMatches(e.r,terms),false));
+    }
+  }else{
+    const rules=sortedRuleEntries(entries.filter(e=>!e.note&&ruleMatches(e.r,terms)),mode);
+    if(!rules.length)host.append(el('div',{class:'hint',style:'padding:18px 2px'},'no rules match.'));
+    else if(!grouped){
+      for(const e of rules)host.append(ruleRow(e.r,e.i,e.num,false,true));
+    }else{
+      const label=GROUPLABEL[mode];
+      let cur=null,bucket=[];
+      const flush=()=>{
+        if(!bucket.length)return;
+        const ref=mode==='self'||mode==='neighbor'||mode==='product'?cur:null;
+        const hdr=el('div',{class:'rxgrouphdr'});
+        if(ref&&ref!=='(none)'&&!ref.startsWith('(no '))hdr.append(swatch(ref,{wide:true}));
+        hdr.append(el('b',{},cur),el('span',{class:'cnt'},bucket.length+' rule'+(bucket.length>1?'s':'')),el('span',{class:'line'}));
+        host.append(hdr);
+        for(const e of bucket)host.append(ruleRow(e.r,e.i,e.num,false,true));
+        bucket=[];
+      };
+      for(const e of rules){
+        const l=label(e.r);
+        if(l!==cur){flush();cur=l;}
+        bucket.push(e);
+      }
+      flush();
+    }
+  }
   refreshDatalists();
 }
 function noteRow(r,i,q){
@@ -672,30 +1047,31 @@ function noteRow(r,i,q){
   wrap.append(ta,rowMoveButtons(i),del);
   return wrap;
 }
-function rowMoveButtons(i){
+function rowMoveButtons(i,locked){
   const box=el('div',{class:'rxactions'});
-  const up=el('button',{class:'icon',title:'move up'},'↑');
-  const dn=el('button',{class:'icon',title:'move down'},'↓');
-  up.disabled=i===0;dn.disabled=i===rx.reactions.length-1;
+  const t=locked?'switch to file order to reorder':null;
+  const up=el('button',{class:'icon',title:t||'move up'},'↑');
+  const dn=el('button',{class:'icon',title:t||'move down'},'↓');
+  up.disabled=locked||i===0;dn.disabled=locked||i===rx.reactions.length-1;
   up.addEventListener('click',()=>{[rx.reactions[i-1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i-1]];touch('rx');renderReactions();});
   dn.addEventListener('click',()=>{[rx.reactions[i+1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i+1]];touch('rx');renderReactions();});
   box.append(up,dn);
   return box;
 }
-function ruleRow(r,i,num,hidden){
+function ruleRow(r,i,num,hidden,sorted){
   const kind=ruleKind(r);
   const row=el('div',{class:'rxrule kind-'+kind+(hidden?' hidden':'')});
-  row.append(el('div',{class:'n'},String(num)));
+  row.append(el('div',{class:'n',title:'file position'},String(num)));
 
   // self
   const selfF=el('div',{class:'f'},el('span',{},'self'));
-  selfF.append(matSelect(r,'self','rx',{}));
+  selfF.append(matSelectSw(r,'self','rx',{}));
   row.append(selfF);
 
   // kind switch
   const kindF=el('div',{class:'f'},el('span',{},'type'));
   const ks=el('select',{});
-  [['pair','+ neighbor'],['decay','decay'],['emit','emit']].forEach(([v,l])=>ks.append(el('option',{value:v},l)));
+  [['pair','+ nbr'],['decay','decay'],['emit','emit']].forEach(([v,l])=>ks.append(el('option',{value:v},l)));
   ks.value=kind;
   ks.addEventListener('change',()=>{
     const keep={self:r.self,chance:r.chance??100,note:r.note};
@@ -723,18 +1099,24 @@ function ruleRow(r,i,num,hidden){
   };
   if(kind==='pair'){
     const nb=el('input',{class:'nb',list:'dl-neighbor',value:r.neighbor??'',spellcheck:'false',placeholder:'id / tag:x / any'});
-    nb.addEventListener('change',()=>{r.neighbor=nb.value.trim();touch('rx');});
-    mid.append(field('neighbor',nb),field('dir',dirSel()));
+    const nbWrap=el('div',{class:'withsw'});
+    let nbIcon=swatch(r.neighbor);
+    nbWrap.append(nbIcon,nb);
+    nb.addEventListener('change',()=>{
+      r.neighbor=nb.value.trim();touch('rx');
+      const next=swatch(r.neighbor);nbWrap.replaceChild(next,nbIcon);nbIcon=next;
+    });
+    mid.append(field('neighbor',nbWrap),field('dir',dirSel()));
     mid.append(el('div',{class:'arrow'},'→'));
-    mid.append(field('self becomes',matSelect(r,'selfBecomes','rx',{none:'(keep)',extra:['air']})));
-    mid.append(field('nbr becomes',matSelect(r,'neighborBecomes','rx',{none:'(keep)',extra:['air']})));
+    mid.append(field('self becomes',matSelectSw(r,'selfBecomes','rx',{none:'(keep)',extra:['air']})));
+    mid.append(field('nbr becomes',matSelectSw(r,'neighborBecomes','rx',{none:'(keep)',extra:['air']})));
   }else if(kind==='decay'){
     mid.append(el('div',{class:'arrow'},'→'));
-    mid.append(field('becomes',matSelect(r,'becomes','rx',{extra:['air']})));
+    mid.append(field('becomes',matSelectSw(r,'becomes','rx',{extra:['air']})));
   }else{ // emit
-    mid.append(field('emit',matSelect(r,'emit','rx',{})));
+    mid.append(field('emit',matSelectSw(r,'emit','rx',{})));
     mid.append(field('dir',dirSel()));
-    mid.append(field('self becomes',matSelect(r,'selfBecomes','rx',{none:'(keep)',extra:['air']})));
+    mid.append(field('self becomes',matSelectSw(r,'selfBecomes','rx',{none:'(keep)',extra:['air']})));
   }
   row.append(mid);
 
@@ -746,9 +1128,9 @@ function ruleRow(r,i,num,hidden){
   cw.append(el('div',{class:'f'},el('span',{},'chance ‰'),ci),sub);
   row.append(cw);
 
-  // actions
+  // actions — reordering is meaningless while sorted, so it is disabled there
   const acts=el('div',{class:'rxactions'});
-  acts.append(rowMoveButtons(i));
+  acts.append(rowMoveButtons(i,sorted));
   const more=el('button',{class:'icon',title:'note / neighborClass'},r.note||r.neighborClass?'✎':'…');
   const dup=el('button',{class:'icon',title:'duplicate below'},'⧉');
   dup.addEventListener('click',()=>{rx.reactions.splice(i+1,0,structuredClone(r));touch('rx');renderReactions();});
@@ -796,7 +1178,9 @@ function refreshDatalists(){
 /* ================= render: overview ================= */
 function ruleSentence(r,selfId){
   const span=(cls,txt)=>`<span class="${cls}">${txt}</span>`;
-  const name=x=>x?.startsWith?.('tag:')?span('tag',x):span('mat',x||'?');
+  // inline swatch as HTML so it can sit inside these generated sentences
+  const swHtml=ref=>swatch(ref).outerHTML;
+  const name=x=>swHtml(x)+' '+(x?.startsWith?.('tag:')?span('tag',x):span('mat',x||'?'));
   const pct=` <span class="pct">${r.chance??'?'}‰ ${chanceHint(r)}</span>`;
   const arr=span('arr',' → ');
   if(r.decay)return`${name(r.self)} decays${arr}${name(r.becomes)}${pct}`;
@@ -907,7 +1291,358 @@ function validate(){
 $('#valhead').addEventListener('click',()=>$('#valbar').classList.toggle('open'));
 
 /* ================= global render / wiring ================= */
+
+/* ================= render: tuning =================
+   Every control is built from TUNING_SCHEMA (assets/tuner_schema.js); nothing
+   here knows about individual parameters. A row binds straight to
+   tune[group][key], so moving a slider mutates the JSON that gets saved.
+
+   Rows compare against tuneBase (the file as it was loaded) to mark "changed"
+   and to drive the per-row reset, so the baseline is always what the engine
+   will actually read rather than a duplicated default table that could drift. */
+
+const APPLY_LABEL={shader:'shader',cpu:'runtime',worldgen:'worldgen'};
+const tabGroup=tab=>tab.group||tab.id;
+const paramGroup=(tab,pr)=>pr.g||tabGroup(tab);
+
+// Round to the row's step, so a dragged slider writes 0.35 into the JSON
+// instead of 0.35000000000000003.
+function roundStep(v,step){
+  if(!isFinite(v)||!step)return v;
+  const dec=(String(step).split('.')[1]||'').length;
+  return +(Math.round(v/step)*step).toFixed(dec);
+}
+const getAt=(obj,g,k)=>obj&&obj[g]?obj[g][k]:undefined;
+function setAt(obj,g,k,v){(obj[g]=obj[g]||{})[k]=v;}
+
+function sameVal(a,b){
+  if(Array.isArray(a)&&Array.isArray(b))
+    return a.length===b.length&&a.every((x,i)=>Math.abs(x-b[i])<1e-9);
+  if(typeof a==='number'&&typeof b==='number')return Math.abs(a-b)<1e-9;
+  return a===b;
+}
+
+// Colours are authored as linear 0..1 triples because that is what the shader
+// consumes; the picker is only a convenient way to reach them.
+const to255=v=>Math.max(0,Math.min(255,Math.round(v*255)));
+const rgbToHex=c=>'#'+c.map(v=>to255(v).toString(16).padStart(2,'0')).join('');
+const hexToRgb=h=>[0,1,2].map(i=>parseInt(h.slice(1+i*2,3+i*2),16)/255);
+
+function matchesQuery(tab,pr,g,q){
+  if(!q)return true;
+  return (pr.n+' '+pr.k+' '+pr.d+' '+tab.title+' '+g).toLowerCase().includes(q);
+}
+
+function renderTuning(){
+  const host=$('#tuneGroups');host.innerHTML='';
+  if(!tune){
+    host.append(el('div',{class:'hint',style:'padding:24px 2px;line-height:1.7'},
+      'No tuning.json loaded. Click ',el('b',{},'Open assets folder'),
+      ' (tuning.json lives in assets/materials/), or drag the file onto this window.'));
+    $('#tuneCount').textContent='';
+    return;
+  }
+  const q=$('#tuneFilter').value.trim().toLowerCase();
+  let shown=0,changed=0;
+
+  for(const tab of TUNING_SCHEMA){
+    const rows=[];
+    for(const pr of tab.params){
+      const g=paramGroup(tab,pr);
+      const row=tuneRow(tab,pr,g);
+      if(!matchesQuery(tab,pr,g,q))row.classList.add('hidden');
+      else{
+        shown++;
+        if(row.classList.contains('changed'))changed++;
+      }
+      rows.push(row);
+    }
+    const visible=rows.filter(r=>!r.classList.contains('hidden')).length;
+    if(!visible)continue;
+
+    const det=el('details',{class:'tgroup'+(tab.determinism?' det':'')});
+    // Searching should reveal what it matched; otherwise open the two tabs
+    // people reach for most and leave the rest collapsed.
+    det.open=q?true:(tab.id==='player'||tab.id==='render');
+    det.append(el('summary',{},
+      el('span',{class:'ico'},tab.icon||''),
+      el('b',{},tab.title),
+      el('span',{class:'cnt'},visible+' param'+(visible===1?'':'s')),
+      el('span',{class:'spacer'}),
+      el('span',{class:'ap ap-'+(tab.determinism?'sim':tab.apply)},
+        tab.determinism?'determinism':(APPLY_LABEL[tab.apply]||tab.apply))));
+    if(tab.blurb)det.append(el('div',{class:'tblurb'},tab.blurb));
+    if(tab.determinism){
+      det.append(el('div',{class:'detwarn'},
+        '⚠ These change the world hash. The sim is bit-deterministic by design ',
+        '— the same seed and tick must produce the same world on every machine ',
+        '— so after editing anything here, run ',
+        el('code',{},'sandvox.exe --selftest'),
+        ' to confirm the sim still reproduces itself. Worlds and replays recorded ',
+        'before the change will diverge.'));
+    }
+    const body=el('div',{class:'trows'});
+    rows.forEach(r=>body.append(r));
+    det.append(body);
+    host.append(det);
+  }
+  $('#tuneCount').textContent=shown+' shown'+(changed?' · '+changed+' changed':'');
+}
+
+function tuneRow(tab,pr,g){
+  const cur=getAt(tune,g,pr.k);
+  const base=getAt(tuneBase,g,pr.k);
+  const row=el('div',{class:'trow'+(tab.determinism?' det':'')});
+  const mark=()=>row.classList.toggle('changed',!sameVal(getAt(tune,g,pr.k),base));
+
+  row.append(el('div',{class:'nm',title:pr.k},
+    el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)));
+
+  if(pr.type==='color'||pr.type==='vec3'){
+    row.append(vecEditor(pr,g,mark));
+    row.append(el('span',{}));   // triples have no single numeric box
+  }else{
+    const rng=el('input',{type:'range',min:pr.min,max:pr.max,step:pr.step??'any'});
+    const num=el('input',{class:'tnum',type:'number',step:pr.step??'any'});
+    const write=v=>{
+      let x=roundStep(v,pr.step);
+      if(pr.int)x=Math.round(x);
+      if(pr.min!=null)x=Math.max(pr.min,x);
+      if(pr.max!=null)x=Math.min(pr.max,x);
+      if(!isFinite(x))return;
+      setAt(tune,g,pr.k,x);
+      rng.value=x;num.value=x;
+      touchTune();mark();
+    };
+    const v0=(cur!=null?cur:(pr.min??0));
+    rng.value=v0;num.value=v0;
+    rng.addEventListener('input',()=>write(+rng.value));
+    num.addEventListener('change',()=>write(+num.value));
+    row.append(rng);
+    const wrap=el('div',{style:'display:flex;gap:5px;align-items:center'},num);
+    if(pr.u)wrap.append(el('span',{class:'unit'},pr.u));
+    row.append(wrap);
+  }
+
+  const rst=el('button',{class:'rst',title:'reset to the value on disk'},'↺');
+  rst.addEventListener('click',()=>{
+    if(base===undefined)return;
+    setAt(tune,g,pr.k,structuredClone(base));
+    touchTune();renderTuning();
+  });
+  row.append(rst);
+
+  const help=el('div',{class:'thelp'},pr.d);
+  if(pr.warn){help.append(' ');help.append(el('b',{},'⚠ '+pr.warn));}
+  row.append(help);
+
+  if(!sameVal(cur,base))row.classList.add('changed');
+  return row;
+}
+
+function vecEditor(pr,g,mark){
+  const wrap=el('div',{class:'vecwrap'});
+  const cur=(getAt(tune,g,pr.k)||[0,0,0]).slice();
+  if(pr.type==='color'){
+    const pv=el('span',{class:'swatchpv'});
+    const setPv=()=>{
+      const c=getAt(tune,g,pr.k)||[0,0,0];
+      pv.style.background='rgb('+c.map(to255).join(',')+')';
+    };
+    const pick=el('input',{type:'color'});
+    pick.value=rgbToHex(cur);
+    const boxes=[0,1,2].map(i=>{
+      const b=el('input',{class:'tnum',type:'number',step:'0.005'});
+      b.value=cur[i];
+      b.addEventListener('change',()=>{
+        const c=(getAt(tune,g,pr.k)||[0,0,0]).slice();
+        c[i]=+b.value;
+        setAt(tune,g,pr.k,c);
+        pick.value=rgbToHex(c);setPv();touchTune();mark();
+      });
+      return b;
+    });
+    pick.addEventListener('input',()=>{
+      // The picker is 8-bit. Keep 3 decimals so round-tripping a colour does
+      // not silently quantise a value the shader reads at full float precision
+      // (HDR ambient/sun colours legitimately sit between 8-bit steps).
+      const c=hexToRgb(pick.value).map(v=>+v.toFixed(3));
+      setAt(tune,g,pr.k,c);
+      boxes.forEach((b,i)=>b.value=c[i]);
+      setPv();touchTune();mark();
+    });
+    setPv();
+    wrap.append(pv,pick,...boxes);
+  }else{
+    [0,1,2].forEach(i=>{
+      const b=el('input',{class:'tnum',type:'number',step:pr.step??'any'});
+      b.value=cur[i];
+      b.addEventListener('change',()=>{
+        const c=(getAt(tune,g,pr.k)||[0,0,0]).slice();
+        let x=+b.value;
+        if(pr.min!=null)x=Math.max(pr.min,x);
+        if(pr.max!=null)x=Math.min(pr.max,x);
+        c[i]=roundStep(x,pr.step);
+        b.value=c[i];
+        setAt(tune,g,pr.k,c);touchTune();mark();
+      });
+      wrap.append(b);
+    });
+  }
+  return wrap;
+}
+
+function touchTune(){dirty.tune=true;updatePills();}
+
+$('#tuneFilter').addEventListener('input',renderTuning);
+$('#btnTuneReset').addEventListener('click',()=>{
+  if(!tune||!tuneBase)return;
+  const q=$('#tuneFilter').value.trim().toLowerCase();
+  let n=0;
+  for(const tab of TUNING_SCHEMA){
+    for(const pr of tab.params){
+      const g=paramGroup(tab,pr);
+      if(!matchesQuery(tab,pr,g,q))continue;
+      const base=getAt(tuneBase,g,pr.k);
+      if(base===undefined)continue;
+      if(!sameVal(getAt(tune,g,pr.k),base)){
+        setAt(tune,g,pr.k,structuredClone(base));n++;
+      }
+    }
+  }
+  if(n){touchTune();renderTuning();toast('reset '+n+' parameter'+(n===1?'':'s'));}
+  else toast('nothing to reset');
+});
+
+
+/* ================= server mode =================
+   When the tuner is served by scripts/tuner_server.py instead of opened as a
+   file://, the page gains three things a sandboxed page cannot have: it knows
+   where assets/ is (so it loads on start with no folder picker), Save writes
+   through an endpoint, and Build/Play can drive the toolchain.
+
+   Detection is a probe rather than a location check, so opening the file
+   directly still works exactly as before — everything below simply stays off. */
+
+async function detectServer(){
+  // file:// pages have origin "null"; skip the probe entirely there.
+  if(location.protocol==='file:')return false;
+  try{
+    const r=await fetch('/api/files',{cache:'no-store'});
+    if(!r.ok)return false;
+    const j=await r.json();
+    if(j.materials==null&&j.reactions==null&&j.tuning==null)return false;
+    applyServerFiles(j);
+    return true;
+  }catch{return false;}
+}
+
+function applyServerFiles(j){
+  const eolOf=t=>t.includes('\r\n')?'\r\n':'\n';
+  if(j.materials){mat=JSON.parse(j.materials);eol.mat=eolOf(j.materials);}
+  if(j.reactions){rx=JSON.parse(j.reactions);eol.rx=eolOf(j.reactions);}
+  if(j.tuning){
+    tune=JSON.parse(j.tuning);tuneBase=structuredClone(tune);eol.tune=eolOf(j.tuning);
+  }
+  dirty={mat:false,rx:false,tune:false};
+  if(mat&&rx)onLoaded(); else {updatePills();renderAll();}
+}
+
+async function serverSave(){
+  const files={};
+  if(dirty.mat)files.materials=serialize(mat,eol.mat);
+  if(dirty.rx)files.reactions=serialize(rx,eol.rx);
+  if(dirty.tune)files.tuning=serialize(tune,eol.tune);
+  if(!Object.keys(files).length)return true;
+  const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({files})});
+  const j=await r.json().catch(()=>({ok:false,error:'bad response'}));
+  if(!j.ok){toast('save failed: '+(j.error||r.status),true);return false;}
+  const hadTune=dirty.tune;
+  dirty={mat:false,rx:false,tune:false};
+  if(tune)tuneBase=structuredClone(tune);
+  updatePills();
+  toast(hadTune?'saved — press F5 in-game (or Build for code changes)'
+               :'saved — press R in-game to hot-reload');
+  return true;
+}
+
+/* ---- build / play ---- */
+let buildPoll=null;
+const bpanel=()=>$('#buildPanel');
+function showBuild(on){bpanel().classList.toggle('show',on);}
+
+async function doBuild(){
+  const b=$('#btnBuild');
+  if(b.classList.contains('busy'))return;
+  // Unsaved edits would be invisible to a rebuild, which is the most confusing
+  // possible outcome — flush them first.
+  if(dirty.mat||dirty.rx||dirty.tune){ if(!await serverSave())return; }
+  b.classList.add('busy');b.classList.remove('ok','bad');
+  $('#buildSt').textContent='running…';$('#buildSt').className='st';
+  $('#buildLog').textContent='';
+  showBuild(true);
+  const r=await fetch('/api/build',{method:'POST'});
+  if(!r.ok){
+    const j=await r.json().catch(()=>({}));
+    b.classList.remove('busy');
+    $('#buildSt').textContent=j.error||'failed to start';$('#buildSt').className='st bad';
+    return;
+  }
+  clearInterval(buildPoll);
+  buildPoll=setInterval(pollBuild,700);
+}
+
+async function pollBuild(){
+  let j;
+  try{ j=await (await fetch('/api/status',{cache:'no-store'})).json(); }catch{return;}
+  if(j.running)return;
+  clearInterval(buildPoll);buildPoll=null;
+  const b=$('#btnBuild');b.classList.remove('busy');
+  b.classList.toggle('ok',!!j.ok);b.classList.toggle('bad',!j.ok);
+  $('#buildSt').textContent=j.ok?'succeeded':('failed (exit '+j.returncode+')');
+  $('#buildSt').className='st '+(j.ok?'ok':'bad');
+  const log=$('#buildLog');log.textContent='';
+  for(const line of (j.log||'').split('\n')){
+    const d=el('div',/error/i.test(line)?{class:'e'}:{},line);
+    log.append(d);
+  }
+  log.scrollTop=log.scrollHeight;
+  $('#btnPlay').disabled=!j.exeExists;
+  toast(j.ok?'build succeeded':'build failed — see panel',!j.ok);
+}
+
+async function doPlay(){
+  // Same reasoning as build: launching against stale files on disk looks like
+  // the edit did nothing.
+  if(dirty.mat||dirty.rx||dirty.tune){ if(!await serverSave())return; }
+  const r=await fetch('/api/play',{method:'POST'});
+  const j=await r.json().catch(()=>({ok:false}));
+  toast(j.ok?'launched sandvox':(j.error||'could not launch'),!j.ok);
+}
+
+$('#btnBuild').addEventListener('click',doBuild);
+$('#btnPlay').addEventListener('click',doPlay);
+$('#buildClose').addEventListener('click',()=>showBuild(false));
+
+(async()=>{
+  server=await detectServer();
+  if(!server)return;
+  for(const id of ['#runSep','#btnBuild','#btnPlay'])$(id).hidden=false;
+  // The picker is redundant once the server has told us where assets/ is.
+  $('#btnOpen').hidden=true;
+  $('#btnReload').disabled=false;
+  try{
+    const st=await (await fetch('/api/status',{cache:'no-store'})).json();
+    $('#btnPlay').disabled=!st.exeExists;
+  }catch{}
+  toast('connected — assets loaded automatically');
+})();
+
 function renderAll(){
+  // Tuning is independent of materials/reactions: it must render even when only
+  // tuning.json has been loaded.
+  if(activeTab==='tuning'){renderTuning();return;}
   if(!mat||!rx)return;
   if(activeTab==='overview')renderOverview();
   else if(activeTab==='materials')renderMaterials();
@@ -917,7 +1652,15 @@ function renderAll(){
 }
 $('#btnOpen').addEventListener('click',openFolder);
 $('#btnReload').addEventListener('click',async()=>{
-  if((dirty.mat||dirty.rx)&&!confirm('Discard unsaved changes and reload from disk?'))return;
+  if((dirty.mat||dirty.rx||dirty.tune)&&
+     !confirm('Discard unsaved changes and reload from disk?'))return;
+  if(server){
+    try{
+      applyServerFiles(await (await fetch('/api/files',{cache:'no-store'})).json());
+      toast('reloaded from disk');
+    }catch(e){toast('reload failed: '+e.message,true);}
+    return;
+  }
   await loadFromHandles();updatePills();toast('reloaded from disk');
 });
 $('#btnSave').addEventListener('click',saveAll);
@@ -931,6 +1674,8 @@ document.addEventListener('keydown',e=>{
 });
 $('#matFilter').addEventListener('input',renderMaterials);
 $('#rxFilter').addEventListener('input',renderReactions);
+$('#rxSort').addEventListener('change',renderReactions);
+$('#rxGroup').addEventListener('change',renderReactions);
 $('#ovFilter').addEventListener('input',renderOverview);
 $('#btnAddMat').addEventListener('click',()=>{
   let id='new_material',k=2;while(ids().includes(id))id='new_material'+k++;

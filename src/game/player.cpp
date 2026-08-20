@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "sim/tuning.h"
+
 namespace {
 
 // The CPU mirror is 3x3x3 chunks, so collision only works while the player's
@@ -87,13 +89,12 @@ float FlatDist2(const Vec3& from, const Vec3& to) {
 }  // namespace
 
 // Physical tuning, in meters (and m/s, m/s^2). Converted to voxel units below.
+// The values themselves live in assets/materials/tuning.json and are edited
+// with assets/tuner.html; these aliases keep the call sites below readable and
+// keep the rationale comments attached to the thing they explain. `T()` is
+// re-read every frame, so a tuning reload applies immediately.
 namespace {
-constexpr float kFlySpeedM = 13.75f, kFlySprintM = 32.5f;
-constexpr float kWalkSpeedM = 4.5f, kSprintSpeedM = 8.0f;
-constexpr float kGravityM = 9.81f;
-constexpr float kJumpSpeedM = 5.25f;
-constexpr float kSwimUpM = 17.5f, kSwimDownM = 7.5f;
-constexpr float kMaxFallM = 30.0f;
+inline const Tuning::Player& T() { return CurrentTuning().player; }
 
 // Step-up: walk over small ledges without jumping. Everything here is stated
 // as a physical height and converted, so the *feel* of the terrain is fixed by
@@ -103,13 +104,12 @@ constexpr float kMaxFallM = 30.0f;
 // Speed shed per METER climbed, not per voxel. Per-voxel was the bug at small
 // kVoxelMeters: a 20 cm curb is 2 voxels at 0.125 m but 4 at 0.05 m, so the
 // same real ledge cost 2x the speed purely from the resolution change.
-constexpr float kStepSpeedPenaltyPerM = 0.35f / 0.125f;  // was 0.35/voxel @12.5cm
-constexpr float kMinStepSpeedScale = 0.20f;  // climbing never fully stalls
+// -> tuning.json player.stepSpeedPenaltyPerM / player.minStepSpeedScale
 
 // Bumps at or below this height are "floor roughness", not ledges: they are
 // climbed with no speed penalty at all. This is what makes a noisily-placed
 // single-voxel-deep surface feel like smooth ground once voxels are small.
-constexpr float kSmoothBumpM = 0.12f;
+// -> tuning.json player.smoothBump
 
 // Upward speed above which we are unambiguously leaving the ground under our
 // own power, so ground-snapping and step-up must both stand down. Quake 3 says
@@ -117,15 +117,14 @@ constexpr float kSmoothBumpM = 0.12f;
 // NON_JUMP_VELOCITY. Without it the snap drags a jump back onto the bump it is
 // trying to leave — which is exactly why jumping while crossing rough ground
 // used to fail. Expressed in m/s so it is voxel-size independent.
-constexpr float kNonJumpSpeedM = 0.5f;
+// -> tuning.json player.nonJumpSpeed
 
 // Grace windows, seconds. Coyote time keeps a jump legal just after walking off
 // an edge; the buffer honours a jump pressed just before landing. Both exist
 // because on noisy ground the true airborne/grounded boundary is genuinely
 // ragged, and a player pressing jump "while running over gravel" is otherwise
 // at the mercy of which frame the press lands on.
-constexpr float kCoyoteTime = 0.12f;
-constexpr float kJumpBufferTime = 0.12f;
+// -> tuning.json player.coyoteTime / player.jumpBufferTime
 }  // namespace
 
 namespace {
@@ -230,10 +229,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // Timers run every frame regardless of mode so they never go stale in fly.
   if (coyoteTimer > 0.0f) coyoteTimer -= dt;
   if (jumpBuffer > 0.0f) jumpBuffer -= dt;
-  if (in.jumpPressed) jumpBuffer = kJumpBufferTime;
+  if (in.jumpPressed) jumpBuffer = T().jumpBufferTime;
 
   if (fly) {
-    float speed = (in.sprint ? kFlySprintM : kFlySpeedM) / kVoxelMeters;
+    float speed = (in.sprint ? T().flySprint : T().flySpeed) / kVoxelMeters;
     Vec3 wish = lookFwd * in.forward + right * in.strafe;
     if (in.up) wish += Vec3{0, 1, 0};
     if (in.down) wish += Vec3{0, -1, 0};
@@ -242,7 +241,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     grounded = false;
     coyoteTimer = 0.0f;
   } else {
-    const float nonJumpSpeed = kNonJumpSpeedM / kVoxelMeters;
+    const float nonJumpSpeed = T().nonJumpSpeed / kVoxelMeters;
 
     // ---- ground state, decided BEFORE the move (Source uses `oldground`) ----
     // Probe reach gets extended by the step height while we already believe we
@@ -253,36 +252,41 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     float reach = grounded ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
     float drop = rising ? -1.0f : GroundProbe(pos, reach, kindAt);
     bool onGround = drop >= 0.0f && !inLiquid;
-    if (onGround) coyoteTimer = kCoyoteTime;
+    if (onGround) coyoteTimer = T().coyoteTime;
 
-    const float gravity = kGravityM / kVoxelMeters;
-    float accel = inLiquid ? 0.25f : 1.0f;
+    const float gravity = T().gravity / kVoxelMeters;
+    float accel = inLiquid ? T().liquidGravityScale : 1.0f;
     vel.y -= gravity * accel * dt;
 
-    float speed = ((in.sprint ? kSprintSpeedM : kWalkSpeedM) / kVoxelMeters) *
-                  (inLiquid ? 0.55f : 1.0f);
+    float speed = ((in.sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
+                  (inLiquid ? T().liquidSpeedScale : 1.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
-    // snappy ground control, floatier air control
-    float blend = onGround ? 0.35f : (inLiquid ? 0.15f : 0.06f);
+    // Snappy ground control, floatier air control. Expressed as a per-SECOND
+    // rate and converted with 1-exp(-rate*dt): lerping by a bare constant every
+    // frame (what this used to do) made acceleration and water drag scale with
+    // frame rate, so the same input felt different at 30 and 144 FPS.
+    float rate = onGround ? T().groundAccel
+                          : (inLiquid ? T().liquidAccel : T().airAccel);
+    float blend = 1.0f - std::exp(-rate * dt);
     vel.x += (wish.x - vel.x) * blend;
     vel.z += (wish.z - vel.z) * blend;
 
     // ---- jump: buffered press + coyote window, both consumed on use ----
     bool jumped = false;
     if (inLiquid) {
-      vel.y *= 0.92f;  // drag
-      if (in.up) vel.y += (kSwimUpM / kVoxelMeters) * dt;  // swim
-      if (in.down) vel.y -= (kSwimDownM / kVoxelMeters) * dt;
+      vel.y *= std::exp(-T().liquidDrag * dt);  // drag (frame-rate independent)
+      if (in.up) vel.y += (T().swimUp / kVoxelMeters) * dt;  // swim
+      if (in.down) vel.y -= (T().swimDown / kVoxelMeters) * dt;
     } else if (jumpBuffer > 0.0f && coyoteTimer > 0.0f) {
-      vel.y = kJumpSpeedM / kVoxelMeters;
+      vel.y = T().jumpSpeed / kVoxelMeters;
       jumpBuffer = 0.0f;
       coyoteTimer = 0.0f;  // consume both, or one press pogos every frame
       onGround = false;    // no snapping or stepping on the frame we launch
       jumped = true;
     }
-    const float vmax = kMaxFallM / kVoxelMeters;
+    const float vmax = T().maxFall / kVoxelMeters;
     vel.y = std::clamp(vel.y, -vmax, vmax);
 
     // ---- vertical move ----
@@ -319,14 +323,14 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // reflects where we ended up, not where we started.
     grounded = !rising && !inLiquid &&
                GroundProbe(pos, 0.1f, kindAt) >= 0.0f;
-    if (grounded) coyoteTimer = kCoyoteTime;
+    if (grounded) coyoteTimer = T().coyoteTime;
 
     // Surface roughness is free; only real ledges cost speed. Without this
     // exemption, fine voxels turn every noisy floor into a constant drag.
     float climbedM = climbed * kVoxelMeters;
-    if (climbedM > kSmoothBumpM) {
-      float scale = std::max(kMinStepSpeedScale,
-                             1.0f - (climbedM - kSmoothBumpM) * kStepSpeedPenaltyPerM);
+    if (climbedM > T().smoothBump) {
+      float scale = std::max(T().minStepSpeedScale,
+                             1.0f - (climbedM - T().smoothBump) * T().stepSpeedPenaltyPerM);
       vel.x *= scale;
       vel.z *= scale;
     }
@@ -354,6 +358,6 @@ void Player::ApplyPush(Vec3 push, const KindFn& kindAt) {
     // even though the voxel ground probe can't see rigidbodies
     vel.y = 0.0f;
     grounded = true;
-    coyoteTimer = kCoyoteTime;
+    coyoteTimer = T().coyoteTime;
   }
 }

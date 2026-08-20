@@ -24,7 +24,7 @@ constexpr uint32_t kWorldN = 512;
 // (player size, speeds, gravity, fog/media densities) derives from it. Change
 // it here and here only — shaders pick it up automatically.
 // Note: at the same kWorldN, smaller voxels shrink the world's physical size.
-constexpr float kVoxelMeters = 0.125f;
+constexpr float kVoxelMeters = 0.10f;
 constexpr uint32_t kChunk = 16;
 constexpr uint32_t kNChunk = kWorldN / kChunk;          // 16
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 4096

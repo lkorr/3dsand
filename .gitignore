@@ -18,3 +18,9 @@ screenshot_ground.png
 screenshot_*.bmp
 screenshot_*.png
 .look/
+__pycache__/
+# tuner exe build outputs (PyInstaller)
+dist/
+sandvox_tuner.exe
+_exe.png
+scripts/_probe_app.py
