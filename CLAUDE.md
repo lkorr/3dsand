@@ -115,12 +115,18 @@ This concatenates `common.wgsl + <file>` exactly the way `LoadShader` does and r
 each through `tint --validate`. It runs automatically on WGSL edits via the
 PostToolUse hook in `.claude/settings.json`.
 
-Tuning by eye/ear is easiest through the served tuner — it finds `assets/`
-itself, and its Build/Play buttons run the two commands above:
+Tuning by eye/ear goes through the tuner, which finds `assets/` itself and
+whose **Build** / **Play** buttons run the two commands above:
 
 ```bash
-python scripts/tuner_server.py   # http://127.0.0.1:8777, opens a browser
+./sandvox_tuner.exe                   # desktop app (build it once, below)
+python scripts/tuner_server.py        # same UI in a browser, for devtools
+python scripts/build_tuner_exe.py     # (re)build sandvox_tuner.exe
 ```
+
+The exe must sit in the project root: it edits this checkout in place, so
+`assets/` and `build/` are deliberately NOT bundled into it. Building it needs
+`pip install pywebview pyinstaller` once; it is gitignored.
 
 ### Build gotchas (learned the hard way)
 
@@ -155,7 +161,8 @@ python scripts/tuner_server.py   # http://127.0.0.1:8777, opens a browser
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
 | `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
 | `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params |
-| `scripts/tuner_server.py` | serves the tuner with auto-load + Build/Play (`python scripts/tuner_server.py`) |
+| `scripts/tuner_app.py` + `tuner_server.py` | the tuner as a desktop app / local server: auto-loads assets, Build + Play buttons |
+| `scripts/build_tuner_exe.py` | packages the above into `sandvox_tuner.exe` |
 
 **Two invariants that have already cost debugging time — don't rediscover them:**
 

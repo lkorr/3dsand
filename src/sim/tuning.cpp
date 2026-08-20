@@ -6,6 +6,10 @@
 
 #include <nlohmann/json.hpp>
 
+// kDayPhaseMax / kDayPhaseMask — the day phase is defined alongside the other
+// world constants so the sim and the renderer share one definition.
+#include "sim/world.h"
+
 using nlohmann::json;
 
 namespace {
@@ -105,6 +109,63 @@ void EmitV3(std::ostringstream& o, const char* name, const float v[3]) {
 
 const Tuning& CurrentTuning() { return g_current; }
 void SetCurrentTuning(const Tuning& t) { g_current = t; }
+
+SkyState ComputeSkyState(const Tuning& t, uint32_t phase, uint32_t dayNumber) {
+  const auto& d = t.dayNight;
+  SkyState s{};
+  const float kPi = 3.14159265358979f;
+  const float deg = kPi / 180.0f;
+
+  // phase 0 = midnight, so the sun's hour angle is measured from straight
+  // down. At phase 0.25 (0x4000) it is on the eastern horizon, at 0.5 it is at
+  // peak elevation, at 0.75 on the western horizon.
+  float f = (float)(phase & kDayPhaseMask) / (float)kDayPhaseMax;
+  s.dayT = f;
+  float hour = (f - 0.5f) * 2.0f * kPi;   // -pi at midnight, 0 at noon
+
+  // Sun on a tilted great circle: elevation peaks at sunPeakElevation and the
+  // whole arc is rotated by sunAzimuth, which is what makes the sun rise in a
+  // consistent compass direction instead of straight overhead.
+  float peak = d.sunPeakElevation * deg;
+  float el = std::asin(std::sin(peak) * std::cos(hour));
+  // Azimuth sweeps east->west across the day.
+  float az = d.sunAzimuth * deg + std::atan2(std::sin(hour), std::cos(hour) * std::cos(peak));
+  s.sunDir[0] = std::cos(el) * std::sin(az);
+  s.sunDir[1] = std::sin(el);
+  s.sunDir[2] = std::cos(el) * std::cos(az);
+
+  // Daylight weight. Smoothstep over the twilight band around the horizon so
+  // the sky, ambient and key light all crossfade together rather than snapping
+  // at the geometric horizon. This is the RENDER-side daylight measure; the
+  // sim uses the integer daylightStrength() in common.wgsl, and they need only
+  // agree qualitatively (the sim's is the one that touches voxel state).
+  float w = d.twilightWidth > 0.0f ? d.twilightWidth : 0.22f;
+  float x = (s.sunDir[1] + w * 0.35f) / w;
+  x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+  s.sunUp = x * x * (3.0f - 2.0f * x);
+
+  // Moon: roughly opposite the sun, drifting by one lunar period so the phase
+  // cycles, and inclined so it does not simply retrace the sun's arc.
+  float lunar = (float)(dayNumber % (uint32_t)(d.lunarPeriodDays < 1 ? 1 : d.lunarPeriodDays)) /
+                (float)(d.lunarPeriodDays < 1 ? 1 : d.lunarPeriodDays);
+  s.moonPhase = lunar;
+  // Moon hour angle lags the sun by the phase fraction — that lag IS the
+  // phase, physically: a full moon is opposite the sun and rises at sunset.
+  float mhour = hour + kPi + lunar * 2.0f * kPi;
+  float minc = d.moonInclination * deg;
+  float mel = std::asin(std::sin(peak) * std::cos(mhour) * std::cos(minc) +
+                        std::sin(minc) * 0.35f);
+  float maz = d.sunAzimuth * deg +
+              std::atan2(std::sin(mhour), std::cos(mhour) * std::cos(peak));
+  s.moonDir[0] = std::cos(mel) * std::sin(maz);
+  s.moonDir[1] = std::sin(mel);
+  s.moonDir[2] = std::cos(mel) * std::cos(maz);
+
+  // Stars wheel with the day, plus the accumulated whole days so the sky does
+  // not reset every dawn.
+  s.starRot = (f + (float)dayNumber) * 2.0f * kPi * d.starRotSpeed;
+  return s;
+}
 
 bool LoadTuning(const std::string& path, Tuning& out) {
   std::ifstream f(path);
@@ -259,6 +320,38 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     clampMille("ejectGas", s.ejectGas);
   }
 
+  if (const json* g = Find(j, "dayNight")) {
+    auto& d = out.dayNight;
+    const std::string at = "dayNight";
+    ReadI(*g, "cycleMinutes", d.cycleMinutes, out, at);
+    ReadI(*g, "freeze", d.freeze, out, at);
+    ReadI(*g, "freezePhase", d.freezePhase, out, at);
+    ReadF(*g, "sunPeakElevation", d.sunPeakElevation, out, at);
+    ReadF(*g, "sunAzimuth", d.sunAzimuth, out, at);
+    ReadF(*g, "twilightWidth", d.twilightWidth, out, at);
+    ReadI(*g, "lunarPeriodDays", d.lunarPeriodDays, out, at);
+    ReadF(*g, "moonInclination", d.moonInclination, out, at);
+    ReadF(*g, "starRotSpeed", d.starRotSpeed, out, at);
+    // A zero-length day divides by zero in DayPhaseForTick and would freeze
+    // the cycle at midnight; a negative one is meaningless.
+    if (d.cycleMinutes < 1) {
+      out.warnings.push_back("dayNight.cycleMinutes < 1; clamped to 1");
+      d.cycleMinutes = 1;
+    }
+    if (d.lunarPeriodDays < 1) {
+      out.warnings.push_back("dayNight.lunarPeriodDays < 1; clamped to 1");
+      d.lunarPeriodDays = 1;
+    }
+    if (d.freezePhase < 0 || d.freezePhase > 65535) {
+      out.warnings.push_back("dayNight.freezePhase outside 0..65535; wrapped");
+      d.freezePhase = ((d.freezePhase % 65536) + 65536) % 65536;
+    }
+    if (d.twilightWidth <= 0.0f) {
+      out.warnings.push_back("dayNight.twilightWidth must be > 0; reset to 0.22");
+      d.twilightWidth = 0.22f;
+    }
+  }
+
   if (const json* g = Find(j, "render")) {
     auto& r = out.render;
     const std::string at = "render";
@@ -274,6 +367,41 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadV3(*g, "sunDir", r.sunDir, out, at);
     ReadV3(*g, "sunColor", r.sunColor, out, at);
     ReadF(*g, "sunIntensity", r.sunIntensity, out, at);
+    // atmospheric sky
+    ReadF(*g, "skyRayleigh", r.skyRayleigh, out, at);
+    ReadF(*g, "skyMie", r.skyMie, out, at);
+    ReadF(*g, "skyMieG", r.skyMieG, out, at);
+    ReadF(*g, "skyMieStrength", r.skyMieStrength, out, at);
+    ReadF(*g, "skyExposure", r.skyExposure, out, at);
+    ReadV3(*g, "skyGround", r.skyGround, out, at);
+    ReadF(*g, "sunSize", r.sunSize, out, at);
+    // night sky
+    ReadV3(*g, "nightZenith", r.nightZenith, out, at);
+    ReadV3(*g, "nightHorizon", r.nightHorizon, out, at);
+    ReadF(*g, "starBrightness", r.starBrightness, out, at);
+    ReadF(*g, "starDensity", r.starDensity, out, at);
+    ReadF(*g, "starSize", r.starSize, out, at);
+    ReadF(*g, "starTwinkle", r.starTwinkle, out, at);
+    ReadF(*g, "milkyWayStrength", r.milkyWayStrength, out, at);
+    ReadV3(*g, "milkyWayColor", r.milkyWayColor, out, at);
+    ReadF(*g, "nebulaStrength", r.nebulaStrength, out, at);
+    ReadV3(*g, "nebulaCool", r.nebulaCool, out, at);
+    ReadV3(*g, "nebulaWarm", r.nebulaWarm, out, at);
+    ReadF(*g, "auroraStrength", r.auroraStrength, out, at);
+    ReadF(*g, "auroraHeight", r.auroraHeight, out, at);
+    ReadV3(*g, "auroraLow", r.auroraLow, out, at);
+    ReadV3(*g, "auroraHigh", r.auroraHigh, out, at);
+    // moon
+    ReadF(*g, "moonRadius", r.moonRadius, out, at);
+    ReadF(*g, "moonBrightness", r.moonBrightness, out, at);
+    ReadV3(*g, "moonColor", r.moonColor, out, at);
+    ReadF(*g, "moonGlow", r.moonGlow, out, at);
+    ReadF(*g, "moonEarthshine", r.moonEarthshine, out, at);
+    ReadV3(*g, "moonLightColor", r.moonLightColor, out, at);
+    ReadF(*g, "moonLightIntensity", r.moonLightIntensity, out, at);
+    // night ambient
+    ReadV3(*g, "nightAmbSky", r.nightAmbSky, out, at);
+    ReadV3(*g, "nightAmbGround", r.nightAmbGround, out, at);
     ReadF(*g, "fogOpticalDepths", r.fogOpticalDepths, out, at);
     ReadF(*g, "fogLerpPerFrame", r.fogLerpPerFrame, out, at);
     ReadV3(*g, "ambSky", r.ambSky, out, at);
@@ -350,6 +478,33 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("render.gamma must be > 0; reset to 2.2");
       r.gamma = 2.2f;
     }
+    // starSize divides in the star PSF, starDensity scales the direction grid,
+    // moonRadius divides when building the lunar disc frame, and skyMieG at
+    // exactly +-1 makes the Henyey-Greenstein denominator collapse.
+    if (r.starSize <= 0.0f) {
+      out.warnings.push_back("render.starSize must be > 0; reset to 0.0055");
+      r.starSize = 0.0055f;
+    }
+    if (r.starDensity < 1.0f) {
+      out.warnings.push_back("render.starDensity < 1; clamped to 1");
+      r.starDensity = 1.0f;
+    }
+    if (r.moonRadius <= 0.0f) {
+      out.warnings.push_back("render.moonRadius must be > 0; reset to 0.03");
+      r.moonRadius = 0.03f;
+    }
+    if (r.skyMieG <= -0.99f || r.skyMieG >= 0.99f) {
+      out.warnings.push_back("render.skyMieG must be within (-0.99, 0.99); clamped");
+      r.skyMieG = r.skyMieG < 0.0f ? -0.99f : 0.99f;
+    }
+    if (r.auroraHeight <= 0.0f) {
+      out.warnings.push_back("render.auroraHeight must be > 0; reset to 900");
+      r.auroraHeight = 900.0f;
+    }
+    if (r.sunSize <= 0.0f) {
+      out.warnings.push_back("render.sunSize must be > 0; reset to 1.0");
+      r.sunSize = 1.0f;
+    }
     if (r.primarySteps < 1) { r.primarySteps = 1; }
     if (r.shadowSteps < 0) { r.shadowSteps = 0; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
@@ -424,6 +579,45 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitF(o, "TUNE_SUN_HALO_GAIN", r.sunHaloGain);
   EmitV3(o, "TUNE_SUN_COLOR", r.sunColor);
   EmitF(o, "TUNE_SUN_INTENSITY", r.sunIntensity);
+
+  // ---- atmospheric sky ----
+  EmitF(o, "TUNE_SKY_RAYLEIGH", r.skyRayleigh);
+  EmitF(o, "TUNE_SKY_MIE", r.skyMie);
+  EmitF(o, "TUNE_SKY_MIE_G", r.skyMieG);
+  EmitF(o, "TUNE_SKY_MIE_STRENGTH", r.skyMieStrength);
+  EmitF(o, "TUNE_SKY_EXPOSURE", r.skyExposure);
+  EmitV3(o, "TUNE_SKY_GROUND", r.skyGround);
+  EmitF(o, "TUNE_SUN_SIZE", r.sunSize);
+
+  // ---- night sky ----
+  EmitV3(o, "TUNE_NIGHT_ZENITH", r.nightZenith);
+  EmitV3(o, "TUNE_NIGHT_HORIZON", r.nightHorizon);
+  EmitF(o, "TUNE_STAR_BRIGHTNESS", r.starBrightness);
+  EmitF(o, "TUNE_STAR_DENSITY", r.starDensity);
+  EmitF(o, "TUNE_STAR_SIZE", r.starSize);
+  EmitF(o, "TUNE_STAR_TWINKLE", r.starTwinkle);
+  EmitF(o, "TUNE_MILKYWAY_STRENGTH", r.milkyWayStrength);
+  EmitV3(o, "TUNE_MILKYWAY_COLOR", r.milkyWayColor);
+  EmitF(o, "TUNE_NEBULA_STRENGTH", r.nebulaStrength);
+  EmitV3(o, "TUNE_NEBULA_COOL", r.nebulaCool);
+  EmitV3(o, "TUNE_NEBULA_WARM", r.nebulaWarm);
+  EmitF(o, "TUNE_AURORA_STRENGTH", r.auroraStrength);
+  EmitF(o, "TUNE_AURORA_HEIGHT", r.auroraHeight);
+  EmitV3(o, "TUNE_AURORA_LOW", r.auroraLow);
+  EmitV3(o, "TUNE_AURORA_HIGH", r.auroraHigh);
+
+  // ---- moon ----
+  EmitF(o, "TUNE_MOON_RADIUS", r.moonRadius);
+  EmitF(o, "TUNE_MOON_BRIGHTNESS", r.moonBrightness);
+  EmitV3(o, "TUNE_MOON_COLOR", r.moonColor);
+  EmitF(o, "TUNE_MOON_GLOW", r.moonGlow);
+  EmitF(o, "TUNE_MOON_EARTHSHINE", r.moonEarthshine);
+  EmitV3(o, "TUNE_MOON_LIGHT_COLOR", r.moonLightColor);
+  EmitF(o, "TUNE_MOON_LIGHT_INTENSITY", r.moonLightIntensity);
+
+  // ---- night ambient ----
+  EmitV3(o, "TUNE_NIGHT_AMB_SKY", r.nightAmbSky);
+  EmitV3(o, "TUNE_NIGHT_AMB_GROUND", r.nightAmbGround);
 
   // ---- ambient / diffuse ----
   EmitV3(o, "TUNE_AMB_SKY", r.ambSky);

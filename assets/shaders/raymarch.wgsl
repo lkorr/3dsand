@@ -39,13 +39,407 @@ fn paletteColor(m : Material, state : u32) -> vec3f {
   }
 }
 
-fn skyColor(rd : vec3f) -> vec3f {
-  let t = clamp(rd.y * TUNE_SKY_GRADIENT + TUNE_SKY_HORIZON_OFFSET, 0.0, 1.0);
-  var c = mix(TUNE_SKY_HORIZON, TUNE_SKY_ZENITH, t);
-  let s = max(dot(rd, R.sunDir), 0.0);
-  c += TUNE_SUN_TINT * (pow(s, TUNE_SUN_DISC_POWER) * TUNE_SUN_DISC_GAIN
-                      + pow(s, TUNE_SUN_HALO_POWER) * TUNE_SUN_HALO_GAIN);
+// ============================================================================
+// SKY — day/night, sun, moon, stars, aurora
+// ============================================================================
+// Replaces the old two-colour lerp + pow() sun blob. That version had one
+// fundamental problem: the sun disc was a `pow(dot, 800)` lobe ADDED to a flat
+// gradient, which is a smear, not a light source. A real sun reads as lit
+// because of three things the smear had none of:
+//
+//   1. A HARD-EDGED disc. The sun subtends ~0.53 degrees and its limb is
+//      sharp — the eye reads the crisp edge as "object", and a soft power lobe
+//      as "glow". We build the disc from the true angular radius with a
+//      pixel-width antialiased edge, then add limb darkening across it.
+//   2. Scattering that RESPONDS to it. The sky near the sun brightens because
+//      air scatters forward (Mie); the sky opposite stays blue because
+//      molecular scattering is wavelength-dependent (Rayleigh). Driving both
+//      off the same sun vector is what couples sun and sky into one image.
+//   3. An atmosphere that THICKENS toward the horizon. Air mass along the view
+//      ray grows as the ray flattens, which is why the horizon is pale and the
+//      zenith is deep — and why a low sun turns red (its own light crosses far
+//      more air, and blue is scattered out of it first).
+//
+// All of this is render-only float math (CLAUDE.md rule 1 allows floats here);
+// the SIM's notion of day phase is the separate integer path in common.wgsl.
+
+// Angular radius of the solar/lunar disc, radians. Both are ~0.5 deg from
+// Earth, which is the coincidence that makes eclipses work; keeping them equal
+// is both physically right and visually useful.
+const SUN_ANGULAR_RADIUS : f32 = 0.00465;
+
+// Rayleigh scattering is proportional to 1/lambda^4, which is where the sky's
+// blue and the sunset's red BOTH come from. These are the relative
+// coefficients at 680/550/440 nm, normalized — the ratio is the whole look, so
+// they are derived rather than art-directed.
+const RAYLEIGH_RGB : vec3f = vec3f(0.1440, 0.3125, 0.7940);
+
+// Approximate air mass along a view ray leaving the ground at elevation
+// sin(theta) = y. The naive 1/y diverges at the horizon; this is the standard
+// Kasten-Young-style fit, finite at y = 0 and correct overhead.
+fn airMass(y : f32) -> f32 {
+  let c = max(y, -0.02);
+  return 1.0 / (c + 0.15 * pow(max(c + 0.093, 1e-3), -1.253));
+}
+
+// Rayleigh phase: gently forward/backward peaked, symmetric.
+fn phaseRayleigh(mu : f32) -> f32 { return 0.75 * (1.0 + mu * mu); }
+
+// Henyey-Greenstein: the forward-scattering lobe that puts the bright halo
+// around the sun and the glow along the horizon. g near 0.76 is typical haze.
+fn phaseMie(mu : f32, g : f32) -> f32 {
+  let g2 = g * g;
+  let d = 1.0 + g2 - 2.0 * g * mu;
+  return (1.0 - g2) / (4.0 * 3.14159265 * max(d * sqrt(max(d, 1e-4)), 1e-4));
+}
+
+// Colour of direct sunlight after crossing `mass` air masses. Blue is removed
+// first (Rayleigh again), so the disc and everything it lights goes amber then
+// red as it sets. This is ONE function driving the disc, the direct lighting
+// term and the horizon glow, so they cannot disagree.
+fn sunTransmittance(mass : f32) -> vec3f {
+  return exp(-RAYLEIGH_RGB * TUNE_SKY_RAYLEIGH * mass * 0.25);
+}
+
+// ---- starfield ----------------------------------------------------------
+// Stars are point sources: the honest way to draw them is to find the nearest
+// cell centre in a hashed direction grid and measure angular distance to it,
+// which gives round stars of controllable size that do NOT swim or alias as
+// the camera turns (the classic `step(0.99, hash(dir))` starfield sparkles
+// horribly under rotation because it samples a volume, not a point).
+fn starField(dir : vec3f) -> vec3f {
+  // Wheel the sky about the celestial pole. A tilted axis (not straight up)
+  // means stars rise and set at an angle, which is most of what makes a night
+  // sky read as a rotating dome rather than a static texture.
+  let ca = cos(R.starRot);
+  let sa = sin(R.starRot);
+  let axis = normalize(vec3f(0.28, 0.92, 0.0));
+  // Rodrigues rotation about `axis`.
+  let d = dir * ca + cross(axis, dir) * sa + axis * dot(axis, dir) * (1.0 - ca);
+
+  var acc = vec3f(0.0);
+  // Two layers at different densities: a sparse layer of bright named-star
+  // sized points, and a dense faint layer that reads as depth.
+  for (var layer = 0u; layer < 2u; layer++) {
+    let scale = select(TUNE_STAR_DENSITY, TUNE_STAR_DENSITY * 2.3, layer == 1u);
+    let p = d * scale;
+    let cell = floor(p);
+    // Only the containing cell matters: star jitter is kept under half a cell
+    // so a star never leaves its own cell and neighbours cannot contribute.
+    let h = pcg(u32((i32(cell.x) * 73856093) ^ (i32(cell.y) * 19349663) ^
+                    (i32(cell.z) * 83492791)) ^ (layer * 0x9E3779B9u));
+    let hf = vec3f(f32(h & 0x3FFu), f32((h >> 10u) & 0x3FFu),
+                   f32((h >> 20u) & 0x3FFu)) / 1023.0;
+    // Density gate: only a fraction of cells hold a star at all.
+    let occupancyRoll = f32((h >> 6u) & 0xFFu) / 255.0;
+    let thresh = select(0.055, 0.16, layer == 1u);
+    if (occupancyRoll > thresh) { continue; }
+    // Star centre, jittered within the cell, projected back to the sphere.
+    let centre = normalize(cell + 0.5 + (hf - 0.5) * 0.8);
+    let cosAng = clamp(dot(normalize(d), centre), -1.0, 1.0);
+    // Angular distance, small-angle. Size varies per star (magnitude).
+    let ang = acos(cosAng);
+    let mag = f32((h >> 18u) & 0xFFu) / 255.0;
+    let size = TUNE_STAR_SIZE * (0.35 + mag * mag * 1.65) *
+               select(1.0, 0.55, layer == 1u);
+    if (ang > size * 3.0) { continue; }
+    // Gaussian-ish core so bright stars have a small halo, like a real PSF.
+    var b = exp(-(ang * ang) / max(size * size * 0.35, 1e-9));
+    // Twinkle: scintillation is atmospheric, so it is strongest near the
+    // horizon where the air mass is greatest. Phase is per-star.
+    let tw = sin(R.time * (1.7 + mag * 4.3) + f32(h & 0xFFFFu) * 0.001);
+    let horizonBoost = 1.0 + 2.5 * (1.0 - clamp(d.y, 0.0, 1.0));
+    b *= 1.0 + TUNE_STAR_TWINKLE * horizonBoost * tw;
+    // Colour by stellar temperature: hot blue-white through cool orange.
+    let temp = f32((h >> 26u) & 0x3Fu) / 63.0;
+    let col = mix(vec3f(1.0, 0.72, 0.52), vec3f(0.72, 0.82, 1.0), temp);
+    acc += col * max(b, 0.0) * (0.45 + mag * 1.4) *
+           select(1.0, 0.45, layer == 1u);
+  }
+  return acc * TUNE_STAR_BRIGHTNESS;
+}
+
+// ---- value noise / fbm on the sphere, for nebulae and aurora ----
+fn hash3f(p : vec3f) -> f32 {
+  let q = floor(p);
+  let h = pcg(u32((i32(q.x) * 374761393) ^ (i32(q.y) * 668265263) ^
+                  (i32(q.z) * 1274126177)));
+  return f32(h & 0xFFFFFFu) / 16777215.0;
+}
+fn vnoise(p : vec3f) -> f32 {
+  let i = floor(p);
+  let f = p - i;
+  let u = f * f * (3.0 - 2.0 * f);
+  let c000 = hash3f(i + vec3f(0.0, 0.0, 0.0));
+  let c100 = hash3f(i + vec3f(1.0, 0.0, 0.0));
+  let c010 = hash3f(i + vec3f(0.0, 1.0, 0.0));
+  let c110 = hash3f(i + vec3f(1.0, 1.0, 0.0));
+  let c001 = hash3f(i + vec3f(0.0, 0.0, 1.0));
+  let c101 = hash3f(i + vec3f(1.0, 0.0, 1.0));
+  let c011 = hash3f(i + vec3f(0.0, 1.0, 1.0));
+  let c111 = hash3f(i + vec3f(1.0, 1.0, 1.0));
+  let x00 = mix(c000, c100, u.x);
+  let x10 = mix(c010, c110, u.x);
+  let x01 = mix(c001, c101, u.x);
+  let x11 = mix(c011, c111, u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+fn fbm(p : vec3f, octaves : u32) -> f32 {
+  var a = 0.5;
+  var f = 1.0;
+  var s = 0.0;
+  for (var i = 0u; i < octaves; i++) {
+    s += a * vnoise(p * f);
+    f *= 2.02;
+    a *= 0.5;
+  }
+  return s;
+}
+
+// ---- the Shivering Isles night ------------------------------------------
+// The reference look is not "dark blue with dots": it is a sky with STRUCTURE
+// — a bright galactic band, coloured nebulae, and slow curtains of aurora that
+// give the dome motion. Built in three layers so each is separately tunable
+// and any of them can be turned off.
+fn nightSky(rd : vec3f) -> vec3f {
+  // Base gradient: deep indigo overhead easing to a warmer, lighter horizon
+  // (airglow plus whatever light pollution the world implies).
+  let up = clamp(rd.y, 0.0, 1.0);
+  var c = mix(TUNE_NIGHT_HORIZON, TUNE_NIGHT_ZENITH, pow(up, 0.65));
+
+  // Galactic band: a great circle tilted off the horizon, thickened with fbm
+  // so its edges are ragged rather than a clean stripe.
+  let ca = cos(R.starRot);
+  let sa = sin(R.starRot);
+  let axis = normalize(vec3f(0.28, 0.92, 0.0));
+  let d = rd * ca + cross(axis, rd) * sa + axis * dot(axis, rd) * (1.0 - ca);
+  let galNormal = normalize(vec3f(0.36, 0.52, -0.77));
+  let bandDist = abs(dot(normalize(d), galNormal));
+  let bandWidth = 0.17 + 0.10 * fbm(d * 3.1, 3u);
+  let band = 1.0 - smoothstep(0.0, bandWidth, bandDist);
+  // Dust lanes: dark filaments cutting through the band, which is what makes
+  // it read as a galaxy rather than a painted smear.
+  let dust = fbm(d * 7.5 + vec3f(11.0, 3.0, 7.0), 4u);
+  let bandBody = band * band * (0.55 + 0.75 * fbm(d * 4.5, 4u));
+  c += TUNE_MILKYWAY_COLOR * bandBody * TUNE_MILKYWAY_STRENGTH *
+       smoothstep(0.62, 0.28, dust);
+
+  // Nebulae: two tinted fbm masses, one cool one warm, confined mostly to the
+  // band so they read as part of the galaxy.
+  let n1 = fbm(d * 2.2 + vec3f(31.0, 17.0, 5.0), 5u);
+  let n2 = fbm(d * 1.7 + vec3f(-9.0, 23.0, 41.0), 5u);
+  let nebMask = 0.35 + 0.65 * band;
+  c += TUNE_NEBULA_COOL * smoothstep(0.52, 0.86, n1) * nebMask *
+       TUNE_NEBULA_STRENGTH;
+  c += TUNE_NEBULA_WARM * smoothstep(0.58, 0.92, n2) * nebMask *
+       TUNE_NEBULA_STRENGTH * 0.8;
+
+  // Stars over the top of the nebulae, so bright stars sit in front.
+  c += starField(rd);
+
+  // Aurora: vertical curtains that ripple. Modelled as a height-banded noise
+  // field in the horizontal plane, faded in above the horizon and out toward
+  // the zenith, with the classic green base / magenta tip gradient.
+  if (TUNE_AURORA_STRENGTH > 0.0 && rd.y > 0.0) {
+    // Project onto a plane well above the camera: curtains converge toward a
+    // vanishing region the way real aurora do near magnetic north.
+    let t = TUNE_AURORA_HEIGHT / max(rd.y, 0.06);
+    let pp = vec3f(rd.x, 0.0, rd.z) * t;
+    // Two scrolling noise fields multiplied: the product is thin and filament-
+    // like where a single field would be blobby.
+    let a1 = fbm(vec3f(pp.x * 0.010, R.time * 0.021, pp.z * 0.010) * 3.0, 4u);
+    let a2 = fbm(vec3f(pp.x * 0.021 + 5.0, R.time * 0.013,
+                       pp.z * 0.021 - 3.0) * 3.0, 3u);
+    var curtain = smoothstep(0.48, 0.86, a1) * smoothstep(0.35, 0.80, a2);
+    // Fade in just off the horizon, out before the zenith.
+    curtain *= smoothstep(0.02, 0.22, rd.y) * (1.0 - smoothstep(0.35, 0.85, rd.y));
+    // Vertical colour ramp along the curtain: green low, magenta at the tips.
+    let ramp = clamp(rd.y * 2.6, 0.0, 1.0);
+    let auroraCol = mix(TUNE_AURORA_LOW, TUNE_AURORA_HIGH, ramp * ramp);
+    c += auroraCol * curtain * TUNE_AURORA_STRENGTH;
+  }
+
   return c;
+}
+
+// ---- the moon -------------------------------------------------------------
+// A real disc with a terminator, maria, and a soft glow. The phase is driven
+// from R.moonPhase so it waxes and wanes across in-game days.
+fn moonLayer(rd : vec3f) -> vec3f {
+  let cosAng = dot(rd, R.moonDir);
+  if (cosAng < 0.9) {
+    // Far from the disc: only the broad glow, which is cheap.
+    let glow = pow(max(cosAng, 0.0), 220.0) * TUNE_MOON_GLOW;
+    return TUNE_MOON_COLOR * glow;
+  }
+  let ang = acos(clamp(cosAng, -1.0, 1.0));
+  let r = TUNE_MOON_RADIUS;
+  var c = vec3f(0.0);
+
+  // Broad halo around the disc.
+  c += TUNE_MOON_COLOR * pow(max(cosAng, 0.0), 220.0) * TUNE_MOON_GLOW;
+
+  if (ang < r * 1.6) {
+    // Build a local frame on the disc so we can texture it and cut the phase.
+    var upv = vec3f(0.0, 1.0, 0.0);
+    if (abs(R.moonDir.y) > 0.95) { upv = vec3f(1.0, 0.0, 0.0); }
+    let mx = normalize(cross(upv, R.moonDir));
+    let my = cross(R.moonDir, mx);
+    // Offset of this ray from disc centre, in disc radii.
+    let off = vec2f(dot(rd, mx), dot(rd, my)) / r;
+    let rr = length(off);
+    if (rr < 1.25) {
+      // Antialias the limb against one pixel of angular size.
+      let px = max(R.tanHalfFov * 2.0 / max(R.viewPx, 1.0), 1e-6) / r;
+      let disc = 1.0 - smoothstep(1.0 - px * 1.5, 1.0 + px * 1.5, rr);
+      // Surface: hemisphere normal, so maria and the terminator wrap.
+      let z = sqrt(max(1.0 - rr * rr, 0.0));
+      let nrm = normalize(mx * off.x + my * off.y + R.moonDir * z);
+      // Maria: large dark basalt patches plus fine cratering.
+      let maria = fbm(nrm * 3.4 + vec3f(4.0, 1.0, 9.0), 4u);
+      let craters = fbm(nrm * 15.0, 3u);
+      var albedo = mix(0.55, 1.0, smoothstep(0.38, 0.72, maria));
+      albedo *= 0.86 + 0.14 * craters;
+      // PHASE: the terminator is the shadow of the moon's own sphere. Build
+      // the illumination direction from moonPhase (0 = new, 0.5 = full) and
+      // light the hemisphere with it. Real lunar photometry is famously flat
+      // (retroreflective regolith), so use a very wrapped diffuse rather than
+      // Lambert or the disc looks like a shaded billiard ball.
+      let pa = (R.moonPhase - 0.5) * 6.2831853;
+      let lightDir = normalize(mx * sin(pa) + R.moonDir * cos(pa) * -1.0 +
+                               my * 0.06);
+      let ndl = dot(nrm, lightDir);
+      let lit = smoothstep(-0.09, 0.09, ndl);
+      // Earthshine: the dark limb is faintly visible, lit by planetshine.
+      let earthshine = TUNE_MOON_EARTHSHINE * (1.0 - lit);
+      c += TUNE_MOON_COLOR * disc * albedo *
+           (lit * TUNE_MOON_BRIGHTNESS + earthshine);
+    }
+  }
+  return c;
+}
+
+// ---- the day sky ---------------------------------------------------------
+fn daySky(rd : vec3f) -> vec3f {
+  let mu = dot(rd, R.sunDir);
+  let viewMass = airMass(rd.y);
+  let sunMass = airMass(R.sunDir.y);
+
+  // Direct sunlight colour after its own trip through the atmosphere. Drives
+  // the disc, the halo and the horizon warmth together.
+  let sunLight = sunTransmittance(sunMass) * TUNE_SUN_INTENSITY;
+
+  // Rayleigh in-scatter: how much blue this view ray picks up. Scales with the
+  // air mass along the ray, which is what makes the horizon pale and the
+  // zenith deep. The (1 - exp(-tau)) form saturates instead of growing without
+  // bound at the horizon.
+  let tauR = RAYLEIGH_RGB * TUNE_SKY_RAYLEIGH * viewMass * 0.25;
+  let inscatterR = (1.0 - exp(-tauR)) * phaseRayleigh(mu);
+
+  // Mie in-scatter: white-ish forward haze that concentrates around the sun.
+  let tauM = TUNE_SKY_MIE * viewMass * 0.03;
+  let inscatterM = vec3f(1.0 - exp(-tauM)) * phaseMie(mu, TUNE_SKY_MIE_G) *
+                   12.0 * TUNE_SKY_MIE_STRENGTH;
+
+  // The sky is lit by the sun, so both terms are modulated by sunlight colour
+  // and by how high the sun is. As the sun drops, sunLight reddens and the
+  // whole dome follows it — that single coupling is the sunset.
+  var c = (inscatterR + inscatterM) * sunLight * TUNE_SKY_EXPOSURE;
+
+  // Ground bounce near and below the horizon, so the dome does not simply go
+  // black under the camera when looking down at distant fog.
+  let below = smoothstep(0.06, -0.20, rd.y);
+  c = mix(c, TUNE_SKY_GROUND * (0.25 + 0.75 * max(R.sunDir.y, 0.0)), below * 0.75);
+
+  return c;
+}
+
+// ---- the sun disc --------------------------------------------------------
+// Kept separate from daySky so reflections and fog can take the sky WITHOUT
+// the disc — a mirrored sun in every ripple is the classic giveaway.
+fn sunDisc(rd : vec3f) -> vec3f {
+  let cosAng = dot(rd, R.sunDir);
+  if (cosAng < 0.999) { return vec3f(0.0); }
+  let ang = acos(clamp(cosAng, -1.0, 1.0));
+  let r = SUN_ANGULAR_RADIUS * TUNE_SUN_SIZE;
+  // Antialias against one pixel's angular size so the limb is crisp at any
+  // resolution but never stair-steps.
+  let px = max(R.tanHalfFov * 2.0 / max(R.viewPx, 1.0), 1e-6);
+  let disc = 1.0 - smoothstep(r - px, r + px, ang);
+  if (disc <= 0.0) { return vec3f(0.0); }
+  // Limb darkening: the sun is a ball of gas, so the edge is dimmer and redder
+  // than the centre because we see less deep (hotter) plasma there. This is
+  // the detail that makes the disc read as a SPHERE rather than a white
+  // sticker, and it costs one sqrt.
+  let x = clamp(ang / r, 0.0, 1.0);
+  let mu2 = sqrt(max(1.0 - x * x, 0.0));
+  // Eddington-style limb law, per channel: red darkens least, blue most.
+  let limb = vec3f(0.34 + 0.66 * pow(mu2, 0.52),
+                   0.28 + 0.72 * pow(mu2, 0.62),
+                   0.22 + 0.78 * pow(mu2, 0.74));
+  let sunMass = airMass(R.sunDir.y);
+  return sunTransmittance(sunMass) * limb * disc * TUNE_SUN_DISC_GAIN * 40.0;
+}
+
+// Full sky including celestial bodies. `withBodies` is false for reflection
+// and fog lookups, which want the dome but not a second sun.
+fn skyDome(rdIn : vec3f, withBodies : bool) -> vec3f {
+  let rd = normalize(rdIn);
+  // Daylight weight: crossfade the whole night sky out as the sun rises. Uses
+  // the CPU-smoothed sunUp rather than sunDir.y directly so the transition is
+  // shaped by the tuner rather than by raw geometry.
+  let dayW = R.sunUp;
+
+  var c = daySky(rd) * dayW;
+
+  if (dayW < 0.999) {
+    var night = nightSky(rd);
+    if (withBodies) { night += moonLayer(rd); }
+    // Stars and nebulae fade under daylight rather than popping off.
+    c += night * (1.0 - dayW);
+  }
+
+  if (withBodies && dayW > 0.001) {
+    c += sunDisc(rd) * dayW;
+  }
+  return max(c, vec3f(0.0));
+}
+
+// The renderer's general "what colour is the sky here" entry point, used by
+// the background, the fog target and ambient. Includes the sun/moon.
+fn skyColor(rd : vec3f) -> vec3f { return skyDome(rd, true); }
+// Body-free variant for reflections and aerial perspective.
+fn skyColorNoBodies(rd : vec3f) -> vec3f { return skyDome(rd, false); }
+
+// ---- direct light: sun by day, moon by night --------------------------------
+// One function so every shading path (near field, far field, reflections,
+// water) agrees on what "the key light" is at this moment. Returns the light
+// colour x intensity; callers multiply by their own N.L / shadow terms.
+// Declared here, immediately after the sky, because everything below shades
+// against it — WGSL requires definition before use.
+fn keyLightColor() -> vec3f {
+  // Sunlight reddens as it sets because its own path through the atmosphere
+  // grows — the same sunTransmittance() the disc and the sky use, so a red sun
+  // always lights the world red.
+  let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
+               TUNE_SUN_INTENSITY;
+  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
+  // Moonlight is sunlight bounced off a dark grey rock: same spectrum, ~400k
+  // times dimmer, and the eye reads it as blue because of the Purkinje shift
+  // at scotopic levels. The blue tint is therefore a perceptual choice, and
+  // lives in TUNE_MOON_LIGHT_COLOR.
+  let moonCol = TUNE_MOON_LIGHT_COLOR * TUNE_MOON_LIGHT_INTENSITY * moonUp *
+                (0.15 + 1.70 * R.moonPhase * R.moonPhase);
+  return mix(moonCol, sunCol, R.sunUp);
+}
+
+// Direction of the key light — the sun by day, the moon by night. Shadows are
+// cast from whichever is dominant, so moonlit shadows point the right way.
+// A hard switch at sunUp = 0.5 rather than a blend: a lerp between two
+// directions would swing the shadow direction wildly through twilight, and at
+// the crossover both lights are dim enough that the swap is invisible.
+fn keyLightDir() -> vec3f {
+  return normalize(mix(R.moonDir, R.sunDir, step(0.5, R.sunUp)));
 }
 
 // Per-meter absorption scale applied to material opacity — trace() (media
@@ -499,7 +893,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 // cross-level shadow reach buys nothing visible through fog at that range.
 // Render-only float math on render-only data (CLAUDE.md rule 1 scopes to sim).
 fn farShadowed(level : u32, roFine : vec3f) -> bool {
-  var rd = R.sunDir;
+  var rd = keyLightDir();
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
   if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
   if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
@@ -600,7 +994,16 @@ const AMB_SKY    : vec3f = TUNE_AMB_SKY;   // zenith, cool
 const AMB_GROUND : vec3f = TUNE_AMB_GROUND;   // bounce, warm
 fn ambientAt(n : vec3f) -> vec3f {
   // n.y = -1 -> full bounce, n.y = +1 -> full sky
-  return mix(AMB_GROUND, AMB_SKY, n.y * 0.5 + 0.5);
+  let base = mix(AMB_GROUND, AMB_SKY, n.y * 0.5 + 0.5);
+  // Day/night: at night the sky term is replaced by a much dimmer, bluer
+  // moon/starlight ambient, and the warm ground bounce nearly vanishes
+  // (there is no sun to bounce). Scaling the SAME split rather than adding a
+  // separate night ambient keeps the shape cues that AMB_SKY/AMB_GROUND buy.
+  let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
+  // Moonlight ambient scales with how full the moon is and whether it is up.
+  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
+  let moonAmt = moonUp * (0.30 + 1.40 * R.moonPhase * R.moonPhase);
+  return mix(nightAmb * (0.45 + moonAmt), base, R.sunUp);
 }
 
 // ---- diffuse response ----
@@ -750,8 +1153,12 @@ fn voxelAO(cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32, uv : vec2f) -> f
 // needs — a contact shadow right at the surface stays crisp, and a shadow cast
 // from far away goes soft. Same one-ray cost, no noise, and it is a closer
 // model of the real effect than a cone of one sample ever was.
+//
+// Cast from the KEY light, so at night the shadows are the moon's and point
+// the other way — a scene whose shadows still track the sun after dark reads
+// as broken immediately.
 fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
-  let s = trace(hp + n * TUNE_SHADOW_BIAS, R.sunDir, TUNE_SHADOW_STEPS, false);
+  let s = trace(hp + n * TUNE_SHADOW_BIAS, keyLightDir(), TUNE_SHADOW_STEPS, false);
   if (!s.hit) { return 1.0; }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
   // resting on the ground) keep a hard, dark contact shadow; distant ones (a
@@ -960,7 +1367,11 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 fn reflectionSky(rd : vec3f) -> vec3f {
   var d = rd;
   if (d.y < 0.02) { d.y = 0.02; }
-  return skyColor(normalize(d));
+  // Body-free: the sun and moon discs are handled by the dedicated glint lobe
+  // below, which is shaped for a rippled surface. Reflecting the real disc
+  // here as well would double it AND scatter single-pixel fireflies wherever
+  // a ripple normal happens to line up.
+  return skyColorNoBodies(normalize(d));
 }
 
 // ---- traced reflection ----
@@ -1012,10 +1423,10 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   if (h.axis == 0) { face = TUNE_FACE_X; }
   else if (h.axis == 2) { face = TUNE_FACE_Z; }
   if (m.klass != CLASS_LIQUID) { albedo *= surfaceGrain(h.cell, TUNE_GRAIN_AMP); }
-  let lam = wrapDiffuse(dot(rn, R.sunDir), 0.55);
+  let lam = wrapDiffuse(dot(rn, keyLightDir()), 0.55);
   // Same lighting model as a primary hit (minus AO and the shadow ray, which
   // are not resolvable in a reflection at this budget).
-  var c = albedo * face * (ambientAt(rn) + vec3f(1.0, 0.95, 0.86) * lam * 0.70);
+  var c = albedo * face * (ambientAt(rn) + keyLightColor() * lam * 0.52);
   let emis = f32(m.emission) / 255.0;
   if (emis > 0.0) { c += albedo * emis * 1.7; }
   // Reflected geometry is seen across the water plus its own distance, so it
@@ -1102,7 +1513,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   if (!underwater && depthM > 0.02) {
     // where on the surface the sunlight entering this bed point came from
     let bedP = hitP + rd * (pathVox);
-    let drift = R.sunDir.xz / max(R.sunDir.y, 0.25) * (depthM / VOXEL_METERS);
+    let kdc = keyLightDir();
+    let drift = kdc.xz / max(kdc.y, 0.25) * (depthM / VOXEL_METERS);
     let cp = (vec2f(bedP.x, bedP.z) - drift) * VOXEL_METERS;
     // Difference over a WIDE baseline and damp out the short bands. Caustic
     // webs come from the long swell — a crest metres across is what has the
@@ -1170,7 +1582,11 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // the ripple slopes scatter the highlight into moving sparkle rather than
   // one blob. Gated on the sun being above the horizon relative to the normal.
   if (upFacing && !underwater) {
-    let hv = normalize(R.sunDir + v);
+    // Key light, so a moonlit lake gets a moon track instead of staying flat
+    // black at night — a still lake under a full moon is one of the strongest
+    // night-lighting cues there is.
+    let kd = keyLightDir();
+    let hv = normalize(kd + v);
     // Roughen the lobe with distance to match the ripple damping in
     // waterNormal(): those flattened far normals would otherwise all agree and
     // collapse the sparkle into one hard mirror disc. Widening the lobe as the
@@ -1189,7 +1605,10 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // bloom cue, not a light source, and letting it run to 2.6x saturates a
     // whole band of the lake to flat white and destroys the ripple detail
     // underneath it.
-    color += vec3f(1.0, 0.97, 0.88) * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
+    // Tinted by the key light so the track is amber at sunset and cold blue
+    // under the moon, matching whatever is actually casting it.
+    let glintTint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
+    color += glintTint * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
   }
 
   // ---- shoreline foam ----
@@ -1653,7 +2072,7 @@ fn fs(in : VSOut) -> FSOut {
       albedo *= surfaceGrain(far.cell << vec3<u32>(farCellShift(far.level)), TUNE_GRAIN_AMP_FAR);
       // Same wrapped diffuse as the near field — a different falloff here is a
       // visible brightness step at the window seam.
-      var lambert = wrapDiffuse(dot(n, R.sunDir), TUNE_DIFFUSE_WRAP);
+      var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         let hp = R.camPos + rd * (far.t - 1e-3) +
@@ -1672,7 +2091,7 @@ fn fs(in : VSOut) -> FSOut {
           farMatAt(far.level, up) != 0u) { ao = TUNE_AO_FAR; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
-      let fsun = TUNE_SUN_COLOR * lambert * TUNE_SUN_INTENSITY;
+      let fsun = keyLightColor() * lambert;
       color = albedo * face * (ambientAt(n) * ao + fsun);
       let emis = f32(m.emission) / 255.0;
       if (emis > 0.0) { color += albedo * emis * TUNE_EMISSIVE_STRENGTH; }
@@ -1730,7 +2149,7 @@ fn fs(in : VSOut) -> FSOut {
     // range completely empty. Two disjoint populations interleaved at voxel
     // frequency is what the eye reports as "noise on the floor"; there was no
     // gradient between them to read as slope. Widening the wrap fills that gap.
-    var lambert = wrapDiffuse(dot(n, R.sunDir), TUNE_DIFFUSE_WRAP);
+    var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       lambert *= sunShadow(R.camPos + rd * (h.t - 1e-3), n, in.pos.xy);
     }
@@ -1738,7 +2157,7 @@ fn fs(in : VSOut) -> FSOut {
     // light, and AO measures how much sky the point can see); direct sun is
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
-    let sun = TUNE_SUN_COLOR * lambert * TUNE_SUN_INTENSITY;
+    let sun = keyLightColor() * lambert;
     color = albedo * face * (ambientAt(n) * ao + sun);
 
     // ---- emissive surfaces ----

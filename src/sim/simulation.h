@@ -41,6 +41,21 @@ class Simulation {
   // TickParams with hashEnable=1 first, reads world.hash after submit.
   void EncodeHashOnly(const wgpu::CommandEncoder& enc);
 
+  // Wake every chunk for the NEXT tick by setting all dirty-in flags.
+  //
+  // Needed because the daylight-gated reactions deliberately do NOT keep a
+  // chunk awake while their condition is unmet (otherwise a lit pond would
+  // spin forever at night and the settled world would never sleep — rule 2).
+  // The cost is paid only when the day phase crosses a gate boundary
+  // (sunrise/sunset), which is a handful of ticks per in-game day, and the
+  // woken chunks that have nothing to do go straight back to sleep on the
+  // following tick.
+  //
+  // Determinism: the caller must trigger this from the tick-derived day phase
+  // ONLY (see main.cpp), never from frame timing — a wake that happens on a
+  // different tick on another machine changes when reactions fire.
+  void EncodeWakeAll(const wgpu::Queue& queue);
+
   // One 30 Hz tick. Caller writes tickUBO/opsBuf/expOps and zeroes the write-
   // page particle count via queue.WriteBuffer first, then submits the encoder
   // produced here before encoding the next tick. particlesActive lets a

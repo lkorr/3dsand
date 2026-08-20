@@ -125,6 +125,33 @@ struct Tuning {
     int wanderHopMask = 7;       // critter hop chance = 1/(mask+1) per tick
   } sim;
 
+  // ---- day/night cycle ----
+  // The cycle phase is derived from the SIM TICK (see DayPhaseForTick in
+  // world.h), not from wall clock, because the daylight-gated reactions make
+  // sunlight feed voxel state. cycleMinutes and the freeze controls therefore
+  // change WHEN reactions fire — they are render-and-sim, and a change to them
+  // changes the world hash. They are integers for the same reason.
+  struct DayNight {
+    int cycleMinutes = 20;      // real minutes for one full in-game day
+    int freeze = 0;             // 1 = pin the cycle at freezePhase
+    int freezePhase = 32768;    // 0..65535, 0 = midnight, 32768 = noon
+    // Sun path. The sun rises in +X and sets in -X, tracking an arc whose peak
+    // elevation is set by `sunPeakElevation` (degrees) and whose orbital plane
+    // is tilted by `sunAzimuth` (degrees) — together these are latitude and
+    // season, and they are what decide how long shadows get at noon.
+    float sunPeakElevation = 58.0f;
+    float sunAzimuth = 24.0f;
+    // How sharply day turns into night. This is the smoothed daylight weight
+    // (R.sunUp) that crossfades the sky, ambient and key light; widening it
+    // lengthens twilight.
+    float twilightWidth = 0.22f;
+    // Moon orbit: lunarPeriodDays days per full phase cycle, inclined off the
+    // sun's plane so it is not simply opposite the sun.
+    int lunarPeriodDays = 8;
+    float moonInclination = 18.0f;   // degrees off the solar plane
+    float starRotSpeed = 1.0f;       // multiplier on the star wheel rate
+  } dayNight;
+
   // ---- render: everything below is emitted as WGSL and F5-reloadable ----
   struct Render {
     // sky / sun
@@ -137,6 +164,50 @@ struct Tuning {
     float sunDir[3] = {0.50f, 0.55f, 0.38f};
     float sunColor[3] = {1.0f, 0.95f, 0.86f};
     float sunIntensity = 1.35f;
+
+    // ---- atmospheric sky (physically-flavoured scattering model) ----
+    // Rayleigh scales the molecular scattering that makes the sky blue and the
+    // sunset red; Mie is the forward-scattering haze that puts a glow around
+    // the sun. These two, plus the air-mass curve, replace the old two-colour
+    // lerp and are what let one model cover noon, sunset and night.
+    float skyRayleigh = 12.0f;
+    float skyMie = 1.0f;
+    float skyMieG = 0.76f;          // Mie anisotropy; higher = tighter halo
+    float skyMieStrength = 1.0f;
+    float skyExposure = 1.6f;
+    float skyGround[3] = {0.22f, 0.20f, 0.17f};  // below-horizon bounce
+    float sunSize = 1.0f;           // multiplier on the true 0.53 deg disc
+
+    // ---- night sky ----
+    float nightZenith[3] = {0.006f, 0.010f, 0.028f};
+    float nightHorizon[3] = {0.030f, 0.036f, 0.062f};
+    float starBrightness = 1.0f;
+    float starDensity = 220.0f;     // direction-grid cells per unit
+    float starSize = 0.0055f;       // angular radius scale, radians
+    float starTwinkle = 0.35f;
+    float milkyWayStrength = 0.55f;
+    float milkyWayColor[3] = {0.52f, 0.56f, 0.78f};
+    float nebulaStrength = 0.40f;
+    float nebulaCool[3] = {0.16f, 0.30f, 0.62f};
+    float nebulaWarm[3] = {0.55f, 0.20f, 0.38f};
+    // Aurora — the Shivering Isles curtains.
+    float auroraStrength = 0.55f;
+    float auroraHeight = 900.0f;    // voxels; sets how curtains converge
+    float auroraLow[3] = {0.10f, 0.85f, 0.45f};
+    float auroraHigh[3] = {0.65f, 0.20f, 0.85f};
+
+    // ---- moon ----
+    float moonRadius = 0.030f;      // angular radius, radians (~5x the real one)
+    float moonBrightness = 1.6f;
+    float moonColor[3] = {0.92f, 0.93f, 0.88f};
+    float moonGlow = 0.35f;
+    float moonEarthshine = 0.055f;
+    float moonLightColor[3] = {0.55f, 0.68f, 1.0f};
+    float moonLightIntensity = 0.16f;
+
+    // ---- night ambient ----
+    float nightAmbSky[3] = {0.055f, 0.075f, 0.135f};
+    float nightAmbGround[3] = {0.022f, 0.026f, 0.042f};
 
     // fog
     float fogOpticalDepths = 4.5f;
@@ -247,3 +318,21 @@ std::string TuningWgslBlock(const Tuning& t);
 // systems; replaced wholesale on reload.
 const Tuning& CurrentTuning();
 void SetCurrentTuning(const Tuning& t);
+
+// ---- day/night: celestial state for one tick --------------------------------
+// Everything the renderer needs about the sky at a given day phase. Derived
+// purely from the integer phase (and the lunar day count), so two machines at
+// the same tick compute the same sky — and, more importantly, the same
+// daylight weight that the sim's reactions are gated on.
+struct SkyState {
+  float sunDir[3];    // unit, toward the sun
+  float moonDir[3];   // unit, toward the moon
+  float dayT;         // 0..1, 0 = midnight
+  float sunUp;        // smoothed 0..1 daylight weight (drives all crossfades)
+  float moonPhase;    // 0 = new, 0.5 = full
+  float starRot;      // radians
+};
+
+// phase is the integer day phase (0..kDayPhaseMask); dayNumber counts elapsed
+// in-game days and drives the lunar phase. Both come from the tick.
+SkyState ComputeSkyState(const Tuning& t, uint32_t phase, uint32_t dayNumber);

@@ -157,6 +157,67 @@ fn productState(mat : u32, r : u32) -> u32 {
   return r % 3u;
 }
 
+// ---- sky exposure (daylight-gated reactions) --------------------------------
+// "Is this cell exposed to the sky?" — answered by looking at the ONE cell
+// directly above it, and nothing further.
+//
+// ---- WHY THIS IS NOT A COLUMN WALK ----
+// The obvious implementation is to march up until something blocks, so that a
+// pond in a cave is correctly "indoors". That was tried here and it BREAKS
+// DETERMINISM, for a reason worth recording because it is easy to talk
+// yourself out of:
+//
+// The 3x3x3 color lattice guarantees that two cells acting in the same pass
+// are >=3 apart and that WRITES reach <=1 cell, so writes never collide. It
+// guarantees nothing about READS. A 48-cell probe column crosses dozens of
+// cells that other threads in this very pass are legally writing, so whether
+// the probe sees a cell before or after its update depends on scheduling —
+// exactly the "no scheduling-dependent outcomes" ban (CLAUDE.md rule 1). It
+// reproduced as a hash divergence at tick 1, with water freezing under
+// different roofs on each run.
+//
+// A one-cell look-up stays inside the guarantee: the cell above is either
+// >=3 away (so it is not acting this pass) or is the mover that is writing
+// into this very cell, which the stamp check already serializes.
+//
+// The cost of the honest version is that "sky" means "nothing directly on top
+// of me" rather than "open to the heavens", so water in a lit cave evaporates
+// too. That is a content inaccuracy, not a correctness one, and the trade is
+// forced: the deterministic alternative is a separate mark/apply pass over a
+// sky-exposure buffer (the pattern sim_explode.wgsl uses), which is the right
+// answer if this ever needs to tell a cave from a meadow.
+fn seesSky(c : vec3<i32>) -> bool {
+  let n = c + vec3<i32>(0, 1, 0);
+  // Left the window going up = open sky above.
+  if (!inBounds(n)) { return true; }
+  let nmat = voxMat(voxels[cellIndexW(n)]);
+  if (nmat == MAT_AIR) { return true; }
+  // Translucent things (water, glass, smoke, steam) let light through; only a
+  // ray blocker really shades the cell below it.
+  return !isRayBlocker(materials[nmat]);
+}
+
+// Does the cell's light environment satisfy this rule's condition?
+// Encoded in Reaction.cond (see materials.h ReactionGpu.cond):
+//   bit0 RCOND_SKY   — requires open sky above
+//   bit1 RCOND_DAY   — requires daytime
+//   bit2 RCOND_NIGHT — requires night
+// `minLight` (bits 8..15) is a daylight-strength floor, so "only near noon"
+// rules are expressible without a second condition bit.
+fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
+  let cond = rule.cond & 0xFFu;
+  if (cond == 0u) { return true; }  // unconditional: the common case, free
+  let day = daylightStrength(T.dayPhase);
+  if ((cond & RCOND_DAY) != 0u && day == 0u) { return false; }
+  if ((cond & RCOND_NIGHT) != 0u && day != 0u) { return false; }
+  let minLight = (rule.cond >> 8u) & 0xFFu;
+  if (day < minLight) { return false; }
+  // Sky probe last: it is the only expensive test, so the cheap phase checks
+  // above reject most cells before it ever runs.
+  if ((cond & RCOND_SKY) != 0u && !seesSky(c)) { return false; }
+  return true;
+}
+
 fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
   if (rule.nbrClass != 0u && ((1u << nm.klass) & rule.nbrClass) == 0u) { return false; }
   if (rule.nbrMat != NBR_ANY) { return nmat == rule.nbrMat; }
@@ -180,8 +241,32 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
     let rr = hash3(rnd, ri, idx);
     let rot = rr >> 12u;
 
+    // Light/phase gate. A rule whose condition is not met is skipped WITHOUT
+    // setting keepAwake — that is what lets a lit pond go back to sleep at
+    // night instead of spinning on a rule that cannot fire (rule 2). The
+    // chunk is re-woken when the phase crosses back, see wakeOnPhaseChange.
+    if (!lightMatches(rule, c)) { continue; }
+
+    // A light-gated rule does not hold its chunk awake even when it MATCHES.
+    //
+    // The unconditional rules use keepAwake to mean "this neighbourhood is
+    // reactive, re-examine it next tick", which is right for chains that
+    // resolve on their own (fire burns out, growth terminates). A light-gated
+    // rule has no such terminus: it stays matched for as long as the sun is in
+    // the right part of the sky, which is thousands of ticks. Letting it set
+    // keepAwake pins every affected chunk awake for half of every in-game day
+    // — measured at 292/32768 chunks still active from ONE such rule, against
+    // a budget of 32 (CLAUDE.md rule 2).
+    //
+    // Instead the day phase itself is the wake signal: Simulation::
+    // EncodeWakeAll re-dirties the world on the tick daylight switches on or
+    // off, which is a handful of ticks per in-game day. Between those
+    // boundaries a chunk with only light-gated work sleeps, and the rules
+    // still fire on the ticks it is awake for other reasons.
+    let lightGated = (rule.cond & 0xFFu) != 0u;
+
     if (kind == RK_DECAY) {
-      keepAwake = true;
+      keepAwake = keepAwake || !lightGated;
       if ((rr % 1000u) < rule.chance) {
         if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
         else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
@@ -198,7 +283,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if (!inBounds(n)) { continue; }
         let ni = cellIndexW((n));
         if (voxMat(voxels[ni]) != MAT_AIR) { continue; }
-        keepAwake = true;
+        keepAwake = keepAwake || !lightGated;
         if ((rr % 1000u) < rule.chance) {
           voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp);
           markDirty(n);
@@ -224,7 +309,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         let nmat = voxMat(nw);
         if (nmat == MAT_AIR) { continue; }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
-        keepAwake = true;
+        keepAwake = keepAwake || !lightGated;
         if ((rr % 1000u) < rule.chance) {
           if (rule.prodNbr != PROD_KEEP) {
             if (rule.prodNbr == 0u) { voxels[ni] = 0u; }

@@ -38,6 +38,11 @@ constexpr uint32_t kDirDown = 1, kDirUp = 2, kDirSide = 4, kDirAny = 7;
 constexpr uint32_t kProdKeep = 0xFFFF;
 constexpr uint32_t kNbrAny = 0xFFFF;
 
+// Reaction light conditions (ReactionGpu.cond bits 0..7) — must match the
+// RCOND_* consts in common.wgsl. Authored in reactions.json as
+// "needsSky": true, "when": "day"|"night", "minLight": 0..255.
+constexpr uint32_t kCondSky = 1, kCondDay = 2, kCondNight = 4;
+
 // GPU-side layout, 32 bytes — must match struct Reaction in common.wgsl.
 struct ReactionGpu {
   uint32_t packed;    // bits 0..1 kind, bits 2..4 dir mask
@@ -47,7 +52,11 @@ struct ReactionGpu {
   uint32_t chance;    // per-mille per tick
   uint32_t prodSelf;  // kProdKeep = unchanged, 0 = air
   uint32_t prodNbr;   // pair: neighbor product; emit: emitted material
-  uint32_t pad;
+  // Light/day-phase condition (was pad — no struct growth).
+  //   bits 0..7  : kCondSky | kCondDay | kCondNight
+  //   bits 8..15 : minimum daylight strength 0..255 (0 = no floor)
+  // Zero means unconditional, which is every pre-existing rule.
+  uint32_t cond;
 };
 static_assert(sizeof(ReactionGpu) == 32, "must match common.wgsl Reaction");
 

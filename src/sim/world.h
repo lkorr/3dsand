@@ -45,6 +45,50 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatGrass = 33, kMatLeaves = 34, kMatPineNeedles = 35,
                    kMatAutumnLeaves = 36, kMatBirchWood = 37, kMatPetal = 38;
 
+// ---- day/night cycle (DESIGN.md §12) ----------------------------------------
+// The cycle phase is an INTEGER derived from the sim tick, never from wall
+// clock. That is what lets sunlight gate reactions (water evaporating in the
+// sun) without breaking CLAUDE.md rule 1: same seed + same tick => same phase
+// => same world hash, on every machine.
+//
+// Phase is 0..kDayPhaseMax over one full day, with 0 = midnight, so:
+//   0x0000 midnight   0x4000 sunrise   0x8000 noon   0xC000 sunset
+// 16 bits is far finer than the sun visibly moves in one tick and keeps every
+// derived comparison in integer range.
+constexpr uint32_t kDayPhaseBits = 16;
+constexpr uint32_t kDayPhaseMax = 1u << kDayPhaseBits;  // 65536
+constexpr uint32_t kDayPhaseMask = kDayPhaseMax - 1u;
+
+// Integer phase for a tick. ticksPerDay comes from tuning (cycle length in
+// real minutes x 30 Hz); freeze pins the phase for shot setup and for the
+// selftest, whose hash must not depend on how long the cycle happens to be.
+// Deliberately integer division: a float here would be a determinism hazard.
+inline uint32_t DayPhaseForTick(uint32_t tick, uint32_t ticksPerDay,
+                                bool frozen, uint32_t frozenPhase) {
+  if (frozen) return frozenPhase & kDayPhaseMask;
+  if (ticksPerDay == 0) return 0;
+  // (tick % ticksPerDay) first: keeps the multiply from overflowing on a long
+  // session, and makes the phase exactly periodic in the tick counter.
+  return (uint32_t)(((uint64_t)(tick % ticksPerDay) * kDayPhaseMax) /
+                    ticksPerDay) & kDayPhaseMask;
+}
+
+// Integer daylight strength for a phase: 0 at night, rising to 255 at noon.
+// EXACT mirror of daylightStrength() in common.wgsl — the CPU uses it to
+// decide which ticks need a wake-all, and the GPU uses it to gate reactions.
+// If these two ever disagree the world still hashes identically (only the GPU
+// copy touches voxel state), but chunks would wake on the wrong tick, so keep
+// them in step.
+constexpr uint32_t kDaySunrise = 16384, kDayNoon = 32768, kDaySunset = 49152;
+inline uint32_t DaylightStrengthCpu(uint32_t phase) {
+  uint32_t p = phase & kDayPhaseMask;
+  if (p <= kDaySunrise || p >= kDaySunset) return 0;
+  uint32_t d = p - kDaySunrise;
+  uint32_t half = kDayNoon - kDaySunrise;
+  uint32_t up = d <= half ? d : 2 * half - d;
+  return (up * 255) / half;
+}
+
 // Must match BrushOp in common.wgsl (32 bytes).
 struct BrushOp {
   int32_t x, y, z;
@@ -113,7 +157,11 @@ struct TickParams {
   int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
   uint32_t spawnCount = 0;  // CPU particle spawns this tick (debris shatter)
   uint32_t farCount = 0;    // far-field fill entries in farList this tick
-  uint32_t pad2 = 0, pad3 = 0, pad4 = 0;
+  // Integer day phase (0..kDayPhaseMask) for THIS tick — see DayPhaseForTick.
+  // Feeds voxel state through the daylight-gated reactions, so it is
+  // determinism-critical: derived from `tick` only, never from frame timing.
+  uint32_t dayPhase = 0;
+  uint32_t pad3 = 0, pad4 = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -146,6 +194,21 @@ struct RenderParams {
   // to be the real target height or the water's apparent choppiness changes
   // with window size.
   float viewPx = 1080.0f;
+
+  // ---- day/night (one std140 row) ----
+  // moonDir is the antipode of the sun tilted by the lunar inclination, so the
+  // moon is not simply "the sun at night". dayT is the phase as 0..1 for the
+  // shader's smooth blends; the SIM uses the integer phase in TickParams
+  // instead, and the two agree because both come from the same tick.
+  float moonDir[3] = {0.0f, -1.0f, 0.0f};
+  float dayT = 0.5f;
+  // sunAboveHorizon: smoothed 0..1 daylight weight (drives ambient, fog tint
+  // and star fade). moonPhase: 0=new, 0.5=full, 1=new again — drives both the
+  // lit fraction of the disc and how much moonlight the world gets.
+  float sunUp = 1.0f;
+  float moonPhase = 0.5f;
+  float starRot = 0.0f;   // radians, stars wheel about the celestial pole
+  float pad_dn = 0.0f;
 };
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9,

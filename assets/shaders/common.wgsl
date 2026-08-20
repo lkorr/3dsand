@@ -68,8 +68,14 @@ struct Reaction {
   chance   : u32,  // per-mille per 30 Hz tick
   prodSelf : u32,  // what self becomes (PROD_KEEP = unchanged, 0 = air)
   prodNbr  : u32,  // pair: neighbor product; emit: emitted material
-  _pad     : u32,
+  // Light/day-phase gate: bits 0..7 RCOND_*, bits 8..15 min daylight 0..255.
+  // 0 = unconditional (every rule that predates the day/night cycle).
+  cond     : u32,
 };
+// Reaction light conditions — must match kCond* in src/sim/materials.h.
+const RCOND_SKY   : u32 = 1u;  // cell must have open sky above it
+const RCOND_DAY   : u32 = 2u;  // only while the sun is up
+const RCOND_NIGHT : u32 = 4u;  // only while the sun is down
 
 struct TickParams {
   tick       : u32,
@@ -83,8 +89,37 @@ struct TickParams {
   origin     : vec3<i32>,  // residency window origin, CHUNK units (DESIGN.md §3)
   spawnCount : u32,  // CPU particle spawns this tick (debris shatter)
   farCount   : u32,  // far-field fill entries in farList this tick
-  _p2 : u32, _p3 : u32, _p4 : u32,
+  // Integer day phase 0..DAY_PHASE_MASK for this tick, derived from `tick`
+  // alone. Gates the daylight reactions, so it is determinism-critical:
+  // integer only, and never sourced from frame timing.
+  dayPhase   : u32,
+  _p3 : u32, _p4 : u32,
 };
+
+// ---- day phase helpers (integer; sim-side) ----
+// 0 = midnight, 0x4000 = sunrise, 0x8000 = noon, 0xC000 = sunset.
+const DAY_PHASE_MAX  : u32 = 65536u;
+const DAY_PHASE_MASK : u32 = 65535u;
+const DAY_SUNRISE : u32 = 16384u;
+const DAY_NOON    : u32 = 32768u;
+const DAY_SUNSET  : u32 = 49152u;
+
+// Integer "how high is the sun", 0 at the horizon rising to 255 at noon and
+// back, 0 all night. A triangle rather than a sine: exact in integers, and the
+// reaction chances that key off it only need a monotone daylight strength.
+// This is the sim's ONLY notion of sun elevation — the renderer uses its own
+// float version, and the two never need to agree bit-for-bit because the
+// renderer cannot write voxel state.
+fn daylightStrength(phase : u32) -> u32 {
+  let p = phase & DAY_PHASE_MASK;
+  if (p <= DAY_SUNRISE || p >= DAY_SUNSET) { return 0u; }  // night
+  // map sunrise..sunset onto 0..512..0
+  let d = p - DAY_SUNRISE;                 // 0 .. 32768
+  let half = DAY_NOON - DAY_SUNRISE;       // 16384
+  let up = select(2u * half - d, d, d <= half);  // 0..16384 triangle
+  return (up * 255u) / half;               // 0..255
+}
+fn isDaytime(phase : u32) -> bool { return daylightStrength(phase) > 0u; }
 
 struct PassParams {
   colorPhase : vec3<u32>,  // (0..2)^3 — 3x3x3 cell-coloring phase of this pass
@@ -115,6 +150,13 @@ struct RenderParams {
   viewPx     : f32,    // render target HEIGHT in pixels — pixel angular size
                        // (tanHalfFov*2/viewPx) is the LOD footprint the water
                        // ripple bands are damped against
+  // ---- day/night (must match RenderParams in world.h) ----
+  moonDir    : vec3f,  // unit vector toward the moon (not just -sunDir)
+  dayT       : f32,    // 0..1 phase, 0 = midnight, 0.5 = noon
+  sunUp      : f32,    // smoothed 0..1 daylight weight
+  moonPhase  : f32,    // 0 = new, 0.5 = full
+  starRot    : f32,    // radians the starfield has wheeled
+  _pdn       : f32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.

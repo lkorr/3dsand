@@ -434,6 +434,15 @@ void Simulation::EncodeHashOnly(const wgpu::CommandEncoder& enc) {
   pass.End();
 }
 
+void Simulation::EncodeWakeAll(const wgpu::Queue& queue) {
+  // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
+  // flag per chunk; 4096 chunks = 16 KB, far inside the ~1 MB/tick CPU->GPU
+  // budget, and only written on a phase boundary.
+  static const std::vector<uint32_t> ones(kNumChunks, 1u);
+  queue.WriteBuffer(world_->dirty[page_], 0, ones.data(),
+                    ones.size() * sizeof(uint32_t));
+}
+
 void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
                             uint32_t cellCount, uint32_t spawnCount) {

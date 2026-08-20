@@ -54,11 +54,28 @@ double NowSec() {
 // renders against complete far-field data (the selftest's benchmark,
 // screenshot, and debris views) stays a one-liner. The live frame loop passes
 // the smoothed adaptive value instead (plan phase 3B).
+// Ticks per in-game day, from the tuning cycle length. Sim runs at 30 Hz.
+uint32_t TicksPerDay(const Tuning& t) {
+  int m = t.dayNight.cycleMinutes < 1 ? 1 : t.dayNight.cycleMinutes;
+  return (uint32_t)m * 60u * 30u;
+}
+
+// The sky for a given sim tick. Both the renderer and the sim's reaction gate
+// derive from this same tick-based phase, which is what keeps a sun-driven
+// reaction deterministic (CLAUDE.md rule 1).
+SkyState SkyForTick(const Tuning& t, uint32_t tick) {
+  uint32_t tpd = TicksPerDay(t);
+  uint32_t phase = DayPhaseForTick(tick, tpd, t.dayNight.freeze != 0,
+                                   (uint32_t)t.dayNight.freezePhase);
+  return ComputeSkyState(t, phase, tpd ? tick / tpd : 0u);
+}
+
 void WriteRenderParams(const wgpu::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
                        float fogDensity = kFarFogDensity,
-                       float viewPx = 1080.0f) {
+                       float viewPx = 1080.0f,
+                       uint32_t tick = 0) {
   RenderParams rp{};
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
   rp.camPos[0] = eye.x; rp.camPos[1] = eye.y; rp.camPos[2] = eye.z;
@@ -74,9 +91,22 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   // that valleys aren't pits. The old 0.78 y put the sun ~52 deg up and
   // flattened the world — shadows were 1-2 cells long and the far field read
   // as unlit wallpaper.
-  const auto& rt = CurrentTuning().render;
-  Vec3 sun = Vec3{rt.sunDir[0], rt.sunDir[1], rt.sunDir[2]}.normalized();
-  rp.sunDir[0] = sun.x; rp.sunDir[1] = sun.y; rp.sunDir[2] = sun.z;
+  // Sun/moon now come from the tick-driven cycle rather than a fixed tuning
+  // vector: render.sunDir survives only as the fallback when the cycle is
+  // disabled (cycleMinutes clamped, freeze pinned) and as the tuner's manual
+  // handle. See ComputeSkyState.
+  const Tuning& tun = CurrentTuning();
+  SkyState sky = SkyForTick(tun, tick);
+  rp.sunDir[0] = sky.sunDir[0];
+  rp.sunDir[1] = sky.sunDir[1];
+  rp.sunDir[2] = sky.sunDir[2];
+  rp.moonDir[0] = sky.moonDir[0];
+  rp.moonDir[1] = sky.moonDir[1];
+  rp.moonDir[2] = sky.moonDir[2];
+  rp.dayT = sky.dayT;
+  rp.sunUp = sky.sunUp;
+  rp.moonPhase = sky.moonPhase;
+  rp.starRot = sky.starRot;
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   IVec3 o = world.WindowOrigin();
@@ -102,6 +132,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
   tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
+  // Day phase for THIS tick. Derived from `tick` alone — the daylight-gated
+  // reactions read it, so anything frame-timed here would break determinism.
+  const Tuning& dtun = CurrentTuning();
+  tp.dayPhase = DayPhaseForTick(tick, TicksPerDay(dtun),
+                                dtun.dayNight.freeze != 0,
+                                (uint32_t)dtun.dayNight.freezePhase);
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
@@ -118,6 +154,22 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // the write page starts each tick empty; survivors + emissions repopulate
     uint32_t zero = 0;
     ctx.queue.WriteBuffer(world.particleCounts, (1 - sim.Page()) * 4, &zero, 4);
+  }
+
+  // Day/night sleep handshake. The daylight-gated reactions deliberately do
+  // NOT hold a chunk awake while their condition is unmet, so a pond that went
+  // to sleep at dusk would never notice sunrise. Wake the world on the ticks
+  // where daylight actually switches on or off — a handful per in-game day.
+  //
+  // Derived from the tick, not from frame timing, so every machine wakes on
+  // the same tick and the hash stays identical (CLAUDE.md rule 1).
+  if (tick > 0) {
+    uint32_t prevPhase = DayPhaseForTick(tick - 1, TicksPerDay(dtun),
+                                         dtun.dayNight.freeze != 0,
+                                         (uint32_t)dtun.dayNight.freezePhase);
+    bool wasDay = DaylightStrengthCpu(prevPhase) > 0;
+    bool isDay = DaylightStrengthCpu(tp.dayPhase) > 0;
+    if (wasDay != isDay) sim.EncodeWakeAll(ctx.queue);
   }
 
   wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
@@ -2049,7 +2101,7 @@ int main(int argc, char** argv) {
       fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
       WriteRenderParams(ctx.queue, world, eye, cam,
                         (float)ctx.width / (float)ctx.height, ui.shadows,
-                        (float)now, fogSmooth, (float)ctx.height);
+                        (float)now, fogSmooth, (float)ctx.height, tick);
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;

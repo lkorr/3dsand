@@ -32,6 +32,45 @@ SPEC = [
     ("render", "sunColor", "TUNE_SUN_COLOR", "v3", [1.0, 0.95, 0.86]),
     ("render", "sunIntensity", "TUNE_SUN_INTENSITY", "f", 1.35),
 
+    # atmospheric sky
+    ("render", "skyRayleigh", "TUNE_SKY_RAYLEIGH", "f", 12.0),
+    ("render", "skyMie", "TUNE_SKY_MIE", "f", 1.0),
+    ("render", "skyMieG", "TUNE_SKY_MIE_G", "f", 0.76),
+    ("render", "skyMieStrength", "TUNE_SKY_MIE_STRENGTH", "f", 1.0),
+    ("render", "skyExposure", "TUNE_SKY_EXPOSURE", "f", 1.6),
+    ("render", "skyGround", "TUNE_SKY_GROUND", "v3", [0.22, 0.20, 0.17]),
+    ("render", "sunSize", "TUNE_SUN_SIZE", "f", 1.0),
+
+    # night sky
+    ("render", "nightZenith", "TUNE_NIGHT_ZENITH", "v3", [0.006, 0.010, 0.028]),
+    ("render", "nightHorizon", "TUNE_NIGHT_HORIZON", "v3", [0.030, 0.036, 0.062]),
+    ("render", "starBrightness", "TUNE_STAR_BRIGHTNESS", "f", 1.0),
+    ("render", "starDensity", "TUNE_STAR_DENSITY", "f", 220.0),
+    ("render", "starSize", "TUNE_STAR_SIZE", "f", 0.0055),
+    ("render", "starTwinkle", "TUNE_STAR_TWINKLE", "f", 0.35),
+    ("render", "milkyWayStrength", "TUNE_MILKYWAY_STRENGTH", "f", 0.55),
+    ("render", "milkyWayColor", "TUNE_MILKYWAY_COLOR", "v3", [0.52, 0.56, 0.78]),
+    ("render", "nebulaStrength", "TUNE_NEBULA_STRENGTH", "f", 0.40),
+    ("render", "nebulaCool", "TUNE_NEBULA_COOL", "v3", [0.16, 0.30, 0.62]),
+    ("render", "nebulaWarm", "TUNE_NEBULA_WARM", "v3", [0.55, 0.20, 0.38]),
+    ("render", "auroraStrength", "TUNE_AURORA_STRENGTH", "f", 0.55),
+    ("render", "auroraHeight", "TUNE_AURORA_HEIGHT", "f", 900.0),
+    ("render", "auroraLow", "TUNE_AURORA_LOW", "v3", [0.10, 0.85, 0.45]),
+    ("render", "auroraHigh", "TUNE_AURORA_HIGH", "v3", [0.65, 0.20, 0.85]),
+
+    # moon
+    ("render", "moonRadius", "TUNE_MOON_RADIUS", "f", 0.030),
+    ("render", "moonBrightness", "TUNE_MOON_BRIGHTNESS", "f", 1.6),
+    ("render", "moonColor", "TUNE_MOON_COLOR", "v3", [0.92, 0.93, 0.88]),
+    ("render", "moonGlow", "TUNE_MOON_GLOW", "f", 0.35),
+    ("render", "moonEarthshine", "TUNE_MOON_EARTHSHINE", "f", 0.055),
+    ("render", "moonLightColor", "TUNE_MOON_LIGHT_COLOR", "v3", [0.55, 0.68, 1.0]),
+    ("render", "moonLightIntensity", "TUNE_MOON_LIGHT_INTENSITY", "f", 0.16),
+
+    # night ambient
+    ("render", "nightAmbSky", "TUNE_NIGHT_AMB_SKY", "v3", [0.055, 0.075, 0.135]),
+    ("render", "nightAmbGround", "TUNE_NIGHT_AMB_GROUND", "v3", [0.022, 0.026, 0.042]),
+
     ("render", "ambSky", "TUNE_AMB_SKY", "v3", [0.40, 0.48, 0.62]),
     ("render", "ambGround", "TUNE_AMB_GROUND", "v3", [0.25, 0.22, 0.17]),
     ("render", "diffuseWrap", "TUNE_DIFFUSE_WRAP", "f", 0.55),

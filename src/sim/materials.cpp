@@ -221,6 +221,31 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     if (g.chance < 1 || g.chance > 1000)
       errors += path + ": reaction self=\"" + self + "\": chance must be 1..1000\n";
 
+    // ---- light / day-phase condition (day-night cycle) ----
+    // These gate the rule on the cell's light environment. They feed voxel
+    // state, so everything here is integer and derived from the tick-based
+    // day phase — see DayPhaseForTick in world.h.
+    if (r.value("needsSky", false)) g.cond |= kCondSky;
+    if (r.contains("when")) {
+      std::string when = r["when"].get<std::string>();
+      if (when == "day") g.cond |= kCondDay;
+      else if (when == "night") g.cond |= kCondNight;
+      else if (when != "any")
+        errors += path + ": reaction self=\"" + self + "\": unknown when \"" +
+                  when + "\" (expected day|night|any)\n";
+    }
+    if (r.contains("minLight")) {
+      int ml = r.value("minLight", 0);
+      if (ml < 0 || ml > 255)
+        errors += path + ": reaction self=\"" + self +
+                  "\": minLight must be 0..255\n";
+      else
+        g.cond |= ((uint32_t)ml & 0xFFu) << 8u;
+    }
+    if ((g.cond & kCondDay) && (g.cond & kCondNight))
+      errors += path + ": reaction self=\"" + self +
+                "\": when cannot be both day and night\n";
+
     uint32_t kind, dirMask = ParseDir(r, path, self, errors);
     if (r.value("decay", false)) {
       kind = kReactDecay;
