@@ -42,7 +42,11 @@
     "terrainFriction": 0.85,
     "playerProxyFriction": 0.3,
     "explosionImpulseScale": 0.15,
-    "explosionImpulseRadiusScale": 3
+    "explosionImpulseRadiusScale": 3,
+    "playerMassKg": 80,
+    "sphereFriction": 0.5,
+    "sphereRestitution": 0.3,
+    "sphereAngularDamping": 0.05
   },
   "debris": {
     "minBodyVoxels": 8,

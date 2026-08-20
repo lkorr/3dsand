@@ -18,9 +18,11 @@
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
+#include <Jolt/Physics/Body/AllowedDOFs.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
@@ -250,6 +252,38 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   bcs.mLinearDamping = pt.debrisLinearDamping;
   bcs.mAngularDamping = pt.debrisAngularDamping;
   bcs.mAllowDynamicOrKinematic = allowKinematic;
+  // Ghost contacts with internal edges of the marching-cubes terrain are what
+  // make debris snag and hop on flat-looking ground; this is Jolt's fix.
+  bcs.mEnhancedInternalEdgeRemoval = true;
+
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
+  if (id.IsInvalid()) return 0;
+  uint64_t h = FromBodyID(id);
+  dynamicBodies_.push_back(h);
+  return h;
+}
+
+uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
+                                   float densityKgM3) {
+  if (!system_ || radiusVoxels <= 0) return 0;
+  const float rM = VoxToM(radiusVoxels);
+  JPH::BodyCreationSettings bcs(
+      new JPH::SphereShape(rM),
+      JPH::RVec3(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y),
+                 VoxToM(centerVoxel.z)),
+      JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Layers::MOVING);
+  bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+  bcs.mMassPropertiesOverride.mMass =
+      std::max(densityKgM3 * (4.0f / 3.0f) * JPH::JPH_PI * rM * rM * rM, 0.05f);
+  const auto& pt = CurrentTuning().physics;
+  bcs.mFriction = pt.sphereFriction;
+  bcs.mRestitution = pt.sphereRestitution;
+  bcs.mLinearDamping = pt.debrisLinearDamping;
+  // Deliberately lighter angular damping than debris: rolling is the entire
+  // point of this shape, and the debris value is tuned to stop tumbling fast.
+  bcs.mAngularDamping = pt.sphereAngularDamping;
+  bcs.mEnhancedInternalEdgeRemoval = true;
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
@@ -274,6 +308,12 @@ uint64_t Physics::CreateTerrainMesh(const std::vector<float>& vertsXYZ,
     tris.push_back(JPH::IndexedTriangle(indices[i], indices[i + 1], indices[i + 2]));
 
   JPH::MeshShapeSettings mesh(verts, tris);
+  // Default is cos(5°): nearly every seam between marching-cubes triangles
+  // counts as an "active" edge whose normal can kick a rolling body. 25° keeps
+  // real ridges active but lets the near-coplanar facets of smooth-looking
+  // terrain read as one surface. Pairs with mEnhancedInternalEdgeRemoval on
+  // the dynamic bodies.
+  mesh.mActiveEdgeCosThresholdAngle = 0.9063f;  // cos(25 deg)
   auto shapeResult = mesh.Create();
   if (shapeResult.HasError()) return 0;
 
@@ -290,13 +330,26 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   if (!system_) return 0;
   float radius = VoxToM(halfXZVox);
   float cylHalf = std::max(VoxToM(halfYVox) - radius, 0.01f);
+  // Dynamic, not kinematic — see the header comment: finite mass is what
+  // makes shoves scale with the shoved body's mass. Rotation is locked (a
+  // capsule that tips over is not a player) and gravity is off (the AABB
+  // controller owns vertical motion; the proxy just mirrors it).
   JPH::BodyCreationSettings bcs(new JPH::CapsuleShape(cylHalf, radius),
                                 JPH::RVec3::sZero(), JPH::Quat::sIdentity(),
-                                JPH::EMotionType::Kinematic, Layers::PLAYER);
+                                JPH::EMotionType::Dynamic, Layers::PLAYER);
+  bcs.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX |
+                     JPH::EAllowedDOFs::TranslationY |
+                     JPH::EAllowedDOFs::TranslationZ;
+  bcs.mGravityFactor = 0.0f;
+  bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+  bcs.mMassPropertiesOverride.mMass =
+      std::max(CurrentTuning().physics.playerMassKg, 1.0f);
   bcs.mFriction = CurrentTuning().physics.playerProxyFriction;
+  bcs.mRestitution = 0.0f;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
-  // NOT in dynamicBodies_: the proxy takes no impulses and never despawns
+  // NOT in dynamicBodies_: the proxy never despawns and must not receive
+  // explosion impulses or WakeNear — the player controller owns its motion.
   return id.IsInvalid() ? 0 : FromBodyID(id);
 }
 
@@ -307,7 +360,19 @@ void Physics::MovePlayerBody(uint64_t handle, Vec3 centerVoxel, float dt) {
   if (!bi.IsAdded(id)) return;
   JPH::RVec3 target(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y),
                     VoxToM(centerVoxel.z));
-  bi.MoveKinematic(id, target, JPH::Quat::sIdentity(), std::max(dt, 1e-3f));
+  // Teleport to the authoritative position (discarding whatever contacts did
+  // to the proxy last step), then set the velocity the move implies so the
+  // solver has real momentum to hand to anything the player walks into.
+  JPH::RVec3 cur = bi.GetPosition(id);
+  bi.SetPositionAndRotation(id, target, JPH::Quat::sIdentity(),
+                            JPH::EActivation::Activate);
+  JPH::Vec3 vel = JPH::Vec3(target - cur) / std::max(dt, 1e-3f);
+  // A teleport (spawn, world load) is not a sprint: cap the implied speed so
+  // one warped frame can't hand a resting body a 1000 m/s contact impulse.
+  constexpr float kMaxSpeed = 30.0f;  // m/s, ~2x top sprint speed
+  float speed = vel.Length();
+  if (speed > kMaxSpeed) vel *= kMaxSpeed / speed;
+  bi.SetLinearVelocity(id, vel);
 }
 
 Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {

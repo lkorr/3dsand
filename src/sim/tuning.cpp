@@ -236,6 +236,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "playerProxyFriction", p.playerProxyFriction, out, at);
     ReadF(*g, "explosionImpulseScale", p.explosionImpulseScale, out, at);
     ReadF(*g, "explosionImpulseRadiusScale", p.explosionImpulseRadiusScale, out, at);
+    ReadF(*g, "playerMassKg", p.playerMassKg, out, at);
+    ReadF(*g, "sphereFriction", p.sphereFriction, out, at);
+    ReadF(*g, "sphereRestitution", p.sphereRestitution, out, at);
+    ReadF(*g, "sphereAngularDamping", p.sphereAngularDamping, out, at);
     if (p.collisionSteps < 1) {
       out.warnings.push_back("physics.collisionSteps < 1; clamped to 1");
       p.collisionSteps = 1;

@@ -1212,6 +1212,26 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.5.6 (2026-08-20)** — rigidbody feel pass: mass-relative shoves + true
+> spheres. The player proxy is now a DYNAMIC capsule (rotation-locked, zero
+> gravity, tuned `playerMassKg`) teleported to the authoritative position each
+> tick instead of a kinematic one: kinematic = infinite mass to the solver, so
+> a strolling player launched a two-ton block exactly like a bucket. With real
+> mass the solver splits contact impulses by mass ratio, and since body mass
+> comes from per-voxel material density, shove strength falls out of the
+> material data (selftest-gated: light sphere must move >3x a heavy one under
+> the same walk). Teleport-implied velocity is capped at 30 m/s so a world
+> load can't hand a resting body a huge impulse. `PlayerPushOut` and the
+> player's own terrain sweeps are unchanged — the proxy's solver displacement
+> is discarded every tick. New `Physics::CreateSphereBody`: an analytic Jolt
+> sphere (greedy-boxed voxel balls can't roll), rendered as a center-origin
+> voxel ball via `AdoptBody`; K spawns one at the crosshair, half the player's
+> height in diameter, made of the current brush material. Rolling smoothness:
+> `mEnhancedInternalEdgeRemoval` on all dynamic bodies + terrain-mesh active
+> edge threshold 5°→25°, killing the ghost contacts with internal
+> marching-cubes edges that made debris snag and hop on flat ground. CPU-float
+> Jolt only — world hashes unaffected.
+>
 > **v0.5.5 (2026-08-19)** — generative branching birch. Every species was a
 > solid crown volume centred over a straight bole: at distance that silhouette
 > reads as a lollipop, and it was the birch — the slender species that most

@@ -77,6 +77,13 @@ struct Tuning {
     float terrainFriction = 0.85f, playerProxyFriction = 0.3f;
     float explosionImpulseScale = 0.15f;
     float explosionImpulseRadiusScale = 3.0f;
+    // Player proxy mass: the shove-strength knob. Contact impulses split by
+    // mass ratio, so this vs a body's density-derived mass decides how far a
+    // walking player moves it.
+    float playerMassKg = 80.0f;
+    // Rolling spheres (analytic colliders, not boxed voxels).
+    float sphereFriction = 0.5f, sphereRestitution = 0.3f;
+    float sphereAngularDamping = 0.05f;
   } physics;
 
   // ---- debris / island -> rigidbody conversion ----

@@ -1840,10 +1840,35 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     uint64_t farBody = stoneBlock({520, 500, 500});
     float pushFar = phys.PlayerPushOut(pb, at).len();
     phys.RemoveBody(farBody);
+
+    // mass-relative shove: the proxy is dynamic with a real mass, so walking
+    // into a light sphere must move it far more than the same walk into a
+    // heavy one (both fall freely — only horizontal displacement counts).
+    auto walkInto = [&](float density) {
+      at = Vec3{500.0f, 500.0f, 500.0f};
+      phys.MovePlayerBody(pb, at, kTickDt);
+      phys.Step(kTickDt);
+      const float startX = 509.5f;  // just clear of capsule(4.8) + sphere(4)
+      uint64_t s = phys.CreateSphereBody({startX, 500.0f, 500.0f}, 4.0f, density);
+      for (int i = 0; i < 12; i++) {
+        at.x += 2.2f;  // ~4.2 m/s walk
+        phys.MovePlayerBody(pb, at, kTickDt);
+        phys.Step(kTickDt);
+      }
+      BodyTransform xf{};
+      phys.GetTransform(s, xf);
+      phys.RemoveBody(s);
+      return xf.pos.x - startX;
+    };
+    float lightMoved = walkInto(150.0f);    // ~10 kg beach ball
+    float heavyMoved = walkInto(12000.0f);  // ~780 kg lead sphere
     phys.RemoveBody(pb);
-    pushOk = pushNear > 0.01f && pushFar < 1e-3f;
-    std::printf("player body: %s (overlap push %.2f vox, clear push %.3f vox)\n",
-                pushOk ? "PASS" : "FAIL", pushNear, pushFar);
+    bool shoveOk = lightMoved > 2.0f && lightMoved > 3.0f * heavyMoved;
+    pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk;
+    std::printf(
+        "player body: %s (overlap push %.2f vox, clear push %.3f vox, "
+        "shove light %.1f vox vs heavy %.1f vox)\n",
+        pushOk ? "PASS" : "FAIL", pushNear, pushFar, lightMoved, heavyMoved);
   }
 
   // M2 save/load: snapshot at tick 100, diverge 50 ticks, load — the world
@@ -2196,7 +2221,7 @@ int main(int argc, char** argv) {
   glfwGetCursorPos(window, &mx0, &my0);
 
   KeyEdge eP, eN, eV, eF1, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eTab;
+      eG, eX, eB, eT, eO, eM, eK, eTab;
   bool prevMouseL = false;
   std::vector<Grenade> grenades;
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
@@ -2282,6 +2307,7 @@ int main(int argc, char** argv) {
       ui.tool = (ui.tool + 1) % UIState::kToolCount;
     if (captured && eM.Pressed(key(GLFW_KEY_M))) ui.spawnMob = true;
     if (captured && eB.Pressed(key(GLFW_KEY_B))) ui.placePrefab = true;
+    if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
     if (ui.tool == UIState::kToolPrefab && eT.Pressed(key(GLFW_KEY_T)))
       ui.prefabRot = (ui.prefabRot + 1) & 3;
     if (ui.tool == UIState::kToolPrefab && eO.Pressed(key(GLFW_KEY_O)) &&
@@ -2480,6 +2506,40 @@ int main(int argc, char** argv) {
                      {(int)msnap.pick[5] - d.prefab.size.x / 2,
                       (int)msnap.pick[6],
                       (int)msnap.pick[7] - d.prefab.size.z / 2});
+        }
+      }
+
+      // rolling sphere (K): a rigidbody ball, half the player's height in
+      // diameter, made of the current brush material. The collider is a true
+      // Jolt sphere (CreateSphereBody) so it rolls smoothly; the voxel ball
+      // only exists to render it, with locals centered on the body origin so
+      // collider and art agree. Mass comes from the material's density —
+      // which is also what decides how far the player can shove it.
+      if (ui.spawnSphere) {
+        ui.spawnSphere = false;
+        const WorldSnapshot& ssnap = world.Snap();
+        uint32_t sphereMat = (uint32_t)ui.brushMaterial;
+        if (ssnap.valid && ssnap.pick[0] != 0 && sphereMat < mats.size()) {
+          const float r = Player::kHalfY * 0.5f;  // vox: diameter = height/2
+          std::vector<DebrisVoxel> ball;
+          int ext = (int)std::ceil(r);
+          for (int z = -ext; z < ext; z++)
+            for (int y = -ext; y < ext; y++)
+              for (int x = -ext; x < ext; x++) {
+                float dx = x + 0.5f, dy = y + 0.5f, dz = z + 0.5f;
+                if (dx * dx + dy * dy + dz * dz <= r * r)
+                  ball.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0,
+                                  (uint16_t)sphereMat});
+              }
+          BodyTransform sxf{};
+          // drop it just above the picked surface cell
+          sxf.pos = Vec3{(float)ssnap.pick[5] + 0.5f,
+                         (float)ssnap.pick[6] + r + 1.5f,
+                         (float)ssnap.pick[7] + 0.5f};
+          sxf.quat[3] = 1;
+          uint64_t sh = phys.CreateSphereBody(
+              sxf.pos, r, (float)mats[sphereMat].gpu.density);
+          if (sh) debris.AdoptBody(sh, std::move(ball), sxf);
         }
       }
 

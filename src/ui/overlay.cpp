@@ -147,6 +147,10 @@ void Overlay::Draw(UIState& s) {
 
   if (ImGui::Button("detonate at crosshair (X)")) s.pendingDetonate = true;
 
+  // rolling sphere: rigidbody ball of the current brush material, so its
+  // mass — and how far the player can shove it — comes from the material
+  if (ImGui::Button("spawn sphere (K)")) s.spawnSphere = true;
+
   ImGui::TextDisabled("Tab switch tool  1-8 material  Esc cursor  F1 UI");
   ImGui::TextDisabled("G grenade  X detonate  F laser  M spawn mob  B place");
   ImGui::End();

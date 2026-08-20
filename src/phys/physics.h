@@ -56,6 +56,12 @@ class Physics {
                               const BodyTransform& xf,
                               const std::vector<float>& densityOfMat,
                               bool allowKinematic = false);
+  // Analytic sphere collider — a greedy-boxed voxel ball can never roll
+  // smoothly, so rolling objects get a true Jolt sphere. Mass = density *
+  // sphere volume. The voxel ball that renders it is the caller's business
+  // (DebrisSystem::AdoptBody with locals centered on the body origin).
+  uint64_t CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
+                            float densityKgM3);
   // Linear/angular velocity in voxel units (split halves keep momentum).
   bool GetBodyVelocities(uint64_t handle, Vec3& lin, Vec3& angRadPerSec) const;
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);
@@ -94,13 +100,24 @@ class Physics {
                              const std::vector<uint32_t>& indices);
 
   // ---- player proxy (deferred from M6; DESIGN.md §8) ----
-  // Kinematic capsule the debris collides against. Voxel terrain collision
-  // stays in the AABB controller (player.cpp); this body only exists so
-  // rigidbodies can't pass through the player and so a moving player shoves
-  // debris (MoveKinematic gives it real velocity). It ignores STATIC terrain
-  // meshes — colliding with both grids would double-resolve.
+  // Capsule the debris collides against. Voxel terrain collision stays in the
+  // AABB controller (player.cpp); this body only exists so rigidbodies can't
+  // pass through the player and so a moving player shoves debris. It ignores
+  // STATIC terrain meshes — colliding with both grids would double-resolve.
+  //
+  // The proxy is DYNAMIC (rotation-locked, zero gravity, tuned playerMassKg)
+  // rather than kinematic: a kinematic body is infinite mass to the solver, so
+  // a strolling player would launch a two-ton block exactly like a bucket.
+  // With a real mass the solver splits every contact impulse by true mass
+  // ratio — light bodies get shoved, heavy ones barely creep — and since body
+  // mass comes from per-voxel material density, "how hard can I push it"
+  // falls out of the material data with no extra code. MovePlayerBody
+  // re-teleports it to the authoritative player position each tick, so
+  // whatever the solver did to the proxy itself is discarded; the player only
+  // ever moves via PlayerPushOut through its own terrain sweeps.
   uint64_t CreatePlayerBody(float halfXZVox, float halfYVox);
-  // Drive the proxy toward the player's AABB center over dt seconds.
+  // Snap the proxy to the player's AABB center and give it the velocity
+  // implied by the move (contacts need real velocity to transfer momentum).
   void MovePlayerBody(uint64_t handle, Vec3 centerVoxel, float dt);
   // Depenetration vector (voxel units) to move the player out of any debris
   // bodies overlapping the proxy shape at centerVoxel. Zero when clear.

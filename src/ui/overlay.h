@@ -23,6 +23,8 @@ struct UIState {
   uint32_t activeBodyCount = 0;
   uint32_t mobCount = 0;
   bool spawnMob = false;         // M key: spawn mob def 0 at crosshair
+  bool spawnSphere = false;      // K key / UI button: rolling sphere of the
+                                 // current brush material at the crosshair
   float playerPos[3] = {};
   bool mirrorValid = false;
 
