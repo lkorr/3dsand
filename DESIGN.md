@@ -153,8 +153,9 @@ grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
   monolithic `.svx` (SVX2) format is retired.
 - **Unloaded space is treated as solid and inert** so liquids can't drain off the
   edge of the loaded world (Burkelbear's solution; adopt it verbatim).
-- Underground, darkness hides the streaming horizon. Overworld draw distance vs.
-  fog is a known open problem — defer.
+- Overworld draw distance beyond the window is handled by the render-only
+  far-field cascades (§9) — the streaming horizon is no longer visible from
+  the surface. Underground, darkness still hides it.
 
 ---
 
@@ -482,9 +483,27 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   body's own voxel payload inside the box to the exact voxel hit** — debris stays
   voxel-crisp instead of marching-cubes-smooth, and reuses the terrain shading
   path. Adopt once bodies carry their voxel payloads (M6).
-- Later: distance fog + LOD bricks for far terrain, emissive materials feeding a
-  cheap GI (light propagation volumes or per-chunk flood lighting), volumetrics
-  for gases. **None of this in v1** — flat lit voxels first.
+- **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
+  view distance beyond the residency window comes from kFarLevels nested
+  toroidal 256³ volumes centered on the player, level k holding one material
+  byte per cell at 2^k-voxel resolution — each level doubles view distance at
+  constant memory (~96 MB total, outermost half-extent ≈ 64× the window
+  radius). Levels are filled on the GPU by sampling `genCell()` at stride
+  (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
+  streaming window, and refilled a plane at a time (≤ kFarListCap
+  level-chunks/tick, managed by `sim/farfield`). Rays that exit the fine
+  window without a hit continue through the cascade boxes with the same
+  occupancy-skipped DDA in level-cell units; t-ordering (each level starts at
+  the previous box's exit) keeps coarse data from ever occluding fine data.
+  Far hits shade with palette + N·L, no shadow rays; fog density is a uniform
+  pinned so opacity ≈ 1 at the outermost level. Determinism is untouched by
+  construction: cascades are derived render-only data — never read by the
+  sim, never hashed, no MutationQueue involvement. Known phase-1 limits:
+  player edits are invisible beyond the window (phase 2 = dirty-driven
+  downsample), center-sampling terraces the far surface (phase 3 = dithered
+  transitions), cascades regenerate from seed on load rather than persisting.
+- Later: emissive materials feeding a cheap GI (light propagation volumes or
+  per-chunk flood lighting), volumetrics for gases.
 
 ## 10. Networking (design now, build later)
 
@@ -605,6 +624,19 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.5.3 (2026-08-19)** — far-field cascades: view distance from ~1 window
+> radius to ~64 window radii (§9, docs/PLAN_far_field_cascades.md phase 1).
+> Six nested render-only 256³ LOD volumes (1 material byte/cell, 2^k-voxel
+> cells, ~96 MB) fill from `genCell()` sampled at stride on the GPU
+> (worldgen.wgsl `far`), recenter with the player (`sim/farfield`, plane
+> refills ≤4096 level-chunks/tick through the tick submit), and extend the
+> raymarch past the window exit with the same occupancy-skipped DDA per level.
+> Fog density became a RenderParams uniform pinned to the outermost level.
+> Sim untouched: cascades are derived data — not read by any sim kernel, not
+> hashed, regenerated from seed (edits beyond the window invisible until
+> phase 2's dirty-driven downsample). Selftest PASS end to end; render
+> 1080p shadows-on 9.4 ms with the far march + fully filled cascades.
+>
 > **v0.5.2 (2026-08-19)** — fire pass: burning rigidbodies + fire look.
 > Detached islands froze mid-flame forever (bodies are outside the CA);
 > `DebrisSystem::BurnBodies` now runs the reaction table over body payloads —

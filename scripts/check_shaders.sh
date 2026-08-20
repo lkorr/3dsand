@@ -64,8 +64,10 @@ W_N="$(cpp_const kWorldN)"
 W_CHUNK="$(cpp_const kChunk)"
 W_VOX="$(cpp_const kVoxelMeters)"
 W_IFAIR="$(cpp_const_hex kCellOpIfAir)"
-if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ]; then
-  echo "check_shaders: cannot parse kWorldN/kChunk/kVoxelMeters/kCellOpIfAir from $WORLD_H" >&2
+W_FAR="$(cpp_const kFarLevels)"
+if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
+   || [ -z "$W_FAR" ]; then
+  echo "check_shaders: cannot parse kWorldN/kChunk/kVoxelMeters/kCellOpIfAir/kFarLevels from $WORLD_H" >&2
   exit 1
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
@@ -83,6 +85,8 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_MASK : i32 = $((W_N - 1));" \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
+  "const FAR_LEVELS : u32 = ${W_FAR}u;" \
+  "const WORLD_VOX : u32 = $((W_N * W_N * W_N))u;" \
   "const VOXEL_METERS : f32 = ${W_VOX};")"
 
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".

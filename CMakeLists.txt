@@ -103,6 +103,7 @@ add_executable(sandvox
   src/sim/world.cpp
   src/sim/worldio.cpp
   src/sim/stream.cpp
+  src/sim/farfield.cpp
   src/sim/chunkstore.cpp
   src/sim/simulation.cpp
   src/sim/materials.cpp

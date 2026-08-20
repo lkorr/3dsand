@@ -64,6 +64,15 @@ void World::Init(const wgpu::Device& device) {
                             U::Storage | U::CopyDst, "bodyXforms");
   genList = CreateBuffer(device, kNumChunks * 4, U::Storage | U::CopyDst, "genList");
 
+  // Far-field cascades (render-only LOD). Zero-initialized = air, so unfilled
+  // regions render as sky, never garbage.
+  farVox = CreateBuffer(device, (uint64_t)kFarLevels * kVoxelCount, U::Storage,
+                        "farVox");
+  farOcc = CreateBuffer(device, (uint64_t)kFarLevels * kNumChunks * 4, U::Storage,
+                        "farOcc");
+  farList = CreateBuffer(device, kFarListCap * 4, U::Storage | U::CopyDst, "farList");
+  farUBO = CreateBuffer(device, sizeof(FarParams), U::Uniform | U::CopyDst, "farUBO");
+
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
     s.inFlight = false;

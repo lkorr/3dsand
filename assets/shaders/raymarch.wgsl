@@ -8,6 +8,10 @@
 @group(0) @binding(1) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+// far-field cascades (render-only LOD — DESIGN.md §9)
+@group(0) @binding(4) var<storage, read> farVox : array<u32>;
+@group(0) @binding(5) var<storage, read> farOcc : array<u32>;
+@group(0) @binding(6) var<uniform> F : FarParams;
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -54,6 +58,10 @@ struct Hit {
   hit      : bool,
   saturated: bool,    // media absorbed the ray before any surface hit
   t        : f32,
+  tExit    : f32,     // where the ray leaves the window box (0 if it misses):
+                      // the far-field march starts here, never inside the
+                      // window, so coarse data can't occlude fine data
+
   cell     : vec3<i32>,
   axis     : i32,     // axis stepped into the hit cell
   sgn      : f32,     // ray direction sign on that axis
@@ -76,6 +84,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   var out : Hit;
   out.hit = false;
   out.saturated = false;
+  out.tExit = 0.0;
   out.mediaTau = 0.0;
   out.mediaTint = vec3f(0.0);
   out.mediaMat = 0u;
@@ -99,6 +108,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
   let tExit = min(tmax.x, min(tmax.y, tmax.z));
   if (tExit <= tEnter) { return out; }
+  out.tExit = tExit;
 
   var t = tEnter + 1e-4;
   var p = ro + rd * t;
@@ -243,6 +253,126 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   return out;
 }
 
+// ---- far-field cascade march (DESIGN.md §9) ----
+// Continues a ray that left the residency window without hitting anything.
+// Each cascade level is marched in ITS OWN cell units (the same DDA as the
+// fine march, occupancy-skipped per level chunk); `t` values convert back to
+// fine-voxel units so depth and fog reuse the existing math. Levels are
+// nested boxes: starting level k at max(its entry, level k-1's exit) makes
+// the t-ordering skip every region covered by finer data automatically.
+struct FarHit {
+  hit  : bool,
+  t    : f32,          // fine-voxel units
+  axis : i32,
+  sgn  : f32,
+  mat  : u32,
+  cell : vec3<i32>,    // level cells (palette jitter)
+};
+
+fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
+  let bi = farVoxByteIndex(level, c);
+  return (farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
+}
+
+fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32) -> FarHit {
+  var out : FarHit;
+  out.hit = false;
+
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+
+  var tPrev = max(tStart, 0.0);   // fine-voxel units
+
+  for (var level = 1u; level <= FAR_LEVELS; level++) {
+    let s = f32(1u << level);     // fine voxels per level cell
+    let org = F.origins[level - 1u].xyz;
+    // everything below is in LEVEL-CELL coords: pos/s, t/s (same rd)
+    let roL = ro / s;
+    let lo = vec3f(org * i32(CHUNK));
+    let tt0 = (lo - roL) * inv;
+    let tt1 = (lo + f32(WORLD_N) - roL) * inv;
+    let tmin = min(tt0, tt1);
+    let tmax = max(tt0, tt1);
+    let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
+    let tExit = min(tmax.x, min(tmax.y, tmax.z));
+    if (tExit <= tEnter) { continue; }   // box missed (or fully behind tPrev)
+
+    var t = tEnter + 1e-4;
+    var p = roL + rd * t;
+    let loI = org * i32(CHUNK);
+    var cell = clamp(vec3<i32>(floor(p)), loI, loI + vec3<i32>(i32(WORLD_N) - 1));
+    let stepv = vec3<i32>(sign(rd));
+    let tDelta = abs(inv);
+    var tMax : vec3f;
+    for (var a = 0; a < 3; a++) {
+      let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+      tMax[a] = (boundary - roL[a]) * inv[a];
+    }
+    var axis = 0;
+    if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
+    else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
+    var tCur = t;
+
+    for (var i = 0; i < 384; i++) {
+      if (!inWindow(cell, org)) { break; }
+      if (farOcc[farOccIndex(level, cell)] == 0u) {
+        // empty level chunk: jump to its exit face (same seam-safe jump as
+        // the fine march — force the crossing on the exit axis)
+        let ch = worldChunkOf(cell);
+        let clo = vec3f(ch * i32(CHUNK));
+        let e0 = (clo - roL) * inv;
+        let e1 = (clo + f32(CHUNK) - roL) * inv;
+        let ex = max(e0, e1);
+        let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+        t = tOut + 1e-4;
+        if (t >= tExit) { break; }
+        p = roL + rd * t;
+        var nc = vec3<i32>(floor(p));
+        if (ex.x <= ex.y && ex.x <= ex.z) {
+          nc.x = select(ch.x * i32(CHUNK) - 1, (ch.x + 1) * i32(CHUNK), rd.x > 0.0);
+        } else if (ex.y <= ex.z) {
+          nc.y = select(ch.y * i32(CHUNK) - 1, (ch.y + 1) * i32(CHUNK), rd.y > 0.0);
+        } else {
+          nc.z = select(ch.z * i32(CHUNK) - 1, (ch.z + 1) * i32(CHUNK), rd.z > 0.0);
+        }
+        if (!inWindow(nc, org)) { break; }
+        cell = nc;
+        for (var a = 0; a < 3; a++) {
+          let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+          tMax[a] = (boundary - roL[a]) * inv[a];
+        }
+        tCur = t;
+        continue;
+      }
+
+      let mat = farMatAt(level, cell);
+      if (mat != 0u) {
+        out.hit = true;
+        out.t = tCur * s;   // back to fine-voxel units
+        out.axis = axis;
+        out.sgn = sign(rd[axis]);
+        out.mat = mat;
+        out.cell = cell;
+        return out;
+      }
+
+      if (tMax.x < tMax.y && tMax.x < tMax.z) {
+        cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+      } else if (tMax.y < tMax.z) {
+        cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+      } else {
+        cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+      }
+      if (tCur >= tExit) { break; }
+    }
+    tPrev = max(tPrev, tExit * s);
+  }
+  return out;
+}
+
 struct FSOut {
   @location(0) color : vec4f,
   @builtin(frag_depth) depth : f32,
@@ -257,6 +387,14 @@ fn fs(in : VSOut) -> FSOut {
 
   let h = trace(R.camPos, rd, 4096, true);
 
+  // Rays that leave the window without a surface hit (and weren't absorbed by
+  // media) continue into the far-field cascades from the window's exit point.
+  var far : FarHit;
+  far.hit = false;
+  if (!h.hit && !h.saturated) {
+    far = traceFar(R.camPos, rd, h.tExit);
+  }
+
   // reversed-Z depth so raster geometry (particles/debris) composites in.
   // A saturated media march writes depth at its stop point: the smoke is
   // opaque there, and raster geometry behind it must not draw through.
@@ -264,11 +402,34 @@ fn fs(in : VSOut) -> FSOut {
   if (h.hit || h.saturated) {
     let viewZ = h.t * dot(rd, R.camFwd);
     depth = clamp(KNEAR / max(viewZ, KNEAR), 0.0, 1.0);
+  } else if (far.hit) {
+    let viewZ = far.t * dot(rd, R.camFwd);
+    depth = clamp(KNEAR / max(viewZ, KNEAR), 0.0, 1.0);
   }
 
   var color : vec3f;
   if (!h.hit) {
-    color = skyColor(rd);
+    if (far.hit) {
+      // far-field shading: palette + face term + unshadowed N·L + fog. No
+      // shadow rays out here — at these distances fog dominates the term.
+      let m = materials[far.mat];
+      let jit = pcg(u32(far.cell.x * 7 + far.cell.y * 131 + far.cell.z * 2917));
+      var albedo = paletteColor(m, jit);
+      if (m.klass == CLASS_LIQUID) { albedo = unpackColor(m.color0); }
+      var n = vec3f(0.0);
+      n[far.axis] = -far.sgn;
+      var face = 0.85;
+      if (far.axis == 1) { face = select(0.55, 1.0, n.y > 0.0); }
+      else if (far.axis == 2) { face = 0.75; }
+      let lambert = max(dot(n, R.sunDir), 0.0);
+      color = albedo * face * (0.38 + 0.72 * lambert * vec3f(1.0, 0.96, 0.88));
+      let emis = f32(m.emission) / 255.0;
+      if (emis > 0.0) { color += albedo * emis * 1.7; }
+      let fog = 1.0 - exp(-far.t * VOXEL_METERS * R.fogDensity);
+      color = mix(color, skyColor(rd) * 0.9, fog);
+    } else {
+      color = skyColor(rd);
+    }
   } else {
     let mat = voxMat(h.word);
     let m = materials[mat];
@@ -304,8 +465,10 @@ fn fs(in : VSOut) -> FSOut {
       color += albedo * emis * 1.7 * flick;
     }
 
-    // distance fog (density per meter, so the look survives voxel-size changes)
-    let fog = 1.0 - exp(-h.t * VOXEL_METERS * 0.0128);
+    // distance fog (density per meter, so the look survives voxel-size
+    // changes). Density is a uniform pinned to the far-field extent so the
+    // cascade horizon fades out instead of ending in a cut.
+    let fog = 1.0 - exp(-h.t * VOXEL_METERS * R.fogDensity);
     color = mix(color, skyColor(rd) * 0.9, fog);
   }
 

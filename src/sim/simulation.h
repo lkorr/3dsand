@@ -33,6 +33,10 @@ class Simulation {
   // rebuilds occupancy over freshly uploaded voxels. Caller has already
   // written the voxel + dirty buffers (see worldio.cpp).
   void EncodeLoadReset(const wgpu::CommandEncoder& enc);
+  // Fill `count` far-field cascade level-chunks whose packed entries the
+  // caller wrote to world.farList (count also in tickUBO.farCount). Render-
+  // only derived data — safe to encode anywhere in the tick (DESIGN.md §9).
+  void EncodeFarFill(const wgpu::CommandEncoder& enc, uint32_t count);
   // Standalone whole-world hash pass (save/load verification): caller writes
   // TickParams with hashEnable=1 first, reads world.hash after submit.
   void EncodeHashOnly(const wgpu::CommandEncoder& enc);
@@ -85,12 +89,14 @@ class Simulation {
   // simSlimBGL_ mirrors simBGL_ bindings 0..4 only — the particle/explosion
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
-  wgpu::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_;
-  wgpu::PipelineLayout simPL_, simPL2_, renderPL_;
+  wgpu::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
+      farBGL_;
+  wgpu::PipelineLayout simPL_, simPL2_, renderPL_, farPL_;
   wgpu::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   wgpu::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
+  wgpu::ComputePipeline farFill_;
   wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_;
   wgpu::ShaderModule raymarchModule_, debrisModule_;
   wgpu::TextureFormat targetFormat_ = wgpu::TextureFormat::Undefined;
@@ -102,6 +108,6 @@ class Simulation {
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   wgpu::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
-  wgpu::BindGroup renderBG_, renderPartBG_[2];
+  wgpu::BindGroup renderBG_, renderPartBG_[2], farBG_;
   int page_ = 0;
 };

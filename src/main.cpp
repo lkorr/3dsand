@@ -22,6 +22,7 @@
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
+#include "sim/farfield.h"
 #include "sim/materials.h"
 #include "sim/simulation.h"
 #include "sim/stream.h"
@@ -63,6 +64,7 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   rp.flags = shadows ? 1u : 0u;
   Vec3 sun = Vec3{0.45f, 0.78f, 0.32f}.normalized();
   rp.sunDir[0] = sun.x; rp.sunDir[1] = sun.y; rp.sunDir[2] = sun.z;
+  rp.fogDensity = kFarFogDensity;  // horizon fades at the far-field extent
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
@@ -77,13 +79,15 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ExplosionOp>& exps,
                 const std::vector<CellOp>& cells, bool hashEnable,
                 IVec3 playerChunk, bool wantReadback, bool particlesActive,
-                const std::vector<ParticleSpawn>& spawns = {}) {
+                const std::vector<ParticleSpawn>& spawns = {},
+                uint32_t farCount = 0) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
+  tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
@@ -105,6 +109,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount);
+  sim.EncodeFarFill(enc, farCount);
   bool doCopy = false;
   if (wantReadback) {
     doCopy = world.EncodeReadbacks(ctx.device, enc,
@@ -400,6 +405,25 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   ctx.WaitIdle();
   double simMs = (NowSec() - t0) * 1000.0 / 100.0;
   std::printf("sim: %.2f ms/tick (active scene, includes submit overhead)\n", simMs);
+
+  // far-field cascades: fill fully (render-only, ~6 dispatches) so the render
+  // benchmark + screenshot cover the far march with real data
+  {
+    FarField far;
+    far.Init(&world);
+    far.FullRefill({108 >> 4, 122 >> 4, 108 >> 4});
+    uint32_t n;
+    while ((n = far.PrepareTick(ctx.queue)) > 0) {
+      TickParams tp{0, kDefaultSeed, 0, 0};
+      tp.farCount = n;
+      ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+      wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeFarFill(enc, n);
+      wgpu::CommandBuffer cmd = enc.Finish();
+      ctx.queue.Submit(1, &cmd);
+    }
+    ctx.WaitIdle();
+  }
 
   // render perf: offscreen 1080p
   const uint32_t W = 1920, H = 1080;
@@ -1200,6 +1224,8 @@ int main(int argc, char** argv) {
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
+  FarField far;
+  far.Init(&world);
 
   if (selftest)
     return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream);
@@ -1227,6 +1253,10 @@ int main(int argc, char** argv) {
   for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
   int spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
   player.pos = Vec3{140, (float)(spawnH + 10), 140};
+  // seed the far-field cascades around spawn (coarsest first; the queue
+  // drains at kFarListCap level-chunks per tick through SubmitTick)
+  far.FullRefill({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
+                  ifloor(player.pos.z) >> 4});
   // kinematic capsule proxy so debris collides with (and is shoved by) the
   // player; terrain collision stays in the AABB controller
   uint64_t playerBody = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
@@ -1443,8 +1473,12 @@ int main(int argc, char** argv) {
 
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
-      stream.Update({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
-                     ifloor(player.pos.z) >> 4});
+      IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
+                           ifloor(player.pos.z) >> 4};
+      stream.Update(playerChunkNow);
+      // far-field cascades track the player the same way (render-only)
+      far.Update(playerChunkNow);
+      uint32_t farCount = far.PrepareTick(ctx.queue);
 
       std::vector<BrushOp> ops;
       brush.radius = ui.brushRadius;
@@ -1603,7 +1637,7 @@ int main(int argc, char** argv) {
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
-                 spawns);
+                 spawns, farCount);
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
       debris.PostStep();
       mobs.PostStep();

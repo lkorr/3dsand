@@ -48,6 +48,10 @@ std::string ShaderConstantPrelude() {
   o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
   o << "const CELLOP_IF_AIR : u32 = 0x" << std::hex << kCellOpIfAir << std::dec
     << "u;\n";
+  // Far-field cascades (render-only LOD, DESIGN.md §9). WORLD_VOX is the cell
+  // count of one 256^3 volume (fits u32; kFarLevels * WORLD_VOX < 2^32).
+  o << "const FAR_LEVELS : u32 = " << kFarLevels << "u;\n";
+  o << "const WORLD_VOX : u32 = " << (uint32_t)kVoxelCount << "u;\n";
   // Render-only: the sim never reads it, so voxel state stays integer and
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);

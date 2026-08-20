@@ -118,6 +118,9 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(1, T::ReadOnlyStorage, S::Fragment),               // occupancy
         entry(2, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // materials
         entry(3, T::Uniform, S::Fragment | S::Vertex),           // RenderParams
+        entry(4, T::ReadOnlyStorage, S::Fragment),               // farVox
+        entry(5, T::ReadOnlyStorage, S::Fragment),               // farOcc
+        entry(6, T::Uniform, S::Fragment),                       // FarParams
     };
     wgpu::BindGroupLayoutDescriptor d{};
     d.entryCount = std::size(entries);
@@ -149,6 +152,34 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
     d.bindGroupLayoutCount = 2;
     d.bindGroupLayouts = renderGroups;
     renderPL_ = device.CreatePipelineLayout(&d);
+  }
+  {
+    // far-field cascade fill: slim sim group 0 (the `far` entry statically
+    // uses only materials + TickParams there) + far buffers as group 1
+    auto entry = [](uint32_t binding, wgpu::BufferBindingType type) {
+      wgpu::BindGroupLayoutEntry e{};
+      e.binding = binding;
+      e.visibility = wgpu::ShaderStage::Compute;
+      e.buffer.type = type;
+      return e;
+    };
+    using T = wgpu::BufferBindingType;
+    wgpu::BindGroupLayoutEntry entries[] = {
+        entry(0, T::Storage),          // farVox
+        entry(1, T::Storage),          // farOcc
+        entry(2, T::ReadOnlyStorage),  // farList
+        entry(3, T::Uniform),          // FarParams
+    };
+    wgpu::BindGroupLayoutDescriptor d{};
+    d.entryCount = std::size(entries);
+    d.entries = entries;
+    farBGL_ = device.CreateBindGroupLayout(&d);
+
+    wgpu::BindGroupLayout farGroups[] = {simSlimBGL_, farBGL_};
+    wgpu::PipelineLayoutDescriptor pd{};
+    pd.bindGroupLayoutCount = 2;
+    pd.bindGroupLayouts = farGroups;
+    farPL_ = device.CreatePipelineLayout(&pd);
   }
 
   // ---- bind groups ----
@@ -229,12 +260,28 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(1, world_->occupancy),
         b(2, materialBuf_),
         b(3, world_->renderUBO),
+        b(4, world_->farVox),
+        b(5, world_->farOcc),
+        b(6, world_->farUBO),
     };
     wgpu::BindGroupDescriptor d{};
     d.layout = renderBGL_;
     d.entryCount = std::size(entries);
     d.entries = entries;
     renderBG_ = device.CreateBindGroup(&d);
+  }
+  {
+    wgpu::BindGroupEntry entries[] = {
+        b(0, world_->farVox),
+        b(1, world_->farOcc),
+        b(2, world_->farList),
+        b(3, world_->farUBO),
+    };
+    wgpu::BindGroupDescriptor d{};
+    d.layout = farBGL_;
+    d.entryCount = std::size(entries);
+    d.entries = entries;
+    farBG_ = device.CreateBindGroup(&d);
   }
 
   std::string err;
@@ -278,6 +325,7 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
 
   worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
   worldgenList_ = MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
+  farFill_ = MakeComputePipeline(device, farPL_, mWorldgen, "far", "farFill");
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
   mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells");
   compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact");
@@ -342,6 +390,16 @@ void Simulation::EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count) 
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(worldgenList_);
+  pass.DispatchWorkgroups(count, 1, 1);
+  pass.End();
+}
+
+void Simulation::EncodeFarFill(const wgpu::CommandEncoder& enc, uint32_t count) {
+  if (count == 0) return;
+  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  pass.SetBindGroup(0, simSlimBG_[page_]);
+  pass.SetBindGroup(1, farBG_);
+  pass.SetPipeline(farFill_);
   pass.DispatchWorkgroups(count, 1, 1);
   pass.End();
 }

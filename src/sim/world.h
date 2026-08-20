@@ -18,7 +18,7 @@ constexpr uint32_t kWorldN = 256;
 // (player size, speeds, gravity, fog/media densities) derives from it. Change
 // it here and here only — shaders pick it up automatically.
 // Note: at the same kWorldN, smaller voxels shrink the world's physical size.
-constexpr float kVoxelMeters = 0.125f;
+constexpr float kVoxelMeters = 0.0625f;
 constexpr uint32_t kChunk = 16;
 constexpr uint32_t kNChunk = kWorldN / kChunk;          // 16
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 4096
@@ -103,6 +103,8 @@ struct TickParams {
   uint32_t genCount = 0;   // chunks in genList (worldgen streaming dispatch)
   int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
   uint32_t spawnCount = 0;  // CPU particle spawns this tick (debris shatter)
+  uint32_t farCount = 0;    // far-field fill entries in farList this tick
+  uint32_t pad2 = 0, pad3 = 0, pad4 = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -128,9 +130,29 @@ struct RenderParams {
   float camFwd[3];
   uint32_t flags;
   float sunDir[3];
-  float pad1;
+  float fogDensity = 0.0128f;  // per-meter; pinned to the far-field extent
   int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
   int32_t pad2 = 0;
+};
+
+// ---- far-field cascades (render-only LOD — DESIGN.md §9,
+// docs/PLAN_far_field_cascades.md) ----
+// kFarLevels nested toroidal 256^3 volumes around the residency window; level
+// k (1-based) cells are 2^k fine voxels, so each level doubles view distance
+// at constant memory. Derived data: filled from worldgen on the GPU, never
+// read by the sim, excluded from the world hash — determinism rule #1 is
+// untouched by construction.
+constexpr uint32_t kFarLevels = 6;      // outermost half-extent: 1024 m
+constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
+// Fog density such that opacity ~= 1 (4.5 optical depths) at the outermost
+// level's half-extent from the centered player.
+constexpr float kFarFogDensity =
+    4.5f / ((float)(kWorldN << kFarLevels) * kVoxelMeters * 0.5f);
+
+// Must match FarParams in common.wgsl. Origins are per level, in that level's
+// chunk units (one level-k chunk = 16 level cells = 2^k fine chunks).
+struct FarParams {
+  int32_t origins[kFarLevels][4];  // xyz = origin, w unused
 };
 
 enum class CellKind { Unknown, Air, Solid, Liquid, Gas };
@@ -273,6 +295,12 @@ class World {
   wgpu::Buffer bodyInstances;   // debris-body voxel instances (render)
   wgpu::Buffer bodyXforms;      // debris-body transforms (render)
   wgpu::Buffer genList;         // worldgen streaming: slot indices to generate
+
+  // ---- far-field cascades (render-only; never bound in any sim pipeline) ----
+  wgpu::Buffer farVox;   // kFarLevels x 256^3 material bytes, packed 4/u32
+  wgpu::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
+  wgpu::Buffer farList;  // kFarListCap u32 fill entries: (level-1)<<12 | slot
+  wgpu::Buffer farUBO;   // FarParams
 
  private:
   struct Slot {

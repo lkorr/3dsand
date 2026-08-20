@@ -258,3 +258,65 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
   if (wg.x >= T.genCount) { return; }
   genChunk(genList[wg.x], li);
 }
+
+// ---- far-field cascade fill: the worldgen "sieve" ----
+// (render-only LOD — DESIGN.md §9, docs/PLAN_far_field_cascades.md)
+// Lives in this file to share genCell(): a level-k cascade cell is filled by
+// sampling genCell at the FINE-voxel center of the 2^k-wide region it covers,
+// so cascades regenerate bit-identically from (coords, seed) at any stride.
+// Gases are dropped (no media in the far field); liquids keep their ID and
+// render as opaque surfaces at distance. Features thinner than a coarse cell
+// vanish — correct LOD behavior, not data loss.
+//
+// One workgroup per farList entry: (level-1) << 12 | chunk slot. Each thread
+// owns 64 CONSECUTIVE cells = 16 whole u32 words of the byte-packed farVox,
+// so there are no partial-word writes and no atomics on the voxel data.
+@group(1) @binding(0) var<storage, read_write> farVox : array<u32>;
+@group(1) @binding(1) var<storage, read_write> farOcc : array<u32>;
+@group(1) @binding(2) var<storage, read> farList : array<u32>;
+@group(1) @binding(3) var<uniform> F : FarParams;
+
+var<workgroup> wgFarCount : atomic<u32>;
+
+@compute @workgroup_size(64)
+fn far(@builtin(workgroup_id) wg : vec3<u32>,
+       @builtin(local_invocation_index) li : u32) {
+  if (wg.x >= T.farCount) { return; }
+  if (li == 0u) { atomicStore(&wgFarCount, 0u); }
+  workgroupBarrier();
+
+  let packed = farList[wg.x];
+  let level = (packed >> 12u) + 1u;   // 1-based
+  let slot = packed & 0xFFFu;
+  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
+                               slot / (NCHUNK * NCHUNK)));
+  // base LEVEL-cell coord of this level chunk (origins are level-chunk units)
+  let base = slotToWorldChunk(sc, F.origins[level - 1u].xyz) * i32(CHUNK);
+
+  var count = 0u;
+  let wordBase = ((level - 1u) * WORLD_VOX + slot * CHUNK_VOL) / 4u + li * 16u;
+  for (var wi = 0u; wi < 16u; wi++) {
+    var word = 0u;
+    for (var b = 0u; b < 4u; b++) {
+      let i = li * 64u + wi * 4u + b;
+      let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK,
+                                  i / (CHUNK * CHUNK)));
+      let cc = base + l;   // level-cell coords
+      // the sieve: fine-voxel center of the 2^level-wide region this cell covers
+      let fine = (cc << vec3<u32>(level)) + vec3<i32>(1 << (level - 1u));
+      let mat = genCell(fine, T.seed) & 0xFFFu;
+      var byteV = 0u;
+      if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
+        byteV = min(mat, 255u);
+        count += 1u;
+      }
+      word |= byteV << (b * 8u);
+    }
+    farVox[wordBase + wi] = word;
+  }
+  atomicAdd(&wgFarCount, count);
+  workgroupBarrier();
+  if (li == 0u) {
+    farOcc[(level - 1u) * NUM_CHUNKS + slot] = atomicLoad(&wgFarCount);
+  }
+}
