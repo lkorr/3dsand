@@ -223,7 +223,8 @@
       "tags": [
         "dissolvable"
       ],
-      "molten": "water"
+      "molten": "water",
+      "opacity": 40
     },
     {
       "id": "snow",
@@ -422,7 +423,8 @@
       "tags": [
         "meltable"
       ],
-      "molten": "molten_glass"
+      "molten": "molten_glass",
+      "opacity": 22
     },
     {
       "id": "source_water",
