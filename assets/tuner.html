@@ -162,6 +162,28 @@
     font-family:var(--mono);font-size:12px;padding:6px;width:420px;min-height:40px;resize:vertical;
   }
   .ncbox{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--dim);padding-top:4px}
+
+  /* ---------- reaction conditions (light gate + neighbour scaling) ---------- */
+  .condbox{
+    display:flex;flex-direction:column;gap:8px;background:#12161e;border:1px solid #262e3c;
+    border-radius:6px;padding:8px 10px;min-width:430px;
+  }
+  .condbox>.hdr{
+    font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--faint);
+    display:flex;gap:8px;align-items:center;
+  }
+  .condbox .row{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
+  .condbox .why{font-size:11px;color:var(--faint);line-height:1.45;max-width:430px}
+  .condbox input[type=number]{width:66px;text-align:right}
+  .condbox .chk{display:flex;gap:5px;align-items:center;cursor:pointer;font-size:12px;color:var(--dim);padding-bottom:3px}
+  .ramp{display:flex;gap:3px;align-items:flex-end;height:34px}
+  .ramp .b{width:26px;background:#2a3446;border-radius:2px 2px 0 0;position:relative;min-height:1px}
+  .ramp .b.on{background:linear-gradient(#6f9bd8,#3a6ea8)}
+  .ramp .b.zero{background:#3a2430;border:1px dashed #6d3b4d;box-sizing:border-box}
+  .ramplbl{display:flex;gap:3px;font-size:9.5px;color:var(--faint);font-family:var(--mono)}
+  .ramplbl span{width:26px;text-align:center}
+  .rampwrap{display:flex;flex-direction:column;gap:2px}
+  .condbox .warnline{font-size:11px;color:#e8c477;line-height:1.45;max-width:430px}
   .kind-pair{border-left:3px solid #3a6ea8}
   .kind-decay{border-left:3px solid #8a6ecf}
   .kind-emit{border-left:3px solid #4f9b4a}
@@ -1163,7 +1185,10 @@ function ruleRow(r,i,num,hidden,sorted){
   // chance
   const cw=el('div',{class:'chancewrap'});
   const sub=el('div',{class:'sub'},chanceHint(r));
-  const ci=bindNum(r,'chance','rx',{min:1,max:1000,oninput:()=>{sub.textContent=chanceHint(r);}});
+  const ci=bindNum(r,'chance','rx',{min:1,max:1000,oninput:()=>{
+    sub.textContent=chanceHint(r);
+    det._syncCond?.();  // the neighbour-scaling ramp is drawn from chance
+  }});
   ci.classList.remove('cell');
   cw.append(el('div',{class:'f'},el('span',{},'chance ‰'),ci),sub);
   row.append(cw);
@@ -1171,7 +1196,12 @@ function ruleRow(r,i,num,hidden,sorted){
   // actions — reordering is meaningless while sorted, so it is disabled there
   const acts=el('div',{class:'rxactions'});
   acts.append(rowMoveButtons(i,sorted));
-  const more=el('button',{class:'icon',title:'note / neighborClass'},r.note||r.neighborClass?'✎':'…');
+  const gated=r.needsSky||r.when||r.minLight!=null||r.scaleByNeighbors;
+  const more=el('button',{
+    class:'icon',
+    title:gated?'conditions set — light gate / neighbour scaling':'note / conditions / neighborClass',
+    style:gated?'color:#6f9bd8':'',
+  },gated?'◈':(r.note||r.neighborClass?'✎':'…'));
   const dup=el('button',{class:'icon',title:'duplicate below'},'⧉');
   dup.addEventListener('click',()=>{rx.reactions.splice(i+1,0,structuredClone(r));touch('rx');renderReactions();});
   const del=el('button',{class:'icon danger',title:'delete'},'✕');
@@ -1201,9 +1231,195 @@ function ruleRow(r,i,num,hidden,sorted){
     });
     det.append(box);
   }
+  const cond=condPanel(r,kind);
+  det.append(cond);
+  det._syncCond=cond._sync;
   more.addEventListener('click',()=>{det.style.display=det.style.display==='none'?'':'none';});
   row.append(det);
   return row;
+}
+
+/* ---- conditions: light gate + neighbour-count scaling ----------------------
+   These mirror the reactions.json fields parsed in src/sim/materials.cpp:
+     needsSky / when / minLight        -> ReactionGpu.cond bits 0..15
+     scaleByNeighbors {neighbor,invert,scaleMax} -> cond bits 16..31
+   Everything here changes voxel state, so the panel says so loudly: any edit
+   needs --selftest re-run (CLAUDE.md rule 1). scaleByNeighbors is decay-only
+   because a pair rule's neighbor fields already select its partner. */
+const SCALE_MUL_MIN=1, SCALE_MUL_MAX=4.75;  // kScaleMulMin/Max in materials.h
+
+// The exact integer ramp sim_step.wgsl's scaledChance() computes, in per-mille
+// (it works in a finer denominator internally; this divides back out so the
+// numbers read against the authored "chance ‰"). Count 0 is always a hard 0.
+function scaledChanceAt(chance,scaleMax,count,minCount){
+  if(count<Math.max(1,minCount||1))return 0;
+  const SCALE=20, UNIT=4;                       // REACT_CHANCE_SCALE, RSCALE_MUL_UNIT
+  const maxQ=Math.round(scaleMax*UNIT), span=maxQ-UNIT;
+  const num=chance*SCALE*(UNIT*5+span*(count-1));
+  return Math.min(Math.floor(num/(UNIT*5)),1000*SCALE)/SCALE;
+}
+function condPanel(r,kind){
+  const box=el('div',{class:'condbox'});
+  const isDecay=kind==='decay';
+  box.append(el('div',{class:'hdr'},'conditions — light gate & neighbour scaling',
+    el('span',{style:'color:#e06c75;letter-spacing:0'},'· changes the world hash · re-run --selftest')));
+
+  /* --- light gate: sky / phase / minimum daylight --- */
+  const lr=el('div',{class:'row'});
+  const skyCb=bindCheck(r,'needsSky','rx');
+  lr.append(el('label',{class:'chk',title:'the cell must have open sky directly above it'},skyCb,'needs sky'));
+
+  const whenSel=el('select',{});
+  [['','any time'],['day','day only'],['night','night only']].forEach(([v,l])=>
+    whenSel.append(el('option',{value:v},l)));
+  whenSel.value=r.when&&r.when!=='any'?r.when:'';
+  whenSel.addEventListener('change',()=>{
+    if(whenSel.value==='')delete r.when;else r.when=whenSel.value;
+    touch('rx');syncLight();
+  });
+  lr.append(el('div',{class:'f'},el('span',{},'when'),whenSel));
+
+  const mlSub=el('div',{class:'chancewrap'});
+  const mlHint=el('div',{class:'sub'});
+  const ml=bindNum(r,'minLight','rx',{min:0,max:255,ph:'0',oninput:()=>syncLight()});
+  ml.classList.remove('cell');
+  mlSub.append(el('div',{class:'f'},el('span',{},'min light 0-255'),ml),mlHint);
+  lr.append(mlSub);
+  box.append(lr);
+
+  const lightWhy=el('div',{class:'why'});
+  box.append(lightWhy);
+  function syncLight(){
+    const v=r.minLight??0;
+    mlHint.textContent=v===0?'any brightness':v>=200?'near noon only':v>=120?'high sun':'mid-morning on';
+    const bits=[];
+    if(r.needsSky)bits.push('only cells with open sky above (a pond surface, not its depths, and nothing under a roof)');
+    if(r.when==='day')bits.push('only while the sun is up');
+    else if(r.when==='night')bits.push('only while the sun is down');
+    if(v>0)bits.push(`only once daylight strength reaches ${v}/255`);
+    lightWhy.textContent=bits.length
+      ?'Fires '+bits.join(', ')+'. Light-gated rules do not hold their chunk awake; the engine wakes the world when the day phase flips.'
+      :'Unconditional — fires regardless of light or time of day.';
+  }
+  syncLight();
+
+  if(!isDecay){
+    box.append(el('div',{class:'why'},
+      'Neighbour-count scaling is decay-only: a pair rule’s neighbor field already selects its partner, so there is nowhere to put a second predicate. The engine rejects it with an error.'));
+    return box;
+  }
+
+  /* --- neighbour-count scaling --- */
+  const sr=el('div',{class:'row'});
+  const onCb=el('input',{type:'checkbox'});
+  onCb.checked=!!r.scaleByNeighbors;
+  onCb.addEventListener('change',()=>{
+    if(onCb.checked)r.scaleByNeighbors={neighbor:r.self??'any',invert:true,scaleMax:4};  // the frontier default: count neighbours unlike me
+    else delete r.scaleByNeighbors;
+    touch('rx');renderReactions();
+  });
+  sr.append(el('label',{class:'chk',title:'scale this rule’s chance by how many of the 6 face neighbours match'},onCb,'scale by neighbours'));
+  box.append(sr);
+
+  const s=r.scaleByNeighbors;
+  if(!s){
+    box.append(el('div',{class:'why'},
+      'Off — the rule fires at its flat chance everywhere it matches. Turn this on to make it spread from a FRONTIER instead of nucleating uniformly: the chance scales with how many of the six face neighbours match, and a count of zero forbids it outright.'));
+    return box;
+  }
+
+  const cfg=el('div',{class:'row'});
+  const nb=el('input',{class:'nb',list:'dl-neighbor',value:s.neighbor??'',spellcheck:'false',placeholder:'id / tag:x'});
+  const nbWrap=el('div',{class:'withsw'});
+  let nbIcon=swatch(s.neighbor);
+  nbWrap.append(nbIcon,nb);
+  nb.addEventListener('change',()=>{
+    s.neighbor=nb.value.trim();touch('rx');
+    const next=swatch(s.neighbor);nbWrap.replaceChild(next,nbIcon);nbIcon=next;
+    sync();
+  });
+  cfg.append(el('div',{class:'f'},el('span',{},'count neighbours'),nbWrap));
+
+  const invSel=el('select',{});
+  [['1','that are NOT it'],['0','that ARE it']].forEach(([v,l])=>invSel.append(el('option',{value:v},l)));
+  invSel.value=s.invert?'1':'0';
+  invSel.addEventListener('change',()=>{
+    if(invSel.value==='1')s.invert=true;else delete s.invert;
+    touch('rx');sync();
+  });
+  cfg.append(el('div',{class:'f'},el('span',{},'matching'),invSel));
+
+  const mc=el('input',{class:'num',type:'number',step:'1',min:1,max:4});
+  mc.value=s.minCount??1;
+  mc.addEventListener('input',()=>{
+    const v=Math.round(+mc.value);
+    if(mc.value.trim()!==''&&isFinite(v)){
+      const cl=Math.min(4,Math.max(1,v));
+      if(cl===1)delete s.minCount;else s.minCount=cl;
+    }
+    touch('rx');sync();
+  });
+  cfg.append(el('div',{class:'f',title:'below this many matching neighbours the rule cannot fire at all'},
+    el('span',{},'min count 1-4'),mc));
+
+  const mx=el('input',{class:'num',type:'number',step:'0.25',min:SCALE_MUL_MIN,max:SCALE_MUL_MAX});
+  mx.value=s.scaleMax??1;
+  mx.addEventListener('input',()=>{
+    const v=+mx.value;
+    if(mx.value.trim()!==''&&isFinite(v))s.scaleMax=Math.min(SCALE_MUL_MAX,Math.max(SCALE_MUL_MIN,Math.round(v*4)/4));
+    touch('rx');sync();
+  });
+  cfg.append(el('div',{class:'f'},el('span',{},'max × at 6'),mx));
+  box.append(cfg);
+
+  // The ramp: what the rule's real chance is at each neighbour count 0..6.
+  const rampWrap=el('div',{class:'rampwrap'});
+  const ramp=el('div',{class:'ramp'});
+  const lbl=el('div',{class:'ramplbl'});
+  for(let i=0;i<=6;i++)lbl.append(el('span',{},String(i)));
+  rampWrap.append(ramp,lbl,el('div',{class:'why'},'effective chance ‰ by matching-neighbour count (0 = cannot fire)'));
+  box.append(rampWrap);
+
+  const why=el('div',{class:'why'});
+  const warn=el('div',{class:'warnline'});
+  box.append(why,warn);
+
+  function sync(){
+    const base=r.chance??0, smax=s.scaleMax??1, minc=s.minCount??1;
+    const vals=[];for(let i=0;i<=6;i++)vals.push(scaledChanceAt(base,smax,i,minc));
+    const peak=Math.max(...vals,0.0001);
+    ramp.innerHTML='';
+    vals.forEach((v,i)=>{
+      const b=el('div',{class:'b'+(v>0?' on':' zero'),
+        title:`${i} neighbour${i===1?'':'s'} → ${v?v.toFixed(2)+'‰':'never fires'}`});
+      b.style.height=(v>0?Math.max(3,Math.round(v/peak*34)):3)+'px';
+      ramp.append(b);
+    });
+    const nbName=s.neighbor||'?', not=s.invert?'not ':'';
+    const ref=r.self&&nbName===r.self&&s.invert;
+    // The immunity sentence is only meaningful in the inverted case, where the
+    // counted set is the complement of what the reader is picturing.
+    const immune=s.invert
+      ? `, so anything with ${6-minc+1} or more ${nbName} neighbours is immune`
+      : `, so anything with ${6-minc+1} or more non-${nbName} neighbours is immune`;
+    const gate=minc>1
+      ? `Below ${minc} it CANNOT fire at all${immune}. At ${minc} it runs at the base ${base||'?'}‰`
+      : `At 0 it CANNOT fire; at 1 it runs at the base ${base||'?'}‰`;
+    why.textContent=
+      `Counts how many of the 6 face neighbours are ${not}${nbName}. `+gate+
+      `; at 6 it runs ${smax}× that (${vals[6].toFixed(2)}‰). `+
+      (ref?`Because ${r.self} counts neighbours that are NOT ${r.self}, this is a frontier rule: `
+          +`voxels deep inside a mass of ${r.self} are fully surrounded and can never fire, while ones `
+          +`at the surface or against a wall fire fastest — and each conversion raises its neighbours’ odds, so the front creeps inward.`
+          +(minc>1?` The min count of ${minc} pulls the frontier back further: a flat surface (1 non-${r.self} neighbour) is immune, and only genuinely exposed cells go.`:'')
+        :`A voxel fires fastest where the most neighbours match.`);
+    warn.textContent=vals[6]>=200
+      ? 'At high counts this exceeds 200‰ per tick — at 30 ticks/s that is effectively instant. Lower the base chance or the multiplier if you want it to read as gradual.'
+      : '';
+  }
+  sync();
+  box._sync=sync;
+  return box;
 }
 function refreshDatalists(){
   let dl=$('#dl-neighbor');if(!dl){dl=el('datalist',{id:'dl-neighbor'});document.body.append(dl);}
@@ -1216,12 +1432,22 @@ function refreshDatalists(){
 }
 
 /* ================= render: overview ================= */
+// Compact "when does this actually fire" tail for the overview sentences.
+function condSummary(r){
+  const bits=[];
+  if(r.when==='day')bits.push('day');else if(r.when==='night')bits.push('night');
+  if(r.needsSky)bits.push('sky');
+  if(r.minLight)bits.push('light≥'+r.minLight);
+  const s=r.scaleByNeighbors;
+  if(s)bits.push(`×${s.scaleMax??1} by ${s.invert?'non-':''}${s.neighbor||'?'} nbrs`);
+  return bits.length?` <span class="tag" title="conditions — see the reaction row">${bits.join(' · ')}</span>`:'';
+}
 function ruleSentence(r,selfId){
   const span=(cls,txt)=>`<span class="${cls}">${txt}</span>`;
   // inline swatch as HTML so it can sit inside these generated sentences
   const swHtml=ref=>swatch(ref).outerHTML;
   const name=x=>swHtml(x)+' '+(x?.startsWith?.('tag:')?span('tag',x):span('mat',x||'?'));
-  const pct=` <span class="pct">${r.chance??'?'}‰ ${chanceHint(r)}</span>`;
+  const pct=` <span class="pct">${r.chance??'?'}‰ ${chanceHint(r)}</span>`+condSummary(r);
   const arr=span('arr',' → ');
   if(r.decay)return`${name(r.self)} decays${arr}${name(r.becomes)}${pct}`;
   if(r.emit!==undefined)return`${name(r.self)} emits ${name(r.emit)}${r.dir?` (${r.dir})`:''}${r.selfBecomes?arr+name(r.selfBecomes):''}${pct}`;

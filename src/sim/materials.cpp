@@ -4,6 +4,11 @@
 #include <map>
 #include <nlohmann/json.hpp>
 
+// For the voxel-word stain limits (kStainTypeMax / kStainAmtMax): the stain a
+// material applies has to fit the field the voxel word reserves for it, and
+// world.h is the single source of truth for that layout.
+#include "sim/world.h"
+
 using nlohmann::json;
 
 static bool ParseColor(const std::string& hex, uint32_t& out) {
@@ -48,8 +53,98 @@ static int FindMaterial(const std::vector<MaterialDef>& mats, const std::string&
   return -1;
 }
 
+// Stain-type registry: stain name -> slot 1..7, assigned first-seen. Keyed by
+// NAME rather than by material so several materials can share one stain look
+// (any of the future gore materials can all stain "blood"), and so the slot
+// numbers stay stable as long as the file order of first use does.
+//
+// Only 7 slots exist — the voxel word can spare 3 bits and no more (world.h).
+// That is a deliberate ceiling: stains are a visual vocabulary of a handful of
+// kinds, not a per-material property. Running out is a loud load error.
+struct StainRegistry {
+  std::map<std::string, uint32_t> slots;
+  bool full = false;
+  uint32_t SlotOf(const std::string& name) {
+    auto it = slots.find(name);
+    if (it != slots.end()) return it->second;
+    if (slots.size() >= kStainTypeMax) {
+      full = true;
+      return 0;
+    }
+    uint32_t slot = (uint32_t)slots.size() + 1;  // 0 means "unstained"
+    slots[name] = slot;
+    return slot;
+  }
+};
+
+// Parses "stain": { type, color, amount, chance, consume } into stainPack +
+// stainColor. Absent = this material does not stain (stainPack 0), which is
+// every material that predates the feature.
+static void ParseStain(const json& m, const std::string& path,
+                       StainRegistry& stainReg, MaterialDef& d,
+                       std::string& errors) {
+  if (!m.contains("stain")) return;
+  const json& s = m["stain"];
+  if (!s.is_object()) {
+    errors += path + ": material \"" + d.name + "\": \"stain\" must be an object\n";
+    return;
+  }
+  // Only a liquid can stain what it touches. The sim rule runs off the liquid
+  // movement path, and a staining SOLID would need a different mechanism
+  // entirely — rejecting it here beats silently doing nothing at runtime.
+  if (d.gpu.klass != CLASS_LIQUID) {
+    errors += path + ": material \"" + d.name +
+              "\": only liquids can stain (class is not liquid)\n";
+    return;
+  }
+  d.stain = s.value("type", d.name);
+  uint32_t slot = stainReg.SlotOf(d.stain);
+  if (slot == 0) {
+    errors += path + ": material \"" + d.name + "\": more than " +
+              std::to_string(kStainTypeMax) + " distinct stain types\n";
+    return;
+  }
+
+  uint32_t color = 0;
+  if (s.contains("color")) {
+    if (!ParseColor(s["color"].get<std::string>(), color))
+      errors += path + ": material \"" + d.name +
+                "\": bad stain color (want #rrggbb)\n";
+  } else {
+    // Default to the material's own darkest palette entry: a stain is what the
+    // liquid leaves once it has soaked in and dried down, so it is a darker
+    // relative of the liquid, never a brand-new hue.
+    color = d.gpu.color1;
+  }
+  d.gpu.stainColor = color;
+
+  int amount = s.value("amount", 5);
+  int chance = s.value("chance", 60);
+  int consume = s.value("consume", 0);
+  if (amount < 1 || amount > (int)kStainAmtMax) {
+    errors += path + ": material \"" + d.name + "\": stain amount must be 1.." +
+              std::to_string(kStainAmtMax) + "\n";
+    amount = 5;
+  }
+  if (chance < 0 || chance > (int)kStainChanceMax) {
+    errors += path + ": material \"" + d.name +
+              "\": stain chance must be 0..1000 per-mille\n";
+    chance = 0;
+  }
+  if (consume < 0 || consume > (int)kStainChanceMax) {
+    errors += path + ": material \"" + d.name +
+              "\": stain consume must be 0..1000 per-mille\n";
+    consume = 0;
+  }
+  d.gpu.stainPack = ((uint32_t)slot << kStainPackTypeShift) |
+                    ((uint32_t)amount << kStainPackAmtShift) |
+                    ((uint32_t)chance << kStainPackChanceShift) |
+                    ((uint32_t)consume << kStainPackConsumeShift);
+}
+
 static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>& mats,
-                              TagRegistry& tagReg, std::string& errors) {
+                              TagRegistry& tagReg, StainRegistry& stainReg,
+                              std::string& errors) {
   std::ifstream f(path);
   if (!f) {
     errors += "cannot open " + path + "\n";
@@ -138,6 +233,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
 
     d.rubble = m.value("rubble", "");
     d.molten = m.value("molten", "");
+    ParseStain(m, path, stainReg, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
       uint32_t bit = tagReg.MaskOf(t, true);
@@ -178,6 +274,105 @@ static uint32_t ParseDir(const json& r, const std::string& path,
   if (dir == "side") return kDirSide;
   errors += path + ": reaction self=\"" + self + "\": unknown dir \"" + dir + "\"\n";
   return kDirAny;
+}
+
+// Parses the neighbour-matching vocabulary — "neighbor" (exact id / "tag:x" /
+// "any") plus an optional "neighborClass" list — into nbrMat/nbrTags/nbrClass.
+// Shared by pair rules (where it selects the reacting partner) and by
+// scaleByNeighbors (where it selects what gets counted), so both speak exactly
+// the same language.
+static void ParseNbrPredicate(const json& r, const std::vector<MaterialDef>& mats,
+                              TagRegistry& tagReg, const std::string& path,
+                              const std::string& self, ReactionGpu& g,
+                              std::string& errors) {
+  if (r.contains("neighbor")) {
+    std::string nbr = r["neighbor"].get<std::string>();
+    if (nbr.rfind("tag:", 0) == 0) {
+      std::string tag = nbr.substr(4);
+      uint32_t bit = tagReg.MaskOf(tag, false);
+      if (bit == 0)
+        errors += path + ": reaction self=\"" + self + "\": tag \"" + tag +
+                  "\" not declared by any material\n";
+      g.nbrTags = bit;
+    } else if (nbr == "air") {
+      g.nbrMat = 0;
+    } else if (nbr != "any") {
+      int id = FindMaterial(mats, nbr);
+      if (id < 0)
+        errors += path + ": reaction self=\"" + self + "\": unknown neighbor \"" + nbr + "\"\n";
+      else
+        g.nbrMat = (uint32_t)id;
+    }
+  }
+  if (r.contains("neighborClass")) {
+    for (auto& c : r["neighborClass"]) {
+      std::string cls = c.get<std::string>();
+      if (cls == "solid") g.nbrClass |= 1u << CLASS_SOLID;
+      else if (cls == "powder") g.nbrClass |= 1u << CLASS_POWDER;
+      else if (cls == "liquid") g.nbrClass |= 1u << CLASS_LIQUID;
+      else if (cls == "gas") g.nbrClass |= 1u << CLASS_GAS;
+      else errors += path + ": reaction self=\"" + self + "\": unknown class \"" + cls + "\"\n";
+    }
+  }
+}
+
+// "scaleByNeighbors": scales the rule's chance by how many of the 6 face
+// neighbours match a predicate, and forbids it entirely at a count of zero.
+// See the ReactionGpu.cond comment in materials.h for the bit layout and the
+// reactions.json note for why a frontier rule needs this.
+static void ParseNeighborScale(const json& r, const std::vector<MaterialDef>& mats,
+                               TagRegistry& tagReg, const std::string& path,
+                               const std::string& self, uint32_t kind,
+                               ReactionGpu& g, std::string& errors) {
+  if (!r.contains("scaleByNeighbors")) return;
+  const json& s = r["scaleByNeighbors"];
+  if (!s.is_object()) {
+    errors += path + ": reaction self=\"" + self +
+              "\": scaleByNeighbors must be an object\n";
+    return;
+  }
+  // A pair rule already consumes nbrMat/nbrTags/nbrClass to pick its partner,
+  // so it has nowhere to put a second, different predicate. Rejecting this is
+  // better than silently counting the partner set.
+  if (kind != kReactDecay) {
+    errors += path + ": reaction self=\"" + self +
+              "\": scaleByNeighbors is only supported on decay rules "
+              "(a pair rule's neighbor fields already select its partner)\n";
+    return;
+  }
+  g.cond |= kScaleEnable;
+  if (s.value("invert", false)) g.cond |= kScaleInvert;
+  ParseNbrPredicate(s, mats, tagReg, path, self, g, errors);
+  if (g.nbrMat == kNbrAny && g.nbrTags == 0 && g.nbrClass == 0 &&
+      (g.cond & kScaleInvert) == 0) {
+    // "count anything" matches all 6 neighbours in solid matter and 0 in a
+    // vacuum, which is not a frontier — almost certainly an authoring slip.
+    errors += path + ": reaction self=\"" + self +
+              "\": scaleByNeighbors needs a neighbor/neighborClass to count\n";
+  }
+  // "minCount": a floor on the matching count. 1 (the default) is the plain
+  // "any matching neighbour lets it fire" behaviour; higher values demand a
+  // wider frontier, which is how evaporation says a lone droplet boils off
+  // but a flat pond surface does not.
+  if (s.contains("minCount")) {
+    int mc = s.value("minCount", 1);
+    if (mc < (int)kScaleMinCountMin || mc > (int)kScaleMinCountMax) {
+      errors += path + ": reaction self=\"" + self + "\": minCount must be " +
+                std::to_string(kScaleMinCountMin) + ".." +
+                std::to_string(kScaleMinCountMax) + "\n";
+      return;
+    }
+    g.cond |= ((uint32_t)(mc - 1) & kScaleMinMask) << kScaleMinShift;
+  }
+  float mul = s.value("scaleMax", 1.0f);
+  if (mul < kScaleMulMin || mul > kScaleMulMax) {
+    errors += path + ": reaction self=\"" + self + "\": scaleMax must be " +
+              std::to_string(kScaleMulMin) + ".." + std::to_string(kScaleMulMax) + "\n";
+    return;
+  }
+  // Quantized to quarters and biased by 1.0x — see materials.h.
+  uint32_t q = (uint32_t)(mul * (float)kScaleMulUnit + 0.5f) - kScaleMulUnit;
+  g.cond |= (q & kScaleMulMask) << kScaleMulShift;
 }
 
 static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>& mats,
@@ -260,31 +455,7 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
       g.prodSelf = ParseProduct(r, "selfBecomes", mats, path, self, errors);
     } else if (r.contains("neighbor")) {
       kind = kReactPair;
-      std::string nbr = r["neighbor"].get<std::string>();
-      if (nbr.rfind("tag:", 0) == 0) {
-        std::string tag = nbr.substr(4);
-        uint32_t bit = tagReg.MaskOf(tag, false);
-        if (bit == 0)
-          errors += path + ": reaction self=\"" + self + "\": tag \"" + tag +
-                    "\" not declared by any material\n";
-        g.nbrTags = bit;
-      } else if (nbr != "any") {
-        int id = FindMaterial(mats, nbr);
-        if (id < 0)
-          errors += path + ": reaction self=\"" + self + "\": unknown neighbor \"" + nbr + "\"\n";
-        else
-          g.nbrMat = (uint32_t)id;
-      }
-      if (r.contains("neighborClass")) {
-        for (auto& c : r["neighborClass"]) {
-          std::string cls = c.get<std::string>();
-          if (cls == "solid") g.nbrClass |= 1u << CLASS_SOLID;
-          else if (cls == "powder") g.nbrClass |= 1u << CLASS_POWDER;
-          else if (cls == "liquid") g.nbrClass |= 1u << CLASS_LIQUID;
-          else if (cls == "gas") g.nbrClass |= 1u << CLASS_GAS;
-          else errors += path + ": reaction self=\"" + self + "\": unknown class \"" + cls + "\"\n";
-        }
-      }
+      ParseNbrPredicate(r, mats, tagReg, path, self, g, errors);
       g.prodSelf = ParseProduct(r, "selfBecomes", mats, path, self, errors);
       g.prodNbr = ParseProduct(r, "neighborBecomes", mats, path, self, errors);
       if (g.prodSelf == kProdKeep && g.prodNbr == kProdKeep)
@@ -295,6 +466,9 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
                 "\": need one of \"neighbor\", \"decay\", \"emit\"\n";
       continue;
     }
+    // After `kind` is known: scaling rejects non-decay rules, whose neighbour
+    // fields are already spoken for.
+    ParseNeighborScale(r, mats, tagReg, path, self, kind, g, errors);
     g.packed = (kind & 3u) | ((dirMask & 7u) << 2u);
     buckets[selfId].push_back(g);
   }
@@ -317,7 +491,8 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
   std::vector<MaterialDef> m;
   std::vector<ReactionGpu> r;
   TagRegistry tags;
-  bool ok = LoadMaterialsJson(materialsPath, m, tags, errors);
+  StainRegistry stains;
+  bool ok = LoadMaterialsJson(materialsPath, m, tags, stains, errors);
   if (ok) LoadReactionsJson(reactionsPath, m, tags, r, errors);
   for (auto& d : m) {
     if (!d.rubble.empty() && FindMaterial(m, d.rubble) < 0)

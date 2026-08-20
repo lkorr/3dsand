@@ -502,6 +502,72 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     render({(float)(gx - 26), (float)(gh + 14), (float)(gz - 26)}, 0.785f,
            -0.32f, "screenshot_lava_spatter.bmp");
   }
+
+  // ---- blood: the spatter case AND the pooled case, in one frame ----
+  // Blood's whole shading problem is that it is usually NOT a still pool: it
+  // comes out of NPCs as droplets, runs and thin trails. shadeViscous blends
+  // between a droplet look and a pool look, so the shot has to contain both or
+  // half the model goes unreviewed — and the failure mode being guarded
+  // against here (every voxel shading as its own little cube) shows up on the
+  // scattered droplets long before it shows up on a pool.
+  //
+  // Laid out as: a filled basin, a run of blood down a step, and a field of
+  // isolated droplets, all in one view. Deterministic placement, no rand(),
+  // so the shot is reproducible frame to frame like every other look shot.
+  {
+    std::vector<CellOp> gore;
+    int gx = 340, gz = 300;
+    int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
+    auto put = [&](int x, int y, int z, uint32_t mat) {
+      IVec3 c{x, y, z};
+      if (!world.CellInWindow(c)) return;
+      uint32_t state = (mat == kMatAir) ? 0u : 7u;  // liquids are born full
+      gore.push_back({World::SlotCellIndex(c),
+                      (mat & 0xFFFu) | (state << 12) | (0xFFu << 16)});
+    };
+    // A stone basin holding a pool: the "still pool" end of the blend, and the
+    // surface that the surrounding stone gets stained by.
+    for (int z = -7; z <= 7; z++)
+      for (int x = -7; x <= 7; x++) {
+        bool rim = (x < -6 || x > 6 || z < -6 || z > 6);
+        put(gx + x, gh + 1, gz + z, kMatStone);
+        put(gx + x, gh + 2, gz + z, rim ? kMatStone : kMatBlood);
+      }
+    // A run down a two-step ledge: the vertical-trail case, which is where a
+    // height-field normal (water's model) would fail outright.
+    for (int i = 0; i < 10; i++) {
+      put(gx + 10, gh + 2 - i / 3, gz - 6 + i, kMatStone);
+      put(gx + 10, gh + 3 - i / 3, gz - 6 + i, kMatBlood);
+    }
+    // Isolated droplets scattered over open ground: the "in flight / just
+    // landed" end, and the case that reads as gelatin cubes when the surface
+    // normal is per-voxel rather than from the smooth field.
+    for (int i = 0; i < 48; i++) {
+      int ox = ((i * 37) % 21) - 10;
+      int oz = ((i * 53) % 25) - 12;
+      int oy = ((i * 29) % 2);
+      put(gx - 22 + ox, gh + 1 + oy, gz + oz, kMatBlood);
+    }
+    // Only a few ticks of settle. Blood carries a decay rule ("blood dries
+    // away", reactions.json) at 8 per-mille, so a long settle leaves nothing
+    // but the STAIN in frame — which is a fine shot of the stain layer and a
+    // useless one for judging the liquid. 12 ticks is enough for the pool to
+    // find its surface and the droplets to land, and ~91% of the blood is
+    // still there.
+    for (uint32_t t = 121; t <= 132; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 t == 121 ? gore : std::vector<CellOp>{}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    // Low and close across the basin: the grazing angle where the wet sheen
+    // and the Fresnel rim have to carry it, with the droplet field in frame.
+    render({(float)(gx - 30), (float)(gh + 9), (float)(gz - 24)}, 0.60f, -0.22f,
+           "screenshot_blood.bmp");
+    // Looking down into the pool: the low-Fresnel angle, where the body colour
+    // and the stain on the surrounding stone carry the frame instead.
+    render({(float)gx, (float)(gh + 16), (float)(gz + 14)}, -1.571f, -0.85f,
+           "screenshot_blood_down.bmp");
+  }
   return 0;
 }
 
@@ -812,6 +878,273 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 pondOk ? "PASS" : "FAIL", edgeIce, edgeN, midIce, midN,
                 iceTotal, violations);
     SetCurrentTuning(saved);
+  }
+
+  // ---- the sun dries spread water, not bodies of water -----------------------
+  // The mirror of the pond-freeze test above, and it asserts the thing that
+  // actually went wrong: evaporation used to be a flat chance on any sunlit
+  // surface cell, so a pond boiled off from its whole top face in seconds.
+  // The fix is scaleByNeighbors with minCount 4 — a cell must have >= 4
+  // non-water face neighbours before the sun can take it.
+  //
+  // A rate comparison would be weak here for the same reason it was for
+  // freezing, so this asserts the two ENDS of the rule as hard invariants on
+  // the final state:
+  //
+  //   1. A pond does NOT shrink. Its surface counts 1 non-water neighbour
+  //      (the air above), which is below minCount, so after thousands of
+  //      sunlit ticks every last surface cell must still be water. One
+  //      missing cell means the gate is not being applied.
+  //   2. Isolated droplets DO go. A single water voxel sitting on stone
+  //      counts 5-6 non-water neighbours and must evaporate.
+  //
+  // Together they pin the rule from both sides: (1) alone passes a rule that
+  // never fires, (2) alone passes the old always-fires rule.
+  bool evapOk = false;
+  {
+    auto matId = [&](const char* n) {
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == n) return (int)i;
+      return -1;
+    };
+    const int wi = matId("water"), si = matId("stone");
+    // Pin the cycle at noon so the day-gated rule is at full strength every
+    // tick (minLight 120 needs a high sun).
+    Tuning noon = CurrentTuning();
+    noon.dayNight.freeze = 1;
+    noon.dayNight.freezePhase = 32768;  // 32768 = noon
+    Tuning saved = CurrentTuning();
+    SetCurrentTuning(noon);
+
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+
+    // Left: a walled pond, 3 deep, open to the sky. Right: a row of single
+    // water voxels on a stone shelf, spaced 3 apart so none touches another
+    // (spacing matters — two adjacent droplets would each count a water
+    // neighbour and drop toward the gate).
+    const int px = 80, py = 120, pz = 96, R = 8, kDepth = 3;
+    const int dx = 120, kDrops = 12;
+    std::vector<CellOp> scene;
+    auto put = [&](int x, int y, int z, int m) {
+      uint32_t state = (m == wi) ? 7u : 0u;  // liquids are born full
+      scene.push_back({World::SlotCellIndex({x, y, z}),
+                       (uint32_t)((m & 0xFFF) | (state << 12))});
+    };
+    for (int z = -R - 1; z <= R + 1; z++)
+      for (int x = -R - 1; x <= R + 1; x++) {
+        put(px + x, py - 1, pz + z, si);  // floor
+        bool rim = (x < -R || x > R || z < -R || z > R);
+        for (int y = 0; y < kDepth; y++) put(px + x, py + y, pz + z, rim ? si : wi);
+        for (int y = kDepth; y < kDepth + 3; y++) put(px + x, py + y, pz + z, 0);
+      }
+    for (int i = 0; i < kDrops; i++) {
+      const int x = dx + i * 3;
+      put(x, py - 1, pz, si);            // shelf under the droplet
+      put(x, py, pz, wi);                // the droplet itself
+      for (int y = 1; y < 4; y++) put(x, py + y, pz, 0);  // open sky above
+    }
+    uint32_t et = 1;
+    SubmitTick(ctx, world, sim, et, kDefaultSeed, {}, {}, scene, false,
+               {6, 7, 6}, false, false);
+    ctx.WaitIdle();
+
+    // Long enough that a droplet at ~2-3 per-mille is overwhelmingly likely to
+    // have gone (P(survive) < 1e-3 at 2500 ticks), and long enough that the
+    // old flat 2 per-mille rule would have stripped the pond surface many
+    // times over.
+    for (uint32_t t = 2; t <= 2500; t++)
+      SubmitTick(ctx, world, sim, ++et, kDefaultSeed, {}, {}, {}, false,
+                 {6, 7, 6}, false, false);
+    ctx.WaitIdle();
+
+    std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+    {
+      const uint64_t bytes = (uint64_t)vox.size() * 4;
+      wgpu::Buffer st = CreateBuffer(ctx.device, bytes,
+                                     wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                     "evapRead");
+      wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+      e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
+      wgpu::CommandBuffer c = e.Finish();
+      ctx.queue.Submit(1, &c);
+      wgpu::Future f = st.MapAsync(
+          wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
+            if (s2 == wgpu::MapAsyncStatus::Success) {
+              std::memcpy(vox.data(), st.GetConstMappedRange(0, bytes), bytes);
+              st.Unmap();
+            }
+          });
+      ctx.instance.WaitAny(f, UINT64_MAX);
+    }
+    auto readCell = [&](int x, int y, int z) {
+      return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
+    };
+
+    // (1) The pond's surface layer must be intact — every cell still water.
+    const int surf = py + kDepth - 1;
+    uint32_t surfN = 0, surfWater = 0;
+    for (int z = -R; z <= R; z++)
+      for (int x = -R; x <= R; x++) {
+        surfN++;
+        if (readCell(px + x, surf, pz + z) == (uint32_t)wi) surfWater++;
+      }
+    // (2) The droplets must be gone.
+    uint32_t dropsLeft = 0;
+    for (int i = 0; i < kDrops; i++)
+      if (readCell(dx + i * 3, py, pz) == (uint32_t)wi) dropsLeft++;
+
+    evapOk = surfWater == surfN && dropsLeft == 0;
+    std::printf("evaporation: %s (pond surface %u/%u water after 2500 noon "
+                "ticks, %u/%d isolated droplets left)\n",
+                evapOk ? "PASS" : "FAIL", surfWater, surfN, dropsLeft, kDrops);
+    SetCurrentTuning(saved);
+  }
+
+  // ---- blood stains what it touches, and then goes to sleep ------------------
+  // Staining writes the voxel word's spare bits (kStain*, world.h) from the
+  // liquid movement path in sim_step.wgsl. Three separate things have to hold,
+  // and none of them is visible to the hash test:
+  //
+  //   1. It HAPPENS — stone under a pool of blood ends up carrying a stain of
+  //      the right type. (A rule that silently never fires still hashes fine.)
+  //   2. It TERMINATES — the chunk goes back to sleep. This is the rule-2 risk
+  //      and the one that would not show up until a level is full of gore: a
+  //      pool of blood sits on stone forever, so a naive "keep me awake while
+  //      I'm touching something stainable" would pin those chunks awake for
+  //      the rest of the session. doStaining only holds the chunk while there
+  //      is UNSTAINED surface left in reach, and this is what proves it.
+  //   3. It stays BOUNDED — stain amounts saturate at kStainAmtMax rather than
+  //      overflowing into the neighbouring bits of the word (which would
+  //      corrupt the tick-stamp and, one bit further, the material id).
+  bool stainOk = false;
+  {
+    auto matId = [&](const char* n) {
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == n) return (int)i;
+      return -1;
+    };
+    const int bi = matId("blood"), si = matId("stone");
+    const uint32_t stainType = mats[bi].gpu.stainPack & kStainPackTypeMask;
+
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+
+    // A stone basin with blood poured into it, in open air well clear of the
+    // terrain. The floor and walls are what should end up stained.
+    const int px = 96, py = 120, pz = 96, R = 6;
+    std::vector<CellOp> pool;
+    auto put = [&](int x, int y, int z, int m) {
+      uint32_t state = (m == bi) ? 7u : 0u;  // liquids are born full
+      pool.push_back({World::SlotCellIndex({x, y, z}),
+                      (uint32_t)((m & 0xFFF) | (state << 12))});
+    };
+    for (int z = -R - 1; z <= R + 1; z++)
+      for (int x = -R - 1; x <= R + 1; x++) {
+        put(px + x, py - 1, pz + z, si);  // floor
+        bool rim = (x < -R || x > R || z < -R || z > R);
+        for (int y = 0; y < 2; y++) put(px + x, py + y, pz + z, rim ? si : bi);
+        for (int y = 2; y < 5; y++) put(px + x, py + y, pz + z, 0);
+      }
+    uint32_t st = 1;
+    SubmitTick(ctx, world, sim, st, kDefaultSeed, {}, {}, pool, false,
+               {6, 7, 6}, false, false);
+    ctx.WaitIdle();
+    // Run until the blood has DRIED AWAY, not merely until it has finished
+    // staining. Blood carries an unconditional decay rule ("blood dries away",
+    // reactions.json) at 8 per-mille, which correctly holds its chunks awake
+    // for as long as any blood is left — so a shorter run would measure a pool
+    // that is still mid-evaporation and say nothing about sleep.
+    //
+    // Waiting for the dry-out is the stronger test anyway: it asserts that the
+    // STAIN OUTLIVES THE LIQUID. That is the whole point of putting stain in
+    // the voxel word rather than deriving it from what is standing there — the
+    // mark on the floor has to survive the blood evaporating off it, and it
+    // has to do so without keeping the chunk awake.
+    // 8 per-mille gives a half-life of ~87 ticks; 4000 is ~46 half-lives.
+    const uint32_t kDryTicks = 4000;
+    for (uint32_t t = 2; t <= kDryTicks; t++)
+      SubmitTick(ctx, world, sim, ++st, kDefaultSeed, {}, {}, {}, false,
+                 {6, 7, 6}, false, false);
+    ctx.WaitIdle();
+
+    std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+    {
+      const uint64_t bytes = (uint64_t)vox.size() * 4;
+      wgpu::Buffer sb = CreateBuffer(ctx.device, bytes,
+                                     wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                     "stainRead");
+      wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+      e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
+      wgpu::CommandBuffer c = e.Finish();
+      ctx.queue.Submit(1, &c);
+      wgpu::Future f = sb.MapAsync(
+          wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
+            if (s2 == wgpu::MapAsyncStatus::Success) {
+              std::memcpy(vox.data(), sb.GetConstMappedRange(0, bytes), bytes);
+              sb.Unmap();
+            }
+          });
+      ctx.instance.WaitAny(f, UINT64_MAX);
+    }
+
+    // Count stained floor voxels, and check every stain in the world is
+    // well-formed: right type, amount within the field, and never on air.
+    uint32_t stainedFloor = 0, floorN = 0, badStain = 0, consumed = 0;
+    for (int z = -R; z <= R; z++)
+      for (int x = -R; x <= R; x++) {
+        floorN++;
+        uint32_t w = vox[World::SlotCellIndex({px + x, py - 1, pz + z})];
+        if ((w & 0xFFFu) == 0u) { consumed++; continue; }  // eaten by the stain
+        if (VoxStainType(w) == stainType && VoxStainAmt(w) > 0) stainedFloor++;
+      }
+    for (size_t i = 0; i < vox.size(); i++) {
+      uint32_t w = vox[i];
+      uint32_t type = VoxStainType(w), amt = VoxStainAmt(w);
+      if (type == 0 && amt == 0) continue;
+      // A stain must have both halves, name a registered type, fit the field,
+      // and sit on actual matter.
+      if (type != stainType || amt == 0 || amt > kStainAmtMax ||
+          (w & 0xFFFu) == 0u) {
+        badStain++;
+      }
+    }
+
+    // How much blood is left? The sleep assertion only means anything once the
+    // pool has actually dried, so report it rather than assuming.
+    uint32_t bloodLeft = 0;
+    for (size_t i = 0; i < vox.size(); i++)
+      if ((vox[i] & 0xFFFu) == (uint32_t)bi) bloodLeft++;
+
+    uint32_t stainActive = ReadActiveChunksSync(ctx, world, sim);
+    // Four assertions, each covering a different way this could be broken:
+    //   covered   — the stain HAPPENED (a rule that never fires still hashes)
+    //   badStain  — every stain is well-formed and none landed on air, so the
+    //               packing never overflowed into the stamp or material bits
+    //   bloodLeft — the pool really did dry, so the sleep check below is
+    //               measuring a settled world and not a mid-reaction one
+    //   active    — and the stained floor SLEEPS. This is the rule-2 half: a
+    //               stain is permanent, so if it held its chunk awake the way
+    //               a naive "am I touching something stainable" rule would,
+    //               every gore-soaked chunk would stay awake for the session.
+    //
+    // bloodLeft is checked against a small threshold, not zero. A handful of
+    // isolated voxels can settle in a chunk that then goes to sleep with no
+    // neighbour left to wake it, and a sleeping chunk does not run reactions —
+    // so their decay is simply paused until something disturbs them. That is
+    // the sleep rule working as designed (cost scales with activity), not a
+    // stuck reaction, and it is exactly why `active` is the assertion that
+    // matters here rather than a demand that every last voxel evaporate.
+    bool covered = stainedFloor + consumed > floorN / 2 && stainedFloor > 0;
+    const uint32_t kBloodDregs = 16;  // isolated voxels in sleeping chunks
+    stainOk = covered && badStain == 0 && bloodLeft <= kBloodDregs &&
+              stainActive < 32;
+    std::printf("blood stain: %s (%u/%u floor stained, %u consumed, %u malformed, "
+                "%u blood left, %u chunks active after %u ticks)\n",
+                stainOk ? "PASS" : "FAIL", stainedFloor, floorN, consumed,
+                badStain, bloodLeft, stainActive, kDryTicks);
   }
 
   // sim perf: worst-case-ish activity (brushes + explosions + particles),
@@ -1678,7 +2011,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk && sleepOk && pondOk && debrisOk &&
+  bool pass = deterministic && walkOk && sleepOk && pondOk && evapOk && stainOk && debrisOk &&
               prefabOk && mobOk && settleOk && pushOk && saveOk && storeOk &&
               streamOk && farDownOk && fogOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");

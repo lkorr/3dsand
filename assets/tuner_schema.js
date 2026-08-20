@@ -212,6 +212,68 @@ const TUNING_SCHEMA = [
   },
 
   {
+    id: 'ice',
+    title: 'Ice & Glass',
+    icon: '\u{1F9CA}',
+    apply: 'shader',
+    blurb: 'Translucent SOLIDS. Any solid whose material opacity is under 255 ' +
+           'takes this path — ice and glass today, crystal or amber tomorrow. ' +
+           'Absorption is per metre of the real path a ray takes through the ' +
+           'slab, so one setting covers both "thin rim ice is nearly clear" ' +
+           'and "a thick block is deep cyan" without authoring them separately.',
+    rows: [
+      {k:'iceAbsorb', n:'absorption', d:'Absorption per metre of depth, scaled by the material’s own opacity. This is the main knob: raise it and ice turns blue in a thinner slab.', min:0, max:12, step:0.05},
+      {k:'iceAbsorbFloor', n:'absorption floor', d:'Minimum absorption on every channel, so even the clearest ice tints slightly rather than becoming invisible glass.', min:0, max:1, step:0.005},
+      {k:'iceScatter', n:'internal scatter', d:'Trapped bubbles and grain boundaries scattering light back out. This is what separates ice from glass — drop it to zero and you get a clean window.', min:0, max:2, step:0.01},
+      {k:'iceScatterDepth', n:'scatter depth', d:'How fast the internal scatter saturates with thickness. Higher = shallow ice already looks milky.', min:0.1, max:8, step:0.05},
+      {k:'iceScatterNight', n:'scatter at night', d:'Fraction of the internal glow that survives with the sun down. Ice has no light to scatter at night, so this should stay low.', min:0, max:1, step:0.01},
+      {k:'iceF0', n:'reflectivity', d:'Head-on reflectance. Ice’s IOR (1.31) is nearly water’s, so ~2% is physical; the grazing-angle rise is what sells the surface.', min:0, max:0.3, step:0.001},
+      {k:'iceFresnelPower', n:'fresnel falloff', d:'Schlick exponent. Lower spreads the sky reflection further in from the grazing edge.', min:1, max:8, step:0.1},
+      {k:'iceGrain', n:'frost grain', d:'How much the surface normal is perturbed by frost. Zero is a flat mirror plate; too much and the ice reads as sandblasted.', min:0, max:0.6, step:0.005},
+      {k:'iceGrainScale', n:'frost scale', d:'Spatial frequency of the frost pattern, in world space so it does not swim with the camera.', min:0.02, max:3, step:0.01},
+      {k:'iceGloss', n:'gloss', d:'Specular exponent. Much tighter than water’s, because ice has no wave field to spread the highlight.', min:4, max:1200, step:2},
+      {k:'iceSpec', n:'highlight', d:'Strength of the specular glint — the cue that says hard and polished rather than soft.', min:0, max:3, step:0.01},
+      {k:'iceReflectMin', n:'reflection cutoff', d:'Fresnel weight below which the traced reflection falls back to a plain sky lookup. A translucent solid can show many surfaces to one ray, so this is a frame-time guard, not a look knob — raising it trades grazing-angle reflections for speed.', min:0, max:1, step:0.01},
+      {k:'iceDepthMax', n:'depth cutoff', d:'Metres of ice past which the ray stops marching. A perf bound: beyond this the far side cannot change the pixel anyway.', min:0.5, max:40, step:0.5, u:'m'},
+    ],
+  },
+
+  {
+    id: 'blood',
+    title: 'Blood & Stains',
+    icon: '\u{1FA78}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'Blood is neither water nor lava: it is nearly opaque, viscous, and usually in MOTION rather than sitting in a pool. The shader blends every term between a droplet look (bulged, bright, broad highlight) and a pool look (flat, dark, tight highlight) — the "droplet vs pool" pair below is where that line sits. Staining is the second half: a staining liquid marks what it touches, and may eat it.',
+    params: [
+      {k:'bloodSheen', n:'wet sheen', d:'Strength of the specular highlight. This is the single term that makes blood read as fluid instead of red paint — turn it to 0 and a splatter looks like a decal.', min:0, max:5, step:0.05},
+      {k:'bloodSheenDrop', n:'sheen size (droplet)', d:'Specular tightness on an isolated droplet. Deliberately BROAD: a bead is curved, so its highlight spreads across the whole face. Too tight and blood in flight disappears at any distance.', min:2, max:2000, step:2},
+      {k:'bloodSheenPool', n:'sheen size (pool)', d:'Specular tightness on a still pool. Tight, because a flat surface concentrates the highlight.', min:2, max:2000, step:2},
+      {k:'bloodAmbientSheen', n:'ambient sheen', d:'Sky-lit sheen, so blood still reads wet indoors or at night. Without it, blood out of direct light goes completely matte.', min:0, max:2, step:0.01},
+      {k:'bloodPoolLow', n:'droplet threshold', d:'Neighbourhood fraction below which a hit is treated as an isolated droplet. Keep low — the interesting split is "speck vs body", and raising it puts every pool RIM in the transition band and draws a ring around each puddle.', min:0, max:1, step:0.01},
+      {k:'bloodPoolHigh', n:'pool threshold', d:'Neighbourhood fraction above which a hit is fully a pool.', min:0, max:1, step:0.01},
+      {k:'bloodEdgeFeather', n:'edge softness', d:'Softens the SILHOUETTE. The smoothing knob fixes how blood is shaded; this fixes where it ends — the ray stops on a voxel face, so without it a droplet\'s outline is a hard cube however well it is lit. Raising it feathers the rim further; 0 gives back the hard voxel edge.', min:0, max:0.6, step:0.01},
+      {k:'bloodSmooth', n:'surface smoothing', d:'How far the surface-normal gradient reaches, in voxels. This is the anti-gelatin knob: blood is shaded from a smooth interpolated density field rather than per voxel, and this sets how wide that field is sampled. 1.0 dissolves the cube faceting while keeping droplet shape; higher is blobbier; below ~0.5 the samples fall inside one cell and the cubes come back.', min:0.25, max:3, step:0.05, u:'vox'},
+      {k:'bloodWobble', n:'surface wobble', d:'Slow surface-tension wobble. NOT wind ripples — blood is far too viscous for travelling waves, and running water\'s ripple field over it makes a puddle look like it is boiling. Keep tiny.', min:0, max:0.05, step:0.0005},
+      {k:'bloodAbsorb', n:'absorption', d:'How fast blood goes opaque with depth, scaled by its authored opacity. High: a couple of centimetres is already solid.', min:0, max:200, step:1},
+      {k:'bloodTransmit', n:'transmission', d:'How much of the surface behind shows through a thin film. Low, or blood starts looking like tinted glass.', min:0, max:1, step:0.01},
+      {k:'bloodDepthRamp', n:'depth darkening', d:'How quickly blood goes from bright thin red to near-black maroon with depth. This ramp replaces water\'s shallow-to-deep colour shift.', min:0, max:100, step:0.5, u:'/m'},
+      {k:'bloodF0', n:'reflectivity', d:'Head-on reflectance of the blood surface.', min:0, max:0.3, step:0.001},
+      {k:'bloodGraze', n:'grazing reflectivity', d:'Reflectance at grazing angles. Water goes to 1.0 (a full mirror); blood is absorbing and slightly rough, so it stops lower — at 1.0 every pool edge gets a bright white rim.', min:0, max:1, step:0.01},
+      {k:'bloodEdgeDepth', n:'thin edge depth', d:'Column thinner than this counts as the feathered edge of a splatter.', min:0, max:0.5, step:0.005, u:'m'},
+      {k:'bloodEdgeStrength', n:'edge darkening', d:'How much that thin edge darkens and browns. Real splatter edges are darker and more oxidised than their middles.', min:0, max:1, step:0.01},
+      {k:'bloodEdgeTint', n:'edge tint', d:'Colour the thin edge is tinted toward.', type:'color'},
+      {k:'stainCoverage', n:'stain coverage', d:'How fast a stain\'s amount turns into visible coverage. Higher = a light stain already reads as a solid mark.', min:0, max:4, step:0.01},
+      {k:'stainMottle', n:'stain break-up', d:'How mottled the stain edge is. 0 gives a flat wash (reads as paint); high gives scattered flecks that build into a splatter.', min:0, max:2, step:0.01},
+      {k:'stainMottleScale', n:'stain fleck size', d:'Noise frequency of that break-up. Higher = finer speckle.', min:0.05, max:4, step:0.01},
+      {k:'stainDarken', n:'stain darkening', d:'How much a stain darkens what it soaked into. Stains multiply rather than repaint, so the substrate\'s own texture stays visible through them.', min:0, max:1, step:0.01},
+      {k:'stainOpacity', n:'stain opacity', d:'How far a heavy stain goes toward its pure colour rather than staying a darkening of the surface.', min:0, max:1, step:0.01},
+      {k:'stainSheen', n:'stain wetness', d:'Wet highlight on a fresh stain. This is what separates "blood-soaked" from "rusty".', min:0, max:3, step:0.01},
+      {k:'stainSheenPower', n:'stain sheen size', d:'Specular tightness of that wet highlight.', min:2, max:1000, step:2},
+    ],
+  },
+
+  {
     id: 'fire',
     title: 'Fire & Lava',
     icon: '\u{1F525}',

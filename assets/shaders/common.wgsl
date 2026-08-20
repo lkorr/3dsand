@@ -43,8 +43,62 @@ struct Material {
   opacity     : u32,   // 0..255 media absorbance (translucent liquids/gases)
   hardness    : u32,   // 0..255 blast/dig resistance (DESIGN.md §7)
   molten      : u32,   // laser/heat product material (0 = vaporize to air)
-  _p3 : u32, _p4 : u32,
+  // ---- staining (was _p3/_p4 — no struct growth) ----
+  // stainPack: what this material does to what it touches.
+  //   bits 0..2   : stain TYPE it applies (0 = this material does not stain)
+  //   bits 3..6   : amount added per successful contact, 1..15
+  //   bits 7..16  : per-mille chance per tick to stain a touching neighbour
+  //   bits 17..26 : per-mille chance that a stain CONSUMES the voxel (to air)
+  // stainColor: RGBA8 the renderer composites for THIS material's stain type.
+  // Both are authored in materials.json under "stain" (see materials.h).
+  stainPack   : u32,
+  stainColor  : u32,
 };
+
+// stainPack accessors — must match kStainPack* in src/sim/materials.h.
+fn matStainType(m : Material)    -> u32 { return m.stainPack & 0x7u; }
+fn matStainAmount(m : Material)  -> u32 { return (m.stainPack >> 3u) & 0xFu; }
+fn matStainChance(m : Material)  -> u32 { return (m.stainPack >> 7u) & 0x3FFu; }
+fn matStainConsume(m : Material) -> u32 { return (m.stainPack >> 17u) & 0x3FFu; }
+// Does this material stain what it touches at all? One comparison, so the sim
+// can reject the overwhelmingly common "no" before doing any other work.
+fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
+
+// Is this a VISCOUS liquid — blood, and anything authored like it?
+//
+// Render-side classification, and it is deliberately made of AUTHORED DATA
+// rather than a material id or a tag bit index. Tag bits are assigned
+// first-seen at load, so a shader cannot name one without hardcoding an order
+// that materials.json is free to change; opacity and moveEvery are stable
+// per-material numbers that already mean exactly the right things:
+//   * moveEvery > 1 is the sim's own definition of viscous (the material only
+//     flows every Nth tick), which is why lava and blood both carry it.
+//   * high opacity separates blood from a thin liquid that happens to be slow.
+// The pairing is what makes it specific: lava is viscous AND opaque but is
+// MATF_OPAQUE, so it takes the molten path long before this is consulted.
+fn isViscousLiquid(m : Material) -> bool {
+  return m.klass == CLASS_LIQUID && (m.flags & MATF_OPAQUE) == 0u &&
+         m.moveEvery > 1u && m.opacity >= 150u;
+}
+
+// Is this a TRANSLUCENT SOLID — ice, glass, and anything authored like them?
+//
+// Same principle as isViscousLiquid above: authored data, no material ids. The
+// signal is `opacity` on a SOLID, which is free to carry this meaning because
+// nothing else reads it for solids — the media path only ever consults opacity
+// for gases and non-opaque liquids, and every solid defaults to 255. So an
+// authored `"opacity": 40` on a solid is unambiguous and every existing solid
+// keeps rendering exactly as before.
+//
+// This is why translucency did NOT need a new Material field: the struct is a
+// hard 64 bytes (static_assert in materials.h) and is read by every sim thread,
+// so re-using a byte that already means "how much does this absorb" beats
+// growing it. The value is absorption per unit depth, not an alpha: it feeds
+// Beer-Lambert in shadeTranslucent, so thin ice is nearly clear and a thick
+// block is deep cyan from the SAME number.
+fn isTranslucentSolid(m : Material) -> bool {
+  return m.klass == CLASS_SOLID && m.opacity < 255u;
+}
 
 // Reaction kinds (bits 0..1 of packed) — DESIGN.md §6, authored in
 // assets/materials/reactions.json and compiled per-material at load.
@@ -69,6 +123,7 @@ struct Reaction {
   prodSelf : u32,  // what self becomes (PROD_KEEP = unchanged, 0 = air)
   prodNbr  : u32,  // pair: neighbor product; emit: emitted material
   // Light/day-phase gate: bits 0..7 RCOND_*, bits 8..15 min daylight 0..255.
+  // Neighbour-count scaling: bits 16..23 RSCALE_*.
   // 0 = unconditional (every rule that predates the day/night cycle).
   cond     : u32,
 };
@@ -76,6 +131,22 @@ struct Reaction {
 const RCOND_SKY   : u32 = 1u;  // cell must have open sky above it
 const RCOND_DAY   : u32 = 2u;  // only while the sun is up
 const RCOND_NIGHT : u32 = 4u;  // only while the sun is down
+
+// Neighbour-count scaling — must match kScale* in src/sim/materials.h.
+// Chance scales with how many of the 6 face neighbours match the rule's
+// nbrMat/nbrTags/nbrClass predicate; a count of 0 blocks the rule outright.
+const RSCALE_ON     : u32 = 0x10000u;  // bit 16: scaling armed
+const RSCALE_INVERT : u32 = 0x20000u;  // bit 17: count neighbours NOT matching
+const RSCALE_MIN_SHIFT : u32 = 18u;    // bits 18..19: minCount-1, a floor on
+const RSCALE_MIN_MASK  : u32 = 0x3u;   // ... the count (0 => any count >= 1)
+const RSCALE_MUL_SHIFT : u32 = 20u;    // bits 20..23: max multiplier ...
+const RSCALE_MUL_MASK  : u32 = 0xFu;   // ... in quarters, biased by 1.0x
+const RSCALE_MUL_UNIT  : u32 = 4u;
+// Reaction chance is authored per-mille but rolled in a finer denominator, so
+// that a scaled rule authored at chance 1 still resolves all 6 ramp steps
+// instead of truncating them onto 4. Must be a multiple of RSCALE_MUL_UNIT*5.
+const REACT_CHANCE_SCALE : u32 = 20u;
+const REACT_CHANCE_DEN   : u32 = 1000u * REACT_CHANCE_SCALE;
 
 struct TickParams {
   tick       : u32,
@@ -350,12 +421,59 @@ fn occTotal(occ : u32) -> u32 { return occ & 0xFFFFu; }
 fn occBlockers(occ : u32) -> u32 { return occ >> 16u; }
 fn packOcc(total : u32, blockers : u32) -> u32 { return total | (blockers << 16u); }
 
-// Voxel word: bits 0..11 material, 12..15 state, 16..23 tick-stamp, 24..31 spare.
+// Voxel word: bits 0..11 material, 12..15 state, 16..23 tick-stamp,
+//             24..27 stain amount, 28..30 stain type, 31 reserved.
 fn voxMat(w : u32) -> u32 { return w & 0xFFFu; }
 fn voxState(w : u32) -> u32 { return (w >> 12u) & 0xFu; }
 fn voxStamp(w : u32) -> u32 { return (w >> 16u) & 0xFFu; }
 fn packVox(mat : u32, state : u32, stamp : u32) -> u32 {
   return (mat & 0xFFFu) | ((state & 0xFu) << 12u) | ((stamp & 0xFFu) << 16u);
+}
+
+// ---- the stain layer (DESIGN.md §3, §6) -------------------------------------
+// Bits 24..30 of the voxel word: 4 bits of AMOUNT and 3 bits of TYPE. This is
+// the "extra per-voxel state" DESIGN.md §3 anticipated, taken out of the spare
+// byte the u32 word already carries rather than out of a new buffer — so it
+// costs zero additional memory across 134M resident voxels, which is the whole
+// reason it is 7 bits and not a byte-per-voxel side layer.
+//
+// TYPE is a small palette (1..7) registered at load from materials.json, NOT a
+// material id: a 12-bit id would not fit, and the renderer only needs to know
+// which of a handful of stain LOOKS to composite. Type 0 means unstained, so a
+// clean world is bit-identical to one from before this feature existed.
+//
+// AMOUNT is 1..15 saturation. It drives coverage and darkness in the renderer
+// and lets a stain build up from repeated contact instead of being binary.
+//
+// DETERMINISM (rule 1): stain is written by a sim kernel, so it is sim state.
+// It is integer, it is rolled from the stateless RNG, and it IS covered by the
+// world hash (see sim_occupancy.wgsl, which hashes bits 0..30). Bit 31 stays
+// out of both: it is CELLOP_IF_AIR, a transient CPU->GPU flag that sim_mutate
+// masks off before storing, and hashing it would be hashing a message field.
+const STAIN_AMT_SHIFT  : u32 = 24u;
+const STAIN_AMT_MASK   : u32 = 0xFu;
+const STAIN_TYPE_SHIFT : u32 = 28u;
+const STAIN_TYPE_MASK  : u32 = 0x7u;
+const STAIN_AMT_MAX    : u32 = 15u;
+const STAIN_TYPE_MAX   : u32 = 7u;
+// The whole stain field, for masking it off or carrying it across a rewrite.
+const STAIN_BITS : u32 = 0x7F000000u;
+
+fn voxStainAmt(w : u32) -> u32 { return (w >> STAIN_AMT_SHIFT) & STAIN_AMT_MASK; }
+fn voxStainType(w : u32) -> u32 { return (w >> STAIN_TYPE_SHIFT) & STAIN_TYPE_MASK; }
+// A voxel is stained only if it has BOTH a type and an amount — either half at
+// zero means unstained, which keeps "no stain" a single comparison.
+fn voxStained(w : u32) -> bool { return (w & STAIN_BITS) != 0u && voxStainAmt(w) != 0u; }
+fn packStain(stainType : u32, amt : u32) -> u32 {
+  return ((amt & STAIN_AMT_MASK) << STAIN_AMT_SHIFT) |
+         ((stainType & STAIN_TYPE_MASK) << STAIN_TYPE_SHIFT);
+}
+// Re-pack a word, KEEPING whatever stain it already carries. Every sim write
+// that means "this voxel is still the same voxel, it just moved or changed
+// fullness" must use this instead of packVox, or the stain is scrubbed off by
+// ordinary liquid flow.
+fn packVoxKeepStain(mat : u32, state : u32, stamp : u32, prev : u32) -> u32 {
+  return packVox(mat, state, stamp) | (prev & STAIN_BITS);
 }
 
 // Stateless counter-based RNG (PCG output permutation).

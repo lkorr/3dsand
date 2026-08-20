@@ -275,6 +275,55 @@ struct Tuning {
     float glintPowerNear = 180.0f, glintPowerFar = 900.0f;
     float foamDepth = 0.42f, foamStrength = 0.55f;
 
+    // translucent solids — ice, glass (shadeTranslucent in raymarch.wgsl).
+    // A solid is translucent when its authored `opacity` is < 255; these
+    // control what that translucency LOOKS like. Absorption is per metre of
+    // real path through the slab, so one number covers "thin ice is clear"
+    // and "thick ice is deep cyan" at once.
+    float iceF0 = 0.021f;           // head-on reflectance (ice IOR 1.31)
+    float iceFresnelPower = 5.0f;   // Schlick exponent
+    float iceAbsorb = 3.2f;         // absorption gain per metre, x opacity
+    float iceAbsorbFloor = 0.06f;   // floor so even clear ice tints slightly
+    float iceScatter = 0.30f;       // internal bubble/grain scatter strength
+    float iceScatterDepth = 1.6f;   // how fast scatter saturates with depth
+    float iceScatterNight = 0.25f;  // scatter retained with the sun down
+    float iceGrain = 0.09f;         // frost normal perturbation amplitude
+    float iceGrainScale = 0.35f;    // frost noise frequency (world space)
+    float iceGloss = 190.0f;        // specular exponent (higher = tighter)
+    float iceSpec = 0.55f;          // specular highlight strength
+    float iceDepthMax = 3.0f;       // metres of ice past which the march stops
+    // Fresnel weight below which the traced reflection is replaced by a plain
+    // sky lookup. Unlike water, a translucent SOLID can present many surfaces
+    // to one ray, so an ungated reflection here is a frame-time cliff.
+    float iceReflectMin = 0.12f;
+
+    // blood / viscous liquids (shadeViscous in raymarch.wgsl)
+    float bloodF0 = 0.030f;        // head-on reflectance
+    float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)
+    float bloodAbsorb = 55.0f;     // opacity -> per-metre absorption
+    float bloodTransmit = 0.35f;   // how much of the surface behind shows through
+    float bloodDepthRamp = 22.0f;  // metres^-1: bright thin -> dark deep
+    float bloodPoolLow = 0.18f, bloodPoolHigh = 0.55f;  // droplet <-> pool ramp
+    float bloodEdgeFeather = 0.10f;  // field value below which the rim fades out
+    float bloodSmooth = 1.0f;   // field-gradient baseline in voxels (anti-faceting)
+    float bloodWobble = 0.004f;    // surface-tension wobble (NOT wind ripples)
+    float bloodSheen = 1.15f;      // wet highlight strength
+    float bloodSheenDrop = 32.0f;  // specular exponent on a droplet (broad)
+    float bloodSheenPool = 220.0f; // ... and on a pool (tight)
+    float bloodAmbientSheen = 0.35f;  // sky-lit sheen, so it reads wet in shade
+    float bloodEdgeDepth = 0.035f;    // metres of column counted as "thin edge"
+    float bloodEdgeStrength = 0.65f;
+    float bloodEdgeTint[3] = {0.55f, 0.40f, 0.38f};
+
+    // stains (applyStain in raymarch.wgsl)
+    float stainCoverage = 1.35f;      // how fast amount turns into coverage
+    float stainMottle = 0.85f;        // splatter break-up (0 = flat wash)
+    float stainMottleScale = 0.55f;   // noise frequency of that break-up
+    float stainDarken = 0.55f;        // how much a stain darkens its substrate
+    float stainOpacity = 0.70f;       // how far it goes to the pure stain colour
+    float stainSheen = 0.55f;         // wet highlight on a fresh stain
+    float stainSheenPower = 90.0f;
+
     // lava
     float lavaCrackFreq = 2.4f;
     float lavaCrackKneeLow = 0.50f, lavaCrackKneeHigh = 0.90f;

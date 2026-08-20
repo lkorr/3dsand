@@ -301,6 +301,18 @@ void Simulation::UploadTables(const wgpu::Queue& queue,
                               const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
   for (size_t i = 0; i < mats.size() && i < 4096; i++) table[i] = mats[i].gpu;
+
+  // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
+  // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by
+  // indexing there, which avoids a dedicated buffer + bind slot for what is at
+  // most eight RGBA values. Every staining material writes its own slot; two
+  // materials sharing a stain name share a slot and the last one wins, which
+  // is correct — they are by definition the same stain.
+  for (const auto& d : mats) {
+    uint32_t type = d.gpu.stainPack & kStainPackTypeMask;
+    if (type == 0) continue;
+    table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
+  }
   queue.WriteBuffer(materialBuf_, 0, table.data(), table.size() * sizeof(MaterialGpu));
 
   std::vector<ReactionGpu> rtable(kMaxReactions, ReactionGpu{});

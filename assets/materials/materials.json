@@ -493,6 +493,7 @@
       ]
     },
     {
+      "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl.",
       "id": "blood",
       "class": "liquid",
       "density": 1050,
@@ -505,6 +506,13 @@
         "#8c1414",
         "#b42020"
       ],
+      "stain": {
+        "type": "blood",
+        "color": "#4a0f0f",
+        "amount": 5,
+        "chance": 90,
+        "consume": 6
+      },
       "tags": [
         "organic",
         "dissolvable"

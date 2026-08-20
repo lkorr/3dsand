@@ -72,6 +72,14 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
 
+# Stain palette base — kStainPaletteBase is defined as an expression in world.h
+# (kMaterialSlots - 8), so scrape the slot count and redo the arithmetic here
+# rather than trying to parse the expression.
+W_MATSLOTS="$(cpp_const kMaterialSlots)"
+[ -n "$W_MATSLOTS" ] || {
+  echo "check_shaders: cannot parse kMaterialSlots from $WORLD_H" >&2; exit 1; }
+W_STAINBASE=$((W_MATSLOTS - 8))
+
 # far-field grid (decoupled from the window — see world.h kFarN/kFarShiftBase)
 W_FARN="$(cpp_const kFarN)"
 [ -n "$W_FARN" ] || { echo "check_shaders: cannot parse kFarN from $WORLD_H" >&2; exit 1; }
@@ -92,6 +100,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_MASK : i32 = $((W_N - 1));" \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
+  "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
   "const FAR_N : u32 = ${W_FARN}u;" \
   "const FAR_NCHUNK : u32 = ${W_FARNCHUNK}u;" \

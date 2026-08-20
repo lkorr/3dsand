@@ -586,6 +586,22 @@ struct Hit {
   liqSgn   : f32,
   liqPath  : f32,     // total distance travelled INSIDE liquid, fine voxels —
                       // drives per-channel Beer-Lambert depth absorption
+
+  // ---- translucent solid (ice, glass — see shadeTranslucent) ----
+  // Same surface-plus-volume split as the liquid fields above, but a solid
+  // needs its own set: a ray can cross ice and THEN water (a frozen pond is
+  // exactly that), and collapsing the two would make the ice surface vanish
+  // the moment the ray reached the water under it.
+  //
+  // The ray does not stop at a translucent solid — it keeps marching and
+  // accumulates depth, so whatever is behind is still shaded normally and the
+  // slab tints it by how far the ray travelled inside.
+  tsT      : f32,     // t of the first translucent-solid entry (0 if none)
+  tsCell   : vec3<i32>,
+  tsAxis   : i32,     // face the ray entered through
+  tsSgn    : f32,
+  tsMat    : u32,     // which translucent material (palette + absorption)
+  tsPath   : f32,     // distance travelled INSIDE it, in fine voxels
 };
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
@@ -610,6 +626,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.liqAxis = 1;
   out.liqSgn = -1.0;
   out.liqPath = 0.0;
+  out.tsT = 0.0;
+  out.tsCell = vec3<i32>(0);
+  out.tsAxis = 1;
+  out.tsSgn = -1.0;
+  out.tsMat = 0u;
+  out.tsPath = 0.0;
 
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -703,6 +725,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     var cellTint = vec3f(0.0);
     var cellFire = 0.0; // this cell's flicker-weighted emission
     var cellLiq = 0.0;  // fullness if this cell is a translucent liquid
+    var cellTS = 0.0;   // 1 if this cell is a translucent SOLID (ice, glass)
     if (mat != MAT_AIR) {
       let k = materials[mat].klass;
       // gases and translucent liquids are participating media; OPAQUE liquids
@@ -744,6 +767,28 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           }
         }
         // fall through and keep marching
+      } else if (wantMedia && isTranslucentSolid(materials[mat])) {
+        // ---- translucent solid: a surface AND a volume ----
+        // Ice and glass do not stop the ray. It keeps marching so whatever is
+        // behind still shades normally, and the distance travelled inside
+        // (tsPath) drives the Beer-Lambert tint in shadeTranslucent.
+        //
+        // `wantMedia` gates this deliberately. Media-blind rays are the SHADOW
+        // rays, and they must keep treating ice as a blocker: it is what the
+        // sim already believes (isRayBlocker, which seesSky reads to decide
+        // that ice shades the water under it and stops it re-freezing), and a
+        // shadow ray that passed through ice would disagree with the sim about
+        // what is lit. Ice therefore casts a solid shadow — physically it is a
+        // dense scatterer, so that reads correctly.
+        cellTS = 1.0;
+        if (out.tsT == 0.0) {
+          out.tsT = tCur;
+          out.tsCell = cell;
+          out.tsAxis = axis;
+          out.tsSgn = sign(rd[axis]);
+          out.tsMat = mat;
+        }
+        // fall through and keep marching
       } else {
         out.hit = true;
         out.t = tCur;
@@ -766,6 +811,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     }
     let segRaw = tCur - tPrev;
     out.liqPath += segRaw * cellLiq;   // depth travelled in liquid (Beer-Lambert)
+    out.tsPath += segRaw * cellTS;     // depth travelled in ice/glass (ditto)
     let seg = segRaw * weight;
     if (seg > 0.0 && cellOp > 0.0) {
       // fire is dimmed by the media already crossed in front of it, so flames
@@ -801,6 +847,15 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     // ~ 0.8%), so the bed cannot affect the pixel and the march can stop.
     // Purely a perf bound on very deep water, ~24 m of path.
     if (out.liqPath * VOXEL_METERS > 24.0) {
+      out.saturated = true;
+      out.t = tCur;
+      break;
+    }
+    // Same bound for translucent solids. Ice absorbs far more per metre than
+    // water, so this cuts in much sooner: past TUNE_ICE_DEPTH_MAX metres of
+    // glacier the far side cannot affect the pixel, and without a cap a ray
+    // entering a large ice body would march it voxel by voxel to the horizon.
+    if (out.tsPath * VOXEL_METERS > TUNE_ICE_DEPTH_MAX) {
       out.saturated = true;
       out.t = tCur;
       break;
@@ -1184,6 +1239,54 @@ fn surfaceGrain(cell : vec3<i32>, amp : f32) -> f32 {
   return 1.0 + (n - 0.5) * 2.0 * amp;
 }
 
+// ---- the stain overlay (DESIGN.md §3, §6) ----------------------------------
+// A stained voxel carries a 3-bit stain TYPE and a 4-bit AMOUNT in its word's
+// spare bits, written by the sim (see doStaining in sim_step.wgsl). This paints
+// that stain over the surface albedo.
+//
+// It is composited over the ALBEDO, before lighting, not added to the final
+// colour — a stain is a change to what the surface IS, so it has to take the
+// scene's light, shadow and AO exactly like the material under it. Adding it
+// afterwards makes stains glow in shadow, which reads as decals floating above
+// the geometry rather than as something soaked in.
+//
+// The colour comes from the reserved stain-palette entries of the material
+// table (STAIN_PALETTE_BASE, world.h): no extra binding, and it hot-reloads
+// with materials.json.
+//
+// Returns the stained albedo, and writes the 0..1 stain coverage to `wetOut`
+// so the caller can add a wet sheen — a fresh stain is damp and catches a
+// highlight, which is most of what makes it read as blood rather than as rust.
+fn applyStain(albedo : vec3f, w : u32, cell : vec3<i32>, wetOut : ptr<function, f32>) -> vec3f {
+  *wetOut = 0.0;
+  if (!voxStained(w)) { return albedo; }
+  let amt = f32(voxStainAmt(w)) / f32(STAIN_AMT_MAX);
+  let stainCol = unpackColor(materials[STAIN_PALETTE_BASE + voxStainType(w)].stainColor);
+
+  // Break the stain up so it does not cover the voxel as a flat wash. A real
+  // splatter has a mottled, uneven edge; sampling the existing value-noise
+  // field at a fine scale and using it as a THRESHOLD against the amount gives
+  // exactly that for one noise tap, and it means a light stain (amount 1-2)
+  // appears as scattered flecks while a heavy one (12-15) is near-solid.
+  let mottle = valueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE);
+  // Amount drives BOTH how far the threshold opens and how opaque the covered
+  // part is, so a stain deepens in two ways at once as it builds up.
+  let cover = clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
+                    TUNE_STAIN_COVERAGE, 0.0, 1.0);
+  if (cover <= 0.0) { return albedo; }
+  *wetOut = cover * amt;
+
+  // MULTIPLY toward the stain colour rather than mixing to it. A stain soaks
+  // in and DARKENS what is under it — it does not repaint it. Mixing makes a
+  // stain on dark stone come out lighter than the stone, which looks like
+  // paint; multiplying keeps the substrate's own texture and shading visible
+  // through the stain, which is what soaking looks like. The lerp toward the
+  // pure stain colour at full coverage is what lets a really heavy stain still
+  // read as its own colour rather than as an arbitrarily dark patch.
+  let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
+  return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
+}
+
 // ---- voxel ambient occlusion ----
 // The classic Minecraft-style per-vertex AO, evaluated per PIXEL because a
 // raymarcher has no vertices: for the face we hit, sample the two tangent
@@ -1536,6 +1639,11 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   if (h.axis == 0) { face = TUNE_FACE_X; }
   else if (h.axis == 2) { face = TUNE_FACE_Z; }
   if (m.klass != CLASS_LIQUID) { albedo *= surfaceGrain(h.cell, TUNE_GRAIN_AMP); }
+  // Stains show in reflections too — a pool of blood reflecting the stained
+  // wall beside it should not reflect a clean wall. Albedo-only (the sheen is
+  // not resolvable at this budget), same as the grain above.
+  var rwet = 0.0;
+  albedo = applyStain(albedo, h.word, h.cell, &rwet);
   let lam = wrapDiffuse(dot(rn, keyLightDir()), 0.55);
   // Same lighting model as a primary hit (minus AO and the shadow ray, which
   // are not resolvable in a reflection at this budget).
@@ -1556,6 +1664,123 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
 // Returns the final color for a pixel whose primary ray crossed a water
 // surface. `underwater` flips the treatment: from below there is no sky to
 // reflect and the absorption applies to the whole view, not just the depth.
+// ---- translucent solids: ice, glass ----------------------------------------
+// A translucent solid is the same surface-plus-volume problem as water, but it
+// is NOT water with different constants, and the differences are what make ice
+// read as ice:
+//
+//   * No ripples, no caustics, no fullness gradient. Ice is a rigid slab; its
+//     normal is the flat voxel face, perturbed only by a little frost grain.
+//     Driving it with the liquid column height (waterNormal) would tilt a
+//     frozen surface as though it were still flowing.
+//   * Absorption is much stronger per metre than water and biased to keep the
+//     cyan. That is the whole "thin ice is clear, thick ice is deep blue"
+//     behaviour, and it comes out of ONE authored number via Beer-Lambert
+//     rather than a per-thickness alpha.
+//   * The internal scatter term is what separates ice from glass. Ice is full
+//     of trapped bubbles and grain boundaries, so it glows slightly from
+//     within rather than being a clean window; glass authored with a low
+//     scatter stays a window.
+//
+// `sceneBehind` is everything the march already resolved past the slab — the
+// pond bed, the terrain, the sky. This decides how much of it survives the
+// trip through, and what covers the rest.
+fn shadeTranslucent(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
+                    axis : i32, sgn : f32, pathVox : f32,
+                    sceneBehind : vec3f, tSurf : f32, px : vec2f) -> vec3f {
+  let m = materials[mat];
+
+  // ---- normal: flat voxel face + frost grain ----
+  // The grain is a small, stable per-voxel perturbation, not a wave: it breaks
+  // the mirror up so a frozen pond does not read as one flat plate of glass,
+  // and it is the same surfaceGrain the opaque solids use, so ice sits in the
+  // same visual family as the rest of the world.
+  var n = vec3f(0.0);
+  n[axis] = -sgn;
+  // Perturb across the two axes that are not the face normal, so the face
+  // stays facing outward and only tilts. Sampled in WORLD space rather than
+  // per-cell so the frost reads as one continuous field across a frozen
+  // surface instead of stopping at every voxel boundary.
+  let a1 = (axis + 1) % 3;
+  let a2 = (axis + 2) % 3;
+  var nn = n;
+  nn[a1] += (valueNoise(hitP, TUNE_ICE_GRAIN_SCALE) - 0.5) * TUNE_ICE_GRAIN;
+  nn[a2] += (valueNoise(hitP + vec3f(37.0, 11.0, 5.0),
+                        TUNE_ICE_GRAIN_SCALE) - 0.5) * TUNE_ICE_GRAIN;
+  n = normalize(nn);
+
+  let v = -rd;
+  let cosI = clamp(dot(n, v), 0.0, 1.0);
+
+  // ---- Fresnel (Schlick) ----
+  // Same physics as water and the same reason it matters: head-on you look
+  // through the ice, at a grazing angle it turns into a sheet of reflected
+  // sky. Ice's index of refraction (1.31) is very close to water's (1.33), so
+  // F0 sits at essentially the same 2%.
+  let f0 = TUNE_ICE_F0;
+  var fres = f0 + (1.0 - f0) * pow(1.0 - cosI, TUNE_ICE_FRESNEL_POWER);
+
+  // ---- transmission: per-channel Beer-Lambert over the REAL path ----
+  // pathVox is the distance the ray actually spent inside the slab, so a
+  // grazing view through the same ice is correctly darker than a head-on one,
+  // and a 1-voxel rim of new ice is nearly clear while a metre-thick block is
+  // deep cyan. Absorption is derived from the material's own authored opacity
+  // and palette so glass and ice differ without any material ids here.
+  let depthM = max(pathVox, 0.0) * VOXEL_METERS;
+  let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
+  // Absorb the COMPLEMENT of the material colour, scaled by authored opacity:
+  // a pale-cyan ice absorbs red hardest, which is what leaves thick ice blue.
+  let k = (f32(m.opacity) / 255.0) * TUNE_ICE_ABSORB;
+  let absorbK = (vec3f(1.0) - base) * k + vec3f(TUNE_ICE_ABSORB_FLOOR);
+  let trans = exp(-absorbK * depthM);
+
+  // ---- internal scatter ----
+  // Trapped bubbles and grain boundaries scatter light back out, so ice is not
+  // a clean window: it picks up its own colour with depth. Saturating with
+  // depth (rather than growing without bound) is what keeps thick ice reading
+  // as ice rather than as flat paint.
+  let sunUp = clamp(keyLightDir().y, 0.0, 1.0);
+  let scatterAmt = (1.0 - exp(-depthM * TUNE_ICE_SCATTER_DEPTH)) * TUNE_ICE_SCATTER;
+  let scatterCol = base * mix(TUNE_ICE_SCATTER_NIGHT, 1.0, sunUp);
+
+  // What survives the slab, plus what the slab itself adds.
+  var through = sceneBehind * trans + scatterCol * scatterAmt;
+
+  // ---- reflection ----
+  // At grazing angles this is most of what you see, and it is what sells the
+  // surface as solid and polished.
+  //
+  // But it is gated on the Fresnel weight, which water does NOT need to do,
+  // and the difference is geometric rather than aesthetic: a lake is ONE
+  // surface, so a traced reflection costs one secondary ray per water pixel.
+  // A translucent solid is a volume the ray passes through, so a hollow glass
+  // shell presents two surfaces per pixel and a stack of ice presents more —
+  // and since the ray no longer terminates, every one of them would fire its
+  // own reflection. Measured: an unconditional reflection here took the
+  // selftest's glass ball from 85 fps to 6.
+  //
+  // Below the threshold the reflection is being mixed in at a few percent and
+  // is genuinely invisible, so falling back to the sky lookup costs nothing
+  // visually and skips the trace entirely. Head-on views — the common case,
+  // and the one where you are looking THROUGH the ice anyway — take the cheap
+  // path; grazing views still get the real reflection.
+  var refl : vec3f;
+  if (fres > TUNE_ICE_REFLECT_MIN) { refl = traceReflection(hitP, n, rd); }
+  else { refl = reflectionSky(reflect(rd, n)); }
+
+  // ---- specular glint ----
+  // The sharp highlight that says "hard, smooth surface". Much tighter than
+  // water's, because ice does not have a wave field to spread it out.
+  let ld = keyLightDir();
+  let hv = normalize(ld + v);
+  let spec = pow(max(dot(n, hv), 0.0), TUNE_ICE_GLOSS) * TUNE_ICE_SPEC;
+  let shadow = sunShadow(hitP, n, px);
+
+  var color = mix(through, refl, fres);
+  color += vec3f(spec) * shadow * keyLightColor();
+  return color;
+}
+
 fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
               axis : i32, sgn : f32, pathVox : f32, surfFull : f32,
               sceneBehind : vec3f, tSurf : f32, underwater : bool) -> vec3f {
@@ -1742,6 +1967,331 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
       color = mix(color, vec3f(0.92, 0.95, 0.97), shallow * mask * TUNE_FOAM_STRENGTH);
     }
   }
+
+  return color;
+}
+
+// ============================================================================
+// VISCOUS LIQUIDS — BLOOD (DESIGN.md §9)
+// ============================================================================
+// Blood is a third case, distinct from both water and lava, and reusing either
+// gets it wrong.
+//
+// Water's look is REFRACTION and DEPTH: you see through it, the bed shifts, the
+// colour tells you how deep it is, and a wind-driven ripple field covers the
+// whole surface. Lava's look is EMISSION. Blood is neither — it is a nearly
+// opaque, strongly absorbing, VISCOUS liquid, and its look is almost entirely:
+//
+//   1. a WET SHEEN — a tight specular highlight. This is the single term that
+//      makes a red patch read as fluid rather than as red paint, and it is
+//      what survives at every scale from a single droplet to a pool.
+//   2. NO travelling ripples. Water's five wave bands are wind-driven gravity
+//      waves on an open surface; a splash of blood is centimetres across and
+//      far too viscous to carry them. Running the water ripple field over
+//      blood makes a puddle look like it is boiling — this is the most
+//      important thing NOT to inherit.
+//   3. depth that saturates almost immediately. A few centimetres of blood is
+//      already opaque, so unlike water there is no bed to see and no
+//      shallow-to-deep colour ramp worth modelling; what varies with thinness
+//      is how much of the SURFACE UNDER it shows through.
+//   4. a dark, desaturating rim where it thins out to nothing — the edge of a
+//      real splatter is browner and darker than its middle, not a clean
+//      contour of the same red.
+//
+// ---- MOVING vs POOLED, which is the requirement that shapes this ----
+// Blood in this game comes out of NPCs, so the overwhelmingly common case is
+// blood that is NOT a still pool: single voxels in flight, thin trails running
+// down a wall, a spray of disconnected droplets. Those need to read as WET and
+// BRIGHT and self-contained — a droplet has high curvature, so it catches a
+// broad highlight and shows its own colour, not the colour of a deep column.
+//
+// A still pool is the opposite: flat, darker, more mirror-like, with a coherent
+// surface that can hold a sharp reflection of the sky.
+//
+// `bloodPooling` measures which of the two a hit is, exactly the way
+// moltenPooling does for lava (and for the same reason — a treatment that
+// assumes a continuous surface paints nonsense onto an isolated speck). The
+// shade then interpolates every term along that axis. See the function itself
+// for why the neighbourhood is sampled in 3D here where lava's is horizontal.
+//
+// All render-only float math on render-only data — the sim never sees it.
+
+// Returns 0 for an isolated droplet / thin trail and 1 for the interior of a
+// pool. Sampled in ALL THREE axes, unlike moltenPooling's horizontal-only
+// probe: a one-voxel-deep sheet of lava spread on a floor is still a pool and
+// should crust, but a one-voxel-wide RUN of blood down a wall is precisely the
+// "moving" case this needs to catch. Vertical extent is the signal that tells a
+// wall trail (tall, thin, moving) from a floor pool (wide, flat, still), so it
+// has to be part of the measurement.
+fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
+  var n = 0.0;
+  var total = 0.0;
+  // 2-voxel spacing over a 5^3-ish neighbourhood: wide enough that a pool
+  // interior saturates, tight enough that a 2-3 voxel droplet does not.
+  for (var dx = -2; dx <= 2; dx += 2) {
+    for (var dy = -2; dy <= 2; dy += 2) {
+      for (var dz = -2; dz <= 2; dz += 2) {
+        total += 1.0;
+        let c = cell + vec3<i32>(dx, dy, dz);
+        if (!inBounds(c)) { continue; }
+        if (occTotal(chunkOcc(c)) == 0u) { continue; }
+        if (voxMat(voxels[cellIndexW(c)]) == mat) { n += 1.0; }
+      }
+    }
+  }
+  // Threshold placed LOW for the same reason moltenPooling's is: the
+  // interesting distinction is "isolated droplet" vs "part of a body", and a
+  // high threshold would put every pool's rim in the transition band and draw
+  // a bright ring around each puddle.
+  return smoothstep(TUNE_BLOOD_POOL_LOW, TUNE_BLOOD_POOL_HIGH, n / max(total, 1.0));
+}
+
+// ---- the smooth liquid field ----
+// THE function that decides whether blood reads as fluid or as a heap of
+// gelatin cubes, so it is worth being explicit about why it exists.
+//
+// A voxel liquid hit gives you an axis-aligned face normal. Water gets away
+// with replacing that by the gradient of the COLUMN HEIGHT (waterNormal): a
+// lake is a wide, essentially 2D surface, its top is a height field, and the
+// slope of that field is the true macro normal.
+//
+// Blood is not a height field. It arrives as droplets, runs down walls, and
+// pools in patches a few voxels across — fully 3D, and often only one or two
+// voxels thick. Applying the height-field treatment to it leaves every side
+// and bottom face with its raw voxel normal, and the eye reads the result as
+// exactly what it is: individually shaded cubes. Adding a per-cell dome on top
+// (which an earlier version of this did) makes it worse, not better — it
+// renders each voxel as a rounded cube, which is precisely the gelatin look.
+//
+// The fix is the standard one for voxel fluids: treat the liquid as a scalar
+// DENSITY FIELD, sample it with trilinear interpolation so it is continuous
+// across cell boundaries, and take its gradient as the normal. Because the
+// interpolation is continuous, so is the normal, and the cube structure
+// dissolves into one smooth surface — the same reason marching cubes produces
+// smooth isosurfaces from blocky data.
+//
+// Density is the liquid's FULLNESS (the state nibble, DESIGN.md §4), which the
+// sim already maintains: 0 for a cell that is not this liquid, 1/8..8/8 for one
+// that is. So a droplet is a small blob of density in an empty field and comes
+// out spherical; a pool is a slab and comes out flat on top. Both fall out of
+// the same code with no special cases.
+fn liquidDensityAt(c : vec3<i32>, mat : u32) -> f32 {
+  if (!inBounds(c)) { return 0.0; }
+  let w = voxels[cellIndexW(c)];
+  if (voxMat(w) != mat) { return 0.0; }
+  return f32(voxState(w) + 1u) / 8.0;
+}
+
+// Trilinearly-interpolated density at an arbitrary world point. Samples on the
+// lattice of cell CENTRES (hence the -0.5), so the field is smooth everywhere
+// rather than piecewise-constant per cell.
+fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
+  let g = p - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let c0 = vec3<i32>(b);
+  var acc = 0.0;
+  // 8 corners, standard trilinear weights.
+  for (var i = 0; i < 8; i++) {
+    let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+    let wgt = mix(1.0 - f, f, vec3f(o));
+    acc += liquidDensityAt(c0 + o, mat) * wgt.x * wgt.y * wgt.z;
+  }
+  return acc;
+}
+
+// Gradient of that field = the smooth surface normal. Central differences at a
+// one-voxel baseline: wide enough to span a cell (so the normal reflects the
+// neighbourhood's shape rather than one cell's face) and narrow enough to keep
+// a droplet's curvature.
+//
+// 6 field samples x 8 taps = 48 voxel reads. That is the real cost of this
+// function, and it is why it runs ONLY on the primary blood surface hit — not
+// in reflections, not in shadow rays, and not on any other material.
+fn liquidFieldNormal(p : vec3f, mat : u32, fallback : vec3f) -> vec3f {
+  // Sampling baseline in voxels. This is the smoothing control: at 1.0 the
+  // gradient spans one cell either side, which removes the per-voxel faceting
+  // while keeping a droplet's shape. Raising it smooths harder (a blobbier,
+  // more merged surface) at the cost of small-detail shape; below ~0.5 the
+  // samples fall inside a single cell and the cubes come back.
+  let e = TUNE_BLOOD_SMOOTH;
+  let gx = liquidFieldAt(p + vec3f(e, 0.0, 0.0), mat) -
+           liquidFieldAt(p - vec3f(e, 0.0, 0.0), mat);
+  let gy = liquidFieldAt(p + vec3f(0.0, e, 0.0), mat) -
+           liquidFieldAt(p - vec3f(0.0, e, 0.0), mat);
+  let gz = liquidFieldAt(p + vec3f(0.0, 0.0, e), mat) -
+           liquidFieldAt(p - vec3f(0.0, 0.0, e), mat);
+  // The gradient points INTO the liquid (density increases inward), so the
+  // outward surface normal is its negation.
+  let g = vec3f(-gx, -gy, -gz);
+  let len = length(g);
+  // A degenerate gradient means the field is locally flat — the interior of a
+  // large body, or a lone voxel whose neighbours are all empty. Neither has a
+  // meaningful gradient, so fall back to the voxel face normal.
+  if (len < 1e-4) { return fallback; }
+  return g / len;
+}
+
+// The full viscous-liquid shade. `sceneBehind` is what the primary march
+// resolved behind the blood; `pathVox` is how far the ray travelled inside it.
+//
+// Returns the final colour for a pixel whose ray crossed a viscous liquid
+// surface. Deliberately NOT a variant of shadeWater(): it shares the Fresnel
+// idea and nothing else, and every attempt to express it as water-with-
+// different-constants ends up with either travelling ripples or a see-through
+// puddle.
+fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
+                axis : i32, sgn : f32, pathVox : f32, surfFull : f32,
+                sceneBehind : vec3f, underwater : bool) -> vec3f {
+  let m = materials[mat];
+  let upFacing = (axis == 1 && sgn < 0.0);
+  let pool = bloodPooling(cell, mat);
+
+  // ---- normal ----
+  // The smooth field gradient (see liquidFieldNormal) on EVERY face, not just
+  // up-facing ones. This is the difference between fluid and gelatin cubes: a
+  // trail running down a wall and a droplet in mid-air are shaded by the shape
+  // of the blood AROUND them, so neighbouring voxels agree on their normal and
+  // the surface reads as continuous.
+  var flat = vec3f(0.0);
+  flat[axis] = -sgn;
+  var n = liquidFieldNormal(hitP, mat, flat);
+  // Blend back toward the face normal on big flat pools. A pool's interior has
+  // a weak, noisy gradient (the field is saturated in every direction), and
+  // letting that noise drive the normal makes a still puddle shimmer; its true
+  // surface really is flat and horizontal.
+  if (upFacing) { n = normalize(mix(n, vec3f(0.0, 1.0, 0.0), pool * 0.5)); }
+
+  {
+    // A slow, low-amplitude wobble — surface tension relaxing, not wind waves.
+    // Two orders of magnitude slower and shallower than the water ripples, and
+    // faded out on pools, which genuinely are still. Perturbs the smooth normal
+    // rather than a height slope, so it works on vertical runs too.
+    let pm = hitP * VOXEL_METERS;
+    let wob = TUNE_BLOOD_WOBBLE * (1.0 - pool * 0.75);
+    n = normalize(n + vec3f(sin(pm.x * 9.0 + R.time * 0.6),
+                            sin(pm.y * 10.0 + R.time * 0.45),
+                            cos(pm.z * 11.0 + R.time * 0.5)) * wob);
+  }
+  if (underwater) { n = -n; }
+
+  let v = -rd;
+  let cosI = clamp(dot(n, v), 0.0, 1.0);
+
+  // ---- Fresnel ----
+  // Same dielectric law as water (blood's IOR is ~1.35, near enough), but the
+  // grazing reflection is pulled down: an absorbing, slightly rough organic
+  // fluid does not go to a 100% mirror at the horizon the way clean water does,
+  // and letting it turns every pool edge into a bright white rim.
+  var fres = TUNE_BLOOD_F0 + (TUNE_BLOOD_GRAZE - TUNE_BLOOD_F0) *
+             pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
+  // Thin films are not mirrors — same reasoning as water's surfFull term.
+  fres *= mix(0.45, 1.0, surfFull);
+  if (!upFacing) { fres *= 0.6; }
+
+  // ---- body colour ----
+  // Blood is dense enough that a couple of centimetres is opaque, so rather
+  // than water's per-channel Beer-Lambert over a deep column, the useful
+  // variable is how much of the surface BEHIND shows through a THIN film.
+  // Derived from the authored palette + opacity, never from a material ID, so
+  // any liquid tagged viscous gets a coherent look (CLAUDE.md conventions).
+  let deep = unpackColor(m.color1);   // darkest palette entry: pooled interior
+  let bright = unpackColor(m.color2); // lightest: fresh, thin, oxygenated
+  let depthM = max(pathVox, 0.0) * VOXEL_METERS;
+  // Opacity drives how fast it goes opaque. The 55x is what turns the
+  // authored 200/255 into "opaque past about 2 cm", which is the real scale.
+  let k = (f32(m.opacity) / 255.0) * TUNE_BLOOD_ABSORB;
+  let trans = exp(-k * depthM);
+
+  // Thin blood reads BRIGHTER and more orange-red (less path length, more of
+  // the light scattering straight back out); deep blood reads near-black
+  // maroon. That ramp is the depth cue, in place of water's colour shift.
+  var body = mix(bright, deep, clamp(depthM * TUNE_BLOOD_DEPTH_RAMP, 0.0, 1.0));
+  // Pools are darker than droplets even at equal path length: more of the
+  // light that enters a large body is absorbed before it can scatter back.
+  body = mix(body, deep, pool * 0.35);
+
+  // What comes back out: the surface behind, filtered by the film, plus the
+  // blood's own scattered colour. Blood scatters strongly (it is a suspension,
+  // not a clear fluid), so the body colour dominates as soon as it is not a
+  // one-voxel film — which is what keeps it from ever looking like tinted glass.
+  var refracted = sceneBehind * trans * TUNE_BLOOD_TRANSMIT + body * (1.0 - trans);
+
+  // ---- reflection ----
+  // A pool can hold a real reflection; a droplet cannot (there is no coherent
+  // surface, and tracing a ray per droplet is a waste of the budget). Blend by
+  // pooling, and only trace where the reflection is actually worth it.
+  var reflection : vec3f;
+  if (underwater) {
+    reflection = body * 1.4;
+  } else if (upFacing && pool > 0.5 && fres > TUNE_REFLECTION_CUTOFF) {
+    reflection = traceReflection(hitP, n, rd);
+  } else {
+    reflection = reflectionSky(reflect(rd, n));
+  }
+  // Reflections off blood are TINTED by it — a dielectric this dark reflects a
+  // dimmer, redder version of what a clean surface would.
+  reflection = mix(reflection, reflection * (bright + vec3f(0.25)), 0.5);
+
+  var color = mix(refracted, reflection, fres);
+
+  // ---- the wet sheen ----
+  // The load-bearing term. A tight specular lobe on the key light is what the
+  // eye reads as "wet", and it is the one thing that has to work on a single
+  // voxel in mid-air as well as on a pool.
+  //
+  // Unlike water's glint this is NOT gated to up-facing surfaces: a trail
+  // running down a wall is wet too, and it is one of the main things the
+  // player sees. Side faces get a slightly broader, weaker lobe since their
+  // normal is the flat voxel face rather than a real gradient.
+  {
+    let kd = keyLightDir();
+    let hv = normalize(kd + v);
+    // Droplets get a BROADER lobe than pools. A bead's curvature spreads the
+    // highlight over its whole face, while a flat pool concentrates it — using
+    // the pool exponent on a droplet gives a highlight so small it disappears
+    // at any distance, which is exactly how blood ends up looking like paint.
+    let power = mix(TUNE_BLOOD_SHEEN_DROP, TUNE_BLOOD_SHEEN_POOL, pool);
+    var spec = pow(max(dot(n, hv), 0.0), power);
+    if (!upFacing) { spec *= 0.55; }
+    // Ambient-lit sheen as well as key-lit: a wet surface in shadow still
+    // reads wet, because it reflects the sky. Without this, blood indoors or
+    // at night goes completely matte and dead.
+    let ambientSheen = pow(1.0 - cosI, 4.0) * TUNE_BLOOD_AMBIENT_SHEEN;
+    let tint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
+    color += tint * min(spec, 1.0) * TUNE_BLOOD_SHEEN * (0.35 + fres)
+           + ambientAt(n) * ambientSheen;
+  }
+
+  // ---- thin edge darkening ----
+  // The feathered edge of a real splatter is darker and browner than its
+  // middle: less material, more of the substrate's shadow, and the iron has
+  // oxidised. Keyed on a THIN column rather than on pooling, so it catches the
+  // trailing edge of a run as well as the rim of a puddle.
+  if (!underwater) {
+    let thin = 1.0 - smoothstep(0.0, TUNE_BLOOD_EDGE_DEPTH, depthM);
+    color = mix(color, color * TUNE_BLOOD_EDGE_TINT, thin * TUNE_BLOOD_EDGE_STRENGTH);
+  }
+
+  // ---- silhouette softening ----
+  // The smooth normal fixes the SHADING, but the ray still stops on a voxel
+  // FACE, so a droplet's outline is a hard-edged cube no matter how well it is
+  // lit. That silhouette is the other half of the gelatin-cube look, and it
+  // cannot be fixed by shading alone.
+  //
+  // The same density field gives the fix for free: sample it at the hit point,
+  // and where the value is low the surface is the feathered fringe of the blob
+  // rather than its solid body. Fading toward what is BEHIND across that
+  // fringe replaces the hard cube face with a soft edge — the standard
+  // isosurface-antialiasing trick, and it costs one more field sample.
+  //
+  // Deliberately only the OUTER fringe (the smoothstep's low end): fading too
+  // deep makes the whole droplet translucent and washed out instead of just
+  // softening its rim.
+  let edgeField = liquidFieldAt(hitP - rd * 0.35, mat);
+  let solid = smoothstep(TUNE_BLOOD_EDGE_FEATHER, TUNE_BLOOD_EDGE_FEATHER + 0.28,
+                         edgeField);
+  color = mix(sceneBehind, color, clamp(solid, 0.0, 1.0));
 
   return color;
 }
@@ -2237,6 +2787,12 @@ fn fs(in : VSOut) -> FSOut {
       albedo *= surfaceGrain(h.cell, TUNE_GRAIN_AMP);
     }
 
+    // Stain overlay, applied to the ALBEDO so it takes the same light, shadow
+    // and AO as the surface it soaked into (see applyStain). `wet` is the
+    // coverage, used for the sheen below.
+    var wet = 0.0;
+    albedo = applyStain(albedo, h.word, h.cell, &wet);
+
     // ---- ambient occlusion ----
     // Needs the hit point's position within the face, so build it from the
     // exact hit and take the two axes tangent to the face normal.
@@ -2275,6 +2831,20 @@ fn fs(in : VSOut) -> FSOut {
     // double-darkens contact regions into black smears.
     let sun = keyLightColor() * lambert;
     color = albedo * face * (ambientAt(n) * ao + sun);
+
+    // ---- wet sheen on a fresh stain ----
+    // A stain is WET, and the specular highlight is what says so. Without it a
+    // blood-soaked floor is just a floor with a red patch on it; with it the
+    // patch reads as something spilled. Same Blinn-Phong lobe as the blood
+    // surface itself so a pool and the stain around it are continuous.
+    //
+    // Modulated by the shadow-tested `lambert`, so a stain in shadow does not
+    // catch a highlight from a sun it cannot see.
+    if (wet > 0.0) {
+      let hv = normalize(keyLightDir() - rd);
+      let spec = pow(max(dot(n, hv), 0.0), TUNE_STAIN_SHEEN_POWER);
+      color += keyLightColor() * spec * lambert * wet * TUNE_STAIN_SHEEN;
+    }
 
     // ---- emissive surfaces ----
     // MOLTEN materials (an emissive OPAQUE liquid — lava, molten glass) take
@@ -2367,13 +2937,46 @@ fn fs(in : VSOut) -> FSOut {
       // real face, and absorption applies to the entire view rather than to a
       // bounded depth.
       let underwater = h.liqT < 0.05;
-      color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
-                         h.liqPath, max(h.mediaSurf, 0.125), color,
-                         h.liqT, underwater);
+      // Viscous liquids (blood) take their own surface model: no travelling
+      // ripples, a wet sheen that works on a lone droplet, and a
+      // moving-vs-pooled blend. See shadeViscous for why this is not
+      // shadeWater with different constants.
+      if (isViscousLiquid(materials[lm])) {
+        color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+                             h.liqPath, max(h.mediaSurf, 0.125), color,
+                             underwater);
+      } else {
+        color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+                           h.liqPath, max(h.mediaSurf, 0.125), color,
+                           h.liqT, underwater);
+      }
       // The water surface itself is at liqT, nearer than whatever is behind
       // it, so aerial perspective applies from the SURFACE — otherwise a
       // distant lake gets the fog of its own bed and reads too hazy.
       color = applyAerial(color, rd, h.liqT);
+    }
+  }
+
+  // ---- translucent solid surface (ice, glass) ----
+  // Applied AFTER water on purpose. Compositing here runs back-to-front, and a
+  // frozen pond is ice sitting ON water: the ice is nearer the eye, so it has
+  // to be the last thing laid over everything it covers. Doing it before the
+  // water block would let the water surface paint over its own ice lid.
+  //
+  // The guard is tsT vs liqT rather than tsT alone, so a ray that enters water
+  // FIRST and only then meets ice (looking up from under a frozen pond) does
+  // not get the lid drawn over the water it is actually looking through.
+  if (h.tsT > 0.0 && (h.liqT <= 0.0 || h.tsT < h.liqT)) {
+    // Re-read defensively, exactly as the water path does: a hot material
+    // reload between trace and shade would otherwise index the wrong
+    // absorption.
+    let tm = voxMat(voxels[cellIndexW(h.tsCell)]);
+    if (tm != MAT_AIR && isTranslucentSolid(materials[tm])) {
+      let hitP = R.camPos + rd * h.tsT;
+      color = shadeTranslucent(hitP, rd, tm, h.tsCell, h.tsAxis, h.tsSgn,
+                               h.tsPath, color, h.tsT, in.pos.xy);
+      // Fog from the ice surface, not from whatever is behind it.
+      color = applyAerial(color, rd, h.tsT);
     }
   }
 

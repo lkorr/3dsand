@@ -251,6 +251,13 @@ fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
 // odds. Deep water is surrounded by water, counts 0, and cannot freeze until
 // the front reaches it.
 //
+// `minCount` generalizes the count-0 gate into a count-<N gate, which is what
+// evaporation needs: it counts NON-water neighbours too, but demands at least
+// 4 of them, so a lone droplet (6 non-water) boils off fast, a rim cell (4-5)
+// goes slowly, and the flat surface of a pond (1 non-water — just the air
+// above) is immune. Without the floor, a pond surface would fire at the full
+// base chance, which is exactly the "way too much steam" failure.
+//
 // The return is in a FINER denominator than the authored per-mille, because
 // the interesting rules are authored at chance 1-2: computing
 // `(chance * q) / 4` per-mille would truncate 1.5x and 2.75x onto the same
@@ -283,7 +290,13 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
     }
     if (hit != invert) { count++; }
   }
-  if (count == 0u) { return 0u; }  // hard gate: no frontier, no reaction
+  // Hard gate: below the minimum count there is no frontier, so no reaction.
+  // minCount defaults to 1 (any matching neighbour will do), which is the
+  // freezing case. Evaporation raises it so that a water voxel with a couple
+  // of watery neighbours still counts as "part of the pond" and is immune,
+  // while an exposed droplet is not.
+  let minCount = ((rule.cond >> RSCALE_MIN_SHIFT) & RSCALE_MIN_MASK) + 1u;
+  if (count < minCount) { return 0u; }
 
   // chance * lerp(1.0x, maxMul, (count-1)/5), integer throughout, evaluated
   // with the single divide LAST so nothing is truncated mid-ramp.
@@ -414,6 +427,155 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
   return false;
 }
 
+// ---- staining (DESIGN.md §6) ------------------------------------------------
+// A staining liquid marks the voxels it touches. The mark lives in the voxel
+// word's spare bits (STAIN_* in common.wgsl) as a 3-bit type + 4-bit amount:
+// no side buffer, no struct growth, and it survives movement because every sim
+// write carries the stain across (packVoxKeepStain).
+//
+// Authored per material, not per material PAIR — "blood stains what it touches"
+// is one line in materials.json and applies to every surface in the game,
+// present and future, which is the same anti-N×M argument tags exist for
+// (CLAUDE.md conventions). Rules:
+//
+//   * A staining liquid rolls once per tick against `chance` (per-mille).
+//   * On success it stains ONE face neighbour — chosen by an RNG rotation, so
+//     which one is deterministic but not biased toward an axis.
+//   * The stain ADDS to whatever the neighbour already carries, saturating at
+//     STAIN_AMT_MAX. Repeated contact deepens a stain rather than resetting it.
+//   * Having stained, it may CONSUME the voxel (per-mille `consume`), which
+//     deletes it to air and lets the liquid flow into the hole.
+//
+// ---- DETERMINISM (rule 1) ----
+// Write reach is exactly 1 cell (a face neighbour), which is what the 3x3x3
+// colour lattice bounds; two cells acting in the same pass are >=3 apart, so
+// no two stainers can write the same neighbour. All integer, all from
+// hash3(seed, tick, cell) — no scheduling, no atomics, no float.
+//
+// ---- SLEEP (rule 2) ----
+// This is the subtle half, and it is why the rule tracks `progress`.
+// A pool of blood sitting on stone is a PERMANENT condition: the liquid is
+// there, the stone is there, and a rule that says "keep this chunk awake while
+// I am touching something stainable" would pin every blood-soaked chunk awake
+// forever — the exact failure the light-gated rules hit (see the keepAwake note
+// in doReactions, and gotcha: light-gated rules never sleep).
+//
+// So the chunk is kept awake ONLY while there is work left to do: a neighbour
+// that is not yet stained to the full amount this material applies. Once every
+// touching surface has taken all the stain it can, nothing marks the chunk and
+// the pool settles and sleeps. That termination is what makes the rule
+// decisively subcritical: the reachable surface is finite, each cell's stain
+// is bounded by STAIN_AMT_MAX, and stain only ever increases.
+//
+// Returns true if SELF was destroyed (never — staining does not consume the
+// stainer), or more usefully: whether the caller should keep the cell awake.
+fn doStaining(c : vec3<i32>, m : Material, rnd : u32) -> bool {
+  let stainType = matStainType(m);
+  let addAmt = matStainAmount(m);
+  let stamp = stampFor(T.tick, P.substep);
+
+  // Rotate the scan so the stained neighbour is not biased toward -Y. One roll
+  // decides WHETHER we stain this tick; the rotation decides WHICH neighbour.
+  let rot = rnd >> 7u;
+  let fires = (rnd % 1000u) < matStainChance(m);
+
+  var progress = false;  // is there still unstained surface in reach?
+  for (var i = 0u; i < 6u; i++) {
+    let di = (i + rot) % 6u;
+    let n = c + faceDir(di);
+    if (!inBounds(n)) { continue; }
+    let ni = cellIndexW(n);
+    let nw = voxels[ni];
+    let nmat = voxMat(nw);
+    if (nmat == MAT_AIR) { continue; }
+    // Don't stain other liquids or gases: a stain is something that soaks into
+    // a SURFACE. Blood mixing into water is a different (and unimplemented)
+    // thing, and staining a gas would mark smoke that then drifts away with it.
+    let nk = materials[nmat].klass;
+    if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
+
+    let cur = voxStainAmt(nw);
+    let curType = voxStainType(nw);
+    // Already saturated with THIS stain: no work left here. A neighbour
+    // carrying a different stain is still work — the newer stain takes over.
+    if (curType == stainType && cur >= addAmt) { continue; }
+    progress = true;
+    if (!fires) { break; }  // work remains, but not this tick
+
+    // Deepen an existing stain of the same type; overwrite a different one.
+    var amt = addAmt;
+    if (curType == stainType) { amt = min(cur + addAmt, STAIN_AMT_MAX); }
+    voxels[ni] = (nw & ~STAIN_BITS) | packStain(stainType, amt);
+    markDirty(n);
+
+    // Consumption: the stain eats the voxel it just marked. Rolled from a
+    // DIFFERENT slice of the hash than the stain roll, so the two are
+    // independent — reusing the same bits would correlate "stained" with
+    // "consumed" and every stain would either always or never eat.
+    let croll = hash3(rnd, 0x51A17u, ni) % 1000u;
+    if (croll < matStainConsume(m)) {
+      voxels[ni] = 0u;
+      // The voxel that vanished may have been holding a solid up.
+      flagSupportLoss(n, nk, MAT_AIR);
+    }
+    markDirty(c);
+    break;  // one neighbour per tick — bounds the rule's rate (rule 2)
+  }
+  return progress;
+}
+
+// Would stepLiquid() find anything to do for this cell? PURE READ — it makes
+// no writes at all, and every read is a face/diagonal neighbour (reach 1), so
+// it stays inside the colour lattice's guarantee exactly like the reaction
+// neighbour scans do.
+//
+// Exists so a viscous liquid on an off-tick can decide whether it is worth
+// staying awake for (see the moveEvery gate in main). The conditions below
+// MIRROR stepLiquid's three stages; if one drifts from the other the cost is a
+// pool that sleeps a tick early (and is woken by the next thing that touches
+// it) or one that stays awake without moving — not a correctness bug, but keep
+// them in step.
+fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
+  let f = voxState(w) + 1u;
+
+  // 1) down: a partial same-liquid cell to top up, or anything displaceable.
+  let below = c + vec3<i32>(0, -1, 0);
+  if (inBounds(below)) {
+    let bw = voxels[cellIndexW(below)];
+    if (voxMat(bw) == mat) {
+      if (voxState(bw) + 1u < 8u) { return true; }
+    } else if (canDisplace(m.density, false, bw)) {
+      return true;
+    }
+  }
+
+  // 2) the four down-diagonals.
+  for (var i = 0u; i < 4u; i++) {
+    let d = lateralDir(i);
+    let n = c + vec3<i32>(d.x, -1, d.y);
+    if (!inBounds(n)) { continue; }
+    if (canDisplace(m.density, false, voxels[cellIndexW(n)])) { return true; }
+  }
+
+  // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
+  //    split into air, or displace something lighter.
+  for (var i = 0u; i < 4u; i++) {
+    let d = lateralDir(i);
+    let n = c + vec3<i32>(d.x, 0, d.y);
+    if (!inBounds(n)) { continue; }
+    let nw = voxels[cellIndexW(n)];
+    let nmat = voxMat(nw);
+    if (nmat == mat) {
+      if (voxState(nw) + 1u + TUNE_LIQUID_EQUALIZE <= f) { return true; }
+    } else if (nmat == MAT_AIR) {
+      if (f >= 2u) { return true; }
+    } else if (canDisplace(m.density, false, nw)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Mass-conserving liquid flow (fullness in eighths, DESIGN.md §4).
 fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : u32) {
   let f = voxState(w) + 1u;  // fullness 1..8
@@ -503,11 +665,35 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     if (doReactions(c, idx, w, mat, m, rnd)) { return; }
   }
 
+  // Staining, same once-per-tick budget as reactions. Gated on the material
+  // flag first so the ~all materials that do not stain pay one comparison.
+  // Keeps the chunk awake only while unstained surface remains in reach — see
+  // the sleep note on doStaining.
+  if (P.substep == 0u && matStains(m)) {
+    if (doStaining(c, m, rnd)) { markDirty(c); }
+  }
+
   if (m.klass == CLASS_SOLID) { return; }
 
-  // Viscosity: thick liquids (lava, molten glass) only move on their tick.
+  // Viscosity: thick liquids (lava, molten glass, blood) only move on their
+  // tick. On an off-tick the cell stays awake for the tick it MAY move on —
+  // but only if it has somewhere to go.
+  //
+  // The unconditional markDirty this replaces meant a settled pool of any
+  // viscous liquid re-dirtied its chunk on every off-tick, forever: those
+  // chunks could never sleep, at any pool size, for the rest of the session
+  // (CLAUDE.md rule 2). It went unnoticed because the sleep selftest only ever
+  // settled water and powders — moveEvery is 1 for both, so they take the fast
+  // path below and this branch never ran in the test.
+  //
+  // `canFlowAnywhere` is the same predicate stepLiquid() uses to decide it has
+  // work, evaluated read-only: if it is false the cell would do nothing on its
+  // move tick either, so there is nothing to stay awake for. A pool whose
+  // surface is flat and whose floor is solid therefore sleeps, and any change
+  // around it (a wall broken, liquid added) marks it dirty through the normal
+  // paths and wakes it back up.
   if (m.moveEvery > 1u && (T.tick % m.moveEvery) != 0u) {
-    markDirty(c);  // stay awake for the tick it may move on
+    if (canFlowAnywhere(c, w, mat, m)) { markDirty(c); }
     return;
   }
 

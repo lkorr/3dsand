@@ -139,10 +139,49 @@ struct CellOp {
   uint32_t word;     // full voxel word to store (stamp byte included)
 };
 constexpr uint32_t kMaxCellOpsPerTick = 65536;
-// CellOp.word flag in the spare bits (24..31): only write if the target cell
+// CellOp.word flag in the TOP spare bit (31): only write if the target cell
 // is air (prefab paint mode). Masked off by sim_mutate before the store, so
-// it never lands in the grid.
+// it never lands in the grid. Bit 31 specifically, because bits 24..30 of a
+// stored word are now the stain layer (below) and a CellOp carries real stain
+// bits through to the grid.
 constexpr uint32_t kCellOpIfAir = 0x80000000u;
+
+// ---- the stain layer (DESIGN.md §3) ----
+// Bits 24..30 of the voxel word: 4-bit amount, 3-bit type. EXACT mirror of the
+// STAIN_* consts in common.wgsl — that file is the one the shaders see, this
+// one is for the CPU paths that build voxel words (prefabs, debris rubble,
+// worldio) and must not scribble on a stain or invent one.
+// Type 0 = unstained; 1..7 are palette slots registered from materials.json in
+// file order (see MaterialDef::stain in materials.h).
+constexpr uint32_t kStainAmtShift = 24, kStainAmtMask = 0xF;
+constexpr uint32_t kStainTypeShift = 28, kStainTypeMask = 0x7;
+constexpr uint32_t kStainAmtMax = 15, kStainTypeMax = 7;
+constexpr uint32_t kStainBits = 0x7F000000u;
+inline uint32_t VoxStainAmt(uint32_t w) { return (w >> kStainAmtShift) & kStainAmtMask; }
+inline uint32_t VoxStainType(uint32_t w) { return (w >> kStainTypeShift) & kStainTypeMask; }
+inline uint32_t PackStain(uint32_t type, uint32_t amt) {
+  return ((amt & kStainAmtMask) << kStainAmtShift) |
+         ((type & kStainTypeMask) << kStainTypeShift);
+}
+
+// ---- the stain palette ----
+// The renderer needs stain TYPE (3 bits in the voxel word) -> colour, but a
+// type is not a material id, so it cannot index the material table directly.
+// Rather than add a buffer and a bind slot for eight colours, the palette is
+// mirrored into the TOP 8 entries of the 4096-entry material table, which is
+// otherwise all zeroes (there are ~39 real materials and the 12-bit id space
+// is nowhere near full). Entry kStainPaletteBase + type holds that stain's
+// colour in its `stainColor` field; Simulation::UploadTables fills them.
+//
+// This rides the existing table upload, so stains hot-reload with R along with
+// everything else in materials.json and no shader gains a binding. The entries
+// are inert otherwise: class 0, density 0, no reactions, and nothing can
+// reference them because material ids are assigned from the bottom up.
+//
+// Lives in world.h rather than materials.h because ShaderConstantPrelude() and
+// scripts/check_shaders.sh both generate the WGSL constants from THIS file.
+constexpr uint32_t kMaterialSlots = 4096;
+constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
 
 // Must match TickParams in common.wgsl.
 struct TickParams {

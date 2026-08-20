@@ -218,6 +218,29 @@ reproducible (killing lockstep networking and replay debugging).
   a u32 word (16-bit voxel + 8-bit stamp + 8 spare) since WebGPU storage buffers
   address u32s; repacking to 16 bpv + separate stamp layer is an M2+ memory
   optimization.
+- **The stain layer (2026-08-20)** claims 7 of those 8 spare bits: bits 24..27 a
+  stain AMOUNT (1..15) and bits 28..30 a stain TYPE (1..7, 0 = unstained). Bit 31
+  stays reserved for `kCellOpIfAir`, a transient CPU→GPU message flag that
+  `sim_mutate` masks off before storing. Constants live in `world.h`
+  (`kStain*`) and are mirrored in `common.wgsl` (`STAIN_*`).
+  - This is the "extra per-voxel state" §3 anticipated, taken from the spare
+    byte rather than from a sparse aux layer — at 134M resident voxels a
+    byte-per-voxel side buffer would cost 134 MB for what fits in bits already
+    being paid for. The aux-layer plan still stands for anything wider.
+  - Type is a small PALETTE, not a material id (12 bits would not fit and the
+    renderer only needs to know which of a handful of stain looks to paint).
+    Slots are registered at load from the `stain` blocks in materials.json, and
+    their colours are mirrored into reserved material-table entries at
+    `kStainPaletteBase` so the renderer needs no new binding and stains
+    hot-reload with R.
+  - **Stain is sim state, so it is hashed.** `sim_occupancy` folds bits 24..30
+    into the world hash alongside the material and state nibble; without that,
+    `--selftest` could not tell a correctly-stained world from one where
+    staining diverged across vendors (rule 1). The stamp byte stays excluded —
+    it is scheduling bookkeeping, not state.
+  - Every sim write that means "same voxel, moved or refilled" goes through
+    `packVoxKeepStain` rather than `packVox`, or ordinary liquid flow scrubs
+    the stain off the world.
 - A voxel that moves at a chunk boundary **sets the neighbor chunk's dirty flag**.
 - Anything that changes marks its chunk dirty; a chunk with zero movement and zero
   active reactions for a tick clears its dirty flag and sleeps.
@@ -357,8 +380,9 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   environment, which is what lets sunlight drive the world (§4.5):
   ```json
   { "self": "water", "decay": true, "becomes": "steam",
-    "needsSky": true, "when": "day", "minLight": 90, "chance": 2 }
+    "needsSky": true, "when": "day", "minLight": 120, "chance": 1 }
   ```
+  (the shipped rule adds `scaleByNeighbors` on top of this — see below)
   - `needsSky` — the cell must not be covered by a ray blocker.
   - `when: day|night` — gated on the tick-derived day phase.
   - `minLight: 0..255` — a floor on daylight strength, so "only near noon"
@@ -404,6 +428,67 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   rate comparison alone cannot separate "the gate works and the front crept
   down from the frozen surface" from "the gate is ignored", because both land
   at about the same percentage.
+- **`minCount` — a floor on the count (2026-08-20):** the count-0 gate above has
+  one blind spot, and evaporation walked straight into it. An open pond's whole
+  top face has air above it, so every surface cell counts ≥1 and fires at the
+  full base chance — which is why sun-driven evaporation boiled a lake off from
+  the surface in seconds. `minCount` (1..4, in the two spare `cond` bits 18–19,
+  stored biased by 1 so the default stays zero) raises the gate:
+  ```json
+  { "self": "water", "decay": true, "becomes": "steam",
+    "needsSky": true, "when": "day", "minLight": 120, "chance": 1,
+    "scaleByNeighbors": { "neighbor": "water", "invert": true,
+                          "minCount": 4, "scaleMax": 3.0 } }
+  ```
+  At `minCount: 4` a water voxel must be *mostly out of the water* before the
+  sun can take it: a flat pond surface (1 non-water neighbour) and a cell near a
+  bank (2–3) are immune, a rim cell or thin sheet (4) goes at the base rate, and
+  a lone droplet on stone (6) goes at 3×. Spread water dries, bodies of water do
+  not — and a shallow puddle still dries edge-inward, because losing a rim cell
+  exposes the next one.
+
+  This makes freezing and evaporation *opposed frontiers over the same count*:
+  freezing wants a small count (it spreads from the shore in), evaporation wants
+  a large one (it retreats from the rim out). They are already exclusive by day
+  phase, so they cannot fight.
+
+  `--selftest` gained an `evaporation` gate that pins the rule from both ends in
+  one scene: a pond whose surface must be **fully intact** after 2500 noon ticks,
+  plus isolated droplets that must **all** be gone. Either assertion alone is
+  weak — the first passes a rule that never fires, the second passes the old
+  always-fires rule — and only together do they distinguish the two.
+
+- **Staining (2026-08-20):** a liquid may mark the voxels it touches, and may
+  eat what it marks. Authored per material, not per material PAIR — the same
+  anti-N×M argument tags exist for:
+  ```json
+  { "id": "blood", "class": "liquid", ...,
+    "stain": { "type": "blood", "color": "#4a0f0f",
+               "amount": 5, "chance": 90, "consume": 6 } }
+  ```
+  - `type` names a stain palette slot (shared: two liquids naming the same
+    stain get the same slot and the same look). `amount` is added per contact
+    and saturates at 15, so repeated contact deepens a stain.
+  - `chance` is per-mille per tick to stain one touching face neighbour;
+    `consume` is per-mille that the stain then deletes that voxel to air,
+    which is what lets blood slowly pit what it soaks.
+  - Compiles into the two spare words of the 64-byte `Material` record
+    (`stainPack` + `stainColor`), so the struct did not grow.
+  - **Sleep discipline (rule 2) is the whole difficulty.** A pool of blood on
+    stone is a PERMANENT condition, so a rule that stays awake "while touching
+    something stainable" pins those chunks awake forever — the same trap the
+    light-gated rules hit. `doStaining` therefore holds the chunk only while
+    there is UNSATURATED surface left in reach; once everything touching is
+    fully stained, the pool settles and sleeps. Reachable surface is finite and
+    stain only ever increases, which is what makes it decisively subcritical.
+  - Write reach is exactly one face neighbour, so it stays inside the colour
+    lattice's guarantee, and both rolls come from the stateless hash.
+  - Fixing this surfaced a PRE-EXISTING rule-2 bug: the `moveEvery > 1`
+    viscosity gate re-dirtied its chunk unconditionally on every off-tick, so
+    a settled pool of ANY viscous liquid (lava included) could never sleep. It
+    now re-dirties only if `canFlowAnywhere` says the cell has somewhere to go.
+    It went unnoticed because the sleep selftest only ever settled water and
+    powders, both `moveEvery == 1`.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -807,6 +892,50 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   All of this is render-only float math on render-only data. The sim never
   reads it and the world hash never covers it, so determinism rule #1 is
   untouched (it scopes to sim state).
+- **Viscous liquids / blood (implemented 2026-08-20):** a third case, distinct
+  from both water and lava. Blood is nearly opaque, strongly absorbing and
+  viscous, and — because it comes out of NPCs — is usually NOT a still pool but
+  droplets in flight, thin trails and disconnected spatter. `shadeViscous()`
+  handles it; the material is classified by authored data (`moveEvery > 1` and
+  high `opacity`, on a non-`MATF_OPAQUE` liquid), never by material ID.
+  - **The smooth field normal is the load-bearing part.** Water gets away with
+    a normal from the gradient of its COLUMN HEIGHT because a lake is a wide 2D
+    height field. Blood is fully 3D and often one or two voxels thick, so that
+    treatment leaves every side and bottom face with its raw voxel normal and
+    the result reads as a heap of individually-shaded cubes. Instead the liquid
+    is treated as a scalar DENSITY field (fullness, which the sim already
+    maintains), sampled with trilinear interpolation and differentiated —
+    continuous across cell boundaries, so neighbouring voxels agree on their
+    normal and the cube structure dissolves. A per-cell dome term was tried
+    first and made it worse: it renders each voxel as a ROUNDED cube, which is
+    precisely the gelatin look. Costs 48 voxel reads, so it runs only on the
+    primary blood hit — never in reflections or shadow rays.
+  - The silhouette is softened separately, by fading toward the background
+    where the field value is low. The smooth normal fixes the SHADING; without
+    this the ray still stops on a voxel face and a droplet's outline stays a
+    hard cube however well it is lit.
+  - **No travelling ripples.** Water's five wave bands are wind-driven gravity
+    waves on an open surface; a splash of blood is centimetres across and far
+    too viscous to carry them, and running that field over blood makes a puddle
+    look like it is boiling. Only a slow, tiny surface-tension wobble, faded out
+    on pools.
+  - A **wet sheen** (tight specular lobe, plus an ambient term so it still
+    reads wet in shade) is what makes it read as fluid rather than red paint,
+    and it is deliberately not gated to up-facing surfaces — a trail running
+    down a wall is wet too. Droplets get a BROADER lobe than pools: a bead's
+    curvature spreads its highlight, and using the pool exponent on a droplet
+    makes it vanish at any distance.
+  - `bloodPooling()` measures droplet-vs-pool the way `moltenPooling` does for
+    lava, but samples all three axes rather than horizontally only: vertical
+    extent is what separates a wall trail (tall, thin, moving) from a floor
+    pool (wide, flat, still).
+  - **Stains** (§3, §6) render as a change to the ALBEDO, composited before
+    lighting, so they take the same sun, shadow and AO as the surface they
+    soaked into — added afterwards they glow in shadow and read as decals
+    floating above the geometry. They MULTIPLY toward the stain colour rather
+    than replacing it, so the substrate's texture stays visible through them
+    (soaking, not painting), and a value-noise threshold breaks the coverage up
+    so a light stain is scattered flecks and a heavy one is near-solid.
 - **Molten surfaces (implemented 2026-08-19):** lava is the OPPOSITE problem to
   water and reusing the water treatment would be wrong in every particular.
   Water's look comes from what it REFLECTS and TRANSMITS; lava is `MATF_OPAQUE`

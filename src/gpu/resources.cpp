@@ -49,6 +49,9 @@ std::string ShaderConstantPrelude() {
   o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
   o << "const CELLOP_IF_AIR : u32 = 0x" << std::hex << kCellOpIfAir << std::dec
     << "u;\n";
+  // Stain palette: reserved material-table entries holding stain-type colours
+  // (world.h). The renderer indexes materials[STAIN_PALETTE_BASE + type].
+  o << "const STAIN_PALETTE_BASE : u32 = " << kStainPaletteBase << "u;\n";
   // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
   // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
   // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).

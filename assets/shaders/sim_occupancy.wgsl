@@ -66,7 +66,21 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   var block = 0u;
   var h = 0u;
   for (var i = li; i < CHUNK_VOL; i += 64u) {
-    let v = voxels[base + i] & 0xFFFFu;   // stamp byte excluded from state identity
+    // What counts as "state identity" for the determinism hash: material +
+    // state nibble (bits 0..15) and the STAIN layer (bits 24..30).
+    //
+    // The tick-stamp byte (16..23) is deliberately excluded — it is scheduling
+    // bookkeeping ("has this voxel acted this substep"), not world state, and
+    // it legitimately differs between two runs that reached the same world.
+    //
+    // The stain bits ARE state: a sim kernel writes them, they persist, and
+    // they change what the world looks like. Leaving them out of the hash
+    // would mean --selftest could not tell a correctly-stained world from one
+    // where staining diverged across vendors — exactly the hole the hash
+    // exists to close (CLAUDE.md rule 1). Bit 31 stays out: it is the
+    // transient CELLOP_IF_AIR message flag and is never stored.
+    let w = voxels[base + i];
+    let v = (w & 0xFFFFu) | ((w & STAIN_BITS) >> 8u);
     let m = v & 0xFFFu;
     if (m != MAT_AIR) {
       count += 1u;
