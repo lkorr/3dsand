@@ -156,8 +156,8 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `src/main.cpp` | frame loop, arg parsing, selftest harness, BMP writer |
 | `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation, `.vox` prefab loader |
 | `src/gpu/` | Dawn context, buffer/shader/pipeline helpers |
-| `src/game/` | player controller, camera, brush, prefab placer, mob system |
-| `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy) |
+| `src/game/` | player controller, camera, brush, prefab placer, mob system, player avatar (`avatar.*`) + third-person rig (`thirdperson.*`) |
+| `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy; `gen_wizard.py` emits the PLAYER AVATAR rig, which is a mob def driven by `game/avatar.cpp` rather than by mob AI) |
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
 | `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
 | `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params. Also hosts the **Wiki** tab (every fact about one material/tag/tuning group/shader, assembled live from all four sources) and the **Notes** tab (markdown pages autosaved to `notes/`, gitignored) |

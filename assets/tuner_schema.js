@@ -16,6 +16,10 @@
      int   true  -> integer-only input (no decimals accepted)
      type  'color' -> [r,g,b] 0..1 triple edited with a color picker
            'vec3'  -> [x,y,z] triple edited as three numbers
+     bool  true -> a checkbox writing a JSON true/false (no min/max/step).
+           The C++ side must read it with ReadB, which REJECTS a number
+           rather than coercing it — so a bool row must never be given a
+           slider, and a slider row must never be read with ReadB.
      warn  extra caution text rendered on the row
      var   this row gets a randomness control (the ⚄ button). The tuned value
            becomes the CENTRE of a distribution and each instance draws an
@@ -89,6 +93,48 @@ const TUNING_SCHEMA = [
       {k:'mouseSensitivity', n:'mouse sensitivity', d:'Radians of turn per pixel of mouse movement.', min:0.0002, max:0.01, step:0.0001},
       {k:'fovY', n:'field of view', d:'Vertical FOV in radians. 1.2 rad ≈ 69°; 1.57 ≈ 90°.', min:0.5, max:2.6, step:0.01, u:'rad'},
       {k:'pitchClamp', n:'pitch limit', d:'How far up/down you can look. 1.5708 is straight up — just under it avoids gimbal flip.', min:0.5, max:1.5707, step:0.001, u:'rad'},
+    ],
+  },
+
+  {
+    id: 'thirdPerson',
+    title: 'Third Person',
+    icon: '\u{1F3AC}',
+    apply: 'cpu',
+    blurb: 'The orbit camera behind the player avatar. C in-game cycles first person → third → over-shoulder. Distances are METERS and converted to voxels at use, so the framing stays physically meaningful if the voxel size changes. Everything here is render-only: picking rays, the brush, the laser and the grenade all keep using the player’s own eye position, so no camera setting can move the world hash.',
+    params: [
+      {k:'distance', n:'boom length', d:'How far behind the character the camera sits in plain third person.', min:0.5, max:12, step:0.1, u:'m'},
+      {k:'shoulderDist', n:'shoulder boom', d:'Boom length in over-shoulder mode. Shorter than the plain boom: this mode exists for aiming, where you want the character out of the way rather than fully in frame.', min:0.3, max:6, step:0.1, u:'m'},
+      {k:'shoulderOffset', n:'shoulder offset', d:'How far to the side the camera sits in over-shoulder mode. This is what moves the character off the crosshair so you can actually see what you are aiming at.', min:-2, max:2, step:0.05, u:'m'},
+      {k:'heightOffset', n:'focus height', d:'How far above the head joint the boom pivots. Raising it frames more of the ground ahead; lowering it frames more sky.', min:-1, max:2, step:0.05, u:'m'},
+      {k:'sideOffset', n:'side offset', d:'Lateral offset in plain third person. A small value keeps the character out of the exact centre of the screen, which most third-person games do.', min:-2, max:2, step:0.05, u:'m'},
+      {k:'collide', n:'collide with world', d:'Sweep the boom against the voxel world and pull the camera in when something is in the way. Off means the camera happily sits inside walls.', bool:true},
+      {k:'collideMargin', n:'collision margin', d:'How far short of a hit the camera stops. Too small and the near plane clips into the wall; too large and the camera crowds the character in tight spaces.', min:0, max:1.5, step:0.05, u:'m'},
+      {k:'collideRadius', n:'collision thickness', d:'Fattens the boom sweep so the camera cannot slip through a one-voxel gap and pop to the far side of a wall. 0 is a bare ray.', min:0, max:1, step:0.05, u:'m'},
+      {k:'focusHalflife', n:'focus smoothing', d:'Half-life of the pivot point catching up to the character. This is what stops the camera jittering with every step bob. Only the pivot is smoothed — never the final eye, which would let it drift back into the wall it was just pulled out of.', min:0, max:0.5, step:0.005, u:'s'},
+      {k:'distInHalflife', n:'pull-in smoothing', d:'Half-life when the camera moves CLOSER (something got in the way). Normally 0 — easing inward leaves the camera inside the wall for the duration of the ease, which is the one camera artifact players always notice.', min:0, max:0.5, step:0.005, u:'s', warn:'Above ~0.05 the camera visibly passes through walls before recovering.'},
+      {k:'distOutHalflife', n:'push-out smoothing', d:'Half-life when the camera moves back OUT after clearing an obstruction. Deliberately slower than pull-in: snapping outward the instant you round a corner reads as a glitch.', min:0, max:1.5, step:0.01, u:'s'},
+      {k:'pitchLift', n:'pitch lift', d:'How much the boom rises when you look steeply down, so the character stays framed instead of being hidden under its own hat brim. 0 disables.', min:0, max:2, step:0.05, u:'m'},
+      {k:'stateFollow', n:'injury follow', d:'How strongly the camera follows the body down when a dismemberment state lowers it (crawl, squirm). 1 rides the pose exactly; below 1 the camera stays a little higher than a crawling body, which frames it better than lying on the floor with it.', min:0, max:1, step:0.05},
+      {k:'speedFov', n:'speed FOV', d:'Extra field of view at full sprint, added on top of the camera FOV and eased in. Sells speed without the player touching a setting. 0 disables.', min:0, max:0.4, step:0.01, u:'rad'},
+      {k:'speedFovHalflife', n:'speed FOV smoothing', d:'Half-life of the speed FOV easing in and out. Short values punch; long values breathe.', min:0.01, max:2, step:0.01, u:'s'},
+    ],
+  },
+
+  {
+    id: 'avatar',
+    title: 'Avatar',
+    icon: '\u{1F9D9}',
+    apply: 'cpu',
+    blurb: 'The player’s visible body — a robed wizard rigged for dismemberment (assets/mobs/wizard.vox + .json, authored at 4 microvoxels per world voxel). It reuses the whole mob animation runtime: IK, gait, springs, clips, and the dismemberment locomotion states. Losing a leg makes the player slower, losing both drops them to a crawl and stops them jumping — those speeds come from the rig’s own `states` table, not from here. H in-game severs the next part for testing.',
+    params: [
+      {k:'enabled', n:'show avatar', d:'Spawn and draw the player body at all. Off is the old bodiless first-person behaviour, and also the fastest way to tell whether a visual glitch is the avatar’s fault.', bool:true},
+      {k:'firstPersonArms', n:'first-person arms', d:'In first person the body is hidden so you are not looking at the inside of your own hat — but the arms, hands and staff are kept, which is most of what sells having a body. Off hides everything.', bool:true},
+      {k:'turnRate', n:'turn rate', d:'How fast the body swings around to face where it is going. In first person the body always faces the camera; in third it turns toward its MOTION, which is what stops the character moon-walking sideways across the screen.', min:1, max:40, step:0.5, u:'rad/s'},
+      {k:'turnMinSpeed', n:'turn threshold', d:'Below this speed the body holds its last facing instead of chasing a near-zero velocity vector, which would make it spin on the spot when you stop.', min:0, max:3, step:0.05, u:'m/s'},
+      {k:'footTrim', n:'foot trim', d:'Vertical nudge of the whole avatar against the player collision box. The rig’s feet should already land on the box’s bottom face; this is the trim for art whose contact point is not exactly at its origin.', min:-1, max:1, step:0.01, u:'m'},
+      {k:'severImpulse', n:'sever impulse', d:'Extra shove given to a part as it comes off, on top of whatever the hit imparted. Higher values throw limbs dramatically; 0 lets them simply drop.', min:0, max:40, step:0.5},
+      {k:'respawnDelay', n:'respawn delay', d:'How long the corpse lies there before the avatar is rebuilt. The severed parts stay in the world as ordinary debris either way — they are DebrisSystem’s from the moment they come off.', min:0, max:20, step:0.5, u:'s'},
     ],
   },
 
@@ -435,6 +481,7 @@ const TUNING_SCHEMA = [
       {k:'detonatePower', n:'detonate power', g:'tools', d:'Hardness budget at the centre of an X-key explosion.', min:10, max:4000, step:10, int:true},
       {k:'laserRange', n:'laser range', g:'tools', d:'How far the laser reaches.', min:10, max:1000, step:5, u:'vox'},
       {k:'laserMeltRadius', n:'laser bore', g:'tools', d:'Radius of the hole the laser melts.', min:1, max:8, step:1, int:true, u:'vox'},
+      {k:'laserCarveRadius', n:'laser carve (flesh)', g:'tools', d:'Radius the laser carves out of LIVING limbs, in world voxels. Sub-voxel on purpose: at mob scale 4 one micro voxel is 0.25, so 0.3 bores a channel about one micro voxel wide. This is the precision dial for surgery — turn it down to sculpt, up to butcher.', min:0.1, max:3, step:0.05, u:'vox'},
       {k:'laserDamage', n:'laser damage', g:'tools', d:'Damage per hit against mob limbs.', min:0.1, max:20, step:0.1, u:'hp'},
       {k:'brushAirDistance', n:'brush reach', g:'tools', d:'How far ahead you paint when the crosshair is pointing at open sky.', min:4, max:200, step:1, u:'vox'},
       {k:'throwSpeed', n:'grenade throw speed', g:'grenade', d:'Launch speed; your own velocity is added on top.', min:1, max:80, step:0.5, u:'m/s'},

@@ -13,11 +13,13 @@
 
 #include <GLFW/glfw3.h>
 
+#include "game/avatar.h"
 #include "game/brush.h"
 #include "game/camera.h"
 #include "game/mob.h"
 #include "game/player.h"
 #include "game/prefab.h"
+#include "game/thirdperson.h"
 #include "gpu/context.h"
 #include "gpu/resources.h"
 #include "math3d.h"
@@ -209,21 +211,30 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
 }
 
 // Body render plumbing shared by the frame loop and the selftest. Debris takes
-// slots [0, D), mob limbs stack after — so the two systems must always be
-// walked in that order and with that base, which is exactly the sort of
-// agreement that rots when it is spelled out at two call sites.
+// slots [0, D), mob limbs stack after, and the player avatar's parts stack
+// after those — so the three systems must always be walked in that order and
+// with those bases, which is exactly the sort of agreement that rots when it
+// is spelled out at two call sites.
+//
+// `avatar` may be null (selftest paths that never spawn one); the slot walk is
+// then identical to what it was before the avatar existed.
 void BuildBodyXforms(const DebrisSystem& debris, const MobSystem& mobs,
+                     const PlayerAvatar* avatar,
                      std::vector<BodyXformGpu>& out) {
   debris.BuildXforms(out);
   mobs.AppendXforms(out);
+  if (avatar) avatar->AppendXforms(out);
 }
 // Micro bodies (PLAN §C): already compacted, so `out.size()` IS the draw's
 // instance count and an empty result means the pass is skipped entirely.
 void BuildMicroInsts(const DebrisSystem& debris, const MobSystem& mobs,
+                     const PlayerAvatar* avatar,
                      std::vector<MicroBodyInstGpu>& out) {
   out.clear();
   debris.AppendMicroInsts(out);
   mobs.AppendMicroInsts(out, debris.BodyCount());
+  if (avatar)
+    avatar->AppendMicroInsts(out, debris.BodyCount() + mobs.LimbBodyCount());
 }
 
 bool WriteBmp(const std::string& path, const std::vector<uint8_t>& rgba,
@@ -681,6 +692,222 @@ uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {
       });
   ctx.instance.WaitAny(f, UINT64_MAX);
   return n;
+}
+
+// --shot-mob <def>[:limb,limb,...] — the mob counterpart of --shot: worldgen,
+// spawn the named def, sever the listed limbs, run real ticks until the
+// locomotion state settles, then write close-up screenshots from three angles.
+// Exists because mob poses (gait, crawl clips, dismemberment states) can
+// otherwise only be judged in a live session — this makes "what does the
+// legless crawl actually look like" a ten-second question.
+int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
+               DebrisSystem& debris, MobSystem& mobs, const std::string& spec) {
+  std::string defName = spec, limbCsv;
+  // optional trailing "@x,z" picks the spawn column (default 137,139) — the
+  // default area is forested and a wandering mob ends its shot behind a trunk
+  // often enough that re-aiming from the CLI beats rebuilding.
+  int spawnX = 137, spawnZ = 139;
+  if (size_t at = defName.find('@'); at != std::string::npos) {
+    std::sscanf(defName.c_str() + at + 1, "%d,%d", &spawnX, &spawnZ);
+    defName = defName.substr(0, at);
+  }
+  if (size_t c = defName.find(':'); c != std::string::npos) {
+    limbCsv = defName.substr(c + 1);
+    defName = defName.substr(0, c);
+  }
+  if (size_t at = limbCsv.find('@'); at != std::string::npos) {
+    std::sscanf(limbCsv.c_str() + at + 1, "%d,%d", &spawnX, &spawnZ);
+    limbCsv = limbCsv.substr(0, at);
+  }
+  int defIndex = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == defName) defIndex = (int)i;
+  if (defIndex < 0) {
+    std::fprintf(stderr, "--shot-mob: no mob def named \"%s\"\n",
+                 defName.c_str());
+    return 1;
+  }
+  const MobDef& def = mobs.Defs()[defIndex];
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  int h = World::TerrainHeight(spawnX + 3, spawnZ + 1, kDefaultSeed);
+  uint32_t t = 6000;
+  for (int i = 0; i < 60; i++)  // powders settle, as in play
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+               {8, h / 16, 8}, false, false);
+  ctx.WaitIdle();
+
+  uint64_t id = mobs.Spawn(defIndex, {spawnX, h + 1, spawnZ});
+  if (!id) {
+    std::fprintf(stderr, "--shot-mob: spawn failed\n");
+    return 1;
+  }
+  auto mobTick = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    mobs.PreTick(t + 1, world, ops, spawns);
+    debris.QueueSupportEvents(world.Snap());
+    std::vector<CellOp> cellOps;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
+               {8, h / 16, 8}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+    mobs.PostStep();
+  };
+
+  for (int i = 0; i < 20; i++) mobTick();  // healthy walk first: live gait pose
+  for (size_t start = 0; start < limbCsv.size();) {
+    size_t end = limbCsv.find(',', start);
+    if (end == std::string::npos) end = limbCsv.size();
+    std::string nm = limbCsv.substr(start, end - start);
+    start = end + 1;
+    int li = -1;
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (def.limbs[i].name == nm) li = (int)i;
+    if (li < 0) {
+      std::fprintf(stderr, "--shot-mob: def \"%s\" has no limb \"%s\"\n",
+                   defName.c_str(), nm.c_str());
+      return 1;
+    }
+    mobs.Sever(id, li);
+  }
+  // enough for the loco crossfade to finish and the sever spray to land, but
+  // short enough that a crawler hasn't dragged itself in among the trees
+  for (int i = 0; i < 90; i++) mobTick();
+  std::printf("--shot-mob: %s locoState=%d clips=%d\n", spec.c_str(),
+              mobs.LocoState(id), mobs.ActiveClips(id));
+  {
+    std::printf("--shot-mob: live clips:");
+    for (const auto& cw : mobs.ClipWeights(id))
+      std::printf(" %s=%.2f", cw.first.c_str(), cw.second);
+    std::printf("\n");
+  }
+  // Objective pose numbers alongside the pixels: each live limb's local +Y
+  // axis, as degrees above the horizon. Screenshots on sloped ground lie
+  // about angles; the quaternion does not. (For the dummy's torso this IS
+  // the crawl elevation the states ladder tunes.)
+  {
+    std::vector<BodyXformGpu> mt;
+    mobs.AppendXforms(mt);
+    std::printf("--shot-mob: limb +Y elevation above horizon (90 = upright, "
+                "0 = flat on the ground):\n");
+    size_t slot = 0;
+    for (size_t i = 0; i < def.limbs.size() && slot < mt.size(); i++) {
+      if (!mobs.LimbBody(id, (int)i)) continue;  // severed: no slot emitted
+      const BodyXformGpu& m = mt[slot++];
+      Quat q{m.quat[0], m.quat[1], m.quat[2], m.quat[3]};
+      Vec3 up = QuatRotate(q, {0, 1, 0});
+      Vec3 lup = mobs.LimbLocalUp(id, (int)i);
+      Vec3 mup = mobs.LimbModelUp(id, (int)i);
+      std::printf("    %-8s world %5.1f  model %5.1f  local %5.1f deg\n",
+                  def.limbs[i].name.c_str(),
+                  std::asin(std::clamp(up.y, -1.0f, 1.0f)) * 57.29578f,
+                  std::asin(std::clamp(mup.y, -1.0f, 1.0f)) * 57.29578f,
+                  std::asin(std::clamp(lup.y, -1.0f, 1.0f)) * 57.29578f);
+    }
+  }
+
+  // body upload, same slot agreement as the frame loop: debris first, mobs after
+  std::vector<BodyXformGpu> xf;
+  BuildBodyXforms(debris, mobs, nullptr, xf);
+  if (!xf.empty())
+    ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                          xf.size() * sizeof(BodyXformGpu));
+  std::vector<MicroBodyInstGpu> microInsts;
+  BuildMicroInsts(debris, mobs, nullptr, microInsts);
+  std::vector<BodyVoxInst> inst;
+  debris.BuildInstances(inst);
+  mobs.AppendInstances(inst, debris.BodyCount());
+  if (!inst.empty())
+    ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                          inst.size() * sizeof(BodyVoxInst));
+
+  // Aim at the centroid of the LIVE limbs, not the spawn point — the mob has
+  // been walking, and after heavy dismemberment its origin is nowhere near
+  // the visible body.
+  Vec3 target = mobs.MobOrigin(id) +
+                Vec3{def.worldSize.x * 0.5f, def.worldSize.y * 0.3f,
+                     def.worldSize.z * 0.5f};
+  {
+    std::vector<BodyXformGpu> mt;
+    mobs.AppendXforms(mt);
+    if (!mt.empty()) {
+      Vec3 sum{};
+      for (const BodyXformGpu& m : mt)
+        sum += Vec3{m.pos[0], m.pos[1], m.pos[2]};
+      target = sum * (1.0f / (float)mt.size()) + Vec3{0, 1, 0};
+    }
+  }
+
+  const uint32_t W = 1280, H = 720;
+  wgpu::TextureDescriptor td{};
+  td.size = {W, H, 1};
+  td.format = wgpu::TextureFormat::RGBA8Unorm;
+  td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+  auto shoot = [&](Vec3 dir, float dist, const char* path) {
+    Vec3 eye = target + dir.normalized() * dist;
+    Vec3 look = (target - eye).normalized();
+    Camera cam;
+    cam.yaw = std::atan2(look.z, look.x);
+    cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
+    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0);
+    wgpu::Texture tex = ctx.device.CreateTexture(&td);
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    sim.DrawBodies(rp, (uint32_t)inst.size());
+    if (!microInsts.empty()) sim.DrawMicroBodies(rp, ctx.queue, microInsts);
+    rp.End();
+    wgpu::Buffer shotBuf = CreateBuffer(
+        ctx.device, (uint64_t)W * H * 4,
+        wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "mobShot");
+    wgpu::TexelCopyTextureInfo srcT{};
+    srcT.texture = tex;
+    wgpu::TexelCopyBufferInfo dstB{};
+    dstB.buffer = shotBuf;
+    dstB.layout.bytesPerRow = W * 4;
+    dstB.layout.rowsPerImage = H;
+    wgpu::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+    std::vector<uint8_t> pixels((size_t)W * H * 4, 0);
+    wgpu::Future f = shotBuf.MapAsync(
+        wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          if (status == wgpu::MapAsyncStatus::Success) {
+            std::memcpy(pixels.data(),
+                        shotBuf.GetConstMappedRange(0, pixels.size()),
+                        pixels.size());
+            shotBuf.Unmap();
+          }
+        });
+    ctx.instance.WaitAny(f, UINT64_MAX);
+    if (WriteBmp(path, pixels, W, H)) std::printf("wrote %s\n", path);
+  };
+  // Camera directions are relative to the mob's FACING (it turns while it
+  // walks): the side view is the one that shows pitch, the front quarter
+  // shows limb placement.
+  Vec3 fwd = mobs.MobFacing(id);
+  Vec3 right{fwd.z, 0, -fwd.x};
+  // Frame by the def's own SIZE rather than a fixed 18 voxels: the dummy and
+  // critter are ~8 voxels tall but a humanoid rig is ~28, and a constant
+  // distance either crops the tall one or leaves the short one a speck.
+  const float shotDist =
+      std::max(18.0f, 2.4f * std::max(def.worldSize.y,
+                                      std::max(def.worldSize.x,
+                                               def.worldSize.z)));
+  shoot(right + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_side.bmp");
+  shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
+        "screenshot_mob_quarter.bmp");
+  shoot(fwd + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_front.bmp");
+  return 0;
 }
 
 int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
@@ -1981,12 +2208,12 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
           // Slot lists exactly as the frame loop builds them.
           std::vector<BodyXformGpu> xf;
-          BuildBodyXforms(debris, mobs, xf);
+          BuildBodyXforms(debris, mobs, nullptr, xf);
           if (!xf.empty())
             ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
                                   xf.size() * sizeof(BodyXformGpu));
           std::vector<MicroBodyInstGpu> microInsts;
-          BuildMicroInsts(debris, mobs, microInsts);
+          BuildMicroInsts(debris, mobs, nullptr, microInsts);
           std::vector<BodyVoxInst> inst;
           debris.BuildInstances(inst);
           mobs.AppendInstances(inst, debris.BodyCount());
@@ -2218,6 +2445,92 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           mobOk = mobOk && microOk;
         }
 
+        // ---- per-voxel carving of a LIVE limb ----
+        // The assertions are per-limb invariants, not rates (the frontier-rule
+        // lesson):
+        //   1. a carve removes REAL voxels from a limb that is still attached,
+        //   2. the limb keeps its identity while it does — same body, still
+        //      alive, still driving locomotion — so wounds are cosmetic until
+        //      they are not, and
+        //   3. carving the SAME spot until the limb cannot hold together
+        //      severs it, with no hp threshold having decided that.
+        // (3) is the load-bearing one: it is what makes dismemberment a
+        // geometric consequence of what the player actually cut away.
+        //
+        // Run on the CRITTER (scale 2), not the dummy: the dummy's arm is five
+        // world voxels, which is below the fragment floor before a single cut
+        // lands, so it could only ever prove the collapse branch. Carving is
+        // for micro rigs — that is where a limb has enough voxels for a wound
+        // to be a wound rather than an amputation.
+        if (critterDef >= 0) {
+          debris.Reset();
+          mobs.Reset();
+          const MobDef& ccd = mobs.Defs()[critterDef];
+          auto critterLimb = [&](const char* name) {
+            for (size_t i = 0; i < ccd.limbs.size(); i++)
+              if (ccd.limbs[i].name == name) return (int)i;
+            return -1;
+          };
+          uint64_t cid = mobs.Spawn(critterDef, {143, h + 1, 143});
+          for (int i = 0; i < 6; i++) mobTick({});
+          // An upper leg: severable (unlike the torso, which is the root) and
+          // big enough at scale 2 to survive several bites.
+          const int carveLimb = critterLimb("legU.FL");
+          uint32_t v0 = mobs.LimbVoxelCount(cid, carveLimb);
+          uint32_t spawnVox = mobs.LimbVoxelsAtSpawn(cid, carveLimb);
+
+          // One nick, off the joint: the limb must lose matter and keep living.
+          uint32_t v1 = v0;
+          bool stillAttached = false, nickHit = false;
+          {
+            uint64_t lb = mobs.LimbBody(cid, carveLimb);
+            std::vector<ParticleSpawn> cs;
+            // Aim at a voxel in the middle of the limb's own list — far from
+            // the hip anchor, so this cannot be the joint-crossing sever path
+            // in disguise. Not xf.pos: that is the min corner, not flesh.
+            // Radius is in WORLD voxels; at scale 2 this is ~1 world voxel.
+            nickHit = mobs.CarveLimbRadial(
+                lb, mobs.LimbVoxelPos(cid, carveLimb, v0 / 2), 0.5f, true, true,
+                world, cs);
+            for (int i = 0; i < 3; i++) mobTick({});
+            v1 = mobs.LimbVoxelCount(cid, carveLimb);
+            stillAttached = mobs.LimbBody(cid, carveLimb) != 0;
+          }
+
+          // Now keep cutting the same limb until it comes off. The body handle
+          // is re-read every pass: a carve rebuilds the collider and hands the
+          // limb a NEW handle, so a cached one goes stale after the first cut
+          // (the same trap the debris kerf test documents).
+          int passes = 0;
+          for (; passes < 40 && mobs.LimbBody(cid, carveLimb) != 0; passes++) {
+            uint64_t lb = mobs.LimbBody(cid, carveLimb);
+            std::vector<ParticleSpawn> cs;
+            // Bite at flesh that is STILL THERE each pass. A fixed aim point
+            // bores one hole and then sits in the cavity it made — what
+            // survives is exactly what was out of its reach — so eating a limb
+            // through means following the remaining meat.
+            mobs.CarveLimbRadial(lb, mobs.LimbVoxelPos(cid, carveLimb, 0), 0.8f,
+                                 true, true, world, cs);
+            mobTick({});
+          }
+          bool severedByCarving = mobs.LimbBody(cid, carveLimb) == 0;
+          // The mob must survive losing an arm — otherwise "it died" would
+          // explain the detachment just as well as carving did.
+          bool aliveAfter = mobs.IsAlive(cid);
+
+          bool carveOk = nickHit && v1 < v0 && v1 > 0 && stillAttached &&
+                         severedByCarving && aliveAfter;
+          std::printf("mob carve: %s (legU.FL %u/%u -> %u voxels attached=%d, "
+                      "severed after %d more carves, mob alive=%d)\n",
+                      carveOk ? "PASS" : "FAIL", v0, spawnVox, v1,
+                      stillAttached ? 1 : 0, passes, aliveAfter ? 1 : 0);
+          mobOk = mobOk && carveOk;
+          debris.Reset();
+          mobs.Reset();
+        } else {
+          std::printf("mob carve: SKIP (no critter def)\n");
+        }
+
         // ---- dismemberment locomotion states: the maimed keep moving ----
         // The rules live in the sidecars ("states"). Assertions are
         // structural — which rule is active, the loco clip is running, the
@@ -2228,7 +2541,10 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           debris.Reset();
           mobs.Reset();
 
-          // dummy: rule 1 (limp) at one leg lost, rule 0 (crawl) at both
+          // dummy ladder, most-maimed-first in the sidecar so the indices
+          // run BACKWARDS as limbs come off: intact -1, one leg lost -> 3
+          // (crawl.oneLeg), both legs -> 2 (crawl.legless), plus an arm -> 1
+          // (crawl.oneArm), no arms -> 0 (prone, speedScale 0).
           uint64_t did = mobs.Spawn(dummyDef, {137, h + 1, 139});
           for (int i = 0; i < 10; i++) mobTick({});
           int s0 = mobs.LocoState(did);
@@ -2239,6 +2555,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           for (int i = 0; i < 10; i++) mobTick({});
           int s2 = mobs.LocoState(did);
           bool dummyClip = mobs.ActiveClips(did) >= 1;
+          // legless, it must still make way along its facing
           Vec3 dPrev2 = mobs.MobOrigin(did);
           float dAlong2 = 0.0f, dPath2 = 0.0f;
           for (int i = 0; i < 180; i++) {
@@ -2251,8 +2568,29 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
             dPath2 += std::sqrt(step.x * step.x + step.z * step.z);
           }
           bool dummyCrawls = dPath2 > 1.0f && dAlong2 > 0.5f * dPath2;
-          bool dummyStates =
-              s0 == -1 && s1 == 1 && s2 == 0 && dummyClip && dummyCrawls;
+          // one arm gone: still a (slower) crawl; both arms gone: prone and
+          // IMMOBILE — "it stops moving" is the invariant, so measure the
+          // path, not the rate.
+          mobs.Sever(did, limbIndex("arm.L"));
+          for (int i = 0; i < 10; i++) mobTick({});
+          int s3 = mobs.LocoState(did);
+          mobs.Sever(did, limbIndex("arm.R"));
+          for (int i = 0; i < 10; i++) mobTick({});
+          int s4 = mobs.LocoState(did);
+          bool proneClip = mobs.ActiveClips(did) >= 1;
+          Vec3 pPrev = mobs.MobOrigin(did);
+          float pPath = 0.0f;
+          for (int i = 0; i < 100; i++) {
+            mobTick({});
+            Vec3 now = mobs.MobOrigin(did);
+            Vec3 step{now.x - pPrev.x, 0, now.z - pPrev.z};
+            pPrev = now;
+            pPath += std::sqrt(step.x * step.x + step.z * step.z);
+          }
+          bool proneStill = pPath < 0.25f && mobs.IsAlive(did);
+          bool dummyStates = s0 == -1 && s1 == 3 && s2 == 2 && s3 == 1 &&
+                             s4 == 0 && dummyClip && dummyCrawls &&
+                             proneClip && proneStill;
 
           // critter: one lost chain is the gait's own graceful degradation
           // (no rule fires); the second flips it to the crawl state, which
@@ -2284,17 +2622,144 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
           bool stateOk = dummyStates && critStates;
           std::printf(
-              "mob dismember states: %s (dummy %d->%d->%d clip=%d crawled "
-              "%.1f/%.1f vox; critter %d->%d clip=%d swingTicks=%d crawled "
-              "%.1f/%.1f vox)\n",
-              stateOk ? "PASS" : "FAIL", s0, s1, s2, dummyClip ? 1 : 0,
-              dAlong2, dPath2, c1, c2, critClip ? 1 : 0, swingTicks, cAlong2,
-              cPath2);
+              "mob dismember states: %s (dummy %d->%d->%d->%d->%d clip=%d "
+              "crawled %.1f/%.1f vox, prone drift %.2f; critter %d->%d "
+              "clip=%d swingTicks=%d crawled %.1f/%.1f vox)\n",
+              stateOk ? "PASS" : "FAIL", s0, s1, s2, s3, s4, dummyClip ? 1 : 0,
+              dAlong2, dPath2, pPath, c1, c2, critClip ? 1 : 0, swingTicks,
+              cAlong2, cPath2);
           mobOk = mobOk && stateOk;
         }
 
         debris.Reset();
         mobs.Reset();
+      }
+
+      // ---- player avatar ----
+      // The avatar reuses the mob rig but is driven by the PLAYER, so none of
+      // the tests above touch it. What is worth asserting is exactly the part
+      // that is avatar-specific and easy to break silently:
+      //   1. the wizard def loads with every part, chain and state resolved
+      //   2. spawning creates one Jolt body per part
+      //   3. the body FOLLOWS the player rather than wandering off
+      //   4. dismemberment walks DOWN the authored state ladder and each step
+      //      actually slows the player (the movement coupling), ending with a
+      //      state that cannot jump
+      //   5. severed parts become debris and the avatar tears down cleanly
+      {
+        int wizDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++)
+          if (mobs.Defs()[i].name == "wizard") wizDef = (int)i;
+        if (wizDef < 0) {
+          std::printf("avatar: SKIP (no wizard def — run "
+                      "scripts/gen_wizard.py)\n");
+        } else {
+          debris.Reset();
+          const MobDef& wd = mobs.Defs()[wizDef];
+          PlayerAvatar avatar;
+          avatar.Init(&phys, &world, &debris, mats);
+          avatar.SetDefs(&mobs.Defs(), "wizard");
+
+          int h2 = World::TerrainHeight(140, 140, kDefaultSeed);
+          Player pl;
+          pl.fly = false;
+          pl.pos = Vec3{140.5f, (float)(h2 + 2) + Player::kHalfY, 140.5f};
+          bool spawned = avatar.Spawn(pl, 0.0f);
+          const int nParts = (int)wd.limbs.size();
+          bool allBodies = (int)avatar.LimbBodyCount() == nParts;
+
+          auto avTick = [&]() {
+            std::vector<BrushOp> ops;
+            std::vector<ParticleSpawn> spawns;
+            avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, spawns);
+            debris.QueueSupportEvents(world.Snap());
+            std::vector<CellOp> cellOps;
+            debris.PreTick(t + 1, world, cellOps, spawns);
+            ++t;
+            SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps,
+                       false, {140 / 16, h2 / 16, 140 / 16}, true, false,
+                       spawns);
+            ctx.WaitIdle();
+            ctx.ProcessEvents();
+            phys.Step(kTickDt);
+            debris.PostStep();
+            avatar.PostStep();
+          };
+          for (int i = 0; i < 20; i++) avTick();
+
+          // The body must TRACK the player: walk the player 12 voxels and the
+          // avatar origin has to come along. A rig that ignored its driver
+          // (the mob wander drive, say) would sit still and still look fine in
+          // a screenshot.
+          Vec3 originBefore = avatar.Origin();
+          for (int i = 0; i < 60; i++) {
+            pl.pos.x += 0.2f;
+            avTick();
+          }
+          float followed = avatar.Origin().x - originBefore.x;
+          bool follows = followed > 10.0f;
+
+          // The body must stay AT the player, not drift vertically away from
+          // it. The gait used to re-derive its own standing height from the
+          // foot plane, and because the foot goal falls back to that same
+          // height when a ground probe misses, it fed itself and the avatar
+          // climbed ~9.5 voxels a tick — "the wizard is 100 feet above the
+          // player". A drift assertion is the cheap guard: any feedback path
+          // that returns shows up here as an unbounded number, whatever its
+          // cause. Tolerance is one body height, which covers the legitimate
+          // gap between the AABB sole and an animated pose.
+          float soleY = pl.pos.y - Player::kHalfY;
+          float drift = std::abs(avatar.BodyY() - soleY);
+          bool tracksY = drift < wd.worldSize.y;
+
+          // Walk DOWN the state ladder and check the movement coupling at each
+          // rung. Speed must be non-increasing and must actually drop by the
+          // end — the whole point of the states is that damage costs you.
+          const char* ladder[] = {"foot.R", "legL.R", "legU.L"};
+          float prevSpeed = avatar.Locomotion().speedScale;
+          bool monotone = prevSpeed == 1.0f;
+          int statesSeen = 0;
+          for (const char* nm : ladder) {
+            if (!avatar.SeverByName(nm)) continue;
+            for (int i = 0; i < 12; i++) avTick();
+            float s = avatar.Locomotion().speedScale;
+            monotone = monotone && s <= prevSpeed + 1e-4f;
+            prevSpeed = s;
+            if (avatar.LocoState() >= 0) statesSeen++;
+          }
+          bool slowed = prevSpeed < 1.0f;
+          // both legs unusable -> no jump. This is derived from leg liveness
+          // rather than authored, so it must hold whatever the rules say.
+          // Captured HERE, while the avatar is still standing: reading it back
+          // after Despawn would report the pristine defaults and quietly turn
+          // this assertion into a tautology.
+          const bool canJumpNow = avatar.Locomotion().canJump;
+          const int stateNow = avatar.LocoState();
+          bool noJump = !canJumpNow;
+
+          uint32_t partsLeft = avatar.LimbBodyCount();
+          bool partsGone = (int)partsLeft < nParts;
+          size_t debrisNow = debris.BodyCount();
+          bool becameDebris = debrisNow > 0;
+
+          avatar.Despawn();
+          bool tornDown = avatar.LimbBodyCount() == 0;
+
+          bool avOk = spawned && allBodies && follows && tracksY && monotone &&
+                      slowed && noJump && statesSeen > 0 && partsGone &&
+                      becameDebris && tornDown;
+          std::printf(
+              "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
+              "y-drift %.2f vox, states seen=%d (last %d) speed 1.00->%.2f "
+              "monotone=%d canJump=%d, %u parts left, %zu debris, "
+              "torn down=%d)\n",
+              avOk ? "PASS" : "FAIL", nParts, spawned ? 1 : 0,
+              allBodies ? 1 : 0, followed, drift, statesSeen, stateNow,
+              prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0, partsLeft,
+              debrisNow, tornDown ? 1 : 0);
+          mobOk = mobOk && avOk;
+          debris.Reset();
+        }
       }
     }
   }
@@ -2823,10 +3288,12 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool lowPowerAdapter = false;
+  std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--selftest") selftest = true;
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
+    if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
     // `--time 0..1` sets the time of day for --shot: 0 = midnight, 0.25 =
     // sunrise, 0.5 = noon, 0.75 = sunset. Lets the sky be judged at any point
     // in the cycle without waiting for it.
@@ -2883,7 +3350,7 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot) {
+  if (!selftest && !shot && shotMob.empty()) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -2914,6 +3381,10 @@ int main(int argc, char** argv) {
   // debris system needs a handle on the same set.
   MicroBodySet mbSet;
   debris.SetMicroSet(&mbSet);
+  // Carving a LIVE limb clones its brick out of the same pool, so mobs need the
+  // same handle: without it a wounded limb still loses real voxels, it just
+  // cannot show them (game/mob.h CarveLimbRadial).
+  mobs.SetMicroSet(&mbSet);
   std::unordered_map<uint32_t, MicroBodyRef> sphereModels;  // material -> model
   {
     std::vector<MobDef> mobDefs;
@@ -2932,6 +3403,8 @@ int main(int argc, char** argv) {
   far.Init(&world);
 
   if (shot) return RunShots(ctx, world, sim);
+  if (!shotMob.empty())
+    return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);
   if (selftest)
     return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream);
 
@@ -2954,6 +3427,19 @@ int main(int argc, char** argv) {
   Player player;
   Brush brush;
   PrefabPlacer placer;
+  // The player avatar shares MobSystem's def list rather than loading its own:
+  // one micro-body pool, and a hot reload (R) rebuilds both at once. It points
+  // at whichever def is named `avatarDefName`, so swapping the player
+  // character is data, not code.
+  const std::string avatarDefName = "wizard";
+  PlayerAvatar avatar;
+  avatar.Init(&phys, &world, &debris, mats);
+  avatar.SetDefs(&mobs.Defs(), avatarDefName);
+  ThirdPersonRig tpRig;
+  CameraMode camMode = CameraMode::First;
+  float avatarHeading = 0.0f;   // body facing, radians about +Y
+  float fovNow = CurrentTuning().camera.fovY;
+  float respawnTimer = 0.0f;
   // Clear-then-fill, matching the hot-reload path below. These run once here,
   // but an append-only build of a list the UI indexes into is exactly how a
   // duplicate entry (and the ImGui ID collision that follows) gets introduced.
@@ -2977,7 +3463,7 @@ int main(int argc, char** argv) {
   glfwGetCursorPos(window, &mx0, &my0);
 
   KeyEdge eP, eN, eV, eF1, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH;
   bool prevMouseL = false;
   std::vector<Grenade> grenades;
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
@@ -3067,6 +3553,24 @@ int main(int argc, char** argv) {
     if (captured && eM.Pressed(key(GLFW_KEY_M))) ui.spawnMob = true;
     if (captured && eB.Pressed(key(GLFW_KEY_B))) ui.placePrefab = true;
     if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
+    // C cycles first -> third -> over-shoulder. Snapping the rig on a change
+    // stops the boom easing across the world when the mode flips.
+    if (captured && eC.Pressed(key(GLFW_KEY_C))) {
+      camMode = (CameraMode)(((int)camMode + 1) % (int)CameraMode::Count);
+      tpRig.Snap();
+    }
+    // H severs the next intact part, worst-case first: a debug driver for the
+    // dismemberment states that does not need a weapon pointed at yourself.
+    // The order walks DOWN the state ladder (hand -> arm -> foot -> leg ->
+    // head), so repeated presses march through limp, hop, crawl and squirm.
+    if (captured && eH.Pressed(key(GLFW_KEY_H)) && avatar.Spawned()) {
+      static const char* kSeverOrder[] = {
+          "staff",  "hand.R", "hand.L", "armL.R", "armL.L",
+          "foot.R", "foot.L", "legL.R", "legL.L", "armU.R",
+          "armU.L", "legU.R", "legU.L", "head"};
+      for (const char* nm : kSeverOrder)
+        if (avatar.SeverByName(nm)) break;
+    }
     if (ui.tool == UIState::kToolPrefab && eT.Pressed(key(GLFW_KEY_T)))
       ui.prefabRot = (ui.prefabRot + 1) & 3;
     if (ui.tool == UIState::kToolPrefab && eO.Pressed(key(GLFW_KEY_O)) &&
@@ -3147,6 +3651,13 @@ int main(int argc, char** argv) {
         if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
+        // The avatar holds a MobDef* INTO that vector, so it must be
+        // re-published after SetDefs replaces the contents or the pointer
+        // dangles. SetDefs despawns first, which also drops limb bodies that
+        // reference the now-freed micro models.
+        avatar.OnMaterialsReloaded(mats);
+        avatar.SetDefs(&mobs.Defs(), avatarDefName);
+        tpRig.Snap();
         ui.mobNames.clear();
         for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
         if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
@@ -3176,6 +3687,12 @@ int main(int argc, char** argv) {
       everExploded = false;
       debris.Reset();
       mobs.Reset();
+      // The avatar's severed parts live in DebrisSystem and its live limbs are
+      // Jolt bodies in the world that just went away; despawn rather than
+      // leave it holding handles into a system that has been reset. The
+      // per-tick block respawns it on the next tick.
+      avatar.Despawn();
+      tpRig.Snap();
     }
     if (ui.saveWorld) {
       ui.saveWorld = false;
@@ -3190,12 +3707,26 @@ int main(int argc, char** argv) {
         everExploded = false;
         debris.Reset();
         mobs.Reset();
+        avatar.Despawn();
+        tpRig.Snap();
       }
     }
 
     // ---- player (per frame, against the latest one-tick-latent mirror) ----
     player.fly = ui.fly;
     auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
+    // Dismemberment drives movement: the active AnimStateRule's speedScale and
+    // the leg-liveness-derived jump scale come straight from the avatar, so
+    // losing a leg slows the player down and losing both stops them jumping.
+    // Fly mode deliberately ignores all of it — a debug camera should not be
+    // crippled by the character's injuries.
+    {
+      const AvatarLocomotion loco = avatar.Locomotion();
+      const bool couple = avatar.Spawned() && !player.fly;
+      player.speedScale = couple ? loco.speedScale : 1.0f;
+      player.jumpScale = couple ? loco.jumpScale : 1.0f;
+      player.canJump = couple ? loco.canJump : true;
+    }
     player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(), kindAt);
     ui.fly = player.fly;
 
@@ -3245,6 +3776,7 @@ int main(int argc, char** argv) {
         uint64_t body = 0;
         Vec3 at{};
         float radius = 0;
+        bool limb = false;  // a live mob limb carves; plain debris melts
       } laserCut;
       if (laserHeld) {
         const WorldSnapshot& lsnap = world.Snap();
@@ -3268,13 +3800,30 @@ int main(int argc, char** argv) {
           // no cutting plane is chosen, so what falls apart is decided by the
           // geometry the player carved, not by camera orientation.
           Vec3 hitPos = eye + fwd * bodyDist;
-          if (!mobs.Damage(hitBody, CurrentTuning().tools.laserDamage, hitPos)) {
+          // The avatar is checked alongside mobs — a beam that crosses the
+          // player's own joint takes that part off exactly as it would a
+          // mob's, with no avatar-specific damage path.
+          if (avatar.Damage(hitBody, CurrentTuning().tools.laserDamage,
+                            hitPos)) {
+            // handled by the avatar
+          } else if (mobs.Damage(hitBody, CurrentTuning().tools.laserDamage,
+                                 hitPos)) {
+            // A limb hit is now BOTH: the hp/sever logic above (joint
+            // crossings, flinch, loco states) AND a real channel bored through
+            // the flesh. Deferred like the melt below, for the same reason.
+            //
+            // Damage() may have severed the limb outright, in which case this
+            // handle is no longer a live limb — the carve then simply misses
+            // (CarveLimbRadial returns false) rather than touching stale state.
+            laserCut = {hitBody, hitPos,
+                        (float)CurrentTuning().tools.laserCarveRadius, true};
+          } else {
             // Deferred: the melt needs the `spawns` list that debris.PreTick
             // fills further down, and the ray must be cast HERE where the
             // camera and physics state for this tick are current. Carrying the
             // hit forward is cheaper than reordering the tick.
             float br = (float)CurrentTuning().tools.laserMeltRadius;
-            laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br};
+            laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br, false};
           }
         } else if (gridDist < 1e8f) {
           const int r = CurrentTuning().tools.laserMeltRadius;
@@ -3434,6 +3983,70 @@ int main(int argc, char** argv) {
       // bleeding ops — must run before debris.PreTick consumes the anchors
       mobs.PreTick(tick, world, ops, spawns);
 
+      // ---- player avatar ----
+      // Same slot in the tick order as mobs, and for the same reason: it
+      // drives kinematic bodies and appends bleeding ops that debris.PreTick
+      // must see. The body's FACING is decided here rather than inside the
+      // avatar because it is a game-design policy, not a rig property: in
+      // first person the body always faces the camera (you are looking down
+      // its own axis), while in third person it turns toward its MOTION and
+      // only snaps to the camera when standing still — which is what stops
+      // the character from moon-walking sideways across the screen.
+      {
+        const auto& av = CurrentTuning().avatar;
+        // Camera yaw and rig heading use different conventions: Camera's
+        // forward is (cos yaw, ., sin yaw) while a mob's is (sin h, ., cos h),
+        // so h = pi/2 - yaw. Getting this wrong makes the avatar face 90
+        // degrees off its travel direction.
+        const float camHeading = 1.5707963f - cam.yaw;
+        float wantHeading = camHeading;
+        if (camMode != CameraMode::First) {
+          Vec3 v{player.vel.x, 0, player.vel.z};
+          float sp = v.len() * kVoxelMeters;   // voxels/s -> m/s
+          if (sp > av.turnMinSpeed) wantHeading = std::atan2(v.x, v.z);
+          else wantHeading = avatarHeading;    // too slow: hold, don't spin
+        }
+        // Shortest-arc turn toward the goal, rate-limited.
+        float d = wantHeading - avatarHeading;
+        while (d > 3.14159265f) d -= 6.2831853f;
+        while (d < -3.14159265f) d += 6.2831853f;
+        float maxStep = av.turnRate * kTickDt;
+        avatarHeading += std::clamp(d, -maxStep, maxStep);
+
+        // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
+        // one is what makes flying feel possessed:
+        //   1. The rig walks/IKs against ground it is nowhere near, so the
+        //      avatar flails or stretches toward the terrain below.
+        //   2. Far worse — the 16 limb bodies are real Jolt bodies, and
+        //      PlayerPushOut resolves the player against everything it
+        //      overlaps. Flying leaves the player sitting inside their OWN
+        //      limbs, so the body shoves its own player around the sky. Fly
+        //      mode already ignores voxel collision for exactly this reason;
+        //      the avatar has to follow the same rule.
+        const bool wantAvatar = av.enabled && !player.fly;
+        if (wantAvatar && avatar.HasDef() && !avatar.Spawned()) {
+          avatar.Spawn(player, avatarHeading);
+          tpRig.Snap();   // re-entering from fly: don't ease across the gap
+        }
+        if (!wantAvatar && avatar.Spawned()) avatar.Despawn();
+        if (avatar.Spawned())
+          avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
+                         spawns);
+        // Dead avatar: hold the corpse for respawnDelay, then rebuild it.
+        // The parts are already DebrisSystem's by then, so the corpse stays
+        // in the world and settles like any other debris.
+        if (avatar.Spawned() && !avatar.IsAlive()) {
+          respawnTimer += kTickDt;
+          if (respawnTimer >= av.respawnDelay) {
+            respawnTimer = 0;
+            avatar.Revive(player, avatarHeading);
+            tpRig.Snap();
+          }
+        } else {
+          respawnTimer = 0;
+        }
+      }
+
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
       debris.QueueSupportEvents(world.Snap());
@@ -3443,9 +4056,18 @@ int main(int argc, char** argv) {
       debris.PreTick(tick, world, cellOps, spawns);
       // laser kerf into a body, deferred from the input block above so it can
       // reach `spawns` (a cut that severs the body sheds the loose bits)
-      if (laserCut.body)
-        debris.MeltBodyAt(laserCut.body, laserCut.at, laserCut.radius, world,
-                          spawns);
+      if (laserCut.body) {
+        // A live limb is carved (eject=false: the beam vaporizes, and a held
+        // laser spraying gobbets every tick would drain the particle ring);
+        // plain debris melts. The two paths are the same operation on the two
+        // populations — see game/mob.h.
+        if (laserCut.limb)
+          mobs.CarveLimbRadial(laserCut.body, laserCut.at, laserCut.radius,
+                               false /*ragged*/, false /*eject*/, world, spawns);
+        else
+          debris.MeltBodyAt(laserCut.body, laserCut.at, laserCut.radius, world,
+                            spawns);
+      }
       // prefab stamps drain after island ops (they win same-cell conflicts)
       placer.PreTick(world, cellOps);
 
@@ -3485,10 +4107,15 @@ int main(int argc, char** argv) {
           // separate bodies when the crater severs it. Runs first so the
           // impulse below acts on the post-damage bodies (including the new
           // fragments, which is what makes a blown-apart object scatter).
-          debris.DamageBodiesRadial(
-              Vec3{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f},
-              (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale,
-              world, spawns);
+          const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
+          const float edr =
+              (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
+          debris.DamageBodiesRadial(ec, edr, world, spawns);
+          // Living flesh craters too: a blast next to a mob tears voxels off
+          // its limbs, and takes a limb clean off when it removes enough of it.
+          // Same call shape as the debris line above — that parallel is the
+          // point (game/mob.h).
+          mobs.CarveMobsRadial(ec, edr, world, spawns);
           phys.ApplyRadialImpulse(
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
@@ -3522,6 +4149,7 @@ int main(int argc, char** argv) {
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
       debris.PostStep();
       mobs.PostStep();
+      avatar.PostStep();
       // debris that ended the step overlapping the player pushes the player
       // out (fly mode ignores collision entirely, matching the voxel rules)
       if (!player.fly)
@@ -3537,6 +4165,62 @@ int main(int argc, char** argv) {
       // offset so voxel steps glide instead of popping. Everything that can
       // feed the sim (brush/laser/grenade rays, physics) stays on EyePos.
       Vec3 eye = player.ViewEyePos();
+      // ---- avatar camera ----
+      // The rig only decides where the RENDER eye sits. Picking rays, the
+      // brush, the laser and the grenade all keep using player.EyePos(), so
+      // switching to third person cannot change anything the sim sees — the
+      // same guarantee the view-smoothing offset already relies on.
+      {
+        const AvatarLocomotion loco = avatar.Locomotion();
+        // ORBIT THE PLAYER, NOT THE ART. The obvious-looking choice — the head
+        // joint's world anchor — is wrong three times over: that transform is
+        // read back from Jolt (one tick latent), it is driven by the gait's
+        // bob/sway, and it swings with every animation. Orbiting it makes the
+        // camera chase a lagging, bobbing point, which reads as constant jank
+        // and, worse, makes walking feel like it does nothing: the boom is
+        // still catching up to where the body was rather than following where
+        // the player IS.
+        //
+        // The player's own eye is authoritative, frame-current, and already
+        // step-smoothed (ViewEyePos), so it is the only stable thing to orbit.
+        // The avatar merely rides along.
+        Vec3 focus = eye;
+        tpRig.Update(dt, camMode, cam, focus, loco, world, kindAt);
+        if (camMode != CameraMode::First) eye = tpRig.EyePos();
+
+        // Hide the body in first person so the player is not inside their own
+        // hat, but keep the arms and the staff — seeing your own hands is most
+        // of what sells a first-person body.
+        std::vector<uint8_t> hide;
+        if (avatar.Spawned()) {
+          const AvatarParts& p = avatar.Parts();
+          hide.assign(avatar.Def() ? avatar.Def()->limbs.size() : 0, 0);
+          if (camMode == CameraMode::First) {
+            for (size_t i = 0; i < hide.size(); i++) hide[i] = 1;
+            if (CurrentTuning().avatar.firstPersonArms) {
+              const int keep[7] = {p.armUL, p.armUR, p.handL, p.handR,
+                                   p.staff, -1, -1};
+              for (int k : keep)
+                if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
+            }
+          }
+          avatar.SetHiddenParts(hide);
+        }
+
+        // Speed-driven FOV: widens toward a sprint and eases back. Purely a
+        // feel knob, and eased with the same half-life form as the rig so it
+        // behaves identically at any frame rate.
+        const auto& tp = CurrentTuning().thirdPerson;
+        float sp = Vec3{player.vel.x, 0, player.vel.z}.len() * kVoxelMeters;
+        float ref = std::max(CurrentTuning().player.sprintSpeed, 0.01f);
+        float fovGoal = CurrentTuning().camera.fovY +
+                        tp.speedFov * std::clamp(sp / ref, 0.0f, 1.0f);
+        float k = tp.speedFovHalflife <= 1e-4f
+                      ? 1.0f
+                      : 1.0f - std::exp2(-dt / tp.speedFovHalflife);
+        fovNow += (fovGoal - fovNow) * k;
+        cam.fovY = fovNow;
+      }
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
@@ -3666,10 +4350,13 @@ int main(int argc, char** argv) {
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mbSet.dirty = false;
       }
-      if (debris.InstancesDirty() || mobs.InstancesDirty()) {
+      if (debris.InstancesDirty() || mobs.InstancesDirty() ||
+          avatar.InstancesDirty()) {
         std::vector<BodyVoxInst> inst;
         debris.BuildInstances(inst);
         mobs.AppendInstances(inst, debris.BodyCount());
+        avatar.AppendInstances(inst,
+                               debris.BodyCount() + mobs.LimbBodyCount());
         bodyInstCount = (uint32_t)inst.size();
         if (!inst.empty())
           ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
@@ -3680,11 +4367,13 @@ int main(int argc, char** argv) {
       // are hoisted out of the loop so a steady-state frame reuses their
       // capacity instead of allocating — clear() keeps the storage.
       microInsts.clear();
-      if (debris.BodyCount() + mobs.LimbBodyCount() > 0) {
-        BuildBodyXforms(debris, mobs, bodyXf);
+      if (debris.BodyCount() + mobs.LimbBodyCount() +
+              avatar.LimbBodyCount() >
+          0) {
+        BuildBodyXforms(debris, mobs, &avatar, bodyXf);
         ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
                               bodyXf.size() * sizeof(BodyXformGpu));
-        BuildMicroInsts(debris, mobs, microInsts);
+        BuildMicroInsts(debris, mobs, &avatar, microInsts);
       }
 
       wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();

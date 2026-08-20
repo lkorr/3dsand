@@ -827,6 +827,165 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "id": "robe_cloth",
+      "class": "solid",
+      "density": 320,
+      "hardness": 5,
+      "rubble": "ash",
+      "colors": [
+        "#3b2f6b",
+        "#31275a",
+        "#473a80"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "robe_trim",
+      "class": "solid",
+      "density": 330,
+      "hardness": 6,
+      "emission": 6,
+      "rubble": "ash",
+      "colors": [
+        "#c9a227",
+        "#b08d1d",
+        "#e0bb3c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "robe_shadow",
+      "class": "solid",
+      "density": 320,
+      "hardness": 5,
+      "rubble": "ash",
+      "colors": [
+        "#241c46",
+        "#1c153a",
+        "#2e2554"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "skin",
+      "class": "solid",
+      "density": 1010,
+      "hardness": 8,
+      "rubble": "blood",
+      "colors": [
+        "#d9a074",
+        "#c68d63",
+        "#e8b287"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "hair_white",
+      "class": "solid",
+      "density": 280,
+      "hardness": 3,
+      "rubble": "ash",
+      "colors": [
+        "#e6e2d8",
+        "#d2cec2",
+        "#f5f2ea"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "leather",
+      "class": "solid",
+      "density": 860,
+      "hardness": 14,
+      "rubble": "ash",
+      "colors": [
+        "#5a3a22",
+        "#4b301b",
+        "#6b472b"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "staff_wood",
+      "class": "solid",
+      "density": 620,
+      "hardness": 34,
+      "rubble": "ash",
+      "colors": [
+        "#6a4a2c",
+        "#5b3e24",
+        "#7d5a38"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "gem_arcane",
+      "class": "solid",
+      "density": 2600,
+      "hardness": 90,
+      "emission": 200,
+      "rubble": "dust",
+      "colors": [
+        "#7ad6ff",
+        "#4fb8f0",
+        "#a8e8ff"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "id": "bone",
+      "class": "solid",
+      "density": 1200,
+      "hardness": 24,
+      "rubble": "dust",
+      "colors": [
+        "#e4dfcb",
+        "#d0cab4",
+        "#f2eeda"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ]
     }
   ]
 }

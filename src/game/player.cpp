@@ -273,7 +273,8 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     vel.y -= gravity * accel * dt;
 
     float speed = ((in.sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
-                  (inLiquid ? T().liquidSpeedScale : 1.0f);
+                  (inLiquid ? T().liquidSpeedScale : 1.0f) *
+                  (speedScale > 0.0f ? speedScale : 0.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
@@ -293,8 +294,9 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       vel.y *= std::exp(-T().liquidDrag * dt);  // drag (frame-rate independent)
       if (in.up) vel.y += (T().swimUp / kVoxelMeters) * dt;  // swim
       if (in.down) vel.y -= (T().swimDown / kVoxelMeters) * dt;
-    } else if (jumpBuffer > 0.0f && coyoteTimer > 0.0f) {
-      vel.y = T().jumpSpeed / kVoxelMeters;
+    } else if (jumpBuffer > 0.0f && coyoteTimer > 0.0f && canJump &&
+               jumpScale > 0.0f) {
+      vel.y = (T().jumpSpeed / kVoxelMeters) * jumpScale;
       jumpBuffer = 0.0f;
       coyoteTimer = 0.0f;  // consume both, or one press pogos every frame
       onGround = false;    // no snapping or stepping on the frame we launch

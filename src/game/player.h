@@ -62,6 +62,19 @@ class Player {
   // Render-only — see ViewEyePos().
   float viewYOffset = 0.0f;
 
+  // ---- avatar damage coupling ----
+  // Multipliers the PlayerAvatar's dismemberment state feeds in (see
+  // AvatarLocomotion): a wizard missing a leg walks at speedScale and jumps at
+  // jumpScale, and one missing both cannot jump at all.
+  //
+  // Kept as plain fields set by the caller rather than as extra Update()
+  // parameters so that every existing caller — including tests/movement_test,
+  // which has no avatar at all — keeps compiling and keeps its 1.0 defaults.
+  // They multiply the tuned speeds, so "intact" is exactly the old behaviour.
+  float speedScale = 1.0f;
+  float jumpScale = 1.0f;
+  bool canJump = true;
+
   static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
   static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall
   static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // eyes near the top

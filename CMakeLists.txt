@@ -117,6 +117,8 @@ add_executable(sandvox
   src/game/prefab.cpp
   src/game/mob.cpp
   src/game/anim.cpp
+  src/game/avatar.cpp
+  src/game/thirdperson.cpp
   src/phys/physics.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp

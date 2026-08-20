@@ -2267,6 +2267,23 @@ function tuneRow(tab,pr,g){
   if(pr.type==='color'||pr.type==='vec3'){
     row.append(vecEditor(pr,g,mark));
     row.append(el('span',{}));   // triples have no single numeric box
+  }else if(pr.bool){
+    // Booleans are a checkbox, not a 0..1 slider. The C++ reader (ReadB in
+    // sim/tuning.cpp) rejects a number outright rather than coercing it, so a
+    // slider here would write values the engine then refuses to load.
+    const chk=el('input',{type:'checkbox'});
+    const lbl=el('span',{class:'unit'});
+    const paint=()=>{lbl.textContent=chk.checked?'on':'off';};
+    chk.checked=!!(cur??false);
+    paint();
+    chk.addEventListener('change',()=>{
+      setTuned(g,pr.k,chk.checked);
+      paint();
+      touchTune();mark();
+    });
+    row.append(el('label',{class:'chk',
+      style:'display:flex;align-items:center;gap:7px'},chk,lbl));
+    row.append(el('span',{}));   // no numeric box
   }else{
     const rng=el('input',{type:'range',min:pr.min,max:pr.max,step:pr.step??'any'});
     const num=el('input',{class:'tnum',type:'number',step:pr.step??'any'});

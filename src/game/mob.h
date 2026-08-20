@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -96,6 +97,11 @@ class MobSystem {
  public:
   void Init(Physics* phys, World* world, DebrisSystem* debris,
             const std::vector<MaterialDef>& mats);
+  // Carving a micro limb clones its brick copy-on-write out of the SAME pool the
+  // renderer uploads, so the owner hands it over once at startup (as it already
+  // does for DebrisSystem). Not owned. Without it, micro limbs still take real
+  // damage — they just cannot show it.
+  void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
@@ -126,6 +132,25 @@ class MobSystem {
   // flinch clip when the rig defines one.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
               float impactSpeed = 0.0f);
+
+  // ---- per-voxel carving (docs/DESIGN.md §7 "Carving living bodies") ---------
+  //
+  // Removes actual voxels from a LIVE limb, the same way DamageBody carves a
+  // rigidbody. This is the substrate for precise wounds: a laser bores a real
+  // channel through a torso, a blast scoops a crater out of a shoulder, and in
+  // time a scalpel takes out one micro voxel of brain. Missing voxels are
+  // cosmetic — the limb keeps its identity, hp, joints and animation — until
+  // the carve actually disconnects it, which is when dismemberment becomes a
+  // geometric consequence rather than an hp threshold.
+  //
+  // `eject` spawns the removed matter as ballistic particles (blast) rather
+  // than vaporizing it (laser). Returns true when the handle was a live limb.
+  bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
+                       float radiusVoxels, bool ragged, bool eject, World& world,
+                       std::vector<ParticleSpawn>& spawns);
+  // Every live limb of every mob within the blast — the explosion entry point.
+  void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
+                       std::vector<ParticleSpawn>& spawns);
   // Detach a limb now (laser crossing the joint). Root/vital kills instead.
   void Sever(uint64_t mobId, int limbIndex);
   // Nearest live limb of any mob to a body handle; -1 if none.
@@ -168,6 +193,27 @@ class MobSystem {
   // Active dismemberment locomotion state: index into the def's authored
   // `states` list (AnimSkeleton::states), -1 for normal locomotion.
   int LocoState(uint64_t mobId) const;
+  // Pose introspection for --shot-mob: a limb's local +Y (post-blend, stage 3)
+  // and model +Y (post-flatten/IK, stage 4-5). Comparing these against the
+  // limb's WORLD transform is what localizes a pose bug to a stage instead of
+  // guessing from a screenshot.
+  Vec3 LimbLocalUp(uint64_t mobId, int limbIndex) const;
+  Vec3 LimbModelUp(uint64_t mobId, int limbIndex) const;
+  // Live clip instances as "name:weight" pairs — the one view that tells a
+  // stuck crossfade (two clips still blending) apart from a mis-authored key.
+  std::vector<std::pair<std::string, float>> ClipWeights(uint64_t mobId) const;
+  // Live voxel count of one limb, and what it was authored with. The carve
+  // selftest asserts against these rather than against rendered instance
+  // counts: a micro limb emits no cube instances at all, so counting draws
+  // would silently measure nothing on exactly the rigs carving matters most on.
+  uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
+  uint32_t LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const;
+  // World position of one of a limb's SURVIVING voxels — the `n`th, wrapped.
+  // Deliberately not the centroid: once a carve has hollowed a limb, its
+  // centroid is in the cavity, and a tool aimed there eats nothing. Anything
+  // that wants to keep cutting (the selftest, a future aim assist) has to aim
+  // at flesh that is actually still present.
+  Vec3 LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const;
 
  private:
   struct Limb {
@@ -218,6 +264,16 @@ class MobSystem {
     // rebuild collision every 100 ms). Instances rebuild on frame change.
     int flipbookModel = -1;
     std::vector<std::vector<DebrisVoxel>> frameVoxels;  // per .vox model index
+    // Per-voxel carving state. `carved` latches the first time this limb loses
+    // a voxel; from then on its micro model is a copy-on-write clone this limb
+    // OWNS and must free (ReleaseLimbMicro), and its flipbooks are disabled —
+    // a frame swap re-points rendering at an intact authored model, which would
+    // silently heal the wounds the player just carved.
+    bool carved = false;
+    // Voxel count the limb was authored with, so damage can be expressed as a
+    // FRACTION of the limb rather than an absolute count. A carve that removes
+    // half a scale-4 arm and half a scale-1 arm should read as the same injury.
+    uint32_t voxelsAtSpawn = 0;
   };
   // Per-mob gore profile: the entity-scoped variance draws, resolved ONCE when
   // the mob is created and then held for its whole life. Every mob that is made
@@ -262,6 +318,39 @@ class MobSystem {
 
   void Die(Mob& mob);          // ragdoll: limbs go dynamic, adopt into debris
   void DetachLimb(Mob& mob, int limbIndex, bool adopt);
+
+  // ---- carving internals -----------------------------------------------------
+  // Shared carve core, the live-limb twin of DebrisSystem::DamageBody: erase the
+  // voxels `keep` rejects, re-skin, rebuild the collider, and hand any piece the
+  // carve disconnected to DebrisSystem as ordinary debris. Returns false when
+  // the limb was destroyed outright (severed or the mob died), in which case
+  // `mob` may no longer be alive and the caller must not touch the limb again.
+  bool CarveLimb(Mob& mob, int limbIndex, World& world,
+                 std::vector<ParticleSpawn>& spawns, bool eject,
+                 const std::function<bool(const DebrisVoxel&)>& keep);
+  // Re-skin a carved limb: clone-on-first-carve, rewrite the brick from the
+  // surviving voxels, shift the transform so the art stays on the collider, and
+  // shift restOffset/anchorLimb with it so the RIG follows too — the difference
+  // from the debris version, whose bodies answer to nobody. False = pool full
+  // (limb keeps a stale skin but is really carved).
+  bool ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t defScale);
+  // Rebuild a carved limb's Jolt body and re-create its joint to its parent.
+  // A collider rebuild REPLACES the handle, so the joint must be rebuilt or the
+  // limb falls off; children's joints anchor to this body and are rebuilt too.
+  bool RebuildLimbBody(Mob& mob, int limbIndex);
+  // Return a carved limb's owned micro brick to the pool. Must be called on
+  // every path that stops the mob owning the limb (sever, death, despawn,
+  // reset) or the pool leaks words nothing reclaims.
+  void ReleaseLimbMicro(Limb& limb);
+  // Hand one disconnected chunk of a limb to DebrisSystem as a free body, with
+  // its own COW brick. Falls back to particles when a body or brick can't be
+  // made, exactly as ShatterBody does.
+  void EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
+                          std::vector<DebrisVoxel> part, World& world,
+                          std::vector<ParticleSpawn>& spawns);
+  void LimbVoxelsToParticles(const Limb& limb, uint32_t defScale,
+                             const std::vector<DebrisVoxel>& voxels, World& world,
+                             std::vector<ParticleSpawn>& spawns) const;
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY) const;
   // Animation pipeline stages 1-5 plus the procedural gait layer; leaves the
   // model-space pose in mob.anim.model. Pure float, no grid contact.
@@ -272,6 +361,7 @@ class MobSystem {
   Physics* phys_ = nullptr;
   World* world_ = nullptr;
   DebrisSystem* debris_ = nullptr;
+  MicroBodySet* microSet_ = nullptr;  // shared brick pool; see SetMicroSet
   std::vector<float> densityOf_;
   std::vector<uint32_t> classOf_;
   std::vector<MobDef> defs_;
@@ -288,4 +378,22 @@ class MobSystem {
   static constexpr int kBleedOpsPerTick = 6;  // of the 64-op tick budget
   // how long a severed piece holds its last animated pose before ragdolling
   static constexpr float kSeverHoldSeconds = 0.25f;
+  // ---- carving ---------------------------------------------------------------
+  // A carved chunk needs this many voxels to become its own rigidbody; smaller
+  // pieces spray as particles. Deliberately lower than the debris island floor
+  // (8): flesh comes off in gobbets, and a severed finger IS the interesting
+  // object even though a 4-voxel rock chip is not.
+  static constexpr uint32_t kMinFragmentVoxels = 4;
+  // Fragments one carve may spawn, so a point-blank blast on a crowd cannot
+  // flood the body table (rule 2: bound every emergent process).
+  static constexpr uint32_t kMaxCarveFragments = 3;
+  // Below this fraction of its authored volume a limb is no longer a limb: it
+  // severs. This is what makes "shoot the arm until it falls off" work through
+  // pure geometry, without an hp bar deciding it.
+  static constexpr float kLimbCollapseFraction = 0.25f;
+  // Carve damage per voxel removed, as a fraction of the limb's authored
+  // volume: losing all of a limb's matter costs this multiple of its full hp.
+  // > 1 so a limb that is being visibly minced dies a little before it is
+  // wholly gone, which reads better than a limb hanging on at one voxel.
+  static constexpr float kCarveDamagePerVolume = 1.5f;
 };

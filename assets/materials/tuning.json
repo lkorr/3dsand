@@ -33,6 +33,32 @@
     "fovY": 1.2,
     "pitchClamp": 1.55
   },
+  "thirdPerson": {
+    "distance": 3.2,
+    "shoulderDist": 1.7,
+    "shoulderOffset": 0.55,
+    "heightOffset": 0.25,
+    "sideOffset": 0.0,
+    "collideMargin": 0.35,
+    "collideRadius": 0.25,
+    "collide": true,
+    "focusHalflife": 0.06,
+    "distInHalflife": 0.0,
+    "distOutHalflife": 0.25,
+    "pitchLift": 0.35,
+    "stateFollow": 0.75,
+    "speedFov": 0.06,
+    "speedFovHalflife": 0.35
+  },
+  "avatar": {
+    "enabled": true,
+    "turnRate": 12.0,
+    "turnMinSpeed": 0.35,
+    "firstPersonArms": true,
+    "footTrim": 0.0,
+    "severImpulse": 6.0,
+    "respawnDelay": 3.0
+  },
   "physics": {
     "gravity": 9.81,
     "collisionSteps": 1,
@@ -109,6 +135,7 @@
     "detonatePower": 340,
     "laserRange": 200,
     "laserMeltRadius": 2,
+    "laserCarveRadius": 0.3,
     "laserDamage": 1.5,
     "brushAirDistance": 48
   },

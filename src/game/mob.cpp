@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <unordered_map>
 
 #include <nlohmann/json.hpp>
 
@@ -579,6 +580,9 @@ void MobSystem::Reset() {
         phys_->ClearCollisionGroup(l.holdBody);
         l.holdBody = 0;
       }
+      // A carved limb owns a copy-on-write brick; dropping the mob without
+      // returning it leaks pool words nothing will ever reclaim.
+      ReleaseLimbMicro(l);
       if (l.body) phys_->RemoveBody(l.body);
     }
   mobs_.clear();
@@ -684,6 +688,9 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
       limb.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
                              (uint16_t)(v.material | (variant << 12))});
     }
+    // Authored volume, so carve damage can be expressed as a FRACTION of the
+    // limb — the same wound should read the same on a scale-1 and a scale-4 rig.
+    limb.voxelsAtSpawn = (uint32_t)limb.voxels.size();
     // The body origin is the limb's min corner in WORLD voxels; the collider
     // is built at pitch 1/scale so its micro-unit local coordinates land in the
     // right physical place. Not an integer cell any more at scale>1, which is
@@ -1227,6 +1234,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           phys_->ClearCollisionGroup(l.holdBody);
           l.holdBody = 0;
         }
+        ReleaseLimbMicro(l);  // carved limbs own their brick — return it
         if (l.body) phys_->RemoveBody(l.body);
       }
       mobs_[mi] = std::move(mobs_.back());
@@ -1263,20 +1271,23 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         // settle feet onto the ground; walk only when footing is known
         float targetY = (float)groundY;
         mob.origin.y += std::clamp(targetY - mob.origin.y, -0.3f, 0.3f);
+        // A maimed mob keeps moving, just slower: the active dismemberment
+        // state scales the drive speed (a crawl covers ground at a fraction
+        // of a walk; a fully disarmed prone state is 0 and goes nowhere).
+        // Reads LAST tick's state — UpdateAnimation below re-evaluates it —
+        // which is at most one tick of lag on a sever.
+        float speedScale =
+            mob.anim.locoState >= 0 &&
+                    mob.anim.locoState < (int)def.skel.states.size()
+                ? def.skel.states[mob.anim.locoState].speedScale
+                : 1.0f;
         bool blocked = haveAhead && aheadY > groundY + 2;  // > step-up reach
-        if (blocked && tick > mob.lastTurnTick + 15) {
+        // speedScale 0 also suppresses the blocked-turn: an immobile mob
+        // pirouetting in place at a wall reads as a bug, not as AI.
+        if (blocked && speedScale > 0 && tick > mob.lastTurnTick + 15) {
           mob.heading += 1.5707963f;  // turn 90° and try again
           mob.lastTurnTick = tick;
         } else if (!blocked) {
-          // A maimed mob keeps moving, just slower: the active dismemberment
-          // state scales the drive speed (a crawl covers ground at a fraction
-          // of a walk). Reads LAST tick's state — UpdateAnimation below
-          // re-evaluates it — which is at most one tick of lag on a sever.
-          float speedScale =
-              mob.anim.locoState >= 0 &&
-                      mob.anim.locoState < (int)def.skel.states.size()
-                  ? def.skel.states[mob.anim.locoState].speedScale
-                  : 1.0f;
           mob.origin += fwd * (def.speed * speedScale * dt);
           mob.phase += def.speed * speedScale * dt * 2.2f;  // stride frequency
         }
@@ -1493,6 +1504,469 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
   return false;
 }
 
+// ---- per-voxel carving of LIVE limbs ---------------------------------------
+//
+// The live-limb twin of the DebrisSystem::DamageBody family. The two are
+// deliberately parallel rather than shared: a debris body answers to nobody, so
+// carving it is "erase, re-skin, rebuild, maybe split", while a limb is held in
+// a joint chain and driven by an animation rig, so the same carve additionally
+// has to keep the rig's anchors, the parent/child joints and the loco states
+// agreeing with the new geometry. Trying to serve both from one function would
+// mean threading a rig-shaped callback through the debris path for the benefit
+// of its one non-debris caller.
+//
+// What is genuinely shared is the part that must not diverge: the micro
+// copy-on-write brick (sim/microbody.h) is the SAME pool with the same
+// ownership rules, so a limb carved here and the same limb carved after it is
+// severed behave identically — which is the property that makes "cut the arm
+// off, then keep cutting the arm" work without a special case.
+
+void MobSystem::LimbVoxelsToParticles(const Limb& limb, uint32_t defScale,
+                                      const std::vector<DebrisVoxel>& voxels,
+                                      World& world,
+                                      std::vector<ParticleSpawn>& spawns) const {
+  // Mirrors DebrisSystem::VoxelsToParticles: a micro limb's voxels are 1/scale
+  // of a world voxel, so one particle per voxel would emit `scale^3` times the
+  // matter the limb actually lost. Sub-sampling on the micro lattice conserves
+  // the visible volume — the grid has no sub-voxel resolution to receive the
+  // detail anyway.
+  const float inv = 1.0f / (float)std::max(1u, defScale);
+  const int step = (int)std::max(1u, defScale);
+  Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+  for (const DebrisVoxel& v : voxels) {
+    if (spawns.size() >= kMaxParticleSpawnsPerTick) return;  // ring full: lost
+    if (step > 1 && (((int)v.x % step) || ((int)v.y % step) || ((int)v.z % step)))
+      continue;
+    Vec3 wp = limb.xf.pos + Rotate(q, Vec3{((float)v.x + 0.5f) * inv,
+                                           ((float)v.y + 0.5f) * inv,
+                                           ((float)v.z + 0.5f) * inv});
+    if (!world.CellInWindow({ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)})) continue;
+    // A limb is kinematic while alive, so Jolt's velocity is the animation
+    // drive, not something to inherit — flesh knocked off a walking mob should
+    // fall away from the wound, not sail off at walk speed. The outward push
+    // comes from the carve site instead (the caller's ejection direction).
+    ParticleSpawn s;
+    s.px = (int32_t)std::lround(wp.x * 256.0f);
+    s.py = (int32_t)std::lround(wp.y * 256.0f);
+    s.pz = (int32_t)std::lround(wp.z * 256.0f);
+    Vec3 out = wp - limb.xf.pos;
+    float len = out.len();
+    out = len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0};
+    out.y += 0.6f;  // loft, so gobbets arc instead of skidding along the floor
+    const float sp = 3.0f;
+    s.vx = (int32_t)std::lround(out.x * sp * 256.0f / 30.0f);
+    s.vy = (int32_t)std::lround(out.y * sp * 256.0f / 30.0f);
+    s.vz = (int32_t)std::lround(out.z * sp * 256.0f / 30.0f);
+    s.payload = v.payload;
+    s.flags = 1u;  // PFLAG_ALIVE
+    spawns.push_back(s);
+  }
+}
+
+void MobSystem::ReleaseLimbMicro(Limb& limb) {
+  // Only a CARVED limb owns its brick; an intact one points at the def's shared
+  // model, which every other instance of that mob is also using. MicroBodyFree
+  // ignores shared models, but the `carved` gate makes the intent explicit at
+  // the call site rather than relying on that.
+  if (limb.carved && limb.microModel >= 0 && microSet_)
+    MicroBodyFree(*microSet_, (uint32_t)limb.microModel);
+  limb.carved = false;
+}
+
+bool MobSystem::ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t defScale) {
+  if (limb.microModel < 0 || !microSet_) return false;
+  int own = MicroBodyOwn(*microSet_, (uint32_t)limb.microModel);
+  if (own < 0) return false;  // pool full: keep the stale skin, stay carved
+  limb.microModel = own;
+  limb.carved = true;
+  std::vector<PrefabVoxel> mv;
+  mv.reserve(limb.voxels.size());
+  for (const DebrisVoxel& v : limb.voxels)
+    mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                  (uint16_t)(v.payload & 0xFFF)});
+  IVec3 shift{};
+  if (!MicroBodyEdit(*microSet_, (uint32_t)limb.microModel, mv, shift))
+    return false;
+  if (shift.x || shift.y || shift.z) {
+    // MicroBodyEdit rebased the brick to its own min corner. For a debris body
+    // that means moving the transform; for a LIMB it means moving the transform
+    // AND the rig offsets that derive from the limb origin, because the
+    // animation pipeline re-poses this limb from restOffset every single frame.
+    // Move only the transform and the next frame's pose puts it straight back
+    // where it was, undoing the shift and sliding the art off the collider —
+    // the wound would appear to crawl along the limb as it was carved.
+    const float inv = 1.0f / (float)std::max(1u, defScale);
+    Vec3 d{(float)shift.x * inv, (float)shift.y * inv, (float)shift.z * inv};
+    Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+    limb.xf.pos += Rotate(q, d);
+    limb.restOffset += d;
+    // The joint anchors are expressed from the limb origin, so they move the
+    // opposite way to stay on the same physical point of the creature.
+    limb.anchorLimb = limb.anchorLimb - d;
+    for (DebrisVoxel& v : limb.voxels) {
+      v.x = (int8_t)(v.x - shift.x);
+      v.y = (int8_t)(v.y - shift.y);
+      v.z = (int8_t)(v.z - shift.z);
+    }
+    limb.woundLocal = limb.woundLocal - d;
+    limb.gushLocal = limb.gushLocal - d;
+  }
+  return true;
+}
+
+bool MobSystem::RebuildLimbBody(Mob& mob, int limbIndex) {
+  Limb& limb = mob.limbs[limbIndex];
+  if (!limb.body || limb.voxels.empty()) return false;
+  const MobDef& def = defs_[mob.defIndex];
+  const float pitch = 1.0f / (float)std::max(1u, def.scale);
+  phys_->GetTransform(limb.body, limb.xf);
+  uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, densityOf_,
+                                          true /*allowKinematic*/, pitch);
+  if (nh == 0) return false;  // Jolt refused: keep the old collider, stay carved
+
+  // The handle CHANGES, so every reference to the old one must be re-pointed
+  // in the same breath or the limb silently detaches:
+  //   - its joint to its parent,
+  //   - its children's joints, which anchor to this body,
+  //   - the intra-mob collision exclusion set.
+  // Rebuilding them from the LIVE poses (not the rest pose) is what keeps a
+  // limb carved mid-stride from snapping back to its spawn position.
+  for (size_t k = 0; k < mob.limbs.size(); k++) {
+    if ((int)k == limbIndex) continue;
+    if (def.limbs[k].parent != def.limbs[limbIndex].name) continue;
+    Limb& child = mob.limbs[k];
+    if (!child.body || !child.joint) continue;
+    Quat cq{child.xf.quat[0], child.xf.quat[1], child.xf.quat[2],
+            child.xf.quat[3]};
+    Vec3 anchorW = child.xf.pos + Rotate(cq, child.anchorLimb);
+    phys_->DestroyJoint(child.joint);
+    child.joint = phys_->CreateJoint(nh, child.body, def.limbs[k].joint, anchorW,
+                                     def.limbs[k].axis, def.limbs[k].minAngle,
+                                     def.limbs[k].maxAngle);
+  }
+  bool kinematic = mob.alive;
+  phys_->RemoveBody(limb.body);
+  limb.body = nh;
+  phys_->SetBodyKinematic(limb.body, kinematic);
+
+  if (limb.joint) {
+    phys_->DestroyJoint(limb.joint);
+    limb.joint = 0;
+  }
+  if (limbIndex != def.rootLimb) {
+    for (size_t k = 0; k < def.limbs.size(); k++) {
+      if (def.limbs[k].name != def.limbs[limbIndex].parent) continue;
+      if (!mob.limbs[k].body) break;  // parent already severed: no joint to make
+      Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+      Vec3 anchorW = limb.xf.pos + Rotate(q, limb.anchorLimb);
+      limb.joint = phys_->CreateJoint(mob.limbs[k].body, limb.body,
+                                      def.limbs[limbIndex].joint, anchorW,
+                                      def.limbs[limbIndex].axis,
+                                      def.limbs[limbIndex].minAngle,
+                                      def.limbs[limbIndex].maxAngle);
+      break;
+    }
+  }
+  // Re-exclude the whole mob: the new handle is not in the old exclusion set,
+  // so without this a carved limb starts colliding with its own siblings and
+  // the rig fights itself into a jitter.
+  {
+    std::vector<uint64_t> handles;
+    for (const Limb& l : mob.limbs)
+      if (l.body) handles.push_back(l.body);
+    phys_->DisableCollisionsAmong(handles);
+  }
+  return true;
+}
+
+void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
+                                   std::vector<DebrisVoxel> part, World& world,
+                                   std::vector<ParticleSpawn>& spawns) {
+  // Rebase the chunk to its own min corner and move its pose to match, the same
+  // construction ShatterBody uses for a debris fragment.
+  IVec3 mn{127, 127, 127};
+  for (const DebrisVoxel& v : part) {
+    mn.x = std::min<int>(mn.x, v.x);
+    mn.y = std::min<int>(mn.y, v.y);
+    mn.z = std::min<int>(mn.z, v.z);
+  }
+  BodyTransform xf = src.xf;
+  const float inv = 1.0f / (float)std::max(1u, defScale);
+  Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  xf.pos += Rotate(q, Vec3{(float)mn.x * inv, (float)mn.y * inv,
+                           (float)mn.z * inv});
+  for (DebrisVoxel& v : part) {
+    v.x = (int8_t)(v.x - mn.x);
+    v.y = (int8_t)(v.y - mn.y);
+    v.z = (int8_t)(v.z - mn.z);
+  }
+
+  // A chunk of a micro limb is itself a micro body: it needs its OWN brick,
+  // because the limb's brick shows the limb. Without one it cannot be drawn at
+  // the right size at all (cube instances are one WORLD voxel each), so it
+  // falls through to particles — the same handoff every under-floor piece takes.
+  MicroBodyRef micro{};
+  if (src.microModel >= 0 && microSet_) {
+    std::vector<PrefabVoxel> mv;
+    mv.reserve(part.size());
+    for (const DebrisVoxel& v : part)
+      mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                    (uint16_t)(v.payload & 0xFFF)});
+    IVec3 dims{1, 1, 1};
+    for (const PrefabVoxel& v : mv) {
+      dims.x = std::max<int>(dims.x, v.x + 1);
+      dims.y = std::max<int>(dims.y, v.y + 1);
+      dims.z = std::max<int>(dims.z, v.z + 1);
+    }
+    std::string log;
+    int m = MicroBodyPack(*microSet_, mv, dims, defScale, "carve", log);
+    if (m < 0) {
+      LimbVoxelsToParticles(src, defScale, part, world, spawns);
+      return;
+    }
+    // Packed models are SHARED by default; this one belongs to exactly one body
+    // and must be freeable with it, or every gobbet leaks pool words.
+    if (m < (int)microSet_->owned.size()) microSet_->owned[m] = 1;
+    micro = MicroBodyRef{(uint32_t)m, defScale};
+  }
+
+  const float pitch = 1.0f / (float)std::max(1u, defScale);
+  uint64_t h = phys_->CreateDebrisBodyXf(part, xf, densityOf_, false, pitch);
+  if (h == 0) {
+    if (micro.Valid()) MicroBodyFree(*microSet_, micro.model);
+    LimbVoxelsToParticles(src, defScale, part, world, spawns);
+    return;
+  }
+  // Push it off the wound so it visibly leaves the body rather than resting in
+  // the cavity it came from.
+  Vec3 away = xf.pos - src.xf.pos;
+  float len = away.len();
+  away = len > 1e-3f ? away * (1.0f / len) : Vec3{0, 1, 0};
+  phys_->SetBodyVelocities(h, away * 2.5f + Vec3{0, 1.5f, 0}, Vec3{});
+  debris_->AdoptBody(h, std::move(part), xf, micro);
+}
+
+bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
+                          std::vector<ParticleSpawn>& spawns, bool eject,
+                          const std::function<bool(const DebrisVoxel&)>& keep) {
+  Limb& limb = mob.limbs[limbIndex];
+  if (!limb.body || limb.voxels.empty()) return true;
+  const MobDef& def = defs_[mob.defIndex];
+  // NOTE: limb.xf is deliberately NOT refreshed from Jolt here. `keep` was
+  // built against the pose the CALLER measured, and a live limb is kinematic —
+  // the animation pipeline re-poses it every tick — so re-reading the transform
+  // now would test the voxels against a pose the predicate never saw and carve
+  // the wrong cells (or, as the pose drifts, none at all).
+
+  std::vector<DebrisVoxel> removed;
+  for (const DebrisVoxel& v : limb.voxels)
+    if (!keep(v)) removed.push_back(v);
+  if (removed.empty()) return true;  // nothing in range
+
+  if (eject) LimbVoxelsToParticles(limb, def.scale, removed, world, spawns);
+  limb.voxels.erase(
+      std::remove_if(limb.voxels.begin(), limb.voxels.end(),
+                     [&](const DebrisVoxel& v) { return !keep(v); }),
+      limb.voxels.end());
+  instancesDirty_ = true;
+
+  // A carved limb must stop flipbooking: a frame swap re-points rendering at an
+  // intact authored model, which would heal every wound on screen.
+  limb.flipbookModel = -1;
+
+  // Losing matter hurts, in proportion to how much of the limb it was. The
+  // wound is placed at the carve so the existing bleed machinery sprays from
+  // the right spot with no new plumbing.
+  const uint32_t at0 = std::max(1u, limb.voxelsAtSpawn);
+  const float lost = (float)removed.size() / (float)at0;
+  limb.hp -= lost * def.limbs[limbIndex].hp * kCarveDamagePerVolume;
+  if (def.bleedMat) {
+    Vec3 c{};
+    for (const DebrisVoxel& v : removed)
+      c += Vec3{(float)v.x, (float)v.y, (float)v.z};
+    // Centroid of what was removed, in limb-local WORLD voxels — the frame
+    // woundLocal is read in (PreTick rotates it by the limb's live quat).
+    limb.woundLocal = c * (1.0f / (float)removed.size() /
+                           (float)std::max(1u, def.scale));
+    limb.bleedBudget =
+        std::min(limb.bleedBudget + lost * (float)at0 * def.bleedPerDamage,
+                 120.0f);
+  }
+
+  // Carved down past the point of being a limb at all: it comes off. This is
+  // the geometric route to dismemberment — no hp threshold decided it, the
+  // player simply removed too much of the arm for it to still be an arm.
+  const bool collapsed =
+      limb.voxels.size() < kMinFragmentVoxels ||
+      (float)limb.voxels.size() < kLimbCollapseFraction * (float)at0;
+  if (collapsed || limb.hp <= 0) {
+    // Sever() re-enters this mob by id and may call Die(); after it, neither
+    // `mob` nor `limb` may be assumed live, so nothing below may touch them.
+    Sever(mob.id, limbIndex);
+    return false;
+  }
+
+  // ---- did the carve separate the limb into pieces? --------------------------
+  // 6-connected components in limb-local space, the same test ShatterBody runs.
+  // The component holding the JOINT ANCHOR keeps the limb's identity — it is
+  // the part still attached to the creature — rather than simply the largest,
+  // which would let a big carved-off haunch steal the leg's rig slot and leave
+  // the animation driving a stump that is no longer connected to anything.
+  const uint32_t n = (uint32_t)limb.voxels.size();
+  if (n >= 2) {
+    std::unordered_map<uint32_t, uint32_t> map;
+    map.reserve(n * 2);
+    auto key = [](int x, int y, int z) {
+      return (uint32_t)((x + 128) | ((y + 128) << 8) | ((z + 128) << 16));
+    };
+    for (uint32_t i = 0; i < n; i++)
+      map[key(limb.voxels[i].x, limb.voxels[i].y, limb.voxels[i].z)] = i;
+    std::vector<int32_t> comp(n, -1);
+    std::vector<uint32_t> compSize, stack;
+    for (uint32_t seed = 0; seed < n; seed++) {
+      if (comp[seed] != -1) continue;
+      int32_t c = (int32_t)compSize.size();
+      uint32_t size = 0;
+      stack.assign(1, seed);
+      comp[seed] = c;
+      while (!stack.empty()) {
+        uint32_t i = stack.back();
+        stack.pop_back();
+        size++;
+        const DebrisVoxel& v = limb.voxels[i];
+        const int d[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                             {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+        for (auto& dd : d) {
+          auto it = map.find(key(v.x + dd[0], v.y + dd[1], v.z + dd[2]));
+          if (it != map.end() && comp[it->second] == -1) {
+            comp[it->second] = c;
+            stack.push_back(it->second);
+          }
+        }
+      }
+      compSize.push_back(size);
+    }
+    if (compSize.size() > 1) {
+      // The anchor in limb-local MICRO units — the point the joint holds.
+      Vec3 aMicro = limb.anchorLimb * (float)std::max(1u, def.scale);
+      uint32_t keepComp = 0;
+      float best = 1e30f;
+      for (uint32_t i = 0; i < n; i++) {
+        const DebrisVoxel& v = limb.voxels[i];
+        float d2 = (Vec3{(float)v.x, (float)v.y, (float)v.z} - aMicro).len();
+        // Ties broken toward the bigger component, so a lone voxel sitting on
+        // the anchor cannot inherit the limb.
+        if (d2 < best || (d2 == best && compSize[comp[i]] > compSize[keepComp])) {
+          best = d2;
+          keepComp = (uint32_t)comp[i];
+        }
+      }
+      std::vector<std::vector<DebrisVoxel>> parts(compSize.size());
+      for (uint32_t c = 0; c < compSize.size(); c++) parts[c].reserve(compSize[c]);
+      for (uint32_t i = 0; i < n; i++) parts[comp[i]].push_back(limb.voxels[i]);
+      limb.voxels = std::move(parts[keepComp]);
+
+      uint32_t budget = kMaxCarveFragments;
+      for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
+        if (c == keepComp || parts[c].empty()) continue;
+        if (parts[c].size() >= kMinFragmentVoxels && budget > 0) {
+          EmitCarvedFragment(mob, limb, def.scale, std::move(parts[c]), world,
+                             spawns);
+          budget--;
+        } else {
+          LimbVoxelsToParticles(limb, def.scale, parts[c], world, spawns);
+        }
+      }
+      // Losing the disconnected mass can itself take the limb under the floor.
+      if (limb.voxels.size() < kMinFragmentVoxels ||
+          (float)limb.voxels.size() < kLimbCollapseFraction * (float)at0) {
+        Sever(mob.id, limbIndex);
+        return false;
+      }
+    }
+  }
+
+  // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
+  // collider must be built from the voxels in their FINAL frame.
+  if (limb.microModel >= 0) ReskinLimbMicro(mob, limb, def.scale);
+  RebuildLimbBody(mob, limbIndex);
+  return true;
+}
+
+bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
+                                float radiusVoxels, bool ragged, bool eject,
+                                World& world,
+                                std::vector<ParticleSpawn>& spawns) {
+  if (!phys_ || radiusVoxels <= 0.0f) return false;
+  for (Mob& mob : mobs_) {
+    for (size_t i = 0; i < mob.limbs.size(); i++) {
+      if (mob.limbs[i].body != bodyHandle) continue;
+      const MobDef& def = defs_[mob.defIndex];
+      Limb& limb = mob.limbs[i];
+      phys_->GetTransform(limb.body, limb.xf);
+      // Carve centre into limb-local MICRO units, so the per-voxel test is a
+      // plain distance compare in the frame the voxels live in. This is what
+      // makes precision scale with the def: at scale 4 a radius of 0.25 world
+      // voxels is a single micro voxel, so a fine enough tool can take out one
+      // cell of a brain without any new code path.
+      const float scale = (float)std::max(1u, def.scale);
+      Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+      Vec3 cLocal = RotateInv(q, centerWorldVoxel - limb.xf.pos) * scale;
+      const float rLocal = radiusVoxels * scale;
+      const float rLocal2 = rLocal * rLocal;
+      const uint32_t seed = (uint32_t)mob.id * 2654435761u + (uint32_t)i;
+      CarveLimb(mob, (int)i, world, spawns, eject,
+                [&](const DebrisVoxel& v) {
+                  Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+                  Vec3 dv = c - cLocal;
+                  float d2 = dv.dot(dv);
+                  if (d2 >= rLocal2) return true;  // outside
+                  if (!ragged) return false;       // clean bore (laser kerf)
+                  // Ragged rim: certain removal in the core, thinning outward,
+                  // so a blast crater in flesh is torn rather than scooped.
+                  // CPU gameplay state (limbs are outside the hashed domain),
+                  // so a float hash is fine — rule 1 governs the grid.
+                  float t = std::sqrt(d2 / rLocal2);
+                  float chance = 1.0f - t * t;
+                  uint32_t h = Hash3(seed, (uint32_t)(int32_t)v.x * 73856093u,
+                                     (uint32_t)(int32_t)v.y * 19349663u ^
+                                         (uint32_t)(int32_t)v.z * 83492791u);
+                  return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+                });
+      return true;
+    }
+  }
+  return false;
+}
+
+void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                                World& world,
+                                std::vector<ParticleSpawn>& spawns) {
+  if (!phys_ || radiusVoxels <= 0.0f) return;
+  // Collect handles FIRST: carving rebuilds colliders and can sever limbs or
+  // kill mobs, both of which mutate mobs_ and limb handles mid-walk. Iterating
+  // the live structure while it reshapes under us is how this kind of loop
+  // usually acquires a use-after-free.
+  std::vector<uint64_t> handles;
+  for (const Mob& mob : mobs_)
+    if (mob.alive)
+      for (const Limb& l : mob.limbs)
+        if (l.body) {
+          BodyTransform xf{};
+          phys_->GetTransform(l.body, xf);
+          // cheap reject against the limb's bounding sphere
+          float r = 0;
+          const float inv = 1.0f / (float)std::max(1u, defs_[mob.defIndex].scale);
+          r = 0.5f * Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z}.len() *
+              inv;
+          if ((xf.pos - centerWorldVoxel).len() <= radiusVoxels + r + 2.0f)
+            handles.push_back(l.body);
+        }
+  for (uint64_t h : handles)
+    CarveLimbRadial(h, centerWorldVoxel, radiusVoxels, true /*ragged*/,
+                    true /*eject*/, world, spawns);
+}
+
 void MobSystem::Sever(uint64_t mobId, int limbIndex) {
   for (Mob& mob : mobs_) {
     if (mob.id != mobId) continue;
@@ -1607,11 +2081,19 @@ void MobSystem::DetachLimb(Mob& mob, int limbIndex, bool adopt) {
     mob.anim.partAlive[limbIndex] = 0;  // gait stops scheduling it, IK -> 0
   if (adopt) {
     // Hand the micro description over with the body: that is what makes a
-    // severed microvoxel limb keep its detail as ordinary debris (PLAN §C4).
+    // severed microvoxel limb keep its detail as ordinary debris (PLAN §C4) —
+    // and, for a CARVED limb, what makes it keep its wounds. The brick this
+    // limb owns is transferred, not copied, so `carved` is cleared: from here
+    // DebrisSystem's ReleaseBody is the one thing that may free it, and a limb
+    // that also thought it owned the model would double-free the block.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf, limb.MicroRef(def.scale));
+    limb.carved = false;
     limb.holdBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
   } else {
+    // Not adopted: nothing downstream will ever free this limb's brick, so it
+    // must be returned here.
+    ReleaseLimbMicro(limb);
     phys_->SetBodyKinematic(limb.body, false);
     phys_->ClearCollisionGroup(limb.body);
     phys_->RemoveBody(limb.body);
@@ -1631,6 +2113,7 @@ void MobSystem::Die(Mob& mob) {
     phys_->SetBodyKinematic(limb.body, false);
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(defs_[mob.defIndex].scale));
+    limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     limb.body = 0;
     if (limb.joint) limb.joint = 0;  // ownership follows the bodies now
     if (i < mob.anim.partAlive.size()) mob.anim.partAlive[i] = 0;
@@ -1766,6 +2249,68 @@ int MobSystem::LocoState(uint64_t mobId) const {
   for (const Mob& mob : mobs_)
     if (mob.id == mobId) return mob.anim.locoState;
   return -1;
+}
+
+std::vector<std::pair<std::string, float>> MobSystem::ClipWeights(
+    uint64_t mobId) const {
+  std::vector<std::pair<std::string, float>> out;
+  for (const Mob& mob : mobs_) {
+    if (mob.id != mobId) continue;
+    const AnimSkeleton& sk = defs_[mob.defIndex].skel;
+    for (const ClipInstance& ci : mob.anim.clips) {
+      if (ci.clip < 0 || ci.clip >= (int)sk.clips.size()) continue;
+      out.push_back({sk.clips[ci.clip].name, ci.weight * ci.fade});
+    }
+  }
+  return out;
+}
+
+Vec3 MobSystem::LimbLocalUp(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id != mobId) continue;
+    if (limbIndex < 0 || limbIndex >= (int)mob.anim.local.size()) break;
+    return QuatRotate(mob.anim.local[limbIndex].rot, {0, 1, 0});
+  }
+  return {0, 1, 0};
+}
+
+Vec3 MobSystem::LimbModelUp(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id != mobId) continue;
+    if (limbIndex < 0 || limbIndex >= (int)mob.anim.model.size()) break;
+    return QuatRotate(mob.anim.model[limbIndex].rot, {0, 1, 0});
+  }
+  return {0, 1, 0};
+}
+
+uint32_t MobSystem::LimbVoxelCount(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs.size())
+      return (uint32_t)mob.limbs[limbIndex].voxels.size();
+  return 0;
+}
+
+uint32_t MobSystem::LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs.size())
+      return mob.limbs[limbIndex].voxelsAtSpawn;
+  return 0;
+}
+
+Vec3 MobSystem::LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id != mobId) continue;
+    if (limbIndex < 0 || limbIndex >= (int)mob.limbs.size()) break;
+    const Limb& limb = mob.limbs[limbIndex];
+    if (limb.voxels.empty()) return limb.xf.pos;
+    const DebrisVoxel& v = limb.voxels[n % (uint32_t)limb.voxels.size()];
+    const float inv = 1.0f / (float)std::max(1u, defs_[mob.defIndex].scale);
+    Vec3 c{((float)v.x + 0.5f) * inv, ((float)v.y + 0.5f) * inv,
+           ((float)v.z + 0.5f) * inv};
+    Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+    return limb.xf.pos + Rotate(q, c);
+  }
+  return Vec3{};
 }
 
 uint32_t MobSystem::LimbBodyCount() const {

@@ -57,6 +57,20 @@ void ReadI(const json& j, const char* key, int& dst, Tuning& t,
   dst = v->get<int>();
 }
 
+// Booleans are read strictly rather than accepting 0/1: a checkbox that
+// silently accepts a number is a checkbox that silently accepts a typo, and
+// these gate whole subsystems (avatar on/off, camera collision on/off).
+void ReadB(const json& j, const char* key, bool& dst, Tuning& t,
+           const std::string& at) {
+  const json* v = Find(j, key);
+  if (!v) return;
+  if (!v->is_boolean()) {
+    t.warnings.push_back(at + "." + key + ": expected true or false");
+    return;
+  }
+  dst = v->get<bool>();
+}
+
 // ---- variance readers ----------------------------------------------------
 // A variance rides alongside its parameter as a sibling object, so the tuner's
 // generic tune[group][key] writer round-trips it with no save-path changes:
@@ -354,6 +368,38 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "pitchClamp", c.pitchClamp, out, at);
   }
 
+  if (const json* g = Find(j, "thirdPerson")) {
+    auto& c = out.thirdPerson;
+    const std::string at = "thirdPerson";
+    ReadF(*g, "distance", c.distance, out, at);
+    ReadF(*g, "shoulderDist", c.shoulderDist, out, at);
+    ReadF(*g, "shoulderOffset", c.shoulderOffset, out, at);
+    ReadF(*g, "heightOffset", c.heightOffset, out, at);
+    ReadF(*g, "sideOffset", c.sideOffset, out, at);
+    ReadF(*g, "collideMargin", c.collideMargin, out, at);
+    ReadF(*g, "collideRadius", c.collideRadius, out, at);
+    ReadB(*g, "collide", c.collide, out, at);
+    ReadF(*g, "focusHalflife", c.focusHalflife, out, at);
+    ReadF(*g, "distInHalflife", c.distInHalflife, out, at);
+    ReadF(*g, "distOutHalflife", c.distOutHalflife, out, at);
+    ReadF(*g, "pitchLift", c.pitchLift, out, at);
+    ReadF(*g, "stateFollow", c.stateFollow, out, at);
+    ReadF(*g, "speedFov", c.speedFov, out, at);
+    ReadF(*g, "speedFovHalflife", c.speedFovHalflife, out, at);
+  }
+
+  if (const json* g = Find(j, "avatar")) {
+    auto& a = out.avatar;
+    const std::string at = "avatar";
+    ReadB(*g, "enabled", a.enabled, out, at);
+    ReadF(*g, "turnRate", a.turnRate, out, at);
+    ReadF(*g, "turnMinSpeed", a.turnMinSpeed, out, at);
+    ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
+    ReadF(*g, "footTrim", a.footTrim, out, at);
+    ReadF(*g, "severImpulse", a.severImpulse, out, at);
+    ReadF(*g, "respawnDelay", a.respawnDelay, out, at);
+  }
+
   if (const json* g = Find(j, "physics")) {
     auto& p = out.physics;
     const std::string at = "physics";
@@ -461,6 +507,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "detonatePower", t.detonatePower, out, at);
     ReadF(*g, "laserRange", t.laserRange, out, at);
     ReadI(*g, "laserMeltRadius", t.laserMeltRadius, out, at);
+    ReadF(*g, "laserCarveRadius", t.laserCarveRadius, out, at);
     ReadF(*g, "laserDamage", t.laserDamage, out, at);
     ReadF(*g, "brushAirDistance", t.brushAirDistance, out, at);
   }

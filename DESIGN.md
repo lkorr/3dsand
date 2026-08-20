@@ -775,6 +775,63 @@ neighbors, so this needs an explicit connectivity pass:
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
 
+### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
+
+Limb loss used to be a threshold: a limb had hp, hp hit zero, the whole limb
+became debris. That makes dismemberment an *event the rig decides*, which caps
+how precise a weapon can ever be — there is no way to express "took a bite out
+of the shoulder", let alone "removed one specific voxel of brain".
+
+Live limbs now carve per voxel, the same way rigidbodies already did. A limb
+already owns exactly what a debris body owns — a `DebrisVoxel` payload plus a
+copy-on-write micro brick — so the operation is the same one on a different
+population: **erase the voxels a `keep()` predicate rejects → re-skin the brick
+→ rebuild the collider → split off whatever the carve disconnected.**
+
+- **Wounds are cosmetic until they are not.** A carved limb keeps its identity,
+  its hp, its joints and its animation; it is the same `arm.L` driving the same
+  loco state, just with holes in it. That is what makes damage *readable* — you
+  can see how hurt something is — without every scratch being a gameplay event.
+- **Dismemberment becomes geometry, not bookkeeping.** A limb severs when it
+  can no longer hold together: under `kLimbCollapseFraction` of its authored
+  volume, or when the carve disconnects it from its own joint anchor. No hp
+  threshold decides it; the player decides it by what they cut away.
+- **Disconnected chunks become ordinary debris** (`EmitCarvedFragment`), with
+  their own COW brick, so a hand cut off mid-forearm is a real object that falls,
+  collides, and can be carved again. Sub-`kMinFragmentVoxels` scraps spray as
+  particles instead. The authored limb list never changes — only its geometry —
+  so the rig, the gait and the dismemberment states are untouched by a carve
+  that does not sever.
+- **Precision scales with the def's micro scale, not with new code.** The carve
+  centre is converted into limb-local micro units, so at `scale: 4` a radius of
+  0.25 world voxels is one micro voxel. `tools.laserCarveRadius` is a float and
+  sub-voxel by default: the beam that melts a 2-voxel hole in stone bores a
+  roughly one-micro-voxel channel through flesh. Targeting a specific *region*
+  (an organ, a part of a brain) is then an authoring problem — paint it as
+  distinct materials in the limb's `.vox` — not an engine one.
+
+Three things that are easy to get wrong here and are load-bearing:
+
+- **A live limb is kinematic and re-posed every tick.** `CarveLimb` must NOT
+  re-read the transform from Jolt: the `keep` predicate was built against the
+  pose the caller measured, and refreshing it mid-carve tests the voxels against
+  a pose the predicate never saw. That bug removes the wrong cells, then (as the
+  animation drifts) none at all.
+- **Re-skinning moves the limb origin, so the RIG must move with it.** A debris
+  body only has to shift its transform; a limb also has to shift `restOffset`
+  and `anchorLimb`, because the animation pipeline rebuilds its pose from those
+  every frame and would otherwise undo the shift — the wound appears to crawl
+  along the limb as it is carved.
+- **A collider rebuild replaces the Jolt handle**, so the limb's joint, its
+  children's joints and the intra-mob collision exclusion set are all rebuilt in
+  the same breath (`RebuildLimbBody`). Miss one and the limb silently detaches
+  or starts fighting its siblings.
+
+Brick ownership follows the body: a carved limb owns its COW model, and
+`DetachLimb`/`Die` hand that ownership to `DebrisSystem` (clearing `carved`) so
+exactly one system will ever free it — which is also why a severed carved limb
+keeps its wounds as debris with no special case.
+
 ---
 
 ## 8. Player & Projectiles
@@ -901,6 +958,60 @@ works untouched, its `swingAmp`/`swingPhase` now running as a procedural layer
 `assets/mobs/critter.*` (`scripts/gen_critter_mob.py`) is the worked example:
 a quadruped with two-segment legs (real two-bone IK), diagonal-pair gait
 groups, a spring tail and a masked flinch clip.
+
+### Player avatar and third-person camera (2026-08-20; `game/avatar`, `game/thirdperson`)
+
+The player has a visible, dismemberable body: a robed wizard authored at **4
+microvoxels per world voxel** (`assets/mobs/wizard.*`,
+`scripts/gen_wizard.py`), rigged into 16 independently severable parts — head,
+torso, hips, upper/fore arms, hands, thighs/shins, feet, and a held staff.
+
+**One schema, two drivers.** The avatar is an ordinary `MobDef`: same `.vox` +
+sidecar format, same loader, same `AnimSkeleton` runtime. It therefore
+inherits clips, masks, two-bone IK, the gait state machine, springs and — the
+reason it is worth doing this way — the `states` dismemberment table, at zero
+marginal cost. What it does *not* inherit is `MobSystem`'s driver: `PlayerAvatar`
+takes its position and facing from `Player` instead of the wander drive.
+Expressing this as "a mob the player possesses" would have meant threading
+input through the wander drive, the despawn sweep and `kMaxMobs`; a separate
+driver costs one file and leaves `MobSystem` untouched. Anything an animator
+authors for a mob works on the player and vice versa.
+
+**Damage is the same path as everything else.** A laser crossing a joint
+anchor severs that part; the piece is handed to `DebrisSystem::AdoptBody` with
+its `MicroBodyRef`, so it keeps its microvoxel detail and is then culled, burnt
+and settled by the ordinary debris rules with no avatar-specific code. Bleeding
+goes out as `BrushOp`s and `ParticleSpawn`s on the shared per-tick budget, i.e.
+through the MutationQueue like every other world edit (rule 3). Every field in
+`PlayerAvatar` is CPU-float presentation state and never touches the hashed
+grid (rule 1) — `--selftest` determinism is unchanged with an avatar standing.
+
+**Dismemberment drives movement.** `AvatarLocomotion` is the single place the
+damage state is turned into gameplay: `speedScale` comes from the matched
+`AnimStateRule`, while `jumpScale`/`canJump` are derived from *leg liveness*
+rather than authored per state, so a new rule cannot accidentally grant a
+legless wizard a jump. `Player` multiplies its tuned speeds by these, which is
+why losing a leg slows you, losing both drops you to a crawl, and fly mode
+ignores all of it. The camera reads the same struct, so the pose and the
+framing agree by construction instead of via two tables kept in sync.
+
+One trap worth recording: `AnimSelectState`'s `minChainsLost` counts **every**
+IK chain, and this rig has arm chains as well as leg chains. `minChainsLost: 2`
+would therefore have fired "crawl" when both *arms* came off. The wizard's
+rules name leg parts directly; the two formulations are only equivalent on an
+all-legs rig like the critter.
+
+**Camera.** `Camera` stays orientation-only and is shared by both modes, so
+mouse look, the picking ray and the walk basis are identical in first and third
+person. `ThirdPersonRig` adds only the position policy: an orbit boom, swept
+against the voxel world and pulled in to the first hit (unloaded space counts
+as solid — the residency-window rule — or the camera backs out of the world).
+Pull-in is instant and push-out is eased; easing inward would leave the camera
+inside the wall for the duration of the ease, which is the artifact players
+actually notice. In first person the body is hidden but the arms, hands and
+staff are kept. The render eye is the only consumer — brush, laser, grenade and
+physics all keep using `Player::EyePos()`, so no camera setting can move the
+world hash.
 
 ---
 

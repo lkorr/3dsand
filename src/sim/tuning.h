@@ -131,6 +131,73 @@ struct Tuning {
     float pitchClamp = 1.55f;
   } camera;
 
+  // ---- third-person camera rig ----
+  //
+  // Distances are METERS and converted to voxels at use, exactly like the
+  // player block: that is what keeps the framing physically meaningful if
+  // kVoxelMeters ever changes. Render-only — the picking ray and every sim
+  // input keep using the player's own eye, so nothing here can move the hash.
+  struct ThirdPerson {
+    float distance = 3.2f;        // boom length behind the focus point
+    float shoulderDist = 1.7f;    // boom length in over-shoulder mode
+    float shoulderOffset = 0.55f; // lateral offset, over-shoulder mode
+    float heightOffset = 0.25f;   // focus point above the head anchor
+    float sideOffset = 0.0f;      // lateral offset in plain third person
+    // Collision: the boom is swept against the voxel world and pulled in to
+    // the first hit, minus this margin, so the near plane never clips inside
+    // a wall. `collideRadius` fattens the sweep so the camera does not slip
+    // through a one-voxel gap and pop to the far side.
+    float collideMargin = 0.35f;
+    float collideRadius = 0.25f;
+    bool collide = true;
+    // Smoothing half-lives, seconds. The focus point is smoothed so the
+    // camera does not jitter with every step bob; the boom length is smoothed
+    // separately and ASYMMETRICALLY — pulling IN must be instant (or the
+    // camera spends a frame inside the wall) while pushing back OUT is eased,
+    // which is the standard fix for a camera that pops when clearing a corner.
+    float focusHalflife = 0.06f;
+    float distInHalflife = 0.0f;   // 0 = snap in immediately
+    float distOutHalflife = 0.25f;
+    // Extra pitch-driven lift: at steep downward pitch the boom rises so the
+    // character stays framed instead of being hidden by its own hat.
+    float pitchLift = 0.35f;
+    // How strongly the dismemberment state's body drop moves the camera.
+    // 1 = follow the pose exactly, 0 = ignore it. Below 1 the camera stays a
+    // little higher than a crawling body, which reads better than lying on
+    // the floor with it.
+    float stateFollow = 0.75f;
+    // Field-of-view widening with speed, radians at full sprint. Sells speed
+    // without the player touching a setting.
+    float speedFov = 0.06f;
+    float speedFovHalflife = 0.35f;
+  } thirdPerson;
+
+  // ---- player avatar ----
+  struct Avatar {
+    // Which mob def the avatar rig is loaded from. Data, not code: pointing
+    // this at another def in assets/mobs swaps the player character whole.
+    // Not hot-reloadable by itself — it is read when the avatar is (re)spawned.
+    bool enabled = true;
+    // Body facing. In third person the body turns toward its MOTION and only
+    // faces the camera when the player aims, which is what stops the character
+    // from moon-walking sideways. This is the turn rate, radians/sec.
+    float turnRate = 12.0f;
+    // Below this speed (m/s) the body keeps its last facing instead of
+    // snapping to a near-zero velocity vector, which would spin on the spot.
+    float turnMinSpeed = 0.35f;
+    // In first person the body is hidden, but the ARMS are kept so the player
+    // can see their own hands and staff. Turning this off hides everything.
+    bool firstPersonArms = true;
+    // Vertical offset applied to the whole avatar relative to the player AABB,
+    // in meters. The rig's own feet should land on the box's bottom face; this
+    // is the trim for art whose contact point is not exactly at its origin.
+    float footTrim = 0.0f;
+    // Damage/dismemberment feel.
+    float severImpulse = 6.0f;   // extra shove given to a part as it comes off
+    // How long the corpse's parts stay before the avatar can respawn, seconds.
+    float respawnDelay = 3.0f;
+  } avatar;
+
   // ---- Jolt rigid bodies ----
   struct Physics {
     float gravity = 9.81f;
@@ -236,6 +303,12 @@ struct Tuning {
     int detonateRadius = 12, detonatePower = 340;
     float laserRange = 200.0f;
     int laserMeltRadius = 2;
+    // Carve radius when the beam is on LIVING flesh, in WORLD voxels — float,
+    // and deliberately sub-voxel by default. This is the precision dial for
+    // surgery: at mob scale 4 a micro voxel is 0.25 world voxels, so 0.3 bores
+    // a channel roughly one micro voxel wide, while the same beam still melts
+    // a 2-voxel hole in stone. Flesh is cut, not blasted.
+    float laserCarveRadius = 0.3f;
     float laserDamage = 1.5f;
     float brushAirDistance = 48.0f;
   } tools;
