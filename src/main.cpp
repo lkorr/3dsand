@@ -1234,6 +1234,97 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 badStain, bloodLeft, stainActive, kDryTicks);
   }
 
+  bool fullOk = false;
+  // ---- flung liquid lands FULL (the anti-gelatin invariant) --------------
+  // A liquid that rejoins the grid from flight must be born at full fullness,
+  // exactly like one a brush paints (sim_mutate.wgsl: "liquids are born
+  // full"). This is a LOOK invariant with no visible symptom in any other
+  // check: the state nibble is fullness, the renderer builds blood's smooth
+  // surface from that as a density field, and a spawn that leaves the nibble
+  // at 0 lands at 1/8 density. The hash still matches, the world still
+  // settles, nothing fails — the blood just renders as separately shaded
+  // translucent cubes (the "gelatin" look shadeViscous exists to avoid).
+  //
+  // So this asserts the nibble directly rather than trusting a screenshot.
+  {
+    auto matId = [&](const char* n) {
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == n) return (int)i;
+      return -1;
+    };
+    const int bloodMat = matId("blood");
+
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+
+    // A stone slab in open air, and blood particles dropped onto it — the
+    // same coordinates and window the stain test uses, which are known to sit
+    // inside the residency window with nothing else going on around them.
+    const int px = 96, py = 120, pz = 96;
+    std::vector<CellOp> slab;
+    for (int z = -3; z <= 3; z++)
+      for (int x = -3; x <= 3; x++)
+        slab.push_back({World::SlotCellIndex({px + x, py, pz + z}),
+                        (uint32_t)(matId("stone") & 0xFFF)});
+
+    std::vector<ParticleSpawn> drops;
+    for (int i = 0; i < 25 && bloodMat > 0; i++) {
+      ParticleSpawn s{};
+      s.px = (px - 2 + (i % 5)) * 256 + 128;
+      s.py = (py + 6) * 256 + 128;
+      s.pz = (pz - 2 + (i / 5)) * 256 + 128;
+      s.vx = 0; s.vy = -128; s.vz = 0;
+      s.payload = (uint32_t)bloodMat;  // state nibble deliberately left 0
+      s.flags = kPFlagAlive;
+      drops.push_back(s);
+    }
+    uint32_t ft = 20000;
+    for (int i = 0; i < 40; i++) {
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {},
+                 i == 0 ? slab : std::vector<CellOp>{}, false, {6, 7, 6},
+                 /*wantReadback=*/false, /*particlesActive=*/true,
+                 i == 1 ? drops : std::vector<ParticleSpawn>{});
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+    }
+
+    std::vector<uint32_t> fv(kNumChunks * (size_t)kChunkVol);
+    {
+      const uint64_t bytes = (uint64_t)fv.size() * 4;
+      wgpu::Buffer sb = CreateBuffer(
+          ctx.device, bytes,
+          wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "fullRead");
+      wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+      e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
+      wgpu::CommandBuffer c = e.Finish();
+      ctx.queue.Submit(1, &c);
+      wgpu::Future f = sb.MapAsync(
+          wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
+            if (s2 == wgpu::MapAsyncStatus::Success) {
+              std::memcpy(fv.data(), sb.GetConstMappedRange(0, bytes), bytes);
+              sb.Unmap();
+            }
+          });
+      ctx.instance.WaitAny(f, UINT64_MAX);
+    }
+    // Count landed blood and how much of it is at less than full fullness.
+    // Blood FLOWS once it lands, and flowing splits a cell's fullness across
+    // its neighbours, so partial cells are expected at the spreading edge —
+    // the bug being caught is "everything lands at the 1/8 floor", so the
+    // assertion is that the maximum reached full, not that every cell did.
+    uint32_t landed = 0, maxState = 0;
+    for (size_t i = 0; i < fv.size(); i++) {
+      if ((fv[i] & 0xFFFu) != (uint32_t)bloodMat) continue;
+      landed++;
+      maxState = std::max(maxState, (fv[i] >> 12) & 0xFu);
+    }
+    fullOk = bloodMat > 0 && landed > 0 && maxState == 7;
+    std::printf("flung liquid fullness: %s (%u blood voxels landed, max "
+                "fullness %u/7 - 0 would render as gelatin cubes)\n",
+                fullOk ? "PASS" : "FAIL", landed, maxState);
+  }
+
   // sim perf: worst-case-ish activity (brushes + explosions + particles),
   // synchronous timing
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -1769,14 +1860,15 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       // while wet, and terrain refreshes wake nearby bodies by design)
       mobs.Sever(id, limbIndex("head"));
       bool died = !mobs.IsAlive(id) || mobs.MobCount() == 0;
-      for (int i = 0; i < 500; i++) mobTick({});
-      std::printf("  [probe] after 500: awake=%u bodies=%u
-",
-                  debris.ActiveBodyCount(), debris.BodyCount());
-      for (int i = 0; i < 2000; i++) mobTick({});
-      std::printf("  [probe] after 2500: awake=%u bodies=%u
-",
-                  debris.ActiveBodyCount(), debris.BodyCount());
+      // 2500, not 500: dismemberment now throws real blood voxels (gore.
+      // severVoxels) on top of the wound drip, and wet blood keeps its chunks
+      // dirty while it flows and soaks, which by design keeps waking the
+      // bodies resting in it. Measured on the RTX 3060 Ti: awake=5 at 500
+      // ticks, awake=0 by 2500. The assertion still tests that the scene
+      // reaches full rest — this is a slower settle, not a leak, and shrinking
+      // the blood to fit the old window would be testing the tuning instead of
+      // the invariant.
+      for (int i = 0; i < 2500; i++) mobTick({});
       uint32_t awake = debris.ActiveBodyCount();
       bool settled = awake == 0 && mobs.MobCount() == 0;
 
@@ -2593,7 +2685,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk && sleepOk && pondOk && evapOk && stainOk && debrisOk &&
+  bool pass = deterministic && walkOk && sleepOk && pondOk && evapOk && stainOk && fullOk && debrisOk &&
               prefabOk && mobOk && settleOk && pushOk && saveOk && storeOk &&
               streamOk && farDownOk && fogOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
@@ -2997,6 +3089,7 @@ int main(int argc, char** argv) {
       world.SetWindowOrigin({0, 0, 0});
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
       player.pos = Vec3{140, (float)(spawnH + 10), 140};
+      player.viewYOffset = 0.0f;  // teleport: never smooth across it
       tick = 0;
       grenades.clear();
       everExploded = false;
@@ -3359,7 +3452,10 @@ int main(int argc, char** argv) {
     // ---- render ----
     wgpu::TextureView target = ctx.AcquireFrame();
     if (target) {
-      Vec3 eye = player.EyePos();
+      // ViewEyePos, not EyePos: the render camera rides the step-smoothing
+      // offset so voxel steps glide instead of popping. Everything that can
+      // feed the sim (brush/laser/grenade rays, physics) stays on EyePos.
+      Vec3 eye = player.ViewEyePos();
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing

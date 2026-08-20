@@ -213,6 +213,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "halfWidth", p.halfWidth, out, at);
     ReadF(*g, "halfHeight", p.halfHeight, out, at);
     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);
+    ReadF(*g, "viewSmoothHalflife", p.viewSmoothHalflife, out, at);
   }
 
   if (const json* g = Find(j, "camera")) {

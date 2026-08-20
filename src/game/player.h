@@ -32,6 +32,13 @@ class Player {
 
   Vec3 EyePos() const { return pos + Vec3{0, kEyeOffset, 0}; }
 
+  // Render-only eye position: EyePos plus a vertical offset that cancels the
+  // instantaneous pop when the body steps up/down a voxel ledge, then decays
+  // to zero (tuning.json player.viewSmoothHalflife). The raymarch camera is
+  // its ONLY consumer — physics, picking rays and everything that can feed the
+  // sim keep using EyePos()/pos, so the world hash cannot be affected.
+  Vec3 ViewEyePos() const { return pos + Vec3{0, kEyeOffset + viewYOffset, 0}; }
+
   Vec3 pos{128, 100, 140};  // AABB center
   Vec3 vel{0, 0, 0};
   bool fly = true;          // start in fly mode until the first mirror arrives
@@ -46,6 +53,14 @@ class Player {
   // happens to be cresting a bump.
   float coyoteTimer = 0.0f;
   float jumpBuffer = 0.0f;
+
+  // View-smoothing state (voxels): when the BODY snaps vertically by a step
+  // (step-up climb or the walk-down ground snap), the negative of that snap is
+  // added here so the EYE stays put that frame, then Update() decays it toward
+  // zero exponentially. Clamped to one step height so falls, teleports and
+  // spawns never smear the camera. Zeroed in fly mode and on teleports.
+  // Render-only — see ViewEyePos().
+  float viewYOffset = 0.0f;
 
   static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
   static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall

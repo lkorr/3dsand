@@ -159,9 +159,9 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `src/game/` | player controller, camera, brush, prefab placer, mob system |
 | `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy) |
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
-| `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
-| `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params |
-| `scripts/tuner_app.py` + `tuner_server.py` | the tuner as a desktop app / local server: auto-loads assets, Build + Play buttons |
+| `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
+| `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params. Also hosts the **Wiki** tab (every fact about one material/tag/tuning group/shader, assembled live from all four sources) and the **Notes** tab (markdown pages autosaved to `notes/`, gitignored) |
+| `scripts/tuner_app.py` + `tuner_server.py` | the tuner as a desktop app / local server: auto-loads assets, Build + Play buttons |
 | `scripts/build_tuner_exe.py` | packages the above into `sandvox_tuner.exe` |
 
 **Two invariants that have already cost debugging time — don't rediscover them:**
@@ -183,6 +183,23 @@ The exe must sit in the project root: it edits this checkout in place, so
   `assets/materials/tuning.json`, and a row in `assets/tuner_schema.js`. Values
   under `sim.*` are integer-only and change the world hash — rule 1 applies, and
   `--selftest` must be re-run.
+- **`matRow`/`ruleRow`/`condPanel` are shared by two tabs — re-render through
+  `rerenderRules()`, never `renderReactions()`.** The Wiki embeds the very same
+  row editors the Materials/Reactions tabs use, so an edit made in either place
+  is the same edit. A *structural* change (kind switch, duplicate, delete,
+  reorder) has to rebuild the list it lives in, and that list differs by tab —
+  hardcoding `renderReactions()` there throws you back to the Reactions tab
+  mid-edit and silently discards the wiki page you were on.
+- **The tuner Wiki's render-path table restates shader predicates — keep it in
+  step.** Shaders never name a material (that is the point: behavior is data),
+  so the Wiki tab derives "which render path does water take, and why" by
+  re-evaluating the same authored-field tests the shaders use —
+  `isViscousLiquid` (class+opacity+moveEvery), `isTranslucentSolid` (opacity on
+  a solid), `MATF_OPAQUE`, `MATF_MICRO`. That table is `RENDER_PATHS` in
+  `assets/tuner.html`, and the flag key names in it must match the ones
+  `materials.cpp` reads (`opaque`, `wanders`, a `micro` block). Change a
+  predicate in `common.wgsl` without changing `RENDER_PATHS` and the wiki will
+  confidently explain the wrong thing.
 - **World constants are generated from `world.h`, never redeclared in WGSL.**
   `ShaderConstantPrelude()` (`gpu/resources.cpp`) emits `WORLD_N`, `CHUNK`,
   `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of

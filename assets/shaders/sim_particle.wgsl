@@ -247,7 +247,19 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   if (won && voxMat(voxels[tgt]) == MAT_AIR) {
     // rejoin the grid; stamp 0xFF = "hasn't acted", falls next tick
-    voxels[tgt] = packVox(p.payload & 0xFFFu, (p.payload >> 12u) & 0xFu, 0xFFu);
+    let mat = p.payload & 0xFFFu;
+    var state = (p.payload >> 12u) & 0xFu;
+    // A LIQUID is born full, exactly as sim_mutate.wgsl does for a painted one
+    // — its state nibble is FULLNESS, not a variant index.
+    //
+    // Without this, a spawn that leaves the nibble at 0 lands at 1/8 fullness,
+    // and the renderer's smooth density field (liquidDensityAt) then sees a
+    // scatter of near-empty cells with no coherent isosurface between them.
+    // The result reads as separately shaded translucent cubes — the exact
+    // "gelatin" failure shadeViscous is written to avoid. Fullness is what
+    // makes flung blood shade like the blood a brush paints.
+    if (materials[mat].klass == CLASS_LIQUID) { state = LIQ_FULL_STATE; }
+    voxels[tgt] = packVox(mat, state, 0xFFu);
     markDirtyNext(cell);
     p.flags = 0u;  // dead
   } else {

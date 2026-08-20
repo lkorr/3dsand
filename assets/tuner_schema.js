@@ -58,6 +58,7 @@ const TUNING_SCHEMA = [
       {k:'halfWidth', n:'body half-width', d:'Half the AABB width — controls the tightest gap you fit through.', min:0.05, max:1.5, step:0.01, u:'m', warn:'Collision geometry: a large change can wedge the player in tight terrain.'},
       {k:'halfHeight', n:'body half-height', d:'Half the body height (0.85 = a 1.7 m player).', min:0.2, max:3, step:0.01, u:'m', warn:'Collision geometry. Must stay well under 3 chunks or collision breaks.'},
       {k:'eyeOffset', n:'eye height', d:'Camera offset above the AABB centre.', min:-1, max:2, step:0.01, u:'m'},
+      {k:'viewSmoothHalflife', n:'step view smoothing', d:'Half-life of the camera catching up after the body steps up/down a ledge. Render-only; the body still steps instantly. 0 disables.', min:0, max:0.4, step:0.005, u:'s'},
     ],
   },
 

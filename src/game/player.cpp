@@ -214,6 +214,19 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
                     const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
   dt = std::min(dt, 0.05f);
 
+  // Decay the render-only step-smoothing offset toward zero (frame-rate
+  // independent: a fixed half-life, so the eye covers half the remaining
+  // distance every viewSmoothHalflife seconds at any FPS). Decayed BEFORE this
+  // frame's snaps are accumulated so the frame a step lands on starts fully
+  // compensated. See Player::ViewEyePos().
+  {
+    const float hl = T().viewSmoothHalflife;
+    if (hl > 1e-4f)
+      viewYOffset *= std::pow(0.5f, dt / hl);
+    else
+      viewYOffset = 0.0f;  // knob at 0 disables smoothing entirely
+  }
+
   // How much of the body is in liquid? Sample a fixed number of points spread
   // over the body's actual height, so coverage does not depend on voxel size.
   int liquidCells = 0;
@@ -240,6 +253,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     pos += vel * dt;
     grounded = false;
     coyoteTimer = 0.0f;
+    viewYOffset = 0.0f;  // fly motion is deliberate: never smooth it
   } else {
     const float nonJumpSpeed = T().nonJumpSpeed / kVoxelMeters;
 
@@ -296,6 +310,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // ---- horizontal move, with step-up ----
     float climbed =
         onGround ? StepSlide(pos, vel.x * dt, vel.z * dt, kindAt) : 0.0f;
+    // The climb is an instantaneous vertical snap of the BODY; cancel it in
+    // the view offset so the eye stays put this frame and glides up as the
+    // offset decays. Horizontal motion is untouched — stays 1:1.
+    viewYOffset -= climbed;
     if (!onGround) {
       // Airborne: plain slide, no stepping (both Quake and Source refuse to
       // step while off the ground). Zeroing the blocked component here is
@@ -314,7 +332,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     if (onGround && !jumped && vel.y <= nonJumpSpeed) {
       float snap = GroundProbe(pos, 0.1f + (float)kMaxStepUpVoxels, kindAt);
       if (snap > 0.0f) {
+        float yBefore = pos.y;
         SweepAxis(pos, -snap, 1, kindAt);
+        // Downward twin of the step-up compensation: the snap teleports the
+        // body onto the lower surface, so bank the drop (positive) into the
+        // view offset and let the eye follow it down over the half-life.
+        viewYOffset += yBefore - pos.y;
         if (vel.y < 0.0f) vel.y = 0.0f;
       }
     }
@@ -334,6 +357,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       vel.x *= scale;
       vel.z *= scale;
     }
+
+    // Cap the view offset at one step height. Anything bigger than a step is
+    // not a step — a long fall resolved by the ground snap, a spawn, a shove —
+    // and smearing the camera across it reads as lag, not smoothness.
+    const float maxOff = (float)kMaxStepUpVoxels;
+    viewYOffset = std::clamp(viewYOffset, -maxOff, maxOff);
   }
 
   // No world-bounds clamp: the world is infinite (toroidal streaming follows

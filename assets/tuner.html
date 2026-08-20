@@ -735,6 +735,42 @@
   .noteprev a.wl{color:var(--acc);cursor:pointer;text-decoration:none;border-bottom:1px dotted var(--acc)}
   .noteprev a.wl.missing{color:var(--amber);border-bottom-color:var(--amber)}
   .noteprev hr{border:none;border-top:1px solid var(--line)}
+  /* ---- inline expansion ----
+     A chip or row opens its detail in place. The left rule + inset background
+     is the only cue that you are looking at a nested thing, so nesting stays
+     legible without the page turning into a tree widget. */
+  .wexp{
+    margin:6px 0 8px 26px;border-left:2px solid var(--line2);
+    background:#131820;border-radius:0 8px 8px 0;padding:9px 11px;
+  }
+  .wexp.lv2{margin-left:16px;background:#151b24}
+  .wexphd{display:flex;align-items:center;gap:9px;margin-bottom:7px}
+  .wexphd .sw{width:20px;height:20px;border-radius:5px;border:1px solid #0006;flex:none}
+  .wexphd .t{font-family:var(--mono);font-size:14px}
+  .wexphd .kind{
+    font-family:var(--mono);font-size:10px;color:var(--faint);
+    border:1px solid var(--line2);border-radius:20px;padding:1px 7px;
+  }
+  code.open{border-color:var(--acc);color:var(--acc);background:#16203a}
+  /* the editable field grid used inside an expansion and on the page itself */
+  .wedit{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:flex-end}
+  .wedit .f{display:flex;flex-direction:column;gap:3px}
+  .wedit .f>span{
+    font-family:var(--mono);font-size:9.5px;letter-spacing:.5px;
+    text-transform:uppercase;color:var(--faint);
+  }
+  .wedit input.cell,.wedit select.cell,.wedit input.num{min-width:0}
+  .wedit .num{width:76px}
+  .wedit .chips{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+  .wedit .swatches{display:flex;gap:3px}
+  .wedit .swatches input[type=color]{
+    width:26px;height:24px;padding:0;border:1px solid var(--line2);
+    border-radius:4px;background:none;cursor:pointer;
+  }
+  /* a rule expanded in place reuses .rxrule, so only the framing differs */
+  .wexp .rxrule{margin:0;background:none;border:none;padding:0}
+  .wruleopen{background:var(--card2);border-color:var(--line2)!important}
+
   /* the note attached to a wiki entity, shown inside its own page */
   .wnote{width:100%;min-height:150px;resize:vertical;padding:10px 12px;
     background:#0f141c;color:var(--fg);border:1px solid var(--line2);border-radius:7px;
@@ -1267,7 +1303,8 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     activeTab=b.dataset.tab;
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
-    if((mat&&rx)||activeTab==='tuning'||activeTab==='models')renderAll();
+    // wiki and notes render with whatever is loaded, including nothing.
+    if((mat&&rx)||['tuning','models','wiki','notes'].includes(activeTab))renderAll();
   });
 });
 function gotoReactions(filter){
@@ -1392,6 +1429,17 @@ function matRow(m,i){
 }
 
 /* ================= render: reactions ================= */
+/* ruleRow() and matRow() are shared by the Reactions/Materials tabs and by the
+   Wiki, which embeds them inline. A STRUCTURAL edit (kind switch, duplicate,
+   delete, reorder) has to rebuild the list it lives in — but "the list" is a
+   different one depending on where the row was rendered, so these go through
+   renderAll() rather than naming a tab. Value edits still just touch() and
+   leave the DOM alone; only shape changes come through here. */
+function rerenderRules(){
+  if(activeTab==='wiki')renderWikiPage();
+  else renderAll();
+}
+
 function ruleKind(r){return r.decay?'decay':r.emit!==undefined?'emit':'pair';}
 // products = everything a rule can turn a cell into
 const ruleProducts=r=>[r.becomes,r.selfBecomes,r.neighborBecomes,r.emit].filter(v=>v!=null&&v!=='');
@@ -1535,7 +1583,7 @@ function noteRow(r,i,q){
   ta.addEventListener('input',()=>{r.note=ta.value;touch('rx');fit();});
   requestAnimationFrame(fit);
   const del=el('button',{class:'icon danger',title:'delete note'},'✕');
-  del.addEventListener('click',()=>{if(confirm('Delete this note?')){rx.reactions.splice(i,1);touch('rx');renderReactions();}});
+  del.addEventListener('click',()=>{if(confirm('Delete this note?')){rx.reactions.splice(i,1);touch('rx');rerenderRules();}});
   wrap.append(ta,rowMoveButtons(i),del);
   return wrap;
 }
@@ -1545,8 +1593,8 @@ function rowMoveButtons(i,locked){
   const up=el('button',{class:'icon',title:t||'move up'},'↑');
   const dn=el('button',{class:'icon',title:t||'move down'},'↓');
   up.disabled=locked||i===0;dn.disabled=locked||i===rx.reactions.length-1;
-  up.addEventListener('click',()=>{[rx.reactions[i-1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i-1]];touch('rx');renderReactions();});
-  dn.addEventListener('click',()=>{[rx.reactions[i+1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i+1]];touch('rx');renderReactions();});
+  up.addEventListener('click',()=>{[rx.reactions[i-1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i-1]];touch('rx');rerenderRules();});
+  dn.addEventListener('click',()=>{[rx.reactions[i+1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i+1]];touch('rx');rerenderRules();});
   box.append(up,dn);
   return box;
 }
@@ -1573,7 +1621,7 @@ function ruleRow(r,i,num,hidden,sorted){
     if(ks.value==='decay'){r.decay=true;r.chance=keep.chance;r.becomes='air';}
     else if(ks.value==='emit'){r.emit=ids()[0]||'fire';r.dir='up';r.chance=keep.chance;}
     else{r.neighbor='any';r.chance=keep.chance;r.selfBecomes='air';}
-    touch('rx');renderReactions();
+    touch('rx');rerenderRules();
   });
   kindF.append(ks);
   row.append(kindF);
@@ -1633,9 +1681,9 @@ function ruleRow(r,i,num,hidden,sorted){
     style:gated?'color:#6f9bd8':'',
   },gated?'◈':(r.note||r.neighborClass?'✎':'…'));
   const dup=el('button',{class:'icon',title:'duplicate below'},'⧉');
-  dup.addEventListener('click',()=>{rx.reactions.splice(i+1,0,structuredClone(r));touch('rx');renderReactions();});
+  dup.addEventListener('click',()=>{rx.reactions.splice(i+1,0,structuredClone(r));touch('rx');rerenderRules();});
   const del=el('button',{class:'icon danger',title:'delete'},'✕');
-  del.addEventListener('click',()=>{rx.reactions.splice(i,1);touch('rx');renderReactions();});
+  del.addEventListener('click',()=>{rx.reactions.splice(i,1);touch('rx');rerenderRules();});
   acts.append(more,dup,del);
   row.append(acts);
 
@@ -1749,7 +1797,7 @@ function condPanel(r,kind){
   onCb.addEventListener('change',()=>{
     if(onCb.checked)r.scaleByNeighbors={neighbor:r.self??'any',invert:true,scaleMax:4};  // the frontier default: count neighbours unlike me
     else delete r.scaleByNeighbors;
-    touch('rx');renderReactions();
+    touch('rx');rerenderRules();
   });
   sr.append(el('label',{class:'chk',title:'scale this rule’s chance by how many of the 6 face neighbours match'},onCb,'scale by neighbours'));
   box.append(sr);
@@ -2446,6 +2494,10 @@ function renderAll(){
   // hand it the tab-activation edge. It renders fine with no materials loaded
   // (the palette is simply empty), so it returns before the mat/rx guard.
   if(activeTab==='models'){modelsActivate();return;}
+  // Notes are independent of every JSON file; the Wiki degrades gracefully
+  // (it can still show tuning groups and shaders with no materials loaded).
+  if(activeTab==='notes'){renderNotes();return;}
+  if(activeTab==='wiki'){renderWiki();return;}
   if(!mat||!rx)return;
   if(activeTab==='overview')renderOverview();
   else if(activeTab==='materials')renderMaterials();
@@ -2480,6 +2532,13 @@ $('#rxFilter').addEventListener('input',renderReactions);
 $('#rxSort').addEventListener('change',renderReactions);
 $('#rxGroup').addEventListener('change',renderReactions);
 $('#ovFilter').addEventListener('input',renderOverview);
+$('#wikiSearch').addEventListener('input',renderWikiList);
+$('#noteSearch').addEventListener('input',renderNotesList);
+$('#btnNewNote').addEventListener('click',()=>{
+  let n='untitled',k=2;while(notes[n]!==undefined)n='untitled '+k++;
+  noteOpen(n,true);
+  renderNotesList();renderNoteEditor();
+});
 $('#btnAddMat').addEventListener('click',()=>{
   let id='new_material',k=2;while(ids().includes(id))id='new_material'+k++;
   mat.materials.push({id,class:'powder',density:1000,hardness:12,colors:['#888888','#7d7d7d','#949494'],tags:[]});
@@ -2496,6 +2555,1061 @@ $('#btnAddNote').addEventListener('click',()=>{
   $('#rxFilter').value='';touch('rx');renderReactions();
   window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
 });
+
+/* ================= WIKI =================
+   One page per entity, assembled from all four sources at render time. The
+   point is that nothing here is a second copy of the data: every fact is read
+   live out of mat/rx/tune, and every editable control is the SAME control the
+   owning tab uses, so an edit made here is an edit made there.
+
+   The hard part is the visual section. Shaders never name a material — that
+   is a deliberate design rule (CLAUDE.md: "don't hardcode material IDs in
+   shaders"), and rendering is instead driven by AUTHORED FIELDS that shader
+   helpers classify: isViscousLiquid() keys off class+opacity+moveEvery,
+   isTranslucentSolid() off opacity on a solid, MATF_OPAQUE off the flag.
+   So the render path is DERIVED here by evaluating the same predicates the
+   shader evaluates, and each one carries the reason it fired. That is why the
+   section can say "water takes the liquid-media path BECAUSE opacity is 90 and
+   MATF_OPAQUE is unset" rather than pointing at a line that mentions water. */
+
+let wikiSel=null;             // {kind:'material'|'tag'|'tune'|'shader', id}
+let shaderSrc=null;           // filename -> text, fetched once from /api/shaders
+let shaderFetch=null;         // in-flight promise, so we fetch at most once
+
+async function loadShaders(){
+  if(shaderSrc)return shaderSrc;
+  if(!server)return (shaderSrc={});
+  if(!shaderFetch)shaderFetch=(async()=>{
+    try{
+      const j=await (await fetch('/api/shaders',{cache:'no-store'})).json();
+      shaderSrc=j.shaders||{};
+    }catch(e){shaderSrc={};}
+    return shaderSrc;
+  })();
+  return shaderFetch;
+}
+
+/* ---- render-path derivation ----
+   Each entry mirrors one predicate in the shaders. `when` returns a reason
+   string when the path applies to this material, or null. Keep these in step
+   with common.wgsl / raymarch.wgsl — they are a readable restatement of the
+   same authored-data tests, not an independent guess. */
+const MATF={WANDER:1,OPAQUE:2,MICRO:4};
+const matOpacity=m=>m.opacity==null?255:m.opacity;
+// materials.json authors the flags as plain booleans under these keys and the
+// loader packs them into Material.flags; the names must match materials.h.
+const MATF_KEY={[MATF.OPAQUE]:'opaque',[MATF.WANDER]:'wanders',[MATF.MICRO]:'micro'};
+const matFlagged=(m,bit)=>!!m[MATF_KEY[bit]];
+
+const RENDER_PATHS=[
+  {
+    id:'opaque-liquid', title:'OPAQUE LIQUID — surface hit',
+    fn:'traceMedia', file:'raymarch.wgsl', groups:['fire'],
+    when:m=>m.class==='liquid'&&matFlagged(m,MATF.OPAQUE)
+      ?'MATF_OPAQUE is set on a liquid, so the ray stops at the surface and shades it like a solid instead of integrating it as media. This is the lava path.':null,
+  },
+  {
+    id:'viscous-liquid', title:'VISCOUS LIQUID — blood shading',
+    fn:'shadeBlood', file:'raymarch.wgsl', groups:['blood'],
+    when:m=>{
+      if(m.class!=='liquid'||matFlagged(m,MATF.OPAQUE))return null;
+      const mv=m.moveEvery??1, op=matOpacity(m);
+      if(mv>1&&op>=150)
+        return `isViscousLiquid() matches: a non-opaque liquid with moveEvery ${mv} (>1 = the sim's own definition of viscous) and opacity ${op} (≥150 = thick, not a thin slow liquid). Both halves are needed — that pairing is what separates blood from slow water.`;
+      return null;
+    },
+  },
+  {
+    id:'liquid-media', title:'TRANSLUCENT LIQUID — water shading',
+    fn:'shadeWater', file:'raymarch.wgsl', groups:['water'],
+    when:m=>{
+      if(m.class!=='liquid'||matFlagged(m,MATF.OPAQUE))return null;
+      const mv=m.moveEvery??1, op=matOpacity(m);
+      if(mv>1&&op>=150)return null;   // viscous path claimed it above
+      return `A non-opaque liquid, so the ray passes through and is attenuated by per-channel Beer–Lambert absorption over the depth it travels (opacity ${op}). Red is absorbed far faster than blue, which is why shallow reads cyan and deep reads blue.`;
+    },
+  },
+  {
+    id:'translucent-solid', title:'TRANSLUCENT SOLID — ice / glass',
+    fn:'shadeIce', file:'raymarch.wgsl', groups:['ice'],
+    when:m=>m.class==='solid'&&matOpacity(m)<255
+      ?`isTranslucentSolid() matches: a SOLID with authored opacity ${matOpacity(m)} (<255). Nothing else reads opacity on a solid, so that field is free to mean "absorption per metre of slab" here — which is why translucency needed no new Material field.`:null,
+  },
+  {
+    id:'gas-media', title:'GAS — media integration',
+    fn:'traceMedia', file:'raymarch.wgsl', groups:['fire'],
+    when:m=>m.class==='gas'
+      ?`Gases are integrated as participating media along the ray, accumulating absorption from opacity ${matOpacity(m)}. Smoke plumes get an early-out once the ray is saturated, which is why a chunk of pure smoke costs about what air costs.`:null,
+  },
+  {
+    id:'emissive', title:'EMISSIVE — glow and flicker',
+    fn:null, file:'raymarch.wgsl', groups:['fire'],
+    when:m=>(m.emission??0)>0
+      ?`emission is ${m.emission}/255, so this both lights nearby surfaces and pulses with per-cell spatio-temporal flicker rather than sitting at a constant brightness.`:null,
+  },
+  {
+    id:'stain', title:'STAINS what it touches',
+    fn:'matStains', file:'common.wgsl', groups:['blood'],
+    when:m=>m.stain?`This material carries an authored "stain" block, so it marks neighbouring voxels through the sparse per-voxel stain layer — and, if the consume chance is set, may eat them.`:null,
+  },
+  {
+    id:'micro', title:'MICRO DETAIL — subdivided brick',
+    fn:'trace', file:'raymarch.wgsl', groups:['micro'],
+    when:m=>matFlagged(m,MATF.MICRO)
+      ?'This material carries a "micro" block, so the loader sets MATF_MICRO and the raymarcher substitutes a subdiv³ brick for each of its cells instead of a flat voxel face.':null,
+  },
+  {
+    // Not a render path — it changes how the SIM moves the voxel — but it is
+    // the thing people are looking for when a powder behaves oddly, and it is
+    // authored right next to the visual fields.
+    id:'wander', title:'WANDERS — scuttles laterally',
+    fn:null, file:'sim_step.wgsl', groups:[],
+    when:m=>matFlagged(m,MATF.WANDER)
+      ?'MATF_WANDER is set ("wanders": true), so this powder scuttles sideways and hops rather than falling straight down — the critter movement.':null,
+  },
+  {
+    id:'opaque-solid', title:'OPAQUE SURFACE — standard shading',
+    fn:'shadeSurface', file:'raymarch.wgsl', groups:['shading'],
+    when:m=>(m.class==='solid'||m.class==='powder')&&matOpacity(m)>=255
+      ?`A fully opaque ${m.class}: the ray terminates on first hit and takes the ordinary surface path — palette variant, normal, direct sun, shadow ray, ambient.`:null,
+  },
+];
+
+function renderPathsFor(m){
+  const out=[];
+  for(const p of RENDER_PATHS){
+    const why=p.when(m);
+    if(why)out.push({...p,why});
+  }
+  return out;
+}
+
+/* Pull a named function out of shader source, with its leading comment block.
+   The comments in these files carry the actual rationale, so a body without
+   them would be the least useful half. Brace-matched rather than regexed to
+   the end, because these functions nest freely. */
+function shaderFn(file,name){
+  const src=(shaderSrc||{})[file];
+  if(!src||!name)return null;
+  const re=new RegExp('^fn\\s+'+name+'\\s*\\(','m');
+  const m=re.exec(src);
+  if(!m)return null;
+  let start=m.index;
+  // walk backwards over the contiguous comment block above the signature
+  const lines=src.slice(0,start).split('\n');
+  let i=lines.length-1;
+  while(i>0&&/^\s*\/\//.test(lines[i-1]))i--;
+  start=lines.slice(0,i).join('\n').length+(i?1:0);
+  // brace match forward from the signature
+  let depth=0,j=m.index,seen=false;
+  for(;j<src.length;j++){
+    const c=src[j];
+    if(c==='{'){depth++;seen=true;}
+    else if(c==='}'){depth--;if(seen&&depth===0){j++;break;}}
+  }
+  const text=src.slice(start,j);
+  const line=src.slice(0,start).split('\n').length;
+  return {text,line,file};
+}
+
+/* ---- the sources a tuning param is wired into ---- */
+function tuneConst(k){
+  // tuning.cpp emits camelCase keys as TUNE_UPPER_SNAKE.
+  return 'TUNE_'+k.replace(/([a-z0-9])([A-Z])/g,'$1_$2').replace(/([A-Z]+)([A-Z][a-z])/g,'$1_$2').toUpperCase();
+}
+// Which shader files reference this parameter, and how often. Cheap enough to
+// run per row because the sources are already in memory.
+function tuneUses(k){
+  const c=tuneConst(k),out=[];
+  for(const [file,src] of Object.entries(shaderSrc||{})){
+    // \b would match TUNE_ICE_ABSORB inside TUNE_ICE_ABSORB_FLOOR; require a
+    // non-identifier character after, so the two stay distinct.
+    const re=new RegExp(c+'(?![A-Z0-9_])','g');
+    const n=(src.match(re)||[]).length;
+    if(n)out.push({file,n});
+  }
+  return {konst:c,uses:out};
+}
+
+/* ---- index ---- */
+// Everything addressable in the wiki, in one flat list the search filters.
+function wikiIndex(){
+  const out=[];
+  (mat?.materials||[]).forEach((m,i)=>out.push({
+    kind:'material',id:m.id,label:m.id,group:'materials',
+    color:(m.colors||[])[0]||'#666',sub:m.class,
+    hay:[m.id,m.class,...(m.tags||[]),m.rubble||'',m.molten||''].join(' ').toLowerCase(),
+    count:countRefs(m.id),idx:i,
+  }));
+  for(const t of allTags())out.push({
+    kind:'tag',id:t,label:'tag:'+t,group:'tags',
+    hay:('tag:'+t).toLowerCase(),
+    count:(mat?.materials||[]).filter(m=>(m.tags||[]).includes(t)).length,
+  });
+  for(const tab of TUNING_SCHEMA)out.push({
+    kind:'tune',id:tab.id,label:tab.title,group:'tuning',sub:tab.icon,
+    hay:(tab.title+' '+tab.id+' '+(tab.blurb||'')+' '+
+         (tab.params||[]).map(p=>p.n+' '+p.k+' '+p.d).join(' ')).toLowerCase(),
+    count:(tab.params||[]).length,
+  });
+  for(const f of Object.keys(shaderSrc||{}))out.push({
+    kind:'shader',id:f,label:f,group:'shaders',
+    hay:f.toLowerCase()+' '+(shaderSrc[f]||'').toLowerCase(),
+    count:((shaderSrc[f]||'').match(/^fn\s/gm)||[]).length,
+  });
+  return out;
+}
+
+function renderWikiList(){
+  const host=$('#wikiList');host.innerHTML='';
+  const q=$('#wikiSearch').value.trim().toLowerCase();
+  const items=wikiIndex().filter(e=>!q||e.hay.includes(q));
+  const order=['materials','tags','tuning','shaders'];
+  const label={materials:'materials',tags:'tags',tuning:'tuning groups',shaders:'shaders'};
+  let n=0;
+  for(const g of order){
+    const rows=items.filter(e=>e.group===g);
+    if(!rows.length)continue;
+    host.append(el('div',{class:'wikigrp'},label[g]+' · '+rows.length));
+    for(const e of rows){
+      n++;
+      const it=el('div',{class:'wikiitem'+(wikiSel&&wikiSel.kind===e.kind&&wikiSel.id===e.id?' on':'')});
+      if(e.kind==='material')it.append(el('span',{class:'sw',style:'background:'+e.color}));
+      else it.append(el('span',{class:'sw',style:'background:none;border-color:transparent'},e.sub||''));
+      it.append(el('span',{class:'nm'},e.label));
+      it.append(el('span',{class:'cnt'},String(e.count)));
+      it.addEventListener('click',()=>wikiGo(e.kind,e.id));
+      host.append(it);
+    }
+  }
+  $('#wikiHint').textContent=q?n+' match'+(n===1?'':'es'):'materials, tags, tuning groups & shaders';
+}
+
+function wikiGo(kind,id){
+  wikiSel={kind,id};
+  if(activeTab!=='wiki'){
+    document.querySelector('nav.tabs button[data-tab=wiki]').click();
+  }else{
+    renderWikiList();renderWikiPage();
+  }
+}
+
+function renderWiki(){
+  // The shader fetch is async and only matters to two sections, so paint
+  // immediately and repaint once it lands rather than blocking the tab.
+  renderWikiList();renderWikiPage();
+  if(!shaderSrc)loadShaders().then(()=>{
+    if(activeTab==='wiki'){renderWikiList();renderWikiPage();}
+  });
+}
+
+function wsec(title,count,open,...body){
+  const d=el('details',{class:'wsec'});
+  if(open)d.open=true;
+  d.append(el('summary',{},title,count!=null?el('span',{class:'cnt'},String(count)):el('span',{})));
+  const b=el('div',{class:'wsecbody'});
+  body.forEach(x=>b.append(x));
+  d.append(b);
+  return d;
+}
+function wempty(t){return el('div',{class:'wempty'},t);}
+/* A reference chip that EXPANDS IN PLACE rather than navigating.
+   Clicking opens a nested card directly after the chip's owning line, so you
+   can follow "water + lava ⇒ steam" three hops deep without ever losing the
+   page you started on. The expansion is inserted after `anchor` (the row the
+   chip sits in) so it never lands mid-sentence. `depth` only shifts the inset,
+   and is capped so a long chain stays readable. */
+function wref(v,anchor,depth){
+  if(v==null||v==='')return el('span',{},'—');
+  const s=String(v);
+  const isTag=s.startsWith('tag:');
+  const known=isTag?allTags().includes(s.slice(4)):!!matById(s);
+  const c=el('code',{class:isTag?'tag':'',
+    title:known?'click to expand here · shift-click to open its page':'not a known material'},s);
+  if(!known){c.style.color='var(--red)';return c;}
+  c.addEventListener('click',e=>{
+    e.stopPropagation();
+    if(e.shiftKey){wikiGo(isTag?'tag':'material',isTag?s.slice(4):s);return;}
+    const host=anchor||c.closest('.wrule')||c;
+    // toggle: a second click on the same chip closes what it opened
+    const open=host.nextElementSibling;
+    if(open&&open.classList.contains('wexp')&&open.dataset.for===s){
+      open.remove();c.classList.remove('open');return;
+    }
+    if(open&&open.classList.contains('wexp'))open.remove();
+    host.parentNode.querySelectorAll(':scope>code.open').forEach(x=>x.classList.remove('open'));
+    const card=isTag?wexpandTag(s.slice(4),depth||0):wexpandMaterial(matById(s),depth||0);
+    card.dataset.for=s;
+    host.after(card);
+    c.classList.add('open');
+  });
+  return c;
+}
+
+/* The nested card: enough to answer "what is this thing" without leaving, and
+   editable, because the whole point is to change effects from here. */
+function wexpandMaterial(m,depth){
+  const box=el('div',{class:'wexp'+(depth?' lv2':'')});
+  const i=(mat.materials||[]).indexOf(m);
+  const go=el('button',{class:'small',title:'open the full page for '+m.id},'open ↗');
+  go.addEventListener('click',()=>wikiGo('material',m.id));
+  box.append(el('div',{class:'wexphd'},
+    el('span',{class:'sw',style:'background:'+((m.colors||[])[0]||'#666')}),
+    el('span',{class:'t'},m.id),
+    el('span',{class:'kind'},m.class),
+    el('span',{class:'kind'},'id# '+(i+1)),
+    el('span',{class:'spacer',style:'flex:1'}),go));
+
+  box.append(wmatFields(m));
+
+  // what the renderer does with it, one line each — the same derivation the
+  // full page shows, minus the source viewer.
+  const paths=renderPathsFor(m);
+  if(paths.length)box.append(el('div',{class:'hint',style:'margin-top:7px;font-size:12px'},
+    'renders as: '+paths.map(p=>p.title.split(' — ')[0]).join(' · ')));
+
+  const n=rxTouching(m).length;
+  const rxb=el('button',{class:'small',style:'margin-top:7px'},
+    n+' reaction'+(n===1?'':'s')+' — show');
+  let shown=null;
+  rxb.addEventListener('click',()=>{
+    if(shown){shown.remove();shown=null;rxb.textContent=n+' reaction'+(n===1?'':'s')+' — show';return;}
+    shown=el('div',{style:'margin-top:6px'});
+    for(const [r,as] of rxTouching(m))shown.append(wruleLine(r,as,(depth||0)+1));
+    box.append(shown);rxb.textContent='hide reactions';
+  });
+  if(n)box.append(rxb);
+  return box;
+}
+
+function wexpandTag(t,depth){
+  const box=el('div',{class:'wexp'+(depth?' lv2':'')});
+  const go=el('button',{class:'small'},'open ↗');
+  go.addEventListener('click',()=>wikiGo('tag',t));
+  const carriers=(mat?.materials||[]).filter(m=>(m.tags||[]).includes(t));
+  box.append(el('div',{class:'wexphd'},
+    el('span',{class:'t'},'tag:'+t),
+    el('span',{class:'kind'},carriers.length+' materials'),
+    el('span',{class:'spacer',style:'flex:1'}),go));
+  const row=el('div',{class:'wedit'});
+  const chips=el('div',{class:'chips'});
+  carriers.forEach(m=>{chips.append(wref(m.id,box,(depth||0)+1));});
+  row.append(el('div',{class:'f'},el('span',{},'carried by'),
+    carriers.length?chips:el('span',{class:'wempty'},'nothing')));
+  box.append(row);
+  return box;
+}
+
+/* One reaction as a readable sentence, which expands into the REAL rule editor
+   (ruleRow, the same widget the Reactions tab renders) on click. Chips inside
+   the sentence expand their own material card, so a rule and its operands can
+   all be open at once. `role` may be null when the line is not being shown
+   from a particular material's point of view. */
+function wruleLine(r,role,depth){
+  const row=el('div',{class:'wrule'});
+  const i=rx.reactions.indexOf(r);
+  row.append(el('span',{class:'n',title:'file position'},'#'+(i+1)));
+  const t=el('span',{class:'txt'});
+  const kind=ruleKind(r);
+  const ref=v=>wref(v,row,(depth||0)+1);
+  if(kind==='decay'){
+    t.append(ref(r.self),' decays into ',ref(r.becomes??r.selfBecomes));
+  }else if(kind==='emit'){
+    t.append(ref(r.self),' emits ',ref(r.emit));
+    if(r.dir)t.append(' ',el('em',{style:'color:var(--faint)'},'('+r.dir+')'));
+  }else{
+    t.append(ref(r.self),' + ',ref(r.neighbor));
+    const outs=[];
+    if(r.selfBecomes!=null)outs.push(['self →',r.selfBecomes]);
+    if(r.becomes!=null)outs.push(['→',r.becomes]);
+    if(r.neighborBecomes!=null)outs.push(['neighbour →',r.neighborBecomes]);
+    if(outs.length){
+      t.append(' ⇒ ');
+      outs.forEach(([lbl,v],n)=>{if(n)t.append(', ');t.append(el('em',{style:'color:var(--faint)'},lbl+' '),ref(v));});
+    }
+  }
+  if(r.when||r.needsSky||r.minLight!=null){
+    const cs=condSummary(r);
+    if(cs)t.append(' ',el('em',{style:'color:var(--amber);font-size:12px'},'['+cs+']'));
+  }
+  row.append(t);
+  row.append(el('span',{class:'ch'},chanceHint(r)));
+  if(role)row.append(el('span',{class:'role role-'+role},
+    role==='self'?'as self':role==='nbr'?'as neighbour':'produces it'));
+
+  // Expand into the full editor. ruleRow wants the rule's FILE index (it drives
+  // the reorder buttons), and `sorted` is false here because the wiki lists
+  // rules in file order within each role group.
+  row.addEventListener('click',e=>{
+    if(e.target.closest('code'))return;          // chips own their own clicks
+    const open=row.nextElementSibling;
+    if(open&&open.classList.contains('wexp')&&open.dataset.rule==='1'){
+      open.remove();row.classList.remove('wruleopen');return;
+    }
+    if(open&&open.classList.contains('wexp'))open.remove();
+    const card=el('div',{class:'wexp'+(depth?' lv2':'')});
+    card.dataset.rule='1';
+    const go=el('button',{class:'small'},'open in Reactions ↗');
+    go.addEventListener('click',ev=>{ev.stopPropagation();gotoReactions('self:'+(r.self||''));});
+    card.append(el('div',{class:'wexphd'},
+      el('span',{class:'t'},'rule #'+(i+1)),
+      el('span',{class:'kind'},kind),
+      el('span',{class:'spacer',style:'flex:1'}),go));
+    card.append(ruleRow(r,i,i+1,false,false));
+    // Clicks inside the editor must not bubble back to the summary row and
+    // collapse the thing being edited.
+    card.addEventListener('click',ev=>ev.stopPropagation());
+    row.after(card);
+    row.classList.add('wruleopen');
+  });
+  return row;
+}
+
+/* The editable material fields, reusing the Materials tab's own binders so an
+   edit here is identical to an edit there — same validation, same touch(). */
+function wmatFields(m){
+  const g=el('div',{class:'wedit'});
+  const f=(label,node,title)=>g.append(el('div',{class:'f',title:title||''},el('span',{},label),node));
+
+  const cls=el('select',{class:'cell class-'+m.class});
+  CLASSES.forEach(c=>cls.append(el('option',{value:c},c)));
+  cls.value=m.class;
+  cls.addEventListener('change',()=>{
+    m.class=cls.value;cls.className='cell class-'+cls.value;
+    touch('mat');
+    // class decides the render path, so the derivation above it is now stale
+    renderWikiPage();
+  });
+  f('class',cls);
+  f('density',bindNum(m,'density','mat',{min:0}),'drives displacement; air is 10');
+  f('hardness',bindNum(m,'hardness','mat',{min:0,max:255}),'0–255 blast/dig resistance');
+  f('emission',bindNum(m,'emission','mat',{min:0,max:255,ph:'0',oninput:()=>renderWikiPage()}),'0–255 glow');
+  f('opacity',bindNum(m,'opacity','mat',{min:0,max:255,ph:'—',oninput:()=>renderWikiPage()}),
+    'translucency — also what selects the ice/water render path');
+  f('moveEvery',bindNum(m,'moveEvery','mat',{min:1,ph:'1',oninput:()=>renderWikiPage()}),
+    'viscosity: move only every Nth tick');
+
+  const opq=bindCheck(m,'opaque','mat');
+  opq.addEventListener('change',()=>renderWikiPage());
+  f('opaque',opq,'liquid renders as a surface, not media');
+  const wnd=bindCheck(m,'wanders','mat');
+  wnd.addEventListener('change',()=>renderWikiPage());
+  f('wanders',wnd,'powder scuttles laterally');
+
+  f('rubble',matSelectSw(m,'rubble','mat',{none:'—'}),'what this shatters into');
+  f('molten',matSelectSw(m,'molten','mat',{none:'(vapor)'}),'heat/laser product');
+
+  const sw=el('div',{class:'swatches'});
+  (m.colors||[]).forEach((c,ci)=>{
+    const inp=el('input',{type:'color',title:'variant '+ci});inp.value=c;
+    inp.addEventListener('input',()=>{m.colors[ci]=inp.value;touch('mat');});
+    sw.append(inp);
+  });
+  f('colors',sw);
+
+  const chips=el('div',{class:'chips'});
+  (m.tags||[]).forEach((t,ti)=>{
+    const x=el('b',{title:'remove',style:'cursor:pointer'},'×');
+    x.addEventListener('click',()=>{m.tags.splice(ti,1);touch('mat');renderWikiPage();});
+    chips.append(el('span',{class:'chip'},t,x));
+  });
+  const tagIn=el('input',{class:'cell',placeholder:'+tag',list:'dl-tags',spellcheck:'false',style:'width:80px'});
+  const addTag=()=>{
+    const v=tagIn.value.trim();if(!v)return;
+    m.tags=m.tags||[];
+    if(!m.tags.includes(v))m.tags.push(v);
+    touch('mat');renderWikiPage();
+  };
+  tagIn.addEventListener('keydown',e=>{if(e.key==='Enter')addTag();});
+  tagIn.addEventListener('change',addTag);
+  chips.append(tagIn);
+  f('tags',chips);
+  return g;
+}
+
+function renderWikiPage(){
+  const host=$('#wikiBody');host.innerHTML='';
+  if(!wikiSel){
+    host.append(el('div',{class:'hint',style:'padding:30px 4px;line-height:1.8;max-width:640px'},
+      el('div',{style:'font-size:16px;color:var(--fg);margin-bottom:8px'},'Pick anything on the left.'),
+      'Every page pulls together all four sources for one thing: what it is, ',
+      'every reaction that produces or consumes it, which render path the shader ',
+      'actually takes for it and why, the tuning parameters that govern that path ',
+      '(editable right here), and your own notes. ',
+      el('br'),el('br'),
+      'Search matches ids, tags, classes, parameter help text and shader source.',
+      el('br'),el('br'),
+      'Everything expands in place: click a material chip to open its fields ',
+      'right where it is, click a reaction to get its full editor. Edits go ',
+      'straight into the JSON, exactly as if you had made them on the owning ',
+      'tab. Shift-click a chip when you do want to jump to its page.'));
+    return;
+  }
+  if(wikiSel.kind==='material')return wikiMaterial(host);
+  if(wikiSel.kind==='tag')return wikiTag(host);
+  if(wikiSel.kind==='tune')return wikiTune(host);
+  if(wikiSel.kind==='shader')return wikiShader(host);
+}
+
+/* ---- material page: the full dossier ---- */
+function wikiMaterial(host){
+  const m=matById(wikiSel.id);
+  if(!m){host.append(wempty('no such material'));return;}
+  const i=(mat.materials||[]).indexOf(m);
+
+  host.append(el('div',{class:'wikihead'},
+    el('span',{class:'sw',style:'background:'+((m.colors||[])[0]||'#666')}),
+    el('h2',{},m.id),
+    el('span',{class:'kind'},m.class),
+    el('span',{class:'kind'},'id# '+(i+1)),
+    el('span',{class:'spacer',style:'flex:1'}),
+    el('span',{class:'hint',style:'font-size:11px'},'click any chip or rule to expand it here · shift-click a chip to open its page'),
+    (()=>{const b=el('button',{class:'small'},'edit in Materials');
+      b.addEventListener('click',()=>gotoMaterial(m.id));return b;})()));
+
+  /* --- identity: editable, with the consequence of each field spelled out ---
+     The fields are live inputs rather than text because the authored values ARE
+     the behaviour: opacity and moveEvery decide which render path this material
+     takes, so changing one here re-derives the Visual section below it. */
+  const idBody=el('div',{});
+  idBody.append(wmatFields(m));
+  const notes=el('div',{class:'wfacts',style:'margin-top:9px'});
+  const note=(k,v)=>{notes.append(el('div',{class:'k'},k),el('div',{class:'v'},el('em',{},v)));};
+  note('density',(m.density>=1000?'heavier':'lighter')+' than water; air is 10, and heavier sinks through lighter');
+  note('hardness',m.hardness>=255?'indestructible':'blast/dig resistance on a 0–255 scale');
+  note('opacity',matOpacity(m)>=255?'fully opaque'
+    :m.class==='solid'?'a translucent SOLID — this is what selects the ice/glass path'
+    :'translucent: absorbed per metre of depth the ray travels');
+  if(m.moveEvery&&m.moveEvery>1)note('moveEvery','viscous — flows only every '+m.moveEvery+'th tick');
+  if(m.stain)note('stain','marks what it touches (type '+m.stain.type+', '+
+    (m.stain.chance??0)+'‰ per tick'+(m.stain.consume?', consumes '+m.stain.consume+'‰':'')+')');
+  note('rubble',m.rubble?'shatters into '+m.rubble:'leaves no rubble');
+  note('molten',m.molten?'heat/laser turns it into '+m.molten:'vaporises to air');
+  idBody.append(notes);
+  host.append(wsec('\u{1F4CB} Identity',null,true,idBody));
+
+  /* --- reactions, split by the role this material plays --- */
+  const touching=rxTouching(m);
+  const byRole={self:[],nbr:[],out:[]};
+  for(const [r,as] of touching)byRole[as].push(r);
+  const idxOf=r=>rx.reactions.indexOf(r);
+  const ruleLine=(r,role)=>wruleLine(r,role,0);
+  const rxBody=el('div',{});
+  const part=(title,list,role,blurb)=>{
+    if(!list.length)return;
+    rxBody.append(el('div',{style:'font-family:var(--mono);font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.6px;margin:9px 0 3px'},
+      title+' · '+list.length));
+    if(blurb)rxBody.append(el('div',{class:'hint',style:'margin:0 0 4px;font-size:12px'},blurb));
+    list.forEach(r=>rxBody.append(ruleLine(r,role)));
+  };
+  part('turns into something else',byRole.self,'self',
+       m.id+' is the reacting cell. Rules are tried top-down and at most one fires per cell per tick, so order is priority.');
+  part('reacts as the neighbour',byRole.nbr,'nbr',
+       'Something else reacts because '+m.id+' (or one of its tags) is next to it.');
+  part('produced by',byRole.out,'out',
+       'These rules create '+m.id+'.');
+  host.append(wsec('⚗ Reactions',touching.length,true,
+    touching.length?rxBody:wempty('no reaction touches '+m.id+'.')));
+
+  /* --- visual / rendering --- */
+  const vis=el('div',{});
+  const paths=renderPathsFor(m);
+  if(!paths.length)vis.append(wempty('no render path matched — check class and opacity.'));
+  const groups=new Set();
+  for(const p of paths){
+    p.groups.forEach(g=>groups.add(g));
+    const box=el('div',{class:'wpath'});
+    box.append(el('div',{class:'t'},p.title+(p.fn?'  →  '+p.file+' · '+p.fn+'()':'  →  '+p.file)));
+    box.append(el('div',{class:'why'},p.why));
+    if(p.fn){
+      const src=shaderFn(p.file,p.fn);
+      const btn=el('button',{class:'small',style:'margin-top:6px'},
+        src?'view '+p.fn+'() source':(shaderSrc?'source not found':'loading source…'));
+      if(src){
+        let open=false,pane=null;
+        btn.addEventListener('click',()=>{
+          open=!open;
+          if(open){
+            pane=el('div',{class:'wsrc'},
+              el('div',{class:'wsrcbar'},p.file+' : '+src.line,
+                el('span',{class:'spacer',style:'flex:1'}),
+                el('span',{},'read-only')),
+              el('pre',{},src.text));
+            box.append(pane);btn.textContent='hide source';
+          }else{pane.remove();btn.textContent='view '+p.fn+'() source';}
+        });
+      }else btn.disabled=true;
+      box.append(btn);
+    }
+    vis.append(box);
+  }
+  host.append(wsec('\u{1F3A8} Visual / rendering',paths.length,true,vis));
+
+  /* --- the tuning knobs those paths actually read --- */
+  const tuneBody=el('div',{});
+  if(!tune)tuneBody.append(wempty('tuning.json not loaded.'));
+  else if(!groups.size)tuneBody.append(wempty('no tuning group governs this material.'));
+  else for(const gid of groups){
+    const tab=TUNING_SCHEMA.find(t=>t.id===gid);
+    if(!tab)continue;
+    tuneBody.append(wikiTuneGroup(tab));
+  }
+  host.append(wsec('\u{1F39B} Tuning that affects it',
+    [...groups].reduce((n,g)=>n+((TUNING_SCHEMA.find(t=>t.id===g)||{}).params||[]).length,0),
+    true,tuneBody));
+
+  host.append(wikiNoteSection('material:'+m.id));
+}
+
+// A whole tuning group rendered with the Tuning tab's own rows, so edits here
+// go through setTuned/touchTune exactly like they do there.
+function wikiTuneGroup(tab){
+  const box=el('div',{class:'wtune'});
+  box.append(el('div',{class:'wtunehd'},
+    el('span',{class:'ico'},tab.icon||''),el('b',{},tab.title),
+    el('span',{class:'spacer',style:'flex:1'}),
+    el('span',{class:'ap ap-'+(tab.determinism?'sim':tab.apply)},
+      tab.determinism?'determinism':(APPLY_LABEL[tab.apply]||tab.apply))));
+  if(tab.blurb)box.append(el('div',{class:'tblurb'},tab.blurb));
+  const rows=el('div',{class:'trows'});
+  for(const pr of (tab.params||[])){
+    const g=paramGroup(tab,pr);
+    if(getAt(tune,g,pr.k)===undefined){
+      // The schema declares it but tuning.json does not carry it. Worth
+      // showing rather than hiding: it means the file is behind the schema.
+      rows.append(el('div',{class:'trow'},
+        el('div',{class:'nm',title:pr.k},el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)),
+        el('div',{class:'wmiss',style:'grid-column:2/5'},
+          'not present in tuning.json — the engine default is used'),
+        el('div',{class:'thelp'},pr.d)));
+      continue;
+    }
+    rows.append(tuneRow(tab,pr,g));
+  }
+  box.append(rows);
+  return box;
+}
+
+/* ---- tag page ---- */
+function wikiTag(host){
+  const t=wikiSel.id;
+  host.append(el('div',{class:'wikihead'},
+    el('h2',{},'tag:'+t),el('span',{class:'kind'},'tag')));
+  host.append(el('div',{class:'hint',style:'margin-bottom:6px'},
+    'Reactions target tags rather than enumerating materials — that is the guard against the N×M interaction explosion. Adding this tag to a material opts it into every rule below.'));
+
+  const carriers=(mat?.materials||[]).filter(m=>(m.tags||[]).includes(t));
+  const cb=el('div',{});
+  carriers.forEach(m=>{
+    const row=el('div',{class:'wrule'});
+    row.append(el('span',{class:'sw',style:'width:12px;height:12px;border-radius:3px;background:'+((m.colors||[])[0]||'#666')}));
+    row.append(el('span',{class:'txt'},wref(m.id,row,1),' ',el('em',{style:'color:var(--faint)'},m.class)));
+    // Removing the tag here is the fastest way to opt a material out of a whole
+    // family of rules, so it belongs on this list rather than only on the material.
+    const rm=el('button',{class:'icon danger',title:'remove tag:'+t+' from '+m.id},'✕');
+    rm.addEventListener('click',ev=>{
+      ev.stopPropagation();
+      m.tags=(m.tags||[]).filter(x=>x!==t);
+      touch('mat');renderWikiPage();renderWikiList();
+    });
+    row.append(el('span',{class:'spacer',style:'flex:1'}),rm);
+    cb.append(row);
+  });
+  // Adding it is the same operation in reverse.
+  const addWrap=el('div',{class:'wedit',style:'margin-top:8px'});
+  const addSel=el('select',{class:'cell'});
+  addSel.append(el('option',{value:''},'+ add this tag to…'));
+  (mat?.materials||[]).filter(m=>!(m.tags||[]).includes(t))
+    .forEach(m=>addSel.append(el('option',{value:m.id},m.id)));
+  addSel.addEventListener('change',()=>{
+    const m=matById(addSel.value);
+    if(!m)return;
+    m.tags=m.tags||[];m.tags.push(t);
+    touch('mat');renderWikiPage();renderWikiList();
+  });
+  addWrap.append(el('div',{class:'f'},el('span',{},'opt a material in'),addSel));
+  cb.append(addWrap);
+  host.append(wsec('\u{1F9F1} Materials carrying it',carriers.length,true,cb));
+
+  const ref='tag:'+t;
+  const hits=(rx?.reactions||[]).filter(r=>r.self===ref||REF_KEYS.some(k=>r[k]===ref));
+  const rb=el('div',{});
+  hits.forEach(r=>rb.append(wruleLine(r,null,0)));
+  host.append(wsec('⚗ Reactions using it',hits.length,true,
+    hits.length?rb:wempty('no rule references this tag.')));
+  host.append(wikiNoteSection('tag:'+t));
+}
+
+/* ---- tuning group page ---- */
+function wikiTune(host){
+  const tab=TUNING_SCHEMA.find(t=>t.id===wikiSel.id);
+  if(!tab){host.append(wempty('no such group'));return;}
+  host.append(el('div',{class:'wikihead'},
+    el('h2',{},(tab.icon||'')+' '+tab.title),
+    el('span',{class:'kind'},'tuning'),
+    el('span',{class:'ap ap-'+(tab.determinism?'sim':tab.apply)},
+      tab.determinism?'determinism':(APPLY_LABEL[tab.apply]||tab.apply))));
+  if(tab.blurb)host.append(el('div',{class:'hint',style:'margin-bottom:4px;max-width:820px;line-height:1.7'},tab.blurb));
+
+  if(tune)host.append(wsec('\u{1F39B} Parameters',(tab.params||[]).length,true,wikiTuneGroup(tab)));
+  else host.append(wsec('\u{1F39B} Parameters',null,true,wempty('tuning.json not loaded.')));
+
+  // Which materials this group actually governs — the inverse of the material
+  // page's derivation, so the two directions always agree.
+  const govern=(mat?.materials||[]).filter(m=>renderPathsFor(m).some(p=>p.groups.includes(tab.id)));
+  const gb=el('div',{});
+  govern.forEach(m=>{
+    const row=el('div',{class:'wrule'});
+    row.append(el('span',{class:'sw',style:'width:12px;height:12px;border-radius:3px;background:'+((m.colors||[])[0]||'#666')}));
+    row.append(el('span',{class:'txt'},wref(m.id,row,1),' ',el('em',{style:'color:var(--faint)'},
+      renderPathsFor(m).filter(p=>p.groups.includes(tab.id)).map(p=>p.title.split(' — ')[0]).join(', '))));
+    gb.append(row);
+  });
+  if(govern.length)host.append(wsec('\u{1F9F1} Materials it governs',govern.length,true,gb));
+
+  // Where the consts land in the shaders.
+  const ub=el('div',{});
+  let anyUse=false;
+  for(const pr of (tab.params||[])){
+    const {konst,uses}=tuneUses(pr.k);
+    const row=el('div',{class:'wrule'});
+    row.append(el('span',{class:'txt'},el('code',{},konst),' ',
+      el('em',{style:'color:var(--faint)'},pr.n)));
+    row.append(el('span',{class:'ch'},uses.length?uses.map(u=>u.file+' ×'+u.n).join(', ')
+      :(tab.apply==='shader'?'— unused in any shader':'read by C++')));
+    if(uses.length)anyUse=true;
+    ub.append(row);
+  }
+  host.append(wsec('\u{1F517} Where these reach the shaders',null,shaderSrc&&anyUse,
+    shaderSrc?ub:wempty(server?'loading shader source…':'shader source needs the tuner server.')));
+
+  host.append(wikiNoteSection('tune:'+tab.id));
+}
+
+/* ---- shader page ---- */
+function wikiShader(host){
+  const f=wikiSel.id, src=(shaderSrc||{})[f]||'';
+  host.append(el('div',{class:'wikihead'},
+    el('h2',{},f),el('span',{class:'kind'},'shader'),
+    el('span',{class:'kind'},src.split('\n').length+' lines')));
+
+  const fns=[...src.matchAll(/^fn\s+([A-Za-z0-9_]+)\s*\(/gm)].map(m=>m[1]);
+  const fb=el('div',{});
+  fns.forEach(n=>{
+    const row=el('div',{class:'wrule'});
+    row.append(el('span',{class:'txt'},el('code',{},n+'()')));
+    const s=shaderFn(f,n);
+    row.append(el('span',{class:'ch'},s?'line '+s.line:''));
+    row.addEventListener('click',()=>{
+      const ex=host.querySelector('.wsrc.fnview');
+      if(ex)ex.remove();
+      if(!s)return;
+      const pane=el('div',{class:'wsrc fnview'},
+        el('div',{class:'wsrcbar'},f+' : '+s.line,
+          el('span',{class:'spacer',style:'flex:1'}),el('span',{},'read-only')),
+        el('pre',{},s.text));
+      row.after(pane);
+    });
+    fb.append(row);
+  });
+  host.append(wsec('ƒ Functions',fns.length,true,
+    fns.length?fb:wempty(server?'no functions found.':'shader source needs the tuner server.')));
+
+  // Every TUNE_ const this file reads, mapped back to the group that owns it.
+  const consts=[...new Set([...src.matchAll(/TUNE_[A-Z0-9_]+/g)].map(m=>m[0]))].sort();
+  const cb=el('div',{});
+  consts.forEach(c=>{
+    let owner=null,param=null;
+    for(const tab of TUNING_SCHEMA)for(const pr of (tab.params||[]))
+      if(tuneConst(pr.k)===c){owner=tab;param=pr;}
+    const row=el('div',{class:'wrule'});
+    row.append(el('span',{class:'txt'},el('code',{},c),
+      param?el('span',{},' ',el('em',{style:'color:var(--faint)'},param.n)):
+            el('span',{},' ',el('em',{style:'color:var(--faint)'},'generated — not a tuner knob'))));
+    if(owner){
+      const b=el('button',{class:'small'},owner.title);
+      b.addEventListener('click',()=>wikiGo('tune',owner.id));
+      row.append(b);
+    }
+    cb.append(row);
+  });
+  host.append(wsec('\u{1F39B} Tuning consts it reads',consts.length,false,
+    consts.length?cb:wempty('none.')));
+  host.append(wikiNoteSection('shader:'+f));
+}
+
+/* ================= NOTES =================
+   Markdown pages autosaved to notes/ beside assets/, so they are ordinary
+   project documents: Obsidian opens the folder as a vault, git diffs them.
+   Two entry points share one store — a standalone page list here, and a note
+   attached to each wiki entity (stored as a page named for that entity, so an
+   attached note is just a page you can also open in Obsidian).             */
+
+let notes={};                 // name -> text, the in-memory mirror
+let notesLoaded=false;
+let noteSel=null;             // page name being edited
+let notePreview=false;
+const noteTimers={};          // name -> pending autosave timer
+
+const NOTE_SAVE_MS=700;       // idle time before an autosave fires
+
+async function notesLoad(){
+  if(!server){notesLoaded=true;return;}
+  try{
+    const j=await (await fetch('/api/notes',{cache:'no-store'})).json();
+    const want=(j.pages||[]).map(p=>p.name);
+    // Fetch bodies in parallel; the page count here is small by nature.
+    const texts=await Promise.all(want.map(async n=>{
+      try{
+        const r=await (await fetch('/api/note?name='+encodeURIComponent(n),{cache:'no-store'})).json();
+        return [n,r.text||''];
+      }catch(e){return [n,''];}
+    }));
+    notes={};texts.forEach(([n,t])=>notes[n]=t);
+    $('#notesWhere').textContent=j.dir||'';
+  }catch(e){/* leave notes empty; the tab still works read-only */}
+  notesLoaded=true;
+}
+
+// Autosave: debounce per page, and report state on the row that owns it.
+function noteSave(name,statusEl){
+  clearTimeout(noteTimers[name]);
+  if(statusEl){statusEl.textContent='• unsaved';statusEl.className='notestat saving';}
+  noteTimers[name]=setTimeout(async()=>{
+    if(!server){
+      if(statusEl){statusEl.textContent='no server — not saved';statusEl.className='notestat saving';}
+      return;
+    }
+    try{
+      const r=await fetch('/api/note?name='+encodeURIComponent(name),{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({text:notes[name]??''})});
+      const j=await r.json();
+      if(!j.ok)throw new Error(j.error||'save failed');
+      if(statusEl){statusEl.textContent='saved';statusEl.className='notestat saved';}
+      renderNotesList();
+    }catch(e){
+      if(statusEl){statusEl.textContent='save failed: '+e.message;statusEl.className='notestat saving';}
+    }
+  },NOTE_SAVE_MS);
+}
+
+/* Minimal markdown -> HTML. Deliberately small and escaping-first: this
+   renders text the user typed into their own tool, but building the output
+   by hand means no innerHTML path ever sees unescaped input. [[links]] are
+   resolved against the wiki index, which is the whole reason for a custom
+   renderer rather than a library. */
+function mdEscape(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function mdInline(s){
+  let h=mdEscape(s);
+  h=h.replace(/`([^`]+)`/g,(m,c)=>'<code>'+c+'</code>');
+  h=h.replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
+  h=h.replace(/(^|[^*])\*([^*]+)\*/g,'$1<i>$2</i>');
+  // [[target]] — resolved to a wiki entity when one matches, amber when not.
+  h=h.replace(/\[\[([^\]]+)\]\]/g,(m,t)=>{
+    const key=t.trim();
+    const hit=wikiResolve(key);
+    return '<a class="wl'+(hit?'':' missing')+'" data-wl="'+
+      mdEscape(key).replace(/"/g,'&quot;')+'">'+mdEscape(key)+'</a>';
+  });
+  return h;
+}
+// What does [[x]] point at? Materials and tags first, then tuning and shaders.
+function wikiResolve(key){
+  const k=key.toLowerCase().trim();
+  if(k.startsWith('tag:')&&allTags().includes(k.slice(4)))return{kind:'tag',id:k.slice(4)};
+  // Case-insensitive so [[Water]] in prose still resolves.
+  const m=(mat?.materials||[]).find(x=>x.id.toLowerCase()===k);
+  if(m)return{kind:'material',id:m.id};
+  const tab=TUNING_SCHEMA.find(t=>t.id.toLowerCase()===k||t.title.toLowerCase()===k);
+  if(tab)return{kind:'tune',id:tab.id};
+  if((shaderSrc||{})[key])return{kind:'shader',id:key};
+  return null;
+}
+function mdRender(src,host){
+  host.innerHTML='';
+  const lines=(src||'').split('\n');
+  let i=0,html=[];
+  while(i<lines.length){
+    const L=lines[i];
+    if(/^```/.test(L)){
+      const buf=[];i++;
+      while(i<lines.length&&!/^```/.test(lines[i]))buf.push(lines[i++]);
+      i++;
+      html.push('<pre><code>'+mdEscape(buf.join('\n'))+'</code></pre>');
+      continue;
+    }
+    let m;
+    if((m=/^(#{1,3})\s+(.*)$/.exec(L))){
+      html.push('<h'+m[1].length+'>'+mdInline(m[2])+'</h'+m[1].length+'>');i++;continue;
+    }
+    if(/^\s*---+\s*$/.test(L)){html.push('<hr>');i++;continue;}
+    if(/^\s*>/.test(L)){
+      const buf=[];
+      while(i<lines.length&&/^\s*>/.test(lines[i]))buf.push(lines[i++].replace(/^\s*>\s?/,''));
+      html.push('<blockquote>'+mdInline(buf.join(' '))+'</blockquote>');continue;
+    }
+    if(/^\s*([-*+]|\d+\.)\s+/.test(L)){
+      const ol=/^\s*\d+\./.test(L),buf=[];
+      while(i<lines.length&&/^\s*([-*+]|\d+\.)\s+/.test(lines[i]))
+        buf.push(lines[i++].replace(/^\s*([-*+]|\d+\.)\s+/,''));
+      html.push('<'+(ol?'ol':'ul')+'>'+buf.map(b=>'<li>'+mdInline(b)+'</li>').join('')+'</'+(ol?'ol':'ul')+'>');
+      continue;
+    }
+    if(!L.trim()){i++;continue;}
+    const buf=[];
+    while(i<lines.length&&lines[i].trim()&&!/^(#{1,3}\s|```|\s*>|\s*([-*+]|\d+\.)\s)/.test(lines[i]))
+      buf.push(lines[i++]);
+    html.push('<p>'+mdInline(buf.join(' '))+'</p>');
+  }
+  host.innerHTML=html.join('\n');
+  // Wire the wiki links after the fact, so no handler is ever built from text.
+  host.querySelectorAll('a.wl').forEach(a=>{
+    a.addEventListener('click',()=>{
+      const hit=wikiResolve(a.dataset.wl);
+      if(hit)wikiGo(hit.kind,hit.id);
+      else{
+        // A dangling link is an invitation to write that page.
+        noteOpen(a.dataset.wl,true);
+        document.querySelector('nav.tabs button[data-tab=notes]').click();
+      }
+    });
+  });
+}
+
+function renderNotes(){
+  if(!notesLoaded){
+    notesLoad().then(()=>{if(activeTab==='notes'){renderNotesList();renderNoteEditor();}});
+  }
+  renderNotesList();renderNoteEditor();
+}
+
+function renderNotesList(){
+  const host=$('#notesList');if(!host)return;
+  host.innerHTML='';
+  const q=($('#noteSearch').value||'').trim().toLowerCase();
+  const names=Object.keys(notes).sort((a,b)=>a.localeCompare(b))
+    .filter(n=>!q||n.toLowerCase().includes(q)||(notes[n]||'').toLowerCase().includes(q));
+  if(!names.length){
+    host.append(el('div',{class:'wempty',style:'padding:10px'},
+      Object.keys(notes).length?'no page matches.':'no pages yet.'));
+    return;
+  }
+  for(const n of names){
+    const it=el('div',{class:'noteitem'+(n===noteSel?' on':'')});
+    it.append(el('span',{class:'nm',title:n},n));
+    it.append(el('span',{class:'tick'},String((notes[n]||'').length)));
+    it.addEventListener('click',()=>noteOpen(n));
+    host.append(it);
+  }
+}
+
+function noteOpen(name,create){
+  noteSel=name;
+  if(create&&notes[name]===undefined){
+    notes[name]='# '+name+'\n\n';
+    noteSave(name,null);
+  }
+  if(activeTab==='notes'){renderNotesList();renderNoteEditor();}
+}
+
+function renderNoteEditor(){
+  const host=$('#notesBody');if(!host)return;
+  host.innerHTML='';
+  if(noteSel===null||notes[noteSel]===undefined){
+    host.append(el('div',{class:'hint',style:'padding:30px 4px;line-height:1.8;max-width:620px'},
+      el('div',{style:'font-size:16px;color:var(--fg);margin-bottom:8px'},'Pick a page, or make one.'),
+      'Pages are markdown files in ',el('code',{},'notes/'),' next to ',el('code',{},'assets/'),
+      ' — open that folder as an Obsidian vault and these are the same files. ',
+      'Typing autosaves after a short pause. ',
+      el('br'),el('br'),
+      'Write ',el('code',{},'[[water]]'),' or ',el('code',{},'[[tag:flammable]]'),
+      ' to link straight to a wiki page; a link with no target turns amber and ',
+      'creates the page when you click it.'));
+    if(!server)host.append(el('div',{class:'banner',style:'margin-top:14px'},'⚠',el('div',{},
+      'Notes need the tuner server (or the desktop exe) to read and write files. ',
+      'Opened as a plain file:// page, this tab cannot save.')));
+    return;
+  }
+
+  const bar=el('div',{class:'notesbar'});
+  const title=el('input',{class:'title',type:'text',value:noteSel,spellcheck:'false'});
+  const stat=el('span',{class:'notestat saved'},'saved');
+  bar.append(title);
+
+  const btnPrev=el('button',{class:'small'},notePreview?'edit':'preview');
+  btnPrev.addEventListener('click',()=>{notePreview=!notePreview;renderNoteEditor();});
+  const btnDel=el('button',{class:'small danger'},'delete');
+  btnDel.addEventListener('click',async()=>{
+    if(!confirm('Delete "'+noteSel+'"? The .md file is removed from notes/.'))return;
+    const gone=noteSel;
+    delete notes[gone];noteSel=null;
+    if(server)try{await fetch('/api/note/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({name:gone})});}catch(e){}
+    toast('deleted '+gone);
+    renderNotesList();renderNoteEditor();
+  });
+  bar.append(btnPrev,btnDel,stat);
+  host.append(bar);
+
+  // Rename: write under the new name and drop the old file server-side.
+  let renaming=noteSel;
+  title.addEventListener('change',async()=>{
+    const to=title.value.trim();
+    if(!to||to===renaming){title.value=renaming;return;}
+    if(notes[to]!==undefined){toast('a page called '+to+' already exists',true);title.value=renaming;return;}
+    const from=renaming,text=notes[from]??'';
+    if(server){
+      try{
+        const r=await fetch('/api/note?name='+encodeURIComponent(to),{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({text,rename:from})});
+        const j=await r.json();
+        if(!j.ok)throw new Error(j.error||'rename failed');
+      }catch(e){toast('rename failed: '+e.message,true);title.value=from;return;}
+    }
+    delete notes[from];notes[to]=text;noteSel=to;renaming=to;
+    toast('renamed to '+to);renderNotesList();renderNoteEditor();
+  });
+
+  if(notePreview){
+    const pv=el('div',{class:'noteprev'});
+    mdRender(notes[noteSel],pv);
+    host.append(pv);
+  }else{
+    const ta=el('textarea',{class:'noteedit',spellcheck:'false'});
+    ta.value=notes[noteSel]??'';
+    ta.addEventListener('input',()=>{notes[noteSel]=ta.value;noteSave(noteSel,stat);});
+    host.append(ta);
+    ta.focus();
+  }
+}
+
+// The note attached to one wiki entity. Same store, name derived from the
+// entity, so it shows up in the Notes list and in Obsidian like any other page.
+function wikiNoteSection(key){
+  const name=key.replace(/[^A-Za-z0-9\-_. ()]/g,'-');
+  const has=notes[name]!==undefined&&(notes[name]||'').trim();
+  const body=el('div',{});
+  const stat=el('span',{class:'notestat saved'},has?'saved':'');
+  const ta=el('textarea',{class:'wnote',spellcheck:'false',
+    placeholder:'Notes on this — autosaved to notes/'+name+'.md. [[links]] work here too.'});
+  ta.value=notes[name]??'';
+  ta.addEventListener('input',()=>{notes[name]=ta.value;noteSave(name,stat);});
+  body.append(ta);
+  const bar=el('div',{style:'display:flex;gap:8px;align-items:center;margin-top:6px'});
+  const open=el('button',{class:'small'},'open in Notes');
+  open.addEventListener('click',()=>{
+    if(notes[name]===undefined)notes[name]='';
+    noteOpen(name);
+    document.querySelector('nav.tabs button[data-tab=notes]').click();
+  });
+  bar.append(open,el('span',{class:'hint',style:'font-size:11px'},'notes/'+name+'.md'),stat);
+  body.append(bar);
+  return wsec('\u{1F4DD} Notes',null,!!has,body);
+}
 
 /* ================= models tab bridge =================
    assets/editor/editor.js is an ES module and loads asynchronously, so this

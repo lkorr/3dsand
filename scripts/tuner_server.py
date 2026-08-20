@@ -128,6 +128,8 @@ def notes_dir():
 # file, so there is no traversal to defend against in the first place.
 _NOTE_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
                "0123456789-_. ()")
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
+    "%s%d" % (p, i) for p in ("COM", "LPT") for i in range(1, 10)}
 NOTE_EXT = ".md"
 
 
@@ -150,6 +152,11 @@ def _note_path(name):
     if not name or name in (".", "..") or name != name.strip("."):
         return None
     if any(c not in _NOTE_OK for c in name):
+        return None
+    # Windows device names are not openable as files whatever the extension,
+    # so "con.md" would fail at write time with a confusing error. Reject the
+    # name up front instead.
+    if name.split(".")[0].upper() in _WIN_RESERVED:
         return None
     root = notes_dir()
     path = os.path.abspath(os.path.join(root, name + NOTE_EXT))

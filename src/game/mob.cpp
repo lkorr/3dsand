@@ -1151,6 +1151,18 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // ---- bleeding (PLAN §B5): decaying wound budget, bounded ops ----
     if (def.bleedMat != 0) {
       const auto& gore = CurrentTuning().gore;
+      // Rest-pose prefab offset -> world, for limbs with no physics body left.
+      // Recomputed here rather than reusing the walk block's bodyRot because
+      // that is scoped to live mobs, and a corpse still bleeds.
+      //
+      // Only the yaw and the animated body height matter for placing a wound;
+      // the foot-plane tilt is deliberately omitted, since a dead mob has no
+      // maintained foot plane and a stale one would swing the spray sideways.
+      const Quat bodyRotNow = AxisAngle({0, 1, 0}, mob.heading);
+      const Vec3 bodyOriginNow{mob.origin.x, mob.bodyY, mob.origin.z};
+      auto bodyFrame = [&](Vec3 prefabOffset) {
+        return bodyOriginNow + Rotate(bodyRotNow, prefabOffset);
+      };
       for (size_t li = 0; li < mob.limbs.size(); li++) {
         Limb& limb = mob.limbs[li];
         Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
@@ -1169,9 +1181,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           float frac = (float)limb.gushTicks / (float)decay;
           int want = (int)std::lround(2.0f * (float)gore.severSpray * frac /
                                       (float)decay);
+          // Bodyless fallback goes through bodyFrame(), not mob.origin +
+          // anchorRoot: origin.y is the spawn corner, so the raw offset puts
+          // the wound at the mob's feet instead of at the joint, and it also
+          // drops the heading rotation. Same reasoning as the fix in Sever().
           Vec3 origin = limb.body ? limb.xf.pos + Rotate(lq, limb.gushLocal)
-                                  : mob.origin + limb.anchorRoot;
-          Vec3 axis = limb.body ? Rotate(lq, limb.gushDir) : limb.gushDir;
+                                  : bodyFrame(limb.anchorRoot);
+          Vec3 axis = limb.body ? Rotate(lq, limb.gushDir)
+                                : Rotate(bodyRotNow, limb.gushDir);
           for (int k = 0; k < want; k++) {
             if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
             uint32_t h = Hash3((uint32_t)mob.id * 2654435761u + (uint32_t)li,
@@ -1195,7 +1212,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         if ((tick & 3u) != 0) continue;  // drip every 4th tick
         Vec3 w = limb.body
                      ? limb.xf.pos + Rotate(lq, limb.woundLocal)
-                     : mob.origin + limb.anchorRoot;  // stump on the parent
+                     : bodyFrame(limb.anchorRoot);  // stump on the parent
         ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), 1,
                        def.bleedMat, 0 /*paint into air*/, 0, 0});
         limb.bleedBudget -= 1.0f;
@@ -1290,6 +1307,26 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
     if (limbIndex == def.rootLimb || ld.vital || !ld.severable) {
       Die(mob);
     } else {
+      // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
+      // anchor expressed through the severed limb's own live transform.
+      //
+      // The obvious-looking `mob.origin + anchorRoot` is wrong and was the bug
+      // behind blood appearing under the mob and on its wrong side. anchorRoot
+      // is a REST-POSE offset in the prefab authoring frame, so using it raw
+      // ignores (a) the mob's heading — a creature facing away sprays from the
+      // mirrored side — and (b) `mob.bodyY`, the animated body height, where
+      // mob.origin.y is only the spawn corner, so the wound sits at the mob's
+      // feet while the body stands above it.
+      //
+      // limb.xf is the pose Jolt is actually holding this instant, and
+      // anchorLimb is the same joint in that limb's local frame, so this is
+      // correct under any animation, heading or slope with no frame rebuild —
+      // the identical construction Damage() uses to locate a hit.
+      const Limb& cut = mob.limbs[limbIndex];
+      Quat cq{cut.xf.quat[0], cut.xf.quat[1], cut.xf.quat[2], cut.xf.quat[3]};
+      Vec3 anchorW = cut.body ? cut.xf.pos + Rotate(cq, cut.anchorLimb)
+                              : mob.origin + cut.anchorRoot;
+
       DetachLimb(mob, limbIndex, true);
       // the stump bleeds: wound at the joint on the PARENT side
       for (size_t k = 0; k < def.limbs.size(); k++)
@@ -1297,7 +1334,6 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
           Limb& parent = mob.limbs[k];
           Quat q{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
                  parent.xf.quat[3]};
-          Vec3 anchorW = mob.origin + mob.limbs[limbIndex].anchorRoot;
           parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
           parent.bleedBudget = std::min(parent.bleedBudget + 40.0f, 120.0f);
 

@@ -59,6 +59,11 @@ struct Tuning {
     float liquidGravityScale = 0.25f;
     float liquidSpeedScale = 0.55f;
     float halfWidth = 0.30f, halfHeight = 0.85f, eyeOffset = 0.65f;
+    // Camera step smoothing: half-life (seconds) of the render-only eye
+    // offset that cancels the vertical pop when the body steps up/down a
+    // ledge (Player::ViewEyePos). 0 disables. CPU/render only — the physics
+    // position and the sim are untouched.
+    float viewSmoothHalflife = 0.10f;
   } player;
 
   // ---- camera ----

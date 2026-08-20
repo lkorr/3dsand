@@ -23,3 +23,6 @@ screenshot_*.png
 __pycache__/
 sandvox_tuner.exe
 dist/
+
+# tuner Notes tab — local engineering notes, not part of the engine
+notes/
