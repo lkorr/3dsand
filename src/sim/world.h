@@ -11,14 +11,20 @@
 // World constants. These are the SINGLE source of truth: the matching WGSL
 // consts are generated from them by ShaderConstantPrelude() (gpu/resources.cpp)
 // and prepended ahead of common.wgsl, so shaders cannot drift from C++.
-constexpr uint32_t kWorldN = 256;
+// 512^3 residency window = 32 m per edge at 6.25 cm voxels (doubled from 256
+// on 2026-08-19: the simulated world extends +-16 m around the player). The
+// voxel buffer is kVoxelCount u32 = 512 MiB — exactly the storage limit
+// context.cpp requests; growing this again means raising those limits AND
+// accepting 8x that memory. Must stay a power of two (all window addressing
+// is bitmasks).
+constexpr uint32_t kWorldN = 512;
 
 // Physical edge length of one voxel. The engine runs entirely in voxel units;
 // this is the single meters<->voxels conversion, and every physical constant
 // (player size, speeds, gravity, fog/media densities) derives from it. Change
 // it here and here only — shaders pick it up automatically.
 // Note: at the same kWorldN, smaller voxels shrink the world's physical size.
-constexpr float kVoxelMeters = 0.0625f;
+constexpr float kVoxelMeters = 0.125f;
 constexpr uint32_t kChunk = 16;
 constexpr uint32_t kNChunk = kWorldN / kChunk;          // 16
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 4096
@@ -135,7 +141,11 @@ struct RenderParams {
   float sunDir[3];
   float fogDensity = 0.0128f;  // per-meter; pinned to the far-field extent
   int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
-  int32_t pad2 = 0;
+  // Render target HEIGHT in pixels. The water shader damps its ripple bands
+  // against the angular size of one pixel (tanHalfFov*2/viewPx), so this has
+  // to be the real target height or the water's apparent choppiness changes
+  // with window size.
+  float viewPx = 1080.0f;
 };
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9,
@@ -145,7 +155,28 @@ struct RenderParams {
 // at constant memory. Derived data: filled from worldgen on the GPU, never
 // read by the sim, excluded from the world hash — determinism rule #1 is
 // untouched by construction.
-constexpr uint32_t kFarLevels = 6;      // outermost half-extent: 1024 m
+// The far field lives on its OWN kFarN^3 grid, decoupled from the residency
+// window (since the 512^3 window): tying cascade storage to kWorldN would have
+// made each level 128 MiB. Level k (1-based) cells span 2^(k + kFarShiftBase)
+// fine voxels, with kFarShiftBase = log2(kWorldN / kFarN) — chosen so level
+// k's box edge is always 2^k WINDOW edges (half-extent = 2^k window radii)
+// whatever kWorldN is. All cascade distances therefore scale WITH the window.
+constexpr uint32_t kFarN = 256;
+constexpr uint32_t kFarNChunk = kFarN / kChunk;  // 16
+constexpr uint32_t kFarNumChunks = kFarNChunk * kFarNChunk * kFarNChunk;  // 4096
+constexpr uint32_t kFarVox = kFarN * kFarN * kFarN;  // cells per level
+constexpr uint32_t kFarShiftBase = [] {
+  uint32_t s = 0;
+  while ((kFarN << s) < kWorldN) s++;
+  return s;
+}();
+static_assert(kWorldN >= kFarN && (kFarN << kFarShiftBase) == kWorldN,
+              "kFarN must divide kWorldN by a power of two");
+// 8 levels: outermost half-extent = (kWorldN << 8)/2 voxels = 4096 m at the
+// 512 window and 6.25 cm voxels. farVox = kFarLevels * 16 MiB = 128 MiB.
+constexpr uint32_t kFarLevels = 8;
+static_assert((uint64_t)kFarLevels * kFarVox < (1ull << 32),
+              "farVox byte indices must fit u32");
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
 // Fog reaches ~full opacity (exp(-4.5) ~= 1%) at whatever radius it is pinned
 // to; kFogOpticalDepths is that budget, shared by the static pin below and by

@@ -72,6 +72,13 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
 
+# far-field grid (decoupled from the window — see world.h kFarN/kFarShiftBase)
+W_FARN="$(cpp_const kFarN)"
+[ -n "$W_FARN" ] || { echo "check_shaders: cannot parse kFarN from $WORLD_H" >&2; exit 1; }
+W_FARNCHUNK=$((W_FARN / W_CHUNK))
+W_FARSHIFT=0
+while [ $((W_FARN << W_FARSHIFT)) -lt "$W_N" ]; do W_FARSHIFT=$((W_FARSHIFT + 1)); done
+
 W_SHIFT=0
 while [ $((1 << W_SHIFT)) -lt "$W_CHUNK" ]; do W_SHIFT=$((W_SHIFT + 1)); done
 PRELUDE_TEXT="$(printf '%s\n' \
@@ -86,7 +93,13 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
-  "const WORLD_VOX : u32 = $((W_N * W_N * W_N))u;" \
+  "const FAR_N : u32 = ${W_FARN}u;" \
+  "const FAR_NCHUNK : u32 = ${W_FARNCHUNK}u;" \
+  "const FAR_NUM_CHUNKS : u32 = $((W_FARNCHUNK * W_FARNCHUNK * W_FARNCHUNK))u;" \
+  "const FAR_VOX : u32 = $((W_FARN * W_FARN * W_FARN))u;" \
+  "const FAR_MASK : i32 = $((W_FARN - 1));" \
+  "const FAR_NCHUNK_MASK : i32 = $((W_FARNCHUNK - 1));" \
+  "const FAR_SHIFT_BASE : u32 = ${W_FARSHIFT}u;" \
   "const VOXEL_METERS : f32 = ${W_VOX};")"
 
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".

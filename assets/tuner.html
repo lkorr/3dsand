@@ -1,0 +1,953 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>sandvox tuner</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root{
+    --bg:#0e1116; --bg2:#141922; --card:#1a2029; --card2:#1f2733;
+    --line:#2a3240; --line2:#39445a;
+    --fg:#d7dde6; --dim:#8a94a6; --faint:#5c667a;
+    --acc:#6ea8fe; --amber:#ffb454; --green:#7cf03a; --red:#ff6b6b;
+    --mono:"Cascadia Code","Consolas",monospace;
+    --sans:"Segoe UI",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--line2);border-radius:5px}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  header{
+    position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:10px;
+    padding:10px 16px;background:linear-gradient(180deg,#151b24,#11151d);
+    border-bottom:1px solid var(--line);flex-wrap:wrap;
+  }
+  header h1{font-size:16px;margin:0;font-family:var(--mono);letter-spacing:.5px}
+  header h1 span{color:var(--amber)}
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;
+    background:var(--card);border:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--dim);
+  }
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+  .pill.loaded .dot{background:var(--green)}
+  .pill.dirty .dot{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .pill.dirty{color:var(--amber)}
+
+  button{
+    background:var(--card2);color:var(--fg);border:1px solid var(--line2);border-radius:6px;
+    padding:6px 12px;cursor:pointer;font-size:13px;font-family:var(--sans);
+  }
+  button:hover{background:#273143;border-color:var(--acc)}
+  button.primary{background:#1d3a6e;border-color:#2c5cb0}
+  button.primary:hover{background:#25498a}
+  button.small{padding:2px 7px;font-size:12px}
+  button.icon{padding:2px 6px;font-size:12px;font-family:var(--mono);color:var(--dim)}
+  button.icon:hover{color:var(--fg)}
+  button.danger:hover{background:#4a2020;border-color:var(--red);color:var(--red)}
+  button:disabled{opacity:.4;cursor:default}
+  button:disabled:hover{background:var(--card2);border-color:var(--line2)}
+
+  nav.tabs{display:flex;gap:2px;padding:0 16px;background:var(--bg2);border-bottom:1px solid var(--line)}
+  nav.tabs button{
+    background:none;border:none;border-bottom:2px solid transparent;border-radius:0;
+    padding:9px 16px;color:var(--dim);font-size:13.5px;
+  }
+  nav.tabs button:hover{color:var(--fg);background:none}
+  nav.tabs button.active{color:var(--acc);border-bottom-color:var(--acc)}
+
+  main{padding:14px 16px 120px}
+  .view{display:none}
+  .view.active{display:block}
+
+  .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .toolbar input[type=search]{
+    background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--fg);
+    padding:6px 10px;width:260px;font-size:13px;
+  }
+  .toolbar input[type=search]:focus{outline:none;border-color:var(--acc)}
+  .hint{color:var(--faint);font-size:12px}
+  .spacer{flex:1}
+
+  details.schema{margin-bottom:12px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+  details.schema summary{padding:7px 12px;cursor:pointer;color:var(--dim);font-size:12.5px;user-select:none}
+  details.schema div{padding:2px 14px 12px;color:var(--dim);font-size:12.5px;line-height:1.55;white-space:pre-wrap;font-family:var(--mono)}
+
+  /* ---------- materials table ---------- */
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+  table{border-collapse:collapse;width:100%;min-width:1180px}
+  thead th{
+    position:sticky;top:0;background:#1c2430;color:var(--dim);font-weight:600;font-size:11.5px;
+    text-transform:uppercase;letter-spacing:.6px;padding:8px 8px;text-align:left;border-bottom:1px solid var(--line2);
+    white-space:nowrap;z-index:5;
+  }
+  tbody td{padding:4px 8px;border-bottom:1px solid #222a36;vertical-align:middle;white-space:nowrap}
+  tbody tr:hover td{background:#1e2530}
+  tbody tr.details-row td{background:#161c26;padding:10px 14px;white-space:normal}
+  td.idx{color:var(--faint);font-family:var(--mono);font-size:12px;text-align:right}
+  input.cell,select.cell{
+    background:#12161e;border:1px solid #262e3c;border-radius:5px;color:var(--fg);
+    padding:4px 6px;font-size:13px;font-family:var(--mono);
+  }
+  input.cell:focus,select.cell:focus{outline:none;border-color:var(--acc)}
+  input.cell.num{width:64px;text-align:right}
+  input.cell.id{width:110px;font-weight:600}
+  select.cell{cursor:pointer}
+  input[type=color]{
+    width:24px;height:24px;border:1px solid var(--line2);border-radius:5px;padding:0;background:none;cursor:pointer;
+  }
+  input[type=color]::-webkit-color-swatch-wrapper{padding:1px}
+  input[type=color]::-webkit-color-swatch{border:none;border-radius:3px}
+  input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
+  .swatches{display:flex;gap:3px}
+  .class-solid{color:#c9d4e4}.class-powder{color:#e6cb84}.class-liquid{color:#6ea8fe}.class-gas{color:#b6a7e8}
+
+  .chips{display:flex;gap:4px;flex-wrap:wrap;align-items:center;max-width:340px}
+  .chip{
+    display:inline-flex;align-items:center;gap:4px;background:#232c3b;border:1px solid var(--line2);
+    color:#aebbd0;border-radius:12px;padding:1px 4px 1px 9px;font-size:11.5px;font-family:var(--mono);
+  }
+  .chip b{cursor:pointer;color:var(--faint);font-weight:400;padding:0 3px}
+  .chip b:hover{color:var(--red)}
+  .chips input{background:none;border:none;color:var(--fg);width:64px;font-size:11.5px;font-family:var(--mono)}
+  .chips input:focus{outline:none}
+  a.rxcount{color:var(--acc);cursor:pointer;font-family:var(--mono);font-size:12px;text-decoration:none}
+  a.rxcount:hover{text-decoration:underline}
+
+  .banner{
+    display:flex;gap:8px;align-items:baseline;background:#2a2314;border:1px solid #57451e;color:#e8c477;
+    border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12.5px;
+  }
+
+  /* ---------- reactions ---------- */
+  .rxlist{display:flex;flex-direction:column;gap:4px}
+  .rxnote{
+    margin-top:14px;display:flex;gap:8px;align-items:flex-start;
+  }
+  .rxnote:first-child{margin-top:0}
+  .rxnote textarea{
+    flex:1;background:none;border:none;border-left:3px solid var(--line2);color:var(--dim);
+    font-family:var(--mono);font-size:12px;line-height:1.5;padding:4px 10px;resize:none;overflow:hidden;
+  }
+  .rxnote textarea:focus{outline:none;border-left-color:var(--amber);color:#cbb98a}
+  .rxrule{
+    display:grid;grid-template-columns:34px 128px 88px 1fr 118px auto;gap:8px;align-items:center;
+    background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;
+  }
+  .rxrule.hidden,.rxnote.hidden{display:none}
+  .rxrule:hover{border-color:var(--line2)}
+  .rxrule .n{color:var(--faint);font-family:var(--mono);font-size:11px;text-align:right}
+  .rxrule .mid{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .f{display:flex;flex-direction:column;gap:1px}
+  .f>span{font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.5px}
+  .f input,.f select{
+    background:#12161e;border:1px solid #262e3c;border-radius:5px;color:var(--fg);
+    padding:3px 6px;font-size:12.5px;font-family:var(--mono);
+  }
+  .f input:focus,.f select:focus{outline:none;border-color:var(--acc)}
+  .f input.nb{width:130px}
+  .arrow{color:var(--faint);font-size:15px;padding-top:12px}
+  .chancewrap{display:flex;flex-direction:column;gap:1px}
+  .chancewrap .sub{font-size:10.5px;color:var(--faint);font-family:var(--mono)}
+  .chancewrap input{width:64px;text-align:right;background:#12161e;border:1px solid #262e3c;border-radius:5px;color:var(--fg);padding:3px 6px;font-size:12.5px;font-family:var(--mono)}
+  .rxactions{display:flex;gap:3px}
+  .rxdetails{
+    grid-column:1/-1;border-top:1px dashed var(--line);margin-top:4px;padding-top:8px;
+    display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start;
+  }
+  .rxdetails textarea{
+    background:#12161e;border:1px solid #262e3c;border-radius:5px;color:var(--dim);
+    font-family:var(--mono);font-size:12px;padding:6px;width:420px;min-height:40px;resize:vertical;
+  }
+  .ncbox{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--dim);padding-top:4px}
+  .kind-pair{border-left:3px solid #3a6ea8}
+  .kind-decay{border-left:3px solid #8a6ecf}
+  .kind-emit{border-left:3px solid #4f9b4a}
+
+  /* ---------- overview ---------- */
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
+  .mcard{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:hidden}
+  .mcard h3{
+    margin:0 0 6px;font-family:var(--mono);font-size:14px;display:flex;align-items:center;gap:8px;cursor:pointer;
+  }
+  .mcard h3:hover{color:var(--acc)}
+  .mcard .sw{display:inline-flex;gap:2px}
+  .mcard .sw i{width:14px;height:14px;border-radius:3px;display:inline-block}
+  .mcard .props{color:var(--dim);font-size:11.5px;font-family:var(--mono);margin-bottom:8px;line-height:1.7}
+  .mcard .props b{color:var(--fg);font-weight:600}
+  .mcard ul{margin:0;padding:0;list-style:none;font-size:12px;font-family:var(--mono);line-height:1.8}
+  .mcard li{color:#aeb8c8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .mcard li .pct{color:var(--faint)}
+  .mcard li .as{display:inline-block;width:14px;color:var(--faint)}
+  .mcard li .mat{color:var(--amber)} .mcard li .tag{color:var(--green)} .mcard li .arr{color:var(--faint)}
+  .mcard .none{color:var(--faint);font-size:12px;font-style:italic}
+
+  /* ---------- validation footer ---------- */
+  #valbar{
+    position:fixed;bottom:0;left:0;right:0;z-index:60;background:#151b24;border-top:1px solid var(--line);
+    max-height:40vh;display:flex;flex-direction:column;
+  }
+  #valhead{display:flex;align-items:center;gap:10px;padding:6px 16px;cursor:pointer;user-select:none}
+  #valhead .count{font-family:var(--mono);font-size:12px}
+  #valhead .count.err{color:var(--red)} #valhead .count.warn{color:var(--amber)} #valhead .count.ok{color:var(--green)}
+  #valbody{overflow-y:auto;padding:0 16px 10px;display:none}
+  #valbar.open #valbody{display:block}
+  .vmsg{font-family:var(--mono);font-size:12px;padding:2px 0}
+  .vmsg.err{color:var(--red)} .vmsg.warn{color:var(--amber)}
+
+  #toast{
+    position:fixed;bottom:52px;left:50%;transform:translateX(-50%);z-index:100;
+    background:#1d3a6e;border:1px solid #2c5cb0;color:#dce8ff;padding:9px 18px;border-radius:8px;
+    font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;box-shadow:0 4px 20px #0008;
+  }
+  #toast.show{opacity:1}
+  #toast.bad{background:#4a2020;border-color:var(--red)}
+
+  #splash{
+    display:flex;flex-direction:column;align-items:center;gap:16px;padding:80px 20px;text-align:center;color:var(--dim);
+  }
+  #splash .big{font-size:15px;color:var(--fg)}
+  kbd{background:var(--card2);border:1px solid var(--line2);border-radius:4px;padding:1px 6px;font-family:var(--mono);font-size:12px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>&#9879; sandvox <span>tuner</span></h1>
+  <button class="primary" id="btnOpen">Open assets folder</button>
+  <button id="btnReload" disabled>Reload from disk</button>
+  <span class="pill" id="pillMat"><span class="dot"></span>materials.json</span>
+  <span class="pill" id="pillRx"><span class="dot"></span>reactions.json</span>
+  <span class="spacer"></span>
+  <button id="btnSave" disabled>Save <kbd>Ctrl+S</kbd></button>
+  <button id="btnCopy" disabled>Save copy&hellip;</button>
+</header>
+
+<nav class="tabs">
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="materials">Materials</button>
+  <button data-tab="reactions">Reactions</button>
+</nav>
+
+<main>
+  <div id="splash">
+    <div class="big">No data loaded.</div>
+    <div>Click <b>Open assets folder</b> and pick either <code>assets/</code> or <code>assets/materials/</code>.<br>
+    Chrome/Edge write straight back to the JSON files; then press <kbd>R</kbd> in-game to hot-reload.</div>
+    <div>
+      <button id="btnFallback">&hellip;or load files manually (read-only folder access)</button>
+      <input type="file" id="fileInput" accept=".json" multiple style="display:none">
+    </div>
+  </div>
+
+  <!-- OVERVIEW -->
+  <section class="view" id="view-overview">
+    <div class="toolbar">
+      <input type="search" id="ovFilter" placeholder="filter materials / tags&hellip;">
+      <span class="hint">one card per voxel type: properties + every reaction that touches it. Click a name to edit it.</span>
+    </div>
+    <div class="cards" id="ovCards"></div>
+  </section>
+
+  <!-- MATERIALS -->
+  <section class="view" id="view-materials">
+    <div class="banner">&#9888; <div><b>Order defines the 12-bit GPU material ID.</b> Worldgen and world.h assume it &mdash; new materials are appended at the end, reordering is disabled, and deleting anything but the last entry will shift every later ID.</div></div>
+    <details class="schema" id="matSchema"><summary>schema notes (from materials.json)</summary><div></div></details>
+    <div class="toolbar">
+      <input type="search" id="matFilter" placeholder="filter by id / tag / class&hellip;">
+      <span class="spacer"></span>
+      <button id="btnAddMat">+ material</button>
+    </div>
+    <div class="tablewrap">
+      <table id="matTable">
+        <thead><tr>
+          <th title="GPU material ID (index+1; 0 is air)">id#</th>
+          <th>colors</th><th>id</th><th>class</th>
+          <th title="drives displacement; air=10">density</th>
+          <th title="0-255 blast/dig resistance; 255 = indestructible">hard</th>
+          <th title="0-255 glow">emit</th>
+          <th title="liquid/gas translucency">opac</th>
+          <th title="viscosity: move only every Nth tick">mv/N</th>
+          <th title="liquid renders as surface, not media">opq</th>
+          <th title="critter scuttle">wnd</th>
+          <th title="what this breaks into when shattered">rubble</th>
+          <th title="what heat/laser melt turns this into; empty = vaporized">molten</th>
+          <th>tags</th>
+          <th title="reactions touching this material">rx</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="matBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- REACTIONS -->
+  <section class="view" id="view-reactions">
+    <details class="schema" id="rxSchema"><summary>schema notes (from reactions.json)</summary><div></div></details>
+    <div class="toolbar">
+      <input type="search" id="rxFilter" placeholder="filter by material / tag&hellip;">
+      <span class="hint">file order matters: rules for the same <i>self</i> are tried top-down, at most one fires per cell per tick. chance is &permil; per 30&thinsp;Hz tick.</span>
+      <span class="spacer"></span>
+      <button id="btnAddNote">+ note</button>
+      <button id="btnAddRule">+ rule</button>
+    </div>
+    <div class="rxlist" id="rxList"></div>
+  </section>
+</main>
+
+<div id="valbar">
+  <div id="valhead">
+    <span class="count ok" id="valcount">no issues</span>
+    <span class="hint" id="valhint">click to expand</span>
+  </div>
+  <div id="valbody"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+'use strict';
+/* ================= state ================= */
+let mat=null, rx=null;                 // parsed JSON, mutated in place
+let matHandle=null, rxHandle=null;     // FS Access handles (null in fallback mode)
+let dirty={mat:false, rx:false};
+let eol={mat:'\r\n', rx:'\r\n'};       // detected per file at load, preserved on save
+let activeTab='overview';
+const CLASSES=['solid','powder','liquid','gas'];
+const DIRS=['up','down','side'];       // absent = any
+
+const $=s=>document.querySelector(s);
+function el(tag,attrs={},...kids){
+  const e=document.createElement(tag);
+  for(const [k,v] of Object.entries(attrs)){
+    if(k==='class')e.className=v;
+    else if(k.startsWith('on'))e.addEventListener(k.slice(2),v);
+    else if(v!==false&&v!=null)e.setAttribute(k,v===true?'':v);
+  }
+  for(const k of kids.flat(9)){if(k!=null)e.append(k.nodeType?k:document.createTextNode(k));}
+  return e;
+}
+const ids=()=>mat?mat.materials.map(m=>m.id):[];
+function allTags(){const s=new Set();(mat?.materials||[]).forEach(m=>(m.tags||[]).forEach(t=>s.add(t)));return[...s].sort();}
+
+/* ================= toast / dirty ================= */
+let toastT=null;
+function toast(msg,bad=false){
+  const t=$('#toast');t.textContent=msg;t.className=bad?'show bad':'show';
+  clearTimeout(toastT);toastT=setTimeout(()=>t.className='',2600);
+}
+function touch(which){
+  dirty[which]=true;updatePills();validateSoon();
+}
+function updatePills(){
+  const set=(id,loaded,d)=>{const p=$(id);p.classList.toggle('loaded',loaded&&!d);p.classList.toggle('dirty',d);};
+  set('#pillMat',!!mat,dirty.mat);set('#pillRx',!!rx,dirty.rx);
+  $('#btnSave').disabled=!(dirty.mat||dirty.rx);
+  $('#btnCopy').disabled=!(mat||rx);
+  $('#btnReload').disabled=!(matHandle&&rxHandle);
+}
+window.addEventListener('beforeunload',e=>{if(dirty.mat||dirty.rx){e.preventDefault();e.returnValue='';}});
+
+/* ================= file I/O ================= */
+async function openFolder(){
+  if(!window.showDirectoryPicker){toast('File System Access API unavailable — use manual load',true);return;}
+  let root;
+  try{root=await showDirectoryPicker({id:'sandvox-assets'});}catch{return;}
+  let dir=root;
+  try{await dir.getFileHandle('materials.json');}
+  catch{
+    try{dir=await root.getDirectoryHandle('materials');}
+    catch{toast('materials.json not found in that folder (pick assets/ or assets/materials/)',true);return;}
+  }
+  try{
+    matHandle=await dir.getFileHandle('materials.json');
+    rxHandle=await dir.getFileHandle('reactions.json');
+  }catch{toast('could not find both materials.json and reactions.json',true);return;}
+  await loadFromHandles();
+  toast('loaded '+mat.materials.length+' materials, '+rx.reactions.filter(r=>r.self!==undefined).length+' reactions');
+}
+async function loadFromHandles(){
+  const mt=await (await matHandle.getFile()).text();
+  const rt=await (await rxHandle.getFile()).text();
+  mat=JSON.parse(mt);rx=JSON.parse(rt);
+  eol.mat=mt.includes('\r\n')?'\r\n':'\n';
+  eol.rx=rt.includes('\r\n')?'\r\n':'\n';
+  dirty={mat:false,rx:false};
+  onLoaded();
+}
+// match the on-disk style exactly (CRLF + \uXXXX escapes) so a no-op save is diff-clean
+function serialize(data,eolStr){
+  const s=JSON.stringify(data,null,2)
+    .replace(/[\u007f-\uffff]/g,ch=>'\\u'+ch.charCodeAt(0).toString(16).padStart(4,'0'));
+  return (s+'\n').replace(/\n/g,eolStr);
+}
+async function saveAll(){
+  if(!dirty.mat&&!dirty.rx)return;
+  const jobs=[];
+  if(dirty.mat)jobs.push(['mat',matHandle,mat,'materials.json']);
+  if(dirty.rx)jobs.push(['rx',rxHandle,rx,'reactions.json']);
+  for(const [which,handle,data,name] of jobs){
+    const text=serialize(data,eol[which]);
+    if(handle){
+      try{
+        const w=await handle.createWritable();await w.write(text);await w.close();
+        dirty[which]=false;
+      }catch(e){toast('save failed: '+e.message,true);updatePills();return;}
+    }else{
+      download(name,text);dirty[which]=false;
+    }
+  }
+  updatePills();
+  toast('saved — press R in-game to hot-reload');
+}
+async function saveCopy(){
+  const isMat=activeTab==='materials'||activeTab==='overview';
+  const data=isMat?mat:rx, base=isMat?'materials':'reactions';
+  if(!data)return;
+  const text=serialize(data,eol[isMat?'mat':'rx']);
+  if(window.showSaveFilePicker){
+    try{
+      const h=await showSaveFilePicker({suggestedName:base+'_copy.json',types:[{description:'JSON',accept:{'application/json':['.json']}}]});
+      const w=await h.createWritable();await w.write(text);await w.close();
+      toast('copy saved');
+    }catch{}
+  }else download(base+'_copy.json',text);
+}
+function download(name,text){
+  const a=el('a',{href:URL.createObjectURL(new Blob([text],{type:'application/json'})),download:name});
+  a.click();URL.revokeObjectURL(a.href);
+}
+function fallbackLoad(files){
+  for(const f of files){
+    f.text().then(t=>{
+      const j=JSON.parse(t);
+      if(j.materials){mat=j;eol.mat=t.includes('\r\n')?'\r\n':'\n';}
+      else if(j.reactions){rx=j;eol.rx=t.includes('\r\n')?'\r\n':'\n';}
+      if(mat&&rx){dirty={mat:false,rx:false};onLoaded();toast('loaded (read-only mode: Save downloads new files)');}
+    }).catch(()=>toast('could not parse '+f.name,true));
+  }
+}
+function onLoaded(){
+  $('#splash').style.display='none';
+  $('#matSchema div').textContent=mat.comment||'';
+  $('#rxSchema div').textContent=rx.comment||'';
+  renderAll();updatePills();
+}
+
+/* ================= binding helpers ================= */
+function bindNum(obj,key,which,opts={}){
+  const inp=el('input',{class:'cell num',type:'number',...opts.attrs});
+  inp.value=obj[key]??'';
+  if(opts.min!=null)inp.min=opts.min; if(opts.max!=null)inp.max=opts.max;
+  if(opts.ph)inp.placeholder=opts.ph;
+  inp.addEventListener('input',()=>{
+    const v=inp.value.trim();
+    if(v==='')delete obj[key];else obj[key]=Math.round(+v);
+    touch(which);opts.oninput?.(obj[key]);
+  });
+  return inp;
+}
+function bindCheck(obj,key,which){
+  const c=el('input',{type:'checkbox'});c.checked=!!obj[key];
+  c.addEventListener('change',()=>{if(c.checked)obj[key]=true;else delete obj[key];touch(which);});
+  return c;
+}
+function matSelect(obj,key,which,{none=null,extra=[],structural=false}={}){
+  const s=el('select',{class:'cell'});
+  const opts=[...extra,...ids()];
+  if(none!==null)s.append(el('option',{value:''},none));
+  for(const id of opts)s.append(el('option',{value:id},id));
+  s.value=obj[key]??'';
+  if(obj[key]&&![...s.options].some(o=>o.value===obj[key])){ // preserve unknown refs
+    s.append(el('option',{value:obj[key]},obj[key]+' (?)'));s.value=obj[key];
+  }
+  s.addEventListener('change',()=>{
+    if(s.value==='')delete obj[key];else obj[key]=s.value;
+    touch(which);if(structural)renderAll();else validateSoon();
+  });
+  return s;
+}
+
+/* ================= reference utilities ================= */
+const REF_KEYS=['neighbor','becomes','selfBecomes','neighborBecomes','emit'];
+function renameRefs(oldId,newId){
+  let n=0;
+  for(const m of mat.materials){
+    if(m.rubble===oldId){m.rubble=newId;n++;}
+    if(m.molten===oldId){m.molten=newId;n++;}
+  }
+  for(const r of rx.reactions){
+    if(r.self===oldId){r.self=newId;n++;}
+    for(const k of REF_KEYS)if(r[k]===oldId){r[k]=newId;n++;}
+  }
+  return n;
+}
+function countRefs(id){
+  let n=0;
+  for(const r of rx?.reactions||[]){
+    if(r.self===id)n++;
+    for(const k of REF_KEYS)if(r[k]===id)n++;
+  }
+  return n;
+}
+function rxTouching(m){ // reactions involving material m directly or via its tags
+  const tags=new Set((m.tags||[]).map(t=>'tag:'+t));
+  const out=[];
+  for(const r of rx?.reactions||[]){
+    if(r.self===undefined)continue;
+    let as=null;
+    if(r.self===m.id)as='self';
+    else if(r.neighbor===m.id||tags.has(r.neighbor))as='nbr';
+    else if(r.becomes===m.id||r.selfBecomes===m.id||r.neighborBecomes===m.id||r.emit===m.id)as='out';
+    if(as)out.push([r,as]);
+  }
+  return out;
+}
+
+/* ================= chance math ================= */
+const perSec=c=>1-Math.pow(1-Math.min(c,1000)/1000,30);
+function chanceHint(r){
+  const c=r.chance??0;
+  if(!c)return'—';
+  if(r.decay)return`~${(1000/c/30).toFixed(1)}s life`;
+  return`~${Math.round(perSec(c)*100)}%/s`;
+}
+
+/* ================= tabs ================= */
+document.querySelectorAll('nav.tabs button').forEach(b=>{
+  b.addEventListener('click',()=>{
+    activeTab=b.dataset.tab;
+    document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
+    document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
+    if(mat&&rx)renderAll();
+  });
+});
+function gotoReactions(filter){
+  $('#rxFilter').value=filter;
+  document.querySelector('nav.tabs button[data-tab=reactions]').click();
+}
+function gotoMaterial(id){
+  $('#matFilter').value=id;
+  document.querySelector('nav.tabs button[data-tab=materials]').click();
+}
+
+/* ================= render: materials ================= */
+function renderMaterials(){
+  const body=$('#matBody');body.innerHTML='';
+  const q=$('#matFilter').value.trim().toLowerCase();
+  mat.materials.forEach((m,i)=>{
+    if(q&&!(m.id.toLowerCase().includes(q)||m.class.includes(q)||(m.tags||[]).some(t=>t.includes(q))))return;
+    body.append(matRow(m,i));
+  });
+}
+function matRow(m,i){
+  const tr=el('tr');
+  tr.append(el('td',{class:'idx',title:'GPU material ID'},String(i+1)));
+
+  // colors
+  const sw=el('div',{class:'swatches'});
+  (m.colors||[]).forEach((c,ci)=>{
+    const inp=el('input',{type:'color',title:'variant '+ci});inp.value=c;
+    inp.addEventListener('input',()=>{m.colors[ci]=inp.value;touch('mat');});
+    sw.append(inp);
+  });
+  tr.append(el('td',{},sw));
+
+  // id (rename cascades to references)
+  const idInp=el('input',{class:'cell id',value:m.id,spellcheck:'false'});
+  idInp.addEventListener('change',()=>{
+    const nv=idInp.value.trim();
+    if(!nv||nv===m.id){idInp.value=m.id;return;}
+    if(ids().includes(nv)){toast(`id "${nv}" already exists`,true);idInp.value=m.id;return;}
+    const old=m.id;m.id=nv;
+    const n=renameRefs(old,nv);
+    if(n)touch('rx');
+    touch('mat');renderAll();
+    toast(`renamed ${old} → ${nv}${n?` (${n} references updated)`:''}`);
+  });
+  tr.append(el('td',{},idInp));
+
+  // class
+  const cls=el('select',{class:'cell class-'+m.class});
+  CLASSES.forEach(c=>cls.append(el('option',{value:c},c)));
+  cls.value=m.class;
+  cls.addEventListener('change',()=>{m.class=cls.value;cls.className='cell class-'+cls.value;touch('mat');});
+  tr.append(el('td',{},cls));
+
+  tr.append(el('td',{},bindNum(m,'density','mat',{min:0})));
+  tr.append(el('td',{},bindNum(m,'hardness','mat',{min:0,max:255})));
+  tr.append(el('td',{},bindNum(m,'emission','mat',{min:0,max:255,ph:'0'})));
+  tr.append(el('td',{},bindNum(m,'opacity','mat',{min:0,max:255,ph:'—'})));
+  tr.append(el('td',{},bindNum(m,'moveEvery','mat',{min:1,ph:'1'})));
+  tr.append(el('td',{},bindCheck(m,'opaque','mat')));
+  tr.append(el('td',{},bindCheck(m,'wanders','mat')));
+  tr.append(el('td',{},matSelect(m,'rubble','mat',{none:'—'})));
+  tr.append(el('td',{},matSelect(m,'molten','mat',{none:'(vapor)'})));
+
+  // tags
+  const chips=el('div',{class:'chips'});
+  (m.tags||[]).forEach((t,ti)=>{
+    const x=el('b',{title:'remove'},'×');
+    x.addEventListener('click',()=>{m.tags.splice(ti,1);touch('mat');renderAll();});
+    chips.append(el('span',{class:'chip'},t,x));
+  });
+  const tagIn=el('input',{placeholder:'+tag',list:'dl-tags',spellcheck:'false'});
+  tagIn.addEventListener('keydown',e=>{
+    if(e.key==='Enter'&&tagIn.value.trim()){
+      m.tags=m.tags||[];
+      if(!m.tags.includes(tagIn.value.trim()))m.tags.push(tagIn.value.trim());
+      touch('mat');renderAll();
+    }
+  });
+  tagIn.addEventListener('change',()=>{ // datalist click
+    if(tagIn.value.trim()){m.tags=m.tags||[];if(!m.tags.includes(tagIn.value.trim()))m.tags.push(tagIn.value.trim());touch('mat');renderAll();}
+  });
+  chips.append(tagIn);
+  tr.append(el('td',{},chips));
+
+  // rx count
+  const n=rxTouching(m).length;
+  const a=el('a',{class:'rxcount',title:'show reactions touching '+m.id},n||'·');
+  a.addEventListener('click',()=>gotoReactions(m.id));
+  tr.append(el('td',{},a));
+
+  // actions
+  const dup=el('button',{class:'icon',title:'duplicate (appends at end)'},'⧉');
+  dup.addEventListener('click',()=>{
+    const c=structuredClone(m);
+    let nn=m.id+'_copy',k=2;while(ids().includes(nn))nn=m.id+'_copy'+k++;
+    c.id=nn;mat.materials.push(c);touch('mat');renderAll();
+    toast('duplicated as '+nn+' (id# '+mat.materials.length+')');
+  });
+  const del=el('button',{class:'icon danger',title:'delete'},'✕');
+  del.addEventListener('click',()=>{
+    const last=i===mat.materials.length-1;
+    const refs=countRefs(m.id);
+    let msg=`Delete "${m.id}"?`;
+    if(!last)msg+=`\n\n⚠ NOT the last entry: every material after it shifts down one GPU ID. Worldgen, world.h and saved worlds assume the current order.`;
+    if(refs)msg+=`\n⚠ ${refs} reaction reference(s) will dangle.`;
+    if(confirm(msg)){mat.materials.splice(i,1);touch('mat');renderAll();}
+  });
+  const info=el('button',{class:'icon',title:'comment'},m.comment?'✎':'…');
+  tr.append(el('td',{},el('div',{style:'display:flex;gap:2px'},info,dup,del)));
+
+  // details row (comment)
+  const dtr=el('tr',{class:'details-row',style:'display:none'});
+  const dtd=el('td',{colspan:'16'});
+  const ta=el('textarea',{style:'width:100%;min-height:44px;background:#12161e;border:1px solid #262e3c;border-radius:5px;color:var(--dim);font-family:var(--mono);font-size:12px;padding:6px;resize:vertical',placeholder:'comment for this material (stored in JSON)'});
+  ta.value=m.comment||'';
+  ta.addEventListener('input',()=>{if(ta.value.trim())m.comment=ta.value;else delete m.comment;touch('mat');});
+  dtd.append(ta);dtr.append(dtd);
+  info.addEventListener('click',()=>{dtr.style.display=dtr.style.display==='none'?'':'none';});
+
+  const frag=document.createDocumentFragment();frag.append(tr,dtr);return frag;
+}
+
+/* ================= render: reactions ================= */
+function ruleKind(r){return r.decay?'decay':r.emit!==undefined?'emit':'pair';}
+function renderReactions(){
+  const host=$('#rxList');host.innerHTML='';
+  const q=$('#rxFilter').value.trim().toLowerCase();
+  const qTags=q&&mat.materials.find(m=>m.id===q)?new Set((mat.materials.find(m=>m.id===q).tags||[]).map(t=>'tag:'+t)):null;
+  let shownRuleIdx=0;
+  rx.reactions.forEach((r,i)=>{
+    if(r.self===undefined&&r.note!==undefined){host.append(noteRow(r,i,q));return;}
+    shownRuleIdx++;
+    const hay=[r.self,r.neighbor,r.becomes,r.selfBecomes,r.neighborBecomes,r.emit].filter(Boolean).join(' ').toLowerCase();
+    const match=!q||hay.includes(q)||(qTags&&(qTags.has(r.neighbor)));
+    host.append(ruleRow(r,i,shownRuleIdx,!match));
+  });
+  refreshDatalists();
+}
+function noteRow(r,i,q){
+  const wrap=el('div',{class:'rxnote'+(q?' hidden':'')});
+  const ta=el('textarea',{rows:'1',spellcheck:'false'});
+  ta.value=r.note;
+  const fit=()=>{ta.style.height='auto';ta.style.height=ta.scrollHeight+'px';};
+  ta.addEventListener('input',()=>{r.note=ta.value;touch('rx');fit();});
+  requestAnimationFrame(fit);
+  const del=el('button',{class:'icon danger',title:'delete note'},'✕');
+  del.addEventListener('click',()=>{if(confirm('Delete this note?')){rx.reactions.splice(i,1);touch('rx');renderReactions();}});
+  wrap.append(ta,rowMoveButtons(i),del);
+  return wrap;
+}
+function rowMoveButtons(i){
+  const box=el('div',{class:'rxactions'});
+  const up=el('button',{class:'icon',title:'move up'},'↑');
+  const dn=el('button',{class:'icon',title:'move down'},'↓');
+  up.disabled=i===0;dn.disabled=i===rx.reactions.length-1;
+  up.addEventListener('click',()=>{[rx.reactions[i-1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i-1]];touch('rx');renderReactions();});
+  dn.addEventListener('click',()=>{[rx.reactions[i+1],rx.reactions[i]]=[rx.reactions[i],rx.reactions[i+1]];touch('rx');renderReactions();});
+  box.append(up,dn);
+  return box;
+}
+function ruleRow(r,i,num,hidden){
+  const kind=ruleKind(r);
+  const row=el('div',{class:'rxrule kind-'+kind+(hidden?' hidden':'')});
+  row.append(el('div',{class:'n'},String(num)));
+
+  // self
+  const selfF=el('div',{class:'f'},el('span',{},'self'));
+  selfF.append(matSelect(r,'self','rx',{}));
+  row.append(selfF);
+
+  // kind switch
+  const kindF=el('div',{class:'f'},el('span',{},'type'));
+  const ks=el('select',{});
+  [['pair','+ neighbor'],['decay','decay'],['emit','emit']].forEach(([v,l])=>ks.append(el('option',{value:v},l)));
+  ks.value=kind;
+  ks.addEventListener('change',()=>{
+    const keep={self:r.self,chance:r.chance??100,note:r.note};
+    for(const k of Object.keys(r))delete r[k];
+    if(keep.note!==undefined)r.note=keep.note;
+    r.self=keep.self;
+    if(ks.value==='decay'){r.decay=true;r.chance=keep.chance;r.becomes='air';}
+    else if(ks.value==='emit'){r.emit=ids()[0]||'fire';r.dir='up';r.chance=keep.chance;}
+    else{r.neighbor='any';r.chance=keep.chance;r.selfBecomes='air';}
+    touch('rx');renderReactions();
+  });
+  kindF.append(ks);
+  row.append(kindF);
+
+  // middle fields per kind
+  const mid=el('div',{class:'mid'});
+  const field=(label,node)=>el('div',{class:'f'},el('span',{},label),node);
+  const dirSel=()=>{
+    const s=el('select',{});
+    s.append(el('option',{value:''},'any'));
+    DIRS.forEach(d=>s.append(el('option',{value:d},d)));
+    s.value=r.dir??'';
+    s.addEventListener('change',()=>{if(s.value==='')delete r.dir;else r.dir=s.value;touch('rx');});
+    return s;
+  };
+  if(kind==='pair'){
+    const nb=el('input',{class:'nb',list:'dl-neighbor',value:r.neighbor??'',spellcheck:'false',placeholder:'id / tag:x / any'});
+    nb.addEventListener('change',()=>{r.neighbor=nb.value.trim();touch('rx');});
+    mid.append(field('neighbor',nb),field('dir',dirSel()));
+    mid.append(el('div',{class:'arrow'},'→'));
+    mid.append(field('self becomes',matSelect(r,'selfBecomes','rx',{none:'(keep)',extra:['air']})));
+    mid.append(field('nbr becomes',matSelect(r,'neighborBecomes','rx',{none:'(keep)',extra:['air']})));
+  }else if(kind==='decay'){
+    mid.append(el('div',{class:'arrow'},'→'));
+    mid.append(field('becomes',matSelect(r,'becomes','rx',{extra:['air']})));
+  }else{ // emit
+    mid.append(field('emit',matSelect(r,'emit','rx',{})));
+    mid.append(field('dir',dirSel()));
+    mid.append(field('self becomes',matSelect(r,'selfBecomes','rx',{none:'(keep)',extra:['air']})));
+  }
+  row.append(mid);
+
+  // chance
+  const cw=el('div',{class:'chancewrap'});
+  const sub=el('div',{class:'sub'},chanceHint(r));
+  const ci=bindNum(r,'chance','rx',{min:1,max:1000,oninput:()=>{sub.textContent=chanceHint(r);}});
+  ci.classList.remove('cell');
+  cw.append(el('div',{class:'f'},el('span',{},'chance ‰'),ci),sub);
+  row.append(cw);
+
+  // actions
+  const acts=el('div',{class:'rxactions'});
+  acts.append(rowMoveButtons(i));
+  const more=el('button',{class:'icon',title:'note / neighborClass'},r.note||r.neighborClass?'✎':'…');
+  const dup=el('button',{class:'icon',title:'duplicate below'},'⧉');
+  dup.addEventListener('click',()=>{rx.reactions.splice(i+1,0,structuredClone(r));touch('rx');renderReactions();});
+  const del=el('button',{class:'icon danger',title:'delete'},'✕');
+  del.addEventListener('click',()=>{rx.reactions.splice(i,1);touch('rx');renderReactions();});
+  acts.append(more,dup,del);
+  row.append(acts);
+
+  // details
+  const det=el('div',{class:'rxdetails',style:'display:none'});
+  const ta=el('textarea',{placeholder:'note for this rule (stored in JSON)',spellcheck:'false'});
+  ta.value=r.note||'';
+  ta.addEventListener('input',()=>{if(ta.value.trim())r.note=ta.value;else delete r.note;touch('rx');});
+  det.append(el('div',{class:'f'},el('span',{},'note'),ta));
+  if(kind==='pair'){
+    const box=el('div',{class:'ncbox'});
+    box.append(el('span',{style:'text-transform:uppercase;font-size:10px;letter-spacing:.5px;color:var(--faint)'},'neighborClass'));
+    CLASSES.forEach(c=>{
+      const cb=el('input',{type:'checkbox'});
+      cb.checked=(r.neighborClass||[]).includes(c);
+      cb.addEventListener('change',()=>{
+        let a=r.neighborClass||[];
+        if(cb.checked)a.push(c);else a=a.filter(x=>x!==c);
+        if(a.length)r.neighborClass=a;else delete r.neighborClass;
+        touch('rx');
+      });
+      box.append(el('label',{style:'display:flex;gap:4px;align-items:center;cursor:pointer'},cb,c));
+    });
+    det.append(box);
+  }
+  more.addEventListener('click',()=>{det.style.display=det.style.display==='none'?'':'none';});
+  row.append(det);
+  return row;
+}
+function refreshDatalists(){
+  let dl=$('#dl-neighbor');if(!dl){dl=el('datalist',{id:'dl-neighbor'});document.body.append(dl);}
+  dl.innerHTML='';
+  dl.append(el('option',{value:'any'}));
+  allTags().forEach(t=>dl.append(el('option',{value:'tag:'+t})));
+  ids().forEach(id=>dl.append(el('option',{value:id})));
+  let dt=$('#dl-tags');if(!dt){dt=el('datalist',{id:'dl-tags'});document.body.append(dt);}
+  dt.innerHTML='';allTags().forEach(t=>dt.append(el('option',{value:t})));
+}
+
+/* ================= render: overview ================= */
+function ruleSentence(r,selfId){
+  const span=(cls,txt)=>`<span class="${cls}">${txt}</span>`;
+  const name=x=>x?.startsWith?.('tag:')?span('tag',x):span('mat',x||'?');
+  const pct=` <span class="pct">${r.chance??'?'}‰ ${chanceHint(r)}</span>`;
+  const arr=span('arr',' → ');
+  if(r.decay)return`${name(r.self)} decays${arr}${name(r.becomes)}${pct}`;
+  if(r.emit!==undefined)return`${name(r.self)} emits ${name(r.emit)}${r.dir?` (${r.dir})`:''}${r.selfBecomes?arr+name(r.selfBecomes):''}${pct}`;
+  const prod=[];
+  if(r.selfBecomes)prod.push(`self${arr}${name(r.selfBecomes)}`);
+  if(r.neighborBecomes)prod.push(`nbr${arr}${name(r.neighborBecomes)}`);
+  const nc=r.neighborClass?` [${r.neighborClass.join('/')}]`:'';
+  return`${name(r.self)} + ${name(r.neighbor)}${nc}${r.dir?` (${r.dir})`:''}: ${prod.join(', ')||'?'}${pct}`;
+}
+function renderOverview(){
+  const host=$('#ovCards');host.innerHTML='';
+  const q=$('#ovFilter').value.trim().toLowerCase();
+  mat.materials.forEach((m,i)=>{
+    if(q&&!(m.id.toLowerCase().includes(q)||m.class.includes(q)||(m.tags||[]).some(t=>t.includes(q))))return;
+    const card=el('div',{class:'mcard'});
+    const sw=el('span',{class:'sw'},(m.colors||[]).map(c=>{const s=el('i');s.style.background=c;return s;}));
+    const h=el('h3',{title:'edit in Materials tab'},sw,m.id,el('span',{style:'color:var(--faint);font-weight:400;font-size:11px'},'#'+(i+1)));
+    h.addEventListener('click',()=>gotoMaterial(m.id));
+    card.append(h);
+    const bits=[`<b class="class-${m.class}">${m.class}</b>`,`ρ <b>${m.density??'?'}</b>`,`hard <b>${m.hardness??'?'}</b>`];
+    if(m.emission)bits.push(`glow <b>${m.emission}</b>`);
+    if(m.opacity)bits.push(`opac <b>${m.opacity}</b>`);
+    if(m.moveEvery)bits.push(`visc <b>1/${m.moveEvery}</b>`);
+    if(m.opaque)bits.push('<b>opaque</b>');
+    if(m.wanders)bits.push('<b>wanders</b>');
+    if(m.rubble)bits.push(`rubble→<b>${m.rubble}</b>`);
+    bits.push(`molten→<b>${m.molten??'vapor'}</b>`);
+    if(m.tags?.length)bits.push('['+m.tags.join(', ')+']');
+    const props=el('div',{class:'props'});props.innerHTML=bits.join(' &nbsp; ');
+    card.append(props);
+    const touching=rxTouching(m);
+    if(!touching.length)card.append(el('div',{class:'none'},'inert — no reactions'));
+    else{
+      const ul=el('ul');
+      const mark={self:'▸',nbr:'◂',out:'⇢'};
+      for(const [r,as] of touching){
+        const li=el('li',{title:{self:'acts as self',nbr:'matched as neighbor',out:'produced by this rule'}[as]});
+        li.innerHTML=`<span class="as">${mark[as]}</span>`+ruleSentence(r,m.id);
+        ul.append(li);
+      }
+      card.append(ul);
+    }
+    host.append(card);
+  });
+}
+
+/* ================= validation ================= */
+let valTimer=null;
+function validateSoon(){clearTimeout(valTimer);valTimer=setTimeout(validate,300);}
+function validate(){
+  if(!mat||!rx)return;
+  const issues=[];
+  const err=(m)=>issues.push(['err',m]),warn=(m)=>issues.push(['warn',m]);
+  const idset=new Set(),tags=new Set(allTags());
+  mat.materials.forEach((m,i)=>{
+    const at=`materials[${i}] "${m.id}"`;
+    if(!m.id)err(`${at}: missing id`);
+    else if(idset.has(m.id))err(`${at}: duplicate id`);
+    idset.add(m.id);
+    if(!CLASSES.includes(m.class))err(`${at}: bad class "${m.class}"`);
+    if(m.density==null)warn(`${at}: missing density`);
+    if(!Array.isArray(m.colors)||m.colors.length!==3)err(`${at}: needs exactly 3 colors`);
+    else m.colors.forEach(c=>{if(!/^#[0-9a-fA-F]{6}$/.test(c))err(`${at}: bad color "${c}"`);});
+    if(m.rubble&&!idset.has(m.rubble)&&!ids().includes(m.rubble))err(`${at}: rubble "${m.rubble}" is not a material`);
+    if(m.molten&&!ids().includes(m.molten))err(`${at}: molten "${m.molten}" is not a material`);
+  });
+  const validRef=x=>x==='air'||idset.has(x);
+  const decaySum={};
+  rx.reactions.forEach(r=>{if(r.self!==undefined&&r.decay)decaySum[r.self]=(decaySum[r.self]||0)+(r.chance||0);});
+  let n=0;
+  rx.reactions.forEach((r,i)=>{
+    if(r.self===undefined)return;
+    n++;
+    const at=`reaction #${n} (${r.self})`;
+    if(!idset.has(r.self))err(`${at}: self "${r.self}" is not a material`);
+    if(r.chance==null)err(`${at}: missing chance`);
+    else if(r.chance<1||r.chance>1000)err(`${at}: chance ${r.chance} outside 1..1000‰`);
+    const kind=ruleKind(r);
+    if(kind==='decay'){
+      if(!validRef(r.becomes))err(`${at}: becomes "${r.becomes}" unknown`);
+    }else if(kind==='emit'){
+      if(!idset.has(r.emit))err(`${at}: emit "${r.emit}" unknown`);
+      if(r.selfBecomes&&!validRef(r.selfBecomes))err(`${at}: selfBecomes "${r.selfBecomes}" unknown`);
+      if(r.emit===r.self&&!(decaySum[r.self]>0))warn(`${at}: self-emitting with NO decay rule — chunks will never sleep (CLAUDE.md rule 2)`);
+      else if(r.emit===r.self&&(r.chance||0)>=(decaySum[r.self]||0)*8)warn(`${at}: self-emit ${r.chance}‰ vs decay Σ${decaySum[r.self]}‰ — check growth stays subcritical`);
+    }else{
+      const nb=r.neighbor;
+      if(!nb)err(`${at}: pair rule missing neighbor`);
+      else if(nb!=='any'&&!idset.has(nb)&&!(nb.startsWith('tag:')&&tags.has(nb.slice(4))))
+        err(`${at}: neighbor "${nb}" matches nothing (no such material/tag)`);
+      if(!r.selfBecomes&&!r.neighborBecomes)warn(`${at}: pair rule with no product — has no effect`);
+      if(r.selfBecomes&&!validRef(r.selfBecomes))err(`${at}: selfBecomes "${r.selfBecomes}" unknown`);
+      if(r.neighborBecomes&&!validRef(r.neighborBecomes))err(`${at}: neighborBecomes "${r.neighborBecomes}" unknown`);
+      if(r.neighborClass&&r.neighborClass.some(c=>!CLASSES.includes(c)))err(`${at}: bad neighborClass`);
+    }
+  });
+  const body=$('#valbody');body.innerHTML='';
+  const ne=issues.filter(x=>x[0]==='err').length,nw=issues.length-ne;
+  const c=$('#valcount');
+  if(!issues.length){c.textContent='✓ no issues';c.className='count ok';}
+  else{
+    c.textContent=`${ne?ne+' error'+(ne>1?'s':''):''}${ne&&nw?', ':''}${nw?nw+' warning'+(nw>1?'s':''):''}`;
+    c.className='count '+(ne?'err':'warn');
+  }
+  issues.forEach(([lv,m])=>body.append(el('div',{class:'vmsg '+lv},(lv==='err'?'✕ ':'⚠ ')+m)));
+}
+$('#valhead').addEventListener('click',()=>$('#valbar').classList.toggle('open'));
+
+/* ================= global render / wiring ================= */
+function renderAll(){
+  if(!mat||!rx)return;
+  if(activeTab==='overview')renderOverview();
+  else if(activeTab==='materials')renderMaterials();
+  else renderReactions();
+  refreshDatalists();
+  validate();
+}
+$('#btnOpen').addEventListener('click',openFolder);
+$('#btnReload').addEventListener('click',async()=>{
+  if((dirty.mat||dirty.rx)&&!confirm('Discard unsaved changes and reload from disk?'))return;
+  await loadFromHandles();updatePills();toast('reloaded from disk');
+});
+$('#btnSave').addEventListener('click',saveAll);
+$('#btnCopy').addEventListener('click',saveCopy);
+$('#btnFallback').addEventListener('click',()=>$('#fileInput').click());
+$('#fileInput').addEventListener('change',e=>fallbackLoad(e.target.files));
+document.addEventListener('dragover',e=>e.preventDefault());
+document.addEventListener('drop',e=>{e.preventDefault();if(e.dataTransfer.files.length)fallbackLoad(e.dataTransfer.files);});
+document.addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();saveAll();}
+});
+$('#matFilter').addEventListener('input',renderMaterials);
+$('#rxFilter').addEventListener('input',renderReactions);
+$('#ovFilter').addEventListener('input',renderOverview);
+$('#btnAddMat').addEventListener('click',()=>{
+  let id='new_material',k=2;while(ids().includes(id))id='new_material'+k++;
+  mat.materials.push({id,class:'powder',density:1000,hardness:12,colors:['#888888','#7d7d7d','#949494'],tags:[]});
+  $('#matFilter').value='';touch('mat');renderMaterials();
+  toast('added '+id+' at id# '+mat.materials.length);
+});
+$('#btnAddRule').addEventListener('click',()=>{
+  rx.reactions.push({self:ids()[0]||'stone',neighbor:'any',chance:100,selfBecomes:'air'});
+  $('#rxFilter').value='';touch('rx');renderReactions();
+  window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
+});
+$('#btnAddNote').addEventListener('click',()=>{
+  rx.reactions.push({note:'-------- new section --------'});
+  $('#rxFilter').value='';touch('rx');renderReactions();
+  window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
+});
+</script>
+</body>
+</html>

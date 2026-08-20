@@ -38,9 +38,11 @@ renderer needs its own, cheaper representation of everything beyond it.
 
 ## 3. Design
 
-K = 6 cascade levels around the residency window. Level k (1-based) has cells
-of 2^k fine voxels and a box edge of 2^k window edges, so the outermost
-half-extent is **64× the window radius** at any voxel scale. At the current
+K cascade levels around the residency window (6 at phase 1; **8 since phase
+4**, the ceiling the default WebGPU storage-binding limit allows). Level k
+(1-based) has cells of 2^k fine voxels and a box edge of 2^k window edges, so
+the outermost half-extent is **2^K× the window radius** at any voxel scale —
+256× = 2048 m at the current 6.25 cm voxels. At the current
 kVoxelMeters = 0.7 (window edge 179 m):
 
 | level | cell size | box edge | half-extent from player |
@@ -212,9 +214,79 @@ becomes `farCount`; `RenderParams` spare `_p1` becomes `fogDensity`.
      camera at (140,130,140) whose frame is mostly cascade. The standard
      `screenshot.bmp` looks down at the near forest and shows almost no far
      field, so it could not have caught any of this.
-4. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
-   shows in profiles; cascade persistence alongside region files; distant
-   prop baking.
+4. **Distance look — IMPLEMENTED (2026-08-19).** The v0.5.4 far field was
+   structurally sound but visually dismal: a milky white-out past ~150 m (fog
+   pinned to a 512 m horizon), distant hills reading as gray stone with green
+   contour stripes, and flat unshadowed shading that made LOD terrain look
+   like a different (worse) world than the near field. Survey of shipped
+   microvoxel engines (Teardown frame breakdowns, Dwyer's Octo, Distant
+   Horizons/Voxy, GigaVoxels/ESVO lineage) says the seam artifact that
+   matters is SHADING consistency, not geometry. Changes:
+   - **kFarLevels 6 → 8**: horizon 512 m → 2048 m. farVox is now 128 MiB —
+     exactly the WebGPU default maxStorageBufferBindingSize, so this is the
+     ceiling without raising limits. Fog pin follows automatically
+     (kFarFogDensity derives from kFarLevels): density fell 4×, which is what
+     actually removed the white-out.
+   - **Surface skin (worldgen.wgsl `farSurfaceMat`)**: cell shape still comes
+     from the center sample, but the topmost solid cell of a column
+     (center ≤ h < center + 2^k — NOT "span contains h", which misses half of
+     all surface cells) recolors with `genCell(x, h, z)` — the 1-voxel
+     grass/sand/snow skin a coarse center sample almost never hits. Shared
+     verbatim by `far` and `fardown`, preserving their agreement invariant
+     (the skin lookup is pristine-procgen on both sides; an edited chunk's
+     rim keeps a slightly stale skin color while its center voxel survives —
+     invisible at cascade distances, unlike a seam).
+   - **Canopy flattening (`treeCanopyAt`)**: at levels ≥ 5 (cells 2 m+), a
+     surface cell under a tree crown's XZ footprint takes the leaf material —
+     the "flatten props into the macro chunk" trick; distant forest keeps its
+     canopy color after individual trees stop surviving the sieve.
+   - **Far shading (raymarch.wgsl)**: same constants as the near field, plus
+     `farShadowed` — one occupancy-skipped DDA toward the sun at the hit's
+     own level, SOFT (lambert ×0.3): a debug-tint pass showed the casters are
+     mostly single-cell terrace steps, and a hard shadow term renders as
+     ant-trail speckle. One-sample AO from the cell above; palette jitter
+     re-keyed to a fixed ~0.5 m world frequency (per-cell keying flattened
+     coarse cells into single-color slabs); sky reflection on water top faces.
+   - **Aerial perspective (`applyAerial`)**: fog converges surfaces exactly to
+     `skyColor(rd)`; the old `×0.9` target kept every distant surface slightly
+     darker than the sky behind it — the "gray veil" look.
+   - **Sun lowered to ~41°** (main.cpp): at 52° shadows were 1–2 cells long
+     and the world lit flat.
+   - **`--shot` mode (main.cpp `RunShots`)**: worldgen + cascade fill +
+     3 standard screenshots in ~15 s, for look iteration without the full
+     selftest. `screenshot_ground.bmp` (eye-height, horizon in frame) joined
+     the selftest captures — the elevated shots kept hiding first-person
+     artifacts.
+   - Verified: full selftest PASS, world hash bit-identical with all of the
+     above on (d936c328) — the sim is untouched by construction. 1080p
+     shadows-on 5.2 ms/frame (193 fps) on the RTX 3060 Ti.
+5. **512³ residency window + far-grid decoupling — IMPLEMENTED (2026-08-19).**
+   The simulated world doubled to 32 m per edge (kWorldN = 512; voxels buffer
+   512 MiB — exactly the storage limits context.cpp requests, and the ceiling
+   without raising them). The cascades moved onto their OWN kFarN = 256 grid
+   (`FAR_*` prelude constants; `farCellIndexG`/`farChunkIndexG`/`farInBox`/
+   `farSlotToChunk` in common.wgsl; kFarNChunk-based math in farfield.cpp):
+   level k cells span 2^(k + kFarShiftBase) fine voxels, the shift base pinned
+   so a level's box edge is always 2^k WINDOW edges. Consequences: cascade
+   memory stays 128 MiB whatever the window size, every cascade distance
+   scales with the window (outermost half-extent now 4096 m), and reverting
+   kWorldN to 256 reproduces the old geometry exactly (shift base 0). The
+   `far downsample` gate re-derives farVox indices with far-grid math and
+   paints radius 12 so the 3×3×3 level-1 cell block (cells are now 4 fine
+   voxels) stays covered. The sleep gate's settle budget became adaptive
+   (tick until quiet, hard cap 3000) — 8× the resident content legitimately
+   needs more than the fixed 500 ticks tuned for 256³. Selftest PASS end to
+   end at 512³: sleep 0/32768 after ~500 ticks (with the disc-pond worldgen
+   rework that replaced leaking basin-contour ponds), 1080p shadows-on
+   8.8 ms/frame (114 fps) on the RTX 3060 Ti.
+6. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
+   shows in profiles — the strongest structural win per the survey (ESVO-style
+   low-res conservative pre-pass; also lets near-field-occluded pixels skip
+   the far march entirely); cascade persistence alongside region files;
+   ray-guided fill priority (GigaVoxels-style usage feedback through the
+   existing async readback ring); water-surface flattening in the sieve
+   (shoreline terrace rings come from the per-column water table, not the
+   renderer).
 
 ## 6. Known accepted limitations (phase 1)
 

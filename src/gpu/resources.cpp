@@ -48,10 +48,17 @@ std::string ShaderConstantPrelude() {
   o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
   o << "const CELLOP_IF_AIR : u32 = 0x" << std::hex << kCellOpIfAir << std::dec
     << "u;\n";
-  // Far-field cascades (render-only LOD, DESIGN.md §9). WORLD_VOX is the cell
-  // count of one 256^3 volume (fits u32; kFarLevels * WORLD_VOX < 2^32).
+  // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
+  // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
+  // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).
   o << "const FAR_LEVELS : u32 = " << kFarLevels << "u;\n";
-  o << "const WORLD_VOX : u32 = " << (uint32_t)kVoxelCount << "u;\n";
+  o << "const FAR_N : u32 = " << kFarN << "u;\n";
+  o << "const FAR_NCHUNK : u32 = " << kFarNChunk << "u;\n";
+  o << "const FAR_NUM_CHUNKS : u32 = " << kFarNumChunks << "u;\n";
+  o << "const FAR_VOX : u32 = " << kFarVox << "u;\n";
+  o << "const FAR_MASK : i32 = " << (kFarN - 1) << ";\n";
+  o << "const FAR_NCHUNK_MASK : i32 = " << (kFarNChunk - 1) << ";\n";
+  o << "const FAR_SHIFT_BASE : u32 = " << kFarShiftBase << "u;\n";
   // Render-only: the sim never reads it, so voxel state stays integer and
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);

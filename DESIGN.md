@@ -342,6 +342,14 @@ neighbors, so this needs an explicit connectivity pass:
 - **Chunk-face acceleration**: per-chunk `faceOccupancy` flags let the fill run
   per-voxel only in chunks touched by the destruction, then continue at
   chunk-face granularity beyond — orders of magnitude cheaper.
+- **Region-exit test (2026-08-19):** a component reaching the scan region's
+  boundary is only *anchored* when the structure genuinely continues outside —
+  i.e. the cell just past the boundary face is itself solid/powder. Treating any
+  boundary contact as anchored (the original rule) meant nothing taller than the
+  scan box could ever fall: a tree at the 64³ support-margin region always grazed
+  a face, so felling one produced no body at all, while its dithered crown rim
+  became sub-8 "islands" that were deleted. Unknown/unfetched cells and the
+  residency edge read as solid, so the conservative direction is unchanged.
 - Known accepted flaw: large floating sections can survive. Ship it; revisit.
 
 ### Rigidbodies
@@ -352,6 +360,18 @@ neighbors, so this needs an explicit connectivity pass:
   remain destructible: damaging a body re-runs marching cubes and can split it.
 - **Two-way handoff**: islands under ~8 voxels don't become bodies — they convert
   to their powder-equivalent material and drop back into the CA as rubble.
+- **Body-worthiness budget (2026-08-19):** a rigidbody is expensive and
+  permanent (compound-shape build up front, then broadphase + terrain-mesh
+  upkeep every tick until it settles), while loose voxels in the CA are nearly
+  free. So bodies are rationed, not granted to every loose component: at most
+  `kMaxNewBodiesPerScan` per island scan and `kMaxNewBodiesPerTick` per tick
+  across all shatter, with components taken **largest first** so the tree earns
+  the body and the twigs fall back to rubble rather than scan order deciding.
+  Anything over budget or under the size floor goes back to the grid as rubble
+  or ballistic particles, which reads the same on screen and costs nothing.
+  This is rule #2 (cost scales with activity) applied to the CPU side: without
+  it, one burning forest converts an unbounded amount of the world into Jolt
+  bodies and the frame time collapses.
 - **Settle-back (2026-08-19, implemented):** the reverse handoff. A body asleep
   for 2 s whose rotation is within ~20° of a signed-permutation orientation
   snaps to the lattice and stamps its voxels back into the grid as exact-cell
@@ -382,12 +402,21 @@ neighbors, so this needs an explicit connectivity pass:
   emit fire ops).
 - **Body shatter (2026-08-19, implemented):** when burn removals disconnect a
   body's voxels, `ShatterBody` splits it: the largest 6-connected component
-  keeps the body, fragments ≥ 8 voxels become bodies of their own at the same
-  pose with inherited momentum (parent collider rebuilt immediately so its
-  ghost boxes don't fight the new body), and smaller clumps re-enter the world
-  as **ballistic particles** at their world positions with the body's rigid
-  point velocity (`lin + ang × r`) — break a body enough and it just turns
-  back into loose voxels. A body burned/broken below 8 voxels dissolves the
+  keeps the body, fragments ≥ `kMinBurnFragmentVoxels` (24) become bodies of
+  their own at the same pose with inherited momentum while the per-tick body
+  budget allows (parent collider rebuilt immediately so its ghost boxes don't
+  fight the new body), and everything else re-enters the world as **ballistic
+  particles** at their world positions with the body's rigid point velocity
+  (`lin + ang × r`) — break a body enough and it just turns back into loose
+  voxels. Burn fragments face a much higher bar than fresh islands (24 vs 8) for
+  a specific reason: a body disintegrating in a fire re-fragments every few
+  ticks and each fragment that earns a body re-fragments in turn, so the low
+  threshold made one burning tree recurse into hundreds of tiny bodies that
+  chugged the CPU. Charred bits falling off a burning object read as embers
+  anyway, so below the bar they stay in the CA. The connectivity flood is O(n)
+  per body, so it runs batched — every `min(6, n/16)` voxels shed, i.e.
+  immediately for small bodies (a clump must detach before the remainder burns
+  under the dissolve floor) and amortized for large ones. A body burned/broken below 8 voxels dissolves the
   same way (only when it actually lost voxels that pass — small split halves
   and mob hands are legitimate bodies and persist). CPU-authored spawns ride a
   new per-tick `spawnOps` stream consumed by `sim_particle.wgsl spawn`, which
@@ -406,6 +435,15 @@ neighbors, so this needs an explicit connectivity pass:
 - **Terrain collision for bodies**: localized marching cubes over the contact
   region to get sloped normals (not box faces), generated on demand, cached per
   chunk until the chunk dirties.
+- **Meshing cost (2026-08-19):** patch rebuilds are the steady-state CPU cost of
+  having bodies at all, so the sampler is not a callback. Occupancy is gathered
+  once into an 18³ bitmask (16 cells + the 1-cell border they read) by walking
+  the ≤27 source chunks directly, turning 32768 `std::function` hops — each into
+  a chunk-cache hash lookup — into 5832 direct reads, after which the polygonizer
+  reads bits out of L1. Output vertices are welded: marching-cubes vertices sit
+  at edge midpoints, i.e. on a half-integer lattice, so identical positions
+  dedupe exactly by integer key with no epsilon compare, and ~4× fewer vertices
+  reach Jolt's `MeshShape` build (the dominant cost of a rebuild).
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
 
@@ -473,8 +511,9 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   `nonEmpty` flags for empty-space skipping — the same flags the physics uses).
   The sim already lives in GPU memory, so the renderer reads it for free.
 - Pipeline: fullscreen ray pass → G-buffer (albedo/normal/depth/material) →
-  deferred lighting. Voxel face normals from the hit axis; optional smoothed
-  normals for liquids.
+  deferred lighting. Voxel face normals from the hit axis; liquids take
+  smoothed normals from the fullness-field gradient instead (see the water
+  section below — implemented).
 - Variant nibble → palette jitter in-shader (stable per-grain color, no reshuffling
   as grains move — exactly why the variant lives in the voxel).
 - Rigidbodies/debris: two options. v1 = raster their marching-cubes meshes,
@@ -485,10 +524,13 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   path. Adopt once bodies carry their voxel payloads (M6).
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
-  toroidal 256³ volumes centered on the player, level k holding one material
-  byte per cell at 2^k-voxel resolution — each level doubles view distance at
-  constant memory (~96 MB total, outermost half-extent ≈ 64× the window
-  radius). Levels are filled on the GPU by sampling `genCell()` at stride
+  toroidal kFarN³ (256³) volumes centered on the player, one material byte per
+  cell. The far grid is DECOUPLED from the window size (phase 5, when the
+  window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
+  the shift base chosen so level k's box edge is always 2^k WINDOW edges —
+  cascade distances scale with the window at constant memory (128 MiB total at
+  kFarLevels = 8; outermost half-extent = 256× the window radius ≈ 4 km at the
+  512³ window and 6.25 cm voxels). Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
   level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field
@@ -508,7 +550,30 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   window without a hit continue through the cascade boxes with the same
   occupancy-skipped DDA in level-cell units; t-ordering (each level starts at
   the previous box's exit) keeps coarse data from ever occluding fine data.
-  Far hits shade with palette + N·L, no shadow rays.
+  **Distance look (phase 4, 2026-08-19):** kFarLevels is 8 (128 MiB farVox —
+  exactly the WebGPU default storage-binding limit; the horizon sits 2 km out
+  at 6.25 cm voxels). Cell COLOR is decoupled from cell SHAPE: shape still
+  comes from the center sample, but a cell that is the topmost solid cell of
+  its column (`farSurfaceMat` in worldgen.wgsl, shared verbatim by sieve and
+  downsample so their outputs stay identical) takes the SURFACE skin material
+  — `genCell` at y = `surfHeightAt(x,z)` — instead of the body material the
+  center sample lands on. Without this every distant hillside read as stone
+  with grass contour stripes, because the grass skin is 1 voxel thick and a
+  coarse center sample almost never hits it. At levels ≥ 5 (cells 2 m+, wider
+  than a tree) surface cells under a crown's XZ footprint take the leaf
+  material instead (`treeCanopyAt`) — trees too thin to survive center
+  sampling are flattened into the terrain, so the far forest keeps its canopy
+  color. Far hits shade with the same palette/face/ambient constants as the
+  near field plus: palette jitter keyed at a fixed ~0.5 m world frequency
+  (not per level cell, which flattened coarse cells into single-color slabs),
+  a one-sample AO from the cell above, sky reflection on distant water top
+  faces, and a SOFT sun-shadow term (`farShadowed`) — one occupancy-skipped
+  DDA toward the sun through the hit's own cascade level, attenuating lambert
+  to 0.3 rather than zero because at cascade resolution most casters are
+  single-cell terrace steps and a hard term reads as speckle noise. Fog is
+  aerial perspective: `applyAerial` converges surfaces exactly to
+  `skyColor(rd)` (the old ×0.9 target left everything hanging slightly darker
+  than the sky it should dissolve into, which read as a gray veil).
   **Transition polish (phase 3):** each handoff — the window→level-1 one and
   every level→level one — is pulled NEARER by a per-pixel hash of the fragment
   coordinate, up to half a cell of the outer level at that seam
@@ -539,6 +604,61 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   capped at `h - 10`, so caves never breach the surface and coarse center
   samples never land in a void — verified by rendering levels 4–6 with fog at
   3% of nominal, which shows solid terrain with no swiss-cheese.
+- **Water as a surface, not fog (implemented 2026-08-19):** translucent liquids
+  were originally shaded purely as participating media — a per-metre tint
+  accumulated along the ray — and that is why a lake read as a flat blue disc
+  painted onto the terrain. An absorbing volume with no interface has no
+  reflection, no glint, no refraction and no depth cue, and no amount of tuning
+  the tint fixes any of those. Liquids now carry BOTH halves: the volume terms
+  (`mediaTau`/`mediaTint`) still accumulate, and `trace()` additionally records
+  where the ray first crossed into liquid (`liqT`/`liqCell`/`liqAxis`) plus the
+  total distance travelled inside it (`liqPath`). `shadeWater()` then builds a
+  real air/water interface there:
+  - **Normal from the fullness field, not the voxel face.** The liquid state
+    nibble is fill level in eighths (§4), so the liquid column height varies
+    cell to cell and its gradient is the true macro slope of the surface —
+    the standard scalar-field-gradient normal, over data the sim already
+    maintains for free. Four taps, and it is what stops a lake looking like
+    tiled glass. Side/bottom faces keep their flat voxel normal (the gradient
+    describes the top surface only).
+  - **Ripples** as a sum of 5 directional wave bands (analytic slope, no
+    texture), each faded out once the per-pixel footprint approaches its
+    wavelength — per-band mip selection done analytically. The footprint must
+    be the screen-space one (distance × pixel angle ÷ grazing cosine): a raw
+    distance term is radial about the camera and visibly stamps concentric
+    rings onto the water.
+  - **Fresnel (Schlick, F0 = 0.0204)** blending reflection against refraction.
+    This is the term that makes water read as wet — 2% head-on and ~100% at
+    grazing across one continuous surface.
+  - **Traced reflection.** The engine already has a DDA, so the reflection is a
+    real secondary ray (step-budgeted, media-blind) rather than a screen-space
+    trace — no missing-information artifacts at screen edges and correct
+    reflections of geometry behind the camera, which is precisely what
+    Teardown's SSR cannot do. Sky fallback, blended across the horizon rather
+    than switched, or the ripples break the surface into per-pixel speckle.
+  - **Per-channel Beer-Lambert absorption** over `liqPath`, in metres, plus an
+    in-scatter floor. Red is absorbed ~9× faster than blue, so shallow reads
+    cyan-green and deep reads blue — the strongest depth cue there is, and
+    structurally impossible with a scalar tint.
+  - **Caustics** from the curvature (divergence of slope) of the long swell
+    bands, projected along the sun direction and applied MULTIPLICATIVELY to
+    the bed. Additive caustics light up the volume and read as glowing blobs
+    floating in the water; multiplicative ones scale the light already landing
+    on the bed, which is what they physically are.
+  - **Sun glint** as a tight specular lobe that gets *tighter* with distance to
+    match the ripple damping, and shoreline foam masked by the ripple field.
+
+  One consequence worth flagging: the media saturation early-out
+  (`MEDIA_TAU_MAX`) is a SMOKE optimization and had to be scoped to gases.
+  Water's authored opacity against the legacy absorption constant saturates
+  after ~2.7 m of path, so any lake deeper than waist height — or any shallow
+  one viewed at a grazing angle — used to terminate the primary ray in
+  mid-water and report no hit, which is the mechanical reason lake beds were
+  invisible. Liquids get their own far looser depth cap instead.
+
+  All of this is render-only float math on render-only data. The sim never
+  reads it and the world hash never covers it, so determinism rule #1 is
+  untouched (it scopes to sim state).
 - Later: emissive materials feeding a cheap GI (light propagation volumes or
   per-chunk flood lighting), volumetrics for gases.
 
@@ -724,6 +844,41 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
 > That silently coupled unrelated scenarios: a worldgen tweak that changed how
 > many islands an earlier test produced re-rolled a later fire. Reset now clears
 > it, making a burn a function of its scenario rather than of history.
+>
+> **Scale, third pass + burning forests (2026-08-19).** The HSCALE=2 world
+> overshot: the verdict in play was "trees are right, everything around them
+> is too big". So the world halved around the trees: `HSCALE` back to 1, hill
+> wavelength AND amplitude halved (band y32..y86 — same slopes, half the
+> size), `TREELINE` 116→72, authored pools 68/32/24-voxel radii (depths kept —
+> a halved lake would be too shallow to swim), ruins 3.5 m huts (the 2 m
+> doorway deliberately NOT halved — it clears the 1.7 m player), spawn deck
+> footprint halved at unchanged 3 m height. Tree dimensions and the 384-voxel
+> biome cell are pinned: biome regions must stay many 9 m tree-tiles wide or
+> the field reads as per-tree noise. `World::TerrainHeight` mirrors as always.
+>
+> Ponds were not retuned but REDESIGNED, because the retune exposed a latent
+> leak: contour-fill ponds (basin-noise mask filled to a noise water table)
+> spill wherever the mask edge crosses ground below the local table — the
+> sleep gate caught one pouring downhill forever (82 chunks awake after 600
+> settle ticks; a CPU-mirror scan counted 175 spill edges around that one
+> pond, and the committed tune had only passed by luck of where its mask
+> edges fell). Ponds are now DISCS placed one-per-224-voxel-tile by tile hash,
+> exactly like trees: water level = 2 below the lowest of 24 integer-circle
+> terrain samples on the pond's own rim, bowl carved into the terrain beneath.
+> Contained by construction — the shore is above the water everywhere. Keep-out
+> discs cover the spawn clearing, the streaming-test ball column and the
+> authored pools; `surfHeightAt` mirrors the carve for the far-field skin.
+>
+> Burning a tree used to rain "charcoal dust" through the canopy: foliage had
+> NO combustion rules (only the trunk's `wood` burned), so the torched trunk
+> vanished, the support scan found the crown, and the island detector crumbled
+> the procedurally-dithered rim — thousands of sub-8-voxel leaf "islands" —
+> into `ash`. Two-sided fix: the foliage set (leaves/pine_needles/
+> autumn_leaves/grass/petal) now flashes to `fire` and is consumed (birch_wood
+> smolders to `ember` like wood), and sub-8 floaters of `tag:foliage`
+> materials vanish to air instead of crumbling (`DebrisSystem` rubble
+> handoff) — leaf crumbs shed by ANY support scan near a tree, not just fire.
+> Foliage combustion is still rule-2 safe: fire is consumptive, nothing grows.
 
 > **v0.5.3 (2026-08-19)** — far-field cascades: view distance from ~1 window
 > radius to ~64 window radii (§9, docs/PLAN_far_field_cascades.md phase 1).

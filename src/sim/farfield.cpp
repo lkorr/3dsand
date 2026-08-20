@@ -7,15 +7,16 @@
 namespace {
 constexpr int kHyst = 2;  // level-chunk hysteresis, same feel as Stream
 // Player fine-chunk coord -> this level's chunk coord (arithmetic shift =
-// floor division; one level-k chunk = 2^k fine chunks).
+// floor division; one level-k chunk = 16 cells of 2^(k+kFarShiftBase) fine
+// voxels = 2^(k+kFarShiftBase) fine chunks; k here is the 0-based index).
 IVec3 LevelChunk(IVec3 fineChunk, uint32_t k) {
-  int s = (int)k + 1;
+  int s = (int)(k + 1 + kFarShiftBase);
   return {fineChunk.x >> s, fineChunk.y >> s, fineChunk.z >> s};
 }
 // centered window origin for the player's level-chunk coord
 IVec3 DesiredOrigin(IVec3 fineChunk, uint32_t k) {
   IVec3 lc = LevelChunk(fineChunk, k);
-  int h = (int)kNChunk / 2;
+  int h = (int)kFarNChunk / 2;
   return {lc.x - h, lc.y - h, lc.z - h};
 }
 }  // namespace
@@ -26,15 +27,15 @@ void FarField::Enqueue(uint32_t k, uint32_t slot) {
 }
 
 void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
-  int m = (int)kNChunk - 1;
+  int m = (int)kFarNChunk - 1;
   int sa = wcoord & m;
-  for (int b = 0; b < (int)kNChunk; b++) {
-    for (int a = 0; a < (int)kNChunk; a++) {
+  for (int b = 0; b < (int)kFarNChunk; b++) {
+    for (int a = 0; a < (int)kFarNChunk; a++) {
       int s[3];
       s[axis] = sa;
       s[(axis + 1) % 3] = a;
       s[(axis + 2) % 3] = b;
-      uint32_t slot = ((uint32_t)s[2] * kNChunk + (uint32_t)s[1]) * kNChunk +
+      uint32_t slot = ((uint32_t)s[2] * kFarNChunk + (uint32_t)s[1]) * kFarNChunk +
                       (uint32_t)s[0];
       Enqueue(k, slot);
     }
@@ -44,7 +45,7 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
 void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   origins_[k] = desired;
   uboDirty_ = true;
-  for (uint32_t slot = 0; slot < kNumChunks; slot++) Enqueue(k, slot);
+  for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
 }
 
 void FarField::FullRefill(IVec3 playerChunk) {
@@ -56,8 +57,9 @@ void FarField::FullRefill(IVec3 playerChunk) {
 }
 
 float FarField::SafeRadiusMeters() const {
-  // Half-extent of cascade level k (1-based) in meters: the level's box is
-  // kWorldN cells of 2^k fine voxels per edge, so half of it is
+  // Half-extent of cascade level k (1-based) in meters: the level's box edge
+  // is kFarN << (k + kFarShiftBase) = kWorldN << k fine voxels (the shift base
+  // pins box size to WINDOW edges), so half of it is
   // (kWorldN / 2) * 2^k * kVoxelMeters. Derived from world.h, never hardcoded.
   auto halfExtent = [](uint32_t k) {
     return (float)(kWorldN >> 1) * (float)(1u << k) * kVoxelMeters;
@@ -77,8 +79,8 @@ void FarField::Update(IVec3 playerChunk) {
     IVec3 desired = DesiredOrigin(playerChunk, k);
     int d[3] = {desired.x - origins_[k].x, desired.y - origins_[k].y,
                 desired.z - origins_[k].z};
-    if (std::abs(d[0]) >= (int)kNChunk || std::abs(d[1]) >= (int)kNChunk ||
-        std::abs(d[2]) >= (int)kNChunk) {
+    if (std::abs(d[0]) >= (int)kFarNChunk || std::abs(d[1]) >= (int)kFarNChunk ||
+        std::abs(d[2]) >= (int)kFarNChunk) {
       ResetLevel(k, desired);  // whole window stale (teleport / load)
       continue;
     }
@@ -90,7 +92,7 @@ void FarField::Update(IVec3 playerChunk) {
       *o += dir;
       uboDirty_ = true;
       // incoming plane: the window's leading face after the shift
-      int wcoord = dir > 0 ? *o + (int)kNChunk - 1 : *o;
+      int wcoord = dir > 0 ? *o + (int)kFarNChunk - 1 : *o;
       EnqueuePlane(k, axis, wcoord);
     }
   }

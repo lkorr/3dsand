@@ -24,12 +24,33 @@ constexpr uint32_t kSupportCooldownTicks = 45;
 constexpr int kSupportMargin = 24;
 constexpr int kSupportDrainPerTick = 2;
 
+// Body budget policy. A rigidbody is expensive and permanent: a compound-shape
+// build up front, then broadphase + terrain-mesh upkeep around it every tick
+// until it settles. Loose voxels in the CA are nearly free by comparison. So
+// matter only earns a body when it is big enough to read as an object, and
+// only a few per scan / per tick — everything else goes back to the grid as
+// rubble or ballistic particles, which looks the same and costs nothing.
+constexpr uint32_t kMinBodyVoxels = 8;         // below this: rubble
+constexpr uint32_t kMaxNewBodiesPerScan = 4;   // one island scan's share
+constexpr uint32_t kMaxNewBodiesPerTick = 4;   // shatter's share, all bodies
+
+// Fragments broken off a BURNING body face a much higher bar than a fresh
+// island. A body disintegrating in a fire re-fragments every few ticks, and
+// each fragment that earns a body re-fragments in turn — that recursion is
+// what turned one burning tree into hundreds of tiny bodies chugging the CPU.
+// Charred bits that fall off a burning object are visually just embers, so
+// below this they become ballistic particles and stay in the CA.
+constexpr uint32_t kMinBurnFragmentVoxels = 24;
+
 // Body burn budgets: voxel scans across all bodies per tick, grid writes
 // (emitted fire / escaping ash+smoke) per tick, and how many voxels must burn
 // away before the Jolt collider is rebuilt to match the charred shape.
 constexpr uint32_t kBurnScanPerTick = 4096;
 constexpr uint32_t kBurnOpsPerTick = 384;
 constexpr uint32_t kBurnRebuildVoxels = 12;
+// Connectivity re-check after burning is O(n) per body; run it only when
+// enough matter has actually left to plausibly disconnect the remainder.
+constexpr uint32_t kShatterCheckVoxels = 6;
 
 // CPU mirror of common.wgsl pcg/hash3 — counter-based, stateless, so burn
 // rolls replay identically for a given (body serial, tick, voxel, rule).
@@ -80,6 +101,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   classOf_.clear();
   densityOf_.clear();
   rubbleOf_.clear();
+  foliageOf_.clear();
   matGpu_.clear();
   matSelfActive_.clear();
   matHasPair_.clear();
@@ -107,6 +129,10 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
       r = organic && dust > 0 ? dust : (gravel > 0 ? gravel : 0);
     }
     rubbleOf_.push_back((uint32_t)r);
+    uint8_t foliage = 0;
+    for (const auto& t : m.tags)
+      if (t == "foliage") foliage = 1;
+    foliageOf_.push_back(foliage);
   }
   for (Body& b : bodies_) RecountBurn(b);  // hot-reload can change rule sets
 }
@@ -221,15 +247,24 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   };
 
   // solid mask from the chunk cache (solids only: powders/liquids fall on
-  // their own in the CA)
+  // their own in the CA). The chunk pointer is hoisted out of the x loop: a
+  // 64^3 region is 262144 cells but only ~64 chunks, and Cached() is a hash
+  // lookup.
   std::vector<uint32_t> words(vol, 0);
   std::vector<uint8_t> solid(vol, 0);
   for (int z = 0; z < dz; z++)
-    for (int y = 0; y < dy; y++)
+    for (int y = 0; y < dy; y++) {
+      int wy = e.lo.y + y, wz = e.lo.z + z;
+      const CachedChunk* cc = nullptr;
+      int ccx = INT32_MIN;
       for (int x = 0; x < dx; x++) {
-        int wx = e.lo.x + x, wy = e.lo.y + y, wz = e.lo.z + z;
-        const CachedChunk* cc = world.Cached(ChunkOfCell(wx, wy, wz));
-        if (!cc || cc->voxels.size() != kChunkVol) continue;
+        int wx = e.lo.x + x;
+        if ((wx >> 4) != ccx) {
+          ccx = wx >> 4;
+          cc = world.Cached({ccx, wy >> 4, wz >> 4});
+          if (cc && cc->voxels.size() != kChunkVol) cc = nullptr;
+        }
+        if (!cc) continue;
         uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(wy & 15),
                  lz = (uint32_t)(wz & 15);
         uint32_t w = cc->voxels[(lz * kChunk + ly) * kChunk + lx];
@@ -238,6 +273,22 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         solid[lidx(x, y, z)] =
             mat != 0 && mat < classOf_.size() && classOf_[mat] == CLASS_SOLID;
       }
+    }
+
+  // Does a solid voxel sit just outside the region at this face cell? Used to
+  // decide whether a component leaving the region is really attached to more
+  // structure out there, or just happens to graze the box. One cache lookup
+  // per query, only for boundary cells of unanchored components.
+  auto solidOutside = [&](int wx, int wy, int wz) -> bool {
+    if (!world.CellInWindow({wx, wy, wz})) return true;  // window edge is solid
+    const CachedChunk* cc = world.Cached(ChunkOfCell(wx, wy, wz));
+    if (!cc || cc->voxels.size() != kChunkVol) return true;  // unknown: assume
+    uint32_t mat = cc->voxels[((uint32_t)(wz & 15) * kChunk +
+                               (uint32_t)(wy & 15)) * kChunk +
+                              (uint32_t)(wx & 15)] & 0xFFF;
+    return mat != 0 && mat < classOf_.size() &&
+           (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER);
+  };
 
   // 6-connected components; a component touching the region boundary is
   // anchored to the world (or too big to judge) and stays put
@@ -260,8 +311,23 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       comp.cells.push_back(i);
       if (comp.cells.size() > kMaxIslandVoxels) comp.anchored = true;  // abort: too big
       int x = (int)(i % dx), y = (int)((i / dx) % dy), z = (int)(i / ((size_t)dx * dy));
-      if (x == 0 || y == 0 || z == 0 || x == dx - 1 || y == dy - 1 || z == dz - 1)
-        comp.anchored = true;
+      // Leaving the region only anchors when the structure actually CONTINUES
+      // outside: a cell on the boundary face whose outward neighbor is solid
+      // is attached to matter we can't see, so the component stays put. A tree
+      // crown that merely pokes through the top/side of the scan box has air
+      // out there and is free to fall.
+      //
+      // Treating any boundary contact as anchored (the old rule) is why
+      // felling a tree produced nothing: at kSupportMargin the region is 64^3,
+      // a tree is taller than that, so the crown always grazed a face and was
+      // pinned — while its dithered rim leaves became sub-8 islands and got
+      // deleted. Now only the trunk's actual ground contact anchors it.
+      if (x == 0 && solidOutside(e.lo.x - 1, e.lo.y + y, e.lo.z + z)) comp.anchored = true;
+      if (y == 0 && solidOutside(e.lo.x + x, e.lo.y - 1, e.lo.z + z)) comp.anchored = true;
+      if (z == 0 && solidOutside(e.lo.x + x, e.lo.y + y, e.lo.z - 1)) comp.anchored = true;
+      if (x == dx - 1 && solidOutside(e.hi.x + 1, e.lo.y + y, e.lo.z + z)) comp.anchored = true;
+      if (y == dy - 1 && solidOutside(e.lo.x + x, e.hi.y + 1, e.lo.z + z)) comp.anchored = true;
+      if (z == dz - 1 && solidOutside(e.lo.x + x, e.lo.y + y, e.hi.z + 1)) comp.anchored = true;
       // resting on powder = supported: without this, every slab on a sand
       // pile would convert to a body the moment a support-loss scan runs.
       // When the powder flows away the sim re-flags the chunk and the next
@@ -287,18 +353,46 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     next++;
   }
 
-  for (const Comp& comp : comps) {
-    if (comp.anchored) continue;
+  // Largest components first: when a scan turns up more loose structure than
+  // the per-tick body budget covers, the tree gets the body and the twigs fall
+  // back to rubble, rather than the arbitrary scan order deciding.
+  std::vector<uint32_t> order;
+  order.reserve(comps.size());
+  for (uint32_t c = 0; c < (uint32_t)comps.size(); c++)
+    if (!comps[c].anchored) order.push_back(c);
+  std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+    return comps[a].cells.size() > comps[b].cells.size();
+  });
+
+  uint32_t madeThisScan = 0;
+  for (uint32_t ci : order) {
+    const Comp& comp = comps[ci];
     if (cellOps.size() + comp.cells.size() > kMaxCellOpsPerTick) break;  // next tick
 
-    if (comp.cells.size() < 8) {
-      // rubble handoff: crumble to the powder form, stay in the CA
+    // Body-worthiness. A scan over a burning forest can turn up dozens of
+    // loose components; each body costs a compound-shape build plus permanent
+    // per-tick broadphase/terrain-meshing work, so past the per-scan budget
+    // (or below the size floor) matter goes back to the CA as rubble instead.
+    // Rubble is nearly free: it is just voxels the GPU already simulates.
+    bool worthBody = comp.cells.size() >= kMinBodyVoxels &&
+                     madeThisScan < kMaxNewBodiesPerScan &&
+                     bodies_.size() < kMaxBodies;
+    if (!worthBody) {
+      // rubble handoff: crumble to the powder form, stay in the CA. Foliage
+      // clumps vanish instead: procgen crowns dither their rims with isolated
+      // voxels by design, so any support scan near a tree finds hundreds of
+      // sub-8 leaf "islands" — as rubble that was a rain of ash through the
+      // canopy the first time a tree burned or anything moved nearby.
       for (size_t i : comp.cells) {
         int x = (int)(i % dx), y = (int)((i / dx) % dy), z = (int)(i / ((size_t)dx * dy));
         int wx = e.lo.x + x, wy = e.lo.y + y, wz = e.lo.z + z;
         uint32_t mat = words[i] & 0xFFF;
-        uint32_t rub = mat < rubbleOf_.size() ? rubbleOf_[mat] : 0;
         uint32_t cellIdx = CellIndexOf(wx, wy, wz);
+        if (mat < foliageOf_.size() && foliageOf_[mat]) {
+          cellOps.push_back({cellIdx, 0u});
+          continue;
+        }
+        uint32_t rub = mat < rubbleOf_.size() ? rubbleOf_[mat] : 0;
         uint32_t word = (rub & 0xFFF) | (((cellIdx * 2654435761u) >> 8 & 3u) << 12) |
                         (0xFFu << 16);
         cellOps.push_back({cellIdx, word});
@@ -306,8 +400,6 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       lastCellWriteTick_ = tick;
       continue;
     }
-
-    if (bodies_.size() >= kMaxBodies) continue;  // body budget spent: leave it
 
     // island -> rigidbody: min-corner local frame, voxels leave the grid
     IVec3 mn{dx, dy, dz};
@@ -346,6 +438,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     RecountBurn(body);
     bodies_.push_back(std::move(body));
     instancesDirty_ = true;
+    madeThisScan++;
     std::printf("debris: island of %zu voxels -> body (total %zu)\n",
                 comp.cells.size(), bodies_.size());
   }
@@ -494,6 +587,10 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
   uint32_t scanBudget = kBurnScanPerTick;
   uint32_t opsBudget = kBurnOpsPerTick;
   bool rebuiltOne = false;
+  // shared across every body this tick: a forest fire breaks many bodies at
+  // once, and each new body is a compound-shape build plus permanent per-tick
+  // upkeep. Past the budget, fragments become particles instead.
+  uint32_t newBodyBudget = kMaxNewBodiesPerTick;
   // fragment bodies split off by ShatterBody, appended after the loop (a
   // push_back into bodies_ mid-iteration would invalidate `b`)
   std::vector<Body> fragments;
@@ -700,8 +797,23 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       b.burnedSinceRebuild += removed;
       if (!b.voxels.empty()) b.burnCursor %= (uint32_t)b.voxels.size();
       // removals can disconnect the remainder: split fragments off (bodies /
-      // ballistic particles) before recounting
-      ShatterBody(b, world, fragments, spawns);
+      // ballistic particles) before recounting. The connectivity flood is O(n)
+      // over the body, so it waits until enough matter has actually burned
+      // away to plausibly disconnect anything — a body losing one voxel a tick
+      // to embers doesn't re-flood every tick.
+      // Threshold scales with the body: losing 4 voxels out of 13 can easily
+      // sever it, out of 2000 it cannot. Small bodies therefore re-check
+      // immediately (correctness — a clump must detach before the remainder
+      // burns under the dissolve floor), big ones amortize (perf).
+      b.burnedSinceShatter += removed;
+      uint32_t shatterEvery =
+          std::max(1u, std::min(kShatterCheckVoxels,
+                                (uint32_t)b.voxels.size() / 16u));
+      if (b.burnedSinceShatter >= shatterEvery) {
+        b.burnedSinceShatter = 0;
+        ShatterBody(b, world, fragments, spawns, kMinBurnFragmentVoxels,
+                    newBodyBudget);
+      }
     }
     if (changed) {
       RecountBurn(b);
@@ -752,7 +864,8 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
 }
 
 void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
-                               std::vector<ParticleSpawn>& spawns) {
+                               std::vector<ParticleSpawn>& spawns,
+                               uint32_t minFragment, uint32_t& budget) {
   const uint32_t n = (uint32_t)b.voxels.size();
   if (n < 2) return;
   std::unordered_map<uint32_t, uint32_t> map;
@@ -804,7 +917,8 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
 
   for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
     if (c == keep) continue;
-    if (parts[c].size() >= 8 && bodies_.size() + fragments.size() < kMaxBodies) {
+    if (parts[c].size() >= minFragment && budget > 0 &&
+        bodies_.size() + fragments.size() < kMaxBodies) {
       // body-worthy fragment: its own body at the same pose, rebased to its
       // min corner (like SplitBody halves), keeping the parent's momentum
       IVec3 mn{127, 127, 127};
@@ -833,6 +947,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
         RecountBurn(nb);
         fragments.push_back(std::move(nb));
         madeBody = true;
+        budget--;
         continue;
       }
       // body creation failed: fall through to particles (coords were rebased,
@@ -1057,21 +1172,53 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // (re)build the marching-cubes patch. Solids AND powders carry weight;
     // liquids don't (debris sinks). Missing neighbor chunks sample as empty —
     // transient until their fetch lands.
-    auto solidAt = [&](int x, int y, int z) -> bool {
-      if (!world.CellInWindow({x, y, z}))
-        return true;  // residency edge is solid (matches sim rule)
-      const CachedChunk* n = world.Cached(ChunkOfCell(x, y, z));
-      if (!n || n->voxels.size() != kChunkVol) return false;
-      uint32_t lx = (uint32_t)(x & 15), ly = (uint32_t)(y & 15),
-               lz = (uint32_t)(z & 15);
-      uint32_t mat = n->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
-      if (mat == 0 || mat >= classOf_.size()) return false;
-      return classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER;
-    };
+    //
+    // Sample occupancy into an 18^3 bitmask up front, one source chunk at a
+    // time: the 5832 samples touch at most 27 chunks, so the chunk-cache hash
+    // lookup happens 27 times instead of once per sample (and the polygonizer
+    // then reads bits, not a std::function).
     IVec3 origin{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
+    uint32_t occ[kMcOccWords] = {};
+    for (int ncz = -1; ncz <= 1; ncz++)
+      for (int ncy = -1; ncy <= 1; ncy++)
+        for (int ncx = -1; ncx <= 1; ncx++) {
+          IVec3 nwc{wc.x + ncx, wc.y + ncy, wc.z + ncz};
+          // the sub-box of this neighbor chunk that lands inside the 18^3 box,
+          // in occ coords (chunk-local + 1)
+          int blo[3], bhi[3];
+          const int nc[3] = {ncx, ncy, ncz};
+          for (int a = 0; a < 3; a++) {
+            blo[a] = nc[a] < 0 ? 0 : (nc[a] == 0 ? 1 : kMcOccDim - 1);
+            bhi[a] = nc[a] < 0 ? 0 : (nc[a] == 0 ? kMcOccDim - 2 : kMcOccDim - 1);
+          }
+          bool inWin = world.ChunkInWindow(nwc);
+          const CachedChunk* n = inWin ? world.Cached(nwc) : nullptr;
+          bool haveVox = n && n->voxels.size() == kChunkVol;
+          // Outside the residency window is solid and inert (matches the sim
+          // rule); in-window but not yet fetched reads as empty until it lands.
+          if (!inWin) {
+            for (int z = blo[2]; z <= bhi[2]; z++)
+              for (int y = blo[1]; y <= bhi[1]; y++)
+                for (int x = blo[0]; x <= bhi[0]; x++) McOccSet(occ, x, y, z);
+            continue;
+          }
+          if (!haveVox) continue;
+          for (int z = blo[2]; z <= bhi[2]; z++)
+            for (int y = blo[1]; y <= bhi[1]; y++)
+              for (int x = blo[0]; x <= bhi[0]; x++) {
+                // occ coord -> world cell -> local cell in THIS neighbor
+                int lx = (origin.x + x - 1) & 15, ly = (origin.y + y - 1) & 15,
+                    lz = (origin.z + z - 1) & 15;
+                uint32_t mat =
+                    n->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+                if (mat == 0 || mat >= classOf_.size()) continue;
+                if (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER)
+                  McOccSet(occ, x, y, z);
+              }
+        }
     std::vector<float> verts;
     std::vector<uint32_t> indices;
-    PolygonizeChunk(origin, solidAt, verts, indices);
+    PolygonizeChunk(origin, occ, verts, indices);
 
     // identical collision surface (liquids flowed, blood dried, gases moved):
     // keep the existing mesh and — critically — do NOT wake sleeping bodies.

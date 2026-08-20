@@ -56,7 +56,8 @@ double NowSec() {
 void WriteRenderParams(const wgpu::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
-                       float fogDensity = kFarFogDensity) {
+                       float fogDensity = kFarFogDensity,
+                       float viewPx = 1080.0f) {
   RenderParams rp{};
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
   rp.camPos[0] = eye.x; rp.camPos[1] = eye.y; rp.camPos[2] = eye.z;
@@ -67,9 +68,15 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   rp.aspect = aspect;
   rp.time = time;
   rp.flags = shadows ? 1u : 0u;
-  Vec3 sun = Vec3{0.45f, 0.78f, 0.32f}.normalized();
+  // ~41 deg elevation: low enough that terrain and canopy cast readable
+  // shadows (near field AND the far-field cascade shadow march), high enough
+  // that valleys aren't pits. The old 0.78 y put the sun ~52 deg up and
+  // flattened the world — shadows were 1-2 cells long and the far field read
+  // as unlit wallpaper.
+  Vec3 sun = Vec3{0.50f, 0.55f, 0.38f}.normalized();
   rp.sunDir[0] = sun.x; rp.sunDir[1] = sun.y; rp.sunDir[2] = sun.z;
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
+  rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
@@ -268,6 +275,136 @@ void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
   ctx.instance.WaitAny(f, UINT64_MAX);
 }
 
+// --shot: minimal look-iteration harness. Worldgen, drain the far-field fill
+// queue, settle briefly, write the three standard screenshots, exit — so
+// render/look changes can be judged in seconds instead of the full selftest.
+// Cameras deliberately match the selftest's so the two stay comparable.
+int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  FarField far;
+  far.Init(&world);
+  far.FullRefill({8, 3, 8});
+  uint32_t n;
+  while ((n = far.PrepareTick(ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = n;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, n);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+  }
+  for (uint32_t t = 1; t <= 120; t++)  // powders settle so shots match play
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+               false, false);
+  ctx.WaitIdle();
+
+  const uint32_t W = 1920, H = 1080;
+  wgpu::TextureDescriptor td{};
+  td.size = {W, H, 1};
+  td.format = wgpu::TextureFormat::RGBA8Unorm;
+  td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+  wgpu::Texture offscreen = ctx.device.CreateTexture(&td);
+  wgpu::TextureView view = offscreen.CreateView();
+  auto grab = [&](const char* path) {
+    wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                     wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                     "screenshot");
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    wgpu::TexelCopyTextureInfo srcT{};
+    srcT.texture = offscreen;
+    wgpu::TexelCopyBufferInfo dstB{};
+    dstB.buffer = shot;
+    dstB.layout.bytesPerRow = W * 4;
+    dstB.layout.rowsPerImage = H;
+    wgpu::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+    std::vector<uint8_t> pixels(W * H * 4);
+    bool got = false;
+    wgpu::Future f = shot.MapAsync(
+        wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          if (status == wgpu::MapAsyncStatus::Success) {
+            std::memcpy(pixels.data(), shot.GetConstMappedRange(0, pixels.size()),
+                        pixels.size());
+            shot.Unmap();
+            got = true;
+          }
+        });
+    ctx.instance.WaitAny(f, UINT64_MAX);
+    if (got && WriteBmp(path, pixels, W, H)) std::printf("wrote %s\n", path);
+  };
+  // Fixed, nonzero shot time: wave animation and flicker are driven by R.time,
+  // so a time of 0 would show every shot at the one phase where the ripples
+  // happen to be flat. Constant, so shots stay reproducible frame to frame.
+  const float kShotTime = 11.7f;
+  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+    Camera c;
+    c.yaw = yaw;
+    c.pitch = pitch;
+    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime);
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder rp =
+        sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+    ctx.WaitIdle();
+    grab(path);
+  };
+  int h108 = World::TerrainHeight(108, 108, kDefaultSeed);
+  render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
+  render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
+  render({108, (float)(h108 + 28), 108}, 0.785f, -0.02f, "screenshot_ground.bmp");
+  // Water look shots: the authored lake is centered at (420,420), surface at
+  // y=68 (worldgen poolY 44 + 24), floor at y=44, rim y=70.
+  //   _water: from the near rim at a shallow grazing angle — where Fresnel
+  //           reflection and sun glint dominate.
+  //   _water_down: from above looking down — the low-Fresnel angle, where
+  //           refraction, depth absorption and the visible bed have to carry it.
+  // Just above the surface at the near rim, looking across the lake: the
+  // grazing angle where Fresnel reflection and sun glint dominate.
+  render({372, 80, 372}, 0.785f, -0.30f, "screenshot_water.bmp");
+  // Standing over the middle looking down: the low-Fresnel angle, where
+  // refraction, per-channel depth absorption and the visible bed carry it.
+  render({420, 88, 452}, -1.571f, -0.75f, "screenshot_water_down.bmp");
+  // Oil pond (260,300) and lava pool (220,520): the non-water liquid paths.
+  // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
+  // still render as a surface hit, untouched by any of the water work.
+  render({236, 80, 276}, 0.785f, -0.45f, "screenshot_oil.bmp");
+  render({198, 78, 496}, 0.785f, -0.45f, "screenshot_lava.bmp");
+  return 0;
+}
+
+// Count of chunks whose dirty flag is set (selftest only — blocking readback).
+uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {
+  wgpu::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
+                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                      "activeRead");
+  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumChunks * 4);
+  wgpu::CommandBuffer cmd = enc.Finish();
+  ctx.queue.Submit(1, &cmd);
+  uint32_t n = 0;
+  wgpu::Future f = staging.MapAsync(
+      wgpu::MapMode::Read, 0, kNumChunks * 4, wgpu::CallbackMode::WaitAnyOnly,
+      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        if (status == wgpu::MapAsyncStatus::Success) {
+          const uint32_t* d =
+              (const uint32_t*)staging.GetConstMappedRange(0, kNumChunks * 4);
+          for (uint32_t i = 0; i < kNumChunks; i++)
+            if (d[i] != 0) n++;
+          staging.Unmap();
+        }
+      });
+  ctx.instance.WaitAny(f, UINT64_MAX);
+  return n;
+}
+
 int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 const std::vector<MaterialDef>& mats, Physics& phys,
                 DebrisSystem& debris, MobSystem& mobs, Stream& stream) {
@@ -304,16 +441,29 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   // Includes an explosion: every ejected particle must reinsert and die.
   uint32_t sleepActive = 0;
   uint32_t particlesLeft = 0;
+  int settled = 0;  // tick at which the world went quiet (or the cap)
   {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     uint32_t t = 0;
-    for (int i = 0; i < 500; i++) {  // seeds sprout+harden, pools settle
+    // Settle budget is ADAPTIVE: 500 fixed ticks was tuned for the 256^3
+    // window; the 512^3 window holds 8x the content (every pond and lava
+    // pocket in 32 m of world), and freshly generated liquid legitimately
+    // takes longer to equalize. Tick until the world is quiet, hard-capped —
+    // the cap is what still catches never-sleeping content (rule 2).
+    uint32_t quiet = kNumChunks;
+    for (int i = 0; i < 3000; i++) {
       std::vector<ExplosionOp> exps;
       if (i == 30) exps.push_back({110, 76, 110, 12, 350, 0, 0, 0});  // wood slab
       bool pactive = i >= 30 && i < 460;
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, {8, 3, 8},
                  false, pactive);
+      if (i >= 500 && i % 100 == 0) {
+        ctx.WaitIdle();
+        quiet = ReadActiveChunksSync(ctx, world, sim);
+        settled = i;
+        if (quiet < 32) break;
+      }
     }
     ctx.WaitIdle();
     uint32_t counts[2] = {};
@@ -389,9 +539,10 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     }
   }
   bool sleepOk = sleepActive < 32 && particlesLeft == 0;
-  std::printf("sleep: %s (%u / 4096 chunks active, %u particles alive after "
-              "600 settle ticks)\n",
-              sleepOk ? "PASS" : "FAIL", sleepActive, particlesLeft);
+  std::printf("sleep: %s (%u / %u chunks active, %u particles alive, quiet "
+              "after ~%d settle ticks)\n",
+              sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesLeft,
+              settled);
 
   // sim perf: worst-case-ish activity (brushes + explosions + particles),
   // synchronous timing
@@ -459,13 +610,22 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   // vanishes the moment the player walks away.
   bool farDownOk = false;
   {
-    // The window origin is {0,0,0} in this section, so world cells 0..255 are
+    // The window origin is {0,0,0} in this section, so the paint site is
     // resident; (140, 200, 140) is open air well above the hills and canopy.
     const IVec3 c{140, 200, 140};
-    // One level-1 cell spans 2 fine voxels and is sampled at (cc << 1) + 1;
-    // the 3x3x3 cell block centered on the paint sits well inside radius 6.
+    // One level-1 cell spans 2^(1+kFarShiftBase) fine voxels, sampled at its
+    // center. The brush radius below must cover the sample points of the full
+    // 3x3x3 cell block around the paint: the farthest one sits
+    // 1.5 * cellsize - (cellsize/2 - offset) away per axis — radius 12 covers
+    // it at the current 4-voxel cells (corner sample distance^2 = 108 < 144).
+    const int farShift1 = (int)(1 + kFarShiftBase);
     auto farByte = [&](IVec3 cc) {
-      uint64_t bi = World::SlotCellIndex(cc);  // == farVoxByteIndex(1, cc)
+      // farVoxByteIndex(1, cc) on the FAR grid (kFarN masks, chunk-major)
+      auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+      uint32_t x = wrapv(cc.x), y = wrapv(cc.y), z = wrapv(cc.z);
+      uint32_t ch = ((z >> 4) * kFarNChunk + (y >> 4)) * kFarNChunk + (x >> 4);
+      uint32_t lo = ((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15);
+      uint64_t bi = (uint64_t)ch * kChunkVol + lo;
       wgpu::Buffer staging = CreateBuffer(
           ctx.device, 4, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
           "farVoxRead");
@@ -490,7 +650,8 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       for (int dz = -1; dz <= 1; dz++)
         for (int dy = -1; dy <= 1; dy++)
           for (int dx = -1; dx <= 1; dx++)
-            if (farByte({(c.x >> 1) + dx, (c.y >> 1) + dy, (c.z >> 1) + dz}) == want)
+            if (farByte({(c.x >> farShift1) + dx, (c.y >> farShift1) + dy,
+                         (c.z >> farShift1) + dz}) == want)
               n++;
       return n;
     };
@@ -499,7 +660,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     uint32_t airBefore = scan(kMatAir);
     for (uint32_t t = 1; t <= 4; t++) {
       std::vector<BrushOp> ops;
-      if (t == 1) ops.push_back({c.x, c.y, c.z, 6, kMatGlass, 1u /*overwrite*/, 0, 0});
+      if (t == 1) ops.push_back({c.x, c.y, c.z, 12, kMatGlass, 1u /*overwrite*/, 0, 0});
       SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, {}, false, {8, 12, 8},
                  false, false);
     }
@@ -611,6 +772,27 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     ctx.queue.Submit(1, &cmd);
     ctx.WaitIdle();
     grab("screenshot_far.bmp");
+  }
+
+  // ground-level view (phase 4): eye height on the terrain, horizon in frame.
+  // This is the player's actual experience of the distance work — the elevated
+  // shots can look fine while the first-person seam/fog/shading is still
+  // wrong, so judge distance changes against THIS one.
+  {
+    Camera gCam;
+    gCam.yaw = 0.785f;
+    gCam.pitch = -0.02f;
+    Vec3 gEye{108, (float)(World::TerrainHeight(108, 108, kDefaultSeed) + 28), 108};
+    WriteRenderParams(ctx.queue, world, gEye, gCam, (float)W / H, true, 0);
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder rp =
+        sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+    ctx.WaitIdle();
+    grab("screenshot_ground.bmp");
   }
 
   // player walk test: drop onto terrain through the real async-mirror path
@@ -1287,10 +1469,12 @@ bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt) {
 
 int main(int argc, char** argv) {
   bool selftest = false;
+  bool shot = false;
   bool lowPowerAdapter = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--selftest") selftest = true;
+    if (a == "--shot") shot = true;  // screenshots only (look iteration)
     // `--adapter low` picks the LowPower adapter (iGPU) so the selftest hash
     // can be compared across GPU vendors (DESIGN.md §14 risk 3).
     if (a == "--adapter" && i + 1 < argc) lowPowerAdapter = std::string(argv[++i]) == "low";
@@ -1317,7 +1501,7 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest) {
+  if (!selftest && !shot) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -1352,6 +1536,7 @@ int main(int argc, char** argv) {
   FarField far;
   far.Init(&world);
 
+  if (shot) return RunShots(ctx, world, sim);
   if (selftest)
     return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream);
 
@@ -1795,7 +1980,7 @@ int main(int argc, char** argv) {
       fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
       WriteRenderParams(ctx.queue, world, eye, cam,
                         (float)ctx.width / (float)ctx.height, ui.shadows,
-                        (float)now, fogSmooth);
+                        (float)now, fogSmooth, (float)ctx.height);
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;

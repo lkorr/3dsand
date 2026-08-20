@@ -1,5 +1,7 @@
 #include "phys/marching_cubes.h"
 
+#include <unordered_map>
+
 #include "phys/mc_tables.h"
 #include "sim/world.h"  // kChunk
 
@@ -23,44 +25,53 @@ constexpr int kEdge[12][2] = {
 
 }  // namespace
 
-void PolygonizeChunk(IVec3 o, const std::function<bool(int, int, int)>& solid,
-                     std::vector<float>& outVerts, std::vector<uint32_t>& outIndices) {
+void PolygonizeChunk(IVec3 o, const uint32_t* occ, std::vector<float>& outVerts,
+                     std::vector<uint32_t>& outIndices) {
   const int n = (int)kChunk;
+
+  // Weld key: edge midpoints land on halves, so 2*coord is an exact integer.
+  // Local doubled coords span 0..2n, which fits 6 bits per axis.
+  std::unordered_map<uint32_t, uint32_t> weld;
+  weld.reserve(1024);
+  auto emit = [&](int e, int x, int y, int z) -> uint32_t {
+    const int* a = kCorner[kEdge[e][0]];
+    const int* b = kCorner[kEdge[e][1]];
+    int dx = 2 * x + a[0] + b[0];
+    int dy = 2 * y + a[1] + b[1];
+    int dz = 2 * z + a[2] + b[2];
+    uint32_t key = (uint32_t)dx | ((uint32_t)dy << 8) | ((uint32_t)dz << 16);
+    auto it = weld.find(key);
+    if (it != weld.end()) return it->second;
+    uint32_t idx = (uint32_t)(outVerts.size() / 3);
+    outVerts.push_back((float)o.x + 0.5f * (float)dx);
+    outVerts.push_back((float)o.y + 0.5f * (float)dy);
+    outVerts.push_back((float)o.z + 0.5f * (float)dz);
+    weld.emplace(key, idx);
+    return idx;
+  };
+
   for (int z = 0; z < n; z++) {
     for (int y = 0; y < n; y++) {
       for (int x = 0; x < n; x++) {
-        int cx = o.x + x, cy = o.y + y, cz = o.z + z;
+        // occ is stored with a +1 border offset
         int cubeIndex = 0;
         for (int c = 0; c < 8; c++) {
-          if (solid(cx + kCorner[c][0], cy + kCorner[c][1], cz + kCorner[c][2]))
+          if (McOccGet(occ, x + kCorner[c][0] + 1, y + kCorner[c][1] + 1,
+                       z + kCorner[c][2] + 1))
             cubeIndex |= 1 << c;
         }
         int edges = mc::kEdgeTable[cubeIndex];
         if (edges == 0) continue;
 
-        // vertex on each crossed edge, at the midpoint (binary occupancy)
-        float vx[12], vy[12], vz[12];
-        for (int e = 0; e < 12; e++) {
-          if (!(edges & (1 << e))) continue;
-          const int* a = kCorner[kEdge[e][0]];
-          const int* b = kCorner[kEdge[e][1]];
-          vx[e] = (float)cx + 0.5f * (float)(a[0] + b[0]);
-          vy[e] = (float)cy + 0.5f * (float)(a[1] + b[1]);
-          vz[e] = (float)cz + 0.5f * (float)(a[2] + b[2]);
-        }
+        uint32_t vi[12];
+        for (int e = 0; e < 12; e++)
+          if (edges & (1 << e)) vi[e] = emit(e, x, y, z);
 
         const int* tri = mc::kTriTable[cubeIndex];
         for (int t = 0; tri[t] != -1; t += 3) {
-          uint32_t base = (uint32_t)(outVerts.size() / 3);
-          for (int k = 0; k < 3; k++) {
-            int e = tri[t + k];
-            outVerts.push_back(vx[e]);
-            outVerts.push_back(vy[e]);
-            outVerts.push_back(vz[e]);
-          }
-          outIndices.push_back(base);
-          outIndices.push_back(base + 1);
-          outIndices.push_back(base + 2);
+          outIndices.push_back(vi[tri[t]]);
+          outIndices.push_back(vi[tri[t + 1]]);
+          outIndices.push_back(vi[tri[t + 2]]);
         }
       }
     }

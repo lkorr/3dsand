@@ -68,10 +68,10 @@ void World::Init(const wgpu::Device& device) {
   // regions render as sky, never garbage.
   // CopySrc is selftest-only (the phase-2 downsample gate reads back one word);
   // the frame path stays readback-free per CLAUDE.md.
-  farVox = CreateBuffer(device, (uint64_t)kFarLevels * kVoxelCount,
+  farVox = CreateBuffer(device, (uint64_t)kFarLevels * kFarVox,
                         U::Storage | U::CopySrc, "farVox");
-  farOcc = CreateBuffer(device, (uint64_t)kFarLevels * kNumChunks * 4, U::Storage,
-                        "farOcc");
+  farOcc = CreateBuffer(device, (uint64_t)kFarLevels * kFarNumChunks * 4,
+                        U::Storage, "farOcc");
   farList = CreateBuffer(device, kFarListCap * 4, U::Storage | U::CopyDst, "farList");
   farUBO = CreateBuffer(device, sizeof(FarParams), U::Uniform | U::CopyDst, "farUBO");
 
@@ -290,8 +290,8 @@ static int vnoise(int x, int z, int cs, uint32_t seed) {
 }
 // Must stay bit-identical to baseHeight() in worldgen.wgsl, INCLUDING the
 // horizontal scale factor — kHScale here is that shader's HSCALE.
-static constexpr int kHScale = 2;
+static constexpr int kHScale = 1;
 int World::TerrainHeight(int x, int z, uint32_t seed) {
-  return 32 + (vnoise(x, z, 64 * kHScale, seed ^ 1u) * 84) / 255 +
-         (vnoise(x, z, 16 * kHScale, seed ^ 2u) * 24) / 255;
+  return 32 + (vnoise(x, z, 64 * kHScale, seed ^ 1u) * 42) / 255 +
+         (vnoise(x, z, 16 * kHScale, seed ^ 2u) * 12) / 255;
 }

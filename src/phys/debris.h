@@ -111,6 +111,7 @@ class DebrisSystem {
     uint16_t pairCount = 0;       // voxels with pair rules (ignitable/dousable)
     uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
+    uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
   };
   struct TerrainEntry {
     uint64_t handle = 0;
@@ -135,12 +136,16 @@ class DebrisSystem {
   void RecountBurn(Body& b) const;
   bool AnyDirtyNear(const Body& b, const WorldSnapshot& snap, World& world) const;
   // Break a body whose voxels no longer form one 6-connected component: the
-  // largest piece keeps the body, fragments >= 8 voxels become bodies of
-  // their own (parent collider rebuilt immediately), smaller clumps re-enter
-  // the world as ballistic particles with the body's point velocity — break
-  // a body enough and it just turns back into loose voxels.
+  // largest piece keeps the body, fragments >= `minFragment` voxels become
+  // bodies of their own while `budget` allows (parent collider rebuilt
+  // immediately), everything else re-enters the world as ballistic particles
+  // with the body's point velocity — break a body enough and it just turns
+  // back into loose voxels. `budget` is decremented per body created and is
+  // shared across all bodies in a tick, so a disintegrating object cannot
+  // spawn an unbounded fleet of fragments.
   void ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
-                   std::vector<ParticleSpawn>& spawns);
+                   std::vector<ParticleSpawn>& spawns, uint32_t minFragment,
+                   uint32_t& budget);
   void VoxelsToParticles(const Body& b, const std::vector<DebrisVoxel>& voxels,
                          Vec3 lin, Vec3 ang, World& world,
                          std::vector<ParticleSpawn>& spawns) const;
@@ -154,6 +159,7 @@ class DebrisSystem {
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;
+  std::vector<uint8_t> foliageOf_;  // tag:foliage — sub-8 floaters vanish, no rubble
   // body burn tables (rebuilt on materials hot-reload; data-driven, no
   // hardcoded material IDs — the JSON stays the single source of behavior)
   std::vector<MaterialGpu> matGpu_;

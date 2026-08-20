@@ -111,7 +111,10 @@ struct RenderParams {
   camUp      : vec3f,  time       : f32,
   camFwd     : vec3f,  flags      : u32,   // bit0 = sun shadows
   sunDir     : vec3f,  fogDensity : f32,   // per meter (pinned to far extent)
-  origin     : vec3<i32>, _p2     : i32,   // residency window origin, CHUNK units
+  origin     : vec3<i32>,                  // residency window origin, CHUNK units
+  viewPx     : f32,    // render target HEIGHT in pixels — pixel angular size
+                       // (tanHalfFov*2/viewPx) is the LOD footprint the water
+                       // ripple bands are damped against
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -247,23 +250,47 @@ fn slotToWorldChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
 }
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9) ----
-// FAR_LEVELS nested toroidal 256^3 volumes around the residency window; level
-// k (1-based) cells span 2^k fine voxels. Coordinates in "level cells" and
-// "level chunks" reuse the window addressing above verbatim (same POT masks);
-// each level has its own origin (level-chunk units) in FarParams. farVox packs
-// one material byte per cell (0 = air, IDs clamped to 255); farOcc holds one
-// non-air count per level chunk for empty-space skipping. Derived data: the
-// sim never reads any of it, and the world hash never covers it.
+// FAR_LEVELS nested toroidal FAR_N^3 volumes around the residency window, on
+// their OWN grid (decoupled from WORLD_N so growing the window doesn't
+// multiply cascade memory). Level k (1-based) cells span
+// 2^(k + FAR_SHIFT_BASE) fine voxels — the shift base is chosen in world.h so
+// level k's box edge is always 2^k WINDOW edges. Each level has its own
+// origin (level-chunk units) in FarParams. farVox packs one material byte per
+// cell (0 = air, IDs clamped to 255); farOcc holds one non-air count per
+// level chunk for empty-space skipping. Derived data: the sim never reads any
+// of it, and the world hash never covers it.
 struct FarParams {
   origins : array<vec4<i32>, FAR_LEVELS>,  // xyz = origin, w unused
 };
-// byte index into farVox for a level cell (caller checked inWindow against
-// that level's origin — level cells WORLD_N apart alias one slot)
+// fine voxels per level-k cell, as a shift amount
+fn farCellShift(level : u32) -> u32 { return level + FAR_SHIFT_BASE; }
+// Far-grid twins of the window addressing above, with FAR_N masks. Callers
+// must have checked farInBox() first — level cells FAR_N apart alias a slot.
+fn farCellIndexG(c : vec3<i32>) -> u32 {
+  let s = vec3<u32>(c & vec3<i32>(FAR_MASK));
+  let ch = s / CHUNK;
+  let lo = s % CHUNK;
+  return ((ch.z * FAR_NCHUNK + ch.y) * FAR_NCHUNK + ch.x) * CHUNK_VOL +
+         (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+}
+fn farChunkIndexG(c : vec3<i32>) -> u32 {
+  let ch = vec3<u32>(c & vec3<i32>(FAR_MASK)) / CHUNK;
+  return (ch.z * FAR_NCHUNK + ch.y) * FAR_NCHUNK + ch.x;
+}
+fn farInBox(c : vec3<i32>, originChunk : vec3<i32>) -> bool {
+  let d = c - originChunk * i32(CHUNK);
+  let n = i32(FAR_N);
+  return d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < n && d.y < n && d.z < n;
+}
+// level chunk resident in far slot chunk sc under that level's origin o
+fn farSlotToChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
+  return o + ((sc - o) & vec3<i32>(FAR_NCHUNK_MASK));
+}
 fn farVoxByteIndex(level : u32, c : vec3<i32>) -> u32 {
-  return (level - 1u) * WORLD_VOX + cellIndexW(c);
+  return (level - 1u) * FAR_VOX + farCellIndexG(c);
 }
 fn farOccIndex(level : u32, c : vec3<i32>) -> u32 {
-  return (level - 1u) * NUM_CHUNKS + chunkIndexW(c);
+  return (level - 1u) * FAR_NUM_CHUNKS + farChunkIndexG(c);
 }
 
 // ---- per-chunk occupancy packing ----

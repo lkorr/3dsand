@@ -13,13 +13,13 @@
     {
       "self": "fire",
       "decay": true,
-      "chance": 40,
+      "chance": 80,
       "becomes": "smoke"
     },
     {
       "self": "fire",
       "decay": true,
-      "chance": 120,
+      "chance": 80,
       "becomes": "air"
     },
     {
@@ -51,6 +51,45 @@
       "neighbor": "tag:hot",
       "chance": 18,
       "selfBecomes": "ember"
+    },
+    {
+      "self": "birch_wood",
+      "neighbor": "tag:hot",
+      "chance": 22,
+      "selfBecomes": "ember"
+    },
+    {
+      "note": "foliage flashes to fire and is CONSUMED (no ember stage): a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (fire decays in ~6 ticks and leaves nothing that grows)."
+    },
+    {
+      "self": "leaves",
+      "neighbor": "tag:hot",
+      "chance": 75,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "pine_needles",
+      "neighbor": "tag:hot",
+      "chance": 380,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "autumn_leaves",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "grass",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "petal",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire"
     },
     {
       "self": "oil",
@@ -122,16 +161,25 @@
       "chance": 90
     },
     {
+      "note": "The ember stage IS the burn: wood ignites to ember on contact with tag:hot, then smolders here until one of these decay rules retires it. Their SUM is the death rate, so scaling all three together sets burn DURATION without touching how fire spreads (that is the wood+tag:hot ignition rule above, deliberately left fast). Total 7 per-mille vs the old 27 = wood takes ~4x longer to be consumed, ~140 ticks mean. Within that budget ash is ~1/4 of decays and smoke is doubled relative to the old 20:7 ash:smoke split, so a burnt-out fire leaves a scatter of ash rather than a floor of it. Embers also live 4x longer, so each one emits its upward fire ~4x more over its life: fire persists longer without spreading faster."
+    },
+    {
       "self": "ember",
       "decay": true,
-      "chance": 20,
+      "chance": 1,
       "becomes": "ash"
     },
     {
       "self": "ember",
       "decay": true,
-      "chance": 7,
+      "chance": 4,
       "becomes": "smoke"
+    },
+    {
+      "self": "ember",
+      "decay": true,
+      "chance": 3,
+      "becomes": "air"
     },
     {
       "note": "-------- water vs heat --------"
