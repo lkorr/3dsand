@@ -432,6 +432,69 @@ export function gridToModel(g, name = '') {
    ========================================================================== */
 
 /**
+ * Canonicalize a prefab to the form the ENGINE builds at load: every model
+ * cropped to the tight bounds of its voxels and the whole prefab rebased so
+ * the voxel min corner is 0 (voxload.cpp:239-284 does exactly this). Saving
+ * anything else is a trap twice over: the round-trip test reads back the
+ * tight form and fails on the slack boxes, and — worse — limb anchors
+ * authored against a slack layout land shifted in the engine's rebased frame.
+ *
+ * Returns { prefab, shift } where `shift` is the global voxel min in the
+ * INPUT's coordinates — the amount by which prefab-space data (anchors) must
+ * move to stay on the same voxels. Empty models are dropped.
+ */
+export function tightenPrefab(prefab) {
+  const parts = [];
+  for (const m of prefab.models) {
+    const d = m.dim;
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    let any = false;
+    for (let z = 0; z < d.z; z++)
+      for (let y = 0; y < d.y; y++)
+        for (let x = 0; x < d.x; x++) {
+          if (!m.grid.data[x + y * d.x + z * d.x * d.y]) continue;
+          any = true;
+          if (x < mn[0]) mn[0] = x; if (x > mx[0]) mx[0] = x;
+          if (y < mn[1]) mn[1] = y; if (y > mx[1]) mx[1] = y;
+          if (z < mn[2]) mn[2] = z; if (z > mx[2]) mx[2] = z;
+        }
+    if (any) parts.push({ m, mn, mx });
+  }
+  const shift = { x: Infinity, y: Infinity, z: Infinity };
+  for (const { m, mn } of parts) {
+    shift.x = Math.min(shift.x, m.offset.x + mn[0]);
+    shift.y = Math.min(shift.y, m.offset.y + mn[1]);
+    shift.z = Math.min(shift.z, m.offset.z + mn[2]);
+  }
+  if (!parts.length) return { prefab: { size: { x: 0, y: 0, z: 0 }, models: [] },
+                              shift: { x: 0, y: 0, z: 0 } };
+  const models = parts.map(({ m, mn, mx }) => {
+    const dim = { x: mx[0] - mn[0] + 1, y: mx[1] - mn[1] + 1, z: mx[2] - mn[2] + 1 };
+    const g = makeGrid(dim);
+    for (let z = 0; z < dim.z; z++)
+      for (let y = 0; y < dim.y; y++)
+        for (let x = 0; x < dim.x; x++)
+          g.data[x + y * dim.x + z * dim.x * dim.y] =
+            m.grid.data[(x + mn[0]) + (y + mn[1]) * m.dim.x +
+                        (z + mn[2]) * m.dim.x * m.dim.y];
+    return {
+      name: m.name,
+      offset: { x: m.offset.x + mn[0] - shift.x,
+                y: m.offset.y + mn[1] - shift.y,
+                z: m.offset.z + mn[2] - shift.z },
+      dim, grid: g,
+    };
+  });
+  const size = { x: 0, y: 0, z: 0 };
+  for (const m of models) {
+    size.x = Math.max(size.x, m.offset.x + m.dim.x);
+    size.y = Math.max(size.y, m.offset.y + m.dim.y);
+    size.z = Math.max(size.z, m.offset.z + m.dim.z);
+  }
+  return { prefab: { size, models }, shift };
+}
+
+/**
  * Convert an engine-space prefab into models ready for writeVox(..., {scene:true}).
  */
 export function prefabToVoxModels(prefab) {

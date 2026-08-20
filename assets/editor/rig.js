@@ -36,6 +36,7 @@ import * as AN from './anim.js';
 
 let el = null, toast = () => {};
 let sideEl = null, timelineEl = null;
+let clipWrap = null;          // renderClipLane()'s own container, see below
 
 let selectedPart = null;      // limb name, or null
 let gaitOn = false;
@@ -109,6 +110,49 @@ const limbByName = n => limbs().find(l => l.name === n) || null;
 function touched() {
   ed.touchSidecar();
   rebuildSkeleton();
+}
+
+/**
+ * Upscale the whole document 2×: geometry (editor.js doubles every model and
+ * offset), then everything in the sidecar that is measured in voxels —
+ * anchors and clip pos keys — and finally `scale`, so the creature keeps its
+ * world size and gains detail. This is THE way to give an existing mob
+ * finer microvoxels: scale 2 → 4 halves the voxel size without moving a
+ * joint or changing a clip's meaning.
+ */
+function upscale2x() {
+  const s = sc();
+  const scl = +(s.scale) || 1;
+  if (isRigged() && scl >= 4) {
+    toast('already at scale 4 — the engine caps micro mobs there (mob.cpp)', true);
+    return;
+  }
+  if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' +
+      (isRigged() ? `, anchors/keys double, and scale goes ${scl} → ${scl * 2}` : '') +
+      '. This clears the undo history.')) return;
+  if (!ed.upscaleDoc()) return;          // toasts its own reason on failure
+  for (const l of limbs())
+    if (Array.isArray(l.anchor) && l.anchor.length === 3)
+      l.anchor = l.anchor.map(v => v * 2);
+  for (const c of Object.values(clips()))
+    for (const tr of Object.values(c.tracks || {}))
+      for (const k of (tr.pos || []))
+        if (Array.isArray(k.v)) k.v = k.v.map(v => v * 2);
+  const parts = s.editor?.parts;
+  if (parts)
+    for (const p of Object.values(parts))
+      if (Array.isArray(p.box))
+        // lo doubles; hi is an inclusive cell index, so its block ends at 2h+1.
+        p.box = [p.box[0].map(v => v * 2), p.box[1].map(v => v * 2 + 1)];
+  if (isRigged()) s.scale = scl * 2;
+  touched();
+  bindGizmo();
+  ed.refreshMicroGhost?.();
+  ed.invalidate();
+  renderAllPanels();
+  toast('upscaled 2×' + (isRigged()
+    ? ` — scale ${scl * 2}: same world size, ${scl * 2}× voxel density`
+    : ' — the model is twice the resolution (and twice the world size)'));
 }
 
 // A limb entry for every model that does not have one yet. This is how a
@@ -245,6 +289,12 @@ function renderRigPanel() {
     el('div', { class: 'righdr' }, 'Models',
       el('span', { class: 'spacer' }),
       el('button', {
+        class: 'small',
+        title: 'double the resolution: every voxel becomes 2×2×2, anchors and ' +
+          'pos keys double, scale bumps — same world size, finer voxels',
+        onclick: upscale2x,
+      }, '2×'),
+      el('button', {
         class: 'small', title: 'add an empty model to this file',
         onclick: () => {
           const s = prompt('new model dimensions, "x y z" or one number', '8 8 8');
@@ -331,6 +381,29 @@ function renderRigPanel() {
 
     const spd = numInput(s, 'speed', { ph: '5.0' });
     sideEl.append(field('speed', spd, 'm/s; also drives preview cadence'));
+
+    // Micro authoring scale (mob.cpp:160): voxels in this file are MICRO
+    // units, `scale` of them per world voxel. This is how a mob gets more
+    // detail than one world voxel per cube — model it big here, set the
+    // scale, and the engine shrinks it. Rig, anchors and clips are all
+    // authored in the same units, so nothing else in this panel changes.
+    const sclSel = el('select', { class: 'cell' });
+    for (const v of [1, 2, 4]) sclSel.append(el('option', { value: v }, String(v)));
+    sclSel.value = String(+(s.scale) || 1);
+    sclSel.addEventListener('change', () => {
+      const v = +sclSel.value;
+      if (v > 1) s.scale = v; else delete s.scale;
+      touched();
+      ed.refreshMicroGhost?.();
+      ed.invalidate();
+    });
+    const scl = +(s.scale) || 1;
+    const wsz = ed.getDoc()?.size || { x: 0, y: 0, z: 0 };
+    sideEl.append(field('scale', sclSel,
+      scl > 1
+        ? `micro voxels/world voxel — draws ${Math.ceil(wsz.x / scl)}×` +
+          `${Math.ceil(wsz.y / scl)}×${Math.ceil(wsz.z / scl)} world voxels`
+        : 'micro voxels per world voxel (2/4 = finer-than-terrain detail)'));
   }
 
   for (const limb of L) {
@@ -600,7 +673,12 @@ function renderGaitReadout() {
 
 function bindGizmo() {
   const limb = selectedPart ? limbByName(selectedPart) : null;
-  if (!limb) { ed.setGizmo(null); return; }
+  if (!limb) {
+    ed.setGizmo(null);
+    ed.setRotGizmo(null);
+    poseEdit = null;       // a stale edit would keep posing the old part
+    return;
+  }
   // A limb with no explicit anchor uses the engine's AutoAnchor (mob.cpp:59).
   // Rather than reimplement that heuristic, seed the gizmo at the model's
   // centre so the first drag writes a real value — and say so in the panel.
@@ -625,23 +703,37 @@ function bindGizmo() {
 
   // Rotation rings only make sense while a clip is open: outside a clip there
   // is nowhere to put the pose.
-  if (activeClip) {
-    // Seed from whatever the clip already says at the cursor, so grabbing a
-    // ring continues the existing pose instead of snapping to identity.
-    const seeded = sampleClipPose(limb.name, clipCursorMs);
-    poseEdit = { part: limb.name, rot: seeded.rot, pos: seeded.pos };
-    ed.setRotGizmo({
-      quat: poseEdit.rot,
-      onChange: (q, done) => {
-        poseEdit.rot = q;
-        ed.invalidate();
-        if (done && autoKey) writeKey();
-      },
-    });
-  } else {
-    ed.setRotGizmo(null);
-    poseEdit = null;
-  }
+  reseedPose();
+}
+
+/**
+ * (Re)bind the rotation rings to the pose the clip samples at the cursor and
+ * drop any in-progress pose edit. Called whenever what the rings should
+ * reflect changed: part selection, scrub, key select, play toggle, key write.
+ *
+ * poseEdit exists only from first ring drag to key write. It used to be
+ * seeded permanently at part-select time, which meant applyPoseEdit()
+ * overrode the sampled pose forever after — scrubbing and playback visibly
+ * did nothing for the selected part.
+ */
+function reseedPose() {
+  poseEdit = null;
+  const limb = selectedPart ? limbByName(selectedPart) : null;
+  if (!activeClip || !limb) { ed.setRotGizmo(null); return; }
+  // Seed from whatever the clip already says at the cursor, so grabbing a
+  // ring continues the existing pose instead of snapping to identity.
+  const seeded = sampleClipPose(limb.name, clipCursorMs);
+  ed.setRotGizmo({
+    quat: seeded.rot,
+    onChange: (q, done) => {
+      if (!poseEdit || poseEdit.part !== limb.name)
+        poseEdit = { part: limb.name, rot: q,
+                     pos: sampleClipPose(limb.name, clipCursorMs).pos };
+      poseEdit.rot = q;
+      ed.invalidate();
+      if (done && autoKey) writeKey();
+    },
+  });
 }
 
 /**
@@ -758,6 +850,20 @@ function stepPreview(dt) {
   previewCtx.defSpeed = num(sidecar.speed, 5);
   previewCtx.prefabSize = ed.getDoc()?.size || { x: 1, y: 1, z: 1 };
   previewCtx.rootLimb = skel.rootLimb;
+
+  // Pin the runtime clip instance to the editor's cursor every step.
+  // animSampleAndBlend is the ENGINE's own loop and advances timeMs by
+  // dt*1000 itself, so pre-compensate: after its advance the sample lands
+  // exactly on clipCursorMs — paused (the pose must not drift off the scrub
+  // cursor), scrubbing, or playing (tick() owns the cursor) alike. This also
+  // survives rebuildSkeleton(), which resets anim.clips on every rig edit.
+  {
+    const ci = activeClip ? skel.clips.findIndex(k => k.name === activeClip) : -1;
+    anim.clips = ci >= 0
+      ? [{ clip: ci, timeMs: clipCursorMs - dt * 1000, weight: 1,
+           stopping: false, fade: 1 }]
+      : [];
+  }
 
   const speed = previewCtx.defSpeed * gaitSpeedScale;
 
@@ -897,14 +1003,106 @@ function frameMs(i) {
   return Math.max(1, num(f[i]?.durationMs, DEFAULT_FRAME_MS));
 }
 
+const isRigged = () => limbs().length > 0;
+
+const modelIndexByName = n => ed.getModels().findIndex(m => m.name === n);
+
+// The part a tag's frames animate. The ENGINE requires every frame to name a
+// part (mob.cpp drops frames whose part does not resolve), and in practice a
+// whole tag animates one part, so the UI exposes it per tag. Returns the
+// unique part name, '' when no frame has one, or null when frames disagree.
+function tagPartOf(tag) {
+  const frames = flipbooks()[tag]?.frames || [];
+  let part = '';
+  for (const f of frames) {
+    const p = f.part || '';
+    if (!part) part = p;
+    else if (p && p !== part) return null;          // mixed
+  }
+  return part;
+}
+
+// Default part for a new tag on a rigged file: the selected limb, else root,
+// else the first limb.
+function defaultTagPart() {
+  return (selectedPart && limbByName(selectedPart)) ? selectedPart
+       : (sc().root || limbs()[0]?.name || '');
+}
+
+/**
+ * User navigation to a frame (click / [ ] keys). Also selects the frame's
+ * model so the brushes edit what you are looking at. Automatic PLAYBACK never
+ * comes through here — setActiveModel resets the per-model undo stack, which
+ * is fine for a deliberate switch and disastrous 10x per second.
+ */
 function gotoFrame(i) {
   const n = frameCount();
   if (!n) return;
   frameIndex = ((i % n) + n) % n;
   frameClockMs = 0;
-  ed.setActiveModel(frameModel(frameIndex));
+  if (!playing) ed.setActiveModel(frameModel(frameIndex));
   ed.invalidate();
   renderTimeline();
+}
+
+// Cheap highlight-only refresh for playback: a full renderTimeline() per
+// frame advance would rebuild thumbnails and tear focus out of the duration
+// inputs.
+function updateFrameStrip() {
+  const cells = timelineEl?.querySelectorAll('.framestrip .frame');
+  if (cells) cells.forEach((c, i) => c.classList.toggle('on', i === frameIndex));
+}
+
+function togglePlay() {
+  if (!playing && !frameList() && isRigged()) {
+    // "All models" on a rig would step the view through the LIMBS — always
+    // wrong, and confusing enough that we refuse rather than preview garbage.
+    toast('this file is a rig — flipbooks animate one part: create a tag ' +
+      '(+ tag) to author frames, or use clips / the gait preview', true);
+    return;
+  }
+  playing = !playing;
+  frameClockMs = 0;
+  ed.invalidate();
+  renderTimeline();
+}
+
+/**
+ * What the viewport should show — see editor.js rebuildInstances.
+ * - Flipbook PLAYBACK: the composed frame, exactly what the engine renders.
+ *   For a rig that means every limb's model plus the current frame's model
+ *   swapped in at the flipbooked part's slot (parked variant models hidden);
+ *   for a plain file it means only the current frame's model.
+ * - Gait / clip preview: everything at full brightness.
+ * - Otherwise null: the normal editing view.
+ */
+function viewPlan() {
+  if (playing) {
+    const models = ed.getModels();
+    const frames = frameList();
+    const cur = frames?.[frameIndex];
+    if (cur && cur.part && isRigged()) {
+      const entries = [];
+      for (const l of limbs()) {
+        const mi = modelIndexByName(l.name);
+        if (mi < 0) continue;
+        if (l.name === cur.part) {
+          // The engine swaps the FRAME model's voxels into the part's slot:
+          // draw that model at the part's offset, moving with the part.
+          const fmi = clamp(num(cur.model, mi), 0, models.length - 1);
+          entries.push({ model: fmi, offset: models[mi].offset, xfModel: mi });
+        } else {
+          entries.push({ model: mi });
+        }
+      }
+      return { entries };
+    }
+    // Plain flipbook file (or an implicit all-models book): one frame at a
+    // time, like the engine's microvox flipbooks.
+    return { entries: [{ model: frameModel(frameIndex) }] };
+  }
+  if (gaitOn || clipPlaying || activeClip) return { allBright: true };
+  return null;
 }
 
 function renderTimeline() {
@@ -934,11 +1132,22 @@ function renderTimeline() {
         const n = prompt('tag name (walk / idle / attack / death)', 'idle');
         if (!n) return;
         if (fb[n]) return toast('that tag already exists', true);
-        // Seed with one frame per model so the tag is immediately playable.
-        fb[n] = {
-          frames: ed.getModels().map((_, i) =>
-            ({ model: i, durationMs: DEFAULT_FRAME_MS })),
-        };
+        if (isRigged()) {
+          // The engine's flipbooks are PER-PART: each frame swaps one limb's
+          // model for another model in the file. Seed one frame showing the
+          // part's own model; the author duplicates models for further frames.
+          const part = defaultTagPart();
+          const mi = Math.max(0, modelIndexByName(part));
+          fb[n] = { frames: [{ part, model: mi, durationMs: DEFAULT_FRAME_MS }] };
+          toast(`tag "${n}" animates "${part}" — change it in the part dropdown; ` +
+            'duplicate a model (⧉), edit it, then + to add it as a frame');
+        } else {
+          // Plain flipbook file: every model is a frame (microvox convention).
+          fb[n] = {
+            frames: ed.getModels().map((_, i) =>
+              ({ model: i, durationMs: DEFAULT_FRAME_MS })),
+          };
+        }
         touched();
         activeTag = n;
         gotoFrame(0);
@@ -956,10 +1165,33 @@ function renderTimeline() {
         renderTimeline();
       },
     }, '✕ tag') : null,
-    el('span', { class: 'spacer' }),
+    el('span', { class: 'spacer' }));
+
+  // Part selector for the active tag. The engine DROPS frames whose part does
+  // not resolve to a limb, so a rigged file's tag without a part is dead data
+  // — surface that here instead of at load time in the engine.
+  if (activeTag && isRigged()) {
+    const part = tagPartOf(activeTag);
+    const psel = el('select', { class: 'sortsel', title: 'the limb this flipbook animates' });
+    if (part === null) psel.append(el('option', { value: '' }, '(mixed parts)'));
+    else if (!part) psel.append(el('option', { value: '' }, '⚠ no part — pick one'));
+    for (const l of limbs()) psel.append(el('option', { value: l.name }, l.name));
+    psel.value = part || '';
+    psel.addEventListener('change', () => {
+      if (!psel.value) return;
+      for (const f of (fb[activeTag].frames || [])) f.part = psel.value;
+      touched();
+      renderTimeline();
+    });
+    tagbar.append(el('span', { class: 'hint' }, 'part'), psel);
+  }
+
+  tagbar.append(
     el('button', {
       class: 'small' + (playing ? ' on' : ''),
-      onclick: () => { playing = !playing; frameClockMs = 0; renderTimeline(); },
+      title: 'play the flipbook — the view shows the composed frame, exactly ' +
+        'what the engine renders',
+      onclick: togglePlay,
     }, playing ? '■ stop [space]' : '▶ play [space]'),
     el('button', {
       class: 'small' + (onionOn ? ' on' : ''),
@@ -1019,9 +1251,14 @@ function renderTimeline() {
 
   if (frameList()) {
     strip.append(el('button', {
-      class: 'framadd', title: 'append a frame [+]',
+      class: 'framadd', title: 'append the ACTIVE model as a new frame',
       onclick: () => {
-        frameList().push({ model: ed.getActiveModel(), durationMs: DEFAULT_FRAME_MS });
+        const frame = { model: ed.getActiveModel(), durationMs: DEFAULT_FRAME_MS };
+        // Frames inherit the tag's part — a part-less frame is dead data to
+        // the engine (mob.cpp drops it).
+        const part = tagPartOf(activeTag);
+        if (part) frame.part = part;
+        frameList().push(frame);
         touched();
         gotoFrame(frameCount() - 1);
       },
@@ -1029,13 +1266,28 @@ function renderTimeline() {
   }
   timelineEl.append(strip);
 
+  const partless = isRigged() && frameList() &&
+    frameList().some(f => !f.part || !limbByName(f.part));
   timelineEl.append(el('div', { class: 'hint' },
     frameList()
-      ? 'D duplicate frame · Del delete · [ ] step · drag to reorder · ' +
+      ? (partless
+          ? '⚠ some frames have no valid part — the ENGINE will drop them; ' +
+            'pick a part in the dropdown above. '
+          : '') +
+        'D duplicate frame · Del delete · [ ] step · drag to reorder · ' +
         'space play · O onion'
-      : 'Showing every model in the file. Create a tag to author a flipbook ' +
-        'with per-frame durations.'));
+      : (isRigged()
+          ? 'Showing every model (= limb) in the file for editing. To animate: ' +
+            'K walks the gait, clips pose limbs, and "+ tag" makes a per-part ' +
+            'flipbook (model swap per frame).'
+          : 'Showing every model in the file — playing treats them as flipbook ' +
+            'frames, one at a time. Create a tag for per-frame durations.')));
 
+  // The clip lane renders into its own cleared container: renderClipLane()
+  // is also called standalone (play/auto-key toggles, end of playback) and
+  // appending straight to timelineEl from there would duplicate the lane.
+  clipWrap = el('div', { class: 'clipwrap' });
+  timelineEl.append(clipWrap);
   renderClipLane();
 }
 
@@ -1073,6 +1325,8 @@ function keyTimes(track) {
 }
 
 function renderClipLane() {
+  if (!clipWrap) return;
+  clipWrap.innerHTML = '';
   const C = clips();
   const names = Object.keys(C);
 
@@ -1082,8 +1336,9 @@ function renderClipLane() {
       class: 'small' + (activeClip === n ? ' on' : ''),
       onclick: () => {
         activeClip = activeClip === n ? null : n;
-        clipCursorMs = 0; selectedKey = null; poseEdit = null;
-        syncClipInstance();
+        clipCursorMs = 0; selectedKey = null;
+        clipPlaying = false;
+        reseedPose();
         renderAllPanels();
       },
     }, n));
@@ -1134,13 +1389,13 @@ function renderClipLane() {
     }, 'Key [I]') : null,
     activeClip ? el('button', {
       class: 'small' + (clipPlaying ? ' on' : ''),
-      onclick: () => { clipPlaying = !clipPlaying; syncClipInstance(); renderClipLane(); },
+      onclick: () => { clipPlaying = !clipPlaying; reseedPose(); renderClipLane(); },
     }, clipPlaying ? '■ stop [P]' : '▶ play [P]') : null);
-  timelineEl.append(bar);
+  clipWrap.append(bar);
 
   const c = clipObj();
   if (!c) {
-    timelineEl.append(el('div', { class: 'rignote' },
+    clipWrap.append(el('div', { class: 'rignote' },
       'No clip selected. Clips are keyframed poses layered over the gait; ' +
       'the engine samples them with nlerp between fused quat+pos keys.'));
     return;
@@ -1163,7 +1418,7 @@ function renderClipLane() {
   props.append(field('blendInMs', numInput(c, 'blendInMs', { int: true, ph: '0' })));
   props.append(field('blendOutMs', numInput(c, 'blendOutMs', { int: true, ph: '0' }),
     'non-looping clips only'));
-  timelineEl.append(props);
+  clipWrap.append(props);
 
   /* ---- mask ---- */
   const maskWrap = el('div', { class: 'clipmask' },
@@ -1188,7 +1443,7 @@ function renderClipLane() {
   }
   maskWrap.append(el('span', { class: 'hint' },
     (!c.mask || !c.mask.length) ? '(empty = all parts)' : ''));
-  timelineEl.append(maskWrap);
+  clipWrap.append(maskWrap);
 
   /* ---- scrubber ---- */
   const dur = Math.max(1, num(c.durationMs, 500));
@@ -1198,8 +1453,11 @@ function renderClipLane() {
     const r = scrub.getBoundingClientRect();
     const setT = ev => {
       clipCursorMs = clamp(Math.round((ev.clientX - r.left) / CLIP_PX_PER_MS), 0, dur);
-      syncClipInstance();
-      renderClipLane();
+      // No re-render mid-drag (it would rebuild the element under the
+      // pointer): move the cursor marker and re-seed the pose preview.
+      reseedPose();
+      updateClipCursorUI();
+      ed.invalidate();
     };
     setT(e);
     const mv = ev => setT(ev);
@@ -1213,8 +1471,8 @@ function renderClipLane() {
     scrub.append(el('span', { class: 'ctick', style: `left:${t * CLIP_PX_PER_MS}px` },
       el('i', {}, t + '')));
   scrub.append(el('span', { class: 'ccursor', style: `left:${clipCursorMs * CLIP_PX_PER_MS}px` }));
-  timelineEl.append(el('div', { class: 'clipscrubwrap' },
-    el('span', { class: 'hint' }, clipCursorMs + ' ms'), scrub));
+  clipWrap.append(el('div', { class: 'clipscrubwrap' },
+    el('span', { class: 'hint cliptime' }, Math.round(clipCursorMs) + ' ms'), scrub));
 
   /* ---- per-part key rows ---- */
   const rows = el('div', { class: 'cliprows' });
@@ -1239,7 +1497,8 @@ function renderClipLane() {
           selectedKey = { part: limb.name, tMs: t };
           clipCursorMs = t;
           selectedPart = limb.name;
-          syncClipInstance();
+          bindGizmo();
+          ed.invalidate();
           renderAllPanels();
         },
       }));
@@ -1247,7 +1506,7 @@ function renderClipLane() {
     row.append(lane);
     rows.append(row);
   }
-  timelineEl.append(rows);
+  clipWrap.append(rows);
 
   /* ---- selected key inspector ---- */
   if (selectedKey) {
@@ -1292,12 +1551,22 @@ function renderClipLane() {
           touched(); renderAllPanels();
         },
       }, 'delete key')));
-    timelineEl.append(box);
+    clipWrap.append(box);
   }
 
-  timelineEl.append(el('div', { class: 'hint' },
-    'click a lane to scrub · I key · P play clip · select a part then drag the ' +
-    'rotation rings to pose · auto-key writes on release'));
+  clipWrap.append(el('div', { class: 'hint' },
+    'click a lane to scrub · I key (no ring drag = holds the sampled pose) · ' +
+    'P play clip · select a part then drag the rotation rings to pose · ' +
+    'auto-key writes on release'));
+}
+
+// Playback-rate UI updates: move the cursor marker and the ms label without
+// rebuilding the lane (which would tear focus and event state).
+function updateClipCursorUI() {
+  const cur = clipWrap?.querySelector('.ccursor');
+  if (cur) cur.style.left = (clipCursorMs * CLIP_PX_PER_MS) + 'px';
+  const lbl = clipWrap?.querySelector('.cliptime');
+  if (lbl) lbl.textContent = Math.round(clipCursorMs) + ' ms';
 }
 
 function sortTrack(tr) {
@@ -1317,8 +1586,13 @@ function writeKey() {
   const tr = trackFor(selectedPart);
   const t = Math.round(clipCursorMs);
 
-  const rot = poseEdit && poseEdit.part === selectedPart ? poseEdit.rot : AN.qid();
-  const pos = poseEdit && poseEdit.part === selectedPart ? poseEdit.pos : AN.v3();
+  // No ring drag in progress => key the pose the clip SAMPLES at the cursor
+  // (a "hold" key). Keying identity instead would snap the limb to rest,
+  // which is never what an untouched Key press means.
+  const sampled = sampleClipPose(selectedPart, t);
+  const editing = poseEdit && poseEdit.part === selectedPart;
+  const rot = editing ? poseEdit.rot : sampled.rot;
+  const pos = editing ? poseEdit.pos : sampled.pos;
 
   tr.rot = tr.rot || [];
   let rk = tr.rot.find(k => (+k.t || 0) === t);
@@ -1336,20 +1610,14 @@ function writeKey() {
   sortTrack(tr);
   selectedKey = { part: selectedPart, tMs: t };
   touched();
+  // The pose now lives in the track — sample it back so the rings and the
+  // preview agree with what was actually written.
+  reseedPose();
   toast(`keyed ${selectedPart} @ ${t}ms`);
   renderAllPanels();
 }
 
 const round4 = v => Math.round(v * 10000) / 10000;
-
-// Keep the runtime clip instance in sync with the editor's cursor/playback.
-function syncClipInstance() {
-  if (!skel || !anim) return;
-  const ci = activeClip ? skel.clips.findIndex(c => c.name === activeClip) : -1;
-  if (ci < 0) { anim.clips = []; return; }
-  // Scrubbing drives timeMs directly; playback lets the runtime advance it.
-  anim.clips = [{ clip: ci, timeMs: clipCursorMs, weight: 1, stopping: false, fade: 1 }];
-}
 
 function moveFrame(from, to) {
   const f = frameList();
@@ -1399,13 +1667,33 @@ function deleteFrame() {
 const ONION_PREV = { r: 1.0, g: 0.25, b: 0.25 };
 const ONION_NEXT = { r: 0.3, g: 0.5, b: 1.0 };
 
+// Where the current frame is DRAWN: during playback of a part flipbook the
+// engine shows it in the part's slot; otherwise it sits at its model's own
+// prefab offset (the editing view).
+function frameDrawOffset() {
+  if (playing) {
+    const f = frameList()?.[frameIndex];
+    if (f && f.part) {
+      const mi = modelIndexByName(f.part);
+      if (mi >= 0) return ed.getModels()[mi].offset;
+    }
+  }
+  return ed.getModels()[frameModel(frameIndex)]?.offset;
+}
+
 function appendOnionInstances(cubes, n, cap, m4, col) {
   if (!onionOn) return n;
   const total = frameCount();
   if (total < 2) return n;
 
-  const cur = ed.getModels()[frameModel(frameIndex)];
+  const models = ed.getModels();
+  const cur = models[frameModel(frameIndex)];
   if (!cur) return n;
+  // Ghost frames are drawn IN the current frame's box, whatever offsets their
+  // models are parked at in the file — flipbook frames replace each other in
+  // place in the engine, so an aligned onion is the only useful one. Cells
+  // compare in LOCAL coordinates for the same reason.
+  const base = frameDrawOffset() || cur.offset;
 
   for (let d = 1; d <= onionRange; d++) {
     if (d >= total) break;
@@ -1413,8 +1701,8 @@ function appendOnionInstances(cubes, n, cap, m4, col) {
       // Wrap around the active tag range (see banner).
       const fi = ((frameIndex + dir * d) % total + total) % total;
       if (fi === frameIndex) continue;
-      const m = ed.getModels()[frameModel(fi)];
-      if (!m) continue;
+      const m = models[frameModel(fi)];
+      if (!m || m === cur) continue;
       const tint = dir < 0 ? ONION_PREV : ONION_NEXT;
       const fade = 0.5 / d;              // opacity falloff by distance
 
@@ -1424,16 +1712,12 @@ function appendOnionInstances(cubes, n, cap, m4, col) {
             if (n >= cap) return n;
             const v = m.grid.data[x + y * m.dim.x + z * m.dim.x * m.dim.y];
             if (!v) continue;
-            // Only where the live frame is empty.
-            const lx = x + m.offset.x - cur.offset.x;
-            const ly = y + m.offset.y - cur.offset.y;
-            const lz = z + m.offset.z - cur.offset.z;
-            if (lx >= 0 && ly >= 0 && lz >= 0 &&
-                lx < cur.dim.x && ly < cur.dim.y && lz < cur.dim.z &&
-                cur.grid.data[lx + ly * cur.dim.x + lz * cur.dim.x * cur.dim.y])
+            // Only where the live frame is empty (same local cell).
+            if (x < cur.dim.x && y < cur.dim.y && z < cur.dim.z &&
+                cur.grid.data[x + y * cur.dim.x + z * cur.dim.x * cur.dim.y])
               continue;
-            m4.makeTranslation(x + 0.5 + m.offset.x, y + 0.5 + m.offset.y,
-                               z + 0.5 + m.offset.z);
+            m4.makeTranslation(x + 0.5 + base.x, y + 0.5 + base.y,
+                               z + 0.5 + base.z);
             cubes.setMatrixAt(n, m4);
             col.setRGB(tint.r * fade, tint.g * fade, tint.b * fade);
             cubes.setColorAt(n, col);
@@ -1451,12 +1735,10 @@ function appendOnionInstances(cubes, n, cap, m4, col) {
 // Returns true when the key was consumed. editor.js calls this first.
 function onKey(ev) {
   const k = ev.key.toLowerCase();
-  if (k === ' ' || ev.code === 'Space') {
-    playing = !playing; frameClockMs = 0; renderTimeline(); return true;
-  }
+  if (k === ' ' || ev.code === 'Space') { togglePlay(); return true; }
   if (k === 'o') { onionOn = !onionOn; ed.invalidate(); renderTimeline(); return true; }
   if (k === 'k') { setGait(!gaitOn); renderAllPanels(); return true; }
-  if (k === 'p') { clipPlaying = !clipPlaying; syncClipInstance(); renderClipLane(); return true; }
+  if (k === 'p') { clipPlaying = !clipPlaying; reseedPose(); renderClipLane(); return true; }
   if (k === 'i') { writeKey(); return true; }
   if (k === '[') { gotoFrame(frameIndex - 1); return true; }
   if (k === ']') { gotoFrame(frameIndex + 1); return true; }
@@ -1485,33 +1767,38 @@ function onKey(ev) {
 // Advance playback and the preview runtime. Called from editor.js's rAF loop.
 function tick(dt) {
   if (playing) {
+    // Playback only moves the frame POINTER and the composed view (viewPlan);
+    // it must never call setActiveModel — that resets the per-model undo
+    // stack and, on a rig, marches the edit target through the limbs.
     const n = frameCount();
     if (n > 1) {
       frameClockMs += dt * 1000;
-      let guard = 0;
+      let guard = 0, moved = false;
       while (frameClockMs >= frameMs(frameIndex) && guard++ < 64) {
         frameClockMs -= frameMs(frameIndex);
         frameIndex = (frameIndex + 1) % n;
-        ed.setActiveModel(frameModel(frameIndex));
-        ed.invalidate();
-        renderTimeline();
+        moved = true;
       }
+      if (moved) { ed.invalidate(); updateFrameStrip(); }
     }
   }
 
   if (clipPlaying) {
-    // Advance the cursor ourselves so the scrubber tracks playback; the
-    // runtime instance is re-synced from it each step, which keeps one source
-    // of truth for "where are we in the clip".
+    // Advance the cursor ourselves so the scrubber tracks playback;
+    // stepPreview() re-pins the runtime clip instance to the cursor each
+    // step, which keeps one source of truth for "where are we in the clip".
     const c = clipObj();
     const dur = Math.max(1, num(c?.durationMs, 500));
     clipCursorMs += dt * 1000;
+    let ended = false;
     if (clipCursorMs >= dur) {
       if (c?.loop) clipCursorMs -= dur;
-      else { clipCursorMs = dur; clipPlaying = false; }
+      else { clipCursorMs = dur; clipPlaying = false; ended = true; }
     }
-    syncClipInstance();
-    renderClipLane();
+    updateClipCursorUI();
+    // The full lane re-render is reserved for the discrete end-of-clip event;
+    // per-frame it would rebuild inputs mid-typing and eat the play button.
+    if (ended) { reseedPose(); renderClipLane(); }
   }
 
   if (previewActive()) {
@@ -1540,6 +1827,7 @@ export function attach(opts) {
 export const hooks = {
   selectedPart: () => selectedPart,
   modelTransform,
+  viewPlan,
   appendOnionInstances,
   onKey,
   tick,
@@ -1547,7 +1835,7 @@ export const hooks = {
   onSidecarChanged: () => {
     selectedPart = null; activeTag = null; frameIndex = 0;
     activeClip = null; selectedKey = null; poseEdit = null;
-    clipCursorMs = 0; clipPlaying = false;
+    clipCursorMs = 0; clipPlaying = false; playing = false;
     rebuildSkeleton();
     bindGizmo(); renderAllPanels();
   },

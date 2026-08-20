@@ -430,6 +430,35 @@
   .msw-cell:hover{border-color:var(--acc)}
   .msw-cell.on{box-shadow:0 0 0 2px var(--acc);border-color:var(--acc)}
 
+  .edhelppanel{
+    margin-bottom:8px;padding:8px 10px;background:var(--card);
+    border:1px solid var(--line);border-radius:8px;
+    display:flex;flex-direction:column;gap:6px;
+  }
+  .edhelprow{display:flex;gap:10px;font-size:12px;line-height:1.5}
+  .edhelprow b{
+    flex:none;width:64px;color:var(--acc);font-family:var(--mono);
+    font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding-top:1px;
+  }
+  .edhelprow span{color:var(--dim)}
+
+  .edsliders{display:inline-flex;align-items:center;gap:5px;margin-left:6px}
+  .edsliders input.edslider{width:70px;accent-color:var(--acc)}
+  .edslideval{min-width:28px;font-family:var(--mono)}
+
+  .edwheel{
+    margin-bottom:8px;padding:8px 10px;background:var(--card);
+    border:1px solid var(--line);border-radius:8px;max-width:420px;
+  }
+  .edwheelhead{display:flex;align-items:center;gap:8px;margin-bottom:6px;
+    font-family:var(--mono);font-size:12px}
+  .edwheelbody{display:flex;gap:12px;align-items:flex-start}
+  .edwheelcv{border-radius:50%;cursor:crosshair;flex:none}
+  .edwheelside{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1}
+  .edwheelside input.edslider{width:100%;accent-color:var(--acc)}
+  .edwheelsw{display:flex;gap:3px;flex-wrap:wrap}
+  .edwheelhex{width:90px;font-family:var(--mono)}
+
   .edviewport{
     position:relative;width:100%;height:calc(100vh - 340px);min-height:340px;
     background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:hidden;
@@ -546,6 +575,171 @@
   }
   .ckey:hover{background:#9ec8ff}
   .ckey.on{background:var(--amber);border-color:#a5751f;box-shadow:0 0 6px var(--amber)}
+
+  /* ================= wiki ================= */
+  /* Two panes: a persistent index on the left, the assembled dossier on the
+     right. The index stays put while you read so lateral moves between
+     related entities are one click, which is the whole point of the tab. */
+  .wikiwrap{display:flex;gap:14px;align-items:flex-start}
+  .wikinav{
+    flex:none;width:250px;position:sticky;top:96px;max-height:calc(100vh - 116px);
+    display:flex;flex-direction:column;gap:8px;
+  }
+  .wikinav input[type=search]{width:100%}
+  .wikilist{overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--bg2)}
+  .wikigrp{
+    padding:5px 10px;font-family:var(--mono);font-size:10.5px;letter-spacing:.6px;
+    text-transform:uppercase;color:var(--faint);background:var(--card);
+    border-bottom:1px solid var(--line);position:sticky;top:0;
+  }
+  .wikiitem{
+    display:flex;align-items:center;gap:7px;padding:5px 10px;cursor:pointer;
+    border-bottom:1px solid #1b2129;font-size:13px;
+  }
+  .wikiitem:hover{background:var(--card)}
+  .wikiitem.on{background:#1d2c48;color:var(--acc)}
+  .wikiitem .sw{width:12px;height:12px;border-radius:3px;border:1px solid #0006;flex:none}
+  .wikiitem .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wikiitem .cnt{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .wikibody{flex:1;min-width:0}
+
+  .wikihead{display:flex;align-items:center;gap:12px;margin:0 0 4px}
+  .wikihead .sw{width:34px;height:34px;border-radius:8px;border:1px solid #0006;flex:none}
+  .wikihead h2{margin:0;font-family:var(--mono);font-size:21px}
+  .wikihead .kind{
+    font-family:var(--mono);font-size:11px;color:var(--faint);
+    border:1px solid var(--line2);border-radius:20px;padding:2px 9px;
+  }
+  /* Section cards. Each answers one question about the entity, and they are
+     ordered identity -> inputs -> outputs -> visuals -> knobs -> notes. */
+  .wsec{
+    border:1px solid var(--line);border-radius:9px;background:var(--card);
+    margin:12px 0;overflow:hidden;
+  }
+  .wsec>summary{
+    list-style:none;cursor:pointer;padding:8px 12px;background:var(--card2);
+    display:flex;align-items:center;gap:9px;font-weight:600;
+  }
+  .wsec>summary::-webkit-details-marker{display:none}
+  .wsec>summary::before{content:'\25B8';color:var(--faint);font-size:11px}
+  .wsec[open]>summary::before{content:'\25BE'}
+  .wsec>summary .cnt{
+    margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint);font-weight:400;
+  }
+  .wsecbody{padding:10px 12px}
+  .wempty{color:var(--faint);font-style:italic;padding:2px}
+
+  /* fact grid — the authored fields, with the shader consequence spelled out */
+  .wfacts{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+  .wfacts .k{font-family:var(--mono);font-size:12px;color:var(--dim);white-space:nowrap}
+  .wfacts .v{font-family:var(--mono);font-size:12px}
+  .wfacts .v em{font-family:var(--sans);font-style:normal;color:var(--faint);font-size:12px}
+
+  /* one reaction line, rendered as a sentence rather than a form */
+  .wrule{
+    display:flex;align-items:baseline;gap:8px;padding:5px 7px;border-radius:6px;
+    border:1px solid transparent;font-size:13px;line-height:1.5;
+  }
+  .wrule:hover{background:var(--card2);border-color:var(--line)}
+  .wrule .n{font-family:var(--mono);font-size:10.5px;color:var(--faint);flex:none;width:26px;text-align:right}
+  .wrule .txt{flex:1;min-width:0}
+  .wrule .ch{font-family:var(--mono);font-size:11px;color:var(--dim);flex:none}
+  .wrule code{
+    font-family:var(--mono);background:#0c1017;border:1px solid var(--line);
+    border-radius:4px;padding:0 4px;cursor:pointer;
+  }
+  .wrule code:hover{border-color:var(--acc);color:var(--acc)}
+  .wrule code.tag{color:var(--amber);border-color:#4a3a1c}
+  .wrule .role{
+    font-family:var(--mono);font-size:9.5px;letter-spacing:.5px;text-transform:uppercase;
+    border-radius:3px;padding:1px 5px;flex:none;
+  }
+  .role-self{background:#1d3a6e;color:#9ec8ff}
+  .role-nbr{background:#3a2d5c;color:#c4aaff}
+  .role-out{background:#1d4a32;color:#8ee6a8}
+  .role-tag{background:#4a3a1c;color:var(--amber)}
+
+  /* render-path explanation: what the shader does with this material, and why */
+  .wpath{
+    border-left:3px solid var(--acc);background:#131a26;border-radius:0 7px 7px 0;
+    padding:8px 11px;margin:0 0 10px;
+  }
+  .wpath .t{font-family:var(--mono);font-size:13px;color:var(--acc);margin-bottom:3px}
+  .wpath .why{font-size:12.5px;color:var(--dim);line-height:1.55}
+  .wpath .why code{font-family:var(--mono);color:var(--fg);background:#0c1017;padding:0 4px;border-radius:4px}
+  .wsrc{
+    margin-top:7px;background:#0b0e14;border:1px solid var(--line);border-radius:7px;
+    max-height:340px;overflow:auto;
+  }
+  .wsrc pre{
+    margin:0;padding:8px 10px;font-family:var(--mono);font-size:11.5px;line-height:1.5;
+    color:#b9c4d4;white-space:pre;
+  }
+  .wsrcbar{
+    display:flex;align-items:center;gap:8px;padding:4px 8px;background:var(--card2);
+    border-bottom:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--dim);
+    position:sticky;top:0;
+  }
+  .wsrc mark{background:#3a3410;color:var(--amber);border-radius:2px}
+
+  /* the tuning rows are reused verbatim from the Tuning tab */
+  .wtune{border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:9px}
+  .wtunehd{
+    padding:5px 10px;background:var(--card2);border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:8px;font-size:12.5px;
+  }
+  .wtunehd .ico{font-size:13px}
+  .wmiss{color:var(--amber);font-family:var(--mono);font-size:11px}
+
+  /* ================= notes ================= */
+  .noteswrap{display:flex;gap:14px;align-items:flex-start}
+  .notesnav{flex:none;width:230px;position:sticky;top:96px;display:flex;flex-direction:column;gap:8px}
+  .noteslist{
+    max-height:calc(100vh - 200px);overflow:auto;border:1px solid var(--line);
+    border-radius:8px;background:var(--bg2);
+  }
+  .noteitem{
+    padding:6px 10px;cursor:pointer;border-bottom:1px solid #1b2129;font-size:13px;
+    display:flex;align-items:center;gap:7px;
+  }
+  .noteitem:hover{background:var(--card)}
+  .noteitem.on{background:#1d2c48;color:var(--acc)}
+  .noteitem .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .noteitem .tick{font-family:var(--mono);font-size:10px;color:var(--faint)}
+  .notesbody{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
+  .notesbar{display:flex;align-items:center;gap:8px}
+  .notesbar input.title{
+    flex:1;font-family:var(--mono);font-size:15px;padding:7px 10px;
+    background:var(--card);color:var(--fg);border:1px solid var(--line2);border-radius:7px;
+  }
+  .noteedit{
+    width:100%;min-height:calc(100vh - 260px);resize:vertical;padding:12px 14px;
+    background:var(--card);color:var(--fg);border:1px solid var(--line2);border-radius:8px;
+    font-family:var(--mono);font-size:13px;line-height:1.65;tab-size:2;
+  }
+  .noteedit:focus{outline:none;border-color:var(--acc)}
+  .notestat{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .notestat.saving{color:var(--amber)}
+  .notestat.saved{color:var(--green)}
+  .noteprev{
+    padding:12px 14px;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;line-height:1.7;min-height:200px;
+  }
+  .noteprev h1,.noteprev h2,.noteprev h3{margin:.7em 0 .3em;font-family:var(--mono)}
+  .noteprev h1{font-size:20px}.noteprev h2{font-size:17px}.noteprev h3{font-size:15px}
+  .noteprev code{font-family:var(--mono);background:#0c1017;border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:12.5px}
+  .noteprev pre{background:#0b0e14;border:1px solid var(--line);border-radius:7px;padding:9px 11px;overflow:auto}
+  .noteprev pre code{background:none;border:none;padding:0}
+  .noteprev ul,.noteprev ol{padding-left:22px;margin:.4em 0}
+  .noteprev blockquote{border-left:3px solid var(--line2);margin:.5em 0;padding:2px 12px;color:var(--dim)}
+  .noteprev a.wl{color:var(--acc);cursor:pointer;text-decoration:none;border-bottom:1px dotted var(--acc)}
+  .noteprev a.wl.missing{color:var(--amber);border-bottom-color:var(--amber)}
+  .noteprev hr{border:none;border-top:1px solid var(--line)}
+  /* the note attached to a wiki entity, shown inside its own page */
+  .wnote{width:100%;min-height:150px;resize:vertical;padding:10px 12px;
+    background:#0f141c;color:var(--fg);border:1px solid var(--line2);border-radius:7px;
+    font-family:var(--mono);font-size:12.5px;line-height:1.6;}
+  .wnote:focus{outline:none;border-color:var(--acc)}
 </style>
 </head>
 <body>
@@ -572,6 +766,9 @@
   <span class="tabsep"></span>
   <button data-tab="tuning">Tuning</button>
   <button data-tab="models">Models</button>
+  <span class="tabsep"></span>
+  <button data-tab="wiki">Wiki</button>
+  <button data-tab="notes">Notes</button>
 </nav>
 
 <main>
@@ -674,6 +871,31 @@
 
   <!-- MODELS (voxel editor; assets/editor/editor.js fills this in) -->
   <section class="view" id="view-models"></section>
+
+  <!-- WIKI — every fact about one entity, assembled from all four sources -->
+  <section class="view" id="view-wiki">
+    <div class="wikiwrap">
+      <div class="wikinav">
+        <input type="search" id="wikiSearch" placeholder="search anything&hellip;">
+        <div class="hint" id="wikiHint" style="font-size:11.5px">materials, tags, tuning groups &amp; shaders</div>
+        <div class="wikilist" id="wikiList"></div>
+      </div>
+      <div class="wikibody" id="wikiBody"></div>
+    </div>
+  </section>
+
+  <!-- NOTES — markdown pages autosaved to notes/ -->
+  <section class="view" id="view-notes">
+    <div class="noteswrap">
+      <div class="notesnav">
+        <button id="btnNewNote">+ new page</button>
+        <input type="search" id="noteSearch" placeholder="filter pages&hellip;">
+        <div class="noteslist" id="notesList"></div>
+        <div class="hint" id="notesWhere" style="font-size:11px"></div>
+      </div>
+      <div class="notesbody" id="notesBody"></div>
+    </div>
+  </section>
 </main>
 
 <div id="valbar">
@@ -2309,6 +2531,10 @@ window.__tunerRegisterModels=api=>{
 };
 window.__tunerModelsHooks={
   el, toast, materials:modelsMaterials, onDirty:modelsSetDirty,
+  // The editor's colour wheel writes into mat.materials[..].colors in place;
+  // this marks materials.json dirty so the ordinary save/validation flow
+  // (and the Materials tab, next time it renders) picks the change up.
+  touchMaterials:()=>{if(mat)touch('mat');},
   section:$('#view-models'),
 };
 
