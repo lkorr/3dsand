@@ -11,7 +11,8 @@ struct GLFWwindow;
 struct UIState {
   // stats (read-only in UI)
   float fps = 0;
-  float frameMs = 0;
+  float frameMs = 0;         // window average
+  float frameMsWorst = 0;    // worst frame in the window (hitch visibility)
   float tickCpuMs = 0;       // CPU encode+submit per tick
   uint32_t tick = 0;
   uint32_t activeChunks = 0;

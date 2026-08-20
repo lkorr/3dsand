@@ -110,7 +110,10 @@ grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
   chunk (cx,cy,cz) always maps to slot (cx mod N, cy mod N, cz mod N).
 - Per-chunk metadata (CPU-mirrored, few bytes each):
   - `dirty` — contains moving/reacting voxels; the only chunks the CA dispatches
-  - `nonEmpty` — any voxels at all (empty-space skipping for rendering & raycasts)
+  - `nonEmpty` — any voxels at all (empty-space skipping for rendering & raycasts).
+    Implemented as a packed per-chunk word: low 16 bits = non-air count, high 16 =
+    ray-blocker count (solid/powder/opaque-liquid), so media-blind rays (shadows)
+    skip chunks that hold only gas/translucent liquid (see common.wgsl packOcc)
   - `hasLiquid`, `hasLights` — cheap routing flags
   - `faceOccupancy[6]` — does any voxel touch each boundary face (island detection §7)
 - **Hierarchical dirty flags**: a mip-style tree over chunk flags so the dispatcher
@@ -356,6 +359,40 @@ neighbors, so this needs an explicit connectivity pass:
   them would resample to mush. One body per tick, whole body or nothing (no
   partial settles losing matter). This closes the grid → body → grid loop and
   applies to blast debris and severed mob limbs alike.
+- **Body burn (2026-08-19, implemented):** bodies are outside the CA, so
+  without this a burning plank froze mid-flame the moment it detached.
+  `DebrisSystem::BurnBodies` runs a CPU mirror of the reaction table (same
+  per-material buckets, file order, per-mille chances, counter-based RNG over
+  body serial/tick/voxel) over body voxel payloads each tick. Solid products
+  swap in place (wood→ember, doused ember→wood); non-solid products (ash,
+  smoke, fire) escape into the grid as fill-air-only exact-cell ops at the
+  voxel's world cell, and the voxel leaves the body — burning debris visibly
+  wastes away, its Jolt collider rebuilt batched (≥12 voxels shed, one body
+  per tick), crumbling to grid rubble under 8 voxels. Pair rules match
+  body-internal 6-neighbors AND world cells sampled from the chunk cache
+  (already fetched for terrain meshing), so grid fire ignites a cold wooden
+  body and the fire it emits lights anything nearby through the normal CA.
+  Cost gates: bodies with no self-driven voxels skip entirely unless a chunk
+  they overlap is dirty; scans/ops are budgeted per tick. Burn ops do NOT
+  bump the island-scan freshness watermark — they are additive fill-air
+  writes a stale scan can safely miss, and holding the watermark at the
+  current tick while anything burns would starve island detection forever.
+  Selftest gate: `body burn` (ember-topped wood body must shed voxels and
+  emit fire ops).
+- **Body shatter (2026-08-19, implemented):** when burn removals disconnect a
+  body's voxels, `ShatterBody` splits it: the largest 6-connected component
+  keeps the body, fragments ≥ 8 voxels become bodies of their own at the same
+  pose with inherited momentum (parent collider rebuilt immediately so its
+  ghost boxes don't fight the new body), and smaller clumps re-enter the world
+  as **ballistic particles** at their world positions with the body's rigid
+  point velocity (`lin + ang × r`) — break a body enough and it just turns
+  back into loose voxels. A body burned/broken below 8 voxels dissolves the
+  same way (only when it actually lost voxels that pass — small split halves
+  and mob hands are legitimate bodies and persist). CPU-authored spawns ride a
+  new per-tick `spawnOps` stream consumed by `sim_particle.wgsl spawn`, which
+  appends to the live page exactly like explosion ejecta — part of the tick
+  input stream, so saves/replays capture shatter for free. Selftest gate:
+  `body shatter` (ember-bridge dumbbell must drop its clump as particles).
 - **Terrain-mesh identity rule (2026-08-19):** collision patches rebuild from
   dirty chunks, but a chunk can be dirty for reasons that don't move the
   collision surface (liquid flowing or drying — liquids carry no weight in the
@@ -568,6 +605,40 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.5.2 (2026-08-19)** — fire pass: burning rigidbodies + fire look.
+> Detached islands froze mid-flame forever (bodies are outside the CA);
+> `DebrisSystem::BurnBodies` now runs the reaction table over body payloads —
+> embers advance to ash, emit real grid fire (fill-air-only cell ops), grid
+> fire ignites cold bodies via the chunk cache, burned voxels leave the body
+> (batched collider rebuilds). Removals that disconnect a body shatter it:
+> big fragments become bodies, small clumps and sub-8 remainders re-enter the
+> world as ballistic particles with the body's point velocity, via a new
+> CPU→GPU particle spawn stream (`spawnOps` + `sim_particle.wgsl spawn`).
+> New selftest gates: `body burn`, `body shatter`.
+> Rendering: the media march accumulates per-CELL optical depth + tau-weighted
+> tint (fire→smoke paths shade each stretch with its own material; the
+> saturation early-out is now exact instead of first-material-approximated),
+> plus a separate emissive channel — per-voxel phase flicker, dimmed by the
+> media in front of it, driving a temperature ramp (deep-orange wisps →
+> white-hot plume cores). Ember voxels on debris bodies flicker like their
+> grid counterparts. World hashes unaffected by the render work; burn ops ride
+> the MutationQueue like settle-back (selftest PASS end to end).
+>
+> **v0.5.1 (2026-08-19)** — fire-scene perf pass. Root cause of the burn-time
+> FPS collapse was the renderer, not the CA: gas plumes defeated chunk-level
+> empty-space skipping (occupancy counted any non-air voxel) and media rays had
+> no absorption early-out, so primary AND shadow rays walked entire smoke
+> volumes voxel-by-voxel. Fixes: occupancy word now packs (rayBlockers << 16) |
+> nonAir — shadow rays skip on the blocker count (writers: sim_occupancy,
+> worldgen, stream FillSlots; CPU readers mask low 16) — and trace() stops once
+> accumulated optical depth passes MEDIA_TAU_MAX (~exp(-6) transmittance),
+> writing depth at the stop point so raster geometry can't draw through opaque
+> smoke. Frame-loop honesty: FPS overlay now reports frames/wall-clock over a
+> 0.5 s window + worst-frame ms (the old EMA of 1/dt read 100+ when GPU-bound
+> at <10), and the fixed-tick accumulator clamps its backlog at 4 ticks so a
+> slow stretch no longer leaves the loop in 4-ticks/frame catch-up forever.
+> Render-only + counters: world hashes unaffected (selftest PASS).
+>
 > **v0.5 (2026-08-19)** — engine-debt pass: the three consciously deferred
 > v0.4 simplifications paid down. All selftest-gated (new gates: player-body
 > overlap push, region-store spill roundtrip).

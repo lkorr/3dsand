@@ -36,8 +36,10 @@ constexpr uint32_t kMaxBodies = 200;
 
 class DebrisSystem {
  public:
-  void Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats);
-  void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
+  void Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats,
+            const std::vector<ReactionGpu>& reactions);
+  void OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
+                           const std::vector<ReactionGpu>& reactions);
   // Remove all bodies, terrain patches and pending events (world regen).
   void Reset();
 
@@ -55,9 +57,12 @@ class DebrisSystem {
   void QueueSupportEvents(const WorldSnapshot& snap);
 
   // Once per tick BEFORE SubmitTick: requests chunk fetches, runs any ready
-  // island detections (appends exact-cell ops), maintains terrain collision
-  // meshes around live bodies. `cellOps` must be submitted this tick.
-  void PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
+  // island detections (appends exact-cell ops), burns bodies, maintains
+  // terrain collision meshes around live bodies. `cellOps` and `spawns`
+  // (body fragments re-entering the world as ballistic voxels) must both be
+  // submitted this tick.
+  void PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+               std::vector<ParticleSpawn>& spawns);
 
   // Mob limbs need marching-cubes terrain too: register extra positions for
   // this tick's ManageTerrain sweep (call before PreTick; cleared after).
@@ -100,6 +105,12 @@ class DebrisSystem {
     BodyTransform xf{};
     float radiusVoxels = 0;
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
+    // body burn (fire continuity on rigidbodies):
+    uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
+    uint16_t activeCount = 0;     // voxels with self-driven rules (decay/emit)
+    uint16_t pairCount = 0;       // voxels with pair rules (ignitable/dousable)
+    uint32_t burnCursor = 0;      // rotating scan window into voxels
+    uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
   };
   struct TerrainEntry {
     uint64_t handle = 0;
@@ -115,6 +126,24 @@ class DebrisSystem {
   void RunIslandDetection(const Event& e, uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps);
   void ManageTerrain(uint32_t tick, World& world);
+  // Body burn: a CPU mirror of the reaction table over body voxel payloads,
+  // so detached matter keeps burning (embers advance to ash, emit real fire
+  // into the grid via fill-air-only ops, and grid fire ignites cold bodies
+  // through the chunk cache). Idle bodies cost nothing (see impl comment).
+  void BurnBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                  std::vector<ParticleSpawn>& spawns);
+  void RecountBurn(Body& b) const;
+  bool AnyDirtyNear(const Body& b, const WorldSnapshot& snap, World& world) const;
+  // Break a body whose voxels no longer form one 6-connected component: the
+  // largest piece keeps the body, fragments >= 8 voxels become bodies of
+  // their own (parent collider rebuilt immediately), smaller clumps re-enter
+  // the world as ballistic particles with the body's point velocity — break
+  // a body enough and it just turns back into loose voxels.
+  void ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
+                   std::vector<ParticleSpawn>& spawns);
+  void VoxelsToParticles(const Body& b, const std::vector<DebrisVoxel>& voxels,
+                         Vec3 lin, Vec3 ang, World& world,
+                         std::vector<ParticleSpawn>& spawns) const;
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.
@@ -125,6 +154,13 @@ class DebrisSystem {
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;
+  // body burn tables (rebuilt on materials hot-reload; data-driven, no
+  // hardcoded material IDs — the JSON stays the single source of behavior)
+  std::vector<MaterialGpu> matGpu_;
+  std::vector<ReactionGpu> reactions_;
+  std::vector<uint8_t> matSelfActive_;  // material has decay/emit rules
+  std::vector<uint8_t> matHasPair_;     // material has pair rules
+  uint32_t nextSerial_ = 1;
   std::deque<Event> events_;
   // support-loss plumbing: flagged chunks wait here until the event queue has
   // room (never dropped — a missed final event is a floating island forever).

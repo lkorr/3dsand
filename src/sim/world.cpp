@@ -54,6 +54,8 @@ void World::Init(const wgpu::Device& device) {
                          U::Storage | U::CopyDst, "explosionMask");
   cellOps = CreateBuffer(device, kMaxCellOpsPerTick * sizeof(CellOp),
                          U::Storage | U::CopyDst, "cellOps");
+  spawnOps = CreateBuffer(device, kMaxParticleSpawnsPerTick * sizeof(ParticleSpawn),
+                          U::Storage | U::CopyDst, "spawnOps");
   sprites = CreateBuffer(device, kMaxSprites * sizeof(Sprite), U::Storage | U::CopyDst,
                          "sprites");
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
@@ -173,8 +175,10 @@ void World::KickReadback() {
             for (uint32_t i = 0; i < kNumChunks; i++) {
               snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
               active += snap_.dirtyFlags[i];
-              snap_.occupancy[i] = occW[i];
-              total += occW[i];
+              // GPU word packs (blockers << 16) | nonAir; CPU consumers
+              // (streaming evict, voxelTotal) want the non-air count
+              snap_.occupancy[i] = occW[i] & 0xFFFFu;
+              total += occW[i] & 0xFFFFu;
             }
             snap_.activeChunks = active;
             snap_.voxelTotal = total;

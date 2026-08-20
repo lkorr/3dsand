@@ -24,6 +24,35 @@ constexpr uint32_t kSupportCooldownTicks = 45;
 constexpr int kSupportMargin = 24;
 constexpr int kSupportDrainPerTick = 2;
 
+// Body burn budgets: voxel scans across all bodies per tick, grid writes
+// (emitted fire / escaping ash+smoke) per tick, and how many voxels must burn
+// away before the Jolt collider is rebuilt to match the charred shape.
+constexpr uint32_t kBurnScanPerTick = 4096;
+constexpr uint32_t kBurnOpsPerTick = 384;
+constexpr uint32_t kBurnRebuildVoxels = 12;
+
+// CPU mirror of common.wgsl pcg/hash3 — counter-based, stateless, so burn
+// rolls replay identically for a given (body serial, tick, voxel, rule).
+uint32_t Pcg(uint32_t v) {
+  uint32_t s = v * 747796405u + 2891336453u;
+  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
+  return Pcg(a ^ Pcg(b ^ Pcg(c)));
+}
+
+uint32_t LocalKey(int x, int y, int z) {
+  return (uint32_t)(x & 0xFF) | ((uint32_t)(y & 0xFF) << 8) |
+         ((uint32_t)(z & 0xFF) << 16);
+}
+
+Vec3 QuatRot(const float q[4], Vec3 v) {
+  Vec3 u{q[0], q[1], q[2]};
+  Vec3 t = u.cross(v) * 2.0f;
+  return v + t * q[3] + u.cross(t);
+}
+
 // world CHUNK coord of a world cell (floor shift: valid for negatives)
 IVec3 ChunkOfCell(int x, int y, int z) { return {x >> 4, y >> 4, z >> 4}; }
 // slot linear cell index (what cellOps / sim_mutate `cells` consume)
@@ -39,21 +68,37 @@ int FindMaterialId(const std::vector<MaterialDef>& mats, const std::string& name
 
 }  // namespace
 
-void DebrisSystem::Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats) {
+void DebrisSystem::Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats,
+                        const std::vector<ReactionGpu>& reactions) {
   phys_ = phys;
   world_ = world;
-  OnMaterialsReloaded(mats);
+  OnMaterialsReloaded(mats, reactions);
 }
 
-void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
+void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
+                                       const std::vector<ReactionGpu>& reactions) {
   classOf_.clear();
   densityOf_.clear();
   rubbleOf_.clear();
+  matGpu_.clear();
+  matSelfActive_.clear();
+  matHasPair_.clear();
+  reactions_ = reactions;
   int gravel = FindMaterialId(mats, "gravel");
   int dust = FindMaterialId(mats, "dust");
   for (const auto& m : mats) {
     classOf_.push_back(m.gpu.klass);
     densityOf_.push_back((float)m.gpu.density);
+    matGpu_.push_back(m.gpu);
+    // which rule shapes this material owns (drives the burn-pass gates)
+    uint8_t selfActive = 0, hasPair = 0;
+    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
+      uint32_t kind = reactions_[m.gpu.reactOffset + ri].packed & 3u;
+      if (kind == kReactDecay || kind == kReactEmit) selfActive = 1;
+      if (kind == kReactPair) hasPair = 1;
+    }
+    matSelfActive_.push_back(selfActive);
+    matHasPair_.push_back(hasPair);
     int r = m.rubble.empty() ? -1 : FindMaterialId(mats, m.rubble);
     if (r < 0) {
       bool organic = false;
@@ -62,6 +107,18 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
       r = organic && dust > 0 ? dust : (gravel > 0 ? gravel : 0);
     }
     rubbleOf_.push_back((uint32_t)r);
+  }
+  for (Body& b : bodies_) RecountBurn(b);  // hot-reload can change rule sets
+}
+
+void DebrisSystem::RecountBurn(Body& b) const {
+  b.activeCount = 0;
+  b.pairCount = 0;
+  for (const DebrisVoxel& v : b.voxels) {
+    uint32_t m = v.payload & 0xFFFu;
+    if (m >= matGpu_.size()) continue;
+    if (matSelfActive_[m]) b.activeCount++;
+    if (matHasPair_[m]) b.pairCount++;
   }
 }
 
@@ -278,6 +335,8 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     float ex = (float)(mx.x - mn.x + 1), ey = (float)(mx.y - mn.y + 1),
           ez = (float)(mx.z - mn.z + 1);
     body.radiusVoxels = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) + 2.0f;
+    body.serial = nextSerial_++;
+    RecountBurn(body);
     bodies_.push_back(std::move(body));
     instancesDirty_ = true;
     std::printf("debris: island of %zu voxels -> body (total %zu)\n",
@@ -285,7 +344,8 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   }
 }
 
-void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps) {
+void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                           std::vector<ParticleSpawn>& spawns) {
   // promote flagged support-loss chunks into events while there is queue room
   for (int i = 0; i < kSupportDrainPerTick && !pendingSupport_.empty(); i++) {
     IVec3 wc = pendingSupport_.front();
@@ -316,6 +376,7 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       events_.pop_front();
     }
   }
+  BurnBodies(tick, world, cellOps, spawns);
   SettleBodies(tick, world, cellOps);
   ManageTerrain(tick, world);
 }
@@ -400,6 +461,443 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
   }
 }
 
+// ---- body burn: fire continuity on rigidbodies ----
+// A detached island is CPU state no CA pass touches, so without this a burning
+// plank froze mid-flame the moment it became a body: its embers never advanced,
+// never spread, never lit anything. This pass runs the SAME reaction table
+// (per-material buckets, file order, first-fire-wins, per-mille chances) over
+// body voxel payloads each tick:
+//   - decay/emit rules advance in place: ember -> ash, ember emits fire. The
+//     emitted fire and any non-solid product (ash, smoke) land in the GRID at
+//     the voxel's world cell as fill-air-only CellOps — real fire voxels that
+//     rise, spread, and ignite neighbors through the normal CA rules. Escaped
+//     voxels leave the body, so burning debris visibly wastes away.
+//   - pair rules match body-internal 6-neighbors (ember ignites the wood next
+//     to it inside the body) and world cells sampled from the chunk cache
+//     (already fetched for terrain meshing around every live body), so grid
+//     fire licking a cold wooden body ignites it and water douses its embers.
+// Grid writes ride the MutationQueue like settle-back; RNG is counter-based
+// (serial, tick, voxel, rule). Idle cost is zero: bodies with no self-driven
+// voxels skip unless the sim is actually moving in a chunk they overlap.
+void DebrisSystem::BurnBodies(uint32_t tick, World& world,
+                              std::vector<CellOp>& cellOps,
+                              std::vector<ParticleSpawn>& spawns) {
+  if (reactions_.empty() || bodies_.empty()) return;
+  const WorldSnapshot& snap = world.Snap();
+  uint32_t scanBudget = kBurnScanPerTick;
+  uint32_t opsBudget = kBurnOpsPerTick;
+  bool rebuiltOne = false;
+  // fragment bodies split off by ShatterBody, appended after the loop (a
+  // push_back into bodies_ mid-iteration would invalidate `b`)
+  std::vector<Body> fragments;
+
+  for (size_t bi = 0; bi < bodies_.size();) {
+    Body& b = bodies_[bi];
+    uint32_t n = (uint32_t)b.voxels.size();
+    bool active = b.activeCount > 0;
+    if (n == 0 || scanBudget == 0 || (!active && b.pairCount == 0) ||
+        (!active && !AnyDirtyNear(b, snap, world))) {
+      bi++;
+      continue;
+    }
+
+    // rotation helpers (same quaternion sandwich as SplitBody)
+    const float qx = b.xf.quat[0], qy = b.xf.quat[1], qz = b.xf.quat[2],
+                qw = b.xf.quat[3];
+    auto rotQ = [&](Vec3 v) {
+      Vec3 u{qx, qy, qz};
+      Vec3 t = u.cross(v) * 2.0f;
+      return v + t * qw + u.cross(t);
+    };
+    auto rotInvQ = [&](Vec3 v) {
+      Vec3 u{-qx, -qy, -qz};
+      Vec3 t = u.cross(v) * 2.0f;
+      return v + t * qw + u.cross(t);
+    };
+    auto worldCellOf = [&](const DebrisVoxel& v) {
+      Vec3 wp = b.xf.pos +
+                rotQ(Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f});
+      return IVec3{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
+    };
+    // world direction -> nearest body-local lattice offset (occlusion checks)
+    auto localDirOf = [&](IVec3 d) {
+      Vec3 l = rotInvQ(Vec3{(float)d.x, (float)d.y, (float)d.z});
+      return IVec3{(int)std::lround(l.x), (int)std::lround(l.y),
+                   (int)std::lround(l.z)};
+    };
+    // grid material at a world cell via the chunk cache (terrain meshing keeps
+    // chunks around live bodies fetched + refreshed while they are dirty).
+    // Unknown/missing reads as air: ignition is best-effort, never wrong-way.
+    auto worldMatAt = [&](IVec3 c) -> uint32_t {
+      if (!world.CellInWindow(c)) return 0u;
+      const CachedChunk* cc = world.Cached(ChunkOfCell(c.x, c.y, c.z));
+      if (!cc || cc->voxels.size() != kChunkVol) return 0u;
+      uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+               lz = (uint32_t)(c.z & 15);
+      return cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFFu;
+    };
+    auto nbrMatches = [&](uint32_t nm, const ReactionGpu& r) -> bool {
+      if (nm == 0 || nm >= matGpu_.size()) return false;
+      const MaterialGpu& g = matGpu_[nm];
+      if (r.nbrClass != 0 && ((r.nbrClass >> g.klass) & 1u) == 0) return false;
+      if (r.nbrMat != kNbrAny) return nm == r.nbrMat;
+      if (r.nbrTags != 0) return (g.tagMask & r.nbrTags) != 0;
+      return true;
+    };
+
+    // local occupancy for internal spread; values are voxel indices, entries
+    // whose payload was zeroed this pass read as absent
+    std::unordered_map<uint32_t, uint32_t> local;
+    if (active) {
+      local.reserve(n * 2);
+      for (uint32_t i = 0; i < n; i++)
+        local[LocalKey(b.voxels[i].x, b.voxels[i].y, b.voxels[i].z)] = i;
+    }
+    auto localMatAt = [&](int x, int y, int z) -> uint32_t {
+      if (!active) return 0u;
+      auto it = local.find(LocalKey(x, y, z));
+      if (it == local.end()) return 0u;
+      return b.voxels[it->second].payload & 0xFFFu;
+    };
+
+    uint32_t removed = 0;
+    bool changed = false;
+    // rewrite a voxel to a rule product. Solids swap in place; anything else
+    // (ash, smoke, fire, air) escapes into the grid at the voxel's world cell
+    // and the voxel leaves the body.
+    auto applyProduct = [&](uint32_t vi, uint32_t prod, uint32_t rr) {
+      if (prod == kProdKeep) return;
+      DebrisVoxel& tv = b.voxels[vi];
+      uint32_t pm = prod & 0xFFFu;
+      if (pm != 0 && pm < matGpu_.size() && matGpu_[pm].klass == CLASS_SOLID) {
+        tv.payload = (uint16_t)(pm | (((rr >> 6u) % 3u) << 12u));
+      } else {
+        if (pm != 0 && pm < matGpu_.size() && opsBudget > 0 &&
+            cellOps.size() < kMaxCellOpsPerTick) {
+          IVec3 cell = worldCellOf(tv);
+          if (world.CellInWindow(cell)) {
+            uint32_t state = matGpu_[pm].klass == CLASS_LIQUID
+                                 ? 7u  // LIQ_FULL_STATE
+                                 : (rr >> 6u) % 3u;
+            cellOps.push_back({World::SlotCellIndex(cell),
+                               pm | (state << 12u) | (0xFFu << 16u) | kCellOpIfAir});
+            opsBudget--;
+          }
+        }
+        tv.payload = 0;  // compacted below
+        removed++;
+      }
+      changed = true;
+    };
+
+    const IVec3 kDirs[6] = {{0, 1, 0}, {0, -1, 0}, {1, 0, 0},
+                            {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+    uint32_t steps = std::min(n, scanBudget);
+    scanBudget -= steps;
+    for (uint32_t s = 0; s < steps; s++) {
+      uint32_t vi = (b.burnCursor + s) % n;
+      DebrisVoxel& v = b.voxels[vi];
+      uint32_t m = v.payload & 0xFFFu;
+      if (m == 0 || m >= matGpu_.size()) continue;
+      const MaterialGpu& mg = matGpu_[m];
+      if (mg.reactCount == 0) continue;
+      if (!active && !matHasPair_[m]) continue;
+
+      for (uint32_t ri = 0; ri < mg.reactCount; ri++) {
+        const ReactionGpu& r = reactions_[mg.reactOffset + ri];
+        uint32_t kind = r.packed & 3u;
+        uint32_t dmask = (r.packed >> 2u) & 7u;
+        uint32_t rr = Hash3(b.serial * 0x9E3779B9u + vi, tick, ri);
+        if (rr % 1000u >= r.chance) continue;  // one roll per rule, GPU-style
+        bool fired = false;
+
+        if (kind == kReactDecay) {
+          applyProduct(vi, r.prodSelf, rr);
+          fired = true;
+        } else if (kind == kReactEmit) {
+          // emit in an allowed WORLD direction (fire rises in world space no
+          // matter how the body tumbles), first direction not occluded by the
+          // body itself; IfAir lets grid content win
+          IVec3 cand[6];
+          int nc = 0;
+          if (dmask & kDirUp) cand[nc++] = {0, 1, 0};
+          if (dmask & kDirDown) cand[nc++] = {0, -1, 0};
+          if (dmask & kDirSide) {
+            const IVec3 side[4] = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+            uint32_t rot = rr >> 12u;
+            for (int k = 0; k < 4; k++) cand[nc++] = side[(rot + k) & 3u];
+          }
+          IVec3 wc0 = worldCellOf(v);
+          for (int k = 0; k < nc; k++) {
+            IVec3 ld = localDirOf(cand[k]);
+            if (localMatAt(v.x + ld.x, v.y + ld.y, v.z + ld.z) != 0) continue;
+            IVec3 t{wc0.x + cand[k].x, wc0.y + cand[k].y, wc0.z + cand[k].z};
+            if (world.CellInWindow(t) && opsBudget > 0 &&
+                cellOps.size() < kMaxCellOpsPerTick) {
+              cellOps.push_back({World::SlotCellIndex(t),
+                                 (r.prodNbr & 0xFFFu) | (((rr >> 8u) % 3u) << 12u) |
+                                     (0xFFu << 16u) | kCellOpIfAir});
+              opsBudget--;
+            }
+            fired = true;  // rule consumed even if the write missed the budget
+            break;
+          }
+        } else {  // kReactPair
+          // body-internal neighbors first (ember ignites adjacent wood inside
+          // the plank), then the voxel's own world cell + 6 world neighbors
+          // (grid fire drifts into / around the body's footprint)
+          int matched = -2;  // -2 none, -1 world, >=0 internal voxel index
+          if (active) {
+            for (const IVec3& d : kDirs) {
+              uint32_t nm = localMatAt(v.x + d.x, v.y + d.y, v.z + d.z);
+              if (nm != 0 && nbrMatches(nm, r)) {
+                matched = (int)local[LocalKey(v.x + d.x, v.y + d.y, v.z + d.z)];
+                break;
+              }
+            }
+          }
+          if (matched == -2 && r.prodNbr == kProdKeep) {
+            // world neighbors are read-only: only rules that keep the
+            // neighbor are eligible (a body cannot rewrite grid content)
+            IVec3 wc = worldCellOf(v);
+            if (nbrMatches(worldMatAt(wc), r)) {
+              matched = -1;
+            } else {
+              for (const IVec3& d : kDirs) {
+                if (nbrMatches(worldMatAt({wc.x + d.x, wc.y + d.y, wc.z + d.z}), r)) {
+                  matched = -1;
+                  break;
+                }
+              }
+            }
+          }
+          if (matched != -2) {
+            applyProduct(vi, r.prodSelf, rr);
+            if (matched >= 0 && r.prodNbr != kProdKeep)
+              applyProduct((uint32_t)matched, r.prodNbr, Pcg(rr));
+            fired = true;
+          }
+        }
+        if (fired) {
+          changed = true;
+          break;  // at most one rule per voxel per tick, file order
+        }
+      }
+    }
+    b.burnCursor = n > 0 ? (b.burnCursor + steps) % n : 0;
+
+    if (removed) {
+      b.voxels.erase(std::remove_if(b.voxels.begin(), b.voxels.end(),
+                                    [](const DebrisVoxel& v) { return v.payload == 0; }),
+                     b.voxels.end());
+      b.burnedSinceRebuild += removed;
+      if (!b.voxels.empty()) b.burnCursor %= (uint32_t)b.voxels.size();
+      // removals can disconnect the remainder: split fragments off (bodies /
+      // ballistic particles) before recounting
+      ShatterBody(b, world, fragments, spawns);
+    }
+    if (changed) {
+      RecountBurn(b);
+      instancesDirty_ = true;
+      // NOTE: burn ops deliberately do NOT bump lastCellWriteTick_. They are
+      // additive fill-air-only writes a stale island scan can safely miss;
+      // bumping it every burning tick would hold EventReady's required
+      // version at the current tick forever and starve island detection.
+    }
+
+    // burned/broken below body-worthiness: the remainder re-enters the world
+    // as ballistic voxels carrying the body's momentum (the moving-body
+    // analogue of the <8-voxel island rubble handoff). Gated on THIS pass
+    // having removed voxels — a small body that isn't burning (a 4-voxel
+    // split half, a mob hand) is legitimate and must persist.
+    if (removed > 0 && b.voxels.size() < 8) {
+      Vec3 lin{}, ang{};
+      phys_->GetBodyVelocities(b.handle, lin, ang);
+      VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
+      phys_->RemoveBody(b.handle);
+      bodies_[bi] = std::move(bodies_.back());
+      bodies_.pop_back();
+      instancesDirty_ = true;
+      continue;  // re-examine the swapped-in body at this index
+    }
+
+    // batched collider refresh: the charred shape sheds its burned voxels
+    // (at most one Jolt rebuild per tick across all bodies)
+    if (b.burnedSinceRebuild >= kBurnRebuildVoxels && !rebuiltOne) {
+      Vec3 lin{}, ang{};
+      phys_->GetBodyVelocities(b.handle, lin, ang);
+      uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_);
+      if (nh != 0) {
+        phys_->RemoveBody(b.handle);
+        b.handle = nh;
+        phys_->SetBodyVelocities(nh, lin, ang);
+        b.burnedSinceRebuild = 0;
+        rebuiltOne = true;
+      }
+    }
+    bi++;
+  }
+
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+}
+
+void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragments,
+                               std::vector<ParticleSpawn>& spawns) {
+  const uint32_t n = (uint32_t)b.voxels.size();
+  if (n < 2) return;
+  std::unordered_map<uint32_t, uint32_t> map;
+  map.reserve(n * 2);
+  for (uint32_t i = 0; i < n; i++)
+    map[LocalKey(b.voxels[i].x, b.voxels[i].y, b.voxels[i].z)] = i;
+
+  // 6-connected components in body-local space
+  std::vector<int32_t> comp(n, -1);
+  std::vector<uint32_t> compSize;
+  std::vector<uint32_t> stack;
+  for (uint32_t seed = 0; seed < n; seed++) {
+    if (comp[seed] != -1) continue;
+    int32_t c = (int32_t)compSize.size();
+    uint32_t size = 0;
+    stack.assign(1, seed);
+    comp[seed] = c;
+    while (!stack.empty()) {
+      uint32_t i = stack.back();
+      stack.pop_back();
+      size++;
+      const DebrisVoxel& v = b.voxels[i];
+      const int d[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                           {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+      for (auto& dd : d) {
+        auto it = map.find(LocalKey(v.x + dd[0], v.y + dd[1], v.z + dd[2]));
+        if (it != map.end() && comp[it->second] == -1) {
+          comp[it->second] = c;
+          stack.push_back(it->second);
+        }
+      }
+    }
+    compSize.push_back(size);
+  }
+  if (compSize.size() <= 1) return;
+
+  uint32_t keep = 0;
+  for (uint32_t c = 1; c < compSize.size(); c++)
+    if (compSize[c] > compSize[keep]) keep = c;
+
+  std::vector<std::vector<DebrisVoxel>> parts(compSize.size());
+  for (uint32_t c = 0; c < compSize.size(); c++) parts[c].reserve(compSize[c]);
+  for (uint32_t i = 0; i < n; i++) parts[comp[i]].push_back(b.voxels[i]);
+
+  Vec3 lin{}, ang{};
+  phys_->GetBodyVelocities(b.handle, lin, ang);
+  b.voxels = std::move(parts[keep]);
+  bool madeBody = false;
+
+  for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
+    if (c == keep) continue;
+    if (parts[c].size() >= 8 && bodies_.size() + fragments.size() < kMaxBodies) {
+      // body-worthy fragment: its own body at the same pose, rebased to its
+      // min corner (like SplitBody halves), keeping the parent's momentum
+      IVec3 mn{127, 127, 127};
+      for (const DebrisVoxel& v : parts[c]) {
+        mn.x = std::min<int>(mn.x, v.x);
+        mn.y = std::min<int>(mn.y, v.y);
+        mn.z = std::min<int>(mn.z, v.z);
+      }
+      for (DebrisVoxel& v : parts[c]) {
+        v.x = (int8_t)(v.x - mn.x);
+        v.y = (int8_t)(v.y - mn.y);
+        v.z = (int8_t)(v.z - mn.z);
+      }
+      Body nb;
+      nb.xf = b.xf;
+      nb.xf.pos += QuatRot(b.xf.quat, Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
+      nb.handle = phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_);
+      if (nb.handle != 0) {
+        phys_->SetBodyVelocities(nb.handle, lin, ang);
+        nb.voxels = std::move(parts[c]);
+        float r = 0;
+        for (const DebrisVoxel& v : nb.voxels)
+          r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
+        nb.radiusVoxels = r + 2.0f;
+        nb.serial = nextSerial_++;
+        RecountBurn(nb);
+        fragments.push_back(std::move(nb));
+        madeBody = true;
+        continue;
+      }
+      // body creation failed: fall through to particles (coords were rebased,
+      // but VoxelsToParticles reads them against nb.xf — rebuild not worth it;
+      // un-rebase instead)
+      for (DebrisVoxel& v : parts[c]) {
+        v.x = (int8_t)(v.x + mn.x);
+        v.y = (int8_t)(v.y + mn.y);
+        v.z = (int8_t)(v.z + mn.z);
+      }
+    }
+    // small clump: back to loose voxels, flying with the body's point velocity
+    VoxelsToParticles(b, parts[c], lin, ang, world, spawns);
+  }
+
+  if (madeBody) {
+    // fragment bodies occupy space the parent's old compound still covers:
+    // rebuild the parent NOW or the ghost boxes fight the new bodies
+    uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_);
+    if (nh != 0) {
+      phys_->RemoveBody(b.handle);
+      b.handle = nh;
+      phys_->SetBodyVelocities(nh, lin, ang);
+      b.burnedSinceRebuild = 0;
+    }
+  }
+}
+
+void DebrisSystem::VoxelsToParticles(const Body& b,
+                                     const std::vector<DebrisVoxel>& voxels,
+                                     Vec3 lin, Vec3 ang, World& world,
+                                     std::vector<ParticleSpawn>& spawns) const {
+  for (const DebrisVoxel& v : voxels) {
+    if (spawns.size() >= kMaxParticleSpawnsPerTick) return;  // ring full: lost
+    Vec3 wp = b.xf.pos + QuatRot(b.xf.quat, Vec3{(float)v.x + 0.5f,
+                                                 (float)v.y + 0.5f,
+                                                 (float)v.z + 0.5f});
+    if (!world.CellInWindow({ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)})) continue;
+    // rigid point velocity (voxels/s), converted to fixed 24.8 voxels/tick
+    Vec3 vel = lin + ang.cross(wp - b.xf.pos);
+    ParticleSpawn s;
+    s.px = (int32_t)std::lround(wp.x * 256.0f);
+    s.py = (int32_t)std::lround(wp.y * 256.0f);
+    s.pz = (int32_t)std::lround(wp.z * 256.0f);
+    s.vx = (int32_t)std::lround(vel.x * 256.0f / 30.0f);
+    s.vy = (int32_t)std::lround(vel.y * 256.0f / 30.0f);
+    s.vz = (int32_t)std::lround(vel.z * 256.0f / 30.0f);
+    s.payload = v.payload;
+    s.flags = 1u;  // PFLAG_ALIVE
+    spawns.push_back(s);
+  }
+}
+
+bool DebrisSystem::AnyDirtyNear(const Body& b, const WorldSnapshot& snap,
+                                World& world) const {
+  if (!snap.valid || snap.dirtyFlags.empty()) return false;
+  float r = b.radiusVoxels + 1.0f;
+  int lo[3] = {ifloor(b.xf.pos.x - r) >> 4, ifloor(b.xf.pos.y - r) >> 4,
+               ifloor(b.xf.pos.z - r) >> 4};
+  int hi[3] = {ifloor(b.xf.pos.x + r) >> 4, ifloor(b.xf.pos.y + r) >> 4,
+               ifloor(b.xf.pos.z + r) >> 4};
+  for (int cz = lo[2]; cz <= hi[2]; cz++)
+    for (int cy = lo[1]; cy <= hi[1]; cy++)
+      for (int cx = lo[0]; cx <= hi[0]; cx++) {
+        IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) continue;
+        uint32_t si = World::SlotChunkIndex(wc);
+        if (si < snap.dirtyFlags.size() && snap.dirtyFlags[si]) return true;
+      }
+  return false;
+}
+
 void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels) {
   extraAnchors_.push_back({posVoxel, radiusVoxels});
 }
@@ -419,6 +917,8 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
   float ex = (float)(mx.x - mn.x + 1), ey = (float)(mx.y - mn.y + 1),
         ez = (float)(mx.z - mn.z + 1);
   body.radiusVoxels = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) + 2.0f;
+  body.serial = nextSerial_++;
+  RecountBurn(body);
   bodies_.push_back(std::move(body));
   instancesDirty_ = true;
 }
@@ -487,6 +987,8 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     for (const DebrisVoxel& v : newBodies[h].voxels)
       r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
     newBodies[h].radiusVoxels = r + 2.0f;
+    newBodies[h].serial = nextSerial_++;
+    RecountBurn(newBodies[h]);
     phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
   }
 

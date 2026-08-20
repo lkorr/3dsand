@@ -41,8 +41,8 @@ void Overlay::Draw(UIState& s) {
   ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
   ImGui::Begin("sandvox", nullptr, ImGuiWindowFlags_NoFocusOnAppearing);
 
-  ImGui::Text("%.0f fps  (%.2f ms frame, %.2f ms tick cpu)", s.fps, s.frameMs,
-              s.tickCpuMs);
+  ImGui::Text("%.0f fps  (%.1f ms avg, %.0f ms worst, %.2f ms tick cpu)",
+              s.fps, s.frameMs, s.frameMsWorst, s.tickCpuMs);
   ImGui::Text("tick %u   active chunks %u / 4096", s.tick, s.activeChunks);
   ImGui::Text("voxels %.2f M   particles %u   hash %08x %s", s.voxelTotal / 1e6,
               s.particleCount, s.worldHash, s.mirrorValid ? "" : "(mirror pending)");

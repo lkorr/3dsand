@@ -21,6 +21,7 @@
 @group(0) @binding(0) var<storage, read_write> voxels    : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dirtyIn   : array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut  : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(7) var<storage, read_write> occupancy : array<u32>;
 @group(0) @binding(16) var<storage, read> genList : array<u32>;
@@ -201,27 +202,38 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
 }
 
 var<workgroup> wgCount : atomic<u32>;
+var<workgroup> wgBlock : atomic<u32>;
 
 fn genChunk(slot : u32, li : u32) {
-  if (li == 0u) { atomicStore(&wgCount, 0u); }
+  if (li == 0u) {
+    atomicStore(&wgCount, 0u);
+    atomicStore(&wgBlock, 0u);
+  }
   workgroupBarrier();
 
   let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
                                slot / (NCHUNK * NCHUNK)));
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
   var count = 0u;
+  var block = 0u;
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK, i / (CHUNK * CHUNK)));
     let w = genCell(base + l, T.seed);
     voxels[slot * CHUNK_VOL + i] = w;
-    if ((w & 0xFFFu) != MAT_AIR) { count += 1u; }
+    let m = w & 0xFFFu;
+    if (m != MAT_AIR) {
+      count += 1u;
+      if (isRayBlocker(materials[m])) { block += 1u; }
+    }
   }
   atomicAdd(&wgCount, count);
+  atomicAdd(&wgBlock, block);
   workgroupBarrier();
 
   if (li == 0u) {
     let n = atomicLoad(&wgCount);
-    occupancy[slot] = n;   // in-kernel so the renderer never sees a stale 0
+    // in-kernel so the renderer never sees a stale 0
+    occupancy[slot] = packOcc(n, atomicLoad(&wgBlock));
     if (n > 0u) {          // wake once; loose material settles, then sleeps
       atomicStore(&dirtyIn[slot], 1u);
       atomicStore(&dirtyOut[slot], 1u);

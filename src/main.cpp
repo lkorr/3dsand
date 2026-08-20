@@ -76,11 +76,14 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t seed, const std::vector<BrushOp>& ops,
                 const std::vector<ExplosionOp>& exps,
                 const std::vector<CellOp>& cells, bool hashEnable,
-                IVec3 playerChunk, bool wantReadback, bool particlesActive) {
-  particlesActive = particlesActive || !exps.empty();
+                IVec3 playerChunk, bool wantReadback, bool particlesActive,
+                const std::vector<ParticleSpawn>& spawns = {}) {
+  particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
+  uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
+  tp.spawnCount = spawnCount;
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
@@ -90,6 +93,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     ctx.queue.WriteBuffer(world.expOps, 0, exps.data(), exps.size() * sizeof(ExplosionOp));
   if (cellCount > 0)
     ctx.queue.WriteBuffer(world.cellOps, 0, cells.data(), cellCount * sizeof(CellOp));
+  if (spawnCount > 0)
+    ctx.queue.WriteBuffer(world.spawnOps, 0, spawns.data(),
+                          spawnCount * sizeof(ParticleSpawn));
   if (particlesActive) {
     // the write page starts each tick empty; survivors + emissions repopulate
     uint32_t zero = 0;
@@ -98,7 +104,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 
   wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
-                 particlesActive, cellCount);
+                 particlesActive, cellCount, spawnCount);
   bool doCopy = false;
   if (wantReadback) {
     doCopy = world.EncodeReadbacks(ctx.device, enc,
@@ -519,10 +525,11 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
       debris.QueueSupportEvents(world.Snap());
       std::vector<CellOp> cellOps;
-      debris.PreTick(t + 1, world, cellOps);
+      std::vector<ParticleSpawn> spawns;
+      debris.PreTick(t + 1, world, cellOps, spawns);
       ++t;
       SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, exps, cellOps, false,
-                 {3, (h + 10) / 16, 3}, true, i >= 40 && i < 380);
+                 {3, (h + 10) / 16, 3}, true, i >= 40 && i < 380, spawns);
       ctx.WaitIdle();
       ctx.ProcessEvents();
       phys.Step(kTickDt);
@@ -681,10 +688,11 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
         mobs.PreTick(t + 1, world, ops);
         debris.QueueSupportEvents(world.Snap());
         std::vector<CellOp> cellOps;
-        debris.PreTick(t + 1, world, cellOps);
+        std::vector<ParticleSpawn> spawns;
+        debris.PreTick(t + 1, world, cellOps, spawns);
         ++t;
         SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
-                   {8, h / 16, 8}, true, false);
+                   {8, h / 16, 8}, true, false, spawns);
         ctx.WaitIdle();
         ctx.ProcessEvents();
         phys.Step(kTickDt);
@@ -752,10 +760,11 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     uint32_t t = 8000;
     for (int i = 0; i < 360 && debris.BodyCount() > 0; i++) {
       std::vector<CellOp> cellOps;
-      debris.PreTick(t + 1, world, cellOps);
+      std::vector<ParticleSpawn> spawns;
+      debris.PreTick(t + 1, world, cellOps, spawns);
       ++t;
       SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
-                 {5, h / 16, 5}, true, false);
+                 {5, h / 16, 5}, true, false, spawns);
       ctx.WaitIdle();
       ctx.ProcessEvents();
       phys.Step(kTickDt);
@@ -785,6 +794,91 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     std::printf("body split: %s (%u bodies after cut)\n",
                 splitOk ? "PASS" : "FAIL", debris.BodyCount());
     settleOk = settleOk && splitOk;
+    debris.Reset();
+
+    // body burn: a rigidbody carrying embers must KEEP burning — embers decay
+    // away (voxels leave the body) and emit real fire into the grid so nearby
+    // flammables can catch. This is the fix for detached islands freezing
+    // mid-flame forever.
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    int bh2 = World::TerrainHeight(90, 90, kDefaultSeed);
+    std::vector<DebrisVoxel> plank;
+    for (int z = 0; z < 5; z++)
+      for (int y = 0; y < 5; y++)
+        for (int x = 0; x < 5; x++)
+          plank.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0,
+                           (uint16_t)(y == 4 ? kMatEmber : kMatWood)});
+    uint32_t plankVoxels = (uint32_t)plank.size();
+    uint64_t pb = phys.CreateDebrisBody(plank, {90, bh2 + 4, 90}, dens);
+    BodyTransform pxf{};
+    pxf.pos = Vec3{90, (float)(bh2 + 4), 90};
+    pxf.quat[3] = 1;
+    debris.AdoptBody(pb, plank, pxf);
+    uint32_t fireOps = 0;
+    t = 9000;
+    for (int i = 0; i < 90 && debris.BodyCount() > 0; i++) {
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      debris.PreTick(t + 1, world, cellOps, spawns);
+      for (const CellOp& op : cellOps)
+        if ((op.word & 0xFFFu) == kMatFire) fireOps++;
+      ++t;
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+                 {5, bh2 / 16, 5}, true, false, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+    }
+    std::vector<BodyVoxInst> burnInst;
+    debris.BuildInstances(burnInst);
+    bool burnOk = fireOps > 5 && (uint32_t)burnInst.size() < plankVoxels;
+    std::printf("body burn: %s (%u fire ops emitted, %u -> %zu voxels)\n",
+                burnOk ? "PASS" : "FAIL", fireOps, plankVoxels,
+                burnInst.size());
+    settleOk = settleOk && burnOk;
+    debris.Reset();
+
+    // body shatter: burn through a dumbbell's ember bridge and the small
+    // clump must disconnect and re-enter the world as ballistic particles
+    // (the big plate keeps the body). Spin the body so it never settles.
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<DebrisVoxel> bell;
+    for (int y = 0; y < 3; y++)  // 3x3x1 plate at z=0
+      for (int x = 0; x < 3; x++)
+        bell.push_back({(int8_t)x, (int8_t)y, 0, 0, kMatWood});
+    bell.push_back({1, 1, 1, 0, kMatEmber});  // bridge
+    bell.push_back({1, 1, 2, 0, kMatWood});   // 4-voxel clump beyond it
+    bell.push_back({0, 1, 2, 0, kMatWood});
+    bell.push_back({2, 1, 2, 0, kMatWood});
+    bell.push_back({1, 0, 2, 0, kMatWood});
+    uint64_t db = phys.CreateDebrisBody(bell, {90, bh2 + 6, 90}, dens);
+    BodyTransform dxf{};
+    dxf.pos = Vec3{90, (float)(bh2 + 6), 90};
+    dxf.quat[3] = 1;
+    debris.AdoptBody(db, bell, dxf);
+    phys.SetBodyVelocities(db, Vec3{0, 0, 0}, Vec3{0.4f, 1.2f, 0.3f});
+    uint32_t spawnsSeen = 0;
+    t = 10000;
+    for (int i = 0; i < 400 && debris.BodyCount() > 0 && spawnsSeen < 3; i++) {
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      debris.PreTick(t + 1, world, cellOps, spawns);
+      spawnsSeen += (uint32_t)spawns.size();
+      ++t;
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+                 {5, bh2 / 16, 5}, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+    }
+    bool shatterOk = spawnsSeen >= 3 && debris.BodyCount() == 1;
+    std::printf("body shatter: %s (%u fragment voxels -> particles, %u bodies)\n",
+                shatterOk ? "PASS" : "FAIL", spawnsSeen, debris.BodyCount());
+    settleOk = settleOk && shatterOk;
     debris.Reset();
   }
 
@@ -1092,7 +1186,7 @@ int main(int argc, char** argv) {
   Physics phys;
   if (!phys.Init()) return 1;
   DebrisSystem debris;
-  debris.Init(&phys, &world, mats);
+  debris.Init(&phys, &world, mats, reactions);
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats);
   {
@@ -1105,6 +1199,7 @@ int main(int argc, char** argv) {
   }
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
+  stream.OnMaterialsReloaded(mats);
 
   if (selftest)
     return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream);
@@ -1152,15 +1247,29 @@ int main(int argc, char** argv) {
   uint32_t bodyInstCount = 0;
   double lastTime = NowSec();
   double accumulator = 0;
-  float fpsSmooth = 60, frameMsSmooth = 16, tickMsSmooth = 0;
+  float fpsSmooth = 0, frameMsSmooth = 0, tickMsSmooth = 0, frameMsWorst = 0;
+  double fpsWinStart = lastTime, fpsWinWorst = 0;
+  int fpsWinFrames = 0;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
     double now = NowSec();
     float dt = (float)(now - lastTime);
     lastTime = now;
-    frameMsSmooth += (dt * 1000.0f - frameMsSmooth) * 0.05f;
-    fpsSmooth += (1.0f / std::max(dt, 1e-4f) - fpsSmooth) * 0.05f;
+    // Presented rate = frames / wall-clock over a window. An EMA of the
+    // instantaneous 1/dt over-weights the fast frames whenever the CPU races
+    // ahead of a GPU-bound present queue (several ~5 ms loops, one long
+    // block), and reads 100+ while the screen updates at <10.
+    fpsWinFrames++;
+    fpsWinWorst = std::max(fpsWinWorst, (double)dt);
+    if (now - fpsWinStart >= 0.5) {
+      fpsSmooth = (float)(fpsWinFrames / (now - fpsWinStart));
+      frameMsSmooth = (float)(1000.0 * (now - fpsWinStart) / fpsWinFrames);
+      frameMsWorst = (float)(fpsWinWorst * 1000.0);
+      fpsWinFrames = 0;
+      fpsWinWorst = 0;
+      fpsWinStart = now;
+    }
 
     int fbw = 0, fbh = 0;
     glfwGetFramebufferSize(window, &fbw, &fbh);
@@ -1237,7 +1346,8 @@ int main(int argc, char** argv) {
         mats = std::move(newMats);
         reactions = std::move(newReactions);
         sim.UploadTables(ctx.queue, mats, reactions);
-        debris.OnMaterialsReloaded(mats);
+        debris.OnMaterialsReloaded(mats, reactions);
+        stream.OnMaterialsReloaded(mats);
         // prefabs hot-reload with materials: palette indices may map now
         std::string plog;
         LoadPrefabDir(assetDir + "/prefabs", mats.size(), prefabs, plog);
@@ -1307,6 +1417,10 @@ int main(int argc, char** argv) {
 
     // ---- fixed-tick simulation ----
     accumulator += dt;
+    // Cap the tick backlog: with no cap, any stretch where 30 Hz can't be met
+    // (heavy fire, worldgen, a save) accrues unbounded debt and the loop runs
+    // 4 ticks/frame long after the load has passed. Drop the excess instead.
+    if (accumulator > 4 * kTickDt) accumulator = 4 * kTickDt;
     int ticksThisFrame = 0;
     bool mouseL = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool mouseR = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
@@ -1426,9 +1540,11 @@ int main(int argc, char** argv) {
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
       debris.QueueSupportEvents(world.Snap());
-      // island detection results + terrain collision upkeep (may add cell ops)
+      // island detection results + body burn + terrain collision upkeep
+      // (may add cell ops and particle spawns from shattered bodies)
       std::vector<CellOp> cellOps;
-      debris.PreTick(tick, world, cellOps);
+      std::vector<ParticleSpawn> spawns;
+      debris.PreTick(tick, world, cellOps, spawns);
       // prefab stamps drain after island ops (they win same-cell conflicts)
       placer.PreTick(world, cellOps);
 
@@ -1471,6 +1587,12 @@ int main(int argc, char** argv) {
       for (const BrushOp& b : ops)
         stream.MarkModifiedBox({b.x - b.radius, b.y - b.radius, b.z - b.radius},
                                {b.x + b.radius, b.y + b.radius, b.z + b.radius});
+      // body-shatter spawns keep the particle passes alive exactly like
+      // explosions do (a fragment must fly and land on later ticks too)
+      if (!spawns.empty()) {
+        everExploded = true;
+        lastExplosionTick = tick;
+      }
       bool particlesActive =
           everExploded &&
           (tick - lastExplosionTick < 400 || world.Snap().particleCount > 0);
@@ -1480,7 +1602,8 @@ int main(int argc, char** argv) {
       double t0 = NowSec();
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
-                 tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive);
+                 tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
+                 spawns);
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
       debris.PostStep();
       mobs.PostStep();
@@ -1502,6 +1625,7 @@ int main(int argc, char** argv) {
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;
+      ui.frameMsWorst = frameMsWorst;
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;

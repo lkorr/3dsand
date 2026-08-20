@@ -96,6 +96,7 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(4, T::Storage),          // pArgsStage
         entry(5, T::ReadOnlyStorage),  // explosion ops
         entry(6, T::Storage),          // explosion destruction scratch
+        entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
     };
     d.entryCount = std::size(pentries);
     d.entries = pentries;
@@ -204,6 +205,7 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(4, world_->pArgsStage),
         b(5, world_->expOps),
         b(6, world_->expMask),
+        b(7, world_->spawnOps),
     };
     d.layout = particleBGL_;
     d.entryCount = std::size(pentries);
@@ -288,6 +290,7 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark");
   explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply");
   pArgs1_ = MakeComputePipeline(device, simPL2_, mParticle, "args1", "pArgs1");
+  pSpawn_ = MakeComputePipeline(device, simPL2_, mParticle, "spawn", "pSpawn");
   pIntegrate_ = MakeComputePipeline(device, simPL2_, mParticle, "integrate", "pIntegrate");
   pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2");
   pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve");
@@ -370,7 +373,7 @@ void Simulation::EncodeHashOnly(const wgpu::CommandEncoder& enc) {
 
 void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
-                            uint32_t cellCount) {
+                            uint32_t cellCount, uint32_t spawnCount) {
   enc.ClearBuffer(world_->dirty[1 - page_], 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->argsStage, 0, wgpu::kWholeSize);
   if (particlesActive) enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
@@ -399,6 +402,14 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
       prep.DispatchWorkgroups(kExplosionWg * expCount, kExplosionWg, kExplosionWg);
       prep.SetPipeline(explodeApply_);
       prep.DispatchWorkgroups(kExplosionWg * expCount, kExplosionWg, kExplosionWg);
+    }
+    if (spawnCount > 0) {
+      // CPU particle spawns (debris shatter) append to the read page here,
+      // before args1 sizes the integrate dispatch — same page ejecta uses
+      prep.SetBindGroup(0, simSlimBG_[page_]);
+      prep.SetBindGroup(1, particleBG_[page_]);
+      prep.SetPipeline(pSpawn_);
+      prep.DispatchWorkgroups((spawnCount + 63) / 64, 1, 1);
     }
     // compact dirtyIn -> dense chunk list + indirect args (after mutate/explode
     // so freshly touched chunks simulate this tick)

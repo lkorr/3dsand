@@ -7,6 +7,7 @@
 
 #include "math3d.h"
 #include "sim/chunkstore.h"
+#include "sim/materials.h"
 #include "sim/world.h"
 
 class Simulation;
@@ -42,6 +43,10 @@ bool RleDecodeChunk(const uint16_t* rle, size_t pairs, uint32_t* out);
 class Stream {
  public:
   void Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed);
+
+  // Rebuild the per-material ray-blocker table (occupancy high-16 packing —
+  // see common.wgsl). Call after Init and again on material hot-reload.
+  void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
 
   // Recenter toward playerChunk: at most one 1-chunk shift per axis per call,
   // 2-chunk hysteresis. Call BETWEEN ticks only — a shift must complete before
@@ -112,6 +117,7 @@ class Stream {
   uint32_t seed_ = 0;
   uint32_t shifts_ = 0;
   ChunkStore store_;
+  std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
   std::deque<PendingEvict> pending_;
   std::vector<wgpu::Buffer> stagingPool_;

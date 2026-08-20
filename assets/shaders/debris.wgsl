@@ -134,7 +134,14 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColor(albedo, wn, world, f32(m.emission) / 255.0);
+  // emissive body voxels (embers on burning debris) flicker like their grid
+  // counterparts in raymarch.wgsl — same rate, per-voxel phase
+  var emis = f32(m.emission) / 255.0;
+  if (emis > 0.0) {
+    let fh = pcg(inst * 2917u + (b.packed >> 16u) * 131u);
+    emis *= 0.82 + 0.28 * sin(R.time * 9.0 + f32(fh & 0xFFu) * 0.0245);
+  }
+  out.color = litColor(albedo, wn, world, emis);
   return out;
 }
 

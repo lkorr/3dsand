@@ -102,8 +102,20 @@ struct TickParams {
   uint32_t cellCount;  // exact-cell ops this tick
   uint32_t genCount = 0;   // chunks in genList (worldgen streaming dispatch)
   int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
-  int32_t pad1 = 0;
+  uint32_t spawnCount = 0;  // CPU particle spawns this tick (debris shatter)
 };
+
+// Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
+// spawns: debris-body fragments re-entering the world as ballistic voxels
+// (DESIGN.md §7 shatter). Appended to the live page by sim_particle.wgsl
+// `spawn`; part of the per-tick input stream like BrushOp/CellOp.
+struct ParticleSpawn {
+  int32_t px, py, pz;   // position, fixed 24.8 voxels
+  int32_t vx, vy, vz;   // velocity, fixed 24.8 voxels/tick
+  uint32_t payload;     // bits 0..11 material, 12..15 state
+  uint32_t flags;       // forced to PFLAG_ALIVE on the GPU
+};
+constexpr uint32_t kMaxParticleSpawnsPerTick = 4096;
 
 // Must match RenderParams in common.wgsl (std140-ish: vec3 + pad pairs).
 struct RenderParams {
@@ -235,7 +247,8 @@ class World {
   wgpu::Buffer dispatchArgs;// 3 u32 — indirect-only copy of argsStage; kept out of all
                             // bind groups (Dawn forbids indirect + bound-writable usage
                             // of one buffer in the same pass, even if statically unused)
-  wgpu::Buffer occupancy;   // kNumChunks u32
+  wgpu::Buffer occupancy;   // kNumChunks u32: (rayBlockers << 16) | nonAirCount
+                            // (see the occupancy packing note in common.wgsl)
   wgpu::Buffer support;     // kNumChunks u32 — support-loss flags (sim_step writes,
                             // readback consumes + clears; drives island checks)
   wgpu::Buffer hash;        // 4 u32 (only [0] used)
@@ -255,6 +268,7 @@ class World {
   wgpu::Buffer expOps;          // kMaxExplosionsPerTick ExplosionOp
   wgpu::Buffer expMask;         // per-op destruction scratch (see sim_explode.wgsl)
   wgpu::Buffer cellOps;         // kMaxCellOpsPerTick CellOp (island removal)
+  wgpu::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   wgpu::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
   wgpu::Buffer bodyInstances;   // debris-body voxel instances (render)
   wgpu::Buffer bodyXforms;      // debris-body transforms (render)

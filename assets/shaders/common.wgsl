@@ -81,7 +81,7 @@ struct TickParams {
   cellCount  : u32,  // exact-cell ops this tick
   genCount   : u32,  // chunks in genList this dispatch (worldgen streaming)
   origin     : vec3<i32>,  // residency window origin, CHUNK units (DESIGN.md §3)
-  _p1        : i32,
+  spawnCount : u32,  // CPU particle spawns this tick (debris shatter)
 };
 
 struct PassParams {
@@ -243,6 +243,21 @@ fn chunkSlotIndex(wc : vec3<i32>) -> u32 {
 fn slotToWorldChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
   return o + ((sc - o) & vec3<i32>(NCHUNK_MASK));
 }
+
+// ---- per-chunk occupancy packing ----
+// Low 16 bits: total non-air voxels (chunk-skip for media-aware rays, CPU
+// streaming/save-worthiness). High 16 bits: ray BLOCKERS — voxels that stop a
+// ray as a surface hit (solids, powders, opaque liquids). Shadow rays skip
+// chunks with zero blockers, so smoke/steam plumes stay cheap to shadow.
+// Writers: sim_occupancy (both entries), worldgen genChunk, stream.cpp
+// FillSlots (CPU). Readers must mask; the raw word is not a count.
+fn isRayBlocker(m : Material) -> bool {
+  return m.klass == CLASS_SOLID || m.klass == CLASS_POWDER ||
+         (m.klass == CLASS_LIQUID && (m.flags & MATF_OPAQUE) != 0u);
+}
+fn occTotal(occ : u32) -> u32 { return occ & 0xFFFFu; }
+fn occBlockers(occ : u32) -> u32 { return occ >> 16u; }
+fn packOcc(total : u32, blockers : u32) -> u32 { return total | (blockers << 16u); }
 
 // Voxel word: bits 0..11 material, 12..15 state, 16..23 tick-stamp, 24..31 spare.
 fn voxMat(w : u32) -> u32 { return w & 0xFFFu; }

@@ -44,7 +44,7 @@ class Simulation {
   // ONLY from tick-deterministic inputs (see main.cpp) or determinism breaks.
   void EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
                   bool hashEnable, uint32_t expCount, bool particlesActive,
-                  uint32_t cellCount);
+                  uint32_t cellCount, uint32_t spawnCount = 0);
 
   // Render pass with the shared depth target (raymarch writes frag_depth,
   // raster geometry depth-tests against it). Caller draws UI into same pass.
@@ -89,8 +89,8 @@ class Simulation {
   wgpu::PipelineLayout simPL_, simPL2_, renderPL_;
   wgpu::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
-  wgpu::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pIntegrate_, pArgs2_,
-      pResolve_;
+  wgpu::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
+      pArgs2_, pResolve_;
   wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_;
   wgpu::ShaderModule raymarchModule_, debrisModule_;
   wgpu::TextureFormat targetFormat_ = wgpu::TextureFormat::Undefined;

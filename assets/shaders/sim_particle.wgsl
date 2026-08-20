@@ -19,6 +19,7 @@
 @group(1) @binding(2) var<storage, read_write> counts : array<atomic<u32>>;
 @group(1) @binding(3) var<storage, read_write> claim  : array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read_write> pArgs  : array<u32>;
+@group(1) @binding(7) var<storage, read>       spawnOps : array<Particle>;
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
@@ -82,6 +83,20 @@ fn args2() {
 fn append(p : Particle) {
   let slot = atomicAdd(&counts[1u - T.page], 1u);
   if (slot < PARTICLE_CAP) { pWrite[slot] = p; }
+}
+
+// CPU-authored spawns (debris shatter: body fragments re-entering the world
+// as voxels-in-flight). Appended to the READ page before args1/integrate —
+// same page explosion ejecta uses — so they fly this very tick. The op data
+// is part of the tick's input stream, so replays capture it for free.
+@compute @workgroup_size(64)
+fn spawn(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= T.spawnCount) { return; }
+  let slot = atomicAdd(&counts[T.page], 1u);
+  if (slot >= PARTICLE_CAP) { return; }  // ring full: fragment just vaporizes
+  var p = spawnOps[gid.x];
+  p.flags = PFLAG_ALIVE;
+  pRead[slot] = p;
 }
 
 @compute @workgroup_size(64)

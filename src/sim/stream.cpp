@@ -50,6 +50,15 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   modified_.assign(kNumChunks, 0);
 }
 
+void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
+  // must match isRayBlocker in common.wgsl: solids, powders, opaque liquids
+  blockerOf_.clear();
+  for (const auto& m : mats)
+    blockerOf_.push_back(m.gpu.klass == CLASS_SOLID || m.gpu.klass == CLASS_POWDER ||
+                         (m.gpu.klass == CLASS_LIQUID &&
+                          (m.gpu.flags & kMatFlagOpaque) != 0));
+}
+
 void Stream::Update(IVec3 playerChunk) {
   // harvest evictions whose readback completed since last tick (non-blocking)
   while (!pending_.empty() &&
@@ -219,9 +228,14 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
       ctx_->queue.WriteBuffer(world_->voxels, (uint64_t)s * kChunkBytes,
                               data.data(), kChunkBytes);
-      uint32_t occ = 0;
-      for (uint32_t w : data)
-        if ((w & 0xFFFu) != 0) occ++;
+      uint32_t occ = 0, blockers = 0;
+      for (uint32_t w : data) {
+        uint32_t m = w & 0xFFFu;
+        if (m == 0) continue;
+        occ++;
+        if (m < blockerOf_.size() && blockerOf_[m]) blockers++;
+      }
+      occ |= blockers << 16;  // packing per common.wgsl packOcc
       ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
       // wake once: neighbors may have changed since this chunk was saved
       ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
