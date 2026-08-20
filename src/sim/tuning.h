@@ -192,8 +192,15 @@ struct Tuning {
     float nightZenith[3] = {0.006f, 0.010f, 0.028f};
     float nightHorizon[3] = {0.030f, 0.036f, 0.062f};
     float starBrightness = 1.0f;
-    float starDensity = 220.0f;     // direction-grid cells per unit
-    float starSize = 0.0055f;       // angular radius scale, radians
+    float starDensity = 150.0f;     // direction-grid cells per unit
+    // PSF core radius in PIXELS, not radians. Sizing in pixels is what keeps a
+    // star a point at any resolution/FOV; the first version used a fixed
+    // angular radius ~4x the SUN's, which read as nearby blobs with visible
+    // pixel steps across their falloff.
+    float starSize = 0.85f;
+    // Fraction of grid cells that hold a star (per layer; the fine layer uses
+    // 1.7x this). Low on purpose — filling a fifth of the grid is TV static.
+    float starSparsity = 0.012f;
     float starTwinkle = 0.35f;
     float milkyWayStrength = 0.55f;
     float milkyWayColor[3] = {0.52f, 0.56f, 0.78f};

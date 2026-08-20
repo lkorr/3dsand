@@ -3,13 +3,13 @@
   "player": {
     "flySpeed": 13.75,
     "flySprint": 32.5,
-    "walkSpeed": 4.5,
-    "sprintSpeed": 8.0,
+    "walkSpeed": 20,
+    "sprintSpeed": 8,
     "gravity": 9.81,
     "jumpSpeed": 5.25,
     "swimUp": 17.5,
     "swimDown": 7.5,
-    "maxFall": 30.0,
+    "maxFall": 30,
     "stepUp": 0.58,
     "smoothBump": 0.12,
     "stepSpeedPenaltyPerM": 2.8,
@@ -42,7 +42,7 @@
     "terrainFriction": 0.85,
     "playerProxyFriction": 0.3,
     "explosionImpulseScale": 0.15,
-    "explosionImpulseRadiusScale": 3.0
+    "explosionImpulseRadiusScale": 3
   },
   "debris": {
     "minBodyVoxels": 8,
@@ -54,7 +54,7 @@
     "burnOpsPerTick": 384
   },
   "grenade": {
-    "throwSpeed": 20.0,
+    "throwSpeed": 20,
     "fuse": 2.2,
     "restitution": 0.45,
     "friction": 0.8,
@@ -65,10 +65,10 @@
   "tools": {
     "detonateRadius": 12,
     "detonatePower": 340,
-    "laserRange": 200.0,
+    "laserRange": 200,
     "laserMeltRadius": 2,
     "laserDamage": 1.5,
-    "brushAirDistance": 48.0
+    "brushAirDistance": 48
   },
   "sim": {
     "partGravity": 22,
@@ -96,13 +96,13 @@
       0.85
     ],
     "sunTint": [
-      1.0,
+      1,
       0.9,
       0.7
     ],
-    "sunDiscPower": 800.0,
-    "sunDiscGain": 3.0,
-    "sunHaloPower": 8.0,
+    "sunDiscPower": 800,
+    "sunDiscGain": 3,
+    "sunHaloPower": 8,
     "sunHaloGain": 0.12,
     "sunDir": [
       0.5,
@@ -110,7 +110,7 @@
       0.38
     ],
     "sunColor": [
-      1.0,
+      1,
       0.95,
       0.86
     ],
@@ -135,19 +135,19 @@
     "shadowBias": 0.02,
     "shadowSteps": 384,
     "shadowSoftNear": 0.6,
-    "shadowSoftFar": 9.0,
+    "shadowSoftFar": 9,
     "shadowLift": 0.45,
     "shadowFarLift": 0.3,
-    "grainBroadScale": 11.0,
+    "grainBroadScale": 11,
     "grainFineScale": 2.5,
     "grainMix": 0.68,
     "grainAmp": 0.065,
     "grainAmpFar": 0.05,
     "mediaAbsorb": 6.4,
-    "mediaTauMax": 6.0,
+    "mediaTauMax": 6,
     "fireFlickerBase": 0.7,
     "fireFlickerAmp": 0.55,
-    "fireFlickerRate": 13.0,
+    "fireFlickerRate": 13,
     "fireGlowRate": 1.4,
     "fireIntensity": 2.1,
     "fireBreatheAmp": 0.08,
@@ -155,7 +155,7 @@
     "emissiveStrength": 1.7,
     "emissiveFlickerBase": 0.82,
     "emissiveFlickerAmp": 0.28,
-    "emissiveFlickerRate": 9.0,
+    "emissiveFlickerRate": 9,
     "waterF0": 0.0204,
     "waterAbsorb": [
       1.85,
@@ -167,16 +167,16 @@
       0.16,
       0.2
     ],
-    "waterFresnelPower": 5.0,
-    "rippleAmpScale": 1.0,
-    "rippleSpeedScale": 1.0,
+    "waterFresnelPower": 5,
+    "rippleAmpScale": 1,
+    "rippleSpeedScale": 1,
     "reflectionCutoff": 0.06,
     "reflectionSteps": 96,
     "causticGain": 1.5,
     "causticCap": 0.85,
     "glintIntensity": 0.85,
-    "glintPowerNear": 180.0,
-    "glintPowerFar": 900.0,
+    "glintPowerNear": 180,
+    "glintPowerFar": 900,
     "foamDepth": 0.42,
     "foamStrength": 0.55,
     "lavaCrackFreq": 2.4,
@@ -188,7 +188,7 @@
     "lavaPulseRate": 0.9,
     "heatSpillStrength": 0.16,
     "emberBrightness": 2.2,
-    "emberRise": 26.0,
+    "emberRise": 26,
     "emberRate": 3.4,
     "emberDensity": 84,
     "exposureWhite": 4.2,
@@ -196,18 +196,18 @@
     "gamma": 2.2,
     "primarySteps": 4096,
     "farSteps": 384,
-    "skyRayleigh": 12.0,
-    "skyMie": 1.0,
+    "skyRayleigh": 12,
+    "skyMie": 1,
     "skyMieG": 0.76,
-    "skyMieStrength": 1.0,
+    "skyMieStrength": 1,
     "skyExposure": 1.6,
     "skyGround": [
       0.22,
       0.2,
       0.17
     ],
-    "sunSize": 3.0,
-    "sunReddening": 1.0,
+    "sunSize": 3,
+    "sunReddening": 1,
     "nightZenith": [
       0.006,
       0.01,
@@ -218,9 +218,9 @@
       0.036,
       0.062
     ],
-    "starBrightness": 1.0,
-    "starDensity": 220.0,
-    "starSize": 0.0055,
+    "starBrightness": 1,
+    "starDensity": 150.0,
+    "starSize": 0.85,
     "starTwinkle": 0.35,
     "milkyWayStrength": 0.55,
     "milkyWayColor": [
@@ -240,7 +240,7 @@
       0.38
     ],
     "auroraStrength": 0.55,
-    "auroraHeight": 900.0,
+    "auroraHeight": 900,
     "auroraLow": [
       0.1,
       0.85,
@@ -263,7 +263,7 @@
     "moonLightColor": [
       0.55,
       0.68,
-      1.0
+      1
     ],
     "moonLightIntensity": 0.16,
     "nightAmbSky": [
@@ -275,7 +275,8 @@
       0.022,
       0.026,
       0.042
-    ]
+    ],
+    "starSparsity": 0.012
   },
   "worldgen": {
     "treeline": 72,
@@ -306,11 +307,11 @@
     "cycleMinutes": 20,
     "freeze": 0,
     "freezePhase": 32768,
-    "sunPeakElevation": 58.0,
-    "sunAzimuth": 24.0,
+    "sunPeakElevation": 58,
+    "sunAzimuth": 24,
     "twilightWidth": 0.22,
     "lunarPeriodDays": 8,
-    "moonInclination": 18.0,
-    "starRotSpeed": 1.0
+    "moonInclination": 18,
+    "starRotSpeed": 1
   }
 }

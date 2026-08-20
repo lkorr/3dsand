@@ -120,11 +120,28 @@ fn sunTransmittance(mass : f32) -> vec3f {
 }
 
 // ---- starfield ----------------------------------------------------------
-// Stars are point sources: the honest way to draw them is to find the nearest
-// cell centre in a hashed direction grid and measure angular distance to it,
-// which gives round stars of controllable size that do NOT swim or alias as
-// the camera turns (the classic `step(0.99, hash(dir))` starfield sparkles
-// horribly under rotation because it samples a volume, not a point).
+// A star is a POINT SOURCE. It has no resolvable disc — even Betelgeuse is
+// ~0.05 arcsec, thousands of times smaller than one pixel. What reaches the
+// eye is a point spread function roughly one pixel wide, and brighter stars
+// look "bigger" only because their PSF wings clear the visibility floor.
+//
+// ---- WHY SIZE IS MEASURED IN PIXELS, NOT RADIANS ----
+// The first version used a fixed angular radius (0.0055 rad, ~4x the SUN's
+// angular radius — genuinely enormous) and a Gaussian falloff across it. Two
+// consequences, both of which were visible immediately:
+//   * the stars read as nearby round blobs rather than distant points, and
+//   * because the falloff spanned many pixels, its per-pixel steps were
+//     directly visible as chunky squares.
+// Sizing the PSF in PIXELS instead makes a star exactly as small as the
+// display allows at any resolution or FOV, which is what "infinitely far
+// away" actually looks like. `pxAng` below is the angular size of one pixel.
+//
+// Density is deliberately low. Naked-eye stars number ~5000 over the whole
+// sphere, of which a fraction are in frame; filling a fifth of a fine grid
+// (the first version's ~21% across two layers) is the TV-static look. The
+// magnitude distribution matters as much as the count: real skies have a very
+// few bright stars and a long tail of faint ones, so `mag` is raised to a
+// high power to make bright stars genuinely rare.
 fn starField(dir : vec3f) -> vec3f {
   // Wheel the sky about the celestial pole. A tilted axis (not straight up)
   // means stars rise and set at an angle, which is most of what makes a night
@@ -133,13 +150,18 @@ fn starField(dir : vec3f) -> vec3f {
   let sa = sin(R.starRot);
   let axis = normalize(vec3f(0.28, 0.92, 0.0));
   // Rodrigues rotation about `axis`.
-  let d = dir * ca + cross(axis, dir) * sa + axis * dot(axis, dir) * (1.0 - ca);
+  let d = normalize(dir * ca + cross(axis, dir) * sa +
+                    axis * dot(axis, dir) * (1.0 - ca));
+
+  // Angular size of one pixel. The PSF is built as a multiple of this, so a
+  // star stays a point at any resolution instead of growing with the window.
+  let pxAng = max(R.tanHalfFov * 2.0 / max(R.viewPx, 1.0), 1e-7);
 
   var acc = vec3f(0.0);
-  // Two layers at different densities: a sparse layer of bright named-star
-  // sized points, and a dense faint layer that reads as depth.
+  // Two layers: a sparse bright layer (the stars you would actually name) and
+  // a finer, much fainter layer that gives the sky depth without texture.
   for (var layer = 0u; layer < 2u; layer++) {
-    let scale = select(TUNE_STAR_DENSITY, TUNE_STAR_DENSITY * 2.3, layer == 1u);
+    let scale = select(TUNE_STAR_DENSITY, TUNE_STAR_DENSITY * 2.7, layer == 1u);
     let p = d * scale;
     let cell = floor(p);
     // Only the containing cell matters: star jitter is kept under half a cell
@@ -148,31 +170,50 @@ fn starField(dir : vec3f) -> vec3f {
                     (i32(cell.z) * 83492791)) ^ (layer * 0x9E3779B9u));
     let hf = vec3f(f32(h & 0x3FFu), f32((h >> 10u) & 0x3FFu),
                    f32((h >> 20u) & 0x3FFu)) / 1023.0;
-    // Density gate: only a fraction of cells hold a star at all.
+    // Density gate: only a small fraction of cells hold a star at all.
     let occupancyRoll = f32((h >> 6u) & 0xFFu) / 255.0;
-    let thresh = select(0.055, 0.16, layer == 1u);
+    let thresh = select(TUNE_STAR_SPARSITY, TUNE_STAR_SPARSITY * 1.7, layer == 1u);
     if (occupancyRoll > thresh) { continue; }
     // Star centre, jittered within the cell, projected back to the sphere.
     let centre = normalize(cell + 0.5 + (hf - 0.5) * 0.8);
-    let cosAng = clamp(dot(normalize(d), centre), -1.0, 1.0);
-    // Angular distance, small-angle. Size varies per star (magnitude).
+    let cosAng = clamp(dot(d, centre), -1.0, 1.0);
     let ang = acos(cosAng);
-    let mag = f32((h >> 18u) & 0xFFu) / 255.0;
-    let size = TUNE_STAR_SIZE * (0.35 + mag * mag * 1.65) *
-               select(1.0, 0.55, layer == 1u);
-    if (ang > size * 3.0) { continue; }
-    // Gaussian-ish core so bright stars have a small halo, like a real PSF.
-    var b = exp(-(ang * ang) / max(size * size * 0.35, 1e-9));
+
+    // Magnitude: mag^4 so bright stars are rare and most of the field is faint.
+    let magRaw = f32((h >> 18u) & 0xFFu) / 255.0;
+    let mag = magRaw * magRaw * magRaw * magRaw;
+
+    // PSF core radius in PIXELS. Even the brightest star stays close to a
+    // single pixel; TUNE_STAR_SIZE scales the whole field for taste.
+    let corePx = TUNE_STAR_SIZE * (0.62 + mag * 0.85) *
+                 select(1.0, 0.72, layer == 1u);
+    let core = corePx * pxAng;
+    // Cull well outside the visible wings — cheap early-out for most pixels.
+    if (ang > core * 4.0) { continue; }
+
+    // Airy-like profile: a tight Gaussian core plus a much weaker, wider skirt.
+    // The skirt is what makes a bright star read as bright rather than merely
+    // as a lit pixel, and it is what the eye interprets as "size".
+    let x = ang / core;
+    var b = exp(-x * x * 2.2) + 0.10 * exp(-x * x * 0.35);
+
     // Twinkle: scintillation is atmospheric, so it is strongest near the
-    // horizon where the air mass is greatest. Phase is per-star.
-    let tw = sin(R.time * (1.7 + mag * 4.3) + f32(h & 0xFFFFu) * 0.001);
-    let horizonBoost = 1.0 + 2.5 * (1.0 - clamp(d.y, 0.0, 1.0));
+    // horizon where the air mass is greatest, and absent at the zenith.
+    let tw = sin(R.time * (1.7 + magRaw * 4.3) + f32(h & 0xFFFFu) * 0.001);
+    let horizonBoost = 1.0 + 2.0 * (1.0 - clamp(d.y, 0.0, 1.0));
     b *= 1.0 + TUNE_STAR_TWINKLE * horizonBoost * tw;
-    // Colour by stellar temperature: hot blue-white through cool orange.
+
+    // Fade stars out toward the horizon: real ones are extinguished by the
+    // long air path, and it also stops the starfield from meeting the terrain
+    // in a hard line. Uses the UNROTATED direction — extinction is fixed to
+    // the observer's horizon, not to the rotating celestial sphere.
+    let horizonFade = smoothstep(-0.02, 0.16, dir.y);
+
+    // Colour by stellar temperature: cool orange through hot blue-white.
     let temp = f32((h >> 26u) & 0x3Fu) / 63.0;
-    let col = mix(vec3f(1.0, 0.72, 0.52), vec3f(0.72, 0.82, 1.0), temp);
-    acc += col * max(b, 0.0) * (0.45 + mag * 1.4) *
-           select(1.0, 0.45, layer == 1u);
+    let col = mix(vec3f(1.0, 0.78, 0.62), vec3f(0.76, 0.85, 1.0), temp);
+    acc += col * max(b, 0.0) * (0.20 + mag * 2.2) * horizonFade *
+           select(1.0, 0.35, layer == 1u);
   }
   return acc * TUNE_STAR_BRIGHTNESS;
 }
@@ -219,7 +260,10 @@ fn fbm(p : vec3f, octaves : u32) -> f32 {
 // — a bright galactic band, coloured nebulae, and slow curtains of aurora that
 // give the dome motion. Built in three layers so each is separately tunable
 // and any of them can be turned off.
-fn nightSky(rd : vec3f) -> vec3f {
+// Returns SMOOTH night emission only — no stars. Stars are added separately by
+// skyColorNoBodies(), so that fog and reflection lookups can take this and get
+// the right colour without point sources bleeding into solid geometry.
+fn nightGlow(rd : vec3f) -> vec3f {
   // Base gradient: deep indigo overhead easing to a warmer, lighter horizon
   // (airglow plus whatever light pollution the world implies).
   let up = clamp(rd.y, 0.0, 1.0);
@@ -251,9 +295,6 @@ fn nightSky(rd : vec3f) -> vec3f {
        TUNE_NEBULA_STRENGTH;
   c += TUNE_NEBULA_WARM * smoothstep(0.58, 0.92, n2) * nebMask *
        TUNE_NEBULA_STRENGTH * 0.8;
-
-  // Stars over the top of the nebulae, so bright stars sit in front.
-  c += starField(rd);
 
   // Aurora: vertical curtains that ripple. Modelled as a height-banded noise
   // field in the horizontal plane, faded in above the horizon and out toward
@@ -436,35 +477,46 @@ fn sunDisc(rd : vec3f) -> vec3f {
   return sunTransmittance(sunMass) * limb * disc * TUNE_SUN_DISC_GAIN * 40.0;
 }
 
-// Full sky including celestial bodies. `withBodies` is false for reflection
-// and fog lookups, which want the dome but not a second sun.
-fn skyDome(rdIn : vec3f, withBodies : bool) -> vec3f {
+// ---- the three sky tiers -------------------------------------------------
+// Point-like detail (stars, sun disc, moon disc) belongs ONLY to a primary ray
+// that actually escaped to space. Everything else — fog targets, reflections
+// off LOD water, ambient lookups — must use the smooth tier, because those
+// consumers integrate over a solid angle far larger than a star.
+//
+// Getting this wrong is not subtle: aerial perspective converging on the full
+// sky rendered stars *through* distant terrain and below the horizon line,
+// since heavily-fogged surfaces are exactly the ones that take the most sky.
+//
+// Tier 1 — skyAirglow(): smooth emission only. Gradient + galactic band +
+//          nebulae, no point sources. This is the fog/reflection/ambient target.
+// Tier 2 — skyColorNoBodies(): airglow + stars, no sun/moon discs. For a
+//          primary ray that reached space where a mirrored sun would double up.
+// Tier 3 — skyColor(): everything. Background pixels only.
+fn skyAirglow(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
-  // Daylight weight: crossfade the whole night sky out as the sun rises. Uses
-  // the CPU-smoothed sunUp rather than sunDir.y directly so the transition is
-  // shaped by the tuner rather than by raw geometry.
   let dayW = R.sunUp;
-
   var c = daySky(rd) * dayW;
-
-  if (dayW < 0.999) {
-    var night = nightSky(rd);
-    if (withBodies) { night += moonLayer(rd); }
-    // Stars and nebulae fade under daylight rather than popping off.
-    c += night * (1.0 - dayW);
-  }
-
-  if (withBodies && dayW > 0.001) {
-    c += sunDisc(rd) * dayW;
-  }
+  if (dayW < 0.999) { c += nightGlow(rd) * (1.0 - dayW); }
   return max(c, vec3f(0.0));
 }
 
-// The renderer's general "what colour is the sky here" entry point, used by
-// the background, the fog target and ambient. Includes the sun/moon.
-fn skyColor(rd : vec3f) -> vec3f { return skyDome(rd, true); }
-// Body-free variant for reflections and aerial perspective.
-fn skyColorNoBodies(rd : vec3f) -> vec3f { return skyDome(rd, false); }
+fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
+  let rd = normalize(rdIn);
+  let dayW = R.sunUp;
+  var c = skyAirglow(rd);
+  // Stars fade out under daylight rather than popping off.
+  if (dayW < 0.999) { c += starField(rd) * (1.0 - dayW); }
+  return max(c, vec3f(0.0));
+}
+
+fn skyColor(rdIn : vec3f) -> vec3f {
+  let rd = normalize(rdIn);
+  let dayW = R.sunUp;
+  var c = skyColorNoBodies(rd);
+  if (dayW < 0.999) { c += moonLayer(rd) * (1.0 - dayW); }
+  if (dayW > 0.001) { c += sunDisc(rd) * dayW; }
+  return max(c, vec3f(0.0));
+}
 
 // ---- direct light: sun by day, moon by night --------------------------------
 // One function so every shading path (near field, far field, reflections,
@@ -1019,7 +1071,13 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // read as a gray veil over the whole horizon instead of atmosphere.
 fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   let f = 1.0 - exp(-tFine * VOXEL_METERS * R.fogDensity);
-  return mix(color, skyColor(rd), f);
+  // Star-free sky. Aerial perspective is AIR between the eye and a SOLID
+  // surface, so it must converge to the airglow in that direction and nothing
+  // else. Using the full skyColor() here mixes the starfield, moon and
+  // nebulae into distant terrain — which renders stars *through* hillsides,
+  // trees and the ground near the horizon, because those surfaces are exactly
+  // the ones carrying the most fog.
+  return mix(color, skyAirglow(rd), f);
 }
 
 // ============================================================================
@@ -2116,8 +2174,11 @@ fn fs(in : VSOut) -> FSOut {
       if (m.klass == CLASS_LIQUID) {
         albedo = unpackColor(m.color0);
         // distant water: a touch of sky reflection on up-facing surfaces so
-        // lakes read as water instead of flat blue paint
-        if (n.y > 0.5) { albedo = mix(albedo, skyColor(reflect(rd, n)), 0.35); }
+        // lakes read as water instead of flat blue paint. Airglow only — a
+        // full skyColor() here reflects individual stars off LOD-scale water
+        // cells, which is both wrong (a star is far below a cascade cell's
+        // angular footprint) and reads as sparkling noise on every far lake.
+        if (n.y > 0.5) { albedo = mix(albedo, skyAirglow(reflect(rd, n)), 0.35); }
       }
       // Match the near field's face weights exactly — a different constant
       // here is a visible brightness step at the window seam.

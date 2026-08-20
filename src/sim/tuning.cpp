@@ -382,6 +382,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "starBrightness", r.starBrightness, out, at);
     ReadF(*g, "starDensity", r.starDensity, out, at);
     ReadF(*g, "starSize", r.starSize, out, at);
+    ReadF(*g, "starSparsity", r.starSparsity, out, at);
     ReadF(*g, "starTwinkle", r.starTwinkle, out, at);
     ReadF(*g, "milkyWayStrength", r.milkyWayStrength, out, at);
     ReadV3(*g, "milkyWayColor", r.milkyWayColor, out, at);
@@ -483,8 +484,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // moonRadius divides when building the lunar disc frame, and skyMieG at
     // exactly +-1 makes the Henyey-Greenstein denominator collapse.
     if (r.starSize <= 0.0f) {
-      out.warnings.push_back("render.starSize must be > 0; reset to 0.0055");
-      r.starSize = 0.0055f;
+      out.warnings.push_back("render.starSize must be > 0; reset to 0.85");
+      r.starSize = 0.85f;
+    }
+    if (r.starSparsity < 0.0f || r.starSparsity > 1.0f) {
+      out.warnings.push_back("render.starSparsity outside 0..1; clamped");
+      r.starSparsity = r.starSparsity < 0.0f ? 0.0f : 1.0f;
     }
     if (r.starDensity < 1.0f) {
       out.warnings.push_back("render.starDensity < 1; clamped to 1");
@@ -597,6 +602,7 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitF(o, "TUNE_STAR_BRIGHTNESS", r.starBrightness);
   EmitF(o, "TUNE_STAR_DENSITY", r.starDensity);
   EmitF(o, "TUNE_STAR_SIZE", r.starSize);
+  EmitF(o, "TUNE_STAR_SPARSITY", r.starSparsity);
   EmitF(o, "TUNE_STAR_TWINKLE", r.starTwinkle);
   EmitF(o, "TUNE_MILKYWAY_STRENGTH", r.milkyWayStrength);
   EmitV3(o, "TUNE_MILKYWAY_COLOR", r.milkyWayColor);
