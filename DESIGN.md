@@ -367,6 +367,43 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   These compile into the spare word of the 32-byte reaction entry, so the
   struct did not grow. Everything about them is integer and tick-derived,
   which is what keeps a sun-driven reaction inside the determinism rule.
+- **Neighbour-count scaling (2026-08-20):** a decay rule's chance may scale with
+  how many of its 6 face neighbours match a predicate, where a count of **zero
+  forbids the rule outright**. This is what turns a uniform nucleation rule into
+  a spreading frontier:
+  ```json
+  { "self": "water", "decay": true, "becomes": "ice",
+    "needsSky": true, "when": "night", "chance": 1,
+    "scaleByNeighbors": { "neighbor": "water", "invert": true, "scaleMax": 4.0 } }
+  ```
+  Water scaled by its count of *non*-water neighbours freezes shore-first: bank
+  and surface cells count 2–3 and freeze fastest, every voxel that freezes is
+  itself non-water and so raises its neighbours' odds, and water enclosed by
+  water counts 0 and cannot freeze until the front reaches it. The ice creeps
+  inward instead of speckling.
+
+  Three constraints shaped the design:
+  - The predicate **reuses `nbrMat`/`nbrTags`/`nbrClass`**, which a decay rule
+    leaves unused. So the counted set speaks the vocabulary pair rules already
+    use, no new field was needed for the 12-bit id, and the entry stayed 32
+    bytes. Scaling is *rejected* on pair rules, whose neighbour fields already
+    select their reacting partner.
+  - **Rolls moved to a finer denominator** (`REACT_CHANCE_DEN`). The interesting
+    rules are authored at chance 1–2 per-mille, where evaluating
+    `(chance * q) / 4` in per-mille truncates 1.5× and 2.75× onto the same
+    integer and collapses the 6-step ramp to 4 distinct rates. This changes the
+    RNG-to-outcome mapping for *every* reaction, so it changed the world hash.
+  - It is a **read-only 1-cell probe, integer throughout**. The colour lattice
+    bounds *writes* to one cell, so a neighbourhood read stays inside its
+    guarantee (§2) — this is the one place where "reads ≤ 1 cell" and "writes
+    ≤ 1 cell" are worth keeping distinct in your head.
+
+  The shape is invisible to the hash test, so `--selftest` gained a pond-freeze
+  gate asserting *both* that the rim leads the middle by >2× and that no ice
+  voxel ends up with zero non-water neighbours. Only the second is decisive: a
+  rate comparison alone cannot separate "the gate works and the front crept
+  down from the frozen surface" from "the gate is ignored", because both land
+  at about the same percentage.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
