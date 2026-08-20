@@ -17,3 +17,4 @@ screenshot_ground.png
 # ad-hoc look-pass captures (material/lighting spot checks)
 screenshot_*.bmp
 screenshot_*.png
+.look/

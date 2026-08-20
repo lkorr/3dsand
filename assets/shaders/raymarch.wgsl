@@ -595,11 +595,29 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
 // below, since sunlight that missed the surface hit the dirt first). Terrain
 // shaded this way gets its form back for free — north faces go blue-shifted,
 // undersides go earth-toned, and the eye reads that split as shape.
-const AMB_SKY    : vec3f = vec3f(0.34, 0.42, 0.55);   // zenith, cool
-const AMB_GROUND : vec3f = vec3f(0.26, 0.22, 0.16);   // bounce, warm
+const AMB_SKY    : vec3f = vec3f(0.40, 0.48, 0.62);   // zenith, cool
+const AMB_GROUND : vec3f = vec3f(0.25, 0.22, 0.17);   // bounce, warm
 fn ambientAt(n : vec3f) -> vec3f {
   // n.y = -1 -> full bounce, n.y = +1 -> full sky
   return mix(AMB_GROUND, AMB_SKY, n.y * 0.5 + 0.5);
+}
+
+// ---- diffuse response ----
+// Plain max(dot(n,l),0) is wrong for terrain built out of axis-aligned voxel
+// faces, and it is the specific reason a grassy hillside rendered as harsh
+// horizontal banding. A voxel slope is a STAIRCASE: every 1-voxel rise puts a
+// vertical face next to a horizontal one. With a hard Lambert term the top face
+// gets dot ~= 0.66 and the away-facing riser gets exactly 0, so the two
+// alternate at ~1.8x brightness down the whole hill. The eye reads that
+// alternation as noise, not as slope, because a real grass slope has no such
+// discontinuity — the two facets differ by a few percent, not by 80%.
+//
+// Wrapped diffuse fixes it at the source: remap dot from [-1,1] so the falloff
+// continues smoothly past the terminator instead of clamping to zero. This is
+// the standard cheap stand-in for the light a rough/scattering surface picks up
+// at grazing angles, and it keeps risers lit enough to sit next to their tops.
+fn wrapDiffuse(ndl : f32, wrap : f32) -> f32 {
+  return clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
 }
 
 // ---- voxel-scale grain ----
@@ -711,27 +729,41 @@ fn voxelAO(cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32, uv : vec2f) -> f
 // between blocker and receiver; that gradient is a strong depth cue and its
 // absence makes shadows read as painted-on decals.
 //
-// Cheap stand-in: jitter the shadow ray direction per pixel inside a small cone
-// and take the single sample. One ray, same cost as before — the softness comes
-// from neighbouring pixels drawing different samples, which the eye integrates.
-// The jitter is keyed on the pixel AND on time-free noise so it does not crawl.
+// ---- WHY THIS IS NOT A JITTERED CONE ----
+// The obvious cheap trick — jitter the ray direction per pixel inside a cone
+// and take one sample, letting neighbouring pixels integrate the penumbra — was
+// tried here and is WRONG for voxel terrain. One binary sample per pixel cannot
+// resolve a penumbra; it only dithers between fully lit and fully shadowed. On
+// near-flat ground under a grazing sun, adjacent pixels then randomly hit or
+// miss the next terrace step, and the result is per-pixel salt-and-pepper over
+// every hillside. Measured: the jitter DOUBLED high-frequency luminance energy
+// on foreground grass (mean |dL| between horizontally adjacent pixels went
+// 2.33 -> 4.74) — that stipple was the "noise on the floor", not the palette
+// and not the AO. Without temporal accumulation or many samples there is
+// nothing to average it back out, so the noise is the final image.
+//
+// Instead: ONE deterministic ray along the exact sun direction, and take the
+// softness from the geometry it already reports. A shadow edge's penumbra width
+// grows with the distance between blocker and receiver, so `s.t` (how far the
+// ray travelled before being blocked) is exactly the quantity a soft shadow
+// needs — a contact shadow right at the surface stays crisp, and a shadow cast
+// from far away goes soft. Same one-ray cost, no noise, and it is a closer
+// model of the real effect than a cone of one sample ever was.
 fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
-  // Two decorrelated hashes -> a small tangent-plane offset.
-  let h1 = pcg(u32(px.x) * 1973u + u32(px.y) * 9277u + 0x517CC1B7u);
-  let h2 = pcg(h1 ^ 0x9E3779B9u);
-  let j1 = (f32(h1 & 0xFFFFu) * (1.0 / 65535.0) - 0.5);
-  let j2 = (f32(h2 & 0xFFFFu) * (1.0 / 65535.0) - 0.5);
-  // Build a basis around the sun direction.
-  let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0),
-                  abs(R.sunDir.y) > 0.9);
-  let t1 = normalize(cross(up, R.sunDir));
-  let t2 = cross(R.sunDir, t1);
-  // Cone half-angle. Wider than the true solar disc: at one sample per pixel a
-  // physically-correct 0.005 rad cone quantises to a hard edge anyway, and a
-  // slightly generous penumbra reads better than an aliased exact one.
-  let sd = normalize(R.sunDir + (t1 * j1 + t2 * j2) * 0.085);
-  let s = trace(hp + n * 0.02, sd, 384, false);
-  return select(1.0, 0.0, s.hit);
+  let s = trace(hp + n * 0.02, R.sunDir, 384, false);
+  if (!s.hit) { return 1.0; }
+  // Distance from receiver to blocker, in metres. Near blockers (a voxel
+  // resting on the ground) keep a hard, dark contact shadow; distant ones (a
+  // tree canopy over a meadow) soften and lift, which is what stops every
+  // terrace step from stamping a hard black band onto the hillside.
+  let dM = s.t * VOXEL_METERS;
+  // A shadowed point keeps NO direct sun — the hemisphere ambient term is what
+  // fills it in, and that is already occluded by AO. Letting direct sun leak
+  // into shadow instead washes the whole scene out and erases the cast shadow
+  // under overhangs. The softening is in the EDGE, not in the depth: a distant
+  // blocker only partially covers the solar disc, so its shadow lifts toward
+  // ~0.45 of full sun, while a contact shadow stays at 0.
+  return clamp(smoothstep(0.6, 9.0, dM) * 0.45, 0.0, 1.0);
 }
 
 // ============================================================================
@@ -977,10 +1009,10 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   if (h.axis == 0) { face = 0.96; }
   else if (h.axis == 2) { face = 0.92; }
   if (m.klass != CLASS_LIQUID) { albedo *= surfaceGrain(h.cell, 0.065); }
-  let lam = max(dot(rn, R.sunDir), 0.0);
+  let lam = wrapDiffuse(dot(rn, R.sunDir), 0.55);
   // Same lighting model as a primary hit (minus AO and the shadow ray, which
   // are not resolvable in a reflection at this budget).
-  var c = albedo * face * (ambientAt(rn) + vec3f(1.0, 0.95, 0.86) * lam * 1.05);
+  var c = albedo * face * (ambientAt(rn) + vec3f(1.0, 0.95, 0.86) * lam * 0.70);
   let emis = f32(m.emission) / 255.0;
   if (emis > 0.0) { c += albedo * emis * 1.7; }
   // Reflected geometry is seen across the water plus its own distance, so it
@@ -1179,6 +1211,192 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   return color;
 }
 
+// ============================================================================
+// MOLTEN SURFACES (DESIGN.md §9)
+// ============================================================================
+// Lava is the OPPOSITE problem to water, and reusing the water treatment would
+// get it wrong in every particular. Water's look comes from what it REFLECTS
+// and TRANSMITS — Fresnel, refraction, depth absorption. Lava is opaque
+// (MATF_OPAQUE, so it resolves as a surface hit and never enters the media
+// path at all) and its look comes almost entirely from what it EMITS. There is
+// no reflection worth tracing, nothing behind it to refract, and no depth to
+// absorb through.
+//
+// Before this pass, lava was: flat palette albedo, one per-cell random
+// flicker, added uniformly at emission 215/255 * 1.7 = 1.43x. Every channel
+// saturated, so a lava pool rendered as a featureless WHITE slab — brighter
+// than the sky and with less structure than the grass around it. Turning the
+// intensity down alone would only have produced a flat ORANGE slab: the
+// problem is the absence of spatial structure, not the exposure.
+//
+// What actually makes molten rock read as molten rock:
+//   1. a CRUST — real flows are dark basaltic plates with glowing cracks
+//      between them, not uniform orange. This is the whole look.
+//   2. a blackbody ramp — black -> red -> orange -> yellow -> white, driven
+//      by temperature rather than by palette index
+//   3. flow — the crust drifts and the cracks shear open and closed
+//   4. tonemapping — so "hotter" reads as a colour shift, not as clipping
+//   5. light spill onto the surroundings, so the pool lights its own rim
+//
+// Render-only float math on render-only data: the sim never sees any of this
+// (CLAUDE.md rule 1 scopes to sim state).
+
+// Blackbody-ish ramp for incandescent rock, parameterised on normalised
+// temperature 0..1. Not a Planck-law fit: it is anchored on the AUTHORED
+// palette so a modder retinting lava in materials.json still gets a coherent
+// heat ramp, which the data-driven-materials convention requires. c2/c0/c1 are
+// the cool/mid/hot palette entries by convention for emissive materials.
+fn moltenRamp(m : Material, temp : f32) -> vec3f {
+  let t = clamp(temp, 0.0, 1.0);
+  // Below the incandescence threshold the rock is genuinely dark — this is the
+  // crust, and it must be allowed to go nearly black or there are no plates,
+  // only a bright field with darker bits.
+  let dark = vec3f(0.055, 0.040, 0.038);
+  let cool = unpackColor(m.color1);   // deep red
+  let mid  = unpackColor(m.color0);   // orange
+  let hot  = unpackColor(m.color2);   // yellow-orange
+  // The top of the ramp stays SATURATED. It is tempting to drive it to white
+  // here, but the per-channel tonemap in fs() already desaturates bright
+  // values on its own — pushing the ramp toward white as well compounds the
+  // two and the crack cores come out bleached to grey-white, losing the hue
+  // that made them read as molten. Let the hottest authored colour be the
+  // hottest colour, and let the tonemap decide how white it looks.
+  let white = mix(hot, vec3f(1.0, 0.86, 0.55), 0.35);
+  // Band boundaries are pushed LATE on purpose. Most of a real flow's visible
+  // area is crust and cooling red rock; the orange-and-above range belongs to
+  // the crack cores alone, which are a small fraction of the surface. Spread
+  // the bands evenly instead and the average pixel lands in the orange/yellow
+  // part of the ramp, which — compounded by the tonemap's per-channel
+  // desaturation on the way up — renders the whole pool as glowing gold
+  // honeycomb rather than molten rock.
+  var c = mix(dark, cool, smoothstep(0.00, 0.38, t));
+  c = mix(c, mid,   smoothstep(0.48, 0.78, t));
+  c = mix(c, hot,   smoothstep(0.80, 0.94, t));
+  c = mix(c, white, smoothstep(0.95, 1.00, t));
+  return c;
+}
+
+// ---- the crust field ----
+// A value in 0..1 across the surface: 0 = cooled plate, 1 = molten crack.
+//
+// Built from layered value noise in WORLD metres (so plates are a fixed
+// physical size regardless of voxel scale), ADVECTED so the whole crust drifts
+// like a skin being dragged along. The crack network is the ridge transform
+// (1 - |2n-1|), which is what turns smooth blobs into the thin branching
+// filaments that read as fractures between plates; smooth noise alone gives
+// soft mottling that reads as rust.
+fn hashNoise2(p : vec2f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  // Quintic smoothstep — C2 continuous, so the derivative used by the glow
+  // gradient below doesn't show the lattice.
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let a = f32(pcg(u32(i32(i.x) * 374761393 + i32(i.y) * 668265263)) & 0xFFFFu) / 65535.0;
+  let b = f32(pcg(u32(i32(i.x + 1.0) * 374761393 + i32(i.y) * 668265263)) & 0xFFFFu) / 65535.0;
+  let c = f32(pcg(u32(i32(i.x) * 374761393 + i32(i.y + 1.0) * 668265263)) & 0xFFFFu) / 65535.0;
+  let d = f32(pcg(u32(i32(i.x + 1.0) * 374761393 + i32(i.y + 1.0) * 668265263)) & 0xFFFFu) / 65535.0;
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Ridged multi-octave noise -> crack network. Returns 0..1, high in cracks.
+fn crustCracks(pm : vec2f, t : f32) -> f32 {
+  // Advection: each octave drifts at its own rate and direction, so the crust
+  // shears rather than sliding rigidly. Slow — lava is viscous, and anything
+  // fast enough to notice per-frame reads as boiling water, not rock.
+  var v = 0.0;
+  var amp = 1.0;
+  var norm = 0.0;
+  // Base frequency in cycles per metre. Plates want to be roughly fist- to
+  // head-sized; at 0.55 they came out metres across and the pool read as
+  // polished marble rather than crust.
+  var p = pm * 2.4;
+  var drift = vec2f(0.031, -0.019);
+  for (var i = 0; i < 4; i++) {
+    let n = hashNoise2(p + drift * t);
+    // ridge transform: peaks become creases
+    let ridge = 1.0 - abs(n * 2.0 - 1.0);
+    v += ridge * ridge * amp;
+    norm += amp;
+    amp *= 0.5;
+    p = p * 2.07 + vec2f(11.3, 7.7);   // non-integer lacunarity: no re-tiling
+    drift = vec2f(-drift.y, drift.x) * 1.35;
+  }
+  return v / max(norm, 1e-5);
+}
+
+// ---- the full molten shade ----
+// Returns the emitted colour of a molten surface cell, in linear HDR (values
+// well above 1 are expected and are handled by the tonemap in fs()).
+fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f, n : vec3f,
+               rd : vec3f) -> vec3f {
+  // Plates live in the horizontal plane for a pool surface; for a wall of
+  // lava, project onto whichever plane the face points out of, so a vertical
+  // flow gets vertical structure instead of a smeared top-down pattern.
+  var pm : vec2f;
+  if (abs(n.y) > 0.5) { pm = vec2f(hitP.x, hitP.z); }
+  else if (abs(n.x) > 0.5) { pm = vec2f(hitP.z, hitP.y); }
+  else { pm = vec2f(hitP.x, hitP.y); }
+  pm *= VOXEL_METERS;
+
+  let cracks = crustCracks(pm, R.time);
+
+  // Map the crack field to temperature with a SHARP knee. The knee is what
+  // separates plate from crack: a soft ramp gives a uniformly warm surface
+  // with no plate boundaries, which is the failure mode this whole function
+  // exists to avoid.
+  // The knee sits HIGH so that most of the surface falls below it and stays
+  // crust. Lowering it floods the pool with melt and the plates stop reading
+  // as plates — the dark area between cracks is what gives the glow something
+  // to be brighter *than*.
+  var temp = smoothstep(0.52, 0.93, cracks);
+
+  // Per-cell variation so two adjacent plates are not the same temperature —
+  // some crust is freshly congealed and still glowing, some is old and dark.
+  // Keyed on the CELL (stable as the camera moves), coarsened to ~4-voxel
+  // patches so it reads as plate-scale variation and not per-voxel noise.
+  let pc = cell >> vec3<u32>(2u);
+  let ph = pcg(u32(pc.x * 7 + pc.y * 131 + pc.z * 2917));
+  temp += (f32(ph & 0xFFu) / 255.0 - 0.5) * 0.22;
+
+  // Slow per-cell pulse: convection turning fresh melt over. Distinct phase
+  // per patch so the pool does not beat in unison (same reasoning as the fire
+  // flicker, which this deliberately does NOT reuse — fire flickers fast and
+  // randomly, lava breathes).
+  temp += 0.06 * sin(R.time * 0.9 + f32(ph & 0x3FFu) * 0.0061);
+
+  // Top faces are the coolest (they radiate to the sky and skin over first);
+  // the sides of a flow are freshly exposed melt and run hotter. This is a
+  // real effect and it also usefully breaks up the silhouette of a pool.
+  if (n.y > 0.5) { temp -= 0.10; }
+  else { temp += 0.12; }
+
+  temp = clamp(temp, 0.0, 1.0);
+
+  var c = moltenRamp(m, temp);
+
+  // Emission scales STEEPLY with temperature (Stefan-Boltzmann is T^4; the
+  // exponent here is tuned rather than physical, but the point is the same —
+  // the cracks must out-radiate the plates by a large factor, or the surface
+  // averages back out into the flat slab this replaces).
+  let emis = f32(m.emission) / 255.0;
+  // Peak intensity is bounded on purpose. The steep exponent is what makes
+  // cracks out-radiate plates, but run it to 3.4x and the crack cores land
+  // deep in the tonemap's shoulder, where per-channel compression bleaches
+  // them to white and the hue is lost exactly where the surface is most
+  // interesting. ~1.9x peak keeps the cores inside the range where the
+  // shoulder still discriminates colour.
+  let power = temp * temp * (0.35 + 2.2 * temp);
+  c *= 0.16 + power * emis * 1.9;
+
+  // Fresnel-ish rim: a glancing view of any surface catches more of its
+  // emission, and on a pool this draws a hot lip around the far edge that
+  // makes it read as a volume of liquid rather than a painted disc.
+  let grazing = 1.0 - abs(dot(n, -rd));
+  c += moltenRamp(m, min(temp + 0.25, 1.0)) * pow(grazing, 3.0) * emis * 0.55;
+
+  return c;
+}
+
 struct FSOut {
   @location(0) color : vec4f,
   @builtin(frag_depth) depth : f32,
@@ -1243,7 +1461,9 @@ fn fs(in : VSOut) -> FSOut {
       if (far.axis == 0) { face = 0.96; }
       else if (far.axis == 2) { face = 0.92; }
       albedo *= surfaceGrain(far.cell << vec3<u32>(farCellShift(far.level)), 0.05);
-      var lambert = max(dot(n, R.sunDir), 0.0);
+      // Same wrapped diffuse as the near field — a different falloff here is a
+      // visible brightness step at the window seam.
+      var lambert = wrapDiffuse(dot(n, R.sunDir), 0.55);
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         let hp = R.camPos + rd * (far.t - 1e-3) +
@@ -1262,7 +1482,7 @@ fn fs(in : VSOut) -> FSOut {
           farMatAt(far.level, up) != 0u) { ao = 0.72; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
-      let fsun = vec3f(1.0, 0.95, 0.86) * lambert * 1.05;
+      let fsun = vec3f(1.0, 0.95, 0.86) * lambert * 1.35;
       color = albedo * face * (ambientAt(n) * ao + fsun);
       let emis = f32(m.emission) / 255.0;
       if (emis > 0.0) { color += albedo * emis * 1.7; }
@@ -1312,7 +1532,15 @@ fn fs(in : VSOut) -> FSOut {
     if (h.axis == 0) { face = 0.96; }
     else if (h.axis == 2) { face = 0.92; }
 
-    var lambert = max(dot(n, R.sunDir), 0.0);
+    // Wrapped diffuse (see wrapDiffuse): keeps the risers of the terrain
+    // staircase within a few percent of their tops instead of 1.8x apart.
+    // wrap = 1.0 is deliberately wide. Measured on a grass hillside, the old
+    // hard Lambert produced a BIMODAL luminance histogram — a cluster at 88-112
+    // (risers) and a separate spike at 208 (sun-facing tops) with the 144-176
+    // range completely empty. Two disjoint populations interleaved at voxel
+    // frequency is what the eye reports as "noise on the floor"; there was no
+    // gradient between them to read as slope. Widening the wrap fills that gap.
+    var lambert = wrapDiffuse(dot(n, R.sunDir), 0.55);
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       lambert *= sunShadow(R.camPos + rd * (h.t - 1e-3), n, in.pos.xy);
     }
@@ -1320,13 +1548,26 @@ fn fs(in : VSOut) -> FSOut {
     // light, and AO measures how much sky the point can see); direct sun is
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
-    let sun = vec3f(1.0, 0.95, 0.86) * lambert * 1.05;
+    let sun = vec3f(1.0, 0.95, 0.86) * lambert * 1.35;
     color = albedo * face * (ambientAt(n) * ao + sun);
 
-    // emissive materials glow through shadow, with a slow per-cell flicker
-    // (render-only floats: the sim never sees any of this)
+    // ---- emissive surfaces ----
+    // MOLTEN materials (an emissive OPAQUE liquid — lava, molten glass) take
+    // the crust treatment: they REPLACE the diffuse shade rather than adding
+    // to it, because an incandescent surface is not lit by the sun in any
+    // meaningful sense, it is its own light source. Adding emission on top of
+    // a sun-lit albedo is exactly what saturated every channel and turned a
+    // lava pool into a white slab.
+    //
+    // Detected by class + flags + emission, never by material ID: any modder's
+    // emissive opaque liquid gets this for free (CLAUDE.md conventions).
     let emis = f32(m.emission) / 255.0;
-    if (emis > 0.0) {
+    let isMolten = m.klass == CLASS_LIQUID &&
+                   (m.flags & MATF_OPAQUE) != 0u && m.emission > 0u;
+    if (isMolten) {
+      color = shadeMolten(m, h.cell, R.camPos + rd * h.t, n, rd);
+    } else if (emis > 0.0) {
+      // everything else emissive (fire, embers) keeps the fast random flicker
       let ch = pcg(u32(h.cell.x * 7 + h.cell.y * 131 + h.cell.z * 2917));
       let flick = 0.82 + 0.28 * sin(R.time * 9.0 + f32(ch & 0xFFu) * 0.0245);
       color += albedo * emis * 1.7 * flick;
@@ -1406,8 +1647,43 @@ fn fs(in : VSOut) -> FSOut {
     color += fc * x * 2.1 * breathe;
   }
 
-  // gamma-ish
-  color = pow(max(color, vec3f(0.0)), vec3f(1.0 / 2.2));
+  // ---- tonemap ----
+  // The renderer works in linear HDR and emissive surfaces legitimately exceed
+  // 1.0 by a wide margin, so the output curve has to COMPRESS the highlights
+  // rather than clip them. The previous `pow(color, 1/2.2)` was a bare gamma
+  // curve: everything over 1.0 clamped flat, which meant a hot surface lost
+  // all its colour AND all its structure at exactly the moment it got
+  // interesting. It is half the reason lava rendered as a white slab (the
+  // other half being that emission was added on top of a lit albedo).
+  //
+  // Reinhard-with-white-point, applied to LUMINANCE and then reapplied to the
+  // colour, rather than per channel.
+  //
+  // Per-channel Reinhard desaturates catastrophically and at ALL intensities,
+  // not just bright ones: the 1/(1+c) denominator compresses a strong channel
+  // far harder than a weak one, so a saturated ember orange (#ff5a1a, sat
+  // 0.90) comes out as tan (sat 0.59) even at half exposure. Every warm
+  // emissive surface in the scene — lava cracks, fire, embers — turned gold.
+  // Scaling by the luminance ratio instead preserves the authored hue exactly.
+  //
+  // A CONTROLLED amount of the per-channel behaviour is still wanted at the
+  // very top, because genuine blackbody progression does shift toward white as
+  // things get hotter. So blend a little of it back in, weighted by how far
+  // into the shoulder the pixel sits: hue is preserved through the midtones,
+  // and only the truly hot cores bleach.
+  const WHITE : f32 = 4.2;   // intensity that maps to display white
+  color = max(color, vec3f(0.0));
+  let lum = max(dot(color, vec3f(0.2126, 0.7152, 0.0722)), 1e-5);
+  let mapped = (lum * (1.0 + lum / (WHITE * WHITE))) / (1.0 + lum);
+  let hueKept = color * (mapped / lum);
+  let perCh = (color * (1.0 + color / (WHITE * WHITE))) / (1.0 + color);
+  // Cubed so the crossover is late: below ~2x exposure the blend is a few
+  // percent and hue is essentially untouched, and only genuinely hot cores
+  // (3x and up) bleach toward white. A linear weight starts desaturating in
+  // the midtones, which is the gold-honeycomb failure this replaces.
+  let bleach = clamp(mapped * mapped * mapped * 0.9, 0.0, 0.9);
+  color = mix(hueKept, perCh, bleach);
+  color = pow(color, vec3f(1.0 / 2.2));
   var out : FSOut;
   out.color = vec4f(color, 1.0);
   out.depth = depth;
