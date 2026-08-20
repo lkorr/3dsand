@@ -163,9 +163,15 @@ cubicInOut`; times in integer ms; unique part names enforced at edit time.
   existing call sites are unchanged).
 - Flipbook frames swap the **rendered** voxel set only; the Jolt shape stays the
   rest model, and instances rebuild only on an actual frame change.
+- Clip rotations are authored **from vertical**: a torso key of 60° leaves the
+  limb 30° above the ground. `--shot-mob <def>[:limb,...][@x,z]` prints every
+  live limb's local/model/world +Y elevation (90 = upright, 0 = flat) next to
+  the screenshots, which is how these angles are set — and how a pose bug gets
+  localized to a pipeline stage instead of guessed at from an image.
 - `states` (dismemberment locomotion): rules are evaluated **in authored order,
   first match wins**, so list the most-maimed state first ("both legs gone →
-  crawl" before "a leg gone → limp"). A rule with an empty predicate never
+  crawl" before "a leg gone → limp"). `speedScale: 0` also suppresses the
+  blocked-turn, so a fully immobilized mob doesn't pirouette against a wall. A rule with an empty predicate never
   matches. `minChainsLost` counts IK chains with **any** severed part — the same
   test the gait uses to drop a leg, so the rule flips exactly when the gait
   stops using it. Selection lives in `AnimSelectState` (anim.cpp, re-evaluated
