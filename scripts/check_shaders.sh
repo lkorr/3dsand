@@ -57,11 +57,15 @@ EOF
 cpp_const() {  # cpp_const <name> -> literal, minus any type suffix
   sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \([0-9.]*\)f\?;.*/\1/p" "$WORLD_H" | head -1
 }
+cpp_const_hex() {  # cpp_const_hex <name> -> hex literal, minus the u suffix
+  sed -n "s/.*constexpr[a-z0-9_ ]* $1 = \(0x[0-9A-Fa-f]*\)u\?;.*/\1/p" "$WORLD_H" | head -1
+}
 W_N="$(cpp_const kWorldN)"
 W_CHUNK="$(cpp_const kChunk)"
 W_VOX="$(cpp_const kVoxelMeters)"
-if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ]; then
-  echo "check_shaders: cannot parse kWorldN/kChunk/kVoxelMeters from $WORLD_H" >&2
+W_IFAIR="$(cpp_const_hex kCellOpIfAir)"
+if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ]; then
+  echo "check_shaders: cannot parse kWorldN/kChunk/kVoxelMeters/kCellOpIfAir from $WORLD_H" >&2
   exit 1
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
@@ -78,6 +82,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const CHUNK_MASK : i32 = $((W_CHUNK - 1));" \
   "const WORLD_MASK : i32 = $((W_N - 1));" \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
+  "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
   "const VOXEL_METERS : f32 = ${W_VOX};")"
 
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".

@@ -59,6 +59,22 @@ class DebrisSystem {
   // meshes around live bodies. `cellOps` must be submitted this tick.
   void PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
 
+  // Mob limbs need marching-cubes terrain too: register extra positions for
+  // this tick's ManageTerrain sweep (call before PreTick; cleared after).
+  void AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels);
+
+  // Take ownership of an existing physics body (severed limb, ragdoll piece):
+  // it becomes ordinary debris — culling, despawn, terrain upkeep. Any joints
+  // still attached die when the body is eventually removed.
+  void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
+                 const BodyTransform& xf);
+
+  // Laser body cut (PLAN §C2): partition a body's voxels by the world-space
+  // plane (point, normal), destroy it, spawn both halves at the same pose
+  // with inherited velocity. False when the cut misses or a half is too
+  // small to be worth a body (< 4 voxels).
+  bool SplitBody(uint64_t handle, Vec3 planePointVoxel, Vec3 planeNormal);
+
   // Once per tick AFTER Physics::Step: refresh transforms, cull fallen /
   // excess bodies.
   void PostStep();
@@ -71,6 +87,7 @@ class DebrisSystem {
   uint32_t BodyCount() const { return (uint32_t)bodies_.size(); }
   uint32_t ActiveBodyCount() const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
+  uint32_t SettledBack() const { return settledBack_; }
 
  private:
   struct Event {
@@ -82,6 +99,7 @@ class DebrisSystem {
     std::vector<DebrisVoxel> voxels;
     BodyTransform xf{};
     float radiusVoxels = 0;
+    uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
   };
   struct TerrainEntry {
     uint64_t handle = 0;
@@ -89,12 +107,18 @@ class DebrisSystem {
     uint32_t builtVersion = 0;
     uint32_t lastNeeded = 0;
     uint32_t lastRefreshReq = 0;
+    uint64_t meshHash = 0;  // collision-surface identity: liquids flowing
+                            // through a chunk must not rebuild-and-wake
   };
 
   bool EventReady(const Event& e, World& world, uint32_t required) const;
   void RunIslandDetection(const Event& e, uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps);
   void ManageTerrain(uint32_t tick, World& world);
+  // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
+  // its voxels to CellOps (fill-air-only: grid content wins deterministically
+  // on the GPU) and frees its body. At most one body per tick.
+  void SettleBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;
@@ -110,8 +134,10 @@ class DebrisSystem {
   std::unordered_map<uint64_t, uint32_t> supportCooldown_;  // chunk -> last tick
   uint32_t lastSupportSnapTick_ = 0;
   std::vector<Body> bodies_;
+  std::vector<std::pair<Vec3, float>> extraAnchors_;    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   uint32_t lastCellWriteTick_ = 0;
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
+  uint32_t settledBack_ = 0;
 };

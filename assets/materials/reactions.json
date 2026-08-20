@@ -1,92 +1,412 @@
 {
-  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick — put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes.",
+  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick \u2014 put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes.",
   "reactions": [
-
-    { "note": "-------- fire: short-lived rising flame; doused by water --------" },
-    { "self": "fire", "neighbor": "tag:extinguisher", "chance": 400, "selfBecomes": "smoke" },
-    { "self": "fire", "decay": true, "chance": 40,  "becomes": "smoke" },
-    { "self": "fire", "decay": true, "chance": 120, "becomes": "air" },
-
-    { "note": "-------- smoke & steam: fade; steam condenses into rain --------" },
-    { "self": "smoke", "decay": true, "chance": 9, "becomes": "air" },
-    { "self": "steam", "decay": true, "chance": 10, "becomes": "air" },
-    { "self": "steam", "decay": true, "chance": 3,  "becomes": "water" },
-
-    { "note": "-------- combustion: each flammable defines its burn character --------" },
-    { "self": "wood",  "neighbor": "tag:hot", "chance": 18,   "selfBecomes": "ember" },
-    { "self": "oil",   "neighbor": "tag:hot", "chance": 350,  "selfBecomes": "fire" },
-    { "self": "dust",  "neighbor": "tag:hot", "chance": 1000, "selfBecomes": "fire" },
-    { "self": "plant", "neighbor": "tag:hot", "chance": 250,  "selfBecomes": "fire" },
-    { "self": "seed",  "neighbor": "tag:hot", "chance": 400,  "selfBecomes": "fire" },
-    { "self": "sprout","neighbor": "tag:hot", "chance": 300,  "selfBecomes": "fire" },
-    { "self": "stem",  "neighbor": "tag:hot", "chance": 300,  "selfBecomes": "fire" },
-    { "self": "flower","neighbor": "tag:hot", "chance": 300,  "selfBecomes": "fire" },
-    { "self": "vine",  "neighbor": "tag:hot", "chance": 300,  "selfBecomes": "fire" },
-    { "self": "fungus","neighbor": "tag:hot", "chance": 350,  "selfBecomes": "fire" },
-
-    { "note": "-------- ember: smolders, licks flame upward, dies to ash; doused back to charwood --------" },
-    { "self": "ember", "neighbor": "tag:extinguisher", "chance": 250, "selfBecomes": "wood" },
-    { "self": "ember", "emit": "fire", "dir": "up", "chance": 90 },
-    { "self": "ember", "decay": true, "chance": 20, "becomes": "ash" },
-    { "self": "ember", "decay": true, "chance": 7,  "becomes": "smoke" },
-
-    { "note": "-------- water vs heat --------" },
-    { "self": "water", "neighbor": "tag:hot", "chance": 180, "selfBecomes": "steam" },
-
-    { "note": "-------- lava: crusts against water, melts sand. Deliberately NOT tag:meltable: glass must be stable next to lava or the pool rim remelts its own crust forever and never sleeps --------" },
-    { "self": "lava", "neighbor": "water", "chance": 300, "selfBecomes": "stone" },
-    { "self": "lava", "neighbor": "sand", "chance": 30, "neighborBecomes": "molten_glass" },
-
-    { "note": "-------- molten glass: cools to glass, quenched instantly by water --------" },
-    { "self": "molten_glass", "neighbor": "water", "chance": 500, "selfBecomes": "glass" },
-    { "self": "molten_glass", "decay": true, "chance": 25, "becomes": "glass" },
-
-    { "note": "-------- acid erosion chain (stone->gravel->sand->gone); glass is immune --------" },
-    { "self": "acid", "neighbor": "stone",  "chance": 25, "neighborBecomes": "gravel" },
-    { "self": "acid", "neighbor": "gravel", "chance": 30, "neighborBecomes": "sand" },
-    { "self": "acid", "neighbor": "tag:dissolvable", "chance": 45, "neighborBecomes": "air" },
-    { "self": "acid", "neighbor": "tag:dissolvable", "chance": 10, "selfBecomes": "air" },
-
-    { "note": "-------- cold: creeping freeze, melting, snow compaction --------" },
-    { "self": "ice",  "neighbor": "tag:hot", "chance": 400, "selfBecomes": "water" },
-    { "self": "ice",  "neighbor": "water", "chance": 6, "neighborBecomes": "ice" },
-    { "self": "snow", "neighbor": "tag:hot", "chance": 500, "selfBecomes": "water" },
-
-    { "note": "-------- plants: the sandspiel signature. plant grows into water; seeds sprout stalks that race hardening vs growth; stems rarely branch; tips bloom --------" },
-    { "self": "plant",  "neighbor": "water", "chance": 140, "neighborBecomes": "plant" },
-    { "self": "seed",   "neighbor": "tag:soil", "dir": "down", "chance": 600, "selfBecomes": "sprout" },
-    { "self": "seed",   "neighbor": "water", "chance": 30, "selfBecomes": "sprout" },
-    { "self": "sprout", "emit": "stem", "dir": "up", "chance": 300, "selfBecomes": "stem" },
-    { "self": "sprout", "decay": true, "chance": 30, "becomes": "plant" },
-    { "note": "stem growth must stay decisively subcritical: mean stalk = up/(up-decays) cells, branches-per-stalk = stalk * side/(side+decays). At 380/4/78 that is ~6-cell stalks with R~0.3 branches — the epidemic dies out and chunks sleep. Raising side or up can make growth self-sustaining forever (measured: 400/6/52 never settles)." },
-    { "self": "stem",   "emit": "stem", "dir": "up", "chance": 380 },
-    { "self": "stem",   "emit": "stem", "dir": "side", "chance": 4 },
-    { "self": "stem",   "decay": true, "chance": 60, "becomes": "plant" },
-    { "self": "stem",   "decay": true, "chance": 18, "becomes": "flower" },
-    { "self": "vine",   "emit": "vine", "dir": "down", "chance": 250 },
-    { "self": "vine",   "emit": "flower", "dir": "side", "chance": 2 },
-
-    { "note": "-------- fungus: creeps over everything organic --------" },
-    { "self": "fungus", "neighbor": "tag:organic", "chance": 7, "neighborBecomes": "fungus" },
-
-    { "note": "-------- mites: wandering critters — eat the garden, breed on plants, drown, expire --------" },
-    { "self": "mite", "neighbor": "water", "chance": 700, "selfBecomes": "air" },
-    { "self": "mite", "neighbor": "tag:hot", "chance": 800, "selfBecomes": "smoke" },
-    { "self": "mite", "neighbor": "plant", "chance": 15, "neighborBecomes": "mite" },
-    { "self": "mite", "neighbor": "seed",  "chance": 300, "neighborBecomes": "air" },
-    { "self": "mite", "neighbor": "flower","chance": 200, "neighborBecomes": "air" },
-    { "self": "mite", "neighbor": "plant", "chance": 120, "neighborBecomes": "air" },
-    { "self": "mite", "neighbor": "stem",  "chance": 120, "neighborBecomes": "air" },
-    { "self": "mite", "neighbor": "vine",  "chance": 120, "neighborBecomes": "air" },
-    { "self": "mite", "neighbor": "dust",  "chance": 200, "neighborBecomes": "air" },
-    { "self": "mite", "neighbor": "wood",  "chance": 60,  "neighborBecomes": "air" },
-    { "self": "mite", "decay": true, "chance": 3, "becomes": "air" },
-
-    { "note": "-------- cloner-style sources and the void drain --------" },
-    { "self": "source_water", "emit": "water", "chance": 250 },
-    { "self": "source_sand",  "emit": "sand",  "chance": 250 },
-    { "self": "source_lava",  "emit": "lava",  "chance": 120 },
-    { "self": "void", "neighbor": "any", "neighborClass": ["powder", "liquid", "gas"],
-      "chance": 900, "neighborBecomes": "air" }
+    {
+      "note": "-------- fire: short-lived rising flame; doused by water --------"
+    },
+    {
+      "self": "fire",
+      "neighbor": "tag:extinguisher",
+      "chance": 400,
+      "selfBecomes": "smoke"
+    },
+    {
+      "self": "fire",
+      "decay": true,
+      "chance": 40,
+      "becomes": "smoke"
+    },
+    {
+      "self": "fire",
+      "decay": true,
+      "chance": 120,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- smoke & steam: fade; steam condenses into rain --------"
+    },
+    {
+      "self": "smoke",
+      "decay": true,
+      "chance": 9,
+      "becomes": "air"
+    },
+    {
+      "self": "steam",
+      "decay": true,
+      "chance": 10,
+      "becomes": "air"
+    },
+    {
+      "self": "steam",
+      "decay": true,
+      "chance": 3,
+      "becomes": "water"
+    },
+    {
+      "note": "-------- combustion: each flammable defines its burn character --------"
+    },
+    {
+      "self": "wood",
+      "neighbor": "tag:hot",
+      "chance": 18,
+      "selfBecomes": "ember"
+    },
+    {
+      "self": "oil",
+      "neighbor": "tag:hot",
+      "chance": 350,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "dust",
+      "neighbor": "tag:hot",
+      "chance": 1000,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "plant",
+      "neighbor": "tag:hot",
+      "chance": 250,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "seed",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "sprout",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "stem",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "flower",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "vine",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "fungus",
+      "neighbor": "tag:hot",
+      "chance": 350,
+      "selfBecomes": "fire"
+    },
+    {
+      "note": "-------- ember: smolders, licks flame upward, dies to ash; doused back to charwood --------"
+    },
+    {
+      "self": "ember",
+      "neighbor": "tag:extinguisher",
+      "chance": 250,
+      "selfBecomes": "wood"
+    },
+    {
+      "self": "ember",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 90
+    },
+    {
+      "self": "ember",
+      "decay": true,
+      "chance": 20,
+      "becomes": "ash"
+    },
+    {
+      "self": "ember",
+      "decay": true,
+      "chance": 7,
+      "becomes": "smoke"
+    },
+    {
+      "note": "-------- water vs heat --------"
+    },
+    {
+      "self": "water",
+      "neighbor": "tag:hot",
+      "chance": 180,
+      "selfBecomes": "steam"
+    },
+    {
+      "note": "-------- lava: crusts against water, melts sand. Deliberately NOT tag:meltable: glass must be stable next to lava or the pool rim remelts its own crust forever and never sleeps --------"
+    },
+    {
+      "self": "lava",
+      "neighbor": "water",
+      "chance": 300,
+      "selfBecomes": "stone"
+    },
+    {
+      "self": "lava",
+      "neighbor": "sand",
+      "chance": 30,
+      "neighborBecomes": "molten_glass"
+    },
+    {
+      "note": "-------- molten glass: cools to glass, quenched instantly by water --------"
+    },
+    {
+      "self": "molten_glass",
+      "neighbor": "water",
+      "chance": 500,
+      "selfBecomes": "glass"
+    },
+    {
+      "self": "molten_glass",
+      "decay": true,
+      "chance": 25,
+      "becomes": "glass"
+    },
+    {
+      "note": "-------- acid erosion chain (stone->gravel->sand->gone); glass is immune --------"
+    },
+    {
+      "self": "acid",
+      "neighbor": "stone",
+      "chance": 25,
+      "neighborBecomes": "gravel"
+    },
+    {
+      "self": "acid",
+      "neighbor": "gravel",
+      "chance": 30,
+      "neighborBecomes": "sand"
+    },
+    {
+      "self": "acid",
+      "neighbor": "tag:dissolvable",
+      "chance": 45,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "acid",
+      "neighbor": "tag:dissolvable",
+      "chance": 10,
+      "selfBecomes": "air"
+    },
+    {
+      "note": "-------- cold: creeping freeze, melting, snow compaction --------"
+    },
+    {
+      "self": "ice",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "water"
+    },
+    {
+      "self": "ice",
+      "neighbor": "water",
+      "chance": 6,
+      "neighborBecomes": "ice"
+    },
+    {
+      "self": "snow",
+      "neighbor": "tag:hot",
+      "chance": 500,
+      "selfBecomes": "water"
+    },
+    {
+      "note": "-------- plants: the sandspiel signature. plant grows into water; seeds sprout stalks that race hardening vs growth; stems rarely branch; tips bloom --------"
+    },
+    {
+      "self": "plant",
+      "neighbor": "water",
+      "chance": 140,
+      "neighborBecomes": "plant"
+    },
+    {
+      "self": "seed",
+      "neighbor": "tag:soil",
+      "dir": "down",
+      "chance": 600,
+      "selfBecomes": "sprout"
+    },
+    {
+      "self": "seed",
+      "neighbor": "water",
+      "chance": 30,
+      "selfBecomes": "sprout"
+    },
+    {
+      "self": "sprout",
+      "emit": "stem",
+      "dir": "up",
+      "chance": 300,
+      "selfBecomes": "stem"
+    },
+    {
+      "self": "sprout",
+      "decay": true,
+      "chance": 30,
+      "becomes": "plant"
+    },
+    {
+      "note": "stem growth must stay decisively subcritical: mean stalk = up/(up-decays) cells, branches-per-stalk = stalk * side/(side+decays). At 380/4/78 that is ~6-cell stalks with R~0.3 branches \u2014 the epidemic dies out and chunks sleep. Raising side or up can make growth self-sustaining forever (measured: 400/6/52 never settles)."
+    },
+    {
+      "self": "stem",
+      "emit": "stem",
+      "dir": "up",
+      "chance": 380
+    },
+    {
+      "self": "stem",
+      "emit": "stem",
+      "dir": "side",
+      "chance": 4
+    },
+    {
+      "self": "stem",
+      "decay": true,
+      "chance": 60,
+      "becomes": "plant"
+    },
+    {
+      "self": "stem",
+      "decay": true,
+      "chance": 18,
+      "becomes": "flower"
+    },
+    {
+      "self": "vine",
+      "emit": "vine",
+      "dir": "down",
+      "chance": 250
+    },
+    {
+      "self": "vine",
+      "emit": "flower",
+      "dir": "side",
+      "chance": 2
+    },
+    {
+      "note": "-------- fungus: creeps over everything organic --------"
+    },
+    {
+      "self": "fungus",
+      "neighbor": "tag:organic",
+      "chance": 7,
+      "neighborBecomes": "fungus"
+    },
+    {
+      "note": "-------- mites: wandering critters \u2014 eat the garden, breed on plants, drown, expire --------"
+    },
+    {
+      "self": "mite",
+      "neighbor": "water",
+      "chance": 700,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "tag:hot",
+      "chance": 800,
+      "selfBecomes": "smoke"
+    },
+    {
+      "self": "mite",
+      "neighbor": "plant",
+      "chance": 15,
+      "neighborBecomes": "mite"
+    },
+    {
+      "self": "mite",
+      "neighbor": "seed",
+      "chance": 300,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "flower",
+      "chance": 200,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "plant",
+      "chance": 120,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "stem",
+      "chance": 120,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "vine",
+      "chance": 120,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "dust",
+      "chance": 200,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "neighbor": "wood",
+      "chance": 60,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "mite",
+      "decay": true,
+      "chance": 3,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- cloner-style sources and the void drain --------"
+    },
+    {
+      "self": "source_water",
+      "emit": "water",
+      "chance": 250
+    },
+    {
+      "self": "source_sand",
+      "emit": "sand",
+      "chance": 250
+    },
+    {
+      "self": "source_lava",
+      "emit": "lava",
+      "chance": 120
+    },
+    {
+      "self": "void",
+      "neighbor": "any",
+      "neighborClass": [
+        "powder",
+        "liquid",
+        "gas"
+      ],
+      "chance": 900,
+      "neighborBecomes": "air"
+    },
+    {
+      "note": "blood dries away so pools go back to sleep (PLAN #B5, rule 2)",
+      "self": "blood",
+      "decay": true,
+      "becomes": "air",
+      "chance": 8
+    }
   ]
 }

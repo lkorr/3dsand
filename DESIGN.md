@@ -125,16 +125,29 @@ grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
   masks to slots (sizes are powers of two, so `mod` is a bitmask even for
   negatives); the window origin rides TickParams/RenderParams. The 3×3×3 color
   lattice is computed in WORLD coords — coloring by slot would race at the
-  toroidal wrap. v1 simplifications, on purpose: the evicted-chunk store lives
-  in RAM behind a `ChunkStore` interface (region files can replace the map
-  without touching callers; the .svx save serializes the store wholesale), and
-  eviction readback is synchronous per shift (bounded: one 16×16 plane,
-  save-worthy chunks only — fresh terrain evicts almost nothing). Eviction
+  toroidal wrap. Eviction readback is ASYNC (post-v0.4): the leaving plane's
+  copy into a pooled staging buffer is submitted before the slots refill
+  (queue order keeps it correct), the mapAsync lands ticks later, and a
+  pending-eviction set force-completes any in-flight chunk that streams back
+  in or gets saved — the frame never stalls on a shift. Eviction
   save-worthiness reads the snapshot's occupancy/dirty flags, which lag the GPU
   by the readback ring: activity that starts on the trailing plane in those
-  last ~2 ticks can be lost on re-entry — accepted, revisit with async
-  eviction. CPU-known writes (brush/explosions) mark chunks modified
-  immediately to shrink that window.
+  last ~2 ticks can be lost on re-entry — accepted (the trailing plane is ≥6
+  chunks behind the player; only self-propelled fronts can be there).
+  CPU-known writes (brush/explosions) mark chunks modified immediately to
+  shrink that window.
+- **Region files (post-v0.4):** the `ChunkStore` groups chunks into 16³-chunk
+  regions. Unbound it is pure RAM (unchanged); bound to a world directory
+  (`world.svd/` = `meta.svm` + `r_<x>_<y>_<z>.svr`) regions lazy-load on Get,
+  dirty regions write on Flush, and an LRU budget (64 regions in RAM) spills
+  to disk — long journeys stream to disk instead of growing RAM, and saves
+  are per-region instead of one monolithic file. A bound directory is a LIVE
+  world store (Minecraft-style), not a snapshot: LRU spills may persist
+  chunks between explicit saves, F9 = flush checkpoint, F10 = re-fill the
+  window from the directory. Binding happens on first save/load and is one
+  directory per session; regen detaches without deleting files, so the last
+  explicit save survives until the next save overwrites it. The old
+  monolithic `.svx` (SVX2) format is retired.
 - **Unloaded space is treated as solid and inert** so liquids can't drain off the
   edge of the loaded world (Burkelbear's solution; adopt it verbatim).
 - Underground, darkness hides the streaming horizon. Overworld draw distance vs.
@@ -276,6 +289,10 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   tags, not editing every reaction. This is the single most important guard against
   the N×M interaction explosion.
 - Explicit pairs override tag rules when both match.
+- **`molten` (2026-08-19):** optional per-material product for the heat/laser
+  melt brush (`BrushOp.mode == 2`): each cell in the brush converts to *its own*
+  molten form (stone→lava, sand→molten glass, wood→fire; absent = vaporize).
+  255-hardness matter is immune. Data, not code — the laser knows no material IDs.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -331,8 +348,20 @@ neighbors, so this needs an explicit connectivity pass:
   remain destructible: damaging a body re-runs marching cubes and can split it.
 - **Two-way handoff**: islands under ~8 voxels don't become bodies — they convert
   to their powder-equivalent material and drop back into the CA as rubble.
-  (Conversely, a body that settles and stops could optionally re-fuse into the
-  grid — defer, Noita keeps bodies as bodies.)
+- **Settle-back (2026-08-19, implemented):** the reverse handoff. A body asleep
+  for 2 s whose rotation is within ~20° of a signed-permutation orientation
+  snaps to the lattice and stamps its voxels back into the grid as exact-cell
+  ops (fill-air-only flag: existing grid content wins, resolved on the GPU so
+  it is deterministic and replayable). Odd-angle bodies stay bodies — snapping
+  them would resample to mush. One body per tick, whole body or nothing (no
+  partial settles losing matter). This closes the grid → body → grid loop and
+  applies to blast debris and severed mob limbs alike.
+- **Terrain-mesh identity rule (2026-08-19):** collision patches rebuild from
+  dirty chunks, but a chunk can be dirty for reasons that don't move the
+  collision surface (liquid flowing or drying — liquids carry no weight in the
+  mesh). Rebuilds hash the polygonized mesh and skip the rebuild *and the
+  WakeNear* when identical, otherwise any drying pool re-wakes every settled
+  body nearby forever and rule-#2 sleep never happens.
 - Unlike Noita, body voxels do **not** live in the grid each frame (too expensive
   in 3D); bodies are meshes that carve/displace grid voxels on contact, ejecting
   displaced material into the particle system.
@@ -358,6 +387,44 @@ neighbors, so this needs an explicit connectivity pass:
   modifiers). On hit: run effect, or reflect off a local marching-cubes normal.
   This tag-composition structure is deliberately the seed of the Noita-style
   wand/spell system later.
+
+### Voxel art pipeline, articulated mobs, and the laser (2026-08-19)
+
+Implemented per `docs/PLAN_voxel_art_and_mobs.md`; the through-line is that
+handmade art becomes matter the existing destruction pipeline already breaks.
+
+- **Prefabs (`sim/voxload`, `game/prefab`):** MagicaVoxel `.vox` in
+  `assets/prefabs/`, parsed with the scene graph (nTRN/nGRP/nSHP, frame 0).
+  **Palette index == material ID** — modeling is painting with materials
+  (`scripts/gen_palette.py` emits the palette PNG from materials.json); no RGB
+  colour-matching, ever. The loader converts Z-up→Y-up once,
+  chirality-preserving. `PrefabPlacer` stamps models as exact-cell ops, 16k per
+  tick, pending cells kept in *world* coords because the residency window can
+  shift mid-placement; the `kCellOpIfAir` spare-bit flag gives paint-into-air
+  semantics with the occupancy test on the GPU (deterministic). Same-cell
+  conflicts with island ops defer a tick rather than race GPU write order.
+- **Mobs (`game/mob`):** one Jolt body per limb (scene-graph partitioned, each
+  limb independently inside `DebrisVoxel`'s int8 range), joined by the new
+  joint API in `Physics` (Fixed/Hinge/Ball, voxel-unit anchors, auto-derived
+  from limb AABB adjacency or overridden in the JSON sidecar). Bodies are
+  CPU-float gameplay state outside the hashed grid domain; blood, severed
+  limbs and corpses reach the grid exclusively through the op stream, so
+  determinism rule #1 is untouched. Alive = kinematic keyframe walk (ground
+  sampled from the chunk cache); death = flip dynamic and hand every limb to
+  `DebrisSystem::AdoptBody`, where culling, terrain upkeep and settle-back
+  apply with zero mob-specific code. Intra-mob collisions are disabled via a
+  Jolt `GroupFilterTable` — adjacent limb boxes otherwise fight their joints
+  and the ragdoll never sleeps. Mob limbs render as extra body slots appended
+  after the debris bodies (shared 12-bit slot space, `kMaxBodySlots`).
+- **Bleeding:** wound budgets, capped per tick, emitted as radius-1 brush ops;
+  blood is a real material (organic tags → burns/reacts for free) with a
+  subcritical dry-to-air decay so pools go back to sleep (rule #2).
+- **Laser (hold F):** grid cuts are per-tick melt-mode brush ops at the picked
+  surface — the recessing cut is just repeated ops, and cutting supports feeds
+  the same island/support-loss pipeline as explosions. Body cuts ray-test Jolt
+  first: crossing a joint anchor severs it; hits on plain debris split the
+  body by a plane through the beam (voxel partition → two bodies, pose and
+  velocity inherited).
 
 ---
 
@@ -501,6 +568,23 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.5 (2026-08-19)** — engine-debt pass: the three consciously deferred
+> v0.4 simplifications paid down. All selftest-gated (new gates: player-body
+> overlap push, region-store spill roundtrip).
+> **Player↔body collision:** kinematic Jolt capsule proxy in a PLAYER layer
+> (collides with MOVING only; terrain stays the AABB controller's) driven by
+> MoveKinematic each tick, plus a narrow-phase depenetration query applied
+> through the normal voxel sweeps — debris can't pass through the player,
+> gets shoved by them, and can be stood on (upward push = ground support).
+> **Async eviction:** shifts no longer block on the leaving-plane readback —
+> pooled staging + mapAsync completes ticks later; a pending-eviction set
+> force-completes chunks that stream back in or get saved (see §3). Filter
+> semantics (and the accepted trailing-plane race) unchanged.
+> **Region-file ChunkStore:** 16³-chunk regions, lazy disk load, LRU spill at
+> 64 RAM regions, saves are now a `world.svd/` directory of region files +
+> meta — RAM stays bounded on long journeys and saves stop being monolithic
+> (see §3; SVX2 retired).
+>
 > **v0.4 (2026-08-19)** — M2 complete, M7 core complete, island-detection
 > support-loss triggers. All selftest-gated (new: streamed-walk determinism +
 > eviction/persistence roundtrip).
@@ -559,8 +643,15 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
 > exactly. Still open for M2/M7: toroidal residency + disk streaming beyond one
 > resident cube + procgen — the next major phase; the chunk-granular file
 > format and the chunk-fetch cache were built to serve it.
-> Deferred consciously: player↔body collision, destructible bodies (re-split on
-> damage), body re-fusion into the grid, particle↔media interactions.
+> Deferred consciously: destructible bodies (re-split on damage), body
+> re-fusion into the grid, particle↔media interactions. Player↔body collision
+> landed post-v0.4: a kinematic Jolt capsule proxy (PLAYER layer, collides
+> with MOVING only — terrain stays the AABB controller's job) follows the
+> player via MoveKinematic so debris can't pass through and gets shoved; a
+> narrow-phase depenetration query (`Physics::PlayerPushOut`) pushes the
+> player out of overlapping bodies through the normal voxel sweeps, and an
+> upward push counts as ground support (standing/jumping on debris works).
+> Selftest-gated (overlap ⇒ push, clear ⇒ none).
 >
 > **v0.2 (2026-08-19)** — M3 complete + M2 core. Fullness liquids (state nibble =
 > eighths, mass-conserving fall/equalize/split; fullness-1 films never spread, so

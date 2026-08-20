@@ -46,6 +46,8 @@ std::string ShaderConstantPrelude() {
   o << "const CHUNK_MASK : i32 = " << (kChunk - 1) << ";\n";
   o << "const WORLD_MASK : i32 = " << (kWorldN - 1) << ";\n";
   o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
+  o << "const CELLOP_IF_AIR : u32 = 0x" << std::hex << kCellOpIfAir << std::dec
+    << "u;\n";
   // Render-only: the sim never reads it, so voxel state stays integer and
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);

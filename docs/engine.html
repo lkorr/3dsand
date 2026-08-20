@@ -149,12 +149,13 @@
   <h1>sandvox — engine architecture</h1>
   <p class="sub">
     A 3D falling-sand voxel engine: a GPU-resident cellular automaton over a
-    256³ world, raymarched directly from the simulation buffers. This page walks
-    the per-tick pipeline stage by stage. Expand any stage for its mechanism,
-    computation counts, and limits.
+    256³ <strong>toroidal residency window</strong> into an infinite streamed,
+    procedurally generated world, raymarched directly from the simulation
+    buffers. This page walks the per-tick pipeline stage by stage. Expand any
+    stage for its mechanism, computation counts, and limits.
   </p>
   <div class="meta">
-    <span>world <b>256³</b> = 16.7M voxels</span>
+    <span>resident <b>256³</b> = 16.7M voxels, world <b>infinite</b></span>
     <span>chunks <b>4096</b> × 16³</span>
     <span>tick <b>30 Hz</b></span>
     <span>sim <b>0.25 ms</b> active</span>
@@ -283,10 +284,74 @@
   indirectly off its output).
 </p>
 <div class="flow">
+  <span>stream</span><i>→</i>
   <span>mutate</span><i>→</i><span>explode</span><i>→</i><span>compact</span><i>→</i>
   <span>54 × CA</span><i>→</i><span>particles</span><i>→</i><span>occupancy</span><i>→</i>
   <span>readback</span><i>→</i><span>physics</span><i>→</i><span>render</span>
 </div>
+
+<!-- ============================================================ -->
+<details class="stage" data-stage="stream">
+  <summary>
+    <span class="caret">▶</span>
+    <span class="tag t-xfer">transfer</span>
+    <span class="sname">Toroidal streaming</span>
+    <span class="sdesc">Residency window follows the player — evict, load, or generate one plane at a time</span>
+    <span class="cost">≤1 shift/axis</span>
+  </summary>
+  <div class="body">
+    <p>
+      The 256³ cube in GPU memory is a <strong>window</strong>, not the world.
+      World coordinates are unbounded signed integers; world chunk <code>c</code>
+      lives in slot <code>c mod 16</code> per axis — a bitmask, since every size
+      is a power of two, correct for negative coordinates too. The buffer never
+      shifts in memory: moving the window recycles the trailing plane of slots in
+      place. Every kernel does its logic in world coordinates (the window origin
+      rides the tick/render uniforms) and masks to slots only to touch memory;
+      cells outside the window are <strong>solid and inert</strong>, so liquids
+      can't drain off the loaded edge and the player can't walk past it.
+    </p>
+    <h4>One shift (per axis, per tick, with 2-chunk hysteresis)</h4>
+    <ol style="color:var(--fg-dim); max-width:74ch; padding-left:20px;">
+      <li>The leaving 16×16 chunk plane is read back synchronously —
+        save-worthy chunks only (occupied or ever-dirty since load; fresh
+        terrain evicts almost nothing).</li>
+      <li>Each saved chunk is RLE-compressed into the <code>ChunkStore</code>
+        (in-RAM for v1, behind an interface a region-file backend can replace;
+        the .svx save serializes the store wholesale, so streamed worlds
+        round-trip).</li>
+      <li>The recycled slots refill: store hits upload directly; misses are
+        generated on the GPU (<code>worldgen.wgsl:list</code> — one workgroup
+        per chunk, occupancy and dirty flags computed in-kernel so the renderer
+        never sees a stale empty chunk).</li>
+    </ol>
+    <p>
+      Procgen is a <strong>pure function of world coordinates + seed</strong>
+      (floor-division noise so the lattice is seamless across negatives,
+      mirrored exactly in C++): infinite hills, two cave bands carved as
+      2D-noise column spans, lava on deep cavern floors, sparse ruin POIs per
+      256² tile. A chunk generated, evicted unmodified, and revisited
+      regenerates bit-identically — only modified chunks ever need storage.
+      Column-span carving is deliberate: 3D-threshold caves generate
+      free-floating stone blobs that the island detector then
+      correctly-but-endlessly converts into debris.
+    </p>
+    <div class="limit">
+      <b>Limits</b>
+      <p>
+        Eviction readback is synchronous per shift (a few ms in heavily
+        modified areas — async eviction is the planned fix). Save-worthiness
+        reads snapshot flags that lag the GPU by the readback ring depth, so
+        sim activity starting on the trailing plane in the last ~2 ticks can be
+        lost on re-entry; CPU-known writes (brush, explosions) mark chunks
+        modified immediately to shrink that window. View distance is bounded by
+        the window: terrain more than ~6–16 chunks ahead pops in as you move
+        (the DESIGN.md draw-distance open problem). Bodies that exit the window
+        despawn — there is no terrain out there to collide with.
+      </p>
+    </div>
+  </div>
+</details>
 
 <!-- ============================================================ -->
 <details class="stage" data-stage="mutate">
@@ -471,12 +536,14 @@
     <div class="limit">
       <b>The global-lattice invariant</b>
       <p>
-        The color lattice is <strong>global, not chunk-local</strong>. Because
+        The color lattice is <strong>global in WORLD coordinates</strong> — not
+        chunk-local, and not slot-local either. Because
         <code>CHUNK = 16 ≡ 1 (mod 3)</code>, each chunk's first colored local
-        coordinate shifts by its chunk coordinate. Dispatch must correct for this
-        with <code>start = (colorPhase + 3 - (chunkCoord % 3)) % 3</code>.
-        Omitting the correction produces a simulation that looks completely
-        correct and is silently racy across chunk boundaries.
+        coordinate shifts by its <em>world</em> chunk coordinate (negative-safe:
+        <code>((base % 3) + 3) % 3</code>). Coloring by slot coordinates would
+        reintroduce the race at the toroidal wrap, where world-adjacent cells
+        have slots 256 apart and would share a color. Either omission produces a
+        simulation that looks completely correct and is silently racy.
       </p>
     </div>
 
@@ -702,12 +769,26 @@ at cap     ~524k thread-launches/tick</pre>
       DESIGN.md's <strong>risk #1</strong> — flagged by the one team who has
       shipped it as "hardest, not completely solved."
     </p>
+    <h4>What triggers a check</h4>
+    <p>
+      Explosions and brush erases register events directly. But most support
+      loss comes from the CA itself — fire eats a stem, ember decays to ash,
+      sand flows out from under a slab — so the sim also sets a per-chunk
+      <strong>support-loss flag</strong> (a side-channel buffer like the dirty
+      flags, never fed back into voxel state) whenever a supporting solid or
+      powder vacates or transforms next to a solid. The flags ride the readback,
+      are cleared on consume, and become island checks with a per-chunk
+      cooldown. This is what makes burnt plants actually fall.
+    </p>
     <h4>Pipeline</h4>
     <ol style="color:var(--fg-dim); max-width:74ch; padding-left:20px;">
-      <li>A destruction event registers an expanded voxel box.</li>
+      <li>A destruction or support-loss event registers an expanded voxel box.</li>
       <li>The region is fetched asynchronously through the readback ring.</li>
       <li><strong>Bounded 6-connected flood fill</strong> runs outward. Exceeding
-        ~32,000 voxels aborts and declares "not an island."</li>
+        ~32,000 voxels aborts and declares "not an island." A component with
+        powder directly below any voxel counts as <em>resting</em> (anchored) —
+        otherwise every slab on a sand pile would become a rigidbody the moment
+        a grain shifted.</li>
       <li>Islands leave the grid via exact-cell ops and become Jolt bodies with
         greedy-merged box compounds; mass sums per-voxel material density.</li>
       <li>Islands under 8 voxels crumble to their powder form and stay in the CA.</li>
@@ -857,8 +938,10 @@ at cap     ~524k thread-launches/tick</pre>
   <div class="body">
     <p>
       "Sleeping is the product." Every system needs a costs-nothing-when-idle
-      state. A settled 256³ world holds 16.7M voxels and simulates
-      <strong>4 chunks</strong> — 0.1% of the world.
+      state. A settled 256³ residency window holds 16.7M voxels and simulates
+      <strong>4 chunks</strong> — 0.1% of what's resident. Streaming preserves
+      this: chunks arrive from the store already settled, and generated chunks
+      wake exactly once to settle their loose material, then sleep.
     </p>
     <h4>Mechanism</h4>
     <p>

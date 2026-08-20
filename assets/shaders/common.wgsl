@@ -42,7 +42,8 @@ struct Material {
   moveEvery   : u32,   // viscosity: only move on ticks where tick % moveEvery == 0
   opacity     : u32,   // 0..255 media absorbance (translucent liquids/gases)
   hardness    : u32,   // 0..255 blast/dig resistance (DESIGN.md §7)
-  _p2 : u32, _p3 : u32, _p4 : u32,
+  molten      : u32,   // laser/heat product material (0 = vaporize to air)
+  _p3 : u32, _p4 : u32,
 };
 
 // Reaction kinds (bits 0..1 of packed) — DESIGN.md §6, authored in

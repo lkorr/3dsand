@@ -59,14 +59,24 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let idx = cellIndexW(c);
   if (op.mode == 0u && voxMat(voxels[idx]) != MAT_AIR) { return; }  // paint fills air only
 
+  var mat = op.material;
+  if (op.mode == 2u) {
+    // melt (laser, PLAN §C1): each cell converts to ITS OWN molten product
+    // from the material table — stone becomes lava while the sand next to it
+    // becomes molten glass. Air stays air, 255-hardness matter is immune.
+    let cur = voxMat(voxels[idx]);
+    if (cur == MAT_AIR || materials[cur].hardness >= 255u) { return; }
+    mat = materials[cur].molten;
+  }
+
   let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, idx);
   // liquids are born full (their state nibble is fullness); everything else
   // gets a palette variant. stamp 0xFF = "hasn't acted": falls this tick.
   var state = rnd % 3u;
-  if (op.material != MAT_AIR && materials[op.material].klass == CLASS_LIQUID) {
+  if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
     state = LIQ_FULL_STATE;
   }
-  voxels[idx] = packVox(op.material, state, 0xFFu);
+  voxels[idx] = packVox(mat, state, 0xFFu);
   markBoth(c);
 }
 
@@ -79,7 +89,13 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.cellCount) { return; }
   let op = cellOps[gid.x];
   if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
-  voxels[op.cellIdx] = op.word;
+  var word = op.word;
+  // prefab paint mode: fill air only (flag is spare-bit metadata, never stored)
+  if ((word & CELLOP_IF_AIR) != 0u) {
+    if (voxMat(voxels[op.cellIdx]) != MAT_AIR) { return; }
+    word &= ~CELLOP_IF_AIR;
+  }
+  voxels[op.cellIdx] = word;
 
   // cellIdx is a SLOT index: reconstruct the world cell through the window
   let ci = op.cellIdx / CHUNK_VOL;

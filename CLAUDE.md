@@ -141,9 +141,10 @@ PostToolUse hook in `.claude/settings.json`.
 | Path | What |
 |---|---|
 | `src/main.cpp` | frame loop, arg parsing, selftest harness, BMP writer |
-| `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation |
+| `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation, `.vox` prefab loader |
 | `src/gpu/` | Dawn context, buffer/shader/pipeline helpers |
-| `src/game/` | player controller, camera, brush |
+| `src/game/` | player controller, camera, brush, prefab placer, mob system |
+| `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy) |
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
 | `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game) |
 

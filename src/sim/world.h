@@ -34,7 +34,7 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatStem = 20, kMatFlower = 21, kMatVine = 22, kMatFungus = 23,
                    kMatDust = 24, kMatMoltenGlass = 25, kMatGlass = 26,
                    kMatSourceWater = 27, kMatSourceSand = 28, kMatSourceLava = 29,
-                   kMatVoid = 30, kMatMite = 31;
+                   kMatVoid = 30, kMatMite = 31, kMatBlood = 32;
 
 // Must match BrushOp in common.wgsl (32 bytes).
 struct BrushOp {
@@ -63,6 +63,11 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
 
+// Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
+// slot in bits 16..27, so the hard ceiling is 4096). Debris bodies take slots
+// [0, debrisCount), mob limbs stack after them.
+constexpr uint32_t kMaxBodySlots = 512;
+
 // CPU-authored render instance (grenades, markers) — must match Sprite in
 // debris.wgsl (32 bytes). Render-only: floats are fine here.
 struct Sprite {
@@ -81,6 +86,10 @@ struct CellOp {
   uint32_t word;     // full voxel word to store (stamp byte included)
 };
 constexpr uint32_t kMaxCellOpsPerTick = 65536;
+// CellOp.word flag in the spare bits (24..31): only write if the target cell
+// is air (prefab paint mode). Masked off by sim_mutate before the store, so
+// it never lands in the grid.
+constexpr uint32_t kCellOpIfAir = 0x80000000u;
 
 // Must match TickParams in common.wgsl.
 struct TickParams {

@@ -58,7 +58,8 @@ void World::Init(const wgpu::Device& device) {
                          "sprites");
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
                                "bodyInstances");
-  bodyXforms = CreateBuffer(device, 256ull * 32, U::Storage | U::CopyDst, "bodyXforms");
+  bodyXforms = CreateBuffer(device, (uint64_t)kMaxBodySlots * 32,
+                            U::Storage | U::CopyDst, "bodyXforms");
   genList = CreateBuffer(device, kNumChunks * 4, U::Storage | U::CopyDst, "genList");
 
   for (auto& s : slots_) {

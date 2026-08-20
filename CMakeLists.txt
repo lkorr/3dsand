@@ -103,11 +103,15 @@ add_executable(sandvox
   src/sim/world.cpp
   src/sim/worldio.cpp
   src/sim/stream.cpp
+  src/sim/chunkstore.cpp
   src/sim/simulation.cpp
   src/sim/materials.cpp
+  src/sim/voxload.cpp
   src/game/player.cpp
   src/game/camera.cpp
   src/game/brush.cpp
+  src/game/prefab.cpp
+  src/game/mob.cpp
   src/phys/physics.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
@@ -127,3 +131,33 @@ target_link_libraries(sandvox PRIVATE
 
 # Run from any cwd: bake the asset dir absolute path for dev builds.
 target_compile_definitions(sandvox PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
+
+# ---------------------------------------------------------------------------
+# movement_test — CPU-only player controller harness (no GPU, no window).
+#
+# Covers what --selftest's walk check cannot: crossing NOISY ground. The
+# selftest drops the player onto smooth terrain and asserts it lands, which
+# still passes when walking over rough ground is completely broken. This one
+# runs the controller against synthetic noisy/gritty heightfields and asserts
+# distance covered and jumps honoured. Links no Dawn code — it only needs the
+# headers that sim/world.h pulls in.
+# ---------------------------------------------------------------------------
+add_executable(movement_test
+  tests/movement_test.cpp
+  src/game/player.cpp
+)
+target_include_directories(movement_test PRIVATE src)
+target_compile_definitions(movement_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(movement_test PRIVATE webgpu_cpp)
+
+# ---------------------------------------------------------------------------
+# voxload_test — CPU-only .vox parser harness (no GPU). Asserts the Z-up ->
+# Y-up conversion, scene-graph flattening, and palette warnings — the
+# properties that silently put every model on its side if they regress.
+# ---------------------------------------------------------------------------
+add_executable(voxload_test
+  tests/voxload_test.cpp
+  src/sim/voxload.cpp
+)
+target_include_directories(voxload_test PRIVATE src)
+target_compile_definitions(voxload_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

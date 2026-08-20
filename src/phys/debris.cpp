@@ -316,25 +316,207 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       events_.pop_front();
     }
   }
+  SettleBodies(tick, world, cellOps);
   ManageTerrain(tick, world);
+}
+
+void DebrisSystem::SettleBodies(uint32_t tick, World& world,
+                                std::vector<CellOp>& cellOps) {
+  constexpr uint32_t kSettleAfterTicks = 60;   // 2 s asleep before converting
+  constexpr float kAlignCos = 0.94f;           // ~20°: snap or stay a body
+
+  for (size_t bi = 0; bi < bodies_.size(); bi++) {
+    Body& b = bodies_[bi];
+    if (phys_->IsActive(b.handle)) {
+      b.inactiveTicks = 0;
+      continue;
+    }
+    if (++b.inactiveTicks < kSettleAfterTicks) continue;
+    if (b.inactiveTicks % 30 != 0) continue;  // re-test alignment cheaply
+
+    // rotation -> 3x3, then the nearest signed permutation. Reject when any
+    // axis strays past the snap tolerance (resampling odd angles looks like
+    // mush — PLAN §B6 explicitly leaves those as bodies).
+    const float x = b.xf.quat[0], y = b.xf.quat[1], z = b.xf.quat[2],
+                w = b.xf.quat[3];
+    float m[3][3] = {
+        {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)},
+        {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
+        {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)}};
+    int snap[3][3] = {};
+    bool aligned = true;
+    bool rowUsed[3] = {};
+    for (int col = 0; col < 3 && aligned; col++) {
+      int best = 0;
+      for (int row = 1; row < 3; row++)
+        if (std::abs(m[row][col]) > std::abs(m[best][col])) best = row;
+      if (std::abs(m[best][col]) < kAlignCos || rowUsed[best]) {
+        aligned = false;
+        break;
+      }
+      rowUsed[best] = true;
+      snap[best][col] = m[best][col] > 0 ? 1 : -1;
+    }
+    if (!aligned) continue;
+
+    // whole body must land inside the residency window, and this tick's op
+    // budget must hold every voxel — partial settles would lose matter
+    if (cellOps.size() + b.voxels.size() > kMaxCellOpsPerTick) continue;
+
+    // snapped basis is a lattice bijection: with the body origin rounded to a
+    // cell corner, voxel centers land on distinct cells — no self-collisions.
+    IVec3 base{(int)std::lround(b.xf.pos.x), (int)std::lround(b.xf.pos.y),
+               (int)std::lround(b.xf.pos.z)};
+    bool inWindow = true;
+    size_t opsStart = cellOps.size();
+    for (const DebrisVoxel& v : b.voxels) {
+      float lx = (float)v.x + 0.5f, ly = (float)v.y + 0.5f, lz = (float)v.z + 0.5f;
+      IVec3 cell{
+          base.x + ifloor(snap[0][0] * lx + snap[0][1] * ly + snap[0][2] * lz),
+          base.y + ifloor(snap[1][0] * lx + snap[1][1] * ly + snap[1][2] * lz),
+          base.z + ifloor(snap[2][0] * lx + snap[2][1] * ly + snap[2][2] * lz)};
+      if (!world.CellInWindow(cell)) {
+        inWindow = false;
+        break;
+      }
+      // fill-air-only: occupied cells win on the GPU (deterministic — grid
+      // state is hashed, and the op replays identically). Minor volume loss
+      // where the world grew into the footprint is accepted (§B6).
+      uint32_t word = (uint32_t)v.payload | (0xFFu << 16) | kCellOpIfAir;
+      cellOps.push_back({World::SlotCellIndex(cell), word});
+    }
+    if (!inWindow) {
+      cellOps.resize(opsStart);
+      continue;
+    }
+
+    lastCellWriteTick_ = tick;
+    phys_->RemoveBody(b.handle);
+    bodies_[bi] = std::move(bodies_.back());
+    bodies_.pop_back();
+    instancesDirty_ = true;
+    settledBack_++;
+    break;  // one body per tick: bounded CPU + op traffic
+  }
+}
+
+void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels) {
+  extraAnchors_.push_back({posVoxel, radiusVoxels});
+}
+
+void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
+                             const BodyTransform& xf) {
+  if (handle == 0 || voxels.empty()) return;
+  Body body;
+  body.handle = handle;
+  body.voxels = std::move(voxels);
+  body.xf = xf;
+  IVec3 mn{127, 127, 127}, mx{-128, -128, -128};
+  for (const DebrisVoxel& v : body.voxels) {
+    mn.x = std::min<int>(mn.x, v.x); mn.y = std::min<int>(mn.y, v.y); mn.z = std::min<int>(mn.z, v.z);
+    mx.x = std::max<int>(mx.x, v.x); mx.y = std::max<int>(mx.y, v.y); mx.z = std::max<int>(mx.z, v.z);
+  }
+  float ex = (float)(mx.x - mn.x + 1), ey = (float)(mx.y - mn.y + 1),
+        ez = (float)(mx.z - mn.z + 1);
+  body.radiusVoxels = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) + 2.0f;
+  bodies_.push_back(std::move(body));
+  instancesDirty_ = true;
+}
+
+bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
+                             Vec3 planeNormal) {
+  size_t bi = 0;
+  for (; bi < bodies_.size(); bi++)
+    if (bodies_[bi].handle == handle) break;
+  if (bi == bodies_.size()) return false;
+  Body& b = bodies_[bi];
+  phys_->GetTransform(b.handle, b.xf);
+
+  // plane into body-local space (conjugate rotation)
+  const float qx = -b.xf.quat[0], qy = -b.xf.quat[1], qz = -b.xf.quat[2],
+              qw = b.xf.quat[3];
+  auto rotInv = [&](Vec3 v) {
+    Vec3 u{qx, qy, qz};
+    Vec3 t = u.cross(v) * 2.0f;
+    return v + t * qw + u.cross(t);
+  };
+  Vec3 pLocal = rotInv(planePointVoxel - b.xf.pos);
+  Vec3 nLocal = rotInv(planeNormal).normalized();
+
+  std::vector<DebrisVoxel> halves[2];
+  for (const DebrisVoxel& v : b.voxels) {
+    Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+    halves[(c - pLocal).dot(nLocal) >= 0 ? 1 : 0].push_back(v);
+  }
+  if (halves[0].size() < 4 || halves[1].size() < 4) return false;
+
+  Vec3 lin{}, ang{};
+  phys_->GetBodyVelocities(b.handle, lin, ang);
+  auto rot = [&](Vec3 v) {
+    Vec3 u{-qx, -qy, -qz};
+    Vec3 t = u.cross(v) * 2.0f;
+    return v + t * qw + u.cross(t);
+  };
+
+  Body newBodies[2];
+  for (int h = 0; h < 2; h++) {
+    // rebase to the half's own min corner (keeps int8 coords tight) and
+    // shift the body position by the rotated offset so nothing moves
+    IVec3 mn{127, 127, 127};
+    for (const DebrisVoxel& v : halves[h]) {
+      mn.x = std::min<int>(mn.x, v.x);
+      mn.y = std::min<int>(mn.y, v.y);
+      mn.z = std::min<int>(mn.z, v.z);
+    }
+    for (DebrisVoxel& v : halves[h]) {
+      v.x = (int8_t)(v.x - mn.x);
+      v.y = (int8_t)(v.y - mn.y);
+      v.z = (int8_t)(v.z - mn.z);
+    }
+    BodyTransform xf = b.xf;
+    Vec3 shift = rot(Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
+    xf.pos += shift;
+    newBodies[h].handle = phys_->CreateDebrisBodyXf(halves[h], xf, densityOf_);
+    if (newBodies[h].handle == 0) {
+      if (h == 1 && newBodies[0].handle) phys_->RemoveBody(newBodies[0].handle);
+      return false;
+    }
+    newBodies[h].voxels = std::move(halves[h]);
+    newBodies[h].xf = xf;
+    float r = 0;
+    for (const DebrisVoxel& v : newBodies[h].voxels)
+      r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
+    newBodies[h].radiusVoxels = r + 2.0f;
+    phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
+  }
+
+  phys_->RemoveBody(b.handle);
+  bodies_[bi] = std::move(newBodies[0]);
+  bodies_.push_back(std::move(newBodies[1]));
+  instancesDirty_ = true;
+  return true;
 }
 
 void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   const WorldSnapshot& snap = world.Snap();
 
-  // which chunks need collision right now? (around every dynamic body)
+  // which chunks need collision right now? (around every dynamic body and
+  // this tick's registered mob-limb anchors)
   std::vector<IVec3> needed;
-  for (const Body& b : bodies_) {
-    float r = b.radiusVoxels + 6.0f;
-    int lo[3] = {ifloor(b.xf.pos.x - r) >> 4, ifloor(b.xf.pos.y - r) >> 4,
-                 ifloor(b.xf.pos.z - r) >> 4};
-    int hi[3] = {ifloor(b.xf.pos.x + r) >> 4, ifloor(b.xf.pos.y + r) >> 4,
-                 ifloor(b.xf.pos.z + r) >> 4};
+  auto needAround = [&](Vec3 pos, float radius) {
+    float r = radius + 6.0f;
+    int lo[3] = {ifloor(pos.x - r) >> 4, ifloor(pos.y - r) >> 4,
+                 ifloor(pos.z - r) >> 4};
+    int hi[3] = {ifloor(pos.x + r) >> 4, ifloor(pos.y + r) >> 4,
+                 ifloor(pos.z + r) >> 4};
     for (int cz = lo[2]; cz <= hi[2]; cz++)
       for (int cy = lo[1]; cy <= hi[1]; cy++)
         for (int cx = lo[0]; cx <= hi[0]; cx++)
           if (world.ChunkInWindow({cx, cy, cz})) needed.push_back({cx, cy, cz});
-  }
+  };
+  for (const Body& b : bodies_) needAround(b.xf.pos, b.radiusVoxels);
+  for (const auto& [pos, r] : extraAnchors_) needAround(pos, r);
+  extraAnchors_.clear();
   auto keyLess = [](IVec3 a, IVec3 b) {
     return World::PackChunkKey(a) < World::PackChunkKey(b);
   };
@@ -382,9 +564,25 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     std::vector<uint32_t> indices;
     PolygonizeChunk(origin, solidAt, verts, indices);
 
+    // identical collision surface (liquids flowed, blood dried, gases moved):
+    // keep the existing mesh and — critically — do NOT wake sleeping bodies.
+    // Without this, a drying pool re-wakes every settled body nearby forever.
+    uint64_t h = 1469598103934665603ull;  // FNV-1a over the mesh bytes
+    auto mix = [&h](const void* p, size_t n) {
+      const uint8_t* b = (const uint8_t*)p;
+      for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    };
+    mix(verts.data(), verts.size() * sizeof(float));
+    mix(indices.data(), indices.size() * sizeof(uint32_t));
+    if (t.builtVersion != 0 && h == t.meshHash) {
+      t.builtVersion = cc->version;
+      continue;
+    }
+
     if (t.handle) phys_->RemoveBody(t.handle);
     t.handle = indices.empty() ? 0 : phys_->CreateTerrainMesh(verts, indices);
     t.builtVersion = cc->version;
+    t.meshHash = h;
     // ground under sleeping debris may have moved: let them re-settle
     phys_->WakeNear(Vec3{(float)origin.x + 8, (float)origin.y + 8,
                          (float)origin.z + 8},

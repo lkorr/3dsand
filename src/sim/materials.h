@@ -27,7 +27,8 @@ struct MaterialGpu {
   uint32_t moveEvery;               // viscosity: move only when tick % moveEvery == 0
   uint32_t opacity;                 // 0..255 media absorbance (liquids/gases)
   uint32_t hardness;                // 0..255 blast/dig resistance (DESIGN.md §7)
-  uint32_t pad2, pad3, pad4;
+  uint32_t molten;                  // laser/heat product ID (0 = vaporize to air)
+  uint32_t pad3, pad4;
 };
 static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
 
@@ -59,6 +60,9 @@ struct MaterialDef {
   // What sub-8-voxel islands of this material crumble into (DESIGN.md §7).
   // Empty = default (dust for organics/flammables, gravel otherwise).
   std::string rubble;
+  // What the laser/heat melt mode converts this into (stone -> lava,
+  // sand -> molten_glass, wood -> fire ...). Empty = vaporize to air.
+  std::string molten;
 };
 
 // Loads materials.json + reactions.json and compiles them into GPU tables:

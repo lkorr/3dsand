@@ -1,5 +1,6 @@
 #include "phys/physics.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <unordered_map>
@@ -10,12 +11,26 @@
 #include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
+#include <Jolt/Physics/Collision/CollideShape.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
+#include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
+#include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Constraints/Constraint.h>
+#include <Jolt/Physics/Constraints/FixedConstraint.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
+#include <Jolt/Physics/Constraints/PointConstraint.h>
+#include <Jolt/Physics/Body/BodyLockInterface.h>
+#include <Jolt/Physics/Body/BodyLockMulti.h>
+#include <Jolt/Physics/Collision/GroupFilterTable.h>
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/RegisterTypes.h>
@@ -27,7 +42,10 @@ namespace {
 namespace Layers {
 constexpr JPH::ObjectLayer STATIC = 0;
 constexpr JPH::ObjectLayer MOVING = 1;
-constexpr JPH::ObjectLayer NUM = 2;
+// player proxy: collides with MOVING only — terrain collision is the voxel
+// AABB controller's job, and resolving against both would double-collide
+constexpr JPH::ObjectLayer PLAYER = 2;
+constexpr JPH::ObjectLayer NUM = 3;
 }  // namespace Layers
 
 namespace BP {
@@ -53,6 +71,7 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bp) const override {
     if (layer == Layers::STATIC) return bp == BP::MOVING;  // static vs moving only
+    if (layer == Layers::PLAYER) return bp == BP::MOVING;  // proxy: bodies only
     return true;
   }
 };
@@ -60,6 +79,8 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
 class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
+    if (a == Layers::PLAYER || b == Layers::PLAYER)
+      return a == Layers::MOVING || b == Layers::MOVING;
     return !(a == Layers::STATIC && b == Layers::STATIC);
   }
 };
@@ -77,6 +98,17 @@ struct Physics::LayerImpls {
   ObjPairFilter objPair;
 };
 
+// Constraint bookkeeping: Jolt asserts if a constraint outlives either body,
+// so RemoveBody tears down attached joints first (byBody index).
+struct Physics::JointImpls {
+  struct Entry {
+    JPH::Ref<JPH::Constraint> constraint;
+    uint64_t bodyA = 0, bodyB = 0;
+  };
+  std::unordered_map<uint64_t, Entry> joints;                 // handle -> entry
+  std::unordered_map<uint64_t, std::vector<uint64_t>> byBody; // body -> joints
+};
+
 Physics::Physics() = default;
 Physics::~Physics() { Shutdown(); }
 
@@ -90,6 +122,7 @@ bool Physics::Init() {
   jobs_ = std::make_unique<JPH::JobSystemThreadPool>(
       JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, 2 /*threads*/);
   layers_ = std::make_unique<LayerImpls>();
+  joints_ = std::make_unique<JointImpls>();
 
   system_ = std::make_unique<JPH::PhysicsSystem>();
   system_->Init(4096 /*max bodies*/, 0, 4096, 2048, layers_->bpInterface,
@@ -99,6 +132,7 @@ bool Physics::Init() {
 }
 
 void Physics::Shutdown() {
+  joints_.reset();  // constraint refs drop before the system that owns bodies
   system_.reset();
   layers_.reset();
   jobs_.reset();
@@ -112,7 +146,18 @@ void Physics::Step(float dt) {
 
 uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
                                    IVec3 originVoxel,
-                                   const std::vector<float>& densityOfMat) {
+                                   const std::vector<float>& densityOfMat,
+                                   bool allowKinematic) {
+  BodyTransform xf{};
+  xf.pos = Vec3{(float)originVoxel.x, (float)originVoxel.y, (float)originVoxel.z};
+  xf.quat[3] = 1;
+  return CreateDebrisBodyXf(voxels, xf, densityOfMat, allowKinematic);
+}
+
+uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
+                                     const BodyTransform& xf,
+                                     const std::vector<float>& densityOfMat,
+                                     bool allowKinematic) {
   if (!system_ || voxels.empty()) return 0;
 
   // greedy box merge over the local voxel set (runs in +x, extended in +y,
@@ -186,17 +231,19 @@ uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
     return 0;
   }
 
+  JPH::Quat q(xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]);
+  if (q.LengthSq() < 1e-6f) q = JPH::Quat::sIdentity();
   JPH::BodyCreationSettings bcs(
       shapeResult.Get(),
-      JPH::RVec3(VoxToM((float)originVoxel.x), VoxToM((float)originVoxel.y),
-                 VoxToM((float)originVoxel.z)),
-      JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Layers::MOVING);
+      JPH::RVec3(VoxToM(xf.pos.x), VoxToM(xf.pos.y), VoxToM(xf.pos.z)),
+      q.Normalized(), JPH::EMotionType::Dynamic, Layers::MOVING);
   bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
   bcs.mMassPropertiesOverride.mMass = std::max(totalMass, 0.05f);
   bcs.mFriction = 0.75f;
   bcs.mRestitution = 0.05f;
   bcs.mLinearDamping = 0.05f;
   bcs.mAngularDamping = 0.15f;
+  bcs.mAllowDynamicOrKinematic = allowKinematic;
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
@@ -233,8 +280,228 @@ uint64_t Physics::CreateTerrainMesh(const std::vector<float>& vertsXYZ,
   return id.IsInvalid() ? 0 : FromBodyID(id);
 }
 
+uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
+  if (!system_) return 0;
+  float radius = VoxToM(halfXZVox);
+  float cylHalf = std::max(VoxToM(halfYVox) - radius, 0.01f);
+  JPH::BodyCreationSettings bcs(new JPH::CapsuleShape(cylHalf, radius),
+                                JPH::RVec3::sZero(), JPH::Quat::sIdentity(),
+                                JPH::EMotionType::Kinematic, Layers::PLAYER);
+  bcs.mFriction = 0.3f;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
+  // NOT in dynamicBodies_: the proxy takes no impulses and never despawns
+  return id.IsInvalid() ? 0 : FromBodyID(id);
+}
+
+void Physics::MovePlayerBody(uint64_t handle, Vec3 centerVoxel, float dt) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  JPH::RVec3 target(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y),
+                    VoxToM(centerVoxel.z));
+  bi.MoveKinematic(id, target, JPH::Quat::sIdentity(), std::max(dt, 1e-3f));
+}
+
+Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {
+  if (!system_ || handle == 0) return {0, 0, 0};
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return {0, 0, 0};
+  JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
+  if (!shape) return {0, 0, 0};
+
+  JPH::RVec3 center(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y),
+                    VoxToM(centerVoxel.z));
+  JPH::CollideShapeSettings settings;
+  JPH::AllHitCollisionCollector<JPH::CollideShapeCollector> collector;
+  JPH::SpecifiedObjectLayerFilter movingOnly(Layers::MOVING);
+  JPH::IgnoreSingleBodyFilter ignoreSelf(id);
+  system_->GetNarrowPhaseQuery().CollideShape(
+      shape, JPH::Vec3::sReplicate(1.0f), JPH::RMat44::sTranslation(center),
+      settings, JPH::RVec3::sZero(), collector, {}, movingOnly, ignoreSelf);
+
+  JPH::Vec3 push = JPH::Vec3::sZero();
+  for (const JPH::CollideShapeResult& hit : collector.mHits) {
+    float len = hit.mPenetrationAxis.Length();
+    if (len < 1e-6f || hit.mPenetrationDepth <= 0) continue;
+    // mPenetrationAxis points the way shape 2 (the body) moves to separate;
+    // the player moves the opposite way
+    push -= hit.mPenetrationAxis * (hit.mPenetrationDepth / len);
+  }
+  return Vec3{push.GetX(), push.GetY(), push.GetZ()} * (1.0f / kVoxelMeters);
+}
+
+uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB, JointType type,
+                              Vec3 anchorVoxel, Vec3 axis, float minAngle,
+                              float maxAngle) {
+  if (!system_ || bodyA == 0 || bodyB == 0) return 0;
+  // TwoBodyConstraintSettings::Create wants Body&: lock both bodies
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  JPH::BodyID ids[2] = {ToBodyID(bodyA), ToBodyID(bodyB)};
+  JPH::BodyLockMultiWrite lock(bli, ids, 2);
+  JPH::Body* a = lock.GetBody(0);
+  JPH::Body* b = lock.GetBody(1);
+  if (!a || !b) return 0;
+
+  JPH::RVec3 anchor(VoxToM(anchorVoxel.x), VoxToM(anchorVoxel.y),
+                    VoxToM(anchorVoxel.z));
+  JPH::Ref<JPH::Constraint> constraint;
+  switch (type) {
+    case JointType::Fixed: {
+      JPH::FixedConstraintSettings s;
+      s.mAutoDetectPoint = true;
+      constraint = s.Create(*a, *b);
+      break;
+    }
+    case JointType::Hinge: {
+      JPH::HingeConstraintSettings s;
+      s.mPoint1 = s.mPoint2 = anchor;
+      JPH::Vec3 ax(axis.x, axis.y, axis.z);
+      if (ax.LengthSq() < 1e-6f) ax = JPH::Vec3::sAxisX();
+      ax = ax.Normalized();
+      s.mHingeAxis1 = s.mHingeAxis2 = ax;
+      s.mNormalAxis1 = s.mNormalAxis2 = ax.GetNormalizedPerpendicular();
+      s.mLimitsMin = std::max(minAngle, -JPH::JPH_PI);
+      s.mLimitsMax = std::min(maxAngle, JPH::JPH_PI);
+      constraint = s.Create(*a, *b);
+      break;
+    }
+    case JointType::Ball: {
+      JPH::PointConstraintSettings s;
+      s.mPoint1 = s.mPoint2 = anchor;
+      constraint = s.Create(*a, *b);
+      break;
+    }
+  }
+  if (!constraint) return 0;
+  system_->AddConstraint(constraint);
+
+  uint64_t h = nextJointId_++;
+  joints_->joints[h] = {constraint, bodyA, bodyB};
+  joints_->byBody[bodyA].push_back(h);
+  joints_->byBody[bodyB].push_back(h);
+  return h;
+}
+
+void Physics::DestroyJoint(uint64_t joint) {
+  if (!system_ || !joints_) return;
+  auto it = joints_->joints.find(joint);
+  if (it == joints_->joints.end()) return;
+  system_->RemoveConstraint(it->second.constraint);
+  for (uint64_t body : {it->second.bodyA, it->second.bodyB}) {
+    auto bit = joints_->byBody.find(body);
+    if (bit == joints_->byBody.end()) continue;
+    auto& v = bit->second;
+    v.erase(std::remove(v.begin(), v.end(), joint), v.end());
+    if (v.empty()) joints_->byBody.erase(bit);
+  }
+  // waking both sides matters: a severed limb must start falling even if the
+  // ragdoll had gone to sleep
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  if (bi.IsAdded(ToBodyID(it->second.bodyA))) bi.ActivateBody(ToBodyID(it->second.bodyA));
+  if (bi.IsAdded(ToBodyID(it->second.bodyB))) bi.ActivateBody(ToBodyID(it->second.bodyB));
+  joints_->joints.erase(it);
+}
+
+void Physics::SetBodyKinematic(uint64_t handle, bool kinematic) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  bi.SetMotionType(id, kinematic ? JPH::EMotionType::Kinematic
+                                 : JPH::EMotionType::Dynamic,
+                   JPH::EActivation::Activate);
+}
+
+void Physics::MoveKinematicBody(uint64_t handle, Vec3 posVoxel,
+                                const float quat[4], float dt) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  bi.MoveKinematic(id,
+                   JPH::RVec3(VoxToM(posVoxel.x), VoxToM(posVoxel.y),
+                              VoxToM(posVoxel.z)),
+                   JPH::Quat(quat[0], quat[1], quat[2], quat[3]).Normalized(),
+                   std::max(dt, 1e-3f));
+}
+
+void Physics::SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  bi.SetLinearVelocity(id, JPH::Vec3(VoxToM(velVoxelsPerSec.x),
+                                     VoxToM(velVoxelsPerSec.y),
+                                     VoxToM(velVoxelsPerSec.z)));
+}
+
+bool Physics::GetBodyVelocities(uint64_t handle, Vec3& lin,
+                                Vec3& angRadPerSec) const {
+  if (!system_ || handle == 0) return false;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  JPH::Vec3 l = bi.GetLinearVelocity(id);
+  JPH::Vec3 a = bi.GetAngularVelocity(id);
+  lin = Vec3{l.GetX(), l.GetY(), l.GetZ()} * (1.0f / kVoxelMeters);
+  angRadPerSec = Vec3{a.GetX(), a.GetY(), a.GetZ()};
+  return true;
+}
+
+void Physics::SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  bi.SetLinearVelocity(id, JPH::Vec3(VoxToM(lin.x), VoxToM(lin.y), VoxToM(lin.z)));
+  bi.SetAngularVelocity(id, JPH::Vec3(angRadPerSec.x, angRadPerSec.y, angRadPerSec.z));
+}
+
+void Physics::DisableCollisionsAmong(const std::vector<uint64_t>& handles) {
+  if (!system_ || handles.size() < 2) return;
+  JPH::Ref<JPH::GroupFilterTable> table =
+      new JPH::GroupFilterTable((uint32_t)handles.size());
+  for (uint32_t i = 1; i < (uint32_t)handles.size(); i++)
+    for (uint32_t j = 0; j < i; j++) table->DisableCollision(i, j);
+  uint32_t gid = nextCollisionGroup_++;
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  for (uint32_t i = 0; i < (uint32_t)handles.size(); i++) {
+    JPH::BodyLockWrite lock(bli, ToBodyID(handles[i]));
+    if (lock.Succeeded())
+      lock.GetBody().SetCollisionGroup(JPH::CollisionGroup(table, gid, i));
+  }
+}
+
+uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
+                              float maxDistVoxels, float& fraction) const {
+  fraction = 1.0f;
+  if (!system_) return 0;
+  JPH::RRayCast ray(JPH::RVec3(VoxToM(fromVoxel.x), VoxToM(fromVoxel.y),
+                               VoxToM(fromVoxel.z)),
+                    JPH::Vec3(dirNormalized.x, dirNormalized.y,
+                              dirNormalized.z) *
+                        VoxToM(maxDistVoxels));
+  JPH::RayCastResult hit;
+  JPH::SpecifiedObjectLayerFilter movingOnly(Layers::MOVING);
+  if (!system_->GetNarrowPhaseQuery().CastRay(ray, hit, {}, movingOnly))
+    return 0;
+  fraction = hit.mFraction;
+  return FromBodyID(hit.mBodyID);
+}
+
 void Physics::RemoveBody(uint64_t handle) {
   if (!system_ || handle == 0) return;
+  // joints attached to this body die with it (Jolt asserts otherwise)
+  if (joints_) {
+    auto bit = joints_->byBody.find(handle);
+    if (bit != joints_->byBody.end()) {
+      std::vector<uint64_t> attached = bit->second;  // DestroyJoint mutates
+      for (uint64_t j : attached) DestroyJoint(j);
+    }
+  }
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = ToBodyID(handle);
   bi.RemoveBody(id);

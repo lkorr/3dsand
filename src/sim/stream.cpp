@@ -12,6 +12,7 @@ namespace {
 constexpr uint64_t kChunkBytes = kChunkVol * 4;
 constexpr int kHysteresis = 2;        // chunks past center before a shift
 constexpr size_t kEvictBatch = 256;   // staging bound: 4 MB per readback batch
+constexpr size_t kMaxPendingEvicts = 4;  // in-flight batches before we block
 }  // namespace
 
 void RleEncodeChunk(const uint32_t* words, std::vector<uint16_t>& out) {
@@ -50,6 +51,12 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
 }
 
 void Stream::Update(IVec3 playerChunk) {
+  // harvest evictions whose readback completed since last tick (non-blocking)
+  while (!pending_.empty() &&
+         ctx_->instance.WaitAny(pending_.front().future, 0) ==
+             wgpu::WaitStatus::Success)
+    CompleteOldest(/*discard=*/false);
+
   // sticky modified set from the latest snapshot (slot-indexed, ~2 ticks
   // latent; see the accepted-race note in stream.h)
   const WorldSnapshot& snap = world_->Snap();
@@ -105,51 +112,96 @@ void Stream::ShiftAxis(int axis, int dir) {
 
 void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
   const WorldSnapshot& snap = world_->Snap();
-  std::vector<std::pair<uint32_t, IVec3>> toSave;
+  // Everything the completion needs is captured NOW: the slots are refilled
+  // (and modified_ reset) before the readback lands.
+  std::vector<std::pair<uint32_t, PendingEvict::Item>> toSave;
   toSave.reserve(slots.size());
   for (uint32_t s : slots) {
     bool worth = true;
     if (filter && snap.valid)
       worth = snap.occupancy[s] > 0 || modified_[s] != 0;
-    if (worth) toSave.push_back({s, world_->SlotToWorldChunk(s)});
+    if (!worth) continue;
+    // all-air and never modified => procgen reproduces it; don't store
+    // (only trustable with a live snapshot — flushes store everything)
+    uint8_t dropIfAir = filter && snap.valid && modified_[s] == 0;
+    toSave.push_back({s, {world_->SlotToWorldChunk(s), dropIfAir}});
   }
-  if (toSave.empty()) return;
 
-  std::vector<uint32_t> data(kChunkVol);
-  std::vector<uint16_t> rle;
   for (size_t off = 0; off < toSave.size(); off += kEvictBatch) {
     size_t n = std::min(kEvictBatch, toSave.size() - off);
-    wgpu::Buffer staging = CreateBuffer(
-        ctx_->device, n * kChunkBytes,
-        wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "evictStaging");
+    PendingEvict p;
+    p.staging = AcquireStaging();
+    p.mapStatus = std::make_shared<uint32_t>(0);
+    p.items.reserve(n);
     wgpu::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
-    for (size_t i = 0; i < n; i++)
+    for (size_t i = 0; i < n; i++) {
       enc.CopyBufferToBuffer(world_->voxels,
                              (uint64_t)toSave[off + i].first * kChunkBytes,
-                             staging, i * kChunkBytes, kChunkBytes);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx_->queue.Submit(1, &cmd);
-    const uint8_t* p = nullptr;
-    wgpu::Future f = staging.MapAsync(
-        wgpu::MapMode::Read, 0, n * kChunkBytes, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          if (status == wgpu::MapAsyncStatus::Success)
-            p = (const uint8_t*)staging.GetConstMappedRange(0, n * kChunkBytes);
-        });
-    ctx_->instance.WaitAny(f, UINT64_MAX);
-    if (!p) continue;  // lost this batch (device error); keep going
-    for (size_t i = 0; i < n; i++) {
-      std::memcpy(data.data(), p + i * kChunkBytes, kChunkBytes);
-      RleEncodeChunk(data.data(), rle);
-      uint32_t slot = toSave[off + i].first;
-      // all-air and never modified => procgen reproduces it; don't store
-      // (only trustable with a live snapshot — flushes store everything)
-      bool air = rle.size() == 2 && rle[1] == 0;
-      if (air && filter && snap.valid && modified_[slot] == 0) continue;
-      store_.Put(toSave[off + i].second, rle);
+                             p.staging, i * kChunkBytes, kChunkBytes);
+      p.items.push_back(toSave[off + i].second);
+      pendingChunks_[World::PackChunkKey(toSave[off + i].second.wc)]++;
     }
-    staging.Unmap();
+    wgpu::CommandBuffer cmd = enc.Finish();
+    // submit BEFORE FillSlots writes: queue order makes the copy read the
+    // leaving plane's data even though the map completes ticks later
+    ctx_->queue.Submit(1, &cmd);
+    p.future = p.staging.MapAsync(
+        wgpu::MapMode::Read, 0, n * kChunkBytes, wgpu::CallbackMode::WaitAnyOnly,
+        [st = p.mapStatus](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          *st = status == wgpu::MapAsyncStatus::Success ? 1u : 2u;
+        });
+    pending_.push_back(std::move(p));
   }
+}
+
+wgpu::Buffer Stream::AcquireStaging() {
+  if (stagingPool_.empty() && pending_.size() >= kMaxPendingEvicts)
+    CompleteOldest(/*discard=*/false);  // ring full: recycle the oldest
+  if (!stagingPool_.empty()) {
+    wgpu::Buffer b = stagingPool_.back();
+    stagingPool_.pop_back();
+    return b;
+  }
+  return CreateBuffer(ctx_->device, kEvictBatch * kChunkBytes,
+                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                      "evictStaging");
+}
+
+void Stream::CompleteOldest(bool discard) {
+  if (pending_.empty()) return;
+  PendingEvict p = std::move(pending_.front());
+  pending_.pop_front();
+  ctx_->instance.WaitAny(p.future, UINT64_MAX);  // fires the map callback
+
+  if (*p.mapStatus == 1) {
+    if (!discard) {
+      const uint8_t* ptr = (const uint8_t*)p.staging.GetConstMappedRange(
+          0, p.items.size() * kChunkBytes);
+      if (ptr) {
+        std::vector<uint32_t> data(kChunkVol);
+        std::vector<uint16_t> rle;
+        for (size_t i = 0; i < p.items.size(); i++) {
+          std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
+          RleEncodeChunk(data.data(), rle);
+          bool air = rle.size() == 2 && rle[1] == 0;
+          if (air && p.items[i].dropIfAir) continue;
+          store_.Put(p.items[i].wc, rle);
+        }
+      }
+    }
+    p.staging.Unmap();
+    stagingPool_.push_back(p.staging);
+  }
+  // a failed map (device error) loses the batch AND retires the buffer; keep going
+
+  for (const PendingEvict::Item& it : p.items) {
+    auto pc = pendingChunks_.find(World::PackChunkKey(it.wc));
+    if (pc != pendingChunks_.end() && --pc->second == 0) pendingChunks_.erase(pc);
+  }
+}
+
+void Stream::DrainEvictions(bool discard) {
+  while (!pending_.empty()) CompleteOldest(discard);
 }
 
 void Stream::FillSlots(const std::vector<uint32_t>& slots) {
@@ -159,6 +211,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
   for (uint32_t s : slots) {
     modified_[s] = 0;
     IVec3 wc = world_->SlotToWorldChunk(s);
+    // the chunk's own eviction may still be in flight (player doubled back
+    // within the map latency): complete it so the store lookup sees it
+    while (pendingChunks_.count(World::PackChunkKey(wc)))
+      CompleteOldest(/*discard=*/false);
     const std::vector<uint16_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
       ctx_->queue.WriteBuffer(world_->voxels, (uint64_t)s * kChunkBytes,
@@ -194,9 +250,12 @@ void Stream::FlushResident() {
   std::vector<uint32_t> slots(kNumChunks);
   for (uint32_t i = 0; i < kNumChunks; i++) slots[i] = i;
   EvictSlots(slots, /*filter=*/false);
+  DrainEvictions();  // a save wants the store complete NOW
 }
 
 void Stream::ReloadWindow(IVec3 origin) {
+  // in-flight evictions belong to the world being replaced
+  DrainEvictions(/*discard=*/true);
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumChunks, 0);
   std::vector<uint32_t> slots(kNumChunks);

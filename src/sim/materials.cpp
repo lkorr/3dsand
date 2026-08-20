@@ -137,6 +137,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     }
 
     d.rubble = m.value("rubble", "");
+    d.molten = m.value("molten", "");
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
       uint32_t bit = tagReg.MaskOf(t, true);
@@ -297,6 +298,16 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
     if (!d.rubble.empty() && FindMaterial(m, d.rubble) < 0)
       errors += materialsPath + ": material \"" + d.name + "\": unknown rubble \"" +
                 d.rubble + "\"\n";
+    // molten resolves after the whole table exists (forward references:
+    // stone -> lava). The resolved ID rides the GPU material record.
+    if (!d.molten.empty()) {
+      int id = FindMaterial(m, d.molten);
+      if (id < 0)
+        errors += materialsPath + ": material \"" + d.name + "\": unknown molten \"" +
+                  d.molten + "\"\n";
+      else
+        d.gpu.molten = (uint32_t)id;
+    }
   }
   if (!errors.empty()) return false;
   mats = std::move(m);

@@ -15,11 +15,27 @@ static_assert(2.0f * Player::kHalfY < 3.0f * kChunk - 2.0f &&
               "small for this player size. Either raise kVoxelMeters or widen "
               "the mirror (World::Snap/mirrorBase) before going finer.");
 
+// Skin width, in voxels. The AABB is queried very slightly shrunk so that
+// resting *flush* against an axis-aligned voxel face does not read as an
+// overlap. Without this, a box whose face lands exactly on a voxel boundary
+// (constantly, on an axis-aligned grid — the coordinates compare bit-equal)
+// reports a collision at zero penetration every frame: the move resolves to
+// zero length and the player welds itself to the surface. Luanti solves this
+// by defining touching as non-intersecting; the shrink is the same fix.
+constexpr float kSkin = 1.0f / 512.0f;
+
+// Cosine of the steepest surface that still counts as standable ground. On a
+// voxel grid every face is axis-aligned so this is really a "is the blocking
+// face a floor, not a wall" test, but keeping the Quake threshold (0.7) means
+// the rule reads the same as everywhere else.
+constexpr float kMinWalkNormalY = 0.7f;
+
 // Does the AABB centered at p overlap any solid voxel?
 bool Collides(const Vec3& p, const Player::KindFn& kindAt) {
-  int x0 = ifloor(p.x - Player::kHalfXZ), x1 = ifloor(p.x + Player::kHalfXZ);
-  int y0 = ifloor(p.y - Player::kHalfY), y1 = ifloor(p.y + Player::kHalfY);
-  int z0 = ifloor(p.z - Player::kHalfXZ), z1 = ifloor(p.z + Player::kHalfXZ);
+  const float hx = Player::kHalfXZ - kSkin, hy = Player::kHalfY - kSkin;
+  int x0 = ifloor(p.x - hx), x1 = ifloor(p.x + hx);
+  int y0 = ifloor(p.y - hy), y1 = ifloor(p.y + hy);
+  int z0 = ifloor(p.z - hx), z1 = ifloor(p.z + hx);
   // Feet upward: ground is the overwhelmingly common blocker, and the body
   // spans kHalfY*2/kVoxelMeters rows (34 at 0.05 m voxels), so finding the hit
   // on the first row instead of the last is most of the cost.
@@ -60,6 +76,14 @@ bool SweepAxis(Vec3& pos, float delta, int axis, const Player::KindFn& kindAt) {
   return false;
 }
 
+// Horizontal distance squared travelled from `from` to `to`. Vertical gain is
+// deliberately excluded: a step-up attempt that climbs a lot but advances
+// little must not beat a flat slide that actually made progress.
+float FlatDist2(const Vec3& from, const Vec3& to) {
+  float dx = to.x - from.x, dz = to.z - from.z;
+  return dx * dx + dz * dz;
+}
+
 }  // namespace
 
 // Physical tuning, in meters (and m/s, m/s^2). Converted to voxel units below.
@@ -86,35 +110,103 @@ constexpr float kMinStepSpeedScale = 0.20f;  // climbing never fully stalls
 // climbed with no speed penalty at all. This is what makes a noisily-placed
 // single-voxel-deep surface feel like smooth ground once voxels are small.
 constexpr float kSmoothBumpM = 0.12f;
+
+// Upward speed above which we are unambiguously leaving the ground under our
+// own power, so ground-snapping and step-up must both stand down. Quake 3 says
+// "never step up when you still have up velocity"; Source spells the same rule
+// NON_JUMP_VELOCITY. Without it the snap drags a jump back onto the bump it is
+// trying to leave — which is exactly why jumping while crossing rough ground
+// used to fail. Expressed in m/s so it is voxel-size independent.
+constexpr float kNonJumpSpeedM = 0.5f;
+
+// Grace windows, seconds. Coyote time keeps a jump legal just after walking off
+// an edge; the buffer honours a jump pressed just before landing. Both exist
+// because on noisy ground the true airborne/grounded boundary is genuinely
+// ragged, and a player pressing jump "while running over gravel" is otherwise
+// at the mercy of which frame the press lands on.
+constexpr float kCoyoteTime = 0.12f;
+constexpr float kJumpBufferTime = 0.12f;
 }  // namespace
 
 namespace {
 
-// After a blocked horizontal sweep, try lifting the AABB by 1..kMaxStepUpVoxels,
-// redoing the move, then settling back down onto the ledge. Returns the height
-// actually climbed IN VOXELS (fractional — the settle-down lands wherever the
-// ledge is, which need not be the height we probed), or -1 if no step height
-// clears the obstacle.
+// Positional ground probe: is there standable ground within `reach` voxels
+// below the AABB? Returns the (positive) drop to the surface, or -1 for none.
 //
-// The probe is a single lift to the max step height rather than a 1..N ladder:
-// at small kVoxelMeters the ladder ran up to kStepUpM/kVoxelMeters iterations
-// (9 at 0.05 m) of three sweeps each, and the settle-down finds the true ledge
-// top anyway, so the intermediate heights only cost time.
-float TryStepUp(Vec3& pos, float delta, int axis, const Player::KindFn& kindAt) {
-  const float h = (float)Player::kMaxStepUpVoxels;
+// This replaces the old "did this frame's downward sweep get blocked" test,
+// which is the single worst bug on noisy terrain: crossing rough ground means
+// genuinely leaving the surface for a fraction of a voxel on most frames, so a
+// per-frame blocked test makes `grounded` strobe. Everything gated on grounded
+// — jumping, step-up, ground friction — then strobes with it. Asking the
+// positional question instead ("is there floor under me right now") is stable
+// because it does not care whether this particular frame happened to touch.
+float GroundProbe(const Vec3& pos, float reach, const Player::KindFn& kindAt) {
   Vec3 test = pos;
-  if (SweepAxis(test, h, 1, kindAt)) {
-    // Not enough headroom for a full-height lift. Retry with whatever vertical
-    // room we actually got; if that is nothing, there is no step to take.
-    float lifted = test.y - pos.y;
-    if (lifted <= 1e-4f) return -1.0f;
+  if (!SweepAxis(test, -reach, 1, kindAt)) return -1.0f;  // fell the whole way
+  return pos.y - test.y;
+}
+
+// Try to advance horizontally by (dx, dz) using the classic Quake/Source
+// three-attempt step move, and take whichever attempt travelled farther
+// horizontally. Returns the height climbed IN VOXELS (0 if the flat move won).
+//
+// The three attempts are:
+//   (A) slide flat from the original position;
+//   (B) lift by the step height, slide from up there, then press back down;
+//   and the winner is decided by horizontal distance, not by "did (A) block".
+//
+// The naive alternative — "if blocked, lift and retry the blocked axis" — is
+// what used to be here, and it fails on rough ground in three separate ways:
+// it commits to the lift even when the lift makes things worse (raised, the
+// AABB can foul a *different* voxel that the flat slide would have slid past,
+// and the flat result no longer exists to fall back on); it never validates
+// that it landed on something standable, so it will climb the side of a
+// one-voxel spike; and by retrying only the blocked axis it drops wall-sliding
+// at the exact moment it steps, which reads as catching on every corner.
+float StepSlide(Vec3& pos, float dx, float dz, const Player::KindFn& kindAt) {
+  const Vec3 start = pos;
+
+  // (A) the flat slide. Each axis is swept independently, so a blocked X still
+  // permits the full Z — that is the sliding behaviour, and it must happen
+  // before any decision about stepping.
+  Vec3 flat = start;
+  bool blockedX = SweepAxis(flat, dx, 0, kindAt);
+  bool blockedZ = SweepAxis(flat, dz, 2, kindAt);
+  if (!blockedX && !blockedZ) {  // nothing in the way: no step needed at all
+    pos = flat;
+    return 0.0f;
   }
-  if (SweepAxis(test, delta, axis, kindAt)) return -1.0f;  // still blocked
-  SweepAxis(test, -h, 1, kindAt);                          // settle onto ledge
-  float climbed = test.y - pos.y;
-  if (climbed < -1e-4f) return -1.0f;  // settled below start: not a step up
-  pos = test;
-  return std::max(0.0f, climbed);
+
+  // (B) lift, slide, settle.
+  const float lift = (float)Player::kMaxStepUpVoxels;
+  Vec3 up = start;
+  SweepAxis(up, lift, 1, kindAt);  // partial lift is fine (low ceiling)
+  float lifted = up.y - start.y;
+  float climbed = -1.0f;
+  if (lifted > 1e-4f) {
+    SweepAxis(up, dx, 0, kindAt);
+    SweepAxis(up, dz, 2, kindAt);
+    // Press back down by the distance actually achieved, not the nominal step
+    // height (Quake 3's stepSize fix — matters under a low ceiling).
+    bool landed = SweepAxis(up, -lifted, 1, kindAt);
+    // The settle must land on real floor. If we fell the whole way back down
+    // we merely hopped over nothing; if we ended above where we started
+    // without landing, we are wedged. Either way the step is not valid.
+    if (landed) {
+      float c = up.y - start.y;
+      if (c >= -1e-4f) climbed = std::max(0.0f, c);
+    }
+  }
+
+  // Take whichever attempt actually made horizontal progress. This comparison
+  // is the whole point of the pattern: stepping is only better if it moved you
+  // farther, and on noisy ground the flat slide frequently wins.
+  if (climbed >= 0.0f && FlatDist2(start, up) > FlatDist2(start, flat) + 1e-6f) {
+    pos = up;
+    return climbed;
+  }
+  pos = flat;
+  return 0.0f;
 }
 
 }  // namespace
@@ -135,6 +227,11 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   }
   inLiquid = liquidCells > 0;
 
+  // Timers run every frame regardless of mode so they never go stale in fly.
+  if (coyoteTimer > 0.0f) coyoteTimer -= dt;
+  if (jumpBuffer > 0.0f) jumpBuffer -= dt;
+  if (in.jumpPressed) jumpBuffer = kJumpBufferTime;
+
   if (fly) {
     float speed = (in.sprint ? kFlySprintM : kFlySpeedM) / kVoxelMeters;
     Vec3 wish = lookFwd * in.forward + right * in.strafe;
@@ -142,7 +239,22 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     if (in.down) wish += Vec3{0, -1, 0};
     vel = wish.len() > 1e-3f ? wish.normalized() * speed : Vec3{0, 0, 0};
     pos += vel * dt;
+    grounded = false;
+    coyoteTimer = 0.0f;
   } else {
+    const float nonJumpSpeed = kNonJumpSpeedM / kVoxelMeters;
+
+    // ---- ground state, decided BEFORE the move (Source uses `oldground`) ----
+    // Probe reach gets extended by the step height while we already believe we
+    // are grounded. That hysteresis is the structural form of coyote time: it
+    // stops `grounded` flickering as the body crests sub-voxel noise, and it
+    // keeps us attached walking down a rough slope instead of bouncing off it.
+    bool rising = vel.y > nonJumpSpeed;
+    float reach = grounded ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
+    float drop = rising ? -1.0f : GroundProbe(pos, reach, kindAt);
+    bool onGround = drop >= 0.0f && !inLiquid;
+    if (onGround) coyoteTimer = kCoyoteTime;
+
     const float gravity = kGravityM / kVoxelMeters;
     float accel = inLiquid ? 0.25f : 1.0f;
     vel.y -= gravity * accel * dt;
@@ -153,45 +265,68 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     wish.y = 0;
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
     // snappy ground control, floatier air control
-    float blend = grounded ? 0.35f : (inLiquid ? 0.15f : 0.06f);
+    float blend = onGround ? 0.35f : (inLiquid ? 0.15f : 0.06f);
     vel.x += (wish.x - vel.x) * blend;
     vel.z += (wish.z - vel.z) * blend;
 
+    // ---- jump: buffered press + coyote window, both consumed on use ----
+    bool jumped = false;
     if (inLiquid) {
       vel.y *= 0.92f;  // drag
       if (in.up) vel.y += (kSwimUpM / kVoxelMeters) * dt;  // swim
       if (in.down) vel.y -= (kSwimDownM / kVoxelMeters) * dt;
-    } else if (in.jumpPressed && grounded) {
+    } else if (jumpBuffer > 0.0f && coyoteTimer > 0.0f) {
       vel.y = kJumpSpeedM / kVoxelMeters;
+      jumpBuffer = 0.0f;
+      coyoteTimer = 0.0f;  // consume both, or one press pogos every frame
+      onGround = false;    // no snapping or stepping on the frame we launch
+      jumped = true;
     }
     const float vmax = kMaxFallM / kVoxelMeters;
     vel.y = std::clamp(vel.y, -vmax, vmax);
 
+    // ---- vertical move ----
     bool blockedY = SweepAxis(pos, vel.y * dt, 1, kindAt);
-    grounded = blockedY && vel.y < 0;
     if (blockedY) vel.y = 0;
 
-    float climbedM = 0.0f;
-    for (int axis : {0, 2}) {
-      float& v = axis == 0 ? vel.x : vel.z;
-      float start = axis == 0 ? pos.x : pos.z;
-      if (!SweepAxis(pos, v * dt, axis, kindAt)) continue;
-      // blocked: on the ground, try to climb the ledge with the unconsumed
-      // part of the move instead of stopping dead
-      float remaining = start + v * dt - (axis == 0 ? pos.x : pos.z);
-      float climbed = grounded ? TryStepUp(pos, remaining, axis, kindAt) : -1.0f;
-      if (climbed < 0.0f) {
-        v = 0;
-      } else {
-        // Surface roughness is free; only real ledges cost speed. Without this
-        // exemption, fine voxels turn every noisy floor into a constant drag.
-        float m = climbed * kVoxelMeters;
-        if (m > kSmoothBumpM) climbedM += m - kSmoothBumpM;
+    // ---- horizontal move, with step-up ----
+    float climbed =
+        onGround ? StepSlide(pos, vel.x * dt, vel.z * dt, kindAt) : 0.0f;
+    if (!onGround) {
+      // Airborne: plain slide, no stepping (both Quake and Source refuse to
+      // step while off the ground). Zeroing the blocked component here is
+      // wrong for the same reason it was wrong before — against a voxel
+      // staircase a diagonal run alternates X and Z blocks and would lose both
+      // components — so a blocked axis just stops advancing this frame and
+      // keeps its velocity for the next.
+      SweepAxis(pos, vel.x * dt, 0, kindAt);
+      SweepAxis(pos, vel.z * dt, 2, kindAt);
+    }
+
+    // ---- stay on ground: snap back down onto the surface after moving ----
+    // Source calls this at the end of every WalkMove. It is what turns walking
+    // *down* rough ground from a series of little falls into contact motion,
+    // and it is why grounded stays true across noise. Skipped while rising.
+    if (onGround && !jumped && vel.y <= nonJumpSpeed) {
+      float snap = GroundProbe(pos, 0.1f + (float)kMaxStepUpVoxels, kindAt);
+      if (snap > 0.0f) {
+        SweepAxis(pos, -snap, 1, kindAt);
+        if (vel.y < 0.0f) vel.y = 0.0f;
       }
     }
-    if (climbedM > 0.0f) {
+
+    // Re-probe after the move so `grounded` reported to the rest of the frame
+    // reflects where we ended up, not where we started.
+    grounded = !rising && !inLiquid &&
+               GroundProbe(pos, 0.1f, kindAt) >= 0.0f;
+    if (grounded) coyoteTimer = kCoyoteTime;
+
+    // Surface roughness is free; only real ledges cost speed. Without this
+    // exemption, fine voxels turn every noisy floor into a constant drag.
+    float climbedM = climbed * kVoxelMeters;
+    if (climbedM > kSmoothBumpM) {
       float scale = std::max(kMinStepSpeedScale,
-                             1.0f - climbedM * kStepSpeedPenaltyPerM);
+                             1.0f - (climbedM - kSmoothBumpM) * kStepSpeedPenaltyPerM);
       vel.x *= scale;
       vel.z *= scale;
     }
@@ -201,4 +336,24 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // the player). The residency-window faces read as Solid through kindAt, so
   // collision alone stops the player in the rare case a face is ever reached
   // (the window recenters ~6 chunks before that).
+}
+
+void Player::ApplyPush(Vec3 push, const KindFn& kindAt) {
+  float len = push.len();
+  if (len < 1e-4f) return;
+  // A body can shove at most one body-width per tick: a deeply interpenetrated
+  // state (debris spawned around the player) resolves over a few ticks instead
+  // of ejecting the camera across the map in one frame.
+  const float kMaxPush = 2.0f * kHalfXZ;
+  if (len > kMaxPush) push = push * (kMaxPush / len);
+  SweepAxis(pos, push.x, 0, kindAt);
+  SweepAxis(pos, push.y, 1, kindAt);
+  SweepAxis(pos, push.z, 2, kindAt);
+  if (push.y > 0.01f && vel.y < 0.0f) {
+    // supported from below by a body: standing (and jumping) on debris works
+    // even though the voxel ground probe can't see rigidbodies
+    vel.y = 0.0f;
+    grounded = true;
+    coyoteTimer = kCoyoteTime;
+  }
 }

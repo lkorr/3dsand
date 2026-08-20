@@ -46,7 +46,8 @@ void Overlay::Draw(UIState& s) {
   ImGui::Text("tick %u   active chunks %u / 4096", s.tick, s.activeChunks);
   ImGui::Text("voxels %.2f M   particles %u   hash %08x %s", s.voxelTotal / 1e6,
               s.particleCount, s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
-  ImGui::Text("debris bodies %u (%u awake)", s.bodyCount, s.activeBodyCount);
+  ImGui::Text("debris bodies %u (%u awake)   mobs %u", s.bodyCount,
+              s.activeBodyCount, s.mobCount);
   ImGui::Text("pos %.0f %.0f %.0f  (%s)", s.playerPos[0], s.playerPos[1],
               s.playerPos[2], s.fly ? "fly" : "walk");
   ImGui::Separator();
@@ -82,6 +83,57 @@ void Overlay::Draw(UIState& s) {
     ImGui::EndCombo();
   }
 
+  ImGui::Separator();
+  ImGui::Text("tool (Tab):");
+  ImGui::SameLine();
+  ImGui::RadioButton("brush", &s.tool, UIState::kToolBrush);
+  ImGui::SameLine();
+  ImGui::RadioButton("laser", &s.tool, UIState::kToolLaser);
+  ImGui::SameLine();
+  ImGui::RadioButton("prefab", &s.tool, UIState::kToolPrefab);
+  ImGui::SameLine();
+  ImGui::RadioButton("mob", &s.tool, UIState::kToolMob);
+
+  if (s.tool == UIState::kToolBrush) {
+    ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
+  } else if (s.tool == UIState::kToolLaser) {
+    ImGui::TextDisabled("hold LMB (or F): melts what it hits, cuts bodies");
+  } else if (s.tool == UIState::kToolPrefab) {
+    if (!s.prefabNames.empty()) {
+      if (s.prefabSelected >= (int)s.prefabNames.size()) s.prefabSelected = 0;
+      if (ImGui::BeginCombo("prefab", s.prefabNames[s.prefabSelected].c_str())) {
+        for (int i = 0; i < (int)s.prefabNames.size(); i++)
+          if (ImGui::Selectable(s.prefabNames[i].c_str(), i == s.prefabSelected))
+            s.prefabSelected = i;
+        ImGui::EndCombo();
+      }
+      ImGui::Text("rotation %d°", s.prefabRot * 90);
+      ImGui::SameLine();
+      if (ImGui::Button("rotate (T)")) s.prefabRot = (s.prefabRot + 1) & 3;
+      ImGui::SameLine();
+      ImGui::Checkbox("overwrite", &s.prefabOverwrite);
+      if (s.prefabPending > 0)
+        ImGui::Text("placing... %u voxels pending", s.prefabPending);
+      ImGui::TextDisabled("LMB place  T rotate  O cycle");
+    } else {
+      ImGui::TextDisabled("no prefabs (assets/prefabs/*.vox)");
+    }
+  } else if (s.tool == UIState::kToolMob) {
+    if (!s.mobNames.empty()) {
+      if (s.mobSelected >= (int)s.mobNames.size()) s.mobSelected = 0;
+      if (ImGui::BeginCombo("mob", s.mobNames[s.mobSelected].c_str())) {
+        for (int i = 0; i < (int)s.mobNames.size(); i++)
+          if (ImGui::Selectable(s.mobNames[i].c_str(), i == s.mobSelected))
+            s.mobSelected = i;
+        ImGui::EndCombo();
+      }
+      ImGui::TextDisabled("LMB (or M) spawn at crosshair");
+    } else {
+      ImGui::TextDisabled("no mobs (assets/mobs/*.vox + .json)");
+    }
+  }
+  ImGui::Separator();
+
   if (ImGui::Button("reload shaders (F5)")) s.reloadShaders = true;
   ImGui::SameLine();
   if (ImGui::Button("reload materials (R)")) s.reloadMaterials = true;
@@ -95,8 +147,8 @@ void Overlay::Draw(UIState& s) {
 
   if (ImGui::Button("detonate at crosshair (X)")) s.pendingDetonate = true;
 
-  ImGui::TextDisabled("LMB paint  RMB erase  1-8 material  Esc cursor  F1 UI");
-  ImGui::TextDisabled("G throw grenade  X detonate at crosshair");
+  ImGui::TextDisabled("Tab switch tool  1-8 material  Esc cursor  F1 UI");
+  ImGui::TextDisabled("G grenade  X detonate  F laser  M spawn mob  B place");
   ImGui::End();
 }
 

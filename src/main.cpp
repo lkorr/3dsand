@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -13,7 +14,9 @@
 
 #include "game/brush.h"
 #include "game/camera.h"
+#include "game/mob.h"
 #include "game/player.h"
+#include "game/prefab.h"
 #include "gpu/context.h"
 #include "gpu/resources.h"
 #include "math3d.h"
@@ -22,6 +25,7 @@
 #include "sim/materials.h"
 #include "sim/simulation.h"
 #include "sim/stream.h"
+#include "sim/voxload.h"
 #include "sim/world.h"
 #include "sim/worldio.h"
 #include "ui/overlay.h"
@@ -202,6 +206,11 @@ std::vector<BrushOp> SelftestOps(uint32_t tick) {
   if (tick >= 10 && tick < 16) {
     ops.push_back({150, 90, 128, 2, kMatSeed, 0, 0, 0});
   }
+  // melt-mode coverage (laser, PLAN §C1): catches the falling sand column in
+  // a mode-2 brush — molten-glass conversion feeds the determinism hash
+  if (tick >= 70 && tick < 100) {
+    ops.push_back({100, 166, 100, 3, 0, 2u, 0, 0});
+  }
   return ops;
 }
 
@@ -245,7 +254,7 @@ void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
 
 int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 const std::vector<MaterialDef>& mats, Physics& phys,
-                DebrisSystem& debris, Stream& stream) {
+                DebrisSystem& debris, MobSystem& mobs, Stream& stream) {
   std::printf("=== selftest ===\n");
   constexpr int kTicks = 200;
 
@@ -587,11 +596,234 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     }
   }
 
+  // Milestone A prefab placement: a 48^3 stone cube (110,592 voxels) must
+  // spread across ticks under the 16384/tick placer budget and land with
+  // ZERO dropped voxels (exact count via chunk fetches).
+  bool prefabOk = false;
+  {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    Prefab pf;
+    pf.name = "testcube";
+    PrefabModel pm;
+    pm.name = "cube";
+    pm.size = {48, 48, 48};
+    for (int z = 0; z < 48; z++)
+      for (int y = 0; y < 48; y++)
+        for (int x = 0; x < 48; x++)
+          pm.voxels.push_back({(int16_t)x, (int16_t)y, (int16_t)z,
+                               (uint16_t)kMatStone});
+    pf.size = pm.size;
+    pf.models.push_back(std::move(pm));
+
+    PrefabPlacer placer;
+    IVec3 lo{100, 150, 100}, hi;
+    placer.Place(pf, lo, 0, true, mats, lo, hi);
+    uint32_t t = 4000;
+    int drainTicks = 0;
+    while (placer.PendingCount() > 0 && drainTicks < 32) {
+      std::vector<CellOp> cellOps;
+      placer.PreTick(world, cellOps);
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, cellOps, false,
+                 {8, 10, 8}, false, false);
+      drainTicks++;
+    }
+    ctx.WaitIdle();
+
+    // count the stamped voxels back out through the async fetch path
+    uint32_t placedTick = t;
+    uint64_t stone = 0;
+    bool allFresh = false;
+    for (int tries = 0; tries < 90 && !allFresh; tries++) {
+      allFresh = true;
+      stone = 0;
+      for (int cz = 100 >> 4; cz <= 147 >> 4; cz++)
+        for (int cy = 150 >> 4; cy <= 197 >> 4; cy++)
+          for (int cx = 100 >> 4; cx <= 147 >> 4; cx++) {
+            const CachedChunk* cc = world.Cached({cx, cy, cz});
+            if (!cc || cc->version < placedTick) {
+              world.RequestChunkFetch({cx, cy, cz});
+              allFresh = false;
+              continue;
+            }
+            for (uint32_t w : cc->voxels)
+              if ((w & 0xFFFu) == kMatStone) stone++;
+          }
+      if (!allFresh) {
+        SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                   {8, 10, 8}, true, false);
+        ctx.WaitIdle();
+        ctx.ProcessEvents();
+      }
+    }
+    prefabOk = allFresh && stone == 48ull * 48 * 48 && drainTicks >= 6;
+    std::printf("prefab: %s (%llu / %llu voxels landed over %d ticks)\n",
+                prefabOk ? "PASS" : "FAIL", (unsigned long long)stone,
+                48ull * 48 * 48, drainTicks);
+  }
+
+  // Milestone B mobs: spawn the generated dummy on terrain — it must stand
+  // and walk (kinematic limbs over cached-chunk ground), lose an arm to
+  // Sever (joint destroyed, limb adopted as debris), die to a vital hit
+  // (whole-body ragdoll), and every piece must go to sleep.
+  bool mobOk = false;
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    if (mobs.Defs().empty()) {
+      std::printf("mob: FAIL (no mob defs — run scripts/gen_test_mob.py)\n");
+    } else {
+      int h = World::TerrainHeight(140, 140, kDefaultSeed);
+      uint32_t t = 6000;
+      auto mobTick = [&](std::vector<BrushOp> ops) {
+        mobs.PreTick(t + 1, world, ops);
+        debris.QueueSupportEvents(world.Snap());
+        std::vector<CellOp> cellOps;
+        debris.PreTick(t + 1, world, cellOps);
+        ++t;
+        SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
+                   {8, h / 16, 8}, true, false);
+        ctx.WaitIdle();
+        ctx.ProcessEvents();
+        phys.Step(kTickDt);
+        debris.PostStep();
+        mobs.PostStep();
+      };
+
+      uint64_t id = mobs.Spawn(0, {137, h + 1, 139});
+      Vec3 spawnPos = mobs.MobOrigin(id);
+      for (int i = 0; i < 120; i++) mobTick({});
+      Vec3 walked = mobs.MobOrigin(id);
+      float dist = (walked - spawnPos).len();
+      bool standing = mobs.IsAlive(id) && mobs.LimbBodyCount() == 6 &&
+                      std::abs(walked.y - (float)(h + 1)) < 6.0f;
+
+      // sever arm.L (limb index 2 in the generated sidecar)
+      uint32_t debrisBefore = debris.BodyCount();
+      mobs.Sever(id, 2);
+      bool severed = mobs.LimbBodyCount() == 5 &&
+                     debris.BodyCount() == debrisBefore + 1 && mobs.IsAlive(id);
+      for (int i = 0; i < 60; i++) mobTick({});
+
+      // vital hit: decapitation kills — remaining 5 limbs ragdoll into debris.
+      // settle window covers the blood drying out (its chunks stay dirty
+      // while wet, and terrain refreshes wake nearby bodies by design)
+      mobs.Sever(id, 1);
+      bool died = !mobs.IsAlive(id) || mobs.MobCount() == 0;
+      for (int i = 0; i < 500; i++) mobTick({});
+      uint32_t awake = debris.ActiveBodyCount();
+      bool settled = awake == 0 && mobs.MobCount() == 0;
+
+      mobOk = standing && severed && died && settled;
+      std::printf(
+          "mob: %s (stood=%d walked %.1f vox, sever=%d, death=%d, %u debris "
+          "pieces, %u awake after settle)\n",
+          mobOk ? "PASS" : "FAIL", standing ? 1 : 0, dist, severed ? 1 : 0,
+          died ? 1 : 0, debris.BodyCount(), awake);
+      debris.Reset();
+      mobs.Reset();
+    }
+  }
+
+  // B6 settle-back: a dropped stone block must sleep, snap to the lattice,
+  // convert back into grid voxels through the op stream, and free its body —
+  // closing the grid -> body -> grid loop.
+  bool settleOk = false;
+  {
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    int h = World::TerrainHeight(80, 80, kDefaultSeed);
+    std::vector<float> dens;
+    for (const auto& m : mats) dens.push_back((float)m.gpu.density);
+    std::vector<DebrisVoxel> vox;
+    for (int z = 0; z < 3; z++)
+      for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++)
+          vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+    uint64_t bh = phys.CreateDebrisBody(vox, {80, h + 4, 80}, dens);
+    BodyTransform bxf{};
+    bxf.pos = Vec3{80, (float)(h + 4), 80};
+    bxf.quat[3] = 1;
+    debris.AdoptBody(bh, vox, bxf);
+
+    uint32_t t = 8000;
+    for (int i = 0; i < 360 && debris.BodyCount() > 0; i++) {
+      std::vector<CellOp> cellOps;
+      debris.PreTick(t + 1, world, cellOps);
+      ++t;
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+                 {5, h / 16, 5}, true, false);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+    }
+    settleOk = debris.BodyCount() == 0 && debris.SettledBack() >= 1;
+    std::printf("settle-back: %s (%u bodies converted to grid, %u still "
+                "bodies)\n",
+                settleOk ? "PASS" : "FAIL", debris.SettledBack(),
+                debris.BodyCount());
+
+    // C2 body split: a 3x3x9 bar cut through the middle must become two
+    // independent bodies (no stepping needed — pure partition + respawn)
+    std::vector<DebrisVoxel> bar;
+    for (int z = 0; z < 9; z++)
+      for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++)
+          bar.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+    uint64_t barBody = phys.CreateDebrisBody(bar, {500, 500, 500}, dens);
+    BodyTransform barXf{};
+    barXf.pos = Vec3{500, 500, 500};
+    barXf.quat[3] = 1;
+    debris.AdoptBody(barBody, bar, barXf);
+    bool splitOk = debris.SplitBody(barBody, Vec3{501.5f, 501.5f, 504.5f},
+                                    Vec3{0, 0, 1}) &&
+                   debris.BodyCount() == 2;
+    std::printf("body split: %s (%u bodies after cut)\n",
+                splitOk ? "PASS" : "FAIL", debris.BodyCount());
+    settleOk = settleOk && splitOk;
+    debris.Reset();
+  }
+
+  // player↔body (deferred from M6): the kinematic player proxy must register
+  // debris overlap as a depenetration push, and read clear when separated.
+  // Pure narrow-phase — no stepping between spawn and query, so deterministic.
+  bool pushOk = false;
+  {
+    std::vector<float> dens;
+    for (const auto& m : mats) dens.push_back((float)m.gpu.density);
+    auto stoneBlock = [&](IVec3 origin) {
+      std::vector<DebrisVoxel> vox;
+      for (int z = 0; z < 3; z++)
+        for (int y = 0; y < 3; y++)
+          for (int x = 0; x < 3; x++)
+            vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+      return phys.CreateDebrisBody(vox, origin, dens);
+    };
+    uint64_t pb = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    Vec3 at{500.0f, 500.0f, 500.0f};  // far from the debris-test terrain
+    phys.MovePlayerBody(pb, at, kTickDt);
+    phys.Step(kTickDt);  // proxy reaches its target
+    uint64_t nearBody = stoneBlock({499, 499, 499});  // straddles the capsule
+    float pushNear = phys.PlayerPushOut(pb, at).len();
+    phys.RemoveBody(nearBody);
+    uint64_t farBody = stoneBlock({520, 500, 500});
+    float pushFar = phys.PlayerPushOut(pb, at).len();
+    phys.RemoveBody(farBody);
+    phys.RemoveBody(pb);
+    pushOk = pushNear > 0.01f && pushFar < 1e-3f;
+    std::printf("player body: %s (overlap push %.2f vox, clear push %.3f vox)\n",
+                pushOk ? "PASS" : "FAIL", pushNear, pushFar);
+  }
+
   // M2 save/load: snapshot at tick 100, diverge 50 ticks, load — the world
   // hash must return exactly to the snapshot value (stamp bytes excluded).
   bool saveOk = false;
   {
-    const char* kPath = "selftest_world.svx";
+    const char* kPath = "selftest_world.svd";
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     uint32_t t = 3000;
@@ -611,7 +843,36 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     saveOk = saved && loaded && h1 == h2 && h1 != hDiverged;
     std::printf("save/load: %s (hash %08x -> diverged %08x -> restored %08x)\n",
                 saveOk ? "PASS" : "FAIL", h1, hDiverged, h2);
-    std::remove(kPath);
+    stream.Store().Unbind();  // detach before deleting the directory
+    std::filesystem::remove_all(kPath);
+  }
+
+  // region store: RAM must stay bounded past kMaxRamRegions (LRU spill to
+  // region files) and spilled chunks must read back from disk intact.
+  bool storeOk = false;
+  {
+    const char* kDir = "selftest_store.svd";
+    ChunkStore cs;
+    storeOk = cs.BindSave(kDir);
+    const size_t kRegions = ChunkStore::kMaxRamRegions + 16;
+    for (size_t i = 0; i < kRegions; i++) {
+      // one chunk per region: a full-chunk run of a per-region material
+      std::vector<uint16_t> rle = {(uint16_t)kChunkVol,
+                                   (uint16_t)(kMatStone + (i % 3))};
+      cs.Put({(int)i * 16, 0, 0}, std::move(rle));
+    }
+    size_t ramAfterPuts = cs.Count();
+    for (size_t i = 0; i < kRegions && storeOk; i++) {
+      const std::vector<uint16_t>* rle = cs.Get({(int)i * 16, 0, 0});
+      storeOk = rle && rle->size() == 2 && (*rle)[0] == (uint16_t)kChunkVol &&
+                (*rle)[1] == (uint16_t)(kMatStone + (i % 3));
+    }
+    storeOk = storeOk && ramAfterPuts <= ChunkStore::kMaxRamRegions;
+    std::printf("region store: %s (%zu regions written, %zu chunks in RAM "
+                "after puts)\n",
+                storeOk ? "PASS" : "FAIL", kRegions, ramAfterPuts);
+    cs.Unbind();
+    std::filesystem::remove_all(kDir);
   }
 
   // M2/M7 streaming: (a) slide the residency window +X across many shifts,
@@ -723,7 +984,8 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk && sleepOk && debrisOk && saveOk && streamOk;
+  bool pass = deterministic && walkOk && sleepOk && debrisOk && prefabOk &&
+              mobOk && settleOk && pushOk && saveOk && storeOk && streamOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
@@ -802,6 +1064,15 @@ int main(int argc, char** argv) {
   }
   std::printf("loaded %zu materials, %zu reactions\n", mats.size(), reactions.size());
 
+  // voxel art prefabs (PLAN §A): drop .vox files in assets/prefabs/
+  std::vector<Prefab> prefabs;
+  {
+    std::string plog;
+    LoadPrefabDir(assetDir + "/prefabs", mats.size(), prefabs, plog);
+    if (!plog.empty()) std::fprintf(stderr, "%s", plog.c_str());
+    std::printf("loaded %zu prefabs\n", prefabs.size());
+  }
+
   GLFWwindow* window = nullptr;
   if (!selftest) {
     if (!glfwInit()) return 1;
@@ -822,10 +1093,21 @@ int main(int argc, char** argv) {
   if (!phys.Init()) return 1;
   DebrisSystem debris;
   debris.Init(&phys, &world, mats);
+  MobSystem mobs;
+  mobs.Init(&phys, &world, &debris, mats);
+  {
+    std::vector<MobDef> mobDefs;
+    std::string mlog;
+    LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mlog);
+    if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
+    std::printf("loaded %zu mob defs\n", mobDefs.size());
+    mobs.SetDefs(std::move(mobDefs));
+  }
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
 
-  if (selftest) return RunSelftest(ctx, world, sim, mats, phys, debris, stream);
+  if (selftest)
+    return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream);
 
   Overlay overlay;
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
@@ -845,8 +1127,14 @@ int main(int argc, char** argv) {
   Camera cam;
   Player player;
   Brush brush;
+  PrefabPlacer placer;
+  for (const Prefab& p : prefabs) ui.prefabNames.push_back(p.name);
+  for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
   int spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
   player.pos = Vec3{140, (float)(spawnH + 10), 140};
+  // kinematic capsule proxy so debris collides with (and is shoved by) the
+  // player; terrain collision stays in the AABB controller
+  uint64_t playerBody = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
 
   bool captured = true;
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
@@ -854,12 +1142,14 @@ int main(int argc, char** argv) {
   glfwGetCursorPos(window, &mx0, &my0);
 
   KeyEdge eP, eN, eV, eF1, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX;
+      eG, eX, eB, eT, eO, eM, eTab;
+  bool prevMouseL = false;
   std::vector<Grenade> grenades;
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
   uint32_t tick = 0;
+  uint32_t bodyInstCount = 0;
   double lastTime = NowSec();
   double accumulator = 0;
   float fpsSmooth = 60, frameMsSmooth = 16, tickMsSmooth = 0;
@@ -914,6 +1204,15 @@ int main(int argc, char** argv) {
       grenades.push_back(g);
     }
     if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
+    if (captured && eTab.Pressed(key(GLFW_KEY_TAB)))
+      ui.tool = (ui.tool + 1) % UIState::kToolCount;
+    if (captured && eM.Pressed(key(GLFW_KEY_M))) ui.spawnMob = true;
+    if (captured && eB.Pressed(key(GLFW_KEY_B))) ui.placePrefab = true;
+    if (ui.tool == UIState::kToolPrefab && eT.Pressed(key(GLFW_KEY_T)))
+      ui.prefabRot = (ui.prefabRot + 1) & 3;
+    if (ui.tool == UIState::kToolPrefab && eO.Pressed(key(GLFW_KEY_O)) &&
+        !prefabs.empty())
+      ui.prefabSelected = (ui.prefabSelected + 1) % (int)prefabs.size();
 
     PlayerInput pin;
     pin.forward = (key(GLFW_KEY_W) ? 1.f : 0.f) - (key(GLFW_KEY_S) ? 1.f : 0.f);
@@ -939,6 +1238,25 @@ int main(int argc, char** argv) {
         reactions = std::move(newReactions);
         sim.UploadTables(ctx.queue, mats, reactions);
         debris.OnMaterialsReloaded(mats);
+        // prefabs hot-reload with materials: palette indices may map now
+        std::string plog;
+        LoadPrefabDir(assetDir + "/prefabs", mats.size(), prefabs, plog);
+        if (!plog.empty()) std::fprintf(stderr, "%s", plog.c_str());
+        ui.prefabNames.clear();
+        for (const Prefab& p : prefabs) ui.prefabNames.push_back(p.name);
+        if (ui.prefabSelected >= (int)prefabs.size()) ui.prefabSelected = 0;
+        // mob defs too (tuning dummy.json live is the test loop); live mobs
+        // reference the old defs by index, so they respawn fresh
+        mobs.Reset();
+        mobs.OnMaterialsReloaded(mats);
+        std::vector<MobDef> mobDefs;
+        std::string mlog;
+        LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mlog);
+        if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
+        mobs.SetDefs(std::move(mobDefs));
+        ui.mobNames.clear();
+        for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
+        if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
         classOf.clear();
         for (auto& m : mats) classOf.push_back(m.gpu.klass);
         ui.materialNames.clear();
@@ -963,19 +1281,21 @@ int main(int argc, char** argv) {
       grenades.clear();
       everExploded = false;
       debris.Reset();
+      mobs.Reset();
     }
     if (ui.saveWorld) {
       ui.saveWorld = false;
       ctx.WaitIdle();
-      SaveWorld(ctx, world, stream, "world.svx");
+      SaveWorld(ctx, world, stream, "world.svd");
     }
     if (ui.loadWorld) {
       ui.loadWorld = false;
       ctx.WaitIdle();
-      if (LoadWorld(ctx, world, sim, stream, "world.svx")) {
+      if (LoadWorld(ctx, world, sim, stream, "world.svd")) {
         grenades.clear();
         everExploded = false;
         debris.Reset();
+        mobs.Reset();
       }
     }
 
@@ -990,6 +1310,16 @@ int main(int argc, char** argv) {
     int ticksThisFrame = 0;
     bool mouseL = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool mouseR = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    // LMB routes to the active tool: continuous for brush/laser, click-edge
+    // for one-shot tools (prefab stamp, mob spawn)
+    bool mouseLClick = mouseL && !prevMouseL;
+    prevMouseL = mouseL;
+    if (mouseLClick && ui.tool == UIState::kToolPrefab) ui.placePrefab = true;
+    if (mouseLClick && ui.tool == UIState::kToolMob) ui.spawnMob = true;
+    bool laserHeld =
+        captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
+                     (ui.tool == UIState::kToolLaser && mouseL));
+    bool brushActive = ui.tool == UIState::kToolBrush;
     while (accumulator >= kTickDt && ticksThisFrame < 4) {
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
@@ -1005,15 +1335,93 @@ int main(int argc, char** argv) {
       std::vector<BrushOp> ops;
       brush.radius = ui.brushRadius;
       brush.material = (uint32_t)ui.brushMaterial;
+
+      // laser (PLAN §C1/C2): laser tool + LMB, or hold F from any tool.
+      // Bodies are tested first — a mob limb or debris chunk in the beam
+      // takes the hit instead of the wall behind it.
+      if (laserHeld) {
+        const WorldSnapshot& lsnap = world.Snap();
+        Vec3 eye = player.EyePos(), fwd = cam.Forward();
+        float gridDist = 1e9f;
+        IVec3 hit{};
+        if (lsnap.valid && lsnap.pick[0] != 0) {
+          hit = {(int)lsnap.pick[2], (int)lsnap.pick[3], (int)lsnap.pick[4]};
+          gridDist = (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - eye).len();
+        }
+        float frac = 1.0f;
+        const float kLaserRange = 200.0f;
+        uint64_t hitBody = phys.CastRayBody(eye, fwd, kLaserRange, frac);
+        float bodyDist = frac * kLaserRange;
+
+        if (hitBody != 0 && bodyDist < gridDist) {
+          // body cut (PLAN §C2): mob limbs take damage (instant sever when
+          // the beam crosses a joint); plain debris splits along a vertical
+          // plane containing the beam
+          Vec3 hitPos = eye + fwd * bodyDist;
+          if (!mobs.Damage(hitBody, 1.5f, hitPos) && tick % 6 == 0) {
+            Vec3 right = cam.Right();
+            Vec3 n = right - fwd * right.dot(fwd);
+            if (n.len() < 0.1f) n = cam.Up();
+            debris.SplitBody(hitBody, hitPos, n.normalized());
+          }
+        } else if (gridDist < 1e8f) {
+          const int r = 2;
+          ops.push_back({hit.x, hit.y, hit.z, r, 0, 2u /*melt*/, 0, 0});
+          // cutting through a support must drop the far side: rate-limited
+          // island checks over the cut (support-loss flags catch the rest)
+          if (tick % 8 == 0)
+            debris.AddDestructionEvent(tick, {hit.x - r, hit.y - r, hit.z - r},
+                                       {hit.x + r, hit.y + r, hit.z + r});
+        }
+      }
+
+      // mob spawn (mob tool LMB, or M): drop the selected def at the picked
+      // surface, feet on the last empty cell
+      if (ui.spawnMob) {
+        ui.spawnMob = false;
+        const WorldSnapshot& msnap = world.Snap();
+        if (msnap.valid && msnap.pick[0] != 0 && !mobs.Defs().empty()) {
+          if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
+          const MobDef& d = mobs.Defs()[ui.mobSelected];
+          mobs.Spawn(ui.mobSelected,
+                     {(int)msnap.pick[5] - d.prefab.size.x / 2,
+                      (int)msnap.pick[6],
+                      (int)msnap.pick[7] - d.prefab.size.z / 2});
+        }
+      }
+
       BrushOp op;
-      if (mouseL && brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), false, op))
+      if (brushActive && mouseL &&
+          brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), false, op))
         ops.push_back(op);
-      if (mouseR && brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), true, op)) {
+      if (brushActive && mouseR &&
+          brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), true, op)) {
         ops.push_back(op);
         // erasing can cut supports: queue an island check around the hole
         debris.AddDestructionEvent(tick, {op.x - op.radius, op.y - op.radius, op.z - op.radius},
                                    {op.x + op.radius, op.y + op.radius, op.z + op.radius});
       }
+
+      // prefab placement: stamp at the last-empty pick cell, anchored at the
+      // rotated footprint's bottom center
+      if (ui.placePrefab) {
+        ui.placePrefab = false;
+        const WorldSnapshot& snap = world.Snap();
+        if (snap.valid && snap.pick[0] != 0 && !prefabs.empty() &&
+            ui.prefabSelected < (int)prefabs.size()) {
+          const Prefab& pf = prefabs[ui.prefabSelected];
+          IVec3 rs = PrefabPlacer::RotatedSize(pf, ui.prefabRot);
+          IVec3 at{(int)snap.pick[5] - rs.x / 2, (int)snap.pick[6],
+                   (int)snap.pick[7] - rs.z / 2};
+          IVec3 blo, bhi;
+          placer.Place(pf, at, ui.prefabRot, ui.prefabOverwrite, mats, blo, bhi);
+          stream.MarkModifiedBox(blo, bhi);
+        }
+      }
+
+      // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
+      // bleeding ops — must run before debris.PreTick consumes the anchors
+      mobs.PreTick(tick, world, ops);
 
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
@@ -1021,6 +1429,8 @@ int main(int argc, char** argv) {
       // island detection results + terrain collision upkeep (may add cell ops)
       std::vector<CellOp> cellOps;
       debris.PreTick(tick, world, cellOps);
+      // prefab stamps drain after island ops (they win same-cell conflicts)
+      placer.PreTick(world, cellOps);
 
       // explosions: X-detonate at the crosshair + grenade fuses
       std::vector<ExplosionOp> exps;
@@ -1068,10 +1478,16 @@ int main(int argc, char** argv) {
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
       double t0 = NowSec();
+      phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive);
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
       debris.PostStep();
+      mobs.PostStep();
+      // debris that ended the step overlapping the player pushes the player
+      // out (fly mode ignores collision entirely, matching the voxel rules)
+      if (!player.fly)
+        player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
       tickMsSmooth += ((float)((NowSec() - t0) * 1000.0) - tickMsSmooth) * 0.1f;
     }
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
@@ -1095,6 +1511,8 @@ int main(int argc, char** argv) {
       ui.particleCount = world.Snap().particleCount;
       ui.bodyCount = debris.BodyCount();
       ui.activeBodyCount = debris.ActiveBodyCount();
+      ui.prefabPending = (uint32_t)placer.PendingCount();
+      ui.mobCount = mobs.MobCount();
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
@@ -1114,23 +1532,73 @@ int main(int argc, char** argv) {
         s.emission = flash;
         sprv.push_back(s);
       }
+      // laser beam: emissive sprite dashes from the muzzle to the picked
+      // surface + an impact glow (render-only; the cut is the mode-2 ops)
+      if (laserHeld && world.Snap().valid && world.Snap().pick[0] != 0) {
+        const WorldSnapshot& snap = world.Snap();
+        Vec3 hit{(float)(int)snap.pick[2] + 0.5f, (float)(int)snap.pick[3] + 0.5f,
+                 (float)(int)snap.pick[4] + 0.5f};
+        Vec3 from = player.EyePos() + cam.Forward() * 1.2f +
+                    cam.Right() * 0.7f - cam.Up() * 0.5f;
+        Vec3 d = hit - from;
+        int n = std::min(22, (int)(d.len() / 2.5f) + 1);
+        for (int i = 1; i <= n && sprv.size() + 1 < kMaxSprites; i++) {
+          float f = (float)i / (float)(n + 1);
+          Sprite s{};
+          Vec3 p = from + d * f;
+          s.pos[0] = p.x; s.pos[1] = p.y; s.pos[2] = p.z;
+          s.halfSize = 0.18f;
+          s.color = 0xFF2030FF;  // red beam (0xAABBGGRR)
+          s.emission = 0.9f;
+          sprv.push_back(s);
+        }
+        Sprite s{};
+        s.pos[0] = hit.x; s.pos[1] = hit.y; s.pos[2] = hit.z;
+        s.halfSize = 0.7f;
+        s.color = 0xFF60B0FF;
+        s.emission = 1.0f;
+        sprv.push_back(s);
+      }
+
+      // prefab tool preview: marker box at the anchor cell, sized to the
+      // rotated footprint (cheap stand-in for a full ghost render)
+      if (ui.tool == UIState::kToolPrefab && !prefabs.empty() &&
+          ui.prefabSelected < (int)prefabs.size() && world.Snap().valid &&
+          world.Snap().pick[0] != 0) {
+        const WorldSnapshot& snap = world.Snap();
+        const Prefab& pf = prefabs[ui.prefabSelected];
+        IVec3 rs = PrefabPlacer::RotatedSize(pf, ui.prefabRot);
+        Sprite s{};
+        s.pos[0] = (float)((int)snap.pick[5]) + 0.5f;
+        s.pos[1] = (float)((int)snap.pick[6]) + (float)rs.y * 0.5f;
+        s.pos[2] = (float)((int)snap.pick[7]) + 0.5f;
+        s.halfSize = 0.5f * (float)std::max(rs.x, std::max(rs.y, rs.z));
+        s.color = 0x2860E0FF;  // translucent warm marker (0xAABBGGRR)
+        s.emission = 0.25f;
+        sprv.push_back(s);
+      }
       if (!sprv.empty()) {
         if (sprv.size() > kMaxSprites) sprv.resize(kMaxSprites);
         ctx.queue.WriteBuffer(world.sprites, 0, sprv.data(),
                               sprv.size() * sizeof(Sprite));
       }
 
-      // debris bodies: instances change on spawn/despawn, transforms per frame
-      if (debris.InstancesDirty()) {
+      // rigid bodies: debris takes slots [0, D), mob limbs stack after —
+      // instances rebuild when either side changes (slot bases shift),
+      // transforms are cheap and refresh per frame
+      if (debris.InstancesDirty() || mobs.InstancesDirty()) {
         std::vector<BodyVoxInst> inst;
         debris.BuildInstances(inst);
+        mobs.AppendInstances(inst, debris.BodyCount());
+        bodyInstCount = (uint32_t)inst.size();
         if (!inst.empty())
           ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
                                 inst.size() * sizeof(BodyVoxInst));
       }
-      if (debris.BodyCount() > 0) {
+      if (debris.BodyCount() + mobs.LimbBodyCount() > 0) {
         std::vector<BodyXformGpu> xf;
         debris.BuildXforms(xf);
+        mobs.AppendXforms(xf);
         ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
                               xf.size() * sizeof(BodyXformGpu));
       }
@@ -1140,7 +1608,7 @@ int main(int argc, char** argv) {
                                                        ctx.width, ctx.height);
       sim.DrawWorld(rp);
       sim.DrawParticles(rp);
-      sim.DrawBodies(rp, debris.InstanceCount());
+      sim.DrawBodies(rp, bodyInstCount);
       sim.DrawSprites(rp, (uint32_t)sprv.size());
       overlay.Render(rp);
       rp.End();

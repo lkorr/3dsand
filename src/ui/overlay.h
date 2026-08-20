@@ -20,6 +20,8 @@ struct UIState {
   uint32_t particleCount = 0;
   uint32_t bodyCount = 0;
   uint32_t activeBodyCount = 0;
+  uint32_t mobCount = 0;
+  bool spawnMob = false;         // M key: spawn mob def 0 at crosshair
   float playerPos[3] = {};
   bool mirrorValid = false;
 
@@ -36,6 +38,22 @@ struct UIState {
   bool pendingDetonate = false;  // X key / UI button: explode at crosshair
   bool saveWorld = false;        // F9
   bool loadWorld = false;        // F10
+
+  // active tool: LMB drives it; Tab cycles. F/M/B stay as shortcuts.
+  enum Tool { kToolBrush = 0, kToolLaser, kToolPrefab, kToolMob, kToolCount };
+  int tool = kToolBrush;
+
+  // prefab placement tool (PLAN §A3)
+  int prefabSelected = 0;        // index into prefabNames (O cycles)
+  int prefabRot = 0;             // 90° Y steps (T rotates)
+  bool prefabOverwrite = false;  // false = fill air only
+  bool placePrefab = false;      // B key / LMB click / UI button
+  uint32_t prefabPending = 0;    // voxels still draining (stat)
+  std::vector<std::string> prefabNames;
+
+  // mob spawner tool
+  int mobSelected = 0;           // index into mobNames
+  std::vector<std::string> mobNames;
 
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
