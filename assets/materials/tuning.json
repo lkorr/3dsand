@@ -195,7 +195,87 @@
     "bleachAmount": 0.9,
     "gamma": 2.2,
     "primarySteps": 4096,
-    "farSteps": 384
+    "farSteps": 384,
+    "skyRayleigh": 12.0,
+    "skyMie": 1.0,
+    "skyMieG": 0.76,
+    "skyMieStrength": 1.0,
+    "skyExposure": 1.6,
+    "skyGround": [
+      0.22,
+      0.2,
+      0.17
+    ],
+    "sunSize": 3.0,
+    "sunReddening": 1.0,
+    "nightZenith": [
+      0.006,
+      0.01,
+      0.028
+    ],
+    "nightHorizon": [
+      0.03,
+      0.036,
+      0.062
+    ],
+    "starBrightness": 1.0,
+    "starDensity": 220.0,
+    "starSize": 0.0055,
+    "starTwinkle": 0.35,
+    "milkyWayStrength": 0.55,
+    "milkyWayColor": [
+      0.52,
+      0.56,
+      0.78
+    ],
+    "nebulaStrength": 0.4,
+    "nebulaCool": [
+      0.16,
+      0.3,
+      0.62
+    ],
+    "nebulaWarm": [
+      0.55,
+      0.2,
+      0.38
+    ],
+    "auroraStrength": 0.55,
+    "auroraHeight": 900.0,
+    "auroraLow": [
+      0.1,
+      0.85,
+      0.45
+    ],
+    "auroraHigh": [
+      0.65,
+      0.2,
+      0.85
+    ],
+    "moonRadius": 0.03,
+    "moonBrightness": 1.6,
+    "moonColor": [
+      0.92,
+      0.93,
+      0.88
+    ],
+    "moonGlow": 0.35,
+    "moonEarthshine": 0.055,
+    "moonLightColor": [
+      0.55,
+      0.68,
+      1.0
+    ],
+    "moonLightIntensity": 0.16,
+    "nightAmbSky": [
+      0.055,
+      0.075,
+      0.135
+    ],
+    "nightAmbGround": [
+      0.022,
+      0.026,
+      0.042
+    ]
   },
   "worldgen": {
     "treeline": 72,
@@ -221,5 +301,16 @@
     "ruinChance": 5,
     "caveThreshold1": 150,
     "caveThreshold2": 148
+  },
+  "dayNight": {
+    "cycleMinutes": 20,
+    "freeze": 0,
+    "freezePhase": 32768,
+    "sunPeakElevation": 58.0,
+    "sunAzimuth": 24.0,
+    "twilightWidth": 0.22,
+    "lunarPeriodDays": 8,
+    "moonInclination": 18.0,
+    "starRotSpeed": 1.0
   }
 }
