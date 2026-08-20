@@ -350,6 +350,20 @@ struct Tuning {
     float bleachAmount = 0.9f;
     float gamma = 2.2f;
 
+    // static micro-detail (traceMicro in raymarch.wgsl)
+    // Distance in METRES past which a micro cell is drawn as a plain voxel
+    // instead of running its nested DDA. At 0.0625 m voxels a cell subtends
+    // one pixel at ~110 m for a 1080p 90-degree view, so anything past that is
+    // paying a 3*subdiv-step march to decide the colour of a sub-pixel — the
+    // LOD is not an approximation there, it is the same answer for less.
+    float microLodDist = 40.0f;
+    // Cap on nested micro marches per primary ray. A ray grazing a meadow can
+    // cross dozens of grass cells, and each one that MISSES keeps the ray
+    // alive, so without a cap one pixel can pay for the whole field. Past the
+    // cap a micro cell is treated as SOLID (not as air), because terminating
+    // the ray is bounded and correct-ish while letting it fly is neither.
+    int microMaxPerRay = 8;
+
     // budgets
     int primarySteps = 4096;
     int farSteps = 384;

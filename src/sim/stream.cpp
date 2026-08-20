@@ -51,12 +51,15 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
 }
 
 void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
-  // must match isRayBlocker in common.wgsl: solids, powders, opaque liquids
+  // must match isRayBlocker in common.wgsl: solids, powders, opaque liquids,
+  // MINUS micro-detail materials (a grass cell is mostly air, so it must not
+  // stop a chunk-skipping shadow ray — see the comment there).
   blockerOf_.clear();
   for (const auto& m : mats)
-    blockerOf_.push_back(m.gpu.klass == CLASS_SOLID || m.gpu.klass == CLASS_POWDER ||
-                         (m.gpu.klass == CLASS_LIQUID &&
-                          (m.gpu.flags & kMatFlagOpaque) != 0));
+    blockerOf_.push_back((m.gpu.flags & kMatFlagMicro) == 0 &&
+                         (m.gpu.klass == CLASS_SOLID || m.gpu.klass == CLASS_POWDER ||
+                          (m.gpu.klass == CLASS_LIQUID &&
+                           (m.gpu.flags & kMatFlagOpaque) != 0)));
 }
 
 void Stream::Update(IVec3 playerChunk) {

@@ -52,6 +52,13 @@ std::string ShaderConstantPrelude() {
   // Stain palette: reserved material-table entries holding stain-type colours
   // (world.h). The renderer indexes materials[STAIN_PALETTE_BASE + type].
   o << "const STAIN_PALETTE_BASE : u32 = " << kStainPaletteBase << "u;\n";
+  // Static micro-detail (render-only, DESIGN.md §9): the size of the brick pool
+  // the raymarcher bounds-checks its nested DDA fetches against.
+  o << "const MICRO_POOL_WORDS : u32 = " << kMicroPoolWordsWorld << "u;\n";
+  // Dynamic microvoxel bodies (render-only, DESIGN.md §9): the pool the
+  // microbody fragment march bounds-checks its brick fetches against.
+  o << "const MICRO_BODY_POOL_WORDS : u32 = " << kMicroBodyPoolWordsWorld << "u;\n";
+  o << "const MATERIAL_SLOTS : u32 = " << kMaterialSlots << "u;\n";
   // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
   // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
   // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).

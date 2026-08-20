@@ -1,5 +1,6 @@
 #include "sim/materials.h"
 
+#include <cstdio>
 #include <fstream>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -10,6 +11,18 @@
 #include "sim/world.h"
 
 using nlohmann::json;
+
+std::string FormatMille(double mille) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.4f", mille);
+  std::string s(buf);
+  // trim trailing zeros, then a bare trailing '.'
+  size_t last = s.find_last_not_of('0');
+  if (s.find('.') != std::string::npos && last != std::string::npos) {
+    s.erase(s[last] == '.' ? last : last + 1);
+  }
+  return s;
+}
 
 static bool ParseColor(const std::string& hex, uint32_t& out) {
   if (hex.size() != 7 || hex[0] != '#') return false;
@@ -412,9 +425,24 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     g.prodSelf = kProdKeep;
     g.prodNbr = kProdKeep;
 
-    g.chance = r.value("chance", 0);
-    if (g.chance < 1 || g.chance > 1000)
-      errors += path + ": reaction self=\"" + self + "\": chance must be 1..1000\n";
+    // Chance is authored in per-mille but MAY be fractional, because per-mille
+    // bottoms out at a mean wait of ~33 s and rare ambient events want to be
+    // far rarer than that. It is compiled into units of 1/kReactChanceDen so
+    // the shader can roll against it directly with no scaling.
+    //
+    // The conversion is done in double and rounded ONCE here on the CPU, so
+    // the GPU never sees a float (rule 1). Every machine loading the same JSON
+    // gets the same integer.
+    double chanceMille = r.value("chance", 0.0);
+    if (!(chanceMille >= kReactChanceMinMille) || chanceMille > 1000.0) {
+      errors += path + ": reaction self=\"" + self + "\": chance must be " +
+                FormatMille(kReactChanceMinMille) + "..1000 per-mille\n";
+    } else {
+      // round-half-up on a non-negative value; the floor of 1 unit means a
+      // rule that passed validation can never quantize to "never fires".
+      g.chance = (uint32_t)(chanceMille * (double)kReactChanceScale + 0.5);
+      if (g.chance == 0) g.chance = 1;
+    }
 
     // ---- light / day-phase condition (day-night cycle) ----
     // These gate the rule on the cell's light environment. They feed voxel

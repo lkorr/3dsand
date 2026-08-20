@@ -46,22 +46,34 @@ class Physics {
   // (kg/m^3). Returns an opaque handle (0 = failure).
   // allowKinematic: body may later switch motion type (mob limbs animate
   // kinematically while alive, go dynamic as ragdoll — PLAN §B4).
+  //
+  // `voxelPitch` is the size of ONE of the supplied voxels, in world voxels: 1
+  // for ordinary debris, 1/scale for a microvoxel mob limb whose coordinates
+  // are in micro units (docs/PLAN_voxel_editor.md §C). It scales the collider
+  // AND the per-voxel volume that feeds mass, so a limb of the same physical
+  // size weighs the same regardless of the resolution it was drawn at.
   uint64_t CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
                             IVec3 originVoxel,
                             const std::vector<float>& densityOfMat,
-                            bool allowKinematic = false);
+                            bool allowKinematic = false,
+                            float voxelPitch = 1.0f);
   // Same, but at an arbitrary transform (laser splits inherit the parent
   // body's pose mid-tumble — PLAN §C2).
   uint64_t CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
                               const BodyTransform& xf,
                               const std::vector<float>& densityOfMat,
-                              bool allowKinematic = false);
+                              bool allowKinematic = false,
+                              float voxelPitch = 1.0f);
   // Analytic sphere collider — a greedy-boxed voxel ball can never roll
   // smoothly, so rolling objects get a true Jolt sphere. Mass = density *
   // sphere volume. The voxel ball that renders it is the caller's business
-  // (DebrisSystem::AdoptBody with locals centered on the body origin).
+  // (DebrisSystem::AdoptBody). `originOffsetVox` is the vector from the BODY
+  // ORIGIN to the sphere's centre: zero for a plain centered body, (r,r,r)
+  // when the render model is a min-corner-origin microvoxel brick (the micro
+  // march runs [0..dims] from the origin, so collider and art must agree on
+  // where the origin sits — microbody.wgsl).
   uint64_t CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
-                            float densityKgM3);
+                            float densityKgM3, Vec3 originOffsetVox = Vec3{});
   // Linear/angular velocity in voxel units (split halves keep momentum).
   bool GetBodyVelocities(uint64_t handle, Vec3& lin, Vec3& angRadPerSec) const;
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);
@@ -89,6 +101,10 @@ class Physics {
   // boxes otherwise fight their own joints — the push/pull jitter keeps the
   // ragdoll awake forever. Jolt's own Ragdoll class does exactly this.
   void DisableCollisionsAmong(const std::vector<uint64_t>& handles);
+  // Undo the above for ONE body: drop it out of its mob's GroupFilterTable so
+  // a severed limb can hit the corpse it came off. Without this the filter
+  // suppresses those contacts forever and the arm falls through the torso.
+  void ClearCollisionGroup(uint64_t handle);
 
   // First dynamic (MOVING-layer) body hit by the ray, or 0. `fraction` is the
   // hit position along the ray (0..1 of maxDistVoxels). Laser body cuts.

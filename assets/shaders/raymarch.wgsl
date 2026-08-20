@@ -12,6 +12,11 @@
 @group(0) @binding(4) var<storage, read> farVox : array<u32>;
 @group(0) @binding(5) var<storage, read> farOcc : array<u32>;
 @group(0) @binding(6) var<uniform> F : FarParams;
+// static micro-detail (render-only — see MicroBrick in common.wgsl). Bound HERE
+// and nowhere else: these are render data, and putting them on a sim shader's
+// bind group would make the renderer a sim input (CLAUDE.md rule 1).
+@group(0) @binding(7) var<storage, read> microBricks : array<MicroBrick>;
+@group(0) @binding(8) var<storage, read> microPool : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -27,17 +32,9 @@ fn vs(@builtin(vertex_index) vi : u32) -> VSOut {
   return out;
 }
 
-fn unpackColor(c : u32) -> vec3f {
-  return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
-}
-
-fn paletteColor(m : Material, state : u32) -> vec3f {
-  switch (state % 3u) {
-    case 0u: { return unpackColor(m.color0); }
-    case 1u: { return unpackColor(m.color1); }
-    default: { return unpackColor(m.color2); }
-  }
-}
+// unpackColor / paletteColor live in common.wgsl: the 3-variant palette is a
+// property of the Material struct, which is declared there, and all three
+// render paths (raymarch, cubes, micro bodies) decode it identically.
 
 // ============================================================================
 // SKY — day/night, sun, moon, stars, aurora
@@ -68,26 +65,12 @@ fn paletteColor(m : Material, state : u32) -> vec3f {
 // is both physically right and visually useful.
 const SUN_ANGULAR_RADIUS : f32 = 0.00465;
 
-// Rayleigh scattering is proportional to 1/lambda^4, which is where the sky's
-// blue and the sunset's red BOTH come from. These are the relative
-// coefficients at 680/550/440 nm, normalized — the ratio is the whole look, so
-// they are derived rather than art-directed.
-const RAYLEIGH_RGB : vec3f = vec3f(0.1440, 0.3125, 0.7940);
-
-// Relative air mass along a ray leaving the ground at elevation sin(theta) = y.
-// 1.0 straight up, ~38 at the horizon. The naive 1/y diverges at y = 0; this is
-// the Kasten-Young fit, which stays finite and is accurate to well under a
-// percent across the whole range.
-//
-// This curve is the single most important function in the sky: it is why the
-// horizon is pale (long path, scattering saturated), why the zenith is deep
-// (short path), and why a low sun goes red (its own light crosses ~38 air
-// masses and loses blue first).
-fn airMass(y : f32) -> f32 {
-  let c = clamp(y, -0.02, 1.0);
-  let zdeg = degrees(acos(clamp(c, -1.0, 1.0)));
-  return 1.0 / (c + 0.50572 * pow(max(96.07995 - zdeg, 1e-3), -1.6364));
-}
+// RAYLEIGH_RGB / airMass / sunTransmittance moved to common.wgsl: the raster
+// body paths (debris.wgsl, microbody.wgsl) share them so detached voxels
+// light exactly like the terrain they came off. airMass is the single most
+// important function in the sky: it is why the horizon is pale (long path,
+// scattering saturated), why the zenith is deep (short path), and why a low
+// sun goes red (its own light crosses ~38 air masses and loses blue first).
 
 // Rayleigh phase: gently forward/backward peaked, symmetric.
 fn phaseRayleigh(mu : f32) -> f32 { return 0.75 * (1.0 + mu * mu); }
@@ -100,24 +83,13 @@ fn phaseMie(mu : f32, g : f32) -> f32 {
   return (1.0 - g2) / (4.0 * 3.14159265 * max(d * sqrt(max(d, 1e-4)), 1e-4));
 }
 
-// Colour of direct sunlight after crossing `mass` air masses. Blue is removed
-// first (Rayleigh again), so the disc and everything it lights goes amber then
-// red as it sets. This is ONE function driving the disc, the direct lighting
-// term and the horizon glow, so they cannot disagree.
-//
-// Independent of TUNE_SKY_RAYLEIGH for the same reason as SUN_EXTINCT_K above:
-// the in-scatter strength (how blue the sky is) and the extinction strength
-// (how fast the sun reddens) want opposite tuning, and sharing one constant
-// makes a rich blue sky imply a permanently orange sun.
-//
-// At this coefficient the sun is essentially white overhead (mass 1 ->
-// 0.98/0.97/0.92) and a deep orange right on the horizon (mass 38 ->
-// 0.61/0.34/0.07), which is the range a real day covers. TUNE_SUN_REDDENING
-// scales it if you want a hazier or a cleaner atmosphere.
-const SUN_TRANSMIT_K : f32 = 0.09;
-fn sunTransmittance(mass : f32) -> vec3f {
-  return exp(-RAYLEIGH_RGB * mass * SUN_TRANSMIT_K * TUNE_SUN_REDDENING);
-}
+// sunTransmittance (now in common.wgsl) is independent of TUNE_SKY_RAYLEIGH
+// for the same reason as SUN_EXTINCT_K above: the in-scatter strength (how
+// blue the sky is) and the extinction strength (how fast the sun reddens)
+// want opposite tuning, and sharing one constant makes a rich blue sky imply
+// a permanently orange sun. At its coefficient the sun is essentially white
+// overhead (mass 1 -> 0.98/0.97/0.92) and deep orange on the horizon
+// (mass 38 -> 0.61/0.34/0.07). TUNE_SUN_REDDENING scales it.
 
 // ---- starfield ----------------------------------------------------------
 // A star is a POINT SOURCE. It has no resolvable disc — even Betelgeuse is
@@ -527,14 +499,16 @@ fn skyColor(rdIn : vec3f) -> vec3f {
 fn keyLightColor() -> vec3f {
   // Sunlight reddens as it sets because its own path through the atmosphere
   // grows — the same sunTransmittance() the disc and the sky use, so a red sun
-  // always lights the world red.
+  // always lights the world red. Moonlight is sunlight bounced off a dark grey
+  // rock: same spectrum, ~400k times dimmer, read as blue because of the
+  // Purkinje shift at scotopic levels — the tint is a perceptual choice and
+  // lives in TUNE_MOON_LIGHT_COLOR. MUST MATCH keyLightColorP (common.wgsl),
+  // which the raster body paths use: inlined here rather than calling it
+  // because this sits in per-hit shading loops and passing RenderParams by
+  // value per call is a real cost at this call frequency.
   let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
                TUNE_SUN_INTENSITY;
   let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
-  // Moonlight is sunlight bounced off a dark grey rock: same spectrum, ~400k
-  // times dimmer, and the eye reads it as blue because of the Purkinje shift
-  // at scotopic levels. The blue tint is therefore a perceptual choice, and
-  // lives in TUNE_MOON_LIGHT_COLOR.
   let moonCol = TUNE_MOON_LIGHT_COLOR * TUNE_MOON_LIGHT_INTENSITY * moonUp *
                 (0.15 + 1.70 * R.moonPhase * R.moonPhase);
   return mix(moonCol, sunCol, R.sunUp);
@@ -542,9 +516,7 @@ fn keyLightColor() -> vec3f {
 
 // Direction of the key light — the sun by day, the moon by night. Shadows are
 // cast from whichever is dominant, so moonlit shadows point the right way.
-// A hard switch at sunUp = 0.5 rather than a blend: a lerp between two
-// directions would swing the shadow direction wildly through twilight, and at
-// the crossover both lights are dim enough that the swap is invisible.
+// MUST MATCH keyLightDirP (common.wgsl); inlined for the same reason as above.
 fn keyLightDir() -> vec3f {
   return normalize(mix(R.moonDir, R.sunDir, step(0.5, R.sunUp)));
 }
@@ -602,12 +574,216 @@ struct Hit {
   tsSgn    : f32,
   tsMat    : u32,     // which translucent material (palette + absorption)
   tsPath   : f32,     // distance travelled INSIDE it, in fine voxels
+
+  // ---- static micro-detail (see traceMicro) ----
+  // A hit inside a micro brick reports the WORLD cell in `cell` as usual, but
+  // the material and normal come from the sub-voxel that was struck rather than
+  // from the cell's own material and entry face. Zero micMat means "this hit is
+  // an ordinary voxel", which is every hit that predates the feature.
+  micMat   : u32,     // material of the micro voxel struck (0 = not a micro hit)
 };
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
 
 fn chunkOcc(cell : vec3<i32>) -> u32 {
   return occupancy[chunkIndexW(cell)];
+}
+
+// ============================================================================
+// STATIC MICRO-DETAIL — the nested brick DDA
+// ============================================================================
+// docs/PLAN_voxel_editor.md §A. The world DDA has landed on a solid cell whose
+// material carries MATF_MICRO. Instead of reporting a surface there, run a
+// SECOND Amanatides-Woo DDA over that cell's subdiv^3 brick in cell-local
+// space. A hit gives the micro voxel's material and the axis it was entered
+// through; a MISS means the ray passes through the cell entirely, which is the
+// whole point — a grass cell is mostly air, and the world march has to keep
+// going or every tuft would render as a solid block.
+//
+// Everything here is render-only float math on render-only data. The two
+// sources of per-cell variety are keyed on integer hashes of the cell so they
+// are stable frame to frame and identical on every machine, without any of it
+// being sim state (CLAUDE.md rule 1 scopes to what can write voxels).
+//
+// COST: the loop is capped at 3*subdiv + 4 steps, which is the exact worst case
+// for a diagonal ray crossing an S^3 box (S steps per axis plus slack for the
+// entry rounding). The CALLER additionally caps how many bricks one ray may
+// enter (TUNE_MICRO_MAX_PER_RAY) — a grazing ray over a meadow crosses dozens
+// of cells and each MISS keeps it alive, so per-cell bounding is not enough.
+
+struct MicroHit {
+  hit  : bool,
+  mat  : u32,   // material of the sub-voxel struck
+  t    : f32,   // distance from the cell entry point, in WORLD voxel units
+  axis : i32,   // axis last stepped (face normal)
+  sgn  : f32,   // ray direction sign on that axis
+};
+
+// Which flipbook frame is showing at `tick`. Integer-only and a pure function
+// of the tick, exactly like the sim's day phase: two machines at the same tick
+// draw the same frame, and no frame timing leaks in. (It is render-only either
+// way — this is about the animation being reproducible in a replay, not about
+// determinism of the world.)
+fn microFrameAt(b : MicroBrick, tick : u32) -> u32 {
+  let n = microFrameCount(b);
+  if (n <= 1u) { return 0u; }
+  let period = microPeriod(b);
+  if (period == 0u) { return 0u; }
+  let phase = tick % period;
+  // Linear scan over the cumulative-offset header. n is <= 255 by construction
+  // and realistically 2-8, so a scan beats any cleverness and has no divides.
+  for (var i = 0u; i < n; i++) {
+    if (phase < microPool[b.base + i]) { return i; }
+  }
+  return n - 1u;
+}
+
+// Fetch one sub-voxel's material from a packed brick. `p` must already be
+// inside [0, S)^3.
+fn microVoxAt(b : MicroBrick, frame : u32, p : vec3<i32>) -> u32 {
+  let s = 1u << b.subdivLog2;
+  let idx = (u32(p.z) * s + u32(p.y)) * s + u32(p.x);
+  // frameCount header words, then `frame` whole bricks of S^3/4 words.
+  let wordsPerBrick = (s * s * s) >> 2u;
+  let w = b.base + microFrameCount(b) + frame * wordsPerBrick + (idx >> 2u);
+  if (w >= MICRO_POOL_WORDS) { return 0u; }  // defensive: never index past the pool
+  return (microPool[w] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+// `entry` is the ray's position in CELL-LOCAL coords (0..1 per axis) at the
+// point it crossed into the cell; `rd` is the (normalised) world direction,
+// which is also the cell-local direction because a cell is a unit cube.
+fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
+              tick : u32) -> MicroHit {
+  var out : MicroHit;
+  out.hit = false;
+  out.mat = 0u;
+  out.t = 0.0;
+  out.axis = 1;
+  out.sgn = -1.0;
+
+  let sl = b.subdivLog2;
+  let S = i32(1u << sl);
+  let frame = microFrameAt(b, tick);
+
+  // ---- per-cell variation, keyed on the cell, not on time ----
+  // ONE hash draw feeds both the yaw and the jitter, so a cell's identity is a
+  // single value and the two never decorrelate. hash3(seed, 0, cellIndexW) is
+  // the same shape the sim's RNG uses; the middle argument is 0 because there
+  // is no tick here — a tuft must not re-roll its orientation every frame.
+  let h = hash3(R.seed, 0u, cellIndexW(cell));
+
+  // Local ray, in SUB-VOXEL units (0..S). Working in sub-voxels rather than in
+  // 0..1 makes the DDA identical in shape to the world one, and `t` comes back
+  // out in world-voxel units by dividing by S at the end.
+  var p = entry * f32(S);
+  var d = rd;
+
+  // ---- quarter-turn yaw as a coordinate swizzle ----
+  // A rotation of the RAY by -theta is equivalent to rotating the MODEL by
+  // +theta, and for multiples of 90 degrees it is an exact swap-and-negate with
+  // no trig and no resampling. Four variants is enough: a tuft of grass has no
+  // preferred face, and the eye reads four orientations scattered over a field
+  // as "not tiled" long before it can count them.
+  if ((b.flags & MICROF_YAW) != 0u) {
+    let q = h & 3u;
+    let fS = f32(S);
+    if (q == 1u) {        // 90 deg:  (x, z) -> (z, S - x)
+      p = vec3f(p.z, p.y, fS - p.x);
+      d = vec3f(d.z, d.y, -d.x);
+    } else if (q == 2u) { // 180 deg
+      p = vec3f(fS - p.x, p.y, fS - p.z);
+      d = vec3f(-d.x, d.y, -d.z);
+    } else if (q == 3u) { // 270 deg
+      p = vec3f(fS - p.z, p.y, p.x);
+      d = vec3f(-d.z, d.y, d.x);
+    }
+  }
+
+  // ---- sub-cell XZ jitter ----
+  // Shifts the MODEL within its cell so a field of tufts does not sit on a
+  // perfect lattice. Bounded to +-1 sub-voxel: any more and a blade would poke
+  // out of the cell the world DDA is standing in, and the part outside would
+  // simply never be marched. Quantised to whole sub-voxels so it costs the DDA
+  // nothing (the brick lookup stays an integer index) and so it cannot open a
+  // seam by landing mid-voxel.
+  if ((b.flags & MICROF_JITTER) != 0u) {
+    let jx = f32(i32((h >> 8u) & 3u) - 1) * 0.5;
+    let jz = f32(i32((h >> 10u) & 3u) - 1) * 0.5;
+    p = vec3f(p.x - jx, p.y, p.z - jz);
+  }
+
+  // ---- Amanatides-Woo over the brick ----
+  // Nudge off the entry face before flooring: a ray entering at exactly x = 0
+  // otherwise floors to cell -1 or 0 depending on float noise, and half the
+  // blades would drop their first row.
+  p = p + d * 1e-4;
+  var c = vec3<i32>(floor(p));
+  // Entry can still land just outside on the face the ray came through (or,
+  // with jitter, genuinely outside). Clamp only the axes that are within one
+  // voxel of the box; anything further out is a real miss.
+  let stepv = vec3<i32>(sign(d));
+  var inv = vec3f(0.0);
+  inv.x = 1.0 / select(d.x, select(-1e-6, 1e-6, d.x >= 0.0), abs(d.x) < 1e-6);
+  inv.y = 1.0 / select(d.y, select(-1e-6, 1e-6, d.y >= 0.0), abs(d.y) < 1e-6);
+  inv.z = 1.0 / select(d.z, select(-1e-6, 1e-6, d.z >= 0.0), abs(d.z) < 1e-6);
+  let tDelta = abs(inv);
+  var tMax : vec3f;
+  for (var a = 0; a < 3; a++) {
+    let boundary = f32(c[a]) + select(0.0, 1.0, d[a] > 0.0);
+    tMax[a] = (boundary - p[a]) * inv[a];
+  }
+
+  var axis = 0;
+  var tCur = 0.0;
+  // 3*S covers a full diagonal traverse; +4 is slack for the entry rounding
+  // above and for a jittered start that begins one voxel outside the box.
+  let maxSteps = 3 * S + 4;
+  for (var i = 0; i < maxSteps; i++) {
+    if (c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < S && c.y < S && c.z < S) {
+      let m = microVoxAt(b, frame, c);
+      if (m != 0u) {
+        out.hit = true;
+        out.mat = m;
+        out.t = tCur / f32(S);  // sub-voxel units back to world-voxel units
+        out.axis = axis;
+        out.sgn = sign(d[axis]);
+        return out;
+      }
+    } else if (i > 0) {
+      // Left the box after having been inside it (or after the entry slack ran
+      // out): the ray misses the model entirely.
+      //
+      // The `i > 0` guard is what lets a jittered start begin one voxel outside
+      // and still march in. Without it the very first out-of-box test would
+      // abort before the DDA ever stepped.
+      let outAway = (c.x < 0 && stepv.x <= 0) || (c.x >= S && stepv.x >= 0) ||
+                    (c.y < 0 && stepv.y <= 0) || (c.y >= S && stepv.y >= 0) ||
+                    (c.z < 0 && stepv.z <= 0) || (c.z >= S && stepv.z >= 0);
+      if (outAway) { break; }
+    }
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      c.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+    } else if (tMax.y < tMax.z) {
+      c.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+    } else {
+      c.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+    }
+  }
+  return out;
+}
+
+// After the yaw swizzle above, the normal the DDA reports is in MODEL space and
+// has to come back to world space or the lighting rotates with the variant.
+// The inverse of each quarter turn is the quarter turn by the negated angle,
+// which for a normal (a direction) is again a swap-and-negate.
+fn microNormalToWorld(n : vec3f, flags : u32, h : u32) -> vec3f {
+  if ((flags & MICROF_YAW) == 0u) { return n; }
+  let q = h & 3u;
+  if (q == 1u) { return vec3f(-n.z, n.y, n.x); }   // inverse of (x,z)->(z,-x)
+  if (q == 2u) { return vec3f(-n.x, n.y, -n.z); }
+  if (q == 3u) { return vec3f(n.z, n.y, -n.x); }
+  return n;
 }
 
 fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
@@ -632,6 +808,20 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.tsSgn = -1.0;
   out.tsMat = 0u;
   out.tsPath = 0.0;
+  out.micMat = 0u;
+
+  // ---- micro-detail budget for THIS ray ----
+  // `wantMedia` is exactly "this is the primary camera ray" at every call site
+  // (shadow and reflection rays pass false), so it doubles as the micro gate.
+  // That IS the v1 shadow policy from the plan: SHADOW RAYS SKIP MICRO CELLS
+  // ENTIRELY and pass straight through them.
+  //
+  // Which is also why isRayBlocker excludes micro materials — the two have to
+  // agree. A meadow therefore casts no shadow from its grass, which reads
+  // correctly (grass shadows at 6 cm are sub-pixel at any normal viewing
+  // distance) and costs nothing, where marching a brick per shadow ray would
+  // multiply the most expensive ray in the frame by 3*subdiv.
+  var microBudget = select(0, TUNE_MICRO_MAX_PER_RAY, wantMedia);
 
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -789,6 +979,68 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           out.tsMat = mat;
         }
         // fall through and keep marching
+      } else if (microBudget > 0 && (materials[mat].flags & MATF_MICRO) != 0u &&
+                 microBricks[mat].base != MICRO_NONE) {
+        // ---- static micro-detail: substitute a subdiv^3 model for this cell --
+        // See traceMicro. The cell is an ordinary solid voxel as far as the sim
+        // is concerned; only the RAY treats it as a finer model.
+        //
+        // LOD: past TUNE_MICRO_LOD_DIST a world cell is roughly one pixel, so
+        // the nested march is spending 3*subdiv steps to decide the colour of a
+        // sub-pixel — the model's silhouette cannot survive the sample anyway.
+        // Beyond it the cell shades as a plain voxel, which is not merely
+        // cheaper but the SAME answer averaged, and it keeps distant meadows
+        // reading as continuous ground instead of dissolving into stipple.
+        if (tCur * VOXEL_METERS > TUNE_MICRO_LOD_DIST) {
+          out.hit = true;
+          out.t = tCur;
+          out.cell = cell;
+          out.axis = axis;
+          out.sgn = sign(rd[axis]);
+          out.word = w;
+          return out;
+        }
+        // Cell-local entry point. tCur is where the ray crossed INTO this cell
+        // (the DDA sets it at the step that arrived here), so ro + rd*tCur
+        // minus the cell corner is a 0..1 coordinate on each axis.
+        let entry = (ro + rd * tCur) - vec3f(cell);
+        let mh = traceMicro(microBricks[mat], cell, clamp(entry, vec3f(0.0), vec3f(1.0)),
+                            rd, R.tick);
+        microBudget -= 1;
+        if (mh.hit) {
+          out.hit = true;
+          out.t = tCur + mh.t;
+          out.cell = cell;
+          out.axis = mh.axis;
+          out.sgn = mh.sgn;
+          // Keep the world voxel's word (stamp/stain/state travel with the
+          // CELL, not with the sub-voxel) but report the micro material
+          // separately, so fs() shades the blade's colour on the tuft's stain.
+          out.word = w;
+          out.micMat = mh.mat;
+          return out;
+        }
+        // MISS — and this is the crucial half. The ray passes through: fall out
+        // of the `if` and let the world DDA step past the cell exactly as if it
+        // were air. A micro cell that blocked on a miss would render every tuft
+        // of grass as a solid 6 cm cube.
+        //
+        // Note what happens once `microBudget` reaches 0: this branch stops
+        // matching and control drops to the plain-solid `else` at the bottom,
+        // so a ray that has already entered TUNE_MICRO_MAX_PER_RAY bricks
+        // treats the next micro cell as SOLID. That is the intended bound —
+        // terminating is bounded and reads as distant ground, where letting the
+        // ray fly on unbounded would punch a hole through a whole meadow.
+      } else if (!wantMedia && (materials[mat].flags & MATF_MICRO) != 0u) {
+        // ---- shadow / reflection ray meets a micro cell ----
+        // Pass straight through. These rays never march bricks (see the
+        // microBudget comment at the top of trace), and treating the cell as
+        // solid instead would make a grass blade cast a full 6 cm cube of
+        // shadow — the exact artifact isRayBlocker's micro exclusion exists to
+        // prevent, and the two must agree or chunk skipping and per-cell
+        // marching would disagree about the same meadow.
+        //
+        // Falls through with no state written, so the DDA steps past it as air.
       } else {
         out.hit = true;
         out.t = tCur;
@@ -1158,17 +1410,16 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
 // below, since sunlight that missed the surface hit the dirt first). Terrain
 // shaded this way gets its form back for free — north faces go blue-shifted,
 // undersides go earth-toned, and the eye reads that split as shape.
-const AMB_SKY    : vec3f = TUNE_AMB_SKY;   // zenith, cool
-const AMB_GROUND : vec3f = TUNE_AMB_GROUND;   // bounce, warm
 fn ambientAt(n : vec3f) -> vec3f {
-  // n.y = -1 -> full bounce, n.y = +1 -> full sky
-  let base = mix(AMB_GROUND, AMB_SKY, n.y * 0.5 + 0.5);
-  // Day/night: at night the sky term is replaced by a much dimmer, bluer
-  // moon/starlight ambient, and the warm ground bounce nearly vanishes
-  // (there is no sun to bounce). Scaling the SAME split rather than adding a
-  // separate night ambient keeps the shape cues that AMB_SKY/AMB_GROUND buy.
+  // n.y = -1 -> full bounce, n.y = +1 -> full sky. Day/night: at night the
+  // sky term is replaced by a much dimmer, bluer moon/starlight ambient, and
+  // the warm ground bounce nearly vanishes (there is no sun to bounce).
+  // Scaling the SAME split rather than adding a separate night ambient keeps
+  // the shape cues the sky/ground split buys. MUST MATCH ambientAtP
+  // (common.wgsl), which the raster body paths use; inlined here because this
+  // sits in per-hit shading loops (see keyLightColor).
+  let base = mix(TUNE_AMB_GROUND, TUNE_AMB_SKY, n.y * 0.5 + 0.5);
   let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
-  // Moonlight ambient scales with how full the moon is and whether it is up.
   let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
   let moonAmt = moonUp * (0.30 + 1.40 * R.moonPhase * R.moonPhase);
   return mix(nightAmb * (0.45 + moonAmt), base, R.sunUp);
@@ -2767,9 +3018,22 @@ fn fs(in : VSOut) -> FSOut {
       color = skyColor(rd);
     }
   } else {
-    let mat = voxMat(h.word);
+    // A micro hit reports the SUB-VOXEL's material (h.micMat) while the cell's
+    // own word still carries state/stamp/stain. Shading the sub-voxel's
+    // material through the ordinary path here is exactly what the "palette
+    // index == material id" convention buys: a red petal and a green stem in
+    // one cell each light like the material they are, with no new shading code
+    // and no per-micro colour table.
+    let isMicro = h.micMat != 0u;
+    let mat = select(voxMat(h.word), h.micMat, isMicro);
     let m = materials[mat];
-    var albedo = paletteColor(m, voxState(h.word));
+    // Palette variant: a micro voxel has no state nibble of its own, so key it
+    // on the sub-voxel's material and the cell, which keeps a tuft's blades
+    // from all landing on the same palette entry while staying stable in time.
+    let paletteState = select(voxState(h.word),
+                              hash3(R.seed, 1u, cellIndexW(h.cell) ^ h.micMat),
+                              isMicro);
+    var albedo = paletteColor(m, paletteState);
     if (m.klass == CLASS_LIQUID) {
       // liquid state nibble is fullness, not a palette variant: fuller = deeper
       let fullness = f32(voxState(h.word) + 1u) / 8.0;
@@ -2778,6 +3042,13 @@ fn fs(in : VSOut) -> FSOut {
 
     var n = vec3f(0.0);
     n[h.axis] = -h.sgn;
+    if (isMicro) {
+      // The nested DDA ran in MODEL space, after the per-cell quarter-turn
+      // swizzle, so its face normal has to be rotated back or a yaw-varied
+      // tuft would light as though the sun had turned with it.
+      n = microNormalToWorld(n, microBricks[voxMat(h.word)].flags,
+                             hash3(R.seed, 0u, cellIndexW(h.cell)));
+    }
 
     // Voxel-scale grain: breaks up the white-noise palette confetti into
     // correlated patches (see surfaceGrain). Liquids are excluded — their state
@@ -2801,7 +3072,15 @@ fn fs(in : VSOut) -> FSOut {
     let a1 = select(0, 1, h.axis == 0);            // first tangent axis
     let a2 = select(2, 1, h.axis == 2);            // second tangent axis
     let uv = vec2f(fract(hp[a1]), fract(hp[a2]));
-    let ao = voxelAO(h.cell, ni, a1, a2, uv);
+    // voxelAO samples the eight CELL-scale neighbours around the hit face,
+    // which is meaningless for a hit that happened INSIDE a cell: the face it
+    // would sample is up to a whole cell away from the blade that was struck,
+    // and the cell's own neighbours (open air, on all sides of a tuft) report
+    // no occlusion anyway. Unoccluded instead of wrongly occluded — the micro
+    // model's own self-shadowing would need a second march, which is exactly
+    // the cost this feature exists to avoid, and grass genuinely does sit in
+    // open sky.
+    let ao = select(voxelAO(h.cell, ni, a1, a2, uv), 1.0, isMicro);
 
     // Per-face constant: kept, but much gentler than the old 0.55/0.75/0.85
     // spread. That spread was doing the job real ambient should do, and doing
@@ -2809,9 +3088,14 @@ fn fs(in : VSOut) -> FSOut {
     // of where the sky actually was. Now the hemisphere ambient carries the
     // directional term and this only breaks the tie between the two horizontal
     // axes so parallel walls don't fuse.
+    //
+    // Keyed on the WORLD normal rather than on h.axis, because a micro hit's
+    // axis is in model space: after the quarter-turn yaw swizzle, x and z can
+    // be swapped, and using the raw axis would give two identically-oriented
+    // tufts different face weights.
     var face = 1.0;
-    if (h.axis == 0) { face = TUNE_FACE_X; }
-    else if (h.axis == 2) { face = TUNE_FACE_Z; }
+    if (abs(n.x) > 0.5) { face = TUNE_FACE_X; }
+    else if (abs(n.z) > 0.5) { face = TUNE_FACE_Z; }
 
     // Wrapped diffuse (see wrapDiffuse): keeps the risers of the terrain
     // staircase within a few percent of their tops instead of 1.8x apart.
@@ -3014,34 +3298,13 @@ fn fs(in : VSOut) -> FSOut {
   // interesting. It is half the reason lava rendered as a white slab (the
   // other half being that emission was added on top of a lit albedo).
   //
-  // Reinhard-with-white-point, applied to LUMINANCE and then reapplied to the
-  // colour, rather than per channel.
-  //
-  // Per-channel Reinhard desaturates catastrophically and at ALL intensities,
-  // not just bright ones: the 1/(1+c) denominator compresses a strong channel
-  // far harder than a weak one, so a saturated ember orange (#ff5a1a, sat
-  // 0.90) comes out as tan (sat 0.59) even at half exposure. Every warm
-  // emissive surface in the scene — lava cracks, fire, embers — turned gold.
-  // Scaling by the luminance ratio instead preserves the authored hue exactly.
-  //
-  // A CONTROLLED amount of the per-channel behaviour is still wanted at the
-  // very top, because genuine blackbody progression does shift toward white as
-  // things get hotter. So blend a little of it back in, weighted by how far
-  // into the shoulder the pixel sits: hue is preserved through the midtones,
-  // and only the truly hot cores bleach.
-  const WHITE : f32 = TUNE_EXPOSURE_WHITE;   // intensity that maps to display white
-  color = max(color, vec3f(0.0));
-  let lum = max(dot(color, vec3f(0.2126, 0.7152, 0.0722)), 1e-5);
-  let mapped = (lum * (1.0 + lum / (WHITE * WHITE))) / (1.0 + lum);
-  let hueKept = color * (mapped / lum);
-  let perCh = (color * (1.0 + color / (WHITE * WHITE))) / (1.0 + color);
-  // Cubed so the crossover is late: below ~2x exposure the blend is a few
-  // percent and hue is essentially untouched, and only genuinely hot cores
-  // (3x and up) bleach toward white. A linear weight starts desaturating in
-  // the midtones, which is the gold-honeycomb failure this replaces.
-  let bleach = clamp(mapped * mapped * mapped * TUNE_BLEACH_AMOUNT, 0.0, TUNE_BLEACH_AMOUNT);
-  color = mix(hueKept, perCh, bleach);
-  color = pow(color, vec3f(1.0 / TUNE_GAMMA));
+  // Reinhard-with-white-point on LUMINANCE (per-channel desaturates: ember
+  // orange turns tan and every warm emissive goes gold), with a late cubed
+  // blend of per-channel at the very top so genuinely hot cores bleach toward
+  // white like real blackbody progression. Lives in common.wgsl (tonemapHdr)
+  // because the raster body paths must compress through the SAME curve or
+  // debris brightness drifts from the terrain it landed on.
+  color = tonemapHdr(color);
   var out : FSOut;
   out.color = vec4f(color, 1.0);
   out.depth = depth;

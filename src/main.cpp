@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <GLFW/glfw3.h>
@@ -24,6 +25,8 @@
 #include "phys/physics.h"
 #include "sim/farfield.h"
 #include "sim/materials.h"
+#include "sim/microbody.h"
+#include "sim/microvox.h"
 #include "sim/simulation.h"
 #include "sim/tuning.h"
 #include "sim/stream.h"
@@ -109,6 +112,11 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   rp.starRot = sky.starRot;
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
+  // Micro-detail animation clock + per-cell variation key (see world.h). Both
+  // are render-only inputs; the tick is passed rather than `time` so a flipbook
+  // advances at the sim's rate on every machine and reproduces in a replay.
+  rp.tick = tick;
+  rp.seed = kDefaultSeed;
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
@@ -198,6 +206,24 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   sim.EncodeWorldgen(enc);
   wgpu::CommandBuffer cmd = enc.Finish();
   ctx.queue.Submit(1, &cmd);
+}
+
+// Body render plumbing shared by the frame loop and the selftest. Debris takes
+// slots [0, D), mob limbs stack after — so the two systems must always be
+// walked in that order and with that base, which is exactly the sort of
+// agreement that rots when it is spelled out at two call sites.
+void BuildBodyXforms(const DebrisSystem& debris, const MobSystem& mobs,
+                     std::vector<BodyXformGpu>& out) {
+  debris.BuildXforms(out);
+  mobs.AppendXforms(out);
+}
+// Micro bodies (PLAN §C): already compacted, so `out.size()` IS the draw's
+// instance count and an empty result means the pass is skipped entirely.
+void BuildMicroInsts(const DebrisSystem& debris, const MobSystem& mobs,
+                     std::vector<MicroBodyInstGpu>& out) {
+  out.clear();
+  debris.AppendMicroInsts(out);
+  mobs.AppendMicroInsts(out, debris.BodyCount());
 }
 
 bool WriteBmp(const std::string& path, const std::vector<uint8_t>& rgba,
@@ -567,6 +593,67 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // and the stain on the surrounding stone carry the frame instead.
     render({(float)gx, (float)(gh + 16), (float)(gz + 14)}, -1.571f, -0.85f,
            "screenshot_blood_down.bmp");
+  }
+
+  // ---- static micro-detail: grass, foliage and flowers -------------------
+  // Worldgen does not place any of these (deliberately — Wave 1a does not
+  // touch worldgen), so the shot has to paint them itself, exactly the way the
+  // lava-spatter and blood scenes above do. Without this the entire feature
+  // would go unreviewed by --shot.
+  //
+  // The layout is chosen to exercise the three things that can go wrong:
+  //   * a MEADOW of grass_tuft, which is where the "cell must not block the
+  //     ray on a miss" rule shows up — get it wrong and this reads as a solid
+  //     green slab rather than as blades against ground.
+  //   * a MIXED patch of flowers among the grass, which is where the per-cell
+  //     yaw/jitter has to stop the field looking stamped.
+  //   * a low CLOSE camera and a HIGH one, so the LOD handoff at
+  //     TUNE_MICRO_LOD_DIST is visible in the same pass.
+  {
+    std::vector<CellOp> flora;
+    const int gx = 150, gz = 150;
+    // Deterministic placement — no rand(), so the shot is reproducible frame to
+    // frame like every other look shot in this function.
+    for (int dz = -22; dz <= 22; dz++) {
+      for (int dx = -22; dx <= 22; dx++) {
+        int wx = gx + dx, wz = gz + dz;
+        int gh = World::TerrainHeight(wx, wz, kDefaultSeed);
+        IVec3 c{wx, gh + 1, wz};
+        if (!world.CellInWindow(c)) continue;
+        // A cheap integer hash of the column picks what grows here. Grass is
+        // the common case; flowers are sparse, because a meadow where every
+        // cell is a poppy reads as gravel.
+        uint32_t r = (uint32_t)(wx * 73856093 ^ wz * 19349663);
+        r ^= r >> 13; r *= 0x9E3779B9u; r ^= r >> 16;
+        uint32_t roll = r % 100u;
+        uint32_t mat;
+        if (roll < 55u) { mat = kMatGrassTuft; }
+        else if (roll < 62u) { mat = kMatFlowerPoppy; }
+        else if (roll < 68u) { mat = kMatFlowerDaisy; }
+        else if (roll < 72u) { mat = kMatFoliageBush; }
+        else { continue; }  // bare ground between the tufts
+        // Same word rules as a brush paint on a solid: state 0, stamp 0xFF.
+        flora.push_back({World::SlotCellIndex(c), (mat & 0xFFFu) | (0xFFu << 16)});
+      }
+    }
+    for (uint32_t t = 133; t <= 136; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 t == 133 ? flora : std::vector<CellOp>{}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    int mh = World::TerrainHeight(gx, gz, kDefaultSeed);
+    // Eye-level and close: individual blades and petals have to resolve here,
+    // and a micro cell that wrongly blocked its ray shows up immediately as a
+    // wall of green cubes.
+    // Above the tips looking down the slope: close enough that individual
+    // blades and petals resolve, but OUT of the grass — a camera at tuft height
+    // sits inside a blade and the frame is one green wall.
+    render({(float)(gx - 16), (float)(mh + 7), (float)(gz - 16)}, 0.785f, -0.32f,
+           "screenshot_micro.bmp");
+    // High and back: crosses TUNE_MICRO_LOD_DIST inside one frame, so the
+    // near/far handoff is visible as a single image rather than two shots.
+    render({(float)(gx - 60), (float)(mh + 30), (float)(gz - 60)}, 0.785f, -0.30f,
+           "screenshot_micro_far.bmp");
   }
   return 0;
 }
@@ -1609,6 +1696,21 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     if (mobs.Defs().empty()) {
       std::printf("mob: FAIL (no mob defs — run scripts/gen_test_mob.py)\n");
     } else {
+      // Select the dummy BY NAME and resolve limb indices by name too: mob
+      // defs load in filename order, so adding assets/mobs/critter.* would
+      // otherwise silently re-point this fixture at a different rig. The
+      // loader also topologically sorts limbs, so positional indices are not
+      // stable across sidecar edits either.
+      int dummyDef = 0;
+      for (size_t i = 0; i < mobs.Defs().size(); i++)
+        if (mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+      const MobDef& dd = mobs.Defs()[dummyDef];
+      auto limbIndex = [&](const char* name) {
+        for (size_t i = 0; i < dd.limbs.size(); i++)
+          if (dd.limbs[i].name == name) return (int)i;
+        return -1;
+      };
+      const int nLimbs = (int)dd.limbs.size();
       int h = World::TerrainHeight(140, 140, kDefaultSeed);
       uint32_t t = 6000;
       auto mobTick = [&](std::vector<BrushOp> ops) {
@@ -1627,9 +1729,23 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
         mobs.PostStep();
       };
 
-      uint64_t id = mobs.Spawn(0, {137, h + 1, 139});
+      uint64_t id = mobs.Spawn(dummyDef, {137, h + 1, 139});
       Vec3 spawnPos = mobs.MobOrigin(id);
-      for (int i = 0; i < 120; i++) mobTick({});
+      // Same forward-locomotion invariant the critter is held to (below): the
+      // legacy scale-1 rig must keep walking along its facing, so a fix aimed
+      // at one model can never silently reverse the other.
+      Vec3 dPrev = spawnPos;
+      float dAlong = 0.0f, dPath = 0.0f;
+      for (int i = 0; i < 120; i++) {
+        Vec3 face = mobs.MobFacing(id);
+        mobTick({});
+        Vec3 now = mobs.MobOrigin(id);
+        Vec3 step{now.x - dPrev.x, 0, now.z - dPrev.z};
+        dPrev = now;
+        dAlong += step.x * face.x + step.z * face.z;
+        dPath += std::sqrt(step.x * step.x + step.z * step.z);
+      }
+      bool dummyForward = dPath > 1.0f && dAlong > 0.5f * dPath;
       Vec3 walked = mobs.MobOrigin(id);
       float dist = (walked - spawnPos).len();
       // The mob wanders ~20 voxels over these 120 ticks, and terrain averages
@@ -1638,33 +1754,374 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       // catch "fell through the world" / "stuck in the air", not honest walking
       // downhill — it was 6.0 when hills spanned 45 voxels and the mob grazed
       // it at exactly -6.0 once hills spanned 90.
-      bool standing = mobs.IsAlive(id) && mobs.LimbBodyCount() == 6 &&
+      bool standing = mobs.IsAlive(id) && mobs.LimbBodyCount() == (uint32_t)nLimbs &&
                       std::abs(walked.y - (float)(h + 1)) < 16.0f;
 
-      // sever arm.L (limb index 2 in the generated sidecar)
+      // sever arm.L
       uint32_t debrisBefore = debris.BodyCount();
-      mobs.Sever(id, 2);
-      bool severed = mobs.LimbBodyCount() == 5 &&
+      mobs.Sever(id, limbIndex("arm.L"));
+      bool severed = mobs.LimbBodyCount() == (uint32_t)(nLimbs - 1) &&
                      debris.BodyCount() == debrisBefore + 1 && mobs.IsAlive(id);
       for (int i = 0; i < 60; i++) mobTick({});
 
       // vital hit: decapitation kills — remaining 5 limbs ragdoll into debris.
       // settle window covers the blood drying out (its chunks stay dirty
       // while wet, and terrain refreshes wake nearby bodies by design)
-      mobs.Sever(id, 1);
+      mobs.Sever(id, limbIndex("head"));
       bool died = !mobs.IsAlive(id) || mobs.MobCount() == 0;
       for (int i = 0; i < 500; i++) mobTick({});
       uint32_t awake = debris.ActiveBodyCount();
       bool settled = awake == 0 && mobs.MobCount() == 0;
 
-      mobOk = standing && severed && died && settled;
+      mobOk = standing && severed && died && settled && dummyForward;
       std::printf(
-          "mob: %s (stood=%d walked %.1f vox, sever=%d, death=%d, %u debris "
-          "pieces, %u awake after settle)\n",
-          mobOk ? "PASS" : "FAIL", standing ? 1 : 0, dist, severed ? 1 : 0,
-          died ? 1 : 0, debris.BodyCount(), awake);
+          "mob: %s (stood=%d walked %.1f vox, forward %.1f/%.1f, sever=%d, "
+          "death=%d, %u debris pieces, %u awake after settle)\n",
+          mobOk ? "PASS" : "FAIL", standing ? 1 : 0, dist, dAlong, dPath,
+          severed ? 1 : 0, died ? 1 : 0, debris.BodyCount(), awake);
       debris.Reset();
       mobs.Reset();
+
+      // ---- Wave 2a: procedural gait + IK + clips on the critter rig ----
+      // Per-tick INVARIANTS, not rate comparisons: (a) at most one gait group
+      // swings at a time, which is the whole gait state machine; (b) some foot
+      // is always planted, or the mob is airborne; (c) losing a leg silently
+      // drops it from the schedule; (d) a non-fatal hit starts the flinch clip
+      // and that clip eventually blends out to nothing.
+      int critterDef = -1;
+      for (size_t i = 0; i < mobs.Defs().size(); i++)
+        if (mobs.Defs()[i].name == "critter") critterDef = (int)i;
+      if (critterDef < 0) {
+        std::printf("mob gait: SKIP (no critter def — run "
+                    "scripts/gen_critter_mob.py)\n");
+      } else {
+        const MobDef& cd = mobs.Defs()[critterDef];
+        auto critterLimb = [&](const char* nm) {
+          for (size_t i = 0; i < cd.limbs.size(); i++)
+            if (cd.limbs[i].name == nm) return (int)i;
+          return -1;
+        };
+        uint64_t cid = mobs.Spawn(critterDef, {137, h + 1, 139});
+        int maxSwing = 0, everSwung = 0, neverPlanted = 0;
+        // FORWARD-LOCOMOTION CHECK. A mob must travel along the direction it
+        // faces. Sample facing every tick and accumulate the dot product of
+        // each tick's displacement with that tick's facing, so a mid-walk turn
+        // (the critter turns 90 deg when blocked) can never make a
+        // forward-walking mob look backward. A model authored nose-backwards
+        // walks in reverse and this sum goes negative — that was a real bug.
+        Vec3 prevPos = mobs.MobOrigin(cid);
+        float alongFacing = 0.0f, pathLen = 0.0f;
+        for (int i = 0; i < 150; i++) {
+          Vec3 face = mobs.MobFacing(cid);
+          mobTick({});
+          int sw = mobs.SwingingFeet(cid);
+          int pl = mobs.PlantedFeet(cid);
+          if (sw > maxSwing) maxSwing = sw;
+          if (sw > 0) everSwung++;
+          if (pl == 0) neverPlanted++;
+          Vec3 now = mobs.MobOrigin(cid);
+          Vec3 step{now.x - prevPos.x, 0, now.z - prevPos.z};
+          prevPos = now;
+          alongFacing += step.x * face.x + step.z * face.z;
+          pathLen += std::sqrt(step.x * step.x + step.z * step.z);
+        }
+        // Require the motion to be not merely forward-ish but essentially ALL
+        // forward: a backwards model scores about -1 here, a correct one +1.
+        bool walksForward = pathLen > 1.0f && alongFacing > 0.5f * pathLen;
+        // groups are diagonal PAIRS, so up to 2 feet may swing together, but
+        // never a third (that would mean two groups swinging at once)
+        bool oneGroup = maxSwing <= 2;
+        bool stepped = everSwung > 0;
+        bool grounded = neverPlanted < 30;   // brief all-swing frames are ok
+
+        // limb loss: sever a front-left leg; its chain must drop out entirely
+        int beforeFeet = mobs.SwingingFeet(cid) + mobs.PlantedFeet(cid);
+        mobs.Sever(cid, critterLimb("legU.FL"));
+        for (int i = 0; i < 40; i++) mobTick({});
+        int afterFeet = mobs.SwingingFeet(cid) + mobs.PlantedFeet(cid);
+        bool legLost = mobs.IsAlive(cid) && afterFeet < beforeFeet;
+
+        // flinch clip: a non-fatal hit on the torso starts "attack"
+        uint64_t torso = mobs.LimbBody(cid, critterLimb("torso"));
+        mobs.Damage(torso, 1.0f, mobs.MobOrigin(cid), 0.0f);
+        int clipsNow = mobs.ActiveClips(cid);
+        for (int i = 0; i < 40; i++) mobTick({});
+        int clipsLater = mobs.ActiveClips(cid);
+        // the clip must both START and eventually retire (blend-out works)
+        bool clipOk = clipsNow >= 1 && clipsLater == 0;
+
+        bool gaitOk = oneGroup && stepped && grounded && legLost && clipOk &&
+                      walksForward;
+        std::printf(
+            "mob gait: %s (max %d feet swinging, stepped on %d/150 ticks, "
+            "%d all-swing ticks, leg loss %d->%d feet, clip %d->%d, "
+            "forward %.1f of %.1f vox travelled)\n",
+            gaitOk ? "PASS" : "FAIL", maxSwing, everSwung, neverPlanted,
+            beforeFeet, afterFeet, clipsNow, clipsLater, alongFacing, pathLen);
+        if (!walksForward)
+          std::printf("  critter walks BACKWARDS (displacement . facing = "
+                      "%.2f over %.1f vox of path)\n",
+                      alongFacing, pathLen);
+        mobOk = mobOk && gaitOk;
+
+        // ---- Wave 3: the microvoxel render pass actually draws ----
+        // The critter is a "scale": 2 def, so its limbs emit NO cube instances
+        // and must come entirely from microbody.wgsl. Render the same frame
+        // twice — once with the micro pass, once without — and count differing
+        // pixels. That proves three things at once with no depth readback: the
+        // pass produced fragments, they survived the reversed-Z depth test
+        // against the world raymarch (a pass writing depth behind the terrain
+        // would change nothing), and the limbs are not ALSO being drawn by the
+        // cube path (which would make both images identical).
+        {
+          const uint32_t W = 640, H = 360;
+          wgpu::TextureDescriptor td{};
+          td.size = {W, H, 1};
+          td.format = wgpu::TextureFormat::RGBA8Unorm;
+          td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+
+          // Slot lists exactly as the frame loop builds them.
+          std::vector<BodyXformGpu> xf;
+          BuildBodyXforms(debris, mobs, xf);
+          if (!xf.empty())
+            ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                                  xf.size() * sizeof(BodyXformGpu));
+          std::vector<MicroBodyInstGpu> microInsts;
+          BuildMicroInsts(debris, mobs, microInsts);
+          std::vector<BodyVoxInst> inst;
+          debris.BuildInstances(inst);
+          mobs.AppendInstances(inst, debris.BodyCount());
+          if (!inst.empty())
+            ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                                  inst.size() * sizeof(BodyVoxInst));
+
+          // Close in and AIMED. The critter is ~3 world voxels across and has
+          // been walking for 190 ticks, so a fixed yaw/pitch pair aimed at the
+          // spawn point misses it entirely and the pixel threshold below stops
+          // meaning anything. Take the torso's live transform and derive the
+          // camera angles from the look vector.
+          Vec3 target{};
+          {
+            std::vector<BodyXformGpu> t;
+            mobs.AppendXforms(t);
+            if (!t.empty()) target = Vec3{t[0].pos[0], t[0].pos[1], t[0].pos[2]};
+            else target = mobs.MobOrigin(cid);
+          }
+
+          auto shoot = [&](bool withMicro, std::vector<uint8_t>& out) {
+            wgpu::Texture tex = ctx.device.CreateTexture(&td);
+            wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+            wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
+                enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+            sim.DrawWorld(rp);
+            sim.DrawBodies(rp, (uint32_t)inst.size());
+            if (withMicro) sim.DrawMicroBodies(rp, ctx.queue, microInsts);
+            rp.End();
+            wgpu::Buffer shot = CreateBuffer(
+                ctx.device, (uint64_t)W * H * 4,
+                wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "microShot");
+            wgpu::TexelCopyTextureInfo srcT{};
+            srcT.texture = tex;
+            wgpu::TexelCopyBufferInfo dstB{};
+            dstB.buffer = shot;
+            dstB.layout.bytesPerRow = W * 4;
+            dstB.layout.rowsPerImage = H;
+            wgpu::Extent3D ext{W, H, 1};
+            enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
+            wgpu::CommandBuffer cmd = enc.Finish();
+            ctx.queue.Submit(1, &cmd);
+            out.assign((size_t)W * H * 4, 0);
+            wgpu::Future f = shot.MapAsync(
+                wgpu::MapMode::Read, 0, out.size(), wgpu::CallbackMode::WaitAnyOnly,
+                [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                  if (status == wgpu::MapAsyncStatus::Success) {
+                    std::memcpy(out.data(), shot.GetConstMappedRange(0, out.size()),
+                                out.size());
+                    shot.Unmap();
+                  }
+                });
+            ctx.instance.WaitAny(f, UINT64_MAX);
+          };
+
+          // VIEW SWEEP. One camera angle cannot test an OBB: the box has six
+          // faces and a winding bug in even one of them only hides the body
+          // from the directions that face it. Orbit the critter through the 8
+          // diagonal octants AND the 6 axis directions, and require the pass to
+          // change pixels from EVERY one. This is the regression for the
+          // mixed-winding bug (backface culling ate the faces whose triangles
+          // wound the other way, so the critter vanished from half the compass).
+          const Vec3 kDirs[] = {
+              // 8 diagonal octants
+              {1, 1, 1},   {1, 1, -1},  {1, -1, 1},  {1, -1, -1},
+              {-1, 1, 1},  {-1, 1, -1}, {-1, -1, 1}, {-1, -1, -1},
+              // 6 axis directions (grazing/axis-aligned rays are their own case:
+              // the DDA's near-zero-component guard only matters here)
+              {1, 0, 0},   {-1, 0, 0},  {0, 0, 1},   {0, 0, -1},
+              {0, 1, 0},   {0, -1, 0},
+          };
+          const int kNumDirs = (int)(sizeof(kDirs) / sizeof(kDirs[0]));
+          uint32_t minDiff = 0xFFFFFFFFu, maxDiff = 0;
+          int badDirs = 0, firstBad = -1;
+          std::vector<uint8_t> withPix, withoutPix, keepPix;
+          for (int d = 0; d < kNumDirs; d++) {
+            // Normalize then push out to a fixed radius so every direction
+            // frames the critter at the same distance — otherwise a diagonal
+            // eye sits 1.7x further out than an axial one and the pixel counts
+            // are not comparable.
+            Vec3 dir = kDirs[d].normalized();
+            Vec3 eye = target + dir * 8.0f;
+            Vec3 look = (target - eye).normalized();
+            Camera cam2;
+            cam2.yaw = std::atan2(look.z, look.x);
+            cam2.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
+            WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0);
+
+            shoot(true, withPix);
+            shoot(false, withoutPix);
+            uint32_t diff = 0;
+            for (size_t p = 0; p + 3 < withPix.size(); p += 4)
+              if (withPix[p] != withoutPix[p] ||
+                  withPix[p + 1] != withoutPix[p + 1] ||
+                  withPix[p + 2] != withoutPix[p + 2])
+                diff++;
+            if (diff < minDiff) minDiff = diff;
+            if (diff > maxDiff) maxDiff = diff;
+            // A scale-2 critter framed from 8 voxels away covers several
+            // thousand pixels at 640x360. 500 is a floor only a direction that
+            // drew nothing — or drew entirely behind the terrain, i.e. got the
+            // depth convention wrong — can fall under. Deliberately far below
+            // the observed count so gait wander can never flake the test.
+            if (diff < 500) {
+              badDirs++;
+              if (firstBad < 0) firstBad = d;
+            }
+            // keep the first diagonal's image as the visual artifact
+            if (d == 0) keepPix = withPix;
+          }
+          // SINGLE-BODY PROBE. The sweep above draws all 9 limbs at once, so a
+          // box that vanishes is masked by its neighbours — the critter as a
+          // whole stays visible even when individual limbs drop out. Culling is
+          // decided per triangle in the body's OWN object space, so isolate ONE
+          // body with an IDENTITY rotation: object space then equals world
+          // space, and the camera's octant maps 1:1 onto the box's own octant.
+          // A winding bug in the 36-vertex cube shows up here as a whole octant
+          // rendering nothing, which is exactly the reported symptom.
+          int soloBad = 0, soloFirst = -1;
+          uint32_t soloMin = 0xFFFFFFFFu;
+          {
+            std::vector<MicroBodyInstGpu> solo(1, microInsts[0]);
+            // Park the single body in open air well above the terrain, with an
+            // identity quaternion, so nothing occludes it and no gait pose
+            // rotates the octants out from under the assertion.
+            uint32_t slot = solo[0].slot;
+            Vec3 soloPos{target.x, target.y + 24.0f, target.z};
+            std::vector<BodyXformGpu> sxf = xf;
+            if (slot < sxf.size()) {
+              sxf[slot].pos[0] = soloPos.x;
+              sxf[slot].pos[1] = soloPos.y;
+              sxf[slot].pos[2] = soloPos.z;
+              sxf[slot].quat[0] = 0.0f;
+              sxf[slot].quat[1] = 0.0f;
+              sxf[slot].quat[2] = 0.0f;
+              sxf[slot].quat[3] = 1.0f;
+              ctx.queue.WriteBuffer(world.bodyXforms, 0, sxf.data(),
+                                    sxf.size() * sizeof(BodyXformGpu));
+            }
+            std::vector<uint8_t> sWith, sWithout;
+            for (int d = 0; d < kNumDirs; d++) {
+              Vec3 dir = kDirs[d].normalized();
+              Vec3 eye = soloPos + dir * 6.0f;
+              Vec3 look = (soloPos - eye).normalized();
+              Camera cam3;
+              cam3.yaw = std::atan2(look.z, look.x);
+              cam3.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
+              WriteRenderParams(ctx.queue, world, eye, cam3, (float)W / H, true, 0);
+              // Draw ONLY the micro pass against the world, twice, so the diff
+              // isolates this one body.
+              auto shootSolo = [&](bool withMicro, std::vector<uint8_t>& out) {
+                wgpu::Texture tex = ctx.device.CreateTexture(&td);
+                wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+                wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
+                    enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+                sim.DrawWorld(rp);
+                if (withMicro) sim.DrawMicroBodies(rp, ctx.queue, solo);
+                rp.End();
+                wgpu::Buffer shot = CreateBuffer(
+                    ctx.device, (uint64_t)W * H * 4,
+                    wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                    "microSolo");
+                wgpu::TexelCopyTextureInfo srcT{};
+                srcT.texture = tex;
+                wgpu::TexelCopyBufferInfo dstB{};
+                dstB.buffer = shot;
+                dstB.layout.bytesPerRow = W * 4;
+                dstB.layout.rowsPerImage = H;
+                wgpu::Extent3D ext{W, H, 1};
+                enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
+                wgpu::CommandBuffer cmd = enc.Finish();
+                ctx.queue.Submit(1, &cmd);
+                out.assign((size_t)W * H * 4, 0);
+                wgpu::Future fu = shot.MapAsync(
+                    wgpu::MapMode::Read, 0, out.size(),
+                    wgpu::CallbackMode::WaitAnyOnly,
+                    [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                      if (status == wgpu::MapAsyncStatus::Success) {
+                        std::memcpy(out.data(),
+                                    shot.GetConstMappedRange(0, out.size()),
+                                    out.size());
+                        shot.Unmap();
+                      }
+                    });
+                ctx.instance.WaitAny(fu, UINT64_MAX);
+              };
+              shootSolo(true, sWith);
+              shootSolo(false, sWithout);
+              uint32_t sd = 0;
+              for (size_t p = 0; p + 3 < sWith.size(); p += 4)
+                if (sWith[p] != sWithout[p] || sWith[p + 1] != sWithout[p + 1] ||
+                    sWith[p + 2] != sWithout[p + 2])
+                  sd++;
+              if (sd < soloMin) soloMin = sd;
+              // A single limb 6 voxels away fills hundreds of pixels; 50 is a
+              // floor only "drew nothing at all" can fall under.
+              if (sd < 50) {
+                soloBad++;
+                if (soloFirst < 0) soloFirst = d;
+              }
+            }
+            // restore the real transforms for anything downstream
+            if (!xf.empty())
+              ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                                    xf.size() * sizeof(BodyXformGpu));
+          }
+
+          bool microOk = !microInsts.empty() && badDirs == 0 && soloBad == 0;
+          std::printf("micro body render: %s (%zu micro slots, %d/%d views drew, "
+                      "%u..%u px changed of %u, solo body %d/%d views (min %u px), "
+                      "%zu cube instances from micro limbs)\n",
+                      microOk ? "PASS" : "FAIL", microInsts.size(),
+                      kNumDirs - badDirs, kNumDirs, minDiff, maxDiff, W * H,
+                      kNumDirs - soloBad, kNumDirs, soloMin, inst.size());
+          if (badDirs > 0)
+            std::printf("  critter INVISIBLE from %d view(s); first is dir "
+                        "(%.0f,%.0f,%.0f)\n",
+                        badDirs, kDirs[firstBad].x, kDirs[firstBad].y,
+                        kDirs[firstBad].z);
+          if (soloBad > 0)
+            std::printf("  SOLO micro body INVISIBLE from %d/%d view(s); first "
+                        "is dir (%.0f,%.0f,%.0f) — mixed cube winding?\n",
+                        soloBad, kNumDirs, kDirs[soloFirst].x, kDirs[soloFirst].y,
+                        kDirs[soloFirst].z);
+          // Visual proof alongside the numeric one — the pixel count says
+          // "something drew", the image says "it drew a critter".
+          if (!keepPix.empty() && WriteBmp("screenshot_microbody.bmp", keepPix, W, H))
+            std::printf("wrote screenshot_microbody.bmp\n");
+          mobOk = mobOk && microOk;
+        }
+
+        debris.Reset();
+        mobs.Reset();
+      }
     }
   }
 
@@ -2144,6 +2601,20 @@ int main(int argc, char** argv) {
     std::printf("loaded %zu prefabs\n", prefabs.size());
   }
 
+  // static micro-detail bricks (docs/PLAN_voxel_editor.md §A). Runs AFTER
+  // LoadAssets because it needs the compiled material list to resolve names,
+  // and BEFORE Simulation::Init because it SETS MATF_MICRO on `mats` — the
+  // material table upload has to carry that flag or the raymarcher never looks
+  // at the brick table.
+  MicroSet micro;
+  {
+    std::string mvlog;
+    LoadMicroVox(assetDir + "/materials/materials.json", assetDir, mats, micro, mvlog);
+    if (!mvlog.empty()) std::fprintf(stderr, "%s", mvlog.c_str());
+    std::printf("loaded %u micro materials (%u frames, %zu pool words)\n",
+                micro.materialCount, micro.frameCount, micro.pool.size());
+  }
+
   GLFWwindow* window = nullptr;
   if (!selftest && !shot) {
     if (!glfwInit()) return 1;
@@ -2158,7 +2629,8 @@ int main(int argc, char** argv) {
   World world;
   world.Init(ctx.device);
   Simulation sim;
-  if (!sim.Init(ctx.device, world, mats, reactions, assetDir + "/shaders")) return 1;
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders"))
+    return 1;
 
   Physics phys;
   if (!phys.Init()) return 1;
@@ -2166,12 +2638,20 @@ int main(int argc, char** argv) {
   debris.Init(&phys, &world, mats, reactions);
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats);
+  // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
+  // straight after: they are per-DEF art, shared by every instance. The set
+  // persists past load because the sphere spawner packs 2x-detail ball models
+  // into the same pool lazily (one per material, cached below) and re-uploads.
+  MicroBodySet mbSet;
+  std::unordered_map<uint32_t, MicroBodyRef> sphereModels;  // material -> model
   {
     std::vector<MobDef> mobDefs;
     std::string mlog;
-    LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mlog);
+    LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog);
     if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
-    std::printf("loaded %zu mob defs\n", mobDefs.size());
+    std::printf("loaded %zu mob defs (%zu micro-body limb models, %zu pool words)\n",
+                mobDefs.size(), mbSet.models.size(), mbSet.pool.size());
+    sim.UploadMicroBodies(ctx.queue, mbSet);
     mobs.SetDefs(std::move(mobDefs));
   }
   Stream stream;
@@ -2203,6 +2683,11 @@ int main(int argc, char** argv) {
   Player player;
   Brush brush;
   PrefabPlacer placer;
+  // Clear-then-fill, matching the hot-reload path below. These run once here,
+  // but an append-only build of a list the UI indexes into is exactly how a
+  // duplicate entry (and the ImGui ID collision that follows) gets introduced.
+  ui.prefabNames.clear();
+  ui.mobNames.clear();
   for (const Prefab& p : prefabs) ui.prefabNames.push_back(p.name);
   for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
   int spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
@@ -2229,6 +2714,9 @@ int main(int argc, char** argv) {
   uint32_t lastExplosionTick = 0;
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
+  // Per-frame render scratch, hoisted so the steady state reuses capacity.
+  std::vector<BodyXformGpu> bodyXf;
+  std::vector<MicroBodyInstGpu> microInsts;
   double lastTime = NowSec();
   double accumulator = 0;
   float fpsSmooth = 0, frameMsSmooth = 0, tickMsSmooth = 0, frameMsWorst = 0;
@@ -2346,6 +2834,18 @@ int main(int argc, char** argv) {
                      errors)) {
         mats = std::move(newMats);
         reactions = std::move(newReactions);
+        // Micro bricks BEFORE the table upload: LoadMicroVox sets MATF_MICRO on
+        // `mats`, and the flag has to be in the buffer the raymarcher reads or
+        // an edited "micro" block would silently do nothing until a restart.
+        // It also has to precede stream.OnMaterialsReloaded, which mirrors
+        // isRayBlocker (and that now depends on the flag).
+        {
+          std::string mvlog;
+          LoadMicroVox(assetDir + "/materials/materials.json", assetDir, mats, micro,
+                       mvlog);
+          if (!mvlog.empty()) std::fprintf(stderr, "%s", mvlog.c_str());
+          sim.UploadMicro(ctx.queue, micro);
+        }
         sim.UploadTables(ctx.queue, mats, reactions);
         debris.OnMaterialsReloaded(mats, reactions);
         stream.OnMaterialsReloaded(mats);
@@ -2362,8 +2862,13 @@ int main(int argc, char** argv) {
         mobs.OnMaterialsReloaded(mats);
         std::vector<MobDef> mobDefs;
         std::string mlog;
-        LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mlog);
+        // rebuild the shared micro pool from scratch: model indices die here,
+        // so the cached sphere models die with them (material ids can remap)
+        mbSet = MicroBodySet{};
+        sphereModels.clear();
+        LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog);
         if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
+        sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
         ui.mobNames.clear();
         for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
@@ -2511,35 +3016,94 @@ int main(int argc, char** argv) {
 
       // rolling sphere (K): a rigidbody ball, half the player's height in
       // diameter, made of the current brush material. The collider is a true
-      // Jolt sphere (CreateSphereBody) so it rolls smoothly; the voxel ball
-      // only exists to render it, with locals centered on the body origin so
-      // collider and art agree. Mass comes from the material's density —
-      // which is also what decides how far the player can shove it.
+      // Jolt sphere (CreateSphereBody) so it rolls smoothly; rendering is a
+      // scale-2 MICROVOXEL ball (PLAN §C) — twice the voxels across the same
+      // radius, so the silhouette carries real curvature. Models are packed
+      // lazily into the shared micro pool, one per material (micro voxels
+      // bake material ids), cached, and the pool re-uploaded on first use.
+      // Mass comes from the material's density — which is also what decides
+      // how far the player can shove it.
       if (ui.spawnSphere) {
         ui.spawnSphere = false;
         const WorldSnapshot& ssnap = world.Snap();
         uint32_t sphereMat = (uint32_t)ui.brushMaterial;
         if (ssnap.valid && ssnap.pick[0] != 0 && sphereMat < mats.size()) {
           const float r = Player::kHalfY * 0.5f;  // vox: diameter = height/2
-          std::vector<DebrisVoxel> ball;
-          int ext = (int)std::ceil(r);
-          for (int z = -ext; z < ext; z++)
-            for (int y = -ext; y < ext; y++)
-              for (int x = -ext; x < ext; x++) {
-                float dx = x + 0.5f, dy = y + 0.5f, dz = z + 0.5f;
-                if (dx * dx + dy * dy + dz * dz <= r * r)
-                  ball.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0,
+          const uint32_t kSphereScale = 2;        // micro voxels per world voxel
+          const float rm = r * (float)kSphereScale;  // radius, micro voxels
+          const int dims = (int)std::ceil(2.0f * rm);
+          // brick coords run [0..dims); the ball centre sits mid-brick
+          auto inBall = [&](int x, int y, int z) {
+            float dx = x + 0.5f - dims * 0.5f, dy = y + 0.5f - dims * 0.5f,
+                  dz = z + 0.5f - dims * 0.5f;
+            return dx * dx + dy * dy + dz * dz <= rm * rm;
+          };
+          auto mit = sphereModels.find(sphereMat);
+          if (mit == sphereModels.end() && sphereMat <= 255) {
+            std::vector<PrefabVoxel> mv;
+            for (int z = 0; z < dims; z++)
+              for (int y = 0; y < dims; y++)
+                for (int x = 0; x < dims; x++)
+                  if (inBall(x, y, z))
+                    mv.push_back({(int16_t)x, (int16_t)y, (int16_t)z,
                                   (uint16_t)sphereMat});
-              }
+            std::string slog;
+            int mi = MicroBodyPack(mbSet, mv, {dims, dims, dims}, kSphereScale,
+                                   "sphere:" + mats[sphereMat].name, slog);
+            if (!slog.empty()) std::fprintf(stderr, "%s", slog.c_str());
+            MicroBodyRef packed{};
+            if (mi >= 0) {
+              packed.model = (uint32_t)mi;
+              packed.scale = kSphereScale;
+              sim.UploadMicroBodies(ctx.queue, mbSet);
+            }
+            // a failed pack caches as invalid: fall back to the cube path
+            // below rather than re-attempting (and re-logging) every K press
+            mit = sphereModels.emplace(sphereMat, packed).first;
+          }
+          MicroBodyRef ref =
+              mit != sphereModels.end() ? mit->second : MicroBodyRef{};
+
+          // sphere centre drops just above the picked surface cell
+          Vec3 center{(float)ssnap.pick[5] + 0.5f,
+                      (float)ssnap.pick[6] + r + 1.5f,
+                      (float)ssnap.pick[7] + 0.5f};
+          std::vector<DebrisVoxel> ball;
           BodyTransform sxf{};
-          // drop it just above the picked surface cell
-          sxf.pos = Vec3{(float)ssnap.pick[5] + 0.5f,
-                         (float)ssnap.pick[6] + r + 1.5f,
-                         (float)ssnap.pick[7] + 0.5f};
           sxf.quat[3] = 1;
-          uint64_t sh = phys.CreateSphereBody(
-              sxf.pos, r, (float)mats[sphereMat].gpu.density);
-          if (sh) debris.AdoptBody(sh, std::move(ball), sxf);
+          uint64_t sh = 0;
+          if (ref.Valid()) {
+            // micro body: min-corner origin shared by the brick march and the
+            // collider (sphere shape offset to the brick centre). Body voxels
+            // are in MICRO units, which is what settle-back's downsample and
+            // AdoptBody's radius calculation expect.
+            for (int z = 0; z < dims; z++)
+              for (int y = 0; y < dims; y++)
+                for (int x = 0; x < dims; x++)
+                  if (inBall(x, y, z))
+                    ball.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0,
+                                    (uint16_t)sphereMat});
+            sxf.pos = center - Vec3{r, r, r};
+            sh = phys.CreateSphereBody(center, r,
+                                       (float)mats[sphereMat].gpu.density,
+                                       Vec3{r, r, r});
+          } else {
+            // cube-path fallback (material id > 255 or pack failure):
+            // world-unit ball centered on the body origin, as before
+            int ext = (int)std::ceil(r);
+            for (int z = -ext; z < ext; z++)
+              for (int y = -ext; y < ext; y++)
+                for (int x = -ext; x < ext; x++) {
+                  float dx = x + 0.5f, dy = y + 0.5f, dz = z + 0.5f;
+                  if (dx * dx + dy * dy + dz * dz <= r * r)
+                    ball.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0,
+                                    (uint16_t)sphereMat});
+                }
+            sxf.pos = center;
+            sh = phys.CreateSphereBody(center, r,
+                                       (float)mats[sphereMat].gpu.density);
+          }
+          if (sh) debris.AdoptBody(sh, std::move(ball), sxf, ref);
         }
       }
 
@@ -2773,12 +3337,16 @@ int main(int argc, char** argv) {
           ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
                                 inst.size() * sizeof(BodyVoxInst));
       }
+      // Micro bodies (PLAN §C) share the slot space with the cube path: each
+      // slot is claimed by exactly one of the two passes. Both scratch vectors
+      // are hoisted out of the loop so a steady-state frame reuses their
+      // capacity instead of allocating — clear() keeps the storage.
+      microInsts.clear();
       if (debris.BodyCount() + mobs.LimbBodyCount() > 0) {
-        std::vector<BodyXformGpu> xf;
-        debris.BuildXforms(xf);
-        mobs.AppendXforms(xf);
-        ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
-                              xf.size() * sizeof(BodyXformGpu));
+        BuildBodyXforms(debris, mobs, bodyXf);
+        ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
+                              bodyXf.size() * sizeof(BodyXformGpu));
+        BuildMicroInsts(debris, mobs, microInsts);
       }
 
       wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
@@ -2787,6 +3355,7 @@ int main(int argc, char** argv) {
       sim.DrawWorld(rp);
       sim.DrawParticles(rp);
       sim.DrawBodies(rp, bodyInstCount);
+      sim.DrawMicroBodies(rp, ctx.queue, microInsts);
       sim.DrawSprites(rp, (uint32_t)sprv.size());
       overlay.Render(rp);
       rp.End();

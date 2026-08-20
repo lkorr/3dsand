@@ -14,6 +14,11 @@ enum MatClass : uint32_t {
 // Material flags — must match common.wgsl.
 constexpr uint32_t kMatFlagWander = 1;  // powder scuttles laterally / hops
 constexpr uint32_t kMatFlagOpaque = 2;  // liquid renders as surface hit (lava)
+// Static micro-detail: the raymarcher substitutes a subdiv^3 brick for this
+// material's cells (sim/microvox.h). NOT authored directly in materials.json —
+// it is SET BY THE MICRO LOADER on any material whose "micro" block resolved to
+// a valid brick, so the flag and the brick table can never disagree.
+constexpr uint32_t kMatFlagMicro = 4;
 
 // GPU-side layout, 64 bytes — must match struct Material in common.wgsl.
 struct MaterialGpu {
@@ -60,6 +65,27 @@ constexpr uint32_t kStainChanceMax = 1000;
 
 // The stain palette lives at kStainPaletteBase in the material table — see
 // world.h, which holds it because the WGSL prelude is generated from that file.
+
+// Reaction chance resolution — must match REACT_CHANCE_* in common.wgsl.
+//
+// Chances are AUTHORED in per-mille but stored in units of 1/kReactChanceDen,
+// which buys two things: the neighbour-count ramp keeps 6 distinct steps even
+// at chance 1 (see kScale* below), and a rule can be authored far below 1
+// per-mille. Plain per-mille bottoms out at a mean wait of 1000 ticks ~= 33 s
+// at 30 Hz — much too frequent for a "rare ambient event" rule, which is why
+// the authored value is allowed to be fractional.
+//
+// kReactChanceScale must stay a multiple of kScaleMulUnit*5 (= 20) so the ramp
+// divide in scaledChance() is exact. At 2000 the finest authorable chance is
+// 0.0005 per-mille, a mean wait of ~2e9 ticks (~18.5 h at 30 Hz), and the
+// worst-case ramp numerator (den * 95) is ~1.9e8 — 22x inside u32.
+constexpr uint32_t kReactChanceScale = 2000;
+constexpr uint32_t kReactChanceDen = 1000 * kReactChanceScale;
+constexpr double kReactChanceMinMille = 1.0 / (double)kReactChanceScale;
+
+// Formats a per-mille chance for diagnostics without trailing-zero noise
+// (0.0005 rather than 0.000500).
+std::string FormatMille(double mille);
 
 // Reaction kinds / direction bits — must match common.wgsl.
 constexpr uint32_t kReactPair = 0, kReactDecay = 1, kReactEmit = 2;
@@ -113,7 +139,7 @@ struct ReactionGpu {
   uint32_t nbrMat;    // exact neighbor id, or kNbrAny
   uint32_t nbrTags;   // tag mask (nonzero => neighbor matches on any shared tag)
   uint32_t nbrClass;  // bit-per-class filter (1<<klass); 0 = any class
-  uint32_t chance;    // per-mille per tick
+  uint32_t chance;    // per tick, in units of 1/kReactChanceDen (see above)
   uint32_t prodSelf;  // kProdKeep = unchanged, 0 = air
   uint32_t prodNbr;   // pair: neighbor product; emit: emitted material
   // Light/day-phase condition + neighbour-count scaling (was pad — no struct

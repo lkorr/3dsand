@@ -102,9 +102,18 @@ void Overlay::Draw(UIState& s) {
     if (!s.prefabNames.empty()) {
       if (s.prefabSelected >= (int)s.prefabNames.size()) s.prefabSelected = 0;
       if (ImGui::BeginCombo("prefab", s.prefabNames[s.prefabSelected].c_str())) {
-        for (int i = 0; i < (int)s.prefabNames.size(); i++)
+        // PushID(i) makes each row's ID its INDEX, not its label. Two assets
+        // that happen to share a display name (or an empty one) would otherwise
+        // hash to the same ImGui ID: they draw as "2 items with conflicting
+        // id!" and — worse — every click resolves to whichever row won the ID,
+        // so the selection cannot be changed. Keying on the index is correct
+        // for ANY future name collision rather than only the ones we have.
+        for (int i = 0; i < (int)s.prefabNames.size(); i++) {
+          ImGui::PushID(i);
           if (ImGui::Selectable(s.prefabNames[i].c_str(), i == s.prefabSelected))
             s.prefabSelected = i;
+          ImGui::PopID();
+        }
         ImGui::EndCombo();
       }
       ImGui::Text("rotation %d°", s.prefabRot * 90);
@@ -122,9 +131,16 @@ void Overlay::Draw(UIState& s) {
     if (!s.mobNames.empty()) {
       if (s.mobSelected >= (int)s.mobNames.size()) s.mobSelected = 0;
       if (ImGui::BeginCombo("mob", s.mobNames[s.mobSelected].c_str())) {
-        for (int i = 0; i < (int)s.mobNames.size(); i++)
+        // Index-keyed IDs — see the prefab combo above for why. A mob def's
+        // name comes from the .vox filename stem, so two mob files in different
+        // states of a rename, or a def whose sidecar failed to load, can put
+        // the same string in this list twice.
+        for (int i = 0; i < (int)s.mobNames.size(); i++) {
+          ImGui::PushID(i);
           if (ImGui::Selectable(s.mobNames[i].c_str(), i == s.mobSelected))
             s.mobSelected = i;
+          ImGui::PopID();
+        }
         ImGui::EndCombo();
       }
       ImGui::TextDisabled("LMB (or M) spawn at crosshair");

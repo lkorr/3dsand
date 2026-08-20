@@ -43,7 +43,17 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatVoid = 30, kMatMite = 31, kMatBlood = 32,
                    // forest set: inert (no growth reactions) — see materials.json
                    kMatGrass = 33, kMatLeaves = 34, kMatPineNeedles = 35,
-                   kMatAutumnLeaves = 36, kMatBirchWood = 37, kMatPetal = 38;
+                   kMatAutumnLeaves = 36, kMatBirchWood = 37, kMatPetal = 38,
+                   // static micro-detail set (sim/microvox.h): ordinary solid
+                   // materials whose CELLS the raymarcher draws as subdiv^3
+                   // models. The four *_TUFT/BUSH/FLOWER ids carry a "micro"
+                   // block in materials.json; the five below them are the
+                   // ordinary materials those models are PAINTED with, so a
+                   // petal knocked loose behaves like a petal.
+                   kMatGrassTuft = 39, kMatFoliageBush = 40,
+                   kMatFlowerPoppy = 41, kMatFlowerDaisy = 42,
+                   kMatPetalRed = 43, kMatPetalWhite = 44, kMatPetalYellow = 45,
+                   kMatLeafGreen = 46, kMatStemGreen = 47;
 
 // ---- day/night cycle (DESIGN.md §12) ----------------------------------------
 // The cycle phase is an INTEGER derived from the sim tick, never from wall
@@ -183,6 +193,43 @@ inline uint32_t PackStain(uint32_t type, uint32_t amt) {
 constexpr uint32_t kMaterialSlots = 4096;
 constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
 
+// ---- static micro-detail brick pool (render-only — sim/microvox.h) ----------
+// The raymarcher substitutes a subdiv^3 voxel model for cells of a MATF_MICRO
+// material. All frames of all such materials live in ONE pool buffer, indexed
+// by a per-material table of kMaterialSlots entries. Both are bound to the
+// raymarch pipeline and to nothing else: they are render data, and putting them
+// on a sim shader's bind group would make render state a sim input (rule 1).
+//
+// Lives here rather than in microvox.h because ShaderConstantPrelude() and
+// scripts/check_shaders.sh both generate their WGSL constants from THIS file.
+// 4 MiB is room for ~32k subdiv-8 frames — a hard bound, not an open-ended
+// allocation (rule 2).
+constexpr uint32_t kMicroPoolWordsWorld = 1u << 20;
+
+// ---- dynamic microvoxel bodies (render-only — sim/microbody.h) -------------
+// A mob def with "scale": 2|4 authors its limbs at that many micro voxels per
+// WORLD voxel. Those limb models are packed once at load into their own brick
+// pool and drawn by rasterizing each body's OBB and marching the brick per
+// fragment (microbody.wgsl), instead of one cube instance per voxel.
+//
+// Same rules as the static pool above: render-only, never bound in a sim
+// shader, constants generated from THIS file so the WGSL and the C++ agree.
+//
+// Sized MUCH smaller than the static pool, and deliberately so. The static pool
+// is always populated — every world loads the micro blocks in materials.json —
+// whereas this one holds per-DEF limb art for the handful of mob defs that opt
+// into scale>1, shared across every instance. The whole scale-2 critter is 218
+// words; 256 KiB is room for ~1M micro voxels, i.e. dozens of far more detailed
+// creatures, and it is a hard ceiling rather than an open allocation (rule 2).
+// The buffer is allocated at this size unconditionally, so keeping it honest is
+// what stops an unused feature from costing 4 MiB of VRAM in every world.
+constexpr uint32_t kMicroBodyPoolWordsWorld = 1u << 16;
+// Per-limb model records, indexed by body slot through kMaxBodySlots-sized
+// slot table. One record per (def, limb) pair across every loaded mob def.
+constexpr uint32_t kMaxMicroBodyModels = 256;
+// A micro body's model has no micro model when its slot maps here.
+constexpr uint32_t kMicroBodyNoModel = 0xFFFFFFFFu;
+
 // Must match TickParams in common.wgsl.
 struct TickParams {
   uint32_t tick;
@@ -247,8 +294,28 @@ struct RenderParams {
   float sunUp = 1.0f;
   float moonPhase = 0.5f;
   float starRot = 0.0f;   // radians, stars wheel about the celestial pole
-  float pad_dn = 0.0f;
+  // ---- static micro-detail (render-only — sim/microvox.h) ----
+  // The raymarcher needs the tick to pick a flipbook frame and the world seed
+  // to key per-cell yaw/jitter. Both are already integers the sim owns; passing
+  // them through RenderParams rather than reading TickParams keeps the render
+  // bind group free of any sim uniform (which is what makes it obvious that the
+  // arrow only ever points sim -> render).
+  //
+  // The tick is used ONLY as an animation clock here. It is deliberately not
+  // wall time: a flipbook driven by frame timing would run at a different rate
+  // on a different machine, and a replay would not reproduce the frame the
+  // player saw.
+  uint32_t tick = 0;
+  // `seed` completes the row that starts at sunUp; the three pads then round
+  // the struct out to a whole 16-byte std140 row. WebGPU pads a uniform binding
+  // up to a multiple of 16 and validates the BOUND SIZE against that, so a
+  // struct that ends mid-row is rejected outright ("bound with size 140 ...
+  // requires at least 144"). Keep the total a multiple of 4 scalars.
+  uint32_t seed = 0;
+  uint32_t pad_dn0 = 0, pad_dn1 = 0, pad_dn2 = 0;
 };
+static_assert(sizeof(RenderParams) % 16 == 0,
+              "RenderParams must be a whole number of std140 rows");
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9,
 // docs/PLAN_far_field_cascades.md) ----

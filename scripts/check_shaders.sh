@@ -80,6 +80,20 @@ W_MATSLOTS="$(cpp_const kMaterialSlots)"
   echo "check_shaders: cannot parse kMaterialSlots from $WORLD_H" >&2; exit 1; }
 W_STAINBASE=$((W_MATSLOTS - 8))
 
+# Static micro-detail brick pool (render-only). kMicroPoolWordsWorld is written
+# as a shift expression in world.h, so scrape the shift and redo the arithmetic
+# rather than trying to parse `1u << 20`.
+W_MICROSHIFT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroPoolWordsWorld = 1u << \([0-9]*\);.*/\1/p' "$WORLD_H" | head -1)"
+[ -n "$W_MICROSHIFT" ] || {
+  echo "check_shaders: cannot parse kMicroPoolWordsWorld from $WORLD_H" >&2; exit 1; }
+W_MICROPOOL=$((1 << W_MICROSHIFT))
+
+# Dynamic microvoxel body pool (same shift-expression problem as above).
+W_MBSHIFT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroBodyPoolWordsWorld = 1u << \([0-9]*\);.*/\1/p' "$WORLD_H" | head -1)"
+[ -n "$W_MBSHIFT" ] || {
+  echo "check_shaders: cannot parse kMicroBodyPoolWordsWorld from $WORLD_H" >&2; exit 1; }
+W_MBPOOL=$((1 << W_MBSHIFT))
+
 # far-field grid (decoupled from the window — see world.h kFarN/kFarShiftBase)
 W_FARN="$(cpp_const kFarN)"
 [ -n "$W_FARN" ] || { echo "check_shaders: cannot parse kFarN from $WORLD_H" >&2; exit 1; }
@@ -101,6 +115,9 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
+  "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
+  "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
+  "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
   "const FAR_N : u32 = ${W_FARN}u;" \
   "const FAR_NCHUNK : u32 = ${W_FARNCHUNK}u;" \

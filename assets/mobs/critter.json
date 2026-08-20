@@ -1,0 +1,322 @@
+{
+  "root": "torso",
+  "scale": 2,
+  "bleed": {
+    "material": "blood",
+    "perDamage": 2.0
+  },
+  "speed": 6.0,
+  "gait": {
+    "cadence": 2.6,
+    "strideBias": 0.45,
+    "leadTime": 0.18,
+    "stepThreshold": 0.55,
+    "stepDuration": 0.18,
+    "stepHeight": 0.3,
+    "rideHeight": 1.05,
+    "groups": [
+      [
+        "legU.FL",
+        "legU.BR"
+      ],
+      [
+        "legU.FR",
+        "legU.BL"
+      ]
+    ],
+    "bobAmp": 0.09,
+    "bobFreqMul": 2.0,
+    "swayAmp": 0.05,
+    "rollAmp": 0.07,
+    "spineCounter": 0.6,
+    "phaseLag": 0.04
+  },
+  "limbs": [
+    {
+      "name": "torso",
+      "hp": 45,
+      "severable": false,
+      "tag": "spine"
+    },
+    {
+      "name": "head",
+      "parent": "torso",
+      "joint": "ball",
+      "hp": 18,
+      "severable": true,
+      "vital": true,
+      "tag": "head",
+      "anchor": [
+        4,
+        14.0,
+        20
+      ],
+      "severImpactSpeed": 22.0
+    },
+    {
+      "name": "tail",
+      "parent": "torso",
+      "joint": "ball",
+      "hp": 8,
+      "severable": true,
+      "tag": "tail",
+      "anchor": [
+        4,
+        12.0,
+        8
+      ],
+      "severImpactSpeed": 10.0,
+      "spring": {
+        "halflife": 0.18,
+        "gain": 1.4,
+        "maxAngle": 0.6
+      }
+    },
+    {
+      "name": "legU.FL",
+      "parent": "torso",
+      "joint": "ball",
+      "hp": 14,
+      "severable": true,
+      "tag": "leg",
+      "anchor": [
+        0,
+        12.0,
+        18
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legL.FL",
+      "parent": "legU.FL",
+      "joint": "hinge",
+      "hp": 12,
+      "severable": true,
+      "tag": "leg",
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "minAngle": -2.0,
+      "maxAngle": 0.05,
+      "anchor": [
+        0,
+        6.0,
+        18
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legU.FR",
+      "parent": "torso",
+      "joint": "ball",
+      "hp": 14,
+      "severable": true,
+      "tag": "leg",
+      "anchor": [
+        8,
+        12.0,
+        18
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legL.FR",
+      "parent": "legU.FR",
+      "joint": "hinge",
+      "hp": 12,
+      "severable": true,
+      "tag": "leg",
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "minAngle": -2.0,
+      "maxAngle": 0.05,
+      "anchor": [
+        8,
+        6.0,
+        18
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legU.BL",
+      "parent": "torso",
+      "joint": "ball",
+      "hp": 14,
+      "severable": true,
+      "tag": "leg",
+      "anchor": [
+        0,
+        12.0,
+        12
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legL.BL",
+      "parent": "legU.BL",
+      "joint": "hinge",
+      "hp": 12,
+      "severable": true,
+      "tag": "leg",
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "minAngle": -2.0,
+      "maxAngle": 0.05,
+      "anchor": [
+        0,
+        6.0,
+        12
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legU.BR",
+      "parent": "torso",
+      "joint": "ball",
+      "hp": 14,
+      "severable": true,
+      "tag": "leg",
+      "anchor": [
+        8,
+        12.0,
+        12
+      ],
+      "severImpactSpeed": 18.0
+    },
+    {
+      "name": "legL.BR",
+      "parent": "legU.BR",
+      "joint": "hinge",
+      "hp": 12,
+      "severable": true,
+      "tag": "leg",
+      "axis": [
+        1,
+        0,
+        0
+      ],
+      "minAngle": -2.0,
+      "maxAngle": 0.05,
+      "anchor": [
+        8,
+        6.0,
+        12
+      ],
+      "severImpactSpeed": 18.0
+    }
+  ],
+  "chains": [
+    {
+      "tag": "leg",
+      "parts": [
+        "legU.FL",
+        "legL.FL"
+      ],
+      "effector": "legL.FL",
+      "pole": [
+        0,
+        0,
+        1
+      ],
+      "solver": "twobone"
+    },
+    {
+      "tag": "leg",
+      "parts": [
+        "legU.FR",
+        "legL.FR"
+      ],
+      "effector": "legL.FR",
+      "pole": [
+        0,
+        0,
+        1
+      ],
+      "solver": "twobone"
+    },
+    {
+      "tag": "leg",
+      "parts": [
+        "legU.BL",
+        "legL.BL"
+      ],
+      "effector": "legL.BL",
+      "pole": [
+        0,
+        0,
+        1
+      ],
+      "solver": "twobone"
+    },
+    {
+      "tag": "leg",
+      "parts": [
+        "legU.BR",
+        "legL.BR"
+      ],
+      "effector": "legL.BR",
+      "pole": [
+        0,
+        0,
+        1
+      ],
+      "solver": "twobone"
+    }
+  ],
+  "clips": {
+    "attack": {
+      "durationMs": 420,
+      "loop": false,
+      "mode": "override",
+      "mask": [
+        "head"
+      ],
+      "blendInMs": 60,
+      "blendOutMs": 140,
+      "tracks": {
+        "head": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 200,
+              "q": [
+                0.342,
+                0.0,
+                0.0,
+                0.94
+              ],
+              "ease": "cubicInOut"
+            },
+            {
+              "t": 420,
+              "q": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "ease": "linear"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

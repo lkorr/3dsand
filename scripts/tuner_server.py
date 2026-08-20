@@ -10,6 +10,9 @@ happens in this process rather than in the page:
   GET  /                      the tuner, served from assets/
   GET  /api/files             materials.json + reactions.json + tuning.json
   POST /api/save              write those files back
+  GET  /api/models            list .vox/.json under assets/{models,mobs,microvox}
+  GET  /api/model?path=...    read one of those files (bytes for .vox)
+  POST /api/model?path=...    write one of those files
   POST /api/build             cmake --build ... --target sandvox
   POST /api/play              launch build/Release/sandvox.exe
   GET  /api/status            build state + whether the exe is running
@@ -20,9 +23,14 @@ Usage:
 
 SCOPE / SAFETY. This is a developer tool for one machine, not a service:
   - It binds 127.0.0.1 only, so nothing off this box can reach it.
-  - The three writable paths are a fixed allowlist (materials/reactions/tuning
-    .json under assets/materials). The page cannot name a path, so a bad or
-    malicious request cannot write anywhere else.
+  - The three JSON writable paths are a fixed allowlist (materials/reactions/
+    tuning .json under assets/materials). The page cannot name a path, so a bad
+    or malicious request cannot write anywhere else.
+  - The model routes DO take a path from the request (the editor must be able
+    to name the file it is editing), so every one goes through _model_path(),
+    which resolves the path and requires the result to sit inside one of three
+    fixed directories with an allowed extension. Traversal, absolute paths,
+    symlinks and odd extensions are all rejected there.
   - /api/build and /api/play run one hardcoded command each with a fixed
     argument list and shell=False. Nothing from the request reaches a command
     line.
@@ -34,6 +42,7 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -48,6 +57,48 @@ WRITABLE = {
     "reactions": os.path.join(MATDIR, "reactions.json"),
     "tuning": os.path.join(MATDIR, "tuning.json"),
 }
+
+# Directories the editor may read and write models in, as paths RELATIVE to
+# assets/. They are resolved against ASSETS at request time rather than frozen
+# here, because tuner_app.py re-points the module's ASSETS global after import
+# (it runs from a PyInstaller bundle whose __file__ is not the checkout).
+MODEL_DIRS = ("models", "mobs", "microvox")
+MODEL_EXTS = (".vox", ".json")
+
+
+def model_dirs():
+    """Absolute, normalised model directories for the CURRENT ASSETS value."""
+    return [os.path.abspath(os.path.join(ASSETS, d)) for d in MODEL_DIRS]
+
+
+def _model_path(rel):
+    """Resolve a request-supplied model path, or return None if it is not allowed.
+
+    `rel` is relative to assets/, e.g. "models/goblin.vox". Everything about
+    this function is the security boundary for the two /api/model routes:
+    the path is resolved (so "..", "." and symlinks are collapsed) and the
+    result must live directly inside one of MODEL_DIRS with an allowed
+    extension. An absolute path in the request cannot escape either, because
+    os.path.join() would adopt it and the containment check then fails.
+    """
+    if not isinstance(rel, str) or not rel:
+        return None
+    rel = rel.replace("\\", "/")
+    if "\x00" in rel:
+        return None
+    # os.path.join would silently take over on an absolute or drive-qualified
+    # path; reject those outright rather than relying on the check below.
+    if rel.startswith("/") or os.path.isabs(rel) or (len(rel) > 1 and rel[1] == ":"):
+        return None
+    path = os.path.realpath(os.path.join(ASSETS, rel))
+    if os.path.splitext(path)[1].lower() not in MODEL_EXTS:
+        return None
+    for d in model_dirs():
+        root = os.path.realpath(d)
+        if path.startswith(root + os.sep):
+            return path
+    return None
+
 
 BUILD_CMD = ["cmake", "--build", "build", "--config", "Release",
              "--target", "sandvox"]
@@ -125,6 +176,14 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj))
 
+    def _query(self):
+        q = self.path.split("?", 1)
+        return urllib.parse.parse_qs(q[1]) if len(q) > 1 else {}
+
+    def _raw(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n > 0 else b""
+
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
@@ -146,7 +205,9 @@ class Handler(BaseHTTPRequestHandler):
         ctype = {".html": "text/html; charset=utf-8",
                  ".js": "text/javascript; charset=utf-8",
                  ".json": "application/json",
-                 ".css": "text/css"}.get(ext, "application/octet-stream")
+                 ".css": "text/css",
+                 ".vox": "model/x-vox",
+                 ".png": "image/png"}.get(ext, "application/octet-stream")
         with open(path, "rb") as f:
             self._send(200, f.read(), ctype)
 
@@ -169,6 +230,43 @@ class Handler(BaseHTTPRequestHandler):
                     out[name] = None
             out["root"] = ROOT
             return self._json(200, out)
+        if p == "/api/models":
+            # assets/models/ is the editor's own output directory; create it on
+            # first listing so a fresh checkout has somewhere to save to.
+            try:
+                os.makedirs(os.path.join(ASSETS, MODEL_DIRS[0]), exist_ok=True)
+            except OSError:
+                pass
+            files = []
+            for d, absdir in zip(MODEL_DIRS, model_dirs()):
+                try:
+                    names = sorted(os.listdir(absdir))
+                except OSError:
+                    continue
+                for n in names:
+                    if os.path.splitext(n)[1].lower() not in MODEL_EXTS:
+                        continue
+                    full = os.path.join(absdir, n)
+                    if not os.path.isfile(full):
+                        continue
+                    files.append({"path": "%s/%s" % (d, n), "dir": d, "name": n,
+                                  "size": os.path.getsize(full),
+                                  "mtime": int(os.path.getmtime(full))})
+            return self._json(200, {"ok": True, "dirs": list(MODEL_DIRS),
+                                    "files": files})
+
+        if p == "/api/model":
+            rel = self._query().get("path", [""])[0]
+            path = _model_path(rel)
+            if not path:
+                return self._json(400, {"ok": False, "error": "path not allowed"})
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "not found"})
+            ctype = ("application/json" if path.lower().endswith(".json")
+                     else "model/x-vox")
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), ctype)
+
         if p == "/api/status":
             with _lock:
                 b = dict(_build)
@@ -197,6 +295,36 @@ class Handler(BaseHTTPRequestHandler):
                     f.write(text)
                 written.append(name)
             return self._json(200, {"ok": True, "written": written})
+
+        if p == "/api/model":
+            rel = self._query().get("path", [""])[0]
+            path = _model_path(rel)
+            if not path:
+                return self._json(400, {"ok": False, "error": "path not allowed"})
+            data = self._raw()
+            if not data:
+                return self._json(400, {"ok": False, "error": "empty body"})
+            is_json = path.lower().endswith(".json")
+            if is_json:
+                # Same rule as /api/save: never write a .json that will not
+                # parse, because the engine would then fail to load the asset.
+                try:
+                    json.loads(data.decode("utf-8"))
+                except Exception as e:
+                    return self._json(400, {"ok": False,
+                                            "error": "not valid JSON: %s" % e})
+            else:
+                if data[:4] != b"VOX ":
+                    return self._json(400, {"ok": False,
+                                            "error": "not a .vox file (bad magic)"})
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "path": rel,
+                                    "bytes": len(data)})
 
         if p == "/api/build":
             with _lock:

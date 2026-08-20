@@ -181,6 +181,10 @@ SPEC = [
     ("render", "exposureWhite", "TUNE_EXPOSURE_WHITE", "f", 4.2),
     ("render", "bleachAmount", "TUNE_BLEACH_AMOUNT", "f", 0.9),
     ("render", "gamma", "TUNE_GAMMA", "f", 2.2),
+    # static micro-detail
+    ("render", "microLodDist", "TUNE_MICRO_LOD_DIST", "f", 40.0),
+    ("render", "microMaxPerRay", "TUNE_MICRO_MAX_PER_RAY", "i", 8),
+
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
 

@@ -1,5 +1,6 @@
 #include "sim/simulation.h"
 
+#include <algorithm>
 #include <cstdio>
 
 #include "gpu/resources.h"
@@ -9,6 +10,7 @@ static constexpr uint32_t kPassStride = 256;  // min uniform dynamic-offset alig
 bool Simulation::Init(const wgpu::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
                       const std::vector<ReactionGpu>& reactions,
+                      const MicroSet& micro,
                       const std::string& shaderDir) {
   world_ = &world;
   device_ = device;
@@ -22,6 +24,31 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
                               wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
                               "reactions");
   UploadTables(queue, mats, reactions);
+
+  // Static micro-detail (render-only — sim/microvox.h). Both buffers are bound
+  // ONLY to the raymarch pipeline: they are render data, and a sim shader that
+  // could read them would put the renderer on the sim's dependency graph.
+  microTableBuf_ = CreateBuffer(device, sizeof(MicroBrickGpu) * kMaterialSlots,
+                                wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                "microBricks");
+  microPoolBuf_ = CreateBuffer(device, (uint64_t)kMicroPoolWords * 4,
+                               wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                               "microPool");
+  UploadMicro(queue, micro);
+
+  // Dynamic micro BODIES (PLAN §C). Sized here, filled by UploadMicroBodies
+  // once the mob defs have loaded — mobs load after the Simulation exists, and
+  // an empty table is a perfectly valid "no micro bodies" state.
+  mbModelBuf_ = CreateBuffer(device, sizeof(MicroBodyModelGpu) * kMaxMicroBodyModels,
+                             wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                             "microBodyModels");
+  mbPoolBuf_ = CreateBuffer(device, (uint64_t)kMicroBodyPoolWordsWorld * 4,
+                            wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                            "microBodyPool");
+  mbInstBuf_ = CreateBuffer(device, sizeof(MicroBodyInstGpu) * kMaxBodySlots,
+                            wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                            "microBodyInsts");
+  UploadMicroBodies(queue, MicroBodySet{});
 
   // 27 color-phase slices x 2 gravity substeps (54 total)
   {
@@ -121,6 +148,13 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(4, T::ReadOnlyStorage, S::Fragment),               // farVox
         entry(5, T::ReadOnlyStorage, S::Fragment),               // farOcc
         entry(6, T::Uniform, S::Fragment),                       // FarParams
+        // Static micro-detail. Two more storage entries here takes the render
+        // pipeline layout to 7 storage buffers across both groups (5 here + 4
+        // in renderPartBGL_ minus the uniforms), still well under Dawn's limit
+        // of 16 LAYOUT ENTRIES per stage — the limit counts declarations, not
+        // shader usage (see the simSlimBGL_ comment).
+        entry(7, T::ReadOnlyStorage, S::Fragment),               // microBricks
+        entry(8, T::ReadOnlyStorage, S::Fragment),               // microPool
     };
     wgpu::BindGroupLayoutDescriptor d{};
     d.entryCount = std::size(entries);
@@ -136,6 +170,23 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
     d.entryCount = std::size(pentries);
     d.entries = pentries;
     renderPartBGL_ = device.CreateBindGroupLayout(&d);
+
+    // Micro bodies get their OWN group 1 rather than extending renderPartBGL_.
+    // Three reasons: the model/pool reads happen in the FRAGMENT stage (the
+    // cube path's body buffers are vertex-only), the pool is 4 MiB that no
+    // other pipeline should have bound, and Dawn counts layout ENTRIES per
+    // stage — pairing renderBGL_'s 7 fragment storage entries with these 4
+    // gives 11, comfortably under 16, whereas piling everything into one group
+    // would have to be re-audited every time either side grows.
+    wgpu::BindGroupLayoutEntry mbentries[] = {
+        entry(0, T::ReadOnlyStorage, S::Vertex | S::Fragment),  // bodyXforms
+        entry(1, T::ReadOnlyStorage, S::Vertex | S::Fragment),  // models
+        entry(2, T::ReadOnlyStorage, S::Fragment),              // brick pool
+        entry(3, T::ReadOnlyStorage, S::Vertex | S::Fragment),  // draw list
+    };
+    d.entryCount = std::size(mbentries);
+    d.entries = mbentries;
+    microBodyBGL_ = device.CreateBindGroupLayout(&d);
   }
   {
     wgpu::PipelineLayoutDescriptor d{};
@@ -152,6 +203,11 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
     d.bindGroupLayoutCount = 2;
     d.bindGroupLayouts = renderGroups;
     renderPL_ = device.CreatePipelineLayout(&d);
+
+    wgpu::BindGroupLayout mbGroups[] = {renderBGL_, microBodyBGL_};
+    d.bindGroupLayoutCount = 2;
+    d.bindGroupLayouts = mbGroups;
+    microBodyPL_ = device.CreatePipelineLayout(&d);
   }
   {
     // far-field cascade fill + downsample: slim sim group 0 (`far` statically
@@ -266,12 +322,27 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(4, world_->farVox),
         b(5, world_->farOcc),
         b(6, world_->farUBO),
+        b(7, microTableBuf_),
+        b(8, microPoolBuf_),
     };
     wgpu::BindGroupDescriptor d{};
     d.layout = renderBGL_;
     d.entryCount = std::size(entries);
     d.entries = entries;
     renderBG_ = device.CreateBindGroup(&d);
+  }
+  {
+    wgpu::BindGroupEntry entries[] = {
+        b(0, world_->bodyXforms),
+        b(1, mbModelBuf_),
+        b(2, mbPoolBuf_),
+        b(3, mbInstBuf_),
+    };
+    wgpu::BindGroupDescriptor d{};
+    d.layout = microBodyBGL_;
+    d.entryCount = std::size(entries);
+    d.entries = entries;
+    microBodyBG_ = device.CreateBindGroup(&d);
   }
   {
     wgpu::BindGroupEntry entries[] = {
@@ -321,6 +392,37 @@ void Simulation::UploadTables(const wgpu::Queue& queue,
   queue.WriteBuffer(reactionBuf_, 0, rtable.data(), rtable.size() * sizeof(ReactionGpu));
 }
 
+void Simulation::UploadMicro(const wgpu::Queue& queue, const MicroSet& micro) {
+  // The table is exactly kMaterialSlots entries by construction (LoadMicroVox
+  // sizes it), but a caller that hands over a default-constructed MicroSet
+  // must still leave the GPU with a well-formed "nothing has a micro model"
+  // table rather than a stale one.
+  std::vector<MicroBrickGpu> table = micro.table;
+  table.resize(kMaterialSlots, MicroBrickGpu{kMicroNoBrick, 0, 0, 0});
+  queue.WriteBuffer(microTableBuf_, 0, table.data(), table.size() * sizeof(MicroBrickGpu));
+
+  if (!micro.pool.empty()) {
+    size_t words = std::min<size_t>(micro.pool.size(), kMicroPoolWords);
+    queue.WriteBuffer(microPoolBuf_, 0, micro.pool.data(), words * 4);
+  }
+}
+
+void Simulation::UploadMicroBodies(const wgpu::Queue& queue,
+                                   const MicroBodySet& set) {
+  // Fixed-size GPU buffers: pad the table so a shrinking reload cannot leave a
+  // stale model behind a still-live index, and never write past the ceiling.
+  std::vector<MicroBodyModelGpu> table = set.models;
+  if (table.size() > kMaxMicroBodyModels) table.resize(kMaxMicroBodyModels);
+  table.resize(kMaxMicroBodyModels, MicroBodyModelGpu{kMicroBodyNoModel, 0, 1, 0});
+  queue.WriteBuffer(mbModelBuf_, 0, table.data(),
+                    table.size() * sizeof(MicroBodyModelGpu));
+
+  if (!set.pool.empty()) {
+    size_t words = std::min<size_t>(set.pool.size(), kMicroBodyPoolWordsWorld);
+    queue.WriteBuffer(mbPoolBuf_, 0, set.pool.data(), words * 4);
+  }
+}
+
 bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   auto mod = [&](const char* name) { return LoadShader(device, shaderDir_, name); };
   wgpu::ShaderModule mWorldgen = mod("worldgen.wgsl");
@@ -333,8 +435,9 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   wgpu::ShaderModule mParticle = mod("sim_particle.wgsl");
   wgpu::ShaderModule mRay = mod("raymarch.wgsl");
   wgpu::ShaderModule mDebris = mod("debris.wgsl");
+  wgpu::ShaderModule mMicroBody = mod("microbody.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
-      !mExplode || !mParticle || !mRay || !mDebris) {
+      !mExplode || !mParticle || !mRay || !mDebris || !mMicroBody) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -362,6 +465,7 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
 
   raymarchModule_ = mRay;
   debrisModule_ = mDebris;
+  microBodyModule_ = mMicroBody;
   targetFormat_ = wgpu::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
 }
@@ -679,6 +783,27 @@ void Simulation::EnsureRenderPipelines(wgpu::TextureFormat format) {
     d.label = "bodyDraw";
     bodyDraw_ = device_.CreateRenderPipeline(&d);
   }
+  {
+    // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
+    // FRONT-face culling so only the far side of each OBB rasterizes. That is
+    // what keeps a limb drawn when the camera is inside its box — the fragment
+    // shader starts its march at the ray's slab entry, not at the triangle.
+    wgpu::FragmentState fs{};
+    fs.module = microBodyModule_;
+    fs.entryPoint = "fs";
+    fs.targetCount = 1;
+    fs.targets = &ct;
+    wgpu::RenderPipelineDescriptor d{};
+    d.layout = microBodyPL_;
+    d.vertex.module = microBodyModule_;
+    d.vertex.entryPoint = "vs";
+    d.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+    d.primitive.cullMode = wgpu::CullMode::Front;
+    d.depthStencil = &dsTest;
+    d.fragment = &fs;
+    d.label = "microBodyDraw";
+    microBodyDraw_ = device_.CreateRenderPipeline(&d);
+  }
 }
 
 wgpu::RenderPassEncoder Simulation::BeginRenderPass(const wgpu::CommandEncoder& enc,
@@ -733,6 +858,22 @@ void Simulation::DrawBodies(const wgpu::RenderPassEncoder& pass, uint32_t voxIns
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, voxInstances);
+}
+
+void Simulation::DrawMicroBodies(const wgpu::RenderPassEncoder& pass,
+                                 const wgpu::Queue& queue,
+                                 const std::vector<MicroBodyInstGpu>& insts) {
+  // Zero micro bodies costs exactly one branch: no upload, no bind, no draw.
+  // The instance list is CPU-compacted rather than indirect because the count
+  // is already known on the CPU (it is built from the body slots this frame),
+  // and an indirect buffer could not also be bound in this pass anyway.
+  if (insts.empty()) return;
+  size_t n = std::min<size_t>(insts.size(), kMaxBodySlots);
+  queue.WriteBuffer(mbInstBuf_, 0, insts.data(), n * sizeof(MicroBodyInstGpu));
+  pass.SetPipeline(microBodyDraw_);
+  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(1, microBodyBG_);
+  pass.Draw(36, (uint32_t)n);
 }
 
 void Simulation::FlipPage() { page_ = 1 - page_; }

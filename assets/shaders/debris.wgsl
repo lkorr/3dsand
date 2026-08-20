@@ -32,21 +32,10 @@ struct BodyXform {
 @group(1) @binding(2) var<storage, read> bodyInst : array<BodyVoxInst>;
 @group(1) @binding(3) var<storage, read> bodyXf : array<BodyXform>;
 
-fn quatRotate(q : vec4f, v : vec3f) -> vec3f {
-  let t = 2.0 * cross(q.xyz, v);
-  return v + q.w * t + cross(q.xyz, t);
-}
-
 struct VSOut {
   @builtin(position) pos : vec4f,
   @location(0) color : vec3f,
 };
-
-fn axisUnit(a : u32) -> vec3f {
-  if (a == 0u) { return vec3f(1.0, 0.0, 0.0); }
-  if (a == 1u) { return vec3f(0.0, 1.0, 0.0); }
-  return vec3f(0.0, 0.0, 1.0);
-}
 
 // vi in 0..35: face = vi/6 (+x,-x,+y,-y,+z,-z), two triangles per face.
 fn cubeOffset(vi : u32, out_n : ptr<function, vec3f>) -> vec3f {
@@ -64,19 +53,8 @@ fn cubeOffset(vi : u32, out_n : ptr<function, vec3f>) -> vec3f {
   return n * 0.5 + t1 * (q.x * 0.5) + t2 * (q.y * 0.5);
 }
 
-fn unpackColor(c : u32) -> vec3f {
-  return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
-}
-
-fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32) -> vec3f {
-  let lambert = max(dot(n, R.sunDir), 0.0);
-  var c = albedo * (0.38 + 0.72 * lambert * vec3f(1.0, 0.96, 0.88));
-  c += albedo * emission * 1.7;
-  let dist = length(worldPos - R.camPos);
-  let fog = 1.0 - exp(-dist * VOXEL_METERS * 0.0128);
-  // cheap sky tint for fog (matches raymarch closely enough at these distances)
-  return mix(c, vec3f(0.55, 0.65, 0.85), fog);
-}
+// quatRotate / axisUnit / unpackColor / litColor / emberFlicker are shared with
+// microbody.wgsl and live in common.wgsl — the two paths draw the same limbs.
 
 fn clipped() -> VSOut {
   var out : VSOut;
@@ -98,16 +76,11 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
 
   let mat = p.payload & 0xFFFu;
   let m = materials[mat];
-  var albedo = unpackColor(m.color0);
-  switch ((p.payload >> 12u) % 3u) {
-    case 1u: { albedo = unpackColor(m.color1); }
-    case 2u: { albedo = unpackColor(m.color2); }
-    default: {}
-  }
+  let albedo = paletteColor(m, p.payload >> 12u);
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColor(albedo, n, world, f32(m.emission) / 255.0);
+  out.color = litColor(albedo, n, world, f32(m.emission) / 255.0, R);
   return out;
 }
 
@@ -125,23 +98,15 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 
   let mat = b.packed & 0xFFFu;
   let m = materials[mat];
-  var albedo = unpackColor(m.color0);
-  switch (((b.packed >> 12u) & 0xFu) % 3u) {
-    case 1u: { albedo = unpackColor(m.color1); }
-    case 2u: { albedo = unpackColor(m.color2); }
-    default: {}
-  }
+  let albedo = paletteColor(m, (b.packed >> 12u) & 0xFu);
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
   // emissive body voxels (embers on burning debris) flicker like their grid
   // counterparts in raymarch.wgsl — same rate, per-voxel phase
-  var emis = f32(m.emission) / 255.0;
-  if (emis > 0.0) {
-    let fh = pcg(inst * 2917u + (b.packed >> 16u) * 131u);
-    emis *= 0.82 + 0.28 * sin(R.time * 9.0 + f32(fh & 0xFFu) * 0.0245);
-  }
-  out.color = litColor(albedo, wn, world, emis);
+  let fh = pcg(inst * 2917u + (b.packed >> 16u) * 131u);
+  let emis = emberFlicker(f32(m.emission) / 255.0, fh, R.time);
+  out.color = litColor(albedo, wn, world, emis, R);
   return out;
 }
 
@@ -154,11 +119,14 @@ fn vsSprite(@builtin(vertex_index) vi : u32,
   let world = s.pos + off;
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColor(unpackColor(s.color), n, world, s.emission);
+  out.color = litColor(unpackColor(s.color), n, world, s.emission, R);
   return out;
 }
 
 @fragment
 fn fs(in : VSOut) -> @location(0) vec4f {
-  return vec4f(pow(max(in.color, vec3f(0.0)), vec3f(1.0 / 2.2)), 1.0);
+  // litColor is linear HDR; compress through the terrain's tonemap so a cube
+  // matches the ground it lands on at any time of day (bare gamma here made
+  // debris glow at night).
+  return vec4f(tonemapHdr(in.color), 1.0);
 }

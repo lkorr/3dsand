@@ -326,6 +326,19 @@ const TUNING_SCHEMA = [
   },
 
   {
+    id: 'micro',
+    title: 'Micro detail',
+    icon: '\u{1F33C}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'Static micro-detail cells (grass, flowers): world voxels whose material substitutes a finer sub-voxel model at render time. The sim never sees the fine geometry, so these are pure look/perf trades.',
+    params: [
+      {k:'microLodDist', n:'micro LOD distance', d:'Past this distance a micro cell is drawn as a plain voxel instead of marching its fine model. The main perf lever for meadows.', min:0, max:200, step:1, u:'m'},
+      {k:'microMaxPerRay', n:'micro bricks per ray', d:'Cap on nested micro marches for one camera ray. Beyond the cap a micro cell reads as solid, not air — grazing rays across grass stay bounded.', min:0, max:32, step:1, int:true},
+    ],
+  },
+
+  {
     id: 'physics',
     title: 'Physics',
     icon: '⚙',

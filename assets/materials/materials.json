@@ -629,6 +629,204 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "id": "grass_tuft",
+      "class": "solid",
+      "density": 200,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#5f9a3c",
+        "#4d8531",
+        "#72ab49"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/grass_tuft.vox",
+        "subdiv": 8,
+        "frames": [
+          { "model": 0, "ticks": 26 },
+          { "model": 1, "ticks": 26 }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "id": "foliage_bush",
+      "class": "solid",
+      "density": 260,
+      "hardness": 4,
+      "rubble": "dust",
+      "colors": [
+        "#3f7a2e",
+        "#356825",
+        "#4e8f39"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/foliage.vox",
+        "subdiv": 8,
+        "yawVariants": true
+      }
+    },
+    {
+      "id": "flower_poppy",
+      "class": "solid",
+      "density": 210,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "These are the LOD colours: past TUNE_MICRO_LOD_DIST the cell shades as a plain voxel, so they must be the MODEL'S AVERAGE, not the blossom's. A poppy cell is mostly green stem and leaf with a small red head, so a saturated red here makes a distant meadow read as a field of red cubes rather than as grass with flowers in it.",
+      "colors": [
+        "#6f8a41",
+        "#5e7a38",
+        "#8a8446"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_poppy.vox",
+        "subdiv": 8,
+        "frames": [
+          { "model": 0, "ticks": 34 },
+          { "model": 1, "ticks": 34 }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "id": "flower_daisy",
+      "class": "solid",
+      "density": 210,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "LOD colours = the model's average (see flower_poppy). A daisy cell is stem and leaf with a small white-and-yellow head.",
+      "colors": [
+        "#78904e",
+        "#687f45",
+        "#93a05c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_daisy.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "id": "petal_red",
+      "class": "solid",
+      "density": 290,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#cf3a2e",
+        "#ad2c22",
+        "#e8523f"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "petal_white",
+      "class": "solid",
+      "density": 290,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#f4f2ea",
+        "#e0ddd1",
+        "#ffffff"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "petal_yellow",
+      "class": "solid",
+      "density": 290,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#e8c53a",
+        "#cfa92b",
+        "#f6dc5c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "leaf_green",
+      "class": "solid",
+      "density": 300,
+      "hardness": 3,
+      "rubble": "dust",
+      "colors": [
+        "#417f30",
+        "#356a27",
+        "#519a3c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "stem_green",
+      "class": "solid",
+      "density": 340,
+      "hardness": 4,
+      "rubble": "dust",
+      "colors": [
+        "#4a7d35",
+        "#3d692c",
+        "#589440"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

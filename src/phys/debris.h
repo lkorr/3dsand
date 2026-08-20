@@ -7,6 +7,7 @@
 #include "math3d.h"
 #include "phys/physics.h"
 #include "sim/materials.h"
+#include "sim/microbody.h"
 #include "sim/world.h"
 
 // Debris pipeline (DESIGN.md §7, Grimorium devlog mWdlTZ_FoBc):
@@ -71,8 +72,13 @@ class DebrisSystem {
   // Take ownership of an existing physics body (severed limb, ragdoll piece):
   // it becomes ordinary debris — culling, despawn, terrain upkeep. Any joints
   // still attached die when the body is eventually removed.
+  //
+  // `micro` describes the body's microvoxel rendering, if any (sim/microbody.h).
+  // Defaulted, so plain-debris callers are unchanged; a severed micro limb keeps
+  // its detail purely by the caller passing what it already knows, with no
+  // mob-specific code on this side.
   void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
-                 const BodyTransform& xf);
+                 const BodyTransform& xf, MicroBodyRef micro = {});
 
   // Laser body cut (PLAN §C2): partition a body's voxels by the world-space
   // plane (point, normal), destroy it, spawn both halves at the same pose
@@ -88,6 +94,12 @@ class DebrisSystem {
   bool InstancesDirty() const { return instancesDirty_; }
   void BuildInstances(std::vector<BodyVoxInst>& out);  // clears dirty flag
   void BuildXforms(std::vector<BodyXformGpu>& out) const;
+  // Append this system's micro bodies to the COMPACTED draw list, one entry per
+  // micro body, with slot indices matching the transforms BuildXforms writes.
+  // Appending straight into the compacted list (rather than building a dense
+  // per-slot array to filter afterwards) is what makes a world with no micro
+  // bodies cost one loop and no allocation — sim/microbody.h.
+  void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const;
   uint32_t InstanceCount() const { return instanceCount_; }
   uint32_t BodyCount() const { return (uint32_t)bodies_.size(); }
   uint32_t ActiveBodyCount() const;
@@ -104,6 +116,10 @@ class DebrisSystem {
     std::vector<DebrisVoxel> voxels;
     BodyTransform xf{};
     float radiusVoxels = 0;
+    // Microvoxel rendering, handed over by the adopting caller and OWNED here
+    // from then on — so a severed micro limb keeps its detail as ordinary
+    // debris, and the description cannot outlive the body it describes.
+    MicroBodyRef micro{};
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)

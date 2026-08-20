@@ -5,6 +5,8 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include "sim/materials.h"
+#include "sim/microbody.h"
+#include "sim/microvox.h"
 #include "sim/world.h"
 
 // Owns the compute pipelines + bind groups and records the fixed-tick GPU
@@ -16,7 +18,8 @@ class Simulation {
  public:
   bool Init(const wgpu::Device& device, World& world,
             const std::vector<MaterialDef>& mats,
-            const std::vector<ReactionGpu>& reactions, const std::string& shaderDir);
+            const std::vector<ReactionGpu>& reactions, const MicroSet& micro,
+            const std::string& shaderDir);
 
   // Recompile all WGSL from disk; returns false (keeping old pipelines) on
   // compile error.
@@ -24,6 +27,13 @@ class Simulation {
   // Re-upload the material + reaction tables (JSON hot reload).
   void UploadTables(const wgpu::Queue& queue, const std::vector<MaterialDef>& mats,
                     const std::vector<ReactionGpu>& reactions);
+  // Re-upload the static micro-detail brick pool + per-material table (rides
+  // the same R hot-reload as materials — sim/microvox.h). Render-only data:
+  // these buffers are bound to the raymarch pipeline and to nothing else.
+  void UploadMicro(const wgpu::Queue& queue, const MicroSet& micro);
+  // Re-upload the dynamic micro-BODY model table + brick pool (mob defs load /
+  // hot reload — sim/microbody.h). Render-only, same doctrine as UploadMicro.
+  void UploadMicroBodies(const wgpu::Queue& queue, const MicroBodySet& set);
 
   void EncodeWorldgen(const wgpu::CommandEncoder& enc);
   // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
@@ -75,6 +85,13 @@ class Simulation {
   void DrawParticles(const wgpu::RenderPassEncoder& pass);
   void DrawSprites(const wgpu::RenderPassEncoder& pass, uint32_t count);
   void DrawBodies(const wgpu::RenderPassEncoder& pass, uint32_t voxInstances);
+  // Microvoxel bodies (PLAN §C): one 36-vertex OBB per entry in `insts`, drawn
+  // between DrawBodies and DrawSprites. `insts` is the compacted (slot, model)
+  // list built by the caller from the frame's body slots; an empty list draws
+  // nothing at all, so a world with no micro bodies pays zero.
+  void DrawMicroBodies(const wgpu::RenderPassEncoder& pass,
+                       const wgpu::Queue& queue,
+                       const std::vector<MicroBodyInstGpu>& insts);
 
   static constexpr wgpu::TextureFormat kDepthFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -100,20 +117,26 @@ class Simulation {
   std::string shaderDir_;
   wgpu::Buffer materialBuf_;
   wgpu::Buffer reactionBuf_;
+  // Static micro-detail (render-only). Deliberately NOT in any sim bind group.
+  wgpu::Buffer microTableBuf_, microPoolBuf_;
+  // Dynamic micro BODIES (render-only, same doctrine): per-def limb models, the
+  // shared brick pool, and this frame's compacted (slot, model) draw list.
+  wgpu::Buffer mbModelBuf_, mbPoolBuf_, mbInstBuf_;
 
   // simSlimBGL_ mirrors simBGL_ bindings 0..4 only — the particle/explosion
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   wgpu::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
-      farBGL_;
-  wgpu::PipelineLayout simPL_, simPL2_, renderPL_, farPL_;
+      farBGL_, microBodyBGL_;
+  wgpu::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_;
   wgpu::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   wgpu::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   wgpu::ComputePipeline farFill_, farDown_;
-  wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_;
-  wgpu::ShaderModule raymarchModule_, debrisModule_;
+  wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
+      microBodyDraw_;
+  wgpu::ShaderModule raymarchModule_, debrisModule_, microBodyModule_;
   wgpu::TextureFormat targetFormat_ = wgpu::TextureFormat::Undefined;
 
   wgpu::Texture depthTex_;
@@ -123,6 +146,6 @@ class Simulation {
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   wgpu::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
-  wgpu::BindGroup renderBG_, renderPartBG_[2], farBG_;
+  wgpu::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_;
   int page_ = 0;
 };

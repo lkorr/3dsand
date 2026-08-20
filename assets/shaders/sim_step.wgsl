@@ -271,7 +271,7 @@ fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
 // expression is done in u32 with the divide last so it rounds identically on
 // every vendor. A float here would be a determinism bug.
 fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
-  if ((rule.cond & RSCALE_ON) == 0u) { return rule.chance * REACT_CHANCE_SCALE; }
+  if ((rule.cond & RSCALE_ON) == 0u) { return rule.chance; }
   let invert = (rule.cond & RSCALE_INVERT) != 0u;
 
   var count = 0u;
@@ -306,10 +306,9 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
   // a distinct integer even at chance 1.
   let maxQ = ((rule.cond >> RSCALE_MUL_SHIFT) & RSCALE_MUL_MASK) + RSCALE_MUL_UNIT;
   let span = maxQ - RSCALE_MUL_UNIT;  // quarters above 1.0x
-  let num = rule.chance * REACT_CHANCE_SCALE *
-            (RSCALE_MUL_UNIT * 5u + span * (count - 1u));
+  let num = rule.chance * (RSCALE_MUL_UNIT * 5u + span * (count - 1u));
   let scaled = num / (RSCALE_MUL_UNIT * 5u);
-  return min(scaled, 1000u * REACT_CHANCE_SCALE);
+  return min(scaled, REACT_CHANCE_DEN);
 }
 
 // Runs the cell's reaction bucket. At most one rule fires per tick. Returns
@@ -376,7 +375,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         let ni = cellIndexW((n));
         if (voxMat(voxels[ni]) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rule.chance * REACT_CHANCE_SCALE) {
+        if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp);
           markDirty(n);
           markDirty(c);
@@ -402,7 +401,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if (nmat == MAT_AIR) { continue; }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rule.chance * REACT_CHANCE_SCALE) {
+        if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           if (rule.prodNbr != PROD_KEEP) {
             if (rule.prodNbr == 0u) { voxels[ni] = 0u; }
             else { voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp); }

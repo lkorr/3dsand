@@ -508,6 +508,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "exposureWhite", r.exposureWhite, out, at);
     ReadF(*g, "bleachAmount", r.bleachAmount, out, at);
     ReadF(*g, "gamma", r.gamma, out, at);
+    ReadF(*g, "microLodDist", r.microLodDist, out, at);
+    ReadI(*g, "microMaxPerRay", r.microMaxPerRay, out, at);
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
@@ -553,6 +555,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       r.sunSize = 1.0f;
     }
     if (r.primarySteps < 1) { r.primarySteps = 1; }
+    // A negative micro budget would underflow the shader's u32 counter and
+    // uncap the very thing the knob exists to bound; 0 means "never nest",
+    // which is a legitimate way to turn the feature off by eye.
+    if (r.microMaxPerRay < 0) { r.microMaxPerRay = 0; }
+    if (r.microLodDist < 0.0f) { r.microLodDist = 0.0f; }
     if (r.shadowSteps < 0) { r.shadowSteps = 0; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
     if (r.farSteps < 1) { r.farSteps = 1; }
@@ -783,6 +790,10 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitF(o, "TUNE_EXPOSURE_WHITE", r.exposureWhite);
   EmitF(o, "TUNE_BLEACH_AMOUNT", r.bleachAmount);
   EmitF(o, "TUNE_GAMMA", r.gamma);
+  // ---- static micro-detail ----
+  EmitF(o, "TUNE_MICRO_LOD_DIST", r.microLodDist);
+  EmitI(o, "TUNE_MICRO_MAX_PER_RAY", r.microMaxPerRay);
+
   EmitI(o, "TUNE_PRIMARY_STEPS", r.primarySteps);
   EmitI(o, "TUNE_FAR_STEPS", r.farSteps);
 

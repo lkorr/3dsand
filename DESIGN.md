@@ -735,6 +735,74 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   body by a plane through the beam (voxel partition → two bodies, pose and
   velocity inherited).
 
+### Animation pipeline (2026-08-20; `game/anim`, docs/PLAN_voxel_editor.md §B)
+
+The single-sine limb swing became a layered pose pipeline. **All of it is
+CPU-float presentation state and none of it is hashed** — the mob's only grid
+contact remains BrushOp/CellOp (blood, severed limbs settling), so determinism
+rule #1 is untouched. `game/anim.{h,cpp}` holds the schema-facing pose/blend/IK
+machinery with no Jolt or World dependency (the editor shares it); `mob.cpp`
+consumes it and owns the physics plumbing. Per mob per tick:
+
+1. **Sample** active clips (fused quat+pos keyframes, integer ms, easing enum).
+2. **Blend** override layers, weight-normalized, per-part masks, rest-pose
+   fallback below Σw = 0.1. N-way blends are **nlerp with accumulator
+   alignment** — each incoming quaternion is sign-fixed against the *running
+   sum*, never against a fixed reference and never a chain of slerps, which
+   would be order-dependent.
+3. **Additive** layers applied *after* the normalize: `q_out = q_base *
+   nlerp(identity, dq, w)`, with `dq = conj(q_ref) * q_src` measured against
+   the clip's own frame 0. Applying them before the normalize would let the
+   weight division scale the delta away.
+4. **Flatten** parent→child in one linear pass; the loader topologically sorts
+   limbs so a parent's index is always below its children's.
+5. **IK** — two-bone analytic, in model space, strictly a **post-process**.
+   IK is never a blended layer: blending two IK results yields a pose that
+   satisfies neither end-effector constraint. Reach is clamped to
+   `[|L1-L2|+ε, L1+L2-ε]`, every `acos` argument is clamped to `[-1,1]`, the
+   root angle uses the `atan2` form, and the bend plane comes from an
+   **explicit per-chain pole vector** with a fixed fallback axis when the
+   cross product degenerates near full extension.
+6. **Physics blend / submit** through the existing `MoveKinematicBody` path.
+
+**Gait** is the base layer and needs no per-gait table. Each leg's ideal
+contact is `hip + fwd·strideBias + vel·leadTime`, snapped down through
+`GroundHeightAt`; a foot unplants when it has drifted past
+`stepThreshold·legLength` **and no other leg in its group is swinging**. That
+one constraint *is* the gait state machine: singleton groups give a walk,
+diagonal pairs give a trot, and losing a leg just means the survivors take
+their turns sooner. Stride and lift scale by speed so an idle mob's feet are
+genuinely still. **Body height and tilt are derived from the foot average and
+the foot-plane normal (Newell's method)** — which is why walking up voxel
+stairs works with zero slope-handling code. Pelvis bob runs at 2× step
+frequency (one rise per footfall), sway/roll at 1×, plus spine
+counter-rotation and a progressive phase lag per hierarchy level.
+
+**Springs** (Holden's closed form, unconditionally stable at any dt) drive
+parts like tails. A part is *keyed or jiggled, never both*, so a spring never
+fights a clip for the same channel. **Flipbooks** re-point a limb at another
+`.vox` model by an integer-ms frame index, rebuilding instances only on an
+actual frame change (the Jolt shape never changes — a frame swap must not
+rebuild collision).
+
+**Dismemberment** gained a second threshold, `severImpactSpeed`: a fast enough
+hit takes the limb regardless of remaining hp (absent ⇒ infinite, so old rigs
+are unchanged). A severed piece is handed to `DebrisSystem` immediately but
+**holds its last animated pose kinematically for ~0.25 s** before going
+dynamic — cutting straight to ragdoll on the hit frame reads as a teleport.
+On release it gets `ClearCollisionGroup`: the mob's `GroupFilterTable` would
+otherwise suppress contact between the severed arm and the torso it came off
+*forever*. Constraints are removed via Jolt's `RemoveConstraint`, not left
+disabled.
+
+Rigs are data. Every new sidecar field (`gait`, `tag`, `chains`, `clips`,
+`flipbooks`, `spring`, `severImpactSpeed`) is optional; `dummy.json` still
+works untouched, its `swingAmp`/`swingPhase` now running as a procedural layer
+*inside* the same pipeline rather than as a parallel code path.
+`assets/mobs/critter.*` (`scripts/gen_critter_mob.py`) is the worked example:
+a quadruped with two-segment legs (real two-bone IK), diagonal-pair gait
+groups, a spring tail and a masked flinch clip.
+
 ---
 
 ## 9. Rendering
@@ -1089,6 +1157,143 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   second key light — `keyLightColor()`/`keyLightDir()` route sun-vs-moon
   through one place, so shadows, water glints and caustics all follow whichever
   body is actually up.
+
+### Static micro-detail (2026-08-20; docs/PLAN_voxel_editor.md §A)
+
+Grass, foliage and flowers are ordinary world cells that the RENDERER draws at
+2×/4×/8× finer resolution. A material may declare a `"micro"` block naming a
+`.vox` whose every model is one flipbook frame; the loader (`src/sim/microvox.*`)
+packs all frames of all such materials into one brick pool (`array<u32>`, four
+8-bit palette indices per word) plus a per-material `MicroBrick` table sized
+`kMaterialSlots`. Palette index == material ID, as everywhere else, so a micro
+voxel shades through the existing material table with no new colour path.
+
+**Where it hooks.** In `trace()` (`raymarch.wgsl`), when the world DDA lands on a
+solid cell whose material carries `MATF_MICRO`, a nested Amanatides–Woo DDA runs
+over the `subdiv³` brick in cell-local space. A hit reports the sub-voxel's
+material and the face it was entered through; a **miss lets the ray continue past
+the cell**, which is the load-bearing half — a grass cell is mostly air, and a
+micro cell that blocked on a miss would draw every tuft as a solid 6 cm cube.
+Per-cell variety is a quarter-turn yaw swizzle plus an optional whole-sub-voxel
+XZ jitter, both keyed on `hash3(seed, 0, cellIndexW(cell))`.
+
+**Why this is free.** The world cell stays one ordinary 16-bit voxel. The CA
+never sees the brick, the world hash never covers it, chunk sleeping is
+unaffected, and the `.svx`/`.svd` save format is unchanged — a meadow costs
+exactly what the dirt it replaced cost (§11). The alternative, storing real
+sub-voxels, would have multiplied resident memory by `subdiv³`.
+
+**Determinism (rule 1).** Wholly render-side. `microBricks`/`microPool` are bound
+to the raymarch pipeline and to nothing else, so no sim kernel can read them.
+The two per-cell hashes and the flipbook frame index are integer functions of
+`(seed, cell)` and of `tick` respectively — never of wall time — so the animation
+reproduces in a replay without any of it becoming sim state. `--selftest`
+confirms it: the world hash is byte-identical with the feature on and with
+`microMaxPerRay: 0`.
+
+**Bounds (rule 2).** Three, all necessary:
+- the nested DDA is capped at `3·subdiv + 4` steps, the exact worst case for a
+  diagonal crossing of an `S³` box;
+- `TUNE_MICRO_MAX_PER_RAY` (~8) caps how many bricks ONE ray may enter, because
+  a grazing ray over a meadow crosses dozens of cells and every *miss* keeps it
+  alive. Past the cap the next micro cell is treated as solid — terminating is
+  bounded, letting the ray fly is not;
+- past `TUNE_MICRO_LOD_DIST` the cell shades as a plain voxel, since at ~1 px per
+  cell the nested march is deciding the colour of a sub-pixel. This makes a
+  micro material's own `colors` its LOD colours, so they must be authored as the
+  model's AVERAGE (a poppy is muted green with a red cast, not red).
+
+**Shadows and occupancy.** Shadow and reflection rays skip micro cells entirely
+(v1, matching the plan), and `isRayBlocker` correspondingly excludes
+`MATF_MICRO` from the per-chunk BLOCKER count. The two must agree: without the
+occupancy half, a chunk full of grass would report itself solid and terminate
+every chunk-skipping shadow ray at the meadow surface — a lawn casting the
+shadow of a wall. This is safe because occupancy is derived render-only data,
+written by `sim_occupancy`/worldgen and read only by the renderer and by CPU
+streaming; no sim kernel reads it and the hash does not cover it. The `total`
+count is deliberately untouched — a grass voxel IS present, and save/stream
+worthiness keys off that.
+
+Worldgen does not place these yet (Wave 1a deliberately does not touch it); the
+`--shot` harness paints a demo meadow, and they are brush-selectable like any
+other material.
+
+### Dynamic microvoxel bodies (2026-08-20; docs/PLAN_voxel_editor.md §C)
+
+Static micro-detail above substitutes a brick for a *grid cell*. Creatures and
+rigidbodies are the other half of the problem: they have free float transforms,
+so there is no cell to stand in and nothing for the world DDA to hand off to.
+
+A mob sidecar may declare `"scale": 2` (or 4). Its limb `.vox` coordinates are
+then **micro units** — that many per world voxel — so the same silhouette gets
+2×/4× the resolution without getting bigger. `src/sim/microbody.*` packs each
+limb model once at def load into a second brick pool (`array<u32>`, four 8-bit
+palette indices per word, palette index == material ID as everywhere else) and
+records a `MicroBodyModel { base, dims, scale }` per limb. Models are shared by
+every instance of the def: voxels never change after load in v1, so there is no
+copy-on-write and no per-instance storage at all.
+
+**OBB raster + per-fragment march.** Each micro body draws as ONE box — 36
+vertices — between `DrawBodies` and `DrawSprites`. The vertex shader positions
+the corners from `bodyXforms[slot]` and the model's dims; the fragment shader
+rebuilds the world ray, rotates it into object space by the body's conjugate
+quaternion, slab-tests, and runs an Amanatides–Woo DDA over the brick, or
+`discard`s. Cost therefore scales with the SCREEN AREA a limb covers rather than
+with its voxel count, which is the whole point: the instanced-cube path
+(`debris.wgsl vsBody`) is one 36-vertex instance per voxel, so a scale-4 limb
+would cost 64× the instances for the same on-screen result. That inverts rule
+§11's "cost tracks activity, not content".
+
+**Backfaces only.** The pipeline culls FRONT faces, so only the far side of the
+OBB rasterizes. Front faces would vanish the instant the camera entered the box
+(near-plane clipping); the far side is covered from every camera position
+including one inside, and the march simply starts at the ray's slab entry rather
+than at the triangle it was generated from.
+
+**Depth is the load-bearing detail.** The fragment writes `frag_depth` with
+*exactly* the raymarcher's reversed-Z convention — `viewZ = t·dot(rd, camFwd)`
+then `KNEAR / max(viewZ, KNEAR)` — with `rd` the UNNORMALIZED camera-to-fragment
+vector on both sides. Nothing in the shader normalizes anything: the object-space
+ray is the world ray under a rigid rotation, and the micro-unit ray is that
+scaled uniformly, so all three parametrizations share one `t`. Get this wrong by
+normalizing and micro bodies punch through terrain or sink into it. Hardware
+`GreaterEqual` testing then composites them against the world, particles, cubes
+and sprites with no sorting anywhere.
+
+**Routing.** Body render slots are shared: a slot with a micro model draws here
+and contributes NO cube instances (drawing both would double-draw at the wrong
+size); a slot without one keeps the cube path unchanged. The routing key is the
+**body**, not "is a mob limb", which is what makes a severed micro limb keep its
+detail for free: `MobSystem` hands a `MicroBodyRef` to `DebrisSystem::AdoptBody`
+alongside the voxels it already passes, and the debris body owns it from then on.
+Deliberately a parameter rather than a side table keyed by physics handle — a
+side table would need syncing at every spawn, sever, death, cull and reset, and a
+recycled Jolt `BodyID` could then paint unrelated debris as somebody's leg.
+Physics
+builds micro limbs at voxel pitch `1/scale` (collider extents, convex radius and
+per-voxel volume all scale together), so mass and physical size match the scale-1
+art they replace; the `pitch == 1` path is arithmetically identical to before.
+
+**What micro bodies deliberately do not do (v1).** They do not burn, split or
+shatter. Both of those mutate `b.voxels`, and the brick they render from is
+shared per-def — a per-body edit would be invisible on screen, and a
+copy-on-write pool is out of scope. Body burn additionally maps body-local
+coordinates straight onto world cells, which a micro voxel is 1/scale of. They
+DO settle back into the grid: `SettleBodies` collapses each `scale³` micro block
+to at most one world voxel by majority fill (blocks under half full become air),
+which is bounded and paid at most once per body.
+
+**Shadows: none, v1** — parity with the cube path, which also casts none. Shadow
+rays must never iterate models; a coarse occupancy proxy stamped render-side is
+the stretch goal.
+
+**Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
+(worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
+The draw list is CPU-compacted, so the instance count IS the number of micro
+bodies and a world with none does no upload, no bind and no draw. Determinism is
+untouched: the pool, the model table and the draw list are bound to the
+microbody pipeline and to nothing else, and `--selftest` reports an unchanged
+world hash with a scale-2 critter walking through the scene.
 
 - Later: emissive materials feeding a cheap GI (light propagation volumes or
   per-chunk flood lighting), volumetrics for gases.

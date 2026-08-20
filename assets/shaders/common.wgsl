@@ -27,6 +27,10 @@ const LIQ_FULL_STATE : u32 = 7u;
 // Material flags (bitfield).
 const MATF_WANDER : u32 = 1u;  // powder scuttles laterally / hops (critters)
 const MATF_OPAQUE : u32 = 2u;  // liquid renders as a surface hit (lava), not media
+// Static micro-detail: the raymarcher substitutes a subdiv^3 brick for this
+// material's cells (see MicroBrick below and trace() in raymarch.wgsl). Set by
+// the CPU micro loader, never authored — sim/microvox.h.
+const MATF_MICRO  : u32 = 4u;
 
 struct Material {
   klass       : u32,
@@ -100,6 +104,68 @@ fn isTranslucentSolid(m : Material) -> bool {
   return m.klass == CLASS_SOLID && m.opacity < 255u;
 }
 
+// ---- static micro-detail (docs/PLAN_voxel_editor.md §A, DESIGN.md §9) -------
+// A material with MATF_MICRO keeps an ordinary 16-bit world cell — the CA, the
+// hash and occupancy all see one plain voxel — and the RAYMARCHER substitutes a
+// finer subdiv^3 model when a primary ray lands on it. Grass, flowers and
+// foliage are therefore free to simulate, and cost nothing at all when off
+// screen.
+//
+// DETERMINISM (rule 1): this whole path is render-only. `microBricks` and
+// `microPool` are bound to the raymarch pipeline and to NOTHING else — binding
+// either in a sim shader would put render data on the sim's dependency graph.
+// Per-cell yaw/jitter come from hash3(seed, 0, cellIndexW), and the flipbook
+// frame is an integer function of `tick`, so every machine draws the same thing
+// without any of it being sim state.
+//
+// Must match struct MicroBrickGpu in src/sim/microvox.h (16 bytes).
+struct MicroBrick {
+  // Word index into microPool, or MICRO_NONE. Layout at `base`:
+  //   [0, frameCount)  cumulative tick offsets: entry i is the tick frame i
+  //                    ENDS at within one loop, so the last is the period.
+  //   then             frameCount bricks of (subdiv^3 / 4) words, 4 packed
+  //                    8-bit palette indices per word, index (z*S + y)*S + x.
+  // Palette index == material id, so a micro voxel shades through the ordinary
+  // material table with no extra mapping.
+  base       : u32,
+  subdivLog2 : u32,  // 1, 2 or 3
+  frameInfo  : u32,  // bits 0..7 frame count, bits 8..31 loop period in ticks
+  flags      : u32,  // MICROF_*
+};
+const MICRO_NONE : u32 = 0xFFFFFFFFu;
+const MICROF_YAW    : u32 = 1u;  // hash-keyed quarter-turn yaw about Y
+const MICROF_JITTER : u32 = 2u;  // hash-keyed sub-cell XZ offset
+
+fn microFrameCount(b : MicroBrick) -> u32 { return b.frameInfo & 0xFFu; }
+fn microPeriod(b : MicroBrick) -> u32 { return b.frameInfo >> 8u; }
+
+// ---- dynamic microvoxel BODIES (docs/PLAN_voxel_editor.md §C) --------------
+// A mob limb authored at "scale": 2|4 keeps its voxels in MICRO units and is
+// drawn by rasterizing its oriented bounding box and marching this brick in
+// the fragment shader (microbody.wgsl) — one 36-vertex box per limb instead of
+// one cube per voxel, so cost tracks screen area rather than voxel count.
+//
+// Render-only, exactly like MicroBrick above: bound to the microbody pipeline
+// and to nothing else. Voxels never change after load, so the record is shared
+// by every instance of the def and there is no per-instance storage at all.
+//
+// Must match struct MicroBodyModelGpu in src/sim/microbody.h (16 bytes).
+struct MicroBodyModel {
+  // Word index into microBodyPool. Payload is dims.x*dims.y*dims.z micro
+  // voxels, 4 packed 8-bit palette indices per word, idx = (z*dy + y)*dx + x.
+  // Palette index == material id, so a micro voxel shades through the ordinary
+  // material table with no extra mapping.
+  base  : u32,
+  dims  : u32,  // bits 0..9 x, 10..19 y, 20..29 z (micro voxels)
+  scale : u32,  // micro voxels per world voxel: 2 or 4
+  _pad  : u32,  // padding to 16 bytes; no flag bits are defined
+};
+
+fn microBodyDims(m : MicroBodyModel) -> vec3<i32> {
+  return vec3<i32>(i32(m.dims & 0x3FFu), i32((m.dims >> 10u) & 0x3FFu),
+                   i32((m.dims >> 20u) & 0x3FFu));
+}
+
 // Reaction kinds (bits 0..1 of packed) — DESIGN.md §6, authored in
 // assets/materials/reactions.json and compiled per-material at load.
 const RK_PAIR  : u32 = 0u;  // self + matching neighbor -> products
@@ -119,7 +185,8 @@ struct Reaction {
   nbrMat   : u32,  // exact neighbor material id, or NBR_ANY
   nbrTags  : u32,  // neighbor matches if (tagMask & nbrTags) != 0 (when nonzero)
   nbrClass : u32,  // bit-per-class filter (1<<klass); 0 = any class
-  chance   : u32,  // per-mille per 30 Hz tick
+  chance   : u32,  // odds per 30 Hz tick, in units of 1/REACT_CHANCE_DEN
+                   // (authored per-mille, pre-multiplied by the compiler)
   prodSelf : u32,  // what self becomes (PROD_KEEP = unchanged, 0 = air)
   prodNbr  : u32,  // pair: neighbor product; emit: emitted material
   // Light/day-phase gate: bits 0..7 RCOND_*, bits 8..15 min daylight 0..255.
@@ -142,10 +209,19 @@ const RSCALE_MIN_MASK  : u32 = 0x3u;   // ... the count (0 => any count >= 1)
 const RSCALE_MUL_SHIFT : u32 = 20u;    // bits 20..23: max multiplier ...
 const RSCALE_MUL_MASK  : u32 = 0xFu;   // ... in quarters, biased by 1.0x
 const RSCALE_MUL_UNIT  : u32 = 4u;
-// Reaction chance is authored per-mille but rolled in a finer denominator, so
-// that a scaled rule authored at chance 1 still resolves all 6 ramp steps
-// instead of truncating them onto 4. Must be a multiple of RSCALE_MUL_UNIT*5.
-const REACT_CHANCE_SCALE : u32 = 20u;
+// Reaction chance is authored per-mille but rolled in a finer denominator, for
+// two reasons. First, a scaled rule authored at chance 1 must still resolve all
+// 6 ramp steps instead of truncating them onto 4 — that needs the numerator to
+// carry sub-per-mille precision, so SCALE must be a multiple of
+// RSCALE_MUL_UNIT*5 (= 20). Second, per-mille bottoms out at one event per 1000
+// ticks ~= 33 s at 30 Hz, which is far too frequent for rare-event rules (a
+// once-an-hour ambient event, a slow ore vein). SCALE is the reciprocal of the
+// finest authorable step: at 2000 a rule can be authored down to 0.0005 per-
+// mille, i.e. a mean wait of ~18.5 hours of wall clock.
+//
+// ReactionGpu.chance is stored ALREADY multiplied by this, so roll sites
+// compare `rr % REACT_CHANCE_DEN < rule.chance` with no scaling in the shader.
+const REACT_CHANCE_SCALE : u32 = 2000u;
 const REACT_CHANCE_DEN   : u32 = 1000u * REACT_CHANCE_SCALE;
 
 struct TickParams {
@@ -227,7 +303,16 @@ struct RenderParams {
   sunUp      : f32,    // smoothed 0..1 daylight weight
   moonPhase  : f32,    // 0 = new, 0.5 = full
   starRot    : f32,    // radians the starfield has wheeled
-  _pdn       : f32,
+  // ---- static micro-detail (render-only) ----
+  // `tick` is the flipbook clock and `seed` keys per-cell yaw/jitter. Both are
+  // integers the sim owns, passed in here so the render bind group needs no sim
+  // uniform. A flipbook on WALL TIME would run at a different rate per machine
+  // and would not reproduce in a replay, which is why it is the tick.
+  tick       : u32,
+  seed       : u32,
+  _pdn0      : u32,
+  _pdn1      : u32,
+  _pdn2      : u32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -235,6 +320,147 @@ struct RenderParams {
 // geometry (particles, debris bodies, sprites) composites exactly against the
 // raymarched terrain. KNEAR is in voxels.
 const KNEAR : f32 = 0.4;
+
+// ---- shared raster-geometry helpers ----------------------------------------
+// Everything below is used by BOTH raster body paths — the instanced cubes in
+// debris.wgsl and the OBB brick march in microbody.wgsl. They live here rather
+// than in either file because the two paths draw the SAME limbs (a live mob's
+// arm vs the severed one lying beside it), so a lighting or palette tweak that
+// reached only one of them would show as two halves of one creature shading
+// differently. A copy cannot enforce that; a shared definition can.
+
+fn quatRotate(q : vec4f, v : vec3f) -> vec3f {
+  let t = 2.0 * cross(q.xyz, v);
+  return v + q.w * t + cross(q.xyz, t);
+}
+
+fn axisUnit(a : u32) -> vec3f {
+  if (a == 0u) { return vec3f(1.0, 0.0, 0.0); }
+  if (a == 1u) { return vec3f(0.0, 1.0, 0.0); }
+  return vec3f(0.0, 0.0, 1.0);
+}
+
+fn unpackColor(c : u32) -> vec3f {
+  return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
+}
+
+// The 3-variant palette is a property of Material (declared above), so its
+// decode belongs here rather than being re-derived by each render path.
+fn paletteColor(m : Material, state : u32) -> vec3f {
+  switch (state % 3u) {
+    case 0u: { return unpackColor(m.color0); }
+    case 1u: { return unpackColor(m.color1); }
+    default: { return unpackColor(m.color2); }
+  }
+}
+
+// ---- shared day/night lighting ---------------------------------------------
+// The key light, ambient and tonemap live HERE (not in raymarch.wgsl) because
+// the raster body paths must light with the SAME terms as the raymarched
+// terrain. Before this the raster paths used fixed daytime constants and bare
+// gamma: debris read fine at noon and glowed like a lamp at midnight.
+// raymarch.wgsl keeps thin `keyLightColor()`-style wrappers over the *P
+// versions so its many call sites stay unchanged (it binds R at module scope;
+// these take R as a parameter so any shader can call them).
+
+// Rayleigh scattering is proportional to 1/lambda^4, which is where the sky's
+// blue and the sunset's red BOTH come from. These are the relative
+// coefficients at 680/550/440 nm, normalized — the ratio is the whole look, so
+// they are derived rather than art-directed.
+const RAYLEIGH_RGB : vec3f = vec3f(0.1440, 0.3125, 0.7940);
+
+// Relative air mass along a ray leaving the ground at elevation sin(theta) = y.
+// 1.0 straight up, ~38 at the horizon. The naive 1/y diverges at y = 0; this is
+// the Kasten-Young fit, which stays finite and is accurate to well under a
+// percent across the whole range.
+fn airMass(y : f32) -> f32 {
+  let c = clamp(y, -0.02, 1.0);
+  let zdeg = degrees(acos(clamp(c, -1.0, 1.0)));
+  return 1.0 / (c + 0.50572 * pow(max(96.07995 - zdeg, 1e-3), -1.6364));
+}
+
+// Colour of direct sunlight after crossing `mass` air masses. Blue is removed
+// first (Rayleigh again), so the disc and everything it lights goes amber then
+// red as it sets. This is ONE function driving the disc, the direct lighting
+// term and the horizon glow, so they cannot disagree.
+const SUN_TRANSMIT_K : f32 = 0.09;
+fn sunTransmittance(mass : f32) -> vec3f {
+  return exp(-RAYLEIGH_RGB * mass * SUN_TRANSMIT_K * TUNE_SUN_REDDENING);
+}
+
+// Direct light: sun by day, moon by night. Returns colour x intensity;
+// callers multiply by their own N.L / shadow terms.
+fn keyLightColorP(R : RenderParams) -> vec3f {
+  let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
+               TUNE_SUN_INTENSITY;
+  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
+  let moonCol = TUNE_MOON_LIGHT_COLOR * TUNE_MOON_LIGHT_INTENSITY * moonUp *
+                (0.15 + 1.70 * R.moonPhase * R.moonPhase);
+  return mix(moonCol, sunCol, R.sunUp);
+}
+
+// Direction of the key light. A hard switch at sunUp = 0.5 rather than a
+// blend: a lerp between two directions would swing shadows wildly through
+// twilight, and at the crossover both lights are dim enough to hide the swap.
+fn keyLightDirP(R : RenderParams) -> vec3f {
+  return normalize(mix(R.moonDir, R.sunDir, step(0.5, R.sunUp)));
+}
+
+// Two-tone hemisphere ambient (cool sky above, warm bounce below), scaled to
+// a dim blue moon/starlight version at night.
+fn ambientAtP(n : vec3f, R : RenderParams) -> vec3f {
+  let base = mix(TUNE_AMB_GROUND, TUNE_AMB_SKY, n.y * 0.5 + 0.5);
+  let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
+  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
+  let moonAmt = moonUp * (0.30 + 1.40 * R.moonPhase * R.moonPhase);
+  return mix(nightAmb * (0.45 + moonAmt), base, R.sunUp);
+}
+
+// Reinhard-with-white-point applied to LUMINANCE then reapplied to the colour
+// (per-channel Reinhard desaturates: saturated ember orange comes out tan),
+// with a controlled per-channel blend at the very top so genuinely hot cores
+// bleach toward white like real blackbody progression. Includes the output
+// gamma — this is the LAST thing a fragment shader does. See the long-form
+// rationale where this lived originally (raymarch.wgsl fs history).
+fn tonemapHdr(colorIn : vec3f) -> vec3f {
+  const WHITE : f32 = TUNE_EXPOSURE_WHITE;
+  let color = max(colorIn, vec3f(0.0));
+  let lum = max(dot(color, vec3f(0.2126, 0.7152, 0.0722)), 1e-5);
+  let mapped = (lum * (1.0 + lum / (WHITE * WHITE))) / (1.0 + lum);
+  let hueKept = color * (mapped / lum);
+  let perCh = (color * (1.0 + color / (WHITE * WHITE))) / (1.0 + color);
+  let bleach = clamp(mapped * mapped * mapped * TUNE_BLEACH_AMOUNT, 0.0,
+                     TUNE_BLEACH_AMOUNT);
+  return pow(mix(hueKept, perCh, bleach), vec3f(1.0 / TUNE_GAMMA));
+}
+
+// Key-light lambert + hemisphere ambient + emissive + distance fog for raster
+// geometry, in the same linear HDR space as the terrain. Callers MUST run the
+// result through tonemapHdr() — bare gamma clips the highlights and drifts
+// from the raymarched look in both directions.
+fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+            R : RenderParams) -> vec3f {
+  let lambert = max(dot(n, keyLightDirP(R)), 0.0);
+  var c = albedo * (ambientAtP(n, R) + keyLightColorP(R) * lambert);
+  c += albedo * emission * 1.7;
+  let dist = length(worldPos - R.camPos);
+  let fog = 1.0 - exp(-dist * VOXEL_METERS * 0.0128);
+  // cheap sky tint for fog, dimmed through the night like the real sky (a
+  // fixed day-blue tint here was a second source of midnight glow)
+  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
+  let fogTint = vec3f(0.55, 0.65, 0.85) *
+                mix(0.015 + 0.05 * moonUp * R.moonPhase, 1.0, R.sunUp);
+  return mix(c, fogTint, fog);
+}
+
+// Emissive voxels (embers on burning debris, lava) pulse rather than sitting at
+// a flat value. `hash` is a per-voxel phase key so neighbours don't blink in
+// lockstep; every raster path must use the SAME rate or a severed limb flickers
+// out of step with the corpse it came off.
+fn emberFlicker(emission : f32, hash : u32, time : f32) -> f32 {
+  if (emission <= 0.0) { return emission; }
+  return emission * (0.82 + 0.28 * sin(time * 9.0 + f32(hash & 0xFFu) * 0.0245));
+}
 
 // Camera-basis projection for raster geometry — no matrices; identical math to
 // the raymarcher's ray construction, so depth agrees across both paths.
@@ -413,7 +639,21 @@ fn farOccIndex(level : u32, c : vec3<i32>) -> u32 {
 // chunks with zero blockers, so smoke/steam plumes stay cheap to shadow.
 // Writers: sim_occupancy (both entries), worldgen genChunk, stream.cpp
 // FillSlots (CPU). Readers must mask; the raw word is not a count.
+// MICRO MATERIALS ARE NOT BLOCKERS, and this exclusion is load-bearing rather
+// than cosmetic. A grass cell is mostly air: a ray that enters it usually
+// misses the blades and has to CONTINUE. The blocker count exists so a shadow
+// ray can skip a whole chunk in one step, and a chunk full of grass would
+// otherwise report itself as solid and terminate every shadow ray at the
+// meadow surface — a field of grass would cast the shadow of a wall.
+//
+// Safe for determinism because occupancy is derived, render-only data: it is
+// written by sim_occupancy/worldgen and read ONLY by the renderer and by CPU
+// streaming decisions. No sim kernel reads it, and the world hash does not
+// cover it (see the hash comment in sim_occupancy.wgsl). The `total` count is
+// deliberately left alone — a grass voxel IS present, and streaming/save
+// worthiness keys off that.
 fn isRayBlocker(m : Material) -> bool {
+  if ((m.flags & MATF_MICRO) != 0u) { return false; }
   return m.klass == CLASS_SOLID || m.klass == CLASS_POWDER ||
          (m.klass == CLASS_LIQUID && (m.flags & MATF_OPAQUE) != 0u);
 }

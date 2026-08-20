@@ -109,11 +109,14 @@ add_executable(sandvox
   src/sim/materials.cpp
   src/sim/tuning.cpp
   src/sim/voxload.cpp
+  src/sim/microvox.cpp
+  src/sim/microbody.cpp
   src/game/player.cpp
   src/game/camera.cpp
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  src/game/anim.cpp
   src/phys/physics.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp

@@ -511,6 +511,61 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
   ManageTerrain(tick, world);
 }
 
+namespace {
+
+// Collapse a MICRO-unit voxel set (scale micro voxels per world voxel) down to
+// world voxels, one output voxel per scale^3 block. A block that is less than
+// half full becomes air, and a block that survives takes its most common
+// material — so a scale-2 critter leg settles as the solid 3x1x1 stub it
+// visually is, rather than as a 6x2x2 lump at twice its real size.
+//
+// The vote is a linear scan over a tiny fixed array rather than a map: a limb
+// block holds at most scale^3 (8 or 64) voxels and realistically one or two
+// distinct materials, and at those sizes a hash map is all overhead. Past
+// kMaxDistinct materials in one block the first-seen ones win, which is
+// invisible — no authored limb has eight materials in a 2x2x2 box.
+std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
+                                         uint32_t scale) {
+  const int s = (int)scale;
+  const uint32_t full = (uint32_t)(s * s * s);
+  constexpr int kMaxDistinct = 8;
+  struct Blk {
+    uint32_t count = 0;
+    int n = 0;
+    uint16_t mat[kMaxDistinct]{};
+    uint32_t hits[kMaxDistinct]{};
+  };
+  std::unordered_map<uint64_t, Blk> blocks;
+  for (const DebrisVoxel& v : src) {
+    // DebrisVoxel coords are non-negative by construction (bodies are rebased
+    // to their min corner), so a plain divide is the block index.
+    uint64_t key = ((uint64_t)(uint8_t)((int)v.x / s) << 32) |
+                   ((uint64_t)(uint8_t)((int)v.y / s) << 16) |
+                   (uint8_t)((int)v.z / s);
+    Blk& blk = blocks[key];
+    blk.count++;
+    int k = 0;
+    for (; k < blk.n; k++)
+      if (blk.mat[k] == v.payload) break;
+    if (k == blk.n && blk.n < kMaxDistinct) blk.mat[blk.n++] = v.payload;
+    if (k < kMaxDistinct) blk.hits[k]++;
+  }
+
+  std::vector<DebrisVoxel> out;
+  out.reserve(blocks.size());
+  for (const auto& [key, blk] : blocks) {
+    if (blk.count * 2 < full) continue;  // majority-fill: mostly air -> air
+    int best = 0;
+    for (int k = 1; k < blk.n; k++)
+      if (blk.hits[k] > blk.hits[best]) best = k;
+    out.push_back({(int8_t)(uint8_t)(key >> 32), (int8_t)(uint8_t)(key >> 16),
+                   (int8_t)(uint8_t)key, 0, blk.mat[best]});
+  }
+  return out;
+}
+
+}  // namespace
+
 void DebrisSystem::SettleBodies(uint32_t tick, World& world,
                                 std::vector<CellOp>& cellOps) {
   constexpr uint32_t kSettleAfterTicks = 60;   // 2 s asleep before converting
@@ -550,9 +605,19 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     }
     if (!aligned) continue;
 
+    // ---- micro -> world downsample (PLAN §C, one body, only on settle) ----
+    // A micro body's voxels are in 1/scale units; the GRID has no such thing.
+    const std::vector<DebrisVoxel>* settleSrc = &b.voxels;
+    std::vector<DebrisVoxel> downsampled;
+    if (b.micro.scale > 1) {
+      downsampled = DownsampleMicro(b.voxels, b.micro.scale);
+      if (downsampled.empty()) continue;  // nothing survives: stay a body
+      settleSrc = &downsampled;
+    }
+
     // whole body must land inside the residency window, and this tick's op
     // budget must hold every voxel — partial settles would lose matter
-    if (cellOps.size() + b.voxels.size() > kMaxCellOpsPerTick) continue;
+    if (cellOps.size() + settleSrc->size() > kMaxCellOpsPerTick) continue;
 
     // snapped basis is a lattice bijection: with the body origin rounded to a
     // cell corner, voxel centers land on distinct cells — no self-collisions.
@@ -560,7 +625,7 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
                (int)std::lround(b.xf.pos.z)};
     bool inWindow = true;
     size_t opsStart = cellOps.size();
-    for (const DebrisVoxel& v : b.voxels) {
+    for (const DebrisVoxel& v : *settleSrc) {
       float lx = (float)v.x + 0.5f, ly = (float)v.y + 0.5f, lz = (float)v.z + 0.5f;
       IVec3 cell{
           base.x + ifloor(snap[0][0] * lx + snap[0][1] * ly + snap[0][2] * lz),
@@ -629,7 +694,16 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     Body& b = bodies_[bi];
     uint32_t n = (uint32_t)b.voxels.size();
     bool active = b.activeCount > 0;
-    if (n == 0 || scanBudget == 0 || (!active && b.pairCount == 0) ||
+    // MICRO BODIES DO NOT BURN (v1). Two independent reasons, both structural:
+    // this pass maps body-local voxel coords straight onto WORLD cells (a
+    // micro voxel is 1/scale of one), and it removes voxels from b.voxels —
+    // but the micro renderer marches a brick SHARED by every instance of the
+    // def, so a per-body edit is invisible and a copy-on-write pool is
+    // explicitly out of scope for v1 (PLAN §C). Skipping is the honest
+    // behaviour; the alternative is a limb that burns away in physics and not
+    // on screen. Same reasoning excludes them from SplitBody below.
+    if (n == 0 || scanBudget == 0 || b.micro.Valid() ||
+        (!active && b.pairCount == 0) ||
         (!active && !AnyDirtyNear(b, snap, world))) {
       bi++;
       continue;
@@ -742,7 +816,9 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         uint32_t kind = r.packed & 3u;
         uint32_t dmask = (r.packed >> 2u) & 7u;
         uint32_t rr = Hash3(b.serial * 0x9E3779B9u + vi, tick, ri);
-        if (rr % 1000u >= r.chance) continue;  // one roll per rule, GPU-style
+        // one roll per rule, GPU-style — chance is in 1/kReactChanceDen units,
+        // so this must use the same denominator sim_step.wgsl rolls against
+        if (rr % kReactChanceDen >= r.chance) continue;
         bool fired = false;
 
         if (kind == kReactDecay) {
@@ -1055,7 +1131,7 @@ void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels) {
 }
 
 void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
-                             const BodyTransform& xf) {
+                             const BodyTransform& xf, MicroBodyRef micro) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
@@ -1068,7 +1144,13 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
   }
   float ex = (float)(mx.x - mn.x + 1), ey = (float)(mx.y - mn.y + 1),
         ez = (float)(mx.z - mn.z + 1);
-  body.radiusVoxels = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) + 2.0f;
+  // Micro rendering comes in with the body (PLAN §C4): a severed microvoxel
+  // limb keeps its detail with no mob-specific code here, because the caller
+  // hands over what it already knows. The extents above are in MICRO units for
+  // such a body, so the radius divides by the scale — the +2 slack does not.
+  body.micro = micro;
+  body.radiusVoxels =
+      0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) / (float)micro.scale + 2.0f;
   body.serial = nextSerial_++;
   RecountBurn(body);
   bodies_.push_back(std::move(body));
@@ -1082,6 +1164,11 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     if (bodies_[bi].handle == handle) break;
   if (bi == bodies_.size()) return false;
   Body& b = bodies_[bi];
+  // Micro bodies are not cuttable in v1: both halves would need their own
+  // brick, and the pool holds per-DEF models shared across instances (see the
+  // BurnBodies note). The laser passes through instead of silently producing
+  // two wrongly-scaled cube bodies.
+  if (b.micro.Valid()) return false;
   phys_->GetTransform(b.handle, b.xf);
 
   // plane into body-local space (conjugate rotation)
@@ -1321,6 +1408,10 @@ void DebrisSystem::PostStep() {
 void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
   out.clear();
   for (size_t bi = 0; bi < bodies_.size() && bi < kMaxBodies; bi++) {
+    // Micro bodies draw through the OBB/brick-march pass instead. They still
+    // OWN their slot (the two passes share bodyXforms), they just contribute
+    // no cube instances — emitting both would double-draw at the wrong size.
+    if (bodies_[bi].micro.Valid()) continue;
     for (const DebrisVoxel& v : bodies_[bi].voxels) {
       if (out.size() >= kMaxBodyVoxInstances) break;
       out.push_back({(float)v.x, (float)v.y, (float)v.z,
@@ -1342,6 +1433,12 @@ void DebrisSystem::BuildXforms(std::vector<BodyXformGpu>& out) const {
     std::memcpy(x.quat, b.xf.quat, sizeof(x.quat));
     out.push_back(x);
   }
+}
+
+void DebrisSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
+  for (size_t i = 0; i < bodies_.size() && i < kMaxBodies; i++)
+    if (bodies_[i].micro.Valid())
+      out.push_back({(uint32_t)i, bodies_[i].micro.model, 0, 0});
 }
 
 uint32_t DebrisSystem::ActiveBodyCount() const {

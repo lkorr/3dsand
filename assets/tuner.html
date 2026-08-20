@@ -4,6 +4,27 @@
 <meta charset="utf-8">
 <title>sandvox tuner</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+
+<!-- Import map for the Models tab's vendored three.js. It MUST appear before
+     any module script in the document, which is why it sits up here rather
+     than beside the loader at the bottom.
+
+     Paths are RELATIVE (no leading slash) so the page keeps working whether it
+     is served from / by tuner_server.py, opened inside pywebview, or loaded
+     straight off disk. three@0.180.0 is pinned and vendored under
+     assets/editor/vendor/ (with its MIT LICENSE); three.module.js pulls in
+     three.core.js by a relative import of its own, so only the two bare
+     specifiers below need mapping. Note the trailing slash on BOTH sides of
+     the "three/addons/" entry — without it the prefix does not match. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./editor/vendor/three.module.js",
+    "three/addons/": "./editor/vendor/"
+  }
+}
+</script>
+
 <style>
   :root{
     --bg:#0e1116; --bg2:#141922; --card:#1a2029; --card2:#1f2733;
@@ -378,6 +399,153 @@
     font-family:var(--mono);font-size:11.5px;line-height:1.5;color:#aeb8c8;
   }
   #buildPanel pre .e{color:var(--red)}
+
+  /* ---------- models (voxel editor) ---------- */
+  .edbar{margin-bottom:8px}
+  .btngroup{display:flex;gap:0}
+  .btngroup button{border-radius:0;margin-left:-1px}
+  .btngroup button:first-child{border-radius:6px 0 0 6px;margin-left:0}
+  .btngroup button:last-child{border-radius:0 6px 6px 0}
+  .btngroup button.on{background:#1d3a6e;border-color:#2c5cb0;color:#dce8ff;z-index:1}
+  /* The mode indicator is deliberately loud: attach/erase/paint are modal and
+     an unnoticed mode is the #1 way to wreck a model. */
+  .medind{
+    font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.8px;
+    padding:4px 10px;border-radius:6px;border:1px solid;min-width:74px;text-align:center;
+  }
+  .medind.attach{color:#9ec8ff;border-color:#2c5cb0;background:#16283a}
+  .medind.erase{color:#ff9d9d;border-color:#6d2b2b;background:#341818}
+  .medind.paint{color:#e8c477;border-color:#57451e;background:#2a2314}
+  .matchip{width:18px;height:18px;border-radius:4px;border:1px solid var(--line2);display:inline-block;flex:none}
+  .edstatus{font-family:var(--mono)}
+
+  .edpalette{
+    display:flex;flex-wrap:wrap;gap:3px;margin-bottom:8px;padding:6px;
+    background:var(--card);border:1px solid var(--line);border-radius:8px;
+  }
+  .msw-cell{
+    width:22px;height:22px;padding:0;border-radius:4px;border:1px solid #00000060;
+    box-shadow:0 0 0 1px #ffffff12;cursor:pointer;
+  }
+  .msw-cell:hover{border-color:var(--acc)}
+  .msw-cell.on{box-shadow:0 0 0 2px var(--acc);border-color:var(--acc)}
+
+  .edviewport{
+    position:relative;width:100%;height:calc(100vh - 340px);min-height:340px;
+    background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:hidden;
+  }
+  .edcanvas{display:block;width:100%;height:100%;outline:none;cursor:crosshair}
+  .edhelp{margin-top:6px;display:block}
+
+  /* ---------- models: rig panel + timeline ---------- */
+  .edmain{display:flex;gap:10px;align-items:stretch}
+  .edmain .edviewport{flex:1;min-width:0}
+  .edside{
+    width:320px;flex:none;overflow-y:auto;max-height:calc(100vh - 340px);
+    background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+  }
+  .righdr{
+    display:flex;align-items:center;gap:8px;margin:10px 0 6px;
+    color:var(--dim);font-family:var(--mono);font-size:11.5px;
+    text-transform:uppercase;letter-spacing:.6px;
+    border-bottom:1px solid var(--line);padding-bottom:4px;
+  }
+  .righdr:first-child{margin-top:0}
+  .riglist{display:flex;flex-direction:column;gap:2px}
+  .rigrow{
+    display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:5px;
+    cursor:pointer;font-size:12.5px;font-family:var(--mono);
+  }
+  .rigrow:hover{background:#1e2530}
+  .rigrow.on{background:#1d3a6e;color:#dce8ff}
+  .rigrow .rigdim{color:var(--faint);font-size:10.5px;min-width:56px}
+  .rigrow input.id{flex:1;min-width:0}
+  .rigdot{width:6px;height:6px;border-radius:50%;background:var(--amber);flex:none}
+  .rigbody{padding:4px 4px 10px 10px;border-left:2px solid var(--line2);margin:2px 0 6px}
+  .rigf{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:12px}
+  .rigf>span{color:var(--dim);min-width:104px;flex:none}
+  .rigf>i{color:var(--faint);font-size:10.5px;font-style:normal;flex:1}
+  .rigf input.num{width:64px}
+  .rigf input[type=range]{flex:1;accent-color:var(--acc)}
+  .rigvec{display:flex;gap:3px}
+  .rigvec input{width:52px}
+  .rignote{color:var(--faint);font-size:11.5px;line-height:1.5;margin:4px 0 6px}
+  .rigbtns{display:flex;gap:5px;flex-wrap:wrap;margin:6px 0}
+  .rigerr{color:var(--red);font-size:11px;font-style:normal;display:block;margin:-2px 0 4px 110px}
+  input.cell.bad{border-color:var(--red);background:#2a1414}
+  .edside button.on{background:#1d3a6e;border-color:#2c5cb0;color:#dce8ff}
+
+  .edtimeline{
+    margin-top:8px;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;padding:7px 9px;
+  }
+  .tagbar{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+  .tagbar button.on{background:#1d3a6e;border-color:#2c5cb0;color:#dce8ff}
+  .framestrip{display:flex;gap:4px;overflow-x:auto;padding-bottom:4px}
+  .frame{
+    flex:none;width:60px;display:flex;flex-direction:column;align-items:center;gap:2px;
+    padding:4px;border:1px solid var(--line2);border-radius:6px;background:#12161e;
+    cursor:pointer;font-family:var(--mono);
+  }
+  .frame:hover{border-color:var(--acc)}
+  .frame.on{border-color:var(--acc);background:#16283a;box-shadow:0 0 0 1px var(--acc)}
+  .frame.drop{border-color:var(--green);background:#14240f}
+  .frame .fnum{font-size:9.5px;color:var(--faint)}
+  .frame .fthumb{width:40px;height:40px;image-rendering:pixelated;background:#0b0e13;border-radius:3px}
+  .frame .fname{
+    font-size:9.5px;color:var(--dim);max-width:52px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;
+  }
+  .frame .fms{
+    width:48px;text-align:center;font-size:10px;padding:1px 2px;
+    background:#0b0e13;border:1px solid #262e3c;border-radius:3px;color:var(--fg);
+    font-family:var(--mono);
+  }
+  .frame .fms.ro{border-color:transparent;background:none;color:var(--faint)}
+  .framadd{
+    flex:none;width:32px;align-self:stretch;border-radius:6px;
+    background:var(--card2);border:1px dashed var(--line2);color:var(--dim);cursor:pointer;
+  }
+  .framadd:hover{border-color:var(--acc);color:var(--fg)}
+
+  /* ---------- clip keyframe lane ---------- */
+  .clipprops{
+    display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:6px 0;
+    padding:6px 8px;background:#12161e;border:1px solid #262e3c;border-radius:6px;
+  }
+  .clipprops .rigf{margin-bottom:0}
+  .clipprops .rigf>span{min-width:auto}
+  .clipmask{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin:4px 0}
+  .clipmask button{opacity:.55}
+  .clipmask button.on{opacity:1;background:#1d3a6e;border-color:#2c5cb0;color:#dce8ff}
+  .clipscrubwrap{display:flex;gap:8px;align-items:center;margin:6px 0 2px}
+  .cliplane{
+    position:relative;height:22px;background:#12161e;border:1px solid #262e3c;
+    border-radius:4px;cursor:crosshair;flex:none;
+  }
+  .cliplane.keys{height:16px;background:#0f131a;cursor:default}
+  .ctick{position:absolute;top:0;bottom:0;width:1px;background:#2a3240}
+  .ctick i{
+    position:absolute;top:1px;left:2px;font-style:normal;font-size:9px;
+    color:var(--faint);font-family:var(--mono);
+  }
+  .ccursor{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--amber);
+    box-shadow:0 0 5px var(--amber);pointer-events:none}
+  .cliprows{display:flex;flex-direction:column;gap:2px;margin-top:2px}
+  .cliprow{display:flex;align-items:center;gap:6px}
+  .cliprow.on .cliplbl{color:var(--acc)}
+  .cliplbl{
+    width:88px;flex:none;font-family:var(--mono);font-size:11px;color:var(--dim);
+    cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .cliplbl:hover{color:var(--fg)}
+  /* keys are diamonds: rotated squares centred on their time */
+  .ckey{
+    position:absolute;top:3px;width:9px;height:9px;margin-left:-4.5px;
+    background:#6ea8fe;border:1px solid #2c5cb0;transform:rotate(45deg);cursor:pointer;
+  }
+  .ckey:hover{background:#9ec8ff}
+  .ckey.on{background:var(--amber);border-color:#a5751f;box-shadow:0 0 6px var(--amber)}
 </style>
 </head>
 <body>
@@ -403,6 +571,7 @@
   <button data-tab="reactions">Reactions</button>
   <span class="tabsep"></span>
   <button data-tab="tuning">Tuning</button>
+  <button data-tab="models">Models</button>
 </nav>
 
 <main>
@@ -481,7 +650,7 @@
       <button id="btnAddNote">+ note</button>
       <button id="btnAddRule">+ rule</button>
     </div>
-    <div class="hint" style="margin:-4px 0 10px">file order matters: rules for the same <i>self</i> are tried top-down, at most one fires per cell per tick. chance is &permil; per 30&thinsp;Hz tick.</div>
+    <div class="hint" style="margin:-4px 0 10px">file order matters: rules for the same <i>self</i> are tried top-down, at most one fires per cell per tick. chance is &permil; per 30&thinsp;Hz tick, and may be fractional &mdash; 1&permil; is a ~33&thinsp;s mean wait, 0.01&permil; is ~55&thinsp;min, and the floor is 0.0005&permil;.</div>
     <div class="sortnote" id="rxSortNote">&#9888; <div><b>Sorted view &mdash; display only.</b> The file is untouched and rule priority is unchanged. Reorder buttons are disabled here; switch back to <b>file order</b> to move rules.</div></div>
     <div class="rxlist" id="rxList"></div>
   </section>
@@ -502,6 +671,9 @@
     </div>
     <div id="tuneGroups"></div>
   </section>
+
+  <!-- MODELS (voxel editor; assets/editor/editor.js fills this in) -->
+  <section class="view" id="view-models"></section>
 </main>
 
 <div id="valbar">
@@ -538,6 +710,11 @@ let tuneBase=null;
 // True when served by scripts/tuner_server.py (auto-load + Build/Play).
 // Declared here because updatePills() reads it well before the probe runs.
 let server=false;
+// Unsaved edits in the Models tab. Declared up here for the same reason as
+// `server`: updatePills() and beforeunload read it long before the editor
+// module has loaded, and a `let` further down would be in the temporal dead
+// zone at that point.
+let modelsDirty=false;
 // Per-parameter history, keyed "group.key".
 //   tunePrev  — the value immediately before the most recent edit (green chip)
 //   tuneSaved — the value as of the last save (red chip)
@@ -629,11 +806,13 @@ function updatePills(){
   const set=(id,loaded,d)=>{const p=$(id);p.classList.toggle('loaded',loaded&&!d);p.classList.toggle('dirty',d);};
   set('#pillMat',!!mat,dirty.mat);set('#pillRx',!!rx,dirty.rx);
   set('#pillTune',!!tune,dirty.tune);
-  $('#btnSave').disabled=!(dirty.mat||dirty.rx||dirty.tune);
+  $('#btnSave').disabled=!(dirty.mat||dirty.rx||dirty.tune||modelsDirty);
   $('#btnCopy').disabled=!(mat||rx||tune);
   $('#btnReload').disabled=!(server||(matHandle&&rxHandle));
 }
-window.addEventListener('beforeunload',e=>{if(dirty.mat||dirty.rx||dirty.tune){e.preventDefault();e.returnValue='';}});
+window.addEventListener('beforeunload',e=>{
+  if(dirty.mat||dirty.rx||dirty.tune||modelsDirty){e.preventDefault();e.returnValue='';}
+});
 
 /* ================= file I/O ================= */
 async function openFolder(){
@@ -747,9 +926,13 @@ function bindNum(obj,key,which,opts={}){
   inp.value=obj[key]??'';
   if(opts.min!=null)inp.min=opts.min; if(opts.max!=null)inp.max=opts.max;
   if(opts.ph)inp.placeholder=opts.ph;
+  if(opts.step!=null)inp.step=opts.step;
   inp.addEventListener('input',()=>{
     const v=inp.value.trim();
-    if(v==='')delete obj[key];else obj[key]=Math.round(+v);
+    // opts.float keeps fractional input intact — reaction chance is authored in
+    // per-mille but may go far below 1 for rare-event rules, so rounding it to
+    // an integer here would silently clamp 0.01 to 0 (or to 1, 100x too fast).
+    if(v==='')delete obj[key];else obj[key]=opts.float?+v:Math.round(+v);
     touch(which);opts.oninput?.(obj[key]);
   });
   return inp;
@@ -823,12 +1006,37 @@ function rxTouching(m){ // reactions involving material m directly or via its ta
 }
 
 /* ================= chance math ================= */
+// kReactChanceScale in src/sim/materials.h — chances are authored in per-mille
+// but compiled into 1/(1000*SCALE) units, so they may be fractional. CHANCE_MIN
+// is the finest step that survives that quantization.
+const CHANCE_SCALE=2000, CHANCE_MIN=1/CHANCE_SCALE;
 const perSec=c=>1-Math.pow(1-Math.min(c,1000)/1000,30);
+// Mean wait for a per-mille chance at 30 Hz, phrased in whatever unit reads
+// naturally — sub-per-mille rules have waits measured in hours, and "3333.3s"
+// is not a number anyone can feel.
+function meanWait(c){
+  const s=1000/c/30;
+  if(s<90)return`${s.toFixed(1)}s`;
+  if(s<5400)return`${(s/60).toFixed(1)}min`;
+  if(s<172800)return`${(s/3600).toFixed(1)}h`;
+  return`${(s/86400).toFixed(1)}d`;
+}
+// Enough decimals to show the value, not more: 12 stays "12", 0.0005 does not
+// collapse to "0.00" the way a fixed 2-decimal format would.
+function fmtMille(v){
+  if(v===0)return'0';
+  const dp=v>=1?2:v>=0.01?4:5;
+  return(+v.toFixed(dp)).toString();
+}
 function chanceHint(r){
   const c=r.chance??0;
   if(!c)return'—';
-  if(r.decay)return`~${(1000/c/30).toFixed(1)}s life`;
-  return`~${Math.round(perSec(c)*100)}%/s`;
+  if(r.decay)return`~${meanWait(c)} life`;
+  // below ~1%/s the percentage rounds to 0 and tells you nothing; the mean
+  // wait is the useful readout for exactly the rare rules this range exists for
+  const ps=perSec(c);
+  if(ps<0.01)return`~${meanWait(c)} wait`;
+  return`~${Math.round(ps*100)}%/s`;
 }
 
 /* ================= tabs ================= */
@@ -837,7 +1045,7 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     activeTab=b.dataset.tab;
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
-    if((mat&&rx)||activeTab==='tuning')renderAll();
+    if((mat&&rx)||activeTab==='tuning'||activeTab==='models')renderAll();
   });
 });
 function gotoReactions(filter){
@@ -1043,7 +1251,7 @@ const GROUPLABEL={
   neighbor:r=>ruleKind(r)==='pair'?(r.neighbor||'(none)'):'(no neighbor — '+ruleKind(r)+')',
   product:r=>ruleProducts(r)[0]||'(no product)',
   kind:r=>({pair:'pair — self + neighbor',decay:'decay',emit:'emit'})[ruleKind(r)],
-  chance:r=>{const c=r.chance??0;return c>=500?'500–1000‰ (very likely)':c>=100?'100–499‰':c>=10?'10–99‰':'1–9‰ (rare)';},
+  chance:r=>{const c=r.chance??0;return c>=500?'500–1000‰ (very likely)':c>=100?'100–499‰':c>=10?'10–99‰':c>=1?'1–9‰ (rare)':c>=0.1?'0.1–1‰ (very rare)':'<0.1‰ (ambient)';},
 };
 
 function renderReactions(){
@@ -1185,7 +1393,7 @@ function ruleRow(r,i,num,hidden,sorted){
   // chance
   const cw=el('div',{class:'chancewrap'});
   const sub=el('div',{class:'sub'},chanceHint(r));
-  const ci=bindNum(r,'chance','rx',{min:1,max:1000,oninput:()=>{
+  const ci=bindNum(r,'chance','rx',{min:CHANCE_MIN,max:1000,step:'any',float:true,oninput:()=>{
     sub.textContent=chanceHint(r);
     det._syncCond?.();  // the neighbour-scaling ramp is drawn from chance
   }});
@@ -1251,12 +1459,15 @@ const SCALE_MUL_MIN=1, SCALE_MUL_MAX=4.75;  // kScaleMulMin/Max in materials.h
 // The exact integer ramp sim_step.wgsl's scaledChance() computes, in per-mille
 // (it works in a finer denominator internally; this divides back out so the
 // numbers read against the authored "chance ‰"). Count 0 is always a hard 0.
+// The quantization to CHANCE_SCALE units mirrors what materials.cpp compiles,
+// so the preview shows the rate the sim will actually run at.
 function scaledChanceAt(chance,scaleMax,count,minCount){
   if(count<Math.max(1,minCount||1))return 0;
-  const SCALE=20, UNIT=4;                       // REACT_CHANCE_SCALE, RSCALE_MUL_UNIT
+  const UNIT=4;                                 // RSCALE_MUL_UNIT
+  const units=Math.max(1,Math.round(chance*CHANCE_SCALE));  // as materials.cpp
   const maxQ=Math.round(scaleMax*UNIT), span=maxQ-UNIT;
-  const num=chance*SCALE*(UNIT*5+span*(count-1));
-  return Math.min(Math.floor(num/(UNIT*5)),1000*SCALE)/SCALE;
+  const num=units*(UNIT*5+span*(count-1));
+  return Math.min(Math.floor(num/(UNIT*5)),1000*CHANCE_SCALE)/CHANCE_SCALE;
 }
 function condPanel(r,kind){
   const box=el('div',{class:'condbox'});
@@ -1391,7 +1602,7 @@ function condPanel(r,kind){
     ramp.innerHTML='';
     vals.forEach((v,i)=>{
       const b=el('div',{class:'b'+(v>0?' on':' zero'),
-        title:`${i} neighbour${i===1?'':'s'} → ${v?v.toFixed(2)+'‰':'never fires'}`});
+        title:`${i} neighbour${i===1?'':'s'} → ${v?fmtMille(v)+'‰':'never fires'}`});
       b.style.height=(v>0?Math.max(3,Math.round(v/peak*34)):3)+'px';
       ramp.append(b);
     });
@@ -1407,7 +1618,7 @@ function condPanel(r,kind){
       : `At 0 it CANNOT fire; at 1 it runs at the base ${base||'?'}‰`;
     why.textContent=
       `Counts how many of the 6 face neighbours are ${not}${nbName}. `+gate+
-      `; at 6 it runs ${smax}× that (${vals[6].toFixed(2)}‰). `+
+      `; at 6 it runs ${smax}× that (${fmtMille(vals[6])}‰). `+
       (ref?`Because ${r.self} counts neighbours that are NOT ${r.self}, this is a frontier rule: `
           +`voxels deep inside a mass of ${r.self} are fully surrounded and can never fire, while ones `
           +`at the surface or against a wall fire fastest — and each conversion raises its neighbours’ odds, so the front creeps inward.`
@@ -1524,7 +1735,9 @@ function validate(){
     const at=`reaction #${n} (${r.self})`;
     if(!idset.has(r.self))err(`${at}: self "${r.self}" is not a material`);
     if(r.chance==null)err(`${at}: missing chance`);
-    else if(r.chance<1||r.chance>1000)err(`${at}: chance ${r.chance} outside 1..1000‰`);
+    else if(r.chance<CHANCE_MIN||r.chance>1000)err(`${at}: chance ${r.chance} outside ${CHANCE_MIN}..1000‰`);
+    else if(Math.abs(r.chance*CHANCE_SCALE-Math.round(r.chance*CHANCE_SCALE))>1e-6)
+      warn(`${at}: chance ${r.chance}‰ quantizes to ${(Math.round(r.chance*CHANCE_SCALE)/CHANCE_SCALE)}‰ (steps of ${CHANCE_MIN}‰)`);
     const kind=ruleKind(r);
     if(kind==='decay'){
       if(!validRef(r.becomes))err(`${at}: becomes "${r.becomes}" unknown`);
@@ -2007,6 +2220,10 @@ function renderAll(){
   // Tuning is independent of materials/reactions: it must render even when only
   // tuning.json has been loaded.
   if(activeTab==='tuning'){renderTuning();return;}
+  // Models owns its own DOM and its own render loop; renderAll's job is only to
+  // hand it the tab-activation edge. It renders fine with no materials loaded
+  // (the palette is simply empty), so it returns before the mat/rx guard.
+  if(activeTab==='models'){modelsActivate();return;}
   if(!mat||!rx)return;
   if(activeTab==='overview')renderOverview();
   else if(activeTab==='materials')renderMaterials();
@@ -2056,6 +2273,94 @@ $('#btnAddNote').addEventListener('click',()=>{
   rx.reactions.push({note:'-------- new section --------'});
   $('#rxFilter').value='';touch('rx');renderReactions();
   window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
+});
+
+/* ================= models tab bridge =================
+   assets/editor/editor.js is an ES module and loads asynchronously, so this
+   half of the wiring is plain functions the module calls into once it is
+   ready. Everything here degrades to a no-op if the module never loads (no
+   WebGL, a stale checkout, a file:// page with no import-map support) —
+   the other four tabs must not care.                                        */
+
+let modelsApi=null;          // set by the module once it has imported cleanly
+let modelsPending=false;     // tab was activated before the module arrived
+
+// The editor's own materials view: mat.materials in ID order, so array index i
+// is GPU material ID i+1 — exactly what the "id#" column prints. Returning a
+// live reference is fine because the editor only reads it.
+function modelsMaterials(){return mat?.materials||[];}
+
+function modelsSetDirty(d){
+  modelsDirty=!!d;
+  // updatePills() already folds modelsDirty into the Save button and the
+  // beforeunload guard; going through it keeps one definition of "dirty".
+  updatePills();
+}
+
+function modelsActivate(){
+  if(modelsApi)modelsApi.activate();
+  else modelsPending=true;
+}
+
+// Called by the module when it finishes importing.
+window.__tunerRegisterModels=api=>{
+  modelsApi=api;
+  if(modelsPending){modelsPending=false;api.activate();}
+};
+window.__tunerModelsHooks={
+  el, toast, materials:modelsMaterials, onDirty:modelsSetDirty,
+  section:$('#view-models'),
+};
+
+// Ctrl+S on the Models tab saves the model, not the JSON files.
+document.addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'&&activeTab==='models'&&modelsApi){
+    e.preventDefault();e.stopImmediatePropagation();modelsApi.saveFromHost();
+  }
+},true);
+</script>
+
+<!-- The voxel editor, loaded as a module so it can import the vendored three.js
+     through the import map above. Deferred by nature (type=module), and every
+     failure path is caught: a browser without WebGL, a missing vendor file, or
+     an import-map-less browser all leave the other four tabs untouched and put
+     a readable message in the Models pane instead. -->
+<script type="module">
+import * as editor from './editor/editor.js';
+try{
+  editor.attach(window.__tunerModelsHooks);
+  // The rig/timeline layer is optional: if it fails to import, the voxel
+  // editor still works and simply has no parts panel or timeline.
+  try{
+    const rig=await import('./editor/rig.js');
+    editor.attachRig(rig.hooks);
+    rig.attach(window.__tunerModelsHooks);
+  }catch(e){
+    console.error('rig layer failed to load',e);
+  }
+  window.__tunerRegisterModels(editor);
+}catch(e){
+  console.error('models tab failed to initialise',e);
+  const s=document.querySelector('#view-models');
+  if(s)s.textContent='the model editor failed to load: '+(e.message||e);
+}
+</script>
+<script>
+// If the module above never ran (no import-map support, a 404 on a vendor
+// file, a syntax error) the Models pane would sit empty with no explanation.
+// This runs after it and only speaks up when nothing registered.
+window.addEventListener('load',()=>{
+  setTimeout(()=>{
+    const s=document.querySelector('#view-models');
+    if(!modelsApi&&s&&!s.childElementCount){
+      s.innerHTML='';
+      s.append(el('div',{class:'banner'},'⚠',el('div',{},
+        'The model editor did not load. It needs a browser with ES module and ' +
+        'import-map support (Chrome/Edge 89+, Firefox 108+) and the vendored ' +
+        'three.js under assets/editor/vendor/. Everything else in the tuner ' +
+        'works normally.')));
+    }
+  },1500);
 });
 </script>
 </body>

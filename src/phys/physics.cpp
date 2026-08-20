@@ -22,6 +22,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
@@ -154,18 +155,19 @@ void Physics::Step(float dt) {
 uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
                                    IVec3 originVoxel,
                                    const std::vector<float>& densityOfMat,
-                                   bool allowKinematic) {
+                                   bool allowKinematic, float voxelPitch) {
   BodyTransform xf{};
   xf.pos = Vec3{(float)originVoxel.x, (float)originVoxel.y, (float)originVoxel.z};
   xf.quat[3] = 1;
-  return CreateDebrisBodyXf(voxels, xf, densityOfMat, allowKinematic);
+  return CreateDebrisBodyXf(voxels, xf, densityOfMat, allowKinematic, voxelPitch);
 }
 
 uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
                                      const BodyTransform& xf,
                                      const std::vector<float>& densityOfMat,
-                                     bool allowKinematic) {
+                                     bool allowKinematic, float voxelPitch) {
   if (!system_ || voxels.empty()) return 0;
+  if (!(voxelPitch > 0.0f)) voxelPitch = 1.0f;
 
   // greedy box merge over the local voxel set (runs in +x, extended in +y,
   // then +z) — keeps compound shapes small for compact islands
@@ -189,7 +191,13 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
 
   JPH::StaticCompoundShapeSettings compound;
   float totalMass = 0;
-  const float voxVol = kVoxelMeters * kVoxelMeters * kVoxelMeters;
+  // One supplied voxel is `voxelPitch` world voxels on a side, so its physical
+  // volume is (pitch * kVoxelMeters)^3. A scale-2 limb has 8x the voxels at 1/8
+  // the volume each: same total mass, same density, same physical size as the
+  // scale-1 art it replaced. The `pitch == 1` path is arithmetically identical
+  // to the original expression, so ordinary debris is unchanged.
+  const float pm = voxelPitch * kVoxelMeters;
+  const float voxVol = pm * pm * pm;
   for (const DebrisVoxel& v : voxels) {
     uint32_t mat = v.payload & 0xFFF;
     float density = mat < densityOfMat.size() ? densityOfMat[mat] : 1000.0f;
@@ -221,12 +229,16 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
       for (int j = 0; j < sy; j++)
         for (int i = 0; i < sx; i++) used[key(v.x + i, v.y + j, v.z + k)] = true;
 
-    JPH::Vec3 half(VoxToM(sx * 0.5f), VoxToM(sy * 0.5f), VoxToM(sz * 0.5f));
-    JPH::Vec3 center(VoxToM(v.x + sx * 0.5f), VoxToM(v.y + sy * 0.5f),
-                     VoxToM(v.z + sz * 0.5f));
-    // tiny convex radius: debris voxels are 12.5 cm
+    JPH::Vec3 half(VoxToM(sx * 0.5f * voxelPitch), VoxToM(sy * 0.5f * voxelPitch),
+                   VoxToM(sz * 0.5f * voxelPitch));
+    JPH::Vec3 center(VoxToM((v.x + sx * 0.5f) * voxelPitch),
+                     VoxToM((v.y + sy * 0.5f) * voxelPitch),
+                     VoxToM((v.z + sz * 0.5f) * voxelPitch));
+    // Tiny convex radius: debris voxels are 12.5 cm. Scale it with the pitch
+    // too — a fixed 1 cm skin on a 3 cm micro voxel is a third of the box, and
+    // Jolt would round the limb off into a lump.
     compound.AddShape(center, JPH::Quat::sIdentity(),
-                      new JPH::BoxShape(half, 0.01f));
+                      new JPH::BoxShape(half, 0.01f * voxelPitch));
     boxes++;
     if (boxes >= 1024) break;  // pathological shapes get a truncated collider
   }
@@ -265,13 +277,27 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
 }
 
 uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
-                                   float densityKgM3) {
+                                   float densityKgM3, Vec3 originOffsetVox) {
   if (!system_ || radiusVoxels <= 0) return 0;
   const float rM = VoxToM(radiusVoxels);
+  // Offset origin: the sphere sits at +offset from the body origin so a
+  // min-corner microvoxel render model and the collider agree (header note).
+  // Jolt keeps the COM at the shape's centre either way, so rotation still
+  // pivots through the middle of the ball and rolling is unaffected.
+  JPH::Ref<JPH::Shape> shape = new JPH::SphereShape(rM);
+  if (originOffsetVox.x != 0 || originOffsetVox.y != 0 || originOffsetVox.z != 0) {
+    JPH::RotatedTranslatedShapeSettings rts(
+        JPH::Vec3(VoxToM(originOffsetVox.x), VoxToM(originOffsetVox.y),
+                  VoxToM(originOffsetVox.z)),
+        JPH::Quat::sIdentity(), shape);
+    auto res = rts.Create();
+    if (res.HasError()) return 0;
+    shape = res.Get();
+  }
+  Vec3 origin = centerVoxel - originOffsetVox;
   JPH::BodyCreationSettings bcs(
-      new JPH::SphereShape(rM),
-      JPH::RVec3(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y),
-                 VoxToM(centerVoxel.z)),
+      shape,
+      JPH::RVec3(VoxToM(origin.x), VoxToM(origin.y), VoxToM(origin.z)),
       JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Layers::MOVING);
   bcs.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
   bcs.mMassPropertiesOverride.mMass =
@@ -544,6 +570,15 @@ void Physics::DisableCollisionsAmong(const std::vector<uint64_t>& handles) {
     if (lock.Succeeded())
       lock.GetBody().SetCollisionGroup(JPH::CollisionGroup(table, gid, i));
   }
+}
+
+void Physics::ClearCollisionGroup(uint64_t handle) {
+  if (!system_ || handle == 0) return;
+  // CollisionGroup::sInvalidGroup with a null filter = "collides with
+  // everything", which is what an adopted debris body should do.
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  JPH::BodyLockWrite lock(bli, ToBodyID(handle));
+  if (lock.Succeeded()) lock.GetBody().SetCollisionGroup(JPH::CollisionGroup());
 }
 
 uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
