@@ -105,10 +105,13 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   let tw = voxels[di];
   if (!canDisplace(myDensity, rising, tw)) { return false; }
   let stamp = stampFor(T.tick, P.substep);
-  voxels[di] = packVox(voxMat(myWord), voxState(myWord), stamp);
+  // Stain travels WITH the voxel, not with the cell: a stained pebble that
+  // falls is still stained, and the air it left behind is not. Both sides of
+  // the swap therefore carry their own source word's stain bits.
+  voxels[di] = packVoxKeepStain(voxMat(myWord), voxState(myWord), stamp, myWord);
   // displaced fluid (or air) swaps into the source cell, stamped so it does
   // not act again this tick
-  voxels[cellIndexW((src))] = packVox(voxMat(tw), voxState(tw), stamp);
+  voxels[cellIndexW((src))] = packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw);
   markDirty(src);
   markDirty(dst);
   // a powder sliding out from under a solid may leave it floating
@@ -124,9 +127,21 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   let stamp = stampFor(T.tick, P.substep);
   let si = cellIndexW((src));
   let di = cellIndexW((dst));
+  // Stain and flowing liquid: the DESTINATION keeps its own stain, and the
+  // source keeps its own. A liquid moving through a cell does not pick the
+  // cell's stain up and carry it downstream — stain marks the SURFACE that was
+  // soaked, and it stays on that surface until the stain rule itself changes
+  // it. (A stained liquid voxel is a normal thing to have: blood that has
+  // pooled on stained ground reads stained through, which is right.)
+  //
+  // A source cell that empties completely goes to 0 — full air, no stain. That
+  // is deliberate: the stain belonged to the liquid that just left, and an
+  // empty cell of air has no surface to hold it.
+  let sw = voxels[si];
+  let dw = voxels[di];
   if (t >= sf) { voxels[si] = 0u; }
-  else { voxels[si] = packVox(mat, sf - t - 1u, stamp); }
-  voxels[di] = packVox(mat, df + t - 1u, stamp);
+  else { voxels[si] = packVoxKeepStain(mat, sf - t - 1u, stamp, sw); }
+  voxels[di] = packVoxKeepStain(mat, df + t - 1u, stamp, dw);
   markDirty(src);
   markDirty(dst);
 }
@@ -225,6 +240,65 @@ fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
   return true;  // wildcard "any"
 }
 
+// Scales a rule's chance by how many of the 6 face neighbours match its
+// neighbour predicate. Returns the effective chance in units of
+// 1/REACT_CHANCE_DEN; 0 means the rule cannot fire at all this tick.
+//
+// This is what makes a rule spread from a FRONTIER instead of nucleating
+// uniformly. Water freezing is the motivating case: scaled by the count of
+// non-water neighbours, a pond's banks and surface freeze first and the ice
+// creeps inward, because every new ice voxel raises its liquid neighbours'
+// odds. Deep water is surrounded by water, counts 0, and cannot freeze until
+// the front reaches it.
+//
+// The return is in a FINER denominator than the authored per-mille, because
+// the interesting rules are authored at chance 1-2: computing
+// `(chance * q) / 4` per-mille would truncate 1.5x and 2.75x onto the same
+// integer, collapsing a 6-step ramp to 4 steps. Scaling the numerator instead
+// keeps every step distinct at chance 1.
+//
+// Determinism (rule 1): this READS a 1-cell neighbourhood and writes nothing,
+// so it stays inside the colour lattice's guarantee — the lattice bounds
+// WRITES to 1 cell, and no cell within 1 of an acting cell is itself acting.
+// All integer: the multiplier is quarters, biased by 1.0x, and the whole
+// expression is done in u32 with the divide last so it rounds identically on
+// every vendor. A float here would be a determinism bug.
+fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
+  if ((rule.cond & RSCALE_ON) == 0u) { return rule.chance * REACT_CHANCE_SCALE; }
+  let invert = (rule.cond & RSCALE_INVERT) != 0u;
+
+  var count = 0u;
+  for (var i = 0u; i < 6u; i++) {
+    let n = c + faceDir(i);
+    // Out-of-window space is solid and inert, and reads as "not the counted
+    // material" — which is right for ice: the residency edge acts like a bank
+    // rather than like more water.
+    var hit = false;
+    if (inBounds(n)) {
+      let nmat = voxMat(voxels[cellIndexW(n)]);
+      // MAT_AIR has no Material entry worth matching on tags/class, so an
+      // air neighbour only counts via an exact nbrMat == 0 predicate.
+      if (nmat == MAT_AIR) { hit = rule.nbrMat == MAT_AIR; }
+      else { hit = nbrMatches(rule, nmat, materials[nmat]); }
+    }
+    if (hit != invert) { count++; }
+  }
+  if (count == 0u) { return 0u; }  // hard gate: no frontier, no reaction
+
+  // chance * lerp(1.0x, maxMul, (count-1)/5), integer throughout, evaluated
+  // with the single divide LAST so nothing is truncated mid-ramp.
+  //   scaled = chance * SCALE * (4 + span*(count-1)/5) / 4
+  // Numerator first, then one divide by (RSCALE_MUL_UNIT * 5) = 20, which
+  // divides REACT_CHANCE_SCALE exactly — so every one of the 6 steps lands on
+  // a distinct integer even at chance 1.
+  let maxQ = ((rule.cond >> RSCALE_MUL_SHIFT) & RSCALE_MUL_MASK) + RSCALE_MUL_UNIT;
+  let span = maxQ - RSCALE_MUL_UNIT;  // quarters above 1.0x
+  let num = rule.chance * REACT_CHANCE_SCALE *
+            (RSCALE_MUL_UNIT * 5u + span * (count - 1u));
+  let scaled = num / (RSCALE_MUL_UNIT * 5u);
+  return min(scaled, 1000u * REACT_CHANCE_SCALE);
+}
+
 // Runs the cell's reaction bucket. At most one rule fires per tick. Returns
 // true if SELF changed material (caller then skips movement this substep).
 // Matching-but-unfired rules mark the chunk dirty so reactive neighborhoods
@@ -266,8 +340,13 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
     let lightGated = (rule.cond & 0xFFu) != 0u;
 
     if (kind == RK_DECAY) {
+      // Neighbour-count scaling (frontier rules — see scaledChance). Returns
+      // rule.chance untouched for the ordinary unscaled case; 0 means the cell
+      // has no qualifying neighbours and the rule is inert here this tick.
+      let chance = scaledChance(rule, c);
+      if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
-      if ((rr % 1000u) < rule.chance) {
+      if ((rr % REACT_CHANCE_DEN) < chance) {
         if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
         else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
         markDirty(c);
@@ -284,7 +363,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         let ni = cellIndexW((n));
         if (voxMat(voxels[ni]) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % 1000u) < rule.chance) {
+        if ((rr % REACT_CHANCE_DEN) < rule.chance * REACT_CHANCE_SCALE) {
           voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp);
           markDirty(n);
           markDirty(c);
@@ -310,7 +389,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if (nmat == MAT_AIR) { continue; }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % 1000u) < rule.chance) {
+        if ((rr % REACT_CHANCE_DEN) < rule.chance * REACT_CHANCE_SCALE) {
           if (rule.prodNbr != PROD_KEEP) {
             if (rule.prodNbr == 0u) { voxels[ni] = 0u; }
             else { voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp); }

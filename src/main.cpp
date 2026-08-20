@@ -669,6 +669,151 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
               sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesLeft,
               settled);
 
+  // ---- pond freezes shore-first, not uniformly -------------------------------
+  // The water->ice rule is scaled by its count of non-water neighbours
+  // (reactions.json), so ice appears at the rim first and works inward. That
+  // SHAPE is the whole point of the rule and it is invisible to the hash test,
+  // which only proves the sim is reproducible, not that it is right.
+  //
+  // What this measures is a RATE gradient, not an absolute gate, and the
+  // distinction is worth stating because it is easy to write a test that
+  // asserts the wrong thing (this one did, first time round):
+  //
+  //   An open pond's whole surface has AIR above it, so every surface cell
+  //   counts >= 1 non-water neighbour and CAN freeze. Only water enclosed by
+  //   water on all six sides is truly gated to zero, which in a real pond
+  //   means the sub-surface body, not the top face.
+  //
+  // So the rim's advantage is that it counts 2-3 (bank + air) against the
+  // middle's 1, i.e. it freezes 1.6-2.2x faster and the ice front then feeds
+  // itself inward. The check therefore samples EARLY, while that ratio is
+  // still visible, and separately asserts the hard gate on a cell that really
+  // is enclosed: the pond's bottom layer under unfrozen water.
+  bool pondOk = false;
+  {
+    auto matId = [&](const char* n) {
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == n) return (int)i;
+      return -1;
+    };
+    const int wi = matId("water"), si = matId("stone"), ii = matId("ice");
+    // Pin the cycle at midnight so the night-gated rule fires every tick.
+    Tuning night = CurrentTuning();
+    night.dayNight.freeze = 1;
+    night.dayNight.freezePhase = 0;  // 0 = midnight
+    Tuning saved = CurrentTuning();
+    SetCurrentTuning(night);
+
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+
+    // A 24x24 pond, 3 deep, walled and floored in stone, with open air above so
+    // needsSky passes. Placed inside the window, well clear of terrain. Three
+    // deep is what gives a middle layer (y+1) that is enclosed by water above
+    // and below — the cells the count-0 gate must forbid outright.
+    const int px = 96, py = 120, pz = 96, R = 12, kDepth = 3;
+    std::vector<CellOp> pond;
+    auto put = [&](int x, int y, int z, int m) {
+      uint32_t state = (m == wi) ? 7u : 0u;  // liquids are born full (LIQ_FULL_STATE)
+      pond.push_back({World::SlotCellIndex({x, y, z}),
+                      (uint32_t)((m & 0xFFF) | (state << 12))});
+    };
+    for (int z = -R - 1; z <= R + 1; z++)
+      for (int x = -R - 1; x <= R + 1; x++) {
+        put(px + x, py - 1, pz + z, si);  // floor
+        bool rim = (x < -R || x > R || z < -R || z > R);
+        for (int y = 0; y < kDepth; y++) put(px + x, py + y, pz + z, rim ? si : wi);
+        for (int y = kDepth; y < kDepth + 3; y++) put(px + x, py + y, pz + z, 0);
+      }
+    uint32_t pt = 1;
+    SubmitTick(ctx, world, sim, pt, kDefaultSeed, {}, {}, pond, false,
+               {6, 7, 6}, false, false);
+    ctx.WaitIdle();
+
+    // Sampled while the rim/middle rate ratio is still visible. Run much
+    // longer and the whole surface saturates at 100% ice, which says nothing
+    // about the ordering.
+    for (uint32_t t = 2; t <= 250; t++)
+      SubmitTick(ctx, world, sim, ++pt, kDefaultSeed, {}, {}, {}, false,
+                 {6, 7, 6}, false, false);
+    ctx.WaitIdle();
+
+    // Pull the whole voxel buffer down once — ~1200 sample points, and a
+    // blocking map each would be far slower than one copy.
+    std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+    {
+      const uint64_t bytes = (uint64_t)vox.size() * 4;
+      wgpu::Buffer st = CreateBuffer(ctx.device, bytes,
+                                     wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                     "pondRead");
+      wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+      e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
+      wgpu::CommandBuffer c = e.Finish();
+      ctx.queue.Submit(1, &c);
+      wgpu::Future f = st.MapAsync(
+          wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
+            if (s2 == wgpu::MapAsyncStatus::Success) {
+              std::memcpy(vox.data(), st.GetConstMappedRange(0, bytes), bytes);
+              st.Unmap();
+            }
+          });
+      ctx.instance.WaitAny(f, UINT64_MAX);
+    }
+    auto readCell = [&](int x, int y, int z) {
+      return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
+    };
+    // Surface layer (y+kDepth-1): rim ring touches the bank and counts 2-3;
+    // the middle 5x5 only has air above and counts 1. Rim must be visibly
+    // ahead.
+    const int surf = py + kDepth - 1;
+    uint32_t edgeIce = 0, edgeN = 0, midIce = 0, midN = 0;
+    for (int z = -R; z <= R; z++)
+      for (int x = -R; x <= R; x++) {
+        bool edge = (x == -R || x == R || z == -R || z == R);
+        bool mid = (std::abs(x) <= 2 && std::abs(z) <= 2);
+        if (!edge && !mid) continue;
+        uint32_t m = readCell(px + x, surf, pz + z);
+        if (edge) { edgeN++; if (m == (uint32_t)ii) edgeIce++; }
+        else      { midN++;  if (m == (uint32_t)ii) midIce++; }
+      }
+    // The hard gate, asserted directly on the final state rather than by
+    // sampling a rate: NO ice voxel anywhere in the pond may be one that had
+    // zero non-water neighbours. Equivalently — since ice only ever replaces
+    // water in place — every ice voxel must still touch something that is not
+    // water. An ice voxel fully surrounded by water is a voxel that froze at
+    // count 0, which the rule forbids outright.
+    //
+    // This is what makes the check decisive. A rate comparison cannot separate
+    // "the gate works and the front crept down from the surface" from "the
+    // gate is ignored" — both land near the same percentage. The invariant
+    // can: it is violated by exactly one of those two.
+    uint32_t violations = 0, iceTotal = 0;
+    for (int y = 0; y < kDepth; y++)
+      for (int z = -R; z <= R; z++)
+        for (int x = -R; x <= R; x++) {
+          if (readCell(px + x, py + y, pz + z) != (uint32_t)ii) continue;
+          iceTotal++;
+          const int d[6][3] = {{0,-1,0},{0,1,0},{1,0,0},{-1,0,0},{0,0,1},{0,0,-1}};
+          bool touchesNonWater = false;
+          for (auto& o : d)
+            if (readCell(px + x + o[0], py + y + o[1], pz + z + o[2]) != (uint32_t)wi)
+              touchesNonWater = true;
+          if (!touchesNonWater) violations++;
+        }
+    // Rim ahead of the middle by a clear margin, and no voxel froze in the
+    // interior of open water. Both halves matter: the gradient alone would
+    // pass a rule that froze everything, the invariant alone would pass one
+    // that never fired.
+    bool gradient = edgeN > 0 && midN > 0 && edgeIce * midN > 2 * midIce * edgeN;
+    pondOk = gradient && violations == 0 && edgeIce > 0;
+    std::printf("pond freeze: %s (rim %u/%u vs middle %u/%u ice at 250 night "
+                "ticks; %u ice voxels, %u frozen with 0 non-water neighbours)\n",
+                pondOk ? "PASS" : "FAIL", edgeIce, edgeN, midIce, midN,
+                iceTotal, violations);
+    SetCurrentTuning(saved);
+  }
+
   // sim perf: worst-case-ish activity (brushes + explosions + particles),
   // synchronous timing
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -1533,9 +1678,9 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
-  bool pass = deterministic && walkOk && sleepOk && debrisOk && prefabOk &&
-              mobOk && settleOk && pushOk && saveOk && storeOk && streamOk &&
-              farDownOk && fogOk;
+  bool pass = deterministic && walkOk && sleepOk && pondOk && debrisOk &&
+              prefabOk && mobOk && settleOk && pushOk && saveOk && storeOk &&
+              streamOk && farDownOk && fogOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }

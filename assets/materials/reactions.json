@@ -486,7 +486,7 @@
       "becomes": "water"
     },
     {
-      "note": "-------- snow and ice follow the sun --------\nSnow in direct sun melts; exposed water freezes on clear nights. These two are\nopposed, which is exactly what makes them safe: they cannot both fire in the\nsame phase, so there is no melt/freeze loop that keeps chunks awake. The ice\nrule needs sky so lakes freeze from the top and cave water stays liquid."
+      "note": "-------- snow and ice follow the sun --------\nSnow in direct sun melts; exposed water freezes on clear nights. These two are\nopposed, which is exactly what makes them safe: they cannot both fire in the\nsame phase, so there is no melt/freeze loop that keeps chunks awake. The ice\nrule needs sky so lakes freeze from the top and cave water stays liquid, and it\nis scaled by neighbour count so a pond freezes shore-first — see the note on\nthe water rule below."
     },
     {
       "self": "snow",
@@ -507,12 +507,20 @@
       "becomes": "water"
     },
     {
+      "note": "Ice grows from the SHORE inward, it does not flash-freeze the pond.\nThe chance is scaled by how many of the six face neighbours are NOT water\n(\"neighbor\": \"water\" + \"invert\": true), which produces the real behaviour for\nfree:\n\n  - Deep interior water is surrounded by water: count 0, chance 0, it CANNOT\n    freeze. No ice ever nucleates in open water.\n  - Water touching the bank, or the pond surface (the cell above is air), has\n    count >= 1 and freezes at the base rate.\n  - Every voxel that DOES freeze becomes ice, which is itself non-water, so it\n    raises its liquid neighbours' count and their odds. The front feeds itself\n    and creeps inward.\n  - A cell in a narrow channel, nearly enclosed by bank and ice, hits count 6\n    and freezes at scaleMax (4x).\n\nThis is decisively subcritical (rule 2) despite being self-reinforcing: it\nconverts water and water does not come back at night, so the frontier is a\nshrinking 2D surface that terminates when the pond is solid. The day rule above\nmelts it back, and the two cannot fire in the same phase."
+    },
+    {
       "self": "water",
       "decay": true,
       "needsSky": true,
       "when": "night",
       "chance": 1,
-      "becomes": "ice"
+      "becomes": "ice",
+      "scaleByNeighbors": {
+        "neighbor": "water",
+        "invert": true,
+        "scaleMax": 4.0
+      }
     },
     {
       "note": "-------- growth follows the light --------\nPlants only put on growth in daylight. The existing stem/sprout rules are left\nalone (their subcritical budget is carefully tuned — see the stem note above);\nthese are the ADDITIONAL daylight-only behaviours.\n\nGrass creeping onto lit soil is the one rule here that creates new matter, so\nit is the one to watch: it is capped by needsSky (only the exposed top surface\nof the ground qualifies) and by requiring a soil neighbour, so the frontier is\na 2D surface, not a volume, and it terminates when the surface is covered. At\n3 per mille it spreads about a cell per 10 in-game seconds of daylight."
