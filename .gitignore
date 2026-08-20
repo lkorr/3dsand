@@ -14,3 +14,6 @@ evidence_dither_*.png
 screenshot_ground.bmp
 screenshot_far.png
 screenshot_ground.png
+# ad-hoc look-pass captures (material/lighting spot checks)
+screenshot_*.bmp
+screenshot_*.png
