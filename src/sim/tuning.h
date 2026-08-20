@@ -32,6 +32,64 @@
 // deliberately (blast size and sand fall speed are worth tuning by eye) but a
 // change there means re-running --selftest to re-baseline. Everything outside
 // the sim group is render- or CPU-side only and cannot perturb the hash.
+// ---- per-instance variance (the "randomness" column in the tuner) ---------
+//
+// A Variance turns one authored constant into a distribution. It is the answer
+// to "every NPC bleeds exactly the same amount": the tuned value stays the
+// CENTRE, and each instance draws an offset around it, so on a rare roll a mob
+// bleeds far more than the mean and the sim gets a moment worth watching.
+//
+// DETERMINISM (CLAUDE.md rule 1). Nothing here is a stateful RNG and nothing
+// reads wall clock. Every draw is `Hash3(seed, tick, index)` — the same
+// stateless counter-based scheme the sim shaders use — so two machines at the
+// same tick draw the SAME offset, and a replay reproduces it exactly. That is
+// what makes this safe to apply to spawn streams, which are per-tick INPUTS
+// that replays must reproduce (see the Gore comment below).
+//
+// This is deliberately NOT available on the `sim.*` integers or on material
+// interaction rules. Those feed voxel state directly through the CA, where the
+// authored number IS the physics; randomising them would not add excitement,
+// it would make the same collision resolve differently for no legible reason.
+// Variance belongs on PRESENTATION and on per-instance CHARACTER, not on the
+// rules that decide what a material does.
+struct Variance {
+  enum Dist : int { kNone = 0, kUniform = 1, kGaussian = 2 };
+  // Scope decides what a single roll is shared across, and it is the whole
+  // reason "a rare NPC is a gusher" is expressible at all:
+  //   kEvent   re-rolls per droplet/spawn — droplet-to-droplet jitter.
+  //   kEntity  rolls ONCE per mob (from its id) and holds for that mob's
+  //            lifetime — this mob bleeds heavily, consistently, until it dies.
+  // Event scope on a bleed rate averages out over a wound and reads as noise;
+  // entity scope is what reads as character.
+  enum Scope : int { kEvent = 0, kEntity = 1 };
+  int dist = kNone;
+  int scope = kEvent;
+  // Half-width of the offset, in the parameter's own units. Uniform draws flat
+  // in [-amount, +amount]. Gaussian treats `amount` as ONE SIGMA and clamps at
+  // `sigmaClamp` sigma, so a heavy tail stays bounded (rule 2: an unbounded
+  // draw on a spawn count is an unbounded particle budget).
+  float amount = 0.0f;
+  float sigmaClamp = 3.0f;
+  // Optional hard floor/ceiling on the RESULT. Defaults are inert; a negative
+  // spray count or a negative speed is meaningless, so callers that need a
+  // floor set one (Apply always clamps counts at >= 0 regardless).
+  float minValue = -1e30f, maxValue = 1e30f;
+  bool on() const { return dist != kNone && amount != 0.0f; }
+};
+
+// Draws `base` perturbed by `v`. `seed` identifies the thing being varied
+// (mob id for entity scope, or mob id mixed with the droplet index for event
+// scope), `tick` is the sim tick, `index` separates draws within one tick.
+//
+// Pure function of its arguments — no globals, no state, no clock.
+float ApplyVariance(float base, const Variance& v, uint32_t seed, uint32_t tick,
+                    uint32_t index);
+
+// Integer form, for counts (droplets, voxels, ticks). Rounds half-to-even via
+// lround and clamps at >= 0 so a wide draw can never request negative work.
+int ApplyVarianceI(int base, const Variance& v, uint32_t seed, uint32_t tick,
+                   uint32_t index);
+
 struct Tuning {
   // ---- player movement (meters / seconds; converted to voxels at use) ----
   struct Player {
@@ -141,6 +199,26 @@ struct Tuning {
     // clears: no droplet outlives it, whether or not it ever hits anything.
     int microLifeTicks = 70;
     int microScale = 4;
+
+    // ---- per-instance variance ----
+    // Each of these perturbs the like-named value above. Defaults are all
+    // dist=kNone, so gore behaves exactly as before until a knob is turned on
+    // in the tuner — this whole feature is opt-in and inert at rest.
+    //
+    // The interesting ones are entity-scoped: bleedSprayPerDrip and
+    // severSpray/severVoxels rolled per mob are what make ONE npc a gusher for
+    // its whole life rather than making every wound flicker.
+    Variance bleedSprayPerDripVar, bleedSpraySpeedVar, bleedSprayConeVar;
+    Variance severSprayVar, severSpraySpeedVar, severSprayConeVar;
+    Variance severVoxelsVar, severVoxelSpeedVar, severDecayTicksVar;
+    Variance microLifeTicksVar;
+    // Whole-wound gain: multiplies every blood quantity for one mob at once
+    // (spray, sever spray, sever voxels). This is the single knob for "rare
+    // NPC bleeds an extreme amount" — varying the individual counts
+    // independently gives a mob that gushes spray but throws normal voxels,
+    // which reads as a bug rather than as a heavy bleeder. Centre is 1.0.
+    float bleedGain = 1.0f;
+    Variance bleedGainVar;
   } gore;
 
   // ---- grenade ----

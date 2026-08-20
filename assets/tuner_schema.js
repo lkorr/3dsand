@@ -17,6 +17,23 @@
      type  'color' -> [r,g,b] 0..1 triple edited with a color picker
            'vec3'  -> [x,y,z] triple edited as three numbers
      warn  extra caution text rendered on the row
+     var   this row gets a randomness control (the ⚄ button). The tuned value
+           becomes the CENTRE of a distribution and each instance draws an
+           offset, so mobs/events differ from one another instead of all
+           behaving identically. Stored in tuning.json as a SIBLING object
+           named <k>Var: {dist, scope, amount, sigmaClamp}.
+             scopes    which scopes this row allows, in menu order:
+                       'event'  re-rolls per spawn/droplet (jitter)
+                       'entity' one roll per mob, held for its life (character)
+             defScope  scope selected when randomness is first switched on
+             max       upper bound of the amount slider (in the param's units;
+                       for gaussian, amount is ONE SIGMA)
+             note/warn extra text shown inside the popover
+           Only put this on PRESENTATION and per-instance CHARACTER. It must
+           never go on the sim.* integers or on material interaction rules:
+           those feed voxel state through the CA, where the authored number is
+           the physics, and randomising them makes identical collisions resolve
+           differently for no legible reason (CLAUDE.md rule 1).
 
    `apply` on each group says what the user has to do for an edit to show up:
      'shader'   F5 in-game (reload shaders) — recompiles with the new consts
@@ -390,18 +407,19 @@ const TUNING_SCHEMA = [
     title: 'Gore',
     icon: '\u{1FA78}',
     apply: 'cpu',
-    blurb: 'Bleeding and dismemberment. Two sizes of matter come off a wound: whole blood VOXELS, which the sim carries and which pool on the ground, and sub-voxel MICRO droplets, which fly, never re-enter the grid, and stain whatever surface they hit. The spray is what sells the hit; the voxels are what is still there a minute later.',
+    blurb: 'Bleeding and dismemberment. Two sizes of matter come off a wound: whole blood VOXELS, which the sim carries and which pool on the ground, and sub-voxel MICRO droplets, which fly, never re-enter the grid, and stain whatever surface they hit. The spray is what sells the hit; the voxels are what is still there a minute later. — Most rows here carry a ⚄ RANDOMNESS control: the slider value becomes the CENTRE of a distribution and each instance draws its own offset, so mobs differ from one another instead of all bleeding identically. Scope "entity" rolls once per mob and holds for its life (this NPC is a gusher); "event" re-rolls per droplet (jitter within one wound). Start with bleed gain — gaussian, entity scope — for the rare extreme bleeder. Every draw comes from the sim hash, so it is identical on every machine and reproduces under replay.',
     params: [
-      {k:'bleedSprayPerDrip', n:'bleed spray / drip', d:'Micro droplets thrown per blood voxel a wound drips. Bleeding rate itself is set by the mob\'s bleed.perDamage; this only decides how visible each drip is.', min:0, max:24, step:0.5},
-      {k:'bleedSpraySpeed', n:'bleed spray speed', d:'Launch speed of a bleed droplet, upward-biased.', min:0, max:30, step:0.5, u:'vox/s'},
-      {k:'bleedSprayCone', n:'bleed spray spread', d:'Lateral scatter as a fraction of launch speed. 0 is a straight jet, 1 is a hemisphere.', min:0, max:2, step:0.05},
-      {k:'severSpray', n:'sever spray', d:'Total micro droplets released by a dismemberment, spread over the decay window. This is the arterial gout — the single biggest visual cue that a limb came off.', min:0, max:2000, step:10, int:true, warn:'Very high values with a long decay can hold hundreds of particles live at once.'},
-      {k:'severDecayTicks', n:'sever decay', d:'How long the gout lasts. Emission is front-loaded across this window, so the burst hits hardest at the cut and tails off. 30 ticks = 1 second.', min:1, max:300, step:5, int:true, u:'ticks'},
-      {k:'severSpraySpeed', n:'sever spray speed', d:'Launch speed of dismemberment spray.', min:0, max:40, step:0.5, u:'vox/s'},
-      {k:'severSprayCone', n:'sever spray spread', d:'Lateral scatter of dismemberment spray.', min:0, max:2, step:0.05},
-      {k:'severVoxels', n:'sever blood voxels', d:'Whole blood voxels thrown by the cut. Unlike spray these are real matter the sim has to move and settle, so this is a perf knob as much as a look knob.', min:0, max:200, step:1, int:true, warn:'Large values dump a lot of liquid into the CA at once.'},
-      {k:'severVoxelSpeed', n:'sever voxel speed', d:'Launch speed of the whole blood voxels.', min:0, max:30, step:0.5, u:'vox/s'},
-      {k:'microLifeTicks', n:'droplet life', d:'How long a micro droplet lives before evaporating, whether or not it ever lands. This is the guarantee that spray clears and the world settles. Hard limit 255.', min:1, max:255, step:1, int:true, u:'ticks'},
+      {k:'bleedGain', n:'bleed gain (per mob)', d:'Whole-wound multiplier on every blood QUANTITY for one mob: bleed spray, sever spray and thrown voxels all scale together. This is the knob for "on a rare roll, this NPC bleeds an extreme amount" — set randomness to gaussian + entity scope and a small fraction of mobs become gushers for life. Speeds, cones and lifetimes are deliberately NOT scaled, so a heavy bleeder bleeds more, not differently.', min:0, max:8, step:0.05, var:{scopes:['entity','event'], defScope:'entity', max:6, note:'Entity scope is the point of this knob: one roll per mob, held for life.'}},
+      {k:'bleedSprayPerDrip', n:'bleed spray / drip', d:'Micro droplets thrown per blood voxel a wound drips. Bleeding rate itself is set by the mob\'s bleed.perDamage; this only decides how visible each drip is.', min:0, max:24, step:0.5, var:{scopes:['entity','event'], defScope:'entity', max:20}},
+      {k:'bleedSpraySpeed', n:'bleed spray speed', d:'Launch speed of a bleed droplet, upward-biased.', min:0, max:30, step:0.5, u:'vox/s', var:{scopes:['event','entity'], defScope:'event', max:20}},
+      {k:'bleedSprayCone', n:'bleed spray spread', d:'Lateral scatter as a fraction of launch speed. 0 is a straight jet, 1 is a hemisphere.', min:0, max:2, step:0.05, var:{scopes:['event','entity'], defScope:'event', max:1.5}},
+      {k:'severSpray', n:'sever spray', d:'Total micro droplets released by a dismemberment, spread over the decay window. This is the arterial gout — the single biggest visual cue that a limb came off.', min:0, max:2000, step:10, int:true, warn:'Very high values with a long decay can hold hundreds of particles live at once.', var:{scopes:['entity','event'], defScope:'entity', max:1500, warn:'A wide draw here multiplies the live particle count — the gaussian tail is clamped, but check the budget.'}},
+      {k:'severDecayTicks', n:'sever decay', d:'How long the gout lasts. Emission is front-loaded across this window, so the burst hits hardest at the cut and tails off. 30 ticks = 1 second.', min:1, max:300, step:5, int:true, u:'ticks', var:{scopes:['entity','event'], defScope:'entity', max:200}},
+      {k:'severSpraySpeed', n:'sever spray speed', d:'Launch speed of dismemberment spray.', min:0, max:40, step:0.5, u:'vox/s', var:{scopes:['event','entity'], defScope:'event', max:25}},
+      {k:'severSprayCone', n:'sever spray spread', d:'Lateral scatter of dismemberment spray.', min:0, max:2, step:0.05, var:{scopes:['event','entity'], defScope:'event', max:1.5}},
+      {k:'severVoxels', n:'sever blood voxels', d:'Whole blood voxels thrown by the cut. Unlike spray these are real matter the sim has to move and settle, so this is a perf knob as much as a look knob.', min:0, max:200, step:1, int:true, warn:'Large values dump a lot of liquid into the CA at once.', var:{scopes:['entity','event'], defScope:'entity', max:150, warn:'These are real voxels the CA must move. A wide draw is a perf draw.'}},
+      {k:'severVoxelSpeed', n:'sever voxel speed', d:'Launch speed of the whole blood voxels.', min:0, max:30, step:0.5, u:'vox/s', var:{scopes:['event','entity'], defScope:'event', max:20}},
+      {k:'microLifeTicks', n:'droplet life', d:'How long a micro droplet lives before evaporating, whether or not it ever lands. This is the guarantee that spray clears and the world settles. Hard limit 255.', min:1, max:255, step:1, int:true, u:'ticks', var:{scopes:['event','entity'], defScope:'event', max:150, note:'Result is always clamped to 1..255 — the field is 8 bits.'}},
       {k:'microScale', n:'droplet fineness', d:'Micro voxels per world voxel: a droplet renders at 1/this of a cell. Only 2, 3, 4 and 6 are representable.', min:2, max:6, step:1, int:true},
     ],
   },

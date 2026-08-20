@@ -40,6 +40,21 @@ float SignedUnit(uint32_t h) {
   return (float)(int32_t)(h & 0xFFFFu) / 32768.0f - 1.0f;
 }
 
+// Event-scoped variance, applied at the spray sites. Entity-scoped variances
+// were already resolved into mob.gore at spawn, so these pass through — this is
+// what keeps a per-mob trait from being re-rolled every droplet and flattening
+// back into noise.
+float EventVar(float base, const Variance& v, uint32_t seed, uint32_t tick,
+               uint32_t index) {
+  return v.scope == Variance::kEvent ? ApplyVariance(base, v, seed, tick, index)
+                                     : base;
+}
+int EventVarI(int base, const Variance& v, uint32_t seed, uint32_t tick,
+              uint32_t index) {
+  return v.scope == Variance::kEvent ? ApplyVarianceI(base, v, seed, tick, index)
+                                     : base;
+}
+
 // Builds one ballistic droplet. `micro` picks sub-voxel spray (dies on contact,
 // stains, never becomes a voxel) over a real blood voxel.
 //
@@ -386,6 +401,34 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         else log += jp + ": chain \"" + ch.tag + "\" needs >=2 parts + effector\n";
       }
 
+      // Dismemberment locomotion states. Authored order IS the priority
+      // order (first match wins), so the array form is deliberate — an object
+      // would let the JSON library reorder the rules.
+      for (const auto& s : j.value("states", json::array())) {
+        AnimStateRule rule;
+        rule.name = s.value("name", "");
+        auto partList = [&](const char* key, std::vector<int>& out) {
+          for (const auto& nm : s.value(key, json::array())) {
+            int pi = sk.FindPart(nm.get<std::string>());
+            if (pi >= 0) out.push_back(pi);
+            else log += jp + ": state \"" + rule.name +
+                        "\" names unknown part \"" + nm.get<std::string>() + "\"\n";
+          }
+        };
+        partList("missing", rule.missingAll);
+        partList("missingAny", rule.missingAnyOf);
+        rule.minChainsLost = s.value("minChainsLost", 0);
+        rule.clip = s.value("clip", "");
+        rule.speedScale = s.value("speedScale", 1.0f);
+        rule.disableGait = s.value("disableGait", false);
+        rule.bodyYOffset = s.value("bodyYOffset", 0.0f);
+        if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
+            rule.minChainsLost <= 0)
+          log += jp + ": state \"" + rule.name +
+                 "\" has an empty predicate and will never match\n";
+        sk.states.push_back(std::move(rule));
+      }
+
       // NB: bind the object to a named local. `j.value(k, json::object())`
       // returns a TEMPORARY; iterating begin()/end() off two separate
       // temporaries yields iterators into different destroyed objects.
@@ -449,6 +492,13 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         }
         sk.clips.push_back(std::move(clip));
       }
+
+      // States name clips by string and PlayClip silently no-ops on a miss, so
+      // a typo'd crawl clip would otherwise fail as "the mob just slides".
+      for (const AnimStateRule& rule : sk.states)
+        if (!rule.clip.empty() && sk.FindClip(rule.clip) < 0)
+          log += jp + ": state \"" + rule.name + "\" names unknown clip \"" +
+                 rule.clip + "\"\n";
 
       const json fbJson = j.contains("flipbooks") && j["flipbooks"].is_object()
                               ? j["flipbooks"]
@@ -535,6 +585,71 @@ void MobSystem::Reset() {
   instancesDirty_ = true;
 }
 
+// Draws this mob's own bleed character. Entity-scoped variances resolve here,
+// once, against the mob id; event-scoped ones are left alone (they are drawn
+// per droplet at the spray sites, where the droplet index is in hand).
+//
+// The whole-wound gain is folded into every QUANTITY (spray counts, thrown
+// voxels) but deliberately NOT into speeds, cones or lifetimes: "this one is a
+// gusher" should mean more blood, not blood that also flies faster and lives
+// longer, which reads as a different material rather than a worse wound.
+MobSystem::GoreProfile MobSystem::MakeGoreProfile(uint64_t mobId) {
+  const auto& g = CurrentTuning().gore;
+  const uint32_t seed = (uint32_t)(mobId ^ (mobId >> 32));
+  // Entity draws share one seed but must not share one INDEX, or every
+  // parameter with the same distribution would move in lockstep.
+  auto ent = [&](float base, const Variance& v, uint32_t idx) {
+    return v.scope == Variance::kEntity ? ApplyVariance(base, v, seed, 0, idx)
+                                        : base;
+  };
+  auto entI = [&](int base, const Variance& v, uint32_t idx) {
+    return v.scope == Variance::kEntity ? ApplyVarianceI(base, v, seed, 0, idx)
+                                        : base;
+  };
+
+  GoreProfile p;
+  // Gain first: it multiplies the quantities drawn below. Floored at 0 so a
+  // wide gaussian tail cannot invert a wound into negative blood.
+  p.bleedGain = ent(g.bleedGain, g.bleedGainVar, 101u);
+  if (!(p.bleedGain > 0.0f)) p.bleedGain = 0.0f;
+
+  p.bleedSprayPerDrip =
+      ent(g.bleedSprayPerDrip, g.bleedSprayPerDripVar, 1u) * p.bleedGain;
+  p.bleedSpraySpeed = ent(g.bleedSpraySpeed, g.bleedSpraySpeedVar, 2u);
+  p.bleedSprayCone = ent(g.bleedSprayCone, g.bleedSprayConeVar, 3u);
+  p.severSpray =
+      (int)std::lround(entI(g.severSpray, g.severSprayVar, 4u) * p.bleedGain);
+  p.severSpraySpeed = ent(g.severSpraySpeed, g.severSpraySpeedVar, 5u);
+  p.severSprayCone = ent(g.severSprayCone, g.severSprayConeVar, 6u);
+  p.severVoxels =
+      (int)std::lround(entI(g.severVoxels, g.severVoxelsVar, 7u) * p.bleedGain);
+  p.severVoxelSpeed = ent(g.severVoxelSpeed, g.severVoxelSpeedVar, 8u);
+  p.severDecayTicks = entI(g.severDecayTicks, g.severDecayTicksVar, 9u);
+  p.microLifeTicks = entI(g.microLifeTicks, g.microLifeTicksVar, 10u);
+
+  // Re-apply the invariants the loader enforces on the authored values: a
+  // variance draw can push past them, and microLifeTicks in particular is an
+  // 8-bit field (PMICRO_LIFE_MASK) that wraps to "dies instantly" past 255.
+  if (p.severDecayTicks < 1) p.severDecayTicks = 1;
+  if (p.microLifeTicks < 1) p.microLifeTicks = 1;
+  if (p.microLifeTicks > 255) p.microLifeTicks = 255;
+  if (p.bleedSprayPerDrip < 0.0f) p.bleedSprayPerDrip = 0.0f;
+  if (p.bleedSpraySpeed < 0.0f) p.bleedSpraySpeed = 0.0f;
+  if (p.severSpraySpeed < 0.0f) p.severSpraySpeed = 0.0f;
+  if (p.severVoxelSpeed < 0.0f) p.severVoxelSpeed = 0.0f;
+  if (p.bleedSprayCone < 0.0f) p.bleedSprayCone = 0.0f;
+  if (p.severSprayCone < 0.0f) p.severSprayCone = 0.0f;
+  if (p.severSpray < 0) p.severSpray = 0;
+  if (p.severVoxels < 0) p.severVoxels = 0;
+  return p;
+}
+
+void MobSystem::RefreshGoreProfiles() {
+  // Same id -> same draw, so a mob keeps its identity across a reload unless
+  // the variance settings themselves changed.
+  for (Mob& mob : mobs_) mob.gore = MakeGoreProfile(mob.id);
+}
+
 uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   if (defIndex < 0 || defIndex >= (int)defs_.size()) return 0;
   if (mobs_.size() >= kMaxMobs) return 0;
@@ -542,6 +657,7 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
 
   Mob mob;
   mob.id = nextId_++;
+  mob.gore = MakeGoreProfile(mob.id);
   mob.defIndex = defIndex;
   mob.origin = Vec3{(float)atVoxel.x, (float)atVoxel.y, (float)atVoxel.z};
   mob.limbs.resize(def.limbs.size());
@@ -886,6 +1002,35 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   if (st.gaitPhase > 1.0f) st.gaitPhase -= std::floor(st.gaitPhase);
   mob.phase = st.gaitPhase * 6.2831853f;
 
+  // ---- dismemberment locomotion states ----
+  // Re-evaluated every frame rather than only on Sever: partAlive changes in
+  // several places (Sever, recursive DetachLimb, Die), and this poll is a few
+  // comparisons against a handful of rules. On a transition the outgoing
+  // state's loco clip blends out (the runtime's stopping fade) while the new
+  // one blends in over its own blendInMs — a crossfade for free.
+  {
+    int want = AnimSelectState(sk, st);
+    if (want != st.locoState) {
+      if (st.locoState >= 0 && !sk.states[st.locoState].clip.empty()) {
+        int old = sk.FindClip(sk.states[st.locoState].clip);
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == old) inst.stopping = true;
+      }
+      st.locoState = want;
+      if (want >= 0) {
+        const AnimStateRule& rule = sk.states[want];
+        if (!rule.clip.empty()) PlayClip(mob, def, rule.clip);
+        // A foot frozen mid-swing would report "swinging" forever once the
+        // gait stops running; land everything where it stands.
+        if (rule.disableGait)
+          for (FootState& f : st.feet) f.swinging = false;
+      }
+    }
+  }
+  const AnimStateRule* loco =
+      st.locoState >= 0 ? &sk.states[st.locoState] : nullptr;
+  const bool clipOwnsPose = loco && loco->disableGait;
+
   // ---- stages 1-3: sample active clips, blend, apply additives ----
   AnimSampleAndBlend(sk, st, dt);
 
@@ -893,7 +1038,10 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // dummy.json has swingAmp/swingPhase and no chains; running it HERE rather
   // than as a separate code path means the fallback and the new rig share one
   // pipeline (flatten, IK, physics blend all behave identically).
-  for (size_t i = 0; i < sk.parts.size(); i++) {
+  // Suppressed entirely while a disableGait loco state is active: a crawl clip
+  // keys the same parts the walk swing and pelvis bob drive, and "authored
+  // crawl plus leftover walk bounce" reads as a glitch, not a blend.
+  for (size_t i = 0; !clipOwnsPose && i < sk.parts.size(); i++) {
     const AnimPart& p = sk.parts[i];
     if (p.swingAmp == 0) continue;
     // progressive phase lag up the hierarchy: each level down the chain
@@ -912,7 +1060,8 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     st.local[i].rot = QuatNormalize(QuatMul(st.local[i].rot,
                                             QuatAxisAngle(p.axis, swing)));
   }
-  if (g.present && def.rootLimb >= 0 && def.rootLimb < (int)sk.parts.size()) {
+  if (g.present && !clipOwnsPose && def.rootLimb >= 0 &&
+      def.rootLimb < (int)sk.parts.size()) {
     Transform& root = st.local[def.rootLimb];
     // Pelvis bob runs at 2x step frequency: the body rises once per FOOTFALL,
     // and there are two footfalls per full stride cycle.
@@ -955,8 +1104,21 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // ---- gait + stage 5: IK, strictly a POST-PROCESS on the flattened pose ----
   // IK must never be a blended layer: blending two IK results produces a pose
   // that satisfies neither end-effector constraint, which defeats the point.
-  if (g.present) UpdateGait(mob, def, world, dt);
-  if (!sk.chains.empty()) {
+  const bool gaitActive = g.present && !clipOwnsPose;
+  if (gaitActive) {
+    UpdateGait(mob, def, world, dt);
+  } else {
+    // No foot plane is being maintained (legacy rig, or a loco clip owns the
+    // pose): the animated body height follows the walk drive's ground contact
+    // plus the state's authored offset, and the slope tilt eases back flat.
+    // This is the same settle UpdateGait applies when every foot is lost.
+    float targetY = mob.origin.y + (loco ? loco->bodyYOffset : 0.0f);
+    mob.bodyY += std::clamp(targetY - mob.bodyY, -0.4f, 0.4f);
+    mob.footInit = true;
+    mob.bodyUp = (mob.bodyUp * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
+    if (mob.bodyUp.len() < 0.5f) mob.bodyUp = {0, 1, 0};
+  }
+  if (!sk.chains.empty() && gaitActive) {
     Quat yaw = AxisAngle({0, 1, 0}, mob.heading);
     Vec3 rootAnchor = sk.parts[def.rootLimb].anchorLocal;
     Vec3 pivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
@@ -1106,8 +1268,17 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           mob.heading += 1.5707963f;  // turn 90° and try again
           mob.lastTurnTick = tick;
         } else if (!blocked) {
-          mob.origin += fwd * (def.speed * dt);
-          mob.phase += def.speed * dt * 2.2f;  // stride frequency
+          // A maimed mob keeps moving, just slower: the active dismemberment
+          // state scales the drive speed (a crawl covers ground at a fraction
+          // of a walk). Reads LAST tick's state — UpdateAnimation below
+          // re-evaluates it — which is at most one tick of lag on a sever.
+          float speedScale =
+              mob.anim.locoState >= 0 &&
+                      mob.anim.locoState < (int)def.skel.states.size()
+                  ? def.skel.states[mob.anim.locoState].speedScale
+                  : 1.0f;
+          mob.origin += fwd * (def.speed * speedScale * dt);
+          mob.phase += def.speed * speedScale * dt * 2.2f;  // stride frequency
         }
       }
 
@@ -1174,12 +1345,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         // thins out. Runs on its own schedule (every tick, not the drip's every
         // 4th) because a burst that stutters at 7.5 Hz reads as a pump.
         if (limb.gushTicks > 0) {
-          int decay = std::max(1, gore.severDecayTicks);
+          int decay = std::max(1, mob.gore.severDecayTicks);
           // Triangular weighting: sum over the window of (2*total/decay) *
           // (k/decay) for k = decay..1 is ~= total, so severSpray is the actual
           // droplet count released rather than a rate to be multiplied out.
           float frac = (float)limb.gushTicks / (float)decay;
-          int want = (int)std::lround(2.0f * (float)gore.severSpray * frac /
+          int want = (int)std::lround(2.0f * (float)mob.gore.severSpray * frac /
                                       (float)decay);
           // Bodyless fallback goes through bodyFrame(), not mob.origin +
           // anchorRoot: origin.y is the spawn corner, so the raw offset puts
@@ -1193,17 +1364,28 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
             if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
             uint32_t h = Hash3((uint32_t)mob.id * 2654435761u + (uint32_t)li,
                                tick, (uint32_t)k * 0x9E3779B9u);
-            Vec3 dir{axis.x + SignedUnit(h) * gore.severSprayCone,
-                     axis.y + SignedUnit(Pcg(h ^ 0x51A17u)) * gore.severSprayCone,
-                     axis.z + SignedUnit(Pcg(h ^ 0xB0011u)) * gore.severSprayCone};
+            // Event-scoped variance re-rolls per droplet; entity-scoped values
+            // already landed in mob.gore and pass through untouched.
+            const uint32_t es = (uint32_t)mob.id ^ ((uint32_t)li << 16);
+            float cone = EventVar(mob.gore.severSprayCone, gore.severSprayConeVar,
+                                  es, tick, (uint32_t)k * 3u + 0u);
+            Vec3 dir{axis.x + SignedUnit(h) * cone,
+                     axis.y + SignedUnit(Pcg(h ^ 0x51A17u)) * cone,
+                     axis.z + SignedUnit(Pcg(h ^ 0xB0011u)) * cone};
             // speed varies +-25% so the jet has depth instead of a hard front
-            float sp = gore.severSpraySpeed *
+            float sp = EventVar(mob.gore.severSpraySpeed,
+                                gore.severSpraySpeedVar, es, tick,
+                                (uint32_t)k * 3u + 1u) *
                        (0.75f + 0.5f * (float)(Pcg(h ^ 0x1234u) & 0xFFFFu) / 65535.0f);
+            if (sp < 0.0f) sp = 0.0f;
+            int life = EventVarI(mob.gore.microLifeTicks, gore.microLifeTicksVar,
+                                 es, tick, (uint32_t)k * 3u + 2u);
+            life = life < 1 ? 1 : (life > 255 ? 255 : life);
             if (!world.CellInWindow({ifloor(origin.x), ifloor(origin.y),
                                      ifloor(origin.z)}))
               break;
             spawns.push_back(MakeDroplet(origin, dir * sp, def.bleedMat, true,
-                                         gore.microLifeTicks, gore.microScale));
+                                         life, gore.microScale));
           }
           limb.gushTicks--;
         }
@@ -1222,17 +1404,30 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         // Rides the drip's existing budget rather than carrying its own: the
         // drip rate is already bounded and already tied to the wound, so spray
         // per drip cannot outrun the bleeding it is depicting.
-        int sprayN = (int)std::lround(gore.bleedSprayPerDrip);
+        const uint32_t es = (uint32_t)mob.id ^ ((uint32_t)li << 16);
+        // The drip's spray count. Entity scope makes this mob a heavy bleeder
+        // for life; event scope varies it drip to drip.
+        int sprayN = (int)std::lround(
+            EventVar(mob.gore.bleedSprayPerDrip, gore.bleedSprayPerDripVar, es,
+                     tick, 0u));
+        if (sprayN < 0) sprayN = 0;
         for (int k = 0; k < sprayN; k++) {
           if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
           uint32_t h = Hash3((uint32_t)mob.id * 40503u + (uint32_t)li,
                              tick ^ 0xB1005u, (uint32_t)k * 2246822519u);
+          float cone = EventVar(mob.gore.bleedSprayCone, gore.bleedSprayConeVar,
+                                es, tick, (uint32_t)k * 3u + 1u);
           // biased upward and outward: a wound sprays, it does not just drool
-          Vec3 dir{SignedUnit(h) * gore.bleedSprayCone,
+          Vec3 dir{SignedUnit(h) * cone,
                    0.6f + 0.4f * std::fabs(SignedUnit(Pcg(h ^ 0x77u))),
-                   SignedUnit(Pcg(h ^ 0xC0FFEEu)) * gore.bleedSprayCone};
-          spawns.push_back(MakeDroplet(w, dir * gore.bleedSpraySpeed,
-                                       def.bleedMat, true, gore.microLifeTicks,
+                   SignedUnit(Pcg(h ^ 0xC0FFEEu)) * cone};
+          float sp = EventVar(mob.gore.bleedSpraySpeed, gore.bleedSpraySpeedVar,
+                              es, tick, (uint32_t)k * 3u + 2u);
+          if (sp < 0.0f) sp = 0.0f;
+          int life = EventVarI(mob.gore.microLifeTicks, gore.microLifeTicksVar,
+                               es, tick, (uint32_t)k * 3u + 3u);
+          life = life < 1 ? 1 : (life > 255 ? 255 : life);
+          spawns.push_back(MakeDroplet(w, dir * sp, def.bleedMat, true, life,
                                        gore.microScale));
         }
       }
@@ -1342,7 +1537,7 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
           // inside the one per-tick spawn budget, and keeps spray order
           // independent of the order limbs happened to be damaged in.
           const auto& gore = CurrentTuning().gore;
-          parent.gushTicks = gore.severDecayTicks;
+          parent.gushTicks = mob.gore.severDecayTicks;
           parent.gushLocal = parent.woundLocal;
           // Spray along the stump: from the parent's centre out through the
           // wound, so a cut arm sprays away from the torso instead of into it.
@@ -1360,7 +1555,13 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
           // (they pool, they flow, the CA owns them), so they are deliberately
           // few next to the hundreds of micro droplets — the spray does the
           // visual work, the voxels do the lasting mess.
-          for (int k = 0; k < gore.severVoxels; k++) {
+          const uint32_t es = (uint32_t)mob.id ^ ((uint32_t)limbIndex << 16);
+          // Sever is not driven by the tick loop, so the draw is indexed by the
+          // voxel counter alone; the mob id keeps it distinct between mobs.
+          int nVox = EventVarI(mob.gore.severVoxels, gore.severVoxelsVar, es,
+                               0x5EEDu, 0u);
+          if (nVox < 0) nVox = 0;
+          for (int k = 0; k < nVox; k++) {
             if (pendingSpawns_.size() >= kMaxParticleSpawnsPerTick) break;
             uint32_t h = Hash3((uint32_t)mob.id * 22695477u + (uint32_t)limbIndex,
                                (uint32_t)k, 0x5EEDu);
@@ -1368,8 +1569,10 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
                      std::fabs(parent.gushDir.y) + 0.3f,
                      parent.gushDir.z + SignedUnit(Pcg(h ^ 0x31u)) * 0.7f};
             dir = Rotate(q, dir);
-            float sp = gore.severVoxelSpeed *
+            float sp = EventVar(mob.gore.severVoxelSpeed, gore.severVoxelSpeedVar,
+                                es, 0x5EEDu, (uint32_t)k + 1u) *
                        (0.6f + 0.8f * (float)(Pcg(h ^ 0x9Fu) & 0xFFFFu) / 65535.0f);
+            if (sp < 0.0f) sp = 0.0f;
             pendingSpawns_.push_back(MakeDroplet(anchorW, dir * sp, def.bleedMat,
                                                  false, 0, 0));
           }
@@ -1556,6 +1759,12 @@ int MobSystem::PlantedFeet(uint64_t mobId) const {
 int MobSystem::ActiveClips(uint64_t mobId) const {
   for (const Mob& mob : mobs_)
     if (mob.id == mobId) return (int)mob.anim.clips.size();
+  return -1;
+}
+
+int MobSystem::LocoState(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id == mobId) return mob.anim.locoState;
   return -1;
 }
 

@@ -329,7 +329,7 @@
   }
   .trows{padding:2px 6px 10px}
   .trow{
-    display:grid;grid-template-columns:210px 1fr 96px 150px 30px;gap:12px;align-items:center;
+    display:grid;grid-template-columns:210px 1fr 96px 26px 150px 30px;gap:12px;align-items:center;
     padding:5px 8px;border-radius:6px;
   }
   .trow:hover{background:#1b222c}
@@ -371,6 +371,49 @@
     padding:0 0 2px 2px;max-width:88ch;
   }
   .thelp b{color:#e8c477;font-weight:600}
+  /* randomness (variance) control: a die button per row that opens a popover.
+     Collapsed by default because most rows are plain constants and an always-
+     visible distribution editor would triple the height of every tab. */
+  .vwrap{position:relative;display:flex;justify-content:center}
+  .vbtn{
+    background:none;border:1px solid transparent;border-radius:5px;cursor:pointer;
+    color:#3f4a5c;font-size:13px;line-height:1;padding:3px 4px;
+  }
+  .trow:hover .vbtn{color:var(--faint)}
+  .vbtn:hover{color:var(--fg);border-color:var(--line2);background:#12161e}
+  .vbtn.on{color:var(--amber);border-color:#5a4520;background:#241d0f}
+  .vbtn.on:hover{color:#ffd479}
+  .vpop{
+    position:absolute;z-index:60;top:26px;right:-4px;width:290px;
+    background:#141a23;border:1px solid var(--line2);border-radius:8px;
+    box-shadow:0 10px 28px #000a;padding:10px;display:grid;gap:8px;
+    cursor:default;text-align:left;
+  }
+  .vpop .vhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .vpop .vtitle{font-size:12px;color:var(--fg);font-weight:600}
+  .vpop .vclose{background:none;border:none;color:var(--faint);cursor:pointer;font-size:14px;padding:0 2px}
+  .vpop .vclose:hover{color:var(--fg)}
+  .vpop .vlbl{font-size:11px;color:var(--faint);display:block;margin-bottom:3px}
+  .vpop .vseg{display:flex;gap:4px}
+  .vpop .vseg button{
+    flex:1;background:#12161e;border:1px solid #262e3c;border-radius:5px;
+    color:var(--faint);font-size:11.5px;padding:4px 2px;cursor:pointer;
+  }
+  .vpop .vseg button:hover{color:var(--fg);border-color:#3a4557}
+  .vpop .vseg button.sel{background:#1d2a3a;border-color:var(--acc);color:var(--fg)}
+  .vpop .vamt{display:grid;grid-template-columns:1fr 66px;gap:6px;align-items:center}
+  .vpop input[type=range]{width:100%;accent-color:var(--amber);cursor:pointer}
+  .vpop .vnote{font-size:10.5px;color:var(--faint);line-height:1.45}
+  .vpop .vnote b{color:#e8c477;font-weight:600}
+  /* live preview of the resulting spread, so "sigma 1.2" is legible as a range */
+  .vpop .vrange{
+    font-family:var(--mono);font-size:11px;color:var(--green);
+    background:#101a12;border:1px solid #24402a;border-radius:5px;padding:4px 6px;
+  }
+  .trow .vsum{
+    font-family:var(--mono);font-size:10px;color:var(--amber);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
   .vecwrap{display:flex;gap:5px;align-items:center}
   .vecwrap input.tnum{width:64px}
   .vecwrap input[type=color]{width:26px;height:22px;flex:none}
@@ -2247,6 +2290,22 @@ function tuneRow(tab,pr,g){
     row.append(wrap);
   }
 
+  // ---- randomness column ----
+  // Rows without a `var` schema entry still get the cell, so the grid columns
+  // stay aligned down the whole tab.
+  if(pr.var&&pr.type!=='color'&&pr.type!=='vec3'){
+    row.append(varEditor(tab,pr,g,()=>{
+      // The help line carries the live spread summary, so the effect of a
+      // setting is visible without reopening the popover.
+      renderVarSum();
+      row.classList.toggle('changed',
+        !sameVal(getAt(tune,g,pr.k),base)||
+        !sameVal(getAt(tune,g,VAR_KEY(pr.k)),getAt(tuneBase,g,VAR_KEY(pr.k))));
+    }));
+  }else{
+    row.append(el('span',{}));
+  }
+
   // ---- history chips: green = before the last edit, red = last saved ----
   const hist=el('div',{class:'hist'});
   paintHist=()=>{
@@ -2271,7 +2330,15 @@ function tuneRow(tab,pr,g){
 
   const rst=el('button',{class:'rst',title:'reset to the value on disk'},'↺');
   rst.addEventListener('click',()=>{
-    if(base===undefined)return;
+    // Reset restores the randomness alongside the value: they are one setting
+    // as far as the user is concerned, and leaving a distribution behind after
+    // a reset is how you get a "reset" row that still behaves differently.
+    if(pr.var){
+      const vb=getAt(tuneBase,g,VAR_KEY(pr.k));
+      if(vb===undefined)delete (tune[g]||{})[VAR_KEY(pr.k)];
+      else setTuned(g,VAR_KEY(pr.k),structuredClone(vb));
+    }
+    if(base===undefined){touchTune();renderTuning();return;}
     setTuned(g,pr.k,structuredClone(base));
     touchTune();renderTuning();
   });
@@ -2279,10 +2346,189 @@ function tuneRow(tab,pr,g){
 
   const help=el('div',{class:'thelp'},pr.d);
   if(pr.warn){help.append(' ');help.append(el('b',{},'⚠ '+pr.warn));}
+  const vsum=el('span',{class:'vsum'});
+  help.append(' ');help.append(vsum);
   row.append(help);
 
+  function renderVarSum(){
+    const v=varOf(g,pr.k);
+    const t=varRangeText(pr,getAt(tune,g,pr.k)??0,v);
+    vsum.textContent=t?('  ⚄ '+v.dist+' / '+v.scope+' — '+t):'';
+  }
+  renderVarSum();
+
   if(!sameVal(cur,base))row.classList.add('changed');
+  // A row whose randomness differs from disk is "changed" even if its centre
+  // value did not move — otherwise switching a distribution on leaves no mark
+  // and the save pill is the only hint anything happened.
+  if(pr.var&&!sameVal(getAt(tune,g,VAR_KEY(pr.k)),
+                      getAt(tuneBase,g,VAR_KEY(pr.k))))
+    row.classList.add('changed');
   return row;
+}
+
+/* ---- randomness / variance -------------------------------------------
+   A row whose schema entry carries `var` gets a die button that edits a
+   SIBLING object in tuning.json named <k>Var. The parameter itself keeps its
+   meaning as the centre of the distribution, so turning randomness off leaves
+   the value exactly where it was — the whole feature is additive.
+
+   The engine draws these from the same stateless hash the sim uses
+   (Hash3(seed, tick, index) — see ApplyVariance in src/sim/tuning.cpp), so the
+   result is identical on every machine and reproduces under replay. That is
+   why this is safe on spawn streams, and why it is deliberately unavailable on
+   the sim.* integers. */
+const VAR_KEY=k=>k+'Var';
+const varOf=(g,k)=>getAt(tune,g,VAR_KEY(k))||null;
+const varOn=v=>!!v&&v.dist&&v.dist!=='none'&&+v.amount!==0;
+
+// The spread a setting actually produces, in the parameter's units. Gaussian
+// amount is one sigma, so the honest summary is the ~95% band (2 sigma), not
+// the clamp — quoting the clamp makes every gaussian look enormous.
+function varRangeText(pr,base,v){
+  if(!varOn(v))return null;
+  const a=+v.amount||0;
+  const lo=x=>{
+    let r=base-x; if(pr.min!=null)r=Math.max(pr.min,r);
+    if(pr.int)r=Math.round(r); return +r.toFixed(3);
+  };
+  const hi=x=>{
+    let r=base+x; if(pr.max!=null)r=Math.min(pr.max,r);
+    if(pr.int)r=Math.round(r); return +r.toFixed(3);
+  };
+  if(v.dist==='uniform')return 'flat '+lo(a)+' … '+hi(a);
+  const s=Math.min(2,+v.sigmaClamp||3);
+  return '~95%: '+lo(a*s)+' … '+hi(a*s)+'  (σ='+(+a.toFixed(3))+')';
+}
+
+function varEditor(tab,pr,g,onChange){
+  const cfg=pr.var||{};
+  const scopes=cfg.scopes||['event','entity'];
+  const wrap=el('div',{class:'vwrap'});
+  const btn=el('button',{class:'vbtn',title:'randomness'},'⚄');
+  wrap.append(btn);
+  let pop=null;
+
+  const cur=()=>varOf(g,pr.k)||{dist:'none',scope:cfg.defScope||scopes[0],
+                                amount:0,sigmaClamp:3};
+  const paint=()=>{
+    btn.classList.toggle('on',varOn(varOf(g,pr.k)));
+    btn.title=varOn(varOf(g,pr.k))
+      ? 'randomness: '+cur().dist+' ±'+cur().amount+' ('+cur().scope+')'
+      : 'randomness: off';
+  };
+  const put=(patch)=>{
+    const next=Object.assign({},cur(),patch);
+    // Writing through setTuned keeps the undo chips and the dirty pill working
+    // for variance exactly as they do for the value itself.
+    setTuned(g,VAR_KEY(pr.k),next);
+    touchTune();paint();onChange&&onChange();
+  };
+
+  const close=()=>{if(pop){pop.remove();pop=null;
+    document.removeEventListener('mousedown',outside,true);}};
+  const outside=e=>{if(pop&&!pop.contains(e.target)&&e.target!==btn)close();};
+
+  const open=()=>{
+    const v=cur();
+    pop=el('div',{class:'vpop'});
+    pop.addEventListener('mousedown',e=>e.stopPropagation());
+    const x=el('button',{class:'vclose',title:'close'},'✕');
+    x.addEventListener('click',close);
+    pop.append(el('div',{class:'vhead'},
+      el('span',{class:'vtitle'},'randomness — '+pr.n),x));
+
+    // distribution
+    const dseg=el('div',{class:'vseg'});
+    [['none','off'],['uniform','uniform'],['gaussian','gaussian']]
+      .forEach(([id,label])=>{
+        const b=el('button',{class:cur().dist===id?'sel':''},label);
+        b.addEventListener('click',()=>{
+          // Turning a distribution on with amount still 0 would look broken —
+          // seed a visible default from the row's own range.
+          const amt=(+cur().amount||0)>0?+cur().amount
+            :+( (cfg.max!=null?cfg.max:(pr.max??1))*0.15 ).toFixed(3);
+          put({dist:id,amount:id==='none'?cur().amount:amt});
+          close();open();
+        });
+        dseg.append(b);
+      });
+    pop.append(el('div',{},el('span',{class:'vlbl'},'distribution'),dseg));
+
+    // scope
+    const sseg=el('div',{class:'vseg'});
+    scopes.forEach(id=>{
+      const b=el('button',{class:cur().scope===id?'sel':'',
+        title:id==='entity'
+          ? 'one roll per mob, held for its whole life — makes THIS npc a heavy bleeder'
+          : 'a fresh roll every spawn/droplet — jitter within one wound'},id);
+      b.addEventListener('click',()=>{put({scope:id});close();open();});
+      sseg.append(b);
+    });
+    pop.append(el('div',{},el('span',{class:'vlbl'},'scope'),sseg));
+
+    // amount (+ sigma clamp for gaussian)
+    if(cur().dist!=='none'){
+      const amax=cfg.max!=null?cfg.max:(pr.max??1);
+      const astep=pr.step??0.01;
+      const rng=el('input',{type:'range',min:0,max:amax,step:astep});
+      const num=el('input',{class:'tnum',type:'number',min:0,step:astep});
+      const band=el('div',{class:'vrange'});
+      const base=getAt(tune,g,pr.k)??0;
+      const sync=()=>{
+        const a=+cur().amount||0;
+        rng.value=a;num.value=a;
+        band.textContent=varRangeText(pr,base,cur())||'no spread';
+      };
+      const setA=a=>{
+        let x=roundStep(Math.max(0,a),astep);
+        if(!isFinite(x))return;
+        put({amount:x});sync();
+      };
+      rng.addEventListener('input',()=>setA(+rng.value));
+      num.addEventListener('change',()=>setA(+num.value));
+      pop.append(el('div',{},
+        el('span',{class:'vlbl'},
+          cur().dist==='gaussian'?'amount (one σ)':'amount (± half-width)'),
+        el('div',{class:'vamt'},rng,num)));
+
+      if(cur().dist==='gaussian'){
+        const cstep=0.25;
+        const crng=el('input',{type:'range',min:0.5,max:5,step:cstep});
+        const cnum=el('input',{class:'tnum',type:'number',min:0.5,step:cstep});
+        const csync=()=>{const c=+cur().sigmaClamp||3;crng.value=c;cnum.value=c;};
+        const setC=c=>{
+          let x=roundStep(Math.max(0.25,c),cstep);
+          if(!isFinite(x))return;
+          put({sigmaClamp:x});csync();sync();
+        };
+        crng.addEventListener('input',()=>setC(+crng.value));
+        cnum.addEventListener('change',()=>setC(+cnum.value));
+        csync();
+        pop.append(el('div',{},
+          el('span',{class:'vlbl'},'tail clamp (σ) — bounds the extreme roll'),
+          el('div',{class:'vamt'},crng,cnum)));
+      }
+      sync();
+      pop.append(band);
+    }
+
+    const notes=el('div',{class:'vnote'});
+    notes.append(cur().scope==='entity'
+      ? 'One roll per mob, fixed at spawn and held for life.'
+      : 'A fresh roll for every spawn — varies within a single wound.');
+    if(cfg.note){notes.append(' ');notes.append(cfg.note);}
+    if(cfg.warn){notes.append(' ');notes.append(el('b',{},'⚠ '+cfg.warn));}
+    notes.append(' Deterministic: drawn from the sim hash, so it is identical on every machine and under replay.');
+    pop.append(notes);
+
+    wrap.append(pop);
+    document.addEventListener('mousedown',outside,true);
+  };
+
+  btn.addEventListener('click',()=>{pop?close():open();});
+  paint();
+  return wrap;
 }
 
 function vecEditor(pr,g,mark){
@@ -2348,6 +2594,16 @@ $('#btnTuneReset').addEventListener('click',()=>{
     for(const pr of tab.params){
       const g=paramGroup(tab,pr);
       if(!matchesQuery(tab,pr,g,q))continue;
+      // Randomness resets with its parameter — same reasoning as the per-row
+      // reset above.
+      if(pr.var){
+        const vb=getAt(tuneBase,g,VAR_KEY(pr.k));
+        if(!sameVal(getAt(tune,g,VAR_KEY(pr.k)),vb)){
+          if(vb===undefined)delete (tune[g]||{})[VAR_KEY(pr.k)];
+          else setTuned(g,VAR_KEY(pr.k),structuredClone(vb));
+          n++;
+        }
+      }
       const base=getAt(tuneBase,g,pr.k);
       if(base===undefined)continue;
       if(!sameVal(getAt(tune,g,pr.k),base)){
@@ -3179,7 +3435,7 @@ function wikiTuneGroup(tab){
       // showing rather than hiding: it means the file is behind the schema.
       rows.append(el('div',{class:'trow'},
         el('div',{class:'nm',title:pr.k},el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)),
-        el('div',{class:'wmiss',style:'grid-column:2/5'},
+        el('div',{class:'wmiss',style:'grid-column:2/6'},
           'not present in tuning.json — the engine default is used'),
         el('div',{class:'thelp'},pr.d)));
       continue;

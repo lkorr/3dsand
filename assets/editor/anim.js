@@ -774,6 +774,24 @@ export function buildSkeleton(sidecar, models) {
     if (members.length) gait.groups.push(members);
   }
 
+  // --- dismemberment locomotion states (mob.cpp "states" parse) ---
+  // Authored order IS the priority order: first match wins in animSelectState.
+  const states = [];
+  for (const s of (Array.isArray(sidecar?.states) ? sidecar.states : [])) {
+    const names = key => (Array.isArray(s[key]) ? s[key] : [])
+      .map(nm => index.get(nm)).filter(v => v !== undefined);
+    states.push({
+      name: s.name || '',
+      missingAll: names('missing'),
+      missingAnyOf: names('missingAny'),
+      minChainsLost: +s.minChainsLost || 0,
+      clip: s.clip || '',
+      speedScale: s.speedScale ?? 1.0,
+      disableGait: !!s.disableGait,
+      bodyYOffset: +s.bodyYOffset || 0,
+    });
+  }
+
   // --- clips (mob.cpp:317-373) ---
   const clips = [];
   const cj = (sidecar?.clips && typeof sidecar.clips === 'object') ? sidecar.clips : {};
@@ -841,10 +859,32 @@ export function buildSkeleton(sidecar, models) {
   }
 
   return {
-    parts, chains, gait, clips, flipbooks, rootLimb: rootIndex,
+    parts, chains, gait, clips, flipbooks, states, rootLimb: rootIndex,
     order: ordered.map(l => l.name),
     findPart: nm => index.get(nm) ?? -1,
   };
+}
+
+/**
+ * Dismemberment state selection — anim.cpp AnimSelectState: first rule whose
+ * predicate holds against st.partAlive, or -1. A chain counts as lost when ANY
+ * of its parts is dead (the same test updateGait uses to drop a leg), and an
+ * empty predicate never matches (it would shadow every rule after it).
+ */
+export function animSelectState(sk, st) {
+  const dead = p => p >= 0 && p < (st.partAlive?.length ?? 0) && !st.partAlive[p];
+  let chainsLost = 0;
+  for (const ch of (sk.chains || []))
+    if (ch.parts.some(dead)) chainsLost++;
+  for (let r = 0; r < (sk.states?.length ?? 0); r++) {
+    const rule = sk.states[r];
+    if (!rule.missingAll.length && !rule.missingAnyOf.length &&
+        rule.minChainsLost <= 0) continue;
+    let match = rule.missingAll.every(dead);
+    if (rule.missingAnyOf.length) match = match && rule.missingAnyOf.some(dead);
+    if (match && chainsLost >= rule.minChainsLost) return r;
+  }
+  return -1;
 }
 
 /**
@@ -880,6 +920,8 @@ export function chainLegLength(sk, chain) {
        spine counter, spring goal)     mob.cpp:780-838
      Skeleton build (topo order, anchors, rest.pos, chains, gait groups,
        clip/track fusion, flipbooks)   mob.cpp:216-392
+     animSelectState (chain-lost test, empty-predicate skip, first match)
+                                       anim.cpp AnimSelectState
      chainLegLength                    mob.cpp:541-549
 
    APPROXIMATED (documented, not silently):

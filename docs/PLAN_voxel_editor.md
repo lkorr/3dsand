@@ -128,6 +128,12 @@ working unchanged (swingAmp/swingPhase remain the no-IK fallback).
       "tracks": { "arm.R": { "rot": [ { "t":0, "q":[0,0,0,1], "ease":"cubicOut" } ],
                               "pos": [ { "t":0, "v":[0,0,0] } ] } } } },
   "flipbooks": { "death": { "frames": [ { "part":"torso", "model":3, "durationMs":120 } ] } },
+  "states": [                       // NEW: dismemberment locomotion, first match wins
+    { "name": "crawl", "missing": ["leg.L","leg.R"],  // AND-ed predicates; also
+      "clip": "crawl",              // "missingAny": [...] and "minChainsLost": N
+      "speedScale": 0.35,           // walk-drive multiplier while active
+      "disableGait": true,          // clip owns the pose: no gait/IK/swing/bob
+      "bodyYOffset": 0.0 } ],       // body height vs ground while gait is off
   "editor": { "parts": { "leg.L": { "box": [[0,0,0],[2,5,2]] } } }  // NEW: editor-only,
 }                                                // voxel-selection→part mapping; engine ignores
 ```
@@ -157,6 +163,18 @@ cubicInOut`; times in integer ms; unique part names enforced at edit time.
   existing call sites are unchanged).
 - Flipbook frames swap the **rendered** voxel set only; the Jolt shape stays the
   rest model, and instances rebuild only on an actual frame change.
+- `states` (dismemberment locomotion): rules are evaluated **in authored order,
+  first match wins**, so list the most-maimed state first ("both legs gone →
+  crawl" before "a leg gone → limp"). A rule with an empty predicate never
+  matches. `minChainsLost` counts IK chains with **any** severed part — the same
+  test the gait uses to drop a leg, so the rule flips exactly when the gait
+  stops using it. Selection lives in `AnimSelectState` (anim.cpp, re-evaluated
+  every frame); transitions crossfade for free (old loco clip blends out via
+  the stopping fade, new one in over its `blendInMs`). While a `disableGait`
+  state is active the whole procedural layer (gait, IK, legacy swing, pelvis
+  bob) is suppressed and `bodyY` settles to the walk drive's ground contact
+  plus `bodyYOffset`; the tail spring keeps running (jiggle is not gait).
+  `speedScale` is read by the walk drive one tick behind selection.
 
 ## Engine architecture
 

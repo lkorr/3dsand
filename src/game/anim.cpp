@@ -193,6 +193,40 @@ float ClipFade(const AnimClip& c, float tMs, bool stopping, float stopFade) {
 
 }  // namespace
 
+// ---- dismemberment state selection ------------------------------------------
+
+int AnimSelectState(const AnimSkeleton& sk, const AnimState& st) {
+  auto dead = [&](int p) {
+    return p >= 0 && p < (int)st.partAlive.size() && !st.partAlive[p];
+  };
+  // A chain is "lost" the moment ANY of its parts is severed — the same test
+  // UpdateGait uses to stop scheduling a leg's steps, so a rule keyed on
+  // minChainsLost flips exactly when the gait stops using that leg.
+  int chainsLost = 0;
+  for (const IkChain& ch : sk.chains) {
+    bool lost = false;
+    for (int p : ch.parts) lost |= dead(p);
+    chainsLost += lost ? 1 : 0;
+  }
+  for (size_t r = 0; r < sk.states.size(); r++) {
+    const AnimStateRule& rule = sk.states[r];
+    // an empty predicate would shadow every rule after it — never match it
+    if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
+        rule.minChainsLost <= 0)
+      continue;
+    bool match = true;
+    for (int p : rule.missingAll) match &= dead(p);
+    if (!rule.missingAnyOf.empty()) {
+      bool any = false;
+      for (int p : rule.missingAnyOf) any |= dead(p);
+      match &= any;
+    }
+    match &= chainsLost >= rule.minChainsLost;
+    if (match) return (int)r;
+  }
+  return -1;
+}
+
 void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   const size_t n = sk.parts.size();
   st.local.resize(n);

@@ -107,6 +107,29 @@ struct GaitDef {
   std::vector<std::vector<int>> groups;  // part indices
 };
 
+// Locomotion state selected by DISMEMBERMENT: each rule pairs a predicate over
+// the severed parts with how the survivor keeps moving (a looping clip, a speed
+// penalty, whether the gait still owns the legs). Rules are evaluated in
+// authored order and the FIRST match wins, so a sidecar lists the most-maimed
+// state first ("both legs gone -> crawl" before "a leg gone -> limp"). No match
+// = normal locomotion. All predicate fields are AND-ed; an empty predicate
+// never matches (it would otherwise shadow every rule after it).
+struct AnimStateRule {
+  std::string name;
+  std::vector<int> missingAll;    // every one of these parts is severed
+  std::vector<int> missingAnyOf;  // at least one of these parts is severed
+  int minChainsLost = 0;          // >= N IK chains disabled ("legs of use lost")
+  std::string clip;               // looping loco clip, crossfaded on entry
+  float speedScale = 1.0f;        // walk-drive speed multiplier
+  // The clip owns the pose: suppress gait scheduling, IK, the legacy phase
+  // swing and the pelvis bob while this state is active. A crawl keyed on the
+  // torso fights all four otherwise.
+  bool disableGait = false;
+  // Animated body height relative to the walk drive's ground (world voxels)
+  // while the gait's foot-derived height is suppressed.
+  float bodyYOffset = 0.0f;
+};
+
 enum class IkSolver : uint8_t { TwoBone };
 
 struct IkChain {
@@ -150,6 +173,7 @@ struct AnimSkeleton {
   std::vector<AnimClip> clips;
   std::vector<IkChain> chains;
   std::vector<Flipbook> flipbooks;
+  std::vector<AnimStateRule> states;  // dismemberment locomotion, first match wins
   GaitDef gait;
   int FindPart(const std::string& name) const;
   int FindClip(const std::string& name) const;
@@ -195,6 +219,7 @@ struct AnimState {
   std::vector<FootState> feet;    // parallel to skeleton.chains
   std::vector<SpringState> springs;  // parallel to skeleton.parts
   FlipbookState flipbook;
+  int locoState = -1;             // index into skeleton.states, -1 = normal
   float gaitPhase = 0;
   Vec3 lastPos{};
   Vec3 velocity{};
@@ -202,6 +227,12 @@ struct AnimState {
 };
 
 // ---- pipeline ---------------------------------------------------------------
+
+// Dismemberment state selection: the first rule in sk.states whose predicate
+// holds against st.partAlive (and the chain liveness derived from it), or -1
+// for none. Pure query — the caller owns reacting to a change (starting and
+// stopping loco clips lives in mob.cpp, next to the rest of clip control).
+int AnimSelectState(const AnimSkeleton& sk, const AnimState& st);
 
 // Stage 1-3. Samples every active clip, blends OVERRIDE layers with
 // weight-normalized nlerp (rest-pose fallback below kBlendEpsilon), then

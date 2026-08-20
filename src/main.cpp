@@ -2218,6 +2218,81 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           mobOk = mobOk && microOk;
         }
 
+        // ---- dismemberment locomotion states: the maimed keep moving ----
+        // The rules live in the sidecars ("states"). Assertions are
+        // structural — which rule is active, the loco clip is running, the
+        // gait is silenced while a crawl owns the pose — plus "it still makes
+        // way along its facing", never rate comparisons (the frontier-rule
+        // lesson: rates prove nothing).
+        {
+          debris.Reset();
+          mobs.Reset();
+
+          // dummy: rule 1 (limp) at one leg lost, rule 0 (crawl) at both
+          uint64_t did = mobs.Spawn(dummyDef, {137, h + 1, 139});
+          for (int i = 0; i < 10; i++) mobTick({});
+          int s0 = mobs.LocoState(did);
+          mobs.Sever(did, limbIndex("leg.L"));
+          for (int i = 0; i < 10; i++) mobTick({});
+          int s1 = mobs.LocoState(did);
+          mobs.Sever(did, limbIndex("leg.R"));
+          for (int i = 0; i < 10; i++) mobTick({});
+          int s2 = mobs.LocoState(did);
+          bool dummyClip = mobs.ActiveClips(did) >= 1;
+          Vec3 dPrev2 = mobs.MobOrigin(did);
+          float dAlong2 = 0.0f, dPath2 = 0.0f;
+          for (int i = 0; i < 180; i++) {
+            Vec3 face = mobs.MobFacing(did);
+            mobTick({});
+            Vec3 now = mobs.MobOrigin(did);
+            Vec3 step{now.x - dPrev2.x, 0, now.z - dPrev2.z};
+            dPrev2 = now;
+            dAlong2 += step.x * face.x + step.z * face.z;
+            dPath2 += std::sqrt(step.x * step.x + step.z * step.z);
+          }
+          bool dummyCrawls = dPath2 > 1.0f && dAlong2 > 0.5f * dPath2;
+          bool dummyStates =
+              s0 == -1 && s1 == 1 && s2 == 0 && dummyClip && dummyCrawls;
+
+          // critter: one lost chain is the gait's own graceful degradation
+          // (no rule fires); the second flips it to the crawl state, which
+          // must silence the gait scheduler completely.
+          uint64_t cid2 = mobs.Spawn(critterDef, {150, h + 1, 150});
+          mobs.Sever(cid2, critterLimb("legU.FL"));
+          for (int i = 0; i < 10; i++) mobTick({});
+          int c1 = mobs.LocoState(cid2);
+          mobs.Sever(cid2, critterLimb("legU.BR"));
+          for (int i = 0; i < 10; i++) mobTick({});
+          int c2 = mobs.LocoState(cid2);
+          bool critClip = mobs.ActiveClips(cid2) >= 1;
+          int swingTicks = 0;
+          Vec3 cPrev2 = mobs.MobOrigin(cid2);
+          float cAlong2 = 0.0f, cPath2 = 0.0f;
+          for (int i = 0; i < 150; i++) {
+            Vec3 face = mobs.MobFacing(cid2);
+            mobTick({});
+            if (mobs.SwingingFeet(cid2) > 0) swingTicks++;
+            Vec3 now = mobs.MobOrigin(cid2);
+            Vec3 step{now.x - cPrev2.x, 0, now.z - cPrev2.z};
+            cPrev2 = now;
+            cAlong2 += step.x * face.x + step.z * face.z;
+            cPath2 += std::sqrt(step.x * step.x + step.z * step.z);
+          }
+          bool critCrawls = cPath2 > 1.0f && cAlong2 > 0.5f * cPath2;
+          bool critStates = c1 == -1 && c2 == 0 && critClip &&
+                            swingTicks == 0 && critCrawls;
+
+          bool stateOk = dummyStates && critStates;
+          std::printf(
+              "mob dismember states: %s (dummy %d->%d->%d clip=%d crawled "
+              "%.1f/%.1f vox; critter %d->%d clip=%d swingTicks=%d crawled "
+              "%.1f/%.1f vox)\n",
+              stateOk ? "PASS" : "FAIL", s0, s1, s2, dummyClip ? 1 : 0,
+              dAlong2, dPath2, c1, c2, critClip ? 1 : 0, swingTicks, cAlong2,
+              cPath2);
+          mobOk = mobOk && stateOk;
+        }
+
         debris.Reset();
         mobs.Reset();
       }
@@ -3017,6 +3092,12 @@ int main(int argc, char** argv) {
         for (const std::string& w : tune.warnings)
           std::fprintf(stderr, "tuning: %s\n", w.c_str());
         SetCurrentTuning(tune);
+        // Gore variance is drawn per mob at spawn, so mobs already standing in
+        // the world hold profiles from the OLD tuning. Re-draw them here or an
+        // edit to the randomness controls appears to do nothing until the next
+        // spawn. Same id -> same draw, so a mob keeps its identity unless the
+        // variance settings themselves changed.
+        mobs.RefreshGoreProfiles();
       }
       std::printf("reloading shaders... %s\n",
                   sim.ReloadShaders(ctx.device, ctx.instance) ? "ok" : "FAILED (kept old)");

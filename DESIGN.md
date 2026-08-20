@@ -539,6 +539,47 @@ the terrain you can see. `scripts/tuning_prelude.py` mirrors the emitter for
 `check_shaders.sh`; a name present in one and not the other fails validation
 loudly rather than drifting.
 
+#### Per-instance variance (2026-08-20)
+A tuned constant makes every instance identical: every NPC bleeds exactly the
+same amount, which is legible but lifeless. A `Variance` (`sim/tuning.h`) turns
+one authored number into a distribution — the tuned value stays the **centre**,
+and each instance draws an offset — so on a rare roll an NPC bleeds far more
+than the mean and the moment is worth watching.
+
+Stored as a sibling object next to its parameter, so the tuner's generic
+`tune[group][key]` writer round-trips it with no save-path change:
+
+```json
+"bleedGain": 1.0,
+"bleedGainVar": { "dist": "gaussian", "scope": "entity",
+                  "amount": 0.35, "sigmaClamp": 3.0 }
+```
+
+- **`dist`** — `none` | `uniform` (flat ±amount) | `gaussian` (amount is one
+  σ, clamped at `sigmaClamp` σ).
+- **`scope`** — the reason "a rare NPC is a gusher" is expressible at all.
+  `event` re-rolls per droplet (jitter *within* one wound); `entity` rolls
+  **once per mob** and holds for its life (character). Event scope on a bleed
+  rate averages out over a wound and reads as noise; entity scope reads as *this
+  one is a heavy bleeder*. Entity draws resolve at spawn into
+  `MobSystem::GoreProfile` and are re-drawn on F5 by `RefreshGoreProfiles()`.
+
+**Determinism (rule #1).** Every draw is `Hash3(seed, tick, index)` — the same
+stateless counter-based scheme the sim shaders use — so two machines at the same
+tick draw the same offset and a replay reproduces it exactly. The gaussian is
+closed-form Box-Muller, never a rejection loop, so it cannot vary in iteration
+count across machines. Verified: the world hash is unchanged at `765da1f8` with
+gore variance active, and 20k entity draws reproduce mean 1.00 / sd 0.35 with
+~2.2% of mobs past 2σ.
+
+**Where it may be applied.** Presentation and per-instance character only. It is
+deliberately unavailable on the `sim.*` integers and on material interaction
+rules: those feed voxel state through the CA, where the authored number *is* the
+physics, and randomising them makes identical collisions resolve differently for
+no legible reason. Bounded by construction (rule #2) — the gaussian tail is
+clamped and count draws floor at 0 and cap, because an unbounded draw on a spawn
+count is an unbounded particle budget.
+
 ---
 
 ## 7. Destruction, Islands, and Rigidbodies

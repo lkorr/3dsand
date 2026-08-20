@@ -70,7 +70,30 @@
     "severVoxels": 14,
     "severVoxelSpeed": 6,
     "microLifeTicks": 70,
-    "microScale": 4
+    "microScale": 4,
+    "bleedGain": 1.0,
+    "bleedGainVar": {
+      "dist": "gaussian",
+      "scope": "entity",
+      "amount": 0.35,
+      "sigmaClamp": 3.0
+    },
+    "severSprayVar": {
+      "dist": "gaussian",
+      "scope": "entity",
+      "amount": 120,
+      "sigmaClamp": 3.0
+    },
+    "bleedSpraySpeedVar": {
+      "dist": "uniform",
+      "scope": "event",
+      "amount": 0.8
+    },
+    "severSpraySpeedVar": {
+      "dist": "uniform",
+      "scope": "event",
+      "amount": 1.5
+    }
   },
   "grenade": {
     "throwSpeed": 20,

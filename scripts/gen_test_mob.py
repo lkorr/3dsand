@@ -10,6 +10,7 @@ Coordinates here are MagicaVoxel scene space (Z-up); the engine loader
 converts to Y-up. Palette index == material ID (wood=2, plant=17).
 """
 import json
+import math
 import os
 import struct
 import sys
@@ -101,8 +102,35 @@ def main():
     with open(vox_path, "wb") as f:
         f.write(data)
 
-    # Sidecar. Anchors are PREFAB-LOCAL ENGINE coords (Y-up, min corner 0):
-    # engine = (scene.x + 3, scene.z, -scene.y) for this model's extents.
+    # Quaternion helpers for authoring clip keys: (x, y, z, w), single-axis
+    # rotations in degrees, and a Hamilton product for the one combined key.
+    def qx(deg):
+        h = math.radians(deg) * 0.5
+        return [round(math.sin(h), 4), 0.0, 0.0, round(math.cos(h), 4)]
+
+    def qy(deg):
+        h = math.radians(deg) * 0.5
+        return [0.0, round(math.sin(h), 4), 0.0, round(math.cos(h), 4)]
+
+    def qz(deg):
+        h = math.radians(deg) * 0.5
+        return [0.0, 0.0, round(math.sin(h), 4), round(math.cos(h), 4)]
+
+    def qmul(a, b):
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        return [round(aw * bx + ax * bw + ay * bz - az * by, 4),
+                round(aw * by - ax * bz + ay * bw + az * bx, 4),
+                round(aw * bz + ax * by - ay * bx + az * bw, 4),
+                round(aw * bw - ax * bx - ay * by - az * bz, 4)]
+
+    # Crawl pose geometry (prefab-local, world voxels): the torso's rest anchor
+    # is its bottom-center at y=6 with the legs filling y 0..6. With both legs
+    # severed and the walk drive holding origin.y at the ground, pitching the
+    # torso ~75 deg forward about its anchor and dropping it 5 voxels lays it
+    # at y~1 — prone on the ground — with the head (a child) out in front and
+    # the arms reaching the ground to drag.
+    crawl_pitch = 75
     sidecar = {
         "root": "torso",
         "bleed": {"material": "blood", "perDamage": 2.0},
@@ -124,6 +152,75 @@ def main():
              "severable": True, "anchor": [4.5, 6.0, 0.5],
              "swingAmp": 0.5, "swingPhase": 1.0},
         ],
+        # Dismemberment locomotion: first match wins, so the most-maimed state
+        # (both legs gone) is listed before the one it would otherwise shadow.
+        "states": [
+            {"name": "crawl", "missing": ["leg.L", "leg.R"], "clip": "crawl",
+             "speedScale": 0.35, "disableGait": True},
+            {"name": "limp", "missingAny": ["leg.L", "leg.R"], "clip": "limp",
+             "speedScale": 0.6},
+        ],
+        "clips": {
+            # Prone drag: torso pitched onto the ground (see crawl_pitch note
+            # above) with a slow alternating yaw wriggle, head counter-pitched
+            # to look forward, arms alternately reaching and pulling. Override
+            # + disableGait: the clip owns every surviving part it masks.
+            "crawl": {
+                "durationMs": 900, "loop": True, "mode": "override",
+                "mask": ["torso", "head", "arm.L", "arm.R"],
+                "blendInMs": 150,
+                "tracks": {
+                    "torso": {
+                        "rot": [
+                            {"t": 0, "q": qmul(qx(crawl_pitch), qy(10)),
+                             "ease": "quadInOut"},
+                            {"t": 450, "q": qmul(qx(crawl_pitch), qy(-10)),
+                             "ease": "quadInOut"},
+                            {"t": 900, "q": qmul(qx(crawl_pitch), qy(10))},
+                        ],
+                        # constant 5-voxel drop plus a small heave on each pull
+                        "pos": [
+                            {"t": 0, "v": [0.0, -5.0, 0.0], "ease": "quadInOut"},
+                            {"t": 225, "v": [0.0, -4.7, 0.0], "ease": "quadInOut"},
+                            {"t": 450, "v": [0.0, -5.0, 0.0], "ease": "quadInOut"},
+                            {"t": 675, "v": [0.0, -4.7, 0.0], "ease": "quadInOut"},
+                            {"t": 900, "v": [0.0, -5.0, 0.0]},
+                        ],
+                    },
+                    "head": {"rot": [{"t": 0, "q": qx(-55)}]},
+                    "arm.L": {
+                        "rot": [
+                            {"t": 0, "q": qx(-110), "ease": "quadInOut"},
+                            {"t": 450, "q": qx(-60), "ease": "quadInOut"},
+                            {"t": 900, "q": qx(-110)},
+                        ]
+                    },
+                    "arm.R": {
+                        "rot": [
+                            {"t": 0, "q": qx(-60), "ease": "quadInOut"},
+                            {"t": 450, "q": qx(-110), "ease": "quadInOut"},
+                            {"t": 900, "q": qx(-60)},
+                        ]
+                    },
+                },
+            },
+            # One-legged hobble: ADDITIVE (delta against its own frame 0), so
+            # the surviving leg's phase swing keeps walking underneath while
+            # the torso rhythmically dips into a roll.
+            "limp": {
+                "durationMs": 700, "loop": True, "mode": "additive",
+                "mask": ["torso"], "blendInMs": 200,
+                "tracks": {
+                    "torso": {
+                        "rot": [
+                            {"t": 0, "q": qz(0), "ease": "quadInOut"},
+                            {"t": 350, "q": qz(12), "ease": "quadInOut"},
+                            {"t": 700, "q": qz(0)},
+                        ]
+                    }
+                },
+            },
+        },
     }
     json_path = os.path.join(out_dir, "dummy.json")
     with open(json_path, "w", encoding="utf-8") as f:

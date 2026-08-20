@@ -37,6 +37,7 @@ comment on LIMBS: authoring the nose on the wrong axis makes the mob walk
 backwards, and the `mob gait` selftest asserts against exactly that.
 """
 import json
+import math
 import os
 import struct
 import sys
@@ -279,6 +280,29 @@ def main():
     def anchor(scene_xyz):
         return to_engine(scene_xyz, min_x, max_y)
 
+    # Quaternion helpers for clip keys: (x, y, z, w), degrees, single axis.
+    def qx(deg):
+        h = math.radians(deg) * 0.5
+        return [round(math.sin(h), 4), 0.0, 0.0, round(math.cos(h), 4)]
+
+    def qy(deg):
+        h = math.radians(deg) * 0.5
+        return [0.0, round(math.sin(h), 4), 0.0, round(math.cos(h), 4)]
+
+    # Crawl leg tracks: diagonal pairs paddle in anti-phase about X (the same
+    # pairing the trot's gait groups use, so the scrabble reads as the broken
+    # remains of its old stride) while every lower leg stays folded flat. The
+    # tracks cover ALL legs; a severed one has no body and simply isn't drawn.
+    def paddle(phase_ms, period=1000):
+        half = period // 2
+        k0 = qx(40) if phase_ms == 0 else qx(-40)
+        k1 = qx(-40) if phase_ms == 0 else qx(40)
+        return {"rot": [{"t": 0, "q": k0, "ease": "quadInOut"},
+                        {"t": half, "q": k1, "ease": "quadInOut"},
+                        {"t": period, "q": k0}]}
+
+    fold = {"rot": [{"t": 0, "q": qx(-70)}]}
+
     # Joint anchors are scene-space points and must sit on the same side of the
     # body as the limb they attach: the head joint at the FRONT (scene -y), the
     # tail joint at the BACK (scene +y). These flipped with the LIMBS table.
@@ -334,6 +358,14 @@ def main():
              "pole": [0, 0, 1], "solver": "twobone"}
             for l in ("FL", "FR", "BL", "BR")
         ],
+        # Dismemberment locomotion. A single lost leg needs no rule at all —
+        # the gait state machine already drops that chain and the survivors
+        # take their turns sooner. Two unusable legs is where a trot stops
+        # making sense: drop to the belly and scrabble.
+        "states": [
+            {"name": "crawl", "minChainsLost": 2, "clip": "crawl",
+             "speedScale": 0.35, "disableGait": True},
+        ],
         # Two-key override clip, masked to the head, wired to the non-fatal
         # damage flinch. Quaternions are (x, y, z, w).
         "clips": {
@@ -351,7 +383,35 @@ def main():
                         ]
                     }
                 },
-            }
+            },
+            # Belly scrabble for the >=2-legs-lost state: with disableGait the
+            # foot-derived body height is gone and mob.bodyY settles onto the
+            # walk drive's ground contact, which alone drops the body from
+            # standing height to the ground — no torso pos key needed. The
+            # serpentine yaw wriggle and the head-up are what keep it reading
+            # as "dragging itself" rather than "sunken idle". Tail is
+            # deliberately unmasked: it is spring-jiggled, never keyed.
+            "crawl": {
+                "durationMs": 1000, "loop": True, "mode": "override",
+                "mask": ["torso", "head",
+                         "legU.FL", "legL.FL", "legU.FR", "legL.FR",
+                         "legU.BL", "legL.BL", "legU.BR", "legL.BR"],
+                "blendInMs": 200,
+                "tracks": {
+                    "torso": {
+                        "rot": [
+                            {"t": 0, "q": qy(8), "ease": "quadInOut"},
+                            {"t": 500, "q": qy(-8), "ease": "quadInOut"},
+                            {"t": 1000, "q": qy(8)},
+                        ]
+                    },
+                    "head": {"rot": [{"t": 0, "q": qx(-30)}]},
+                    "legU.FL": paddle(0), "legU.BR": paddle(0),
+                    "legU.FR": paddle(500), "legU.BL": paddle(500),
+                    "legL.FL": fold, "legL.FR": fold,
+                    "legL.BL": fold, "legL.BR": fold,
+                },
+            },
         },
     }
 

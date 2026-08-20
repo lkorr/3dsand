@@ -57,6 +57,66 @@ void ReadI(const json& j, const char* key, int& dst, Tuning& t,
   dst = v->get<int>();
 }
 
+// ---- variance readers ----------------------------------------------------
+// A variance rides alongside its parameter as a sibling object, so the tuner's
+// generic tune[group][key] writer round-trips it with no save-path changes:
+//
+//   "bleedSprayPerDrip": 3.0,
+//   "bleedSprayPerDripVar": { "dist": "gaussian", "scope": "entity",
+//                             "amount": 1.2, "sigmaClamp": 3.0 }
+//
+// Absent or dist:"none" leaves the parameter a plain constant.
+void ReadVar(const json& j, const char* key, Variance& dst, Tuning& t,
+             const std::string& at) {
+  const json* v = Find(j, key);
+  if (!v) return;
+  if (!v->is_object()) {
+    t.warnings.push_back(std::string(at) + "." + key + ": expected an object");
+    return;
+  }
+  const std::string vat = at + "." + key;
+  if (const json* d = Find(*v, "dist")) {
+    if (!d->is_string()) {
+      t.warnings.push_back(vat + ".dist: expected a string");
+    } else {
+      const std::string s = d->get<std::string>();
+      if (s == "none") dst.dist = Variance::kNone;
+      else if (s == "uniform") dst.dist = Variance::kUniform;
+      else if (s == "gaussian") dst.dist = Variance::kGaussian;
+      else t.warnings.push_back(vat + ".dist: expected none|uniform|gaussian");
+    }
+  }
+  if (const json* s = Find(*v, "scope")) {
+    if (!s->is_string()) {
+      t.warnings.push_back(vat + ".scope: expected a string");
+    } else {
+      const std::string ss = s->get<std::string>();
+      if (ss == "event") dst.scope = Variance::kEvent;
+      else if (ss == "entity") dst.scope = Variance::kEntity;
+      else t.warnings.push_back(vat + ".scope: expected event|entity");
+    }
+  }
+  ReadF(*v, "amount", dst.amount, t, vat);
+  ReadF(*v, "sigmaClamp", dst.sigmaClamp, t, vat);
+  ReadF(*v, "min", dst.minValue, t, vat);
+  ReadF(*v, "max", dst.maxValue, t, vat);
+  if (dst.amount < 0.0f) {
+    t.warnings.push_back(vat + ".amount < 0; using its magnitude");
+    dst.amount = -dst.amount;
+  }
+  // A clamp at 0 sigma would silence a gaussian entirely, which looks like the
+  // feature is broken rather than like a deliberate setting.
+  if (dst.sigmaClamp < 0.25f) {
+    t.warnings.push_back(vat + ".sigmaClamp < 0.25; clamped to 0.25");
+    dst.sigmaClamp = 0.25f;
+  }
+  if (dst.minValue > dst.maxValue) {
+    t.warnings.push_back(vat + ": min > max; ignoring both");
+    dst.minValue = -1e30f;
+    dst.maxValue = 1e30f;
+  }
+}
+
 void ReadV3(const json& j, const char* key, float dst[3], Tuning& t,
             const std::string& at) {
   const json* v = Find(j, key);
@@ -109,6 +169,76 @@ void EmitV3(std::ostringstream& o, const char* name, const float v[3]) {
 
 const Tuning& CurrentTuning() { return g_current; }
 void SetCurrentTuning(const Tuning& t) { g_current = t; }
+
+// ---- variance draws ------------------------------------------------------
+// CPU mirror of common.wgsl's pcg/hash3 — the same one mob.cpp and debris.cpp
+// carry. Stateless and counter-based (CLAUDE.md rule 1): the draw is a pure
+// function of (seed, tick, index), so it is identical on every machine and a
+// replay reproduces it. Never seed this from a counter that advances with
+// frame boundaries or iteration order.
+namespace {
+
+uint32_t VPcg(uint32_t v) {
+  uint32_t s = v * 747796405u + 2891336453u;
+  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+uint32_t VHash3(uint32_t a, uint32_t b, uint32_t c) {
+  return VPcg(a ^ VPcg(b ^ VPcg(c)));
+}
+// Uniform in [0, 1). 24 bits is well inside f32's exact-integer range, so this
+// is reproducible bit-for-bit rather than merely close.
+float Unit01(uint32_t h) {
+  return (float)(h & 0x00FFFFFFu) / 16777216.0f;
+}
+
+}  // namespace
+
+float ApplyVariance(float base, const Variance& v, uint32_t seed, uint32_t tick,
+                    uint32_t index) {
+  if (!v.on()) return base;
+  // Entity scope drops the tick and the index: one roll per seed, stable for
+  // that entity's whole life. Event scope keeps both, so every draw differs.
+  const bool entity = v.scope == Variance::kEntity;
+  const uint32_t t = entity ? 0x5E17A11u : tick;
+  const uint32_t i = entity ? 0x9E3779B9u : index;
+  const uint32_t h = VHash3(seed * 2654435761u + 0x9E3779B9u, t, i);
+
+  float off;
+  if (v.dist == Variance::kUniform) {
+    off = (Unit01(h) * 2.0f - 1.0f) * v.amount;
+  } else {
+    // Box-Muller from two independent hash words. Deterministic and closed
+    // form — no rejection loop, so it cannot vary in iteration count across
+    // machines. u1 is nudged off zero because log(0) is -inf.
+    const float u1 = Unit01(h) * 0.99999994f + 3e-8f;
+    const float u2 = Unit01(VPcg(h ^ 0xB10057u));
+    const float r = std::sqrt(-2.0f * std::log(u1));
+    const float g = r * std::cos(6.28318530718f * u2);
+    // Clamp the tail: `amount` is one sigma, and an unbounded gaussian on a
+    // spawn count is an unbounded particle budget (rule 2).
+    const float c = g < -v.sigmaClamp ? -v.sigmaClamp
+                                      : (g > v.sigmaClamp ? v.sigmaClamp : g);
+    off = c * v.amount;
+  }
+  float out = base + off;
+  if (out < v.minValue) out = v.minValue;
+  if (out > v.maxValue) out = v.maxValue;
+  return out;
+}
+
+int ApplyVarianceI(int base, const Variance& v, uint32_t seed, uint32_t tick,
+                   uint32_t index) {
+  if (!v.on()) return base;
+  const float f = ApplyVariance((float)base, v, seed, tick, index);
+  if (!std::isfinite(f)) return base;
+  const long r = std::lround(f);
+  // Counts are work. A wide draw must never ask for negative work, and must
+  // never overflow an int on its way to a loop bound.
+  if (r < 0) return 0;
+  if (r > 1000000L) return 1000000;
+  return (int)r;
+}
 
 SkyState ComputeSkyState(const Tuning& t, uint32_t phase, uint32_t dayNumber) {
   const auto& d = t.dayNight;
@@ -278,6 +408,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "severVoxelSpeed", e.severVoxelSpeed, out, at);
     ReadI(*g, "microLifeTicks", e.microLifeTicks, out, at);
     ReadI(*g, "microScale", e.microScale, out, at);
+    ReadF(*g, "bleedGain", e.bleedGain, out, at);
+    ReadVar(*g, "bleedGainVar", e.bleedGainVar, out, at);
+    ReadVar(*g, "bleedSprayPerDripVar", e.bleedSprayPerDripVar, out, at);
+    ReadVar(*g, "bleedSpraySpeedVar", e.bleedSpraySpeedVar, out, at);
+    ReadVar(*g, "bleedSprayConeVar", e.bleedSprayConeVar, out, at);
+    ReadVar(*g, "severSprayVar", e.severSprayVar, out, at);
+    ReadVar(*g, "severSpraySpeedVar", e.severSpraySpeedVar, out, at);
+    ReadVar(*g, "severSprayConeVar", e.severSprayConeVar, out, at);
+    ReadVar(*g, "severVoxelsVar", e.severVoxelsVar, out, at);
+    ReadVar(*g, "severVoxelSpeedVar", e.severVoxelSpeedVar, out, at);
+    ReadVar(*g, "severDecayTicksVar", e.severDecayTicksVar, out, at);
+    ReadVar(*g, "microLifeTicksVar", e.microLifeTicksVar, out, at);
+    // A negative or zero gain would silently disable bleeding rather than
+    // reading as a tuning mistake, so floor it just above zero.
+    if (e.bleedGain < 0.0f) {
+      out.warnings.push_back(at + ".bleedGain < 0; clamped to 0");
+      e.bleedGain = 0.0f;
+    }
     // The life field is 8 bits in Particle.flags (PMICRO_LIFE_MASK). A value
     // past 255 would wrap and produce droplets that die instantly, which reads
     // as "the spray stopped working" rather than as a bad number.

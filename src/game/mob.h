@@ -131,6 +131,11 @@ class MobSystem {
   // Nearest live limb of any mob to a body handle; -1 if none.
   bool FindLimb(uint64_t bodyHandle, uint64_t& mobId, int& limbIndex) const;
 
+  // Re-draw every live mob's gore profile against the current tuning. Called
+  // on tuning reload (F5) so a variance edit is visible on the mobs already
+  // standing there, instead of only on the next ones spawned.
+  void RefreshGoreProfiles();
+
   // Render plumbing: limbs append after the debris bodies' slots.
   bool InstancesDirty() const { return instancesDirty_; }
   void AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
@@ -160,6 +165,9 @@ class MobSystem {
   int SwingingFeet(uint64_t mobId) const;
   int PlantedFeet(uint64_t mobId) const;
   int ActiveClips(uint64_t mobId) const;
+  // Active dismemberment locomotion state: index into the def's authored
+  // `states` list (AnimSkeleton::states), -1 for normal locomotion.
+  int LocoState(uint64_t mobId) const;
 
  private:
   struct Limb {
@@ -211,10 +219,35 @@ class MobSystem {
     int flipbookModel = -1;
     std::vector<std::vector<DebrisVoxel>> frameVoxels;  // per .vox model index
   };
+  // Per-mob gore profile: the entity-scoped variance draws, resolved ONCE when
+  // the mob is created and then held for its whole life. Every mob that is made
+  // gets its own, so one NPC can be a heavy bleeder from spawn to corpse while
+  // its neighbour bleeds normally.
+  //
+  // Resolved at spawn rather than re-drawn at each use for two reasons: the
+  // draw is only stable if nothing about it varies per call site, and holding
+  // it means a mid-session tuning reload does not change the character of mobs
+  // already standing in the world (RefreshGoreProfiles re-rolls them on demand).
+  // Values are absolute (already multiplied by the whole-wound gain), so the
+  // spray sites just read them.
+  struct GoreProfile {
+    float bleedSprayPerDrip = 0;
+    float bleedSpraySpeed = 0, bleedSprayCone = 0;
+    int severSpray = 0, severDecayTicks = 1;
+    float severSpraySpeed = 0, severSprayCone = 0;
+    int severVoxels = 0;
+    float severVoxelSpeed = 0;
+    int microLifeTicks = 1;
+    float bleedGain = 1.0f;   // kept for display/debug; already folded in above
+  };
+  // Draws the entity-scoped variance for one mob id against the current tuning.
+  static GoreProfile MakeGoreProfile(uint64_t mobId);
+
   struct Mob {
     uint64_t id = 0;
     int defIndex = 0;
     bool alive = true;
+    GoreProfile gore;          // this mob's own bleed character
     float heading = 0;         // radians about +Y
     float phase = 0;           // walk cycle
     Vec3 origin{};             // mob prefab min corner, world voxels
