@@ -125,12 +125,38 @@ def main():
                 round(aw * bw - ax * bx - ay * by - az * bz, 4)]
 
     # Crawl pose geometry (prefab-local, world voxels): the torso's rest anchor
-    # is its bottom-center at y=6 with the legs filling y 0..6. With both legs
-    # severed and the walk drive holding origin.y at the ground, pitching the
-    # torso ~75 deg forward about its anchor and dropping it 5 voxels lays it
-    # at y~1 — prone on the ground — with the head (a child) out in front and
-    # the arms reaching the ground to drag.
-    crawl_pitch = 75
+    # is its bottom-center at y=6 with the legs filling y 0..6. The walk drive
+    # holds origin.y at the ground, so a pos key of -5 seats the torso's pivot
+    # ~1 voxel above it; the pitch keys then lean the torso forward about that
+    # pivot. Pitch here is measured FROM VERTICAL, so elevation-above-ground =
+    # 90 - pitch. The dismemberment ladder lowers it stage by stage:
+    # one leg 35 (still half-propped by the splayed leg), no legs 60 (~30 deg
+    # off the ground), fully limbless ~85 (flat).
+    def crawl_torso(pitch, wiggle_deg, period, drop):
+        return {
+            "rot": [
+                {"t": 0, "q": qmul(qx(pitch), qy(wiggle_deg)), "ease": "quadInOut"},
+                {"t": period // 2, "q": qmul(qx(pitch), qy(-wiggle_deg)),
+                 "ease": "quadInOut"},
+                {"t": period, "q": qmul(qx(pitch), qy(wiggle_deg))},
+            ],
+            # constant drop plus a small heave on each pull
+            "pos": [
+                {"t": 0, "v": [0.0, drop, 0.0], "ease": "quadInOut"},
+                {"t": period // 4, "v": [0.0, drop + 0.3, 0.0], "ease": "quadInOut"},
+                {"t": period // 2, "v": [0.0, drop, 0.0], "ease": "quadInOut"},
+                {"t": 3 * period // 4, "v": [0.0, drop + 0.3, 0.0],
+                 "ease": "quadInOut"},
+                {"t": period, "v": [0.0, drop, 0.0]},
+            ],
+        }
+
+    def arm_drag(reach, pull, period, phase):
+        a = qx(reach) if phase == 0 else qx(pull)
+        b = qx(pull) if phase == 0 else qx(reach)
+        return {"rot": [{"t": 0, "q": a, "ease": "quadInOut"},
+                        {"t": period // 2, "q": b, "ease": "quadInOut"},
+                        {"t": period, "q": a}]}
     sidecar = {
         "root": "torso",
         "bleed": {"material": "blood", "perDamage": 2.0},
@@ -152,72 +178,69 @@ def main():
              "severable": True, "anchor": [4.5, 6.0, 0.5],
              "swingAmp": 0.5, "swingPhase": 1.0},
         ],
-        # Dismemberment locomotion: first match wins, so the most-maimed state
-        # (both legs gone) is listed before the one it would otherwise shadow.
+        # Dismemberment locomotion ladder: first match wins, so the states are
+        # listed most-maimed first (each earlier rule's predicate is a strict
+        # superset of the ones after it). One leg -> crawl with the survivor
+        # splayed; no legs -> flatter and slower; an arm gone too -> slower
+        # still; no arms left -> flat on the ground and going nowhere.
         "states": [
-            {"name": "crawl", "missing": ["leg.L", "leg.R"], "clip": "crawl",
-             "speedScale": 0.35, "disableGait": True},
-            {"name": "limp", "missingAny": ["leg.L", "leg.R"], "clip": "limp",
-             "speedScale": 0.6},
+            {"name": "prone",
+             "missing": ["arm.L", "arm.R", "leg.L", "leg.R"],
+             "clip": "prone", "speedScale": 0.0, "disableGait": True},
+            {"name": "crawl.oneArm", "missing": ["leg.L", "leg.R"],
+             "missingAny": ["arm.L", "arm.R"],
+             "clip": "crawl.low", "speedScale": 0.12, "disableGait": True},
+            {"name": "crawl.legless", "missing": ["leg.L", "leg.R"],
+             "clip": "crawl.low", "speedScale": 0.25, "disableGait": True},
+            {"name": "crawl.oneLeg", "missingAny": ["leg.L", "leg.R"],
+             "clip": "crawl", "speedScale": 0.4, "disableGait": True},
         ],
         "clips": {
-            # Prone drag: torso pitched onto the ground (see crawl_pitch note
-            # above) with a slow alternating yaw wriggle, head counter-pitched
-            # to look forward, arms alternately reaching and pulling. Override
-            # + disableGait: the clip owns every surviving part it masks.
+            # One leg lost: half-raised drag — torso leaned 35 deg from
+            # vertical, arms doing the pulling, the surviving leg splayed out
+            # sideways and trailing (both legs carry the splay key; a severed
+            # one has no body and isn't drawn). Override + disableGait: the
+            # clip owns every surviving part it masks.
             "crawl": {
                 "durationMs": 900, "loop": True, "mode": "override",
+                "mask": ["torso", "head", "arm.L", "arm.R", "leg.L", "leg.R"],
+                "blendInMs": 150,
+                "tracks": {
+                    "torso": crawl_torso(35, 8, 900, -5.0),
+                    "head": {"rot": [{"t": 0, "q": qx(-20)}]},
+                    "arm.L": arm_drag(-110, -60, 900, 0),
+                    "arm.R": arm_drag(-110, -60, 900, 1),
+                    # splayed out to that leg's own side, trailing behind
+                    "leg.L": {"rot": [{"t": 0, "q": qmul(qz(-60), qx(25))}]},
+                    "leg.R": {"rot": [{"t": 0, "q": qmul(qz(60), qx(25))}]},
+                },
+            },
+            # Both legs lost (and also the one-armed stage, at a lower speed):
+            # 60 deg from vertical = ~30 deg off the ground, the arms doing all
+            # the work, the head craned up to see where it is dragging itself.
+            "crawl.low": {
+                "durationMs": 1100, "loop": True, "mode": "override",
                 "mask": ["torso", "head", "arm.L", "arm.R"],
                 "blendInMs": 150,
                 "tracks": {
-                    "torso": {
-                        "rot": [
-                            {"t": 0, "q": qmul(qx(crawl_pitch), qy(10)),
-                             "ease": "quadInOut"},
-                            {"t": 450, "q": qmul(qx(crawl_pitch), qy(-10)),
-                             "ease": "quadInOut"},
-                            {"t": 900, "q": qmul(qx(crawl_pitch), qy(10))},
-                        ],
-                        # constant 5-voxel drop plus a small heave on each pull
-                        "pos": [
-                            {"t": 0, "v": [0.0, -5.0, 0.0], "ease": "quadInOut"},
-                            {"t": 225, "v": [0.0, -4.7, 0.0], "ease": "quadInOut"},
-                            {"t": 450, "v": [0.0, -5.0, 0.0], "ease": "quadInOut"},
-                            {"t": 675, "v": [0.0, -4.7, 0.0], "ease": "quadInOut"},
-                            {"t": 900, "v": [0.0, -5.0, 0.0]},
-                        ],
-                    },
-                    "head": {"rot": [{"t": 0, "q": qx(-55)}]},
-                    "arm.L": {
-                        "rot": [
-                            {"t": 0, "q": qx(-110), "ease": "quadInOut"},
-                            {"t": 450, "q": qx(-60), "ease": "quadInOut"},
-                            {"t": 900, "q": qx(-110)},
-                        ]
-                    },
-                    "arm.R": {
-                        "rot": [
-                            {"t": 0, "q": qx(-60), "ease": "quadInOut"},
-                            {"t": 450, "q": qx(-110), "ease": "quadInOut"},
-                            {"t": 900, "q": qx(-60)},
-                        ]
-                    },
+                    # 60 from vertical = 30 deg of elevation above the ground,
+                    # measured with --shot-mob's limb-angle readout.
+                    "torso": crawl_torso(60, 8, 1100, -5.0),
+                    "head": {"rot": [{"t": 0, "q": qx(-40)}]},
+                    "arm.L": arm_drag(-120, -50, 1100, 0),
+                    "arm.R": arm_drag(-120, -50, 1100, 1),
                 },
             },
-            # One-legged hobble: ADDITIVE (delta against its own frame 0), so
-            # the surviving leg's phase swing keeps walking underneath while
-            # the torso rhythmically dips into a roll.
-            "limp": {
-                "durationMs": 700, "loop": True, "mode": "additive",
-                "mask": ["torso"], "blendInMs": 200,
+            # No limbs left that could move it: flat on the ground, going
+            # nowhere (the state's speedScale is 0) — only a slow writhe and a
+            # raised head say "alive, immobile" rather than "corpse".
+            "prone": {
+                "durationMs": 1600, "loop": True, "mode": "override",
+                "mask": ["torso", "head"],
+                "blendInMs": 200,
                 "tracks": {
-                    "torso": {
-                        "rot": [
-                            {"t": 0, "q": qz(0), "ease": "quadInOut"},
-                            {"t": 350, "q": qz(12), "ease": "quadInOut"},
-                            {"t": 700, "q": qz(0)},
-                        ]
-                    }
+                    "torso": crawl_torso(85, 6, 1600, -5.2),
+                    "head": {"rot": [{"t": 0, "q": qx(-55)}]},
                 },
             },
         },

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 // Layered animation runtime — see anim.h for the determinism boundary note.
 // Stage numbering matches docs/PLAN_voxel_editor.md §B:
@@ -147,37 +149,46 @@ namespace {
 
 // Sample one track at `tMs`. Keys are sorted; holds the first/last key outside
 // the range. Returns false when the track has no keys at all.
+//
+// Rot and pos are sampled INDEPENDENTLY over the fused key list: a key that
+// carries only a position must not act as a rotation key, because its rot
+// field is the default identity and every mid-segment sample would get dragged
+// toward it. First shipped symptom: a crawl clip whose torso track had rot
+// keys at 0/450/900 ms and pos keys at 0/225/450/675/900 rendered an authored
+// 75-degree pitch as ~25 degrees — the pos-only keys at 225/675 pulled each
+// rot sample most of the way back upright. Each channel interpolates between
+// its own neighbouring keys, with the ease of that channel's outgoing key.
 bool SampleTrack(const AnimTrack& tr, float tMs, Transform& out,
                  bool& gotRot, bool& gotPos) {
   if (tr.keys.empty()) return false;
   gotRot = gotPos = false;
-  if (tMs <= (float)tr.keys.front().tMs) {
-    out.rot = tr.keys.front().rot;
-    out.pos = tr.keys.front().pos;
-    gotRot = tr.keys.front().hasRot;
-    gotPos = tr.keys.front().hasPos;
+  auto channel = [&](bool AnimKey::*has, auto apply) {
+    int prev = -1, next = -1;
+    for (size_t k = 0; k < tr.keys.size(); k++) {
+      if (!(tr.keys[k].*has)) continue;
+      if ((float)tr.keys[k].tMs <= tMs) prev = (int)k;
+      else { next = (int)k; break; }
+    }
+    if (prev < 0 && next < 0) return false;      // channel absent entirely
+    if (prev < 0) { apply(tr.keys[next], tr.keys[next], 0.0f); return true; }
+    if (next < 0) { apply(tr.keys[prev], tr.keys[prev], 0.0f); return true; }
+    const AnimKey& a = tr.keys[prev];
+    const AnimKey& b = tr.keys[next];
+    float span = (float)(b.tMs - a.tMs);
+    float u = span > 0 ? (tMs - (float)a.tMs) / span : 0.0f;
+    // easing is a property of the OUTGOING key (Aseprite/ozz convention)
+    apply(a, b, ApplyEase(a.ease, u));
     return true;
-  }
-  if (tMs >= (float)tr.keys.back().tMs) {
-    out.rot = tr.keys.back().rot;
-    out.pos = tr.keys.back().pos;
-    gotRot = tr.keys.back().hasRot;
-    gotPos = tr.keys.back().hasPos;
-    return true;
-  }
-  size_t k = 0;
-  while (k + 1 < tr.keys.size() && (float)tr.keys[k + 1].tMs <= tMs) k++;
-  const AnimKey& a = tr.keys[k];
-  const AnimKey& b = tr.keys[std::min(k + 1, tr.keys.size() - 1)];
-  float span = (float)(b.tMs - a.tMs);
-  float u = span > 0 ? (tMs - (float)a.tMs) / span : 0.0f;
-  // easing is a property of the OUTGOING key (Aseprite/ozz convention)
-  u = ApplyEase(a.ease, u);
-  out.rot = QuatNlerp(a.rot, b.rot, u);
-  out.pos = a.pos + (b.pos - a.pos) * u;
-  gotRot = a.hasRot || b.hasRot;
-  gotPos = a.hasPos || b.hasPos;
-  return true;
+  };
+  gotRot = channel(&AnimKey::hasRot,
+                   [&](const AnimKey& a, const AnimKey& b, float u) {
+                     out.rot = QuatNlerp(a.rot, b.rot, u);
+                   });
+  gotPos = channel(&AnimKey::hasPos,
+                   [&](const AnimKey& a, const AnimKey& b, float u) {
+                     out.pos = a.pos + (b.pos - a.pos) * u;
+                   });
+  return gotRot || gotPos;
 }
 
 // Per-clip blend-in/out envelope: ramps up over blendInMs, and for
@@ -234,11 +245,19 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   for (size_t i = 0; i < n; i++) st.local[i] = sk.parts[i].rest;
   if (st.clips.empty()) return;
 
-  // per-part accumulators for the OVERRIDE pass
+  // Per-part accumulators for the OVERRIDE pass.
+  //
+  // acc starts at ZERO, not at Quat{} — the default-constructed Quat is the
+  // IDENTITY (0,0,0,1), and this is a weighted SUM, not a pose. Seeding it
+  // with identity silently adds an unweighted "upright" sample to every part:
+  // one clip at weight 1 then normalized to halfway between its key and rest,
+  // so an authored 90-degree crawl pitch rendered at 45 and every clip in the
+  // game was quietly at half strength. accW stays the true weight total, which
+  // is what made the bug invisible in the weights.
   static thread_local std::vector<Quat> acc;
   static thread_local std::vector<Vec3> accPos;
   static thread_local std::vector<float> accW;
-  acc.assign(n, Quat{});
+  acc.assign(n, Quat{0, 0, 0, 0});
   accPos.assign(n, Vec3{});
   accW.assign(n, 0.0f);
   static thread_local std::vector<uint8_t> touched;

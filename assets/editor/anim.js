@@ -163,37 +163,47 @@ export function applyEase(e, t) {
 }
 
 /* ============================================================================
-   Track sampling — anim.cpp:150-181 SampleTrack
+   Track sampling — anim.cpp SampleTrack
 
-   Keys are sorted by tMs; the first/last key is HELD outside the range.
-   Easing is a property of the OUTGOING key (anim.cpp:174).
+   Keys are sorted by tMs; the first/last key of a CHANNEL is held outside its
+   range. Easing is a property of the OUTGOING key of that channel.
+
+   Rot and pos are sampled INDEPENDENTLY over the fused key list (engine fix
+   2026-08-20): a key carrying only a position must not act as a rotation key —
+   its rot field is default identity, and interpolating through it dragged
+   every mid-segment rot sample toward upright (an authored 75° crawl pitch
+   rendered as ~25°). Each channel interpolates between its own neighbours.
 
    A track here is { keys: [{tMs, rot, pos, hasRot, hasPos, ease}] }.
    ========================================================================== */
 
 export function sampleTrack(track, tMs) {
   const keys = track.keys;
-  if (!keys.length) return null;                               // :151
-  if (tMs <= keys[0].tMs) {                                    // :154
-    return { rot: keys[0].rot, pos: keys[0].pos,
-             gotRot: !!keys[0].hasRot, gotPos: !!keys[0].hasPos };
-  }
-  const last = keys[keys.length - 1];
-  if (tMs >= last.tMs) {                                       // :161
-    return { rot: last.rot, pos: last.pos,
-             gotRot: !!last.hasRot, gotPos: !!last.hasPos };
-  }
-  let k = 0;                                                   // :168
-  while (k + 1 < keys.length && keys[k + 1].tMs <= tMs) k++;
-  const a = keys[k], b = keys[Math.min(k + 1, keys.length - 1)];
-  const span = b.tMs - a.tMs;                                  // :172
-  let u = span > 0 ? (tMs - a.tMs) / span : 0;
-  u = applyEase(a.ease || 'linear', u);                        // :175
+  if (!keys.length) return null;
+  const channel = has => {
+    let prev = -1, next = -1;
+    for (let k = 0; k < keys.length; k++) {
+      if (!keys[k][has]) continue;
+      if (keys[k].tMs <= tMs) prev = k;
+      else { next = k; break; }
+    }
+    if (prev < 0 && next < 0) return null;       // channel absent entirely
+    if (prev < 0) return { a: keys[next], b: keys[next], u: 0 };
+    if (next < 0) return { a: keys[prev], b: keys[prev], u: 0 };
+    const a = keys[prev], b = keys[next];
+    const span = b.tMs - a.tMs;
+    const u = span > 0 ? (tMs - a.tMs) / span : 0;
+    return { a, b, u: applyEase(a.ease || 'linear', u) };
+  };
+  const r = channel('hasRot');
+  const p = channel('hasPos');
+  if (!r && !p) return null;
   return {
-    rot: qnlerp(a.rot || qid(), b.rot || qid(), u),            // :176
-    pos: vadd(a.pos || v3(), vmul(vsub(b.pos || v3(), a.pos || v3()), u)), // :177
-    gotRot: !!(a.hasRot || b.hasRot),                          // :178
-    gotPos: !!(a.hasPos || b.hasPos),                          // :179
+    rot: r ? qnlerp(r.a.rot || qid(), r.b.rot || qid(), r.u) : qid(),
+    pos: p ? vadd(p.a.pos || v3(),
+                  vmul(vsub(p.b.pos || v3(), p.a.pos || v3()), p.u)) : v3(),
+    gotRot: !!r,
+    gotPos: !!p,
   };
 }
 
@@ -226,6 +236,9 @@ export function animSampleAndBlend(sk, st, dt) {
 
   const acc = new Array(n), accPos = new Array(n);
   const accW = new Array(n).fill(0), touched = new Array(n).fill(0);
+  // acc starts at ZERO, not identity — this is a weighted SUM, not a pose.
+  // (The engine seeded it with a default-constructed Quat, i.e. identity,
+  // which halved every clip's strength until 2026-08-20; this port was right.)
   for (let i = 0; i < n; i++) { acc[i] = { x: 0, y: 0, z: 0, w: 0 }; accPos[i] = v3(); }
   const additives = [];                                        // :213
 
@@ -904,7 +917,8 @@ export function chainLegLength(sk, chain) {
    TRANSCRIBED (C++ line cited inline above each block):
      QuatMul/Conj/AxisAngle/Dot/Normalize/Rotate/RotateInv/Nlerp/Slerp/FromTo
      ApplyEase (all 8 modes)          anim.cpp:102-122
-     SampleTrack (hold + ease-on-outgoing-key + nlerp)  anim.cpp:150-181
+     SampleTrack (per-CHANNEL hold + ease-on-outgoing-key + nlerp; rot and
+       pos interpolate between their own neighbouring keys)  anim.cpp SampleTrack
      ClipFade                          anim.cpp:185-192
      AnimSampleAndBlend (timing, loop/stop, fade, mask, additive ref-frame,
        accumulator-aligned override, normalize, kBlendEpsilon)  anim.cpp:196-293
