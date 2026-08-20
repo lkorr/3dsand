@@ -23,7 +23,6 @@
       "class": "solid",
       "density": 600,
       "hardness": 40,
-      "rubble": "dust",
       "colors": [
         "#7a5230",
         "#6e4829",
@@ -591,7 +590,6 @@
       "class": "solid",
       "density": 560,
       "hardness": 36,
-      "rubble": "dust",
       "colors": [
         "#dcd8cc",
         "#c8c3b5",

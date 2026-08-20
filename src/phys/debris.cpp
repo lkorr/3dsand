@@ -24,14 +24,18 @@ constexpr uint32_t kSupportCooldownTicks = 45;
 constexpr int kSupportMargin = 24;
 constexpr int kSupportDrainPerTick = 2;
 
-// Body budget policy. A rigidbody is expensive and permanent: a compound-shape
-// build up front, then broadphase + terrain-mesh upkeep around it every tick
-// until it settles. Loose voxels in the CA are nearly free by comparison. So
-// matter only earns a body when it is big enough to read as an object, and
-// only a few per scan / per tick — everything else goes back to the grid as
-// rubble or ballistic particles, which looks the same and costs nothing.
-constexpr uint32_t kMinBodyVoxels = 8;         // below this: rubble
-constexpr uint32_t kMaxNewBodiesPerScan = 4;   // one island scan's share
+// Body budget policy. Anything that comes loose as a coherent object earns a
+// rigidbody — a felled trunk falls as a log, not as a puff of powder. The only
+// gates are the size floor (below it matter is individual voxels, not an
+// object) and the global kMaxBodies ceiling.
+//
+// The per-scan cap used to be 4, which quietly decided that the 5th-largest
+// piece of a shattered tree — however big — crumbled to rubble instead. That
+// is what made felled wood change material on screen. It is now the body
+// ceiling itself: a scan may fill every free slot, and PostStep's oldest-first
+// despawn is what keeps the population bounded.
+constexpr uint32_t kMinBodyVoxels = 8;               // below this: rubble
+constexpr uint32_t kMaxNewBodiesPerScan = kMaxBodies;  // only the global cap
 constexpr uint32_t kMaxNewBodiesPerTick = 4;   // shatter's share, all bodies
 
 // Fragments broken off a BURNING body face a much higher bar than a fresh
@@ -106,8 +110,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matSelfActive_.clear();
   matHasPair_.clear();
   reactions_ = reactions;
-  int gravel = FindMaterialId(mats, "gravel");
-  int dust = FindMaterialId(mats, "dust");
+  uint32_t selfIdx = 0;
   for (const auto& m : mats) {
     classOf_.push_back(m.gpu.klass);
     densityOf_.push_back((float)m.gpu.density);
@@ -121,14 +124,15 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     }
     matSelfActive_.push_back(selfActive);
     matHasPair_.push_back(hasPair);
+    // Rubble = what a voxel becomes when it crumbles to loose matter. An
+    // undeclared rubble form defaults to the material ITSELF: a scrap of wood
+    // is still wood, and transmuting it (the old organic->dust / ->gravel
+    // guess) is why a felled tree's leftovers came out yellow-tan instead of
+    // brown. Materials that genuinely pulverize say so in JSON.
     int r = m.rubble.empty() ? -1 : FindMaterialId(mats, m.rubble);
-    if (r < 0) {
-      bool organic = false;
-      for (const auto& t : m.tags)
-        if (t == "organic" || t == "flammable") organic = true;
-      r = organic && dust > 0 ? dust : (gravel > 0 ? gravel : 0);
-    }
+    if (r < 0) r = (int)selfIdx;
     rubbleOf_.push_back((uint32_t)r);
+    selfIdx++;
     uint8_t foliage = 0;
     for (const auto& t : m.tags)
       if (t == "foliage") foliage = 1;
@@ -237,7 +241,8 @@ bool DebrisSystem::EventReady(const Event& e, World& world, uint32_t required) c
 }
 
 void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& world,
-                                      std::vector<CellOp>& cellOps) {
+                                      std::vector<CellOp>& cellOps,
+                                      std::vector<ParticleSpawn>& spawns) {
   const int dx = e.hi.x - e.lo.x + 1;
   const int dy = e.hi.y - e.lo.y + 1;
   const int dz = e.hi.z - e.lo.z + 1;
@@ -378,11 +383,14 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
                      madeThisScan < kMaxNewBodiesPerScan &&
                      bodies_.size() < kMaxBodies;
     if (!worthBody) {
-      // rubble handoff: crumble to the powder form, stay in the CA. Foliage
-      // clumps vanish instead: procgen crowns dither their rims with isolated
-      // voxels by design, so any support scan near a tree finds hundreds of
-      // sub-8 leaf "islands" — as rubble that was a rain of ash through the
-      // canopy the first time a tree burned or anything moved nearby.
+      // Rubble handoff: too small to read as an object, so it crumbles to
+      // individual voxels. It keeps its own material unless the JSON names a
+      // rubble form (stone -> gravel, glass -> sand); matter is never
+      // transmuted just because it came loose. Foliage clumps vanish instead:
+      // procgen crowns dither their rims with isolated voxels by design, so any
+      // support scan near a tree finds hundreds of sub-8 leaf "islands" — as
+      // rubble that was a rain of ash through the canopy the first time a tree
+      // burned or anything moved nearby.
       for (size_t i : comp.cells) {
         int x = (int)(i % dx), y = (int)((i / dx) % dy), z = (int)(i / ((size_t)dx * dy));
         int wx = e.lo.x + x, wy = e.lo.y + y, wz = e.lo.z + z;
@@ -393,8 +401,30 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
           continue;
         }
         uint32_t rub = mat < rubbleOf_.size() ? rubbleOf_[mat] : 0;
-        uint32_t word = (rub & 0xFFF) | (((cellIdx * 2654435761u) >> 8 & 3u) << 12) |
-                        (0xFFu << 16);
+        // palette variant, not a raw 2-bit mask: `& 3u` produced state 3, which
+        // no material has a colour for (the shaders all select with `% 3u`).
+        uint32_t state = ((cellIdx * 2654435761u) >> 8) % 3u;
+        if (rub < matGpu_.size() && matGpu_[rub].klass == CLASS_LIQUID)
+          state = 7u;  // LIQ_FULL_STATE: the nibble is fullness for liquids
+        // A scrap that keeps its own SOLID material cannot fall in the grid
+        // (sim_step returns early for CLASS_SOLID), so writing it back in place
+        // would leave it hanging where its support used to be. Hand it to the
+        // particle system instead: it carries the payload verbatim, falls, and
+        // rejoins the grid as itself. Powder/liquid rubble still goes straight
+        // back to the CA, which already moves it.
+        bool frozen = rub < matGpu_.size() && matGpu_[rub].klass == CLASS_SOLID;
+        if (frozen && spawns.size() < kMaxParticleSpawnsPerTick) {
+          ParticleSpawn s{};
+          s.px = (int32_t)((wx * 256) + 128);
+          s.py = (int32_t)((wy * 256) + 128);
+          s.pz = (int32_t)((wz * 256) + 128);
+          s.payload = (uint16_t)((rub & 0xFFF) | (state << 12));
+          s.flags = 1u;  // PFLAG_ALIVE
+          spawns.push_back(s);
+          cellOps.push_back({cellIdx, 0u});  // vacate the grid cell
+          continue;
+        }
+        uint32_t word = (rub & 0xFFF) | (state << 12) | (0xFFu << 16);
         cellOps.push_back({cellIdx, word});
       }
       lastCellWriteTick_ = tick;
@@ -464,7 +494,7 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
     uint32_t required = std::max(e.tick, lastCellWriteTick_);
     if (EventReady(e, world, required)) {
       events_.pop_front();
-      RunIslandDetection(e, tick, world, cellOps);
+      RunIslandDetection(e, tick, world, cellOps, spawns);
       // terrain under the blast changed: sleeping debris nearby must re-check
       Vec3 c{(float)(e.lo.x + e.hi.x) * 0.5f, (float)(e.lo.y + e.hi.y) * 0.5f,
              (float)(e.lo.z + e.hi.z) * 0.5f};

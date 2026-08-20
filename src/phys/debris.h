@@ -125,7 +125,8 @@ class DebrisSystem {
 
   bool EventReady(const Event& e, World& world, uint32_t required) const;
   void RunIslandDetection(const Event& e, uint32_t tick, World& world,
-                          std::vector<CellOp>& cellOps);
+                          std::vector<CellOp>& cellOps,
+                          std::vector<ParticleSpawn>& spawns);
   void ManageTerrain(uint32_t tick, World& world);
   // Body burn: a CPU mirror of the reaction table over body voxel payloads,
   // so detached matter keeps burning (embers advance to ash, emit real fire
