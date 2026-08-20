@@ -49,9 +49,14 @@ double NowSec() {
   return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+// fogDensity defaults to the fully-filled-cascade pin so every call site that
+// renders against complete far-field data (the selftest's benchmark,
+// screenshot, and debris views) stays a one-liner. The live frame loop passes
+// the smoothed adaptive value instead (plan phase 3B).
 void WriteRenderParams(const wgpu::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
-                       bool shadows, float time) {
+                       bool shadows, float time,
+                       float fogDensity = kFarFogDensity) {
   RenderParams rp{};
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
   rp.camPos[0] = eye.x; rp.camPos[1] = eye.y; rp.camPos[2] = eye.z;
@@ -64,7 +69,7 @@ void WriteRenderParams(const wgpu::Queue& queue, const World& world,
   rp.flags = shadows ? 1u : 0u;
   Vec3 sun = Vec3{0.45f, 0.78f, 0.32f}.normalized();
   rp.sunDir[0] = sun.x; rp.sunDir[1] = sun.y; rp.sunDir[2] = sun.z;
-  rp.fogDensity = kFarFogDensity;  // horizon fades at the far-field extent
+  rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
@@ -407,11 +412,21 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   std::printf("sim: %.2f ms/tick (active scene, includes submit overhead)\n", simMs);
 
   // far-field cascades: fill fully (render-only, ~6 dispatches) so the render
-  // benchmark + screenshot cover the far march with real data
+  // benchmark + screenshot cover the far march with real data.
+  //
+  // This drain is also the gate for the phase-3 adaptive fog radius: the queue
+  // starts full (nothing filled) and ends empty, so SafeRadiusMeters must
+  // start at the cold-start floor, never go BACKWARDS while draining (fog that
+  // re-closes as data arrives would pop the wrong way), and finish at the full
+  // outermost half-extent.
+  bool fogOk = false;
   {
     FarField far;
     far.Init(&world);
     far.FullRefill({108 >> 4, 122 >> 4, 108 >> 4});
+    const float coldR = far.SafeRadiusMeters();
+    float prevR = coldR;
+    bool monotone = true;
     uint32_t n;
     while ((n = far.PrepareTick(ctx.queue)) > 0) {
       TickParams tp{0, kDefaultSeed, 0, 0};
@@ -421,8 +436,79 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       sim.EncodeFarFill(enc, n);
       wgpu::CommandBuffer cmd = enc.Finish();
       ctx.queue.Submit(1, &cmd);
+      float r = far.SafeRadiusMeters();
+      if (r < prevR) monotone = false;
+      prevR = r;
     }
     ctx.WaitIdle();
+    // cold start: level 1 still pending -> only the residency window is trusted
+    const float wantCold = (float)(kWorldN >> 1) * kVoxelMeters;
+    const float wantFull =
+        (float)(kWorldN >> 1) * (float)(1u << kFarLevels) * kVoxelMeters;
+    fogOk = std::abs(coldR - wantCold) < 1e-3f && monotone &&
+            std::abs(prevR - wantFull) < 1e-3f;
+    std::printf("far fog radius: %s (cold %.1f m -> filled %.1f m, monotone=%d)\n",
+                fogOk ? "PASS" : "FAIL", coldR, prevR, monotone ? 1 : 0);
+  }
+
+  // far-field phase 2 (edits at distance): paint a distinctive block into a
+  // resident region well above terrain, run a few ticks, and verify the
+  // cascade cells covering it now read that material. Proves the dirty-driven
+  // downsample (worldgen.wgsl `fardown`) actually reaches farVox — without it
+  // the cascades still hold pristine procgen (air up here) and the edit
+  // vanishes the moment the player walks away.
+  bool farDownOk = false;
+  {
+    // The window origin is {0,0,0} in this section, so world cells 0..255 are
+    // resident; (140, 200, 140) is open air well above the hills and canopy.
+    const IVec3 c{140, 200, 140};
+    // One level-1 cell spans 2 fine voxels and is sampled at (cc << 1) + 1;
+    // the 3x3x3 cell block centered on the paint sits well inside radius 6.
+    auto farByte = [&](IVec3 cc) {
+      uint64_t bi = World::SlotCellIndex(cc);  // == farVoxByteIndex(1, cc)
+      wgpu::Buffer staging = CreateBuffer(
+          ctx.device, 4, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+          "farVoxRead");
+      wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      enc.CopyBufferToBuffer(world.farVox, bi & ~3ull, staging, 0, 4);
+      wgpu::CommandBuffer cmd = enc.Finish();
+      ctx.queue.Submit(1, &cmd);
+      uint32_t word = 0;
+      wgpu::Future f = staging.MapAsync(
+          wgpu::MapMode::Read, 0, 4, wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            if (status == wgpu::MapAsyncStatus::Success) {
+              std::memcpy(&word, staging.GetConstMappedRange(0, 4), 4);
+              staging.Unmap();
+            }
+          });
+      ctx.instance.WaitAny(f, UINT64_MAX);
+      return (word >> ((bi & 3ull) * 8)) & 0xFFu;
+    };
+    auto scan = [&](uint32_t want) {
+      uint32_t n = 0;
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+            if (farByte({(c.x >> 1) + dx, (c.y >> 1) + dy, (c.z >> 1) + dz}) == want)
+              n++;
+      return n;
+    };
+    // before: the sieve filled these cells from pristine procgen — open sky,
+    // so all 27 must read air. Guards the gate against passing vacuously.
+    uint32_t airBefore = scan(kMatAir);
+    for (uint32_t t = 1; t <= 4; t++) {
+      std::vector<BrushOp> ops;
+      if (t == 1) ops.push_back({c.x, c.y, c.z, 6, kMatGlass, 1u /*overwrite*/, 0, 0});
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, {}, false, {8, 12, 8},
+                 false, false);
+    }
+    ctx.WaitIdle();
+    uint32_t glassAfter = scan(kMatGlass);
+    farDownOk = airBefore == 27 && glassAfter == 27;
+    std::printf("far downsample: %s (%u/27 level-1 cells air before the edit, "
+                "%u/27 read glass after)\n",
+                farDownOk ? "PASS" : "FAIL", airBefore, glassAfter);
   }
 
   // render perf: offscreen 1080p
@@ -435,9 +521,13 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   wgpu::TextureView view = offscreen.CreateView();
 
   Camera cam;
-  cam.yaw = 0.785f;   // overlook the water pool at (176,176)
-  cam.pitch = -0.5f;
-  Vec3 eye{108, 122, 108};
+  cam.yaw = 0.785f;   // look out over the forest from above the canopy
+  cam.pitch = -0.35f;
+  // Anchored to the local ground, not a fixed y: terrain now reaches y140 and
+  // a hardcoded eye height buried the camera inside a hillside (the render
+  // benchmark then timed a screenful of dirt, and the screenshot showed one).
+  // 20 m up clears the canopy on any ridge.
+  Vec3 eye{108, (float)(World::TerrainHeight(108, 108, kDefaultSeed) + 120), 108};
 
   double bestFrameMs = 1e9;
   for (int pass = 0; pass < 2; pass++) {
@@ -462,8 +552,9 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     bestFrameMs = std::min(bestFrameMs, ms);
   }
 
-  // screenshot
-  {
+  // Read the offscreen target back and write it out. Shared by the standard
+  // screenshot and the far-field view below.
+  auto grab = [&](const char* path) {
     wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
                                      "screenshot");
@@ -491,8 +582,35 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           }
         });
     ctx.instance.WaitAny(f, UINT64_MAX);
-    if (got && WriteBmp("screenshot.bmp", pixels, W, H))
-      std::printf("wrote screenshot.bmp\n");
+    if (got && WriteBmp(path, pixels, W, H)) std::printf("wrote %s\n", path);
+  };
+
+  // screenshot
+  grab("screenshot.bmp");
+
+  // far-field view (plan phase 3): the standard screenshot looks DOWN at the
+  // near forest, where cascade data barely appears. This one puts the camera
+  // high with a near-level horizon so the cascade bands fill most of the
+  // frame — the only way to actually see the level seams the phase-3 dither
+  // targets, and the swiss-cheese check for coarse-level cave sampling.
+  {
+    Camera farCam;
+    farCam.yaw = 0.785f;      // look diagonally out over open terrain
+    farCam.pitch = -0.20f;    // shallow: horizon high in the frame
+    // Well above the canopy on purpose. At tree height a single trunk in front
+    // of the lens fills the frame and the shot shows no far field at all —
+    // which is exactly what happened when worldgen grew taller trees.
+    Vec3 farEye{140, 220, 140};
+    WriteRenderParams(ctx.queue, world, farEye, farCam, (float)W / H, true, 0);
+    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder rp =
+        sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    wgpu::CommandBuffer cmd = enc.Finish();
+    ctx.queue.Submit(1, &cmd);
+    ctx.WaitIdle();
+    grab("screenshot_far.bmp");
   }
 
   // player walk test: drop onto terrain through the real async-mirror path
@@ -729,8 +847,14 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       for (int i = 0; i < 120; i++) mobTick({});
       Vec3 walked = mobs.MobOrigin(id);
       float dist = (walked - spawnPos).len();
+      // The mob wanders ~20 voxels over these 120 ticks, and terrain averages
+      // ~0.34 voxels of fall per voxel travelled, so a healthy mob legitimately
+      // ends up several voxels below where it started. The bound only has to
+      // catch "fell through the world" / "stuck in the air", not honest walking
+      // downhill — it was 6.0 when hills spanned 45 voxels and the mob grazed
+      // it at exactly -6.0 once hills spanned 90.
       bool standing = mobs.IsAlive(id) && mobs.LimbBodyCount() == 6 &&
-                      std::abs(walked.y - (float)(h + 1)) < 6.0f;
+                      std::abs(walked.y - (float)(h + 1)) < 16.0f;
 
       // sever arm.L (limb index 2 in the generated sidecar)
       uint32_t debrisBefore = debris.BodyCount();
@@ -1103,7 +1227,8 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
   bool pass = deterministic && walkOk && sleepOk && debrisOk && prefabOk &&
-              mobOk && settleOk && pushOk && saveOk && storeOk && streamOk;
+              mobOk && settleOk && pushOk && saveOk && storeOk && streamOk &&
+              farDownOk && fogOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
@@ -1280,6 +1405,11 @@ int main(int argc, char** argv) {
   float fpsSmooth = 0, frameMsSmooth = 0, tickMsSmooth = 0, frameMsWorst = 0;
   double fpsWinStart = lastTime, fpsWinWorst = 0;
   int fpsWinFrames = 0;
+  // Adaptive fog (plan phase 3B): the queue is drained by whole planes, so the
+  // trusted radius jumps in steps. Start at the cold-start ceiling (nothing is
+  // filled yet at this point — FullRefill above just queued everything) and
+  // ease outward as the bands land.
+  float fogSmooth = kFarFogDensityMax;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -1653,9 +1783,19 @@ int main(int argc, char** argv) {
     wgpu::TextureView target = ctx.AcquireFrame();
     if (target) {
       Vec3 eye = player.EyePos();
+      // Adaptive fog: pin the fade to whatever cascade radius is actually
+      // filled, so a backlogged refill (spawn, load, teleport, sprinting past
+      // a level's hysteresis) fogs out the pending bands instead of showing
+      // sky holes through them. Clamped to [kFarFogDensity, kFarFogDensityMax]
+      // — never thinner than the full-horizon pin, never so thick that the
+      // residency window itself disappears — then eased so the horizon opens
+      // smoothly rather than stepping with each landed plane.
+      float fogTarget = std::clamp(kFogOpticalDepths / far.SafeRadiusMeters(),
+                                   kFarFogDensity, kFarFogDensityMax);
+      fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
       WriteRenderParams(ctx.queue, world, eye, cam,
                         (float)ctx.width / (float)ctx.height, ui.shadows,
-                        (float)now);
+                        (float)now, fogSmooth);
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;

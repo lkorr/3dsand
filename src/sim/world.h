@@ -34,7 +34,10 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatStem = 20, kMatFlower = 21, kMatVine = 22, kMatFungus = 23,
                    kMatDust = 24, kMatMoltenGlass = 25, kMatGlass = 26,
                    kMatSourceWater = 27, kMatSourceSand = 28, kMatSourceLava = 29,
-                   kMatVoid = 30, kMatMite = 31, kMatBlood = 32;
+                   kMatVoid = 30, kMatMite = 31, kMatBlood = 32,
+                   // forest set: inert (no growth reactions) — see materials.json
+                   kMatGrass = 33, kMatLeaves = 34, kMatPineNeedles = 35,
+                   kMatAutumnLeaves = 36, kMatBirchWood = 37, kMatPetal = 38;
 
 // Must match BrushOp in common.wgsl (32 bytes).
 struct BrushOp {
@@ -144,10 +147,29 @@ struct RenderParams {
 // untouched by construction.
 constexpr uint32_t kFarLevels = 6;      // outermost half-extent: 1024 m
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
-// Fog density such that opacity ~= 1 (4.5 optical depths) at the outermost
-// level's half-extent from the centered player.
+// Fog reaches ~full opacity (exp(-4.5) ~= 1%) at whatever radius it is pinned
+// to; kFogOpticalDepths is that budget, shared by the static pin below and by
+// the adaptive term in WriteRenderParams.
+constexpr float kFogOpticalDepths = 4.5f;
+// Fog density such that opacity ~= 1 at the outermost level's half-extent from
+// the centered player. This is the FLOOR of the adaptive density (phase 3B):
+// the fully-filled cascade is the farthest anything is ever visible, so fog is
+// never thinner than this.
 constexpr float kFarFogDensity =
-    4.5f / ((float)(kWorldN << kFarLevels) * kVoxelMeters * 0.5f);
+    kFogOpticalDepths / ((float)(kWorldN << kFarLevels) * kVoxelMeters * 0.5f);
+// Ceiling of the adaptive density (phase 3B). While a cold start / teleport
+// has cascade fills outstanding, fog closes in to hide the unfilled bands —
+// but never nearer than cascade level 2's half-extent, which is 4x the
+// residency window's own half-extent. That keeps the *simulated* world (the
+// thing the player is standing in and editing) fully visible no matter how
+// backlogged the fill queue is; only the LOD horizon ever gets fogged away.
+constexpr float kFarFogDensityMax =
+    kFogOpticalDepths / ((float)(kWorldN << 2) * kVoxelMeters * 0.5f);
+// Per-frame exponential approach of fog density toward its target. Cascade
+// bands land in whole planes, so an instantly-applied density steps visibly as
+// the queue drains; ~0.08/frame fades the horizon open over ~0.5 s instead.
+// Render-only smoothing — the sim never sees it (CLAUDE.md rule 1).
+constexpr float kFogLerpPerFrame = 0.08f;
 
 // Must match FarParams in common.wgsl. Origins are per level, in that level's
 // chunk units (one level-k chunk = 16 level cells = 2^k fine chunks).
@@ -298,6 +320,8 @@ class World {
 
   // ---- far-field cascades (render-only; never bound in any sim pipeline) ----
   wgpu::Buffer farVox;   // kFarLevels x 256^3 material bytes, packed 4/u32
+                         // (atomic in the fill/downsample kernels: partial-word
+                         // byte updates from neighboring dirty chunks race)
   wgpu::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
   wgpu::Buffer farList;  // kFarListCap u32 fill entries: (level-1)<<12 | slot
   wgpu::Buffer farUBO;   // FarParams

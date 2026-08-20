@@ -491,17 +491,54 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   radius). Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
-  level-chunks/tick, managed by `sim/farfield`). Rays that exit the fine
+  level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field
+  (phase 2):** each tick, `worldgen.wgsl fardown` runs one workgroup per entry
+  of the compacted dirty list — the same `DispatchWorkgroupsIndirect` args the
+  occupancy update uses, so a settled world dispatches nothing — and re-derives
+  from the LIVE voxel grid every cascade cell whose sample point falls in a
+  chunk that changed. It samples the identical center voxel the sieve does, so
+  edited and pristine regions agree exactly where they meet, and a chunk edited
+  while resident leaves its downsampled ghost behind automatically (eviction
+  needs no special handling). Because a level-k word packs 4 cells = 4·2^k fine
+  voxels — wider than a 16-voxel chunk for k ≥ 2 — neighboring chunks' byte
+  writes collide, so `farVox`/`farOcc` are atomic in both far kernels
+  (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
+  keeps it conservative: never falsely zero). Atomics are legal here precisely
+  because cascades carry no determinism requirement. Rays that exit the fine
   window without a hit continue through the cascade boxes with the same
   occupancy-skipped DDA in level-cell units; t-ordering (each level starts at
   the previous box's exit) keeps coarse data from ever occluding fine data.
-  Far hits shade with palette + N·L, no shadow rays; fog density is a uniform
-  pinned so opacity ≈ 1 at the outermost level. Determinism is untouched by
-  construction: cascades are derived render-only data — never read by the
-  sim, never hashed, no MutationQueue involvement. Known phase-1 limits:
-  player edits are invisible beyond the window (phase 2 = dirty-driven
-  downsample), center-sampling terraces the far surface (phase 3 = dithered
-  transitions), cascades regenerate from seed on load rather than persisting.
+  Far hits shade with palette + N·L, no shadow rays.
+  **Transition polish (phase 3):** each handoff — the window→level-1 one and
+  every level→level one — is pulled NEARER by a per-pixel hash of the fragment
+  coordinate, up to half a cell of the outer level at that seam
+  (`farDither` in `raymarch.wgsl`), so the constant-distance ring where the
+  representation changes dissolves into a static stipple. The offset is
+  strictly one-sided because the levels tile `t`-space exactly: pushing a
+  handoff *farther* opens a band that no level marches and rays fall straight
+  through it (measured as thousands of speckled holes when it was first written
+  two-sided). The hash takes no time input and is keyed on screen space — a
+  temporal key crawls, a world-space key re-aligns into arcs as the boxes
+  recenter. Fog density is a uniform tracking the cascade radius that is
+  actually FILLED: `FarField` counts pending fills per level and reports the
+  half-extent of the level below the innermost incomplete one, so a cold start
+  or teleport fogs out the bands still in the queue instead of showing sky
+  through them, clamped between the full-horizon pin (`kFarFogDensity`) and a
+  ceiling at level 2's half-extent (`kFarFogDensityMax`, so the residency
+  window is never fogged away) and eased over a few frames. Determinism is
+  untouched by construction: cascades are derived render-only data — never
+  read by the sim, never hashed, no MutationQueue involvement (the selftest's
+  `far downsample` gate proves the propagation works while the determinism
+  gate proves the hash is unmoved). Remaining limits: center-sampling terraces
+  the surface *within* a level (the dither only addresses the seams between
+  levels; a real blend would cost a second march per pixel), cascades
+  regenerate from seed on load rather than persisting, and an edit landing on
+  a hash tick (every 15th, which takes the whole-world occupancy path and
+  never compacts the dirty list) propagates one tick late. Coarse-level cave
+  suppression was assessed and rejected: `caveAt` carves enclosed column bands
+  capped at `h - 10`, so caves never breach the surface and coarse center
+  samples never land in a void — verified by rendering levels 4–6 with fog at
+  3% of nominal, which shows solid terrain with no swiss-cheese.
 - Later: emissive materials feeding a cheap GI (light propagation volumes or
   per-chunk flood lighting), volumetrics for gases.
 
@@ -624,6 +661,70 @@ CMake.**
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **v0.5.4 (2026-08-19)** — forest overworld. The world was one desert; it is
+> now forest-dominant, driven by a low-frequency biome field (forest / meadow /
+> pine slopes, with the old sand desert kept as a rare ~12% destination biome
+> and snow still overriding above height 80). Surface caps as a one-voxel grass
+> skin directly over stone — deliberately NOT over a dirt layer, because `dirt`
+> is a powder and a loose shell under a solid skin avalanches out from under the
+> grass on every slope, so the whole surface creeps and never sleeps. Ponds fill
+> noise basins to a local water table, kept independent of the cave bands (a
+> cave breaching a pond drains it forever, the same failure the authored rims
+> already avoid). Trees: 5 procedural species (oak, great oak, pine, birch,
+> bush) placed one-per-16² XZ tile by tile hash and sampled from the 5×5 tile
+> neighborhood so canopies overhang tile borders — pure `genCell()`, so a tree
+> straddling a chunk boundary generates identically from either side and the
+> far-field cascades get it for free.
+>
+> Six new INERT materials (grass, leaves, pine_needles, autumn_leaves,
+> birch_wood, petal). Inert is the whole point: they carry organic/flammable
+> tags so fire, acid, mites and the laser treat them like the reactive garden,
+> but no reaction uses them as a growing `self`. Worldgen paints foliage by the
+> million, and a generated forest of `stem` would keep every chunk in the world
+> awake forever (rule 2). Relatedly, worldgen no longer scatters reactive
+> `seed` at all — even at 1/4000 the stalks outgrew the oaks, and being the only
+> moving thing in frame they were what the world looked like. The garden is
+> unchanged and one brush stroke away; it just isn't the default overworld.
+> Settled world now measures **0 active chunks** (was 4).
+>
+> **World scale (the second pass).** The first cut sized everything in bare
+> voxel counts, which silently assumed a voxel was about a metre. It isn't:
+> `kVoxelMeters` is 6.25 cm, so there are 16 voxels to the metre and the player
+> capsule is 27 voxels tall. Every feature was therefore a tabletop model of
+> itself — 4 m hills, a 2 m "lake", 0.9 m ruins with a mouse-hole door, and
+> "oaks" whose 10-voxel trunks stood 60 cm high. Fixed by making scale explicit:
+> a single `HSCALE` (currently 2) multiplies every horizontal noise cell — hills,
+> biome field, lake basins, cave masks, flora clumps, the ruin tile — and tree
+> and building dimensions are written in metres (`VOX_PER_M`) or tenths of a
+> metre, never as raw voxel counts. Trees are now 5.5-12 m with trunk radius
+> proportional to height and tapering; ruins are 7 m square with a 2 m doorway;
+> the spawn platform is a 5 m deck on posts.
+>
+> Vertical is deliberately NOT on `HSCALE`. The residency window is 256 voxels
+> = 16 m tall and does not stream in Y, so height is a hard budget: hills got
+> ~2.5x (band y32..y140) and no more, because a 6 m tree crown on the highest
+> ridge has to still fit under y256. The old bare `80` treeline became
+> `TREELINE` sized to the new band. `World::TerrainHeight` mirrors the new
+> `baseHeight` exactly, `HSCALE` included — they must stay bit-identical.
+>
+> Three things this shook out. (0) The mob walk test bounded vertical drift at
+> 6 voxels; over a 90-voxel height range a mob walking 20 voxels honestly
+> descends ~7, and it failed at exactly -6.0. The bound exists to catch "fell
+> through the world", not honest downhill walking — raised to 16. Measured
+> first: mean |dh/dx| only went 0.29 -> 0.34 and max step stayed 2, so the
+> terrain is not meaningfully steeper, just taller. (1) The selftest's
+> debris/burn/shatter fixtures
+> drop bodies on fixed columns whose margins were tuned against loose sand, and
+> a single solid grass tuft one voxel up is enough to rest a burning body higher
+> and change which of its voxels the fire reaches — so those pads keep the
+> original bare sand cap (`onFixturePad`), and a wider spawn clearing keeps
+> ponds and trunks off the fixture sites. (2) `DebrisSystem::Reset()` did not
+> reset `nextSerial_`, and body serials seed the burn RNG — so a body's fire
+> outcome depended on how many bodies happened to exist earlier in the process.
+> That silently coupled unrelated scenarios: a worldgen tweak that changed how
+> many islands an earlier test produced re-rolled a later fire. Reset now clears
+> it, making a burn a function of its scenario rather than of history.
+
 > **v0.5.3 (2026-08-19)** — far-field cascades: view distance from ~1 window
 > radius to ~64 window radii (§9, docs/PLAN_far_field_cascades.md phase 1).
 > Six nested render-only 256³ LOD volumes (1 material byte/cell, 2^k-voxel
@@ -706,7 +807,8 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
 > detector then correctly-but-endlessly converts to debris), lava pools on
 > deep cavern floors, sparse ruin POIs per 256² tile, authored set pieces at
 > their absolute coords (cave-free under pool rims: a breached rim drains the
-> pool forever and the world never sleeps).
+> pool forever and the world never sleeps). Surface biomes, ponds and the
+> procedural forest layered on top of this in v0.5.4.
 > **Debris:** GPU support-loss flags (§7) — the CA reports supporting-voxel
 > removal next to solids (burnt stems, ember→ash, undermined slabs) through a
 > side-channel buffer; CPU turns flags into cooldown-limited island checks.

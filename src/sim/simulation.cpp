@@ -154,8 +154,10 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
     renderPL_ = device.CreatePipelineLayout(&d);
   }
   {
-    // far-field cascade fill: slim sim group 0 (the `far` entry statically
-    // uses only materials + TickParams there) + far buffers as group 1
+    // far-field cascade fill + downsample: slim sim group 0 (`far` statically
+    // uses only materials + TickParams; `fardown` adds voxels) + far buffers
+    // as group 1. 4 storage entries in slim + 4 here = 8, well under Dawn's
+    // 16-per-stage layout limit.
     auto entry = [](uint32_t binding, wgpu::BufferBindingType type) {
       wgpu::BindGroupLayoutEntry e{};
       e.binding = binding;
@@ -169,6 +171,7 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(1, T::Storage),          // farOcc
         entry(2, T::ReadOnlyStorage),  // farList
         entry(3, T::Uniform),          // FarParams
+        entry(4, T::ReadOnlyStorage),  // dirtyList (phase-2 downsample work set)
     };
     wgpu::BindGroupLayoutDescriptor d{};
     d.entryCount = std::size(entries);
@@ -276,6 +279,7 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(1, world_->farOcc),
         b(2, world_->farList),
         b(3, world_->farUBO),
+        b(4, world_->dirtyList),
     };
     wgpu::BindGroupDescriptor d{};
     d.layout = farBGL_;
@@ -326,6 +330,7 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
   worldgenList_ = MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
   farFill_ = MakeComputePipeline(device, farPL_, mWorldgen, "far", "farFill");
+  farDown_ = MakeComputePipeline(device, farPL_, mWorldgen, "fardown", "farDown");
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
   mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells");
   compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact");
@@ -559,6 +564,24 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
       pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
       pass.SetPipeline(pick_);
       pass.DispatchWorkgroups(1, 1, 1);
+      pass.End();
+    }
+    // Far-field phase 2: downsample the same compacted dirtyOut list into the
+    // cascades, so edits stay visible after the player walks away (render-only
+    // derived data — DESIGN.md §9). Rides the SAME indirect args as the
+    // occupancy update, so a settled world dispatches nothing. Separate pass:
+    // it uses farPL_ (slim group 0 + far group 1), not simPL_.
+    // NOTE: hash ticks (every 15th) skip this — they take the whole-world
+    // occupancy branch above and never compact dirtyOut, so there is no work
+    // list. A chunk edited on a hash tick is still dirty the next tick and
+    // downsamples then; only single-tick-then-settle edits landing exactly on
+    // a hash tick propagate one tick late, which is invisible in practice.
+    {
+      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      pass.SetBindGroup(0, simSlimBG_[page_]);
+      pass.SetBindGroup(1, farBG_);
+      pass.SetPipeline(farDown_);
+      pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
       pass.End();
     }
   }

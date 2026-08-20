@@ -128,13 +128,90 @@ becomes `farCount`; `RenderParams` spare `_p1` becomes `fogDensity`.
    continuation, pinned fog. Exit: stand on a hill, see ~1 km, selftest
    passes (hash unchanged, sleep unchanged, perf gate holds), screenshot
    shows a horizon.
-2. **Edits at distance:** dirty-driven downsample of fine chunks into the
-   cascades (a chunk evicted from the window leaves its downsampled ghost),
-   so craters/buildings survive in the far field. Rides the existing dirty
-   list; still render-only.
-3. **Polish:** dithered blend band at level transitions, adaptive fog radius
-   during fast motion, cave-band suppression at coarse levels if swiss-cheese
-   artifacts show on cliff faces.
+2. **Edits at distance — IMPLEMENTED (2026-08-19).** `worldgen.wgsl fardown`:
+   one workgroup per entry of the compacted dirty list, dispatched indirect
+   off the SAME `dispatchArgs` the per-tick occupancy update uses (right after
+   `occupancyDirty_` in `EncodeTick`), so a settled world dispatches nothing.
+   Each workgroup walks levels 1..6 and, for every cascade cell whose *sample
+   point* lands inside its 16³ chunk, reads that fine voxel from the LIVE
+   `voxels` buffer and writes the material byte into `farVox`. Sampling the
+   same center voxel as the sieve is the whole trick: downsampled and pristine
+   regions agree exactly at their boundary, so there is no seam, and a chunk
+   edited while resident keeps its ghost after eviction with no eviction hook.
+   Cells whose center lands in a *neighboring* chunk are that chunk's job —
+   at k ≥ 5 one cell is wider than a chunk, so most chunks contribute nothing
+   at those levels, which is correct.
+   - **Atomics:** a level-k word packs 4 cells = 4·2^k fine voxels of x-extent,
+     wider than one chunk for k ≥ 2, so two workgroups race on different bytes
+     of one word. `farVox`/`farOcc` are therefore declared
+     `array<atomic<u32>>`; the byte update is `atomicAnd(clear) | atomicOr(set)`
+     and `farOcc` gets `atomicMax(.,1)` (conservative — a stale over-estimate
+     only costs marching an empty level chunk; a stale zero would hide new
+     terrain). WGSL forbids one buffer being both atomic and non-atomic in a
+     module, so `far`'s whole-word stores became `atomicStore` — uncontended,
+     free. Legal only because cascades carry no determinism requirement.
+   - **Plumbing:** `farBGL_` gained binding 4 = `dirtyList` (read-only storage);
+     `farPL_` is unchanged otherwise (slim group 0 + far group 1 = 8 storage
+     layout entries, well under Dawn's 16/stage).
+   - **Known gap:** hash ticks (`tick % 15 == 0`) take the whole-world
+     occupancy branch and never compact `dirtyOut`, so there is no work list
+     and the downsample is skipped. The chunk is still dirty the next tick and
+     propagates then — only an edit that lands exactly on a hash tick *and*
+     settles immediately is one tick late. Accepted, documented in
+     `EncodeTick`.
+   - **Gate:** selftest `far downsample` paints glass into open air at
+     (140,200,140), asserts all 27 covering level-1 cells read air *before*
+     (guards against a vacuous pass) and glass *after* 4 ticks, reading back
+     `farVox` directly (`CopySrc` added to the buffer — selftest only; the
+     frame path stays readback-free). Verified to FAIL when the dispatch is
+     removed, and the world hash is bit-identical with it on and off.
+3. **Transition polish — IMPLEMENTED (2026-08-19).**
+   - **(A) Dithered level transitions** (`raymarch.wgsl` `farDither` +
+     `traceFar`). Every handoff (window→L1 and each Lk→Lk+1) is offset NEARER
+     by a per-pixel hash of the fragment coordinate, scaled to up to half a
+     cell of the OUTER level at that seam. The hash takes no time input (a
+     crawling stipple is worse than the seam) and is keyed on screen space,
+     not world space — the seam is a screen-space artifact of camera-centered
+     boxes, and a world-space key would re-align into arcs as the boxes
+     recenter. Cost is zero: each pixel still marches exactly one level per
+     stretch.
+   - **The offset must be one-sided (nearer only).** The levels tile t-space
+     exactly, so pushing a handoff FARTHER opens a band no level marches and
+     rays fall through it. Measured: a two-sided ±half-cell jitter punched
+     ~3.2k pixels of hole-speckle through tree edges in the 1080p far view;
+     the one-sided version has none while still perturbing ~4.4k seam-adjacent
+     pixels. `evidence_dither_baseline.png` / `_twosided_holes.png` /
+     `_onesided_clean.png` (repo root, phase-3 working set) are the same crop
+     under all three conditions; the two-sided one is visibly speckled.
+   - **(B) Adaptive fog** (`FarField::SafeRadiusMeters` +
+     `WriteRenderParams(..., fogDensity)`). `FarField` keeps a per-level
+     pending-fill counter alongside the FIFO queue (incremented on enqueue,
+     decremented as `PrepareTick` pops). The trusted radius is the half-extent
+     of the level below the INNERMOST incomplete one — boxes are nested, so a
+     gap at level k makes everything from level k's half-extent outward
+     suspect. Fog density = `kFogOpticalDepths / safeRadius`, clamped to
+     `[kFarFogDensity, kFarFogDensityMax]` (never thinner than the
+     full-horizon pin; never so thick that the residency window itself is
+     hidden — the ceiling is pinned to level 2's half-extent, 4× the window
+     radius) and eased toward its target at `kFogLerpPerFrame` so the horizon
+     opens smoothly instead of stepping with each landed plane. All three
+     constants live in `world.h`. `WriteRenderParams` defaults the parameter
+     to `kFarFogDensity`, so every selftest call site (which renders against
+     fully-filled cascades) is unchanged.
+   - **(C) Coarse cave suppression — ASSESSED, NOT WARRANTED.** Rendered the
+     cascades from 900 voxels up with fog at 3% of nominal, so levels 4–6 fill
+     the frame across kilometers: the coarse surface is completely solid, no
+     swiss-cheese on any hillside. This is structural, not luck — `caveAt`
+     carves *enclosed column bands* whose ceiling is capped at `h - 10`, so a
+     cave never breaks the surface and a coarse cell's center sample lands in
+     terrain, never in a cave void, wherever the surface is. Suppression would
+     have been a no-op that risked the sieve/`fardown` boundary agreement the
+     `far downsample` gate protects. Revisit only if worldgen ever gains
+     surface-breaching caves or overhangs.
+   - **Selftest addition:** `screenshot_far.bmp` — an elevated near-level
+     camera at (140,130,140) whose frame is mostly cascade. The standard
+     `screenshot.bmp` looks down at the near forest and shows almost no far
+     field, so it could not have caught any of this.
 4. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
    shows in profiles; cascade persistence alongside region files; distant
    prop baking.
@@ -145,8 +222,12 @@ becomes `farCount`; `RenderParams` spare `_p1` becomes `fogDensity`.
   window until phase 2. The window edge can pop where recent edits meet the
   cascade (16 m away, at the old draw distance — strictly better than the
   current sky cut).
-- Center-sampling aliases the surface by ±half a coarse cell — visible as
-  gentle terracing at level seams until phase 3 dithers it.
+- Center-sampling aliases the surface by ±half a coarse cell. Phase 3's dither
+  breaks up the *seam lines between levels*; the terracing WITHIN a level is
+  inherent to the representation and is not addressed (a blend band would mean
+  marching two levels per pixel). At the current kVoxelMeters = 0.0625 the
+  nominal fog reaches full opacity at 512 m, well inside level 4, so levels 4–6
+  are effectively never visible and the outer seams are moot.
 - Level boxes recenter independently with hysteresis; containment margin is
   large (each box is 2× the previous) but not formally guaranteed — a
   non-contained sliver would render as a sky wedge for a frame. Not observed;

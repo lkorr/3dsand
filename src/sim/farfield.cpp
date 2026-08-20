@@ -20,6 +20,11 @@ IVec3 DesiredOrigin(IVec3 fineChunk, uint32_t k) {
 }
 }  // namespace
 
+void FarField::Enqueue(uint32_t k, uint32_t slot) {
+  queue_.push_back((k << 12) | slot);
+  pending_[k]++;
+}
+
 void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
   int m = (int)kNChunk - 1;
   int sa = wcoord & m;
@@ -31,7 +36,7 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
       s[(axis + 2) % 3] = b;
       uint32_t slot = ((uint32_t)s[2] * kNChunk + (uint32_t)s[1]) * kNChunk +
                       (uint32_t)s[0];
-      queue_.push_back((k << 12) | slot);
+      Enqueue(k, slot);
     }
   }
 }
@@ -39,15 +44,32 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
 void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   origins_[k] = desired;
   uboDirty_ = true;
-  for (uint32_t slot = 0; slot < kNumChunks; slot++)
-    queue_.push_back((k << 12) | slot);
+  for (uint32_t slot = 0; slot < kNumChunks; slot++) Enqueue(k, slot);
 }
 
 void FarField::FullRefill(IVec3 playerChunk) {
   queue_.clear();
+  for (uint32_t k = 0; k < kFarLevels; k++) pending_[k] = 0;
   // coarsest first: the horizon band appears before the near bands refine
   for (int k = (int)kFarLevels - 1; k >= 0; k--)
     ResetLevel((uint32_t)k, DesiredOrigin(playerChunk, (uint32_t)k));
+}
+
+float FarField::SafeRadiusMeters() const {
+  // Half-extent of cascade level k (1-based) in meters: the level's box is
+  // kWorldN cells of 2^k fine voxels per edge, so half of it is
+  // (kWorldN / 2) * 2^k * kVoxelMeters. Derived from world.h, never hardcoded.
+  auto halfExtent = [](uint32_t k) {
+    return (float)(kWorldN >> 1) * (float)(1u << k) * kVoxelMeters;
+  };
+  for (uint32_t k = 0; k < kFarLevels; k++) {
+    if (pending_[k] == 0) continue;
+    // level k+1 (1-based) is incomplete; trust out to level k's half-extent,
+    // or — if even level 1 is incomplete — only the residency window itself
+    // (half of kWorldN fine voxels), which is the pre-cascade draw distance.
+    return k == 0 ? (float)(kWorldN >> 1) * kVoxelMeters : halfExtent(k);
+  }
+  return halfExtent(kFarLevels);   // everything filled: the full horizon
 }
 
 void FarField::Update(IVec3 playerChunk) {
@@ -93,6 +115,10 @@ uint32_t FarField::PrepareTick(const wgpu::Queue& queue) {
   for (uint32_t i = 0; i < count; i++) {
     list[i] = queue_.front();
     queue_.pop_front();
+    // The dispatch is encoded in THIS tick's submit, so the entry counts as
+    // filled from here on — SafeRadiusMeters is read on the render path of the
+    // same frame, one submit behind at worst.
+    pending_[list[i] >> 12]--;
   }
   queue.WriteBuffer(world_->farList, 0, list.data(), count * 4);
   return count;

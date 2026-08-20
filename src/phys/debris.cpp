@@ -134,6 +134,13 @@ void DebrisSystem::Reset() {
   supportCooldown_.clear();
   instancesDirty_ = true;
   instanceCount_ = 0;
+  // Body serials seed the burn RNG (Hash3(serial, tick, rule)), so a counter
+  // that survives Reset() makes every body's burn sequence depend on how many
+  // bodies happened to exist before it. That silently couples unrelated
+  // scenarios: a worldgen tweak that changes how many islands an earlier
+  // destruction produces re-rolls a later fire's outcome entirely. Resetting
+  // here makes a body's burn a function of the scenario, not of history.
+  nextSerial_ = 1;
 }
 
 bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int margin) {

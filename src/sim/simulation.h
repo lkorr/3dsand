@@ -96,7 +96,7 @@ class Simulation {
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   wgpu::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
-  wgpu::ComputePipeline farFill_;
+  wgpu::ComputePipeline farFill_, farDown_;
   wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_;
   wgpu::ShaderModule raymarchModule_, debrisModule_;
   wgpu::TextureFormat targetFormat_ = wgpu::TextureFormat::Undefined;

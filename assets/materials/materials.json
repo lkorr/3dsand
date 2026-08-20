@@ -508,6 +508,119 @@
         "organic",
         "dissolvable"
       ]
+    },
+    {
+      "comment": "Forest set (worldgen only). These are INERT on purpose: they carry the organic/flammable tags so fire, acid, mites and the laser treat them like the reactive garden, but no reaction in reactions.json uses them as `self` with an emit. Worldgen paints them by the million, and anything that grows would keep those chunks awake forever (CLAUDE.md rule 2).",
+      "id": "grass",
+      "class": "solid",
+      "density": 420,
+      "hardness": 8,
+      "rubble": "dirt",
+      "colors": [
+        "#4e9b3a",
+        "#438a31",
+        "#5aad46"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "leaves",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#3c8f36",
+        "#33802d",
+        "#4aa244"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "pine_needles",
+      "class": "solid",
+      "density": 300,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#1f5c33",
+        "#1a4f2b",
+        "#276b3d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "autumn_leaves",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#d1762a",
+        "#bb5f1e",
+        "#e0913a"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "birch_wood",
+      "class": "solid",
+      "density": 560,
+      "hardness": 36,
+      "rubble": "dust",
+      "colors": [
+        "#dcd8cc",
+        "#c8c3b5",
+        "#eae6dc"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "petal",
+      "class": "solid",
+      "density": 290,
+      "hardness": 5,
+      "rubble": "dust",
+      "colors": [
+        "#f0e34a",
+        "#e8628f",
+        "#8f6fe0"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

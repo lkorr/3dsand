@@ -7,3 +7,7 @@ screenshot_debris.bmp
 screenshot_debris.png
 *.svx
 *.svd/
+screenshot_far.bmp
+screenshot_far.png
+screenshot_far_verify.png
+evidence_dither_*.png

@@ -260,6 +260,49 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
 // fine-voxel units so depth and fog reuse the existing math. Levels are
 // nested boxes: starting level k at max(its entry, level k-1's exit) makes
 // the t-ordering skip every region covered by finer data automatically.
+//
+// ---- level-transition dither (plan phase 3A) ----
+// Every handoff above is a HARD distance: at one exact t the representation
+// jumps from 2^k-voxel cells to 2^(k+1)-voxel cells, and because the two
+// resolutions disagree about where the surface is by up to half a coarse
+// cell, that constant-t surface draws as a visible arc across hillsides —
+// the same artifact as an unblended terrain-LOD ring.
+//
+// Fix: pull each handoff distance NEARER by a per-pixel random amount of up to
+// half an OUTER cell at that seam. Neighboring pixels then cross the seam at
+// slightly different distances, so the ring dissolves into a stipple that
+// reads as texture instead of as a line. This is stratified sampling of the
+// seam, not a blend: each pixel still picks exactly one level, so there is no
+// extra marching cost.
+//
+// THE OFFSET IS ONE-SIDED (nearer only), and that is not a style choice. The
+// levels tile t-space exactly: level k+1 starts where level k's box ends.
+// Pushing a handoff FARTHER opens a gap that no level marches, and rays through
+// it fall past the terrain into whatever is behind — measured as ~3.2k pixels
+// of hole-speckle punched through tree edges when this was first written
+// two-sided. Pulling it NEARER only makes the coarser level re-cover a sliver
+// the finer level already marched and found empty, which is exactly the
+// intended "this pixel takes the coarse surface a bit early".
+//
+// Two rules the hash must obey:
+//   * NO TIME INPUT. A time-varying hash makes the stipple crawl, which is
+//     far more objectionable than the seam it replaces; the pattern must be
+//     frozen to the pixel so it reads as static dither.
+//   * KEYED ON PIXEL, NOT ON WORLD POSITION. The seam is a screen-space
+//     artifact of the camera-centered cascade boxes, so screen space is where
+//     it must be broken up; a world-space key would leave the pattern
+//     stationary in the world and re-align into arcs as the boxes recenter.
+// Render-only float math on render-only data — determinism is untouched
+// (CLAUDE.md rule 1 scopes to sim state).
+//
+// Returns an offset in [0, 0.5) cells, uniform-ish per pixel, to SUBTRACT.
+fn farDither(px : vec2f) -> f32 {
+  let h = pcg(u32(px.x) * 1973u + u32(px.y) * 9277u + 0x9E3779B9u);
+  // 16 bits of mantissa is plenty: the seam only needs enough distinct
+  // offsets that no two adjacent pixels line up, not a smooth distribution.
+  return f32(h & 0xFFFFu) * (0.5 / 65536.0);
+}
+
 struct FarHit {
   hit  : bool,
   t    : f32,          // fine-voxel units
@@ -274,7 +317,7 @@ fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
   return (farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
 }
 
-fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32) -> FarHit {
+fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   var out : FarHit;
   out.hit = false;
 
@@ -284,7 +327,19 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32) -> FarHit {
   if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
   let inv = 1.0 / rd;
 
-  var tPrev = max(tStart, 0.0);   // fine-voxel units
+  // One draw per pixel, reused at every seam scaled by that seam's cell size:
+  // the offsets stay correlated across levels for one pixel (a pixel that
+  // takes the coarse side early keeps taking it), which stipples cleanly
+  // instead of re-randomizing into per-level speckle.
+  let dith = farDither(px);
+
+  // Window -> level 1 seam. tStart is where the ray left the residency window;
+  // the fine march already found no hit out to there, so starting level 1 up to
+  // half a level-1 cell (1 fine voxel) earlier only lets it re-cover the last
+  // sliver of already-marched empty fine space. Sub-voxel at the window edge —
+  // it exists to break the hard line where the two representations of the same
+  // terrain disagree, nothing more.
+  var tPrev = max(tStart - dith * 2.0, 0.0);   // fine-voxel units
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {
     let s = f32(1u << level);     // fine voxels per level cell
@@ -368,7 +423,11 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32) -> FarHit {
       }
       if (tCur >= tExit) { break; }
     }
-    tPrev = max(tPrev, tExit * s);
+    // Level k -> k+1 seam. The outer level's cells are 2s fine voxels, so half
+    // a coarse cell is s: pull this handoff up to s nearer and the ring where
+    // level k's box ends dissolves. Still max()'d against the running tPrev so
+    // the start can never precede an even earlier level's coverage.
+    tPrev = max(tPrev, tExit * s - dith * 2.0 * s);
   }
   return out;
 }
@@ -392,7 +451,9 @@ fn fs(in : VSOut) -> FSOut {
   var far : FarHit;
   far.hit = false;
   if (!h.hit && !h.saturated) {
-    far = traceFar(R.camPos, rd, h.tExit);
+    // in.pos.xy is the fragment's pixel coordinate — the dither key (see
+    // farDither: screen-space, time-free, stable per pixel)
+    far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
   }
 
   // reversed-Z depth so raster geometry (particles/debris) composites in.
@@ -466,8 +527,10 @@ fn fs(in : VSOut) -> FSOut {
     }
 
     // distance fog (density per meter, so the look survives voxel-size
-    // changes). Density is a uniform pinned to the far-field extent so the
-    // cascade horizon fades out instead of ending in a cut.
+    // changes). Density is a uniform tracking the far field's currently
+    // FILLED radius (FarField::SafeRadiusMeters, plan phase 3B) so the
+    // cascade horizon fades out instead of ending in a cut — and so a
+    // half-filled cascade fogs out before its empty bands become visible.
     let fog = 1.0 - exp(-h.t * VOXEL_METERS * R.fogDensity);
     color = mix(color, skyColor(rd) * 0.9, fog);
   }
