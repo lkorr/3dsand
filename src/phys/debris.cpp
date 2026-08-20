@@ -153,7 +153,7 @@ void DebrisSystem::RecountBurn(Body& b) const {
 }
 
 void DebrisSystem::Reset() {
-  for (Body& b : bodies_) phys_->RemoveBody(b.handle);
+  for (Body& b : bodies_) ReleaseBody(b);
   bodies_.clear();
   for (auto& [ci, t] : terrain_)
     if (t.handle) phys_->RemoveBody(t.handle);
@@ -647,7 +647,7 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     }
 
     lastCellWriteTick_ = tick;
-    phys_->RemoveBody(b.handle);
+    ReleaseBody(b);
     bodies_[bi] = std::move(bodies_.back());
     bodies_.pop_back();
     instancesDirty_ = true;
@@ -939,7 +939,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       Vec3 lin{}, ang{};
       phys_->GetBodyVelocities(b.handle, lin, ang);
       VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
-      phys_->RemoveBody(b.handle);
+      ReleaseBody(b);
       bodies_[bi] = std::move(bodies_.back());
       bodies_.pop_back();
       instancesDirty_ = true;
@@ -1040,21 +1040,37 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       }
       Body nb;
       nb.xf = b.xf;
+      // A fragment of a micro body is itself a micro body: it inherits the
+      // scale so its collider pitch, radius and particle conversion all stay
+      // right, and gets its OWN brick below (the parent's brick still shows
+      // the whole original shape, so sharing it would draw each half as the
+      // intact object). If that brick can't be allocated the fragment cannot
+      // be drawn at all — the cube path would render it at scale-1 size,
+      // twice too big — so it falls through to particles instead, which is
+      // the same handoff every under-floor piece already takes.
+      nb.micro = b.micro;
       nb.xf.pos += QuatRot(b.xf.quat, Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
-      nb.handle = phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_);
+      const float pitch = 1.0f / (float)std::max(1u, nb.micro.scale);
+      nb.handle =
+          phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_, false, pitch);
       if (nb.handle != 0) {
         phys_->SetBodyVelocities(nb.handle, lin, ang);
         nb.voxels = std::move(parts[c]);
         float r = 0;
         for (const DebrisVoxel& v : nb.voxels)
           r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
-        nb.radiusVoxels = r + 2.0f;
+        nb.radiusVoxels = r / (float)std::max(1u, nb.micro.scale) + 2.0f;
         nb.serial = nextSerial_++;
-        RecountBurn(nb);
-        fragments.push_back(std::move(nb));
-        madeBody = true;
-        budget--;
-        continue;
+        if (!nb.micro.Valid() || ReskinMicro(nb)) {
+          RecountBurn(nb);
+          fragments.push_back(std::move(nb));
+          madeBody = true;
+          budget--;
+          continue;
+        }
+        // Brick pool full: undo the body and let it become particles below.
+        phys_->RemoveBody(nb.handle);
+        parts[c] = std::move(nb.voxels);
       }
       // body creation failed: fall through to particles (coords were rebased,
       // but VoxelsToParticles reads them against nb.xf — rebuild not worth it;
@@ -1086,11 +1102,21 @@ void DebrisSystem::VoxelsToParticles(const Body& b,
                                      const std::vector<DebrisVoxel>& voxels,
                                      Vec3 lin, Vec3 ang, World& world,
                                      std::vector<ParticleSpawn>& spawns) const {
+  // A micro body's voxels are 1/scale of a world voxel, so local coords must be
+  // divided down to reach world space. They are also SMALLER than a particle:
+  // emitting one particle per micro voxel would turn a scale-2 body into 8x the
+  // matter it had. Sub-sampling on the micro lattice (one particle per world
+  // cell) conserves the visible volume — the grid has no sub-voxel resolution
+  // to receive the detail anyway.
+  const float inv = 1.0f / (float)std::max(1u, b.micro.scale);
+  const int step = (int)std::max(1u, b.micro.scale);
   for (const DebrisVoxel& v : voxels) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) return;  // ring full: lost
-    Vec3 wp = b.xf.pos + QuatRot(b.xf.quat, Vec3{(float)v.x + 0.5f,
-                                                 (float)v.y + 0.5f,
-                                                 (float)v.z + 0.5f});
+    if (step > 1 && (((int)v.x % step) || ((int)v.y % step) || ((int)v.z % step)))
+      continue;
+    Vec3 wp = b.xf.pos + QuatRot(b.xf.quat, Vec3{((float)v.x + 0.5f) * inv,
+                                                 ((float)v.y + 0.5f) * inv,
+                                                 ((float)v.z + 0.5f) * inv});
     if (!world.CellInWindow({ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)})) continue;
     // rigid point velocity (voxels/s), converted to fixed 24.8 voxels/tick
     Vec3 vel = lin + ang.cross(wp - b.xf.pos);
@@ -1155,6 +1181,244 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
   RecountBurn(body);
   bodies_.push_back(std::move(body));
   instancesDirty_ = true;
+}
+
+void DebrisSystem::ReleaseBody(Body& b) {
+  // Free the brick BEFORE the handle so an early return can never strand pool
+  // words. Shared models (mob-def art, the cached sphere balls) are ignored by
+  // MicroBodyFree — only copy-on-write clones this body owns are reclaimed.
+  if (b.micro.Valid() && microSet_) MicroBodyFree(*microSet_, b.micro.model);
+  b.micro = MicroBodyRef{};
+  if (b.handle) phys_->RemoveBody(b.handle);
+  b.handle = 0;
+}
+
+void DebrisSystem::RebaseVoxels(std::vector<DebrisVoxel>& voxels,
+                                BodyTransform& xf) {
+  if (voxels.empty()) return;
+  IVec3 mn{127, 127, 127};
+  for (const DebrisVoxel& v : voxels) {
+    mn.x = std::min<int>(mn.x, v.x);
+    mn.y = std::min<int>(mn.y, v.y);
+    mn.z = std::min<int>(mn.z, v.z);
+  }
+  if (mn.x == 0 && mn.y == 0 && mn.z == 0) return;
+  for (DebrisVoxel& v : voxels) {
+    v.x = (int8_t)(v.x - mn.x);
+    v.y = (int8_t)(v.y - mn.y);
+    v.z = (int8_t)(v.z - mn.z);
+  }
+  // The origin moved to the new min corner, so the transform moves with it or
+  // the body teleports by the rebase amount.
+  xf.pos += QuatRot(xf.quat, Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
+}
+
+bool DebrisSystem::RebuildCollider(Body& b) {
+  if (b.voxels.empty()) return false;
+  Vec3 lin{}, ang{};
+  phys_->GetBodyVelocities(b.handle, lin, ang);
+  // A micro body's voxels are 1/scale world voxels on a side. Building at
+  // pitch 1 would inflate a scale-2 body to twice its size and 8x its mass.
+  const float pitch = 1.0f / (float)std::max(1u, b.micro.scale);
+  uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_, false, pitch);
+  if (nh == 0) return false;
+  phys_->RemoveBody(b.handle);
+  b.handle = nh;
+  phys_->SetBodyVelocities(nh, lin, ang);
+  b.burnedSinceRebuild = 0;
+  // A damaged sphere is no longer a sphere: the analytic collider it spawned
+  // with is replaced by the greedy-boxed voxel compound built above, so a
+  // carved ball stops rolling like a perfect one. That is the whole reason
+  // this goes through CreateDebrisBodyXf rather than patching the old shape.
+  return true;
+}
+
+bool DebrisSystem::ReskinMicro(Body& b) {
+  if (!b.micro.Valid() || !microSet_) return false;
+  int own = MicroBodyOwn(*microSet_, b.micro.model);
+  if (own < 0) return false;  // pool full: keep the stale skin, stay damaged
+  b.micro.model = (uint32_t)own;
+  std::vector<PrefabVoxel> mv;
+  mv.reserve(b.voxels.size());
+  for (const DebrisVoxel& v : b.voxels)
+    mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                  (uint16_t)(v.payload & 0xFFF)});
+  IVec3 shift{};
+  if (!MicroBodyEdit(*microSet_, b.micro.model, mv, shift)) return false;
+  // MicroBodyEdit rebased the brick to ITS OWN min corner. The body's voxels
+  // may not be rebased to the same corner yet — ShatterBody re-skins fragments
+  // whose coords it already rebased (shift 0), but DamageBody re-skins a
+  // survivor whose min corner has just moved inward as voxels were carved off
+  // (shift > 0). The brick march runs [0..dims) from the body ORIGIN, so any
+  // nonzero shift must move the transform or the art slides off the collider.
+  // Doing it here, from what MicroBodyEdit actually chose, is what keeps the
+  // two frames agreeing without either side having to assume the other's.
+  if (shift.x || shift.y || shift.z) {
+    const float inv = 1.0f / (float)std::max(1u, b.micro.scale);
+    b.xf.pos += QuatRot(b.xf.quat, Vec3{(float)shift.x * inv,
+                                        (float)shift.y * inv,
+                                        (float)shift.z * inv});
+    // Bring the body's own voxels into the brick's frame so collider rebuilds
+    // and particle conversion measure from the same origin the art does.
+    for (DebrisVoxel& v : b.voxels) {
+      v.x = (int8_t)(v.x - shift.x);
+      v.y = (int8_t)(v.y - shift.y);
+      v.z = (int8_t)(v.z - shift.z);
+    }
+  }
+  return true;
+}
+
+bool DebrisSystem::DamageBody(size_t bi, World& world,
+                              std::vector<ParticleSpawn>& spawns,
+                              std::vector<Body>& fragments,
+                              uint32_t& newBodyBudget, bool eject,
+                              const std::function<bool(const DebrisVoxel&)>& keep) {
+  Body& b = bodies_[bi];
+  phys_->GetTransform(b.handle, b.xf);
+
+  std::vector<DebrisVoxel> removed;
+  for (const DebrisVoxel& v : b.voxels)
+    if (!keep(v)) removed.push_back(v);
+  if (removed.empty()) return true;  // nothing in range
+
+  Vec3 lin{}, ang{};
+  phys_->GetBodyVelocities(b.handle, lin, ang);
+  if (eject) VoxelsToParticles(b, removed, lin, ang, world, spawns);
+
+  b.voxels.erase(std::remove_if(b.voxels.begin(), b.voxels.end(),
+                                [&](const DebrisVoxel& v) { return !keep(v); }),
+                 b.voxels.end());
+  instancesDirty_ = true;
+
+  // Wholly destroyed, or blown under the body-worthiness floor: the remainder
+  // rejoins the world as loose voxels, exactly like the burn dissolve path.
+  if (b.voxels.size() < kMinBodyVoxels) {
+    VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
+    ReleaseBody(b);
+    bodies_[bi] = std::move(bodies_.back());
+    bodies_.pop_back();
+    return false;
+  }
+
+  // Blowing a body in half must yield two bodies, not one body with a hole:
+  // the connectivity split is what turns "removed voxels" into "separated
+  // pieces". Fresh blast damage uses the ISLAND floor (8), not the much higher
+  // burn-fragment floor — a body blown apart by an explosion is a one-off
+  // event, not the every-few-ticks re-fragmentation that forced burn's bar up.
+  ShatterBody(b, world, fragments, spawns, kMinBodyVoxels, newBodyBudget);
+
+  // Rebase AFTER shatter (which rebases fragments itself) so the surviving
+  // body's coords stay tight in int8 range, then rebuild the collider.
+  //
+  // Micro bodies rebase through ReskinMicro INSTEAD, not as well: RebaseVoxels
+  // shifts the transform in world-voxel units, but a micro body's coords are
+  // 1/scale of one, so using it here would move a scale-2 body twice as far as
+  // its voxels actually moved. ReskinMicro divides by the scale and takes the
+  // corner MicroBodyEdit really chose, so art, collider and voxels stay in one
+  // frame. Exactly one of these two runs for any body.
+  if (b.micro.Valid())
+    ReskinMicro(b);
+  else
+    RebaseVoxels(b.voxels, b.xf);
+  RebuildCollider(b);
+  float r = 0;
+  for (const DebrisVoxel& v : b.voxels)
+    r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
+  b.radiusVoxels = r / (float)std::max(1u, b.micro.scale) + 2.0f;
+  b.burnCursor = b.voxels.empty() ? 0 : b.burnCursor % (uint32_t)b.voxels.size();
+  RecountBurn(b);
+  return true;
+}
+
+void DebrisSystem::DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels,
+                                      World& world,
+                                      std::vector<ParticleSpawn>& spawns) {
+  if (!phys_ || radiusVoxels <= 0.0f) return;
+  std::vector<Body> fragments;
+  uint32_t budget = kMaxNewBodiesPerTick;
+  const float r2 = radiusVoxels * radiusVoxels;
+
+  for (size_t bi = 0; bi < bodies_.size();) {
+    Body& b = bodies_[bi];
+    phys_->GetTransform(b.handle, b.xf);
+    // cheap reject: blast sphere vs body bounding sphere
+    if ((b.xf.pos - centerVoxel).len() > radiusVoxels + b.radiusVoxels + 2.0f) {
+      bi++;
+      continue;
+    }
+    // Blast centre into body-local MICRO units, so the per-voxel test is a
+    // plain distance compare in the frame the voxels live in.
+    const float scale = (float)std::max(1u, b.micro.scale);
+    const float q[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2], b.xf.quat[3]};
+    Vec3 cLocal = QuatRot(q, centerVoxel - b.xf.pos) * scale;
+    const float rLocal2 = r2 * scale * scale;
+    // Deterministic-enough jitter so the crater rim is ragged rather than a
+    // billiard-ball scoop. This is CPU gameplay state (bodies are outside the
+    // hashed domain), so a float hash is fine here — rule 1 governs the grid.
+    const uint32_t seed = b.serial;
+
+    bool alive = DamageBody(
+        bi, world, spawns, fragments, budget, true,
+        [&](const DebrisVoxel& v) {
+          Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+          Vec3 dv = c - cLocal;
+          float d2 = dv.dot(dv);
+          if (d2 >= rLocal2) return true;  // outside the blast
+          // Falloff: certain removal in the core, thinning toward the rim.
+          float t = std::sqrt(d2 / rLocal2);       // 0 centre .. 1 rim
+          float chance = 1.0f - t * t;             // quadratic, wide core
+          uint32_t h = Hash3(seed, (uint32_t)(int32_t)v.x * 73856093u,
+                             (uint32_t)(int32_t)v.y * 19349663u ^
+                                 (uint32_t)(int32_t)v.z * 83492791u);
+          return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+        });
+    if (alive) bi++;
+  }
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+}
+
+bool DebrisSystem::MeltBodyAt(uint64_t handle, Vec3 pointVoxel,
+                              float radiusVoxels, World& world,
+                              std::vector<ParticleSpawn>& spawns) {
+  if (!phys_) return false;
+  size_t bi = 0;
+  for (; bi < bodies_.size(); bi++)
+    if (bodies_[bi].handle == handle) break;
+  if (bi == bodies_.size()) return false;
+
+  Body& b = bodies_[bi];
+  phys_->GetTransform(b.handle, b.xf);
+  const float scale = (float)std::max(1u, b.micro.scale);
+  const float q[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2], b.xf.quat[3]};
+  Vec3 pLocal = QuatRot(q, pointVoxel - b.xf.pos) * scale;
+  const float rLocal = radiusVoxels * scale;
+  const float rLocal2 = rLocal * rLocal;
+
+  std::vector<Body> fragments;
+  uint32_t budget = kMaxNewBodiesPerTick;
+  // eject=false: the beam vaporizes. A held laser damages every tick, and
+  // spraying particles from each one would drain the spawn ring in a second.
+  // The return says whether the body survived; either way the hit landed, and
+  // fragments still have to be adopted below.
+  DamageBody(bi, world, spawns, fragments, budget, false,
+             [&](const DebrisVoxel& v) {
+               Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+               Vec3 dv = c - pLocal;
+               return dv.dot(dv) >= rLocal2;
+             });
+  for (Body& f : fragments) {
+    bodies_.push_back(std::move(f));
+    instancesDirty_ = true;
+  }
+  return true;
+}
+
+bool DebrisSystem::MicroDirty() const {
+  return microSet_ && microSet_->dirty;
 }
 
 bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
@@ -1231,7 +1495,7 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
   }
 
-  phys_->RemoveBody(b.handle);
+  ReleaseBody(b);
   bodies_[bi] = std::move(newBodies[0]);
   bodies_.push_back(std::move(newBodies[1]));
   instancesDirty_ = true;
@@ -1389,7 +1653,7 @@ void DebrisSystem::PostStep() {
                 b.xf.pos.y > wlo.y + (float)kWorldN + kPad ||
                 b.xf.pos.z > wlo.z + (float)kWorldN + kPad;
     if (dead) {
-      phys_->RemoveBody(b.handle);
+      ReleaseBody(b);
       bodies_[i] = std::move(bodies_.back());
       bodies_.pop_back();
       instancesDirty_ = true;
@@ -1399,7 +1663,7 @@ void DebrisSystem::PostStep() {
   }
   // body budget: oldest bodies despawn first (they are usually settled rubble)
   while (bodies_.size() > kMaxBodies) {
-    phys_->RemoveBody(bodies_.front().handle);
+    ReleaseBody(bodies_.front());
     bodies_.erase(bodies_.begin());
     instancesDirty_ = true;
   }

@@ -8,6 +8,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "sim/tuning.h"
+
 using nlohmann::json;
 
 namespace {
@@ -19,6 +21,47 @@ inline Quat AxisAngle(Vec3 axis, float angle) { return QuatAxisAngle(axis, angle
 inline Quat Mul(const Quat& a, const Quat& b) { return QuatMul(a, b); }
 inline Vec3 Rotate(const Quat& q, Vec3 v) { return QuatRotate(q, v); }
 inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
+
+// CPU mirror of common.wgsl pcg/hash3, same as the one in debris.cpp: stateless
+// and counter-based, so a given (mob, limb, tick, index) always produces the
+// same droplet. Spray direction is presentation, but it is authored INTO the
+// tick's spawn stream, which replays must reproduce — a stateful rng here would
+// desync a replay the moment a frame boundary moved.
+uint32_t Pcg(uint32_t v) {
+  uint32_t s = v * 747796405u + 2891336453u;
+  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
+  return Pcg(a ^ Pcg(b ^ Pcg(c)));
+}
+// Uniform in [-1, 1) from a hash word.
+float SignedUnit(uint32_t h) {
+  return (float)(int32_t)(h & 0xFFFFu) / 32768.0f - 1.0f;
+}
+
+// Builds one ballistic droplet. `micro` picks sub-voxel spray (dies on contact,
+// stains, never becomes a voxel) over a real blood voxel.
+//
+// Velocity is in voxels/sec and converted to the particle system's fixed 24.8
+// voxels/TICK here, at the same 30 Hz the debris shatter path uses — the sim is
+// fixed-step, so this factor is a constant, not a frame-time.
+ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
+                          bool micro, int lifeTicks, int microScale) {
+  ParticleSpawn s{};
+  s.px = (int32_t)std::lround(posVoxel.x * 256.0f);
+  s.py = (int32_t)std::lround(posVoxel.y * 256.0f);
+  s.pz = (int32_t)std::lround(posVoxel.z * 256.0f);
+  s.vx = (int32_t)std::lround(vel.x * 256.0f / 30.0f);
+  s.vy = (int32_t)std::lround(vel.y * 256.0f / 30.0f);
+  s.vz = (int32_t)std::lround(vel.z * 256.0f / 30.0f);
+  s.payload = material & 0xFFFu;
+  s.flags = kPFlagAlive;
+  if (micro) {
+    s.flags |= kPFlagMicro | ParticleMicroBits(microScale, lifeTicks);
+  }
+  return s;
+}
 
 int FindMaterialId(const std::vector<MaterialDef>& mats, const std::string& name) {
   for (size_t i = 0; i < mats.size(); i++)
@@ -954,12 +997,25 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   }
 }
 
-void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops) {
+void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
+                        std::vector<ParticleSpawn>& spawns) {
   const float dt = 1.0f / 30.0f;
   IVec3 wo = world.WindowOrigin();
   Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
            (float)(wo.z * (int)kChunk)};
   int bleedOps = 0;
+
+  // Drain particles authored since the last tick (dismemberment blood voxels).
+  // Dropped rather than carried over when the tick's budget is already full:
+  // stale gore arriving a tick late would spawn from a wound that has since
+  // moved, and the burst it belongs to is over by then anyway.
+  for (const ParticleSpawn& s : pendingSpawns_) {
+    if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+    IVec3 c{s.px >> 8, s.py >> 8, s.pz >> 8};
+    if (!world.CellInWindow(c)) continue;
+    spawns.push_back(s);
+  }
+  pendingSpawns_.clear();
 
   for (size_t mi = 0; mi < mobs_.size();) {
     Mob& mob = mobs_[mi];
@@ -1094,18 +1150,74 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops) 
 
     // ---- bleeding (PLAN §B5): decaying wound budget, bounded ops ----
     if (def.bleedMat != 0) {
-      for (Limb& limb : mob.limbs) {
+      const auto& gore = CurrentTuning().gore;
+      for (size_t li = 0; li < mob.limbs.size(); li++) {
+        Limb& limb = mob.limbs[li];
+        Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                limb.xf.quat[3]};
+
+        // ---- the dismemberment gout ----
+        // Front-loaded: emission is proportional to the REMAINING countdown, so
+        // the first ticks after the cut throw the bulk of it and the tail
+        // thins out. Runs on its own schedule (every tick, not the drip's every
+        // 4th) because a burst that stutters at 7.5 Hz reads as a pump.
+        if (limb.gushTicks > 0) {
+          int decay = std::max(1, gore.severDecayTicks);
+          // Triangular weighting: sum over the window of (2*total/decay) *
+          // (k/decay) for k = decay..1 is ~= total, so severSpray is the actual
+          // droplet count released rather than a rate to be multiplied out.
+          float frac = (float)limb.gushTicks / (float)decay;
+          int want = (int)std::lround(2.0f * (float)gore.severSpray * frac /
+                                      (float)decay);
+          Vec3 origin = limb.body ? limb.xf.pos + Rotate(lq, limb.gushLocal)
+                                  : mob.origin + limb.anchorRoot;
+          Vec3 axis = limb.body ? Rotate(lq, limb.gushDir) : limb.gushDir;
+          for (int k = 0; k < want; k++) {
+            if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+            uint32_t h = Hash3((uint32_t)mob.id * 2654435761u + (uint32_t)li,
+                               tick, (uint32_t)k * 0x9E3779B9u);
+            Vec3 dir{axis.x + SignedUnit(h) * gore.severSprayCone,
+                     axis.y + SignedUnit(Pcg(h ^ 0x51A17u)) * gore.severSprayCone,
+                     axis.z + SignedUnit(Pcg(h ^ 0xB0011u)) * gore.severSprayCone};
+            // speed varies +-25% so the jet has depth instead of a hard front
+            float sp = gore.severSpraySpeed *
+                       (0.75f + 0.5f * (float)(Pcg(h ^ 0x1234u) & 0xFFFFu) / 65535.0f);
+            if (!world.CellInWindow({ifloor(origin.x), ifloor(origin.y),
+                                     ifloor(origin.z)}))
+              break;
+            spawns.push_back(MakeDroplet(origin, dir * sp, def.bleedMat, true,
+                                         gore.microLifeTicks, gore.microScale));
+          }
+          limb.gushTicks--;
+        }
+
         if (limb.bleedBudget < 1.0f || bleedOps >= kBleedOpsPerTick) continue;
         if ((tick & 3u) != 0) continue;  // drip every 4th tick
         Vec3 w = limb.body
-                     ? limb.xf.pos + Rotate({limb.xf.quat[0], limb.xf.quat[1],
-                                             limb.xf.quat[2], limb.xf.quat[3]},
-                                            limb.woundLocal)
+                     ? limb.xf.pos + Rotate(lq, limb.woundLocal)
                      : mob.origin + limb.anchorRoot;  // stump on the parent
         ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), 1,
                        def.bleedMat, 0 /*paint into air*/, 0, 0});
         limb.bleedBudget -= 1.0f;
         bleedOps++;
+
+        // ---- the spray that accompanies the drip ----
+        // Rides the drip's existing budget rather than carrying its own: the
+        // drip rate is already bounded and already tied to the wound, so spray
+        // per drip cannot outrun the bleeding it is depicting.
+        int sprayN = (int)std::lround(gore.bleedSprayPerDrip);
+        for (int k = 0; k < sprayN; k++) {
+          if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+          uint32_t h = Hash3((uint32_t)mob.id * 40503u + (uint32_t)li,
+                             tick ^ 0xB1005u, (uint32_t)k * 2246822519u);
+          // biased upward and outward: a wound sprays, it does not just drool
+          Vec3 dir{SignedUnit(h) * gore.bleedSprayCone,
+                   0.6f + 0.4f * std::fabs(SignedUnit(Pcg(h ^ 0x77u))),
+                   SignedUnit(Pcg(h ^ 0xC0FFEEu)) * gore.bleedSprayCone};
+          spawns.push_back(MakeDroplet(w, dir * gore.bleedSpraySpeed,
+                                       def.bleedMat, true, gore.microLifeTicks,
+                                       gore.microScale));
+        }
       }
     }
     mi++;
@@ -1188,6 +1300,43 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
           Vec3 anchorW = mob.origin + mob.limbs[limbIndex].anchorRoot;
           parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
           parent.bleedBudget = std::min(parent.bleedBudget + 40.0f, 120.0f);
+
+          // Arm the gout. PreTick drains it over severDecayTicks; arming state
+          // here rather than emitting now keeps every particle this frame
+          // inside the one per-tick spawn budget, and keeps spray order
+          // independent of the order limbs happened to be damaged in.
+          const auto& gore = CurrentTuning().gore;
+          parent.gushTicks = gore.severDecayTicks;
+          parent.gushLocal = parent.woundLocal;
+          // Spray along the stump: from the parent's centre out through the
+          // wound, so a cut arm sprays away from the torso instead of into it.
+          Vec3 out = anchorW - parent.xf.pos;
+          float len = out.len();
+          out = len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0};
+          // Tilt it upward — a horizontal jet mostly misses the world and the
+          // droplets expire in mid-air with nothing stained.
+          out.y += 0.5f;
+          len = out.len();
+          parent.gushDir = RotateInv(q, len > 1e-3f ? out * (1.0f / len)
+                                                    : Vec3{0, 1, 0});
+
+          // The whole blood VOXELS the cut throws. These are conserved matter
+          // (they pool, they flow, the CA owns them), so they are deliberately
+          // few next to the hundreds of micro droplets — the spray does the
+          // visual work, the voxels do the lasting mess.
+          for (int k = 0; k < gore.severVoxels; k++) {
+            if (pendingSpawns_.size() >= kMaxParticleSpawnsPerTick) break;
+            uint32_t h = Hash3((uint32_t)mob.id * 22695477u + (uint32_t)limbIndex,
+                               (uint32_t)k, 0x5EEDu);
+            Vec3 dir{parent.gushDir.x + SignedUnit(h) * 0.7f,
+                     std::fabs(parent.gushDir.y) + 0.3f,
+                     parent.gushDir.z + SignedUnit(Pcg(h ^ 0x31u)) * 0.7f};
+            dir = Rotate(q, dir);
+            float sp = gore.severVoxelSpeed *
+                       (0.6f + 0.8f * (float)(Pcg(h ^ 0x9Fu) & 0xFFFFu) / 65535.0f);
+            pendingSpawns_.push_back(MakeDroplet(anchorW, dir * sp, def.bleedMat,
+                                                 false, 0, 0));
+          }
         }
     }
     return;

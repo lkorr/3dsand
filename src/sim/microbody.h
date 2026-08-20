@@ -24,9 +24,10 @@
 //
 // DETERMINISM (rule 1): everything here is render-only, exactly like the static
 // micro pool. The pool and the tables are bound to the microbody render
-// pipeline and to nothing else; the sim never sees them, and the voxels never
-// change after load (damage does not edit a limb's micro model in v1, so there
-// is no copy-on-write and no per-instance storage at all).
+// pipeline and to nothing else; the sim never sees them. Damage edits micro
+// payloads (see the COW section below), but only ever as presentation state —
+// a body's authoritative voxels live in DebrisSystem, and nothing here feeds
+// back into the hashed grid.
 
 // ---- GPU layout ------------------------------------------------------------
 
@@ -65,11 +66,40 @@ static_assert(sizeof(MicroBodyInstGpu) == 16,
 
 // ---- CPU side --------------------------------------------------------------
 
-// The pool plus the per-model records. Built at mob-def load, uploaded once,
-// shared by every instance of every def (voxels never change post-load).
+// The pool plus the per-model records.
+//
+// Two populations share one pool. **Shared** models are packed at mob-def load
+// (or on first sphere spawn), indexed by every instance of that def, and never
+// freed. **Owned** models are copy-on-write clones created the first time a
+// particular BODY is damaged — from then on that body has its own payload and
+// edits are local to it (MicroBodyOwn / MicroBodyEdit below).
+//
+// Freed owned blocks return to `freeList` keyed by word count and are reused
+// verbatim, which is what keeps "shoot the same sphere for ten minutes" from
+// walking the pool's high-water mark to the ceiling. Blocks are never
+// coalesced or compacted: a compaction would have to rewrite every live
+// model's `base` while the GPU may still be reading last frame's upload, and
+// exact-size reuse already handles the dominant case (a body re-editing its
+// own block in place, which does not reallocate at all).
 struct MicroBodySet {
   std::vector<MicroBodyModelGpu> models;
   std::vector<uint32_t> pool;
+  // model index -> true when this record is an owned COW clone (freeable).
+  // Shared models must never be freed: other instances still point at them.
+  std::vector<uint8_t> owned;
+  // model index -> words actually reserved at `base`. This is NOT derivable
+  // from dims: an edited body reuses its block in place while shrinking, so
+  // the block stays the size it was allocated at and must be freed at that
+  // size or the surplus leaks out of the pool permanently.
+  std::vector<uint32_t> blockWords;
+  // word count -> list of free block bases of exactly that size.
+  std::vector<std::pair<uint32_t, std::vector<uint32_t>>> freeList;
+  // Retired owned model records, reusable so a long fight does not exhaust
+  // kMaxMicroBodyModels even though the pool words are recycled.
+  std::vector<uint32_t> freeModels;
+  // Set by any mutation; the caller re-uploads and clears. Batching one upload
+  // per tick rather than one per edit is rule 2 applied to PCIe traffic.
+  bool dirty = false;
 };
 
 // Packs one limb's voxel model into `set` and returns its model index, or -1 on
@@ -84,6 +114,42 @@ struct MicroBodySet {
 int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
                   IVec3 dims, uint32_t scale, const std::string& label,
                   std::string& log);
+
+// ---- copy-on-write: destructible micro bodies -------------------------------
+//
+// A shared model cannot be edited — every instance of the def points at it, so
+// carving a crater in one sphere would crater all of them. Damage therefore
+// goes through MicroBodyOwn first: it clones the model into a fresh block and
+// returns a NEW model index that exactly one body holds. Calling it on a model
+// that is already owned is a no-op returning the same index, so the damage path
+// can call it unconditionally and only the first hit pays the copy.
+//
+// Returns -1 if the pool or the model table is full, in which case the caller
+// must fall back to leaving the body's rendering alone (the body's authoritative
+// voxels still change; only the skin stops keeping up). Losing detail under
+// memory pressure beats refusing to be destructible.
+int MicroBodyOwn(MicroBodySet& set, uint32_t model);
+
+// Rewrites an OWNED model's payload from `voxels` (micro units, coordinates
+// relative to the body origin, i.e. the same frame DebrisSystem stores). The
+// model's dims/base are re-derived: a body that lost its top half gets a
+// smaller brick, so the OBB the raster pass draws shrinks with it and the march
+// does not wade through empty space.
+//
+// `originShift` receives the min corner the new brick was rebased to, in MICRO
+// units. The caller must shift the body transform by that (rotated into world
+// space) or the art will drift off the collider — the brick march runs [0..dims)
+// from the body origin, so moving the min corner moves the art.
+//
+// Returns false and leaves the model untouched when `voxels` is empty or the
+// re-pack does not fit; `model` must be owned (MicroBodyOwn first).
+bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
+                   const std::vector<PrefabVoxel>& voxels, IVec3& originShift);
+
+// Returns an owned model's words to the free list and retires its record.
+// Safe (no-op) on shared models and on kMicroBodyNoModel, so body teardown can
+// call it blindly.
+void MicroBodyFree(MicroBodySet& set, uint32_t model);
 
 // A body's micro rendering, passed along when ownership of the body moves.
 //

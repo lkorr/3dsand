@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -86,6 +87,42 @@ class DebrisSystem {
   // small to be worth a body (< 4 voxels).
   bool SplitBody(uint64_t handle, Vec3 planePointVoxel, Vec3 planeNormal);
 
+  // ---- direct damage (explosions, laser kerf) --------------------------------
+  //
+  // Bodies used to be immune to everything except fire: an explosion shoved
+  // them as a rigid whole and the laser could only bisect them along a chosen
+  // plane. Both now remove actual voxels through the shared DamageBody core,
+  // which is the same "erase, re-skin, rebuild collider, maybe shatter" path
+  // burning already used — so a blown-apart body splits into real bodies and
+  // loose particles for free.
+
+  // Explosion damage: erase body voxels within `radiusVoxels` of the centre,
+  // with probability falling off toward the rim so the crater edge is ragged
+  // rather than a clean sphere. Ejected voxels become ballistic particles.
+  // Runs before the radial impulse so the surviving shape takes the push.
+  void DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels, World& world,
+                          std::vector<ParticleSpawn>& spawns);
+
+  // Laser kerf: melt body voxels within `radiusVoxels` of a world point. The
+  // beam eats a channel tick by tick and the body splits when the channel
+  // actually severs it — no cutting plane is ever chosen (DESIGN.md §8).
+  // Returns true when the body was hit. Melted voxels vanish (no particles):
+  // a laser vaporizes, and spraying debris from every tick of a held beam
+  // would flood the particle ring.
+  bool MeltBodyAt(uint64_t handle, Vec3 pointVoxel, float radiusVoxels,
+                  World& world, std::vector<ParticleSpawn>& spawns);
+
+  // Micro bodies render from a shared brick pool; damaging one clones its model
+  // copy-on-write, so the pool changes and must be re-uploaded. The owner polls
+  // this after PreTick and clears it via TakeMicroSet.
+  bool MicroDirty() const;
+  // The live micro set, so the caller can re-upload it. Non-const because the
+  // dirty flag is cleared here.
+  MicroBodySet* MicroSet() { return microSet_; }
+  // Micro bodies must allocate out of the same set the renderer uploads, so
+  // the owner hands it over once at startup. Not owned.
+  void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
+
   // Once per tick AFTER Physics::Step: refresh transforms, cull fallen /
   // excess bodies.
   void PostStep();
@@ -102,6 +139,12 @@ class DebrisSystem {
   void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const;
   uint32_t InstanceCount() const { return instanceCount_; }
   uint32_t BodyCount() const { return (uint32_t)bodies_.size(); }
+  // Physics handle of body `i`. Damage rebuilds a body's collider, which
+  // REPLACES its handle, so anything holding one across a damage call (the
+  // selftest's repeated laser kerf) must re-read it here. 0 if out of range.
+  uint64_t BodyHandle(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].handle : 0;
+  }
   uint32_t ActiveBodyCount() const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
@@ -166,6 +209,37 @@ class DebrisSystem {
   void VoxelsToParticles(const Body& b, const std::vector<DebrisVoxel>& voxels,
                          Vec3 lin, Vec3 ang, World& world,
                          std::vector<ParticleSpawn>& spawns) const;
+
+  // ---- shared damage core ----------------------------------------------------
+  // `keep(v)` decides which of `b`'s voxels survive. Removed voxels become
+  // particles when `eject`, else vanish. Handles the micro re-skin, the
+  // collider rebuild, the connectivity split and the dissolve-to-rubble floor,
+  // so explosions, the laser and (in time) any other damage source all behave
+  // identically. Returns false when the body was destroyed outright, in which
+  // case `bi` now indexes a DIFFERENT body (swap-and-pop) and the caller must
+  // not advance.
+  bool DamageBody(size_t bi, World& world, std::vector<ParticleSpawn>& spawns,
+                  std::vector<Body>& fragments, uint32_t& newBodyBudget,
+                  bool eject,
+                  const std::function<bool(const DebrisVoxel&)>& keep);
+  // Rebuild a body's Jolt collider from its current voxels, preserving pose and
+  // velocity. Micro bodies pass voxelPitch = 1/scale — a scale-2 body's voxels
+  // are half-size, and building it at pitch 1 would double its physical volume
+  // and its mass. Returns false if Jolt refused (body left untouched).
+  bool RebuildCollider(Body& b);
+  // Re-skin a damaged micro body: clone-on-first-damage, rewrite the brick from
+  // the surviving voxels, and shift the transform so the art stays on the
+  // collider. No-op for cube-path bodies. Returns false if the pool is full,
+  // in which case the body keeps its stale skin but is still really damaged.
+  bool ReskinMicro(Body& b);
+  // The pose fix-up both damage and split need: rebasing voxels to a new min
+  // corner moves the body origin, so the transform must move the other way.
+  static void RebaseVoxels(std::vector<DebrisVoxel>& voxels, BodyTransform& xf);
+  // Tear down one body: drops its Jolt body AND returns its copy-on-write
+  // micro brick to the pool. Every removal site must go through this — a body
+  // culled, settled, dissolved or split without freeing its brick leaks pool
+  // words that nothing will ever reclaim, and the pool is a hard ceiling.
+  void ReleaseBody(Body& b);
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.
@@ -173,6 +247,9 @@ class DebrisSystem {
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;
+  // Shared micro brick pool (owned by main, uploaded by Simulation). Damaged
+  // micro bodies allocate private models out of it — see SetMicroSet.
+  MicroBodySet* microSet_ = nullptr;
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;

@@ -1770,6 +1770,40 @@ fn liquidColumn(c : vec3<i32>, mat : u32) -> f32 {
   return h;
 }
 
+// ---- how OPEN is this body of water? ----
+// Ripples are wind-driven gravity waves, and a gravity wave needs FETCH: an
+// open surface many wavelengths across for the wind to work on. The shortest
+// band in rippleSlope is 0.22 m — three and a half voxels — and the longest is
+// 2.6 m, or forty. A puddle one voxel wide cannot physically carry any of them.
+//
+// Running the field on one anyway is what made single droplets on the ground
+// look like a fast-moving current: the waves are defined in world XZ and
+// animate at 0.55-2.3 m/s regardless of what they are drawn on, so a 6 cm
+// splash shows a full-speed wavefront crossing it and reads as rushing water.
+// Scale is the giveaway — the same slope that looks like gentle chop on a lake
+// looks like whitewater when it crosses a droplet in a fraction of a second.
+//
+// So measure the surface's horizontal extent and fade the ripples out with it.
+// A horizontal probe, deliberately: fetch is a property of how far the surface
+// runs, and depth has nothing to do with it. Samples the COLUMN (not one cell)
+// so a shallow-but-wide pond still counts as open, which is the case that would
+// otherwise go glassy and dead.
+//
+// 12 taps on a 2-voxel spacing, primary up-facing water hits only.
+fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
+  var n = 0.0;
+  for (var i = 0; i < 12; i++) {
+    // Two rings at 2 and 4 voxels: the inner one separates a droplet from a
+    // small puddle, the outer one a puddle from something with real fetch.
+    let ring = select(2, 4, i >= 6);
+    let a = f32(i % 6) * 1.0472;   // 60 degrees apart
+    let o = vec3<i32>(i32(round(cos(a) * f32(ring))), 0,
+                      i32(round(sin(a) * f32(ring))));
+    if (liquidColumn(cell + o, mat) > 0.05) { n += 1.0; }
+  }
+  return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
+}
+
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
   // Side/bottom faces of a liquid volume keep their flat voxel normal: the
@@ -1822,7 +1856,12 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let gain = footM;
   // Ripple slope is metres-of-height per metre — same units as `slope` above
   // (voxels per voxel), so they add directly.
-  slope += rippleSlope(pm, R.time, gain);
+  //
+  // Scaled by fetch (see waterOpenness): a droplet or a one-voxel puddle gets
+  // no travelling waves at all and keeps the macro slope from the column
+  // gradient, so it reads as a still bead of water. A lake keeps the full
+  // field. Everything between crosses over smoothly.
+  slope += rippleSlope(pm, R.time, gain) * waterOpenness(cell, mat);
 
   return normalize(vec3f(-slope.x, 1.0, -slope.y));
 }
@@ -2466,7 +2505,18 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // blood's own scattered colour. Blood scatters strongly (it is a suspension,
   // not a clear fluid), so the body colour dominates as soon as it is not a
   // one-voxel film — which is what keeps it from ever looking like tinted glass.
-  var refracted = sceneBehind * trans * TUNE_BLOOD_TRANSMIT + body * (1.0 - trans);
+  //
+  // TRANSMISSION IS CAPPED, and that cap is what stops blood reading as red
+  // glass. Beer-Lambert alone is the wrong model for a dense suspension at
+  // droplet scale: a lone voxel's path is a fraction of VOXEL_METERS, so
+  // exp(-k*d) stays high and a large slice of the wall behind survives, no
+  // matter how absorbing the material is authored to be. Real blood does not
+  // work that way — it is opaque at well under a millimetre because it
+  // BACKSCATTERS, and the ray never reaches the far side to begin with.
+  // Clamping the surviving fraction models that scattering albedo directly, so
+  // even a single droplet shows its own colour rather than the scene through it.
+  let seeThrough = min(trans * TUNE_BLOOD_TRANSMIT, TUNE_BLOOD_MAX_TRANSMIT);
+  var refracted = sceneBehind * seeThrough + body * (1.0 - seeThrough);
 
   // ---- reflection ----
   // A pool can hold a real reflection; a droplet cannot (there is no coherent
@@ -2539,9 +2589,26 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Deliberately only the OUTER fringe (the smoothstep's low end): fading too
   // deep makes the whole droplet translucent and washed out instead of just
   // softening its rim.
+  //
+  // The threshold must be RELATIVE to what the field actually reaches here, and
+  // getting that wrong is what produced a red halo around every splash. An
+  // absolute band (the previous 0.10..0.38) assumes the field approaches 1.0
+  // inside the liquid, which only holds in the interior of a POOL. Trilinear
+  // interpolation of an isolated voxel peaks near 0.125 even when that voxel is
+  // completely full, so a droplet sat ENTIRELY below the band: `solid` was
+  // small across its whole face, not just at its rim, and the droplet was
+  // blended toward the background everywhere while its sheen still lit the air
+  // around it. That is the aura.
+  //
+  // Referencing the field's local peak instead makes the feather scale-free: it
+  // trims the same fraction of the outer fringe off a droplet and off a pool,
+  // and never eats into the body of either.
   let edgeField = liquidFieldAt(hitP - rd * 0.35, mat);
-  let solid = smoothstep(TUNE_BLOOD_EDGE_FEATHER, TUNE_BLOOD_EDGE_FEATHER + 0.28,
-                         edgeField);
+  // Peak the field can reach for this blob, floored so a full pool still uses
+  // the authored feather rather than a vanishing one.
+  let peak = max(liquidFieldAt(hitP - rd * 1.1, mat), 0.35);
+  let lo = TUNE_BLOOD_EDGE_FEATHER * peak;
+  let solid = smoothstep(lo, lo + 0.28 * peak, edgeField);
   color = mix(sceneBehind, color, clamp(solid, 0.0, 1.0));
 
   return color;

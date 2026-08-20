@@ -128,15 +128,48 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   else if (m.klass == CLASS_GAS) { ejectPerMille = TUNE_EJECT_GAS; }
 
   let rnd = hash3(T.seed ^ 0xB0011u, T.tick, idx);
-  if (rnd % 1000u >= ejectPerMille) { return; }
-
-  let slot = atomicAdd(&counts[T.page], 1u);
-  if (slot >= PARTICLE_CAP) { return; }  // ring full: voxel just vaporizes
 
   // outward velocity scaled by surviving power, plus per-cell jitter
   let remaining = i32(val - 1u);
   let dist = max(i32(isqrt(u32(d2))), 1);
   let speed = min(PART_MAX_VEL, PART_ONE + remaining * 2);
+
+  // ---- micro grit ----
+  // Rolled from a DIFFERENT slice of the hash than the eject roll, and emitted
+  // BEFORE it, so grit is independent of whether this cell also throws a real
+  // voxel. Correlating the two would make the blast either doubly dense or
+  // bare in exactly the places the eject roll already decided.
+  //
+  // Grit is sub-voxel, dies on contact and stains only if its material stains,
+  // so it adds no matter to the world — it is the dust and spall that sells a
+  // blast, and it costs one ring slot with a short lifetime.
+  let gritRoll = hash3(rnd, 0x6217u, idx);
+  if ((gritRoll % 1000u) < TUNE_EXP_MICRO_PERMILLE) {
+    let gslot = atomicAdd(&counts[T.page], 1u);
+    if (gslot < PARTICLE_CAP) {
+      // Faster than the voxel ejecta and scattered wider: light debris leaves
+      // a blast ahead of the heavy chunks.
+      let gspeed = min(PART_MAX_VEL, speed + speed / 2);
+      var g : Particle;
+      g.px = c.x * PART_ONE + 128;
+      g.py = c.y * PART_ONE + 128;
+      g.pz = c.z * PART_ONE + 128;
+      g.vx = local.x * gspeed / dist + (i32((gritRoll >> 8u) & 0xFFu) - 128);
+      g.vy = local.y * gspeed / dist + (i32((gritRoll >> 16u) & 0xFFu) - 64);
+      g.vz = local.z * gspeed / dist + (i32((gritRoll >> 24u) & 0xFFu) - 128);
+      g.payload = w & 0xFFFFu;
+      g.flags = PFLAG_ALIVE | PFLAG_MICRO |
+                (u32(TUNE_EXP_MICRO_SCALE_IDX) << PMICRO_SCALE_SHIFT) |
+                (u32(TUNE_EXP_MICRO_LIFE) << PMICRO_LIFE_SHIFT);
+      pReadBuf[gslot] = g;
+    }
+  }
+
+  if (rnd % 1000u >= ejectPerMille) { return; }
+
+  let slot = atomicAdd(&counts[T.page], 1u);
+  if (slot >= PARTICLE_CAP) { return; }  // ring full: voxel just vaporizes
+
   var p : Particle;
   p.px = c.x * PART_ONE + 128;
   p.py = c.y * PART_ONE + 128;

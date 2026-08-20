@@ -656,6 +656,60 @@ neighbors, so this needs an explicit connectivity pass:
   appends to the live page exactly like explosion ejecta — part of the tick
   input stream, so saves/replays capture shatter for free. Selftest gate:
   `body shatter` (ember-bridge dumbbell must drop its clump as particles).
+  The fixture's plate is 5×5, not 3×3, for a reason worth keeping: the ember
+  does not only burn the bridge, it ignites the wood it touches, so a 9-voxel
+  plate erodes past the 8-voxel dissolve floor *before* the connectivity check
+  ever separates the clump — the test then measured erosion rather than
+  shattering and reported 0 bodies. Any fixture here needs the surviving
+  component to outlast the burn with margin.
+- **Direct body damage (2026-08-20, implemented):** bodies used to be immune to
+  everything except fire — an explosion shoved them as a rigid whole and the
+  laser could only bisect them along a camera-derived plane. Both now remove
+  actual voxels through one shared core, `DebrisSystem::DamageBody`, which is
+  the same "erase → re-skin → rebuild collider → maybe shatter → dissolve if
+  under the floor" path burning already used. Consequences fall out of reusing
+  it: a blast that severs a body yields real separate bodies, and one that
+  takes it under 8 voxels turns the remainder into ballistic particles.
+  - **Explosions** (`DamageBodiesRadial`, called from the `X`/grenade path
+    before `ApplyRadialImpulse`) erase with a quadratic falloff so the crater
+    rim is ragged rather than a billiard-ball scoop, eject the removed voxels
+    as particles, and let the impulse act on what survives — including the new
+    fragments, which is what makes a blown-apart object scatter. Reach is
+    `physics.explosionBodyDamageScale` × the destruction radius, kept separate
+    from the impulse reach so a blast pushes objects from further away than it
+    dismembers them.
+  - **The laser** (`MeltBodyAt`) bores a channel tick by tick and the body
+    splits when that channel actually severs it. No cutting plane is chosen,
+    so what comes apart is decided by the geometry the player carved rather
+    than by where the camera happened to be. Melted voxels vaporize (no
+    ejecta): a held beam damages every tick and spraying particles from each
+    one would drain the spawn ring in a second.
+  - Selftest gates: `body blast` (neck-jointed dumbbell must lose voxels AND
+    become ≥2 bodies) and `laser kerf` (a held beam must bore through a rod
+    and sever it).
+- **Destructible micro bodies / copy-on-write bricks (2026-08-20):** the micro
+  brick pool held only per-DEF art shared by every instance, so damaging one
+  sphere would have cratered all of them — which is exactly why micro bodies
+  were previously exempt from every destruction path. `MicroBodyOwn` now clones
+  a shared model into a private block on first damage and returns a new model
+  index exactly one body holds; `MicroBodyEdit` rewrites that block from the
+  surviving voxels and re-derives the dims, so a body that lost half its mass
+  draws a smaller OBB instead of marching through air. Freed blocks return to
+  an exact-size free list (no coalescing: a compaction would have to rewrite
+  every live `base` while the GPU may still be reading last frame's upload, and
+  a body re-carving its own block reuses it in place anyway). `blockWords`
+  tracks the reserved size separately from the dims precisely because shrinking
+  reuses the block — freeing by dims would leak the surplus. Every body
+  teardown routes through `DebrisSystem::ReleaseBody` so a culled, settled,
+  dissolved or split body cannot strand pool words. Under pool exhaustion a
+  fragment falls through to particles rather than to the cube path, which would
+  draw it at scale-1 size — twice too big.
+  - This also fixed two latent scale bugs that only bit once micro bodies could
+    be damaged: `ShatterBody` built fragment colliders at pitch 1 (inflating a
+    scale-2 fragment to 8× its mass) and `VoxelsToParticles` emitted one
+    full-size particle per micro voxel (turning a scale-2 body into 8× the
+    matter it had). Both now divide by the body's scale, and particle emission
+    sub-samples on the micro lattice to conserve visible volume.
 - **Terrain-mesh identity rule (2026-08-19):** collision patches rebuild from
   dirty chunks, but a chunk can be dirty for reasons that don't move the
   collision surface (liquid flowing or drying — liquids carry no weight in the
@@ -731,9 +785,13 @@ handmade art becomes matter the existing destruction pipeline already breaks.
 - **Laser (hold F):** grid cuts are per-tick melt-mode brush ops at the picked
   surface — the recessing cut is just repeated ops, and cutting supports feeds
   the same island/support-loss pipeline as explosions. Body cuts ray-test Jolt
-  first: crossing a joint anchor severs it; hits on plain debris split the
-  body by a plane through the beam (voxel partition → two bodies, pose and
-  velocity inherited).
+  first: crossing a joint anchor severs it; hits on plain debris **melt body
+  voxels at the beam** (`MeltBodyAt`), boring a channel that splits the body
+  once it actually severs it — see "Direct body damage" in §7. The original
+  implementation bisected the body along a plane through the beam, which read
+  as teleport-slicing and let camera orientation, rather than the carved
+  geometry, decide what fell off. `SplitBody` survives for that plane-cut case
+  but is no longer on the laser path.
 
 ### Animation pipeline (2026-08-20; `game/anim`, docs/PLAN_voxel_editor.md §B)
 
@@ -1230,8 +1288,10 @@ then **micro units** — that many per world voxel — so the same silhouette ge
 limb model once at def load into a second brick pool (`array<u32>`, four 8-bit
 palette indices per word, palette index == material ID as everywhere else) and
 records a `MicroBodyModel { base, dims, scale }` per limb. Models are shared by
-every instance of the def: voxels never change after load in v1, so there is no
-copy-on-write and no per-instance storage at all.
+every instance of the def while undamaged; the first time a particular body is
+blasted, cut or shattered it clones its model into a private block and edits
+that (copy-on-write — see "Destructible micro bodies" in §7), so the shared art
+stays pristine and only bodies that actually took damage cost pool words.
 
 **OBB raster + per-fragment march.** Each micro body draws as ONE box — 36
 vertices — between `DrawBodies` and `DrawSprites`. The vertex shader positions

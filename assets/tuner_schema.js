@@ -199,6 +199,8 @@ const TUNING_SCHEMA = [
       {k:'waterFresnelPower', n:'fresnel falloff', d:'How quickly reflection ramps up toward grazing angles. 5 is physically standard.', min:1, max:10, step:0.1},
       {k:'rippleAmpScale', n:'ripple height', d:'Scales all five wave bands. 0 gives mirror-flat water.', min:0, max:4, step:0.01},
       {k:'rippleSpeedScale', n:'ripple speed', d:'Scales how fast the waves travel.', min:0, max:4, step:0.01},
+      {k:'waterFetchLow', n:'wave fetch start', d:'How open a water surface must be before travelling waves appear at all (fraction of a 12-tap horizontal ring that is liquid). Below this a droplet or puddle stays perfectly still.', min:0, max:1, step:0.01},
+      {k:'waterFetchHigh', n:'wave fetch full', d:'Openness at which the wave field reaches full strength. Raise to keep small ponds calm and reserve waves for lakes.', min:0, max:1, step:0.01},
       {k:'reflectionCutoff', n:'reflection cutoff', d:'Below this reflectance, use a cheap sky sample instead of tracing a ray. Raising it is a solid perf win on water-heavy views.', min:0, max:1, step:0.005},
       {k:'reflectionSteps', n:'reflection budget', d:'Max steps a reflection ray marches — a direct frame-time multiplier when looking at water.', min:0, max:512, step:8, int:true},
       {k:'causticGain', n:'caustic strength', d:'Brightness of the focused light bands on the bed.', min:0, max:8, step:0.05},
@@ -216,12 +218,13 @@ const TUNING_SCHEMA = [
     title: 'Ice & Glass',
     icon: '\u{1F9CA}',
     apply: 'shader',
+    group: 'render',
     blurb: 'Translucent SOLIDS. Any solid whose material opacity is under 255 ' +
            'takes this path — ice and glass today, crystal or amber tomorrow. ' +
            'Absorption is per metre of the real path a ray takes through the ' +
            'slab, so one setting covers both "thin rim ice is nearly clear" ' +
            'and "a thick block is deep cyan" without authoring them separately.',
-    rows: [
+    params: [
       {k:'iceAbsorb', n:'absorption', d:'Absorption per metre of depth, scaled by the material’s own opacity. This is the main knob: raise it and ice turns blue in a thinner slab.', min:0, max:12, step:0.05},
       {k:'iceAbsorbFloor', n:'absorption floor', d:'Minimum absorption on every channel, so even the clearest ice tints slightly rather than becoming invisible glass.', min:0, max:1, step:0.005},
       {k:'iceScatter', n:'internal scatter', d:'Trapped bubbles and grain boundaries scattering light back out. This is what separates ice from glass — drop it to zero and you get a clean window.', min:0, max:2, step:0.01},
@@ -257,6 +260,7 @@ const TUNING_SCHEMA = [
       {k:'bloodWobble', n:'surface wobble', d:'Slow surface-tension wobble. NOT wind ripples — blood is far too viscous for travelling waves, and running water\'s ripple field over it makes a puddle look like it is boiling. Keep tiny.', min:0, max:0.05, step:0.0005},
       {k:'bloodAbsorb', n:'absorption', d:'How fast blood goes opaque with depth, scaled by its authored opacity. High: a couple of centimetres is already solid.', min:0, max:200, step:1},
       {k:'bloodTransmit', n:'transmission', d:'How much of the surface behind shows through a thin film. Low, or blood starts looking like tinted glass.', min:0, max:1, step:0.01},
+      {k:'bloodMaxTransmit', n:'max transmission', d:'Hard ceiling on that transmission, modelling backscatter. Beer-Lambert alone leaves a lone droplet half-transparent because its path is a fraction of a voxel; this is what keeps a single splash opaque and red. Raise it and blood becomes red glass.', min:0, max:0.5, step:0.005},
       {k:'bloodDepthRamp', n:'depth darkening', d:'How quickly blood goes from bright thin red to near-black maroon with depth. This ramp replaces water\'s shallow-to-deep colour shift.', min:0, max:100, step:0.5, u:'/m'},
       {k:'bloodF0', n:'reflectivity', d:'Head-on reflectance of the blood surface.', min:0, max:0.3, step:0.001},
       {k:'bloodGraze', n:'grazing reflectivity', d:'Reflectance at grazing angles. Water goes to 1.0 (a full mirror); blood is absorbing and slightly rough, so it stops lower — at 1.0 every pool edge gets a bright white rim.', min:0, max:1, step:0.01},
@@ -354,6 +358,7 @@ const TUNING_SCHEMA = [
       {k:'playerProxyFriction', n:'player friction', d:'Friction of the player capsule against bodies. Kept low so the player does not drag debris around.', min:0, max:2, step:0.01},
       {k:'explosionImpulseScale', n:'blast impulse', d:'How hard an explosion throws debris — the how-far-does-a-plank-fly knob.', min:0, max:2, step:0.005},
       {k:'explosionImpulseRadiusScale', n:'blast impulse reach', d:'Impulse radius as a multiple of the destruction radius, so bodies just outside the crater still get pushed.', min:0.5, max:10, step:0.1, u:'×'},
+      {k:'explosionBodyDamageScale', n:'blast body damage reach', d:'How far a blast blows voxels OFF rigidbodies, as a multiple of the destruction radius. Below the impulse reach, so blasts push objects from further than they dismember them.', min:0, max:4, step:0.05, u:'×'},
       {k:'playerMassKg', n:'player mass', d:'Mass of the player contact proxy. Contact impulses split by mass ratio against a body\'s density-derived mass, so this is the how-hard-can-I-shove-things knob.', min:10, max:500, step:1, u:'kg'},
       {k:'sphereFriction', n:'sphere friction', d:'Grip of rolling sphere bodies. Higher converts more sliding into rolling.', min:0, max:2, step:0.01},
       {k:'sphereRestitution', n:'sphere bounce', d:'Bounciness of rolling spheres on impact.', min:0, max:1, step:0.01},
@@ -376,6 +381,27 @@ const TUNING_SCHEMA = [
       {k:'settleAfterTicks', n:'settle delay', d:'How long a body must sleep before it converts back into grid voxels. 30 ticks = 1 second.', min:5, max:600, step:5, int:true, u:'ticks'},
       {k:'alignCos', n:'settle alignment', d:'How close to axis-aligned a body must be to settle back into the grid. 0.94 is about 20°; bodies at odd angles stay bodies.', min:0.5, max:0.9999, step:0.005},
       {k:'burnOpsPerTick', n:'burn ops / tick', d:'Cap on fire/ash writes emitted by burning bodies per tick.', min:16, max:4096, step:16, int:true},
+    ],
+  },
+
+  {
+    id: 'gore',
+    title: 'Gore',
+    icon: '\u{1FA78}',
+    apply: 'cpu',
+    blurb: 'Bleeding and dismemberment. Two sizes of matter come off a wound: whole blood VOXELS, which the sim carries and which pool on the ground, and sub-voxel MICRO droplets, which fly, never re-enter the grid, and stain whatever surface they hit. The spray is what sells the hit; the voxels are what is still there a minute later.',
+    params: [
+      {k:'bleedSprayPerDrip', n:'bleed spray / drip', d:'Micro droplets thrown per blood voxel a wound drips. Bleeding rate itself is set by the mob\'s bleed.perDamage; this only decides how visible each drip is.', min:0, max:24, step:0.5},
+      {k:'bleedSpraySpeed', n:'bleed spray speed', d:'Launch speed of a bleed droplet, upward-biased.', min:0, max:30, step:0.5, u:'vox/s'},
+      {k:'bleedSprayCone', n:'bleed spray spread', d:'Lateral scatter as a fraction of launch speed. 0 is a straight jet, 1 is a hemisphere.', min:0, max:2, step:0.05},
+      {k:'severSpray', n:'sever spray', d:'Total micro droplets released by a dismemberment, spread over the decay window. This is the arterial gout — the single biggest visual cue that a limb came off.', min:0, max:2000, step:10, int:true, warn:'Very high values with a long decay can hold hundreds of particles live at once.'},
+      {k:'severDecayTicks', n:'sever decay', d:'How long the gout lasts. Emission is front-loaded across this window, so the burst hits hardest at the cut and tails off. 30 ticks = 1 second.', min:1, max:300, step:5, int:true, u:'ticks'},
+      {k:'severSpraySpeed', n:'sever spray speed', d:'Launch speed of dismemberment spray.', min:0, max:40, step:0.5, u:'vox/s'},
+      {k:'severSprayCone', n:'sever spray spread', d:'Lateral scatter of dismemberment spray.', min:0, max:2, step:0.05},
+      {k:'severVoxels', n:'sever blood voxels', d:'Whole blood voxels thrown by the cut. Unlike spray these are real matter the sim has to move and settle, so this is a perf knob as much as a look knob.', min:0, max:200, step:1, int:true, warn:'Large values dump a lot of liquid into the CA at once.'},
+      {k:'severVoxelSpeed', n:'sever voxel speed', d:'Launch speed of the whole blood voxels.', min:0, max:30, step:0.5, u:'vox/s'},
+      {k:'microLifeTicks', n:'droplet life', d:'How long a micro droplet lives before evaporating, whether or not it ever lands. This is the guarantee that spray clears and the world settles. Hard limit 255.', min:1, max:255, step:1, int:true, u:'ticks'},
+      {k:'microScale', n:'droplet fineness', d:'Micro voxels per world voxel: a droplet renders at 1/this of a cell. Only 2, 3, 4 and 6 are representable.', min:2, max:6, step:1, int:true},
     ],
   },
 
@@ -421,6 +447,9 @@ const TUNING_SCHEMA = [
       {k:'airDensity', n:'air density', d:'Anything denser than this sinks through air; anything lighter rises. Compared against the density values in materials.json.', min:0, max:2000, step:1, int:true, warn:'Raising this above a material’s density inverts whether it sinks or floats.'},
       {k:'liquidEqualize', n:'liquid spread', d:'How many eighths emptier a neighbouring cell must be before liquid flows sideways into it. Low values spread water into thin films that never settle.', min:1, max:7, step:1, int:true, warn:'Below 2, pools spread thin and chunks may never sleep — that breaks the settled-world guarantee.'},
       {k:'wanderHopMask', n:'critter hop rarity', d:'Chance a wandering powder hops is 1 in (this + 1) per tick. 7 means one in eight.', min:0, max:255, step:1, int:true},
+      {k:'expMicroPerMille', n:'blast grit', d:'Sub-voxel spall an explosion throws, per mille of the cells it destroys. Pure visual grit alongside the real flying voxels — it adds no matter and does not change how much is destroyed, but it IS rolled by a sim kernel, so it changes the world hash.', min:0, max:1000, step:10, int:true},
+      {k:'expMicroLifeTicks', n:'blast grit life', d:'How long blast grit lives before evaporating. Shorter than blood spray so dust snaps out rather than hanging in the air. 30 ticks = 1 second.', min:1, max:255, step:1, int:true, u:'ticks'},
+      {k:'expMicroScaleIdx', n:'blast grit fineness', d:'How fine the grit is: 0 = half a voxel, 1 = a third, 2 = a quarter, 3 = a sixth.', min:0, max:3, step:1, int:true},
     ],
   },
 

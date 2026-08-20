@@ -28,6 +28,13 @@ struct UIState {
   float playerPos[3] = {};
   bool mirrorValid = false;
 
+  // what the crosshair is over, from the sim_pick readback (one tick latent).
+  // hoverMat == 0 means the ray left the residency window without hitting
+  // anything, so there is nothing to name.
+  int hoverMat = 0;
+  int hoverCell[3] = {};
+  float hoverDist = 0;  // metres from the eye to the hit cell centre
+
   // controls (edited by UI, applied by main)
   bool paused = false;
   bool stepOnce = false;

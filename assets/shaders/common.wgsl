@@ -484,6 +484,58 @@ const PART_MAX_VEL  : i32 = TUNE_PART_MAX_VEL;      // 6 voxels/tick terminal sp
 const PFLAG_ALIVE   : u32 = 1u;
 const PFLAG_PENDING : u32 = 2u;        // proposed a reinsertion this tick
 
+// ---- MICROVOXEL particles (sub-voxel spray) --------------------------------
+// A micro particle is a particle that is SMALLER than a grid cell, so the grid
+// has nowhere to put it. That single fact drives everything else about it:
+//
+//   * It NEVER reinserts as a voxel. On contact it either vanishes or, if its
+//     material stains (materials.json `stain`), it deposits that stain into the
+//     surface it hit. Reinserting would round a 1/4-voxel droplet up to a whole
+//     voxel and manufacture matter — a mob would bleed out more blood than it
+//     could hold, and a spray of a hundred droplets would tile a wall solid.
+//   * It carries a LIFETIME. Ordinary particles are conserved matter and are
+//     entitled to persist; spray is an effect and must die down on its own or
+//     a fight leaves the ring permanently full (rule 2 — a settled world must
+//     cost nothing, and "settled" has to include "after the blood dried").
+//
+// Both live in spare bits of `flags`, so the 32-byte Particle does not grow:
+//   bit 2      PFLAG_MICRO   — this is a micro particle
+//   bits 3..4  scale index   — 0..3 maps to MICRO_SCALES (2,3,4,6 per voxel)
+//   bits 5..12 life          — ticks remaining, decremented each integrate
+//
+// DETERMINISM (rule 1): a micro particle that stains WRITES THE GRID, so it is
+// sim state, not decoration. Its stain therefore goes through the same claim
+// hash that reinsertion uses (see microStainPriority) — atomicMax over a
+// state-derived priority, so exactly one droplet per cell per tick applies and
+// the winner does not depend on dispatch order. Reading a word, or-ing a stain
+// in and storing it from every droplet that landed would be a read-modify-write
+// race and would break the world hash.
+const PFLAG_MICRO   : u32 = 4u;
+const PMICRO_SCALE_SHIFT : u32 = 3u;
+const PMICRO_SCALE_MASK  : u32 = 3u;
+const PMICRO_LIFE_SHIFT  : u32 = 5u;
+const PMICRO_LIFE_MASK   : u32 = 0xFFu;   // 255 ticks max
+const PMICRO_LIFE_ONE    : u32 = 1u << PMICRO_LIFE_SHIFT;
+
+// Micro voxels per world voxel, indexed by the 2-bit scale field. Rendering
+// divides the cube by this; it is presentation only (the sim never subdivides
+// a cell), which is why non-power-of-two entries are fine here.
+fn microScaleOf(flags : u32) -> u32 {
+  let i = (flags >> PMICRO_SCALE_SHIFT) & PMICRO_SCALE_MASK;
+  if (i == 0u) { return 2u; }
+  if (i == 1u) { return 3u; }
+  if (i == 2u) { return 4u; }
+  return 6u;
+}
+fn microLifeOf(flags : u32) -> u32 {
+  return (flags >> PMICRO_LIFE_SHIFT) & PMICRO_LIFE_MASK;
+}
+fn withMicroLife(flags : u32, life : u32) -> u32 {
+  return (flags & ~(PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT)) |
+         ((life & PMICRO_LIFE_MASK) << PMICRO_LIFE_SHIFT);
+}
+fn isMicro(p : Particle) -> bool { return (p.flags & PFLAG_MICRO) != 0u; }
+
 struct Particle {
   px : i32, py : i32, pz : i32,   // position, fixed 24.8 voxels
   vx : i32, vy : i32, vz : i32,   // velocity, fixed 24.8 voxels/tick
@@ -501,6 +553,23 @@ fn particlePriority(p : Particle) -> u32 {
 }
 fn claimSlot(cellIdx : u32) -> u32 {
   return pcg(cellIdx) & (CLAIM_SIZE - 1u);
+}
+
+// Priority for a micro particle's STAIN claim. Same contract as
+// particlePriority — derived purely from particle state so atomicMax picks an
+// order-independent winner — but deliberately a DIFFERENT hash, and it forces
+// the low bit CLEAR where particlePriority forces it set.
+//
+// That parity split is what lets both populations share one claim array: a
+// reinserting particle can never tie with a staining droplet, so a droplet
+// landing on the same cell a voxel wants to occupy cannot steal the cell (it
+// would lose the max) nor be mistaken for the winner (it checks its own value
+// back). Two independent claim buffers would be the alternative and would cost
+// another megabyte for nothing.
+fn microStainPriority(p : Particle) -> u32 {
+  let h = pcg(0x5D1A17u ^ u32(p.px) ^ pcg(u32(p.py) ^ pcg(u32(p.pz) ^
+          pcg(u32(p.vx) ^ pcg(u32(p.vy) ^ pcg(u32(p.vz) ^ p.payload))))));
+  return (h | 2u) & ~1u;  // nonzero, and always even
 }
 
 // Must match ExplosionOp in world.h (32 bytes).

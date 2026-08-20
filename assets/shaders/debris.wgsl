@@ -69,8 +69,15 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   let p = particles[inst];
   if ((p.flags & PFLAG_ALIVE) == 0u) { return clipped(); }
 
+  // A micro particle is drawn at 1/scale of a voxel — that size difference IS
+  // the feature (a fine spray reading as droplets rather than as flying
+  // bricks). 0.7 of a cell for ordinary particles is the established look;
+  // micro keeps the same proportion of its own smaller cell.
+  var size = 0.7;
+  if (isMicro(p)) { size = 0.7 / f32(microScaleOf(p.flags)); }
+
   var n : vec3f;
-  let off = cubeOffset(vi, &n) * 0.7;  // slightly smaller than a voxel
+  let off = cubeOffset(vi, &n) * size;
   let center = vec3f(f32(p.px), f32(p.py), f32(p.pz)) / 256.0;
   let world = center + off;
 

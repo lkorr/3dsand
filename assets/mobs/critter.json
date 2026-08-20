@@ -3,9 +3,9 @@
   "scale": 2,
   "bleed": {
     "material": "blood",
-    "perDamage": 2.0
+    "perDamage": 2
   },
-  "speed": 6.0,
+  "speed": 6,
   "gait": {
     "cadence": 2.6,
     "strideBias": 0.45,
@@ -25,7 +25,7 @@
       ]
     ],
     "bobAmp": 0.09,
-    "bobFreqMul": 2.0,
+    "bobFreqMul": 2,
     "swayAmp": 0.05,
     "rollAmp": 0.07,
     "spineCounter": 0.6,
@@ -48,10 +48,10 @@
       "tag": "head",
       "anchor": [
         4,
-        14.0,
+        14,
         20
       ],
-      "severImpactSpeed": 22.0
+      "severImpactSpeed": 22
     },
     {
       "name": "tail",
@@ -62,10 +62,10 @@
       "tag": "tail",
       "anchor": [
         4,
-        12.0,
+        12,
         8
       ],
-      "severImpactSpeed": 10.0,
+      "severImpactSpeed": 10,
       "spring": {
         "halflife": 0.18,
         "gain": 1.4,
@@ -81,10 +81,10 @@
       "tag": "leg",
       "anchor": [
         0,
-        12.0,
+        12,
         18
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legL.FL",
@@ -98,14 +98,14 @@
         0,
         0
       ],
-      "minAngle": -2.0,
+      "minAngle": -2,
       "maxAngle": 0.05,
       "anchor": [
         0,
-        6.0,
+        6,
         18
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legU.FR",
@@ -116,10 +116,10 @@
       "tag": "leg",
       "anchor": [
         8,
-        12.0,
+        12,
         18
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legL.FR",
@@ -133,14 +133,14 @@
         0,
         0
       ],
-      "minAngle": -2.0,
+      "minAngle": -2,
       "maxAngle": 0.05,
       "anchor": [
         8,
-        6.0,
+        6,
         18
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legU.BL",
@@ -151,10 +151,10 @@
       "tag": "leg",
       "anchor": [
         0,
-        12.0,
+        12,
         12
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legL.BL",
@@ -168,14 +168,14 @@
         0,
         0
       ],
-      "minAngle": -2.0,
+      "minAngle": -2,
       "maxAngle": 0.05,
       "anchor": [
         0,
-        6.0,
+        6,
         12
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legU.BR",
@@ -186,10 +186,10 @@
       "tag": "leg",
       "anchor": [
         8,
-        12.0,
+        12,
         12
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     },
     {
       "name": "legL.BR",
@@ -203,14 +203,14 @@
         0,
         0
       ],
-      "minAngle": -2.0,
+      "minAngle": -2,
       "maxAngle": 0.05,
       "anchor": [
         8,
-        6.0,
+        6,
         12
       ],
-      "severImpactSpeed": 18.0
+      "severImpactSpeed": 18
     }
   ],
   "chains": [
@@ -287,10 +287,10 @@
             {
               "t": 0,
               "q": [
-                0.0,
-                0.0,
-                0.0,
-                1.0
+                0,
+                0,
+                0,
+                1
               ],
               "ease": "cubicOut"
             },
@@ -298,8 +298,8 @@
               "t": 200,
               "q": [
                 0.342,
-                0.0,
-                0.0,
+                0,
+                0,
                 0.94
               ],
               "ease": "cubicInOut"
@@ -307,10 +307,10 @@
             {
               "t": 420,
               "q": [
-                0.0,
-                0.0,
-                0.0,
-                1.0
+                0,
+                0,
+                0,
+                1
               ],
               "ease": "linear"
             }
@@ -318,5 +318,6 @@
         }
       }
     }
-  }
+  },
+  "flipbooks": {}
 }

@@ -236,6 +236,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "playerProxyFriction", p.playerProxyFriction, out, at);
     ReadF(*g, "explosionImpulseScale", p.explosionImpulseScale, out, at);
     ReadF(*g, "explosionImpulseRadiusScale", p.explosionImpulseRadiusScale, out, at);
+    ReadF(*g, "explosionBodyDamageScale", p.explosionBodyDamageScale, out, at);
     ReadF(*g, "playerMassKg", p.playerMassKg, out, at);
     ReadF(*g, "sphereFriction", p.sphereFriction, out, at);
     ReadF(*g, "sphereRestitution", p.sphereRestitution, out, at);
@@ -260,6 +261,36 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("debris.minBodyVoxels < 1; clamped to 1");
       d.minBodyVoxels = 1;
     }
+  }
+
+  if (const json* g = Find(j, "gore")) {
+    auto& e = out.gore;
+    const std::string at = "gore";
+    ReadF(*g, "bleedSprayPerDrip", e.bleedSprayPerDrip, out, at);
+    ReadF(*g, "bleedSpraySpeed", e.bleedSpraySpeed, out, at);
+    ReadF(*g, "bleedSprayCone", e.bleedSprayCone, out, at);
+    ReadI(*g, "severSpray", e.severSpray, out, at);
+    ReadI(*g, "severDecayTicks", e.severDecayTicks, out, at);
+    ReadF(*g, "severSpraySpeed", e.severSpraySpeed, out, at);
+    ReadF(*g, "severSprayCone", e.severSprayCone, out, at);
+    ReadI(*g, "severVoxels", e.severVoxels, out, at);
+    ReadF(*g, "severVoxelSpeed", e.severVoxelSpeed, out, at);
+    ReadI(*g, "microLifeTicks", e.microLifeTicks, out, at);
+    ReadI(*g, "microScale", e.microScale, out, at);
+    // The life field is 8 bits in Particle.flags (PMICRO_LIFE_MASK). A value
+    // past 255 would wrap and produce droplets that die instantly, which reads
+    // as "the spray stopped working" rather than as a bad number.
+    if (e.microLifeTicks < 1 || e.microLifeTicks > 255) {
+      out.warnings.push_back(at + ".microLifeTicks out of 1..255; clamped");
+      e.microLifeTicks = e.microLifeTicks < 1 ? 1 : 255;
+    }
+    // Only 2/3/4/6 are representable in the 2-bit scale field.
+    if (e.microScale != 2 && e.microScale != 3 && e.microScale != 4 &&
+        e.microScale != 6) {
+      out.warnings.push_back("gore.microScale must be 2, 3, 4 or 6; using 4");
+      e.microScale = 4;
+    }
+    if (e.severDecayTicks < 1) e.severDecayTicks = 1;
   }
 
   if (const json* g = Find(j, "grenade")) {
@@ -298,6 +329,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "ejectGas", s.ejectGas, out, at);
     ReadI(*g, "liquidEqualize", s.liquidEqualize, out, at);
     ReadI(*g, "wanderHopMask", s.wanderHopMask, out, at);
+    ReadI(*g, "expMicroPerMille", s.expMicroPerMille, out, at);
+    ReadI(*g, "expMicroLifeTicks", s.expMicroLifeTicks, out, at);
+    ReadI(*g, "expMicroScaleIdx", s.expMicroScaleIdx, out, at);
+    // Both of these are packed into bit fields in Particle.flags; an
+    // out-of-range value would wrap into the neighbouring field rather than
+    // merely looking wrong, so clamp instead of trusting the file.
+    if (s.expMicroLifeTicks < 1 || s.expMicroLifeTicks > 255) {
+      out.warnings.push_back("sim.expMicroLifeTicks out of 1..255; clamped");
+      s.expMicroLifeTicks = s.expMicroLifeTicks < 1 ? 1 : 255;
+    }
+    if (s.expMicroScaleIdx < 0 || s.expMicroScaleIdx > 3) {
+      out.warnings.push_back("sim.expMicroScaleIdx out of 0..3; clamped");
+      s.expMicroScaleIdx = s.expMicroScaleIdx < 0 ? 0 : 3;
+    }
+    if (s.expMicroPerMille < 0 || s.expMicroPerMille > 1000) {
+      out.warnings.push_back("sim.expMicroPerMille out of 0..1000; clamped");
+      s.expMicroPerMille = s.expMicroPerMille < 0 ? 0 : 1000;
+    }
     // A zero falloff makes every explosion reach the full residency window:
     // not a crash, but a guaranteed frame-time cliff and an unbounded emergent
     // process (CLAUDE.md rule 2). Clamp rather than trust the file.
@@ -447,6 +496,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "waterFresnelPower", r.waterFresnelPower, out, at);
     ReadF(*g, "rippleAmpScale", r.rippleAmpScale, out, at);
     ReadF(*g, "rippleSpeedScale", r.rippleSpeedScale, out, at);
+    ReadF(*g, "waterFetchLow", r.waterFetchLow, out, at);
+    ReadF(*g, "waterFetchHigh", r.waterFetchHigh, out, at);
     ReadF(*g, "reflectionCutoff", r.reflectionCutoff, out, at);
     ReadI(*g, "reflectionSteps", r.reflectionSteps, out, at);
     ReadF(*g, "causticGain", r.causticGain, out, at);
@@ -473,6 +524,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "bloodGraze", r.bloodGraze, out, at);
     ReadF(*g, "bloodAbsorb", r.bloodAbsorb, out, at);
     ReadF(*g, "bloodTransmit", r.bloodTransmit, out, at);
+    ReadF(*g, "bloodMaxTransmit", r.bloodMaxTransmit, out, at);
     ReadF(*g, "bloodDepthRamp", r.bloodDepthRamp, out, at);
     ReadF(*g, "bloodPoolLow", r.bloodPoolLow, out, at);
     ReadF(*g, "bloodPoolHigh", r.bloodPoolHigh, out, at);
@@ -721,6 +773,8 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitF(o, "TUNE_WATER_FRESNEL_POWER", r.waterFresnelPower);
   EmitF(o, "TUNE_RIPPLE_AMP_SCALE", r.rippleAmpScale);
   EmitF(o, "TUNE_RIPPLE_SPEED_SCALE", r.rippleSpeedScale);
+  EmitF(o, "TUNE_WATER_FETCH_LOW", r.waterFetchLow);
+  EmitF(o, "TUNE_WATER_FETCH_HIGH", r.waterFetchHigh);
   EmitF(o, "TUNE_REFLECTION_CUTOFF", r.reflectionCutoff);
   EmitI(o, "TUNE_REFLECTION_STEPS", r.reflectionSteps);
   EmitF(o, "TUNE_CAUSTIC_GAIN", r.causticGain);
@@ -749,6 +803,7 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitF(o, "TUNE_BLOOD_GRAZE", r.bloodGraze);
   EmitF(o, "TUNE_BLOOD_ABSORB", r.bloodAbsorb);
   EmitF(o, "TUNE_BLOOD_TRANSMIT", r.bloodTransmit);
+  EmitF(o, "TUNE_BLOOD_MAX_TRANSMIT", r.bloodMaxTransmit);
   EmitF(o, "TUNE_BLOOD_DEPTH_RAMP", r.bloodDepthRamp);
   EmitF(o, "TUNE_BLOOD_POOL_LOW", r.bloodPoolLow);
   EmitF(o, "TUNE_BLOOD_POOL_HIGH", r.bloodPoolHigh);
@@ -810,6 +865,9 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitU(o, "TUNE_EJECT_GAS", s.ejectGas);
   EmitU(o, "TUNE_LIQUID_EQUALIZE", s.liquidEqualize);
   EmitU(o, "TUNE_WANDER_HOP_MASK", s.wanderHopMask);
+  EmitU(o, "TUNE_EXP_MICRO_PERMILLE", s.expMicroPerMille);
+  EmitU(o, "TUNE_EXP_MICRO_LIFE", s.expMicroLifeTicks);
+  EmitU(o, "TUNE_EXP_MICRO_SCALE_IDX", s.expMicroScaleIdx);
 
   // ---- worldgen (integer; needs a world regen to take effect) ----
   EmitI(o, "TUNE_TREELINE", w.treeline);

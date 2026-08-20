@@ -13,6 +13,11 @@ happens in this process rather than in the page:
   GET  /api/models            list .vox/.json under assets/{models,mobs,microvox}
   GET  /api/model?path=...    read one of those files (bytes for .vox)
   POST /api/model?path=...    write one of those files
+  GET  /api/shaders           list assets/shaders/*.wgsl with their text
+  GET  /api/notes             list note pages under notes/
+  GET  /api/note?name=...     read one note page
+  POST /api/note?name=...     write one note page (autosave)
+  POST /api/note/delete       delete one note page
   POST /api/build             cmake --build ... --target sandvox
   POST /api/play              launch build/Release/sandvox.exe
   GET  /api/status            build state + whether the exe is running
@@ -31,6 +36,9 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
     which resolves the path and requires the result to sit inside one of three
     fixed directories with an allowed extension. Traversal, absolute paths,
     symlinks and odd extensions are all rejected there.
+  - The note routes take a NAME, not a path, and _note_path() rejects anything
+    that is not a plain filename of safe characters before joining it to
+    notes/. Shaders are read-only and served from a fixed directory listing.
   - /api/build and /api/play run one hardcoded command each with a fixed
     argument list and shell=False. Nothing from the request reaches a command
     line.
@@ -98,6 +106,56 @@ def _model_path(rel):
         if path.startswith(root + os.sep):
             return path
     return None
+
+
+def shader_dir():
+    """assets/shaders for the CURRENT ASSETS value (see model_dirs)."""
+    return os.path.abspath(os.path.join(ASSETS, "shaders"))
+
+
+def notes_dir():
+    """Where note pages live: notes/ beside assets/, NOT inside it.
+
+    Deliberately outside assets/ so notes are ordinary project documents —
+    openable in Obsidian, diffable in git — rather than engine assets the
+    loader might try to parse. Resolved per call for the same reason
+    model_dirs() is: tuner_app.py re-points ROOT after import.
+    """
+    return os.path.abspath(os.path.join(ROOT, "notes"))
+
+
+# A note is named, not pathed. Anything outside this alphabet cannot name a
+# file, so there is no traversal to defend against in the first place.
+_NOTE_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+               "0123456789-_. ()")
+NOTE_EXT = ".md"
+
+
+def _note_path(name):
+    """Resolve a note NAME to an absolute .md path, or None if not allowed.
+
+    The name is a bare filename with no directory part: the page title as the
+    user typed it. Rejecting on the character allowlist (plus the explicit
+    dot-segment and length checks) happens BEFORE any join, so unlike the
+    model routes this never depends on a containment test to be safe. The
+    containment test is still applied afterwards as a second line of defence.
+    """
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name or len(name) > 120:
+        return None
+    if name.lower().endswith(NOTE_EXT):
+        name = name[:-len(NOTE_EXT)]
+    if not name or name in (".", "..") or name != name.strip("."):
+        return None
+    if any(c not in _NOTE_OK for c in name):
+        return None
+    root = notes_dir()
+    path = os.path.abspath(os.path.join(root, name + NOTE_EXT))
+    if os.path.dirname(path) != root:
+        return None
+    return path
 
 
 BUILD_CMD = ["cmake", "--build", "build", "--config", "Release",
@@ -267,6 +325,58 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as f:
                 return self._send(200, f.read(), ctype)
 
+        if p == "/api/shaders":
+            # Read-only: the wiki quotes shader source as context, it does not
+            # edit it. Sent as one payload because the pages cross-reference
+            # every file and the whole set is well under a megabyte.
+            out = {}
+            d = shader_dir()
+            try:
+                names = sorted(n for n in os.listdir(d)
+                               if n.lower().endswith(".wgsl"))
+            except OSError:
+                names = []
+            for n in names:
+                try:
+                    with open(os.path.join(d, n), encoding="utf-8") as f:
+                        out[n] = f.read()
+                except OSError:
+                    continue
+            return self._json(200, {"ok": True, "shaders": out})
+
+        if p == "/api/notes":
+            d = notes_dir()
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                pass
+            pages = []
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                names = []
+            for n in names:
+                if not n.lower().endswith(NOTE_EXT):
+                    continue
+                full = os.path.join(d, n)
+                if not os.path.isfile(full):
+                    continue
+                pages.append({"name": n[:-len(NOTE_EXT)],
+                              "size": os.path.getsize(full),
+                              "mtime": int(os.path.getmtime(full))})
+            return self._json(200, {"ok": True, "dir": d, "pages": pages})
+
+        if p == "/api/note":
+            name = self._query().get("name", [""])[0]
+            path = _note_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad note name"})
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "not found"})
+            with open(path, encoding="utf-8") as f:
+                return self._json(200, {"ok": True, "name": name,
+                                        "text": f.read()})
+
         if p == "/api/status":
             with _lock:
                 b = dict(_build)
@@ -325,6 +435,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(500, {"ok": False, "error": repr(e)})
             return self._json(200, {"ok": True, "path": rel,
                                     "bytes": len(data)})
+
+        if p == "/api/note":
+            name = self._query().get("name", [""])[0]
+            path = _note_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad note name"})
+            body = self._body()
+            text = body.get("text")
+            if not isinstance(text, str):
+                return self._json(400, {"ok": False, "error": "no text"})
+            # An old name means this save is also a rename: write the new file
+            # first, then drop the old one, so a failure loses nothing.
+            old = _note_path(body.get("rename")) if body.get("rename") else None
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                if old and old != path and os.path.isfile(old):
+                    os.remove(old)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "name": name,
+                                    "bytes": len(text.encode("utf-8")),
+                                    "mtime": int(os.path.getmtime(path))})
+
+        if p == "/api/note/delete":
+            path = _note_path(self._body().get("name"))
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad note name"})
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True})
 
         if p == "/api/build":
             with _lock:

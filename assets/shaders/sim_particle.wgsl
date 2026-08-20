@@ -95,7 +95,13 @@ fn spawn(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = atomicAdd(&counts[T.page], 1u);
   if (slot >= PARTICLE_CAP) { return; }  // ring full: fragment just vaporizes
   var p = spawnOps[gid.x];
-  p.flags = PFLAG_ALIVE;
+  // Keep the CPU's micro bits (PFLAG_MICRO, scale, life) and force only the
+  // liveness/pending state, so a malformed op cannot inject a particle that is
+  // already claiming a cell. Masking to the fields the CPU is allowed to
+  // author is what keeps this an input stream rather than raw state injection.
+  p.flags = PFLAG_ALIVE | (p.flags & (PFLAG_MICRO |
+            (PMICRO_SCALE_MASK << PMICRO_SCALE_SHIFT) |
+            (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT)));
   pRead[slot] = p;
 }
 
@@ -108,8 +114,27 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let startCell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
   if (!inBounds(startCell)) { return; }  // fell out of the world: gone
 
+  // ---- micro particles: age out ----
+  // Spray is an effect with a finite budget, not conserved matter. Expiring in
+  // mid-air is the common exit for a droplet that never hits anything, and it
+  // is what guarantees a fight settles back to zero live particles (rule 2).
+  if (isMicro(p)) {
+    let life = microLifeOf(p.flags);
+    if (life == 0u) { return; }  // dead: not appended, slot reclaimed
+    p.flags = withMicroLife(p.flags, life - 1u);
+  }
+
   // buried (CA moved material onto us): rise one voxel per tick until free
   if (blocksParticle(startCell)) {
+    // A micro particle has no voxel to dig out to. Being buried means the CA
+    // flowed over it, so it is inside something now — stain that something and
+    // be gone, rather than tunnelling upward through solid rock.
+    if (isMicro(p)) {
+      p.flags |= PFLAG_PENDING;
+      atomicMax(&claim[claimSlot(cellIndexW(startCell))], microStainPriority(p));
+      append(p);
+      return;
+    }
     p.py += PART_ONE;
     p.vx = 0; p.vy = 0; p.vz = 0;
     append(p);
@@ -133,6 +158,22 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     let cell = vec3<i32>(sx >> 8u, sy >> 8u, sz >> 8u);
     if (!inBounds(cell)) { return; }  // left the world: particle dies
     if (blocksParticle(cell)) {
+      // ---- micro: land ON the surface, stain it, and stop existing ----
+      // The droplet is parked at the CONTACT point (first blocked sample), not
+      // backed off to the last air cell the way a reinserting particle is. The
+      // stain target must be recoverable in `resolve` from particle state
+      // alone, and re-deriving it there from a backed-off position would mean
+      // re-tracing the step — with the velocity, which resolve must not touch
+      // because microStainPriority hashes it. Parking on contact makes the
+      // target simply "the cell I am in", and the half-voxel overlap is
+      // invisible: the renderer shrinks a micro cube to a fraction of a cell.
+      if (isMicro(p)) {
+        p.px = sx; p.py = sy; p.pz = sz;
+        p.flags |= PFLAG_PENDING;
+        atomicMax(&claim[claimSlot(cellIndexW(cell))], microStainPriority(p));
+        append(p);
+        return;
+      }
       // propose reinsertion at the last empty position
       p.px = lastAir.x; p.py = lastAir.y; p.pz = lastAir.z;
       p.flags |= PFLAG_PENDING;
@@ -159,6 +200,49 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   let cell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
   let tgt = cellIndexW(cell);
+
+  // ---- micro particles: deposit a stain, never a voxel ----
+  // Whether it won the claim or not, the droplet is spent — it is sub-voxel
+  // matter with nowhere to go. Losing only means another droplet stained this
+  // cell on this tick, which is visually identical. Retrying (the ordinary
+  // particle's behaviour) would leave spray hovering against a wall until a
+  // slot freed up.
+  if (isMicro(p)) {
+    p.flags = 0u;  // dead either way
+    pWrite[gid.x] = p;
+    if (atomicLoad(&claim[claimSlot(tgt)]) != microStainPriority(p)) { return; }
+
+    let w = voxels[tgt];
+    let hit = voxMat(w);
+    // The cell may have been emptied by the CA between integrate and resolve;
+    // staining air would paint a stain onto nothing and it would render as a
+    // floating smear.
+    if (hit == MAT_AIR) { return; }
+    let hk = materials[hit].klass;
+    // Same surface rule the CA's own staining uses (doStaining in
+    // sim_step.wgsl): a stain soaks into a SURFACE. Blood spray landing in
+    // water or drifting through smoke leaves nothing behind.
+    if (hk != CLASS_SOLID && hk != CLASS_POWDER) { return; }
+
+    // The droplet stains with ITS OWN material's authored stain, so this is
+    // driven by materials.json and works for anything authored to stain — not
+    // just blood (conventions: no hardcoded material IDs).
+    let sm = materials[p.payload & 0xFFFu];
+    let stainType = matStainType(sm);
+    if (stainType == 0u) { return; }  // this material does not stain: vanish
+    let addAmt = matStainAmount(sm);
+    let cur = voxStainAmt(w);
+    let curType = voxStainType(w);
+    var amt = addAmt;
+    if (curType == stainType) {
+      if (cur >= STAIN_AMT_MAX) { return; }  // saturated: nothing to write
+      amt = min(cur + addAmt, STAIN_AMT_MAX);
+    }
+    voxels[tgt] = (w & ~STAIN_BITS) | packStain(stainType, amt);
+    markDirtyNext(cell);
+    return;
+  }
+
   let won = atomicLoad(&claim[claimSlot(tgt)]) == particlePriority(p);
 
   if (won && voxMat(voxels[tgt]) == MAT_AIR) {

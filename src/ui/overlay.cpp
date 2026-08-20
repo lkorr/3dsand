@@ -50,6 +50,26 @@ void Overlay::Draw(UIState& s) {
               s.activeBodyCount, s.mobCount);
   ImGui::Text("pos %.0f %.0f %.0f  (%s)", s.playerPos[0], s.playerPos[1],
               s.playerPos[2], s.fly ? "fly" : "walk");
+
+  // crosshair readout: what material the centre ray landed on. The swatch is
+  // the same gpu color0 the material combo uses, so eyeballing "is that ice or
+  // glass?" doesn't need the name to be read.
+  if (s.hoverMat > 0 && s.hoverMat < (int)s.materialNames.size()) {
+    if (s.hoverMat < (int)s.materialColors.size()) {
+      uint32_t c = s.materialColors[s.hoverMat];  // 0xAABBGGRR
+      ImVec4 col(((c) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                 ((c >> 16) & 0xFF) / 255.0f, 1.0f);
+      ImGui::ColorButton("##hoversw", col,
+                         ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker,
+                         ImVec2(14, 14));
+      ImGui::SameLine();
+    }
+    ImGui::Text("looking at %s  [%d %d %d]  %.1fm",
+                s.materialNames[s.hoverMat].c_str(), s.hoverCell[0],
+                s.hoverCell[1], s.hoverCell[2], s.hoverDist);
+  } else {
+    ImGui::TextDisabled("looking at ---");
+  }
   ImGui::Separator();
 
   if (ImGui::Button(s.paused ? "resume (P)" : "pause (P)")) s.paused = !s.paused;
@@ -101,7 +121,13 @@ void Overlay::Draw(UIState& s) {
   } else if (s.tool == UIState::kToolPrefab) {
     if (!s.prefabNames.empty()) {
       if (s.prefabSelected >= (int)s.prefabNames.size()) s.prefabSelected = 0;
-      if (ImGui::BeginCombo("prefab", s.prefabNames[s.prefabSelected].c_str())) {
+      ImGui::TextUnformatted("prefab");
+      ImGui::SameLine();
+      // "##prefab" not "prefab": the label text would otherwise hash to the
+      // same ID as the RadioButton("prefab") above it — same window, same ID
+      // stack level — and ImGui resolves both to one widget, so the dropdown
+      // stops responding. The visible caption is drawn separately.
+      if (ImGui::BeginCombo("##prefab", s.prefabNames[s.prefabSelected].c_str())) {
         // PushID(i) makes each row's ID its INDEX, not its label. Two assets
         // that happen to share a display name (or an empty one) would otherwise
         // hash to the same ImGui ID: they draw as "2 items with conflicting
@@ -130,7 +156,11 @@ void Overlay::Draw(UIState& s) {
   } else if (s.tool == UIState::kToolMob) {
     if (!s.mobNames.empty()) {
       if (s.mobSelected >= (int)s.mobNames.size()) s.mobSelected = 0;
-      if (ImGui::BeginCombo("mob", s.mobNames[s.mobSelected].c_str())) {
+      ImGui::TextUnformatted("mob");
+      ImGui::SameLine();
+      // "##mob" —collides with RadioButton("mob") otherwise; see the prefab
+      // combo above.
+      if (ImGui::BeginCombo("##mob", s.mobNames[s.mobSelected].c_str())) {
         // Index-keyed IDs — see the prefab combo above for why. A mob def's
         // name comes from the .vox filename stem, so two mob files in different
         // states of a rename, or a def whose sidecar failed to load, can put

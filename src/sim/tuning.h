@@ -77,6 +77,11 @@ struct Tuning {
     float terrainFriction = 0.85f, playerProxyFriction = 0.3f;
     float explosionImpulseScale = 0.15f;
     float explosionImpulseRadiusScale = 3.0f;
+    // How far an explosion actually BLOWS VOXELS OFF bodies, as a multiple of
+    // the destruction radius. Kept separate from the impulse reach on purpose:
+    // the blast should push objects from further away than it dismembers them,
+    // so this is normally the smaller of the two.
+    float explosionBodyDamageScale = 1.0f;
     // Player proxy mass: the shove-strength knob. Contact impulses split by
     // mass ratio, so this vs a body's density-derived mass decides how far a
     // walking player moves it.
@@ -96,6 +101,42 @@ struct Tuning {
     int maxBodies = 200;
     int burnOpsPerTick = 384;
   } debris;
+
+  // ---- gore: bleed spray + dismemberment burst ----
+  //
+  // These drive CPU-authored ParticleSpawns (mob.cpp), not shader constants, so
+  // they are floats and do NOT change the world hash by themselves. What the
+  // spawns do once they land IS sim state — micro droplets stain — but the
+  // stain is authored in materials.json, and the spawn stream is a per-tick
+  // INPUT exactly like a BrushOp. Retuning these changes future worlds, the
+  // same way moving the mouse does; it does not make a replay diverge.
+  struct Gore {
+    // Droplets per wound-budget voxel spent. Bleeding already drips real blood
+    // voxels into the grid (mob.cpp bleeding); this is the visible spray that
+    // accompanies each drip, so it multiplies an existing, already-bounded rate.
+    float bleedSprayPerDrip = 3.0f;
+    float bleedSpraySpeed = 3.5f;      // voxels/sec, upward-biased cone
+    float bleedSprayCone = 0.55f;      // lateral spread as a fraction of speed
+    // The dismemberment burst. `severSpray` droplets are emitted over
+    // `severDecayTicks`, front-loaded so the arterial gout is at the cut and
+    // the tail dies down — a flat rate over the same window reads as a
+    // sprinkler rather than a wound.
+    int severSpray = 220;
+    int severDecayTicks = 45;
+    float severSpraySpeed = 9.0f;
+    float severSprayCone = 0.8f;
+    // Whole blood VOXELS thrown by the cut, alongside the sub-voxel spray. This
+    // is the part that actually pools on the floor; the micro spray only marks
+    // surfaces. Kept small — every one of these is conserved matter the CA has
+    // to move (rule 2).
+    int severVoxels = 14;
+    float severVoxelSpeed = 6.0f;
+    // Micro droplet lifetime in ticks, and how finely it is subdivided
+    // (2/3/4/6 micro voxels per world voxel). Life is the guarantee that spray
+    // clears: no droplet outlives it, whether or not it ever hits anything.
+    int microLifeTicks = 70;
+    int microScale = 4;
+  } gore;
 
   // ---- grenade ----
   struct Grenade {
@@ -130,6 +171,14 @@ struct Tuning {
     int ejectGas = 0;
     int liquidEqualize = 2;      // eighths a neighbor must be emptier to flow
     int wanderHopMask = 7;       // critter hop chance = 1/(mask+1) per tick
+    // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
+    // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
+    // advances sim state and the droplets can stain, so these are integers in
+    // the determinism-critical group and --selftest must be re-run when they
+    // change. expMicroScaleIdx indexes microScaleOf's 2/3/4/6 table.
+    int expMicroPerMille = 900;
+    int expMicroLifeTicks = 40;
+    int expMicroScaleIdx = 2;    // 0=2, 1=3, 2=4, 3=6 micro voxels per voxel
   } sim;
 
   // ---- day/night cycle ----
@@ -274,7 +323,15 @@ struct Tuning {
     float waterAbsorb[3] = {1.85f, 0.42f, 0.20f};
     float waterScatter[3] = {0.045f, 0.16f, 0.20f};
     float waterFresnelPower = 5.0f;
-    float rippleAmpScale = 1.0f, rippleSpeedScale = 1.0f;
+    // Global calm-down of the travelling wave field. Water reads as still,
+    // glassy water at rest rather than as a windswept sea; the column-height
+    // gradient still gives real bodies their macro shape, so lowering these
+    // makes water calm, not flat.
+    float rippleAmpScale = 0.35f, rippleSpeedScale = 0.40f;
+    // Fetch gate (waterOpenness in raymarch.wgsl): fraction of a 12-tap
+    // horizontal ring that must be liquid before travelling waves appear.
+    // Below LOW a surface is a droplet or puddle and stays perfectly still.
+    float waterFetchLow = 0.35f, waterFetchHigh = 0.85f;
     float reflectionCutoff = 0.06f;
     int reflectionSteps = 96;
     float causticGain = 1.5f, causticCap = 0.85f;
@@ -309,6 +366,11 @@ struct Tuning {
     float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)
     float bloodAbsorb = 55.0f;     // opacity -> per-metre absorption
     float bloodTransmit = 0.35f;   // how much of the surface behind shows through
+    // Hard ceiling on that transmission. Beer-Lambert alone leaves a lone
+    // droplet (path << one voxel) half-transparent no matter how absorbing the
+    // material is; blood is opaque at sub-millimetre scale because it
+    // backscatters, and this models that. Raise it and blood becomes red glass.
+    float bloodMaxTransmit = 0.06f;
     float bloodDepthRamp = 22.0f;  // metres^-1: bright thin -> dark deep
     float bloodPoolLow = 0.18f, bloodPoolHigh = 0.55f;  // droplet <-> pool ramp
     float bloodEdgeFeather = 0.10f;  // field value below which the rim fades out

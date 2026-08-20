@@ -106,7 +106,16 @@ class MobSystem {
 
   // Once per tick BEFORE debris.PreTick: kinematic walk drive, terrain
   // anchors, bleeding (bounded BrushOps into `ops`), despawn out-of-window.
-  void PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops);
+  //
+  // `spawns` receives the VISUAL half of bleeding: micro blood droplets that
+  // fly and stain but never re-enter the grid. The grid half (real blood
+  // voxels) still goes through `ops`, so the authoritative liquid is unchanged
+  // and the spray is pure addition. Dismemberment bursts queued by Sever()
+  // drain here too — Sever is called from damage handling all over the frame,
+  // and emitting hundreds of particles from inside it would both bypass the
+  // per-tick budget and put spawn order at the mercy of hit order.
+  void PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
+               std::vector<ParticleSpawn>& spawns);
   // After Physics::Step: refresh limb transforms from Jolt.
   void PostStep();
 
@@ -176,6 +185,18 @@ class MobSystem {
     BodyTransform xf{};
     float bleedBudget = 0;
     Vec3 woundLocal{};
+    // Dismemberment gout, drained over several ticks by PreTick. `gushTicks`
+    // counts DOWN from gore.severDecayTicks, and emission is proportional to
+    // it, so the burst is front-loaded and tails off by itself — that decay is
+    // what makes a cut read as arterial rather than as a running tap.
+    //
+    // It lives on the PARENT limb (the stump), not on the piece that came off:
+    // the severed limb is debris the moment it detaches, and a detached limb
+    // that kept bleeding would trail spray from a body MobSystem no longer
+    // owns or tracks.
+    int gushTicks = 0;
+    Vec3 gushLocal{};          // wound point, parent-limb local
+    Vec3 gushDir{0, 1, 0};     // outward spray axis, parent-limb local
     // A severed part is handed to DebrisSystem immediately (counts, rendering
     // and terrain upkeep all move over on the same frame) but holds its last
     // animated pose KINEMATICALLY for a beat before flipping dynamic — cutting
@@ -224,6 +245,11 @@ class MobSystem {
   std::vector<Mob> mobs_;
   uint64_t nextId_ = 1;
   bool instancesDirty_ = false;
+  // Particles authored outside PreTick — Sever() is reached from damage
+  // handling at several points in the frame, and appending straight to the
+  // caller's spawn list from there would mean Sever needs it threaded through
+  // every one of those paths. Drained (and cleared) at the top of PreTick.
+  std::vector<ParticleSpawn> pendingSpawns_;
 
   static constexpr uint32_t kMaxMobs = 16;
   static constexpr int kBleedOpsPerTick = 6;  // of the 64-op tick budget

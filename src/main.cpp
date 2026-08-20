@@ -1714,10 +1714,10 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       int h = World::TerrainHeight(140, 140, kDefaultSeed);
       uint32_t t = 6000;
       auto mobTick = [&](std::vector<BrushOp> ops) {
-        mobs.PreTick(t + 1, world, ops);
+        std::vector<ParticleSpawn> spawns;
+        mobs.PreTick(t + 1, world, ops, spawns);
         debris.QueueSupportEvents(world.Snap());
         std::vector<CellOp> cellOps;
-        std::vector<ParticleSpawn> spawns;
         debris.PreTick(t + 1, world, cellOps, spawns);
         ++t;
         SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
@@ -1770,6 +1770,13 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       mobs.Sever(id, limbIndex("head"));
       bool died = !mobs.IsAlive(id) || mobs.MobCount() == 0;
       for (int i = 0; i < 500; i++) mobTick({});
+      std::printf("  [probe] after 500: awake=%u bodies=%u
+",
+                  debris.ActiveBodyCount(), debris.BodyCount());
+      for (int i = 0; i < 2000; i++) mobTick({});
+      std::printf("  [probe] after 2500: awake=%u bodies=%u
+",
+                  debris.ActiveBodyCount(), debris.BodyCount());
       uint32_t awake = debris.ActiveBodyCount();
       bool settled = awake == 0 && mobs.MobCount() == 0;
 
@@ -2186,6 +2193,92 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     settleOk = settleOk && splitOk;
     debris.Reset();
 
+    // body blast: an explosion must take VOXELS OFF a body, not just shove it.
+    // A blast centred on the waist of a dumbbell has to cut it in two, so the
+    // gate is both "lost voxels" and "ended up as more than one body" — the
+    // second is what separates real damage from a cosmetic crater.
+    {
+      SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      ctx.WaitIdle();
+      int bh3 = World::TerrainHeight(120, 120, kDefaultSeed);
+      // two 5x5x2 plates joined by a 1x1x3 neck: blasting the neck separates
+      // them, and each plate is far above the 8-voxel body floor
+      std::vector<DebrisVoxel> bar;
+      for (int z = 0; z < 2; z++)
+        for (int y = 0; y < 5; y++)
+          for (int x = 0; x < 5; x++) {
+            bar.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+            bar.push_back({(int8_t)x, (int8_t)y, (int8_t)(z + 5), 0, kMatStone});
+          }
+      for (int z = 2; z < 5; z++)
+        bar.push_back({2, 2, (int8_t)z, 0, kMatStone});
+      uint32_t barVox = (uint32_t)bar.size();
+      Vec3 barAt{120, (float)(bh3 + 8), 120};
+      uint64_t bb = phys.CreateDebrisBody(bar, {120, bh3 + 8, 120}, dens);
+      BodyTransform bxf{};
+      bxf.pos = barAt;
+      bxf.quat[3] = 1;
+      debris.AdoptBody(bb, bar, bxf);
+
+      std::vector<ParticleSpawn> bspawns;
+      // centred on the neck (local 2,2,3 -> world), radius covers it only
+      debris.DamageBodiesRadial(barAt + Vec3{2.5f, 2.5f, 3.5f}, 2.5f, world,
+                                bspawns);
+      uint32_t after = 0;
+      {
+        std::vector<BodyVoxInst> bi2;
+        debris.BuildInstances(bi2);
+        after = (uint32_t)bi2.size();
+      }
+      bool blastOk = after < barVox && debris.BodyCount() >= 2;
+      std::printf("body blast: %s (%u -> %u voxels, %u bodies, %zu ejecta)\n",
+                  blastOk ? "PASS" : "FAIL", barVox, after, debris.BodyCount(),
+                  bspawns.size());
+      settleOk = settleOk && blastOk;
+      debris.Reset();
+    }
+
+    // laser kerf on a body: repeated melts at one spot must bore through and
+    // eventually sever it. Unlike the old plane split this removes matter, so
+    // the gate is "voxels went away AND the body came apart" — a cut that only
+    // separated (without eating a channel) would be the old behaviour back.
+    {
+      SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      ctx.WaitIdle();
+      int bh4 = World::TerrainHeight(150, 150, kDefaultSeed);
+      std::vector<DebrisVoxel> rod;  // 3x3x11 rod: cut across the middle
+      for (int z = 0; z < 11; z++)
+        for (int y = 0; y < 3; y++)
+          for (int x = 0; x < 3; x++)
+            rod.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+      uint32_t rodVox = (uint32_t)rod.size();
+      Vec3 rodAt{150, (float)(bh4 + 8), 150};
+      uint64_t rb = phys.CreateDebrisBody(rod, {150, bh4 + 8, 150}, dens);
+      BodyTransform rxf{};
+      rxf.pos = rodAt;
+      rxf.quat[3] = 1;
+      debris.AdoptBody(rb, rod, rxf);
+
+      // Hold the beam on the middle of the rod for a few ticks. The handle is
+      // re-read every iteration because each melt rebuilds the collider and
+      // hands the body a new one — `rb` is stale after the first pass.
+      std::vector<ParticleSpawn> lspawns;
+      for (int i = 0; i < 12 && debris.BodyCount() < 2; i++)
+        debris.MeltBodyAt(debris.BodyHandle(0), rodAt + Vec3{1.5f, 1.5f, 5.5f},
+                          2.0f, world, lspawns);
+      uint32_t lafter = 0;
+      {
+        std::vector<BodyVoxInst> bi3;
+        debris.BuildInstances(bi3);
+        lafter = (uint32_t)bi3.size();
+      }
+      bool kerfOk = lafter < rodVox && debris.BodyCount() >= 2;
+      std::printf("laser kerf: %s (%u -> %u voxels, %u bodies)\n",
+                  kerfOk ? "PASS" : "FAIL", rodVox, lafter, debris.BodyCount());
+      settleOk = settleOk && kerfOk;
+      debris.Reset();
+    }
+
     // body burn: a rigidbody carrying embers must KEEP burning — embers decay
     // away (voxels leave the body) and emit real fire into the grid so nearby
     // flammables can catch. This is the fix for detached islands freezing
@@ -2236,14 +2329,21 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     std::vector<DebrisVoxel> bell;
-    for (int y = 0; y < 3; y++)  // 3x3x1 plate at z=0
-      for (int x = 0; x < 3; x++)
+    // The plate is 5x5, not 3x3, and that margin is the point. The ember does
+    // not merely burn the bridge: it ignites the wood it touches, so the plate
+    // is losing voxels the whole time the bridge is burning through. A 3x3
+    // plate (9 voxels) erodes past the 8-voxel dissolve floor BEFORE the
+    // connectivity check ever separates the clump, so the whole dumbbell went
+    // to particles and the test measured erosion instead of shattering.
+    // 25 voxels outlast the bridge with room to spare.
+    for (int y = 0; y < 5; y++)  // 5x5x1 plate at z=0
+      for (int x = 0; x < 5; x++)
         bell.push_back({(int8_t)x, (int8_t)y, 0, 0, kMatWood});
-    bell.push_back({1, 1, 1, 0, kMatEmber});  // bridge
-    bell.push_back({1, 1, 2, 0, kMatWood});   // 4-voxel clump beyond it
-    bell.push_back({0, 1, 2, 0, kMatWood});
+    bell.push_back({2, 2, 1, 0, kMatEmber});  // bridge, centred on the plate
+    bell.push_back({2, 2, 2, 0, kMatWood});   // 4-voxel clump beyond it
+    bell.push_back({1, 2, 2, 0, kMatWood});
+    bell.push_back({3, 2, 2, 0, kMatWood});
     bell.push_back({2, 1, 2, 0, kMatWood});
-    bell.push_back({1, 0, 2, 0, kMatWood});
     uint64_t db = phys.CreateDebrisBody(bell, {90, bh2 + 6, 90}, dens);
     BodyTransform dxf{};
     dxf.pos = Vec3{90, (float)(bh2 + 6), 90};
@@ -2642,7 +2742,11 @@ int main(int argc, char** argv) {
   // straight after: they are per-DEF art, shared by every instance. The set
   // persists past load because the sphere spawner packs 2x-detail ball models
   // into the same pool lazily (one per material, cached below) and re-uploads.
+  // Damage also allocates here: a blasted or cut micro body clones its model
+  // copy-on-write so its crater is its own (sim/microbody.h), which is why the
+  // debris system needs a handle on the same set.
   MicroBodySet mbSet;
+  debris.SetMicroSet(&mbSet);
   std::unordered_map<uint32_t, MicroBodyRef> sphereModels;  // material -> model
   {
     std::vector<MobDef> mobDefs;
@@ -2963,6 +3067,11 @@ int main(int argc, char** argv) {
       // laser (PLAN §C1/C2): laser tool + LMB, or hold F from any tool.
       // Bodies are tested first — a mob limb or debris chunk in the beam
       // takes the hit instead of the wall behind it.
+      struct LaserCut {
+        uint64_t body = 0;
+        Vec3 at{};
+        float radius = 0;
+      } laserCut;
       if (laserHeld) {
         const WorldSnapshot& lsnap = world.Snap();
         Vec3 eye = player.EyePos(), fwd = cam.Forward();
@@ -2979,17 +3088,22 @@ int main(int argc, char** argv) {
 
         if (hitBody != 0 && bodyDist < gridDist) {
           // body cut (PLAN §C2): mob limbs take damage (instant sever when
-          // the beam crosses a joint); plain debris splits along a vertical
-          // plane containing the beam
+          // the beam crosses a joint); plain debris is MELTED where the beam
+          // lands. The beam bores a channel tick by tick and the body splits
+          // when that channel actually severs it (DebrisSystem::MeltBodyAt) —
+          // no cutting plane is chosen, so what falls apart is decided by the
+          // geometry the player carved, not by camera orientation.
           Vec3 hitPos = eye + fwd * bodyDist;
-          if (!mobs.Damage(hitBody, 1.5f, hitPos) && tick % 6 == 0) {
-            Vec3 right = cam.Right();
-            Vec3 n = right - fwd * right.dot(fwd);
-            if (n.len() < 0.1f) n = cam.Up();
-            debris.SplitBody(hitBody, hitPos, n.normalized());
+          if (!mobs.Damage(hitBody, CurrentTuning().tools.laserDamage, hitPos)) {
+            // Deferred: the melt needs the `spawns` list that debris.PreTick
+            // fills further down, and the ray must be cast HERE where the
+            // camera and physics state for this tick are current. Carrying the
+            // hit forward is cheaper than reordering the tick.
+            float br = (float)CurrentTuning().tools.laserMeltRadius;
+            laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br};
           }
         } else if (gridDist < 1e8f) {
-          const int r = 2;
+          const int r = CurrentTuning().tools.laserMeltRadius;
           ops.push_back({hit.x, hit.y, hit.z, r, 0, 2u /*melt*/, 0, 0});
           // cutting through a support must drop the far side: rate-limited
           // island checks over the cut (support-loss flags catch the rest)
@@ -3136,9 +3250,15 @@ int main(int argc, char** argv) {
         }
       }
 
+      // Declared before mobs.PreTick so bleed spray and dismemberment gore
+      // share the one per-tick spawn stream with debris shatter — the ring and
+      // its 4096-op budget are global, so a single list is what keeps the two
+      // systems honest about the shared limit.
+      std::vector<ParticleSpawn> spawns;
+
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
       // bleeding ops — must run before debris.PreTick consumes the anchors
-      mobs.PreTick(tick, world, ops);
+      mobs.PreTick(tick, world, ops, spawns);
 
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
@@ -3146,8 +3266,12 @@ int main(int argc, char** argv) {
       // island detection results + body burn + terrain collision upkeep
       // (may add cell ops and particle spawns from shattered bodies)
       std::vector<CellOp> cellOps;
-      std::vector<ParticleSpawn> spawns;
       debris.PreTick(tick, world, cellOps, spawns);
+      // laser kerf into a body, deferred from the input block above so it can
+      // reach `spawns` (a cut that severs the body sheds the loose bits)
+      if (laserCut.body)
+        debris.MeltBodyAt(laserCut.body, laserCut.at, laserCut.radius, world,
+                          spawns);
       // prefab stamps drain after island ops (they win same-cell conflicts)
       placer.PreTick(world, cellOps);
 
@@ -3182,6 +3306,15 @@ int main(int argc, char** argv) {
         for (const ExplosionOp& e : exps) {
           debris.AddDestructionEvent(tick, {e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                      {e.x + e.radius, e.y + e.radius, e.z + e.radius});
+          // Blow voxels OFF the bodies in range before shoving what survives:
+          // an explosion next to a rigidbody now craters it, and splits it into
+          // separate bodies when the crater severs it. Runs first so the
+          // impulse below acts on the post-damage bodies (including the new
+          // fragments, which is what makes a blown-apart object scatter).
+          debris.DamageBodiesRadial(
+              Vec3{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f},
+              (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale,
+              world, spawns);
           phys.ApplyRadialImpulse(
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
@@ -3259,6 +3392,26 @@ int main(int argc, char** argv) {
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
 
+      // crosshair material readout — same sim_pick snapshot the brush, laser
+      // and prefab placer read, so the name shown is exactly the cell those
+      // tools would act on (one tick latent, like every other pick consumer).
+      {
+        const auto& psnap = world.Snap();
+        if (psnap.valid && psnap.pick[0] != 0) {
+          ui.hoverMat = (int)psnap.pick[1];
+          ui.hoverCell[0] = (int)psnap.pick[2];
+          ui.hoverCell[1] = (int)psnap.pick[3];
+          ui.hoverCell[2] = (int)psnap.pick[4];
+          float dx = (float)ui.hoverCell[0] + 0.5f - eye.x;
+          float dy = (float)ui.hoverCell[1] + 0.5f - eye.y;
+          float dz = (float)ui.hoverCell[2] + 0.5f - eye.z;
+          ui.hoverDist =
+              std::sqrt(dx * dx + dy * dy + dz * dz) * kVoxelMeters;
+        } else {
+          ui.hoverMat = 0;
+        }
+      }
+
       overlay.BeginFrame();
       overlay.Draw(ui);
 
@@ -3328,6 +3481,14 @@ int main(int argc, char** argv) {
       // rigid bodies: debris takes slots [0, D), mob limbs stack after —
       // instances rebuild when either side changes (slot bases shift),
       // transforms are cheap and refresh per frame
+      // Damaged micro bodies edited their bricks (copy-on-write) this tick, so
+      // the shared pool has to reach the GPU before the march reads it. One
+      // upload per tick regardless of how many bodies were hit — the flag is
+      // set by every edit and cleared here.
+      if (debris.MicroDirty()) {
+        sim.UploadMicroBodies(ctx.queue, mbSet);
+        mbSet.dirty = false;
+      }
       if (debris.InstancesDirty() || mobs.InstancesDirty()) {
         std::vector<BodyVoxInst> inst;
         debris.BuildInstances(inst);

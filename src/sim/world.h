@@ -258,9 +258,34 @@ struct ParticleSpawn {
   int32_t px, py, pz;   // position, fixed 24.8 voxels
   int32_t vx, vy, vz;   // velocity, fixed 24.8 voxels/tick
   uint32_t payload;     // bits 0..11 material, 12..15 state
-  uint32_t flags;       // forced to PFLAG_ALIVE on the GPU
+  uint32_t flags;       // PFLAG_ALIVE is forced on the GPU; micro bits survive
 };
 constexpr uint32_t kMaxParticleSpawnsPerTick = 4096;
+
+// Particle flag bits — must match PFLAG_* / PMICRO_* in common.wgsl.
+//
+// A MICRO particle is sub-voxel spray (blood droplets, blast grit). It never
+// reinserts into the grid: on contact it applies its material's authored stain
+// and dies, and it dies on its own after `life` ticks regardless. See the long
+// note in common.wgsl for why both properties are forced rather than optional.
+constexpr uint32_t kPFlagAlive = 1u;
+constexpr uint32_t kPFlagMicro = 4u;
+constexpr uint32_t kPMicroScaleShift = 3, kPMicroScaleMask = 3u;
+constexpr uint32_t kPMicroLifeShift = 5, kPMicroLifeMask = 0xFFu;
+
+// Packs the micro scale + lifetime fields. `scale` is micro voxels per world
+// voxel and must be one of 2/3/4/6 (the only values the 2-bit field encodes);
+// anything else falls back to 4. `lifeTicks` saturates at 255 — the field is 8
+// bits, and silently wrapping would make a long-lived droplet die instantly.
+inline uint32_t ParticleMicroBits(int scale, int lifeTicks) {
+  uint32_t idx = 2;  // default: 4 micro voxels per world voxel
+  if (scale == 2) idx = 0;
+  else if (scale == 3) idx = 1;
+  else if (scale == 4) idx = 2;
+  else if (scale == 6) idx = 3;
+  uint32_t life = (uint32_t)(lifeTicks < 0 ? 0 : (lifeTicks > 255 ? 255 : lifeTicks));
+  return (idx << kPMicroScaleShift) | (life << kPMicroLifeShift);
+}
 
 // Must match RenderParams in common.wgsl (std140-ish: vec3 + pad pairs).
 struct RenderParams {
