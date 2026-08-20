@@ -234,6 +234,62 @@ Each dirty voxel rolls against its reaction table entries: probability is expres
 Chained rules produce emergent behavior for free: acid → stone → gravel → sand is
 an erosion system nobody explicitly wrote.
 
+### Day/night, and sunlight as a sim input (2026-08-20)
+
+The world runs a day/night cycle, and sunlight is a real input to the CA:
+exposed water evaporates in the sun, snow melts by day and water freezes at
+night, plants only grow in daylight, fungus prefers the dark. That makes the
+sun part of the *simulation*, not just the renderer, so it has to satisfy
+rule 1 (bit-determinism). Three decisions follow from that, and each of them
+is the reason a more obvious approach was rejected.
+
+**1. The cycle is driven by the tick, never the clock.**
+`DayPhaseForTick()` (world.h) maps the tick counter onto a 16-bit integer
+phase — 0 = midnight, 0x8000 = noon. Same seed + same tick ⇒ same phase ⇒ same
+world hash, on every machine. A wall-clock cycle would have been simpler and
+would have made every daylight-gated reaction non-deterministic and
+non-replayable. The renderer derives its float sun/moon vectors from the same
+phase (`ComputeSkyState`), so what you see and what the sim does cannot drift.
+
+**2. Sky exposure is a one-cell test, not a column walk.**
+`seesSky()` looks at the single cell above and asks whether it is a ray
+blocker. The natural implementation — march up until something blocks, so a
+pond in a cave is properly "indoors" — **breaks determinism**, and it is worth
+being precise about why, because the argument is easy to get backwards:
+
+> The 3×3×3 colour lattice guarantees that two cells acting in the same pass
+> are ≥3 apart and that *writes* reach ≤1 cell. It guarantees nothing about
+> *reads*. A 48-cell probe column crosses dozens of cells that other threads
+> in that same pass are legally writing, so whether the probe sees a cell
+> before or after its update is scheduling-dependent.
+
+That reproduced as a hash divergence at tick 1. The one-cell test stays inside
+the guarantee. The cost is that "sky" means "nothing directly on top of me", so
+water in a lit cave also evaporates — a content inaccuracy, not a correctness
+one. If that distinction ever matters, the deterministic way to get it is a
+separate mark/apply pass over a sky-exposure buffer, exactly as
+`sim_explode.wgsl` does.
+
+**3. Light-gated rules do not hold their chunk awake.**
+The unconditional rules set `keepAwake` to mean "this neighbourhood is
+reactive, look again next tick", which is right for chains that terminate
+(fire burns out, growth stops). A light-gated rule has no terminus: it stays
+matched for as long as the sun is in the right part of the sky, i.e. thousands
+of ticks. Letting it keep its chunk awake pinned 292/32768 chunks active
+against a budget of 32 — rule 2 violated by a rule that *looked* harmless.
+
+Instead the phase change itself is the wake signal: `Simulation::
+EncodeWakeAll()` re-dirties every chunk on the few ticks per in-game day where
+daylight switches on or off. Between those boundaries, a chunk whose only
+pending work is light-gated sleeps.
+
+**What this rules out.** A permanent emitter still cannot settle at any chance
+value — an overnight "leaves emit dew" rule was tried twice and abandoned,
+because every leaf is a source and the steam it makes re-dirties its chunk
+forever. Sunlight can *drive* processes that consume something finite; it
+cannot be hooked to a rule that manufactures matter indefinitely. The failed
+attempt is documented in `reactions.json` so it is not tried a third time.
+
 ---
 
 ## 5. Particle System (voxels in flight)
@@ -297,6 +353,20 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   melt brush (`BrushOp.mode == 2`): each cell in the brush converts to *its own*
   molten form (stone→lava, sand→molten glass, wood→fire; absent = vaporize).
   255-hardness matter is immune. Data, not code — the laser knows no material IDs.
+- **Light conditions (2026-08-20):** any rule may additionally require a light
+  environment, which is what lets sunlight drive the world (§4.5):
+  ```json
+  { "self": "water", "decay": true, "becomes": "steam",
+    "needsSky": true, "when": "day", "minLight": 90, "chance": 2 }
+  ```
+  - `needsSky` — the cell must not be covered by a ray blocker.
+  - `when: day|night` — gated on the tick-derived day phase.
+  - `minLight: 0..255` — a floor on daylight strength, so "only near noon"
+    is expressible without a second condition.
+
+  These compile into the spare word of the 32-byte reaction entry, so the
+  struct did not grow. Everything about them is integer and tick-derived,
+  which is what keeps a sun-driven reaction inside the determinism rule.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -807,6 +877,53 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   near lava. It is now gated on a one-read chunk-occupancy probe along the
   normal and capped at 4 taps, which brings it to ~1 ms. Any future per-pixel
   effect keyed on a *rare* material needs the same treatment.
+- **Sky: a scattering model, not a gradient (2026-08-20).** The sky used to be
+  a two-colour lerp with `pow(dot(rd, sun), 800)` added for the sun. That
+  cannot produce a sunset, cannot light the world differently at different
+  times of day, and reads as a painted backdrop. It is now a single-scattering
+  model, and every part of the look falls out of it:
+  - **Rayleigh** in-scatter with the real 1/λ⁴ coefficients (0.144/0.313/0.794)
+    makes the sky blue and the setting sun red *from the same numbers*.
+  - **Mie** in-scatter with a Henyey-Greenstein lobe puts the haze glow around
+    the sun, wavelength-neutral, so it turns orange only because the light
+    reaching it has.
+  - A **Kasten-Young air-mass curve** (1.0 at the zenith, ~38 at the horizon)
+    thickens both toward the horizon, which is what gives the pale horizon
+    band, the deep zenith, and the reddening of a low sun.
+  - The **sun disc** is drawn at its true 0.53° angular size (oversized 3× by
+    default because physically-correct is a pinprick at game FOV),
+    pixel-antialiased, with per-channel limb darkening so it reads as a sphere.
+
+  Two coefficient traps, both of which produced a *khaki* sky and both of
+  which are easy to re-introduce:
+  1. **Do not apply the sun's reddened transmittance to the Rayleigh
+     in-scatter.** The in-scatter integral already accounts for the
+     wavelength-dependent loss; multiplying a blue in-scatter by a red
+     transmittance cancels the blue. Measured: zenith 0.33/0.34/0.13.
+  2. **Extinction strength must be a separate constant from in-scatter
+     strength.** Sharing `skyRayleigh` between "how blue is the sky" and "how
+     fast does the sun redden" couples two knobs that want opposite values — at
+     12 it left a 15° sun keeping 72% of red and 20% of blue, so the whole dome
+     went khaki (measured 102,98,75). They are now `skyRayleigh` and
+     `sunReddening`.
+
+  The horizon's warmth is driven by the **sun's** air mass, not the view ray's:
+  the view mass is ~38 at the horizon whatever the sun is doing, so using it
+  reddens the horizon at midday, which is wrong.
+
+- **Night sky and the moon (2026-08-20).** Stars are point-sampled from a
+  hashed direction grid (nearest cell centre, angular distance to it) rather
+  than thresholded noise — a `step(0.99, hash(dir))` starfield samples a
+  *volume* and sparkles violently under rotation. Twinkle scales with air mass,
+  so stars scintillate near the horizon and sit steady overhead, as they do.
+  Over that: a galactic band with fbm dust lanes, two nebula masses, and
+  aurora curtains built from a product of two scrolling noise fields (a product
+  is filament-like where a single field is blobby). The moon is a real disc
+  with phase geometry, maria, craters and earthshine, and it is a genuine
+  second key light — `keyLightColor()`/`keyLightDir()` route sun-vs-moon
+  through one place, so shadows, water glints and caustics all follow whichever
+  body is actually up.
+
 - Later: emissive materials feeding a cheap GI (light propagation volumes or
   per-chunk flood lighting), volumetrics for gases.
 

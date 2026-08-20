@@ -39,7 +39,8 @@ SPEC = [
     ("render", "skyMieStrength", "TUNE_SKY_MIE_STRENGTH", "f", 1.0),
     ("render", "skyExposure", "TUNE_SKY_EXPOSURE", "f", 1.6),
     ("render", "skyGround", "TUNE_SKY_GROUND", "v3", [0.22, 0.20, 0.17]),
-    ("render", "sunSize", "TUNE_SUN_SIZE", "f", 1.0),
+    ("render", "sunSize", "TUNE_SUN_SIZE", "f", 3.0),
+    ("render", "sunReddening", "TUNE_SUN_REDDENING", "f", 1.0),
 
     # night sky
     ("render", "nightZenith", "TUNE_NIGHT_ZENITH", "v3", [0.006, 0.010, 0.028]),

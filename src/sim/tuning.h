@@ -176,7 +176,17 @@ struct Tuning {
     float skyMieStrength = 1.0f;
     float skyExposure = 1.6f;
     float skyGround[3] = {0.22f, 0.20f, 0.17f};  // below-horizon bounce
-    float sunSize = 1.0f;           // multiplier on the true 0.53 deg disc
+    // Multiplier on the true 0.53 deg disc. 1.0 is physically correct and
+    // reads as a pinprick on a 16:9 screen at a game FOV — every engine that
+    // wants the sun to be a PRESENCE oversizes it. 3x is about the smallest
+    // that still looks deliberate rather than like a dead pixel.
+    float sunSize = 3.0f;
+    // How hard the atmosphere reddens a low sun. Scales the extinction that
+    // colours BOTH the sun disc and the dome, and is deliberately separate
+    // from skyRayleigh: that one sets how blue the sky is, and sharing one
+    // constant between them makes a rich blue sky imply a permanently orange
+    // sun (it did — the whole dome came out khaki).
+    float sunReddening = 1.0f;
 
     // ---- night sky ----
     float nightZenith[3] = {0.006f, 0.010f, 0.028f};

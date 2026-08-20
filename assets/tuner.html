@@ -286,7 +286,7 @@
   }
   .trows{padding:2px 6px 10px}
   .trow{
-    display:grid;grid-template-columns:210px 1fr 96px 30px;gap:12px;align-items:center;
+    display:grid;grid-template-columns:210px 1fr 96px 150px 30px;gap:12px;align-items:center;
     padding:5px 8px;border-radius:6px;
   }
   .trow:hover{background:#1b222c}
@@ -304,6 +304,19 @@
   }
   .trow input.tnum:focus{outline:none;border-color:var(--acc)}
   .trow .unit{color:var(--faint);font-size:11px;font-family:var(--mono)}
+  /* history chips: previous value (green) and last-saved value (red).
+     Both are buttons — clicking one restores that value, which is the whole
+     point of showing them. */
+  .hist{display:flex;gap:4px;align-items:center;justify-content:flex-end;min-width:0}
+  .hchip{
+    font-family:var(--mono);font-size:10.5px;line-height:1;padding:2px 5px;
+    border-radius:4px;border:1px solid;background:none;cursor:pointer;white-space:nowrap;
+    max-width:92px;overflow:hidden;text-overflow:ellipsis;
+  }
+  .hchip.prev{color:var(--green);border-color:#2f6030;background:#14240f}
+  .hchip.prev:hover{background:#1d3416;border-color:var(--green)}
+  .hchip.saved{color:#ff8b8b;border-color:#6d2b2b;background:#2a1414}
+  .hchip.saved:hover{background:#3a1a1a;border-color:var(--red)}
   .trow .rst{
     background:none;border:none;color:var(--faint);cursor:pointer;font-size:13px;padding:2px 4px;
     opacity:0;font-family:var(--mono);
@@ -503,6 +516,31 @@ let tuneBase=null;
 // True when served by scripts/tuner_server.py (auto-load + Build/Play).
 // Declared here because updatePills() reads it well before the probe runs.
 let server=false;
+// Per-parameter history, keyed "group.key".
+//   tunePrev  — the value immediately before the most recent edit (green chip)
+//   tuneSaved — the value as of the last save (red chip)
+// Kept separate from tuneBase: tuneBase is the file as first loaded and drives
+// the "changed" highlight, whereas these two move as you work. Both survive a
+// re-render because they live outside the DOM.
+let tunePrev={}, tuneSaved={};
+const histKey=(g,k)=>g+'.'+k;
+// Persisted so the marks survive closing the app — the red "last saved" value
+// is most useful precisely when you come back later. Scoped by project path so
+// two checkouts keep separate trails; a corrupt or absent entry just means no
+// history, never a broken page.
+let histStoreKey='sandvox.tuner.hist';
+function saveHist(){
+  try{
+    localStorage.setItem(histStoreKey,JSON.stringify({prev:tunePrev,saved:tuneSaved}));
+  }catch{}
+}
+function loadHist(){
+  try{
+    const j=JSON.parse(localStorage.getItem(histStoreKey)||'{}');
+    tunePrev=j.prev&&typeof j.prev==='object'?j.prev:{};
+    tuneSaved=j.saved&&typeof j.saved==='object'?j.saved:{};
+  }catch{tunePrev={};tuneSaved={};}
+}
 let activeTab='overview';
 const CLASSES=['solid','powder','liquid','gas'];
 const DIRS=['up','down','side'];       // absent = any
@@ -608,6 +646,7 @@ async function loadFromHandles(){
     eol.tune=tt.includes('\r\n')?'\r\n':'\n';
   }else tune=null;
   tuneBase=tune?structuredClone(tune):null;
+  adoptHist();
   dirty={mat:false,rx:false,tune:false};
   onLoaded();
 }
@@ -637,6 +676,7 @@ async function saveAll(){
     }
   }
   if(tune)tuneBase=structuredClone(tune);
+  if(dirty0.tune)snapshotSaved();
   updatePills();
   toast(dirty0.tune?'saved — F5 in-game for tuning, R for materials'
                    :'saved — press R in-game to hot-reload');
@@ -1314,6 +1354,20 @@ function roundStep(v,step){
 }
 const getAt=(obj,g,k)=>obj&&obj[g]?obj[g][k]:undefined;
 function setAt(obj,g,k,v){(obj[g]=obj[g]||{})[k]=v;}
+// Every control writes through here, so this is the one place that has to
+// remember the outgoing value. Repeated edits keep the ORIGINAL previous value
+// rather than the last intermediate one — while dragging a slider, "previous"
+// should mean where you started, not the pixel before.
+function setTuned(g,k,v){
+  const old=getAt(tune,g,k);
+  if(!sameVal(old,v)){
+    const kk=histKey(g,k);
+    if(!(kk in tunePrev))tunePrev[kk]=structuredClone(old);
+    else if(sameVal(tunePrev[kk],v))delete tunePrev[kk];  // returned to it
+    saveHist();
+  }
+  setAt(tune,g,k,v);
+}
 
 function sameVal(a,b){
   if(Array.isArray(a)&&Array.isArray(b))
@@ -1327,6 +1381,62 @@ function sameVal(a,b){
 const to255=v=>Math.max(0,Math.min(255,Math.round(v*255)));
 const rgbToHex=c=>'#'+c.map(v=>to255(v).toString(16).padStart(2,'0')).join('');
 const hexToRgb=h=>[0,1,2].map(i=>parseInt(h.slice(1+i*2,3+i*2),16)/255);
+
+// Record where every parameter stood at this save. Called after a successful
+// write, so the red chip always means "what is on disk right now" — which is
+// what you compare against when a change turns out worse than what you had.
+// Pull the stored trail back in after a (re)load, dropping entries that no
+// longer say anything: if a remembered value equals what is now on disk, there
+// is nothing to compare against and the chip would be noise.
+function adoptHist(){
+  loadHist();
+  if(!tune){tunePrev={};tuneSaved={};return;}
+  const live=(m)=>{
+    const out={};
+    for(const [kk,v] of Object.entries(m||{})){
+      const i=kk.indexOf('.');
+      const g=kk.slice(0,i),k=kk.slice(i+1);
+      const now=getAt(tune,g,k);
+      if(now!==undefined&&!sameVal(v,now))out[kk]=v;
+    }
+    return out;
+  };
+  tunePrev=live(tunePrev);
+  tuneSaved=live(tuneSaved);
+  saveHist();
+}
+
+function snapshotSaved(){
+  const next={};
+  for(const tab of TUNING_SCHEMA){
+    for(const pr of tab.params){
+      const g=paramGroup(tab,pr);
+      const v=getAt(tune,g,pr.k);
+      if(v!==undefined)next[histKey(g,pr.k)]=structuredClone(v);
+    }
+  }
+  // Only keep entries that DIFFER from the new save, so the chip appears on the
+  // parameters you actually moved this session rather than on all 168.
+  const keep={};
+  for(const [k,v] of Object.entries(tuneSaved)){
+    if(!sameVal(v,next[k]))keep[k]=v;
+  }
+  for(const [k,v] of Object.entries(tunePrev)){
+    if(!(k in keep)&&!sameVal(v,next[k]))keep[k]=v;
+  }
+  tuneSaved=keep;
+  tunePrev={};        // a save closes the current edit run
+  saveHist();
+  renderTuning();
+}
+
+// Compact display for a chip: triples collapse to a swatch-ish tuple, numbers
+// lose trailing zeros so 0.5000000001 does not blow the chip width.
+function histText(v){
+  if(Array.isArray(v))return v.map(x=>+(+x).toFixed(3)).join(', ');
+  if(typeof v==='number')return String(+v.toFixed(6));
+  return String(v);
+}
 
 function matchesQuery(tab,pr,g,q){
   if(!q)return true;
@@ -1393,7 +1503,11 @@ function tuneRow(tab,pr,g){
   const cur=getAt(tune,g,pr.k);
   const base=getAt(tuneBase,g,pr.k);
   const row=el('div',{class:'trow'+(tab.determinism?' det':'')});
-  const mark=()=>row.classList.toggle('changed',!sameVal(getAt(tune,g,pr.k),base));
+  let paintHist=()=>{};   // assigned below, once the chip container exists
+  const mark=()=>{
+    row.classList.toggle('changed',!sameVal(getAt(tune,g,pr.k),base));
+    paintHist();
+  };
 
   row.append(el('div',{class:'nm',title:pr.k},
     el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)));
@@ -1410,7 +1524,7 @@ function tuneRow(tab,pr,g){
       if(pr.min!=null)x=Math.max(pr.min,x);
       if(pr.max!=null)x=Math.min(pr.max,x);
       if(!isFinite(x))return;
-      setAt(tune,g,pr.k,x);
+      setTuned(g,pr.k,x);
       rng.value=x;num.value=x;
       touchTune();mark();
     };
@@ -1424,10 +1538,32 @@ function tuneRow(tab,pr,g){
     row.append(wrap);
   }
 
+  // ---- history chips: green = before the last edit, red = last saved ----
+  const hist=el('div',{class:'hist'});
+  paintHist=()=>{
+    hist.innerHTML='';
+    const kk=histKey(g,pr.k);
+    const now=getAt(tune,g,pr.k);
+    const add=(cls,val,label)=>{
+      if(val===undefined||sameVal(val,now))return;
+      const b=el('button',{class:'hchip '+cls,
+        title:label+': '+histText(val)+'  —  click to restore'},histText(val));
+      b.addEventListener('click',()=>{
+        setTuned(g,pr.k,structuredClone(val));
+        touchTune();renderTuning();
+      });
+      hist.append(b);
+    };
+    add('prev',tunePrev[kk],'before your last edit');
+    add('saved',tuneSaved[kk],'value at last save');
+  };
+  paintHist();
+  row.append(hist);
+
   const rst=el('button',{class:'rst',title:'reset to the value on disk'},'↺');
   rst.addEventListener('click',()=>{
     if(base===undefined)return;
-    setAt(tune,g,pr.k,structuredClone(base));
+    setTuned(g,pr.k,structuredClone(base));
     touchTune();renderTuning();
   });
   row.append(rst);
@@ -1457,7 +1593,7 @@ function vecEditor(pr,g,mark){
       b.addEventListener('change',()=>{
         const c=(getAt(tune,g,pr.k)||[0,0,0]).slice();
         c[i]=+b.value;
-        setAt(tune,g,pr.k,c);
+        setTuned(g,pr.k,c);
         pick.value=rgbToHex(c);setPv();touchTune();mark();
       });
       return b;
@@ -1467,7 +1603,7 @@ function vecEditor(pr,g,mark){
       // not silently quantise a value the shader reads at full float precision
       // (HDR ambient/sun colours legitimately sit between 8-bit steps).
       const c=hexToRgb(pick.value).map(v=>+v.toFixed(3));
-      setAt(tune,g,pr.k,c);
+      setTuned(g,pr.k,c);
       boxes.forEach((b,i)=>b.value=c[i]);
       setPv();touchTune();mark();
     });
@@ -1484,7 +1620,7 @@ function vecEditor(pr,g,mark){
         if(pr.max!=null)x=Math.min(pr.max,x);
         c[i]=roundStep(x,pr.step);
         b.value=c[i];
-        setAt(tune,g,pr.k,c);touchTune();mark();
+        setTuned(g,pr.k,c);touchTune();mark();
       });
       wrap.append(b);
     });
@@ -1506,7 +1642,7 @@ $('#btnTuneReset').addEventListener('click',()=>{
       const base=getAt(tuneBase,g,pr.k);
       if(base===undefined)continue;
       if(!sameVal(getAt(tune,g,pr.k),base)){
-        setAt(tune,g,pr.k,structuredClone(base));n++;
+        setTuned(g,pr.k,structuredClone(base));n++;
       }
     }
   }
@@ -1543,6 +1679,7 @@ function applyServerFiles(j){
   if(j.reactions){rx=JSON.parse(j.reactions);eol.rx=eolOf(j.reactions);}
   if(j.tuning){
     tune=JSON.parse(j.tuning);tuneBase=structuredClone(tune);eol.tune=eolOf(j.tuning);
+    adoptHist();
   }
   dirty={mat:false,rx:false,tune:false};
   if(mat&&rx)onLoaded(); else {updatePills();renderAll();}
@@ -1561,6 +1698,7 @@ async function serverSave(){
   const hadTune=dirty.tune;
   dirty={mat:false,rx:false,tune:false};
   if(tune)tuneBase=structuredClone(tune);
+  if(hadTune)snapshotSaved();
   updatePills();
   toast(hadTune?'saved — press F5 in-game (or Build for code changes)'
                :'saved — press R in-game to hot-reload');

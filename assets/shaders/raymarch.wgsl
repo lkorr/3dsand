@@ -74,12 +74,19 @@ const SUN_ANGULAR_RADIUS : f32 = 0.00465;
 // they are derived rather than art-directed.
 const RAYLEIGH_RGB : vec3f = vec3f(0.1440, 0.3125, 0.7940);
 
-// Approximate air mass along a view ray leaving the ground at elevation
-// sin(theta) = y. The naive 1/y diverges at the horizon; this is the standard
-// Kasten-Young-style fit, finite at y = 0 and correct overhead.
+// Relative air mass along a ray leaving the ground at elevation sin(theta) = y.
+// 1.0 straight up, ~38 at the horizon. The naive 1/y diverges at y = 0; this is
+// the Kasten-Young fit, which stays finite and is accurate to well under a
+// percent across the whole range.
+//
+// This curve is the single most important function in the sky: it is why the
+// horizon is pale (long path, scattering saturated), why the zenith is deep
+// (short path), and why a low sun goes red (its own light crosses ~38 air
+// masses and loses blue first).
 fn airMass(y : f32) -> f32 {
-  let c = max(y, -0.02);
-  return 1.0 / (c + 0.15 * pow(max(c + 0.093, 1e-3), -1.253));
+  let c = clamp(y, -0.02, 1.0);
+  let zdeg = degrees(acos(clamp(c, -1.0, 1.0)));
+  return 1.0 / (c + 0.50572 * pow(max(96.07995 - zdeg, 1e-3), -1.6364));
 }
 
 // Rayleigh phase: gently forward/backward peaked, symmetric.
@@ -97,8 +104,19 @@ fn phaseMie(mu : f32, g : f32) -> f32 {
 // first (Rayleigh again), so the disc and everything it lights goes amber then
 // red as it sets. This is ONE function driving the disc, the direct lighting
 // term and the horizon glow, so they cannot disagree.
+//
+// Independent of TUNE_SKY_RAYLEIGH for the same reason as SUN_EXTINCT_K above:
+// the in-scatter strength (how blue the sky is) and the extinction strength
+// (how fast the sun reddens) want opposite tuning, and sharing one constant
+// makes a rich blue sky imply a permanently orange sun.
+//
+// At this coefficient the sun is essentially white overhead (mass 1 ->
+// 0.98/0.97/0.92) and a deep orange right on the horizon (mass 38 ->
+// 0.61/0.34/0.07), which is the range a real day covers. TUNE_SUN_REDDENING
+// scales it if you want a hazier or a cleaner atmosphere.
+const SUN_TRANSMIT_K : f32 = 0.09;
 fn sunTransmittance(mass : f32) -> vec3f {
-  return exp(-RAYLEIGH_RGB * TUNE_SKY_RAYLEIGH * mass * 0.25);
+  return exp(-RAYLEIGH_RGB * mass * SUN_TRANSMIT_K * TUNE_SUN_REDDENING);
 }
 
 // ---- starfield ----------------------------------------------------------
@@ -327,24 +345,61 @@ fn daySky(rd : vec3f) -> vec3f {
 
   // Direct sunlight colour after its own trip through the atmosphere. Drives
   // the disc, the halo and the horizon warmth together.
+  //
+  // NOTE the deliberate asymmetry below: this reddened colour is applied to
+  // the MIE term but only partially to the RAYLEIGH term. Applying it fully to
+  // both is physically tempting and visually wrong — it double-counts the
+  // extinction, because the Rayleigh in-scatter integral ALREADY accounts for
+  // the wavelength-dependent loss along the path. Doing it anyway multiplies
+  // a blue in-scatter by a red transmittance and the two cancel, which turns
+  // the noon sky olive-khaki. (Measured: zenith came out 0.33/0.34/0.13.)
   let sunLight = sunTransmittance(sunMass) * TUNE_SUN_INTENSITY;
 
   // Rayleigh in-scatter: how much blue this view ray picks up. Scales with the
   // air mass along the ray, which is what makes the horizon pale and the
   // zenith deep. The (1 - exp(-tau)) form saturates instead of growing without
-  // bound at the horizon.
-  let tauR = RAYLEIGH_RGB * TUNE_SKY_RAYLEIGH * viewMass * 0.25;
-  let inscatterR = (1.0 - exp(-tauR)) * phaseRayleigh(mu);
+  // bound at the horizon — and that saturation IS the pale horizon band: by
+  // ~10 air masses every channel is near 1.0, so the colour washes to white.
+  let tauR = RAYLEIGH_RGB * TUNE_SKY_RAYLEIGH * viewMass * 0.06;
+  // (1 - exp(-tau)) alone saturates every channel toward 1 at the horizon, so
+  // the horizon band comes out warm WHITE. Real horizon light is also
+  // EXTINGUISHED on its way in, which is what keeps it from blowing out.
+  //
+  // Crucially the extinction that COLOURS the horizon is the one along the
+  // SUNLIGHT's path, not the view path. Using the view path reddens the
+  // horizon even at midday (the view mass is ~38 at the horizon whatever the
+  // sun is doing), which is wrong: a noon horizon is pale blue-white and only
+  // goes orange when the SUN gets low. Splitting them this way is what makes
+  // one model cover both.
+  //
+  // This coefficient is DELIBERATELY not TUNE_SKY_RAYLEIGH. Reusing the
+  // in-scatter strength here couples two things that need opposite tuning: a
+  // high Rayleigh makes the sky a richer blue (good) but, reused as extinction,
+  // also crushes blue out of the daylight sky entirely. At 12 it made a 15-deg
+  // sun keep 72% of red and only 20% of blue, so the whole dome went khaki
+  // (measured 102,98,75). Kept small and separate, the sunset still reddens
+  // (mass ~38 at the horizon) while a mid-morning sky stays blue.
+  const SUN_EXTINCT_K : f32 = 0.045;
+  let extinctR = exp(-RAYLEIGH_RGB * sunMass * SUN_EXTINCT_K * TUNE_SUN_REDDENING);
+  let inscatterR = (1.0 - exp(-tauR)) * extinctR * phaseRayleigh(mu);
 
   // Mie in-scatter: white-ish forward haze that concentrates around the sun.
-  let tauM = TUNE_SKY_MIE * viewMass * 0.03;
+  // This one DOES take the full reddened sunlight, because haze scattering is
+  // essentially wavelength-neutral — whatever colour reaches the particles is
+  // the colour they scatter, which is why the glow around a setting sun is
+  // orange while the sky opposite stays blue.
+  let tauM = TUNE_SKY_MIE * viewMass * 0.012;
   let inscatterM = vec3f(1.0 - exp(-tauM)) * phaseMie(mu, TUNE_SKY_MIE_G) *
-                   12.0 * TUNE_SKY_MIE_STRENGTH;
+                   TUNE_SKY_MIE_STRENGTH * 22.0;
 
-  // The sky is lit by the sun, so both terms are modulated by sunlight colour
-  // and by how high the sun is. As the sun drops, sunLight reddens and the
-  // whole dome follows it — that single coupling is the sunset.
-  var c = (inscatterR + inscatterM) * sunLight * TUNE_SKY_EXPOSURE;
+  // Brightness follows the sun's elevation: the dome dims as the sun sets
+  // rather than staying at full noon brightness until it clips the horizon.
+  let sunAlt = clamp(R.sunDir.y, 0.0, 1.0);
+  let lit = 0.12 + 0.88 * pow(sunAlt, 0.55);
+
+  // inscatterR already carries the sun's colour through extinctR; inscatterM
+  // takes the full reddened sunlight because haze scatters whatever reaches it.
+  var c = (inscatterR + inscatterM * sunLight) * lit * TUNE_SKY_EXPOSURE;
 
   // Ground bounce near and below the horizon, so the dome does not simply go
   // black under the camera when looking down at distant fog.

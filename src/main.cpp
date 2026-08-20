@@ -329,6 +329,10 @@ void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
   ctx.instance.WaitAny(f, UINT64_MAX);
 }
 
+// Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
+// 0.5 = noon). Set by `--time`; see RunShots.
+float g_shotTimeOfDay = 0.34f;
+
 // --shot: minimal look-iteration harness. Worldgen, drain the far-field fill
 // queue, settle briefly, write the three standard screenshots, exit — so
 // render/look changes can be judged in seconds instead of the full selftest.
@@ -395,11 +399,21 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // so a time of 0 would show every shot at the one phase where the ripples
   // happen to be flat. Constant, so shots stay reproducible frame to frame.
   const float kShotTime = 11.7f;
+  // Time of day for the shots. `--time 0..1` (0 = midnight, 0.5 = noon) maps
+  // to the tick that lands on that phase, so the sky/sun/moon can be inspected
+  // at any point in the cycle without waiting for the cycle to get there.
+  // Defaults to mid-morning, which shows terrain lighting at a readable sun
+  // angle rather than the flat overhead of noon.
+  const Tuning& shotTun = CurrentTuning();
+  uint32_t shotTicksPerDay = TicksPerDay(shotTun);
+  uint32_t shotTick =
+      (uint32_t)((double)g_shotTimeOfDay * (double)shotTicksPerDay) % shotTicksPerDay;
   auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
     Camera c;
     c.yaw = yaw;
     c.pitch = pitch;
-    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime);
+    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
+                      kFarFogDensity, 1080.0f, shotTick);
     wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     wgpu::RenderPassEncoder rp =
         sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
@@ -411,6 +425,21 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     grab(path);
   };
   int h108 = World::TerrainHeight(108, 108, kDefaultSeed);
+  // Sky shot: aimed along the sun's azimuth and tilted up, so the frame holds
+  // the sun disc, the halo, the scattering gradient AND long raking shadows on
+  // the terrain below. The other shots deliberately face away from the sun, so
+  // without this one the whole sky/sun path goes unreviewed.
+  {
+    SkyState ss = SkyForTick(shotTun, shotTick);
+    // Camera::Forward() is (cos yaw, sin pitch, sin yaw), so yaw runs from +X
+    // toward +Z — atan2(z, x), NOT atan2(x, z).
+    float sunYaw = std::atan2(ss.sunDir[2], ss.sunDir[0]);
+    // Pitch straight AT the sun so the disc, its limb darkening and the halo
+    // are actually in frame — a shot merely pointed down-sun misses the disc
+    // entirely and the whole sun path goes unreviewed.
+    float sunPitch = std::asin(std::clamp(ss.sunDir[1], -1.0f, 1.0f));
+    render({108, (float)(h108 + 40), 108}, sunYaw, sunPitch, "screenshot_sky.bmp");
+  }
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
   render({108, (float)(h108 + 28), 108}, 0.785f, -0.02f, "screenshot_ground.bmp");
@@ -1571,6 +1600,13 @@ int main(int argc, char** argv) {
     std::string a = argv[i];
     if (a == "--selftest") selftest = true;
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
+    // `--time 0..1` sets the time of day for --shot: 0 = midnight, 0.25 =
+    // sunrise, 0.5 = noon, 0.75 = sunset. Lets the sky be judged at any point
+    // in the cycle without waiting for it.
+    if (a == "--time" && i + 1 < argc) {
+      g_shotTimeOfDay = std::fmod(std::atof(argv[++i]), 1.0);
+      if (g_shotTimeOfDay < 0.0f) g_shotTimeOfDay += 1.0f;
+    }
     // `--adapter low` picks the LowPower adapter (iGPU) so the selftest hash
     // can be compared across GPU vendors (DESIGN.md §14 risk 3).
     if (a == "--adapter" && i + 1 < argc) lowPowerAdapter = std::string(argv[++i]) == "low";

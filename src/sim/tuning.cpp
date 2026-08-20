@@ -375,6 +375,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "skyExposure", r.skyExposure, out, at);
     ReadV3(*g, "skyGround", r.skyGround, out, at);
     ReadF(*g, "sunSize", r.sunSize, out, at);
+    ReadF(*g, "sunReddening", r.sunReddening, out, at);
     // night sky
     ReadV3(*g, "nightZenith", r.nightZenith, out, at);
     ReadV3(*g, "nightHorizon", r.nightHorizon, out, at);
@@ -588,6 +589,7 @@ std::string TuningWgslBlock(const Tuning& t) {
   EmitF(o, "TUNE_SKY_EXPOSURE", r.skyExposure);
   EmitV3(o, "TUNE_SKY_GROUND", r.skyGround);
   EmitF(o, "TUNE_SUN_SIZE", r.sunSize);
+  EmitF(o, "TUNE_SUN_REDDENING", r.sunReddening);
 
   // ---- night sky ----
   EmitV3(o, "TUNE_NIGHT_ZENITH", r.nightZenith);
