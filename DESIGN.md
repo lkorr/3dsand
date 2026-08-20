@@ -986,6 +986,33 @@ through the MutationQueue like every other world edit (rule 3). Every field in
 `PlayerAvatar` is CPU-float presentation state and never touches the hashed
 grid (rule 1) — `--selftest` determinism is unchanged with an avatar standing.
 
+**Your own body must not push you** (`Layers::AVATAR`). The avatar's limbs are
+drawn *around* the player's capsule proxy — `origin_` is derived from
+`player.pos` — so on the ordinary `MOVING` layer every limb is permanently
+interpenetrated with the proxy. That leaked into movement twice: the solver saw
+a contact it could never resolve, and `PlayerPushOut` summed a large
+depenetration vector whose *direction swung with the gait animation*. The
+result was the player being steered backwards and diagonally while trying to
+walk forward, sporadically — a movement bug whose cause was the renderer's
+character model.
+
+The fix is a fourth object layer, `AVATAR`, identical to `MOVING` except that
+`ObjPairFilter` refuses the `AVATAR`↔`PLAYER` pair and `PlayerPushOut` (which
+filters on `MOVING`) cannot see it. The split is about **contacts, not
+visibility**: rays still hit these bodies, so laser damage and dismemberment
+are untouched — `CastRayBody` uses a `DynamicLayerFilter` accepting both
+layers rather than a single-layer filter. `Physics::SetBodyAvatarLayer` moves a
+body on or off it; both layers map to the same broadphase layer, so this is
+never a broadphase rebuild. A severed limb is switched *back* to `MOVING` when
+its hold expires (and the whole corpse on death), because a detached arm has
+stopped being "you" and should bump you like any other debris.
+
+Selftest-gated: the avatar test walks a proxy alongside a spawned avatar for 30
+ticks and asserts the peak `PlayerPushOut` magnitude is zero. Sampled over many
+ticks rather than once because the failure was *animated* — a single sample can
+land on a frame where the limb swing happens to cancel. With the layer
+assignment removed that assertion reads ~19 voxels/tick.
+
 **Dismemberment drives movement.** `AvatarLocomotion` is the single place the
 damage state is turned into gameplay: `speedScale` comes from the matched
 `AnimStateRule`, while `jumpScale`/`canJump` are derived from *leg liveness*

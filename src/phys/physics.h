@@ -97,6 +97,21 @@ class Physics {
                          float dt);
   void SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec);
 
+  // Move a body onto (or off) the PLAYER-AVATAR collision layer. Bodies there
+  // behave exactly like normal dynamic bodies except that they never generate
+  // contacts with the player proxy, and they are invisible to PlayerPushOut.
+  //
+  // WHY THIS EXISTS. The player's avatar is drawn around the player's own
+  // capsule, so its limbs are permanently interpenetrated with the proxy. On
+  // the normal layer that produced a large depenetration push every tick whose
+  // direction swung with the gait animation — the player's own body steering
+  // them backwards and sideways. Rays and other queries still see these
+  // bodies, so laser/damage hits on the avatar are unaffected.
+  //
+  // Call with `false` when a limb is severed: the detached piece stops being
+  // "you" and should be able to bump into you like any other debris.
+  void SetBodyAvatarLayer(uint64_t handle, bool isAvatar);
+
   // Disable collisions among a set of bodies (one mob's limbs): adjacent limb
   // boxes otherwise fight their own joints — the push/pull jitter keeps the
   // ragdoll awake forever. Jolt's own Ragdoll class does exactly this.

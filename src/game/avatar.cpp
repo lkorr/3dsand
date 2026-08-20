@@ -159,6 +159,15 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
       return false;
     }
     phys_->SetBodyKinematic(p.body, true);
+    // YOUR OWN BODY MUST NOT PUSH YOU. These limbs live inside the player's
+    // capsule proxy by construction (origin_ above), so on the normal dynamic
+    // layer they are permanently interpenetrated with it: the solver fights a
+    // contact it can never resolve, and PlayerPushOut reads a large ejection
+    // vector whose direction swings with the gait. That is what made walking
+    // forward drift backwards and diagonally. The AVATAR layer is identical
+    // in every other respect and stays visible to rays, so laser hits and
+    // dismemberment are unchanged.
+    phys_->SetBodyAvatarLayer(p.body, true);
     p.xf.pos = o;
     p.xf.quat[3] = 1;
   }
@@ -610,6 +619,10 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // A severed part must collide with the body it came off again: the
     // DisableCollisionsAmong group suppressed those contacts forever.
     phys_->ClearCollisionGroup(p.holdBody);
+    // It also stops being "you". Back on the normal dynamic layer it can bump
+    // the player like any other debris — the avatar-layer exemption is only
+    // for limbs still attached and still living inside the player's capsule.
+    phys_->SetBodyAvatarLayer(p.holdBody, false);
     p.holdBody = 0;
   }
 
@@ -864,6 +877,8 @@ void PlayerAvatar::Die() {
     debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.scale));
     phys_->SetBodyKinematic(p.body, false);
     phys_->ClearCollisionGroup(p.body);
+    // The corpse is debris now, not the player's body — it collides normally.
+    phys_->SetBodyAvatarLayer(p.body, false);
     p.body = 0;
     p.joint = 0;
   }

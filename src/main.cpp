@@ -2712,6 +2712,28 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           float drift = std::abs(avatar.BodyY() - soleY);
           bool tracksY = drift < wd.worldSize.y;
 
+          // YOUR OWN BODY MUST NOT PUSH YOU. The avatar's limbs are drawn
+          // around the player capsule, so on the normal dynamic layer they sit
+          // permanently interpenetrated with the proxy and PlayerPushOut reads
+          // a large ejection vector whose direction swings with the gait —
+          // walking forward drifted backwards and diagonally. The limbs live
+          // on Layers::AVATAR now, which PlayerPushOut does not see. Sampled
+          // over several ticks because the failure was ANIMATED, not static:
+          // one sample could land on a frame where the swing happened to
+          // cancel.
+          uint64_t avProxy = phys.CreatePlayerBody(Player::kHalfXZ,
+                                                   Player::kHalfY);
+          float selfPush = 0.0f;
+          for (int i = 0; i < 30; i++) {
+            pl.pos.x += 0.2f;
+            phys.MovePlayerBody(avProxy, pl.pos, kTickDt);
+            avTick();
+            selfPush = std::max(selfPush,
+                                phys.PlayerPushOut(avProxy, pl.pos).len());
+          }
+          phys.RemoveBody(avProxy);
+          bool noSelfPush = selfPush < 0.001f;
+
           // Walk DOWN the state ladder and check the movement coupling at each
           // rung. Speed must be non-increasing and must actually drop by the
           // end — the whole point of the states is that damage costs you.
@@ -2745,18 +2767,18 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           avatar.Despawn();
           bool tornDown = avatar.LimbBodyCount() == 0;
 
-          bool avOk = spawned && allBodies && follows && tracksY && monotone &&
-                      slowed && noJump && statesSeen > 0 && partsGone &&
-                      becameDebris && tornDown;
+          bool avOk = spawned && allBodies && follows && tracksY &&
+                      noSelfPush && monotone && slowed && noJump &&
+                      statesSeen > 0 && partsGone && becameDebris && tornDown;
           std::printf(
               "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
-              "y-drift %.2f vox, states seen=%d (last %d) speed 1.00->%.2f "
-              "monotone=%d canJump=%d, %u parts left, %zu debris, "
-              "torn down=%d)\n",
+              "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
+              "speed 1.00->%.2f monotone=%d canJump=%d, %u parts left, "
+              "%zu debris, torn down=%d)\n",
               avOk ? "PASS" : "FAIL", nParts, spawned ? 1 : 0,
-              allBodies ? 1 : 0, followed, drift, statesSeen, stateNow,
-              prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0, partsLeft,
-              debrisNow, tornDown ? 1 : 0);
+              allBodies ? 1 : 0, followed, drift, selfPush, statesSeen,
+              stateNow, prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0,
+              partsLeft, debrisNow, tornDown ? 1 : 0);
           mobOk = mobOk && avOk;
           debris.Reset();
         }

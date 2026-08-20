@@ -49,7 +49,16 @@ constexpr JPH::ObjectLayer MOVING = 1;
 // player proxy: collides with MOVING only — terrain collision is the voxel
 // AABB controller's job, and resolving against both would double-collide
 constexpr JPH::ObjectLayer PLAYER = 2;
-constexpr JPH::ObjectLayer NUM = 3;
+// PLAYER AVATAR LIMBS. Identical to MOVING in every respect EXCEPT that it
+// does not collide with PLAYER. The avatar is drawn AROUND the player's own
+// capsule by construction (avatar.cpp derives origin_ from player.pos), so on
+// MOVING every limb is permanently interpenetrated with the proxy. That fed
+// the solver a contact it could never resolve and fed PlayerPushOut a large
+// depenetration vector whose direction swung with the gait — which is exactly
+// "walking forward moves me backwards/diagonally, sporadically". Your own body
+// must never be able to push you.
+constexpr JPH::ObjectLayer AVATAR = 3;
+constexpr JPH::ObjectLayer NUM = 4;
 }  // namespace Layers
 
 namespace BP {
@@ -83,9 +92,23 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
 class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
+    // The avatar's own limbs never touch the player proxy they live inside.
+    if ((a == Layers::PLAYER && b == Layers::AVATAR) ||
+        (a == Layers::AVATAR && b == Layers::PLAYER))
+      return false;
     if (a == Layers::PLAYER || b == Layers::PLAYER)
       return a == Layers::MOVING || b == Layers::MOVING;
     return !(a == Layers::STATIC && b == Layers::STATIC);
+  }
+};
+
+// "Any body a query should be able to see", i.e. both dynamic layers.
+// SpecifiedObjectLayerFilter takes a single layer, which stopped being enough
+// once the avatar moved off MOVING.
+class DynamicLayerFilter final : public JPH::ObjectLayerFilter {
+ public:
+  bool ShouldCollide(JPH::ObjectLayer layer) const override {
+    return layer == Layers::MOVING || layer == Layers::AVATAR;
   }
 };
 
@@ -557,6 +580,15 @@ void Physics::SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec) {
   bi.SetAngularVelocity(id, JPH::Vec3(angRadPerSec.x, angRadPerSec.y, angRadPerSec.z));
 }
 
+void Physics::SetBodyAvatarLayer(uint64_t handle, bool isAvatar) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  // Both layers map to BP::MOVING, so this never needs a broadphase rebuild.
+  bi.SetObjectLayer(id, isAvatar ? Layers::AVATAR : Layers::MOVING);
+}
+
 void Physics::DisableCollisionsAmong(const std::vector<uint64_t>& handles) {
   if (!system_ || handles.size() < 2) return;
   JPH::Ref<JPH::GroupFilterTable> table =
@@ -591,8 +623,11 @@ uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
                               dirNormalized.z) *
                         VoxToM(maxDistVoxels));
   JPH::RayCastResult hit;
-  JPH::SpecifiedObjectLayerFilter movingOnly(Layers::MOVING);
-  if (!system_->GetNarrowPhaseQuery().CastRay(ray, hit, {}, movingOnly))
+  // Both dynamic layers: the avatar's limbs sit on AVATAR rather than MOVING
+  // so they cannot shove the player proxy, but a laser must still be able to
+  // hit them — the split is about CONTACTS, not about visibility to queries.
+  DynamicLayerFilter dynamicOnly;
+  if (!system_->GetNarrowPhaseQuery().CastRay(ray, hit, {}, dynamicOnly))
     return 0;
   fraction = hit.mFraction;
   return FromBodyID(hit.mBodyID);
