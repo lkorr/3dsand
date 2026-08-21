@@ -6181,7 +6181,25 @@ at cap     ~524k thread-launches/tick</pre>`},
    <div class="eng-limit"><b>Limits</b><p>
      Cost scales with screen pixels and traversal depth, not activity.
      No LOD: distant geometry costs the same per-step as near geometry.
-   </p></div>`}
+   </p></div>`},
+
+  {key:'submit',tag:'cpu',label:'Tick submit',
+   desc:'CPU time to encode + submit the GPU command buffer',
+   cost:'—',
+   body:`<p>
+     CPU cost of building the command buffer (uniform writes, encode calls,
+     <code>queue.Submit</code>). The GPU work runs asynchronously after Submit
+     returns, so this measures encoding overhead, not GPU execution.
+   </p>`},
+
+  {key:'post',tag:'cpu',label:'Post-step',
+   desc:'Debris, mobs, avatar post-step + player push-out',
+   cost:'—',
+   body:`<p>
+     CPU work after Jolt's physics step: debris post-step (island detection,
+     body management), mob post-step (steering, animation), avatar post-step,
+     and collision push-out.
+   </p>`}
 ];
 
 const ENG_INVARIANTS=[
@@ -6362,7 +6380,9 @@ function engStartDemo(){
       occupancy:{ms:jit(0.04+a*0.08,0.01)},
       readback:{ms:jit(0.06,0.02)},
       physics:{ms:jit(0.1+a*0.7,0.05)},
-      render:{ms:jit(2.66+a*0.8,0.25)}
+      render:{ms:jit(2.66+a*0.8,0.25)},
+      submit:{ms:jit(0.08+a*0.12,0.03)},
+      post:{ms:jit(0.05+a*0.15,0.02)}
     }});
   },1000/30);
 }

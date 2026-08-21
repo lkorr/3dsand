@@ -202,6 +202,7 @@ add_executable(sandvox
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
   src/ui/overlay.cpp
+  src/telemetry.cpp
 )
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
 # resolves unmodified — the sandvox-side audio code uses "audio/xyzpan/..."
@@ -216,6 +217,7 @@ target_link_libraries(sandvox PRIVATE
   imgui_lib
   nlohmann_json::nlohmann_json
   Jolt
+  ws2_32
 )
 
 # Run from any cwd: bake the asset dir absolute path for dev builds.
