@@ -698,18 +698,56 @@ size_t Physics::GetSubShapeBoxes(uint64_t handle,
   JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return 0;
   JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
-  if (!shape) return 0;
-  const auto* compound =
-      dynamic_cast<const JPH::StaticCompoundShape*>(shape.GetPtr());
-  if (!compound) return 0;
+  if (!shape || out.size() >= limit) return 0;
+
   const float inv = 1.0f / kVoxelMeters;
+
+  // Jolt optimizes a single-sub-shape compound into a bare BoxShape or a
+  // RotatedTranslatedShape wrapping one. Handle both so those limbs also
+  // get tight-fitting boxes instead of falling back to the AABB.
+  if (shape->GetSubType() == JPH::EShapeSubType::Box) {
+    const auto* box = static_cast<const JPH::BoxShape*>(shape.GetPtr());
+    JPH::Vec3 half = box->GetHalfExtent();
+    SubShapeBox b;
+    b.center = Vec3{};
+    b.halfExtents = Vec3{half.GetX() * inv, half.GetY() * inv,
+                         half.GetZ() * inv};
+    b.quat[0] = 0; b.quat[1] = 0; b.quat[2] = 0; b.quat[3] = 1;
+    out.push_back(b);
+    return 1;
+  }
+
+  if (shape->GetSubType() == JPH::EShapeSubType::RotatedTranslated) {
+    const auto* rt = static_cast<const JPH::RotatedTranslatedShape*>(
+        shape.GetPtr());
+    const JPH::Shape* inner = rt->GetInnerShape();
+    if (inner && inner->GetSubType() == JPH::EShapeSubType::Box) {
+      const auto* box = static_cast<const JPH::BoxShape*>(inner);
+      JPH::Vec3 pos = rt->GetPosition();
+      JPH::Quat rot = rt->GetRotation();
+      JPH::Vec3 half = box->GetHalfExtent();
+      SubShapeBox b;
+      b.center = Vec3{pos.GetX() * inv, pos.GetY() * inv,
+                       pos.GetZ() * inv};
+      b.halfExtents = Vec3{half.GetX() * inv, half.GetY() * inv,
+                           half.GetZ() * inv};
+      b.quat[0] = rot.GetX(); b.quat[1] = rot.GetY();
+      b.quat[2] = rot.GetZ(); b.quat[3] = rot.GetW();
+      out.push_back(b);
+      return 1;
+    }
+    return 0;
+  }
+
+  if (shape->GetSubType() != JPH::EShapeSubType::StaticCompound) return 0;
+  const auto* compound =
+      static_cast<const JPH::StaticCompoundShape*>(shape.GetPtr());
   size_t added = 0;
   for (uint32_t i = 0; i < compound->GetNumSubShapes(); i++) {
     if (out.size() >= limit) break;
     const JPH::CompoundShape::SubShape& ss = compound->GetSubShape(i);
-    const auto* box = dynamic_cast<const JPH::BoxShape*>(
-        ss.mShape.GetPtr());
-    if (!box) continue;
+    if (ss.mShape->GetSubType() != JPH::EShapeSubType::Box) continue;
+    const auto* box = static_cast<const JPH::BoxShape*>(ss.mShape.GetPtr());
     JPH::Vec3 pos = ss.GetPositionCOM();
     JPH::Vec3 half = box->GetHalfExtent();
     JPH::Quat rot = ss.GetRotation();

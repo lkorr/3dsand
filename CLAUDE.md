@@ -383,3 +383,15 @@ The exe must sit in the project root: it edits this checkout in place, so
 - Don't grow the 16-bit voxel. Extra per-voxel state goes in an optional sparse
   auxiliary layer keyed by chunk (DESIGN.md §3). 16 bpv is what makes 100M+
   resident voxels affordable.
+- **Verify rotations with `scripts/geometry.py` — don't reason about quaternions
+  in your head.** The engine is Y-up, quats are `(x,y,z,w)`, Euler order is
+  X-then-Y-then-Z, heading 0 = +Z, and .vox files are Z-up (converted by
+  `vox_to_engine`). Use the script to confirm any rotation does what you intend:
+  ```bash
+  python scripts/geometry.py describe_quat 0 0.707 0 0.707   # what does this quat do?
+  python scripts/geometry.py qy 90                            # 90° about Y
+  python scripts/geometry.py rotate_point 0 1 0 45 -- 1 0 0   # where does (1,0,0) end up?
+  python scripts/geometry.py vox_to_engine 10 5 20             # scene -> engine coords
+  python scripts/geometry.py euler_to_quat 30 45 0             # euler -> quat
+  python scripts/geometry.py look_at 0 0 0 -- 5 0 5            # quat to face a target
+  ```
