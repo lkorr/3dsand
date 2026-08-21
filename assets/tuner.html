@@ -4079,7 +4079,14 @@ const RENDER_PATHS=[
   {
     id:'stain', title:'STAINS what it touches',
     fn:'matStains', file:'common.wgsl', groups:['blood'],
-    when:m=>m.stain?`This material carries an authored "stain" block, so it marks neighbouring voxels through the sparse per-voxel stain layer — and, if the consume chance is set, may eat them.`:null,
+    when:m=>m.stain?`This material carries an authored "stain" block, so it marks neighbouring voxels through the sparse per-voxel stain layer — and, if the consume chance is set, may eat them.`+
+      (m.stain.washes?' It also WASHES: a foreign stain under it is stepped down toward zero and rinsed away rather than repainted in this material’s colour.':''):null,
+  },
+  {
+    id:'absorb', title:'ABSORBS liquid — soaks before it pools',
+    fn:'matAbsorbs', file:'common.wgsl', groups:['blood'],
+    when:m=>(m.absorb&&m.absorb.capacity)
+      ?`This material carries an "absorb" block, so a staining liquid touching it soaks IN rather than pooling: the liquid spends an eighth of its fullness per contact and the stain deepens, up to level ${m.absorb.capacity}/15. Once that ceiling is reached the ground is saturated, absorption stops, and further liquid persists on top as a real pool.`:null,
   },
   {
     id:'micro', title:'MICRO DETAIL — subdivided brick',
@@ -5218,7 +5225,11 @@ function wikiMaterial(host){
     :'translucent: absorbed per metre of depth the ray travels');
   if(m.moveEvery&&m.moveEvery>1)note('moveEvery','viscous — flows only every '+m.moveEvery+'th tick');
   if(m.stain)note('stain','marks what it touches (type '+m.stain.type+', '+
-    (m.stain.chance??0)+'‰ per tick'+(m.stain.consume?', consumes '+m.stain.consume+'‰':'')+')');
+    (m.stain.chance??0)+'‰ per tick'+(m.stain.consume?', consumes '+m.stain.consume+'‰':'')+
+    (m.stain.washes?', WASHES foreign stains out':'')+')');
+  if(m.absorb&&m.absorb.capacity)note('absorb','soaks up staining liquid to level '+
+    m.absorb.capacity+'/15 before it pools on top — liquid landing on this SPENDS itself '+
+    'soaking in until the ground is saturated');
   note('rubble',m.rubble?'shatters into '+m.rubble:'leaves no rubble');
   note('molten',m.molten?'heat/laser turns it into '+m.molten:'vaporises to air');
   idBody.append(notes);

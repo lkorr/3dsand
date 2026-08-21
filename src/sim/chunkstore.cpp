@@ -6,7 +6,11 @@
 namespace fs = std::filesystem;
 
 namespace {
-constexpr uint32_t kRegionMagic = 0x31525653;  // 'SVR1'
+// 'SVR2' — bumped from 'SVR1' when the persisted voxel word widened from
+// 16 to 32 bits to carry the stain layer (see RleEncodeChunk). An old
+// 'SVR1' file is REJECTED rather than misread: its 16-bit payload would
+// decode as garbage runs at the wrong stride.
+constexpr uint32_t kRegionMagic = 0x32525653;  // 'SVR2'
 
 // region files and the save meta are the only files this code ever deletes
 bool IsOurFile(const fs::path& p) {
@@ -41,7 +45,7 @@ void ChunkStore::EnsureLoaded(IVec3 rc, Region& r) {
     std::fclose(fp);
     return;
   }
-  std::vector<uint16_t> rle;
+  std::vector<uint32_t> rle;
   for (uint32_t c = 0; c < hdr[1]; c++) {
     int32_t wc[3];
     uint32_t pairs = 0;
@@ -52,7 +56,7 @@ void ChunkStore::EnsureLoaded(IVec3 rc, Region& r) {
       break;
     }
     rle.resize((size_t)pairs * 2);
-    if (std::fread(rle.data(), 2, rle.size(), fp) != rle.size()) {
+    if (std::fread(rle.data(), 4, rle.size(), fp) != rle.size()) {
       std::fprintf(stderr, "chunkstore: %s truncated at entry %u\n",
                    RegionPath(rc).c_str(), c);
       break;
@@ -89,8 +93,8 @@ bool ChunkStore::WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut) {
     uint32_t pairs = (uint32_t)(e.rle.size() / 2);
     ok = ok && std::fwrite(wc, 4, 3, fp) == 3 &&
          std::fwrite(&pairs, 4, 1, fp) == 1 &&
-         std::fwrite(e.rle.data(), 2, e.rle.size(), fp) == e.rle.size();
-    bytes += 16 + e.rle.size() * 2;
+         std::fwrite(e.rle.data(), 4, e.rle.size(), fp) == e.rle.size();
+    bytes += 16 + e.rle.size() * 4;
   }
   std::fclose(fp);
   if (ok) {
@@ -122,7 +126,7 @@ void ChunkStore::SpillOverBudget() {
   }
 }
 
-void ChunkStore::Put(IVec3 wc, std::vector<uint16_t> rle) {
+void ChunkStore::Put(IVec3 wc, std::vector<uint32_t> rle) {
   Region& r = Touch(RegionOf(wc));
   uint64_t key = World::PackChunkKey(wc);
   auto [it, inserted] = r.chunks.try_emplace(key);
@@ -133,7 +137,7 @@ void ChunkStore::Put(IVec3 wc, std::vector<uint16_t> rle) {
   SpillOverBudget();
 }
 
-const std::vector<uint16_t>* ChunkStore::Get(IVec3 wc) {
+const std::vector<uint32_t>* ChunkStore::Get(IVec3 wc) {
   IVec3 rc = RegionOf(wc);
   Region& r = Touch(rc);
   EnsureLoaded(rc, r);

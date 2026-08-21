@@ -56,13 +56,41 @@ static_assert(sizeof(MaterialGpu) == 64, "must match common.wgsl Material");
 //   bits 3..6   : amount added per contact, 1..15 (voxel amounts saturate at 15)
 //   bits 7..16  : per-mille chance per tick to stain a touching neighbour
 //   bits 17..26 : per-mille chance a stain CONSUMES the voxel it stained
+//   bits 27..30 : ABSORB CAPACITY, 0..15 — see below. Authored on the SUBSTRATE,
+//                 not on the stainer, so it shares this word only because there
+//                 was room; the two halves are read by opposite sides of the
+//                 rule and never by the same material.
+//   bit  31     : WASHES — this liquid scrubs FOREIGN stains away instead of
+//                 overwriting them with its own (water rinsing blood off).
 // 10 bits per chance = 0..1023, which covers the 0..1000 per-mille range the
 // rest of the reaction system already speaks.
 constexpr uint32_t kStainPackTypeShift = 0, kStainPackTypeMask = 0x7;
 constexpr uint32_t kStainPackAmtShift = 3, kStainPackAmtMask = 0xF;
 constexpr uint32_t kStainPackChanceShift = 7, kStainPackChanceMask = 0x3FF;
 constexpr uint32_t kStainPackConsumeShift = 17, kStainPackConsumeMask = 0x3FF;
+constexpr uint32_t kStainPackAbsorbShift = 27, kStainPackAbsorbMask = 0xF;
+constexpr uint32_t kStainPackWashesBit = 1u << 31;
 constexpr uint32_t kStainChanceMax = 1000;
+
+// ---- absorption (MaterialGpu.stainPack bits 27..30) ------------------------
+// How much staining liquid a GROUND material soaks up before the liquid starts
+// to persist on top of it as a pool. Authored on the substrate:
+//
+//   "absorb": { "capacity": 12 }
+//
+// Capacity is measured in the same 0..15 units as a voxel's stain amount, so
+// "grass absorbs 12" literally means "grass accepts stain up to level 12".
+// Absent (or 0) = this material never absorbs, and a liquid touching it pools
+// immediately — which is every material that predates the feature, including
+// every kind of stone.
+//
+// Why it lives on the substrate and not on the liquid: the liquid's `amount` is
+// the per-contact STEP (how fast it soaks in), and capacity is the CEILING (how
+// much this ground can hold). Those are genuinely different axes — the same
+// rain soaks into sand quickly but shallowly, and into loam slowly but deeply —
+// and authoring the ceiling per material PAIR is the N x M explosion tags exist
+// to avoid.
+constexpr uint32_t kAbsorbCapacityMax = 15;
 
 // The stain palette lives at kStainPaletteBase in the material table — see
 // world.h, which holds it because the WGSL prelude is generated from that file.
@@ -170,6 +198,11 @@ struct MaterialDef {
   // {"type": ...}). Shared across materials: two liquids naming the same stain
   // get the same palette slot. Empty = this material does not stain.
   std::string stain;
+  // How much staining liquid this material soaks up before the liquid pools on
+  // top (materials.json "absorb": {"capacity": ...}), in the same 0..15 units
+  // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
+  // gpu.stainPack; kept unpacked here for the tuner and the wiki.
+  uint32_t absorbCapacity = 0;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

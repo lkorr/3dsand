@@ -22,15 +22,15 @@ class ChunkStore {
  public:
   struct Entry {
     IVec3 wc;
-    std::vector<uint16_t> rle;
+    std::vector<uint32_t> rle;
   };
   static constexpr int kRegionShift = 4;  // 16 chunks (256 voxels) per axis
   static constexpr size_t kMaxRamRegions = 64;
 
-  void Put(IVec3 wc, std::vector<uint16_t> rle);
+  void Put(IVec3 wc, std::vector<uint32_t> rle);
   // Pointer is valid only until the next Put/Get/Clear: either may LRU-spill
   // the region that owns it. Use immediately.
-  const std::vector<uint16_t>* Get(IVec3 wc);
+  const std::vector<uint32_t>* Get(IVec3 wc);
 
   // Forget everything in RAM and detach from any bound directory. Files are
   // left on disk untouched (a regen must not destroy the last explicit save;

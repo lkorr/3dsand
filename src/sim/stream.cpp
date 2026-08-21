@@ -15,22 +15,36 @@ constexpr size_t kEvictBatch = 256;   // staging bound: 4 MB per readback batch
 constexpr size_t kMaxPendingEvicts = 4;  // in-flight batches before we block
 }  // namespace
 
-void RleEncodeChunk(const uint32_t* words, std::vector<uint16_t>& out) {
+// The persisted word is 32-bit, not 16. It was 16 while the low half was the
+// only durable state, but the STAIN layer (bits 24..30) is written by a sim
+// kernel, is folded into the determinism hash by sim_occupancy, and therefore
+// has to survive a round trip: a 16-bit store silently dropped every stain on
+// save, so a saved-and-reloaded world hashed differently from the one saved.
+// That was invisible while blood was the only stainer (nothing in the selftest
+// world was stained at save time) and became a hard save/load failure the
+// moment worldgen ponds started wetting their banks.
+//
+// Only the STAMP byte (bits 16..23) is stripped, which is what the mask below
+// keeps out — it is per-tick scheduling scratch, not state, and is deliberately
+// excluded from the hash for the same reason.
+constexpr uint32_t kPersistMask = 0xFF00FFFFu;  // everything but the stamp byte
+
+void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out) {
   out.clear();
   uint32_t i = 0;
   while (i < kChunkVol) {
-    uint16_t w = (uint16_t)(words[i] & 0xFFFF);  // stamp byte stripped
+    uint32_t w = words[i] & kPersistMask;
     uint32_t run = 1;
-    while (i + run < kChunkVol && (uint16_t)(words[i + run] & 0xFFFF) == w &&
-           run < 0xFFFF)
+    while (i + run < kChunkVol && (words[i + run] & kPersistMask) == w &&
+           run < 0xFFFFFFFFu)
       run++;
-    out.push_back((uint16_t)run);
+    out.push_back(run);
     out.push_back(w);
     i += run;
   }
 }
 
-bool RleDecodeChunk(const uint16_t* rle, size_t pairs, uint32_t* out) {
+bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out) {
   uint32_t i = 0;
   for (size_t p = 0; p < pairs; p++) {
     uint32_t run = rle[p * 2];
@@ -191,7 +205,7 @@ void Stream::CompleteOldest(bool discard) {
           0, p.items.size() * kChunkBytes);
       if (ptr) {
         std::vector<uint32_t> data(kChunkVol);
-        std::vector<uint16_t> rle;
+        std::vector<uint32_t> rle;
         for (size_t i = 0; i < p.items.size(); i++) {
           std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
           RleEncodeChunk(data.data(), rle);
@@ -227,7 +241,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     // within the map latency): complete it so the store lookup sees it
     while (pendingChunks_.count(World::PackChunkKey(wc)))
       CompleteOldest(/*discard=*/false);
-    const std::vector<uint16_t>* rle = store_.Get(wc);
+    const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
       ctx_->queue.WriteBuffer(world_->voxels, (uint64_t)s * kChunkBytes,
                               data.data(), kChunkBytes);

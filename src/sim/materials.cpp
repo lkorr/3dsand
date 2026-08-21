@@ -150,10 +150,52 @@ static void ParseStain(const json& m, const std::string& path,
               "\": stain consume must be 0..1000 per-mille\n";
     consume = 0;
   }
-  d.gpu.stainPack = ((uint32_t)slot << kStainPackTypeShift) |
+  // "washes": this liquid RINSES foreign stains rather than replacing them with
+  // its own. Without it, water flowing over blood-soaked ground would relabel
+  // the blood as "wet" — the stain would change colour but never actually come
+  // out, which is not what washing looks like.
+  if (s.value("washes", false)) d.gpu.stainPack |= kStainPackWashesBit;
+
+  // Preserve any absorb capacity already parsed for this material: the two
+  // halves of stainPack are authored in separate JSON blocks and either may be
+  // read first, so neither may clobber the other's bits.
+  d.gpu.stainPack = (d.gpu.stainPack & ((kStainPackAbsorbMask << kStainPackAbsorbShift) |
+                                        kStainPackWashesBit)) |
+                    ((uint32_t)slot << kStainPackTypeShift) |
                     ((uint32_t)amount << kStainPackAmtShift) |
                     ((uint32_t)chance << kStainPackChanceShift) |
                     ((uint32_t)consume << kStainPackConsumeShift);
+}
+
+// Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
+// the SUBSTRATE (grass, sand, dirt) rather than on the liquid — see the absorb
+// note in materials.h for why the ceiling and the per-contact step are separate
+// axes. Absent = never absorbs, which is every material that predates this.
+static void ParseAbsorb(const json& m, const std::string& path, MaterialDef& d,
+                        std::string& errors) {
+  if (!m.contains("absorb")) return;
+  const json& a = m["absorb"];
+  if (!a.is_object()) {
+    errors += path + ": material \"" + d.name + "\": \"absorb\" must be an object\n";
+    return;
+  }
+  // A liquid soaking into another liquid is not absorption, it is mixing, and
+  // the stain rule deliberately refuses to stain liquids and gases at all
+  // (see doStaining). Authoring capacity on one would silently do nothing.
+  if (d.gpu.klass != CLASS_SOLID && d.gpu.klass != CLASS_POWDER) {
+    errors += path + ": material \"" + d.name +
+              "\": only solids and powders can absorb (class is not solid/powder)\n";
+    return;
+  }
+  int capacity = a.value("capacity", 0);
+  if (capacity < 0 || capacity > (int)kAbsorbCapacityMax) {
+    errors += path + ": material \"" + d.name + "\": absorb capacity must be 0.." +
+              std::to_string(kAbsorbCapacityMax) + "\n";
+    capacity = 0;
+  }
+  d.absorbCapacity = (uint32_t)capacity;
+  d.gpu.stainPack = (d.gpu.stainPack & ~(kStainPackAbsorbMask << kStainPackAbsorbShift)) |
+                    ((uint32_t)capacity << kStainPackAbsorbShift);
 }
 
 static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>& mats,
@@ -260,6 +302,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
         if (name.is_string() && !name.get<std::string>().empty())
           d.sounds[slot] = name.get<std::string>();
     ParseStain(m, path, stainReg, d, errors);
+    ParseAbsorb(m, path, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
       uint32_t bit = tagReg.MaskOf(t, true);

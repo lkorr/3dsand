@@ -466,17 +466,59 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
 // decisively subcritical: the reachable surface is finite, each cell's stain
 // is bounded by STAIN_AMT_MAX, and stain only ever increases.
 //
-// Returns true if SELF was destroyed (never — staining does not consume the
-// stainer), or more usefully: whether the caller should keep the cell awake.
-fn doStaining(c : vec3<i32>, m : Material, rnd : u32) -> bool {
+// ---- absorption and washing (DESIGN.md §6) ----------------------------------
+// Two behaviours layered on the rule above, both authored as data:
+//
+//   * ABSORPTION. A substrate declares `absorb: {capacity: N}` — how deep a
+//     stain it will hold. A staining liquid soaking into UNSATURATED ground
+//     SPENDS ITSELF doing it: one eighth of the source cell's fullness per
+//     successful contact. So a puddle on dry grass drains away into the grass,
+//     and only once the ground under it is saturated does the water stop
+//     vanishing and start to persist as a pool on top. That "spend a unit of
+//     mass" step is the whole feature — without it the puddle stains the ground
+//     and then sits there full forever, which is the current behaviour and is
+//     not absorption at all.
+//
+//     The capacity comes off the NEIGHBOUR (the ground), and the per-contact
+//     step off the STAINER (the liquid): how deep the ground can get wet is a
+//     property of the ground, how fast it soaks is a property of the liquid.
+//     Capacity 0 (every material that predates this, all stone) means the
+//     liquid never soaks in and pools immediately.
+//
+//   * WASHING. A liquid with `stain: {washes: true}` rinses a FOREIGN stain out
+//     instead of repainting it: the foreign amount is stepped DOWN toward 0, and
+//     only once it is gone does the washer's own stain start to build. This is
+//     water cleaning blood off the ground. Overwriting (the old behaviour) would
+//     have relabelled blood as "wet" at full strength — the colour would change
+//     but the mess would never actually come out.
+//
+// ---- SLEEP (rule 2) ----
+// Both additions preserve the termination argument, and that is the thing to
+// check when editing this. Every one of these is a monotone step toward a
+// bounded fixed point: stain rises only to min(capacity, addAmt); a washed
+// stain falls only to 0; absorbed fullness falls only to 0 (the cell dies).
+// Nothing here ever increases the work remaining, so `progress` goes false and
+// stays false, and a saturated puddle on saturated ground sleeps. A rule that
+// could both wet and dry the same cell would NOT terminate — that is exactly
+// the trap in the drying variant, and why saturation here is terminal.
+//
+// Returns whether the caller should keep the cell awake.
+fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
   let stainType = matStainType(m);
   let addAmt = matStainAmount(m);
+  let washes = matWashes(m);
   let stamp = stampFor(T.tick, P.substep);
 
   // Rotate the scan so the stained neighbour is not biased toward -Y. One roll
   // decides WHETHER we stain this tick; the rotation decides WHICH neighbour.
   let rot = rnd >> 7u;
   let fires = (rnd % 1000u) < matStainChance(m);
+
+  // This cell's own fullness, for the absorption debit below. Re-read rather
+  // than passed in: a reaction earlier this tick may have rewritten it.
+  let selfWord = voxels[idx];
+  let selfMat = voxMat(selfWord);
+  let selfIsLiquid = materials[selfMat].klass == CLASS_LIQUID;
 
   var progress = false;  // is there still unstained surface in reach?
   for (var i = 0u; i < 6u; i++) {
@@ -495,17 +537,92 @@ fn doStaining(c : vec3<i32>, m : Material, rnd : u32) -> bool {
 
     let cur = voxStainAmt(nw);
     let curType = voxStainType(nw);
-    // Already saturated with THIS stain: no work left here. A neighbour
-    // carrying a different stain is still work — the newer stain takes over.
-    if (curType == stainType && cur >= addAmt) { continue; }
+    // How deep this particular ground will take this stain. The liquid's own
+    // amount is still the ceiling, so `absorb` can only ever hold LESS than the
+    // liquid would otherwise apply — a material opts into being soakable, it
+    // cannot opt into being stained harder than the liquid stains.
+    let capacity = matAbsorbCapacity(materials[nmat]);
+    let ceiling = min(addAmt, max(capacity, 1u));
+
+    // Is there work left on this neighbour? A foreign stain is work for a
+    // washer (rinse it out) and for a non-washer alike (overwrite it, the
+    // pre-existing behaviour). Our own stain is work only while it sits under
+    // the ceiling this ground allows.
+    let foreign = cur != 0u && curType != stainType;
+    let canWash = washes && foreign;
+    let canStain = foreign || cur < ceiling;
+    if (!canWash && !canStain) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick
 
-    // Deepen an existing stain of the same type; overwrite a different one.
-    var amt = addAmt;
-    if (curType == stainType) { amt = min(cur + addAmt, STAIN_AMT_MAX); }
+    // ---- washing: step the foreign stain DOWN rather than repainting it ----
+    if (canWash) {
+      // Rinse ONE level per contact, not `addAmt` levels. Water authors a large
+      // amount (it wets ground to whatever depth the ground allows), and reusing
+      // that here would erase any stain in a single touch — blood would blink
+      // out the instant water reached it instead of visibly fading under the
+      // flow. One level per successful contact makes washing a process you can
+      // watch, and it still terminates: the amount only ever decreases.
+      //
+      // When it hits 0 the TYPE goes with it, so the cell reads as genuinely
+      // unstained rather than as "blood, amount 0" (voxStained() checks both
+      // halves, and a stale type would let the next blood contact resume from
+      // the old slot).
+      let washed = cur - 1u;
+      var washedType = curType;
+      if (washed == 0u) { washedType = 0u; }
+      voxels[ni] = (nw & ~STAIN_BITS) | packStain(washedType, washed);
+      markDirty(n);
+      markDirty(c);
+      break;
+    }
+
+    // ---- ordinary staining, now clamped by the substrate's capacity ----
+    // On ABSORBENT ground the stain climbs ONE level per contact, in lockstep
+    // with the eighth of liquid spent below, so the ground visibly darkens as
+    // it drinks and the depth reached is paid for in real mass. Jumping
+    // straight to the ceiling would soak grass to full for one eighth of water,
+    // which is both free mass and an instant, un-watchable transition.
+    //
+    // On NON-absorbent ground (capacity 0, all stone) nothing is spent, so
+    // there is no rate to keep in step with and the original behaviour stands:
+    // the stainer applies its full amount at once. That is what keeps blood on
+    // stone looking exactly as it did before this feature.
+    var amt = ceiling;
+    if (capacity > 0u) {
+      amt = min(cur + 1u, ceiling);
+      if (curType != stainType) { amt = 1u; }  // foreign stain: start over at 1
+    } else if (curType == stainType) {
+      amt = min(cur + addAmt, ceiling);
+    }
     voxels[ni] = (nw & ~STAIN_BITS) | packStain(stainType, amt);
     markDirty(n);
+
+    // ---- absorption: the liquid SPENDS itself soaking in ----
+    // Only when the ground actually declared a capacity, and only for a liquid
+    // that has mass to give. One eighth per contact, and the cell dies when it
+    // gives its last — mass-conserving in the same units stepLiquid speaks.
+    //
+    // This writes SELF, which the stain rule otherwise never does. It is safe
+    // for the same reason the neighbour write is: reach is still <= 1 cell, so
+    // the colour lattice still guarantees no other thread touches either cell
+    // this pass. The stamp is set so the movement code below cannot ALSO move
+    // this cell in the same substep and double-spend the eighth.
+    //
+    // `amt > cur` is the load-bearing test, not a redundant one: it charges the
+    // liquid ONLY for a contact that actually deepened the stain. Saturated
+    // ground never gets here (canStain is false, so the loop skipped it), but
+    // stating the invariant locally is what stops a future edit to the ceiling
+    // logic from silently turning this into a puddle that drains into ground
+    // it is no longer wetting — water disappearing for free.
+    if (capacity > 0u && selfIsLiquid && amt > cur) {
+      let sf = voxState(selfWord) + 1u;  // fullness 1..8
+      if (sf <= 1u) {
+        voxels[idx] = 0u;                // last eighth soaked in — gone
+      } else {
+        voxels[idx] = packVoxKeepStain(selfMat, sf - 2u, stamp, selfWord);
+      }
+    }
 
     // Consumption: the stain eats the voxel it just marked. Rolled from a
     // DIFFERENT slice of the hash than the stain roll, so the two are
@@ -669,7 +786,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // Keeps the chunk awake only while unstained surface remains in reach — see
   // the sleep note on doStaining.
   if (P.substep == 0u && matStains(m)) {
-    if (doStaining(c, m, rnd)) { markDirty(c); }
+    if (doStaining(c, idx, m, rnd)) { markDirty(c); }
+    // Absorption can have emptied this cell (the liquid soaked away) or docked
+    // its fullness and stamped it. Re-read before the movement code below acts
+    // on a stale word: moving an already-spent eighth would create mass.
+    let after = voxels[idx];
+    if (voxMat(after) == MAT_AIR) { return; }
+    if (voxStamp(after) == stampFor(T.tick, P.substep)) { return; }
   }
 
   if (m.klass == CLASS_SOLID) { return; }

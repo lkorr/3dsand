@@ -41,6 +41,9 @@
       "id": "sand",
       "footstep": "path",
       "class": "powder",
+      "absorb": {
+        "capacity": 6
+      },
       "density": 1600,
       "hardness": 12,
       "colors": [
@@ -89,6 +92,15 @@
         "extinguisher",
         "conductive"
       ],
+      "comment": "Water darkens what it soaks rather than tinting it, so the stain colour is a desaturated near-grey: a wet patch should read as the same ground, wetter. amount 15 is the CEILING water would apply on its own; how deep any given ground actually gets is that ground's absorb capacity, which is always the smaller of the two. washes lets running water rinse blood out instead of relabelling it as wet.",
+      "stain": {
+        "type": "wet",
+        "color": "#6d6f73",
+        "amount": 15,
+        "chance": 260,
+        "consume": 0,
+        "washes": true
+      },
       "molten": "steam"
     },
     {
@@ -170,6 +182,9 @@
       "id": "ash",
       "footstep": "path",
       "class": "powder",
+      "absorb": {
+        "capacity": 14
+      },
       "density": 700,
       "hardness": 8,
       "colors": [
@@ -252,6 +267,9 @@
       "id": "dirt",
       "footstep": "path",
       "class": "powder",
+      "absorb": {
+        "capacity": 10
+      },
       "density": 1500,
       "hardness": 14,
       "colors": [
@@ -535,6 +553,9 @@
       "class": "solid",
       "density": 420,
       "hardness": 8,
+      "absorb": {
+        "capacity": 12
+      },
       "rubble": "dirt",
       "colors": [
         "#4e9b3a",

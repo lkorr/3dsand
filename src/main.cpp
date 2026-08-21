@@ -1479,7 +1479,17 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       if (type == 0 && amt == 0) continue;
       // A stain must have both halves, name a registered type, fit the field,
       // and sit on actual matter.
-      if (type != stainType || amt == 0 || amt > kStainAmtMax ||
+      //
+      // This deliberately does NOT demand `type == stainType`. It once did,
+      // back when blood was the only staining material in the game, so "any
+      // stain anywhere in the world" and "a blood stain" were the same set.
+      // Water now wets absorbent ground, and worldgen paints ponds on grass and
+      // sand by the thousand, so a world-wide scan legitimately sees tens of
+      // thousands of "wet" stains. Asserting they were blood reported them as
+      // malformed packing — a broken test, not a broken sim. What is actually
+      // invariant is that every stain is WELL-FORMED; the blood-specific
+      // assertion is `stainedFloor` above, which looks only at the test's floor.
+      if (type > kStainTypeMax || amt == 0 || amt > kStainAmtMax ||
           (w & 0xFFFu) == 0u) {
         badStain++;
       }
@@ -3904,15 +3914,15 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     const size_t kRegions = ChunkStore::kMaxRamRegions + 16;
     for (size_t i = 0; i < kRegions; i++) {
       // one chunk per region: a full-chunk run of a per-region material
-      std::vector<uint16_t> rle = {(uint16_t)kChunkVol,
-                                   (uint16_t)(kMatStone + (i % 3))};
+      std::vector<uint32_t> rle = {(uint32_t)kChunkVol,
+                                   (uint32_t)(kMatStone + (i % 3))};
       cs.Put({(int)i * 16, 0, 0}, std::move(rle));
     }
     size_t ramAfterPuts = cs.Count();
     for (size_t i = 0; i < kRegions && storeOk; i++) {
-      const std::vector<uint16_t>* rle = cs.Get({(int)i * 16, 0, 0});
-      storeOk = rle && rle->size() == 2 && (*rle)[0] == (uint16_t)kChunkVol &&
-                (*rle)[1] == (uint16_t)(kMatStone + (i % 3));
+      const std::vector<uint32_t>* rle = cs.Get({(int)i * 16, 0, 0});
+      storeOk = rle && rle->size() == 2 && (*rle)[0] == (uint32_t)kChunkVol &&
+                (*rle)[1] == (uint32_t)(kMatStone + (i % 3));
     }
     storeOk = storeOk && ramAfterPuts <= ChunkStore::kMaxRamRegions;
     std::printf("region store: %s (%zu regions written, %zu chunks in RAM "
