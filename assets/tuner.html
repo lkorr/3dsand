@@ -297,6 +297,116 @@
   #splash .big{font-size:15px;color:var(--fg)}
   kbd{background:var(--card2);border:1px solid var(--line2);border-radius:4px;padding:1px 6px;font-family:var(--mono);font-size:12px}
 
+  /* ---------- engine ---------- */
+  .eng-bar{
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+    padding:10px 14px;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;margin-bottom:14px;
+  }
+  .eng-bar .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none;transition:background .2s}
+  .eng-bar.live .dot{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .eng-bar .lbl{font:12px/1 var(--mono);color:var(--dim)}
+  .eng-bar .spacer{flex:1}
+  .eng-bar input[type=text]{
+    font:12px/1 var(--mono);color:var(--fg);background:var(--bg);
+    border:1px solid var(--line);border-radius:6px;padding:7px 10px;width:190px;
+  }
+  .eng-wrap{max-width:1080px}
+  .eng-wrap h2{
+    margin:32px 0 4px;font-size:13px;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--faint);font-weight:600;
+  }
+  .eng-wrap .note{color:var(--dim);font-size:14px;margin:0 0 18px;max-width:70ch}
+  .eng-stage{
+    border:1px solid var(--line);border-radius:10px;background:var(--card);
+    margin-bottom:10px;overflow:hidden;
+  }
+  .eng-stage>summary{
+    list-style:none;cursor:pointer;padding:14px 18px;display:flex;
+    align-items:center;gap:14px;user-select:none;
+  }
+  .eng-stage>summary::-webkit-details-marker{display:none}
+  .eng-stage>summary:hover{background:var(--card2)}
+  .eng-caret{color:var(--faint);font:11px/1 var(--mono);width:10px;flex:none;transition:transform .18s}
+  .eng-stage[open] .eng-caret{transform:rotate(90deg)}
+  .eng-tag{
+    font:10px/1 var(--mono);padding:4px 7px;border-radius:4px;flex:none;
+    text-transform:uppercase;letter-spacing:.06em;font-weight:600;
+  }
+  .eng-t-gpu{background:rgba(76,154,255,.14);color:#4c9aff}
+  .eng-t-cpu{background:rgba(242,166,90,.14);color:#f2a65a}
+  .eng-t-xfer{background:rgba(199,146,234,.14);color:#c792ea}
+  .eng-t-render{background:rgba(94,211,165,.14);color:#5ed3a5}
+  .eng-t-inv{background:rgba(242,111,107,.14);color:#f2726f}
+  .eng-sname{font-weight:600;flex:none}
+  .eng-sdesc{color:var(--dim);font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .eng-cost{
+    font:12px/1 var(--mono);color:var(--faint);flex:none;
+    padding:4px 8px;border:1px solid var(--line);border-radius:4px;
+  }
+  .eng-cost.live{color:var(--green);border-color:rgba(124,240,58,.4)}
+  .eng-body{padding:2px 18px 20px 42px;border-top:1px solid var(--line)}
+  .eng-body p{margin:14px 0;color:var(--dim);max-width:74ch}
+  .eng-body p strong{color:var(--fg);font-weight:600}
+  .eng-body h4{margin:20px 0 6px;font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint)}
+  .eng-body ul{margin:10px 0;padding-left:20px;color:var(--dim);max-width:74ch}
+  .eng-body li{margin:5px 0}
+  .eng-body code{font:12.5px/1.4 var(--mono);background:var(--bg);padding:2px 5px;border-radius:3px;color:#a9c7ff}
+  .eng-body pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:12px/1.6 var(--mono);color:var(--dim)}
+  .eng-body table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}
+  .eng-body th,.eng-body td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+  .eng-body th{color:var(--faint);font:11px/1 var(--mono);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+  .eng-body td{color:var(--dim)}
+  .eng-body td:first-child{color:var(--fg);font-family:var(--mono);font-size:12px}
+  .eng-limit{border-left:2px solid #f2726f;padding:2px 0 2px 14px;margin:14px 0}
+  .eng-limit b{color:#f2726f;font-size:11px;letter-spacing:.07em;text-transform:uppercase;display:block;margin-bottom:3px}
+  .eng-limit p{margin:0}
+  .eng-spark{display:none;width:100%;height:44px;margin-top:14px;background:var(--bg);border:1px solid var(--line);border-radius:6px}
+  .eng-live .eng-spark{display:block}
+  .eng-flow{
+    display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+    margin:14px 0 26px;font:11px/1 var(--mono);color:var(--faint);
+  }
+  .eng-flow span{padding:5px 9px;border:1px solid var(--line);border-radius:5px;background:var(--card)}
+  .eng-flow i{font-style:normal;color:var(--line)}
+  .eng-meta{display:flex;gap:20px;flex-wrap:wrap;font:12px/1 var(--mono);color:var(--faint);margin-top:12px}
+  .eng-meta b{color:#4c9aff;font-weight:600}
+  /* event log */
+  .eng-log-panel{
+    border:1px solid var(--line);border-radius:8px;background:var(--card);
+    margin-top:14px;overflow:hidden;
+  }
+  .eng-log-hdr{
+    display:flex;align-items:center;gap:10px;padding:10px 14px;
+    border-bottom:1px solid var(--line);
+  }
+  .eng-log-hdr h3{margin:0;font-size:13px;font-weight:600;color:var(--fg)}
+  .eng-log-body{
+    max-height:400px;overflow-y:auto;font:12px/1.6 var(--mono);color:var(--dim);
+    padding:0;
+  }
+  .eng-log-body .row{
+    display:flex;gap:12px;padding:4px 14px;border-bottom:1px solid #1a2029;
+  }
+  .eng-log-body .row:hover{background:#1a2029}
+  .eng-log-body .row .tick{color:var(--faint);min-width:56px;text-align:right}
+  .eng-log-body .row .stage{min-width:80px;font-weight:600}
+  .eng-log-body .row .val{color:var(--fg)}
+  .eng-log-body .row .slow{color:#f2726f}
+  .eng-log-body .empty{color:var(--faint);padding:24px 14px;text-align:center}
+  .eng-filter-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  .eng-filter-row label{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:4px;cursor:pointer}
+  .eng-filter-row label input{accent-color:var(--acc)}
+  .eng-thresholds{
+    display:flex;gap:14px;flex-wrap:wrap;align-items:center;
+    padding:10px 14px;border-bottom:1px solid var(--line);font-size:12px;color:var(--dim);
+  }
+  .eng-thresholds label{display:flex;align-items:center;gap:5px}
+  .eng-thresholds input[type=number]{
+    width:60px;background:var(--bg);border:1px solid var(--line);border-radius:4px;
+    color:var(--fg);padding:3px 6px;font:12px var(--mono);text-align:right;
+  }
+
   /* ---------- tuning ---------- */
   nav.tabs .tabsep{width:1px;background:var(--line);margin:6px 8px}
   .applybar{
@@ -995,6 +1105,7 @@
   <span class="tabsep"></span>
   <button data-tab="wiki">Wiki</button>
   <button data-tab="notes">Notes</button>
+  <button data-tab="engine">Engine</button>
 </nav>
 
 <main>
@@ -1170,6 +1281,9 @@
       <div class="notesbody" id="notesBody"></div>
     </div>
   </section>
+
+  <!-- ENGINE — architecture reference + live telemetry + event log -->
+  <section class="view" id="view-engine"></section>
 </main>
 
 <div id="valbar">
@@ -1574,7 +1688,7 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
     // wiki and notes render with whatever is loaded, including nothing.
-    if((mat&&rx)||['tuning','models','wiki','notes'].includes(activeTab))renderAll();
+    if((mat&&rx)||['tuning','models','wiki','notes','engine'].includes(activeTab))renderAll();
   });
 });
 function gotoReactions(filter){
@@ -3268,6 +3382,7 @@ function renderAll(){
   // it renders with nothing else loaded — a sound set is worth auditioning
   // before any material names it.
   if(activeTab==='audio'){renderAudio();return;}
+  if(activeTab==='engine'){renderEngine();return;}
   if(!mat||!rx)return;
   if(activeTab==='overview')renderOverview();
   else if(activeTab==='materials')renderMaterials();
@@ -5865,6 +5980,553 @@ document.addEventListener('keydown',e=>{
     e.preventDefault();e.stopImmediatePropagation();modelsApi.saveFromHost();
   }
 },true);
+
+/* ================= ENGINE TAB ================= */
+// Architecture reference (from docs/engine.html) + live telemetry + event log.
+// The tab is independent of every JSON file — it renders with nothing loaded.
+(function(){
+'use strict';
+
+const ENG_STAGES=[
+  {key:'stream',tag:'xfer',label:'Toroidal streaming',
+   desc:'Residency window follows the player — evict, load, or generate one plane at a time',
+   cost:'≤1 shift/axis',
+   body:`<p>
+     The 256³ cube in GPU memory is a <strong>window</strong>, not the world.
+     World coordinates are unbounded signed integers; world chunk <code>c</code>
+     lives in slot <code>c mod 16</code> per axis — a bitmask, since every size
+     is a power of two, correct for negative coordinates too. The buffer never
+     shifts in memory: moving the window recycles the trailing plane of slots in
+     place.
+   </p>
+   <h4>One shift (per axis, per tick, with 2-chunk hysteresis)</h4>
+   <ol style="color:var(--dim);max-width:74ch;padding-left:20px">
+     <li>The leaving 16×16 chunk plane is read back synchronously —
+       save-worthy chunks only.</li>
+     <li>Each saved chunk is RLE-compressed into the <code>ChunkStore</code>.</li>
+     <li>The recycled slots refill: store hits upload directly; misses are
+       generated on the GPU (<code>worldgen.wgsl</code>).</li>
+   </ol>
+   <p>Procgen is a <strong>pure function of world coordinates + seed</strong>
+     — infinite hills, two cave bands, lava on deep cavern floors, sparse ruin POIs.</p>
+   <div class="eng-limit"><b>Limits</b><p>
+     Eviction readback is synchronous per shift. View distance is bounded by
+     the window: terrain pops in as you move. Bodies that exit the window despawn.
+   </p></div>`},
+
+  {key:'mutate',tag:'gpu',label:'MutationQueue',
+   desc:'All world writes — brush, explosions, island removal',
+   cost:'≤64 ops',
+   body:`<p>
+     Every write to the world enters through this queue and lands via
+     <code>sim_mutate.wgsl</code>. Nothing else writes voxel memory.
+     <strong>This is the most important architectural rule in the engine</strong> —
+     the op stream is simultaneously the save format, the replay log, and the
+     network replication stream.
+   </p>
+   <h4>Two op kinds</h4>
+   <table>
+     <tr><th>Op</th><th>Size</th><th>Cap / tick</th><th>Dispatch</th></tr>
+     <tr><td>BrushOp</td><td>32 B</td><td>64</td><td>(4×ops, 4, 4) wg of 4³</td></tr>
+     <tr><td>CellOp</td><td>8 B</td><td>65,536</td><td>(ops+63)/64 wg of 64</td></tr>
+   </table>
+   <div class="eng-limit"><b>Limits</b><p>
+     Caps are per tick. Brush dispatch is sized for a 16³ box, so radius above 8 clips.
+   </p></div>`},
+
+  {key:'explode',tag:'gpu',label:'Explosions',
+   desc:'Ray-cast destruction, hardness budget, particle ejection',
+   cost:'≤8 / tick',
+   body:`<p>
+     Two kernels, mark then apply. Rays cast from the blast center to every
+     voxel on the blast sphere's surface, DDA-traversing outward and spending a
+     hardness budget. A fraction of removed voxels eject as particles.
+   </p>
+   <p>Key scaling: ray count grows as <strong>O(r²)</strong> while destroyed
+     volume grows as O(r³). ~170k threads per explosion per tick.</p>
+   <div class="eng-limit"><b>Limits</b><p>
+     Radius hard-capped at 20 voxels (<code>kMaxExplosionRadius</code>).
+     Cost is paid for the full bounding box regardless of actual radius.
+   </p></div>`},
+
+  {key:'compact',tag:'gpu',label:'Dirty compaction',
+   desc:'Scans 4096 chunk flags into a dense list + indirect args',
+   cost:'64 wg',
+   body:`<p>
+     The stage that makes the whole engine scale. It scans per-chunk dirty
+     flags and compacts them into a dense index list. The 54 CA passes then
+     dispatch <em>exactly one workgroup per dirty chunk</em> — a settled world
+     dispatches nothing.
+   </p>
+   <h4>Computation</h4>
+   <p><code>4096 / 64 = 64 workgroups</code> of 64 threads = 4,096 threads.
+     Fixed cost every tick — negligible.</p>
+   <h4>Determinism note</h4>
+   <p>List order is scheduling-dependent (<code>atomicAdd</code> append), but safe
+     because the color scheme makes all same-pass writes disjoint.</p>`},
+
+  {key:'ca',tag:'gpu',label:'Cellular automaton — 54 passes',
+   desc:'27 color phases × 2 gravity substeps; movement + reactions',
+   cost:'54 × dirty',
+   body:`<p>
+     The core simulation. Each tick runs <strong>27 color phases × 2 gravity
+     substeps = 54 indirect dispatches</strong>, each processing one workgroup
+     of 6³ threads per dirty chunk.
+   </p>
+   <h4>Why 27 passes</h4>
+   <p>A <strong>3×3×3 cell-coloring lattice</strong>. Pass <em>k</em> updates
+     only cells where <code>(x%3, y%3, z%3)</code> equals color <em>k</em>.
+     Same-color cells are ≥3 apart on every axis, so writes are provably disjoint —
+     race-free and bit-deterministic with no atomics on voxel data.</p>
+   <h4>Computation</h4>
+   <pre>54 dispatches × dirty_chunks workgroups × 216 threads
+settled  (4 dirty):        ~46,700 thread-launches
+moderate (200 dirty):     ~2.3M
+heavy    (2000 dirty):    ~23.3M
+all      (4096 dirty):    ~47.8M</pre>
+   <h4>What each cell does</h4>
+   <ul>
+     <li><strong>Stamp check</strong> — prevents a voxel that already moved from acting again.</li>
+     <li><strong>Reactions</strong> (substep 0 only) — pair, decay, emit rules with tag matching.</li>
+     <li><strong>Movement</strong> — powder falls + 4 down-diagonals; liquids add laterals + equalization; gases invert.</li>
+     <li><strong>Density displacement</strong> — a mover entering a lighter fluid swaps with it.</li>
+   </ul>
+   <div class="eng-limit"><b>Limits</b><p>
+     Write reach must stay ≤1 cell. Everything influencing voxel state must be integer.
+     Reaction growth must be decisively subcritical.
+   </p></div>`},
+
+  {key:'particles',tag:'gpu',label:'Particle system',
+   desc:'Ballistic voxels in flight, DDA collision, claim-based reinsertion',
+   cost:'≤262,144',
+   body:`<p>
+     When a voxel should fly — splash, explosion ejecta, displacement — it leaves
+     the grid and joins a GPU particle buffer. Positions are 24.8 fixed-point.
+     Sub-voxel integration at ≤ half-voxel intervals prevents tunneling.
+   </p>
+   <h4>Deterministic conflict resolution</h4>
+   <p><code>atomicMax</code> of a priority value into a claim hash — order-independent,
+     so bit-determinism is preserved.</p>
+   <h4>Computation</h4>
+   <pre>capacity   262,144 particles (32 B each = 8 MB × 2 pages)
+claim hash 262,144 u32 (1 MB)
+at cap     ~524k thread-launches/tick</pre>`},
+
+  {key:'occupancy',tag:'gpu',label:'Occupancy + pick',
+   desc:'Per-chunk emptiness flags for render skipping; cursor raycast',
+   cost:'dirty-only',
+   body:`<p>
+     Recomputes per-chunk occupancy — whether a chunk holds any voxels — used
+     by the renderer for empty-space skipping and the CPU for collision routing.
+     Runs over the <em>compacted next-tick dirty list</em>, not all 4,096 chunks.
+   </p>
+   <p><code>sim_pick.wgsl</code> rides along as a single-thread dispatch for brush preview.</p>`},
+
+  {key:'readback',tag:'xfer',label:'Async readback',
+   desc:'3-slot ring, one tick latent — the CPU’s window into GPU state',
+   cost:'≤1 MB/tick',
+   body:`<p>
+     A <strong>3-slot ring buffer with <code>mapAsync</code></strong>,
+     deliberately one tick latent. At 30 Hz, one tick of latency is imperceptible.
+   </p>
+   <h4>What crosses the bus each tick</h4>
+   <table>
+     <tr><th>Payload</th><th>Size</th><th>Consumer</th></tr>
+     <tr><td>3×3×3 chunk mirror</td><td>432 KB</td><td>Player collision</td></tr>
+     <tr><td>On-demand fetches</td><td>≤64 chunks</td><td>Islands, terrain meshing</td></tr>
+     <tr><td>Dirty flags</td><td>4 KB</td><td>Mesh invalidation</td></tr>
+     <tr><td>Hash + counts</td><td>&lt;64 B</td><td>Determinism check, HUD</td></tr>
+   </table>`},
+
+  {key:'physics',tag:'cpu',label:'Islands, debris, and Jolt',
+   desc:'Bounded flood fill → marching cubes → rigidbodies',
+   cost:'≤200 bodies',
+   body:`<p>
+     Destroying support must let disconnected terrain fall. CA rules only see
+     immediate neighbors, so connectivity needs an explicit pass.
+   </p>
+   <h4>Pipeline</h4>
+   <ol style="color:var(--dim);max-width:74ch;padding-left:20px">
+     <li>Destruction/support-loss event registers an expanded voxel box.</li>
+     <li>Region fetched through the readback ring.</li>
+     <li><strong>Bounded 6-connected flood fill</strong> (~32k voxel limit).</li>
+     <li>Islands leave the grid via exact-cell ops and become Jolt bodies.</li>
+     <li>Islands under 8 voxels crumble to their powder form.</li>
+   </ol>
+   <p>Jolt handles ≤200 debris bodies and static terrain patches.
+     Built with <code>CROSS_PLATFORM_DETERMINISTIC</code>, keeping lockstep viable.</p>`},
+
+  {key:'render',tag:'render',label:'Raymarched rendering',
+   desc:'DDA through the voxel grid — no meshing, reads sim buffers directly',
+   cost:'2.66 ms @1080p',
+   body:`<p>
+     Terrain geometry changes every tick, so a fullscreen pass raymarches the
+     voxel grid directly, DDA-stepping through chunks and using occupancy flags
+     for empty-space skipping. The sim already lives in GPU memory, so the renderer
+     reads it at zero upload cost.
+   </p>
+   <h4>Passes</h4>
+   <ul>
+     <li><strong>raymarch</strong> — fullscreen terrain; primary ray + sun shadow ray.</li>
+     <li><strong>particleDraw</strong> — instanced cubes, indirect off GPU count.</li>
+     <li><strong>spriteDraw</strong> — CPU-authored markers, ≤64.</li>
+     <li><strong>bodyDraw</strong> — debris voxel instances transformed by body quaternion.</li>
+   </ul>
+   <h4>Measured cost (RTX 3060 Ti, 1080p)</h4>
+   <table>
+     <tr><th>Config</th><th>Frame</th><th>FPS</th></tr>
+     <tr><td>shadows on</td><td>2.66 ms</td><td>376</td></tr>
+     <tr><td>shadows off</td><td>1.41 ms</td><td>709</td></tr>
+   </table>
+   <div class="eng-limit"><b>Limits</b><p>
+     Cost scales with screen pixels and traversal depth, not activity.
+     No LOD: distant geometry costs the same per-step as near geometry.
+   </p></div>`}
+];
+
+const ENG_INVARIANTS=[
+  {key:'determinism',tag:'inv',label:'Bit-determinism',
+   desc:'Same seed + tick + inputs → same hash, on every GPU',
+   cost:'hash 3dbdf3c1',
+   body:`<ul>
+     <li><strong>Integer-only sim math.</strong> No float may influence voxel state.</li>
+     <li><strong>Stateless counter RNG</strong> — <code>hash3(seed, tick, idx)</code>.</li>
+     <li><strong>No scheduling-dependent outcomes.</strong> No CAS claims, no subgroup ops.</li>
+     <li><strong>Write reach ≤1 cell.</strong></li>
+   </ul>
+   <p>Verified by <code>--selftest</code>: runs the sim twice and compares hashes
+     over 200 ticks including explosions and particles.</p>
+   <div class="eng-limit"><b>Open risk</b><p>
+     Determinism verified on one vendor only (RTX 3060 Ti). Cross-vendor
+     validation — DESIGN.md risk #3 — remains open.
+   </p></div>`},
+
+  {key:'sleep',tag:'inv',label:'Sleeping',
+   desc:'Cost scales with activity, not world size',
+   cost:'4 / 4096 settled',
+   body:`<p>
+     "Sleeping is the product." A settled 256³ residency window simulates
+     <strong>4 chunks</strong> — 0.1% of what's resident.
+   </p>
+   <h4>Mechanism</h4>
+   <p>Anything that changes marks its chunk dirty. A chunk with no movement and
+     no active reactions clears its flag and sleeps.</p>
+   <div class="eng-limit"><b>The subcritical-growth trap</b><p>
+     Any reaction with ≥1 offspring/tick grows unbounded, so its chunks never sleep.
+     The selftest guards this: settled world must hold under 32 active chunks.
+   </p></div>`}
+];
+
+const ENG_BASELINE=[
+  ['determinism','PASS','hash 3dbdf3c1 over 200 ticks'],
+  ['sim (active)','0.25 ms/tick','brushes + explosions + particles'],
+  ['sim (settled)','0.746 ms/tick','includes full-world hash scan'],
+  ['sleep','4 / 4096','after 600 settle ticks, 0 particles'],
+  ['render (shadows)','2.66 ms','376 fps @1080p'],
+  ['render (no shadows)','1.41 ms','709 fps @1080p'],
+  ['tick budget','33.3 ms','30 Hz — sim uses ~0.8%'],
+];
+
+let engSock=null,engDemoTimer=null,engLive=false;
+let engHistory={};
+const ENG_HIST=120;
+let engChips={};
+let engLogEntries=[];
+const ENG_LOG_MAX=500;
+let engLogEnabled=true;
+let engLogPaused=false;
+let engLogStageFilters={};
+let engThresholdMs=1.0;
+
+function engFmt(ms){return ms.toFixed(2)+' ms';}
+
+function engSparkFor(stage){
+  const body=document.querySelector('#view-engine [data-eng-stage="'+stage+'"] .eng-body');
+  if(!body)return null;
+  let c=body.querySelector('.eng-spark');
+  if(!c){
+    c=document.createElement('canvas');
+    c.className='eng-spark';
+    body.appendChild(c);
+  }
+  return c;
+}
+
+function engDrawSpark(stage){
+  const c=engSparkFor(stage),data=engHistory[stage];
+  if(!c||!data||!data.length)return;
+  const w=c.clientWidth,h=c.clientHeight,dpr=window.devicePixelRatio||1;
+  if(c.width!==w*dpr||c.height!==h*dpr){c.width=w*dpr;c.height=h*dpr;}
+  const g=c.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  const max=Math.max(...data)||1;
+  const pad=4,iw=w-pad*2,ih=h-pad*2;
+  const step=iw/Math.max(ENG_HIST-1,1);
+  g.beginPath();g.moveTo(pad,h-pad);
+  data.forEach((v,i)=>g.lineTo(pad+i*step,h-pad-(v/max)*ih));
+  g.lineTo(pad+(data.length-1)*step,h-pad);g.closePath();
+  g.fillStyle='rgba(124,240,58,.12)';g.fill();
+  g.beginPath();
+  data.forEach((v,i)=>{const x=pad+i*step,y=h-pad-(v/max)*ih;i?g.lineTo(x,y):g.moveTo(x,y);});
+  g.strokeStyle='#7cf03a';g.lineWidth=1.5;g.stroke();
+  g.fillStyle='#6b7888';g.font='10px ui-monospace, monospace';
+  g.fillText('peak '+max.toFixed(2)+' ms',pad+2,pad+9);
+}
+
+function engApplySample(msg){
+  if(!msg||!msg.stages)return;
+  for(const[stage,s]of Object.entries(msg.stages)){
+    if(typeof s.ms!=='number')continue;
+    const chip=engChips[stage];
+    if(chip){chip.el.textContent=engFmt(s.ms);chip.el.classList.add('live');}
+    (engHistory[stage]=engHistory[stage]||[]).push(s.ms);
+    if(engHistory[stage].length>ENG_HIST)engHistory[stage].shift();
+    engDrawSpark(stage);
+    if(engLogEnabled&&!engLogPaused&&(engLogStageFilters[stage]!==false)){
+      const slow=s.ms>=engThresholdMs;
+      if(slow||!document.getElementById('engOnlySlow')?.checked){
+        engLogEntries.push({tick:msg.tick,stage,ms:s.ms,slow,extra:s});
+        if(engLogEntries.length>ENG_LOG_MAX)engLogEntries.splice(0,engLogEntries.length-ENG_LOG_MAX);
+      }
+    }
+  }
+  const t=document.getElementById('eng-status');
+  if(t&&typeof msg.tick==='number')t.textContent='live — tick '+msg.tick;
+  engRenderLog();
+}
+
+function engSetLive(on,label){
+  engLive=on;
+  const wrap=document.getElementById('view-engine');
+  if(!wrap)return;
+  wrap.classList.toggle('eng-live',on);
+  const bar=wrap.querySelector('.eng-bar');
+  if(bar)bar.classList.toggle('live',on);
+  const t=document.getElementById('eng-status');
+  if(t)t.textContent=label;
+  if(!on){
+    for(const[k,c]of Object.entries(engChips)){
+      c.el.textContent=c.base;c.el.classList.remove('live');
+    }
+  }
+}
+
+function engStopDemo(){
+  if(engDemoTimer){clearInterval(engDemoTimer);engDemoTimer=null;}
+  const btn=document.getElementById('eng-demo');
+  if(btn)btn.textContent='demo data';
+}
+
+function engConnect(){
+  if(engSock){engSock.close();return;}
+  engStopDemo();
+  const urlEl=document.getElementById('eng-url');
+  if(!urlEl)return;
+  const url=urlEl.value.trim();
+  const btn=document.getElementById('eng-connect');
+  try{engSock=new WebSocket(url);}catch(e){
+    engSetLive(false,'bad URL: '+e.message);return;
+  }
+  engSetLive(false,'connecting to '+url+'…');
+  if(btn)btn.textContent='disconnect';
+  engSock.onopen=()=>engSetLive(true,'live — waiting for first tick');
+  engSock.onmessage=ev=>{try{engApplySample(JSON.parse(ev.data));}catch(e){}};
+  engSock.onerror=()=>engSetLive(false,'connection error — is the sim running with --telemetry?');
+  engSock.onclose=()=>{
+    engSock=null;
+    if(btn)btn.textContent='connect';
+    engSetLive(false,'telemetry offline — showing static reference values');
+  };
+}
+
+function engStartDemo(){
+  if(engDemoTimer){engStopDemo();engSetLive(false,'telemetry offline — showing static reference values');return;}
+  if(engSock)engSock.close();
+  const btn=document.getElementById('eng-demo');
+  if(btn)btn.textContent='stop demo';
+  engSetLive(true,'demo data — synthetic values, not measured');
+  let tick=0,burst=0;
+  engDemoTimer=setInterval(()=>{
+    tick++;
+    if(burst<=0&&Math.random()<0.04)burst=20+Math.random()*30;
+    const a=burst>0?(burst--/50):0;
+    const jit=(b,s)=>Math.max(0.01,b+(Math.random()-0.5)*s);
+    engApplySample({tick,stages:{
+      stream:{ms:jit(0.05+a*0.1,0.02)},
+      mutate:{ms:jit(0.02+a*0.05,0.01)},
+      explode:{ms:jit(a*0.35,0.02)},
+      compact:{ms:jit(0.03,0.01)},
+      ca:{ms:jit(0.18+a*1.4,0.06)},
+      particles:{ms:jit(a*0.9,0.05)},
+      occupancy:{ms:jit(0.04+a*0.08,0.01)},
+      readback:{ms:jit(0.06,0.02)},
+      physics:{ms:jit(0.1+a*0.7,0.05)},
+      render:{ms:jit(2.66+a*0.8,0.25)}
+    }});
+  },1000/30);
+}
+
+function engRenderLog(){
+  const body=document.getElementById('engLogBody');
+  if(!body||activeTab!=='engine')return;
+  const visible=engLogEntries.filter(e=>engLogStageFilters[e.stage]!==false);
+  if(!visible.length){
+    body.innerHTML='<div class="empty">No events logged yet. Connect to the running sim or start demo data.</div>';
+    return;
+  }
+  const last=visible.slice(-100);
+  body.innerHTML=last.map(e=>
+    `<div class="row"><span class="tick">${e.tick}</span>`+
+    `<span class="stage" style="color:var(--${engTagColor(e.stage)})">${e.stage}</span>`+
+    `<span class="val${e.slow?' slow':''}">${e.ms.toFixed(2)} ms</span></div>`
+  ).join('');
+  if(!engLogPaused)body.scrollTop=body.scrollHeight;
+}
+
+function engTagColor(stage){
+  const s=ENG_STAGES.find(x=>x.key===stage);
+  if(!s)return 'dim';
+  return{gpu:'acc',cpu:'amber',xfer:'dim',render:'green'}[s.tag]||'dim';
+}
+
+function engMakeStage(s){
+  const tagCls={gpu:'eng-t-gpu',cpu:'eng-t-cpu',xfer:'eng-t-xfer',render:'eng-t-render',inv:'eng-t-inv'}[s.tag]||'';
+  const d=document.createElement('details');
+  d.className='eng-stage';d.dataset.engStage=s.key;
+  d.innerHTML=`<summary>
+    <span class="eng-caret">▶</span>
+    <span class="eng-tag ${tagCls}">${s.tag==='inv'?'invariant':s.tag}</span>
+    <span class="eng-sname">${s.label}</span>
+    <span class="eng-sdesc">${s.desc}</span>
+    <span class="eng-cost" data-eng-metric="${s.key}">${s.cost}</span>
+  </summary>
+  <div class="eng-body">${s.body}</div>`;
+  return d;
+}
+
+let engRendered=false;
+function renderEngine(){
+  const root=document.getElementById('view-engine');
+  if(!root)return;
+  if(engRendered)return;
+  engRendered=true;
+
+  // Telemetry bar
+  const bar=el('div',{class:'eng-bar'},
+    el('span',{class:'dot'}),
+    el('span',{class:'lbl',id:'eng-status'},'telemetry offline — showing static reference values'),
+    el('span',{class:'spacer'}),
+    el('input',{type:'text',id:'eng-url',value:'ws://localhost:8080',spellcheck:'false'}),
+    el('button',{id:'eng-connect',onclick:engConnect},'connect'),
+    el('button',{id:'eng-demo',onclick:engStartDemo},'demo data')
+  );
+  root.appendChild(bar);
+
+  const wrap=el('div',{class:'eng-wrap'});
+
+  // Header
+  wrap.appendChild(el('div',{style:'padding:24px 0 16px;border-bottom:1px solid var(--line)'},
+    el('h1',{style:'margin:0 0 6px;font-size:24px;letter-spacing:-.02em'},'Engine Architecture'),
+    el('p',{class:'note',style:'margin:8px 0 0'},
+      'A 3D falling-sand voxel engine: a GPU-resident cellular automaton over a 256³ ',
+      el('strong',{},'toroidal residency window'),
+      ' into an infinite streamed, procedurally generated world, raymarched directly from the simulation buffers. Expand any stage for its mechanism, computation counts, and limits.'),
+    el('div',{class:'eng-meta'},
+      el('span',{},'resident ',el('b',{},'256³'),' = 16.7M voxels, world ',el('b',{},'infinite')),
+      el('span',{},'chunks ',el('b',{},'4096'),' × 16³'),
+      el('span',{},'tick ',el('b',{},'30 Hz')),
+      el('span',{},'sim ',el('b',{},'0.25 ms'),' active'),
+      el('span',{},'render ',el('b',{},'2.66 ms'),' @1080p'),
+      el('span',{},'RTX 3060 Ti')
+    )
+  ));
+
+  // Pipeline flow
+  wrap.appendChild(el('h2',{},'Per-tick pipeline'));
+  wrap.appendChild(el('p',{class:'note'},'Every tick runs these stages in order. The ordering is load-bearing: mutations must land before compaction, and compaction must precede the CA passes.'));
+  const flow=el('div',{class:'eng-flow'});
+  ['stream','mutate','explode','compact','54 × CA','particles','occupancy','readback','physics','render'].forEach((s,i)=>{
+    if(i)flow.appendChild(el('i',{},'→'));
+    flow.appendChild(el('span',{},s));
+  });
+  wrap.appendChild(flow);
+
+  // Pipeline stages
+  ENG_STAGES.forEach(s=>wrap.appendChild(engMakeStage(s)));
+
+  // Cross-cutting invariants
+  wrap.appendChild(el('h2',{},'Cross-cutting invariants'));
+  wrap.appendChild(el('p',{class:'note'},'These hold across every stage above. Each is cheap to maintain now and near-impossible to retrofit.'));
+  ENG_INVARIANTS.forEach(s=>wrap.appendChild(engMakeStage(s)));
+
+  // Measured baseline table
+  wrap.appendChild(el('h2',{},'Measured baseline'));
+  wrap.appendChild(el('p',{class:'note'},'From --selftest on an RTX 3060 Ti. Live telemetry replaces these with running measurements.'));
+  const tbl=el('table',{class:'eng-body',style:'margin:0 0 20px'});
+  tbl.innerHTML='<tr><th>Metric</th><th>Value</th><th>Notes</th></tr>'+
+    ENG_BASELINE.map(([m,v,n])=>`<tr><td>${m}</td><td>${v}</td><td>${n}</td></tr>`).join('');
+  wrap.appendChild(tbl);
+
+  // Event log panel
+  wrap.appendChild(el('h2',{},'Event log'));
+  wrap.appendChild(el('p',{class:'note'},'Live performance events from the running sim. Set a threshold to highlight slow stages, and filter by stage to focus on bottlenecks.'));
+
+  const logPanel=el('div',{class:'eng-log-panel'});
+
+  // Filter row
+  const filterRow=el('div',{class:'eng-filter-row',style:'padding:10px 14px;border-bottom:1px solid var(--line)'});
+  const allStages=[...ENG_STAGES.map(s=>s.key)];
+  allStages.forEach(key=>{
+    engLogStageFilters[key]=true;
+    const lbl=el('label',{},
+      el('input',{type:'checkbox',checked:true,onchange(e){
+        engLogStageFilters[key]=e.target.checked;
+        engRenderLog();
+      }}),key);
+    filterRow.appendChild(lbl);
+  });
+  logPanel.appendChild(filterRow);
+
+  // Thresholds row
+  const threshRow=el('div',{class:'eng-thresholds'});
+  threshRow.appendChild(el('label',{},'slow threshold (ms): ',
+    el('input',{type:'number',value:'1.0',step:'0.1',min:'0',onchange(e){
+      engThresholdMs=parseFloat(e.target.value)||1.0;
+    }})));
+  threshRow.appendChild(el('label',{},
+    el('input',{type:'checkbox',id:'engOnlySlow',onchange(){engRenderLog();}}),
+    ' only show slow events'));
+  threshRow.appendChild(el('span',{class:'spacer'}));
+  threshRow.appendChild(el('label',{},
+    el('input',{type:'checkbox',onchange(e){engLogPaused=e.target.checked;}}),
+    ' pause scroll'));
+  threshRow.appendChild(el('button',{onclick(){engLogEntries=[];engRenderLog();}},'clear'));
+  logPanel.appendChild(threshRow);
+
+  // Log body
+  logPanel.appendChild(el('div',{class:'eng-log-body',id:'engLogBody'},
+    el('div',{class:'empty'},'No events logged yet. Connect to the running sim or start demo data.')));
+  wrap.appendChild(logPanel);
+
+  root.appendChild(wrap);
+
+  // Collect cost chips for live updates
+  engChips={};
+  root.querySelectorAll('[data-eng-metric]').forEach(el=>{
+    engChips[el.dataset.engMetric]={el,base:el.textContent};
+  });
+
+  // Open CA stage by default
+  const ca=root.querySelector('[data-eng-stage="ca"]');
+  if(ca)ca.open=true;
+}
+
+window.addEventListener('resize',()=>{
+  if(activeTab==='engine')Object.keys(engHistory).forEach(engDrawSpark);
+});
+
+})();
 </script>
 
 <!-- The voxel editor, loaded as a module so it can import the vendored three.js
