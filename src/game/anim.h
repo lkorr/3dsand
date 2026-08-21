@@ -36,6 +36,12 @@ Quat QuatNlerp(const Quat& a, const Quat& b, float t);
 Quat QuatSlerp(const Quat& a, const Quat& b, float t);
 // Minimal rotation taking `from` to `to` (both need not be normalized).
 Quat QuatFromTo(Vec3 from, Vec3 to);
+// Euler DEGREES -> quat, applied X then Y then Z. The order is stated here
+// once and shared by everything that authors a rotation as three numbers in
+// JSON (rig sockets, item grips), because "which order were those Euler
+// angles in" is otherwise decided independently at each call site and they
+// disagree the first time an axis is non-zero.
+Quat QuatFromEulerDeg(Vec3 deg);
 
 struct Transform {
   Quat rot;

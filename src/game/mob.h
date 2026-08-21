@@ -69,6 +69,31 @@ struct MobLimbDef {
   int microModel = -1;
 };
 
+// An attachment point on a rig: the frame a held item is placed in.
+//
+// Deliberately tiny. A socket is a POINT AND A FRAME on one part, nothing
+// more — no item knowledge, no grip data. Anything about how a particular
+// weapon sits in a hand belongs to that weapon (ItemDef::grip), so the same
+// socket serves a sword, a torch and an empty hand without edits.
+struct MobSocketDef {
+  // The CONTEXT this socket serves — "held_right" — matching the key an item
+  // uses in its own `grip` map. Deliberately NOT the limb's name: an item asks
+  // to be held in a context, and which limb provides that context is the rig's
+  // business. A left-handed creature puts "held_right" on its hand.L and every
+  // item still hangs correctly with no per-item edits.
+  std::string name;
+  std::string part;            // rig part it rides; resolved to an index at load
+  int partIndex = -1;
+  // Offset from the part's own model corner, in WORLD voxels (converted from
+  // the sidecar's micro units at load, with the anchors).
+  Vec3 offset{};
+  // Extra rotation of the socket frame. Normally identity: the hand's frame IS
+  // the socket frame, and putting a rotation here as well as in the item's
+  // grip would mean two places encode "which way does a held thing point",
+  // which is exactly how those two drift apart.
+  Quat rotation{};
+};
+
 struct MobDef {
   std::string name;
   Prefab prefab;               // one model per limb
@@ -114,6 +139,24 @@ struct MobDef {
   // and stored parent-before-child (AnimFlatten's one-pass requirement); the
   // loader topologically sorts `limbs` to guarantee it.
   AnimSkeleton skel;
+  // Where a held ITEM attaches. The rig states only WHERE THE FIST CLOSES; the
+  // item states how it sits in that fist (its own `grip` block), and the
+  // runtime composes socket x grip — see game/item.h.
+  //
+  // The split is the whole point. A weapon used to be a limb of the rig, and
+  // that is what broke: prefab-local space is rebased on the BODY's min corner
+  // (props are excluded from that measurement, because a creature's size must
+  // not change with its luggage), so a blade reaching past that corner landed
+  // at NEGATIVE prefab-local coordinates, which the space cannot represent.
+  // An item owning its own origin cannot do that to the body wearing it, and
+  // one sword now fits any rig that publishes a hand socket.
+  std::vector<MobSocketDef> sockets;
+
+  int FindSocket(const std::string& n) const {
+    for (size_t i = 0; i < sockets.size(); i++)
+      if (sockets[i].name == n) return (int)i;
+    return -1;
+  }
 };
 
 // Loads assets/mobs/*.vox + matching .json sidecars. Appends problems to log;

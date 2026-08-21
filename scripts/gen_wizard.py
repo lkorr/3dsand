@@ -483,7 +483,23 @@ LIMBS = {
     "foot.R":   (( 6, 10,  7), (-6, -7,  0), LEATHER),
 
     # Held in hand.R, which is now at model -X (the figure's right).
-    "staff":    (( 5,  5, 56), (-14, -2, 26), STAFF),
+    #
+    # ITS X IS PINNED TO THE BODY'S MINIMUM (-11, hand.R's own low corner) and
+    # that is a correctness constraint, not styling. Anchors are rebased on the
+    # BODY's min corner — props are excluded from that measurement, since a
+    # creature's size must not change with what it carries — so a prop reaching
+    # below it lands at NEGATIVE prefab-local coordinates, which that space
+    # cannot represent. At -14 this staff did exactly that (engine x -3), the
+    # same defect that put mina's sword 30 micro outside her box and drew her
+    # body offset from where her arm solved.
+    #
+    # The real fix for a WEAPON is to make it a standalone item with its own
+    # origin (assets/items/, scripts/gen_sword_item.py) held through a socket,
+    # which is what the sword did. This staff stays a rig prop for now — the
+    # wizard is not the player avatar (main.cpp kAvatarDefName is "mina") and
+    # it is keyframed by name in the cast clips — so it is simply kept inboard:
+    # centred in the fist rather than hanging off its outer edge.
+    "staff":    (( 5,  5, 56), (-11, -2, 26), STAFF),
 }
 
 # Held props. Excluded from the prefab extents below because the LOADER

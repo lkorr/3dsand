@@ -129,8 +129,21 @@ void PlayerAvatar::SetDefs(const std::vector<MobDef>* defs,
 
 void PlayerAvatar::ResolveParts() {
   parts_ = AvatarParts{};
-  if (!def_) return;
-  const AnimSkeleton& sk = def_->skel;
+  if (!def_) {
+    skel_ = AnimSkeleton{};
+    limbs_.clear();
+    return;
+  }
+  // Re-seed the owned rig from the (possibly hot-reloaded) def. This runs
+  // while DESPAWNED — SetDefs tears the body down first — so there is no
+  // equipped item to preserve here; Spawn re-seeds it again and EquipItem
+  // re-appends the slot. Doing it in both places keeps "the owned rig always
+  // matches the current def" true no matter which entry point ran last.
+  skel_ = def_->skel;
+  limbs_ = def_->limbs;
+  heldSlot_ = -1;
+  heldItem_.clear();
+  const AnimSkeleton& sk = skel_;
   parts_.head = sk.FindPart("head");
   parts_.torso = sk.FindPart("torso");
   parts_.hips = sk.FindPart("hips");
@@ -149,11 +162,153 @@ void PlayerAvatar::ResolveParts() {
   heldPartIndex_ = heldPart_.empty() ? -1 : sk.FindPart(heldPart_);
 }
 
-void PlayerAvatar::SetHeldPart(const std::string& partName) {
-  if (heldPart_ == partName) return;
-  heldPart_ = partName;
-  heldPartIndex_ = def_ ? def_->skel.FindPart(partName) : -1;
+// ---- holding an item --------------------------------------------------------
+//
+// THE ENTITY <-> SLOT SYNC SEAM. Everything that makes a held item behave like
+// a limb happens here and nowhere else; see the note in avatar.h.
+
+bool PlayerAvatar::EquipItem(const ItemDef* item, const char* context) {
+  if (!def_ || !phys_) return false;
+
+  // Unequip first, always — including on a re-equip, so swapping weapons goes
+  // through exactly one code path instead of a "replace in place" variant that
+  // would have to duplicate the joint and body teardown.
+  if (heldSlot_ >= 0) {
+    Part& old = parts[heldSlot_];
+    if (old.joint) phys_->DestroyJoint(old.joint);
+    if (old.body) phys_->RemoveBody(old.body);
+    // The slot is appended last, so popping it keeps parts/skel_/limbs_
+    // index-parallel with no renumbering. Anything holding a part index across
+    // an equip would be broken by a mid-vector erase; this cannot be.
+    parts.pop_back();
+    skel_.parts.pop_back();
+    limbs_.pop_back();
+    if ((int)hidden_.size() > heldSlot_) hidden_.pop_back();
+    anim_.partAlive.resize(skel_.parts.size());
+    anim_.springs.resize(skel_.parts.size());
+    heldSlot_ = -1;
+    heldItem_.clear();
+    heldPartIndex_ = -1;
+    heldPart_.clear();
+    instancesDirty_ = true;
+  }
+  if (!item) return true;
+  if (!spawned_) return false;
+
+  const int si = def_->FindSocket(context);
+  if (si < 0) return false;              // no such socket: loud, per avatar.h
+  const MobSocketDef& sock = def_->sockets[si];
+  const ItemGrip* grip = item->Grip(context);
+  if (!grip) return false;               // item cannot be held this way
+  if (sock.partIndex < 0 || sock.partIndex >= (int)parts.size()) return false;
+  if (!PartAlive(sock.partIndex)) return false;   // no hand, no grip
+
+  // ---- the borrowed slot --------------------------------------------------
+  const int slot = (int)parts.size();
+  parts.push_back(Part{});
+  limbs_.push_back(MobLimbDef{});
+  skel_.parts.push_back(AnimPart{});
+  hidden_.push_back(0);
+
+  MobLimbDef& ld = limbs_[slot];
+  ld.name = "item:" + item->name;
+  ld.parent = sock.part;
+  ld.joint = Physics::JointType::Fixed;   // a grip does not hinge
+  ld.hp = item->hp;
+  ld.severable = item->severable;
+  ld.vital = false;                       // losing your sword is not fatal
+  ld.tag = "item";
+  ld.severImpactSpeed = item->severImpactSpeed;
+  ld.hasSpring = item->hasSpring;
+  ld.spring = item->spring;
+  ld.hasEdge = item->hasEdge;
+  ld.edgeFrom = item->edgeFrom;
+  ld.edgeTo = item->edgeTo;
+  ld.edgeHalfWidth = item->edgeHalfWidth;
+  ld.microModel = item->microModel;
+
+  AnimPart& ap = skel_.parts[slot];
+  ap.name = ld.name;
+  ap.parent = sock.partIndex;
+  ap.tag = ld.tag;
+  ap.hasSpring = ld.hasSpring;
+  ap.spring = ld.spring;
+
+  // ---- SOCKET x GRIP, composed forward ------------------------------------
+  //
+  // The socket is a point in the HAND's own frame; the grip is how the item
+  // sits once placed there. Translation applies BEFORE rotation (item.h), so
+  // the item's local offset is rotated into the socket frame rather than added
+  // after it — getting that order backwards puts the pommel where the tip
+  // should be and looks like a bad grip constant.
+  //
+  // NOT the inverse form (Inverse(grip) x socket) VR rigs use: that solves for
+  // a hand pose given a fixed grip, which is not the question here.
+  const Part& hand = parts[sock.partIndex];
+  const Quat q = QuatMul(sock.rotation, grip->rotation);
+  ap.rest.rot = q;
+  // The slot's rest position, relative to the hand part, is the socket offset
+  // measured from the hand's own model corner.
+  const Vec3 socketLocal = sock.offset - hand.restOffset;
+  ap.rest.pos = socketLocal + QuatRotate(q, grip->translation);
+  ap.anchorLocal = sock.offset;
+
+  Part& p = parts[slot];
+  p.hp = item->hp;
+  p.size = item->size;
+  p.microModel = item->microModel;
+  p.restOffset = ap.rest.pos;
+  const float inv = 1.0f / (float)(item->scale ? item->scale : 1);
+  p.voxels.reserve(item->voxels.size());
+  for (const PrefabVoxel& v : item->voxels) {
+    uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+    p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
+                        (uint16_t)(v.material | (variant << 12))});
+  }
+
+  // Body at the composed pose, on the avatar layer like every other part (your
+  // own sword must not shove you any more than your own elbow may).
+  BodyTransform bxf{};
+  bxf.pos = hand.xf.pos + QuatRotate(
+      Quat{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2], hand.xf.quat[3]},
+      ap.rest.pos);
+  bxf.quat[0] = q.x; bxf.quat[1] = q.y; bxf.quat[2] = q.z; bxf.quat[3] = q.w;
+  p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, densityOf_, true, inv);
+  if (p.body == 0) {
+    parts.pop_back();
+    skel_.parts.pop_back();
+    limbs_.pop_back();
+    hidden_.pop_back();
+    return false;
+  }
+  phys_->SetBodyKinematic(p.body, true);
+  phys_->SetBodyAvatarLayer(p.body, true);
+  p.xf = bxf;
+  p.anchorRoot = sock.offset;
+  p.anchorLimb = p.anchorRoot - p.restOffset;
+  p.joint = phys_->CreateJoint(hand.body, p.body, ld.joint,
+                               p.xf.pos, ld.axis, ld.minAngle, ld.maxAngle);
+
+  // The new body must not collide with the rest of the avatar, exactly as
+  // Spawn arranges for the limbs — a sword resting against the thigh would
+  // otherwise fight the solver every tick.
+  {
+    std::vector<uint64_t> handles;
+    for (const Part& q2 : parts)
+      if (q2.body) handles.push_back(q2.body);
+    phys_->DisableCollisionsAmong(handles);
+  }
+
+  anim_.partAlive.resize(skel_.parts.size(), 1);
+  anim_.springs.resize(skel_.parts.size(), SpringState{});
+  heldSlot_ = slot;
+  heldItem_ = item->name;
+  // The weapon-arm IK derives the arm from the held part's parent, so these
+  // stay in step with the slot rather than being a second source of truth.
+  heldPartIndex_ = slot;
+  heldPart_ = ld.name;
   instancesDirty_ = true;
+  return true;
 }
 
 void PlayerAvatar::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
@@ -183,8 +338,8 @@ bool PlayerAvatar::OwnsBody(uint64_t bodyHandle) const {
 bool PlayerAvatar::WeaponEdge(Vec3& outBase, Vec3& outTip,
                               float& outHalfWidth) const {
   if (!def_ || heldPartIndex_ < 0) return false;
-  if (heldPartIndex_ >= (int)def_->limbs.size()) return false;
-  const MobLimbDef& ld = def_->limbs[heldPartIndex_];
+  if (heldPartIndex_ >= (int)limbs_.size()) return false;
+  const MobLimbDef& ld = limbs_[heldPartIndex_];
   if (!ld.hasEdge) return false;
   if (!PartAlive(heldPartIndex_)) return false;   // severed: nothing to cut with
   const Part& p = parts[heldPartIndex_];
@@ -201,7 +356,7 @@ bool PlayerAvatar::WeaponEdge(Vec3& outBase, Vec3& outTip,
 }
 
 int PlayerAvatar::PartIndex(const std::string& name) const {
-  return def_ ? def_->skel.FindPart(name) : -1;
+  return def_ ? skel_.FindPart(name) : -1;
 }
 
 bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
@@ -221,6 +376,16 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   bodyUp_ = Vec3{0, 1, 0};
   footInit_ = false;
   alive_ = true;
+
+  // The rig this instance animates is a COPY of the def's (see avatar.h): a
+  // held item borrows a slot by APPENDING a part, and the shared def must not
+  // grow one. Reset here so a respawn never inherits the last life's sword.
+  skel_ = def.skel;
+  limbs_ = def.limbs;
+  heldSlot_ = -1;
+  heldItem_.clear();
+  heldPartIndex_ = -1;
+  heldPart_.clear();
 
   parts.assign(def.limbs.size(), Part{});
   const float inv = 1.0f / (float)def.scale;
@@ -351,7 +516,7 @@ void PlayerAvatar::SetHiddenParts(const std::vector<uint8_t>& hidden) {
 
 void PlayerAvatar::PlayClip(const std::string& name) {
   if (!def_) return;
-  int ci = def_->skel.FindClip(name);
+  int ci = skel_.FindClip(name);
   if (ci < 0) return;
   for (ClipInstance& inst : anim_.clips)
     if (inst.clip == ci && !inst.stopping) {
@@ -362,7 +527,7 @@ void PlayerAvatar::PlayClip(const std::string& name) {
       // forever: the arms sat frozen on the first keyframe — held out in front,
       // never swinging — which is exactly the "zombie arms" look. A looping
       // clip that is already running needs no retrigger at all.
-      if (!def_->skel.clips[ci].loop) {
+      if (!skel_.clips[ci].loop) {
         inst.timeMs = 0;
         inst.ageMs = 0;   // a re-triggered one-shot replays its blend-in too
       }
@@ -380,7 +545,7 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
   AvatarLocomotion out;
   out.alive = alive_;
   if (!def_ || !spawned_) return out;
-  const AnimSkeleton& sk = def_->skel;
+  const AnimSkeleton& sk = skel_;
   if (anim_.locoState >= 0 && anim_.locoState < (int)sk.states.size()) {
     const AnimStateRule& rule = sk.states[anim_.locoState];
     out.stateIndex = anim_.locoState;
@@ -445,7 +610,7 @@ bool PlayerAvatar::GroundHeightAt(World& world, int wx, int wz, int yFrom,
 }
 
 void PlayerAvatar::UpdateGait(float dt, World& world) {
-  const AnimSkeleton& sk = def_->skel;
+  const AnimSkeleton& sk = skel_;
   const GaitDef& g = sk.gait;
   if (sk.chains.empty()) return;
 
@@ -748,7 +913,7 @@ void PlayerAvatar::UpdateAirPose(float dt) {
 
 void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
                                    const Vec3& playerVel) {
-  const AnimSkeleton& sk = def_->skel;
+  const AnimSkeleton& sk = skel_;
   AnimState& st = anim_;
   if (sk.parts.empty()) return;
   st.partAlive.resize(sk.parts.size(), 1);
@@ -1274,7 +1439,7 @@ bool PlayerAvatar::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     Part& p = parts[i];
     if (p.body != bodyHandle) continue;
     const MobDef& def = *def_;
-    const MobLimbDef& ld = def.limbs[i];
+    const MobLimbDef& ld = limbs_[i];
     Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
     // a beam crossing the joint anchor severs outright
     if ((int)i != def.rootLimb && p.joint) {
@@ -1318,7 +1483,7 @@ int32_t PlayerAvatar::HealthMax() const {
   // silently rescaling itself to the smaller body.
   if (!def_) return 0;
   float sum = 0;
-  for (const MobLimbDef& ld : def_->limbs)
+  for (const MobLimbDef& ld : limbs_)
     if (ld.hp > 0) sum += ld.hp;
   return sum <= 0 ? 0 : (int32_t)sum;
 }
@@ -1372,7 +1537,7 @@ void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
   std::vector<int> hits;
   for (size_t i = 0; i < parts.size(); i++) {
     if (!PartAlive((int)i) || !parts[i].body) continue;
-    const MobLimbDef& ld = def_->limbs[i];
+    const MobLimbDef& ld = limbs_[i];
     if ((int)i == def_->rootLimb || ld.vital || !ld.severable) continue;
     if ((parts[i].xf.pos - atWorldVoxel).len() <= radiusVox + 2.0f)
       hits.push_back((int)i);
@@ -1393,7 +1558,7 @@ void PlayerAvatar::Sever(int partIndex) {
   if (!def_ || !spawned_) return;
   const MobDef& def = *def_;
   if (partIndex < 0 || partIndex >= (int)parts.size()) return;
-  const MobLimbDef& ld = def.limbs[partIndex];
+  const MobLimbDef& ld = limbs_[partIndex];
   if (partIndex == def.rootLimb || ld.vital || !ld.severable) {
     Die();
     return;
@@ -1411,8 +1576,8 @@ void PlayerAvatar::Sever(int partIndex) {
   DetachPart(partIndex, true);
 
   // the stump bleeds: wound at the joint on the PARENT side
-  for (size_t k = 0; k < def.limbs.size(); k++) {
-    if (def.limbs[k].name != ld.parent) continue;
+  for (size_t k = 0; k < limbs_.size(); k++) {
+    if (limbs_[k].name != ld.parent) continue;
     Part& parent = parts[k];
     Quat q{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
            parent.xf.quat[3]};
@@ -1448,8 +1613,8 @@ void PlayerAvatar::DetachPart(int index, bool adopt) {
   // Children are orphaned too: their joints attach to this part and die with
   // it. A severed forearm must take the hand (and the staff) with it.
   const MobDef& def = *def_;
-  for (size_t k = 0; k < def.limbs.size(); k++)
-    if (def.limbs[k].parent == def.limbs[index].name && parts[k].body)
+  for (size_t k = 0; k < limbs_.size(); k++)
+    if (limbs_[k].parent == limbs_[index].name && parts[k].body)
       DetachPart((int)k, adopt);
 
   if (index < (int)anim_.partAlive.size())

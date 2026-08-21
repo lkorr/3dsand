@@ -392,6 +392,44 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                      : sk.parts[i].anchorLocal;
       }
 
+      // ---- sockets: where a held ITEM attaches (mob.h MobSocketDef) --------
+      //
+      // Parsed after the limbs because a socket names the part it rides and is
+      // resolved to an index here — a socket on a part that does not exist is
+      // a loud diagnostic, never a silent no-op, since the failure mode it
+      // guards against is an item that renders at the origin instead of in the
+      // hand.
+      //
+      // Offsets take the SAME micro -> world conversion the anchors just did,
+      // and for the same reason: everything downstream works in world voxels.
+      {
+        const float inv = 1.0f / (float)def.scale;
+        for (const auto& s : j.value("sockets", json::array())) {
+          MobSocketDef sd;
+          sd.name = s.value("name", "");
+          sd.part = s.value("part", "");
+          if (sd.name.empty() || sd.part.empty()) {
+            log += jp + ": socket needs both \"name\" and \"part\"\n";
+            continue;
+          }
+          sd.partIndex = sk.FindPart(sd.part);
+          if (sd.partIndex < 0) {
+            log += jp + ": socket \"" + sd.name + "\" names part \"" + sd.part +
+                   "\", which is not a limb of this rig\n";
+            continue;
+          }
+          if (s.contains("offset") && s["offset"].size() == 3)
+            sd.offset = Vec3{s["offset"][0].get<float>(),
+                             s["offset"][1].get<float>(),
+                             s["offset"][2].get<float>()} * inv;
+          if (s.contains("rotation") && s["rotation"].size() == 3)
+            sd.rotation = QuatFromEulerDeg({s["rotation"][0].get<float>(),
+                                            s["rotation"][1].get<float>(),
+                                            s["rotation"][2].get<float>()});
+          def.sockets.push_back(std::move(sd));
+        }
+      }
+
       if (j.contains("gait") && j["gait"].is_object()) {
         const json& g = j["gait"];
         GaitDef& gd = sk.gait;

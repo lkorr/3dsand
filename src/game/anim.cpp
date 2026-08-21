@@ -28,6 +28,17 @@ Quat QuatAxisAngle(Vec3 axis, float angle) {
   return {a.x * s, a.y * s, a.z * s, std::cos(angle * 0.5f)};
 }
 
+Quat QuatFromEulerDeg(Vec3 deg) {
+  const float k = 3.14159265358979f / 180.0f;
+  // X then Y then Z, composed left-to-right so the LAST rotation is applied in
+  // the frame the first two produced. See the note in anim.h: the order is a
+  // shared convention, not a local choice.
+  Quat q = QuatAxisAngle({1, 0, 0}, deg.x * k);
+  q = QuatMul(QuatAxisAngle({0, 1, 0}, deg.y * k), q);
+  q = QuatMul(QuatAxisAngle({0, 0, 1}, deg.z * k), q);
+  return QuatNormalize(q);
+}
+
 float QuatDot(const Quat& a, const Quat& b) {
   return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }

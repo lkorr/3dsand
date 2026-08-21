@@ -968,7 +968,10 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
 
 int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 const std::vector<MaterialDef>& mats, Physics& phys,
-                DebrisSystem& debris, MobSystem& mobs, Stream& stream) {
+                DebrisSystem& debris, MobSystem& mobs, Stream& stream,
+                // The melee gate equips a real ITEM now (the sword left the
+                // rig), so the library has to reach in here.
+                const ItemLibrary& items) {
   std::printf("=== selftest ===\n");
   constexpr int kTicks = 200;
 
@@ -3442,14 +3445,20 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           // (2) is load-bearing: a cone-in-front-of-the-crosshair hitbox would
           // pass a "did it damage something" test and fail this one.
           {
-            const int swordPart = avatar.PartIndex("sword");
+            // The sword is a standalone ITEM now, not a part of the rig, so
+            // the gate asks the library for it and equips it into the hand
+            // socket. A missing item or a rig with no hand socket is a SKIP,
+            // exactly as a missing rig part used to be.
+            const int swordDef = items.Find("sword");
+            const ItemDef* swordItem = items.At(swordDef);
             bool edgeOk = false, movedOk = false, hitRight = false;
             bool missedFar = true, selfSafe = true;
+            bool equipped = false;
+            int swordPart = -1;
             uint32_t targetBefore = 0, targetAfter = 0, farBefore = 0,
                      farAfter = 0;
-            if (swordPart < 0) {
-              std::printf("melee: SKIP (no sword part in %s)\n",
-                          avDefName.c_str());
+            if (!swordItem) {
+              std::printf("melee: SKIP (no \"sword\" item in the library)\n");
             } else {
               // A FRESH BODY. The avatar block above deliberately ends by
               // severing parts and calling Despawn(), so by here the rig has
@@ -3459,7 +3468,13 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
               debris.Reset();
               pl.pos = Vec3{140.5f, (float)(h2 + 2) + Player::kHalfY, 140.5f};
               avatar.Revive(pl, 0.0f);
-              avatar.SetHeldPart("sword");
+              // EQUIP THE ITEM. This is the borrowed-slot path under test as
+              // much as the edge is: if socket x grip fails to resolve, there
+              // is no blade in the hand and every measurement below reads
+              // false — so the failure is reported here, where it is legible,
+              // rather than as a mysterious edge miss.
+              equipped = avatar.EquipItem(swordItem);
+              swordPart = avatar.HeldSlot();
               for (int i = 0; i < 8; i++) avTick();
               Vec3 b0, t0;
               float hw = 0;
@@ -3536,12 +3551,14 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                            !avatar.OwnsBody(0);
                 if (foreign) phys.RemoveBody(foreign);
               }
-              bool meleeOk = edgeOk && movedOk && hitRight && missedFar &&
-                             selfSafe;
+              bool meleeOk = equipped && edgeOk && movedOk && hitRight &&
+                             missedFar && selfSafe;
               std::printf(
-                  "melee: %s (edge len ok=%d moved=%d, struck limb %u->%u, "
-                  "far limb %u->%u untouched=%d, self-hit guarded=%d)\n",
-                  meleeOk ? "PASS" : "FAIL", edgeOk ? 1 : 0, movedOk ? 1 : 0,
+                  "melee: %s (equipped=%d slot=%d, edge len ok=%d moved=%d, "
+                  "struck limb %u->%u, far limb %u->%u untouched=%d, "
+                  "self-hit guarded=%d)\n",
+                  meleeOk ? "PASS" : "FAIL", equipped ? 1 : 0, swordPart,
+                  edgeOk ? 1 : 0, movedOk ? 1 : 0,
                   targetBefore, targetAfter, farBefore, farAfter,
                   missedFar ? 1 : 0, selfSafe ? 1 : 0);
               mobOk = mobOk && meleeOk;
@@ -4359,14 +4376,11 @@ int main(int argc, char** argv) {
   // same hot-reload key. Not fatal if it fails: an item file that will not
   // load costs you the hotbar, not the game, and the rest of the session is
   // still worth having.
+  // Declared here, LOADED BELOW once the micro-body pool exists: an item owns
+  // its own .vox now, and its brick goes in the same pool the rigs use (a held
+  // item is drawn by the borrowed slot's own render path). See the load beside
+  // LoadMobDefs.
   ItemLibrary items;
-  {
-    std::string ierr;
-    if (!LoadItems(assetDir + "/items/items.json", items, ierr))
-      std::fprintf(stderr, "item load failed:\n%s", ierr.c_str());
-    else
-      std::printf("loaded %zu items\n", items.items.size());
-  }
 
   // voxel art prefabs (PLAN §A): drop .vox files in assets/prefabs/
   std::vector<Prefab> prefabs;
@@ -4435,6 +4449,16 @@ int main(int argc, char** argv) {
     if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
     std::printf("loaded %zu mob defs (%zu micro-body limb models, %zu pool words)\n",
                 mobDefs.size(), mbSet.models.size(), mbSet.pool.size());
+    // Items load into the SAME pool, before the upload, so a held item's brick
+    // rides the one UploadMicroBodies the rigs already pay for. Not fatal if
+    // it fails: a broken item file costs you the hotbar, not the session.
+    std::string ierr;
+    const bool itemsOk = LoadItems(assetDir + "/items", mats.size(), mbSet,
+                                   items, ierr);
+    // Warnings survive a successful load (a stray palette index, a missing
+    // grip context), so print them either way rather than only on failure.
+    if (!ierr.empty()) std::fprintf(stderr, "%s", ierr.c_str());
+    if (itemsOk) std::printf("loaded %zu items\n", items.items.size());
     sim.UploadMicroBodies(ctx.queue, mbSet);
     mobs.SetDefs(std::move(mobDefs));
   }
@@ -4448,7 +4472,8 @@ int main(int argc, char** argv) {
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);
   if (selftest)
-    return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream);
+    return RunSelftest(ctx, world, sim, mats, phys, debris, mobs, stream,
+                       items);
 
   Overlay overlay;
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
@@ -4798,6 +4823,15 @@ int main(int argc, char** argv) {
         sphereModels.clear();
         LoadMobDefs(assetDir + "/mobs", mats, mobDefs, mbSet, mlog);
         if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
+        // Items MUST reload here too: their bricks live in the pool that was
+        // just thrown away, so a stale ItemDef would hold a model index into
+        // a freed model. The hotbar stores indices into `items`, so it is
+        // re-validated below once the new library exists.
+        {
+          std::string ierr;
+          LoadItems(assetDir + "/items", mats.size(), mbSet, items, ierr);
+          if (!ierr.empty()) std::fprintf(stderr, "%s", ierr.c_str());
+        }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
         // The avatar holds a MobDef* INTO that vector, so it must be
@@ -5254,8 +5288,13 @@ int main(int argc, char** argv) {
           melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
                        cam.Forward());
           if (avatar.Spawned()) {
-            avatar.SetHeldPart(meleeArmed && heldItem ? heldItem->part
-                                                      : std::string());
+            // Equip/unequip only on a CHANGE. EquipItem builds a body and a
+            // joint, so calling it every tick with the same weapon would
+            // rebuild the sword 60 times a second; comparing against what is
+            // already in the hand keeps this a no-op in the common case.
+            const ItemDef* want = meleeArmed ? heldItem : nullptr;
+            const std::string wantName = want ? want->name : std::string();
+            if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
             // Weight rises while the weapon is up and falls to zero at rest,
             // so the arm hands back to the walk cycle instead of being pinned
             // by an IK solve that is no longer expressing anything.
@@ -5605,10 +5644,11 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> hide;
         if (avatar.Spawned()) {
           const AvatarParts& p = avatar.Parts();
-          hide.assign(avatar.Def() ? avatar.Def()->limbs.size() : 0, 0);
-          const int heldPart = avatar.HeldPart().empty()
-                                   ? -1
-                                   : avatar.PartIndex(avatar.HeldPart());
+          // Sized from the LIVE rig, not the def: a held item borrows an
+          // appended slot, so the def's limb count is one short whenever the
+          // player is armed and the weapon would never be addressable here.
+          hide.assign(avatar.PartCount(), 0);
+          const int heldPart = avatar.HeldSlot();
           if (camMode == CameraMode::First) {
             for (size_t i = 0; i < hide.size(); i++) hide[i] = 1;
             if (CurrentTuning().avatar.firstPersonArms) {
@@ -5618,16 +5658,12 @@ int main(int argc, char** argv) {
                 if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
             }
           }
-          // PROPS THE PLAYER IS NOT HOLDING ARE NOT DRAWN. The rig carries one
-          // part per possible held item, so without this every weapon the
-          // character owns hangs off the hand at once. Hiding is the whole of
-          // "equipping": the part is always there, always severable, and only
-          // the selected one is visible and able to cut (WeaponEdge checks the
-          // same held index).
-          for (size_t i = 0; i < hide.size(); i++)
-            if (avatar.Def() && avatar.Def()->limbs[i].tag == "prop" &&
-                (int)i != heldPart)
-              hide[i] = 1;
+          // NOTHING TO HIDE FOR UNHELD ITEMS ANY MORE. The rig used to carry
+          // one part per possible weapon and hide the ones not in hand, which
+          // is what made "equipping" a visibility trick. An item is now a
+          // standalone asset that borrows a slot only while actually held, so
+          // an unequipped sword has no part at all — there is nothing to hide,
+          // and the rig cannot accumulate luggage it is not carrying.
           avatar.SetHiddenParts(hide);
         }
 

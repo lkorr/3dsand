@@ -14,8 +14,124 @@ using nlohmann::json;
 
 // ---- item library ----------------------------------------------------------
 
-bool LoadItems(const std::string& path, ItemLibrary& out, std::string& errors) {
+namespace {
+
+// One item's own art + sidecar: assets/items/<id>.{vox,json}. Fills the
+// geometry, grip and edge halves of the def; the behaviour half comes from
+// items.json. Returns false (loudly) if the item cannot be shown, since an
+// item that silently fails to load is one that turns up invisible in the hand.
+bool LoadItemAsset(const std::string& dir, size_t materialCount,
+                   MicroBodySet& micro, ItemDef& d, std::string& errors) {
+  const std::string base = dir + "/" + d.name;
+  std::ifstream sf(base + ".json");
+  if (!sf) {
+    errors += "items: \"" + d.name + "\" has no sidecar " + base + ".json\n";
+    return false;
+  }
+  json s;
+  try {
+    sf >> s;
+  } catch (const std::exception& e) {
+    errors += "items: " + d.name + ".json parse error: " + e.what() + "\n";
+    return false;
+  }
+
+  std::string verr, vwarn;
+  if (!LoadVoxFile(base + ".vox", materialCount, d.prefab, verr, vwarn)) {
+    errors += "items: \"" + d.name + "\" art failed to load: " + verr + "\n";
+    return false;
+  }
+  errors += vwarn;
+
+  d.scale = s.value("scale", 1u);
+  if (d.scale < 1) d.scale = 1;
+  const std::string modelName = s.value("model", d.name);
+  int mi = -1;
+  for (size_t i = 0; i < d.prefab.models.size(); i++)
+    if (d.prefab.models[i].name == modelName) mi = (int)i;
+  // A single-model .vox with an unnamed model is still perfectly usable; only
+  // complain when there is genuinely nothing to draw.
+  if (mi < 0 && d.prefab.models.size() == 1) mi = 0;
+  if (mi < 0) {
+    errors += "items: \"" + d.name + "\" has no model named \"" + modelName +
+              "\" in " + base + ".vox\n";
+    return false;
+  }
+  const PrefabModel& m = d.prefab.models[mi];
+  d.size = m.size;
+  d.offset = m.offset;
+  d.voxels = m.voxels;
+
+  d.hp = s.value("hp", 30.0f);
+  d.severable = s.value("severable", true);
+  d.severImpactSpeed = s.value("severImpactSpeed", 0.0f);
+  if (s.contains("spring") && s["spring"].is_object()) {
+    d.hasSpring = true;
+    d.spring.halflife = s["spring"].value("halflife", 0.15f);
+    d.spring.gain = s["spring"].value("gain", 1.0f);
+    d.spring.maxAngle = s["spring"].value("maxAngle", 0.7f);
+  }
+
+  const float inv = 1.0f / (float)d.scale;
+
+  // ---- grip contexts ------------------------------------------------------
+  // Every context is read whole: no key inherits from another (see item.h).
+  if (s.contains("grip") && s["grip"].is_object()) {
+    for (auto it = s["grip"].begin(); it != s["grip"].end(); ++it) {
+      const json& g = it.value();
+      ItemGrip gr;
+      if (g.contains("translation") && g["translation"].size() == 3)
+        gr.translation = Vec3{g["translation"][0].get<float>(),
+                              g["translation"][1].get<float>(),
+                              g["translation"][2].get<float>()} * inv;
+      if (g.contains("rotation") && g["rotation"].size() == 3)
+        gr.rotation = QuatFromEulerDeg({g["rotation"][0].get<float>(),
+                                        g["rotation"][1].get<float>(),
+                                        g["rotation"][2].get<float>()});
+      gr.scale = g.value("scale", 1.0f);
+      d.grip[it.key()] = gr;
+    }
+  }
+  if (d.grip.empty())
+    errors += "items: \"" + d.name +
+              "\" declares no grip contexts — it cannot be held\n";
+
+  // ---- cutting edge -------------------------------------------------------
+  // Same shape and the same micro -> world conversion as a rig part's edge
+  // (mob.cpp), including the scene(Z-up) -> engine(Y-up) axis map, so the
+  // sidecar can speak the art's own coordinates.
+  if (s.contains("edge") && s["edge"].is_object()) {
+    const json& e = s["edge"];
+    Vec3 ax{0, 0, 1};
+    if (e.contains("axis") && e["axis"].size() == 3)
+      ax = {e["axis"][0].get<float>(), e["axis"][1].get<float>(),
+            e["axis"][2].get<float>()};
+    const Vec3 axEngine{ax.x, ax.z, -ax.y};
+    d.hasEdge = true;
+    d.edgeFrom = axEngine * (e.value("from", 0.0f) * inv);
+    d.edgeTo = axEngine * (e.value("to", 0.0f) * inv);
+    d.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
+  }
+
+  // Micro brick, packed into the SAME pool the rigs use — a held item is drawn
+  // by the borrowed slot's own render path.
+  if (d.scale > 1) {
+    d.microModel =
+        MicroBodyPack(micro, d.voxels, d.size, d.scale, "item/" + d.name,
+                      errors);
+    if (d.microModel < 0)
+      errors += "items: \"" + d.name +
+                "\" has no micro brick and will not render\n";
+  }
+  return true;
+}
+
+}  // namespace
+
+bool LoadItems(const std::string& dir, size_t materialCount,
+               MicroBodySet& micro, ItemLibrary& out, std::string& errors) {
   out = ItemLibrary{};
+  const std::string path = dir + "/items.json";
   std::ifstream f(path);
   if (!f) {
     errors += "items: cannot open " + path + "\n";
@@ -43,10 +159,12 @@ bool LoadItems(const std::string& path, ItemLibrary& out, std::string& errors) {
                 "\" — skipped\n";
       continue;
     }
-    d.part = it.value("part", "");
     d.damage = it.value("damage", 12.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
     d.reach = it.value("reach", 9.0f);
+    // A broken item is skipped, never fatal: one bad asset must not cost the
+    // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
+    if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;
     out.items.push_back(std::move(d));
   }
   if (out.items.empty()) errors += "items: no usable items in " + path + "\n";

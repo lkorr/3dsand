@@ -1,13 +1,12 @@
 {
-  "comment": "Items are CONTENT, like materials.json and glyphs.json — not look-and-feel knobs like tuning.json. An item is a name, a behaviour kind the engine switches on, and (for anything held) the name of the RIG PART that shows it. The art is not here: a held item's mesh is a part of the wearer's own rig (assets/mobs/mina.*), authored and severable exactly like a hand, so a dropped sword, a severed sword-arm and a burnt sword all fall out of systems that already exist. Hot-reloads on R alongside materials and glyphs.",
+  "comment": "Items are CONTENT, like materials.json and glyphs.json — not look-and-feel knobs like tuning.json. This file holds an item's BEHAVIOUR: its id, the kind the engine switches on, and its damage numbers. THE ART IS NOT HERE, and it is not part of any creature either: each item owns <id>.vox plus an <id>.json sidecar carrying its grip and its cutting edge. A held item BORROWS a rig slot, so while worn it is a real rig part — severable with the arm, droppable as debris, carvable per voxel — but its geometry has its own origin, so a weapon can never inflate the box of the body holding it. That was a real bug: as a rig prop the sword reached 30 micro outside mina's prefab box and drew her body offset from her own arm. Hot-reloads on R alongside materials and glyphs.",
 
-  "kinds": "melee = swung, and cuts along the `edge` segment its rig part declares (see scripts/gen_mina.py sword_vox). The blade geometry is what decides the wound; `carveBonus` only widens it.",
+  "kinds": "melee = swung, and cuts along the `edge` segment its own sidecar declares (see scripts/gen_sword_item.py). The blade geometry is what decides the wound; `carveBonus` only widens it.",
 
   "items": [
     {
       "id": "sword",
       "kind": "melee",
-      "part": "sword",
       "damage": 14.0,
       "carveBonus": 0.15,
       "reach": 9.0,

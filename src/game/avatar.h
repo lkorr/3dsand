@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "game/anim.h"
+#include "game/item.h"
 #include "game/mob.h"
 #include "game/player.h"
 #include "math3d.h"
@@ -146,11 +147,28 @@ class PlayerAvatar {
   // instead of snapping.
   void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
                      float weight);
-  // Which rig part is currently acting as the held weapon, by name, or "" for
-  // an empty hand. Parts not equipped are hidden, so one rig can carry several
-  // props and show only what is in hand.
-  void SetHeldPart(const std::string& partName);
-  const std::string& HeldPart() const { return heldPart_; }
+  // ---- holding an item ----------------------------------------------------
+  //
+  // THE ENTITY<->SLOT SYNC SEAM, and deliberately the only one. Equipping
+  // BORROWS A RIG SLOT: the item's own geometry fills a real Part parented to
+  // the socket's limb, so while worn it is a rig part in every respect —
+  // animated, rendered, severable with the arm that holds it, droppable as
+  // debris, carvable per voxel. Nothing downstream needs an "is this an item"
+  // branch, which is precisely why the item is not welded on as a special case.
+  //
+  // Placement composes SOCKET x GRIP, forward: the rig says where the fist
+  // closes (MobDef::sockets), the item says how it sits in that fist
+  // (ItemDef::grip). Pass nullptr to unequip.
+  //
+  // Returns false and changes nothing if the item cannot be held — no such
+  // socket, or the item declares no grip for this context. Both are content
+  // bugs that must be loud: the silent alternative parks the blade at the
+  // wearer's origin, which reads as a physics glitch rather than missing JSON.
+  bool EquipItem(const ItemDef* item, const char* context = "held_right");
+  const std::string& HeldItem() const { return heldItem_; }
+  // The rig slot the held item occupies, or -1. Exposed so the melee damage
+  // path can exclude it from its own sweep.
+  int HeldSlot() const { return heldSlot_; }
 
   // The held weapon's cutting edge in WORLD voxels, from the part's authored
   // `edge` block through its live transform. False when nothing is held, the
@@ -231,6 +249,10 @@ class PlayerAvatar {
   // arms, so the wizard can see their own hands and staff. Empty in third
   // person. Set by main.cpp from the camera mode.
   void SetHiddenParts(const std::vector<uint8_t>& hidden);
+  // Total parts on the live rig, INCLUDING a borrowed item slot. Callers
+  // building a per-part array (the first-person hide list) must size against
+  // this rather than the def's limb count, which does not know about items.
+  int PartCount() const { return (int)parts.size(); }
 
   // introspection (overlay / selftest)
   // Jolt body of a part, or 0 when it is severed or never spawned. Mirrors
@@ -357,6 +379,28 @@ class PlayerAvatar {
   bool running_ = false;
   float airTime_ = 0;
   uint64_t id_ = 0x5A11EDU;          // stable seed for gore variance
+  // ---- the rig this instance actually animates ----------------------------
+  //
+  // A COPY of def_->skel plus def_->limbs, owned per instance, because a held
+  // ITEM borrows a real rig slot: equipping appends a part, and the shared def
+  // must not grow a sword every time somebody picks one up. Everything that
+  // used to read def_->skel / def_->limbs reads these instead, so an item slot
+  // is indistinguishable from a limb to the animation runtime, the IK, the
+  // renderer and the damage path — which is the entire point of the borrowed
+  // slot, and what preserves severing, dropping and per-voxel carving for free.
+  //
+  // Rebuilt from the def on spawn and on hot reload; `parts`, `skel_.parts`
+  // and `limbs_` stay index-parallel, which several loops depend on.
+  AnimSkeleton skel_;
+  std::vector<MobLimbDef> limbs_;
+  const AnimSkeleton& Skel() const { return skel_; }
+
+  // The equipped item's slot, or -1. This is the ONE piece of entity<->slot
+  // state; keeping the sync in EquipItem alone is what stops the two views of
+  // "what is in the hand" from drifting.
+  int heldSlot_ = -1;
+  std::string heldItem_;
+
   // Held weapon + swing pose, pushed in by main.cpp (SetWeaponPose). Pure
   // presentation, like everything else here.
   std::string heldPart_;

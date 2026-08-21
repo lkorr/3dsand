@@ -57,8 +57,15 @@ dot(model +X in world, camera Right) = -1.000 at every heading. The scene ->
 engine map (x, z, -y) negates y, which flips handedness, so the intuitive
 "it faces -Y, therefore +X is its right" is wrong — that reasoning had every
 .L/.R limb on the wrong side of both characters until 2026-08-21. So .L limbs
-sit at POSITIVE scene x and .R limbs at negative, and the sword (held in
-hand.R) hangs off model -X.
+sit at POSITIVE scene x and .R limbs at negative.
+
+This rig carries NO WEAPON. A held item is a standalone asset with its own
+.vox and its own origin (assets/items/, scripts/gen_sword_item.py); this file
+publishes a SOCKET on hand.R and the runtime composes socket x grip to place
+it. The sword lived here as a `"tag": "prop"` limb until the handedness fix
+above moved hand.R to model -X and took the blade to engine x -30 — geometry
+at negative prefab-local coordinates, which that space cannot hold, drawing
+the body offset from where its own arm solved.
 
 Run:  python scripts/gen_mina.py
 """
@@ -78,8 +85,8 @@ TRIM = 49       # robe_trim    gold, faintly emissive — the sash
 SHADE = 50      # robe_shadow  near-black indigo: hood interior and the face
 SKIN = 51       # skin         the one hand
 LEATHER = 53    # leather      shoes under the hem
-STEEL = 57      # steel        the sword blade, guard and pommel
-GRIP = 58       # grip_leather the wrapped hilt
+# STEEL/GRIP are the sword's palette entries and live with the sword now
+# (scripts/gen_sword_item.py); the figure itself is cloth, skin and leather.
 
 SCALE = 4       # micro voxels per world voxel
 WORLD_H = 17    # world voxels, head to toe — matches Player::kHalfY * 2
@@ -410,98 +417,6 @@ def foot_vox(size):
     return flip_y(size, out)
 
 
-# ---- the sword --------------------------------------------------------------
-# A held prop, exactly like the wizard's staff: parented to hand.R, severable,
-# not vital, low hp — so losing the hand drops it as ordinary debris and no
-# code anywhere has to special-case "the player is disarmed".
-#
-# The geometry below is the ONE source of truth for where the edge is. The
-# melee sweep (game/melee.cpp) needs a segment in the sword's own local frame
-# to carve along, and re-measuring it by eye in C++ would rot the moment the
-# art changes — so the numbers are emitted into the sidecar as `edge` and the
-# engine reads them.
-#
-# THE BLADE RUNS ALONG SCENE +X (the figure's right), NOT UP ITS OWN Z.
-#
-# Two constraints pin this down and they are both load-bearing:
-#
-#  1. ORTHOGONAL TO THE ARM. A sword built up the model's Z axis is parallel
-#     to the forearm, which puts it INSIDE the arm: the fist closes on thin
-#     air and the blade occupies the same space as the limb holding it. A
-#     gripped weapon crosses the forearm at a right angle and KEEPS that
-#     angle through the swing — the arm moves, the wrist does not swivel.
-#
-#  2. IT MUST NOT INFLATE THE PREFAB BOX. `MobDef::worldSize` is the whole
-#     prefab's bounding box, and the avatar derives origin_, the gait pivot
-#     and its standing height from it (avatar.cpp). A blade projecting 28
-#     micro out the FRONT tripled the rig's Z depth (4.0 -> 11.0 world
-#     voxels), which moved the body's reference frame and widened the walk
-#     until the legs failed their own upright assertion. Laying the blade
-#     along X — the axis the skirt already makes 20 micro wide — costs the
-#     box nothing.
-#
-# So: long axis x, guard crossing y, flat of the blade thin in z.
-#
-# The `edge` block in the sidecar states this axis explicitly rather than
-# assuming one, and mob.cpp maps scene -> engine when it reads it — so the art
-# and the hitbox rotate together and neither can be fixed without the other.
-SWORD_LEN = 44          # micro, pommel butt to tip: 11 world voxels
-SWORD_GRIP = 10         # micro of hilt behind the guard
-SWORD_GUARD = 2         # micro of crossguard
-SWORD_HALF_W = 3        # blade half-width at the widest (micro)
-
-
-def sword_vox(size):
-    """A straight, tapering, double-edged blade on a wrapped hilt, lying along
-    the box's X axis with the pommel at low x and the tip at high x. Thin in Z
-    (the flat of the blade), so it reads as a blade rather than a bar, and the
-    taper is what makes the tip the part that bites.
-
-    No flip_y: the blade is symmetric in y, so mirroring it would be a no-op
-    that only invites confusion about which end is the point.
-
-    MIRRORED IN X at the end. The sword is held in the RIGHT hand, which is at
-    model -X (see the handedness note in LIMBS), so the blade points outboard
-    along -X: the TIP is at low x and the pommel at high x, against the fist.
-    The body is built pommel-first because that is how the profile reads, then
-    flipped once — the same trick flip_y plays for the figure's facing."""
-    sx, sy, sz = size
-    out = []
-    cy, cz = sy * 0.5, sz * 0.5
-    guard_x = SWORD_GRIP + SWORD_GUARD
-
-    for x in range(sx):
-        if x < 2:
-            # pommel: a squat steel knob, wider than the grip
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, 1.6, 1.6):
-                        out.append((x, y, z, STEEL))
-        elif x < SWORD_GRIP:
-            # wrapped grip
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, 1.1, 1.1):
-                        out.append((x, y, z, GRIP))
-        elif x < guard_x:
-            # crossguard: a bar across Y, thin in Z
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, sy * 0.5, 1.0):
-                        out.append((x, y, z, STEEL))
-        else:
-            # blade: full width at the ricasso, tapering to a point. Thin in Z
-            # (half-thickness 1) so the flat reads flat.
-            t = (x - guard_x) / max(sx - 1 - guard_x, 1)
-            hw = SWORD_HALF_W * (1.0 - 0.65 * t * t)
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, hw, 1.0):
-                        out.append((x, y, z, STEEL))
-    # tip to low x, pommel to high x (see the docstring)
-    return [(sx - 1 - x, y, z, m) for (x, y, z, m) in out]
-
-
 # ---- limb table -------------------------------------------------------------
 # name -> (size, min-corner in SCENE space, default material)
 #
@@ -542,8 +457,14 @@ LIMBS = {
     # Arms hang just clear of the torso (which spans x -4..4): a 1-micro gap
     # either side. Overlapping them into the chest is what turned the first
     # draft into an unbroken slab from shoulder to sash with no waist.
-    # HANDEDNESS: model +X is the character's LEFT. See the derivation by the
-    # sword below — .L limbs take the POSITIVE x offsets, .R the negative.
+    # HANDEDNESS: model +X is the character's LEFT, so .L limbs take the
+    # POSITIVE x offsets and .R the negative. This is NOT the "obvious" reading
+    # and it has been got wrong once already: the .vox -> engine map is
+    # (x, z, -y), which negates y and therefore FLIPS handedness, so the
+    # natural "front = +y, right = +x" intuition does not survive the load.
+    # It was verified from the camera basis rather than argued from the
+    # facing: dot(model +X in world, camera Right) = -1.000 across yaws.
+    # Derive the side from the camera basis, never from the facing alone.
     "armU.L":   (( 4,  4,  8), (  4, -2, 37), ROBE),
     "armL.L":   (( 4,  4,  7), (  4, -2, 31), ROBE),
     "hand.L":   (( 4,  4,  4), (  4, -2, 28), SKIN),
@@ -558,30 +479,9 @@ LIMBS = {
     "legL.R":   (( 4,  4, 11), (-4, -2,  4), SHADE),
     "foot.R":   (( 4,  7,  4), (-4, -4,  0), LEATHER),
 
-    # The sword, held in the RIGHT hand (scene -X: hand.R spans x -8..-4),
-    # lying along X so the blade crosses the forearm at a right angle and
-    # reaches out to the figure's right, clear of the body.
-    #
-    # WHICH SIDE IS RIGHT (this was wrong until 2026-08-21, and the wrong
-    # comment is what kept it wrong — do not "restore" it):
-    #
-    #   Camera::Right() = Forward() x (0,1,0)  [game/camera.cpp:23], and the
-    #   rig heading is h = pi/2 - cam.yaw with model->world a rotation about
-    #   +Y by h. Compose those and dot(model +X in world, camera Right) is
-    #   -1.000 at EVERY heading: model +X is screen-LEFT, i.e. the character's
-    #   LEFT side. So the character's RIGHT is model -X.
-    #
-    #   The old comment reasoned "the figure faces -Y, so +X is its right",
-    #   which quietly assumes a left-handed scene basis. The .vox -> engine
-    #   map is (x, z, -y): it negates y, which FLIPS handedness, so the
-    #   natural "front = +y, right = +x" reading does not survive the load.
-    #   Derive the side from the camera basis, never from the facing alone.
-    #
-    # The grip (SWORD_GRIP micro from the pommel) lands on the hand's centre
-    # at x=-6, and the blade runs outward along -X, so the box starts at the
-    # tip. See the axis note by sword_vox for why this is X and not Z.
-    "sword":    (( SWORD_LEN, 2 * SWORD_HALF_W, 4),
-                 ( -6 - SWORD_LEN + SWORD_GRIP, -SWORD_HALF_W, 28), STEEL),
+    # NO SWORD HERE. A held weapon is a standalone item with its own .vox and
+    # its own origin (assets/items/, scripts/gen_sword_item.py); the rig
+    # publishes a SOCKET on hand.R instead. See the socket block in main().
 }
 
 SHAPES = {
@@ -592,7 +492,6 @@ SHAPES = {
     "legU.L": thigh_vox, "legU.R": thigh_vox,
     "legL.L": shin_vox, "legL.R": shin_vox,
     "foot.L": foot_vox, "foot.R": foot_vox,
-    "sword": sword_vox,
 }
 
 # Parent-before-child; the loader also topologically sorts, but authoring in
@@ -601,12 +500,20 @@ ORDER = ["hips", "torso", "head",
          "armU.L", "armL.L", "hand.L",
          "armU.R", "armL.R", "hand.R",
          "legU.L", "legL.L", "foot.L",
-         "legU.R", "legL.R", "foot.R",
-         "sword"]
+         "legU.R", "legL.R", "foot.R"]
 
 # Held props: in the rig, but not part of the figure's own silhouette. The
-# height contract in main() measures the body without these.
-PROPS = {"sword"}
+# height contract and the prefab-origin measurement in main() both exclude
+# these, mirroring the loader (mob.cpp skips tag == "prop" when it measures
+# worldSize).
+#
+# EMPTY NOW, AND THAT IS THE POINT. The sword was the only entry; it is a
+# standalone item today (assets/items/, scripts/gen_sword_item.py) held
+# through the hand.R socket, so nothing the figure carries can reach into
+# these measurements at all. The mechanism stays because the exclusion rule
+# is still correct for any prop that IS genuinely part of a rig — but a
+# WEAPON should be an item, not a prop.
+PROPS = set()
 
 
 def to_engine(scene_xyz, min_x, max_y):
@@ -813,37 +720,50 @@ def main():
             "anchor": joint_bottom(f"foot.{side}", dy=-1.5, rise=3.0),
             "severImpactSpeed": 12.0})
 
-    # The sword is a HELD PROP, following the staff precedent in gen_wizard.py:
-    # parented to the hand, severable, not vital, and cheap to knock loose. It
-    # is a normal rig part, so it inherits animation, rendering, carving and
-    # the debris hand-off with no new code — and losing the right hand drops it
-    # exactly the way losing that hand should.
+    # ---- sockets: where an ITEM attaches ------------------------------------
     #
-    # Its grip is at the HAND, partway ALONG the shaft, not at either end. The
-    # blade lies along X now (see sword_vox), so the pivot is derived on that
-    # axis rather than through joint_bottom, which measures height.
-    sword_sz, sword_mn, _ = LIMBS["sword"]
+    # THE SWORD IS NOT IN THIS RIG. It used to be, as a `"tag": "prop"` limb
+    # parented to hand.R, and that is precisely what broke: prefab-local space
+    # is rebased on the BODY's min corner (props are excluded from that
+    # measurement, because a creature's size must not change with its
+    # luggage), so once the handedness fix put the right hand at model -X the
+    # blade reached to engine x -30 — thirty micro of geometry at NEGATIVE
+    # prefab-local coordinates, which that space cannot represent. The body
+    # drew offset from where the arm actually solved.
+    #
+    # An item now owns its own .vox and its own origin
+    # (assets/items/sword.*, scripts/gen_sword_item.py) and BORROWS this
+    # socket at runtime. The rig states only where the fist closes; the item
+    # states how it sits in that fist (its `grip` block), and the runtime
+    # composes socket x grip. Splitting it on that seam is what lets one
+    # sword be held by any rig with a hand, and what keeps a weapon from ever
+    # again inflating the body it is held by.
+    #
+    # A socket is a POINT AND A FRAME, in the same prefab-local world voxels
+    # as every anchor, derived from the hand box so resizing the hand keeps
+    # the grip in it.
     hand_sz, hand_mn, _ = LIMBS["hand.R"]
-    limbs.append({
-        "name": "sword", "parent": "hand.R", "joint": "ball",
-        "hp": 30, "severable": True, "tag": "prop",
-        # Pivot AT THE FIST: at the grip point along the shaft, centred on the
-        # hand in y/z. Derived from the two limb boxes so resizing either one
-        # keeps the sword in the hand.
-        # The box is mirrored in x (tip at low x), so the grip sits GRIP micro
-        # from the high-x end rather than from the low-x end.
-        "anchor": anchor((sword_mn[0] + sword_sz[0] - SWORD_GRIP,
+    sockets = [{
+        # The socket is named for the CONTEXT an item asks to be held in, not
+        # for the limb it rides — those are two different questions and
+        # conflating them is a bug. An item declares grips per context
+        # ("held_right"), so that is the key it looks up here; `part` is the
+        # separate matter of which limb carries this context on THIS rig.
+        # A left-handed creature would put "held_right" on its own hand.L and
+        # every item would still hang correctly with no per-item edits.
+        "name": "held_right",
+        "part": "hand.R",
+        # Centre of the fist. The item's own translation is what slides it so
+        # the right point along the blade lands here.
+        "offset": anchor((hand_mn[0] + hand_sz[0] * 0.5,
                           hand_mn[1] + hand_sz[1] * 0.5,
                           hand_mn[2] + hand_sz[2] * 0.5)),
-        "severImpactSpeed": 7.0,
-        # The blade's own frame, in MICRO units along the model's -X (outboard
-        # on the RIGHT side: the axis sword_vox lays the blade on). The melee
-        # sweep carves along this segment; emitting it from the same constants
-        # that built the mesh is what keeps the hitbox and the art from
-        # drifting apart (see the note by sword_vox above).
-        "edge": {"from": SWORD_GRIP + SWORD_GUARD, "to": SWORD_LEN,
-                 "axis": [-1, 0, 0], "halfWidth": SWORD_HALF_W},
-        "spring": {"halflife": 0.09, "gain": 0.35, "maxAngle": 0.15}})
+        # No rotation: the socket frame IS the hand's frame. Every weapon's
+        # own orientation is its business, stated in its grip block — putting
+        # a rotation here too would mean two places encode "which way does a
+        # held thing point" and they would drift apart.
+        "rotation": [0, 0, 0],
+    }]
 
     # ---- IK chains ----
     # Legs are gait-driven. Arms get chains too so the avatar code can plant a
@@ -1297,6 +1217,7 @@ def main():
             "rollAmp": 0.06, "spineCounter": 0.75, "phaseLag": 0.05,
         },
         "limbs": limbs,
+        "sockets": sockets,
         "chains": chains,
         "states": states,
         "clips": clips,
