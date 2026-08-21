@@ -42,6 +42,7 @@
 #include "sim/world.h"
 #include "sim/worldio.h"
 #include "ui/overlay.h"
+#include "crash.h"
 
 namespace {
 
@@ -4313,6 +4314,8 @@ bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  InstallCrashHandler();
+
   bool selftest = false;
   bool shot = false;
   bool lowPowerAdapter = false;

@@ -154,6 +154,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(sandvox
   src/main.cpp
+  src/crash.cpp
   src/gpu/context.cpp
   src/gpu/resources.cpp
   src/sim/world.cpp
@@ -216,6 +217,7 @@ target_link_libraries(sandvox PRIVATE
   imgui_lib
   nlohmann_json::nlohmann_json
   Jolt
+  dbghelp
 )
 
 # Run from any cwd: bake the asset dir absolute path for dev builds.
