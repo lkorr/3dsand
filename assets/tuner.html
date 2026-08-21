@@ -635,12 +635,33 @@
   .edhelp{margin-top:6px;display:block}
 
   /* ---------- models: rig panel + timeline ---------- */
-  .edmain{display:flex;gap:10px;align-items:stretch}
-  .edmain .edviewport{flex:1;min-width:0}
+  .edmain{display:flex;gap:0;align-items:stretch}
+  .edmain .edviewport{flex:1;min-width:220px}
   .edside{
-    width:320px;flex:none;overflow-y:auto;max-height:calc(100vh - 340px);
+    width:320px;flex:none;overflow-y:auto;overflow-x:hidden;
+    max-height:calc(100vh - 340px);
     background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;
   }
+  /* Drag handle on the side panel's LEFT edge. It owns the gap that `.edmain`
+     used to provide (hence gap:0 above), so widening the panel does not also
+     shift the seam the pointer is holding. */
+  .edgrip{
+    flex:none;width:10px;margin:0 1px;align-self:stretch;
+    cursor:col-resize;position:relative;border-radius:5px;
+    display:flex;align-items:center;justify-content:center;
+    touch-action:none;
+  }
+  .edgrip::before{
+    content:'';width:2px;height:26px;border-radius:1px;
+    background:var(--line2);transition:background .12s,height .12s;
+  }
+  .edgrip:hover::before{background:var(--acc);height:44px}
+  .edgrip.dragging::before{background:var(--acc);height:100%}
+  /* While dragging, the pointer is captured by the grip; killing selection and
+     pointer-events elsewhere stops the canvas from stealing the drag or the
+     page from blue-highlighting the panel text. */
+  body.edresizing{cursor:col-resize;user-select:none}
+  body.edresizing .edcanvas{pointer-events:none}
   .righdr{
     display:flex;align-items:center;gap:8px;margin:10px 0 6px;
     color:var(--dim);font-family:var(--mono);font-size:11.5px;
@@ -657,16 +678,23 @@
   .rigrow.on{background:#1d3a6e;color:#dce8ff}
   .rigrow .rigdim{color:var(--faint);font-size:10.5px;min-width:56px}
   /* Editable box size in the model row: three tight number cells. Spinners
-     are hidden — the row is cramped and the value is usually typed. */
-  .rigdimedit{display:inline-flex;align-items:center;gap:1px;min-width:0}
-  .rigdimedit i{color:var(--faint);font-style:normal;font-size:9px}
-  .rigdimedit input{width:26px;padding:1px 2px;font-size:10.5px;text-align:center;
+     are hidden — the row is cramped and the value is usually typed.
+     NOTE the doubled `.rigdimedit` selectors: these inputs carry `cell num`,
+     and the generic `input.cell.num{width:64px}` up top outweighs a plain
+     `.rigdimedit input`. Without the extra class the three boxes render at
+     64px each and shove x×y×z past the right edge of the panel. */
+  .rigdimedit{display:inline-flex;align-items:center;gap:1px;min-width:0;flex:none}
+  .rigdimedit i{color:var(--faint);font-style:normal;font-size:9px;flex:none}
+  .rigdimedit.rigdimedit input.cell.num{
+    width:32px;min-width:0;flex:none;padding:1px 2px;font-size:10.5px;text-align:center;
     background:var(--bg2);border:1px solid transparent;border-radius:3px;color:var(--dim)}
-  .rigdimedit input:hover{border-color:var(--line)}
-  .rigdimedit input:focus{border-color:var(--acc);color:var(--fg);outline:none}
+  .rigdimedit.rigdimedit input.cell.num:hover{border-color:var(--line)}
+  .rigdimedit.rigdimedit input.cell.num:focus{border-color:var(--acc);color:var(--fg);outline:none}
   .rigdimedit input::-webkit-outer-spin-button,
   .rigdimedit input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
-  .rigrow input.id{flex:1;min-width:0}
+  /* Same fight, other side: `input.cell.id{width:110px}` is a floor the flex
+     item cannot shrink below, so a long limb name pushes the row wide. */
+  .rigrow input.cell.id{flex:1;min-width:0;width:0}
   .rigdot{width:6px;height:6px;border-radius:50%;background:var(--amber);flex:none}
   .rigbody{padding:4px 4px 10px 10px;border-left:2px solid var(--line2);margin:2px 0 6px}
   .rigf{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:12px}
