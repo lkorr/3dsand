@@ -5120,7 +5120,7 @@ int main(int argc, char** argv) {
             MicroBodyRef packed{};
             if (mi >= 0) {
               packed.model = (uint32_t)mi;
-              packed.scale = kSphereScale;
+              packed.skinScale = kSphereScale;
               sim.UploadMicroBodies(ctx.queue, mbSet);
             }
             // a failed pack caches as invalid: fall back to the cube path

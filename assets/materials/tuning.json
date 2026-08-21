@@ -473,7 +473,7 @@
     "starRotSpeed": 1
   },
   "weather": {
-    "waterFreezes": true,
-    "iceMelts": true
+    "waterFreezes": false,
+    "iceMelts": false
   }
 }
