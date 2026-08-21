@@ -68,6 +68,23 @@ struct UIState {
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
   bool visible = true;
+
+  // ---- magic (game/spell.h, game/caster.h) --------------------------------
+  // The crossover readout — where the running cost stops coming out of mana
+  // and starts coming out of health — IS the tension mechanic, so it gets a
+  // real visual break rather than a number.
+  bool magicMode = false;         // number row speaks glyphs instead of picking
+                                  // a brush material
+  int32_t mana = 0, manaMax = 0;  // manaMax is the ward-adjusted EFFECTIVE max
+  int32_t health = 0;
+  int32_t spellCost = 0;          // running cost of the spoken sequence
+  std::string spellText;          // "lava + trail + projectile"
+  std::string spellVerdict;       // what the VM thinks it is
+  int spellOutcome = -1;          // last CastOutcome, -1 = none yet
+  int liveProjectiles = 0;
+  int spellOpsDropped = 0;        // ops the reservation could not fit (§F)
+  // slot -> glyph id, for the bound-key strip. Empty string = unbound slot.
+  std::vector<std::string> glyphSlots;
 };
 
 class Overlay {

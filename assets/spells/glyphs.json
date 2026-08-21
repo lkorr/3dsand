@@ -1,0 +1,110 @@
+{
+  "comment": "Glyphs are CONTENT, like materials.json and reactions.json — not look-and-feel knobs like tuning.json. A glyph is a word of the ancient language: speaking it pushes a value on the caster VM's typed stack, and the cast key applies 'cast' to whatever is on top. Materials are referenced BY NAME and resolved to 12-bit ids at load (game/spell.cpp); a name that does not resolve is a LOUD error, never a silent id 0. Hot-reloads on R alongside materials.json. Types: element (names a material), form (turns the stack into a live effect), modifier (decorates the spell). Costs are integer mana — the VM is integer throughout so a spell is replayable and lockstep-safe (DESIGN.md §8).",
+
+  "budgets": {
+    "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front, so no spell can hold a chunk awake forever. These are hard engine ceilings; a glyph's own budget is clamped to them at load.",
+    "maxLiveProjectiles": 32,
+    "maxGeneration": 3,
+    "maxTrailVoxels": 256,
+    "maxLifetimeTicks": 300
+  },
+
+  "glyphs": [
+    {
+      "id": "water",
+      "type": "element",
+      "material": "water",
+      "mana": 4,
+      "backfire": "drown",
+      "desc": "The word for water. Alone it is only a name; give it a form and it moves."
+    },
+    {
+      "id": "lava",
+      "type": "element",
+      "material": "lava",
+      "mana": 14,
+      "backfire": "burn",
+      "desc": "Molten stone. Expensive, and it does not care whose flesh it lands on."
+    },
+    {
+      "id": "acid",
+      "type": "element",
+      "material": "acid",
+      "mana": 12,
+      "backfire": "dissolve",
+      "desc": "Eats stone and meat alike. Backfiring on acid turns the speaker into it."
+    },
+    {
+      "id": "sand",
+      "type": "element",
+      "material": "sand",
+      "mana": 3,
+      "backfire": "bury",
+      "desc": "The cheapest matter there is. Good for practising without dying."
+    },
+
+    {
+      "id": "projectile",
+      "type": "form",
+      "form": "projectile",
+      "mana": 6,
+      "speed": 48,
+      "lifetimeTicks": 150,
+      "impactRadius": 3,
+      "desc": "Hurls the spell from the caster's hand. speed is voxels/tick in 24.8 fixed point; lifetimeTicks bounds it absolutely (rule 2)."
+    },
+
+    {
+      "id": "trail",
+      "type": "modifier",
+      "modifier": "trail",
+      "mana": 8,
+      "radius": 0,
+      "voxelBudget": 200,
+      "everyTicks": 2,
+      "desc": "Lays the spell's element behind the projectile. voxelBudget is a hard VOLUME budget (an op of radius r costs (2r+1)^3), not an op count, so a fat trail costs proportionally more; when it runs out the trail stops and the projectile dies. That bound is what stops a trail spell pinning chunks awake. radius 0 = one voxel per mark: at 48 voxels/tick a radius-1 mark costs 27 voxels, so anything wider spends the whole budget within a tick or two and reads as a blob rather than a trail."
+    },
+    {
+      "id": "transmute",
+      "type": "modifier",
+      "modifier": "transmute_to",
+      "mana": 10,
+      "radius": 3,
+      "desc": "Converts what the projectile hits into the spell's element, via the same melt-mode overwrite BrushOp the laser uses. Target material is the element on the stack — 'acid transmute projectile' throws a bolt that turns rock to acid."
+    }
+  ],
+
+  "conjoined": {
+    "comment": "STUB (§G). A conjoined glyph is nothing but a saved list of glyph ids that pushes the same result as speaking them in order — no new VM opcode, no crafting UI yet. Present so the data model and the loader already carry the shape.",
+    "entries": [
+      {
+        "id": "firebolt",
+        "glyphs": ["lava", "trail", "projectile"],
+        "desc": "The worked example: a lava bolt that leaves a burning wake."
+      },
+      {
+        "id": "acid_lance",
+        "glyphs": ["acid", "transmute", "projectile"],
+        "desc": "Turns whatever it strikes into acid, which then does the rest on its own."
+      }
+    ]
+  },
+
+  "wards": {
+    "comment": "STUB (§G). Wards are NOT implemented — this block only fixes the shape. Intended semantics: a ward filters the incoming OP STREAM on the CPU (cheap, sim untouched), never the CA itself. So a ward stops someone CASTING acid at your feet; it does not stop acid already flowing toward you. That is deliberate — it keeps the falling-sand game underneath, and makes 'cast next to them and let physics do it' the counterplay. drainFraction reduces EFFECTIVE MAX MANA by a FRACTION (per-mille here, integer like everything else): a flat cost would let a big late-game pool buy invulnerability, whereas a fraction keeps a ward a real choice at every scale.",
+    "entries": [
+      {
+        "id": "ward_transmute",
+        "filter": "transmute_to",
+        "drainPerMille": 200,
+        "desc": "Refuses transmutation ops targeting cells within radius of the warded caster."
+      },
+      {
+        "id": "ward_projectile",
+        "filter": "projectile",
+        "drainPerMille": 300,
+        "desc": "Absorbs incoming projectiles before they resolve their impact."
+      }
+    ]
+  }
+}

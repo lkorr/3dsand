@@ -17,7 +17,9 @@
 #include "game/avatar.h"
 #include "game/brush.h"
 #include "game/camera.h"
+#include "game/caster.h"
 #include "game/mob.h"
+#include "game/spell.h"
 #include "game/player.h"
 #include "game/prefab.h"
 #include "game/thirdperson.h"
@@ -3531,11 +3533,147 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                 stream.Store().Count());
   }
 
+  // ---- spells: budget discipline and the overcast ---------------------------
+  // What is asserted here is INVARIANTS, not plausible-looking numbers — the
+  // project's own lesson that a rate comparison proves nothing (see the pond
+  // gate above). Three things, each of which fails loudly if the structure is
+  // wrong rather than merely mistuned:
+  //
+  //   1. The trail's voxel budget is respected EXACTLY. Not "roughly bounded":
+  //      the total volume the trail ever authorizes must be <= the authored
+  //      budget, and the projectile must be dead once it is spent. That is the
+  //      rule-2 guarantee, and it is the one that keeps a trail spell from
+  //      becoming the fourth never-sleeping-chunk bug.
+  //   2. An overcast KILLS the caster. Specifically: a spell costing more than
+  //      mana + health resolves Fatal, and a Fatal cast emits its effect and
+  //      asks for the caster to be carved — i.e. backfire runs the spell's own
+  //      payload rather than special-case death code.
+  //   3. Every emission is an OP. The VM must produce ops and nothing else;
+  //      if a spell ever needed a non-op channel, thesis 1 is broken.
+  bool spellOk = false;
+  {
+    GlyphLibrary lib;
+    std::string gerr;
+    const std::string gpath = AssetDir() + "/spells/glyphs.json";
+    if (!LoadGlyphs(gpath, mats, lib, gerr)) {
+      std::printf("spells: FAIL (glyph load: %s)\n", gerr.c_str());
+    } else {
+      SpellSystem sys;
+      sys.SetLibrary(&lib);
+      std::vector<uint32_t> classOf;
+      for (const auto& m : mats) classOf.push_back(m.gpu.klass);
+
+      // (1) trail budget. Speak sand + trail + projectile and fly it in open
+      // air, counting every voxel the trail authorizes.
+      int gSand = lib.Find("sand"), gTrail = lib.Find("trail"),
+          gProj = lib.Find("projectile");
+      int64_t trailVolume = 0;
+      int32_t authoredBudget = 0;
+      bool diedWithBudget = false;
+      int flownTicks = 0;
+      if (gSand >= 0 && gTrail >= 0 && gProj >= 0) {
+        authoredBudget = lib.glyphs[gTrail].voxelBudget;
+        SpellStack st;
+        st.spoken = {gSand, gTrail, gProj};
+        Spell sp = CompileSpell(lib, st);
+        CasterState cs;
+        cs.mana = 10000;   // fund it fully: this gate is about the BUDGET
+        cs.manaMax = 10000;
+        // A health source that never dies, so nothing here depends on the
+        // avatar being spawned.
+        static int32_t kFakeHp = 10000;
+        CasterHealth hp;
+        hp.ctx = &kFakeHp;
+        hp.get = [](void* c) { return *(int32_t*)c; };
+        hp.spend = [](void* c, int32_t a) { *(int32_t*)c -= a; };
+
+        // Fire horizontally through open air, INSIDE the current residency
+        // window. The window origin is wherever the streaming gate above left
+        // it, and out-of-window space is solid (DESIGN.md §3) — so a fixed
+        // world position makes this gate depend on test ordering, and the
+        // projectile detonates on tick 1 against the window wall. Anchor to
+        // the live origin and aim toward the window's middle instead.
+        const IVec3 worg = world.WindowOrigin();
+        const int sx = worg.x * (int)kChunk + 8;
+        const int sz = worg.z * (int)kChunk + (int)kWorldN / 2;
+        const int sy = worg.y * (int)kChunk + (int)kWorldN / 2;
+        SpellEmission emit;
+        SpellFxVec origin{SpellFxFromFloat((float)sx), SpellFxFromFloat((float)sy),
+                          SpellFxFromFloat((float)sz)};
+        SpellFxVec dir{kSpellFxOne, 0, 0};
+        sys.Cast(sp, cs, hp, 1, origin, dir, 1, emit);
+        // Count ONLY trail ops. The impact effect emits its own op at the
+        // transmute/impact radius, and folding that into the trail total is
+        // how the first version of this gate reported 343 voxels against a 64
+        // budget — the budget was fine and the measurement was wrong. Trail
+        // ops are exactly the ones at the trail glyph's radius in paint mode.
+        const int32_t trailRadius = lib.glyphs[gTrail].radius;
+        for (int t = 0; t < (int)lib.budgets.maxLifetimeTicks + 10; t++) {
+          SpellEmission e;
+          sys.Tick((uint32_t)(2 + t), world, classOf, e);
+          for (const BrushOp& b : e.ops) {
+            if (b.mode != 0u || b.radius != trailRadius) continue;
+            int64_t d = 2 * (int64_t)b.radius + 1;
+            trailVolume += d * d * d;
+          }
+          flownTicks++;
+          if (sys.LiveCount() == 0) {
+            diedWithBudget = true;
+            break;
+          }
+        }
+      }
+      // EXACT respect: the trail may never authorize more volume than it was
+      // budgeted, and the projectile must not outlive the budget.
+      const bool budgetOk = authoredBudget > 0 && trailVolume > 0 &&
+                            trailVolume <= authoredBudget && diedWithBudget;
+
+      // (2) the overcast. Cost beyond mana + health must resolve Fatal, and a
+      // Fatal cast must run the spell's own payload AT the caster.
+      int gLava = lib.Find("lava");
+      bool fatalOk = false, carveAsked = false, fatalEmitted = false;
+      if (gLava >= 0 && gProj >= 0) {
+        SpellStack st;
+        st.spoken = {gLava, gProj};
+        Spell sp = CompileSpell(lib, st);
+        CasterState cs;
+        cs.mana = 1;
+        cs.manaMax = 100;
+        static int32_t kTinyHp = 2;   // mana + health = 3, well under the cost
+        CasterHealth hp;
+        hp.ctx = &kTinyHp;
+        hp.get = [](void* c) { return *(int32_t*)c; };
+        hp.spend = [](void* c, int32_t a) { *(int32_t*)c -= a; };
+        CastResult pre = ResolveCast(cs, kTinyHp, sp.manaCost);
+        SpellEmission emit;
+        CastResult res = sys.Cast(sp, cs, hp, 2, {0, 0, 0}, {kSpellFxOne, 0, 0},
+                                  3, emit);
+        fatalOk = pre.outcome == CastOutcome::Fatal &&
+                  res.outcome == CastOutcome::Fatal;
+        carveAsked = emit.carveCaster;
+        // The payload ran: lava's backfire is an explosion, and it is emitted
+        // by ApplySpellEffect rather than by any death-specific branch.
+        fatalEmitted = !emit.explosions.empty() || !emit.ops.empty();
+        // A fatal cast must NOT also launch the projectile — the spell goes
+        // off at the caster instead of leaving the hand.
+        fatalOk = fatalOk && sys.LiveCount() == 0;
+      }
+
+      spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted;
+      std::printf(
+          "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
+          "overcast fatal=%d carve=%d payload=%d)\n",
+          spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget,
+          flownTicks, diedWithBudget ? 1 : 0, fatalOk ? 1 : 0,
+          carveAsked ? 1 : 0, fatalEmitted ? 1 : 0);
+    }
+  }
+
   bool perfOk = simMs < 8.0 && bestFrameMs < 16.0;
   std::printf("perf: %s\n", perfOk ? "PASS" : "MARGINAL (see numbers above)");
   bool pass = deterministic && walkOk && sleepOk && pondOk && evapOk && stainOk && fullOk && debrisOk &&
               prefabOk && mobOk && settleOk && pushOk && saveOk && storeOk &&
-              streamOk && farDownOk && fogOk;
+              streamOk && farDownOk && fogOk && spellOk;
   std::printf("=== selftest %s ===\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }
@@ -3635,6 +3773,22 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("loaded %zu materials, %zu reactions\n", mats.size(), reactions.size());
+
+  // glyphs (assets/spells/glyphs.json — DESIGN.md §8 "The spell system").
+  // Content like materials.json, so it loads here and hot-reloads on the same
+  // key (R). A bad glyph file is a LOUD failure at startup rather than a spell
+  // that silently conjures air.
+  GlyphLibrary glyphs;
+  {
+    std::string gerr;
+    if (!LoadGlyphs(assetDir + "/spells/glyphs.json", mats, glyphs, gerr)) {
+      std::fprintf(stderr, "glyph load failed:\n%s", gerr.c_str());
+      return 1;
+    }
+    std::printf("loaded %zu glyphs (%zu conjoined, %zu wards)\n",
+                glyphs.glyphs.size(), glyphs.conjoined.size(),
+                glyphs.wards.size());
+  }
 
   // voxel art prefabs (PLAN §A): drop .vox files in assets/prefabs/
   std::vector<Prefab> prefabs;
@@ -3780,9 +3934,32 @@ int main(int argc, char** argv) {
   glfwGetCursorPos(window, &mx0, &my0);
 
   KeyEdge eP, eN, eV, eF1, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack;
+  KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
+  bool prevMouseR = false;
   std::vector<Grenade> grenades;
+
+  // ---- magic (game/spell.h, game/caster.h) ---------------------------------
+  // The VM is not player-coupled: SpellSystem takes an origin, a direction and
+  // a CasterState, so a mob can drive the identical call later. PlayerCaster is
+  // only the player's inventory + spoken stack, kept out of Player (which stays
+  // a clean movement controller).
+  SpellSystem spells;
+  spells.SetLibrary(&glyphs);
+  PlayerCaster caster;
+  caster.inventory.GrantAllAndBind(glyphs);   // placeholder acquisition
+  caster.Recompile(glyphs);
+  // Health lives on PlayerAvatar's per-part hp, read through this indirection
+  // so the VM never includes the avatar (thesis 4 in spell.h).
+  CasterHealth playerHealth;
+  playerHealth.ctx = &avatar;
+  playerHealth.get = [](void* c) {
+    return ((PlayerAvatar*)c)->TotalHealth();
+  };
+  playerHealth.spend = [](void* c, int32_t amount) {
+    ((PlayerAvatar*)c)->SpendHealth(amount);
+  };
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
@@ -3853,8 +4030,31 @@ int main(int argc, char** argv) {
       ui.brushRadius = std::max(1, ui.brushRadius - 1);
     if (eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
       ui.brushRadius = std::min(7, ui.brushRadius + 1);
-    for (int i = 0; i < 8; i++)
-      if (key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) ui.brushMaterial = i + 1;
+    // The number row is SHARED: it picks a brush material normally and SPEAKS
+    // glyphs in magic mode (Z). Both wanted 1-8 and the brush binding predates
+    // magic, so a mode toggle is what keeps the existing tool usable rather
+    // than silently stealing its keys.
+    if (!ui.magicMode) {
+      for (int i = 0; i < 8; i++)
+        if (key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) ui.brushMaterial = i + 1;
+    } else {
+      // Pressing a number SPEAKS that glyph — it never casts. Edge-triggered:
+      // a held key must not stutter the same word onto the stack.
+      for (int i = 0; i < kGlyphSlots; i++) {
+        // GLFW's number row is contiguous 1..9 then 0, and slot 10 is the 0
+        // key, matching the strip the HUD prints.
+        int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
+        if (captured && eGlyph[i].Pressed(key(k)))
+          caster.SpeakSlot(glyphs, i);
+      }
+    }
+    if (captured && eZ.Pressed(key(GLFW_KEY_Z))) {
+      ui.magicMode = !ui.magicMode;
+      if (!ui.magicMode) caster.Clear(glyphs);   // leaving mode abandons the spell
+    }
+    // Abandon a half-spoken spell. Backspace rather than a letter: it is the
+    // universal "undo what I just typed" key and the left hand is on WASD.
+    if (captured && eBack.Pressed(key(GLFW_KEY_BACKSPACE))) caster.Clear(glyphs);
 
     if (captured && eG.Pressed(key(GLFW_KEY_G))) {
       Grenade g;
@@ -3947,6 +4147,24 @@ int main(int argc, char** argv) {
         sim.UploadTables(ctx.queue, mats, reactions);
         debris.OnMaterialsReloaded(mats, reactions);
         stream.OnMaterialsReloaded(mats);
+        // Glyphs reload with materials, and MUST: a glyph holds a resolved
+        // 12-bit material id, so a materials edit that reorders the file would
+        // otherwise leave every element glyph naming the wrong matter. A failed
+        // reload keeps the old library rather than leaving the player with no
+        // magic — the diagnostic is the fix path.
+        {
+          GlyphLibrary next;
+          std::string gerr;
+          if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
+            glyphs = std::move(next);
+            spells.Clear();          // live projectiles hold stale glyph indices
+            caster.inventory.GrantAllAndBind(glyphs);
+            caster.Clear(glyphs);
+            std::printf("glyphs reloaded (%zu)\n", glyphs.glyphs.size());
+          } else {
+            std::fprintf(stderr, "glyph reload failed:\n%s", gerr.c_str());
+          }
+        }
         // prefabs hot-reload with materials: palette indices may map now
         std::string plog;
         LoadPrefabDir(assetDir + "/prefabs", mats.size(), prefabs, plog);
@@ -4063,13 +4281,23 @@ int main(int argc, char** argv) {
     // LMB routes to the active tool: continuous for brush/laser, click-edge
     // for one-shot tools (prefab stamp, mob spawn)
     bool mouseLClick = mouseL && !prevMouseL;
+    bool mouseRClick = mouseR && !prevMouseR;
     prevMouseL = mouseL;
+    prevMouseR = mouseR;
     if (mouseLClick && ui.tool == UIState::kToolPrefab) ui.placePrefab = true;
     if (mouseLClick && ui.tool == UIState::kToolMob) ui.spawnMob = true;
+    // THE CAST KEY is RMB, and only while magic mode is on.
+    //
+    // Chosen over Enter, which the brief suggested against for the right
+    // reason: the left hand lives on WASD and the right hand is already on the
+    // mouse for aiming, so Enter would mean leaving the number row to reach
+    // across the keyboard mid-fight. A spell is AIMED, so the cast belongs on
+    // the aiming hand. Magic mode is what keeps this from stealing brush-erase.
+    bool castPressed = captured && ui.magicMode && mouseRClick;
     bool laserHeld =
         captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
                      (ui.tool == UIState::kToolLaser && mouseL));
-    bool brushActive = ui.tool == UIState::kToolBrush;
+    bool brushActive = ui.tool == UIState::kToolBrush && !ui.magicMode;
     while (accumulator >= kTickDt && ticksThisFrame < 4) {
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
@@ -4380,6 +4608,75 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- magic (game/spell.h) ---------------------------------------------
+      // Same slot in the tick order as mobs and the avatar, and for the same
+      // reason: everything a spell does leaves as ops on the streams assembled
+      // below. The VM never touches a voxel buffer (thesis 1 / rule 3).
+      std::vector<ExplosionOp> spellExps;
+      {
+        caster.mana.Tick();
+        SpellEmission emit;
+
+        if (castPressed && !caster.stack.Empty()) {
+          // Origin at the muzzle — in front of the eye so the bolt does not
+          // spawn inside the caster's own head. Direction is the aim ray.
+          const Vec3 eye = player.EyePos();
+          const Vec3 fwd = cam.Forward();
+          const Vec3 muzzle = eye + fwd * 1.5f;
+          SpellFxVec originFx{SpellFxFromFloat(muzzle.x),
+                              SpellFxFromFloat(muzzle.y),
+                              SpellFxFromFloat(muzzle.z)};
+          SpellFxVec dirFx{SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
+                           SpellFxFromFloat(fwd.z)};
+          // A FATAL cast runs its effect at the CASTER instead — and does so
+          // through the same ApplySpellEffect call, with the caster's position
+          // as the argument (thesis 2). Nothing here branches on the spell.
+          const bool fatal =
+              ResolveCast(caster.mana, playerHealth.Get(),
+                          caster.compiled.manaCost).outcome == CastOutcome::Fatal;
+          if (fatal) {
+            const Vec3 body = player.pos;
+            originFx = {SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
+                        SpellFxFromFloat(body.z)};
+          }
+          CastResult res =
+              spells.Cast(caster.compiled, caster.mana, playerHealth,
+                          0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit);
+          caster.lastOutcome = res.outcome;
+          if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
+        }
+
+        spells.Tick(tick, world, classOf, emit);
+
+        // The caster's own body pays for a fatal overcast: severed parts, then
+        // death, all through the existing dismemberment/gore pipeline. The
+        // avatar half is separate from the world half above only because the
+        // VM may not reach into PlayerAvatar (thesis 4).
+        if (emit.carveCaster && avatar.Spawned())
+          avatar.SelfDestruct(emit.carveAt, emit.carveRadius, world, spawns);
+
+        // OP BUDGET FAIRNESS (§F). Magic gets an explicit reservation rather
+        // than silently sharing the 64-op tick budget with mob bleeding (6)
+        // and avatar bleeding (6). Anything past it is COUNTED, not dropped
+        // silently — a spell that sometimes doesn't fire is miserable to
+        // diagnose, so the overflow is visible in the HUD.
+        int spellOps = 0;
+        for (const BrushOp& b : emit.ops) {
+          if (spellOps >= SpellSystem::kSpellOpsPerTick ||
+              ops.size() >= kMaxOpsPerTick) {
+            ui.spellOpsDropped++;
+            continue;
+          }
+          ops.push_back(b);
+          spellOps++;
+        }
+        // Explosions are carried to the explosion block below, where `exps`
+        // exists — a spell blast must go through the SAME path as a grenade
+        // (island checks, body damage, mob carving, impulse), not a second one.
+        spellExps = std::move(emit.explosions);
+        for (const ParticleSpawn& p : emit.spawns) spawns.push_back(p);
+      }
+
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
       // the same island-check pipeline as explosions and brush erases
       debris.QueueSupportEvents(world.Snap());
@@ -4404,8 +4701,13 @@ int main(int argc, char** argv) {
       // prefab stamps drain after island ops (they win same-cell conflicts)
       placer.PreTick(world, cellOps);
 
-      // explosions: X-detonate at the crosshair + grenade fuses
+      // explosions: X-detonate at the crosshair + grenade fuses + spell blasts
       std::vector<ExplosionOp> exps;
+      // Spell blasts join here rather than getting their own path, so a
+      // firebolt's detonation gets the island checks, body damage, mob carving
+      // and impulse a grenade already gets — for free, and consistently.
+      for (const ExplosionOp& e : spellExps)
+        if (exps.size() < kMaxExplosionsPerTick) exps.push_back(e);
       if (ui.pendingDetonate) {
         ui.pendingDetonate = false;
         const WorldSnapshot& snap = world.Snap();
@@ -4602,6 +4904,22 @@ int main(int argc, char** argv) {
       ui.activeBodyCount = debris.ActiveBodyCount();
       ui.prefabPending = (uint32_t)placer.PendingCount();
       ui.mobCount = mobs.MobCount();
+      // magic readout: cost must be visible BEFORE the cast, which is what
+      // makes the mana/health crossover a decision rather than a surprise.
+      ui.mana = caster.mana.mana;
+      ui.manaMax = caster.mana.EffectiveMax();
+      ui.health = playerHealth.Get();
+      ui.spellCost = caster.compiled.manaCost;
+      ui.spellText = caster.readout.text;
+      ui.spellVerdict = caster.readout.verdict;
+      ui.spellOutcome = (int)caster.lastOutcome;
+      ui.liveProjectiles = spells.LiveCount();
+      ui.glyphSlots.clear();
+      for (int i = 0; i < kGlyphSlots; i++) {
+        int gi = caster.inventory.At(i);
+        ui.glyphSlots.push_back(
+            gi >= 0 && gi < (int)glyphs.glyphs.size() ? glyphs.glyphs[gi].id : "");
+      }
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
@@ -4665,6 +4983,24 @@ int main(int argc, char** argv) {
         s.pos[0] = hit.x; s.pos[1] = hit.y; s.pos[2] = hit.z;
         s.halfSize = 0.7f;
         s.color = 0xFF60B0FF;
+        s.emission = 1.0f;
+        sprv.push_back(s);
+      }
+
+      // spell projectiles render as emissive sprites tinted by their element,
+      // so a firebolt reads as fire and an acid bolt as acid with no per-spell
+      // render code. THIS is the one place spell state becomes float: the
+      // authoritative position is fixed-point and is only lerped to float here,
+      // at the drawing boundary (spell.h thesis 3).
+      for (const SpellProjectile& p : spells.Live()) {
+        Sprite s{};
+        s.pos[0] = SpellFxToFloat(p.pos.x);
+        s.pos[1] = SpellFxToFloat(p.pos.y);
+        s.pos[2] = SpellFxToFloat(p.pos.z);
+        s.halfSize = 0.6f;
+        s.color = p.spell.element < mats.size()
+                      ? mats[p.spell.element].gpu.color0
+                      : 0xFFFFFFFFu;
         s.emission = 1.0f;
         sprv.push_back(s);
       }

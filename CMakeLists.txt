@@ -138,6 +138,7 @@ add_executable(sandvox
   src/game/anim.cpp
   src/game/avatar.cpp
   src/game/thirdperson.cpp
+  src/game/spell.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp

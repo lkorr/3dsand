@@ -849,6 +849,115 @@ keeps its wounds as debris with no special case.
   This tag-composition structure is deliberately the seed of the Noita-style
   wand/spell system later.
 
+### The spell system (2026-08-20; `game/spell`, `game/caster`, `assets/spells/glyphs.json`)
+
+The Noita-style wand system this section always anticipated ("spell modifiers
+attach as tags with per-frame logic ... the seed of the Noita-style wand/spell
+system later"), crossed with the *ancient language* of Eragon: you speak words,
+the words compose, and imprecision is punished rather than rejected. What is
+implemented is an **exploratory slice** — one form (projectile), four elements,
+two modifiers — deliberately optimized for being CHANGED rather than for being
+complete. What follows is the part that is *not* meant to change.
+
+**A spell is a program whose only output is op-stream emissions.** Every world
+change a spell makes leaves as a `BrushOp`/`ExplosionOp`/`CellOp`/
+`ParticleSpawn` on the MutationQueue (rule 3). `SpellEmission` is the only
+channel out of the VM, and there is no path from spell code into a voxel
+buffer. That is what gives spells save/replay/networking for free, and it is
+why a spell blast joins the ordinary `exps` list rather than getting its own
+detonation path — island checks, body damage, mob carving and impulse all apply
+with no spell-specific code.
+
+**The effect payload is position-parameterized, so backfire is free.**
+`ApplySpellEffect(spell, at, dir, strength, out)` takes the position as an
+argument, so "cast it at the muzzle" and "cast it at the caster's own chest"
+are the *same call*. Backfire is therefore never per-spell special-case code: a
+new element or form gets a thematic death the day it is added. This was built
+this way from the first line, while only two effects existed, precisely because
+it is the kind of structure that cannot be retrofitted once the glyph set grows.
+
+**The VM is integer, in fixed point — and this is NOT rule 1.** Projectile
+position/velocity are 24.8 fixed-point voxels (the exact convention
+`ParticleSpawn` already uses), and mana/health/timers are integers. Spell state
+is CPU-side gameplay state *outside* the hashed grid domain, exactly like mobs
+and debris, so the world hash cannot see it either way — verified: the hash is
+unmoved at `765da1f8` with the system live. It is fixed-point for **lockstep MP
+(§10) and replay debugging**, where a projectile's path must reproduce
+bit-exactly on every machine. The comments say so explicitly so nobody
+"simplifies" it back to float. Floats appear only at the drawing boundary.
+
+**The VM is not player-coupled.** Casting is a free function over (glyph list,
+caster state, origin, direction) → emitted ops; a mob will drive the identical
+`Cast()` call. Health is read through a `CasterHealth` callback rather than a
+field, which is what lets the player's health stay where it actually lives —
+`PlayerAvatar`'s per-part hp — instead of a parallel number that would drift
+from the visible damage state within a session. `PlayerCaster` (inventory +
+spoken stack) is a separate struct and `Player` is untouched.
+
+**Rule 2 applies to magic, with no exception.** Every sustained effect declares
+a finite budget up front: a trail carries a hard voxel VOLUME budget that only
+decreases, and the projectile dies when it is spent; lifetimes and live
+projectile counts are capped in `glyphs.json` and clamped against engine
+ceilings at load. A generation counter is wired now (`Spell::gen`, capped)
+even though nothing triggers anything yet — it is the subcriticality guarantee,
+and it is annoying to add after triggers exist. This codebase has hit the
+"permanent condition keeps chunks awake forever" trap three times already
+(light-gated rules, staining, viscous liquids); a trail spell must not be the
+fourth, and the selftest asserts the budget is respected *exactly*.
+
+**An ill-formed spell is castable and misfires — it is never rejected.** That
+is the design thesis, and a hard parse error would make experimentation
+frustrating. `CompileSpell` is total: any glyph sequence folds into a `Spell`.
+No form spoken ⇒ the spell goes off at the caster. The HUD shows what the VM
+thinks the spell is, which is worth more than validation.
+
+**Casting into health makes a spell IMPRECISE, not merely expensive.** Cost ≤
+mana casts normally; cost ≤ mana + health casts but spends the remainder as
+health *and* wobbles the trajectory in proportion to how deep it went; cost >
+mana + health runs the spell's own payload at the caster and kills them. That
+middle case is the whole mechanic — it makes the mana bar a *precision meter*
+rather than a second HP bar — so the HUD draws mana and health on one axis with
+a hard break at the crossover, rather than as two numbers.
+
+Two decisions worth recording because the obvious alternative is wrong:
+
+- **`transmute_to` is an OVERWRITE brush op (mode 1), not the laser's melt mode
+  (2).** Melt converts each cell to *its own* authored `molten` product
+  (stone→lava, sand→molten glass), which is exactly right for a heat beam and
+  exactly wrong for "transmute to acid", where the caster chooses the target
+  material. Mode 1 is the existing primitive for that; no second conversion
+  path was invented.
+- **A projectile treats UNKNOWN cells as PASSABLE, the opposite of the player
+  controller's choice.** The CPU mirror covers only the 3×3×3 chunks around the
+  player (~48 voxels), which is ample for a capsule that never leaves its own
+  neighbourhood and useless for a 48 vox/tick projectile that exits the mirror
+  within one tick. Reading Unknown as solid — the conservative-looking option —
+  detonates every bolt in the caster's face. Out-of-window space is still
+  solid, per §3. The cost is that a bolt fired at a distant wall passes through
+  it; the honest fix is a swept `RequestChunkFetch` along the flight path, not
+  a bigger mirror.
+
+Wards and glyph conjoining are landed as **shape only** (structs + `glyphs.json`
+blocks, no behaviour). The recorded intent for wards is the load-bearing part:
+a ward filters the incoming **op stream** (cheap, CPU-side, sim untouched), not
+the CA — so it stops someone *casting* acid at your feet but not acid already
+flowing toward you. That is deliberate: it keeps the falling-sand game
+underneath and makes "cast next to them and let physics do it" the counterplay.
+Ward drain is a **fraction** of max mana rather than a flat amount, because a
+flat cost lets a big late-game pool buy invulnerability.
+
+Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
+`BrushOp`s, alongside mob and avatar bleeding's 6 each) and overflow is
+**counted and shown in the HUD** rather than dropped silently — a spell that
+sometimes doesn't fire is miserable to diagnose.
+
+Selftest gate `spells`: the trail's voxel budget is respected exactly and the
+projectile dies with it, and an overcast resolves Fatal, emits its own payload,
+and asks for the caster to be carved. Invariants, not plausible numbers — the
+first version of the gate folded the impact op into the trail total and
+reported 343 voxels against a 64 budget, where the budget was fine and the
+measurement was wrong.
+
 ### Voxel art pipeline, articulated mobs, and the laser (2026-08-19)
 
 Implemented per `docs/PLAN_voxel_art_and_mobs.md`; the through-line is that

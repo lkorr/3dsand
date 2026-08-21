@@ -160,6 +160,8 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `src/audio/` | spatialized sound (DESIGN.md §12b). `cues.*` is the ONLY header the rest of the game includes — it speaks game events (`Footstep`, `Land`, `Impact`, ambience). Below it: `world.*` voice pools + the one place voxels/Y-up become meters/Z-up, `voice.*` one emitter (lock-free handoff + pre-engine occlusion filter), `occlusion.*` voxel-ray muffling, `library.*` folder-per-set asset registry, `device.*` miniaudio. `xyzpan/` is a VENDORED spatializer — read its `VENDORED_FROM.md` before editing, and keep it dependency-free. Assets are MONO (the panner builds the stereo image); the audio thread must never touch a game object or `CurrentTuning()` |
 | `assets/sounds/` | mono one-shots, one FOLDER per sound set (`footsteps/leaf/leaf_01.wav` = set `footsteps/leaf`). A material names sets in its `"sounds"` block (the flat `"footstep"` key still works); a mob names them in its `.json` sidecar. `raw/` holds the uncut source takes and `.trash/` holds tuner-deleted ones — both SKIPPED by the loader; `scripts/split_footsteps.py` cuts raw takes into per-step files on the transient |
 | `assets/sound_schema.js` | the only list of sound SLOTS (material `footstep`/`impact`/`break`…, mob `hurt`/`death`/`sever`…). The tuner's Audio tab and wiki Audio section are built entirely from it; each slot's `prefix` must match `Cues::kSlotPrefix` in `audio/cues.cpp` or the tuner writes bindings the engine cannot resolve |
+| `src/game/spell.*`, `src/game/caster.*` | the magic system (DESIGN.md §8). `spell.*` is the caster VM: glyphs are functions on a typed stack, `CompileSpell` folds them into a `Spell`, and `ApplySpellEffect` is the ONE position-parameterized payload — casting at the muzzle and backfiring into your own chest are the same call with different arguments. Integer 24.8 fixed point throughout (NOT rule 1 — spell state is outside the hashed domain; it is for lockstep MP + replay, so don't "simplify" it to float). Not player-coupled: health arrives via a `CasterHealth` callback so a mob can cast through the same path. `caster.*` is the player's inventory + spoken stack only |
+| `assets/spells/glyphs.json` | glyph CONTENT (materials.json precedent, not tuning.json). Materials by NAME, resolved at load; hot-reloads with R alongside materials — it MUST, since a glyph holds a resolved 12-bit id. Every sustained effect declares a finite budget here and is clamped against engine ceilings at load (rule 2) |
 | `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy; `gen_mina.py` emits the PLAYER AVATAR rig, which is a mob def driven by `game/avatar.cpp` rather than by mob AI — `gen_wizard.py` is a second, unused character). The avatar's height is NOT free: it is derived from `Player::kHalfY`/`kEyeOffset` at the current `kVoxelMeters` (17 world voxels, eyes at voxel 15) and asserted in the generator. `kAvatarDefName` in `main.cpp` picks which def the player wears |
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
 | `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
@@ -213,6 +215,27 @@ The exe must sit in the project root: it edits this checkout in place, so
   restates `FallbackFootstep()` (cues.cpp) so a material page can say what will
   actually play rather than only what was authored — same standing obligation
   `RENDER_PATHS` carries for the shader predicates.
+- **The CPU mirror is 3×3×3 chunks around the PLAYER, so a fast projectile
+  leaves it inside one tick.** `World::KindAt` returns `Unknown` past ~48
+  voxels. The player controller treats Unknown as blocking, which is right for
+  a capsule that never leaves its neighbourhood; a spell projectile must treat
+  it as PASSABLE or every bolt detonates in the caster's face. Out-of-window is
+  still solid (the residency-window rule) — those are two different tests and
+  conflating them is the bug. Anything else that flies fast and queries the
+  grid on the CPU inherits this; the real fix is a swept `RequestChunkFetch`
+  along the path.
+- **A selftest gate that fires into the world must anchor to the LIVE window
+  origin, not a fixed world position.** Gates run in sequence and the streaming
+  gate leaves the origin ~20 chunks out, so a hardcoded `x=140` lands outside
+  the window, where space is solid — the spell gate detonated on tick 1 and
+  read as a budget failure. `world.WindowOrigin()` is the fix.
+- **A budget must be charged BEFORE the op is emitted, and the op refused if it
+  does not fit.** The natural ordering (emit → subtract → check `<= 0`) lets
+  the last op overrun by nearly its whole volume, and anything that sub-steps
+  within a tick overruns once per sub-step. "Bounded eventually" is not what
+  rule 2 asks for. Related: a trail marks per whole VOXEL of travel, not per
+  sub-step — the sweep is subdivided for anti-tunneling, so a per-sub-step mark
+  spends the entire budget in one tick on a handful of overlapping cells.
 - **World constants are generated from `world.h`, never redeclared in WGSL.**
   `ShaderConstantPrelude()` (`gpu/resources.cpp`) emits `WORLD_N`, `CHUNK`,
   `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of

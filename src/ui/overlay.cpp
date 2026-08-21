@@ -72,6 +72,89 @@ void Overlay::Draw(UIState& s) {
   }
   ImGui::Separator();
 
+  // ---- magic (game/spell.h) -------------------------------------------------
+  // The whole point of this readout is the CROSSOVER: the exact point where
+  // the running cost stops coming out of mana and starts coming out of health.
+  // It is drawn as one continuous bar with a hard break at that point, because
+  // a pair of numbers does not communicate "this next glyph will cost you an
+  // arm" the way a bar segment eating into red does.
+  ImGui::Text("magic %s   (M toggles)", s.magicMode ? "ON" : "off");
+  {
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = 14.0f;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* d = ImGui::GetWindowDrawList();
+    const int32_t poolMax = s.manaMax > 0 ? s.manaMax : 1;
+    // The bar spans mana + health so both costs are measured on ONE axis;
+    // otherwise the crossover has no visual meaning.
+    const int32_t span = poolMax + (s.health > 0 ? s.health : 0);
+    auto frac = [&](int32_t v) {
+      return span > 0 ? (float)v / (float)span : 0.0f;
+    };
+    // backdrop: mana region then health region
+    d->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(28, 32, 46, 255));
+    const float manaEdge = p.x + w * frac(poolMax);
+    d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(p.x + w, p.y + h),
+                     IM_COL32(52, 22, 24, 255));
+    // filled mana
+    d->AddRectFilled(p, ImVec2(p.x + w * frac(s.mana), p.y + h),
+                     IM_COL32(70, 130, 235, 255));
+    // filled health, starting at the mana edge
+    d->AddRectFilled(ImVec2(manaEdge, p.y),
+                     ImVec2(manaEdge + w * frac(s.health), p.y + h),
+                     IM_COL32(190, 60, 60, 255));
+    // THE CROSSOVER. The spoken cost is drawn as a bright overlay eating
+    // right-to-left out of mana; the part of it past the mana edge is drawn in
+    // warning colour because that part is coming out of the body.
+    if (s.spellCost > 0) {
+      const int32_t fromMana = s.spellCost < s.mana ? s.spellCost : s.mana;
+      const int32_t fromHealth = s.spellCost - fromMana;
+      const float x0 = p.x + w * frac(s.mana - fromMana);
+      d->AddRectFilled(ImVec2(x0, p.y), ImVec2(p.x + w * frac(s.mana), p.y + h),
+                       IM_COL32(150, 200, 255, 255));
+      if (fromHealth > 0) {
+        const float hx = manaEdge + w * frac(fromHealth < s.health ? fromHealth
+                                                                   : s.health);
+        d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(hx, p.y + h),
+                         IM_COL32(255, 140, 60, 255));
+      }
+      // the hard break itself
+      d->AddLine(ImVec2(manaEdge, p.y - 2), ImVec2(manaEdge, p.y + h + 2),
+                 IM_COL32(255, 255, 255, 220), 2.0f);
+    }
+    ImGui::Dummy(ImVec2(w, h + 4));
+  }
+  ImGui::Text("mana %d/%d   health %d   cost %d", s.mana, s.manaMax, s.health,
+              s.spellCost);
+  if (s.spellCost > s.mana + s.health) {
+    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                       "FATAL - this will kill you");
+  } else if (s.spellCost > s.mana) {
+    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
+                       "unstable - %d from your body", s.spellCost - s.mana);
+  }
+  if (!s.spellText.empty()) {
+    ImGui::Text("speaking: %s", s.spellText.c_str());
+    ImGui::TextDisabled("%s", s.spellVerdict.c_str());
+  } else {
+    ImGui::TextDisabled("speaking: (nothing)   RMB casts, C clears");
+  }
+  if (!s.glyphSlots.empty()) {
+    std::string strip;
+    for (size_t i = 0; i < s.glyphSlots.size(); i++) {
+      if (s.glyphSlots[i].empty()) continue;
+      strip += std::to_string((i + 1) % 10) + ":" + s.glyphSlots[i] + "  ";
+    }
+    ImGui::TextDisabled("%s", strip.c_str());
+  }
+  ImGui::Text("projectiles %d", s.liveProjectiles);
+  if (s.spellOpsDropped > 0) {
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d ops dropped",
+                       s.spellOpsDropped);
+  }
+  ImGui::Separator();
+
   if (ImGui::Button(s.paused ? "resume (P)" : "pause (P)")) s.paused = !s.paused;
   ImGui::SameLine();
   if (ImGui::Button("step (N)")) s.stepOnce = true;
