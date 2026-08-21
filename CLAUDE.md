@@ -210,6 +210,37 @@ assertion, perf, a walk test, and writes `screenshot.bmp`. Run it after any sim,
 shader, or material change and report the actual result — never claim a sim change
 works without it.
 
+### Run ONE gate, not all twenty
+
+The suite is a registry of named gates (`src/test/selftest*.cpp`). The full run
+is ~50 s; a single gate is usually 4–20 s, so iterate on one and run the whole
+thing once before you land:
+
+```bash
+./build/Release/sandvox.exe --selftest --list          # names + deps, no GPU needed
+./build/Release/sandvox.exe --selftest --gate prefab   # just this one (~4 s)
+./build/Release/sandvox.exe --selftest --json out.json # machine-readable results
+```
+
+`--gate` pulls in whatever that gate declares as a dependency, and gates run in
+the order `kOrder` (selftest.cpp) pins — **which is load-bearing**. Gates share
+one `World`/`Simulation` and several rely on state an earlier gate left behind;
+the streaming gate in particular leaves the window origin ~20 chunks out. Adding
+a gate means a row in its domain file *and* a name in `kOrder`; one that is
+missing from `kOrder` prints a warning and never runs.
+
+### A red run tells you whether it is yours
+
+`tests/baseline.json` records which gates already fail. A gate failing there is
+reported as *known-failing at baseline (not yours)* and the run still exits 0;
+anything else that fails is a **REGRESSION** and exits 1. Fix one, flip it to
+`"pass"` in the same commit — the run prints `FIXED since baseline` to remind
+you. `tests/BASELINE.md` says why each known failure is there and how to
+reproduce it.
+
+This replaces the old ritual of rebuilding clean `HEAD` to prove a failure was
+not yours. Reach for that only when the baseline itself is in doubt.
+
 **A running `sandvox.exe` may be killed without asking.** The link step fails with
 `LNK1104: cannot open file ...sandvox.exe` whenever an instance still holds the
 binary. That instance is essentially always me poking at the build, and there is
@@ -229,6 +260,18 @@ bash scripts/check_shaders.sh
 This concatenates `common.wgsl + <file>` exactly the way `LoadShader` does and runs
 each through `tint --validate`. It runs automatically on WGSL edits via the
 PostToolUse hook in `.claude/settings.json`.
+
+That same hook (`scripts/post_edit_check.sh`) also runs:
+
+```bash
+python scripts/check_invariants.py          # all pairs
+python scripts/check_invariants.py <file>   # just the ones that file can break
+```
+
+which mechanically enforces the "two places that must agree" pairs listed below
+— sound slots, `TUNE_*` constants, `RENDER_PATHS`, world constants. Every one of
+those is a *silent* failure otherwise: green build, working tuner, wrong
+behaviour at runtime. It is quiet unless something actually disagrees.
 
 Tuning by eye/ear goes through the tuner, which finds `assets/` itself and
 whose **Build** / **Play** buttons run the two commands above:
@@ -268,7 +311,8 @@ The exe must sit in the project root: it edits this checkout in place, so
 
 | Path | What |
 |---|---|
-| `src/main.cpp` | frame loop, arg parsing, selftest harness, BMP writer |
+| `src/main.cpp` | frame loop, arg parsing, `--shot`/`--shot-mob` harnesses |
+| `src/test/` | the acceptance gate. `support.*` is the sim/render plumbing shared with `main.cpp` (`SubmitTick`, `WriteRenderParams`, the sync readbacks) — ONE definition, so a test can never pass against behaviour the game does not have. `selftest.*` is the harness: gate registry, `kOrder`, baseline diffing, `--gate`/`--list`/`--json`. One `selftest_<domain>.cpp` per domain, which is also what stops two agents colliding in one hub file |
 | `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation, `.vox` prefab loader |
 | `src/gpu/` | Dawn context, buffer/shader/pipeline helpers |
 | `src/game/` | player controller, camera, brush, prefab placer, mob system, player avatar (`avatar.*`) + third-person rig (`thirdperson.*`) |
@@ -284,7 +328,12 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `scripts/tuner_app.py` + `tuner_server.py` | the tuner as a desktop app / local server: auto-loads assets, Build + Play buttons |
 | `scripts/build_tuner_exe.py` | packages the above into `sandvox_tuner.exe` |
 
-**Two invariants that have already cost debugging time — don't rediscover them:**
+**Invariants that have already cost debugging time — don't rediscover them.**
+The four "two places that must agree" entries below (sound slots, `TUNE_*`,
+`RENDER_PATHS`, world constants) are now checked mechanically by
+`scripts/check_invariants.py`, which the PostToolUse hook runs on every edit.
+The prose stays because it explains *why* each pair exists and what breaks —
+the checker only tells you that something disagrees.
 
 - **The 3×3×3 color lattice is GLOBAL in WORLD coordinates, not chunk- or
   slot-local.** Chunk-local dispatch must offset by the WORLD chunk coordinate
