@@ -187,12 +187,23 @@ cmake --build build --config Release --target sandvox
 ```
 
 Third-party sources (Dawn, Jolt, ImGui, …) are fetched into a **shared** cache
-outside the checkout — `~/.sandvox-deps`, set by `FETCHCONTENT_BASE_DIR` in
+outside the checkout — `C:/sv-deps`, set by `FETCHCONTENT_BASE_DIR` in
 CMakeLists.txt — so a new worktree does not re-clone or re-build Dawn. Only the
 first configure anywhere on the machine pays the ~15 min. Each worktree still
 gets its own `build/`, so no two agents share an object file or `sandvox.exe`.
 Override with `-DFETCHCONTENT_BASE_DIR=...` or `$SANDVOX_DEPS` for a private
-cache; delete `~/.sandvox-deps` to force a clean refetch.
+cache; delete `C:/sv-deps` to force a clean refetch.
+
+Two things about that path are load-bearing, both learned by breaking them:
+
+- **It is set before `include(FetchContent)`.** The module defines
+  `FETCHCONTENT_BASE_DIR` itself at include time, so a guard placed after the
+  include never fires and every worktree silently gets a private cache — the
+  ~15 min per agent this exists to avoid.
+- **It is short (`C:/sv-deps`, not under your home dir).** Dawn's tint test
+  corpus has ~200-char filenames; nested under
+  `.claude/worktrees/<name>/build/_deps/…` they exceed the Windows 260-char
+  `MAX_PATH` and the fetch dies with `Filename too long`. Don't lengthen it.
 
 `--selftest` is the acceptance gate: it checks the twice-run world hash, the sleep
 assertion, perf, a walk test, and writes `screenshot.bmp`. Run it after any sim,

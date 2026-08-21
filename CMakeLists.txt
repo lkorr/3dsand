@@ -4,29 +4,33 @@ project(sandvox LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(FetchContent)
-
 # ---------------------------------------------------------------------------
-# Shared dependency cache across git worktrees.
+# Shared dependency cache — MUST be set before include(FetchContent).
 #
 # Every parallel agent session gets its own worktree (CLAUDE.md "Parallel
 # sessions"), and a worktree is a fresh checkout with an empty build/. Left
 # alone, FetchContent would re-clone and re-BUILD Dawn per worktree: ~15 min and
 # several GB each, which is what makes worktrees unusable on this project rather
-# than merely slow.
+# than merely slow. Pointing FETCHCONTENT_BASE_DIR at one location outside every
+# checkout shares the immutable third-party sources; each worktree still gets
+# its own build/ for OUR objects, so agents never fight over sandvox.exe.
 #
-# Pointing FETCHCONTENT_BASE_DIR at one location OUTSIDE every checkout means
-# the Dawn/Jolt/ImGui sources are cloned once and shared. Each worktree still
-# gets its own build/ for OUR objects, so agents never fight over sandvox.exe
-# or a .obj — only the immutable third-party sources are shared.
+# The path is deliberately SHORT (C:/sv-deps, not ~/.sandvox-deps). Dawn's tint
+# test corpus has ~200-char filenames, and under a worktree
+# (…/.claude/worktrees/<name>/build/_deps/…) they blow the Windows 260-char
+# MAX_PATH limit — the fetch fails with "Filename too long" and no amount of
+# cache sharing helps. A short root keeps every worktree under the limit.
 #
-# Override with -DFETCHCONTENT_BASE_DIR=... if you want a private cache.
+# Ordering matters: FetchContent's module sets FETCHCONTENT_BASE_DIR itself at
+# include() time, so a `if(NOT DEFINED ...)` guard placed after the include
+# never fires and every worktree silently gets a private cache. Guard on the
+# CACHE entry so an explicit -DFETCHCONTENT_BASE_DIR=... still wins.
 # ---------------------------------------------------------------------------
-if(NOT DEFINED FETCHCONTENT_BASE_DIR)
+if(NOT DEFINED CACHE{FETCHCONTENT_BASE_DIR})
   if(DEFINED ENV{SANDVOX_DEPS})
     set(_sv_deps "$ENV{SANDVOX_DEPS}")
-  elseif(WIN32 AND DEFINED ENV{USERPROFILE})
-    set(_sv_deps "$ENV{USERPROFILE}/.sandvox-deps")
+  elseif(WIN32)
+    set(_sv_deps "C:/sv-deps")
   elseif(DEFINED ENV{HOME})
     set(_sv_deps "$ENV{HOME}/.sandvox-deps")
   else()
@@ -36,6 +40,8 @@ if(NOT DEFINED FETCHCONTENT_BASE_DIR)
       "Shared FetchContent cache, so worktrees don't each rebuild Dawn")
 endif()
 message(STATUS "sandvox: dependency cache = ${FETCHCONTENT_BASE_DIR}")
+
+include(FetchContent)
 
 # ---------------------------------------------------------------------------
 # Dawn (WebGPU implementation; Vulkan backend on Windows native).
