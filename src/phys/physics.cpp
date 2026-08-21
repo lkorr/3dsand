@@ -673,6 +673,23 @@ bool Physics::GetTransform(uint64_t handle, BodyTransform& out) const {
   return true;
 }
 
+bool Physics::GetLocalBounds(uint64_t handle, Vec3& outMin, Vec3& outMax) const {
+  if (!system_ || handle == 0) return false;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
+  if (!shape) return false;
+  // Local bounds: the shape's own box, before the body transform. The overlay
+  // applies the live rotation itself, which is what makes the wireframe an
+  // ORIENTED box rather than a world-axis one.
+  const JPH::AABox b = shape->GetLocalBounds();
+  const float inv = 1.0f / kVoxelMeters;
+  outMin = Vec3{b.mMin.GetX() * inv, b.mMin.GetY() * inv, b.mMin.GetZ() * inv};
+  outMax = Vec3{b.mMax.GetX() * inv, b.mMax.GetY() * inv, b.mMax.GetZ() * inv};
+  return true;
+}
+
 bool Physics::IsActive(uint64_t handle) const {
   if (!system_ || handle == 0) return false;
   return system_->GetBodyInterface().IsActive(ToBodyID(handle));

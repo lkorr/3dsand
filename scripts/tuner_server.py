@@ -9,9 +9,10 @@ happens in this process rather than in the page:
 
   GET  /                      the tuner, served from assets/
   GET  /api/files             materials.json + reactions.json + tuning.json
+                              + items/items.json
                               (+ spells/glyphs.json, READ-ONLY, for the Wiki)
   POST /api/save              write those files back
-  GET  /api/models            list .vox/.json under assets/{models,mobs,microvox}
+  GET  /api/models            list .vox/.json under assets/{models,mobs,microvox,items}
   GET  /api/model?path=...    read one of those files (bytes for .vox)
   POST /api/model?path=...    write one of those files
   GET  /api/shaders           list assets/shaders/*.wgsl with their text
@@ -36,15 +37,17 @@ Usage:
 
 SCOPE / SAFETY. This is a developer tool for one machine, not a service:
   - It binds 127.0.0.1 only, so nothing off this box can reach it.
-  - The three JSON writable paths are a fixed allowlist (materials/reactions/
-    tuning .json under assets/materials). The page cannot name a path, so a bad
-    or malicious request cannot write anywhere else. glyphs.json is served for
+  - The JSON writable paths are a fixed allowlist (materials/reactions/tuning
+    under assets/materials, plus items/items.json). The page cannot name a
+    path, so a bad or malicious request cannot write anywhere else. A per-item
+    sidecar is NOT here: it is named by the request, so it goes through the
+    model routes and their containment check. glyphs.json is served for
     the Wiki but is NOT in that allowlist, so /api/save cannot reach it however
     the request is spelled — read-only is structural, not a convention.
   - The model routes DO take a path from the request (the editor must be able
     to name the file it is editing), so every one goes through _model_path(),
-    which resolves the path and requires the result to sit inside one of three
-    fixed directories with an allowed extension. Traversal, absolute paths,
+    which resolves the path and requires the result to sit inside one of the
+    fixed MODEL_DIRS with an allowed extension. Traversal, absolute paths,
     symlinks and odd extensions are all rejected there.
   - The note routes take a NAME, not a path, and _note_path() rejects anything
     that is not a plain filename of safe characters before joining it to
@@ -81,6 +84,10 @@ WRITABLE = {
     "materials": os.path.join(MATDIR, "materials.json"),
     "reactions": os.path.join(MATDIR, "reactions.json"),
     "tuning": os.path.join(MATDIR, "tuning.json"),
+    # Item BEHAVIOUR (damage, reach, kind). An item's art and its grip live in
+    # per-item sidecars under assets/items/, which ride the /api/model routes
+    # instead — this is the one fixed file, so it belongs here.
+    "items": os.path.join(ASSETS, "items", "items.json"),
 }
 
 def readable():
@@ -102,7 +109,13 @@ def readable():
 # assets/. They are resolved against ASSETS at request time rather than frozen
 # here, because tuner_app.py re-points the module's ASSETS global after import
 # (it runs from a PyInstaller bundle whose __file__ is not the checkout).
-MODEL_DIRS = ("models", "mobs", "microvox")
+#
+# `items` is here for the same reason `mobs` is: an item is a .vox plus a .json
+# sidecar the tuner edits in place (grip, edge, durability). It rides the two
+# /api/model routes rather than /api/save, because those already carry the
+# path-containment check a per-file asset needs — items.json itself, being one
+# fixed file, goes through /api/save with the other three.
+MODEL_DIRS = ("models", "mobs", "microvox", "items")
 MODEL_EXTS = (".vox", ".json")
 
 

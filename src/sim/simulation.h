@@ -84,6 +84,11 @@ class Simulation {
   void DrawWorld(const wgpu::RenderPassEncoder& pass);
   void DrawParticles(const wgpu::RenderPassEncoder& pass);
   void DrawSprites(const wgpu::RenderPassEncoder& pass, uint32_t count);
+  // Collision-box debug overlay: one oriented wireframe box per physics body.
+  // Drawn LAST of the world passes (after the micro bodies, before ImGui) with
+  // depth testing off, so a collider is visible through whatever contains it.
+  // `count` of 0 draws nothing at all — the overlay is free when it is off.
+  void DrawDebugBoxes(const wgpu::RenderPassEncoder& pass, uint32_t count);
   void DrawBodies(const wgpu::RenderPassEncoder& pass, uint32_t voxInstances);
   // Microvoxel bodies (PLAN §C): one 36-vertex OBB per entry in `insts`, drawn
   // between DrawBodies and DrawSprites. `insts` is the compacted (slot, model)
@@ -135,8 +140,9 @@ class Simulation {
       pArgs2_, pResolve_;
   wgpu::ComputePipeline farFill_, farDown_;
   wgpu::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
-      microBodyDraw_;
-  wgpu::ShaderModule raymarchModule_, debrisModule_, microBodyModule_;
+      microBodyDraw_, debugBoxDraw_;
+  wgpu::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
+      debugLineModule_;
   wgpu::TextureFormat targetFormat_ = wgpu::TextureFormat::Undefined;
 
   wgpu::Texture depthTex_;

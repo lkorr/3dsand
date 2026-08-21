@@ -2590,6 +2590,46 @@ void MobSystem::AppendXforms(std::vector<BodyXformGpu>& out) const {
   }
 }
 
+
+// ---- collision-box debug overlay (world.h DebugBox) -------------------------
+//
+// The bounds come from Physics::GetLocalBounds, i.e. from the JOLT SHAPE, not
+// from the voxel list that built it. That is the whole point of the overlay:
+// the collider is a greedy box merge of those voxels (capped, and inflated by a
+// convex radius), so drawing the voxels back would show what we MEANT to build
+// while this shows what is actually collided against. When they disagree, that
+// disagreement is the thing you opened the overlay to find.
+void MobSystem::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
+                                 uint32_t color) const {
+  if (!phys_) return;
+  for (const Mob& mob : mobs_) {
+    for (const Limb& limb : mob.limbs) {
+      if (!limb.body) continue;
+      if (out.size() >= limit) return;
+      Vec3 lo, hi;
+      if (!phys_->GetLocalBounds(limb.body, lo, hi)) continue;
+      DebugBox b{};
+      // The shape's local bounds are centred on the body's own origin, which
+      // for these colliders is the centre of mass — so the box centre is the
+      // body position plus the bounds' own (usually tiny) offset, rotated into
+      // world space. Skipping that offset is what makes a wireframe sit a
+      // fraction off the limb it belongs to.
+      const Vec3 mid{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                     (lo.z + hi.z) * 0.5f};
+      const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                   limb.xf.quat[3]};
+      const Vec3 c = limb.xf.pos + QuatRotate(q, mid);
+      b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
+      b.half[0] = (hi.x - lo.x) * 0.5f;
+      b.half[1] = (hi.y - lo.y) * 0.5f;
+      b.half[2] = (hi.z - lo.z) * 0.5f;
+      std::memcpy(b.quat, limb.xf.quat, sizeof(b.quat));
+      b.color = color;
+      out.push_back(b);
+    }
+  }
+}
+
 void MobSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
                                  uint32_t slotBase) const {
   // Walks slots in the SAME order as AppendXforms/AppendInstances, so the slot

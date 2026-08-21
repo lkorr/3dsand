@@ -59,6 +59,8 @@ void World::Init(const wgpu::Device& device) {
                           U::Storage | U::CopyDst, "spawnOps");
   sprites = CreateBuffer(device, kMaxSprites * sizeof(Sprite), U::Storage | U::CopyDst,
                          "sprites");
+  debugBoxes = CreateBuffer(device, (uint64_t)kMaxDebugBoxes * sizeof(DebugBox),
+                            U::Storage | U::CopyDst, "debugBoxes");
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
                                "bodyInstances");
   bodyXforms = CreateBuffer(device, (uint64_t)kMaxBodySlots * 32,

@@ -253,6 +253,13 @@ class PlayerAvatar {
   // building a per-part array (the first-person hide list) must size against
   // this rather than the def's limb count, which does not know about items.
   int PartCount() const { return (int)parts.size(); }
+  // Collision-box debug overlay (world.h DebugBox, the dev panel's "collision
+  // boxes" toggle). One oriented wireframe per LIVE part body, read from the
+  // body's actual Jolt collider via Physics::GetLocalBounds — not from the
+  // part's art, so a collider that has drifted from the model it represents
+  // shows up as exactly that. Appends; stops at `limit` total.
+  void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
+                        uint32_t color) const;
 
   // introspection (overlay / selftest)
   // Jolt body of a part, or 0 when it is severed or never spawned. Mirrors

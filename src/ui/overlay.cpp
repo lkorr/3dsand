@@ -262,6 +262,14 @@ void Overlay::Draw(UIState& s) {
   ImGui::Checkbox("shadows", &s.shadows);
 
   ImGui::Checkbox("fly (V)", &s.fly);
+  ImGui::Checkbox("collision boxes (F3)", &s.showCollisionBoxes);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Wireframes around every physics collider, read from the actual Jolt\n"
+        "shape rather than the art: green = avatar parts (a held item too),\n"
+        "cyan = mob limbs, yellow = loose debris.\n"
+        "Drawn THROUGH walls on purpose - the reason to look at a collider is\n"
+        "usually that something is on top of it.");
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
 
   auto swatch = [&](int i) {
