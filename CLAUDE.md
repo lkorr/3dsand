@@ -157,10 +157,13 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation, `.vox` prefab loader |
 | `src/gpu/` | Dawn context, buffer/shader/pipeline helpers |
 | `src/game/` | player controller, camera, brush, prefab placer, mob system, player avatar (`avatar.*`) + third-person rig (`thirdperson.*`) |
-| `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy; `gen_wizard.py` emits the PLAYER AVATAR rig, which is a mob def driven by `game/avatar.cpp` rather than by mob AI) |
+| `src/audio/` | spatialized sound (DESIGN.md §12b). `cues.*` is the ONLY header the rest of the game includes — it speaks game events (`Footstep`, `Land`, `Impact`, ambience). Below it: `world.*` voice pools + the one place voxels/Y-up become meters/Z-up, `voice.*` one emitter (lock-free handoff + pre-engine occlusion filter), `occlusion.*` voxel-ray muffling, `library.*` folder-per-set asset registry, `device.*` miniaudio. `xyzpan/` is a VENDORED spatializer — read its `VENDORED_FROM.md` before editing, and keep it dependency-free. Assets are MONO (the panner builds the stereo image); the audio thread must never touch a game object or `CurrentTuning()` |
+| `assets/sounds/` | mono one-shots, one FOLDER per sound set (`footsteps/leaf/leaf_01.wav` = set `footsteps/leaf`). A material names sets in its `"sounds"` block (the flat `"footstep"` key still works); a mob names them in its `.json` sidecar. `raw/` holds the uncut source takes and `.trash/` holds tuner-deleted ones — both SKIPPED by the loader; `scripts/split_footsteps.py` cuts raw takes into per-step files on the transient |
+| `assets/sound_schema.js` | the only list of sound SLOTS (material `footstep`/`impact`/`break`…, mob `hurt`/`death`/`sever`…). The tuner's Audio tab and wiki Audio section are built entirely from it; each slot's `prefix` must match `Cues::kSlotPrefix` in `audio/cues.cpp` or the tuner writes bindings the engine cannot resolve |
+| `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy; `gen_mina.py` emits the PLAYER AVATAR rig, which is a mob def driven by `game/avatar.cpp` rather than by mob AI — `gen_wizard.py` is a second, unused character). The avatar's height is NOT free: it is derived from `Player::kHalfY`/`kEyeOffset` at the current `kVoxelMeters` (17 world voxels, eyes at voxel 15) and asserted in the generator. `kAvatarDefName` in `main.cpp` picks which def the player wears |
 | `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
 | `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
-| `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params. Also hosts the **Wiki** tab (every fact about one material/tag/tuning group/shader, assembled live from all four sources) and the **Notes** tab (markdown pages autosaved to `notes/`, gitignored) |
+| `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params. Also hosts the **Wiki** tab (every fact about one material/tag/tuning group/shader/sound set, assembled live from all four sources), the **Audio** tab (set browser, waveform audition, drag-drop import, slot bindings — needs the server/app, since a `file://` page cannot touch `assets/sounds/`) and the **Notes** tab (markdown pages autosaved to `notes/`, gitignored) |
 | `scripts/tuner_app.py` + `tuner_server.py` | the tuner as a desktop app / local server: auto-loads assets, Build + Play buttons |
 | `scripts/build_tuner_exe.py` | packages the above into `sandvox_tuner.exe` |
 
@@ -200,6 +203,16 @@ The exe must sit in the project root: it edits this checkout in place, so
   `materials.cpp` reads (`opaque`, `wanders`, a `micro` block). Change a
   predicate in `common.wgsl` without changing `RENDER_PATHS` and the wiki will
   confidently explain the wrong thing.
+- **A sound slot is defined in two places that must agree.** `assets/sound_schema.js`
+  says which slots exist and which namespace each binds into; `Cues::kSlotPrefix`
+  in `audio/cues.cpp` does the same concatenation at runtime. The tuner offers
+  set lists per slot from the first table and the engine resolves through the
+  second, so a slot present in one and not the other means the tuner writes a
+  binding that silently resolves to nothing. Adding a slot = a row in each, plus
+  a call site that fires it. The wiki's `resolveMaterialSound()` additionally
+  restates `FallbackFootstep()` (cues.cpp) so a material page can say what will
+  actually play rather than only what was authored — same standing obligation
+  `RENDER_PATHS` carries for the shader predicates.
 - **World constants are generated from `world.h`, never redeclared in WGSL.**
   `ShaderConstantPrelude()` (`gpu/resources.cpp`) emits `WORLD_N`, `CHUNK`,
   `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of

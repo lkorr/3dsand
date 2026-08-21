@@ -246,6 +246,18 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
 
     d.rubble = m.value("rubble", "");
     d.molten = m.value("molten", "");
+    // Sound slots. The "sounds" object is the general form; the flat
+    // "footstep" key predates it and is still honoured so no existing
+    // materials.json has to be rewritten. The object wins when both appear —
+    // a file that says two things should not have the loader pick the older
+    // one.
+    d.sounds.clear();
+    if (m.contains("footstep") && m["footstep"].is_string())
+      d.sounds["footstep"] = m["footstep"].get<std::string>();
+    if (m.contains("sounds") && m["sounds"].is_object())
+      for (auto& [slot, name] : m["sounds"].items())
+        if (name.is_string() && !name.get<std::string>().empty())
+          d.sounds[slot] = name.get<std::string>();
     ParseStain(m, path, stainReg, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {

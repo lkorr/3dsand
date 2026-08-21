@@ -94,6 +94,25 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 # ---------------------------------------------------------------------------
+# miniaudio (playback device + wav/flac/mp3 decoding for src/audio/)
+#
+# Single header, so it is fetched rather than linked: MINIAUDIO_IMPLEMENTATION
+# is defined in exactly one TU (src/audio/device.cpp) and the rest of the audio
+# code includes it for declarations only. Populate-only — miniaudio ships a
+# CMakeLists that would add targets we do not want.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+  miniaudio
+  GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+  GIT_TAG        0.11.21
+  GIT_SHALLOW    TRUE
+)
+FetchContent_GetProperties(miniaudio)
+if(NOT miniaudio_POPULATED)
+  FetchContent_Populate(miniaudio)
+endif()
+
+# ---------------------------------------------------------------------------
 # sandvox
 # ---------------------------------------------------------------------------
 add_executable(sandvox
@@ -119,12 +138,36 @@ add_executable(sandvox
   src/game/anim.cpp
   src/game/avatar.cpp
   src/game/thirdperson.cpp
+  src/audio/device.cpp
+  src/audio/library.cpp
+  src/audio/voice.cpp
+  src/audio/occlusion.cpp
+  src/audio/world.cpp
+  src/audio/cues.cpp
+  # Vendored spatializer (src/audio/xyzpan/VENDORED_FROM.md). Compiled into the
+  # sandvox target rather than as its own library: sandvox has no other
+  # sub-libraries, and one target keeps the build simple. The upstream project
+  # builds these with /fp:fast, which we deliberately do NOT do here — relaxed
+  # float must never reach the sim (CLAUDE.md rule 1).
+  src/audio/xyzpan/src/Engine.cpp
+  src/audio/xyzpan/src/BinauralPipeline.cpp
+  src/audio/xyzpan/src/DistancePipeline.cpp
+  src/audio/xyzpan/src/ChestPipeline.cpp
+  src/audio/xyzpan/src/FloorPipeline.cpp
+  src/audio/xyzpan/src/ERPipeline.cpp
+  src/audio/xyzpan/src/Coordinates.cpp
+  src/audio/xyzpan/src/FDNReverb.cpp
+  src/audio/xyzpan/src/LFO.cpp
+  src/audio/xyzpan/src/SwarmMode.cpp
   src/phys/physics.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
   src/ui/overlay.cpp
 )
-target_include_directories(sandvox PRIVATE src)
+# src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
+# resolves unmodified — the sandvox-side audio code uses "audio/xyzpan/..."
+# instead, matching the project's src-relative convention.
+target_include_directories(sandvox PRIVATE src src/audio ${miniaudio_SOURCE_DIR})
 target_compile_definitions(sandvox PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(sandvox PRIVATE
   dawn::webgpu_dawn

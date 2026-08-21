@@ -623,6 +623,69 @@
   /* Two panes: a persistent index on the left, the assembled dossier on the
      right. The index stays put while you read so lateral moves between
      related entities are one click, which is the whole point of the tab. */
+  /* ---- audio: set browser + binding editor ---- */
+  .audwrap{display:flex;gap:14px;align-items:flex-start}
+  .audnav{
+    flex:none;width:250px;position:sticky;top:96px;max-height:calc(100vh - 116px);
+    overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--bg2);
+  }
+  .audbody{flex:1;min-width:0}
+  .audhead{
+    padding:5px 10px;font-family:var(--mono);font-size:10.5px;letter-spacing:.6px;
+    text-transform:uppercase;color:var(--faint);background:var(--card);
+    border-bottom:1px solid var(--line);position:sticky;top:0;
+  }
+  .auditem{
+    display:flex;align-items:center;gap:7px;padding:5px 10px;cursor:pointer;
+    border-bottom:1px solid #1b2129;font-size:13px;
+  }
+  .auditem:hover{background:var(--card)}
+  .auditem.on{background:#1d2c48;color:var(--acc)}
+  .auditem.drop{background:#1f3a24;box-shadow:inset 0 0 0 1px var(--green)}
+  .auditem .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .auditem .cnt{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .auditem.unused .nm{color:var(--dim)}
+  /* One variant: waveform, name, and the two destructive controls. */
+  .avar{
+    display:flex;align-items:center;gap:9px;padding:5px 8px;border-radius:6px;
+    border:1px solid var(--line);background:var(--card);margin-bottom:5px;
+  }
+  .avar:hover{border-color:var(--line2)}
+  .avar.playing{border-color:var(--acc);background:#182135}
+  .avar canvas{
+    flex:1;min-width:0;height:34px;cursor:pointer;border-radius:4px;background:#0d1117;
+  }
+  .avar .vn{
+    font-family:var(--mono);font-size:11.5px;color:var(--dim);flex:none;width:118px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:text;
+  }
+  .avar .vmeta{font-family:var(--mono);font-size:10.5px;color:var(--faint);flex:none;width:64px;text-align:right}
+  .avar .warn{color:var(--amber)}
+  /* The drop zone is deliberately large and always visible on a slot: the
+     whole workflow is "drag a wav onto the thing it belongs to". */
+  .adrop{
+    border:1px dashed var(--line2);border-radius:8px;padding:10px 12px;
+    color:var(--faint);font-size:12px;text-align:center;background:#0d1117;
+  }
+  .adrop.over{border-color:var(--green);color:var(--green);background:#15241a}
+  .aslot{
+    border:1px solid var(--line);border-radius:8px;background:var(--card);
+    padding:10px 12px;margin-bottom:9px;
+  }
+  .aslot.over{border-color:var(--green);background:#15241a}
+  .aslot .sh{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+  .aslot .sh b{font-size:13.5px}
+  .aslot .sh .k{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .aslot .sd{color:var(--dim);font-size:12.5px;line-height:1.5;margin-bottom:7px}
+  .aslot .sf{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:5px}
+  .aslot select{min-width:190px}
+  .abadge{
+    font-family:var(--mono);font-size:10.5px;padding:1px 6px;border-radius:10px;
+    border:1px solid var(--line2);color:var(--dim);
+  }
+  .abadge.ok{color:var(--green);border-color:#2c5a2c}
+  .abadge.miss{color:var(--red);border-color:#5a2c2c}
+  .abadge.fb{color:var(--amber);border-color:#5a4a2c}
   .wikiwrap{display:flex;gap:14px;align-items:flex-start}
   .wikinav{
     flex:none;width:250px;position:sticky;top:96px;max-height:calc(100vh - 116px);
@@ -845,6 +908,7 @@
   <span class="tabsep"></span>
   <button data-tab="tuning">Tuning</button>
   <button data-tab="models">Models</button>
+  <button data-tab="audio">Audio</button>
   <span class="tabsep"></span>
   <button data-tab="wiki">Wiki</button>
   <button data-tab="notes">Notes</button>
@@ -951,6 +1015,26 @@
   <!-- MODELS (voxel editor; assets/editor/editor.js fills this in) -->
   <section class="view" id="view-models"></section>
 
+  <!-- AUDIO — sound sets on the left, the thing they are bound to on the right -->
+  <section class="view" id="view-audio">
+    <div class="toolbar">
+      <input type="search" id="audFilter" placeholder="filter sets, materials, mobs&hellip;">
+      <span class="hint" id="audCount"></span>
+      <span class="spacer"></span>
+      <label class="hint" style="display:flex;align-items:center;gap:5px">
+        <input type="checkbox" id="audAuto" checked> audition on hover
+      </label>
+      <button id="btnAudRescan">&#8635; Rescan</button>
+      <button id="btnAudNewSet">+ set</button>
+    </div>
+    <div class="audwrap">
+      <div class="audnav">
+        <div class="audgrp" id="audSetList"></div>
+      </div>
+      <div class="audbody" id="audBody"></div>
+    </div>
+  </section>
+
   <!-- WIKI — every fact about one entity, assembled from all four sources -->
   <section class="view" id="view-wiki">
     <div class="wikiwrap">
@@ -997,6 +1081,7 @@
 <div id="toast"></div>
 
 <script src="tuner_schema.js"></script>
+<script src="sound_schema.js"></script>
 <script>
 'use strict';
 /* ================= state ================= */
@@ -2771,6 +2856,10 @@ function renderAll(){
   // (it can still show tuning groups and shaders with no materials loaded).
   if(activeTab==='notes'){renderNotes();return;}
   if(activeTab==='wiki'){renderWiki();return;}
+  // Audio reads the sound folder and the mob sidecars, not materials.json, so
+  // it renders with nothing else loaded — a sound set is worth auditioning
+  // before any material names it.
+  if(activeTab==='audio'){renderAudio();return;}
   if(!mat||!rx)return;
   if(activeTab==='overview')renderOverview();
   else if(activeTab==='materials')renderMaterials();
@@ -2805,6 +2894,30 @@ $('#rxFilter').addEventListener('input',renderReactions);
 $('#rxSort').addEventListener('change',renderReactions);
 $('#rxGroup').addEventListener('change',renderReactions);
 $('#ovFilter').addEventListener('input',renderOverview);
+$('#audFilter').addEventListener('input',renderAudList);
+$('#btnAudRescan').addEventListener('click',async()=>{
+  // Peaks are dropped wholesale rather than diffed: a rescan is rare, and a
+  // waveform left over from a replaced file is a lie the eye trusts.
+  for(const k of Object.keys(peakCache))delete peakCache[k];
+  await audLoadTree();
+  mobDefs={};await audEnsureMobs();
+  renderAudio();toast('rescanned assets/sounds');
+});
+$('#btnAudNewSet').addEventListener('click',async()=>{
+  const n=prompt('new sound set name\n\n'+
+    'A set is a FOLDER of interchangeable takes. Namespaces in use:\n  '+
+    SOUND_PREFIXES.join('\n  '),'footsteps/');
+  if(!n)return;
+  try{
+    const r=await fetch('/api/sound/set',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({set:n})});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.error||'failed');
+    soundTree=j.tree;
+    audSel={kind:'set',id:n.replace(/\/+$/,'').toLowerCase()};
+    renderAudio();toast('created '+n);
+  }catch(e){toast('could not create set: '+e.message,true);}
+});
 $('#wikiSearch').addEventListener('input',renderWikiList);
 $('#noteSearch').addEventListener('input',renderNotesList);
 $('#btnNewNote').addEventListener('click',()=>{
@@ -2828,6 +2941,641 @@ $('#btnAddNote').addEventListener('click',()=>{
   $('#rxFilter').value='';touch('rx');renderReactions();
   window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
 });
+
+/* ================= AUDIO =================
+   Two views onto one model. `soundTree` is the folder listing from the server
+   (what EXISTS); the bindings live in materials.json and the mob sidecars
+   (what is USED). Everything on the tab is derived from those two by
+   SOUND_SCHEMA — no third copy of the mapping, so a slot added to the schema
+   appears here, in the wiki, and in the orphan report at once.
+
+   Binding edits go through the ordinary dirty/save path for materials, and
+   straight to /api/model for mobs (which the Models tab already owns). File
+   operations are immediate and server-side: dropping a wav is not an edit you
+   can Ctrl+S, it is a file appearing on disk, and pretending otherwise would
+   mean holding megabytes of PCM in the page waiting for a save.            */
+
+let soundTree=null;           // {dir, sets:[{name, variants:[...]}], trash}
+let audSel=null;              // {kind:'set'|'material'|'mob', id}
+let mobDefs={};               // path -> parsed .json sidecar, lazily loaded
+let mobDirty={};              // path -> true, saved on edit (mobs autosave)
+let audioCtx=null;            // one AudioContext, created on first audition
+const peakCache={};           // "set/file" -> Float32Array of waveform peaks
+let audPlaying=null;          // currently sounding source, so a new one cuts it
+
+function actx(){
+  // Created lazily and only from a click: browsers refuse an AudioContext
+  // without a user gesture, and creating one at load leaves it suspended in a
+  // way that makes the first audition silently do nothing.
+  if(!audioCtx)audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  if(audioCtx.state==='suspended')audioCtx.resume();
+  return audioCtx;
+}
+const soundUrl=(set,file)=>
+  '/api/sound?set='+encodeURIComponent(set)+'&file='+encodeURIComponent(file);
+
+async function audLoadTree(){
+  if(!server){soundTree={dir:'',sets:[],trash:0};return;}
+  try{
+    const j=await (await fetch('/api/sounds',{cache:'no-store'})).json();
+    soundTree=j;
+  }catch(e){soundTree={dir:'',sets:[],trash:0};}
+}
+const audSets=()=>(soundTree?.sets||[]);
+const audSet=n=>audSets().find(s=>s.name===n)||null;
+function audSetsWithPrefix(p){
+  return audSets().filter(s=>s.name===p||s.name.startsWith(p+'/'));
+}
+
+/* ---- audition ----------------------------------------------------------
+   decodeAudioData gives both playback and the waveform from one fetch, so a
+   set you have listened to costs nothing to draw. Peaks are cached by path;
+   the cache is dropped wholesale on rescan rather than invalidated per file,
+   because a rescan is rare and a stale waveform is a confusing lie. */
+async function audBuffer(set,file){
+  const key=set+'/'+file;
+  if(peakCache[key]&&peakCache[key].buf)return peakCache[key].buf;
+  const r=await fetch(soundUrl(set,file),{cache:'no-store'});
+  if(!r.ok)throw new Error('fetch failed');
+  const buf=await actx().decodeAudioData(await r.arrayBuffer());
+  peakCache[key]={buf,peaks:computePeaks(buf,300)};
+  return buf;
+}
+function computePeaks(buf,n){
+  const d=buf.getChannelData(0),step=Math.max(1,Math.floor(d.length/n));
+  const out=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    let m=0;const a=i*step,b=Math.min(d.length,a+step);
+    for(let j=a;j<b;j++){const v=Math.abs(d[j]);if(v>m)m=v;}
+    out[i]=m;
+  }
+  return out;
+}
+function audStop(){
+  if(audPlaying){try{audPlaying.stop();}catch(e){}audPlaying=null;}
+  document.querySelectorAll('.avar.playing').forEach(e=>e.classList.remove('playing'));
+}
+async function audPlay(set,file,row,fromFrac){
+  try{
+    audStop();
+    const buf=await audBuffer(set,file);
+    const src=actx().createBufferSource();
+    src.buffer=buf;src.connect(actx().destination);
+    src.start(0,Math.max(0,(fromFrac||0)*buf.duration));
+    audPlaying=src;
+    if(row){row.classList.add('playing');
+      src.onended=()=>row.classList.remove('playing');}
+  }catch(e){toast('cannot play '+file+': '+e.message,true);}
+}
+// Play one variant of a set at random — what the game actually does, and the
+// only way to judge whether a set holds together as a set.
+function audPlaySet(name){
+  const s=audSet(name);
+  if(!s||!s.variants.length){toast('set "'+name+'" has no sounds',true);return;}
+  const v=s.variants[Math.floor(Math.random()*s.variants.length)];
+  audPlay(name,v.file,null,0);
+}
+
+function drawWave(cv,peaks,accent){
+  const w=cv.width=cv.clientWidth*(window.devicePixelRatio||1);
+  const h=cv.height=cv.clientHeight*(window.devicePixelRatio||1);
+  const g=cv.getContext('2d');
+  g.clearRect(0,0,w,h);
+  g.fillStyle=accent||'#6ea8fe';
+  const n=peaks.length,bw=w/n;
+  for(let i=0;i<n;i++){
+    const a=Math.max(1,peaks[i]*h*0.92);
+    g.fillRect(i*bw,(h-a)/2,Math.max(1,bw-0.5),a);
+  }
+  // Centre line, so a near-silent file is visibly a file and not a failure.
+  g.fillStyle='#2a3340';g.fillRect(0,h/2-0.5,w,1);
+}
+
+/* ---- bindings ----------------------------------------------------------
+   Reading is tolerant (new "sounds" block or the legacy flat key), writing
+   follows whichever shape the owner already uses, so opening the tuner never
+   silently rewrites materials.json into a new format. */
+function matSounds(m){return (m&&m.sounds)||null;}
+function getBinding(owner,ownerKind,slot){
+  const sch=SOUND_SCHEMA[ownerKind];
+  const s=owner?.sounds;
+  if(s&&typeof s==='object'&&s[slot.k]!=null)return String(s[slot.k]);
+  if(sch.legacyKey&&slot.k===sch.legacySlot&&owner&&owner[sch.legacyKey]!=null)
+    return String(owner[sch.legacyKey]);
+  return '';
+}
+function setBinding(owner,ownerKind,slot,value){
+  const sch=SOUND_SCHEMA[ownerKind];
+  const legacy=sch.legacyKey&&slot.k===sch.legacySlot;
+  // Keep an existing flat "footstep" flat. Anything else — a new slot, or a
+  // material that already has a sounds block — goes in the block.
+  if(legacy&&owner[sch.legacyKey]!=null&&!owner.sounds){
+    if(value)owner[sch.legacyKey]=value;else delete owner[sch.legacyKey];
+    return;
+  }
+  if(!value){
+    if(owner.sounds){delete owner.sounds[slot.k];
+      if(!Object.keys(owner.sounds).length)delete owner.sounds;}
+    if(legacy)delete owner[sch.legacyKey];
+    return;
+  }
+  owner.sounds=owner.sounds||{};
+  owner.sounds[slot.k]=value;
+  // A block wins over the flat key; leaving both would make the file say two
+  // things and the reader pick one.
+  if(legacy)delete owner[sch.legacyKey];
+}
+
+// Which sets are referenced by anything, and by whom. Drives both the "unused"
+// marking in the list and the "used by" section on a set's page.
+function soundUsage(){
+  const use={};   // setName -> [{kind,id,slot}]
+  const add=(n,u)=>{if(n)(use[n]=use[n]||[]).push(u);};
+  for(const m of (mat?.materials||[]))
+    for(const slot of SOUND_SCHEMA.material.slots){
+      const v=getBinding(m,'material',slot);
+      if(v)add(soundSetName(slot,v),{kind:'material',id:m.id,slot});
+    }
+  for(const [path,def] of Object.entries(mobDefs))
+    for(const slot of SOUND_SCHEMA.mob.slots){
+      const v=getBinding(def,'mob',slot);
+      if(v)add(soundSetName(slot,v),{kind:'mob',id:path,slot});
+    }
+  return use;
+}
+
+/* ---- import ------------------------------------------------------------
+   One path for every drop target on the tab and in the wiki: the caller says
+   which SET the files belong in, and this puts them there. `onDone` re-renders
+   whatever view asked. */
+async function audImport(setName,files,onDone){
+  if(!server){toast('file import needs the tuner server or app',true);return;}
+  if(!setName){toast('pick a sound set first',true);return;}
+  const list=[...files].filter(f=>/\.(wav|flac|mp3|ogg)$/i.test(f.name));
+  if(!list.length){toast('no audio files in that drop',true);return;}
+  let ok=0,warnStereo=0,last=null;
+  for(const f of list){
+    try{
+      const r=await fetch('/api/sound/import?set='+encodeURIComponent(setName)+
+                          '&name='+encodeURIComponent(f.name),
+                          {method:'POST',body:await f.arrayBuffer()});
+      const j=await r.json();
+      if(!j.ok)throw new Error(j.error||'import failed');
+      ok++;last=j;
+      if(j.channels&&j.channels>1)warnStereo++;
+      soundTree=j.tree||soundTree;
+    }catch(e){toast('import failed: '+e.message,true);}
+  }
+  if(ok){
+    toast('imported '+ok+' file'+(ok===1?'':'s')+' into '+setName+
+          (warnStereo?' — '+warnStereo+' is STEREO, see below':''));
+    // Stereo is worth a loud warning, not a toast that scrolls away: the
+    // spatializer builds the image itself, so a stereo asset fights it.
+    if(warnStereo)
+      toast('STEREO asset: assets must be MONO — the panner builds the stereo '+
+            'image from position. Convert it or the direction will smear.',true);
+    if(onDone)onDone(last);
+  }
+}
+// Wire an element as a drop target for one set. Returns the element.
+function audDropTarget(elm,setNameFn,onDone,cls){
+  const on=cls||'over';
+  elm.addEventListener('dragover',e=>{
+    e.preventDefault();e.stopPropagation();
+    e.dataTransfer.dropEffect='copy';elm.classList.add(on);
+  });
+  elm.addEventListener('dragleave',e=>{e.stopPropagation();elm.classList.remove(on);});
+  elm.addEventListener('drop',e=>{
+    e.preventDefault();e.stopPropagation();elm.classList.remove(on);
+    const f=e.dataTransfer.files;
+    if(f&&f.length)audImport(setNameFn(),f,onDone);
+  });
+  return elm;
+}
+
+/* ---- one variant row ---- */
+function variantRow(setName,v,onChange){
+  const row=el('div',{class:'avar'});
+  const name=el('div',{class:'vn',title:v.file+'  —  click to rename'},v.file);
+  name.addEventListener('click',async()=>{
+    const to=prompt('rename variant',v.file);
+    if(!to||to===v.file)return;
+    try{
+      const r=await fetch('/api/sound/rename',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({set:setName,file:v.file,to})});
+      const j=await r.json();
+      if(!j.ok)throw new Error(j.error||'rename failed');
+      soundTree=j.tree;onChange&&onChange();
+    }catch(e){toast('rename failed: '+e.message,true);}
+  });
+  row.append(name);
+
+  const cv=el('canvas',{title:'click to play from that point'});
+  row.append(cv);
+  // Draw once the element has a width; the canvas is flex-sized, so measuring
+  // before layout gives zero.
+  requestAnimationFrame(async()=>{
+    const key=setName+'/'+v.file;
+    try{
+      if(!peakCache[key])await audBuffer(setName,v.file);
+      drawWave(cv,peakCache[key].peaks);
+    }catch(e){
+      const g=cv.getContext('2d');
+      cv.width=cv.clientWidth;cv.height=cv.clientHeight;
+      g.fillStyle='#5c667a';g.font='11px monospace';
+      g.fillText('could not decode',6,cv.height/2+4);
+    }
+  });
+  cv.addEventListener('click',e=>{
+    const r=cv.getBoundingClientRect();
+    audPlay(setName,v.file,row,(e.clientX-r.left)/r.width);
+  });
+
+  const stereo=v.channels&&v.channels>1;
+  row.append(el('div',{class:'vmeta'+(stereo?' warn':''),
+    title:stereo?'STEREO — assets must be mono; the spatializer builds the image':
+      (v.rate?v.rate+' Hz mono':'')},
+    (v.seconds!=null?v.seconds.toFixed(2)+'s':'—')+(stereo?' ⚠2ch':'')));
+
+  const mv=el('button',{class:'icon',title:'move to another set'},'→');
+  mv.addEventListener('click',async()=>{
+    const to=prompt('move "'+v.file+'" to which set?\n\n'+
+      audSets().map(s=>'  '+s.name).join('\n'),setName);
+    if(!to||to===setName)return;
+    try{
+      const r=await fetch('/api/sound/move',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({set:setName,file:v.file,to})});
+      const j=await r.json();
+      if(!j.ok)throw new Error(j.error||'move failed');
+      soundTree=j.tree;onChange&&onChange();toast('moved to '+to+' as '+j.file);
+    }catch(e){toast('move failed: '+e.message,true);}
+  });
+  const del=el('button',{class:'icon',title:'move to .trash/'},'✕');
+  del.addEventListener('click',async()=>{
+    if(!confirm('Move "'+v.file+'" to assets/sounds/.trash/?\n\n'+
+                'The engine ignores .trash/, so it stops playing immediately. '+
+                'The file stays on disk.'))return;
+    try{
+      const r=await fetch('/api/sound/delete',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({set:setName,file:v.file})});
+      const j=await r.json();
+      if(!j.ok)throw new Error(j.error||'delete failed');
+      soundTree=j.tree;onChange&&onChange();toast('moved to .trash/');
+    }catch(e){toast('delete failed: '+e.message,true);}
+  });
+  row.append(mv,del);
+  return row;
+}
+
+// The whole variant list for a set, plus its drop zone. Shared by the Audio
+// tab and by every slot in the wiki — this IS the set editor, wherever it
+// appears.
+function setPanel(setName,onChange,opts={}){
+  const box=el('div',{});
+  const s=audSet(setName);
+  if(s&&s.variants.length){
+    s.variants.forEach(v=>box.append(variantRow(setName,v,onChange)));
+  }else if(!opts.quiet){
+    box.append(el('div',{class:'hint',style:'margin-bottom:6px'},
+      s?'this set folder exists but holds no audio files.'
+       :'no set "'+setName+'" yet — dropping a file here creates it.'));
+  }
+  const drop=audDropTarget(
+    el('div',{class:'adrop'},
+      'drop .wav files here → assets/sounds/'+setName+'/'),
+    ()=>setName,()=>{onChange&&onChange();});
+  // Clicking the zone opens a file picker, because a drop is not always
+  // possible (remote desktop, keyboard-only).
+  drop.addEventListener('click',()=>{
+    const inp=el('input',{type:'file',accept:'.wav,.flac,.mp3,.ogg',multiple:true});
+    inp.addEventListener('change',()=>audImport(setName,inp.files,onChange));
+    inp.click();
+  });
+  box.append(drop);
+  return box;
+}
+
+/* ---- the tab ---- */
+function renderAudio(){
+  const list=$('#audSetList'),body=$('#audBody');
+  if(!soundTree){
+    list.innerHTML='';body.innerHTML='';
+    body.append(el('div',{class:'hint',style:'padding:30px 4px'},'loading sounds…'));
+    audLoadTree().then(()=>{audEnsureMobs().then(renderAudio);});
+    return;
+  }
+  renderAudList();
+  renderAudPage();
+}
+
+// Mob sidecars are fetched once, on first visit to the tab: the Models tab
+// lists them, but their JSON is only needed here.
+async function audEnsureMobs(){
+  if(!server||Object.keys(mobDefs).length)return;
+  try{
+    const j=await (await fetch('/api/models',{cache:'no-store'})).json();
+    const jsons=(j.files||[]).filter(f=>f.dir==='mobs'&&f.name.endsWith('.json'));
+    await Promise.all(jsons.map(async f=>{
+      try{
+        const r=await fetch('/api/model?path='+encodeURIComponent(f.path),{cache:'no-store'});
+        mobDefs[f.path]=await r.json();
+      }catch(e){}
+    }));
+  }catch(e){}
+}
+
+async function saveMob(path){
+  if(!server)return;
+  try{
+    const r=await fetch('/api/model?path='+encodeURIComponent(path),{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(mobDefs[path],null,2)});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.error||'save failed');
+    delete mobDirty[path];
+    toast('saved '+path);
+  }catch(e){toast('save failed: '+e.message,true);}
+}
+
+function renderAudList(){
+  const host=$('#audSetList');host.innerHTML='';
+  const q=$('#audFilter').value.trim().toLowerCase();
+  const use=soundUsage();
+  const item=(label,sel,cnt,extra)=>{
+    const on=audSel&&audSel.kind===sel.kind&&audSel.id===sel.id;
+    const it=el('div',{class:'auditem'+(on?' on':'')+(extra||'')});
+    it.append(el('span',{class:'nm'},label));
+    if(cnt!=null)it.append(el('span',{class:'cnt'},String(cnt)));
+    it.addEventListener('click',()=>{audSel=sel;renderAudList();renderAudPage();});
+    return it;
+  };
+  let n=0;
+  // Sets, grouped by namespace so footsteps/ and mobs/ read as families.
+  const sets=audSets().filter(s=>!q||s.name.includes(q));
+  const byPrefix={};
+  for(const s of sets){
+    const p=s.name.includes('/')?s.name.split('/')[0]:'(root)';
+    (byPrefix[p]=byPrefix[p]||[]).push(s);
+  }
+  for(const p of Object.keys(byPrefix).sort()){
+    host.append(el('div',{class:'audhead'},p+' · '+byPrefix[p].length));
+    for(const s of byPrefix[p]){
+      n++;
+      const used=(use[s.name]||[]).length;
+      const it=item(s.name.includes('/')?s.name.split('/').slice(1).join('/'):s.name,
+                    {kind:'set',id:s.name},s.variants.length,used?'':' unused');
+      it.title=s.name+' — '+s.variants.length+' variant'+(s.variants.length===1?'':'s')+
+               (used?', used by '+used:', UNUSED: nothing binds this set');
+      // A set in the list is itself a drop target, so you can drag straight
+      // from a file manager onto the set without opening it first.
+      audDropTarget(it,()=>s.name,()=>{renderAudList();renderAudPage();},'drop');
+      host.append(it);
+    }
+  }
+  // Materials and mobs: the OWNERS, so you can work from "what makes noise"
+  // rather than from "what files exist".
+  const mats=(mat?.materials||[]).filter(m=>!q||m.id.includes(q));
+  if(mats.length){
+    host.append(el('div',{class:'audhead'},'materials · '+mats.length));
+    for(const m of mats){
+      n++;
+      const bound=SOUND_SCHEMA.material.slots
+        .filter(s=>getBinding(m,'material',s)).length;
+      host.append(item(m.id,{kind:'material',id:m.id},bound||null));
+    }
+  }
+  const mobs=Object.keys(mobDefs).filter(p=>!q||p.toLowerCase().includes(q)).sort();
+  if(mobs.length){
+    host.append(el('div',{class:'audhead'},'mobs · '+mobs.length));
+    for(const p of mobs){
+      n++;
+      const bound=SOUND_SCHEMA.mob.slots
+        .filter(s=>getBinding(mobDefs[p],'mob',s)).length;
+      host.append(item(p.replace(/^mobs\//,'').replace(/\.json$/,''),
+                       {kind:'mob',id:p},bound||null));
+    }
+  }
+  const tot=audSets().reduce((a,s)=>a+s.variants.length,0);
+  $('#audCount').textContent=
+    audSets().length+' sets · '+tot+' files'+(q?' · '+n+' shown':'')+
+    (soundTree.trash?' · '+soundTree.trash+' in .trash':'');
+}
+
+function renderAudPage(){
+  const host=$('#audBody');host.innerHTML='';
+  if(!server){
+    host.append(el('div',{class:'hint',style:'padding:30px 4px;line-height:1.8;max-width:640px'},
+      el('div',{style:'font-size:16px;color:var(--fg);margin-bottom:8px'},'Audio needs the tuner app or server.'),
+      'Reading and writing sound files means touching the assets/sounds folder, ',
+      'which a file:// page cannot do. Run ',el('code',{},'sandvox_tuner.exe'),
+      ' or ',el('code',{},'python scripts/tuner_server.py'),'.'));
+    return;
+  }
+  if(!audSel){
+    host.append(el('div',{class:'hint',style:'padding:30px 4px;line-height:1.8;max-width:680px'},
+      el('div',{style:'font-size:16px;color:var(--fg);margin-bottom:8px'},'Pick a set, a material, or a mob.'),
+      'A sound SET is a folder of interchangeable takes — the engine picks one ',
+      'at random per trigger and never twice in a row. Adding a variant is ',
+      'dropping a .wav in; there is no manifest to update.',el('br'),el('br'),
+      'Open a material or a mob to see its slots (footstep, takes damage, …), ',
+      'and drop a file straight onto a slot to bind it: the file is copied into ',
+      'the right folder, given the set\'s numbering, and the binding is written ',
+      'into the owner\'s JSON.',el('br'),el('br'),
+      'Every asset must be MONO — the spatializer builds the stereo image from ',
+      'the emitter\'s position. Stereo files are flagged in orange.'));
+    return;
+  }
+  if(audSel.kind==='set')return audPageSet(host);
+  if(audSel.kind==='material')return audPageOwner(host,'material');
+  if(audSel.kind==='mob')return audPageOwner(host,'mob');
+}
+
+function audPageSet(host){
+  const name=audSel.id,s=audSet(name);
+  const use=soundUsage()[name]||[];
+  host.append(el('div',{class:'wikihead'},
+    el('h2',{},name),
+    el('span',{class:'kind'},(s?s.variants.length:0)+' variants'),
+    el('span',{class:'spacer',style:'flex:1'}),
+    (()=>{const b=el('button',{class:'small'},'▶ audition (random)');
+      b.addEventListener('click',()=>audPlaySet(name));return b;})()));
+
+  host.append(wsec('\u{1F3B5} Variants',s?s.variants.length:0,true,
+    setPanel(name,()=>{renderAudList();renderAudPage();}),
+    el('div',{class:'hint',style:'margin-top:7px'},
+      'One trigger plays ONE of these, chosen at random and never the same one ',
+      'twice running. Variety here is what stops a walk cycle sounding like a ',
+      'loop — it is worth more than any single take being perfect.')));
+
+  const ub=el('div',{});
+  if(!use.length){
+    ub.append(wempty('nothing binds this set. It loads into memory and never plays.'));
+  }else for(const u of use){
+    const line=el('div',{class:'wrule'});
+    line.append(el('code',{class:'',style:'cursor:pointer'},u.id));
+    line.append(el('span',{class:'hint'},' · '+u.slot.n));
+    line.addEventListener('click',()=>{
+      audSel={kind:u.kind,id:u.id};renderAudList();renderAudPage();});
+    ub.append(line);
+  }
+  host.append(wsec('\u{1F517} Used by',use.length,true,ub));
+}
+
+// The slot editor for one material or one mob. Identical code for both; the
+// only differences are where the bindings are stored and how they are saved,
+// and both of those come out of SOUND_SCHEMA.
+function audPageOwner(host,kind){
+  const sch=SOUND_SCHEMA[kind];
+  const owner=kind==='material'?matById(audSel.id):mobDefs[audSel.id];
+  if(!owner){host.append(wempty('not found'));return;}
+  const label=kind==='material'?owner.id
+    :audSel.id.replace(/^mobs\//,'').replace(/\.json$/,'');
+  const rerender=()=>{renderAudList();renderAudPage();};
+
+  host.append(el('div',{class:'wikihead'},
+    kind==='material'
+      ? el('span',{class:'sw',style:'background:'+((owner.colors||[])[0]||'#666')})
+      : el('span',{},sch.icon),
+    el('h2',{},label),
+    el('span',{class:'kind'},kind),
+    el('span',{class:'spacer',style:'flex:1'}),
+    kind==='material'
+      ? (()=>{const b=el('button',{class:'small'},'wiki page');
+          b.addEventListener('click',()=>wikiGo('material',owner.id));return b;})()
+      : (()=>{const b=el('button',{class:'small'},'save '+audSel.id);
+          b.addEventListener('click',()=>saveMob(audSel.id));return b;})()));
+
+  host.append(el('div',{class:'hint',style:'margin:0 0 10px;max-width:760px;line-height:1.6'},
+    sch.blurb));
+  host.append(audSlots(owner,kind,rerender));
+}
+
+// Every slot of one owner. Extracted so the wiki can drop the same block onto
+// a material page without a second implementation.
+function audSlots(owner,kind,rerender){
+  const sch=SOUND_SCHEMA[kind];
+  const wrap=el('div',{});
+  for(const slot of sch.slots){
+    const val=getBinding(owner,kind,slot);
+    const full=soundSetName(slot,val);
+    const set=full?audSet(full):null;
+    const box=el('div',{class:'aslot'});
+
+    // Status, in one glance: bound and present / bound but missing / falls back.
+    const badge=!val
+      ? el('span',{class:'abadge fb',title:slot.fallback},'fallback')
+      : set&&set.variants.length
+        ? el('span',{class:'abadge ok'},set.variants.length+' variant'+
+            (set.variants.length===1?'':'s'))
+        : el('span',{class:'abadge miss',
+            title:'bound to "'+full+'", which has no audio files'},'missing');
+
+    const head=el('div',{class:'sh'},
+      el('b',{},slot.n),el('span',{class:'k'},slot.k),badge,
+      el('span',{class:'spacer',style:'flex:1'}));
+    if(set&&set.variants.length){
+      const b=el('button',{class:'small'},'▶');
+      b.title='audition a random variant of '+full;
+      b.addEventListener('click',()=>audPlaySet(full));
+      head.append(b);
+    }
+    box.append(head);
+    box.append(el('div',{class:'sd'},slot.d));
+
+    // The binding control: every existing set in this slot's namespace, plus
+    // the free-text escape hatch for a set that does not exist yet.
+    const row=el('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap'});
+    const sel=el('select',{class:'cell'});
+    sel.append(el('option',{value:''},'— none (' +
+      (slot.fallback||'silent').replace(/\.$/,'') + ') —'));
+    const opts=audSetsWithPrefix(slot.prefix);
+    for(const s of opts){
+      const rel=s.name.startsWith(slot.prefix+'/')
+        ? s.name.slice(slot.prefix.length+1) : s.name;
+      sel.append(el('option',{value:rel},rel+'  ('+s.variants.length+')'));
+    }
+    // A binding pointing somewhere that no longer exists must still be
+    // selectable, or opening the tuner would silently retarget it.
+    if(val&&![...sel.options].some(o=>o.value===val))
+      sel.append(el('option',{value:val},val+'  (missing)'));
+    sel.value=val;
+    sel.addEventListener('change',()=>{
+      setBinding(owner,kind,slot,sel.value);
+      if(kind==='material')touch('mat');else saveMob(audSel.id);
+      rerender();
+    });
+    row.append(el('span',{class:'hint'},'set:'),sel);
+    row.append(el('span',{class:'hint',style:'font-family:var(--mono);font-size:11px'},
+      full?'→ assets/sounds/'+full+'/':''));
+    box.append(row);
+
+    // The slot itself is a drop target. This is the headline workflow: drag a
+    // recording onto "takes damage" and everything else happens — the set is
+    // named for the owner and the slot, the folder is created, the file is
+    // renamed into the set's numbering, and the binding is written.
+    const defaultSet=()=>{
+      if(val)return full;
+      const leaf=kind==='material'?owner.id
+        :audSel.id.replace(/^mobs\//,'').replace(/\.json$/,'');
+      return slot.prefix==='mobs'? 'mobs/'+leaf+'/'+slot.k
+                                 : slot.prefix+'/'+leaf;
+    };
+    const target=audDropTarget(el('div',{class:'adrop',style:'margin-top:8px'},
+      val? 'drop .wav here → assets/sounds/'+full+'/'
+         : 'drop .wav here → creates assets/sounds/'+defaultSet()+'/ and binds it'),
+      defaultSet,
+      ()=>{
+        // Binding after the import, not before: if the copy failed there is
+        // nothing to bind, and writing the key anyway would leave a material
+        // pointing at an empty folder.
+        if(!val){
+          const d=defaultSet();
+          setBinding(owner,kind,slot,
+            d.startsWith(slot.prefix+'/')?d.slice(slot.prefix.length+1):d);
+          if(kind==='material')touch('mat');else saveMob(audSel.id);
+        }
+        rerender();
+      });
+    target.addEventListener('click',()=>{
+      const inp=el('input',{type:'file',accept:'.wav,.flac,.mp3,.ogg',multiple:true});
+      inp.addEventListener('change',()=>audImport(defaultSet(),inp.files,()=>{
+        if(!val){
+          const d=defaultSet();
+          setBinding(owner,kind,slot,
+            d.startsWith(slot.prefix+'/')?d.slice(slot.prefix.length+1):d);
+          if(kind==='material')touch('mat');else saveMob(audSel.id);
+        }
+        rerender();
+      }));
+      inp.click();
+    });
+    box.append(target);
+
+    // The variants themselves, when there are any: audition without leaving
+    // the slot you are working on.
+    if(set&&set.variants.length){
+      const det=el('details',{style:'margin-top:8px'});
+      det.append(el('summary',{style:'cursor:pointer;color:var(--dim);font-size:12px'},
+        set.variants.length+' variant'+(set.variants.length===1?'':'s')+' in '+full));
+      const inner=el('div',{style:'margin-top:7px'});
+      set.variants.forEach(v=>inner.append(variantRow(full,v,rerender)));
+      det.append(inner);
+      box.append(det);
+    }
+
+    const meta=[];
+    if(slot.fires)meta.push('fires: '+slot.fires);
+    if(slot.gain)meta.push('gain: '+slot.gain);
+    if(slot.pitch)meta.push('pitch: '+slot.pitch);
+    if(!val&&slot.fallback)meta.push('unbound → '+slot.fallback);
+    if(meta.length)box.append(el('div',{class:'sf'},meta.join('  ·  ')));
+    wrap.append(box);
+  }
+  return wrap;
+}
 
 /* ================= WIKI =================
    One page per entity, assembled from all four sources at render time. The
@@ -3030,6 +3778,13 @@ function wikiIndex(){
     hay:f.toLowerCase()+' '+(shaderSrc[f]||'').toLowerCase(),
     count:((shaderSrc[f]||'').match(/^fn\s/gm)||[]).length,
   });
+  // Sound sets are wiki entities too: searching "leaf" should find the set as
+  // well as the materials that use it.
+  for(const s of audSets())out.push({
+    kind:'sound',id:s.name,label:s.name,group:'sounds',sub:'♪',
+    hay:s.name.toLowerCase()+' '+s.variants.map(v=>v.file).join(' ').toLowerCase(),
+    count:s.variants.length,
+  });
   return out;
 }
 
@@ -3037,8 +3792,9 @@ function renderWikiList(){
   const host=$('#wikiList');host.innerHTML='';
   const q=$('#wikiSearch').value.trim().toLowerCase();
   const items=wikiIndex().filter(e=>!q||e.hay.includes(q));
-  const order=['materials','tags','tuning','shaders'];
-  const label={materials:'materials',tags:'tags',tuning:'tuning groups',shaders:'shaders'};
+  const order=['materials','tags','tuning','sounds','shaders'];
+  const label={materials:'materials',tags:'tags',tuning:'tuning groups',
+               sounds:'sound sets',shaders:'shaders'};
   let n=0;
   for(const g of order){
     const rows=items.filter(e=>e.group===g);
@@ -3073,6 +3829,13 @@ function renderWiki(){
   renderWikiList();renderWikiPage();
   if(!shaderSrc)loadShaders().then(()=>{
     if(activeTab==='wiki'){renderWikiList();renderWikiPage();}
+  });
+  // Same deal for sounds: the index lists sound sets and material pages carry
+  // an Audio section, but neither is worth delaying the first paint for.
+  if(!soundTree&&server)audLoadTree().then(()=>{
+    audEnsureMobs().then(()=>{
+      if(activeTab==='wiki'){renderWikiList();renderWikiPage();}
+    });
   });
 }
 
@@ -3322,6 +4085,52 @@ function renderWikiPage(){
   if(wikiSel.kind==='tag')return wikiTag(host);
   if(wikiSel.kind==='tune')return wikiTune(host);
   if(wikiSel.kind==='shader')return wikiShader(host);
+  if(wikiSel.kind==='sound')return wikiSound(host);
+}
+
+/* A sound set's page. The set editor is the Audio tab's own, so a take dropped
+   here lands identically; what the wiki adds is the reverse index — every
+   material and mob that reaches for this set, and how the engine treats it. */
+function wikiSound(host){
+  const name=wikiSel.id,s=audSet(name);
+  const use=soundUsage()[name]||[];
+  host.append(el('div',{class:'wikihead'},
+    el('span',{},'♪'),el('h2',{},name),
+    el('span',{class:'kind'},(s?s.variants.length:0)+' variants'),
+    el('span',{class:'spacer',style:'flex:1'}),
+    (()=>{const b=el('button',{class:'small'},'▶ audition');
+      b.addEventListener('click',()=>audPlaySet(name));return b;})(),
+    (()=>{const b=el('button',{class:'small'},'open in Audio');
+      b.addEventListener('click',()=>{
+        audSel={kind:'set',id:name};
+        document.querySelector('nav.tabs button[data-tab=audio]').click();
+      });return b;})()));
+
+  if(!server){
+    host.append(wempty('sound files need the tuner app or server.'));
+    return;
+  }
+  host.append(wsec('\u{1F3B5} Variants',s?s.variants.length:0,true,
+    setPanel(name,()=>renderWikiPage())));
+
+  const ub=el('div',{});
+  if(!use.length)ub.append(wempty(
+    'nothing binds this set — it is decoded into memory at startup and never '+
+    'played. Either bind it, or move it out of assets/sounds/.'));
+  else for(const u of use){
+    const line=el('div',{class:'wrule'});
+    const c=el('code',{style:'cursor:pointer'},u.id);
+    c.addEventListener('click',()=>{
+      if(u.kind==='material')wikiGo('material',u.id);
+      else{audSel={kind:'mob',id:u.id};
+        document.querySelector('nav.tabs button[data-tab=audio]').click();}
+    });
+    line.append(c,el('span',{class:'hint'},' · '+u.slot.n+
+      ' ('+u.kind+')'));
+    ub.append(line);
+  }
+  host.append(wsec('\u{1F517} Used by',use.length,true,ub));
+  host.append(wikiNoteSection('sound:'+name.replace(/\//g,'-')));
 }
 
 /* ---- material page: the full dossier ---- */
@@ -3430,6 +4239,13 @@ function wikiMaterial(host){
   host.append(wsec('\u{1F39B} Tuning that affects it',
     [...groups].reduce((n,g)=>n+((TUNING_SCHEMA.find(t=>t.id===g)||{}).params||[]).length,0),
     true,tuneBody));
+
+  /* --- audio: the same slot editor the Audio tab uses ---
+     Not a summary of it — the very same audSlots() block, so auditioning a
+     step, rebinding it, or dropping a new take is done HERE, on the page you
+     were already reading, exactly as the wiki embeds the material and reaction
+     row editors rather than restating them. */
+  host.append(wikiAudioSection(m));
 
   host.append(wikiNoteSection('material:'+m.id));
 }
@@ -3862,6 +4678,66 @@ function renderNoteEditor(){
 
 // The note attached to one wiki entity. Same store, name derived from the
 // entity, so it shows up in the Notes list and in Obsidian like any other page.
+/* The audio dossier for one material, embedded in its wiki page.
+
+   The sound tree is fetched lazily here rather than at load: the wiki is
+   usable without the audio server, and a material page must not wait on a
+   folder scan to render. When there is no tree yet the section renders a
+   placeholder and re-renders itself once the fetch lands. */
+function wikiAudioSection(m){
+  const body=el('div',{});
+  if(!server){
+    body.append(wempty('sound files need the tuner app or server — run '+
+      'sandvox_tuner.exe or scripts/tuner_server.py to audition and import.'));
+    return wsec('\u{1F50A} Audio',null,false,body);
+  }
+  if(!soundTree){
+    body.append(el('div',{class:'hint'},'loading assets/sounds…'));
+    audLoadTree().then(()=>{if(wikiSel&&wikiSel.kind==='material')renderWikiPage();});
+    return wsec('\u{1F50A} Audio',null,true,body);
+  }
+
+  // What the ENGINE will actually do, fallback included — the question a wiki
+  // page exists to answer. cues.cpp resolves an unbound material by tag, so
+  // saying only "no footstep key" would be true and useless.
+  const resolved=resolveMaterialSound(m,SOUND_SCHEMA.material.slots[0]);
+  body.append(el('div',{class:'hint',style:'margin-bottom:9px;line-height:1.6'},
+    'Walking on ',el('b',{},m.id),' plays ',
+    resolved.set
+      ? [el('code',{},resolved.set),' (',String(resolved.count),' variant',
+         resolved.count===1?'':'s',resolved.authored?', named by this material'
+           :', by tag fallback: '+resolved.why,')']
+      : el('em',{},'nothing — '+resolved.why),
+    '. Drop a .wav on a slot below to bind it.'));
+
+  body.append(audSlots(m,'material',()=>renderWikiPage()));
+  const bound=SOUND_SCHEMA.material.slots
+    .filter(s=>getBinding(m,'material',s)).length;
+  return wsec('\u{1F50A} Audio',bound||null,true,body);
+}
+
+/* Mirror of cues.cpp's resolution for the footstep slot, so the wiki can state
+   what will happen rather than what was authored. It restates FallbackFootstep()
+   and MUST be kept in step with it — the same standing obligation the render-path
+   table carries for the shader predicates. */
+function resolveMaterialSound(m,slot){
+  const authored=getBinding(m,'material',slot);
+  const tags=m.tags||[];
+  let name=authored,why='',isAuthored=!!authored;
+  if(!authored){
+    if(tags.includes('foliage')){name='leaf';why='tagged foliage';}
+    else if(m.class==='liquid'){name='';why='liquids are deliberately silent';}
+    else if(m.class==='gas'){name='';why='gases are deliberately silent';}
+    else if(tags.includes('organic')){name='branch';why='tagged organic — a dry snap';}
+    else if(tags.includes('soil')){name='path';why='tagged soil';}
+    else if(tags.includes('mineral')){name='path';why='tagged mineral';}
+    else{name='path';why='every solid gets a step';}
+  }
+  const full=name?soundSetName(slot,name):'';
+  const s=full?audSet(full):null;
+  return {set:full,count:s?s.variants.length:0,authored:isAuthored,why:why||''};
+}
+
 function wikiNoteSection(key){
   const name=key.replace(/[^A-Za-z0-9\-_. ()]/g,'-');
   const has=notes[name]!==undefined&&(notes[name]||'').trim();

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,23 @@ struct MobDef {
   // gameplay geometry — gait pivots, terrain anchors, ground probes — reads
   // this rather than `prefab.size`, which stays in the .vox's own (micro) units.
   Vec3 worldSize{};
+  // Sound sets for this creature, keyed by SLOT ("hurt", "death", "sever",
+  // ...), from the sidecar's "sounds" object. Values name a set relative to
+  // the slot's namespace exactly as materials do — "hurt": "goblin/hurt"
+  // resolves to "mobs/goblin/hurt". assets/sound_schema.js lists the slots the
+  // tuner offers.
+  //
+  // Unlike materials there is NO fallback: an unbound slot is silent, because
+  // one creature borrowing another's voice is always wrong. Presentation only;
+  // an unknown set name is a diagnostic, never a load failure.
+  std::map<std::string, std::string> sounds;
+
+  const std::string& Sound(const char* slot) const {
+    static const std::string kNone;
+    auto it = sounds.find(slot);
+    return it == sounds.end() ? kNone : it->second;
+  }
+
   std::vector<MobLimbDef> limbs;
   // Rig for the animation runtime. `skel.parts` is index-parallel to `limbs`
   // and stored parent-before-child (AnimFlatten's one-pass requirement); the

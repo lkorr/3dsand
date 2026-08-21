@@ -961,10 +961,26 @@ groups, a spring tail and a masked flinch clip.
 
 ### Player avatar and third-person camera (2026-08-20; `game/avatar`, `game/thirdperson`)
 
-The player has a visible, dismemberable body: a robed wizard authored at **4
-microvoxels per world voxel** (`assets/mobs/wizard.*`,
-`scripts/gen_wizard.py`), rigged into 16 independently severable parts — head,
-torso, hips, upper/fore arms, hands, thighs/shins, feet, and a held staff.
+The player has a visible, dismemberable body: a small hooded, robed figure
+("mina") authored at **4 microvoxels per world voxel** (`assets/mobs/mina.*`,
+`scripts/gen_mina.py`), rigged into 15 independently severable parts — head
+(the hood), torso, hips (the robe skirt), upper/fore arms, hands, thighs/shins
+and feet.
+
+**The rig is sized from the engine's own player constants, not by eye.** At
+`kVoxelMeters = 0.10`, `Player::kHalfY` (0.85 m) makes the collision box
+exactly **17 world voxels** tall and `Player::kEyeOffset` (0.65 m) puts the
+first-person camera at **world voxel 15** — so the figure is authored 17 voxels
+tall with the hood's face void centred on voxel 15, and `gen_mina.py` asserts
+both rather than trusting a comment. The predecessor (`gen_wizard.py`, kept as
+a second character) was authored 28 voxels tall against an assumed
+`kVoxelMeters` of 0.0625; at the real 0.10 that is a 2.8 m giant standing in a
+1.7 m box, with the eye camera inside its chest. Deriving the art's height from
+the same constants the controller uses is what stops that class of mismatch.
+
+Which def the player wears is one string — `avatarDefName` in `main.cpp`, which
+the selftest's avatar block reads too, so swapping characters cannot leave the
+test pinned to the old one.
 
 **One schema, two drivers.** The avatar is an ordinary `MobDef`: same `.vox` +
 sidecar format, same loader, same `AnimSkeleton` runtime. It therefore
@@ -1651,6 +1667,154 @@ CMake.**
   hostile to the moddable JSON/tag scripting that is this project's pillar, and
   far harder to debug. Worth revisiting if readback latency proves worse than
   expected (§14 risk 2) — it's the escape hatch.
+
+## 12b. Audio (added 2026-08-20)
+
+**Spatialized, occluded, data-driven sound. Presentation only — the audio layer
+may never feed anything back into the sim (rule 1), and it is the first real
+concurrency in the codebase (see the threading contract below).**
+
+### The spatializer is vendored, not written
+
+`src/audio/xyzpan/` is a verbatim copy of the binaural engine from the
+`audio_webgame` project (itself a snapshot of the `xyzpan` VST). It is pure
+C++20 with **zero third-party includes**, which is the property that made it
+droppable in. Each `XYZPanEngine` instance spatializes exactly ONE mono source
+through: doppler delay → comb bank → pinna/ear-canal EQ → ITD/ILD split → chest
+and floor bounce → distance gain + air absorption → early reflections → FDN
+reverb. Full provenance, local modifications, and the two traps below are
+recorded in `src/audio/xyzpan/VENDORED_FROM.md` — read it before touching
+`MakeParams`.
+
+Two conversions happen in exactly one function (`AudioWorld::MakeParams`):
+
+- **Axes.** The engine is Z-up / Y-forward; sandvox is Y-up. `(x, y, z)` →
+  `(x, z, y)`.
+- **Units.** The engine needs METERS, not voxels — its binaural cues use virtual
+  ears offset by 0.087 *units*, which is a head radius only if a unit is a
+  meter. Feeding voxels would put the listener's ears 87 cm apart.
+
+### Why every asset on disk is mono
+
+The spatializer synthesizes the stereo image from the emitter's position. A
+stereo asset arrives with its own baked image, which fights the panner and
+smears the direction — so `Library` decodes everything to 1 channel at the
+device's negotiated rate, and `scripts/split_footsteps.py` writes mono files.
+
+### Occlusion is a voxel ray, not diffraction
+
+`audio_webgame` solves Maekawa knife-edge diffraction analytically against a
+list of cylinders and boxes. A voxel field has no such list, so the model here
+is different in kind: trace the straight listener→source line, accumulate the
+material crossed, and convert it into (broadband gain, low-pass cutoff) using
+per-material acoustic properties derived from class/hardness/tags.
+
+The **low-pass is the load-bearing half**: transmission loss rises with
+frequency (mass law), so material between you and a source removes highs far
+faster than lows — a wall makes a sound *dull*, not merely quiet. Getting that
+tilt right matters more for readability than the absolute level does.
+
+Cost obeys rule 2: one ray per *audible* voice per frame, capped in length and
+step count, over the same chunk cache the avatar's foot probe uses — no GPU
+work, no readback, no new synchronization. What this deliberately does NOT model
+(diffraction imaging, portals, geometry-specific reflections) is listed at the
+bottom of `src/audio/occlusion.h` so nobody assumes it does.
+
+### Footsteps come from the gait, not from a distance accumulator
+
+The avatar's gait state machine already has an exact touchdown moment
+(`f.planted = f.swingTo`). Footsteps fire there, which means a step is heard on
+the frame the art shows the foot land, at whatever cadence the gait chose, and a
+leg lost to dismemberment stops producing steps for free because it never swings
+again. The ground probe that picks the foot's target already reads the
+supporting voxel's material and used to discard it; it now returns it.
+
+Events are QUEUED (`PlayerAvatar::Footfall`) rather than fired directly, because
+`PreTick` runs inside the fixed-tick loop up to 4× per frame — firing inline
+would stack several steps on one instant. The consumer drains them once per
+frame.
+
+Material → sound is DATA: `materials.json` carries a `"footstep"` key naming a
+folder under `assets/sounds/footsteps/`, resolved once at load into a flat table
+indexed by material id. Materials with no key fall back **by tag** (foliage →
+leaf, organic → branch, soil/mineral → path), so a new material is audible the
+day it is added — the same guard against the N×M explosion that reactions use.
+
+### Sound slots: one authoring surface for every noise a thing makes
+
+A **slot** is one authored binding — an owner (a material, a mob) naming a sound
+set for one event. Materials carry theirs in a `"sounds"` object
+(`{"footstep": "leaf", "impact": "stone"}`); mobs carry theirs in their `.json`
+sidecar, so a creature stays one `.vox` plus one `.json` with its voice
+included. The older flat `"footstep": "leaf"` is still read and still written
+back for materials that already use it — opening the tuner never silently
+rewrites a file into a new shape.
+
+The slot list itself lives in **`assets/sound_schema.js`**, and it is the only
+place that knows a slot exists. Each entry names the namespace it binds into
+(`footstep` → `footsteps/`, `hurt` → `mobs/`), which is what lets the tuner
+offer a correct set list per slot instead of every set in the project. The
+engine does the same concatenation through `Cues::kSlotPrefix`; the two tables
+are mirrored and adding a slot means a row in each plus a call site that fires
+it. Material slots fall back to the footstep set (a body hitting stone and a
+boot hitting stone are the same surface, separated by pitch and gain);
+`break` and every mob slot are **silent** when unbound, because a shatter is not
+a step and one creature borrowing another's voice is always wrong.
+
+Creature voices are rate-limited per source (`kMobVoiceMinGap`): a body taking
+a burst of per-tick laser damage speaks once, rather than firing a machine-gun
+of overlapping copies of one sample. Death and sever bypass the limiter — they
+happen once and are the events the player most needs to hear.
+
+### Authoring is drag-and-drop (the tuner's Audio tab)
+
+Because a set is a folder and nothing else, importing a sound is a file copy —
+so the tuner does it. Dropping a `.wav` onto a slot creates the set folder,
+renames the file into that set's numbering (variant order is a filename sort,
+and `take 3 FINAL.wav` landing mid-list would silently renumber every variant),
+writes the binding into the owner's JSON, and rescans. The same set editor —
+waveform audition, rename, move, delete — is embedded in the wiki page for
+every material and every sound set, so it is the same edit wherever you make
+it. Deletes move to `assets/sounds/.trash/` (skipped by the loader, like
+`raw/`): a recorded take is not reproducible, so the destructive path is not
+trusted to a click. All of it needs the tuner server or app; a `file://` page
+cannot reach the folder.
+
+### Threading contract (the first real concurrency here)
+
+    GAME THREAD owns  World, Player, PlayerAvatar, Tuning, Library.
+    AUDIO THREAD owns playback position, filter state, engine smoothers.
+    Shared: ONLY lock-free atomics + sample buffers the library keeps immortal.
+
+The audio thread must never touch a game object, and in particular must never
+call `CurrentTuning()`: F5 replaces that global wholesale. Tuning is read on the
+game thread and copied down. `Library` is append-only with buffers behind
+`unique_ptr`, so a `const std::vector<float>*` handed to a playing voice stays
+valid forever — do not add a remove/replace op without solving reclamation.
+
+### Headless is silent
+
+`--selftest`, `--shot` and `--shot-mob` return before audio init, so they open
+no device (there is no sound hardware in CI, and a gate that needs one is not a
+gate). `--noaudio` forces the same. A failed device init is never an error —
+the game runs silent. The selftest still asserts the *events* (`avatar
+footfalls`), which is the half that can break silently.
+
+### Built but not yet triggered
+
+`Cues::Impact()` and the ambience loop API (`StartAmbience`/`MoveAmbience`/
+`StopAmbience`) are implemented and tested, but nothing calls `Impact()`
+automatically yet: the debris system has no contact/landing event, and Physics
+exposes no velocity read-back. Wiring it needs a Jolt contact listener plus its
+own test — deliberately left as a hook rather than landed unverified.
+
+`Cues::MobSound()` is likewise implemented, resolvable and bindable from the
+tuner, but no damage/death site calls it yet. The `idle`, `alert` and `attack`
+slots have no AI event to hang off at all. Each slot in
+`assets/sound_schema.js` states its own status in its `fires:` field, and the
+tuner shows it on the slot — so binding a sound to something nothing triggers
+tells you so at authoring time instead of leaving you wondering why it is
+silent.
 
 ## 13. Roadmap
 

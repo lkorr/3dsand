@@ -3,6 +3,7 @@
   "materials": [
     {
       "id": "stone",
+      "footstep": "path",
       "class": "solid",
       "density": 2600,
       "hardness": 90,
@@ -20,6 +21,7 @@
     },
     {
       "id": "wood",
+      "footstep": "branch",
       "class": "solid",
       "density": 600,
       "hardness": 40,
@@ -37,6 +39,7 @@
     },
     {
       "id": "sand",
+      "footstep": "path",
       "class": "powder",
       "density": 1600,
       "hardness": 12,
@@ -55,6 +58,7 @@
     },
     {
       "id": "gravel",
+      "footstep": "path",
       "class": "powder",
       "density": 1800,
       "hardness": 18,
@@ -164,6 +168,7 @@
     },
     {
       "id": "ash",
+      "footstep": "path",
       "class": "powder",
       "density": 700,
       "hardness": 8,
@@ -211,6 +216,7 @@
     },
     {
       "id": "ice",
+      "footstep": "path",
       "class": "solid",
       "density": 917,
       "hardness": 35,
@@ -228,6 +234,7 @@
     },
     {
       "id": "snow",
+      "footstep": "path",
       "class": "powder",
       "density": 300,
       "hardness": 6,
@@ -243,6 +250,7 @@
     },
     {
       "id": "dirt",
+      "footstep": "path",
       "class": "powder",
       "density": 1500,
       "hardness": 14,
@@ -260,6 +268,7 @@
     },
     {
       "id": "plant",
+      "footstep": "leaf",
       "class": "solid",
       "density": 400,
       "hardness": 10,
@@ -411,6 +420,7 @@
     },
     {
       "id": "glass",
+      "footstep": "path",
       "class": "solid",
       "density": 2400,
       "hardness": 30,
@@ -521,6 +531,7 @@
     {
       "comment": "Forest set (worldgen only). These are INERT on purpose: they carry the organic/flammable tags so fire, acid, mites and the laser treat them like the reactive garden, but no reaction in reactions.json uses them as `self` with an emit. Worldgen paints them by the million, and anything that grows would keep those chunks awake forever (CLAUDE.md rule 2).",
       "id": "grass",
+      "footstep": "path",
       "class": "solid",
       "density": 420,
       "hardness": 8,
@@ -540,6 +551,7 @@
     },
     {
       "id": "leaves",
+      "footstep": "leaf",
       "class": "solid",
       "density": 320,
       "hardness": 6,
@@ -559,6 +571,7 @@
     },
     {
       "id": "pine_needles",
+      "footstep": "leaf",
       "class": "solid",
       "density": 300,
       "hardness": 6,
@@ -578,6 +591,7 @@
     },
     {
       "id": "autumn_leaves",
+      "footstep": "leaf",
       "class": "solid",
       "density": 320,
       "hardness": 6,
@@ -597,6 +611,7 @@
     },
     {
       "id": "birch_wood",
+      "footstep": "branch",
       "class": "solid",
       "density": 560,
       "hardness": 36,
@@ -632,6 +647,7 @@
     },
     {
       "id": "grass_tuft",
+      "footstep": "leaf",
       "class": "solid",
       "density": 200,
       "hardness": 2,
@@ -661,6 +677,7 @@
     },
     {
       "id": "foliage_bush",
+      "footstep": "leaf",
       "class": "solid",
       "density": 260,
       "hardness": 4,
@@ -793,6 +810,7 @@
     },
     {
       "id": "leaf_green",
+      "footstep": "leaf",
       "class": "solid",
       "density": 300,
       "hardness": 3,
@@ -939,6 +957,7 @@
     },
     {
       "id": "staff_wood",
+      "footstep": "branch",
       "class": "solid",
       "density": 620,
       "hardness": 34,
@@ -973,6 +992,7 @@
     },
     {
       "id": "bone",
+      "footstep": "path",
       "class": "solid",
       "density": 1200,
       "hardness": 24,

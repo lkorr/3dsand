@@ -198,6 +198,69 @@ struct Tuning {
     float respawnDelay = 3.0f;
   } avatar;
 
+  // ---- sound ----
+  // CPU-only: nothing here reaches a shader, so there is no TUNE_* emitter and
+  // no entry in scripts/tuning_prelude.py. Read through CurrentTuning() on the
+  // GAME thread and copied into the audio layer once per frame — the audio
+  // thread must never touch this struct, since F5 replaces it wholesale
+  // (see src/audio/voice.h for the threading contract).
+  struct Audio {
+    bool enabled = true;
+    float masterVolume = 0.8f;
+
+    // Footsteps. `volume` is the overall trim; per-material trims multiply it.
+    float footstepVolume = 0.85f;
+    // Audible radius in meters — the distance at which a step falls to the
+    // gain floor. Steps are small sounds; a big radius makes them carry
+    // unnaturally and wastes voices on inaudible ones.
+    float footstepRadius = 22.0f;
+    // Step pitch is randomized per trigger to hide sample repetition. This is
+    // the half-range: 0.06 means each step lands in [0.94, 1.06] of natural
+    // rate. Too much and the surface changes identity step to step.
+    float footstepPitchJitter = 0.06f;
+    // Loudness at walking pace vs at sprint. Speed maps between them, so a
+    // sneak is quiet and a sprint is not merely faster but heavier.
+    float footstepWalkGain = 0.55f;
+    float footstepSprintGain = 1.0f;
+    // Speed (m/s) that counts as a full sprint for the mapping above.
+    float footstepSprintSpeed = 7.0f;
+    // Left and right feet are pitched apart by this fraction so a gait reads
+    // as two feet rather than one repeated impact.
+    float footstepFootDetune = 0.03f;
+
+    // Landing after a fall: gain scales with impact speed up to this speed
+    // (m/s), which also caps the pitch drop.
+    float landVolume = 1.0f;
+    float landFullSpeed = 12.0f;
+
+    // Physical impacts (debris, bodies).
+    float impactVolume = 0.9f;
+    float impactRadius = 30.0f;
+    // Creature voices (hurt/death/sever/...). Kept separate from impacts
+    // because a mob crying out and a rock landing are mixed against each
+    // other, and one trim cannot serve both.
+    float mobVolume = 1.0f;
+    float mobRadius = 45.0f;
+    float mobPitchJitter = 0.07f;
+
+    // Reverb send for world sounds, 0..1. The engine's FDN reverb is what
+    // makes a cave read as a cave; keep it modest for outdoor-heavy worlds.
+    float reverbWet = 0.16f;
+
+    // ---- occlusion ----
+    // See src/audio/occlusion.h for the model. These are the knobs that decide
+    // how much a wall between you and a sound matters.
+    bool occlusion = true;
+    float occlusionMaxDb = 24.0f;      // cap on the broadband duck
+    float occlusionMinCutoffHz = 320.0f;  // fully-muffled low-pass floor
+    float occlusionScale = 1.0f;       // multiplies the accumulated dB
+    float occlusionCutoffScale = 1.0f; // <1 = darker through walls
+    float occlusionMaxRangeM = 40.0f;  // never trace a ray longer than this
+    // How much of the reverb send survives an occluded path. High values keep
+    // a blocked sound present-but-muffled instead of switching it off.
+    float occlusionWetKeep = 0.7f;
+  } audio;
+
   // ---- Jolt rigid bodies ----
   struct Physics {
     float gravity = 9.81f;

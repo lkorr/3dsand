@@ -1,0 +1,158 @@
+/* ==========================================================================
+   Sound slot catalog — the single description of every sound a thing can make.
+   ==========================================================================
+   The Audio tab and the wiki's Audio section are both built entirely from this
+   table, and nothing else in the tuner knows what a "footstep" or a "hurt" is.
+   That is the point: adding "the sound a mob makes when it lands" should be one
+   row here plus the C++ that fires it, never a new panel.
+
+   A SLOT is one authored binding: an owner (a material, a mob) names a sound
+   SET for one event. Sets are folders under assets/sounds/ — see
+   src/audio/library.h; the tuner never invents structure the engine cannot
+   scan.
+
+   Slot fields:
+     k        key written into the owner's JSON
+     n        display name
+     d        what triggers it, in plain terms — shown as help text
+     prefix   the sound-set namespace this slot binds into. An authored value
+              of "leaf" in a slot with prefix 'footsteps' resolves to the set
+              "footsteps/leaf". This mirrors cues.cpp, which does exactly that
+              concatenation, and it is why the tuner can offer a correct set
+              list per slot rather than every set in the project.
+     fires    where the engine calls it, so the wiki can say "nothing triggers
+              this yet" honestly instead of implying a wired-up feature
+     fallback how a missing binding is resolved, described for the reader. The
+              real fallback lives in C++ (cues.cpp FallbackFootstep); this
+              string must be kept honest against it.
+     gain/pitch  presentation notes shown on the slot
+
+   OWNER KINDS. `store` says where a binding is written:
+     'material'  materials.json, in the material's "sounds" object
+     'mob'       assets/mobs/<name>.json, in its "sounds" object
+   Both are edited in place through the tuner's existing save paths — a sound
+   binding is an ordinary authored field, not a fourth file to keep in sync.
+
+   BACK COMPATIBILITY. materials.json historically carried a flat
+   "footstep": "leaf" key. Both the engine and this tuner still read it, and
+   the tuner writes through to whichever form the material already uses, so an
+   old file is never silently rewritten into a new shape.               */
+
+const SOUND_SCHEMA = {
+
+  // ---- materials: what a SURFACE sounds like ----------------------------
+  material: {
+    store: 'material',
+    title: 'Surface sounds',
+    icon: '\u{1FAA8}',
+    blurb: 'What this material sounds like when something interacts with it. ' +
+           'Bindings are by MATERIAL, but a material that names nothing falls ' +
+           'back by TAG — the same guard against the N×M explosion that ' +
+           'reactions use, so a new material is audible the day it is added.',
+    // The legacy flat key, still honoured on read and preserved on write.
+    legacyKey: 'footstep',
+    legacySlot: 'footstep',
+    slots: [
+      {k:'footstep', n:'footstep', prefix:'footsteps',
+       d:'A foot planted on this surface. Fires from the avatar’s own gait at the frame each foot plants, not from a distance accumulator, so it stays in step with the animation.',
+       fires:'audio::Cues::Footstep — src/audio/cues.cpp',
+       fallback:'by tag: foliage→leaf, organic→branch, soil/mineral→path; liquids and gases are deliberately silent.',
+       gain:'scales with walk→sprint speed (Audio tuning group)',
+       pitch:'random jitter ± a fixed left/right detune'},
+
+      {k:'land', n:'landing', prefix:'footsteps',
+       d:'Touchdown after a fall onto this surface. Louder and pitched down with impact speed — that pitch drop is what separates a landing from a step without a second set of samples.',
+       fires:'audio::Cues::Land — src/audio/cues.cpp',
+       fallback:'the footstep set for this material.',
+       gain:'scales with fall speed up to the landing-full-speed knob',
+       pitch:'down to −22% at full impact'},
+
+      {k:'impact', n:'impact', prefix:'impacts',
+       d:'Debris or a thrown body striking this material.',
+       fires:'audio::Cues::Impact — src/audio/cues.cpp',
+       fallback:'the footstep set for this material, pitched and gained differently.',
+       gain:'scales with impact energy',
+       pitch:'heavier impact → lower'},
+
+      {k:'break', n:'break / shatter', prefix:'breaks',
+       d:'This material being destroyed — dug out, blasted, or shattered into rubble.',
+       fires:'not wired yet — bind it and the set is ready when it is',
+       fallback:'silent.'},
+
+      {k:'ambience', n:'ambience loop', prefix:'ambience',
+       d:'A positioned looping bed for a body of this material, e.g. a lava lake or a waterfall. Started per emitter with a radius, not per voxel.',
+       fires:'audio::Cues::StartAmbience — called by game code, not automatic',
+       fallback:'silent.'},
+    ],
+  },
+
+  // ---- mobs: what a CREATURE sounds like --------------------------------
+  // The slot list a character author actually reaches for. Drop a .wav on one
+  // of these and it lands in mobs/<mob>/<slot>/ as a numbered variant.
+  mob: {
+    store: 'mob',
+    title: 'Creature sounds',
+    icon: '\u{1F43A}',
+    blurb: 'Bound per mob in its own .json sidecar, so a mob stays one .vox ' +
+           'plus one .json with its sounds included. A slot left empty is ' +
+           'silent — there is no cross-mob fallback, because one creature ' +
+           'borrowing another’s voice is always wrong.',
+    slots: [
+      {k:'hurt', n:'takes damage', prefix:'mobs',
+       d:'Struck but still alive. Fires once per damage event, so a burst of hits should not fire a burst of voices — the engine rate-limits it.',
+       fires:'audio::Cues::MobSound(Hurt) — src/audio/cues.cpp',
+       fallback:'silent.',
+       gain:'scales with the fraction of max hp removed'},
+
+      {k:'death', n:'dies', prefix:'mobs',
+       d:'The killing blow. Fired once, at the moment the mob is marked dead, before the ragdoll takes over.',
+       fires:'audio::Cues::MobSound(Death) — src/audio/cues.cpp',
+       fallback:'silent.'},
+
+      {k:'sever', n:'limb severed', prefix:'mobs',
+       d:'A limb comes off. Distinct from taking damage because dismemberment is a state change the player should hear, not merely a bigger hit.',
+       fires:'audio::Cues::MobSound(Sever) — src/audio/cues.cpp',
+       fallback:'the hurt set, if one is bound.'},
+
+      {k:'idle', n:'idle vocal', prefix:'mobs',
+       d:'Occasional noise while alive and unaware. The cheapest way to make a world feel inhabited — and the fastest way to make it maddening, so keep the interval long.',
+       fires:'not wired yet — bind it and the set is ready when it is',
+       fallback:'silent.'},
+
+      {k:'alert', n:'notices you', prefix:'mobs',
+       d:'The moment this mob acquires the player. Doubles as the player’s only warning, so it should be legible over distance.',
+       fires:'not wired yet — bind it and the set is ready when it is',
+       fallback:'silent.'},
+
+      {k:'attack', n:'attacks', prefix:'mobs',
+       d:'The swing, lunge or shot itself.',
+       fires:'not wired yet — bind it and the set is ready when it is',
+       fallback:'silent.'},
+
+      {k:'step', n:'footstep', prefix:'footsteps',
+       d:'This mob’s own step, overriding the surface it walks on. For creatures whose feet are the story — something hooved or metal reads by its gait, not by the ground.',
+       fires:'audio::Cues::Footstep, when the mob overrides the surface',
+       fallback:'the SURFACE material’s footstep set (the usual case).'},
+    ],
+  },
+};
+
+// Every namespace a slot can bind into, for the set browser's grouping and for
+// "which sets exist that nothing uses" reports.
+const SOUND_PREFIXES = (() => {
+  const s = new Set();
+  for (const owner of Object.values(SOUND_SCHEMA))
+    for (const slot of owner.slots) s.add(slot.prefix);
+  return [...s].sort();
+})();
+
+// A slot's authored value is a set name RELATIVE to its prefix; this is the one
+// place that concatenation happens on the tuner side. It must stay identical to
+// the one in src/audio/cues.cpp.
+function soundSetName(slot, value) {
+  if (!value) return '';
+  // An authored value containing '/' is already a full set name — an escape
+  // hatch for pointing a slot at a set outside its namespace without inventing
+  // a second syntax for it.
+  return value.includes('/') ? value : slot.prefix + '/' + value;
+}

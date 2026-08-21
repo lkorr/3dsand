@@ -400,6 +400,35 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "respawnDelay", a.respawnDelay, out, at);
   }
 
+  if (const json* g = Find(j, "audio")) {
+    auto& a = out.audio;
+    const std::string at = "audio";
+    ReadB(*g, "enabled", a.enabled, out, at);
+    ReadF(*g, "masterVolume", a.masterVolume, out, at);
+    ReadF(*g, "footstepVolume", a.footstepVolume, out, at);
+    ReadF(*g, "footstepRadius", a.footstepRadius, out, at);
+    ReadF(*g, "footstepPitchJitter", a.footstepPitchJitter, out, at);
+    ReadF(*g, "footstepWalkGain", a.footstepWalkGain, out, at);
+    ReadF(*g, "footstepSprintGain", a.footstepSprintGain, out, at);
+    ReadF(*g, "footstepSprintSpeed", a.footstepSprintSpeed, out, at);
+    ReadF(*g, "footstepFootDetune", a.footstepFootDetune, out, at);
+    ReadF(*g, "landVolume", a.landVolume, out, at);
+    ReadF(*g, "landFullSpeed", a.landFullSpeed, out, at);
+    ReadF(*g, "impactVolume", a.impactVolume, out, at);
+    ReadF(*g, "impactRadius", a.impactRadius, out, at);
+    ReadF(*g, "mobVolume", a.mobVolume, out, at);
+    ReadF(*g, "mobRadius", a.mobRadius, out, at);
+    ReadF(*g, "mobPitchJitter", a.mobPitchJitter, out, at);
+    ReadF(*g, "reverbWet", a.reverbWet, out, at);
+    ReadB(*g, "occlusion", a.occlusion, out, at);
+    ReadF(*g, "occlusionMaxDb", a.occlusionMaxDb, out, at);
+    ReadF(*g, "occlusionMinCutoffHz", a.occlusionMinCutoffHz, out, at);
+    ReadF(*g, "occlusionScale", a.occlusionScale, out, at);
+    ReadF(*g, "occlusionCutoffScale", a.occlusionCutoffScale, out, at);
+    ReadF(*g, "occlusionMaxRangeM", a.occlusionMaxRangeM, out, at);
+    ReadF(*g, "occlusionWetKeep", a.occlusionWetKeep, out, at);
+  }
+
   if (const json* g = Find(j, "physics")) {
     auto& p = out.physics;
     const std::string at = "physics";

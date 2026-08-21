@@ -216,6 +216,15 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     }
     def.speed = j.value("speed", 4.0f);
 
+    // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
+    // is skipped rather than failing the def — a mob with a typo'd sound name
+    // should still walk into the world, silently.
+    def.sounds.clear();
+    if (j.contains("sounds") && j["sounds"].is_object())
+      for (auto& [slot, name] : j["sounds"].items())
+        if (name.is_string() && !name.get<std::string>().empty())
+          def.sounds[slot] = name.get<std::string>();
+
     // Micro-voxel authoring scale (PLAN §C). Anything other than 1/2/4 is a
     // typo, not a feature: fall back to 1 loudly rather than half-applying it.
     def.scale = j.value("scale", 1u);

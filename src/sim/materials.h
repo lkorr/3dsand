@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -169,6 +170,28 @@ struct MaterialDef {
   // {"type": ...}). Shared across materials: two liquids naming the same stain
   // get the same palette slot. Empty = this material does not stain.
   std::string stain;
+  // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
+  // "break", ...). Each value names a set relative to the slot's namespace, so
+  // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under
+  // assets/sounds/ whose files are the interchangeable variants.
+  //
+  // Authored either as a "sounds" object or, for footsteps only, as the older
+  // flat "footstep": "leaf" key, which is still read (and still written by the
+  // tuner for materials that already use it). assets/sound_schema.js is the
+  // list of slots the tuner offers; the engine only cares that a key it looks
+  // up is present.
+  //
+  // A missing slot is NOT an error: cues.cpp falls back by tag, so a new
+  // material is audible the day it is added. Purely presentation — the sim
+  // never reads any of this, and an unknown set name is a diagnostic.
+  std::map<std::string, std::string> sounds;
+
+  // The named slot, or "" if this material does not author one.
+  const std::string& Sound(const char* slot) const {
+    static const std::string kNone;
+    auto it = sounds.find(slot);
+    return it == sounds.end() ? kNone : it->second;
+  }
 };
 
 // Loads materials.json + reactions.json and compiles them into GPU tables:

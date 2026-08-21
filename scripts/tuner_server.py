@@ -14,6 +14,13 @@ happens in this process rather than in the page:
   GET  /api/model?path=...    read one of those files (bytes for .vox)
   POST /api/model?path=...    write one of those files
   GET  /api/shaders           list assets/shaders/*.wgsl with their text
+  GET  /api/sounds            the whole assets/sounds/ tree, grouped into sets
+  GET  /api/sound?path=...    stream one audio file (audition in the page)
+  POST /api/sound/import      write a dropped file into a set folder
+  POST /api/sound/rename      rename one variant within its set
+  POST /api/sound/move        move a variant to another set
+  POST /api/sound/delete      delete one variant (to assets/sounds/.trash/)
+  POST /api/sound/set         create an empty set folder
   GET  /api/notes             list note pages under notes/
   GET  /api/note?name=...     read one note page
   POST /api/note?name=...     write one note page (autosave)
@@ -39,6 +46,13 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
   - The note routes take a NAME, not a path, and _note_path() rejects anything
     that is not a plain filename of safe characters before joining it to
     notes/. Shaders are read-only and served from a fixed directory listing.
+  - The sound routes take a set name + a bare filename, never a path. Both go
+    through _sound_path(), which validates each path SEGMENT against the same
+    character allowlist the notes use, so there is no traversal to defend
+    against; containment under assets/sounds is then asserted anyway. Deletes
+    move the file to assets/sounds/.trash/ rather than unlinking it — a
+    recorded take is not reproducible, so the destructive path is the one place
+    here that must not be trusted to a click.
   - /api/build and /api/play run one hardcoded command each with a fixed
     argument list and shell=False. Nothing from the request reaches a command
     line.
@@ -163,6 +177,160 @@ def _note_path(name):
     if os.path.dirname(path) != root:
         return None
     return path
+
+
+# ---------------------------------------------------------------- sounds ----
+# assets/sounds/ mirrors src/audio/library.h exactly: a SET is a FOLDER and its
+# files are the variants. The server therefore never invents structure — it
+# lists what the engine's own scanner would see, so a set that appears here is
+# a set the game can play. Two directories are skipped for the same reasons the
+# C++ loader skips them (raw/) or the loader must never see them (.trash/).
+SOUND_EXTS = (".wav", ".flac", ".mp3", ".ogg")
+SOUND_SKIP_DIRS = ("raw", ".trash")
+TRASH_DIR = ".trash"
+
+
+def sounds_dir():
+    """assets/sounds for the CURRENT ASSETS value (see model_dirs)."""
+    return os.path.abspath(os.path.join(ASSETS, "sounds"))
+
+
+def _seg_ok(seg):
+    """One path segment of a set name or filename, validated by allowlist.
+
+    Reusing the note alphabet (minus space, which library.h rewrites to '_'
+    and which would therefore make the set name on disk differ from the name
+    the engine reports). Rejecting per SEGMENT is what makes the sound routes
+    traversal-proof by construction: '..' fails the dot check, a separator
+    cannot appear inside a segment at all, and no segment may be empty.
+    """
+    if not seg or len(seg) > 80:
+        return False
+    if seg in (".", "..") or seg != seg.strip("."):
+        return False
+    if seg.split(".")[0].upper() in _WIN_RESERVED:
+        return False
+    return all(c in _NOTE_OK and c != " " for c in seg)
+
+
+def _sound_path(setname, filename=None, allow_trash=False):
+    """Resolve set[+file] under assets/sounds/, or None if not allowed.
+
+    `setname` is a '/'-joined set name as the engine spells it
+    ("footsteps/leaf"); `filename` is a bare name with an audio extension.
+    With no filename the result is the set DIRECTORY, which is what the
+    create-set and move routes need.
+    """
+    if not isinstance(setname, str):
+        return None
+    segs = [s for s in setname.replace("\\", "/").split("/") if s != ""]
+    if not segs or len(segs) > 6:
+        return None
+    if not all(_seg_ok(s) for s in segs):
+        return None
+    if not allow_trash and segs[0] in SOUND_SKIP_DIRS:
+        return None
+    root = sounds_dir()
+    parts = [root] + segs
+    if filename is not None:
+        if not isinstance(filename, str) or not _seg_ok(filename):
+            return None
+        if os.path.splitext(filename)[1].lower() not in SOUND_EXTS:
+            return None
+        parts.append(filename)
+    path = os.path.abspath(os.path.join(*parts))
+    # Second line of defence, exactly as the model route does it.
+    if not path.startswith(root + os.sep):
+        return None
+    return path
+
+
+def _wav_info(path):
+    """(seconds, channels, rate) for a WAV, or (None, None, None).
+
+    Only WAV is inspected, and only via the stdlib: the tuner shows duration
+    and flags stereo files because MONO is a hard requirement of the
+    spatializer (library.h), and a stereo asset is a real authoring bug that
+    is otherwise invisible until you hear the image collapse. Other formats
+    report nothing rather than pulling in a decoder.
+    """
+    if not path.lower().endswith(".wav"):
+        return (None, None, None)
+    try:
+        import wave
+        with wave.open(path, "rb") as w:
+            n, rate, ch = w.getnframes(), w.getframerate(), w.getnchannels()
+            return (n / float(rate) if rate else None, ch, rate)
+    except Exception:
+        return (None, None, None)
+
+
+def scan_sounds():
+    """Every set under assets/sounds/, as the engine's scanner would see it.
+
+    Set names are lowercased and space-to-underscore mapped to match
+    SetNameFor() in src/audio/library.cpp — if the two ever disagree, the
+    tuner would happily bind a material to a set name the engine cannot
+    resolve.
+    """
+    root = sounds_dir()
+    sets = {}
+    if not os.path.isdir(root):
+        return {"dir": root, "sets": [], "trash": 0}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SOUND_SKIP_DIRS)
+        rel = os.path.relpath(dirpath, root).replace("\\", "/")
+        if rel == ".":
+            rel = ""
+        files = [f for f in sorted(filenames)
+                 if os.path.splitext(f)[1].lower() in SOUND_EXTS]
+        if not files:
+            continue
+        for f in files:
+            # A file directly in the root is a set named after the FILE; a file
+            # in a subfolder makes that whole folder one set. Same two-case rule
+            # as library.cpp.
+            name = (rel if rel else os.path.splitext(f)[0])
+            name = name.lower().replace(" ", "_")
+            full = os.path.join(dirpath, f)
+            secs, ch, rate = _wav_info(full)
+            sets.setdefault(name, []).append({
+                "file": f,
+                "path": (rel + "/" + f) if rel else f,
+                "size": os.path.getsize(full),
+                "mtime": int(os.path.getmtime(full)),
+                "seconds": secs, "channels": ch, "rate": rate,
+            })
+    trash = 0
+    tdir = os.path.join(root, TRASH_DIR)
+    if os.path.isdir(tdir):
+        trash = sum(len(f) for _, _, f in os.walk(tdir))
+    return {
+        "dir": root, "trash": trash,
+        "sets": [{"name": k, "variants": v} for k, v in sorted(sets.items())],
+    }
+
+
+def _next_variant_name(setdir, setname, ext):
+    """A free `<leaf>_NN<ext>` in setdir.
+
+    Imported files are RENAMED into the set's own numbering rather than
+    keeping whatever the recorder called them, because the variant list is
+    sorted by filename and the engine's deterministic variant order depends on
+    that sort (library.cpp sorts before decoding). "take 3 FINAL.wav" landing
+    between leaf_02 and leaf_03 would silently reorder every variant id.
+    """
+    leaf = setname.rstrip("/").split("/")[-1] or "sound"
+    existing = set()
+    try:
+        existing = {n.lower() for n in os.listdir(setdir)}
+    except OSError:
+        pass
+    for i in range(1, 1000):
+        cand = "%s_%02d%s" % (leaf, i, ext)
+        if cand.lower() not in existing:
+            return cand
+    return None
 
 
 BUILD_CMD = ["cmake", "--build", "build", "--config", "Release",
@@ -351,6 +519,23 @@ class Handler(BaseHTTPRequestHandler):
                     continue
             return self._json(200, {"ok": True, "shaders": out})
 
+        if p == "/api/sounds":
+            return self._json(200, dict(scan_sounds(), ok=True))
+
+        if p == "/api/sound":
+            q = self._query()
+            path = _sound_path(q.get("set", [""])[0], q.get("file", [""])[0])
+            if not path:
+                return self._json(400, {"ok": False, "error": "path not allowed"})
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "not found"})
+            ctype = {".wav": "audio/wav", ".mp3": "audio/mpeg",
+                     ".ogg": "audio/ogg", ".flac": "audio/flac"}.get(
+                         os.path.splitext(path)[1].lower(),
+                         "application/octet-stream")
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), ctype)
+
         if p == "/api/notes":
             d = notes_dir()
             try:
@@ -466,6 +651,124 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "name": name,
                                     "bytes": len(text.encode("utf-8")),
                                     "mtime": int(os.path.getmtime(path))})
+
+        # ---- sounds ----
+        # The whole point of this group is that dropping a .wav on a slot in
+        # the page is the ENTIRE authoring step: the file lands in the right
+        # folder, under the right name, in a set the engine already knows how
+        # to scan. Every route answers with the rescanned tree so the page
+        # never has to guess what the folder now looks like.
+        if p == "/api/sound/import":
+            q = self._query()
+            setname = q.get("set", [""])[0]
+            setdir = _sound_path(setname)
+            if not setdir:
+                return self._json(400, {"ok": False, "error": "bad set name"})
+            src = q.get("name", [""])[0]
+            ext = os.path.splitext(src)[1].lower()
+            if ext not in SOUND_EXTS:
+                return self._json(400, {"ok": False,
+                                        "error": "not an audio file: %r" % (src,)})
+            data = self._raw()
+            if not data:
+                return self._json(400, {"ok": False, "error": "empty body"})
+            if len(data) > 64 * 1024 * 1024:
+                return self._json(400, {"ok": False, "error": "file too large"})
+            if ext == ".wav" and data[:4] != b"RIFF":
+                return self._json(400, {"ok": False,
+                                        "error": "not a WAV file (bad magic)"})
+            try:
+                os.makedirs(setdir, exist_ok=True)
+                name = _next_variant_name(setdir, setname, ext)
+                if not name:
+                    return self._json(400, {"ok": False, "error": "set is full"})
+                with open(os.path.join(setdir, name), "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            secs, ch, rate = _wav_info(os.path.join(setdir, name))
+            return self._json(200, {"ok": True, "set": setname, "file": name,
+                                    "bytes": len(data), "channels": ch,
+                                    "seconds": secs, "rate": rate,
+                                    "tree": scan_sounds()})
+
+        if p == "/api/sound/rename":
+            b = self._body()
+            old = _sound_path(b.get("set"), b.get("file"))
+            new = _sound_path(b.get("set"), b.get("to"))
+            if not old or not new:
+                return self._json(400, {"ok": False, "error": "path not allowed"})
+            if not os.path.isfile(old):
+                return self._json(404, {"ok": False, "error": "not found"})
+            if os.path.exists(new) and os.path.abspath(new) != os.path.abspath(old):
+                return self._json(409, {"ok": False, "error": "name already taken"})
+            try:
+                os.replace(old, new)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "tree": scan_sounds()})
+
+        if p == "/api/sound/move":
+            b = self._body()
+            src = _sound_path(b.get("set"), b.get("file"))
+            dstdir = _sound_path(b.get("to"))
+            if not src or not dstdir:
+                return self._json(400, {"ok": False, "error": "path not allowed"})
+            if not os.path.isfile(src):
+                return self._json(404, {"ok": False, "error": "not found"})
+            try:
+                os.makedirs(dstdir, exist_ok=True)
+                ext = os.path.splitext(src)[1].lower()
+                name = _next_variant_name(dstdir, b.get("to"), ext)
+                if not name:
+                    return self._json(400, {"ok": False, "error": "set is full"})
+                os.replace(src, os.path.join(dstdir, name))
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "file": name,
+                                    "tree": scan_sounds()})
+
+        if p == "/api/sound/delete":
+            b = self._body()
+            src = _sound_path(b.get("set"), b.get("file"))
+            if not src:
+                return self._json(400, {"ok": False, "error": "path not allowed"})
+            if not os.path.isfile(src):
+                return self._json(404, {"ok": False, "error": "not found"})
+            # MOVED, not unlinked. A take is a recording someone made once;
+            # the loader already skips .trash/ by name, so a "deleted" variant
+            # is inaudible to the engine and still on disk if it was a mistake.
+            try:
+                rel = os.path.relpath(src, sounds_dir()).replace("\\", "/")
+                dst = os.path.join(sounds_dir(), TRASH_DIR,
+                                   rel.replace("/", "__"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                stem, ext = os.path.splitext(dst)
+                n = 1
+                while os.path.exists(dst):
+                    dst = "%s (%d)%s" % (stem, n, ext)
+                    n += 1
+                os.replace(src, dst)
+                # Drop the set folder if that was its last variant, so an
+                # emptied set stops showing up as a set with no sounds.
+                d = os.path.dirname(src)
+                if d != sounds_dir() and not os.listdir(d):
+                    os.rmdir(d)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "trashed": True,
+                                    "tree": scan_sounds()})
+
+        if p == "/api/sound/set":
+            b = self._body()
+            d = _sound_path(b.get("set"))
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad set name"})
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "tree": scan_sounds()})
 
         if p == "/api/note/delete":
             path = _note_path(self._body().get("name"))
