@@ -44,6 +44,15 @@ loader maps scene -> engine as (x, z, -y), which negates scene y, so
 "front on engine +Z" means "front on scene -Y". Everything below is authored
 with the face/toes toward scene -Y.
 
+HANDEDNESS CONVENTION (separate from facing, and NOT derivable from it).
+Model +X is the character's LEFT. Camera::Right() = Forward() x (0,1,0)
+(game/camera.cpp:23) composed with the rig heading h = pi/2 - cam.yaw gives
+dot(model +X in world, camera Right) = -1.000 at every heading. The scene ->
+engine map (x, z, -y) negates y, which flips handedness, so the intuitive
+"it faces -Y, therefore +X is its right" is wrong — that reasoning had every
+.L/.R limb on the wrong side of both characters until 2026-08-21. So .L limbs
+sit at POSITIVE scene x and .R limbs at negative.
+
 Run:  python scripts/gen_wizard.py
 """
 import json
@@ -453,22 +462,34 @@ LIMBS = {
     "torso":    ((13, 11, 26), (-6, -5, 58), ROBE),
     "head":     ((12, 12, 40), (-6, -6, 78), SKIN),
 
-    "armU.L":   (( 6,  6, 16), (-11, -3, 68), ROBE),
-    "armL.L":   (( 7,  7, 15), (-11, -3, 53), ROBE),
-    "hand.L":   (( 7,  6,  9), (-11, -3, 44), SKIN),
-    "armU.R":   (( 6,  6, 16), (  5, -3, 68), ROBE),
-    "armL.R":   (( 7,  7, 15), (  4, -3, 53), ROBE),
-    "hand.R":   (( 7,  6,  9), (  4, -3, 44), SKIN),
+    # HANDEDNESS: model +X is the character's LEFT, so .L limbs take the
+    # POSITIVE x offsets and .R the negative. Camera::Right() (camera.cpp:23)
+    # composed with the rig heading h = pi/2 - cam.yaw gives
+    # dot(model +X in world, camera Right) = -1 at every heading; the scene ->
+    # engine map (x, z, -y) negates y and so flips handedness, which is why
+    # "the figure faces -Y therefore +X is its right" does NOT hold.
+    "armU.L":   (( 6,  6, 16), (  5, -3, 68), ROBE),
+    "armL.L":   (( 7,  7, 15), (  4, -3, 53), ROBE),
+    "hand.L":   (( 7,  6,  9), (  4, -3, 44), SKIN),
+    "armU.R":   (( 6,  6, 16), (-11, -3, 68), ROBE),
+    "armL.R":   (( 7,  7, 15), (-11, -3, 53), ROBE),
+    "hand.R":   (( 7,  6,  9), (-11, -3, 44), SKIN),
 
-    "legU.L":   (( 7,  7, 20), (-7, -3, 24), ROBE),
-    "legL.L":   (( 6,  6, 20), (-6, -3,  5), ROBE),
-    "foot.L":   (( 6, 10,  7), (-6, -7,  0), LEATHER),
-    "legU.R":   (( 7,  7, 20), ( 0, -3, 24), ROBE),
-    "legL.R":   (( 6,  6, 20), ( 0, -3,  5), ROBE),
-    "foot.R":   (( 6, 10,  7), ( 0, -7,  0), LEATHER),
+    "legU.L":   (( 7,  7, 20), ( 0, -3, 24), ROBE),
+    "legL.L":   (( 6,  6, 20), ( 0, -3,  5), ROBE),
+    "foot.L":   (( 6, 10,  7), ( 0, -7,  0), LEATHER),
+    "legU.R":   (( 7,  7, 20), (-7, -3, 24), ROBE),
+    "legL.R":   (( 6,  6, 20), (-6, -3,  5), ROBE),
+    "foot.R":   (( 6, 10,  7), (-6, -7,  0), LEATHER),
 
-    "staff":    (( 5,  5, 56), (  9, -2, 26), STAFF),
+    # Held in hand.R, which is now at model -X (the figure's right).
+    "staff":    (( 5,  5, 56), (-14, -2, 26), STAFF),
 }
+
+# Held props. Excluded from the prefab extents below because the LOADER
+# excludes them (mob.cpp skips `tag == "prop"` when measuring worldSize) — see
+# the note by min_x. A prop must never redefine the body's frame.
+PROPS = {"staff"}
 
 SHAPES = {
     "hips": hips_vox, "torso": torso_vox, "head": head_vox,
@@ -537,9 +558,16 @@ def main():
     with open(os.path.join(out_dir, "wizard.vox"), "wb") as f:
         f.write(data)
 
-    # prefab extents in scene space, for the anchor conversion
-    min_x = min(mn[0] for (_, mn, _) in LIMBS.values())
-    max_y = max(mn[1] + sz[1] for (sz, mn, _) in LIMBS.values())
+    # prefab extents in scene space, for the anchor conversion.
+    #
+    # PROPS ARE EXCLUDED to MIRROR THE LOADER: mob.cpp (~L603) skips
+    # `tag == "prop"` when measuring worldSize, so the engine's box is the
+    # BODY's box. Measuring a different box here shifts every anchor by the
+    # difference and puts the gait pivot (worldSize * 0.5) off the body.
+    # The staff is the prop; keep this in step with the `"tag": "prop"` limb.
+    body_x = {n: v for n, v in LIMBS.items() if n not in PROPS}
+    min_x = min(mn[0] for (_, mn, _) in body_x.values())
+    max_y = max(mn[1] + sz[1] for (sz, mn, _) in body_x.values())
 
     def anchor(scene_xyz):
         return to_engine(scene_xyz, min_x, max_y)

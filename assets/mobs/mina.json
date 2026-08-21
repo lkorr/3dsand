@@ -78,7 +78,7 @@
       "severable": true,
       "tag": "arm",
       "anchor": [
-        4.0,
+        16.0,
         45.0,
         8.0
       ],
@@ -99,7 +99,7 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        4.0,
+        16.0,
         38.0,
         8.0
       ],
@@ -113,7 +113,7 @@
       "severable": true,
       "tag": "hand",
       "anchor": [
-        4.0,
+        16.0,
         32.0,
         8.0
       ],
@@ -127,7 +127,7 @@
       "severable": true,
       "tag": "arm",
       "anchor": [
-        16.0,
+        4.0,
         45.0,
         8.0
       ],
@@ -148,7 +148,7 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        16.0,
+        4.0,
         38.0,
         8.0
       ],
@@ -162,7 +162,7 @@
       "severable": true,
       "tag": "hand",
       "anchor": [
-        16.0,
+        4.0,
         32.0,
         8.0
       ],
@@ -176,7 +176,7 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        8.0,
+        12.0,
         26.0,
         8.0
       ],
@@ -197,7 +197,7 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        8.0,
+        12.0,
         15.0,
         8.0
       ],
@@ -218,7 +218,7 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        8.0,
+        12.0,
         3.0,
         10.0
       ],
@@ -232,7 +232,7 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        12.0,
+        8.0,
         26.0,
         8.0
       ],
@@ -253,7 +253,7 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        12.0,
+        8.0,
         15.0,
         8.0
       ],
@@ -274,7 +274,7 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        12.0,
+        8.0,
         3.0,
         10.0
       ],
@@ -288,7 +288,7 @@
       "severable": true,
       "tag": "prop",
       "anchor": [
-        16,
+        4,
         30.0,
         8.0
       ],
@@ -297,7 +297,7 @@
         "from": 12,
         "to": 44,
         "axis": [
-          1,
+          -1,
           0,
           0
         ],

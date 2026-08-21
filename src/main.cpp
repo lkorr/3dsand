@@ -3098,10 +3098,25 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
             // start both feet are planted under the body and the first strides
             // are catching up, so the legs legitimately pass through low
             // elevations for a few ticks. 20 ticks was not enough once the
-            // stride budget raised the cadence; 30 clears the transient with
-            // margin and still leaves 60 ticks (2 s, several full cycles) of
-            // real walking to assert on.
-            if (i < 30) continue;
+            // stride budget raised the cadence; 30 was not enough once the
+            // rig's handedness was corrected, which shifts the gait PHASE by a
+            // couple of ticks and so slides the tail of that same transient
+            // past the old cutoff. 36 clears it with real margin.
+            //
+            // NOTE THIS MEASURES ALL FOUR LEG PARTS, thighs AND shins, but the
+            // GAITDBG line below only prints the two thighs. The sample that
+            // failed at 30 was a SHIN (17.3 deg at t34) while every thigh was
+            // >= 21.2 — so a summary `legElev>=17` that no traced column ever
+            // shows is not a contradiction, it is the shin. From t36 the shin
+            // minimum is 25.8 and the thigh minimum 29.7.
+            //
+            // This cutoff bounds the TRANSIENT, not the gait: steady state is
+            // symmetric either way (legU swings L -37.9..20.5 vs R
+            // -37.1..20.7, both signs on both legs). Do NOT raise it further
+            // to paper over a leg that is genuinely lying down — read the
+            // SANDVOX_GAITDBG trace and confirm the dip is a single tick at
+            // the edge of the window first.
+            if (i < 36) continue;
             for (int lp : legParts)
               if (lp >= 0) minLegElev = std::min(minLegElev, elevationOf(lp));
             for (int s = 0; s < 2; s++)
@@ -3128,11 +3143,12 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
             if (getenv("SANDVOX_GAITDBG")) {
               std::printf(
                   "  t%02d spd=%4.1f arm %6.1f/%6.1f  legU %6.1f/%6.1f  "
-                  "legElev %5.1f/%5.1f\n",
+                  "legElev %5.1f/%5.1f shin %5.1f/%5.1f\n",
                   i, avatar.SpeedNow(), swingOf(armParts[0]),
                   swingOf(armParts[1]), swingOf(legParts[0]),
                   swingOf(legParts[1]), elevationOf(legParts[0]),
-                  elevationOf(legParts[1]));
+                  elevationOf(legParts[1]), elevationOf(legParts[2]),
+                  elevationOf(legParts[3]));
             }
           }
           // A walking leg should never lie down. A healthy stride bottoms out

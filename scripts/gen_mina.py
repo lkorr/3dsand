@@ -50,6 +50,16 @@ engine +Z and a model must have its FRONT on engine +Z. The loader maps scene
 "front on scene -Y". Everything below is authored with the face toward scene
 -Y, in the natural "front = +y" reading, and mirrored once through flip_y.
 
+HANDEDNESS CONVENTION (separate from facing, and NOT derivable from it).
+Model +X is the character's LEFT. Camera::Right() = Forward() x (0,1,0)
+(game/camera.cpp:23) composed with the rig heading h = pi/2 - cam.yaw gives
+dot(model +X in world, camera Right) = -1.000 at every heading. The scene ->
+engine map (x, z, -y) negates y, which flips handedness, so the intuitive
+"it faces -Y, therefore +X is its right" is wrong — that reasoning had every
+.L/.R limb on the wrong side of both characters until 2026-08-21. So .L limbs
+sit at POSITIVE scene x and .R limbs at negative, and the sword (held in
+hand.R) hangs off model -X.
+
 Run:  python scripts/gen_mina.py
 """
 import json
@@ -448,7 +458,13 @@ def sword_vox(size):
     taper is what makes the tip the part that bites.
 
     No flip_y: the blade is symmetric in y, so mirroring it would be a no-op
-    that only invites confusion about which end is the point."""
+    that only invites confusion about which end is the point.
+
+    MIRRORED IN X at the end. The sword is held in the RIGHT hand, which is at
+    model -X (see the handedness note in LIMBS), so the blade points outboard
+    along -X: the TIP is at low x and the pommel at high x, against the fist.
+    The body is built pommel-first because that is how the profile reads, then
+    flipped once — the same trick flip_y plays for the figure's facing."""
     sx, sy, sz = size
     out = []
     cy, cz = sy * 0.5, sz * 0.5
@@ -482,7 +498,8 @@ def sword_vox(size):
                 for y in range(sy):
                     if ellipse_mask(y, z, cy, cz, hw, 1.0):
                         out.append((x, y, z, STEEL))
-    return out
+    # tip to low x, pommel to high x (see the docstring)
+    return [(sx - 1 - x, y, z, m) for (x, y, z, m) in out]
 
 
 # ---- limb table -------------------------------------------------------------
@@ -525,33 +542,46 @@ LIMBS = {
     # Arms hang just clear of the torso (which spans x -4..4): a 1-micro gap
     # either side. Overlapping them into the chest is what turned the first
     # draft into an unbroken slab from shoulder to sash with no waist.
-    "armU.L":   (( 4,  4,  8), (-8, -2, 37), ROBE),
-    "armL.L":   (( 4,  4,  7), (-8, -2, 31), ROBE),
-    "hand.L":   (( 4,  4,  4), (-8, -2, 28), SKIN),
-    "armU.R":   (( 4,  4,  8), (  4, -2, 37), ROBE),
-    "armL.R":   (( 4,  4,  7), (  4, -2, 31), ROBE),
-    "hand.R":   (( 4,  4,  4), (  4, -2, 28), SKIN),
+    # HANDEDNESS: model +X is the character's LEFT. See the derivation by the
+    # sword below — .L limbs take the POSITIVE x offsets, .R the negative.
+    "armU.L":   (( 4,  4,  8), (  4, -2, 37), ROBE),
+    "armL.L":   (( 4,  4,  7), (  4, -2, 31), ROBE),
+    "hand.L":   (( 4,  4,  4), (  4, -2, 28), SKIN),
+    "armU.R":   (( 4,  4,  8), (-8, -2, 37), ROBE),
+    "armL.R":   (( 4,  4,  7), (-8, -2, 31), ROBE),
+    "hand.R":   (( 4,  4,  4), (-8, -2, 28), SKIN),
 
-    "legU.L":   (( 4,  4, 12), (-4, -2, 14), SHADE),
-    "legL.L":   (( 4,  4, 11), (-4, -2,  4), SHADE),
-    "foot.L":   (( 4,  7,  4), (-4, -4,  0), LEATHER),
-    "legU.R":   (( 4,  4, 12), (  0, -2, 14), SHADE),
-    "legL.R":   (( 4,  4, 11), (  0, -2,  4), SHADE),
-    "foot.R":   (( 4,  7,  4), (  0, -4,  0), LEATHER),
+    "legU.L":   (( 4,  4, 12), (  0, -2, 14), SHADE),
+    "legL.L":   (( 4,  4, 11), (  0, -2,  4), SHADE),
+    "foot.L":   (( 4,  7,  4), (  0, -4,  0), LEATHER),
+    "legU.R":   (( 4,  4, 12), (-4, -2, 14), SHADE),
+    "legL.R":   (( 4,  4, 11), (-4, -2,  4), SHADE),
+    "foot.R":   (( 4,  7,  4), (-4, -4,  0), LEATHER),
 
-    # The sword, held in the RIGHT hand (scene +X: hand.R spans x 4..8), lying
-    # along X so the blade crosses the forearm at a right angle and reaches out
-    # to the figure's right, clear of the body.
+    # The sword, held in the RIGHT hand (scene -X: hand.R spans x -8..-4),
+    # lying along X so the blade crosses the forearm at a right angle and
+    # reaches out to the figure's right, clear of the body.
     #
-    # The right hand is at scene +X because the figure faces -Y: looking along
-    # the way it faces, +X is its right. Getting this backwards puts the sword
-    # in the left hand while every clip still swings the right arm.
+    # WHICH SIDE IS RIGHT (this was wrong until 2026-08-21, and the wrong
+    # comment is what kept it wrong — do not "restore" it):
+    #
+    #   Camera::Right() = Forward() x (0,1,0)  [game/camera.cpp:23], and the
+    #   rig heading is h = pi/2 - cam.yaw with model->world a rotation about
+    #   +Y by h. Compose those and dot(model +X in world, camera Right) is
+    #   -1.000 at EVERY heading: model +X is screen-LEFT, i.e. the character's
+    #   LEFT side. So the character's RIGHT is model -X.
+    #
+    #   The old comment reasoned "the figure faces -Y, so +X is its right",
+    #   which quietly assumes a left-handed scene basis. The .vox -> engine
+    #   map is (x, z, -y): it negates y, which FLIPS handedness, so the
+    #   natural "front = +y, right = +x" reading does not survive the load.
+    #   Derive the side from the camera basis, never from the facing alone.
     #
     # The grip (SWORD_GRIP micro from the pommel) lands on the hand's centre
-    # at x=6, so the pommel sits just inboard of the fist and the blade runs
-    # outward. See the axis note by sword_vox for why this is X and not Z.
+    # at x=-6, and the blade runs outward along -X, so the box starts at the
+    # tip. See the axis note by sword_vox for why this is X and not Z.
     "sword":    (( SWORD_LEN, 2 * SWORD_HALF_W, 4),
-                 (  6 - SWORD_GRIP, -SWORD_HALF_W, 28), STEEL),
+                 ( -6 - SWORD_LEN + SWORD_GRIP, -SWORD_HALF_W, 28), STEEL),
 }
 
 SHAPES = {
@@ -657,9 +687,23 @@ def main():
     with open(os.path.join(out_dir, "mina.vox"), "wb") as f:
         f.write(data)
 
-    # prefab extents in scene space, for the anchor conversion
-    min_x = min(mn[0] for (_, mn, _) in LIMBS.values())
-    max_y = max(mn[1] + sz[1] for (sz, mn, _) in LIMBS.values())
+    # prefab extents in scene space, for the anchor conversion.
+    #
+    # PROPS ARE EXCLUDED, and that is not a nicety — it MIRRORS THE LOADER.
+    # mob.cpp (~L603) skips `tag == "prop"` when it measures worldSize, so the
+    # engine's box is the BODY's box. Anchors are rebased against this origin,
+    # so if the generator measured a box the loader does not, every anchor
+    # would be shifted by the difference and the gait pivot
+    # (worldSize * 0.5, avatar.cpp UpdateGait) would sit off the body.
+    #
+    # That is exactly what happened when the sword moved to the figure's real
+    # right (model -X): the blade became the new minimum x, every anchor slid
+    # +30 micro, the stance was rotated about a pivot ~7 world voxels off the
+    # legs, and the IK froze the legs bolt upright mid-walk (`upright=0`).
+    # Keep this set in step with the `"tag": "prop"` limbs below.
+    body_x = {n: v for n, v in LIMBS.items() if n not in PROPS}
+    min_x = min(mn[0] for (_, mn, _) in body_x.values())
+    max_y = max(mn[1] + sz[1] for (sz, mn, _) in body_x.values())
 
     def anchor(scene_xyz):
         return to_engine(scene_xyz, min_x, max_y)
@@ -786,17 +830,19 @@ def main():
         # Pivot AT THE FIST: at the grip point along the shaft, centred on the
         # hand in y/z. Derived from the two limb boxes so resizing either one
         # keeps the sword in the hand.
-        "anchor": anchor((sword_mn[0] + SWORD_GRIP,
+        # The box is mirrored in x (tip at low x), so the grip sits GRIP micro
+        # from the high-x end rather than from the low-x end.
+        "anchor": anchor((sword_mn[0] + sword_sz[0] - SWORD_GRIP,
                           hand_mn[1] + hand_sz[1] * 0.5,
                           hand_mn[2] + hand_sz[2] * 0.5)),
         "severImpactSpeed": 7.0,
-        # The blade's own frame, in MICRO units along the model's +X (outboard:
-        # the axis sword_vox lays the blade on). The melee sweep carves along
-        # this segment; emitting it from the same constants that built the mesh
-        # is what keeps the hitbox and the art from drifting apart (see the
-        # note by sword_vox above).
+        # The blade's own frame, in MICRO units along the model's -X (outboard
+        # on the RIGHT side: the axis sword_vox lays the blade on). The melee
+        # sweep carves along this segment; emitting it from the same constants
+        # that built the mesh is what keeps the hitbox and the art from
+        # drifting apart (see the note by sword_vox above).
         "edge": {"from": SWORD_GRIP + SWORD_GUARD, "to": SWORD_LEN,
-                 "axis": [1, 0, 0], "halfWidth": SWORD_HALF_W},
+                 "axis": [-1, 0, 0], "halfWidth": SWORD_HALF_W},
         "spring": {"halflife": 0.09, "gain": 0.35, "maxAngle": 0.15}})
 
     # ---- IK chains ----
