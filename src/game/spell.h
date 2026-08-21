@@ -79,7 +79,16 @@ enum class GlyphType : uint8_t {
 };
 
 enum class SpellForm : uint8_t {
-  None = 0,
+  // NOT "no form". Spray is the DEFAULT form every spell falls back to when no
+  // form glyph was spoken: a handful of loose voxels of the element flung out
+  // of the caster's hand as ballistic particles.
+  //
+  // This is what makes the language total. Speaking a bare element used to
+  // misfire, which taught the player that half a spell is a mistake — exactly
+  // the wrong lesson for a system whose whole appeal is that any sequence
+  // means SOMETHING. A bare "sand" is now the simplest real spell there is,
+  // and every longer sequence is an elaboration of it rather than a correction.
+  Spray = 0,
   Projectile,
 };
 
@@ -111,8 +120,8 @@ struct GlyphDef {
   uint32_t material = 0;         // resolved 12-bit id (never hardcoded anywhere)
   BackfireKind backfire = BackfireKind::Generic;
 
-  // form
-  SpellForm form = SpellForm::None;
+  // form (only read when type == Form; Spray is the fallback, not a glyph)
+  SpellForm form = SpellForm::Spray;
   int32_t speed = 48;            // voxels/tick, whole voxels (scaled to fx at cast)
   int32_t lifetimeTicks = 150;   // hard bound (rule 2)
   int32_t impactRadius = 3;
@@ -161,6 +170,14 @@ struct SpellBudgets {
   int32_t maxGeneration = 3;
   int32_t maxTrailVoxels = 256;
   int32_t maxLifetimeTicks = 300;
+  // ---- the default form (Spray) -------------------------------------------
+  // A bare element throws this many voxels out of the caster's hand, scaled by
+  // the element's multiplicity ("sand sand" throws twice as many). Capped, so
+  // a 64x amplified spray cannot outrun the per-tick spawn budget (rule 2).
+  int32_t sprayVoxels = 3;
+  int32_t maxSprayVoxels = 96;
+  int32_t spraySpeed = 14;      // voxels/tick, whole voxels
+  int32_t sprayConeMille = 130; // lateral scatter, per-mille of forward speed
 };
 
 struct GlyphLibrary {
@@ -193,9 +210,35 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
 struct Spell {
   uint32_t element = 0;                 // material id (0 = none spoken)
   BackfireKind backfire = BackfireKind::Generic;
-  SpellForm form = SpellForm::None;
+  SpellForm form = SpellForm::Spray;    // Spray is the default, not "none"
   std::vector<int> modifiers;           // glyph indices, in spoken order
   int32_t manaCost = 0;
+
+  // ---- multiplicity: repetition AMPLIFIES ----------------------------------
+  // Saying a word twice means it harder. Each repeat of a glyph DOUBLES that
+  // glyph's contribution and doubles its share of the cost, so
+  //   sand           -> x1  output, 1x mana
+  //   sand sand      -> x2  output, 2x mana
+  //   sand sand sand -> x4  output, 4x mana
+  // i.e. the Nth utterance contributes 2^(N-1).
+  //
+  // Why doubling rather than counting: a linear ramp makes repetition a
+  // tedious way to buy a small increase, and the interesting decision — "is
+  // this worth an entire extra mana bar?" — only exists if the curve is steep.
+  // It also means the cost is legible without arithmetic: each extra word
+  // costs as much as everything before it.
+  //
+  // Held as a power rather than a multiplier so it stays integer and cannot
+  // overflow: capped at kMaxAmplifyPow, which is also what stops a stuck key
+  // from authoring an unbounded particle count (rule 2).
+  int32_t elementPow = 0;   // element repeats beyond the first
+  int32_t formPow = 0;      // form repeats beyond the first
+  // Parallel to `modifiers`: repeats beyond the first for each. "trail trail"
+  // is ONE trail with twice the budget, not two trails on one projectile.
+  std::vector<int32_t> modifierPow;
+
+  // 1 << pow, saturated. The one place the doubling is turned into a number.
+  static int32_t Amplify(int32_t pow);
 
   // Form parameters, folded down from the form glyph.
   int32_t speed = 48;
@@ -209,9 +252,26 @@ struct Spell {
   // spawn site.
   int32_t gen = 0;
 
-  bool HasForm() const { return form != SpellForm::None; }
+  // Whether a FORM GLYPH was actually spoken. The spell always has a form
+  // (Spray is the fallback), so this asks a different question than "is this
+  // castable" — everything is castable now.
+  bool formSpoken = false;
   bool HasElement() const { return element != 0; }
+
+  // How many voxels a Spray throws, and how many ops a modifier authorizes:
+  // the base value scaled by the element's multiplicity.
+  int32_t ElementScale() const { return Amplify(elementPow); }
+  int32_t FormScale() const { return Amplify(formPow); }
+  // Multiplier for the i'th entry of `modifiers`.
+  int32_t ModifierScale(size_t i) const {
+    return i < modifierPow.size() ? Amplify(modifierPow[i]) : 1;
+  }
 };
+
+// Cap on repetition. 2^6 = 64x is already an absurd spell; past that the
+// doubling would overflow the budgets it feeds long before it stopped being
+// fun, and an uncapped exponent is an unbounded emergent process (rule 2).
+constexpr int32_t kMaxAmplifyPow = 6;
 
 // What the VM thinks the spoken sequence is, for the HUD. A clear on-screen
 // readout of this is worth more than validation — an illegal sequence must

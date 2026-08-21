@@ -34,6 +34,26 @@ int32_t ClampI(int32_t v, int32_t lo, int32_t hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// Integer square root. Deliberately not std::sqrt: every vector normalization
+// in this file feeds authoritative spell state, and a float sqrt is exactly
+// the kind of thing that differs in the last bit across compilers and would
+// desync a lockstep replay (spell.h thesis 3).
+int64_t IntSqrt(int64_t x) {
+  if (x <= 0) return 0;
+  int64_t r = 0, b = 1LL << 40;
+  while (b > x) b >>= 2;
+  while (b) {
+    if (x >= r + b) {
+      x -= r + b;
+      r = (r >> 1) + b;
+    } else {
+      r >>= 1;
+    }
+    b >>= 2;
+  }
+  return r;
+}
+
 }  // namespace
 
 // ---- loading ---------------------------------------------------------------
@@ -76,6 +96,10 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
     rd("maxGeneration", out.budgets.maxGeneration);
     rd("maxTrailVoxels", out.budgets.maxTrailVoxels);
     rd("maxLifetimeTicks", out.budgets.maxLifetimeTicks);
+    rd("sprayVoxels", out.budgets.sprayVoxels);
+    rd("maxSprayVoxels", out.budgets.maxSprayVoxels);
+    rd("spraySpeed", out.budgets.spraySpeed);
+    rd("sprayConeMille", out.budgets.sprayConeMille);
   }
   // Rule 2: these are hard engine ceilings, so a content edit cannot author an
   // unbounded spell. Clamped rather than trusted.
@@ -83,6 +107,13 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   out.budgets.maxGeneration = ClampI(out.budgets.maxGeneration, 0, 8);
   out.budgets.maxTrailVoxels = ClampI(out.budgets.maxTrailVoxels, 1, 4096);
   out.budgets.maxLifetimeTicks = ClampI(out.budgets.maxLifetimeTicks, 1, 1800);
+  out.budgets.sprayVoxels = ClampI(out.budgets.sprayVoxels, 1, 64);
+  // Hard ceiling on one spray. kMaxParticleSpawnsPerTick is 4096 and it is
+  // SHARED with gore and debris shatter, so a spell may not author a spray
+  // that could crowd them out even at 64x amplification.
+  out.budgets.maxSprayVoxels = ClampI(out.budgets.maxSprayVoxels, 1, 512);
+  out.budgets.spraySpeed = ClampI(out.budgets.spraySpeed, 1, 128);
+  out.budgets.sprayConeMille = ClampI(out.budgets.sprayConeMille, 0, 1000);
 
   if (!j.contains("glyphs") || !j["glyphs"].is_array()) {
     errors += "glyphs: missing \"glyphs\" array\n";
@@ -200,37 +231,113 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
 
 // ---- compilation -----------------------------------------------------------
 
+int32_t Spell::Amplify(int32_t pow) {
+  if (pow <= 0) return 1;
+  if (pow > kMaxAmplifyPow) pow = kMaxAmplifyPow;
+  return (int32_t)1 << pow;
+}
+
 Spell CompileSpell(const GlyphLibrary& lib, const SpellStack& stack) {
   Spell s;
-  // A fold over the stack. Deliberately total: any sequence compiles, because
-  // an illegal one must be CASTABLE and misfire rather than be rejected. The
-  // ancient language punishes imprecision; a parse error would just be
-  // annoying.
+  // A fold over the stack, and it is TOTAL: every sequence compiles into
+  // something that does something. There is no such thing as an invalid spell,
+  // only a spell that does something other than what you meant. That is the
+  // whole design thesis — the ancient language punishes imprecision by
+  // granting the literal request, not by refusing to parse.
   //
-  // LAST element wins and LAST form wins — speaking "water lava projectile"
-  // throws lava. That is the least surprising reading of "the most recent word
-  // qualifies the spell", and it means a mis-spoken word can be corrected by
-  // speaking the right one rather than by clearing and starting over.
+  // Two rules give it that totality:
+  //
+  // 1. REPETITION AMPLIFIES. Saying a word again means it harder: the Nth
+  //    utterance of a glyph contributes 2^(N-1), and costs 2^(N-1) times its
+  //    mana. So "sand sand sand" is 4x the sand for 4x the mana rather than
+  //    three redundant words. This is why the fold counts repeats per glyph
+  //    instead of letting the last one win.
+  //
+  // 2. AN UNSPOKEN FORM IS SPRAY. A bare element throws a few loose voxels of
+  //    itself out of the caster's hand. So the shortest legal spell is one
+  //    word, and every longer sequence reads as an elaboration of it.
+  //
+  // A DIFFERENT element still replaces the current one (speaking "water lava"
+  // throws lava, not both): the element is what the spell is MADE of, and
+  // "made of two things" has no meaning here, whereas "more of it" does. Same
+  // for a different form. Only REPEATS amplify.
+  int32_t elementRepeats = 0, formRepeats = 0;
+  int lastElementGlyph = -1, lastFormGlyph = -1;
+  // Per-glyph repeat counts for modifiers, keyed by glyph index.
+  std::vector<int32_t> modRepeats(lib.glyphs.size(), 0);
+
   for (int gi : stack.spoken) {
     if (gi < 0 || gi >= (int)lib.glyphs.size()) continue;
     const GlyphDef& g = lib.glyphs[gi];
-    s.manaCost += g.mana;
+    // The cost of THIS utterance: the glyph's mana doubled once per PRIOR
+    // utterance of the same glyph, so the first costs the authored mana, the
+    // second twice it, the third four times — and the running total for N
+    // sands is (2^N - 1) times the base.
+    //
+    // The counters below track repeats-BEYOND-THE-FIRST (so one utterance is
+    // pow 0), which is what the *_Scale() multipliers want. The charge needs
+    // the count of PRIOR utterances instead, and those two differ by one from
+    // the second utterance onward: reading the counter directly here charged
+    // the second `sand` at 1x, so three sands cost 3/6/12 instead of 3/9/21
+    // while the voxel count doubled correctly. The two must agree.
+    int32_t prior = 0;
     switch (g.type) {
       case GlyphType::Element:
-        s.element = g.material;
-        s.backfire = g.backfire;
+        prior = (gi == lastElementGlyph) ? elementRepeats + 1 : 0;
         break;
       case GlyphType::Form:
-        s.form = g.form;
-        s.speed = g.speed;
-        s.lifetimeTicks = g.lifetimeTicks;
-        s.impactRadius = g.impactRadius;
+        prior = (gi == lastFormGlyph) ? formRepeats + 1 : 0;
         break;
       case GlyphType::Modifier:
-        s.modifiers.push_back(gi);
+        prior = modRepeats[gi];
+        break;
+    }
+    const int32_t repeats = prior;
+    // Saturating: at the cap an extra word is free and does nothing, which is
+    // the honest behaviour — better than silently charging for an effect the
+    // budget will refuse to deliver.
+    if (repeats < kMaxAmplifyPow) s.manaCost += g.mana * Spell::Amplify(repeats);
+
+    switch (g.type) {
+      case GlyphType::Element:
+        if (gi == lastElementGlyph) {
+          if (elementRepeats < kMaxAmplifyPow) elementRepeats++;
+        } else {
+          // A different element REPLACES, and resets the amplification: you
+          // are now casting a different substance, not more of the old one.
+          lastElementGlyph = gi;
+          elementRepeats = 0;
+          s.element = g.material;
+          s.backfire = g.backfire;
+        }
+        break;
+      case GlyphType::Form:
+        if (gi == lastFormGlyph) {
+          if (formRepeats < kMaxAmplifyPow) formRepeats++;
+        } else {
+          lastFormGlyph = gi;
+          formRepeats = 0;
+          s.form = g.form;
+          s.speed = g.speed;
+          s.lifetimeTicks = g.lifetimeTicks;
+          s.impactRadius = g.impactRadius;
+        }
+        s.formSpoken = true;
+        break;
+      case GlyphType::Modifier:
+        // A modifier is listed once and carries its own repeat count, so
+        // "trail trail" is one trail with twice the budget rather than two
+        // trails fighting over the same projectile.
+        if (modRepeats[gi] == 0) s.modifiers.push_back(gi);
+        if (modRepeats[gi] < kMaxAmplifyPow) modRepeats[gi]++;
         break;
     }
   }
+  s.elementPow = elementRepeats;
+  s.formPow = formRepeats;
+  s.modifierPow.assign(s.modifiers.size(), 0);
+  for (size_t i = 0; i < s.modifiers.size(); i++)
+    s.modifierPow[i] = modRepeats[s.modifiers[i]] - 1;  // stored as repeats-beyond-first
   return s;
 }
 
@@ -243,15 +350,33 @@ SpellReadout DescribeSpell(const GlyphLibrary& lib, const SpellStack& stack,
     if (!r.text.empty()) r.text += " + ";
     r.text += lib.glyphs[gi].id;
   }
-  r.wellFormed = spell.HasElement() && spell.HasForm();
+  // EVERY sequence with an element is well formed now — there is no such thing
+  // as a malformed spell, only one that does something other than intended.
+  // The readout's job is therefore to say what it WILL do, not whether it is
+  // allowed, which is the more useful thing to show anyway.
+  r.wellFormed = spell.HasElement();
+  const int32_t es = spell.ElementScale();
+  auto times = [](int32_t m) {
+    return m > 1 ? (" x" + std::to_string(m)) : std::string();
+  };
   if (stack.spoken.empty()) {
     r.verdict = "silence";
-  } else if (!spell.HasForm()) {
-    r.verdict = "no form spoken - will misfire at your feet";
   } else if (!spell.HasElement()) {
-    r.verdict = "no element spoken - will misfire";
+    // A form with nothing to make it out of. Still castable, still does
+    // something: it costs the mana and fizzles, which is the correct lesson.
+    r.verdict = "no element - the form has nothing to shape, it will fizzle";
+  } else if (spell.form == SpellForm::Spray) {
+    r.verdict = "spray: " + std::to_string(spell.ElementScale() *
+                                           (lib.budgets.sprayVoxels)) +
+                " voxels from your hand" + times(es);
   } else {
-    r.verdict = "ready";
+    r.verdict = "bolt" + times(spell.FormScale());
+    if (es > 1) r.verdict += ", element" + times(es);
+    for (size_t i = 0; i < spell.modifiers.size(); i++) {
+      int gi = spell.modifiers[i];
+      if (gi < 0 || gi >= (int)lib.glyphs.size()) continue;
+      r.verdict += " + " + lib.glyphs[gi].id + times(spell.ModifierScale(i));
+    }
   }
   return r;
 }
@@ -330,17 +455,7 @@ SpellFxVec SpellWobble(SpellFxVec dirFx, int32_t instabilityMille,
   // and a slow one wobble by the same ANGLE, not the same distance.
   int64_t len2 = (int64_t)dirFx.x * dirFx.x + (int64_t)dirFx.y * dirFx.y +
                  (int64_t)dirFx.z * dirFx.z;
-  int32_t len = (int32_t)0;
-  {  // integer sqrt, deterministic across machines (no float, no libm)
-    int64_t x = len2, r = 0, b = 1LL << 30;
-    while (b > x) b >>= 2;
-    while (b) {
-      if (x >= r + b) { x -= r + b; r = (r >> 1) + b; }
-      else r >>= 1;
-      b >>= 2;
-    }
-    len = (int32_t)r;
-  }
+  const int32_t len = (int32_t)IntSqrt(len2);
   if (len <= 0) return dirFx;
   SpellFxVec o = dirFx;
   o.x += (int32_t)((int64_t)jitter(dirFx.x, 0x9E37u) * len / kSpellFxOne);
@@ -354,7 +469,6 @@ SpellFxVec SpellWobble(SpellFxVec dirFx, int32_t instabilityMille,
 void ApplySpellEffect(const GlyphLibrary& lib, const Spell& spell,
                       SpellFxVec atFx, SpellFxVec dirFx, int32_t strengthMille,
                       SpellEmission& out) {
-  (void)dirFx;
   strengthMille = ClampI(strengthMille, 0, 1000);
   if (strengthMille == 0) return;
 
@@ -379,13 +493,68 @@ void ApplySpellEffect(const GlyphLibrary& lib, const Spell& spell,
   // material is chosen by the caster rather than by the material being hit.
   // Mode 1 is the existing primitive for that and needs no new conversion path.
   bool didTransmute = false;
-  for (int gi : spell.modifiers) {
+  for (size_t mi = 0; mi < spell.modifiers.size(); mi++) {
+    int gi = spell.modifiers[mi];
     if (gi < 0 || gi >= (int)lib.glyphs.size()) continue;
     if (lib.glyphs[gi].modifier != SpellModifier::TransmuteTo) continue;
     if (!spell.HasElement()) continue;
-    out.ops.push_back({cx, cy, cz, scaled(lib.glyphs[gi].radius), spell.element,
+    // Repeating `transmute` widens the conversion. Radius grows as the CUBE
+    // ROOT of the multiplier, so a 2x spell converts 2x the VOLUME rather than
+    // 8x — the multiplier means "twice as much matter", consistently with what
+    // it means everywhere else.
+    int32_t r = lib.glyphs[gi].radius;
+    const int32_t mul = spell.ModifierScale(mi);
+    for (int32_t k = 1; k < mul; k *= 2) r = (r * 5) / 4;  // ~cbrt(2) per double
+    out.ops.push_back({cx, cy, cz, ClampI(scaled(r), 1, 8), spell.element,
                        1u /*overwrite*/, 0, 0});
     didTransmute = true;
+  }
+
+  // SPRAY — the default form, and the reason a one-word spell is a real spell.
+  // Loose voxels of the element flung along `dirFx` as ballistic particles,
+  // which is the existing gore/ejecta pipeline (DESIGN.md §5) and needs no new
+  // machinery: they fly, collide, and reinsert into the grid on landing.
+  //
+  // Emitted from inside ApplySpellEffect rather than from the cast path, so a
+  // FATAL spray backfires as a spray into the caster's own body — the same
+  // free-backfire property every other effect gets (thesis 2).
+  if (spell.form == SpellForm::Spray && spell.HasElement()) {
+    const SpellBudgets& b = lib.budgets;
+    int64_t n = (int64_t)b.sprayVoxels * spell.ElementScale();
+    n = n * strengthMille / 1000;
+    if (n > b.maxSprayVoxels) n = b.maxSprayVoxels;
+    for (int64_t i = 0; i < n; i++) {
+      // Counter-based scatter: same tick + same index => same direction on
+      // every machine, so a replay reproduces the spray exactly.
+      uint32_t h = Hash3((uint32_t)spell.element * 2654435761u,
+                         (uint32_t)atFx.x ^ (uint32_t)atFx.z, (uint32_t)i);
+      auto jit = [&](uint32_t salt) {
+        uint32_t v = Pcg(h ^ salt);
+        return (int64_t)(int32_t)(v & 0xFFFFu) - 32768;  // [-32768, 32768)
+      };
+      const int64_t sp = (int64_t)b.spraySpeed * kSpellFxOne / 30;  // per tick
+      // Direction scaled to unit-ish, then coned. dirFx need not be normalized,
+      // so it is renormalized against its own magnitude here.
+      int64_t len2 = (int64_t)dirFx.x * dirFx.x + (int64_t)dirFx.y * dirFx.y +
+                     (int64_t)dirFx.z * dirFx.z;
+      int64_t len = IntSqrt(len2);
+      if (len <= 0) len = 1;
+      const int64_t cone = sp * b.sprayConeMille / 1000;
+      ParticleSpawn s{};
+      s.px = atFx.x;
+      s.py = atFx.y;
+      s.pz = atFx.z;
+      s.vx = (int32_t)((int64_t)dirFx.x * sp / len + jit(0x9E37u) * cone / 32768);
+      s.vy = (int32_t)((int64_t)dirFx.y * sp / len + jit(0x85EBu) * cone / 32768);
+      s.vz = (int32_t)((int64_t)dirFx.z * sp / len + jit(0xC2B2u) * cone / 32768);
+      // A FULL-SIZE particle, not a micro droplet: these are real voxels of
+      // matter that must land in the grid and stay there. Micro particles are
+      // sub-voxel spray that stains and dies (world.h), which is the opposite
+      // of what conjured matter should do.
+      s.payload = spell.element & 0xFFFu;
+      s.flags = kPFlagAlive;
+      out.spawns.push_back(s);
+    }
   }
 
   switch (spell.backfire) {
@@ -419,8 +588,12 @@ CastResult SpellSystem::Cast(const Spell& spell, CasterState& caster,
                              uint32_t tick, SpellEmission& out) {
   CastResult r;
   if (!lib_) return r;
-  if (spell.manaCost <= 0 && spell.modifiers.empty() && !spell.HasForm())
-    return r;  // nothing spoken
+  // The ONLY thing that is not a spell is silence. Anything spoken has a cost
+  // and does something — an element with no form sprays, a form with no
+  // element fizzles and still charges for the attempt.
+  if (spell.manaCost <= 0 && spell.modifiers.empty() && !spell.formSpoken &&
+      !spell.HasElement())
+    return r;
 
   const int32_t hp = health.Get();
   r = ResolveCast(caster, hp, spell.manaCost);
@@ -462,38 +635,40 @@ CastResult SpellSystem::Cast(const Spell& spell, CasterState& caster,
     p.ticksLeft = ClampI(spell.lifetimeTicks, 1, lib_->budgets.maxLifetimeTicks);
     // Normalize the aim to the form's speed, in fixed point. Integer sqrt so
     // two machines agree exactly (no libm, no float).
-    int64_t len2 = (int64_t)aim.x * aim.x + (int64_t)aim.y * aim.y +
-                   (int64_t)aim.z * aim.z;
-    int64_t x = len2, rr = 0, b = 1LL << 40;
-    while (b > x) b >>= 2;
-    while (b) {
-      if (x >= rr + b) { x -= rr + b; rr = (rr >> 1) + b; }
-      else rr >>= 1;
-      b >>= 2;
-    }
+    const int64_t rr =
+        IntSqrt((int64_t)aim.x * aim.x + (int64_t)aim.y * aim.y +
+                (int64_t)aim.z * aim.z);
     if (rr <= 0) {
       p.vel = {0, 0, 0};
     } else {
-      const int64_t sp = (int64_t)spell.speed * kSpellFxOne;  // fx voxels/tick
+      // Repeating the FORM makes the bolt faster and longer-lived — "more
+      // projectile" reads as a harder throw, not as a second projectile
+      // (which is what an element repeat would mean).
+      const int32_t fs = spell.FormScale();
+      const int64_t sp = (int64_t)spell.speed * fs * kSpellFxOne;
       p.vel.x = (int32_t)((int64_t)aim.x * sp / rr);
       p.vel.y = (int32_t)((int64_t)aim.y * sp / rr);
       p.vel.z = (int32_t)((int64_t)aim.z * sp / rr);
     }
     // Trail budget: a HARD voxel count that only ever decreases. This is the
     // rule-2 guarantee — the trail cannot outlive its budget, so it cannot
-    // hold a chunk awake indefinitely.
-    for (int gi : spell.modifiers) {
+    // hold a chunk awake indefinitely. Repeating `trail` buys a proportionally
+    // longer trail, and the engine ceiling still caps it.
+    for (size_t mi = 0; mi < spell.modifiers.size(); mi++) {
+      int gi = spell.modifiers[mi];
       if (gi >= 0 && gi < (int)lib_->glyphs.size() &&
           lib_->glyphs[gi].modifier == SpellModifier::Trail)
-        p.trailBudget = std::min(lib_->glyphs[gi].voxelBudget,
-                                 lib_->budgets.maxTrailVoxels);
+        p.trailBudget =
+            std::min((int32_t)((int64_t)lib_->glyphs[gi].voxelBudget *
+                               spell.ModifierScale(mi)),
+                     lib_->budgets.maxTrailVoxels);
     }
     live_.push_back(p);
   } else {
-    // No form spoken: the spell has nowhere to go, so it goes off here. This
-    // is the misfire the design asks for — an ill-formed sequence is castable
-    // and punishing rather than rejected.
-    ApplySpellEffect(*lib_, spell, originFx, aim, 700, out);
+    // SPRAY, the default form: the spell throws its element out of the hand.
+    // Not a misfire — this is a real, if humble, spell, and it is the reason a
+    // one-word utterance is legal. Full strength, because nothing went wrong.
+    ApplySpellEffect(*lib_, spell, originFx, aim, 1000, out);
   }
   return r;
 }

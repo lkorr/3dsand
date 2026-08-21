@@ -1,12 +1,18 @@
 {
   "comment": "Glyphs are CONTENT, like materials.json and reactions.json — not look-and-feel knobs like tuning.json. A glyph is a word of the ancient language: speaking it pushes a value on the caster VM's typed stack, and the cast key applies 'cast' to whatever is on top. Materials are referenced BY NAME and resolved to 12-bit ids at load (game/spell.cpp); a name that does not resolve is a LOUD error, never a silent id 0. Hot-reloads on R alongside materials.json. Types: element (names a material), form (turns the stack into a live effect), modifier (decorates the spell). Costs are integer mana — the VM is integer throughout so a spell is replayable and lockstep-safe (DESIGN.md §8).",
 
+  "language": "EVERY sequence compiles into something that does something; there is no invalid spell, only one that does something other than you meant. Two rules make that true. (1) REPETITION AMPLIFIES: the Nth utterance of a glyph contributes 2^(N-1) and costs 2^(N-1) times its mana, so 'sand'=x1, 'sand sand'=x2, 'sand sand sand'=x4 — each extra word costs as much as everything before it, which is what makes repetition a real decision rather than a tedious ramp. Capped at 64x. A DIFFERENT element replaces rather than stacks ('water lava' throws lava): an element is what the spell is MADE of, and 'made of two things' has no meaning, whereas 'more of it' does. (2) AN UNSPOKEN FORM IS SPRAY: a bare element flings a few loose voxels of itself out of your hand, so the shortest legal spell is one word and every longer sequence is an elaboration of it.",
+
   "budgets": {
-    "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front, so no spell can hold a chunk awake forever. These are hard engine ceilings; a glyph's own budget is clamped to them at load.",
+    "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front, so no spell can hold a chunk awake forever. These are hard engine ceilings; a glyph's own budget is clamped to them at load. The spray* values are the DEFAULT FORM — what a bare element does when no form glyph was spoken. sprayVoxels is per cast at x1; repeating the element doubles it (sand=3, sand sand=6, sand sand sand=12), and maxSprayVoxels is the hard cap that keeps an amplified spray from crowding gore and debris shatter out of the shared per-tick particle spawn budget.",
     "maxLiveProjectiles": 32,
     "maxGeneration": 3,
     "maxTrailVoxels": 256,
-    "maxLifetimeTicks": 300
+    "maxLifetimeTicks": 300,
+    "sprayVoxels": 3,
+    "maxSprayVoxels": 96,
+    "spraySpeed": 14,
+    "sprayConeMille": 130
   },
 
   "glyphs": [

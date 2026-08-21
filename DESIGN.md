@@ -905,11 +905,47 @@ and it is annoying to add after triggers exist. This codebase has hit the
 (light-gated rules, staining, viscous liquids); a trail spell must not be the
 fourth, and the selftest asserts the budget is respected *exactly*.
 
-**An ill-formed spell is castable and misfires — it is never rejected.** That
-is the design thesis, and a hard parse error would make experimentation
-frustrating. `CompileSpell` is total: any glyph sequence folds into a `Spell`.
-No form spoken ⇒ the spell goes off at the caster. The HUD shows what the VM
-thinks the spell is, which is worth more than validation.
+**Every sequence compiles into something that does something.** There is no
+invalid spell — only one that does something other than you meant. That is the
+design thesis: the ancient language punishes imprecision by granting the
+literal request, not by refusing to parse. `CompileSpell` is total, and two
+rules are what make it so:
+
+- **Repetition amplifies.** The Nth utterance of a glyph contributes 2^(N-1)
+  and costs 2^(N-1) times its mana, so `sand`=×1, `sand sand`=×2,
+  `sand sand sand`=×4 — the running total for N words is (2^N − 1)× the base.
+  Doubling rather than a linear ramp because the interesting decision ("is this
+  worth an entire extra mana bar?") only exists if the curve is steep, and
+  because it makes the price legible without arithmetic: each extra word costs
+  as much as everything before it combined. Capped at ×64 (`kMaxAmplifyPow`);
+  past the cap an extra word is free and does nothing, which is more honest
+  than charging for an effect the budget will refuse to deliver. A *different*
+  element replaces rather than stacks (`water lava` throws lava): an element is
+  what the spell is made OF, and "made of two things" has no meaning here while
+  "more of it" does. Repeating a form throws harder, repeating a modifier buys
+  a proportionally bigger one — `trail trail` is one trail with twice the
+  budget, not two trails fighting over one projectile.
+- **An unspoken form is Spray.** `SpellForm::Spray` is the fallback, not "no
+  form": a bare element flings a few loose voxels of itself out of the caster's
+  hand as ballistic particles (the existing ejecta pipeline, §5 — they fly,
+  collide and reinsert on landing). So the shortest legal spell is one word,
+  and every longer sequence reads as an elaboration of it rather than as a
+  correction. Spray is emitted from inside `ApplySpellEffect`, so a fatal spray
+  backfires into the caster's own body for free like everything else.
+
+Only silence is not a spell. A form with no element still charges and fizzles.
+
+The HUD shows what the VM thinks the spell is — "spray: 6 voxels from your
+hand", "bolt ×2, element ×4 + trail ×2" — which is worth far more than
+validation, since the question is never "is this legal" but "what will this do".
+
+One arithmetic trap this cost, recorded because the two counters look
+interchangeable and are not: the amplification counters track repeats *beyond
+the first* (one utterance ⇒ pow 0, which is what the `×` multipliers want),
+while the mana charge needs the count of *prior* utterances. They differ by one
+from the second utterance onward. Reading the counter directly for the charge
+billed the second `sand` at ×1, so three sands cost 3/6/12 while the voxel
+count correctly doubled at 3/6/12 — the output and the price silently disagreed.
 
 **Casting into health makes a spell IMPRECISE, not merely expensive.** Cost ≤
 mana casts normally; cost ≤ mana + health casts but spends the remainder as
@@ -952,11 +988,16 @@ Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
 sometimes doesn't fire is miserable to diagnose.
 
 Selftest gate `spells`: the trail's voxel budget is respected exactly and the
-projectile dies with it, and an overcast resolves Fatal, emits its own payload,
-and asks for the caster to be carved. Invariants, not plausible numbers — the
-first version of the gate folded the impact op into the trail total and
-reported 343 voxels against a 64 budget, where the budget was fine and the
-measurement was wrong.
+projectile dies with it; an overcast resolves Fatal, emits its own payload, and
+asks for the caster to be carved; and a bare element sprays, with N+1 words
+producing *exactly* twice the matter of N at *exactly* the doubled price.
+Invariants, not plausible numbers — the amplification is asserted as an exact
+relation between three casts rather than as absolute counts, because a gate
+that only checked "more words ⇒ more output" would pass a linear ramp too, and
+because measuring the relation is what caught the off-by-one above. The first
+version of the gate folded the impact op into the trail total and reported 343
+voxels against a 64 budget, where the budget was fine and the measurement was
+wrong.
 
 ### Voxel art pipeline, articulated mobs, and the laser (2026-08-19)
 
