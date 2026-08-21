@@ -8,11 +8,13 @@
 
 // Dynamic microvoxel BODIES (docs/PLAN_voxel_editor.md §C, DESIGN.md §9).
 //
-// A mob def may declare `"scale": 2` (or 4): its limb .vox models are authored
+// A mob def may declare `"skinScale": 2|4|8: its limb .vox models are authored
 // at that many voxels per WORLD voxel, so a limb whose .vox box is 6x2x2 at
-// scale 2 occupies 3x1x1 world voxels. Physics builds the same limb with a
-// voxel pitch of 1/scale, so the creature is the same physical size as a
-// scale-1 one with a coarser skin — the extra resolution buys detail, not bulk.
+// skinScale 2 occupies 3x1x1 world voxels. Physics builds the same limb at a
+// pitch of 1/physScale — a SEPARATE, coarser resolution derived from the art
+// (mob.h) — so the creature is the same physical size as a scale-1 one with a
+// coarser skin: the extra resolution buys detail, not bulk, and does not drag
+// the collider up with it.
 //
 // RENDERING is where they diverge. The cube path (debris.wgsl `vsBody`) emits
 // one 36-vertex cube per voxel; at scale 4 that is 64x the instances for the

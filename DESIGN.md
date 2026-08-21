@@ -901,9 +901,12 @@ population: **erase the voxels a `keep()` predicate rejects → re-skin the bric
   particles instead. The authored limb list never changes — only its geometry —
   so the rig, the gait and the dismemberment states are untouched by a carve
   that does not sever.
-- **Precision scales with the def's micro scale, not with new code.** The carve
-  centre is converted into limb-local micro units, so at `scale: 4` a radius of
-  0.25 world voxels is one micro voxel. `tools.laserCarveRadius` is a float and
+- **Precision scales with the def's skin scale, not with new code.** The carve
+  is expressed once as a world-space volume and re-evaluated per lattice, so at
+  `skinScale: 8` a radius of 0.125 world voxels is one skin voxel. Where the
+  derived collider is too coarse to notice a fine carve, the skin still
+  registers it — otherwise fine tools would be silent no-ops on exactly the
+  detailed art the skin exists to serve. `tools.laserCarveRadius` is a float and
   sub-voxel by default: the beam that melts a 2-voxel hole in stone bores a
   roughly one-micro-voxel channel through flesh. Targeting a specific *region*
   (an organ, a part of a brain) is then an authoring problem — paint it as
@@ -1849,9 +1852,34 @@ Static micro-detail above substitutes a brick for a *grid cell*. Creatures and
 rigidbodies are the other half of the problem: they have free float transforms,
 so there is no cell to stand in and nothing for the world DDA to hand off to.
 
-A mob sidecar may declare `"scale": 2` (or 4). Its limb `.vox` coordinates are
-then **micro units** — that many per world voxel — so the same silhouette gets
-2×/4× the resolution without getting bigger. `src/sim/microbody.*` packs each
+A mob sidecar may declare `"skinScale": 2`, `4` or `8`. Its limb `.vox`
+coordinates are then **skin units** — that many per world voxel — so the same
+silhouette gets 2×/4×/8× the resolution without getting bigger.
+
+**Skin resolution and collider resolution are separate** (2026-08-21). They were
+one number until it became the binding constraint: `DebrisVoxel` stores local
+coordinates as `int8`, so a single lattice bounded a limb at 120/scale world
+voxels — 30 at scale 4, 15 at scale 8, and the player avatar is 17 world voxels
+tall. Widening the type would have been the wrong fix, because the two costs are
+unrelated: the brick march is a fragment shader over one OBB, so **skin cost
+tracks screen area**, while the collider is Jolt boxes and **tracks voxel
+count** — an 8× collider is ~512× the boxes to greedy-merge and solve against.
+Coupling them held the cheap axis hostage to the expensive one.
+
+So `skinScale` is authored and `MobDef::physScale` is DERIVED at load: the
+finest of {8,4,2,1} that fits both the int8 bound and a cost ceiling
+(`kMaxPhysScale`). It is engine-picked because the bound it satisfies is a
+property of how big the art is, not a choice an author can make usefully — and
+because that makes collider resolution *emergent*, which silently moves mass,
+contacts and ground probes, the loader logs the value it chose for every def.
+
+The **skin is authoritative and the collider is derived from it** by majority
+fill (`phys/lattice.h DownsampleSkin`, tested CPU-only in `tests/lattice_test.cpp`).
+A carve edits the skin and re-derives the collider, so the two cannot drift —
+disagreement is unrepresentable rather than merely discouraged. Data flows skin
+→ collider and never back, which is what keeps the whole mechanism outside the
+hashed domain: the moment skin state fed a collider decision it would be in the
+hashed domain and rule 1 would apply. `src/sim/microbody.*` packs each
 limb model once at def load into a second brick pool (`array<u32>`, four 8-bit
 palette indices per word, palette index == material ID as everywhere else) and
 records a `MicroBodyModel { base, dims, scale }` per limb. Models are shared by
@@ -1897,9 +1925,10 @@ Deliberately a parameter rather than a side table keyed by physics handle — a
 side table would need syncing at every spawn, sever, death, cull and reset, and a
 recycled Jolt `BodyID` could then paint unrelated debris as somebody's leg.
 Physics
-builds micro limbs at voxel pitch `1/scale` (collider extents, convex radius and
-per-voxel volume all scale together), so mass and physical size match the scale-1
-art they replace; the `pitch == 1` path is arithmetically identical to before.
+builds micro limbs at voxel pitch `1/physScale` (collider extents, convex radius
+and per-voxel volume all scale together), so mass and physical size match the
+scale-1 art they replace whatever resolution the collider was derived at; the
+`pitch == 1` path is arithmetically identical to before.
 
 **What micro bodies deliberately do not do (v1).** They do not burn, split or
 shatter. Both of those mutate `b.voxels`, and the brick they render from is

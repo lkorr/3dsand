@@ -220,8 +220,8 @@ constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
 constexpr uint32_t kMicroPoolWordsWorld = 1u << 20;
 
 // ---- dynamic microvoxel bodies (render-only — sim/microbody.h) -------------
-// A mob def with "scale": 2|4 authors its limbs at that many micro voxels per
-// WORLD voxel. Those limb models are packed once at load into their own brick
+// A mob def with "skinScale": 2|4|8 authors its limbs at that many skin voxels
+// per WORLD voxel. Those limb models are packed once at load into their own brick
 // pool and drawn by rasterizing each body's OBB and marching the brick per
 // fragment (microbody.wgsl), instead of one cube instance per voxel.
 //

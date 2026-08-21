@@ -107,7 +107,12 @@ working unchanged (swingAmp/swingPhase remain the no-IK fallback).
 ```jsonc
 {
   "root": "torso", "speed": 5.0, "bleed": { "material": "blood", "perDamage": 2.0 },
-  "scale": 2,                       // NEW: 1 = world voxels (cube path), 2|4 = microvoxels
+  "skinScale": 8,                   // 1 = world voxels (cube path), 2|4|8 = microvoxels.
+                                    // The ART's resolution. The COLLIDER's is
+                                    // derived at load (MobDef::physScale) and
+                                    // logged; it is never authored here.
+                                    // "scale" is still read, and means both
+                                    // lattices are equal (the pre-split key).
   "gait": {                         // NEW: procedural locomotion params
     "cadence": 2.2, "strideBias": 0.35, "leadTime": 0.2,
     "stepThreshold": 0.6, "stepDuration": 0.22, "stepHeight": 0.25,
@@ -266,8 +271,8 @@ and `DrawSprites`:
 - Brick pool: per-mob-def limb bricks uploaded once at load (shared across
   instances; damage does not edit voxels in v1, so no copy-on-write).
 - Physics stays on the existing debris path with voxel pitch scaled by
-  1/scale; `DebrisVoxel` int8 coords are in MICRO units — enforce the ±127
-  bound at load with a clear error. Settle-back into the world downsamples
+  1/physScale; `DebrisVoxel` int8 coords are in COLLIDER units, and the loader
+  coarsens physScale until they fit rather than refusing the def. Settle-back into the world downsamples
   micro→world by majority-fill through ordinary CellOps.
 - Slots without a micro model keep the cube path; `scale:1` mobs unchanged.
 - Lighting v1: match or modestly improve the cube path (litColor + normal
@@ -286,19 +291,33 @@ and `DrawSprites`:
   A severed micro limb keeps micro rendering because `MobSystem` hands over what
   it already knows; there is no side table to keep in sync and no way for a
   description to outlive the body it describes.
-- Rig geometry is converted MICRO -> WORLD once, at load (`anchorLocal *= 1/scale`)
-  and at spawn (`restOffset`, joint anchors, `MobDef::worldSize`). The animation
-  runtime, the gait and `GroundHeightAt` are therefore completely scale-unaware.
-  `limb.voxels` and `limb.size` stay in micro units — that is what the collider's
-  `1/scale` pitch and the renderer's brick both want.
+- Rig geometry is converted SKIN -> WORLD once, at load (`anchorLocal *=
+  1/skinScale`) and at spawn (`restOffset`, joint anchors, `MobDef::worldSize`).
+  The animation runtime, the gait and `GroundHeightAt` are therefore completely
+  scale-unaware.
+- **Skin and collider are two lattices, not one.** This originally read "`limb.
+  voxels` and `limb.size` stay in micro units — that is what the collider's
+  `1/scale` pitch and the renderer's brick both want", and that coupling is
+  what capped micro rigs at scale 4. It no longer holds. `MobDef::skinScale` is
+  the AUTHORED art resolution (1/2/4/8); `MobDef::physScale` is DERIVED at load
+  as the finest of {8,4,2,1} that fits both the DebrisVoxel int8 bound and the
+  `kMaxPhysScale` cost ceiling, and is logged per def. `limb.voxels`/`limb.size`
+  are in physScale units; `limb.skinVoxels` (int16) is the skin and the brick
+  source, empty when the two coincide. The skin is AUTHORITATIVE and the
+  collider is re-derived from it by majority fill (`phys/lattice.h`
+  `DownsampleSkin`) — data flows skin -> collider and never back, which is what
+  keeps all of it outside the hashed domain.
 - `Physics::CreateDebrisBody{,Xf}` gained a trailing `voxelPitch` (default 1, so
   every existing call site is byte-identical). It scales the box halves, the
   centres, the convex radius AND the per-voxel volume feeding mass.
 - Micro bodies are excluded from body burn and `SplitBody` (both mutate
   `b.voxels`, which the shared per-def brick cannot follow). Settle-back
   downsamples micro -> world by majority fill instead.
-- The `.vox` int8 bound (120) applies in MICRO units, i.e. 60 world voxels at
-  scale 2 and 30 at scale 4; the loader says so explicitly in the error.
+- The `.vox` int8 bound (120) applies to the DERIVED COLLIDER, not to the art:
+  the loader coarsens `physScale` until the limbs fit, so the authored lattice
+  is bounded only by int16. A def only fails when a limb exceeds 120 *world*
+  voxels, which no collider resolution can represent; the loader says so
+  explicitly in the error.
 - The `--selftest` `micro body render` case renders the scale-2 critter twice,
   with and without the pass, and asserts a pixel-difference floor. That proves
   the pass drew, that its depth survived the reversed-Z test against the world,

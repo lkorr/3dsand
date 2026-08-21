@@ -776,9 +776,9 @@ function buildScene() {
 // Micro context, two flavours:
 // - a lone 2/4/8-cubed model is a micro BRICK (one world cell subdivided,
 //   for a material's "micro" block) — outline that cell;
-// - a document whose sidecar carries "scale" 2/4 is a micro-unit MOB — every
-//   `scale` editor voxels are one world cell, so outline one world cell at
-//   the active model's corner as a scale reference.
+// - a document whose sidecar carries "skinScale" 2/4/8 (or the older "scale")
+//   is a micro-unit MOB — every `skinScale` editor voxels are one world cell,
+//   so outline one world cell at the active model's corner as a reference.
 function updateMicroGhost() {
   if (!microGhost || !doc) return;
   const d = activeDef()?.dim;
@@ -2347,9 +2347,10 @@ function buildHelpPanel() {
       'model is a micro BRICK: one world cell subdivided (green wireframe = ' +
       'the cell) — save under microvox/ and point a material\'s "micro" block ' +
       'at it; that is also how terrain and prefabs get micro detail. A mob ' +
-      'gets micro detail from "scale" in the rig panel: the whole file is ' +
-      'authored in micro units, scale of them per world voxel, so a 128³ ' +
-      'model at scale 4 is a 32-voxel-tall creature with 4× detail. The 2× ' +
+      'gets micro detail from "skinScale" in the rig panel: the whole file ' +
+      'is authored in skin units, skinScale of them per world voxel, so a ' +
+      '136³ model at skinScale 8 is a 17-voxel-tall creature with 8× detail. ' +
+      'The collider is derived coarser by the engine. The 2× ' +
       'button (Models panel) upscales an EXISTING mob in place: voxels, ' +
       'anchors and keys double and scale bumps — same size, finer grain.'));
   p.style.display = 'none';

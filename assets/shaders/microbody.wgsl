@@ -118,9 +118,12 @@ fn vs(@builtin(vertex_index) vi : u32,
   let dims = microBodyDims(m);
   let scale = f32(max(m.scale, 1u));
 
-  // Object-space box, in WORLD voxels: the limb is dims micro voxels across at
-  // 1/scale world voxels each. Body-local coords are micro units divided by
-  // scale, which is exactly the pitch the collider was built at (physics.cpp).
+  // Object-space box, in WORLD voxels: the limb is dims SKIN voxels across at
+  // 1/scale world voxels each. `m.scale` is the SKIN resolution — the brick is
+  // packed from the skin lattice — and it is NOT necessarily the pitch the
+  // collider was built at. Since the skin/collider split those are two
+  // resolutions (mob.h MobDef::skinScale vs physScale, phys/lattice.h): the
+  // collider is derived coarser, and the renderer neither knows nor cares.
   let extent = vec3f(dims) / scale;
   // Half a micro voxel of skin, grown symmetrically about the box centre.
   // Without it a ray grazing a face can rasterize a fragment whose slab entry
