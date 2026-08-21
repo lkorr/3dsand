@@ -1156,8 +1156,20 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       // the mouse-driven offset from it. The offset arrives in WORLD space
       // (main.cpp built it from the camera basis), so it is un-yawed into the
       // rig's frame here — the same conversion the legs do one block up.
+      //
+      // THEN X IS NEGATED, and that is not a fudge. The .vox -> engine load map
+      // is (x, z, -y): it negates y, which FLIPS HANDEDNESS, so model +X is the
+      // character's LEFT (the limb table has .L at engine x 14..18 and .R at
+      // 2..6). Un-yawing alone therefore lands camera-RIGHT on the model's
+      // LEFT: measured at six yaws, RotateInv(yaw, camera Right) is model +X
+      // every time. Without this flip the mouse drives the weapon arm to the
+      // mirrored side — you could reach across your chest but not out to the
+      // side you were actually pointing at. Z (forward) is unaffected: the
+      // toe of the shoe sits at model +Z, which is where camera-forward lands.
       Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
-      Vec3 targetLocal = shoulder + RotateInv(yaw, weaponHand_);
+      Vec3 handRig = RotateInv(yaw, weaponHand_);
+      handRig.x = -handRig.x;
+      Vec3 targetLocal = shoulder + handRig;
       AnimSolveTwoBone(sk, st, ch, targetLocal - rootAnchor, weight);
       break;
     }

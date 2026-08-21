@@ -471,14 +471,47 @@ void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st,
   // which flips unpredictably when the chain straightens.
   Vec3 pole = chain.pole.normalized();
   if (pole.len() < 1e-6f) pole = Vec3{0, 0, 1};
-  Vec3 bendAxis = dirTarget.cross(pole);
-  if (bendAxis.len() < 1e-4f) {
-    // pole parallel to the target direction: substitute a fixed forward vector
+  // ORTHOGONALIZE THE POLE AGAINST THE TARGET (Gram-Schmidt) rather than
+  // crossing with it raw.
+  //
+  // The pole says which way the joint should BULGE. An arm's pole is straight
+  // back ([0,0,-1] on these rigs, because a human elbow points behind), so
+  // reaching straight FORWARD makes the pole exactly antiparallel to the
+  // target and `dirTarget.cross(pole)` collapses to zero — the degenerate case.
+  // The old fallback then bent the joint about world-up, i.e. sideways, which
+  // is how "point the hand forward" produced an elbow winging out to the side
+  // while pointing BACKWARD (equally degenerate, opposite sign) still looked
+  // plausible. Worse, it SNAPPED: the fallback switched in discontinuously as
+  // the arm swung through the parallel direction.
+  //
+  // Removing the target-parallel component keeps only the part of the pole
+  // that can actually define a plane, so the bend direction stays continuous
+  // as the limb sweeps through the pole axis instead of flipping at it.
+  Vec3 polePerp = pole - dirTarget * dirTarget.dot(pole);
+  if (polePerp.len() < 1e-4f) {
+    // Genuinely no information left (pole exactly along the target). Any plane
+    // is as good as another here, but it must be CHOSEN CONSISTENTLY or the
+    // joint spins as the target crosses this axis: prefer the rig's up, then
+    // its side, whichever is less parallel to the target.
     Vec3 alt = std::fabs(dirTarget.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
-    bendAxis = dirTarget.cross(alt);
+    polePerp = alt - dirTarget * dirTarget.dot(alt);
   }
-  bendAxis = bendAxis.normalized();
+  if (polePerp.len() < 1e-6f) return;
+  polePerp = polePerp.normalized();
+  // NOTE THE ORDER: polePerp x dirTarget, not dirTarget x polePerp.
+  //
+  // `angle1` above comes out NEGATIVE (ty is 0 and tx is positive, so the
+  // atan2 numerator is -tx*opp), which means rotating the upper bone by it
+  // about `dirTarget x polePerp` swings the middle joint AWAY from the pole.
+  // That inverted the whole convention: with the arm pole authored straight
+  // back the elbow bulged forward, and — measured the same way — the leg pole
+  // authored forward put the KNEE BACKWARD at every target, which is
+  // anatomically backwards for both. Crossing the other way makes the joint
+  // bulge TOWARD the pole, which is what "pole vector" means everywhere else
+  // and what the authored [0,0,-1] / [0,0,1] values plainly intend.
+  Vec3 bendAxis = polePerp.cross(dirTarget);
   if (bendAxis.len() < 1e-4f) return;
+  bendAxis = bendAxis.normalized();
 
   // Current upper-bone direction -> aimed at the target, then rotated by
   // angle1 about the bend axis to open the elbow/knee.
