@@ -198,6 +198,11 @@ struct FootState {
   Vec3 swingFrom{}, swingTo{};
   float swingT = 0;              // 0..1 through the step
   float legLength = 1.0f;
+  // Material under swingTo, captured by the ground probe when the target was
+  // chosen. Presentation only (footstep sounds): sampled at probe time rather
+  // than re-read at touchdown so the sound matches the surface the foot was
+  // actually aimed at, even if the world changed underneath mid-swing.
+  uint32_t swingMat = 0;
 };
 
 struct SpringState {
@@ -258,3 +263,11 @@ void AnimSpringStep(const SpringDef& def, SpringState& s, Vec3 goal, float dt);
 int AnimFlipbookFrame(const Flipbook& fb, int32_t elapsedMs);
 
 constexpr float kBlendEpsilon = 0.1f;
+
+// Spring goal scale, applied to a body's velocity AFTER it has been divided by
+// that def's own top speed. Shared by both animation drivers (mob.cpp and
+// avatar.cpp) so `SpringDef::gain` means the same thing — radians of lag at
+// full speed — no matter which one is driving the rig. Against raw voxels per
+// second it does not: the player avatar moves an order of magnitude faster than
+// a critter, and the same authored gain pinned its head at maxAngle forever.
+constexpr float kSpringVelScale = 0.6f;

@@ -1090,11 +1090,20 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // ---- springs: parts with `spring` are jiggled, never keyed ----
   // The goal is the body's own motion expressed in the part's local frame, so
   // a tail lags behind acceleration and settles when the mob stops.
+  //
+  // Velocity is NORMALIZED by the def's own top speed, exactly as avatar.cpp
+  // does it, so `gain` means "radians of lag at full speed" for every def
+  // regardless of how fast that def moves. Against raw voxels/second the same
+  // authored gain reads completely differently on a slow critter and on a
+  // 60-voxel/s player avatar — the latter sat pegged at maxAngle permanently.
+  // Both drivers must agree here or a def's springs change meaning depending on
+  // which one is animating it.
+  const float speedRef = std::max(def.speed, 0.01f);
   for (size_t i = 0; i < sk.parts.size(); i++) {
     const AnimPart& p = sk.parts[i];
     if (!p.hasSpring) continue;
-    Vec3 goal{-st.velocity.z * p.spring.gain * 0.05f, 0,
-              st.velocity.x * p.spring.gain * 0.05f};
+    Vec3 goal{-st.velocity.z / speedRef * p.spring.gain * kSpringVelScale, 0,
+              st.velocity.x / speedRef * p.spring.gain * kSpringVelScale};
     goal.x = std::clamp(goal.x, -p.spring.maxAngle, p.spring.maxAngle);
     goal.z = std::clamp(goal.z, -p.spring.maxAngle, p.spring.maxAngle);
     AnimSpringStep(p.spring, st.springs[i], goal, dt);

@@ -13,6 +13,7 @@
 
 #include <GLFW/glfw3.h>
 
+#include "audio/cues.h"
 #include "game/avatar.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -369,6 +370,12 @@ void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
 float g_shotTimeOfDay = 0.34f;
+
+// Which mob def the player wears. Swapping the player character is meant to be
+// a one-line data change, so this lives in ONE place: the game's avatar and
+// the selftest's avatar block both read it. Two literals would let the test
+// keep passing against a character nobody plays.
+const char* kAvatarDefName = "mina";
 
 // --shot: minimal look-iteration harness. Worldgen, drain the far-field fill
 // queue, settle briefly, write the three standard screenshots, exit — so
@@ -849,13 +856,22 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   td.size = {W, H, 1};
   td.format = wgpu::TextureFormat::RGBA8Unorm;
   td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+  // Honour `--time` here the same way RunShots does. Passing a literal 0 tick
+  // pinned every mob shot to MIDNIGHT, which is the worst possible light for
+  // judging a character's silhouette — the whole point of this mode.
+  const Tuning& mobShotTun = CurrentTuning();
+  uint32_t mobShotTicksPerDay = TicksPerDay(mobShotTun);
+  uint32_t mobShotTick = (uint32_t)((double)g_shotTimeOfDay *
+                                    (double)mobShotTicksPerDay) %
+                         mobShotTicksPerDay;
   auto shoot = [&](Vec3 dir, float dist, const char* path) {
     Vec3 eye = target + dir.normalized() * dist;
     Vec3 look = (target - eye).normalized();
     Camera cam;
     cam.yaw = std::atan2(look.z, look.x);
     cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
-    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0);
+    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                      kFarFogDensity, 1080.0f, mobShotTick);
     wgpu::Texture tex = ctx.device.CreateTexture(&td);
     wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
@@ -2639,7 +2655,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       // The avatar reuses the mob rig but is driven by the PLAYER, so none of
       // the tests above touch it. What is worth asserting is exactly the part
       // that is avatar-specific and easy to break silently:
-      //   1. the wizard def loads with every part, chain and state resolved
+      //   1. the avatar def loads with every part, chain and state resolved
       //   2. spawning creates one Jolt body per part
       //   3. the body FOLLOWS the player rather than wandering off
       //   4. dismemberment walks DOWN the authored state ladder and each step
@@ -2647,22 +2663,33 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       //      state that cannot jump
       //   5. severed parts become debris and the avatar tears down cleanly
       {
+        // Test whatever def the GAME uses as the avatar (kAvatarDefName), not
+        // a hardcoded name — a selftest pinned to the old name would keep
+        // passing against a character nobody plays.
+        const std::string avDefName = kAvatarDefName;
         int wizDef = -1;
         for (size_t i = 0; i < mobs.Defs().size(); i++)
-          if (mobs.Defs()[i].name == "wizard") wizDef = (int)i;
+          if (mobs.Defs()[i].name == avDefName) wizDef = (int)i;
         if (wizDef < 0) {
-          std::printf("avatar: SKIP (no wizard def — run "
-                      "scripts/gen_wizard.py)\n");
+          std::printf("avatar: SKIP (no %s def — run scripts/gen_%s.py)\n",
+                      avDefName.c_str(), avDefName.c_str());
         } else {
           debris.Reset();
           const MobDef& wd = mobs.Defs()[wizDef];
           PlayerAvatar avatar;
           avatar.Init(&phys, &world, &debris, mats);
-          avatar.SetDefs(&mobs.Defs(), "wizard");
+          avatar.SetDefs(&mobs.Defs(), avDefName);
 
           int h2 = World::TerrainHeight(140, 140, kDefaultSeed);
           Player pl;
           pl.fly = false;
+          // The avatar gates its locomotion clips on `grounded` (you do not
+          // swing your arms mid-jump), and a default-constructed Player is not
+          // grounded — so without this the walk/run clips never start and the
+          // arms hang dead through the whole test. That is exactly the "arms
+          // outstretched like a zombie" case, so leaving it unset would have
+          // the test assert on a pose the game never shows.
+          pl.grounded = true;
           pl.pos = Vec3{140.5f, (float)(h2 + 2) + Player::kHalfY, 140.5f};
           bool spawned = avatar.Spawn(pl, 0.0f);
           const int nParts = (int)wd.limbs.size();
@@ -2692,12 +2719,34 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           // (the mob wander drive, say) would sit still and still look fine in
           // a screenshot.
           Vec3 originBefore = avatar.Origin();
+          // Footfall accounting over the walk. These are what drive footstep
+          // AUDIO, but the assertion is deliberately about the EVENTS, not the
+          // sound: the selftest is headless and opens no audio device, so this
+          // checks the half that can actually break silently — that the gait
+          // emits one event per plant, on a real material, at the foot.
+          int footfalls = 0;
+          int footfallsBadMat = 0;
+          int footfallsFarFromFoot = 0;
           for (int i = 0; i < 60; i++) {
             pl.pos.x += 0.2f;
             avTick();
+            for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
+              footfalls++;
+              // A step must name a real, non-air material, or it is silent.
+              if (ff.mat == 0 || ff.mat >= mats.size()) footfallsBadMat++;
+              // ...and must land at the body, not at the world origin: a step
+              // heard 100 m away from the player is the failure mode a
+              // coordinate-conversion bug produces.
+              if (Vec3{ff.posVox.x - pl.pos.x, 0, ff.posVox.z - pl.pos.z}.len() > 8.0f)
+                footfallsFarFromFoot++;
+            }
+            avatar.ClearFootfalls();
           }
           float followed = avatar.Origin().x - originBefore.x;
           bool follows = followed > 10.0f;
+          // 60 ticks of walking is 2 s; any sane gait plants several times.
+          bool stepsOk = footfalls >= 2 && footfallsBadMat == 0 &&
+                         footfallsFarFromFoot == 0;
 
           // The body must stay AT the player, not drift vertically away from
           // it. The gait used to re-derive its own standing height from the
@@ -2734,6 +2783,85 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           phys.RemoveBody(avProxy);
           bool noSelfPush = selfPush < 0.001f;
 
+          // ---- gait quality AT THE PLAYER'S REAL SPEED ----
+          // Everything above walks the player at 0.2 vox/tick = 6 vox/sec,
+          // which is a sixth of walkSpeed and a tenth of sprintSpeed. That is
+          // why "the legs flail behind like a naruto run" sailed through a
+          // green selftest: the failure only exists at speeds the test never
+          // reached. Drive the real numbers and assert on the POSE.
+          //
+          // The invariant is limb ELEVATION: a leg that is walking stays near
+          // vertical (its two bones fold and swing about the hip), while a leg
+          // whose IK target is out of reach straightens and rotates toward
+          // horizontal to point at it. So "min elevation over a stride" is a
+          // direct measure of the trailing-leg failure, with no reference pose
+          // to keep in sync.
+          // Elevation of a limb's own axis above horizontal, 90 = hanging
+          // straight down/up, 0 = sticking straight out. Limbs point along
+          // their local +Y, and a limb rotates AWAY from vertical as it swings,
+          // so this is the natural "is it swinging or is it pointing" measure.
+          auto elevationOf = [&](int part) {
+            Vec3 p;
+            Quat q;
+            if (!avatar.PartWorldTransform(part, p, q)) return 90.0f;
+            Vec3 axis = QuatRotate(q, Vec3{0, 1, 0});
+            float a = std::asin(std::clamp(axis.y, -1.0f, 1.0f));
+            return std::fabs(a) * 57.29578f;
+          };
+          // SIGNED fore/aft swing of a limb, in degrees: how far its axis has
+          // rotated out of vertical along the travel direction. The unsigned
+          // elevation above folds a forward swing onto a backward one, so an
+          // arm swinging +-14 degrees and an arm frozen at 0 both read ~90 and
+          // the test could not tell "swinging" from "held out".
+          auto swingOf = [&](int part) {
+            Vec3 p;
+            Quat q;
+            if (!avatar.PartWorldTransform(part, p, q)) return 0.0f;
+            Vec3 axis = QuatRotate(q, Vec3{0, 1, 0});
+            // Travel is +x. Fold the axis onto the DOWNWARD hemisphere first:
+            // a limb model may point either way along its local +Y, and
+            // atan2 against the wrong one wraps to +-180 and makes a 14-degree
+            // swing look like a 360-degree range.
+            if (axis.y > 0) axis = axis * -1.0f;
+            return std::atan2(axis.x, -axis.y) * 57.29578f;
+          };
+          const int legParts[4] = {avatar.PartIndex("legU.L"),
+                                   avatar.PartIndex("legU.R"),
+                                   avatar.PartIndex("legL.L"),
+                                   avatar.PartIndex("legL.R")};
+          const int armParts[2] = {avatar.PartIndex("armU.L"),
+                                   avatar.PartIndex("armU.R")};
+          float minLegElev = 90.0f, minArmElev = 999.0f, maxArmElev = -999.0f;
+          const float walkStep =
+              (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
+          for (int i = 0; i < 90; i++) {
+            pl.pos.x += walkStep;
+            avTick();
+            if (i < 20) continue;   // let the gait spin up before sampling
+            for (int lp : legParts)
+              if (lp >= 0) minLegElev = std::min(minLegElev, elevationOf(lp));
+            for (int ap : armParts)
+              if (ap >= 0) {
+                float e = swingOf(ap);
+                minArmElev = std::min(minArmElev, e);
+                maxArmElev = std::max(maxArmElev, e);
+              }
+          }
+          // A walking leg should never lie down. A healthy stride here bottoms
+          // out around 35 degrees at the extremes of the swing and spends most
+          // of the cycle well above it; the trailing-leg failures this guards
+          // against drove it to 3-23, so the gap is wide and the threshold does
+          // not need to be tight to catch them.
+          bool legsUpright = minLegElev > 30.0f;
+          // Arms must SWING and must stay roughly under the shoulder. In the
+          // signed measure, 0 is hanging straight down and +-90 is held
+          // straight out. A zombie arm pins near one extreme and never moves;
+          // a walking arm oscillates about 0. So: a real range, and both
+          // extremes within a sane arc of vertical.
+          bool armsSwing = (maxArmElev - minArmElev) > 8.0f;
+          bool armsHang = std::fabs(maxArmElev) < 60.0f &&
+                          std::fabs(minArmElev) < 60.0f;
+
           // Walk DOWN the state ladder and check the movement coupling at each
           // rung. Speed must be non-increasing and must actually drop by the
           // end — the whole point of the states is that damage costs you.
@@ -2769,17 +2897,30 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
 
           bool avOk = spawned && allBodies && follows && tracksY &&
                       noSelfPush && monotone && slowed && noJump &&
-                      statesSeen > 0 && partsGone && becameDebris && tornDown;
+                      statesSeen > 0 && partsGone && becameDebris && tornDown &&
+                      legsUpright && armsHang && armsSwing;
           std::printf(
               "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
               "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
               "speed 1.00->%.2f monotone=%d canJump=%d, %u parts left, "
-              "%zu debris, torn down=%d)\n",
+              "%zu debris, torn down=%d; walking legElev>=%.0f arm %.0f..%.0f "
+              "upright=%d hang=%d swing=%d)\n",
               avOk ? "PASS" : "FAIL", nParts, spawned ? 1 : 0,
               allBodies ? 1 : 0, followed, drift, selfPush, statesSeen,
               stateNow, prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0,
-              partsLeft, debrisNow, tornDown ? 1 : 0);
+              partsLeft, debrisNow, tornDown ? 1 : 0, minLegElev, minArmElev,
+              maxArmElev, legsUpright ? 1 : 0, armsHang ? 1 : 0,
+              armsSwing ? 1 : 0);
           mobOk = mobOk && avOk;
+
+          // Reported separately from `avatar` so a gait-look regression and a
+          // footstep-plumbing regression never hide behind one another.
+          std::printf(
+              "avatar footfalls: %s (%d plants over 60 walk ticks, %d bad "
+              "material, %d away from the body)\n",
+              stepsOk ? "PASS" : "FAIL", footfalls, footfallsBadMat,
+              footfallsFarFromFoot);
+          mobOk = mobOk && stepsOk;
           debris.Reset();
         }
       }
@@ -3310,12 +3451,14 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool lowPowerAdapter = false;
+  bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--selftest") selftest = true;
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
     if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
+    if (a == "--noaudio") noAudio = true;
     // `--time 0..1` sets the time of day for --shot: 0 = midnight, 0.25 =
     // sunrise, 0.5 = noon, 0.75 = sunset. Lets the sky be judged at any point
     // in the cycle without waiting for it.
@@ -3433,6 +3576,13 @@ int main(int argc, char** argv) {
   Overlay overlay;
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
 
+  // Audio comes up HERE, after the three headless modes have returned: none of
+  // --shot/--shot-mob/--selftest should ever open a sound device (there is no
+  // audio hardware in CI, and a selftest that depends on one is not a test).
+  // A failed init is not an error anywhere — the game runs silent.
+  audio::Cues audioCues;
+  if (!noAudio) audioCues.Init(assetDir + "/sounds", mats);
+
   UIState ui;
   for (auto& m : mats) {
     ui.materialNames.push_back(m.name);
@@ -3453,7 +3603,7 @@ int main(int argc, char** argv) {
   // one micro-body pool, and a hot reload (R) rebuilds both at once. It points
   // at whichever def is named `avatarDefName`, so swapping the player
   // character is data, not code.
-  const std::string avatarDefName = "wizard";
+  const std::string avatarDefName = kAvatarDefName;
   PlayerAvatar avatar;
   avatar.Init(&phys, &world, &debris, mats);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
@@ -3679,6 +3829,10 @@ int main(int argc, char** argv) {
         // reference the now-freed micro models.
         avatar.OnMaterialsReloaded(mats);
         avatar.SetDefs(&mobs.Defs(), avatarDefName);
+        // Re-resolve material -> footstep set and the acoustic table. Also
+        // rescans assets/sounds, so dropping in a new step variant and hitting
+        // R makes it audible without a rebuild.
+        audioCues.RescanSounds(mats);
         tpRig.Snap();
         ui.mobNames.clear();
         for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
@@ -4032,8 +4186,20 @@ int main(int argc, char** argv) {
         float d = wantHeading - avatarHeading;
         while (d > 3.14159265f) d -= 6.2831853f;
         while (d < -3.14159265f) d += 6.2831853f;
-        float maxStep = av.turnRate * kTickDt;
-        avatarHeading += std::clamp(d, -maxStep, maxStep);
+        // FIRST PERSON DOES NOT EASE. The rate limit exists so a third-person
+        // body pivots on its feet instead of snapping to face its travel
+        // direction. In first person there is no body to watch turn — the
+        // camera IS the head, so any lag means the torso is yawed away from
+        // the view while the arms stay welded to the torso. Both of them then
+        // hang off to one side of the screen until the ease catches up, which
+        // at turnRate 12 rad/s is most of a fast mouse turn. Snapping is
+        // correct here: the thing the lag was protecting is off-screen.
+        if (camMode == CameraMode::First) {
+          avatarHeading = wantHeading;
+        } else {
+          float maxStep = av.turnRate * kTickDt;
+          avatarHeading += std::clamp(d, -maxStep, maxStep);
+        }
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:
@@ -4243,6 +4409,26 @@ int main(int argc, char** argv) {
         fovNow += (fovGoal - fovNow) * k;
         cam.fovY = fovNow;
       }
+
+      // ---- audio ----
+      // The listener rides the RENDER eye, not the player's head: in third
+      // person the camera is where the player's attention is, and putting the
+      // ears anywhere else makes panning disagree with what is on screen.
+      // After the camera block, so `eye` is final for the frame.
+      //
+      // Footfalls are drained here rather than inside the tick loop because
+      // that loop runs up to 4 times per frame; firing from inside it would
+      // put several steps at the same instant.
+      if (audioCues.Enabled()) {
+        for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
+          if (ff.landing)
+            audioCues.Land(ff.mat, ff.posVox, ff.fallSpeed);
+          else
+            audioCues.Footstep(ff.mat, ff.posVox, ff.speed, ff.foot);
+        }
+        audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
+      }
+      avatar.ClearFootfalls();
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
@@ -4416,6 +4602,14 @@ int main(int argc, char** argv) {
   }
 
   ctx.WaitIdle();
+  // Audio down before anything it points at: Shutdown stops the device, which
+  // is the only thread that can still be inside the mixer.
+  if (audioCues.Enabled()) {
+    const audio::Cues::Stats& as = audioCues.GetStats();
+    std::printf("[audio] %u steps, %u landings, %u impacts, %u dropped\n",
+                as.steps, as.lands, as.impacts, as.dropped);
+  }
+  audioCues.Shutdown();
   overlay.Shutdown();
   glfwDestroyWindow(window);
   glfwTerminate();

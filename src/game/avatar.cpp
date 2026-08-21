@@ -29,6 +29,19 @@ float SignedUnit(uint32_t h) {
   return (float)(int32_t)(h & 0xFFFFu) / 32768.0f - 1.0f;
 }
 
+// Ceiling on the gait's velocity lookahead, in leg lengths. `leadTime` is a
+// DURATION, so the unclamped offset grows linearly with speed and blows past
+// what a two-bone chain can reach — see the note at the clamp in UpdateGait.
+// Just under 1 keeps the planted foot inside the leg's reach annulus even at a
+// full-lean sprint, so the IK poses a bent leg instead of a straight pointer.
+constexpr float kMaxLeadLegLengths = 0.9f;
+
+// Floor on the speed scaling of the swing, and an absolute floor on the swing
+// itself. Together they stop a near-stationary step from swinging for seconds
+// and a sprint from snapping the foot across with no visible arc.
+constexpr float kMinSwingScale = 0.35f;
+constexpr float kMinSwingSeconds = 0.09f;
+
 ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
                           bool micro, int lifeTicks, int microScale) {
   ParticleSpawn s{};
@@ -259,8 +272,15 @@ void PlayerAvatar::PlayClip(const std::string& name) {
   int ci = def_->skel.FindClip(name);
   if (ci < 0) return;
   for (ClipInstance& inst : anim_.clips)
-    if (inst.clip == ci && !inst.stopping) {  // retrigger: restart, don't stack
-      inst.timeMs = 0;
+    if (inst.clip == ci && !inst.stopping) {
+      // ALREADY PLAYING: leave it alone. This used to rewind to timeMs = 0,
+      // which is right for a one-shot you re-trigger (cast, land) but fatal for
+      // the locomotion clips, because PreTick calls PlayClip("walk") EVERY
+      // TICK to keep it alive. Rewinding every tick pinned the clip at t=0
+      // forever: the arms sat frozen on the first keyframe — held out in front,
+      // never swinging — which is exactly the "zombie arms" look. A looping
+      // clip that is already running needs no retrigger at all.
+      if (!def_->skel.clips[ci].loop) inst.timeMs = 0;
       return;
     }
   ClipInstance inst;
@@ -312,7 +332,7 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
 // ---- animation --------------------------------------------------------------
 
 bool PlayerAvatar::GroundHeightAt(World& world, int wx, int wz, int yFrom,
-                                  int& outY) const {
+                                  int& outY, uint32_t* outMat) const {
   // Scans down through the chunk cache, requesting a fetch for a missing
   // chunk. Bounded to one column per foot per tick (rule 2). Same probe
   // MobSystem uses — solids and powders carry weight, liquids and gases do
@@ -332,6 +352,7 @@ bool PlayerAvatar::GroundHeightAt(World& world, int wx, int wz, int yFrom,
     if (mat != 0 && mat < classOf_.size() &&
         (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER)) {
       outY = y + 1;
+      if (outMat != nullptr) *outMat = mat;
       return true;
     }
   }
@@ -364,6 +385,11 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
   int nFeet = 0;
   float footLo = 0, footHi = 0;
   Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  // Best step candidate this frame — see the "neediest foot" note below.
+  int bestFoot = -1;
+  float bestDrift = 0;
+  Vec3 bestGoal{};
+  uint32_t bestMat = 0;
 
   for (size_t c = 0; c < sk.chains.size() && c < anim_.feet.size(); c++) {
     const IkChain& ch = sk.chains[c];
@@ -385,22 +411,49 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
     for (int par = sk.parts[ch.effector].parent; par >= 0;
          par = sk.parts[par].parent)
       restLocal = restLocal + sk.parts[par].rest.pos;
-    Vec3 stancePrefab = restLocal + sk.parts[def_->rootLimb].anchorLocal;
+    // restLocal is ALREADY the foot's anchor in PREFAB coordinates: the walk
+    // above accumulates rest.pos all the way up through the root, and each
+    // rest.pos is a joint anchor measured from its parent's anchor, so the sum
+    // telescopes to the effector's absolute prefab anchor. Adding the root
+    // anchor on top double-counts it and slides the whole stance by
+    // (rootAnchor) — here (2.5, 0, 2.0) world voxels, so both feet were planted
+    // 2.5 voxels FORWARD and 2 sideways of where the legs actually hang. The
+    // gait then stepped correctly about a stance that was never under the body,
+    // the IK stretched to reach it, and the legs raked out behind: the
+    // "naruto run". The IK below closes the loop by subtracting rootAnchor from
+    // the prefab point, which is the other half of this same convention.
+    Vec3 stancePrefab = restLocal;
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
     Vec3 stance = Vec3{origin_.x, bodyY_, origin_.z} + pivot +
                   Rotate(yaw, stancePrefab - pivot);
     // Lead the target by the current velocity so the foot lands where the body
     // is GOING, not where it was — without this a walk always trails.
-    Vec3 goal = stance + Vec3{anim_.velocity.x, 0, anim_.velocity.z} *
-                             (g.leadTime + g.strideBias * 0.1f);
+    //
+    // THE LEAD MUST BE CLAMPED TO THE LEG'S REACH. `leadTime` is a duration, so
+    // the raw offset grows without bound with speed: the player moves an order
+    // of magnitude faster than the mobs these gait numbers were tuned on
+    // (sprintSpeed 6 m/s at kVoxelMeters 0.10 is 60 world voxels/s, against a
+    // ~6-voxel leg), which puts the target ~15 voxels behind a leg that can
+    // reach ~6. AnimSolveTwoBone then clamps to its reach annulus every frame
+    // and the leg simply points at the target — a straight limb trailing the
+    // body, which is the "legs flail behind instead of walking" report. Capping
+    // the lead at a fraction of leg length keeps the same lean at walk pace and
+    // degrades to a reachable stride at a sprint.
+    Vec3 lead = Vec3{anim_.velocity.x, 0, anim_.velocity.z} *
+                (g.leadTime + g.strideBias * 0.1f);
+    const float maxLead = kMaxLeadLegLengths * f.legLength;
+    float leadLen = lead.len();
+    if (leadLen > maxLead) lead = lead * (maxLead / leadLen);
+    Vec3 goal = stance + lead;
     // Probe from just above the SOLE (origin_.y), and fall back to the sole
     // when the probe misses. Both used to reference bodyY_, which is what let
     // the height feed itself — see the body-height note at the end of this
     // function. origin_.y is player-owned and cannot be perturbed from here,
     // so the fallback is a fixed reference rather than a feedback path.
     int gy = 0;
+    uint32_t gmat = 0;
     if (GroundHeightAt(world, ifloor(goal.x), ifloor(goal.z),
-                       ifloor(origin_.y) + 2, gy))
+                       ifloor(origin_.y) + 2, gy, &gmat))
       goal.y = (float)gy;
     else
       goal.y = origin_.y;
@@ -410,12 +463,42 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
       f.swinging = false;
     }
     if (f.swinging) {
-      f.swingT += dt / std::max(g.stepDuration, 0.01f);
+      // SWING TIME SHORTENS WITH SPEED. A fixed stepDuration is what actually
+      // caps the stride: only one leg may swing at a time, so the body keeps
+      // advancing for the whole swing and the planted foot falls further behind
+      // the faster you go — the leg ends up permanently over-extended and the
+      // IK just points it backward. Real gaits shorten the swing as they speed
+      // up; dividing by speedFactor does the same here and keeps the distance
+      // covered per step roughly constant in leg lengths. Clamped so a crawl
+      // does not get an infinitely long swing and a sprint keeps a visible arc.
+      float durScale = std::clamp(speedFactor, kMinSwingScale, 1.5f);
+      float dur = std::max(g.stepDuration / durScale, kMinSwingSeconds);
+      f.swingT += dt / dur;
       if (f.swingT >= 1.0f) {
         f.swingT = 0;
         f.swinging = false;
         f.planted = f.swingTo;
+        // THE FOOTFALL. The gait's own touchdown moment, so a step is heard
+        // exactly when the art shows the foot land — no separate accumulator
+        // to drift out of sync with the animation, and a severed leg stops
+        // producing steps for free because it never swings again.
+        Footfall ff;
+        ff.posVox = f.swingTo;
+        ff.mat = f.swingMat;
+        ff.speed = speedNow_;
+        ff.foot = (int)c;
+        if (ff.mat != 0) footfalls_.push_back(ff);
       } else {
+        // RE-TARGET THE SWING WHILE IT IS IN THE AIR. Freezing swingTo at
+        // lift-off is what actually starved the gait: the body travels
+        // speed * stepDuration during a swing (about 6 voxels at walk pace)
+        // while the foot only gains the lead (about 5), so every single step
+        // lost ground and the feet fell permanently behind the body no matter
+        // how the cadence was tuned. Easing the target toward the CURRENT goal
+        // as the swing progresses lets the foot land where the body actually
+        // is. Weighted by t so the early swing keeps its committed direction
+        // (no jitter at lift-off) and the late swing homes in on the truth.
+        f.swingTo = f.swingTo * (1.0f - f.swingT) + goal * f.swingT;
         // parabolic arc between lift-off and touch-down
         float t = f.swingT;
         Vec3 flat = f.swingFrom * (1.0f - t) + f.swingTo * t;
@@ -423,14 +506,21 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
         f.planted = flat;
       }
     } else {
+      // THE NEEDIEST FOOT STEPS, NOT THE FIRST ONE IN THE LIST. Only one leg
+      // may swing at a time, and claiming that slot inline meant chain 0 took
+      // it every single time: by the frame its own swing ended, its drift was
+      // already past the threshold again, and since the loop visits it first it
+      // re-claimed the slot before chain 1 was ever considered. The right leg
+      // stayed planted at its spawn position forever while the left pogo'd —
+      // one leg raking out behind the body, which is most of what "naruto run"
+      // looked like. Record the best candidate here and commit after the loop.
       float drift = Vec3{goal.x - f.planted.x, 0, goal.z - f.planted.z}.len();
-      bool mayStep = swingingGroup < 0;
-      if (mayStep && drift > g.stepThreshold * f.legLength && speedFactor > 0.05f) {
-        f.swinging = true;
-        f.swingT = 0;
-        f.swingFrom = f.planted;
-        f.swingTo = goal;
-        swingingGroup = (int)c;   // claim the slot for this frame
+      if (swingingGroup < 0 && drift > g.stepThreshold * f.legLength &&
+          speedFactor > 0.05f && drift > bestDrift) {
+        bestDrift = drift;
+        bestFoot = (int)c;
+        bestGoal = goal;
+        bestMat = gmat;  // surface this step is aimed at, for the footfall
       }
     }
     // Collected for the SLOPE only (see the body-height note below): the
@@ -440,6 +530,21 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
     nFeet++;
     if (nFeet == 1 || f.planted.y < footLo) footLo = f.planted.y;
     if (nFeet == 1 || f.planted.y > footHi) footHi = f.planted.y;
+  }
+
+  // Commit the single step chosen above. Deferring it out of the loop is what
+  // makes the choice order-independent: every eligible foot has been measured
+  // by the time the slot is awarded, so the leg that has fallen furthest behind
+  // gets it and the legs alternate on their own. No per-gait table, no explicit
+  // left/right state — the same "one group at a time" rule as before, only now
+  // it is a fair comparison rather than a race won by list position.
+  if (bestFoot >= 0 && (size_t)bestFoot < anim_.feet.size()) {
+    FootState& bf = anim_.feet[bestFoot];
+    bf.swinging = true;
+    bf.swingT = 0;
+    bf.swingFrom = bf.planted;
+    bf.swingTo = bestGoal;
+    bf.swingMat = bestMat;
   }
 
   // BODY HEIGHT COMES FROM THE PLAYER, NOT FROM THE FEET.
@@ -542,11 +647,21 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world) {
   }
 
   // springs: a part is KEYED or JIGGLED, never both
+  //
+  // The goal is driven by velocity NORMALIZED against the def's own top speed,
+  // not by raw voxels/second. MobSystem's `velocity * gain * 0.05` is tuned for
+  // mob speeds; the player moves ~10x faster (60 world voxels/s at a sprint),
+  // which drives the head spring to ~2.7 rad and leaves it PINNED at its
+  // maxAngle clamp for the whole of every move — the head permanently reared
+  // back, snapping between extremes on every turn. Dividing by def_->speed
+  // makes `gain` mean "deflection at full speed" for any character, so a
+  // spring authored on a mob reads the same on the avatar.
+  const float speedRef = std::max(def_->speed, 0.01f);
   for (size_t i = 0; i < sk.parts.size(); i++) {
     const AnimPart& p = sk.parts[i];
     if (!p.hasSpring) continue;
-    Vec3 goal{-st.velocity.z * p.spring.gain * 0.05f, 0,
-              st.velocity.x * p.spring.gain * 0.05f};
+    Vec3 goal{-st.velocity.z / speedRef * p.spring.gain * kSpringVelScale, 0,
+              st.velocity.x / speedRef * p.spring.gain * kSpringVelScale};
     goal.x = std::clamp(goal.x, -p.spring.maxAngle, p.spring.maxAngle);
     goal.z = std::clamp(goal.z, -p.spring.maxAngle, p.spring.maxAngle);
     AnimSpringStep(p.spring, st.springs[i], goal, dt);
@@ -640,12 +755,33 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // here rather than in main.cpp so every consumer of the avatar gets the
     // same behaviour without restating the thresholds.
     if (player.grounded) {
-      if (!wasGrounded_ && airTime_ > 0.25f) PlayClip("land");
+      if (!wasGrounded_ && airTime_ > 0.25f) {
+        PlayClip("land");
+        // A landing is its own sound, not a footstep: both feet arrive at once
+        // and the impact carries the fall. Uses the fall speed remembered from
+        // the last airborne tick, because by the time `grounded` is true the
+        // collision sweep has already zeroed the downward velocity.
+        Footfall ff;
+        ff.posVox = Vec3{player.pos.x, origin_.y, player.pos.z};
+        ff.speed = speedNow_;
+        ff.foot = 0;
+        ff.landing = true;
+        ff.fallSpeed = lastFallSpeed_;
+        int gy = 0;
+        uint32_t gmat = 0;
+        if (GroundHeightAt(world, ifloor(player.pos.x), ifloor(player.pos.z),
+                           ifloor(origin_.y) + 2, gy, &gmat))
+          ff.mat = gmat;
+        if (ff.mat != 0) footfalls_.push_back(ff);
+      }
       airTime_ = 0;
     } else {
       if (wasGrounded_) PlayClip("jump");
       airTime_ += dt;
       if (airTime_ > 0.45f) PlayClip("fall");
+      // Remember how fast we are falling; the landing tick needs it after the
+      // sweep has already cancelled the velocity.
+      lastFallSpeed_ = player.vel.y < 0 ? -player.vel.y : 0.0f;
     }
     wasGrounded_ = player.grounded;
 
@@ -654,11 +790,36 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // the def's top speed. Both are retriggered every tick, which PlayClip
     // turns into a no-op once the instance exists.
     const bool moving = speedNow_ > 0.4f && player.grounded;
-    const bool running = speedNow_ > def.speed * 0.55f;
-    for (ClipInstance& inst : anim_.clips) {
-      int wc = def.skel.FindClip("walk"), rc = def.skel.FindClip("run");
-      if (inst.clip == wc && (!moving || running)) inst.stopping = true;
-      if (inst.clip == rc && (!moving || !running)) inst.stopping = true;
+    // `def.speed` is the SPRINT reference, so a plain walk (35 of 60 voxels/s)
+    // already sits at 0.58 of it — right on top of a 0.55 threshold. The clip
+    // selection then flipped between walk and run every frame, and since each
+    // one blends in over 180 ms neither ever got past a fraction of its weight:
+    // the authored 28-degree arm swing rendered as about 4 degrees of twitch,
+    // which is the "arms held out stiff" look. Split at the midpoint between
+    // walk and sprint instead, with hysteresis so speeds that sit near the
+    // boundary pick one and stay there.
+    const float runOn = def.speed * 0.80f;
+    const float runOff = def.speed * 0.70f;
+    running_ = running_ ? (speedNow_ > runOff) : (speedNow_ > runOn);
+    const bool running = running_;
+    {
+      // IDLE MUST STOP WHEN YOU MOVE. It was started but never retired, and it
+      // is a LOOPING ADDITIVE keyed on the same arms and spine the walk swing
+      // drives — so it kept composing with the walk forever, dragging an
+      // authored 14-degree arm swing down to about 4 and leaving the arms
+      // nearly rigid. That near-motionless pose is the "arms outstretched like
+      // a zombie" look. Each of the three is exclusive with the other two, so
+      // retire the two that do not apply rather than only the locomotion pair.
+      const int ic = def.skel.FindClip("idle");
+      const int wc = def.skel.FindClip("walk");
+      const int rc = def.skel.FindClip("run");
+      const int want = !moving ? ic : (running ? rc : wc);
+      for (ClipInstance& inst : anim_.clips) {
+        if (inst.clip < 0) continue;
+        if ((inst.clip == ic || inst.clip == wc || inst.clip == rc) &&
+            inst.clip != want)
+          inst.stopping = true;
+      }
     }
     if (moving) PlayClip(running ? "run" : "walk");
     else PlayClip("idle");

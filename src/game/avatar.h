@@ -113,6 +113,26 @@ class PlayerAvatar {
   // After Physics::Step: refresh limb transforms from Jolt.
   void PostStep();
 
+  // ---- footfall events (presentation only) --------------------------------
+  // A foot touching down, produced by the gait's own plant moment rather than
+  // by a distance accumulator — so a step sounds exactly when the art shows
+  // the foot land, at whatever cadence the gait chose, and a leg lost to
+  // dismemberment simply stops producing them.
+  //
+  // These QUEUE rather than fire directly because PreTick runs inside the
+  // fixed-tick loop (up to 4 ticks per frame): the consumer drains them once
+  // per frame. Presentation only — nothing here may feed back into the sim.
+  struct Footfall {
+    Vec3 posVox{};      // where the foot landed
+    uint32_t mat = 0;   // material id of the supporting voxel (0 = unknown)
+    float speed = 0;    // walker speed at touchdown, voxels/sec
+    int foot = 0;       // chain index, so left/right can be pitched apart
+    bool landing = false;  // true when this is a touchdown from a fall
+    float fallSpeed = 0;   // downward speed on a landing, voxels/sec
+  };
+  const std::vector<Footfall>& Footfalls() const { return footfalls_; }
+  void ClearFootfalls() { footfalls_.clear(); }
+
   // ---- damage / dismemberment ----
   // Same contract as MobSystem::Damage: returns true if the handle was one of
   // the avatar's limbs. A hit crossing a joint anchor, or one past the limb's
@@ -191,7 +211,11 @@ class PlayerAvatar {
   void PlayClip(const std::string& name);
   void UpdateAnimation(float dt, World& world);
   void UpdateGait(float dt, World& world);
-  bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY) const;
+  // `outMat` receives the material id of the supporting voxel — the probe
+  // already reads it to decide what carries weight, so returning it costs
+  // nothing and is what lets a footstep know which surface it landed on.
+  bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
+                      uint32_t* outMat = nullptr) const;
   void ResolveParts();
 
   Physics* phys_ = nullptr;
@@ -211,6 +235,7 @@ class PlayerAvatar {
   bool instancesDirty_ = false;
   std::vector<uint8_t> hidden_;      // per-part render suppression
   std::vector<ParticleSpawn> pendingSpawns_;
+  std::vector<Footfall> footfalls_;  // drained once per frame by the caller
 
   Vec3 origin_{};                    // prefab min corner, world voxels
   float heading_ = 0;
@@ -219,6 +244,10 @@ class PlayerAvatar {
   float speedNow_ = 0;
   bool footInit_ = false;
   bool wasGrounded_ = true;
+  // Downward speed on the last airborne tick, voxels/sec. Sampled while still
+  // falling because the collision sweep zeroes vel.y before `grounded` flips.
+  float lastFallSpeed_ = 0;
+  bool running_ = false;
   float airTime_ = 0;
   uint64_t id_ = 0x5A11EDU;          // stable seed for gore variance
 
