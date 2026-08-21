@@ -243,6 +243,13 @@ class MobSystem {
   // the limb's transform lands in — sim/microbody.h.
   void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
                         uint32_t slotBase) const;
+  // Collision-box debug overlay (world.h DebugBox, the dev panel's "collision
+  // boxes" toggle). One oriented wireframe per LIVE limb body, read from the
+  // body's actual Jolt collider via Physics::GetLocalBounds — not from the
+  // limb's art, so a collider that has drifted from the model it represents
+  // shows up as exactly that. Appends; stops at `limit` total.
+  void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
+                        uint32_t color) const;
   uint32_t LimbBodyCount() const;
   uint32_t MobCount() const { return (uint32_t)mobs_.size(); }
 

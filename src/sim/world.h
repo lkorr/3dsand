@@ -142,6 +142,19 @@ struct Sprite {
 };
 constexpr uint32_t kMaxSprites = 64;
 
+// One ORIENTED wireframe box for the collision-box debug overlay.
+struct DebugBox {
+  float pos[3];
+  float pad0 = 0;
+  float half[3];
+  float pad1 = 0;
+  float quat[4];
+  uint32_t color;
+  uint32_t pad2 = 0, pad3 = 0, pad4 = 0;
+};
+static_assert(sizeof(DebugBox) == 64, "must match DebugBox in debug_lines.wgsl");
+constexpr uint32_t kMaxDebugBoxes = 1024;
+
 // Exact-cell MutationQueue op (8 bytes) — island removal / rubble handoff
 // (DESIGN.md §7). Must match sim_mutate.wgsl entry `cells`.
 struct CellOp {
@@ -539,6 +552,7 @@ class World {
   wgpu::Buffer cellOps;         // kMaxCellOpsPerTick CellOp (island removal)
   wgpu::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   wgpu::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
+  wgpu::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
   wgpu::Buffer bodyInstances;   // debris-body voxel instances (render)
   wgpu::Buffer bodyXforms;      // debris-body transforms (render)
   wgpu::Buffer genList;         // worldgen streaming: slot indices to generate

@@ -4536,7 +4536,7 @@ int main(int argc, char** argv) {
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
 
-  KeyEdge eP, eN, eV, eF1, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF3, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
@@ -4654,6 +4654,8 @@ int main(int argc, char** argv) {
     if (eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
     if (eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
     if (eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
+    if (eF3.Pressed(key(GLFW_KEY_F3)))
+      ui.showCollisionBoxes = !ui.showCollisionBoxes;
     if (eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
     if (eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
@@ -5874,6 +5876,40 @@ int main(int argc, char** argv) {
                               sprv.size() * sizeof(Sprite));
       }
 
+      uint32_t debugBoxCount = 0;
+      if (ui.showCollisionBoxes) {
+        static std::vector<DebugBox> dbg;
+        dbg.clear();
+        avatar.AppendDebugBoxes(dbg, kMaxDebugBoxes, 0xC000FF40u);
+        mobs.AppendDebugBoxes(dbg, kMaxDebugBoxes, 0xC0FFFF40u);
+        for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+          if (dbg.size() >= kMaxDebugBoxes) break;
+          const uint64_t h = debris.BodyHandle(i);
+          if (!h) continue;
+          Vec3 lo, hi;
+          BodyTransform xf{};
+          if (!phys.GetLocalBounds(h, lo, hi)) continue;
+          if (!phys.GetTransform(h, xf)) continue;
+          DebugBox b{};
+          const Vec3 mid{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                         (lo.z + hi.z) * 0.5f};
+          const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+          const Vec3 c = xf.pos + QuatRotate(q, mid);
+          b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
+          b.half[0] = (hi.x - lo.x) * 0.5f;
+          b.half[1] = (hi.y - lo.y) * 0.5f;
+          b.half[2] = (hi.z - lo.z) * 0.5f;
+          std::memcpy(b.quat, xf.quat, sizeof(b.quat));
+          b.color = 0xC040FFFFu;
+          dbg.push_back(b);
+        }
+        if (!dbg.empty()) {
+          debugBoxCount = (uint32_t)dbg.size();
+          ctx.queue.WriteBuffer(world.debugBoxes, 0, dbg.data(),
+                                dbg.size() * sizeof(DebugBox));
+        }
+      }
+
       // rigid bodies: debris takes slots [0, D), mob limbs stack after —
       // instances rebuild when either side changes (slot bases shift),
       // transforms are cheap and refresh per frame
@@ -5919,6 +5955,7 @@ int main(int argc, char** argv) {
       sim.DrawBodies(rp, bodyInstCount);
       sim.DrawMicroBodies(rp, ctx.queue, microInsts);
       sim.DrawSprites(rp, (uint32_t)sprv.size());
+      sim.DrawDebugBoxes(rp, debugBoxCount);
       overlay.Render(rp);
       rp.End();
       wgpu::CommandBuffer cmd = enc.Finish();

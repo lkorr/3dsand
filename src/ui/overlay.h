@@ -40,6 +40,12 @@ struct UIState {
   bool stepOnce = false;
   bool shadows = true;
   bool fly = true;
+  // Collision-box debug overlay (F3). Draws one green oriented wireframe per
+  // physics body — avatar and mob limbs, held items, rigidbody debris — using
+  // the body's ACTUAL Jolt collider bounds rather than its art, so the two
+  // disagreeing is visible rather than inferred. Off by default and free when
+  // off (the draw is skipped at zero boxes).
+  bool showCollisionBoxes = false;
   int brushRadius = 4;
   int brushMaterial = 3;     // sand
   bool reloadShaders = false;

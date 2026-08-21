@@ -166,6 +166,10 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(1, T::ReadOnlyStorage, S::Vertex),  // sprites
         entry(2, T::ReadOnlyStorage, S::Vertex),  // debris body voxel instances
         entry(3, T::ReadOnlyStorage, S::Vertex),  // debris body transforms
+        // Collision-box debug overlay. Costs one LAYOUT entry whether or not
+        // the overlay is on; the draw is skipped entirely at zero boxes, so an
+        // off overlay costs nothing but this declaration.
+        entry(4, T::ReadOnlyStorage, S::Vertex),  // debug wireframe boxes
     };
     d.entryCount = std::size(pentries);
     d.entries = pentries;
@@ -307,6 +311,7 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(1, world_->sprites),
         b(2, world_->bodyInstances),
         b(3, world_->bodyXforms),
+        b(4, world_->debugBoxes),
     };
     d.layout = renderPartBGL_;
     d.entryCount = std::size(rpentries);
@@ -436,8 +441,10 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   wgpu::ShaderModule mRay = mod("raymarch.wgsl");
   wgpu::ShaderModule mDebris = mod("debris.wgsl");
   wgpu::ShaderModule mMicroBody = mod("microbody.wgsl");
+  wgpu::ShaderModule mDebugLines = mod("debug_lines.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
-      !mExplode || !mParticle || !mRay || !mDebris || !mMicroBody) {
+      !mExplode || !mParticle || !mRay || !mDebris || !mMicroBody ||
+      !mDebugLines) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -466,6 +473,7 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   raymarchModule_ = mRay;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
+  debugLineModule_ = mDebugLines;
   targetFormat_ = wgpu::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
 }
@@ -784,6 +792,48 @@ void Simulation::EnsureRenderPipelines(wgpu::TextureFormat format) {
     bodyDraw_ = device_.CreateRenderPipeline(&d);
   }
   {
+    // Collision-box wireframes. Its own module (debug_lines.wgsl) but the SAME
+    // pipeline layout, so it needs no new bind groups.
+    //
+    // DEPTH TESTING OFF, WRITES OFF, and both are deliberate. A collider you
+    // can only see when nothing is in front of it is useless precisely when you
+    // need it — the reason to look at a limb's box is usually that the limb is
+    // buried in something. Writes are off so the wireframe never occludes the
+    // world it is annotating.
+    wgpu::DepthStencilState dsNone{};
+    dsNone.format = kDepthFormat;
+    dsNone.depthWriteEnabled = false;
+    dsNone.depthCompare = wgpu::CompareFunction::Always;
+
+    // Straight alpha over the frame: these are annotation, not lit geometry.
+    wgpu::BlendState blend{};
+    blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
+    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+    blend.color.operation = wgpu::BlendOperation::Add;
+    blend.alpha.srcFactor = wgpu::BlendFactor::One;
+    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+    blend.alpha.operation = wgpu::BlendOperation::Add;
+    wgpu::ColorTargetState cbt{};
+    cbt.format = format;
+    cbt.blend = &blend;
+
+    wgpu::FragmentState fs{};
+    fs.module = debugLineModule_;
+    fs.entryPoint = "fsBox";
+    fs.targetCount = 1;
+    fs.targets = &cbt;
+    wgpu::RenderPipelineDescriptor d{};
+    d.layout = renderPL_;
+    d.vertex.module = debugLineModule_;
+    d.vertex.entryPoint = "vsBox";
+    d.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+    d.primitive.cullMode = wgpu::CullMode::None;
+    d.depthStencil = &dsNone;
+    d.fragment = &fs;
+    d.label = "debugBoxDraw";
+    debugBoxDraw_ = device_.CreateRenderPipeline(&d);
+  }
+  {
     // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
     // FRONT-face culling so only the far side of each OBB rasterizes. That is
     // what keeps a limb drawn when the camera is inside its box — the fragment
@@ -850,6 +900,16 @@ void Simulation::DrawSprites(const wgpu::RenderPassEncoder& pass, uint32_t count
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);
+}
+
+void Simulation::DrawDebugBoxes(const wgpu::RenderPassEncoder& pass,
+                               uint32_t count) {
+  if (count == 0) return;   // overlay off: costs nothing
+  pass.SetPipeline(debugBoxDraw_);
+  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  // 12 edges x 6 vertices (two triangles per edge quad).
+  pass.Draw(72, count);
 }
 
 void Simulation::DrawBodies(const wgpu::RenderPassEncoder& pass, uint32_t voxInstances) {

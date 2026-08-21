@@ -158,6 +158,18 @@ class Physics {
   void RemoveBody(uint64_t handle);
   bool GetTransform(uint64_t handle, BodyTransform& out) const;
   bool IsActive(uint64_t handle) const;
+  // Local-space bounds of a body's actual COLLIDER, in voxels, relative to its
+  // own origin. For the collision-box debug overlay.
+  //
+  // Read off the Jolt shape rather than recomputed from the voxel list that
+  // built it, and that distinction is the whole value of this call: the
+  // collider is a greedy box merge of those voxels, capped at 1024 boxes and
+  // inflated by a small convex radius, so a reconstruction would show what we
+  // MEANT to build while this shows what is actually being collided against.
+  // When those two disagree, the disagreement is the bug you are looking for.
+  //
+  // False when the handle is dead or not in the simulation.
+  bool GetLocalBounds(uint64_t handle, Vec3& outMin, Vec3& outMax) const;
   // Radial impulse (explosions). center/radius in voxels, impulse in kg*m/s
   // at the center, falling off linearly to zero at radius.
   void ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels, float impulse);
