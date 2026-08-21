@@ -63,9 +63,10 @@ struct MobLimbDef {
   Vec3 edgeFrom{}, edgeTo{};   // base (ricasso) and tip, local
   float edgeHalfWidth = 0;     // carve radius at the blade, world voxels
   // Index into the shared micro-body model pool (sim/microbody.h), or -1 for
-  // the cube path. Only ever set for defs with scale > 1; a limb whose model
-  // failed to pack keeps -1 and simply does not render (cube instances are one
-  // WORLD voxel each, so they would draw it at scale times its real size).
+  // the cube path. Only ever set for defs with skinScale > 1; a limb whose
+  // model failed to pack keeps -1 and simply does not render (cube instances
+  // are one WORLD voxel each, so they would draw it at skinScale times its
+  // real size).
   int microModel = -1;
 };
 
@@ -101,21 +102,39 @@ struct MobDef {
   uint32_t bleedMat = 0;       // 0 = mob does not bleed
   float bleedPerDamage = 1.5f; // wound budget voxels per point of damage
   float speed = 4.0f;          // voxels/sec walk speed
-  // Micro-voxel authoring scale (docs/PLAN_voxel_editor.md §C): 1 = the legacy
-  // path (limb .vox coords ARE world voxels, drawn as instanced cubes), 2|4 =
-  // limb .vox coords are MICRO units, `scale` of them per world voxel. Physics
-  // builds those limbs at voxel pitch 1/scale and the renderer marches their
-  // brick instead of emitting a cube per voxel (sim/microbody.h).
+  // Micro-voxel AUTHORING scale (docs/PLAN_voxel_editor.md §C): 1 = the legacy
+  // path (limb .vox coords ARE world voxels, drawn as instanced cubes), 2|4|8 =
+  // limb .vox coords are MICRO units, `skinScale` of them per world voxel. The
+  // renderer marches the limb's brick instead of emitting a cube per voxel
+  // (sim/microbody.h).
   //
-  // NOTE FOR CALLERS: at scale>1 the limb voxel coordinates and sizes stored in
-  // MobSystem::Limb stay in MICRO units, but everything the rig and the
-  // simulation touch — anchors, rest transforms, restOffset, world positions —
-  // is divided into WORLD voxels at load. One conversion point, so the
-  // animation runtime and the gait code need no scale awareness at all.
-  uint32_t scale = 1;
-  // Prefab bounding box in WORLD voxels (= prefab.size / scale). Every piece of
-  // gameplay geometry — gait pivots, terrain anchors, ground probes — reads
-  // this rather than `prefab.size`, which stays in the .vox's own (micro) units.
+  // This is the ART's resolution and the units the .vox file is authored in.
+  // It is NOT the collider's resolution — see `physScale` below. The two were
+  // one field until the skin/collider split, and separating them is what lets
+  // an 8x limb exist at all: DebrisVoxel is int8, so a single lattice capped a
+  // limb at 120/scale world voxels, and mina is 17 world voxels tall.
+  //
+  // NOTE FOR CALLERS: at skinScale>1 the limb voxel coordinates and sizes
+  // stored in MobSystem::Limb stay in COLLIDER (physScale) units, but
+  // everything the rig and the simulation touch — anchors, rest transforms,
+  // restOffset, world positions — is divided into WORLD voxels at load. One
+  // conversion point, so the animation runtime and the gait code need no scale
+  // awareness at all.
+  uint32_t skinScale = 1;
+  // Collider resolution, in collider voxels per world voxel. DERIVED at load,
+  // never authored: the finest of {8,4,2,1} whose limb extents still fit the
+  // DebrisVoxel int8 bound of +-120. Always <= skinScale.
+  //
+  // Engine-picked because the bound it has to satisfy is a property of the art
+  // (how big the limbs are), not a choice an author can make usefully. That
+  // makes collider resolution an EMERGENT property, which is a real downside —
+  // it silently changes mass, contacts and ground probes — so LoadMobDefs logs
+  // the value it picked for every def rather than letting it move unnoticed.
+  uint32_t physScale = 1;
+  // Prefab bounding box in WORLD voxels (= prefab.size / skinScale). Every
+  // piece of gameplay geometry — gait pivots, terrain anchors, ground probes —
+  // reads this rather than `prefab.size`, which stays in the .vox's own (micro)
+  // units.
   Vec3 worldSize{};
   // Sound sets for this creature, keyed by SLOT ("hurt", "death", "sever",
   // ...), from the sidecar's "sounds" object. Values name a set relative to
@@ -160,7 +179,7 @@ struct MobDef {
 };
 
 // Loads assets/mobs/*.vox + matching .json sidecars. Appends problems to log;
-// defs that fail validation are skipped. Limb models of defs with "scale" > 1
+// defs that fail validation are skipped. Limb models of defs with "skinScale" > 1
 // are packed into `micro` (which the caller uploads); `micro` is CLEARED first,
 // so a hot reload rebuilds the whole pool rather than growing it forever.
 bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
@@ -312,18 +331,28 @@ class MobSystem {
     uint64_t body = 0;         // 0 = severed or never spawned
     uint64_t joint = 0;        // to parent
     float hp = 0;
-    // Voxels + size stay in the DEF'S AUTHORING UNITS: micro voxels at
-    // scale>1 (that is what both the collider's 1/scale pitch and the
-    // renderer's brick march expect). Everything positional below is in
-    // WORLD voxels.
+    // The COLLIDER lattice, in `MobDef::physScale` units per world voxel —
+    // int8, which is the bound physScale is chosen to satisfy. `size` is in the
+    // same units. Everything positional below is in WORLD voxels.
     std::vector<DebrisVoxel> voxels;
     IVec3 size{};
+    // The SKIN lattice, in `MobDef::skinScale` units per world voxel. int16,
+    // and the source the brick is packed from — so this is what the player
+    // actually sees, and what a carve must edit.
+    //
+    // Empty when skinScale == physScale: the two lattices coincide and
+    // `voxels` is the whole story, exactly as before the split. Every existing
+    // def stays on that path and pays nothing.
+    std::vector<PrefabVoxel> skinVoxels;
+    bool HasFineSkin() const { return !skinVoxels.empty(); }
     int microModel = -1;       // copy of MobLimbDef::microModel, -1 = cube path
     // What this limb's body needs to keep rendering as microvoxels once it is
     // no longer a limb — handed to DebrisSystem::AdoptBody on sever/death.
-    MicroBodyRef MicroRef(uint32_t defScale) const {
+    // Takes the SKIN scale: MicroBodyRef is a render description, and the brick
+    // it points at was packed on the skin lattice.
+    MicroBodyRef MicroRef(uint32_t skinScale) const {
       return microModel < 0 ? MicroBodyRef{}
-                            : MicroBodyRef{(uint32_t)microModel, defScale};
+                            : MicroBodyRef{(uint32_t)microModel, skinScale};
     }
     Vec3 restOffset{};         // limb min corner from mob min corner (rest)
     Vec3 anchorRoot{};         // joint anchor from mob min corner (rest)
@@ -440,20 +469,31 @@ class MobSystem {
   void DetachLimb(Mob& mob, int limbIndex, bool adopt);
 
   // ---- carving internals -----------------------------------------------------
-  // Shared carve core, the live-limb twin of DebrisSystem::DamageBody: erase the
-  // voxels `keep` rejects, re-skin, rebuild the collider, and hand any piece the
-  // carve disconnected to DebrisSystem as ordinary debris. Returns false when
-  // the limb was destroyed outright (severed or the mob died), in which case
-  // `mob` may no longer be alive and the caller must not touch the limb again.
+  // A carve volume, expressed once and evaluated per lattice. The factory is
+  // handed a lattice scale (units per world voxel) and returns the keep-test in
+  // THAT lattice's coordinates — so a limb with a fine skin carves the same
+  // world-space volume out of both its skin and its collider without the
+  // caller describing the shape twice. Mirrors DebrisSystem::CarveFactory.
+  using LimbCarveKeep = std::function<bool(int, int, int)>;
+  using LimbCarveFactory = std::function<LimbCarveKeep(float)>;
+  // Shared carve core, the live-limb twin of DebrisSystem::DamageBody: erase
+  // the voxels the predicate rejects, re-skin, rebuild the collider, and hand
+  // any piece the carve disconnected to DebrisSystem as ordinary debris.
+  // Returns false when the limb was destroyed outright (severed or the mob
+  // died), in which case `mob` may no longer be alive and the caller must not
+  // touch the limb again.
   bool CarveLimb(Mob& mob, int limbIndex, World& world,
                  std::vector<ParticleSpawn>& spawns, bool eject,
-                 const std::function<bool(const DebrisVoxel&)>& keep);
+                 const LimbCarveFactory& carveAt);
   // Re-skin a carved limb: clone-on-first-carve, rewrite the brick from the
   // surviving voxels, shift the transform so the art stays on the collider, and
   // shift restOffset/anchorLimb with it so the RIG follows too — the difference
   // from the debris version, whose bodies answer to nobody. False = pool full
   // (limb keeps a stale skin but is really carved).
-  bool ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t defScale);
+  // Re-pack a carved limb's brick. Takes BOTH lattices: the brick and the
+  // origin shift are skin-side, the re-derived collider is phys-side.
+  bool ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t skinScale,
+                       uint32_t physScale);
   // Rebuild a carved limb's Jolt body and re-create its joint to its parent.
   // A collider rebuild REPLACES the handle, so the joint must be rebuilt or the
   // limb falls off; children's joints anchor to this body and are rebuilt too.
@@ -465,10 +505,10 @@ class MobSystem {
   // Hand one disconnected chunk of a limb to DebrisSystem as a free body, with
   // its own COW brick. Falls back to particles when a body or brick can't be
   // made, exactly as ShatterBody does.
-  void EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
+  void EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t physScale,
                           std::vector<DebrisVoxel> part, World& world,
                           std::vector<ParticleSpawn>& spawns);
-  void LimbVoxelsToParticles(const Limb& limb, uint32_t defScale,
+  void LimbVoxelsToParticles(const Limb& limb, uint32_t physScale,
                              const std::vector<DebrisVoxel>& voxels, World& world,
                              std::vector<ParticleSpawn>& spawns) const;
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY) const;

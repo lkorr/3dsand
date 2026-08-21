@@ -296,12 +296,18 @@ class PlayerAvatar {
     uint64_t body = 0;
     uint64_t joint = 0;
     float hp = 0;
-    std::vector<DebrisVoxel> voxels;   // authoring (micro) units
+    std::vector<DebrisVoxel> voxels;   // COLLIDER units (MobDef::physScale)
+    // The SKIN lattice (MobDef::skinScale), int16 — the brick source, and what
+    // travels to DebrisSystem on sever so a severed part keeps its detail.
+    // Empty when the two lattices coincide (mob.h Limb::skinVoxels).
+    std::vector<PrefabVoxel> skinVoxels;
+    bool HasFineSkin() const { return !skinVoxels.empty(); }
     IVec3 size{};
     int microModel = -1;
-    MicroBodyRef MicroRef(uint32_t s) const {
+    // Takes the SKIN scale: a MicroBodyRef is a render description.
+    MicroBodyRef MicroRef(uint32_t skinScale) const {
       return microModel < 0 ? MicroBodyRef{}
-                            : MicroBodyRef{(uint32_t)microModel, s};
+                            : MicroBodyRef{(uint32_t)microModel, skinScale};
     }
     Vec3 restOffset{};
     Vec3 anchorRoot{};

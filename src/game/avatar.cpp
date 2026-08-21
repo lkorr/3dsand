@@ -1,5 +1,7 @@
 #include "game/avatar.h"
 
+#include "phys/lattice.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -388,7 +390,12 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   heldPart_.clear();
 
   parts.assign(def.limbs.size(), Part{});
-  const float inv = 1.0f / (float)def.scale;
+  // SKIN -> WORLD for positions authored in .vox units; the collider is built
+  // at 1/physScale because that is the lattice p.voxels live on (mob.h).
+  const float inv = 1.0f / (float)def.skinScale;
+  const float physInv = 1.0f / (float)std::max(1u, def.physScale);
+  const uint32_t ratio =
+      std::max(1u, def.skinScale / std::max(1u, def.physScale));
 
   for (size_t i = 0; i < def.limbs.size(); i++) {
     const MobLimbDef& ld = def.limbs[i];
@@ -397,21 +404,37 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
     const PrefabModel& model = def.prefab.models[mi];
     Part& p = parts[i];
     p.hp = ld.hp;
-    p.size = model.size;
     p.microModel = ld.microModel;
     p.restOffset = Vec3{(float)model.offset.x, (float)model.offset.y,
                         (float)model.offset.z} * inv;
-    p.voxels.reserve(model.voxels.size());
-    for (const PrefabVoxel& v : model.voxels) {
-      uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-      p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
-                          (uint16_t)(v.material | (variant << 12))});
+    if (ratio > 1) {
+      // Fine skin: the art is the skin lattice and the collider is DERIVED
+      // from it by majority-fill, exactly as MobSystem::Spawn does.
+      p.skinVoxels.reserve(model.voxels.size());
+      for (const PrefabVoxel& v : model.voxels) {
+        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+        p.skinVoxels.push_back(
+            {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12))});
+      }
+      bool overflow = false;
+      p.voxels = DownsampleSkin(p.skinVoxels, ratio, &overflow);
+      p.size = IVec3{(model.size.x + (int)ratio - 1) / (int)ratio,
+                     (model.size.y + (int)ratio - 1) / (int)ratio,
+                     (model.size.z + (int)ratio - 1) / (int)ratio};
+    } else {
+      p.size = model.size;
+      p.voxels.reserve(model.voxels.size());
+      for (const PrefabVoxel& v : model.voxels) {
+        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+        p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
+                            (uint16_t)(v.material | (variant << 12))});
+      }
     }
     Vec3 o = origin_ + p.restOffset;
     BodyTransform bxf{};
     bxf.pos = o;
     bxf.quat[3] = 1;
-    p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, densityOf_, true, inv);
+    p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, densityOf_, true, physInv);
     if (p.body == 0) {
       for (Part& q : parts)
         if (q.body) phys_->RemoveBody(q.body);
@@ -1634,7 +1657,9 @@ void PlayerAvatar::DetachPart(int index, bool adopt) {
   if (adopt) {
     // Hand the micro description over with the body — that is what keeps a
     // severed microvoxel limb detailed as ordinary debris.
-    debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.scale));
+    debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
+                       def.physScale, std::move(p.skinVoxels));
+    p.skinVoxels.clear();
     p.holdBody = p.body;
     p.holdSeconds = kSeverHoldSeconds;
   } else if (phys_) {
@@ -1654,7 +1679,9 @@ void PlayerAvatar::Die() {
   for (size_t i = 0; i < parts.size(); i++) {
     Part& p = parts[i];
     if (!p.body) continue;
-    debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.scale));
+    debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
+                       def.physScale, std::move(p.skinVoxels));
+    p.skinVoxels.clear();
     phys_->SetBodyKinematic(p.body, false);
     phys_->ClearCollisionGroup(p.body);
     // The corpse is debris now, not the player's body — it collides normally.

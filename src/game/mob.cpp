@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "phys/lattice.h"
 #include "sim/tuning.h"
 
 using nlohmann::json;
@@ -226,13 +227,22 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         if (name.is_string() && !name.get<std::string>().empty())
           def.sounds[slot] = name.get<std::string>();
 
-    // Micro-voxel authoring scale (PLAN §C). Anything other than 1/2/4 is a
+    // Micro-voxel AUTHORING scale (PLAN §C). Anything other than 1/2/4/8 is a
     // typo, not a feature: fall back to 1 loudly rather than half-applying it.
-    def.scale = j.value("scale", 1u);
-    if (def.scale != 1 && def.scale != 2 && def.scale != 4) {
-      log += jp + ": scale must be 1, 2 or 4 (got " +
-             std::to_string(def.scale) + ") — using 1\n";
-      def.scale = 1;
+    //
+    // "skinScale" is the current name. "scale" is kept as an alias meaning
+    // BOTH lattices are equal, which is what it meant before the split — that
+    // is what keeps every already-authored sidecar loading unchanged. An asset
+    // that says "scale" gets the old single-lattice behaviour exactly; only an
+    // asset that says "skinScale" opts into a derived coarser collider.
+    const bool authoredSkin = j.contains("skinScale");
+    def.skinScale = j.value("skinScale", j.value("scale", 1u));
+    if (def.skinScale != 1 && def.skinScale != 2 && def.skinScale != 4 &&
+        def.skinScale != 8) {
+      log += jp + ": " + (authoredSkin ? "skinScale" : "scale") +
+             " must be 1, 2, 4 or 8 (got " + std::to_string(def.skinScale) +
+             ") — using 1\n";
+      def.skinScale = 1;
     }
 
     bool ok = true;
@@ -308,24 +318,63 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         ok = false;
       }
     }
-    // DebrisVoxel is int8: each LIMB must fit in the byte range (§2.1). At
-    // scale > 1 the limb's voxels are stored in MICRO units, so the bound
-    // applies to the micro box — a scale-4 limb may only be 30 world voxels
-    // long. Say so, because "exceeds 120 voxels" on a limb the author drew 24
-    // world-voxels tall is otherwise baffling.
-    for (const PrefabModel& m : def.prefab.models)
-      if (m.size.x > 120 || m.size.y > 120 || m.size.z > 120) {
-        log += def.name + ": limb model \"" + m.name + "\" is " +
-               std::to_string(m.size.x) + "x" + std::to_string(m.size.y) + "x" +
-               std::to_string(m.size.z) +
-               (def.scale > 1 ? " MICRO voxels; the DebrisVoxel int8 bound is "
-                                "120 micro voxels per axis (= " +
-                                    std::to_string(120 / def.scale) +
-                                    " world voxels at scale " +
-                                    std::to_string(def.scale) + ")\n"
-                              : " voxels, exceeding the int8 bound of 120\n");
-        ok = false;
+    // Derive the COLLIDER resolution from the art (mob.h MobDef::physScale).
+    //
+    // DebrisVoxel is int8, so a limb's collider box must fit ±120 on every
+    // axis. The skin has no such bound (PrefabVoxel is int16), which is the
+    // whole point of the split: pick the FINEST collider that fits and let the
+    // skin stay as fine as it was authored. At skinScale 8 a 136-micro-tall
+    // rig needs physScale 4 (34 collider voxels) — 8 would need 136 and blow
+    // the bound.
+    //
+    // Measured on the largest limb, not the whole rig: each limb is its own
+    // body with its own origin, so the bound applies per limb.
+    {
+      int32_t maxExtent = 0;
+      for (const PrefabModel& m : def.prefab.models)
+        maxExtent = std::max(
+            {maxExtent, m.size.x, m.size.y, m.size.z});
+      def.physScale = 1;
+      for (uint32_t cand : {8u, 4u, 2u, 1u}) {
+        if (cand > def.skinScale) continue;  // never finer than the art
+        // Extents are in skin units; a collider voxel spans skinScale/cand of
+        // them, so the collider box is maxExtent * cand / skinScale.
+        if ((int64_t)maxExtent * cand / def.skinScale <= 120) {
+          def.physScale = cand;
+          break;
+        }
       }
+      // Even physScale 1 can overflow if a limb is over 120 WORLD voxels —
+      // that is a genuine authoring error, not something to derive around.
+      if ((int64_t)maxExtent * def.physScale / def.skinScale > 120) {
+        for (const PrefabModel& m : def.prefab.models)
+          if (m.size.x > 120 || m.size.y > 120 || m.size.z > 120) {
+            log += def.name + ": limb model \"" + m.name + "\" is " +
+                   std::to_string(m.size.x) + "x" + std::to_string(m.size.y) +
+                   "x" + std::to_string(m.size.z) +
+                   (def.skinScale > 1
+                        ? " SKIN voxels (= " +
+                              std::to_string(m.size.y / def.skinScale) +
+                              " world voxels tall at skinScale " +
+                              std::to_string(def.skinScale) +
+                              "); even a 1:1 collider exceeds the DebrisVoxel "
+                              "int8 bound of 120 world voxels\n"
+                        : " voxels, exceeding the int8 bound of 120\n");
+            ok = false;
+          }
+      }
+      // Log the pick ALWAYS, not only when it is surprising. Collider
+      // resolution is emergent from art size, and an emergent value that
+      // changes mass, contacts and ground probes must never move silently —
+      // this line is the record that it did.
+      if (ok && def.skinScale > 1)
+        log += def.name + ": skinScale " + std::to_string(def.skinScale) +
+               ", derived physScale " + std::to_string(def.physScale) +
+               " (largest limb " + std::to_string(maxExtent) +
+               " skin voxels -> " +
+               std::to_string(maxExtent * def.physScale / def.skinScale) +
+               " collider voxels, bound 120)\n";
+    }
 
     // ---- rig for the animation runtime (all of this is optional data) ----
     if (ok && !TopoSortLimbs(def.limbs, def.rootLimb)) {
@@ -365,12 +414,18 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
           anchor = Vec3{(float)m.offset.x + m.size.x * 0.5f, (float)m.offset.y,
                         (float)m.offset.z + m.size.z * 0.5f};
         }
-        // MICRO -> WORLD. Anchors are authored in .vox coordinates, which at
-        // scale>1 are micro units; the rig, the gait and the physics all work
-        // in world voxels. Converting HERE, once, is what keeps every
-        // downstream stage (AnimFlatten, IK, GroundHeightAt, the joint
-        // anchors in Spawn) completely scale-unaware.
-        const float inv = 1.0f / (float)def.scale;
+        // SKIN -> WORLD. Anchors are authored in .vox coordinates, which at
+        // skinScale>1 are SKIN units — this is the ART's lattice, so it is
+        // skinScale here and NOT physScale. (The collider frame conversion is
+        // the one in CarveLimb, which multiplies by physScale; confusing the
+        // two shifts every joint in the rig without changing anything visible
+        // about the art, which is why they are commented at both ends.)
+        //
+        // The rig, the gait and the physics all work in world voxels.
+        // Converting HERE, once, is what keeps every downstream stage
+        // (AnimFlatten, IK, GroundHeightAt, the joint anchors in Spawn)
+        // completely scale-unaware.
+        const float inv = 1.0f / (float)def.skinScale;
         sk.parts[i].anchorLocal = anchor * inv;
         // The cutting edge rides the same conversion, for the same reason: it
         // is rig geometry, and every consumer downstream works in world
@@ -400,10 +455,10 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       // guards against is an item that renders at the origin instead of in the
       // hand.
       //
-      // Offsets take the SAME micro -> world conversion the anchors just did,
+      // Offsets take the SAME skin -> world conversion the anchors just did,
       // and for the same reason: everything downstream works in world voxels.
       {
-        const float inv = 1.0f / (float)def.scale;
+        const float inv = 1.0f / (float)def.skinScale;
         for (const auto& s : j.value("sockets", json::array())) {
           MobSocketDef sd;
           sd.name = s.value("name", "");
@@ -655,19 +710,23 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                      (float)(hi.z - lo.z)}
               : Vec3{(float)def.prefab.size.x, (float)def.prefab.size.y,
                      (float)def.prefab.size.z};
-      def.worldSize = box * (1.0f / (float)def.scale);
+      // The prefab box is measured in the .vox's own units, which are SKIN
+      // units — so it divides by skinScale to reach world voxels.
+      def.worldSize = box * (1.0f / (float)def.skinScale);
     }
 
     // ---- micro brick upload (PLAN §C, sim/microbody.h) ----
     // Packed once per DEF, shared by every instance: a limb's voxels never
     // change after load in v1, so there is no per-instance storage at all.
     // Done last so a def that failed validation never enters the pool.
-    if (ok && def.scale > 1) {
+    if (ok && def.skinScale > 1) {
       for (MobLimbDef& ld : def.limbs) {
         int mi = FindModel(def.prefab, ld.name);
         if (mi < 0) continue;
         const PrefabModel& m = def.prefab.models[mi];
-        ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.scale,
+        // The one PURE RENDER read in the loader: the brick is the art, so it
+        // is packed at the authored skin resolution and never at physScale.
+        ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.skinScale,
                                       def.name + "/" + ld.name, log);
         if (ld.microModel < 0)
           log += def.name + ": limb \"" + ld.name +
@@ -796,11 +855,16 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   mob.origin = Vec3{(float)atVoxel.x, (float)atVoxel.y, (float)atVoxel.z};
   mob.limbs.resize(def.limbs.size());
 
-  // MICRO -> WORLD. limb.voxels and limb.size stay in the def's authoring units
-  // (micro voxels at scale>1) because that is what both the collider and the
-  // renderer's brick march want; every POSITION derived from them is divided
-  // into world voxels here.
-  const float inv = 1.0f / (float)def.scale;
+  // SKIN -> WORLD. The .vox model is authored on the skin lattice, so every
+  // POSITION derived from it divides by skinScale to reach world voxels.
+  const float inv = 1.0f / (float)def.skinScale;
+  // COLLIDER pitch: limb.voxels live on the physScale lattice, so the Jolt
+  // body is built at 1/physScale. These two differ whenever the collider was
+  // derived coarser than the art, and using one where the other belongs is the
+  // silent-joint-shift bug the split exists to make impossible.
+  const float physInv = 1.0f / (float)std::max(1u, def.physScale);
+  const uint32_t ratio =
+      std::max(1u, def.skinScale / std::max(1u, def.physScale));
 
   for (size_t i = 0; i < def.limbs.size(); i++) {
     const MobLimbDef& ld = def.limbs[i];
@@ -808,29 +872,58 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
     const PrefabModel& model = def.prefab.models[mi];
     Limb& limb = mob.limbs[i];
     limb.hp = ld.hp;
-    limb.size = model.size;
     limb.microModel = ld.microModel;
     limb.restOffset = Vec3{(float)model.offset.x, (float)model.offset.y,
                            (float)model.offset.z} * inv;
-    limb.voxels.reserve(model.voxels.size());
-    for (const PrefabVoxel& v : model.voxels) {
-      uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-      limb.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
-                             (uint16_t)(v.material | (variant << 12))});
+    if (ratio > 1) {
+      // Fine skin: the authored art IS the skin lattice, and the collider is
+      // DERIVED from it by the same majority-fill the debris path uses. Data
+      // flows skin -> collider and never back (phys/lattice.h), so the two can
+      // never drift; a carve edits the skin and re-derives.
+      limb.skinVoxels.reserve(model.voxels.size());
+      for (const PrefabVoxel& v : model.voxels) {
+        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+        limb.skinVoxels.push_back(
+            {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12))});
+      }
+      bool overflow = false;
+      limb.voxels = DownsampleSkin(limb.skinVoxels, ratio, &overflow);
+      if (overflow)
+        std::printf(
+            "mob: limb \"%s\" of %s exceeded the collider's +-127 bound; part "
+            "of it was dropped from the collider (physScale too fine)\n",
+            ld.name.c_str(), def.name.c_str());
+      // Collider units, so the body's box matches the lattice it is built on.
+      limb.size = IVec3{(model.size.x + (int)ratio - 1) / (int)ratio,
+                        (model.size.y + (int)ratio - 1) / (int)ratio,
+                        (model.size.z + (int)ratio - 1) / (int)ratio};
+    } else {
+      // The two lattices coincide: `voxels` is the whole story and skinVoxels
+      // stays empty, exactly the pre-split path. Every existing def is here.
+      limb.size = model.size;
+      limb.voxels.reserve(model.voxels.size());
+      for (const PrefabVoxel& v : model.voxels) {
+        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+        limb.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
+                               (uint16_t)(v.material | (variant << 12))});
+      }
     }
     // Authored volume, so carve damage can be expressed as a FRACTION of the
     // limb — the same wound should read the same on a scale-1 and a scale-4 rig.
-    limb.voxelsAtSpawn = (uint32_t)limb.voxels.size();
+    // Counted on the lattice a carve actually removes from, so the fraction is
+    // measured against the same denominator that shrinks.
+    limb.voxelsAtSpawn = (uint32_t)(limb.HasFineSkin() ? limb.skinVoxels.size()
+                                                       : limb.voxels.size());
     // The body origin is the limb's min corner in WORLD voxels; the collider
-    // is built at pitch 1/scale so its micro-unit local coordinates land in the
-    // right physical place. Not an integer cell any more at scale>1, which is
-    // fine — a Jolt body has never been lattice-aligned.
+    // is built at pitch 1/physScale so its collider-unit local coordinates land
+    // in the right physical place. Not an integer cell any more at scale>1,
+    // which is fine — a Jolt body has never been lattice-aligned.
     Vec3 origin = mob.origin + limb.restOffset;
     BodyTransform bxf{};
     bxf.pos = origin;
     bxf.quat[3] = 1;
     limb.body = phys_->CreateDebrisBodyXf(limb.voxels, bxf, densityOf_,
-                                          true /*allowKinematic*/, inv);
+                                          true /*allowKinematic*/, physInv);
     if (limb.body == 0) {
       for (Limb& l : mob.limbs)
         if (l.body) phys_->RemoveBody(l.body);
@@ -1914,17 +2007,17 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
 // severed behave identically — which is the property that makes "cut the arm
 // off, then keep cutting the arm" work without a special case.
 
-void MobSystem::LimbVoxelsToParticles(const Limb& limb, uint32_t defScale,
+void MobSystem::LimbVoxelsToParticles(const Limb& limb, uint32_t physScale,
                                       const std::vector<DebrisVoxel>& voxels,
                                       World& world,
                                       std::vector<ParticleSpawn>& spawns) const {
-  // Mirrors DebrisSystem::VoxelsToParticles: a micro limb's voxels are 1/scale
-  // of a world voxel, so one particle per voxel would emit `scale^3` times the
-  // matter the limb actually lost. Sub-sampling on the micro lattice conserves
-  // the visible volume — the grid has no sub-voxel resolution to receive the
-  // detail anyway.
-  const float inv = 1.0f / (float)std::max(1u, defScale);
-  const int step = (int)std::max(1u, defScale);
+  // Mirrors DebrisSystem::VoxelsToParticles: a micro limb's COLLIDER voxels are
+  // 1/physScale of a world voxel, so one particle per voxel would emit
+  // `physScale^3` times the matter the limb actually lost. Sub-sampling on that
+  // lattice conserves the visible volume — the grid has no sub-voxel resolution
+  // to receive the detail anyway.
+  const float inv = 1.0f / (float)std::max(1u, physScale);
+  const int step = (int)std::max(1u, physScale);
   Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
   for (const DebrisVoxel& v : voxels) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) return;  // ring full: lost
@@ -1966,17 +2059,26 @@ void MobSystem::ReleaseLimbMicro(Limb& limb) {
   limb.carved = false;
 }
 
-bool MobSystem::ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t defScale) {
+bool MobSystem::ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t skinScale,
+                                uint32_t physScale) {
   if (limb.microModel < 0 || !microSet_) return false;
   int own = MicroBodyOwn(*microSet_, (uint32_t)limb.microModel);
   if (own < 0) return false;  // pool full: keep the stale skin, stay carved
   limb.microModel = own;
   limb.carved = true;
+  // The brick is packed from the SKIN when there is one, and from the collider
+  // voxels when the two lattices coincide — the same rule debris.cpp
+  // ReskinMicro follows, because whatever this reads is what the player sees.
   std::vector<PrefabVoxel> mv;
-  mv.reserve(limb.voxels.size());
-  for (const DebrisVoxel& v : limb.voxels)
-    mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                  (uint16_t)(v.payload & 0xFFF)});
+  const bool fine = limb.HasFineSkin();
+  if (fine) {
+    mv = limb.skinVoxels;
+  } else {
+    mv.reserve(limb.voxels.size());
+    for (const DebrisVoxel& v : limb.voxels)
+      mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                    (uint16_t)(v.payload & 0xFFF)});
+  }
   IVec3 shift{};
   if (!MicroBodyEdit(*microSet_, (uint32_t)limb.microModel, mv, shift))
     return false;
@@ -1988,18 +2090,44 @@ bool MobSystem::ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t defScale) {
     // Move only the transform and the next frame's pose puts it straight back
     // where it was, undoing the shift and sliding the art off the collider —
     // the wound would appear to crawl along the limb as it was carved.
-    const float inv = 1.0f / (float)std::max(1u, defScale);
+    //
+    // The shift is in SKIN units (that is the lattice MicroBodyEdit just
+    // rebased), so it divides by skinScale to reach world voxels — NOT by
+    // physScale, even though limb.voxels are physScale units.
+    const float inv = 1.0f / (float)std::max(1u, skinScale);
     Vec3 d{(float)shift.x * inv, (float)shift.y * inv, (float)shift.z * inv};
+    // The transform is read from `limb.xf` as the animation left it, never
+    // re-read from Jolt here: re-reading a kinematic limb's transform mid-carve
+    // picks up a pose the rest of this carve was not computed against, which
+    // slides the wound along the limb (gotcha-live-limb-carve-pose).
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
     limb.xf.pos += Rotate(q, d);
     limb.restOffset += d;
     // The joint anchors are expressed from the limb origin, so they move the
     // opposite way to stay on the same physical point of the creature.
     limb.anchorLimb = limb.anchorLimb - d;
-    for (DebrisVoxel& v : limb.voxels) {
-      v.x = (int8_t)(v.x - shift.x);
-      v.y = (int8_t)(v.y - shift.y);
-      v.z = (int8_t)(v.z - shift.z);
+    if (fine) {
+      // A skin-unit shift is not generally a whole number of collider voxels
+      // (at skin 8 / collider 2, a shift of 3 is 0.75 of one). So the skin
+      // rebases exactly and the collider is RE-DERIVED from it rather than
+      // shifted to match — the derived lattice inherits the brick's origin
+      // instead of negotiating for it, which is what makes the two frames
+      // agree by construction rather than by vigilance.
+      for (PrefabVoxel& sv : limb.skinVoxels) {
+        sv.x = (int16_t)(sv.x - shift.x);
+        sv.y = (int16_t)(sv.y - shift.y);
+        sv.z = (int16_t)(sv.z - shift.z);
+      }
+      bool overflow = false;
+      limb.voxels = DownsampleSkin(
+          limb.skinVoxels,
+          std::max(1u, skinScale / std::max(1u, physScale)), &overflow);
+    } else {
+      for (DebrisVoxel& v : limb.voxels) {
+        v.x = (int8_t)(v.x - shift.x);
+        v.y = (int8_t)(v.y - shift.y);
+        v.z = (int8_t)(v.z - shift.z);
+      }
     }
     limb.woundLocal = limb.woundLocal - d;
     limb.gushLocal = limb.gushLocal - d;
@@ -2011,7 +2139,9 @@ bool MobSystem::RebuildLimbBody(Mob& mob, int limbIndex) {
   Limb& limb = mob.limbs[limbIndex];
   if (!limb.body || limb.voxels.empty()) return false;
   const MobDef& def = defs_[mob.defIndex];
-  const float pitch = 1.0f / (float)std::max(1u, def.scale);
+  // COLLIDER pitch: limb.voxels are physScale units, so the Jolt body is built
+  // at 1/physScale.
+  const float pitch = 1.0f / (float)std::max(1u, def.physScale);
   phys_->GetTransform(limb.body, limb.xf);
   uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, densityOf_,
                                           true /*allowKinematic*/, pitch);
@@ -2072,7 +2202,7 @@ bool MobSystem::RebuildLimbBody(Mob& mob, int limbIndex) {
   return true;
 }
 
-void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
+void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t physScale,
                                    std::vector<DebrisVoxel> part, World& world,
                                    std::vector<ParticleSpawn>& spawns) {
   // Rebase the chunk to its own min corner and move its pose to match, the same
@@ -2084,7 +2214,7 @@ void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
     mn.z = std::min<int>(mn.z, v.z);
   }
   BodyTransform xf = src.xf;
-  const float inv = 1.0f / (float)std::max(1u, defScale);
+  const float inv = 1.0f / (float)std::max(1u, physScale);
   Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
   xf.pos += Rotate(q, Vec3{(float)mn.x * inv, (float)mn.y * inv,
                            (float)mn.z * inv});
@@ -2112,22 +2242,22 @@ void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
       dims.z = std::max<int>(dims.z, v.z + 1);
     }
     std::string log;
-    int m = MicroBodyPack(*microSet_, mv, dims, defScale, "carve", log);
+    int m = MicroBodyPack(*microSet_, mv, dims, physScale, "carve", log);
     if (m < 0) {
-      LimbVoxelsToParticles(src, defScale, part, world, spawns);
+      LimbVoxelsToParticles(src, physScale, part, world, spawns);
       return;
     }
     // Packed models are SHARED by default; this one belongs to exactly one body
     // and must be freeable with it, or every gobbet leaks pool words.
     if (m < (int)microSet_->owned.size()) microSet_->owned[m] = 1;
-    micro = MicroBodyRef{(uint32_t)m, defScale};
+    micro = MicroBodyRef{(uint32_t)m, physScale};
   }
 
-  const float pitch = 1.0f / (float)std::max(1u, defScale);
+  const float pitch = 1.0f / (float)std::max(1u, physScale);
   uint64_t h = phys_->CreateDebrisBodyXf(part, xf, densityOf_, false, pitch);
   if (h == 0) {
     if (micro.Valid()) MicroBodyFree(*microSet_, micro.model);
-    LimbVoxelsToParticles(src, defScale, part, world, spawns);
+    LimbVoxelsToParticles(src, physScale, part, world, spawns);
     return;
   }
   // Push it off the wound so it visibly leaves the body rather than resting in
@@ -2141,26 +2271,67 @@ void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t defScale,
 
 bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
                           std::vector<ParticleSpawn>& spawns, bool eject,
-                          const std::function<bool(const DebrisVoxel&)>& keep) {
+                          const LimbCarveFactory& carveAt) {
   Limb& limb = mob.limbs[limbIndex];
   if (!limb.body || limb.voxels.empty()) return true;
   const MobDef& def = defs_[mob.defIndex];
-  // NOTE: limb.xf is deliberately NOT refreshed from Jolt here. `keep` was
-  // built against the pose the CALLER measured, and a live limb is kinematic —
-  // the animation pipeline re-poses it every tick — so re-reading the transform
-  // now would test the voxels against a pose the predicate never saw and carve
-  // the wrong cells (or, as the pose drifts, none at all).
+  // NOTE: limb.xf is deliberately NOT refreshed from Jolt here. the predicate
+  // was built against the pose the CALLER measured, and a live limb is
+  // kinematic — the animation pipeline re-poses it every tick — so re-reading
+  // the transform now would test the voxels against a pose the predicate never
+  // saw and carve the wrong cells (or, as the pose drifts, none at all).
+
+  const bool fine = limb.HasFineSkin();
+  // ONE world-space volume, re-expressed per lattice. The collider predicate
+  // always exists; the skin one only when the skin is a separate lattice.
+  const auto keep = carveAt((float)std::max(1u, def.physScale));
 
   std::vector<DebrisVoxel> removed;
   for (const DebrisVoxel& v : limb.voxels)
-    if (!keep(v)) removed.push_back(v);
-  if (removed.empty()) return true;  // nothing in range
+    if (!keep(v.x, v.y, v.z)) removed.push_back(v);
+  // On a fine skin the COLLIDER may be too coarse to notice a small carve that
+  // the skin does register. Deciding "nothing in range" on the collider would
+  // silently make fine tools no-ops on exactly the detailed art the skin exists
+  // to serve, so the skin gets its own say.
+  bool skinRemoved = false;
+  // Accumulated DURING the erase: once a voxel is gone the predicate can no
+  // longer be asked where it was.
+  Vec3 skinLostSum{};
+  size_t skinLostN = 0;
+  if (fine) {
+    const auto keepSkin = carveAt((float)std::max(1u, def.skinScale));
+    const size_t before = limb.skinVoxels.size();
+    limb.skinVoxels.erase(
+        std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
+                       [&](const PrefabVoxel& v) {
+                         if (keepSkin(v.x, v.y, v.z)) return false;
+                         skinLostSum +=
+                             Vec3{(float)v.x, (float)v.y, (float)v.z};
+                         skinLostN++;
+                         return true;
+                       }),
+        limb.skinVoxels.end());
+    skinRemoved = limb.skinVoxels.size() != before;
+  }
+  if (removed.empty() && !skinRemoved) return true;  // nothing in range
 
-  if (eject) LimbVoxelsToParticles(limb, def.scale, removed, world, spawns);
-  limb.voxels.erase(
-      std::remove_if(limb.voxels.begin(), limb.voxels.end(),
-                     [&](const DebrisVoxel& v) { return !keep(v); }),
-      limb.voxels.end());
+  if (eject) LimbVoxelsToParticles(limb, def.physScale, removed, world, spawns);
+  if (fine) {
+    // Skin is authoritative: re-derive the collider from what the carve left
+    // rather than carving the collider in parallel. Disagreement between the
+    // two lattices is then unrepresentable (phys/lattice.h).
+    bool overflow = false;
+    limb.voxels = DownsampleSkin(
+        limb.skinVoxels,
+        std::max(1u, def.skinScale / std::max(1u, def.physScale)), &overflow);
+  } else {
+    limb.voxels.erase(
+        std::remove_if(limb.voxels.begin(), limb.voxels.end(),
+                       [&](const DebrisVoxel& v) {
+                         return !keep(v.x, v.y, v.z);
+                       }),
+        limb.voxels.end());
+  }
   instancesDirty_ = true;
 
   // A carved limb must stop flipbooking: a frame swap re-points rendering at an
@@ -2171,16 +2342,35 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
   // wound is placed at the carve so the existing bleed machinery sprays from
   // the right spot with no new plumbing.
   const uint32_t at0 = std::max(1u, limb.voxelsAtSpawn);
-  const float lost = (float)removed.size() / (float)at0;
+  // Measured on the lattice `voxelsAtSpawn` counted, which is the skin whenever
+  // there is one: a fraction only means anything against its own denominator,
+  // and mixing the two would scale every wound by (skinScale/physScale)^3.
+  const uint32_t nowCount =
+      (uint32_t)(fine ? limb.skinVoxels.size() : limb.voxels.size());
+  const uint32_t lostCount = at0 > nowCount ? at0 - nowCount : 0u;
+  const float lost = (float)lostCount / (float)at0;
   limb.hp -= lost * def.limbs[limbIndex].hp * kCarveDamagePerVolume;
   if (def.bleedMat) {
-    Vec3 c{};
-    for (const DebrisVoxel& v : removed)
-      c += Vec3{(float)v.x, (float)v.y, (float)v.z};
     // Centroid of what was removed, in limb-local WORLD voxels — the frame
     // woundLocal is read in (PreTick rotates it by the limb's live quat).
-    limb.woundLocal = c * (1.0f / (float)removed.size() /
-                           (float)std::max(1u, def.scale));
+    // Taken on whichever lattice actually registered the carve, then divided
+    // by THAT lattice's scale.
+    Vec3 c{};
+    size_t n = 0;
+    if (!removed.empty()) {
+      for (const DebrisVoxel& v : removed)
+        c += Vec3{(float)v.x, (float)v.y, (float)v.z};
+      n = removed.size();
+      c = c * (1.0f / (float)n / (float)std::max(1u, def.physScale));
+    } else if (skinLostN) {
+      // Collider too coarse to notice, skin was not: fall back to the skin's
+      // own account of where the damage landed rather than leaving the wound
+      // at wherever the last one happened to be.
+      n = skinLostN;
+      c = skinLostSum *
+          (1.0f / (float)n / (float)std::max(1u, def.skinScale));
+    }
+    if (n) limb.woundLocal = c;
     limb.bleedBudget = AddBleedBudget(limb.bleedBudget,
                                       lost * (float)at0 * def.bleedPerDamage);
   }
@@ -2188,9 +2378,12 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
   // Carved down past the point of being a limb at all: it comes off. This is
   // the geometric route to dismemberment — no hp threshold decided it, the
   // player simply removed too much of the arm for it to still be an arm.
+  // The FRACTION is measured on the same lattice `at0` counted (skin when
+  // there is one); the absolute kMinFragmentVoxels floor stays on the collider,
+  // which is what "too few voxels to be a body" has always meant to Jolt.
   const bool collapsed =
       limb.voxels.size() < kMinFragmentVoxels ||
-      (float)limb.voxels.size() < kLimbCollapseFraction * (float)at0;
+      (float)nowCount < kLimbCollapseFraction * (float)at0;
   if (collapsed || limb.hp <= 0) {
     // Sever() re-enters this mob by id and may call Die(); after it, neither
     // `mob` nor `limb` may be assumed live, so nothing below may touch them.
@@ -2239,8 +2432,12 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
       compSize.push_back(size);
     }
     if (compSize.size() > 1) {
-      // The anchor in limb-local MICRO units — the point the joint holds.
-      Vec3 aMicro = limb.anchorLimb * (float)std::max(1u, def.scale);
+      // The anchor in limb-local COLLIDER units — the point the joint holds.
+      // The components were found on `limb.voxels`, so the anchor must be
+      // expressed on THAT lattice: physScale, not skinScale. (This is the
+      // conversion the loader's skinScale one at the top of the file is easiest
+      // to confuse with; they run in opposite directions on different data.)
+      Vec3 aMicro = limb.anchorLimb * (float)std::max(1u, def.physScale);
       uint32_t keepComp = 0;
       float best = 1e30f;
       for (uint32_t i = 0; i < n; i++) {
@@ -2256,22 +2453,54 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
       std::vector<std::vector<DebrisVoxel>> parts(compSize.size());
       for (uint32_t c = 0; c < compSize.size(); c++) parts[c].reserve(compSize[c]);
       for (uint32_t i = 0; i < n; i++) parts[comp[i]].push_back(limb.voxels[i]);
+
+      // The SKIN must follow the component that kept the limb's identity, or
+      // the art would go on drawing flesh that physics has already thrown away
+      // — the split happened on the collider, so which coarse block a skin
+      // voxel belongs to is what decides where it goes.
+      if (fine) {
+        const uint32_t ratio =
+            std::max(1u, def.skinScale / std::max(1u, def.physScale));
+        std::unordered_map<uint32_t, uint32_t> blockComp;
+        blockComp.reserve(n * 2);
+        for (uint32_t i = 0; i < n; i++)
+          blockComp[key(limb.voxels[i].x, limb.voxels[i].y, limb.voxels[i].z)] =
+              (uint32_t)comp[i];
+        limb.skinVoxels.erase(
+            std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
+                           [&](const PrefabVoxel& v) {
+                             auto it = blockComp.find(key((int)v.x / (int)ratio,
+                                                          (int)v.y / (int)ratio,
+                                                          (int)v.z / (int)ratio));
+                             // A skin voxel whose block did not survive the
+                             // majority-fill has no component to belong to;
+                             // it goes with the limb rather than vanishing.
+                             return it != blockComp.end() &&
+                                    it->second != keepComp;
+                           }),
+            limb.skinVoxels.end());
+      }
       limb.voxels = std::move(parts[keepComp]);
 
       uint32_t budget = kMaxCarveFragments;
       for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
         if (c == keepComp || parts[c].empty()) continue;
         if (parts[c].size() >= kMinFragmentVoxels && budget > 0) {
-          EmitCarvedFragment(mob, limb, def.scale, std::move(parts[c]), world,
-                             spawns);
+          // A carved-off fragment becomes its own debris body, packed from the
+          // COLLIDER voxels it was split on — it has no skin lattice of its
+          // own, so its brick is packed at physScale to match its coords.
+          EmitCarvedFragment(mob, limb, def.physScale, std::move(parts[c]),
+                             world, spawns);
           budget--;
         } else {
-          LimbVoxelsToParticles(limb, def.scale, parts[c], world, spawns);
+          LimbVoxelsToParticles(limb, def.physScale, parts[c], world, spawns);
         }
       }
       // Losing the disconnected mass can itself take the limb under the floor.
+      // Same lattice pairing as the first collapse test above.
       if (limb.voxels.size() < kMinFragmentVoxels ||
-          (float)limb.voxels.size() < kLimbCollapseFraction * (float)at0) {
+          (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
+              kLimbCollapseFraction * (float)at0) {
         Sever(mob.id, limbIndex);
         return false;
       }
@@ -2280,7 +2509,8 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
 
   // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
   // collider must be built from the voxels in their FINAL frame.
-  if (limb.microModel >= 0) ReskinLimbMicro(mob, limb, def.scale);
+  if (limb.microModel >= 0)
+    ReskinLimbMicro(mob, limb, def.skinScale, def.physScale);
   RebuildLimbBody(mob, limbIndex);
   return true;
 }
@@ -2296,35 +2526,53 @@ bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
       const MobDef& def = defs_[mob.defIndex];
       Limb& limb = mob.limbs[i];
       phys_->GetTransform(limb.body, limb.xf);
-      // Carve centre into limb-local MICRO units, so the per-voxel test is a
-      // plain distance compare in the frame the voxels live in. This is what
-      // makes precision scale with the def: at scale 4 a radius of 0.25 world
-      // voxels is a single micro voxel, so a fine enough tool can take out one
-      // cell of a brain without any new code path.
-      const float scale = (float)std::max(1u, def.scale);
+      // ONE world-space sphere, re-expressed per lattice. CarveLimb calls this
+      // once with physScale and, on a fine-skinned limb, again with skinScale —
+      // the centre and radius are converted into whichever frame the voxels
+      // being tested live in, so the same physical volume is removed from both.
+      //
+      // This is what makes precision scale with the def: at skinScale 8 a
+      // radius of 0.125 world voxels is a single skin voxel, so a fine enough
+      // tool can take out one cell of a brain without any new code path.
       Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
-      Vec3 cLocal = RotateInv(q, centerWorldVoxel - limb.xf.pos) * scale;
-      const float rLocal = radiusVoxels * scale;
-      const float rLocal2 = rLocal * rLocal;
+      const Vec3 cBody = RotateInv(q, centerWorldVoxel - limb.xf.pos);
       const uint32_t seed = (uint32_t)mob.id * 2654435761u + (uint32_t)i;
-      CarveLimb(mob, (int)i, world, spawns, eject,
-                [&](const DebrisVoxel& v) {
-                  Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
-                  Vec3 dv = c - cLocal;
-                  float d2 = dv.dot(dv);
-                  if (d2 >= rLocal2) return true;  // outside
-                  if (!ragged) return false;       // clean bore (laser kerf)
-                  // Ragged rim: certain removal in the core, thinning outward,
-                  // so a blast crater in flesh is torn rather than scooped.
-                  // CPU gameplay state (limbs are outside the hashed domain),
-                  // so a float hash is fine — rule 1 governs the grid.
-                  float t = std::sqrt(d2 / rLocal2);
-                  float chance = 1.0f - t * t;
-                  uint32_t h = Hash3(seed, (uint32_t)(int32_t)v.x * 73856093u,
-                                     (uint32_t)(int32_t)v.y * 19349663u ^
-                                         (uint32_t)(int32_t)v.z * 83492791u);
-                  return (float)(h & 0xFFFFu) / 65535.0f >= chance;
-                });
+      // The ragged-rim jitter is keyed on the SKIN lattice regardless of which
+      // lattice is being tested, so the crater's shape is a property of the
+      // art rather than of whatever collider resolution the engine happened to
+      // derive — otherwise the same blast would tear differently on two rigs
+      // that only differ in limb size.
+      const float jitterScale = (float)std::max(1u, def.skinScale);
+      CarveLimb(
+          mob, (int)i, world, spawns, eject,
+          [&, cBody, seed, jitterScale](float scale) {
+            const Vec3 cLocal = cBody * scale;
+            const float rLocal = radiusVoxels * scale;
+            const float rLocal2 = rLocal * rLocal;
+            const float toSkin = jitterScale / scale;
+            return [=](int x, int y, int z) {
+              Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
+              Vec3 dv = c - cLocal;
+              float d2 = dv.dot(dv);
+              if (d2 >= rLocal2) return true;  // outside
+              if (!ragged) return false;       // clean bore (laser kerf)
+              // Ragged rim: certain removal in the core, thinning outward,
+              // so a blast crater in flesh is torn rather than scooped.
+              // CPU gameplay state (limbs are outside the hashed domain),
+              // so a float hash is fine — rule 1 governs the grid.
+              float t = std::sqrt(d2 / rLocal2);
+              float chance = 1.0f - t * t;
+              // Quantised onto the skin lattice so both passes agree on which
+              // part of the rim is torn.
+              int sx = (int)std::floor((float)x * toSkin);
+              int sy = (int)std::floor((float)y * toSkin);
+              int sz = (int)std::floor((float)z * toSkin);
+              uint32_t h = Hash3(seed, (uint32_t)sx * 73856093u,
+                                 (uint32_t)sy * 19349663u ^
+                                     (uint32_t)sz * 83492791u);
+              return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+            };
+          });
       return true;
     }
   }
@@ -2346,9 +2594,11 @@ void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
         if (l.body) {
           BodyTransform xf{};
           phys_->GetTransform(l.body, xf);
-          // cheap reject against the limb's bounding sphere
+          // cheap reject against the limb's bounding sphere. `l.size` is in
+          // COLLIDER units, so it divides by physScale.
           float r = 0;
-          const float inv = 1.0f / (float)std::max(1u, defs_[mob.defIndex].scale);
+          const float inv =
+              1.0f / (float)std::max(1u, defs_[mob.defIndex].physScale);
           r = 0.5f * Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z}.len() *
               inv;
           if ((xf.pos - centerWorldVoxel).len() <= radiusVoxels + r + 2.0f)
@@ -2500,7 +2750,14 @@ void MobSystem::DetachLimb(Mob& mob, int limbIndex, bool adopt) {
     // limb owns is transferred, not copied, so `carved` is cleared: from here
     // DebrisSystem's ReleaseBody is the one thing that may free it, and a limb
     // that also thought it owned the model would double-free the block.
-    debris_->AdoptBody(limb.body, limb.voxels, limb.xf, limb.MicroRef(def.scale));
+    // The SKIN travels with the body: AdoptBody's trailing params exist so a
+    // severed limb stays as detailed as it was on the creature. Without them
+    // the debris body would fall back to its collider lattice and the limb
+    // would visibly coarsen at the moment it came off.
+    debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
+                       limb.MicroRef(def.skinScale), def.physScale,
+                       std::move(limb.skinVoxels));
+    limb.skinVoxels.clear();
     limb.carved = false;
     limb.holdBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
@@ -2526,7 +2783,10 @@ void MobSystem::Die(Mob& mob) {
     if (!limb.body) continue;
     phys_->SetBodyKinematic(limb.body, false);
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
-                       limb.MicroRef(defs_[mob.defIndex].scale));
+                       limb.MicroRef(defs_[mob.defIndex].skinScale),
+                       defs_[mob.defIndex].physScale,
+                       std::move(limb.skinVoxels));
+    limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     limb.body = 0;
     if (limb.joint) limb.joint = 0;  // ownership follows the bodies now
@@ -2797,7 +3057,9 @@ Vec3 MobSystem::LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const {
     const Limb& limb = mob.limbs[limbIndex];
     if (limb.voxels.empty()) return limb.xf.pos;
     const DebrisVoxel& v = limb.voxels[n % (uint32_t)limb.voxels.size()];
-    const float inv = 1.0f / (float)std::max(1u, defs_[mob.defIndex].scale);
+    // Reading limb.voxels, which are COLLIDER units.
+    const float inv =
+        1.0f / (float)std::max(1u, defs_[mob.defIndex].physScale);
     Vec3 c{((float)v.x + 0.5f) * inv, ((float)v.y + 0.5f) * inv,
            ((float)v.z + 0.5f) * inv};
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
