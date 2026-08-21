@@ -9,6 +9,7 @@ happens in this process rather than in the page:
 
   GET  /                      the tuner, served from assets/
   GET  /api/files             materials.json + reactions.json + tuning.json
+                              (+ spells/glyphs.json, READ-ONLY, for the Wiki)
   POST /api/save              write those files back
   GET  /api/models            list .vox/.json under assets/{models,mobs,microvox}
   GET  /api/model?path=...    read one of those files (bytes for .vox)
@@ -37,7 +38,9 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
   - It binds 127.0.0.1 only, so nothing off this box can reach it.
   - The three JSON writable paths are a fixed allowlist (materials/reactions/
     tuning .json under assets/materials). The page cannot name a path, so a bad
-    or malicious request cannot write anywhere else.
+    or malicious request cannot write anywhere else. glyphs.json is served for
+    the Wiki but is NOT in that allowlist, so /api/save cannot reach it however
+    the request is spelled — read-only is structural, not a convention.
   - The model routes DO take a path from the request (the editor must be able
     to name the file it is editing), so every one goes through _model_path(),
     which resolves the path and requires the result to sit inside one of three
@@ -79,6 +82,21 @@ WRITABLE = {
     "reactions": os.path.join(MATDIR, "reactions.json"),
     "tuning": os.path.join(MATDIR, "tuning.json"),
 }
+
+def readable():
+    """Read-only sources the Wiki assembles pages from, for the CURRENT ASSETS.
+
+    Served by /api/files alongside the writable three, but deliberately NOT in
+    WRITABLE: the Wiki EXPLAINS the magic system, it does not edit it. A glyph
+    holds a RESOLVED 12-bit material id at runtime, so authoring one from a page
+    that cannot re-run the engine's name resolution is how you get a spell that
+    silently conjures air. Edit assets/spells/glyphs.json directly.
+
+    A function rather than a module constant for the same reason model_dirs()
+    is: tuner_app.py re-points ASSETS after import, and a dict frozen here would
+    keep pointing at the pre-import path.
+    """
+    return {"glyphs": os.path.join(ASSETS, "spells", "glyphs.json")}
 
 # Directories the editor may read and write models in, as paths RELATIVE to
 # assets/. They are resolved against ASSETS at request time rather than frozen
@@ -455,7 +473,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(204, b"", "image/x-icon")
         if p == "/api/files":
             out = {}
-            for name, path in WRITABLE.items():
+            # The writable three, then the read-only Wiki sources. Same shape on
+            # the wire; the page decides what it may write back.
+            for name, path in list(WRITABLE.items()) + list(readable().items()):
                 try:
                     with open(path, encoding="utf-8") as f:
                         out[name] = f.read()

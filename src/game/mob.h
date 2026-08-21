@@ -50,6 +50,18 @@ struct MobLimbDef {
   float severImpactSpeed = 0;  // 0 = absent: a fast hit severs regardless of hp
   bool hasSpring = false;      // non-null "spring" ⇒ jiggled, never keyed
   SpringDef spring;
+  // ---- cutting edge (a weapon part; game/melee.h) ----
+  // The segment along which this part cuts, in the part's OWN local frame.
+  // Authored in the sidecar's `edge` block by whatever generated the art, so
+  // the hitbox comes from the same constants as the mesh rather than being
+  // re-measured by eye in C++ (see scripts/gen_mina.py sword_vox).
+  //
+  // Stored in WORLD voxels like every other piece of rig geometry — converted
+  // from the .vox's micro units at load, at the same point anchors are, so
+  // nothing downstream needs scale awareness.
+  bool hasEdge = false;
+  Vec3 edgeFrom{}, edgeTo{};   // base (ricasso) and tip, local
+  float edgeHalfWidth = 0;     // carve radius at the blade, world voxels
   // Index into the shared micro-body model pool (sim/microbody.h), or -1 for
   // the cube path. Only ever set for defs with scale > 1; a limb whose model
   // failed to pack keeps -1 and simply does not render (cube instances are one
@@ -393,7 +405,7 @@ class MobSystem {
   std::vector<ParticleSpawn> pendingSpawns_;
 
   static constexpr uint32_t kMaxMobs = 16;
-  static constexpr int kBleedOpsPerTick = 6;  // of the 64-op tick budget
+  // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)
   // how long a severed piece holds its last animated pose before ragdolling
   static constexpr float kSeverHoldSeconds = 0.25f;
   // ---- carving ---------------------------------------------------------------

@@ -1,0 +1,17 @@
+{
+  "comment": "Items are CONTENT, like materials.json and glyphs.json — not look-and-feel knobs like tuning.json. An item is a name, a behaviour kind the engine switches on, and (for anything held) the name of the RIG PART that shows it. The art is not here: a held item's mesh is a part of the wearer's own rig (assets/mobs/mina.*), authored and severable exactly like a hand, so a dropped sword, a severed sword-arm and a burnt sword all fall out of systems that already exist. Hot-reloads on R alongside materials and glyphs.",
+
+  "kinds": "melee = swung, and cuts along the `edge` segment its rig part declares (see scripts/gen_mina.py sword_vox). The blade geometry is what decides the wound; `carveBonus` only widens it.",
+
+  "items": [
+    {
+      "id": "sword",
+      "kind": "melee",
+      "part": "sword",
+      "damage": 14.0,
+      "carveBonus": 0.15,
+      "reach": 9.0,
+      "desc": "A straight double-edged arming sword. Held point-up; it cuts with the length of its blade, so where you land it is where the wound opens."
+    }
+  ]
+}

@@ -391,6 +391,30 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   These compile into the spare word of the 32-byte reaction entry, so the
   struct did not grow. Everything about them is integer and tick-derived,
   which is what keeps a sun-driven reaction inside the determinism rule.
+- **Weather switches (2026-08-20):** a rule may name one named switch, and is
+  dropped at COMPILE TIME when that switch is off:
+  ```json
+  { "self": "water", "decay": true, "becomes": "ice",
+    "when": "night", "requires": "waterFreezes", "chance": 1 }
+  ```
+  The switches are booleans in `tuning.json`'s `weather` group
+  (`waterFreezes`, `iceMelts`), resolved by `WeatherFlagEnabled` in
+  `sim/materials.cpp`. This is deliberately **not** another `cond` bit: a
+  switched-off rule never enters the GPU table at all, so it costs nothing per
+  cell rather than being tested every tick and always failing (rule 2). The
+  bucket flattening recomputes `reactOffset`/`reactCount` from the surviving
+  rules, so nothing downstream needs to know a rule went missing — and a
+  material whose every rule is off is skipped wholesale by the `reactCount > 0`
+  dispatch guard.
+
+  Two consequences worth stating plainly. **They change the world hash**, the
+  same way editing `reactions.json` does — that is content, not divergence, but
+  a lockstep session has to agree on them. And because the reaction table is
+  built by `LoadAssets` (which F5 does not otherwise run), the F5 path now
+  falls through into the materials reload so a switch applies on one keypress.
+  An unknown switch name is a load ERROR, not a silent drop: silently
+  compiling would make the switch look broken, and silently dropping would
+  delete content.
 - **Neighbour-count scaling (2026-08-20):** a decay rule's chance may scale with
   how many of its 6 face neighbours match a predicate, where a count of **zero
   forbids the rule outright**. This is what turns a uniform nucleation rule into
@@ -579,6 +603,41 @@ physics, and randomising them makes identical collisions resolve differently for
 no legible reason. Bounded by construction (rule #2) — the gaussian tail is
 clamped and count draws floor at 0 and cap, because an unbounded draw on a spawn
 count is an unbounded particle budget.
+
+### Two sizes of blood (2026-08-20)
+
+Gore comes off a wound at two scales, and they are tuned separately because they
+do different jobs. **Micro droplets** fly, stain what they hit, never re-enter
+the grid, and are guaranteed to clear (`microLifeTicks`) — they sell the moment
+of the hit. **Whole voxels** are conserved matter the CA carries, flows and
+pools — they are what is still on the floor a minute later.
+
+Most of the `gore` group governs the spray. The whole-voxel side is:
+
+- `severVoxels` / `severVoxelSpeed` — the one-shot throw at a cut. These are
+  particle spawns with `micro=false`, so they ride the 4096-particle budget and
+  bypass the drip op budget entirely.
+- `bleedVoxelGain` — multiplies what a wound OWES per point of damage, on top of
+  the per-mob `bleed.perDamage` in the mob's own sidecar. The global "how wet is
+  this game" dial.
+- `bleedBudgetCap` — the ceiling on what ONE wound can still owe, and the real
+  bound on how much matter a fight puts into the world. The rate below only
+  decides how fast it arrives.
+- `bleedDripTicks` / `bleedOpsPerTick` — the rate: at most one drip per wound per
+  period, and at most N drips per tick across all mobs (and again for the
+  avatar). Together these are the hard ceiling on blood entering the sim.
+
+Note `bleedGain` (the per-mob gusher roll) scales spray and the sever throw, but
+NOT the drip budget — the drip is the sustained bleed and is bounded by the cap.
+All six former `120.0f` literals now route through one `AddBleedBudget` helper in
+`sim/tuning.h`, because a per-wound ceiling duplicated six ways is how one of
+them ends up stale.
+
+These feed `BrushOp`s rather than shader constants, so like the rest of the gore
+group they are a per-tick INPUT and not part of the hashed domain — but they DO
+decide how much wet blood exists, and wet blood keeps its chunks awake while it
+flows and soaks. The selftest's post-dismemberment settle window is sized against
+them; raising the cap a long way is a settle-time change as much as a look one.
 
 ---
 
@@ -983,7 +1042,9 @@ Ward drain is a **fraction** of max mana rather than a flat amount, because a
 flat cost lets a big late-game pool buy invulnerability.
 
 Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
-`BrushOp`s, alongside mob and avatar bleeding's 6 each) and overflow is
+`BrushOp`s, alongside `gore.bleedOpsPerTick` — 6 by default — for mob and for
+avatar bleeding each; magic's share is deliberately NOT tunable, so turning the
+gore up cannot starve spells, and the bleed side is clamped to 64) and overflow is
 **counted and shown in the HUD** rather than dropped silently — a spell that
 sometimes doesn't fire is miserable to diagnose.
 
@@ -998,6 +1059,63 @@ because measuring the relation is what caught the off-by-one above. The first
 version of the gate folded the impact op into the trail total and reported 343
 voxels against a 64 budget, where the budget was fine and the measurement was
 wrong.
+
+### Items, and mouse-directed melee (2026-08-20; `game/item.h`, `game/melee.*`)
+
+A hotbar and a sword, built as the melee counterpart to the spell system: the
+same division of labour (main.cpp owns the player's inventory, the systems are
+player-agnostic) and the same refusal to add a parallel damage path.
+
+**The pose is the hitbox.** A swing does not switch on a hitbox during an
+animation window and it does not test a cone in front of the crosshair. The
+blade's authored `edge` segment is read through its **live** transform and
+swept from where it was last tick to where it is now; whatever that quad passes
+through is cut, at the point it was crossed. So the location struck is the
+location that loses voxels — which is only worth saying because §7's live-limb
+carving already made "lose voxels *there*" expressible. Melee adds no gore
+code: it calls `CarveLimbRadial` for flesh and `MeltBodyAt` for debris, the
+same two calls the laser splits between, and dismemberment stays geometric
+(a limb comes off when the cuts disconnect it, not when a counter hits zero).
+
+**The mouse is the swing.** Holding the attack button guards; the accumulated
+mouse velocity steers the guard and, past a threshold, commits a cut along the
+direction actually moved — a diagonal flick is a diagonal cut. Damage scales
+with the blade's measured tip speed, so the player's own motion is the damage
+roll: no cooldowns, no swing timer, no randomness, and being slow is punished
+by being ineffective rather than by being locked out. The HUD prints the phase
+and the measured mouse speed, because an input this analogue has to be
+*falsifiable* — the player needs to tell "the game misread my flick" from "I
+misjudged the distance".
+
+**The arm swings; the blade does not steer.** The weapon keeps the grip angle
+its rig gives it, orthogonal to the forearm, and only the arm's IK chain is
+driven. An early version re-aimed the held part at the cut direction every
+tick; it looked like the sword swivelling in the fist, and because the override
+wrote into the flattened pose it also fought the animation pipeline and widened
+the walk until the legs failed their own upright assertion — a "leg bug" whose
+cause was the thing the character was holding.
+
+**A held item is a rig part, not an object.** The sword is a part of the
+avatar's own `.vox` (`scripts/gen_mina.py`, the staff precedent from
+`gen_wizard.py`): severable, non-vital, cheap to knock loose. Equipping is
+"show that part". So a dropped sword, a severed sword-arm, a burnt sword and a
+carved sword are all things the existing systems already do, and `ItemDef`
+stays a name plus a behaviour kind rather than a mesh.
+
+Two traps worth recording, both found by the selftest:
+
+- **A held prop must not inflate `MobDef::worldSize`.** That box is the
+  *creature's*, and the avatar derives `origin_`, the gait pivot and its
+  standing height from it. A blade reaching outside the body re-centred the rig
+  on the weapon — visibly, it slid the whole avatar (and the camera riding its
+  head) sideways. Anything tagged `prop` is now measured out of the box.
+- **A weapon must not cut its wielder.** The blade starts inside its own hand
+  and sweeps across the body's front, so without an explicit `OwnsBody` reject
+  every guard saws through the arm holding it.
+
+The gate asserts the property the feature exists for: the limb under the edge
+loses voxels while a limb on the far side of the *same mob* does not. A
+crosshair-cone hitbox would pass "did it damage something" and fail that.
 
 ### Voxel art pipeline, articulated mobs, and the laser (2026-08-19)
 

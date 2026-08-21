@@ -251,6 +251,25 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       ld.tag = l.value("tag", "");
       // absent severImpactSpeed = "never severs on impact alone"
       ld.severImpactSpeed = l.value("severImpactSpeed", 0.0f);
+      // A cutting edge: the segment this part cuts along, in its own local
+      // frame. Authored in MICRO units along an axis of the part's model box;
+      // converted to world voxels below, with the anchors.
+      if (l.contains("edge") && l["edge"].is_object()) {
+        const json& e = l["edge"];
+        Vec3 ax{0, 0, 1};
+        if (e.contains("axis") && e["axis"].size() == 3)
+          ax = {e["axis"][0].get<float>(), e["axis"][1].get<float>(),
+                e["axis"][2].get<float>()};
+        // The .vox scene is Z-up and the engine is Y-up (voxload.cpp), so an
+        // axis authored up the model's +Z is the engine's +Y. Mapping it here
+        // means the sidecar can speak the art's coordinates, which is what the
+        // generator that wrote them was thinking in.
+        Vec3 axEngine{ax.x, ax.z, -ax.y};
+        ld.hasEdge = true;
+        ld.edgeFrom = axEngine * e.value("from", 0.0f);
+        ld.edgeTo = axEngine * e.value("to", 0.0f);
+        ld.edgeHalfWidth = e.value("halfWidth", 1.0f);
+      }
       if (l.contains("spring") && l["spring"].is_object()) {
         ld.hasSpring = true;
         ld.spring.halflife = l["spring"].value("halflife", 0.15f);
@@ -352,6 +371,18 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         // anchors in Spawn) completely scale-unaware.
         const float inv = 1.0f / (float)def.scale;
         sk.parts[i].anchorLocal = anchor * inv;
+        // The cutting edge rides the same conversion, for the same reason: it
+        // is rig geometry, and every consumer downstream works in world
+        // voxels. Its offsets are measured from the part's own ORIGIN (the
+        // model's min corner), so they need no anchor rebasing here — the
+        // melee sweep composes them with the part transform, which already
+        // carries the origin.
+        MobLimbDef& mld = def.limbs[i];
+        if (mld.hasEdge) {
+          mld.edgeFrom = mld.edgeFrom * inv;
+          mld.edgeTo = mld.edgeTo * inv;
+          mld.edgeHalfWidth *= inv;
+        }
       }
       for (size_t i = 0; i < def.limbs.size(); i++) {
         int par = sk.parts[i].parent;
@@ -534,8 +565,42 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     }
 
     // Prefab box in WORLD voxels — the one number the gait/terrain code reads.
-    def.worldSize = Vec3{(float)def.prefab.size.x, (float)def.prefab.size.y,
-                         (float)def.prefab.size.z} * (1.0f / (float)def.scale);
+    //
+    // HELD PROPS ARE EXCLUDED. This box is the CREATURE's, not its luggage:
+    // the gait pivot, the avatar's origin, its standing height and the terrain
+    // anchor radius all derive from it (avatar.cpp, and the pivot uses below).
+    // A sword lying in the hand reaches well outside the body, so counting it
+    // here silently re-centres the rig on the weapon — which showed up as the
+    // avatar's walk widening until its legs failed their own upright
+    // assertion, a "leg bug" whose actual cause was the thing it was holding.
+    //
+    // Anything tagged "prop" is therefore measured out. Props still render,
+    // still collide and are still severable; they simply do not define how big
+    // the creature is.
+    {
+      IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX};
+      IVec3 hi{INT32_MIN, INT32_MIN, INT32_MIN};
+      bool any = false;
+      for (const MobLimbDef& ld : def.limbs) {
+        if (ld.tag == "prop") continue;
+        int mi = FindModel(def.prefab, ld.name);
+        if (mi < 0) continue;
+        const PrefabModel& m = def.prefab.models[mi];
+        lo.x = std::min(lo.x, m.offset.x);
+        lo.y = std::min(lo.y, m.offset.y);
+        lo.z = std::min(lo.z, m.offset.z);
+        hi.x = std::max(hi.x, m.offset.x + m.size.x);
+        hi.y = std::max(hi.y, m.offset.y + m.size.y);
+        hi.z = std::max(hi.z, m.offset.z + m.size.z);
+        any = true;
+      }
+      const Vec3 box =
+          any ? Vec3{(float)(hi.x - lo.x), (float)(hi.y - lo.y),
+                     (float)(hi.z - lo.z)}
+              : Vec3{(float)def.prefab.size.x, (float)def.prefab.size.y,
+                     (float)def.prefab.size.z};
+      def.worldSize = box * (1.0f / (float)def.scale);
+    }
 
     // ---- micro brick upload (PLAN §C, sim/microbody.h) ----
     // Packed once per DEF, shared by every instance: a limb's voxels never
@@ -1428,8 +1493,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           limb.gushTicks--;
         }
 
-        if (limb.bleedBudget < 1.0f || bleedOps >= kBleedOpsPerTick) continue;
-        if ((tick & 3u) != 0) continue;  // drip every 4th tick
+        if (limb.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
+        // Drip period, tunable. Modulo rather than a mask because the tuner
+        // offers every period, not just powers of two; the divisor is clamped
+        // >= 1 at load so this cannot divide by zero.
+        if (tick % (uint32_t)std::max(1, gore.bleedDripTicks) != 0) continue;
         Vec3 w = limb.body
                      ? limb.xf.pos + Rotate(lq, limb.woundLocal)
                      : bodyFrame(limb.anchorRoot);  // stump on the parent
@@ -1516,8 +1584,8 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
           ld.severImpactSpeed > 0 && impactSpeed >= ld.severImpactSpeed;
       limb.hp -= amount;
       limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
-      limb.bleedBudget = std::min(limb.bleedBudget + amount * def.bleedPerDamage,
-                                  120.0f);
+      limb.bleedBudget =
+          AddBleedBudget(limb.bleedBudget, amount * def.bleedPerDamage);
       if (limb.hp <= 0 || impactSevers) {
         Sever(mob.id, (int)i);
       } else {
@@ -1815,9 +1883,8 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
     // woundLocal is read in (PreTick rotates it by the limb's live quat).
     limb.woundLocal = c * (1.0f / (float)removed.size() /
                            (float)std::max(1u, def.scale));
-    limb.bleedBudget =
-        std::min(limb.bleedBudget + lost * (float)at0 * def.bleedPerDamage,
-                 120.0f);
+    limb.bleedBudget = AddBleedBudget(limb.bleedBudget,
+                                      lost * (float)at0 * def.bleedPerDamage);
   }
 
   // Carved down past the point of being a limb at all: it comes off. This is
@@ -2030,14 +2097,17 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
           Limb& parent = mob.limbs[k];
           Quat q{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
                  parent.xf.quat[3]};
+          const auto& gore = CurrentTuning().gore;
           parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
-          parent.bleedBudget = std::min(parent.bleedBudget + 40.0f, 120.0f);
+          // The stump's own drip budget, on top of the thrown voxels below:
+          // this is the puddle that keeps forming under a fresh amputation.
+          parent.bleedBudget =
+              AddBleedBudget(parent.bleedBudget, gore.severStumpBudget);
 
           // Arm the gout. PreTick drains it over severDecayTicks; arming state
           // here rather than emitting now keeps every particle this frame
           // inside the one per-tick spawn budget, and keeps spray order
           // independent of the order limbs happened to be damaged in.
-          const auto& gore = CurrentTuning().gore;
           parent.gushTicks = mob.gore.severDecayTicks;
           parent.gushLocal = parent.woundLocal;
           // Spray along the stump: from the parent's centre out through the

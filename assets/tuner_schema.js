@@ -80,6 +80,8 @@ const TUNING_SCHEMA = [
       {k:'halfHeight', n:'body half-height', d:'Half the body height (0.85 = a 1.7 m player).', min:0.2, max:3, step:0.01, u:'m', warn:'Collision geometry. Must stay well under 3 chunks or collision breaks.'},
       {k:'eyeOffset', n:'eye height', d:'Camera offset above the AABB centre.', min:-1, max:2, step:0.01, u:'m'},
       {k:'viewSmoothHalflife', n:'step view smoothing', d:'Half-life of the camera catching up after the body steps up/down a ledge. Render-only; the body still steps instantly. 0 disables.', min:0, max:0.4, step:0.005, u:'s'},
+      {k:'unstickMaxDepth', n:'unstick depth', d:'How deep the body may be buried in solid voxels and still be lifted clear. Collision sweeps are a hard veto that fails from an overlapping start, so a body that ends up INSIDE the ground cannot move on any axis until something pushes it out — that is the "stuck on noisy terrain until you noclip" case. Past this depth you stay buried, because being entombed by a collapse is a real state and teleporting out of it would be the worse bug. 0 disables the ejection.', min:0, max:3, step:0.05, u:'m'},
+      {k:'unstickSpeed', n:'unstick speed', d:'How fast the body rises while being ejected from ground it is inside. Rate-limited rather than teleported so a shallow lift glides instead of popping; the climb is banked into the same view smoothing a step-up uses. Very high values approach an instant snap.', min:0.1, max:20, step:0.1, u:'m/s'},
     ],
   },
 
@@ -132,6 +134,10 @@ const TUNING_SCHEMA = [
       {k:'firstPersonArms', n:'first-person arms', d:'In first person the body is hidden so you are not looking at the inside of your own hat — but the arms, hands and staff are kept, which is most of what sells having a body. Off hides everything.', bool:true},
       {k:'turnRate', n:'turn rate', d:'How fast the body swings around to face where it is going. In first person the body always faces the camera; in third it turns toward its MOTION, which is what stops the character moon-walking sideways across the screen.', min:1, max:40, step:0.5, u:'rad/s'},
       {k:'turnMinSpeed', n:'turn threshold', d:'Below this speed the body holds its last facing instead of chasing a near-zero velocity vector, which would make it spin on the spot when you stop.', min:0, max:3, step:0.05, u:'m/s'},
+      {k:'velocityHalflife', n:'motion smoothing', d:'Half-life of the rig’s own speed measurement. That one number drives cadence, bob, sway, roll, the walk/run clip choice, the spring goals AND the swing budget, so noise in it is amplified into every one of them at once — which is what jittery, spazzing limbs actually are. Longer is calmer but makes the gait slower to react to a stop or a sprint; 0 uses the raw per-tick measurement.', min:0, max:0.5, step:0.005, u:'s'},
+      {k:'firstPersonTurnHalflife', n:'first-person turn smoothing', d:'Half-life of the body yaw catching up to the camera in FIRST person (third person has its own turn rate above). The body is hidden here but the arms are not, and they are welded to the torso — so a hard snap steps them across the view in jumps on every fast mouse turn. Keep this short: too long and the arms visibly trail the crosshair. 0 restores the old instant snap.', min:0, max:0.3, step:0.005, u:'s'},
+      {k:'ikBlendHalflife', n:'IK blend', d:'How quickly the leg IK fades in and out as the gait starts and stops. Crossing bumpy ground makes `grounded` genuinely ragged — the body really does leave the surface cresting each bump — and the IK used to be switched on that as a hard bool, so the limbs snapped between the IK pose and the rest hang over and over. That snap is the “arms shoot straight up while walking uphill” tweaking. Longer is smoother but makes the legs slower to commit to the ground on landing; 0 restores the old hard switch.', min:0, max:0.4, step:0.005, u:'s'},
+      {k:'airDebounce', n:'air debounce', d:'How long the body must be continuously off the ground before the jump/fall/land clips believe it. `grounded` genuinely drops false for a tick at a time cresting bumps, and these clips used to fire on that raw edge — so walking up a noisy incline retriggered the arms-up `jump` one-shot over and over. That is the single biggest cause of the character “tweaking out” on rough ground. A real jump clears this in one tick; a bump crest never does. Too high and a genuine jump animates late. 0 restores the old undebounced behaviour.', min:0, max:0.5, step:0.01, u:'s'},
       {k:'footTrim', n:'foot trim', d:'Vertical nudge of the whole avatar against the player collision box. The rig’s feet should already land on the box’s bottom face; this is the trim for art whose contact point is not exactly at its origin.', min:-1, max:1, step:0.01, u:'m'},
       {k:'severImpulse', n:'sever impulse', d:'Extra shove given to a part as it comes off, on top of whatever the hit imparted. Higher values throw limbs dramatically; 0 lets them simply drop.', min:0, max:40, step:0.5},
       {k:'respawnDelay', n:'respawn delay', d:'How long the corpse lies there before the avatar is rebuilt. The severed parts stay in the world as ordinary debris either way — they are DebrisSystem’s from the moment they come off.', min:0, max:20, step:0.5, u:'s'},
@@ -156,6 +162,20 @@ const TUNING_SCHEMA = [
       {k:'lunarPeriodDays', n:'lunar month', d:'In-game days for the moon to go new -> full -> new. Also sets how far the moon drifts from opposite-the-sun each night.', min:1, max:60, step:1, int:true, u:'days'},
       {k:'moonInclination', n:'moon tilt', d:'How far the moon’s arc is tilted off the sun’s, in degrees. 0 makes it retrace the sun’s path exactly, which reads as fake.', min:-60, max:60, step:0.5, u:'°'},
       {k:'starRotSpeed', n:'star wheel speed', d:'Multiplier on how fast the starfield rotates about the celestial pole.', min:0, max:8, step:0.05, u:'×'},
+    ],
+  },
+
+  {
+    id: 'weather',
+    title: 'Weather',
+    icon: '\u{2744}',
+    apply: 'cpu',
+    group: 'weather',
+    determinism: true,
+    blurb: 'Switches for the sun-driven reactions. Unlike every other tab these do not scale a rate — they decide whether a reaction rule is COMPILED AT ALL, so a rule switched off costs nothing at runtime instead of being tested per cell and always failing. That also means they change which rules exist, exactly the way editing reactions.json does: the world hash changes, and a lockstep session has to agree on them. Reload (F5) rebuilds the reaction table, so a checkbox here applies on the same keypress as everything else.',
+    params: [
+      {k:'waterFreezes', n:'water freezes at night', d:'Exposed water turns to ice on clear nights, and existing ice spreads into the water it touches. Freezing works from the shore inward — deep open water cannot nucleate ice, so ponds skin over from the bank rather than flash-freezing. Off leaves every pond liquid through the night. Needs open sky, so cave water is unaffected either way.', bool:true},
+      {k:'iceMelts', n:'ice and snow melt in sun', d:'Snow and ice in direct daylight melt back to water. Off makes winter permanent. Note this only governs SUNLIGHT: ice and snow still melt on contact with fire and lava regardless, since that is a heat rule rather than a weather one. Turning this off while freezing stays on means ice only ever accumulates — stable, but one-way.', bool:true},
     ],
   },
 
@@ -501,6 +521,11 @@ const TUNING_SCHEMA = [
       {k:'severVoxelSpeed', n:'sever voxel speed', d:'Launch speed of the whole blood voxels.', min:0, max:30, step:0.5, u:'vox/s', var:{scopes:['event','entity'], defScope:'event', max:20}},
       {k:'microLifeTicks', n:'droplet life', d:'How long a micro droplet lives before evaporating, whether or not it ever lands. This is the guarantee that spray clears and the world settles. Hard limit 255.', min:1, max:255, step:1, int:true, u:'ticks', var:{scopes:['event','entity'], defScope:'event', max:150, note:'Result is always clamped to 1..255 — the field is 8 bits.'}},
       {k:'microScale', n:'droplet fineness', d:'Micro voxels per world voxel: a droplet renders at 1/this of a cell. Only 2, 3, 4 and 6 are representable.', min:2, max:6, step:1, int:true},
+      {k:'bleedVoxelGain', n:'bleed volume (voxels)', d:'Multiplier on how much WHOLE-VOXEL blood a wound owes per point of damage — the counterpart to "bleed gain", which only scales spray and the sever throw. This is the "how wet is this game" dial: it decides the size of the puddle that is still on the floor a minute later. The per-mob rate it multiplies is authored in the mob\'s own .json (bleed.perDamage).', min:0, max:8, step:0.05},
+      {k:'bleedBudgetCap', n:'max blood per wound', d:'Ceiling on how many whole blood voxels ONE wound can still owe. This, not the rate, is the real bound on how much matter a fight puts into the world — the rate only decides how fast it gets there. Raise it for gushing wounds that keep running; lower it so even a huge hit stops bleeding quickly.', min:0, max:600, step:5, u:'vox', warn:'Wet blood keeps its chunks awake while it flows and soaks. Large values mean a long settle — the selftest\'s post-dismemberment settle window is sized against this.'},
+      {k:'severStumpBudget', n:'stump blood', d:'Whole blood voxels added to the stump\'s wound budget when a limb comes off, on top of the thrown "sever blood voxels". This is the puddle that forms under a fresh amputation, as opposed to the spatter thrown by the cut itself.', min:0, max:400, step:5, u:'vox'},
+      {k:'bleedDripTicks', n:'drip period', d:'Ticks between whole-voxel drips from a single wound. 4 = about 7.5 drips a second at the 30 Hz step. Lower means blood arrives faster (not that there is more of it — total volume is the budget cap above).', min:1, max:60, step:1, int:true, u:'ticks'},
+      {k:'bleedOpsPerTick', n:'drip ops / tick', d:'Cap on wound drips per tick, applied separately to all mobs and to the player. This is a perf budget out of the 64 world-edit ops a tick carries, not a look knob — magic holds its own reservation, so raising this starves other bleeding rather than spells.', min:0, max:64, step:1, int:true},
     ],
   },
 

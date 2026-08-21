@@ -68,6 +68,8 @@ TRIM = 49       # robe_trim    gold, faintly emissive — the sash
 SHADE = 50      # robe_shadow  near-black indigo: hood interior and the face
 SKIN = 51       # skin         the one hand
 LEATHER = 53    # leather      shoes under the hem
+STEEL = 57      # steel        the sword blade, guard and pommel
+GRIP = 58       # grip_leather the wrapped hilt
 
 SCALE = 4       # micro voxels per world voxel
 WORLD_H = 17    # world voxels, head to toe — matches Player::kHalfY * 2
@@ -398,6 +400,91 @@ def foot_vox(size):
     return flip_y(size, out)
 
 
+# ---- the sword --------------------------------------------------------------
+# A held prop, exactly like the wizard's staff: parented to hand.R, severable,
+# not vital, low hp — so losing the hand drops it as ordinary debris and no
+# code anywhere has to special-case "the player is disarmed".
+#
+# The geometry below is the ONE source of truth for where the edge is. The
+# melee sweep (game/melee.cpp) needs a segment in the sword's own local frame
+# to carve along, and re-measuring it by eye in C++ would rot the moment the
+# art changes — so the numbers are emitted into the sidecar as `edge` and the
+# engine reads them.
+#
+# THE BLADE RUNS ALONG SCENE +X (the figure's right), NOT UP ITS OWN Z.
+#
+# Two constraints pin this down and they are both load-bearing:
+#
+#  1. ORTHOGONAL TO THE ARM. A sword built up the model's Z axis is parallel
+#     to the forearm, which puts it INSIDE the arm: the fist closes on thin
+#     air and the blade occupies the same space as the limb holding it. A
+#     gripped weapon crosses the forearm at a right angle and KEEPS that
+#     angle through the swing — the arm moves, the wrist does not swivel.
+#
+#  2. IT MUST NOT INFLATE THE PREFAB BOX. `MobDef::worldSize` is the whole
+#     prefab's bounding box, and the avatar derives origin_, the gait pivot
+#     and its standing height from it (avatar.cpp). A blade projecting 28
+#     micro out the FRONT tripled the rig's Z depth (4.0 -> 11.0 world
+#     voxels), which moved the body's reference frame and widened the walk
+#     until the legs failed their own upright assertion. Laying the blade
+#     along X — the axis the skirt already makes 20 micro wide — costs the
+#     box nothing.
+#
+# So: long axis x, guard crossing y, flat of the blade thin in z.
+#
+# The `edge` block in the sidecar states this axis explicitly rather than
+# assuming one, and mob.cpp maps scene -> engine when it reads it — so the art
+# and the hitbox rotate together and neither can be fixed without the other.
+SWORD_LEN = 44          # micro, pommel butt to tip: 11 world voxels
+SWORD_GRIP = 10         # micro of hilt behind the guard
+SWORD_GUARD = 2         # micro of crossguard
+SWORD_HALF_W = 3        # blade half-width at the widest (micro)
+
+
+def sword_vox(size):
+    """A straight, tapering, double-edged blade on a wrapped hilt, lying along
+    the box's X axis with the pommel at low x and the tip at high x. Thin in Z
+    (the flat of the blade), so it reads as a blade rather than a bar, and the
+    taper is what makes the tip the part that bites.
+
+    No flip_y: the blade is symmetric in y, so mirroring it would be a no-op
+    that only invites confusion about which end is the point."""
+    sx, sy, sz = size
+    out = []
+    cy, cz = sy * 0.5, sz * 0.5
+    guard_x = SWORD_GRIP + SWORD_GUARD
+
+    for x in range(sx):
+        if x < 2:
+            # pommel: a squat steel knob, wider than the grip
+            for z in range(sz):
+                for y in range(sy):
+                    if ellipse_mask(y, z, cy, cz, 1.6, 1.6):
+                        out.append((x, y, z, STEEL))
+        elif x < SWORD_GRIP:
+            # wrapped grip
+            for z in range(sz):
+                for y in range(sy):
+                    if ellipse_mask(y, z, cy, cz, 1.1, 1.1):
+                        out.append((x, y, z, GRIP))
+        elif x < guard_x:
+            # crossguard: a bar across Y, thin in Z
+            for z in range(sz):
+                for y in range(sy):
+                    if ellipse_mask(y, z, cy, cz, sy * 0.5, 1.0):
+                        out.append((x, y, z, STEEL))
+        else:
+            # blade: full width at the ricasso, tapering to a point. Thin in Z
+            # (half-thickness 1) so the flat reads flat.
+            t = (x - guard_x) / max(sx - 1 - guard_x, 1)
+            hw = SWORD_HALF_W * (1.0 - 0.65 * t * t)
+            for z in range(sz):
+                for y in range(sy):
+                    if ellipse_mask(y, z, cy, cz, hw, 1.0):
+                        out.append((x, y, z, STEEL))
+    return out
+
+
 # ---- limb table -------------------------------------------------------------
 # name -> (size, min-corner in SCENE space, default material)
 #
@@ -451,6 +538,20 @@ LIMBS = {
     "legU.R":   (( 4,  4, 12), (  0, -2, 14), SHADE),
     "legL.R":   (( 4,  4, 11), (  0, -2,  4), SHADE),
     "foot.R":   (( 4,  7,  4), (  0, -4,  0), LEATHER),
+
+    # The sword, held in the RIGHT hand (scene +X: hand.R spans x 4..8), lying
+    # along X so the blade crosses the forearm at a right angle and reaches out
+    # to the figure's right, clear of the body.
+    #
+    # The right hand is at scene +X because the figure faces -Y: looking along
+    # the way it faces, +X is its right. Getting this backwards puts the sword
+    # in the left hand while every clip still swings the right arm.
+    #
+    # The grip (SWORD_GRIP micro from the pommel) lands on the hand's centre
+    # at x=6, so the pommel sits just inboard of the fist and the blade runs
+    # outward. See the axis note by sword_vox for why this is X and not Z.
+    "sword":    (( SWORD_LEN, 2 * SWORD_HALF_W, 4),
+                 (  6 - SWORD_GRIP, -SWORD_HALF_W, 28), STEEL),
 }
 
 SHAPES = {
@@ -461,6 +562,7 @@ SHAPES = {
     "legU.L": thigh_vox, "legU.R": thigh_vox,
     "legL.L": shin_vox, "legL.R": shin_vox,
     "foot.L": foot_vox, "foot.R": foot_vox,
+    "sword": sword_vox,
 }
 
 # Parent-before-child; the loader also topologically sorts, but authoring in
@@ -469,7 +571,12 @@ ORDER = ["hips", "torso", "head",
          "armU.L", "armL.L", "hand.L",
          "armU.R", "armL.R", "hand.R",
          "legU.L", "legL.L", "foot.L",
-         "legU.R", "legL.R", "foot.R"]
+         "legU.R", "legL.R", "foot.R",
+         "sword"]
+
+# Held props: in the rig, but not part of the figure's own silhouette. The
+# height contract in main() measures the body without these.
+PROPS = {"sword"}
 
 
 def to_engine(scene_xyz, min_x, max_y):
@@ -487,8 +594,15 @@ def main():
     # The height contract, asserted rather than commented. If someone changes
     # kVoxelMeters or kHalfY, this is the thing that should complain — a
     # mismatch here is exactly how the old wizard ended up 2.8 m tall.
-    top = max(mn[2] + sz[2] for (sz, mn, _m) in LIMBS.values())
-    bottom = min(mn[2] for (_sz, mn, _m) in LIMBS.values())
+    #
+    # PROPS ARE EXCLUDED. A held sword reaches well above the hood and below
+    # the fist, and letting it into this measurement would mean the figure's
+    # "height" changed with whatever it happens to be carrying — which would
+    # both break the assert and, worse, quietly redefine the contract it
+    # exists to protect. The BODY is what has to match the player AABB.
+    body_parts = {n: v for n, v in LIMBS.items() if n not in PROPS}
+    top = max(mn[2] + sz[2] for (sz, mn, _m) in body_parts.values())
+    bottom = min(mn[2] for (_sz, mn, _m) in body_parts.values())
     assert bottom == 0, f"figure does not stand on z=0 (lowest part at {bottom})"
     assert top == MICRO_H, (
         f"figure is {top} micro ({top / SCALE} world voxels) tall, expected "
@@ -654,6 +768,36 @@ def main():
             # forward from here) so the foot pivots the way a foot does
             "anchor": joint_bottom(f"foot.{side}", dy=-1.5, rise=3.0),
             "severImpactSpeed": 12.0})
+
+    # The sword is a HELD PROP, following the staff precedent in gen_wizard.py:
+    # parented to the hand, severable, not vital, and cheap to knock loose. It
+    # is a normal rig part, so it inherits animation, rendering, carving and
+    # the debris hand-off with no new code — and losing the right hand drops it
+    # exactly the way losing that hand should.
+    #
+    # Its grip is at the HAND, partway ALONG the shaft, not at either end. The
+    # blade lies along X now (see sword_vox), so the pivot is derived on that
+    # axis rather than through joint_bottom, which measures height.
+    sword_sz, sword_mn, _ = LIMBS["sword"]
+    hand_sz, hand_mn, _ = LIMBS["hand.R"]
+    limbs.append({
+        "name": "sword", "parent": "hand.R", "joint": "ball",
+        "hp": 30, "severable": True, "tag": "prop",
+        # Pivot AT THE FIST: at the grip point along the shaft, centred on the
+        # hand in y/z. Derived from the two limb boxes so resizing either one
+        # keeps the sword in the hand.
+        "anchor": anchor((sword_mn[0] + SWORD_GRIP,
+                          hand_mn[1] + hand_sz[1] * 0.5,
+                          hand_mn[2] + hand_sz[2] * 0.5)),
+        "severImpactSpeed": 7.0,
+        # The blade's own frame, in MICRO units along the model's +X (outboard:
+        # the axis sword_vox lays the blade on). The melee sweep carves along
+        # this segment; emitting it from the same constants that built the mesh
+        # is what keeps the hitbox and the art from drifting apart (see the
+        # note by sword_vox above).
+        "edge": {"from": SWORD_GRIP + SWORD_GUARD, "to": SWORD_LEN,
+                 "axis": [1, 0, 0], "halfWidth": SWORD_HALF_W},
+        "spring": {"halflife": 0.09, "gain": 0.35, "maxAngle": 0.15}})
 
     # ---- IK chains ----
     # Legs are gait-driven. Arms get chains too so the avatar code can plant a

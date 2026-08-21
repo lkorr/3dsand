@@ -10,6 +10,58 @@ update DESIGN.md in the same commit or don't make the change.
 
 ---
 
+## You are probably not alone in this tree
+
+Several Claude sessions routinely work this repo **at the same time**. They have
+already, on separate occasions: dropped an authored block out of
+`materials.json` while every shader still compiled, swept another session's
+half-finished work into an unrelated commit, and left conflict markers inside
+JSON via a stash/pop. All of it was silent — green build, normal `git status`.
+
+`AGENTS_BOARD.md` (gitignored, append-only) is the shared scratchpad the
+sessions use to see each other. A `SessionStart` hook prints the open claims and
+the last 12 hours into your context automatically, so you start already knowing
+who is holding what.
+
+**Write to it only through `scripts/board.sh`** — it appends one line, which is
+safe under concurrent writes. Editing the board with Edit/Write rewrites the
+whole file and silently drops whatever another agent appended a second earlier.
+
+```bash
+bash scripts/board.sh active                     # who holds what right now
+bash scripts/board.sh claim "<files>" "<what>"   # BEFORE you start editing
+bash scripts/board.sh done "<what landed>"       # when you stop, or hand off
+bash scripts/board.sh note "<heads-up>"          # no claim, just information
+```
+
+What is actually required of you:
+
+- **Claim before editing anything shared** — `world.h`, `common.wgsl`,
+  `simulation.cpp`, `main.cpp`, `CLAUDE.md`, `DESIGN.md`, and every file under
+  `assets/materials/`, `assets/spells/`, `assets/tuner*`. `claim` warns you if
+  someone already holds an overlapping path; treat that warning as a reason to
+  re-read the file and reconcile, not as something to ride past.
+- **Re-check the board before a build, a commit, or a `--selftest` run.** These
+  are the three operations that collide hardest: `LNK1104` means someone's
+  `sandvox.exe` is live, and a selftest failure may belong to their tree rather
+  than yours (see the attribution rule below).
+- **Post a `done` with what actually landed**, not "finished". The next session
+  reads that line to know whether the thing it depends on exists yet.
+- **`note` anything cross-cutting the moment you decide it** — a constant you
+  changed, a JSON block you added, a file you are about to regenerate. The
+  `kVoxelMeters` and `stain`-block incidents were both one `note` away from
+  being non-events.
+- **A stale claim is not a lock.** If a claim is hours old and the file looks
+  untouched, it is abandoned; say so with a `note` and proceed. The board is
+  information, never a mutex — nothing blocks on it.
+
+This does not replace the freshness checks. Still run
+`ls --time-style=full-iso` on a hub file whose content you are depending on, and
+still re-`grep` an authored JSON block back out after a parallel-edit warning.
+The board tells you who is nearby; the mtime tells you what actually changed.
+
+---
+
 ## The three rules that outrank everything
 
 Every one of these is cheap to honor now and near-impossible to retrofit. A change

@@ -1006,6 +1006,40 @@
         "organic",
         "dissolvable"
       ]
+    },
+    {
+      "id": "steel",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 7800,
+      "hardness": 200,
+      "rubble": "gravel",
+      "colors": [
+        "#b8bfc8",
+        "#9aa2ad",
+        "#d8dee6"
+      ],
+      "tags": [
+        "mineral"
+      ],
+      "molten": "lava"
+    },
+    {
+      "id": "grip_leather",
+      "class": "solid",
+      "density": 900,
+      "hardness": 20,
+      "rubble": "dust",
+      "colors": [
+        "#3a2a1e",
+        "#2e2117",
+        "#4a3728"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ]
     }
   ]
 }

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Generate assets/mobs/wizard.{vox,json} — the PLAYER AVATAR: a robed
-wizard/witch rigged for dismemberment.
+"""Generate assets/mobs/wizard.{vox,json} — a robed wizard/witch rigged for
+dismemberment.
+
+NOT THE CURRENT PLAYER AVATAR. That is gen_mina.py; this file is kept as a
+second character. It is also MIS-SCALED for the player slot: the sizes below
+were authored assuming kVoxelMeters = 0.0625, but sim/world.h has long said
+0.10, which makes this figure 28 world voxels = 2.8 m tall against a 1.7 m
+player box — it towered over its own collider and the first-person camera sat
+inside its chest. Fix the height budget (or scale every z by 17/28) before
+pointing kAvatarDefName at it again.
 
 WHY THIS IS A MOB DEF. The avatar is authored in exactly the same format as
 critter/dummy and loaded by the same LoadMobDefs path, so it inherits the whole
@@ -12,11 +20,11 @@ Player's own position and input instead of MobSystem's wander drive. One
 schema, two drivers.
 
 SCALE 4. Every coordinate below is in MICRO units, 4 per world voxel, so the
-numbers here are 4x their world-voxel values. At kVoxelMeters = 0.0625 a world
-voxel is 6.25 cm, so a micro voxel is 1.5625 cm — fine enough for individual
-fingers, a hat brim, a beard and robe folds. The engine divides every POSITION
-by `scale` at load and builds the colliders at pitch 1/4, so the wizard is a
-normal-sized human (~1.75 m) with a very high-resolution skin, not a giant.
+numbers here are 4x their world-voxel values. A micro voxel is a quarter of a
+world voxel — fine enough for individual fingers, a hat brim, a beard and robe
+folds. The engine divides every POSITION by `scale` at load and builds the
+colliders at pitch 1/4. (The original comment here claimed this made a ~1.75 m
+human; that arithmetic used kVoxelMeters = 0.0625. See the header note.)
 
 BODY PLAN — 17 severable parts, which is the whole point of the exercise:
 
@@ -422,14 +430,16 @@ def staff_vox(size):
 #
 # MICRO units (4 per world voxel). Scene is Z-up; engine Y = scene Z, so the
 # z column below IS the height. The figure stands with feet at z=0 and the hat
-# tip near z=112, i.e. 28 world voxels = 1.75 m at kVoxelMeters 0.0625.
+# tip near z=112, i.e. 28 world voxels to the crown.
 #
 # Front is scene -Y throughout (see the module docstring).
-# HEIGHT BUDGET (micro units, 4 per world voxel, 1.5625 cm each). The player
-# AABB is 1.7 m tall (Player::kHalfY = 0.85 m), so the avatar must stand very
-# close to that or it visibly floats above / sinks into its own collision box.
-# 112 micro = 28 world voxels = 1.750 m to the crown; the hat tip goes higher,
-# which is correct — a hat is not part of your height.
+# HEIGHT BUDGET (micro units, 4 per world voxel). The player AABB is 1.7 m
+# tall (Player::kHalfY = 0.85 m), so an avatar must stand very close to that or
+# it visibly floats above / sinks into its own collision box. THIS RIG DOES
+# NOT: 28 world voxels is 1.75 m only at kVoxelMeters 0.0625, and the engine
+# runs at 0.10, making it 2.8 m. See the header note before using it as the
+# player. gen_mina.py derives its budget from the constants instead and
+# asserts it.
 #
 #   feet    z  0..6     boots
 #   shin    z  5..25    (overlaps the boot cuff)

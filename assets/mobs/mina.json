@@ -279,6 +279,35 @@
         10.0
       ],
       "severImpactSpeed": 12.0
+    },
+    {
+      "name": "sword",
+      "parent": "hand.R",
+      "joint": "ball",
+      "hp": 30,
+      "severable": true,
+      "tag": "prop",
+      "anchor": [
+        16,
+        30.0,
+        8.0
+      ],
+      "severImpactSpeed": 7.0,
+      "edge": {
+        "from": 12,
+        "to": 44,
+        "axis": [
+          1,
+          0,
+          0
+        ],
+        "halfWidth": 3
+      },
+      "spring": {
+        "halflife": 0.09,
+        "gain": 0.35,
+        "maxAngle": 0.15
+      }
     }
   ],
   "chains": [

@@ -145,6 +145,37 @@ float GroundProbe(const Vec3& pos, float reach, const Player::KindFn& kindAt) {
   return pos.y - test.y;
 }
 
+// DE-PENETRATION: lift the body out of ground it is already inside.
+//
+// Every sweep in this file is a hard VETO — SweepAxis refuses any substep that
+// ENDS overlapping a solid. That is correct while the body starts outside the
+// world, and it is a trap the moment it does not: once the AABB overlaps a
+// voxel, the very first substep of every axis fails, including the upward ones,
+// so nothing can move at all. The player is welded in place until they noclip
+// out. Getting there is routine rather than exotic — the CA drops a powder into
+// your feet, a step-down settle lands a fraction inside a face, a reaction grows
+// a solid where you stand — which is why walking noisy ground gets stuck so
+// often. No amount of tuning the sweeps helps, because the sweeps are working
+// as designed; what was missing is a way back OUT.
+//
+// So: scan upward in half-voxel increments for the first position that is free
+// and return how far up it is, or -1 if there is no free spot inside `maxRise`.
+// Upward only, and capped: a player standing shin-deep in a drift is lifted
+// clear, while one buried under a collapse stays buried (being entombed is a
+// real state the world can put you in, and teleporting out of it would be a
+// worse bug than being stuck). The cap is a caller's policy decision, not a
+// constant here.
+float UnstickRise(const Vec3& pos, float maxRise, const Player::KindFn& kindAt) {
+  if (!Collides(pos, kindAt)) return -1.0f;  // not stuck: nothing to do
+  const float kProbeStep = 0.5f;
+  for (float rise = kProbeStep; rise <= maxRise + 1e-4f; rise += kProbeStep) {
+    Vec3 test = pos;
+    test.y += rise;
+    if (!Collides(test, kindAt)) return rise;
+  }
+  return -1.0f;  // buried deeper than the cap allows: leave them in it
+}
+
 // Try to advance horizontally by (dx, dz) using the classic Quake/Source
 // three-attempt step move, and take whichever attempt travelled farther
 // horizontally. Returns the height climbed IN VOXELS (0 if the flat move won).
@@ -225,6 +256,36 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       viewYOffset *= std::pow(0.5f, dt / hl);
     else
       viewYOffset = 0.0f;  // knob at 0 disables smoothing entirely
+  }
+
+  // ---- unstick: eject a body that is already inside solid ground ----
+  //
+  // Runs BEFORE anything else moves, because every sweep below is a veto that
+  // fails outright from an overlapping start (see UnstickRise). Skipped in fly
+  // mode, where passing through solids is the whole point.
+  //
+  // The lift is RATE-LIMITED rather than teleported: a whole step height in one
+  // frame reads as a pop, and the cases this fires on are usually a voxel or two
+  // deep, so at a few m/s the eye barely registers it. It also self-limits — the
+  // moment the AABB is clear, UnstickRise returns -1 and this stops. The vertical
+  // velocity is cancelled on the way out so a body that was falling into the
+  // ground does not immediately drive itself back in, and the climb is banked
+  // into viewYOffset exactly like a step-up so the camera glides rather than
+  // jumps.
+  if (!fly) {
+    const float maxRise = T().unstickMaxDepth / kVoxelMeters;
+    float rise = UnstickRise(pos, maxRise, kindAt);
+    if (rise > 0.0f) {
+      float step = std::min(rise, (T().unstickSpeed / kVoxelMeters) * dt);
+      pos.y += step;
+      viewYOffset -= step;
+      if (vel.y < 0.0f) vel.y = 0.0f;
+      // Being lifted out counts as standing on the thing you were inside:
+      // without this the frame reports airborne, which strobes every
+      // grounded-gated system for as long as the ejection takes.
+      grounded = true;
+      coyoteTimer = T().coyoteTime;
+    }
   }
 
   // How much of the body is in liquid? Sample a fixed number of points spread

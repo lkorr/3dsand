@@ -133,6 +133,37 @@ class PlayerAvatar {
   const std::vector<Footfall>& Footfalls() const { return footfalls_; }
   void ClearFootfalls() { footfalls_.clear(); }
 
+  // ---- held weapon / melee (game/melee.h) ---------------------------------
+  // The swing pose, pushed in once per tick by main.cpp before PreTick. The
+  // avatar does NOT own the swing state machine and does not read input: it is
+  // told where the weapon hand should be and which way the blade points, and
+  // it aims the arm chain there. Same division as heading — main.cpp owns the
+  // policy, the avatar owns the rig.
+  //
+  // `handOffset` is relative to the weapon shoulder, in world voxels, in WORLD
+  // space (the caller built it from the camera basis). `weight` fades the
+  // whole thing against the ordinary animation pose, so sheathing eases out
+  // instead of snapping.
+  void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
+                     float weight);
+  // Which rig part is currently acting as the held weapon, by name, or "" for
+  // an empty hand. Parts not equipped are hidden, so one rig can carry several
+  // props and show only what is in hand.
+  void SetHeldPart(const std::string& partName);
+  const std::string& HeldPart() const { return heldPart_; }
+
+  // The held weapon's cutting edge in WORLD voxels, from the part's authored
+  // `edge` block through its live transform. False when nothing is held, the
+  // part is severed, or the def declares no edge. This is what the melee
+  // damage sweep carves along — reading it from the same transform the
+  // renderer draws means the hitbox cannot drift from the visible blade.
+  bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const;
+
+  // Is this Jolt body one of the avatar's own parts? A held weapon starts
+  // inside its wielder's hand and sweeps across their front, so the melee
+  // sweep would otherwise carve the arm holding it on every guard.
+  bool OwnsBody(uint64_t bodyHandle) const;
+
   // ---- damage / dismemberment ----
   // Same contract as MobSystem::Damage: returns true if the handle was one of
   // the avatar's limbs. A hit crossing a joint anchor, or one past the limb's
@@ -155,6 +186,11 @@ class PlayerAvatar {
   // Health is the summed hp of every LIVE part, rounded to an integer because
   // the caster VM is integer throughout (thesis 3 in spell.h).
   int32_t TotalHealth() const;
+  // The authored total across every limb — the HUD bar's denominator. Health
+  // NEVER regenerates, so this is a ceiling the player only moves away from;
+  // it is deliberately not lowered by severing, so a lost limb reads as a
+  // permanently short bar rather than as a full one on a smaller body.
+  int32_t HealthMax() const;
   // Spend health across live parts, proportionally to what each still has.
   // Distributing rather than draining one part keeps a mana overdraw from
   // arbitrarily severing whichever limb happens to be first in the list.
@@ -197,6 +233,10 @@ class PlayerAvatar {
   void SetHiddenParts(const std::vector<uint8_t>& hidden);
 
   // introspection (overlay / selftest)
+  // Jolt body of a part, or 0 when it is severed or never spawned. Mirrors
+  // MobSystem::LimbBody so a test can reach the same handle the damage paths
+  // are handed.
+  uint64_t PartBody(int part) const;
   int PartIndex(const std::string& name) const;
   int LivePartCount() const;
   int ActiveClips() const { return (int)anim_.clips.size(); }
@@ -254,7 +294,15 @@ class PlayerAvatar {
   // WALKING system — it only means anything when there is a floor under the
   // feet — so it is a parameter here rather than something UpdateAnimation
   // infers, and the airborne pose is handled explicitly (see UpdateAirPose).
-  void UpdateAnimation(float dt, World& world, bool grounded);
+  //
+  // `playerVel` is the player's TRUE velocity (world voxels/sec). It is passed
+  // in rather than differenced from origin_ because the player moves once per
+  // FRAME while this runs 0..4 times per frame — so a position delta over
+  // kTickDt measures the wrong interval every frame and reads zero on the
+  // second tick of a double-tick frame. See the note at the top of
+  // UpdateAnimation; that mismeasurement was the source of the limb jitter.
+  void UpdateAnimation(float dt, World& world, bool grounded,
+                       const Vec3& playerVel);
   void UpdateGait(float dt, World& world);
   // Airborne leg pose: relaxes the legs toward their rest hang instead of
   // leaving IK chasing a stale world-space foot plant.
@@ -291,14 +339,31 @@ class PlayerAvatar {
   Vec3 bodyUp_{0, 1, 0};
   float speedNow_ = 0;
   bool footInit_ = false;
+  // How strongly the leg IK is applied, 0..1. Eased rather than switched: on
+  // bumpy ground `grounded` is genuinely ragged, and gating the IK on it as a
+  // bool made the legs and arms snap between the IK pose and the rest hang on
+  // every bump — the "arms shoot straight up going uphill" tweaking. See the
+  // note in UpdateAnimation.
+  float gaitWeight_ = 0.0f;
   bool wasGrounded_ = true;
+  // Seconds spent continuously off the ground. `grounded` flickers false for a
+  // tick at a time crossing bumpy terrain, and the air-state clips used to fire
+  // on that raw edge — retriggering the arms-up `jump` one-shot on every bump.
+  // This debounces it; see the note in PreTick.
+  float airOffTime_ = 0.0f;
   // Downward speed on the last airborne tick, voxels/sec. Sampled while still
   // falling because the collision sweep zeroes vel.y before `grounded` flips.
   float lastFallSpeed_ = 0;
   bool running_ = false;
   float airTime_ = 0;
   uint64_t id_ = 0x5A11EDU;          // stable seed for gore variance
+  // Held weapon + swing pose, pushed in by main.cpp (SetWeaponPose). Pure
+  // presentation, like everything else here.
+  std::string heldPart_;
+  int heldPartIndex_ = -1;
+  Vec3 weaponHand_{}, weaponDir_{0, 1, 0}, weaponUp_{0, 0, 1};
+  float weaponWeight_ = 0;
 
   static constexpr float kSeverHoldSeconds = 0.25f;
-  static constexpr int kBleedOpsPerTick = 6;
+  // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)
 };

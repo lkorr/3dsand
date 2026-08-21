@@ -68,13 +68,20 @@ def main():
     dest = os.path.join(ROOT, "sandvox_tuner.exe")
     try:
         shutil.copy2(exe, dest)
-        where = dest
     except PermissionError:
-        # Already running; leave the dist copy and say so.
-        where = exe
-        print("note: could not overwrite %s (is it running?)" % dest)
+        # A RUNNING TUNER HOLDS THIS FILE, and falling back to the dist copy
+        # with a friendly note is how the root exe silently stayed months
+        # stale: the build "succeeded" every time, so nobody looked. The tool
+        # you double-click is the root one, so failing to replace it means the
+        # build did not do its job. Fail loudly and say exactly what to do.
+        print("\nERROR: %s is in use and could not be replaced." % dest)
+        print("       Close the tuner window(s), or run:")
+        print("           taskkill //F //IM sandvox_tuner.exe")
+        print("       then re-run this script. The fresh build is at:")
+        print("           %s" % exe)
+        return 1
 
-    print("\nbuilt: %s  (%.1f MB)" % (where, os.path.getsize(exe) / 1e6))
+    print("\nbuilt: %s  (%.1f MB)" % (dest, os.path.getsize(dest) / 1e6))
     print("double-click it from the project root.")
     return 0
 

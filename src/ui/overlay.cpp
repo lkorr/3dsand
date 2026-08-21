@@ -1,5 +1,7 @@
 #include "ui/overlay.h"
 
+#include <cstdio>
+
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_wgpu.h>
@@ -25,6 +27,81 @@ void Overlay::BeginFrame() {
   ImGui_ImplWGPU_NewFrame();
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
+}
+
+// ---- the player-facing HUD --------------------------------------------------
+//
+// Bottom-left, two stacked bars: health above mana. Deliberately NOT an ImGui
+// window — it is chrome, not a panel, so it neither moves, focuses, nor eats
+// the mouse, and it is drawn on the FOREGROUND list so nothing in the dev panel
+// can land on top of it.
+//
+// The dev panel's magic bar (Draw() below) stays as-is and keeps showing the
+// mana/health CROSSOVER on one shared axis, which is a debugging readout. This
+// HUD answers a different question — "how much of each do I have" — so the two
+// pools get one bar each and the cost is shown as drain off the right end of
+// whichever pool will pay it.
+void Overlay::DrawHUD(const UIState& s) {
+  ImDrawList* d = ImGui::GetForegroundDrawList();
+  const ImVec2 disp = ImGui::GetIO().DisplaySize;
+
+  const float w = 240.0f, h = 16.0f, pad = 18.0f, gap = 6.0f;
+  const float x = pad;
+  // Anchored to the BOTTOM edge: y is derived from display height so the HUD
+  // stays put when the window is resized.
+  const float yMana = disp.y - pad - h;
+  const float yHealth = yMana - gap - h;
+
+  // One bar: backdrop, fill, and an optional brighter "this is about to be
+  // spent" segment eating right-to-left off the end of the fill.
+  auto bar = [&](float y, int32_t cur, int32_t max, int32_t pending,
+                 ImU32 fill, ImU32 spend, const char* label) {
+    const ImVec2 p(x, y), q(x + w, y + h);
+    d->AddRectFilled(ImVec2(p.x - 2, p.y - 2), ImVec2(q.x + 2, q.y + 2),
+                     IM_COL32(0, 0, 0, 110), 3.0f);          // outer scrim
+    d->AddRectFilled(p, q, IM_COL32(18, 20, 28, 220), 2.0f);  // empty track
+    if (max > 0) {
+      if (cur < 0) cur = 0;
+      if (cur > max) cur = max;
+      const float frac = (float)cur / (float)max;
+      const float fx = p.x + w * frac;
+      if (frac > 0) d->AddRectFilled(p, ImVec2(fx, q.y), fill, 2.0f);
+      // Pending cost: the part of the fill this pool is about to lose.
+      if (pending > 0) {
+        int32_t take = pending < cur ? pending : cur;
+        if (take > 0) {
+          const float sx = p.x + w * ((float)(cur - take) / (float)max);
+          d->AddRectFilled(ImVec2(sx, p.y), ImVec2(fx, q.y), spend, 2.0f);
+        }
+      }
+    }
+    d->AddRect(p, q, IM_COL32(255, 255, 255, 45), 2.0f);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s %d/%d", label, cur < 0 ? 0 : cur, max);
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    const ImVec2 tp(p.x + 6, p.y + (h - ts.y) * 0.5f);
+    d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), buf);
+    d->AddText(tp, IM_COL32(235, 238, 245, 255), buf);
+  };
+
+  // A spoken spell drains mana first and only bites into health past it — the
+  // same split ResolveCast() applies, so the HUD cannot promise a cost the VM
+  // will not charge.
+  const int32_t fromMana = s.spellCost < s.mana ? s.spellCost : s.mana;
+  const int32_t fromHealth = s.spellCost - fromMana;
+
+  bar(yHealth, s.health, s.healthMax, fromHealth, IM_COL32(190, 55, 55, 235),
+      IM_COL32(255, 140, 60, 245), "hp");
+  bar(yMana, s.mana, s.manaMax, fromMana, IM_COL32(70, 120, 230, 235),
+      IM_COL32(150, 200, 255, 245), "mp");
+
+  if (!s.playerAlive) {
+    const char* dead = "DEAD";
+    const ImVec2 ts = ImGui::CalcTextSize(dead);
+    const ImVec2 tp(x, yHealth - ts.y - 6);
+    d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);
+    d->AddText(tp, IM_COL32(255, 70, 60, 255), dead);
+  }
 }
 
 void Overlay::Draw(UIState& s) {
@@ -155,6 +232,29 @@ void Overlay::Draw(UIState& s) {
   }
   ImGui::Separator();
 
+  // ---- hotbar + melee (game/item.h, game/melee.h) ---------------------------
+  // The swing readout exists to make the input FALSIFIABLE. A cut is directed
+  // by mouse motion, so when it goes wrong the player needs to tell "the game
+  // misread my flick" from "I misjudged the distance" — showing the phase and
+  // the speed the state machine actually measured is what makes that
+  // answerable instead of a matter of opinion.
+  if (!s.itemNames.empty()) {
+    std::string strip;
+    for (size_t i = 0; i < s.itemNames.size(); i++) {
+      if (s.itemNames[i].empty()) continue;
+      const bool sel = (int)i == s.itemSelected;
+      strip += (sel ? "[" : " ") + std::to_string((i + 1) % 10) + ":" +
+               s.itemNames[i] + (sel ? "] " : "  ");
+    }
+    if (!strip.empty()) ImGui::TextDisabled("%s", strip.c_str());
+  }
+  if (s.swingPhase && s.swingPhase[0]) {
+    ImGui::Text("swing %s", s.swingPhase);
+    ImGui::SameLine();
+    ImGui::TextDisabled("  mouse %.0f px/s", s.swingSpeed);
+  }
+  ImGui::Separator();
+
   if (ImGui::Button(s.paused ? "resume (P)" : "pause (P)")) s.paused = !s.paused;
   ImGui::SameLine();
   if (ImGui::Button("step (N)")) s.stepOnce = true;
@@ -196,7 +296,12 @@ void Overlay::Draw(UIState& s) {
   ImGui::RadioButton("prefab", &s.tool, UIState::kToolPrefab);
   ImGui::SameLine();
   ImGui::RadioButton("mob", &s.tool, UIState::kToolMob);
+  ImGui::SameLine();
+  ImGui::RadioButton("sword", &s.tool, UIState::kToolMelee);
 
+  if (s.tool == UIState::kToolMelee) {
+    ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
+  }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
   } else if (s.tool == UIState::kToolLaser) {

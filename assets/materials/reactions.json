@@ -1,5 +1,5 @@
 {
-  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick \u2014 put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes.",
+  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick — put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes.",
   "reactions": [
     {
       "note": "-------- fire: short-lived rising flame; doused by water --------"
@@ -260,7 +260,8 @@
       "self": "ice",
       "neighbor": "water",
       "chance": 6,
-      "neighborBecomes": "ice"
+      "neighborBecomes": "ice",
+      "requires": "waterFreezes"
     },
     {
       "self": "snow",
@@ -308,7 +309,7 @@
       "becomes": "plant"
     },
     {
-      "note": "stem growth must stay decisively subcritical: mean stalk = up/(up-decays) cells, branches-per-stalk = stalk * side/(side+decays). At 380/4/78 that is ~6-cell stalks with R~0.3 branches \u2014 the epidemic dies out and chunks sleep. Raising side or up can make growth self-sustaining forever (measured: 400/6/52 never settles)."
+      "note": "stem growth must stay decisively subcritical: mean stalk = up/(up-decays) cells, branches-per-stalk = stalk * side/(side+decays). At 380/4/78 that is ~6-cell stalks with R~0.3 branches — the epidemic dies out and chunks sleep. Raising side or up can make growth self-sustaining forever (measured: 400/6/52 never settles)."
     },
     {
       "self": "stem",
@@ -356,7 +357,7 @@
       "neighborBecomes": "fungus"
     },
     {
-      "note": "-------- mites: wandering critters \u2014 eat the garden, breed on plants, drown, expire --------"
+      "note": "-------- mites: wandering critters — eat the garden, breed on plants, drown, expire --------"
     },
     {
       "self": "mite",
@@ -464,7 +465,7 @@
       "note": "======== DAY/NIGHT INTERACTIONS ========================================\nThese carry the light conditions added with the day/night cycle:\n  \"needsSky\": true   the cell must have open sky above it (bounded probe up)\n  \"when\": \"day\"      only while the sun is up  |  \"night\" only while it is down\n  \"minLight\": 0-255  a floor on daylight strength (255 = only at high noon)\n\nAll three are integer and derived from the tick-based day phase, so they are\nas deterministic as every other rule (CLAUDE.md rule 1).\n\nSLEEP DISCIPLINE (rule 2): a rule whose light condition is UNMET does not hold\nits chunk awake, so a pond sleeps all night instead of spinning. The engine\nwakes every chunk on the tick daylight switches on or off (Simulation::\nEncodeWakeAll), which is a few ticks per in-game day. Chances are kept low so\nthese are a slow background weathering, not a strobe."
     },
     {
-      "note": "-------- sun + water: evaporation --------\nSPREAD WATER burns off in the sun; BODIES of water do not. This is the mirror\nimage of the freezing rule below, and it is the whole reason evaporation is\ninteresting rather than just a slow leak on every pond.\n\nThe chance is scaled by how many of the six face neighbours are NOT water\n(\"neighbor\": \"water\" + \"invert\": true), with a minCount of 4 \u2014 so a cell needs\nto be mostly OUT of the water before the sun can take it:\n\n  - 0 non-water (deep water)               never. Fully enclosed.\n  - 1 non-water (flat pond surface, air     never. This is the case that\n    above and water on all five other       matters: a pond's surface is NOT\n    sides)                                  consumed, so ponds are stable.\n  - 2-3 non-water (surface near a bank)    never. Still reads as \"pond\".\n  - 4 non-water (a rim cell, a thin sheet) base rate, ~1 real minute.\n  - 5 non-water (nearly isolated)          1.3x\n  - 6 non-water (a lone droplet on stone)  3x, ~40 real seconds.\n\nSo rain puddles and splash thrown onto hot rock steam away while the lake they\ncame from sits there. Because a pond can only ever lose cells from its rim,\nand losing a rim cell exposes the next one, a SHALLOW puddle still dries up\nfrom its edges inward \u2014 it just takes minutes, not seconds.\n\nminLight 120 confines it to the middle of the day (the rule is live for about\na quarter of the cycle), and needsSky keeps water in caves and under canopy\nintact. Strictly consumptive (water -> steam -> mostly air), so it is\nsubcritical by construction: it can only ever remove water."
+      "note": "-------- sun + water: evaporation --------\nSPREAD WATER burns off in the sun; BODIES of water do not. This is the mirror\nimage of the freezing rule below, and it is the whole reason evaporation is\ninteresting rather than just a slow leak on every pond.\n\nThe chance is scaled by how many of the six face neighbours are NOT water\n(\"neighbor\": \"water\" + \"invert\": true), with a minCount of 4 — so a cell needs\nto be mostly OUT of the water before the sun can take it:\n\n  - 0 non-water (deep water)               never. Fully enclosed.\n  - 1 non-water (flat pond surface, air     never. This is the case that\n    above and water on all five other       matters: a pond's surface is NOT\n    sides)                                  consumed, so ponds are stable.\n  - 2-3 non-water (surface near a bank)    never. Still reads as \"pond\".\n  - 4 non-water (a rim cell, a thin sheet) base rate, ~1 real minute.\n  - 5 non-water (nearly isolated)          1.3x\n  - 6 non-water (a lone droplet on stone)  3x, ~40 real seconds.\n\nSo rain puddles and splash thrown onto hot rock steam away while the lake they\ncame from sits there. Because a pond can only ever lose cells from its rim,\nand losing a rim cell exposes the next one, a SHALLOW puddle still dries up\nfrom its edges inward — it just takes minutes, not seconds.\n\nminLight 120 confines it to the middle of the day (the rule is live for about\na quarter of the cycle), and needsSky keeps water in caves and under canopy\nintact. Strictly consumptive (water -> steam -> mostly air), so it is\nsubcritical by construction: it can only ever remove water."
     },
     {
       "self": "water",
@@ -492,7 +493,7 @@
       "becomes": "water"
     },
     {
-      "note": "-------- snow and ice follow the sun --------\nSnow in direct sun melts; exposed water freezes on clear nights. These two are\nopposed, which is exactly what makes them safe: they cannot both fire in the\nsame phase, so there is no melt/freeze loop that keeps chunks awake. The ice\nrule needs sky so lakes freeze from the top and cave water stays liquid, and it\nis scaled by neighbour count so a pond freezes shore-first \u2014 see the note on\nthe water rule below."
+      "note": "-------- snow and ice follow the sun --------\nSnow in direct sun melts; exposed water freezes on clear nights. These two are\nopposed, which is exactly what makes them safe: they cannot both fire in the\nsame phase, so there is no melt/freeze loop that keeps chunks awake. The ice\nrule needs sky so lakes freeze from the top and cave water stays liquid, and it\nis scaled by neighbour count so a pond freezes shore-first — see the note on\nthe water rule below."
     },
     {
       "self": "snow",
@@ -501,7 +502,8 @@
       "when": "day",
       "minLight": 120,
       "chance": 4,
-      "becomes": "water"
+      "becomes": "water",
+      "requires": "iceMelts"
     },
     {
       "self": "ice",
@@ -510,7 +512,8 @@
       "when": "day",
       "minLight": 160,
       "chance": 2,
-      "becomes": "water"
+      "becomes": "water",
+      "requires": "iceMelts"
     },
     {
       "note": "Ice grows from the SHORE inward, it does not flash-freeze the pond.\nThe chance is scaled by how many of the six face neighbours are NOT water\n(\"neighbor\": \"water\" + \"invert\": true), which produces the real behaviour for\nfree:\n\n  - Deep interior water is surrounded by water: count 0, chance 0, it CANNOT\n    freeze. No ice ever nucleates in open water.\n  - Water touching the bank, or the pond surface (the cell above is air), has\n    count >= 1 and freezes at the base rate.\n  - Every voxel that DOES freeze becomes ice, which is itself non-water, so it\n    raises its liquid neighbours' count and their odds. The front feeds itself\n    and creeps inward.\n  - A cell in a narrow channel, nearly enclosed by bank and ice, hits count 6\n    and freezes at scaleMax (4x).\n\nThis is decisively subcritical (rule 2) despite being self-reinforcing: it\nconverts water and water does not come back at night, so the frontier is a\nshrinking 2D surface that terminates when the pond is solid. The day rule above\nmelts it back, and the two cannot fire in the same phase."
@@ -526,10 +529,11 @@
         "neighbor": "water",
         "invert": true,
         "scaleMax": 4
-      }
+      },
+      "requires": "waterFreezes"
     },
     {
-      "note": "-------- growth follows the light --------\nPlants only put on growth in daylight. The existing stem/sprout rules are left\nalone (their subcritical budget is carefully tuned \u2014 see the stem note above);\nthese are the ADDITIONAL daylight-only behaviours.\n\nGrass creeping onto lit soil is the one rule here that creates new matter, so\nit is the one to watch: it is capped by needsSky (only the exposed top surface\nof the ground qualifies) and by requiring a soil neighbour, so the frontier is\na 2D surface, not a volume, and it terminates when the surface is covered. At\n3 per mille it spreads about a cell per 10 in-game seconds of daylight."
+      "note": "-------- growth follows the light --------\nPlants only put on growth in daylight. The existing stem/sprout rules are left\nalone (their subcritical budget is carefully tuned — see the stem note above);\nthese are the ADDITIONAL daylight-only behaviours.\n\nGrass creeping onto lit soil is the one rule here that creates new matter, so\nit is the one to watch: it is capped by needsSky (only the exposed top surface\nof the ground qualifies) and by requiring a soil neighbour, so the frontier is\na 2D surface, not a volume, and it terminates when the surface is covered. At\n3 per mille it spreads about a cell per 10 in-game seconds of daylight."
     },
     {
       "self": "grass",
@@ -590,7 +594,7 @@
       "selfBecomes": "fire"
     },
     {
-      "note": "-------- NOT IMPLEMENTED: overnight dew on foliage --------\nA night-time \"leaves emit steam upward\" rule was tried twice and REMOVED both\ntimes. Recording it here so it is not re-attempted a third time.\n\nAttempt 1 \u2014 plain emit. doReactions() set keepAwake as soon as an emit rule\nfound an adjacent air cell, before rolling its chance, so every leaf with air\nabove it pinned its chunk awake all night: 292/32768 chunks active after 2900\nsettle ticks, against a budget of 32 (CLAUDE.md rule 2).\n\nAttempt 2 \u2014 after making light-gated rules skip keepAwake (that change was\nkept; it is correct and the other gated rules need it). Still 250 chunks\nawake, now as a permanent steam plume: every canopy leaf is a SOURCE, the\nsteam it emits is a gas that moves every tick and re-dirties its chunk, and\nemission outpaces steam's decay. Awake chunks were a vertical column at fixed\nx,z \u2014 a plume, not a settling neighbourhood.\n\nThe lesson is rule 2's: a permanent emitter has no terminus, so no chance\nvalue makes it settle. Dew needs a FINITE source \u2014 e.g. a dew material that\nleaves deposit once and consume, or a decay on something that runs out.\nLeft out rather than shipped breaking the sleep guarantee."
+      "note": "-------- NOT IMPLEMENTED: overnight dew on foliage --------\nA night-time \"leaves emit steam upward\" rule was tried twice and REMOVED both\ntimes. Recording it here so it is not re-attempted a third time.\n\nAttempt 1 — plain emit. doReactions() set keepAwake as soon as an emit rule\nfound an adjacent air cell, before rolling its chance, so every leaf with air\nabove it pinned its chunk awake all night: 292/32768 chunks active after 2900\nsettle ticks, against a budget of 32 (CLAUDE.md rule 2).\n\nAttempt 2 — after making light-gated rules skip keepAwake (that change was\nkept; it is correct and the other gated rules need it). Still 250 chunks\nawake, now as a permanent steam plume: every canopy leaf is a SOURCE, the\nsteam it emits is a gas that moves every tick and re-dirties its chunk, and\nemission outpaces steam's decay. Awake chunks were a vertical column at fixed\nx,z — a plume, not a settling neighbourhood.\n\nThe lesson is rule 2's: a permanent emitter has no terminus, so no chance\nvalue makes it settle. Dew needs a FINITE source — e.g. a dew material that\nleaves deposit once and consume, or a decay on something that runs out.\nLeft out rather than shipped breaking the sleep guarantee."
     }
   ]
 }

@@ -74,7 +74,7 @@ let docDirty = false;
 // --- tools ---------------------------------------------------------------
 const MODES = ['attach', 'erase', 'paint'];
 let mode = 'attach';
-const BRUSHES = ['voxel', 'box', 'face', 'select', 'noise'];
+const BRUSHES = ['voxel', 'box', 'face', 'select', 'noise', 'move'];
 let brush = 'voxel';
 let selection = null;         // { lo:[x,y,z], hi:[x,y,z], model } active-model-local
 let mirror = { x: false, y: false, z: false };   // Y/Z wired, UI exposes X
@@ -156,7 +156,11 @@ function inBounds(x, y, z) {
 // Material at an EDIT-SPACE cell (model-local, or prefab-space in whole mode).
 function cellGet(x, y, z) {
   if (!wholeMode) return gridGet(grid, x, y, z);
-  for (const m of doc.models) {
+  for (let mi = 0; mi < doc.models.length; mi++) {
+    // Hidden limbs are transparent to the raycast too, so you can click
+    // through a hidden torso onto the arm behind it.
+    if (!modelVisible(mi)) continue;
+    const m = doc.models[mi];
     const v = gridGet(m.grid, x - m.offset.x, y - m.offset.y, z - m.offset.z);
     if (v) return v;
   }
@@ -174,6 +178,9 @@ function ownerOf(x, y, z) {
   if (!wholeMode) return { mi: activeModel, lx: x, ly: y, lz: z };
   let empty = null;
   for (let mi = 0; mi < doc.models.length; mi++) {
+    // A hidden limb is not a paint target: writing into something invisible
+    // is indistinguishable from the edit being dropped.
+    if (!modelVisible(mi)) continue;
     const m = doc.models[mi];
     const lx = x - m.offset.x, ly = y - m.offset.y, lz = z - m.offset.z;
     const d = m.dim;
@@ -285,6 +292,126 @@ function reboundDoc() {
     for (const m of doc.models)
       for (const a of ['x', 'y', 'z']) m.offset[a] -= mn[a];
   doc.size = { x: mx.x - mn.x, y: mx.y - mn.y, z: mx.z - mn.z };
+}
+
+/**
+ * Translate a whole model by a voxel delta. Geometry lives in the model's own
+ * grid, so moving a limb is purely a change of `offset` — no voxels are
+ * rewritten and the shape cannot be clipped or resampled.
+ *
+ * The limb's `anchor` moves with it. Geometry (model.offset -> restOffset,
+ * mob.cpp:692) and joints (sidecar anchor -> anchorLocal) are INDEPENDENT in
+ * the format, so a move that touched only one would slide the joint out of the
+ * mesh. Carrying both is what makes this a "move the limb" rather than a "move
+ * the voxels"; a caller that wants the joint to stay put can pass
+ * moveAnchor:false and drag the orange ball afterwards.
+ *
+ * reboundDoc() may rebase every offset afterwards (it keeps the prefab's min
+ * corner at 0, matching the engine's load-time rebase). That shift applies to
+ * models and anchors alike, so it is applied to both here — otherwise moving
+ * one limb below the origin would silently desync every OTHER limb's anchor.
+ */
+function moveModel(i, d, moveAnchor = true) {
+  if (!doc) return false;
+  const m = doc.models[i];
+  if (!m) return false;
+  const dx = d.x | 0, dy = d.y | 0, dz = d.z | 0;
+  if (!dx && !dy && !dz) return false;
+
+  const anchorsOf = name => {
+    if (!moveAnchor || !sidecar || !Array.isArray(sidecar.limbs)) return [];
+    return sidecar.limbs.filter(l => l.name === name &&
+      Array.isArray(l.anchor) && l.anchor.length === 3);
+  };
+  for (const l of anchorsOf(m.name)) {
+    l.anchor[0] += dx; l.anchor[1] += dy; l.anchor[2] += dz;
+  }
+
+  const before = { x: m.offset.x, y: m.offset.y, z: m.offset.z };
+  m.offset.x += dx; m.offset.y += dy; m.offset.z += dz;
+
+  // Note the rebase by watching what reboundDoc did to THIS model, then apply
+  // the same correction to every anchor in the file.
+  const expect = { x: before.x + dx, y: before.y + dy, z: before.z + dz };
+  reboundDoc();
+  const rb = { x: m.offset.x - expect.x, y: m.offset.y - expect.y,
+               z: m.offset.z - expect.z };
+  if ((rb.x || rb.y || rb.z) && sidecar && Array.isArray(sidecar.limbs))
+    for (const l of sidecar.limbs)
+      if (Array.isArray(l.anchor) && l.anchor.length === 3) {
+        l.anchor[0] += rb.x; l.anchor[1] += rb.y; l.anchor[2] += rb.z;
+      }
+
+  // Structural: offsets are not in the quad-format undo log, so a stale log
+  // would replay voxel edits at the wrong place (same reason as splitSelection).
+  clearUndo();
+  markDirty();
+  needsRebuild = true;
+  hooks.onModelsChanged?.();
+  updateStatus();
+  return true;
+}
+
+/**
+ * Grow a model's box by `pad` voxels on each side that needs it, so there is
+ * empty space to paint into. A model's grid is exactly its authored bounds, so
+ * after moving a limb the gap it left is inside NO box — ownerOf returns null
+ * there and applyOps silently drops the write. That reads as "the editor won't
+ * let me paint", which is why this exists as an explicit, undo-clearing op.
+ *
+ * Voxels keep their world position: the grid is re-blitted at the new offset,
+ * and the anchor is untouched because nothing moved on screen.
+ */
+function growModel(i, pad) {
+  if (!doc) return false;
+  const m = doc.models[i];
+  if (!m) return false;
+  const p = {
+    lo: { x: pad.lo?.x | 0, y: pad.lo?.y | 0, z: pad.lo?.z | 0 },
+    hi: { x: pad.hi?.x | 0, y: pad.hi?.y | 0, z: pad.hi?.z | 0 },
+  };
+  const dim = { x: m.dim.x + p.lo.x + p.hi.x, y: m.dim.y + p.lo.y + p.hi.y,
+                z: m.dim.z + p.lo.z + p.hi.z };
+  if (dim.x < 1 || dim.y < 1 || dim.z < 1) return false;
+  const g = makeGrid(dim);
+  // Negative padding CROPS, so the destination must be range-checked: a raw
+  // gridSet with a negative index writes into the neighbouring row instead of
+  // failing, which would smear voxels across the model rather than cut them.
+  let cropped = 0;
+  for (let z = 0; z < m.dim.z; z++)
+    for (let y = 0; y < m.dim.y; y++)
+      for (let x = 0; x < m.dim.x; x++) {
+        const v = gridGet(m.grid, x, y, z);
+        if (!v) continue;
+        const nx = x + p.lo.x, ny = y + p.lo.y, nz = z + p.lo.z;
+        if (nx < 0 || ny < 0 || nz < 0 ||
+            nx >= dim.x || ny >= dim.y || nz >= dim.z) { cropped++; continue; }
+        gridSet(g, nx, ny, nz, v);
+      }
+  if (cropped) hooks.toast(`cropped ${cropped} voxel` + (cropped === 1 ? '' : 's'), true);
+  m.grid = g; m.dim = dim;
+  // Growing on the low side moves the box's min corner outward, so the offset
+  // has to walk back by the same amount or the content would jump.
+  m.offset.x -= p.lo.x; m.offset.y -= p.lo.y; m.offset.z -= p.lo.z;
+  if (i === activeModel) grid = g;
+  // Same rebase hazard as moveModel: growing below the origin makes
+  // reboundDoc shift every offset, and anchors must follow or every OTHER
+  // limb's joint silently desyncs from its mesh.
+  const expect = { x: m.offset.x, y: m.offset.y, z: m.offset.z };
+  reboundDoc();
+  const rb = { x: m.offset.x - expect.x, y: m.offset.y - expect.y,
+               z: m.offset.z - expect.z };
+  if ((rb.x || rb.y || rb.z) && sidecar && Array.isArray(sidecar.limbs))
+    for (const l of sidecar.limbs)
+      if (Array.isArray(l.anchor) && l.anchor.length === 3) {
+        l.anchor[0] += rb.x; l.anchor[1] += rb.y; l.anchor[2] += rb.z;
+      }
+  clearUndo();
+  markDirty();
+  needsRebuild = true;
+  hooks.onModelsChanged?.();
+  updateStatus();
+  return true;
 }
 
 function setActiveModel(i) {
@@ -752,6 +879,55 @@ const DIM_UNSELECTED = 0.16;
 
 let cappedWarned = false;
 
+/* ---- per-model visibility (hide / solo) --------------------------------
+   Keyed by model NAME, not index: models get added, removed and reordered,
+   and an index-keyed set would silently start hiding the wrong limb. Purely
+   a view state — never saved, and it does not touch the grids.
+
+   Hidden models are also unpickable, so painting cannot land in a limb you
+   cannot see. Solo is the inverse selection and wins over hide. */
+let hiddenModels = new Set();
+let soloModels = new Set();
+
+/** True when this model should be drawn and picked. */
+function modelVisible(mi) {
+  const m = doc?.models[mi];
+  if (!m) return false;
+  if (soloModels.size) return soloModels.has(m.name);
+  return !hiddenModels.has(m.name);
+}
+
+export const isModelHidden = name => hiddenModels.has(name);
+export const isModelSolo = name => soloModels.has(name);
+export const anySolo = () => soloModels.size > 0;
+
+export function toggleModelHidden(name) {
+  if (hiddenModels.has(name)) hiddenModels.delete(name);
+  else { hiddenModels.add(name); soloModels.delete(name); }
+  needsRebuild = true;
+  hooks.onModelsChanged?.();
+  updateStatus();
+}
+
+export function toggleModelSolo(name) {
+  if (soloModels.has(name)) soloModels.delete(name);
+  else { soloModels.add(name); hiddenModels.delete(name); }
+  needsRebuild = true;
+  hooks.onModelsChanged?.();
+  updateStatus();
+}
+
+/** Clear both sets — the "show everything again" escape hatch. */
+export function showAllModels() {
+  if (!hiddenModels.size && !soloModels.size) return false;
+  hiddenModels = new Set();
+  soloModels = new Set();
+  needsRebuild = true;
+  hooks.onModelsChanged?.();
+  updateStatus();
+  return true;
+}
+
 function rebuildInstances() {
   if (!cubes || !doc) return;
   let n = 0;
@@ -811,6 +987,7 @@ function rebuildInstances() {
   } else {
     for (let mi = 0; mi < doc.models.length; mi++) {
       const m = doc.models[mi];
+      if (!modelVisible(mi)) continue;
       // Gait preview supplies a per-model transform; without it models sit at
       // their static prefab offsets.
       const xf = hooks.modelTransform?.(mi) || null;
@@ -1153,6 +1330,27 @@ function gizmoHitTest(px, py) {
   return Math.hypot(px - sx, py - sy) < 14;   // px radius, generous on purpose
 }
 
+/**
+ * Ray/plane intersection in EDIT space for the move brush. The plane passes
+ * through the grabbed cell and faces the camera, which is the same trick
+ * gizmoDrag uses — it keeps the model tracking the cursor at any orbit angle
+ * instead of being confined to one world axis.
+ */
+function movePlanePoint(px, py, h, nOverride, p0Override) {
+  const r = canvas.getBoundingClientRect();
+  _ndc.set(((px - r.left) / r.width) * 2 - 1, -((py - r.top) / r.height) * 2 + 1);
+  const o = camera.position.clone();
+  const d = new THREE.Vector3(_ndc.x, _ndc.y, 0.5).unproject(camera).sub(o).normalize();
+  const n = nOverride || camera.getWorldDirection(new THREE.Vector3()).negate();
+  const c = h ? toWorld(h.cell[0], h.cell[1], h.cell[2]) : null;
+  const p0 = p0Override || new THREE.Vector3(c.x + 0.5, c.y + 0.5, c.z + 0.5);
+  const denom = n.dot(d);
+  if (Math.abs(denom) < 1e-6) return null;
+  const t = n.dot(p0.clone().sub(o)) / denom;
+  if (t <= 0) return null;
+  return o.addScaledVector(d, t);
+}
+
 function gizmoDrag(px, py) {
   const r = canvas.getBoundingClientRect();
   _ndc.set(((px - r.left) / r.width) * 2 - 1, -((py - r.top) / r.height) * 2 + 1);
@@ -1370,6 +1568,33 @@ function onPointerDown(ev) {
     return;
   }
 
+  // Move brush: grab the model under the cursor and slide it. Picking by the
+  // clicked voxel rather than using activeModel means you grab the limb you
+  // are pointing at, which is the whole point of a direct-manipulation move.
+  if (brush === 'move') {
+    // pickCell works in EDIT space, which is the active model's box unless
+    // whole mode is on; ownerOf is the one place that maps a cell back to the
+    // model that actually owns it. Outside whole mode that is activeModel by
+    // definition, so grabbing a specific limb means turning whole mode on.
+    const own = h.cell[1] < 0 ? null : ownerOf(h.cell[0], h.cell[1], h.cell[2]);
+    const mi = own ? own.mi : activeModel;
+    const m = doc.models[mi];
+    if (!m) return;
+    drag = {
+      move: true, mi,
+      start: { x: m.offset.x, y: m.offset.y, z: m.offset.z },
+      applied: { x: 0, y: 0, z: 0 },
+      // Drag on the plane through the grabbed cell facing the camera, and
+      // remember where on it the grab started, so the model tracks the cursor
+      // instead of jumping its centre there.
+      p0: movePlanePoint(ev.clientX, ev.clientY, h),
+      n: camera.getWorldDirection(new THREE.Vector3()).negate(),
+    };
+    if (mi !== activeModel) setActiveModel(mi);
+    canvas.setPointerCapture(ev.pointerId);
+    return;
+  }
+
   // Alt-click is the eyedropper in every mode.
   if (ev.altKey) {
     const v = cellGet(h.cell[0], h.cell[1], h.cell[2]);
@@ -1425,6 +1650,31 @@ function onPointerMove(ev) {
     }
     return;
   }
+  if (drag && drag.move) {
+    if (!drag.p0) return;
+    const p = movePlanePoint(ev.clientX, ev.clientY, null, drag.n, drag.p0);
+    if (!p) return;
+    // Snap the CUMULATIVE delta from the grab point, not a per-event delta:
+    // rounding each frame would let sub-voxel remainders accumulate and the
+    // model would creep away from the cursor over a long drag.
+    const want = {
+      x: Math.round(p.x - drag.p0.x),
+      y: Math.round(p.y - drag.p0.y),
+      z: Math.round(p.z - drag.p0.z),
+    };
+    if (want.x === drag.applied.x && want.y === drag.applied.y &&
+        want.z === drag.applied.z) return;
+    // moveModel takes a relative step, so send the difference from what is
+    // already applied. It also rebases, which is why `start` is not simply
+    // written back here.
+    const step = { x: want.x - drag.applied.x, y: want.y - drag.applied.y,
+                   z: want.z - drag.applied.z };
+    // Deliberately NOT onSidecarChanged: that hook means "a different sidecar
+    // was loaded" and resets the rig panel's selected part, which would drop
+    // the limb being dragged. moveModel already fired onModelsChanged.
+    if (moveModel(drag.mi, step)) drag.applied = want;
+    return;
+  }
   if (drag && drag.select) {
     const h = pickCell(ev.clientX, ev.clientY);
     if (h) {
@@ -1466,6 +1716,17 @@ function onPointerUp(ev) {
     drag = null;
     // `true` = the drag finished, which is what auto-key listens for.
     rotState?.onChange?.(rotState.quat, true);
+    return;
+  }
+  if (drag.move) {
+    const d = drag.applied, name = doc.models[drag.mi]?.name || 'model';
+    drag = null;
+    if (d.x || d.y || d.z) {
+      const scl = +(sidecar?.scale) || 1;
+      hooks.toast(`moved ${name} by ${d.x},${d.y},${d.z}` +
+        (scl > 1 ? ` (${(d.x / scl).toFixed(2)},${(d.y / scl).toFixed(2)},` +
+                   `${(d.z / scl).toFixed(2)} world voxels)` : ''));
+    }
     return;
   }
   if (drag.select) {
@@ -1526,6 +1787,7 @@ function onKeyDown(ev) {
   else if (k === 'g') { setBrush('box'); ev.preventDefault(); }
   else if (k === 'f') { setBrush('face'); ev.preventDefault(); }
   else if (k === 'v') { setBrush('select'); ev.preventDefault(); }
+  else if (k === 'x') { setBrush('move'); ev.preventDefault(); }
   else if (k === 'n') { setBrush('noise'); ev.preventDefault(); }
   else if (k === 'w') { setWholeMode(!wholeMode); ev.preventDefault(); }
   else if (k === 'm') { mirror.x = !mirror.x; updateMirrorPlane(); renderToolbar(); ev.preventDefault(); }
@@ -1550,6 +1812,14 @@ function setBrush(b) {
   if (b === 'select' && wholeMode) {
     hooks.toast('select works on one model — turn off Whole [W] first', true);
     return;
+  }
+  // Move is the mirror of select: select needs ONE model's coordinate space,
+  // move needs to see every box so ownerOf can tell which limb was grabbed.
+  // Turning whole mode on here rather than refusing keeps it one click.
+  if (b === 'move' && !wholeMode) {
+    setWholeMode(true);
+    hooks.toast('Move: whole mode on so every limb is grabbable — ' +
+      'drag a limb to slide it, its anchor follows');
   }
   brush = b; drag = null; renderToolbar();
 }
@@ -1828,7 +2098,10 @@ function updateStatus() {
     (microSubdiv ? `  ·  micro ${microSubdiv}³` : '') +
     (scl > 1 ? `  ·  scale ${scl} → world ${Math.ceil(ws.x / scl)}×` +
                `${Math.ceil(ws.y / scl)}×${Math.ceil(ws.z / scl)}` : '') +
-    `  ·  ${filled} voxel${filled === 1 ? '' : 's'}  ·  ${undoStack.length} undo`;
+    `  ·  ${filled} voxel${filled === 1 ? '' : 's'}  ·  ${undoStack.length} undo` +
+    // Say it out loud: a hidden limb looks exactly like deleted geometry.
+    (soloModels.size ? `  ·  SOLO ${soloModels.size}` : '') +
+    (hiddenModels.size ? `  ·  ${hiddenModels.size} hidden` : '');
 }
 
 /** Panel mounts for rig.js. */
@@ -1848,6 +2121,10 @@ function buildUI(section) {
     mkBtn('Box [G]', { 'data-brush': 'box', onclick: () => setBrush('box') }),
     mkBtn('Face [F]', { 'data-brush': 'face', onclick: () => setBrush('face') }),
     mkBtn('Select [V]', { 'data-brush': 'select', onclick: () => setBrush('select') }),
+    mkBtn('Move [X]', {
+      'data-brush': 'move', onclick: () => setBrush('move'),
+      title: 'drag a whole model (limb) around — its anchor moves with it',
+    }),
     mkBtn('Noise [N]', {
       'data-brush': 'noise',
       title: 'scatter the active material over exposed surface voxels — ' +
@@ -1950,7 +2227,8 @@ function buildUI(section) {
   ui.timeline = el('div', { class: 'edtimeline' });  // ...and this
 
   ui.note = el('div', { class: 'hint edhelp' },
-    'left-drag paints · right-drag orbits · middle-drag pans · wheel zooms · ' +
+    'left-drag paints · X moves a whole limb · right-drag orbits · ' +
+    'middle-drag pans · wheel zooms · ' +
     'alt-click eyedropper · 1-9 material · Ctrl+Z/Y undo · Esc clear selection · ' +
     '? for the full cheat sheet');
 
@@ -1984,6 +2262,13 @@ function buildHelpPanel() {
       '"sync" in Limbs gives every model a limb entry; set root, parents and ' +
       'joints there. The orange ball is the joint anchor — drag it into the ' +
       'socket; the blue line is the swing axis.'),
+    row('move', 'Move [X] drags a WHOLE limb: grab any limb and slide it, on ' +
+      'the plane facing the camera, snapped to whole voxels. Its joint anchor ' +
+      'moves with it, so the joint stays where it sits in the mesh — that is ' +
+      'the difference from painting voxels around, which leaves the anchor ' +
+      'behind. Children do NOT follow their parent: raising a torso means ' +
+      'moving the head and arms too. Structural, so it clears undo — drag it ' +
+      'back rather than Ctrl+Z.'),
     row('walk', 'K toggles the gait preview (it walks the exported data, not ' +
       'an editor imitation). Legs need a two-bone IK chain (+ chain with the ' +
       'LOWER bone selected) and a gait block; leg groups define the gait ' +
@@ -2297,6 +2582,15 @@ export function activate() {
       if (!drag) ghost.visible = false;
     });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
+    // Middle-drag is PAN (see controls.mouseButtons). OrbitControls is
+    // pointer-events only and sets touchAction='none', which covers touch
+    // and the wheel — but NOT middle-click autoscroll, which the browser
+    // triggers off the legacy `mousedown`. Nothing else in the stack listens
+    // for that, so panning also kicked the tuner page into scroll mode.
+    // Same shape as the contextmenu guard above: the button is ours.
+    canvas.addEventListener('mousedown', e => {
+      if (e.button === 1) e.preventDefault();
+    });
     window.addEventListener('resize', resize);
     // The section is display:none until now, so clientWidth was 0 during
     // buildScene(); size it after the tab is visible.
@@ -2346,7 +2640,7 @@ export function setSidecar(s) { sidecar = s; }
 export function touchSidecar() { markDirty(); }
 
 export { setActiveModel, addModel, duplicateModel, removeModel, renameModel,
-         splitSelectionToModel, upscaleDoc, markDirty };
+         splitSelectionToModel, upscaleDoc, markDirty, moveModel, growModel };
 
 /** Force a full instance rebuild (gait preview / onion skin drive this). */
 export function invalidate() { needsRebuild = true; }

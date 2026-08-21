@@ -50,8 +50,20 @@ struct UIState {
   bool loadWorld = false;        // F10
 
   // active tool: LMB drives it; Tab cycles. F/M/B stay as shortcuts.
-  enum Tool { kToolBrush = 0, kToolLaser, kToolPrefab, kToolMob, kToolCount };
+  // kToolMelee swings whatever the hotbar has equipped (game/melee.h): it is a
+  // tool rather than a mode because LMB already routes per-tool, so the sword
+  // gets the attack button without taking it from the brush.
+  enum Tool {
+    kToolBrush = 0, kToolLaser, kToolPrefab, kToolMob, kToolMelee, kToolCount
+  };
   int tool = kToolBrush;
+
+  // hotbar (game/item.h): mirrored out of Inventory each frame for the HUD.
+  // The overlay never owns inventory state — it only draws it.
+  std::vector<std::string> itemNames;   // per slot, "" = empty
+  int itemSelected = 0;
+  const char* swingPhase = "";          // melee state, for the HUD readout
+  float swingSpeed = 0;                 // mouse speed driving the swing
 
   // prefab placement tool (PLAN §A3)
   int prefabSelected = 0;        // index into prefabNames (O cycles)
@@ -77,6 +89,10 @@ struct UIState {
                                   // a brush material
   int32_t mana = 0, manaMax = 0;  // manaMax is the ward-adjusted EFFECTIVE max
   int32_t health = 0;
+  // Authored ceiling for the HUD bar's denominator. Health does NOT regenerate,
+  // so this is only ever a high-water mark the player moves away from.
+  int32_t healthMax = 0;
+  bool playerAlive = true;
   int32_t spellCost = 0;          // running cost of the spoken sequence
   std::string spellText;          // "lava + trail + projectile"
   std::string spellVerdict;       // what the VM thinks it is
@@ -92,6 +108,10 @@ class Overlay {
   bool Init(GLFWwindow* window, const wgpu::Device& device,
             wgpu::TextureFormat format);
   void BeginFrame();
+  // The player-facing HUD: health + mana in the bottom-left corner. Separate
+  // from Draw() and drawn unconditionally, because the dev panel is F1-hideable
+  // and the HUD must not be.
+  void DrawHUD(const UIState& s);
   void Draw(UIState& s);
   void Render(const wgpu::RenderPassEncoder& pass);
   void Shutdown();

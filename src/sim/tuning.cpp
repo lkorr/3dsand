@@ -358,6 +358,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "halfHeight", p.halfHeight, out, at);
     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);
     ReadF(*g, "viewSmoothHalflife", p.viewSmoothHalflife, out, at);
+    ReadF(*g, "unstickMaxDepth", p.unstickMaxDepth, out, at);
+    ReadF(*g, "unstickSpeed", p.unstickSpeed, out, at);
   }
 
   if (const json* g = Find(j, "camera")) {
@@ -394,6 +396,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadB(*g, "enabled", a.enabled, out, at);
     ReadF(*g, "turnRate", a.turnRate, out, at);
     ReadF(*g, "turnMinSpeed", a.turnMinSpeed, out, at);
+    ReadF(*g, "velocityHalflife", a.velocityHalflife, out, at);
+    ReadF(*g, "firstPersonTurnHalflife", a.firstPersonTurnHalflife, out, at);
+    ReadF(*g, "ikBlendHalflife", a.ikBlendHalflife, out, at);
+    ReadF(*g, "airDebounce", a.airDebounce, out, at);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);
@@ -483,6 +489,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "severVoxelSpeed", e.severVoxelSpeed, out, at);
     ReadI(*g, "microLifeTicks", e.microLifeTicks, out, at);
     ReadI(*g, "microScale", e.microScale, out, at);
+    ReadI(*g, "bleedDripTicks", e.bleedDripTicks, out, at);
+    ReadI(*g, "bleedOpsPerTick", e.bleedOpsPerTick, out, at);
+    ReadF(*g, "bleedVoxelGain", e.bleedVoxelGain, out, at);
+    ReadF(*g, "bleedBudgetCap", e.bleedBudgetCap, out, at);
+    ReadF(*g, "severStumpBudget", e.severStumpBudget, out, at);
     ReadF(*g, "bleedGain", e.bleedGain, out, at);
     ReadVar(*g, "bleedGainVar", e.bleedGainVar, out, at);
     ReadVar(*g, "bleedSprayPerDripVar", e.bleedSprayPerDripVar, out, at);
@@ -515,6 +526,36 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       e.microScale = 4;
     }
     if (e.severDecayTicks < 1) e.severDecayTicks = 1;
+    // ---- whole-voxel bleeding bounds (rule 2) ----
+    // The drip period and the op budget together cap how much real matter a
+    // wound can push into the CA, so both need a hard floor/ceiling here
+    // rather than a "should be sensible" comment. A period of 0 would drip
+    // every tick AND divide nothing — it is the one value that turns a wound
+    // into an unbounded fountain.
+    if (e.bleedDripTicks < 1) {
+      out.warnings.push_back(at + ".bleedDripTicks < 1; clamped to 1");
+      e.bleedDripTicks = 1;
+    }
+    // 64 is far above anything the look needs (six is the shipped value) and
+    // still leaves the per-tick cell-op queue overwhelmingly free.
+    if (e.bleedOpsPerTick < 0 || e.bleedOpsPerTick > 64) {
+      out.warnings.push_back(at + ".bleedOpsPerTick out of 0..64; clamped");
+      e.bleedOpsPerTick = e.bleedOpsPerTick < 0 ? 0 : 64;
+    }
+    if (e.bleedVoxelGain < 0.0f) {
+      out.warnings.push_back(at + ".bleedVoxelGain < 0; clamped to 0");
+      e.bleedVoxelGain = 0.0f;
+    }
+    // The cap is what bounds ONE wound's total output. Zero means a wound
+    // never owes anything, i.e. drips are off; negative is meaningless.
+    if (e.bleedBudgetCap < 0.0f) {
+      out.warnings.push_back(at + ".bleedBudgetCap < 0; clamped to 0");
+      e.bleedBudgetCap = 0.0f;
+    }
+    if (e.severStumpBudget < 0.0f) {
+      out.warnings.push_back(at + ".severStumpBudget < 0; clamped to 0");
+      e.severStumpBudget = 0.0f;
+    }
   }
 
   if (const json* g = Find(j, "grenade")) {
@@ -628,6 +669,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("dayNight.twilightWidth must be > 0; reset to 0.22");
       d.twilightWidth = 0.22f;
     }
+  }
+
+  if (const json* g = Find(j, "weather")) {
+    auto& w = out.weather;
+    const std::string at = "weather";
+    ReadB(*g, "waterFreezes", w.waterFreezes, out, at);
+    ReadB(*g, "iceMelts", w.iceMelts, out, at);
   }
 
   if (const json* g = Find(j, "render")) {

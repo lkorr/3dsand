@@ -122,6 +122,21 @@ struct Tuning {
     // ledge (Player::ViewEyePos). 0 disables. CPU/render only — the physics
     // position and the sim are untouched.
     float viewSmoothHalflife = 0.10f;
+    // ---- unstick (de-penetration) ----
+    // Every collision sweep is a hard veto that fails from an overlapping
+    // start, so a body that ends up INSIDE solid ground cannot move on any
+    // axis — it is welded there until noclip. These control the way out.
+    //
+    // How deep (meters) the body may be buried and still be lifted clear.
+    // Beyond this it stays put: being entombed by a collapse is a real state,
+    // and teleporting out of it would be worse than being stuck. About a step
+    // height and a half covers the cases that actually happen (a powder
+    // settling into your feet, a step-down landing a fraction inside a face).
+    float unstickMaxDepth = 0.9f;
+    // How fast (m/s) the body rises while being ejected. Rate-limited rather
+    // than teleported so a two-voxel lift is a glide, not a pop; the climb is
+    // banked into the same view offset a step-up uses.
+    float unstickSpeed = 3.0f;
   } player;
 
   // ---- camera ----
@@ -192,6 +207,38 @@ struct Tuning {
     // in meters. The rig's own feet should land on the box's bottom face; this
     // is the trim for art whose contact point is not exactly at its origin.
     float footTrim = 0.0f;
+    // ---- motion smoothing ----
+    // The rig's own measured speed drives cadence, bob, sway, roll, the
+    // walk/run clip choice, the spring goals and the swing budget — so any
+    // noise in it is amplified into every one of those at once. Half-life in
+    // seconds (frame-rate independent): the measurement covers half the
+    // remaining distance to the truth every this-many seconds. 0 disables the
+    // smoothing entirely and uses the raw per-tick measurement.
+    float velocityHalflife = 0.08f;
+    // Half-life (seconds) of the FIRST-PERSON body yaw. Third person has its
+    // own rate limit (turnRate above) because you are watching the body pivot;
+    // first person used to snap outright, on the reasoning that the body is
+    // off-screen — but the ARMS are not, and they are welded to the torso, so
+    // a fast mouse turn steps them across the view in hard jumps. A short
+    // half-life keeps them attached to the view without visible lag. 0 restores
+    // the old hard snap.
+    float firstPersonTurnHalflife = 0.05f;
+    // Half-life (seconds) of the leg IK fading in and out as the gait starts
+    // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
+    // body really does leave the surface cresting each bump — and switching the
+    // IK on that as a bool snapped the limbs between the IK pose and the rest
+    // hang every time, which is what "the arms shoot up straight going uphill"
+    // is. Longer is smoother but makes the legs slower to commit to the ground
+    // on landing; 0 restores the old hard switch.
+    float ikBlendHalflife = 0.08f;
+    // How long (seconds) the body must be continuously off the ground before
+    // the air-state clips believe it. `grounded` drops false for a tick at a
+    // time cresting bumps, and the jump/fall/land clips used to fire on that
+    // raw edge — so walking up a noisy incline retriggered the arms-up `jump`
+    // one-shot over and over, which is the tweaking. A real jump clears this in
+    // one tick; a bump crest never does. Too high and a genuine jump animates
+    // late. 0 restores the old undebounced behaviour.
+    float airDebounce = 0.12f;
     // Damage/dismemberment feel.
     float severImpulse = 6.0f;   // extra shove given to a part as it comes off
     // How long the corpse's parts stay before the avatar can respawn, seconds.
@@ -330,6 +377,31 @@ struct Tuning {
     int microLifeTicks = 70;
     int microScale = 4;
 
+    // ---- whole-voxel bleeding ----
+    // Everything above governs the SPRAY (micro droplets that stain and
+    // evaporate) plus the one-shot sever throw. These four govern the other
+    // half: the real blood VOXELS a wound drips into the grid, which the CA
+    // carries, which pool, and which are still on the floor a minute later.
+    // They were hardcoded in mob.cpp; the literals below are those values, so
+    // an untouched tuning.json behaves exactly as before.
+    //
+    // Rate is a period, not a chance, because bleeding must stay bounded per
+    // rule 2: a wound drips at most one voxel every `bleedDripTicks`, and at
+    // most `bleedOpsPerTick` drips happen across all limbs of all mobs in a
+    // tick. Those two together are the hard ceiling on blood entering the sim.
+    int bleedDripTicks = 4;      // ticks between drips from one wound
+    int bleedOpsPerTick = 6;     // global cell-op budget for drips, per tick
+    // How much blood one point of damage is worth, and the ceiling on what a
+    // single wound can still owe. The per-damage rate is authored per mob
+    // (bleed.perDamage in the .json sidecar); this MULTIPLIES it, so it is the
+    // global "how wet is this game" dial. The cap is what stops a huge hit
+    // from turning into a minute-long fountain.
+    float bleedVoxelGain = 1.0f;
+    float bleedBudgetCap = 120.0f;   // max voxels one wound can still owe
+    // Voxels added to the stump's budget when a limb comes off, on top of the
+    // sever throw. This is the puddle under a fresh amputation.
+    float severStumpBudget = 40.0f;
+
     // ---- per-instance variance ----
     // Each of these perturbs the like-named value above. Defaults are all
     // dist=kNone, so gore behaves exactly as before until a knob is turned on
@@ -426,6 +498,33 @@ struct Tuning {
     float moonInclination = 18.0f;   // degrees off the solar plane
     float starRotSpeed = 1.0f;       // multiplier on the star wheel rate
   } dayNight;
+
+  // ---- weather: switches for the sun-driven reactions ----
+  //
+  // These do NOT scale a rate — they decide whether a reaction rule is
+  // COMPILED AT ALL. A rule switched off here is dropped by LoadReactionsJson
+  // and never reaches the GPU table, so an off switch costs exactly zero at
+  // runtime rather than a per-cell predicate that always fails (rule 2).
+  //
+  // The mechanism is a "requires" key in reactions.json naming one of these
+  // flags; see kWeatherFlagName in sim/materials.cpp for the binding. That
+  // keeps the rules themselves data — the flag gates content it does not know
+  // about, so adding a second freeze rule needs no C++ change.
+  //
+  // These change WHICH rules exist, so they change the world hash exactly the
+  // way editing reactions.json does. That is fine and expected — it is content,
+  // not a divergence — but a lockstep session must agree on them, and toggling
+  // one mid-session is a reload, not a live tweak. Booleans rather than ints
+  // for exactly that reason: there is no half-on.
+  struct Weather {
+    // Exposed water freezes to ice on clear nights (the shore-inward frontier
+    // rule in reactions.json). Off leaves ponds liquid through the night.
+    bool waterFreezes = true;
+    // Snow and ice in direct daylight melt back to water. Off makes winter
+    // permanent — note that leaving this off while waterFreezes is on means
+    // ice only ever accumulates, which is stable but one-way.
+    bool iceMelts = true;
+  } weather;
 
   // ---- render: everything below is emitted as WGSL and F5-reloadable ----
   struct Render {
@@ -686,6 +785,20 @@ std::string TuningWgslBlock(const Tuning& t);
 // systems; replaced wholesale on reload.
 const Tuning& CurrentTuning();
 void SetCurrentTuning(const Tuning& t);
+
+// ---- gore: adding to a wound's whole-voxel budget ---------------------------
+// One helper for every site that grows a bleed budget (mob damage, limb carve,
+// sever stump, the avatar's equivalents). It applies the volume gain and the
+// per-wound ceiling in one place, because the ceiling is the actual bound on
+// how much conserved matter one wound can push into the CA (rule 2) and six
+// copies of a literal cap is exactly how one of them ends up stale.
+//
+// `add` is in whole voxels, already scaled by the mob's bleedPerDamage.
+inline float AddBleedBudget(float current, float add) {
+  const auto& g = CurrentTuning().gore;
+  const float grown = current + add * g.bleedVoxelGain;
+  return grown > g.bleedBudgetCap ? g.bleedBudgetCap : grown;
+}
 
 // ---- day/night: celestial state for one tick --------------------------------
 // Everything the renderer needs about the sky at a given day phase. Derived

@@ -222,6 +222,96 @@ function checkInput(obj, key) {
   return c;
 }
 
+/**
+ * Editable x×y×z box size, in the model list row. Typing a bigger number grows
+ * that limb's box so there is empty space to paint into; a smaller one crops it.
+ *
+ * Growth goes on the HIGH side by default, which keeps the model's min corner
+ * (and therefore every voxel's position and the limb's anchor) exactly where it
+ * is — the common case is "make room above/ahead". Hold Shift while committing
+ * to grow from the LOW side instead, for when the room is needed below/behind.
+ *
+ * Cropping cannot be undone by re-growing, because the voxels outside the new
+ * box are gone, so it asks first.
+ */
+function dimInput(m, mi) {
+  const wrap = el('span', { class: 'rigdim rigdimedit' });
+  const boxes = ['x', 'y', 'z'].map(axis => {
+    const b = el('input', {
+      class: 'cell num', type: 'number', min: '1', step: '1',
+      title: `${axis} size — grows on the high side, Shift+Enter grows the low side`,
+    });
+    b.value = m.dim[axis];
+    b.addEventListener('click', e => e.stopPropagation());
+    const commit = shift => {
+      const want = Math.round(+b.value);
+      if (!Number.isFinite(want) || want < 1) { b.value = m.dim[axis]; return; }
+      const d = want - m.dim[axis];
+      if (!d) return;
+      if (d < 0 && !confirm(
+        `Shrink ${m.name} ${axis} from ${m.dim[axis]} to ${want}? ` +
+        'Voxels outside the new box are deleted.')) { b.value = m.dim[axis]; return; }
+      const zero = { x: 0, y: 0, z: 0 };
+      const side = shift ? 'lo' : 'hi';
+      const pad = { lo: { ...zero }, hi: { ...zero } };
+      pad[side][axis] = d;
+      if (!ed.growModel(mi, pad)) { b.value = m.dim[axis]; return; }
+      bindGizmo();
+      renderAllPanels();
+      toast(`${m.name} ${axis} ${want} (${d > 0 ? '+' : ''}${d} on the ` +
+        `${shift ? 'low' : 'high'} side)`);
+    };
+    b.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(e.shiftKey); }
+    });
+    b.addEventListener('change', () => commit(false));
+    return b;
+  });
+  wrap.append(boxes[0], el('i', {}, '×'), boxes[1], el('i', {}, '×'), boxes[2]);
+  return wrap;
+}
+
+/**
+ * Relative move for a whole limb: three deltas plus Apply. Deltas rather than
+ * an absolute position, because a limb's position is its model offset, which
+ * is not otherwise surfaced — "up 5" is the question actually being asked, and
+ * an absolute field would force reading the offset out of the .vox first.
+ *
+ * Applies to the MODEL of the same name; ed.moveModel carries the anchor so
+ * the joint stays inside the mesh. Units are file voxels — at scale 4 that is
+ * micro-voxels, so one world voxel is 4 here (the hint says so live).
+ */
+function moveInput(limb) {
+  const wrap = el('div', { class: 'rigvec' });
+  const boxes = [0, 1, 2].map(() => {
+    const b = el('input', { class: 'cell num', type: 'number', step: '1', value: '0' });
+    return b;
+  });
+  const apply = () => {
+    const d = { x: num(boxes[0].value, 0), y: num(boxes[1].value, 0),
+                z: num(boxes[2].value, 0) };
+    if (!d.x && !d.y && !d.z) return;
+    const mi = ed.getModels().findIndex(m => m.name === limb.name);
+    if (mi < 0) { toast(`no model named "${limb.name}"`, true); return; }
+    if (!ed.moveModel(mi, d)) return;
+    boxes.forEach(b => { b.value = '0'; });
+    touched();
+    bindGizmo();
+    ed.invalidate();
+    renderAllPanels();
+    const scl = +(sc().scale) || 1;
+    const w = a => (a / scl).toFixed(scl > 1 ? 2 : 0);
+    toast(`moved ${limb.name} by ${d.x},${d.y},${d.z}` +
+      (scl > 1 ? ` (${w(d.x)},${w(d.y)},${w(d.z)} world voxels)` : ''));
+  };
+  boxes.forEach(b => {
+    b.addEventListener('keydown', e => { if (e.key === 'Enter') apply(); });
+    wrap.append(b);
+  });
+  wrap.append(el('button', { class: 'small', title: 'apply the delta', onclick: apply }, '→'));
+  return wrap;
+}
+
 // [x,y,z] triple bound to a limb key, e.g. anchor or axis.
 function vecInput(obj, key, dflt, after) {
   const wrap = el('div', { class: 'rigvec' });
@@ -248,12 +338,27 @@ function renderRigPanel() {
 
   const models = ed.getModels();
 
-  /* ---- model list ---- */
+  /* ---- model list ----
+     This IS the limb list: one model per limb is the engine's format, so a
+     row selects the model AND opens that limb's editor inline below it.
+     They used to be two lists at opposite ends of the panel, which meant
+     clicking a model did nothing visible and the limb had to be found again
+     further down. */
   const list = el('div', { class: 'riglist' });
   models.forEach((m, i) => {
+    const limbHere = limbByName(m.name);
+    const openHere = !!limbHere && limbHere.name === selectedPart;
     const row = el('div', {
       class: 'rigrow' + (i === ed.getActiveModel() ? ' on' : ''),
-      onclick: () => { ed.setActiveModel(i); renderAllPanels(); },
+      onclick: () => {
+        ed.setActiveModel(i);
+        // Toggle the inline limb editor. A model with no limb entry still
+        // selects (for painting); "sync" in Limbs is what gives it an entry.
+        selectedPart = (limbHere && !openHere) ? m.name : null;
+        bindGizmo();
+        ed.invalidate();
+        renderAllPanels();
+      },
     });
     const nm = el('input', { class: 'cell id', value: m.name });
     nm.addEventListener('click', e => e.stopPropagation());
@@ -267,8 +372,19 @@ function renderRigPanel() {
       renderAllPanels();
     });
     row.append(
-      el('span', { class: 'rigdim' }, `${m.dim.x}×${m.dim.y}×${m.dim.z}`),
+      dimInput(m, i),
       nm,
+      el('button', {
+        class: 'icon' + (ed.isModelSolo(m.name) ? ' on' : ''),
+        title: 'solo — show only this limb (and any other soloed)',
+        onclick: e => { e.stopPropagation(); ed.toggleModelSolo(m.name); renderAllPanels(); },
+      }, 'S'),
+      el('button', {
+        class: 'icon' + (ed.isModelHidden(m.name) ? ' on' : ''),
+        title: ed.isModelHidden(m.name) ? 'hidden — click to show'
+                                        : 'hide this limb (also unpickable)',
+        onclick: e => { e.stopPropagation(); ed.toggleModelHidden(m.name); renderAllPanels(); },
+      }, ed.isModelHidden(m.name) ? '◌' : '◉'),
       el('button', {
         class: 'icon', title: 'duplicate',
         onclick: e => { e.stopPropagation(); ed.duplicateModel(i); renderAllPanels(); },
@@ -283,11 +399,21 @@ function renderRigPanel() {
         },
       }, '✕'));
     list.append(row);
+    // The limb editor lives directly under its own row — this is the merge of
+    // the old Models and Limbs lists.
+    if (openHere) list.append(limbBody(limbHere));
   });
 
+  const anyHidden = models.some(m => ed.isModelHidden(m.name)) || ed.anySolo();
   sideEl.append(
     el('div', { class: 'righdr' }, 'Models',
       el('span', { class: 'spacer' }),
+      // Only offered when something IS hidden — otherwise a limb left hidden
+      // from an earlier session reads as missing geometry with no way back.
+      anyHidden ? el('button', {
+        class: 'small', title: 'clear every hide/solo',
+        onclick: () => { ed.showAllModels(); renderAllPanels(); },
+      }, 'show all') : null,
       el('button', {
         class: 'small',
         title: 'double the resolution: every voxel becomes 2×2×2, anchors and ' +
@@ -350,9 +476,9 @@ function renderRigPanel() {
         }, 'Split to model')));
   }
 
-  /* ---- limbs ---- */
+  /* ---- rig-wide settings (the per-limb editors are inline above) ---- */
   sideEl.append(
-    el('div', { class: 'righdr' }, 'Limbs',
+    el('div', { class: 'righdr' }, 'Rig',
       el('span', { class: 'spacer' }),
       el('button', {
         class: 'small', title: 'create a limb entry for every model that lacks one',
@@ -406,7 +532,15 @@ function renderRigPanel() {
         : 'micro voxels per world voxel (2/4 = finer-than-terrain detail)'));
   }
 
-  for (const limb of L) {
+  // Limbs with no model of the same name cannot be reached from the model
+  // list, so they still get a row here — otherwise a typo'd name would make
+  // the limb uneditable and invisible.
+  const orphans = L.filter(l => !models.some(m => m.name === l.name));
+  if (orphans.length)
+    sideEl.append(el('div', { class: 'rignote' },
+      'These limb entries name no model in this file — fix the name or ' +
+      'remove them; the engine matches limb to model BY NAME.'));
+  for (const limb of orphans) {
     const open = limb.name === selectedPart;
     const head = el('div', {
       class: 'rigrow' + (open ? ' on' : ''),
@@ -418,8 +552,15 @@ function renderRigPanel() {
       },
     }, el('span', { class: 'rigdot' }), limb.name || '(unnamed)');
     sideEl.append(head);
-    if (!open) continue;
+    if (open) sideEl.append(limbBody(limb));
+  }
 
+  renderRigTail();
+}
+
+/** The per-limb editor, rendered inline under its row in the model list. */
+function limbBody(limb) {
+  {
     const body = el('div', { class: 'rigbody' });
 
     // name, with inline validation
@@ -478,6 +619,9 @@ function renderRigPanel() {
       return t;
     })(), 'gait/chain queries go by tag'));
 
+    body.append(field('move', moveInput(limb),
+      'shift this limb\'s voxels AND its anchor — or drag it with Move [X]'));
+
     body.append(field('anchor',
       vecInput(limb, 'anchor', [0, 0, 0], () => { bindGizmo(); ed.invalidate(); }),
       'joint position in prefab coords — drag the orange ball'));
@@ -508,9 +652,12 @@ function renderRigPanel() {
         },
       }, 'remove limb')));
 
-    sideEl.append(body);
+    return body;
   }
+}
 
+/** Everything below the per-limb editors: chains, gait, clips. */
+function renderRigTail() {
   /* ---- chains (read-only summary; authored by Split-to-model + this) ---- */
   sideEl.append(
     el('div', { class: 'righdr' }, 'IK chains',
@@ -1831,7 +1978,10 @@ export const hooks = {
   appendOnionInstances,
   onKey,
   tick,
-  onModelsChanged: () => { rebuildSkeleton(); renderAllPanels(); },
+  // bindGizmo re-reads the anchor: the move brush shifts a limb's anchor as
+  // it drags, so without this the orange ball would sit at the pre-move
+  // position until the part was reselected.
+  onModelsChanged: () => { rebuildSkeleton(); bindGizmo(); renderAllPanels(); },
   onSidecarChanged: () => {
     selectedPart = null; activeTag = null; frameIndex = 0;
     activeClip = null; selectedKey = null; poseEdit = null;

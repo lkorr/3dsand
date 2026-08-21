@@ -65,6 +65,9 @@
   button.primary:hover{background:#25498a}
   button.small{padding:2px 7px;font-size:12px}
   button.icon{padding:2px 6px;font-size:12px;font-family:var(--mono);color:var(--dim)}
+  /* Active toggle (hide / solo in the model list) — must read at a glance,
+     since a hidden limb otherwise looks like missing geometry. */
+  button.icon.on{color:var(--amber);background:#ffb4541f;border-radius:3px}
   button.icon:hover{color:var(--fg)}
   button.danger:hover{background:#4a2020;border-color:var(--red);color:var(--red)}
   button:disabled{opacity:.4;cursor:default}
@@ -531,6 +534,16 @@
   .rigrow:hover{background:#1e2530}
   .rigrow.on{background:#1d3a6e;color:#dce8ff}
   .rigrow .rigdim{color:var(--faint);font-size:10.5px;min-width:56px}
+  /* Editable box size in the model row: three tight number cells. Spinners
+     are hidden — the row is cramped and the value is usually typed. */
+  .rigdimedit{display:inline-flex;align-items:center;gap:1px;min-width:0}
+  .rigdimedit i{color:var(--faint);font-style:normal;font-size:9px}
+  .rigdimedit input{width:26px;padding:1px 2px;font-size:10.5px;text-align:center;
+    background:var(--bg2);border:1px solid transparent;border-radius:3px;color:var(--dim)}
+  .rigdimedit input:hover{border-color:var(--line)}
+  .rigdimedit input:focus{border-color:var(--acc);color:var(--fg);outline:none}
+  .rigdimedit input::-webkit-outer-spin-button,
+  .rigdimedit input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
   .rigrow input.id{flex:1;min-width:0}
   .rigdot{width:6px;height:6px;border-radius:50%;background:var(--amber);flex:none}
   .rigbody{padding:4px 4px 10px 10px;border-left:2px solid var(--line2);margin:2px 0 6px}
@@ -734,6 +747,63 @@
   }
   .wsecbody{padding:10px 12px}
   .wempty{color:var(--faint);font-style:italic;padding:2px}
+
+  /* ---- magic pages ----
+     These read as a design document rather than a form, so they get prose
+     measure, a table, and the three-segment stability strip. */
+  /* table-layout:fixed so a long prose cell WRAPS instead of forcing the table
+     wider than its card — the outcome table's "what happens" column is a
+     paragraph, and auto layout pushes it off the right edge. */
+  .wtab{
+    border-collapse:collapse;width:100%;font-size:12.5px;margin:2px 0 10px;
+    table-layout:fixed;
+  }
+  .wtab th{
+    text-align:left;font-family:var(--mono);font-size:10.5px;font-weight:400;
+    letter-spacing:.6px;text-transform:uppercase;color:var(--faint);
+    border-bottom:1px solid var(--line);padding:4px 8px 4px 0;
+  }
+  .wtab td{
+    padding:5px 8px 5px 0;border-bottom:1px solid #ffffff08;vertical-align:top;
+    line-height:1.55;
+  }
+  .wtab tr:last-child td{border-bottom:none}
+  /* The label column is a short id/keyword; everything after it is prose that
+     must be free to wrap. overflow-wrap so a long unbroken token cannot push
+     the column open again. */
+  .wtab td:first-child,.wtab th:first-child{width:20%}
+  /* 4-column tables (the engine-ceilings grid) carry three narrow value columns
+     and one prose column, so the prose gets whatever is left rather than a
+     quarter of the width. */
+  .wtab.c4 td:first-child,.wtab.c4 th:first-child{width:16%}
+  .wtab.c4 td:nth-child(2),.wtab.c4 th:nth-child(2){width:14%}
+  .wtab.c4 td:nth-child(3),.wtab.c4 th:nth-child(3){width:11%}
+  .wtab td:first-child{font-family:var(--mono);font-size:12px}
+  /* The global `tbody td{white-space:nowrap}` above is right for the data grids
+     (a material row must not reflow), and wrong here: these cells are prose.
+     Undo it explicitly rather than loosening the global rule. */
+  .wtab td,.wtab th{overflow-wrap:anywhere;white-space:normal}
+  code.mcode{
+    font-family:var(--mono);font-size:11.5px;background:#0c1017;
+    border:1px solid var(--line);border-radius:4px;padding:0 4px;
+  }
+  /* the mana → health → past-both strip on the Stability page */
+  .mbar{display:flex;gap:3px;margin:10px 0 4px;max-width:74ch}
+  .mbar .seg{
+    flex:1;text-align:center;font-family:var(--mono);font-size:10.5px;
+    letter-spacing:.4px;padding:6px 4px;border-radius:5px;border:1px solid;
+  }
+  .mbar .seg.ok{background:#12233d;border-color:#24466e;color:#8fb6ee}
+  .mbar .seg.warn{background:#3a2a12;border-color:#6b4a1c;color:#e0ab5e}
+  .mbar .seg.bad{background:#3a1618;border-color:#6e2a2c;color:#e87b74}
+  .otag{
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.4px;
+    border-radius:3px;padding:1px 6px;border:1px solid;white-space:nowrap;
+  }
+  .otag.ok{background:#12233d;border-color:#24466e;color:#8fb6ee}
+  .otag.warn{background:#3a2a12;border-color:#6b4a1c;color:#e0ab5e}
+  .otag.bad{background:#3a1618;border-color:#6e2a2c;color:#e87b74}
+  .otag.dim{background:var(--bg2);border-color:var(--line);color:var(--faint)}
 
   /* fact grid — the authored fields, with the shader consequence spelled out */
   .wfacts{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
@@ -1086,7 +1156,13 @@
 'use strict';
 /* ================= state ================= */
 let mat=null, rx=null, tune=null;      // parsed JSON, mutated in place
+// assets/spells/glyphs.json, READ-ONLY. The Wiki's Magic pages read it; nothing
+// writes it back, and it is deliberately absent from `dirty`/`eol`/save. A
+// glyph resolves a material NAME to a 12-bit id inside the engine at load, so
+// editing one here could author a spell that resolves to air.
+let glyphs=null, glyphsErr=null;
 let matHandle=null, rxHandle=null, tuneHandle=null;  // FS Access handles (null in fallback mode)
+let glyphsHandle=null;                 // read-only, never written back
 let dirty={mat:false, rx:false, tune:false};
 let eol={mat:'\r\n', rx:'\r\n', tune:'\r\n'};       // detected per file at load, preserved on save
 // Values as first read from disk. "changed" and the reset buttons compare
@@ -1218,6 +1294,18 @@ async function openFolder(){
   // tuning.json is optional: older checkouts predate it, and the engine falls
   // back to compiled-in defaults when it is missing.
   try{tuneHandle=await dir.getFileHandle('tuning.json');}catch{tuneHandle=null;}
+  // glyphs.json lives in assets/spells/, a sibling of assets/materials/, so it
+  // is reached from the ROOT handle rather than `dir`. Read-only and optional:
+  // without it the Wiki's Magic pages explain the system from the schema and
+  // say the content is unavailable.
+  // Only reachable when the picked folder was assets/ itself (dir!==root means
+  // we descended into materials/); picking assets/materials/ directly leaves no
+  // way up, and that is fine — the pages degrade.
+  glyphsHandle=null;
+  try{
+    const sp=await root.getDirectoryHandle('spells');
+    glyphsHandle=await sp.getFileHandle('glyphs.json');
+  }catch{glyphsHandle=null;}
   await loadFromHandles();
   toast('loaded '+mat.materials.length+' materials, '+rx.reactions.filter(r=>r.self!==undefined).length+' reactions');
 }
@@ -1232,6 +1320,11 @@ async function loadFromHandles(){
     tune=JSON.parse(tt);
     eol.tune=tt.includes('\r\n')?'\r\n':'\n';
   }else tune=null;
+  // Read-only, and no eol/dirty entry on purpose — nothing writes it back.
+  if(glyphsHandle){
+    try{glyphs=JSON.parse(await (await glyphsHandle.getFile()).text());glyphsErr=null;}
+    catch(e){glyphs=null;glyphsErr=e.message;}
+  }else{glyphs=null;glyphsErr=null;}
   tuneBase=tune?structuredClone(tune):null;
   adoptHist();
   dirty={mat:false,rx:false,tune:false};
@@ -2744,6 +2837,14 @@ function applyServerFiles(j){
   const eolOf=t=>t.includes('\r\n')?'\r\n':'\n';
   if(j.materials){mat=JSON.parse(j.materials);eol.mat=eolOf(j.materials);}
   if(j.reactions){rx=JSON.parse(j.reactions);eol.rx=eolOf(j.reactions);}
+  // glyphs.json is READ-ONLY here (see readable() in tuner_server.py): the Wiki
+  // documents the magic system, it does not author it. Never added to `dirty`,
+  // so no save path can ever pick it up. Malformed content must not take the
+  // whole tuner down with it — the Magic page degrades to a diagnostic instead.
+  if(j.glyphs){
+    try{glyphs=JSON.parse(j.glyphs);glyphsErr=null;}
+    catch(e){glyphs=null;glyphsErr=e.message;}
+  }
   if(j.tuning){
     tune=JSON.parse(j.tuning);tuneBase=structuredClone(tune);eol.tune=eolOf(j.tuning);
     adoptHist();
@@ -3785,16 +3886,40 @@ function wikiIndex(){
     hay:s.name.toLowerCase()+' '+s.variants.map(v=>v.file).join(' ').toLowerCase(),
     count:s.variants.length,
   });
+  // ---- magic ----
+  // The overview page is ALWAYS listed, even with no glyphs.json loaded: it is
+  // the design doc for the system, and most of what it says is true of the
+  // engine rather than of the content. Individual glyph pages need the file.
+  for(const t of MAGIC_TOPICS)out.push({
+    kind:'magic',id:t.id,label:t.title,group:'magic',sub:t.icon,
+    hay:(t.title+' '+t.id+' '+(t.hay||'')).toLowerCase(),
+    count:t.count?t.count():null,
+  });
+  for(const g of glyphList())out.push({
+    kind:'glyph',id:g.id,label:g.id,group:'magic',sub:GLYPH_ICON[g.type]||'',
+    hay:[g.id,g.type,g.material||'',g.form||'',g.modifier||'',g.desc||'']
+      .join(' ').toLowerCase(),
+    count:g.mana,
+  });
   return out;
 }
+
+/* Glyphs, defensively: the file is optional and may be malformed, and every
+   caller wants "the list, or nothing" rather than a throw. */
+function glyphList(){
+  const g=glyphs&&glyphs.glyphs;
+  return Array.isArray(g)?g.filter(x=>x&&typeof x.id==='string'):[];
+}
+function glyphById(id){return glyphList().find(g=>g.id===id)||null;}
+const GLYPH_ICON={element:'◆',form:'▶',modifier:'✦'};
 
 function renderWikiList(){
   const host=$('#wikiList');host.innerHTML='';
   const q=$('#wikiSearch').value.trim().toLowerCase();
   const items=wikiIndex().filter(e=>!q||e.hay.includes(q));
-  const order=['materials','tags','tuning','sounds','shaders'];
-  const label={materials:'materials',tags:'tags',tuning:'tuning groups',
-               sounds:'sound sets',shaders:'shaders'};
+  const order=['magic','materials','tags','tuning','sounds','shaders'];
+  const label={magic:'magic',materials:'materials',tags:'tags',
+               tuning:'tuning groups',sounds:'sound sets',shaders:'shaders'};
   let n=0;
   for(const g of order){
     const rows=items.filter(e=>e.group===g);
@@ -3806,12 +3931,13 @@ function renderWikiList(){
       if(e.kind==='material')it.append(el('span',{class:'sw',style:'background:'+e.color}));
       else it.append(el('span',{class:'sw',style:'background:none;border-color:transparent'},e.sub||''));
       it.append(el('span',{class:'nm'},e.label));
-      it.append(el('span',{class:'cnt'},String(e.count)));
+      it.append(el('span',{class:'cnt'},e.count==null?'':String(e.count)));
       it.addEventListener('click',()=>wikiGo(e.kind,e.id));
       host.append(it);
     }
   }
-  $('#wikiHint').textContent=q?n+' match'+(n===1?'':'es'):'materials, tags, tuning groups & shaders';
+  $('#wikiHint').textContent=q?n+' match'+(n===1?'':'es')
+    :'magic, materials, tags, tuning, sounds & shaders';
 }
 
 function wikiGo(kind,id){
@@ -4086,6 +4212,617 @@ function renderWikiPage(){
   if(wikiSel.kind==='tune')return wikiTune(host);
   if(wikiSel.kind==='shader')return wikiShader(host);
   if(wikiSel.kind==='sound')return wikiSound(host);
+  if(wikiSel.kind==='magic')return wikiMagic(host);
+  if(wikiSel.kind==='glyph')return wikiGlyph(host);
+}
+
+/* ============================ MAGIC ==================================
+   The design doc for the caster VM, assembled the same way every other wiki
+   page is: prose that states the RULE, next to values pulled live out of
+   glyphs.json so the numbers can never drift from the content.
+
+   Read the engine side in src/game/spell.h (the four theses) and spell.cpp
+   (CompileSpell / ResolveCast / ApplySpellEffect). Where a number below is
+   quoted, it comes from glyphs.json if the file is loaded and from the
+   engine's own clamp otherwise — ENGINE_CEILINGS restates the ClampI() calls
+   in LoadGlyphs(), and carries the same standing obligation RENDER_PATHS does:
+   change a clamp in spell.cpp and this table must change with it, or the wiki
+   will confidently explain the wrong ceiling. */
+
+const MAGIC_TOPICS=[
+  {id:'overview',   title:'Magic: the caster VM', icon:'✧',
+   hay:'magic spell caster vm glyph overview language stack thesis'},
+  {id:'stability',  title:'Stability & backfire', icon:'⚖',
+   hay:'stable unstable fatal backfire instability wobble overcast mana health precision crossover'},
+  {id:'language',   title:'The language: folding a spell', icon:'❡',
+   hay:'language repetition amplify element form modifier spray compile fold multiplicity'},
+  {id:'budgets',    title:'Budgets & subcriticality', icon:'⛒',
+   hay:'budget rule2 subcritical trail voxel ops reservation ceiling generation sleep'},
+  {id:'glyphs',     title:'Glyph reference', icon:'◈',
+   hay:'glyph reference element form modifier list',
+   count:()=>glyphList().length},
+];
+
+/* The engine's own hard clamps, from LoadGlyphs() in src/game/spell.cpp and the
+   constants in spell.h. These bound whatever glyphs.json authors, which is the
+   rule-2 guarantee: a content edit cannot author an unbounded spell. */
+const ENGINE_CEILINGS=[
+  ['maxLiveProjectiles','1 … 256','spell.cpp',
+   'How many bolts may exist at once. Past it a cast MISFIRES at the caster rather than silently not firing — a spell that sometimes does nothing is miserable to diagnose.'],
+  ['maxGeneration','0 … 8','spell.cpp',
+   'Spawn depth. Nothing triggers anything yet, but anything a trigger spawns later must carry gen = parent.gen + 1 and be refused past this. THE subcriticality guarantee.'],
+  ['maxTrailVoxels','1 … 4096','spell.cpp',
+   'Hard ceiling on a trail’s VOLUME budget, whatever a glyph authors.'],
+  ['maxLifetimeTicks','1 … 1800','spell.cpp',
+   'Absolute bound on time-of-flight. An expired bolt fizzles — deliberately NOT an impact, so a spell whose budget ran out cannot deposit a free effect somewhere you never aimed.'],
+  ['sprayVoxels','1 … 64','spell.cpp','Voxels a bare element throws, at x1.'],
+  ['maxSprayVoxels','1 … 512','spell.cpp',
+   'Cap on ONE spray. The particle spawn budget (4096/tick) is SHARED with gore and debris shatter, so an amplified spray may not crowd them out.'],
+  ['spraySpeed','1 … 128','spell.cpp','Spray muzzle speed, whole voxels/tick.'],
+  ['sprayConeMille','0 … 1000','spell.cpp','Lateral scatter, per-mille of forward speed.'],
+  ['glyph speed','1 … 512','spell.cpp','Per-form projectile speed, voxels/tick.'],
+  ['glyph impactRadius','0 … 8','spell.cpp','Bounded by the mutate kernel’s 16³ brush footprint.'],
+  ['glyph radius','0 … 8','spell.cpp','Same brush-footprint bound, for modifiers.'],
+  ['glyph everyTicks','1 … 60','spell.cpp','Trail mark spacing, in whole voxels of travel.'],
+  ['kMaxAmplifyPow','2⁶ = 64×','spell.h',
+   'Repetition cap. Past it an extra word is FREE and does nothing — better than charging for an effect the budget will refuse to deliver.'],
+  ['kSpellOpsPerTick','24 BrushOps','spell.h',
+   'Magic’s own slice of the 64-op tick budget, reserved rather than shared so trails cannot starve against ambient mob (6) and avatar (6) bleeding.'],
+];
+
+/* The three outcomes, which are the whole tension mechanic. Restates
+   ResolveCast() in spell.cpp — one row per branch, in the order it tests. */
+const CAST_OUTCOMES=[
+  {id:'Normal',tone:'ok',test:'cost ≤ mana',
+   what:'Spends mana only. The bolt flies exactly where you aimed.',
+   why:'instability 0, so SpellWobble() returns the aim vector untouched.'},
+  {id:'Unstable',tone:'warn',test:'mana < cost ≤ mana + health',
+   what:'Drains mana to zero, takes the REMAINDER out of your body, and the spell goes off IMPRECISELY.',
+   why:'instability = overflow / health, per-mille. This is what makes the mana bar a PRECISION meter rather than a second HP bar — you are not merely paying more, you are losing your aim.'},
+  {id:'Fatal',tone:'bad',test:'cost > mana + health',
+   what:'The spell still HAPPENS — it just happens HERE. The payload runs at the caster and the body is carved through the ordinary dismemberment pipeline.',
+   why:'Not special-cased anywhere: ApplySpellEffect() is position-parameterized, so backfire is the same call with the caster’s position instead of the muzzle’s (thesis 2).'},
+  {id:'Nothing',tone:'dim',test:'nothing spoken (cost ≤ 0 and an empty stack)',
+   what:'No cost, no effect. The ONLY thing that is not a spell is silence.',
+   why:'An element with no form sprays; a form with no element fizzles and still charges for the attempt.'},
+];
+
+function magicBudget(k,fallback){
+  const b=(glyphs&&glyphs.budgets)||{};
+  return b[k]==null?fallback:b[k];
+}
+
+/* A labelled prose block. The wiki's own <p> styling is tuned for short facts,
+   and these pages are the design doc, so they get a slightly roomier line. */
+function mpara(...kids){
+  return el('div',{style:'font-size:13px;line-height:1.72;margin:0 0 10px;max-width:74ch'},...kids);
+}
+function mlead(t){
+  return el('div',{style:'font-size:14px;line-height:1.65;margin:0 0 12px;max-width:74ch;color:var(--fg)'},t);
+}
+/* A rule stated as a heading + its consequence. The consequence is the point:
+   every one of these exists because getting it wrong cost debugging time. */
+function mrule(title,...body){
+  const d=el('div',{style:'margin:0 0 12px;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg2)'});
+  d.append(el('div',{style:'font-family:var(--mono);font-size:12px;color:var(--acc);margin-bottom:5px'},title));
+  d.append(el('div',{style:'font-size:12.5px;line-height:1.65'},...body));
+  return d;
+}
+function mtable(cols,rows){
+  // c4 tunes the column widths for the 4-column shape (see the .wtab rules):
+  // three narrow value columns and one prose column that takes the remainder.
+  const t=el('table',{class:'wtab'+(cols.length>=4?' c4':'')});
+  t.append(el('thead',{},el('tr',{},...cols.map(c=>el('th',{},c)))));
+  const tb=el('tbody',{});
+  for(const r of rows)tb.append(el('tr',{},...r.map(c=>el('td',{},c))));
+  t.append(tb);
+  return t;
+}
+function mcode(t){return el('code',{class:'mcode'},t);}
+
+function wikiMagic(host){
+  const t=MAGIC_TOPICS.find(x=>x.id===wikiSel.id)||MAGIC_TOPICS[0];
+  host.append(el('div',{class:'wikihead'},
+    el('span',{},t.icon),el('h2',{},t.title),
+    el('span',{class:'kind'},'magic'),
+    el('span',{class:'spacer',style:'flex:1'}),
+    el('span',{class:'hint',style:'font-size:11px'},
+      glyphs?'content from assets/spells/glyphs.json · read-only'
+            :'engine rules only — glyphs.json not loaded')));
+
+  if(glyphsErr)host.append(el('div',{class:'wempty',style:'color:var(--red)'},
+    'glyphs.json failed to parse: '+glyphsErr+' — the rules below still apply; '+
+    'the numbers fall back to engine defaults.'));
+
+  ({overview:magicOverview,stability:magicStability,language:magicLanguage,
+    budgets:magicBudgets,glyphs:magicGlyphIndex}[t.id])(host);
+
+  host.append(wikiNoteSection('magic-'+t.id));
+}
+
+/* ---- overview ---- */
+function magicOverview(host){
+  const b=el('div',{});
+  b.append(mlead(
+    'A spell is a PROGRAM the player speaks one word at a time. Glyphs are '+
+    'functions on a typed stack; the cast key applies "cast" to whatever is on '+
+    'top. The whole system is built so that every sequence means something — '+
+    'there is no parse error, only a spell that does something other than what '+
+    'you meant.'));
+  b.append(mpara(
+    'That is the design thesis in one line: ',
+    el('b',{},'the ancient language punishes imprecision by granting the literal request'),
+    ', not by refusing to run. A hard validation error would make experimentation '+
+    'frustrating and would teach the player that half a spell is a mistake — '+
+    'exactly the wrong lesson for a system whose appeal is that anything you say '+
+    'does something.'));
+  host.append(wsec('✨ What it is',null,true,b));
+
+  const th=el('div',{});
+  th.append(mpara('Four properties are ',el('b',{},'structural'),
+    ' — the slice around them expects to be rewritten, these do not. From ',
+    mcode('src/game/spell.h'),'.'));
+  th.append(mrule('1 · A spell’s only output is op-stream emissions',
+    'Every world change a spell makes leaves as a BrushOp, ExplosionOp, CellOp or '+
+    'ParticleSpawn on the MutationQueue. There is no path from spell code into a '+
+    'voxel buffer and there must never be one — that is exactly what gives spells '+
+    'save, replay and networking for free (CLAUDE.md rule 3).'));
+  th.append(mrule('2 · The effect payload is position-parameterized',
+    mcode('ApplySpellEffect()'),' takes the position and direction as arguments, so '+
+    '"cast it at the muzzle" and "cast it into your own chest" are the SAME call '+
+    'with different arguments. ',el('b',{},'Backfire is therefore never per-spell code'),
+    ' — add a new element and it gets a thematic death for free.'));
+  th.append(mrule('3 · The VM is integer, in 24.8 fixed point',
+    'Projectile position and velocity use the same 24.8 convention ParticleSpawn '+
+    'does; mana, health and timers are plain integers. ',
+    el('b',{},'This is NOT required by rule 1'),' — spell state is CPU-side gameplay '+
+    'state outside the hashed grid, so the world hash cannot see it either way. It '+
+    'is future-proofing for lockstep MP and replay, where a bolt’s path must '+
+    'reproduce bit-exactly. Retrofitting fixed point after the glyph set grows is a '+
+    'rewrite, so don’t "simplify" it back to float. Even the square roots are '+
+    'integer (',mcode('IntSqrt'),') for that reason.'));
+  th.append(mrule('4 · The VM is not player-coupled',
+    'Compiling and casting is a free function over (glyphs, caster state, origin, '+
+    'direction) → emitted ops. Health arrives through a ',mcode('CasterHealth'),
+    ' callback rather than a field, so the player’s health can stay on '+
+    'PlayerAvatar’s per-part hp with no parallel number to drift. ',
+    el('b',{},'A mob can cast through this same path'),' and the VM never learns what a mob is.'));
+  host.append(wsec('\u{1F9F1} The four theses',4,true,th));
+
+  const fl=el('div',{});
+  fl.append(mpara('One cast, end to end:'));
+  fl.append(mtable(['stage','what happens','where'],[
+    ['speak',    'A number key pushes a glyph onto the stack. Pressing a number SPEAKS, it never casts.','game/caster.h'],
+    ['compile',  'The stack folds into a Spell on every change, so the running cost is known BEFORE you commit.','CompileSpell()'],
+    ['resolve',  'Cost is charged against mana, then health. Yields Normal / Unstable / Fatal.','ResolveCast()'],
+    ['aim',      'Instability perturbs the aim vector by a counter-based hash — reproducible in a replay.','SpellWobble()'],
+    ['emit',     'Spray and instant effects resolve now; a projectile is queued live.','ApplySpellEffect()'],
+    ['fly',      'Swept integration at ≤ ½ voxel per sub-step (anti-tunneling), laying trail against a budget.','SpellSystem::Tick()'],
+    ['impact',   'The same payload function runs at the impact point.','ApplySpellEffect()'],
+  ]));
+  fl.append(mpara(el('b',{},'The cost is visible before you cast.'),
+    ' That is deliberate and load-bearing: it makes the mana/health crossover a '+
+    'DECISION rather than a surprise. The HUD recompiles the stack on every '+
+    'keypress for exactly this reason.'));
+  host.append(wsec('\u{1F501} One cast, end to end',7,true,fl));
+
+  const ctl=el('div',{});
+  ctl.append(mtable(['input','does'],[
+    [mcode('Z'),'toggle magic mode — the number row speaks glyphs instead of picking a brush material'],
+    [mcode('1…0'),'speak the glyph bound to that slot (10 slots; the number at hand is a real constraint)'],
+    [mcode('RMB'),'cast what is on the stack'],
+    [mcode('C'),'clear the spoken stack'],
+    [mcode('Backspace'),'clear the spoken stack'],
+    [mcode('R'),'hot-reload glyphs.json alongside materials.json'],
+  ]));
+  ctl.append(mpara('Leaving magic mode abandons the half-spoken spell. Glyphs '+
+    'hot-reload with materials and MUST — a glyph holds a RESOLVED 12-bit material '+
+    'id, so reloading materials without reloading glyphs would leave every glyph '+
+    'pointing at whatever now occupies that id.'));
+  host.append(wsec('\u{1F3AE} Controls',6,false,ctl));
+}
+
+/* ---- stability: the question the user actually asked ---- */
+function magicStability(host){
+  const b=el('div',{});
+  b.append(mlead(
+    'Stability is not a property a spell HAS. It is the relationship between what '+
+    'the spell COSTS and what the caster can currently PAY — so the identical '+
+    'sequence is stable when you are rested and fatal when you are not.'));
+  b.append(mpara('Cost is charged against two pools in a fixed order: ',
+    el('b',{},'mana first, then your body'),'. Where the cost lands decides the outcome.'));
+  b.append(el('div',{class:'mbar'},
+    el('div',{class:'seg ok'},'≤ mana  →  STABLE'),
+    el('div',{class:'seg warn'},'into health  →  UNSTABLE'),
+    el('div',{class:'seg bad'},'past both  →  FATAL')));
+  host.append(wsec('⚖ What stability means',null,true,b));
+
+  const rows=CAST_OUTCOMES.map(o=>[
+    el('span',{class:'otag '+o.tone},o.id),
+    mcode(o.test),
+    el('span',{},o.what),
+  ]);
+  const oc=el('div',{});
+  oc.append(mtable(['outcome','when','what happens'],rows));
+  const why=el('div',{style:'margin-top:10px'});
+  for(const o of CAST_OUTCOMES)
+    why.append(mrule(o.id+' — why',o.why));
+  oc.append(why);
+  host.append(wsec('\u{1F3AF} The three outcomes',CAST_OUTCOMES.length,true,oc));
+
+  const st=el('div',{});
+  st.append(mpara(el('b',{},'What makes a spell STABLE:'),' simply that its total cost '+
+    'fits inside your current mana. Nothing else. There is no "stable glyph" and no '+
+    'stability stat — a one-word ',mcode('sand'),' is stable at 3 mana, and so is a '+
+    'six-word bolt if you have the pool for it.'));
+  st.append(mpara(el('b',{},'What makes it UNSTABLE:'),' overrunning mana into health. '+
+    'The spell still goes off, but instability is measured as ',
+    mcode('overflow / health'),' per-mille — how deep into the body it reached, as a '+
+    'FRACTION of what was left. Two consequences that are easy to miss:'));
+  const ul=el('ul',{style:'font-size:12.5px;line-height:1.7;margin:0 0 10px 18px;max-width:74ch'});
+  ul.append(el('li',{},'It is relative to REMAINING health, so the same overspend is '+
+    'mild at full health and wild when you are nearly dead. Being hurt makes you a '+
+    'worse caster, which is the interesting coupling.'));
+  ul.append(el('li',{},'The wobble is ',el('b',{},'squared'),' (',mcode('mag = i² / 1000'),
+    ') — a shallow dip barely wavers while a deep one sprays wildly. The interesting '+
+    'part of the curve is the far end, so the curve is shaped to spend its resolution there.'));
+  st.append(ul);
+  st.append(mpara(el('b',{},'What makes it FATAL:'),' a cost beyond mana AND health '+
+    'combined. Note what does NOT happen: the cast is not refused. The spell goes off '+
+    'at the caster — the payload runs at your position, and the avatar is carved by '+
+    'the ordinary gore pipeline. You wanted a lava bolt; you got a lava bolt, here.'));
+  host.append(wsec('\u{1F9EA} Stable, unstable, fatal',3,true,st));
+
+  const w=el('div',{});
+  w.append(mpara('The mana bar is a ',el('b',{},'precision meter'),', not a second health bar. '+
+    'That distinction is the entire reason instability drives AIM rather than damage: '+
+    'if overspending merely cost more, mana would be a resource; because it costs you '+
+    'your accuracy, mana is a measure of control.'));
+  w.append(mpara('The perturbation is scaled against the direction vector’s own '+
+    'magnitude, so a fast spell and a slow one wobble by the same ANGLE rather than the '+
+    'same distance. It is driven by ',mcode('Hash3(casterId, tick, component)'),
+    ' — stateless and counter-based, so a replay reproduces the exact same bad shot.'));
+  host.append(wsec('\u{1F300} Why instability moves the aim',null,true,w));
+
+  const bf=el('div',{});
+  bf.append(mpara('A backfire is not an error path. It is the ordinary effect payload '+
+    'with the caster’s position as its argument — so every element gets a death '+
+    'that suits it without a single line of per-spell code. The ',mcode('backfire'),
+    ' field on an element is ',el('b',{},'thematic only'),'; the mechanism is identical.'));
+  const kinds=[
+    ['burn','fire / lava','A real explosion at the position (radius ~6, strength 220), plus the caster carve. Both go through existing pipelines.'],
+    ['dissolve','acid','Deposits the element into the caster’s own volume — your voxels become acid, and the ordinary CA then eats you with it.'],
+    ['drown','water','Deposits the element. The falling-sand sim does the rest.'],
+    ['bury','sand','Deposits the element. Cheapest possible way to practise dying.'],
+    ['generic','anything unnamed','Deposits the element at radius ~3 as a paint-into-air op.'],
+  ];
+  bf.append(mtable(['backfire','on','what it does'],kinds.map(k=>[mcode(k[0]),k[1],k[2]])));
+  bf.append(mpara('Note the ',el('b',{},'spray backfire'),' falls out for free: because spray '+
+    'is emitted from inside ',mcode('ApplySpellEffect'),' rather than from the cast path, '+
+    'a fatal spray sprays into your own body. Nobody wrote that case.'));
+  host.append(wsec('\u{1F4A5} Backfire',kinds.length,true,bf));
+
+  const misc=el('div',{});
+  misc.append(mpara('Two more ways a spell fails to do what you meant, neither of which '+
+    'is an outcome:'));
+  misc.append(mrule('Over the projectile cap → misfire at the caster',
+    'Past ',mcode('maxLiveProjectiles'),' a cast runs its payload at the caster at 40% '+
+    'strength instead of spawning. Deliberately loud: a spell that silently does nothing '+
+    'is miserable to diagnose.'));
+  misc.append(mrule('Out of trail budget → the projectile dies',
+    'When the trail cannot afford another mark the bolt dies WITH its budget rather '+
+    'than flying on inertly — the trail was the point of the spell.'));
+  misc.append(mrule('Lifetime expiry → fizzle, NOT impact',
+    'An expired bolt does nothing at all. If expiry deposited an impact, a spell whose '+
+    'budget ran out would drop a free effect somewhere you never aimed.'));
+  host.append(wsec('⚠ Other ways it goes wrong',3,false,misc));
+
+  const hp=el('div',{});
+  hp.append(mpara('Health is the summed hp of every LIVE part of the avatar — there is no '+
+    'single hp field, deliberately, so the mana bar’s overdraw and the visible damage '+
+    'state cannot drift apart. An overcast spends it ',el('b',{},'proportionally across '+
+    'live parts'),' rather than draining the first one, because otherwise a mana overdraw '+
+    'would deterministically sever whichever limb happens to sort first, which reads as a bug.'));
+  hp.append(mpara('Parts driven to zero are severed through the ordinary ',mcode('Sever()'),
+    ' path, so an overcast dismembers you with no new gore code. And ',
+    el('b',{},'health does not regenerate'),' — it is a ceiling you only ever move away '+
+    'from, which is what makes casting into it a real decision rather than a rechargeable '+
+    'second resource. Mana regenerates; your body does not.'));
+  host.append(wsec('❤ Where health comes from',null,false,hp));
+}
+
+/* ---- the language ---- */
+function magicLanguage(host){
+  const b=el('div',{});
+  b.append(mlead('Compiling a spell is a fold over the spoken stack, and it is TOTAL: '+
+    'every sequence compiles into something that does something. Two rules give it that totality.'));
+  host.append(wsec('❡ Totality',null,true,b));
+
+  const r1=el('div',{});
+  r1.append(mpara(el('b',{},'Saying a word again means it harder.'),' The Nth utterance of a '+
+    'glyph contributes 2^(N-1) and costs 2^(N-1) times its mana. So each extra word costs as '+
+    'much as everything before it combined.'));
+  const sand=glyphById('sand'), sm=sand?sand.mana:3;
+  r1.append(mtable(['spoken','effect','this word costs','running total'],[
+    ['sand','×1',String(sm),String(sm)],
+    ['sand sand','×2',String(sm*2),String(sm*3)],
+    ['sand sand sand','×4',String(sm*4),String(sm*7)],
+    ['sand ×N','×2^(N-1)','—','(2^N − 1) × '+sm],
+  ]));
+  r1.append(mpara('Why doubling rather than counting: a linear ramp makes repetition a tedious '+
+    'way to buy a small increase. The interesting decision — ',el('em',{},'"is this worth an '+
+    'entire extra mana bar?"'),' — only exists if the curve is steep. It also makes the cost '+
+    'legible without arithmetic.'));
+  r1.append(mrule('Capped at 2⁶ = 64×',
+    'Past the cap an extra word is FREE and does nothing. That is the honest behaviour: better '+
+    'than silently charging for an effect the budget will refuse to deliver. It is also what '+
+    'stops a stuck key authoring an unbounded particle count (rule 2). The stack itself is '+
+    'bounded at 16 words for the same reason.'));
+  r1.append(mrule('A DIFFERENT element replaces; it does not stack',
+    'Speaking ',mcode('water lava'),' throws lava, not both — and it RESETS the amplification. '+
+    'An element is what the spell is MADE of, and "made of two things" has no meaning here, '+
+    'whereas "more of it" does. Same for a different form. Only repeats amplify.'));
+  host.append(wsec('① Repetition amplifies',null,true,r1));
+
+  const r2=el('div',{});
+  r2.append(mpara('Spray is ',el('b',{},'not'),' "no form" — it is the default form every spell '+
+    'falls back to when no form glyph was spoken: a handful of loose voxels of the element flung '+
+    'out of your hand as ballistic particles, riding the existing gore/ejecta pipeline.'));
+  r2.append(mpara('This is what makes the language total. A bare element used to misfire, which '+
+    'taught the player that half a spell is a mistake. Now ',el('b',{},'the shortest legal spell '+
+    'is one word'),' and every longer sequence reads as an elaboration of it rather than a correction.'));
+  r2.append(mtable(['spoken','yields'],[
+    ['sand','a spray of '+magicBudget('sprayVoxels',3)+' sand voxels'],
+    ['sand sand','×2 — '+(magicBudget('sprayVoxels',3)*2)+' voxels, for twice the mana'],
+    ['projectile','a form with nothing to shape: fizzles, and still charges for the attempt'],
+    ['sand projectile','a sand bolt'],
+  ]));
+  host.append(wsec('② An unspoken form is spray',null,true,r2));
+
+  const fold=el('div',{});
+  fold.append(mpara('How each glyph type folds in:'));
+  fold.append(mtable(['type','on repeat','on a different one'],[
+    [el('span',{},GLYPH_ICON.element+' element'),'amplifies ×2 per repeat','REPLACES, and resets amplification'],
+    [el('span',{},GLYPH_ICON.form+' form'),'faster and longer-lived — "more projectile" is a harder throw, not a second bolt','replaces'],
+    [el('span',{},GLYPH_ICON.modifier+' modifier'),'listed once, carries its own repeat count — "trail trail" is ONE trail with twice the budget','both apply, in spoken order'],
+  ]));
+  fold.append(mrule('Transmute widens by VOLUME, not by radius',
+    'Repeating ',mcode('transmute'),' grows the radius as the ',el('b',{},'cube root'),
+    ' of the multiplier (×5/4 per doubling), so a ×2 spell converts twice the MATTER rather '+
+    'than eight times. The multiplier means the same thing everywhere: "twice as much".'));
+  host.append(wsec('\u{1F9EE} Folding the stack',3,true,fold));
+
+  const rd=el('div',{});
+  rd.append(mpara('The readout exists because a clear statement of what a sequence WILL do is '+
+    'worth more than validation. It says what happens, not whether it is allowed — which is the '+
+    'more useful thing to show, and the only honest one in a language with no illegal sentences.'));
+  rd.append(mtable(['verdict','means'],[
+    ['silence','nothing spoken'],
+    ['no element — the form has nothing to shape, it will fizzle','a form with no matter. Still cast, still charged.'],
+    ['spray: N voxels from your hand','the default form'],
+    ['bolt ×N + trail ×M','a projectile with its modifiers and their multipliers'],
+  ]));
+  host.append(wsec('\u{1F4DC} The readout',null,false,rd));
+}
+
+/* ---- budgets ---- */
+function magicBudgets(host){
+  const b=el('div',{});
+  b.append(mlead('CLAUDE.md rule 2 — cost scales with activity, not world size — applies to magic '+
+    'with no exception. Every sustained effect declares a FINITE budget up front: voxels affected, '+
+    'ticks alive, total ops. Never an open-ended duration.'));
+  b.append(mpara('This is not defensive coding. This codebase has hit the ',
+    el('b',{},'"permanent condition keeps chunks awake forever"'),' trap three times already — '+
+    'light-gated rules, staining, viscous liquids. A trail spell must not be the fourth. A rule '+
+    'whose expected offspring per tick is ≥ 1 means chunks never sleep and the sim never settles; '+
+    'it looks like a perf bug but it is a content bug.'));
+  host.append(wsec('⛒ Why budgets exist',null,true,b));
+
+  const tb=el('div',{});
+  tb.append(mpara('The trail is the worked example, and it took three separate fixes to get right. '+
+    'Each is a trap worth knowing:'));
+  tb.append(mrule('The budget is a VOLUME count, charged BEFORE the op is emitted',
+    'An op of radius r costs (2r+1)³ voxels, not one. Charging per OP would make a radius-8 trail '+
+    'cost the same as a radius-1 one and the bound would mean nothing. And it is charged first, '+
+    'then refused if it does not fit: the natural ordering (emit → subtract → check ≤ 0) lets the '+
+    'last op overrun by nearly its whole volume. Measured at ',el('b',{},'343 voxels against a 64 '+
+    'budget'),' before the fix. "Bounded eventually" is not what rule 2 asks for.'));
+  tb.append(mrule('One mark per WHOLE VOXEL of travel, not per sub-step',
+    'The sweep is subdivided for anti-tunneling — up to ~96 sub-steps at 48 voxels/tick — so '+
+    'marking per sub-step spends the entire budget in a single tick and lays a dozen overlapping '+
+    'ops on one cell. Gating on the cell actually CHANGING makes trail length proportional to '+
+    'distance flown, which is what the budget is meant to measure.'));
+  tb.append(mrule('Out of budget kills the projectile',
+    'Rather than letting it fly on inertly — the trail was the spell’s whole point.'));
+  const tr=glyphById('trail');
+  if(tr)tb.append(mpara('Current content: ',mcode('trail'),' authors ',
+    el('b',{},String(tr.voxelBudget??64)+' voxels'),' at radius ',mcode(String(tr.radius??1)),
+    ', marking every ',mcode(String(tr.everyTicks??1)),' voxel(s). ',
+    (tr.radius===0?'Radius 0 = one voxel per mark: at 48 voxels/tick a radius-1 mark costs 27 '+
+     'voxels, so anything wider spends the whole budget within a tick or two and reads as a blob '+
+     'rather than a trail.':'')));
+  host.append(wsec('\u{1F3AF} The trail, and its three traps',3,true,tb));
+
+  const ops=el('div',{});
+  ops.append(mpara('Magic reserves ',el('b',{},'24 of the 64 BrushOps'),' available per tick, '+
+    'rather than sharing them. Mob bleeding already reserves 6 and the avatar 6 more; without an '+
+    'explicit slice, trails and transmutes would starve against ambient bleeding and a spell would '+
+    '"sometimes not fire", which is miserable to diagnose.'));
+  ops.append(mpara('Anything past the reservation is ',el('b',{},'counted, not dropped silently'),
+    ' — the overflow is surfaced in the HUD as "ops dropped". A spell that quietly does nothing is '+
+    'the exact failure this exists to prevent.'));
+  host.append(wsec('\u{1F4E6} Op budget fairness',null,true,ops));
+
+  const ce=el('div',{});
+  ce.append(mpara('Authored budgets in ',mcode('glyphs.json'),' are ',el('b',{},'clamped'),
+    ' against these engine ceilings at load, not trusted. A content edit cannot author an '+
+    'unbounded spell.'));
+  const cur=(k,fb)=>{const v=magicBudget(k,null);return v==null?el('span',{class:'hint'},'—'):mcode(String(v));};
+  ce.append(mtable(['knob','engine range','authored now','why'],
+    ENGINE_CEILINGS.map(r=>[mcode(r[0]),mcode(r[1]),cur(r[0]),
+      el('span',{style:'font-size:12px'},r[3])])));
+  host.append(wsec('\u{1F512} Engine ceilings',ENGINE_CEILINGS.length,true,ce));
+
+  const gen=el('div',{});
+  gen.append(mpara('Nothing triggers anything yet — but ',mcode('gen'),' is already on every Spell. '+
+    'Anything a trigger spawns later must carry ',mcode('gen = parent.gen + 1'),' and be refused past ',
+    mcode('maxGeneration'),'. Wiring it now costs one field; adding it after triggers exist means '+
+    'auditing every spawn site. This is the subcriticality guarantee in advance: reaction-driven '+
+    'growth must be decisively subcritical or the sim never settles.'));
+  host.append(wsec('\u{1F9EC} Subcriticality, pre-wired',null,false,gen));
+}
+
+/* ---- glyph index ---- */
+function magicGlyphIndex(host){
+  const list=glyphList();
+  if(!list.length){
+    host.append(wempty(glyphsErr
+      ?'glyphs.json did not parse — see the error above.'
+      :'glyphs.json not loaded. Run the tuner app or server, or pick the assets/ '+
+       'folder (not assets/materials/) so the Wiki can reach assets/spells/.'));
+    return;
+  }
+  for(const type of ['element','form','modifier']){
+    const rows=list.filter(g=>g.type===type);
+    if(!rows.length)continue;
+    const body=el('div',{});
+    for(const g of rows){
+      const line=el('div',{class:'wrule'});
+      const c=el('code',{style:'cursor:pointer'},g.id);
+      c.addEventListener('click',()=>wikiGo('glyph',g.id));
+      line.append(c);
+      line.append(el('span',{class:'txt'},g.desc||''));
+      line.append(el('span',{class:'ch'},g.mana+' mana'));
+      body.append(line);
+    }
+    host.append(wsec(GLYPH_ICON[type]+' '+type+'s',rows.length,true,body));
+  }
+  const cj=(glyphs&&glyphs.conjoined&&glyphs.conjoined.entries)||[];
+  if(cj.length){
+    const body=el('div',{});
+    body.append(mpara('A conjoined glyph is nothing but a saved list of glyph ids that pushes the '+
+      'same result as speaking them in order — no new VM opcode. That is the whole data-model cost '+
+      'of conjoining. ',el('b',{},'STUB:'),' no crafting UI yet.'));
+    for(const c of cj){
+      const line=el('div',{class:'wrule'});
+      line.append(el('code',{},c.id));
+      line.append(el('span',{class:'txt'},c.desc||''));
+      line.append(el('span',{class:'ch'},(c.glyphs||[]).join(' + ')));
+      body.append(line);
+    }
+    host.append(wsec('\u{1F517} Conjoined',cj.length,false,body));
+  }
+  const wd=(glyphs&&glyphs.wards&&glyphs.wards.entries)||[];
+  if(wd.length){
+    const body=el('div',{});
+    body.append(mpara(el('b',{},'STUB — wards are NOT implemented;'),' the block fixes the shape only. '+
+      'Intended semantics: a ward filters the incoming OP STREAM on the CPU (cheap, sim untouched), '+
+      'never the CA itself. So a ward stops someone CASTING acid at your feet; it does not stop acid '+
+      'already flowing toward you. That is deliberate — it keeps the falling-sand game underneath and '+
+      'makes "cast next to them and let physics do it" the counterplay.'));
+    body.append(mpara('Drain reduces EFFECTIVE MAX MANA by a FRACTION rather than a flat amount, so a '+
+      'big late-game pool cannot buy invulnerability.'));
+    for(const w of wd){
+      const line=el('div',{class:'wrule'});
+      line.append(el('code',{},w.id));
+      line.append(el('span',{class:'txt'},w.desc||''));
+      line.append(el('span',{class:'ch'},(w.drainPerMille||0)/10+'% max mana'));
+      body.append(line);
+    }
+    host.append(wsec('\u{1F6E1} Wards',wd.length,false,body));
+  }
+}
+
+/* ---- one glyph ---- */
+function wikiGlyph(host){
+  const g=glyphById(wikiSel.id);
+  if(!g){host.append(wempty('no such glyph'));return;}
+  const isEl=g.type==='element';
+  const m=isEl?matById(g.material):null;
+
+  host.append(el('div',{class:'wikihead'},
+    el('span',{class:'sw',style:'background:'+(m?((m.colors||[])[0]||'#666'):'none')+
+      (m?'':';border-color:transparent')},m?'':(GLYPH_ICON[g.type]||'')),
+    el('h2',{},g.id),
+    el('span',{class:'kind'},g.type),
+    el('span',{class:'kind'},g.mana+' mana'),
+    el('span',{class:'spacer',style:'flex:1'}),
+    el('span',{class:'hint',style:'font-size:11px'},'read-only · edit assets/spells/glyphs.json')));
+
+  if(g.desc)host.append(mlead(g.desc));
+
+  const f=el('div',{class:'wfacts'});
+  const fact=(k,v)=>{f.append(el('div',{class:'k'},k),el('div',{class:'v'},v));};
+  fact('type',g.type);
+  fact('mana',String(g.mana)+' ');
+  if(isEl){
+    const mm=el('span',{});
+    if(m){
+      const c=el('code',{style:'cursor:pointer'},g.material);
+      c.addEventListener('click',()=>wikiGo('material',g.material));
+      mm.append(c);
+    }else mm.append(el('span',{style:'color:var(--red)'},
+      (g.material||'(none)')+' — does not resolve; the engine REFUSES to load this'));
+    fact('material',mm);
+    fact('backfire',el('span',{},g.backfire||'generic',
+      el('em',{style:'color:var(--faint)'},'  · thematic only; the mechanism is the same call')));
+  }
+  if(g.type==='form'){
+    fact('form',g.form||'');
+    fact('speed',g.speed+' voxels/tick');
+    fact('lifetimeTicks',g.lifetimeTicks+'  ');
+    fact('impactRadius',String(g.impactRadius));
+  }
+  if(g.type==='modifier'){
+    fact('modifier',g.modifier||'');
+    fact('radius',String(g.radius));
+    if(g.voxelBudget!=null)fact('voxelBudget',g.voxelBudget+' voxels (VOLUME, not ops)');
+    if(g.everyTicks!=null)fact('everyTicks','every '+g.everyTicks+' voxel(s) of travel');
+  }
+  host.append(wsec('\u{1F4CB} Fields',null,true,f));
+
+  const amp=el('div',{});
+  const cost=n=>{let t=0;for(let i=0;i<n;i++)t+=g.mana*Math.pow(2,Math.min(i,6));return t;};
+  amp.append(mpara('Repeating this glyph doubles its contribution and its share of the cost:'));
+  amp.append(mtable(['spoken','multiplier','running cost'],
+    [1,2,3,4].map(n=>[Array(n).fill(g.id).join(' '),'×'+Math.pow(2,n-1),String(cost(n))])));
+  if(g.type==='element')amp.append(mpara('For an element the multiplier scales the MATTER — '+
+    'spray voxel count, and the share of any modifier’s authorized ops.'));
+  if(g.type==='form')amp.append(mpara('For a form it scales speed and lifetime: "more projectile" '+
+    'is a harder throw, not a second bolt.'));
+  if(g.type==='modifier')amp.append(mpara('For a modifier it scales that modifier’s budget — ',
+    mcode(g.id+' '+g.id),' is ONE '+g.id+' with twice the budget, not two of them.'));
+  host.append(wsec('\u{1F4C8} Under repetition',null,true,amp));
+
+  if(isEl){
+    const bf=el('div',{});
+    const K={burn:'A real explosion at the caster (radius ~6, strength 220) plus the body carve — both through existing pipelines.',
+             dissolve:'Deposits '+g.material+' into the caster’s own volume. Your voxels become it, and the CA eats you with it.',
+             drown:'Deposits '+g.material+' at the caster and lets the falling-sand sim finish the job.',
+             bury:'Deposits '+g.material+' at the caster.',
+             generic:'Deposits '+g.material+' at radius ~3 as a paint-into-air op.'};
+    bf.append(mpara(K[g.backfire||'generic']||K.generic));
+    bf.append(mpara('Reached when a cast costs more than mana + health combined. Not an error path '+
+      'and not special-cased: it is ',mcode('ApplySpellEffect'),' with the caster’s position '+
+      'instead of the muzzle’s.'));
+    host.append(wsec('\u{1F4A5} If it backfires',null,true,bf));
+  }
+
+  const used=[];
+  for(const c of ((glyphs&&glyphs.conjoined&&glyphs.conjoined.entries)||[]))
+    if((c.glyphs||[]).includes(g.id))used.push(c);
+  if(used.length){
+    const body=el('div',{});
+    for(const c of used){
+      const line=el('div',{class:'wrule'});
+      line.append(el('code',{},c.id));
+      line.append(el('span',{class:'txt'},c.desc||''));
+      line.append(el('span',{class:'ch'},(c.glyphs||[]).join(' + ')));
+      body.append(line);
+    }
+    host.append(wsec('\u{1F517} Used in',used.length,true,body));
+  }
+  host.append(wikiNoteSection('glyph-'+g.id));
 }
 
 /* A sound set's page. The set editor is the Audio tab's own, so a take dropped

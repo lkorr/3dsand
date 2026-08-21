@@ -8,6 +8,7 @@
 // For the voxel-word stain limits (kStainTypeMax / kStainAmtMax): the stain a
 // material applies has to fit the field the voxel word reserves for it, and
 // world.h is the single source of truth for that layout.
+#include "sim/tuning.h"
 #include "sim/world.h"
 
 using nlohmann::json;
@@ -400,6 +401,27 @@ static void ParseNeighborScale(const json& r, const std::vector<MaterialDef>& ma
   g.cond |= (q & kScaleMulMask) << kScaleMulShift;
 }
 
+// ---- weather switches: "requires" in reactions.json ----------------------
+//
+// A rule may name ONE named switch. If the switch is off the rule is dropped
+// here and never reaches the GPU table, so an off switch costs nothing per
+// cell — the alternative (a cond bit the shader tests every tick) would spend
+// work to do nothing, which rule 2 exists to prevent.
+//
+// The flag names live here rather than in the JSON schema so that a typo is a
+// load error instead of a rule that silently never compiles. Adding a switch
+// = a bool in Tuning::Weather, a row here, and a row in the tuner schema.
+//
+// Returns false and sets `known` = false for an unrecognised name.
+static bool WeatherFlagEnabled(const std::string& name, bool& known) {
+  const auto& w = CurrentTuning().weather;
+  known = true;
+  if (name == "waterFreezes") return w.waterFreezes;
+  if (name == "iceMelts") return w.iceMelts;
+  known = false;
+  return false;
+}
+
 static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>& mats,
                               TagRegistry& tagReg, std::vector<ReactionGpu>& out,
                               std::string& errors) {
@@ -432,6 +454,31 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
       errors += path + ": reaction with unknown or missing self \"" + self + "\"\n";
       continue;
     }
+    // A rule may be gated on a weather switch. Dropped BEFORE any other
+    // parsing so an off rule costs nothing and cannot report errors about
+    // fields nobody will read; the bucket flattening below recomputes
+    // reactOffset/reactCount from the surviving rules, so nothing else needs
+    // to know a rule went missing.
+    if (r.contains("requires")) {
+      if (!r["requires"].is_string()) {
+        errors += path + ": reaction self=\"" + self +
+                  "\": \"requires\" must be a string\n";
+        continue;
+      }
+      const std::string need = r["requires"].get<std::string>();
+      bool known = false;
+      const bool on = WeatherFlagEnabled(need, known);
+      if (!known) {
+        // A typo must be loud. Silently compiling the rule would make the
+        // switch appear to do nothing; silently dropping it would delete
+        // content — an error is the only honest option.
+        errors += path + ": reaction self=\"" + self +
+                  "\": unknown \"requires\" switch \"" + need + "\"\n";
+        continue;
+      }
+      if (!on) continue;
+    }
+
     ReactionGpu g{};
     g.nbrMat = kNbrAny;
     g.prodSelf = kProdKeep;

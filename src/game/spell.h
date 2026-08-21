@@ -432,12 +432,17 @@ void ApplySpellEffect(const GlyphLibrary& lib, const Spell& spell,
 // coupled: Cast() takes an origin and a direction, so a mob can drive it.
 class SpellSystem {
  public:
-  // OP BUDGET FAIRNESS (§F). kMaxOpsPerTick is 64 BrushOps and MobSystem
-  // already reserves kBleedOpsPerTick = 6 for bleeding, with the avatar
-  // reserving 6 more. Trails and transmutes would otherwise starve against
+  // OP BUDGET FAIRNESS (§F). kMaxOpsPerTick is 64 BrushOps and both MobSystem
+  // and the avatar reserve gore.bleedOpsPerTick (tuning.json, 6 by default)
+  // each for wound drips. Trails and transmutes would otherwise starve against
   // ambient bleeding and a spell would "sometimes not fire", which is
   // miserable to diagnose. So magic gets its own explicit reservation in the
   // same spirit, rather than silently sharing.
+  //
+  // The bleed side is tunable and this one is not, deliberately: magic's share
+  // must not shrink because someone turned the gore up. bleedOpsPerTick is
+  // clamped to 64 at load, so a reckless value costs blood ops their own
+  // fairness rather than taking this reservation away.
   static constexpr int kSpellOpsPerTick = 24;
 
   void SetLibrary(const GlyphLibrary* lib) { lib_ = lib; }

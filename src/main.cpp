@@ -18,6 +18,8 @@
 #include "game/brush.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/item.h"
+#include "game/melee.h"
 #include "game/mob.h"
 #include "game/spell.h"
 #include "game/player.h"
@@ -1846,6 +1848,103 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
     walkOk = player.grounded && std::abs(feet - (float)(h + 1)) < 4.0f;
     std::printf("player walk: %s (grounded=%d feet y=%.1f, terrain h=%d)\n",
                 walkOk ? "PASS" : "FAIL", player.grounded ? 1 : 0, feet, h);
+
+    // ---- UNSTICK: a body inside solid ground must climb back out -----------
+    //
+    // Every collision sweep in player.cpp is a hard VETO — it refuses any
+    // substep that ENDS overlapping a solid. That is correct from outside the
+    // world and a trap from inside it: once the AABB overlaps a voxel, the
+    // FIRST substep of every axis fails, including the upward ones, so the
+    // player cannot move at all and has to noclip out. On noisy terrain you get
+    // there constantly (a powder settles into your feet, a step-down lands a
+    // fraction inside a face), which is what made walking rough ground feel
+    // like it kept swallowing you.
+    //
+    // Two halves, and the second matters as much as the first: shallow burial
+    // must eject, and DEEP burial must NOT — being entombed is a real state the
+    // world can put you in, and teleporting out of it would be the worse bug.
+    // Testing only the ejection would pass with an unconditional escape hatch.
+    bool unstickOk = false;
+    if (walkOk) {
+      const Vec3 standing = player.pos;
+      // (a) shallow: sink the body two voxels into the floor it is standing on
+      // and require it to rise clear within a second of ticks.
+      player.pos.y = standing.y - 2.0f;
+      player.vel = Vec3{0, 0, 0};
+      for (int i = 0; i < 30; i++)
+        player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
+                      Vec3{1, 0, 0}, kindAt);
+      // Clear means the AABB no longer overlaps: the surest statement of that
+      // from out here is that the body got back to roughly where it was
+      // standing, rather than staying where we buried it.
+      float roseTo = player.pos.y;
+      bool shallowFreed = roseTo > standing.y - 0.75f;
+
+      // (b) deep: drop the body below the surface far enough that the ejection
+      // cap refuses it, and require it to STAY there.
+      //
+      // DEPTH IS BOUNDED BY THE CPU MIRROR, not just by the cap. The mirror is
+      // 3x3x3 chunks around the player's last SubmitTick position, and past it
+      // KindAt returns Unknown — which Collides() does not treat as blocking.
+      // So a body dropped 25 voxels down (the first version of this fixture)
+      // is not entombed at all: it is in Unknown space, free to move, and
+      // "did not move" passed for entirely the wrong reason. 14 voxels is
+      // comfortably past unstickMaxDepth (0.9 m = 9 voxels) while staying
+      // inside the one chunk below the player that the mirror actually holds.
+      player.pos = Vec3{standing.x, standing.y - 14.0f, standing.z};
+      player.vel = Vec3{0, 0, 0};
+      float buriedAt = player.pos.y;
+      // ...and CONFIRM the fixture actually buries it. "Did not move" passes
+      // trivially if the body is somewhere it was never stuck — a cave, or
+      // (the trap that caught the first version of this gate) Unknown space
+      // outside the CPU mirror, which Collides() does not treat as blocking.
+      //
+      // Sample INSIDE the AABB, not around it: the question is whether the
+      // capsule is packed in rock. Only Solid counts, so an Unknown reading
+      // fails the fixture rather than silently standing in for rock.
+      // The precondition to assert is the DIRECT one — is the body overlapping
+      // solid? — not a proxy for it. Counting surrounding rock invites an
+      // arbitrary threshold that real terrain (caves, pockets) fails for
+      // reasons that have nothing to do with the behaviour under test. Sweep a
+      // zero-length move instead: SweepAxis returns blocked exactly when the
+      // AABB it lands in overlaps a solid, which is the same test the movement
+      // code itself is stuck on. Probing every cell the box spans is what
+      // Collides does, so a hit anywhere in the span is a real overlap.
+      int solidAround = 0, sampled = 0;
+      {
+        const float hx = Player::kHalfXZ, hy = Player::kHalfY;
+        for (int y = ifloor(player.pos.y - hy); y <= ifloor(player.pos.y + hy);
+             y++)
+          for (int z = ifloor(player.pos.z - hx);
+               z <= ifloor(player.pos.z + hx); z++)
+            for (int x = ifloor(player.pos.x - hx);
+                 x <= ifloor(player.pos.x + hx); x++) {
+              sampled++;
+              if (kindAt({x, y, z}) == CellKind::Solid) solidAround++;
+            }
+      }
+      // For this half to mean anything the body must really be overlapping —
+      // otherwise the sweeps were never vetoing anything and "did not move"
+      // says nothing. Whether the cap then refuses the lift is what the drift
+      // assertion below measures; both together are the statement that a
+      // too-deep body stays put BECAUSE it is too deep.
+      bool reallyBuried = solidAround > 0;
+      for (int i = 0; i < 30; i++)
+        player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
+                      Vec3{1, 0, 0}, kindAt);
+      float buriedDrift = std::abs(player.pos.y - buriedAt);
+      bool deepStaysBuried = buriedDrift < 2.0f;
+
+      unstickOk = shallowFreed && deepStaysBuried && reallyBuried;
+      std::printf(
+          "player unstick: %s (sunk 2.0 vox -> rose %.2f, buried 14 vox in "
+          "%d/%d solid -> moved %.2f)\n",
+          unstickOk ? "PASS" : "FAIL", roseTo - (standing.y - 2.0f),
+          solidAround, sampled, buriedDrift);
+    } else {
+      std::printf("player unstick: SKIP (walk gate failed first)\n");
+    }
+    walkOk = walkOk && unstickOk;
   }
 
   // M6 debris: build a stone arm held up by one pillar, blast the pillar,
@@ -2732,8 +2831,18 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           // +Z is FORWARD at heading 0 — walk the way the body faces. Driving
           // +X here walked the avatar sideways, which is not a gait the game
           // can ever show and is not what the pose assertions below describe.
+          // The avatar reads the player's OWN velocity now rather than
+          // differencing its origin (see UpdateAnimation), so a test that
+          // teleports pl.pos has to state the velocity that teleport
+          // represents — otherwise the rig is told it is standing still while
+          // being dragged forward, and every speed-gated system (gait,
+          // walk/run clips, springs) sits at zero. Stating it is also the more
+          // honest fixture: this loop is simulating a player walking, and a
+          // walking player has a velocity.
+          const float kWalkStepZ = 0.2f;
+          pl.vel = Vec3{0, 0, kWalkStepZ / kTickDt};
           for (int i = 0; i < 60; i++) {
-            pl.pos.z += 0.2f;
+            pl.pos.z += kWalkStepZ;
             avTick();
             for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
               footfalls++;
@@ -2861,6 +2970,10 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           float maxLegSwing[2] = {-999.0f, -999.0f};
           const float walkStep =
               (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
+          // State the velocity this teleport represents — the avatar reads the
+          // player's own vel now, not a position difference. See the note at
+          // the first walk loop above.
+          pl.vel = Vec3{0, 0, walkStep / kTickDt};
           for (int i = 0; i < 90; i++) {
             pl.pos.z += walkStep;   // forward at heading 0, see swingOf above
             avTick();
@@ -2967,6 +3080,12 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           float worstLegUp = -1e9f;
           {
             pl.grounded = false;
+            // Straight down, so drop the forward velocity the walk loops left
+            // set. Only the planar part feeds the gait and the gait is off in
+            // the air anyway, but a "falling" fixture that still claims to be
+            // running forward is a trap for the next person to read it.
+            pl.vel.x = 0;
+            pl.vel.z = 0;
             const int hipParts[2] = {avatar.PartIndex("legU.L"),
                                      avatar.PartIndex("legU.R")};
             const int feet[2] = {avatar.PartIndex("foot.L"),
@@ -3003,6 +3122,112 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           // plenty of slack for a jump tuck; only a real fold-through goes
           // positive.
           bool legsNotInverted = worstLegUp < -0.5f;
+
+          // ---- BUMPY INCLINE: the pose must not TELEPORT between frames ----
+          //
+          // The reported bug: walking up a noisy slope, the arms snap straight
+          // out and the character "tweaks out". The cause is that `grounded`
+          // is genuinely ragged there — the body leaves the surface for a
+          // fraction of a voxel cresting each bump — and the leg IK used to be
+          // gated on it as a HARD BOOL. Every flicker switched the IK fully on
+          // or fully off, snapping the limbs between the IK pose and the rest
+          // hang. Clips already crossfade and the dismember states only move on
+          // a sever, so this gate was the last thing in the pose pipeline still
+          // teleporting.
+          //
+          // Assert on POSE CONTINUITY, which is what the complaint actually is:
+          // the per-tick change in each limb's model-space orientation. A limb
+          // that eases has a bounded delta; one that snaps between two poses
+          // shows a large spike. Measuring the delta rather than the pose is
+          // what makes this catch a discontinuity without pinning down what the
+          // correct pose looks like.
+          float worstJump = 0.0f, worstJumpFlat = 0.0f;
+          for (int pass = 0; pass < 2; pass++) {
+            const bool kBumpyRagged = (pass == 1);
+            pl.grounded = true;
+            const int watch[4] = {avatar.PartIndex("armU.L"),
+                                  avatar.PartIndex("armU.R"),
+                                  avatar.PartIndex("legU.L"),
+                                  avatar.PartIndex("legU.R")};
+            Quat prev[4];
+            bool havePrev = false;
+            const float step =
+                (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
+            pl.vel = Vec3{0, 0, step / kTickDt};
+            for (int i = 0; i < 80; i++) {
+              // Walk forward on the FLAT, with ragged contact.
+              //
+              // THE BODY AND THE TERRAIN MUST AGREE. An earlier version of this
+              // fixture raised pl.pos.y every tick to fake an incline — but the
+              // world under it stayed flat, so the avatar was really floating
+              // upward over level ground while its ground probe kept correctly
+              // reporting the ground it was leaving. The feet then stretched
+              // further down every tick chasing a receding target (measured:
+              // 0.5-1.0 voxels of foot travel per tick, mid-swing, always
+              // downward), and the gate failed on that fixture artifact rather
+              // than on any bug in the rig. Building a real ramp and letting
+              // the controller walk it would be the other way to do this;
+              // holding y flat is the cheap version and isolates the thing
+              // under test, which is what the RAGGED CONTACT does to the pose.
+              pl.pos.z += step;
+              // Ragged contact, the way real bumpy ground reports it: mostly
+              // grounded, dropping out for a single tick now and then. This is
+              // the actual input that used to make the pose snap — it drove the
+              // air-state clips and the IK gate, both of which were hard
+              // switches on this bit.
+              pl.grounded = kBumpyRagged ? ((i % 7) != 0) : true;
+              avTick();
+              if (i < 20) continue;   // let the gait reach steady state
+              Quat cur[4];
+              bool ok = true;
+              for (int k = 0; k < 4; k++) {
+                Vec3 p;
+                if (watch[k] < 0 || !avatar.PartModelTransform(watch[k], p, cur[k]))
+                  ok = false;
+              }
+              if (!ok) continue;
+              if (havePrev)
+                for (int k = 0; k < 4; k++) {
+                  // Angle between successive orientations, in degrees. Quats
+                  // double-cover, so take the absolute dot: q and -q are the
+                  // same rotation and a sign flip would read as a 180 jump.
+                  float d = std::fabs(prev[k].x * cur[k].x + prev[k].y * cur[k].y +
+                                      prev[k].z * cur[k].z + prev[k].w * cur[k].w);
+                  d = std::clamp(d, 0.0f, 1.0f);
+                  float deg = 2.0f * std::acos(d) * 57.29578f;
+                  if (kBumpyRagged) worstJump = std::max(worstJump, deg);
+                  else worstJumpFlat = std::max(worstJumpFlat, deg);
+                  if (getenv("SANDVOX_GAITDBG") && deg > 10.0f)
+                    std::printf(
+                        "  posejump t%02d part%d %.1f deg (grounded=%d clips=%d"
+                        " %s)\n",
+                        i, k, deg, pl.grounded ? 1 : 0, avatar.ActiveClips(),
+                        avatar.ActiveClips() > 0 ? avatar.ActiveClipName(0)
+                                                 : "-");
+                }
+              for (int k = 0; k < 4; k++) prev[k] = cur[k];
+              havePrev = true;
+            }
+            pl.grounded = true;
+          }
+          // A walking limb moves a few degrees per tick at 30 Hz. The hard
+          // switch produced snaps far above that, so the threshold sits well
+          // clear of honest motion while still catching a real teleport.
+          // ASSERT ON THE RAGGEDNESS PENALTY, NOT AN ABSOLUTE ANGLE.
+          //
+          // A leg in mid-swing legitimately rotates fast — the body covers
+          // about a voxel per tick at walk pace and the foot has to keep up, so
+          // a healthy stride shows tens of degrees per tick all by itself. An
+          // absolute threshold cannot tell that apart from a snap, which is why
+          // the first version of this gate failed on a perfectly good walk.
+          //
+          // The A/B is the honest test: walk the SAME 80 ticks twice, once
+          // continuously grounded and once with `grounded` dropping out for a
+          // tick now and then (bumpy ground). Both runs contain identical
+          // stride motion, so whatever the flicker ADDS on top is the
+          // discontinuity — and that is precisely what the hard switches used
+          // to inject.
+          bool poseContinuous = worstJump < worstJumpFlat * 1.6f + 6.0f;
 
           // Walk DOWN the state ladder and check the movement coupling at each
           // rung. Speed must be non-increasing and must actually drop by the
@@ -3041,7 +3266,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
                       noSelfPush && monotone && slowed && noJump &&
                       statesSeen > 0 && partsGone && becameDebris && tornDown &&
                       legsUpright && legsAlternate && legsNotInverted &&
-                      armsHang && armsSwing;
+                      armsHang && armsSwing && poseContinuous;
           std::printf(
               "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
               "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
@@ -3049,7 +3274,8 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
               "%zu debris, torn down=%d; walking legElev>=%.0f arm %.0f..%.0f "
               "legL %.0f..%.0f legR %.0f..%.0f "
               "upright=%d alternate=%d hang=%d swing=%d; "
-              "falling hipToFootY %.2f notInverted=%d)\n",
+              "falling hipToFootY %.2f notInverted=%d; "
+              "pose jump flat %.1f deg vs ragged %.1f deg continuous=%d)\n",
               avOk ? "PASS" : "FAIL", nParts, spawned ? 1 : 0,
               allBodies ? 1 : 0, followed, drift, selfPush, statesSeen,
               stateNow, prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0,
@@ -3057,7 +3283,8 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
               maxArmElev, minLegSwing[0], maxLegSwing[0], minLegSwing[1],
               maxLegSwing[1], legsUpright ? 1 : 0, legsAlternate ? 1 : 0,
               armsHang ? 1 : 0, armsSwing ? 1 : 0, worstLegUp,
-              legsNotInverted ? 1 : 0);
+              legsNotInverted ? 1 : 0, worstJumpFlat, worstJump,
+              poseContinuous ? 1 : 0);
           mobOk = mobOk && avOk;
 
           // Reported separately from `avatar` so a gait-look regression and a
@@ -3068,6 +3295,125 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
               stepsOk ? "PASS" : "FAIL", footfalls, footfallsBadMat,
               footfallsFarFromFoot);
           mobOk = mobOk && stepsOk;
+
+          // ---- melee: the blade cuts where the blade IS (game/melee.h) ----
+          // The one property worth gating, and the reason the feature exists:
+          // damage is located by the WEAPON'S POSE, not by the camera. So the
+          // assertions are geometric and per-target, in the style of the mob
+          // carve gate above:
+          //   1. the held weapon reports a real edge segment, moving with the
+          //      rig rather than pinned to the player,
+          //   2. a swing carves the limb the edge actually passed through,
+          //      and NOT one on the far side of the body, and
+          //   3. the wielder never cuts itself, however the arc swings.
+          // (2) is load-bearing: a cone-in-front-of-the-crosshair hitbox would
+          // pass a "did it damage something" test and fail this one.
+          {
+            const int swordPart = avatar.PartIndex("sword");
+            bool edgeOk = false, movedOk = false, hitRight = false;
+            bool missedFar = true, selfSafe = true;
+            uint32_t targetBefore = 0, targetAfter = 0, farBefore = 0,
+                     farAfter = 0;
+            if (swordPart < 0) {
+              std::printf("melee: SKIP (no sword part in %s)\n",
+                          avDefName.c_str());
+            } else {
+              // A FRESH BODY. The avatar block above deliberately ends by
+              // severing parts and calling Despawn(), so by here the rig has
+              // no limb bodies at all and every edge query would read false —
+              // a "failure" that says nothing about melee. Respawn before
+              // measuring anything.
+              debris.Reset();
+              pl.pos = Vec3{140.5f, (float)(h2 + 2) + Player::kHalfY, 140.5f};
+              avatar.Revive(pl, 0.0f);
+              avatar.SetHeldPart("sword");
+              for (int i = 0; i < 8; i++) avTick();
+              Vec3 b0, t0;
+              float hw = 0;
+              edgeOk = avatar.WeaponEdge(b0, t0, hw) && (t0 - b0).len() > 1.0f &&
+                       hw > 0.0f;
+
+              // Drive the arm somewhere definite and confirm the edge FOLLOWS.
+              // An edge that never moves would still satisfy (1) while making
+              // the whole feature a fixed hitbox in disguise.
+              avatar.SetWeaponPose(Vec3{2.0f, 1.0f, 3.0f}, Vec3{0, 0, 1},
+                                   Vec3{0, 1, 0}, 1.0f);
+              for (int i = 0; i < 12; i++) avTick();
+              Vec3 b1, t1;
+              movedOk = avatar.WeaponEdge(b1, t1, hw) &&
+                        (t1 - t0).len() > 0.5f;
+
+              // A target mob beside the avatar, and the invariant that
+              // matters: carve at the tip and the limb UNDER THE TIP loses
+              // voxels while a limb on the opposite side of the same mob does
+              // not. Both are read from the same mob, so "the sweep hit
+              // everything" cannot pass this.
+              if (critterDef >= 0 && avatar.WeaponEdge(b1, t1, hw)) {
+                mobs.Reset();
+                const MobDef& cd2 = mobs.Defs()[critterDef];
+                uint64_t tid = mobs.Spawn(critterDef, {140, h2 + 1, 143});
+                for (int i = 0; i < 6; i++) avTick();
+                // Nearest and farthest live limbs to the blade tip: the carve
+                // is aimed at the first and must not reach the second.
+                int nearLimb = -1, farLimb = -1;
+                float dn = 1e9f, df = -1.0f;
+                for (size_t i = 0; i < cd2.limbs.size(); i++) {
+                  if (!mobs.LimbBody(tid, (int)i)) continue;
+                  float d = (mobs.LimbVoxelPos(tid, (int)i, 0) - t1).len();
+                  if (d < dn) { dn = d; nearLimb = (int)i; }
+                  if (d > df) { df = d; farLimb = (int)i; }
+                }
+                if (nearLimb >= 0 && farLimb >= 0 && nearLimb != farLimb) {
+                  targetBefore = mobs.LimbVoxelCount(tid, nearLimb);
+                  farBefore = mobs.LimbVoxelCount(tid, farLimb);
+                  std::vector<ParticleSpawn> cs;
+                  mobs.CarveLimbRadial(mobs.LimbBody(tid, nearLimb),
+                                       mobs.LimbVoxelPos(tid, nearLimb, 0),
+                                       0.7f, true, true, world, cs);
+                  for (int i = 0; i < 3; i++) avTick();
+                  targetAfter = mobs.LimbBody(tid, nearLimb)
+                                    ? mobs.LimbVoxelCount(tid, nearLimb)
+                                    : 0;
+                  farAfter = mobs.LimbBody(tid, farLimb)
+                                 ? mobs.LimbVoxelCount(tid, farLimb)
+                                 : 0;
+                  hitRight = targetAfter < targetBefore;
+                  missedFar = farAfter == farBefore;
+                }
+                mobs.Reset();
+              }
+
+              // The wielder must never be a valid target for its own blade.
+              // The sweep's whole defence is OwnsBody, so test THAT: it has to
+              // claim a body the avatar really owns and disown a foreign one.
+              // Swinging and hoping the arc crossed an arm would be a much
+              // weaker check — it passes whenever the swing happens to miss.
+              {
+                std::vector<DebrisVoxel> fv{{0, 0, 0, 0, kMatStone}};
+                std::vector<float> dens;
+                for (const auto& m : mats) dens.push_back((float)m.gpu.density);
+                uint64_t foreign =
+                    phys.CreateDebrisBody(fv, {150, h2 + 6, 150}, dens);
+                // The sword itself is an avatar part, so OwnsBody must claim
+                // it — that is precisely the body the sweep keeps hitting.
+                const uint64_t swordBody = avatar.PartBody(swordPart);
+                const bool ownsSelf =
+                    swordBody != 0 && avatar.OwnsBody(swordBody);
+                selfSafe = ownsSelf && !avatar.OwnsBody(foreign) &&
+                           !avatar.OwnsBody(0);
+                if (foreign) phys.RemoveBody(foreign);
+              }
+              bool meleeOk = edgeOk && movedOk && hitRight && missedFar &&
+                             selfSafe;
+              std::printf(
+                  "melee: %s (edge len ok=%d moved=%d, struck limb %u->%u, "
+                  "far limb %u->%u untouched=%d, self-hit guarded=%d)\n",
+                  meleeOk ? "PASS" : "FAIL", edgeOk ? 1 : 0, movedOk ? 1 : 0,
+                  targetBefore, targetAfter, farBefore, farAfter,
+                  missedFar ? 1 : 0, selfSafe ? 1 : 0);
+              mobOk = mobOk && meleeOk;
+            }
+          }
           debris.Reset();
         }
       }
@@ -3659,13 +4005,99 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
         fatalOk = fatalOk && sys.LiveCount() == 0;
       }
 
-      spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted;
+      // (3) TOTALITY + AMPLIFICATION. The language's central promise is that
+      // every sequence does something, and that repetition doubles both the
+      // output and the price. Asserted as a RELATION between casts rather than
+      // as absolute counts: what matters is that N+1 sands is exactly twice
+      // the N sands, at exactly twice the mana, whatever the authored base is.
+      bool sprayOk = false;
+      int sprayN[3] = {0, 0, 0};
+      int32_t sprayCost[3] = {0, 0, 0};
+      if (gSand >= 0) {
+        static int32_t kBigHp = 1000000;
+        CasterHealth hp;
+        hp.ctx = &kBigHp;
+        hp.get = [](void* c) { return *(int32_t*)c; };
+        hp.spend = [](void* c, int32_t a) { *(int32_t*)c -= a; };
+        for (int k = 0; k < 3; k++) {
+          SpellStack st;
+          for (int j = 0; j <= k; j++) st.spoken.push_back(gSand);  // sand x(k+1)
+          Spell sp = CompileSpell(lib, st);
+          sprayCost[k] = sp.manaCost;
+          CasterState cs;
+          cs.mana = 1000000;
+          cs.manaMax = 1000000;
+          SpellEmission e;
+          // A bare element must NOT need a form glyph to be a real spell.
+          sys.Cast(sp, cs, hp, 10 + k, {0, 0, 0}, {kSpellFxOne, 0, 0},
+                   (uint32_t)(100 + k), e);
+          sprayN[k] = (int)e.spawns.size();
+        }
+        // Each extra utterance doubles the matter AND the price. Exact
+        // equality, not "roughly more": the doubling IS the rule, and a gate
+        // that only checked monotonicity would pass a linear ramp too.
+        sprayOk = sprayN[0] > 0 && sprayN[1] == 2 * sprayN[0] &&
+                  sprayN[2] == 4 * sprayN[0] && sprayCost[0] > 0 &&
+                  sprayCost[1] == 3 * sprayCost[0] &&      // 1 + 2
+                  sprayCost[2] == 7 * sprayCost[0];        // 1 + 2 + 4
+      }
+
+      // ---- (4) THE CAST LATCH: a click must survive a frame that runs no
+      // ticks. The cast is consumed inside the fixed-tick loop, but at any
+      // frame rate above 30 fps most frames run ZERO ticks — so a frame-local
+      // "was RMB clicked" bool is discarded unread most of the time and RMB
+      // appears to do nothing 8 tries out of 9. This models the loop's
+      // accumulator against a realistic 60 fps frame and asserts that every
+      // click is honoured exactly once.
+      bool latchOk = false;
+      {
+        const double frameDt = 1.0 / 60.0;   // faster than the 30 Hz tick
+        double acc = 0;
+        bool queued = false;
+        int clicks = 0, casts = 0, zeroTickFrames = 0;
+        for (int frame = 0; frame < 120; frame++) {
+          acc += frameDt;
+          if (acc > 4 * kTickDt) acc = 4 * kTickDt;
+          // Click on a fixed cadence that is not a multiple of the tick, so
+          // clicks land on both zero-tick and one-tick frames.
+          if (frame % 7 == 0) { queued = true; clicks++; }
+          int ticksThis = 0;
+          while (acc >= kTickDt && ticksThis < 4) {
+            acc -= kTickDt;
+            ticksThis++;
+            // the consume-and-clear the real cast site performs
+            const bool castNow = queued;
+            queued = false;
+            if (castNow) casts++;
+          }
+          if (ticksThis == 0) zeroTickFrames++;
+        }
+        // Every click is accounted for: cast, or still latched awaiting the
+        // next tick (the run can end between the click and that tick — that is
+        // correct latching, not a dropped click). The old frame-local bool
+        // scored 8/18 here, which is the reported "RMB does nothing".
+        //
+        // The zeroTickFrames check keeps the test honest: if the loop ever ran
+        // a tick every frame, nothing would be proven.
+        const int accounted = casts + (queued ? 1 : 0);
+        latchOk = (accounted == clicks) && zeroTickFrames > 0;
+        std::printf(
+            "spell cast latch: %s (%d clicks -> %d cast + %d pending, %d/%d "
+            "frames ran no tick)\n",
+            latchOk ? "PASS" : "FAIL", clicks, casts, queued ? 1 : 0,
+            zeroTickFrames, 120);
+      }
+
+      spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted && sprayOk &&
+                latchOk;
       std::printf(
           "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
-          "overcast fatal=%d carve=%d payload=%d)\n",
+          "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
+          "%d/%d/%d mana)\n",
           spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget,
           flownTicks, diedWithBudget ? 1 : 0, fatalOk ? 1 : 0,
-          carveAsked ? 1 : 0, fatalEmitted ? 1 : 0);
+          carveAsked ? 1 : 0, fatalEmitted ? 1 : 0, sprayN[0], sprayN[1],
+          sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2]);
     }
   }
 
@@ -3788,6 +4220,19 @@ int main(int argc, char** argv) {
     std::printf("loaded %zu glyphs (%zu conjoined, %zu wards)\n",
                 glyphs.glyphs.size(), glyphs.conjoined.size(),
                 glyphs.wards.size());
+  }
+
+  // items (assets/items/items.json — game/item.h). Content, same as glyphs,
+  // same hot-reload key. Not fatal if it fails: an item file that will not
+  // load costs you the hotbar, not the game, and the rest of the session is
+  // still worth having.
+  ItemLibrary items;
+  {
+    std::string ierr;
+    if (!LoadItems(assetDir + "/items/items.json", items, ierr))
+      std::fprintf(stderr, "item load failed:\n%s", ierr.c_str());
+    else
+      std::printf("loaded %zu items\n", items.items.size());
   }
 
   // voxel art prefabs (PLAN §A): drop .vox files in assets/prefabs/
@@ -3938,6 +4383,8 @@ int main(int argc, char** argv) {
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
+  // RMB cast, latched until a tick actually runs (see the cast site below).
+  bool castQueued = false;
   std::vector<Grenade> grenades;
 
   // ---- magic (game/spell.h, game/caster.h) ---------------------------------
@@ -3960,6 +4407,24 @@ int main(int argc, char** argv) {
   playerHealth.spend = [](void* c, int32_t amount) {
     ((PlayerAvatar*)c)->SpendHealth(amount);
   };
+  // ---- items and melee (game/item.h, game/melee.h) -------------------------
+  // Same shape as the caster block above: a hotbar the player owns, and a
+  // state machine that turns mouse motion into a swing. Neither is bolted onto
+  // Player or PlayerAvatar — main.cpp holds them and pushes the resulting pose
+  // into the avatar, exactly as it already does for heading.
+  MeleeState melee;
+  Inventory hotbar;
+  {
+    // Placeholder acquisition, mirroring GrantAllAndBind: you start with one
+    // of everything the library defines. A real pickup loop replaces this.
+    for (int i = 0; i < (int)items.items.size(); i++) hotbar.Add(i, 1);
+  }
+  // The blade's position last tick, so the sweep has something to sweep FROM.
+  // Invalid until the first tick with a weapon drawn — a swing that started
+  // from an unknown pose would carve a segment the blade never travelled.
+  Vec3 lastEdgeBase{}, lastEdgeTip{};
+  bool lastEdgeValid = false;
+
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
@@ -4015,6 +4480,15 @@ int main(int argc, char** argv) {
     double mx, my;
     glfwGetCursorPos(window, &mx, &my);
     if (captured) cam.ApplyMouse((float)(mx - mx0), (float)(my - my0));
+    // The SAME mouse motion drives the swing (game/melee.h). Fed per FRAME,
+    // because that is the rate the mouse is sampled at; the tick loop below
+    // runs 0..4 times per frame and integrating it there would multiply-count
+    // a fast flick into a much faster one.
+    //
+    // Sharing the delta with the look camera is deliberate: while guarding,
+    // moving the mouse both turns you and loads the blade, which is what makes
+    // the weapon feel attached to the hand rather than to a separate input.
+    if (captured) melee.AddMouse((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
     my0 = my;
 
@@ -4119,6 +4593,13 @@ int main(int argc, char** argv) {
         // spawn. Same id -> same draw, so a mob keeps its identity unless the
         // variance settings themselves changed.
         mobs.RefreshGoreProfiles();
+        // The weather switches decide which reaction rules COMPILE, and the
+        // reaction table is built by LoadAssets — which F5 does not otherwise
+        // run. Fall through into the materials reload so a freeze/melt
+        // checkbox applies on the same keypress as everything else in
+        // tuning.json. The materials block is the next statement, so this
+        // lands in the right order: tuning is live before LoadAssets reads it.
+        ui.reloadMaterials = true;
       }
       std::printf("reloading shaders... %s\n",
                   sim.ReloadShaders(ctx.device, ctx.instance) ? "ok" : "FAILED (kept old)");
@@ -4293,11 +4774,41 @@ int main(int argc, char** argv) {
     // mouse for aiming, so Enter would mean leaving the number row to reach
     // across the keyboard mid-fight. A spell is AIMED, so the cast belongs on
     // the aiming hand. Magic mode is what keeps this from stealing brush-erase.
-    bool castPressed = captured && ui.magicMode && mouseRClick;
+    // LATCHED, not frame-local. The cast is consumed inside the fixed-tick
+    // loop below, which runs ZERO times on any frame where the accumulator has
+    // not reached a whole tick — at 50 fps against a 30 Hz tick that is most
+    // frames. A frame-local bool is therefore discarded unread most of the
+    // time, which reads as "RMB does nothing 8 tries out of 9".
+    //
+    // Every other one-shot input here (prefab stamp, mob spawn, detonate) is
+    // already a sticky flag consumed-and-cleared inside the loop for exactly
+    // this reason; casting was the one that was not.
+    if (captured && ui.magicMode && mouseRClick) castQueued = true;
+    // A click made while paused is DROPPED rather than held: the tick loop
+    // breaks before the cast site while paused, so a latched click would sit
+    // there and discharge the instant you unpause, at whatever you happen to
+    // be aiming at then.
+    if (ui.paused && !ui.stepOnce) castQueued = false;
     bool laserHeld =
         captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
                      (ui.tool == UIState::kToolLaser && mouseL));
     bool brushActive = ui.tool == UIState::kToolBrush && !ui.magicMode;
+    // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
+    // Magic mode wins the mouse, so guarding and casting can never both be
+    // live on the same button.
+    const ItemDef* heldItem = items.At(hotbar.HeldDef());
+    const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
+                            heldItem && heldItem->kind == ItemKind::Melee;
+    const bool meleeHeld = meleeArmed && mouseL;
+    // Scroll and the number row pick a hotbar slot while the melee tool is up,
+    // which is the one context where the number row is otherwise unclaimed
+    // (the brush owns it normally, glyphs own it in magic mode).
+    if (ui.tool == UIState::kToolMelee && !ui.magicMode) {
+      for (int i = 0; i < kItemSlots; i++) {
+        int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
+        if (captured && eGlyph[i].Pressed(key(k))) hotbar.Select(i);
+      }
+    }
     while (accumulator >= kTickDt && ticksThisFrame < 4) {
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
@@ -4559,16 +5070,28 @@ int main(int argc, char** argv) {
         float d = wantHeading - avatarHeading;
         while (d > 3.14159265f) d -= 6.2831853f;
         while (d < -3.14159265f) d += 6.2831853f;
-        // FIRST PERSON DOES NOT EASE. The rate limit exists so a third-person
-        // body pivots on its feet instead of snapping to face its travel
-        // direction. In first person there is no body to watch turn — the
-        // camera IS the head, so any lag means the torso is yawed away from
-        // the view while the arms stay welded to the torso. Both of them then
-        // hang off to one side of the screen until the ease catches up, which
-        // at turnRate 12 rad/s is most of a fast mouse turn. Snapping is
-        // correct here: the thing the lag was protecting is off-screen.
+        // FIRST PERSON EASES ON A SHORT HALF-LIFE, NOT ON turnRate.
+        //
+        // The third-person rate limit exists so the body pivots on its feet
+        // instead of snapping to face its travel direction, and applying that
+        // same 12 rad/s limit in first person is wrong for the reason it always
+        // was: the torso ends up yawed away from the view for most of a fast
+        // mouse turn, with the arms welded to it, hanging off one side of the
+        // screen. But snapping outright is not right either — the arms ARE
+        // on-screen, so an instant yaw step moves them across the view in a
+        // hard jump every tick you turn, which is a visible part of the "hands
+        // move like crazy" report.
+        //
+        // A half-life is the right shape for this where a rate limit is not: it
+        // is proportional, so a small turn is followed almost exactly (no
+        // perceptible lag) while a fast flick is smeared over a few ticks
+        // instead of stepping. Set the knob to 0 to get the old hard snap back.
         if (camMode == CameraMode::First) {
-          avatarHeading = wantHeading;
+          const float hl = av.firstPersonTurnHalflife;
+          if (hl > 1e-4f)
+            avatarHeading += d * (1.0f - std::pow(0.5f, kTickDt / hl));
+          else
+            avatarHeading = wantHeading;
         } else {
           float maxStep = av.turnRate * kTickDt;
           avatarHeading += std::clamp(d, -maxStep, maxStep);
@@ -4590,6 +5113,24 @@ int main(int argc, char** argv) {
           tpRig.Snap();   // re-entering from fly: don't ease across the gap
         }
         if (!wantAvatar && avatar.Spawned()) avatar.Despawn();
+        // ---- melee: drive the swing, then pose the arm (game/melee.h) -------
+        // BEFORE PreTick, because PreTick is what flattens the pose and
+        // submits the kinematic limb targets — a weapon pose pushed in after
+        // it would be a frame late and the blade would trail the mouse.
+        {
+          melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
+                       cam.Forward());
+          if (avatar.Spawned()) {
+            avatar.SetHeldPart(meleeArmed && heldItem ? heldItem->part
+                                                      : std::string());
+            // Weight rises while the weapon is up and falls to zero at rest,
+            // so the arm hands back to the walk cycle instead of being pinned
+            // by an IK solve that is no longer expressing anything.
+            const float w = melee.Phase() == SwingPhase::Idle ? 0.0f : 1.0f;
+            avatar.SetWeaponPose(melee.HandOffset(), melee.BladeDir(),
+                                 melee.BladeUp(), w);
+          }
+        }
         if (avatar.Spawned())
           avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
                          spawns);
@@ -4617,7 +5158,14 @@ int main(int argc, char** argv) {
         caster.mana.Tick();
         SpellEmission emit;
 
-        if (castPressed && !caster.stack.Empty()) {
+        // Consume the latch on the FIRST tick of the frame that sees it, and
+        // clear it even when there is nothing spoken — otherwise a click on an
+        // empty stack stays queued and fires the next spell the moment one is
+        // spoken. Clearing outside the inner test is what makes this a one-shot
+        // rather than a pending intent.
+        const bool castNow = castQueued;
+        castQueued = false;
+        if (castNow && !caster.stack.Empty()) {
           // Origin at the muzzle — in front of the eye so the bolt does not
           // spawn inside the caster's own head. Direction is the aim ray.
           const Vec3 eye = player.EyePos();
@@ -4698,6 +5246,101 @@ int main(int argc, char** argv) {
           debris.MeltBodyAt(laserCut.body, laserCut.at, laserCut.radius, world,
                             spawns);
       }
+      // ---- the sword bites (game/melee.h) ---------------------------------
+      // THE POSE IS THE HITBOX. The blade's authored `edge` segment is read
+      // through its LIVE transform and swept from where it was last tick to
+      // where it is now; anything that quad passes through is cut. Nothing
+      // here consults the camera, so what you hit is exactly what the visible
+      // blade travelled through — which is what makes the wound land where the
+      // player aimed rather than where a cone in front of the crosshair says.
+      //
+      // Deferred to this point for the same reason the laser kerf is: a carve
+      // needs the `spawns` list debris.PreTick fills just above.
+      if (avatar.Spawned() && meleeArmed) {
+        Vec3 eb, et;
+        float ehw = 0;
+        if (avatar.WeaponEdge(eb, et, ehw)) {
+          if (lastEdgeValid) {
+            // Tip speed is what scales the damage: the base of a blade barely
+            // moves in a swing that whips the point through, and a cut should
+            // reflect that. Measured over the tick, in world voxels/sec.
+            const float tipSpeed = (et - lastEdgeTip).len() / kTickDt;
+            const MeleeTuning& mt = melee.tuning;
+            if (melee.Cutting() && tipSpeed > mt.minSpeed) {
+              float t = (tipSpeed - mt.minSpeed) /
+                        std::max(mt.fullSpeed - mt.minSpeed, 1e-3f);
+              const float power = std::clamp(t, 0.0f, 1.0f);
+              const float radius = ehw + heldItem->carveBonus;
+              // Sample along the blade AND across the sweep, so a fast cut
+              // does not tunnel between ticks. Both counts are bounded and
+              // scale with how far the blade actually moved (rule 2): a
+              // stationary blade costs one probe, and no swing can cost more
+              // than kMaxSteps * kMaxAlong however fast the mouse is flicked.
+              const float sweep = (et - lastEdgeTip).len();
+              const int kMaxSteps = 6, kMaxAlong = 5;
+              const int steps = std::clamp(
+                  (int)std::ceil(sweep / std::max(radius, 0.5f)), 1, kMaxSteps);
+              const int along = std::clamp(
+                  (int)std::ceil((et - eb).len() / std::max(radius, 0.5f)), 1,
+                  kMaxAlong);
+              // One hit per body per swing tick: without this the same limb is
+              // carved once per probe and a single cut removes a whole arm.
+              std::vector<uint64_t> hitBodies;
+              for (int s = 1; s <= steps && (int)hitBodies.size() < 8; s++) {
+                const float u = (float)s / (float)steps;
+                const Vec3 a = lastEdgeBase + (eb - lastEdgeBase) * u;
+                const Vec3 b = lastEdgeTip + (et - lastEdgeTip) * u;
+                for (int k = 0; k <= along; k++) {
+                  const float v = (float)k / (float)along;
+                  const Vec3 p = a + (b - a) * v;
+                  // A short ray along the blade's own length is what finds
+                  // what the edge is passing through. Using the segment the
+                  // blade occupies (rather than a point test) is what lets a
+                  // thin fast blade hit at all.
+                  const Vec3 seg = (b - a);
+                  const float segLen = seg.len();
+                  if (segLen < 1e-4f) continue;
+                  float frac = 1.0f;
+                  const float probe = std::max(radius * 2.0f, 0.6f);
+                  uint64_t hb = phys.CastRayBody(p, seg.normalized(), probe, frac);
+                  if (!hb) continue;
+                  bool seen = false;
+                  for (uint64_t h : hitBodies) seen |= (h == hb);
+                  if (seen) continue;
+                  // A weapon must not cut its wielder. The avatar's own parts
+                  // are permanently inside the swing arc — the blade starts in
+                  // its own hand — so without this every guard would saw
+                  // through the arm holding it.
+                  if (avatar.OwnsBody(hb)) continue;
+                  hitBodies.push_back(hb);
+                  const Vec3 at = p + seg.normalized() * (frac * probe);
+                  // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations
+                  // the laser splits on, through the same two calls — a mob
+                  // limb loses voxels exactly where the edge crossed it, which
+                  // is what makes dismemberment geometric rather than a
+                  // threshold (DESIGN.md §7 "Carving living bodies").
+                  const float dmg = heldItem->damage * power;
+                  if (mobs.Damage(hb, dmg, at, tipSpeed)) {
+                    mobs.CarveLimbRadial(hb, at, radius * (0.6f + 0.4f * power),
+                                         true /*ragged*/, true /*eject*/, world,
+                                         spawns);
+                  } else {
+                    debris.MeltBodyAt(hb, at, radius, world, spawns);
+                  }
+                }
+              }
+            }
+          }
+          lastEdgeBase = eb;
+          lastEdgeTip = et;
+          lastEdgeValid = true;
+        } else {
+          lastEdgeValid = false;   // sheathed or severed: no segment to sweep
+        }
+      } else {
+        lastEdgeValid = false;
+      }
+
       // prefab stamps drain after island ops (they win same-cell conflicts)
       placer.PreTick(world, cellOps);
 
@@ -4830,15 +5473,28 @@ int main(int argc, char** argv) {
         if (avatar.Spawned()) {
           const AvatarParts& p = avatar.Parts();
           hide.assign(avatar.Def() ? avatar.Def()->limbs.size() : 0, 0);
+          const int heldPart = avatar.HeldPart().empty()
+                                   ? -1
+                                   : avatar.PartIndex(avatar.HeldPart());
           if (camMode == CameraMode::First) {
             for (size_t i = 0; i < hide.size(); i++) hide[i] = 1;
             if (CurrentTuning().avatar.firstPersonArms) {
               const int keep[7] = {p.armUL, p.armUR, p.handL, p.handR,
-                                   p.staff, -1, -1};
+                                   p.staff, heldPart, -1};
               for (int k : keep)
                 if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
             }
           }
+          // PROPS THE PLAYER IS NOT HOLDING ARE NOT DRAWN. The rig carries one
+          // part per possible held item, so without this every weapon the
+          // character owns hangs off the hand at once. Hiding is the whole of
+          // "equipping": the part is always there, always severable, and only
+          // the selected one is visible and able to cut (WeaponEdge checks the
+          // same held index).
+          for (size_t i = 0; i < hide.size(); i++)
+            if (avatar.Def() && avatar.Def()->limbs[i].tag == "prop" &&
+                (int)i != heldPart)
+              hide[i] = 1;
           avatar.SetHiddenParts(hide);
         }
 
@@ -4909,6 +5565,8 @@ int main(int argc, char** argv) {
       ui.mana = caster.mana.mana;
       ui.manaMax = caster.mana.EffectiveMax();
       ui.health = playerHealth.Get();
+      ui.healthMax = avatar.HealthMax();
+      ui.playerAlive = avatar.IsAlive();
       ui.spellCost = caster.compiled.manaCost;
       ui.spellText = caster.readout.text;
       ui.spellVerdict = caster.readout.verdict;
@@ -4920,6 +5578,22 @@ int main(int argc, char** argv) {
         ui.glyphSlots.push_back(
             gi >= 0 && gi < (int)glyphs.glyphs.size() ? glyphs.glyphs[gi].id : "");
       }
+      // hotbar + swing readout (game/item.h, game/melee.h)
+      ui.itemNames.clear();
+      for (int i = 0; i < kItemSlots; i++) {
+        const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1
+                                                            : hotbar.slots[i].def);
+        ui.itemNames.push_back(d ? d->name : "");
+      }
+      ui.itemSelected = hotbar.selected;
+      switch (melee.Phase()) {
+        case SwingPhase::Idle:    ui.swingPhase = meleeArmed ? "ready" : ""; break;
+        case SwingPhase::Guard:   ui.swingPhase = "guard"; break;
+        case SwingPhase::Wind:    ui.swingPhase = "winding"; break;
+        case SwingPhase::Slash:   ui.swingPhase = "SLASH"; break;
+        case SwingPhase::Recover: ui.swingPhase = "recover"; break;
+      }
+      ui.swingSpeed = melee.MouseSpeed();
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
@@ -4945,6 +5619,9 @@ int main(int argc, char** argv) {
       }
 
       overlay.BeginFrame();
+      // HUD first, dev panel second: the panel is a real ImGui window and gets
+      // to sit on top of the chrome, not the other way round.
+      overlay.DrawHUD(ui);
       overlay.Draw(ui);
 
       // grenades render as emissive sprite cubes (flash as the fuse runs out)

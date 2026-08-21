@@ -26,3 +26,8 @@ dist/
 
 # tuner Notes tab — local engineering notes, not part of the engine
 notes/
+
+# live coordination log between parallel Claude sessions (scripts/board.sh).
+# Deliberately untracked: it is session state, and tracking the very file meant
+# to prevent collisions would make it a merge-conflict site itself.
+AGENTS_BOARD.md

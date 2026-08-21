@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #include "sim/tuning.h"
 
@@ -141,6 +143,61 @@ void PlayerAvatar::ResolveParts() {
   parts_.legUL = sk.FindPart("legU.L");
   parts_.legUR = sk.FindPart("legU.R");
   parts_.staff = sk.FindPart("staff");
+  // Re-resolve the held prop against the new def: a hot reload replaces the
+  // skeleton, so a cached part index from the old one would point at whatever
+  // limb happens to sit there now.
+  heldPartIndex_ = heldPart_.empty() ? -1 : sk.FindPart(heldPart_);
+}
+
+void PlayerAvatar::SetHeldPart(const std::string& partName) {
+  if (heldPart_ == partName) return;
+  heldPart_ = partName;
+  heldPartIndex_ = def_ ? def_->skel.FindPart(partName) : -1;
+  instancesDirty_ = true;
+}
+
+void PlayerAvatar::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
+                                 float weight) {
+  weaponHand_ = handOffset;
+  // bladeDir/bladeUp are accepted but NOT applied to the held part: the blade
+  // keeps its grip angle and only the ARM is driven (see the weapon-arm block
+  // in UpdateAnimation). They are kept in the signature because the caller
+  // computes them anyway for the HUD, and because a weapon that genuinely does
+  // re-aim in the hand — a levelled spear, a raised shield — would want them.
+  if (bladeDir.len() > 1e-4f) weaponDir_ = bladeDir.normalized();
+  if (bladeUp.len() > 1e-4f) weaponUp_ = bladeUp.normalized();
+  weaponWeight_ = weight < 0 ? 0 : (weight > 1 ? 1 : weight);
+}
+
+uint64_t PlayerAvatar::PartBody(int part) const {
+  return (part >= 0 && part < (int)parts.size()) ? parts[part].body : 0;
+}
+
+bool PlayerAvatar::OwnsBody(uint64_t bodyHandle) const {
+  if (!bodyHandle) return false;
+  for (const Part& p : parts)
+    if (p.body == bodyHandle) return true;
+  return false;
+}
+
+bool PlayerAvatar::WeaponEdge(Vec3& outBase, Vec3& outTip,
+                              float& outHalfWidth) const {
+  if (!def_ || heldPartIndex_ < 0) return false;
+  if (heldPartIndex_ >= (int)def_->limbs.size()) return false;
+  const MobLimbDef& ld = def_->limbs[heldPartIndex_];
+  if (!ld.hasEdge) return false;
+  if (!PartAlive(heldPartIndex_)) return false;   // severed: nothing to cut with
+  const Part& p = parts[heldPartIndex_];
+  if (!p.body) return false;
+  // The part's body transform sits at the model's MIN CORNER (restOffset in
+  // Spawn), and the authored edge is measured from that same corner — so the
+  // composition is direct, with no anchor rebasing. Reading the LIVE transform
+  // is the point: the hitbox is wherever the renderer just drew the blade.
+  Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
+  outBase = p.xf.pos + QuatRotate(q, ld.edgeFrom);
+  outTip = p.xf.pos + QuatRotate(q, ld.edgeTo);
+  outHalfWidth = ld.edgeHalfWidth;
+  return true;
 }
 
 int PlayerAvatar::PartIndex(const std::string& name) const {
@@ -515,8 +572,28 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
         dur = std::min(dur, budget);
       }
       dur = std::max(dur, kMinSwingSeconds);
+      // THE ARC MUST LAND ON THE GROUND, NOT ABOVE IT.
+      //
+      // The swing height is a parabola, sin(t*pi)*stepHeight*legLength, which
+      // is only zero exactly at t = 1. The step used to end on the first tick
+      // where swingT >= 1, and then assign `planted = swingTo` — but the
+      // PREVIOUS tick rendered the foot at, say, t = 0.97, still a third of a
+      // voxel up in the air. So touchdown dropped the foot that whole distance
+      // in a single frame, every step. Through the two-bone IK that is a large
+      // instantaneous change in knee and hip angle: measured at 45-48 degrees
+      // of leg rotation in one tick on a walk. On flat ground it is a subtle
+      // hitch; on rising ground the probe returns a new height each tick, the
+      // arc lands higher than it lifted, and the snap grows — which is why it
+      // reads as the legs tweaking out going uphill specifically.
+      //
+      // Clamping t to exactly 1 for the final sample makes the arc evaluate at
+      // sin(pi) = 0, so the foot is already ON the target when the step ends
+      // and the handover is continuous by construction.
       f.swingT += dt / dur;
       if (f.swingT >= 1.0f) {
+        // Land ON the target: at t = 1 the arc's lift term is sin(pi) = 0, so
+        // assigning swingTo here is now continuous with the previous sample
+        // rather than a drop from wherever the arc happened to be.
         f.swingT = 0;
         f.swinging = false;
         f.planted = f.swingTo;
@@ -541,10 +618,23 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
         // is. Weighted by t so the early swing keeps its committed direction
         // (no jitter at lift-off) and the late swing homes in on the truth.
         f.swingTo = f.swingTo * (1.0f - f.swingT) + goal * f.swingT;
-        // parabolic arc between lift-off and touch-down
+        // Parabolic arc between lift-off and touch-down.
+        //
+        // The lift is EASED OUT over the last part of the swing rather than
+        // being left to the parabola alone. sin(t*pi) is only zero at exactly
+        // t = 1, and the swing almost never samples exactly 1 — it crosses it
+        // mid-tick — so the last airborne sample sits a fraction of a voxel up
+        // and touchdown drops the foot that distance in one frame. Through the
+        // two-bone IK that measured as a 45+ degree leg snap per step. Scaling
+        // the lift down to nothing over the final quarter of the swing makes
+        // the foot arrive already flat on the target whatever t lands on.
         float t = f.swingT;
         Vec3 flat = f.swingFrom * (1.0f - t) + f.swingTo * t;
-        flat.y += std::sin(t * 3.14159265f) * g.stepHeight * f.legLength;
+        float lift = std::sin(t * 3.14159265f) * g.stepHeight * f.legLength;
+        const float kLandEase = 0.75f;   // lift is fully shed by t = 1
+        if (t > kLandEase)
+          lift *= std::max(0.0f, (1.0f - t) / (1.0f - kLandEase));
+        flat.y += lift;
         f.planted = flat;
       }
     } else {
@@ -656,17 +746,46 @@ void PlayerAvatar::UpdateAirPose(float dt) {
   if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
 }
 
-void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded) {
+void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
+                                   const Vec3& playerVel) {
   const AnimSkeleton& sk = def_->skel;
   AnimState& st = anim_;
   if (sk.parts.empty()) return;
   st.partAlive.resize(sk.parts.size(), 1);
   st.springs.resize(sk.parts.size(), SpringState{});
 
-  Vec3 delta = origin_ - st.lastPos;
-  st.lastPos = origin_;
-  Vec3 planar{delta.x / std::max(dt, 1e-4f), 0, delta.z / std::max(dt, 1e-4f)};
-  st.velocity = st.velocity * 0.7f + planar * 0.3f;
+  // THE VELOCITY COMES FROM THE PLAYER, NOT FROM DIFFERENCING OUR OWN ORIGIN.
+  //
+  // This is the jitter. A mob differences its position because it moves itself,
+  // one step per tick, so the delta is always exactly one tick of travel. The
+  // avatar does not: Player::Update runs once per FRAME at real dt, while this
+  // runs 0..4 times per frame inside the fixed-tick loop. So the delta over
+  // `kTickDt` is measuring the wrong interval every single frame —
+  //
+  //   * two ticks in one frame: the first sees the whole frame's travel (too
+  //     fast), the SECOND sees zero, because the player has not moved since.
+  //   * zero ticks: the measurement is simply stale.
+  //   * one tick: too fast or too slow depending on how dt compares to kTickDt.
+  //
+  // The result is a speed that slams between roughly double the truth and zero
+  // at frame rate. And `speedNow_` is not some minor readout — it drives the
+  // gait cadence, the bob/sway/roll amplitudes, the walk/run clip selection, the
+  // spring goals and the swing-duration budget. Every one of those oscillates
+  // together, which is exactly the "character spazzes, hands move like crazy"
+  // report. It is not a tuning problem and no amount of extra filtering downstream
+  // would have fixed it, because the signal itself was garbage.
+  //
+  // The player already knows its velocity exactly. Use it.
+  st.lastPos = origin_;  // still tracked: other code reads it as "where we were"
+  Vec3 planar{playerVel.x, 0, playerVel.z};
+  // Frame-rate independent smoothing, on a half-life rather than a bare
+  // per-call lerp. The old `0.7/0.3` blend was per CALL, so its time constant
+  // scaled with how many ticks happened to fire — the same class of bug as the
+  // measurement above, and it would have made the gait feel different at 30 and
+  // 144 fps even with a clean velocity.
+  const float hl = CurrentTuning().avatar.velocityHalflife;
+  float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
+  st.velocity = st.velocity + (planar - st.velocity) * k;
   speedNow_ = Vec3{st.velocity.x, 0, st.velocity.z}.len();
   float speedFactor =
       std::clamp(speedNow_ / std::max(def_->speed, 0.01f), 0.0f, 1.5f);
@@ -752,6 +871,38 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded) {
   // `grounded` is part of the gate, not just an input to it: a gait with no
   // floor under it has no meaningful foot target (see UpdateAirPose).
   const bool gaitActive = g.present && !clipOwnsPose && grounded;
+
+  // THE IK FADES IN AND OUT; IT DOES NOT SWITCH.
+  //
+  // This is the uphill tweaking. `grounded` is genuinely ragged when you cross
+  // a bumpy incline — the body really does leave the surface for a fraction of
+  // a voxel as it crests each bump, which is why the player controller has
+  // hysteresis and coyote time for exactly this. The gait inherits that
+  // raggedness, and until now it turned it into a HARD switch: IK fully on one
+  // tick, fully off the next, with the limbs snapping between the IK-solved
+  // pose and the rest hang that UpdateAirPose leaves behind. That snap-to-rest
+  // is the "arms shoot up straight" frame, and on a bumpy ascent it fires over
+  // and over.
+  //
+  // Clips already crossfade (ClipFade/blendInMs) and the dismemberment states
+  // only change on a sever, so neither of those could be the discontinuity —
+  // this gate was the only thing in the pose pipeline still teleporting.
+  //
+  // AnimSolveTwoBone already takes a WEIGHT and blends its result against the
+  // incoming pose, so the fix is to drive that weight continuously rather than
+  // to gate the block on a bool. Note this is NOT the thing the comment below
+  // warns about: that warns against blending two IK RESULTS together (a pose
+  // satisfying neither foot), whereas this fades a single solve against the
+  // flattened animation pose, which is what the weight parameter is for.
+  {
+    const float hl = CurrentTuning().avatar.ikBlendHalflife;
+    float want = gaitActive ? 1.0f : 0.0f;
+    float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
+    gaitWeight_ += (want - gaitWeight_) * k;
+    if (gaitWeight_ < 1e-3f) gaitWeight_ = 0.0f;
+    if (gaitWeight_ > 0.999f) gaitWeight_ = 1.0f;
+  }
+
   if (!grounded && !clipOwnsPose) {
     UpdateAirPose(dt);
   } else if (gaitActive) {
@@ -766,7 +917,16 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded) {
 
   // IK is a POST-PROCESS on the flattened pose, never a blended layer:
   // blending two IK results gives a pose that satisfies neither end-effector.
-  if (!sk.chains.empty() && gaitActive) {
+  // (Fading ONE solve's weight against the animation pose, which is what
+  // gaitWeight_ does, is a different thing — see the note above.)
+  //
+  // Runs whenever the weight is non-zero, not only while gaitActive: that is
+  // the whole point of the fade, since the ticks that need blending are exactly
+  // the ones just after the gait switched off. `f.planted` is still the last
+  // real foot target during those ticks — UpdateAirPose parks the SWING but
+  // deliberately leaves `planted` alone — so the legs ease out of their last
+  // stance instead of snapping to the rest hang.
+  if (!sk.chains.empty() && gaitWeight_ > 0.0f) {
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
     Vec3 rootAnchor = sk.parts[def_->rootLimb].anchorLocal;
     Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
@@ -774,12 +934,72 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded) {
     for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
       if (sk.chains[c].tag != "leg") continue;
       const FootState& f = st.feet[c];
-      float weight = f.valid ? sk.chains[c].weight : 0.0f;
+      float weight = f.valid ? sk.chains[c].weight * gaitWeight_ : 0.0f;
       if (weight <= 0) continue;
       Vec3 rel = f.planted - bodyOrigin - pivot;
+      // A STALE PLANT MUST NOT BE REACHED FOR. `planted` is a WORLD point, and
+      // in a real fall the body drops away from it until it sits above the hip
+      // — at which point the solver aims the legs UP and folds them through the
+      // pelvis (the leg-inversion failure UpdateAirPose exists to prevent).
+      // The fade is short enough that a fall leaves the weight at zero within a
+      // few ticks, but "short enough" is a timing argument and this is a
+      // geometry problem, so state it as geometry: once the target is further
+      // than the leg can reach, there is nothing sensible to solve for and the
+      // remaining fade is dropped rather than pointed at a ghost.
+      if (rel.len() > f.legLength * 1.6f) continue;
       Vec3 prefabPt = RotateInv(yaw, rel) + pivot;
       AnimSolveTwoBone(sk, st, sk.chains[c], prefabPt - rootAnchor, weight);
     }
+  }
+
+  // ---- weapon arm (game/melee.h) -------------------------------------------
+  // The swing is driven by aiming the WEAPON ARM's IK chain at a point derived
+  // from the mouse. Doing it through the existing chain rather than as a
+  // bespoke clip is what makes it compose with everything else: the legs keep
+  // walking, the gait keeps running, dismemberment still disables the chain (a
+  // severed arm simply stops solving and the sword falls), and a mob could
+  // swing the same way through the same call.
+  //
+  // THE BLADE IS NOT AIMED — THE ARM IS. The sword keeps the orientation its
+  // rig gives it, fixed relative to the hand, so it stays orthogonal to the
+  // forearm through the whole swing exactly as a gripped weapon does. Clicking
+  // buys you CONTROL OF THE ARM, not a blade that re-points itself.
+  //
+  // An earlier version rotated the held part toward the cut direction every
+  // tick. That was wrong twice over: the sword swivelled in the fist (pointing
+  // "directly out" mid-swing instead of holding its grip angle), and because
+  // the override wrote model[] after the flatten, it fought the pose pipeline
+  // and dragged the walk off its authored stride — which read as a leg bug,
+  // not a weapon one.
+  //
+  // POST-PROCESS, LIKE THE LEGS. Same rule as the note above: IK is applied to
+  // the flattened pose, never blended as a layer. `weaponWeight_` fades the
+  // solve itself, which AnimSolveTwoBone already supports.
+  if (weaponWeight_ > 0.0f && heldPartIndex_ >= 0 && !sk.chains.empty()) {
+    Quat yaw = AxisAngle({0, 1, 0}, heading_);
+    Vec3 rootAnchor = sk.parts[def_->rootLimb].anchorLocal;
+    // The weapon arm is the one whose hand is this prop's ancestor. Deriving it
+    // from the rig rather than hardcoding "arm.R" means a left-handed rig, or
+    // a second weapon, needs no change here.
+    int handPart = sk.parts[heldPartIndex_].parent;
+    for (size_t c = 0; c < sk.chains.size(); c++) {
+      const IkChain& ch = sk.chains[c];
+      if (ch.tag != "arm" || ch.effector != handPart) continue;
+      float weight = ch.weight * weaponWeight_;
+      if (weight <= 0) continue;
+      // The shoulder in model space is the chain root's anchor; the target is
+      // the mouse-driven offset from it. The offset arrives in WORLD space
+      // (main.cpp built it from the camera basis), so it is un-yawed into the
+      // rig's frame here — the same conversion the legs do one block up.
+      Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
+      Vec3 targetLocal = shoulder + RotateInv(yaw, weaponHand_);
+      AnimSolveTwoBone(sk, st, ch, targetLocal - rootAnchor, weight);
+      break;
+    }
+    // NOTHING ROTATES THE BLADE HERE, deliberately — see the note above. The
+    // sword is a child of the hand and AnimFlatten has already composed it
+    // against whatever the arm solve produced, so it rides the fist with its
+    // authored grip angle intact.
   }
 }
 
@@ -828,13 +1048,39 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
                    player.pos.z - def.worldSize.z * 0.5f};
     heading_ = heading;
 
-    UpdateAnimation(dt, world, player.grounded);
+    UpdateAnimation(dt, world, player.grounded, player.vel);
 
     // ---- air state clips ----
     // Grounded transitions drive jump/land; sustained air drives fall. Kept
     // here rather than in main.cpp so every consumer of the avatar gets the
     // same behaviour without restating the thresholds.
-    if (player.grounded) {
+    // AIR STATE IS DEBOUNCED, because `grounded` is not a clean signal.
+    //
+    // THIS is the "arms shoot up straight walking uphill" bug. Crossing bumpy
+    // ground, the body genuinely leaves the surface for a fraction of a voxel
+    // cresting each bump, so `grounded` drops false for a tick at a time — the
+    // player controller has hysteresis and coyote time precisely because of it.
+    // The clip logic had none: every one of those flickers ran the `wasGrounded_
+    // -> airborne` edge and fired PlayClip("jump"), a one-shot that throws the
+    // arms up. Ascending a noisy incline retriggers it over and over, which is
+    // exactly the reported tweaking — and it also explains why the arms were
+    // the loudest part of it, since the jump clip is an ARM pose while the legs
+    // are mostly IK.
+    //
+    // So the transition runs on SUSTAINED air, not on the raw bit: you must be
+    // off the ground for airDebounce seconds before the body believes it is
+    // airborne. A real jump clears that in one tick of upward travel; a bump
+    // crest never does. Note this deliberately does not touch `grounded` itself
+    // — the gait still wants the instantaneous value, and the footfall/landing
+    // logic below keys off this debounced view instead.
+    const float debounce = CurrentTuning().avatar.airDebounce;
+    if (player.grounded) airOffTime_ = 0.0f;
+    else airOffTime_ += dt;
+    const bool airborneNow = airOffTime_ > debounce;
+
+    // `wasGrounded_` now tracks the DEBOUNCED state, so these edges fire once
+    // per real takeoff/landing rather than once per bump.
+    if (!airborneNow) {
       if (!wasGrounded_ && airTime_ > 0.25f) {
         PlayClip("land");
         // A landing is its own sound, not a footstep: both feet arrive at once
@@ -863,13 +1109,20 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // sweep has already cancelled the velocity.
       lastFallSpeed_ = player.vel.y < 0 ? -player.vel.y : 0.0f;
     }
-    wasGrounded_ = player.grounded;
+    // The DEBOUNCED state, not the raw bit: storing the raw one would put the
+    // edge detection straight back on the flickering signal this block exists
+    // to filter, and the jump clip would retrigger on every bump again.
+    wasGrounded_ = !airborneNow;
 
     // ---- locomotion clips ----
     // Additive arm swing over the IK legs; `run` replaces `walk` past half of
     // the def's top speed. Both are retriggered every tick, which PlayClip
     // turns into a no-op once the instance exists.
-    const bool moving = speedNow_ > 0.4f && player.grounded;
+    // Debounced, not the raw bit: gating the locomotion clips on the flickering
+    // `grounded` made walk/run drop out for a tick on every bump crest, and a
+    // clip that stops and restarts never gets past a fraction of its blend-in
+    // weight (the same mechanism as the walk/run hysteresis note below).
+    const bool moving = speedNow_ > 0.4f && !airborneNow;
     // `def.speed` is the SPRINT reference, so a plain walk (35 of 60 voxels/s)
     // already sits at 0.58 of it — right on top of a 0.55 threshold. The clip
     // selection then flipped between walk and run every frame, and since each
@@ -890,13 +1143,23 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // nearly rigid. That near-motionless pose is the "arms outstretched like
       // a zombie" look. Each of the three is exclusive with the other two, so
       // retire the two that do not apply rather than only the locomotion pair.
+      // FALL BELONGS TO THIS FAMILY TOO, and leaving it out was a real leak:
+      // `fall` is a LOOPING clip and nothing anywhere retired it, so a single
+      // airborne moment past 0.45 s started it and it then played FOREVER,
+      // composing over walk and run for the rest of the session. That is the
+      // same failure the idle note above describes, one clip over — and it is
+      // why the legs kept reading wrong on the ground after any jump or drop.
+      // Landing must retire it; it is exclusive with the three locomotion
+      // clips by construction (you are either on the ground or you are not).
       const int ic = def.skel.FindClip("idle");
       const int wc = def.skel.FindClip("walk");
       const int rc = def.skel.FindClip("run");
-      const int want = !moving ? ic : (running ? rc : wc);
+      const int fc = def.skel.FindClip("fall");
+      const int want = airborneNow ? fc : (!moving ? ic : (running ? rc : wc));
       for (ClipInstance& inst : anim_.clips) {
         if (inst.clip < 0) continue;
-        if ((inst.clip == ic || inst.clip == wc || inst.clip == rc) &&
+        if ((inst.clip == ic || inst.clip == wc || inst.clip == rc ||
+             inst.clip == fc) &&
             inst.clip != want)
           inst.stopping = true;
       }
@@ -975,8 +1238,11 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
         p.gushTicks--;
       }
 
-      if (p.bleedBudget < 1.0f || bleedOps >= kBleedOpsPerTick) continue;
-      if ((tick & 3u) != 0) continue;   // drip every 4th tick
+      if (p.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
+      // Drip period, tunable — same rule as the mob path (mob.cpp). Modulo,
+      // not a mask, because the tuner offers every period and not just powers
+      // of two; the divisor is clamped >= 1 at load.
+      if (tick % (uint32_t)std::max(1, gore.bleedDripTicks) != 0) continue;
       Vec3 w = p.body ? p.xf.pos + Rotate(lq, p.woundLocal)
                       : bodyOriginNow + Rotate(bodyRotNow, p.anchorRoot);
       ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), 1, def.bleedMat, 0,
@@ -1015,7 +1281,7 @@ bool PlayerAvatar::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
         ld.severImpactSpeed > 0 && impactSpeed >= ld.severImpactSpeed;
     p.hp -= amount;
     p.woundLocal = RotateInv(q, hitWorldVoxel - p.xf.pos);
-    p.bleedBudget = std::min(p.bleedBudget + amount * def.bleedPerDamage, 120.0f);
+    p.bleedBudget = AddBleedBudget(p.bleedBudget, amount * def.bleedPerDamage);
     if (p.hp <= 0 || impactSevers) Sever((int)i);
     else PlayClip("attack");
     return true;
@@ -1034,6 +1300,19 @@ int32_t PlayerAvatar::TotalHealth() const {
   float sum = 0;
   for (size_t i = 0; i < parts.size(); i++)
     if (PartAlive((int)i) && parts[i].hp > 0) sum += parts[i].hp;
+  return sum <= 0 ? 0 : (int32_t)sum;
+}
+
+int32_t PlayerAvatar::HealthMax() const {
+  // The AUTHORED total, read straight back off the def rather than cached at
+  // spawn: an intact avatar's TotalHealth() must equal this, and taking both
+  // numbers from the same source is what guarantees it. A severed limb lowers
+  // TotalHealth but NOT this, so the HUD bar shows the missing chunk instead of
+  // silently rescaling itself to the smaller body.
+  if (!def_) return 0;
+  float sum = 0;
+  for (const MobLimbDef& ld : def_->limbs)
+    if (ld.hp > 0) sum += ld.hp;
   return sum <= 0 ? 0 : (int32_t)sum;
 }
 
@@ -1062,9 +1341,8 @@ void PlayerAvatar::SpendHealth(int32_t amount) {
     parts[i].hp -= parts[i].hp * frac;
     // Bleeding from the strain of the overcast, through the ordinary budget.
     if (def_)
-      parts[i].bleedBudget =
-          std::min(parts[i].bleedBudget + 6.0f * frac * def_->bleedPerDamage,
-                   120.0f);
+      parts[i].bleedBudget = AddBleedBudget(parts[i].bleedBudget,
+                                            6.0f * frac * def_->bleedPerDamage);
     if (parts[i].hp <= 0.0f) severed.push_back((int)i);
   }
   for (int i : severed)
@@ -1131,9 +1409,10 @@ void PlayerAvatar::Sever(int partIndex) {
     Part& parent = parts[k];
     Quat q{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
            parent.xf.quat[3]};
-    parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
-    parent.bleedBudget = std::min(parent.bleedBudget + 40.0f, 120.0f);
     const auto& gore = CurrentTuning().gore;
+    parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
+    parent.bleedBudget =
+        AddBleedBudget(parent.bleedBudget, gore.severStumpBudget);
     parent.gushTicks = std::max(1, gore.severDecayTicks);
     parent.gushLocal = parent.woundLocal;
     // Spray along the stump: from the parent's centre out through the wound,
