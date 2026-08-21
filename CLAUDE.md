@@ -181,9 +181,23 @@ the selftest's blocking hash read is the one sanctioned exception.
 ## Build and verify
 
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64   # first run fetches+builds Dawn (~15 min)
-cmake --build build --config Release --target sandvox
-./build/Release/sandvox.exe --selftest                  # determinism, perf, sleep, walk, screenshot
+bash scripts/build.sh                    # build sandvox (Release)
+bash scripts/build.sh --selftest         # build + run selftest
+bash scripts/build.sh --configure        # force cmake configure first
+```
+
+**Always use `scripts/build.sh`, never raw `cmake --build`.** The script
+acquires a machine-global mutex (`C:/sv-build-lock`) so only one MSVC
+compilation runs at a time across all worktrees — 5 simultaneous unbounded
+MSBuild instances will brick the machine. It also caps parallelism to 6 `cl.exe`
+jobs (half of 16 cores), leaving headroom for editing, searching, and the OS.
+Agents keep working while waiting for the lock; only the compile+link serializes.
+
+The underlying commands, for reference or manual use:
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64   # configure (first run fetches Dawn ~15 min)
+cmake --build build --config Release --target sandvox    # DO NOT run this directly from agents
+./build/Release/sandvox.exe --selftest
 ```
 
 Third-party sources (Dawn, Jolt, ImGui, …) are fetched into a **shared** cache
