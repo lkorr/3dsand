@@ -44,14 +44,18 @@ import {
   paletteFromMaterials,
 } from './vox.js';
 
-// Editable box cap. The .vox format allows 256; the engine's mob loader
-// bounds a micro limb at ~120 units (DebrisVoxel int8), so 128 lets a scale-4
-// mob reach its full ~30 world voxels while staying comfortably inside both.
-const MAX_EDIT_DIM = 128;
+// Editable box cap, matching what the .vox format allows.
+//
+// This used to be 128, because the ±120 DebrisVoxel int8 bound applied to the
+// authored lattice — one resolution served as both art and collider. Since the
+// skin/collider split that bound applies only to the DERIVED collider, which
+// the engine coarsens to fit (mob.h MobDef::physScale), so the art is free to
+// be finer: mina is 136 skin voxels tall at skinScale 8.
+const MAX_EDIT_DIM = 256;
 // Instance budget for the viewport, independent of MAX_EDIT_DIM: a dense
-// 128³ would be 2M cubes (~134 MB of instance data), but real models are
-// shells — the "view capped" toast catches the pathological case instead of
-// pre-paying for it.
+// 256³ would be 16M cubes, but real models are shells — the "view capped"
+// toast catches the pathological case instead of pre-paying for it. Unchanged
+// by the cap going to 256 precisely because it was never a function of it.
 const INSTANCE_CAP = 64 ** 3;
 
 // --- document ------------------------------------------------------------
@@ -779,7 +783,7 @@ function updateMicroGhost() {
   if (!microGhost || !doc) return;
   const d = activeDef()?.dim;
   const brick = d && d.x === d.y && d.y === d.z && [2, 4, 8].includes(d.x) ? d.x : 0;
-  const scl = +(sidecar?.scale) || 1;
+  const scl = +(sidecar?.skinScale ?? sidecar?.scale) || 1;
   const sub = brick || (scl > 1 ? scl : 0);
   microGhost.visible = !!sub;
   microSubdiv = brick;
@@ -1770,7 +1774,7 @@ function onPointerUp(ev) {
     const d = drag.applied, name = doc.models[drag.mi]?.name || 'model';
     drag = null;
     if (d.x || d.y || d.z) {
-      const scl = +(sidecar?.scale) || 1;
+      const scl = +(sidecar?.skinScale ?? sidecar?.scale) || 1;
       hooks.toast(`moved ${name} by ${d.x},${d.y},${d.z}` +
         (scl > 1 ? ` (${(d.x / scl).toFixed(2)},${(d.y / scl).toFixed(2)},` +
                    `${(d.z / scl).toFixed(2)} world voxels)` : ''));
@@ -2145,7 +2149,7 @@ function updateStatus() {
   for (let i = 0; i < grid.data.length; i++) if (grid.data[i]) filled++;
   const d = grid.dim;
   const nm = activeDef()?.name || '';
-  const scl = +(sidecar?.scale) || 1;
+  const scl = +(sidecar?.skinScale ?? sidecar?.scale) || 1;
   const ws = doc?.size || d;
   ui.status.textContent =
     `${docName}${docDirty ? ' *' : ''}  ·  ` +

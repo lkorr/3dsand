@@ -322,10 +322,11 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     //
     // DebrisVoxel is int8, so a limb's collider box must fit ±120 on every
     // axis. The skin has no such bound (PrefabVoxel is int16), which is the
-    // whole point of the split: pick the FINEST collider that fits and let the
-    // skin stay as fine as it was authored. At skinScale 8 a 136-micro-tall
-    // rig needs physScale 4 (34 collider voxels) — 8 would need 136 and blow
-    // the bound.
+    // whole point of the split: pick the finest collider that fits BOTH the
+    // int8 bound and the kMaxPhysScale cost ceiling (mob.h), and let the skin
+    // stay as fine as it was authored. Mina at skinScale 8 lands on physScale
+    // 4: her 68-skin-voxel hips would fit ±120 at 8, but an 8× collider is 8×
+    // the boxes for no gain a player can feel.
     //
     // Measured on the largest limb, not the whole rig: each limb is its own
     // body with its own origin, so the bound applies per limb.
@@ -337,6 +338,7 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       def.physScale = 1;
       for (uint32_t cand : {8u, 4u, 2u, 1u}) {
         if (cand > def.skinScale) continue;  // never finer than the art
+        if (cand > kMaxPhysScale) continue;  // physics cost ceiling, below
         // Extents are in skin units; a collider voxel spans skinScale/cand of
         // them, so the collider box is maxExtent * cand / skinScale.
         if ((int64_t)maxExtent * cand / def.skinScale <= 120) {

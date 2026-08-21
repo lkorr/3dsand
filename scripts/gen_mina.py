@@ -88,9 +88,28 @@ LEATHER = 53    # leather      shoes under the hem
 # STEEL/GRIP are the sword's palette entries and live with the sword now
 # (scripts/gen_sword_item.py); the figure itself is cloth, skin and leather.
 
-SCALE = 4       # micro voxels per world voxel
+# The art below is AUTHORED at 4 skin voxels per world voxel and EMITTED at 8.
+#
+# Every literal in LIMBS and inside the shape functions (`lean = 2.6`, the
+# ellipse radii, `sy - 1`, the sash thickness) is an absolute count of micro
+# voxels at the resolution it was drawn for. Re-typing them all for 8 would be
+# re-drawing the character by hand and getting a different figure — the two
+# scales do not share a single scalable constant.
+#
+# So the geometry is generated exactly as before and then UPSCALED 2x: every
+# voxel becomes a 2x2x2 block. That is the same operation the editor's
+# upscale2x offers (assets/editor/rig.js), and it is defined to preserve world
+# size — the figure is bit-for-bit the shape it was, sampled twice as finely,
+# which is what makes this safe to do to art that is already signed off.
+#
+# The point is not that the hood gains detail today; it is that the ENGINE path
+# runs at skinScale 8 end to end, so the next revision of the art can carve
+# half-voxel detail without another format change.
+ART_SCALE = 4   # what the literals below are drawn in
+SKIN_UPSCALE = 2
+SCALE = ART_SCALE * SKIN_UPSCALE  # 8 skin voxels per world voxel, as shipped
 WORLD_H = 17    # world voxels, head to toe — matches Player::kHalfY * 2
-MICRO_H = WORLD_H * SCALE  # 68
+MICRO_H = WORLD_H * SCALE  # 136
 
 # The SPEED contract, the companion to the height contract above. `speed` in
 # the sidecar is the reference top speed in world voxels/sec that the runtime
@@ -515,6 +534,50 @@ ORDER = ["hips", "torso", "head",
 # WEAPON should be an item, not a prop.
 PROPS = set()
 
+# ---- author at ART_SCALE, ship at SCALE ------------------------------------
+# The table above is drawn in ART_SCALE units. Scaling it HERE, once, is what
+# lets every derived quantity — the joint anchors, the socket offset, the
+# height assert, the prefab box — come out at the shipping resolution without
+# any of them knowing this happened. The shape functions still receive the
+# authored size and are upscaled afterwards, so their internal literals stay
+# meaningful.
+_ART_LIMBS = LIMBS
+if SKIN_UPSCALE != 1:
+    LIMBS = {n: (tuple(v * SKIN_UPSCALE for v in size),
+                 tuple(v * SKIN_UPSCALE for v in mn), mat)
+             for n, (size, mn, mat) in _ART_LIMBS.items()}
+
+
+def scale_clip_positions(clips, factor):
+    """Scale every clip's translation keys into the shipping lattice.
+
+    The companion to scaling LIMBS: `pos` keys are micro units and the clip
+    literals are authored at ART_SCALE, so they need the same multiplier the
+    limb table got. `rot` keys are quaternions and must NOT be touched."""
+    if factor == 1:
+        return clips
+    for c in clips.values():
+        for tr in (c.get("tracks") or {}).values():
+            for k in (tr.get("pos") or []):
+                k["v"] = [round(v * factor, 4) for v in k["v"]]
+    return clips
+
+
+def upscale_voxels(voxels, factor):
+    """Every voxel becomes a factor^3 block — the generator's twin of the
+    editor's upscale2x. Shape is preserved exactly; only the sampling changes,
+    which is what keeps an upscale from being a redraw."""
+    if factor == 1:
+        return voxels
+    out = []
+    for x, y, z, c in voxels:
+        bx, by, bz = x * factor, y * factor, z * factor
+        for dz in range(factor):
+            for dy in range(factor):
+                for dx in range(factor):
+                    out.append((bx + dx, by + dy, bz + dz, c))
+    return out
+
 
 def to_engine(scene_xyz, min_x, max_y):
     """Scene (Z-up) -> prefab-local engine coords (Y-up, min corner 0), matching
@@ -565,11 +628,23 @@ def main():
     grp_children = []
     for i, name in enumerate(ORDER):
         size, mn, mat = LIMBS[name]
-        # DebrisVoxel is int8 and these are MICRO units, so a part may be at
-        # most 120 micro = 30 world voxels on an axis. Nothing here is close.
-        assert max(size) <= 120, f"{name} exceeds DebrisVoxel int8 range"
-        voxels = SHAPES[name](size) if name in SHAPES else solid(size, mat)
+        art_size, _art_mn, _m = _ART_LIMBS[name]
+        # The int8 bound is now about the DERIVED COLLIDER, not this lattice.
+        # The engine picks physScale as the finest of {8,4,2,1} whose limb
+        # extents fit ±120 (mob.h MobDef::physScale), so what has to hold here
+        # is that SOME collider resolution fits — i.e. the part is under 120
+        # WORLD voxels. The skin itself is int16 and unbounded in practice.
+        world_extent = max(size) / SCALE
+        assert world_extent <= 120, (
+            f"{name} is {world_extent} world voxels; even a 1:1 collider "
+            f"exceeds the DebrisVoxel int8 bound")
+        # Shapes are drawn in the AUTHORED lattice, then upscaled — their
+        # internal constants are absolute micro counts and do not survive
+        # being handed a doubled size.
+        voxels = (SHAPES[name](art_size) if name in SHAPES
+                  else solid(art_size, mat))
         assert voxels, f"{name} generated no voxels"
+        voxels = upscale_voxels(voxels, SKIN_UPSCALE)
         seen = set()
         uniq = []
         for v in voxels:
@@ -635,25 +710,32 @@ def main():
     # limb is resized. `joint_top` puts the pivot at the TOP face of a part
     # (shoulder, elbow, wrist, hip, knee all work this way once the parts are
     # stacked), centred in x/y unless told otherwise.
+    # These three helpers take offsets in AUTHORED (ART_SCALE) micro units —
+    # the units the numbers at their call sites were measured in — and scale
+    # them to the shipping lattice here. Leaving them unscaled is what floated
+    # the figure: the ankle rise stayed 3 micro while the foot around it
+    # doubled, so the sole ended up half a shoe above the ground.
+    U = float(SKIN_UPSCALE)
+
     def joint_top(part, dx=0.0, dy=0.0, inset=0.0):
         size, mn, _m = LIMBS[part]
-        return anchor((mn[0] + size[0] * 0.5 + dx,
-                       mn[1] + size[1] * 0.5 + dy,
-                       mn[2] + size[2] - inset))
+        return anchor((mn[0] + size[0] * 0.5 + dx * U,
+                       mn[1] + size[1] * 0.5 + dy * U,
+                       mn[2] + size[2] - inset * U))
 
     def joint_bottom(part, dx=0.0, dy=0.0, rise=0.0):
         size, mn, _m = LIMBS[part]
-        return anchor((mn[0] + size[0] * 0.5 + dx,
-                       mn[1] + size[1] * 0.5 + dy,
-                       mn[2] + rise))
+        return anchor((mn[0] + size[0] * 0.5 + dx * U,
+                       mn[1] + size[1] * 0.5 + dy * U,
+                       mn[2] + rise * U))
 
     def joint_at(part, z, dx=0.0, dy=0.0):
         """Pivot at an ARBITRARY height on a part, still centred in x/y. The
         skirt needs this: its model spans floor-to-waist, but it must hinge at
         the WAIST, not at either end of its own box."""
         size, mn, _m = LIMBS[part]
-        return anchor((mn[0] + size[0] * 0.5 + dx,
-                       mn[1] + size[1] * 0.5 + dy, z))
+        return anchor((mn[0] + size[0] * 0.5 + dx * U,
+                       mn[1] + size[1] * 0.5 + dy * U, z))
 
     # ---- limbs ----
     # hp / severImpactSpeed are authored so extremities come off easily and the
@@ -665,7 +747,7 @@ def main():
         # waist: the top of the skirt, i.e. the sash line
         {"name": "torso", "parent": "hips", "joint": "ball", "hp": 60,
          "severable": False, "vital": True, "tag": "spine",
-         "anchor": joint_at("hips", waist_z - 2)},
+         "anchor": joint_at("hips", waist_z - 2 * U)},
         # neck: the top of the torso. This head model's origin IS its base (no
         # beard hanging below it, unlike the wizard), so this is the seam.
         {"name": "head", "parent": "torso", "joint": "ball", "hp": 22,
@@ -1168,8 +1250,14 @@ def main():
 
     sidecar = {
         "root": "hips",
-        # MICROVOXELS: every limb coordinate above is in 1/4-world-voxel units.
-        "scale": SCALE,
+        # MICROVOXELS: every limb coordinate above is in 1/8-world-voxel units.
+        # "skinScale" is the ART's resolution; the engine DERIVES the collider
+        # resolution from it (the finest of {8,4,2,1} whose limbs fit the
+        # DebrisVoxel int8 bound) and logs the value it picked at load. At this
+        # size that comes out at 4 — mina's hips are 68 skin voxels, which is
+        # 34 collider voxels, and 8 would need 68 per axis on a ±120 budget
+        # shared with the rest of the rig.
+        "skinScale": SCALE,
         "bleed": {"material": "blood", "perDamage": 2.5},
         # SPEED IS NOT FREE EITHER — see the height contract at the top of this
         # file. `speed` is the reference top speed in world voxels/sec, and the
@@ -1220,7 +1308,12 @@ def main():
         "sockets": sockets,
         "chains": chains,
         "states": states,
-        "clips": clips,
+        # Clip `pos` keys are MICRO units (the engine divides them by the scale
+        # with everything else), and the literals above were measured against
+        # the authored lattice — so a bob of 0.08 has to become 0.16 at 8x or
+        # every hop, land and limp is silently half as deep as it was drawn.
+        # Rotations are angles and carry over untouched.
+        "clips": scale_clip_positions(clips, SKIN_UPSCALE),
         "flipbooks": {},
     }
 

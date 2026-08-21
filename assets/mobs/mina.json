@@ -1,6 +1,6 @@
 {
   "root": "hips",
-  "scale": 4,
+  "skinScale": 8,
   "bleed": {
     "material": "blood",
     "perDamage": 2.5
@@ -45,9 +45,9 @@
       "vital": true,
       "tag": "spine",
       "anchor": [
-        10.0,
-        32.0,
-        8.0
+        20.0,
+        64.0,
+        16.0
       ]
     },
     {
@@ -59,9 +59,9 @@
       "vital": true,
       "tag": "head",
       "anchor": [
-        10.5,
-        45.0,
-        7.5
+        21.0,
+        90.0,
+        15.0
       ],
       "severImpactSpeed": 20.0,
       "spring": {
@@ -78,9 +78,9 @@
       "severable": true,
       "tag": "arm",
       "anchor": [
-        16.0,
-        45.0,
-        8.0
+        32.0,
+        90.0,
+        16.0
       ],
       "severImpactSpeed": 15.0
     },
@@ -99,9 +99,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        16.0,
-        38.0,
-        8.0
+        32.0,
+        76.0,
+        16.0
       ],
       "severImpactSpeed": 13.0
     },
@@ -113,9 +113,9 @@
       "severable": true,
       "tag": "hand",
       "anchor": [
-        16.0,
         32.0,
-        8.0
+        64.0,
+        16.0
       ],
       "severImpactSpeed": 9.0
     },
@@ -127,9 +127,9 @@
       "severable": true,
       "tag": "arm",
       "anchor": [
-        4.0,
-        45.0,
-        8.0
+        8.0,
+        90.0,
+        16.0
       ],
       "severImpactSpeed": 15.0
     },
@@ -148,9 +148,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        4.0,
-        38.0,
-        8.0
+        8.0,
+        76.0,
+        16.0
       ],
       "severImpactSpeed": 13.0
     },
@@ -162,9 +162,9 @@
       "severable": true,
       "tag": "hand",
       "anchor": [
-        4.0,
-        32.0,
-        8.0
+        8.0,
+        64.0,
+        16.0
       ],
       "severImpactSpeed": 9.0
     },
@@ -176,9 +176,9 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        12.0,
-        26.0,
-        8.0
+        24.0,
+        52.0,
+        16.0
       ],
       "severImpactSpeed": 18.0
     },
@@ -197,9 +197,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        12.0,
-        15.0,
-        8.0
+        24.0,
+        30.0,
+        16.0
       ],
       "severImpactSpeed": 16.0
     },
@@ -218,9 +218,9 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        12.0,
-        3.0,
-        10.0
+        24.0,
+        6.0,
+        20.0
       ],
       "severImpactSpeed": 12.0
     },
@@ -232,9 +232,9 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        8.0,
-        26.0,
-        8.0
+        16.0,
+        52.0,
+        16.0
       ],
       "severImpactSpeed": 18.0
     },
@@ -253,9 +253,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        8.0,
-        15.0,
-        8.0
+        16.0,
+        30.0,
+        16.0
       ],
       "severImpactSpeed": 16.0
     },
@@ -274,9 +274,9 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        8.0,
-        3.0,
-        10.0
+        16.0,
+        6.0,
+        20.0
       ],
       "severImpactSpeed": 12.0
     }
@@ -286,9 +286,9 @@
       "name": "held_right",
       "part": "hand.R",
       "offset": [
-        4.0,
-        30.0,
-        8.0
+        8.0,
+        60.0,
+        16.0
       ],
       "rotation": [
         0,
@@ -503,7 +503,7 @@
               "t": 1600,
               "v": [
                 0,
-                0.08,
+                0.16,
                 0
               ],
               "ease": "quadInOut"
@@ -1293,7 +1293,7 @@
               "t": 110,
               "v": [
                 0,
-                -0.4,
+                -0.8,
                 0
               ],
               "ease": "cubicInOut"
@@ -1786,7 +1786,7 @@
               "t": 0,
               "v": [
                 0,
-                -0.3,
+                -0.6,
                 0
               ],
               "ease": "quadInOut"
@@ -1795,7 +1795,7 @@
               "t": 500,
               "v": [
                 0,
-                -0.08,
+                -0.16,
                 0
               ],
               "ease": "quadInOut"
@@ -1804,7 +1804,7 @@
               "t": 1000,
               "v": [
                 0,
-                -0.3,
+                -0.6,
                 0
               ]
             }
@@ -1889,7 +1889,7 @@
               "t": 260,
               "v": [
                 0,
-                0.9,
+                1.8,
                 0
               ],
               "ease": "cubicInOut"

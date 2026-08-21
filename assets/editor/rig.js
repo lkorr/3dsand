@@ -115,20 +115,27 @@ function touched() {
 /**
  * Upscale the whole document 2×: geometry (editor.js doubles every model and
  * offset), then everything in the sidecar that is measured in voxels —
- * anchors and clip pos keys — and finally `scale`, so the creature keeps its
- * world size and gains detail. This is THE way to give an existing mob
- * finer microvoxels: scale 2 → 4 halves the voxel size without moving a
+ * anchors and clip pos keys — and finally `skinScale`, so the creature keeps
+ * its world size and gains detail. This is THE way to give an existing mob
+ * finer microvoxels: skinScale 4 → 8 halves the voxel size without moving a
  * joint or changing a clip's meaning.
+ *
+ * This function is also the authoritative INVENTORY of which sidecar fields
+ * are measured in micro units: limbs[].anchor, clips[*].tracks[*].pos[].v,
+ * editor.parts[].box, plus the model grids and offsets editor.js handles.
+ * gait.rideHeight, gait.stepHeight and states[].bodyYOffset are WORLD units
+ * and are deliberately untouched — doubling them would raise the creature off
+ * the ground by exactly the amount it just gained in detail.
  */
 function upscale2x() {
   const s = sc();
-  const scl = +(s.scale) || 1;
-  if (isRigged() && scl >= 4) {
-    toast('already at scale 4 — the engine caps micro mobs there (mob.cpp)', true);
+  const scl = +(s.skinScale ?? s.scale) || 1;
+  if (isRigged() && scl >= 8) {
+    toast('already at skinScale 8 — the finest the engine accepts (mob.cpp)', true);
     return;
   }
   if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' +
-      (isRigged() ? `, anchors/keys double, and scale goes ${scl} → ${scl * 2}` : '') +
+      (isRigged() ? `, anchors/keys double, and skinScale goes ${scl} → ${scl * 2}` : '') +
       '. This clears the undo history.')) return;
   if (!ed.upscaleDoc()) return;          // toasts its own reason on failure
   for (const l of limbs())
@@ -144,14 +151,17 @@ function upscale2x() {
       if (Array.isArray(p.box))
         // lo doubles; hi is an inclusive cell index, so its block ends at 2h+1.
         p.box = [p.box[0].map(v => v * 2), p.box[1].map(v => v * 2 + 1)];
-  if (isRigged()) s.scale = scl * 2;
+  if (isRigged()) {
+    delete s.scale;             // one key wins (see the scale dropdown)
+    s.skinScale = scl * 2;
+  }
   touched();
   bindGizmo();
   ed.refreshMicroGhost?.();
   ed.invalidate();
   renderAllPanels();
   toast('upscaled 2×' + (isRigged()
-    ? ` — scale ${scl * 2}: same world size, ${scl * 2}× voxel density`
+    ? ` — skinScale ${scl * 2}: same world size, ${scl * 2}× voxel density`
     : ' — the model is twice the resolution (and twice the world size)'));
 }
 
@@ -299,7 +309,7 @@ function moveInput(limb) {
     bindGizmo();
     ed.invalidate();
     renderAllPanels();
-    const scl = +(sc().scale) || 1;
+    const scl = +(sc().skinScale ?? sc().scale) || 1;
     const w = a => (a / scl).toFixed(scl > 1 ? 2 : 0);
     toast(`moved ${limb.name} by ${d.x},${d.y},${d.z}` +
       (scl > 1 ? ` (${w(d.x)},${w(d.y)},${w(d.z)} world voxels)` : ''));
@@ -508,28 +518,38 @@ function renderRigPanel() {
     const spd = numInput(s, 'speed', { ph: '5.0' });
     sideEl.append(field('speed', spd, 'm/s; also drives preview cadence'));
 
-    // Micro authoring scale (mob.cpp:160): voxels in this file are MICRO
-    // units, `scale` of them per world voxel. This is how a mob gets more
-    // detail than one world voxel per cube — model it big here, set the
-    // scale, and the engine shrinks it. Rig, anchors and clips are all
-    // authored in the same units, so nothing else in this panel changes.
+    // Micro authoring scale (validated in mob.cpp LoadMobDefs, ~line 229):
+    // voxels in this file are SKIN units, `skinScale` of them per world voxel.
+    // This is how a mob gets more detail than one world voxel per cube — model
+    // it big here, set the scale, and the engine shrinks it. Rig, anchors and
+    // clips are all authored in the same units, so nothing else in this panel
+    // changes.
+    //
+    // Writes "skinScale". The engine derives the COLLIDER resolution from the
+    // art (the finest of {8,4,2,1} whose limbs still fit the DebrisVoxel int8
+    // bound) and logs what it picked at load — it is not authored here, because
+    // the bound it satisfies is a property of how big the limbs are. The older
+    // "scale" key is still read, and means both lattices are equal.
     const sclSel = el('select', { class: 'cell' });
-    for (const v of [1, 2, 4]) sclSel.append(el('option', { value: v }, String(v)));
-    sclSel.value = String(+(s.scale) || 1);
+    for (const v of [1, 2, 4, 8]) sclSel.append(el('option', { value: v }, String(v)));
+    sclSel.value = String(+(s.skinScale ?? s.scale) || 1);
     sclSel.addEventListener('change', () => {
       const v = +sclSel.value;
-      if (v > 1) s.scale = v; else delete s.scale;
+      // One key wins: never leave both behind for the loader to choose between.
+      delete s.scale;
+      if (v > 1) s.skinScale = v; else delete s.skinScale;
       touched();
       ed.refreshMicroGhost?.();
       ed.invalidate();
     });
-    const scl = +(s.scale) || 1;
+    const scl = +(s.skinScale ?? s.scale) || 1;
     const wsz = ed.getDoc()?.size || { x: 0, y: 0, z: 0 };
-    sideEl.append(field('scale', sclSel,
+    sideEl.append(field('skinScale', sclSel,
       scl > 1
-        ? `micro voxels/world voxel — draws ${Math.ceil(wsz.x / scl)}×` +
-          `${Math.ceil(wsz.y / scl)}×${Math.ceil(wsz.z / scl)} world voxels`
-        : 'micro voxels per world voxel (2/4 = finer-than-terrain detail)'));
+        ? `skin voxels/world voxel — draws ${Math.ceil(wsz.x / scl)}×` +
+          `${Math.ceil(wsz.y / scl)}×${Math.ceil(wsz.z / scl)} world voxels ` +
+          '(the collider is derived coarser; the engine logs which)'
+        : 'skin voxels per world voxel (2/4/8 = finer-than-terrain detail)'));
   }
 
   // Limbs with no model of the same name cannot be reached from the model

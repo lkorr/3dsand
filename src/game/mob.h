@@ -95,6 +95,22 @@ struct MobSocketDef {
   Quat rotation{};
 };
 
+// Ceiling on the DERIVED collider resolution (MobDef::physScale).
+//
+// The int8 bound alone is not the whole constraint. Collider cost is a voxel
+// COUNT — Jolt greedy-merges the lattice into boxes and then solves contacts
+// against them — so it grows as the cube of the resolution, while the skin is
+// one OBB whose cost is screen area. Deriving "the finest collider that fits
+// in ±120" would hand a 68-voxel limb an 8× collider purely because it is
+// small enough to get away with, which is the coupling this split exists to
+// break: the cheap axis would once again be paying the expensive one's price.
+//
+// 4 keeps every current rig at or below the resolution it already shipped
+// with, so no existing creature's mass, contacts or ground probes move, while
+// leaving the skin free to go to 8. Raising this is a physics-budget decision,
+// not an art one.
+inline constexpr uint32_t kMaxPhysScale = 4;
+
 struct MobDef {
   std::string name;
   Prefab prefab;               // one model per limb
