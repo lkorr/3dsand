@@ -31,3 +31,8 @@ notes/
 # Deliberately untracked: it is session state, and tracking the very file meant
 # to prevent collisions would make it a merge-conflict site itself.
 AGENTS_BOARD.md
+
+# Claude Code worktrees: one isolated checkout per parallel agent session
+# (CLAUDE.md "Parallel sessions"). Contents are real checkouts of this repo,
+# so they must never show up as untracked files in the main one.
+.claude/worktrees/

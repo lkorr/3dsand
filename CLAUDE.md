@@ -10,55 +10,99 @@ update DESIGN.md in the same commit or don't make the change.
 
 ---
 
-## You are probably not alone in this tree
+## Parallel sessions: work in a worktree, not in this checkout
 
-Several Claude sessions routinely work this repo **at the same time**. They have
-already, on separate occasions: dropped an authored block out of
-`materials.json` while every shader still compiled, swept another session's
+Several Claude sessions routinely work this repo **at the same time**. Sharing
+one checkout has already, on separate occasions: dropped an authored block out
+of `materials.json` while every shader still compiled, swept another session's
 half-finished work into an unrelated commit, and left conflict markers inside
 JSON via a stash/pop. All of it was silent — green build, normal `git status`.
 
-`AGENTS_BOARD.md` (gitignored, append-only) is the shared scratchpad the
-sessions use to see each other. A `SessionStart` hook prints the open claims and
-the last 12 hours into your context automatically, so you start already knowing
-who is holding what.
+An advisory board of "claims" was tried and did not work, because a claim is a
+line of text and nothing enforces it. **Git worktrees do enforce it.** A
+worktree is a separate working directory on its own branch sharing this repo's
+history, and while a session is in one, Claude Code *blocks* its edits, its
+`cd`s, and its `git -C` redirects into the main checkout. Two agents cannot
+overwrite each other because they are not editing the same files.
 
-**Write to it only through `scripts/board.sh`** — it appends one line, which is
-safe under concurrent writes. Editing the board with Edit/Write rewrites the
-whole file and silently drops whatever another agent appended a second earlier.
+### Start every editing session in a worktree
 
 ```bash
-bash scripts/board.sh active                     # who holds what right now
-bash scripts/board.sh claim "<files>" "<what>"   # BEFORE you start editing
-bash scripts/board.sh done "<what landed>"       # when you stop, or hand off
-bash scripts/board.sh note "<heads-up>"          # no claim, just information
+claude --worktree <name>          # new isolated checkout + branch worktree-<name>
 ```
 
-What is actually required of you:
+Or, mid-session, just ask to "work in a worktree" and Claude creates one. It
+lands in `.claude/worktrees/<name>/` (gitignored) on branch `worktree-<name>`.
+Name it after the task — `micro-lod`, `items-tab`, `fix-ik-mirror`.
 
-- **Claim before editing anything shared** — `world.h`, `common.wgsl`,
-  `simulation.cpp`, `main.cpp`, `CLAUDE.md`, `DESIGN.md`, and every file under
-  `assets/materials/`, `assets/spells/`, `assets/tuner*`. `claim` warns you if
-  someone already holds an overlapping path; treat that warning as a reason to
-  re-read the file and reconcile, not as something to ride past.
-- **Re-check the board before a build, a commit, or a `--selftest` run.** These
-  are the three operations that collide hardest: `LNK1104` means someone's
-  `sandvox.exe` is live, and a selftest failure may belong to their tree rather
-  than yours (see the attribution rule below).
-- **Post a `done` with what actually landed**, not "finished". The next session
-  reads that line to know whether the thing it depends on exists yet.
-- **`note` anything cross-cutting the moment you decide it** — a constant you
-  changed, a JSON block you added, a file you are about to regenerate. The
-  `kVoxelMeters` and `stain`-block incidents were both one `note` away from
-  being non-events.
-- **A stale claim is not a lock.** If a claim is hours old and the file looks
-  untouched, it is abandoned; say so with a `note` and proceed. The board is
-  information, never a mutex — nothing blocks on it.
+Reading, reviewing, and merging are fine to do in the main checkout. **Editing
+is not.** If you are in the main checkout and about to change a file, move to a
+worktree first; the `SessionStart` brief tells you which one you are in.
 
-This does not replace the freshness checks. Still run
-`ls --time-style=full-iso` on a hub file whose content you are depending on, and
-still re-`grep` an authored JSON block back out after a parallel-edit warning.
-The board tells you who is nearby; the mtime tells you what actually changed.
+### What a worktree does and does not carry
+
+- **It branches from the current `HEAD`**, because `worktree.baseRef` is set to
+  `"head"` in `.claude/settings.json`. The default (`"fresh"`) would branch from
+  `origin/main`, which on this repo is dozens of commits stale — every agent
+  would silently start in the past. Don't change this without checking how far
+  `origin/main` has fallen behind.
+- **Uncommitted work does not come along.** A worktree is checked out from a
+  commit. If your change depends on something another session has only in its
+  working tree, it does not exist for you — commit it or re-make it.
+- **`build/` does not come along, and should not.** Each worktree gets its own,
+  so agents never fight over `sandvox.exe` or a `.obj`. The expensive part is
+  shared instead: `FETCHCONTENT_BASE_DIR` (CMakeLists.txt) points Dawn/Jolt/
+  ImGui sources at one cache outside every checkout, so a new worktree does not
+  re-clone and re-build Dawn. Configure a worktree once with the normal
+  `cmake -S . -B build ...` and it reuses that cache.
+- **Gitignored files listed in `.worktreeinclude`** are copied in automatically.
+
+### Finishing: merge, then remove
+
+Land work as commits on the worktree branch, then from the **main checkout**:
+
+```bash
+bash scripts/worktrees.sh list          # who exists, branch, dirty, ahead/behind
+bash scripts/worktrees.sh diff <name>   # what that worktree changed vs main
+bash scripts/worktrees.sh land <name>   # merge it into main (refuses if dirty)
+bash scripts/worktrees.sh gc            # remove the clean, fully-merged ones
+```
+
+`land` refuses a worktree with uncommitted changes rather than merging its
+branch and silently leaving the actual work behind — the failure the board era
+kept producing. `gc` only removes a worktree that is both clean and fully
+merged, so an abandoned-looking one with real work in it survives.
+
+Don't leave finished worktrees lying around — a stale one is indistinguishable
+from a live agent's, and the next session will tiptoe around nothing. Claude
+cleans up its own subagent worktrees, but not ones you or `--worktree` created.
+
+### Subagents that write files
+
+A subagent editing files while its parent session also edits them is the same
+collision one level down. Give a writing subagent its own worktree:
+
+- ask for it in the prompt ("use worktrees for your agents"), or
+- set `isolation: worktree` in a custom agent's frontmatter under `.claude/agents/`.
+
+Read-only agents (search, review, audit) don't need one and shouldn't pay for
+it. Claude removes a subagent worktree automatically if it finished without
+changes; one with changes stays until you land or `gc` it.
+
+### What still applies
+
+Worktrees remove the file-collision class of bug. They do not remove these:
+
+- **A shared hub file edited in two worktrees still conflicts at merge time** —
+  it just conflicts loudly, in git, instead of silently. `world.h`,
+  `common.wgsl`, `simulation.cpp`, `main.cpp`, `assets/materials/*`,
+  `assets/tuner*` are the usual sites. Before starting, glance at what the other
+  worktrees are touching (the brief lists them) and prefer to split work so two
+  agents don't rewrite one hub file.
+- **`LNK1104` still means someone's `sandvox.exe` is live** — including your
+  own from another worktree. `taskkill //F //IM sandvox.exe` and rebuild.
+- **A selftest failure may still not be yours.** See the attribution rule below:
+  build clean `HEAD` before blaming your change.
 
 ---
 
@@ -141,6 +185,14 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64   # first run fetches+buil
 cmake --build build --config Release --target sandvox
 ./build/Release/sandvox.exe --selftest                  # determinism, perf, sleep, walk, screenshot
 ```
+
+Third-party sources (Dawn, Jolt, ImGui, …) are fetched into a **shared** cache
+outside the checkout — `~/.sandvox-deps`, set by `FETCHCONTENT_BASE_DIR` in
+CMakeLists.txt — so a new worktree does not re-clone or re-build Dawn. Only the
+first configure anywhere on the machine pays the ~15 min. Each worktree still
+gets its own `build/`, so no two agents share an object file or `sandvox.exe`.
+Override with `-DFETCHCONTENT_BASE_DIR=...` or `$SANDVOX_DEPS` for a private
+cache; delete `~/.sandvox-deps` to force a clean refetch.
 
 `--selftest` is the acceptance gate: it checks the twice-run world hash, the sleep
 assertion, perf, a walk test, and writes `screenshot.bmp`. Run it after any sim,

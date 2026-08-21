@@ -1,0 +1,16 @@
+# Gitignored files copied into every new worktree Claude Code creates.
+# .gitignore syntax; only files that match AND are gitignored are copied.
+#
+# Deliberately NOT here:
+#   build/        — multi-GB, and a worktree needs its OWN build dir anyway
+#                   (third-party sources are shared via FETCHCONTENT_BASE_DIR,
+#                   see CMakeLists.txt)
+#   *.svx, *.svd/ — saved worlds; a worktree should start from worldgen
+#   AGENTS_BOARD.md — retired; worktrees replaced it
+
+# The packaged tuner: rebuilding it needs pywebview+pyinstaller, and it edits
+# the checkout it sits in, so each worktree wants its own copy.
+sandvox_tuner.exe
+
+# Local engineering notes surfaced in the tuner's Notes tab.
+notes/

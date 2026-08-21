@@ -1,11 +1,14 @@
 {
+  "worktree": {
+    "baseRef": "head"
+  },
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/board_brief.sh\""
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/worktree_brief.sh\""
           }
         ]
       }
@@ -16,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(cat | sed -n 's/.*\"file_path\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -1); case \"$f\" in *.wgsl) cd \"$CLAUDE_PROJECT_DIR\" && bash scripts/check_shaders.sh \"$f\" ;; *) exit 0 ;; esac"
+            "command": "in=$(cat); f=$(printf '%s' \"$in\" | sed -n 's/.*\"file_path\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -1); case \"$f\" in *.wgsl) d=$(printf '%s' \"$in\" | sed -n 's/.*\"cwd\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -1); cd \"${d:-$CLAUDE_PROJECT_DIR}\" && bash scripts/check_shaders.sh \"$f\" ;; *) exit 0 ;; esac"
           }
         ]
       }

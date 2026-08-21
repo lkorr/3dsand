@@ -7,6 +7,37 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 
 # ---------------------------------------------------------------------------
+# Shared dependency cache across git worktrees.
+#
+# Every parallel agent session gets its own worktree (CLAUDE.md "Parallel
+# sessions"), and a worktree is a fresh checkout with an empty build/. Left
+# alone, FetchContent would re-clone and re-BUILD Dawn per worktree: ~15 min and
+# several GB each, which is what makes worktrees unusable on this project rather
+# than merely slow.
+#
+# Pointing FETCHCONTENT_BASE_DIR at one location OUTSIDE every checkout means
+# the Dawn/Jolt/ImGui sources are cloned once and shared. Each worktree still
+# gets its own build/ for OUR objects, so agents never fight over sandvox.exe
+# or a .obj — only the immutable third-party sources are shared.
+#
+# Override with -DFETCHCONTENT_BASE_DIR=... if you want a private cache.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED FETCHCONTENT_BASE_DIR)
+  if(DEFINED ENV{SANDVOX_DEPS})
+    set(_sv_deps "$ENV{SANDVOX_DEPS}")
+  elseif(WIN32 AND DEFINED ENV{USERPROFILE})
+    set(_sv_deps "$ENV{USERPROFILE}/.sandvox-deps")
+  elseif(DEFINED ENV{HOME})
+    set(_sv_deps "$ENV{HOME}/.sandvox-deps")
+  else()
+    set(_sv_deps "${CMAKE_BINARY_DIR}/_deps")  # last resort: per-build, as before
+  endif()
+  set(FETCHCONTENT_BASE_DIR "${_sv_deps}" CACHE PATH
+      "Shared FetchContent cache, so worktrees don't each rebuild Dawn")
+endif()
+message(STATUS "sandvox: dependency cache = ${FETCHCONTENT_BASE_DIR}")
+
+# ---------------------------------------------------------------------------
 # Dawn (WebGPU implementation; Vulkan backend on Windows native).
 # DAWN_FETCH_DEPENDENCIES pulls Dawn's own third-party deps without depot_tools.
 # ---------------------------------------------------------------------------
