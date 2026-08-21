@@ -690,6 +690,41 @@ bool Physics::GetLocalBounds(uint64_t handle, Vec3& outMin, Vec3& outMax) const 
   return true;
 }
 
+size_t Physics::GetSubShapeBoxes(uint64_t handle,
+                                 std::vector<SubShapeBox>& out,
+                                 size_t limit) const {
+  if (!system_ || handle == 0) return 0;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return 0;
+  JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
+  if (!shape) return 0;
+  const auto* compound =
+      dynamic_cast<const JPH::StaticCompoundShape*>(shape.GetPtr());
+  if (!compound) return 0;
+  const float inv = 1.0f / kVoxelMeters;
+  size_t added = 0;
+  for (uint32_t i = 0; i < compound->GetNumSubShapes(); i++) {
+    if (out.size() >= limit) break;
+    const JPH::CompoundShape::SubShape& ss = compound->GetSubShape(i);
+    const auto* box = dynamic_cast<const JPH::BoxShape*>(
+        ss.mShape.GetPtr());
+    if (!box) continue;
+    JPH::Vec3 pos = ss.GetPositionCOM();
+    JPH::Vec3 half = box->GetHalfExtent();
+    JPH::Quat rot = ss.GetRotation();
+    SubShapeBox b;
+    b.center = Vec3{pos.GetX() * inv, pos.GetY() * inv, pos.GetZ() * inv};
+    b.halfExtents = Vec3{half.GetX() * inv, half.GetY() * inv,
+                         half.GetZ() * inv};
+    b.quat[0] = rot.GetX(); b.quat[1] = rot.GetY();
+    b.quat[2] = rot.GetZ(); b.quat[3] = rot.GetW();
+    out.push_back(b);
+    added++;
+  }
+  return added;
+}
+
 bool Physics::IsActive(uint64_t handle) const {
   if (!system_ || handle == 0) return false;
   return system_->GetBodyInterface().IsActive(ToBodyID(handle));

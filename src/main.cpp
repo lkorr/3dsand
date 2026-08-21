@@ -5882,26 +5882,46 @@ int main(int argc, char** argv) {
         dbg.clear();
         avatar.AppendDebugBoxes(dbg, kMaxDebugBoxes, 0xC000FF40u);
         mobs.AppendDebugBoxes(dbg, kMaxDebugBoxes, 0xC0FFFF40u);
-        for (uint32_t i = 0; i < debris.BodyCount(); i++) {
-          if (dbg.size() >= kMaxDebugBoxes) break;
-          const uint64_t h = debris.BodyHandle(i);
-          if (!h) continue;
-          Vec3 lo, hi;
-          BodyTransform xf{};
-          if (!phys.GetLocalBounds(h, lo, hi)) continue;
-          if (!phys.GetTransform(h, xf)) continue;
-          DebugBox b{};
-          const Vec3 mid{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
-                         (lo.z + hi.z) * 0.5f};
-          const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
-          const Vec3 c = xf.pos + QuatRotate(q, mid);
-          b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
-          b.half[0] = (hi.x - lo.x) * 0.5f;
-          b.half[1] = (hi.y - lo.y) * 0.5f;
-          b.half[2] = (hi.z - lo.z) * 0.5f;
-          std::memcpy(b.quat, xf.quat, sizeof(b.quat));
-          b.color = 0xC040FFFFu;
-          dbg.push_back(b);
+        {
+          static std::vector<SubShapeBox> subs;
+          for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+            if (dbg.size() >= kMaxDebugBoxes) break;
+            const uint64_t h = debris.BodyHandle(i);
+            if (!h) continue;
+            BodyTransform xf{};
+            if (!phys.GetTransform(h, xf)) continue;
+            const Quat bodyQ{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+            subs.clear();
+            if (phys.GetSubShapeBoxes(h, subs, kMaxDebugBoxes - dbg.size())) {
+              for (const SubShapeBox& ss : subs) {
+                DebugBox b{};
+                const Vec3 c = xf.pos + QuatRotate(bodyQ, ss.center);
+                b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
+                b.half[0] = ss.halfExtents.x;
+                b.half[1] = ss.halfExtents.y;
+                b.half[2] = ss.halfExtents.z;
+                const Quat q = QuatNormalize(QuatMul(bodyQ, Quat{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]}));
+                b.quat[0] = q.x; b.quat[1] = q.y; b.quat[2] = q.z;
+                b.quat[3] = q.w;
+                b.color = 0xC040FFFFu;
+                dbg.push_back(b);
+              }
+            } else {
+              Vec3 lo, hi;
+              if (!phys.GetLocalBounds(h, lo, hi)) continue;
+              DebugBox b{};
+              const Vec3 mid{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                             (lo.z + hi.z) * 0.5f};
+              const Vec3 c = xf.pos + QuatRotate(bodyQ, mid);
+              b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
+              b.half[0] = (hi.x - lo.x) * 0.5f;
+              b.half[1] = (hi.y - lo.y) * 0.5f;
+              b.half[2] = (hi.z - lo.z) * 0.5f;
+              std::memcpy(b.quat, xf.quat, sizeof(b.quat));
+              b.color = 0xC040FFFFu;
+              dbg.push_back(b);
+            }
+          }
         }
         if (!dbg.empty()) {
           debugBoxCount = (uint32_t)dbg.size();

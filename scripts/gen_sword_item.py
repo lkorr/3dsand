@@ -27,11 +27,10 @@ the whole reason the offset lives on the item rather than on the skeleton.
 TWO CONSTRAINTS INHERITED FROM THE RIG VERSION, both still load-bearing:
 
  1. The blade lies along the box's LONG axis (x here), and when held it must
-    end up ORTHOGONAL TO THE FOREARM. A sword parallel to the arm is inside
-    the arm: the fist closes on air and the blade occupies the limb holding
-    it. The grip rotation below is what enforces the right angle, and it must
-    KEEP that angle through a swing — the arm moves, the wrist does not
-    swivel.
+    end up ORTHOGONAL TO THE FOREARM. The arm extends along -y in the rig,
+    so the blade's +x is already perpendicular — identity grip rotation is
+    correct. The angle must HOLD through a swing: the arm moves, the wrist
+    does not swivel.
  2. The `edge` block is the ONE source of truth for where the weapon cuts.
     melee.cpp sweeps that segment; re-measuring it by eye in C++ would rot the
     moment the art changes. It is emitted from the same constants that build
@@ -216,11 +215,9 @@ def main():
     # not the case here, and it drags in a scale hazard.
     #
     # ROTATION, degrees, applied X then Y then Z. The blade is authored along
-    # +x and the hand's socket frame has the fingers curling about the arm's
-    # axis; a quarter turn about Z lays the blade ACROSS the forearm rather
-    # than along it, which is constraint 1 in this file's docstring. The
-    # -90 sign is what sends the tip outboard from the RIGHT hand — the job
-    # the mirror used to do in the art.
+    # +x; the arm extends along -y in the rig. Identity rotation keeps the
+    # blade along +x, which IS perpendicular to the forearm — constraint 1
+    # in this file's docstring. No rotation needed.
     #
     # TRANSLATION is in MICRO units, in the item's own frame, and moves the
     # item so the point the fist closes on lands on the socket. The fist grips
@@ -243,7 +240,7 @@ def main():
         "grip": {
             "held_right": {
                 "translation": [-SWORD_GRIP, 0, 0],
-                "rotation": [0, 0, -90],
+                "rotation": [0, 0, 0],
                 "scale": 1.0,
             }
         },

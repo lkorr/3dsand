@@ -33,6 +33,14 @@ struct DebrisVoxel {
   uint16_t payload;  // material | state<<12
 };
 
+// One sub-shape of a compound collider, in body-local VOXEL coordinates.
+// Used by the collision-box debug overlay to draw tight-fitting boxes.
+struct SubShapeBox {
+  Vec3 center;       // body-local, voxels
+  Vec3 halfExtents;  // along the sub-shape's own axes, voxels
+  float quat[4];     // x, y, z, w — sub-shape orientation in body-local space
+};
+
 class Physics {
  public:
   Physics();
@@ -170,6 +178,11 @@ class Physics {
   //
   // False when the handle is dead or not in the simulation.
   bool GetLocalBounds(uint64_t handle, Vec3& outMin, Vec3& outMax) const;
+  // Individual sub-shapes of a compound collider, in body-local voxels.
+  // Returns the count appended (0 for non-compound or dead bodies).
+  size_t GetSubShapeBoxes(uint64_t handle,
+                          std::vector<SubShapeBox>& out,
+                          size_t limit) const;
   // Radial impulse (explosions). center/radius in voxels, impulse in kg*m/s
   // at the center, falling off linearly to zero at radius.
   void ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels, float impulse);
