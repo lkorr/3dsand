@@ -883,6 +883,69 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
     mat = M_WOOD;
   }
 
+  // ---- combat test arena (authored POI) ----
+  // A flat walled deck a short walk from the spawn point, for trying melee,
+  // spells and mob fights on ground that isn't a noisy hillside. Terrain slope
+  // is the confound this removes: on natural ground a miss is ambiguous between
+  // bad reach and a foot half a voxel up a slope.
+  //
+  // Placed OFF the x==z diagonal on purpose. Every selftest fixture column sits
+  // on it (60,80,90,100,108,120,140,150) and each one assumes TerrainHeight()
+  // is the top of the world there, so a deck over any of them would turn a
+  // passing gate into a mystery — the same trap inSpawnClearing() documents.
+  // z stays <= 142 to clear the wood platform above (z >= 146).
+  //
+  // The deck is ONE flat plane and the space between it and the real terrain is
+  // filled, so there is no lip to trip the step-up and no cave under the floor.
+  // Everything is anchored to baseHeight rather than a literal Y, so the arena
+  // rides the terrain wherever the seed puts it.
+  let arenaCX = 180;
+  let arenaCZ = 110;
+  let arenaHalf = 32;                 // 64 voxels square, ~4 m
+  // The deck sits ABOVE the highest ground in its own footprint, not at the
+  // centre height. Terrain here spans 20 voxels across 64 (51..71 at the
+  // default seed, centre 60), so levelling to the centre buried the uphill half
+  // and dug the deck into a pit you could not see over the rim of — measured,
+  // not guessed. +16 clears the +11 worst case with margin for other seeds, and
+  // turns the arena into a low plinth that reads as built rather than excavated.
+  let arenaY = baseHeight(arenaCX, arenaCZ, seed) + 16;
+  let adx = x - arenaCX;
+  let adz = z - arenaCZ;
+  let inArena = abs(adx) <= arenaHalf && abs(adz) <= arenaHalf;
+  if (inArena) {
+    // Deck plus the plinth under it, filled all the way down past the lowest
+    // ground so a downhill corner is supported instead of hanging over a void.
+    if (y <= arenaY && y > arenaY - 64) { mat = M_STONE; }
+    // Nothing survives above the deck: the plane is the floor everywhere.
+    if (y > arenaY) { mat = MAT_AIR; }
+
+    // Perimeter wall, 2 voxels thick and 24 tall (1.5 m) — high enough to keep
+    // a spawned mob in, low enough to see over in third person.
+    // Doorways are 32 voxels (2 m) tall so they clear the 1.7 m player, the
+    // same reason the ruin's door is not halved with the rest of the world.
+    let onWall = abs(adx) >= arenaHalf - 1 || abs(adz) >= arenaHalf - 1;
+    let inDoor = (abs(adx) <= 10 && abs(adz) >= arenaHalf - 1) ||
+                 (abs(adz) <= 10 && abs(adx) >= arenaHalf - 1);
+    if (onWall && !inDoor && y > arenaY && y <= arenaY + 24) {
+      mat = M_STONE;
+    }
+  }
+
+  // Approach ramp up to the -z doorway. The deck stands ~16 voxels (1 m) proud
+  // of the ground, which is well over the step-up reach, so without this the
+  // only way in is to jump the plinth wall. Runs 24 voxels out from the wall and
+  // rises linearly, giving a ~34 degree slope the gait walks up without the
+  // step-up ever firing.
+  let rampLen = 24;
+  let rampOut = (arenaCZ - arenaHalf) - z;      // 0 at the wall, grows outward
+  // As wide as the doorway it feeds (+-10 -> 21 voxels), so walking straight at
+  // the gap never drops you off the side of the approach.
+  if (abs(adx) <= 10 && rampOut > 0 && rampOut <= rampLen) {
+    let rampTop = arenaY - (arenaY - baseHeight(x, z, seed)) * rampOut / rampLen;
+    if (y <= rampTop && y > rampTop - 64) { mat = M_STONE; }
+    if (y > rampTop) { mat = MAT_AIR; }
+  }
+
   // Procedural ruin POIs: one hollow stone building per ~5th tile, placed by
   // tile hash. Building halved with the world: ~3.5 m square, 3 m tall — a
   // hut, not a hall. The 2 m doorway is NOT halved: it has to clear the 1.7 m
@@ -946,6 +1009,13 @@ fn surfHeightAt(x : i32, z : i32, seed : u32) -> i32 {
   // natural disc ponds carve their bowl into the terrain (mirrors genCell)
   let pw = pondAt(x, z, seed);
   if (pw.y >= 0) { h = min(h, pw.x); }
+  // The combat arena levels its whole footprint to one plane (mirrors genCell).
+  // Without this the far field keeps painting the ORIGINAL hillside height
+  // there, so the deck reads as the wrong material at distance and pops when
+  // you walk into fine-detail range.
+  if (abs(x - 180) <= 32 && abs(z - 110) <= 32) {
+    h = baseHeight(180, 110, seed) + 16;
+  }
   return h;
 }
 

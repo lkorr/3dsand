@@ -491,6 +491,13 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
   render({108, (float)(h108 + 28), 108}, 0.785f, -0.02f, "screenshot_ground.bmp");
+  // Combat arena POI, centered at (180,110): from outside the -x/-z corner
+  // looking across the deck, high enough to see the far wall and both doorways.
+  {
+    int ah = World::TerrainHeight(180, 110, kDefaultSeed);
+    render({120, (float)(ah + 40), 50}, 0.9f, -0.32f, "screenshot_arena.bmp");
+    render({180, (float)(ah + 90), 40}, 1.5708f, -0.85f, "screenshot_arena_top.bmp");
+  }
   // Water look shots: the authored lake is centered at (420,420), surface at
   // y=68 (worldgen poolY 44 + 24), floor at y=44, rim y=70.
   //   _water: from the near rim at a shallow grazing angle — where Fresnel

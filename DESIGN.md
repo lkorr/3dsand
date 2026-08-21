@@ -2088,6 +2088,27 @@ silent.
 
 Each milestone is playable/demoable. Don't start a milestone's "later" items early.
 
+> **Combat test arena (2026-08-21).** An authored walled POI near spawn
+> (centre 180,110; 64 voxels square, 24-voxel wall, four 2 m doorways, ramp up
+> the -z side), for trying melee, spells and mob fights on ground that is not a
+> noisy hillside — on natural terrain a miss is ambiguous between bad reach and
+> a foot half a voxel up a slope. Same shape as the wood-platform set piece:
+> absolute coords in `genCell`, inert stone, so a settled world still reports 0
+> active chunks and the determinism/streaming hashes are unaffected.
+>
+> Two things it shook out. (0) The deck was first levelled to `baseHeight` at
+> its CENTRE, which buries the uphill half and digs a pit: terrain spans 20
+> voxels across the 64-voxel footprint (51..71, centre 60 at the default seed),
+> so the deck now sits at centre+16 — above the +11 worst case — and the arena
+> is a low plinth that fills down to the ground rather than an excavation. The
+> span was measured before choosing the number, not guessed. (1) A plinth that
+> stands 1 m proud is far over the step-up reach, so it needed the approach ramp
+> or the only way in was to jump the wall. Placed OFF the x==z diagonal
+> deliberately: every selftest fixture column sits on it (60/80/90/100/108/120/
+> 140/150) and each assumes `TerrainHeight()` is the top of the world there.
+> `surfHeightAt` mirrors the flattening, as it must, or the far field keeps
+> painting the original hillside and the deck pops on approach.
+>
 > **v0.5.6 (2026-08-20)** — rigidbody feel pass: mass-relative shoves + true
 > spheres. The player proxy is now a DYNAMIC capsule (rotation-locked, zero
 > gravity, tuned `playerMassKg`) teleported to the authoritative position each
