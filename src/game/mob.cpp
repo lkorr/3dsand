@@ -10,7 +10,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/rigrender.h"
 #include "phys/lattice.h"
+#include "sim/rng.h"
 #include "sim/tuning.h"
 
 using nlohmann::json;
@@ -25,23 +27,12 @@ inline Quat Mul(const Quat& a, const Quat& b) { return QuatMul(a, b); }
 inline Vec3 Rotate(const Quat& q, Vec3 v) { return QuatRotate(q, v); }
 inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
 
-// CPU mirror of common.wgsl pcg/hash3, same as the one in debris.cpp: stateless
-// and counter-based, so a given (mob, limb, tick, index) always produces the
-// same droplet. Spray direction is presentation, but it is authored INTO the
-// tick's spawn stream, which replays must reproduce — a stateful rng here would
-// desync a replay the moment a frame boundary moved.
-uint32_t Pcg(uint32_t v) {
-  uint32_t s = v * 747796405u + 2891336453u;
-  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (w >> 22u) ^ w;
-}
-uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
-  return Pcg(a ^ Pcg(b ^ Pcg(c)));
-}
-// Uniform in [-1, 1) from a hash word.
-float SignedUnit(uint32_t h) {
-  return (float)(int32_t)(h & 0xFFFFu) / 32768.0f - 1.0f;
-}
+// sim/rng.h: a given (mob, limb, tick, index) always produces the same droplet.
+// Spray direction is presentation, but it is authored INTO the tick's spawn
+// stream, which replays must reproduce.
+using rng::Hash3;
+using rng::Pcg;
+using rng::SignedUnit;
 
 // Event-scoped variance, applied at the spray sites. Entity-scoped variances
 // were already resolved into mob.gore at spawn, so these pass through — this is
@@ -2826,11 +2817,7 @@ void MobSystem::AppendInstances(std::vector<BodyVoxInst>& out,
           limb.flipbookModel < (int)limb.frameVoxels.size() &&
           !limb.frameVoxels[limb.flipbookModel].empty())
         src = &limb.frameVoxels[limb.flipbookModel];
-      for (const DebrisVoxel& v : *src) {
-        if (out.size() >= kMaxBodyVoxInstances) break;
-        out.push_back({(float)v.x, (float)v.y, (float)v.z,
-                       (uint32_t)v.payload | (slot << 16)});
-      }
+      rigrender::AppendVoxInsts(out, slot, *src);
       slot++;
     }
   }
@@ -2842,12 +2829,7 @@ void MobSystem::AppendXforms(std::vector<BodyXformGpu>& out) const {
     for (const Limb& limb : mob.limbs) {
       if (!limb.body) continue;
       if (out.size() >= kMaxBodySlots) return;
-      BodyXformGpu x{};
-      x.pos[0] = limb.xf.pos.x;
-      x.pos[1] = limb.xf.pos.y;
-      x.pos[2] = limb.xf.pos.z;
-      std::memcpy(x.quat, limb.xf.quat, sizeof(x.quat));
-      out.push_back(x);
+      rigrender::AppendXform(out, limb.xf);
     }
   }
 }
@@ -2856,8 +2838,8 @@ void MobSystem::AppendXforms(std::vector<BodyXformGpu>& out) const {
 // ---- collision-box debug overlay (world.h DebugBox) -------------------------
 //
 // Draws the individual sub-shapes of each compound collider rather than one
-// big AABB per body. Falls back to the whole-shape AABB for non-compound
-// bodies (spheres).
+// big AABB per body. See rigrender::AppendDebugBoxesFor for why these come
+// from the Jolt shape rather than from the voxels that built it.
 void MobSystem::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
                                  uint32_t color) const {
   if (!phys_) return;
@@ -2866,37 +2848,8 @@ void MobSystem::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
     for (const Limb& limb : mob.limbs) {
       if (!limb.body) continue;
       if (out.size() >= limit) return;
-      const Quat bodyQ{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
-                       limb.xf.quat[3]};
-      subs.clear();
-      if (phys_->GetSubShapeBoxes(limb.body, subs, limit - out.size())) {
-        for (const SubShapeBox& ss : subs) {
-          DebugBox b{};
-          const Vec3 c = limb.xf.pos + QuatRotate(bodyQ, ss.center);
-          b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
-          b.half[0] = ss.halfExtents.x;
-          b.half[1] = ss.halfExtents.y;
-          b.half[2] = ss.halfExtents.z;
-          const Quat q = QuatNormalize(QuatMul(bodyQ, Quat{ss.quat[0], ss.quat[1], ss.quat[2], ss.quat[3]}));
-          b.quat[0] = q.x; b.quat[1] = q.y; b.quat[2] = q.z; b.quat[3] = q.w;
-          b.color = color;
-          out.push_back(b);
-        }
-      } else {
-        Vec3 lo, hi;
-        if (!phys_->GetLocalBounds(limb.body, lo, hi)) continue;
-        DebugBox b{};
-        const Vec3 mid{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
-                       (lo.z + hi.z) * 0.5f};
-        const Vec3 c = limb.xf.pos + QuatRotate(bodyQ, mid);
-        b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
-        b.half[0] = (hi.x - lo.x) * 0.5f;
-        b.half[1] = (hi.y - lo.y) * 0.5f;
-        b.half[2] = (hi.z - lo.z) * 0.5f;
-        std::memcpy(b.quat, limb.xf.quat, sizeof(b.quat));
-        b.color = color;
-        out.push_back(b);
-      }
+      rigrender::AppendDebugBoxesFor(out, *phys_, limb.body, limb.xf, limit,
+                                     color, subs);
     }
   }
 }

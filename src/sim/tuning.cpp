@@ -8,6 +8,7 @@
 
 // kDayPhaseMax / kDayPhaseMask — the day phase is defined alongside the other
 // world constants so the sim and the renderer share one definition.
+#include "sim/rng.h"
 #include "sim/world.h"
 
 using nlohmann::json;
@@ -185,26 +186,14 @@ const Tuning& CurrentTuning() { return g_current; }
 void SetCurrentTuning(const Tuning& t) { g_current = t; }
 
 // ---- variance draws ------------------------------------------------------
-// CPU mirror of common.wgsl's pcg/hash3 — the same one mob.cpp and debris.cpp
-// carry. Stateless and counter-based (CLAUDE.md rule 1): the draw is a pure
-// function of (seed, tick, index), so it is identical on every machine and a
-// replay reproduces it. Never seed this from a counter that advances with
-// frame boundaries or iteration order.
+// Hash from sim/rng.h: the draw is a pure function of (seed, tick, index), so
+// it is identical on every machine and a replay reproduces it. Never seed this
+// from a counter that advances with frame boundaries or iteration order.
 namespace {
 
-uint32_t VPcg(uint32_t v) {
-  uint32_t s = v * 747796405u + 2891336453u;
-  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (w >> 22u) ^ w;
-}
-uint32_t VHash3(uint32_t a, uint32_t b, uint32_t c) {
-  return VPcg(a ^ VPcg(b ^ VPcg(c)));
-}
-// Uniform in [0, 1). 24 bits is well inside f32's exact-integer range, so this
-// is reproducible bit-for-bit rather than merely close.
-float Unit01(uint32_t h) {
-  return (float)(h & 0x00FFFFFFu) / 16777216.0f;
-}
+using rng::Hash3;
+using rng::Pcg;
+using rng::Unit01;
 
 }  // namespace
 
@@ -216,7 +205,7 @@ float ApplyVariance(float base, const Variance& v, uint32_t seed, uint32_t tick,
   const bool entity = v.scope == Variance::kEntity;
   const uint32_t t = entity ? 0x5E17A11u : tick;
   const uint32_t i = entity ? 0x9E3779B9u : index;
-  const uint32_t h = VHash3(seed * 2654435761u + 0x9E3779B9u, t, i);
+  const uint32_t h = Hash3(seed * 2654435761u + 0x9E3779B9u, t, i);
 
   float off;
   if (v.dist == Variance::kUniform) {
@@ -226,7 +215,7 @@ float ApplyVariance(float base, const Variance& v, uint32_t seed, uint32_t tick,
     // form — no rejection loop, so it cannot vary in iteration count across
     // machines. u1 is nudged off zero because log(0) is -inf.
     const float u1 = Unit01(h) * 0.99999994f + 3e-8f;
-    const float u2 = Unit01(VPcg(h ^ 0xB10057u));
+    const float u2 = Unit01(Pcg(h ^ 0xB10057u));
     const float r = std::sqrt(-2.0f * std::log(u1));
     const float g = r * std::cos(6.28318530718f * u2);
     // Clamp the tail: `amount` is one sigma, and an unbounded gaussian on a
@@ -972,233 +961,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
 }
 
 std::string TuningWgslBlock(const Tuning& t) {
-  const auto& r = t.render;
-  const auto& s = t.sim;
-  const auto& w = t.worldgen;
   std::ostringstream o;
   o << "// GENERATED from assets/materials/tuning.json by TuningWgslBlock() —\n"
        "// do not edit here and do not redeclare these in any shader.\n";
 
-  // ---- sky / sun ----
-  EmitF(o, "TUNE_SKY_GRADIENT", r.skyGradient);
-  EmitF(o, "TUNE_SKY_HORIZON_OFFSET", r.skyHorizonOffset);
-  EmitV3(o, "TUNE_SKY_HORIZON", r.skyHorizon);
-  EmitV3(o, "TUNE_SKY_ZENITH", r.skyZenith);
-  EmitV3(o, "TUNE_SUN_TINT", r.sunTint);
-  EmitF(o, "TUNE_SUN_DISC_POWER", r.sunDiscPower);
-  EmitF(o, "TUNE_SUN_DISC_GAIN", r.sunDiscGain);
-  EmitF(o, "TUNE_SUN_HALO_POWER", r.sunHaloPower);
-  EmitF(o, "TUNE_SUN_HALO_GAIN", r.sunHaloGain);
-  EmitV3(o, "TUNE_SUN_COLOR", r.sunColor);
-  EmitF(o, "TUNE_SUN_INTENSITY", r.sunIntensity);
-
-  // ---- atmospheric sky ----
-  EmitF(o, "TUNE_SKY_RAYLEIGH", r.skyRayleigh);
-  EmitF(o, "TUNE_SKY_MIE", r.skyMie);
-  EmitF(o, "TUNE_SKY_MIE_G", r.skyMieG);
-  EmitF(o, "TUNE_SKY_MIE_STRENGTH", r.skyMieStrength);
-  EmitF(o, "TUNE_SKY_EXPOSURE", r.skyExposure);
-  EmitV3(o, "TUNE_SKY_GROUND", r.skyGround);
-  EmitF(o, "TUNE_SUN_SIZE", r.sunSize);
-  EmitF(o, "TUNE_SUN_REDDENING", r.sunReddening);
-
-  // ---- night sky ----
-  EmitV3(o, "TUNE_NIGHT_ZENITH", r.nightZenith);
-  EmitV3(o, "TUNE_NIGHT_HORIZON", r.nightHorizon);
-  EmitF(o, "TUNE_STAR_BRIGHTNESS", r.starBrightness);
-  EmitF(o, "TUNE_STAR_DENSITY", r.starDensity);
-  EmitF(o, "TUNE_STAR_SIZE", r.starSize);
-  EmitF(o, "TUNE_STAR_SPARSITY", r.starSparsity);
-  EmitF(o, "TUNE_STAR_TWINKLE", r.starTwinkle);
-  EmitF(o, "TUNE_MILKYWAY_STRENGTH", r.milkyWayStrength);
-  EmitV3(o, "TUNE_MILKYWAY_COLOR", r.milkyWayColor);
-  EmitF(o, "TUNE_NEBULA_STRENGTH", r.nebulaStrength);
-  EmitV3(o, "TUNE_NEBULA_COOL", r.nebulaCool);
-  EmitV3(o, "TUNE_NEBULA_WARM", r.nebulaWarm);
-  EmitF(o, "TUNE_AURORA_STRENGTH", r.auroraStrength);
-  EmitF(o, "TUNE_AURORA_HEIGHT", r.auroraHeight);
-  EmitV3(o, "TUNE_AURORA_LOW", r.auroraLow);
-  EmitV3(o, "TUNE_AURORA_HIGH", r.auroraHigh);
-
-  // ---- moon ----
-  EmitF(o, "TUNE_MOON_RADIUS", r.moonRadius);
-  EmitF(o, "TUNE_MOON_BRIGHTNESS", r.moonBrightness);
-  EmitV3(o, "TUNE_MOON_COLOR", r.moonColor);
-  EmitF(o, "TUNE_MOON_GLOW", r.moonGlow);
-  EmitF(o, "TUNE_MOON_EARTHSHINE", r.moonEarthshine);
-  EmitV3(o, "TUNE_MOON_LIGHT_COLOR", r.moonLightColor);
-  EmitF(o, "TUNE_MOON_LIGHT_INTENSITY", r.moonLightIntensity);
-
-  // ---- night ambient ----
-  EmitV3(o, "TUNE_NIGHT_AMB_SKY", r.nightAmbSky);
-  EmitV3(o, "TUNE_NIGHT_AMB_GROUND", r.nightAmbGround);
-
-  // ---- ambient / diffuse ----
-  EmitV3(o, "TUNE_AMB_SKY", r.ambSky);
-  EmitV3(o, "TUNE_AMB_GROUND", r.ambGround);
-  EmitF(o, "TUNE_DIFFUSE_WRAP", r.diffuseWrap);
-  EmitF(o, "TUNE_FACE_X", r.faceX);
-  EmitF(o, "TUNE_FACE_Z", r.faceZ);
-
-  // ---- AO / shadows ----
-  EmitF(o, "TUNE_AO_STRENGTH", r.aoStrength);
-  EmitF(o, "TUNE_AO_FAR", r.aoFar);
-  EmitF(o, "TUNE_SHADOW_BIAS", r.shadowBias);
-  EmitI(o, "TUNE_SHADOW_STEPS", r.shadowSteps);
-  EmitF(o, "TUNE_SHADOW_SOFT_NEAR", r.shadowSoftNear);
-  EmitF(o, "TUNE_SHADOW_SOFT_FAR", r.shadowSoftFar);
-  EmitF(o, "TUNE_SHADOW_LIFT", r.shadowLift);
-  EmitF(o, "TUNE_SHADOW_FAR_LIFT", r.shadowFarLift);
-
-  // ---- grain ----
-  EmitF(o, "TUNE_GRAIN_BROAD_SCALE", r.grainBroadScale);
-  EmitF(o, "TUNE_GRAIN_FINE_SCALE", r.grainFineScale);
-  EmitF(o, "TUNE_GRAIN_MIX", r.grainMix);
-  EmitF(o, "TUNE_GRAIN_AMP", r.grainAmp);
-  EmitF(o, "TUNE_GRAIN_AMP_FAR", r.grainAmpFar);
-
-  // ---- media / fire ----
-  EmitF(o, "TUNE_MEDIA_ABSORB", r.mediaAbsorb);
-  EmitF(o, "TUNE_MEDIA_TAU_MAX", r.mediaTauMax);
-  EmitF(o, "TUNE_FIRE_FLICKER_BASE", r.fireFlickerBase);
-  EmitF(o, "TUNE_FIRE_FLICKER_AMP", r.fireFlickerAmp);
-  EmitF(o, "TUNE_FIRE_FLICKER_RATE", r.fireFlickerRate);
-  EmitF(o, "TUNE_FIRE_GLOW_RATE", r.fireGlowRate);
-  EmitF(o, "TUNE_FIRE_INTENSITY", r.fireIntensity);
-  EmitF(o, "TUNE_FIRE_BREATHE_AMP", r.fireBreatheAmp);
-  EmitF(o, "TUNE_FIRE_BREATHE_RATE", r.fireBreatheRate);
-  EmitF(o, "TUNE_EMISSIVE_STRENGTH", r.emissiveStrength);
-  EmitF(o, "TUNE_EMISSIVE_FLICKER_BASE", r.emissiveFlickerBase);
-  EmitF(o, "TUNE_EMISSIVE_FLICKER_AMP", r.emissiveFlickerAmp);
-  EmitF(o, "TUNE_EMISSIVE_FLICKER_RATE", r.emissiveFlickerRate);
-
-  // ---- water ----
-  EmitF(o, "TUNE_WATER_F0", r.waterF0);
-  EmitV3(o, "TUNE_WATER_ABSORB", r.waterAbsorb);
-  EmitV3(o, "TUNE_WATER_SCATTER", r.waterScatter);
-  EmitF(o, "TUNE_WATER_FRESNEL_POWER", r.waterFresnelPower);
-  EmitF(o, "TUNE_RIPPLE_AMP_SCALE", r.rippleAmpScale);
-  EmitF(o, "TUNE_RIPPLE_SPEED_SCALE", r.rippleSpeedScale);
-  EmitF(o, "TUNE_WATER_FETCH_LOW", r.waterFetchLow);
-  EmitF(o, "TUNE_WATER_FETCH_HIGH", r.waterFetchHigh);
-  EmitF(o, "TUNE_REFLECTION_CUTOFF", r.reflectionCutoff);
-  EmitI(o, "TUNE_REFLECTION_STEPS", r.reflectionSteps);
-  EmitF(o, "TUNE_CAUSTIC_GAIN", r.causticGain);
-  EmitF(o, "TUNE_CAUSTIC_CAP", r.causticCap);
-  EmitF(o, "TUNE_GLINT_INTENSITY", r.glintIntensity);
-  EmitF(o, "TUNE_GLINT_POWER_NEAR", r.glintPowerNear);
-  EmitF(o, "TUNE_GLINT_POWER_FAR", r.glintPowerFar);
-  EmitF(o, "TUNE_FOAM_DEPTH", r.foamDepth);
-  EmitF(o, "TUNE_FOAM_STRENGTH", r.foamStrength);
-  EmitF(o, "TUNE_ICE_F0", r.iceF0);
-  EmitF(o, "TUNE_ICE_FRESNEL_POWER", r.iceFresnelPower);
-  EmitF(o, "TUNE_ICE_ABSORB", r.iceAbsorb);
-  EmitF(o, "TUNE_ICE_ABSORB_FLOOR", r.iceAbsorbFloor);
-  EmitF(o, "TUNE_ICE_SCATTER", r.iceScatter);
-  EmitF(o, "TUNE_ICE_SCATTER_DEPTH", r.iceScatterDepth);
-  EmitF(o, "TUNE_ICE_SCATTER_NIGHT", r.iceScatterNight);
-  EmitF(o, "TUNE_ICE_GRAIN", r.iceGrain);
-  EmitF(o, "TUNE_ICE_GRAIN_SCALE", r.iceGrainScale);
-  EmitF(o, "TUNE_ICE_GLOSS", r.iceGloss);
-  EmitF(o, "TUNE_ICE_SPEC", r.iceSpec);
-  EmitF(o, "TUNE_ICE_DEPTH_MAX", r.iceDepthMax);
-  EmitF(o, "TUNE_ICE_REFLECT_MIN", r.iceReflectMin);
-
-  // ---- blood / viscous liquids ----
-  EmitF(o, "TUNE_BLOOD_F0", r.bloodF0);
-  EmitF(o, "TUNE_BLOOD_GRAZE", r.bloodGraze);
-  EmitF(o, "TUNE_BLOOD_ABSORB", r.bloodAbsorb);
-  EmitF(o, "TUNE_BLOOD_TRANSMIT", r.bloodTransmit);
-  EmitF(o, "TUNE_BLOOD_MAX_TRANSMIT", r.bloodMaxTransmit);
-  EmitF(o, "TUNE_BLOOD_DEPTH_RAMP", r.bloodDepthRamp);
-  EmitF(o, "TUNE_BLOOD_POOL_LOW", r.bloodPoolLow);
-  EmitF(o, "TUNE_BLOOD_POOL_HIGH", r.bloodPoolHigh);
-  EmitF(o, "TUNE_BLOOD_SMOOTH", r.bloodSmooth);
-  EmitF(o, "TUNE_BLOOD_EDGE_FEATHER", r.bloodEdgeFeather);
-  EmitF(o, "TUNE_BLOOD_WOBBLE", r.bloodWobble);
-  EmitF(o, "TUNE_BLOOD_SHEEN", r.bloodSheen);
-  EmitF(o, "TUNE_BLOOD_SHEEN_DROP", r.bloodSheenDrop);
-  EmitF(o, "TUNE_BLOOD_SHEEN_POOL", r.bloodSheenPool);
-  EmitF(o, "TUNE_BLOOD_AMBIENT_SHEEN", r.bloodAmbientSheen);
-  EmitF(o, "TUNE_BLOOD_EDGE_DEPTH", r.bloodEdgeDepth);
-  EmitF(o, "TUNE_BLOOD_EDGE_STRENGTH", r.bloodEdgeStrength);
-  EmitV3(o, "TUNE_BLOOD_EDGE_TINT", r.bloodEdgeTint);
-
-  // ---- stains ----
-  EmitF(o, "TUNE_STAIN_COVERAGE", r.stainCoverage);
-  EmitF(o, "TUNE_STAIN_MOTTLE", r.stainMottle);
-  EmitF(o, "TUNE_STAIN_MOTTLE_SCALE", r.stainMottleScale);
-  EmitF(o, "TUNE_STAIN_DARKEN", r.stainDarken);
-  EmitF(o, "TUNE_STAIN_OPACITY", r.stainOpacity);
-  EmitF(o, "TUNE_STAIN_SHEEN", r.stainSheen);
-  EmitF(o, "TUNE_STAIN_SHEEN_POWER", r.stainSheenPower);
-
-  // ---- lava / embers ----
-  EmitF(o, "TUNE_LAVA_CRACK_FREQ", r.lavaCrackFreq);
-  EmitF(o, "TUNE_LAVA_CRACK_KNEE_LOW", r.lavaCrackKneeLow);
-  EmitF(o, "TUNE_LAVA_CRACK_KNEE_HIGH", r.lavaCrackKneeHigh);
-  EmitF(o, "TUNE_LAVA_WARM_BIAS", r.lavaWarmBias);
-  EmitF(o, "TUNE_LAVA_EMISSION_GAIN", r.lavaEmissionGain);
-  EmitF(o, "TUNE_LAVA_PULSE_AMP", r.lavaPulseAmp);
-  EmitF(o, "TUNE_LAVA_PULSE_RATE", r.lavaPulseRate);
-  EmitF(o, "TUNE_HEAT_SPILL_STRENGTH", r.heatSpillStrength);
-  EmitF(o, "TUNE_EMBER_BRIGHTNESS", r.emberBrightness);
-  EmitF(o, "TUNE_EMBER_RISE", r.emberRise);
-  EmitF(o, "TUNE_EMBER_RATE", r.emberRate);
-  EmitU(o, "TUNE_EMBER_DENSITY", r.emberDensity);
-
-  // ---- tonemap / budgets ----
-  EmitF(o, "TUNE_EXPOSURE_WHITE", r.exposureWhite);
-  EmitF(o, "TUNE_BLEACH_AMOUNT", r.bleachAmount);
-  EmitF(o, "TUNE_GAMMA", r.gamma);
-  // ---- static micro-detail ----
-  EmitF(o, "TUNE_MICRO_LOD_DIST", r.microLodDist);
-  EmitI(o, "TUNE_MICRO_MAX_PER_RAY", r.microMaxPerRay);
-
-  EmitI(o, "TUNE_PRIMARY_STEPS", r.primarySteps);
-  EmitI(o, "TUNE_FAR_STEPS", r.farSteps);
-
-  // ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
-  o << "// sim constants below feed voxel state: integer-only, and any change\n"
-       "// here changes the world hash (re-run --selftest).\n";
-  EmitI(o, "TUNE_PART_GRAVITY", s.partGravity);
-  EmitI(o, "TUNE_PART_MAX_VEL", s.partMaxVel);
-  EmitI(o, "TUNE_AIR_DENSITY", s.airDensity);
-  EmitI(o, "TUNE_FALLOFF_PER_CELL", s.falloffPerCell);
-  EmitU(o, "TUNE_EJECT_SOLID", s.ejectSolid);
-  EmitU(o, "TUNE_EJECT_LIQUID", s.ejectLiquid);
-  EmitU(o, "TUNE_EJECT_POWDER", s.ejectPowder);
-  EmitU(o, "TUNE_EJECT_GAS", s.ejectGas);
-  EmitU(o, "TUNE_LIQUID_EQUALIZE", s.liquidEqualize);
-  EmitU(o, "TUNE_WANDER_HOP_MASK", s.wanderHopMask);
-  EmitU(o, "TUNE_EXP_MICRO_PERMILLE", s.expMicroPerMille);
-  EmitU(o, "TUNE_EXP_MICRO_LIFE", s.expMicroLifeTicks);
-  EmitU(o, "TUNE_EXP_MICRO_SCALE_IDX", s.expMicroScaleIdx);
-
-  // ---- worldgen (integer; needs a world regen to take effect) ----
-  EmitI(o, "TUNE_TREELINE", w.treeline);
-  EmitI(o, "TUNE_BASE_HEIGHT", w.baseHeight);
-  EmitI(o, "TUNE_HILL_AMPLITUDE", w.hillAmplitude);
-  EmitI(o, "TUNE_HILL_WAVELENGTH", w.hillWavelength);
-  EmitI(o, "TUNE_DETAIL_AMPLITUDE", w.detailAmplitude);
-  EmitI(o, "TUNE_DETAIL_WAVELENGTH", w.detailWavelength);
-  EmitI(o, "TUNE_BIOME_SCALE", w.biomeScale);
-  EmitU(o, "TUNE_DESERT_THRESHOLD", w.desertThreshold);
-  EmitU(o, "TUNE_PINE_THRESHOLD", w.pineThreshold);
-  EmitU(o, "TUNE_MEADOW_THRESHOLD", w.meadowThreshold);
-  EmitI(o, "TUNE_TREE_TILE", w.treeTile);
-  EmitU(o, "TUNE_TREE_CHANCE_FOREST", w.treeChanceForest);
-  EmitU(o, "TUNE_TREE_CHANCE_PINE", w.treeChancePine);
-  EmitU(o, "TUNE_TREE_CHANCE_MEADOW", w.treeChanceMeadow);
-  EmitU(o, "TUNE_TREE_CHANCE_DESERT", w.treeChanceDesert);
-  EmitU(o, "TUNE_AUTUMN_FRACTION", w.autumnFraction);
-  EmitI(o, "TUNE_POND_TILE", w.pondTile);
-  EmitU(o, "TUNE_POND_CHANCE", w.pondChance);
-  EmitI(o, "TUNE_POND_RADIUS_MIN", w.pondRadiusMin);
-  EmitU(o, "TUNE_POND_RADIUS_SPAN", w.pondRadiusSpan);
-  EmitU(o, "TUNE_RUIN_CHANCE", w.ruinChance);
-  EmitU(o, "TUNE_CAVE_THRESHOLD1", w.caveThreshold1);
-  EmitU(o, "TUNE_CAVE_THRESHOLD2", w.caveThreshold2);
+  // Every constant, its type and its WGSL name come from the one table in
+  // sim/tuning_params.def, which scripts/tuning_prelude.py is also generated
+  // from. Adding a knob that shaders can see is now a single row there plus a
+  // declaration in tuning.h -- it is no longer possible to emit a constant the
+  // offline validator does not know about, or vice versa.
+#define TP_F(group, member, name, def) EmitF(o, #name, t.group.member);
+#define TP_I(group, member, name, def) EmitI(o, #name, t.group.member);
+#define TP_U(group, member, name, def) EmitU(o, #name, t.group.member);
+#define TP_V3(group, member, name, ...) EmitV3(o, #name, t.group.member);
+#include "sim/tuning_params.def"
+#undef TP_V3
+#undef TP_U
+#undef TP_I
+#undef TP_F
 
   return o.str();
 }

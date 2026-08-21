@@ -1,0 +1,25 @@
+{
+  "_about": "Which gates already fail, so a run can tell you what is YOURS. See tests/BASELINE.md for why each one is here and how to update it.",
+  "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti",
+
+  "determinism": "pass",
+  "sleep": "pass",
+  "pond-freeze": "fail",
+  "evaporation": "pass",
+  "blood-stain": "pass",
+  "flung-liquid": "pass",
+  "far-fog": "pass",
+  "far-downsample": "pass",
+  "screenshots": "pass",
+  "player-walk": "pass",
+  "debris": "pass",
+  "prefab": "pass",
+  "mob": "fail",
+  "settle-back": "pass",
+  "player-body": "pass",
+  "save-load": "pass",
+  "region-store": "pass",
+  "streaming": "pass",
+  "spells": "pass",
+  "perf": "pass"
+}

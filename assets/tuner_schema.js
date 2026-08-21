@@ -2,9 +2,12 @@
    tuning.json parameter schema — the single description of every knob.
    ==========================================================================
    tuner.html builds its entire Tuning UI from this table, and nothing else
-   knows the parameter list. Adding a knob means: add the field to
-   src/sim/tuning.{h,cpp}, add it to scripts/tuning_prelude.py (so shader
-   validation matches the engine), and add a row here.
+   knows the parameter list. Adding a knob means: declare it in src/sim/tuning.h,
+   read it in LoadTuning (src/sim/tuning.cpp), and add a row here. If SHADERS
+   need to see it, add a row to src/sim/tuning_params.def too and re-run
+   `python scripts/gen_tuning_prelude.py` — that table is the single source for
+   the TUNE_* constants the engine emits and the shader checker validates
+   against.
 
    Row fields:
      k     key inside the group object in tuning.json

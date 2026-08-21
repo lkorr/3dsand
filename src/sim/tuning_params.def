@@ -1,0 +1,253 @@
+// The ONE table of shader-facing tuning parameters.
+//
+// Every row here used to be written out by hand in THREE places that had to
+// agree and that nothing checked: the Emit* call in TuningWgslBlock()
+// (sim/tuning.cpp), the SPEC row in scripts/tuning_prelude.py, and the default
+// in both of those. A row present in one and missing from the other meant
+// shaders that validate offline and then fail to build for real, or — worse —
+// a shader silently compiled against a default the engine never uses.
+//
+// Include this with TP_F / TP_I / TP_U / TP_V3 defined to whatever you need,
+// then #undef them. scripts/tuning_prelude.py is GENERATED from this file by
+// scripts/gen_tuning_prelude.py, so the Python side cannot drift at all.
+//
+// Columns: (group, member, WGSL name, default...)
+//   group  the Tuning sub-struct AND the tuning.json object name — they are
+//          always the same string; LoadTuning relies on it.
+//   member the C++ member inside that sub-struct, which is ALSO the JSON key.
+//   TUNE_* the WGSL constant name. Conventionally TUNE_ + SNAKE(member), but
+//          four rows predate that rule and keep their authored names.
+//
+// The DECLARATIONS and the doc comments live in sim/tuning.h, and the reads
+// (with their per-parameter clamping and warnings) live in LoadTuning. This
+// table deliberately does not try to absorb either: the comments in tuning.h
+// are the reason that file is readable, and the clamps are real logic, not
+// boilerplate.
+//
+// A default changed here changes it for the engine AND for offline shader
+// validation at once. Values in the `sim` and `worldgen` groups feed the CA:
+// changing one changes the world hash, so re-run --selftest (CLAUDE.md rule 1).
+
+// clang-format off
+
+
+// ---- sky / sun ----
+TP_F(render, skyGradient, TUNE_SKY_GRADIENT, 1.4f)
+TP_F(render, skyHorizonOffset, TUNE_SKY_HORIZON_OFFSET, 0.25f)
+TP_V3(render, skyHorizon, TUNE_SKY_HORIZON, 0.72f, 0.8f, 0.9f)
+TP_V3(render, skyZenith, TUNE_SKY_ZENITH, 0.25f, 0.47f, 0.85f)
+TP_V3(render, sunTint, TUNE_SUN_TINT, 1.0f, 0.9f, 0.7f)
+TP_F(render, sunDiscPower, TUNE_SUN_DISC_POWER, 800.0f)
+TP_F(render, sunDiscGain, TUNE_SUN_DISC_GAIN, 3.0f)
+TP_F(render, sunHaloPower, TUNE_SUN_HALO_POWER, 8.0f)
+TP_F(render, sunHaloGain, TUNE_SUN_HALO_GAIN, 0.12f)
+TP_V3(render, sunColor, TUNE_SUN_COLOR, 1.0f, 0.95f, 0.86f)
+TP_F(render, sunIntensity, TUNE_SUN_INTENSITY, 1.35f)
+
+// ---- atmospheric sky ----
+TP_F(render, skyRayleigh, TUNE_SKY_RAYLEIGH, 12.0f)
+TP_F(render, skyMie, TUNE_SKY_MIE, 1.0f)
+TP_F(render, skyMieG, TUNE_SKY_MIE_G, 0.76f)
+TP_F(render, skyMieStrength, TUNE_SKY_MIE_STRENGTH, 1.0f)
+TP_F(render, skyExposure, TUNE_SKY_EXPOSURE, 1.6f)
+TP_V3(render, skyGround, TUNE_SKY_GROUND, 0.22f, 0.2f, 0.17f)
+TP_F(render, sunSize, TUNE_SUN_SIZE, 3.0f)
+TP_F(render, sunReddening, TUNE_SUN_REDDENING, 1.0f)
+
+// ---- night sky ----
+TP_V3(render, nightZenith, TUNE_NIGHT_ZENITH, 0.006f, 0.01f, 0.028f)
+TP_V3(render, nightHorizon, TUNE_NIGHT_HORIZON, 0.03f, 0.036f, 0.062f)
+TP_F(render, starBrightness, TUNE_STAR_BRIGHTNESS, 1.0f)
+TP_F(render, starDensity, TUNE_STAR_DENSITY, 150.0f)
+TP_F(render, starSize, TUNE_STAR_SIZE, 0.85f)
+TP_F(render, starSparsity, TUNE_STAR_SPARSITY, 0.012f)
+TP_F(render, starTwinkle, TUNE_STAR_TWINKLE, 0.35f)
+TP_F(render, milkyWayStrength, TUNE_MILKYWAY_STRENGTH, 0.55f)
+TP_V3(render, milkyWayColor, TUNE_MILKYWAY_COLOR, 0.52f, 0.56f, 0.78f)
+TP_F(render, nebulaStrength, TUNE_NEBULA_STRENGTH, 0.4f)
+TP_V3(render, nebulaCool, TUNE_NEBULA_COOL, 0.16f, 0.3f, 0.62f)
+TP_V3(render, nebulaWarm, TUNE_NEBULA_WARM, 0.55f, 0.2f, 0.38f)
+TP_F(render, auroraStrength, TUNE_AURORA_STRENGTH, 0.55f)
+TP_F(render, auroraHeight, TUNE_AURORA_HEIGHT, 900.0f)
+TP_V3(render, auroraLow, TUNE_AURORA_LOW, 0.1f, 0.85f, 0.45f)
+TP_V3(render, auroraHigh, TUNE_AURORA_HIGH, 0.65f, 0.2f, 0.85f)
+
+// ---- moon ----
+TP_F(render, moonRadius, TUNE_MOON_RADIUS, 0.03f)
+TP_F(render, moonBrightness, TUNE_MOON_BRIGHTNESS, 1.6f)
+TP_V3(render, moonColor, TUNE_MOON_COLOR, 0.92f, 0.93f, 0.88f)
+TP_F(render, moonGlow, TUNE_MOON_GLOW, 0.35f)
+TP_F(render, moonEarthshine, TUNE_MOON_EARTHSHINE, 0.055f)
+TP_V3(render, moonLightColor, TUNE_MOON_LIGHT_COLOR, 0.55f, 0.68f, 1.0f)
+TP_F(render, moonLightIntensity, TUNE_MOON_LIGHT_INTENSITY, 0.16f)
+
+// ---- night ambient ----
+TP_V3(render, nightAmbSky, TUNE_NIGHT_AMB_SKY, 0.055f, 0.075f, 0.135f)
+TP_V3(render, nightAmbGround, TUNE_NIGHT_AMB_GROUND, 0.022f, 0.026f, 0.042f)
+
+// ---- ambient / diffuse ----
+TP_V3(render, ambSky, TUNE_AMB_SKY, 0.4f, 0.48f, 0.62f)
+TP_V3(render, ambGround, TUNE_AMB_GROUND, 0.25f, 0.22f, 0.17f)
+TP_F(render, diffuseWrap, TUNE_DIFFUSE_WRAP, 0.55f)
+TP_F(render, faceX, TUNE_FACE_X, 0.96f)
+TP_F(render, faceZ, TUNE_FACE_Z, 0.92f)
+
+// ---- AO / shadows ----
+TP_F(render, aoStrength, TUNE_AO_STRENGTH, 0.45f)
+TP_F(render, aoFar, TUNE_AO_FAR, 0.72f)
+TP_F(render, shadowBias, TUNE_SHADOW_BIAS, 0.02f)
+TP_I(render, shadowSteps, TUNE_SHADOW_STEPS, 384)
+TP_F(render, shadowSoftNear, TUNE_SHADOW_SOFT_NEAR, 0.6f)
+TP_F(render, shadowSoftFar, TUNE_SHADOW_SOFT_FAR, 9.0f)
+TP_F(render, shadowLift, TUNE_SHADOW_LIFT, 0.45f)
+TP_F(render, shadowFarLift, TUNE_SHADOW_FAR_LIFT, 0.3f)
+
+// ---- grain ----
+TP_F(render, grainBroadScale, TUNE_GRAIN_BROAD_SCALE, 11.0f)
+TP_F(render, grainFineScale, TUNE_GRAIN_FINE_SCALE, 2.5f)
+TP_F(render, grainMix, TUNE_GRAIN_MIX, 0.68f)
+TP_F(render, grainAmp, TUNE_GRAIN_AMP, 0.065f)
+TP_F(render, grainAmpFar, TUNE_GRAIN_AMP_FAR, 0.05f)
+
+// ---- media / fire ----
+TP_F(render, mediaAbsorb, TUNE_MEDIA_ABSORB, 6.4f)
+TP_F(render, mediaTauMax, TUNE_MEDIA_TAU_MAX, 6.0f)
+TP_F(render, fireFlickerBase, TUNE_FIRE_FLICKER_BASE, 0.7f)
+TP_F(render, fireFlickerAmp, TUNE_FIRE_FLICKER_AMP, 0.55f)
+TP_F(render, fireFlickerRate, TUNE_FIRE_FLICKER_RATE, 13.0f)
+TP_F(render, fireGlowRate, TUNE_FIRE_GLOW_RATE, 1.4f)
+TP_F(render, fireIntensity, TUNE_FIRE_INTENSITY, 2.1f)
+TP_F(render, fireBreatheAmp, TUNE_FIRE_BREATHE_AMP, 0.08f)
+TP_F(render, fireBreatheRate, TUNE_FIRE_BREATHE_RATE, 5.3f)
+TP_F(render, emissiveStrength, TUNE_EMISSIVE_STRENGTH, 1.7f)
+TP_F(render, emissiveFlickerBase, TUNE_EMISSIVE_FLICKER_BASE, 0.82f)
+TP_F(render, emissiveFlickerAmp, TUNE_EMISSIVE_FLICKER_AMP, 0.28f)
+TP_F(render, emissiveFlickerRate, TUNE_EMISSIVE_FLICKER_RATE, 9.0f)
+
+// ---- water ----
+TP_F(render, waterF0, TUNE_WATER_F0, 0.0204f)
+TP_V3(render, waterAbsorb, TUNE_WATER_ABSORB, 1.85f, 0.42f, 0.2f)
+TP_V3(render, waterScatter, TUNE_WATER_SCATTER, 0.045f, 0.16f, 0.2f)
+TP_F(render, waterFresnelPower, TUNE_WATER_FRESNEL_POWER, 5.0f)
+TP_F(render, rippleAmpScale, TUNE_RIPPLE_AMP_SCALE, 0.35f)
+TP_F(render, rippleSpeedScale, TUNE_RIPPLE_SPEED_SCALE, 0.4f)
+TP_F(render, waterFetchLow, TUNE_WATER_FETCH_LOW, 0.35f)
+TP_F(render, waterFetchHigh, TUNE_WATER_FETCH_HIGH, 0.85f)
+TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f)
+TP_I(render, reflectionSteps, TUNE_REFLECTION_STEPS, 96)
+TP_F(render, causticGain, TUNE_CAUSTIC_GAIN, 1.5f)
+TP_F(render, causticCap, TUNE_CAUSTIC_CAP, 0.85f)
+TP_F(render, glintIntensity, TUNE_GLINT_INTENSITY, 0.85f)
+TP_F(render, glintPowerNear, TUNE_GLINT_POWER_NEAR, 180.0f)
+TP_F(render, glintPowerFar, TUNE_GLINT_POWER_FAR, 900.0f)
+TP_F(render, foamDepth, TUNE_FOAM_DEPTH, 0.42f)
+TP_F(render, foamStrength, TUNE_FOAM_STRENGTH, 0.55f)
+TP_F(render, iceF0, TUNE_ICE_F0, 0.021f)
+TP_F(render, iceFresnelPower, TUNE_ICE_FRESNEL_POWER, 5.0f)
+TP_F(render, iceAbsorb, TUNE_ICE_ABSORB, 3.2f)
+TP_F(render, iceAbsorbFloor, TUNE_ICE_ABSORB_FLOOR, 0.06f)
+TP_F(render, iceScatter, TUNE_ICE_SCATTER, 0.3f)
+TP_F(render, iceScatterDepth, TUNE_ICE_SCATTER_DEPTH, 1.6f)
+TP_F(render, iceScatterNight, TUNE_ICE_SCATTER_NIGHT, 0.25f)
+TP_F(render, iceGrain, TUNE_ICE_GRAIN, 0.09f)
+TP_F(render, iceGrainScale, TUNE_ICE_GRAIN_SCALE, 0.35f)
+TP_F(render, iceGloss, TUNE_ICE_GLOSS, 190.0f)
+TP_F(render, iceSpec, TUNE_ICE_SPEC, 0.55f)
+TP_F(render, iceDepthMax, TUNE_ICE_DEPTH_MAX, 3.0f)
+TP_F(render, iceReflectMin, TUNE_ICE_REFLECT_MIN, 0.12f)
+
+// ---- blood / viscous liquids ----
+TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.03f)
+TP_F(render, bloodGraze, TUNE_BLOOD_GRAZE, 0.55f)
+TP_F(render, bloodAbsorb, TUNE_BLOOD_ABSORB, 55.0f)
+TP_F(render, bloodTransmit, TUNE_BLOOD_TRANSMIT, 0.35f)
+TP_F(render, bloodMaxTransmit, TUNE_BLOOD_MAX_TRANSMIT, 0.06f)
+TP_F(render, bloodDepthRamp, TUNE_BLOOD_DEPTH_RAMP, 22.0f)
+TP_F(render, bloodPoolLow, TUNE_BLOOD_POOL_LOW, 0.18f)
+TP_F(render, bloodPoolHigh, TUNE_BLOOD_POOL_HIGH, 0.55f)
+TP_F(render, bloodSmooth, TUNE_BLOOD_SMOOTH, 1.0f)
+TP_F(render, bloodEdgeFeather, TUNE_BLOOD_EDGE_FEATHER, 0.1f)
+TP_F(render, bloodWobble, TUNE_BLOOD_WOBBLE, 0.004f)
+TP_F(render, bloodSheen, TUNE_BLOOD_SHEEN, 1.15f)
+TP_F(render, bloodSheenDrop, TUNE_BLOOD_SHEEN_DROP, 32.0f)
+TP_F(render, bloodSheenPool, TUNE_BLOOD_SHEEN_POOL, 220.0f)
+TP_F(render, bloodAmbientSheen, TUNE_BLOOD_AMBIENT_SHEEN, 0.35f)
+TP_F(render, bloodEdgeDepth, TUNE_BLOOD_EDGE_DEPTH, 0.035f)
+TP_F(render, bloodEdgeStrength, TUNE_BLOOD_EDGE_STRENGTH, 0.65f)
+TP_V3(render, bloodEdgeTint, TUNE_BLOOD_EDGE_TINT, 0.55f, 0.4f, 0.38f)
+
+// ---- stains ----
+TP_F(render, stainCoverage, TUNE_STAIN_COVERAGE, 1.35f)
+TP_F(render, stainMottle, TUNE_STAIN_MOTTLE, 0.85f)
+TP_F(render, stainMottleScale, TUNE_STAIN_MOTTLE_SCALE, 0.55f)
+TP_F(render, stainDarken, TUNE_STAIN_DARKEN, 0.55f)
+TP_F(render, stainOpacity, TUNE_STAIN_OPACITY, 0.7f)
+TP_F(render, stainSheen, TUNE_STAIN_SHEEN, 0.55f)
+TP_F(render, stainSheenPower, TUNE_STAIN_SHEEN_POWER, 90.0f)
+
+// ---- lava / embers ----
+TP_F(render, lavaCrackFreq, TUNE_LAVA_CRACK_FREQ, 2.4f)
+TP_F(render, lavaCrackKneeLow, TUNE_LAVA_CRACK_KNEE_LOW, 0.5f)
+TP_F(render, lavaCrackKneeHigh, TUNE_LAVA_CRACK_KNEE_HIGH, 0.9f)
+TP_F(render, lavaWarmBias, TUNE_LAVA_WARM_BIAS, 0.035f)
+TP_F(render, lavaEmissionGain, TUNE_LAVA_EMISSION_GAIN, 1.9f)
+TP_F(render, lavaPulseAmp, TUNE_LAVA_PULSE_AMP, 0.06f)
+TP_F(render, lavaPulseRate, TUNE_LAVA_PULSE_RATE, 0.9f)
+TP_F(render, heatSpillStrength, TUNE_HEAT_SPILL_STRENGTH, 0.16f)
+TP_F(render, emberBrightness, TUNE_EMBER_BRIGHTNESS, 2.2f)
+TP_F(render, emberRise, TUNE_EMBER_RISE, 26.0f)
+TP_F(render, emberRate, TUNE_EMBER_RATE, 3.4f)
+TP_U(render, emberDensity, TUNE_EMBER_DENSITY, 84)
+
+// ---- tonemap / budgets ----
+TP_F(render, exposureWhite, TUNE_EXPOSURE_WHITE, 4.2f)
+TP_F(render, bleachAmount, TUNE_BLEACH_AMOUNT, 0.9f)
+TP_F(render, gamma, TUNE_GAMMA, 2.2f)
+
+// ---- static micro-detail ----
+TP_F(render, microLodDist, TUNE_MICRO_LOD_DIST, 40.0f)
+TP_I(render, microMaxPerRay, TUNE_MICRO_MAX_PER_RAY, 8)
+TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096)
+TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
+
+// ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
+TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22)
+TP_I(sim, partMaxVel, TUNE_PART_MAX_VEL, 1536)
+TP_I(sim, airDensity, TUNE_AIR_DENSITY, 10)
+TP_I(sim, falloffPerCell, TUNE_FALLOFF_PER_CELL, 6)
+TP_U(sim, ejectSolid, TUNE_EJECT_SOLID, 250)
+TP_U(sim, ejectLiquid, TUNE_EJECT_LIQUID, 500)
+TP_U(sim, ejectPowder, TUNE_EJECT_POWDER, 350)
+TP_U(sim, ejectGas, TUNE_EJECT_GAS, 0)
+TP_U(sim, liquidEqualize, TUNE_LIQUID_EQUALIZE, 2)
+TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7)
+TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900)
+TP_U(sim, expMicroLifeTicks, TUNE_EXP_MICRO_LIFE, 40)
+TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
+
+// ---- worldgen (integer; needs a world regen to take effect) ----
+TP_I(worldgen, treeline, TUNE_TREELINE, 72)
+TP_I(worldgen, baseHeight, TUNE_BASE_HEIGHT, 32)
+TP_I(worldgen, hillAmplitude, TUNE_HILL_AMPLITUDE, 42)
+TP_I(worldgen, hillWavelength, TUNE_HILL_WAVELENGTH, 64)
+TP_I(worldgen, detailAmplitude, TUNE_DETAIL_AMPLITUDE, 12)
+TP_I(worldgen, detailWavelength, TUNE_DETAIL_WAVELENGTH, 16)
+TP_I(worldgen, biomeScale, TUNE_BIOME_SCALE, 384)
+TP_U(worldgen, desertThreshold, TUNE_DESERT_THRESHOLD, 214)
+TP_U(worldgen, pineThreshold, TUNE_PINE_THRESHOLD, 176)
+TP_U(worldgen, meadowThreshold, TUNE_MEADOW_THRESHOLD, 92)
+TP_I(worldgen, treeTile, TUNE_TREE_TILE, 144)
+TP_U(worldgen, treeChanceForest, TUNE_TREE_CHANCE_FOREST, 78)
+TP_U(worldgen, treeChancePine, TUNE_TREE_CHANCE_PINE, 70)
+TP_U(worldgen, treeChanceMeadow, TUNE_TREE_CHANCE_MEADOW, 22)
+TP_U(worldgen, treeChanceDesert, TUNE_TREE_CHANCE_DESERT, 6)
+TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
+TP_I(worldgen, pondTile, TUNE_POND_TILE, 224)
+TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
+TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 20)
+TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 17)
+TP_U(worldgen, ruinChance, TUNE_RUIN_CHANCE, 5)
+TP_U(worldgen, caveThreshold1, TUNE_CAVE_THRESHOLD1, 150)
+TP_U(worldgen, caveThreshold2, TUNE_CAVE_THRESHOLD2, 148)
+
+// clang-format on

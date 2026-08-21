@@ -1,0 +1,504 @@
+diff --git a/assets/materials/tuning.json b/assets/materials/tuning.json
+index df0f70c..d004c27 100644
+--- a/assets/materials/tuning.json
++++ b/assets/materials/tuning.json
+@@ -26,7 +26,9 @@
+     "halfWidth": 0.3,
+     "halfHeight": 0.85,
+     "eyeOffset": 0.65,
+-    "viewSmoothHalflife": 0.1
++    "viewSmoothHalflife": 0.1,
++    "unstickMaxDepth": 0.9,
++    "unstickSpeed": 3.0
+   },
+   "camera": {
+     "mouseSensitivity": 0.0022,
+@@ -54,6 +56,8 @@
+     "enabled": true,
+     "turnRate": 12.0,
+     "turnMinSpeed": 0.35,
++    "velocityHalflife": 0.08,
++    "firstPersonTurnHalflife": 0.05,
+     "firstPersonArms": true,
+     "footTrim": 0.0,
+     "severImpulse": 6.0,
+diff --git a/assets/tuner_schema.js b/assets/tuner_schema.js
+index 18abfbd..ec5fe30 100644
+--- a/assets/tuner_schema.js
++++ b/assets/tuner_schema.js
+@@ -80,6 +80,8 @@ const TUNING_SCHEMA = [
+       {k:'halfHeight', n:'body half-height', d:'Half the body height (0.85 = a 1.7 m player).', min:0.2, max:3, step:0.01, u:'m', warn:'Collision geometry. Must stay well under 3 chunks or collision breaks.'},
+       {k:'eyeOffset', n:'eye height', d:'Camera offset above the AABB centre.', min:-1, max:2, step:0.01, u:'m'},
+       {k:'viewSmoothHalflife', n:'step view smoothing', d:'Half-life of the camera catching up after the body steps up/down a ledge. Render-only; the body still steps instantly. 0 disables.', min:0, max:0.4, step:0.005, u:'s'},
++      {k:'unstickMaxDepth', n:'unstick depth', d:'How deep the body may be buried in solid voxels and still be lifted clear. Collision sweeps are a hard veto that fails from an overlapping start, so a body that ends up INSIDE the ground cannot move on any axis until something pushes it out — that is the "stuck on noisy terrain until you noclip" case. Past this depth you stay buried, because being entombed by a collapse is a real state and teleporting out of it would be the worse bug. 0 disables the ejection.', min:0, max:3, step:0.05, u:'m'},
++      {k:'unstickSpeed', n:'unstick speed', d:'How fast the body rises while being ejected from ground it is inside. Rate-limited rather than teleported so a shallow lift glides instead of popping; the climb is banked into the same view smoothing a step-up uses. Very high values approach an instant snap.', min:0.1, max:20, step:0.1, u:'m/s'},
+     ],
+   },
+ 
+@@ -132,6 +134,8 @@ const TUNING_SCHEMA = [
+       {k:'firstPersonArms', n:'first-person arms', d:'In first person the body is hidden so you are not looking at the inside of your own hat — but the arms, hands and staff are kept, which is most of what sells having a body. Off hides everything.', bool:true},
+       {k:'turnRate', n:'turn rate', d:'How fast the body swings around to face where it is going. In first person the body always faces the camera; in third it turns toward its MOTION, which is what stops the character moon-walking sideways across the screen.', min:1, max:40, step:0.5, u:'rad/s'},
+       {k:'turnMinSpeed', n:'turn threshold', d:'Below this speed the body holds its last facing instead of chasing a near-zero velocity vector, which would make it spin on the spot when you stop.', min:0, max:3, step:0.05, u:'m/s'},
++      {k:'velocityHalflife', n:'motion smoothing', d:'Half-life of the rig’s own speed measurement. That one number drives cadence, bob, sway, roll, the walk/run clip choice, the spring goals AND the swing budget, so noise in it is amplified into every one of them at once — which is what jittery, spazzing limbs actually are. Longer is calmer but makes the gait slower to react to a stop or a sprint; 0 uses the raw per-tick measurement.', min:0, max:0.5, step:0.005, u:'s'},
++      {k:'firstPersonTurnHalflife', n:'first-person turn smoothing', d:'Half-life of the body yaw catching up to the camera in FIRST person (third person has its own turn rate above). The body is hidden here but the arms are not, and they are welded to the torso — so a hard snap steps them across the view in jumps on every fast mouse turn. Keep this short: too long and the arms visibly trail the crosshair. 0 restores the old instant snap.', min:0, max:0.3, step:0.005, u:'s'},
+       {k:'footTrim', n:'foot trim', d:'Vertical nudge of the whole avatar against the player collision box. The rig’s feet should already land on the box’s bottom face; this is the trim for art whose contact point is not exactly at its origin.', min:-1, max:1, step:0.01, u:'m'},
+       {k:'severImpulse', n:'sever impulse', d:'Extra shove given to a part as it comes off, on top of whatever the hit imparted. Higher values throw limbs dramatically; 0 lets them simply drop.', min:0, max:40, step:0.5},
+       {k:'respawnDelay', n:'respawn delay', d:'How long the corpse lies there before the avatar is rebuilt. The severed parts stay in the world as ordinary debris either way — they are DebrisSystem’s from the moment they come off.', min:0, max:20, step:0.5, u:'s'},
+diff --git a/src/game/avatar.cpp b/src/game/avatar.cpp
+index 807d08e..f714742 100644
+--- a/src/game/avatar.cpp
++++ b/src/game/avatar.cpp
+@@ -656,17 +656,46 @@ void PlayerAvatar::UpdateAirPose(float dt) {
+   if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
+ }
+ 
+-void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded) {
++void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
++                                   const Vec3& playerVel) {
+   const AnimSkeleton& sk = def_->skel;
+   AnimState& st = anim_;
+   if (sk.parts.empty()) return;
+   st.partAlive.resize(sk.parts.size(), 1);
+   st.springs.resize(sk.parts.size(), SpringState{});
+ 
+-  Vec3 delta = origin_ - st.lastPos;
+-  st.lastPos = origin_;
+-  Vec3 planar{delta.x / std::max(dt, 1e-4f), 0, delta.z / std::max(dt, 1e-4f)};
+-  st.velocity = st.velocity * 0.7f + planar * 0.3f;
++  // THE VELOCITY COMES FROM THE PLAYER, NOT FROM DIFFERENCING OUR OWN ORIGIN.
++  //
++  // This is the jitter. A mob differences its position because it moves itself,
++  // one step per tick, so the delta is always exactly one tick of travel. The
++  // avatar does not: Player::Update runs once per FRAME at real dt, while this
++  // runs 0..4 times per frame inside the fixed-tick loop. So the delta over
++  // `kTickDt` is measuring the wrong interval every single frame —
++  //
++  //   * two ticks in one frame: the first sees the whole frame's travel (too
++  //     fast), the SECOND sees zero, because the player has not moved since.
++  //   * zero ticks: the measurement is simply stale.
++  //   * one tick: too fast or too slow depending on how dt compares to kTickDt.
++  //
++  // The result is a speed that slams between roughly double the truth and zero
++  // at frame rate. And `speedNow_` is not some minor readout — it drives the
++  // gait cadence, the bob/sway/roll amplitudes, the walk/run clip selection, the
++  // spring goals and the swing-duration budget. Every one of those oscillates
++  // together, which is exactly the "character spazzes, hands move like crazy"
++  // report. It is not a tuning problem and no amount of extra filtering downstream
++  // would have fixed it, because the signal itself was garbage.
++  //
++  // The player already knows its velocity exactly. Use it.
++  st.lastPos = origin_;  // still tracked: other code reads it as "where we were"
++  Vec3 planar{playerVel.x, 0, playerVel.z};
++  // Frame-rate independent smoothing, on a half-life rather than a bare
++  // per-call lerp. The old `0.7/0.3` blend was per CALL, so its time constant
++  // scaled with how many ticks happened to fire — the same class of bug as the
++  // measurement above, and it would have made the gait feel different at 30 and
++  // 144 fps even with a clean velocity.
++  const float hl = CurrentTuning().avatar.velocityHalflife;
++  float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
++  st.velocity = st.velocity + (planar - st.velocity) * k;
+   speedNow_ = Vec3{st.velocity.x, 0, st.velocity.z}.len();
+   float speedFactor =
+       std::clamp(speedNow_ / std::max(def_->speed, 0.01f), 0.0f, 1.5f);
+@@ -828,7 +857,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
+                    player.pos.z - def.worldSize.z * 0.5f};
+     heading_ = heading;
+ 
+-    UpdateAnimation(dt, world, player.grounded);
++    UpdateAnimation(dt, world, player.grounded, player.vel);
+ 
+     // ---- air state clips ----
+     // Grounded transitions drive jump/land; sustained air drives fall. Kept
+@@ -1037,6 +1066,19 @@ int32_t PlayerAvatar::TotalHealth() const {
+   return sum <= 0 ? 0 : (int32_t)sum;
+ }
+ 
++int32_t PlayerAvatar::HealthMax() const {
++  // The AUTHORED total, read straight back off the def rather than cached at
++  // spawn: an intact avatar's TotalHealth() must equal this, and taking both
++  // numbers from the same source is what guarantees it. A severed limb lowers
++  // TotalHealth but NOT this, so the HUD bar shows the missing chunk instead of
++  // silently rescaling itself to the smaller body.
++  if (!def_) return 0;
++  float sum = 0;
++  for (const MobLimbDef& ld : def_->limbs)
++    if (ld.hp > 0) sum += ld.hp;
++  return sum <= 0 ? 0 : (int32_t)sum;
++}
++
+ void PlayerAvatar::SpendHealth(int32_t amount) {
+   if (!spawned_ || !alive_ || amount <= 0) return;
+   // Spread the cost across live parts in proportion to what each still has,
+diff --git a/src/game/avatar.h b/src/game/avatar.h
+index fc28170..c22b037 100644
+--- a/src/game/avatar.h
++++ b/src/game/avatar.h
+@@ -155,6 +155,11 @@ class PlayerAvatar {
+   // Health is the summed hp of every LIVE part, rounded to an integer because
+   // the caster VM is integer throughout (thesis 3 in spell.h).
+   int32_t TotalHealth() const;
++  // The authored total across every limb — the HUD bar's denominator. Health
++  // NEVER regenerates, so this is a ceiling the player only moves away from;
++  // it is deliberately not lowered by severing, so a lost limb reads as a
++  // permanently short bar rather than as a full one on a smaller body.
++  int32_t HealthMax() const;
+   // Spend health across live parts, proportionally to what each still has.
+   // Distributing rather than draining one part keeps a mana overdraw from
+   // arbitrarily severing whichever limb happens to be first in the list.
+@@ -254,7 +259,15 @@ class PlayerAvatar {
+   // WALKING system — it only means anything when there is a floor under the
+   // feet — so it is a parameter here rather than something UpdateAnimation
+   // infers, and the airborne pose is handled explicitly (see UpdateAirPose).
+-  void UpdateAnimation(float dt, World& world, bool grounded);
++  //
++  // `playerVel` is the player's TRUE velocity (world voxels/sec). It is passed
++  // in rather than differenced from origin_ because the player moves once per
++  // FRAME while this runs 0..4 times per frame — so a position delta over
++  // kTickDt measures the wrong interval every frame and reads zero on the
++  // second tick of a double-tick frame. See the note at the top of
++  // UpdateAnimation; that mismeasurement was the source of the limb jitter.
++  void UpdateAnimation(float dt, World& world, bool grounded,
++                       const Vec3& playerVel);
+   void UpdateGait(float dt, World& world);
+   // Airborne leg pose: relaxes the legs toward their rest hang instead of
+   // leaving IK chasing a stale world-space foot plant.
+diff --git a/src/game/player.cpp b/src/game/player.cpp
+index c17eae4..5282666 100644
+--- a/src/game/player.cpp
++++ b/src/game/player.cpp
+@@ -145,6 +145,37 @@ float GroundProbe(const Vec3& pos, float reach, const Player::KindFn& kindAt) {
+   return pos.y - test.y;
+ }
+ 
++// DE-PENETRATION: lift the body out of ground it is already inside.
++//
++// Every sweep in this file is a hard VETO — SweepAxis refuses any substep that
++// ENDS overlapping a solid. That is correct while the body starts outside the
++// world, and it is a trap the moment it does not: once the AABB overlaps a
++// voxel, the very first substep of every axis fails, including the upward ones,
++// so nothing can move at all. The player is welded in place until they noclip
++// out. Getting there is routine rather than exotic — the CA drops a powder into
++// your feet, a step-down settle lands a fraction inside a face, a reaction grows
++// a solid where you stand — which is why walking noisy ground gets stuck so
++// often. No amount of tuning the sweeps helps, because the sweeps are working
++// as designed; what was missing is a way back OUT.
++//
++// So: scan upward in half-voxel increments for the first position that is free
++// and return how far up it is, or -1 if there is no free spot inside `maxRise`.
++// Upward only, and capped: a player standing shin-deep in a drift is lifted
++// clear, while one buried under a collapse stays buried (being entombed is a
++// real state the world can put you in, and teleporting out of it would be a
++// worse bug than being stuck). The cap is a caller's policy decision, not a
++// constant here.
++float UnstickRise(const Vec3& pos, float maxRise, const Player::KindFn& kindAt) {
++  if (!Collides(pos, kindAt)) return -1.0f;  // not stuck: nothing to do
++  const float kProbeStep = 0.5f;
++  for (float rise = kProbeStep; rise <= maxRise + 1e-4f; rise += kProbeStep) {
++    Vec3 test = pos;
++    test.y += rise;
++    if (!Collides(test, kindAt)) return rise;
++  }
++  return -1.0f;  // buried deeper than the cap allows: leave them in it
++}
++
+ // Try to advance horizontally by (dx, dz) using the classic Quake/Source
+ // three-attempt step move, and take whichever attempt travelled farther
+ // horizontally. Returns the height climbed IN VOXELS (0 if the flat move won).
+@@ -227,6 +258,36 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
+       viewYOffset = 0.0f;  // knob at 0 disables smoothing entirely
+   }
+ 
++  // ---- unstick: eject a body that is already inside solid ground ----
++  //
++  // Runs BEFORE anything else moves, because every sweep below is a veto that
++  // fails outright from an overlapping start (see UnstickRise). Skipped in fly
++  // mode, where passing through solids is the whole point.
++  //
++  // The lift is RATE-LIMITED rather than teleported: a whole step height in one
++  // frame reads as a pop, and the cases this fires on are usually a voxel or two
++  // deep, so at a few m/s the eye barely registers it. It also self-limits — the
++  // moment the AABB is clear, UnstickRise returns -1 and this stops. The vertical
++  // velocity is cancelled on the way out so a body that was falling into the
++  // ground does not immediately drive itself back in, and the climb is banked
++  // into viewYOffset exactly like a step-up so the camera glides rather than
++  // jumps.
++  if (!fly) {
++    const float maxRise = T().unstickMaxDepth / kVoxelMeters;
++    float rise = UnstickRise(pos, maxRise, kindAt);
++    if (rise > 0.0f) {
++      float step = std::min(rise, (T().unstickSpeed / kVoxelMeters) * dt);
++      pos.y += step;
++      viewYOffset -= step;
++      if (vel.y < 0.0f) vel.y = 0.0f;
++      // Being lifted out counts as standing on the thing you were inside:
++      // without this the frame reports airborne, which strobes every
++      // grounded-gated system for as long as the ejection takes.
++      grounded = true;
++      coyoteTimer = T().coyoteTime;
++    }
++  }
++
+   // How much of the body is in liquid? Sample a fixed number of points spread
+   // over the body's actual height, so coverage does not depend on voxel size.
+   int liquidCells = 0;
+diff --git a/src/main.cpp b/src/main.cpp
+index eddae15..252fb42 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1846,6 +1846,103 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
+     walkOk = player.grounded && std::abs(feet - (float)(h + 1)) < 4.0f;
+     std::printf("player walk: %s (grounded=%d feet y=%.1f, terrain h=%d)\n",
+                 walkOk ? "PASS" : "FAIL", player.grounded ? 1 : 0, feet, h);
++
++    // ---- UNSTICK: a body inside solid ground must climb back out -----------
++    //
++    // Every collision sweep in player.cpp is a hard VETO — it refuses any
++    // substep that ENDS overlapping a solid. That is correct from outside the
++    // world and a trap from inside it: once the AABB overlaps a voxel, the
++    // FIRST substep of every axis fails, including the upward ones, so the
++    // player cannot move at all and has to noclip out. On noisy terrain you get
++    // there constantly (a powder settles into your feet, a step-down lands a
++    // fraction inside a face), which is what made walking rough ground feel
++    // like it kept swallowing you.
++    //
++    // Two halves, and the second matters as much as the first: shallow burial
++    // must eject, and DEEP burial must NOT — being entombed is a real state the
++    // world can put you in, and teleporting out of it would be the worse bug.
++    // Testing only the ejection would pass with an unconditional escape hatch.
++    bool unstickOk = false;
++    if (walkOk) {
++      const Vec3 standing = player.pos;
++      // (a) shallow: sink the body two voxels into the floor it is standing on
++      // and require it to rise clear within a second of ticks.
++      player.pos.y = standing.y - 2.0f;
++      player.vel = Vec3{0, 0, 0};
++      for (int i = 0; i < 30; i++)
++        player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
++                      Vec3{1, 0, 0}, kindAt);
++      // Clear means the AABB no longer overlaps: the surest statement of that
++      // from out here is that the body got back to roughly where it was
++      // standing, rather than staying where we buried it.
++      float roseTo = player.pos.y;
++      bool shallowFreed = roseTo > standing.y - 0.75f;
++
++      // (b) deep: drop the body below the surface far enough that the ejection
++      // cap refuses it, and require it to STAY there.
++      //
++      // DEPTH IS BOUNDED BY THE CPU MIRROR, not just by the cap. The mirror is
++      // 3x3x3 chunks around the player's last SubmitTick position, and past it
++      // KindAt returns Unknown — which Collides() does not treat as blocking.
++      // So a body dropped 25 voxels down (the first version of this fixture)
++      // is not entombed at all: it is in Unknown space, free to move, and
++      // "did not move" passed for entirely the wrong reason. 14 voxels is
++      // comfortably past unstickMaxDepth (0.9 m = 9 voxels) while staying
++      // inside the one chunk below the player that the mirror actually holds.
++      player.pos = Vec3{standing.x, standing.y - 14.0f, standing.z};
++      player.vel = Vec3{0, 0, 0};
++      float buriedAt = player.pos.y;
++      // ...and CONFIRM the fixture actually buries it. "Did not move" passes
++      // trivially if the body is somewhere it was never stuck — a cave, or
++      // (the trap that caught the first version of this gate) Unknown space
++      // outside the CPU mirror, which Collides() does not treat as blocking.
++      //
++      // Sample INSIDE the AABB, not around it: the question is whether the
++      // capsule is packed in rock. Only Solid counts, so an Unknown reading
++      // fails the fixture rather than silently standing in for rock.
++      // The precondition to assert is the DIRECT one — is the body overlapping
++      // solid? — not a proxy for it. Counting surrounding rock invites an
++      // arbitrary threshold that real terrain (caves, pockets) fails for
++      // reasons that have nothing to do with the behaviour under test. Sweep a
++      // zero-length move instead: SweepAxis returns blocked exactly when the
++      // AABB it lands in overlaps a solid, which is the same test the movement
++      // code itself is stuck on. Probing every cell the box spans is what
++      // Collides does, so a hit anywhere in the span is a real overlap.
++      int solidAround = 0, sampled = 0;
++      {
++        const float hx = Player::kHalfXZ, hy = Player::kHalfY;
++        for (int y = ifloor(player.pos.y - hy); y <= ifloor(player.pos.y + hy);
++             y++)
++          for (int z = ifloor(player.pos.z - hx);
++               z <= ifloor(player.pos.z + hx); z++)
++            for (int x = ifloor(player.pos.x - hx);
++                 x <= ifloor(player.pos.x + hx); x++) {
++              sampled++;
++              if (kindAt({x, y, z}) == CellKind::Solid) solidAround++;
++            }
++      }
++      // For this half to mean anything the body must really be overlapping —
++      // otherwise the sweeps were never vetoing anything and "did not move"
++      // says nothing. Whether the cap then refuses the lift is what the drift
++      // assertion below measures; both together are the statement that a
++      // too-deep body stays put BECAUSE it is too deep.
++      bool reallyBuried = solidAround > 0;
++      for (int i = 0; i < 30; i++)
++        player.Update(1.0f / 30.0f, PlayerInput{}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
++                      Vec3{1, 0, 0}, kindAt);
++      float buriedDrift = std::abs(player.pos.y - buriedAt);
++      bool deepStaysBuried = buriedDrift < 2.0f;
++
++      unstickOk = shallowFreed && deepStaysBuried && reallyBuried;
++      std::printf(
++          "player unstick: %s (sunk 2.0 vox -> rose %.2f, buried 14 vox in "
++          "%d/%d solid -> moved %.2f)\n",
++          unstickOk ? "PASS" : "FAIL", roseTo - (standing.y - 2.0f),
++          solidAround, sampled, buriedDrift);
++    } else {
++      std::printf("player unstick: SKIP (walk gate failed first)\n");
++    }
++    walkOk = walkOk && unstickOk;
+   }
+ 
+   // M6 debris: build a stone arm held up by one pillar, blast the pillar,
+@@ -2732,8 +2829,18 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
+           // +Z is FORWARD at heading 0 — walk the way the body faces. Driving
+           // +X here walked the avatar sideways, which is not a gait the game
+           // can ever show and is not what the pose assertions below describe.
++          // The avatar reads the player's OWN velocity now rather than
++          // differencing its origin (see UpdateAnimation), so a test that
++          // teleports pl.pos has to state the velocity that teleport
++          // represents — otherwise the rig is told it is standing still while
++          // being dragged forward, and every speed-gated system (gait,
++          // walk/run clips, springs) sits at zero. Stating it is also the more
++          // honest fixture: this loop is simulating a player walking, and a
++          // walking player has a velocity.
++          const float kWalkStepZ = 0.2f;
++          pl.vel = Vec3{0, 0, kWalkStepZ / kTickDt};
+           for (int i = 0; i < 60; i++) {
+-            pl.pos.z += 0.2f;
++            pl.pos.z += kWalkStepZ;
+             avTick();
+             for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
+               footfalls++;
+@@ -2861,6 +2968,10 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
+           float maxLegSwing[2] = {-999.0f, -999.0f};
+           const float walkStep =
+               (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
++          // State the velocity this teleport represents — the avatar reads the
++          // player's own vel now, not a position difference. See the note at
++          // the first walk loop above.
++          pl.vel = Vec3{0, 0, walkStep / kTickDt};
+           for (int i = 0; i < 90; i++) {
+             pl.pos.z += walkStep;   // forward at heading 0, see swingOf above
+             avTick();
+@@ -2967,6 +3078,12 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
+           float worstLegUp = -1e9f;
+           {
+             pl.grounded = false;
++            // Straight down, so drop the forward velocity the walk loops left
++            // set. Only the planar part feeds the gait and the gait is off in
++            // the air anyway, but a "falling" fixture that still claims to be
++            // running forward is a trap for the next person to read it.
++            pl.vel.x = 0;
++            pl.vel.z = 0;
+             const int hipParts[2] = {avatar.PartIndex("legU.L"),
+                                      avatar.PartIndex("legU.R")};
+             const int feet[2] = {avatar.PartIndex("foot.L"),
+@@ -4559,16 +4676,28 @@ int main(int argc, char** argv) {
+         float d = wantHeading - avatarHeading;
+         while (d > 3.14159265f) d -= 6.2831853f;
+         while (d < -3.14159265f) d += 6.2831853f;
+-        // FIRST PERSON DOES NOT EASE. The rate limit exists so a third-person
+-        // body pivots on its feet instead of snapping to face its travel
+-        // direction. In first person there is no body to watch turn — the
+-        // camera IS the head, so any lag means the torso is yawed away from
+-        // the view while the arms stay welded to the torso. Both of them then
+-        // hang off to one side of the screen until the ease catches up, which
+-        // at turnRate 12 rad/s is most of a fast mouse turn. Snapping is
+-        // correct here: the thing the lag was protecting is off-screen.
++        // FIRST PERSON EASES ON A SHORT HALF-LIFE, NOT ON turnRate.
++        //
++        // The third-person rate limit exists so the body pivots on its feet
++        // instead of snapping to face its travel direction, and applying that
++        // same 12 rad/s limit in first person is wrong for the reason it always
++        // was: the torso ends up yawed away from the view for most of a fast
++        // mouse turn, with the arms welded to it, hanging off one side of the
++        // screen. But snapping outright is not right either — the arms ARE
++        // on-screen, so an instant yaw step moves them across the view in a
++        // hard jump every tick you turn, which is a visible part of the "hands
++        // move like crazy" report.
++        //
++        // A half-life is the right shape for this where a rate limit is not: it
++        // is proportional, so a small turn is followed almost exactly (no
++        // perceptible lag) while a fast flick is smeared over a few ticks
++        // instead of stepping. Set the knob to 0 to get the old hard snap back.
+         if (camMode == CameraMode::First) {
+-          avatarHeading = wantHeading;
++          const float hl = av.firstPersonTurnHalflife;
++          if (hl > 1e-4f)
++            avatarHeading += d * (1.0f - std::pow(0.5f, kTickDt / hl));
++          else
++            avatarHeading = wantHeading;
+         } else {
+           float maxStep = av.turnRate * kTickDt;
+           avatarHeading += std::clamp(d, -maxStep, maxStep);
+diff --git a/src/sim/tuning.cpp b/src/sim/tuning.cpp
+index 12d204f..b5ca1a3 100644
+--- a/src/sim/tuning.cpp
++++ b/src/sim/tuning.cpp
+@@ -358,6 +358,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
+     ReadF(*g, "halfHeight", p.halfHeight, out, at);
+     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);
+     ReadF(*g, "viewSmoothHalflife", p.viewSmoothHalflife, out, at);
++    ReadF(*g, "unstickMaxDepth", p.unstickMaxDepth, out, at);
++    ReadF(*g, "unstickSpeed", p.unstickSpeed, out, at);
+   }
+ 
+   if (const json* g = Find(j, "camera")) {
+@@ -394,6 +396,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
+     ReadB(*g, "enabled", a.enabled, out, at);
+     ReadF(*g, "turnRate", a.turnRate, out, at);
+     ReadF(*g, "turnMinSpeed", a.turnMinSpeed, out, at);
++    ReadF(*g, "velocityHalflife", a.velocityHalflife, out, at);
++    ReadF(*g, "firstPersonTurnHalflife", a.firstPersonTurnHalflife, out, at);
+     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
+     ReadF(*g, "footTrim", a.footTrim, out, at);
+     ReadF(*g, "severImpulse", a.severImpulse, out, at);
+diff --git a/src/sim/tuning.h b/src/sim/tuning.h
+index 869ce01..2ca372a 100644
+--- a/src/sim/tuning.h
++++ b/src/sim/tuning.h
+@@ -122,6 +122,21 @@ struct Tuning {
+     // ledge (Player::ViewEyePos). 0 disables. CPU/render only — the physics
+     // position and the sim are untouched.
+     float viewSmoothHalflife = 0.10f;
++    // ---- unstick (de-penetration) ----
++    // Every collision sweep is a hard veto that fails from an overlapping
++    // start, so a body that ends up INSIDE solid ground cannot move on any
++    // axis — it is welded there until noclip. These control the way out.
++    //
++    // How deep (meters) the body may be buried and still be lifted clear.
++    // Beyond this it stays put: being entombed by a collapse is a real state,
++    // and teleporting out of it would be worse than being stuck. About a step
++    // height and a half covers the cases that actually happen (a powder
++    // settling into your feet, a step-down landing a fraction inside a face).
++    float unstickMaxDepth = 0.9f;
++    // How fast (m/s) the body rises while being ejected. Rate-limited rather
++    // than teleported so a two-voxel lift is a glide, not a pop; the climb is
++    // banked into the same view offset a step-up uses.
++    float unstickSpeed = 3.0f;
+   } player;
+ 
+   // ---- camera ----
+@@ -192,6 +207,22 @@ struct Tuning {
+     // in meters. The rig's own feet should land on the box's bottom face; this
+     // is the trim for art whose contact point is not exactly at its origin.
+     float footTrim = 0.0f;
++    // ---- motion smoothing ----
++    // The rig's own measured speed drives cadence, bob, sway, roll, the
++    // walk/run clip choice, the spring goals and the swing budget — so any
++    // noise in it is amplified into every one of those at once. Half-life in
++    // seconds (frame-rate independent): the measurement covers half the
++    // remaining distance to the truth every this-many seconds. 0 disables the
++    // smoothing entirely and uses the raw per-tick measurement.
++    float velocityHalflife = 0.08f;
++    // Half-life (seconds) of the FIRST-PERSON body yaw. Third person has its
++    // own rate limit (turnRate above) because you are watching the body pivot;
++    // first person used to snap outright, on the reasoning that the body is
++    // off-screen — but the ARMS are not, and they are welded to the torso, so
++    // a fast mouse turn steps them across the view in hard jumps. A short
++    // half-life keeps them attached to the view without visible lag. 0 restores
++    // the old hard snap.
++    float firstPersonTurnHalflife = 0.05f;
+     // Damage/dismemberment feel.
+     float severImpulse = 6.0f;   // extra shove given to a part as it comes off
+     // How long the corpse's parts stay before the avatar can respawn, seconds.

@@ -6,6 +6,7 @@
 
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
+#include "sim/rng.h"
 
 namespace {
 
@@ -57,16 +58,10 @@ constexpr uint32_t kBurnRebuildVoxels = 12;
 // enough matter has actually left to plausibly disconnect the remainder.
 constexpr uint32_t kShatterCheckVoxels = 6;
 
-// CPU mirror of common.wgsl pcg/hash3 — counter-based, stateless, so burn
-// rolls replay identically for a given (body serial, tick, voxel, rule).
-uint32_t Pcg(uint32_t v) {
-  uint32_t s = v * 747796405u + 2891336453u;
-  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (w >> 22u) ^ w;
-}
-uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
-  return Pcg(a ^ Pcg(b ^ Pcg(c)));
-}
+// sim/rng.h — so burn rolls replay identically for a given
+// (body serial, tick, voxel, rule).
+using rng::Hash3;
+using rng::Pcg;
 
 uint32_t LocalKey(int x, int y, int z) {
   return (uint32_t)(x & 0xFF) | ((uint32_t)(y & 0xFF) << 8) |
