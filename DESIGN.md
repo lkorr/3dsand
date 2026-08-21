@@ -507,6 +507,46 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     stain only ever increases, which is what makes it decisively subcritical.
   - Write reach is exactly one face neighbour, so it stays inside the colour
     lattice's guarantee, and both rolls come from the stateless hash.
+
+- **Absorption and washing (2026-08-21):** two behaviours layered on staining,
+  both authored as data, that turn "water marks the ground" into "ground drinks
+  water until it cannot".
+  ```json
+  { "id": "grass", "class": "solid", ..., "absorb": { "capacity": 12 } }
+  { "id": "water", "class": "liquid", ...,
+    "stain": { "type": "wet", "amount": 15, "chance": 260, "washes": true } }
+  ```
+  - **Capacity is authored on the SUBSTRATE, not on the liquid.** This is the
+    part worth defending: the liquid's `amount` is the per-contact STEP (how
+    fast it soaks) and the ground's `capacity` is the CEILING (how much it
+    holds). They are genuinely different axes — the same rain soaks into sand
+    quickly but shallowly, into loam slowly but deeply — and the effective depth
+    is `min(amount, capacity)`. Authoring the ceiling per material PAIR would be
+    exactly the N×M explosion tags exist to avoid. Capacity 0 (every material
+    predating this, all stone) means the liquid never soaks in and pools at once.
+  - **Absorbing SPENDS the liquid**: one eighth of the source cell's fullness
+    per successful contact, in the same units `stepLiquid` speaks, and the cell
+    dies when it gives its last. Without that debit the puddle would stain the
+    ground and then sit there full forever — which is not absorption, and was
+    the behaviour before this. So a puddle on dry grass drains INTO the grass,
+    and only once the ground beneath is saturated does water persist on top.
+  - `washes` makes a liquid RINSE a foreign stain (step its amount down toward
+    0) instead of overwriting it. Water over blood-soaked ground would otherwise
+    relabel the blood as "wet" at full strength: the colour would change but the
+    mess would never come out.
+  - Both fit in `stainPack`'s spare bits (27..30 capacity, 31 washes), so the
+    64-byte `Material` still did not grow.
+  - **Sleep discipline (rule 2)** survives because every step is monotone toward
+    a bounded fixed point: stain rises only to `min(amount, capacity)`, a washed
+    stain falls only to 0, absorbed fullness falls only to 0. Nothing ever
+    increases the work remaining, so `progress` latches false and a saturated
+    puddle on saturated ground sleeps. This is also why saturation is TERMINAL
+    and there is no drying-out rule: a cell that could both wet and dry would
+    never reach a fixed point, and those chunks would never sleep again.
+  - Absorption writes SELF, which the stain rule otherwise never does. Reach is
+    still ≤1 cell so the lattice argument holds, and the write sets the substep
+    stamp so the movement code cannot also move the cell and double-spend the
+    eighth.
   - Fixing this surfaced a PRE-EXISTING rule-2 bug: the `moveEvery > 1`
     viscosity gate re-dirtied its chunk unconditionally on every off-tick, so
     a settled pool of ANY viscous liquid (lava included) could never sleep. It

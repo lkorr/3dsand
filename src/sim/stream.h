@@ -13,13 +13,14 @@
 class Simulation;
 struct GpuContext;
 
-// ---- chunk RLE (16-bit voxel words, stamp bytes stripped) ----
+// ---- chunk RLE (32-bit voxel words, stamp bytes stripped) ----
 // Shared by streaming eviction and the region-file save format (chunkstore /
-// worldio).
-void RleEncodeChunk(const uint32_t* words, std::vector<uint16_t>& out);
+// worldio). The word is 32-bit so the STAIN layer (bits 24..30) round-trips:
+// it is hashed sim state, and a 16-bit store dropped it silently on save.
+void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out);
 // out must hold kChunkVol words; returns false on malformed input.
 // Decoded voxels get stamp 0xFF ("hasn't acted"): everything may move.
-bool RleDecodeChunk(const uint16_t* rle, size_t pairs, uint32_t* out);
+bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out);
 
 // Toroidal residency manager (M2/M7): recenters the resident cube on the
 // player one chunk at a time. A shift reads the leaving plane back

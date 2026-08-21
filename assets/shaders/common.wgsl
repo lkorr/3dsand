@@ -53,6 +53,12 @@ struct Material {
   //   bits 3..6   : amount added per successful contact, 1..15
   //   bits 7..16  : per-mille chance per tick to stain a touching neighbour
   //   bits 17..26 : per-mille chance that a stain CONSUMES the voxel (to air)
+  //   bits 27..30 : ABSORB CAPACITY 0..15 — how much stain THIS material soaks
+  //                 up before a liquid pools on top of it. Authored on the
+  //                 SUBSTRATE ("absorb"), so it is read off the NEIGHBOUR being
+  //                 stained, never off the stainer.
+  //   bit  31     : WASHES — this liquid rinses foreign stains out instead of
+  //                 overwriting them with its own.
   // stainColor: RGBA8 the renderer composites for THIS material's stain type.
   // Both are authored in materials.json under "stain" (see materials.h).
   stainPack   : u32,
@@ -64,6 +70,12 @@ fn matStainType(m : Material)    -> u32 { return m.stainPack & 0x7u; }
 fn matStainAmount(m : Material)  -> u32 { return (m.stainPack >> 3u) & 0xFu; }
 fn matStainChance(m : Material)  -> u32 { return (m.stainPack >> 7u) & 0x3FFu; }
 fn matStainConsume(m : Material) -> u32 { return (m.stainPack >> 17u) & 0x3FFu; }
+// Read off the SUBSTRATE, not the stainer: how deep a stain this material will
+// take before it is saturated and the liquid has to pool on top instead.
+fn matAbsorbCapacity(m : Material) -> u32 { return (m.stainPack >> 27u) & 0xFu; }
+fn matAbsorbs(m : Material) -> bool { return ((m.stainPack >> 27u) & 0xFu) != 0u; }
+// Does this liquid rinse foreign stains out rather than repaint them?
+fn matWashes(m : Material) -> bool { return (m.stainPack & 0x80000000u) != 0u; }
 // Does this material stain what it touches at all? One comparison, so the sim
 // can reject the overwhelmingly common "no" before doing any other work.
 fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
