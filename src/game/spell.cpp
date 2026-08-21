@@ -6,21 +6,16 @@
 
 #include <nlohmann/json.hpp>
 
+#include "sim/rng.h"
+
 using nlohmann::json;
 
 namespace {
 
-// Counter-based hash, identical in shape to the one mob.cpp uses and to the
-// sim shaders' hash3. Stateless by construction: a stateful stream here would
-// desync a replay the moment a frame boundary moved.
-uint32_t Pcg(uint32_t v) {
-  uint32_t s = v * 747796405u + 2891336453u;
-  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (w >> 22u) ^ w;
-}
-uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
-  return Pcg(a ^ Pcg(b ^ Pcg(c)));
-}
+// Counter-based, stateless (sim/rng.h): a stateful stream here would desync a
+// replay the moment a frame boundary moved.
+using rng::Hash3;
+using rng::Pcg;
 
 BackfireKind ParseBackfire(const std::string& s) {
   if (s == "burn") return BackfireKind::Burn;

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Emit the WGSL tuning constants, mirroring TuningWgslBlock() in tuning.cpp.
 
+GENERATED FILE -- do not edit. The table lives in src/sim/tuning_params.def
+and this file is produced from it by scripts/gen_tuning_prelude.py, which is
+also what keeps the names, the TYPES and the DEFAULTS identical to the ones
+the engine compiles in. Edit the .def and re-run the generator.
+
 check_shaders.sh has to compile each shader exactly the way LoadShader() does,
-and LoadShader now prepends this block after the world prelude. Rather than
-re-parse JSON in bash, the script shells out here. The NAMES and TYPES below
-must stay in step with src/sim/tuning.cpp — a name that exists in one and not
-the other shows up as an "unresolved identifier" from tint, which is the
-failure mode we want (loud, at validation time) rather than a silent drift.
+and LoadShader prepends this block after the world prelude. Rather than
+re-parse JSON in bash, the script shells out here.
 
 Values are read from assets/materials/tuning.json; anything missing falls back
 to the same default the C++ struct carries, so the two agree on a partial file.
@@ -18,11 +20,12 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TUNING = os.path.join(ROOT, "assets", "materials", "tuning.json")
 
-# (group, key, wgsl_name, kind) — kind is 'f', 'i', 'u' or 'v3'.
+# (group, key, wgsl_name, kind, default) -- kind is 'f', 'i', 'u' or 'v3'.
 SPEC = [
+    # sky / sun
     ("render", "skyGradient", "TUNE_SKY_GRADIENT", "f", 1.4),
     ("render", "skyHorizonOffset", "TUNE_SKY_HORIZON_OFFSET", "f", 0.25),
-    ("render", "skyHorizon", "TUNE_SKY_HORIZON", "v3", [0.72, 0.80, 0.90]),
+    ("render", "skyHorizon", "TUNE_SKY_HORIZON", "v3", [0.72, 0.8, 0.9]),
     ("render", "skyZenith", "TUNE_SKY_ZENITH", "v3", [0.25, 0.47, 0.85]),
     ("render", "sunTint", "TUNE_SUN_TINT", "v3", [1.0, 0.9, 0.7]),
     ("render", "sunDiscPower", "TUNE_SUN_DISC_POWER", "f", 800.0),
@@ -38,13 +41,13 @@ SPEC = [
     ("render", "skyMieG", "TUNE_SKY_MIE_G", "f", 0.76),
     ("render", "skyMieStrength", "TUNE_SKY_MIE_STRENGTH", "f", 1.0),
     ("render", "skyExposure", "TUNE_SKY_EXPOSURE", "f", 1.6),
-    ("render", "skyGround", "TUNE_SKY_GROUND", "v3", [0.22, 0.20, 0.17]),
+    ("render", "skyGround", "TUNE_SKY_GROUND", "v3", [0.22, 0.2, 0.17]),
     ("render", "sunSize", "TUNE_SUN_SIZE", "f", 3.0),
     ("render", "sunReddening", "TUNE_SUN_REDDENING", "f", 1.0),
 
     # night sky
-    ("render", "nightZenith", "TUNE_NIGHT_ZENITH", "v3", [0.006, 0.010, 0.028]),
-    ("render", "nightHorizon", "TUNE_NIGHT_HORIZON", "v3", [0.030, 0.036, 0.062]),
+    ("render", "nightZenith", "TUNE_NIGHT_ZENITH", "v3", [0.006, 0.01, 0.028]),
+    ("render", "nightHorizon", "TUNE_NIGHT_HORIZON", "v3", [0.03, 0.036, 0.062]),
     ("render", "starBrightness", "TUNE_STAR_BRIGHTNESS", "f", 1.0),
     ("render", "starDensity", "TUNE_STAR_DENSITY", "f", 150.0),
     ("render", "starSize", "TUNE_STAR_SIZE", "f", 0.85),
@@ -52,16 +55,16 @@ SPEC = [
     ("render", "starTwinkle", "TUNE_STAR_TWINKLE", "f", 0.35),
     ("render", "milkyWayStrength", "TUNE_MILKYWAY_STRENGTH", "f", 0.55),
     ("render", "milkyWayColor", "TUNE_MILKYWAY_COLOR", "v3", [0.52, 0.56, 0.78]),
-    ("render", "nebulaStrength", "TUNE_NEBULA_STRENGTH", "f", 0.40),
-    ("render", "nebulaCool", "TUNE_NEBULA_COOL", "v3", [0.16, 0.30, 0.62]),
-    ("render", "nebulaWarm", "TUNE_NEBULA_WARM", "v3", [0.55, 0.20, 0.38]),
+    ("render", "nebulaStrength", "TUNE_NEBULA_STRENGTH", "f", 0.4),
+    ("render", "nebulaCool", "TUNE_NEBULA_COOL", "v3", [0.16, 0.3, 0.62]),
+    ("render", "nebulaWarm", "TUNE_NEBULA_WARM", "v3", [0.55, 0.2, 0.38]),
     ("render", "auroraStrength", "TUNE_AURORA_STRENGTH", "f", 0.55),
     ("render", "auroraHeight", "TUNE_AURORA_HEIGHT", "f", 900.0),
-    ("render", "auroraLow", "TUNE_AURORA_LOW", "v3", [0.10, 0.85, 0.45]),
-    ("render", "auroraHigh", "TUNE_AURORA_HIGH", "v3", [0.65, 0.20, 0.85]),
+    ("render", "auroraLow", "TUNE_AURORA_LOW", "v3", [0.1, 0.85, 0.45]),
+    ("render", "auroraHigh", "TUNE_AURORA_HIGH", "v3", [0.65, 0.2, 0.85]),
 
     # moon
-    ("render", "moonRadius", "TUNE_MOON_RADIUS", "f", 0.030),
+    ("render", "moonRadius", "TUNE_MOON_RADIUS", "f", 0.03),
     ("render", "moonBrightness", "TUNE_MOON_BRIGHTNESS", "f", 1.6),
     ("render", "moonColor", "TUNE_MOON_COLOR", "v3", [0.92, 0.93, 0.88]),
     ("render", "moonGlow", "TUNE_MOON_GLOW", "f", 0.35),
@@ -73,12 +76,14 @@ SPEC = [
     ("render", "nightAmbSky", "TUNE_NIGHT_AMB_SKY", "v3", [0.055, 0.075, 0.135]),
     ("render", "nightAmbGround", "TUNE_NIGHT_AMB_GROUND", "v3", [0.022, 0.026, 0.042]),
 
-    ("render", "ambSky", "TUNE_AMB_SKY", "v3", [0.40, 0.48, 0.62]),
+    # ambient / diffuse
+    ("render", "ambSky", "TUNE_AMB_SKY", "v3", [0.4, 0.48, 0.62]),
     ("render", "ambGround", "TUNE_AMB_GROUND", "v3", [0.25, 0.22, 0.17]),
     ("render", "diffuseWrap", "TUNE_DIFFUSE_WRAP", "f", 0.55),
     ("render", "faceX", "TUNE_FACE_X", "f", 0.96),
     ("render", "faceZ", "TUNE_FACE_Z", "f", 0.92),
 
+    # AO / shadows
     ("render", "aoStrength", "TUNE_AO_STRENGTH", "f", 0.45),
     ("render", "aoFar", "TUNE_AO_FAR", "f", 0.72),
     ("render", "shadowBias", "TUNE_SHADOW_BIAS", "f", 0.02),
@@ -88,15 +93,17 @@ SPEC = [
     ("render", "shadowLift", "TUNE_SHADOW_LIFT", "f", 0.45),
     ("render", "shadowFarLift", "TUNE_SHADOW_FAR_LIFT", "f", 0.3),
 
+    # grain
     ("render", "grainBroadScale", "TUNE_GRAIN_BROAD_SCALE", "f", 11.0),
     ("render", "grainFineScale", "TUNE_GRAIN_FINE_SCALE", "f", 2.5),
     ("render", "grainMix", "TUNE_GRAIN_MIX", "f", 0.68),
     ("render", "grainAmp", "TUNE_GRAIN_AMP", "f", 0.065),
     ("render", "grainAmpFar", "TUNE_GRAIN_AMP_FAR", "f", 0.05),
 
+    # media / fire
     ("render", "mediaAbsorb", "TUNE_MEDIA_ABSORB", "f", 6.4),
     ("render", "mediaTauMax", "TUNE_MEDIA_TAU_MAX", "f", 6.0),
-    ("render", "fireFlickerBase", "TUNE_FIRE_FLICKER_BASE", "f", 0.70),
+    ("render", "fireFlickerBase", "TUNE_FIRE_FLICKER_BASE", "f", 0.7),
     ("render", "fireFlickerAmp", "TUNE_FIRE_FLICKER_AMP", "f", 0.55),
     ("render", "fireFlickerRate", "TUNE_FIRE_FLICKER_RATE", "f", 13.0),
     ("render", "fireGlowRate", "TUNE_FIRE_GLOW_RATE", "f", 1.4),
@@ -108,12 +115,13 @@ SPEC = [
     ("render", "emissiveFlickerAmp", "TUNE_EMISSIVE_FLICKER_AMP", "f", 0.28),
     ("render", "emissiveFlickerRate", "TUNE_EMISSIVE_FLICKER_RATE", "f", 9.0),
 
+    # water
     ("render", "waterF0", "TUNE_WATER_F0", "f", 0.0204),
-    ("render", "waterAbsorb", "TUNE_WATER_ABSORB", "v3", [1.85, 0.42, 0.20]),
-    ("render", "waterScatter", "TUNE_WATER_SCATTER", "v3", [0.045, 0.16, 0.20]),
+    ("render", "waterAbsorb", "TUNE_WATER_ABSORB", "v3", [1.85, 0.42, 0.2]),
+    ("render", "waterScatter", "TUNE_WATER_SCATTER", "v3", [0.045, 0.16, 0.2]),
     ("render", "waterFresnelPower", "TUNE_WATER_FRESNEL_POWER", "f", 5.0),
     ("render", "rippleAmpScale", "TUNE_RIPPLE_AMP_SCALE", "f", 0.35),
-    ("render", "rippleSpeedScale", "TUNE_RIPPLE_SPEED_SCALE", "f", 0.40),
+    ("render", "rippleSpeedScale", "TUNE_RIPPLE_SPEED_SCALE", "f", 0.4),
     ("render", "waterFetchLow", "TUNE_WATER_FETCH_LOW", "f", 0.35),
     ("render", "waterFetchHigh", "TUNE_WATER_FETCH_HIGH", "f", 0.85),
     ("render", "reflectionCutoff", "TUNE_REFLECTION_CUTOFF", "f", 0.06),
@@ -129,7 +137,7 @@ SPEC = [
     ("render", "iceFresnelPower", "TUNE_ICE_FRESNEL_POWER", "f", 5.0),
     ("render", "iceAbsorb", "TUNE_ICE_ABSORB", "f", 3.2),
     ("render", "iceAbsorbFloor", "TUNE_ICE_ABSORB_FLOOR", "f", 0.06),
-    ("render", "iceScatter", "TUNE_ICE_SCATTER", "f", 0.30),
+    ("render", "iceScatter", "TUNE_ICE_SCATTER", "f", 0.3),
     ("render", "iceScatterDepth", "TUNE_ICE_SCATTER_DEPTH", "f", 1.6),
     ("render", "iceScatterNight", "TUNE_ICE_SCATTER_NIGHT", "f", 0.25),
     ("render", "iceGrain", "TUNE_ICE_GRAIN", "f", 0.09),
@@ -140,7 +148,7 @@ SPEC = [
     ("render", "iceReflectMin", "TUNE_ICE_REFLECT_MIN", "f", 0.12),
 
     # blood / viscous liquids
-    ("render", "bloodF0", "TUNE_BLOOD_F0", "f", 0.030),
+    ("render", "bloodF0", "TUNE_BLOOD_F0", "f", 0.03),
     ("render", "bloodGraze", "TUNE_BLOOD_GRAZE", "f", 0.55),
     ("render", "bloodAbsorb", "TUNE_BLOOD_ABSORB", "f", 55.0),
     ("render", "bloodTransmit", "TUNE_BLOOD_TRANSMIT", "f", 0.35),
@@ -149,7 +157,7 @@ SPEC = [
     ("render", "bloodPoolLow", "TUNE_BLOOD_POOL_LOW", "f", 0.18),
     ("render", "bloodPoolHigh", "TUNE_BLOOD_POOL_HIGH", "f", 0.55),
     ("render", "bloodSmooth", "TUNE_BLOOD_SMOOTH", "f", 1.0),
-    ("render", "bloodEdgeFeather", "TUNE_BLOOD_EDGE_FEATHER", "f", 0.10),
+    ("render", "bloodEdgeFeather", "TUNE_BLOOD_EDGE_FEATHER", "f", 0.1),
     ("render", "bloodWobble", "TUNE_BLOOD_WOBBLE", "f", 0.004),
     ("render", "bloodSheen", "TUNE_BLOOD_SHEEN", "f", 1.15),
     ("render", "bloodSheenDrop", "TUNE_BLOOD_SHEEN_DROP", "f", 32.0),
@@ -157,20 +165,21 @@ SPEC = [
     ("render", "bloodAmbientSheen", "TUNE_BLOOD_AMBIENT_SHEEN", "f", 0.35),
     ("render", "bloodEdgeDepth", "TUNE_BLOOD_EDGE_DEPTH", "f", 0.035),
     ("render", "bloodEdgeStrength", "TUNE_BLOOD_EDGE_STRENGTH", "f", 0.65),
-    ("render", "bloodEdgeTint", "TUNE_BLOOD_EDGE_TINT", "v3", [0.55, 0.40, 0.38]),
+    ("render", "bloodEdgeTint", "TUNE_BLOOD_EDGE_TINT", "v3", [0.55, 0.4, 0.38]),
 
     # stains
     ("render", "stainCoverage", "TUNE_STAIN_COVERAGE", "f", 1.35),
     ("render", "stainMottle", "TUNE_STAIN_MOTTLE", "f", 0.85),
     ("render", "stainMottleScale", "TUNE_STAIN_MOTTLE_SCALE", "f", 0.55),
     ("render", "stainDarken", "TUNE_STAIN_DARKEN", "f", 0.55),
-    ("render", "stainOpacity", "TUNE_STAIN_OPACITY", "f", 0.70),
+    ("render", "stainOpacity", "TUNE_STAIN_OPACITY", "f", 0.7),
     ("render", "stainSheen", "TUNE_STAIN_SHEEN", "f", 0.55),
     ("render", "stainSheenPower", "TUNE_STAIN_SHEEN_POWER", "f", 90.0),
 
+    # lava / embers
     ("render", "lavaCrackFreq", "TUNE_LAVA_CRACK_FREQ", "f", 2.4),
-    ("render", "lavaCrackKneeLow", "TUNE_LAVA_CRACK_KNEE_LOW", "f", 0.50),
-    ("render", "lavaCrackKneeHigh", "TUNE_LAVA_CRACK_KNEE_HIGH", "f", 0.90),
+    ("render", "lavaCrackKneeLow", "TUNE_LAVA_CRACK_KNEE_LOW", "f", 0.5),
+    ("render", "lavaCrackKneeHigh", "TUNE_LAVA_CRACK_KNEE_HIGH", "f", 0.9),
     ("render", "lavaWarmBias", "TUNE_LAVA_WARM_BIAS", "f", 0.035),
     ("render", "lavaEmissionGain", "TUNE_LAVA_EMISSION_GAIN", "f", 1.9),
     ("render", "lavaPulseAmp", "TUNE_LAVA_PULSE_AMP", "f", 0.06),
@@ -181,17 +190,18 @@ SPEC = [
     ("render", "emberRate", "TUNE_EMBER_RATE", "f", 3.4),
     ("render", "emberDensity", "TUNE_EMBER_DENSITY", "u", 84),
 
+    # tonemap / budgets
     ("render", "exposureWhite", "TUNE_EXPOSURE_WHITE", "f", 4.2),
     ("render", "bleachAmount", "TUNE_BLEACH_AMOUNT", "f", 0.9),
     ("render", "gamma", "TUNE_GAMMA", "f", 2.2),
+
     # static micro-detail
     ("render", "microLodDist", "TUNE_MICRO_LOD_DIST", "f", 40.0),
     ("render", "microMaxPerRay", "TUNE_MICRO_MAX_PER_RAY", "i", 8),
-
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
 
-    # determinism-critical (CLAUDE.md rule 1)
+    # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),
     ("sim", "partMaxVel", "TUNE_PART_MAX_VEL", "i", 1536),
     ("sim", "airDensity", "TUNE_AIR_DENSITY", "i", 10),
@@ -206,6 +216,7 @@ SPEC = [
     ("sim", "expMicroLifeTicks", "TUNE_EXP_MICRO_LIFE", "u", 40),
     ("sim", "expMicroScaleIdx", "TUNE_EXP_MICRO_SCALE_IDX", "u", 2),
 
+    # worldgen (integer; needs a world regen to take effect)
     ("worldgen", "treeline", "TUNE_TREELINE", "i", 72),
     ("worldgen", "baseHeight", "TUNE_BASE_HEIGHT", "i", 32),
     ("worldgen", "hillAmplitude", "TUNE_HILL_AMPLITUDE", "i", 42),

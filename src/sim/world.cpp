@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "gpu/resources.h"
+#include "sim/rng.h"
 #include "sim/tuning.h"
 
 // Readback slot layout (offsets in bytes).
@@ -261,13 +262,11 @@ CellKind World::KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {
 }
 
 // ---- exact CPU mirror of worldgen.wgsl (integer-only, keep in sync) ----
-static uint32_t pcg(uint32_t v) {
-  uint32_t s = v * 747796405u + 2891336453u;
-  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (w >> 22u) ^ w;
-}
-static uint32_t hash3(uint32_t a, uint32_t b, uint32_t c) {
-  return pcg(a ^ pcg(b ^ pcg(c)));
+// pcg/hash3 come from sim/rng.h; the lowercase wrappers keep this block
+// reading like the WGSL it mirrors line-for-line.
+static inline uint32_t pcg(uint32_t v) { return rng::Pcg(v); }
+static inline uint32_t hash3(uint32_t a, uint32_t b, uint32_t c) {
+  return rng::Hash3(a, b, c);
 }
 // floor division / positive modulo, matching worldgen.wgsl fdiv/fmodp (the
 // noise lattice must be seamless across negative world coordinates)

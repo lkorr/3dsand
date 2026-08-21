@@ -13,10 +13,12 @@ Checks:
      A slot in one and not the other means the tuner writes a binding the
      engine silently resolves to nothing.
 
-  2. TUNING CONSTANTS sim/tuning.cpp  <->  scripts/tuning_prelude.py
-     The emitter and the shader-check prelude must emit the same TUNE_* set, or
-     check_shaders.sh fails (or worse, passes while the real build differs).
-     Also verifies every TUNE_* a shader references is actually emitted.
+  2. TUNING CONSTANTS sim/tuning_params.def  ->  everything downstream of it
+     The TUNE_* set has one source now: that table drives TuningWgslBlock() and
+     GENERATES scripts/tuning_prelude.py, so the emitter and the shader-check
+     prelude cannot name different sets. What is checked here is that the
+     generated file was regenerated, that each row names a member tuning.h
+     really declares, and that every TUNE_* a shader references is in the table.
 
   3. RENDER PATHS     assets/tuner.html RENDER_PATHS  <->  materials.cpp keys
      The wiki re-evaluates the shaders' authored-field tests to say which
@@ -33,6 +35,7 @@ passes the edited file so only the relevant checks run.
 Exit 0 = agree. Exit 1 = a real mismatch.
 """
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -90,31 +93,54 @@ def check_sound_slots():
 
 # ------------------------------------------------------------ tuning TUNE_*
 def check_tuning_consts():
-    emitter, prelude = read("src/sim/tuning.cpp"), read("scripts/tuning_prelude.py")
-    if not emitter or not prelude:
+    """The TUNE_* set now has ONE source: src/sim/tuning_params.def.
+
+    TuningWgslBlock() expands that table, and scripts/tuning_prelude.py is
+    generated from it, so the old emitter-vs-prelude name diff cannot fail by
+    construction. What is still worth checking is that the generated file has
+    actually been regenerated, that every row declares a member that exists in
+    tuning.h, and that no shader references a constant the table never emits.
+    """
+    table = read("src/sim/tuning_params.def")
+    header = read("src/sim/tuning.h")
+    if not table or not header:
         return
     checked.append("tuning constants")
 
-    a = set(re.findall(r"TUNE_[A-Z_0-9]+", emitter))
-    b = set(re.findall(r"TUNE_[A-Z_0-9]+", prelude))
-    for k in sorted(a - b):
-        problems.append(
-            f"{k} is emitted by TuningWgslBlock (sim/tuning.cpp) but missing "
-            f"from scripts/tuning_prelude.py -- check_shaders.sh will not see it")
-    for k in sorted(b - a):
-        problems.append(
-            f"{k} is in scripts/tuning_prelude.py but NOT emitted by "
-            f"TuningWgslBlock (sim/tuning.cpp) -- shaders validate offline and "
-            f"then fail to build for real")
+    rows = re.findall(
+        r"^TP_(F|I|U|V3)\((\w+),\s*(\w+),\s*(TUNE_[A-Z0-9_]+),", table, re.M)
+    emitted = {name for _, _, _, name in rows}
+
+    # The generated prelude must be in step with the table it comes from.
+    gen = ROOT / "scripts" / "gen_tuning_prelude.py"
+    if gen.exists():
+        r = subprocess.run([sys.executable, str(gen), "--check"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            problems.append(
+                "scripts/tuning_prelude.py is stale relative to "
+                "src/sim/tuning_params.def -- run "
+                "`python scripts/gen_tuning_prelude.py`")
+
+    # Every row has to name a real member, or TuningWgslBlock will not compile
+    # -- but the error lands in a macro expansion, which is a miserable read.
+    # Catching it here names the row instead.
+    for kind, group, member, name in rows:
+        decl = rf"\b{member}\s*(\[3\])?\s*(=|,|;)"
+        if not re.search(decl, header):
+            problems.append(
+                f"{name}: src/sim/tuning_params.def names {group}.{member}, "
+                f"which is not declared in src/sim/tuning.h")
 
     used = set()
     for w in (ROOT / "assets/shaders").glob("*.wgsl"):
         used |= set(re.findall(r"TUNE_[A-Z_0-9]+",
                                w.read_text(encoding="utf-8", errors="replace")))
-    for k in sorted(used - a):
+    for k in sorted(used - emitted):
         problems.append(
-            f"{k} is referenced by a shader but never emitted -- the pipeline "
-            f"build will fail at runtime, not at compile time")
+            f"{k} is referenced by a shader but is not a row in "
+            f"src/sim/tuning_params.def -- the pipeline build will fail at "
+            f"runtime, not at compile time")
 
 
 # ----------------------------------------------------------- RENDER_PATHS
@@ -184,6 +210,7 @@ RELEVANT = {
     "src/audio/cues.cpp": ["sound"],
     "src/sim/tuning.cpp": ["tuning"],
     "src/sim/tuning.h": ["tuning"],
+    "src/sim/tuning_params.def": ["tuning"],
     "scripts/tuning_prelude.py": ["tuning"],
     "assets/tuner.html": ["render"],
     "src/sim/materials.cpp": ["render"],

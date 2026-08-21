@@ -559,9 +559,11 @@ exposure and watching the hash stay at `a0d20705`.
 
 `World::TerrainHeight` (the CPU mirror of `baseHeight()`) reads the same
 `worldgen` values as the shader, so tuning terrain cannot desync collision from
-the terrain you can see. `scripts/tuning_prelude.py` mirrors the emitter for
-`check_shaders.sh`; a name present in one and not the other fails validation
-loudly rather than drifting.
+the terrain you can see. `scripts/tuning_prelude.py` supplies the same constants
+to `check_shaders.sh`, and is **generated** from `src/sim/tuning_params.def` —
+the one table the emitter itself expands — so the offline validator and the
+engine cannot disagree about a name, a type, or a default. They used to be two
+hand-maintained lists, and only the *names* were ever compared.
 
 #### Per-instance variance (2026-08-20)
 A tuned constant makes every instance identical: every NPC bleeds exactly the

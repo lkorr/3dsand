@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "game/rigrender.h"
+#include "sim/rng.h"
 #include "sim/tuning.h"
 
 namespace {
@@ -15,21 +17,11 @@ inline Quat Mul(const Quat& a, const Quat& b) { return QuatMul(a, b); }
 inline Vec3 Rotate(const Quat& q, Vec3 v) { return QuatRotate(q, v); }
 inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
 
-// Same stateless counter-based hash the sim shaders and mob.cpp use. The
-// avatar's spray is presentation, but it is authored INTO the tick's spawn
-// stream, which a replay must reproduce — a stateful rng here would desync the
-// moment a frame boundary moved (CLAUDE.md rule 1).
-uint32_t Pcg(uint32_t v) {
-  uint32_t s = v * 747796405u + 2891336453u;
-  uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (w >> 22u) ^ w;
-}
-uint32_t Hash3(uint32_t a, uint32_t b, uint32_t c) {
-  return Pcg(a ^ Pcg(b ^ Pcg(c)));
-}
-float SignedUnit(uint32_t h) {
-  return (float)(int32_t)(h & 0xFFFFu) / 32768.0f - 1.0f;
-}
+// sim/rng.h. The avatar's spray is presentation, but it is authored INTO the
+// tick's spawn stream, which a replay must reproduce (CLAUDE.md rule 1).
+using rng::Hash3;
+using rng::Pcg;
+using rng::SignedUnit;
 
 // Ceiling on the gait's velocity lookahead, in leg lengths. `leadTime` is a
 // DURATION, so the unclamped offset grows linearly with speed and blows past
@@ -1728,11 +1720,7 @@ void PlayerAvatar::AppendInstances(std::vector<BodyVoxInst>& out,
       slot++;
       continue;
     }
-    for (const DebrisVoxel& v : p.voxels) {
-      if (out.size() >= kMaxBodyVoxInstances) break;
-      out.push_back({(float)v.x, (float)v.y, (float)v.z,
-                     (uint32_t)v.payload | (slot << 16)});
-    }
+    rigrender::AppendVoxInsts(out, slot, p.voxels);
     slot++;
   }
   instancesDirty_ = false;
@@ -1742,24 +1730,14 @@ void PlayerAvatar::AppendXforms(std::vector<BodyXformGpu>& out) const {
   for (const Part& p : parts) {
     if (!p.body) continue;
     if (out.size() >= kMaxBodySlots) return;
-    BodyXformGpu x{};
-    x.pos[0] = p.xf.pos.x;
-    x.pos[1] = p.xf.pos.y;
-    x.pos[2] = p.xf.pos.z;
-    std::memcpy(x.quat, p.xf.quat, sizeof(x.quat));
-    out.push_back(x);
+    rigrender::AppendXform(out, p.xf);
   }
 }
 
 
 // ---- collision-box debug overlay (world.h DebugBox) -------------------------
-//
-// The bounds come from Physics::GetLocalBounds, i.e. from the JOLT SHAPE, not
-// from the voxel list that built it. That is the whole point of the overlay:
-// the collider is a greedy box merge of those voxels (capped, and inflated by a
-// convex radius), so drawing the voxels back would show what we MEANT to build
-// while this shows what is actually collided against. When they disagree, that
-// disagreement is the thing you opened the overlay to find.
+// See rigrender::AppendDebugBox for why these come from the Jolt shape rather
+// than from the voxels that built it.
 void PlayerAvatar::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
                                    uint32_t color) const {
   if (!phys_) return;
@@ -1768,18 +1746,7 @@ void PlayerAvatar::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
     if (out.size() >= limit) return;
     Vec3 lo, hi;
     if (!phys_->GetLocalBounds(p.body, lo, hi)) continue;
-    DebugBox b{};
-    const Vec3 mid{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
-                   (lo.z + hi.z) * 0.5f};
-    const Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
-    const Vec3 c = p.xf.pos + QuatRotate(q, mid);
-    b.pos[0] = c.x; b.pos[1] = c.y; b.pos[2] = c.z;
-    b.half[0] = (hi.x - lo.x) * 0.5f;
-    b.half[1] = (hi.y - lo.y) * 0.5f;
-    b.half[2] = (hi.z - lo.z) * 0.5f;
-    std::memcpy(b.quat, p.xf.quat, sizeof(b.quat));
-    b.color = color;
-    out.push_back(b);
+    rigrender::AppendDebugBox(out, lo, hi, p.xf, color);
   }
 }
 

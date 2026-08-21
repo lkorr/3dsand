@@ -346,9 +346,13 @@ the checker only tells you that something disagrees.
   a fixed 0..N box. Unloaded space is solid and inert.
 - **Look/feel constants belong in `tuning.json`, not as literals in shaders.**
   `TuningWgslBlock()` (`sim/tuning.cpp`) emits them as `TUNE_*` WGSL consts into
-  the same prelude, so F5 re-tunes the renderer with no rebuild. Adding one means
-  touching four places: the struct + reader + emitter in `sim/tuning.{h,cpp}`,
-  `scripts/tuning_prelude.py` (or `check_shaders.sh` fails), a default in
+  the same prelude, so F5 re-tunes the renderer with no rebuild. The `TUNE_*`
+  set has ONE source: the table in **`src/sim/tuning_params.def`**, which the
+  emitter expands and which `scripts/tuning_prelude.py` is *generated* from
+  (`python scripts/gen_tuning_prelude.py`; `check_invariants.py` fails if you
+  forget). Adding a shader-visible knob means: a row in the `.def`, the
+  declaration + doc comment in `sim/tuning.h`, a `Read*` in `LoadTuning` (that
+  is where per-parameter clamping lives, so it stays hand-written), a default in
   `assets/materials/tuning.json`, and a row in `assets/tuner_schema.js`. Values
   under `sim.*` are integer-only and change the world hash — rule 1 applies, and
   `--selftest` must be re-run.
