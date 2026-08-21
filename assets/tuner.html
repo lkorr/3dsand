@@ -4411,15 +4411,15 @@ function magicOverview(host){
     [mcode('Z'),'toggle magic mode — the number row speaks glyphs instead of picking a brush material'],
     [mcode('1…0'),'speak the glyph bound to that slot (10 slots; the number at hand is a real constraint)'],
     [mcode('RMB'),'cast what is on the stack'],
-    [mcode('C'),'clear the spoken stack'],
-    [mcode('Backspace'),'clear the spoken stack'],
+    [mcode('Backspace'),'clear the spoken stack — the only clear key. It is '+
+      'not conditioned on magic mode being on, so it is safe to mash.'],
     [mcode('R'),'hot-reload glyphs.json alongside materials.json'],
   ]));
   ctl.append(mpara('Leaving magic mode abandons the half-spoken spell. Glyphs '+
     'hot-reload with materials and MUST — a glyph holds a RESOLVED 12-bit material '+
     'id, so reloading materials without reloading glyphs would leave every glyph '+
     'pointing at whatever now occupies that id.'));
-  host.append(wsec('\u{1F3AE} Controls',6,false,ctl));
+  host.append(wsec('\u{1F3AE} Controls',5,false,ctl));
 }
 
 /* ---- stability: the question the user actually asked ---- */
@@ -4448,7 +4448,10 @@ function magicStability(host){
   for(const o of CAST_OUTCOMES)
     why.append(mrule(o.id+' — why',o.why));
   oc.append(why);
-  host.append(wsec('\u{1F3AF} The three outcomes',CAST_OUTCOMES.length,true,oc));
+  // "Every outcome", not "the three": CastOutcome (spell.h) has four branches
+  // — Nothing is a real one — and hardcoding a number here contradicted the
+  // count badge next to it.
+  host.append(wsec('\u{1F3AF} Every cast outcome',CAST_OUTCOMES.length,true,oc));
 
   const st=el('div',{});
   st.append(mpara(el('b',{},'What makes a spell STABLE:'),' simply that its total cost '+
@@ -4658,8 +4661,15 @@ function magicBudgets(host){
     ' against these engine ceilings at load, not trusted. A content edit cannot author an '+
     'unbounded spell.'));
   const cur=(k,fb)=>{const v=magicBudget(k,null);return v==null?el('span',{class:'hint'},'—'):mcode(String(v));};
+  // r[2] is the file the clamp actually lives in, and the standing obligation
+  // above tells the reader to go change it — so it has to be on the page. It
+  // rides under the knob name rather than as a fifth column, which would take
+  // width from the prose the c4 layout exists to protect.
   ce.append(mtable(['knob','engine range','authored now','why'],
-    ENGINE_CEILINGS.map(r=>[mcode(r[0]),mcode(r[1]),cur(r[0]),
+    ENGINE_CEILINGS.map(r=>[
+      el('span',{},mcode(r[0]),
+        el('div',{class:'hint',style:'margin-top:3px'},r[2])),
+      mcode(r[1]),cur(r[0]),
       el('span',{style:'font-size:12px'},r[3])])));
   host.append(wsec('\u{1F512} Engine ceilings',ENGINE_CEILINGS.length,true,ce));
 

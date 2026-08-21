@@ -589,7 +589,10 @@ function limbBody(limb) {
     // parent
     const par = el('select', { class: 'cell' });
     par.append(el('option', { value: '' }, '(none — root)'));
-    for (const o of L) if (o !== limb) par.append(el('option', { value: o.name }, o.name));
+    // limbs() rather than a captured list: limbBody is called from two places
+    // (inline under a model row, and under an orphan row) and neither is inside
+    // renderRigPanel's scope, where the old `L` lived.
+    for (const o of limbs()) if (o !== limb) par.append(el('option', { value: o.name }, o.name));
     par.value = limb.parent || '';
     par.addEventListener('change', () => {
       if (par.value) limb.parent = par.value; else delete limb.parent;

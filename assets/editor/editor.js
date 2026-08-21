@@ -342,9 +342,13 @@ function moveModel(i, d, moveAnchor = true) {
         l.anchor[0] += rb.x; l.anchor[1] += rb.y; l.anchor[2] += rb.z;
       }
 
-  // Structural: offsets are not in the quad-format undo log, so a stale log
-  // would replay voxel edits at the wrong place (same reason as splitSelection).
-  clearUndo();
+  // The undo log DELIBERATELY survives a move. Its quads are
+  // (modelIndex, flatGridIndex, old, new): a move rewrites no voxels, keeps
+  // every grid and model index identical, and touches only `offset`, so every
+  // entry still replays into exactly the cell it came from. Clearing here also
+  // meant a drag — which calls this once per voxel of travel — wiped unrelated
+  // paint history a voxel at a time. growModel is the opposite case and does
+  // still clear, because it reallocates the grid and renumbers flat indices.
   markDirty();
   needsRebuild = true;
   hooks.onModelsChanged?.();
@@ -472,6 +476,7 @@ function removeModel(i) {
     hooks.toast('a file needs at least one model', true);
     return;
   }
+  renameVisibility(doc.models[i].name, null);
   doc.models.splice(i, 1);
   clearUndo();                 // the splice renumbered models after i
   reboundDoc();
@@ -488,6 +493,7 @@ function renameModel(i, name) {
     hooks.toast(`a model named "${n}" already exists`, true);
     return false;
   }
+  renameVisibility(m.name, n);
   m.name = n;
   markDirty();
   hooks.onModelsChanged?.();
@@ -901,17 +907,55 @@ export const isModelHidden = name => hiddenModels.has(name);
 export const isModelSolo = name => soloModels.has(name);
 export const anySolo = () => soloModels.size > 0;
 
+/**
+ * Keep the name-keyed visibility sets in step with the models they name.
+ * Keying by name survives reorders (the reason it is not by index), but it
+ * means a rename orphans the entry and a delete leaks it: the stale name sits
+ * in the set until some later model happens to be called that, at which point
+ * it comes back hidden for no visible reason. `to` null = the model is gone.
+ */
+function renameVisibility(from, to) {
+  for (const s of [hiddenModels, soloModels])
+    if (s.delete(from) && to) s.add(to);
+}
+
 export function toggleModelHidden(name) {
   if (hiddenModels.has(name)) hiddenModels.delete(name);
-  else { hiddenModels.add(name); soloModels.delete(name); }
+  else {
+    hiddenModels.add(name); soloModels.delete(name);
+    warnIfEditingHidden(name);
+  }
   needsRebuild = true;
   hooks.onModelsChanged?.();
   updateStatus();
 }
 
+/**
+ * Outside whole mode every brush writes into the ACTIVE model by definition —
+ * cellGet/ownerOf short-circuit to it and never consult visibility, because
+ * there is no other model to pick. So hiding the active model there leaves it
+ * invisible but still fully paintable: you paint into empty space and the
+ * ghost floats over nothing. Whole mode has no such gap (both loops skip
+ * hidden models), so this is only reachable with W off.
+ *
+ * Say it rather than silently blocking the edit — refusing to paint with no
+ * explanation is the worse failure, and hiding the thing you are working on is
+ * legitimate right before switching models.
+ */
+function warnIfEditingHidden(name) {
+  if (wholeMode || !doc?.models[activeModel]) return;
+  if (doc.models[activeModel].name !== name) return;
+  hooks.toast(`"${name}" is the model you are editing — hidden, but brushes ` +
+    'still paint into it. Turn on Whole [W] or pick another model.', true);
+}
+
 export function toggleModelSolo(name) {
   if (soloModels.has(name)) soloModels.delete(name);
   else { soloModels.add(name); hiddenModels.delete(name); }
+  // Solo hides everything NOT soloed, so it can bury the active model just as
+  // hide can — same gap, same warning (see warnIfEditingHidden).
+  const act = doc?.models[activeModel];
+  if (act && !modelVisible(activeModel)) warnIfEditingHidden(act.name);
   needsRebuild = true;
   hooks.onModelsChanged?.();
   updateStatus();
@@ -979,6 +1023,10 @@ function rebuildInstances() {
     for (const e of plan.entries) {
       const m = doc.models[e.model];
       if (!m) continue;
+      // Hide/solo is a deliberate view state, so it survives into the preview
+      // too — otherwise pressing K brings every hidden limb back while the
+      // status bar still says SOLO and the row buttons stay lit.
+      if (!modelVisible(e.model)) continue;
       // xfModel: the model whose animation transform this entry follows — a
       // swapped-in flipbook frame moves with the PART it replaces.
       const xf = hooks.modelTransform?.(e.xfModel ?? e.model) || null;
@@ -1829,6 +1877,14 @@ function setWholeMode(on) {
   drag = null;
   if (wholeMode && selection) { selection = null; hooks.onSelectionChanged?.(null); }
   if (wholeMode && brush === 'select') brush = 'voxel';
+  // The mirror of the select guard above. Move needs every box visible so
+  // ownerOf can say which limb was grabbed; with whole mode off ownerOf
+  // short-circuits to the active model, so every click would silently drag
+  // THAT one instead of the limb under the cursor.
+  if (!wholeMode && brush === 'move') {
+    brush = 'voxel';
+    hooks.toast('Move needs Whole mode — brush back to Voxel', true);
+  }
   updateMirrorPlane();
   renderToolbar();
   needsRebuild = true;
@@ -2267,8 +2323,9 @@ function buildHelpPanel() {
       'moves with it, so the joint stays where it sits in the mesh — that is ' +
       'the difference from painting voxels around, which leaves the anchor ' +
       'behind. Children do NOT follow their parent: raising a torso means ' +
-      'moving the head and arms too. Structural, so it clears undo — drag it ' +
-      'back rather than Ctrl+Z.'),
+      'moving the head and arms too. The move itself is not on the undo ' +
+      'stack — drag it back rather than Ctrl+Z — but your paint history ' +
+      'survives it.'),
     row('walk', 'K toggles the gait preview (it walks the exported data, not ' +
       'an editor imitation). Legs need a two-bone IK chain (+ chain with the ' +
       'LOWER bone selected) and a gait block; leg groups define the gait ' +
