@@ -331,6 +331,18 @@
     border-radius:8px;padding:8px 12px;font-size:12.5px;line-height:1.5;
   }
   .trows{padding:2px 6px 10px}
+  /* Section divider INSIDE a group (schema `sec` on the first row of a band).
+     A group like Gore is two different subsystems sharing one name — micro
+     spray and whole blood voxels — and a flat list of 20 rows hides that. */
+  .tsec{
+    display:flex;align-items:baseline;gap:10px;
+    margin:14px 8px 4px;padding:6px 8px 5px;
+    border-top:1px solid #2a3340;
+  }
+  .tsec:first-child{margin-top:2px;border-top:0}
+  .tsec>b{color:#cfe3ff;font-size:12px;letter-spacing:.09em;text-transform:uppercase;white-space:nowrap}
+  .tsec>span{color:var(--dim);font-size:12px;line-height:1.5;max-width:78ch}
+  .tsec.hidden{display:none}
   .trow{
     display:grid;grid-template-columns:210px 1fr 96px 26px 150px 30px;gap:12px;align-items:center;
     padding:5px 8px;border-radius:6px;
@@ -2387,17 +2399,32 @@ function renderTuning(){
 
   for(const tab of TUNING_SCHEMA){
     const rows=[];
+    // A `sec` on a param opens a labelled band and every following row belongs
+    // to it until the next `sec`. The divider tracks its own members so a
+    // search that hides the whole band hides its heading too — a lone heading
+    // over no rows reads as a rendering bug.
+    let sec=null;
     for(const pr of tab.params){
+      if(pr.sec){
+        sec=el('div',{class:'tsec'},el('b',{},pr.sec.t),
+              pr.sec.d?el('span',{},pr.sec.d):null);
+        sec._members=0;
+        rows.push(sec);
+      }
       const g=paramGroup(tab,pr);
       const row=tuneRow(tab,pr,g);
       if(!matchesQuery(tab,pr,g,q))row.classList.add('hidden');
       else{
         shown++;
+        if(sec)sec._members++;
         if(row.classList.contains('changed'))changed++;
       }
       rows.push(row);
     }
-    const visible=rows.filter(r=>!r.classList.contains('hidden')).length;
+    for(const r of rows)
+      if(r.classList.contains('tsec')&&!r._members)r.classList.add('hidden');
+    const visible=rows.filter(
+      r=>!r.classList.contains('hidden')&&!r.classList.contains('tsec')).length;
     if(!visible)continue;
 
     const det=el('details',{class:'tgroup'+(tab.determinism?' det':'')});
@@ -5009,6 +5036,10 @@ function wikiTuneGroup(tab){
   if(tab.blurb)box.append(el('div',{class:'tblurb'},tab.blurb));
   const rows=el('div',{class:'trows'});
   for(const pr of (tab.params||[])){
+    // Same banding as the Tuning tab — the wiki embeds these rows rather than
+    // restating them, so it has to embed their section headings too.
+    if(pr.sec)rows.append(el('div',{class:'tsec'},el('b',{},pr.sec.t),
+                             pr.sec.d?el('span',{},pr.sec.d):null));
     const g=paramGroup(tab,pr);
     if(getAt(tune,g,pr.k)===undefined){
       // The schema declares it but tuning.json does not carry it. Worth

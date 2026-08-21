@@ -1239,15 +1239,22 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       }
 
       if (p.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
+      // Charge before emitting, shrinking the clump to what the wound can still
+      // afford — same rule 2 reasoning as the mob path (mob.cpp).
+      int clumpR = gore.bleedClumpRadius;
+      while (clumpR > 0 && (float)BleedClumpVoxels(clumpR) > p.bleedBudget)
+        clumpR--;
       // Drip period, tunable — same rule as the mob path (mob.cpp). Modulo,
       // not a mask, because the tuner offers every period and not just powers
       // of two; the divisor is clamped >= 1 at load.
       if (tick % (uint32_t)std::max(1, gore.bleedDripTicks) != 0) continue;
       Vec3 w = p.body ? p.xf.pos + Rotate(lq, p.woundLocal)
                       : bodyOriginNow + Rotate(bodyRotNow, p.anchorRoot);
-      ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), 1, def.bleedMat, 0,
-                     0, 0});
-      p.bleedBudget -= 1.0f;
+      // Clump size as a brush radius, debited by the sphere volume it paints —
+      // same rule and same reasoning as the mob drip (mob.cpp).
+      ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
+                     def.bleedMat, 0, 0, 0});
+      p.bleedBudget -= (float)BleedClumpVoxels(clumpR);
       bleedOps++;
     }
   }

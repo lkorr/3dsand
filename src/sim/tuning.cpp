@@ -478,6 +478,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
   if (const json* g = Find(j, "gore")) {
     auto& e = out.gore;
     const std::string at = "gore";
+    // Read order mirrors the banding in Tuning::Gore: micro spray first
+    // (shared droplet properties, then bleed, then sever), whole-voxel blood
+    // second, variance last.
+    // ---- A. micro spray ----
+    ReadI(*g, "microLifeTicks", e.microLifeTicks, out, at);
+    ReadI(*g, "microScale", e.microScale, out, at);
     ReadF(*g, "bleedSprayPerDrip", e.bleedSprayPerDrip, out, at);
     ReadF(*g, "bleedSpraySpeed", e.bleedSpraySpeed, out, at);
     ReadF(*g, "bleedSprayCone", e.bleedSprayCone, out, at);
@@ -485,15 +491,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "severDecayTicks", e.severDecayTicks, out, at);
     ReadF(*g, "severSpraySpeed", e.severSpraySpeed, out, at);
     ReadF(*g, "severSprayCone", e.severSprayCone, out, at);
-    ReadI(*g, "severVoxels", e.severVoxels, out, at);
-    ReadF(*g, "severVoxelSpeed", e.severVoxelSpeed, out, at);
-    ReadI(*g, "microLifeTicks", e.microLifeTicks, out, at);
-    ReadI(*g, "microScale", e.microScale, out, at);
-    ReadI(*g, "bleedDripTicks", e.bleedDripTicks, out, at);
-    ReadI(*g, "bleedOpsPerTick", e.bleedOpsPerTick, out, at);
+    // ---- B. whole-voxel blood ----
     ReadF(*g, "bleedVoxelGain", e.bleedVoxelGain, out, at);
     ReadF(*g, "bleedBudgetCap", e.bleedBudgetCap, out, at);
     ReadF(*g, "severStumpBudget", e.severStumpBudget, out, at);
+    ReadI(*g, "bleedDripTicks", e.bleedDripTicks, out, at);
+    ReadI(*g, "bleedOpsPerTick", e.bleedOpsPerTick, out, at);
+    ReadI(*g, "bleedClumpRadius", e.bleedClumpRadius, out, at);
+    ReadI(*g, "severVoxels", e.severVoxels, out, at);
+    ReadF(*g, "severVoxelSpeed", e.severVoxelSpeed, out, at);
+    ReadI(*g, "severGobbetVoxels", e.severGobbetVoxels, out, at);
+    ReadF(*g, "severGobbetSpread", e.severGobbetSpread, out, at);
+    // ---- C. variance ----
     ReadF(*g, "bleedGain", e.bleedGain, out, at);
     ReadVar(*g, "bleedGainVar", e.bleedGainVar, out, at);
     ReadVar(*g, "bleedSprayPerDripVar", e.bleedSprayPerDripVar, out, at);
@@ -555,6 +564,30 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (e.severStumpBudget < 0.0f) {
       out.warnings.push_back(at + ".severStumpBudget < 0; clamped to 0");
       e.severStumpBudget = 0.0f;
+    }
+    // ---- clump size (rule 2) ----
+    // 3 is the ceiling, not the shader's max brush radius of 7. A drip is a
+    // REPEATING source: the sphere volume goes 1/7/33/123/257, so by radius 4
+    // one wound is pushing a quarter of a chunk's worth of liquid per drip and
+    // the CA cannot settle it between drips — the chunk stops sleeping, which
+    // is a rule 2 failure that presents as a perf bug. The budget debit scales
+    // with the same volume (BleedClumpVoxels), so a big clump empties a wound
+    // proportionally faster rather than multiplying its total output.
+    if (e.bleedClumpRadius < 0 || e.bleedClumpRadius > 3) {
+      out.warnings.push_back(at + ".bleedClumpRadius out of 0..3; clamped");
+      e.bleedClumpRadius = e.bleedClumpRadius < 0 ? 0 : 3;
+    }
+    // A gobbet subdivides severVoxels rather than multiplying it, so the only
+    // real bound needed is "at least one particle per gobbet". 64 is a sanity
+    // ceiling: past it a gobbet exceeds any sane severVoxels and the throw
+    // degenerates to a single lump.
+    if (e.severGobbetVoxels < 1 || e.severGobbetVoxels > 64) {
+      out.warnings.push_back(at + ".severGobbetVoxels out of 1..64; clamped");
+      e.severGobbetVoxels = e.severGobbetVoxels < 1 ? 1 : 64;
+    }
+    if (e.severGobbetSpread < 0.0f) {
+      out.warnings.push_back(at + ".severGobbetSpread < 0; clamped to 0");
+      e.severGobbetSpread = 0.0f;
     }
   }
 

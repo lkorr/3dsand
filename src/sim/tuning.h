@@ -342,67 +342,132 @@ struct Tuning {
     int burnOpsPerTick = 384;
   } debris;
 
-  // ---- gore: bleed spray + dismemberment burst ----
+  // ---- gore ------------------------------------------------------------------
   //
-  // These drive CPU-authored ParticleSpawns (mob.cpp), not shader constants, so
-  // they are floats and do NOT change the world hash by themselves. What the
-  // spawns do once they land IS sim state — micro droplets stain — but the
-  // stain is authored in materials.json, and the spawn stream is a per-tick
-  // INPUT exactly like a BrushOp. Retuning these changes future worlds, the
-  // same way moving the mouse does; it does not make a replay diverge.
+  // TWO SIZES OF MATTER come off a wound, and almost every confusion in this
+  // group came from the two being interleaved. They are now separated, and the
+  // separation is the organising idea of the whole struct:
+  //
+  //   MICRO SPRAY  — sub-voxel droplets (`micro*`, `*Spray*`). They fly, they
+  //                  NEVER re-enter the grid as matter, they stain the first
+  //                  surface they hit and then they expire. Cost is particle
+  //                  slots and nothing else; a droplet cannot pool, flow, or
+  //                  keep a chunk awake. This is what SELLS the hit.
+  //   WHOLE VOXELS — real blood cells the CA owns (`bleed*`, `sever*Voxel*`,
+  //                  `clump*`). They fall, pool, flow, soak, stain from below
+  //                  and are still on the floor a minute later. Every one is
+  //                  conserved matter the sim has to move, so these are perf
+  //                  knobs as much as look knobs. This is the LASTING MESS.
+  //
+  // Within each size, the parameters split again by OCCASION: a slow bleed from
+  // an open wound, versus the one-shot burst when a limb comes off. So the
+  // struct reads as a 2x2 — spray/voxels x bleed/sever — plus the shared micro
+  // droplet properties and the per-instance variance block.
+  //
+  // These drive CPU-authored ParticleSpawns and BrushOps (mob.cpp, avatar.cpp),
+  // not shader constants, so they are floats and do NOT change the world hash
+  // by themselves. What the spawns do once they land IS sim state — micro
+  // droplets stain — but the stain is authored in materials.json, and the spawn
+  // stream is a per-tick INPUT exactly like a BrushOp. Retuning these changes
+  // future worlds, the same way moving the mouse does; it does not make a
+  // replay diverge.
   struct Gore {
-    // Droplets per wound-budget voxel spent. Bleeding already drips real blood
-    // voxels into the grid (mob.cpp bleeding); this is the visible spray that
-    // accompanies each drip, so it multiplies an existing, already-bounded rate.
+    // ========================================================================
+    // A. MICRO SPRAY — sub-voxel droplets. Stain and expire; never become matter.
+    // ========================================================================
+
+    // ---- A1. shared droplet properties (both occasions) ----
+    // Lifetime in ticks, and how finely a droplet is subdivided (2/3/4/6 micro
+    // voxels per world voxel). Life is the guarantee that spray CLEARS: no
+    // droplet outlives it, whether or not it ever hits anything.
+    int microLifeTicks = 70;
+    int microScale = 4;
+
+    // ---- A2. spray from an open wound (the drip's companion) ----
+    // Droplets per whole blood voxel a wound drips. Bleeding already drips real
+    // voxels into the grid; this is the visible spray that accompanies each
+    // drip, so it multiplies an existing, already-bounded rate.
     float bleedSprayPerDrip = 3.0f;
     float bleedSpraySpeed = 3.5f;      // voxels/sec, upward-biased cone
     float bleedSprayCone = 0.55f;      // lateral spread as a fraction of speed
-    // The dismemberment burst. `severSpray` droplets are emitted over
-    // `severDecayTicks`, front-loaded so the arterial gout is at the cut and
-    // the tail dies down — a flat rate over the same window reads as a
-    // sprinkler rather than a wound.
+
+    // ---- A3. spray from a dismemberment (the arterial gout) ----
+    // `severSpray` droplets are emitted over `severDecayTicks`, front-loaded so
+    // the gout is at the cut and the tail dies down — a flat rate over the same
+    // window reads as a sprinkler rather than a wound.
     int severSpray = 220;
     int severDecayTicks = 45;
     float severSpraySpeed = 9.0f;
     float severSprayCone = 0.8f;
-    // Whole blood VOXELS thrown by the cut, alongside the sub-voxel spray. This
-    // is the part that actually pools on the floor; the micro spray only marks
-    // surfaces. Kept small — every one of these is conserved matter the CA has
-    // to move (rule 2).
-    int severVoxels = 14;
-    float severVoxelSpeed = 6.0f;
-    // Micro droplet lifetime in ticks, and how finely it is subdivided
-    // (2/3/4/6 micro voxels per world voxel). Life is the guarantee that spray
-    // clears: no droplet outlives it, whether or not it ever hits anything.
-    int microLifeTicks = 70;
-    int microScale = 4;
 
-    // ---- whole-voxel bleeding ----
-    // Everything above governs the SPRAY (micro droplets that stain and
-    // evaporate) plus the one-shot sever throw. These four govern the other
-    // half: the real blood VOXELS a wound drips into the grid, which the CA
-    // carries, which pool, and which are still on the floor a minute later.
-    // They were hardcoded in mob.cpp; the literals below are those values, so
-    // an untouched tuning.json behaves exactly as before.
-    //
-    // Rate is a period, not a chance, because bleeding must stay bounded per
-    // rule 2: a wound drips at most one voxel every `bleedDripTicks`, and at
-    // most `bleedOpsPerTick` drips happen across all limbs of all mobs in a
-    // tick. Those two together are the hard ceiling on blood entering the sim.
-    int bleedDripTicks = 4;      // ticks between drips from one wound
-    int bleedOpsPerTick = 6;     // global cell-op budget for drips, per tick
-    // How much blood one point of damage is worth, and the ceiling on what a
-    // single wound can still owe. The per-damage rate is authored per mob
-    // (bleed.perDamage in the .json sidecar); this MULTIPLIES it, so it is the
-    // global "how wet is this game" dial. The cap is what stops a huge hit
-    // from turning into a minute-long fountain.
+    // ========================================================================
+    // B. WHOLE-VOXEL BLOOD — real matter the CA carries. Pools, flows, persists.
+    // ========================================================================
+
+    // ---- B1. how much blood a wound is worth, and its ceiling ----
+    // A wound carries a BUDGET in whole voxels and drips it out over time.
+    // `bleedVoxelGain` multiplies the per-mob rate authored in the mob's own
+    // .json (bleed.perDamage), so it is the global "how wet is this game" dial:
+    // it decides the size of the puddle still on the floor a minute later. The
+    // cap is what stops a huge hit turning into a minute-long fountain, and is
+    // the real bound on how much matter one wound can push into the CA.
     float bleedVoxelGain = 1.0f;
     float bleedBudgetCap = 120.0f;   // max voxels one wound can still owe
     // Voxels added to the stump's budget when a limb comes off, on top of the
-    // sever throw. This is the puddle under a fresh amputation.
+    // thrown sever voxels below. This is the puddle under a fresh amputation.
     float severStumpBudget = 40.0f;
 
-    // ---- per-instance variance ----
+    // ---- B2. how fast that budget leaves the wound, and in what size lumps ----
+    // Rate is a PERIOD, not a chance, because bleeding must stay bounded per
+    // rule 2: a wound drips at most once every `bleedDripTicks`, and at most
+    // `bleedOpsPerTick` drips happen across all limbs of all mobs in a tick.
+    int bleedDripTicks = 4;      // ticks between drips from one wound
+    int bleedOpsPerTick = 6;     // global op budget for drips, per tick
+    // CLUMP SIZE: the brush radius of one drip, so a drip can be a single bead
+    // or a thick gout. A BrushOp paints a solid sphere (sim_mutate.wgsl tests
+    // dot(local,local) <= radius^2), so this is a VOLUME dial, not a width one:
+    //   radius 0 -> 1 voxel   1 -> 7   2 -> 33   3 -> 123
+    // Radius 3 is the ceiling on purpose. The op's thread box is 16^3 centred
+    // on the cell (max brush radius 7), so the shader allows more, but a drip
+    // is a repeating source: at radius 4 (257 voxels) a single wound outruns
+    // what the CA can settle between drips and the chunk never sleeps.
+    //
+    // The budget is debited by the SPHERE VOLUME this radius paints, not by 1
+    // (see BleedClumpVoxels below). Otherwise raising clump size multiplies the
+    // matter entering the world while `bleedBudgetCap` reports the same number,
+    // and rule 2's bound quietly becomes a 123x underestimate.
+    int bleedClumpRadius = 0;
+    // Whole blood VOXELS thrown by a cut, alongside the sub-voxel gout. Kept
+    // small next to the hundreds of micro droplets — the spray does the visual
+    // work, these do the lasting mess.
+    int severVoxels = 14;
+    float severVoxelSpeed = 6.0f;
+    // GOBBET SIZE: how many thrown voxels travel together as one lump.
+    //
+    // This is NOT a brush radius, and the difference is forced by the engine
+    // rather than chosen. A thrown voxel is a ballistic PARTICLE, and
+    // sim_particle.wgsl deposits exactly one cell per particle, arbitrated by
+    // the claim lattice — a particle cannot paint a sphere without writing
+    // several cells from one thread, which breaks both the <=1-cell write reach
+    // and the claim arbitration (rule 1). So a clump is expressed the way the
+    // particle system CAN express it: `severGobbetVoxels` particles launched
+    // from the same point with the same velocity, landing as a contiguous lump
+    // instead of a fine mist of single cells.
+    //
+    // severVoxels stays the TOTAL voxel count, so this subdivides the throw
+    // rather than multiplying it: 14 voxels at gobbet 1 is fourteen scattered
+    // cells, at gobbet 7 it is two fat gouts. Matter thrown is unchanged, which
+    // is what keeps this a look knob and not a perf knob.
+    int severGobbetVoxels = 1;
+    // How far apart a gobbet's members are spread at launch, in voxels. Zero
+    // stacks them on one cell, where the claim lattice lets exactly one win and
+    // the rest retry next tick — a slow-motion drip instead of a lump. A small
+    // jitter gives them distinct target cells so they land together.
+    float severGobbetSpread = 0.6f;
+
+    // ========================================================================
+    // C. PER-INSTANCE VARIANCE
+    // ========================================================================
     // Each of these perturbs the like-named value above. Defaults are all
     // dist=kNone, so gore behaves exactly as before until a knob is turned on
     // in the tuner — this whole feature is opt-in and inert at rest.
@@ -419,6 +484,10 @@ struct Tuning {
     // NPC bleeds an extreme amount" — varying the individual counts
     // independently gives a mob that gushes spray but throws normal voxels,
     // which reads as a bug rather than as a heavy bleeder. Centre is 1.0.
+    //
+    // NOTE it scales COUNTS, not the whole-voxel budget: bleedVoxelGain is the
+    // volume dial and is deliberately not per-instance, because a wound budget
+    // that varies per mob makes the bleedBudgetCap bound unreadable.
     float bleedGain = 1.0f;
     Variance bleedGainVar;
   } gore;
@@ -798,6 +867,26 @@ inline float AddBleedBudget(float current, float add) {
   const auto& g = CurrentTuning().gore;
   const float grown = current + add * g.bleedVoxelGain;
   return grown > g.bleedBudgetCap ? g.bleedBudgetCap : grown;
+}
+
+// ---- gore: what one clump actually costs -----------------------------------
+// A BrushOp paints a SOLID SPHERE: sim_mutate.wgsl keeps every cell whose
+// dot(local, local) <= radius^2. So a clump radius is a volume, and the wound
+// budget has to be debited by that volume or the `bleedBudgetCap` bound means
+// nothing the moment clump size leaves 0.
+//
+// Exact counts rather than the 4/3*pi*r^3 approximation, because at these radii
+// the continuous formula is wrong by up to 30% (r=1: 4.2 vs the real 7) and the
+// budget is small enough that the error shows. Radii beyond the table are
+// clamped by the loader, so the fallback is only reached if that clamp changes.
+inline int BleedClumpVoxels(int radius) {
+  switch (radius) {
+    case 0: return 1;
+    case 1: return 7;
+    case 2: return 33;
+    case 3: return 123;
+    default: return radius <= 0 ? 1 : 257;
+  }
 }
 
 // ---- day/night: celestial state for one tick --------------------------------
