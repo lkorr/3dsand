@@ -228,15 +228,21 @@ constexpr uint32_t kMicroPoolWordsWorld = 1u << 20;
 // Same rules as the static pool above: render-only, never bound in a sim
 // shader, constants generated from THIS file so the WGSL and the C++ agree.
 //
-// Sized MUCH smaller than the static pool, and deliberately so. The static pool
-// is always populated — every world loads the micro blocks in materials.json —
-// whereas this one holds per-DEF limb art for the handful of mob defs that opt
-// into scale>1, shared across every instance. The whole scale-2 critter is 218
-// words; 256 KiB is room for ~1M micro voxels, i.e. dozens of far more detailed
-// creatures, and it is a hard ceiling rather than an open allocation (rule 2).
-// The buffer is allocated at this size unconditionally, so keeping it honest is
-// what stops an unused feature from costing 4 MiB of VRAM in every world.
-constexpr uint32_t kMicroBodyPoolWordsWorld = 1u << 16;
+// Sized for the worst case rather than the typical one, because a pool ceiling
+// is a worst-case structure: the whole scale-2 critter is 218 words, but a
+// detailed 8x-skin limb runs to tens of thousands, and copy-on-write doubles the
+// live set exactly when it matters — the detailed entities are the ones taking
+// hits. The old 64 KiW ceiling predated the skin/collider split and had no room
+// for that at all.
+//
+// The buffer is allocated at this size UNCONDITIONALLY (simulation.cpp), so this
+// number is VRAM every world pays whether or not it has a micro body. 1 MiW =
+// 4 MiB buys room for ~4M micro voxels — a fleet of 8x-skin characters — while
+// staying in the same order as the static pool above rather than quietly
+// becoming the largest buffer in the engine. It remains a HARD ceiling (rule 2):
+// past it MicroBodyOwn fails and the body keeps a stale skin, which is the
+// documented graceful degradation, not an unbounded allocation.
+constexpr uint32_t kMicroBodyPoolWordsWorld = 1u << 20;
 // Per-limb model records, indexed by body slot through kMaxBodySlots-sized
 // slot table. One record per (def, limb) pair across every loaded mob def.
 constexpr uint32_t kMaxMicroBodyModels = 256;
