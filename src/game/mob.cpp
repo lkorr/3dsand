@@ -1,6 +1,7 @@
 #include "game/mob.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -418,6 +419,23 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
           }
           if (!members.empty()) gd.groups.push_back(std::move(members));
         }
+      }
+
+      // Steering limits (anim.h LocomotionDef). Absent = the defaults, which
+      // are tuned for a humanoid; every field is optional so an existing
+      // sidecar keeps working untouched.
+      if (j.contains("locomotion") && j["locomotion"].is_object()) {
+        const json& l = j["locomotion"];
+        LocomotionDef& ld = sk.loco;
+        ld.turnRate = l.value("turnRate", ld.turnRate);
+        ld.turnAccel = l.value("turnAccel", ld.turnAccel);
+        ld.driveAlignFull = l.value("driveAlignFull", ld.driveAlignFull);
+        ld.driveAlignZero = l.value("driveAlignZero", ld.driveAlignZero);
+        ld.turnRateMoving = l.value("turnRateMoving", ld.turnRateMoving);
+        // A zero-width align band would divide by zero in the drive scale.
+        if (ld.driveAlignZero <= ld.driveAlignFull)
+          ld.driveAlignZero = ld.driveAlignFull + 1e-3f;
+        if (ld.turnRate < 0) ld.turnRate = 0;
       }
 
       for (const auto& c : j.value("chains", json::array())) {
@@ -941,6 +959,223 @@ void MobSystem::PlayClip(Mob& mob, const MobDef& def, const std::string& name) {
   mob.anim.clips.push_back(inst);
 }
 
+// ---- locomotion stage 0: sense ---------------------------------------------
+// One terrain probe per tick, shared by intent and drive. The fan is in the
+// mob's own frame (probe 0 is dead ahead) so the behaviour layer can reason in
+// "how far off my nose" without knowing the world yaw.
+MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
+                                             World& world) const {
+  GroundSense s;
+  const float cx = mob.origin.x + def.worldSize.x * 0.5f;
+  const float cz = mob.origin.z + def.worldSize.z * 0.5f;
+  const int yFrom = ifloor(mob.origin.y) + 3;
+  s.haveGround = GroundHeightAt(world, ifloor(cx), ifloor(cz), yFrom, s.groundY);
+
+  // Probe at the mob's own footprint plus a margin, so a wide creature notices
+  // a wall before its shoulder is already inside it. The reach is taken
+  // PER AXIS (an ellipse, not a circle) to match the footprint of a non-square
+  // mob — an isotropic max() makes a long creature probe well past where it
+  // can actually walk, and it stops short of gaps it would fit through.
+  const float reachX = def.worldSize.x * 0.5f + 2.0f;
+  const float reachZ = def.worldSize.z * 0.5f + 2.0f;
+  for (int i = 0; i < GroundSense::kProbeCount; i++) {
+    const float yaw =
+        mob.heading + (6.2831853f * (float)i) / (float)GroundSense::kProbeCount;
+    const float px = cx + std::sin(yaw) * reachX;
+    const float pz = cz + std::cos(yaw) * reachZ;
+    int py = 0;
+    if (!GroundHeightAt(world, ifloor(px), ifloor(pz), yFrom, py)) {
+      // Unknown footing is WALKABLE, and deliberately so. The probe reaches
+      // past the CPU mirror long before it reaches anything interesting, so
+      // treating unknown as blocked makes a mob stop dead at the edge of its
+      // own knowledge — it reads as an invisible wall, and it is the mob-scale
+      // version of the projectile bug in CLAUDE.md (Unknown is not the same
+      // test as out-of-window). The drive's own ground check still refuses to
+      // walk off into space, so nothing here can strand a mob in the air.
+      //
+      // `stepUp` is left at 0 rather than INT_MAX so the intent layer's
+      // flatness tie-break does not treat "I cannot see" as "a cliff".
+      s.clear[i] = true;
+      s.stepUp[i] = 0;
+      continue;
+    }
+    const int rise = s.haveGround ? py - s.groundY : 0;
+    s.stepUp[i] = rise;
+    // > 2 voxels of rise is beyond step-up reach; a big DROP is survivable but
+    // not desirable, so it is walkable and the intent layer merely prefers
+    // flatter ground.
+    s.clear[i] = rise <= 2;
+  }
+  return s;
+}
+
+// ---- locomotion stage 1: intent --------------------------------------------
+// THE AI SEAM. The only stage permitted an opinion, and the only thing it may
+// write is desiredHeading / driveScale. Replacing this function with a
+// behaviour tree, a utility scorer or a nav-mesh follower is the whole
+// extension story; steering, drive, gait and pose below are all agnostic.
+//
+// Today: walk forward, and when the way ahead is not walkable pick the clear
+// probe direction closest to the current heading. Choosing by ANGULAR DISTANCE
+// rather than by a fixed 90-degree turn is what makes the avoidance produce
+// free angles — a mob grazing a wall deflects a few degrees along it instead
+// of ricocheting orthogonally.
+void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
+                             const GroundSense& sense, uint32_t tick,
+                             float dt) {
+  mob.driveScale = 1.0f;
+  if (!sense.haveGround) return;
+
+  // The forward probe is index 0 by construction of the fan.
+  const bool blockedAhead = !sense.clear[0];
+  if (!blockedAhead) {
+    mob.blockedTicks = 0;
+    return;
+  }
+  mob.blockedTicks++;
+
+  // Re-picking a target every tick while a slow turn is still executing makes
+  // the mob dither in place. Commit to a chosen deflection for at least as
+  // long as a quarter turn takes, unless we are still blocked well after that.
+  const LocomotionDef& lo = def.skel.loco;
+  const uint32_t kCommitTicks =
+      (uint32_t)std::max(4.0f, (1.5707963f / std::max(lo.turnRate, 0.1f)) / dt);
+  if (tick < mob.lastTurnTick + kCommitTicks) return;
+
+  // Score every clear probe by how little it deviates from where we are
+  // already headed, preferring flatter ground to break ties. The forward probe
+  // is excluded — it is the one that is blocked.
+  int best = -1;
+  float bestCost = 0;
+  for (int i = 1; i < GroundSense::kProbeCount; i++) {
+    if (!sense.clear[i]) continue;
+    // Signed angular offset of this probe from the nose, in [-pi, pi].
+    float off = (6.2831853f * (float)i) / (float)GroundSense::kProbeCount;
+    if (off > 3.14159265f) off -= 6.2831853f;
+    // Wedged: after several blocked ticks, stop preferring the shallow
+    // deflections that clearly are not working and favour a real reversal.
+    // Without this a mob in a corner alternates between two near-forward
+    // probes forever, which is the classic oscillation this kind of steering
+    // fails at.
+    const bool wedged = mob.blockedTicks > kCommitTicks * 3;
+    float cost = wedged ? -std::abs(off) : std::abs(off);
+    cost += 0.15f * (float)std::abs(sense.stepUp[i]);  // prefer flat
+    if (best < 0 || cost < bestCost) {
+      best = i;
+      bestCost = cost;
+    }
+  }
+
+  if (best < 0) {
+    // Boxed in on every probe — reverse. Still a desired heading, so the turn
+    // rate still applies and the mob pivots rather than flipping.
+    mob.desiredHeading = mob.heading + 3.14159265f;
+    mob.lastTurnTick = tick;
+    return;
+  }
+  float off = (6.2831853f * (float)best) / (float)GroundSense::kProbeCount;
+  if (off > 3.14159265f) off -= 6.2831853f;
+  // Aim BETWEEN the blocked nose and the clear probe rather than exactly at
+  // the probe centre: the probes are a coarse 8-way fan and committing to a
+  // multiple of 45 degrees would reintroduce the very quantization this change
+  // exists to remove. The mob re-senses as it turns, so the heading it settles
+  // on is continuous.
+  mob.desiredHeading = mob.heading + off * 0.6f;
+  mob.lastTurnTick = tick;
+}
+
+// ---- locomotion stage 2: steer ---------------------------------------------
+// Close heading -> desiredHeading at a bounded, ramped rate. Returns the
+// resulting forward-drive alignment factor in 0..1.
+float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
+  const LocomotionDef& lo = def.skel.loco;
+  // Shortest signed error, wrapped into [-pi, pi]. Doing this with remainder
+  // rather than a while-loop matters: a desiredHeading that has accumulated
+  // many turns (it is never normalized) would otherwise spin here.
+  float err = std::remainder(mob.desiredHeading - mob.heading, 6.2831853f);
+
+  // Turn tighter when slow, wider when fast — a physical body's trade.
+  const float speedFrac =
+      std::clamp(mob.speedNow / std::max(def.speed, 0.01f), 0.0f, 1.0f);
+  const float rateCap =
+      lo.turnRate * (1.0f + (lo.turnRateMoving - 1.0f) * speedFrac);
+
+  if (rateCap <= 0.0f) {
+    mob.turnVel = 0;
+  } else if (lo.turnAccel <= 0.0f) {
+    // No ramp: step straight to the capped rate.
+    mob.turnVel = std::clamp(err / std::max(dt, 1e-4f), -rateCap, rateCap);
+  } else {
+    // Ramp toward the rate that would arrive on target, but never past the cap.
+    // The sqrt term is a critically-damped arrival: it is the fastest rate from
+    // which the remaining error can still be bled off at turnAccel without
+    // overshooting, so the mob decelerates INTO its heading instead of ringing
+    // around it.
+    const float arrive =
+        std::sqrt(2.0f * lo.turnAccel * std::abs(err)) * (err < 0 ? -1.0f : 1.0f);
+    const float want = std::clamp(arrive, -rateCap, rateCap);
+    const float dv = lo.turnAccel * dt;
+    mob.turnVel += std::clamp(want - mob.turnVel, -dv, dv);
+  }
+
+  // Never step past the target within one tick: at low dt the ramp handles it,
+  // but a large dt (a hitch) would otherwise overshoot and oscillate.
+  float step = mob.turnVel * dt;
+  if (std::abs(step) > std::abs(err)) {
+    step = err;
+    mob.turnVel = err / std::max(dt, 1e-4f);
+  }
+  mob.heading += step;
+  // Keep the ACTUATED heading normalized. Intent is left un-normalized on
+  // purpose (it is a target, and remainder() above handles the wrap), but
+  // `heading` feeds sin/cos every tick for the whole life of the mob and would
+  // slowly lose float precision if it drifted to large magnitudes.
+  mob.heading = std::remainder(mob.heading, 6.2831853f);
+
+  // Alignment: full drive within driveAlignFull, zero past driveAlignZero.
+  const float e = std::abs(std::remainder(mob.desiredHeading - mob.heading,
+                                          6.2831853f));
+  if (e <= lo.driveAlignFull) return 1.0f;
+  if (e >= lo.driveAlignZero) return 0.0f;
+  return 1.0f - (e - lo.driveAlignFull) /
+                    (lo.driveAlignZero - lo.driveAlignFull);
+}
+
+// ---- locomotion stage 3: drive ---------------------------------------------
+void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
+                                const GroundSense& sense, float align,
+                                float dt) {
+  if (!sense.haveGround) return;  // walk only when footing is known
+
+  // settle feet onto the ground
+  mob.origin.y += std::clamp((float)sense.groundY - mob.origin.y, -0.3f, 0.3f);
+
+  // A maimed mob keeps moving, just slower: the active dismemberment state
+  // scales the drive speed (a crawl covers ground at a fraction of a walk; a
+  // fully disarmed prone state is 0 and goes nowhere). Reads LAST tick's state
+  // — UpdateAnimation re-evaluates it — which is at most one tick of lag.
+  const float speedScale =
+      mob.anim.locoState >= 0 &&
+              mob.anim.locoState < (int)def.skel.states.size()
+          ? def.skel.states[mob.anim.locoState].speedScale
+          : 1.0f;
+
+  // Translate along the ACTUAL facing, scaled by how well it is aligned with
+  // intent. A mob mid-turn therefore traces an arc, and one that has to turn
+  // around pivots roughly in place — both fall out of this one multiply rather
+  // than needing a turn-in-place special case.
+  const float drive = def.speed * speedScale * mob.driveScale * align;
+  if (drive <= 0.0f) return;
+  // Do not walk into a wall we can already feel. The mob keeps turning (Steer
+  // ran before this and is unaffected), so it grinds along the obstacle and
+  // turns off it rather than freezing against it.
+  if (!sense.clear[0]) return;
+
+  const Vec3 fwd{std::sin(mob.heading), 0, std::cos(mob.heading)};
+  mob.origin += fwd * (drive * dt);
+  mob.phase += drive * dt * 2.2f;  // stride frequency
+}
+
 // Procedural gait layer. Writes foot targets into mob.anim.feet and derives
 // the body height/tilt from the resulting foot plane; the IK pass in
 // UpdateAnimation then places the legs.
@@ -1381,45 +1616,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                               mobRadius);
 
     if (mob.alive) {
-      // ---- kinematic walk (PLAN §B4: keyframes, not motors) ----
-      float cx = mob.origin.x + def.worldSize.x * 0.5f;
-      float cz = mob.origin.z + def.worldSize.z * 0.5f;
-      Vec3 fwd{std::sin(mob.heading), 0, std::cos(mob.heading)};
-
-      int groundY;
-      bool haveGround = GroundHeightAt(world, ifloor(cx), ifloor(cz),
-                                       ifloor(mob.origin.y) + 3, groundY);
-      int aheadY;
-      bool haveAhead = GroundHeightAt(
-          world, ifloor(cx + fwd.x * (def.worldSize.x * 0.5f + 2.0f)),
-          ifloor(cz + fwd.z * (def.worldSize.z * 0.5f + 2.0f)),
-          ifloor(mob.origin.y) + 3, aheadY);
-
-      if (haveGround) {
-        // settle feet onto the ground; walk only when footing is known
-        float targetY = (float)groundY;
-        mob.origin.y += std::clamp(targetY - mob.origin.y, -0.3f, 0.3f);
-        // A maimed mob keeps moving, just slower: the active dismemberment
-        // state scales the drive speed (a crawl covers ground at a fraction
-        // of a walk; a fully disarmed prone state is 0 and goes nowhere).
-        // Reads LAST tick's state — UpdateAnimation below re-evaluates it —
-        // which is at most one tick of lag on a sever.
-        float speedScale =
-            mob.anim.locoState >= 0 &&
-                    mob.anim.locoState < (int)def.skel.states.size()
-                ? def.skel.states[mob.anim.locoState].speedScale
-                : 1.0f;
-        bool blocked = haveAhead && aheadY > groundY + 2;  // > step-up reach
-        // speedScale 0 also suppresses the blocked-turn: an immobile mob
-        // pirouetting in place at a wall reads as a bug, not as AI.
-        if (blocked && speedScale > 0 && tick > mob.lastTurnTick + 15) {
-          mob.heading += 1.5707963f;  // turn 90° and try again
-          mob.lastTurnTick = tick;
-        } else if (!blocked) {
-          mob.origin += fwd * (def.speed * speedScale * dt);
-          mob.phase += def.speed * speedScale * dt * 2.2f;  // stride frequency
-        }
-      }
+      // ---- locomotion: sense -> intent -> steer -> drive ----
+      // Four stages with one direction of data flow. Only DecideIntent has an
+      // opinion about where to go; only Steer may move `heading`, and it does
+      // so at a bounded rate; only DriveLocomotion translates, and it does so
+      // along the ACTUAL facing. That last point is what turns a heading
+      // change into a curved path instead of an instant change of direction.
+      GroundSense sense = SenseGround(mob, def, world);
+      DecideIntent(mob, def, sense, tick, dt);
+      float align = Steer(mob, def, dt);
+      DriveLocomotion(mob, def, sense, align, dt);
 
       // ---- stages 1-5: pose the rig (float presentation state) ----
       UpdateAnimation(mob, def, world, dt);
@@ -1432,7 +1638,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // Tilt the whole body to the foot-plane normal, again free from gait.
       Quat tilt = QuatFromTo({0, 1, 0}, mob.bodyUp);
       Quat bodyRot = Mul(tilt, yaw);
-      Vec3 yawPivot{cx - mob.origin.x, 0, cz - mob.origin.z};
+      // The yaw pivot is the footprint centre in PREFAB coordinates — it is a
+      // property of the def, not of where the mob currently stands, so it is
+      // written from worldSize directly rather than differencing a world-space
+      // centre against the origin the drive step just moved.
+      Vec3 yawPivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
       Vec3 bodyOrigin{mob.origin.x, mob.bodyY, mob.origin.z};
       for (size_t i = 0; i < mob.limbs.size(); i++) {
         Limb& limb = mob.limbs[i];
@@ -1530,6 +1740,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         }
 
         if (limb.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
+        // Charge the clump BEFORE emitting it, and shrink it to what the wound
+        // can still afford. The natural ordering (emit, then subtract) lets the
+        // last drip overrun bleedBudgetCap by nearly a whole sphere — 123
+        // voxels at radius 3 — which is exactly the rule 2 trap in CLAUDE.md.
+        // Shrinking rather than refusing keeps a wound's final voxels flowing
+        // instead of stranding a sub-clump remainder that never drips.
+        int clumpR = gore.bleedClumpRadius;
+        while (clumpR > 0 &&
+               (float)BleedClumpVoxels(clumpR) > limb.bleedBudget)
+          clumpR--;
         // Drip period, tunable. Modulo rather than a mask because the tuner
         // offers every period, not just powers of two; the divisor is clamped
         // >= 1 at load so this cannot divide by zero.
@@ -1537,9 +1757,13 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         Vec3 w = limb.body
                      ? limb.xf.pos + Rotate(lq, limb.woundLocal)
                      : bodyFrame(limb.anchorRoot);  // stump on the parent
-        ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), 1,
+        // Clump size is a brush radius, and a BrushOp paints a SOLID SPHERE, so
+        // the budget is debited by the volume actually painted (1/7/33/123) and
+        // not by 1. Charging the real cost is what keeps bleedBudgetCap a true
+        // bound on matter entering the CA once clump size leaves 0 (rule 2).
+        ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
                        def.bleedMat, 0 /*paint into air*/, 0, 0});
-        limb.bleedBudget -= 1.0f;
+        limb.bleedBudget -= (float)BleedClumpVoxels(clumpR);
         bleedOps++;
 
         // ---- the spray that accompanies the drip ----
@@ -2168,7 +2392,14 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
           int nVox = EventVarI(mob.gore.severVoxels, gore.severVoxelsVar, es,
                                0x5EEDu, 0u);
           if (nVox < 0) nVox = 0;
-          for (int k = 0; k < nVox; k++) {
+          // Gobbet size SUBDIVIDES the throw: severVoxels stays the total voxel
+          // count and `gob` of them share one trajectory, so raising it makes
+          // the cut throw fewer, fatter lumps without changing how much matter
+          // enters the world. `k` counts gobbets; `m` counts members.
+          const int gob = std::max(1, gore.severGobbetVoxels);
+          const int nGob = (nVox + gob - 1) / gob;
+          int thrown = 0;
+          for (int k = 0; k < nGob; k++) {
             if (pendingSpawns_.size() >= kMaxParticleSpawnsPerTick) break;
             uint32_t h = Hash3((uint32_t)mob.id * 22695477u + (uint32_t)limbIndex,
                                (uint32_t)k, 0x5EEDu);
@@ -2180,8 +2411,20 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
                                 es, 0x5EEDu, (uint32_t)k + 1u) *
                        (0.6f + 0.8f * (float)(Pcg(h ^ 0x9Fu) & 0xFFFFu) / 65535.0f);
             if (sp < 0.0f) sp = 0.0f;
-            pendingSpawns_.push_back(MakeDroplet(anchorW, dir * sp, def.bleedMat,
-                                                 false, 0, 0));
+            // One gobbet: `gob` voxels on the SAME velocity, offset by a small
+            // jitter so they occupy distinct cells. Stacking them on one cell
+            // instead would hand the claim lattice a pile where exactly one
+            // wins per tick, turning a lump into a slow drip.
+            for (int m = 0; m < gob && thrown < nVox; m++, thrown++) {
+              if (pendingSpawns_.size() >= kMaxParticleSpawnsPerTick) break;
+              uint32_t hm = Pcg(h ^ (0x9E3779B9u * (uint32_t)(m + 1)));
+              const float sprd = gore.severGobbetSpread;
+              Vec3 at{anchorW.x + SignedUnit(hm) * sprd,
+                      anchorW.y + SignedUnit(Pcg(hm ^ 0x2A5u)) * sprd,
+                      anchorW.z + SignedUnit(Pcg(hm ^ 0xB77u)) * sprd};
+              pendingSpawns_.push_back(
+                  MakeDroplet(at, dir * sp, def.bleedMat, false, 0, 0));
+            }
           }
         }
     }
@@ -2350,6 +2593,36 @@ Vec3 MobSystem::MobFacing(uint64_t mobId) const {
     if (mob.id == mobId)
       return Vec3{std::sin(mob.heading), 0, std::cos(mob.heading)};
   return {0, 0, 1};
+}
+
+float MobSystem::MobHeading(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id == mobId) return mob.heading;
+  return 0;
+}
+
+float MobSystem::MobDesiredHeading(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id == mobId) return mob.desiredHeading;
+  return 0;
+}
+
+float MobSystem::MobTurnVel(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id == mobId) return mob.turnVel;
+  return 0;
+}
+
+void MobSystem::SetDesiredHeading(uint64_t mobId, float radians) {
+  for (Mob& mob : mobs_)
+    if (mob.id == mobId) {
+      mob.desiredHeading = radians;
+      // Deliberately does NOT touch `heading` or `turnVel`: an external
+      // steering command is subject to exactly the same turn-rate clamp the
+      // wander behaviour is. That is the invariant that keeps a future
+      // "face the player" from becoming an instant snap.
+      return;
+    }
 }
 
 int MobSystem::SwingingFeet(uint64_t mobId) const {

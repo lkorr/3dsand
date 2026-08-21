@@ -6,6 +6,13 @@
     "perDamage": 2
   },
   "speed": 6,
+  "locomotion": {
+    "turnRate": 5.2,
+    "turnAccel": 26.0,
+    "turnRateMoving": 0.7,
+    "driveAlignFull": 0.7,
+    "driveAlignZero": 2.4
+  },
   "gait": {
     "cadence": 2.6,
     "strideBias": 0.45,

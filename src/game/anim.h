@@ -107,6 +107,33 @@ struct GaitDef {
   std::vector<std::vector<int>> groups;  // part indices
 };
 
+// How a body STEERS, as opposed to how its feet land (GaitDef). The split is
+// deliberate: gait is a property of the leg rig and is mirrored by the editor's
+// preview, whereas these are the physical limits an AI's steering output is
+// clamped against. A future behaviour tree writes a desired heading and a
+// desired speed; nothing above this layer ever gets to set body facing
+// directly, which is what keeps "turn instantly to face the player" from
+// becoming possible by accident.
+struct LocomotionDef {
+  // Peak yaw rate, radians/sec. The default is ~206 deg/s: brisk enough that a
+  // mob does not feel sluggish, slow enough that the turn reads as a turn.
+  float turnRate = 3.6f;
+  // Yaw acceleration, radians/sec^2. Rate is ramped rather than stepped so a
+  // reversal eases out of the old direction instead of snapping to full rate,
+  // which is the difference between a creature turning and a turret slewing.
+  // <= 0 means "no ramp": jump straight to turnRate (cheap mobs, insects).
+  float turnAccel = 18.0f;
+  // Facing error (radians) beyond which forward drive is scaled down, and the
+  // error at which it reaches zero. A mob that needs to turn 180 deg should
+  // pivot roughly in place rather than carving a wide arc through the wall it
+  // just bounced off; a mob 10 deg off course should not slow at all.
+  float driveAlignFull = 0.5f;   // <= this: full speed
+  float driveAlignZero = 2.0f;   // >= this: pivot in place
+  // Turn rate multiplier while at full forward speed. Real bodies turn tighter
+  // when slow; 1.0 disables the coupling.
+  float turnRateMoving = 0.55f;
+};
+
 // Locomotion state selected by DISMEMBERMENT: each rule pairs a predicate over
 // the severed parts with how the survivor keeps moving (a looping clip, a speed
 // penalty, whether the gait still owns the legs). Rules are evaluated in
@@ -175,6 +202,7 @@ struct AnimSkeleton {
   std::vector<Flipbook> flipbooks;
   std::vector<AnimStateRule> states;  // dismemberment locomotion, first match wins
   GaitDef gait;
+  LocomotionDef loco;
   int FindPart(const std::string& name) const;
   int FindClip(const std::string& name) const;
   // True when the storage order guarantees parent index < child index.

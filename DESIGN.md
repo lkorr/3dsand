@@ -1145,6 +1145,70 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   Jolt `GroupFilterTable` — adjacent limb boxes otherwise fight their joints
   and the ragdoll never sleeps. Mob limbs render as extra body slots appended
   after the debris bodies (shared 12-bit slot space, `kMaxBodySlots`).
+### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
+
+Locomotion was one block that read the ground, snapped `heading += 90°` when
+blocked, and translated. That is why mobs only ever moved on the four cardinal
+axes: the *only* thing that ever wrote a heading wrote a right angle, instantly.
+Turning and walking were the same statement, so there was nowhere to put an AI
+that wanted to move at 23°, and nowhere to put a turn that took time.
+
+It is now four stages with one direction of data flow, each with a single
+responsibility:
+
+| Stage | Function | May write | Why it is separate |
+|---|---|---|---|
+| sense | `SenseGround` | — | One terrain probe per tick, an 8-way fan in the *mob's own frame*. Intent and drive can no longer disagree about the ground (they each ran their own probe before), and a future sensor — vision cone, sound event, nav query — has one obvious place to join. |
+| intent | `DecideIntent` | `desiredHeading`, `driveScale` | **The AI seam.** The only stage allowed an opinion. Today it is wander-and-avoid; a behaviour tree or utility scorer replaces this one function and inherits working steering, drive, gait and pose. |
+| steer | `Steer` | `heading`, `turnVel` | The only writer of body facing, and it moves it at a bounded, ramped rate. |
+| drive | `DriveLocomotion` | `origin`, `phase` | Translates along the **actual** facing, scaled by alignment with intent. |
+
+The load-bearing split is `heading` (where the body points) versus
+`desiredHeading` (where it wants to point). Because drive translates along
+`heading` while `Steer` closes the gap over several ticks, a heading change
+*automatically* traces an arc, and a mob that must turn around pivots roughly in
+place — both fall out of one multiply rather than needing a turn-in-place case.
+
+That split is also the guard rail. A behaviour is expressed purely as "set
+`desiredHeading` and `driveScale` this tick" and structurally *cannot* teleport
+the facing, so no future AI can reintroduce the snap by accident. The public
+`SetDesiredHeading` is subject to the same clamp — "face the player" is a
+request, never a rotation.
+
+Free angles come from two choices, not from removing the 90° constant: the fan
+is scored by **angular distance** from the current heading (so grazing a wall
+deflects a few degrees along it instead of ricocheting orthogonally), and the
+chosen probe is only aimed *toward*, at 0.6 of the offset, so the mob never
+commits to a multiple of 45° — it re-senses as it turns and settles wherever the
+terrain actually allows.
+
+Two traps worth keeping written down, both found by measurement rather than
+inspection:
+
+- **Unknown footing must read as WALKABLE.** The probe reaches past the CPU
+  mirror long before it reaches anything interesting, so treating unknown as
+  blocked stops a mob dead at the edge of its own knowledge — an invisible wall.
+  This is the mob-scale twin of the projectile rule in CLAUDE.md: *unknown* and
+  *out-of-window* are different tests. The drive's own `haveGround` check is
+  what prevents walking off into space.
+- **Probe reach is per-axis, not an isotropic `max`.** A long creature that
+  probes at `max(sizeX, sizeZ)` reaches well past where it can walk and refuses
+  gaps it would fit through.
+
+Limits live in `LocomotionDef` (`game/anim.h`), authored per creature in the
+sidecar's `locomotion` block — deliberately *not* in `GaitDef`, which is a
+property of the leg rig and is mirrored by the editor's preview. `turnRate`,
+`turnAccel` (a critically-damped arrival, so a body decelerates *into* its
+heading rather than ringing around it), `turnRateMoving` (turn tighter when
+slow), and the `driveAlign*` band that scales forward speed by facing error.
+
+The `mob steering` selftest gate asserts what "any angle" actually means, since
+"the heading changed" and "it walked far enough" are both satisfied by the old
+snap: the per-tick facing delta stays under the rate cap, the turn takes real
+time (~0.67 s, not one tick), it arrives without overshoot, and the mob is seen
+*travelling* along **21 distinct headings** in a single turn — impossible for a
+90° snap (4 in the whole plane) and for turn-in-place-then-go (1).
+
 - **Bleeding:** wound budgets, capped per tick, emitted as radius-1 brush ops;
   blood is a real material (organic tags → burns/reacts for free) with a
   subcritical dry-to-air decay so pools go back to sleep (rule #2).

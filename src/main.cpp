@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <GLFW/glfw3.h>
@@ -2247,7 +2248,15 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
       // reaches full rest — this is a slower settle, not a leak, and shrinking
       // the blood to fit the old window would be testing the tuning instead of
       // the invariant.
-      for (int i = 0; i < 2500; i++) mobTick({});
+      // 5000, not 2500: steering (LocomotionDef) changed where the dummy is
+      // standing when it dies, so the corpse and its blood land on different
+      // ground than the old straight-line walk left them on, and that ground
+      // takes longer to go quiet. MEASURED, not guessed — at the old window
+      // this reads awake=4, and the same run reaches awake=0 well before the
+      // new one expires. The assertion still tests that the scene reaches FULL
+      // rest; only the deadline moved, exactly as it did when gore volume grew
+      // (see the note above).
+      for (int i = 0; i < 5000; i++) mobTick({});
       uint32_t awake = debris.ActiveBodyCount();
       bool settled = awake == 0 && mobs.MobCount() == 0;
 
@@ -2259,6 +2268,79 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           severed ? 1 : 0, died ? 1 : 0, debris.BodyCount(), awake);
       debris.Reset();
       mobs.Reset();
+
+      // ---- steering: free angles and a bounded turn rate -------------------
+      // The invariant here is NOT "the mob turns" (it always did) but "the
+      // body's facing only ever moves at a bounded rate, and it can travel
+      // along any angle". The old locomotion snapped heading by exactly 90
+      // degrees in one tick, which satisfies every did-it-change and
+      // distance-walked test — so those are not the assertions to make.
+      //
+      // Runs on its OWN mob, after the fixture above is fully torn down.
+      // Sharing the dummy would leave the corpse somewhere the death/settle
+      // window was never calibrated for, and this gate would then show up as
+      // an unrelated failure in `mob` — a fixture must not perturb its
+      // neighbours.
+      {
+        uint64_t sid = mobs.Spawn(dummyDef, {137, h + 1, 139});
+        bool turnBounded = true, turnedFreely = false, turnArrived = false;
+        bool turnCurved = false;
+        const float startH = mobs.MobHeading(sid);
+        // 2.4 rad ~= 137 degrees: not a multiple of 90, so a snapping
+        // implementation cannot land on it and a quantizing one cannot rest
+        // there.
+        const float targetH = startH + 2.4f;
+        // Turn-rate cap is the def's own; the drive couples it to speed, so
+        // the per-tick bound is the uncoupled rate plus slack for the accel
+        // ramp's arrival step.
+        const float kMaxRate = 3.6f;   // LocomotionDef default turnRate
+        const float kBound = kMaxRate * kTickDt * 1.5f;
+        float prevH = startH;
+        int ticksTurning = 0;
+        // Distinct headings the mob was seen MOVING along, bucketed at 5
+        // degrees. A snap-turner only translates along a few quantized yaws; a
+        // steered body sweeps continuously through them. This is what makes
+        // "any angle" an assertion rather than a claim.
+        std::unordered_set<int> movedBuckets;
+        Vec3 prevP = mobs.MobOrigin(sid);
+        for (int i = 0; i < 90; i++) {
+          mobs.SetDesiredHeading(sid, targetH);  // hold intent against wander
+          mobTick({});
+          float nowH = mobs.MobHeading(sid);
+          float step = std::abs(std::remainder(nowH - prevH, 6.2831853f));
+          if (step > kBound) turnBounded = false;
+          if (step > 1e-5f) ticksTurning++;
+          prevH = nowH;
+          Vec3 nowP = mobs.MobOrigin(sid);
+          Vec3 d{nowP.x - prevP.x, 0, nowP.z - prevP.z};
+          prevP = nowP;
+          // Only ticks where it genuinely translated, so a mob spinning in
+          // place cannot satisfy the curvature test.
+          if (std::sqrt(d.x * d.x + d.z * d.z) > 1e-3f)
+            movedBuckets.insert(
+                (int)std::floor(std::atan2(d.x, d.z) / 0.0872664626f));
+        }
+        // It must have taken real TIME: 2.4 rad at 3.6 rad/s is ~0.67 s. A
+        // snap arrives in one tick.
+        turnArrived =
+            std::abs(std::remainder(prevH - targetH, 6.2831853f)) < 0.05f;
+        turnedFreely = ticksTurning > 8;
+        // >4 distinct travel directions in one turn: impossible for the old
+        // 90-degree snap (4 in the whole plane) and for turn-in-place-then-go
+        // (1).
+        turnCurved = movedBuckets.size() > 4;
+        bool steerOk =
+            turnBounded && turnArrived && turnedFreely && turnCurved;
+        mobOk = mobOk && steerOk;
+        std::printf(
+            "mob steering: %s (bounded=%d arrived=%d gradual=%d curved=%d, "
+            "%d travel dirs over %d turning ticks)\n",
+            steerOk ? "PASS" : "FAIL", (int)turnBounded, (int)turnArrived,
+            (int)turnedFreely, (int)turnCurved, (int)movedBuckets.size(),
+            ticksTurning);
+        debris.Reset();
+        mobs.Reset();
+      }
 
       // ---- Wave 2a: procedural gait + IK + clips on the critter rig ----
       // Per-tick INVARIANTS, not rate comparisons: (a) at most one gait group

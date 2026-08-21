@@ -213,6 +213,18 @@ class MobSystem {
   // model is authored nose-backwards it will walk in reverse (see the critter
   // generator's axis note in scripts/gen_critter_mob.py).
   Vec3 MobFacing(uint64_t mobId) const;
+  // Steering introspection. `MobHeading` is the body's actual yaw and
+  // `MobDesiredHeading` the intent layer's target; a test asserts the gap
+  // closes at a bounded rate rather than instantly, which is the invariant
+  // that "no 90-degree snap" actually means. Comparing the two is also how the
+  // debug overlay shows a mob mid-turn.
+  float MobHeading(uint64_t mobId) const;
+  float MobDesiredHeading(uint64_t mobId) const;
+  float MobTurnVel(uint64_t mobId) const;
+  // Steering override for tests and (later) scripted behaviour: sets the
+  // desired heading directly, leaving the turn-rate clamp fully in force. The
+  // wander behaviour re-takes control as soon as it next wants to turn.
+  void SetDesiredHeading(uint64_t mobId, float radians);
   // Gait introspection: how many chains currently have a swinging foot, and
   // how far the planted feet have travelled. The selftest asserts the
   // one-group-swinging invariant per tick rather than comparing step rates
@@ -334,7 +346,27 @@ class MobSystem {
     int defIndex = 0;
     bool alive = true;
     GoreProfile gore;          // this mob's own bleed character
-    float heading = 0;         // radians about +Y
+    // ---- steering: intent vs actuation ------------------------------------
+    // `heading` is where the BODY actually points and is the only thing the
+    // pose, the gait and MobFacing ever read. `desiredHeading` is where the
+    // mob WANTS to point. Nothing outside MobSystem::Steer may write `heading`
+    // — the whole reason a mob can move at a free angle with a believable turn
+    // is that the two are separate and the gap is closed at a bounded rate.
+    //
+    // A behaviour layer (chase, flee, patrol, strafe) is expressed purely as
+    // "set desiredHeading and driveScale this tick"; it cannot teleport the
+    // facing even if it wants to, so no future AI can reintroduce the snap.
+    float heading = 0;         // radians about +Y, body facing (actuation)
+    float desiredHeading = 0;  // radians about +Y, steering target (intent)
+    float turnVel = 0;         // current yaw rate, rad/s (ramped by turnAccel)
+    // What the intent layer asked for this tick, 0..1 of def.speed. Reset to
+    // the default each tick by the intent step, so a behaviour that stops
+    // writing it does not leave the mob sprinting forever.
+    float driveScale = 1.0f;
+    // Ticks the mob has been unable to make forward progress. Wander uses it
+    // to widen its avoidance turn rather than re-picking the same blocked
+    // direction; a mob wedged in a corner needs to escalate, not oscillate.
+    uint32_t blockedTicks = 0;
     float phase = 0;           // walk cycle
     Vec3 origin{};             // mob prefab min corner, world voxels
     uint32_t lastTurnTick = 0;
@@ -390,6 +422,45 @@ class MobSystem {
                              const std::vector<DebrisVoxel>& voxels, World& world,
                              std::vector<ParticleSpawn>& spawns) const;
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY) const;
+
+  // ---- locomotion: sense -> intent -> steer -> drive -------------------------
+  // Four stages, deliberately separated so an AI layer can be dropped in at
+  // exactly one of them without disturbing the others. Today's "wander and
+  // avoid walls" behaviour occupies only DecideIntent; a behaviour tree
+  // replaces that one function and inherits working steering and locomotion.
+
+  // What the mob can feel about the ground around it. Probed once per tick and
+  // passed down, so intent and drive cannot disagree about the terrain (they
+  // used to each run their own probe) and so a future sensor — a vision cone,
+  // a sound event, a nav query — has one obvious place to join.
+  struct GroundSense {
+    bool haveGround = false;
+    int groundY = 0;           // ground under the mob's centre column
+    // Probes fanned around the mob at kProbeCount evenly spaced yaws, each at
+    // the mob's own step-out radius. `clear[i]` is whether a body could walk
+    // that way: known footing, and no step up taller than it can climb.
+    static constexpr int kProbeCount = 8;
+    bool clear[kProbeCount] = {};
+    int stepUp[kProbeCount] = {};   // rise at that probe, voxels (INT_MAX = unknown)
+  };
+  GroundSense SenseGround(const Mob& mob, const MobDef& def, World& world) const;
+
+  // Pick this tick's desired heading and drive scale. This is THE AI seam: the
+  // only stage that gets to have an opinion, and it may write nothing except
+  // mob.desiredHeading / mob.driveScale. Currently a wander-and-avoid.
+  void DecideIntent(Mob& mob, const MobDef& def, const GroundSense& sense,
+                    uint32_t tick, float dt);
+
+  // Close the gap between heading and desiredHeading at a bounded rate, and
+  // report how well aligned the body now is (1 = facing the target, 0 = past
+  // driveAlignZero) so the drive can scale forward speed by it.
+  float Steer(Mob& mob, const MobDef& def, float dt);
+
+  // Apply the resulting motion: settle onto the ground and translate along the
+  // ACTUAL facing (never the desired one — that is what makes a turn arc).
+  void DriveLocomotion(Mob& mob, const MobDef& def, const GroundSense& sense,
+                       float align, float dt);
+
   // Animation pipeline stages 1-5 plus the procedural gait layer; leaves the
   // model-space pose in mob.anim.model. Pure float, no grid contact.
   void UpdateAnimation(Mob& mob, const MobDef& def, World& world, float dt);

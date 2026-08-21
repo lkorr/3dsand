@@ -339,6 +339,13 @@ def main():
         "scale": SCALE,
         "bleed": {"material": "blood", "perDamage": 2.0},
         "speed": 6.0,
+        # Steering limits (anim.h LocomotionDef). A small quadruped turns
+        # noticeably tighter than the humanoid defaults: it is fast, short and
+        # low, so a slow slew would read as a vehicle rather than an animal.
+        "locomotion": {
+            "turnRate": 5.2, "turnAccel": 26.0, "turnRateMoving": 0.7,
+            "driveAlignFull": 0.7, "driveAlignZero": 2.4,
+        },
         "gait": {
             "cadence": 2.6, "strideBias": 0.45, "leadTime": 0.18,
             "stepThreshold": 0.55, "stepDuration": 0.18, "stepHeight": 0.3,
