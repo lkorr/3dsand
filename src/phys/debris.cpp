@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "phys/lattice.h"
 #include "phys/marching_cubes.h"
 
 namespace {
@@ -609,8 +610,8 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     // A micro body's voxels are in 1/scale units; the GRID has no such thing.
     const std::vector<DebrisVoxel>* settleSrc = &b.voxels;
     std::vector<DebrisVoxel> downsampled;
-    if (b.micro.scale > 1) {
-      downsampled = DownsampleMicro(b.voxels, b.micro.scale);
+    if (b.physScale > 1) {
+      downsampled = DownsampleMicro(b.voxels, b.physScale);
       if (downsampled.empty()) continue;  // nothing survives: stay a body
       settleSrc = &downsampled;
     }
@@ -1016,9 +1017,33 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
   for (uint32_t c = 0; c < compSize.size(); c++) parts[c].reserve(compSize[c]);
   for (uint32_t i = 0; i < n; i++) parts[comp[i]].push_back(b.voxels[i]);
 
+  // A fine skin follows the COARSE partition: connectivity is decided once, on
+  // the collider lattice, and each skin voxel joins whichever component owns
+  // the collider block it sits in. Running a second connectivity pass on the
+  // skin would be both slower and wrong — the two could disagree about how many
+  // pieces there are, and then a fragment's art would not match its collider.
+  std::vector<std::vector<PrefabVoxel>> skinParts;
+  if (b.HasFineSkin()) {
+    const int ratio = (int)std::max(1u, b.micro.skinScale / b.physScale);
+    std::unordered_map<uint32_t, uint32_t> compOf;
+    compOf.reserve(n * 2);
+    for (uint32_t i = 0; i < n; i++)
+      compOf[LocalKey(b.voxels[i].x, b.voxels[i].y, b.voxels[i].z)] = comp[i];
+    skinParts.resize(compSize.size());
+    for (const PrefabVoxel& sv : b.skinVoxels) {
+      auto it = compOf.find(LocalKey((int)sv.x / ratio, (int)sv.y / ratio,
+                                     (int)sv.z / ratio));
+      // A skin voxel whose collider block did not survive majority-fill has no
+      // component to join; it is interior detail of a block that reads as air,
+      // and dropping it keeps skin and collider describing the same object.
+      if (it != compOf.end()) skinParts[it->second].push_back(sv);
+    }
+  }
+
   Vec3 lin{}, ang{};
   phys_->GetBodyVelocities(b.handle, lin, ang);
   b.voxels = std::move(parts[keep]);
+  if (!skinParts.empty()) b.skinVoxels = std::move(skinParts[keep]);
   bool madeBody = false;
 
   for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
@@ -1049,8 +1074,21 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       // twice too big — so it falls through to particles instead, which is
       // the same handoff every under-floor piece already takes.
       nb.micro = b.micro;
+      nb.physScale = b.physScale;  // MUST precede the pitch below
+      // The fragment's skin rebases by the SAME corner, expressed in skin
+      // units. Both lattices must land on one origin or the art slides off the
+      // collider — the same agreement ReskinMicro maintains after a carve.
+      if (!skinParts.empty()) {
+        const int ratio = (int)std::max(1u, b.micro.skinScale / b.physScale);
+        nb.skinVoxels = std::move(skinParts[c]);
+        for (PrefabVoxel& sv : nb.skinVoxels) {
+          sv.x = (int16_t)(sv.x - mn.x * ratio);
+          sv.y = (int16_t)(sv.y - mn.y * ratio);
+          sv.z = (int16_t)(sv.z - mn.z * ratio);
+        }
+      }
       nb.xf.pos += QuatRot(b.xf.quat, Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
-      const float pitch = 1.0f / (float)std::max(1u, nb.micro.scale);
+      const float pitch = 1.0f / (float)std::max(1u, nb.physScale);
       nb.handle =
           phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_, false, pitch);
       if (nb.handle != 0) {
@@ -1059,7 +1097,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
         float r = 0;
         for (const DebrisVoxel& v : nb.voxels)
           r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
-        nb.radiusVoxels = r / (float)std::max(1u, nb.micro.scale) + 2.0f;
+        nb.radiusVoxels = r / (float)std::max(1u, nb.physScale) + 2.0f;
         nb.serial = nextSerial_++;
         if (!nb.micro.Valid() || ReskinMicro(nb)) {
           RecountBurn(nb);
@@ -1087,8 +1125,15 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
 
   if (madeBody) {
     // fragment bodies occupy space the parent's old compound still covers:
-    // rebuild the parent NOW or the ghost boxes fight the new bodies
-    uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_);
+    // rebuild the parent NOW or the ghost boxes fight the new bodies.
+    //
+    // The pitch is NOT optional here: it was omitted before the skin/collider
+    // split, so a micro parent was rebuilt at pitch 1 and its collider snapped
+    // to physScale times its real size until the next RebuildCollider. The
+    // fragment path two branches up (and RebuildCollider) always passed it.
+    const float pitch = 1.0f / (float)std::max(1u, b.physScale);
+    uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_,
+                                            /*allowKinematic=*/false, pitch);
     if (nh != 0) {
       phys_->RemoveBody(b.handle);
       b.handle = nh;
@@ -1108,8 +1153,8 @@ void DebrisSystem::VoxelsToParticles(const Body& b,
   // matter it had. Sub-sampling on the micro lattice (one particle per world
   // cell) conserves the visible volume — the grid has no sub-voxel resolution
   // to receive the detail anyway.
-  const float inv = 1.0f / (float)std::max(1u, b.micro.scale);
-  const int step = (int)std::max(1u, b.micro.scale);
+  const float inv = 1.0f / (float)std::max(1u, b.physScale);
+  const int step = (int)std::max(1u, b.physScale);
   for (const DebrisVoxel& v : voxels) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) return;  // ring full: lost
     if (step > 1 && (((int)v.x % step) || ((int)v.y % step) || ((int)v.z % step)))
@@ -1157,7 +1202,9 @@ void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels) {
 }
 
 void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
-                             const BodyTransform& xf, MicroBodyRef micro) {
+                             const BodyTransform& xf, MicroBodyRef micro,
+                             uint32_t physScale,
+                             std::vector<PrefabVoxel> skinVoxels) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
@@ -1172,11 +1219,22 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
         ez = (float)(mx.z - mn.z + 1);
   // Micro rendering comes in with the body (PLAN §C4): a severed microvoxel
   // limb keeps its detail with no mob-specific code here, because the caller
-  // hands over what it already knows. The extents above are in MICRO units for
-  // such a body, so the radius divides by the scale — the +2 slack does not.
+  // hands over what it already knows. The extents above are in COLLIDER units
+  // for such a body, so the radius divides by physScale — the +2 slack does not.
+  //
+  // physScale defaults to the skin scale, which is the pre-split behaviour and
+  // stays exact for every caller whose two lattices coincide. A caller with a
+  // genuinely finer skin passes the coarser collider scale explicitly and also
+  // hands over `skinVoxels` (see AdoptBodySkin).
   body.micro = micro;
-  body.radiusVoxels =
-      0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) / (float)micro.scale + 2.0f;
+  body.physScale = physScale ? physScale : std::max(1u, micro.skinScale);
+  // Only keep the fine lattice when it actually IS finer. A caller that hands
+  // over a redundant copy at the collider's own resolution would otherwise pay
+  // for a second array that carries no extra information.
+  if (micro.skinScale > body.physScale) body.skinVoxels = std::move(skinVoxels);
+  body.radiusVoxels = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) /
+                          (float)std::max(1u, body.physScale) +
+                      2.0f;
   body.serial = nextSerial_++;
   RecountBurn(body);
   bodies_.push_back(std::move(body));
@@ -1219,7 +1277,7 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   phys_->GetBodyVelocities(b.handle, lin, ang);
   // A micro body's voxels are 1/scale world voxels on a side. Building at
   // pitch 1 would inflate a scale-2 body to twice its size and 8x its mass.
-  const float pitch = 1.0f / (float)std::max(1u, b.micro.scale);
+  const float pitch = 1.0f / (float)std::max(1u, b.physScale);
   uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_, false, pitch);
   if (nh == 0) return false;
   phys_->RemoveBody(b.handle);
@@ -1233,16 +1291,47 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   return true;
 }
 
+// Re-derive the collider lattice from the (authoritative) skin lattice.
+//
+// This is the ONE direction data flows between the two: skin -> collider,
+// never back. Keeping it one-directional is what keeps the split outside the
+// hashed domain — the skin is render state, and a collider decision that read
+// from it in the other direction would drag render state into physics.
+//
+// Called after any edit to `skinVoxels`. Cheap relative to the carve that
+// preceded it (one pass over the fine lattice, one hash map).
+void DebrisSystem::DeriveColliderFromSkin(Body& b) {
+  if (!b.HasFineSkin()) return;
+  const uint32_t ratio = std::max(1u, b.micro.skinScale / b.physScale);
+  bool overflow = false;
+  b.voxels = DownsampleSkin(b.skinVoxels, ratio, &overflow);
+  if (overflow && !skinOverflowWarned_) {
+    skinOverflowWarned_ = true;
+    std::printf(
+        "debris: skin lattice exceeded the collider's +-127 bound; part of a "
+        "body was dropped from its collider (physScale too fine for the art)\n");
+  }
+}
+
 bool DebrisSystem::ReskinMicro(Body& b) {
   if (!b.micro.Valid() || !microSet_) return false;
   int own = MicroBodyOwn(*microSet_, b.micro.model);
   if (own < 0) return false;  // pool full: keep the stale skin, stay damaged
   b.micro.model = (uint32_t)own;
+  // The brick is packed from the SKIN when there is one, and from the collider
+  // voxels when the two lattices coincide. This is the only difference between
+  // a fine-skinned body and a pre-split one, and it is why carving must edit
+  // `skinVoxels` — whatever this reads is what the player sees.
   std::vector<PrefabVoxel> mv;
-  mv.reserve(b.voxels.size());
-  for (const DebrisVoxel& v : b.voxels)
-    mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                  (uint16_t)(v.payload & 0xFFF)});
+  const bool fine = b.HasFineSkin();
+  if (fine) {
+    mv = b.skinVoxels;
+  } else {
+    mv.reserve(b.voxels.size());
+    for (const DebrisVoxel& v : b.voxels)
+      mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                    (uint16_t)(v.payload & 0xFFF)});
+  }
   IVec3 shift{};
   if (!MicroBodyEdit(*microSet_, b.micro.model, mv, shift)) return false;
   // MicroBodyEdit rebased the brick to ITS OWN min corner. The body's voxels
@@ -1254,16 +1343,31 @@ bool DebrisSystem::ReskinMicro(Body& b) {
   // Doing it here, from what MicroBodyEdit actually chose, is what keeps the
   // two frames agreeing without either side having to assume the other's.
   if (shift.x || shift.y || shift.z) {
-    const float inv = 1.0f / (float)std::max(1u, b.micro.scale);
+    const float inv = 1.0f / (float)std::max(1u, b.micro.skinScale);
     b.xf.pos += QuatRot(b.xf.quat, Vec3{(float)shift.x * inv,
                                         (float)shift.y * inv,
                                         (float)shift.z * inv});
     // Bring the body's own voxels into the brick's frame so collider rebuilds
     // and particle conversion measure from the same origin the art does.
-    for (DebrisVoxel& v : b.voxels) {
-      v.x = (int8_t)(v.x - shift.x);
-      v.y = (int8_t)(v.y - shift.y);
-      v.z = (int8_t)(v.z - shift.z);
+    if (fine) {
+      // The shift is in SKIN units, and a skin-unit shift is not generally a
+      // whole number of collider voxels: at skin 8 / collider 2 a shift of 3
+      // is 0.75 of a collider voxel. So the skin rebases exactly and the
+      // collider is RE-DERIVED from it rather than shifted to match. The
+      // derived lattice inherits the brick's origin instead of negotiating for
+      // it, which is what makes the two frames agree by construction.
+      for (PrefabVoxel& sv : b.skinVoxels) {
+        sv.x = (int16_t)(sv.x - shift.x);
+        sv.y = (int16_t)(sv.y - shift.y);
+        sv.z = (int16_t)(sv.z - shift.z);
+      }
+      DeriveColliderFromSkin(b);
+    } else {
+      for (DebrisVoxel& v : b.voxels) {
+        v.x = (int8_t)(v.x - shift.x);
+        v.y = (int8_t)(v.y - shift.y);
+        v.z = (int8_t)(v.z - shift.z);
+      }
     }
   }
   return true;
@@ -1273,22 +1377,44 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
                               std::vector<ParticleSpawn>& spawns,
                               std::vector<Body>& fragments,
                               uint32_t& newBodyBudget, bool eject,
-                              const std::function<bool(const DebrisVoxel&)>& keep) {
+                              const CarveFactory& carveAt) {
   Body& b = bodies_[bi];
   phys_->GetTransform(b.handle, b.xf);
 
+  const bool fine = b.HasFineSkin();
+  // The collider predicate always exists; the skin one only when the skin is a
+  // separate lattice. Both describe the SAME world-space volume.
+  const auto keep = carveAt((float)std::max(1u, b.physScale));
+
   std::vector<DebrisVoxel> removed;
   for (const DebrisVoxel& v : b.voxels)
-    if (!keep(v)) removed.push_back(v);
+    if (!keep((float)v.x, (float)v.y, (float)v.z)) removed.push_back(v);
   if (removed.empty()) return true;  // nothing in range
 
   Vec3 lin{}, ang{};
   phys_->GetBodyVelocities(b.handle, lin, ang);
   if (eject) VoxelsToParticles(b, removed, lin, ang, world, spawns);
 
-  b.voxels.erase(std::remove_if(b.voxels.begin(), b.voxels.end(),
-                                [&](const DebrisVoxel& v) { return !keep(v); }),
-                 b.voxels.end());
+  if (fine) {
+    // The SKIN is authoritative: carve it at its own resolution, then re-derive
+    // the collider from what survived. Carving the two independently would let
+    // them disagree about the shape; deriving one from the other cannot.
+    const auto keepSkin = carveAt((float)std::max(1u, b.micro.skinScale));
+    b.skinVoxels.erase(
+        std::remove_if(b.skinVoxels.begin(), b.skinVoxels.end(),
+                       [&](const PrefabVoxel& v) {
+                         return !keepSkin((float)v.x, (float)v.y, (float)v.z);
+                       }),
+        b.skinVoxels.end());
+    DeriveColliderFromSkin(b);
+  } else {
+    b.voxels.erase(
+        std::remove_if(b.voxels.begin(), b.voxels.end(),
+                       [&](const DebrisVoxel& v) {
+                         return !keep((float)v.x, (float)v.y, (float)v.z);
+                       }),
+        b.voxels.end());
+  }
   instancesDirty_ = true;
 
   // Wholly destroyed, or blown under the body-worthiness floor: the remainder
@@ -1325,7 +1451,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   float r = 0;
   for (const DebrisVoxel& v : b.voxels)
     r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
-  b.radiusVoxels = r / (float)std::max(1u, b.micro.scale) + 2.0f;
+  b.radiusVoxels = r / (float)std::max(1u, b.physScale) + 2.0f;
   b.burnCursor = b.voxels.empty() ? 0 : b.burnCursor % (uint32_t)b.voxels.size();
   RecountBurn(b);
   return true;
@@ -1347,32 +1473,43 @@ void DebrisSystem::DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels,
       bi++;
       continue;
     }
-    // Blast centre into body-local MICRO units, so the per-voxel test is a
-    // plain distance compare in the frame the voxels live in.
-    const float scale = (float)std::max(1u, b.micro.scale);
+    // Blast centre into body-local units. The predicate is built PER LATTICE:
+    // the same world-space sphere, expressed at whatever resolution the lattice
+    // it is testing lives in. That is what lets one carve edit a fine skin and
+    // a coarse collider without either one having to know about the other.
     const float q[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2], b.xf.quat[3]};
-    Vec3 cLocal = QuatRot(q, centerVoxel - b.xf.pos) * scale;
-    const float rLocal2 = r2 * scale * scale;
+    const Vec3 cBody = QuatRot(q, centerVoxel - b.xf.pos);
     // Deterministic-enough jitter so the crater rim is ragged rather than a
     // billiard-ball scoop. This is CPU gameplay state (bodies are outside the
     // hashed domain), so a float hash is fine here — rule 1 governs the grid.
     const uint32_t seed = b.serial;
+    // Jitter is keyed on the SKIN lattice for both tests, so the crater's rim
+    // pattern is a property of the art rather than of whatever collider
+    // resolution the engine happened to pick. Without this the same explosion
+    // would rag differently depending on physScale.
+    const uint32_t jScale = std::max(1u, b.micro.skinScale);
 
-    bool alive = DamageBody(
-        bi, world, spawns, fragments, budget, true,
-        [&](const DebrisVoxel& v) {
-          Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
-          Vec3 dv = c - cLocal;
-          float d2 = dv.dot(dv);
-          if (d2 >= rLocal2) return true;  // outside the blast
-          // Falloff: certain removal in the core, thinning toward the rim.
-          float t = std::sqrt(d2 / rLocal2);       // 0 centre .. 1 rim
-          float chance = 1.0f - t * t;             // quadratic, wide core
-          uint32_t h = Hash3(seed, (uint32_t)(int32_t)v.x * 73856093u,
-                             (uint32_t)(int32_t)v.y * 19349663u ^
-                                 (uint32_t)(int32_t)v.z * 83492791u);
-          return (float)(h & 0xFFFFu) / 65535.0f >= chance;
-        });
+    auto carve = [&](float lat) {
+      const float sc = lat;
+      const Vec3 cLocal = cBody * sc;
+      const float rLocal2 = r2 * sc * sc;
+      const float jMul = (float)jScale / sc;  // lattice coord -> skin coord
+      return [=](float vx, float vy, float vz) {
+        Vec3 c{vx + 0.5f, vy + 0.5f, vz + 0.5f};
+        Vec3 dv = c - cLocal;
+        float d2 = dv.dot(dv);
+        if (d2 >= rLocal2) return true;  // outside the blast
+        // Falloff: certain removal in the core, thinning toward the rim.
+        float t = std::sqrt(d2 / rLocal2);  // 0 centre .. 1 rim
+        float chance = 1.0f - t * t;        // quadratic, wide core
+        int jx = (int)(vx * jMul), jy = (int)(vy * jMul), jz = (int)(vz * jMul);
+        uint32_t h = Hash3(seed, (uint32_t)jx * 73856093u,
+                           (uint32_t)jy * 19349663u ^ (uint32_t)jz * 83492791u);
+        return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+      };
+    };
+
+    bool alive = DamageBody(bi, world, spawns, fragments, budget, true, carve);
     if (alive) bi++;
   }
   for (Body& f : fragments) {
@@ -1392,24 +1529,28 @@ bool DebrisSystem::MeltBodyAt(uint64_t handle, Vec3 pointVoxel,
 
   Body& b = bodies_[bi];
   phys_->GetTransform(b.handle, b.xf);
-  const float scale = (float)std::max(1u, b.micro.scale);
   const float q[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2], b.xf.quat[3]};
-  Vec3 pLocal = QuatRot(q, pointVoxel - b.xf.pos) * scale;
-  const float rLocal = radiusVoxels * scale;
-  const float rLocal2 = rLocal * rLocal;
+  const Vec3 pBody = QuatRot(q, pointVoxel - b.xf.pos);
+  const float r2 = radiusVoxels * radiusVoxels;
 
   std::vector<Body> fragments;
   uint32_t budget = kMaxNewBodiesPerTick;
+  // Same world-space sphere, re-expressed per lattice — see DamageBodiesRadial.
+  // A clean bore, so no jitter and nothing keyed on a lattice at all.
+  auto carve = [&](float lat) {
+    const Vec3 pLocal = pBody * lat;
+    const float rLocal2 = r2 * lat * lat;
+    return [=](float vx, float vy, float vz) {
+      Vec3 c{vx + 0.5f, vy + 0.5f, vz + 0.5f};
+      Vec3 dv = c - pLocal;
+      return dv.dot(dv) >= rLocal2;
+    };
+  };
   // eject=false: the beam vaporizes. A held laser damages every tick, and
   // spraying particles from each one would drain the spawn ring in a second.
   // The return says whether the body survived; either way the hit landed, and
   // fragments still have to be adopted below.
-  DamageBody(bi, world, spawns, fragments, budget, false,
-             [&](const DebrisVoxel& v) {
-               Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
-               Vec3 dv = c - pLocal;
-               return dv.dot(dv) >= rLocal2;
-             });
+  DamageBody(bi, world, spawns, fragments, budget, false, carve);
   for (Body& f : fragments) {
     bodies_.push_back(std::move(f));
     instancesDirty_ = true;

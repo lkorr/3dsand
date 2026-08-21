@@ -251,3 +251,18 @@ add_executable(voxload_test
 )
 target_include_directories(voxload_test PRIVATE src)
 target_compile_definitions(voxload_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+# ---------------------------------------------------------------------------
+# lattice_test — CPU-only harness for the skin/collider lattice bridge
+# (phys/lattice.h). Header-only dependency, so no engine sources to link.
+#
+# Asserts what a screenshot cannot: that a carve at skin resolution keeps
+# detail the collider cannot express, that the derived collider still agrees
+# with the skin about the body's extent, and that the int8 collider bound is
+# enforced by DROPPING out-of-range blocks rather than wrapping them to the
+# far side of the body.
+# ---------------------------------------------------------------------------
+add_executable(lattice_test tests/lattice_test.cpp)
+target_include_directories(lattice_test PRIVATE src)
+target_compile_definitions(lattice_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(lattice_test PRIVATE webgpu_cpp)

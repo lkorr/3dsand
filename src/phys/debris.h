@@ -78,8 +78,16 @@ class DebrisSystem {
   // Defaulted, so plain-debris callers are unchanged; a severed micro limb keeps
   // its detail purely by the caller passing what it already knows, with no
   // mob-specific code on this side.
+  //
+  // `physScale` is the units of `voxels` (the collider lattice). 0 means "same
+  // as the skin", which is the pre-split behaviour and correct whenever the two
+  // coincide. A body whose skin is FINER than its collider passes the coarser
+  // value here and hands over `skinVoxels` — the fine lattice, in skinScale
+  // units — which then becomes the authoritative shape for carving.
   void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
-                 const BodyTransform& xf, MicroBodyRef micro = {});
+                 const BodyTransform& xf, MicroBodyRef micro = {},
+                 uint32_t physScale = 0,
+                 std::vector<PrefabVoxel> skinVoxels = {});
 
   // Laser body cut (PLAN §C2): partition a body's voxels by the world-space
   // plane (point, normal), destroy it, spawn both halves at the same pose
@@ -156,13 +164,38 @@ class DebrisSystem {
   };
   struct Body {
     uint64_t handle = 0;
+    // The COLLIDER lattice, in `physScale` units per world voxel. int8, so
+    // +-120 per axis — this is the bound that decides how fine physics can be,
+    // and it is why physScale is chosen to fit rather than authored.
     std::vector<DebrisVoxel> voxels;
+    // The SKIN lattice, in `micro.skinScale` units per world voxel. int16, so
+    // it has room the collider does not (voxload.h PrefabVoxel).
+    //
+    // Empty when skinScale == physScale: the two lattices coincide, `voxels`
+    // serves both, and every pre-split body behaves exactly as it did. Only a
+    // body whose skin is genuinely finer pays the second array. `SkinSrc()`
+    // hides the distinction from readers.
+    //
+    // When populated this is the AUTHORITATIVE shape: carving edits it, and
+    // `voxels` is re-derived from it by majority-fill. Deriving rather than
+    // carving both in parallel is what makes skin/collider drift
+    // unrepresentable instead of merely tested.
+    std::vector<PrefabVoxel> skinVoxels;
     BodyTransform xf{};
     float radiusVoxels = 0;
     // Microvoxel rendering, handed over by the adopting caller and OWNED here
     // from then on — so a severed micro limb keeps its detail as ordinary
     // debris, and the description cannot outlive the body it describes.
     MicroBodyRef micro{};
+    // Collider voxels per world voxel: the units of `voxels`, the pitch the
+    // Jolt collider is built at, and the divisor for every world-space
+    // quantity derived from a body-local coordinate (radius, particle
+    // positions, settle-back downsample).
+    uint32_t physScale = 1;
+    // True when the skin is finer than the collider and `skinVoxels` is live.
+    bool HasFineSkin() const {
+      return !skinVoxels.empty() && micro.skinScale > physScale;
+    }
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
@@ -211,17 +244,27 @@ class DebrisSystem {
                          std::vector<ParticleSpawn>& spawns) const;
 
   // ---- shared damage core ----------------------------------------------------
-  // `keep(v)` decides which of `b`'s voxels survive. Removed voxels become
-  // particles when `eject`, else vanish. Handles the micro re-skin, the
-  // collider rebuild, the connectivity split and the dissolve-to-rubble floor,
-  // so explosions, the laser and (in time) any other damage source all behave
-  // identically. Returns false when the body was destroyed outright, in which
-  // case `bi` now indexes a DIFFERENT body (swap-and-pop) and the caller must
-  // not advance.
+  //
+  // A carve is described ONCE, in world space, and asked to express itself at
+  // whichever lattice resolution is being tested: `carveAt(scale)` returns a
+  // `keep(x, y, z)` predicate over body-local coordinates at `scale` units per
+  // world voxel. A body with a finer skin is carved twice from the same
+  // description — once on the skin, and the collider re-derived from it — which
+  // is why the caller hands over a factory rather than a fixed predicate.
+  //
+  // Coordinates are floats rather than a voxel struct so one predicate serves
+  // both int8 DebrisVoxel and int16 PrefabVoxel without a template.
+  using CarveKeep = std::function<bool(float, float, float)>;
+  using CarveFactory = std::function<CarveKeep(float)>;
+  // Removed voxels become particles when `eject`, else vanish. Handles the
+  // micro re-skin, the collider rebuild, the connectivity split and the
+  // dissolve-to-rubble floor, so explosions, the laser and (in time) any other
+  // damage source all behave identically. Returns false when the body was
+  // destroyed outright, in which case `bi` now indexes a DIFFERENT body
+  // (swap-and-pop) and the caller must not advance.
   bool DamageBody(size_t bi, World& world, std::vector<ParticleSpawn>& spawns,
                   std::vector<Body>& fragments, uint32_t& newBodyBudget,
-                  bool eject,
-                  const std::function<bool(const DebrisVoxel&)>& keep);
+                  bool eject, const CarveFactory& carveAt);
   // Rebuild a body's Jolt collider from its current voxels, preserving pose and
   // velocity. Micro bodies pass voxelPitch = 1/scale — a scale-2 body's voxels
   // are half-size, and building it at pitch 1 would double its physical volume
@@ -232,6 +275,10 @@ class DebrisSystem {
   // collider. No-op for cube-path bodies. Returns false if the pool is full,
   // in which case the body keeps its stale skin but is still really damaged.
   bool ReskinMicro(Body& b);
+  // Re-derive the collider lattice from the authoritative skin lattice by
+  // majority-fill. No-op unless the body actually has a finer skin. Data flows
+  // skin -> collider and never the other way; see the impl comment.
+  void DeriveColliderFromSkin(Body& b);
   // The pose fix-up both damage and split need: rebasing voxels to a new min
   // corner moves the body origin, so the transform must move the other way.
   static void RebaseVoxels(std::vector<DebrisVoxel>& voxels, BodyTransform& xf);
@@ -250,6 +297,10 @@ class DebrisSystem {
   // Shared micro brick pool (owned by main, uploaded by Simulation). Damaged
   // micro bodies allocate private models out of it — see SetMicroSet.
   MicroBodySet* microSet_ = nullptr;
+  // One-shot: a skin lattice that overflowed the collider's int8 bound is an
+  // authoring problem, and repeating it every carve would bury the diagnostic
+  // it is trying to deliver.
+  bool skinOverflowWarned_ = false;
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;

@@ -163,9 +163,23 @@ void MicroBodyFree(MicroBodySet& set, uint32_t model);
 //
 // The routing key is still the BODY, not "is a mob limb": that is what makes a
 // severed micro limb keep its detail with no special case at the adoption site.
+//
+// RENDER ONLY. This struct describes the SKIN and nothing else. It used to
+// carry a single `scale` that also defined the units of the body's collider
+// voxels, which is what capped micro bodies at 4: the collider lives in
+// DebrisVoxel (int8, +-120), so a finer skin bought a proportionally smaller
+// creature. The two now move independently — `skinScale` here, `physScale` on
+// the body — because their costs are unrelated. The brick march is a fragment
+// shader over one OBB, so skin cost tracks SCREEN AREA; the collider is Jolt
+// boxes, so physics cost tracks VOXEL COUNT. Coupling them held the cheap axis
+// hostage to the expensive one.
 struct MicroBodyRef {
   // kMicroBodyNoModel = ordinary cube path (plain debris, scale-1 limbs).
   uint32_t model = kMicroBodyNoModel;
-  uint32_t scale = 1;  // micro voxels per world voxel; the body's voxels are in these
+  // Micro voxels per world voxel in the BRICK. The body's `skinVoxels` are in
+  // these units; its collider `voxels` are in `Body::physScale` units, which
+  // may be coarser. Equal values are the ordinary case and mean the two
+  // lattices coincide exactly as they did before the split.
+  uint32_t skinScale = 1;
   bool Valid() const { return model != kMicroBodyNoModel; }
 };
