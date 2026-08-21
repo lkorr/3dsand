@@ -2280,6 +2280,7 @@ function buildUI(section) {
   canvas = el('canvas', { class: 'edcanvas', tabindex: '0' });
   host = el('div', { class: 'edviewport' }, canvas);
   ui.side = el('div', { class: 'edside' });          // rig.js fills this
+  ui.grip = buildSideGrip();                         // drag its left edge to resize
   ui.timeline = el('div', { class: 'edtimeline' });  // ...and this
 
   ui.note = el('div', { class: 'hint edhelp' },
@@ -2289,8 +2290,88 @@ function buildUI(section) {
     '? for the full cheat sheet');
 
   section.append(bar1, bar2, ui.help, buildWheelPanel(), ui.palette,
-    el('div', { class: 'edmain' }, host, ui.side),
+    el('div', { class: 'edmain' }, host, ui.grip, ui.side),
     ui.timeline, ui.note);
+}
+
+/* The rig panel's width is a working preference, not model data: a rigging
+   pass wants it wide enough to read limb names, a painting pass wants the
+   viewport back. So it drags, and the width persists per browser.
+
+   Pointer events (not mouse) with setPointerCapture, so the drag survives the
+   pointer crossing the WebGL canvas — which swallows mousemove for painting —
+   and so a pen/touch drag works the same way. */
+const kSideWKey = 'sandvox.editor.sideW';
+const kSideWMin = 200;
+
+function clampSideW(px, mainW) {
+  // Leave the viewport at least its CSS min-width, so dragging cannot collapse
+  // the thing being edited. mainW is unknown before first layout; fall back to
+  // a generous cap rather than clamping to nothing.
+  const max = Math.max(kSideWMin, (mainW || window.innerWidth) - 240);
+  return Math.round(Math.max(kSideWMin, Math.min(max, px)));
+}
+
+function setSideW(px, mainW) {
+  if (!ui.side) return;
+  ui.side.style.width = clampSideW(px, mainW) + 'px';
+  // The canvas is CSS-sized (width:100%), so the drawing buffer only follows
+  // if we tell it to — window 'resize' does not fire for a flex reflow.
+  resize();
+}
+
+function buildSideGrip() {
+  const grip = el('div', {
+    class: 'edgrip',
+    title: 'drag to resize the panel · double-click to reset',
+  });
+
+  grip.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const main = grip.parentElement;
+    const startX = e.clientX;
+    const startW = ui.side.getBoundingClientRect().width;
+    const mainW = main ? main.getBoundingClientRect().width : 0;
+    grip.setPointerCapture(e.pointerId);
+    grip.classList.add('dragging');
+    document.body.classList.add('edresizing');
+
+    // Dragging LEFT widens the panel, hence the negated delta.
+    const move = ev => setSideW(startW - (ev.clientX - startX), mainW);
+    const up = ev => {
+      grip.releasePointerCapture?.(ev.pointerId);
+      grip.classList.remove('dragging');
+      document.body.classList.remove('edresizing');
+      grip.removeEventListener('pointermove', move);
+      grip.removeEventListener('pointerup', up);
+      grip.removeEventListener('pointercancel', up);
+      try { localStorage.setItem(kSideWKey, String(Math.round(
+        ui.side.getBoundingClientRect().width))); } catch (_) { /* private mode */ }
+    };
+    grip.addEventListener('pointermove', move);
+    grip.addEventListener('pointerup', up);
+    grip.addEventListener('pointercancel', up);
+  });
+
+  grip.addEventListener('dblclick', () => {
+    setSideW(320, grip.parentElement?.getBoundingClientRect().width || 0);
+    try { localStorage.removeItem(kSideWKey); } catch (_) { /* private mode */ }
+  });
+
+  return grip;
+}
+
+// Re-apply the stored width once the tab is actually laid out. Called from
+// init(); before the Models tab is shown every rect is 0 and clamping the
+// stored value against a 0-wide parent would throw the preference away.
+function restoreSideW() {
+  let saved = 0;
+  try { saved = +localStorage.getItem(kSideWKey) || 0; } catch (_) { /* ignore */ }
+  if (!saved || !ui.side) return;
+  const mainW = ui.side.parentElement?.getBoundingClientRect().width || 0;
+  if (mainW <= 0) return;            // not visible yet; leave the CSS default
+  setSideW(saved, mainW);
 }
 
 // The in-app cheat sheet behind the [?] button. The full walkthrough lives in
@@ -2660,6 +2741,9 @@ export function activate() {
     if (!a.ok) hooks.toast('vox.js axis self-test FAILED: ' + a.error, true);
   }
 
+  // Runs on every tab activation, not just the first: this is the earliest
+  // point at which the section is visible and the flex row has a real width.
+  restoreSideW();
   resize();
   updateMirrorPlane();
   updateMicroGhost();

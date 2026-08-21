@@ -316,8 +316,13 @@ Three routes, all engine-supported:
 | `K` | rig | gait walk preview |
 | `P` | clips | play / stop clip |
 | `I` | clips | write key at cursor |
+| Drag left edge | rig panel | resize the panel (double-click resets to 320px) |
 
 Keys never fire while you're typing in a field.
+
+The rig panel's width is remembered per browser, so a rigging pass can keep it
+wide for readable limb names and a painting pass can hand the width back to the
+viewport. It stops at 200px, and never shrinks the viewport below 220px.
 
 ---
 
