@@ -6406,6 +6406,7 @@ function engMakeStage(s){
 }
 
 let engRendered=false;
+window.renderEngine=renderEngine;
 function renderEngine(){
   const root=document.getElementById('view-engine');
   if(!root)return;
