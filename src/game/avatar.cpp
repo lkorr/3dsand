@@ -42,6 +42,31 @@ constexpr float kMaxLeadLegLengths = 0.9f;
 constexpr float kMinSwingScale = 0.35f;
 constexpr float kMinSwingSeconds = 0.09f;
 
+// THE STRIDE BUDGET — why the feet trailed no matter how the gait was tuned.
+//
+// Only ONE leg may swing at a time, so during a swing the body advances
+// `speed * swingDuration` while the swinging foot advances at most its reach:
+// the stance point plus the capped lead, i.e. ~kMaxLeadLegLengths * legLength
+// ahead of where the body will be. If the body's travel exceeds that, the foot
+// lands BEHIND where it lifted off relative to the body, every single step. The
+// error is cumulative and unbounded, so the planted foot ratchets backwards
+// until the leg is straight and pointing away — and since a foot can then never
+// get back out in front, the legs sit permanently behind the character instead
+// of alternating fore and aft.
+//
+// The numbers on this rig at kVoxelMeters 0.10 (walk 35 world vox/s, legLength
+// ~5.79 vox): the body covers 35 * 0.171 = 6.00 voxels per swing against a
+// 5.21-voxel lead cap. Net -0.79 voxels PER STEP. No cadence, threshold or
+// lead-time value can fix that, because the budget itself is negative — which
+// is why tuning it repeatedly changed nothing.
+//
+// So bound the swing by the budget instead of hoping a constant fits: the
+// duration is whatever keeps the body's travel inside the distance the foot can
+// actually gain. Expressed as a fraction so the foot lands with margin rather
+// than exactly at full extension (a foot that lands at maximum reach is a
+// straight, locked leg — the pose we are trying to avoid).
+constexpr float kSwingTravelFrac = 0.7f;
+
 ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
                           bool micro, int lifeTicks, int microScale) {
   ParticleSpawn s{};
@@ -463,16 +488,30 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
       f.swinging = false;
     }
     if (f.swinging) {
-      // SWING TIME SHORTENS WITH SPEED. A fixed stepDuration is what actually
-      // caps the stride: only one leg may swing at a time, so the body keeps
-      // advancing for the whole swing and the planted foot falls further behind
-      // the faster you go — the leg ends up permanently over-extended and the
-      // IK just points it backward. Real gaits shorten the swing as they speed
-      // up; dividing by speedFactor does the same here and keeps the distance
-      // covered per step roughly constant in leg lengths. Clamped so a crawl
-      // does not get an infinitely long swing and a sprint keeps a visible arc.
+      // SWING TIME IS BOUNDED BY THE STRIDE BUDGET, not just scaled by speed.
+      //
+      // Scaling by speedFactor (the previous fix) is directionally right — a
+      // faster gait does swing faster — but it is still a CONSTANT divided by a
+      // number, so nothing ties it to the distance the leg can actually cover.
+      // On this rig it settles at 0.171 s at walk pace, during which the body
+      // travels 6.00 voxels against a 5.21-voxel reach: negative budget, feet
+      // ratchet backwards forever. See kSwingTravelFrac above.
+      //
+      // So take the speed-scaled duration as the DESIRED swing and then cap it
+      // at the budget: the swing may never last longer than it takes the body
+      // to consume the ground the foot is able to gain. At walk pace that caps
+      // 0.171 s at ~0.104 s, which turns a -0.79 voxel net step into a positive
+      // one — the foot lands ahead of the body and the legs alternate fore and
+      // aft the way they should. At low speed the budget is enormous and the
+      // speed scaling governs, so a slow walk is unaffected.
       float durScale = std::clamp(speedFactor, kMinSwingScale, 1.5f);
       float dur = std::max(g.stepDuration / durScale, kMinSwingSeconds);
+      const float reach = kMaxLeadLegLengths * f.legLength;
+      if (speedNow_ > 0.01f) {
+        float budget = kSwingTravelFrac * reach / speedNow_;
+        dur = std::min(dur, budget);
+      }
+      dur = std::max(dur, kMinSwingSeconds);
       f.swingT += dt / dur;
       if (f.swingT >= 1.0f) {
         f.swingT = 0;
@@ -580,7 +619,41 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
   footInit_ = true;
 }
 
-void PlayerAvatar::UpdateAnimation(float dt, World& world) {
+// THE LEGS MUST NOT BE IK-DRIVEN IN MID-AIR.
+//
+// `f.planted` is a WORLD-SPACE point. On the ground that is exactly right: the
+// foot stays put while the body moves over it, which is what a planted foot is.
+// In the air it is a trap. The ground probe scans DOWNWARD only (24 voxels from
+// the sole), so in a fall it misses every tick and the goal degrades to the
+// sole's current height — but nothing ever re-plants the foot, so `planted`
+// stays at the world position where the ground USED to be while the body
+// plummets away from it. Within a few ticks that stale point is ABOVE the hip,
+// and AnimSolveTwoBone does exactly what it is asked: it aims the leg up at the
+// target. The legs fold up through the pelvis and end up inverted inside the
+// torso and head — the "legs invert entirely and fall upside down inside the
+// model" report. It is not floppiness or a weak constraint; it is the IK
+// faithfully solving for a target that should not exist.
+//
+// There is no sensible foot target in the air, so we do not invent one: the
+// legs simply relax to the rest hang the flatten pass already produced, and the
+// foot states are parked so the first grounded tick re-plants from scratch
+// rather than resuming a swing that began before the jump.
+void PlayerAvatar::UpdateAirPose(float dt) {
+  (void)dt;
+  for (FootState& f : anim_.feet) {
+    f.swinging = false;
+    f.swingT = 0;
+  }
+  // Force a fresh plant on landing. Without this the first grounded tick would
+  // measure drift against a plant left over from before take-off — anywhere in
+  // the world — and immediately fire a bogus step (and a bogus footstep sound).
+  footInit_ = false;
+  bodyY_ = origin_.y;
+  bodyUp_ = (bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
+  if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
+}
+
+void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded) {
   const AnimSkeleton& sk = def_->skel;
   AnimState& st = anim_;
   if (sk.parts.empty()) return;
@@ -673,8 +746,12 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world) {
 
   AnimFlatten(sk, st);
 
-  const bool gaitActive = g.present && !clipOwnsPose;
-  if (gaitActive) {
+  // `grounded` is part of the gate, not just an input to it: a gait with no
+  // floor under it has no meaningful foot target (see UpdateAirPose).
+  const bool gaitActive = g.present && !clipOwnsPose && grounded;
+  if (!grounded && !clipOwnsPose) {
+    UpdateAirPose(dt);
+  } else if (gaitActive) {
     UpdateGait(dt, world);
   } else {
     float targetY = origin_.y + (loco ? loco->bodyYOffset : 0.0f);
@@ -748,7 +825,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
                    player.pos.z - def.worldSize.z * 0.5f};
     heading_ = heading;
 
-    UpdateAnimation(dt, world);
+    UpdateAnimation(dt, world, player.grounded);
 
     // ---- air state clips ----
     // Grounded transitions drive jump/land; sustained air drives fall. Kept
@@ -829,9 +906,6 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     Quat tilt = QuatFromTo({0, 1, 0}, bodyUp_);
     Quat bodyRot = Mul(tilt, yaw);
     Vec3 pivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
-    Vec3 rootAnchor = def.skel.parts.empty()
-                          ? Vec3{}
-                          : def.skel.parts[def.rootLimb].anchorLocal;
     Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
     for (size_t i = 0; i < parts.size(); i++) {
       Part& p = parts[i];
@@ -840,9 +914,14 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       Quat local = i < anim_.model.size() ? anim_.model[i].rot : Quat{};
       Vec3 modelPos = i < anim_.model.size() ? anim_.model[i].pos : Vec3{};
       Quat rot = QuatNormalize(Mul(bodyRot, local));
-      Vec3 anchorPrefab = modelPos + rootAnchor;
+      // modelPos is already in prefab coordinates: AnimFlatten starts from the
+      // root's rest.pos which IS rootAnchor, so every part's model pos already
+      // contains the root offset. Adding rootAnchor again shifts the entire rig
+      // by (pivot) from the player — invisible on a mob (nothing external tracks
+      // mob.origin), but on the avatar the camera sits at player.pos and the
+      // body must be there too. Using modelPos directly cancels the offset.
       Vec3 anchorW =
-          bodyOrigin + pivot + Rotate(bodyRot, anchorPrefab - pivot);
+          bodyOrigin + pivot + Rotate(bodyRot, modelPos - pivot);
       Vec3 pos = anchorW - Rotate(rot, p.anchorLimb);
       float q[4] = {rot.x, rot.y, rot.z, rot.w};
       phys_->MoveKinematicBody(p.body, pos, q, dt);
