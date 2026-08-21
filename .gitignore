@@ -27,9 +27,9 @@ dist/
 # tuner Notes tab — local engineering notes, not part of the engine
 notes/
 
-# live coordination log between parallel Claude sessions (scripts/board.sh).
-# Deliberately untracked: it is session state, and tracking the very file meant
-# to prevent collisions would make it a merge-conflict site itself.
+# Stale agent-board log from before worktrees replaced it (scripts/board.sh and
+# AGENTS_BOARD.md are both gone). Kept ignored so an old checkout's leftover
+# log does not show up as untracked in a fresh worktree.
 AGENTS_BOARD.md
 
 # Claude Code worktrees: one isolated checkout per parallel agent session
