@@ -21,7 +21,7 @@
     "stepThreshold": 0.3,
     "stepDuration": 0.1,
     "stepHeight": 0.18,
-    "rideHeight": 0.94,
+    "rideHeight": 1.22,
     "bobAmp": 0.045,
     "bobFreqMul": 2.0,
     "swayAmp": 0.03,

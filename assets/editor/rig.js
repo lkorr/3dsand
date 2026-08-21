@@ -1096,7 +1096,12 @@ function modelTransform(modelIndex) {
   // Body height: the whole rig rides on bodyY relative to its rest ground.
   let dy = 0;
   if (gaitOn && skel.gait.present && anim.feet.length) {
-    const restY = skel.gait.rideHeight * (anim.feet[0].legLength || 1);
+    // Same frame as anim.js/mob.cpp: bodyY is the prefab min corner, and the
+    // rest stance is the sole height plus the rideHeight trim about it. Using
+    // the old `rideHeight * legLength` here would offset the preview by a leg
+    // length against the engine.
+    const restY = AN.restSoleY(skel) +
+                  (skel.gait.rideHeight - 1) * (anim.feet[0].legLength || 1);
     dy = anim.bodyY - restY;
   }
 

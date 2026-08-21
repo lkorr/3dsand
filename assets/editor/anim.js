@@ -566,7 +566,11 @@ export function updateGait(sk, st, ctx, dt) {
 
   // ---- body from feet ---- mob.cpp:714
   if (nFeet > 0) {
-    const targetY = sumY / nFeet + g.rideHeight * st.feet[0].legLength;  // :717
+    // bodyY is the prefab MIN CORNER, so the foot average is converted out of
+    // the sole's frame; rideHeight is a stance trim ABOUT the authored rest
+    // pose (1.0 = stand as modelled), not an absolute lift. Mirrors mob.cpp.
+    const stance = (g.rideHeight - 1) * st.feet[0].legLength;
+    const targetY = sumY / nFeet - restSoleY(sk) + stance;     // :717
     if (!ctx.footInit) {                                       // :720
       st.bodyY = targetY;
       ctx.footInit = true;
@@ -909,6 +913,25 @@ export function chainLegLength(sk, chain) {
   for (let k = 1; k < chain.parts.length; k++)
     len += vlen(sk.parts[chain.parts[k]].rest.pos);
   return Math.max(len, 1);
+}
+
+/**
+ * Rest sole height above the prefab min corner — mob.cpp MobSystem::Spawn.
+ * Walk each leg chain's rest offsets down from the root and keep the lowest
+ * effector anchor. This is what converts the foot plane (a sole height) into
+ * the min-corner frame bodyY is expressed in; without it the rig floats by
+ * roughly a leg length, which is the bug this mirrors the fix for.
+ */
+export function restSoleY(sk) {
+  let lowest = 0, any = false;
+  for (const ch of sk.chains || []) {
+    if (ch.tag !== 'leg' || !ch.parts.length) continue;
+    let y = sk.parts[ch.parts[0]].anchorLocal.y;
+    for (let k = 1; k < ch.parts.length; k++)
+      y += sk.parts[ch.parts[k]].rest.pos.y;
+    if (!any || y < lowest) { lowest = y; any = true; }
+  }
+  return any ? lowest : 0;
 }
 
 /* ============================================================================

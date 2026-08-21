@@ -823,6 +823,34 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     }
   }
 
+  // FOOT CLEARANCE — the number that says whether the mob is standing on the
+  // ground or hovering over it. The elevation table above is all angles, and a
+  // rig floating ten voxels up poses exactly as correctly as one on the floor,
+  // which is how a whole-body hover stayed invisible in this output.
+  //
+  // Measured as the lowest occupied voxel of any live limb minus the terrain
+  // height under it: ~0 is standing, positive is hovering, negative is sunk.
+  {
+    float lowest = 0;
+    bool any = false;
+    for (size_t i = 0; i < def.limbs.size(); i++) {
+      if (!mobs.LimbBody(id, (int)i)) continue;
+      uint32_t n = mobs.LimbVoxelCount(id, (int)i);
+      for (uint32_t v = 0; v < n; v++) {
+        Vec3 p = mobs.LimbVoxelPos(id, (int)i, v);
+        if (!any || p.y < lowest) { lowest = p.y; any = true; }
+      }
+    }
+    if (any) {
+      int gy = World::TerrainHeight(ifloor(mobs.MobOrigin(id).x + def.worldSize.x * 0.5f),
+                                    ifloor(mobs.MobOrigin(id).z + def.worldSize.z * 0.5f),
+                                    kDefaultSeed);
+      std::printf("--shot-mob: foot clearance %.2f voxels (lowest limb voxel "
+                  "y=%.2f, terrain y=%d; ~0 = standing)\n",
+                  lowest - (float)(gy + 1), lowest, gy);
+    }
+  }
+
   // body upload, same slot agreement as the frame loop: debris first, mobs after
   std::vector<BodyXformGpu> xf;
   BuildBodyXforms(debris, mobs, nullptr, xf);

@@ -856,6 +856,33 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
       len += def.skel.parts[ch.parts[k]].rest.pos.len();
     mob.anim.feet[c].legLength = std::max(len, 1.0f);
   }
+  // Rest sole height above the prefab min corner: walk each leg chain's rest
+  // offsets down from the root and keep the LOWEST effector anchor. Measured
+  // from the rig rather than authored, for the same reason legLength is — the
+  // art moves, and a hand-tuned constant would silently rot when it does.
+  //
+  // This lands on the ANKLE PIVOT, not the bottom of the shoe, so a rig whose
+  // foot art hangs below its pivot sits low by that overhang. Deliberately not
+  // "fixed" by measuring the effector's own voxels: the foot models do not
+  // share a local frame (the critter's is flipped), so that correction helps
+  // one rig and pushes another several voxels into the air. `rideHeight` is the
+  // authored per-rig trim for exactly this residual — see the stance term in
+  // UpdateGait — and it is already within a voxel on every current def.
+  {
+    float lowest = 0;
+    bool any = false;
+    for (const IkChain& ch : def.skel.chains) {
+      if (ch.tag != "leg" || ch.parts.empty()) continue;
+      // rest.pos is parent-relative (anchorLocal deltas), so accumulating from
+      // the chain root's absolute anchor reproduces AnimFlatten's rest result
+      // without running the whole pipeline.
+      float y = def.skel.parts[ch.parts[0]].anchorLocal.y;
+      for (size_t k = 1; k < ch.parts.size(); k++)
+        y += def.skel.parts[ch.parts[k]].rest.pos.y;
+      if (!any || y < lowest) { lowest = y; any = true; }
+    }
+    mob.restSoleY = any ? lowest : 0.0f;
+  }
   mob.anim.lastPos = mob.origin;
   mob.bodyY = mob.origin.y;
 
@@ -1032,9 +1059,18 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
   // mob walking up a voxel staircase leans and rises correctly without a
   // single line of slope-handling code.
   if (nFeet > 0) {
-    float targetY = sumY / (float)nFeet + g.rideHeight * mob.anim.feet[0].legLength;
-    // the ride height is expressed in leg lengths but the mob's origin is its
-    // prefab min corner, so clamp the correction rather than snapping
+    // bodyY is the prefab MIN CORNER (origin.y's frame), so the foot average
+    // has to be converted out of the sole's frame: subtracting the rig's rest
+    // sole height puts the corner where the authored rest pose would stand.
+    //
+    // `rideHeight` is then a CROUCH/STRETCH about that rest stance, not an
+    // absolute lift: 1.0 stands at the authored height, lower squats, higher
+    // reaches. Written as (rideHeight - 1) so the default rig sits exactly on
+    // its own art rather than a leg-length above it — the raw
+    // `footAvg + rideHeight*legLength` treated a min corner as a hip and is
+    // the other half of why mobs hovered.
+    float stance = (g.rideHeight - 1.0f) * mob.anim.feet[0].legLength;
+    float targetY = sumY / (float)nFeet - mob.restSoleY + stance;
     if (!mob.footInit) {
       mob.bodyY = targetY;
       mob.footInit = true;
@@ -1397,9 +1433,6 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       Quat tilt = QuatFromTo({0, 1, 0}, mob.bodyUp);
       Quat bodyRot = Mul(tilt, yaw);
       Vec3 yawPivot{cx - mob.origin.x, 0, cz - mob.origin.z};
-      Vec3 rootAnchor = def.skel.parts.empty()
-                            ? Vec3{}
-                            : def.skel.parts[def.rootLimb].anchorLocal;
       Vec3 bodyOrigin{mob.origin.x, mob.bodyY, mob.origin.z};
       for (size_t i = 0; i < mob.limbs.size(); i++) {
         Limb& limb = mob.limbs[i];
@@ -1411,11 +1444,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         Vec3 modelPos =
             i < mob.anim.model.size() ? mob.anim.model[i].pos : Vec3{};
         Quat rot = QuatNormalize(Mul(bodyRot, local));
-        // model space is anchored at the root's own anchor; rebase to the
-        // prefab frame, then rotate about the yaw pivot as before
-        Vec3 anchorPrefab = modelPos + rootAnchor;
+        // modelPos is ALREADY in prefab coordinates: AnimFlatten seeds the root
+        // from its rest.pos, which IS rootAnchor, so every part's model pos
+        // carries the root offset. Adding rootAnchor again lifted the whole rig
+        // by the root anchor — on a biped that is the hip height (6.5 world
+        // voxels on mina), and it is half of why mobs hovered. avatar.cpp fixed
+        // this on its own submit and the mob path never got the same fix.
         Vec3 anchorW = bodyOrigin + yawPivot +
-                       Rotate(bodyRot, anchorPrefab - yawPivot);
+                       Rotate(bodyRot, modelPos - yawPivot);
         Vec3 pos = anchorW - Rotate(rot, limb.anchorLimb);
         float q[4] = {rot.x, rot.y, rot.z, rot.w};
         phys_->MoveKinematicBody(limb.body, pos, q, dt);

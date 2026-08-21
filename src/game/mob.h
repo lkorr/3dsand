@@ -342,7 +342,15 @@ class MobSystem {
     AnimState anim;            // float presentation state (never hashed)
     float speedNow = 0;        // measured planar speed, voxels/sec
     Vec3 bodyUp{0, 1, 0};      // foot-plane normal (slope tilt)
-    float bodyY = 0;           // body height derived from the foot average
+    // Prefab MIN CORNER height, in world voxels — the same frame as origin.y,
+    // because that is what both the Jolt submit and the IK inverse consume.
+    // The gait derives it from the foot plane; it is NOT a hip height.
+    float bodyY = 0;
+    // Rest height of the effector (sole) above the prefab min corner, measured
+    // from the rig at spawn. This is what converts the gait's hip-frame
+    // `rideHeight` into the min-corner frame bodyY is expressed in: standing at
+    // the authored rest pose puts the sole exactly on the foot plane.
+    float restSoleY = 0;
     bool footInit = false;
   };
 

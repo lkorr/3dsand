@@ -1237,7 +1237,14 @@ def main():
             "stepThreshold": 0.3, "stepDuration": 0.10, "stepHeight": 0.18,
             # rideHeight is a FRACTION of leg length, so it carries over from
             # the wizard unchanged even though the legs are much shorter.
-            "rideHeight": 0.94,
+            #
+            # It is now a stance trim ABOUT the rig's authored rest pose (1.0 =
+            # stand exactly as modelled), not an absolute lift off the foot
+            # plane. The extra 0.28 is this rig's ankle-to-sole overhang: the
+            # gait measures the rest sole at the ankle pivot, and mina's shoe
+            # hangs ~1.6 voxels below it, so without the trim she stands that
+            # far into the ground.
+            "rideHeight": 1.22,
             # bob/sway are in world voxels: scaled down with the figure so the
             # walk does not look like it is wading.
             "bobAmp": 0.045, "bobFreqMul": 2.0, "swayAmp": 0.03,
