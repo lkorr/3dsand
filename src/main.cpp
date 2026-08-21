@@ -41,6 +41,7 @@
 #include "sim/voxload.h"
 #include "sim/world.h"
 #include "sim/worldio.h"
+#include "telemetry.h"
 #include "ui/overlay.h"
 
 namespace {
@@ -4327,6 +4328,8 @@ int main(int argc, char** argv) {
   bool shot = false;
   bool lowPowerAdapter = false;
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
+  bool telemetryEnabled = false;
+  uint16_t telemetryPort = 8080;
   std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -4334,6 +4337,8 @@ int main(int argc, char** argv) {
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
     if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
     if (a == "--noaudio") noAudio = true;
+    if (a == "--telemetry") telemetryEnabled = true;
+    if (a == "--telemetry-port" && i + 1 < argc) telemetryPort = (uint16_t)std::atoi(argv[++i]);
     // `--time 0..1` sets the time of day for --shot: 0 = midnight, 0.25 =
     // sunrise, 0.5 = noon, 0.75 = sunset. Lets the sky be judged at any point
     // in the cycle without waiting for it.
@@ -4425,6 +4430,9 @@ int main(int argc, char** argv) {
 
   GpuContext ctx;
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter)) return 1;
+
+  Telemetry telemetry;
+  if (telemetryEnabled) telemetry.Start(telemetryPort);
 
   World world;
   world.Init(ctx.device);
@@ -5605,10 +5613,13 @@ int main(int argc, char** argv) {
                ifloor(player.pos.z) / (int)kChunk};
       double t0 = NowSec();
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
+      double tSubmit0 = NowSec();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount);
+      double tSubmit1 = NowSec();
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
+      double tPhys1 = NowSec();
       debris.PostStep();
       mobs.PostStep();
       avatar.PostStep();
@@ -5616,11 +5627,24 @@ int main(int argc, char** argv) {
       // out (fly mode ignores collision entirely, matching the voxel rules)
       if (!player.fly)
         player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
-      tickMsSmooth += ((float)((NowSec() - t0) * 1000.0) - tickMsSmooth) * 0.1f;
+      double tEnd = NowSec();
+      tickMsSmooth += ((float)((tEnd - t0) * 1000.0) - tickMsSmooth) * 0.1f;
+      if (telemetry.Active()) {
+        double streamMs = (tSubmit0 - t0) * 1000.0;
+        double submitMs = (tSubmit1 - tSubmit0) * 1000.0;
+        double physMs = (tPhys1 - tSubmit1) * 1000.0;
+        double postMs = (tEnd - tPhys1) * 1000.0;
+        TelemetryStage stages[] = {
+          {"stream", streamMs}, {"submit", submitMs},
+          {"physics", physMs}, {"post", postMs},
+        };
+        telemetry.Broadcast(tick, stages, 4);
+      }
     }
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
 
     // ---- render ----
+    double tRender0 = NowSec();
     wgpu::TextureView target = ctx.AcquireFrame();
     if (target) {
       // ViewEyePos, not EyePos: the render camera rides the step-smoothing
@@ -5992,9 +6016,16 @@ int main(int argc, char** argv) {
       ctx.queue.Submit(1, &cmd);
       ctx.Present();
     }
+    if (telemetry.Active() && ticksThisFrame > 0) {
+      double renderMs = (NowSec() - tRender0) * 1000.0;
+      TelemetryStage rs = {"render", renderMs};
+      telemetry.Broadcast(tick, &rs, 1);
+    }
     ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
+    telemetry.Poll();
   }
 
+  telemetry.Shutdown();
   ctx.WaitIdle();
   // Audio down before anything it points at: Shutdown stops the device, which
   // is the only thread that can still be inside the mixer.

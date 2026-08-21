@@ -826,7 +826,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False,
                                         "error": "sandvox.exe not found — build first"})
             try:
-                q = subprocess.Popen([EXE], cwd=ROOT, shell=False)
+                q = subprocess.Popen([EXE, "--telemetry"], cwd=ROOT, shell=False)
                 _play_procs.append(q)
                 return self._json(200, {"ok": True, "pid": q.pid})
             except Exception as e:
