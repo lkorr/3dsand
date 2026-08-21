@@ -185,7 +185,11 @@ struct AnimSkeleton {
 
 struct ClipInstance {
   int clip = -1;
-  float timeMs = 0;
+  float timeMs = 0;              // playhead; WRAPS for a looping clip
+  // Time since this instance started, which does NOT wrap. The blend-in reads
+  // this rather than timeMs so a looping clip fades in once instead of
+  // re-fading at the top of every cycle — see ClipFade in anim.cpp.
+  float ageMs = 0;
   float weight = 1.0f;           // requested weight before blend in/out
   bool stopping = false;         // blending out, remove at weight 0
   float fade = 0;                // current blend-in/out factor 0..1

@@ -305,7 +305,10 @@ void PlayerAvatar::PlayClip(const std::string& name) {
       // forever: the arms sat frozen on the first keyframe — held out in front,
       // never swinging — which is exactly the "zombie arms" look. A looping
       // clip that is already running needs no retrigger at all.
-      if (!def_->skel.clips[ci].loop) inst.timeMs = 0;
+      if (!def_->skel.clips[ci].loop) {
+        inst.timeMs = 0;
+        inst.ageMs = 0;   // a re-triggered one-shot replays its blend-in too
+      }
       return;
     }
   ClipInstance inst;
@@ -1018,6 +1021,80 @@ bool PlayerAvatar::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     return true;
   }
   return false;
+}
+
+// ---- health, as the caster VM sees it (game/spell.h) ------------------------
+//
+// The player deliberately gains no hp field: health IS the per-part hp the
+// dismemberment system already maintains, so the mana bar's overdraw and the
+// visible damage state cannot drift apart.
+
+int32_t PlayerAvatar::TotalHealth() const {
+  if (!spawned_ || !alive_) return 0;
+  float sum = 0;
+  for (size_t i = 0; i < parts.size(); i++)
+    if (PartAlive((int)i) && parts[i].hp > 0) sum += parts[i].hp;
+  return sum <= 0 ? 0 : (int32_t)sum;
+}
+
+void PlayerAvatar::SpendHealth(int32_t amount) {
+  if (!spawned_ || !alive_ || amount <= 0) return;
+  // Spread the cost across live parts in proportion to what each still has,
+  // rather than draining the first one to zero — otherwise a mana overdraw
+  // deterministically severs whichever limb happens to sort first, which reads
+  // as a bug rather than as a cost.
+  const int32_t total = TotalHealth();
+  if (total <= 0) {
+    Die();
+    return;
+  }
+  if (amount >= total) {
+    Die();
+    return;
+  }
+  const float frac = (float)amount / (float)total;
+  // Collect first: Sever() mutates `parts` (it detaches children too), so
+  // deciding everything against the pre-carve state and acting afterwards is
+  // what keeps this from walking a list that reshapes underneath it.
+  std::vector<int> severed;
+  for (size_t i = 0; i < parts.size(); i++) {
+    if (!PartAlive((int)i) || parts[i].hp <= 0) continue;
+    parts[i].hp -= parts[i].hp * frac;
+    // Bleeding from the strain of the overcast, through the ordinary budget.
+    if (def_)
+      parts[i].bleedBudget =
+          std::min(parts[i].bleedBudget + 6.0f * frac * def_->bleedPerDamage,
+                   120.0f);
+    if (parts[i].hp <= 0.0f) severed.push_back((int)i);
+  }
+  for (int i : severed)
+    if (PartAlive(i)) Sever(i);
+}
+
+void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
+                                World& world,
+                                std::vector<ParticleSpawn>& spawns) {
+  (void)world;
+  (void)spawns;
+  if (!spawned_ || !def_) return;
+  // Take off every severable part whose body is inside the blast, then die.
+  // Severing rather than carving is a deliberate simplification for this
+  // slice: the avatar has no equivalent of MobSystem's private CarveLimb, and
+  // duplicating that machinery here to shave voxels off a body that is about
+  // to become a corpse anyway is not worth the second copy. Everything after
+  // the sever — ragdoll, gore spray, debris adoption, settle-back — is the
+  // existing pipeline with no spell-specific code.
+  std::vector<int> hits;
+  for (size_t i = 0; i < parts.size(); i++) {
+    if (!PartAlive((int)i) || !parts[i].body) continue;
+    const MobLimbDef& ld = def_->limbs[i];
+    if ((int)i == def_->rootLimb || ld.vital || !ld.severable) continue;
+    if ((parts[i].xf.pos - atWorldVoxel).len() <= radiusVox + 2.0f)
+      hits.push_back((int)i);
+  }
+  for (int i : hits)
+    if (PartAlive(i)) Sever(i);
+  Die();
 }
 
 bool PlayerAvatar::SeverByName(const std::string& name) {

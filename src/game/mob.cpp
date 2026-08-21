@@ -822,7 +822,16 @@ void MobSystem::PlayClip(Mob& mob, const MobDef& def, const std::string& name) {
   if (ci < 0) return;
   for (ClipInstance& inst : mob.anim.clips)
     if (inst.clip == ci && !inst.stopping) {  // retrigger: restart, don't stack
-      inst.timeMs = 0;
+      // ONLY a one-shot rewinds. A looping clip that is already running needs
+      // no retrigger, and rewinding one is actively wrong: loco clips are
+      // re-requested every tick to keep them alive, so resetting timeMs pins
+      // the clip at t=0 forever and the pose freezes on the first keyframe.
+      // avatar.cpp had this fixed; mob.cpp did not, and mobs re-request their
+      // state clip on the same per-tick cadence.
+      if (!def.skel.clips[ci].loop) {
+        inst.timeMs = 0;
+        inst.ageMs = 0;
+      }
       return;
     }
   ClipInstance inst;

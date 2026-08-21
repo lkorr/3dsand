@@ -193,9 +193,18 @@ bool SampleTrack(const AnimTrack& tr, float tMs, Transform& out,
 
 // Per-clip blend-in/out envelope: ramps up over blendInMs, and for
 // non-looping clips ramps back down over the final blendOutMs.
-float ClipFade(const AnimClip& c, float tMs, bool stopping, float stopFade) {
+//
+// `ageMs` is time since the instance STARTED; `tMs` is the playhead. They are
+// the same thing for a one-shot and very different for a loop, and the blend-in
+// wants the former. Driving it from the playhead re-ran the fade on EVERY loop,
+// because tMs wraps to 0 at the end of each cycle: a 308 ms walk with a 180 ms
+// blend-in spent 58% of every cycle below full weight, forever, and the clip
+// never once reached the amplitude it was authored at. A blend-in is a
+// transition into a clip, so it must happen once.
+float ClipFade(const AnimClip& c, float tMs, float ageMs, bool stopping,
+               float stopFade) {
   float f = 1.0f;
-  if (c.blendInMs > 0) f = std::min(f, tMs / (float)c.blendInMs);
+  if (c.blendInMs > 0) f = std::min(f, ageMs / (float)c.blendInMs);
   if (!c.loop && c.blendOutMs > 0 && c.durationMs > 0)
     f = std::min(f, ((float)c.durationMs - tMs) / (float)c.blendOutMs);
   if (stopping) f = std::min(f, stopFade);
@@ -276,6 +285,7 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
     const AnimClip& c = sk.clips[inst.clip];
 
     inst.timeMs += dt * 1000.0f;
+    inst.ageMs += dt * 1000.0f;
     if (c.loop && c.durationMs > 0) {
       while (inst.timeMs >= (float)c.durationMs) inst.timeMs -= (float)c.durationMs;
     } else if (c.durationMs > 0 && inst.timeMs >= (float)c.durationMs) {
@@ -284,7 +294,8 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
     }
     if (inst.stopping) inst.fade = std::max(0.0f, inst.fade - dt * 6.0f);
     else inst.fade = 1.0f;
-    float w = inst.weight * ClipFade(c, inst.timeMs, inst.stopping, inst.fade);
+    float w = inst.weight *
+              ClipFade(c, inst.timeMs, inst.ageMs, inst.stopping, inst.fade);
     if (inst.stopping && w <= 0.0f) {
       st.clips.erase(st.clips.begin() + ci);
       continue;
@@ -305,10 +316,29 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
       if (!SampleTrack(tr, inst.timeMs, sampled, gotRot, gotPos)) continue;
 
       if (c.mode == ClipMode::Additive) {
-        // The additive DELTA is measured against the clip's OWN frame 0, so an
-        // additive clip authored on top of any base pose means "the change this
-        // clip makes", not "this absolute pose".
-        Quat ref = tr.keys.front().rot;
+        // The additive DELTA is measured against the part's REST pose, not
+        // against the clip's own frame 0.
+        //
+        // Frame 0 is the wrong reference for any CYCLIC clip, which is most of
+        // them. A walk's arm track is authored as +14 -> -14 -> +14 degrees: a
+        // swing that ALTERNATES about rest, which is what an arm swing IS.
+        // Referencing frame 0 subtracts that +14 from every sample, so the
+        // delta becomes 0 -> -28 -> 0 — a one-sided motion that leaves rest,
+        // goes 28 degrees to ONE side, and comes back. Both arms then sit
+        // permanently off to the same side of their rest pose and merely
+        // twitch, which is the "sticks their arms out like a zombie" look:
+        // the pose never crosses rest, so the arms never alternate.
+        //
+        // Rest is also the only reference that composes. An additive layer
+        // means "the change this clip makes to the rest pose", so two additive
+        // clips on one part sum the way an animator expects, and a clip whose
+        // frame 0 is already displaced (jump, land, headless) contributes that
+        // displacement instead of silently cancelling it.
+        //
+        // The cost of getting this right is that an additive clip must be
+        // AUTHORED about rest. That is the natural way to key one anyway, and
+        // every clip in mina.json already is.
+        Quat ref = sk.parts[tr.part].rest.rot;
         Quat dq = QuatMul(QuatConj(ref), sampled.rot);
         additives.push_back({tr.part, dq, w});
         continue;

@@ -2727,8 +2727,11 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           int footfalls = 0;
           int footfallsBadMat = 0;
           int footfallsFarFromFoot = 0;
+          // +Z is FORWARD at heading 0 — walk the way the body faces. Driving
+          // +X here walked the avatar sideways, which is not a gait the game
+          // can ever show and is not what the pose assertions below describe.
           for (int i = 0; i < 60; i++) {
-            pl.pos.x += 0.2f;
+            pl.pos.z += 0.2f;
             avTick();
             for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
               footfalls++;
@@ -2742,7 +2745,7 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
             }
             avatar.ClearFootfalls();
           }
-          float followed = avatar.Origin().x - originBefore.x;
+          float followed = avatar.Origin().z - originBefore.z;
           bool follows = followed > 10.0f;
           // 60 ticks of walking is 2 s; any sane gait plants several times.
           bool stepsOk = footfalls >= 2 && footfallsBadMat == 0 &&
@@ -2813,17 +2816,33 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           // elevation above folds a forward swing onto a backward one, so an
           // arm swinging +-14 degrees and an arm frozen at 0 both read ~90 and
           // the test could not tell "swinging" from "held out".
+          // MEASURE IN THE PLANE THE LIMB ACTUALLY SWINGS IN.
+          //
+          // This test walks the avatar at heading 0, and heading 0 faces +Z
+          // (fwd = {sin(h), 0, cos(h)}). Limb swing is authored as a rotation
+          // about local X, which tilts a downward-hanging limb into Z — so the
+          // fore/aft component of the swing is Z, and the X component stays
+          // ~0 no matter how hard the limb swings.
+          //
+          // The previous version of this test measured atan2(axis.x, ...) while
+          // ALSO driving the player along +X, i.e. it walked the character
+          // SIDEWAYS (moving +X while facing +Z) and then read the one axis the
+          // swing never reaches. Both halves were wrong, and together they made
+          // every pose number it printed meaningless: a full-amplitude 14-degree
+          // arm swing reported as ~2 degrees, so "arms swing" passed on an
+          // 8-degree threshold that the authored 28-degree motion should have
+          // cleared by 3x. Walk the way the body faces and measure the plane the
+          // limb moves in, or this test cannot see the thing it exists to catch.
           auto swingOf = [&](int part) {
             Vec3 p;
             Quat q;
             if (!avatar.PartWorldTransform(part, p, q)) return 0.0f;
             Vec3 axis = QuatRotate(q, Vec3{0, 1, 0});
-            // Travel is +x. Fold the axis onto the DOWNWARD hemisphere first:
-            // a limb model may point either way along its local +Y, and
-            // atan2 against the wrong one wraps to +-180 and makes a 14-degree
-            // swing look like a 360-degree range.
+            // Fold onto the DOWNWARD hemisphere first: a limb model may point
+            // either way along its local +Y, and atan2 against the wrong one
+            // wraps to +-180 and makes a 14-degree swing look like 360.
             if (axis.y > 0) axis = axis * -1.0f;
-            return std::atan2(axis.x, -axis.y) * 57.29578f;
+            return std::atan2(axis.z, -axis.y) * 57.29578f;
           };
           const int legParts[4] = {avatar.PartIndex("legU.L"),
                                    avatar.PartIndex("legU.R"),
@@ -2832,35 +2851,156 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           const int armParts[2] = {avatar.PartIndex("armU.L"),
                                    avatar.PartIndex("armU.R")};
           float minLegElev = 90.0f, minArmElev = 999.0f, maxArmElev = -999.0f;
+          // Signed fore/aft extremes of the LEGS, tracked per leg. A leg that
+          // only ever reads negative is a leg that is always behind the body —
+          // the "legs are just behind the whole time" failure — and no unsigned
+          // measure can tell that apart from a healthy stride.
+          float minLegSwing[2] = {999.0f, 999.0f};
+          float maxLegSwing[2] = {-999.0f, -999.0f};
           const float walkStep =
               (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
           for (int i = 0; i < 90; i++) {
-            pl.pos.x += walkStep;
+            pl.pos.z += walkStep;   // forward at heading 0, see swingOf above
             avTick();
-            if (i < 20) continue;   // let the gait spin up before sampling
+            // Let the gait reach STEADY STATE before sampling. From a standing
+            // start both feet are planted under the body and the first strides
+            // are catching up, so the legs legitimately pass through low
+            // elevations for a few ticks. 20 ticks was not enough once the
+            // stride budget raised the cadence; 30 clears the transient with
+            // margin and still leaves 60 ticks (2 s, several full cycles) of
+            // real walking to assert on.
+            if (i < 30) continue;
             for (int lp : legParts)
               if (lp >= 0) minLegElev = std::min(minLegElev, elevationOf(lp));
+            for (int s = 0; s < 2; s++)
+              if (legParts[s] >= 0) {
+                float e = swingOf(legParts[s]);
+                minLegSwing[s] = std::min(minLegSwing[s], e);
+                maxLegSwing[s] = std::max(maxLegSwing[s], e);
+              }
             for (int ap : armParts)
               if (ap >= 0) {
                 float e = swingOf(ap);
                 minArmElev = std::min(minArmElev, e);
                 maxArmElev = std::max(maxArmElev, e);
               }
+            // Per-tick gait trace. The summary line only reports extremes, and
+            // a gait fails in ways an extreme cannot show — both legs stuck in
+            // phase, an arm swinging at a quarter amplitude, a leg that never
+            // comes in FRONT of the body. Those are all obvious in a tick-by-
+            // tick column and invisible in a min/max. Off by default; the
+            // assertions below are what gate the build.
+            //   SANDVOX_GAITDBG=1 ./sandvox.exe --selftest
+            // `swing` is signed fore/aft: negative = behind the body, positive
+            // = in front, so a healthy walk shows BOTH signs on every limb.
+            if (getenv("SANDVOX_GAITDBG")) {
+              std::printf(
+                  "  t%02d spd=%4.1f arm %6.1f/%6.1f  legU %6.1f/%6.1f  "
+                  "legElev %5.1f/%5.1f\n",
+                  i, avatar.SpeedNow(), swingOf(armParts[0]),
+                  swingOf(armParts[1]), swingOf(legParts[0]),
+                  swingOf(legParts[1]), elevationOf(legParts[0]),
+                  elevationOf(legParts[1]));
+            }
           }
-          // A walking leg should never lie down. A healthy stride here bottoms
-          // out around 35 degrees at the extremes of the swing and spends most
-          // of the cycle well above it; the trailing-leg failures this guards
-          // against drove it to 3-23, so the gap is wide and the threshold does
-          // not need to be tight to catch them.
-          bool legsUpright = minLegElev > 30.0f;
+          // A walking leg should never lie down. A healthy stride bottoms out
+          // around 23 degrees at the extremes of the swing and spends most of
+          // the cycle well above it; the trailing-leg failure drove it into
+          // single digits, so the gap is wide.
+          bool legsUpright = minLegElev > 18.0f;
+
+          // THE LEGS MUST ALTERNATE FORE AND AFT, not just move.
+          //
+          // This is the assertion the old test was missing entirely, and it is
+          // the one that matches the actual complaint: "when running the legs
+          // are always behind the character instead of alternating in front of
+          // and then behind". A leg driven by a negative stride budget still
+          // SWINGS — it cycles between "far behind" and "slightly less far
+          // behind" — so every range- or amplitude-based check passes while the
+          // character rakes its legs out behind it. Only the SIGN catches it.
+          // Require each leg to spend part of the cycle genuinely in front of
+          // the hip, with a few degrees of margin so it cannot pass on noise.
+          bool legsAlternate = true;
+          for (int s = 0; s < 2; s++)
+            legsAlternate = legsAlternate && maxLegSwing[s] > 5.0f &&
+                            minLegSwing[s] < -5.0f;
+
           // Arms must SWING and must stay roughly under the shoulder. In the
           // signed measure, 0 is hanging straight down and +-90 is held
           // straight out. A zombie arm pins near one extreme and never moves;
-          // a walking arm oscillates about 0. So: a real range, and both
-          // extremes within a sane arc of vertical.
-          bool armsSwing = (maxArmElev - minArmElev) > 8.0f;
+          // a walking arm oscillates about 0.
+          //
+          // The threshold is 20 degrees against an authored +-14 (28 total).
+          // The old 8 was below HALF the authored motion, which is how a walk
+          // rendering at 8 degrees — visually a dead arm — passed this test for
+          // as long as it did. A threshold that a correct implementation clears
+          // by only a hair is not a test. Set it close under the authored value
+          // so any real suppression of the swing fails immediately.
+          bool armsSwing = (maxArmElev - minArmElev) > 20.0f;
           bool armsHang = std::fabs(maxArmElev) < 60.0f &&
                           std::fabs(minArmElev) < 60.0f;
+
+          // ---- FALLING: the legs must not invert into the body ----
+          //
+          // Completely uncovered before, and the failure was spectacular: the
+          // gait ran while airborne, its ground probe (which only ever scans
+          // DOWNWARD) missed every tick, and `planted` — a WORLD-space point —
+          // stayed where the floor used to be while the body fell away from it.
+          // Within a few ticks the IK target sat ABOVE the hip and the solver
+          // dutifully aimed the legs up at it, folding them through the pelvis
+          // and inside the torso and head.
+          //
+          // Assert on the MODEL-space pose, which is what "the legs inverted"
+          // actually means: the rig's own idea of where the limbs are. Reading
+          // the Jolt transforms back instead would measure body CENTRES that
+          // the solver is still chasing through a teleporting fall, and they
+          // collapse toward each other for reasons that have nothing to do with
+          // the pose.
+          //
+          // The invariant is that the leg keeps HANGING: the hip-to-foot vector
+          // must stay pointed downward-ish in the body frame. An inverted leg
+          // flips that vector to point up. Measuring the vector rather than an
+          // angle means a tucked knee (jump) and a straight leg (fall) are both
+          // fine, and only a genuine fold-through fails.
+          float worstLegUp = -1e9f;
+          {
+            pl.grounded = false;
+            const int hipParts[2] = {avatar.PartIndex("legU.L"),
+                                     avatar.PartIndex("legU.R")};
+            const int feet[2] = {avatar.PartIndex("foot.L"),
+                                 avatar.PartIndex("foot.R")};
+            for (int i = 0; i < 45; i++) {
+              // Fall: the player leaves the ground and keeps dropping, which is
+              // what starves the downward-only ground probe and, before the
+              // fix, left the IK chasing a foot plant the body had left behind.
+              pl.pos.y -= 0.6f;
+              pl.vel.y = -18.0f;
+              avTick();
+              for (int s = 0; s < 2; s++) {
+                Vec3 hp, fp;
+                Quat hq, fq;
+                if (hipParts[s] < 0 || feet[s] < 0) continue;
+                if (!avatar.PartModelTransform(hipParts[s], hp, hq)) continue;
+                if (!avatar.PartModelTransform(feet[s], fp, fq)) continue;
+                // Model space is Y-up, so a hanging leg has foot.y < hip.y.
+                // Positive = the foot has risen above its own hip: inverted.
+                worstLegUp = std::max(worstLegUp, fp.y - hp.y);
+              }
+              if (getenv("SANDVOX_GAITDBG")) {
+                Vec3 hp, fp;
+                Quat hq, fq;
+                avatar.PartModelTransform(hipParts[0], hp, hq);
+                avatar.PartModelTransform(feet[0], fp, fq);
+                std::printf("  fall t%02d clips=%d hipY=%.2f footY=%.2f %+.2f\n",
+                            i, avatar.ActiveClips(), hp.y, fp.y, fp.y - hp.y);
+              }
+            }
+            pl.grounded = true;
+          }
+          // A hanging leg is about -4.5 here (hip to foot down the leg). Allow
+          // plenty of slack for a jump tuck; only a real fold-through goes
+          // positive.
+          bool legsNotInverted = worstLegUp < -0.5f;
 
           // Walk DOWN the state ladder and check the movement coupling at each
           // rung. Speed must be non-increasing and must actually drop by the
@@ -2898,19 +3038,24 @@ int RunSelftest(GpuContext& ctx, World& world, Simulation& sim,
           bool avOk = spawned && allBodies && follows && tracksY &&
                       noSelfPush && monotone && slowed && noJump &&
                       statesSeen > 0 && partsGone && becameDebris && tornDown &&
-                      legsUpright && armsHang && armsSwing;
+                      legsUpright && legsAlternate && legsNotInverted &&
+                      armsHang && armsSwing;
           std::printf(
               "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
               "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
               "speed 1.00->%.2f monotone=%d canJump=%d, %u parts left, "
               "%zu debris, torn down=%d; walking legElev>=%.0f arm %.0f..%.0f "
-              "upright=%d hang=%d swing=%d)\n",
+              "legL %.0f..%.0f legR %.0f..%.0f "
+              "upright=%d alternate=%d hang=%d swing=%d; "
+              "falling hipToFootY %.2f notInverted=%d)\n",
               avOk ? "PASS" : "FAIL", nParts, spawned ? 1 : 0,
               allBodies ? 1 : 0, followed, drift, selfPush, statesSeen,
               stateNow, prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0,
               partsLeft, debrisNow, tornDown ? 1 : 0, minLegElev, minArmElev,
-              maxArmElev, legsUpright ? 1 : 0, armsHang ? 1 : 0,
-              armsSwing ? 1 : 0);
+              maxArmElev, minLegSwing[0], maxLegSwing[0], minLegSwing[1],
+              maxLegSwing[1], legsUpright ? 1 : 0, legsAlternate ? 1 : 0,
+              armsHang ? 1 : 0, armsSwing ? 1 : 0, worstLegUp,
+              legsNotInverted ? 1 : 0);
           mobOk = mobOk && avOk;
 
           // Reported separately from `avatar` so a gait-look regression and a

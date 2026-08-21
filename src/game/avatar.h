@@ -146,6 +146,29 @@ class PlayerAvatar {
   bool SeverByName(const std::string& name);
   void Revive(const Player& player, float heading);  // heal + respawn all parts
 
+  // ---- health, as the caster VM sees it (game/spell.h) --------------------
+  // The player has no single hp field, and deliberately gains none here:
+  // health effectively lives on the per-part hp below, so the spell system
+  // reads and spends THAT rather than inventing a parallel number that would
+  // immediately drift from the visible damage state.
+  //
+  // Health is the summed hp of every LIVE part, rounded to an integer because
+  // the caster VM is integer throughout (thesis 3 in spell.h).
+  int32_t TotalHealth() const;
+  // Spend health across live parts, proportionally to what each still has.
+  // Distributing rather than draining one part keeps a mana overdraw from
+  // arbitrarily severing whichever limb happens to be first in the list.
+  // Parts driven to zero are severed through the ordinary Sever() path, so an
+  // overcast dismembers you with no new gore code.
+  void SpendHealth(int32_t amount);
+  // Kill the caster spectacularly at `atWorldVoxel`: carve every part within
+  // `radiusVox` and then Die(). Used by a FATAL overcast, whose thematic
+  // flavour comes entirely from the spell's own effect payload running at the
+  // caster (spell.h thesis 2) — this is only the body's half of it, and it
+  // reuses CarveLimbRadial + the existing gore pipeline rather than adding any.
+  void SelfDestruct(Vec3 atWorldVoxel, float radiusVox, World& world,
+                    std::vector<ParticleSpawn>& spawns);
+
   bool IsAlive() const { return alive_; }
   bool PartAlive(int i) const {
     return i >= 0 && i < (int)anim_.partAlive.size() && anim_.partAlive[i];
@@ -177,6 +200,24 @@ class PlayerAvatar {
   int PartIndex(const std::string& name) const;
   int LivePartCount() const;
   int ActiveClips() const { return (int)anim_.clips.size(); }
+  // Measured planar speed in world voxels/sec (presentation/diagnostics only).
+  float SpeedNow() const { return speedNow_; }
+  // The AUTHORED model-space pose, before it is handed to Jolt. Comparing this
+  // against PartWorldTransform (which reads back what the solver did) is how
+  // you tell an animation bug from physics fighting the animation.
+  bool PartModelTransform(int part, Vec3& outPos, Quat& outRot) const {
+    if (part < 0 || part >= (int)anim_.model.size()) return false;
+    outPos = anim_.model[part].pos;
+    outRot = anim_.model[part].rot;
+    return true;
+  }
+  // Name of the i'th active clip, for diagnostics and the selftest.
+  const char* ActiveClipName(int i) const {
+    if (!def_ || i < 0 || i >= (int)anim_.clips.size()) return "?";
+    int c = anim_.clips[i].clip;
+    if (c < 0 || c >= (int)def_->skel.clips.size()) return "?";
+    return def_->skel.clips[c].name.c_str();
+  }
   int LocoState() const { return anim_.locoState; }
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
@@ -209,8 +250,15 @@ class PlayerAvatar {
   void DetachPart(int index, bool adopt);
   void Die();
   void PlayClip(const std::string& name);
-  void UpdateAnimation(float dt, World& world);
+  // `grounded` comes from the player's own collision sweep. The gait is a
+  // WALKING system — it only means anything when there is a floor under the
+  // feet — so it is a parameter here rather than something UpdateAnimation
+  // infers, and the airborne pose is handled explicitly (see UpdateAirPose).
+  void UpdateAnimation(float dt, World& world, bool grounded);
   void UpdateGait(float dt, World& world);
+  // Airborne leg pose: relaxes the legs toward their rest hang instead of
+  // leaving IK chasing a stale world-space foot plant.
+  void UpdateAirPose(float dt);
   // `outMat` receives the material id of the supporting voxel — the probe
   // already reads it to decide what carries weight, so returning it costs
   // nothing and is what lets a footstep know which surface it landed on.

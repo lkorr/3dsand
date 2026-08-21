@@ -719,12 +719,21 @@ def main():
     # rate while the legs step at a speed-dependent one, so the only way they
     # read as one motion is to author each period at the step cycle for the
     # speed that clip is selected at (avatar.cpp switches to `run` past
-    # 0.55 * speed). Two steps per arm cycle: ~440 ms at walk pace, ~260 at a
-    # sprint. The old 900/620 ms were roughly twice too slow, which is what made
-    # the arms drift in and out of phase with the feet.
+    # 0.80 * speed). One arm cycle spans TWO steps — left plants, then right.
     #
-    # Amplitudes are down too: a 24-degree swing at 4.5 steps/s is a windmill.
-    for nm, deg, period in (("walk", 14, 440), ("run", 20, 260)):
+    # The step time is swing + stance, and BOTH are now set by the runtime
+    # rather than by the authored stepDuration: avatar.cpp caps the swing at the
+    # stride budget (kSwingTravelFrac), and the stance ends when the foot has
+    # drifted stepThreshold * legLength behind. At walk (35 world vox/s on a
+    # 5.79-voxel leg) that is 0.104 + 0.050 = 0.154 s per step, so 308 ms per
+    # arm cycle; at the 60 vox/s sprint it is 0.090 + 0.029 = 0.119, so 238 ms.
+    #
+    # Re-derive these if the stride budget, stepThreshold or the speeds move —
+    # an arm cycle that does not divide the step cycle is what makes the arms
+    # visibly drift in and out of phase with the feet.
+    #
+    # Amplitudes: a 24-degree swing at this cadence is a windmill.
+    for nm, deg, period in (("walk", 14, 308), ("run", 20, 238)):
         clips[nm] = {
             "durationMs": period, "loop": True, "mode": "additive",
             "blendInMs": 180, "blendOutMs": 180,
