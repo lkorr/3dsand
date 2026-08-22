@@ -733,6 +733,22 @@ bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt) {
   return false;
 }
 
+// Where the beam LEAVES the caster, in world voxels.
+//
+// It must clear the avatar's own head. The eye sits inside the skull part, so
+// a damage ray cast from there hits the caster on its first tick and the
+// dismemberment path takes their head off before the beam reaches anything —
+// which is exactly what "the laser kills me instantly" was. Forward of the
+// face and down-right of the eyeline, so it reads as fired from the hand.
+//
+// ONE definition on purpose: the damage ray and the beam sprites both call
+// this. They used to carry separate offsets, so the visible beam came from the
+// hand while the lethal one came from the middle of the player's face.
+Vec3 LaserMuzzle(const Player& player, const Camera& cam) {
+  return player.EyePos() + cam.Forward() * 1.2f + cam.Right() * 0.7f -
+         cam.Up() * 0.5f;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1490,17 +1506,32 @@ int main(int argc, char** argv) {
       } laserCut;
       if (laserHeld) {
         const WorldSnapshot& lsnap = world.Snap();
-        Vec3 eye = player.EyePos(), fwd = cam.Forward();
+        Vec3 fwd = cam.Forward();
+        // MUZZLE, NOT EYE. The avatar's own head occupies the eye position, so
+        // a ray cast from there hits the caster's skull on frame 1 and
+        // avatar.Damage() below decapitates them instantly. Emit from in FRONT
+        // of the head instead — the same reason the spell block muzzles its
+        // bolt, and the same offset the beam sprites below already draw from,
+        // so what cuts and what is visible are finally the same ray.
+        const Vec3 muzzle = LaserMuzzle(player, cam);
         float gridDist = 1e9f;
         IVec3 hit{};
         if (lsnap.valid && lsnap.pick[0] != 0) {
           hit = {(int)lsnap.pick[2], (int)lsnap.pick[3], (int)lsnap.pick[4]};
-          gridDist = (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - eye).len();
+          gridDist =
+              (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - muzzle).len();
         }
         float frac = 1.0f;
         const float kLaserRange = CurrentTuning().tools.laserRange;
-        uint64_t hitBody = phys.CastRayBody(eye, fwd, kLaserRange, frac);
+        uint64_t hitBody = phys.CastRayBody(muzzle, fwd, kLaserRange, frac);
         float bodyDist = frac * kLaserRange;
+        // A weapon must not cut its wielder (main.cpp melee sweep, same rule).
+        // The muzzle above clears the head, but an arm swings through the beam
+        // line constantly and a severed-then-still-owned part lingers there —
+        // so the reject is by OWNERSHIP, not by distance. Dropping the hit
+        // entirely (rather than falling through to the grid branch) is
+        // deliberate: the beam is occluded by the limb it refuses to cut.
+        if (hitBody != 0 && avatar.OwnsBody(hitBody)) hitBody = 0;
 
         if (hitBody != 0 && bodyDist < gridDist) {
           // body cut (PLAN §C2): mob limbs take damage (instant sever when
@@ -1509,10 +1540,13 @@ int main(int argc, char** argv) {
           // when that channel actually severs it (DebrisSystem::MeltBodyAt) —
           // no cutting plane is chosen, so what falls apart is decided by the
           // geometry the player carved, not by camera orientation.
-          Vec3 hitPos = eye + fwd * bodyDist;
-          // The avatar is checked alongside mobs — a beam that crosses the
-          // player's own joint takes that part off exactly as it would a
-          // mob's, with no avatar-specific damage path.
+          Vec3 hitPos = muzzle + fwd * bodyDist;
+          // The avatar is checked alongside mobs, but the OwnsBody reject
+          // above means this can no longer be one of the caster's LIVE parts.
+          // It still has to run: a part that was severed and whose hold has
+          // expired is back on MOVING and no longer owned, so it takes the
+          // beam like any other debris — which is the intent. What it must
+          // never again do is take the beam off the head it was fired from.
           if (avatar.Damage(hitBody, CurrentTuning().tools.laserDamage,
                             hitPos)) {
             // handled by the avatar
@@ -2377,8 +2411,7 @@ int main(int argc, char** argv) {
         const WorldSnapshot& snap = world.Snap();
         Vec3 hit{(float)(int)snap.pick[2] + 0.5f, (float)(int)snap.pick[3] + 0.5f,
                  (float)(int)snap.pick[4] + 0.5f};
-        Vec3 from = player.EyePos() + cam.Forward() * 1.2f +
-                    cam.Right() * 0.7f - cam.Up() * 0.5f;
+        Vec3 from = LaserMuzzle(player, cam);
         Vec3 d = hit - from;
         int n = std::min(22, (int)(d.len() / 2.5f) + 1);
         for (int i = 1; i <= n && sprv.size() + 1 < kMaxSprites; i++) {

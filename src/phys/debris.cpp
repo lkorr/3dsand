@@ -1070,6 +1070,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       // the same handoff every under-floor piece already takes.
       nb.micro = b.micro;
       nb.physScale = b.physScale;  // MUST precede the pitch below
+      nb.bleedMat = b.bleedMat;
       // The fragment's skin rebases by the SAME corner, expressed in skin
       // units. Both lattices must land on one origin or the art slides off the
       // collider — the same agreement ReskinMicro maintains after a carve.
@@ -1199,7 +1200,8 @@ void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels) {
 void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                              const BodyTransform& xf, MicroBodyRef micro,
                              uint32_t physScale,
-                             std::vector<PrefabVoxel> skinVoxels) {
+                             std::vector<PrefabVoxel> skinVoxels,
+                             uint32_t bleedMat) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
@@ -1231,6 +1233,7 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                           (float)std::max(1u, body.physScale) +
                       2.0f;
   body.serial = nextSerial_++;
+  body.bleedMat = bleedMat;
   RecountBurn(body);
   bodies_.push_back(std::move(body));
   instancesDirty_ = true;
@@ -1389,6 +1392,58 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   Vec3 lin{}, ang{};
   phys_->GetBodyVelocities(b.handle, lin, ang);
   if (eject) VoxelsToParticles(b, removed, lin, ang, world, spawns);
+
+  // Corpse bleeding: a body that was once flesh emits blood when carved.
+  if (b.bleedMat != 0 && !removed.empty()) {
+    const float ps = (float)std::max(1u, b.physScale);
+    Vec3 centroid{};
+    for (const DebrisVoxel& v : removed)
+      centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+    centroid = centroid * (1.0f / (float)removed.size());
+    Vec3 woundW = b.xf.pos + QuatRot(b.xf.quat, centroid * (1.0f / ps));
+
+    const uint32_t nRemoved = (uint32_t)removed.size();
+    // Micro spray: 2 droplets per removed voxel, capped.
+    const uint32_t sprayN = std::min(nRemoved * 2u, 60u);
+    for (uint32_t k = 0; k < sprayN; k++) {
+      if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+      uint32_t h = rng::Hash3(b.serial * 0x9E3779B9u, (uint32_t)k, nRemoved);
+      Vec3 dir{rng::SignedUnit(h) * 0.7f,
+               0.4f + 0.6f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x51u))),
+               rng::SignedUnit(rng::Pcg(h ^ 0xB0u)) * 0.7f};
+      float sp = 3.5f * (0.6f + 0.8f * rng::Unit01(rng::Pcg(h ^ 0x1234u)));
+      ParticleSpawn s{};
+      s.px = (int32_t)std::lround(woundW.x * 256.0f);
+      s.py = (int32_t)std::lround(woundW.y * 256.0f);
+      s.pz = (int32_t)std::lround(woundW.z * 256.0f);
+      s.vx = (int32_t)std::lround(dir.x * sp * 256.0f / 30.0f);
+      s.vy = (int32_t)std::lround(dir.y * sp * 256.0f / 30.0f);
+      s.vz = (int32_t)std::lround(dir.z * sp * 256.0f / 30.0f);
+      s.payload = b.bleedMat & 0xFFFu;
+      s.flags = kPFlagAlive | kPFlagMicro | ParticleMicroBits(4, 70);
+      spawns.push_back(s);
+    }
+    // Whole-voxel blood: 1 per 4 removed voxels, capped. These pool and persist.
+    const uint32_t bloodN = std::min((nRemoved + 3u) / 4u, 8u);
+    for (uint32_t k = 0; k < bloodN; k++) {
+      if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+      uint32_t h = rng::Hash3(b.serial * 0x51A17u, (uint32_t)k, nRemoved ^ 0xB100Du);
+      Vec3 dir{rng::SignedUnit(h) * 0.5f,
+               0.3f + 0.5f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x77u))),
+               rng::SignedUnit(rng::Pcg(h ^ 0xC0FFu)) * 0.5f};
+      float sp = 2.5f * (0.5f + rng::Unit01(rng::Pcg(h ^ 0x9Eu)));
+      ParticleSpawn s{};
+      s.px = (int32_t)std::lround(woundW.x * 256.0f);
+      s.py = (int32_t)std::lround(woundW.y * 256.0f);
+      s.pz = (int32_t)std::lround(woundW.z * 256.0f);
+      s.vx = (int32_t)std::lround(dir.x * sp * 256.0f / 30.0f);
+      s.vy = (int32_t)std::lround(dir.y * sp * 256.0f / 30.0f);
+      s.vz = (int32_t)std::lround(dir.z * sp * 256.0f / 30.0f);
+      s.payload = b.bleedMat & 0xFFFu;
+      s.flags = kPFlagAlive;
+      spawns.push_back(s);
+    }
+  }
 
   if (fine) {
     // The SKIN is authoritative: carve it at its own resolution, then re-derive
@@ -1627,6 +1682,7 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
       r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
     newBodies[h].radiusVoxels = r + 2.0f;
     newBodies[h].serial = nextSerial_++;
+    newBodies[h].bleedMat = b.bleedMat;
     RecountBurn(newBodies[h]);
     phys_->SetBodyVelocities(newBodies[h].handle, lin, ang);
   }

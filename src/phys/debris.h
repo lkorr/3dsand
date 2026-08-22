@@ -87,7 +87,8 @@ class DebrisSystem {
   void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                  const BodyTransform& xf, MicroBodyRef micro = {},
                  uint32_t physScale = 0,
-                 std::vector<PrefabVoxel> skinVoxels = {});
+                 std::vector<PrefabVoxel> skinVoxels = {},
+                 uint32_t bleedMat = 0);
 
   // Laser body cut (PLAN §C2): partition a body's voxels by the world-space
   // plane (point, normal), destroy it, spawn both halves at the same pose
@@ -196,6 +197,7 @@ class DebrisSystem {
     bool HasFineSkin() const {
       return !skinVoxels.empty() && micro.skinScale > physScale;
     }
+    uint32_t bleedMat = 0;       // nonzero => body bleeds when carved
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)

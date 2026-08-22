@@ -2266,7 +2266,8 @@ void MobSystem::EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t physScale
   float len = away.len();
   away = len > 1e-3f ? away * (1.0f / len) : Vec3{0, 1, 0};
   phys_->SetBodyVelocities(h, away * 2.5f + Vec3{0, 1.5f, 0}, Vec3{});
-  debris_->AdoptBody(h, std::move(part), xf, micro);
+  debris_->AdoptBody(h, std::move(part), xf, micro, 0, {},
+                     defs_[mob.defIndex].bleedMat);
 }
 
 bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
@@ -2756,7 +2757,7 @@ void MobSystem::DetachLimb(Mob& mob, int limbIndex, bool adopt) {
     // would visibly coarsen at the moment it came off.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(def.skinScale), def.physScale,
-                       std::move(limb.skinVoxels));
+                       std::move(limb.skinVoxels), def.bleedMat);
     limb.skinVoxels.clear();
     limb.carved = false;
     limb.holdBody = limb.body;
@@ -2785,7 +2786,8 @@ void MobSystem::Die(Mob& mob) {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(defs_[mob.defIndex].skinScale),
                        defs_[mob.defIndex].physScale,
-                       std::move(limb.skinVoxels));
+                       std::move(limb.skinVoxels),
+                       defs_[mob.defIndex].bleedMat);
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     limb.body = 0;
