@@ -39,6 +39,10 @@ let sideEl = null, timelineEl = null;
 let clipWrap = null;          // renderClipLane()'s own container, see below
 
 let selectedPart = null;      // limb name, or null
+// Socket being dragged, by INDEX into sidecar.sockets, or null. Selecting a
+// socket takes the gizmo over from the joint anchor — both are "a point on a
+// part", so they share one gizmo rather than fighting over the viewport.
+let selectedSocket = null;
 let gaitOn = false;
 // NB: the gait phase itself lives in anim.gaitPhase (the AnimState mirror),
 // not here — it is runtime state the transcribed pipeline owns.
@@ -101,6 +105,25 @@ const chains = () => {
   const s = sc();
   if (!Array.isArray(s.chains)) s.chains = [];
   return s.chains;
+};
+// Sockets: WHERE A HELD ITEM ATTACHES (src/game/mob.h MobSocketDef).
+//
+// A socket is a POINT AND A FRAME on one part, and nothing more — no item
+// knowledge, no grip data. How a particular weapon sits in the fist is the
+// ITEM's business (assets/items/<id>.json's `grip`), so the same socket serves
+// a sword, a torch and an empty hand. That split is what lets one item be held
+// correctly by any rig that publishes a socket, and it is the reason this
+// editor edits only the point.
+//
+// It is named for the CONTEXT an item asks for ("held_right"), NOT for the
+// limb it rides: an item looks up its grip by context, and `part` is the
+// separate question of which limb carries that context on THIS rig. A
+// left-handed creature puts "held_right" on its own hand.L and every item
+// still hangs correctly with no per-item edits.
+const sockets = () => {
+  const s = sc();
+  if (!Array.isArray(s.sockets)) s.sockets = [];
+  return s.sockets;
 };
 const limbByName = n => limbs().find(l => l.name === n) || null;
 
@@ -365,6 +388,7 @@ function renderRigPanel() {
         // Toggle the inline limb editor. A model with no limb entry still
         // selects (for painting); "sync" in Limbs is what gives it an entry.
         selectedPart = (limbHere && !openHere) ? m.name : null;
+        selectedSocket = null;   // picking a limb drops a socket drag
         bindGizmo();
         ed.invalidate();
         renderAllPanels();
@@ -566,6 +590,7 @@ function renderRigPanel() {
       class: 'rigrow' + (open ? ' on' : ''),
       onclick: () => {
         selectedPart = open ? null : limb.name;
+        selectedSocket = null;   // picking a limb drops a socket drag
         bindGizmo();
         ed.invalidate();
         renderAllPanels();
@@ -681,6 +706,111 @@ function limbBody(limb) {
 
 /** Everything below the per-limb editors: chains, gait, clips. */
 function renderRigTail() {
+  /* ---- sockets: where a held ITEM attaches ---- */
+  //
+  // Visible and draggable because the alternative is authoring a grip by
+  // trial and error against a running game, which is exactly how the sword
+  // ended up parked at the character's feet: the socket is the centre of the
+  // fist, the item's own offset is measured from it, and nothing in the
+  // pipeline showed either one until it was already wrong on screen.
+  sideEl.append(
+    el('div', { class: 'righdr' }, 'Item sockets',
+      el('span', { class: 'spacer' }),
+      el('button', {
+        class: 'small',
+        title: selectedPart
+          ? 'add a socket on the selected limb'
+          : 'select a limb first',
+        onclick: () => addSocketFromSelection(),
+      }, '+ socket')));
+
+  const SK = sockets();
+  if (!SK.length) {
+    sideEl.append(el('div', { class: 'rignote' },
+      'No sockets. A rig that publishes one (conventionally "held_right" on ' +
+      'the hand) can hold any item that declares a grip for that context; ' +
+      'without one, EquipItem refuses and nothing appears in the hand.'));
+  }
+  SK.forEach((s, i) => {
+    const on = selectedSocket === i;
+    const a = Array.isArray(s.offset) && s.offset.length === 3
+      ? s.offset : [0, 0, 0];
+    sideEl.append(el('div', { class: 'rigrow' + (on ? ' on' : '') },
+      el('button', {
+        class: 'small' + (on ? ' on' : ''),
+        title: 'drag this socket in the viewport',
+        onclick: () => {
+          selectedSocket = on ? null : i;
+          // A socket lives on its part, so selecting one also selects that
+          // limb — otherwise the gizmo would sit in space with no context.
+          if (!on && s.part) selectedPart = s.part;
+          renderAllPanels();
+        },
+      }, on ? '◉' : '○'),
+      el('span', { style: 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis' },
+        (s.name || '—') + '  on ' + (s.part || '—')),
+      el('span', { class: 'rigdim' },
+        a.map(v => (+v).toFixed(1)).join(', ')),
+      el('button', {
+        class: 'icon danger', title: 'remove socket',
+        onclick: () => {
+          sockets().splice(i, 1);
+          if (selectedSocket === i) selectedSocket = null;
+          else if (selectedSocket > i) selectedSocket--;
+          touched(); renderAllPanels();
+        },
+      }, '✕')));
+
+    if (!on) return;
+    // Name + part are editable inline: "which context does this rig serve"
+    // and "which limb carries it" are the two things a rig actually decides.
+    sideEl.append(el('div', { class: 'rigf' },
+      el('span', {}, 'context'),
+      (() => {
+        const inp = el('input', { type: 'text', value: s.name || '' });
+        inp.addEventListener('change', () => {
+          s.name = inp.value.trim();
+          touched(); renderAllPanels();
+        });
+        return inp;
+      })()));
+    sideEl.append(el('div', { class: 'rigf' },
+      el('span', {}, 'part'),
+      (() => {
+        const sel = el('select');
+        limbs().forEach(l => {
+          const o = el('option', { value: l.name }, l.name);
+          if (l.name === s.part) o.selected = true;
+          sel.append(o);
+        });
+        sel.addEventListener('change', () => {
+          s.part = sel.value;
+          selectedPart = sel.value;
+          touched(); renderAllPanels();
+        });
+        return sel;
+      })()));
+    sideEl.append(el('div', { class: 'rignote' },
+      'Drag the gizmo to move the socket, or type the offset below. This is ' +
+      'the point the fist closes on, in the same prefab-local voxels as a ' +
+      'joint anchor.'));
+    ['x', 'y', 'z'].forEach((ax, k) => {
+      sideEl.append(el('div', { class: 'rigf' },
+        el('span', {}, 'offset ' + ax),
+        (() => {
+          const inp = el('input', { type: 'number', step: '0.5', value: String(a[k]) });
+          inp.addEventListener('change', () => {
+            const v = Array.isArray(s.offset) && s.offset.length === 3
+              ? s.offset.slice() : [0, 0, 0];
+            v[k] = num(inp.value, 0);
+            s.offset = v;
+            touched(); bindGizmo(); ed.invalidate();
+          });
+          return inp;
+        })()));
+    });
+  });
+
   /* ---- chains (read-only summary; authored by Split-to-model + this) ---- */
   sideEl.append(
     el('div', { class: 'righdr' }, 'IK chains',
@@ -821,6 +951,42 @@ function addChainFromSelection() {
   renderAllPanels();
 }
 
+/**
+ * Add a socket on the selected limb, seeded at the CENTRE of that limb's model
+ * box — which is what "where the fist closes" means for a hand, and what
+ * gen_mina.py computes for mina's own socket. Seeding it anywhere else (the
+ * origin, the joint anchor) would put the first drag's starting point somewhere
+ * an author has to correct before they can even see it.
+ *
+ * The default context is "held_right" because that is the one the engine ships
+ * an item for; a second socket is renamed in the panel.
+ */
+function addSocketFromSelection() {
+  const limb = selectedPart ? limbByName(selectedPart) : null;
+  if (!limb) { toast('select a limb first (the hand)', true); return; }
+  const m = ed.getModels().find(o => o.name === limb.name);
+  const c = m
+    ? [m.offset.x + m.dim.x / 2, m.offset.y + m.dim.y / 2, m.offset.z + m.dim.z / 2]
+    : [0, 0, 0];
+  const taken = new Set(sockets().map(s => s.name));
+  let name = 'held_right';
+  for (let i = 2; taken.has(name); i++) name = 'held_right_' + i;
+  sockets().push({
+    name,
+    part: limb.name,
+    offset: c.map(v => Math.round(v * 2) / 2),
+    // Identity: the socket frame IS the limb's frame. Which way a held thing
+    // POINTS is the item's business (its grip rotation) — putting a rotation
+    // here as well would mean two places encode the same fact and they would
+    // drift apart. See mob.h's note on MobSocketDef::rotation.
+    rotation: [0, 0, 0],
+  });
+  selectedSocket = sockets().length - 1;
+  touched();
+  toast(`socket "${name}" on ${limb.name}`);
+  renderAllPanels();
+}
+
 function renderGaitReadout() {
   const r = document.getElementById('gaitReadout');
   if (r) {
@@ -842,6 +1008,32 @@ function renderGaitReadout() {
    ========================================================================== */
 
 function bindGizmo() {
+  // A SELECTED SOCKET OWNS THE GIZMO. Both a socket and a joint anchor are
+  // "a point on this part", so they share one drag gizmo rather than putting
+  // two overlapping handles in the viewport; the socket wins while selected
+  // because the author explicitly asked for it.
+  const SK = sockets();
+  if (selectedSocket !== null && selectedSocket >= 0 && selectedSocket < SK.length) {
+    const s = SK[selectedSocket];
+    const a = Array.isArray(s.offset) && s.offset.length === 3
+      ? s.offset : [0, 0, 0];
+    ed.setGizmo({
+      anchor: a.slice(),
+      // No swing arc: a socket does not hinge. Passing the limb's joint axis
+      // here would draw an arc that means nothing for this handle.
+      axis: [0, 1, 0],
+      onChange: v => {
+        s.offset = v.slice();
+        touched();
+        ed.invalidate();
+        renderAnchorFields(v);
+      },
+    });
+    ed.setRotGizmo(null);
+    poseEdit = null;
+    return;
+  }
+
   const limb = selectedPart ? limbByName(selectedPart) : null;
   if (!limb) {
     ed.setGizmo(null);
@@ -2011,7 +2203,7 @@ export const hooks = {
   // position until the part was reselected.
   onModelsChanged: () => { rebuildSkeleton(); bindGizmo(); renderAllPanels(); },
   onSidecarChanged: () => {
-    selectedPart = null; activeTag = null; frameIndex = 0;
+    selectedPart = null; selectedSocket = null; activeTag = null; frameIndex = 0;
     activeClip = null; selectedKey = null; poseEdit = null;
     clipCursorMs = 0; clipPlaying = false; playing = false;
     rebuildSkeleton();
