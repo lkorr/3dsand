@@ -49,25 +49,41 @@ OcclusionResult ComputeOcclusion(World& world, const Vec3& listenerVox,
   float hfDepth = 0.0f;    // accumulated fraction toward the cutoff floor
   float rawSolidVox = 0.0f;
 
+  // The ray steps one voxel at a time but a chunk is 16 voxels across, so a
+  // straight line spends ~16 consecutive samples inside the SAME chunk. Cache
+  // the last chunk resolved and reuse it while the chunk coords do not change:
+  // that turns ~448 hash lookups per voice per frame into ~28, and skips the
+  // window test with them. Only the lookup is memoized — every sample still
+  // reads its own voxel, so the result is bit-identical to the naive walk.
+  IVec3 curChunk{INT32_MIN, INT32_MIN, INT32_MIN};
+  const CachedChunk* cc = nullptr;   // nullptr = treat this chunk as open
+
   // Skip the first sample: it is the listener's own cell. Standing with your
   // head inside a leaf block should not silence the world.
   for (int i = 1; i < steps; i++) {
     const float t = (float)i * kStepVox;
     const Vec3 p = listenerVox + dir * t;
     const IVec3 cell{ifloor(p.x), ifloor(p.y), ifloor(p.z)};
-
-    // Unknown space is treated as AIR, not as solid. The chunk cache trails
-    // the player, so assuming solid would make every sound past the cached
-    // radius cut out -- a far worse artifact than under-occluding.
-    if (!world.CellInWindow(cell)) continue;
     const IVec3 wc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
-    const CachedChunk* cc = world.Cached(wc);
-    if (cc == nullptr || cc->voxels.size() != kChunkVol) {
-      // Ask for it so the NEXT solve is better; this one treats it as open.
-      // Bounded by World::kFetchPerTick, so a long ray cannot flood the queue.
-      world.RequestChunkFetch(wc);
-      continue;
+
+    if (wc.x != curChunk.x || wc.y != curChunk.y || wc.z != curChunk.z) {
+      curChunk = wc;
+      // Unknown space is treated as AIR, not as solid. The chunk cache trails
+      // the player, so assuming solid would make every sound past the cached
+      // radius cut out -- a far worse artifact than under-occluding.
+      if (!world.ChunkInWindow(wc)) {
+        cc = nullptr;
+      } else {
+        cc = world.Cached(wc);
+        if (cc != nullptr && cc->voxels.size() != kChunkVol) cc = nullptr;
+        // Ask for it so the NEXT solve is better; this one treats it as open.
+        // Bounded by World::kFetchPerTick, so a long ray cannot flood the
+        // queue. Requested once per chunk ENTERED rather than once per sample,
+        // which is the same set of chunks with 1/16th the queue churn.
+        if (cc == nullptr) world.RequestChunkFetch(wc);
+      }
     }
+    if (cc == nullptr) continue;
 
     const uint32_t lx = (uint32_t)(cell.x & 15), ly = (uint32_t)(cell.y & 15),
                    lz = (uint32_t)(cell.z & 15);
