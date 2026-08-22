@@ -37,6 +37,7 @@
 #include "gpu/context.h"
 #include "gpu/passtimer.h"
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
 #include "sim/simulation.h"
 #include "sim/world.h"
 #include "test/support.h"
@@ -412,6 +413,32 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
   }
   MeasureOccupancy(ctx, world);
   MeasureUniformity(ctx, world);
+
+  // ---- resident memory, the phase-7 acceptance number (§3.7) --------------
+  // Two numbers, and conflating them is how a phase claims a win it did not
+  // get: pagesInUse_ * 16 KiB is RESIDENT CONTENT and is what compares to the
+  // 77.7 MiB measurement; the pool reservation is RESERVED VRAM and is what
+  // kPoolPages costs whether or not it is used.
+  {
+    const PageTable& pt = *world.pages;
+    const double pageMiB = (double)kChunkVol * 4.0 / 1048576.0;
+    std::printf("\n=== MEASUREMENT 1c: page residency ===\n");
+    std::printf("  mode:                 %s\n",
+                world.residency == World::Residency::Paged ? "paged" : "dense");
+    std::printf("  pages in use:         %7u  (%.1f MiB resident)\n",
+                pt.PagesInUse(), (double)pt.PagesInUse() * pageMiB);
+    std::printf("  high water:           %7u  (%.1f MiB)\n",
+                pt.PagesHighWater(), (double)pt.PagesHighWater() * pageMiB);
+    std::printf("  pool reservation:     %7u  (%.1f MiB) <- kPoolPages\n",
+                pt.PoolPages(), (double)pt.PoolPages() * pageMiB);
+    std::printf("  dense equivalent:     %7u  (%.1f MiB)\n", kNumChunks,
+                (double)kNumChunks * pageMiB);
+    std::printf("  page fills issued:    %7llu   pages freed: %llu\n",
+                (unsigned long long)pt.FillsIssued(),
+                (unsigned long long)pt.PagesFreed());
+    std::printf("  compare resident against 77.7 MiB measured / 86.9 MiB "
+                "estimated (§3.7).\n");
+  }
 
   uint32_t active = ReadActiveChunksSync(ctx, world, sim);
   std::printf("\n  active (dirty) chunks after settling: %u / %u\n", active,

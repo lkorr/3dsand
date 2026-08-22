@@ -954,6 +954,118 @@ Then, as its own milestone with fresh measurements: grow the window (1024³
 implies 8× occupancy/dirty metadata, compaction-scan and full-scan cost growth,
 far-field shift-base retune — sized separately before committing).
 
+### Phase 7 [AS BUILT] — 2026-08-22, commits dbf47d5 … 5d02e7b
+
+Implemented against `docs/PLAN_page_table.md` §8, commits 0–5. **The memory
+claim landed exactly**; one design formula did not survive contact and is
+recorded below as an open item rather than papered over.
+
+**Measured, `--measure --residency paged`, default seed, settled:**
+
+| number | value | against |
+|---|---|---|
+| resident pages | **4,975 = 77.7 MiB** | 77.7 MiB measured / 86.9 MiB estimated |
+| dense equivalent | 32,768 = 512 MiB | — |
+| reduction | **6.6×** | — |
+| pool reservation (`kPoolPages`) | 8,192 = 128 MiB | reserved VRAM, not resident |
+| high water | 8,192 | during batched worldgen only |
+| pages freed | 27,793 | the all-air chunks, demoted to `EMPTY` |
+| settled tick | **240.975 µs** | 229–236 µs record → **+2.1%**, inside the 5% threshold |
+
+Resident content and pool reservation are reported separately on purpose:
+conflating them is how a phase claims a win it did not get (§3.7).
+
+**Equality, `--vk-smoke --residency paged`:**
+
+```
+worldgen  f97ba745  MATCH   tick 1   d5c8944c  MATCH
+tick 15   f153ce74  MATCH   tick 30  434268e6  MATCH
+tick 50   b3c643a2  MATCH   5/5 MATCH   validation: ZERO messages
+```
+
+A world on 4,975 physical pages with 27,793 `EMPTY` sentinels hashes
+bit-identically to the same world on 32,768 dense pages, and both reproduce
+the pinned constants. That exercises the whole chain: translation arithmetic,
+sentinel encoding, the analytic hash branch, the two-base split, `synthWord`'s
+CPU/GPU agreement, materialization and the fills.
+
+**Suite:** 25 gates, `determinism` reporting the pinned `7cfa2420`,
+`page faults over the suite: 0`, `pond-freeze` and `mob` failing as at
+baseline. `check_pass_table.py`, `check_invariants.py`, `check_shaders.sh` all
+silent.
+
+**Three design deviations, each resolved inside the doc's own rules:**
+
+1. **§4.1a added — the two-base rule is not only about the hash.** Five more
+   sites key an *identity* on a voxel index: the per-cell RNG in
+   `sim_step:main` and `doStaining`, the ejecta and grit rolls in
+   `sim_explode:apply`, the palette-variant roll in `sim_mutate:main`, and the
+   particle claim lattice in `sim_particle:resolve`. Generalized rule: **an
+   index used as an identity must be the SLOT index; only a memory address may
+   be the PAGE index.** Equal under the identity map, which is why commit 1
+   could introduce the split and prove it neutral.
+2. **The accessors cannot live unconditionally in `common.wgsl`** — WGSL
+   resolves module-scope references in unreachable functions, so a block naming
+   `voxels`/`pageTable`/`pageFaults` fails to compile in the five shaders that
+   declare none of them, and `raymarch` declares `voxels` as `read` with no
+   `pageFaults`. Two delimited blocks (READ / WRITE), stripped per shader by
+   `LoadShader` and by `check_shaders.sh`. `common.wgsl` stays the one place
+   the translation is written, and `sim_compact` acquires no spurious
+   `R(PageTable)`.
+3. **Bindings are 17/18 in BOTH `simBGL_` and `simSlimBGL_`**, not 17/18 and
+   5/6 as §5.2 says: one WGSL identifier cannot carry two binding numbers
+   across modules sharing `common.wgsl`, and 5/6 are already `PassParams` and
+   brush ops. The slim group becomes 0..4 + 17..18 — legal under Vulkan, and
+   it preserves the property §5.2a wanted (anything on `simSlimBGL_` inherits
+   translation, which is how `worldgen:fardown` gets it).
+
+**One pre-existing gap surfaced and fixed in the harness layer:**
+`World::Snap().valid` was false on every tick of every headless harness — the
+async map's fence had not retired when `ProcessEvents` ran in the same loop
+iteration. Pre-existing (it is why `KindAt` returned Unknown under harnesses)
+but paging is the first system to depend on the snapshot, since §3.2's
+tightening is the only thing that shrinks the mirror.
+`SetHarnessSnapshotDrain()` (`test/support.h`), **off by default**, makes a
+harness tick behave like a game frame. The game's frame loop shares
+`SubmitTick` and never takes the path.
+
+---
+
+#### OPEN — §3.4's particle set is a correct superset but is NOT BOUNDED
+
+The one formula that did not survive implementation, stated plainly because it
+is the blocker on `--vk-smoke-loud --residency paged`.
+
+§3.4 dilates `particleChunks` one ring per tick and resets only at
+`particleCount == 0`. Dilating the previous dilation makes the set a k-ring
+after k ticks — (2k+1)³ chunks — and nothing shrinks it while any particle is
+alive. Measured on the loud scenario, one explosion's debris drives it
+**1, 27, 125, 343, 729, 1331, 2197, 3375** over eight ticks (3375 = 15³), which
+alone pushes the materialization set past an 8,192-page pool.
+
+Not fixed here: bounding it means changing a reviewed formula, and the
+candidate forms each carry a different soundness argument —
+
+- age the set against a particle-lifetime window and rebuild from spawns;
+- track per-spawn sets and expire them individually;
+- read particle positions back and rebuild exactly (a new readback).
+
+**The consequence is contained and loud, never silent:** the pool exhausts and
+§3.8's fatal abort fires with a clear message. It cannot corrupt a world, does
+not affect dense mode, and does not affect any scenario without live
+particles — `--vk-smoke --residency paged` runs clean end to end.
+
+#### DEFERRED follow-ups (severable, recorded per the pacing directive)
+
+- **Ring-starvation gate.** Hold all three readback slots in flight for ~10
+  consecutive ticks while a fire spreads, and assert the hash still matches
+  dense. It is the only test that would exercise §3.2's conservative path
+  rather than its exact one — with a healthy ring the tightening is the
+  identity and the fallback is dead code that has never run.
+- **Low-`kPoolPages` abort gate.** Run with a deliberately tiny pool and assert
+  the abort fires cleanly with the right message — testing that the failure
+  mode *works*, since under §3.8 it is now the only one.
+
 **Phase 8 — capability exploitation (each its own measured change).**
 Async compute/transfer queues (readbacks, far-field fill off the main queue);
 subgroup ops in occupancy/compaction only (their output order provably cannot
