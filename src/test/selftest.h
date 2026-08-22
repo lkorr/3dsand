@@ -120,6 +120,23 @@ struct Options {
   bool list = false;              // --list
 };
 
+// The GOLDEN world hash, read from tests/baseline.json's "determinismHash" key,
+// or empty when the key is absent.
+//
+// WHY THIS EXISTS. The determinism gate compares two runs of the SAME build
+// against each other, which proves the sim is reproducible but says nothing
+// about WHAT it reproduces. A change that makes the sim do less — the phase-2b
+// discovery was a build where mutate/explode dispatched zero workgroups —
+// stays perfectly self-consistent and the gate stays green. Pinning the value
+// turns "the sim agrees with itself" into "the sim agrees with the world we
+// shipped", which is the property every later phase (and the whole Vulkan port)
+// actually leans on.
+//
+// Set by Run() before any gate executes. Empty means "not pinned": the gate
+// reports the hash and passes, exactly as it did before, so a checkout without
+// the key still works.
+const std::string& GoldenDeterminismHash();
+
 // Run the selected gates. Returns a process exit code: 0 when every gate that
 // ran either passed or was already failing in the baseline.
 int Run(Ctx& c, const Options& opt);

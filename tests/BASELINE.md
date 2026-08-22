@@ -12,6 +12,47 @@
 It exists to retire the attribution ritual in CLAUDE.md — "build clean `HEAD`
 before blaming your change". That took ~15 minutes of rebuild. This takes none.
 
+## `determinismHash` — the golden world hash
+
+`"determinismHash": "7cfa2420"` pins what the determinism gate must actually
+produce, and it is checked separately from the pass/fail entries: a mismatch is
+a **REGRESSION** and turns the run red even though the gate is marked `"pass"`.
+
+It exists because the gate's own check is weaker than it looks. It runs the sim
+twice and compares the two hash sequences — that proves the sim is
+*reproducible*, not that it still simulates the *same world*. A change that
+makes the sim quietly do less is perfectly self-consistent and stays green. The
+Vulkan port's phase 2b found precisely that: a build in which the mutate and
+explode passes dispatched **zero workgroups** passed the full suite. Pinning the
+value converts "the sim agrees with itself" into "the sim agrees with the world
+we recorded", which is what every later change is actually relying on.
+
+**When to flip it.** Any intentional change to hashed state legitimately moves
+the hash: a material or reaction edit, a `sim.*` tuning value, worldgen, or a
+sim kernel. Those are content changes, not regressions — run the gate, take the
+new value, and update the key **in the same commit as the change**, the same
+discipline as flipping a known-failure to `"pass"`:
+
+```bash
+./build/Release/sandvox.exe --selftest --gate determinism
+# determinism: FAIL (final hash 91ab00de over 200 ticks)
+#   GOLDEN HASH MISMATCH: baseline says 7cfa2420, ...
+```
+
+then set `"determinismHash": "91ab00de"`. The commit message should say what
+content changed and why the hash moved — a flip with no explanation is
+indistinguishable from someone silencing a real regression, which is the one way
+this key can make things worse than not having it.
+
+**When NOT to flip it.** If you did not intend to change sim behaviour, a
+mismatch is the gate doing its job: something in the tick path stopped doing
+what it did. Do not update the value to make the run green. Note also that a
+mismatch on a *different GPU vendor* is a rule-1 cross-vendor determinism
+finding (DESIGN.md risk #3), not a reason to re-record.
+
+Deleting the key disables the check: the gate reports `not pinned` and passes on
+self-consistency alone, i.e. the old behaviour.
+
 The file is a **flat string→string map** with no comments: the parser is a
 deliberately strict hand-rolled scanner (no JSON dependency, since it runs
 before anything else is initialised), and prose keys in the file itself once

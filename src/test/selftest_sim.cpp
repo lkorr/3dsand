@@ -42,8 +42,28 @@ for (int run = 0; run < 2; run++) {
   }
 }
 bool deterministic = hashes[0] == hashes[1];
-std::printf("determinism: %s (final hash %08x over %d ticks)\n",
-            deterministic ? "PASS" : "FAIL", hashes[0].back(), kTicks);
+
+// The GOLDEN check. Twice-run equality proves the sim reproduces itself; it
+// does NOT prove it still simulates the same world. A change that quietly makes
+// the sim do less stays perfectly self-consistent and sails through — the
+// phase-2b Vulkan-port work found exactly that, a build where the mutate and
+// explode passes dispatched ZERO workgroups with the full suite green.
+//
+// So the final hash is pinned in tests/baseline.json ("determinismHash") and a
+// mismatch is a REGRESSION, handled like a known-fail flip: an intentional
+// content or sim change updates the recorded value in the same commit. An
+// absent key means "not pinned" and only reports — a checkout predating the key
+// still behaves as before. See tests/BASELINE.md.
+char got[16];
+std::snprintf(got, sizeof(got), "%08x", hashes[0].back());
+const std::string& golden = GoldenDeterminismHash();
+bool goldenOk = golden.empty() || golden == got;
+
+std::printf("determinism: %s (final hash %s over %d ticks%s)\n",
+            (deterministic && goldenOk) ? "PASS" : "FAIL", got, kTicks,
+            golden.empty() ? ", not pinned"
+            : goldenOk     ? ", matches baseline"
+                           : "");
 if (!deterministic) {
   for (int i = 0; i < kTicks; i++) {
     if (hashes[0][i] != hashes[1][i]) {
@@ -53,9 +73,26 @@ if (!deterministic) {
     }
   }
 }
+if (!goldenOk) {
+  std::printf(
+      "  GOLDEN HASH MISMATCH: baseline says %s, this build produced %s.\n"
+      "  The sim is self-consistent but simulates a DIFFERENT world than the\n"
+      "  one recorded. If that was intentional (a material, reaction, tuning\n"
+      "  sim.* or kernel change), set \"determinismHash\": \"%s\" in\n"
+      "  tests/baseline.json in the SAME commit. If it was not, you have found\n"
+      "  a real behaviour change — see tests/BASELINE.md.\n",
+      golden.c_str(), got, got);
+}
 
-  // Verdict: the flag the moved body already computed.
-  return deterministic ? Status::Pass : Status::Fail;
+  std::string goldenNote = golden.empty() ? ", golden hash not pinned"
+                           : goldenOk     ? ", matches golden"
+                                          : ", GOLDEN MISMATCH (baseline " +
+                                                golden + ")";
+  detail = Format("final hash %s over %d ticks%s", got, kTicks,
+                  goldenNote.c_str());
+
+  // Verdict: self-consistent AND simulating the recorded world.
+  return (deterministic && goldenOk) ? Status::Pass : Status::Fail;
 }
 
 // ---- sleep -------------------------------------------------------------

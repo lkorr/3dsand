@@ -134,10 +134,20 @@ std::vector<const Gate*> Plan(const std::vector<std::string>& only) {
   return plan;
 }
 
+// The golden world hash from the baseline, or empty when the key is absent.
+// File-scope because the determinism gate lives in another TU and gates take no
+// options argument; Run() sets it before the first gate runs.
+std::string g_goldenHash;
+
 // Baseline: gate name -> was it failing at the recorded commit. Hand-editable
 // JSON, deliberately a flat object so a human can read a diff of it.
+//
+// Also picks up "determinismHash", whose value is a hex world hash rather than
+// "pass"/"fail" — the same flat string->string shape, so the scanner below
+// needs no new syntax, only a second place to put the value.
 std::unordered_map<std::string, bool> LoadBaseline(const std::string& path) {
   std::unordered_map<std::string, bool> known;
+  g_goldenHash.clear();
   std::ifstream f(path);
   if (!f) return known;
   std::string text((std::istreambuf_iterator<char>(f)),
@@ -169,6 +179,7 @@ std::unordered_map<std::string, bool> LoadBaseline(const std::string& path) {
     if (ve == std::string::npos) break;
     std::string val = text.substr(p + 1, ve - p - 1);
     if (val == "fail" || val == "pass") known[key] = (val == "fail");
+    else if (key == "determinismHash") g_goldenHash = val;
     i = ve + 1;
   }
   return known;
@@ -205,6 +216,8 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
 }
 
 }  // namespace
+
+const std::string& GoldenDeterminismHash() { return g_goldenHash; }
 
 void Ctx::Grab(const char* path) {
   rhi::Buffer shot =

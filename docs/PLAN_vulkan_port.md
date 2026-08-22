@@ -114,6 +114,19 @@ Dawn anyway.
 behavior change.*
 
 **Phase 3 — Vulkan compute backend, headless.**
+
+> **[AS BUILT] Phase 3a deliverable 0 — the golden-hash gate.** Phase 2b
+> discovered the full selftest PASSing on a build where the mutate and explode
+> passes dispatched **zero workgroups**: the determinism gate compares two runs
+> of the same build, so a sim that quietly does less stays self-consistent and
+> green. `tests/baseline.json` now carries `"determinismHash": "7cfa2420"`; the
+> gate compares the 200-tick final hash against it and reports a REGRESSION
+> (exit 1) on mismatch, with an absent key meaning "not pinned" so the old
+> behaviour survives. An intentional content change flips the value in the same
+> commit, exactly like flipping a known failure — `tests/BASELINE.md` says when
+> that is legitimate and when it is someone silencing a real regression. This
+> protects every remaining phase of the port: cross-backend hash equality is
+> only meaningful if the reference value is itself pinned.
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
 barriers generated from the pass table, indirect dispatch (keep the staging
