@@ -269,6 +269,11 @@ int List() {
 }
 
 int Run(Ctx& c, const Options& opt) {
+  // Make a harness tick behave like a game frame: block for the readback map
+  // after a kicked readback so World::Snap() actually becomes valid. See the
+  // block comment on SetHarnessSnapshotDrain (test/support.h) for why the
+  // harnesses need this and the game does not.
+  SetHarnessSnapshotDrain(true);
   std::vector<const Gate*> plan = Plan(opt.only);
   if (plan.empty()) {
     std::fprintf(stderr, "selftest: nothing to run\n");

@@ -382,6 +382,7 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
 }  // namespace
 
 int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
+  SetHarnessSnapshotDrain(true);  // see test/support.h
   std::printf("=== sandvox --measure: Vulkan-port sizing ===\n");
   std::printf("timestamp queries: %s\n",
               ctx.timestampsEnabled ? "SUPPORTED (GPU pass timings below)"

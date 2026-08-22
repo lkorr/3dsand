@@ -202,6 +202,7 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
     std::printf("device init: FAIL\n");
     return false;
   }
+  SetHarnessSnapshotDrain(true);  // see test/support.h
   World world;
   // The residency axis (§4.4 Gate A): one driver, two configurations. Both must
   // produce identical hashes at every probe AND reproduce the pinned constants.

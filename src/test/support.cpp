@@ -220,8 +220,27 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   ctx.queue.Submit(enc.Finish());
   sim.FlipPage();
-  if (doCopy) world.KickReadback();
+  if (doCopy) {
+    world.KickReadback();
+    // Harness only, off by default (see SetHarnessSnapshotDrain in support.h).
+    // Wait for the submit's fence, then pump — which is what a game frame does
+    // for free by having real time elapse between the two. The game's frame
+    // loop shares SubmitTick and must never take this path.
+    if (HarnessSnapshotDrain()) {
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+    }
+  }
 }
+
+namespace {
+// Off by default: main.cpp's frame loop shares SubmitTick and must never pay
+// this sync point. Only --selftest / --vk-smoke / --measure opt in.
+bool g_harnessSnapshotDrain = false;
+}  // namespace
+
+void SetHarnessSnapshotDrain(bool on) { g_harnessSnapshotDrain = on; }
+bool HarnessSnapshotDrain() { return g_harnessSnapshotDrain; }
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
   TickParams tp{0, seed, 0, 0};
