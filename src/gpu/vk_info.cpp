@@ -151,6 +151,12 @@ void PrintCaps(const vk::Caps& c) {
   std::printf("  nonCoherentAtomSize           : %llu\n",
               (unsigned long long)c.nonCoherentAtomSize);
 
+  std::printf("\n=== synchronization2 (phase 3b barriers) ===\n");
+  std::printf("  synchronization2              : %s%s\n", YesNo(c.synchronization2),
+              c.synchronization2
+                  ? "   (vkCmdPipelineBarrier2 usable)"
+                  : "   <- the generated-barrier recorder CANNOT run");
+
   std::printf("\n=== measurement / validation ===\n");
   std::printf("  timestampQuery                : %s (period %.4f ns)\n",
               YesNo(c.timestampQuery), c.timestampPeriodNs);

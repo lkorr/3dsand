@@ -704,6 +704,25 @@ order that matters:
    it is doing something it is not, and the assertion is the honest form of the
    same guarantee.
 
+   **[AS BUILT, phase 3b] The implementation takes a third option, and it is
+   strictly safer than either.** `Recorder::FlushPending` still runs the full
+   per-buffer tracker for a global row — it computes the pending
+   `VkBufferMemoryBarrier2` list exactly as form (A) would — and only *then*
+   collapses it. The collapse is not a discard: any pending barrier carrying an
+   access outside `SHADER_STORAGE_READ|WRITE` has its stages and accesses ORed
+   into the global barrier before the list is dropped. So on today's table it
+   emits precisely form (B) (nothing in the CA loop's pending list is outside
+   the domain after iteration 0), and if a future edit ever did write
+   `dispatchArgs` between iterations, the global barrier would automatically
+   widen to `DRAW_INDIRECT`/`INDIRECT_COMMAND_READ` rather than silently failing
+   to order it.
+   This makes the §6.1 checker assertion a defence-in-depth check rather than
+   the sole guarantee, which is the right ordering for something rule 1 rests
+   on: the code is correct without the checker, and the checker still catches
+   the table drift that motivated it. The cost is computing a barrier list that
+   is usually thrown away — a few dozen struct writes per CA iteration, on the
+   CPU, in a loop that is already issuing a dispatch.
+
 2. **Atomic visibility is covered; indirect visibility is not — and that is the
    same distinction.** §3.2 establishes that `StorageAtomicRMW` maps to
    `SHADER_STORAGE_READ | SHADER_STORAGE_WRITE` because Vulkan has no
@@ -1590,7 +1609,19 @@ Interpretation:
 `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` reports a hazard
 from the *recorded commands*, without needing a divergence to occur — it does
 not care whether the hardware happened to serialize. It is the primary detector
-and it is assumed on for every debug run. Its known gaps are around indirect
+and it is assumed on for every debug run.
+
+**[AS BUILT, phase 3b] It is now actually available.** The layer did not
+enumerate on this machine when phases 1–3a were written (no Vulkan SDK, by
+design), which made this paragraph aspirational and made a malformed descriptor
+fault inside the ICD instead of erroring. The LunarG SDK was installed during
+phase 3b, and `--vk-smoke --vk-validation` runs the full worldgen + 50-tick
+comparison with synchronization validation on and reports **zero** messages.
+One caution the SDK introduced: it registers eight explicit layers (api_dump,
+gfxreconstruct, synchronization2, monitor, screenshot, profiles, shader_object,
+validation), so instance creation must request `khronos_validation` **by exact
+name** and never enable whatever enumerates — an API dumper or a capture layer
+silently in the path of a determinism run is its own hazard. Its known gaps are around indirect
 args and cross-submit hazards, i.e. exactly §4.5 and §4.3, so it is not
 sufficient alone either.
 
@@ -2003,10 +2034,23 @@ frame behind, or that the origin fields diverge.
   / `EncodeDirtyCopy` — the eviction copies §4.3, and the render chain §2.6,
   which phase 4 covers. §2.5.5 `wakeAll` records no commands and needs none.)*
 - **No barrier is ever written at a call site.** If a hazard needs expressing,
-  it is expressed as a table row's `uses`.
+  it is expressed as a table row's `uses`. *(Live since phase 3b: the tracker is
+  `gpu/vk_record.cpp`, and the Vulkan recorder reaches a command only by walking
+  a `pass::Row`, so a use cannot be omitted at a call site — there are no call
+  sites. The single off-table path, `CopyToHost` for the blocking hash read,
+  expresses its source hazard as a `pass::Use` against the same tracker.)*
 - **No static/precomputed barrier list.** §7.5.
 - **The CA loop's 53 inter-iteration barriers are not negotiable.** They are the
-  color lattice, not a cache flush. §7.1.
+  color lattice, not a cache flush. §7.1. *(Phase 3b's `--vk-smoke` prints the
+  count: 55 global barriers per tick = 1 head + 54 CA iterations.)*
+- **`synchronization2` must be ENABLED at device creation, not merely present in
+  a 1.3 device.** Every scope in §3.2 is written in `VkPipelineStageFlags2` /
+  `VkAccessFlags2`, so `vkCmdPipelineBarrier2` is the only barrier command the
+  recorder emits. Core promotion makes the entry point resolve; it does not make
+  the call legal. The backend queries the feature, enables it explicitly, and
+  refuses to initialise without it — a fallback that down-converted these scopes
+  to the 1.0 barrier would be a silently weaker barrier, i.e. the one failure
+  mode this document exists to prevent.
 - **v1 is one queue and keeps the indirect staging copies.** Both relaxations
   are legal in Vulkan and both are separate, hash-gated changes.
 - **Zero-init is a mechanism, not a list**: `CreateBuffer` adds `TRANSFER_DST`

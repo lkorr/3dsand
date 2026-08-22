@@ -109,6 +109,18 @@ enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar };
 //         the iterations must not overlap (pass_table.def header, §3.6/§7.1).
 enum class Dyn : uint8_t { None, Zero, Ca };
 
+// The passUBO slice stride Dyn::Ca steps by. It lives HERE rather than as a
+// file-static in simulation.cpp because two recorders now consume it — the Dawn
+// walk in simulation.cpp and the Vulkan walk in gpu/vk_record.cpp — and a
+// constant copied into the second one is the "two places that must agree" bug
+// this repo has a checker for. It is a property of the TABLE's Dyn::Ca
+// selector, not of a backend.
+//
+// 256 is the value passUBO was built with (54 slices x 256 B) and is a legal
+// dynamic offset on this device: minUniformBufferOffsetAlignment is 64
+// (--vk-info), and the requirement is that the offset be a multiple of it.
+inline constexpr uint32_t kPassStride = 256;
+
 // Conditions, all known on the CPU before recording begins. A row whose
 // condition is false is SKIPPED ENTIRELY (barrier_graph §3.9/§7.5).
 enum class Cond : uint8_t {

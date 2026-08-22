@@ -5,7 +5,9 @@
 
 #include "gpu/resources.h"
 
-static constexpr uint32_t kPassStride = 256;  // min uniform dynamic-offset alignment
+// kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
+// when the Vulkan recorder became a second consumer of it — see the note there.
+using pass::kPassStride;
 
 bool Simulation::Init(const rhi::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,

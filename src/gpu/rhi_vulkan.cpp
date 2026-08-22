@@ -110,25 +110,66 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
   std::vector<const char*> layers;
   std::vector<const char*> exts;
 
+  // LAYER ENUMERATION. Two properties this loop must have, both learned here:
+  //
+  //  1. It requests exactly ONE layer, by exact name. Installing the LunarG SDK
+  //     registered EIGHT explicit layers (api_dump, gfxreconstruct,
+  //     synchronization2, monitor, screenshot, profiles, shader_object,
+  //     validation) — enabling whatever enumerates would silently put an API
+  //     dumper or a capture layer in the path of a determinism run. Only
+  //     khronos_validation is ever asked for, and only when the toggle is on.
+  //  2. It handles VK_INCOMPLETE. The two-call idiom races against a layer set
+  //     that can change between the count call and the fill call, and with a
+  //     dozen registered layers that is no longer hypothetical. On INCOMPLETE
+  //     the vector holds a valid PREFIX, so scanning it is still correct — but
+  //     the loop must not assume `layerCount` entries were written.
   uint32_t layerCount = 0;
   if (gfn_.EnumerateInstanceLayerProperties) {
-    gfn_.EnumerateInstanceLayerProperties(&layerCount, nullptr);
-    std::vector<VkLayerProperties> props(layerCount);
-    if (layerCount) gfn_.EnumerateInstanceLayerProperties(&layerCount, props.data());
-    for (const auto& p : props)
-      if (std::strcmp(p.layerName, "VK_LAYER_KHRONOS_validation") == 0)
-        caps_.validationAvailable = true;
+    VkResult lr = gfn_.EnumerateInstanceLayerProperties(&layerCount, nullptr);
+    if ((lr == VK_SUCCESS || lr == VK_INCOMPLETE) && layerCount) {
+      std::vector<VkLayerProperties> props(layerCount);
+      uint32_t got = layerCount;
+      lr = gfn_.EnumerateInstanceLayerProperties(&got, props.data());
+      if (lr == VK_SUCCESS || lr == VK_INCOMPLETE) {
+        if (got > layerCount) got = layerCount;
+        for (uint32_t i = 0; i < got; i++)
+          if (std::strcmp(props[i].layerName, "VK_LAYER_KHRONOS_validation") == 0)
+            caps_.validationAvailable = true;
+      }
+    }
+  }
+  // The debug messenger is how validation output reaches us at all, so a
+  // validation run without VK_EXT_debug_utils is a validation run whose findings
+  // go nowhere. Check the extension is actually present rather than assuming the
+  // layer brings it.
+  bool debugUtilsAvailable = false;
+  if (gfn_.EnumerateInstanceExtensionProperties) {
+    uint32_t n = 0;
+    VkResult er = gfn_.EnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    if ((er == VK_SUCCESS || er == VK_INCOMPLETE) && n) {
+      std::vector<VkExtensionProperties> eprops(n);
+      uint32_t got = n;
+      er = gfn_.EnumerateInstanceExtensionProperties(nullptr, &got, eprops.data());
+      if (er == VK_SUCCESS || er == VK_INCOMPLETE) {
+        if (got > n) got = n;
+        for (uint32_t i = 0; i < got; i++)
+          if (std::strcmp(eprops[i].extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0)
+            debugUtilsAvailable = true;
+      }
+    }
   }
   if (validation && caps_.validationAvailable) {
     layers.push_back("VK_LAYER_KHRONOS_validation");
-    exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (debugUtilsAvailable) exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     caps_.validationEnabled = true;
   }
 
   // Synchronization validation is the PRIMARY detector for a missing barrier
-  // (docs/vulkan_barrier_graph.md). Nothing records barriers until phase 3b, but
-  // the toggle is plumbed now so that phase starts with its safety net already
-  // wired rather than adding it after the first race.
+  // (barrier_graph §6.2's detection ladder puts it above cross-backend hash
+  // equality and far above the sledgehammer A/B, because it reports a hazard
+  // from the RECORDED COMMANDS without needing a divergence to actually occur).
+  // Live since phase 3b, when the LunarG SDK was installed on this machine —
+  // before that the layer did not enumerate and this toggle did nothing.
   VkValidationFeatureEnableEXT enables[] = {
       VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
   VkValidationFeaturesEXT valFeatures{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
@@ -349,10 +390,37 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   want.sparseBinding = caps_.sparseBinding;
   want.sparseResidencyBuffer = caps_.sparseResidencyBuffer;
 
+  // SYNCHRONIZATION2 IS MANDATORY FOR PHASE 3b, and asking for it is not
+  // optional decoration: vkCmdPipelineBarrier2 is core in Vulkan 1.3, which
+  // makes the entry point RESOLVE, but calling it on a device that never
+  // enabled the feature is undefined behaviour. With no validation layer here
+  // that is an access violation inside the ICD, not an error return — the same
+  // class of failure that cost phase 3a a debugging session on pipeline
+  // layouts. Query first, enable explicitly, and refuse to run without it.
+  VkPhysicalDeviceVulkan13Features feat13{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  if (ifn_.GetPhysicalDeviceFeatures2) {
+    VkPhysicalDeviceVulkan13Features probe{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &probe;
+    ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
+    caps_.synchronization2 = probe.synchronization2 != 0;
+  }
+  if (!caps_.synchronization2) {
+    err =
+        "device does not support VkPhysicalDeviceVulkan13Features::"
+        "synchronization2, which the generated-barrier recorder requires "
+        "(docs/vulkan_barrier_graph.md §3.2 is written in Flags2 scopes)";
+    return false;
+  }
+  feat13.synchronization2 = VK_TRUE;
+
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   dci.pEnabledFeatures = &want;
+  dci.pNext = &feat13;
 
   VkResult r = ifn_.CreateDevice(phys_, &dci, nullptr, &device_);
   if (r != VK_SUCCESS) {
@@ -361,6 +429,10 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   }
   vkl::LoadDevice(ifn_, device_, dfn_);
   dfn_.GetDeviceQueue(device_, queueFamily_, 0, &queue_);
+  if (!dfn_.CmdPipelineBarrier2) {
+    err = "vkCmdPipelineBarrier2 did not resolve despite synchronization2";
+    return false;
+  }
   return true;
 }
 
@@ -699,6 +771,7 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
 }
 
 VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
+                                             const rhi::BindGroupLayoutEntry* layoutEntries,
                                              const rhi::BindGroupEntry* entries,
                                              size_t count,
                                              const std::vector<Buffer*>& buffers) {
@@ -723,13 +796,26 @@ VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
     infos[i].range = entries[i].size ? entries[i].size
                      : (b ? b->size - entries[i].offset : VK_WHOLE_SIZE);
 
+    // THE DESCRIPTOR TYPE COMES FROM THE LAYOUT, matched by binding number
+    // rather than by array position — the two arrays are written independently
+    // at every call site and nothing guarantees they are ordered alike.
+    // Hardcoding STORAGE_BUFFER here (which this did until phase 3b) is
+    // undefined behaviour for every uniform binding, and with no validation
+    // layer it does not error: it corrupts the descriptor and faults later, in
+    // a dispatch, a long way from the cause.
+    VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    for (size_t j = 0; j < count; j++) {
+      if (layoutEntries[j].binding == entries[i].binding) {
+        type = ToVkDescriptorType(layoutEntries[j].type, layoutEntries[j].hasDynamicOffset);
+        break;
+      }
+    }
+
     writes[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[i].dstSet = set;
     writes[i].dstBinding = entries[i].binding;
     writes[i].descriptorCount = 1;
-    // The layout knows the real type; callers pass matching entries. Phase 3c
-    // will carry the type alongside the entry so this cannot drift.
-    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[i].descriptorType = type;
     writes[i].pBufferInfo = &infos[i];
   }
   dfn_.UpdateDescriptorSets(device_, (uint32_t)writes.size(), writes.data(), 0, nullptr);

@@ -107,6 +107,9 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(CmdFillBuffer);
   VKL_D(CmdUpdateBuffer);
   VKL_D(CmdPipelineBarrier);
+  // Core 1.3. Resolvable on a 1.3 device regardless of features; LEGAL to call
+  // only if synchronization2 was enabled. Backend::Init checks both.
+  VKL_D(CmdPipelineBarrier2);
   VKL_D(CmdBindPipeline);
   VKL_D(CmdBindDescriptorSets);
   VKL_D(CmdDispatch);

@@ -104,11 +104,20 @@ struct DeviceFns {
   PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
   PFN_vkResetCommandBuffer ResetCommandBuffer = nullptr;
 
-  // The commands phase 3a actually issues: fills (zero-init) and updates
-  // (Class A uploads). Dispatch/barriers arrive in 3b.
+  // Fills (zero-init), updates (Class A uploads), and — from phase 3b — the
+  // recording commands and the generated barriers.
   PFN_vkCmdFillBuffer CmdFillBuffer = nullptr;
   PFN_vkCmdUpdateBuffer CmdUpdateBuffer = nullptr;
   PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
+  // vkCmdPipelineBarrier2 is CORE VULKAN 1.3, but a core-1.3 command is only
+  // usable when the corresponding feature is ENABLED at device creation —
+  // VkPhysicalDeviceVulkan13Features::synchronization2. Promotion to core makes
+  // the symbol resolvable; it does not make the command legal. With no
+  // validation layer on this machine, calling it on a device that did not
+  // request the feature is undefined behaviour that faults inside the ICD
+  // rather than erroring, so Backend::Init enables the feature explicitly and
+  // refuses to run if the device cannot offer it.
+  PFN_vkCmdPipelineBarrier2 CmdPipelineBarrier2 = nullptr;
   PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
   PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
   PFN_vkCmdDispatch CmdDispatch = nullptr;

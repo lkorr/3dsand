@@ -111,6 +111,17 @@ struct Caps {
   bool validationAvailable = false;
   bool validationEnabled = false;
   bool syncValidationEnabled = false;
+
+  // --- synchronization2 (phase 3b) ---
+  // vkCmdPipelineBarrier2 is the ONE barrier command the generated-barrier
+  // recorder emits, and every scope in docs/vulkan_barrier_graph.md §3.2 is
+  // written in VkPipelineStageFlags2/VkAccessFlags2 terms. Core in 1.3, but a
+  // core command still requires its FEATURE to be enabled at device creation.
+  // If the device cannot offer it, the backend refuses to initialise rather
+  // than falling back to the 1.0 barrier: the fallback would have to
+  // down-convert every scope, and a silently weaker barrier is precisely the
+  // failure mode rule 1 cannot tolerate.
+  bool synchronization2 = false;
 };
 
 // -------------------------------------------------------------- buffer ----
@@ -211,7 +222,16 @@ class Backend {
   // Allocates and writes a descriptor set. A binding with size 0 means "rest of
   // the buffer from offset" (rhi.h semantics), resolved here against the
   // buffer's cached size — which is the reason Buffer stores one.
+  //
+  // `layoutEntries` MUST be the same array the layout was created from: the
+  // descriptor TYPE in a VkWriteDescriptorSet has to match the layout binding's
+  // type exactly, and a mismatch is undefined behaviour that faults inside the
+  // ICD here rather than erroring (no validation layer on this machine). An
+  // earlier version of this function hardcoded STORAGE_BUFFER for every write,
+  // which was silently wrong for every uniform binding — including passUBO,
+  // the dynamic one.
   VkDescriptorSet CreateDescriptorSet(VkDescriptorSetLayout layout,
+                                      const rhi::BindGroupLayoutEntry* layoutEntries,
                                       const rhi::BindGroupEntry* entries, size_t count,
                                       const std::vector<Buffer*>& buffers);
 
