@@ -219,6 +219,34 @@ TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f)
 // How much the underside of the water surface ripples the view of the sky.
 TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f)
 
+// ---- the generic per-liquid submerged profile (submergedProfile) ----
+// These shape the MAPPING from a liquid's authored opacity + palette to its
+// submerged look, so every liquid — including ones added later — gets a
+// complete treatment with no shader change. The subAbsorb/subScatter/
+// subVisibility values above remain WATER'S refinement, blended in at the
+// clear end of the curve rather than selected by a material test.
+//
+// Visibility in a fully opaque liquid. Being inside oil should be
+// claustrophobic — this is the "arm's length" end of the range.
+TP_F(render, subMurkVis, TUNE_SUB_MURK_VIS, 0.55f)
+// Exponent applied to clarity for the VISIBILITY mapping only. Separate from
+// the clarity curve itself because one shared exponent cannot both collapse
+// oil to arm's length and keep water classified as clear (see submergedProfile).
+TP_F(render, subVisCurve, TUNE_SUB_VIS_CURVE, 2.2f)
+// Opacity -> per-metre absorption gain for the derived (non-clear) case.
+TP_F(render, subAbsorbGain, TUNE_SUB_ABSORB_GAIN, 7.0f)
+// Absorption floor, so even a notionally clear liquid is not a vacuum.
+TP_F(render, subAbsorbFloor, TUNE_SUB_ABSORB_FLOOR, 0.05f)
+// How much of its own colour a liquid scatters back at the eye, at the dense
+// and clear ends of the clarity curve. A dense liquid IS what you see.
+TP_F(render, subScatterDense, TUNE_SUB_SCATTER_DENSE, 0.42f)
+TP_F(render, subScatterClear, TUNE_SUB_SCATTER_CLEAR, 0.16f)
+// Clarity band over which a liquid crosses from the derived profile onto
+// water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.16.
+// Widening this band makes more liquids inherit water's look.
+TP_F(render, subClearLow, TUNE_SUB_CLEAR_LOW, 0.62f)
+TP_F(render, subClearHigh, TUNE_SUB_CLEAR_HIGH, 0.82f)
+
 // ---- blood / viscous liquids ----
 TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.03f)
 TP_F(render, bloodGraze, TUNE_BLOOD_GRAZE, 0.55f)

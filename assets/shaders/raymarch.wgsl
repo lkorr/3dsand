@@ -2219,6 +2219,106 @@ fn siltMotes(ro : vec3f, rd : vec3f, maxDistVox : f32, lit : f32) -> f32 {
   return acc * TUNE_SILT_DENSITY * TUNE_SILT_BRIGHTNESS * (0.25 + lit);
 }
 
+// ============================================================================
+// THE SUBMERGED PROFILE — what being inside ANY liquid looks like
+// ============================================================================
+// Every liquid a body can be inside gets a complete submerged treatment for
+// free, derived from what materials.json already authors: its PALETTE and its
+// OPACITY. Nothing here names a material or an id, so a liquid added tomorrow
+// is submersible tomorrow (CLAUDE.md conventions), and the tuning knobs below
+// shape the MAPPING rather than any one liquid's numbers.
+//
+// The first cut of this had a one-line escape hatch — `isWater`, defined as
+// "has any tag AND opacity < 0.45" — and everything else fell into a rough
+// else branch. That was wrong twice over. As a classifier it was accidental:
+// acid (opacity 170) failed it, and so would any new clear liquid authored
+// without tags, so "is this water" was really "did the author happen to write
+// these two fields this way". And the else branch was a stub — no visibility
+// distance, no vignette, no god-ray or Snell gating — so a non-water liquid
+// got a half-finished look that no amount of tuning could fix.
+//
+// OPACITY IS THE AXIS. It is already the authored measure of how much a medium
+// blocks, it is already what the media path uses, and across the shipped
+// liquids it orders them exactly the way submersion should: water 90 (clear,
+// you see across a pond), acid 170, blood 200, oil 235 (nearly opaque, arm's
+// length). Everything below is a function of it, so a new liquid's look
+// follows from one number the author was going to write anyway.
+struct SubProfile {
+  absorbK   : vec3f,  // per-channel extinction per metre
+  scatter   : vec3f,  // colour the volume tends toward
+  visM      : f32,    // metres to full fade — the "how murky" distance
+  clarity   : f32,    // 0 = opaque sludge, 1 = clear water. Gates the extras.
+  vignette  : f32,    // screen-edge darkening
+  snellGain : f32,    // brightness of the window looking up
+};
+
+fn submergedProfile(m : Material) -> SubProfile {
+  var p : SubProfile;
+  // Authored palette average — the liquid's own colour is what the volume
+  // tends toward with distance, for every liquid including water.
+  let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
+  // 0 for a perfectly clear liquid, 1 for a fully blocking one. Water sits at
+  // 0.35, oil at 0.92.
+  let op = clamp(f32(m.opacity) / 255.0, 0.0, 1.0);
+
+  // CLARITY drives everything that only makes sense in a medium you can see
+  // through. It is deliberately non-linear: opacity 90 (water) has to land
+  // near "clear" and opacity 235 (oil) near "blind", and a straight 1-op maps
+  // water to 0.65 and oil to 0.08, which reads as murky water rather than as
+  // oil. The curve pushes the ends apart.
+  p.clarity = pow(clamp(1.0 - op, 0.0, 1.0), 0.55);
+
+  // Visibility: how far you can see before the view is entirely the liquid's
+  // own colour.
+  //
+  // Deliberately a STEEPER function of clarity than the gating above, and the
+  // two curves have to be separate. One shared exponent cannot serve both: a
+  // gentle curve leaves oil seeing 3 m (which reads as murky water, not
+  // sludge), and a steep enough curve to fix that drags water's clarity down
+  // out of the refined band and loses water's hand-tuned look entirely. So
+  // clarity^2.2 collapses the murky end hard while the gentler `clarity`
+  // itself still classifies water as clear. Oil lands near 1 m, blood ~2 m,
+  // acid ~3 m, and water is overridden to its authored 11 m below.
+  p.visM = mix(TUNE_SUB_MURK_VIS, TUNE_SUB_VISIBILITY,
+               pow(p.clarity, TUNE_SUB_VIS_CURVE));
+
+  // Absorption absorbs the COMPLEMENT of the liquid's colour — a green acid
+  // must absorb red and blue, which is what leaves it green at depth. Scaled
+  // by opacity so a dense liquid kills light faster. The floor keeps even a
+  // notionally clear liquid from being a perfect vacuum.
+  p.absorbK = (vec3f(1.0) - base) * (op * TUNE_SUB_ABSORB_GAIN) +
+              vec3f(TUNE_SUB_ABSORB_FLOOR);
+
+  // In-scatter colour. A dense liquid scatters more of its own colour back at
+  // you (it is what you see instead of the scene), a clear one much less.
+  p.scatter = base * mix(TUNE_SUB_SCATTER_DENSE, TUNE_SUB_SCATTER_CLEAR,
+                         p.clarity);
+
+  // A dense medium presses in at the edges of vision harder than a clear one.
+  p.vignette = clamp(TUNE_SUB_VIGNETTE * mix(1.6, 1.0, p.clarity), 0.0, 0.95);
+  // Snell's window needs a medium you can see the sky through at all.
+  p.snellGain = TUNE_SUB_SNELL_GAIN * p.clarity;
+
+  // ---- WATER'S REFINEMENT ----
+  // Water is the one liquid whose submerged look has been tuned by eye rather
+  // than derived, and those hand-set coefficients are better than the generic
+  // curve can be — the per-channel red kill that makes water read as water is
+  // not recoverable from a palette average. So the derivation above is the
+  // DEFAULT and this is an override on top of it, not the other way round.
+  //
+  // Keyed on clarity rather than on a tag or an id: any liquid authored as
+  // clear as water gets water's treatment, which is the correct generalisation
+  // ("clear liquids behave like this") rather than a special case for one
+  // material. The blend means there is no cliff — a liquid authored slightly
+  // murkier than water slides smoothly off the refined values onto the
+  // derived ones.
+  let refined = smoothstep(TUNE_SUB_CLEAR_LOW, TUNE_SUB_CLEAR_HIGH, p.clarity);
+  p.absorbK = mix(p.absorbK, TUNE_SUB_ABSORB, refined);
+  p.scatter = mix(p.scatter, TUNE_SUB_SCATTER, refined);
+  p.visM = mix(p.visM, TUNE_SUB_VISIBILITY, refined);
+  return p;
+}
+
 // ---- the full submerged shade ----
 // Replaces the old two-line `underwater` branch. `sceneBehind` is whatever the
 // primary march resolved — a rock, the bed, or the underside of the surface —
@@ -2234,22 +2334,12 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   let distM = max(pathVox, 0.0) * VOXEL_METERS;
 
   // ---- absorption + in-scatter ----
-  // Underwater absorption is its own tuning set, NOT waterAbsorb. See
-  // tuning.h: the coefficients that make a lake read deep when you look down
-  // into it leave you inside a featureless blue void when you are under it,
-  // because there is no distance information left within arm's reach.
-  var absorbK = TUNE_SUB_ABSORB;
-  var scatterCol = TUNE_SUB_SCATTER;
-  let isWater = (m.tagMask != 0u) && (f32(m.opacity) / 255.0 < 0.45);
-  if (!isWater) {
-    // Any other liquid you can be inside (oil, acid) derives its coefficients
-    // from its own authored palette and opacity, exactly as shadeWater does —
-    // no material IDs in the shader (CLAUDE.md conventions).
-    let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
-    let k = (f32(m.opacity) / 255.0) * 6.0;
-    absorbK = (vec3f(1.0) - base) * k + vec3f(0.05);
-    scatterCol = base * 0.3;
-  }
+  // Derived per liquid from its authored palette and opacity, with water's
+  // hand-tuned coefficients blended in at the clear end. See submergedProfile:
+  // there is no "is this water" test anywhere in here, only "how clear is it".
+  let prof = submergedProfile(m);
+  let absorbK = prof.absorbK;
+  let scatterCol = prof.scatter;
 
   // The scatter colour is lit by the key light, so a pond at night is dark
   // water rather than the same daytime turquoise at lower brightness.
@@ -2274,8 +2364,15 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // That bright disc ringed by dark mirror is the single most recognisable
   // thing about looking up underwater, and without it a submerged view of the
   // sky is just the normal sky slightly tinted, which reads as a bug.
+  //
+  // GATED ON CLARITY. A window is only a window if the medium transmits: in
+  // oil there is no disc of sky above you, just dark. The refraction physics
+  // are identical in any liquid, but at opacity 235 nothing survives the trip
+  // to the eye, so drawing a bright sky disc through sludge is the single most
+  // obviously wrong thing this function could do. snellGain carries the fade,
+  // so the term disappears smoothly as a liquid is authored murkier.
   var behind = sceneBehind;
-  if (sawSky) {
+  if (sawSky && prof.snellGain > 0.001) {
     // Angle off vertical. The critical angle for water is asin(1/1.333) =
     // 48.6 degrees, i.e. cos = 0.661 — that is the edge of the window.
     let cosUp = clamp(rd.y, -1.0, 1.0);
@@ -2295,7 +2392,7 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
     // part right: the horizon ring crowds into the rim of the disc.
     var skyDir = normalize(vec3f(rd.x * 0.62, max(rd.y, 0.05), rd.z * 0.62));
     skyDir += vec3f(s.x, 0.0, s.y) * 0.25;
-    let windowSky = skyColorNoBodies(normalize(skyDir)) * TUNE_SUB_SNELL_GAIN;
+    let windowSky = skyColorNoBodies(normalize(skyDir)) * prof.snellGain;
     behind = mix(scatterCol * keyLightColor() * sunUp * 1.2, windowSky, window);
   }
 
@@ -2312,30 +2409,46 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // which things disappear" knob (at distM == subVisibility the view is
   // 1/e ~ 37% original), and the per-channel absorption still tilts the hue
   // with depth on top of it.
-  let extinction = absorbK + vec3f(1.0 / TUNE_SUB_VISIBILITY);
+  // Per liquid, so a murky one goes blind close in and a clear one does not.
+  let extinction = absorbK + vec3f(1.0 / prof.visM);
   let trans = exp(-extinction * distM);
   var color = behind * trans + ambientWater * (vec3f(1.0) - trans);
 
-  // ---- god rays ----
-  // Added, not mixed: scattered light is light ARRIVING at the eye from the
-  // volume, on top of whatever survived from behind.
-  let shafts = godRays(ro, rd, max(pathVox, 1.0), px);
-  color += ambientWater * shafts;
+  // ---- god rays and silt ----
+  // BOTH GATED ON CLARITY, and both skipped outright in a dense liquid.
+  //
+  // Visually: a shaft of sunlight is only visible because the medium transmits
+  // it far enough to be seen as a beam, and suspended motes are only visible
+  // if light reaches them. In oil neither survives a centimetre, so drawing
+  // sunbeams and drifting specks inside sludge reads as water with the wrong
+  // colour rather than as oil.
+  //
+  // And they are the two most expensive terms in the function — godRays is a
+  // march with a real occlusion trace per sample. Skipping them where they
+  // cannot be seen means a dense liquid is also the CHEAP case, which is the
+  // right way round: you are usually submerged in something dense because you
+  // fell in it, and that is a bad moment for a frame-time spike.
+  if (prof.clarity > 0.08) {
+    // Added, not mixed: scattered light is light ARRIVING at the eye from the
+    // volume, on top of whatever survived from behind.
+    let shafts = godRays(ro, rd, max(pathVox, 1.0), px) * prof.clarity;
+    color += ambientWater * shafts;
 
-  // ---- silt ----
-  // Lit by the same shaft integral, so motes inside a beam flare and motes in
-  // shadow stay dim — which is what makes the beams look like they occupy
-  // space rather than being painted over the image.
-  let motes = siltMotes(ro, rd, max(pathVox, 1.0), shafts);
-  color += ambientWater * motes * 2.0 + vec3f(motes * 0.05);
+    // Motes are lit by the same shaft integral, so ones inside a beam flare
+    // and ones in shadow stay dim — which is what makes the beams look like
+    // they occupy space rather than being painted over the image.
+    let motes = siltMotes(ro, rd, max(pathVox, 1.0), shafts) * prof.clarity;
+    color += ambientWater * motes * 2.0 + vec3f(motes * 0.05);
+  }
 
   // ---- vignette ----
   // Cheap, and a strong "you are inside a medium" cue: light reaching the edge
   // of your view underwater has travelled further through it. Keyed on the
   // angle off the view axis rather than on screen UV so it does not stretch
-  // with aspect ratio.
+  // with aspect ratio. Stronger in a dense liquid, which is what makes being
+  // in oil feel like being in oil.
   let off = 1.0 - clamp(dot(rd, R.camFwd), 0.0, 1.0);
-  color *= 1.0 - clamp(off * TUNE_SUB_VIGNETTE * 2.5, 0.0, TUNE_SUB_VIGNETTE);
+  color *= 1.0 - clamp(off * prof.vignette * 2.5, 0.0, prof.vignette);
 
   return color;
 }

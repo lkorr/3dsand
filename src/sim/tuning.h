@@ -866,6 +866,29 @@ struct Tuning {
     // how strongly the underside of the surface ripples the view of the sky
     float subSurfaceRipple = 1.6f;
 
+    // ---- the generic per-liquid submerged profile ----
+    // (submergedProfile in raymarch.wgsl.) These shape the MAPPING from a
+    // liquid's authored opacity + palette to its submerged look, so EVERY
+    // liquid gets a complete treatment with no shader change — including ones
+    // added later. The subAbsorb/subScatter/subVisibility values above are not
+    // "the underwater settings" any more; they are WATER'S refinement, blended
+    // in at the clear end of the curve rather than picked by a material test.
+    //
+    // Opacity is the axis, because it is already the authored measure of how
+    // much a medium blocks and it already orders the shipped liquids the way
+    // submersion should: water 90, acid 170, blood 200, oil 235.
+    float subMurkVis = 0.55f;      // visibility (m) in a fully opaque liquid
+    float subVisCurve = 2.2f;      // clarity exponent for visibility only
+    float subAbsorbGain = 7.0f;    // opacity -> per-metre absorption
+    float subAbsorbFloor = 0.05f;  // so even a clear liquid is not a vacuum
+    // How much of its own colour a liquid scatters back at the eye, at the
+    // dense and clear ends. In a dense liquid, that scatter IS what you see.
+    float subScatterDense = 0.42f, subScatterClear = 0.16f;
+    // Clarity band over which a liquid crosses from the derived profile onto
+    // water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.25;
+    // widening this band makes more liquids inherit water's look.
+    float subClearLow = 0.62f, subClearHigh = 0.82f;
+
     // blood / viscous liquids (shadeViscous in raymarch.wgsl)
     float bloodF0 = 0.030f;        // head-on reflectance
     float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)

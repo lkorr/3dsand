@@ -176,6 +176,16 @@ SPEC = [
     # surface-from-below
     ("render", "subSurfaceRipple", "TUNE_SUB_SURFACE_RIPPLE", "f", 1.6),
 
+    # the generic per-liquid submerged profile (submergedProfile)
+    ("render", "subMurkVis", "TUNE_SUB_MURK_VIS", "f", 0.55),
+    ("render", "subVisCurve", "TUNE_SUB_VIS_CURVE", "f", 2.2),
+    ("render", "subAbsorbGain", "TUNE_SUB_ABSORB_GAIN", "f", 7.0),
+    ("render", "subAbsorbFloor", "TUNE_SUB_ABSORB_FLOOR", "f", 0.05),
+    ("render", "subScatterDense", "TUNE_SUB_SCATTER_DENSE", "f", 0.42),
+    ("render", "subScatterClear", "TUNE_SUB_SCATTER_CLEAR", "f", 0.16),
+    ("render", "subClearLow", "TUNE_SUB_CLEAR_LOW", "f", 0.62),
+    ("render", "subClearHigh", "TUNE_SUB_CLEAR_HIGH", "f", 0.82),
+
     # blood / viscous liquids
     ("render", "bloodF0", "TUNE_BLOOD_F0", "f", 0.03),
     ("render", "bloodGraze", "TUNE_BLOOD_GRAZE", "f", 0.55),

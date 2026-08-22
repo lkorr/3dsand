@@ -911,6 +911,36 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "siltDrift", r.siltDrift, out, at);
     ReadF(*g, "subSurfaceRipple", r.subSurfaceRipple, out, at);
 
+    // ---- generic per-liquid submerged profile ----
+    ReadF(*g, "subMurkVis", r.subMurkVis, out, at);
+    // Same divide-by-zero hazard as subVisibility: visM is the denominator of
+    // the extinction term, and a zero there takes a submerged frame to NaN,
+    // which renders as a black screen the moment you go under.
+    if (r.subMurkVis < 0.05f) {
+      out.warnings.push_back(at + ".subMurkVis < 0.05; clamped to 0.05");
+      r.subMurkVis = 0.05f;
+    }
+    ReadF(*g, "subVisCurve", r.subVisCurve, out, at);
+    // pow() with a negative exponent on a clarity approaching 0 explodes to
+    // infinity; 0 would make every liquid equally visible and defeat the knob.
+    r.subVisCurve = std::clamp(r.subVisCurve, 0.05f, 8.0f);
+    ReadF(*g, "subAbsorbGain", r.subAbsorbGain, out, at);
+    r.subAbsorbGain = std::max(r.subAbsorbGain, 0.0f);
+    ReadF(*g, "subAbsorbFloor", r.subAbsorbFloor, out, at);
+    r.subAbsorbFloor = std::max(r.subAbsorbFloor, 0.0f);
+    ReadF(*g, "subScatterDense", r.subScatterDense, out, at);
+    ReadF(*g, "subScatterClear", r.subScatterClear, out, at);
+    ReadF(*g, "subClearLow", r.subClearLow, out, at);
+    ReadF(*g, "subClearHigh", r.subClearHigh, out, at);
+    // smoothstep with low >= high is undefined-ish (it degenerates to a step
+    // at best); keep a real band so the crossover onto water's coefficients
+    // stays a blend rather than a cliff.
+    if (r.subClearHigh <= r.subClearLow) {
+      out.warnings.push_back(
+          at + ".subClearHigh <= subClearLow; widened to keep a blend band");
+      r.subClearHigh = r.subClearLow + 0.05f;
+    }
+
     ReadF(*g, "bloodF0", r.bloodF0, out, at);
     ReadF(*g, "bloodGraze", r.bloodGraze, out, at);
     ReadF(*g, "bloodAbsorb", r.bloodAbsorb, out, at);
