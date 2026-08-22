@@ -1,10 +1,11 @@
 // rhi_vk.h — the Vulkan backend behind the rhi.h seam (port phase 4a).
 //
-// PRIVATE TO src/gpu/, like rhi_dawn.h. This is what replaced vk_sim.h's
-// parallel resource declarations: World::Init and Simulation::Init now create
-// their buffers, layouts, descriptor sets and pipelines THROUGH the seam, and
-// these impls translate each call onto vk::Backend (rhi_vulkan.h). There is one
-// World again, working on either backend.
+// PRIVATE TO src/gpu/, and since the Dawn removal (2026-08-22) the ONLY
+// implementation behind the seam. This is what replaced vk_sim.h's parallel
+// resource declarations: World::Init and Simulation::Init create their
+// buffers, layouts, descriptor sets and pipelines THROUGH the seam, and these
+// impls translate each call onto vk::Backend (rhi_vulkan.h). One World, one
+// backend.
 //
 // Phase 4b: textures, render pipelines, render passes and the swapchain are
 // live. The one remaining abort is the generic compute-pass encoder, which no
@@ -31,8 +32,9 @@ namespace vkr {
 // all keep it alive until the last handle drops.
 Device WrapDevice(std::shared_ptr<vk::Backend> be, bool sledgehammer);
 
-// The backend behind a Vulkan seam device (caps, validation messages), or null
-// for a Dawn device. Callers are diagnostics only (--vk-smoke's report).
+// The backend behind a seam device (caps, validation messages), or null if the
+// device is not a Vulkan one. Callers are diagnostics only (--vk-smoke's
+// report) plus overlay.cpp's ImGui init.
 vk::Backend* NativeBackend(const Device& d);
 
 // Recording statistics of the most recently finished command buffer on this
@@ -52,8 +54,9 @@ Stats LastStats(const Device& d);
 TextureView WrapSwapchainImage(vk::Image* img);
 
 // The live VkCommandBuffer behind an open seam render pass — the ONE consumer
-// is src/ui/overlay.cpp, which hands it to ImGui_ImplVulkan_RenderDrawData
-// (the imgui_impl_wgpu Native(pass) counterpart, same sanctioned exception).
+// is src/ui/overlay.cpp, which hands it to ImGui_ImplVulkan_RenderDrawData —
+// the one sanctioned place outside src/gpu/ that names a native GPU handle,
+// because ImGui's render backend takes it directly.
 VkCommandBuffer NativeCmd(const RenderPass& p);
 
 }  // namespace vkr

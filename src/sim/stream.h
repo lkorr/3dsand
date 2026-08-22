@@ -23,12 +23,12 @@ struct GpuContext;
 // the world hash for the same reason, and a restored voxel is re-stamped
 // kStampNever so it is born "has never acted" (CLAUDE.md's tick-stamp rule).
 //
-// This lives in the header rather than as a file-static in stream.cpp because a
-// second consumer now needs it: the Vulkan port's cross-backend smoke has to
-// reproduce the store round-trip EXACTLY to compare against Dawn, and a copy of
-// the literal there was already a "two places that must agree" bug in waiting —
-// it silently produced a divergence that read like a barrier race
-// (docs/PLAN_vulkan_port.md, phase 3c).
+// This lives in the header rather than as a file-static in stream.cpp because
+// the Vulkan port needed a second consumer that reproduced the store round-trip
+// EXACTLY, and a copy of the literal there was a "two places that must agree"
+// bug in waiting — it silently produced a divergence that read like a barrier
+// race (docs/PLAN_vulkan_port.md, phase 3c). That episode is the reason; the
+// rule outlives it.
 inline constexpr uint32_t kPersistMask = 0xFF00FFFFu;  // everything but the stamp byte
 
 void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out);

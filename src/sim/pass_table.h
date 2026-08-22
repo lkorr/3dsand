@@ -5,9 +5,10 @@
 // scripts/check_pass_table.py scrapes the same .def. Read the .def's header
 // comment first — it explains what a row means and why the table exists at all.
 //
-// Nothing here knows about Vulkan. Under Dawn the table drives WHAT is
-// recorded and nothing else; phase 3 adds the last-access tracker that turns
-// each row's `uses` into vkCmdPipelineBarrier2 calls (barrier_graph §3.3).
+// Nothing here knows about Vulkan. The table declares WHAT is recorded; the
+// last-access tracker in gpu/vk_record.cpp is what turns each row's `uses`
+// into vkCmdPipelineBarrier2 calls (barrier_graph §3.3). Keeping those two
+// apart is why a row can be checked against the WGSL by a python script.
 
 #pragma once
 
@@ -110,11 +111,11 @@ enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar };
 enum class Dyn : uint8_t { None, Zero, Ca };
 
 // The passUBO slice stride Dyn::Ca steps by. It lives HERE rather than as a
-// file-static in simulation.cpp because two recorders now consume it — the Dawn
-// walk in simulation.cpp and the Vulkan walk in gpu/vk_record.cpp — and a
-// constant copied into the second one is the "two places that must agree" bug
-// this repo has a checker for. It is a property of the TABLE's Dyn::Ca
-// selector, not of a backend.
+// file-static in simulation.cpp because it is a property of the TABLE's
+// Dyn::Ca selector, not of a recorder — it was already consumed by two walkers
+// before the Dawn removal left one, and a constant copied into a consumer is
+// the "two places that must agree" bug this repo has a checker for. Keep it
+// here even though there is currently a single reader.
 //
 // 256 is the value passUBO was built with (54 slices x 256 B) and is a legal
 // dynamic offset on this device: minUniformBufferOffsetAlignment is 64

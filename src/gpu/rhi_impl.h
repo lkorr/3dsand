@@ -1,23 +1,26 @@
 // rhi_impl.h — the abstract impl layer behind the rhi.h handles (port phase 4a).
 //
 // PRIVATE TO src/gpu/. rhi.h forward-declares these types; this header defines
-// them as abstract bases so TWO backends can coexist in one binary, selected at
-// runtime by which subclass a Device was created from:
+// them as abstract bases. There is exactly ONE subclass set today:
 //
-//   rhi_dawn.cpp   Dawn*  subclasses — thin wgpu:: holders, the passthrough
-//                  backend phase 2a built. Recording is byte-identical to the
-//                  pre-polymorphism seam: same wgpu calls, one virtual hop.
-//   rhi_vk.cpp     Vkr*   subclasses — the Vulkan backend of phase 3, reached
-//                  through the seam instead of through vk_sim.h's parallel
+//   rhi_vk.cpp     Vkr*   subclasses — the Vulkan backend, reached through the
+//                  seam rather than through phase 3b's vk_sim.h parallel
 //                  resource declarations (which phase 4a deleted).
 //
-// WHY VIRTUAL DISPATCH (the shape phases 2a/3b explicitly deferred): the gates
-// drive World/Simulation/Stream, whose resources are rhi:: handles, and running
-// them on Vulkan requires a Vulkan World — i.e. one handle type with two
-// implementations. Dispatch cost is irrelevant at this scale (~60 dispatches
-// and a handful of copies per tick, microseconds of CPU); what mattered was not
-// restructuring the seam while Dawn was the only hash oracle, and phase 3c's
-// cross-backend evidence is what made this restructure safe to verify.
+// rhi_dawn.cpp held the second set until the DAWN REMOVAL (2026-08-22).
+//
+// WHY THE ABSTRACTION SURVIVES ITS SECOND IMPLEMENTATION — this is the obvious
+// thing to "clean up", so the reason is recorded here rather than in a commit
+// message. Virtual dispatch was introduced in phase 4a because the selftest
+// gates drive World/Simulation/Stream, whose resources are rhi:: handles, and
+// pointing a gate at a backend therefore required one handle type with two
+// implementations. That capability is what made the port verifiable phase by
+// phase. It costs one indirect call on ~60 dispatches and a handful of copies
+// per tick — microseconds of CPU, unmeasurable against the tick — and it is
+// the slot phase 7's paged-residency BufferImpl plugs into: a sparse-backed
+// voxels buffer is another BufferImpl subclass, and the paged-vs-dense hash
+// equality checkpoint is the same two-configurations-one-driver shape the
+// cross-backend diff had. Devirtualising now would have to be undone then.
 //
 // The ONE thing the polymorphism does NOT change: barrier generation. The
 // Vulkan encoder does not derive barriers from these wgpu-shaped calls — sim

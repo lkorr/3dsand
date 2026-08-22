@@ -186,9 +186,8 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     // so the copy-out is already on the queue before the overwrite is even
     // enqueued, let alone recorded.
     //
-    // On Vulkan the memory half of the dependency comes from the
-    // head-of-command-buffer global barrier (§3.4) in whichever command buffer
-    // later drains the fill; under Dawn it is automatic.
+    // The memory half of the dependency comes from the head-of-command-buffer
+    // global barrier (§3.4) in whichever command buffer later drains the fill.
     ctx_->queue.Submit(enc.Finish());
     p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, n * kChunkBytes);
     pending_.push_back(std::move(p));

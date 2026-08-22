@@ -2,16 +2,15 @@
 // backend's generated-barrier recorder (port phase 4a).
 //
 // THE CONSTRAINT THIS PRESERVES (phase 3b's seam decision, verbatim): barrier
-// generation is NOT derived from wgpu-shaped encoder calls. The Vulkan recorder
+// generation is NOT derived from the seam's wgpu-shaped encoder calls. The recorder
 // walks pass::kRows ITSELF — the row is the loop variable, not a parameter that
 // can be omitted — so every command it can issue is reachable only from a row,
 // and its `uses` cannot be forgotten. What phase 4a changes is only WHO OWNS
 // THE RESOURCES: Simulation resolves the page-symbolic ids against its own
-// rhi:: handles (the same PassBuffer/PassPipeline resolution the Dawn walk
-// uses) and hands the result across this bridge; vk_sim.cpp's parallel copy of
-// the resolution is deleted.
+// rhi:: handles (PassBuffer/PassPipeline) and hands the result across this
+// bridge; vk_sim.cpp's parallel copy of the resolution is deleted.
 //
-// This header is includable from src/sim (no Vulkan, no wgpu): it speaks only
+// This header is includable from src/sim (no Vulkan headers): it speaks only
 // rhi:: handles and pass:: ids. The downcasts to the live Vulkan objects happen
 // on the other side, in rhi_vk.cpp.
 
@@ -54,12 +53,12 @@ struct TableBindings {
   BindGroup farSet;               // farBG_
 };
 
-// Record one table through the encoder's generated-barrier recorder. VULKAN
-// ONLY — Simulation::RecordTable calls this when device.Kind() is Vulkan and
-// runs its own Dawn walk otherwise. `timer` is the --measure hook (may be
-// null); when set, the recorder writes a GPU timestamp pair around each run of
-// rows sharing a `group` label, mirroring Dawn's per-ComputePassEncoder
-// timestamps so the two backends report comparable per-pass numbers.
+// Record one table through the encoder's generated-barrier recorder. This is
+// the whole of Simulation::RecordTable now that the Dawn walk is gone — one
+// walker, one table. `timer` is the --measure hook (may be null); when set,
+// the recorder writes a GPU timestamp pair around each run of rows sharing a
+// `group` label, which is the granularity the phase-0 per-pass baseline was
+// measured at, so the numbers stay comparable to it.
 void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const TableCtx& cx,
                        const TableBindings& tb, PassTimer* timer);
 

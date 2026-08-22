@@ -75,7 +75,7 @@ class GpuContext {
 
  private:
   // Backend-private state, defined in context.cpp. The pointer is what keeps
-  // wgpu:: out of this header.
+  // the Vulkan headers out of this header, which most of the engine includes.
   struct Backend;
   std::shared_ptr<Backend> back_;
 };

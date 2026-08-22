@@ -56,8 +56,8 @@ struct VkrState {
   std::shared_ptr<vk::Backend> be;
   vk::BarrierMode mode = vk::BarrierMode::Precise;
   // Fence of the most recent Queue::Submit. MapReadAsync/MapReadDeferred borrow
-  // it (RetainFence) because Dawn's semantics are "the map completes when the
-  // work producing the contents completes", and every call site issues the map
+  // it (RetainFence): the seam's contract is "the map completes when the work
+  // producing the contents completes", and every call site issues the map
   // AFTER submitting that work (KickReadback, Stream::EvictSlots).
   VkFence lastFence = VK_NULL_HANDLE;
   struct PendingMap {
@@ -410,8 +410,9 @@ struct VkrDevice final : DeviceImpl {
   ShaderModule CreateShaderModule(const std::string& wgsl, const char* label) override {
     // Deferred: Tint runs at pipeline creation, when the entry point is known.
     // The source is what LoadShader assembled (prelude + tuning + common +
-    // body) — the exact string the engine feeds Dawn, which is the property
-    // phase 3a's "no offline .spv" decision protects (F5 re-bakes tuning).
+    // body) — compiled from the LIVE string, which is the property phase 3a's
+    // "no offline .spv" decision protects: F5 re-bakes the tuning constants
+    // into the prelude, and a precompiled blob would freeze them.
     auto impl = std::make_shared<VkrShaderModule>();
     impl->source = wgsl;
     impl->label = label ? label : "shader";
@@ -682,8 +683,9 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
 
   e->rec->SetBindings(bd);
 
-  // --measure hook: timestamps around each run of rows sharing a group label,
-  // mirroring Dawn's per-ComputePassEncoder writes so the reports compare.
+  // --measure hook: timestamps around each run of rows sharing a group label.
+  // That granularity is not arbitrary — it is the one the phase-0 per-pass
+  // baseline was measured at, so the numbers stay comparable to it.
   if (timer && timer->Valid()) {
     auto* q = static_cast<VkrQuerySet*>(timer->NativeQuerySet().Get());
     if (q && q->pool != VK_NULL_HANDLE) {

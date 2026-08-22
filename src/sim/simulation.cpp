@@ -510,10 +510,12 @@ bool Simulation::ReloadShaders(const rhi::Device& device) {
 // declaration faithful to a recording is to make the declaration BE the
 // recording.
 //
-// Under Dawn this changes nothing about the command buffer: same encoders, same
-// pass splits, same ClearBuffers, same copies, same conditionals, same dynamic
-// offsets, same bind groups, same order. That is the acceptance criterion for
-// this phase (world hash byte-identical), not an aspiration.
+// The restructure was landed hash-neutral: converting the hand-written
+// recorder into a table walk changed nothing about the command buffer — same
+// pass splits, ClearBuffers, copies, conditionals, dynamic offsets, bind
+// groups and order — and a byte-identical world hash was the acceptance
+// criterion, not an aspiration. That is still what the pinned 7cfa2420
+// defends every time a row is edited.
 // ===========================================================================
 
 namespace {

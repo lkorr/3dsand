@@ -128,9 +128,9 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   }
   // Every copy below is TRACKED (rhi::CommandEncoder::CopyTracked): the sources
   // are pass-table buffers written by the tick rows earlier in this SAME
-  // command buffer, so under Vulkan each copy must declare its read to the
-  // generated-barrier tracker (vk_record.h §3.3). Under Dawn the tracked call
-  // is byte-identical to CopyBufferToBuffer.
+  // command buffer, so each copy must declare its read to the generated-barrier
+  // tracker (vk_record.h §3.3) — an untracked CopyBufferToBuffer here reads
+  // whatever the GPU happens to have written, with no barrier ordering it.
   for (size_t i = 0; i < s.fetchIds.size(); i++) {
     enc.CopyTracked(pass::Buf::Voxels, voxels,
                     (uint64_t)SlotChunkIndex(s.fetchIds[i]) * kChunkBytes, s.buf,
