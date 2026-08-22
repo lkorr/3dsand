@@ -157,6 +157,8 @@ add_executable(sandvox
   src/crash.cpp
   src/gpu/context.cpp
   src/gpu/resources.cpp
+  src/gpu/passtimer.cpp
+  src/measure/measure.cpp
   src/sim/world.cpp
   src/sim/worldio.cpp
   src/sim/stream.cpp

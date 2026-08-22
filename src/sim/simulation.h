@@ -4,6 +4,7 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include "gpu/passtimer.h"
 #include "sim/materials.h"
 #include "sim/microbody.h"
 #include "sim/microvox.h"
@@ -120,12 +121,32 @@ class Simulation {
   // Call once after each EncodeTick has been submitted.
   void FlipPage();
 
+  // MEASUREMENT ONLY (`--measure`, src/measure/measure.cpp). When non-null,
+  // every compute pass EncodeTick/EncodeWorldgen opens carries GPU timestamp
+  // writes labelled with the pass name. NULL in the game and in --selftest, so
+  // the encoded command buffer is unchanged. Timestamps observe a pass; they
+  // do not reorder or gate any dispatch, so the world hash is unaffected.
+  void SetPassTimer(PassTimer* t) { passTimer_ = t; }
+  // Resolve timestamp queries into the readback buffer. Encoded at the END of
+  // EncodeTick, so a caller that does nothing special still gets a complete
+  // command buffer — SubmitTick needed no changes at all. No-op without a
+  // timer, which is every non-measure run.
+  void EncodeTimerResolve(const wgpu::CommandEncoder& enc) const {
+    if (passTimer_) passTimer_->EncodeResolve(enc);
+  }
+
  private:
   bool BuildPipelines(const wgpu::Device& device, std::string* err);
   void EnsureDepth(uint32_t width, uint32_t height);
   void EnsureRenderPipelines(wgpu::TextureFormat format);
   // Stamp the cached art palette into a material table being (re)built.
   void ApplyArtPalette(std::vector<MaterialGpu>& table) const;
+  // BeginComputePass, timestamped when a PassTimer is attached (never in the
+  // game). One helper so the encode sites keep their single structure.
+  wgpu::ComputePassEncoder BeginPass(const wgpu::CommandEncoder& enc,
+                                     const char* name) const;
+
+  PassTimer* passTimer_ = nullptr;  // not owned; measurement harness only
 
   World* world_ = nullptr;
   wgpu::Device device_;

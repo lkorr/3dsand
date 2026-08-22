@@ -46,6 +46,7 @@
 #include "sim/worldio.h"
 #include "telemetry.h"
 #include "test/selftest.h"
+#include "measure/measure.h"
 #include "test/support.h"
 #include "ui/overlay.h"
 #include "crash.h"
@@ -980,6 +981,7 @@ int main(int argc, char** argv) {
 
   bool selftest = false;
   bool shot = false;
+  bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
   bool lowPowerAdapter = false;
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   bool telemetryEnabled = false;
@@ -1004,6 +1006,11 @@ int main(int argc, char** argv) {
     if (a == "--json" && i + 1 < argc) stOpt.jsonPath = argv[++i];
     if (a == "--baseline" && i + 1 < argc) stOpt.baselinePath = argv[++i];
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
+    // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
+    // occupancy histogram of the residency window + per-compute-pass GPU
+    // timings. Headless, off by default, and the ONLY thing that requests the
+    // TimestampQuery device feature.
+    if (a == "--measure") measure = true;
     if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
     if (a == "--noaudio") noAudio = true;
     if (a == "--telemetry") telemetryEnabled = true;
@@ -1094,7 +1101,7 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && shotMob.empty()) {
+  if (!selftest && !shot && !measure && shotMob.empty()) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -1102,7 +1109,8 @@ int main(int argc, char** argv) {
   }
 
   GpuContext ctx;
-  if (!ctx.Init(window, 1600, 900, lowPowerAdapter)) return 1;
+  if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure))
+    return 1;
 
   Telemetry telemetry;
   if (telemetryEnabled) telemetry.Start(telemetryPort);
@@ -1159,6 +1167,7 @@ int main(int argc, char** argv) {
   FarField far;
   far.Init(&world);
 
+  if (measure) return RunMeasure(ctx, world, sim);
   if (shot) return RunShots(ctx, world, sim);
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);

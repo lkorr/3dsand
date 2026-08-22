@@ -539,6 +539,14 @@ bool Simulation::ReloadShaders(const wgpu::Device& device, const wgpu::Instance&
   return built && !hadError;
 }
 
+// Measurement seam: identical to enc.BeginComputePass() unless the --measure
+// harness has attached a PassTimer (see Simulation::SetPassTimer).
+wgpu::ComputePassEncoder Simulation::BeginPass(const wgpu::CommandEncoder& enc,
+                                               const char* name) const {
+  if (passTimer_ && passTimer_->Valid()) return passTimer_->BeginPass(enc, name);
+  return enc.BeginComputePass();
+}
+
 void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
   page_ = 0;
   enc.ClearBuffer(world_->dirty[0], 0, wgpu::kWholeSize);
@@ -548,7 +556,7 @@ void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
   enc.ClearBuffer(world_->particleCounts, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->drawArgs, 0, wgpu::kWholeSize);  // no ghost particles
-  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  wgpu::ComputePassEncoder pass = BeginPass(enc, "worldgen");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   // one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
@@ -559,7 +567,7 @@ void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
 
 void Simulation::EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count) {
   if (count == 0) return;
-  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  wgpu::ComputePassEncoder pass = BeginPass(enc, "worldgenList");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(worldgenList_);
@@ -569,7 +577,7 @@ void Simulation::EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count) 
 
 void Simulation::EncodeFarFill(const wgpu::CommandEncoder& enc, uint32_t count) {
   if (count == 0) return;
-  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  wgpu::ComputePassEncoder pass = BeginPass(enc, "farFill");
   pass.SetBindGroup(0, simSlimBG_[page_]);
   pass.SetBindGroup(1, farBG_);
   pass.SetPipeline(farFill_);
@@ -584,7 +592,7 @@ void Simulation::EncodeLoadReset(const wgpu::CommandEncoder& enc) {
   enc.ClearBuffer(world_->particleCounts, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
   enc.ClearBuffer(world_->drawArgs, 0, wgpu::kWholeSize);
-  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyFull(loadReset)");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(occupancy_);
@@ -594,7 +602,7 @@ void Simulation::EncodeLoadReset(const wgpu::CommandEncoder& enc) {
 
 void Simulation::EncodeHashOnly(const wgpu::CommandEncoder& enc) {
   enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
-  wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+  wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyFull(hashOnly)");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(occupancy_);
@@ -624,7 +632,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
 
   // Prep pass: mutate + explode + compact (compact writes argsStage + dirtyList).
   {
-    wgpu::ComputePassEncoder prep = enc.BeginComputePass();
+    wgpu::ComputePassEncoder prep = BeginPass(enc, "prep(mutate+explode+compact)");
     if (opsCount > 0) {
       prep.SetBindGroup(0, simBG_[page_], 1, &off);
       prep.SetPipeline(mutate_);
@@ -664,7 +672,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
   enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
 
   {
-    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+    wgpu::ComputePassEncoder pass = BeginPass(enc, "ca(54 color x substep)");
     pass.SetBindGroup(0, simBG_[page_], 1, &off);
 
     // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
@@ -683,7 +691,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
   // dirtyOut, which the occupancy update below already covers.
   if (particlesActive) {
     {
-      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      wgpu::ComputePassEncoder pass = BeginPass(enc, "particleArgs1");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, particleBG_[page_]);
       pass.SetPipeline(pArgs1_);
@@ -692,7 +700,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     }
     enc.CopyBufferToBuffer(world_->pArgsStage, 16, world_->pDispatchArgs, 0, 12);
     {
-      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      wgpu::ComputePassEncoder pass = BeginPass(enc, "particleIntegrate+args2");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, particleBG_[page_]);
       pass.SetPipeline(pIntegrate_);
@@ -704,7 +712,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     enc.CopyBufferToBuffer(world_->pArgsStage, 16, world_->pDispatchArgs, 0, 12);
     enc.CopyBufferToBuffer(world_->pArgsStage, 0, world_->drawArgs, 0, 16);
     {
-      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      wgpu::ComputePassEncoder pass = BeginPass(enc, "particleResolve");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, particleBG_[page_]);
       pass.SetPipeline(pResolve_);
@@ -715,7 +723,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
 
   if (hashEnable) {
     // hash ticks need the whole-world scan anyway; it also refreshes occupancy
-    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+    wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyFull+pick(hashTick)");
     pass.SetBindGroup(0, simBG_[page_], 1, &off);
     pass.SetPipeline(occupancy_);
     pass.DispatchWorkgroups(kNumChunks, 1, 1);
@@ -727,7 +735,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     // dirtyOut flags (superset of every voxel write) and dispatch indirect
     enc.ClearBuffer(world_->argsStage, 0, wgpu::kWholeSize);
     {
-      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      wgpu::ComputePassEncoder pass = BeginPass(enc, "compactNext");
       pass.SetBindGroup(0, simBG_[page_], 1, &off);
       pass.SetPipeline(compactNext_);
       pass.DispatchWorkgroups(kNumChunks / 64, 1, 1);
@@ -735,7 +743,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     }
     enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
     {
-      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyDirty+pick");
       pass.SetBindGroup(0, simBG_[page_], 1, &off);
       pass.SetPipeline(occupancyDirty_);
       pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
@@ -754,7 +762,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     // downsamples then; only single-tick-then-settle edits landing exactly on
     // a hash tick propagate one tick late, which is invisible in practice.
     {
-      wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+      wgpu::ComputePassEncoder pass = BeginPass(enc, "farDown");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, farBG_);
       pass.SetPipeline(farDown_);
@@ -762,6 +770,9 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
       pass.End();
     }
   }
+
+  // Measurement only: no-op unless --measure attached a PassTimer.
+  EncodeTimerResolve(enc);
 }
 
 void Simulation::EnsureDepth(uint32_t width, uint32_t height) {

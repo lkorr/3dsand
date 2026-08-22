@@ -12,7 +12,7 @@ static void PrintDeviceError(const wgpu::Device&, wgpu::ErrorType type,
 }
 
 bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
-                      bool lowPowerAdapter) {
+                      bool lowPowerAdapter, bool wantTimestamps) {
   width = w;
   height = h;
 
@@ -71,7 +71,18 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
   required.maxComputeInvocationsPerWorkgroup =
       clampTo(256, supported.maxComputeInvocationsPerWorkgroup);
 
+  // Optional TimestampQuery, for `--measure` only. Guarded on adapter support:
+  // an unsupported feature in requiredFeatures makes RequestDevice FAIL, so a
+  // blind request would break the game on any adapter without it.
+  wgpu::FeatureName tsFeature = wgpu::FeatureName::TimestampQuery;
+  if (wantTimestamps && adapter.HasFeature(wgpu::FeatureName::TimestampQuery))
+    timestampsEnabled = true;
+
   wgpu::DeviceDescriptor ddesc{};
+  if (timestampsEnabled) {
+    ddesc.requiredFeatureCount = 1;
+    ddesc.requiredFeatures = &tsFeature;
+  }
   ddesc.requiredLimits = &required;
   ddesc.SetUncapturedErrorCallback(PrintDeviceError);
   ddesc.SetDeviceLostCallback(
