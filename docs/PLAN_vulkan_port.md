@@ -161,6 +161,50 @@ behavior change.*
 >
 > Proven, not assumed: `--vk-info` compiled a WGSL compute shader to 230 SPIR-V
 > words with the correct `07230203` magic, and loaded the Vulkan library.
+>
+> **[AS BUILT] Phase 3a deliverables 2+3 — backend foundations and `--vk-info`.**
+> `src/gpu/rhi_vulkan.{h,cpp}` implements the §4 submit-boundary designs:
+> registry-based zero-init, the pending-upload queue with both classes, a fence
+> on every submit, VMA allocation, Tint-backed shader modules, descriptor/
+> pipeline layouts and compute pipelines. `--vk-info` exercises every one and
+> **PASSES on the RTX 3060 Ti**. Nothing executes sim work; the only commands
+> submitted are the zero-init fills, one empty command buffer, and the upload
+> flush.
+>
+> **The capability record decides phase 7, and the answer is good:**
+>
+> | cap | value | meaning |
+> |---|---|---|
+> | `sparseBinding` | YES | |
+> | `sparseResidencyBuffer` | YES | |
+> | `residencyNonResidentStrict` | **YES** | unbound pages read as ZERO — **sparse is viable**, the dense-fallback branch is not needed on this GPU |
+> | `maxStorageBufferRange` | 4294967295 (4 GiB **minus one byte**) | see below |
+> | `maxComputeWorkGroupInvocations` | 1024 | |
+> | `maxPerStageDescriptorStorageBuffers` | 1048576 | Dawn's 16-per-stage limit is a *Dawn* limit, not hardware |
+> | `minUniformBufferOffsetAlignment` | 64 | passUBO's 256 B stride is legal |
+> | `timestampQuery` | YES, period 1.0 ns | |
+>
+> **Two findings that change later phases:**
+>
+> 1. **`maxStorageBufferRange` is 0xFFFFFFFF — one byte short of the 4 GiB the
+>    phase-7 plan asks for.** A single 4 GiB storage binding does NOT fit. The
+>    virtual voxels buffer must be capped just under 4 GiB, or split across two
+>    bindings. Worth deciding before phase 7 sizes the window, not during.
+> 2. **`VK_LAYER_KHRONOS_validation` is NOT INSTALLED** (no Vulkan SDK here by
+>    design; the registry holds only three *disabled* implicit overlay layers).
+>    So a malformed pipeline or descriptor description does not return an error
+>    — it **faults inside the NVIDIA ICD**. That is how the one real bug in this
+>    deliverable was found: `worldgen.wgsl`'s `far`/`fardown` entry points bind
+>    `@group(1)`, and giving them a one-set pipeline layout produced an access
+>    violation inside `vkCreateComputePipelines` rather than a clean failure.
+>    **This is a blocker for 3b**, which generates barriers and which the barrier
+>    document expects synchronization validation to police. Installing the
+>    validation layer is a prerequisite for trusting a green 3b.
+>
+> Also noted from the record: `maxPerStageDescriptorStorageBuffers` = 1048576
+> confirms `simSlimBGL_` exists purely for Dawn's layout limit and could collapse
+> on Vulkan — a separate, hash-gated change, explicitly out of scope for v1
+> (barrier_graph §4.10).
 
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
