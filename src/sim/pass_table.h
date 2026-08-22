@@ -1,0 +1,189 @@
+// pass_table.h — types for the declarative pass table (src/sim/pass_table.def).
+//
+// Phase 2b of docs/PLAN_vulkan_port.md. The .def is the single source; this
+// header gives it C++ types and expands it into one constexpr array, and
+// scripts/check_pass_table.py scrapes the same .def. Read the .def's header
+// comment first — it explains what a row means and why the table exists at all.
+//
+// Nothing here knows about Vulkan. Under Dawn the table drives WHAT is
+// recorded and nothing else; phase 3 adds the last-access tracker that turns
+// each row's `uses` into vkCmdPipelineBarrier2 calls (barrier_graph §3.3).
+
+#pragma once
+
+#include <cstdint>
+
+namespace pass {
+
+// ---------------------------------------------------------------- buffers --
+// Resolvable identities, NOT strings: a typo is a compile error, and the
+// recorder maps an id to a live rhi::Buffer in exactly one switch
+// (PassBuffer, pass_table.cpp).
+//
+// DirtyIn/DirtyOut are SYMBOLIC — `page_` selects which of dirty[0]/dirty[1]
+// each resolves to, and the recorder resolves at record time. Dirty0/Dirty1 are
+// the two concrete ids, used by worldgen which clears both regardless of page.
+// barrier_graph §2.2, and §4.1's [NEW EDGE]: DirtyIn and DirtyOut must never
+// resolve to the same id, or a tick's dirtyOut fill would silently clobber a
+// day/night wake. check_pass_table.py asserts it for both page values.
+enum class Buf : uint8_t {
+  Voxels,
+  DirtyIn,          // symbolic: dirty[page_]
+  DirtyOut,         // symbolic: dirty[1 - page_]
+  Dirty0,           // concrete dirty[0]
+  Dirty1,           // concrete dirty[1]
+  Materials,
+  TickUBO,
+  PassUBO,
+  OpsBuf,
+  Occupancy,
+  Hash,
+  Pick,
+  RenderUBO,
+  Reactions,
+  DirtyList,
+  ArgsStage,
+  CellOps,
+  Support,
+  GenList,
+  DispatchArgs,
+  ParticlesRead,    // symbolic: particles[page_]
+  ParticlesWrite,   // symbolic: particles[1 - page_]
+  ParticleCounts,
+  Claim,
+  PArgsStage,
+  PDispatchArgs,
+  ExpOps,
+  ExpMask,
+  SpawnOps,
+  DrawArgs,
+  FarVox,
+  FarOcc,
+  FarList,
+  FarUBO,
+  kCount,
+};
+
+// How a pass touches a buffer. The barrier mapping (phase 3) is in
+// barrier_graph §3.2; StorageAtomicRMW is READ|WRITE, not something weaker.
+enum class Acc : uint8_t {
+  StorageRead,
+  StorageWrite,      // written but never read by this entry point
+  StorageRW,
+  StorageAtomicRMW,
+  Uniform,
+  IndirectRead,
+  TransferRead,
+  TransferWrite,
+};
+
+struct Use {
+  Buf buf;
+  Acc acc;
+};
+
+enum class Kind : uint8_t { Compute, ComputeIndirect, Copy, Fill };
+
+// Which Simulation pipeline member. PIPE_NONE for Fill/Copy rows.
+enum class Pipe : uint8_t {
+  None,
+  Worldgen, WorldgenList,
+  Mutate, MutateCells,
+  Compact, CompactNext,
+  Step,
+  Occupancy, OccupancyDirty,
+  Pick,
+  ExplodeMark, ExplodeApply,
+  PArgs1, PSpawn, PIntegrate, PArgs2, PResolve,
+  FarFill, FarDown,
+};
+
+// Bind-group set. GRP_SIM also carries the dynamic passUBO offset.
+enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar };
+
+// Dynamic passUBO offset selector.
+//   None  no dynamic offset (the row's groups have none)
+//   Zero  offset 0 — every non-CA GRP_SIM row
+//   Ca    k * kPassStride for iteration k: the colour phase + gravity substep.
+//         This is what makes each CA iteration a DIFFERENT colour, which is why
+//         the iterations must not overlap (pass_table.def header, §3.6/§7.1).
+enum class Dyn : uint8_t { None, Zero, Ca };
+
+// Conditions, all known on the CPU before recording begins. A row whose
+// condition is false is SKIPPED ENTIRELY (barrier_graph §3.9/§7.5).
+enum class Cond : uint8_t {
+  Always,
+  Ops,        // opsCount > 0
+  Cells,      // cellCount > 0
+  Exp,        // expCount > 0
+  Spawn,      // spawnCount > 0
+  Particles,  // particlesActive
+  Hash,       // hashEnable  (tick % 15 == 0)
+  DirtyTick,  // !hashEnable
+  GenCount,   // EncodeGenList count > 0
+  FarCount,   // EncodeFarFill count > 0
+};
+
+// Which command buffer a row belongs to — one per Encode* entry point.
+enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill };
+
+// Dispatch extents. Values >= kDynBase are selectors resolved at record time
+// from the tick's counts; anything below is a literal extent. Indirect rows put
+// the args-buffer selector in x.
+enum class DispatchSel : uint32_t {
+  // literal extents pass through unchanged (0 .. kDynBase-1)
+  kDynBase = 0x10000000,
+  Ops,        // 4 * opsCount        (y,z are literal 4,4)
+  Cells,      // (cellCount + 63)/64
+  Exp,        // kExplosionWg * expCount   (y,z literal kExplosionWg)
+  Spawn,      // (spawnCount + 63)/64
+  ExpWg,      // kExplosionWg — the y/z extent of the two explosion rows
+  Chunks,     // kNumChunks
+  Chunks64,   // kNumChunks / 64
+  GenCount,   // EncodeGenList count
+  FarCount,   // EncodeFarFill count
+  IndDispatchArgs,   // indirect: world.dispatchArgs @ 0
+  IndPDispatchArgs,  // indirect: world.pDispatchArgs @ 0
+};
+
+// Max `uses` entries on any row. Asserted against the widest row at compile
+// time in pass_table.cpp, so growing a row past this fails the build rather
+// than silently truncating a hazard.
+inline constexpr int kMaxUses = 10;
+
+struct Row {
+  const char* name;
+  // Which ComputePassEncoder this row is recorded into. Consecutive compute
+  // rows sharing a group string go into ONE pass, exactly as today; a Fill or
+  // Copy row (group nullptr) ends the open pass, because ClearBuffer and
+  // CopyBufferToBuffer are encoder-level commands that cannot be recorded
+  // inside a compute pass.
+  //
+  // This is deliberately part of the table rather than inferred: the pass
+  // splits are the thing phase 2b must NOT change, and "prep is one pass,
+  // integrate+args2 is one pass" is a fact about the recording that a reader
+  // should be able to see without reconstructing it from adjacency. Under
+  // Vulkan a compute pass has no meaning at all (barrier_graph §1.2), so this
+  // field becomes a pure PassTimer label there.
+  const char* group;
+  Table table;
+  Pipe pipe;
+  Kind kind;
+  // Compute: workgroup extents (x may be a DispatchSel selector).
+  // Indirect: x is the args-buffer selector.
+  // Copy:     x = srcOffset, y = dstOffset, z = size.
+  // Fill:     unused (whole buffer).
+  uint32_t x, y, z;
+  Groups groups;
+  Dyn dyn;
+  Cond cond;
+  uint32_t repeat;
+  Use uses[kMaxUses];
+  int useCount;
+};
+
+// The expanded table, in record order. Rows for one Table are contiguous.
+extern const Row* const kRows;
+extern const int kRowCount;
+
+}  // namespace pass

@@ -166,6 +166,7 @@ add_executable(sandvox
   src/sim/farfield.cpp
   src/sim/chunkstore.cpp
   src/sim/simulation.cpp
+  src/sim/pass_table.cpp
   src/sim/materials.cpp
   src/sim/tuning.cpp
   src/sim/voxload.cpp

@@ -1,0 +1,306 @@
+// pass_table.def — the ONE declarative table of every GPU command the sim
+// records, and the thing Simulation::Encode* iterates to record it.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// Phase 2b of docs/PLAN_vulkan_port.md. Dawn generates every hazard barrier in
+// the tick automatically from bind-group usage. Vulkan does not: phase 3
+// hand-writes ~60 read-after-write hops on one 512 MiB buffer, and a barrier
+// that is too weak is not a crash — it is a race whose outcome depends on how a
+// particular GPU schedules workgroups, i.e. a world hash that matches on the
+// RTX 3060 Ti and diverges on the next vendor (CLAUDE.md rule 1).
+//
+// The design thesis (docs/vulkan_barrier_graph.md §1.1) is that barriers are
+// GENERATED from this table and never hand-written at a call site. That is only
+// worth anything if the table is FAITHFUL — if it says a pass reads `voxels`
+// when it does not, phase 3 emits a barrier for a hazard that is not there
+// (harmless); if it OMITS a read that happens, phase 3 emits nothing and the
+// hazard is unsynchronized (a silent cross-vendor desync).
+//
+// Two mechanisms keep it faithful, and both depend on this being ONE list:
+//
+//   1. The recorder iterates it. Simulation::EncodeTick and friends do not
+//      record commands directly any more — they walk the rows below. A row that
+//      is wrong about its pipeline or its dispatch is wrong about what actually
+//      runs, so the selftest catches it. The table cannot drift from the
+//      recording because it IS the recording.
+//   2. scripts/check_pass_table.py diffs each row's declared R/W sets against
+//      the bindings its WGSL entry point actually touches, via a call-graph walk
+//      ROOTED at that entry point (docs/vulkan_barrier_graph.md §6.1). It runs
+//      from the PostToolUse hook on every .wgsl and on this file.
+//
+// Same play as src/sim/tuning_params.def: two lists that must agree are a
+// silent bug, one list plus a generator is not. And the same standing
+// obligation — a tick-path edit that changes a kernel's bindings updates this
+// file in the same commit, or the checker fails (barrier_graph §8).
+//
+// HOW TO READ A ROW
+// -----------------
+//   PASS(name, passGroup, table, pipe, kind, dispatch..., groups, dynOff,
+//        cond, repeat, uses)
+//
+//   name      stable identity.
+//   passGroup which ComputePassEncoder the row is recorded into, and the label
+//             that pass opens with (the PassTimer label under --measure).
+//             Consecutive compute rows sharing a group string go into ONE pass,
+//             exactly as the hand-written recorder did; nullptr on Fill/Copy
+//             rows, which are encoder-level and end any open pass. The splits
+//             are the thing phase 2b must NOT change, so they are stated rather
+//             than inferred from adjacency.
+//   table     which command buffer this row belongs to (PT_TICK, PT_WORLDGEN,
+//             PT_GENLIST, PT_LOADRESET, PT_HASHONLY, PT_FARFILL). One table per
+//             Encode* entry point, per barrier_graph §2.5's "a code path that
+//             submits a command buffer gets a table".
+//   pipe      PIPE_* selector into Simulation's pipeline members; PIPE_NONE for
+//             Fill/Copy rows.
+//   kind      K_COMPUTE (direct dispatch), K_INDIRECT (DispatchWorkgroupsIndirect),
+//             K_FILL (ClearBuffer), K_COPY (CopyBufferToBuffer).
+//   groups    GRP_SIM (simBG_ + dynamic passUBO offset), GRP_SLIM_PART
+//             (simSlimBG_ + particleBG_), GRP_SLIM_FAR (simSlimBG_ + farBG_),
+//             GRP_NONE for Fill/Copy.
+//   cond      C_* predicate, evaluated on the CPU before recording. A row whose
+//             condition is false is SKIPPED ENTIRELY — it records nothing and
+//             (phase 3) touches no buffer's last-access state. barrier_graph
+//             §3.9/§7.5: this is the only correct handling, and it is why
+//             barriers must be computed at record time against live state and
+//             never precomputed per adjacent table-index pair.
+//   repeat    1 normally. 54 on the CA row — the 27 colors x 2 gravity
+//             substeps, dispatched with a per-iteration dynamic passUBO offset.
+//
+// USES: R(b) read, W(b) written-not-read, RW(b) read+written, A(b) atomic RMW
+// (READ|WRITE for barrier purposes — Vulkan has no atomic-specific access
+// flag), U(b) uniform read, I(b) indirect-args read, TR(b) transfer read,
+// TW(b) transfer write.
+//
+// `uses` is the union of the bindings the ENTRY POINT actually touches, NOT the
+// bind-group layout. simBGL_ binds 17 buffers; sim_step.wgsl declares 8 and the
+// table lists 8. Declaring the whole layout would insert barriers on occupancy,
+// pick, hash and cellOps in the CA loop that are pure cost with no hazard
+// behind them. The checker asserts layout ⊇ used, never layout == used.
+//
+// THE CA ROW IS NOT AN OPTIMIZATION TARGET. Its 54 iterations must never
+// overlap, and that is a requirement of the 3x3x3 COLOR LATTICE, not of memory
+// visibility (barrier_graph §3.6/§7.1). Within one dispatch every acting cell
+// shares one colorPhase, so acting cells are >=3 apart on every axis while
+// writes reach <=1 cell, and destination writes are provably disjoint. That
+// disjointness holds within a color phase and nowhere else. Two iterations
+// running concurrently are two DIFFERENT colors running concurrently, and cells
+// of adjacent colors are adjacent by construction: their writes collide and the
+// winner is whichever workgroup arrived first — which CLAUDE.md rule 1 bans by
+// name. Batching iterations, merging "redundant" barriers between them, or
+// splitting them across queues is the removal of rule 1, not a perf win.
+//
+// clang-format off
+
+// ============================================================ PT_TICK ======
+// Simulation::EncodeTick. Order below is the record order, verbatim.
+// barrier_graph §2.4.
+
+// ---- phase 0: pre-pass fills (simulation.cpp, top of EncodeTick) ----------
+// DirtyOut is cleared every tick: it accumulates "written this tick" marks.
+// argsStage is the compaction target; note the fill only zeroes the COUNT —
+// sim_compact atomicStores args[1] and args[2] itself, so dispatchArgs.y/.z
+// come from the SHADER. The fill->dispatch WAW is therefore load-bearing for
+// dispatch VALIDITY, not merely count accuracy: lose it and the args read
+// {count, 0, 0}, i.e. zero workgroups and a silently frozen world
+// (barrier_graph §7.3).
+PASS(fill_dirtyOut, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(DirtyOut)))
+PASS(fill_argsStage, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ArgsStage)))
+PASS(fill_claim, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_PARTICLES, 1,
+     USES(TW(Claim)))
+PASS(fill_expMask, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_EXP, 1,
+     USES(TW(ExpMask)))
+PASS(fill_hash, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_HASH, 1,
+     USES(TW(Hash)))
+
+// ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
+// D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
+// tick's counts at record time (see PassDispatchExtent in pass_table.cpp).
+PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUTE, D_OPS,4,4,   GRP_SIM,       DYN_ZERO, C_OPS, 1,
+     USES(R(Materials) U(TickUBO) R(OpsBuf) RW(Voxels) A(DirtyIn) A(DirtyOut)))
+PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_COMPUTE, D_CELLS,1,1, GRP_SIM,       DYN_ZERO, C_CELLS, 1,
+     USES(R(Materials) U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)))
+// mark reads the neighborhood, apply writes it. The two-phase split is what
+// makes the explosion kernel race-free (CLAUDE.md build gotchas); it only works
+// if the barrier between them exists, which under Dawn was free.
+PASS(explodeMark, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_MARK, K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(ExpOps) W(ExpMask) A(DirtyIn) A(DirtyOut)))
+PASS(explodeApply, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_APPLY,K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
+     USES(R(Materials) U(TickUBO) R(ExpOps) R(ExpMask) RW(Voxels) A(DirtyIn) A(DirtyOut)
+          A(ParticleCounts) W(ParticlesRead)))
+// CPU particle spawns (debris shatter) append to the READ page here, before
+// args1 sizes the integrate dispatch — same page explosion ejecta uses.
+PASS(particleSpawn, "prep(mutate+explode+compact)", PT_TICK, PIPE_P_SPAWN,     K_COMPUTE, D_SPAWN,1,1,GRP_SLIM_PART, DYN_NONE, C_SPAWN, 1,
+     USES(R(SpawnOps) U(TickUBO) A(ParticleCounts) W(ParticlesRead)))
+// compact dirtyIn -> dense chunk list + indirect args, AFTER mutate/explode so
+// freshly touched chunks simulate this tick.
+PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMPUTE, D_CHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(DirtyIn) W(DirtyList) A(ArgsStage)))
+
+// ---- phase 2: indirect staging -------------------------------------------
+// The indirect-only args buffer is never bound in any bind group: Dawn forbids
+// indirect + bound-writable usage of one buffer in the same pass, and
+// sim_step.wgsl deliberately omits binding 13 to keep argsStage outside the CA
+// pass's usage scope. v1 keeps the staging copy (barrier_graph §4.10).
+PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(ArgsStage) TW(DispatchArgs)))
+
+// ---- phase 3: the CA loop -------------------------------------------------
+// 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
+// world dispatches zero workgroups here (DESIGN.md §11). DYN_CA feeds iteration
+// k the passUBO slice at k * kPassStride — which is where colorPhase and
+// substep come from, i.e. what makes each iteration a DIFFERENT color. See the
+// lattice note in this file's header before touching repeat.
+//
+// dirtyList is declared read_write at binding 12 in sim_step.wgsl but the entry
+// point only READS it (dirtyList[wg.x] at the top of main).
+// read-only in practice: declared read_write only because WGSL cannot mix
+// access modes for one binding across the module's entry points.
+PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_ALWAYS, 54,
+     USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyList) I(DispatchArgs)
+          RW(Voxels) A(DirtyOut) A(Support)))
+
+// ---- phase 4: particles ---------------------------------------------------
+// Runs after the CA so flights see settled ground. Grid writes land in
+// dirtyOut, which the occupancy update below already covers.
+PASS(particleArgs1, "particleArgs1", PT_TICK, PIPE_P_ARGS1, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
+     USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
+PASS(copy_pArgs_pDispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_PARTICLES, 1,
+     USES(TR(PArgsStage) TW(PDispatchArgs)))
+PASS(particleIntegrate, "particleIntegrate+args2", PT_TICK, PIPE_P_INTEGRATE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
+     GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) RW(ParticlesRead) I(PDispatchArgs)
+          W(ParticlesWrite) A(ParticleCounts) A(Claim) A(DirtyOut)))
+PASS(particleArgs2, "particleIntegrate+args2", PT_TICK, PIPE_P_ARGS2, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
+     USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
+// This second copy overwrites the args the integrate dispatch above FETCHED —
+// a WAR against an in-flight indirect read, which is the case an implementer
+// skips ("nothing reads it after the write"). barrier_graph §7.2.
+PASS(copy_pArgs_pDispatch2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_PARTICLES, 1,
+     USES(TR(PArgsStage) TW(PDispatchArgs)))
+PASS(copy_pArgs_drawArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,16, GRP_NONE, DYN_NONE, C_PARTICLES, 1,
+     USES(TR(PArgsStage) TW(DrawArgs)))
+PASS(particleResolve, "particleResolve", PT_TICK, PIPE_P_RESOLVE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
+     GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
+     USES(R(Materials) U(TickUBO) A(Claim) A(ParticleCounts) I(PDispatchArgs)
+          RW(Voxels) RW(ParticlesWrite) A(DirtyOut)))
+
+// ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
+PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash)))
+PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick)))
+
+// ---- phase 5b: dirty tick -------------------------------------------------
+// Occupancy update over only the chunks written this tick: compact the dirtyOut
+// flags (a superset of every voxel write) and dispatch indirect.
+PASS(fill_argsStage2, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_DIRTYTICK, 1,
+     USES(TW(ArgsStage)))
+PASS(compactNext, "compactNext", PT_TICK, PIPE_COMPACT_NEXT, K_COMPUTE, D_CHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
+     USES(R(DirtyOut) W(DirtyList) A(ArgsStage)))
+PASS(copy_argsStage_dispatchArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_DIRTYTICK, 1,
+     USES(TR(ArgsStage) TW(DispatchArgs)))
+// dirtyList declared read_write at binding 12 in sim_occupancy.wgsl, read only
+// by mainDirty.
+// read-only in practice: shared module-scope declaration with the compaction
+// entry points, which do write it.
+PASS(occupancyDirty, "occupancyDirty+pick", PT_TICK, PIPE_OCCUPANCY_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) R(DirtyList) I(DispatchArgs) W(Occupancy)))
+PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick)))
+// Far-field phase 2: downsample the same compacted dirtyOut list into the
+// cascades, so edits stay visible after the player walks away (render-only
+// derived data — DESIGN.md §9). Rides the SAME indirect args as the occupancy
+// update, so a settled world dispatches nothing. Separate pass: it uses farPL_
+// (slim group 0 + far group 1), not simPL_.
+// NOTE: hash ticks skip this — they take the whole-world occupancy branch and
+// never compact dirtyOut, so there is no work list. A chunk edited on a hash
+// tick is still dirty the next tick and downsamples then.
+PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          A(FarVox) A(FarOcc)))
+
+// ========================================================= PT_WORLDGEN =====
+// Simulation::EncodeWorldgen. barrier_graph §2.5.1. The fills of dirty[0]/[1]
+// DO hazard against the dispatch — genChunk atomicStores both — so "no hazards
+// among them" applies only to the fills against each other.
+PASS(wg_fill_dirty0, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Dirty0)))
+PASS(wg_fill_dirty1, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Dirty1)))
+PASS(wg_fill_hash, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Hash)))
+PASS(wg_fill_support, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Support)))
+PASS(wg_fill_pCounts, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ParticleCounts)))
+PASS(wg_fill_claim, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Claim)))
+// no ghost particles: drawArgs retains the last active tick's instance count
+PASS(wg_fill_drawArgs, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(DrawArgs)))
+// one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
+PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)))
+
+// ========================================================== PT_GENLIST =====
+// Simulation::EncodeGenList — its own encoder, submitted MID-FRAME between
+// ticks from Stream::FillSlots. Binds simBG_ (all 17 bindings) but
+// worldgen:list/genChunk touch six of them; the `uses` set is the six.
+// genChunk atomicStores both dirtyIn and dirtyOut while the concurrently
+// in-flight tick's markDirty/markBoth atomically write the same two buffers —
+// a cross-submit WAW against a shader atomic, covered by barrier_graph §3.4's
+// head-of-command-buffer global barrier, not by anything in this row.
+PASS(worldgenList, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
+     GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
+     USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)))
+
+// ======================================================== PT_LOADRESET =====
+// Simulation::EncodeLoadReset. barrier_graph §2.5.3: clears transient state
+// (hash/particles/claims) and rebuilds occupancy over freshly uploaded voxels.
+// The caller has already written the voxel + dirty buffers (worldio.cpp) — one
+// of the two sanctioned MutationQueue bypasses (CLAUDE.md rule 3).
+PASS(lr_fill_hash, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Hash)))
+PASS(lr_fill_support, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Support)))
+PASS(lr_fill_pCounts, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ParticleCounts)))
+PASS(lr_fill_claim, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Claim)))
+PASS(lr_fill_drawArgs, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(DrawArgs)))
+PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
+     GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash)))
+
+// ========================================================= PT_HASHONLY =====
+// Simulation::EncodeHashOnly — standalone whole-world hash pass (save/load
+// verification). barrier_graph §2.5.4.
+PASS(ho_fill_hash, nullptr, PT_HASHONLY, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Hash)))
+PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
+     GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash)))
+
+// ========================================================== PT_FARFILL =====
+// Simulation::EncodeFarFill. Encoded into the tick's command buffer AFTER
+// EncodeTick today, and also driven standalone in a loop by --shot's far-field
+// drain (barrier_graph §2.5.6). farCount travels INSIDE tickUBO, not as a
+// dispatch dimension, so in the standalone loop the upload->dispatch RAW on
+// tickUBO is load-bearing PER ITERATION.
+//
+// farVox/farOcc carry a WAW against farDown, which wrote them earlier in the
+// same command buffer with a DIFFERENT atomic idiom (atomicAnd/atomicOr vs this
+// row's full-word atomicStore). "They're both atomic" is not a reason to relax
+// the barrier: atomics guarantee per-operation atomicity, not visibility of one
+// dispatch's results to the next. barrier_graph §3.8/§7.8.
+PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarVox) A(FarOcc)))
+
+// clang-format on

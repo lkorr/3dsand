@@ -6,6 +6,7 @@
 #include "sim/materials.h"
 #include "sim/microbody.h"
 #include "sim/microvox.h"
+#include "sim/pass_table.h"
 #include "sim/world.h"
 
 // Owns the compute pipelines + bind groups and records the fixed-tick GPU
@@ -159,6 +160,23 @@ class Simulation {
   // game). One helper so the encode sites keep their single structure.
   rhi::ComputePass BeginPass(const rhi::CommandEncoder& enc,
                                      const char* name) const;
+
+  // ---- table-driven recording (docs/PLAN_vulkan_port.md phase 2b) ----------
+  // Every Encode* above records by walking src/sim/pass_table.def rather than
+  // issuing commands inline, because phase 3 generates Vulkan barriers from the
+  // same table and a declaration that is not also the recording will drift from
+  // it. See pass_table.def's header for what a row means and why.
+  //
+  // `ctx` is an opaque pointer to the anonymous-namespace RecordCtx in
+  // simulation.cpp — the per-call counts and flags the row conditions and
+  // dispatch selectors resolve against. It is deliberately not a public type:
+  // nothing outside the recorder has any business constructing one.
+  void RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
+                   const void* ctx);
+  // Resolve a table buffer id to the live buffer. DirtyIn/DirtyOut and the two
+  // particle pages are symbolic and resolve through page_.
+  const rhi::Buffer& PassBuffer(pass::Buf b) const;
+  const rhi::ComputePipeline& PassPipeline(pass::Pipe p) const;
 
   PassTimer* passTimer_ = nullptr;  // not owned; measurement harness only
 

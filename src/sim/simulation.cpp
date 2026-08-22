@@ -492,67 +492,277 @@ rhi::ComputePass Simulation::BeginPass(const rhi::CommandEncoder& enc,
   return enc.BeginComputePass();
 }
 
+// ===========================================================================
+// TABLE-DRIVEN RECORDING (docs/PLAN_vulkan_port.md phase 2b)
+//
+// Every Encode* below records by WALKING src/sim/pass_table.def, not by issuing
+// commands inline. Read that file's header first; the short version is that
+// phase 3 generates Vulkan barriers from the same table, so the table's
+// fidelity is what the port's determinism rests on — and the only way to keep a
+// declaration faithful to a recording is to make the declaration BE the
+// recording.
+//
+// Under Dawn this changes nothing about the command buffer: same encoders, same
+// pass splits, same ClearBuffers, same copies, same conditionals, same dynamic
+// offsets, same bind groups, same order. That is the acceptance criterion for
+// this phase (world hash byte-identical), not an aspiration.
+// ===========================================================================
+
+namespace {
+
+// Everything the recorder needs to resolve a row's selectors, gathered once per
+// Encode* call. Conditions are all known on the CPU before recording begins
+// (barrier_graph §2.3), which is what makes a skipped row a non-event.
+struct RecordCtx {
+  uint32_t opsCount = 0;
+  uint32_t cellCount = 0;
+  uint32_t expCount = 0;
+  uint32_t spawnCount = 0;
+  uint32_t genCount = 0;
+  uint32_t farCount = 0;
+  bool hashEnable = false;
+  bool particlesActive = false;
+};
+
+bool CondHolds(pass::Cond c, const RecordCtx& cx) {
+  switch (c) {
+    case pass::Cond::Always:    return true;
+    case pass::Cond::Ops:       return cx.opsCount > 0;
+    case pass::Cond::Cells:     return cx.cellCount > 0;
+    case pass::Cond::Exp:       return cx.expCount > 0;
+    case pass::Cond::Spawn:     return cx.spawnCount > 0;
+    case pass::Cond::Particles: return cx.particlesActive;
+    case pass::Cond::Hash:      return cx.hashEnable;
+    case pass::Cond::DirtyTick: return !cx.hashEnable;
+    case pass::Cond::GenCount:  return cx.genCount > 0;
+    case pass::Cond::FarCount:  return cx.farCount > 0;
+  }
+  return false;
+}
+
+// Dispatch extents. Values below kDynBase are literal; the rest are selectors
+// resolved from this tick's counts.
+uint32_t Extent(uint32_t v, const RecordCtx& cx) {
+  if (v < (uint32_t)pass::DispatchSel::kDynBase) return v;
+  switch ((pass::DispatchSel)v) {
+    case pass::DispatchSel::Ops:      return 4 * cx.opsCount;
+    case pass::DispatchSel::Cells:    return (cx.cellCount + 63) / 64;
+    case pass::DispatchSel::Exp:      return kExplosionWg * cx.expCount;
+    case pass::DispatchSel::ExpWg:    return kExplosionWg;
+    case pass::DispatchSel::Spawn:    return (cx.spawnCount + 63) / 64;
+    case pass::DispatchSel::Chunks:   return kNumChunks;
+    case pass::DispatchSel::Chunks64: return kNumChunks / 64;
+    case pass::DispatchSel::GenCount: return cx.genCount;
+    case pass::DispatchSel::FarCount: return cx.farCount;
+    default:                          return v;
+  }
+}
+
+}  // namespace
+
+// Map a table buffer id to the live rhi::Buffer. DirtyIn/DirtyOut and the two
+// particle pages are SYMBOLIC (barrier_graph §2.2): `page_` decides which
+// concrete buffer each names, resolved here at record time. DirtyIn and
+// DirtyOut can never resolve to the same buffer for any page value — if they
+// could, a tick's dirtyOut fill would silently clobber a day/night wake-all
+// (§4.1's [NEW EDGE]). check_pass_table.py asserts that separately.
+const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
+  using B = pass::Buf;
+  switch (b) {
+    case B::Voxels:         return world_->voxels;
+    case B::DirtyIn:        return world_->dirty[page_];
+    case B::DirtyOut:       return world_->dirty[1 - page_];
+    case B::Dirty0:         return world_->dirty[0];
+    case B::Dirty1:         return world_->dirty[1];
+    case B::Materials:      return materialBuf_;
+    case B::TickUBO:        return world_->tickUBO;
+    case B::PassUBO:        return world_->passUBO;
+    case B::OpsBuf:         return world_->opsBuf;
+    case B::Occupancy:      return world_->occupancy;
+    case B::Hash:           return world_->hash;
+    case B::Pick:           return world_->pick;
+    case B::RenderUBO:      return world_->renderUBO;
+    case B::Reactions:      return reactionBuf_;
+    case B::DirtyList:      return world_->dirtyList;
+    case B::ArgsStage:      return world_->argsStage;
+    case B::CellOps:        return world_->cellOps;
+    case B::Support:        return world_->support;
+    case B::GenList:        return world_->genList;
+    case B::DispatchArgs:   return world_->dispatchArgs;
+    case B::ParticlesRead:  return world_->particles[page_];
+    case B::ParticlesWrite: return world_->particles[1 - page_];
+    case B::ParticleCounts: return world_->particleCounts;
+    case B::Claim:          return world_->claim;
+    case B::PArgsStage:     return world_->pArgsStage;
+    case B::PDispatchArgs:  return world_->pDispatchArgs;
+    case B::ExpOps:         return world_->expOps;
+    case B::ExpMask:        return world_->expMask;
+    case B::SpawnOps:       return world_->spawnOps;
+    case B::DrawArgs:       return world_->drawArgs;
+    case B::FarVox:         return world_->farVox;
+    case B::FarOcc:         return world_->farOcc;
+    case B::FarList:        return world_->farList;
+    case B::FarUBO:         return world_->farUBO;
+    default:                return world_->voxels;
+  }
+}
+
+const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
+  using P = pass::Pipe;
+  switch (p) {
+    case P::Worldgen:       return worldgen_;
+    case P::WorldgenList:   return worldgenList_;
+    case P::Mutate:         return mutate_;
+    case P::MutateCells:    return mutateCells_;
+    case P::Compact:        return compact_;
+    case P::CompactNext:    return compactNext_;
+    case P::Step:           return step_;
+    case P::Occupancy:      return occupancy_;
+    case P::OccupancyDirty: return occupancyDirty_;
+    case P::Pick:           return pick_;
+    case P::ExplodeMark:    return explodeMark_;
+    case P::ExplodeApply:   return explodeApply_;
+    case P::PArgs1:         return pArgs1_;
+    case P::PSpawn:         return pSpawn_;
+    case P::PIntegrate:     return pIntegrate_;
+    case P::PArgs2:         return pArgs2_;
+    case P::PResolve:       return pResolve_;
+    case P::FarFill:        return farFill_;
+    case P::FarDown:        return farDown_;
+    default:                return step_;
+  }
+}
+
+// Walk one table's rows and record them.
+//
+// The open compute pass is carried across rows: consecutive compute rows that
+// declare the same `group` string share one ComputePassEncoder, and a Fill or
+// Copy row (group == nullptr) closes it, because ClearBuffer and
+// CopyBufferToBuffer are encoder-level commands. That reproduces today's pass
+// structure exactly rather than approximating it.
+//
+// A row whose condition is false is skipped entirely — no pass is opened for
+// it, nothing is recorded, and in phase 3 no buffer's last-access state is
+// touched. barrier_graph §3.9/§7.5: that is the only correct handling, and it
+// is why barriers must be computed at record time against live state rather
+// than precomputed per adjacent table-index pair.
+void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
+                             const void* ctxOpaque) {
+  const RecordCtx& cx = *(const RecordCtx*)ctxOpaque;
+
+  rhi::ComputePass open;
+  const char* openGroup = nullptr;
+  auto closePass = [&]() {
+    if (openGroup) {
+      open.End();
+      open = rhi::ComputePass{};
+      openGroup = nullptr;
+    }
+  };
+
+  for (int i = 0; i < pass::kRowCount; i++) {
+    const pass::Row& r = pass::kRows[i];
+    if (r.table != which) continue;
+    if (!CondHolds(r.cond, cx)) continue;
+
+    if (r.kind == pass::Kind::Fill) {
+      closePass();
+      enc.ClearBuffer(PassBuffer(r.uses[0].buf), 0, rhi::kWholeSize);
+      continue;
+    }
+    if (r.kind == pass::Kind::Copy) {
+      closePass();
+      // Copy rows carry (srcOffset, dstOffset, size) in x/y/z, and exactly two
+      // uses: the transfer read then the transfer write.
+      enc.CopyBufferToBuffer(PassBuffer(r.uses[0].buf), r.x,
+                             PassBuffer(r.uses[1].buf), r.y, r.z);
+      continue;
+    }
+
+    // Compute / ComputeIndirect.
+    if (!openGroup || r.group != openGroup) {
+      closePass();
+      open = BeginPass(enc, r.group);
+      openGroup = r.group;
+    }
+
+    // Bind groups are set per ROW rather than once per pass. The hand-written
+    // recorder set them before each dispatch block inside the shared prep pass
+    // (mutate, mutateCells, explode, spawn and compact each re-bound), and
+    // SetBindGroup to the same group is idempotent, so per-row is both faithful
+    // and free of a "did the previous row leave the right groups bound?"
+    // question that a future row insertion would silently get wrong.
+    {
+      uint32_t off = 0;
+      switch (r.groups) {
+        case pass::Groups::Sim:
+          open.SetBindGroup(0, simBG_[page_], 1, &off);
+          break;
+        case pass::Groups::SlimPart:
+          open.SetBindGroup(0, simSlimBG_[page_]);
+          open.SetBindGroup(1, particleBG_[page_]);
+          break;
+        case pass::Groups::SlimFar:
+          open.SetBindGroup(0, simSlimBG_[page_]);
+          open.SetBindGroup(1, farBG_);
+          break;
+        default:
+          break;
+      }
+    }
+
+    open.SetPipeline(PassPipeline(r.pipe));
+
+    for (uint32_t k = 0; k < r.repeat; k++) {
+      if (r.dyn == pass::Dyn::Ca) {
+        // The per-iteration passUBO slice: colour phase + gravity substep. Two
+        // iterations are two DIFFERENT colours, which is exactly why they must
+        // never overlap — see the lattice note in pass_table.def's header.
+        uint32_t offset = k * kPassStride;
+        open.SetBindGroup(0, simBG_[page_], 1, &offset);
+      }
+      if (r.kind == pass::Kind::ComputeIndirect) {
+        const rhi::Buffer& args =
+            (pass::DispatchSel)r.x == pass::DispatchSel::IndPDispatchArgs
+                ? world_->pDispatchArgs
+                : world_->dispatchArgs;
+        open.DispatchWorkgroupsIndirect(args, 0);
+      } else {
+        open.DispatchWorkgroups(Extent(r.x, cx), Extent(r.y, cx),
+                                Extent(r.z, cx));
+      }
+    }
+  }
+  closePass();
+}
+
 void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc) {
   page_ = 0;
-  enc.ClearBuffer(world_->dirty[0], 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->dirty[1], 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->support, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->particleCounts, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->claim, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->drawArgs, 0, rhi::kWholeSize);  // no ghost particles
-  rhi::ComputePass pass = BeginPass(enc, "worldgen");
-  uint32_t off = 0;
-  pass.SetBindGroup(0, simBG_[page_], 1, &off);
-  // one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
-  pass.SetPipeline(worldgen_);
-  pass.DispatchWorkgroups(kNumChunks, 1, 1);
-  pass.End();
+  RecordCtx cx{};
+  RecordTable(enc, pass::Table::Worldgen, &cx);
 }
 
 void Simulation::EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count) {
-  if (count == 0) return;
-  rhi::ComputePass pass = BeginPass(enc, "worldgenList");
-  uint32_t off = 0;
-  pass.SetBindGroup(0, simBG_[page_], 1, &off);
-  pass.SetPipeline(worldgenList_);
-  pass.DispatchWorkgroups(count, 1, 1);
-  pass.End();
+  RecordCtx cx{};
+  cx.genCount = count;
+  RecordTable(enc, pass::Table::GenList, &cx);
 }
 
 void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
-  if (count == 0) return;
-  rhi::ComputePass pass = BeginPass(enc, "farFill");
-  pass.SetBindGroup(0, simSlimBG_[page_]);
-  pass.SetBindGroup(1, farBG_);
-  pass.SetPipeline(farFill_);
-  pass.DispatchWorkgroups(count, 1, 1);
-  pass.End();
+  RecordCtx cx{};
+  cx.farCount = count;
+  RecordTable(enc, pass::Table::FarFill, &cx);
 }
 
 void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
   page_ = 0;
-  enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->support, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->particleCounts, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->claim, 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->drawArgs, 0, rhi::kWholeSize);
-  rhi::ComputePass pass = BeginPass(enc, "occupancyFull(loadReset)");
-  uint32_t off = 0;
-  pass.SetBindGroup(0, simBG_[page_], 1, &off);
-  pass.SetPipeline(occupancy_);
-  pass.DispatchWorkgroups(kNumChunks, 1, 1);
-  pass.End();
+  RecordCtx cx{};
+  RecordTable(enc, pass::Table::LoadReset, &cx);
 }
 
 void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
-  enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
-  rhi::ComputePass pass = BeginPass(enc, "occupancyFull(hashOnly)");
-  uint32_t off = 0;
-  pass.SetBindGroup(0, simBG_[page_], 1, &off);
-  pass.SetPipeline(occupancy_);
-  pass.DispatchWorkgroups(kNumChunks, 1, 1);
-  pass.End();
+  RecordCtx cx{};
+  RecordTable(enc, pass::Table::HashOnly, &cx);
 }
 
 void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
@@ -567,158 +777,19 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
 void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
                             uint32_t cellCount, uint32_t spawnCount) {
-  enc.ClearBuffer(world_->dirty[1 - page_], 0, rhi::kWholeSize);
-  enc.ClearBuffer(world_->argsStage, 0, rhi::kWholeSize);
-  if (particlesActive) enc.ClearBuffer(world_->claim, 0, rhi::kWholeSize);
-  if (expCount > 0) enc.ClearBuffer(world_->expMask, 0, rhi::kWholeSize);
-  if (hashEnable) enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
-
-  uint32_t off = 0;
-
-  // Prep pass: mutate + explode + compact (compact writes argsStage + dirtyList).
-  {
-    rhi::ComputePass prep = BeginPass(enc, "prep(mutate+explode+compact)");
-    if (opsCount > 0) {
-      prep.SetBindGroup(0, simBG_[page_], 1, &off);
-      prep.SetPipeline(mutate_);
-      prep.DispatchWorkgroups(4 * opsCount, 4, 4);
-    }
-    if (cellCount > 0) {
-      prep.SetBindGroup(0, simBG_[page_], 1, &off);
-      prep.SetPipeline(mutateCells_);
-      prep.DispatchWorkgroups((cellCount + 63) / 64, 1, 1);
-    }
-    if (expCount > 0) {
-      prep.SetBindGroup(0, simSlimBG_[page_]);
-      prep.SetBindGroup(1, particleBG_[page_]);
-      prep.SetPipeline(explodeMark_);
-      prep.DispatchWorkgroups(kExplosionWg * expCount, kExplosionWg, kExplosionWg);
-      prep.SetPipeline(explodeApply_);
-      prep.DispatchWorkgroups(kExplosionWg * expCount, kExplosionWg, kExplosionWg);
-    }
-    if (spawnCount > 0) {
-      // CPU particle spawns (debris shatter) append to the read page here,
-      // before args1 sizes the integrate dispatch — same page ejecta uses
-      prep.SetBindGroup(0, simSlimBG_[page_]);
-      prep.SetBindGroup(1, particleBG_[page_]);
-      prep.SetPipeline(pSpawn_);
-      prep.DispatchWorkgroups((spawnCount + 63) / 64, 1, 1);
-    }
-    // compact dirtyIn -> dense chunk list + indirect args (after mutate/explode
-    // so freshly touched chunks simulate this tick)
-    prep.SetBindGroup(0, simBG_[page_], 1, &off);
-    prep.SetPipeline(compact_);
-    prep.DispatchWorkgroups(kNumChunks / 64, 1, 1);
-    prep.End();
-  }
-
-  // Feed the indirect-only args buffer (never bound in any bind group; Dawn
-  // forbids indirect + bound-writable usage of one buffer in the same pass).
-  enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
-
-  {
-    rhi::ComputePass pass = BeginPass(enc, "ca(54 color x substep)");
-    pass.SetBindGroup(0, simBG_[page_], 1, &off);
-
-    // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
-    // world dispatches zero workgroups here (DESIGN.md §11).
-    pass.SetPipeline(step_);
-    for (uint32_t k = 0; k < 54; k++) {
-      uint32_t offset = k * kPassStride;
-      pass.SetBindGroup(0, simBG_[page_], 1, &offset);
-      pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
-    }
-    pass.End();
-  }
-
-  // ---- particles: integrate (read page) -> resolve claims (write page) ----
-  // Runs after the CA so flights see settled ground. Grid writes land in
-  // dirtyOut, which the occupancy update below already covers.
-  if (particlesActive) {
-    {
-      rhi::ComputePass pass = BeginPass(enc, "particleArgs1");
-      pass.SetBindGroup(0, simSlimBG_[page_]);
-      pass.SetBindGroup(1, particleBG_[page_]);
-      pass.SetPipeline(pArgs1_);
-      pass.DispatchWorkgroups(1, 1, 1);
-      pass.End();
-    }
-    enc.CopyBufferToBuffer(world_->pArgsStage, 16, world_->pDispatchArgs, 0, 12);
-    {
-      rhi::ComputePass pass = BeginPass(enc, "particleIntegrate+args2");
-      pass.SetBindGroup(0, simSlimBG_[page_]);
-      pass.SetBindGroup(1, particleBG_[page_]);
-      pass.SetPipeline(pIntegrate_);
-      pass.DispatchWorkgroupsIndirect(world_->pDispatchArgs, 0);
-      pass.SetPipeline(pArgs2_);
-      pass.DispatchWorkgroups(1, 1, 1);
-      pass.End();
-    }
-    enc.CopyBufferToBuffer(world_->pArgsStage, 16, world_->pDispatchArgs, 0, 12);
-    enc.CopyBufferToBuffer(world_->pArgsStage, 0, world_->drawArgs, 0, 16);
-    {
-      rhi::ComputePass pass = BeginPass(enc, "particleResolve");
-      pass.SetBindGroup(0, simSlimBG_[page_]);
-      pass.SetBindGroup(1, particleBG_[page_]);
-      pass.SetPipeline(pResolve_);
-      pass.DispatchWorkgroupsIndirect(world_->pDispatchArgs, 0);
-      pass.End();
-    }
-  }
-
-  if (hashEnable) {
-    // hash ticks need the whole-world scan anyway; it also refreshes occupancy
-    rhi::ComputePass pass = BeginPass(enc, "occupancyFull+pick(hashTick)");
-    pass.SetBindGroup(0, simBG_[page_], 1, &off);
-    pass.SetPipeline(occupancy_);
-    pass.DispatchWorkgroups(kNumChunks, 1, 1);
-    pass.SetPipeline(pick_);
-    pass.DispatchWorkgroups(1, 1, 1);
-    pass.End();
-  } else {
-    // occupancy update over only the chunks written this tick: compact the
-    // dirtyOut flags (superset of every voxel write) and dispatch indirect
-    enc.ClearBuffer(world_->argsStage, 0, rhi::kWholeSize);
-    {
-      rhi::ComputePass pass = BeginPass(enc, "compactNext");
-      pass.SetBindGroup(0, simBG_[page_], 1, &off);
-      pass.SetPipeline(compactNext_);
-      pass.DispatchWorkgroups(kNumChunks / 64, 1, 1);
-      pass.End();
-    }
-    enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
-    {
-      rhi::ComputePass pass = BeginPass(enc, "occupancyDirty+pick");
-      pass.SetBindGroup(0, simBG_[page_], 1, &off);
-      pass.SetPipeline(occupancyDirty_);
-      pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
-      pass.SetPipeline(pick_);
-      pass.DispatchWorkgroups(1, 1, 1);
-      pass.End();
-    }
-    // Far-field phase 2: downsample the same compacted dirtyOut list into the
-    // cascades, so edits stay visible after the player walks away (render-only
-    // derived data — DESIGN.md §9). Rides the SAME indirect args as the
-    // occupancy update, so a settled world dispatches nothing. Separate pass:
-    // it uses farPL_ (slim group 0 + far group 1), not simPL_.
-    // NOTE: hash ticks (every 15th) skip this — they take the whole-world
-    // occupancy branch above and never compact dirtyOut, so there is no work
-    // list. A chunk edited on a hash tick is still dirty the next tick and
-    // downsamples then; only single-tick-then-settle edits landing exactly on
-    // a hash tick propagate one tick late, which is invisible in practice.
-    {
-      rhi::ComputePass pass = BeginPass(enc, "farDown");
-      pass.SetBindGroup(0, simSlimBG_[page_]);
-      pass.SetBindGroup(1, farBG_);
-      pass.SetPipeline(farDown_);
-      pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
-      pass.End();
-    }
-  }
+  RecordCtx cx{};
+  cx.opsCount = opsCount;
+  cx.cellCount = cellCount;
+  cx.expCount = expCount;
+  cx.spawnCount = spawnCount;
+  cx.hashEnable = hashEnable;
+  cx.particlesActive = particlesActive;
+  RecordTable(enc, pass::Table::Tick, &cx);
 
   // Measurement only: no-op unless --measure attached a PassTimer.
   EncodeTimerResolve(enc);
 }
+
 
 void Simulation::EnsureDepth(uint32_t width, uint32_t height) {
   if (depthView_ && depthW_ == width && depthH_ == height) return;
