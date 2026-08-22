@@ -71,12 +71,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, idx);
   // liquids are born full (their state nibble is fullness); everything else
-  // gets a palette variant. stamp 0xFF = "hasn't acted": falls this tick.
+  // gets a palette variant. STAMP_NEVER = "hasn't acted": falls this tick.
   var state = rnd % 3u;
   if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
     state = LIQ_FULL_STATE;
   }
-  voxels[idx] = packVox(mat, state, 0xFFu);
+  voxels[idx] = packVox(mat, state, STAMP_NEVER);
   markBoth(c);
 }
 

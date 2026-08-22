@@ -36,12 +36,19 @@
 // One limb model, 16 bytes — must match struct MicroBodyModel in common.wgsl.
 struct MicroBodyModelGpu {
   // Word index into the pool where this model's payload starts. The payload is
-  // dims.x*dims.y*dims.z micro voxels, 4 packed 8-bit palette indices per word,
+  // dims.x*dims.y*dims.z micro voxels, 2 packed 16-bit voxels per word,
   // x-major then y then z (idx = (z*dy + y)*dx + x), padded to a whole word.
   //
-  // Palette index == material ID (the project-wide .vox convention), so a micro
-  // voxel shades through the ordinary material table. 8 bits caps a micro body
-  // at material ids 1..255, checked at load.
+  // Each 16-bit voxel is:
+  //   bits 0..7   material ID — what the voxel IS. Palette index == material ID
+  //               (the project-wide .vox convention), so it shades through the
+  //               ordinary material table. 8 bits caps a micro body at material
+  //               ids 1..255, checked at load.
+  //   bits 8..15  ART COLOUR slot — what the voxel LOOKS like, 0 meaning "use
+  //               the material's own colour". A creature is one material all
+  //               over and painted per voxel, so colour cannot share the
+  //               material's channel. Resolved against the art palette
+  //               (kArtPaletteBase in voxload.h); render-only, never hashed.
   uint32_t base;
   // bits 0..9 dims.x, bits 10..19 dims.y, bits 20..29 dims.z (micro voxels).
   // 10 bits each is 1023 per axis, far past the +-127 DebrisVoxel bound that
@@ -102,7 +109,27 @@ struct MicroBodySet {
   // Set by any mutation; the caller re-uploads and clears. Batching one upload
   // per tick rather than one per edit is rule 2 applied to PCIe traffic.
   bool dirty = false;
+
+  // ---- art palette ----
+  // Skin colours from every loaded prefab, merged, indexed from
+  // kArtPaletteBase (sim/voxload.h). It rides here rather than on any one
+  // Prefab because a frame draws limbs from several defs at once and they all
+  // resolve against ONE reserved run of the material table — so the merge has
+  // to happen where the models are pooled, which is here. Render-only, exactly
+  // like the pool itself.
+  //
+  // Packed 0x00RRGGBB. Entry i is art slot kArtPaletteBase + i.
+  std::vector<uint32_t> artColors;
 };
+
+// Merge one prefab's art palette into `set`, remapping its slots if needed.
+// Returns a 256-entry table mapping the prefab's .vox palette slot -> the
+// merged slot, so the caller can rewrite its voxels' `color` before packing.
+// Colours beyond kArtPaletteSlots are dropped to 0 (unpainted) and reported.
+std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
+                                       const std::vector<uint32_t>& artColors,
+                                       const std::string& label,
+                                       std::string& log);
 
 // Packs one limb's voxel model into `set` and returns its model index, or -1 on
 // failure (pool full, out-of-range material, empty model). `voxels` are in

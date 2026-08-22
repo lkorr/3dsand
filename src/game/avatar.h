@@ -55,6 +55,18 @@ struct AvatarParts {
   int staff = -1;
 };
 
+// Locomotion clip indices, resolved once per def load. These four are looked up
+// on the per-tick path (PreTick picks which to play and which to retire, and
+// PreTick runs four times a frame), and AnimSkeleton::FindClip is a linear scan
+// comparing std::string — so resolving them by name every tick meant a few
+// hundred string compares a frame to answer a question whose answer only
+// changes when the skeleton is replaced. Re-resolved in ResolveParts alongside
+// AvatarParts, for the same reason: a hot reload swaps the skeleton, and a
+// stale index would point at whatever clip now sits in that slot.
+struct AvatarLocoClips {
+  int idle = -1, walk = -1, run = -1, fall = -1;
+};
+
 // What the avatar wants the rest of the game to do about its current state.
 // Movement and camera read this instead of querying part liveness themselves,
 // so "what does losing a leg do" is answered in exactly one place.
@@ -410,6 +422,11 @@ class PlayerAvatar {
   };
   SavedState restore_;
   void PlayClip(const std::string& name);
+  // Same, for a clip index the caller has ALREADY resolved. The locomotion
+  // path runs every tick and had just computed these indices to decide which
+  // clips to retire, then threw them away and re-scanned the clip list by
+  // string — see the call site in PreTick.
+  void PlayClipIndex(int ci);
   // `grounded` comes from the player's own collision sweep. The gait is a
   // WALKING system — it only means anything when there is a floor under the
   // feet — so it is a parameter here rather than something UpdateAnimation
@@ -445,6 +462,7 @@ class PlayerAvatar {
 
   std::vector<Part> parts;
   AvatarParts parts_;
+  AvatarLocoClips locoClips_;
   AnimState anim_;
   bool spawned_ = false;
   bool alive_ = true;

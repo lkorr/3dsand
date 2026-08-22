@@ -1946,6 +1946,542 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   return mix(reflectionSky(rr), applyAerial(c, rr, h.t), horizon);
 }
 
+// ============================================================================
+// SUBMERGED VIEW — being UNDER the water (DESIGN.md §9)
+// ============================================================================
+// Everything above this point shades water seen from OUTSIDE. Being inside it
+// is a different problem and it was previously handled by two lines in
+// shadeWater (flip the normal, swap the reflection for a scatter constant),
+// which is why going under produced a flat blue wash with no light in it.
+//
+// Four terms carry the whole look, in rising order of cost:
+//
+//   1. absorption + in-scatter over the WHOLE view. Not a bounded depth: under
+//      water every ray is inside the medium for its entire length, so this is
+//      the underwater equivalent of aerial perspective and it replaces it.
+//   2. CAUSTICS on every sunlit surface below the waterline. This is the term
+//      the request is really about — the rippling web of light on the rocks.
+//      It is deliberately NOT the caustic term inside shadeWater: that one is
+//      a multiplier on `sceneBehind` at the moment a ray from dry land crosses
+//      a surface. There is no such crossing when you are already under, so
+//      from below the old code applied no caustics to anything at all.
+//   3. GOD RAYS — a ray-marched, occlusion-tested volumetric integral. The
+//      shafts have to break around the shore and any overhang, which is what
+//      a real shadow test buys and what an analytic approximation cannot.
+//   4. SILT — drifting motes. Cheap, and it is most of what makes the shafts
+//      legible: a light shaft is only visible because something is IN it.
+//
+// All render-only float math on render-only data. The sim never sees any of
+// it, so determinism rule #1 is untouched (it scopes to sim state).
+
+// ---- how much water is above this point? ----
+// Walks UP from a surface point counting liquid cells until it reaches air.
+// Returns metres of water overhead, or -1 if the point is not under any.
+//
+// The step count is the cost, and it is bounded rather than complete on
+// purpose: this runs per lit surface pixel, and a point under more water than
+// the cap is one whose caustics have washed out entirely anyway (they fade to
+// nothing by bedCausticFade, which is well inside the cap at any sane setting).
+// Reporting the cap as "deep" is therefore the correct answer, not a
+// truncation artifact.
+const SUB_DEPTH_STEPS : i32 = 40;
+
+// Takes the CONTINUOUS hit point, not the cell. That matters: quantising the
+// depth to the cell makes every pixel on one voxel face share a single depth
+// value, so the caustic strength (which ramps and then fades with depth) jumps
+// in hard steps at every cell boundary. On the vertical rim wall of a pool
+// that renders as exactly what it is — a barcode of flat stripes, one per
+// voxel row — and it was the most obvious artifact in the first cut. Carrying
+// the fractional part of the start height removes the stair entirely for the
+// cost of one subtraction.
+fn waterAbove(p : vec3f) -> f32 {
+  let cell = vec3<i32>(floor(p));
+  var n = 0.0;
+  for (var i = 0; i <= SUB_DEPTH_STEPS; i++) {
+    let c = cell + vec3<i32>(0, i, 0);
+    // Out of the window reads as "no more water". Unloaded space is solid and
+    // inert (CLAUDE.md), so treating it as more water would paint caustics
+    // under every overhang at the window edge.
+    if (!inBounds(c)) { break; }
+    let w = voxels[cellIndexW(c)];
+    let mt = voxMat(w);
+    if (mt == MAT_AIR) { break; }
+    let m = materials[mt];
+    // Only a TRANSLUCENT liquid counts as water overhead. An opaque one (lava)
+    // transmits nothing, and a solid lid ends the column.
+    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { break; }
+    var f = f32(voxState(w) + 1u) / 8.0;
+    // The cell the point is IN contributes only the part above the point.
+    if (i == 0) { f = max(f - fract(p.y), 0.0); }
+    n += f;
+  }
+  return n * VOXEL_METERS;
+}
+
+// ---- the caustic web itself ----
+// Same physical idea as the caustic term in shadeWater — the intensity tracks
+// the CONVERGENCE of rays refracted through the wave surface, which for a
+// small-slope surface is the curvature (Laplacian) of the wave height field —
+// but projected differently, and that difference is the entire reason this is
+// a separate function rather than a shared one.
+//
+// shadeWater projects from the point where the PRIMARY RAY crossed the
+// surface. That is correct for looking down into water from dry land, and it
+// is meaningless from below, where the primary ray never crossed anything.
+//
+// Here the projection runs from the patch of surface DIRECTLY ABOVE the lit
+// point, drifted along the sun direction by the depth — i.e. where the
+// sunlight landing on this point actually entered the water. That makes the
+// pattern correct from any viewpoint, including from underneath looking up at
+// a lit wall, and it makes it stable when the camera moves (it is a property
+// of the surface and the sun, not of the eye).
+fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
+  if (depthM <= 0.0) { return 0.0; }
+  let kd = keyLightDir();
+  // Sun below the horizon: no caustics. Guarded before the divide.
+  if (kd.y < 0.05) { return 0.0; }
+  // Trace back up the sun direction to the surface: the entry point is the lit
+  // point plus the sun vector scaled to cover `depthM` of vertical rise.
+  let up = depthM / max(kd.y, 0.05);
+  let entry = p * VOXEL_METERS + kd * up;
+  let cp = vec2f(entry.x, entry.z);
+
+  // Curvature by finite difference of the slope field. The baseline and the
+  // band-damping footprint are the same as the shadeWater caustic and for the
+  // same reason: differencing at the scale of the shortest (22 cm) chop
+  // samples curvature that focuses far below any real bed and renders as a
+  // fine dotted grid of per-pixel noise. Only the long swell has the focal
+  // length to reach a bed metres down.
+  let e = 0.22;   // metres — finite-difference baseline
+  let cf = 0.5;   // metres — band damping footprint
+  let s0 = rippleSlope(cp, R.time, cf);
+  let sx = rippleSlope(cp + vec2f(e, 0.0), R.time, cf);
+  let sz = rippleSlope(cp + vec2f(0.0, e), R.time, cf);
+  let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
+
+  // Only CONVERGING curvature makes a bright band; diverging is the dark gap
+  // between bands, and it is already dark by being unlit.
+  //
+  // NORMALISE BEFORE THE EXPONENT. This is not cosmetic — getting it wrong
+  // silently deletes the whole effect. The raw Laplacian of this wave field
+  // peaks around 0.15, and raising a number that far below 1 to a power >1
+  // SHRINKS it (0.15^2.2 = 0.015): the "sharpen" step was cutting the signal
+  // by an order of magnitude, so the finished caustic came out at ~3% of the
+  // surface brightness and was invisible against the bed. Scaling into 0..1
+  // first means the exponent does what it is meant to do — redistribute
+  // contrast into thin filaments — while leaving the peak at full strength.
+  //
+  // CAUSTIC_NORM is the reciprocal of that measured peak. It is a property of
+  // the ripple band table (amplitudes x wavenumbers), so if those change, this
+  // wants re-measuring: sample -curv over the field and take the max.
+  const CAUSTIC_NORM : f32 = 6.7;
+  var c = clamp(max(-curv, 0.0) * CAUSTIC_NORM, 0.0, 1.0);
+  // Sharpen into filaments. A raw curvature field is a smooth blob pattern;
+  // real caustics are thin bright lines with wide dark gaps, and the exponent
+  // is what turns one into the other.
+  c = pow(c, TUNE_BED_CAUSTIC_SHARP);
+
+  // Focus grows with depth (longer lever arm from surface to bed) then washes
+  // out as scattering smears the pattern. Both ends matter: no depth ramp and
+  // a surface right at the waterline gets full-strength caustics it physically
+  // cannot have; no fade and the deepest water is the brightest, which is
+  // backwards.
+  let focus = clamp(depthM * 1.5, 0.0, 1.4) *
+              (1.0 - smoothstep(0.0, TUNE_BED_CAUSTIC_FADE, depthM));
+
+  // Caustics land on a surface in proportion to how square-on it faces the
+  // sun, exactly like any other direct light — a wall parallel to the incoming
+  // shafts catches almost none. Without this the web wraps uniformly around
+  // every face of a rock and reads as glowing paint rather than as projected
+  // light.
+  let facing = max(dot(n, kd), 0.0);
+
+  return c * focus * facing;
+}
+
+// ---- Henyey-Greenstein phase function ----
+// The standard single-parameter model for how strongly a medium scatters
+// forward vs backward. g > 0 is forward-scattering, which is what makes a
+// light shaft blaze when you look toward the sun and fade to almost nothing
+// when you look away — the single term that separates "god rays" from "the
+// whole volume got brighter".
+fn phaseHG(cosTheta : f32, g : f32) -> f32 {
+  let g2 = g * g;
+  let d = 1.0 + g2 - 2.0 * g * cosTheta;
+  // d can reach 0 only at g = 1, which LoadTuning clamps away from; the max()
+  // is belt-and-braces against a hand-edited prelude.
+  return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(d, 1e-4), 1.5));
+}
+
+// ---- volumetric light shafts ----
+// Marches the view ray through the water and, at each sample, asks whether the
+// sun reaches that point. The occlusion test is a real trace, so a shaft is
+// cut by the shore, by an overhang, by a rock — which is the whole reason to
+// pay for it. An analytic shaft (modulating in-scatter by the ripple field
+// alone) is nearly free but passes straight through solid terrain, and under
+// water you are constantly looking at beams that ought to be interrupted by
+// the bank you are swimming next to.
+//
+// Cost: godRaySteps x godRayShadowSteps texture-ish reads per submerged pixel.
+// It is gated on being submerged, so a dry frame pays nothing at all, and both
+// counts are clamped in LoadTuning because their product is the frame time.
+fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
+  let steps = TUNE_GODRAY_STEPS;
+  if (steps <= 0) { return 0.0; }
+  let kd = keyLightDir();
+  // No shafts with the key light at or below the horizon: at that angle the
+  // refracted light is running nearly horizontally and there is nothing to
+  // see. Cheap early-out that skips the whole march at night.
+  if (kd.y < 0.08) { return 0.0; }
+
+  let rangeVox = TUNE_GODRAY_RANGE / VOXEL_METERS;
+  let march = min(maxDistVox, rangeVox);
+  if (march <= 0.0) { return 0.0; }
+  let dt = march / f32(steps);
+
+  // Dither the start offset per pixel so the fixed sample count does not
+  // produce visible banding — the classic slice artifact of any volumetric
+  // march. Screen-space and TIME-FREE, matching farDither's reasoning: a
+  // time-varying jitter would crawl, and this is a still-frame-stable pattern
+  // that the eye integrates spatially instead.
+  let jitter = fract(dot(px, vec2f(0.7548776662, 0.5698402909)));
+
+  // Forward-scattering phase, constant along the ray (the sun is directional).
+  let phase = phaseHG(dot(rd, kd), TUNE_GODRAY_ANISO);
+
+  var acc = 0.0;
+  for (var i = 0; i < steps; i++) {
+    let t = (f32(i) + jitter) * dt;
+    let p = ro + rd * t;
+    // Is this sample still inside water? A view ray under water can leave the
+    // liquid (through the surface, or into an air pocket), and scattering must
+    // stop where the medium does or shafts extend out into the sky.
+    let c = vec3<i32>(floor(p));
+    if (!inBounds(c)) { break; }
+    let w = voxels[cellIndexW(c)];
+    let mt = voxMat(w);
+    if (mt == MAT_AIR) { continue; }
+    let m = materials[mt];
+    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { continue; }
+
+    // Occlusion: can the sun reach this point? Short budget on purpose — this
+    // ray only has to find the surface just above or a nearby blocker, and the
+    // chunk-skip in trace() covers open water in a few steps.
+    let s = trace(p, kd, TUNE_GODRAY_SHADOW_STEPS, false);
+    if (s.hit) { continue; }
+
+    // Reaching here means sunlight lands on this sample. Weight it by the
+    // ripple curvature at the surface above, so the shafts inherit the same
+    // moving structure as the caustics on the bed — the beams and the web on
+    // the floor are the same light, and having them animate independently is
+    // an immediate tell.
+    let dAbove = waterAbove(p);
+    let shaft = 1.0 + bedCaustic(p, kd, dAbove) * 0.6;
+    acc += shaft * dt;
+  }
+
+  // dt is in voxels; convert to metres so the strength knob is scale-free.
+  return acc * VOXEL_METERS * phase * TUNE_GODRAY_STRENGTH;
+}
+
+// ---- suspended particulate ----
+// Motes drifting in the water. Render-only, procedural, no particles and no
+// buffer: a 3D value-noise field thresholded hard so it reads as discrete
+// specks rather than as fog, sampled along the view ray at a few depths.
+//
+// This is the cheapest term here and one of the most effective. A light shaft
+// in clear water is invisible — you see a shaft precisely because there is
+// something suspended in it to scatter off — so silt and god rays are really
+// one effect, and the silt is what gives the water a sense of volume and
+// motion when you turn your head.
+fn siltMotes(ro : vec3f, rd : vec3f, maxDistVox : f32, lit : f32) -> f32 {
+  if (TUNE_SILT_DENSITY <= 0.0) { return 0.0; }
+  var acc = 0.0;
+  // Four slabs at increasing distance. Sampling more than this does not read
+  // as more particles, it reads as fog — the eye wants sparse discrete specks.
+  for (var i = 0; i < 4; i++) {
+    let t = maxDistVox * (0.12 + 0.24 * f32(i));
+    if (t <= 0.0) { continue; }
+    var p = ro + rd * t;
+    // Slow vertical drift plus a lateral sway, so the field is alive without
+    // reading as falling snow. Deliberately very slow: real particulate in
+    // still water barely moves, and anything fast immediately looks like a
+    // weather effect happening indoors.
+    p.y -= R.time * TUNE_SILT_DRIFT / VOXEL_METERS;
+    p.x += sin(R.time * 0.11 + p.y * 0.05) * 0.6;
+    // Hard threshold on a noise field = sparse specks. The 1/(1+t) falloff
+    // keeps distant motes from stacking into a haze, which is what happens if
+    // every slab contributes equally.
+    let nz = valueNoise(p, 0.9);
+    let spec = smoothstep(0.82, 0.97, nz);
+    acc += spec / (1.0 + t * VOXEL_METERS * 0.35);
+  }
+  return acc * TUNE_SILT_DENSITY * TUNE_SILT_BRIGHTNESS * (0.25 + lit);
+}
+
+// ============================================================================
+// THE SUBMERGED PROFILE — what being inside ANY liquid looks like
+// ============================================================================
+// Every liquid a body can be inside gets a complete submerged treatment for
+// free, derived from what materials.json already authors: its PALETTE and its
+// OPACITY. Nothing here names a material or an id, so a liquid added tomorrow
+// is submersible tomorrow (CLAUDE.md conventions), and the tuning knobs below
+// shape the MAPPING rather than any one liquid's numbers.
+//
+// The first cut of this had a one-line escape hatch — `isWater`, defined as
+// "has any tag AND opacity < 0.45" — and everything else fell into a rough
+// else branch. That was wrong twice over. As a classifier it was accidental:
+// acid (opacity 170) failed it, and so would any new clear liquid authored
+// without tags, so "is this water" was really "did the author happen to write
+// these two fields this way". And the else branch was a stub — no visibility
+// distance, no vignette, no god-ray or Snell gating — so a non-water liquid
+// got a half-finished look that no amount of tuning could fix.
+//
+// OPACITY IS THE AXIS. It is already the authored measure of how much a medium
+// blocks, it is already what the media path uses, and across the shipped
+// liquids it orders them exactly the way submersion should: water 90 (clear,
+// you see across a pond), acid 170, blood 200, oil 235 (nearly opaque, arm's
+// length). Everything below is a function of it, so a new liquid's look
+// follows from one number the author was going to write anyway.
+struct SubProfile {
+  absorbK   : vec3f,  // per-channel extinction per metre
+  scatter   : vec3f,  // colour the volume tends toward
+  visM      : f32,    // metres to full fade — the "how murky" distance
+  clarity   : f32,    // 0 = opaque sludge, 1 = clear water. Gates the extras.
+  vignette  : f32,    // screen-edge darkening
+  snellGain : f32,    // brightness of the window looking up
+};
+
+fn submergedProfile(m : Material) -> SubProfile {
+  var p : SubProfile;
+  // Authored palette average — the liquid's own colour is what the volume
+  // tends toward with distance, for every liquid including water.
+  let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
+  // 0 for a perfectly clear liquid, 1 for a fully blocking one. Water sits at
+  // 0.35, oil at 0.92.
+  let op = clamp(f32(m.opacity) / 255.0, 0.0, 1.0);
+
+  // CLARITY drives everything that only makes sense in a medium you can see
+  // through. It is deliberately non-linear: opacity 90 (water) has to land
+  // near "clear" and opacity 235 (oil) near "blind", and a straight 1-op maps
+  // water to 0.65 and oil to 0.08, which reads as murky water rather than as
+  // oil. The curve pushes the ends apart.
+  p.clarity = pow(clamp(1.0 - op, 0.0, 1.0), 0.55);
+
+  // Visibility: how far you can see before the view is entirely the liquid's
+  // own colour.
+  //
+  // Deliberately a STEEPER function of clarity than the gating above, and the
+  // two curves have to be separate. One shared exponent cannot serve both: a
+  // gentle curve leaves oil seeing 3 m (which reads as murky water, not
+  // sludge), and a steep enough curve to fix that drags water's clarity down
+  // out of the refined band and loses water's hand-tuned look entirely. So
+  // clarity^2.2 collapses the murky end hard while the gentler `clarity`
+  // itself still classifies water as clear. Oil lands near 1 m, blood ~2 m,
+  // acid ~3 m, and water is overridden to its authored 11 m below.
+  p.visM = mix(TUNE_SUB_MURK_VIS, TUNE_SUB_VISIBILITY,
+               pow(p.clarity, TUNE_SUB_VIS_CURVE));
+
+  // Absorption absorbs the COMPLEMENT of the liquid's colour — a green acid
+  // must absorb red and blue, which is what leaves it green at depth. Scaled
+  // by opacity so a dense liquid kills light faster. The floor keeps even a
+  // notionally clear liquid from being a perfect vacuum.
+  p.absorbK = (vec3f(1.0) - base) * (op * TUNE_SUB_ABSORB_GAIN) +
+              vec3f(TUNE_SUB_ABSORB_FLOOR);
+
+  // In-scatter colour. A dense liquid scatters more of its own colour back at
+  // you (it is what you see instead of the scene), a clear one much less.
+  p.scatter = base * mix(TUNE_SUB_SCATTER_DENSE, TUNE_SUB_SCATTER_CLEAR,
+                         p.clarity);
+
+  // A dense medium presses in at the edges of vision harder than a clear one.
+  p.vignette = clamp(TUNE_SUB_VIGNETTE * mix(1.6, 1.0, p.clarity), 0.0, 0.95);
+  // Snell's window needs a medium you can see the sky through at all.
+  p.snellGain = TUNE_SUB_SNELL_GAIN * p.clarity;
+
+  // ---- WATER'S REFINEMENT ----
+  // Water is the one liquid whose submerged look has been tuned by eye rather
+  // than derived, and those hand-set coefficients are better than the generic
+  // curve can be — the per-channel red kill that makes water read as water is
+  // not recoverable from a palette average. So the derivation above is the
+  // DEFAULT and this is an override on top of it, not the other way round.
+  //
+  // Keyed on clarity rather than on a tag or an id: any liquid authored as
+  // clear as water gets water's treatment, which is the correct generalisation
+  // ("clear liquids behave like this") rather than a special case for one
+  // material. The blend means there is no cliff — a liquid authored slightly
+  // murkier than water slides smoothly off the refined values onto the
+  // derived ones.
+  let refined = smoothstep(TUNE_SUB_CLEAR_LOW, TUNE_SUB_CLEAR_HIGH, p.clarity);
+  p.absorbK = mix(p.absorbK, TUNE_SUB_ABSORB, refined);
+  p.scatter = mix(p.scatter, TUNE_SUB_SCATTER, refined);
+  p.visM = mix(p.visM, TUNE_SUB_VISIBILITY, refined);
+  return p;
+}
+
+// ---- the full submerged shade ----
+// Replaces the old two-line `underwater` branch. `sceneBehind` is whatever the
+// primary march resolved — a rock, the bed, or the underside of the surface —
+// and `pathVox` is how far the ray travelled through the liquid to get there.
+//
+// Returns the final colour for a pixel whose ray is inside the liquid for its
+// whole length. Because the medium covers the entire view, this REPLACES
+// aerial perspective rather than composing with it: fogging air in front of
+// water that the eye is already inside would double-count the same haze.
+fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
+                  sceneBehind : vec3f, px : vec2f, sawSky : bool) -> vec3f {
+  let m = materials[mat];
+  let distM = max(pathVox, 0.0) * VOXEL_METERS;
+
+  // ---- absorption + in-scatter ----
+  // Derived per liquid from its authored palette and opacity, with water's
+  // hand-tuned coefficients blended in at the clear end. See submergedProfile:
+  // there is no "is this water" test anywhere in here, only "how clear is it".
+  let prof = submergedProfile(m);
+  let absorbK = prof.absorbK;
+  let scatterCol = prof.scatter;
+
+  // The scatter colour is lit by the key light, so a pond at night is dark
+  // water rather than the same daytime turquoise at lower brightness.
+  //
+  // The 0.45 is not a fudge: in-scattered light has been scattered out of the
+  // beam before reaching the eye, so it is intrinsically dimmer than the
+  // direct sun that a surface reflects. Driving it at full keyLightColor()
+  // makes the water itself as bright as a sunlit surface, which flattens the
+  // entire view into one luminance and is what "washed out" looks like.
+  let sunUp = clamp(keyLightDir().y * 1.5, 0.05, 1.0);
+  let ambientWater =
+      scatterCol * keyLightColor() * sunUp * TUNE_SUB_SCATTER_GAIN * 0.45;
+
+  // ---- the surface, seen from underneath (Snell's window) ----
+  // A ray that reached the sky left through the underside of the surface, and
+  // that interface is emphatically not a window: going water -> air the light
+  // bends AWAY from the normal, so the entire 180-degree hemisphere above
+  // compresses into a cone of about 97 degrees straight up. Outside that cone
+  // there is TOTAL internal reflection — the surface is a mirror showing you
+  // the murk below, not the sky.
+  //
+  // That bright disc ringed by dark mirror is the single most recognisable
+  // thing about looking up underwater, and without it a submerged view of the
+  // sky is just the normal sky slightly tinted, which reads as a bug.
+  //
+  // GATED ON CLARITY. A window is only a window if the medium transmits: in
+  // oil there is no disc of sky above you, just dark. The refraction physics
+  // are identical in any liquid, but at opacity 235 nothing survives the trip
+  // to the eye, so drawing a bright sky disc through sludge is the single most
+  // obviously wrong thing this function could do. snellGain carries the fade,
+  // so the term disappears smoothly as a liquid is authored murkier.
+  var behind = sceneBehind;
+  if (sawSky && prof.snellGain > 0.001) {
+    // Angle off vertical. The critical angle for water is asin(1/1.333) =
+    // 48.6 degrees, i.e. cos = 0.661 — that is the edge of the window.
+    let cosUp = clamp(rd.y, -1.0, 1.0);
+    const CRIT_COS : f32 = 0.661;
+    // Ripple the boundary rather than letting it be a clean circle: the real
+    // edge shimmers because the surface itself is moving, and a hard analytic
+    // ring immediately reads as a post-effect. Reuse the ripple field so the
+    // distortion agrees with the waves being drawn everywhere else.
+    let pm = vec2f(ro.x + rd.x * pathVox, ro.z + rd.z * pathVox) * VOXEL_METERS;
+    let s = rippleSlope(pm, R.time, 0.0) * TUNE_SUB_SURFACE_RIPPLE;
+    let edge = CRIT_COS + (s.x + s.y) * 0.35;
+    // Inside the window: the sky, but squeezed. Outside: the murk, mirrored.
+    let window = smoothstep(edge - 0.10, edge + 0.06, cosUp);
+    // The sky inside the window is compressed toward the zenith. Scaling the
+    // horizontal component of the direction toward vertical is a cheap,
+    // monotonic stand-in for the real refraction map and gets the important
+    // part right: the horizon ring crowds into the rim of the disc.
+    var skyDir = normalize(vec3f(rd.x * 0.62, max(rd.y, 0.05), rd.z * 0.62));
+    skyDir += vec3f(s.x, 0.0, s.y) * 0.25;
+    let windowSky = skyColorNoBodies(normalize(skyDir)) * prof.snellGain;
+    behind = mix(scatterCol * keyLightColor() * sunUp * 1.2, windowSky, window);
+  }
+
+  // ---- extinction ----
+  // ONE transmittance term, not two. The first cut applied Beer-Lambert AND
+  // then mixed the result toward the water colour again over `subVisibility`,
+  // which double-counts the same falloff: every surface past a couple of
+  // metres landed on the scatter colour twice and the whole view flattened
+  // into a uniform pale wash with no contrast left in it. The bed rendered as
+  // a featureless white sheet — brighter than the water, which is backwards.
+  //
+  // So `subVisibility` folds INTO the extinction coefficient rather than
+  // being a second blend on top of it. It stays the predictable "distance at
+  // which things disappear" knob (at distM == subVisibility the view is
+  // 1/e ~ 37% original), and the per-channel absorption still tilts the hue
+  // with depth on top of it.
+  // Per liquid, so a murky one goes blind close in and a clear one does not.
+  let extinction = absorbK + vec3f(1.0 / prof.visM);
+  let trans = exp(-extinction * distM);
+  var color = behind * trans + ambientWater * (vec3f(1.0) - trans);
+
+  // ---- god rays and silt ----
+  // BOTH GATED ON CLARITY, and both skipped outright in a dense liquid.
+  //
+  // Visually: a shaft of sunlight is only visible because the medium transmits
+  // it far enough to be seen as a beam, and suspended motes are only visible
+  // if light reaches them. In oil neither survives a centimetre, so drawing
+  // sunbeams and drifting specks inside sludge reads as water with the wrong
+  // colour rather than as oil.
+  //
+  // And they are the two most expensive terms in the function — godRays is a
+  // march with a real occlusion trace per sample. Skipping them where they
+  // cannot be seen means a dense liquid is also the CHEAP case, which is the
+  // right way round: you are usually submerged in something dense because you
+  // fell in it, and that is a bad moment for a frame-time spike.
+  if (prof.clarity > 0.08) {
+    // Added, not mixed: scattered light is light ARRIVING at the eye from the
+    // volume, on top of whatever survived from behind.
+    let shafts = godRays(ro, rd, max(pathVox, 1.0), px) * prof.clarity;
+    color += ambientWater * shafts;
+
+    // Motes are lit by the same shaft integral, so ones inside a beam flare
+    // and ones in shadow stay dim — which is what makes the beams look like
+    // they occupy space rather than being painted over the image.
+    let motes = siltMotes(ro, rd, max(pathVox, 1.0), shafts) * prof.clarity;
+    color += ambientWater * motes * 2.0 + vec3f(motes * 0.05);
+  }
+
+  // ---- the surface overhead, in a medium too dense to see through ----
+  // In a dense liquid the sky is gone (the Snell window above is gated off),
+  // and what that left was a completely featureless field of colour - correct
+  // in the sense that you genuinely cannot see anything, but it reads as a
+  // broken shader rather than as being submerged in oil. There is no cue for
+  // which way is up and nothing moves, so the frame looks static even as the
+  // camera turns.
+  //
+  // The physical answer is that even a near-opaque medium transmits a LITTLE
+  // light from above, and it arrives smeared into a soft directional gradient
+  // rather than an image. That is what this adds: a faint glow toward the
+  // surface, modulated by a slow churn field so it drifts and gives the volume
+  // orientation and motion without ever resolving into anything you could
+  // mistake for a view.
+  //
+  // Gated to the murky case - a clear liquid already has the Snell window and
+  // does not need a stand-in for it.
+  let murk = 1.0 - prof.clarity;
+  if (murk > 0.25) {
+    let up = clamp(rd.y, 0.0, 1.0);
+    let pm = (ro + rd * min(pathVox, 24.0)) * VOXEL_METERS;
+    let churn = valueNoise(vec3f(pm.x * 0.7, pm.z * 0.7, R.time * 0.08), 1.0);
+    let glow = pow(up, 2.5) * mix(0.55, 1.0, churn);
+    // Daylight that has struggled through the medium, so it carries both the
+    // key light's colour and the liquid's own tint.
+    color += scatterCol * keyLightColor() * sunUp * glow *
+             TUNE_SUB_MURK_GLOW * murk;
+  }
+
+  // ---- vignette ----
+  // Cheap, and a strong "you are inside a medium" cue: light reaching the edge
+  // of your view underwater has travelled further through it. Keyed on the
+  // angle off the view axis rather than on screen UV so it does not stretch
+  // with aspect ratio. Stronger in a dense liquid, which is what makes being
+  // in oil feel like being in oil.
+  let off = 1.0 - clamp(dot(rd, R.camFwd), 0.0, 1.0);
+  color *= 1.0 - clamp(off * prof.vignette * 2.5, 0.0, prof.vignette);
+
+  return color;
+}
+
 // ---- the full water shade ----
 // `sceneBehind` is whatever the primary march already resolved BEHIND the
 // water (lake bed, terrain, or sky) — this function decides how much of it
@@ -2306,6 +2842,128 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
 //
 // All render-only float math on render-only data — the sim never sees it.
 
+// ---- how OILY is this viscous liquid? ----
+// 0 = a blood-like biological fluid, 1 = a petroleum-like one. Both take the
+// viscous surface path (isViscousLiquid), but they look nothing alike, and the
+// blood constants applied to oil are what made the oil pool render as a sheet
+// of flat beige mud: matte, desaturated, no highlight and no reflection.
+//
+// Three things separate them physically, and all three follow from this one
+// number: oil is GLOSSY (a smooth mirror-dark film, where blood is a diffuse
+// suspension), oil is DARK and near-neutral, and oil carries a thin-film
+// IRIDESCENCE that nothing biological does.
+//
+// Derived from the AUTHORED PALETTE, not from a material id and not from a new
+// JSON key - the same principle isViscousLiquid itself follows, and for the
+// same reason: any modder's petroleum-like liquid gets the treatment for free,
+// and nothing here has to be kept in step with materials.json.
+//
+// SATURATION is the discriminator. Blood's authored colour0 is 0.85 saturated;
+// oil's is 0.46. Biological fluids are strongly chromatic (haemoglobin,
+// chlorophyll, bile) because they are pigment suspensions; petroleum is a dark
+// near-neutral brown-black. The measure is scale-free, so authoring oil
+// lighter or darker changes how it reads, not what it IS.
+fn oiliness(m : Material) -> f32 {
+  let c = unpackColor(m.color0);
+  let mx = max(c.r, max(c.g, c.b));
+  let mn = min(c.r, min(c.g, c.b));
+  // HSV saturation. Pure black reads as fully oily, which is right: a black
+  // liquid is far closer to oil than to blood.
+  let sat = select((mx - mn) / max(mx, 1e-4), 0.0, mx < 1e-4);
+  // Wide band on purpose: blood (0.85) firmly at 0, oil (0.46) firmly at 1,
+  // with a real gradient between so a liquid authored in the middle blends
+  // rather than falling off a cliff.
+  return 1.0 - smoothstep(TUNE_OIL_SAT_LOW, TUNE_OIL_SAT_HIGH, sat);
+}
+
+// ---- is this liquid FLOATING ON another one? ----
+// Returns 1 when a lighter liquid is lying on top of a heavier, different one
+// — oil on water — and 0 for a pool of the stuff on its own.
+//
+// This is the gate for the iridescent sheen, and the physics is the reason it
+// has to exist. Thin-film interference needs a FILM: two closely spaced
+// interfaces, so light bouncing off the top can interfere with light bouncing
+// off the bottom. Oil spread on water is exactly that (an air/oil interface a
+// few microns above an oil/water one) and it is why a puddle in a car park
+// shows rainbows. A deep pool of oil on rock has no second interface anywhere
+// near the surface — the bottom is metres down and the light never gets there
+// — so it is just a dark glossy liquid, and painting rainbows on it is the
+// giveaway that the effect is decoration rather than a model of anything.
+//
+// Probes DOWNWARD for a different liquid with a HIGHER density. Density is
+// what decides which floats (the sim already orders liquids by it), so this
+// asks the same question the sim does and cannot disagree with what the world
+// actually did. No material ids: any light liquid on any heavy one gets a
+// sheen, which is the correct generalisation.
+fn floatingOnLiquid(cell : vec3<i32>, mat : u32) -> f32 {
+  let m = materials[mat];
+  // A film is THIN. Probing far down would find the water under a metre-deep
+  // oil column and call it a film, which is the case this exists to exclude,
+  // so the probe reaches only a few voxels.
+  for (var i = 1; i <= 3; i++) {
+    let c = cell + vec3<i32>(0, -i, 0);
+    if (!inBounds(c)) { return 0.0; }
+    let w = voxels[cellIndexW(c)];
+    let bm = voxMat(w);
+    if (bm == MAT_AIR) { return 0.0; }        // nothing under it
+    if (bm == mat) { continue; }              // still our own liquid: keep going
+    let b = materials[bm];
+    if (b.klass != CLASS_LIQUID) { return 0.0; }  // resting on a solid bed
+    // A DIFFERENT liquid, and denser than us, so we are the one floating.
+    // Fade in with how much denser it is: a marginal difference is a mixture,
+    // a large one is a genuine layer boundary.
+    if (b.density > m.density) {
+      let ratio = f32(b.density - m.density) / max(f32(m.density), 1.0);
+      return clamp(ratio * TUNE_OIL_FLOAT_SENS, 0.0, 1.0);
+    }
+    return 0.0;
+  }
+  // Ran out of probe without finding anything: too deep to be a film.
+  return 0.0;
+}
+
+// ---- thin-film interference (the rainbow sheen on oil) ----
+// The one thing everybody recognises oil by. A film microns thick makes light
+// reflected off its TOP surface interfere with light reflected off its BOTTOM,
+// and which wavelengths cancel depends on the optical path difference - so the
+// colour swims with viewing angle and with film thickness.
+//
+// Modelled the standard cheap way: drive a phase from (thickness / cos of the
+// refracted angle), then convert to RGB with three cosines 120 degrees apart.
+// That is not a spectral integral, but it produces the right BEHAVIOUR - bands
+// that slide across the surface as the eye moves and as the film varies -
+// which is the whole visual signature. A static rainbow texture is not.
+//
+// Thickness varies via the same value-noise field the rest of the renderer
+// uses, animated slowly: a real slick's film is dragged around by the fluid
+// under it, and a uniform film would show one flat colour rather than bands.
+fn filmIridescence(p : vec3f, cosI : f32) -> vec3f {
+  let pm = p * VOXEL_METERS;
+  // Two octaves at different rates so the bands drift and stretch rather than
+  // sliding rigidly, which is what reads as liquid rather than as a scrolling
+  // texture.
+  // LOW spatial frequency, deliberately. At 1.7 and 3.1 cycles per metre the
+  // interference bands land near PIXEL scale across a slick at any real
+  // viewing distance, and the field aliases into a shimmering moire that reads
+  // as a broken screen rather than as oil. A real film's thickness varies over
+  // tens of centimetres, so the bands should be broad, soft and few.
+  let t1 = valueNoise(vec3f(pm.x * 0.45, pm.y * 0.45 + R.time * 0.05, pm.z * 0.45), 1.0);
+  let t2 = valueNoise(vec3f(pm.z * 0.8 - R.time * 0.03, pm.x * 0.8, pm.y * 0.8), 1.0);
+  let thick = mix(t1, t2, 0.4) * TUNE_OIL_FILM_SCALE;
+  // Optical path difference grows as the ray slants through the film, which is
+  // why the bands crowd toward a grazing view. That angular term is most of
+  // what sells it as interference rather than as painted-on colour.
+  let opd = thick / max(cosI, 0.18);
+  let ph = opd * 6.28318;
+  let rgb = vec3f(cos(ph), cos(ph - 2.0944), cos(ph + 2.0944)) * 0.5 + vec3f(0.5);
+  // Kept LINEAR rather than squared. Squaring deepens the gaps between bands
+  // and pushes them toward primaries, which on a real surface reads as a
+  // psychedelic decal instead of a faint oily sheen; the raw cosines are
+  // already pastel, which is what a slick looks like away from its thinnest
+  // fringes.
+  return rgb;
+}
+
 // Returns 0 for an isolated droplet / thin trail and 1 for the interior of a
 // pool. Sampled in ALL THREE axes, unlike moltenPooling's horizontal-only
 // probe: a one-voxel-deep sheet of lava spread on a floor is still a pool and
@@ -2436,6 +3094,9 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   let m = materials[mat];
   let upFacing = (axis == 1 && sgn < 0.0);
   let pool = bloodPooling(cell, mat);
+  // 0 = blood-like, 1 = petroleum-like. Every oil-specific term below rides
+  // this, so a liquid authored between the two blends rather than switching.
+  let oily = oiliness(m);
 
   // ---- normal ----
   // The smooth field gradient (see liquidFieldNormal) on EVERY face, not just
@@ -2473,7 +3134,17 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // grazing reflection is pulled down: an absorbing, slightly rough organic
   // fluid does not go to a 100% mirror at the horizon the way clean water does,
   // and letting it turns every pool edge into a bright white rim.
-  var fres = TUNE_BLOOD_F0 + (TUNE_BLOOD_GRAZE - TUNE_BLOOD_F0) *
+  //
+  // OIL IS THE OPPOSITE CASE. Blood's grazing reflectance is pulled down
+  // because it is a rough absorbing suspension; oil is a smooth dielectric film
+  // and really does approach a mirror at the horizon - that hard bright rim is
+  // the look, not the artifact the blood constant guards against. Oil also has
+  // a higher IOR (~1.47 vs water's 1.33), so its head-on reflectance is about
+  // double. Blending both endpoints on `oily` is what turns the flat matte
+  // pool into something that reads as wet.
+  let f0 = mix(TUNE_BLOOD_F0, TUNE_OIL_F0, oily);
+  let graze = mix(TUNE_BLOOD_GRAZE, TUNE_OIL_GRAZE, oily);
+  var fres = f0 + (graze - f0) *
              pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
   // Thin films are not mirrors — same reasoning as water's surfFull term.
   fres *= mix(0.45, 1.0, surfFull);
@@ -2500,6 +3171,14 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Pools are darker than droplets even at equal path length: more of the
   // light that enters a large body is absorbed before it can scatter back.
   body = mix(body, deep, pool * 0.35);
+  // Oil goes DARKER still, and this is the term that kills the beige. Blood's
+  // ramp is built around a suspension that backscatters brightly - thin blood
+  // genuinely reads lighter and more orange. Petroleum does the opposite: it
+  // absorbs almost everything that enters and reflects the rest off its
+  // surface, so its body should approach black and let the reflection and the
+  // glint carry the image. Rendering oil with blood's backscatter is what made
+  // a pool of it look like a pan of wet clay.
+  body = mix(body, deep * TUNE_OIL_DARKEN, oily);
 
   // What comes back out: the surface behind, filtered by the film, plus the
   // blood's own scattered colour. Blood scatters strongly (it is a suspension,
@@ -2525,14 +3204,41 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   var reflection : vec3f;
   if (underwater) {
     reflection = body * 1.4;
-  } else if (upFacing && pool > 0.5 && fres > TUNE_REFLECTION_CUTOFF) {
+  } else if (upFacing && pool > mix(0.5, 0.18, oily) &&
+             fres > TUNE_REFLECTION_CUTOFF) {
+    // The pooling threshold drops with oiliness. Blood needs a real pool before
+    // a traced reflection is worth a secondary ray - a droplet has no coherent
+    // surface to reflect anything. An oil slick is coherent at a much smaller
+    // scale (that is what a slick IS: a film that spreads flat), and the
+    // reflection is the DOMINANT term in its look rather than a garnish, so it
+    // earns the ray far sooner.
     reflection = traceReflection(hitP, n, rd);
   } else {
-    reflection = reflectionSky(reflect(rd, n));
+    // The cheap fallback: a plain sky lookup. On a POOL that is a fine stand-in
+    // for a traced ray, but on a droplet or a thin trail it is the other half
+    // of oil reading as see-through. Fresnel at a grazing angle drives `color`
+    // almost entirely to this term, and a droplet returning full-brightness
+    // sky is indistinguishable from a droplet you are looking THROUGH.
+    //
+    // A real droplet does reflect the sky, but it is a tiny curved mirror
+    // scattering it in every direction, so what reaches the eye is far dimmer
+    // than the sky itself. Damping the fallback on unpooled oil models that,
+    // and it is what keeps a spray of droplets reading as dark specks of oil
+    // rather than as holes in the world.
+    let sky = reflectionSky(reflect(rd, n));
+    reflection = sky * mix(1.0, mix(TUNE_OIL_DROP_REFLECT, 1.0, pool), oily);
   }
   // Reflections off blood are TINTED by it — a dielectric this dark reflects a
   // dimmer, redder version of what a clean surface would.
-  reflection = mix(reflection, reflection * (bright + vec3f(0.25)), 0.5);
+  //
+  // Oil is barely tinted at all, and that difference matters: a smooth
+  // petroleum film is a near-NEUTRAL dark mirror, so what you see in it is the
+  // sky and the far bank rather than a brown wash of its own body colour.
+  // Pushing blood's tint onto oil was a large part of what flattened the pool
+  // into mud - it dragged the one term carrying real scene information back
+  // toward the same beige as everything else.
+  let tintAmt = mix(0.5, TUNE_OIL_REFLECT_TINT, oily);
+  reflection = mix(reflection, reflection * (bright + vec3f(0.25)), tintAmt);
 
   var color = mix(refracted, reflection, fres);
 
@@ -2552,7 +3258,12 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // highlight over its whole face, while a flat pool concentrates it — using
     // the pool exponent on a droplet gives a highlight so small it disappears
     // at any distance, which is exactly how blood ends up looking like paint.
-    let power = mix(TUNE_BLOOD_SHEEN_DROP, TUNE_BLOOD_SHEEN_POOL, pool);
+    // Oil's lobe is TIGHTER than blood's at both ends. Blood is a scattering
+    // suspension whose surface is microscopically rough, so its highlight is
+    // broad and soft; oil is a smooth film and gives a small hard glint. That
+    // narrowness is most of what the eye reads as "glossy" rather than "damp".
+    let power = mix(mix(TUNE_BLOOD_SHEEN_DROP, TUNE_BLOOD_SHEEN_POOL, pool),
+                    TUNE_OIL_GLOSS, oily);
     var spec = pow(max(dot(n, hv), 0.0), power);
     if (!upFacing) { spec *= 0.55; }
     // Ambient-lit sheen as well as key-lit: a wet surface in shadow still
@@ -2560,8 +3271,29 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // at night goes completely matte and dead.
     let ambientSheen = pow(1.0 - cosI, 4.0) * TUNE_BLOOD_AMBIENT_SHEEN;
     let tint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
-    color += tint * min(spec, 1.0) * TUNE_BLOOD_SHEEN * (0.35 + fres)
+    let sheenAmt = mix(TUNE_BLOOD_SHEEN, TUNE_OIL_SHEEN, oily);
+    color += tint * min(spec, 1.0) * sheenAmt * (0.35 + fres)
            + ambientAt(n) * ambientSheen;
+
+    // ---- thin-film iridescence ----
+    // The rainbow slick, and it ONLY appears where oil is floating on water.
+    //
+    // Interference needs a FILM — two interfaces close enough together that
+    // light off the top can interfere with light off the bottom. Oil lying on
+    // water is exactly that and is why a car-park puddle shows rainbows; a
+    // deep pool of oil on rock has no second interface within reach of the
+    // light, so it is simply a dark glossy liquid. Painting rainbows on one
+    // anyway was the tell that this was decoration rather than a model, and it
+    // made every isolated droplet and every standalone pool look wrong.
+    //
+    // Also weighted by FRESNEL, so within a real slick it shows at glancing
+    // angles and stays off the head-on centre, where it would read as paint.
+    // Scaled by `oily`, so blood never gets a drop of it.
+    let onWater = floatingOnLiquid(cell, mat);
+    if (oily > 0.01 && onWater > 0.01 && !underwater) {
+      color += filmIridescence(hitP, cosI) * oily * onWater * fres *
+               TUNE_OIL_IRIDESCENCE;
+    }
   }
 
   // ---- thin edge darkening ----
@@ -2570,8 +3302,12 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // oxidised. Keyed on a THIN column rather than on pooling, so it catches the
   // trailing edge of a run as well as the rim of a puddle.
   if (!underwater) {
+    // Faded out on oil: that browning is OXIDISED IRON specifically, a
+    // biological detail with no petroleum equivalent. A thinning oil film goes
+    // iridescent (above), it does not go rust-brown.
     let thin = 1.0 - smoothstep(0.0, TUNE_BLOOD_EDGE_DEPTH, depthM);
-    color = mix(color, color * TUNE_BLOOD_EDGE_TINT, thin * TUNE_BLOOD_EDGE_STRENGTH);
+    color = mix(color, color * TUNE_BLOOD_EDGE_TINT,
+                thin * TUNE_BLOOD_EDGE_STRENGTH * (1.0 - oily));
   }
 
   // ---- silhouette softening ----
@@ -2603,12 +3339,27 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Referencing the field's local peak instead makes the feather scale-free: it
   // trims the same fraction of the outer fringe off a droplet and off a pool,
   // and never eats into the body of either.
+  //
+  // OIL GETS A MUCH NARROWER FEATHER, and this is what stopped it reading as
+  // see-through. The 0.28 band is a large fraction of the field's range, so on
+  // a droplet or a thin film a big part of the visible surface — not just the
+  // outermost rim — sits inside the fade and gets mixed toward whatever is
+  // behind it. On blood that is an acceptable trade for killing the gelatin
+  // cube silhouette, because blood's own body colour is bright enough to keep
+  // reading through the blend. Oil's body is nearly black by design, so the
+  // same blend has almost nothing to hold up against the background and the
+  // droplet turns into a smear of the scene behind it.
+  //
+  // Narrowing the band to the true outer fringe keeps the anti-aliasing (the
+  // silhouette is still soft, which is the point of the term) while leaving
+  // the body of the blob opaque.
   let edgeField = liquidFieldAt(hitP - rd * 0.35, mat);
   // Peak the field can reach for this blob, floored so a full pool still uses
   // the authored feather rather than a vanishing one.
   let peak = max(liquidFieldAt(hitP - rd * 1.1, mat), 0.35);
   let lo = TUNE_BLOOD_EDGE_FEATHER * peak;
-  let solid = smoothstep(lo, lo + 0.28 * peak, edgeField);
+  let band = mix(0.28, TUNE_OIL_EDGE_BAND, oily);
+  let solid = smoothstep(lo, lo + band * peak, edgeField);
   color = mix(sceneBehind, color, clamp(solid, 0.0, 1.0));
 
   return color;
@@ -3183,6 +3934,78 @@ fn fs(in : VSOut) -> FSOut {
     let sun = keyLightColor() * lambert;
     color = albedo * face * (ambientAt(n) * ao + sun);
 
+    // ---- caustics on a submerged surface ----
+    // The rippling web of focused sunlight on anything under water. This is
+    // the term that makes a pond bed read as being underwater rather than as
+    // dry ground with a blue sheet over it, and it applies to every lit
+    // surface below a waterline — the bed, a boulder, a reed, the shore's
+    // underwater slope — seen from ABOVE or BELOW the surface alike.
+    //
+    // Distinct from the caustic inside shadeWater, which is a multiplier
+    // applied where a ray from dry land crosses the surface. That one cannot
+    // fire at all when the camera is already submerged (no crossing happens),
+    // which is why looking around underwater used to show no caustics on
+    // anything. See bedCaustic for the projection difference.
+    //
+    // MULTIPLICATIVE, for the same reason as the other caustic path: caustics
+    // redistribute the sunlight already landing on a surface, so they scale
+    // what is there. Bright sand goes brighter, dark stone stays dark. Adding
+    // a constant instead makes unlit rock glow, which reads as the surface
+    // emitting light rather than as light playing over it.
+    //
+    // COST: gated hard. waterAbove() walks up to 40 cells, so it must not run
+    // on every terrain pixel in the frame. `lambert > 0` skips everything in
+    // shadow (a shadowed surface has no direct sun to redistribute anyway),
+    // and the cell directly above must be a liquid before the walk starts —
+    // which is one buffer read, false for essentially the whole world.
+    if (lambert > 0.0) {
+      let up1 = h.cell + vec3<i32>(0, 1, 0);
+      if (inBounds(up1)) {
+        let uw = voxels[cellIndexW(up1)];
+        let um = voxMat(uw);
+        if (um != MAT_AIR && materials[um].klass == CLASS_LIQUID &&
+            (materials[um].flags & MATF_OPAQUE) == 0u) {
+          // Probe from just OFF the face, not from the hit point itself: a hit
+          // point sits exactly on a cell boundary, and floor() there lands
+          // inside the solid half the time, which reads the surface's own
+          // material as the column and returns zero depth in a speckled
+          // pattern. Nudging along the normal puts the probe unambiguously in
+          // the water.
+          let dAbove = waterAbove(hp + n * 0.5);
+
+          // ---- the sunlight reaching this surface came THROUGH the water ----
+          // and it is neither white nor at full strength when it arrives. This
+          // is the term whose absence made the pond bed render BRIGHTER than
+          // the water above it — a lit slab of pale stone, shaded as though it
+          // were sitting in open air, then only tinted on the way back to the
+          // eye. The bed has to be darkened and colour-shifted by the column
+          // standing on it BEFORE anything else, or no amount of tuning on the
+          // return path will stop it reading as white sand under blue fog.
+          //
+          // Beer-Lambert down the sun's slant path (longer than the vertical
+          // depth at any angle off noon), using the same coefficients the
+          // return trip uses, so a bed 2 m down loses most of its red exactly
+          // as the water does.
+          let kdc = keyLightDir();
+          let slant = dAbove / max(kdc.y, 0.15);
+          let downTrans = exp(-TUNE_SUB_ABSORB * slant);
+          color *= mix(vec3f(1.0), downTrans, clamp(dAbove * 4.0, 0.0, 1.0));
+
+          // Scaled by `lambert`, NOT gated on it. The enclosing `lambert > 0`
+          // is only an early-out for fully shadowed pixels; using it as an
+          // on/off switch for the caustic is what turned the soft shadow
+          // gradient on the pool's rim wall into hard vertical stripes. That
+          // wall is a stack of voxels whose shadow ray alternately clears and
+          // clips the terrace lip above it, so `lambert` there is a fine
+          // gradient — and multiplying a smooth gradient by a binary mask
+          // quantises it into a barcode. Riding the same gradient keeps the
+          // caustic continuous across it.
+          let cw = bedCaustic(hp, n, dAbove) * lambert;
+          color *= 1.0 + min(cw * TUNE_BED_CAUSTIC_GAIN, TUNE_BED_CAUSTIC_CAP);
+        }
+      }
+    }
+
     // ---- wet sheen on a fresh stain ----
     // A stain is WET, and the specular highlight is what says so. Without it a
     // blood-soaked floor is just a floor with a red patch on it; with it the
@@ -3292,19 +4115,59 @@ fn fs(in : VSOut) -> FSOut {
       // ripples, a wet sheen that works on a lone droplet, and a
       // moving-vs-pooled blend. See shadeViscous for why this is not
       // shadeWater with different constants.
-      if (isViscousLiquid(materials[lm])) {
+      // SUBMERSION IS TESTED FIRST, ahead of the viscous split. The viscous
+      // model (shadeViscous) is a SURFACE model — a wet sheen on a droplet, a
+      // pooled-vs-moving blend — and it is the right answer for blood or oil
+      // seen from outside. It is the wrong answer for being INSIDE the stuff,
+      // where there is no surface in front of you at all.
+      //
+      // Ordering these the other way round is what sent submerged oil to the
+      // blood shader: oil satisfies isViscousLiquid (liquid, not opaque,
+      // moveEvery 2, opacity 235), so it never reached shadeSubmerged and a
+      // camera under the oil pool rendered as flat grey. Every liquid you can
+      // be inside now takes the submerged path, and submergedProfile derives
+      // its look from that liquid's own palette and opacity.
+      if (underwater) {
+        // ---- the eye is INSIDE the liquid ----
+        // A separate model, not shadeWater with a flag. From in here the
+        // medium covers the entire view, so there is no interface in front of
+        // anything, no Fresnel split to make, and no bounded depth to absorb
+        // over: it is volumetric for the whole ray. See shadeSubmerged.
+        //
+        // Aerial perspective is deliberately NOT applied afterwards. That term
+        // models haze in the AIR between eye and surface, and there is no such
+        // air — shadeSubmerged's own absorption is the distance cue, and
+        // fogging on top of it would double-count and wash the view to sky
+        // colour, which is exactly what hid the bed before.
+        //
+        // pathVox is how far the ray ran inside liquid. For a ray that exits
+        // to open sky it is the whole underwater stretch; for one that ends on
+        // a rock it is the distance to that rock.
+        // `sawSky` says the ray left the water and reached open sky rather
+        // than ending on a surface — that is the case that has to render
+        // Snell's window. A ray that ends on the bed never crossed the
+        // interface and must not get one.
+        let sawSky = !h.hit && !h.saturated && !far.hit;
+        color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
+                               sawSky);
+      } else if (isViscousLiquid(materials[lm])) {
+        // Seen from OUTSIDE: blood and oil take their own surface model — no
+        // travelling ripples, a wet sheen that works on a lone droplet, and a
+        // moving-vs-pooled blend. See shadeViscous for why this is not
+        // shadeWater with different constants.
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              underwater);
+        color = applyAerial(color, rd, h.liqT);
       } else {
         color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
+        // The water surface itself is at liqT, nearer than whatever is behind
+        // it, so aerial perspective applies from the SURFACE — otherwise a
+        // distant lake gets the fog of its own bed and reads too hazy.
+        color = applyAerial(color, rd, h.liqT);
       }
-      // The water surface itself is at liqT, nearer than whatever is behind
-      // it, so aerial perspective applies from the SURFACE — otherwise a
-      // distant lake gets the fog of its own bed and reads too hazy.
-      color = applyAerial(color, rd, h.liqT);
     }
   }
 

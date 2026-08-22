@@ -270,6 +270,9 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
 
     if (m.value("wanders", false)) d.gpu.flags |= kMatFlagWander;
     if (m.value("opaque", false)) d.gpu.flags |= kMatFlagOpaque;
+    // Soft vegetation: bodies move through it. Collision only — the cell stays
+    // a solid for the CA, the brush, fire and the renderer. See kMatFlagPassable.
+    if (m.value("passable", false)) d.gpu.flags |= kMatFlagPassable;
 
     auto colors = m.value("colors", std::vector<std::string>{});
     if (colors.size() != 3) {
@@ -643,4 +646,17 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
   mats = std::move(m);
   reactions = std::move(r);
   return true;
+}
+
+std::vector<uint32_t> BuildCollisionClasses(const std::vector<MaterialDef>& mats) {
+  std::vector<uint32_t> classOf;
+  classOf.reserve(mats.size());
+  for (const MaterialDef& m : mats) {
+    // Passable vegetation reports as GAS so every CPU collision path — all of
+    // which already test for Solid — reads it as empty space. See the header
+    // for why this is a remap rather than a new CellKind.
+    classOf.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
+                                                       : m.gpu.klass);
+  }
+  return classOf;
 }

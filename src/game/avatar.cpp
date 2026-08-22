@@ -103,7 +103,11 @@ void PlayerAvatar::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
   classOf_.clear();
   for (const MaterialDef& m : mats) {
     densityOf_.push_back((float)m.gpu.density);
-    classOf_.push_back(m.gpu.klass);
+    // Collision class, not raw klass: passable vegetation reads as gas so the
+    // avatar's foot probe passes through reeds and kelp rather than planting
+    // on them (sim/materials.h kMatFlagPassable).
+    classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
+                                                        : m.gpu.klass);
   }
 }
 
@@ -153,6 +157,12 @@ void PlayerAvatar::ResolveParts() {
   parts_.legUL = sk.FindPart("legU.L");
   parts_.legUR = sk.FindPart("legU.R");
   parts_.staff = sk.FindPart("staff");
+  // Same reasoning as the parts above, for the clips the per-tick locomotion
+  // path selects between.
+  locoClips_.idle = sk.FindClip("idle");
+  locoClips_.walk = sk.FindClip("walk");
+  locoClips_.run = sk.FindClip("run");
+  locoClips_.fall = sk.FindClip("fall");
   // Re-resolve the held prop against the new def: a hot reload replaces the
   // skeleton, so a cached part index from the old one would point at whatever
   // limb happens to sit there now.
@@ -657,8 +667,12 @@ void PlayerAvatar::SetHiddenParts(const std::vector<uint8_t>& hidden) {
 
 void PlayerAvatar::PlayClip(const std::string& name) {
   if (!def_) return;
-  int ci = skel_.FindClip(name);
-  if (ci < 0) return;
+  PlayClipIndex(skel_.FindClip(name));
+}
+
+void PlayerAvatar::PlayClipIndex(int ci) {
+  if (!def_) return;
+  if (ci < 0 || ci >= (int)skel_.clips.size()) return;
   for (ClipInstance& inst : anim_.clips)
     if (inst.clip == ci && !inst.stopping) {
       // ALREADY PLAYING: leave it alone. This used to rewind to timeMs = 0,
@@ -1192,12 +1206,23 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // rotating `rot` alone swings the head about the neck rather than about the
   // model origin. The springs directly above rely on the same property.
   //
-  // MODEL-SPACE HANDEDNESS, the same trap the weapon arm documents: the
-  // .vox -> engine load map is (x, z, -y), which negates y and flips
-  // handedness, so model +X is the character's LEFT and +Y-positive rotation
-  // takes forward toward that left. Camera yaw is positive to the RIGHT and
-  // camera pitch positive UP, so both are negated going in. Checked with
-  // scripts/geometry.py rather than reasoned about.
+  // THE YAW SIGN COMES FROM THE BODY, NOT FROM THE MODEL AXES. This is the
+  // trap, and the first version got it backwards: `lookYaw_` is a HEADING
+  // delta (camHeading - avatarHeading, both in the rig's heading convention),
+  // not a camera yaw. The body applies its own heading as
+  // AxisAngle({0,1,0}, heading_) — so a POSITIVE heading delta must be applied
+  // to the neck the same positive way, or the head turns opposite the camera.
+  //
+  // Reasoning about it via "model +X is the character's left" is what produced
+  // the inverted version: that fact is true, and it is why the weapon arm
+  // negates X, but it does not apply here. The arm converts a WORLD-space
+  // offset into the model frame and so meets the handedness flip head-on; this
+  // composes an angle that is already expressed in the same convention the
+  // body's own yaw uses, so it needs no flip at all.
+  //
+  // Pitch is the one that does get negated: camera pitch is positive UP, and a
+  // positive rotation about model +X pitches the nose DOWN (verified with
+  // scripts/geometry.py: +90 about X takes +Z to -Y).
   {
     const auto& av = CurrentTuning().avatar;
     const float hl = av.headLookHalflife;
@@ -1243,13 +1268,13 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
             if (sk.parts[i].tag != "spine" || (int)i == def_->rootLimb) continue;
             if (i < st.partAlive.size() && !st.partAlive[i]) continue;
             st.local[i].rot = QuatNormalize(
-                Mul(st.local[i].rot, AxisAngle({0, 1, 0}, -per)));
+                Mul(st.local[i].rot, AxisAngle({0, 1, 0}, per)));
             spineTotal += per;
           }
         }
       }
       const float headYaw = lookYaw_ - spineTotal;
-      Quat look = Mul(AxisAngle({0, 1, 0}, -headYaw),
+      Quat look = Mul(AxisAngle({0, 1, 0}, headYaw),
                       AxisAngle({1, 0, 0}, -lookPitch_));
       st.local[head].rot = QuatNormalize(Mul(st.local[head].rot, look));
     }
@@ -1575,10 +1600,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // why the legs kept reading wrong on the ground after any jump or drop.
       // Landing must retire it; it is exclusive with the three locomotion
       // clips by construction (you are either on the ground or you are not).
-      const int ic = def.skel.FindClip("idle");
-      const int wc = def.skel.FindClip("walk");
-      const int rc = def.skel.FindClip("run");
-      const int fc = def.skel.FindClip("fall");
+      // Resolved once per def load in ResolveParts, not per tick — see
+      // AvatarLocoClips. This block runs on every one of PreTick's four calls a
+      // frame, and FindClip is a linear scan of std::string compares.
+      const int ic = locoClips_.idle;
+      const int wc = locoClips_.walk;
+      const int rc = locoClips_.run;
+      const int fc = locoClips_.fall;
       const int want = airborneNow ? fc : (!moving ? ic : (running ? rc : wc));
       for (ClipInstance& inst : anim_.clips) {
         if (inst.clip < 0) continue;
@@ -1588,8 +1616,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
           inst.stopping = true;
       }
     }
-    if (moving) PlayClip(running ? "run" : "walk");
-    else PlayClip("idle");
+    // Deliberately NOT `PlayClipIndex(want)`: when airborne
+    // `want` is `fall`, but this line has always started `idle` there (`moving`
+    // is false while airborne), and the airborne branch above owns starting
+    // `fall`. Keeping idle's blend alive under a jump is what stops the arms
+    // snapping on landing, so the airborne case must stay idle, not want.
+    PlayClipIndex(moving ? (running ? locoClips_.run : locoClips_.walk)
+                         : locoClips_.idle);
 
     // ---- submit kinematic targets ----
     Quat yaw = AxisAngle({0, 1, 0}, heading_);

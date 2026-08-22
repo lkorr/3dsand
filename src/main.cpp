@@ -257,10 +257,141 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // Standing over the middle looking down: the low-Fresnel angle, where
   // refraction, per-channel depth absorption and the visible bed carry it.
   render({420, 88, 452}, -1.571f, -0.75f, "screenshot_water_down.bmp");
+  // ---- SUBMERGED shots: the camera is INSIDE the lake ----
+  // These are the only views that exercise shadeSubmerged (god rays, silt,
+  // Snell's window, and the caustic web painted on the bed), and none of the
+  // above reach it: every one of them is a ray entering the water from dry
+  // air, which is a different code path entirely. The lake spans y=44 (floor)
+  // to y=68 (surface), so an eye at y=56 is comfortably mid-column with both
+  // the bed and the surface in reach.
+  //   _sub_up:    looking up at the underside of the surface — Snell's window,
+  //               the bright compressed disc of sky ringed by total internal
+  //               reflection. The single most recognisable underwater cue.
+  //   _sub_bed:   looking down/across at the lit bed — the caustic web is the
+  //               whole subject of this frame.
+  //   _sub_shaft: level and aimed toward the sun's azimuth, where the
+  //               forward-scattering phase makes the light shafts brightest.
+  render({420, 56, 420}, 0.785f, 1.20f, "screenshot_sub_up.bmp");
+  render({412, 58, 412}, 0.785f, -0.55f, "screenshot_sub_bed.bmp");
+  {
+    SkyState ss = SkyForTick(shotTun, shotTick);
+    float sunYaw = std::atan2(ss.sunDir[2], ss.sunDir[0]);
+    render({414, 54, 414}, sunYaw, 0.35f, "screenshot_sub_shaft.bmp");
+  }
+  // ---- a GENERATED pond, with its vegetation ----
+  // The authored lake above is a bare stone tub; it exercises the water and
+  // submerged shading but has no plant life, because pond flora is placed by
+  // pondAt() and the authored pools are explicitly excluded from it. This is
+  // the one shot that shows lilypads, reeds and kelp, and the one that would
+  // catch worldgen placing them somewhere absurd (floating, or on dry land).
   // Oil pond (260,300) and lava pool (220,520): the non-water liquid paths.
   // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
   // still render as a surface hit, untouched by any of the water work.
-  render({236, 80, 276}, 0.785f, -0.45f, "screenshot_oil.bmp");
+  // SUBMERGED IN OIL. The generic per-liquid profile (submergedProfile) has to
+  // be judged on a liquid that is NOT water, and oil is the far end of the
+  // range: opacity 235 against water's 90. What this frame must show is a
+  // near-blind brown-black press — visibility about a metre, no Snell window,
+  // no god rays, no silt — where the same code on water gives an 11 m view
+  // with light shafts in it. If this looks like brown water, the clarity curve
+  // is not separating them. The pool spans y=50 (floor) to y=68 (surface).
+  //
+  // Needs the window moved onto it, exactly like the pond shots at the end of
+  // this function and for the same reason: the pool centre (260,300) sits
+  // outside the origin window, and outside the window a liquid shades through
+  // the far-field cascade as flat colour with no submerged path at all. Shot
+  // from the origin window this frame is a grey slab of far-field stone.
+  {
+    world.SetWindowOrigin({260 / (int)kChunk - 8, 0, 300 / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    // The oil SURFACE, from just above it at a grazing angle. Moved inside this
+    // window-relocated block along with the submerged shot, and for the same
+    // reason: from the origin window the pool is FAR-FIELD, which shades a
+    // liquid as flat colour with no Fresnel, no reflection and no specular at
+    // all - the exact terms this frame exists to judge. Shot from out there it
+    // was a blurred grey haze.
+    //
+    // Grazing on purpose: oil's look is carried by the reflection and by a
+    // tight glint, both Fresnel-weighted, so a top-down view is the one angle
+    // where neither shows up. The camera has to sit just above the surface
+    // (y=68) and INSIDE the rim ring, which is raised to y=70 out at radius 42
+    // - anything beyond that is looking at the outside of a stone wall. The
+    // fluid disc is only 32 voxels across, so it sits close to the middle.
+    // Pitch is a compromise. Too shallow (-0.10) and the ray clears the far
+    // rim entirely and the frame is sky; too steep and the Fresnel terms
+    // vanish. -0.42 from 5 voxels up puts the far side of the 32-voxel disc
+    // across the middle of the frame while still hitting it at a glancing
+    // enough angle for the reflection and glint to read.
+    render({260 - 24, 73, 300 - 24}, 0.785f, -0.42f, "screenshot_oil.bmp");
+    render({260, 60, 300}, 0.785f, 0.10f, "screenshot_oil_sub.bmp");
+    // Restore the origin window: the lava/blood/micro shots below all assume
+    // it, and a regen here would otherwise silently relocate every one of them.
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+  }
+
+  // ---- AN OIL SLICK ON WATER: the case that SHOULD show the rainbow ----
+  // The pool shot above is oil on stone and must show NO iridescence - a deep
+  // pool has no second interface within reach of the light, so there is no film
+  // to interfere. This is the other half of that test: oil spilled onto the
+  // water lake, where floatingOnLiquid() finds water underneath and the sheen
+  // switches on. Two frames that differ only in what is UNDER the oil.
+  //
+  // Oil is density 900 against water's 1000, so the sim floats it without any
+  // help here; the ops just place it at the surface and let it spread.
+  {
+    const int kLx = 420, kLz = 420, kSurf = 68;   // authored lake, surface y=68
+    world.SetWindowOrigin({kLx / (int)kChunk - 8, 0, kLz / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> slick;
+    // A disc of oil laid ON the water surface. Deterministic, no rand(), like
+    // every other look shot.
+    for (int dx = -26; dx <= 26; dx++)
+      for (int dz = -26; dz <= 26; dz++) {
+        if (dx * dx + dz * dz > 26 * 26) continue;
+        // ABOVE the surface, not AT it. Writing into the surface cell itself
+        // replaces scattered water voxels with oil and leaves the rest water,
+        // which at a grazing angle reads as a hard 1:1 checkerboard of two
+        // very differently shaded liquids rather than as a slick. Dropped from
+        // one voxel up, the oil settles into a continuous layer ON the water -
+        // which is also the only configuration floatingOnLiquid() should fire
+        // on, so it is the honest test.
+        IVec3 c{kLx + dx, kSurf + 1, kLz + dz};
+        if (!world.CellInWindow(c)) continue;
+        // Same word rules as a brush paint: liquid born full, unstamped.
+        uint32_t word = PackVoxNew(kMatOil, 7u);
+        slick.push_back({World::SlotCellIndex(c), word});
+      }
+    // Long settle: the layer has to spread and level before it reads as one.
+    for (uint32_t t = 1; t <= 200; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 t == 1 ? slick : std::vector<CellOp>{}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    // Grazing, like the pool shot, since the sheen is Fresnel-weighted.
+    // Inside the slick, not outside it: the disc is radius 26 and a camera 40
+    // voxels out looks straight past it at open water.
+    render({(float)(kLx - 14), (float)(kSurf + 4), (float)(kLz - 14)}, 0.785f,
+           -0.16f, "screenshot_oil_slick.bmp");
+
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+  }
   // Lava pool (220,520), surface y=64, rim y=66: close and low, the angle
   // where crust structure and the glow from the cracks have to carry the look.
   render({196, 74, 496}, 0.785f, -0.30f, "screenshot_lava.bmp");
@@ -288,8 +419,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       int oy = ((i * 29) % 3);
       IVec3 c{gx + ox * 2, gh + 1 + oy, gz + oz * 2};
       if (!world.CellInWindow(c)) continue;
-      // same word rules as a brush paint: liquid born full, stamp 0xFF
-      uint32_t word = (kMatLava & 0xFFFu) | (7u << 12) | (0xFFu << 16);
+      // same word rules as a brush paint: liquid born full, unstamped
+      uint32_t word = PackVoxNew(kMatLava, 7u);
       spatter.push_back({World::SlotCellIndex(c), word});
     }
     for (uint32_t t = 121; t <= 124; t++)
@@ -320,8 +451,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       IVec3 c{x, y, z};
       if (!world.CellInWindow(c)) return;
       uint32_t state = (mat == kMatAir) ? 0u : 7u;  // liquids are born full
-      gore.push_back({World::SlotCellIndex(c),
-                      (mat & 0xFFFu) | (state << 12) | (0xFFu << 16)});
+      gore.push_back({World::SlotCellIndex(c), PackVoxNew(mat, state)});
     };
     // A stone basin holding a pool: the "still pool" end of the blend, and the
     // surface that the surrounding stone gets stained by.
@@ -404,8 +534,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         else if (roll < 68u) { mat = kMatFlowerDaisy; }
         else if (roll < 72u) { mat = kMatFoliageBush; }
         else { continue; }  // bare ground between the tufts
-        // Same word rules as a brush paint on a solid: state 0, stamp 0xFF.
-        flora.push_back({World::SlotCellIndex(c), (mat & 0xFFFu) | (0xFFu << 16)});
+        // Same word rules as a brush paint on a solid: state 0, unstamped.
+        flora.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
       }
     }
     for (uint32_t t = 133; t <= 136; t++)
@@ -426,6 +556,63 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // near/far handoff is visible as a single image rather than two shots.
     render({(float)(gx - 60), (float)(mh + 30), (float)(gz - 60)}, 0.785f, -0.30f,
            "screenshot_micro_far.bmp");
+  }
+
+  // ---- a GENERATED pond, with its vegetation ----
+  // LAST on purpose: this block MOVES THE RESIDENCY WINDOW and regenerates the
+  // world, so anything shot after it would be looking at a different region.
+  //
+  // The authored lake shot earlier is a bare stone tub — it exercises the water
+  // and submerged shading but has no plant life, because pond flora is placed
+  // by pondAt() and the authored pools are explicitly excluded from it. This is
+  // the only shot that shows lilypads, reeds and kelp, and the one that would
+  // catch worldgen putting them somewhere absurd (floating, or on dry land).
+  //
+  // WHY THE WINDOW HAS TO MOVE: every pond site is deliberately outside the
+  // spawn keep-out box (-44..264), so no generated pond can fall inside the
+  // residency window while that window sits at the origin. Outside the window
+  // a lake shades through the FAR-FIELD cascade, which paints liquids as flat
+  // colour with no Fresnel, no refraction and no visible bed — from the origin
+  // window a pond is a flat blue disc that tells you nothing. So re-centre on
+  // it and regenerate. Chunk units, min corner, 16 chunks to a 256-voxel window.
+  {
+    // Pond at (258,-235) radius 109 for kDefaultSeed, from pondAt's tile hash.
+    // A pond is now up to radius 127, so the widest ones no longer fit inside
+    // the 256-voxel window with any margin — centring the window on the pond
+    // puts its far shore right at the window edge. That is fine for a look
+    // shot (the near half is what these frames are about) but it is why the
+    // camera sits close to the middle rather than back on the bank.
+    const int kPx = 258, kPz = -235;
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 60; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+
+    // Anchor to terrain OUTSIDE the bowl (the rim), not the centre —
+    // TerrainHeight in the middle of a pond reports the carved floor, 2.6 m
+    // down, and a camera placed relative to that sits underground.
+    // Offsets scale with the pond: these were sized for the old radius-52
+    // bowl and a doubled pond puts the far shore out of frame at those
+    // distances. kOff sits just outside the rim of this pond.
+    const int kR = 109, kOff = kR + 22;
+    int rim = World::TerrainHeight(kPx + kOff, kPz + kOff, kDefaultSeed);
+    // From off the +x/+z side looking back at the centre: atan2(-1,-1) =
+    // -135 degrees. The pad-strewn surface, the reed fringe and the shore.
+    render({(float)(kPx + kOff), (float)(rim + 26), (float)(kPz + kOff)},
+           -2.356f, -0.24f, "screenshot_pond.bmp");
+    // Straight down over the centre: the framing-independent check that the
+    // bowl, the lilypad scatter and the plant density are what worldgen
+    // intended, without depending on getting an eye-level camera right.
+    render({(float)kPx, (float)(rim + 118), (float)kPz}, 0.785f, -1.50f,
+           "screenshot_pond_top.bmp");
+    // INSIDE the pond, under the waterline: kelp silhouettes, the caustic web
+    // on the bed and the light shafts all have to read at once. The surface
+    // sits 2 under the lowest rim sample, the centre TUNE_POND_DEPTH below it.
+    render({(float)(kPx - 30), (float)(rim - 10), (float)(kPz - 30)}, 0.785f,
+           0.04f, "screenshot_pond_sub.bmp");
   }
   return 0;
 }
@@ -966,9 +1153,10 @@ int main(int argc, char** argv) {
     ui.materialColors.push_back(m.gpu.color0);
   }
 
-  // material class LUT for the player's mirror queries
-  std::vector<uint32_t> classOf;
-  for (auto& m : mats) classOf.push_back(m.gpu.klass);
+  // Material COLLISION class LUT for the player's mirror queries. Not raw
+  // klass: BuildCollisionClasses remaps passable vegetation to gas so the
+  // capsule sweep moves through reeds and kelp (sim/materials.h).
+  std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
 
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
 
@@ -1360,8 +1548,7 @@ int main(int argc, char** argv) {
         ui.mobNames.clear();
         for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
         if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
-        classOf.clear();
-        for (auto& m : mats) classOf.push_back(m.gpu.klass);
+        classOf = BuildCollisionClasses(mats);
         ui.materialNames.clear();
         ui.materialColors.clear();
         for (auto& m : mats) {
@@ -1771,82 +1958,16 @@ int main(int argc, char** argv) {
         // so h = pi/2 - yaw. Getting this wrong makes the avatar face 90
         // degrees off its travel direction.
         const float camHeading = 1.5707963f - cam.yaw;
-        float wantHeading = camHeading;
-        if (camMode != CameraMode::First) {
-          Vec3 v{player.vel.x, 0, player.vel.z};
-          float sp = v.len() * kVoxelMeters;   // voxels/s -> m/s
-          if (sp > av.turnMinSpeed) wantHeading = std::atan2(v.x, v.z);
-          else wantHeading = avatarHeading;    // too slow: hold, don't spin
-        }
-        // Shortest-arc turn toward the goal, rate-limited.
-        float d = wantHeading - avatarHeading;
-        while (d > 3.14159265f) d -= 6.2831853f;
-        while (d < -3.14159265f) d += 6.2831853f;
-
-        // THE NECK ABSORBS THE FIRST 70 DEGREES.
-        //
-        // Turning the whole body the instant the mouse moves is what makes a
-        // character read as a turret: every glance pivots the feet, and in
-        // first person it also drags the arms (and a held sword) across the
-        // screen for a look you only meant with your eyes. Real bodies do it
-        // the other way round — the head leads, and the body is recruited only
-        // once the neck runs out.
-        //
-        // So the body's goal is not "face the camera", it is "keep the camera
-        // within headLookYaw of my facing". Inside the cone the requested turn
-        // is dropped to zero and the head takes all of it (PlayerAvatar::
-        // SetLook, fed below); outside, only the EXCESS is requested, so the
-        // body follows exactly as far as it must and the head sits pinned at
-        // its stop for the rest of the sweep.
-        //
-        // Stated as a geometric constraint rather than as an enter/exit state,
-        // which is what keeps it from chattering at the boundary: there is no
-        // edge to cross twice, just a residual that is zero inside the cone.
-        //
-        // BOTH MODES GET THE CONE, and third person needs it for a reason that
-        // is not obvious: movement is CAMERA-RELATIVE, so walking forward makes
-        // the travel direction identical to the camera heading. The body then
-        // chases the camera through `wantHeading` and the head-body offset
-        // collapses to zero — a character who never glances at anything while
-        // moving, which is precisely when you most want them to. Applying the
-        // residual here lets the body lag the camera by up to the cone while
-        // walking, and the head takes up that lag.
-        //
-        // Standing still, `wantHeading` is already pinned to `avatarHeading`
-        // one block up, so `d` is 0 and this changes nothing — the hold is the
-        // existing anti-spin rule and the head does all the work.
-        const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
-        if (headCone > 1e-3f) {
-          if (d > headCone) d -= headCone;
-          else if (d < -headCone) d += headCone;
-          else d = 0.0f;
-        }
-        // FIRST PERSON EASES ON A SHORT HALF-LIFE, NOT ON turnRate.
-        //
-        // The third-person rate limit exists so the body pivots on its feet
-        // instead of snapping to face its travel direction, and applying that
-        // same 12 rad/s limit in first person is wrong for the reason it always
-        // was: the torso ends up yawed away from the view for most of a fast
-        // mouse turn, with the arms welded to it, hanging off one side of the
-        // screen. But snapping outright is not right either — the arms ARE
-        // on-screen, so an instant yaw step moves them across the view in a
-        // hard jump every tick you turn, which is a visible part of the "hands
-        // move like crazy" report.
-        //
-        // A half-life is the right shape for this where a rate limit is not: it
-        // is proportional, so a small turn is followed almost exactly (no
-        // perceptible lag) while a fast flick is smeared over a few ticks
-        // instead of stepping. Set the knob to 0 to get the old hard snap back.
-        if (camMode == CameraMode::First) {
-          const float hl = av.firstPersonTurnHalflife;
-          if (hl > 1e-4f)
-            avatarHeading += d * (1.0f - std::pow(0.5f, kTickDt / hl));
-          else
-            avatarHeading = wantHeading;
-        } else {
-          float maxStep = av.turnRate * kTickDt;
-          avatarHeading += std::clamp(d, -maxStep, maxStep);
-        }
+        // WHERE THE BODY FACES is a policy, not a rig property, and it now
+        // lives in ResolveAvatarHeading (game/thirdperson.h) rather than
+        // inline here. It was moved because both bugs it has had — an inverted
+        // glance, and a dead zone with no restoring term that froze the arms
+        // off-view — were invisible to every gate, for the simple reason that
+        // the policy only ever ran inside this render loop. It is pure, so the
+        // selftest can drive it directly.
+        avatarHeading = ResolveAvatarHeading(
+            camMode, camHeading, avatarHeading,
+            Vec3{player.vel.x, 0, player.vel.z}, kTickDt);
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:

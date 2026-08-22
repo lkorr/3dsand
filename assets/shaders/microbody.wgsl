@@ -148,11 +148,13 @@ fn vs(@builtin(vertex_index) vi : u32,
   return out;
 }
 
+// One micro voxel: bits 0..7 material id, bits 8..15 art colour slot (0 = use
+// the material's own colour). Two per word — see MicroBodyModelGpu::base.
 fn poolVoxAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
   let idx = u32((p.z * dims.y + p.y) * dims.x + p.x);
-  let w = base + (idx >> 2u);
+  let w = base + (idx >> 1u);
   if (w >= MICRO_BODY_POOL_WORDS) { return 0u; }  // defensive
-  return (pool[w] >> ((idx & 3u) * 8u)) & 0xFFu;
+  return (pool[w] >> ((idx & 1u) * 16u)) & 0xFFFFu;
 }
 
 struct FSOut {
@@ -219,6 +221,7 @@ fn fs(in : VSOut) -> FSOut {
   }
   var tCur = tEnter;
   var hitMat = 0u;
+  var hitArt = 0u;   // art colour slot of the hit voxel, 0 = material colour
   // HARD CAP (rule 2: bound every emergent process). 3*maxDim covers a full
   // diagonal traverse of the brick; +4 is slack for the entry rounding above.
   // No data-dependent loop bound anywhere in this shader.
@@ -228,8 +231,9 @@ fn fs(in : VSOut) -> FSOut {
     if (c.x < 0 || c.y < 0 || c.z < 0 ||
         c.x >= dims.x || c.y >= dims.y || c.z >= dims.z) { break; }
     let v = poolVoxAt(in.base, dims, c);
-    if (v != 0u) {
-      hitMat = v;
+    if ((v & 0xFFu) != 0u) {
+      hitMat = v & 0xFFu;
+      hitArt = (v >> 8u) & 0xFFu;
       break;
     }
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
@@ -250,10 +254,22 @@ fn fs(in : VSOut) -> FSOut {
   let n = quatRotate(in.quat, nLocal);
 
   let mat = materials[hitMat];
-  // Palette variant keyed on the micro CELL, not on the instance: a limb's
-  // texture must not crawl when it rotates, and it must be identical on every
-  // machine (this is render-only, but a replay should still look the same).
-  let albedo = paletteColor(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
+  // A painted voxel shows its ART colour; an unpainted one falls back to the
+  // material's 3-variant palette, keyed on the micro CELL rather than on the
+  // instance so a limb's texture does not crawl when it rotates (and is
+  // identical on every machine — render-only, but a replay should still look
+  // the same). Art colour is what lets a creature be one material all over and
+  // still be painted; the material is what a severed limb becomes.
+  // `hitArt` is a .vox palette slot in ART_SLOT_MIN..255. The reserved
+  // material-table run is indexed from its base, so slot ART_SLOT_MIN is
+  // entry 0 — the SAME entry the cube path reaches with its 1-based art index
+  // 1 (debris.wgsl). A slot below the art range is not a colour: unpainted.
+  var albedo : vec3f;
+  if (hitArt >= ART_SLOT_MIN) {
+    albedo = unpackColor(materials[ART_PALETTE_BASE + (hitArt - ART_SLOT_MIN)].color0);
+  } else {
+    albedo = paletteColor(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
+  }
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment
   // vector, and that is the whole point of never normalizing anything: `ro/rd`

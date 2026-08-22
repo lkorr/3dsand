@@ -372,6 +372,38 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
   return true;
 }
 
+namespace {
+// The loader packs art colours as 0x00RRGGBB; the shader's unpackColor reads R
+// from bits 0..7 (RGBA8 little-endian), so the byte order flips on the way in.
+// Getting this wrong swaps red and blue, which reads as an art mistake rather
+// than a packing one — hence one definition, used by both writers below.
+inline uint32_t ArtRgbToGpu(uint32_t rgb) {
+  return ((rgb & 0xFFu) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu) |
+         0xFF000000u;
+}
+}  // namespace
+
+// Write the cached art palette into the reserved run of a material table.
+void Simulation::ApplyArtPalette(std::vector<MaterialGpu>& table) const {
+  for (size_t i = 0; i < artPalette_.size() && i < kArtPaletteSlotsGpu; i++)
+    table[kArtPaletteBaseGpu + i].color0 = ArtRgbToGpu(artPalette_[i]);
+}
+
+void Simulation::SetArtPalette(const wgpu::Queue& queue,
+                               const std::vector<uint32_t>& rgb) {
+  artPalette_ = rgb;
+  if (artPalette_.size() > kArtPaletteSlotsGpu)
+    artPalette_.resize(kArtPaletteSlotsGpu);
+  if (artPalette_.empty()) return;
+  // Patch just the reserved run rather than re-uploading all 4096 entries: the
+  // rest of the table is unchanged and may be mid-frame on the GPU.
+  std::vector<MaterialGpu> run(kArtPaletteSlotsGpu, MaterialGpu{});
+  for (size_t i = 0; i < artPalette_.size(); i++)
+    run[i].color0 = ArtRgbToGpu(artPalette_[i]);
+  queue.WriteBuffer(materialBuf_, (uint64_t)kArtPaletteBaseGpu * sizeof(MaterialGpu),
+                    run.data(), run.size() * sizeof(MaterialGpu));
+}
+
 void Simulation::UploadTables(const wgpu::Queue& queue,
                               const std::vector<MaterialDef>& mats,
                               const std::vector<ReactionGpu>& reactions) {
@@ -389,6 +421,13 @@ void Simulation::UploadTables(const wgpu::Queue& queue,
     if (type == 0) continue;
     table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
   }
+
+  // Art palette, same trick one range lower (world.h). Re-applied here because
+  // this function rebuilds the WHOLE table: without it, hot-reloading
+  // materials.json would silently repaint every mob in its raw material
+  // colours until something reloaded the mob defs.
+  ApplyArtPalette(table);
+
   queue.WriteBuffer(materialBuf_, 0, table.data(), table.size() * sizeof(MaterialGpu));
 
   std::vector<ReactionGpu> rtable(kMaxReactions, ReactionGpu{});
@@ -426,6 +465,11 @@ void Simulation::UploadMicroBodies(const wgpu::Queue& queue,
     size_t words = std::min<size_t>(set.pool.size(), kMicroBodyPoolWordsWorld);
     queue.WriteBuffer(mbPoolBuf_, 0, set.pool.data(), words * 4);
   }
+
+  // The skin's art colours ride the same upload the bricks do: they are
+  // published together or a painted brick indexes colours that are not there
+  // yet. Cheap and idempotent when nothing painted (SetArtPalette early-outs).
+  SetArtPalette(queue, set.artColors);
 }
 
 bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {

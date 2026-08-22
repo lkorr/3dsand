@@ -156,6 +156,97 @@ TP_F(render, iceSpec, TUNE_ICE_SPEC, 0.55f)
 TP_F(render, iceDepthMax, TUNE_ICE_DEPTH_MAX, 3.0f)
 TP_F(render, iceReflectMin, TUNE_ICE_REFLECT_MIN, 0.12f)
 
+// ---- submerged view (raymarch.wgsl shadeSubmerged / godRays / bedCaustic) ----
+// These only ever apply when the ray is INSIDE a liquid, which above water is
+// never — every term below is gated on that, so a dry frame pays nothing.
+// Underwater absorption is deliberately its OWN set rather than reusing
+// waterAbsorb: looking THROUGH a lake from outside wants a strong red kill
+// (that is the depth cue), but living inside it at that strength leaves you in
+// a flat blue void with no visible distance at all. Underwater wants a longer
+// visibility range and a stronger scatter floor.
+TP_V3(render, subAbsorb, TUNE_SUB_ABSORB, 0.42f, 0.11f, 0.075f)
+TP_V3(render, subScatter, TUNE_SUB_SCATTER, 0.055f, 0.19f, 0.24f)
+// In-scatter strength and how fast the volume tint saturates with distance.
+TP_F(render, subScatterGain, TUNE_SUB_SCATTER_GAIN, 1.0f)
+// Distance (metres) at which the far view has fully faded to the scatter
+// colour. This is the underwater equivalent of fog distance and it is the
+// single knob that says "murky pond" vs "clear tropical water".
+TP_F(render, subVisibility, TUNE_SUB_VISIBILITY, 11.0f)
+// Screen-edge darkening while submerged — a cheap, strong "you are in a
+// medium" cue that costs one dot product.
+TP_F(render, subVignette, TUNE_SUB_VIGNETTE, 0.34f)
+// Snell's-window brightening: looking UP from under water compresses the whole
+// sky into a ~97 degree cone. Outside it the surface mirrors the murk.
+TP_F(render, subSnellGain, TUNE_SUB_SNELL_GAIN, 1.25f)
+
+// ---- caustics cast onto submerged surfaces ----
+// The existing causticGain/Cap drive the caustic seen looking DOWN through a
+// surface from outside. These drive the caustic painted on a lit voxel face
+// while the camera is under the water, which is a different projection (from
+// the surface above the SURFACE point, not the bed point) and wants its own
+// strength or one of the two views always looks wrong.
+TP_F(render, bedCausticGain, TUNE_BED_CAUSTIC_GAIN, 2.4f)
+TP_F(render, bedCausticCap, TUNE_BED_CAUSTIC_CAP, 1.5f)
+// Metres of water above a surface past which its caustics have washed out.
+TP_F(render, bedCausticFade, TUNE_BED_CAUSTIC_FADE, 6.0f)
+// Sharpness of the caustic web. Higher = thinner, brighter filaments.
+TP_F(render, bedCausticSharp, TUNE_BED_CAUSTIC_SHARP, 2.2f)
+
+// ---- volumetric light shafts (god rays) ----
+// Ray-marched with a real occlusion test per sample, so shafts break correctly
+// around the shore and any overhang. Sample count is a direct frame-time
+// multiplier on submerged pixels ONLY.
+TP_I(render, godRaySteps, TUNE_GODRAY_STEPS, 14)
+TP_F(render, godRayStrength, TUNE_GODRAY_STRENGTH, 0.55f)
+// Henyey-Greenstein forward-scattering asymmetry: shafts are much brighter
+// looking toward the sun than away from it, which is what makes them read as
+// beams rather than as uniform haze.
+TP_F(render, godRayAniso, TUNE_GODRAY_ANISO, 0.62f)
+// Metres the shaft march covers. Beyond this the scatter has saturated anyway.
+TP_F(render, godRayRange, TUNE_GODRAY_RANGE, 14.0f)
+// Steps the per-sample occlusion ray gets. Short on purpose: it only has to
+// find the surface or a nearby blocker, not resolve distant geometry.
+TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 20)
+
+// ---- drifting particulate (silt) ----
+// Render-only motes in the water volume. This is what gives the shafts
+// something to catch, and it is most of why footage reads as underwater.
+TP_F(render, siltDensity, TUNE_SILT_DENSITY, 0.55f)
+TP_F(render, siltBrightness, TUNE_SILT_BRIGHTNESS, 0.5f)
+TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f)
+
+// ---- surface-from-below ----
+// How much the underside of the water surface ripples the view of the sky.
+TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f)
+
+// ---- the generic per-liquid submerged profile (submergedProfile) ----
+// These shape the MAPPING from a liquid's authored opacity + palette to its
+// submerged look, so every liquid — including ones added later — gets a
+// complete treatment with no shader change. The subAbsorb/subScatter/
+// subVisibility values above remain WATER'S refinement, blended in at the
+// clear end of the curve rather than selected by a material test.
+//
+// Visibility in a fully opaque liquid. Being inside oil should be
+// claustrophobic — this is the "arm's length" end of the range.
+TP_F(render, subMurkVis, TUNE_SUB_MURK_VIS, 0.55f)
+// Exponent applied to clarity for the VISIBILITY mapping only. Separate from
+// the clarity curve itself because one shared exponent cannot both collapse
+// oil to arm's length and keep water classified as clear (see submergedProfile).
+TP_F(render, subVisCurve, TUNE_SUB_VIS_CURVE, 2.2f)
+// Opacity -> per-metre absorption gain for the derived (non-clear) case.
+TP_F(render, subAbsorbGain, TUNE_SUB_ABSORB_GAIN, 7.0f)
+// Absorption floor, so even a notionally clear liquid is not a vacuum.
+TP_F(render, subAbsorbFloor, TUNE_SUB_ABSORB_FLOOR, 0.05f)
+// How much of its own colour a liquid scatters back at the eye, at the dense
+// and clear ends of the clarity curve. A dense liquid IS what you see.
+TP_F(render, subScatterDense, TUNE_SUB_SCATTER_DENSE, 0.42f)
+TP_F(render, subScatterClear, TUNE_SUB_SCATTER_CLEAR, 0.16f)
+// Clarity band over which a liquid crosses from the derived profile onto
+// water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.16.
+// Widening this band makes more liquids inherit water's look.
+TP_F(render, subClearLow, TUNE_SUB_CLEAR_LOW, 0.62f)
+TP_F(render, subClearHigh, TUNE_SUB_CLEAR_HIGH, 0.82f)
+
 // ---- blood / viscous liquids ----
 TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.03f)
 TP_F(render, bloodGraze, TUNE_BLOOD_GRAZE, 0.55f)
@@ -242,12 +333,183 @@ TP_U(worldgen, treeChancePine, TUNE_TREE_CHANCE_PINE, 70)
 TP_U(worldgen, treeChanceMeadow, TUNE_TREE_CHANCE_MEADOW, 22)
 TP_U(worldgen, treeChanceDesert, TUNE_TREE_CHANCE_DESERT, 6)
 TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
-TP_I(worldgen, pondTile, TUNE_POND_TILE, 224)
+TP_I(worldgen, pondTile, TUNE_POND_TILE, 448)
 TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
-TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 20)
-TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 17)
+TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 68)
+TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 60)
+// Bowl depth in VOXELS at the pond centre, tapering to pondDepthRim at the
+// edge. At kVoxelMeters 0.10 the player capsule is 17 voxels tall, so the old
+// 8-voxel centre depth was 0.8 m — ankle deep, and it made "swim in a pond"
+// impossible anywhere except the one authored lake. 26 puts the centre at
+// 2.6 m, comfortably over the player's head, while the rim stays shallow
+// enough to wade in from.
+TP_I(worldgen, pondDepth, TUNE_POND_DEPTH, 26)
+TP_I(worldgen, pondDepthRim, TUNE_POND_DEPTH_RIM, 3)
+// 1-in-N chance a surface cell over deep enough water carries a lilypad, and
+// 1-in-N that a pad carries a blossom.
+TP_U(worldgen, lilyChance, TUNE_LILY_CHANCE, 22)
+TP_U(worldgen, lilyFlowerChance, TUNE_LILY_FLOWER_CHANCE, 5)
+// 1-in-N chance a shallow-margin column grows a reed clump, and how tall the
+// clump runs (voxels above the bed, so a reed in deeper water is still cut off
+// at the surface by the emergent check in genCell).
+TP_U(worldgen, reedChance, TUNE_REED_CHANCE, 130)
+TP_I(worldgen, reedHeight, TUNE_REED_HEIGHT, 16)
+// 1-in-N chance a deeper bed column grows kelp, and its height in voxels.
+TP_U(worldgen, kelpChance, TUNE_KELP_CHANCE, 120)
+TP_I(worldgen, kelpHeight, TUNE_KELP_HEIGHT, 10)
+// ---- vines / climbers / hanging moss (worldgen agent B) ----
+// A hanging vine is a CURTAIN under a canopy: one roll per COLUMN decides
+// whether that column hosts a strand, and the strand then runs from the canopy
+// underside down by a jittered length. 1-in-N over the canopy footprint, so a
+// small number here furs the whole forest — 26 puts a strand every ~5 voxels
+// of canopy, which reads as a draped tree rather than as a hanging curtain
+// wall. Great oaks halve it (they are the ancient ones).
+TP_U(worldgen, vineChance, TUNE_VINE_CHANCE, 26)
+// Strand length in voxels, min + a 0..span jitter. The jitter is what gives
+// the curtain a ragged hem instead of a machine-cut edge; keep the span
+// comparable to the min or every strand ends at visibly the same height.
+TP_I(worldgen, vineLenMin, TUNE_VINE_LEN_MIN, 10)
+TP_I(worldgen, vineLenSpan, TUNE_VINE_LEN_SPAN, 26)
+// 1-in-N vine strands are a FLOWERING creeper, which then blooms every 7th
+// cell down its length. Gated on the same column roll as the vine, so a
+// blossom can only ever appear on a column that actually grew one.
+TP_U(worldgen, creeperFlowerChance, TUNE_CREEPER_FLOWER_CHANCE, 9)
+// Spanish-moss beards on the great oaks and birches: 1-in-N columns, and a
+// short length, because moss is a fuzz on the structure rather than a strand
+// hanging off it. Longer than ~14 and it stops reading as moss.
+TP_U(worldgen, mossChance, TUNE_MOSS_CHANCE, 14)
+TP_I(worldgen, mossLenMin, TUNE_MOSS_LEN_MIN, 4)
+TP_I(worldgen, mossLenSpan, TUNE_MOSS_LEN_SPAN, 9)
+// Ivy climbing a trunk: 1-in-N of the cells on the bole's outer shell, gated
+// to a couple of angular ropes rather than sheathing the trunk.
+TP_U(worldgen, ivyChance, TUNE_IVY_CHANCE, 2)
+// How fast the ivy ropes spiral around the bole, in 1/16 of a 256-step turn
+// per voxel of height. 0 = straight vertical stripes.
+TP_I(worldgen, ivyTwist, TUNE_IVY_TWIST, 5)
+// Ivy coverage on the ARENA and RUIN stone walls, 1..8. Higher is denser;
+// coverage always falls off toward the top of the wall so the coping stays
+// clear and the creeper reads as having climbed rather than been painted.
+TP_U(worldgen, wallIvyDensity, TUNE_WALL_IVY_DENSITY, 3)
+// ---- shoreline: the wet fringe outside a pond ----
+// RESTORED by agent E: these ten rows were dropped from this file during a
+// concurrent rollback while their declarations stayed in tuning.h and their
+// TUNE_* names stayed referenced by worldgen.wgsl. That combination passes
+// check_invariants' .h side and still fails tint with "unresolved value
+// TUNE_SHORE_BAND", which invalidates the worldgen pipeline and makes EVERY
+// gate fail as a determinism regression. Defaults below are read straight off
+// the declarations in tuning.h so they cannot disagree with it.
+TP_I(worldgen, shoreBand, TUNE_SHORE_BAND, 24)
+TP_I(worldgen, shoreMudWidth, TUNE_SHORE_MUD_WIDTH, 10)
+// How far ABOVE the waterline a column may stand and still count as shore, in
+// voxels. The most load-bearing knob in the feature: pondSurface is
+// min(rim) - 2, so most of a rim stands well above the water, and a fringe
+// defined by radius alone paints marsh up whatever hillside abuts the disc.
+// Cutting on height instead puts the reed beds in the shallow bays and leaves
+// the steep sides as dry bank. It moves coverage a long way — at the default
+// pond it keeps 5% of the raw band at 4 and 99% at 24.
+TP_I(worldgen, shoreLift, TUNE_SHORE_LIFT, 12)
+TP_U(worldgen, shoreCattailChance, TUNE_SHORE_CATTAIL_CHANCE, 12)
+TP_I(worldgen, shoreCattailReach, TUNE_SHORE_CATTAIL_REACH, 9)
+TP_I(worldgen, shoreCattailHeight, TUNE_SHORE_CATTAIL_HEIGHT, 20)
+TP_U(worldgen, shoreSedgeChance, TUNE_SHORE_SEDGE_CHANCE, 4)
+TP_U(worldgen, shoreHorsetailChance, TUNE_SHORE_HORSETAIL_CHANCE, 10)
+TP_I(worldgen, shoreHorsetailHeight, TUNE_SHORE_HORSETAIL_HEIGHT, 9)
+TP_U(worldgen, shoreIrisChance, TUNE_SHORE_IRIS_CHANCE, 34)
+TP_U(worldgen, shoreMossChance, TUNE_SHORE_MOSS_CHANCE, 3)
+// ---- desert / pine highland / alpine ground cover (worldgen agent E) ----
+// The three biomes that generated bare. All of these are 1-in-N per column
+// inside the relevant mask, or a percentage where noted, and every one of them
+// places INERT material in a single voxel above the surface (rule 2).
+//
+// Cacti. `cactusChance` is a PERCENT per 2.5 m tile, not a 1-in-N, matching
+// treeChance* above — a cactus is placed by the same per-tile scheme a tree is.
+// `saguaroFraction` is the percentage of those that are tall columns rather
+// than ground-level barrels; the columns are landmarks, so they have to stay
+// occasional or the desert reads as a plantation.
+TP_U(worldgen, cactusChance, TUNE_CACTUS_CHANCE, 26)
+TP_U(worldgen, saguaroFraction, TUNE_SAGUARO_FRACTION, 22)
+// Desert ground cover, 1-in-N per column. Tussock is the common one — it is
+// what stops bare sand reading as a texture — and scrub is the woody accent.
+// Both are gated by a patch mask so the desert has bare stretches between
+// stands rather than an even sprinkle, which is what makes it read as arid.
+TP_U(worldgen, tussockChance, TUNE_TUSSOCK_CHANCE, 9)
+TP_U(worldgen, scrubChance, TUNE_SCRUB_CHANCE, 26)
+// vnoise 0..255 threshold for the desert patch mask: cover only grows where the
+// mask is above this, so the biome keeps open sand between its stands.
+TP_I(worldgen, desertPatch, TUNE_DESERT_PATCH, 130)
+// Pine-highland floor: huckleberry/juniper under the conifers, 1-in-N per
+// column inside its own patch mask.
+TP_U(worldgen, heathChance, TUNE_HEATH_CHANCE, 7)
+TP_I(worldgen, heathPatch, TUNE_HEATH_PATCH, 128)
+// Alpine cushion above TREELINE, 1-in-N per column. DELIBERATELY the sparsest
+// number in this file: the snowline is meant to read as harsh, and a ridge
+// planted at forest-floor density says the opposite. Raising this is the one
+// knob that can undo the whole intent of the alpine band.
+TP_U(worldgen, alpineChance, TUNE_ALPINE_CHANCE, 40)
+// RESTORED by agent E along with the shore rows above: these three were also
+// lost from this file during the concurrent rollback while their declarations
+// stayed in tuning.h, which is the combination that fails tint at
+// "unresolved value TUNE_CAVE_THRESHOLD1" rather than at compile time.
 TP_U(worldgen, ruinChance, TUNE_RUIN_CHANCE, 5)
 TP_U(worldgen, caveThreshold1, TUNE_CAVE_THRESHOLD1, 150)
 TP_U(worldgen, caveThreshold2, TUNE_CAVE_THRESHOLD2, 148)
+
+// ---- oil / petroleum-like viscous liquids (shadeViscous) ----
+// Oil and blood share the viscous SURFACE path but look nothing alike, and the
+// blood constants applied to oil rendered the pool as flat beige mud. These are
+// the oil end of every term that differs; oiliness() derives the blend from the
+// material's own authored palette saturation, so no material ids are involved
+// and any petroleum-like liquid gets the look for free.
+//
+// Saturation band separating a biological fluid from a petroleum one. Blood's
+// authored colour0 is 0.85 saturated, oil's is 0.46 - pigment suspensions are
+// strongly chromatic, petroleum is a near-neutral brown-black.
+TP_F(render, oilSatLow, TUNE_OIL_SAT_LOW, 0.5f)
+TP_F(render, oilSatHigh, TUNE_OIL_SAT_HIGH, 0.78f)
+// Head-on and grazing reflectance. Oil's IOR is ~1.47 against water's 1.33, so
+// F0 is roughly double, and unlike blood it really does approach a mirror at
+// the horizon - that hard bright rim is the look, not an artifact.
+TP_F(render, oilF0, TUNE_OIL_F0, 0.043f)
+TP_F(render, oilGraze, TUNE_OIL_GRAZE, 0.97f)
+// Specular exponent. Much tighter than blood's: a smooth film gives a small
+// hard glint where a rough suspension gives a broad soft one, and that
+// narrowness is most of what reads as "glossy" rather than "damp".
+TP_F(render, oilGloss, TUNE_OIL_GLOSS, 620.0f)
+TP_F(render, oilSheen, TUNE_OIL_SHEEN, 1.6f)
+// How much the reflection is tinted by the liquid's own colour. Near zero for
+// oil: a petroleum film is a near-NEUTRAL dark mirror, so what you see in it is
+// the sky and the far bank rather than a brown wash of its own body.
+TP_F(render, oilReflectTint, TUNE_OIL_REFLECT_TINT, 0.12f)
+// How far oil's body colour is pushed toward black. Petroleum absorbs nearly
+// everything that enters it and reflects the rest off the surface, the opposite
+// of blood's bright backscatter - this is the term that kills the beige.
+TP_F(render, oilDarken, TUNE_OIL_DARKEN, 0.35f)
+// Thin-film interference: the rainbow slick. Strength, and the spatial scale of
+// the film-thickness field that sets the band spacing.
+TP_F(render, oilIridescence, TUNE_OIL_IRIDESCENCE, 0.16f)
+TP_F(render, oilFilmScale, TUNE_OIL_FILM_SCALE, 1.1f)
+// How readily a density difference counts as "floating on". The iridescent
+// sheen only appears where oil lies on a DENSER liquid (floatingOnLiquid);
+// this scales how much denser the layer below has to be before it reads as a
+// real boundary rather than a mixture. Oil 900 on water 1000 is a ratio of
+// 0.111, so at 9.0 that saturates immediately.
+TP_F(render, oilFloatSens, TUNE_OIL_FLOAT_SENS, 9.0f)
+// Width of the silhouette-softening band for oil, against blood's 0.28. Blood
+// can afford a wide feather because its body colour reads through the blend;
+// oil's body is nearly black by design, so the same fade leaves a droplet with
+// nothing to hold up against the background and it becomes a smear of the
+// scene behind it. This is most of why oil looked see-through.
+TP_F(render, oilEdgeBand, TUNE_OIL_EDGE_BAND, 0.07f)
+// How much plain sky reflection an UNPOOLED oil surface returns. A droplet is
+// a tiny curved mirror scattering the sky in every direction, so far less
+// reaches the eye than off a flat pool; at 1.0 a grazing droplet returns
+// full-brightness sky and reads as a hole in the world.
+TP_F(render, oilDropReflect, TUNE_OIL_DROP_REFLECT, 0.3f)
+
+// Faint directional glow toward the surface when submerged in a medium too
+// dense to see through. Without it a dense liquid is a featureless field of
+// colour with no sense of up and nothing in motion - physically honest, but it
+// reads as a broken shader rather than as being under the oil.
+TP_F(render, subMurkGlow, TUNE_SUB_MURK_GLOW, 2.2f)
 
 // clang-format on

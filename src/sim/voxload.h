@@ -22,9 +22,19 @@
 // One voxel in MODEL-local engine coords (min corner 0). int16, deliberately
 // wider than DebrisVoxel's int8: prefabs may be large; only mob limbs must fit
 // in a rigidbody's byte range.
+//
+// `material` and `color` are INDEPENDENT facts about the voxel, and keeping
+// them apart is the whole point: a creature is "meat" everywhere — that is
+// what the sim reacts to, what a severed limb becomes when its voxels land
+// back in the grid — while its skin is painted per voxel. Art colour never
+// reaches the world grid, so it can never affect the hash (rule 1).
+//
+// Free: the struct was already 8 bytes with `material`'s top nibble and two
+// bytes of tail padding unused, so `color` costs nothing.
 struct PrefabVoxel {
   int16_t x, y, z;
   uint16_t material;  // 12-bit material ID (== .vox palette index)
+  uint8_t color = 0;  // art palette slot, 0 = use the material's own colour
 };
 
 struct PrefabModel {
@@ -55,10 +65,26 @@ struct PrefabModel {
   std::vector<PrefabVoxel> voxels;
 };
 
+// Art colours occupy the TOP of the .vox palette, growing downward from 255,
+// while material IDs occupy the bottom. Mirrors ART_BASE/ART_TOP in
+// assets/editor/vox.js — the two must agree or a painted model loads with its
+// colours read as material IDs. See the art-colour note on PrefabVoxel.
+constexpr int kArtPaletteBase = 128;
+constexpr int kArtPaletteTop = 255;
+constexpr int kArtPaletteSlots = kArtPaletteTop - kArtPaletteBase + 1;
+inline bool IsArtPaletteIndex(int i) {
+  return i >= kArtPaletteBase && i <= kArtPaletteTop;
+}
+// The scene-graph name suffix marking a model as another model's colour layer.
+inline constexpr const char* kArtLayerSuffix = ".col";
+
 struct Prefab {
   std::string name;   // file stem
   IVec3 size{};       // overall engine-axis bounding box
   std::vector<PrefabModel> models;
+  // RGB for art palette slots, indexed by (slot - kArtPaletteBase); empty when
+  // the file painted nothing. Packed 0x00RRGGBB.
+  std::vector<uint32_t> artColors;
 };
 
 // Parse from memory (unit-testable without a GPU). materialCount gates the

@@ -356,6 +356,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "liquidDrag", p.liquidDrag, out, at);
     ReadF(*g, "liquidGravityScale", p.liquidGravityScale, out, at);
     ReadF(*g, "liquidSpeedScale", p.liquidSpeedScale, out, at);
+    ReadF(*g, "waterMantleSpeed", p.waterMantleSpeed, out, at);
+    ReadF(*g, "waterMantleTime", p.waterMantleTime, out, at);
     ReadF(*g, "halfWidth", p.halfWidth, out, at);
     ReadF(*g, "halfHeight", p.halfHeight, out, at);
     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);
@@ -419,6 +421,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     a.headLookSpine = std::clamp(a.headLookSpine, 0.0f, 1.0f);
     ReadF(*g, "headLookHalflife", a.headLookHalflife, out, at);
     a.headLookHalflife = std::clamp(a.headLookHalflife, 0.0f, 1.0f);
+    ReadF(*g, "headLookRecenterHalflife", a.headLookRecenterHalflife, out, at);
+    a.headLookRecenterHalflife =
+        std::clamp(a.headLookRecenterHalflife, 0.0f, 3.0f);
     ReadF(*g, "ikBlendHalflife", a.ikBlendHalflife, out, at);
     ReadF(*g, "airDebounce", a.airDebounce, out, at);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
@@ -890,6 +895,132 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "iceSpec", r.iceSpec, out, at);
     ReadF(*g, "iceDepthMax", r.iceDepthMax, out, at);
     ReadF(*g, "iceReflectMin", r.iceReflectMin, out, at);
+
+    // ---- submerged view ----
+    ReadV3(*g, "subAbsorb", r.subAbsorb, out, at);
+    ReadV3(*g, "subScatter", r.subScatter, out, at);
+    ReadF(*g, "subScatterGain", r.subScatterGain, out, at);
+    ReadF(*g, "subVisibility", r.subVisibility, out, at);
+    // A visibility of 0 divides by zero in the shader's fade and takes the
+    // whole submerged view to NaN, which renders as a black screen the moment
+    // the player's head goes under. Floor it well clear of that.
+    if (r.subVisibility < 0.5f) {
+      out.warnings.push_back(at + ".subVisibility < 0.5; clamped to 0.5");
+      r.subVisibility = 0.5f;
+    }
+    ReadF(*g, "subVignette", r.subVignette, out, at);
+    r.subVignette = std::clamp(r.subVignette, 0.0f, 1.0f);
+    ReadF(*g, "subSnellGain", r.subSnellGain, out, at);
+    ReadF(*g, "bedCausticGain", r.bedCausticGain, out, at);
+    ReadF(*g, "bedCausticCap", r.bedCausticCap, out, at);
+    ReadF(*g, "bedCausticFade", r.bedCausticFade, out, at);
+    if (r.bedCausticFade < 0.1f) {
+      out.warnings.push_back(at + ".bedCausticFade < 0.1; clamped to 0.1");
+      r.bedCausticFade = 0.1f;
+    }
+    ReadF(*g, "bedCausticSharp", r.bedCausticSharp, out, at);
+    r.bedCausticSharp = std::clamp(r.bedCausticSharp, 0.1f, 8.0f);
+
+    // ---- god rays ----
+    // Both step counts are a direct per-submerged-pixel frame-time multiplier
+    // (steps x shadowSteps is the real cost), so the ceilings here are a perf
+    // guard, not a taste judgement. 0 steps disables the effect cleanly.
+    ReadI(*g, "godRaySteps", r.godRaySteps, out, at);
+    if (r.godRaySteps < 0 || r.godRaySteps > 64) {
+      out.warnings.push_back(at + ".godRaySteps out of 0..64; clamped");
+      r.godRaySteps = std::clamp(r.godRaySteps, 0, 64);
+    }
+    ReadF(*g, "godRayStrength", r.godRayStrength, out, at);
+    ReadF(*g, "godRayAniso", r.godRayAniso, out, at);
+    // The Henyey-Greenstein phase function has a (1 - g^2) numerator and a
+    // denominator that goes to zero as |g| -> 1, so a g of exactly 1 is a
+    // division by zero and anything past it is not a valid phase function.
+    r.godRayAniso = std::clamp(r.godRayAniso, -0.95f, 0.95f);
+    ReadF(*g, "godRayRange", r.godRayRange, out, at);
+    if (r.godRayRange < 0.1f) {
+      out.warnings.push_back(at + ".godRayRange < 0.1; clamped to 0.1");
+      r.godRayRange = 0.1f;
+    }
+    ReadI(*g, "godRayShadowSteps", r.godRayShadowSteps, out, at);
+    if (r.godRayShadowSteps < 0 || r.godRayShadowSteps > 64) {
+      out.warnings.push_back(at + ".godRayShadowSteps out of 0..64; clamped");
+      r.godRayShadowSteps = std::clamp(r.godRayShadowSteps, 0, 64);
+    }
+
+    // ---- silt ----
+    ReadF(*g, "siltDensity", r.siltDensity, out, at);
+    r.siltDensity = std::clamp(r.siltDensity, 0.0f, 4.0f);
+    ReadF(*g, "siltBrightness", r.siltBrightness, out, at);
+    ReadF(*g, "siltDrift", r.siltDrift, out, at);
+    ReadF(*g, "subSurfaceRipple", r.subSurfaceRipple, out, at);
+
+    // ---- generic per-liquid submerged profile ----
+    ReadF(*g, "subMurkVis", r.subMurkVis, out, at);
+    // Same divide-by-zero hazard as subVisibility: visM is the denominator of
+    // the extinction term, and a zero there takes a submerged frame to NaN,
+    // which renders as a black screen the moment you go under.
+    if (r.subMurkVis < 0.05f) {
+      out.warnings.push_back(at + ".subMurkVis < 0.05; clamped to 0.05");
+      r.subMurkVis = 0.05f;
+    }
+    ReadF(*g, "subVisCurve", r.subVisCurve, out, at);
+    // pow() with a negative exponent on a clarity approaching 0 explodes to
+    // infinity; 0 would make every liquid equally visible and defeat the knob.
+    r.subVisCurve = std::clamp(r.subVisCurve, 0.05f, 8.0f);
+    ReadF(*g, "subAbsorbGain", r.subAbsorbGain, out, at);
+    r.subAbsorbGain = std::max(r.subAbsorbGain, 0.0f);
+    ReadF(*g, "subAbsorbFloor", r.subAbsorbFloor, out, at);
+    r.subAbsorbFloor = std::max(r.subAbsorbFloor, 0.0f);
+    ReadF(*g, "subScatterDense", r.subScatterDense, out, at);
+    ReadF(*g, "subScatterClear", r.subScatterClear, out, at);
+    ReadF(*g, "subClearLow", r.subClearLow, out, at);
+    ReadF(*g, "subClearHigh", r.subClearHigh, out, at);
+    // smoothstep with low >= high is undefined-ish (it degenerates to a step
+    // at best); keep a real band so the crossover onto water's coefficients
+    // stays a blend rather than a cliff.
+    if (r.subClearHigh <= r.subClearLow) {
+      out.warnings.push_back(
+          at + ".subClearHigh <= subClearLow; widened to keep a blend band");
+      r.subClearHigh = r.subClearLow + 0.05f;
+    }
+
+    ReadF(*g, "subMurkGlow", r.subMurkGlow, out, at);
+    r.subMurkGlow = std::max(r.subMurkGlow, 0.0f);
+
+    // ---- oil / petroleum-like viscous liquids ----
+    ReadF(*g, "oilSatLow", r.oilSatLow, out, at);
+    ReadF(*g, "oilSatHigh", r.oilSatHigh, out, at);
+    // Same smoothstep hazard as the clarity band above: low >= high collapses
+    // the blend into a hard switch, so a liquid authored near the boundary
+    // would flip between the blood and oil looks instead of crossing over.
+    if (r.oilSatHigh <= r.oilSatLow) {
+      out.warnings.push_back(
+          at + ".oilSatHigh <= oilSatLow; widened to keep a blend band");
+      r.oilSatHigh = r.oilSatLow + 0.05f;
+    }
+    ReadF(*g, "oilF0", r.oilF0, out, at);
+    ReadF(*g, "oilGraze", r.oilGraze, out, at);
+    ReadF(*g, "oilGloss", r.oilGloss, out, at);
+    // pow(x, e) with e <= 0 is 1 everywhere, which turns the specular lobe into
+    // a full-screen white wash.
+    r.oilGloss = std::max(r.oilGloss, 1.0f);
+    ReadF(*g, "oilSheen", r.oilSheen, out, at);
+    ReadF(*g, "oilReflectTint", r.oilReflectTint, out, at);
+    ReadF(*g, "oilDarken", r.oilDarken, out, at);
+    ReadF(*g, "oilIridescence", r.oilIridescence, out, at);
+    ReadF(*g, "oilFilmScale", r.oilFilmScale, out, at);
+    ReadF(*g, "oilFloatSens", r.oilFloatSens, out, at);
+    r.oilFloatSens = std::max(r.oilFloatSens, 0.0f);
+    ReadF(*g, "oilEdgeBand", r.oilEdgeBand, out, at);
+    // A zero-width smoothstep band is a hard step, which puts the aliased cube
+    // silhouette straight back; too wide and the droplet goes translucent,
+    // which is the bug this parameter exists to fix.
+    r.oilEdgeBand = std::clamp(r.oilEdgeBand, 0.01f, 0.5f);
+    ReadF(*g, "oilDropReflect", r.oilDropReflect, out, at);
+    r.oilDropReflect = std::clamp(r.oilDropReflect, 0.0f, 1.0f);
+    // Divides into the band phase; zero makes the whole surface one flat colour.
+    r.oilFilmScale = std::max(r.oilFilmScale, 0.01f);
+
     ReadF(*g, "bloodF0", r.bloodF0, out, at);
     ReadF(*g, "bloodGraze", r.bloodGraze, out, at);
     ReadF(*g, "bloodAbsorb", r.bloodAbsorb, out, at);
@@ -1010,6 +1141,43 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "pondChance", w.pondChance, out, at);
     ReadI(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
     ReadI(*g, "pondRadiusSpan", w.pondRadiusSpan, out, at);
+    ReadI(*g, "pondDepth", w.pondDepth, out, at);
+    ReadI(*g, "pondDepthRim", w.pondDepthRim, out, at);
+    ReadI(*g, "lilyChance", w.lilyChance, out, at);
+    ReadI(*g, "lilyFlowerChance", w.lilyFlowerChance, out, at);
+    ReadI(*g, "reedChance", w.reedChance, out, at);
+    ReadI(*g, "reedHeight", w.reedHeight, out, at);
+    ReadI(*g, "kelpChance", w.kelpChance, out, at);
+    ReadI(*g, "kelpHeight", w.kelpHeight, out, at);
+    ReadI(*g, "shoreBand", w.shoreBand, out, at);
+    ReadI(*g, "shoreMudWidth", w.shoreMudWidth, out, at);
+    ReadI(*g, "shoreLift", w.shoreLift, out, at);
+    ReadI(*g, "shoreCattailChance", w.shoreCattailChance, out, at);
+    ReadI(*g, "shoreCattailReach", w.shoreCattailReach, out, at);
+    ReadI(*g, "shoreCattailHeight", w.shoreCattailHeight, out, at);
+    ReadI(*g, "shoreSedgeChance", w.shoreSedgeChance, out, at);
+    ReadI(*g, "shoreHorsetailChance", w.shoreHorsetailChance, out, at);
+    ReadI(*g, "shoreHorsetailHeight", w.shoreHorsetailHeight, out, at);
+    ReadI(*g, "shoreIrisChance", w.shoreIrisChance, out, at);
+    ReadI(*g, "shoreMossChance", w.shoreMossChance, out, at);
+    ReadI(*g, "vineChance", w.vineChance, out, at);
+    ReadI(*g, "vineLenMin", w.vineLenMin, out, at);
+    ReadI(*g, "vineLenSpan", w.vineLenSpan, out, at);
+    ReadI(*g, "creeperFlowerChance", w.creeperFlowerChance, out, at);
+    ReadI(*g, "mossChance", w.mossChance, out, at);
+    ReadI(*g, "mossLenMin", w.mossLenMin, out, at);
+    ReadI(*g, "mossLenSpan", w.mossLenSpan, out, at);
+    ReadI(*g, "ivyChance", w.ivyChance, out, at);
+    ReadI(*g, "ivyTwist", w.ivyTwist, out, at);
+    ReadI(*g, "wallIvyDensity", w.wallIvyDensity, out, at);
+    ReadI(*g, "cactusChance", w.cactusChance, out, at);
+    ReadI(*g, "saguaroFraction", w.saguaroFraction, out, at);
+    ReadI(*g, "tussockChance", w.tussockChance, out, at);
+    ReadI(*g, "scrubChance", w.scrubChance, out, at);
+    ReadI(*g, "desertPatch", w.desertPatch, out, at);
+    ReadI(*g, "heathChance", w.heathChance, out, at);
+    ReadI(*g, "heathPatch", w.heathPatch, out, at);
+    ReadI(*g, "alpineChance", w.alpineChance, out, at);
     ReadI(*g, "ruinChance", w.ruinChance, out, at);
     ReadI(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadI(*g, "caveThreshold2", w.caveThreshold2, out, at);
@@ -1028,8 +1196,93 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     atLeast("pondTile", w.pondTile, 8);
     atLeast("pondChance", w.pondChance, 1);
     atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
+    atLeast("lilyChance", w.lilyChance, 1);
+    atLeast("lilyFlowerChance", w.lilyFlowerChance, 1);
+    atLeast("reedChance", w.reedChance, 1);
+    atLeast("kelpChance", w.kelpChance, 1);
+    atLeast("pondDepthRim", w.pondDepthRim, 1);
+    atLeast("pondDepth", w.pondDepth, w.pondDepthRim);
+    // The bowl is carved DOWN from the water surface, and the cave system
+    // starts 40 voxels under the terrain surface. A bowl deeper than that
+    // breaches a tunnel, the pond drains into the cave network, and the world
+    // never settles — which shows up as a sleep-gate failure a long way from
+    // this file. 34 keeps a margin under the 40.
+    if (w.pondDepth > 34) {
+      out.warnings.push_back(
+          "worldgen.pondDepth > 34 would breach the cave layer and drain the "
+          "pond; clamped to 34");
+      w.pondDepth = 34;
+    }
+    // Shoreline knobs. Every "chance" is a modulo divisor (zero is a
+    // div-by-zero in the shader); the band has two ceilings of its own.
+    atLeast("shoreBand", w.shoreBand, 0);      // 0 legally disables the fringe
+    atLeast("shoreMudWidth", w.shoreMudWidth, 0);
+    atLeast("shoreLift", w.shoreLift, 0);
+    atLeast("shoreCattailChance", w.shoreCattailChance, 1);
+    atLeast("shoreCattailHeight", w.shoreCattailHeight, 1);
+    atLeast("shoreSedgeChance", w.shoreSedgeChance, 1);
+    atLeast("shoreHorsetailChance", w.shoreHorsetailChance, 1);
+    atLeast("shoreHorsetailHeight", w.shoreHorsetailHeight, 1);
+    atLeast("shoreIrisChance", w.shoreIrisChance, 1);
+    atLeast("shoreMossChance", w.shoreMossChance, 1);
+    // shoreAt() resolves the distance past the rim by 8 steps of bisection over
+    // [0, shoreBand], which is exact only while the band fits in 2^8.
+    if (w.shoreBand > 255) {
+      out.warnings.push_back(
+          "worldgen.shoreBand > 255 exceeds shoreAt's 8-step bisection; "
+          "clamped to 255");
+      w.shoreBand = 255;
+    }
+    // shoreAt() checks the column's own pond tile plus AT MOST one neighbour
+    // per axis, which is only sound while a column can be within `band` of one
+    // tile edge at a time. Past pondTile/2 - 1 both edges of the same axis are
+    // in reach and the far side's pond would be missed — a marsh sliced off
+    // flat along a tile boundary. Half the tile is already absurdly wide
+    // (224 voxels at the default), so this never bites real tunings.
+    if (w.shoreBand > w.pondTile / 2 - 1) {
+      out.warnings.push_back(
+          "worldgen.shoreBand must stay under half of pondTile for shoreAt's "
+          "2x2 tile scan; clamped");
+      w.shoreBand = w.pondTile / 2 - 1;
+      if (w.shoreBand < 0) w.shoreBand = 0;
+    }
+    // The mud ring lives inside the band; a wider one would just be clipped
+    // silently, which reads as "shoreMudWidth stopped doing anything".
+    if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
+    if (w.shoreCattailReach > w.shoreBand) w.shoreCattailReach = w.shoreBand;
     atLeast("ruinChance", w.ruinChance, 1);
     atLeast("autumnFraction", w.autumnFraction, 1);
+    // Vine/moss/ivy knobs: every "chance" is a modulo divisor and every "span"
+    // a modulo range, so zero is a div-by-zero in the shader.
+    atLeast("vineChance", w.vineChance, 1);
+    atLeast("vineLenMin", w.vineLenMin, 1);
+    atLeast("vineLenSpan", w.vineLenSpan, 1);
+    atLeast("creeperFlowerChance", w.creeperFlowerChance, 1);
+    atLeast("mossChance", w.mossChance, 1);
+    atLeast("mossLenMin", w.mossLenMin, 1);
+    atLeast("mossLenSpan", w.mossLenSpan, 1);
+    atLeast("ivyChance", w.ivyChance, 1);
+    atLeast("ivyTwist", w.ivyTwist, 0);
+    // wallIvyDensity is the NUMERATOR of a coverage ramp (32/d and 48/d). At 0
+    // it divides by zero; past 8 the integer division collapses to 4 and 6 and
+    // the knob stops doing anything, so the useful range is 1..8.
+    atLeast("wallIvyDensity", w.wallIvyDensity, 1);
+    if (w.wallIvyDensity > 8) {
+      out.warnings.push_back(
+          "worldgen.wallIvyDensity > 8 has no further effect; clamped to 8");
+      w.wallIvyDensity = 8;
+    }
+    // A strand that reaches the ground reads as a pillar and blocks a path the
+    // player expected to be open. The shader holds it clear of the trunk's own
+    // ground height, but a length past the tallest canopy is simply wasted
+    // work on cells that can never be reached — cap it at a great oak's crown.
+    if (w.vineLenMin + w.vineLenSpan > 160) {
+      out.warnings.push_back(
+          "worldgen.vineLenMin + vineLenSpan > 160 exceeds the tallest canopy; "
+          "clamped");
+      w.vineLenSpan = 160 - w.vineLenMin;
+      if (w.vineLenSpan < 1) { w.vineLenMin = 159; w.vineLenSpan = 1; }
+    }
   }
 
   return true;

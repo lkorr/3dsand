@@ -117,6 +117,25 @@ struct Tuning {
     float liquidDrag = 8.3f;
     float liquidGravityScale = 0.25f;
     float liquidSpeedScale = 0.55f;
+    // ---- water-edge mantle (climbing out of a pool) ----
+    // Swim thrust is drag-limited on purpose, which means it cannot climb out
+    // of anything: at a pool wall you bob against the rim forever. So a jump
+    // pressed INTO a climbable bank while in liquid pulls the body up onto it
+    // (Player::Update, WaterLedgeAhead).
+    //
+    // A mantle rather than a bigger jump because a floating body's feet dangle
+    // most of a body below the waterline, which puts an ordinary pool lip ~11
+    // voxels above them — an impulse big enough to clear that from a dead float
+    // would fling you off a shallow bank by the same amount. See player.h.
+    //
+    // How fast (m/s) the body climbs. Fast enough not to feel like a cutscene,
+    // slow enough to read as pulling yourself out rather than teleporting.
+    float waterMantleSpeed = 4.5f;
+    // Hard cap (seconds) on one climb. This is a timeout, not a duration: the
+    // mantle normally ends on arrival. It exists so a climb blocked partway —
+    // the bank collapsed, something shoved into the target — returns control
+    // instead of holding movement hostage.
+    float waterMantleTime = 0.9f;
     float halfWidth = 0.30f, halfHeight = 0.85f, eyeOffset = 0.65f;
     // Camera step smoothing: half-life (seconds) of the render-only eye
     // offset that cancels the vertical pop when the body steps up/down a
@@ -257,6 +276,15 @@ struct Tuning {
     // keeps the head from stepping with the raw mouse; the body's own
     // firstPersonTurnHalflife sits behind it.
     float headLookHalflife = 0.07f;
+    // Half-life (seconds) of the FIRST-PERSON body squaring back up to the
+    // view while the player WALKS. Without this the head-look cone is a drift
+    // trap: inside the cone the body's turn is dropped to zero, so its facing
+    // is never driven back to anything and it freezes wherever the last big
+    // turn left it — with the arms welded to the torso, they end up stuck
+    // pointing off-view while you walk somewhere else. Standing still there is
+    // deliberately no recentring; that is the glance. Longer feels looser;
+    // 0 squares the body up immediately whenever you move.
+    float headLookRecenterHalflife = 0.35f;
     // Half-life (seconds) of the leg IK fading in and out as the gait starts
     // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
     // body really does leave the surface cresting each bump — and switching the
@@ -834,6 +862,140 @@ struct Tuning {
     // to one ray, so an ungated reflection here is a frame-time cliff.
     float iceReflectMin = 0.12f;
 
+    // ---- submerged view (shadeSubmerged in raymarch.wgsl) ----
+    // Everything in this block applies ONLY when the view ray is inside a
+    // liquid, so a dry frame is untouched by all of it.
+    //
+    // subAbsorb is deliberately NOT waterAbsorb. Looking down THROUGH a
+    // surface, a hard red kill is the depth cue that makes a lake read deep.
+    // Living inside the water at that same strength puts you in a featureless
+    // blue void two metres from your face — there is no distance information
+    // left to see. Underwater wants a much longer visibility range, so it gets
+    // its own (weaker) coefficients and its own scatter floor.
+    float subAbsorb[3] = {0.42f, 0.11f, 0.075f};   // per metre, per channel
+    float subScatter[3] = {0.055f, 0.19f, 0.24f};  // colour the volume tends to
+    float subScatterGain = 1.0f;    // in-scatter strength multiplier
+    // Metres at which the view has fully faded to the scatter colour. The
+    // underwater analogue of fog distance: this is the "murky pond" vs "clear
+    // tropical water" knob.
+    float subVisibility = 11.0f;
+    float subVignette = 0.34f;      // screen-edge darkening while submerged
+    // Snell's window: from below, the entire sky is compressed into a ~97
+    // degree cone straight up, and outside it the surface is a mirror of the
+    // murk. This scales how bright that window reads.
+    float subSnellGain = 1.25f;
+
+    // caustics cast onto submerged surfaces (bedCaustic in raymarch.wgsl).
+    // Separate from causticGain/Cap, which drive the caustic seen looking DOWN
+    // through a surface from dry land. This is a different projection — from
+    // the surface directly above the LIT POINT rather than above the bed the
+    // primary ray found — and sharing one gain makes one of the two views
+    // always wrong.
+    float bedCausticGain = 2.4f;
+    float bedCausticCap = 1.5f;
+    float bedCausticFade = 6.0f;    // metres of water above, past which it washes out
+    float bedCausticSharp = 2.2f;   // higher = thinner, brighter filaments
+
+    // volumetric light shafts (godRays in raymarch.wgsl). Ray-marched with a
+    // real per-sample occlusion test, so shafts break around the shore and any
+    // overhang instead of passing through terrain. Sample count is a direct
+    // frame-time multiplier, but on SUBMERGED pixels only.
+    int godRaySteps = 14;
+    float godRayStrength = 0.55f;
+    // Henyey-Greenstein asymmetry. Shafts are far brighter looking toward the
+    // sun than away from it; that anisotropy is what makes them read as beams
+    // rather than as a uniform brightening of the whole volume.
+    float godRayAniso = 0.62f;
+    float godRayRange = 14.0f;      // metres the shaft march covers
+    int godRayShadowSteps = 20;     // steps for the per-sample occlusion ray
+
+    // drifting particulate. Render-only motes suspended in the water, which is
+    // what gives the light shafts something visible to catch.
+    float siltDensity = 0.55f;
+    float siltBrightness = 0.50f;
+    float siltDrift = 0.05f;
+
+    // how strongly the underside of the surface ripples the view of the sky
+    float subSurfaceRipple = 1.6f;
+
+    // ---- the generic per-liquid submerged profile ----
+    // (submergedProfile in raymarch.wgsl.) These shape the MAPPING from a
+    // liquid's authored opacity + palette to its submerged look, so EVERY
+    // liquid gets a complete treatment with no shader change — including ones
+    // added later. The subAbsorb/subScatter/subVisibility values above are not
+    // "the underwater settings" any more; they are WATER'S refinement, blended
+    // in at the clear end of the curve rather than picked by a material test.
+    //
+    // Opacity is the axis, because it is already the authored measure of how
+    // much a medium blocks and it already orders the shipped liquids the way
+    // submersion should: water 90, acid 170, blood 200, oil 235.
+    float subMurkVis = 0.55f;      // visibility (m) in a fully opaque liquid
+    float subVisCurve = 2.2f;      // clarity exponent for visibility only
+    float subAbsorbGain = 7.0f;    // opacity -> per-metre absorption
+    float subAbsorbFloor = 0.05f;  // so even a clear liquid is not a vacuum
+    // How much of its own colour a liquid scatters back at the eye, at the
+    // dense and clear ends. In a dense liquid, that scatter IS what you see.
+    float subScatterDense = 0.42f, subScatterClear = 0.16f;
+    // Clarity band over which a liquid crosses from the derived profile onto
+    // water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.25;
+    // widening this band makes more liquids inherit water's look.
+    float subClearLow = 0.62f, subClearHigh = 0.82f;
+
+    // Faint directional glow toward the surface when submerged in a medium
+    // too dense to see through. A near-opaque liquid gates off Snell's window,
+    // and what that left was a featureless field of colour with no sense of up
+    // and nothing in motion - honest, but it reads as a broken shader rather
+    // than as being under the oil.
+    float subMurkGlow = 2.2f;
+
+    // ---- oil / petroleum-like viscous liquids ----
+    // Oil and blood share the viscous SURFACE path (isViscousLiquid) but look
+    // nothing alike, and blood's constants applied to oil rendered the pool as
+    // flat beige mud: matte, desaturated, no highlight, no reflection. These
+    // are the oil end of every term that differs.
+    //
+    // oiliness() in raymarch.wgsl derives the blend from the material's own
+    // authored palette SATURATION - no material ids, no new JSON key, the same
+    // principle isViscousLiquid itself follows. Blood's colour0 is 0.85
+    // saturated and oil's is 0.46: pigment suspensions are strongly chromatic,
+    // petroleum is a near-neutral brown-black.
+    float oilSatLow = 0.50f, oilSatHigh = 0.78f;
+    // Oil's IOR (~1.47 vs water's 1.33) puts F0 at roughly double water's, and
+    // unlike blood it approaches a real mirror at grazing - that hard bright
+    // rim is the look, not the artifact blood's lower graze guards against.
+    float oilF0 = 0.043f, oilGraze = 0.97f;
+    // Tighter lobe than blood's: a smooth film gives a small hard glint where
+    // a rough suspension gives a broad soft one, and that narrowness is most
+    // of what the eye reads as "glossy" rather than "damp".
+    float oilGloss = 620.0f, oilSheen = 1.6f;
+    // How much the reflection is tinted by the liquid itself. Near zero: a
+    // petroleum film is a near-NEUTRAL dark mirror, so what you see in it is
+    // the sky and the far bank, not a brown wash of its own body colour.
+    float oilReflectTint = 0.12f;
+    // How far the body colour is pushed toward black. Petroleum absorbs nearly
+    // everything entering it and reflects the rest off the surface - the
+    // opposite of blood's bright backscatter, and the term that kills the beige.
+    float oilDarken = 0.35f;
+    // Thin-film interference (the rainbow slick): strength, and the spatial
+    // scale of the film-thickness field that sets the band spacing.
+    float oilIridescence = 0.16f, oilFilmScale = 1.1f;
+    // The sheen appears ONLY where oil floats on a DENSER liquid - a film needs
+    // two interfaces close together, and a deep pool on rock has no second one
+    // within reach of the light (floatingOnLiquid in raymarch.wgsl). This
+    // scales how much denser the layer below must be to count as a real
+    // boundary; oil 900 on water 1000 is a ratio of 0.111.
+    float oilFloatSens = 9.0f;
+    // Silhouette-feather width for oil, against blood's 0.28. Blood can afford
+    // a wide fade because its body colour reads through the blend; oil's body
+    // is nearly black, so the same fade leaves a droplet as a smear of the
+    // scene behind it. This is most of why oil looked see-through.
+    float oilEdgeBand = 0.07f;
+    // How much plain sky reflection an UNPOOLED oil surface returns. A droplet
+    // is a tiny curved mirror scattering the sky everywhere, so far less
+    // reaches the eye than off a flat pool; at 1.0 a grazing droplet returns
+    // full-brightness sky and reads as a hole in the world.
+    float oilDropReflect = 0.30f;
+
     // blood / viscous liquids (shadeViscous in raymarch.wgsl)
     float bloodF0 = 0.030f;        // head-on reflectance
     float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)
@@ -916,7 +1078,73 @@ struct Tuning {
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
-    int pondTile = 224, pondChance = 4, pondRadiusMin = 20, pondRadiusSpan = 17;
+    int pondTile = 448, pondChance = 4, pondRadiusMin = 68, pondRadiusSpan = 60;
+    // Bowl depth in VOXELS: pondDepth at the centre, pondDepthRim at the edge.
+    // At kVoxelMeters 0.10 the player is 17 voxels tall, so a pond has to reach
+    // roughly 20 before you can actually submerge in one — the previous
+    // 8-voxel bowl was 0.8 m and could only be waded through.
+    int pondDepth = 26, pondDepthRim = 3;
+    // Pond vegetation. Each is a 1-in-N placement roll per candidate column,
+    // plus a height in voxels where the plant is more than one cell tall.
+    // These are ordinary inert solids placed once at generation: nothing here
+    // grows or reacts, so a settled pond still sleeps (rule 2).
+    int lilyChance = 22, lilyFlowerChance = 5;
+    int reedChance = 130, reedHeight = 16;
+    int kelpChance = 120, kelpHeight = 10;
+    // Shoreline: the wet fringe OUTSIDE the pond disc, which used to go
+    // straight from water to plain hillside grass. shoreBand is how many
+    // voxels past the rim the fringe reaches AND the sole cost knob for
+    // shoreAt() — it is the width of the tile-edge strip where a column has to
+    // consult a second pond tile, so it must stay well under pondTile.
+    // shoreMudWidth is the (shorter) inner ring where the ground skin becomes
+    // wet mud instead of grass. The rest are 1-in-N placement rolls per shore
+    // column, same inert-solid contract as the pond vegetation above.
+    int shoreBand = 24, shoreMudWidth = 10;
+    // shoreLift is the VERTICAL half of the band: how far above the waterline
+    // a column may stand and still be shore. pondSurface is min(rim) - 2, so
+    // most of a rim is well above the water and a fringe cut by radius alone
+    // paints marsh up the abutting hillside; cutting on height instead puts
+    // the reed beds in the shallow bays. High leverage — at the default pond
+    // it keeps 5% of the raw band at 4 and 99% at 24.
+    int shoreLift = 12;
+    int shoreCattailChance = 12, shoreCattailReach = 9, shoreCattailHeight = 20;
+    int shoreSedgeChance = 4;
+    int shoreHorsetailChance = 10, shoreHorsetailHeight = 9;
+    int shoreIrisChance = 34;
+    int shoreMossChance = 3;         // 1-in-N wet stone faces wear moss
+    // Vines, climbers and hanging moss. Same shape as the pond vegetation and
+    // for the same reason: a 1-in-N roll per candidate COLUMN (never per cell,
+    // or the strands come out dashed), placing inert solids once at
+    // generation. Nothing here grows, so a settled forest still sleeps.
+    // The geometry is derived implicitly from the tree that hosts it — the
+    // canopy underside is solved in closed form from the crown parameters, so
+    // a strand costs one integer sqrt and no extra world scan.
+    int vineChance = 26;             // 1-in-N canopy columns carry a strand
+    int vineLenMin = 10, vineLenSpan = 26;   // strand length, voxels
+    int creeperFlowerChance = 9;     // 1-in-N strands are a flowering creeper
+    int mossChance = 14;             // 1-in-N columns carry a moss beard
+    int mossLenMin = 4, mossLenSpan = 9;
+    int ivyChance = 2;               // 1-in-N bole-shell cells grow ivy
+    int ivyTwist = 5;                // ivy rope spiral, 1/16 turn per voxel
+    int wallIvyDensity = 3;          // 1..8, arena + ruin stone-wall coverage
+    // ---- desert / pine highland / alpine ground cover ----
+    // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent
+    // of those that are tall saguaro columns rather than ground-level barrels.
+    // Saguaros are landmarks: keep them occasional or the desert reads as a
+    // planted grid rather than as somewhere you cross to find one.
+    int cactusChance = 26, saguaroFraction = 22;
+    // 1-in-N per desert column, inside desertPatch. Tussock is the common
+    // species (it is what makes bare sand read as ground rather than as a
+    // texture); scrub is the sparse woody accent.
+    int tussockChance = 9, scrubChance = 26;
+    int desertPatch = 130;           // vnoise 0..255 gate; higher = barer
+    // 1-in-N per pine-highland column, inside heathPatch: the huckleberry and
+    // juniper floor under a conifer stand.
+    int heathChance = 7, heathPatch = 128;
+    // 1-in-N per column above TREELINE. The sparsest density here on purpose —
+    // the snowline is meant to read as harsh, so this is the one knob that can
+    // undo the intent of the whole alpine band by being made generous.
+    int alpineChance = 40;
     int ruinChance = 5;
     int caveThreshold1 = 150, caveThreshold2 = 148;
   } worldgen;

@@ -159,7 +159,7 @@ constexpr uint32_t kMaxDebugBoxes = 1024;
 // (DESIGN.md §7). Must match sim_mutate.wgsl entry `cells`.
 struct CellOp {
   uint32_t cellIdx;  // linear chunk-major cell index
-  uint32_t word;     // full voxel word to store (stamp byte included)
+  uint32_t word;     // full voxel word to store (stamp field included)
 };
 constexpr uint32_t kMaxCellOpsPerTick = 65536;
 // CellOp.word flag in the TOP spare bit (31): only write if the target cell
@@ -168,6 +168,42 @@ constexpr uint32_t kMaxCellOpsPerTick = 65536;
 // stored word are now the stain layer (below) and a CellOp carries real stain
 // bits through to the grid.
 constexpr uint32_t kCellOpIfAir = 0x80000000u;
+
+// ---- the voxel word ----
+// bits 0..11 material, 12..15 state, 16..18 tick-stamp, 19..23 FREE,
+// 24..27 stain amount, 28..30 stain type, 31 kCellOpIfAir (never stored).
+//
+// ---- the tick stamp ----
+// EXACT mirror of the STAMP_* consts in common.wgsl (that file is what the
+// shaders see; this is for the CPU paths that build voxel words). The stamp is
+// per-tick scheduling scratch, not state: it is excluded from the world hash
+// (sim_occupancy.wgsl) and stripped on save (kPersistMask in stream.cpp).
+//
+// kStampNever is the ONLY value a CPU path should ever write. No stampFor()
+// output equals it, so a voxel carrying it is free to move on the first tick
+// it is simulated — which is what every CPU-built word wants: a brush paint, a
+// prefab stamp, an RLE decode after a stream-in or a load. Writing a live code
+// instead would make that voxel sit out a substep.
+//
+// This was a 0xFF byte before the field narrowed to 3 bits. 0xFF masked into
+// 3 bits is 7 — a REAL stamp code — so any site still writing the old literal
+// silently becomes "already acted" one tick in seven. If you are reading this
+// because you found such a site, it is a bug; use kStampNever.
+constexpr uint32_t kStampShift = 16, kStampMask = 0x7;
+constexpr uint32_t kStampBits = 0x70000u;
+constexpr uint32_t kStampNever = 0;
+inline uint32_t VoxStamp(uint32_t w) { return (w >> kStampShift) & kStampMask; }
+// The word a CPU path stores for a freshly created voxel.
+inline uint32_t PackVoxNew(uint32_t mat, uint32_t state) {
+  return (mat & 0xFFFu) | ((state & 0xFu) << 12) | (kStampNever << kStampShift);
+}
+
+// ---- the free span ----
+// Bits 19..23: unallocated. Neither hashed nor persisted (see above), so they
+// hold per-tick scratch only unless the hash mask in sim_occupancy.wgsl and
+// kPersistMask in stream.cpp are BOTH widened to cover them. Claiming them
+// means saying so here and in the common.wgsl allocation table.
+constexpr uint32_t kFreeBits = 0x00F80000u;
 
 // ---- the stain layer (DESIGN.md §3) ----
 // Bits 24..30 of the voxel word: 4-bit amount, 3-bit type. EXACT mirror of the
@@ -205,6 +241,21 @@ inline uint32_t PackStain(uint32_t type, uint32_t amt) {
 // scripts/check_shaders.sh both generate the WGSL constants from THIS file.
 constexpr uint32_t kMaterialSlots = 4096;
 constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
+
+// ---- the art palette ----
+// Same trick as the stain palette above, for the same reason. A mob's skin
+// carries a per-voxel ART COLOUR that is independent of its material — a
+// creature is "meat" everywhere and painted all over — so the renderer needs
+// slot -> colour for something that is not a material id. These 128 entries
+// sit just below the stain palette, are filled by Simulation::UploadTables
+// from the loaded prefabs' art palettes, and are inert as materials (nothing
+// can reference them: ids are assigned from the bottom up).
+//
+// 128 matches kArtPaletteSlots in sim/voxload.h, which is the .vox side of the
+// same range; the two must agree. Art colour is render-only and never reaches
+// a world cell, so none of this can move the world hash (rule 1).
+constexpr uint32_t kArtPaletteSlotsGpu = 128;
+constexpr uint32_t kArtPaletteBaseGpu = kStainPaletteBase - kArtPaletteSlotsGpu;
 
 // ---- static micro-detail brick pool (render-only — sim/microvox.h) ----------
 // The raymarcher substitutes a subdiv^3 voxel model for cells of a MATF_MICRO
@@ -523,6 +574,11 @@ class World {
   const WorldSnapshot& Snap() const { return snap_; }
 
   // Voxel word at cell from the mirror; kind Unknown outside mirror coverage.
+  //
+  // `classOf` is a COLLISION class table, not simply a copy of each material's
+  // klass — build it with BuildCollisionClasses() below. The difference is
+  // materials flagged passable (soft vegetation), which report as Air here so
+  // bodies move through them while staying ordinary solids everywhere else.
   CellKind KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const;
 
   // Deterministic worldgen height — exact CPU mirror of worldgen.wgsl.

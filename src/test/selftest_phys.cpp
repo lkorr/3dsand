@@ -17,6 +17,7 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "gpu/resources.h"
+#include "sim/voxload.h"  // kArtPaletteBase
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -169,18 +170,30 @@ bool settleOk = false;
   for (int z = 0; z < 3; z++)
     for (int y = 0; y < 3; y++)
       for (int x = 0; x < 3; x++)
-        vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+        // PAINTED, deliberately: art colour is presentation only, so this
+        // block must land in the grid as plain stone. See the check below.
+        vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z,
+                       (uint8_t)kArtPaletteBase, kMatStone});
   uint64_t bh = phys.CreateDebrisBody(vox, {80, h + 4, 80}, dens);
   BodyTransform bxf{};
   bxf.pos = Vec3{80, (float)(h + 4), 80};
   bxf.quat[3] = 1;
   debris.AdoptBody(bh, vox, bxf);
 
+  // Art colour must never reach a world cell: it is presentation state on a
+  // body's skin, while the grid is hashed sim state (rule 1). A painted limb
+  // that is severed and settles back has to become its plain MATERIAL — which
+  // is checked here, on the ops themselves, because that is the one place the
+  // colour could leak across. A failure here would mean every painted mob
+  // silently desyncs multiplayer the first time a limb hits the ground.
+  bool artStayedOut = true;
   uint32_t t = 8000;
   for (int i = 0; i < 360 && debris.BodyCount() > 0; i++) {
     std::vector<CellOp> cellOps;
     std::vector<ParticleSpawn> spawns;
     debris.PreTick(t + 1, world, cellOps, spawns);
+    for (const CellOp& op : cellOps)
+      if ((op.word & 0xFFFu) != kMatStone) artStayedOut = false;
     ++t;
     SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
                {5, h / 16, 5}, true, false, spawns);
@@ -189,11 +202,11 @@ bool settleOk = false;
     phys.Step(kTickDt);
     debris.PostStep();
   }
-  settleOk = debris.BodyCount() == 0 && debris.SettledBack() >= 1;
+  settleOk = debris.BodyCount() == 0 && debris.SettledBack() >= 1 && artStayedOut;
   std::printf("settle-back: %s (%u bodies converted to grid, %u still "
-              "bodies)\n",
+              "bodies, painted body settled as plain material=%d)\n",
               settleOk ? "PASS" : "FAIL", debris.SettledBack(),
-              debris.BodyCount());
+              debris.BodyCount(), (int)artStayedOut);
 
   // C2 body split: a 3x3x9 bar cut through the middle must become two
   // independent bodies (no stepping needed — pure partition + respawn)

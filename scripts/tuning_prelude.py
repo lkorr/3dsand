@@ -147,6 +147,45 @@ SPEC = [
     ("render", "iceDepthMax", "TUNE_ICE_DEPTH_MAX", "f", 3.0),
     ("render", "iceReflectMin", "TUNE_ICE_REFLECT_MIN", "f", 0.12),
 
+    # submerged view (raymarch.wgsl shadeSubmerged / godRays / bedCaustic)
+    ("render", "subAbsorb", "TUNE_SUB_ABSORB", "v3", [0.42, 0.11, 0.075]),
+    ("render", "subScatter", "TUNE_SUB_SCATTER", "v3", [0.055, 0.19, 0.24]),
+    ("render", "subScatterGain", "TUNE_SUB_SCATTER_GAIN", "f", 1.0),
+    ("render", "subVisibility", "TUNE_SUB_VISIBILITY", "f", 11.0),
+    ("render", "subVignette", "TUNE_SUB_VIGNETTE", "f", 0.34),
+    ("render", "subSnellGain", "TUNE_SUB_SNELL_GAIN", "f", 1.25),
+
+    # caustics cast onto submerged surfaces
+    ("render", "bedCausticGain", "TUNE_BED_CAUSTIC_GAIN", "f", 2.4),
+    ("render", "bedCausticCap", "TUNE_BED_CAUSTIC_CAP", "f", 1.5),
+    ("render", "bedCausticFade", "TUNE_BED_CAUSTIC_FADE", "f", 6.0),
+    ("render", "bedCausticSharp", "TUNE_BED_CAUSTIC_SHARP", "f", 2.2),
+
+    # volumetric light shafts (god rays)
+    ("render", "godRaySteps", "TUNE_GODRAY_STEPS", "i", 14),
+    ("render", "godRayStrength", "TUNE_GODRAY_STRENGTH", "f", 0.55),
+    ("render", "godRayAniso", "TUNE_GODRAY_ANISO", "f", 0.62),
+    ("render", "godRayRange", "TUNE_GODRAY_RANGE", "f", 14.0),
+    ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 20),
+
+    # drifting particulate (silt)
+    ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),
+    ("render", "siltBrightness", "TUNE_SILT_BRIGHTNESS", "f", 0.5),
+    ("render", "siltDrift", "TUNE_SILT_DRIFT", "f", 0.05),
+
+    # surface-from-below
+    ("render", "subSurfaceRipple", "TUNE_SUB_SURFACE_RIPPLE", "f", 1.6),
+
+    # the generic per-liquid submerged profile (submergedProfile)
+    ("render", "subMurkVis", "TUNE_SUB_MURK_VIS", "f", 0.55),
+    ("render", "subVisCurve", "TUNE_SUB_VIS_CURVE", "f", 2.2),
+    ("render", "subAbsorbGain", "TUNE_SUB_ABSORB_GAIN", "f", 7.0),
+    ("render", "subAbsorbFloor", "TUNE_SUB_ABSORB_FLOOR", "f", 0.05),
+    ("render", "subScatterDense", "TUNE_SUB_SCATTER_DENSE", "f", 0.42),
+    ("render", "subScatterClear", "TUNE_SUB_SCATTER_CLEAR", "f", 0.16),
+    ("render", "subClearLow", "TUNE_SUB_CLEAR_LOW", "f", 0.62),
+    ("render", "subClearHigh", "TUNE_SUB_CLEAR_HIGH", "f", 0.82),
+
     # blood / viscous liquids
     ("render", "bloodF0", "TUNE_BLOOD_F0", "f", 0.03),
     ("render", "bloodGraze", "TUNE_BLOOD_GRAZE", "f", 0.55),
@@ -233,13 +272,72 @@ SPEC = [
     ("worldgen", "treeChanceMeadow", "TUNE_TREE_CHANCE_MEADOW", "u", 22),
     ("worldgen", "treeChanceDesert", "TUNE_TREE_CHANCE_DESERT", "u", 6),
     ("worldgen", "autumnFraction", "TUNE_AUTUMN_FRACTION", "u", 5),
-    ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 224),
+    ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 448),
     ("worldgen", "pondChance", "TUNE_POND_CHANCE", "u", 4),
-    ("worldgen", "pondRadiusMin", "TUNE_POND_RADIUS_MIN", "i", 20),
-    ("worldgen", "pondRadiusSpan", "TUNE_POND_RADIUS_SPAN", "u", 17),
+    ("worldgen", "pondRadiusMin", "TUNE_POND_RADIUS_MIN", "i", 68),
+    ("worldgen", "pondRadiusSpan", "TUNE_POND_RADIUS_SPAN", "u", 60),
+    ("worldgen", "pondDepth", "TUNE_POND_DEPTH", "i", 26),
+    ("worldgen", "pondDepthRim", "TUNE_POND_DEPTH_RIM", "i", 3),
+    ("worldgen", "lilyChance", "TUNE_LILY_CHANCE", "u", 22),
+    ("worldgen", "lilyFlowerChance", "TUNE_LILY_FLOWER_CHANCE", "u", 5),
+    ("worldgen", "reedChance", "TUNE_REED_CHANCE", "u", 130),
+    ("worldgen", "reedHeight", "TUNE_REED_HEIGHT", "i", 16),
+    ("worldgen", "kelpChance", "TUNE_KELP_CHANCE", "u", 120),
+    ("worldgen", "kelpHeight", "TUNE_KELP_HEIGHT", "i", 10),
+
+    # vines / climbers / hanging moss (worldgen agent B)
+    ("worldgen", "vineChance", "TUNE_VINE_CHANCE", "u", 26),
+    ("worldgen", "vineLenMin", "TUNE_VINE_LEN_MIN", "i", 10),
+    ("worldgen", "vineLenSpan", "TUNE_VINE_LEN_SPAN", "i", 26),
+    ("worldgen", "creeperFlowerChance", "TUNE_CREEPER_FLOWER_CHANCE", "u", 9),
+    ("worldgen", "mossChance", "TUNE_MOSS_CHANCE", "u", 14),
+    ("worldgen", "mossLenMin", "TUNE_MOSS_LEN_MIN", "i", 4),
+    ("worldgen", "mossLenSpan", "TUNE_MOSS_LEN_SPAN", "i", 9),
+    ("worldgen", "ivyChance", "TUNE_IVY_CHANCE", "u", 2),
+    ("worldgen", "ivyTwist", "TUNE_IVY_TWIST", "i", 5),
+    ("worldgen", "wallIvyDensity", "TUNE_WALL_IVY_DENSITY", "u", 3),
+
+    # shoreline: the wet fringe outside a pond
+    ("worldgen", "shoreBand", "TUNE_SHORE_BAND", "i", 24),
+    ("worldgen", "shoreMudWidth", "TUNE_SHORE_MUD_WIDTH", "i", 10),
+    ("worldgen", "shoreLift", "TUNE_SHORE_LIFT", "i", 12),
+    ("worldgen", "shoreCattailChance", "TUNE_SHORE_CATTAIL_CHANCE", "u", 12),
+    ("worldgen", "shoreCattailReach", "TUNE_SHORE_CATTAIL_REACH", "i", 9),
+    ("worldgen", "shoreCattailHeight", "TUNE_SHORE_CATTAIL_HEIGHT", "i", 20),
+    ("worldgen", "shoreSedgeChance", "TUNE_SHORE_SEDGE_CHANCE", "u", 4),
+    ("worldgen", "shoreHorsetailChance", "TUNE_SHORE_HORSETAIL_CHANCE", "u", 10),
+    ("worldgen", "shoreHorsetailHeight", "TUNE_SHORE_HORSETAIL_HEIGHT", "i", 9),
+    ("worldgen", "shoreIrisChance", "TUNE_SHORE_IRIS_CHANCE", "u", 34),
+    ("worldgen", "shoreMossChance", "TUNE_SHORE_MOSS_CHANCE", "u", 3),
+
+    # desert / pine highland / alpine ground cover (worldgen agent E)
+    ("worldgen", "cactusChance", "TUNE_CACTUS_CHANCE", "u", 26),
+    ("worldgen", "saguaroFraction", "TUNE_SAGUARO_FRACTION", "u", 22),
+    ("worldgen", "tussockChance", "TUNE_TUSSOCK_CHANCE", "u", 9),
+    ("worldgen", "scrubChance", "TUNE_SCRUB_CHANCE", "u", 26),
+    ("worldgen", "desertPatch", "TUNE_DESERT_PATCH", "i", 130),
+    ("worldgen", "heathChance", "TUNE_HEATH_CHANCE", "u", 7),
+    ("worldgen", "heathPatch", "TUNE_HEATH_PATCH", "i", 128),
+    ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
     ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
+
+    # oil / petroleum-like viscous liquids (shadeViscous)
+    ("render", "oilSatLow", "TUNE_OIL_SAT_LOW", "f", 0.5),
+    ("render", "oilSatHigh", "TUNE_OIL_SAT_HIGH", "f", 0.78),
+    ("render", "oilF0", "TUNE_OIL_F0", "f", 0.043),
+    ("render", "oilGraze", "TUNE_OIL_GRAZE", "f", 0.97),
+    ("render", "oilGloss", "TUNE_OIL_GLOSS", "f", 620.0),
+    ("render", "oilSheen", "TUNE_OIL_SHEEN", "f", 1.6),
+    ("render", "oilReflectTint", "TUNE_OIL_REFLECT_TINT", "f", 0.12),
+    ("render", "oilDarken", "TUNE_OIL_DARKEN", "f", 0.35),
+    ("render", "oilIridescence", "TUNE_OIL_IRIDESCENCE", "f", 0.16),
+    ("render", "oilFilmScale", "TUNE_OIL_FILM_SCALE", "f", 1.1),
+    ("render", "oilFloatSens", "TUNE_OIL_FLOAT_SENS", "f", 9.0),
+    ("render", "oilEdgeBand", "TUNE_OIL_EDGE_BAND", "f", 0.07),
+    ("render", "oilDropReflect", "TUNE_OIL_DROP_REFLECT", "f", 0.3),
+    ("render", "subMurkGlow", "TUNE_SUB_MURK_GLOW", "f", 2.2),
 ]
 
 

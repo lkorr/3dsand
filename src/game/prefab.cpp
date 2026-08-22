@@ -53,9 +53,9 @@ void PrefabPlacer::Place(const Prefab& pf, IVec3 at, int rotY, bool overwrite,
       IVec3 cell{at.x + p.x, at.y + p.y, at.z + p.z};
       if (!claimed.insert(PackCell(cell)).second) continue;
       // same word rules as brush paints (sim_mutate.wgsl): liquids born full,
-      // others get a palette variant; stamp 0xFF = "hasn't acted", falls now
+      // others get a palette variant; kStampNever = "hasn't acted", falls now
       uint32_t state = mats[mat].gpu.klass == CLASS_LIQUID ? 7u : VariantOf(cell);
-      uint32_t word = (mat & 0xFFFu) | (state << 12) | (0xFFu << 16);
+      uint32_t word = PackVoxNew(mat, state);
       if (!overwrite) word |= kCellOpIfAir;
       pending_.push_back({cell, word});
     }

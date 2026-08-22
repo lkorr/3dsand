@@ -51,6 +51,121 @@ const M_PINE   : u32 = 35u;
 const M_AUTUMN : u32 = 36u;
 const M_BIRCH  : u32 = 37u;
 const M_PETAL  : u32 = 38u;
+// ---- aquatic plants (materials.json ids 59..62) ----
+const M_LILYPAD : u32 = 59u;
+const M_LILYFLR : u32 = 60u;
+const M_REED    : u32 = 61u;
+const M_KELP    : u32 = 62u;
+// ---- desert / pine-highland / alpine flora (materials.json ids 70..76) ----
+// The three biomes that generated as bare ground: desert (bare sand plus the
+// occasional dead bush), the pine highlands (bare needles over stone) and the
+// snowline above TREELINE (bare snow). Placed by cactusAt() and the three
+// biome ground-cover blocks at the end of genCell.
+//
+// These numbers are ARRAY POSITIONS in materials.json (id == index + 1), read
+// back out of the file AFTER appending — this block was reserved 91..97 and
+// landed at 70..76 because it appended before the other agents' blocks did.
+// Recompute from positions, never from what was reserved:
+//   python -c "import json;[print(i+1,m['id']) for i,m in
+//              enumerate(json.load(open('assets/materials/materials.json'))['materials'])]"
+const M_CACTUS       : u32 = 70u;   // saguaro/barrel flesh: SOLID, blocking
+const M_CACTUS_RIB   : u32 = 71u;   // ribbed skin + spines: SOLID, blocking
+const M_CACTUS_BLOOM : u32 = 72u;   // crown flower: passable
+const M_SCRUB        : u32 = 73u;   // creosote/sage: passable
+const M_TUSSOCK      : u32 = 74u;   // dry bunchgrass: passable
+const M_HEATH        : u32 = 75u;   // huckleberry/juniper: passable
+const M_CUSHION      : u32 = 76u;   // alpine cushion / lichen crust: passable
+// ---- vines / climbers / hanging moss (materials.json ids 77..80) ----
+// These numbers are ARRAY POSITIONS in materials.json (id == index + 1), and
+// they are not the ids this block was authored against: it was reserved 70..76
+// and landed at 77..80 because another agent's block committed in between.
+// That is the append-only contract working as intended — recompute from
+// positions, never from what was reserved:
+//   python -c "import json;[print(i+1,m['id']) for i,m in
+//              enumerate(json.load(open('assets/materials/materials.json'))['materials'])]"
+const M_VINE_HANG      : u32 = 77u;
+const M_CREEPER_FLOWER : u32 = 78u;
+const M_MOSS_HANG      : u32 = 79u;
+const M_IVY            : u32 = 80u;
+// ---- meadow wildflowers (materials.json ids 65..69) ----
+// Five micro-model species that vary by CLUMP, not per cell: see the ground
+// flora block in genCell. petal_blue (63) and petal_pink (64) are colour
+// materials the .vox models paint with and are never placed by worldgen, which
+// is why they have no constant here.
+const M_BLUEBELL  : u32 = 65u;
+const M_FOXGLOVE  : u32 = 66u;
+const M_BUTTERCUP : u32 = 67u;
+const M_CLOVER    : u32 = 68u;
+const M_WILDROSE  : u32 = 69u;
+// Tallest a meadow flower can be, in CELLS — must be >= the largest value
+// flowerHeight() can return (foxglove, 3 + 2 = 5). It bounds the Y range the
+// stalk branch scans, so an under-count silently beheads the tall species and
+// an over-count just costs a few wasted evaluations per column.
+const FLOWER_MAX_H : i32 = 5;
+// ---- shoreline: the wet fringe outside a pond (materials.json ids 81..87) ----
+// Placed by the shore-cover block in genCell against shoreAt(). Like the vine
+// block above, these landed at ids other than the ones reserved for them
+// (77..83) because other agents' blocks committed first — the numbers below are
+// ARRAY POSITIONS read back out of materials.json, not what was asked for.
+const M_SHORE_MUD    : u32 = 81u;
+const M_MARSH_GRASS  : u32 = 82u;
+const M_CATTAIL      : u32 = 83u;
+const M_CATTAIL_HEAD : u32 = 84u;
+const M_HORSETAIL    : u32 = 85u;
+const M_WATER_IRIS   : u32 = 86u;
+const M_WET_MOSS     : u32 = 87u;
+// ---- forest undergrowth (materials.json ids 88..94) ----
+// The layer that lives UNDER a closed canopy, as opposed to the grass and
+// flowers that live in the gaps. Placement is driven by canopy cover, not by
+// biome — see undergrowthSite() and the ground-cover block in genCell.
+// These ids are ARRAY POSITIONS in materials.json (id == index + 1). Re-derive
+// after any append with:
+//   python -c "import json;[print(i+1,m['id']) for i,m in
+//              enumerate(json.load(open('assets/materials/materials.json'))['materials'])]"
+const M_FERN      : u32 = 88u;
+const M_MUSHROOM  : u32 = 89u;
+const M_TOADSTOOL : u32 = 90u;
+const M_MOSS      : u32 = 91u;
+const M_SAPLING   : u32 = 92u;
+const M_BRAMBLE   : u32 = 93u;
+const M_LITTER    : u32 = 94u;
+
+// Undergrowth placement constants. Plain WGSL consts rather than TUNE_* knobs,
+// following the TREE_TILE / TREE_SCAN / POND_RIM precedent in this file: these
+// are PLACEMENT CONTENT (which plant grows where), not look/feel, and the
+// tuning pipeline's five-file round trip is reserved for the latter. They also
+// change the world hash, so they are rule-1 state and belong with the rest of
+// the integer procgen rather than behind an F5 reload.
+//
+// The two COVER thresholds are the whole design, so they are worth reading as a
+// unit. undergrowthSite() returns 0 (open sky) .. 255 (deep under a crown):
+//   < UG_COVER_EDGE   open ground:  grass and flowers, nothing else
+//   >= UG_COVER_EDGE  canopy edge:  flowers, plus a thinning scatter of litter
+//   >= UG_COVER_MIN   under cover:  the shade set takes over from the flowers
+//   >= UG_COVER_DEEP  deep shade:   brambles drop out, fern/moss/litter remain
+// UG_COVER_MIN sits near the middle of a single crown's ramp, NOT at its rim:
+// a rim-aligned threshold draws a visible circle of fern around every tree.
+const UG_COVER_EDGE : i32 = 40;
+const UG_COVER_MIN  : i32 = 96;
+const UG_COVER_DEEP : i32 = 190;
+
+// 1-in-N per column, inside the relevant patch mask. These are the densities
+// that make the floor read as dense without paving it: a fern every ~7 columns
+// inside a fern bank is a bank you push through, one every 2 is a hedge.
+const UG_FERN_CHANCE    : u32 = 7u;
+const UG_FERN_PATCH     : i32 = 140;    // vnoise 0..255; ~40% of the area
+const UG_MOSS_CHANCE    : u32 = 3u;
+const UG_MOSS_PATCH     : i32 = 150;
+const UG_BRAMBLE_CHANCE : u32 = 23u;
+const UG_SAPLING_CHANCE : u32 = 900u;   // rare on purpose: it reads as a TREE
+const UG_LITTER_CHANCE  : u32 = 4u;     // the default floor of a wood
+const UG_LITTER_EDGE_CHANCE : u32 = 11u;  // thinner, past the crown rim
+
+// Mushrooms ring the BOLE. Radius in voxels (a great oak's ring is wider, via
+// the per-tree jitter added at the call site); the inner d2 > 9 keeps them off
+// the trunk cells themselves.
+const UG_SHROOM_RING : i32 = 11;
+const UG_SHROOM_BASE_CHANCE : u32 = 3u;
 
 // Biomes, from the low-frequency biome field (see biomeAt).
 const B_FOREST : u32 = 0u;   // dominant: grass over dirt, dense trees
@@ -200,49 +315,195 @@ const POND_RIM : array<vec2<i32>, 24> = array<vec2<i32>, 24>(
   vec2<i32>(   0, -256), vec2<i32>(  66, -247), vec2<i32>( 128, -222),
   vec2<i32>( 181, -181), vec2<i32>( 222, -128), vec2<i32>( 247,  -66));
 
+// Per-tile pond descriptor, unpacked from one tile hash — the pond analogue of
+// treeInfo. Split out of pondAt so the SHORE band (shoreAt, below) can ask
+// "where is the nearest pond rim" for a column that is OUTSIDE every disc, and
+// therefore gets `none` back from pondAt. Both callers must see exactly the
+// same disc, so there is one place that decides it.
+struct Pond {
+  present : bool,
+  cx      : i32,   // disc centre, world coords
+  cz      : i32,
+  r       : i32,   // disc radius
+};
+
+fn pondInfo(pt : i32, pz : i32, seed : u32) -> Pond {
+  var p : Pond;
+  p.present = false; p.cx = 0; p.cz = 0; p.r = 0;
+
+  let rh = hash3(seed ^ 0xB0A7u, bitcast<u32>(pt), bitcast<u32>(pz));
+  if (rh % TUNE_POND_CHANCE != 0u) { return p; }                 // ~1 pond per 4 tiles
+  let r = TUNE_POND_RADIUS_MIN + i32((rh >> 4u) % TUNE_POND_RADIUS_SPAN);
+  // The disc must never leave its own tile: pondAt is consulted for ONE tile
+  // per column (no neighbourhood scan), so a pond that overhung its tile edge
+  // would simply vanish from the columns on the other side — half a bowl,
+  // carved terrain with no water in it.
+  //
+  // The inset is therefore DERIVED from the largest radius this tuning can
+  // produce, not a hardcoded constant. It used to be a literal 60, which was
+  // correct only for the original radius 20..36; the moment the radii grew
+  // past it the guarantee silently broke. `maxR + 4` keeps a small margin for
+  // the rim samples.
+  let maxR = TUNE_POND_RADIUS_MIN + i32(TUNE_POND_RADIUS_SPAN) - 1;
+  let inset = maxR + 4;
+  // A tile that cannot contain the biggest possible disc holds no pond at all,
+  // rather than one that silently clips. max(1) keeps the modulo legal.
+  let span = u32(max(POND_TILE - 2 * inset, 1));
+  if (POND_TILE - 2 * inset < 1) { return p; }
+  let cx = pt * POND_TILE + inset + i32((rh >> 9u) % span);
+  let cz = pz * POND_TILE + inset + i32((rh >> 17u) % span);
+  // Keep-out zones, by DISC (center + radius), not by column: the spawn
+  // clearing + fixture pads, the streaming ball column (408,128) whose test
+  // assumes TerrainHeight() is the surface, and the three authored pools
+  // (128 covers the widest rim 80 + max radius 36 + slack).
+  if (cx >= -44 && cx <= 264 && cz >= -44 && cz <= 264) { return p; }
+  if (abs(cx - 408) < r + 24 && abs(cz - 128) < r + 24) { return p; }
+  let q1x = cx - 420; let q1z = cz - 420;
+  let q2x = cx - 260; let q2z = cz - 300;
+  let q3x = cx - 220; let q3z = cz - 520;
+  if (q1x * q1x + q1z * q1z < 128 * 128) { return p; }
+  if (q2x * q2x + q2z * q2z < 128 * 128) { return p; }
+  if (q3x * q3x + q3z * q3z < 128 * 128) { return p; }
+  p.present = true; p.cx = cx; p.cz = cz; p.r = r;
+  return p;
+}
+
+// The pond's water surface, from its rim. Split out of pondAt for the same
+// reason pondInfo was: the shore band needs the waterline of a pond it is
+// standing OUTSIDE of, to pick a depth-banded plant and to know how far above
+// the water it is. 24 baseHeight samples, so callers should ask once.
+fn pondSurface(p : Pond, seed : u32) -> i32 {
+  // water level: 2 under the lowest ground on the rim circle
+  var wmin = 0x7FFFFFFF;
+  for (var i = 0; i < 24; i++) {
+    let s = POND_RIM[i];
+    wmin = min(wmin, baseHeight(p.cx + (s.x * p.r) / 256, p.cz + (s.y * p.r) / 256, seed));
+  }
+  return wmin - 2;
+}
+
 // Returns (bowl floor, water surface) at this column, or (-1,-1) outside any
 // pond. genCell carves the terrain to the floor and fills (floor, surface]
 // with water. Pure function of (coords, seed), exactly like treeInfo.
 fn pondAt(x : i32, z : i32, seed : u32) -> vec2<i32> {
   let none = vec2<i32>(-1, -1);
+  let p = pondInfo(fdiv(x, POND_TILE), fdiv(z, POND_TILE), seed);
+  if (!p.present) { return none; }
+  let dx = x - p.cx;
+  let dz = z - p.cz;
+  let d2 = dx * dx + dz * dz;
+  if (d2 > p.r * p.r) { return none; }
+  let surf = pondSurface(p, seed);
+  // Parabolic bowl, carved below the water surface (terrain that is already
+  // lower stays — water just fills deeper there, still capped by the
+  // rim-derived surface).
+  //
+  // DEPTH IS THE WHOLE POINT: at kVoxelMeters 0.10 the player capsule is 17
+  // voxels tall, so the original 8-voxel centre depth was 0.8 m and a pond
+  // could only ever be waded through. TUNE_POND_DEPTH now puts the centre well
+  // over the player's head while TUNE_POND_DEPTH_RIM keeps the edge shallow,
+  // so you walk in off a beach rather than stepping off a wall.
+  // LoadTuning clamps the depth under the cave layer — a bowl that breaches a
+  // tunnel drains the pond and the world never settles.
+  let depth = TUNE_POND_DEPTH_RIM +
+              ((p.r * p.r - d2) * (TUNE_POND_DEPTH - TUNE_POND_DEPTH_RIM)) / (p.r * p.r);
+  return vec2<i32>(surf - depth, surf);
+}
+
+// ---- the shore band ----
+// The wet fringe OUTSIDE the disc. Everything up to here treated a pond as a
+// binary — inside the disc you get water and pond life, one voxel outside you
+// get the same plain grass as a hillside a kilometre away — so walking up to a
+// pond had no approach: the marsh, the mud, the reed bed you push through are
+// what make arriving at water read as arriving somewhere.
+//
+// COST (rule 2). This is a per-column query on the worldgen path, which runs
+// for every cell of every generated chunk, so it must be O(1) and cheap in the
+// overwhelmingly common case of "nowhere near a pond":
+//
+//   * At most FOUR pondInfo calls, never a 5x5 scan like the trees. A pond disc
+//     is guaranteed to lie inside its own tile (see the inset above), so a
+//     column can only be within `band` of a disc belonging to its own tile or
+//     to a tile whose EDGE is within `band` of the column — and a column is
+//     within `band` of at most one tile edge per axis. The loop is over
+//     {0, sx} x {0, sz} where sx/sz are 0 unless the column is inside `band` of
+//     that axis' tile boundary, so it collapses to ONE call away from the
+//     boundaries and the duplicate (0,0) entry is skipped.
+//   * pondSurface (24 baseHeight samples) is evaluated only once a disc has
+//     actually been found within the band — i.e. only for shore columns.
+//
+// Returns (distance PAST the rim in voxels, water surface Y), or (-1,-1) when
+// this column is not on any shore. Distance 0 is the first column outside the
+// disc; the inside of the disc returns none (that is pondAt's job).
+//
+// Why the band cannot simply be read off `pondAt` returning none: the disc's
+// clearance inside its own tile can be as little as 4 voxels for the largest
+// radius, so a wider band derived from one tile alone would be sliced off flat
+// along a tile edge — a straight-line haircut through a marsh, which is exactly
+// the artifact the tile scan buys us out of.
+struct Shore {
+  onShore : bool,
+  past    : i32,   // voxels beyond the rim (0 = first dry column)
+  surf    : i32,   // the pond's water surface Y
+};
+
+fn shoreAt(x : i32, z : i32, seed : u32) -> Shore {
+  var s : Shore;
+  s.onShore = false; s.past = 0; s.surf = -1;
+
+  let band = TUNE_SHORE_BAND;
+  if (band <= 0) { return s; }
+
   let pt = fdiv(x, POND_TILE);
   let pz = fdiv(z, POND_TILE);
-  let rh = hash3(seed ^ 0xB0A7u, bitcast<u32>(pt), bitcast<u32>(pz));
-  if (rh % TUNE_POND_CHANCE != 0u) { return none; }              // ~1 pond per 4 tiles
-  let r = TUNE_POND_RADIUS_MIN + i32((rh >> 4u) % TUNE_POND_RADIUS_SPAN);              // radius 20..36 (2.5-4.5 m)
-  // Center insets by 60 > max radius + margin: the disc never leaves its own
-  // tile, so callers only ever consult ONE tile (no neighborhood scan).
-  let span = u32(POND_TILE - 120);
-  let cx = pt * POND_TILE + 60 + i32((rh >> 9u) % span);
-  let cz = pz * POND_TILE + 60 + i32((rh >> 17u) % span);
-  // Keep-out zones, by DISC (center + radius), not by column: the spawn
-  // clearing + fixture pads, the streaming ball column (408,128) whose test
-  // assumes TerrainHeight() is the surface, and the three authored pools
-  // (128 covers the widest rim 80 + max radius 36 + slack).
-  if (cx >= -44 && cx <= 264 && cz >= -44 && cz <= 264) { return none; }
-  if (abs(cx - 408) < r + 24 && abs(cz - 128) < r + 24) { return none; }
-  let q1x = cx - 420; let q1z = cz - 420;
-  let q2x = cx - 260; let q2z = cz - 300;
-  let q3x = cx - 220; let q3z = cz - 520;
-  if (q1x * q1x + q1z * q1z < 128 * 128) { return none; }
-  if (q2x * q2x + q2z * q2z < 128 * 128) { return none; }
-  if (q3x * q3x + q3z * q3z < 128 * 128) { return none; }
-  let dx = x - cx;
-  let dz = z - cz;
-  let d2 = dx * dx + dz * dz;
-  if (d2 > r * r) { return none; }
-  // water level: 2 under the lowest ground on the rim circle
-  var wmin = 0x7FFFFFFF;
-  for (var i = 0; i < 24; i++) {
-    let s = POND_RIM[i];
-    wmin = min(wmin, baseHeight(cx + (s.x * r) / 256, cz + (s.y * r) / 256, seed));
+  // Which neighbouring tile (if any) has an edge close enough that its disc
+  // could reach this column. -1/+1/0 per axis, so at most 2x2 tiles total.
+  let lx = fmodp(x, POND_TILE);
+  let lz = fmodp(z, POND_TILE);
+  let sx = select(select(0, 1, lx >= POND_TILE - band), -1, lx < band);
+  let sz = select(select(0, 1, lz >= POND_TILE - band), -1, lz < band);
+
+  var best = 0x7FFFFFFF;
+  var bestP : Pond;
+  bestP.present = false; bestP.cx = 0; bestP.cz = 0; bestP.r = 0;
+  for (var iz = 0; iz < 2; iz++) {
+    let oz = select(0, sz, iz == 1);
+    if (iz == 1 && sz == 0) { continue; }        // no second row to check
+    for (var ix = 0; ix < 2; ix++) {
+      let ox = select(0, sx, ix == 1);
+      if (ix == 1 && sx == 0) { continue; }      // no second column to check
+      let p = pondInfo(pt + ox, pz + oz, seed);
+      if (!p.present) { continue; }
+      let dx = x - p.cx;
+      let dz = z - p.cz;
+      let d2 = dx * dx + dz * dz;
+      // Inside the disc is the pond, not the shore.
+      if (d2 <= p.r * p.r) { return s; }
+      // Compare in SQUARED distance to keep this integer-exact (no isqrt), then
+      // resolve `past` once, on the winner only.
+      let outer = p.r + band;
+      if (d2 > outer * outer) { continue; }
+      if (d2 < best) { best = d2; bestP = p; }
+    }
   }
-  let surf = wmin - 2;
-  // parabolic bowl: 2 voxels deep at the rim, 8 at the center, carved below
-  // the water surface (terrain that is already lower stays — water just fills
-  // deeper there, still capped by the rim-derived surface)
-  let depth = 2 + ((r * r - d2) * 6) / (r * r);
-  return vec2<i32>(surf - depth, surf);
+  if (!bestP.present) { return s; }
+
+  // Integer distance past the rim, by bisection on the squared radius — 8 steps
+  // over the band, no sqrt and no f32 (rule 1). `past` is the smallest k with
+  // d2 <= (r+k)^2, minus one, i.e. the number of whole voxels of dry ground
+  // between this column and the waterline.
+  var lo = 0;
+  var hi = band;
+  for (var i = 0; i < 8; i++) {
+    if (lo >= hi) { break; }
+    let mid = (lo + hi) / 2;
+    let rr = bestP.r + mid;
+    if (best <= rr * rr) { hi = mid; } else { lo = mid + 1; }
+  }
+  s.onShore = true;
+  s.past = max(lo - 1, 0);
+  s.surf = pondSurface(bestP, seed);
+  return s;
 }
 
 // ---- trees ----
@@ -665,6 +926,212 @@ fn treeCell(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
   }
 }
 
+// ---- hanging vines, moss beards and trunk ivy (implicit, per-cell) ----
+//
+// THE PROBLEM THIS SOLVES. A vine is the one plant whose real-world form is a
+// PATH: it starts somewhere and travels. Worldgen has no turtle to walk it —
+// genCell sees one cell and must answer for that cell alone, with no memory of
+// the cells above it and no ability to write into them. So a vine cannot be
+// grown; it has to be a CLOSED-FORM PREDICATE that every cell along the strand
+// independently agrees on.
+//
+// The trick is that a hanging vine has exactly one degree of freedom: the
+// column it hangs in. Fix the column and the whole strand is determined by two
+// numbers — where it starts (the canopy underside directly above) and how far
+// it falls (a per-column hash). Both are pure functions of (column, tree), so
+// every cell in the strand derives the identical pair and the strand is
+// continuous by construction rather than by being drawn.
+//
+// That is why the canopy underside is computed ANALYTICALLY below instead of
+// by marching upward looking for leaves. Marching would be the obvious port of
+// the turtle idea and it is exactly wrong here: it costs O(vine length) leaf
+// evaluations per cell, and treeCell is not cheap (a birch alone is 5 limbs x
+// 6 twigs of segment distance). Each species' crown is an implicit surface we
+// already have the parameters for, so its underside is one integer sqrt.
+//
+// Rule 2: everything here is INERT, placed once. A growing vine is the textbook
+// version of the thing the file header warns about — it would keep every forest
+// chunk awake forever. `vine` (material 22) is the REACTIVE garden vine and is
+// deliberately NOT what this places.
+
+// Underside of the tree's foliage in the column (dx,dz) relative to the trunk,
+// as a height above t.base, or -1 if this column carries no canopy to hang
+// from. This is the inverse of the crown tests in treeCell: same parameters,
+// solved for the lowest y instead of tested at a given y.
+fn canopyUnderside(t : Tree, dx : i32, dz : i32) -> i32 {
+  let d2 = dx * dx + dz * dz;
+  let r = t.radius;
+  let topY = t.trunk - t.radius / 3;
+  switch (t.species) {
+    // Round crowns: the treeCell test is dx^2 + dz^2 + ((dy-cy)*3/2)^2 <= r^2,
+    // so the lowest dy in this column is cy - (2/3)*sqrt(r^2 - d2). Great oaks
+    // carry a second, lower lobe centred at cy - r with a 2x vertical squash
+    // and radius 3r/4 — whichever hangs lower is the real underside.
+    case 0u, 3u: {
+      var low = 0x7FFFFFFF;
+      if (d2 <= r * r) {
+        let s = i32(isqrt(u32(r * r - d2)));
+        low = topY - (s * 2) / 3;
+      }
+      if (t.species == 3u) {
+        let r2 = r * 3 / 4;
+        if (d2 <= r2 * r2) {
+          let s2 = i32(isqrt(u32(r2 * r2 - d2)));
+          low = min(low, (topY - r) - s2 / 2);
+        }
+      }
+      if (low == 0x7FFFFFFF) { return -1; }
+      return low;
+    }
+    // Pine: a downward-widening cone, so its underside in a column is the
+    // height at which the cone radius (diamond metric, as in treeCell) equals
+    // that column's distance. Solving cr = (up*r)/span for `up` and converting
+    // back: dy = tip - (md*span)/r. The saw-tooth skirt is ignored here — it
+    // moves the boundary by a voxel or two and a vine hanging from a needle
+    // rather than from the bough beneath it is not a distinction anyone sees.
+    case 1u: {
+      let tip = t.trunk + t.trunk / 8;
+      let start = t.trunk / 4;
+      let span = max(tip - start, 1);
+      let md = abs(dx) + abs(dz);
+      if (md > r) { return -1; }
+      let dy = tip - (md * span) / max(r, 1);
+      if (dy < start) { return -1; }
+      return dy;
+    }
+    // Birch has no crown surface at all — its foliage is fifteen small blobs at
+    // twig tips, and there is no closed form for "the lowest one over this
+    // column". Birches get moss beards off their LIMBS instead (handled by the
+    // caller, which already has the limb geometry in hand), never a curtain.
+    // Bushes are too low to hang anything from.
+    default: { return -1; }
+  }
+}
+
+// Vine material contributed by tree `t` at world cell (x,y,z), or MAT_AIR.
+// Called from treeAt's existing tile loop, so it adds NO new world scan: the
+// 25 tiles were already visited and `t` is already in registers.
+fn treeVine(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  let dx = x - t.wx;
+  let dz = z - t.wz;
+  let dy = y - t.base;
+  if (dy < 0) { return MAT_AIR; }
+
+  // Bushes carry nothing; birch is handled as a moss beard further down.
+  if (t.species == 4u) { return MAT_AIR; }
+
+  // ---- 1. curtain vines under a round/conic canopy ----
+  // One hash per COLUMN (not per cell): the column either hosts a strand or it
+  // does not, and every cell of that strand reads the same roll. A per-cell
+  // roll would give dashed vines, which is the same bug the pond plants call
+  // out — and the salt is distinct per feature, never a bit-slice of a shared
+  // hash, because slices of one hash correlate (see the pond-life note).
+  let hv = hash3(seed ^ 0x71E5u, bitcast<u32>(x), bitcast<u32>(z));
+  // Great oaks are the trees that read as ancient, so they drape hardest.
+  var chance = TUNE_VINE_CHANCE;
+  if (t.species == 3u) { chance = max(TUNE_VINE_CHANCE / 2u, 1u); }
+  if ((hv % chance) == 0u) {
+    let under = canopyUnderside(t, dx, dz);
+    if (under >= 0) {
+      // Strand length, jittered per column so the curtain has a ragged hem
+      // instead of a machine-cut edge — the single most obvious tell that a
+      // procedural vine is procedural.
+      let len = TUNE_VINE_LEN_MIN + i32((hv >> 7u) % u32(max(TUNE_VINE_LEN_SPAN, 1)));
+      // The strand occupies (under - len, under]: it starts INSIDE the foliage
+      // by one cell so there is no visible gap between leaf and vine, and runs
+      // down from there.
+      if (dy <= under && dy > under - len) {
+        // Never let a strand reach the ground: a vine that touches down reads
+        // as a pillar and, worse, is something the player walks into where
+        // they expected floor. Held clear of the trunk's own ground height,
+        // which is the only ground height this function knows.
+        if (dy > 2) {
+          // A minority of strands flower. Gated on the SAME column roll, so a
+          // blossom can only appear on a column that actually grew a vine —
+          // the lilypad/blossom precedent.
+          if (((hv >> 17u) % TUNE_CREEPER_FLOWER_CHANCE) == 0u &&
+              ((dy + i32(hv >> 24u)) % 7) == 0) {
+            return M_CREEPER_FLOWER;
+          }
+          return M_VINE_HANG;
+        }
+      }
+    }
+  }
+
+  // ---- 2. moss beards on the great oaks and birches ----
+  // Spanish-moss style: not a strand from the canopy underside but a short,
+  // fuzzy skirt clinging to the outer canopy rim and to birch limbs, which is
+  // what makes an old forest read as damp rather than merely green.
+  // Restricted to the species that carry it so the whole forest does not fur
+  // over: great oaks (the ancient ones) and birch (whose bare limbs are what
+  // the beard is legible against).
+  if (t.species == 3u || t.species == 2u) {
+    let hm = hash3(seed ^ 0x3055u, bitcast<u32>(x), bitcast<u32>(z));
+    if ((hm % TUNE_MOSS_CHANCE) == 0u) {
+      // For the great oak, hang from the canopy underside like a short vine.
+      // For the birch there is no underside, so the beard hangs from the
+      // BOLE-TOP plane instead, thinned toward the middle so it reads as
+      // hanging off the limb structure rather than as a disc.
+      // 'from' is a RESERVED KEYWORD in WGSL — hence the awkward name.
+      var anchor = -1;
+      if (t.species == 3u) {
+        anchor = canopyUnderside(t, dx, dz);
+      } else {
+        // Birch: limbs occupy the band between the fork and the bole top and
+        // reach `radius` outward. A beard cell is legal inside that annulus,
+        // hanging from a height that falls off with distance so the skirt
+        // follows the limbs' outward-and-downward sweep.
+        let d2 = dx * dx + dz * dz;
+        let rr = t.radius;
+        if (d2 <= rr * rr && d2 > (rr / 3) * (rr / 3)) {
+          let d = i32(isqrt(u32(d2)));
+          anchor = t.trunk - (d * t.trunk) / max(rr * 3, 1);
+        }
+      }
+      if (anchor >= 0) {
+        let mlen = TUNE_MOSS_LEN_MIN + i32((hm >> 9u) % u32(max(TUNE_MOSS_LEN_SPAN, 1)));
+        if (dy <= anchor && dy > anchor - mlen && dy > 2) {
+          return M_MOSS_HANG;
+        }
+      }
+    }
+  }
+
+  // ---- 3. ivy climbing the bole ----
+  // The one climber that is not a hanging strand. Derived as a thin shell
+  // AROUND the trunk cylinder treeCell already defines, so it hugs whatever
+  // the trunk actually is (including the great oak's flared buttress) without
+  // restating the trunk shape: same taper expression, evaluated at +1.
+  // Angular gating by an isin() lobe makes the ivy climb in a couple of ropes
+  // up one side rather than sheathing the trunk uniformly.
+  if (t.species != 2u && dy <= t.trunk * 3 / 4) {
+    var tr = max(t.trunk / 22, 1);
+    let taper = tr - (tr * dy * 2) / max(t.trunk * 5, 1);
+    var trNow = max(taper, 1);
+    if (t.species == 3u && dy < t.trunk / 6) { trNow = trNow + tr / 2; }
+    // the shell: just outside the bark the trunk test claims
+    let ad = abs(dx) + abs(dz);
+    let onShell = max(abs(dx), abs(dz)) <= trNow + 1 && ad > trNow + trNow / 2 + 1 &&
+                  ad <= trNow + trNow / 2 + 3;
+    if (onShell) {
+      // Which side of the trunk, as a 256-step angle, from the sign-corrected
+      // octant — cheap and integer, no atan needed: the ivy only has to pick a
+      // consistent side, not a precise bearing.
+      let ang = (dx * 32) / max(abs(dx) + abs(dz), 1) + select(128, 0, dx >= 0);
+      // Two ropes that spiral: the favoured angle drifts with height.
+      let phase = (i32(t.rnd >> 11u) & 255) + dy * TUNE_IVY_TWIST / 16;
+      let off = ((ang - phase) & 127) - 64;
+      let hi = hash3(seed ^ 0x1E9Au, bitcast<u32>(x), bitcast<u32>(z));
+      if (abs(off) < 26 && (hi % TUNE_IVY_CHANCE) == 0u) {
+        return M_IVY;
+      }
+    }
+  }
+
+  return MAT_AIR;
+}
+
 // Union of every tree whose canopy can reach (x,y,z): the (2*TREE_SCAN+1)^2
 // tile neighborhood, which must cover the largest canopy radius (great oak,
 // ~4.5 m = 72 voxels) plus the trunk's in-tile jitter. First non-air wins —
@@ -696,9 +1163,449 @@ fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
       if (y < t.base || y > vtop) { continue; }
       let m = treeCell(t, x, y, z, seed);
       if (m != MAT_AIR) { return m; }
+      // Vines/moss/ivy fill cells the tree itself left EMPTY, so they are
+      // tested second and can never displace bark or foliage. No extra scan:
+      // this is the same tile, the same `t`, one more predicate.
+      // The horizontal gate above already bounds them — every strand hangs
+      // inside the canopy footprint or on the bole — and the vertical gate is
+      // bounded below by t.base, which is where a strand is cut off anyway.
+      let vm = treeVine(t, x, y, z, seed);
+      if (vm != MAT_AIR) { return vm; }
     }
   }
   return MAT_AIR;
+}
+
+// ---- cacti: the desert's implicit tall shape --------------------------------
+// A cactus is built exactly the way a tree is — per-tile hash placement, a pure
+// per-cell shape test, no state — and for the same reason: worldgen evaluates
+// one voxel at a time with no place to walk a turtle, so anything metre-scale
+// has to be an implicit function of the cell.
+//
+// WHY NOT A MICRO MODEL. A micro model is ONE world cell, which at
+// VOXEL_METERS is 10 cm. A saguaro is 3-5 m. The soft desert ground cover
+// (scrub, tussock) is micro; anything that stands over the player is a shape.
+//
+// SCALE. Dimensions are METRES * VOX_PER_M like the trees above, never bare
+// voxel counts — that is the mistake that produced knee-high "oaks" the first
+// time this file was written, and a 40-voxel saguaro would be 2.5 m of
+// waist-high stump rather than the thing you see across a desert.
+//
+// Two species, because they read completely differently and the contrast is
+// what sells the biome:
+//   0 SAGUARO — a tall ribbed column, 3.2-5.0 m, with 0-2 upcurved arms. The
+//               silhouette everyone already has in their head.
+//   1 BARREL  — a squat ribbed drum, 0.5-0.9 m, crowned with flowers. Ground
+//               furniture; it is what stops the desert floor being empty
+//               between the columns.
+//
+// COST. One tile lookup plus a bounded per-arm loop (CACTUS_ARMS = 2, no
+// recursion). The scan is +-1 tile rather than the trees' +-2 because a cactus
+// is narrow: the widest thing here is a saguaro with both arms out, ~1.1 m of
+// half-width, against a 2.5 m tile. See CACTUS_SCAN.
+const CACTUS_TILE : i32 = 40;    // 2.5 m between cactus sites
+// How many tiles out to search. A cactus can overhang its own tile by
+// (arm reach + in-tile jitter) = ~18 + 20 = 38 voxels, which is inside one
+// tile, so +-1 covers it. Deliberately NOT the trees' +-2: this scan runs for
+// every air cell above the desert floor and a 9-tile scan is 9/25 the cost of
+// a 25-tile one for a shape that cannot reach that far.
+const CACTUS_SCAN : i32 = 1;
+const CACTUS_ARMS : i32 = 2;     // hard cap; bounds the per-cell loop
+
+struct Cactus {
+  present : bool,
+  species : u32,   // 0 saguaro, 1 barrel
+  wx      : i32,   // world x/z of the column centre
+  wz      : i32,
+  base    : i32,   // ground height at the root
+  height  : i32,   // column height in voxels
+  radius  : i32,   // column radius in voxels
+  arms    : i32,   // 0..CACTUS_ARMS (saguaro only)
+  rnd     : u32,
+};
+
+fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
+  var c : Cactus;
+  c.present = false;
+  c.species = 0u; c.wx = 0; c.wz = 0; c.base = 0;
+  c.height = 0; c.radius = 0; c.arms = 0; c.rnd = 0u;
+
+  // DISTINCT SALT. Not a bit-slice of the tree hash and not the tree salt with
+  // a different shift: the pond-life comment in genCell documents exactly why
+  // slices of one hash correlate, and a cactus that only ever grew where a
+  // dead bush also rolled would read as a planted grid.
+  let hsh = hash3(seed ^ 0xCAC71u, bitcast<u32>(tx), bitcast<u32>(tz));
+  c.rnd = hsh;
+  let inset = CACTUS_TILE / 4;
+  let span = u32(CACTUS_TILE / 2);
+  c.wx = tx * CACTUS_TILE + inset + i32((hsh >> 3u) % span);
+  c.wz = tz * CACTUS_TILE + inset + i32((hsh >> 9u) % span);
+
+  // Desert only, and never on the keep-out ground every other feature avoids:
+  // the spawn clearing, the selftest fixture pads, or a pond.
+  if (biomeAt(c.wx, c.wz, seed) != B_DESERT) { return c; }
+  let h = baseHeight(c.wx, c.wz, seed);
+  c.base = h;
+  if (h >= TREELINE) { return c; }
+  if (inSpawnClearing(c.wx, c.wz)) { return c; }
+  if (onFixturePad(c.wx, c.wz)) { return c; }
+  if (pondAt(c.wx, c.wz, seed).y >= 0) { return c; }
+
+  let roll = (hsh >> 17u) % 100u;
+  if (roll >= TUNE_CACTUS_CHANCE) { return c; }
+
+  // Barrels outnumber saguaros heavily. A desert with a saguaro every 2.5 m is
+  // a plantation; the columns have to be occasional or they stop being
+  // landmarks, which is the entire job they do here.
+  let sroll = (hsh >> 24u) % 100u;
+  c.species = select(1u, 0u, sroll < TUNE_SAGUARO_FRACTION);
+
+  // Dimensions in TENTHS OF A METRE, converted below — same convention as
+  // treeInfo, and the reason a saguaro comes out at a real 3.2-5.0 m instead
+  // of as a tabletop model of one.
+  let j = i32((hsh >> 12u) % 5u);
+  var hDm = 0;
+  var rDm = 0;
+  if (c.species == 0u) {
+    hDm = 32 + j * 5;    // saguaro 3.2 - 5.2 m
+    rDm = 3;             // ~0.3 m radius: a 0.6 m thick column
+    // Arms only on the taller half: a young saguaro has none, and putting arms
+    // on a short one is the single most obviously wrong thing this shape can
+    // do. 0, 1 or 2, never more — the loop below is bounded by CACTUS_ARMS.
+    c.arms = select(0, i32((hsh >> 21u) % 3u), j >= 2);
+  } else {
+    hDm = 5 + j;         // barrel 0.5 - 0.9 m
+    rDm = 3 + j / 2;     // squat: radius comparable to height
+  }
+  c.height = hDm * VOX_PER_M / 10;
+  c.radius = max(rDm * VOX_PER_M / 10, 2);
+  c.present = true;
+  return c;
+}
+
+// Where arm `i` leaves the bole, and how far it reaches. Returns
+// (attach height, horizontal dx, horizontal dz, arm length), all in voxels.
+// Split out so the AABB in cactusAt can bound the arms without duplicating the
+// geometry — an AABB that disagrees with the shape is how a limb gets sliced
+// off at an invisible plane.
+fn cactusArm(c : Cactus, i : i32) -> vec4<i32> {
+  let ah = hash3(c.rnd ^ 0x4A12u, bitcast<u32>(i), 3u);
+  // Arms leave the bole between 40% and 65% of its height. Lower than that and
+  // the arm looks like a second plant; higher and the classic candelabra
+  // silhouette collapses into a fork at the tip.
+  let attach = c.height * 2 / 5 + i32(ah % u32(max(c.height / 4, 1)));
+  // Azimuth on the 256-step integer circle. Arms are pushed to opposite sides
+  // (i * 128) so two arms never grow into each other, with per-arm jitter.
+  let az = (i * 128 + i32(ah >> 7u) % 90) & 255;
+  let reach = c.radius * 3 + i32((ah >> 15u) % u32(max(c.radius * 2, 1)));
+  return vec4<i32>(attach, (isin((az + 64) & 255) * reach) / 256,
+                   (isin(az) * reach) / 256, reach);
+}
+
+// Material this cactus contributes at world cell (x,y,z), or MAT_AIR.
+fn cactusCell(c : Cactus, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  let dx = x - c.wx;
+  let dz = z - c.wz;
+  let dy = y - c.base;
+  if (dy < 0) { return MAT_AIR; }
+
+  // ---- the bole ----
+  // A cactus is a RIBBED column, and the ribs are the whole reason it reads as
+  // a cactus rather than as a green pipe. The rib is derived from the integer
+  // azimuth of the cell about the axis, so it is a real vertical flute rather
+  // than a hash speckle — speckle reads as damage, flutes read as anatomy.
+  let d2 = dx * dx + dz * dz;
+  let r = c.radius;
+  if (c.species == 0u) {
+    if (dy <= c.height && d2 <= r * r) {
+      // Rib test: 12 flutes around the column. `dx*8/max(...)` is a cheap
+      // integer stand-in for the azimuth — exact angles are not needed, only a
+      // repeating function of direction that is identical on every machine.
+      let flute = (abs(dx) * 7 + abs(dz) * 11 + dy / 24) % 5;
+      // The rim of the column is skin; the middle is flesh. That split is what
+      // makes a cut cactus show pale flesh inside a darker wall.
+      let rim = d2 * 4 >= r * r * 3;
+      if (rim || flute == 0) { return M_CACTUS_RIB; }
+      return M_CACTUS;
+    }
+    // ---- arms ----
+    // Each arm is TWO segments: out from the bole, then straight up. That
+    // right-angle elbow IS the saguaro silhouette; a single sloping segment
+    // reads as a broken branch.
+    for (var i = 0; i < CACTUS_ARMS; i++) {
+      if (i >= c.arms) { break; }
+      let a = cactusArm(c, i);
+      let attach = a.x;
+      let ex = a.y;
+      let ez = a.z;
+      let ar = max(r * 2 / 3, 2);
+      // horizontal run, at the attach height
+      if (segDist2(dx, dy, dz, 0, attach, 0, ex, attach, ez) <= ar * ar) {
+        return M_CACTUS_RIB;
+      }
+      // vertical rise from the elbow, stopping short of the bole tip so the
+      // main column stays the tallest point
+      let riseTop = attach + (c.height - attach) * 3 / 4;
+      if (segDist2(dx, dy, dz, ex, attach, ez, ex, riseTop, ez) <= ar * ar) {
+        return M_CACTUS_RIB;
+      }
+      // a bloom on the arm tip, on some arms
+      if (((c.rnd >> u32(4 + i)) % 3u) == 0u) {
+        let bx = dx - ex; let by = dy - (riseTop + 1); let bz = dz - ez;
+        if (bx * bx + by * by + bz * bz <= 4) { return M_CACTUS_BLOOM; }
+      }
+    }
+    // Crown of flowers on the bole tip. A blooming saguaro is the thing that
+    // makes one column in a field read as the subject of the frame.
+    if (((c.rnd >> 11u) % 3u) == 0u && dy == c.height + 1 && d2 <= r * r) {
+      return M_CACTUS_BLOOM;
+    }
+    return MAT_AIR;
+  }
+
+  // ---- barrel cactus: a squat ribbed drum ----
+  // Domed rather than flat-topped: the top third pulls in, so it reads as a
+  // barrel and not as a cylinder someone cut off.
+  if (dy > c.height) {
+    // the flower crown sits one voxel above the dome
+    if (dy == c.height + 1 && d2 <= (r / 2) * (r / 2) &&
+        ((c.rnd >> 13u) % 2u) == 0u) {
+      return M_CACTUS_BLOOM;
+    }
+    return MAT_AIR;
+  }
+  // radius shrinks over the top third
+  var br = r;
+  let shoulder = c.height * 2 / 3;
+  if (dy > shoulder) {
+    br = r - (r * (dy - shoulder)) / max(c.height - shoulder, 1);
+  }
+  if (d2 <= br * br) {
+    let flute = (abs(dx) * 7 + abs(dz) * 11) % 4;
+    let rim = d2 * 4 >= br * br * 3;
+    if (rim || flute == 0) { return M_CACTUS_RIB; }
+    return M_CACTUS;
+  }
+  return MAT_AIR;
+}
+
+// Union of every cactus whose shape can reach (x,y,z), over the 3x3 tile
+// neighbourhood. First non-air wins — order is by tile index, a fixed priority,
+// never dispatch order (rule 1). Same structure as treeAt, including the AABB
+// reject before any shape work.
+fn cactusAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  let tx = fdiv(x, CACTUS_TILE);
+  let tz = fdiv(z, CACTUS_TILE);
+  for (var oz = -CACTUS_SCAN; oz <= CACTUS_SCAN; oz++) {
+    for (var ox = -CACTUS_SCAN; ox <= CACTUS_SCAN; ox++) {
+      let c = cactusInfo(tx + ox, tz + oz, seed);
+      if (!c.present) { continue; }
+      // HORIZONTAL reject. Must cover the widest thing the species can produce
+      // or the outer arm gets sliced off at an invisible cylinder — the same
+      // trap the birch's `reach` comment documents. A saguaro arm reaches
+      // radius*3 + jitter from the axis, plus its own thickness.
+      var reach = c.radius + 2;
+      if (c.species == 0u) { reach = c.radius * 6 + 4; }
+      if (abs(x - c.wx) > reach || abs(z - c.wz) > reach) { continue; }
+      // VERTICAL extent must cover the tallest thing the species can put above
+      // its base. Clipping this is how canopies get flat tops (treeAt's vtop
+      // comment); here it would behead the saguaro and its crown of flowers.
+      // + 2 covers the bloom sitting one voxel above the tip.
+      let vtop = c.base + c.height + 2;
+      if (y < c.base || y > vtop) { continue; }
+      let m = cactusCell(c, x, y, z, seed);
+      if (m != MAT_AIR) { return m; }
+    }
+  }
+  return MAT_AIR;
+}
+
+// ---- forest undergrowth: what the canopy decides -----------------------------
+// A real forest floor is not a uniform lawn with flowers on it. Under a closed
+// crown almost no light reaches the ground, so the plants that live there are
+// the shade specialists — ferns, mushrooms, moss, brambles, leaf litter, and
+// the seedlings waiting for a gap. In the gaps between crowns you get the
+// opposite: grass and flowers, which need the light.
+//
+// So undergrowth is placed as a function of CANOPY COVER rather than of biome,
+// and that single inversion is what makes the forest read as LAYERED instead of
+// as one green skin with confetti on it. Cover is the input; the existing
+// grass/flower block is now gated on the complement of it.
+//
+// COST. Answering "how covered is this column" is the same 25-tile scan
+// treeAt/treeCanopyAt already run, so this function does it ONCE and returns
+// everything the placement rule needs — cover, and the distance to the nearest
+// trunk (mushrooms ring tree bases, which is the cheapest high-value detail
+// available here). Calling treeCanopyAt separately would have doubled the scan
+// for the same answer. The scan is bounded at (2*TREE_SCAN+1)^2 = 25 tiles and
+// runs for exactly one Y per column (the y == h + 1 gate), so it costs the same
+// order as the flower block it sits next to.
+//
+// Everything placed is INERT (rule 2): no reaction in reactions.json uses any
+// of these as `self` with an emit, so a generated forest floor settles and
+// sleeps exactly as the bare one did.
+// ---- meadow flowers: which species, and how tall --------------------------
+// A micro model is ONE world cell, and a cell is VOXEL_METERS = 10 cm. So a
+// single-cell flower is 10 cm tall whatever its model does, and every species
+// is the same height as every other — a "foxglove" (1-2 m in life) came out the
+// same size as clover. That is the tabletop-model-of-itself failure the tree
+// block above documents, in miniature.
+//
+// The fix is the reed pattern: a flower is a STACK of cells, and the model in
+// each cell is the same micro model repeated. Height is per-species (a briar is
+// not a clover) with a per-plant hash jitter on top, so a patch has a natural
+// height spread instead of being a mown lawn of identical stems.
+//
+// flowerSpecies() is the single source of truth for "what grows in this
+// column", called by BOTH the base-cell branch and the upper-stalk branch.
+// Sharing it is what makes a stalk one continuous plant rather than two
+// unrelated halves that happen to be adjacent — the same reason the reed block
+// tests the same hashes above and below the waterline.
+struct Flower {
+  mat    : u32,   // MAT_AIR when this column grows no flower
+  height : i32,   // total cells, >= 1
+};
+
+// Per-species base height in CELLS, jittered per plant. Ranges are chosen
+// against the 10 cm cell: clover is ground cover and stays 1 cell (10 cm),
+// while a foxglove spire reaches 4 (40 cm). These are deliberately at the low
+// end of life-size — a true 1.5 m foxglove is 15 cells, which at meadow density
+// would be a wall of stems the player cannot see over.
+fn flowerHeight(sp : u32, h : u32) -> i32 {
+  switch (sp) {
+    case M_CLOVER:    { return 1; }                        // 10 cm mat
+    case M_BUTTERCUP: { return 2 + i32(h % 2u); }           // 20-30 cm
+    case M_BLUEBELL:  { return 2 + i32(h % 2u); }           // 20-30 cm
+    case M_WILDROSE:  { return 3 + i32(h % 2u); }           // 30-40 cm briar
+    default:          { return 3 + i32(h % 3u); }           // foxglove 30-50 cm
+  }
+}
+
+// Which flower this column grows, and how tall. `cover` is the canopy cover
+// from undergrowthSite (wild rose is a woodland-margin plant, so it is placed
+// by cover rather than by the species field).
+//
+// Pure function of (x, z, seed, cover): the upper-stalk branch re-derives it
+// per cell WITHOUT re-running the 25-tile scan, by passing the cover it already
+// knows is irrelevant there (see the call site) — so a taller flower costs a
+// few hashes per extra cell, never another scan.
+fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
+  var f : Flower;
+  f.mat = MAT_AIR;
+  f.height = 0;
+
+  let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
+  let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
+  let biome = biomeAt(x, z, seed);
+  var thresh = 0u;
+  if (biome == B_MEADOW) { thresh = select(6u, 60u, clump > 165); }
+  else                   { thresh = select(2u, 16u, clump > 190); }
+  if ((fr % 1000u) >= thresh) { return f; }
+
+  let sp = vnoise(x + 911, z - 733, 40 * HSCALE, seed ^ 0xF1A5u);
+  let spj = sp + (vnoise(x, z, 11 * HSCALE, seed ^ 0xF1A6u) - 128) / 4;
+  let hBell = hash3(seed ^ 0xB1E7u, bitcast<u32>(x), bitcast<u32>(z));
+  let hFoxg = hash3(seed ^ 0xF0C9u, bitcast<u32>(x), bitcast<u32>(z));
+  let hButt = hash3(seed ^ 0x8B77u, bitcast<u32>(x), bitcast<u32>(z));
+  let hClov = hash3(seed ^ 0xC10Fu, bitcast<u32>(x), bitcast<u32>(z));
+  let hRose = hash3(seed ^ 0x8053u, bitcast<u32>(x), bitcast<u32>(z));
+
+  // Grass is the default: a meadow is grass WITH flowers in it. Grass and petal
+  // stay ONE cell — they are the ground layer the flowers rise out of.
+  var m = select(M_PETAL, M_GRASS, (fr >> 11u) % 4u != 0u);
+  if (spj < 55) {
+    if ((hBell % 3u) == 0u) { m = M_BLUEBELL; }
+  } else if (spj < 100) {
+    if ((hButt % 2u) == 0u) { m = M_BUTTERCUP; }
+  } else if (spj < 140) {
+    if ((hClov % 3u) != 0u) { m = M_CLOVER; }
+  } else if (spj < 175) {
+    if ((hFoxg % 7u) == 0u) { m = M_FOXGLOVE; }
+    else if ((hButt % 3u) == 0u) { m = M_BUTTERCUP; }
+  }
+  if (cover >= UG_COVER_EDGE && (hRose % 9u) == 0u) { m = M_WILDROSE; }
+
+  f.mat = m;
+  // Only the five flowers stack; grass and petal are the one-cell ground layer.
+  if (m == M_GRASS || m == M_PETAL) { f.height = 1; }
+  else { f.height = flowerHeight(m, hFoxg >> 7u); }
+  return f;
+}
+
+struct Undergrowth {
+  cover   : i32,   // 0 = open sky, 255 = deep under a crown
+  trunkD2 : i32,   // squared XZ distance to the nearest trunk, or a large value
+  species : u32,   // species of that nearest tree (0..4)
+  rnd     : u32,   // that tree's hash, for per-tree variation of its own ring
+};
+
+// Cover contribution falls off from the crown CENTRE to its rim rather than
+// being a hard disc, because the interesting structure is the half-lit margin
+// where fern gives way to grass. A hard disc puts a visible circle on the
+// ground under every tree; a ramp puts a gradient there, and gradients are what
+// the eye reads as depth.
+//
+// Contributions ADD across overlapping crowns and saturate at 255: two crowns
+// overlapping is genuinely darker than one, and that is what makes a dense
+// stand of oaks grow a different floor from an isolated tree.
+fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
+  var u : Undergrowth;
+  u.cover = 0;
+  u.trunkD2 = 1 << 24;      // "no trunk anywhere near", larger than any reach
+  u.species = 0u;
+  u.rnd = 0u;
+
+  let tx = fdiv(x, TREE_TILE);
+  let tz = fdiv(z, TREE_TILE);
+  for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
+      let t = treeInfo(tx + ox, tz + oz, seed);
+      if (!t.present) { continue; }
+      let dx = x - t.wx;
+      let dz = z - t.wz;
+      let d2 = dx * dx + dz * dz;
+
+      // Nearest trunk, for the mushroom ring. Ties broken by tile ORDER, which
+      // is fixed (rule 1) — never by dispatch order.
+      if (d2 < u.trunkD2) {
+        u.trunkD2 = d2;
+        u.species = t.species;
+        u.rnd = t.rnd;
+      }
+
+      // Canopy cover. A bush (species 4) is knee-high and shades nothing, so it
+      // contributes none — including it made every meadow read as closed forest
+      // because bushes are the commonest meadow tile.
+      if (t.species == 4u) { continue; }
+      // Birch is a branch skeleton with leaf clusters at the twig tips, so it
+      // covers a wider circle far more thinly. Same approximation the far field
+      // makes in treeCanopyAt: a bigger radius, much less weight.
+      var r = t.radius;
+      var peak = 200;
+      if (t.species == 2u) { r = t.radius * 2; peak = 90; }
+      else if (t.species == 1u) { peak = 230; }   // pine: dense, dark
+      else if (t.species == 3u) { peak = 255; }   // great oak: the darkest floor
+      if (d2 > r * r) { continue; }
+      // Linear ramp in the RADIUS (not in d2), so the falloff is even across
+      // the crown instead of hugging the rim. Integer sqrt-free: compare d2
+      // against r2 scaled by the fraction, which is the same ordering.
+      // cover = peak * (1 - d/r), computed as peak * (r2 - d2) / r2 would bias
+      // toward the centre; the halfway point of that ramp is where fern stops
+      // and grass starts, so it is worth getting the shape right.
+      let rr = max(r, 1);
+      // d/r in 1/256ths. Computed as isqrt(d2 << 16 / r^2) rather than as
+      // 256 * isqrt(d2) / r: the latter takes the square root FIRST and so
+      // throws away its fractional part before the scale, which quantises the
+      // ramp into visible concentric steps at small radii.
+      // Done in u32 deliberately. d2 reaches (2 * 67)^2 = 17956 for the widest
+      // birch footprint, and 17956 << 16 is 1.18e9 — inside i32, but close
+      // enough to 2^31 that a future wider crown would silently wrap. u32 has
+      // the headroom and every operand here is non-negative by construction.
+      let frac = i32(isqrt((u32(d2) << 16u) / u32(rr * rr)));   // 0..256
+      u.cover = min(255, u.cover + (peak * (256 - min(frac, 256))) / 256);
+    }
+  }
+  return u;
 }
 
 // Caves: COLUMN BANDS carved by 2D noise — for each (x,z) inside a cavern
@@ -791,6 +1698,45 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
     if (fluidTop < 0) { fluid = M_WATER; fluidTop = pw.y; }
   }
 
+  // ---- the shore band (see shoreAt) ----
+  // Queried ONCE per column, here, and reused by both the ground-skin swap
+  // below and the shore-cover block further down — it is the one call in this
+  // function that can cost a pondSurface (24 baseHeight samples), so asking
+  // twice would double it for every shore column.
+  //
+  // Suppressed wherever the pond block itself is suppressed: never inside the
+  // authored pool rims (the lava and oil pools must not grow weeds — the same
+  // reason the pond-life block gates on `pond >= 0`), never on a fixture pad or
+  // in the desert, and never above the treeline, so a shore is always a shore
+  // and never a marsh growing out of a snowfield.
+  var shore : Shore;
+  shore.onShore = false; shore.past = 0; shore.surf = -1;
+  if (pond < 0 && !inRim && !onFixturePad(x, z) && biome != B_DESERT &&
+      h < TREELINE) {
+    shore = shoreAt(x, z, seed);
+    // A column whose ground stands well above the waterline is a BLUFF, not a
+    // shore. This is the single most load-bearing test in the feature, and it
+    // is a HEIGHT test rather than a second radius on purpose:
+    //
+    // pondSurface is `min(24 rim samples) - 2`, so the waterline sits under the
+    // LOWEST point of the rim and most of the rim stands well above it — at the
+    // default tuning the median column even at past=0 is ~14 voxels up. A band
+    // defined by radius alone therefore paints marsh up whatever hillside
+    // happens to abut the disc, which is exactly the artifact that gives away
+    // that the fringe is a radius and not a wetness.
+    //
+    // Cutting on height instead makes the marsh follow the LOW parts of the
+    // rim, so a pond in rolling ground gets reed beds in its shallow bays and
+    // dry bank on its steep sides — which is what a real pond does, and it
+    // costs one comparison. `shoreLift` is the knob: it is a fraction of the
+    // raw band that survives, and it moves it a LOT (at the default pond it
+    // takes 5% of columns at 4 and 99% at 24), so it is worth having as its own
+    // parameter rather than derived from the band width.
+    if (shore.onShore && h > shore.surf + TUNE_SHORE_LIFT) {
+      shore.onShore = false;
+    }
+  }
+
   if (y <= h) {
     let submerged = pond >= 0;
     if (!inPoolFloor && h >= TREELINE && y > h - 2) {
@@ -801,6 +1747,24 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
       mat = M_SAND;                        // sandy pond bed
     } else if ((biome == B_DESERT || onFixturePad(x, z)) && y > h - 4) {
       mat = M_SAND;                        // loose cap — avalanches into repose piles
+    } else if (shore.onShore && shore.past < TUNE_SHORE_MUD_WIDTH &&
+               y > h - 2) {
+      // WET MUD, in the inner ring only. This is the transition the whole
+      // feature exists for: the bed inside the disc is sand and the bank
+      // outside it was the same grass as a hillside a kilometre inland, so the
+      // waterline was a hard colour edge with nothing in between.
+      //
+      // Two voxels deep rather than one, unlike the grass skin, because you
+      // dig into a bank far more often than into open ground and a one-voxel
+      // mud skin over stone reads as painted-on the moment it is broken.
+      //
+      // Solid (not powder) for the reason the note under the grass skin gives:
+      // a powder shell on a slope avalanches out from under itself and the
+      // chunk never sleeps.
+      //
+      // A stone face inside the band that is NOT the mud ring gets wet moss
+      // instead — see below.
+      mat = M_SHORE_MUD;
     } else if (y == h) {
       mat = M_GRASS;                       // forest floor: one grass skin (SOLID)
     } else {
@@ -821,8 +1785,99 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
       if (cv == 1) { mat = MAT_AIR; }
       else if (cv == 2) { mat = M_LAVA; }
     }
+    // WET MOSS on the rock at the waterline. A SKIN SWAP on a surface cell that
+    // already exists, not a plant placed above one, so it is free: no extra
+    // voxel, no extra occupancy, nothing new for the CA to look at. Only the
+    // topmost cell, and only where the mud ring has not already claimed the
+    // column, so this is the OUTER half of the band — the stone that is damp
+    // rather than the ground that is mud.
+    //
+    // Its own hash salt, like every other species here: slicing one column
+    // hash for two rolls correlates them, which is documented at length in the
+    // pond-life block below and is what once turned scattered planting into a
+    // solid wall.
+    if (mat == M_STONE && y == h && shore.onShore &&
+        hash3(seed ^ 0x4D05u, bitcast<u32>(x), bitcast<u32>(z))
+          % TUNE_SHORE_MOSS_CHANCE == 0u) {
+      mat = M_WET_MOSS;
+    }
   } else if (fluidTop >= 0 && y <= fluidTop) {
     mat = fluid;
+  }
+
+  // ---- pond life: kelp, reeds, lilypads ----
+  // Placed into cells that would otherwise be pond WATER, so nothing here can
+  // displace terrain or spill outside the bowl. Restricted to `pond >= 0`
+  // (the disc ponds) rather than to any fluid: the authored lava and oil pools
+  // are the same `fluid` machinery and should obviously not grow weeds, and
+  // the disc pond is the only body whose floor and surface are both known here
+  // as pure functions of the column.
+  //
+  // Everything is an INERT solid placed once at generation. Nothing grows,
+  // spreads or reacts with the water it stands in — a plant that did would
+  // keep every pond chunk awake forever and break the sleep budget (rule 2).
+  //
+  // All placement hashes are pure functions of (x, z, seed), like every other
+  // worldgen feature, so a plant straddling a chunk border generates
+  // identically from either chunk and regrows the same after an eviction.
+  // SEPARATE HASHES PER SPECIES, not bit-slices of one. Slicing (fr, fr>>3,
+  // fr>>17) looks independent and is not: the slices share entropy, so the
+  // three rolls correlate and a column that grew one plant is far more likely
+  // than chance to grow another. That is what turned a scattered planting into
+  // a solid wall of stalks. Three distinct salts cost two extra hashes per
+  // pond column and are actually independent.
+  if (mat == M_WATER && pond >= 0) {
+    let bed = min(h, pw.x);          // the carved bowl floor at this column
+    let depth = pond - bed;          // water column height in voxels
+    let above = pond - y;            // how far under the surface this cell is
+    let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
+    let hReed = hash3(seed ^ 0x2E3Du, bitcast<u32>(x), bitcast<u32>(z));
+    let hKelp = hash3(seed ^ 0xC5B1u, bitcast<u32>(x), bitcast<u32>(z));
+
+    // LILYPADS: a single cell floating ON the surface. Needs enough water
+    // under it that a pad reads as floating rather than as lying on mud.
+    if (y == pond && depth >= 10 && (hLily % TUNE_LILY_CHANCE) == 0u) {
+      mat = M_LILYPAD;
+    } else if (depth >= 4 && depth <= 14 && above >= 0 &&
+               y - bed < TUNE_REED_HEIGHT &&
+               (hReed % TUNE_REED_CHANCE) == 0u) {
+      // REEDS: emergent, in the SHALLOW MARGIN only — a narrow depth band, so
+      // they form a fringe around the shore rather than filling the bowl. They
+      // grow from the bed and break the surface, which is what makes them read
+      // as reeds rather than as underwater grass, so the height test is
+      // against the BED, not against the waterline.
+      mat = M_REED;
+    } else if (depth > 16 && above > 4 && y - bed < TUNE_KELP_HEIGHT &&
+               (hKelp % TUNE_KELP_CHANCE) == 0u) {
+      // KELP: fully submerged, in the DEEP MIDDLE only (depth > 16 excludes
+      // the whole shallow ring the reeds occupy, so the two never interleave).
+      // `above > 4` keeps a clear margin below the surface so kelp never pokes
+      // through — that margin is the difference between kelp and a reed. This
+      // is the plant that gives the submerged view its vertical structure for
+      // the light shafts to cut across.
+      mat = M_KELP;
+    }
+  }
+  // Above the waterline over a pond: the emergent half of the reeds, and the
+  // lily blossoms that sit proud of their pads. Both are placed in AIR cells,
+  // so they are the same features as the water-cell block above continued
+  // upward — same hashes, same column tests, so a reed is one continuous stalk
+  // through the surface rather than two unrelated halves.
+  if (mat == MAT_AIR && pond >= 0 && y > pond) {
+    let bed = min(h, pw.x);
+    let depth = pond - bed;
+    let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
+    let hReed = hash3(seed ^ 0x2E3Du, bitcast<u32>(x), bitcast<u32>(z));
+    if (depth >= 4 && depth <= 14 && y - bed < TUNE_REED_HEIGHT &&
+        (hReed % TUNE_REED_CHANCE) == 0u) {
+      mat = M_REED;
+    } else if (y == pond + 1 && depth >= 10 &&
+               (hLily % TUNE_LILY_CHANCE) == 0u &&
+               ((hLily >> 9u) % TUNE_LILY_FLOWER_CHANCE) == 0u) {
+      // Blossom on a minority of pads. Gated on the SAME pad roll, so a flower
+      // can only ever appear on a cell that actually grew a pad under it.
+      mat = M_LILYFLR;
+    }
   }
 
   // ---- surface cover: trees, then ground flora ----
@@ -833,27 +1888,340 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
     if (tm != MAT_AIR) { mat = tm; }
   }
 
-  // Ground flora on the grass skin: flower clumps in meadows, sparse elsewhere.
-  // Inert petal/grass, placed only in the one voxel above the surface, so this
-  // costs a settled world nothing.
+  // ---- shore cover: the marsh fringe outside the pond ----
+  // Cattails, marsh grass, horsetail and the water iris, on the band shoreAt()
+  // found. Placed only into cells that are still AIR above the ground, so
+  // nothing here can displace terrain, and — because the whole block is gated
+  // on `shore.onShore`, which is only ever set outside a disc — nothing here
+  // can spill into the bowl either. Running AFTER the tree block means a trunk
+  // rooted on the bank keeps its cells; the marsh grows around it, which is
+  // what a real bankside willow looks like.
+  //
+  // Everything is an INERT solid placed once at generation, exactly like the
+  // pond life inside the disc. Nothing grows, spreads or reacts with the water
+  // it stands beside: a shore plant that did would keep every pond chunk awake
+  // forever and break the sleep budget (rule 2).
+  //
+  // FOUR DISTINCT HASH SALTS, one per species, never bit-slices of one hash.
+  // The pond-life block above documents why at length — slices of a single
+  // hash share entropy, so a column that grew one plant is far likelier than
+  // chance to grow another, and the scattered planting collapses into a wall.
+  // The cost is three extra hashes on shore columns only.
+  //
+  // Species by DISTANCE FROM THE WATER, so the band reads as a gradient rather
+  // than as a mixed salad: cattails have their feet wet, horsetail stands just
+  // behind them, marsh grass covers the lot, and the iris is the rare accent.
+  if (mat == MAT_AIR && shore.onShore && y > h) {
+    let up = y - h;                  // voxels above this column's ground
+    let hCat  = hash3(seed ^ 0x9C41u, bitcast<u32>(x), bitcast<u32>(z));
+    let hHors = hash3(seed ^ 0x3E77u, bitcast<u32>(x), bitcast<u32>(z));
+    let hSedge= hash3(seed ^ 0x58BDu, bitcast<u32>(x), bitcast<u32>(z));
+    let hIris = hash3(seed ^ 0xA219u, bitcast<u32>(x), bitcast<u32>(z));
+
+    // CATTAILS: the tall silhouette at the waterline, and the only thing here
+    // that is more than a couple of voxels tall. Height jitters per column —
+    // a bed of stalks all cut to exactly one height reads as a fence.
+    let catH = TUNE_SHORE_CATTAIL_HEIGHT + i32((hCat >> 5u) % 7u) - 3;
+    if (shore.past <= TUNE_SHORE_CATTAIL_REACH && up < catH &&
+        (hCat % TUNE_SHORE_CATTAIL_CHANCE) == 0u) {
+      // The brown seed head caps the top two cells of the stalk. Not its own
+      // roll: it is part of the same plant, so gating it on the SAME hash is
+      // what keeps a head from ever floating over a column with no stalk.
+      mat = select(M_CATTAIL, M_CATTAIL_HEAD, up >= catH - 2);
+    } else if (up < TUNE_SHORE_HORSETAIL_HEIGHT + i32((hHors >> 5u) % 5u) - 2 &&
+               (hHors % TUNE_SHORE_HORSETAIL_CHANCE) == 0u) {
+      // HORSETAIL: mid-height jointed stalks filling between the cattails at
+      // the water and the grass further up the bank. Grey-green, so the three
+      // species do not merge into one block of the same colour.
+      mat = M_HORSETAIL;
+    } else if (up == 1 && (hIris % TUNE_SHORE_IRIS_CHANCE) == 0u) {
+      // WATER IRIS: one cell, a micro model. Rare on purpose — this is the
+      // thing you spot, not the thing you wade through.
+      mat = M_WATER_IRIS;
+    } else if (up == 1 && (hSedge % TUNE_SHORE_SEDGE_CHANCE) == 0u) {
+      // MARSH GRASS: one cell, a micro model, and the densest of the four. It
+      // is the ground cover of the whole band, which is what makes the fringe
+      // read as marsh rather than as lawn running up to water — so it is rolled
+      // LAST, filling whatever the taller species did not claim.
+      mat = M_MARSH_GRASS;
+    }
+  }
+
+  // ---- ground cover: undergrowth under the canopy, flowers in the gaps ----
+  //
+  // ONE block, TWO layers, split by canopy cover. The forest floor used to be a
+  // single grass skin with confetti flowers on it, which is exactly backwards
+  // for a closed canopy: under a crown almost no light reaches the ground, so
+  // what grows there is the shade set (fern, mushroom, moss, bramble, litter,
+  // and the seedlings waiting for a light gap), and grass and flowers are what
+  // fill the GAPS between crowns. Inverting on cover is what turns a uniform
+  // green skin into a layered forest.
+  //
+  // Everything here is INERT and lives in the ONE voxel above the surface, so a
+  // settled world still costs nothing (rule 2). Nothing in this block is a
+  // `stem`/`sprout`/`seed`; a generated forest of growing plants would keep
+  // every chunk in the world awake, which is the trap the file header names.
+  //
   // The fixture pads stay bare for the same reason they stay sandy: a single
   // grass tuft above the surface is a SOLID voxel the selftest's dropped bodies
-  // come to rest on, which lifts them a voxel and re-geometries the burn.
+  // come to rest on, which lifts them a voxel and re-geometries the burn. The
+  // undergrowth materials are `passable` — the player walks through a fern
+  // rather than into it — but passable is a COLLISION property only; the CA,
+  // fire, the brush and the renderer all still see a solid, so the rule applies
+  // to them exactly as it does to grass.
+  // `!shore.onShore`: the shore band has its OWN cover set (the block above),
+  // and a column that grew no marsh plant should stay bare rather than fall
+  // through to the upland set. Meadow flowers and dry-woodland ferns scattered
+  // through a reed bed are what would give away that the marsh is a decal on
+  // ordinary ground instead of a different place — the same reason the shore
+  // ground skin is mud rather than a tinted grass.
   if (mat == MAT_AIR && y == h + 1 && !inRim && pond < 0 && h < TREELINE &&
-      biome != B_DESERT && !onFixturePad(x, z)) {
+      biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
     let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
-    // clump mask: flowers grow in patches, not as uniform static
-    let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
-    // Tuned down deliberately: at ~15% coverage the flowers read as confetti
-    // sprayed over the whole map rather than as patches in a meadow. Keeping
-    // them inside the clump mask and rare outside it is what makes finding a
-    // flowery clearing feel like finding something.
-    var thresh = 0u;
-    if (biome == B_MEADOW) { thresh = select(6u, 60u, clump > 165); }
-    else                   { thresh = select(2u, 16u, clump > 190); }
-    let roll = fr % 1000u;
-    if (roll < thresh) {
-      mat = select(M_PETAL, M_GRASS, (fr >> 11u) % 4u != 0u);  // mostly tufts
+    // ONE 25-tile scan answers both "how shaded is this column" and "how far to
+    // the nearest trunk". Calling treeCanopyAt as well would run the identical
+    // scan a second time for a strictly weaker answer.
+    let ug = undergrowthSite(x, z, seed);
+
+    // SEPARATE HASH SALTS PER SPECIES, never bit-slices of one hash. Slicing
+    // (fr, fr>>3, fr>>17) looks independent and is not — the slices share
+    // entropy, so a column that grew one plant is far more likely than chance
+    // to grow another, and a scattered planting collapses into clumps of
+    // everything-at-once. That is the bug the pond-life block above documents;
+    // it cost that feature a solid wall of stalks. These are the same cost as
+    // the pond block pays: a handful of extra hashes on surface columns only.
+    let hFern  = hash3(seed ^ 0xFE7Au, bitcast<u32>(x), bitcast<u32>(z));
+    let hShroom= hash3(seed ^ 0x5A17u, bitcast<u32>(x), bitcast<u32>(z));
+    let hMoss  = hash3(seed ^ 0x3C0Bu, bitcast<u32>(x), bitcast<u32>(z));
+    let hSap   = hash3(seed ^ 0x9D42u, bitcast<u32>(x), bitcast<u32>(z));
+    let hBram  = hash3(seed ^ 0x61E9u, bitcast<u32>(x), bitcast<u32>(z));
+    let hLit   = hash3(seed ^ 0x0B8Fu, bitcast<u32>(x), bitcast<u32>(z));
+
+    // Patch masks, so undergrowth grows in stands rather than as uniform
+    // static — the same device the flower clump mask uses, and for the same
+    // reason: uniform density at any rate reads as noise, never as a place.
+    // Two independent fields at different scales so a fern bank and a moss
+    // patch are not the same patch wearing different plants.
+    let fernPatch = vnoise(x, z, 20 * HSCALE, seed ^ 0xFE70u);
+    let mossPatch = vnoise(x, z, 14 * HSCALE, seed ^ 0x3C00u);
+
+    // ---- layer 1: under the canopy ----
+    // UG_COVER_MIN is where the crown's shadow is deep enough that the shade
+    // plants win. It sits at the halfway point of the cover ramp so the
+    // transition lands inside the crown rather than exactly on its rim — a
+    // rim-aligned transition draws a visible circle of fern around every tree,
+    // which is the artifact this threshold exists to avoid.
+    if (ug.cover >= UG_COVER_MIN) {
+      // MUSHROOMS AT THE TREE BASE. The single cheapest high-value detail
+      // available here: trunk position is already known from the same scan, so
+      // a ring of fungus around the bole costs one comparison. The ring is an
+      // ANNULUS, not a disc — the trunk itself occupies the middle, and
+      // mushrooms grow on the leaf mould around a bole rather than on the bark.
+      // Radius scales with the tree so a great oak carries a wider ring.
+      let ringOut = UG_SHROOM_RING + i32(ug.rnd >> 28u);
+      let atBase = ug.trunkD2 > 9 && ug.trunkD2 < ringOut * ringOut &&
+                   ug.species != 4u;
+      if (atBase && (hShroom % UG_SHROOM_BASE_CHANCE) == 0u) {
+        // Red fly-agaric is the rarer, showier one; the pale toadstool is the
+        // common ring. Gated on the SAME roll that placed a mushroom at all, so
+        // this only ever picks WHICH mushroom, never adds more of them.
+        mat = select(M_TOADSTOOL, M_MUSHROOM, ((hShroom >> 13u) % 4u) == 0u);
+      } else if ((hFern % UG_FERN_CHANCE) == 0u &&
+                 fernPatch > UG_FERN_PATCH) {
+        // FERNS: the signature closed-canopy plant, and the tallest thing in
+        // this layer. Restricted to the patch mask so they form banks.
+        mat = M_FERN;
+      } else if ((hBram % UG_BRAMBLE_CHANCE) == 0u && ug.cover < UG_COVER_DEEP) {
+        // BRAMBLES want the HALF-lit margin, not the deep shade — they are the
+        // plant of a woodland edge and a light gap. Gating them below
+        // UG_COVER_DEEP is what keeps them out of the darkest interior, where
+        // the fern and moss belong.
+        mat = M_BRAMBLE;
+      } else if ((hMoss % UG_MOSS_CHANCE) == 0u && mossPatch > UG_MOSS_PATCH) {
+        // MOSS: the damp carpet. Its own patch field, so a moss patch and a
+        // fern bank are different places.
+        mat = M_MOSS;
+      } else if ((hSap % UG_SAPLING_CHANCE) == 0u) {
+        // SAPLINGS: deliberately RARE. A seedling every few metres reads as a
+        // nursery, not as a forest; and unlike everything else in this layer a
+        // sapling is a recognisable tree, so the eye finds it. It is also the
+        // one that must never become reactive — a growing sapling is exactly
+        // the "reaction-driven growth" rule 2 forbids.
+        mat = M_SAPLING;
+      } else if ((hLit % UG_LITTER_CHANCE) == 0u) {
+        // LEAF LITTER: the cheapest and commonest cover, one voxel of fallen
+        // leaves and twigs. Last in the chain on purpose — it is the default
+        // floor of a wood, so it fills whatever the plants above did not take.
+        mat = M_LITTER;
+      }
+    } else {
+      // ---- layer 2: the gaps ----
+      // The ORIGINAL grass/flower block, now gated on LOW canopy cover. It was
+      // always meant to be the light-loving layer; it just had nothing to be
+      // the complement of. Its rates are untouched.
+      //
+      // clump mask, species field and per-species rolls all live in flowerAt()
+      // now, because the upper cells of a tall flower have to re-derive exactly
+      // the same answer. Everything the old inline block did is still done, in
+      // the same order, with the same salts and the same rates — see flowerAt.
+      let fl = flowerAt(x, z, seed, ug.cover);
+      if (fl.mat != MAT_AIR) {
+        // The base cell of the plant. Cells 1..height-1 are placed by the
+        // separate stalk branch below, which re-derives this same answer.
+        mat = fl.mat;
+      } else if (ug.cover >= UG_COVER_EDGE &&
+                 (hLit % UG_LITTER_EDGE_CHANCE) == 0u) {
+        // The half-lit margin still gets litter, thinly. Without it the two
+        // layers meet on a hard line — flowers on one side, fern on the other —
+        // and the boundary reads as a seam. A thinning scatter of fallen leaves
+        // reaching a little way out past the crown is what a real canopy edge
+        // looks like, and it costs one more roll on columns that grew nothing.
+        mat = M_LITTER;
+      }
+    }
+  }
+
+  // ---- meadow flowers, cells 2..height: the rest of the stalk ---------------
+  // The block above places only the BASE cell (y == h + 1). A flower taller
+  // than one cell continues here, exactly the way the reed block continues its
+  // stalk above the waterline: same column, same hashes, same species answer,
+  // so the plant is one continuous thing rather than two features that happen
+  // to touch.
+  //
+  // COST. This branch is deliberately NOT part of the block above, because that
+  // block runs undergrowthSite() — the 25-tile scan — and putting the stalk
+  // inside it would multiply the most expensive thing on the surface by the
+  // flower height. Here the scan is replaced by ONE cheap fact: the only
+  // species that needs canopy cover is the wild rose, and cover is a property
+  // of the COLUMN, not of Y. So the stalk asks flowerAt for the species with
+  // cover forced to the edge threshold, and then keeps the answer only if the
+  // base cell agrees — `mat` at the base is already the authority. Concretely:
+  // a column whose base grew a rose regrows a rose here; a column whose base
+  // grew something else regrows that. The one case the shortcut could differ on
+  // (cover below the rose threshold) is the case where flowerAt returns the
+  // non-rose species anyway, because the rose is the LAST override in the
+  // chain — so forcing cover high can only ever ADD a rose to a column that
+  // already rolled `hRose % 9 == 0`, and that column's base grew a rose too.
+  //
+  // Y range is bounded by the tallest flower (FLOWER_MAX_H), so a column pays
+  // at most that many extra evaluations and a settled world still costs nothing
+  // (rule 2 — nothing here is reactive).
+  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H &&
+      !inRim && pond < 0 && h < TREELINE &&
+      biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
+    let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
+    // Grass and petal are the one-cell ground layer and never stack.
+    if (fl.mat != MAT_AIR && fl.mat != M_GRASS && fl.mat != M_PETAL &&
+        (y - h) <= fl.height) {
+      mat = fl.mat;
+    }
+  }
+
+  // ---- DESERT: cacti, then the scrub-and-tussock floor ----------------------
+  // The desert generated as bare sand with an occasional dead bush, and the
+  // ground-flora block above excludes it outright (`biome != B_DESERT`). That
+  // exclusion is correct — meadow flowers in a desert would be absurd — but it
+  // left the biome with no ground layer at all, so the one place in the world
+  // you deliberately walk TO was the one place with nothing to look at.
+  //
+  // Two layers, in the order they occlude each other:
+  //   1. CACTI, a metre-scale implicit shape (cactusAt), placed into air ABOVE
+  //      the surface exactly the way a tree is.
+  //   2. GROUND COVER, one voxel above the surface, only where a cactus did
+  //      not already claim the cell.
+  //
+  // Everything is INERT (rule 2): no reaction uses any of these as `self` with
+  // an emit, so a generated desert settles and sleeps exactly as bare sand did.
+  // Nothing here is a `stem`/`sprout`/`seed`.
+  //
+  // KEEP-OUTS are the same as every other feature's: the authored pool rims,
+  // the ponds, the spawn clearing and the selftest fixture pads. cactusInfo()
+  // enforces them at the SITE (so a column rooted outside cannot lean back in),
+  // and the ground block re-tests them per column.
+  if (mat == MAT_AIR && biome == B_DESERT && !inRim && y > h && pond < 0 &&
+      h < TREELINE) {
+    let cm = cactusAt(x, y, z, seed);
+    if (cm != MAT_AIR) { mat = cm; }
+  }
+
+  // Desert ground cover. Same shape as the flora block above: one voxel above
+  // the surface, gated by a patch mask so the biome keeps open sand between its
+  // stands. The mask is what makes a desert read as arid — an even sprinkle of
+  // tussock over the whole biome is a dry lawn, and the bare stretches between
+  // stands are the thing that says "desert" rather than "dry field".
+  //
+  // TWO DISTINCT HASH SALTS, one per species, never bit-slices of one hash —
+  // the pond-life block above documents why at length, and these two species
+  // would visibly co-locate if they shared entropy.
+  if (mat == MAT_AIR && y == h + 1 && biome == B_DESERT && !inRim && pond < 0 &&
+      h < TREELINE && !onFixturePad(x, z)) {
+    // Patch mask, offset off the other flora lattices so the two do not line up
+    // at their cell corners (the same reason the wildflower species field is
+    // sampled at an offset).
+    let cover = vnoise(x - 617, z + 431, 34 * HSCALE, seed ^ 0xD5E7u);
+    if (cover > TUNE_DESERT_PATCH) {
+      let hTus = hash3(seed ^ 0x7055u, bitcast<u32>(x), bitcast<u32>(z));
+      let hScr = hash3(seed ^ 0x5C2Bu, bitcast<u32>(x), bitcast<u32>(z));
+      // Tussock first and commonest: it is the species that turns bare sand
+      // from a texture into ground. Scrub is the sparser woody accent among it.
+      if ((hTus % TUNE_TUSSOCK_CHANCE) == 0u) {
+        mat = M_TUSSOCK;
+      } else if ((hScr % TUNE_SCRUB_CHANCE) == 0u) {
+        mat = M_SCRUB;
+      }
+    }
+  }
+
+  // ---- PINE HIGHLANDS: the conifer floor ------------------------------------
+  // The pine biome grew trees and nothing under them. A conifer stand has a real
+  // floor — huckleberry and juniper in the light gaps, needles everywhere else —
+  // and without it the highlands read as trunks standing on bare stone.
+  //
+  // Gated on the pine BIOME rather than on canopy cover, because the undergrowth
+  // block (where present) owns the cover-driven layer and this is the species
+  // set that belongs to a biome. A column that grew undergrowth is already
+  // non-air by the time we get here, so the two never fight over a cell: this
+  // fills what the shade set left bare.
+  if (mat == MAT_AIR && y == h + 1 && biome == B_PINE && !inRim && pond < 0 &&
+      h < TREELINE && !onFixturePad(x, z)) {
+    let cover = vnoise(x + 271, z - 859, 30 * HSCALE, seed ^ 0x4EA7u);
+    if (cover > TUNE_HEATH_PATCH) {
+      let hHth = hash3(seed ^ 0x483Bu, bitcast<u32>(x), bitcast<u32>(z));
+      if ((hHth % TUNE_HEATH_CHANCE) == 0u) {
+        mat = M_HEATH;
+      }
+    }
+  }
+
+  // ---- SNOWLINE: hardy alpine cushions above the treeline -------------------
+  // Everything else in this file stops at TREELINE (`h < TREELINE` gates the
+  // trees, the flowers, the undergrowth and both blocks above), which left the
+  // high ridges as pure bare snow — correct, and completely dead.
+  //
+  // ONE species, DELIBERATELY SPARSE. The point of the alpine band is that it
+  // reads as harsh, so what goes up there is a scatter of cushions clinging on,
+  // not a planted ridge. TUNE_ALPINE_CHANCE defaults to the sparsest density in
+  // worldgen for exactly that reason, and making it generous is the one change
+  // that undoes the intent of the whole band.
+  //
+  // This is the ONE cover block gated on `h >= TREELINE` rather than
+  // `h < TREELINE`, which is also why it cannot collide with any of them: no
+  // column satisfies both.
+  //
+  // The same material doubles as the lichen crust on exposed rock. At this scale
+  // a cushion plant and a lichen mat are the same object — a couple of
+  // centimetres of growth pressed flat against the ground — so rather than spend
+  // a material id on the distinction, the ground under it makes it: on snow the
+  // cell reads as a cushion, on wind-scoured stone as lichen.
+  if (mat == MAT_AIR && y == h + 1 && h >= TREELINE && !inRim && pond < 0 &&
+      !onFixturePad(x, z)) {
+    let hAlp = hash3(seed ^ 0xA1F1u, bitcast<u32>(x), bitcast<u32>(z));
+    // A patch mask here too, but a WEAK one: alpine plants really do grow in
+    // scattered colonies wherever the wind lets them, so the mask only thins the
+    // most exposed ground rather than carving the band into stands.
+    let cover = vnoise(x - 1103, z + 977, 26 * HSCALE, seed ^ 0xA1F2u);
+    if (cover > 96 && (hAlp % TUNE_ALPINE_CHANCE) == 0u) {
+      mat = M_CUSHION;
     }
   }
 
@@ -931,6 +2299,37 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
     }
   }
 
+  // ---- ivy on the arena wall ----
+  // Same closed-form trick as the tree ivy, one level up: rather than sampling
+  // the neighbouring column to ask "is there a wall next to me?", re-evaluate
+  // the WALL PREDICATE ITSELF at the adjacent column. The predicate is a box
+  // test on constants, so this is a few comparisons and no world access — the
+  // reason a per-cell function can have neighbour-aware decoration at all.
+  //
+  // Ivy climbs from the wall foot up, thinning with height (a creeper that
+  // reaches the coping everywhere reads as paint, not as a plant), and skips
+  // the doorways so the entrances stay legible.
+  if (mat == MAT_AIR && y > arenaY && y <= arenaY + 24) {
+    let climb = y - arenaY;                       // 1..24 up the wall
+    // the two faces this column could be leaning against
+    let nearX = abs(abs(adx) - (arenaHalf - 2)) == 0 && abs(adz) < arenaHalf - 1;
+    let nearZ = abs(abs(adz) - (arenaHalf - 2)) == 0 && abs(adx) < arenaHalf - 1;
+    let outX = abs(abs(adx) - arenaHalf) == 1 && abs(adz) <= arenaHalf;
+    let outZ = abs(abs(adz) - arenaHalf) == 1 && abs(adx) <= arenaHalf;
+    let doorHere = (abs(adx) <= 12 && abs(abs(adz) - arenaHalf) <= 2) ||
+                   (abs(adz) <= 12 && abs(abs(adx) - arenaHalf) <= 2);
+    if ((nearX || nearZ || outX || outZ) && !doorHere) {
+      let hw = hash3(seed ^ 0x19A7u, bitcast<u32>(x), bitcast<u32>(z));
+      // Coverage falls off linearly with height: full odds at the foot, none
+      // at the coping. Integer compare against a 0..24 ramp, no float.
+      let want = i32(hw % 32u);
+      if (want * 24 < (24 - climb) * i32(32u / TUNE_WALL_IVY_DENSITY) &&
+          ((hw >> 13u) % 3u) != 0u) {
+        mat = M_IVY;
+      }
+    }
+  }
+
   // Approach ramp up to the -z doorway. The deck stands ~16 voxels (1 m) proud
   // of the ground, which is well over the step-up reach, so without this the
   // only way in is to jump the plinth wall. Runs 24 voxels out from the wall and
@@ -975,6 +2374,37 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
           else if (!shellXZ) { mat = select(mat, MAT_AIR, y > ry); }  // hollow
         }
       }
+      // ---- ivy over the ruin ----
+      // A ruin is the one structure in the world that is meant to look OLD, so
+      // it gets the heaviest coverage. Tested on a box one voxel WIDER than the
+      // building so the outer faces are reachable: the shell test above only
+      // runs inside the footprint, and the cell hugging the outside of a wall
+      // is not in it. Same predicate-re-evaluation trick as the arena wall —
+      // no neighbour sampling, just the same closed-form box at ±1.
+      if (mat == MAT_AIR &&
+          x >= rx - 1 && x < rx + rw + 1 && z >= rz - 1 && z < rz + rw + 1) {
+        let ry = baseHeight(rx + rw / 2, rz + rw / 2, seed);
+        let climb = y - ry;
+        if (climb > 0 && climb < rht) {
+          // faces: just outside the shell, or just inside it
+          let fx = (x == rx - 1 || x == rx + rw) && z >= rz - 1 && z < rz + rw + 1;
+          let fz = (z == rz - 1 || z == rz + rw) && x >= rx - 1 && x < rx + rw + 1;
+          let ix = (x == rx + 4 || x == rx + rw - 5) &&
+                   z >= rz + 4 && z < rz + rw - 4;
+          let iz = (z == rz + 4 || z == rz + rw - 5) &&
+                   x >= rx + 4 && x < rx + rw - 4;
+          let atDoor = abs(z - (rz + rw / 2)) <= 14 && x <= rx + 5 && climb < 34;
+          if ((fx || fz || ix || iz) && !atDoor) {
+            let hr = hash3(seed ^ 0x2117u, bitcast<u32>(x), bitcast<u32>(z));
+            // Ruins are overgrown from the ground up: full coverage low down,
+            // thinning out near the roofline.
+            let want = i32(hr % 32u);
+            if (want * rht < (rht - climb) * i32(48u / TUNE_WALL_IVY_DENSITY)) {
+              mat = M_IVY;
+            }
+          }
+        }
+      }
     }
   }
 
@@ -984,7 +2414,12 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   // liquids are born full (state nibble = fullness); solids get palette jitter
   var state = rnd % 3u;
   if (mat == M_WATER || mat == M_OIL || mat == M_LAVA) { state = LIQ_FULL_STATE; }
-  return packVox(mat, state, 0xFFu);
+  // STAMP_NEVER, not a live code: a generated voxel has not acted, so it must
+  // be free to move on the first tick it is simulated. (This was 0xFF when the
+  // stamp was a byte; masked into the 3-bit field that would be 7, a REAL
+  // stamp code, and every worldgen voxel would sit out one substep in 1 tick
+  // out of 7.)
+  return packVox(mat, state, STAMP_NEVER);
 }
 
 // ---- far-field surface skin (phase 4: distance look) ----

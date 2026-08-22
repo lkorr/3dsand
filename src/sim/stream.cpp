@@ -50,8 +50,9 @@ bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out) {
     uint32_t run = rle[p * 2];
     uint32_t w = rle[p * 2 + 1];
     if (i + run > kChunkVol) return false;
-    // stamp 0xFF = "hasn't acted": everything may move on the first tick
-    for (uint32_t k = 0; k < run; k++) out[i++] = w | 0xFF0000u;
+    // kStampNever = "hasn't acted": everything may move on the first tick
+    for (uint32_t k = 0; k < run; k++)
+      out[i++] = w | (kStampNever << kStampShift);
   }
   return i == kChunkVol;
 }

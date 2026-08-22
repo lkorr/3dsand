@@ -41,7 +41,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   readVox, writeVox, roundTripTest, prefabRoundTripTest, axisSelfTest,
   gridToModel, prefabToVoxModels, tightenPrefab, makeGrid, gridGet, gridSet,
-  paletteFromMaterials,
+  paletteFromMaterials, gridColorGet, gridColorSet, gridColorLayer,
+  ArtPalette, ART_SLOTS, isArtIndex,
 } from './vox.js';
 
 // Editable box cap, matching what the .vox format allows.
@@ -90,11 +91,39 @@ let wholeMode = false;
 let brushSize = 1;            // spherical radius for voxel/noise brushes (1 = single cell)
 let noiseDensity = 0.35;      // fraction of surface cells the noise brush hits
 
+/* --- art colour ----------------------------------------------------------
+   A voxel carries two independent facts: its MATERIAL (what it is made of —
+   meat, wood, stone; this is what the sim reacts to, and what a dismembered
+   limb becomes when its voxels land back in the grid) and its COLOUR (what
+   it looks like). A creature is meat everywhere and painted all over, so the
+   two cannot be the same channel.
+
+   `artColor` is the brush colour, null meaning "paint the material's own
+   colour", i.e. clear any art colour on the cell. `artAlpha` is coverage: at
+   1 the brush colour replaces, below 1 it is mixed into whatever colour the
+   voxel already shows, which is what makes layering translucent glazes work.
+   The mix happens at WRITE time against the resolved colour of each cell —
+   there is no stored alpha, because a voxel is opaque; only the brush is not. */
+let artColor = null;          // "#rrggbb" or null (= material colour)
+let artAlpha = 1;             // 0..1 brush coverage
+let artPalette = new ArtPalette();   // per-document; indices live in grid.color
+let recentColors = [];        // most-recent-first, deduped, capped
+const kRecentMax = 12;
+// Paint mode with a colour selected touches COLOUR ONLY, leaving the material
+// alone. That is what you want almost always: a creature is meat everywhere
+// and you are painting its skin, not restaining it into a different substance.
+// Turn it off to repaint colour and material in one stroke.
+let artColorOnly = true;
+
 // --- undo ----------------------------------------------------------------
-// Entries are {type, data}. Voxel: data is a flat [modelIndex, cellIndex,
-// oldMat, newMat] quad array. Color: data is {matIndex, variant, oldHex,
-// newHex}. The typed wrapper lets voxel strokes and color-wheel edits share
-// one Ctrl+Z stack without changing the voxel path's flat-array perf.
+// Entries are {type, data}. Voxel: data is a flat array of
+// [modelIndex, cellIndex, oldMat, newMat, oldArt, newArt] tuples — material
+// and art colour move together so one Ctrl+Z takes back a whole brush stroke
+// rather than half of it. Color: data is {matIndex, variant, oldHex, newHex}
+// (the MATERIAL colour wheel, a different thing from per-voxel art colour).
+// The typed wrapper lets these share one stack without changing the voxel
+// path's flat-array perf.
+const kOpStride = 6;
 let undoStack = [], redoStack = [], stroke = null;
 
 // --- clipboard -----------------------------------------------------------
@@ -144,12 +173,55 @@ let palette = new Uint8Array(1024);
 function refreshMaterials() {
   materials = hooks.materials() || [];
   palette = paletteFromMaterials(materials);
+  // Art colours live in the same RGBA chunk, above the material IDs — so the
+  // palette has to be rebuilt whenever EITHER half changes. Doing it here
+  // means every existing call site already does the right thing.
+  artPalette.writeInto(palette);
 }
 
 const matName = id => (materials[id - 1]?.id) || ('#' + id);
 const matColor = id => (id > 0 && materials[id - 1])
   ? ((materials[id - 1].colors || [])[0] || '#888888')
   : '#888888';
+
+/* ---- art colour resolution ---------------------------------------------
+   What a voxel actually LOOKS like: its art colour when it has been painted,
+   otherwise its material's colour. Every display path (viewport, thumbnail,
+   eyedropper, the blend below) goes through this one function, so painted
+   and unpainted voxels can never disagree about what is on screen.       */
+
+const hexToRgb = hex => {
+  const s = String(hex || '#888888').replace('#', '');
+  const n = parseInt(s.length === 3
+    ? s[0] + s[0] + s[1] + s[1] + s[2] + s[2] : s.slice(0, 6), 16) | 0;
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+const rgbToHex = (r, g, b) =>
+  '#' + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v)))
+                            .toString(16).padStart(2, '0')).join('');
+
+// Colour of a cell given its material id and art index (0 = unpainted).
+function shownColor(mat, art) {
+  if (art) {
+    const c = artPalette.colorAt(art);
+    if (c) return c;
+  }
+  return matColor(mat);
+}
+
+/** Mix `over` onto `under` at coverage `a`. Plain source-over on straight RGB. */
+function blendHex(under, over, a) {
+  if (a >= 1) return over;
+  const u = hexToRgb(under), o = hexToRgb(over);
+  return rgbToHex(u[0] + (o[0] - u[0]) * a,
+                  u[1] + (o[1] - u[1]) * a,
+                  u[2] + (o[2] - u[2]) * a);
+}
+
+function pushRecent(hex) {
+  if (!hex) return;
+  recentColors = [hex, ...recentColors.filter(c => c !== hex)].slice(0, kRecentMax);
+}
 
 /* ==========================================================================
    3. model document — grid, ops, undo
@@ -226,14 +298,31 @@ function mirrored(x, y, z) {
   return uniq;
 }
 
+// Sentinel material for "keep whatever is already in the cell". Deliberately
+// outside 0..255 so it can never collide with a real material ID.
+const KEEP_MAT = -1;
+
 function beginStroke() { stroke = []; }
 
 /**
  * Write cells. `cells` is an array of [x,y,z] in EDIT space; `value` is the
  * material ID (0 = erase). Mirror expansion, bounds rejection, model routing,
  * no-op filtering and undo recording all happen here.
+ *
+ * `value` may be KEEP_MAT, meaning "leave the material as it is" — a
+ * colour-only stroke. A KEEP_MAT write to an EMPTY cell does nothing: paint
+ * needs a voxel to sit on and must never conjure one.
+ *
+ * `color` decides what happens to the ART COLOUR layer on each written cell:
+ *   undefined  leave it alone (material-only edits: attach, plain paint)
+ *   0          clear it — the voxel goes back to showing its material colour
+ *   a function (mat, art) => artIndex, evaluated PER CELL. Blending needs
+ *              this: the result depends on what colour that particular voxel
+ *              is already showing, so one scalar cannot express it.
+ * Erasing (value 0) always clears colour: paint must not outlive its voxel
+ * and reappear when the cell is filled again.
  */
-function applyOps(cells, value) {
+function applyOps(cells, value, color) {
   if (!stroke) beginStroke();
   for (const [cx, cy, cz] of cells) {
     for (const [x, y, z] of mirrored(cx, cy, cz)) {
@@ -243,9 +332,21 @@ function applyOps(cells, value) {
       const g = doc.models[o.mi].grid;
       const i = o.lx + o.ly * g.dim.x + o.lz * g.dim.x * g.dim.y;
       const old = g.data[i];
-      if (old === value) continue;         // no-op: keeps undo honest
-      g.data[i] = value;
-      stroke.push(o.mi, i, old, value);
+      const val = value === KEEP_MAT ? old : value;
+      if (!val) {
+        // Nothing here to paint on (or an erase of empty space): make sure a
+        // colour-only stroke cannot leave orphan paint behind.
+        if (value === KEEP_MAT) continue;
+      }
+      const oldArt = g.color ? g.color[i] : 0;
+      let art = oldArt;
+      if (val === 0) art = 0;
+      else if (typeof color === 'function') art = color(old, oldArt) | 0;
+      else if (color !== undefined) art = color | 0;
+      if (old === val && art === oldArt) continue;  // no-op: keeps undo honest
+      g.data[i] = val;
+      if (art !== oldArt) gridColorLayer(g)[i] = art;
+      stroke.push(o.mi, i, old, val, oldArt, art);
     }
   }
 }
@@ -265,16 +366,23 @@ function endStroke() {
 function clearUndo() { undoStack = []; redoStack = []; stroke = null; }
 
 function undoVoxel(s) {
-  for (let i = s.length - 4; i >= 0; i -= 4)
-    doc.models[s[i]].grid.data[s[i + 1]] = s[i + 2];
+  for (let i = s.length - kOpStride; i >= 0; i -= kOpStride) {
+    const g = doc.models[s[i]].grid;
+    g.data[s[i + 1]] = s[i + 2];
+    if (s[i + 4] !== s[i + 5]) gridColorLayer(g)[s[i + 1]] = s[i + 4];
+  }
   needsRebuild = true;
-  hooks.toast('undo (' + (s.length / 4) + ' voxel' + (s.length === 4 ? '' : 's') + ')');
+  const n = s.length / kOpStride;
+  hooks.toast('undo (' + n + ' voxel' + (n === 1 ? '' : 's') + ')');
 }
 function redoVoxel(s) {
-  for (let i = 0; i < s.length; i += 4)
-    doc.models[s[i]].grid.data[s[i + 1]] = s[i + 3];
+  for (let i = 0; i < s.length; i += kOpStride) {
+    const g = doc.models[s[i]].grid;
+    g.data[s[i + 1]] = s[i + 3];
+    if (s[i + 4] !== s[i + 5]) gridColorLayer(g)[s[i + 1]] = s[i + 5];
+  }
   needsRebuild = true;
-  hooks.toast('redo (' + (s.length / 4) + ' voxels)');
+  hooks.toast('redo (' + (s.length / kOpStride) + ' voxels)');
 }
 function undoColor(d) {
   const m = materials[d.matIndex];
@@ -297,7 +405,8 @@ function applyGrowSnapshot(d, which) {
   const snap = d[which];
   const m = doc.models[d.modelIndex];
   if (!m) return;
-  m.grid = { dim: { ...snap.dim }, data: new Uint8Array(snap.data) };
+  m.grid = { dim: { ...snap.dim }, data: new Uint8Array(snap.data),
+             color: snap.color ? new Uint8Array(snap.color) : null };
   m.dim = { ...snap.dim };
   m.offset = { ...snap.offset };
   if (d.modelIndex === activeModel) grid = m.grid;
@@ -400,16 +509,23 @@ function copySelection() {
   const dx = hi[0] - lo[0] + 1, dy = hi[1] - lo[1] + 1, dz = hi[2] - lo[2] + 1;
   const dim = { x: dx, y: dy, z: dz };
   const data = new Uint8Array(dx * dy * dz);
-  let count = 0;
+  // Colours travel as HEX, not as palette indices: the clipboard outlives the
+  // document (paste into another model, or after a reload) and an index only
+  // means something against the art palette that allocated it.
+  const colors = new Array(dx * dy * dz).fill(null);
+  let count = 0, painted = 0;
   for (let z = 0; z < dz; z++)
     for (let y = 0; y < dy; y++)
       for (let x = 0; x < dx; x++) {
         const v = gridGet(grid, lo[0] + x, lo[1] + y, lo[2] + z);
-        data[x + y * dx + z * dx * dy] = v;
+        const i = x + y * dx + z * dx * dy;
+        data[i] = v;
         if (v) count++;
+        const a = gridColorGet(grid, lo[0] + x, lo[1] + y, lo[2] + z);
+        if (v && a) { colors[i] = artPalette.colorAt(a); painted++; }
       }
   if (!count) { hooks.toast('selection contains no voxels', true); return; }
-  clipboard = { dim, data };
+  clipboard = { dim, data, colors: painted ? colors : null };
   hooks.toast(`copied ${count} voxel${count === 1 ? '' : 's'} (${dx}×${dy}×${dz})`);
 }
 
@@ -424,28 +540,36 @@ function pasteClipboard() {
   let ox = 0, oy = 0, oz = 0;
   if (hover) { const t = targetOf(hover); ox = t[0]; oy = t[1]; oz = t[2]; }
   const d = clipboard.dim;
-  const byMat = new Map();
+  // Batch by (material, colour) so one applyOps call covers every cell that
+  // shares both — a pasted block is usually a handful of such pairs, not one
+  // call per voxel.
+  const byPair = new Map();
   let clipped = 0;
   for (let z = 0; z < d.z; z++)
     for (let y = 0; y < d.y; y++)
       for (let x = 0; x < d.x; x++) {
-        const v = clipboard.data[x + y * d.x + z * d.x * d.y];
+        const i = x + y * d.x + z * d.x * d.y;
+        const v = clipboard.data[i];
         if (!v) continue;
         const px = ox + x, py = oy + y, pz = oz + z;
         if (!inBounds(px, py, pz)) { clipped++; continue; }
-        if (!byMat.has(v)) byMat.set(v, []);
-        byMat.get(v).push([px, py, pz]);
+        const hex = clipboard.colors ? clipboard.colors[i] : null;
+        const k = v + '|' + (hex || '');
+        if (!byPair.has(k)) byPair.set(k, { mat: v, hex, cells: [] });
+        byPair.get(k).cells.push([px, py, pz]);
       }
-  if (!byMat.size) {
+  if (!byPair.size) {
     hooks.toast(`paste: all ${clipped} voxels outside bounds`, true); return;
   }
   const savedMirror = mirror;
   mirror = { x: false, y: false, z: false };
   beginStroke();
-  for (const [mat, cells] of byMat) applyOps(cells, mat);
+  for (const { mat, hex, cells } of byPair.values())
+    applyOps(cells, mat, hex ? (allocArt(hex) ?? 0) : 0);
   endStroke();
+  artFullWarned = false;
   mirror = savedMirror;
-  let n = 0; for (const c of byMat.values()) n += c.length;
+  let n = 0; for (const p of byPair.values()) n += p.cells.length;
   let msg = `pasted ${n} voxel${n === 1 ? '' : 's'}`;
   if (clipped) msg += ` (${clipped} clipped)`;
   hooks.toast(msg);
@@ -461,9 +585,11 @@ function fillSelection() {
       for (let x = lo[0]; x <= hi[0]; x++)
         cells.push([x, y, z]);
   beginStroke();
-  applyOps(cells, activeMat);
+  applyOps(cells, activeMat, colorForBrush());
   endStroke();
-  hooks.toast(`filled ${cells.length} cells with ${matName(activeMat)}`);
+  artFullWarned = false;
+  hooks.toast(`filled ${cells.length} cells with ${matName(activeMat)}` +
+              (artColor !== null ? ` · ${artColor}` : ''));
 }
 
 /* ---- multi-model document ---------------------------------------------- */
@@ -562,7 +688,9 @@ function moveModel(i, d, moveAnchor = true) {
  */
 function snapshotModel(i) {
   const m = doc.models[i];
-  const snap = { dim: { ...m.dim }, offset: { ...m.offset }, data: new Uint8Array(m.grid.data) };
+  const snap = { dim: { ...m.dim }, offset: { ...m.offset },
+                 data: new Uint8Array(m.grid.data),
+                 color: m.grid.color ? new Uint8Array(m.grid.color) : null };
   if (sidecar && Array.isArray(sidecar.limbs)) {
     snap.anchors = sidecar.limbs
       .filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
@@ -596,6 +724,8 @@ function growModel(i, pad) {
         if (nx < 0 || ny < 0 || nz < 0 ||
             nx >= dim.x || ny >= dim.y || nz >= dim.z) { cropped++; continue; }
         gridSet(g, nx, ny, nz, v);
+        const a = gridColorGet(m.grid, x, y, z);
+        if (a) gridColorSet(g, nx, ny, nz, a);
       }
   if (cropped) hooks.toast(`cropped ${cropped} voxel` + (cropped === 1 ? '' : 's'), true);
   m.grid = g; m.dim = dim;
@@ -748,6 +878,8 @@ function splitSelectionToModel(name) {
         const v = gridGet(src.grid, x, y, z);
         if (!v) continue;
         gridSet(g, x - mn[0], y - mn[1], z - mn[2], v);
+        const a = gridColorGet(src.grid, x, y, z);
+        if (a) gridColorSet(g, x - mn[0], y - mn[1], z - mn[2], a);
         moved.push([x, y, z]);
       }
   // Erase from the source through applyOps so the extraction is undoable.
@@ -794,17 +926,23 @@ function upscaleDoc() {
   for (const m of doc.models) {
     const nd = { x: m.dim.x * 2, y: m.dim.y * 2, z: m.dim.z * 2 };
     const g = makeGrid(nd);
-    const od = m.dim, src = m.grid.data;
+    const od = m.dim, src = m.grid.data, srcC = m.grid.color;
+    const dstC = srcC ? gridColorLayer(g) : null;
     for (let z = 0; z < od.z; z++)
       for (let y = 0; y < od.y; y++)
         for (let x = 0; x < od.x; x++) {
-          const v = src[x + y * od.x + z * od.x * od.y];
+          const si = x + y * od.x + z * od.x * od.y;
+          const v = src[si];
           if (!v) continue;
+          const a = srcC ? srcC[si] : 0;
           for (let dz = 0; dz < 2; dz++)
             for (let dy = 0; dy < 2; dy++)
-              for (let dx = 0; dx < 2; dx++)
-                g.data[(x * 2 + dx) + (y * 2 + dy) * nd.x +
-                       (z * 2 + dz) * nd.x * nd.y] = v;
+              for (let dx = 0; dx < 2; dx++) {
+                const di = (x * 2 + dx) + (y * 2 + dy) * nd.x +
+                           (z * 2 + dz) * nd.x * nd.y;
+                g.data[di] = v;
+                if (dstC) dstC[di] = a;
+              }
         }
     m.dim = nd;
     m.grid = g;
@@ -835,24 +973,36 @@ function downscaleDoc() {
       z: Math.max(1, Math.floor(m.dim.z / 2)),
     };
     const g = makeGrid(nd);
-    const od = m.dim, src = m.grid.data;
+    const od = m.dim, src = m.grid.data, srcC = m.grid.color;
+    const dstC = srcC ? gridColorLayer(g) : null;
     for (let z = 0; z < nd.z; z++)
       for (let y = 0; y < nd.y; y++)
         for (let x = 0; x < nd.x; x++) {
-          // Take the most common non-zero material in the 2×2×2 source block.
-          const counts = {};
-          let best = 0, bestN = 0;
+          // Take the most common non-zero material in the 2×2×2 source block,
+          // and — independently — the most common colour among the cells that
+          // survived. Colour is voted separately because a block can be one
+          // material in two different colours, and picking the colour of the
+          // winning material's first cell would make the choice order-dependent.
+          const counts = {}, ccounts = {};
+          let best = 0, bestN = 0, bestC = 0, bestCN = 0;
           for (let dz = 0; dz < 2; dz++)
             for (let dy = 0; dy < 2; dy++)
               for (let dx = 0; dx < 2; dx++) {
                 const sx = x * 2 + dx, sy = y * 2 + dy, sz = z * 2 + dz;
                 if (sx >= od.x || sy >= od.y || sz >= od.z) continue;
-                const v = src[sx + sy * od.x + sz * od.x * od.y];
+                const si = sx + sy * od.x + sz * od.x * od.y;
+                const v = src[si];
                 if (!v) continue;
                 const c = (counts[v] = (counts[v] || 0) + 1);
                 if (c > bestN) { bestN = c; best = v; }
+                const a = srcC ? srcC[si] : 0;
+                if (!a) continue;
+                const ac = (ccounts[a] = (ccounts[a] || 0) + 1);
+                if (ac > bestCN) { bestCN = ac; bestC = a; }
               }
-          g.data[x + y * nd.x + z * nd.x * nd.y] = best;
+          const di = x + y * nd.x + z * nd.x * nd.y;
+          g.data[di] = best;
+          if (dstC && best) dstC[di] = bestC;
         }
     m.dim = nd;
     m.grid = g;
@@ -887,6 +1037,11 @@ function newModel(dx, dy, dz, name = 'untitled') {
   docPath = null; docName = name; sidecar = null; sidecarPath = null;
   undoStack = []; redoStack = []; stroke = null;
   setSelection(null);
+  // Art indices are document-scoped, so a new document starts with an empty
+  // palette; keeping the old one would leave indices resolving to colours from
+  // a model that is no longer open.
+  artPalette = new ArtPalette();
+  setArtColor(null);
   clearDirty();
   if (initialised) { frameCamera(); needsRebuild = true; }
   hooks.onModelsChanged?.();
@@ -1310,7 +1465,7 @@ function rebuildInstances() {
   // One model's grid appended at an arbitrary offset/brightness/transform.
   // Shared by the normal editing view and the composed preview below.
   const drawModel = (m, off, bright, xf) => {
-    const d = m.dim, data = m.grid.data;
+    const d = m.dim, data = m.grid.data, cols = m.grid.color;
     for (let z = 0; z < d.z; z++) {
       for (let y = 0; y < d.y; y++) {
         const row = y * d.x + z * d.x * d.y;
@@ -1327,7 +1482,7 @@ function rebuildInstances() {
             _m4.makeTranslation(x + 0.5 + off.x, y + 0.5 + off.y, z + 0.5 + off.z);
           }
           cubes.setMatrixAt(n, _m4);
-          _col.set(matColor(v));
+          _col.set(shownColor(v, cols ? cols[row + x] : 0));
           if (bright < 1) _col.multiplyScalar(bright);
           cubes.setColorAt(n, _col);
           n++;
@@ -1959,7 +2114,74 @@ function brushCells(h) {
   return out;
 }
 
-const valueForMode = () => (mode === 'erase' ? 0 : activeMat);
+// Copy the colour layer along with a block of cells. Used by the clipboard
+// and by any op that relocates voxels: paint belongs to the voxel, so it has
+// to travel with it or a pasted limb comes back grey.
+function colorAtCell(x, y, z) {
+  if (!wholeMode) return gridColorGet(grid, x, y, z);
+  for (let mi = 0; mi < doc.models.length; mi++) {
+    if (!modelVisible(mi)) continue;
+    const m = doc.models[mi];
+    const lx = x - m.offset.x, ly = y - m.offset.y, lz = z - m.offset.z;
+    if (gridGet(m.grid, lx, ly, lz)) return gridColorGet(m.grid, lx, ly, lz);
+  }
+  return 0;
+}
+
+/**
+ * The material an op writes. KEEP_MAT means "whatever is already there":
+ * painting COLOUR onto a voxel must not change what it is made of, and a
+ * brush covers many cells of possibly different materials, so the decision
+ * has to be per cell rather than one value chosen up front.
+ */
+function valueForMode() {
+  if (mode === 'erase') return 0;
+  if (mode === 'paint' && artColor !== null && artColorOnly) return KEEP_MAT;
+  return activeMat;
+}
+
+/**
+ * The `color` argument for applyOps under the current brush settings.
+ *
+ * At full alpha this is a constant index, so it costs one palette lookup for
+ * the whole stroke. Below full alpha it must be a per-cell function: the
+ * result is the brush colour mixed into whatever THAT voxel already shows,
+ * which is the whole point of glazing translucent paint over existing work.
+ *
+ * Returns undefined when colour should be left alone entirely, so an attach
+ * or a plain material paint does not disturb an existing paint job.
+ */
+function colorForBrush() {
+  if (mode === 'erase') return 0;
+  // No colour selected in paint mode means "paint the material's own colour",
+  // i.e. strip any art colour off the cell so the material shows through.
+  if (artColor === null) return mode === 'paint' ? 0 : undefined;
+  if (artAlpha >= 1) {
+    const idx = allocArt(artColor);
+    return idx === null ? undefined : idx;
+  }
+  return (mat, art) => {
+    const idx = allocArt(blendHex(shownColor(mat, art), artColor, artAlpha));
+    return idx === null ? art : idx;
+  };
+}
+
+/**
+ * Art-palette index for `hex`, or null when the palette is full (the caller
+ * then leaves the cell alone rather than painting an arbitrary colour). The
+ * ceiling is reported once per stroke, not once per voxel.
+ */
+let artFullWarned = false;
+function allocArt(hex) {
+  const idx = artPalette.alloc(hex);
+  if (idx) return idx;
+  if (!artFullWarned) {
+    artFullWarned = true;
+    hooks.toast(`art palette full (${ART_SLOTS} colours) — pick an existing ` +
+                'colour, or lower opacity blends less', true);
+  }
+  return null;
+}
 
 /* ==========================================================================
    8. input
@@ -2077,10 +2299,19 @@ function onPointerDown(ev) {
     return;
   }
 
-  // Alt-click is the eyedropper in every mode.
+  // Alt-click is the eyedropper in every mode. It picks up BOTH facts about
+  // the voxel: what it is made of and what colour it is wearing. An unpainted
+  // voxel clears the brush colour, so alt-clicking bare material and painting
+  // is how you get back to "no art colour here".
   if (ev.altKey) {
     const v = cellGet(h.cell[0], h.cell[1], h.cell[2]);
-    if (v) { activeMat = v; renderPalette(); hooks.toast('picked ' + matName(v)); }
+    if (v) {
+      activeMat = v;
+      const a = colorAtCell(h.cell[0], h.cell[1], h.cell[2]);
+      setArtColor(a ? artPalette.colorAt(a) : null);
+      renderPalette();
+      hooks.toast('picked ' + matName(v) + (artColor ? ' · ' + artColor : ''));
+    }
     return;
   }
 
@@ -2095,11 +2326,16 @@ function onPointerDown(ev) {
     return;
   }
 
-  // Noise always paints the active material, whatever the mode says.
-  const val = brush === 'noise' ? activeMat : valueForMode();
+  // Noise always paints the active material, whatever the mode says — unless
+  // a colour is selected, in which case it scatters COLOUR over the surface
+  // and leaves the material alone (speckling a skin, not restaining it).
+  const val = brush === 'noise'
+    ? (artColor !== null && artColorOnly ? KEEP_MAT : activeMat)
+    : valueForMode();
   beginStroke();
-  applyOps(brushCells(h), val);
+  applyOps(brushCells(h), val, colorForBrush());
   endStroke();
+  artFullWarned = false;
   // Voxel and noise brushes drag along a surface; face brush is a one-shot.
   if (brush === 'voxel' || brush === 'noise') {
     drag = { paint: true, seen: new Set() };
@@ -2222,7 +2458,10 @@ function onPointerMove(ev) {
       if (!drag.seen.has(k)) {
         drag.seen.add(k);
         if (!stroke) beginStroke();
-        applyOps(brushCells(h), brush === 'noise' ? activeMat : valueForMode());
+        const v = brush === 'noise'
+          ? (artColor !== null && artColorOnly ? KEEP_MAT : activeMat)
+          : valueForMode();
+        applyOps(brushCells(h), v, colorForBrush());
         needsRebuild = true;
       }
     }
@@ -2286,8 +2525,9 @@ function onPointerUp(ev) {
   if (drag.paint) { endStroke(); drag = null; updateHover(ev); return; }
   const b = drag.last;
   beginStroke();
-  applyOps(boxCells(drag.anchor, b), valueForMode());
+  applyOps(boxCells(drag.anchor, b), valueForMode(), colorForBrush());
   endStroke();
+  artFullWarned = false;
   drag = null;
   updateHover(ev);
 }
@@ -2335,6 +2575,7 @@ function onKeyDown(ev) {
   else if (k === 'x') { setBrush('move'); ev.preventDefault(); }
   else if (k === 'n') { setBrush('noise'); ev.preventDefault(); }
   else if (k === 'w') { setWholeMode(!wholeMode); ev.preventDefault(); }
+  else if (k === 'c') { toggleArtWheel(); ev.preventDefault(); }
   else if (k === 'm') { mirror.x = !mirror.x; updateMirrorPlane(); renderToolbar(); ev.preventDefault(); }
   else if (k === 'escape') { setSelection(null); ev.preventDefault(); }
   else if (k === 'delete') { deleteSelection(); ev.preventDefault(); }
@@ -2410,6 +2651,23 @@ function renderToolbar() {
   ui.modeInd.className = 'medind ' + mode;
 }
 
+/**
+ * Set the brush colour. null = "no art colour": paint then strips whatever
+ * colour a voxel wears and lets its material show through again.
+ */
+function setArtColor(hex) {
+  artColor = hex ? String(hex).toLowerCase() : null;
+  if (artColor) pushRecent(artColor);
+  renderPalette();
+  if (ui.artHex) ui.artHex.value = artColor || '';
+}
+
+function setArtAlpha(a) {
+  artAlpha = Math.max(0, Math.min(1, a));
+  if (ui.alphaVal) ui.alphaVal.textContent = Math.round(artAlpha * 100) + '%';
+  if (ui.alphaSlider) ui.alphaSlider.value = String(Math.round(artAlpha * 100));
+}
+
 function renderPalette() {
   if (!ui.palette) return;
   ui.palette.innerHTML = '';
@@ -2429,6 +2687,7 @@ function renderPalette() {
     sw.style.background = (m.colors || [])[0] || '#888';
     ui.palette.append(sw);
   });
+  renderArtPalette();
   if (ui.matLabel) {
     ui.matLabel.textContent = activeMat + '. ' + matName(activeMat);
     ui.matChip.style.background = matColor(activeMat);
@@ -2445,6 +2704,94 @@ function renderPalette() {
       loadWheelFrom(wheelColors()[0]);
     }
   }
+}
+
+/* ---- art colour palette ------------------------------------------------
+   The colours this DOCUMENT paints with, as opposed to the material colours
+   above. Three rows, in the order you reach for them:
+
+     in use   every colour already painted somewhere in this model
+     recent   colours picked this session, most recent first
+     [none]   clear the brush colour — paint the material's own colour
+
+   Clicking a swatch selects it; the wheel below edits the SELECTED colour's
+   hue/brightness. This is the one place in the editor where a colour is not
+   a material: nothing here touches materials.json.                       */
+
+function renderArtPalette() {
+  if (!ui.artRow) return;
+  ui.artRow.innerHTML = '';
+
+  const swatch = (hex, title, on, onclick) => {
+    const b = el('button', { class: 'msw-cell' + (on ? ' on' : ''), title, onclick });
+    if (hex) b.style.background = hex;
+    else {
+      // "no colour" reads as a slash over the material colour beneath it.
+      b.style.background =
+        'linear-gradient(135deg,#2a2f3a 44%,var(--red) 44%,var(--red) 56%,#2a2f3a 56%)';
+    }
+    return b;
+  };
+
+  ui.artRow.append(el('span', { class: 'hint edartlbl' }, 'colour'));
+  ui.artRow.append(swatch(null, 'no art colour — paint shows the material colour',
+                          artColor === null, () => setArtColor(null)));
+
+  const inUse = documentColors();
+  for (const hex of inUse)
+    ui.artRow.append(swatch(hex, hex + '  (in use in this model)',
+                            artColor === hex, () => setArtColor(hex)));
+
+  const fresh = recentColors.filter(c => !inUse.includes(c));
+  if (fresh.length) {
+    ui.artRow.append(el('span', { class: 'hint edartlbl' }, 'recent'));
+    for (const hex of fresh)
+      ui.artRow.append(swatch(hex, hex + '  (recent)',
+                              artColor === hex, () => setArtColor(hex)));
+  }
+
+  // A brand-new colour comes from the wheel, so the + just opens it.
+  ui.artRow.append(el('button', {
+    class: 'msw-cell', title: 'pick a new colour',
+    onclick: () => toggleArtWheel(true),
+  }, '+'));
+
+  if (ui.artChip) {
+    ui.artChip.style.background = artColor || 'transparent';
+    ui.artChip.style.borderStyle = artColor ? 'solid' : 'dashed';
+  }
+  if (ui.artCount)
+    ui.artCount.textContent = `${artPalette.size}/${ART_SLOTS}`;
+}
+
+/**
+ * Rebuild `artPalette` from a freshly parsed file, so the art indices sitting
+ * in its grids resolve to the colours they were saved with. Indices are
+ * preserved exactly (ArtPalette.fromPalette fills gaps rather than compacting)
+ * — remapping them would mean rewriting every grid, and a colour landing on
+ * the wrong voxels is precisely the bug this avoids.
+ */
+function adoptArtPalette(rgba) {
+  const used = new Set();
+  if (doc) for (const m of doc.models) {
+    if (!m.grid.color) continue;
+    for (const v of m.grid.color) if (v) used.add(v);
+  }
+  artPalette = rgba && used.size ? ArtPalette.fromPalette(rgba, used) : new ArtPalette();
+  setArtColor(null);
+  artPalette.writeInto(palette);
+}
+
+/** Every art colour actually painted somewhere in the document, in palette order. */
+function documentColors() {
+  const seen = new Set();
+  if (doc) for (const m of doc.models) {
+    if (!m.grid.color) continue;
+    const data = m.grid.data, col = m.grid.color;
+    for (let i = 0; i < col.length; i++) if (col[i] && data[i]) seen.add(col[i]);
+  }
+  return [...seen].sort((a, b) => b - a)
+    .map(i => artPalette.colorAt(i)).filter(Boolean);
 }
 
 /* ---- material colour wheel -------------------------------------------
@@ -2670,6 +3017,173 @@ function buildWheelPanel() {
   return ui.wheelPanel;
 }
 
+/* ---- art colour wheel + opacity ---------------------------------------
+   Same wheel widget as the material one, but it feeds the BRUSH rather than
+   materials.json, and it carries the opacity slider — the two belong side by
+   side because "which colour" and "how much of it" are one decision.     */
+
+let artWheel = { h: 0, s: 0.7, v: 0.8 };
+
+function drawArtWheel() {
+  const cv = ui.artCanvas;
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, R = W / 2;
+  const img = ctx.createImageData(W, W);
+  for (let py = 0; py < W; py++)
+    for (let px = 0; px < W; px++) {
+      const dx = (px - R) / R, dy = (py - R) / R;
+      const r = Math.hypot(dx, dy);
+      const o = (py * W + px) * 4;
+      if (r > 1) { img.data[o + 3] = 0; continue; }
+      const h = (Math.atan2(dy, dx) / (2 * Math.PI) + 1) % 1;
+      const n = parseInt(hsvToHex(h, Math.min(r, 1), artWheel.v).slice(1), 16);
+      img.data[o] = (n >> 16) & 255;
+      img.data[o + 1] = (n >> 8) & 255;
+      img.data[o + 2] = n & 255;
+      img.data[o + 3] = 255;
+    }
+  ctx.putImageData(img, 0, 0);
+  const a = artWheel.h * 2 * Math.PI, rr = artWheel.s * R;
+  ctx.beginPath();
+  ctx.arc(R + Math.cos(a) * rr, R + Math.sin(a) * rr, 5, 0, 2 * Math.PI);
+  ctx.strokeStyle = artWheel.v > 0.55 ? '#000' : '#fff';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function toggleArtWheel(show) {
+  const on = show ?? ui.artPanel.style.display === 'none';
+  ui.artPanel.style.display = on ? '' : 'none';
+  if (!on) return;
+  if (artColor) artWheel = { ...artWheel, ...hexToHsv(artColor) };
+  ui.artVal.value = String(Math.round(artWheel.v * 100));
+  drawArtWheel();
+  renderArtPreview();
+}
+
+/** Show what the brush will actually lay down over the current hover cell. */
+function renderArtPreview() {
+  if (!ui.artPreview) return;
+  const hex = hsvToHex(artWheel.h, artWheel.s, artWheel.v);
+  let under = null;
+  if (hover) {
+    const t = hover.cell;
+    const m = cellGet(t[0], t[1], t[2]);
+    if (m) under = shownColor(m, colorAtCell(t[0], t[1], t[2]));
+  }
+  ui.artPreview.innerHTML = '';
+  const chip = (c, label) => el('span', { class: 'edartprev' },
+    Object.assign(el('i', {}), { style: `background:${c}` }),
+    el('span', { class: 'hint' }, label));
+  if (under && artAlpha < 1) {
+    ui.artPreview.append(chip(under, 'under'),
+                         chip(blendHex(under, hex, artAlpha), 'result'));
+  } else {
+    ui.artPreview.append(chip(hex, artAlpha < 1 ? 'brush (hover a voxel)' : 'brush'));
+  }
+}
+
+function buildArtPanel() {
+  ui.artCanvas = el('canvas', { class: 'edwheelcv', width: '120', height: '120' });
+  const pick = ev => {
+    const r = ui.artCanvas.getBoundingClientRect();
+    const dx = (ev.clientX - r.left - r.width / 2) / (r.width / 2);
+    const dy = (ev.clientY - r.top - r.height / 2) / (r.height / 2);
+    artWheel.h = (Math.atan2(dy, dx) / (2 * Math.PI) + 1) % 1;
+    artWheel.s = Math.min(Math.hypot(dx, dy), 1);
+    drawArtWheel();
+    // Live-update the brush colour, but only push to `recent` on release —
+    // a drag across the wheel would otherwise fill the recents with 40 hues.
+    artColor = hsvToHex(artWheel.h, artWheel.s, artWheel.v);
+    ui.artHex.value = artColor;
+    renderArtPreview();
+    if (ui.artChip) { ui.artChip.style.background = artColor;
+                      ui.artChip.style.borderStyle = 'solid'; }
+  };
+  ui.artCanvas.addEventListener('pointerdown', ev => {
+    ev.preventDefault();
+    pick(ev);
+    const mv = e => pick(e);
+    const up = () => { setArtColor(artColor);
+                       window.removeEventListener('pointermove', mv);
+                       window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', mv);
+    window.addEventListener('pointerup', up);
+  });
+
+  ui.artVal = el('input', { type: 'range', min: '0', max: '100', value: '80',
+                            class: 'edslider', title: 'brightness' });
+  ui.artVal.addEventListener('input', () => {
+    artWheel.v = +ui.artVal.value / 100;
+    drawArtWheel();
+    artColor = hsvToHex(artWheel.h, artWheel.s, artWheel.v);
+    ui.artHex.value = artColor;
+    renderArtPreview();
+  });
+  ui.artVal.addEventListener('change', () => setArtColor(artColor));
+
+  ui.artHex = el('input', { class: 'cell id edwheelhex', placeholder: '#rrggbb' });
+  ui.artHex.addEventListener('change', () => {
+    const t = ui.artHex.value.trim();
+    if (!t) { setArtColor(null); return; }
+    if (!/^#?[0-9a-f]{6}$/i.test(t)) return;
+    const hex = '#' + t.replace('#', '').toLowerCase();
+    artWheel = { ...artWheel, ...hexToHsv(hex) };
+    ui.artVal.value = String(Math.round(artWheel.v * 100));
+    drawArtWheel();
+    setArtColor(hex);
+    renderArtPreview();
+  });
+
+  // Opacity. 100% replaces the colour outright; below that each stroke mixes
+  // toward the brush colour, so repeated passes converge on it — which is
+  // exactly how glazing works with real paint.
+  ui.alphaVal = el('span', { class: 'hint edslideval' }, '100%');
+  ui.alphaSlider = el('input', {
+    type: 'range', min: '5', max: '100', step: '5', value: '100',
+    class: 'edslider',
+    title: 'opacity: how much of the brush colour each stroke lays down',
+  });
+  ui.alphaSlider.addEventListener('input', () => {
+    setArtAlpha(+ui.alphaSlider.value / 100);
+    renderArtPreview();
+  });
+
+  ui.artPreview = el('div', { class: 'edartprevrow' });
+  ui.artCount = el('span', { class: 'hint' }, '0/' + ART_SLOTS);
+
+  const onlyBtn = el('button', {
+    class: 'small' + (artColorOnly ? ' on' : ''),
+    title: 'paint colour only, leaving each voxel\'s material alone — a ' +
+      'creature stays meat everywhere while you paint its skin',
+    onclick: () => {
+      artColorOnly = !artColorOnly;
+      onlyBtn.classList.toggle('on', artColorOnly);
+    },
+  }, 'colour only');
+
+  ui.artPanel = el('div', { class: 'edwheel edart' },
+    el('div', { class: 'edwheelhead' }, el('b', {}, 'brush colour'),
+      el('span', { class: 'hint' }, '— per-voxel art, not a material'),
+      el('span', { class: 'spacer' }), ui.artCount,
+      el('button', { class: 'icon', title: 'close',
+                     onclick: () => toggleArtWheel(false) }, '✕')),
+    el('div', { class: 'edwheelbody' },
+      ui.artCanvas,
+      el('div', { class: 'edwheelside' },
+        el('span', { class: 'hint' }, 'brightness'), ui.artVal,
+        el('span', { class: 'hint' }, 'opacity'),
+        el('span', { class: 'edsliders' }, ui.alphaSlider, ui.alphaVal),
+        el('span', { class: 'edartrow2' }, ui.artHex, onlyBtn),
+        ui.artPreview,
+        el('span', { class: 'hint' },
+          'paints into this model only — colour rides in the .vox beside the ' +
+          'material, and a dismembered limb still becomes its material'))));
+  ui.artPanel.style.display = 'none';
+  return ui.artPanel;
+}
+
 function updateStatus() {
   if (!ui.status || !grid) return;
   let filled = 0;
@@ -2794,6 +3308,17 @@ function buildUI(section) {
   }, '');
   ui.status = el('span', { class: 'hint edstatus' }, '');
 
+  // Brush colour chip, beside the material chip: the two facts a brush writes.
+  ui.artChip = el('span', {
+    class: 'matchip edartchip',
+    title: 'brush colour + opacity [C]',
+    onclick: () => toggleArtWheel(),
+  });
+  const artLabel = el('span', {
+    class: 'hint', style: 'cursor:pointer', title: 'brush colour + opacity [C]',
+    onclick: () => toggleArtWheel(),
+  }, 'colour');
+
   const bar2 = el('div', { class: 'toolbar edbar' },
     el('span', { class: 'hint' }, 'open'), ui.fileSel,
     mkBtn('↻', { title: 'refresh list', onclick: refreshFileList }),
@@ -2802,10 +3327,12 @@ function buildUI(section) {
     mkBtn('Save as…', { class: 'small', onclick: () => save(true) }),
     el('span', { class: 'spacer' }),
     ui.matChip, ui.matLabel,
+    el('span', { class: 'hsep' }), ui.artChip, artLabel,
     el('span', { class: 'hsep' }), ui.status);
 
-  // --- palette ---
+  // --- palette: materials on top, art colours under them ---
   ui.palette = el('div', { class: 'edpalette' });
+  ui.artRow = el('div', { class: 'edpalette edartpal' });
 
   // --- viewport, with the rig side panel beside it ---
   canvas = el('canvas', { class: 'edcanvas', tabindex: '0' });
@@ -2819,7 +3346,8 @@ function buildUI(section) {
     'Ctrl+A select all · Ctrl+C/V/X copy/paste/cut · Del delete · ' +
     'Ctrl+Shift+F fill · Ctrl+Z/Y undo · ? cheat sheet');
 
-  section.append(bar1, bar2, ui.help, buildWheelPanel(), ui.palette,
+  section.append(bar1, bar2, ui.help, buildWheelPanel(), buildArtPanel(),
+    ui.palette, ui.artRow,
     el('div', { class: 'edmain' }, host, ui.grip, ui.side),
     ui.timeline, ui.note);
 }
@@ -3016,6 +3544,10 @@ async function openPath(path) {
     docName = path.split('/').pop().replace(/\.vox$/i, '');
     undoStack = []; redoStack = []; stroke = null;
     setSelection(null);
+    // Recover the document's art colours from its own RGBA chunk. This has to
+    // happen before anything renders: the grids came back holding art INDICES,
+    // and an index means nothing without the palette that issued it.
+    adoptArtPalette(parsed.palette);
 
     // Sidecar is optional; a missing one is normal for a fresh model. It is
     // kept as the PARSED OBJECT and written back whole, so fields this editor
@@ -3107,6 +3639,14 @@ async function save(saveAs) {
   // off the editor's origin — prefab-space sidecar data must move with it.
   const { prefab, shift } = tightenPrefab({ size: doc.size, models: live });
   const shifted = !!(shift.x || shift.y || shift.z);
+
+  // The RGBA chunk carries BOTH halves of the palette: material colours (from
+  // refreshMaterials) and the art colours this document painted with. Colours
+  // allocated since the last refresh only exist in artPalette, so fold them in
+  // here — a .vox whose art indices point at black entries loads as a black
+  // creature, and the round-trip below would not catch it (it compares
+  // indices, not the colours they resolve to).
+  artPalette.writeInto(palette);
 
   // Round-trip assertion, every save. The prefab-level test is the one that
   // matters here: the per-model test would pass even if every limb landed on
@@ -3339,9 +3879,10 @@ export function thumbnail(modelIndex, size = 40) {
   for (let z = 0; z < m.dim.z; z++)
     for (let y = 0; y < m.dim.y; y++)
       for (let x = 0; x < m.dim.x; x++) {
-        const v = m.grid.data[x + y * m.dim.x + z * m.dim.x * m.dim.y];
+        const i = x + y * m.dim.x + z * m.dim.x * m.dim.y;
+        const v = m.grid.data[i];
         if (!v) continue;
-        g2.fillStyle = matColor(v);
+        g2.fillStyle = shownColor(v, m.grid.color ? m.grid.color[i] : 0);
         // engine +Y is up, canvas +Y is down
         g2.fillRect(ox + x * sc, oy + (m.dim.y - 1 - y) * sc,
                     Math.ceil(sc), Math.ceil(sc));

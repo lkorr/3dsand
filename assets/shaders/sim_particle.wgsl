@@ -259,7 +259,9 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     // "gelatin" failure shadeViscous is written to avoid. Fullness is what
     // makes flung blood shade like the blood a brush paints.
     if (materials[mat].klass == CLASS_LIQUID) { state = LIQ_FULL_STATE; }
-    voxels[tgt] = packVox(mat, state, 0xFFu);
+    // STAMP_NEVER: a reinserted particle has not acted as a grid voxel yet, so
+    // it is free to move on the tick it lands.
+    voxels[tgt] = packVox(mat, state, STAMP_NEVER);
     markDirtyNext(cell);
     p.flags = 0u;  // dead
   } else {

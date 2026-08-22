@@ -20,11 +20,49 @@
      shifts every colour by one material and looks almost right.
    - Version written is 150 (the version MagicaVoxel itself writes).
 
+   ART COLOUR LAYER (see ART_* below). A mob's voxels are all one MATERIAL —
+   a creature is "meat" everywhere — but its skin is painted per voxel. Those
+   are two independent facts about a voxel, so they are two layers: model
+   "<name>" carries material IDs and the parallel model "<name>.col" carries
+   art-palette indices for the same cells. Dismemberment drops the material
+   layer into the grid, which is why a severed arm becomes plain meat.
+
    Axis convention lives in voxToEngine/engineToVox below and NOWHERE else.
    ========================================================================== */
 
 export const VOX_VERSION = 150;
 export const MAX_DIM = 256;
+
+/* ---- art palette ---------------------------------------------------------
+   Art colours share the .vox RGBA chunk with material colours, because the
+   format has exactly one palette and the engine's "palette index == material
+   ID" convention owns the low end of it. So art colours are allocated from
+   the TOP down: index 255 is the first art colour, 254 the second, and so on.
+
+   ART_BASE is the lowest index an art colour may occupy. Material IDs run
+   1..58 today; capping art at 128 leaves room for materials to roughly double
+   before the two ranges could ever meet, and ART_SLOTS still gives a 128-
+   colour skin palette, which is far more than a hand-painted creature uses.
+   A file is only ever wrong here if BOTH ranges grow into each other, which
+   ArtPalette.alloc refuses to let happen silently.
+
+   The suffix is a naming convention in the .vox scene graph, so a mob file
+   stays ONE file and MagicaVoxel can still open it (the .col models show up
+   as extra objects, which is ugly there but harmless). */
+export const ART_SUFFIX = '.col';
+export const ART_BASE = 128;
+export const ART_TOP = 255;
+export const ART_SLOTS = ART_TOP - ART_BASE + 1;
+
+// Is this palette index an art colour rather than a material ID?
+export const isArtIndex = i => i >= ART_BASE && i <= ART_TOP;
+
+// The name of the colour layer belonging to model `name`, and the inverse.
+export const artLayerName = name => name + ART_SUFFIX;
+export const isArtLayerName = name =>
+  typeof name === 'string' && name.endsWith(ART_SUFFIX);
+export const artLayerBase = name =>
+  isArtLayerName(name) ? name.slice(0, -ART_SUFFIX.length) : name;
 
 /* ============================================================================
    Axis convention
@@ -332,6 +370,36 @@ export function readVox(buf) {
     });
   }
 
+  // ---- fold the art-colour layers into their material layers --------------
+  // "<name>.col" is a parallel lattice of art-palette indices over the same
+  // cells as "<name>" (see ART_SUFFIX). It is matched by name and REMOVED from
+  // the model list: leaving it in would make it a limb of its own, and its
+  // box would widen the prefab AABB — which is the creature's gameplay size.
+  const colParts = new Map();
+  for (const p of parts) if (isArtLayerName(p.name)) colParts.set(artLayerBase(p.name), p);
+  if (colParts.size) {
+    const kept = [];
+    for (const p of parts) {
+      if (isArtLayerName(p.name)) continue;
+      const c = colParts.get(p.name);
+      if (c) {
+        // Key by absolute (already placed) cell, so the two layers line up
+        // even if their tight boxes differ.
+        const at = new Map();
+        for (let i = 0; i < c.cells.length; i++)
+          at.set(c.cells[i].x + ',' + c.cells[i].y + ',' + c.cells[i].z, c.mats[i]);
+        p.cols = p.cells.map(e => at.get(e.x + ',' + e.y + ',' + e.z) || 0);
+        colParts.delete(p.name);
+      }
+      kept.push(p);
+    }
+    for (const [name] of colParts)
+      warnings.push(`colour layer "${artLayerName(name)}" has no model named ` +
+                    `"${name}" — ignored`);
+    parts.length = 0;
+    parts.push(...kept);
+  }
+
   let prefab = null;
   if (parts.length) {
     let pmn = { x: Infinity, y: Infinity, z: Infinity };
@@ -345,9 +413,13 @@ export function readVox(buf) {
       models: parts.map(p => {
         const dim = { x: p.mx.x - p.mn.x + 1, y: p.mx.y - p.mn.y + 1, z: p.mx.z - p.mn.z + 1 };
         const g = makeGrid(dim);
-        for (let i = 0; i < p.cells.length; i++)
+        for (let i = 0; i < p.cells.length; i++) {
           gridSet(g, p.cells[i].x - p.mn.x, p.cells[i].y - p.mn.y,
                   p.cells[i].z - p.mn.z, p.mats[i]);
+          if (p.cols && p.cols[i])
+            gridColorSet(g, p.cells[i].x - p.mn.x, p.cells[i].y - p.mn.y,
+                         p.cells[i].z - p.mn.z, p.cols[i]);
+        }
         return {
           name: p.name,
           modelId: p.modelId,
@@ -371,11 +443,44 @@ export function readVox(buf) {
 
 export const gridIndex = (x, y, z, dim) => x + y * dim.x + z * dim.x * dim.y;
 
+/**
+ * A grid carries TWO parallel byte layers over the same cells:
+ *   data  material ID    1..255, 0 = empty. Governs sim behaviour.
+ *   color art palette index, 0 = "use the material's own colour".
+ * `color` is allocated lazily: a model nobody has painted pays nothing, and
+ * `hasColor` is what the save path uses to decide whether to emit a .col
+ * layer at all. Everything that resizes or copies a grid must carry `color`
+ * along with `data` or paint silently detaches from the voxels it was on.
+ */
 export function makeGrid(dim) {
   return {
     dim: { x: dim.x, y: dim.y, z: dim.z },
     data: new Uint8Array(dim.x * dim.y * dim.z),
+    color: null,
   };
+}
+
+// The colour layer, created on first use. Callers that only READ colour
+// should use gridColorGet, which treats a missing layer as "no paint".
+export function gridColorLayer(g) {
+  if (!g.color) g.color = new Uint8Array(g.dim.x * g.dim.y * g.dim.z);
+  return g.color;
+}
+
+export const hasColor = g => !!(g && g.color && g.color.some(v => v !== 0));
+
+export function gridColorGet(g, x, y, z) {
+  const d = g.dim;
+  if (!g.color) return 0;
+  if (x < 0 || y < 0 || z < 0 || x >= d.x || y >= d.y || z >= d.z) return 0;
+  return g.color[x + y * d.x + z * d.x * d.y];
+}
+
+export function gridColorSet(g, x, y, z, v) {
+  const d = g.dim;
+  if (x < 0 || y < 0 || z < 0 || x >= d.x || y >= d.y || z >= d.z) return false;
+  gridColorLayer(g)[x + y * d.x + z * d.x * d.y] = v;
+  return true;
 }
 
 export function gridGet(g, x, y, z) {
@@ -403,6 +508,22 @@ export function modelToGrid(model) {
   return g;
 }
 
+/**
+ * Fold a parsed ".col" model's voxels into `g` as its colour layer. The two
+ * models are separate XYZI lists over the same box, so this matches them by
+ * position; a colour voxel with no material voxel under it is dropped, which
+ * is what keeps a stale colour layer from resurrecting erased geometry.
+ */
+export function applyColorModel(g, colModel) {
+  for (const v of colModel.voxels) {
+    if (v.c === 0) continue;
+    const e = voxToEngine(v.x, v.y, v.z, colModel.size);
+    if (!gridGet(g, e.x, e.y, e.z)) continue;   // no material here: not paint
+    gridColorSet(g, e.x, e.y, e.z, v.c);
+  }
+  return g;
+}
+
 // Dense engine-space grid -> a model ready for writeVox().
 export function gridToModel(g, name = '') {
   const size = engineSizeToVox(g.dim);
@@ -416,6 +537,28 @@ export function gridToModel(g, name = '') {
         voxels.push({ x: v.x, y: v.y, z: v.z, c });
       }
   return { size, voxels, name };
+}
+
+/**
+ * The ".col" companion model for `g`, or null when nothing is painted.
+ * Emits only cells that carry BOTH a material and a colour, so the layer can
+ * never describe a voxel the material layer does not have.
+ */
+export function gridToColorModel(g, name = '') {
+  if (!g.color) return null;
+  const size = engineSizeToVox(g.dim);
+  const voxels = [];
+  for (let z = 0; z < g.dim.z; z++)
+    for (let y = 0; y < g.dim.y; y++)
+      for (let x = 0; x < g.dim.x; x++) {
+        const i = x + y * g.dim.x + z * g.dim.x * g.dim.y;
+        const c = g.color[i];
+        if (!c || !g.data[i]) continue;
+        const v = engineToVox(x, y, z, size);
+        voxels.push({ x: v.x, y: v.y, z: v.z, c });
+      }
+  if (!voxels.length) return null;
+  return { size, voxels, name: artLayerName(name) };
 }
 
 /* ============================================================================
@@ -471,12 +614,19 @@ export function tightenPrefab(prefab) {
   const models = parts.map(({ m, mn, mx }) => {
     const dim = { x: mx[0] - mn[0] + 1, y: mx[1] - mn[1] + 1, z: mx[2] - mn[2] + 1 };
     const g = makeGrid(dim);
+    // The colour layer is cropped by the SAME offsets as the material layer;
+    // cropping one without the other slides every painted colour onto a
+    // neighbouring voxel, which reads as "the paint drifted" much later.
+    const src = m.grid.color, dst = src ? gridColorLayer(g) : null;
     for (let z = 0; z < dim.z; z++)
       for (let y = 0; y < dim.y; y++)
-        for (let x = 0; x < dim.x; x++)
-          g.data[x + y * dim.x + z * dim.x * dim.y] =
-            m.grid.data[(x + mn[0]) + (y + mn[1]) * m.dim.x +
-                        (z + mn[2]) * m.dim.x * m.dim.y];
+        for (let x = 0; x < dim.x; x++) {
+          const di = x + y * dim.x + z * dim.x * dim.y;
+          const si = (x + mn[0]) + (y + mn[1]) * m.dim.x +
+                     (z + mn[2]) * m.dim.x * m.dim.y;
+          g.data[di] = m.grid.data[si];
+          if (dst) dst[di] = src[si];
+        }
     return {
       name: m.name,
       offset: { x: m.offset.x + mn[0] - shift.x,
@@ -496,18 +646,27 @@ export function tightenPrefab(prefab) {
 
 /**
  * Convert an engine-space prefab into models ready for writeVox(..., {scene:true}).
+ *
+ * A painted model emits TWO .vox models: the material layer under its own
+ * name and the colour layer under "<name>.col", sharing one translation so
+ * the two lattices stay cell-for-cell aligned. Readers that do not know about
+ * the convention (MagicaVoxel, an older voxload) see the colour layer as an
+ * extra object and ignore it.
  */
 export function prefabToVoxModels(prefab) {
-  return prefab.models.map(m => {
+  return prefab.models.flatMap(m => {
     const size = engineSizeToVox(m.dim);
-    const voxels = [];
+    const voxels = [], colors = [];
     for (let z = 0; z < m.dim.z; z++)
       for (let y = 0; y < m.dim.y; y++)
         for (let x = 0; x < m.dim.x; x++) {
-          const c = m.grid.data[x + y * m.dim.x + z * m.dim.x * m.dim.y];
+          const i = x + y * m.dim.x + z * m.dim.x * m.dim.y;
+          const c = m.grid.data[i];
           if (!c) continue;
           const v = engineToVox(x, y, z, size);
           voxels.push({ x: v.x, y: v.y, z: v.z, c });
+          const a = m.grid.color ? m.grid.color[i] : 0;
+          if (a) colors.push({ x: v.x, y: v.y, z: v.z, c: a });
         }
     // Engine offset -> vox-space min corner of this model's box. Inverting
     // engine=(vx, vz, -vy): vox.x = e.x, vox.z = e.y, vox.y = -e.z. The model
@@ -518,12 +677,14 @@ export function prefabToVoxModels(prefab) {
       y: -(m.offset.z + m.dim.z - 1),
       z: m.offset.y,
     };
-    return {
-      name: m.name || '',
-      size,
-      voxels,
-      t: { x: t0.x + (size.x >> 1), y: t0.y + (size.y >> 1), z: t0.z + (size.z >> 1) },
-    };
+    const t = { x: t0.x + (size.x >> 1), y: t0.y + (size.y >> 1),
+                z: t0.z + (size.z >> 1) };
+    const out = [{ name: m.name || '', size, voxels, t }];
+    // Same size and same translation: the colour layer is the material layer's
+    // shadow, and the loader pairs them by name alone.
+    if (colors.length)
+      out.push({ name: artLayerName(m.name || ''), size, voxels: colors, t });
+    return out;
   });
 }
 
@@ -565,6 +726,70 @@ export function paletteColor(palette, index) {
   const o = (index - 1) * 4;
   const h = v => v.toString(16).padStart(2, '0');
   return '#' + h(palette[o]) + h(palette[o + 1]) + h(palette[o + 2]);
+}
+
+const rgbToHex = (r, g, b) =>
+  '#' + [r, g, b].map(v => Math.max(0, Math.min(255, v | 0))
+                            .toString(16).padStart(2, '0')).join('');
+
+/**
+ * The art colours a document uses, allocated from the top of the .vox palette
+ * downward (see ART_BASE). Indices are stable for the lifetime of a document
+ * so a colour grid holding index 255 keeps meaning the same colour.
+ *
+ * This is deliberately a document-level object rather than a global: two
+ * models may use the same index for different colours, and it is the file
+ * that reconciles them.
+ */
+export class ArtPalette {
+  constructor(colors = []) {
+    this.colors = [];              // parallel to indices, [0] == index ART_TOP
+    for (const c of colors) this.alloc(c);
+  }
+
+  /** Index for `hex`, allocating a slot if it is new. 0 when full. */
+  alloc(hex) {
+    const h = String(hex || '').toLowerCase();
+    const at = this.colors.indexOf(h);
+    if (at >= 0) return ART_TOP - at;
+    if (this.colors.length >= ART_SLOTS) return 0;   // caller reports, never wraps
+    this.colors.push(h);
+    return ART_TOP - (this.colors.length - 1);
+  }
+
+  /** "#rrggbb" for an art index, or null when the index is not an art slot. */
+  colorAt(index) {
+    if (!isArtIndex(index)) return null;
+    return this.colors[ART_TOP - index] ?? null;
+  }
+
+  get size() { return this.colors.length; }
+  get full() { return this.colors.length >= ART_SLOTS; }
+
+  /** Write this palette's colours into a 1024-byte RGBA chunk payload. */
+  writeInto(rgba) {
+    this.colors.forEach((hex, i) => {
+      const [r, g, b] = hexToRgb(hex);
+      const o = (ART_TOP - i - 1) * 4;              // entry j holds index j+1
+      rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b; rgba[o + 3] = 255;
+    });
+    return rgba;
+  }
+
+  /** Recover the art colours a parsed file used, from its RGBA chunk. */
+  static fromPalette(rgba, usedIndices) {
+    const p = new ArtPalette();
+    const want = [...usedIndices].filter(isArtIndex).sort((a, b) => b - a);
+    for (const idx of want) {
+      // Slots are dense from the top, so an index only lands back where it
+      // started if every slot above it is also present. Fill any gap with a
+      // placeholder rather than shifting colours onto the wrong voxels.
+      while (p.colors.length < ART_TOP - idx) p.colors.push('#000000');
+      const o = (idx - 1) * 4;
+      p.colors.push(rgbToHex(rgba[o], rgba[o + 1], rgba[o + 2]));
+    }
+    return p;
+  }
 }
 
 /* ============================================================================
@@ -839,6 +1064,17 @@ export function prefabRoundTripTest(prefab, palette) {
       for (let c = 0; c < a.grid.data.length; c++)
         if (a.grid.data[c] !== b.grid.data[c])
           return { ok: false, bytes, error: `model ${i} (${a.name}) voxel drift at index ${c}` };
+      // The colour layer gets the same treatment as the material layer: a
+      // paint job that does not survive the save is exactly as broken as
+      // geometry that does not, and it is far harder to notice by eye.
+      for (let c = 0; c < a.grid.data.length; c++) {
+        const wa = (a.grid.color && a.grid.data[c]) ? a.grid.color[c] : 0;
+        const wb = (b.grid.color && b.grid.data[c]) ? b.grid.color[c] : 0;
+        if (wa !== wb)
+          return { ok: false, bytes,
+                   error: `model ${i} (${a.name}) art colour drift at index ${c}: ` +
+                          `${wb} != ${wa}` };
+      }
     }
     return { ok: true, bytes };
   } catch (e) {

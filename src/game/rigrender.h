@@ -1,10 +1,13 @@
 #pragma once
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
 #include "math3d.h"
+#include "phys/debris.h"
 #include "phys/physics.h"
 #include "sim/microbody.h"
+#include "sim/voxload.h"
 #include "sim/world.h"
 
 // Shared GPU-append walks for the two rigs: MobSystem's Mob/Limb tree and
@@ -37,8 +40,16 @@ inline bool AppendVoxInsts(std::vector<BodyVoxInst>& out, uint32_t slot,
                            const std::vector<DebrisVoxel>& voxels) {
   for (const DebrisVoxel& v : voxels) {
     if (out.size() >= kMaxBodyVoxInstances) return false;
+    // Art colour rides in bits 28..31, clamped to the 4 bits this path has
+    // (debris.h). `v.color` is a .vox palette SLOT, so it is rebased to a
+    // 1-based art index first; 0 stays 0, leaving an unpainted voxel
+    // bit-identical to what this packed before art colour existed.
+    const uint32_t art =
+        IsArtPaletteIndex(v.color)
+            ? (uint32_t)std::min<int>(v.color - kArtPaletteBase + 1, kCubeArtMax)
+            : 0u;
     out.push_back({(float)v.x, (float)v.y, (float)v.z,
-                   (uint32_t)v.payload | (slot << 16)});
+                   (uint32_t)v.payload | (slot << 16) | (art << 28)});
   }
   return true;
 }

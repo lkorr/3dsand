@@ -627,6 +627,28 @@
   .edwheelsw{display:flex;gap:3px;flex-wrap:wrap}
   .edwheelhex{width:90px;font-family:var(--mono)}
 
+  /* Brush colour: per-voxel ART colour, a different thing from the material
+     colour the wheel above edits. A mob is all one material and painted all
+     over, so these two pickers sit side by side and must not look alike —
+     hence the amber accent on everything art-coloured. */
+  .edart{max-width:460px;border-color:#57451e}
+  .edartchip{border-style:dashed;border-color:#8a6d2f}
+  .edartpal{margin-top:-4px;border-color:#3a3320;align-items:center}
+  .edartlbl{
+    font-family:var(--mono);font-size:10px;text-transform:uppercase;
+    letter-spacing:.5px;color:var(--faint);margin:0 3px 0 5px;
+  }
+  .edartpal .edartlbl:first-child{margin-left:0}
+  .edartrow2{display:flex;gap:5px;align-items:center}
+  /* Under/result chips: what the current opacity will actually lay down over
+     the voxel being hovered. Two swatches beat a number for a blend. */
+  .edartprevrow{display:flex;gap:10px;align-items:center;margin-top:2px}
+  .edartprev{display:flex;gap:4px;align-items:center}
+  .edartprev i{
+    width:16px;height:16px;border-radius:3px;display:inline-block;
+    border:1px solid #00000060;box-shadow:0 0 0 1px #ffffff12;
+  }
+
   .edviewport{
     position:relative;width:100%;height:calc(100vh - 340px);min-height:340px;
     background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:hidden;

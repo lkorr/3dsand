@@ -47,9 +47,9 @@ const std::vector<Gate>& SpellGates();
 const char* const kOrder[] = {
     "determinism", "sleep",       "pond-freeze",    "evaporation",
     "blood-stain", "flung-liquid", "far-fog",       "far-downsample",
-    "screenshots", "player-walk", "debris",         "prefab",
-    "mob",         "settle-back", "player-body",    "save-load",
-    "save-entities", "region-store", "streaming",   "spells",
+    "screenshots", "player-walk", "player-waterjump", "player-plants", "debris",
+    "prefab",      "mob",         "settle-back",    "player-body",
+    "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "perf",
 };
 

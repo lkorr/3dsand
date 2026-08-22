@@ -160,8 +160,14 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
   std::unordered_map<int, GrpNode> grps;
   std::unordered_map<int, ShpNode> shps;
 
+  // The RGBA palette, when the file carries one. Material colours come from
+  // materials.json, so the low end of this is ignored; what IS read is the art
+  // range at the top (kArtPaletteBase..kArtPaletteTop), which is the only
+  // place a painted model's colours exist.
+  std::vector<uint8_t> rgba;
+
   // MAIN wrapper then a flat run of child chunks; unknown chunks are skipped
-  // by their declared sizes (MATL, LAYR, rOBJ, rCAM, NOTE, IMAP, RGBA ...).
+  // by their declared sizes (MATL, LAYR, rOBJ, rCAM, NOTE, IMAP ...).
   while (c.ok && c.off + 12 <= c.len) {
     char id[5] = {};
     std::memcpy(id, c.p + c.off, 4);
@@ -184,6 +190,11 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
       c.Skip((size_t)n * 4);
       models.push_back(std::move(m));
       haveSize = false;
+    } else if (std::strcmp(id, "RGBA") == 0) {
+      // 256 RGBA entries; entry i is palette INDEX i+1 (index 0 is empty and
+      // has no entry). Getting that off by one shifts every colour by one
+      // slot, which looks almost right — hence reading it in one place.
+      if (content >= 1024) rgba.assign(c.p + c.off, c.p + c.off + 1024);
     } else if (std::strcmp(id, "nTRN") == 0) {
       int nodeId = c.I32();
       auto attrs = c.Dict();
@@ -242,6 +253,9 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
     std::vector<IVec3> cells;
     std::vector<uint16_t> mats;
     IVec3 mn{INT32_MAX, INT32_MAX, INT32_MAX}, mx{INT32_MIN, INT32_MIN, INT32_MIN};
+    // Set on a "<name>.col" layer: its `mats` are art palette slots, not
+    // material IDs, and it is folded into its parent rather than kept.
+    bool isArtLayer = false;
   };
   std::vector<EngModel> eng;
   std::vector<uint32_t> badIndex(256, 0);
@@ -252,6 +266,11 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
     const RawModel& rm = models[pl.modelId];
     EngModel em;
     em.name = pl.name.empty() ? "model" + std::to_string(pi) : pl.name;
+    {
+      const size_t sl = std::strlen(kArtLayerSuffix);
+      em.isArtLayer = em.name.size() > sl &&
+                      em.name.compare(em.name.size() - sl, sl, kArtLayerSuffix) == 0;
+    }
     // MagicaVoxel rotates about the model box center (floor(size/2)),
     // matching ogt_vox and the editor's behaviour.
     IVec3 pivot{rm.size.x >> 1, rm.size.y >> 1, rm.size.z >> 1};
@@ -259,7 +278,9 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
     for (size_t i = 0; i + 3 < rm.xyzi.size(); i += 4) {
       uint8_t ci = rm.xyzi[i + 3];
       if (ci == 0) continue;  // index 0 = empty by convention
-      if (ci >= materialCount) { badIndex[ci]++; }
+      // An art layer's bytes are palette slots, not material IDs — checking
+      // them against materialCount would warn about every painted voxel.
+      if (!em.isArtLayer && ci >= materialCount) { badIndex[ci]++; }
       IVec3 local{rm.xyzi[i], rm.xyzi[i + 1], rm.xyzi[i + 2]};
       IVec3 s = RotApply(pl.r, {local.x - pivot.x, local.y - pivot.y, local.z - pivot.z});
       s = {s.x + pl.t.x, s.y + pl.t.y, s.z + pl.t.z};
@@ -279,6 +300,81 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
                   std::to_string(badIndex[ci]) +
                   " voxels) has no material — skipped at placement\n";
 
+  // ---- fold art-colour layers into the models they belong to --------------
+  // "<name>.col" is a parallel lattice of art palette slots over the same
+  // cells as "<name>". It is matched by name, keyed by ABSOLUTE cell (both
+  // layers are already placed, so their tight boxes may differ), and then
+  // DROPPED — leaving it in would make it a limb of its own and its box would
+  // widen the prefab AABB, which is the creature's gameplay size.
+  std::vector<std::vector<uint8_t>> engCols(eng.size());
+  {
+    const size_t sl = std::strlen(kArtLayerSuffix);
+    bool anyArt = false;
+    for (const EngModel& em : eng) if (em.isArtLayer) { anyArt = true; break; }
+    if (anyArt) {
+      for (size_t li = 0; li < eng.size(); li++) {
+        if (!eng[li].isArtLayer) continue;
+        const std::string base = eng[li].name.substr(0, eng[li].name.size() - sl);
+        size_t host = SIZE_MAX;
+        for (size_t hi = 0; hi < eng.size(); hi++)
+          if (!eng[hi].isArtLayer && eng[hi].name == base) { host = hi; break; }
+        if (host == SIZE_MAX) {
+          warnings += out.name + ": colour layer \"" + eng[li].name +
+                      "\" has no model named \"" + base + "\" — ignored\n";
+          continue;
+        }
+        std::unordered_map<int64_t, uint8_t> at;
+        at.reserve(eng[li].cells.size() * 2);
+        const auto key = [](const IVec3& c) {
+          return ((int64_t)(c.x & 0x1FFFFF) << 42) |
+                 ((int64_t)(c.y & 0x1FFFFF) << 21) | (int64_t)(c.z & 0x1FFFFF);
+        };
+        for (size_t i = 0; i < eng[li].cells.size(); i++)
+          at[key(eng[li].cells[i])] = (uint8_t)eng[li].mats[i];
+        std::vector<uint8_t>& cols = engCols[host];
+        cols.assign(eng[host].cells.size(), 0);
+        uint32_t outOfRange = 0;
+        for (size_t i = 0; i < eng[host].cells.size(); i++) {
+          auto it = at.find(key(eng[host].cells[i]));
+          if (it == at.end()) continue;
+          if (!IsArtPaletteIndex(it->second)) { outOfRange++; continue; }
+          cols[i] = it->second;
+        }
+        if (outOfRange)
+          warnings += out.name + ": colour layer \"" + eng[li].name + "\" has " +
+                      std::to_string(outOfRange) + " voxel(s) outside the art " +
+                      "palette range " + std::to_string(kArtPaletteBase) + ".." +
+                      std::to_string(kArtPaletteTop) + " — left unpainted\n";
+      }
+      // Compact away the art layers, keeping engCols aligned with what stays.
+      std::vector<EngModel> keptEng;
+      std::vector<std::vector<uint8_t>> keptCols;
+      for (size_t i = 0; i < eng.size(); i++) {
+        if (eng[i].isArtLayer) continue;
+        keptEng.push_back(std::move(eng[i]));
+        keptCols.push_back(std::move(engCols[i]));
+      }
+      eng.swap(keptEng);
+      engCols.swap(keptCols);
+      if (eng.empty()) { errors += "no non-empty models (only colour layers)\n"; return false; }
+
+      // Art palette RGB, straight out of the RGBA chunk. Without it the slots
+      // are indices into nothing and the model renders black.
+      if (!rgba.empty()) {
+        out.artColors.assign(kArtPaletteSlots, 0u);
+        for (int s = kArtPaletteBase; s <= kArtPaletteTop; s++) {
+          const size_t o = (size_t)(s - 1) * 4;   // entry i is index i+1
+          out.artColors[s - kArtPaletteBase] =
+              ((uint32_t)rgba[o] << 16) | ((uint32_t)rgba[o + 1] << 8) |
+              (uint32_t)rgba[o + 2];
+        }
+      } else {
+        warnings += out.name + ": painted models but no RGBA chunk — art "
+                    "colours unavailable, falling back to material colours\n";
+      }
+    }
+  }
+
   IVec3 pmn{INT32_MAX, INT32_MAX, INT32_MAX}, pmx{INT32_MIN, INT32_MIN, INT32_MIN};
   for (const EngModel& em : eng) {
     pmn.x = std::min(pmn.x, em.mn.x); pmn.y = std::min(pmn.y, em.mn.y); pmn.z = std::min(pmn.z, em.mn.z);
@@ -286,7 +382,9 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
   }
   out.size = {pmx.x - pmn.x + 1, pmx.y - pmn.y + 1, pmx.z - pmn.z + 1};
 
-  for (EngModel& em : eng) {
+  for (size_t ei = 0; ei < eng.size(); ei++) {
+    EngModel& em = eng[ei];
+    const std::vector<uint8_t>& cols = engCols[ei];
     PrefabModel pm;
     pm.name = std::move(em.name);
     pm.offset = {em.mn.x - pmn.x, em.mn.y - pmn.y, em.mn.z - pmn.z};
@@ -299,7 +397,8 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
       pm.voxels.push_back({(int16_t)(em.cells[i].x - em.mn.x),
                            (int16_t)(em.cells[i].y - em.mn.y),
                            (int16_t)(em.cells[i].z - em.mn.z),
-                           (uint16_t)(em.mats[i] & 0xFFF)});
+                           (uint16_t)(em.mats[i] & 0xFFF),
+                           cols.empty() ? (uint8_t)0 : cols[i]});
     }
     out.models.push_back(std::move(pm));
   }

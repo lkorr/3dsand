@@ -30,6 +30,29 @@ enum class CameraMode : uint8_t {
 
 const char* CameraModeName(CameraMode m);
 
+// ---- avatar body facing policy ---------------------------------------------
+// Where the BODY should face this tick, given where the camera looks and where
+// the player is moving. Pulled out of main.cpp's frame loop so it can be
+// tested: it is pure (no globals but CurrentTuning, no side effects), and the
+// two bugs it has already had were both invisible to every existing gate
+// because the policy only ran inside the render loop.
+//
+//   - Third person: face the TRAVEL DIRECTION. Holding W squares the character
+//     to where they run, with no slack. Below `turnMinSpeed` the facing holds
+//     rather than chasing a near-zero velocity vector.
+//   - First person: face the CAMERA, but let the neck absorb the first
+//     `headLookYaw` degrees so a glance does not pivot the feet. Past the cone
+//     the body is dragged by the excess only. Inside it, the body still eases
+//     back to the view WHILE WALKING (headLookRecenterHalflife) — without that
+//     restoring term the dead zone is a drift trap and the facing freezes
+//     wherever the last turn left it, taking the arms with it.
+//
+// `camHeading` and `heading` are in the rig's heading convention (forward is
+// (sin h, ., cos h)); `planarVel` is the player's world-voxel velocity with y
+// dropped. Returns the NEW heading, already wrapped.
+float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
+                           Vec3 planarVel, float dt);
+
 class ThirdPersonRig {
  public:
   // Advances the rig one frame. `focusWorld` is the point the boom orbits —

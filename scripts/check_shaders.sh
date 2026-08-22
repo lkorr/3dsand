@@ -80,6 +80,19 @@ W_MATSLOTS="$(cpp_const kMaterialSlots)"
   echo "check_shaders: cannot parse kMaterialSlots from $WORLD_H" >&2; exit 1; }
 W_STAINBASE=$((W_MATSLOTS - 8))
 
+# Art palette — same shape as the stain palette: a run of reserved material
+# slots holding per-voxel mob SKIN colours (world.h kArtPaletteBaseGpu). The
+# lowest .vox palette index that counts as art comes from sim/voxload.h, which
+# is the other half of the same convention.
+W_ARTSLOTS="$(cpp_const kArtPaletteSlotsGpu)"
+[ -n "$W_ARTSLOTS" ] || {
+  echo "check_shaders: cannot parse kArtPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
+W_ARTBASE=$((W_STAINBASE - W_ARTSLOTS))
+VOXLOAD_H="$ROOT/src/sim/voxload.h"
+W_ARTSLOTMIN="$(sed -n 's/^constexpr int kArtPaletteBase = \([0-9]*\);.*/\1/p' "$VOXLOAD_H" | head -1)"
+[ -n "$W_ARTSLOTMIN" ] || {
+  echo "check_shaders: cannot parse kArtPaletteBase from $VOXLOAD_H" >&2; exit 1; }
+
 # Static micro-detail brick pool (render-only). kMicroPoolWordsWorld is written
 # as a shift expression in world.h, so scrape the shift and redo the arithmetic
 # rather than trying to parse `1u << 20`.
@@ -115,6 +128,8 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
+  "const ART_PALETTE_BASE : u32 = ${W_ARTBASE}u;" \
+  "const ART_SLOT_MIN : u32 = ${W_ARTSLOTMIN}u;" \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
   "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
   "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \

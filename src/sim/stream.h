@@ -19,7 +19,7 @@ struct GpuContext;
 // it is hashed sim state, and a 16-bit store dropped it silently on save.
 void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out);
 // out must hold kChunkVol words; returns false on malformed input.
-// Decoded voxels get stamp 0xFF ("hasn't acted"): everything may move.
+// Decoded voxels get kStampNever ("hasn't acted"): everything may move.
 bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out);
 
 // Toroidal residency manager (M2/M7): recenters the resident cube on the
