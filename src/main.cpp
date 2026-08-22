@@ -836,12 +836,14 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
         rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
         "shotTarget");
+    // Upload BEFORE the render pass opens (barrier graph §4.6).
+    uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     rhi::RenderPass rp = sim.BeginRenderPass(
         enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
     sim.DrawBodies(rp, (uint32_t)inst.size());
-    if (!microInsts.empty()) sim.DrawMicroBodies(rp, ctx.queue, microInsts);
+    sim.DrawMicroBodies(rp, microCount);
     rp.End();
     rhi::Buffer shotBuf = CreateBuffer(
         ctx.device, (uint64_t)W * H * 4,
@@ -2789,6 +2791,9 @@ int main(int argc, char** argv) {
                               bodyXf.size() * sizeof(BodyXformGpu));
         bodyReg.BuildMicroInsts(microInsts);
       }
+      // Upload BEFORE the render pass opens (barrier graph §4.6): a buffer
+      // write with the pass open is legal in WebGPU and illegal in Vulkan.
+      uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
 
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
@@ -2796,7 +2801,7 @@ int main(int argc, char** argv) {
       sim.DrawWorld(rp);
       sim.DrawParticles(rp);
       sim.DrawBodies(rp, bodyInstCount);
-      sim.DrawMicroBodies(rp, ctx.queue, microInsts);
+      sim.DrawMicroBodies(rp, microCount);
       sim.DrawSprites(rp, (uint32_t)sprv.size());
       sim.DrawDebugBoxes(rp, debugBoxCount);
       overlay.Render(rp);

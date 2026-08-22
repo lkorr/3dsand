@@ -358,12 +358,15 @@ bool mobOk = false;
         {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
         rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
         "shotTarget");
+          // Upload BEFORE the render pass opens (barrier graph §4.6).
+          uint32_t microCount =
+              withMicro ? sim.UploadMicroBodyInsts(ctx.queue, microInsts) : 0u;
           rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
           rhi::RenderPass rp = sim.BeginRenderPass(
               enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
           sim.DrawWorld(rp);
           sim.DrawBodies(rp, (uint32_t)inst.size());
-          if (withMicro) sim.DrawMicroBodies(rp, ctx.queue, microInsts);
+          sim.DrawMicroBodies(rp, microCount);
           rp.End();
           rhi::Buffer shot = CreateBuffer(
               ctx.device, (uint64_t)W * H * 4,
@@ -477,6 +480,9 @@ bool mobOk = false;
             // Draw ONLY the micro pass against the world, twice, so the diff
             // isolates this one body.
             auto shootSolo = [&](bool withMicro, std::vector<uint8_t>& out) {
+              // Upload BEFORE the render pass opens (barrier graph §4.6).
+              uint32_t soloCount =
+                  withMicro ? sim.UploadMicroBodyInsts(ctx.queue, solo) : 0u;
               rhi::Texture tex = ctx.device.CreateTexture(
         {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
         rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
@@ -485,7 +491,7 @@ bool mobOk = false;
               rhi::RenderPass rp = sim.BeginRenderPass(
                   enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
               sim.DrawWorld(rp);
-              if (withMicro) sim.DrawMicroBodies(rp, ctx.queue, solo);
+              sim.DrawMicroBodies(rp, soloCount);
               rp.End();
               rhi::Buffer shot = CreateBuffer(
                   ctx.device, (uint64_t)W * H * 4,

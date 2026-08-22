@@ -899,20 +899,24 @@ void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) 
   pass.Draw(36, voxInstances);
 }
 
-void Simulation::DrawMicroBodies(const rhi::RenderPass& pass,
-                                 const rhi::Queue& queue,
-                                 const std::vector<MicroBodyInstGpu>& insts) {
-  // Zero micro bodies costs exactly one branch: no upload, no bind, no draw.
+uint32_t Simulation::UploadMicroBodyInsts(const rhi::Queue& queue,
+                                          const std::vector<MicroBodyInstGpu>& insts) {
+  // Zero micro bodies costs exactly one branch: no upload at all.
   // The instance list is CPU-compacted rather than indirect because the count
   // is already known on the CPU (it is built from the body slots this frame),
-  // and an indirect buffer could not also be bound in this pass anyway.
-  if (insts.empty()) return;
-  size_t n = std::min<size_t>(insts.size(), kMaxBodySlots);
-  queue.WriteBuffer(mbInstBuf_, 0, insts.data(), n * sizeof(MicroBodyInstGpu));
+  // and an indirect buffer could not also be bound in the draw pass anyway.
+  if (insts.empty()) return 0;
+  uint32_t n = (uint32_t)std::min<size_t>(insts.size(), kMaxBodySlots);
+  queue.WriteBuffer(mbInstBuf_, 0, insts.data(), (size_t)n * sizeof(MicroBodyInstGpu));
+  return n;
+}
+
+void Simulation::DrawMicroBodies(const rhi::RenderPass& pass, uint32_t count) {
+  if (count == 0) return;  // nothing uploaded this frame: no bind, no draw
   pass.SetPipeline(microBodyDraw_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, microBodyBG_);
-  pass.Draw(36, (uint32_t)n);
+  pass.Draw(36, count);
 }
 
 void Simulation::FlipPage() { page_ = 1 - page_; }

@@ -101,9 +101,25 @@ class Simulation {
   // between DrawBodies and DrawSprites. `insts` is the compacted (slot, model)
   // list built by the caller from the frame's body slots; an empty list draws
   // nothing at all, so a world with no micro bodies pays zero.
-  void DrawMicroBodies(const rhi::RenderPass& pass,
-                       const rhi::Queue& queue,
-                       const std::vector<MicroBodyInstGpu>& insts);
+  // Upload this frame's micro-body instance list. MUST be called BEFORE
+  // BeginRenderPass, and it is a separate call for exactly that reason.
+  //
+  // This used to live inside DrawMicroBodies, i.e. a queue.WriteBuffer issued
+  // with the render pass open. WebGPU defines that as legal (the write is
+  // ordered on the QUEUE, not in the command buffer, so it lands before the
+  // submit that contains the pass), and Dawn happily accepted it. Vulkan does
+  // NOT: vkCmdUpdateBuffer and vkCmdCopyBuffer are forbidden inside a render
+  // pass instance / dynamic rendering scope, so the pattern had to be hoisted
+  // regardless of backend (docs/vulkan_barrier_graph.md §4.6).
+  //
+  // Returns the number of instances actually uploaded — DrawMicroBodies takes
+  // that count, so passing a stale or unuploaded list cannot silently draw
+  // garbage. The signature change is deliberate: the old call shape no longer
+  // compiles, which is what stops the in-pass write regressing invisibly.
+  uint32_t UploadMicroBodyInsts(const rhi::Queue& queue,
+                                const std::vector<MicroBodyInstGpu>& insts);
+  // Pure draw: no uploads, no queue. `count` comes from UploadMicroBodyInsts.
+  void DrawMicroBodies(const rhi::RenderPass& pass, uint32_t count);
 
   static constexpr rhi::TextureFormat kDepthFormat = rhi::TextureFormat::Depth32Float;
 
