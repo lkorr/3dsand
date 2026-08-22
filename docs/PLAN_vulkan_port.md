@@ -72,7 +72,11 @@ then a skip-encode-when-provably-empty option.
 - **`--selftest` is the acceptance gate and stays green at every checkpoint.**
   Strategy: Dawn keeps working throughout; Vulkan lands as a second backend
   behind the same seam, validated by cross-backend world-hash equality (same
-  seed + same tick = same hash) before it renders a single pixel.
+  seed + same tick = same hash) before it renders a single pixel. *(This
+  strategy ran its course: Dawn was removed 2026-08-22 once it had agreed with
+  Vulkan on all 23 gates for a full phase. The acceptance gate itself is
+  unchanged, and the cross-backend hashes it produced are now pinned constants
+  in `src/gpu/vk_smoke.cpp`.)*
 
 ## Shader strategy
 
@@ -315,6 +319,156 @@ behavior change.*
 > every structural feature of the tick table except the particle and explosion
 > chains, which need ops to reach.
 
+> **[AS BUILT] Phase 3c deliverables 1+2 — the rest of the per-tick machinery,
+> and streaming.** `vk::SimBackend` grew the readback ring (3 slots, the
+> `World::Init` layout verbatim), `SubmitTickFull` (the full input set — ops,
+> explosions, cells, spawns, far-fill, readback — i.e. `test/support.cpp`'s
+> `SubmitTick` against Vulkan resources), `PollReadbacks` (`ProcessEvents`'
+> replacement, at the same frame point), `WakeAll`, `EvictSlots`/`CompleteEvict`,
+> `FillSlotFromStore`, `FillSlotsByGen`, `SubmitLoadReset` and
+> `ReadBufferBlocking`.
+>
+> **The readback and eviction copies are Uses, NOT table rows — and that is a
+> decision, not a shortcut.** A `pass::Row` encodes a Copy's offsets as the
+> literal constants `x/y/z`, which is exact for every copy in the tick table (the
+> indirect-args hops are always 12 B at offset 0 or 16). It cannot express
+> `EncodeReadbacks`: up to 64 chunk fetches at slot indices chosen at runtime
+> from a queue, 27 mirror copies whose offsets come from the live window origin,
+> into a slot picked from a 3-deep ring. Their count and offsets are *tick data*.
+> Making the schema carry runtime-parameterised offsets would make a row a
+> closure and dissolve the property that lets `check_pass_table.py` read the
+> `.def` as static text. So they express their hazards as `pass::Use` against the
+> same tracker, which is the mechanism `CopyToHost` established in 3b and which
+> §8 already sanctions ("expressed as a table row's `uses`" — a Use, not
+> necessarily a Row). Two new recorder entry points carry it: `CopyTracked`
+> (source is a `pass::Buf`, so the RAW against its last writer is derived) and
+> `FillTracked` (the `ClearBuffer(support)` WAW of §7.4, which falls out because
+> the fill declares a TransferWrite on a buffer the tracker just saw read).
+> `pass_table.def` is therefore UNCHANGED by 3c, and the checker stays silent.
+>
+> **One real bug, and it was in the fence pool.** §4.2 says a readback slot
+> "borrows a reference to that submit's fence". `Backend::PollFences` recycled a
+> signalled fence into the free list immediately, and `BeginCommands` calls
+> `PollFences` on *every* command buffer — so a slot that submitted at tick N and
+> had not yet been polled held a handle `AcquireFence` had already reset and
+> handed to the tick-N+1 submit. `vkGetFenceStatus` on it then reports a
+> different submit's status, and the slot reads its mapped memory while the GPU
+> is still writing it: silent CPU-mirror corruption, no crash. Fixed with
+> `RetainFence`/`ReleaseFence` refcounts — a retained fence is parked rather than
+> pooled when its submit retires, and returns to the pool on the last release.
+> The borrowed-fence model in §4.2 is correct; what it needed was a retain.
+>
+> **`EncodeWakeAll` needed no special case,** exactly as §4.1 predicted: it is a
+> `QueueWrite` that drains at the head of the tick's command buffer ahead of the
+> first row. The `stream.cpp:172` eviction-ordering comment was corrected in the
+> same commit per §4.3 step 4 — the guarantee is not "both are submits and
+> submits are ordered" but "EvictSlots submits eagerly while FillSlots only
+> enqueues", and `kPersistMask` moved from a stream.cpp file-static to `stream.h`
+> because the smoke now has to reproduce the store round-trip exactly.
+>
+> **[AS BUILT] Phase 3c deliverable 4 — `--vk-smoke-loud`, the port's
+> determinism acceptance evidence for phase 3.** 120 ticks of an ACTIVE world on
+> both backends: brush + melt ops, three explosions (the mark/apply split, the
+> expMask, the whole spawn/integrate/resolve particle chain), exact-cell ops, the
+> readback ring live every tick, and an 8-shift streaming walk with eviction and
+> procgen refill. Hashes compared at 19 points throughout, validation ON.
+>
+> ```
+> === validation ===
+>   ZERO messages (no synchronization hazards reported)
+>
+> === streaming ===
+>   Dawn:   8 window shifts, 34059 chunks in store
+>   Vulkan: 8 window shifts, 8192 chunks evicted, 64 store-hit refills, 8192 procgen refills
+>   store-hit refill self-check: PASS (100.00% of the plane restored through
+>       deferred, submit-less writes flushed by the next tick)
+>
+>   worldgen f97ba745   f97ba745   MATCH      t60      f4fd73c6   f4fd73c6   MATCH
+>   t15      958d2cd1   958d2cd1   MATCH      t75      3c954bbf   3c954bbf   MATCH
+>   t30      9d6c5841   9d6c5841   MATCH      t76      20fd330a   20fd330a   MATCH
+>   t45      896e2082   896e2082   MATCH      t84      95a876da   95a876da   MATCH
+>   t46      5436693c   5436693c   MATCH      t85      4850717a   4850717a   MATCH
+>   t47      22ec46d9   22ec46d9   MATCH      t86      38802cbb   38802cbb   MATCH
+>   t52      c50f2236   c50f2236   MATCH      t87      250cd625   250cd625   MATCH
+>   t53      663bc868   663bc868   MATCH      t88      1a9022a2   1a9022a2   MATCH
+>   t90      2fe6536b   2fe6536b   MATCH      t105     16c239c7   16c239c7   MATCH
+>   t120     cb036bd1   cb036bd1   MATCH
+>
+> === --vk-smoke-loud PASS ===
+> ```
+>
+> An active tick records **20 rows, 64 dispatches, 38 copies, 5 fills, 104
+> barrier calls (67 buffer + 55 global)** against the quiet tick's 11/59/2/3/63 —
+> the difference is the conditional chains plus the readback ring's copies.
+> `--barriers=sledgehammer` produces identical hashes (exoneration per §6.2, and
+> still weak evidence on one GPU).
+>
+> **What the streaming leg deliberately does NOT compare, and why that is not a
+> gap being papered over.** The walk is one-directional. A return leg re-enters
+> evicted planes, which is the only route to the store-hit refill — but the
+> store-hit path's *content* comes from a store, and the two backends cannot
+> share one: Dawn drives the real `Stream` (sticky `modified_` set, `dropIfAir =
+> modified_[s] == 0`, RLE through the region-file `ChunkStore`, force-completion
+> of in-flight evictions), while the Vulkan side has no `Stream` at all — the
+> same `rhi::`-ownership reason `vk_sim.h` exists. Any store the smoke emulates
+> makes different refill decisions, so the worlds diverge in CONTENT.
+>
+> This was confirmed rather than assumed, and the confirmation is the useful
+> part: with a return leg, **both backends were bit-stable run to run** (Dawn
+> `c4c5178f`, Vulkan `2879f83e`, reproducing exactly) and diverged only after the
+> reversal. A barrier race varies between runs; a policy difference does not.
+> Three different emulated store policies each matched through the entire
+> outbound leg and each diverged on the return. Two of those attempts were
+> themselves instructive: storing raw evicted words (rather than applying
+> `kPersistMask` + re-stamping `kStampNever`) and dropping all-air chunks
+> unconditionally (rather than Dawn's `modified_`-gated `dropIfAir`) each produced
+> a divergence with the exact signature of a barrier race and neither was one.
+> So the store-hit path is proven by a direct Vulkan-side round-trip assertion
+> instead — evict a plane, clobber those slots with procgen from a bogus origin,
+> refill from the captured words through the deferred submit-less path, run one
+> ordinary tick, and re-evict. It restores 100%, and step 4 is the load-bearing
+> one: a model where uploads ride their own submit passes the first three steps
+> and fails there.
+
+> **[AS BUILT] Phase 3c deliverable 3 — `--selftest --backend vulkan` is
+> REFUSED, and this is the deliverable's honest outcome rather than a gap.**
+>
+> The brief asked for the gates that do not render to run on Vulkan, with a
+> per-gate flag or a curated skip list as the mechanism. Neither mechanism is the
+> blocker, and discovering that is the result: **the gates never touch a
+> backend.** They drive `World`, `Simulation`, `Stream`, `Physics` and
+> `MobSystem`, and every GPU resource those own is an `rhi::` handle. `rhi::` has
+> exactly one implementation — `rhi_dawn.cpp`, where every impl struct is a
+> `wgpu::` holder. A second implementation of the same handle types cannot
+> coexist in one binary without making all ~50 of those methods virtual, which is
+> a restructure of the backend that is currently the port's only hash oracle.
+> Phase 2a declined that deliberately and phase 3 did not revisit it:
+> `vk::SimBackend` is a parallel set of resource DECLARATIONS driven by the
+> shared pass table, explicitly *not* an `rhi::` backend (`vk_sim.h` says so).
+>
+> There is therefore no way to hand a gate a Vulkan `World`, and the three
+> available responses were: run on Dawn and print "backend: vulkan" (a lie, and
+> exactly what 3b's refusal exists to prevent); skip every gate and report a
+> green run of nothing; or refuse and say what is missing. **The flag refuses,
+> with the reason and the alternative in the message.**
+>
+> What phase 3c ships in its place is `--vk-smoke-loud`, which drives the same
+> tick chain the gates drive and compares hashes against Dawn at 19 points. That
+> is the determinism property `--selftest --backend vulkan` was wanted for; it is
+> simply not spelled `--selftest`.
+>
+> **What DID land from this deliverable: `Gate::needsRender`, declared per gate
+> and printed by `--list`.** Three of the 23 gates need the render path —
+> `screenshots` (the only one in the render group that actually draws; `far-fog`
+> and `far-downsample` exercise the cascades through compute and a one-word
+> readback), `mob` (the 14-angle micro-body view sweep), and `perf` (no draw of
+> its own, but its verdict reads `bestFrameMs`, which only `screenshots` sets).
+> The other 20 are compute + readback only. That is the list phase 4/5 needs the
+> moment `rhi::` can carry two backends, and it is now a property of each gate
+> rather than a curated list in a commit message that goes stale the first time a
+> gate learns to draw. Nothing consumes it to skip a gate yet, and the header
+> comment says so.
+
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
 barriers generated from the pass table, indirect dispatch (keep the staging
@@ -327,11 +481,198 @@ on real fences, `vkCmdFillBuffer` zero-init for all buffers at creation,
    world-hash sequence (scripted via `--selftest --json`).
 3. All compute-only gates green on Vulkan; default Dawn build still fully green.
 
+**[AS BUILT] Checkpoints 1 and 3 were written on a false premise and are
+superseded.** Both assume `--selftest` can be pointed at a backend. It cannot:
+the gates hold `rhi::` handles and `rhi::` has one implementation, so there is
+no Vulkan `World` to give them (phase 3c deliverable 3 below). What actually
+discharges the intent behind them is checkpoint 2, widened: `--vk-smoke` (quiet,
+3b) and `--vk-smoke-loud` (active, 3c) run the same tick chain on both backends
+and compare world hashes — 5 probes over a settled world, 19 over an active one
+with ops, explosions, particles, the readback ring and streaming. The Dawn
+selftest stays fully green throughout, which is the other half of checkpoint 3
+and is unaffected. Running the gate BODIES on Vulkan requires making `rhi::`
+polymorphic and is folded into phase 4/5.
+
 **Phase 4 — Vulkan render path.**
 Swapchain, the 6 raster pipelines, reversed-Z depth, `imgui_impl_vulkan`,
 screenshot/offscreen paths.
 *Checkpoint: full 20-gate selftest green on `--backend vulkan`; screenshots
 visually equivalent; render ms reported vs Dawn baseline.*
+
+> **[AS BUILT] Phase 4b D1 — offscreen render on Vulkan (2026-08-22).**
+> `CreateTexture`/`CreateRenderPipeline`/`BeginRenderPass`/`CopyTextureToBuffer`
+> are real on the Vulkan seam; `--shot --backend vulkan` and
+> `--shot-mob --backend vulkan` run end to end.
+>
+> * **Dynamic rendering, not render-pass objects.** `vkCmdBeginRendering`
+>   matches WebGPU's model 1:1 (no framebuffer/render-pass caching keyed by
+>   attachment combos), the barrier doc §1.2 already assumed it, and both
+>   `dynamicRendering` and `synchronization2` are MANDATORY core-1.3 features —
+>   the backend already refuses devices without the latter, so requiring the
+>   former adds no reachable hardware constraint. Both are probed and enabled
+>   explicitly (a core feature still needs enabling; the 3b lesson).
+> * **WebGPU coordinates via negative-height viewport + CCW front face** — the
+>   same pairing Dawn's own Vulkan backend uses. Framebuffer-space geometry and
+>   winding match, so screenshots are byte-comparable against Dawn.
+> * **Render barriers are generated, never hand-placed** (§2.6/§3.2 as-built
+>   notes): `Recorder::BeginRendering` flushes the tracker into the
+>   render-read domain before the scope opens (barriers are illegal inside);
+>   image layout transitions are derived from `vk::Image::layout` + a
+>   per-recording access state; the screenshot copy transitions
+>   attachment→TRANSFER_SRC the same way. Sledgehammer mode substitutes its
+>   full barrier at the same points, keeping the A/B honest.
+> * **Checkpoint evidence:** all 28 `--shot` screenshots wrote on Vulkan with
+>   sync validation ON; pixel-diff vs the same-build Dawn set: **23/28
+>   byte-identical, the rest differ on <0.001% of pixels with max channel
+>   delta 1/255** (raymarch is float; §3.2's "bytes may differ" allowance was
+>   barely needed). Validation messages are now REPORTED (and fail the run) at
+>   the end of --shot/--shot-mob — the messenger collects continuously but
+>   nothing popped a scope in these harnesses before, so a hazard could have
+>   gone unprinted.
+>
+> **[AS BUILT] Phase 4b D3 — windowed Vulkan (2026-08-22). Phase 4b complete.**
+> Swapchain (FIFO, matching Dawn's present mode), resize, AcquireFrame/Present
+> through the seam, and imgui_impl_vulkan behind the same Overlay interface.
+>
+> * **Semaphores stay exactly where §5.1 allows them**: per-image render-done
+>   semaphores plus a fence-paced ring of 3 acquire semaphores (a semaphore
+>   handed to vkAcquireNextImageKHR must be provably idle; the fence of the
+>   submit that consumed it is the proof — the same Retain/Release discipline
+>   as the readback ring). The presenting submit is detected by the encoder
+>   (its render pass targeted a `presentable` image), not declared by callers.
+> * **PRESENT_SRC transitions are derived like every other image barrier**:
+>   `Recorder::Finish()` transitions any presentable image touched in the
+>   recording, src = its tracked attachment write.
+> * **ImGui**: `imgui_impl_vulkan` (1.92.4) with dynamic rendering, entry
+>   points fed from the engine's own loader (`IMGUI_IMPL_VULKAN_NO_PROTOTYPES`
+>   — one source of Vulkan entry points, by construction). overlay.cpp is now
+>   the sanctioned dual-native exception; `rhi::dawn::Native` and
+>   `rhi::vkr::NativeCmd` are its two doors.
+> * **`--frames N` harness**: runs the windowed game N frames, fires one F5
+>   shader reload midway (the Tint recompile path), exits cleanly, and prints
+>   collected validation messages. Verified: window opens, the world renders
+>   (a window capture shows the raymarched world, grass strands, ImGui panel +
+>   HUD at 98 fps), `reloading shaders... ok`, clean exit,
+>   `session: vulkan validation messages: 0 (clean)` over 1500 frames.
+>   Windowed avg render+present 10.6–12.4 ms under FIFO on both backends; the
+>   honest render-cost comparison is the selftest 1080p sweep — 17.4 ms
+>   shadows-on / 12.4 off (Vulkan) vs 18.8 / 12.8 (Dawn).
+>
+> **[AS BUILT] Phase 4b D2 — all 23 gates run on both backends (2026-08-22).**
+> The `needsRender` skip is gone (the flag survives as documentation in
+> `--list`), the shared offscreen target is created on both backends, and the
+> debris gate's diagnostic screenshot is un-gated. `--selftest --backend
+> vulkan --vk-validation`: **23 gates, exit 0, determinism gate reports the
+> pinned `7cfa2420`, `vulkan validation messages: 0 (clean)`**, and the
+> pass/fail set equals Dawn's exactly — pond-freeze and mob known-failing,
+> with the mob gate's two failing sub-checks (`micro body render: FAIL (10
+> micro slots, 7/14 views drew, ...)` and `avatar: FAIL (... upright=0 ...)`)
+> printing CHARACTER-FOR-CHARACTER identical measured values on both
+> backends. The selftest harness now prints (and fails the run on) any
+> collected Vulkan validation message — a sync-validation hazard is a barrier
+> bug even when every gate is green.
+>
+> **One real barrier bug found and fixed by this deliverable** (the reason the
+> harness reports validation at all): a WRITE_AFTER_WRITE across submits
+> between a queued creation zero-fill and a later Class B data copy — the
+> upload flush ran ahead of the §3.4 head barrier and nothing ordered it
+> against previous submits. §4.1's phase-4b as-built note has the verbatim
+> message and the mechanical fix (one memory barrier at the head of any
+> non-empty flush). The micro-body pool was observably losing limbs to its own
+> creation fill on this GPU.
+>
+> `--vk-smoke-loud` re-run after the render work: 19/19 MATCH, ZERO messages,
+> hashes byte-identical to the phase-3c record (worldgen f97ba745 … t120
+> cb036bd1). Render perf while here: selftest 1080p sweep is 17.4 ms/frame
+> shadows-on / 12.4 shadows-off on Vulkan vs 18.8 / 12.8 on Dawn.
+>
+> **[AS BUILT] Phase 4a — runtime-selectable backends; the real gates run on
+> Vulkan (2026-08-22).** Split off from phase 4: everything except the render
+> path itself.
+>
+> **The seam design: abstract impl bases, chosen over handle+vtable and
+> variant.** Every impl struct behind the rhi.h handles is now an abstract base
+> (`rhi_impl.h`) with two subclasses — `rhi_dawn.cpp` (the same wgpu calls, one
+> virtual hop; recording byte-identical, proven by the pinned hash) and
+> `rhi_vk.cpp` (translating onto `vk::Backend`). Virtual dispatch was picked
+> for clarity and phase-7 headroom: a sparse-resident voxels buffer is just
+> another `BufferImpl` subclass, and phase 6's Dawn removal deletes subclasses
+> without touching a caller. Dispatch cost is irrelevant at ~60 dispatches +
+> a handful of copies per tick.
+>
+> **Barrier generation kept the phase-3b shape exactly.** The Vulkan encoder
+> does NOT derive barriers from the wgpu-shaped calls: `Simulation::RecordTable`
+> branches on `device.Kind()` and hands the page-resolved ids/pipelines/sets
+> across a bridge (`rhi_record.h`) to the encoder's `vk::Recorder`, which walks
+> `pass::kRows` itself. What was deleted is `vk_sim.{h,cpp}` — the phase-3b/3c
+> parallel copy of every resource declaration — so there is ONE World again.
+> Off-table copies go through new `CommandEncoder::CopyTracked/FillTracked`
+> (a `pass::Buf` id + the concrete buffer; under Dawn byte-identical to the
+> plain calls), and buffers with no id (staging, the timer resolve) are tracked
+> BY POINTER in a recorder side table — still derived, never hand-placed.
+> `pass_table.def` unchanged; `check_pass_table.py` silent.
+>
+> **The readback ring, chunk-fetch queue and eviction tickets are World's/
+> Stream's own code on both backends** (closing 3c's "fetchIds has no Vulkan
+> consumer" gap by deletion): `rhi::MapReadAsync` on Vulkan borrows the
+> producing submit's fence (RetainFence) over the persistently mapped slot and
+> fires from `ProcessEvents`; `MapTicket` is the same borrow consumed by
+> poll/wait. Buffer handles are refcounted like wgpu's — released staging is
+> freed through a serial-stamped graveyard once in-flight submits retire
+> (a whole-world gate read is 512 MiB; leaking those to Shutdown was not an
+> option).
+>
+> **Two real bugs, both found by sync validation + hash divergence, both in
+> the new queued zero-init** (barrier_graph §4.1/§4.8 phase-4a notes):
+> intra-flush WAW (a creation fill racing the first data upload — the material
+> table lost and the world froze inert), and the Class B staging ring's own
+> zero-fill wiping freshly host-staged payloads (MapWrite staging is now never
+> GPU-zeroed). Neither existed in 3c because zero-init was one early submit.
+>
+> **`--selftest --backend vulkan` runs 20 of 23 gate bodies for real.** 19
+> PASS; pond-freeze FAILs with the character-for-character identical assertion
+> and measured values as Dawn ("rim 0/96 vs middle 0/25 ice at 250 night
+> ticks; 0 ice voxels, 0 frozen with 0 non-water neighbours") — a known-fail
+> failing the SAME WAY cross-backend. The determinism gate reports the pinned
+> golden hash ON VULKAN: `final hash 7cfa2420 over 200 ticks, matches
+> baseline`. save/load round-trips a real `.svd` (247105c6 → cd6022f6 →
+> restored 247105c6, values identical to Dawn), streaming matches Dawn's hash
+> sequence over 232 shifts (store 36013 chunks, identical). The three
+> `needsRender` gates (screenshots, mob, perf) print
+> `SKIP (needs the render path; not available on --backend vulkan until phase
+> 4b)` — never silently pass; the Vulkan encoder ABORTS on any render entry
+> point, which is how the debris gate's Dawn-only diagnostic screenshot (a
+> draw appended after its compute-only verdict) was found and gated.
+>
+> **The smokes now drive both backends through the identical driver** (real
+> `Stream` + `ChunkStore` on the Vulkan side, previously impossible):
+> `--vk-smoke` 5/5 MATCH, `--vk-smoke-loud` 19/19 MATCH with validation ON and
+> ZERO messages, hashes byte-identical to the phase-3c record (worldgen
+> f97ba745 … t120 cb036bd1) — the folded path reproduces the 3c world
+> bit-for-bit, and even the 34059-chunk stores match.
+>
+> **D4 — `--measure --backend vulkan` works, and the idle-overhead claim has
+> its first cross-API data point** (same machine, same scenarios as the phase-0
+> baseline; Vulkan timestamps via `VkQueryPool` + `vkCmdWriteTimestamp2` around
+> the recorder's group transitions, the same spans Dawn's per-pass writes
+> cover):
+>
+> | pass (settled world) | Dawn phase 0 | Vulkan 4a |
+> |---|---|---|
+> | prep (mutate+explode+compact) | 7.1 µs | 2.6 µs |
+> | CA (54 empty indirect dispatches) | **184.6 µs** | **119.9 µs** |
+> | compactNext | 3.8 µs | 2.7 µs |
+> | occupancyDirty+pick | 9.8 µs | 4.1 µs |
+> | farDown | 5.5 µs | 2.2 µs |
+> | occupancyFull+pick (1-in-15) | 95.6 µs | 97.8 µs |
+> | **settled tick total** | **306 µs** | **229 µs** |
+>
+> The settled tick is ~25% cheaper on Vulkan with identical work: the empty CA
+> dispatches drop from ~3.4 to ~2.2 µs each (driver overhead, exactly the
+> rule-2 violation phase 0 flagged), while the genuinely GPU-bound full-world
+> occupancy scan is unchanged (95.6 vs 97.8 µs) — the port's perf case is
+> idle overhead, and the remaining ~120 µs of empty dispatches is still the
+> phase-8 skip-encode target. Active world: 501 µs (Vulkan) vs 565 µs (Dawn).
 
 **Phase 5 — second-adapter validation.**
 Run the Vulkan selftest on every enumerable device (`--adapter low` equivalent;
@@ -339,22 +680,271 @@ this machine may expose only the 3060 Ti — if so, evaluate lavapipe/SwiftShade
 as a deterministic-CPU cross-check for the hash sequence). Progress on
 DESIGN.md risk #3, not closure, unless a second vendor is actually present.
 
+> **[AS BUILT] Phase 5 — one vendor is all this machine has, and the honest
+> outcome is a documented option list rather than a closed risk (2026-08-22).**
+>
+> **What was enumerated, three independent ways.** `--vk-info` (default) and
+> `--vk-info --adapter low` both select `NVIDIA GeForce RTX 3060 Ti`; the Dawn
+> path prints the same adapter for `--backend dawn` and `--backend dawn
+> --adapter low`; and the SDK's own `vulkaninfo --summary` — which enumerates
+> without any of our selection logic — reports exactly `GPU0`, no GPU1. The
+> `--adapter low` scoring in `Backend::PickPhysicalDevice` is working; there is
+> simply nothing for it to prefer. **The CPU is an i7-11700F** — the `F` suffix
+> is Intel's "no integrated graphics" part — so there is no iGPU to enable in
+> BIOS on this machine, and that option is not merely unused, it is unavailable.
+>
+> **What WAS validated: full 23-gate parity on the one vendor, both backends.**
+>
+> ```
+> $ sandvox --selftest --backend dawn --json p5_dawn.json
+> adapter: NVIDIA GeForce RTX 3060 Ti (backend 6)
+> === selftest === (23 gates, backend dawn)
+> determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)
+> known-failing at baseline (not yours): pond-freeze, mob
+> === selftest PASS === (2 known failures carried)          exit 0
+>
+> $ sandvox --selftest --backend vulkan --vk-validation --json p5_vk.json
+> adapter: NVIDIA GeForce RTX 3060 Ti (backend vulkan)
+> === selftest === (23 gates, backend vulkan)
+> determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)
+> known-failing at baseline (not yours): pond-freeze, mob
+> selftest: vulkan validation messages: 0 (clean)
+> === selftest PASS === (2 known failures carried)          exit 0
+> ```
+>
+> Diffing the two `--json` files gate-by-gate: 23 gates each, identical name
+> set, **zero status differences**, and **zero differences in the reported
+> detail strings** except `perf`, which reports wall-clock (`sim 2.11 ms/tick,
+> best frame 13.21 ms` on Dawn vs `2.06 / 12.57` on Vulkan). Every gate that
+> reports a measured value — hashes, voxel counts, pose angles, the two known
+> failures' assertion text — reports it character-for-character identically
+> across the two backends.
+>
+> **What that is worth, stated precisely.** It is a strong test of *this port*
+> and a weak test of *rule 1*. Two different API host layers, two different
+> barrier regimes (Dawn's auto-generated vs. this port's table-generated), two
+> different SPIR-V producers reaching the driver — agreeing bit-for-bit on 23
+> gates. What it does not vary is the thing risk #3 is actually about: **one
+> vendor, one driver, one shader compiler back end**. An FMA-contraction or
+> transcendental divergence lives below both of our host layers and would agree
+> with itself here just as happily.
+>
+> **Options for closing risk #3, for the user to choose.** None were installed —
+> the brief forbids installing software, and each has a real cost worth deciding
+> deliberately:
+>
+> * **(a) A CPU Vulkan implementation — lavapipe (Mesa) or SwiftShader.** The
+>   strongest available cross-check short of second hardware, and legitimately
+>   so: these are *different compilers* (LLVM/Subzero) emitting for a *different
+>   ISA* (x86 SIMD), so an integer sim kernel that divergently lowers on NVIDIA's
+>   compiler has a genuine chance of lowering differently there. Wiring is
+>   binary-only and needs no code change: drop the ICD and set
+>   `VK_ICD_FILENAMES=<path>\lvp_icd.x86_64.json` (or SwiftShader's
+>   `vk_swiftshader_icd.json`) — our loader is a plain `vulkan-1.dll` walk, so it
+>   picks the override up. Cost: slow. The 23-gate suite is ~50 s on a 3060 Ti;
+>   on lavapipe expect a large multiple, so the realistic scope is the
+>   determinism gate plus `--vk-smoke`/`--vk-smoke-loud`, which is exactly the
+>   hash *sequence* risk #3 wants. Caveat to record if we do it: a CPU ICD is
+>   evidence about the *shader compiler*, not about GPU scheduling — it cannot
+>   surface a race that only a real warp scheduler exposes, which is §7.1's
+>   failure mode.
+> * **(b) Run the suite on a second physical machine.** The only option that
+>   varies the vendor for real (AMD or Intel silicon, ideally). Already
+>   scriptable with no new code: `--selftest --json out.json` produces the
+>   machine-readable per-gate record this note just diffed, and a `.svd` save
+>   round-trips a world for byte-comparison. This is the option that actually
+>   closes risk #3; the others are progress toward it.
+> * **(c) Enable an iGPU in BIOS.** **Ruled out on this machine** — the
+>   i7-11700F has no integrated graphics die. Listed only so the next reader does
+>   not spend an evening in the BIOS looking for it.
+>
+> Risk #3 therefore stays **open**, with its DESIGN.md §14 text updated in the
+> same commit to say what is now true: the hash is pinned and reproduced across
+> two independent host layers on one vendor, and a second vendor's hash sequence
+> is what remains.
+
 **Phase 6 — switch default; update docs.**
 Default backend → Vulkan. CLAUDE.md build/verify sections updated in the same
-commit (DESIGN.md §12 was already updated when the plan was adopted). Dawn is
-retained through phase 7 purely as the cross-backend hash oracle — the browser
-requirement was dropped 2026-08-22, so once sparse residency is green and a
-second adapter has validated the hash sequence, Dawn (and its ~15-min
-first-configure fetch) is removed in a cleanup commit that also simplifies the
-RHI seam to a single live backend. The seam itself stays: it is what made the
-port testable and it costs nothing to keep.
+commit (DESIGN.md §12 was already updated when the plan was adopted). ~~Dawn is
+retained through phase 7 purely as the cross-backend hash oracle~~ —
+**SUPERSEDED 2026-08-22: the user relaxed cross-backend equality and Dawn was
+removed immediately, before phase 7 rather than after it. See the DAWN REMOVAL
+as-built note below.** The seam itself stays, as this paragraph always said: it
+is what made the port testable and it costs nothing to keep.
 
-**Phase 7 — sparse residency (the payoff).**
-4 GiB virtual voxels buffer (verify `maxStorageBufferRange`), 64 KiB pages = 4
-consecutive chunk slots; bind on write-need (worldgen/stream-in/mutation into
-an unbound page), unbind when all 4 chunks report `occTotal == 0` with
-hysteresis; sparse-queue binds fenced before the tick submit. Gated by
-`residencyNonResidentStrict` (else dense fallback).
+> **[AS BUILT] Phase 6 — Vulkan is the default (2026-08-22). Phase 6 complete.**
+>
+> **The flip was small, and that is phase 4a's dividend rather than luck.** The
+> backend is chosen in exactly one place. What needed changing was the *shape* of
+> the variable holding it: `main.cpp` carried `bool backendVulkan = false`, a
+> flag named for the non-default, which cannot express "default Vulkan" without
+> reading backwards. It is now `rhi::BackendKind backend =
+> rhi::BackendKind::Vulkan`, and the ternary at the `GpuContext::Init` call site
+> is gone. Both `--backend dawn` and `--backend vulkan` stay accepted, so no
+> existing invocation or script changes meaning.
+>
+> **Nothing else genuinely needed plumbing, including the two places that looked
+> like they would.** There is no separate "selftest default": the harness prints
+> and runs against `ctx.backendKind`, so it followed the flip for free. The two
+> `BackendKind::Dawn` defaults in `context.h` (the `Init` default argument and
+> the field initialiser) were flipped for consistency, but both call sites pass
+> the argument explicitly — they were latent traps, not live behaviour. Recording,
+> the pass table, barrier generation and buffer creation are untouched, as the
+> brief required.
+>
+> **Checkpoint evidence, all on an mtime-verified exe:**
+>
+> | check | result |
+> |---|---|
+> | `--selftest` (no flag) | 23 gates, **exit 0**, `backend vulkan`, `determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)`, pond-freeze + mob known-failing |
+> | `--selftest --backend dawn` | 23 gates, **exit 0**, `backend dawn`, same `7cfa2420`, same two known failures |
+> | gate-by-gate `--json` diff | identical name set, **zero status differences, zero detail-string differences** except `perf` (wall clock: 2.10 vs 2.16 ms/tick) |
+> | `--vk-smoke-loud --vk-validation` | **19/19 MATCH**, ZERO validation messages, hashes byte-identical to the phase-3c record (worldgen `f97ba745` … t120 `cb036bd1`) |
+> | `check_pass_table.py` | `pass table OK` |
+> | `check_invariants.py` | `invariants OK` |
+> | `--frames 400 --vk-validation` | windowed default is Vulkan, F5 reload `ok`, clean exit, `session: vulkan validation messages: 0 (clean)` |
+> | `--frames 120 --backend dawn` | windowed Dawn unaffected |
+>
+> **`tests/baseline.json` is unchanged, and that is the point.** The golden hash
+> is backend-independent — it was already `7cfa2420` on both — so a default flip
+> has nothing to flip. If a gate ever behaves differently under a backend change,
+> the baseline is the wrong place to absorb it.
+>
+> **A correction to how the render numbers in the 4a/4b notes should be read.**
+> The sim comparison is solid — `--measure` GPU timestamps put a settled tick at
+> 229–236 µs on Vulkan vs 306 on Dawn, reproduced here. The *render* sweep is
+> not: the selftest's 1080p figure moved between 8.0 and 18.8 ms/frame across
+> runs of the same binary in this phase, depending on machine load and on what
+> world state earlier gates left behind (the perf gate in isolation reports
+> ~8 ms; inside a full run, ~17–19), and across those runs the two backends
+> traded places. The 4b note's "17.4/12.4 Vulkan vs 18.8/12.8 Dawn" is one
+> sample from inside that spread, not a measured advantage. **Do not quote a
+> render delta from a single run**; if the render cost ever matters, it needs a
+> harness that pins the scene and repeats, which `--measure` does for compute
+> and nothing yet does for the frame.
+>
+> **D3 — the docs.** CLAUDE.md gained a *"Two backends: Vulkan runs, Dawn
+> judges"* section in build/verify: default is Vulkan, `--backend dawn` is the
+> ORACLE rather than a fallback, `--vk-validation`/`--frames` exist, the
+> sync-validation-fails-the-run policy and *why* it must not be weakened,
+> `SANDVOX_NO_CRASH_DIALOG=1` + `crash.log`, and verify-the-exe-mtime. Plus the
+> header stack line, the `src/gpu/` layout row, the ImGui gotcha, and a new
+> gotcha for phase 3b's trap (a core feature still has to be *enabled*).
+> DESIGN.md §12 gained a second update paragraph: the port landed, Vulkan is
+> default, parity is measured, and Dawn is retained because *its job is to
+> disagree*.
+
+> **[AS BUILT] DAWN REMOVAL — executed EARLY, out of phase order (2026-08-22,
+> user decision).** This plan said removal waits until phase 7's page table is
+> validated. It did not: **the user relaxed the cross-backend equality
+> requirement outright** — bit-equality across backends no longer matters, and
+> what matters is that determinism holds ON VULKAN going forward, anchored by
+> the pinned `7cfa2420`. Dawn was retired having already agreed with Vulkan on
+> all 23 gates, character for character, for a full phase (4b→6), so this is
+> early retirement of a proven oracle rather than an abandoned proof.
+>
+> **What was removed:** `rhi_dawn.{h,cpp}`, the Dawn path in `context.cpp`
+> (instance/adapter/surface/RequestDevice and the wgpu Resize/AcquireFrame/
+> Present), `rhi::BackendKind::Dawn` *the enumerator*, the second table walk in
+> `simulation.cpp` (plus `Simulation::BeginPass` and that file's local
+> `CondHolds`/`Extent`, dead with it — `vk_record.cpp` has always carried its
+> own pair), `ImGui_ImplWGPU_*` and `IMGUI_IMPL_WEBGPU_BACKEND_DAWN`, and
+> `dawn::webgpu_dawn`/`webgpu_cpp`/`webgpu_glfw` from every link line
+> including the two CPU-only test harnesses that only ever wanted the include
+> path. `--backend dawn` now REFUSES with an explanation and exit 2 — a run
+> reported as Dawn that was Vulkan all along is worse than no run, the same
+> principle behind phase 3b's refusal.
+>
+> **What was kept, and why the seam did not go with it:** the `rhi::` seam
+> including the polymorphic impl layer. An abstract base with one subclass is
+> one virtual hop on ~60 dispatches a tick, it is what made this port testable
+> phase by phase, and it is the slot phase 7's paged-residency `BufferImpl`
+> plugs into. Removing it is the change that would have to be undone.
+>
+> **Tint stays, and so does the Dawn CHECKOUT — this is the constraint the
+> removal turned on.** `tint_lang_wgsl_reader` + `tint_lang_spirv_writer` are
+> linked into sandvox (WGSL→SPIR-V at load and at every F5; a precompiled
+> `.spv` cannot work because F5 rebuilds the constant prelude from live tuning
+> values) and `tint.exe` is `check_shaders.sh`'s validator. The mechanism that
+> excludes the *engine* without touching Tint: Dawn's own CMakeLists gates
+> `add_subdirectory(src/dawn)` — which is what DEFINES dawn_native,
+> webgpu_dawn, webgpu_cpp and webgpu_glfw — on "at least one
+> `DAWN_ENABLE_<backend>` is ON". With all of them OFF those targets are never
+> declared, so nothing can link them by accident, while
+> `add_subdirectory(src/tint)` is unconditional. `C:/sv-deps` cache semantics
+> and the FetchContent declaration are untouched.
+>
+> **Three traps, all now commented in CMakeLists.txt:** (1)
+> `TINT_BUILD_SPV_WRITER`/`SPV_READER` default to `${DAWN_ENABLE_VULKAN}`, so
+> turning the Dawn Vulkan backend off silently turns off the SPIR-V writer the
+> engine is built on — both forced ON independently. (2) `DAWN_USE_GLFW` must
+> stay ON: that flag is what makes Dawn's `third_party` add the GLFW *library*
+> our `glfw` target comes from (Dawn's own `dawn_glfw` wgpu-surface helper is a
+> different thing, under `src/dawn`, excluded). (3) `Vulkan::Headers` is
+> declared by Dawn only for its own Vulkan backend, so it vanished too — the
+> sources are fetched under `dawn_standalone` regardless, so CMakeLists does
+> that `add_subdirectory` itself behind a `NOT TARGET` guard.
+>
+> **The smokes were repurposed, not deleted (D2).** `--vk-smoke` and
+> `--vk-smoke-loud` now check 5 and 19 probes against **pinned** hash
+> sequences — verbatim the values 10156bb and c0cc28f established under the
+> cross-backend diff. That is more coverage than the diff in one direction (it
+> catches a change that moves *everything* identically, which the diff could
+> not) and less in the other (no disagreement to localise a barrier bug by),
+> and the gap is covered by sync validation, which was always §6.2's PRIMARY
+> detector and needs no divergence to fire. A bug found doing this: the "tick
+> recording" stats line read `LastStats` after the loop and so described a
+> trailing rehash — it is now snapshotted at a representative tick and reprints
+> the phase-3b/4a records exactly (quiet 11/59/2/3/63, loud 20/64/38/5/104).
+>
+> **Measured:** `sandvox.exe` 13,326,336 → 8,099,840 bytes (−39%); 156
+> dawn_native TUs and a 178 MB `webgpu_dawn.lib` no longer built.
+>
+> **Checkpoint evidence (mtime-verified exe):** `--selftest` 23 gates exit 0,
+> `determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)`,
+> pond-freeze + mob known-failing; `--vk-smoke --vk-validation` 5/5 MATCH ZERO
+> messages; `--vk-smoke-loud --vk-validation` 19/19 MATCH ZERO messages, 8
+> shifts / 34059 chunks in store (identical to the phase-3c record);
+> `--frames 300 --vk-validation` clean exit, 0 validation messages;
+> `check_shaders.sh` 12 shaders OK; `check_invariants.py` and
+> `check_pass_table.py` silent.
+>
+> **Deliberately NOT taken, to keep this purely subtractive:** the
+> `simSlimBGL_` collapse (Dawn's 16-entry layout limit is gone; `--vk-info`
+> measures 1048576 per stage) and the indirect staging-copy elimination. Both
+> change descriptor sets or barrier scopes and are their own hash-gated
+> changes.
+
+**Phase 7 — sparse residency (the payoff) — REWRITTEN 2026-08-22 per
+`docs/ROADMAP_scale.md` §1 (user-reviewed): SOFTWARE PAGE TABLE, not
+`VK_KHR_sparse_binding`.** Hardware sparse was validated as *available* on
+this GPU (phase 3a: all three caps YES) and rejected on evidence: measured
+`vkQueueBindSparse` cost degrading superlinearly with page count on NVIDIA
+(bind is a CPU queue submit, never GPU-driven), `maxStorageBufferRange`
+spec-capped at 4 GiB and 2 GiB on some AMD drivers (3a measured 4 GiB−1 here),
+and no way to express a `UNIFORM(material)` page — the sentinel that makes
+downward window growth (solid bulk) nearly free. Shape: flat u32 table, chunk
+slot → page index into a pooled physical buffer, or `EMPTY`/`UNIFORM(mat)`
+sentinel; one dependent load per chunk entered; the CA is unaware of it; NOT
+an octree (O(1), in-place mutation). Determinism by construction — no
+driver-dependent unbound-read behavior, so `residencyNonResidentStrict`
+becomes moot.
+*Checkpoints (unchanged in substance):*
+1. New gate: page alloc/free roundtrip under streaming + mutation.
+2. **Paged-vs-dense hash equality**: same seed, page table on/off, identical
+   hash sequence over a scripted scenario including sky-boundary explosions.
+   **This is now THE equality matrix** — with Dawn removed, `vulkan-paged` vs
+   `vulkan-dense` replaces `dawn` vs `vulkan` as the two configurations a
+   sequence is diffed across. `--residency` should reuse the `--vk-smoke`
+   driver rather than build a second one: `RunScenario` in `src/gpu/vk_smoke.cpp`
+   still returns a full probe sequence (not a verdict) and `CompareAndReport`
+   still takes two sequences, kept in that shape deliberately for this.
+   Note what the diff is and is not worth: paged-vs-dense varies the
+   *residency mapping*, not the host layer or the shader compiler, so it is a
+   strong test of the page table and says nothing new about §14 risk #3.
+3. Settled-world resident memory reported; full gate green.
+Window growth (2048³ @ 5 cm per ROADMAP §2) remains its own later milestone
+with fresh measurements.
 *Checkpoints:*
 1. New gate: unbind/rebind roundtrip under streaming + mutation.
 2. **Sparse-vs-dense hash equality**: same seed, sparse on/off, identical hash
@@ -397,6 +987,23 @@ explicit heap placement. Re-run `--measure` after each.
 - 2026-08-22 (user): **browser build dropped.** DESIGN.md §1/§12 updated in the
   adoption commit. Dawn's remaining role is reference backend + hash oracle
   during the port; removed after phase 7 validates (see phase 6).
+- 2026-08-22 (user): **DAWN REMOVED EARLY — cross-backend bit-equality is no
+  longer a requirement.** Supersedes the line above: removal was scheduled
+  after phase 7 and executed before it. The user's framing, recorded because it
+  is what licenses the change: what matters is that determinism holds *on
+  Vulkan* going forward, with the pinned `7cfa2420` as the anchor — not that
+  two backends agree. Dawn had already agreed on all 23 gates for a full phase.
+  Consequences folded into the plan: `--vk-smoke`/`--vk-smoke-loud` become
+  pinned-sequence gates (D2), phase 7's equality matrix becomes vulkan-paged vs
+  vulkan-dense, §14 risk #3 narrows to "one vendor, one driver, one compiler,
+  one host layer" and still needs a second vendor to close. The Dawn CHECKOUT
+  and Tint stay — WGSL→SPIR-V at load and F5 depend on them; only the Dawn
+  ENGINE targets are excluded. The `rhi::` seam stays.
+- 2026-08-22: **the now-unlocked simplifications are deliberately deferred**,
+  so the removal commit stayed purely subtractive and its green gate means
+  what it says: `simSlimBGL_` collapse (Dawn's layout-entry limit is gone) and
+  indirect staging-copy elimination. Each changes descriptor sets or barrier
+  scopes, so each is its own hash-gated change.
 - 2026-08-22 (user): **commit at every completed unit of work.** Implementation
   agents commit at green checkpoints with the selftest result in the message;
   never sweep files outside their board claim into a commit.

@@ -33,6 +33,13 @@
 
 #include <string>
 
+// windows.h defines CreateSemaphore as a macro (CreateSemaphoreA/W). Any TU
+// that includes both windows.h and this header would otherwise have the struct
+// member below silently renamed by the preprocessor.
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
+
 namespace vkl {
 
 // Global-tier entry points: everything callable before/without a VkInstance.
@@ -61,6 +68,13 @@ struct InstanceFns {
   // VK_EXT_debug_utils — only non-null when the extension was enabled.
   PFN_vkCreateDebugUtilsMessengerEXT CreateDebugUtilsMessengerEXT = nullptr;
   PFN_vkDestroyDebugUtilsMessengerEXT DestroyDebugUtilsMessengerEXT = nullptr;
+  // VK_KHR_surface — only non-null when the instance enabled the surface
+  // extensions (windowed phase 4b; headless runs leave these null).
+  PFN_vkDestroySurfaceKHR DestroySurfaceKHR = nullptr;
+  PFN_vkGetPhysicalDeviceSurfaceSupportKHR GetPhysicalDeviceSurfaceSupportKHR = nullptr;
+  PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
+  PFN_vkGetPhysicalDeviceSurfaceFormatsKHR GetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+  PFN_vkGetPhysicalDeviceSurfacePresentModesKHR GetPhysicalDeviceSurfacePresentModesKHR = nullptr;
 };
 
 // Device-tier: everything the compute backend actually issues per frame.
@@ -144,11 +158,37 @@ struct DeviceFns {
   PFN_vkAllocateDescriptorSets AllocateDescriptorSets = nullptr;
   PFN_vkUpdateDescriptorSets UpdateDescriptorSets = nullptr;
 
+  // Render path (phase 4b). Dynamic rendering is core 1.3 (its feature bit is
+  // MANDATORY in 1.3, unlike synchronization2's pre-1.3 history), but the same
+  // rule applies: the entry point resolving does not make the call legal until
+  // the feature is enabled at device creation — Backend::Init does both.
+  PFN_vkCmdBeginRendering CmdBeginRendering = nullptr;
+  PFN_vkCmdEndRendering CmdEndRendering = nullptr;
+  PFN_vkCmdDraw CmdDraw = nullptr;
+  PFN_vkCmdDrawIndirect CmdDrawIndirect = nullptr;
+  PFN_vkCmdSetViewport CmdSetViewport = nullptr;
+  PFN_vkCmdSetScissor CmdSetScissor = nullptr;
+  PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
+  PFN_vkCreateImageView CreateImageView = nullptr;
+  PFN_vkDestroyImageView DestroyImageView = nullptr;
+  PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines = nullptr;
+
+  // VK_KHR_swapchain — only non-null when the device enabled it (windowed).
+  PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
+  PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
+  PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR = nullptr;
+  PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
+  PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
+  PFN_vkCreateSemaphore CreateSemaphore = nullptr;
+  PFN_vkDestroySemaphore DestroySemaphore = nullptr;
+
   // Timestamps (capability-gated).
   PFN_vkCreateQueryPool CreateQueryPool = nullptr;
   PFN_vkDestroyQueryPool DestroyQueryPool = nullptr;
   PFN_vkCmdResetQueryPool CmdResetQueryPool = nullptr;
   PFN_vkCmdWriteTimestamp CmdWriteTimestamp = nullptr;
+  PFN_vkCmdWriteTimestamp2 CmdWriteTimestamp2 = nullptr;
+  PFN_vkCmdCopyQueryPoolResults CmdCopyQueryPoolResults = nullptr;
   PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
 };
 

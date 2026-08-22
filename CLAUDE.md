@@ -2,7 +2,10 @@
 
 3D falling-sand voxel engine. GPU-resident cellular automaton over a 256³
 toroidal residency window into an infinite streamed world, raymarched from the
-sim buffers. C++20 + WebGPU (Dawn) + WGSL.
+sim buffers. C++20 + Vulkan + WGSL (compiled to SPIR-V by Tint at load).
+Vulkan-only since 2026-08-22 — Dawn/WebGPU was removed once the port was
+proven; Tint is still built from the Dawn checkout, which is why that
+dependency stays.
 
 **`DESIGN.md` is the source of truth for architecture and rationale.** Read the
 relevant section before changing a system; if a change contradicts DESIGN.md,
@@ -306,17 +309,38 @@ working while waiting for the lock; only the compile+link serializes.
 
 The underlying commands, for reference or manual use:
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64   # configure (first run fetches Dawn ~15 min)
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64   # configure (first run fetches the Dawn repo, ~15 min)
 cmake --build build --config Release --target sandvox    # DO NOT run this directly from agents
 ./build/Release/sandvox.exe --selftest
 ```
 
-Third-party sources (Dawn, Jolt, ImGui, …) are fetched into a **shared** cache
-outside the checkout — `C:/sv-deps`, set by `FETCHCONTENT_BASE_DIR` in
-CMakeLists.txt — so a fresh configure does not re-clone or re-build Dawn. Only
-the first configure on the machine pays the ~15 min. Override with
-`-DFETCHCONTENT_BASE_DIR=...` or `$SANDVOX_DEPS` for a private cache; delete
-`C:/sv-deps` to force a clean refetch.
+**The Dawn CHECKOUT stays even though the Dawn ENGINE is gone, and that is not
+leftovers.** Tint — Dawn's WGSL compiler — is fetched and built from it, and
+the engine cannot work without it: `tint_lang_wgsl_reader` +
+`tint_lang_spirv_writer` are linked into sandvox and are how the live WGSL
+string becomes SPIR-V at load *and* at every F5 reload (precompiling `.spv`
+offline cannot replace this — F5 rebuilds the constant prelude from live tuning
+values, so a precompiled blob would freeze them), and `tint.exe` is
+`check_shaders.sh`'s validator. What is excluded is `add_subdirectory(src/dawn)`
+— dawn_native, webgpu_dawn, webgpu_cpp, webgpu_glfw — which Dawn's own
+CMakeLists gates on "at least one `DAWN_ENABLE_<backend>` is ON". All of them
+are OFF, so those targets are never *declared*; `src/tint` is added
+unconditionally and is unaffected.
+
+Three things in that block are load-bearing and commented in CMakeLists.txt —
+don't rediscover them: `TINT_BUILD_SPV_WRITER`/`SPV_READER` default to
+`${DAWN_ENABLE_VULKAN}` and so must be forced ON *independently*;
+`DAWN_USE_GLFW` must stay ON because that flag is what supplies the `glfw`
+library target (Dawn's own `dawn_glfw` helper is a different thing and is
+excluded); and `Vulkan::Headers` is declared by Dawn only for its own Vulkan
+backend, so CMakeLists does that `add_subdirectory` itself.
+
+Third-party sources (the Dawn repo, Jolt, ImGui, …) are fetched into a
+**shared** cache outside the checkout — `C:/sv-deps`, set by
+`FETCHCONTENT_BASE_DIR` in CMakeLists.txt — so a fresh configure does not
+re-clone or re-build them. Only the first configure on the machine pays the
+~15 min. Override with `-DFETCHCONTENT_BASE_DIR=...` or `$SANDVOX_DEPS` for a
+private cache; delete `C:/sv-deps` to force a clean refetch.
 
 Two things about that path are load-bearing, both learned by breaking them:
 
@@ -332,6 +356,74 @@ Two things about that path are load-bearing, both learned by breaking them:
 assertion, perf, a walk test, and writes `screenshot.bmp`. Run it after any sim,
 shader, or material change and report the actual result — never claim a sim change
 works without it.
+
+### One backend: Vulkan
+
+**Vulkan is the only backend** — headless, windowed and every selftest gate.
+**Dawn was REMOVED 2026-08-22** (user decision) after it had run all 23 gates
+with results character-for-character identical to Vulkan's for a full phase;
+cross-backend bit-equality is explicitly no longer a goal, and the determinism
+guarantee is scoped to Vulkan. `docs/PLAN_vulkan_port.md` is the plan of record
+and carries an `[AS BUILT]` note per phase; `docs/vulkan_barrier_graph.md` is
+the authored sync design that the backend *generates* its barriers from.
+
+The `rhi::` seam survives the removal deliberately: it is what made the port
+testable, an abstract impl with one subclass costs one virtual hop on ~60
+dispatches a tick, and phase 7 plugs a paged-residency `BufferImpl` into that
+same slot. Don't collapse it.
+
+```bash
+./build/Release/sandvox.exe --selftest                    # 23 gates
+./build/Release/sandvox.exe --selftest --vk-validation    # + sync validation
+./build/Release/sandvox.exe --vk-smoke-loud --vk-validation  # 19 PINNED hash probes
+./build/Release/sandvox.exe --frames 400                  # run the WINDOWED game N frames, then exit
+./build/Release/sandvox.exe --vk-info                     # device caps, no sim work
+```
+
+`--backend vulkan` is still accepted (so old invocations keep working);
+`--backend dawn` **refuses with an explanation and exit 2** rather than
+silently running Vulkan under the wrong name. `--adapter low` is unaffected —
+it selects among Vulkan physical devices.
+
+**The smokes are pinned-sequence gates, not cross-backend diffs.**
+`--vk-smoke` (quiet, 5 probes) and `--vk-smoke-loud` (active world: ops,
+explosions, the particle chain, the readback ring, an 8-shift streaming walk;
+19 probes) check the world hash at each probe against constants pinned in
+`src/gpu/vk_smoke.cpp`. That is *more* coverage than the old Dawn-vs-Vulkan
+diff in one direction — it catches a change that would have moved both
+backends identically, which the diff was blind to — and less in another: it
+cannot catch a barrier bug by disagreement. **Sync validation is what covers
+that now**, which is why the next paragraph is not optional. Flipping a pinned
+value to make a run go green is the same act as flipping a known failure in
+`tests/baseline.json`.
+
+The determinism gate's pinned world hash is `7cfa2420` (`tests/baseline.json`).
+**If it moves, you broke the sim** — stop and report it rather than adjusting
+the baseline.
+
+**A sync-validation message FAILS the run, everywhere it can be collected.**
+`--vk-validation` turns on `VK_LAYER_KHRONOS_validation` with synchronization
+validation, and `GpuContext::ReportVkValidation` prints and fails on any
+message in every headless path. This is deliberate and must not be weakened: a
+missing barrier is invisible in a green gate (the CA is deterministic *because*
+of the barriers, not observably) and shows up as a cross-vendor hash divergence
+much later — rule 1's whole nightmare. A hazard is a bug even when all 23 gates
+pass; two real barrier bugs were found exactly this way.
+
+**Every sandvox run wants `SANDVOX_NO_CRASH_DIALOG=1`.** Without it a crash
+pops a modal box and the process hangs forever holding `sandvox.exe`, which
+then fails the next link with `LNK1104`:
+
+```bash
+export SANDVOX_NO_CRASH_DIALOG=1     # do this once per shell
+tail -40 crash.log                   # read this after ANY crash — it has the summary
+```
+
+**Verify the exe you are about to measure.** `build.sh` has printed
+`build succeeded` off a stale binary; `ls --time-style=full-iso -l
+build/Release/sandvox.exe` before trusting a result, and use
+`bash scripts/build.sh --configure` to surface a real configure error that a
+plain build swallows.
 
 ### Run ONE gate, not all twenty
 
@@ -414,17 +506,34 @@ The exe must sit in the project root: it edits this checkout in place, so
 
 ### Build gotchas (learned the hard way)
 
-- Dawn needs `DAWN_FORCE_SYSTEM_COMPONENT_LOAD=ON` or its `vulkan-1.dll` load
-  fails with Windows error 87.
-- ImGui must be ≥1.92 for the current `imgui_impl_wgpu` backend.
-- The compile log is enormous (Dawn). Filter for `src/` and `assets/` paths; don't
-  read `build_compile.log` whole.
+- **Turning a `DAWN_ENABLE_<backend>` back ON re-declares the whole Dawn
+  engine.** All of them are OFF so that `add_subdirectory(src/dawn)` never
+  runs; flipping one drags dawn_native and ~156 TUs back into the build. If you
+  need `Vulkan::Headers` or `glfw`, they are handled explicitly — see the Tint
+  block above and the comments in CMakeLists.txt.
+- ImGui must be ≥1.92 for `imgui_impl_vulkan` (`ui/overlay.cpp` is the
+  sanctioned native exception, and feeds it entry points from the engine's own
+  loader).
+- The compile log is large (Tint/abseil). Filter for `src/` and `assets/`
+  paths; don't read `build_compile.log` whole.
 - Jolt needs `USE_STATIC_MSVC_RUNTIME_LIBRARY=OFF` or the link fails with 139
   `/MT` vs `/MD` runtime mismatches.
-- Dawn's pipeline-layout limit counts **layout entries, not shader usage**: max
-  16 storage buffers per stage across all bind groups in one layout. That's why
-  the particle/explosion pipelines pair a slim group-0 (`simSlimBGL_`, bindings
-  0–4) with group 1 instead of reusing the full sim layout.
+- **`simSlimBGL_` exists for a limit that no longer applies — it is a live
+  follow-up, not a mystery.** Dawn's pipeline-layout limit counted *layout
+  entries, not shader usage*: max 16 storage buffers per stage across all bind
+  groups in one layout. That is why the particle/explosion pipelines pair a
+  slim group-0 (`simSlimBGL_`, bindings 0–4) with group 1 instead of reusing
+  the full sim layout. It was never hardware — `--vk-info` measures 1048576 per
+  stage — and Dawn is gone, so the split can collapse. It was deliberately NOT
+  collapsed in the removal commit, which was kept purely subtractive: this
+  changes descriptor sets and bind points, so it is its own hash-gated change
+  (barrier_graph §4.10).
+- **A core Vulkan feature still has to be ENABLED, not just present.**
+  `synchronization2` and `dynamicRendering` are mandatory in core 1.3, and
+  promotion only makes the entry point *resolve*; calling it without enabling
+  the feature is illegal. The backend probes and refuses a device lacking
+  either, because a silently down-converted barrier is exactly the weakening
+  rule 1 cannot absorb.
 - `target` is a reserved word in WGSL; a buffer used as `Indirect` must not be
   bound in any bind group of the same pass (stage via a Storage copy).
 - A kernel that both reads a neighborhood and writes into it races itself and
@@ -440,7 +549,7 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `src/main.cpp` | frame loop, arg parsing, `--shot`/`--shot-mob` harnesses |
 | `src/test/` | the acceptance gate. `support.*` is the sim/render plumbing shared with `main.cpp` (`SubmitTick`, `WriteRenderParams`, the sync readbacks) — ONE definition, so a test can never pass against behaviour the game does not have. `selftest.*` is the harness: gate registry, `kOrder`, baseline diffing, `--gate`/`--list`/`--json`. One `selftest_<domain>.cpp` per domain, which is also what stops two agents colliding in one hub file |
 | `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation, `.vox` prefab loader |
-| `src/gpu/` | Dawn context, buffer/shader/pipeline helpers |
+| `src/gpu/` | the GPU seam and the Vulkan backend. `rhi.h` is the ONLY GPU API the rest of the engine sees (`vk::` is confined below it); `rhi_impl.h` declares the abstract impls that `rhi_vk.cpp` subclasses — one subclass since the Dawn removal, kept because phase 7's paged-residency buffer is the next one. `vk_*.cpp` is the backend proper — `vk_loader` (a volk-style `vulkan-1.dll` walk; the target builds with `VK_NO_PROTOTYPES`, so a direct `vk*` call is a compile error), `vk_spirv` (WGSL→SPIR-V through Tint, at load and at every F5), `rhi_vulkan` (device/VMA/pipelines/uploads), `vk_record` (the last-access tracker that GENERATES every barrier from `pass_table.def` — no barrier is ever hand-written at a call site), `vk_info`, `vk_smoke` (the pinned hash-sequence gates). `context.*` owns the device and swapchain |
 | `src/game/` | player controller, camera, brush, prefab placer, mob system, player avatar (`avatar.*`) + third-person rig (`thirdperson.*`) |
 | `src/audio/` | spatialized sound (DESIGN.md §12b). `cues.*` is the ONLY header the rest of the game includes — it speaks game events (`Footstep`, `Land`, `Impact`, ambience). Below it: `world.*` voice pools + the one place voxels/Y-up become meters/Z-up, `voice.*` one emitter (lock-free handoff + pre-engine occlusion filter), `occlusion.*` voxel-ray muffling, `library.*` folder-per-set asset registry, `device.*` miniaudio. `xyzpan/` is a VENDORED spatializer — read its `VENDORED_FROM.md` before editing, and keep it dependency-free. Assets are MONO (the panner builds the stereo image); the audio thread must never touch a game object or `CurrentTuning()` |
 | `assets/sounds/` | mono one-shots, one FOLDER per sound set (`footsteps/leaf/leaf_01.wav` = set `footsteps/leaf`). A material names sets in its `"sounds"` block (the flat `"footstep"` key still works); a mob names them in its `.json` sidecar. `raw/` holds the uncut source takes and `.trash/` holds tuner-deleted ones — both SKIPPED by the loader; `scripts/split_footsteps.py` cuts raw takes into per-step files on the transient |
@@ -539,12 +648,14 @@ disagrees.
 - **The pass table's R/W sets and the WGSL bindings its kernels touch must
   agree.** `src/sim/pass_table.def` declares, per recorded command, every buffer
   the kernel reads and writes; `Simulation::Encode*` records by walking it, and
-  the Vulkan backend (port phase 3) *generates* its barriers from the same rows
-  — no barrier is ever hand-written at a call site. So a row that omits a read
-  its kernel performs means phase 3 emits **no** barrier for that hazard, not a
-  weak one. Under Dawn, which generates barriers itself, that costs nothing and
-  the selftest stays green: the bug is invisible until it surfaces as a
-  cross-vendor world-hash divergence, which is rule 1's whole nightmare.
+  the backend *generates* its barriers from the same rows — no barrier is ever
+  hand-written at a call site. So a row that omits a read its kernel performs
+  means **no** barrier is emitted for that hazard, not a weak one. It will
+  usually still pass: the selftest stays green because the hardware happens to
+  order those dispatches anyway, and the bug stays invisible until it surfaces
+  as a cross-vendor world-hash divergence, which is rule 1's whole nightmare.
+  This is why `--vk-validation` is not optional evidence — sync validation
+  reports the hazard from the recorded commands without needing it to fire.
   `scripts/check_pass_table.py` diffs the two by walking each entry point's call
   graph — **rooted at the entry point**, since a WGSL file's module-scope
   bindings are shared by every entry point in it and comparing against those

@@ -75,6 +75,77 @@ VkDescriptorType ToVkDescriptorType(rhi::BufferBindingType t, bool dynamic) {
   return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 }
 
+// ---- phase 4b: render-path mappings ---------------------------------------
+
+VkFormat ToVkFormat(rhi::TextureFormat f) {
+  switch (f) {
+    case rhi::TextureFormat::RGBA8Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
+    case rhi::TextureFormat::BGRA8Unorm: return VK_FORMAT_B8G8R8A8_UNORM;
+    case rhi::TextureFormat::Depth32Float: return VK_FORMAT_D32_SFLOAT;
+    case rhi::TextureFormat::Undefined: break;
+  }
+  return VK_FORMAT_UNDEFINED;
+}
+
+VkCompareOp ToVkCompare(rhi::CompareFunction f) {
+  switch (f) {
+    case rhi::CompareFunction::Never: return VK_COMPARE_OP_NEVER;
+    case rhi::CompareFunction::Less: return VK_COMPARE_OP_LESS;
+    case rhi::CompareFunction::LessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case rhi::CompareFunction::Greater: return VK_COMPARE_OP_GREATER;
+    case rhi::CompareFunction::GreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    case rhi::CompareFunction::Equal: return VK_COMPARE_OP_EQUAL;
+    case rhi::CompareFunction::NotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+    case rhi::CompareFunction::Always: return VK_COMPARE_OP_ALWAYS;
+  }
+  return VK_COMPARE_OP_ALWAYS;
+}
+
+VkCullModeFlags ToVkCull(rhi::CullMode m) {
+  switch (m) {
+    case rhi::CullMode::None: return VK_CULL_MODE_NONE;
+    case rhi::CullMode::Front: return VK_CULL_MODE_FRONT_BIT;
+    case rhi::CullMode::Back: return VK_CULL_MODE_BACK_BIT;
+  }
+  return VK_CULL_MODE_NONE;
+}
+
+VkPrimitiveTopology ToVkTopology(rhi::PrimitiveTopology t) {
+  switch (t) {
+    case rhi::PrimitiveTopology::PointList: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case rhi::PrimitiveTopology::LineList: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case rhi::PrimitiveTopology::LineStrip: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case rhi::PrimitiveTopology::TriangleList: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case rhi::PrimitiveTopology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+  }
+  return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+VkBlendFactor ToVkBlendFactor(rhi::BlendFactor f) {
+  switch (f) {
+    case rhi::BlendFactor::Zero: return VK_BLEND_FACTOR_ZERO;
+    case rhi::BlendFactor::One: return VK_BLEND_FACTOR_ONE;
+    case rhi::BlendFactor::SrcAlpha: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case rhi::BlendFactor::OneMinusSrcAlpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case rhi::BlendFactor::Src: return VK_BLEND_FACTOR_SRC_COLOR;
+    case rhi::BlendFactor::OneMinusSrc: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case rhi::BlendFactor::Dst: return VK_BLEND_FACTOR_DST_COLOR;
+    case rhi::BlendFactor::OneMinusDst: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+  }
+  return VK_BLEND_FACTOR_ONE;
+}
+
+VkBlendOp ToVkBlendOp(rhi::BlendOperation o) {
+  switch (o) {
+    case rhi::BlendOperation::Add: return VK_BLEND_OP_ADD;
+    case rhi::BlendOperation::Subtract: return VK_BLEND_OP_SUBTRACT;
+    case rhi::BlendOperation::ReverseSubtract: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case rhi::BlendOperation::Min: return VK_BLEND_OP_MIN;
+    case rhi::BlendOperation::Max: return VK_BLEND_OP_MAX;
+  }
+  return VK_BLEND_OP_ADD;
+}
+
 VkShaderStageFlags ToVkStages(rhi::ShaderStage s) {
   VkShaderStageFlags f = 0;
   if ((uint32_t)s & (uint32_t)rhi::ShaderStage::Vertex) f |= VK_SHADER_STAGE_VERTEX_BIT;
@@ -103,8 +174,10 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
 Backend::~Backend() { Shutdown(); }
 
 bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
-                   std::string& err) {
+                   std::string& err, const char* const* instanceExts,
+                   uint32_t instanceExtCount, bool wantSwapchain) {
   if (!vkl::LoadGlobal(gfn_, err)) return false;
+  swapchainRequested_ = wantSwapchain;
 
   // ---- layers/extensions ----
   std::vector<const char*> layers;
@@ -163,6 +236,9 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
     if (debugUtilsAvailable) exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     caps_.validationEnabled = true;
   }
+  // Windowed (phase 4b D3): the caller's surface extensions — GLFW's
+  // VK_KHR_surface + VK_KHR_win32_surface on this platform.
+  for (uint32_t i = 0; i < instanceExtCount; i++) exts.push_back(instanceExts[i]);
 
   // Synchronization validation is the PRIMARY detector for a missing barrier
   // (barrier_graph §6.2's detection ladder puts it above cross-backend hash
@@ -406,6 +482,7 @@ bool Backend::CreateLogicalDevice(std::string& err) {
     f2.pNext = &probe;
     ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
     caps_.synchronization2 = probe.synchronization2 != 0;
+    caps_.dynamicRendering = probe.dynamicRendering != 0;
   }
   if (!caps_.synchronization2) {
     err =
@@ -415,12 +492,47 @@ bool Backend::CreateLogicalDevice(std::string& err) {
     return false;
   }
   feat13.synchronization2 = VK_TRUE;
+  // Dynamic rendering is the render path's ONE recording model (phase 4b) —
+  // like synchronization2 it is core-1.3 but must still be enabled, and a
+  // device without it would need a VkRenderPass-object code path nothing else
+  // exercises. Both features are MANDATORY in core 1.3, so a 1.3 device that
+  // lacks either is out of spec; refuse rather than fork the recording model.
+  if (!caps_.dynamicRendering) {
+    err =
+        "device does not support VkPhysicalDeviceVulkan13Features::"
+        "dynamicRendering, which the phase-4b render path requires";
+    return false;
+  }
+  feat13.dynamicRendering = VK_TRUE;
+
+  // Windowed: VK_KHR_swapchain, verified present rather than assumed. A
+  // headless run enables nothing — the device is unchanged from phase 3.
+  std::vector<const char*> devExts;
+  if (swapchainRequested_) {
+    bool have = false;
+    uint32_t n = 0;
+    ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> props(n);
+    if (n) {
+      ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &n, props.data());
+      for (uint32_t i = 0; i < n; i++)
+        if (std::strcmp(props[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+          have = true;
+    }
+    if (!have) {
+      err = "device does not support VK_KHR_swapchain (windowed --backend vulkan)";
+      return false;
+    }
+    devExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  }
 
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   dci.pEnabledFeatures = &want;
   dci.pNext = &feat13;
+  dci.enabledExtensionCount = (uint32_t)devExts.size();
+  dci.ppEnabledExtensionNames = devExts.data();
 
   VkResult r = ifn_.CreateDevice(phys_, &dci, nullptr, &device_);
   if (r != VK_SUCCESS) {
@@ -521,7 +633,49 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
   Buffer* raw = b.get();
   // The zero-init REGISTRY. Every buffer, no exceptions, no opt-out.
   buffers_.push_back(std::move(b));
+
+  // Zero-init, queued (§4.8, phase 4a form): a whole-buffer fill rides the
+  // pending-upload queue in ISSUE ORDER, so it drains at the head of the next
+  // recorded command buffer — before any recorded use, and before any data
+  // upload queued after creation (which therefore still wins). This is what
+  // lets buffers be created at ANY time behind the seam (gate staging, the
+  // eviction pool) and still start life zeroed the way WebGPU guarantees.
+  // Precondition: no command buffer that uses the new buffer is OPEN at
+  // creation time — true for every call site (buffers are always created
+  // before their encoder), and the seam keeps it that way.
+  //
+  // EXCEPTION: MapWrite (host-write staging — the Class B ring). Its contents
+  // are host-produced immediately before every GPU read, so a queued GPU fill
+  // is not just useless — it drains in the same flush as the copies that read
+  // the ring and ZEROES the freshly staged payloads. The material table went
+  // flat that way (a frozen world, not a crash); host-write staging is never
+  // GPU-zeroed.
+  if (!rhi::Any(usage, rhi::BufferUsage::MapWrite)) {
+    Pending p;
+    p.dst = raw;
+    p.dstOffset = 0;
+    p.size = size;
+    p.zeroFill = true;
+    p.classA = false;
+    pending_.push_back(std::move(p));
+  }
   return raw;
+}
+
+void Backend::DestroyBufferDeferred(Buffer* b) {
+  if (!b) return;
+  for (size_t i = 0; i < buffers_.size(); i++) {
+    if (buffers_[i].get() != b) continue;
+    // Drop any still-pending upload aimed at it (a queued zero-fill for a
+    // buffer nothing ever used, typically).
+    for (size_t k = 0; k < pending_.size();) {
+      if (pending_[k].dst == b) pending_.erase(pending_.begin() + k);
+      else k++;
+    }
+    if (b->buf) graveyard_.push_back({b->buf, b->alloc, submitSerial_});
+    buffers_.erase(buffers_.begin() + i);
+    return;
+  }
 }
 
 bool Backend::ZeroInitAll(std::string& err) {
@@ -583,8 +737,67 @@ void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t 
 }
 
 void Backend::FlushUploads(VkCommandBuffer cmd) {
+  if (pending_.empty()) return;
+
+  // CROSS-SUBMIT ordering for the flush itself (phase 4b, found by sync
+  // validation the first time the render gates ran). The §3.4 head barrier is
+  // emitted by Recorder::Begin AFTER this flush's commands, so it orders the
+  // uploads against everything RECORDED AFTER them — but nothing ordered them
+  // against PREVIOUS submits. That gap was unreachable until zero-init moved
+  // into the queue (§4.8 phase 4a): a buffer's creation fill can now drain in
+  // one command buffer and its first Class B data copy in a LATER one, a WAW
+  // across submits that validation reported verbatim as
+  // "vkCmdCopyBuffer ... writes to VkBuffer ... previously written by
+  // vkCmdFillBuffer (from [another] VkCommandBuffer)". On this GPU the copy
+  // could lose the race and the fill zero freshly-uploaded data (the
+  // micro-body pool lost half its limbs exactly this way). One barrier at the
+  // head of any non-empty flush closes the class: every prior write is made
+  // available/visible to these transfer writes. Emitted mechanically for the
+  // whole flush — never per call site.
+  {
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &mb;
+    dfn_.CmdPipelineBarrier2(cmd, &di);
+  }
+
+  // INTRA-FLUSH WAW. Two uploads to one buffer in one flush are transfer
+  // writes with no implicit ordering — vkCmdFillBuffer / vkCmdUpdateBuffer /
+  // vkCmdCopyBuffer may overlap, and "last write wins" (the queue's contract)
+  // only holds if a barrier orders them. This became reachable when zero-init
+  // moved into the queue (phase 4a): a buffer's creation fill is routinely
+  // followed by its first data upload in the SAME flush, and losing that race
+  // zeroed the material table — a frozen world, not a crash. The barrier is
+  // derived from buffer identity (same rule the §3.3 tracker applies), emitted
+  // only when a destination repeats; an ordinary flush emits none.
+  std::vector<Buffer*> touched;
+  auto touchedBefore = [&](Buffer* d) {
+    for (Buffer* t : touched) {
+      if (t == d) return true;
+    }
+    return false;
+  };
   for (const Pending& p : pending_) {
-    if (p.classA) {
+    if (touchedBefore(p.dst)) {
+      VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      di.memoryBarrierCount = 1;
+      di.pMemoryBarriers = &mb;
+      dfn_.CmdPipelineBarrier2(cmd, &di);
+      touched.clear();
+    }
+    if (p.zeroFill) {
+      dfn_.CmdFillBuffer(cmd, p.dst->buf, 0, VK_WHOLE_SIZE, 0);
+    } else if (p.classA) {
       dfn_.CmdUpdateBuffer(cmd, p.dst->buf, p.dstOffset, p.size, p.inlineData.data());
     } else {
       VkBufferCopy region{};
@@ -593,6 +806,7 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
       region.size = p.size;
       dfn_.CmdCopyBuffer(cmd, stagingRing_->buf, p.dst->buf, 1, &region);
     }
+    touched.push_back(p.dst);
   }
   pending_.clear();
 }
@@ -641,6 +855,10 @@ VkFence Backend::SubmitCommands(VkCommandBuffer cmd, std::string& err) {
     err = "vkEndCommandBuffer failed";
     return VK_NULL_HANDLE;
   }
+  return SubmitEnded(cmd, err);
+}
+
+VkFence Backend::SubmitEnded(VkCommandBuffer cmd, std::string& err) {
   VkFence fence = AcquireFence(err);
   if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
@@ -656,20 +874,93 @@ VkFence Backend::SubmitCommands(VkCommandBuffer cmd, std::string& err) {
     err = std::string("vkQueueSubmit failed: ") + vkl::ResultName(r);
     return VK_NULL_HANDLE;
   }
-  inFlight_.push_back({fence, cmd, stagingHead_});
+  inFlight_.push_back({fence, cmd, stagingHead_, ++submitSerial_});
   return fence;
 }
 
 void Backend::PollFences() {
   for (size_t i = 0; i < inFlight_.size();) {
     if (dfn_.GetFenceStatus(device_, inFlight_[i].fence) == VK_SUCCESS) {
+      VkFence f = inFlight_[i].fence;
       dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &inFlight_[i].cmd);
-      freeFences_.push_back(inFlight_[i].fence);
+      // A RETAINED fence must not go back to the pool: a borrower (a readback
+      // slot, an eviction batch) still holds the handle and still needs
+      // vkGetFenceStatus on it to mean THIS submit. Park it until the last
+      // ReleaseFence. See the RetainFence comment in rhi_vulkan.h for what
+      // recycling it under a borrower actually corrupts.
+      auto it = fenceRetain_.find(f);
+      if (it != fenceRetain_.end() && it->second > 0)
+        retiredRetained_.push_back(f);
+      else
+        freeFences_.push_back(f);
       inFlight_.erase(inFlight_.begin() + i);
     } else {
       i++;
     }
   }
+
+  // Drain the buffer graveyard: an entry is freeable once every submit that
+  // was in flight when its handle was released has retired.
+  if (!graveyard_.empty() || !imageGraveyard_.empty()) {
+    uint64_t minInFlight = UINT64_MAX;
+    for (const auto& f : inFlight_) minInFlight = f.serial < minInFlight ? f.serial : minInFlight;
+    for (size_t i = 0; i < graveyard_.size();) {
+      if (graveyard_[i].serial < minInFlight) {
+        vmaDestroyBuffer(allocator_, graveyard_[i].buf, graveyard_[i].alloc);
+        graveyard_.erase(graveyard_.begin() + i);
+      } else {
+        i++;
+      }
+    }
+    for (size_t i = 0; i < imageGraveyard_.size();) {
+      if (imageGraveyard_[i].serial < minInFlight) {
+        if (imageGraveyard_[i].view) dfn_.DestroyImageView(device_, imageGraveyard_[i].view, nullptr);
+        vmaDestroyImage(allocator_, imageGraveyard_[i].img, imageGraveyard_[i].alloc);
+        imageGraveyard_.erase(imageGraveyard_.begin() + i);
+      } else {
+        i++;
+      }
+    }
+  }
+}
+
+void Backend::RetainFence(VkFence f) {
+  if (f == VK_NULL_HANDLE) return;
+  fenceRetain_[f]++;
+}
+
+void Backend::ReleaseFence(VkFence f) {
+  if (f == VK_NULL_HANDLE) return;
+  auto it = fenceRetain_.find(f);
+  if (it == fenceRetain_.end()) return;
+  if (it->second > 0) it->second--;
+  if (it->second != 0) return;
+  fenceRetain_.erase(it);
+  // If the submit already retired while retained, the fence was parked rather
+  // than pooled; hand it back now that nobody holds it.
+  for (size_t i = 0; i < retiredRetained_.size(); i++) {
+    if (retiredRetained_[i] == f) {
+      retiredRetained_.erase(retiredRetained_.begin() + i);
+      freeFences_.push_back(f);
+      return;
+    }
+  }
+}
+
+VkResult Backend::FenceStatus(VkFence f) const {
+  if (f == VK_NULL_HANDLE) return VK_ERROR_UNKNOWN;
+  return dfn_.GetFenceStatus(device_, f);
+}
+
+bool Backend::WaitFence(VkFence f, std::string& err) {
+  if (f == VK_NULL_HANDLE) return true;
+  VkResult r = dfn_.WaitForFences(device_, 1, &f, VK_TRUE, UINT64_MAX);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkWaitForFences failed: ") + vkl::ResultName(r);
+    return false;
+  }
+  PollFences();
+  return true;
 }
 
 bool Backend::WaitIdle(std::string& err) {
@@ -770,6 +1061,417 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   return p;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4b: images and graphics pipelines.
+// ---------------------------------------------------------------------------
+
+Image* Backend::CreateImage(uint32_t w, uint32_t h, rhi::TextureFormat fmt,
+                            rhi::TextureUsage usage, const char* label) {
+  VkFormat vfmt = ToVkFormat(fmt);
+  if (vfmt == VK_FORMAT_UNDEFINED || w == 0 || h == 0) return nullptr;
+  const bool isDepth = fmt == rhi::TextureFormat::Depth32Float;
+
+  VkImageUsageFlags vusage = 0;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::CopySrc)
+    vusage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::CopyDst)
+    vusage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::TextureBinding)
+    vusage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::StorageBinding)
+    vusage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::RenderAttachment)
+    vusage |= isDepth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                      : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+  auto im = std::make_unique<Image>();
+  im->format = vfmt;
+  im->width = w;
+  im->height = h;
+  im->aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+  im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  im->label = label ? label : "";
+
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = vfmt;
+  ici.extent = {w, h, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = vusage;
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  VmaAllocationCreateInfo aci{};
+  aci.usage = VMA_MEMORY_USAGE_AUTO;
+  aci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+  if (vmaCreateImage(allocator_, &ici, &aci, &im->img, &im->alloc, nullptr) != VK_SUCCESS)
+    return nullptr;
+
+  VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = im->img;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = vfmt;
+  vci.subresourceRange = {im->aspect, 0, 1, 0, 1};
+  if (dfn_.CreateImageView(device_, &vci, nullptr, &im->view) != VK_SUCCESS) {
+    vmaDestroyImage(allocator_, im->img, im->alloc);
+    return nullptr;
+  }
+
+  Image* raw = im.get();
+  images_.push_back(std::move(im));
+  return raw;
+}
+
+void Backend::DestroyImageDeferred(Image* im) {
+  if (!im) return;
+  for (size_t i = 0; i < images_.size(); i++) {
+    if (images_[i].get() != im) continue;
+    if (im->img && im->alloc)  // swapchain-owned images have no allocation
+      imageGraveyard_.push_back({im->img, im->alloc, im->view, submitSerial_});
+    images_.erase(images_.begin() + i);
+    return;
+  }
+}
+
+VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModule vs,
+                                           const char* vsEntry, VkShaderModule fs,
+                                           const char* fsEntry,
+                                           const rhi::RenderPipelineDesc& d,
+                                           const char* /*label*/) {
+  if (!dfn_.CreateGraphicsPipelines || layout == VK_NULL_HANDLE ||
+      vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE)
+    return VK_NULL_HANDLE;
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vs;
+  stages[0].pName = vsEntry;
+  stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = fs;
+  stages[1].pName = fsEntry;
+
+  // No vertex buffers anywhere in the engine: every draw pulls from storage
+  // buffers by vertex index (raymarch's fullscreen tri, the cube expanders).
+  VkPipelineVertexInputStateCreateInfo vin{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+  VkPipelineInputAssemblyStateCreateInfo ia{
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ia.topology = ToVkTopology(d.topology);
+
+  VkPipelineViewportStateCreateInfo vp{
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vp.viewportCount = 1;
+  vp.scissorCount = 1;
+
+  // FRONT FACE: CCW, unchanged from WebGPU's default. The recorder sets a
+  // NEGATIVE-HEIGHT viewport (vk_record.cpp BeginRendering), which makes the
+  // viewport transform — and therefore framebuffer-space winding — identical to
+  // WebGPU's. Passing the front face through unchanged is correct ONLY together
+  // with that flip; this is the same pairing Dawn's own Vulkan backend uses.
+  VkPipelineRasterizationStateCreateInfo rs{
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = ToVkCull(d.cullMode);
+  rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rs.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo ms{
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineDepthStencilStateCreateInfo ds{
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  ds.depthTestEnable = VK_TRUE;
+  ds.depthWriteEnable = d.depth.depthWriteEnabled ? VK_TRUE : VK_FALSE;
+  ds.depthCompareOp = ToVkCompare(d.depth.depthCompare);
+
+  VkPipelineColorBlendAttachmentState att{};
+  att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  if (d.blend) {
+    att.blendEnable = VK_TRUE;
+    att.srcColorBlendFactor = ToVkBlendFactor(d.blend->color.srcFactor);
+    att.dstColorBlendFactor = ToVkBlendFactor(d.blend->color.dstFactor);
+    att.colorBlendOp = ToVkBlendOp(d.blend->color.operation);
+    att.srcAlphaBlendFactor = ToVkBlendFactor(d.blend->alpha.srcFactor);
+    att.dstAlphaBlendFactor = ToVkBlendFactor(d.blend->alpha.dstFactor);
+    att.alphaBlendOp = ToVkBlendOp(d.blend->alpha.operation);
+  }
+  VkPipelineColorBlendStateCreateInfo cb{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cb.attachmentCount = 1;
+  cb.pAttachments = &att;
+
+  // Viewport/scissor are dynamic so one pipeline serves any target size
+  // (resize, the offscreen sizes, the swapchain) — the recorder sets both at
+  // BeginRendering.
+  const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dstate{
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dstate.dynamicStateCount = 2;
+  dstate.pDynamicStates = dyn;
+
+  // Dynamic rendering: the attachment formats live on the PIPELINE, not on a
+  // render pass object.
+  VkFormat colorFmt = ToVkFormat(d.colorFormat);
+  VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachmentFormats = &colorFmt;
+  ri.depthAttachmentFormat = ToVkFormat(d.depth.format);
+
+  VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  ci.pNext = &ri;
+  ci.stageCount = 2;
+  ci.pStages = stages;
+  ci.pVertexInputState = &vin;
+  ci.pInputAssemblyState = &ia;
+  ci.pViewportState = &vp;
+  ci.pRasterizationState = &rs;
+  ci.pMultisampleState = &ms;
+  ci.pDepthStencilState = &ds;
+  ci.pColorBlendState = &cb;
+  ci.pDynamicState = &dstate;
+  ci.layout = layout;
+  ci.renderPass = VK_NULL_HANDLE;  // dynamic rendering
+
+  VkPipeline p = VK_NULL_HANDLE;
+  if (dfn_.CreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &p) !=
+      VK_SUCCESS)
+    return VK_NULL_HANDLE;
+  pipelines_.push_back(p);
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4b D3: the swapchain. FIFO to match Dawn's present mode; per-image
+// render-done semaphores; a fence-paced ring of acquire semaphores.
+// ---------------------------------------------------------------------------
+
+PFN_vkVoidFunction Backend::InstanceProc(const char* name) const {
+  return gfn_.GetInstanceProcAddr ? gfn_.GetInstanceProcAddr(instance_, name) : nullptr;
+}
+
+void Backend::DestroySwapchainObjects() {
+  for (auto& im : swapImages_)
+    if (im->view) dfn_.DestroyImageView(device_, im->view, nullptr);
+  swapImages_.clear();
+  for (VkSemaphore s : renderDone_)
+    if (s) dfn_.DestroySemaphore(device_, s, nullptr);
+  renderDone_.clear();
+  for (auto& slot : acquireSlots_) {
+    if (slot.lastUse != VK_NULL_HANDLE) {
+      ReleaseFence(slot.lastUse);
+      slot.lastUse = VK_NULL_HANDLE;
+    }
+    if (slot.sem) dfn_.DestroySemaphore(device_, slot.sem, nullptr);
+    slot.sem = VK_NULL_HANDLE;
+  }
+  if (swapchain_ && dfn_.DestroySwapchainKHR)
+    dfn_.DestroySwapchainKHR(device_, swapchain_, nullptr);
+  swapchain_ = VK_NULL_HANDLE;
+  pendingAcquireSlot_ = nullptr;
+  acquiredIndex_ = UINT32_MAX;
+}
+
+bool Backend::ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
+                                 std::string& err) {
+  if (surface != VK_NULL_HANDLE) surface_ = surface;
+  if (surface_ == VK_NULL_HANDLE) {
+    err = "ConfigureSwapchain: no surface";
+    return false;
+  }
+  if (!dfn_.CreateSwapchainKHR || !ifn_.GetPhysicalDeviceSurfaceCapabilitiesKHR) {
+    err = "swapchain entry points missing (device created without VK_KHR_swapchain?)";
+    return false;
+  }
+
+  // Present support on the one queue family v1 uses (barrier_graph §5.1). A
+  // machine where the graphics+compute family cannot present would need a
+  // second queue, which the single-queue rule forbids — refuse and say so.
+  VkBool32 canPresent = VK_FALSE;
+  ifn_.GetPhysicalDeviceSurfaceSupportKHR(phys_, queueFamily_, surface_, &canPresent);
+  if (!canPresent) {
+    err = "queue family cannot present to this surface (single-queue rule, §5.1)";
+    return false;
+  }
+
+  // Recreate: drain first (in-flight frames reference the old images/views).
+  std::string werr;
+  WaitIdle(werr);
+  DestroySwapchainObjects();
+
+  VkSurfaceCapabilitiesKHR caps{};
+  ifn_.GetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_, &caps);
+  VkExtent2D extent = caps.currentExtent;
+  if (extent.width == UINT32_MAX) {  // surface lets us choose
+    extent.width = w;
+    extent.height = h;
+  }
+  if (extent.width == 0 || extent.height == 0) {
+    // Minimized: leave the swapchain absent; AcquireSwapchainImage returns
+    // null and the frame loop skips rendering, same as Dawn's invalid view.
+    return true;
+  }
+
+  uint32_t imageCount = caps.minImageCount + 1;
+  if (caps.maxImageCount && imageCount > caps.maxImageCount)
+    imageCount = caps.maxImageCount;
+
+  // Format: prefer BGRA8 UNORM (what Dawn negotiates on this platform); fall
+  // back to RGBA8, else the first offered.
+  uint32_t fmtCount = 0;
+  ifn_.GetPhysicalDeviceSurfaceFormatsKHR(phys_, surface_, &fmtCount, nullptr);
+  std::vector<VkSurfaceFormatKHR> fmts(fmtCount);
+  ifn_.GetPhysicalDeviceSurfaceFormatsKHR(phys_, surface_, &fmtCount, fmts.data());
+  VkSurfaceFormatKHR chosen = fmts.empty()
+                                  ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM,
+                                                       VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}
+                                  : fmts[0];
+  for (const auto& f : fmts)
+    if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+      chosen = f;
+      break;
+    }
+  swapFormat_ = chosen.format;
+
+  VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+  sci.surface = surface_;
+  sci.minImageCount = imageCount;
+  sci.imageFormat = chosen.format;
+  sci.imageColorSpace = chosen.colorSpace;
+  sci.imageExtent = extent;
+  sci.imageArrayLayers = 1;
+  sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  sci.preTransform = caps.currentTransform;
+  sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+  // FIFO: always available, and it is Dawn's PresentMode::Fifo — the vsync
+  // pacing the game already has.
+  sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  sci.clipped = VK_TRUE;
+
+  VkResult r = dfn_.CreateSwapchainKHR(device_, &sci, nullptr, &swapchain_);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkCreateSwapchainKHR failed: ") + vkl::ResultName(r);
+    return false;
+  }
+
+  uint32_t n = 0;
+  dfn_.GetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
+  std::vector<VkImage> vkImages(n);
+  dfn_.GetSwapchainImagesKHR(device_, swapchain_, &n, vkImages.data());
+
+  VkSemaphoreCreateInfo semCi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  for (uint32_t i = 0; i < n; i++) {
+    auto im = std::make_unique<Image>();
+    im->img = vkImages[i];
+    im->alloc = nullptr;  // swapchain-owned
+    im->format = swapFormat_;
+    im->width = extent.width;
+    im->height = extent.height;
+    im->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    im->presentable = true;
+    im->label = "swapchain";
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = im->img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = swapFormat_;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn_.CreateImageView(device_, &vci, nullptr, &im->view) != VK_SUCCESS) {
+      err = "vkCreateImageView failed for a swapchain image";
+      return false;
+    }
+    swapImages_.push_back(std::move(im));
+    VkSemaphore s = VK_NULL_HANDLE;
+    dfn_.CreateSemaphore(device_, &semCi, nullptr, &s);
+    renderDone_.push_back(s);
+  }
+  for (auto& slot : acquireSlots_) {
+    dfn_.CreateSemaphore(device_, &semCi, nullptr, &slot.sem);
+    slot.lastUse = VK_NULL_HANDLE;
+  }
+  acquireCursor_ = 0;
+  return true;
+}
+
+rhi::TextureFormat Backend::SwapchainFormat() const {
+  switch (swapFormat_) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return rhi::TextureFormat::BGRA8Unorm;
+    case VK_FORMAT_R8G8B8A8_UNORM: return rhi::TextureFormat::RGBA8Unorm;
+    default: return rhi::TextureFormat::Undefined;
+  }
+}
+
+Image* Backend::AcquireSwapchainImage() {
+  if (swapchain_ == VK_NULL_HANDLE) return nullptr;
+  AcquireSlot& slot = acquireSlots_[acquireCursor_];
+  // The semaphore must be unsignaled AND not in use by a previous acquire.
+  // The fence of the submit that consumed it is the proof.
+  if (slot.lastUse != VK_NULL_HANDLE) {
+    std::string err;
+    WaitFence(slot.lastUse, err);
+    ReleaseFence(slot.lastUse);
+    slot.lastUse = VK_NULL_HANDLE;
+  }
+  uint32_t idx = 0;
+  VkResult r = dfn_.AcquireNextImageKHR(device_, swapchain_, UINT64_MAX, slot.sem,
+                                        VK_NULL_HANDLE, &idx);
+  if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return nullptr;  // OUT_OF_DATE etc.
+  acquiredIndex_ = idx;
+  pendingAcquireSlot_ = &slot;
+  acquireCursor_ = (acquireCursor_ + 1) % kAcquireSlots;
+  return swapImages_[idx].get();
+}
+
+VkFence Backend::SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err) {
+  if (pendingAcquireSlot_ == nullptr || acquiredIndex_ == UINT32_MAX)
+    return SubmitEnded(cmd, err);  // no acquire outstanding: plain submit
+  VkFence fence = AcquireFence(err);
+  if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+  VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.waitSemaphoreCount = 1;
+  si.pWaitSemaphores = &pendingAcquireSlot_->sem;
+  si.pWaitDstStageMask = &waitStage;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  si.signalSemaphoreCount = 1;
+  si.pSignalSemaphores = &renderDone_[acquiredIndex_];
+  VkResult r = dfn_.QueueSubmit(queue_, 1, &si, fence);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkQueueSubmit (present) failed: ") + vkl::ResultName(r);
+    return VK_NULL_HANDLE;
+  }
+  inFlight_.push_back({fence, cmd, stagingHead_, ++submitSerial_});
+  // Pin this submit's fence to the acquire slot: reuse of the semaphore waits
+  // on it (see AcquireSwapchainImage).
+  RetainFence(fence);
+  pendingAcquireSlot_->lastUse = fence;
+  pendingAcquireSlot_ = nullptr;
+  return fence;
+}
+
+void Backend::PresentAcquired() {
+  if (acquiredIndex_ == UINT32_MAX || swapchain_ == VK_NULL_HANDLE) return;
+  VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+  pi.waitSemaphoreCount = 1;
+  pi.pWaitSemaphores = &renderDone_[acquiredIndex_];
+  pi.swapchainCount = 1;
+  pi.pSwapchains = &swapchain_;
+  pi.pImageIndices = &acquiredIndex_;
+  dfn_.QueuePresentKHR(queue_, &pi);  // SUBOPTIMAL/OUT_OF_DATE: resize handles
+  acquiredIndex_ = UINT32_MAX;
+}
+
 VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
                                              const rhi::BindGroupLayoutEntry* layoutEntries,
                                              const rhi::BindGroupEntry* entries,
@@ -864,6 +1566,17 @@ void Backend::Shutdown() {
   inFlight_.clear();
   for (VkFence f : freeFences_) dfn_.DestroyFence(device_, f, nullptr);
   freeFences_.clear();
+  // Fences whose submit retired while a borrower still held them. WaitIdle
+  // above drained the queue, so these are all signalled and unreferenced by the
+  // GPU; the borrowers are going away with the backend.
+  for (VkFence f : retiredRetained_) dfn_.DestroyFence(device_, f, nullptr);
+  retiredRetained_.clear();
+  fenceRetain_.clear();
+
+  DestroySwapchainObjects();
+  if (surface_ != VK_NULL_HANDLE && ifn_.DestroySurfaceKHR)
+    ifn_.DestroySurfaceKHR(instance_, surface_, nullptr);
+  surface_ = VK_NULL_HANDLE;
 
   if (descPool_) dfn_.DestroyDescriptorPool(device_, descPool_, nullptr);
   descPool_ = VK_NULL_HANDLE;
@@ -873,6 +1586,19 @@ void Backend::Shutdown() {
   for (auto& b : buffers_)
     if (b->buf) vmaDestroyBuffer(allocator_, b->buf, b->alloc);
   buffers_.clear();
+  // Graveyard remnants: WaitIdle above drained the queue, so these are idle.
+  for (auto& g : graveyard_) vmaDestroyBuffer(allocator_, g.buf, g.alloc);
+  graveyard_.clear();
+  for (auto& im : images_) {
+    if (im->view) dfn_.DestroyImageView(device_, im->view, nullptr);
+    if (im->img && im->alloc) vmaDestroyImage(allocator_, im->img, im->alloc);
+  }
+  images_.clear();
+  for (auto& g : imageGraveyard_) {
+    if (g.view) dfn_.DestroyImageView(device_, g.view, nullptr);
+    vmaDestroyImage(allocator_, g.img, g.alloc);
+  }
+  imageGraveyard_.clear();
   stagingRing_ = nullptr;
 
   if (allocator_) vmaDestroyAllocator(allocator_);

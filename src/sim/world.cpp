@@ -4,6 +4,8 @@
 #include <cstring>
 
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
+#include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -19,13 +21,32 @@ constexpr uint64_t kPickOff = kHashOff + 256;
 constexpr uint64_t kPCountOff = kPickOff + 256;
 constexpr uint64_t kSupportOff = kPCountOff + 256;
 constexpr uint64_t kSupportBytes = kNumChunks * 4;
-constexpr uint64_t kFetchOff = kSupportOff + kSupportBytes;
+constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
+constexpr uint64_t kFetchOff = kPageFaultOff + 256;
 constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
 
 void World::Init(const rhi::Device& device) {
   using U = rhi::BufferUsage;
-  voxels = CreateBuffer(device, kVoxelCount * 4,
+  // THE PAGE POOL. Sized by the residency mode: dense reserves one page per
+  // slot (kNumChunks) so the identity map is address-identical to the
+  // pre-paging buffer; paged reserves kPoolPages. This is the ONLY place the
+  // pool size is decided, and PoolPages() is the ONLY reader of the mode.
+  voxels = CreateBuffer(device, (uint64_t)PoolPages() * kChunkVol * 4,
                         U::Storage | U::CopySrc | U::CopyDst, "voxels");
+  pageTable = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+                           U::Storage | U::CopySrc | U::CopyDst, "pageTable");
+  pageFaults = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
+                            "pageFaults");
+
+  // The allocator + conservative dirty mirror + materialization rule. It
+  // installs the initial table: the IDENTITY MAP in both modes, because
+  // worldgen writes every slot and its post-pass compaction is what demotes
+  // the all-air chunks (§3.5c). Under the identity map voxWordAt(c) resolves
+  // to exactly voxels[cellIndexW(c)] — the same physical address — so the
+  // whole translation path executes while producing bit-identical addresses to
+  // pre-paging code, which is why --residency dense is the phase's oracle.
+  pages = new PageTable();
+  pages->Init(device, *this);
   dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
   dirty[1] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyB");
   dirtyList = CreateBuffer(device, kNumChunks * 4, U::Storage, "dirtyList");
@@ -125,9 +146,28 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
     if (!ChunkInWindow(wc)) continue;
     s.fetchIds.push_back(wc);
   }
+  // Every copy below is TRACKED (rhi::CommandEncoder::CopyTracked): the sources
+  // are pass-table buffers written by the tick rows earlier in this SAME
+  // command buffer, so each copy must declare its read to the generated-barrier
+  // tracker (vk_record.h §3.3) — an untracked CopyBufferToBuffer here reads
+  // whatever the GPU happens to have written, with no barrier ordering it.
+  //
+  // THE CPU SEAM (§2.1a): the source offset resolves through PageOffsetOfSlot,
+  // never through slot * kChunkBytes. A sentinel slot is SKIPPED entirely and
+  // its 4,096 words are synthesized CPU-side when the snapshot is consumed —
+  // strictly cheaper than today, since a sentinel chunk costs a 4-byte table
+  // read instead of a 16 KiB GPU->CPU copy, which also reduces the readback
+  // traffic kFetchPerTick exists to bound.
+  s.fetchSentinel.assign(s.fetchIds.size(), 0u);
   for (size_t i = 0; i < s.fetchIds.size(); i++) {
-    enc.CopyBufferToBuffer(voxels, (uint64_t)SlotChunkIndex(s.fetchIds[i]) * kChunkBytes,
-                           s.buf, kFetchOff + i * kChunkBytes, kChunkBytes);
+    const uint32_t slotIdx = SlotChunkIndex(s.fetchIds[i]);
+    const uint64_t off = PageOffsetOfSlot(slotIdx);
+    if (off == kNoPage) {
+      s.fetchSentinel[i] = PageEntryOfSlot(slotIdx);
+      continue;
+    }
+    enc.CopyTracked(pass::Buf::Voxels, voxels, off, s.buf,
+                    kFetchOff + i * kChunkBytes, kChunkBytes);
   }
 
   // clamp the 3x3x3 mirror to the residency window (world chunk coords)
@@ -140,31 +180,54 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
             clampBase(playerChunkBase.y, origin_.y),
             clampBase(playerChunkBase.z, origin_.z)};
 
+  // THE CPU SEAM again, and this is the worst of the five sites (§2.1a): the
+  // mirror is CPU-only collision data, so a corrupted mirror is the player
+  // falling through the floor with a CORRECT world hash. Nothing in the
+  // determinism gate can catch it. Sentinel slots are skipped and synthesized
+  // on consumption, exactly like the fetch above.
+  s.mirrorSentinel.fill(0u);
   for (int dz = 0; dz < 3; dz++)
     for (int dy = 0; dy < 3; dy++)
       for (int dx = 0; dx < 3; dx++) {
         uint32_t ci = SlotChunkIndex({s.base.x + dx, s.base.y + dy, s.base.z + dz});
-        uint64_t dst = (uint64_t)((dz * 3 + dy) * 3 + dx) * kChunkBytes;
-        enc.CopyBufferToBuffer(voxels, (uint64_t)ci * kChunkBytes, s.buf, dst,
-                               kChunkBytes);
+        size_t m = (size_t)((dz * 3 + dy) * 3 + dx);
+        uint64_t dst = (uint64_t)m * kChunkBytes;
+        uint64_t off = PageOffsetOfSlot(ci);
+        if (off == kNoPage) {
+          s.mirrorSentinel[m] = PageEntryOfSlot(ci);
+          continue;
+        }
+        enc.CopyTracked(pass::Buf::Voxels, voxels, off, s.buf, dst, kChunkBytes);
       }
   // dirty buffer note: caller copies the *next-tick* dirty buffer; we take a
   // buffer reference at encode time via these explicit copies instead.
-  enc.CopyBufferToBuffer(occupancy, 0, s.buf, kOccOff, kOccBytes);
-  enc.CopyBufferToBuffer(hash, 0, s.buf, kHashOff, 16);
-  enc.CopyBufferToBuffer(pick, 0, s.buf, kPickOff, 32);
-  enc.CopyBufferToBuffer(particleCounts, 0, s.buf, kPCountOff, 16);
+  enc.CopyTracked(pass::Buf::Occupancy, occupancy, 0, s.buf, kOccOff, kOccBytes);
+  enc.CopyTracked(pass::Buf::Hash, hash, 0, s.buf, kHashOff, 16);
+  enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
+  enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // support-loss flags are one-shot: consume into this slot, then clear so the
-  // next window of ticks accumulates fresh flags (no readback = they persist)
-  enc.CopyBufferToBuffer(support, 0, s.buf, kSupportOff, kSupportBytes);
-  enc.ClearBuffer(support, 0, rhi::kWholeSize);
+  // next window of ticks accumulates fresh flags (no readback = they persist).
+  // The copy-then-clear pair is a genuine transfer WAR (barrier_graph §7.4);
+  // routing the fill through the tracker is what makes it fall out on Vulkan.
+  enc.CopyTracked(pass::Buf::Support, support, 0, s.buf, kSupportOff, kSupportBytes);
+  enc.FillTracked(pass::Buf::Support, support);
+  // The page-fault counter rides the ring (risk 1's residual mitigation). No
+  // clear-after-copy, unlike `support`: the counter is MONOTONIC and a non-zero
+  // value is a permanent "this build has a bug" latch, which is the semantics
+  // wanted. That is what makes the detector work in ordinary play rather than
+  // only under test.
+  enc.CopyTracked(pass::Buf::PageFaults, pageFaults, 0, s.buf, kPageFaultOff, 16);
   lastSlot_ = slot;
   return true;
 }
 
 void World::EncodeDirtyCopy(const rhi::CommandEncoder& enc, const rhi::Buffer& dirtyNext) {
   if (lastSlot_ < 0) return;
-  enc.CopyBufferToBuffer(dirtyNext, 0, slots_[lastSlot_].buf, kDirtyOff, kDirtyBytes);
+  // dirtyNext is Simulation::DirtyNext() — the buffer the tick just encoded
+  // writes as "active next tick", i.e. the table's symbolic DirtyOut (the page
+  // has not flipped yet at this point in SubmitTick).
+  enc.CopyTracked(pass::Buf::DirtyOut, dirtyNext, 0, slots_[lastSlot_].buf, kDirtyOff,
+                  kDirtyBytes);
 }
 
 void World::KickReadback() {
@@ -180,6 +243,17 @@ void World::KickReadback() {
           const uint8_t* p = (const uint8_t*)mapped;
           if (p) {
             std::memcpy(snap_.mirror.data(), p, kMirrorBytes);
+            // Sentinel chunks were never copied (§2.1a); synthesize their words
+            // now, through the SAME rule the shader uses. SynthWord (world.h)
+            // and synthWord (common.wgsl) are the two halves of one contract —
+            // the page-roundtrip gate asserts they agree.
+            for (size_t m = 0; m < sl.mirrorSentinel.size(); m++) {
+              const uint32_t e = sl.mirrorSentinel[m];
+              if (e == 0u) continue;  // a real copy landed for this cell
+              const uint32_t w = SynthWord(e);
+              uint32_t* dst = snap_.mirror.data() + m * kChunkVol;
+              for (uint32_t i = 0; i < kChunkVol; i++) dst[i] = w;
+            }
             snap_.mirrorBase = sl.base;
             snap_.windowOrigin = sl.origin;
             const uint32_t* dirtyW = (const uint32_t*)(p + kDirtyOff);
@@ -197,6 +271,7 @@ void World::KickReadback() {
             snap_.activeChunks = active;
             snap_.voxelTotal = total;
             std::memcpy(&snap_.worldHash, p + kHashOff, 4);
+            std::memcpy(&snap_.pageFaults, p + kPageFaultOff, 4);
             std::memcpy(snap_.pick, p + kPickOff, 32);
             const uint32_t* supW = (const uint32_t*)(p + kSupportOff);
             for (uint32_t i = 0; i < kNumChunks; i++)
@@ -214,9 +289,15 @@ void World::KickReadback() {
               CachedChunk& cc = cache_[PackChunkKey(sl.fetchIds[i])];
               if (cc.version <= sl.tick) {
                 cc.version = sl.tick;
-                cc.voxels.assign(
-                    (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
-                    (const uint32_t*)(p + kFetchOff + (i + 1) * kChunkBytes));
+                const uint32_t e =
+                    i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
+                if (e != 0u) {
+                  cc.voxels.assign(kChunkVol, SynthWord(e));  // §2.1a
+                } else {
+                  cc.voxels.assign(
+                      (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
+                      (const uint32_t*)(p + kFetchOff + (i + 1) * kChunkBytes));
+                }
               }
             }
             // bound the cache (drop chunks far in the past)

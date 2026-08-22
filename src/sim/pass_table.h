@@ -5,9 +5,10 @@
 // scripts/check_pass_table.py scrapes the same .def. Read the .def's header
 // comment first — it explains what a row means and why the table exists at all.
 //
-// Nothing here knows about Vulkan. Under Dawn the table drives WHAT is
-// recorded and nothing else; phase 3 adds the last-access tracker that turns
-// each row's `uses` into vkCmdPipelineBarrier2 calls (barrier_graph §3.3).
+// Nothing here knows about Vulkan. The table declares WHAT is recorded; the
+// last-access tracker in gpu/vk_record.cpp is what turns each row's `uses`
+// into vkCmdPipelineBarrier2 calls (barrier_graph §3.3). Keeping those two
+// apart is why a row can be checked against the WGSL by a python script.
 
 #pragma once
 
@@ -61,6 +62,22 @@ enum class Buf : uint8_t {
   FarOcc,
   FarList,
   FarUBO,
+  // ---- the software page table (docs/PLAN_page_table.md §5.1) ----
+  // PageTable is READ by every row whose entry point touches a voxel and
+  // written by nothing on the tick path — it is dispatch-invariant
+  // configuration, not sim state.
+  //
+  // PageFaults is permanent, always-bound and UNCONDITIONAL: no PAGE_ASSERT
+  // prelude flag, no conditional binding, no #if in the .def. It gets an
+  // A(PageFaults) use on every row that can call voxStore. The atomic
+  // increment sits on a branch never taken in a correct build, so its
+  // production cost is a branch that never fires — and in exchange there is
+  // ONE bind-group layout, ONE .def, and no configuration under which the
+  // pass table and the shaders disagree. A conditionally-declared binding
+  // would be two layouts that must agree, which is the shape this repo has a
+  // checker to prevent.
+  PageTable,
+  PageFaults,
   kCount,
 };
 
@@ -110,11 +127,11 @@ enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar };
 enum class Dyn : uint8_t { None, Zero, Ca };
 
 // The passUBO slice stride Dyn::Ca steps by. It lives HERE rather than as a
-// file-static in simulation.cpp because two recorders now consume it — the Dawn
-// walk in simulation.cpp and the Vulkan walk in gpu/vk_record.cpp — and a
-// constant copied into the second one is the "two places that must agree" bug
-// this repo has a checker for. It is a property of the TABLE's Dyn::Ca
-// selector, not of a backend.
+// file-static in simulation.cpp because it is a property of the TABLE's
+// Dyn::Ca selector, not of a recorder — it was already consumed by two walkers
+// before the Dawn removal left one, and a constant copied into a consumer is
+// the "two places that must agree" bug this repo has a checker for. Keep it
+// here even though there is currently a single reader.
 //
 // 256 is the value passUBO was built with (54 slices x 256 B) and is a legal
 // dynamic offset on this device: minUniformBufferOffsetAlignment is 64
@@ -134,6 +151,13 @@ enum class Cond : uint8_t {
   DirtyTick,  // !hashEnable
   GenCount,   // EncodeGenList count > 0
   FarCount,   // EncodeFarFill count > 0
+  // Whole-world worldgen: the D_CHUNKS dispatch that writes all 32,768 slots.
+  // Suppressed under --residency paged, where worldgen runs BATCHED through
+  // worldgenList instead (PLAN_page_table.md §3.5c): a kernel cannot allocate,
+  // so every slot genChunk touches must have a page before the dispatch, and
+  // all 32,768 at once would need a dense pool — i.e. no saving at the moment
+  // of worldgen, and under §3.8's fatal policy an abort at startup.
+  DenseWorldgen,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -161,7 +185,11 @@ enum class DispatchSel : uint32_t {
 // Max `uses` entries on any row. Asserted against the widest row at compile
 // time in pass_table.cpp, so growing a row past this fails the build rather
 // than silently truncating a hazard.
-inline constexpr int kMaxUses = 10;
+// Raised 10 -> 12 by the page table (PLAN_page_table.md §5.3): `ca` goes
+// 9 -> 10 with R(PageTable) -> 11 with A(PageFaults), which exceeded the old
+// ceiling and stopped the build, as the static_assert is meant to. Raised to
+// 12 rather than 11 so the next row addition does not repeat it.
+inline constexpr int kMaxUses = 12;
 
 struct Row {
   const char* name;

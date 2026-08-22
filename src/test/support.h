@@ -63,6 +63,34 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
                     uint32_t seed);
 
+// ---- harness snapshot drain (PLAN_page_table.md, phase 7b) ----------------
+//
+// THE PROBLEM. `World::Snap().valid` is false on every tick of every HEADLESS
+// harness. The async map is issued (KickReadback) and ProcessEvents is pumped,
+// but a harness submits and pumps in lockstep within one loop iteration, so
+// the fence for the just-submitted work has not retired when the callback
+// would fire — and the next iteration overwrites the ring slot. The windowed
+// game does not have this shape: real frames elapse between submit and pump,
+// so its snapshots arrive normally (main.cpp's frame loop, ProcessEvents).
+//
+// This is PRE-EXISTING and orthogonal to paging — it is why World::KindAt has
+// always returned Unknown under the harnesses — but paging is the first system
+// that DEPENDS on the snapshot arriving: §3.2 step (2)'s intersection
+// tightening is the only thing that shrinks the conservative dirty mirror, and
+// §3.6's free condition reads occupancy from the same snapshot.
+//
+// THE FIX, and why it is here and not in the tick path. When this is set, the
+// harness blocks after a kicked readback until the map completes, which makes
+// a harness tick behave like a game frame rather than changing what a tick
+// does. Blocking is sanctioned in exactly this place: CLAUDE.md names the
+// selftest's synchronous reads as the one exception to the no-sync-readback
+// rule, and this is the same exception in the same layer.
+//
+// OFF BY DEFAULT, so main.cpp's frame loop — which shares SubmitTick — is
+// untouched and never pays a sync point. Only the harnesses opt in.
+void SetHarnessSnapshotDrain(bool on);
+bool HarnessSnapshotDrain();
+
 // Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE
 // definition of the debris | mob | avatar slot walk, and all three parallel
 // arrays (xforms, cube instances, micro insts) are built through it. The free
@@ -80,6 +108,20 @@ uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim,
                       uint32_t seed);
 void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
+
+// THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).
+//
+// Reads `count` chunks starting at slot `firstSlot` into `out` (count *
+// kChunkVol words), resolving each slot through World::PageOffsetOfSlot and
+// SYNTHESIZING sentinel chunks CPU-side. A gate that indexes the result with
+// World::SlotCellIndex therefore gets a dense-looking snapshot in slot order
+// whatever the residency mode is — which is what the gates want, since they
+// test sim behaviour rather than residency.
+//
+// `page-roundtrip` is the gate that reads THROUGH the translation instead, on
+// purpose; everything else goes through here.
+void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
+                    uint32_t count, uint32_t* out, const char* label);
 
 // The scripted mutation stream the determinism gate hashes over. A pure
 // function of tick, so both runs of the twice-run comparison see the same ops.

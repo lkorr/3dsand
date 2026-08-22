@@ -17,6 +17,14 @@
 // bind group would make the renderer a sim input (CLAUDE.md rule 1).
 @group(0) @binding(7) var<storage, read> microBricks : array<MicroBrick>;
 @group(0) @binding(8) var<storage, read> microPool : array<u32>;
+// Software page table (docs/PLAN_page_table.md §5.2a). The renderer performs
+// 17 raw voxel reads; under paging every one of them indexes the POOL with a
+// SLOT-derived address and would sample the wrong chunk wherever the target is
+// a sentinel. The world would render as garbage while hashing perfectly — the
+// render path is outside the hashed domain, so no determinism gate could catch
+// it. Read-only here and no pageFaults binding: the renderer must never write
+// the world, so it gets translation without the write path.
+@group(0) @binding(9) var<storage, read> pageTable : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -719,7 +727,7 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     for (var i = 1; i <= 8; i++) {
       let cb = cell - vec3<i32>(0, i, 0);
       if (!inBounds(cb)) { break; }
-      let mb = voxMat(voxels[cellIndexW(cb)]);
+      let mb = voxMat(voxWordAt(cb));
       if (mb == 0u || (microBricks[mb].flags & MICROF_SWAY) == 0u) { break; }
       below++;
     }
@@ -727,7 +735,7 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     for (var i = 1; i <= 8; i++) {
       let ca = cell + vec3<i32>(0, i, 0);
       if (!inBounds(ca)) { break; }
-      let ma = voxMat(voxels[cellIndexW(ca)]);
+      let ma = voxMat(voxWordAt(ca));
       if (ma == 0u || (microBricks[ma].flags & MICROF_SWAY) == 0u) { break; }
       above++;
     }
@@ -932,7 +940,7 @@ fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
   for (var i = 1; i <= 8; i++) {
     let cb = cell - vec3<i32>(0, i, 0);
     if (!inBounds(cb)) { break; }
-    let mb = voxMat(voxels[cellIndexW(cb)]);
+    let mb = voxMat(voxWordAt(cb));
     if (mb == 0u || (microBricks[mb].flags & MICROF_SWAY) == 0u) { break; }
     below++;
   }
@@ -940,7 +948,7 @@ fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
   for (var i = 1; i <= 8; i++) {
     let ca = cell + vec3<i32>(0, i, 0);
     if (!inBounds(ca)) { break; }
-    let ma = voxMat(voxels[cellIndexW(ca)]);
+    let ma = voxMat(voxWordAt(ca));
     if (ma == 0u || (microBricks[ma].flags & MICROF_SWAY) == 0u) { break; }
     above++;
   }
@@ -1178,7 +1186,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       continue;
     }
 
-    let w = voxels[cellIndexW(cell)];
+    let w = voxWordAt(cell);
     let mat = voxMat(w);
     var weight = 0.0;   // this cell's media contribution per unit length
     var cellOp = 0.0;   // this cell's opacity (per-cell, not first-material)
@@ -1826,7 +1834,7 @@ fn applyStain(albedo : vec3f, w : u32, cell : vec3<i32>, wetOut : ptr<function, 
 // only — reflections and shadow rays skip it entirely.
 fn aoSolidAt(c : vec3<i32>) -> f32 {
   if (!inBounds(c)) { return 0.0; }   // unloaded space must not cast AO
-  let w = voxels[cellIndexW(c)];
+  let w = voxWordAt(c);
   let m = voxMat(w);
   if (m == MAT_AIR) { return 0.0; }
   // Only ray blockers occlude: smoke and shallow water must not stamp hard
@@ -2025,7 +2033,7 @@ fn rippleSlope(pWorldM : vec2f, t : f32, footM : f32) -> vec2f {
 // surface with shape rather than as a staircase, and it costs 4 taps.
 fn liquidFullnessAt(c : vec3<i32>, mat : u32) -> f32 {
   if (!inBounds(c)) { return 0.0; }
-  let w = voxels[cellIndexW(c)];
+  let w = voxWordAt(c);
   if (voxMat(w) != mat) { return 0.0; }
   return f32(voxState(w) + 1u) / 8.0;
 }
@@ -2279,7 +2287,7 @@ fn waterAbove(p : vec3f) -> f32 {
     // inert (CLAUDE.md), so treating it as more water would paint caustics
     // under every overhang at the window edge.
     if (!inBounds(c)) { break; }
-    let w = voxels[cellIndexW(c)];
+    let w = voxWordAt(c);
     let mt = voxMat(w);
     if (mt == MAT_AIR) { break; }
     let m = materials[mt];
@@ -2434,7 +2442,7 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     // stop where the medium does or shafts extend out into the sky.
     let c = vec3<i32>(floor(p));
     if (!inBounds(c)) { break; }
-    let w = voxels[cellIndexW(c)];
+    let w = voxWordAt(c);
     let mt = voxMat(w);
     if (mt == MAT_AIR) { continue; }
     let m = materials[mt];
@@ -3179,7 +3187,7 @@ fn floatingOnLiquid(cell : vec3<i32>, mat : u32) -> f32 {
   for (var i = 1; i <= 3; i++) {
     let c = cell + vec3<i32>(0, -i, 0);
     if (!inBounds(c)) { return 0.0; }
-    let w = voxels[cellIndexW(c)];
+    let w = voxWordAt(c);
     let bm = voxMat(w);
     if (bm == MAT_AIR) { return 0.0; }        // nothing under it
     if (bm == mat) { continue; }              // still our own liquid: keep going
@@ -3259,7 +3267,7 @@ fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
         let c = cell + vec3<i32>(dx, dy, dz);
         if (!inBounds(c)) { continue; }
         if (occTotal(chunkOcc(c)) == 0u) { continue; }
-        if (voxMat(voxels[cellIndexW(c)]) == mat) { n += 1.0; }
+        if (voxMat(voxWordAt(c)) == mat) { n += 1.0; }
       }
     }
   }
@@ -3301,7 +3309,7 @@ fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
 // the same code with no special cases.
 fn liquidDensityAt(c : vec3<i32>, mat : u32) -> f32 {
   if (!inBounds(c)) { return 0.0; }
-  let w = voxels[cellIndexW(c)];
+  let w = voxWordAt(c);
   if (voxMat(w) != mat) { return 0.0; }
   return f32(voxState(w) + 1u) / 8.0;
 }
@@ -3813,7 +3821,7 @@ fn heatSpill(cell : vec3<i32>, n : vec3f) -> vec3f {
     if (!inBounds(c)) { break; }
     // chunk-level reject first: an empty or lava-free chunk costs one read
     if (occTotal(chunkOcc(c)) == 0u) { continue; }
-    let mm = materials[voxMat(voxels[cellIndexW(c)])];
+    let mm = materials[voxMat(voxWordAt(c))];
     if (mm.klass == CLASS_LIQUID && (mm.flags & MATF_OPAQUE) != 0u &&
         mm.emission > 0u) {
       // inverse-square-ish falloff, normalised so a touching cell gives ~1
@@ -3852,7 +3860,7 @@ fn moltenPooling(cell : vec3<i32>, mat : u32) -> f32 {
       let c = cell + vec3<i32>(dx, 0, dz);
       if (!inBounds(c)) { continue; }
       if (occTotal(chunkOcc(c)) == 0u) { continue; }
-      if (voxMat(voxels[cellIndexW(c)]) == mat) { n += 1.0; }
+      if (voxMat(voxWordAt(c)) == mat) { n += 1.0; }
     }
   }
   let frac = n / max(total, 1.0);
@@ -4238,7 +4246,7 @@ fn fs(in : VSOut) -> FSOut {
     if (lambert > 0.0) {
       let up1 = h.cell + vec3<i32>(0, 1, 0);
       if (inBounds(up1)) {
-        let uw = voxels[cellIndexW(up1)];
+        let uw = voxWordAt(up1);
         let um = voxMat(uw);
         if (um != MAT_AIR && materials[um].klass == CLASS_LIQUID &&
             (materials[um].flags & MATF_OPAQUE) == 0u) {
@@ -4378,7 +4386,7 @@ fn fs(in : VSOut) -> FSOut {
   // gas tint applied) is what sits BEHIND the water; shadeWater decides how
   // much of it survives the trip back up and what covers the rest.
   if (h.liqT > 0.0) {
-    let lm = voxMat(voxels[cellIndexW(h.liqCell)]);
+    let lm = voxMat(voxWordAt(h.liqCell));
     // Re-read defensively: a cell can have changed class between trace and
     // shade only if the material table moved under us (hot reload), and a
     // stale id would index the wrong absorption.
@@ -4461,7 +4469,7 @@ fn fs(in : VSOut) -> FSOut {
     // Re-read defensively, exactly as the water path does: a hot material
     // reload between trace and shade would otherwise index the wrong
     // absorption.
-    let tm = voxMat(voxels[cellIndexW(h.tsCell)]);
+    let tm = voxMat(voxWordAt(h.tsCell));
     if (tm != MAT_AIR && isTranslucentSolid(materials[tm])) {
       let hitP = R.camPos + rd * h.tsT;
       color = shadeTranslucent(hitP, rd, tm, h.tsCell, h.tsAxis, h.tsSgn,

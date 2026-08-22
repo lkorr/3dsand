@@ -30,7 +30,7 @@ procedurally generated world, alchemy, spells, and online multiplayer.
 | Rendering | **Ray traversal (DDA) over the voxel grid**, not meshing | Geometry changes every frame; meshing churn would dominate |
 | Rigidbody physics | **Jolt Physics** + custom voxel-terrain collision via localized marching cubes | Don't write a rigidbody solver; Jolt is fast, free, battle-tested |
 | Multiplayer model | **Determinism-first sim discipline now; lockstep vs. server-authoritative decided at M9** | A disciplined integer GPU sim CAN be bit-deterministic across machines — both models stay viable (§10) |
-| Language / API | **C++20 + WGSL, migrating WebGPU (Dawn) → native Vulkan** (2026-08-22; see §12 and docs/PLAN_vulkan_port.md) | Browser requirement dropped 2026-08-22. Vulkan unlocks sparse residency (measured: 83% of the voxel buffer is empty pages — a 1024³ window for less memory than 512³ dense), explicit sync/memory control, async queues. WGSL stays the authoring language via Tint→SPIR-V — zero shader rewrites |
+| Language / API | **C++20 + WGSL on native Vulkan** — port complete, Dawn/WebGPU REMOVED 2026-08-22 (see §12 and docs/PLAN_vulkan_port.md) | Browser requirement dropped 2026-08-22. Vulkan unlocks sparse residency (measured: 83% of the voxel buffer is empty pages — a 1024³ window for less memory than 512³ dense), explicit sync/memory control, async queues. WGSL stays the authoring language via Tint→SPIR-V — zero shader rewrites, and Tint is why the Dawn *checkout* remains a dependency |
 
 ---
 
@@ -2100,11 +2100,71 @@ stays the authoring language** (compiled to SPIR-V via Tint at load, so the
 generated-prelude machinery, F5 hot-reload and `check_shaders.sh` are
 untouched); **the determinism rules survive verbatim** (integer sim kernels,
 no subgroup ops in sim state — Vulkan makes those *available*, not
-*permitted*); and **Dawn is retained during the port** as the reference
+*permitted*); and **Dawn was retained during the port** as the reference
 backend and cross-backend hash oracle (same seed + same tick ⇒ same world
-hash) until Vulkan is fully validated, after which its removal is a decision
-recorded in the plan's decision log. The rationale below is kept as the record
-of why WebGPU was the right call while web was a requirement.
+hash) until Vulkan was validated — it was then removed, per the update two
+paragraphs below. The rationale below is kept as the record of why WebGPU was
+the right call while web was a requirement.
+
+**Update (2026-08-22, phases 4–6): the port LANDED, and Vulkan is now the
+DEFAULT backend.** It runs headless and windowed, all 23 selftest gates, the
+`--shot` harnesses and `--measure`; barriers are *generated* from
+`src/sim/pass_table.def` by a last-access tracker (`gpu/vk_record.cpp`) rather
+than hand-placed, exactly as `docs/vulkan_barrier_graph.md` specifies. Parity
+is measured, not assumed: both backends report the same pinned 200-tick world
+hash (`7cfa2420`), the same pass/fail set, and character-identical per-gate
+detail strings — the only difference across a gate-by-gate `--json` diff is
+`perf`, which reports wall clock. Vulkan is also cheaper on the sim, by
+`--measure`'s GPU timestamps: a settled tick is 229–236 µs vs Dawn's 306,
+almost entirely in per-dispatch driver overhead on the 54 empty CA dispatches
+(the §11 idle-cost debt phase 0 flagged), while the genuinely GPU-bound
+full-world occupancy scan is unchanged at ~98 µs. **Render cost is a wash and
+should not be quoted from a single run** — the selftest's 1080p sweep varies
+8–19 ms/frame across runs depending on machine load and the world state
+earlier gates leave behind, and the two backends trade places inside that
+spread.
+
+**Update (2026-08-22, user decision): DAWN IS REMOVED. The engine is
+Vulkan-only, and the determinism guarantee is now scoped to the Vulkan
+backend.** The previous paragraph planned to keep Dawn until the phase-7 page
+table was validated, because its auto-generated barriers were the reference
+implementation of the barrier graph. The user relaxed that requirement
+explicitly: **cross-backend bit-equality is no longer a goal**, and what
+matters is that rule 1 holds on Vulkan going forward, anchored by the pinned
+golden hash `7cfa2420` in `tests/baseline.json`. Dawn was retired having
+already done its job — it agreed with Vulkan on all 23 gates, character for
+character, for a full phase.
+
+What this costs and what replaces it, stated plainly because rule 1 is
+involved:
+
+- **Lost:** the ability to localise a generated-barrier mistake by
+  disagreement. `--vk-smoke`/`--vk-smoke-loud` no longer diff two backends;
+  they check the world hash at 5 and 19 probes against sequences **pinned as
+  constants** (the values the cross-backend diff agreed on and every phase
+  since has reproduced byte-for-byte). That is *more* coverage in one
+  direction — it catches a change that would have moved both backends
+  identically, which the diff was blind to — and less in the other.
+- **Kept, and it was always the stronger detector:** `VK_LAYER_KHRONOS_-
+  validation` with **synchronization validation**, which reports a hazard from
+  the recorded commands *without needing a divergence to occur*. Every
+  headless path fails the run on a single message. Two real barrier bugs were
+  found this way during the port, neither by hash divergence.
+- **§14 risk #3 stays open and its scope narrows honestly:** it was already
+  "one vendor, one driver, one shader compiler". It is now also one host
+  layer. Closing it still needs a second vendor's hash sequence (plan phase 5
+  option (b)); a CPU Vulkan ICD (lavapipe/SwiftShader) remains the cheap
+  partial step and is *unaffected* by this removal, since it plugs in below
+  our host layer.
+
+**The `rhi::` seam stays, including its polymorphic impl layer.** Confining the
+GPU API behind ~10 concepts is what made the port testable one phase at a time;
+an abstract impl with a single subclass costs one virtual hop on ~60 dispatches
+a tick, and it is the slot phase 7's paged-residency buffer plugs into.
+**Tint stays too, and with it the Dawn checkout** — WGSL→SPIR-V at load and at
+every F5 reload is what keeps WGSL the single shader source of truth. What was
+removed is the Dawn *engine* (dawn_native, webgpu_dawn, webgpu_cpp,
+webgpu_glfw), which is excluded by turning off every `DAWN_ENABLE_<backend>`.
 
 **Adopted (2026-08-19, browser requirement): C++20 + WebGPU + WGSL — Dawn
 (Google's WebGPU implementation, Vulkan backend) for native, Emscripten/WASM for
@@ -2699,6 +2759,21 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
    state, or a driver-divergent intrinsic silently breaks cross-GPU reproducibility.
    Mitigation: per-tick world hash asserted in CI-style test runs from M1; validate
    on two GPU vendors early, not at M9.
+   *Status 2026-08-22 (Vulkan port phase 5): still OPEN, but narrowed.* The
+   200-tick hash is now **pinned** to a golden value in `tests/baseline.json`
+   (`7cfa2420`), so a silent drift is a REGRESSION rather than a
+   self-consistent green run — and the full 23-gate suite reproduces it, with
+   character-identical per-gate detail, on **two independent host layers**
+   (Dawn's auto-generated barriers and the Vulkan backend's table-generated
+   ones). That varies the API, the barrier regime and the SPIR-V producer; it
+   does **not** vary the thing this risk is about. This machine exposes exactly
+   one physical device (RTX 3060 Ti — `vulkaninfo --summary` reports one GPU,
+   `--adapter low` finds nothing else, and the i7-11700F has no iGPU), so one
+   vendor, one driver and one shader-compiler back end remain untested against.
+   What closes it is a second vendor's hash *sequence*; `docs/PLAN_vulkan_port.md`
+   phase 5 records the options (a CPU Vulkan ICD such as lavapipe/SwiftShader as
+   a shader-compiler cross-check, or a second physical machine, which is the
+   only one that truly closes it) with their costs.
 4. **Scope** — every system above is the *simple* version of itself on purpose.
    The Noita lesson: they shipped on rules a beginner could write; the magic is
    sleeping, bounding, and content, not clever kernels.

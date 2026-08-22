@@ -461,6 +461,28 @@ R1–R7 are read-only over everything the tick wrote, so **no barriers are neede
 between them**. The barriers that matter are R0→R1 (transfer→vertex/fragment
 shader read) and the cross-submit tick→frame edge (§3.5).
 
+> **[AS BUILT phase 4b] The render table is enforced at the ONE point where it
+> can matter, not re-declared row by row.** Barriers are illegal inside a
+> dynamic-rendering scope, and §2.6 establishes every draw is read-only over
+> buffers — so the render domain's whole hazard surface collapses to the
+> boundary before `vkCmdBeginRendering`. `Recorder::BeginRendering`
+> (vk_record.cpp) therefore flushes the live tracker: every buffer with a
+> recorded write in THIS command buffer gets one derived barrier, src = its
+> tracked last writer, dst = the full render-read domain
+> (`VERTEX|FRAGMENT` shader reads + `DRAW_INDIRECT`/`INDIRECT_COMMAND_READ`,
+> §3.2's stage-domain shift). Writers in previous submits — R0's uploads
+> (flushed at the command buffer's head, ahead of `Recorder::Begin`'s barrier)
+> and §4.5's tick-written `drawArgs` — are covered by the §3.4 head barrier,
+> exactly as for compute. In the common frame recording the flush emits
+> nothing, which is the correct output: the head barrier already did the work.
+> Draw calls record through the recorder (`Draw`/`DrawIndirect`, the latter
+> noting its args read so a post-render writer would WAR); image layout
+> transitions are likewise derived, from `vk::Image::layout` (persists across
+> command buffers) plus a per-recording image access state — UNDEFINED→
+> attachment at BeginRendering, attachment→TRANSFER_SRC inside
+> `CopyImageToBuffer` for the screenshot path. No hand-placed barrier exists on
+> the render path either.
+
 ---
 
 ## 3. Barrier derivation
@@ -498,6 +520,12 @@ For the render table, `StorageRead`/`Uniform` map to
 stays `DRAW_INDIRECT`. The stage is a property of the *table* (each table
 declares its shader-stage domain), not of the `Acc` enum, so one enum serves
 both.
+
+> **[AS BUILT phase 4b]** The domain shift is implemented as the
+> `kRenderReadStages`/`kRenderReadAccess` pair in vk_record.cpp, applied by
+> `BeginRendering`'s tracker flush rather than by re-mapping each row — see the
+> §2.6 as-built note for why the boundary before the rendering scope is the
+> only place a render-domain barrier can exist.
 
 **`StorageAtomicRMW` is `READ|WRITE`, not something weaker.** Vulkan has no
 atomic-specific access flag. Two consecutive atomic-only passes on the same
@@ -989,6 +1017,38 @@ clobber the wake and the world would fail to wake at a day/night boundary. The
 recorder's symbolic resolution (§2.2) makes this a checkable property rather
 than a coincidence; the checker asserts `DirtyIn != DirtyOut` after resolution.
 
+> **[AS BUILT phase 4a] Intra-flush WAW.** When zero-init moved into the queue
+> (§4.8), one flush could legally carry TWO transfer writes to the same buffer —
+> a creation fill followed by the first data upload — and `vkCmdFillBuffer` /
+> `vkCmdUpdateBuffer` have no implicit ordering, so "applied in issue order"
+> silently stopped being true. Sync validation caught it; the hash divergence it
+> caused (the material table zeroed → a frozen, inert world) is recorded in the
+> phase-4a commit. `FlushUploads` now emits one derived
+> `ALL_TRANSFER/TRANSFER_WRITE → ALL_TRANSFER/TRANSFER_WRITE` memory barrier
+> whenever a destination repeats within a single flush — buffer-identity
+> derived, like every barrier here; an ordinary flush (no repeat) emits none.
+> Relatedly, the Class B staging ring (a `MapWrite` buffer) is NEVER GPU-zeroed:
+> its contents are host-produced immediately before each read, and a queued fill
+> for it drains in the same flush as the copies reading it and wipes the staged
+> payloads. Host-write staging is the one exception to §4.8's "fill everything".
+>
+> **[AS BUILT phase 4b] Cross-submit WAW on the flush itself — the third
+> queued-zero-init consequence, found by sync validation the first time the
+> render gates ran.** The §3.4 head barrier is emitted by `Recorder::Begin`
+> AFTER the flush's commands (that order is what makes uploads visible to the
+> recorded rows), so nothing ordered the flush's transfer writes against
+> PREVIOUS submits. Unreachable before zero-init joined the queue: a tick-path
+> upload always targeted a buffer whose prior-submit access was a read. Now a
+> buffer's creation fill can drain in one command buffer and its first Class B
+> data copy in a later one — validation reported it verbatim
+> ("`vkCmdCopyBuffer ... writes to VkBuffer ... previously written by
+> vkCmdFillBuffer (from [another] VkCommandBuffer)`"), and on this GPU the
+> copy could lose the race (the micro-body pool upload lost limbs to its own
+> creation fill — the mob gate's view sweep caught it before the hash could).
+> `FlushUploads` now opens any non-empty flush with one
+> `ALL_COMMANDS/MEMORY_WRITE → ALL_TRANSFER/TRANSFER_WRITE|READ` memory
+> barrier — mechanical, per-flush, never per call site.
+
 ### 4.2 (b) The readback ring on real fences (assumption 10)
 
 Today: `Slot::inFlight` is a bool, set before `MapAsync`, cleared in the map
@@ -1025,6 +1085,22 @@ struct Slot {
   own a fence of its own; `Slot::fence` above is that borrowed handle. This
   keeps the 1:1 mapping onto today's `lastSlot_` while decoupling fence
   lifetime from readback lifetime.
+
+  **[AS BUILT, phase 3c] A borrowed fence needs a RETAIN, and the first
+  implementation without one was silently wrong.** The fence pool recycles a
+  signalled fence into its free list as soon as `PollFences` observes it, and
+  `BeginCommands` calls `PollFences` on *every* command buffer. So a slot that
+  submitted at tick N and had not yet been polled by tick N+1 held a handle
+  `AcquireFence` had already reset and handed to the tick-N+1 submit.
+  `vkGetFenceStatus` on it then reports **a different submit's** status: the
+  slot reads its mapped memory when some unrelated command buffer finishes,
+  which for a 3-deep ring means reading a slot the GPU is still writing. That is
+  silent corruption of the CPU mirror — no crash, no validation message, and the
+  consumers (`KindAt`, the streaming evict filter, the sleep assertion) simply
+  get wrong answers. `Backend::RetainFence`/`ReleaseFence` refcount the borrow;
+  a retained fence whose submit retires is *parked* rather than pooled and
+  returns to the pool on the last release. The borrowed-fence model here is
+  right; what it was missing was the retain that makes "borrowed" true.
 - **Where the CPU polls.** `ctx.ProcessEvents()`'s replacement, called at the
   same point in the frame (`main.cpp:2833`), walks the 3 slots and calls
   `vkGetFenceStatus`. On `VK_SUCCESS`: read the mapped pointer, run the exact
@@ -1050,6 +1126,20 @@ struct Slot {
 - **Blocking readbacks** (`ReadHashSync`, selftest voxel dumps, screenshots)
   become: record copies → submit with a fence → `vkWaitForFences(UINT64_MAX)` →
   read the map. The one sanctioned synchronous path stays exactly as sanctioned.
+
+> **[AS BUILT phase 4a] The ring is World's own code on both backends.** The
+> phase-3c Vulkan-side mirror of the ring (vk_sim.cpp's `ReadbackSlot` /
+> `PollReadbacks` / `PopulateSnapshot`) is deleted. The seam now implements
+> `rhi::MapReadAsync` on Vulkan as exactly this section's design: the call —
+> always issued AFTER the producing submit (`KickReadback`) — borrows that
+> submit's fence via `RetainFence`, and `Device::ProcessEvents` (the
+> `ProcessEvents()` slot in the frame) polls the pending maps and fires each
+> callback from the persistently mapped allocation when its fence signals, then
+> releases the borrow. `MapTicket` (the eviction pool) is the same borrow
+> consumed through Ready()/Wait()/Unmap(). Consequence: the chunk-fetch queue,
+> the CPU chunk cache and the 3×3×3 mirror populate identically on both
+> backends — the phase-3c "fetchIds has no Vulkan consumer" gap closed by
+> deletion rather than by a second implementation.
 
 ### 4.3 (c) Eviction staging pool cross-submit ordering (assumption 7)
 
@@ -1089,7 +1179,13 @@ the whole story:
    copy read the leaving plane's data") stays true, but the reason becomes
    "EvictSlots submits eagerly while FillSlots only enqueues", not "both are
    submits and submits are ordered". Same commit, per the CLAUDE.md rule about
-   docs that contradict code.
+   docs that contradict code. **[AS BUILT, phase 3c] Done** — the comment now
+   states the mechanism, and notes that the memory half comes from §3.4's head
+   barrier on Vulkan and is automatic under Dawn. `kPersistMask` moved from a
+   stream.cpp file-static to `stream.h` in the same commit: the cross-backend
+   smoke has to reproduce the store round-trip exactly, and a second copy of the
+   literal is a "two places that must agree" bug — it had already produced one
+   false divergence that read like a barrier race.
 5. **`CompleteOldest` becomes a fence wait.** Each `PendingEvict` carries the
    `VkFence` of its own submit. `CompleteOldest` does
    `vkWaitForFences(fence, UINT64_MAX)` — a genuine block, exactly as
@@ -1279,6 +1375,22 @@ partial zero-init policy could therefore produce a divergence that the
 determinism gate catches one tick late and attributes to the wrong change. Fill
 everything.
 
+> **[AS BUILT phase 4a] The one-shot `ZeroInitAll` submit became a QUEUED
+> per-buffer fill.** Once buffer creation moved behind the polymorphic seam,
+> buffers are created at many moments (gate staging, the eviction pool, the
+> screenshot readback), not in one init phase — so there is no single "after
+> all buffers exist" moment to submit a registry sweep from. `CreateBuffer` now
+> queues a whole-buffer `vkCmdFillBuffer(0)` on the pending-upload queue
+> (§4.1), which drains at the head of the next recorded command buffer — before
+> any recorded use, and in issue order, so a data upload queued after creation
+> still wins. Same mechanism-not-a-list property; two new consequences are
+> documented in §4.1's phase-4a note (the intra-flush WAW barrier, and the
+> MapWrite staging-ring exception — the one buffer that must NOT be zeroed).
+> `ZeroInitAll` survives only for `--vk-info`'s explicit exercise.
+> Precondition kept by construction: buffers are always created BEFORE the
+> encoder that first uses them (true at every call site; a buffer created while
+> an encoder is open would get its fill one command buffer too late).
+
 ### 4.9 (i) `WaitIdle` / `OnSubmittedWorkDone` (assumption 11)
 
 `GpuContext::WaitIdle` is used by `--shot`, save/load, hot-reload and the
@@ -1313,6 +1425,11 @@ The call sites that matter:
      offscreen render and blocking screenshot readback in `grab()`
      (`main.cpp:160-189`).
 - **`--shot-mob`**: same shape as (3).
+
+> **[AS BUILT phase 4a]** The seam enforces this mechanically: the Vulkan
+> `Device::WaitIdle` checks `PendingUploadCount()` and, if non-zero, records and
+> submits a trivial command buffer (whose `BeginCommands` flushes the queue)
+> before `vkQueueWaitIdle`. No caller has to remember the rule.
 
 ### 4.10 Assumption 13: WebGPU-only constraints
 
@@ -1349,7 +1466,10 @@ vendor. Two variables at once is how a race gets shipped.
 
 Concretely this means:
 - No `VkSemaphore` between tick and frame. Only the swapchain's acquire/present
-  semaphores, which are unrelated to the buffer graph.
+  semaphores, which are unrelated to the buffer graph. **[AS BUILT phase 4b]**
+  Exactly those exist: per-image render-done semaphores + a fence-paced ring of
+  acquire semaphores (`Backend::AcquireSwapchainImage`/`SubmitEndedPresenting`).
+  Nothing else in the engine creates a semaphore.
 - No queue-family ownership transfers anywhere, so `VkBufferMemoryBarrier2`
   always has `srcQueueFamilyIndex = dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED`.
   (This is the correct value for a same-queue barrier and the reason §3's
@@ -2029,10 +2149,33 @@ frame behind, or that the origin fields diverge.
   header enumeration. Until every recorded command is in a table, "barriers are
   generated from the table" means "barriers are missing wherever the table is".
   *(Phase 2b tabled the six `Simulation::Encode*` paths — §2.4 and §2.5.1–2.5.4,
-  2.5.6. Still untabled and therefore still owed a table before phase 3 can
-  claim completeness: the readback copies §2.4 phase 7a/7b — `World::EncodeReadbacks`
-  / `EncodeDirtyCopy` — the eviction copies §4.3, and the render chain §2.6,
-  which phase 4 covers. §2.5.5 `wakeAll` records no commands and needs none.)*
+  2.5.6. §2.5.5 `wakeAll` records no commands and needs none — phase 3c
+  confirmed this: on Vulkan it is a `QueueWrite` draining at the head of the
+  tick's command buffer, with no special case at all.)*
+
+  **RESOLVED for the readback copies (§2.4 phase 7a/7b) and the eviction copies
+  (§4.3), phase 3c — and the resolution is "a Use, not a Row".** A `pass::Row`
+  encodes a Copy's offsets as the literal constants `x/y/z`. That is exact for
+  every copy in the tick table, and it CANNOT express these: `EncodeReadbacks`
+  issues up to 64 chunk fetches at slot indices chosen at runtime from a queue,
+  27 mirror copies whose source offsets come from the live window origin, into a
+  destination slot picked from a 3-deep ring; `EvictSlots` copies a
+  runtime-sized batch out of runtime-chosen slots. Their count and their offsets
+  are **tick data, not table data**. Widening the schema to carry
+  runtime-parameterised offsets would make a row a closure and dissolve the
+  property that lets `check_pass_table.py` read the `.def` as static text.
+
+  So they go through `Recorder::CopyTracked` / `Recorder::FillTracked`, which
+  take the *tracked* endpoint as a `pass::Buf` id and let §3.3 derive the
+  barrier exactly as a row does. The bullet below already permitted this — "if a
+  hazard needs expressing, it is expressed as a table row's `uses`" is satisfied
+  by a `Use`, and `CopyToHost` established the pattern in 3b. Nothing is
+  hand-written: `CopyTracked` declares a `TransferRead` on its source, and
+  `FillTracked` declares a `TransferWrite`, which is what makes the §7.4
+  `support` copy-then-clear WAR fall out instead of being remembered.
+  `src/sim/pass_table.def` is UNCHANGED by phase 3c.
+
+  **Still untabled: the render chain §2.6, which phase 4 covers.**
 - **No barrier is ever written at a call site.** If a hazard needs expressing,
   it is expressed as a table row's `uses`. *(Live since phase 3b: the tracker is
   `gpu/vk_record.cpp`, and the Vulkan recorder reaches a command only by walking

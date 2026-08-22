@@ -107,6 +107,19 @@ struct Gate {
   std::vector<const char*> deps;
   bool advisory = false;          // reports, never fails the run (perf)
   Status (*fn)(Ctx&, std::string& detail);
+  // Does this gate need the RENDER path — the offscreen target, a render
+  // pipeline, a draw?
+  //
+  // Declared rather than inferred, for the Vulkan port. The question "which
+  // gates can run before the Vulkan render path exists" has a machine-readable
+  // answer instead of a curated list in someone's commit message that goes
+  // stale the first time a gate learns to draw. `--list` prints it.
+  //
+  // NOTHING CONSUMES IT since phase 4b: both backends have a render path, so
+  // all 23 gates run on either, and the selftest defaults to Vulkan (phase 6).
+  // The flag survives as documentation — `--list` prints it, and it is the
+  // ready-made answer whenever a backend or a target is again partly built.
+  bool needsRender = false;
 };
 
 // The registry, in declaration order. Defined across src/test/selftest_*.cpp

@@ -35,6 +35,8 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(7) var<storage, read_write> occupancy : array<u32>;
 @group(0) @binding(16) var<storage, read> genList : array<u32>;
+@group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
 const M_STONE : u32 = 1u;
 const M_WOOD  : u32 = 2u;
@@ -2586,7 +2588,10 @@ fn genChunk(slot : u32, li : u32) {
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK, i / (CHUNK * CHUNK)));
     let w = genCell(base + l, T.seed);
-    voxels[slot * CHUNK_VOL + i] = w;
+    // Chunk-linear: the slot's page resolved once, per §2.1's second entry
+    // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
+    // every target slot before the dispatch (§3.5c) and this never faults.
+    voxStore(voxWordInChunk(slot, i), w);
     let m = w & 0xFFFu;
     if (m != MAT_AIR) {
       count += 1u;
@@ -2771,7 +2776,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       if (!farInBox(cc, origin)) { continue; }   // outside this cascade level
 
       // live grid (the sample point is inside this chunk, hence resident)
-      let mat = voxels[cellIndexW(fine)] & 0xFFFu;
+      let mat = voxWordAt(fine) & 0xFFFu;
       var byteV = 0u;
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         // Same skin rule as the sieve — the skin is looked up from PRISTINE

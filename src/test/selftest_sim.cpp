@@ -17,6 +17,8 @@
 #include "test/selftest.h"
 #include "test/support.h"
 
+#include "sim/pagetable.h"
+
 using namespace sandvox;
 
 namespace selftest {
@@ -171,21 +173,16 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     }
     std::printf("\n");
     // material histogram of the first awake chunks
-    rhi::Buffer vstage = CreateBuffer(ctx.device, kChunkVol * 4 * 4,
-                                       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                       "voxRead");
-    rhi::CommandEncoder e2 = ctx.device.CreateCommandEncoder();
-    for (int k = 0; k < 4 && k < (int)awake.size(); k++)
-      e2.CopyBufferToBuffer(world.voxels, (uint64_t)awake[k] * kChunkVol * 4, vstage,
-                            (uint64_t)k * kChunkVol * 4, kChunkVol * 4);
-    ctx.queue.Submit(e2.Finish());
     uint32_t hist[64] = {};
     {
-      std::vector<uint32_t> v_((kChunkVol * 4 * 4) / 4, 0);
-      rhi::ReadBufferBlocking(ctx.device, vstage, 0, v_.data(), (size_t)(kChunkVol * 4 * 4));
+      // Through the CPU seam (§2.1a) — one call per awake slot, since they are
+      // arbitrary slot indices rather than a contiguous range.
+      std::vector<uint32_t> v_((size_t)kChunkVol * 4, 0);
+      for (int k = 0; k < 4 && k < (int)awake.size(); k++)
+        ReadVoxelsSync(ctx, world, awake[k], 1,
+                       v_.data() + (size_t)k * kChunkVol, "voxRead");
       const uint32_t* v = v_.data();
-
-            for (uint32_t i = 0; i < kChunkVol * 4; i++) hist[std::min(v[i] & 0xFFFu, 63u)]++;
+      for (uint32_t i = 0; i < kChunkVol * 4; i++) hist[std::min(v[i] & 0xFFFu, 63u)]++;
     }
     std::printf("  first-4-chunk contents:");
     for (uint32_t m = 1; m < 64; m++)
@@ -282,14 +279,10 @@ bool pondOk = false;
   // blocking map each would be far slower than one copy.
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)vox.size() * 4;
-    rhi::Buffer st = CreateBuffer(ctx.device, bytes,
-                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                   "pondRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, st, 0, vox.data(), (size_t)(bytes));
+    // Through the CPU seam (§2.1a): sentinel slots are synthesized, so the
+    // result is a dense-looking snapshot in SLOT order and the
+    // World::SlotCellIndex indexing below is right in either residency mode.
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "pondRead");
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -435,14 +428,7 @@ bool evapOk = false;
 
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)vox.size() * 4;
-    rhi::Buffer st = CreateBuffer(ctx.device, bytes,
-                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                   "evapRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, st, 0, vox.data(), (size_t)(bytes));
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "evapRead");  // §2.1a
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -547,14 +533,7 @@ bool stainOk = false;
 
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)vox.size() * 4;
-    rhi::Buffer sb = CreateBuffer(ctx.device, bytes,
-                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                   "stainRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, sb, 0, vox.data(), (size_t)(bytes));
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "stainRead");  // §2.1a
   }
 
   // Count stained floor voxels, and check every stain in the world is
@@ -687,14 +666,7 @@ bool fullOk = false;
 
   std::vector<uint32_t> fv(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)fv.size() * 4;
-    rhi::Buffer sb = CreateBuffer(
-        ctx.device, bytes,
-        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "fullRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, sb, 0, fv.data(), (size_t)(bytes));
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, fv.data(), "fullRead");  // §2.1a
   }
   // Count landed blood and how much of it is at less than full fullness.
   // Blood FLOWS once it lands, and flowing splits a cell's fullness across
@@ -807,6 +779,204 @@ Status GatePerf(Ctx& c, std::string& detail) {
   return perfOk ? Status::Pass : Status::Fail;
 }
 
+
+// ---- page-roundtrip (PLAN_page_table.md §4.4 Gate B) ---------------------
+//
+// THE gate that reads THROUGH the translation rather than around it: every
+// other gate goes via ReadVoxelsSync, which synthesizes sentinels so a gate
+// testing sim behaviour sees a dense-looking snapshot. This one asserts the
+// page table itself.
+//
+// Anchored to world.WindowOrigin(), never a fixed world position — gates run
+// in kOrder sequence and the streaming gate leaves the origin ~20 chunks out,
+// which is the documented trap that made the spell gate detonate on tick 1.
+Status GatePageRoundtrip(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  const bool paged = world.residency == World::Residency::Paged;
+  PageTable& pt = *world.pages;
+
+  // Paint into provably-empty sky, well above any terrain. The window origin
+  // is in CHUNK units; +24 chunks of Y from the origin is 384 voxels up.
+  const IVec3 o = world.WindowOrigin();
+  const IVec3 sky{(o.x + (int)kNChunk / 2) * (int)kChunk + 8,
+                  (o.y + 24) * (int)kChunk + 8,
+                  (o.z + (int)kNChunk / 2) * (int)kChunk + 8};
+  const uint32_t skySlot =
+      World::SlotChunkIndex({sky.x >> 4, sky.y >> 4, sky.z >> 4});
+
+  uint32_t t = 900000;  // past any other gate's tick range
+  auto tick = [&](const std::vector<BrushOp>& ops) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, ops, {}, {}, false,
+               {sky.x >> 4, sky.y >> 4, sky.z >> 4}, true, false);
+    ctx.WaitIdle();
+  };
+
+  // ---- step 1: ALLOC -----------------------------------------------------
+  // The target chunk must start as a sentinel in paged mode: it is open sky.
+  const bool wasSentinel =
+      (world.PageEntryOfSlot(skySlot) & kPtSentinelBit) != 0u;
+  const uint32_t before = pt.PagesInUse();
+  tick({{sky.x, sky.y, sky.z, 4, kMatSand, 1, 0, 0}});
+  const bool nowResident =
+      (world.PageEntryOfSlot(skySlot) & kPtSentinelBit) == 0u;
+  const uint32_t afterAlloc = pt.PagesInUse();
+
+  // ---- step 2: CONTENT ---------------------------------------------------
+  // Read the chunk back THROUGH the translation and assert the paint landed.
+  // This is the assertion that a write into a chunk that was a sentinel one
+  // tick earlier actually reached memory rather than being no-oped.
+  std::vector<uint32_t> chunk(kChunkVol, 0);
+  ReadVoxelsSync(ctx, world, skySlot, 1, chunk.data(), "prtRead");
+  uint32_t painted = 0;
+  for (uint32_t w : chunk)
+    if ((w & 0xFFFu) == kMatSand) painted++;
+
+  // ---- step 8: CPU/GPU SYNTHESIS AGREEMENT (§4.4 step 8) -----------------
+  // SynthWord (world.h) and synthWord (common.wgsl) are the two halves of one
+  // contract — the hash contract. EMPTY's half is the strong one and it is
+  // checkable directly: synthWord(PT_EMPTY) must be exactly 0, which is why a
+  // materialized EMPTY page is a plain fillBuffer(0).
+  const bool synthEmptyZero = SynthWord(kPtEmpty) == 0u;
+  bool synthAgrees = true;
+  {
+    // An untouched sky slot next door is still a sentinel; read it through the
+    // seam (which synthesizes CPU-side) and assert every word matches the rule.
+    const uint32_t nbrSlot = World::SlotChunkIndex(
+        {(sky.x >> 4) + 2, sky.y >> 4, sky.z >> 4});
+    std::vector<uint32_t> nbr(kChunkVol, 0);
+    ReadVoxelsSync(ctx, world, nbrSlot, 1, nbr.data(), "prtSynth");
+    const uint32_t entry = world.PageEntryOfSlot(nbrSlot);
+    if ((entry & kPtSentinelBit) != 0u) {
+      const uint32_t want = SynthWord(entry);
+      for (uint32_t w : nbr)
+        if (w != want) { synthAgrees = false; break; }
+    }
+  }
+
+  // ---- step 3: FREE WITH HYSTERESIS -------------------------------------
+  // Erase the ball, then tick past the threshold. The hysteresis is the thing
+  // under test, so assert the page did NOT come back before it — a gate that
+  // only checked the end state would pass with hysteresis removed.
+  tick({{sky.x, sky.y, sky.z, 6, kMatAir, 1, 0, 0}});
+  bool heldThroughHysteresis = true;
+  const int kFreeTicks = 8;  // mirrors kPageFreeTicks (pagetable.h)
+  for (int i = 0; i < kFreeTicks + 6; i++) {
+    tick({});
+    if (i < kFreeTicks - 2 && paged &&
+        (world.PageEntryOfSlot(skySlot) & kPtSentinelBit) != 0u)
+      heldThroughHysteresis = false;  // freed too early
+  }
+  const uint32_t afterFree = pt.PagesInUse();
+
+  // ---- step 7: pageFaults == 0 ------------------------------------------
+  // The assertion that turns §2.4's structural claim into evidence. Read
+  // directly rather than via the snapshot so it covers this gate's own ticks.
+  uint32_t faults = 0;
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.pageFaults, 0, &faults, 4,
+                        "prtFaults");
+
+  // Verdict. In DENSE mode there are no sentinels by construction, so the
+  // alloc/free assertions are vacuous and only the content, synthesis and
+  // fault assertions apply — which is right: dense is the oracle, and what it
+  // must prove is that the translation path produces the same voxels.
+  const bool allocOk =
+      !paged || (wasSentinel && nowResident && afterAlloc > before);
+  const bool freeOk = !paged || (afterFree <= afterAlloc);
+  const bool ok = allocOk && freeOk && painted > 0 && faults == 0 &&
+                  synthEmptyZero && synthAgrees && heldThroughHysteresis;
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: sky slot %u sentinel->resident %d->%d, pages %u->%u->%u, "
+                "%u sand voxels painted through the table, hysteresis held=%d, "
+                "synthWord(EMPTY)==0 %d, CPU/GPU synth agree %d, pageFaults %u",
+                paged ? "paged" : "dense", skySlot, (int)wasSentinel,
+                (int)nowResident, before, afterAlloc, afterFree, painted,
+                (int)heldThroughHysteresis, (int)synthEmptyZero,
+                (int)synthAgrees, faults);
+  detail = buf;
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- daylight-boundary, Gate D (PLAN_page_table.md §3.2a / §4.4) ---------
+//
+// THE SUITE STRUCTURALLY CANNOT DO WITHOUT THIS, and it is new value even
+// without paging: Simulation::EncodeWakeAll has ZERO test coverage today.
+// Every day/night gate PINS the phase (dayNight.freeze = 1 at midnight and at
+// noon), so wasDay != isDay is never true anywhere in the suite and the
+// wake-all path — which sets all 32,768 dirty flags — has never once run under
+// test.
+//
+// It is also the case that decides whether §3.8's fatal abort is reachable in
+// normal play: without the "intersect nonSentinel" filter on the
+// materialization set, a wake-all would demand 32,768 pages from an
+// 8,192-page pool and crash TWICE PER IN-GAME DAY.
+Status GateDaylightBoundary(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  PageTable& pt = *world.pages;
+  const bool paged = world.residency == World::Residency::Paged;
+
+  // Run the cycle UNFROZEN — the whole point — and short, so a boundary is
+  // guaranteed inside the tick budget.
+  const Tuning saved = CurrentTuning();
+  Tuning tun = saved;
+  tun.dayNight.freeze = 0;
+  tun.dayNight.cycleMinutes = 1;   // 1800 ticks per day at 30 Hz
+  SetCurrentTuning(tun);
+
+  const uint32_t tpd = TicksPerDay(tun);
+  uint32_t t = 800000;
+  uint32_t crossings = 0;
+  uint32_t peakPages = pt.PagesInUse();
+  bool everExhausted = false;
+
+  bool prevDay = DaylightStrengthCpu(DayPhaseForTick(t, tpd, false, 0)) > 0;
+  for (uint32_t i = 0; i < tpd; i++) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+               {8, 3, 8}, true, false);
+    const bool isDay =
+        DaylightStrengthCpu(DayPhaseForTick(t, tpd, false, 0)) > 0;
+    if (isDay != prevDay) crossings++;
+    prevDay = isDay;
+    peakPages = std::max(peakPages, pt.PagesInUse());
+    // Only meaningful in PAGED mode: dense is the identity map, so
+    // pagesInUse_ == PoolPages() by construction and always has been.
+    if (paged && pt.PagesInUse() >= pt.PoolPages()) everExhausted = true;
+    if (crossings >= 1 && i > 64) break;   // a boundary plus settle time
+  }
+  ctx.WaitIdle();
+
+  // (a) the hash matches a dense run — carried by the suite running in both
+  //     residency modes rather than re-derived here.
+  // (b) pagesInUse_ < kPoolPages THROUGHOUT: the abort must stay unreachable.
+  // (c) pageFaults == 0: nothing the wake made dirty was written unmaterialized.
+  // (d) chunks return to sleep afterwards.
+  uint32_t faults = 0;
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.pageFaults, 0, &faults, 4,
+                        "dayFaults");
+  const uint32_t active = ReadActiveChunksSync(ctx, world, sim);
+  const uint32_t hash = HashWorldNow(ctx, world, sim, kDefaultSeed);
+
+  SetCurrentTuning(saved);
+
+  const bool ok = crossings >= 1 && !everExhausted && faults == 0;
+  char buf[400];
+  std::snprintf(buf, sizeof(buf),
+                "%s: %u daylight crossing(s) with freeze OFF (EncodeWakeAll "
+                "fired), peak pages %u / %u, exhausted=%d, pageFaults %u, "
+                "%u chunks active after, hash %08x",
+                paged ? "paged" : "dense",
+                crossings, peakPages, pt.PoolPages(), (int)everExhausted,
+                faults, active, hash);
+  detail = buf;
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -818,7 +988,11 @@ const std::vector<Gate>& SimGates() {
       {"blood-stain", "sim", {}, false, GateBloodStain},
       {"flung-liquid", "sim", {}, false, GateFlungLiquid},
       {"prefab", "sim", {}, false, GatePrefab},
-      {"perf", "sim", {"screenshots"}, true, GatePerf},
+      {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
+      {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
+      // No draw of its own, but its verdict reads bestFrameMs, which only the
+      // screenshots gate sets — so it needs the render path transitively.
+      {"perf", "sim", {"screenshots"}, true, GatePerf, /*needsRender=*/true},
   };
   return g;
 }

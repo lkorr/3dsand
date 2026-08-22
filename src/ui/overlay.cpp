@@ -5,14 +5,16 @@
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
-#include <backends/imgui_impl_wgpu.h>
+#include <backends/imgui_impl_vulkan.h>
 
-// PHASE 4 EXCEPTION (docs/PLAN_vulkan_port.md): this file is the ONE place
-// outside src/gpu/ that may name wgpu::, because ImGui_ImplWGPU_* takes native
-// WebGPU handles. Phase 4 replaces this backend with imgui_impl_vulkan and the
-// exception goes away. The overlay's own INTERFACE (overlay.h) already speaks
-// only rhi::, so nothing above it has to care which backend ImGui is on.
-#include "gpu/rhi_dawn.h"
+// BACKEND EXCEPTION (docs/PLAN_vulkan_port.md phase 4b): this file is the ONE
+// place outside src/gpu/ that may name native GPU handles, because ImGui's
+// render backend takes them directly — ImGui_ImplVulkan_* wants the
+// VkInstance/VkDevice/VkCommandBuffer. The overlay's own INTERFACE
+// (overlay.h) speaks only rhi::, so nothing above it sees any of this.
+// The ImGui_ImplWGPU_* half was deleted with Dawn (2026-08-22).
+#include "gpu/rhi_vk.h"
+#include "gpu/rhi_vulkan.h"
 
 bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
                    rhi::TextureFormat format) {
@@ -21,18 +23,47 @@ bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
   ImGui::StyleColorsDark();
   ImGui::GetStyle().Alpha = 0.92f;
   if (!ImGui_ImplGlfw_InitForOther(window, true)) return false;
-  ImGui_ImplWGPU_InitInfo info{};
-  info.Device = rhi::dawn::Native(device).Get();
-  info.NumFramesInFlight = 3;
-  info.RenderTargetFormat = (WGPUTextureFormat)rhi::dawn::ToWgpu(format);
-  // must match Simulation::kDepthFormat — the overlay draws into the same
-  // render pass as the raymarch + debris pipelines
-  info.DepthStencilFormat = WGPUTextureFormat_Depth32Float;
-  return ImGui_ImplWGPU_Init(&info);
+
+  vk::Backend* be = rhi::vkr::NativeBackend(device);
+  if (!be) return false;
+  // The engine loads Vulkan dynamically (VK_NO_PROTOTYPES everywhere), so
+  // ImGui gets its entry points from the same loader.
+  if (!ImGui_ImplVulkan_LoadFunctions(
+          VK_API_VERSION_1_3,
+          [](const char* name, void* ud) {
+            return ((vk::Backend*)ud)->InstanceProc(name);
+          },
+          be))
+    return false;
+  ImGui_ImplVulkan_InitInfo info{};
+  info.ApiVersion = VK_API_VERSION_1_3;
+  info.Instance = be->Instance();
+  info.PhysicalDevice = be->PhysicalDevice();
+  info.Device = be->Device();
+  info.QueueFamily = be->QueueFamily();
+  info.Queue = be->GpuQueue();
+  // Let the backend create its own descriptor pool (font atlas + a few).
+  info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE;
+  info.MinImageCount = 2;
+  info.ImageCount = be->SwapchainImageCount() >= 2 ? be->SwapchainImageCount() : 2;
+  // Same dynamic-rendering scope as the world pass it draws into; the
+  // formats must match Simulation's pipelines (color = swapchain format,
+  // depth = kDepthFormat), or ImGui renders into an incompatible scope.
+  static VkFormat colorFmt;  // ImGui keeps the pointer; static storage
+  colorFmt = format == rhi::TextureFormat::BGRA8Unorm ? VK_FORMAT_B8G8R8A8_UNORM
+                                                      : VK_FORMAT_R8G8B8A8_UNORM;
+  info.UseDynamicRendering = true;
+  info.PipelineInfoMain.PipelineRenderingCreateInfo = {
+      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+  info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+  info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &colorFmt;
+  info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat =
+      VK_FORMAT_D32_SFLOAT;
+  return ImGui_ImplVulkan_Init(&info);
 }
 
 void Overlay::BeginFrame() {
-  ImGui_ImplWGPU_NewFrame();
+  ImGui_ImplVulkan_NewFrame();
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 }
@@ -540,12 +571,11 @@ void Overlay::Draw(UIState& s) {
 
 void Overlay::Render(const rhi::RenderPass& pass) {
   ImGui::Render();
-  ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(),
-                                rhi::dawn::Native(pass).Get());
+  ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), rhi::vkr::NativeCmd(pass));
 }
 
 void Overlay::Shutdown() {
-  ImGui_ImplWGPU_Shutdown();
+  ImGui_ImplVulkan_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
 }

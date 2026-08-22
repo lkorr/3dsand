@@ -13,6 +13,8 @@
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
+@group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
 @group(1) @binding(0) var<storage, read_write> pRead  : array<Particle>;
 @group(1) @binding(1) var<storage, read_write> pWrite : array<Particle>;
@@ -25,7 +27,7 @@ fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
 // Blocks flight: solids, powders and liquids (splash = plop onto the surface).
 fn blocksParticle(c : vec3<i32>) -> bool {
-  let w = voxels[cellIndexW(c)];
+  let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
   return materials[mat].klass != CLASS_GAS;
@@ -199,7 +201,14 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   let cell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
-  let tgt = cellIndexW(cell);
+  // TWO BASES (§4.1, the same rule as the hash key): `tgtSlot` is the SLOT
+  // cell index and is what the reinsertion CLAIM hashes on — the claim lattice
+  // must be a property of the world cell, not of which page currently holds
+  // it, or two particles targeting the same cell could hash to different
+  // claim slots after a reallocation and both win. `tgt` is the physical word
+  // index and is only ever a memory address.
+  let tgtSlot = cellIndexW(cell);
+  let tgt = voxWordIndex(cell);
 
   // ---- micro particles: deposit a stain, never a voxel ----
   // Whether it won the claim or not, the droplet is spent — it is sub-voxel
@@ -210,9 +219,9 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (isMicro(p)) {
     p.flags = 0u;  // dead either way
     pWrite[gid.x] = p;
-    if (atomicLoad(&claim[claimSlot(tgt)]) != microStainPriority(p)) { return; }
+    if (atomicLoad(&claim[claimSlot(tgtSlot)]) != microStainPriority(p)) { return; }
 
-    let w = voxels[tgt];
+    let w = voxWordAt(cell);
     let hit = voxMat(w);
     // The cell may have been emptied by the CA between integrate and resolve;
     // staining air would paint a stain onto nothing and it would render as a
@@ -238,14 +247,14 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
       if (cur >= STAIN_AMT_MAX) { return; }  // saturated: nothing to write
       amt = min(cur + addAmt, STAIN_AMT_MAX);
     }
-    voxels[tgt] = (w & ~STAIN_BITS) | packStain(stainType, amt);
+    voxStore(tgt, (w & ~STAIN_BITS) | packStain(stainType, amt));
     markDirtyNext(cell);
     return;
   }
 
-  let won = atomicLoad(&claim[claimSlot(tgt)]) == particlePriority(p);
+  let won = atomicLoad(&claim[claimSlot(tgtSlot)]) == particlePriority(p);
 
-  if (won && voxMat(voxels[tgt]) == MAT_AIR) {
+  if (won && voxMat(voxWordAt(cell)) == MAT_AIR) {
     // rejoin the grid; stamp 0xFF = "hasn't acted", falls next tick
     let mat = p.payload & 0xFFFu;
     var state = (p.payload >> 12u) & 0xFu;
@@ -261,7 +270,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (materials[mat].klass == CLASS_LIQUID) { state = LIQ_FULL_STATE; }
     // STAMP_NEVER: a reinserted particle has not acted as a grid voxel yet, so
     // it is free to move on the tick it lands.
-    voxels[tgt] = packVox(mat, state, STAMP_NEVER);
+    voxStore(tgt, packVox(mat, state, STAMP_NEVER));
     markDirtyNext(cell);
     p.flags = 0u;  // dead
   } else {

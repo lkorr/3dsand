@@ -9,6 +9,8 @@
 @group(0) @binding(3)  var<storage, read>       materials : array<Material>;
 @group(0) @binding(9)  var<storage, read_write> pick      : array<u32>;
 @group(0) @binding(10) var<uniform> R : RenderParams;
+@group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
 
@@ -33,7 +35,7 @@ fn main() {
   var prev = cell;
   for (var i = 0; i < 640; i++) {
     if (inBounds(cell)) {
-      let w = voxels[cellIndexW(cell)];
+      let w = voxWordAt(cell);
       let mat = voxMat(w);
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         pick[0] = 1u;

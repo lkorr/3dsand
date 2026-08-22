@@ -1,236 +1,424 @@
-// vk_smoke.cpp — the cross-backend hash comparison. See vk_smoke.h.
+// vk_smoke.cpp — PINNED world-hash sequence regression gates
+//                (--vk-smoke, --vk-smoke-loud).
+//
+// DAWN REMOVAL REWRITE (2026-08-22). These two harnesses used to run the SAME
+// scenario on Dawn and on Vulkan and diff the hash sequences; Dawn's
+// auto-generated barriers were the reference implementation of
+// docs/vulkan_barrier_graph.md, so a divergence localised a missing barrier.
+// With Dawn gone there is no second backend to diff against.
+//
+// WHAT REPLACES IT, AND WHY THE REGRESSION POWER SURVIVES. The comparison was
+// never really "Dawn vs Vulkan" — it was "this recording vs a known-good hash
+// sequence", and Dawn happened to be how that sequence was produced. So the
+// sequences are now PINNED as constants below, taken verbatim from the commits
+// that established them under the cross-backend diff (10156bb for the quiet
+// scenario, c0cc28f for the loud one) and reproduced unchanged by every phase
+// since. A run PASSES when every probe equals its pinned value.
+//
+// That is strictly MORE regression coverage than the diff had in one respect
+// and less in another, and both are worth being precise about:
+//
+//   + The pinned value catches a change that would have moved BOTH backends
+//     identically — a WGSL edit, a materials.json reorder, a worldgen tweak.
+//     The old diff was blind to those by construction.
+//   - It cannot catch a barrier bug by *disagreement*, because there is
+//     nothing left to disagree. What covers that now is the other half of the
+//     original evidence, which was always the stronger half:
+//     `--vk-validation` turns on synchronization validation, barrier_graph
+//     §6.2's PRIMARY missing-barrier detector, and BOTH gates FAIL on a
+//     single message. `--barriers=sledgehammer` remains as the §6.2 A/B
+//     oracle: identical hashes under maximal ordering exonerates the barrier
+//     graph (weak evidence, as §6.2 rates it, but free).
+//
+// An intentional content change flips the pinned values here in the same
+// commit, exactly like flipping a known failure in tests/baseline.json — and
+// the same warning applies: doing that to silence a surprise is how a real
+// regression gets buried.
+//
+// The scenario scripts are pure functions of tick (CLAUDE.md rule 1
+// discipline), unchanged since phase 3c — that is what makes pinning legal at
+// all. The streaming walk stays ONE-DIRECTIONAL for the reason phase 3c
+// documented: a return leg's content rides store policy and snapshot timing
+// rather than barriers. The store-hit round trip is covered for real by the
+// save-load / region-store selftest gates.
+//
+// PHASE 7 WILL REUSE THIS DRIVER. `RunScenario` takes the scenario and returns
+// a hash sequence; `--residency` (dense vs paged) is the same shape as the old
+// cross-backend diff — two configurations of one driver, sequences compared —
+// so the RunResult/probe/compare structure is kept intact rather than folded
+// into the pinned check.
 
 #include "gpu/vk_smoke.h"
 
 #include <cstdio>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "gpu/context.h"
-#include "gpu/vk_record.h"
-#include "gpu/vk_sim.h"
+#include "gpu/rhi_vk.h"
+#include "gpu/rhi_vulkan.h"
 #include "sim/materials.h"
 #include "sim/simulation.h"
+#include "sim/stream.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
-#include "test/support.h"  // AssetDir, kDefaultSeed, SubmitWorldgen, SubmitTick, ReadHashSync
+#include "test/support.h"
 
 namespace sandvox {
 namespace {
 
-// The ticks whose hashes are compared. 15 and 30 are hash ticks
-// (tick % 15 == 0), so both phase-5 branches are covered and the comparison
-// straddles the branch rather than sampling one side of it.
-constexpr uint32_t kTicks = 50;
-const uint32_t kProbes[] = {1, 15, 30, 50};
+// ---------------------------------------------------------- scenarios ------
 
-bool IsProbe(uint32_t t) {
-  for (uint32_t p : kProbes)
-    if (p == t) return true;
-  return false;
+constexpr uint32_t kQuietTicks = 50;
+constexpr uint32_t kLoudTicks = 120;
+
+bool QuietProbe(uint32_t t) { return t == 1 || t == 15 || t == 30 || t == 50; }
+
+// The tick whose command-buffer recording stats get printed. Both are ordinary
+// non-hash, non-probe ticks in the middle of the scenario: quiet t=20 is the
+// plain CA path, loud t=50 has ops, explosion fallout and the particle chain
+// all live at once.
+constexpr uint32_t kQuietStatsTick = 20;
+constexpr uint32_t kLoudStatsTick = 50;
+
+// ------------------------------------------------------- the pinned truth ---
+//
+// One entry per probe, in the order RunScenario emits them; `tick == 0` is the
+// post-worldgen hash. These are the values the cross-backend diff agreed on —
+// quiet from commit 10156bb, loud from c0cc28f — and that every phase since
+// has reproduced byte-for-byte. Do not "update" one to make a run go green
+// without knowing which content change moved it; see the header.
+struct Pinned {
+  uint32_t tick;
+  uint32_t hash;
+};
+
+constexpr Pinned kQuietPinned[] = {
+    {0, 0xf97ba745},   // worldgen
+    {1, 0xd5c8944c},
+    {15, 0xf153ce74},
+    {30, 0x434268e6},
+    {50, 0xb3c643a2},  // the settled hash PLAN_vulkan_port.md's baseline
+                       // recorded independently
+};
+
+constexpr Pinned kLoudPinned[] = {
+    {0, 0xf97ba745},   // worldgen — same seed, so identical to the quiet run
+    {15, 0x958d2cd1},  {30, 0x9d6c5841},  {45, 0x896e2082},  {46, 0x5436693c},
+    {47, 0x22ec46d9},  {52, 0xc50f2236},  {53, 0x663bc868},  {60, 0xf4fd73c6},
+    {75, 0x3c954bbf},  {76, 0x20fd330a},  {84, 0x95a876da},  {85, 0x4850717a},
+    {86, 0x38802cbb},  {87, 0x250cd625},  {88, 0x1a9022a2},  {90, 0x2fe6536b},
+    {105, 0x16c239c7}, {120, 0xcb036bd1},
+};
+
+// The loud scenario, verbatim from phase 3c: ops shaped to light up every
+// condition the quiet world leaves dark, and to keep them OVERLAPPING (a tick
+// with ops AND particles AND a hash tick is where a missing barrier between two
+// conditional rows would show).
+std::vector<BrushOp> LoudOps(uint32_t tick) {
+  std::vector<BrushOp> ops;
+  if (tick >= 3 && tick < 100) ops.push_back({100, 170, 100, 6, kMatSand, 0, 0, 0});
+  if (tick >= 8 && tick < 90) ops.push_back({176, 150, 176, 5, kMatWater, 0, 0, 0});
+  if (tick >= 40 && tick < 100) ops.push_back({176, 120, 150, 4, kMatLava, 0, 0, 0});
+  if (tick >= 60 && tick < 110) ops.push_back({110, 80, 110, 3, kMatFire, 0, 0, 0});
+  if (tick >= 70 && tick < 100) ops.push_back({100, 166, 100, 3, 0, 2u, 0, 0});
+  return ops;
 }
 
-// The tick's hashEnable, derived exactly as the game derives it. This is what
-// makes a hash READABLE at a probe tick: the hash buffer is only refreshed on a
-// hash tick, so a probe that is not one would read a stale value on BOTH
-// backends — equal, and meaningless. Every probe above is either 1 (where the
-// hash-only pass supplies the value) or a multiple of 15.
+std::vector<ExplosionOp> LoudExps(uint32_t tick, uint32_t seed) {
+  std::vector<ExplosionOp> exps;
+  if (tick == 45) {
+    int h = World::TerrainHeight(100, 100, seed);
+    exps.push_back({100, h, 100, 14, 400, 0, 0, 0});
+  }
+  if (tick == 52) exps.push_back({176, 50, 176, 10, 300, 0, 0, 0});
+  if (tick == 75) {
+    int h = World::TerrainHeight(120, 120, seed);
+    exps.push_back({120, h, 120, 12, 350, 0, 0, 0});
+  }
+  return exps;
+}
+
+std::vector<CellOp> LoudCells(uint32_t tick, IVec3 windowOrigin) {
+  std::vector<CellOp> cells;
+  if (tick != 20 && tick != 64) return cells;
+  // Anchor to the LIVE window origin, never a fixed world position — the
+  // streaming walk moves the window (the CLAUDE.md selftest-gate trap).
+  IVec3 base{windowOrigin.x * (int)kChunk + 64, windowOrigin.y * (int)kChunk + 96,
+             windowOrigin.z * (int)kChunk + 64};
+  for (int dz = 0; dz < 4; dz++)
+    for (int dy = 0; dy < 4; dy++)
+      for (int dx = 0; dx < 4; dx++) {
+        IVec3 c{base.x + dx, base.y + dy, base.z + dz};
+        cells.push_back({World::SlotCellIndex(c), kMatStone | (kStampNever << kStampShift)});
+      }
+  return cells;
+}
+
+bool LoudParticlesActive(uint32_t tick) { return tick >= 45; }
+
+bool LoudProbe(uint32_t t) {
+  return t == 15 || t == 30 || t == 45 || t == 46 || t == 47 || t == 52 || t == 53 ||
+         t == 60 || t == 75 || t == 76 || t == 84 || t == 85 || t == 86 || t == 87 ||
+         t == 88 || t == 90 || t == 105 || t == 120;
+}
+
 bool HashTick(uint32_t tick) { return tick % 15 == 0; }
 
-}  // namespace
+// The window advances one chunk on +X at these ticks: eviction of the leaving
+// plane, procgen refill of the entering one. 8 shifts.
+bool LoudShiftTick(uint32_t t) { return t >= 85 && t <= 100 && (t % 2) == 0; }
 
-int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation) {
-  std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::printf("=== sandvox --vk-smoke (Vulkan port phase 3b) ===\n");
-  std::printf("mode: barriers=%s validation=%s adapter=%s seed=%u ticks=%u\n",
-              sledgehammer ? "sledgehammer" : "precise", validation ? "ON" : "off",
-              lowPower ? "low" : "default", kDefaultSeed, kTicks);
+// ------------------------------------------------------------ the driver ----
 
-  const std::string assetDir = AssetDir();
+struct Probe {
+  uint32_t tick = 0;
+  uint32_t hash = 0;
+};
 
-  // Tuning FIRST: LoadShader bakes the tuning constants into every shader's
-  // prelude, so both backends must compile against the same live values. This
-  // is the same ordering main.cpp uses.
+struct RunResult {
+  bool ok = false;
+  uint32_t genHash = 0;
+  std::vector<Probe> probes;
+  uint32_t shifts = 0;
+  size_t storeCount = 0;
+  rhi::vkr::Stats stats{};       // last recorded command buffer
+  size_t validationMsgCount = 0;
+  std::vector<std::string> validationMsgs;
+};
+
+// One driver, one configuration today. Phase 7's --residency dense-vs-paged
+// comparison is the same function called twice with a different residency
+// mode, which is why it still returns a whole RunResult rather than a verdict.
+bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
+                 bool paged,
+                 const std::vector<MaterialDef>& mats,
+                 const std::vector<ReactionGpu>& reactions, const std::string& assetDir,
+                 RunResult& out) {
+  GpuContext ctx;
+  if (!ctx.Init(nullptr, 1600, 900, lowPower, false, rhi::BackendKind::Vulkan,
+                validation, sledgehammer)) {
+    std::printf("device init: FAIL\n");
+    return false;
+  }
+  SetHarnessSnapshotDrain(true);  // see test/support.h
+  World world;
+  // The residency axis (§4.4 Gate A): one driver, two configurations. Both must
+  // produce identical hashes at every probe AND reproduce the pinned constants.
+  world.residency = paged ? World::Residency::Paged : World::Residency::Dense;
+  world.Init(ctx.device);
+  Simulation sim;
+  MicroSet micro;
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders")) {
+    std::printf("sim init: FAIL\n");
+    return false;
+  }
+  Stream stream;
+  stream.Init(&ctx, &world, &sim, kDefaultSeed);
+  stream.OnMaterialsReloaded(mats);
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  out.genHash = HashWorldNow(ctx, world, sim, kDefaultSeed);
+
+  const uint32_t ticks = loud ? kLoudTicks : kQuietTicks;
+  for (uint32_t tick = 1; tick <= ticks; tick++) {
+    IVec3 wo = world.WindowOrigin();
+    std::vector<BrushOp> ops;
+    std::vector<ExplosionOp> exps;
+    std::vector<CellOp> cells;
+    bool particles = false;
+    if (loud) {
+      ops = LoudOps(tick);
+      exps = LoudExps(tick, kDefaultSeed);
+      cells = LoudCells(tick, wo);
+      particles = LoudParticlesActive(tick);
+    }
+    // playerChunk tracks the window centre so the 3x3x3 mirror is populated and
+    // the readback ring carries something real (loud only, matching 3c).
+    IVec3 playerChunk{wo.x + (int)kNChunk / 2, wo.y + (int)kNChunk / 2,
+                      wo.z + (int)kNChunk / 2};
+    SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cells, HashTick(tick),
+               playerChunk, /*wantReadback=*/loud, particles, {}, 0);
+    // Snapshot the recording stats HERE, off a representative tick, rather
+    // than after the loop: the last command buffer a run submits is a
+    // standalone rehash or a stream flush, whose 0 rows / 1 copy says nothing
+    // about the tick table. `kStatsTick` is chosen inside each scenario's
+    // busiest stretch so the printed line is the one worth comparing against
+    // the phase-3c/4a records (quiet 11/59/2/3/63, loud 20/64/38/5/104).
+    if (tick == (loud ? kLoudStatsTick : kQuietStatsTick))
+      out.stats = rhi::vkr::LastStats(ctx.device);
+    ctx.ProcessEvents();
+
+    if (loud && LoudShiftTick(tick)) {
+      // Stream::Update's hysteresis decides the shift; a player two chunks past
+      // centre is how the game reaches the same code.
+      IVec3 target{wo.x + (int)kNChunk / 2 + 2, wo.y + (int)kNChunk / 2,
+                   wo.z + (int)kNChunk / 2};
+      uint32_t before = stream.ShiftCount();
+      stream.Update(target);
+      out.shifts += stream.ShiftCount() - before;
+    }
+
+    const bool probe = loud ? LoudProbe(tick) : QuietProbe(tick);
+    if (!probe) continue;
+    // A hash tick's value is already in world.hash; anything else needs a
+    // standalone rehash (PT_HASHONLY) so the probe reads THIS tick's world.
+    uint32_t h = HashTick(tick) ? ReadHashSync(ctx, world)
+                                : HashWorldNow(ctx, world, sim, kDefaultSeed);
+    out.probes.push_back({tick, h});
+  }
+
+  if (loud) {
+    stream.FlushResident();
+    out.storeCount = stream.Store().Count();
+  }
+  ctx.WaitIdle();
+
+  if (vk::Backend* be = ctx.VkBackend()) {
+    out.validationMsgCount = be->ValidationMessages().size();
+    for (size_t i = 0; i < be->ValidationMessages().size() && i < 8; i++)
+      out.validationMsgs.push_back(be->ValidationMessages()[i]);
+  }
+  out.ok = true;
+  return true;
+}
+
+// ------------------------------------------------------------- reporting ----
+
+// Compare the run's probe sequence against the pinned one. Every probe must
+// match; a count mismatch is itself a failure (a scenario edit that changed
+// which ticks are probed must update the pinned table in the same commit).
+int CompareAndReport(const char* name, const RunResult& run, const Pinned* pinned,
+                     size_t pinnedCount, bool validation) {
+  std::printf("\n=== validation ===\n");
+  if (!validation) {
+    std::printf("  (off — rerun with --vk-validation)\n");
+  } else if (run.validationMsgCount == 0) {
+    std::printf("  ZERO messages (no synchronization hazards reported)\n");
+  } else {
+    std::printf("  *** %zu validation message(s) ***\n", run.validationMsgCount);
+    for (const std::string& m : run.validationMsgs)
+      std::printf("    %s\n", m.c_str());
+  }
+
+  // The run's sequence, worldgen first, in pinned order.
+  std::vector<Probe> got;
+  got.push_back({0, run.genHash});
+  for (const Probe& p : run.probes) got.push_back(p);
+
+  std::printf("\n=== hashes vs pinned ===\n");
+  std::printf("  stage              pinned       measured\n");
+  bool allMatch = true;
+  uint32_t matches = 0, total = 0;
+  const size_t n = got.size() < pinnedCount ? got.size() : pinnedCount;
+  for (size_t i = 0; i < n; i++) {
+    char label[32];
+    if (pinned[i].tick == 0)
+      std::snprintf(label, sizeof(label), "worldgen");
+    else
+      std::snprintf(label, sizeof(label), "tick %u", pinned[i].tick);
+    const bool tickOk = got[i].tick == pinned[i].tick;
+    const bool m = tickOk && got[i].hash == pinned[i].hash;
+    allMatch = allMatch && m;
+    total++;
+    if (m) matches++;
+    std::printf("  %-16s   %08x     %08x     %s\n", label, pinned[i].hash,
+                got[i].hash, m ? "MATCH" : "*** MISMATCH ***");
+    if (!tickOk)
+      std::printf("      *** probe is tick %u, pinned expects tick %u ***\n",
+                  got[i].tick, pinned[i].tick);
+  }
+  if (got.size() != pinnedCount) {
+    std::printf("  *** probe count differs: measured %zu, pinned %zu ***\n",
+                got.size(), pinnedCount);
+    allMatch = false;
+  }
+  std::printf("  %u/%u MATCH\n", matches, total);
+
+  const bool hazards = validation && run.validationMsgCount != 0;
+  const bool pass = allMatch && !hazards;
+  if (!pass && !allMatch)
+    std::printf(
+        "\n  A MISMATCH is a world-content regression unless you changed content on\n"
+        "  purpose. The tick where it FIRST appears localises it (barrier_graph\n"
+        "  §6.2): worldgen -> SPIR-V, zero-init or a binding; tick 1 -> recording\n"
+        "  or the CA loop; the first hash tick (15) -> the occupancy path; drift\n"
+        "  appearing later -> re-run with --barriers=sledgehammer, and read §6.2\n"
+        "  on why a matching sledgehammer run is weak evidence.\n");
+  std::printf("\n=== %s %s ===\n", name, pass ? "PASS" : "FAIL");
+  return pass ? 0 : 1;
+}
+
+bool LoadSmokeAssets(std::vector<MaterialDef>& mats, std::vector<ReactionGpu>& reactions,
+                     std::string& assetDir) {
+  assetDir = AssetDir();
   Tuning tuning;
   if (LoadTuning(assetDir + "/materials/tuning.json", tuning)) SetCurrentTuning(tuning);
-
-  std::vector<MaterialDef> mats;
-  std::vector<ReactionGpu> reactions;
   std::string errors;
   if (!LoadAssets(assetDir + "/materials/materials.json",
                   assetDir + "/materials/reactions.json", mats, reactions, errors)) {
     std::printf("asset load failed:\n%s\n", errors.c_str());
-    std::printf("\n=== --vk-smoke FAIL ===\n");
-    return 1;
+    return false;
   }
   std::printf("loaded %zu materials, %zu reactions\n", mats.size(), reactions.size());
+  return true;
+}
 
-  // ---------------------------------------------------------------- Dawn --
-  //
-  // The reference. Its auto-generated barriers are what the Vulkan graph is
-  // being compared against, so it runs first and its numbers are the ones the
-  // Vulkan side must reproduce.
-  std::vector<uint32_t> dawnHashes;
-  uint32_t dawnGenHash = 0;
-  {
-    GpuContext ctx;
-    if (!ctx.Init(nullptr, 1600, 900, lowPower, /*wantTimestamps=*/false)) {
-      std::printf("Dawn device init: FAIL\n");
-      std::printf("\n=== --vk-smoke FAIL ===\n");
-      return 1;
-    }
-    World world;
-    world.Init(ctx.device);
-    Simulation sim;
-    MicroSet micro;
-    if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders")) {
-      std::printf("Dawn sim init: FAIL\n");
-      std::printf("\n=== --vk-smoke FAIL ===\n");
-      return 1;
-    }
+int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
+             bool paged) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  const char* name = loud ? "--vk-smoke-loud" : "--vk-smoke";
+  std::printf("=== sandvox %s (Vulkan, pinned hash sequence, residency %s) ===\n",
+              name, paged ? "paged" : "dense");
+  std::printf("mode: barriers=%s validation=%s adapter=%s seed=%u ticks=%u\n",
+              sledgehammer ? "sledgehammer" : "precise", validation ? "ON" : "off",
+              lowPower ? "low" : "default", kDefaultSeed,
+              loud ? kLoudTicks : kQuietTicks);
+  if (loud)
+    std::printf(
+        "scenario: brush+melt ops, 3 explosions (spawn/integrate/resolve), exact-cell\n"
+        "          ops, readback ring active, 8-shift streaming walk (evict + procgen\n"
+        "          refill; the store-hit round trip is covered by the save gates in\n"
+        "          --selftest)\n");
 
-    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
-    dawnGenHash = HashWorldNow(ctx, world, sim, kDefaultSeed);
-
-    for (uint32_t tick = 1; tick <= kTicks; tick++) {
-      SubmitTick(ctx, world, sim, tick, kDefaultSeed, {}, {}, {}, HashTick(tick),
-                 {0, 0, 0}, /*wantReadback=*/false, /*particlesActive=*/false, {}, 0);
-      if (!IsProbe(tick)) continue;
-      // Tick 1 is not a hash tick, so the hash buffer holds whatever the last
-      // hash pass wrote. Force a rehash there so the probe means something —
-      // and do it identically on both backends, which is what keeps the
-      // comparison honest rather than convenient.
-      uint32_t h = HashTick(tick) ? ReadHashSync(ctx, world)
-                                  : HashWorldNow(ctx, world, sim, kDefaultSeed);
-      dawnHashes.push_back(h);
-    }
-    ctx.WaitIdle();
+  std::vector<MaterialDef> mats;
+  std::vector<ReactionGpu> reactions;
+  std::string assetDir;
+  if (!LoadSmokeAssets(mats, reactions, assetDir)) {
+    std::printf("\n=== %s FAIL ===\n", name);
+    return 1;
   }
 
-  // -------------------------------------------------------------- Vulkan --
-  std::vector<uint32_t> vkHashes;
-  uint32_t vkGenHash = 0;
-  {
-    vk::SimBackend be;
-    std::string err;
-    if (!be.Init(assetDir, mats, reactions, lowPower, validation,
-                 sledgehammer ? vk::BarrierMode::Sledgehammer : vk::BarrierMode::Precise,
-                 err)) {
-      std::printf("Vulkan init: FAIL (%s)\n", err.c_str());
-      std::printf("\n=== --vk-smoke FAIL ===\n");
-      return 1;
-    }
-    std::printf("Vulkan device: %s\n", be.GetCaps().deviceName.c_str());
-    std::printf("  validation layer: %s   sync validation: %s\n",
-                be.GetCaps().validationEnabled ? "ENABLED" : "not enabled",
-                be.GetCaps().syncValidationEnabled ? "ENABLED" : "not enabled");
-
-    if (!be.SubmitWorldgen(kDefaultSeed, err) || !be.SubmitHashOnly(kDefaultSeed, err) ||
-        !be.ReadHash(vkGenHash, err)) {
-      std::printf("Vulkan worldgen: FAIL (%s)\n", err.c_str());
-      std::printf("\n=== --vk-smoke FAIL ===\n");
-      return 1;
-    }
-    const vk::RecordStats gs = be.LastStats();
-    (void)gs;
-
-    for (uint32_t tick = 1; tick <= kTicks; tick++) {
-      if (!be.SubmitTick(tick, kDefaultSeed, HashTick(tick), err)) {
-        std::printf("Vulkan tick %u: FAIL (%s)\n", tick, err.c_str());
-        std::printf("\n=== --vk-smoke FAIL ===\n");
-        return 1;
-      }
-      if (tick == 1) {
-        // Report what the tick table actually recorded, once. The CA row's 54
-        // iterations must each carry their own barrier — that count is the
-        // colour lattice (barrier_graph §7.1), so seeing it is worth a line.
-        const vk::RecordStats& s = be.LastStats();
-        std::printf(
-            "  tick recording: %u rows, %u dispatches, %u copies, %u fills, "
-            "%u barrier calls (%u buffer + %u global)\n",
-            s.rows, s.dispatches, s.copies, s.fills, s.barrierCalls, s.bufferBarriers,
-            s.globalBarriers);
-      }
-      if (!IsProbe(tick)) continue;
-      if (!HashTick(tick)) {
-        if (!be.SubmitHashOnly(kDefaultSeed, err)) {
-          std::printf("Vulkan rehash at tick %u: FAIL (%s)\n", tick, err.c_str());
-          std::printf("\n=== --vk-smoke FAIL ===\n");
-          return 1;
-        }
-      }
-      uint32_t h = 0;
-      if (!be.ReadHash(h, err)) {
-        std::printf("Vulkan hash read at tick %u: FAIL (%s)\n", tick, err.c_str());
-        std::printf("\n=== --vk-smoke FAIL ===\n");
-        return 1;
-      }
-      vkHashes.push_back(h);
-    }
-
-    // Validation findings are a RESULT, not decoration. A sync hazard reported
-    // here is a real finding even when the hashes match — §6.2 is explicit that
-    // matching hashes on one GPU are weak evidence, and that the layer detects
-    // a hazard from the recorded commands without needing a divergence.
-    const auto& msgs = be.Be().ValidationMessages();
-    std::printf("\n=== validation ===\n");
-    if (!be.GetCaps().validationEnabled) {
-      std::printf("  layer not enabled for this run\n");
-    } else if (msgs.empty()) {
-      std::printf("  ZERO messages (no synchronization hazards reported)\n");
-    } else {
-      std::printf("  %zu message(s):\n", msgs.size());
-      for (const auto& m : msgs) std::printf("    %s\n", m.c_str());
-    }
-    be.Shutdown();
-
-    if (be.GetCaps().validationEnabled && !msgs.empty()) {
-      std::printf("\n=== --vk-smoke FAIL (validation reported %zu message(s)) ===\n",
-                  msgs.size());
-      return 1;
-    }
+  RunResult run;
+  if (!RunScenario(loud, lowPower, sledgehammer, validation, paged, mats, reactions,
+                   assetDir, run)) {
+    std::printf("\n=== %s FAIL ===\n", name);
+    return 1;
   }
 
-  // ------------------------------------------------------------ compare --
-  bool ok = true;
-  std::printf("\n=== hashes ===\n");
-  std::printf("  %-18s %-12s %-12s %s\n", "stage", "Dawn", "Vulkan", "");
-  std::printf("  %-18s %08x     %08x     %s\n", "worldgen", dawnGenHash, vkGenHash,
-              dawnGenHash == vkGenHash ? "MATCH" : "*** MISMATCH ***");
-  if (dawnGenHash != vkGenHash) ok = false;
+  std::printf("\n  tick recording: %u rows, %u dispatches, %u copies, %u fills, "
+              "%u barrier calls (%u buffer + %u global)\n",
+              run.stats.rows, run.stats.dispatches, run.stats.copies, run.stats.fills,
+              run.stats.barrierCalls, run.stats.bufferBarriers,
+              run.stats.globalBarriers);
+  if (loud)
+    std::printf("\n=== streaming ===\n  %u window shifts, %zu chunks in store\n",
+                run.shifts, run.storeCount);
 
-  for (size_t i = 0; i < std::size(kProbes); i++) {
-    uint32_t d = i < dawnHashes.size() ? dawnHashes[i] : 0;
-    uint32_t v = i < vkHashes.size() ? vkHashes[i] : 0;
-    char label[32];
-    std::snprintf(label, sizeof(label), "tick %u", kProbes[i]);
-    std::printf("  %-18s %08x     %08x     %s\n", label, d, v,
-                d == v ? "MATCH" : "*** MISMATCH ***");
-    if (d != v) ok = false;
-  }
+  const Pinned* pinned = loud ? kLoudPinned : kQuietPinned;
+  const size_t count = loud ? std::size(kLoudPinned) : std::size(kQuietPinned);
+  return CompareAndReport(name, run, pinned, count, validation);
+}
 
-  if (!ok) {
-    // The divergence pattern is the diagnosis (barrier_graph §6.2).
-    std::printf("\ninterpretation:\n");
-    if (dawnGenHash != vkGenHash) {
-      std::printf("  worldgen already differs -> NOT a barrier bug. Suspect the\n"
-                  "  SPIR-V (compare against the WGSL Dawn ran), zero-init, or a\n"
-                  "  wrong descriptor binding.\n");
-    } else if (!vkHashes.empty() && !dawnHashes.empty() && vkHashes[0] != dawnHashes[0]) {
-      std::printf("  worldgen matches, tick 1 differs -> the recording or the CA\n"
-                  "  loop. Check the dynamic passUBO offsets and the CA row's\n"
-                  "  per-iteration barrier.\n");
-    } else {
-      std::printf("  early ticks match, a later one drifts -> a barrier race.\n"
-                  "  Rerun with --barriers=sledgehammer to bisect; note that\n"
-                  "  barrier_graph 6.2 rates a matching sledgehammer run as WEAK\n"
-                  "  evidence on a single GPU, and as EXONERATION when it still\n"
-                  "  diverges.\n");
-    }
-  }
+}  // namespace
 
-  std::printf("\n=== --vk-smoke %s ===\n", ok ? "PASS" : "FAIL");
-  return ok ? 0 : 1;
+int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation, bool paged) {
+  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation, paged);
+}
+
+int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation, bool paged) {
+  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation, paged);
 }
 
 }  // namespace sandvox

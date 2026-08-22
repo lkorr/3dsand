@@ -2,6 +2,12 @@
 
 #include <windows.h>
 
+// windows.h (included above, after the header) re-defines this; see the note
+// in vk_loader.h.
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
+
 namespace vkl {
 namespace {
 
@@ -64,6 +70,19 @@ void LoadInstance(const GlobalFns& g, VkInstance inst, bool debugUtils, Instance
     o.DestroyDebugUtilsMessengerEXT =
         (PFN_vkDestroyDebugUtilsMessengerEXT)get("vkDestroyDebugUtilsMessengerEXT");
   }
+  // VK_KHR_surface entry points resolve to null when the instance did not
+  // enable the extension (headless), which is the supported outcome.
+  o.DestroySurfaceKHR = (PFN_vkDestroySurfaceKHR)get("vkDestroySurfaceKHR");
+  o.GetPhysicalDeviceSurfaceSupportKHR =
+      (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)get("vkGetPhysicalDeviceSurfaceSupportKHR");
+  o.GetPhysicalDeviceSurfaceCapabilitiesKHR =
+      (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)get(
+          "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+  o.GetPhysicalDeviceSurfaceFormatsKHR =
+      (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)get("vkGetPhysicalDeviceSurfaceFormatsKHR");
+  o.GetPhysicalDeviceSurfacePresentModesKHR =
+      (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)get(
+          "vkGetPhysicalDeviceSurfacePresentModesKHR");
 }
 
 void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
@@ -134,10 +153,32 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(AllocateDescriptorSets);
   VKL_D(UpdateDescriptorSets);
 
+  VKL_D(CmdBeginRendering);
+  VKL_D(CmdEndRendering);
+  VKL_D(CmdDraw);
+  VKL_D(CmdDrawIndirect);
+  VKL_D(CmdSetViewport);
+  VKL_D(CmdSetScissor);
+  VKL_D(CmdCopyImageToBuffer);
+  VKL_D(CreateImageView);
+  VKL_D(DestroyImageView);
+  VKL_D(CreateGraphicsPipelines);
+
+  // VK_KHR_swapchain: null unless the device enabled it (windowed only).
+  VKL_D(CreateSwapchainKHR);
+  VKL_D(DestroySwapchainKHR);
+  VKL_D(GetSwapchainImagesKHR);
+  VKL_D(AcquireNextImageKHR);
+  VKL_D(QueuePresentKHR);
+  VKL_D(CreateSemaphore);
+  VKL_D(DestroySemaphore);
+
   VKL_D(CreateQueryPool);
   VKL_D(DestroyQueryPool);
   VKL_D(CmdResetQueryPool);
   VKL_D(CmdWriteTimestamp);
+  VKL_D(CmdWriteTimestamp2);
+  VKL_D(CmdCopyQueryPoolResults);
   VKL_D(GetQueryPoolResults);
 #undef VKL_D
 }

@@ -11,6 +11,12 @@
 //      per-chunk occupancy buffer the sim already maintains — (rayBlockers
 //      << 16) | nonAirCount per chunk, packOcc() in common.wgsl.
 //
+//   1b. CHUNK UNIFORMITY. Of the chunks that are not all-air, how many are a
+//      single repeated WORD? This is the number PLAN_page_table.md §3.6 turns
+//      on: EMPTY is free, but UNIFORM(material) only pays if whole-word
+//      uniform chunks actually exist. DENSE RESIDENCY ONLY — it reads voxels
+//      at slot*16 KiB, which is ground truth only under the identity map.
+//
 //   2. PER-PASS GPU TIME. Where does a tick go, and does a settled world truly
 //      cost nothing (rule 2)? ComputePassTimestampWrites on every pass
 //      EncodeTick opens, averaged over 3 scenarios.
@@ -24,6 +30,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "gpu/context.h"
@@ -187,6 +195,134 @@ void MeasureOccupancy(GpuContext& ctx, World& world) {
 }
 
 // ---------------------------------------------------------------------------
+// MEASUREMENT 1b: the UNIFORMITY histogram (PLAN_page_table.md §3.6, commit 0).
+//
+// The occupancy buffer above answers "how many chunks are all-air" — the EMPTY
+// sentinel's payoff — but it packs only two 16-bit counts and so cannot answer
+// the question UNIFORM's scope turns on: of the chunks that are NOT all-air,
+// how many are a single repeated WORD? A UNIFORM sentinel carries 12 bits of
+// material and nothing else, so promotion is by whole-word equality, never by
+// material equality (§2.3): worldgen assigns a `rnd % 3` palette variant to
+// each cell's state nibble, which is enough to make a chunk of one material
+// not be a chunk of one word.
+//
+// That distinction is exactly what this histogram measures, in four buckets:
+//
+//   all-air              -> EMPTY. Free, already counted by the occupancy pass.
+//   all-one-WORD         -> UNIFORM is representable. THE number that decides
+//                           whether tick-path uniformity discovery is worth a
+//                           later commit.
+//   all-one-MATERIAL     -> one material, differing state/stain bits. UNIFORM
+//     (mixed state)         canNOT represent these without widening the entry.
+//   mixed                -> a real page, always.
+//
+// DENSE RESIDENCY ONLY (§5.4, review m5). This does a blocking whole-buffer
+// read of `voxels` at slot*16 KiB — the raw-slot-offset shape §2.1a is about —
+// so it is ground truth only under the identity page map. It exists to SIZE
+// the pool, which wants the dense truth anyway; making it page-aware would
+// mean synthesizing sentinel chunks in order to count them, which is circular.
+// The paged side is covered by pagesInUse_/pagesHighWater_ reporting.
+struct UniformHist {
+  uint64_t air = 0;        // every word == 0
+  uint64_t oneWord = 0;    // every word identical, non-air
+  uint64_t oneMat = 0;     // one material, >1 distinct word
+  uint64_t mixed = 0;      // >1 material
+};
+
+void MeasureUniformity(GpuContext& ctx, World& world) {
+  std::printf("\n=== MEASUREMENT 1b: chunk uniformity (page-table sentinels) ==="
+              "\n");
+  std::printf("  *** DENSE RESIDENCY ONLY: this reads `voxels` at slot*%u B,\n"
+              "      which is ground truth only under the identity page map.\n"
+              "      It sizes the pool; it does not describe a paged run.\n",
+              kChunkVol * 4);
+
+  // Read the 512 MiB buffer in slot batches rather than one allocation: the
+  // staging buffer for a whole-buffer copy would itself be 512 MiB of host
+  // memory, and nothing here needs more than one chunk at a time to classify.
+  const uint32_t kBatchChunks = 256;                 // 4 MiB per readback
+  const size_t kBatchWords = (size_t)kBatchChunks * kChunkVol;
+  std::vector<uint32_t> batch(kBatchWords, 0);
+
+  UniformHist h;
+  // Which materials the one-word chunks are made of — the payoff is per
+  // material, and "3,000 chunks of stone" is a different finding from "3,000
+  // chunks spread over 20 materials".
+  std::unordered_map<uint32_t, uint64_t> oneWordMats;
+
+  for (uint32_t base = 0; base < kNumChunks; base += kBatchChunks) {
+    const uint32_t n = std::min(kBatchChunks, kNumChunks - base);
+    if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels,
+                               (uint64_t)base * kChunkVol * 4, batch.data(),
+                               (size_t)n * kChunkVol * 4, "uniformityRead")) {
+      std::printf("  READBACK FAILED at chunk %u — histogram abandoned\n", base);
+      return;
+    }
+    for (uint32_t c = 0; c < n; c++) {
+      const uint32_t* w = batch.data() + (size_t)c * kChunkVol;
+      const uint32_t w0 = w[0];
+      bool sameWord = true, sameMat = true;
+      const uint32_t m0 = w0 & 0xFFFu;
+      for (uint32_t i = 1; i < kChunkVol; i++) {
+        if (w[i] != w0) {
+          sameWord = false;
+          if ((w[i] & 0xFFFu) != m0) { sameMat = false; break; }
+        }
+      }
+      if (sameWord) {
+        if (w0 == 0u) { h.air++; }
+        else { h.oneWord++; oneWordMats[m0]++; }
+      } else if (sameMat) {
+        h.oneMat++;
+      } else {
+        h.mixed++;
+      }
+    }
+  }
+
+  const uint64_t n = h.air + h.oneWord + h.oneMat + h.mixed;
+  auto row = [&](const char* label, uint64_t v, const char* note) {
+    std::printf("    %-26s %7" PRIu64 "  (%6.2f%%)  %s\n", label, v,
+                n ? 100.0 * (double)v / (double)n : 0.0, note);
+  };
+  std::printf("\n  %" PRIu64 " chunks of %u voxels:\n", n, kChunkVol);
+  row("all-air (EMPTY)", h.air, "sentinel, 4 B");
+  row("all-one-WORD (UNIFORM)", h.oneWord, "sentinel, 4 B");
+  row("all-one-MATERIAL, mixed", h.oneMat, "needs a page (state/stain differ)");
+  row("mixed material", h.mixed, "needs a page");
+
+  const double pageKiB = (double)kChunkVol * 4.0 / 1024.0;
+  const uint64_t sentinels = h.air + h.oneWord;
+  std::printf("\n  resident pages if EMPTY only:            %7" PRIu64
+              "  (%.1f MiB)\n",
+              n - h.air, (double)(n - h.air) * pageKiB / 1024.0);
+  std::printf("  resident pages if EMPTY + UNIFORM:       %7" PRIu64
+              "  (%.1f MiB)\n",
+              n - sentinels, (double)(n - sentinels) * pageKiB / 1024.0);
+  std::printf("  UNIFORM's marginal saving over EMPTY:    %7" PRIu64
+              " chunks (%.1f MiB)\n",
+              h.oneWord, (double)h.oneWord * pageKiB / 1024.0);
+
+  if (!oneWordMats.empty()) {
+    std::vector<std::pair<uint32_t, uint64_t>> mats(oneWordMats.begin(),
+                                                    oneWordMats.end());
+    std::sort(mats.begin(), mats.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::printf("\n  one-word chunks by material (word = mat|state<<12|...):\n");
+    for (size_t i = 0; i < mats.size() && i < 8; i++)
+      std::printf("    material %4u  %7" PRIu64 " chunks\n", mats[i].first,
+                  mats[i].second);
+  }
+
+  // The decision rule, stated in the output so the number is not read without
+  // it (PLAN_page_table.md §3.6 / §9 open question 2).
+  std::printf("\n  DECISION RULE (§3.6): tick-path uniformity DISCOVERY is\n"
+              "  worth a later commit only if all-one-WORD is a material\n"
+              "  fraction of the non-air chunks. Streaming/load-path demotion\n"
+              "  lands regardless — those paths already have the words in hand.\n");
+}
+
+// ---------------------------------------------------------------------------
 
 struct Scenario {
   const char* name;
@@ -246,6 +382,7 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
 }  // namespace
 
 int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
+  SetHarnessSnapshotDrain(true);  // see test/support.h
   std::printf("=== sandvox --measure: Vulkan-port sizing ===\n");
   std::printf("timestamp queries: %s\n",
               ctx.timestampsEnabled ? "SUPPORTED (GPU pass timings below)"
@@ -274,6 +411,7 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     std::printf("settled. world hash = %08x\n", hash);
   }
   MeasureOccupancy(ctx, world);
+  MeasureUniformity(ctx, world);
 
   uint32_t active = ReadActiveChunksSync(ctx, world, sim);
   std::printf("\n  active (dirty) chunks after settling: %u / %u\n", active,

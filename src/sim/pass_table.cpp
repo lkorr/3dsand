@@ -68,6 +68,7 @@ namespace {
 #define C_HASH      Cond::Hash
 #define C_DIRTYTICK Cond::DirtyTick
 #define C_GENCOUNT  Cond::GenCount
+#define C_DENSEWG   Cond::DenseWorldgen
 #define C_FARCOUNT  Cond::FarCount
 
 #define D_OPS       (uint32_t)DispatchSel::Ops

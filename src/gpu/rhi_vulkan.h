@@ -112,6 +112,14 @@ struct Caps {
   bool validationEnabled = false;
   bool syncValidationEnabled = false;
 
+  // --- dynamic rendering (phase 4b) ---
+  // The render path records with vkCmdBeginRendering rather than VkRenderPass
+  // objects (barrier_graph §1.2 already assumes it). Mandatory in core 1.3 —
+  // like synchronization2 it still must be ENABLED at device creation, and the
+  // backend refuses to init without it rather than shipping a second (render
+  // pass object) code path nothing would exercise.
+  bool dynamicRendering = false;
+
   // --- synchronization2 (phase 3b) ---
   // vkCmdPipelineBarrier2 is the ONE barrier command the generated-barrier
   // recorder emits, and every scope in docs/vulkan_barrier_graph.md §3.2 is
@@ -135,6 +143,28 @@ struct Buffer {
   std::string label;
 };
 
+// --------------------------------------------------------------- image ----
+//
+// Phase 4b: render attachments (offscreen color, the depth buffer, swapchain
+// images) and the screenshot copy source. `layout` is the image's CURRENT
+// layout — a property of the image, not of a recording, so it persists across
+// command buffers and the recorder derives every transition from it
+// (vk_record.h: no hand-placed image barriers either).
+struct Image {
+  VkImage img = VK_NULL_HANDLE;
+  VmaAllocation alloc = nullptr;  // null when the swapchain owns the VkImage
+  VkImageView view = VK_NULL_HANDLE;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  uint32_t width = 0, height = 0;
+  VkImageAspectFlags aspect = 0;
+  VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  // Swapchain image: the recorder's Finish() transitions it to PRESENT_SRC
+  // after the last touch, and the submit that rendered it waits the acquire
+  // semaphore / signals the per-image render-done semaphore.
+  bool presentable = false;
+  std::string label;
+};
+
 // ------------------------------------------------------------- backend ----
 
 class Backend {
@@ -151,12 +181,46 @@ class Backend {
   // barrier document names the PRIMARY detector for a missing barrier. Both are
   // plumbed now even though nothing records barriers yet, because the moment
   // phase 3b starts generating them is the moment it needs to already be here.
-  bool Init(bool lowPower, bool validation, bool syncValidation, std::string& err);
+  // `instanceExts`/`instanceExtCount` (phase 4b D3): extra instance extensions,
+  // i.e. GLFW's surface extensions when windowed. `wantSwapchain` additionally
+  // enables VK_KHR_swapchain on the device (refused if absent).
+  bool Init(bool lowPower, bool validation, bool syncValidation, std::string& err,
+            const char* const* instanceExts = nullptr, uint32_t instanceExtCount = 0,
+            bool wantSwapchain = false);
   void Shutdown();
 
   const Caps& GetCaps() const { return caps_; }
   VkDevice Device() const { return device_; }
   const vkl::DeviceFns& Fns() const { return dfn_; }
+  // For the windowed path + imgui_impl_vulkan (src/ui/overlay.cpp via rhi_vk.h).
+  VkInstance Instance() const { return instance_; }
+  VkPhysicalDevice PhysicalDevice() const { return phys_; }
+  VkQueue GpuQueue() const { return queue_; }
+  uint32_t QueueFamily() const { return queueFamily_; }
+  // vkGetInstanceProcAddr against the live instance — ImGui's function loader.
+  PFN_vkVoidFunction InstanceProc(const char* name) const;
+
+  // ---- swapchain (phase 4b D3) ----
+  //
+  // FIFO present mode, matching Dawn's PresentMode::Fifo. `surface` is taken
+  // on the FIRST call and owned by the backend from then on; pass
+  // VK_NULL_HANDLE to recreate at a new size (resize). Recreation drains the
+  // queue first.
+  bool ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
+                          std::string& err);
+  // Acquire the next image. Null on OUT_OF_DATE (caller skips the frame; the
+  // resize path reconfigures) or if no swapchain exists.
+  Image* AcquireSwapchainImage();
+  // Present the acquired image (after the presenting submit). Tolerates
+  // SUBOPTIMAL/OUT_OF_DATE — the next resize reconfigures.
+  void PresentAcquired();
+  rhi::TextureFormat SwapchainFormat() const;
+  uint32_t SwapchainImageCount() const { return (uint32_t)swapImages_.size(); }
+  // SubmitEnded, plus the swapchain semaphores: waits the pending acquire
+  // semaphore at COLOR_ATTACHMENT_OUTPUT and signals the acquired image's
+  // render-done semaphore (which PresentAcquired waits on). Used by the seam
+  // for any command buffer whose render pass targeted a swapchain image.
+  VkFence SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err);
 
   // ---- buffers (barrier_graph §4.8) ----
   //
@@ -169,8 +233,18 @@ class Backend {
   Buffer* CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char* label);
 
   // vkCmdFillBuffer(0) over every registered buffer, in one command buffer,
-  // submitted and waited. Called once after all buffers exist.
+  // submitted and waited. Called once after all buffers exist (--vk-info's
+  // explicit path; the seam relies on the queued per-buffer fill below).
   bool ZeroInitAll(std::string& err);
+
+  // Free a buffer created by CreateBuffer, DEFERRED until every submit that was
+  // in flight at the call has retired (phase 4a). The seam's rhi::Buffer
+  // handles are refcounted and gates create/drop large staging buffers freely —
+  // WebGPU frees them on release, so leaving them in the registry until
+  // Shutdown would leak a 512 MiB staging read per whole-world gate.
+  // Precondition kept by construction: only ad-hoc staging is ever destroyed
+  // this way; buffers referenced by descriptor sets live for the device's life.
+  void DestroyBufferDeferred(Buffer* b);
 
   // ---- uploads (barrier_graph §4.1) ----
   //
@@ -199,10 +273,64 @@ class Backend {
   // Ends and submits `cmd` with a fence from the pool. Returns the fence, which
   // the caller may poll; it is retired automatically once signalled.
   VkFence SubmitCommands(VkCommandBuffer cmd, std::string& err);
+  // Submit a command buffer the caller ALREADY ended (the seam's
+  // CommandEncoder::Finish ends it, matching wgpu's Finish/Submit split).
+  VkFence SubmitEnded(VkCommandBuffer cmd, std::string& err);
   bool WaitIdle(std::string& err);
   // Retire any signalled fences: reclaims staging-ring regions and command
   // buffers. Non-blocking; this is ProcessEvents()' replacement.
   void PollFences();
+
+  // ---- borrowed fences (barrier_graph §4.2) ------------------------------
+  //
+  // The readback ring and the eviction pool do not own fences: §4.2 says a
+  // readback slot "borrows a reference to that submit's fence", because every
+  // submit gets one anyway (for staging-ring reclamation) and a second fence
+  // per slot would decouple two lifetimes that should not be decoupled.
+  //
+  // BUT A BORROWED FENCE NEEDS A RETAIN, and phase 3c found this the hard way.
+  // `PollFences()` recycles a signalled fence into `freeFences_` immediately,
+  // and `BeginCommands()` calls `PollFences()` on EVERY command buffer. So a
+  // slot that submitted at tick N and had not yet been polled by tick N+1 held
+  // a handle that `AcquireFence` had already reset and handed to the tick-N+1
+  // submit. `vkGetFenceStatus` on it then reports the LATER submit's status:
+  // the slot reads its mapped memory when a completely different command buffer
+  // finishes, which for a 3-deep ring means reading a slot the GPU is still
+  // writing. That is silent data corruption in the CPU mirror, not a crash —
+  // exactly the class of bug the ring exists to prevent.
+  //
+  // So: `RetainFence` pins a fence against recycling; `ReleaseFence` unpins it,
+  // and the fence returns to the pool once BOTH the submit has retired and
+  // every borrower has released. A borrower must release exactly once.
+  void RetainFence(VkFence f);
+  void ReleaseFence(VkFence f);
+  // Non-blocking status of a retained fence. VK_SUCCESS = the submit that
+  // signalled it has completed.
+  VkResult FenceStatus(VkFence f) const;
+  // Blocking wait on a retained fence — the eviction pool's `CompleteOldest`
+  // (§4.3 step 5), which is a genuine block exactly as `WaitAny` blocks today.
+  bool WaitFence(VkFence f, std::string& err);
+
+  // ---- images + graphics pipelines (phase 4b) ----
+  //
+  // CreateImage allocates a device-local VkImage + view. No zero-init queue
+  // entry: attachments are initialized by their loadOp (Clear) and the
+  // UNDEFINED->attachment transition the recorder derives, which is the Vulkan
+  // idiom WebGPU's lazy-clear maps onto for render targets.
+  Image* CreateImage(uint32_t w, uint32_t h, rhi::TextureFormat fmt,
+                     rhi::TextureUsage usage, const char* label);
+  // Deferred like buffers: freed once every submit in flight at the call has
+  // retired (the depth target is recreated on resize; gates create and drop
+  // offscreen targets).
+  void DestroyImageDeferred(Image* im);
+
+  // Graphics pipeline against dynamic rendering (no VkRenderPass object).
+  // `d` supplies formats/blend/cull/topology/depth; vs/fs are Tint-compiled
+  // single-entry-point modules from GetShaderModule.
+  VkPipeline CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModule vs,
+                                    const char* vsEntry, VkShaderModule fs,
+                                    const char* fsEntry, const rhi::RenderPipelineDesc& d,
+                                    const char* label);
 
   // ---- shaders ----
   //
@@ -253,12 +381,36 @@ class Backend {
     // Class B: offset into the staging ring.
     uint64_t stagingOffset = 0;
     bool classA = true;
+    // Zero-init (§4.8, phase 4a form): a whole-buffer vkCmdFillBuffer(0),
+    // queued by CreateBuffer itself so it drains at the head of the next
+    // command buffer — BEFORE any recorded use of the buffer, in issue order,
+    // so a data upload queued after creation still wins. This replaced the
+    // one-shot ZeroInitAll submit when buffer creation moved behind the seam
+    // (buffers are now created at many times, not one init moment).
+    bool zeroFill = false;
   };
 
   struct InFlight {
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     uint64_t stagingHigh = 0;  // ring high-water at submit; reclaimed on retire
+    uint64_t serial = 0;       // submit order, for the buffer graveyard
+  };
+
+  // A buffer whose seam handle was released while submits that might reference
+  // it were still in flight. Freed once every submit with serial <= `serial`
+  // has retired.
+  struct Doomed {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    uint64_t serial = 0;
+  };
+  // Same discipline for images (phase 4b).
+  struct DoomedImage {
+    VkImage img = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+    uint64_t serial = 0;
   };
 
   bool PickPhysicalDevice(bool lowPower, std::string& err);
@@ -266,6 +418,8 @@ class Backend {
   bool CreateLogicalDevice(std::string& err);
   bool InitAllocator(std::string& err);
   VkFence AcquireFence(std::string& err);
+
+  bool swapchainRequested_ = false;  // Init(wantSwapchain): enable VK_KHR_swapchain
 
   vkl::GlobalFns gfn_{};
   vkl::InstanceFns ifn_{};
@@ -285,6 +439,29 @@ class Backend {
 
   // The zero-init registry (§4.8). Owning, so the backend can free everything.
   std::vector<std::unique_ptr<Buffer>> buffers_;
+  // Image registry (phase 4b). Owning, same lifetime rules as buffers_.
+  std::vector<std::unique_ptr<Image>> images_;
+  std::vector<DoomedImage> imageGraveyard_;
+
+  // ---- swapchain state (phase 4b D3) ----
+  void DestroySwapchainObjects();  // views/semaphores/swapchain, not the surface
+  VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+  VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+  VkFormat swapFormat_ = VK_FORMAT_UNDEFINED;
+  std::vector<std::unique_ptr<Image>> swapImages_;  // wrap swapchain VkImages
+  std::vector<VkSemaphore> renderDone_;             // one per swapchain image
+  // Acquire semaphores: a small ring paced by the fence of the submit that
+  // consumed each one — a semaphore handed to vkAcquireNextImageKHR must be
+  // unsignaled and unused, and the fence wait is what proves it.
+  struct AcquireSlot {
+    VkSemaphore sem = VK_NULL_HANDLE;
+    VkFence lastUse = VK_NULL_HANDLE;  // retained; released before reuse
+  };
+  static constexpr int kAcquireSlots = 3;
+  AcquireSlot acquireSlots_[kAcquireSlots];
+  int acquireCursor_ = 0;
+  AcquireSlot* pendingAcquireSlot_ = nullptr;  // consumed by the next presenting submit
+  uint32_t acquiredIndex_ = UINT32_MAX;
 
   // Pending uploads, in ISSUE ORDER. Never sorted, never coalesced.
   std::vector<Pending> pending_;
@@ -292,7 +469,17 @@ class Backend {
   uint64_t stagingHead_ = 0;
 
   std::vector<InFlight> inFlight_;
+  uint64_t submitSerial_ = 0;
+  std::vector<Doomed> graveyard_;
   std::vector<VkFence> freeFences_;
+  // Borrow counts for fences pinned by RetainFence. A fence with a non-zero
+  // count is never returned to freeFences_, so a borrower's handle stays valid
+  // and keeps meaning the submit it was taken from. Entries are erased when the
+  // count reaches zero AND the submit has retired.
+  std::unordered_map<VkFence, uint32_t> fenceRetain_;
+  // Fences whose submit retired while still retained: signalled, valid, and
+  // waiting for the last ReleaseFence to hand them back to the pool.
+  std::vector<VkFence> retiredRetained_;
 
   std::unordered_map<std::string, VkShaderModule> moduleCache_;
   std::vector<VkDescriptorSetLayout> setLayouts_;

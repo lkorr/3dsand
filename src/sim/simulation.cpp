@@ -4,6 +4,8 @@
 #include <cstdio>
 
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
+#include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
 // when the Vulkan recorder became a second consumer of it — see the note there.
@@ -96,18 +98,42 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(14, T::ReadOnlyStorage), // exact-cell ops (island removal)
         entry(15, T::Storage),         // support-loss flags (sim_step writes)
         entry(16, T::ReadOnlyStorage), // genList (worldgen streaming slots)
+        // ---- the software page table (PLAN_page_table.md §5.2) ----
+        // Group 0 is not negotiable, and that is what makes the shared
+        // accessors in common.wgsl work: common.wgsl is prepended to every
+        // shader, so the accessors must name a group whose meaning is
+        // identical everywhere. Group 1 differs by pipeline, so a group-1
+        // pageTable would have to be declared per shader, which dissolves the
+        // single-seam property the whole design rests on.
+        //
+        // Bindings 17/18 in BOTH simBGL_ and simSlimBGL_, not 17/18 here and
+        // 5/6 there: one WGSL identifier cannot carry two binding numbers
+        // across modules that share common.wgsl, and 5/6 are already taken in
+        // simBGL_ (PassParams, brush ops). The slim group therefore stops
+        // being a dense prefix and becomes 0..4 + 17..18, which Vulkan is
+        // perfectly happy with — sparse binding numbers are legal, and
+        // maxPerStageDescriptorStorageBuffers here is 1,048,576.
+        //
+        // The consequence §5.2a wanted still holds and is now deliberate
+        // rather than lucky: any pipeline built on simSlimBGL_ inherits
+        // translation, which is how worldgen:fardown (on farPL_) gets it.
+        entry(17, T::ReadOnlyStorage), // pageTable
+        entry(18, T::Storage),         // pageFaults (atomic counter)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
-    // slim group 0 (bindings 0..4 only) for particle/explosion pipelines:
-    // pairing the full simBGL_ with particleBGL_ would exceed the
-    // 16-storage-buffer per-stage layout limit
+    // slim group 0 for the particle/explosion/far pipelines: bindings 0..4
+    // plus the two page buffers at 17/18, which must keep the SAME binding
+    // numbers they have in simBGL_ (see the note above). Those pipelines
+    // genuinely do not need the other 12 bindings.
     rhi::BindGroupLayoutEntry sentries[] = {
         entry(0, T::Storage),          // voxels
         entry(1, T::Storage),          // dirtyIn
         entry(2, T::Storage),          // dirtyOut
         entry(3, T::ReadOnlyStorage),  // materials
         entry(4, T::Uniform),          // TickParams
+        entry(17, T::ReadOnlyStorage), // pageTable
+        entry(18, T::Storage),         // pageFaults
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -150,6 +176,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // shader usage (see the simSlimBGL_ comment).
         entry(7, T::ReadOnlyStorage, S::Fragment),               // microBricks
         entry(8, T::ReadOnlyStorage, S::Fragment),               // microPool
+        // Software page table (PLAN_page_table.md §5.2a). raymarch.wgsl does
+        // 17 raw voxel reads; under paging every one indexes the POOL with a
+        // SLOT-derived address and samples the wrong chunk wherever the target
+        // is a sentinel — the world would render as garbage while hashing
+        // perfectly, because the render path is outside the hashed domain and
+        // no determinism gate could catch it.
+        //
+        // ReadOnlyStorage, matching `voxels` at binding 0, and no pageFaults:
+        // the renderer must never write the world. microBodyBGL_ shares
+        // renderBGL_ as group 0 and inherits this for free — microbody.wgsl
+        // reads its own brick pool, not voxels, so it needs nothing itself.
+        entry(9, T::ReadOnlyStorage, S::Fragment),               // pageTable
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -245,6 +283,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(14, world_->cellOps),
         b(15, world_->support),
         b(16, world_->genList),
+        b(17, world_->pageTable),
+        b(18, world_->pageFaults),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -254,6 +294,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(2, world_->dirty[1 - page]),
         b(3, materialBuf_),
         b(4, world_->tickUBO),
+        b(17, world_->pageTable),
+        b(18, world_->pageFaults),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -292,6 +334,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(6, world_->farUBO),
         b(7, microTableBuf_),
         b(8, microPoolBuf_),
+        b(9, world_->pageTable),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -466,6 +509,19 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2");
   pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve");
 
+  // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
+  // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
+  // async error scope and always returns a valid handle, so this check is free
+  // there — but on Vulkan a null pipeline would make the recorder silently
+  // skip the row, which is a wrong SIM, not a crash. Fail the build instead.
+  if (!worldgen_ || !worldgenList_ || !farFill_ || !farDown_ || !mutate_ ||
+      !mutateCells_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
+      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_) {
+    if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
+    return false;
+  }
+
   raymarchModule_ = mRay;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
@@ -486,14 +542,6 @@ bool Simulation::ReloadShaders(const rhi::Device& device) {
   return built && !hadError;
 }
 
-// Measurement seam: identical to enc.BeginComputePass() unless the --measure
-// harness has attached a PassTimer (see Simulation::SetPassTimer).
-rhi::ComputePass Simulation::BeginPass(const rhi::CommandEncoder& enc,
-                                               const char* name) const {
-  if (passTimer_ && passTimer_->Valid()) return passTimer_->BeginPass(enc, name);
-  return enc.BeginComputePass();
-}
-
 // ===========================================================================
 // TABLE-DRIVEN RECORDING (docs/PLAN_vulkan_port.md phase 2b)
 //
@@ -504,10 +552,12 @@ rhi::ComputePass Simulation::BeginPass(const rhi::CommandEncoder& enc,
 // declaration faithful to a recording is to make the declaration BE the
 // recording.
 //
-// Under Dawn this changes nothing about the command buffer: same encoders, same
-// pass splits, same ClearBuffers, same copies, same conditionals, same dynamic
-// offsets, same bind groups, same order. That is the acceptance criterion for
-// this phase (world hash byte-identical), not an aspiration.
+// The restructure was landed hash-neutral: converting the hand-written
+// recorder into a table walk changed nothing about the command buffer — same
+// pass splits, ClearBuffers, copies, conditionals, dynamic offsets, bind
+// groups and order — and a byte-identical world hash was the acceptance
+// criterion, not an aspiration. That is still what the pinned 7cfa2420
+// defends every time a row is edited.
 // ===========================================================================
 
 namespace {
@@ -524,41 +574,17 @@ struct RecordCtx {
   uint32_t farCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
+  // False under --residency paged: worldgen's whole-world dispatch is replaced
+  // by batched worldgenList submits (PLAN_page_table.md §3.5c).
+  bool denseWorldgen = true;
 };
 
-bool CondHolds(pass::Cond c, const RecordCtx& cx) {
-  switch (c) {
-    case pass::Cond::Always:    return true;
-    case pass::Cond::Ops:       return cx.opsCount > 0;
-    case pass::Cond::Cells:     return cx.cellCount > 0;
-    case pass::Cond::Exp:       return cx.expCount > 0;
-    case pass::Cond::Spawn:     return cx.spawnCount > 0;
-    case pass::Cond::Particles: return cx.particlesActive;
-    case pass::Cond::Hash:      return cx.hashEnable;
-    case pass::Cond::DirtyTick: return !cx.hashEnable;
-    case pass::Cond::GenCount:  return cx.genCount > 0;
-    case pass::Cond::FarCount:  return cx.farCount > 0;
-  }
-  return false;
-}
-
-// Dispatch extents. Values below kDynBase are literal; the rest are selectors
-// resolved from this tick's counts.
-uint32_t Extent(uint32_t v, const RecordCtx& cx) {
-  if (v < (uint32_t)pass::DispatchSel::kDynBase) return v;
-  switch ((pass::DispatchSel)v) {
-    case pass::DispatchSel::Ops:      return 4 * cx.opsCount;
-    case pass::DispatchSel::Cells:    return (cx.cellCount + 63) / 64;
-    case pass::DispatchSel::Exp:      return kExplosionWg * cx.expCount;
-    case pass::DispatchSel::ExpWg:    return kExplosionWg;
-    case pass::DispatchSel::Spawn:    return (cx.spawnCount + 63) / 64;
-    case pass::DispatchSel::Chunks:   return kNumChunks;
-    case pass::DispatchSel::Chunks64: return kNumChunks / 64;
-    case pass::DispatchSel::GenCount: return cx.genCount;
-    case pass::DispatchSel::FarCount: return cx.farCount;
-    default:                          return v;
-  }
-}
+// NOTE: the condition and dispatch-extent resolvers that used to live here
+// were the DAWN walk's copies. The Vulkan recorder has always carried its own
+// (Recorder::CondHolds / Recorder::Extent in gpu/vk_record.cpp), which is the
+// only pair left now that the Dawn walk is gone. They read the same
+// pass::Cond / pass::DispatchSel enums, so pass_table.def stays the one
+// declaration.
 
 }  // namespace
 
@@ -605,6 +631,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarOcc:         return world_->farOcc;
     case B::FarList:        return world_->farList;
     case B::FarUBO:         return world_->farUBO;
+    case B::PageTable:      return world_->pageTable;
+    case B::PageFaults:     return world_->pageFaults;
     default:                return world_->voxels;
   }
 }
@@ -637,110 +665,59 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
 
 // Walk one table's rows and record them.
 //
-// The open compute pass is carried across rows: consecutive compute rows that
-// declare the same `group` string share one ComputePassEncoder, and a Fill or
-// Copy row (group == nullptr) closes it, because ClearBuffer and
-// CopyBufferToBuffer are encoder-level commands. That reproduces today's pass
-// structure exactly rather than approximating it.
-//
 // A row whose condition is false is skipped entirely — no pass is opened for
-// it, nothing is recorded, and in phase 3 no buffer's last-access state is
-// touched. barrier_graph §3.9/§7.5: that is the only correct handling, and it
-// is why barriers must be computed at record time against live state rather
-// than precomputed per adjacent table-index pair.
+// it, nothing is recorded, and no buffer's last-access state is touched.
+// barrier_graph §3.9/§7.5: that is the only correct handling, and it is why
+// barriers must be computed at record time against live state rather than
+// precomputed per adjacent table-index pair.
+//
+// SINCE THE DAWN REMOVAL (2026-08-22) there is one walker again. The second
+// one — an inline wgpu-shaped walk that opened a ComputePassEncoder per
+// `group` string and let Dawn derive barriers — is gone with the backend it
+// drove. What survives is the phase-3b/4a shape that mattered: the rows are
+// the Vulkan recorder's LOOP VARIABLE, never a parameter that a call site
+// could forget, and what crosses the bridge (rhi_record.h) is only the
+// RESOLUTION — page-symbolic buffer ids and pipelines, resolved here by
+// PassBuffer/PassPipeline.
 void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
                              const void* ctxOpaque) {
   const RecordCtx& cx = *(const RecordCtx*)ctxOpaque;
 
-  rhi::ComputePass open;
-  const char* openGroup = nullptr;
-  auto closePass = [&]() {
-    if (openGroup) {
-      open.End();
-      open = rhi::ComputePass{};
-      openGroup = nullptr;
-    }
-  };
+  rhi::TableCtx tc{};
+  tc.opsCount = cx.opsCount;
+  tc.cellCount = cx.cellCount;
+  tc.expCount = cx.expCount;
+  tc.spawnCount = cx.spawnCount;
+  tc.genCount = cx.genCount;
+  tc.farCount = cx.farCount;
+  tc.hashEnable = cx.hashEnable;
+  tc.particlesActive = cx.particlesActive;
+  tc.denseWorldgen = cx.denseWorldgen;
 
-  for (int i = 0; i < pass::kRowCount; i++) {
-    const pass::Row& r = pass::kRows[i];
-    if (r.table != which) continue;
-    if (!CondHolds(r.cond, cx)) continue;
+  rhi::TableBindings tb{};
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    tb.buffers[i] = PassBuffer((pass::Buf)i);
+  for (int i = 1; i < (int)pass::Pipe::FarDown + 1; i++)
+    tb.pipelines[i] = PassPipeline((pass::Pipe)i);
+  tb.simLayout = simPL_;
+  tb.slimPartLayout = simPL2_;
+  tb.slimFarLayout = farPL_;
+  tb.simSet = simBG_[page_];
+  tb.slimSet = simSlimBG_[page_];
+  tb.particleSet = particleBG_[page_];
+  tb.farSet = farBG_;
 
-    if (r.kind == pass::Kind::Fill) {
-      closePass();
-      enc.ClearBuffer(PassBuffer(r.uses[0].buf), 0, rhi::kWholeSize);
-      continue;
-    }
-    if (r.kind == pass::Kind::Copy) {
-      closePass();
-      // Copy rows carry (srcOffset, dstOffset, size) in x/y/z, and exactly two
-      // uses: the transfer read then the transfer write.
-      enc.CopyBufferToBuffer(PassBuffer(r.uses[0].buf), r.x,
-                             PassBuffer(r.uses[1].buf), r.y, r.z);
-      continue;
-    }
-
-    // Compute / ComputeIndirect.
-    if (!openGroup || r.group != openGroup) {
-      closePass();
-      open = BeginPass(enc, r.group);
-      openGroup = r.group;
-    }
-
-    // Bind groups are set per ROW rather than once per pass. The hand-written
-    // recorder set them before each dispatch block inside the shared prep pass
-    // (mutate, mutateCells, explode, spawn and compact each re-bound), and
-    // SetBindGroup to the same group is idempotent, so per-row is both faithful
-    // and free of a "did the previous row leave the right groups bound?"
-    // question that a future row insertion would silently get wrong.
-    {
-      uint32_t off = 0;
-      switch (r.groups) {
-        case pass::Groups::Sim:
-          open.SetBindGroup(0, simBG_[page_], 1, &off);
-          break;
-        case pass::Groups::SlimPart:
-          open.SetBindGroup(0, simSlimBG_[page_]);
-          open.SetBindGroup(1, particleBG_[page_]);
-          break;
-        case pass::Groups::SlimFar:
-          open.SetBindGroup(0, simSlimBG_[page_]);
-          open.SetBindGroup(1, farBG_);
-          break;
-        default:
-          break;
-      }
-    }
-
-    open.SetPipeline(PassPipeline(r.pipe));
-
-    for (uint32_t k = 0; k < r.repeat; k++) {
-      if (r.dyn == pass::Dyn::Ca) {
-        // The per-iteration passUBO slice: colour phase + gravity substep. Two
-        // iterations are two DIFFERENT colours, which is exactly why they must
-        // never overlap — see the lattice note in pass_table.def's header.
-        uint32_t offset = k * kPassStride;
-        open.SetBindGroup(0, simBG_[page_], 1, &offset);
-      }
-      if (r.kind == pass::Kind::ComputeIndirect) {
-        const rhi::Buffer& args =
-            (pass::DispatchSel)r.x == pass::DispatchSel::IndPDispatchArgs
-                ? world_->pDispatchArgs
-                : world_->dispatchArgs;
-        open.DispatchWorkgroupsIndirect(args, 0);
-      } else {
-        open.DispatchWorkgroups(Extent(r.x, cx), Extent(r.y, cx),
-                                Extent(r.z, cx));
-      }
-    }
-  }
-  closePass();
+  rhi::RecordTableVulkan(enc, which, tc, tb,
+                         passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
 }
 
-void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc) {
+void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   page_ = 0;
   RecordCtx cx{};
+  // Under --residency paged the caller runs worldgen BATCHED through
+  // worldgenList instead (§3.5c) and passes false, which suppresses only the
+  // whole-world dispatch — the fill rows still clear the transient buffers.
+  cx.denseWorldgen = denseGen;
   RecordTable(enc, pass::Table::Worldgen, &cx);
 }
 
@@ -769,11 +746,33 @@ void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
 
 void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
-  // flag per chunk; 4096 chunks = 16 KB, far inside the ~1 MB/tick CPU->GPU
+  // flag per chunk; 32768 chunks = 128 KB, far inside the ~1 MB/tick CPU->GPU
   // budget, and only written on a phase boundary.
   static const std::vector<uint32_t> ones(kNumChunks, 1u);
   queue.WriteBuffer(world_->dirty[page_], 0, ones.data(),
                     ones.size() * sizeof(uint32_t));
+
+  // THE WAKE IS A DIRTY-SET MUTATION, so it mutates the CPU mirror of the
+  // dirty set in the SAME CALL (PLAN_page_table.md §3.2a fix 1). Two
+  // operations that must agree is the shape this repo has a checker for; one
+  // operation cannot disagree with itself.
+  //
+  // Why this was the most dangerous hole in the design: without it, every
+  // chunk in the window becomes dirtyIn next tick and may write, while
+  // cpuDirty is near-empty because the world was settled — SILENT VOXEL LOSS
+  // AT EVERY DAWN AND EVERY DUSK. And no gate would catch it: the suite pins
+  // the day phase in both directions (selftest_sim.cpp freezes at midnight and
+  // at noon), so wasDay != isDay is never true and this function is never
+  // called. Gate D exists precisely because of that.
+  //
+  // Unioned at step (3) of the normative definitions — strictly AFTER the
+  // tightening — so the 32,768 chunks survive regardless of when a snapshot
+  // happened to land. What stops this demanding 32,768 PAGES from an
+  // 8,192-page pool (a guaranteed abort twice per in-game day, under §3.8) is
+  // the `n nonSentinel` filter on the bracketed half of the materialization
+  // set: a dirty EMPTY chunk holds no matter, so nothing in it can move, and
+  // the only way it can receive matter is from a neighbour that has some.
+  if (world_->pages) world_->pages->WakeAll();
 }
 
 void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,

@@ -96,7 +96,7 @@ Runs after the CA so flights see settled ground.
 **Hash tick (`simulation.cpp:716-724`, one pass):**
 | # | Pipeline | Entry | Dispatch |
 |---|---|---|---|
-| D1 | `occupancy_` | `main` | Direct `(4096,1,1)` — whole-world scan, rewrites all `occupancy`, atomicAdd into `hash` |
+| D1 | `occupancy_` | `main` | Direct `(32768,1,1)` (`D_CHUNKS`) — whole-world scan, rewrites all `occupancy`, atomicAdd into `hash` |
 | D2 | `pick_` | `main` | Direct `(1,1,1)` — DDA down `renderUBO` camera ray → `pick` |
 
 **Dirty tick (`simulation.cpp:728-763`):**
@@ -118,10 +118,10 @@ Hash ticks skip fardown entirely (documented one-tick-late far propagation).
 ### 1.7 — Non-tick / conditional encoders (separate Submits)
 | Function | Passes | Trigger |
 |---|---|---|
-| `EncodeWorldgen` (`:542-558`) | 7 ClearBuffers + `worldgen_:main` direct `(4096,1,1)` | startup, `--shot`, regen |
+| `EncodeWorldgen` (`:542-558`) | 7 ClearBuffers + `worldgen_:main` direct `(32768,1,1)` | startup, `--shot`, regen |
 | `EncodeGenList` (`:560-568`) | `worldgenList_:list` direct `(count,1,1)` | streaming shift — from `Stream::FillSlots` (`stream.cpp:274-278`), own encoder+Submit, mid-frame |
-| `EncodeLoadReset` (`:580-593`) | 5 ClearBuffers + `occupancy_:main` `(4096,1,1)` | `LoadWorld` |
-| `EncodeHashOnly` (`:595-603`) | ClearBuffer(hash) + `occupancy_:main` `(4096,1,1)` | selftest `HashWorldNow` |
+| `EncodeLoadReset` (`:580-593`) | 5 ClearBuffers + `occupancy_:main` `(32768,1,1)` | `LoadWorld` |
+| `EncodeHashOnly` (`:595-603`) | ClearBuffer(hash) + `occupancy_:main` `(32768,1,1)` | selftest `HashWorldNow` |
 | `EncodeWakeAll` (`:605-612`) | no pass — bare `queue.WriteBuffer(dirty[page_], ones, 16 KB)` | day/night gate crossing |
 
 ---
@@ -152,8 +152,17 @@ selftest render gate = R1+R2.
 ## 3. BUFFER INVENTORY
 
 ### 3a. `World::Init` (`src/sim/world.cpp:25-90`)
-`kWorldN=512`, `kNumChunks=4096` (per compaction word-scan; 32768 chunks total),
-`kVoxelCount=512³`, `kParticleCap=262144`, `kFarLevels=8`, `kFarN=256`.
+`kWorldN=512`, `kChunk=16`, so `kNChunk=32` and **`kNumChunks=32768`**
+(`kNumChunks/64 = 512` is the per-word figure the compaction scan dispatches —
+`D_CHUNKS64`), `kVoxelCount=512³`, `kParticleCap=262144`, `kFarLevels=8`,
+`kFarN=256`.
+
+> Corrected 2026-08-22: this line and the whole-world dispatch extents in §1
+> read `4096`, which was the `kNChunk=16` era. `kWorldN` is 512 and `kChunk`
+> is 16, so `kNChunk` is 32 and `kNumChunks` is 32768. `src/sim/world.h`
+> carried the same stale `// 16` / `// 4096` trailing comments and is fixed in
+> the same commit. Note `kFarListCap` and `materialBuf_`'s 4096 rows below are
+> unrelated constants that genuinely are 4096.
 
 | Buffer | Size | Usage | Notes |
 |---|---|---|---|

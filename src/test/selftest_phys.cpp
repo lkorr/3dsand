@@ -81,7 +81,8 @@ bool debrisOk = false;
               debris.PendingEvents());
 
   // visual proof: render the settled debris field to screenshot_debris.bmp
-  // (through the ONE slot walk — game/bodyreg.h — like every render path)
+  // (through the ONE slot walk — game/bodyreg.h — like every render path).
+  // Both backends since phase 4b; the verdict above is still compute-only.
   if (debris.BodyCount() > 0) {
     BodyRegistry bodyReg(debris, c.mobs, nullptr);
     std::vector<BodyVoxInst> inst;

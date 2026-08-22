@@ -51,6 +51,7 @@ const char* const kOrder[] = {
     "player-plants", "debris",
     "prefab",      "mob",         "settle-back",    "player-body",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
+    "page-roundtrip", "daylight-boundary",
     "perf",
 };
 
@@ -255,13 +256,26 @@ int List() {
       for (const char* d : g.deps) std::printf(" %s", d);
     }
     if (g.advisory) std::printf("  [advisory]");
+    // Declared, not inferred — see the Gate::needsRender comment. Printing it
+    // is what makes "which gates could run before the Vulkan render path
+    // exists" a question with an answer in the binary rather than in a commit
+    // message.
+    if (g.needsRender) std::printf("  [needs-render]");
     std::printf("\n");
   }
   std::printf("\nrun one:  sandvox --selftest --gate <name>\n");
+  std::printf("[needs-render] = drives the offscreen target / a draw; the rest\n"
+              "are compute + readback only. All 23 run on both backends since\n"
+              "phase 4b; the flag remains as documentation.\n");
   return 0;
 }
 
 int Run(Ctx& c, const Options& opt) {
+  // Make a harness tick behave like a game frame: block for the readback map
+  // after a kicked readback so World::Snap() actually becomes valid. See the
+  // block comment on SetHarnessSnapshotDrain (test/support.h) for why the
+  // harnesses need this and the game does not.
+  SetHarnessSnapshotDrain(true);
   std::vector<const Gate*> plan = Plan(opt.only);
   if (plan.empty()) {
     std::fprintf(stderr, "selftest: nothing to run\n");
@@ -281,10 +295,13 @@ int Run(Ctx& c, const Options& opt) {
   }
   auto known = LoadBaseline(bpath);
 
-  std::printf("=== selftest === (%zu gate%s)\n", plan.size(),
+  std::printf("=== selftest === (%zu gate%s, backend vulkan)\n", plan.size(),
               plan.size() == 1 ? "" : "s");
 
   // The shared offscreen target every render-touching gate draws into.
+  // Gate::needsRender remains declared (and printed by --list) as
+  // documentation of which gates drive the render path, but nothing skips on
+  // it: all 23 gates run.
   c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
   c.view = c.offscreen.CreateView();
 
@@ -349,11 +366,39 @@ int Run(Ctx& c, const Options& opt) {
       std::printf("%s%s", fixed[i].c_str(), i + 1 < fixed.size() ? ", " : "");
     std::printf("\n  (update tests/baseline.json to lock these in)\n");
   }
-  if (!regressions.empty()) {
-    std::printf("\nREGRESSIONS (%zu): ", regressions.size());
-    for (size_t i = 0; i < regressions.size(); i++)
-      std::printf("%s%s", regressions[i].c_str(),
-                  i + 1 < regressions.size() ? ", " : "");
+  // Vulkan runs with --vk-validation: print whatever the messenger collected
+  // during the whole suite (nothing pops a scope mid-run), and let a hazard
+  // turn the run red — a sync-validation message IS a barrier bug (§6.2).
+  const size_t vkMsgs = c.ctx.ReportVkValidation("selftest");
+
+  // Page faults, over the WHOLE suite (PLAN_page_table.md §2.4, §4.4). The
+  // counter is monotonic and unconditional, so this one read covers every gate
+  // that ran — it is what turns "a kernel can never write through a sentinel"
+  // from a structural claim into a measurement made on every run. Non-zero
+  // means some chunk a kernel wrote was not materialized before its dispatch,
+  // which is risk 1 and is always a bug.
+  uint32_t pageFaults = 0;
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.pageFaults, 0,
+                        &pageFaults, 4, "pageFaults");
+  std::printf("page faults over the suite: %u%s\n", pageFaults,
+              pageFaults == 0 ? " (a sentinel write is a lost voxel: 0 is the"
+                                " only acceptable value)"
+                              : "  *** SENTINEL WRITES LOST VOXELS ***");
+
+  if (!regressions.empty() || vkMsgs > 0 || pageFaults != 0) {
+    if (!regressions.empty()) {
+      std::printf("\nREGRESSIONS (%zu): ", regressions.size());
+      for (size_t i = 0; i < regressions.size(); i++)
+        std::printf("%s%s", regressions[i].c_str(),
+                    i + 1 < regressions.size() ? ", " : "");
+    }
+    if (vkMsgs > 0)
+      std::printf("\nvulkan validation reported %zu message%s (see above)",
+                  vkMsgs, vkMsgs == 1 ? "" : "s");
+    if (pageFaults != 0)
+      std::printf("\n%u page fault%s: a sim kernel wrote through a sentinel and"
+                  " the voxel was LOST (PLAN_page_table.md risk 1)",
+                  pageFaults, pageFaults == 1 ? "" : "s");
     std::printf("\n=== selftest FAIL ===\n");
     return 1;
   }

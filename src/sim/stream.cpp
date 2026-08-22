@@ -6,6 +6,8 @@
 
 #include "gpu/context.h"
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
+#include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked eviction copy
 #include "sim/simulation.h"
 
 namespace {
@@ -24,10 +26,13 @@ constexpr size_t kMaxPendingEvicts = 4;  // in-flight batches before we block
 // world was stained at save time) and became a hard save/load failure the
 // moment worldgen ponds started wetting their banks.
 //
-// Only the STAMP byte (bits 16..23) is stripped, which is what the mask below
-// keeps out — it is per-tick scheduling scratch, not state, and is deliberately
+// Only the STAMP byte (bits 16..23) is stripped, which is what the mask keeps
+// out — it is per-tick scheduling scratch, not state, and is deliberately
 // excluded from the hash for the same reason.
-constexpr uint32_t kPersistMask = 0xFF00FFFFu;  // everything but the stamp byte
+//
+// `kPersistMask` now lives in stream.h: the Vulkan port's cross-backend smoke
+// must reproduce this exact round-trip, and a second copy of the literal is the
+// "two places that must agree" bug this repo has a checker for.
 
 void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out) {
   out.clear();
@@ -159,14 +164,48 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     p.items.reserve(n);
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     for (size_t i = 0; i < n; i++) {
-      enc.CopyBufferToBuffer(world_->voxels,
-                             (uint64_t)toSave[off + i].first * kChunkBytes,
-                             p.staging, i * kChunkBytes, kChunkBytes);
+      // Tracked (pass::Buf id): in this dedicated command buffer the source was
+      // written only by previous submits (the head barrier covers that), but
+      // declaring the read keeps every off-table voxels copy on the same
+      // tracker path (barrier_graph §8) rather than special-casing this one.
+      //
+      // THE CPU SEAM (§2.1a): the source offset resolves through
+      // PageOffsetOfSlot, never through slot * kChunkBytes. Getting this wrong
+      // saves the WRONG CHUNK to disk, silently and permanently.
+      //
+      // §4.2's fast path for a sentinel slot is therefore not an optimization
+      // but MANDATORY: there is nothing to copy, because the CPU already knows
+      // the chunk's entire content from the table entry and synthesizes its
+      // RLE directly (see the sentinel branch in CompleteOldest). That also
+      // removes the largest single source of streaming traffic on a shift
+      // plane that is mostly sky — and it drops the copy from the tracked
+      // path, which is why the recorded copy count moves (§5.6).
+      const uint64_t srcOff = world_->PageOffsetOfSlot(toSave[off + i].first);
       p.items.push_back(toSave[off + i].second);
+      p.sentinel.push_back(srcOff == World::kNoPage
+                               ? world_->PageEntryOfSlot(toSave[off + i].first)
+                               : 0u);
+      if (srcOff != World::kNoPage) {
+        enc.CopyTracked(pass::Buf::Voxels, world_->voxels, srcOff, p.staging,
+                        i * kChunkBytes, kChunkBytes);
+      }
       pendingChunks_[World::PackChunkKey(toSave[off + i].second.wc)]++;
     }
-    // submit BEFORE FillSlots writes: queue order makes the copy read the
-    // leaving plane's data even though the map completes ticks later
+    // Submit BEFORE FillSlots writes, so the copy reads the leaving plane's
+    // data even though the map completes ticks later.
+    //
+    // THE MECHANISM, precisely (docs/vulkan_barrier_graph.md §4.3, corrected
+    // when the Vulkan streaming path landed in phase 3c). It is tempting to say
+    // "both are submits and submits are ordered", but that is not what carries
+    // the guarantee: FillSlots does NOT necessarily submit. Its per-slot writes
+    // are deferred to the next submit from any path, and when every slot hits
+    // the store it issues no submit at all. What actually orders them is that
+    // EvictSlots submits EAGERLY, right here, while FillSlots only ENQUEUES —
+    // so the copy-out is already on the queue before the overwrite is even
+    // enqueued, let alone recorded.
+    //
+    // The memory half of the dependency comes from the head-of-command-buffer
+    // global barrier (§3.4) in whichever command buffer later drains the fill.
     ctx_->queue.Submit(enc.Finish());
     p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, n * kChunkBytes);
     pending_.push_back(std::move(p));
@@ -199,7 +238,18 @@ void Stream::CompleteOldest(bool discard) {
         std::vector<uint32_t> data(kChunkVol);
         std::vector<uint32_t> rle;
         for (size_t i = 0; i < p.items.size(); i++) {
-          std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
+          // A sentinel slot was never copied (§4.2's mandatory fast path): the
+          // CPU already knows its whole content from the table entry, so the
+          // RLE is synthesized directly. RLE compresses a uniform chunk to a
+          // single {4096, w} pair anyway, so a sentinel chunk and a
+          // materialized uniform chunk produce BYTE-IDENTICAL RLE — which is
+          // what makes the save format need no change at all (§4.2).
+          const uint32_t e = i < p.sentinel.size() ? p.sentinel[i] : 0u;
+          if (e != 0u) {
+            std::fill(data.begin(), data.end(), SynthWord(e));
+          } else {
+            std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
+          }
           RleEncodeChunk(data.data(), rle);
           bool air = rle.size() == 2 && rle[1] == 0;
           if (air && p.items[i].dropIfAir) continue;
@@ -235,8 +285,39 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       CompleteOldest(/*discard=*/false);
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
-      ctx_->queue.WriteBuffer(world_->voxels, (uint64_t)s * kChunkBytes,
-                              data.data(), kChunkBytes);
+      // ---- store-hit classification (PLAN_page_table.md §3.5d) ------------
+      //
+      // The CPU has the decoded 16 KiB in `data` before it uploads, so it
+      // knows for FREE — it is already looping over every word below to
+      // compute occ/blockers — whether the chunk is all-air or all-one-word.
+      // All-air or uniform => install the sentinel and SKIP THE 16 KiB UPLOAD
+      // ENTIRELY, which is a bandwidth win on top of the memory win.
+      //
+      // This is also the ONE place UNIFORM discovery lives (§3.6, with commit
+      // 0's measurement behind it): the paths that already hold the words get
+      // demotion, and the tick path does not get a GPU uniformity scan.
+      const uint32_t entry = world_->residency == World::Residency::Paged
+                                 ? PageTable::Classify(data.data())
+                                 : PageTable::kNeedsPage;
+      if (entry != PageTable::kNeedsPage) {
+        world_->pages->SetSentinel(s, entry);
+      } else {
+        // THE CPU SEAM (§2.1a): without translation this writes the decoded
+        // RLE into ANOTHER chunk's page. EnsurePageForOverwrite allocates when
+        // the slot is a sentinel — the same branch that classifies is the one
+        // that allocates, so allocation and offset come from one place.
+        const uint64_t dstOff = world_->pages->EnsurePageForOverwrite(s);
+        ctx_->queue.WriteBuffer(world_->voxels, dstOff, data.data(), kChunkBytes);
+      }
+      world_->pages->FlushTableWrites(ctx_->queue);
+      // Contributor (d) to the CPU dirty mirror (§3.1a): the two dirty writes
+      // below wake this slot on the next tick, in BOTH pages, decided by
+      // streaming rather than by the tick loop. Its own chunk is materialized
+      // by the branch above either way, but it must still enter cpuDirty or a
+      // tightening in the same tick would intersect the refilled chunk's
+      // NEIGHBOURS away and the CA frontier a stream-in creates would be
+      // invisible to the mirror.
+      world_->pages->RefilledSlot(s);
       uint32_t occ = 0, blockers = 0;
       for (uint32_t w : data) {
         uint32_t m = w & 0xFFFu;
@@ -254,6 +335,17 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     }
   }
   if (!genSlots.empty()) {
+    // genChunk overwrites the WHOLE chunk of every slot in the list, so every
+    // one of them needs a page before the dispatch — a kernel cannot allocate
+    // (§3.5c at batch size = the genList count, which the shift plane already
+    // bounds). No fill is queued: the kernel is about to write all 4,096 words.
+    if (world_->residency == World::Residency::Paged) {
+      for (uint32_t gs : genSlots) world_->pages->EnsurePageForOverwrite(gs);
+      world_->pages->FlushTableWrites(ctx_->queue);
+      // Same contributor (d) reasoning as the store-hit branch: genChunk's own
+      // in-kernel dirty write wakes the slot next tick.
+      for (uint32_t gs : genSlots) world_->pages->RefilledSlot(gs);
+    }
     ctx_->queue.WriteBuffer(world_->genList, 0, genSlots.data(),
                             genSlots.size() * 4);
     TickParams tp{};

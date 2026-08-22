@@ -21,6 +21,8 @@
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
+@group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
 @group(1) @binding(0) var<storage, read_write> pReadBuf : array<Particle>;
 @group(1) @binding(2) var<storage, read_write> counts   : array<atomic<u32>>;
@@ -33,7 +35,7 @@ fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
 fn hardnessAt(c : vec3<i32>) -> i32 {
   if (!inBounds(c)) { return 100000; }  // residency edge absorbs everything
-  let mat = voxMat(voxels[cellIndexW(c)]);
+  let mat = voxMat(voxWordAt(c));
   if (mat == MAT_AIR) { return 0; }
   return i32(materials[mat].hardness);
 }
@@ -74,7 +76,7 @@ fn mark(@builtin(workgroup_id) wg : vec3<u32>,
   }
   let remaining = op.power - occlusion - i32(isqrt(u32(d2))) * FALLOFF_PER_CELL;
 
-  let mat = voxMat(voxels[cellIndexW(c)]);
+  let mat = voxMat(voxWordAt(c));
   if (mat == MAT_AIR) {
     // shockwave through open space: wake the chunk so settled piles at the
     // cavity edge re-check support this tick
@@ -116,9 +118,12 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
     if (destroyedBy(j, c) != 0u) { return; }
   }
 
-  let idx = cellIndexW(c);
-  let w = voxels[idx];
-  voxels[idx] = 0u;
+  // TWO BASES (§4.1): slotIdx keys the RNG, idx addresses memory. See the
+  // note in sim_step:main — an RNG keyed on a page index makes the ejecta
+  // stream a function of allocation history.
+  let slotIdx = cellIndexW(c);
+  let w = voxWordAt(c);
+  voxStore(voxWordIndex(c), 0u);
   markBoth(c);
 
   let m = materials[voxMat(w)];
@@ -127,7 +132,7 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   else if (m.klass == CLASS_POWDER) { ejectPerMille = TUNE_EJECT_POWDER; }
   else if (m.klass == CLASS_GAS) { ejectPerMille = TUNE_EJECT_GAS; }
 
-  let rnd = hash3(T.seed ^ 0xB0011u, T.tick, idx);
+  let rnd = hash3(T.seed ^ 0xB0011u, T.tick, slotIdx);
 
   // outward velocity scaled by surviving power, plus per-cell jitter
   let remaining = i32(val - 1u);
@@ -143,7 +148,7 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   // Grit is sub-voxel, dies on contact and stains only if its material stains,
   // so it adds no matter to the world — it is the dust and spall that sells a
   // blast, and it costs one ring slot with a short lifetime.
-  let gritRoll = hash3(rnd, 0x6217u, idx);
+  let gritRoll = hash3(rnd, 0x6217u, slotIdx);
   if ((gritRoll % 1000u) < TUNE_EXP_MICRO_PERMILLE) {
     let gslot = atomicAdd(&counts[T.page], 1u);
     if (gslot < PARTICLE_CAP) {

@@ -43,7 +43,7 @@ class Simulation {
   // Render-only; nothing here can reach a world cell or the hash.
   void SetArtPalette(const rhi::Queue& queue, const std::vector<uint32_t>& rgb);
 
-  void EncodeWorldgen(const rhi::CommandEncoder& enc);
+  void EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen = true);
   // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
   // world.genList (and whose count + window origin are in tickUBO).
   void EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count);
@@ -156,10 +156,6 @@ class Simulation {
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Stamp the cached art palette into a material table being (re)built.
   void ApplyArtPalette(std::vector<MaterialGpu>& table) const;
-  // BeginComputePass, timestamped when a PassTimer is attached (never in the
-  // game). One helper so the encode sites keep their single structure.
-  rhi::ComputePass BeginPass(const rhi::CommandEncoder& enc,
-                                     const char* name) const;
 
   // ---- table-driven recording (docs/PLAN_vulkan_port.md phase 2b) ----------
   // Every Encode* above records by walking src/sim/pass_table.def rather than

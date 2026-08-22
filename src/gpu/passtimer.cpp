@@ -32,6 +32,15 @@ rhi::ComputePass PassTimer::BeginPass(const rhi::CommandEncoder& enc,
   return enc.BeginComputePass(name, tw);
 }
 
+bool PassTimer::AllocPassPair(const char* name, uint32_t& beginIdx, uint32_t& endIdx) {
+  if (!querySet_ || used_ + 2 > capacity_) return false;
+  beginIdx = used_;
+  endIdx = used_ + 1;
+  used_ += 2;
+  pending_.emplace_back(name);
+  return true;
+}
+
 void PassTimer::EncodeResolve(const rhi::CommandEncoder& enc) {
   if (!querySet_ || used_ == 0) return;
   enc.ResolveQuerySet(querySet_, 0, used_, resolve_, 0);

@@ -60,6 +60,10 @@ using namespace sandvox;
 
 namespace {
 
+// --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
+uint64_t g_harnessFrames = 0;
+double g_harnessRenderMs = 0.0;
+
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
 //
 // Maps the avatar's limbs onto the fixed stick-figure slots. The mapping is by
@@ -631,7 +635,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     render({(float)(kPx - 30), (float)(rim - 10), (float)(kPz - 30)}, 0.785f,
            0.04f, "screenshot_pond_sub.bmp");
   }
-  return 0;
+  // A hazard report with no message pop is a hazard report that goes nowhere:
+  // the debug messenger collects continuously, but only the F5-reload scope
+  // pops. Print (and count) whatever this run gathered.
+  return ctx.ReportVkValidation("--shot") > 0 ? 1 : 0;
 }
 
 // Count of chunks whose dirty flag is set (selftest only — blocking readback).
@@ -879,7 +886,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
         "screenshot_mob_quarter.bmp");
   shoot(fwd + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_front.bmp");
-  return 0;
+  return ctx.ReportVkValidation("--shot-mob") > 0 ? 1 : 0;
 }
 
 
@@ -957,12 +964,18 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
+  bool residencyPaged = false;  // --residency paged|dense (dense is the oracle)
   bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
-  // --backend vulkan. Headless ONLY: the Vulkan render path is phase 4, so
-  // there is no swapchain to present to and asking for one is refused loudly
-  // rather than silently falling back to Dawn.
-  bool backendVulkan = false;
+  // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
+  // comparison over an ACTIVE world (ops, explosions, particles, readback ring,
+  // streaming) rather than a quiet one.
+  bool vkSmokeLoud = false;
+  // The backend. VULKAN IS THE ONLY ONE since 2026-08-22 (user decision;
+  // docs/PLAN_vulkan_port.md phase 6 decision log): Dawn was removed after it
+  // ran all 23 gates with results identical to Vulkan's for a full phase. The
+  // variable stays because the rhi:: seam stays.
+  rhi::BackendKind backend = rhi::BackendKind::Vulkan;
   bool sledgehammer = false;  // --barriers=sledgehammer (barrier_graph §6.2 oracle)
   bool vkValidation = false;  // --vk-validation: VK_LAYER_KHRONOS_validation + sync
   bool lowPowerAdapter = false;
@@ -989,11 +1002,31 @@ int main(int argc, char** argv) {
     if (a == "--json" && i + 1 < argc) stOpt.jsonPath = argv[++i];
     if (a == "--baseline" && i + 1 < argc) stOpt.baselinePath = argv[++i];
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
+    // `--frames N` runs the WINDOWED game for N frames, fires one F5 shader
+    // reload midway, and exits cleanly — the phase-4b D3 verification harness.
+    if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
     // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
     // TimestampQuery device feature.
     if (a == "--measure") measure = true;
+    // `--residency paged|dense` selects the voxel buffer's residency
+    // (docs/PLAN_page_table.md §6.2). ONE variable with a total order of
+    // values rather than two flags, per the phase-6 lesson that a flag named
+    // for the non-default cannot express a default flip.
+    //
+    // `dense` is the identity map: address-identical to pre-paging code while
+    // still running the whole translation path. With Dawn gone it is the ONLY
+    // live differential oracle the engine has, which makes it load-bearing
+    // test infrastructure rather than a fallback — never selected
+    // automatically, always available (§6.3).
+    if (a == "--residency" && i + 1 < argc) {
+      const std::string v = argv[++i];
+      if (v == "paged") residencyPaged = true;
+      else if (v == "dense") residencyPaged = false;
+      else { std::fprintf(stderr, "--residency wants paged|dense, got '%s'\n",
+                          v.c_str()); return 1; }
+    }
     if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
     if (a == "--noaudio") noAudio = true;
     if (a == "--telemetry") telemetryEnabled = true;
@@ -1011,23 +1044,37 @@ int main(int argc, char** argv) {
     // `--vk-info` is the Vulkan port's phase-3a exit proof (src/gpu/vk_info.cpp):
     // create a VkDevice, print the capability record phase 7 needs, compile
     // every WGSL shader to SPIR-V through Tint, build every compute pipeline,
-    // zero-init and submit one fenced command buffer. Headless, and it does NOT
-    // touch Dawn or run any sim work — Vulkan executes nothing but the
-    // zero-init fills until phase 3b.
+    // zero-init and submit one fenced command buffer. Headless, and it runs no
+    // sim work — the only commands submitted are the zero-init fills.
     if (a == "--vk-info") vkInfo = true;
-    // `--vk-smoke` is the phase-3b exit proof (src/gpu/vk_smoke.cpp): the same
-    // seed worldgen'd and ticked on BOTH backends, with the world hashes
-    // compared. Dawn's auto-generated barriers are the reference implementation
-    // of docs/vulkan_barrier_graph.md, so this is the strongest single test the
-    // generated-barrier recorder has (§6.3).
+    // `--vk-smoke` runs a quiet 50-tick world and compares its hashes against
+    // the PINNED sequence (src/gpu/vk_smoke.cpp). It used to compare Dawn
+    // against Vulkan; with Dawn gone the pinned values ARE the reference, so
+    // the regression power the cross-backend diff provided is preserved.
     if (a == "--vk-smoke") vkSmoke = true;
-    // `--backend vulkan` selects the Vulkan compute backend. Headless only in
-    // phase 3b — see the refusal below.
+    // `--vk-smoke-loud` does the same over 120 ticks of an ACTIVE world,
+    // reaching everything a quiet world leaves dark — the brush/cell mutation
+    // kernels, the explosion mark/apply split, the whole particle chain, the
+    // readback ring, and a streaming walk that forces eviction and procgen
+    // refill. 19 pinned probes.
+    if (a == "--vk-smoke-loud") vkSmokeLoud = true;
+    // `--backend vulkan` names the only backend explicitly, so existing
+    // invocations and scripts keep working. `--backend dawn` is REFUSED with
+    // an explanation rather than quietly served by Vulkan: a run reported as
+    // Dawn that was Vulkan all along is worse than no run — the same principle
+    // that made phase 3b refuse `--backend vulkan` before it could honour it.
     if (a == "--backend" && i + 1 < argc) {
       std::string b = argv[++i];
-      if (b == "vulkan") backendVulkan = true;
-      else if (b != "dawn") {
-        std::fprintf(stderr, "unknown --backend '%s' (expected dawn|vulkan)\n", b.c_str());
+      if (b == "vulkan") {
+        backend = rhi::BackendKind::Vulkan;
+      } else if (b == "dawn") {
+        std::fprintf(stderr,
+                     "--backend dawn: Dawn was REMOVED 2026-08-22 and the engine is\n"
+                     "Vulkan-only (docs/PLAN_vulkan_port.md phase 6 decision log).\n"
+                     "Drop the flag, or pass --backend vulkan.\n");
+        return 2;
+      } else {
+        std::fprintf(stderr, "unknown --backend '%s' (expected vulkan)\n", b.c_str());
         return 2;
       }
     }
@@ -1047,34 +1094,21 @@ int main(int argc, char** argv) {
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
 
-  // --vk-info likewise answers before any Dawn device exists: it is a Vulkan-only
-  // path, and running it ahead of GpuContext keeps the two backends from
-  // competing for the adapter while phase 3a is still headless.
+  // --vk-info answers before any GpuContext exists: it builds its own device
+  // to print the capability record, so it must not race the engine's for the
+  // adapter.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
-  // --backend vulkan, phase 3b. THE VULKAN RENDER PATH DOES NOT EXIST: phase 4
-  // adds the swapchain, the six raster pipelines and imgui_impl_vulkan. So a
-  // request for the Vulkan backend in a mode that needs to present is refused
-  // with a message rather than silently served by Dawn — a quiet fallback would
-  // mean a run reported as "Vulkan" that was Dawn all along, which is exactly
-  // the kind of result that makes cross-backend evidence worthless.
-  //
-  // The one headless mode Vulkan can actually serve today is --vk-smoke, which
-  // drives the compute tables end to end and compares hashes against Dawn.
-  if (backendVulkan && !vkSmoke) {
-    std::fprintf(stderr,
-                 "--backend vulkan is HEADLESS-ONLY in phase 3b: the Vulkan render\n"
-                 "path (swapchain, raster pipelines, ImGui) is phase 4.\n"
-                 "Use it with a headless mode:\n"
-                 "    sandvox --backend vulkan --vk-smoke\n"
-                 "Add --vk-validation for synchronization validation, and\n"
-                 "--barriers=sledgehammer for the barrier A/B oracle.\n");
-    return 2;
-  }
-  // --vk-smoke runs BOTH backends by construction, so it does not need
-  // --backend to select one; accepting the flag anyway keeps the invocation in
-  // the refusal message above honest.
-  if (vkSmoke) return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation);
+  // Every mode below — the 23 selftest gates, --shot/--shot-mob, --measure and
+  // the windowed game (swapchain + imgui_impl_vulkan) — runs on Vulkan, the
+  // only backend. The smokes build their own GpuContext, so they run here
+  // before the game's asset load.
+  if (vkSmoke)
+    return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation,
+                               residencyPaged);
+  if (vkSmokeLoud)
+    return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation,
+                                   residencyPaged);
 
   std::string assetDir = AssetDir();
   // Tuning first: LoadShader() bakes these into every shader's constant
@@ -1154,13 +1188,16 @@ int main(int argc, char** argv) {
   }
 
   GpuContext ctx;
-  if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure))
+  if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure,
+                backend, vkValidation, sledgehammer))
     return 1;
 
   Telemetry telemetry;
   if (telemetryEnabled) telemetry.Start(telemetryPort);
 
   World world;
+  world.residency =
+      residencyPaged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
   Simulation sim;
   if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders"))
@@ -1360,7 +1397,20 @@ int main(int argc, char** argv) {
   // ease outward as the bands land.
   float fogSmooth = kFarFogDensityMax;
 
+  // --frames N harness (phase 4b D3 verification): run N frames windowed,
+  // fire one F5 shader reload midway (the Tint recompile path), then close
+  // cleanly through the normal shutdown — so "window opens, world renders,
+  // reload works, clean exit" is checkable without a human at the keyboard.
+  uint64_t frameCounter = 0;
   while (!glfwWindowShouldClose(window)) {
+    if (g_harnessFrames > 0) {
+      frameCounter++;
+      if (frameCounter == g_harnessFrames / 2) {
+        std::printf("--frames harness: triggering shader reload (F5 path)\n");
+        ui.reloadShaders = true;
+      }
+      if (frameCounter >= g_harnessFrames) glfwSetWindowShouldClose(window, 1);
+    }
     glfwPollEvents();
     double now = NowSeconds();
     float dt = (float)(now - lastTime);
@@ -2886,12 +2936,24 @@ int main(int argc, char** argv) {
       TelemetryStage rs = {"render", renderMs};
       telemetry.Broadcast(tick, &rs, 1);
     }
+    if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tRender0) * 1000.0;
     ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
     telemetry.Poll();
   }
 
+  if (g_harnessFrames > 0 && frameCounter > 0) {
+    std::printf("--frames harness: %llu frames, avg render+present %.2f ms "
+                "(FIFO/vsync-paced; offscreen render cost is the selftest "
+                "'render 1080p' sweep)\n",
+                (unsigned long long)frameCounter,
+                g_harnessRenderMs / (double)frameCounter);
+  }
+
   telemetry.Shutdown();
   ctx.WaitIdle();
+  // Windowed Vulkan: print (and count) everything the debug messenger
+  // collected over the session — nothing pops a scope except F5 reloads.
+  ctx.ReportVkValidation("session");
   // Audio down before anything it points at: Shutdown stops the device, which
   // is the only thread that can still be inside the mixer.
   if (audioCues.Enabled()) {

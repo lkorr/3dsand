@@ -44,26 +44,74 @@ message(STATUS "sandvox: dependency cache = ${FETCHCONTENT_BASE_DIR}")
 include(FetchContent)
 
 # ---------------------------------------------------------------------------
-# Dawn (WebGPU implementation; Vulkan backend on Windows native).
-# DAWN_FETCH_DEPENDENCIES pulls Dawn's own third-party deps without depot_tools.
+# TINT — the WGSL compiler, fetched as part of the Dawn repository.
+#
+# DAWN WAS REMOVED 2026-08-22 (user decision; docs/PLAN_vulkan_port.md phase 6
+# decision log). The engine is Vulkan-only: nothing links dawn_native,
+# webgpu_dawn, webgpu_cpp or webgpu_glfw any more. What the checkout is STILL
+# here for — and the reason this block is not simply deleted — is Tint:
+#
+#   * `tint_lang_wgsl_reader` + `tint_lang_spirv_writer` are linked into
+#     sandvox and are how `src/gpu/vk_spirv.cpp` turns the live WGSL string
+#     (constant prelude + tuning block + common.wgsl + body) into SPIR-V at
+#     load AND at every F5 hot-reload. Precompiling .spv offline cannot
+#     replace this: F5 rebuilds the prelude from live tuning values, so a
+#     precompiled blob would freeze them.
+#   * `tint.exe` (TINT_BUILD_CMD_TOOLS) is scripts/check_shaders.sh's fast
+#     WGSL validator — seconds of feedback on a shader edit instead of a full
+#     link + launch, and it runs automatically on every WGSL edit via the
+#     PostToolUse hook.
+#
+# HOW THE DAWN ENGINE IS EXCLUDED, and why this shape rather than a target
+# blacklist: Dawn's own CMakeLists gates `add_subdirectory(src/dawn)` (which
+# is what DEFINES dawn_native, webgpu_dawn, webgpu_cpp, webgpu_glfw and the
+# code generator) on "at least one DAWN_ENABLE_<backend> is ON". With all of
+# them OFF those targets are never declared at all — there is nothing left to
+# accidentally link, and ~156 dawn_native translation units plus a 178 MB
+# webgpu_dawn.lib stop being built. `add_subdirectory(src/tint)` is
+# UNCONDITIONAL, so Tint is unaffected.
+#
+# THE TRAP THIS BLOCK EXISTS TO DOCUMENT: three TINT_BUILD_* options default
+# to `${DAWN_ENABLE_VULKAN}` upstream — SPV_WRITER, SPV_READER — so turning
+# the Dawn Vulkan backend off ALSO silently turns off the SPIR-V writer we
+# depend on, and the build fails much later with an unresolved
+# tint::spirv::writer::Generate. They are therefore forced ON here
+# INDEPENDENTLY of any DAWN_ENABLE_* value. Do not "simplify" them away.
 # ---------------------------------------------------------------------------
 set(DAWN_FETCH_DEPENDENCIES ON CACHE BOOL "" FORCE)
-# Without this, Dawn's LoadLibraryExA(vulkan-1.dll) uses search flags that
-# require an absolute path and fails with Windows error 87.
-set(DAWN_FORCE_SYSTEM_COMPONENT_LOAD ON CACHE BOOL "" FORCE)
-set(DAWN_ENABLE_VULKAN ON  CACHE BOOL "" FORCE)
+# Every Dawn backend OFF => src/dawn is never added => no Dawn engine targets.
+set(DAWN_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
 set(DAWN_ENABLE_D3D12  OFF CACHE BOOL "" FORCE)
 set(DAWN_ENABLE_D3D11  OFF CACHE BOOL "" FORCE)
 set(DAWN_ENABLE_NULL   OFF CACHE BOOL "" FORCE)
 set(DAWN_ENABLE_DESKTOP_GL OFF CACHE BOOL "" FORCE)
 set(DAWN_ENABLE_OPENGLES   OFF CACHE BOOL "" FORCE)
+set(DAWN_ENABLE_METAL      OFF CACHE BOOL "" FORCE)
 set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(DAWN_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+# STAYS ON, and not for Dawn's sake: this flag is what makes Dawn's
+# third_party/CMakeLists.txt `add_subdirectory` the GLFW library itself, which
+# is where the engine's `glfw` link target comes from. Dawn's own GLFW helper
+# (`dawn_glfw`, the wgpu::Surface factory) lives under src/dawn and is excluded
+# with the rest of it — we create the VkSurfaceKHR with glfwCreateWindowSurface
+# directly. Turning this OFF removes the `glfw` target and breaks the link.
 set(DAWN_USE_GLFW ON CACHE BOOL "" FORCE)
 set(TINT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# Load-bearing: see "THE TRAP" above. These default to ${DAWN_ENABLE_VULKAN},
+# which is now OFF, and they are exactly what the engine's WGSL->SPIR-V path
+# is built from.
+set(TINT_BUILD_SPV_WRITER  ON CACHE BOOL "" FORCE)
+set(TINT_BUILD_SPV_READER  ON CACHE BOOL "" FORCE)
+set(TINT_BUILD_WGSL_READER ON CACHE BOOL "" FORCE)
+set(TINT_BUILD_WGSL_WRITER ON CACHE BOOL "" FORCE)
 # The `tint` CLI is our fast WGSL validator (scripts/check_shaders.sh) — seconds
 # of feedback on a shader edit instead of a full link + launch.
 set(TINT_BUILD_CMD_TOOLS ON CACHE BOOL "" FORCE)
 
+# The name stays `dawn` (repository, cache directory, FetchContent id): the
+# checkout IS the Dawn repository and renaming it would invalidate every
+# existing C:/sv-deps cache for no benefit. CLAUDE.md's notes about that path
+# being short and set before include(FetchContent) apply unchanged.
 FetchContent_Declare(
   dawn
   GIT_REPOSITORY https://dawn.googlesource.com/dawn
@@ -72,6 +120,28 @@ FetchContent_Declare(
   GIT_SUBMODULES ""
 )
 FetchContent_MakeAvailable(dawn)
+
+# ---------------------------------------------------------------------------
+# Vulkan::Headers — declared HERE, because Dawn only declares it for its own
+# Vulkan backend.
+#
+# Dawn's third_party/CMakeLists.txt guards the Vulkan-Headers add_subdirectory
+# on `NOT TARGET Vulkan::Headers AND DAWN_ENABLE_VULKAN`. With every Dawn
+# backend off (above) the target is never created, and the engine — which needs
+# the headers far more than Dawn ever did — fails to link against a name that
+# does not exist. The SOURCES are unaffected: fetch_dawn_dependencies pulls
+# vulkan-headers under the `dawn_standalone` condition, not under a backend
+# flag, so the checkout is there either way and this just does the
+# add_subdirectory Dawn skipped.
+#
+# `NOT TARGET` guard so that a future Dawn version (or a re-enabled backend)
+# declaring it first is not a duplicate-target error.
+# ---------------------------------------------------------------------------
+if(NOT TARGET Vulkan::Headers)
+  set(VULKAN_HEADERS_ENABLE_MODULE OFF)
+  add_subdirectory("${dawn_SOURCE_DIR}/third_party/vulkan-headers/src"
+                   "${CMAKE_BINARY_DIR}/vulkan-headers" EXCLUDE_FROM_ALL)
+endif()
 
 # ---------------------------------------------------------------------------
 # Vulkan backend dependencies (docs/PLAN_vulkan_port.md phase 3).
@@ -122,7 +192,11 @@ FetchContent_MakeAvailable(dawn)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Dear ImGui (GLFW + WebGPU backends)
+# Dear ImGui (GLFW platform + Vulkan render backend)
+#
+# imgui_impl_wgpu.cpp was dropped with Dawn (2026-08-22): src/ui/overlay.cpp is
+# Vulkan-only, so the WGPU backend TU and the IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+# define it needed are both gone.
 # ---------------------------------------------------------------------------
 FetchContent_Declare(
   imgui
@@ -138,11 +212,16 @@ add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-  ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-target_link_libraries(imgui_lib PUBLIC glfw dawn::webgpu_dawn)
+# IMGUI_IMPL_VULKAN_NO_PROTOTYPES: the whole engine loads Vulkan dynamically
+# (VK_NO_PROTOTYPES; src/gpu/vk_loader.*), so ImGui's Vulkan backend must too —
+# overlay.cpp feeds it entry points via ImGui_ImplVulkan_LoadFunctions. PUBLIC
+# because the flag must match between imgui_impl_vulkan.cpp and every includer
+# of its header.
+target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+target_link_libraries(imgui_lib PUBLIC glfw Vulkan::Headers)
 
 # ---------------------------------------------------------------------------
 # Jolt Physics (rigid bodies for debris islands, DESIGN.md §7)
@@ -203,24 +282,25 @@ endif()
 add_executable(sandvox
   src/main.cpp
   src/crash.cpp
-  src/gpu/rhi_dawn.cpp
+  src/gpu/rhi.cpp
   src/gpu/context.cpp
   src/gpu/resources.cpp
   src/gpu/passtimer.cpp
-  # Vulkan backend (phase 3). Compiled into the default build but NOT reachable
-  # from the frame path: only --vk-info, --vk-smoke and `--backend vulkan`
-  # construct a VkDevice, and all three are headless. Dawn stays the backend for
-  # everything else until phase 4 ports the render path.
+  # The Vulkan backend — the ONLY backend since 2026-08-22. rhi_vk.cpp is the
+  # single implementation behind the rhi.h seam (rhi_dawn.cpp deleted with
+  # Dawn); the seam itself stays, because it is what made the port testable and
+  # an abstract impl with one subclass costs nothing.
   src/gpu/vk_loader.cpp
   src/gpu/vk_vma.cpp
   src/gpu/vk_spirv.cpp
   src/gpu/rhi_vulkan.cpp
+  src/gpu/rhi_vk.cpp
   src/gpu/vk_record.cpp
-  src/gpu/vk_sim.cpp
   src/gpu/vk_info.cpp
   src/gpu/vk_smoke.cpp
   src/measure/measure.cpp
   src/sim/world.cpp
+  src/sim/pagetable.cpp
   src/sim/worldio.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp
@@ -302,9 +382,6 @@ target_compile_definitions(sandvox PRIVATE
   VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
 target_link_libraries(sandvox PRIVATE
-  dawn::webgpu_dawn
-  webgpu_cpp
-  webgpu_glfw
   glfw
   imgui_lib
   nlohmann_json::nlohmann_json
@@ -312,7 +389,8 @@ target_link_libraries(sandvox PRIVATE
   ws2_32
   dbghelp
   # Vulkan backend: headers only (no loader — see the block above), plus Tint's
-  # WGSL front end and SPIR-V back end for in-process shader compilation.
+  # WGSL front end and SPIR-V back end for in-process shader compilation. These
+  # two tint targets are the ONLY thing still linked out of the Dawn checkout.
   Vulkan::Headers
   tint_lang_wgsl_reader
   tint_lang_spirv_writer
@@ -328,8 +406,10 @@ target_compile_definitions(sandvox PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR
 # selftest drops the player onto smooth terrain and asserts it lands, which
 # still passes when walking over rough ground is completely broken. This one
 # runs the controller against synthetic noisy/gritty heightfields and asserts
-# distance covered and jumps honoured. Links no Dawn code — it only needs the
-# headers that sim/world.h pulls in.
+# distance covered and jumps honoured. Links no GPU code at all: it only needs
+# the headers that sim/world.h pulls in, and since the Dawn removal those are
+# plain C++ (the `webgpu_cpp` link line here existed purely to put Dawn's
+# headers on the include path for rhi.h).
 # ---------------------------------------------------------------------------
 add_executable(movement_test
   tests/movement_test.cpp
@@ -338,7 +418,7 @@ add_executable(movement_test
 )
 target_include_directories(movement_test PRIVATE src)
 target_compile_definitions(movement_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(movement_test PRIVATE webgpu_cpp nlohmann_json::nlohmann_json)
+target_link_libraries(movement_test PRIVATE nlohmann_json::nlohmann_json)
 
 # ---------------------------------------------------------------------------
 # voxload_test — CPU-only .vox parser harness (no GPU). Asserts the Z-up ->
@@ -365,4 +445,3 @@ target_compile_definitions(voxload_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 add_executable(lattice_test tests/lattice_test.cpp)
 target_include_directories(lattice_test PRIVATE src)
 target_compile_definitions(lattice_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(lattice_test PRIVATE webgpu_cpp)
