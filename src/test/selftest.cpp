@@ -263,7 +263,8 @@ int List() {
   }
   std::printf("\nrun one:  sandvox --selftest --gate <name>\n");
   std::printf("[needs-render] = drives the offscreen target / a draw; the rest\n"
-              "are compute + readback only (Vulkan port phase 4).\n");
+              "are compute + readback only. All 23 run on both backends since\n"
+              "phase 4b; the flag remains as documentation.\n");
   return 0;
 }
 
@@ -287,20 +288,16 @@ int Run(Ctx& c, const Options& opt) {
   }
   auto known = LoadBaseline(bpath);
 
-  // The render path exists only on Dawn until phase 4b. On Vulkan the
-  // needsRender gates (declared per gate, printed by --list) are skipped WITH A
-  // PRINTED REASON — never silently passed, which would be a green run of
-  // nothing — and the shared offscreen target is not created at all.
-  const bool renderAvail = c.ctx.backendKind == rhi::BackendKind::Dawn;
-
   std::printf("=== selftest === (%zu gate%s, backend %s)\n", plan.size(),
-              plan.size() == 1 ? "" : "s", renderAvail ? "dawn" : "vulkan");
+              plan.size() == 1 ? "" : "s",
+              c.ctx.backendKind == rhi::BackendKind::Dawn ? "dawn" : "vulkan");
 
-  // The shared offscreen target every render-touching gate draws into.
-  if (renderAvail) {
-    c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
-    c.view = c.offscreen.CreateView();
-  }
+  // The shared offscreen target every render-touching gate draws into. Both
+  // backends since phase 4b — Gate::needsRender remains declared (and printed
+  // by --list) as documentation of which gates drive the render path, but
+  // nothing skips on it any more: all 23 gates run on --backend vulkan.
+  c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
+  c.view = c.offscreen.CreateView();
 
   std::vector<Result> results;
   std::unordered_map<std::string, Status> outcome;
@@ -315,14 +312,7 @@ int Run(Ctx& c, const Options& opt) {
     }
     Result r;
     r.name = g->name;
-    if (!renderAvail && g->needsRender) {
-      // Skipped-for-backend, loudly. Distinct from a dependency skip so the
-      // summary reads honestly: these gates were not attempted, not passed.
-      r.status = Status::Skip;
-      r.detail = "needs the render path; not available on --backend vulkan "
-                 "until phase 4b";
-      std::printf("%s: SKIP (%s)\n", r.name.c_str(), r.detail.c_str());
-    } else if (blockedBy) {
+    if (blockedBy) {
       r.status = Status::Skip;
       r.detail = std::string("depends on ") + blockedBy + ", which did not pass";
       std::printf("%s: SKIP (%s)\n", r.name.c_str(), r.detail.c_str());
@@ -370,11 +360,21 @@ int Run(Ctx& c, const Options& opt) {
       std::printf("%s%s", fixed[i].c_str(), i + 1 < fixed.size() ? ", " : "");
     std::printf("\n  (update tests/baseline.json to lock these in)\n");
   }
-  if (!regressions.empty()) {
-    std::printf("\nREGRESSIONS (%zu): ", regressions.size());
-    for (size_t i = 0; i < regressions.size(); i++)
-      std::printf("%s%s", regressions[i].c_str(),
-                  i + 1 < regressions.size() ? ", " : "");
+  // Vulkan runs with --vk-validation: print whatever the messenger collected
+  // during the whole suite (nothing pops a scope mid-run), and let a hazard
+  // turn the run red — a sync-validation message IS a barrier bug (§6.2).
+  const size_t vkMsgs = c.ctx.ReportVkValidation("selftest");
+
+  if (!regressions.empty() || vkMsgs > 0) {
+    if (!regressions.empty()) {
+      std::printf("\nREGRESSIONS (%zu): ", regressions.size());
+      for (size_t i = 0; i < regressions.size(); i++)
+        std::printf("%s%s", regressions[i].c_str(),
+                    i + 1 < regressions.size() ? ", " : "");
+    }
+    if (vkMsgs > 0)
+      std::printf("\nvulkan validation reported %zu message%s (see above)",
+                  vkMsgs, vkMsgs == 1 ? "" : "s");
     std::printf("\n=== selftest FAIL ===\n");
     return 1;
   }

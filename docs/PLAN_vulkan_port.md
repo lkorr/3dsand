@@ -526,6 +526,34 @@ visually equivalent; render ms reported vs Dawn baseline.*
 >   nothing popped a scope in these harnesses before, so a hazard could have
 >   gone unprinted.
 >
+> **[AS BUILT] Phase 4b D2 — all 23 gates run on both backends (2026-08-22).**
+> The `needsRender` skip is gone (the flag survives as documentation in
+> `--list`), the shared offscreen target is created on both backends, and the
+> debris gate's diagnostic screenshot is un-gated. `--selftest --backend
+> vulkan --vk-validation`: **23 gates, exit 0, determinism gate reports the
+> pinned `7cfa2420`, `vulkan validation messages: 0 (clean)`**, and the
+> pass/fail set equals Dawn's exactly — pond-freeze and mob known-failing,
+> with the mob gate's two failing sub-checks (`micro body render: FAIL (10
+> micro slots, 7/14 views drew, ...)` and `avatar: FAIL (... upright=0 ...)`)
+> printing CHARACTER-FOR-CHARACTER identical measured values on both
+> backends. The selftest harness now prints (and fails the run on) any
+> collected Vulkan validation message — a sync-validation hazard is a barrier
+> bug even when every gate is green.
+>
+> **One real barrier bug found and fixed by this deliverable** (the reason the
+> harness reports validation at all): a WRITE_AFTER_WRITE across submits
+> between a queued creation zero-fill and a later Class B data copy — the
+> upload flush ran ahead of the §3.4 head barrier and nothing ordered it
+> against previous submits. §4.1's phase-4b as-built note has the verbatim
+> message and the mechanical fix (one memory barrier at the head of any
+> non-empty flush). The micro-body pool was observably losing limbs to its own
+> creation fill on this GPU.
+>
+> `--vk-smoke-loud` re-run after the render work: 19/19 MATCH, ZERO messages,
+> hashes byte-identical to the phase-3c record (worldgen f97ba745 … t120
+> cb036bd1). Render perf while here: selftest 1080p sweep is 17.4 ms/frame
+> shadows-on / 12.4 shadows-off on Vulkan vs 18.8 / 12.8 on Dawn.
+>
 > **[AS BUILT] Phase 4a — runtime-selectable backends; the real gates run on
 > Vulkan (2026-08-22).** Split off from phase 4: everything except the render
 > path itself.

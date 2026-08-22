@@ -1031,6 +1031,23 @@ than a coincidence; the checker asserts `DirtyIn != DirtyOut` after resolution.
 > its contents are host-produced immediately before each read, and a queued fill
 > for it drains in the same flush as the copies reading it and wipes the staged
 > payloads. Host-write staging is the one exception to §4.8's "fill everything".
+>
+> **[AS BUILT phase 4b] Cross-submit WAW on the flush itself — the third
+> queued-zero-init consequence, found by sync validation the first time the
+> render gates ran.** The §3.4 head barrier is emitted by `Recorder::Begin`
+> AFTER the flush's commands (that order is what makes uploads visible to the
+> recorded rows), so nothing ordered the flush's transfer writes against
+> PREVIOUS submits. Unreachable before zero-init joined the queue: a tick-path
+> upload always targeted a buffer whose prior-submit access was a read. Now a
+> buffer's creation fill can drain in one command buffer and its first Class B
+> data copy in a later one — validation reported it verbatim
+> ("`vkCmdCopyBuffer ... writes to VkBuffer ... previously written by
+> vkCmdFillBuffer (from [another] VkCommandBuffer)`"), and on this GPU the
+> copy could lose the race (the micro-body pool upload lost limbs to its own
+> creation fill — the mob gate's view sweep caught it before the hash could).
+> `FlushUploads` now opens any non-empty flush with one
+> `ALL_COMMANDS/MEMORY_WRITE → ALL_TRANSFER/TRANSFER_WRITE|READ` memory
+> barrier — mechanical, per-flush, never per call site.
 
 ### 4.2 (b) The readback ring on real fences (assumption 10)
 

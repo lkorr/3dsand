@@ -1066,14 +1066,12 @@ int main(int argc, char** argv) {
   // competing for the adapter while phase 3a is still headless.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
-  // --backend vulkan, phase 4a: the rhi:: seam is polymorphic, so the HEADLESS
-  // modes — --selftest, --measure, the smokes — run their real bodies against a
-  // Vulkan-backed World. Gates that need the render path (Gate::needsRender:
-  // screenshots, mob, perf) are SKIPPED with a printed reason, never silently
-  // passed — the render path (swapchain, raster pipelines, imgui_impl_vulkan)
-  // is phase 4b, and a windowed request is still refused rather than silently
-  // served by Dawn: a run reported as Vulkan that was Dawn all along is worse
-  // than no run.
+  // --backend vulkan: every headless mode — --selftest (all 23 gates since
+  // phase 4b), --shot, --shot-mob, --measure, the smokes — runs its real body
+  // against a Vulkan-backed World. Windowed (swapchain + imgui_impl_vulkan) is
+  // phase 4b D3; until it lands a windowed request is refused rather than
+  // silently served by Dawn: a run reported as Vulkan that was Dawn all along
+  // is worse than no run.
   if (backendVulkan && !selftest && !measure && !vkSmoke && !vkSmokeLoud && !shot &&
       shotMob.empty()) {
     std::fprintf(stderr,

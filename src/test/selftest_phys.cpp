@@ -82,10 +82,8 @@ bool debrisOk = false;
 
   // visual proof: render the settled debris field to screenshot_debris.bmp
   // (through the ONE slot walk — game/bodyreg.h — like every render path).
-  // DAWN ONLY: this is a diagnostic bitmap, not the verdict — debrisOk was
-  // computed above from compute + readback, which is why the GATE is not
-  // declared needsRender and still runs its assertions on --backend vulkan.
-  if (debris.BodyCount() > 0 && c.ctx.backendKind == rhi::BackendKind::Dawn) {
+  // Both backends since phase 4b; the verdict above is still compute-only.
+  if (debris.BodyCount() > 0) {
     BodyRegistry bodyReg(debris, c.mobs, nullptr);
     std::vector<BodyVoxInst> inst;
     bodyReg.BuildInstances(inst);

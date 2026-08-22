@@ -709,6 +709,35 @@ void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t 
 }
 
 void Backend::FlushUploads(VkCommandBuffer cmd) {
+  if (pending_.empty()) return;
+
+  // CROSS-SUBMIT ordering for the flush itself (phase 4b, found by sync
+  // validation the first time the render gates ran). The §3.4 head barrier is
+  // emitted by Recorder::Begin AFTER this flush's commands, so it orders the
+  // uploads against everything RECORDED AFTER them — but nothing ordered them
+  // against PREVIOUS submits. That gap was unreachable until zero-init moved
+  // into the queue (§4.8 phase 4a): a buffer's creation fill can now drain in
+  // one command buffer and its first Class B data copy in a LATER one, a WAW
+  // across submits that validation reported verbatim as
+  // "vkCmdCopyBuffer ... writes to VkBuffer ... previously written by
+  // vkCmdFillBuffer (from [another] VkCommandBuffer)". On this GPU the copy
+  // could lose the race and the fill zero freshly-uploaded data (the
+  // micro-body pool lost half its limbs exactly this way). One barrier at the
+  // head of any non-empty flush closes the class: every prior write is made
+  // available/visible to these transfer writes. Emitted mechanically for the
+  // whole flush — never per call site.
+  {
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &mb;
+    dfn_.CmdPipelineBarrier2(cmd, &di);
+  }
+
   // INTRA-FLUSH WAW. Two uploads to one buffer in one flush are transfer
   // writes with no implicit ordering — vkCmdFillBuffer / vkCmdUpdateBuffer /
   // vkCmdCopyBuffer may overlap, and "last write wins" (the queue's contract)
