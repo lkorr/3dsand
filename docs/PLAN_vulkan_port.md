@@ -72,7 +72,11 @@ then a skip-encode-when-provably-empty option.
 - **`--selftest` is the acceptance gate and stays green at every checkpoint.**
   Strategy: Dawn keeps working throughout; Vulkan lands as a second backend
   behind the same seam, validated by cross-backend world-hash equality (same
-  seed + same tick = same hash) before it renders a single pixel.
+  seed + same tick = same hash) before it renders a single pixel. *(This
+  strategy ran its course: Dawn was removed 2026-08-22 once it had agreed with
+  Vulkan on all 23 gates for a full phase. The acceptance gate itself is
+  unchanged, and the cross-backend hashes it produced are now pinned constants
+  in `src/gpu/vk_smoke.cpp`.)*
 
 ## Shader strategy
 
@@ -761,13 +765,12 @@ DESIGN.md risk #3, not closure, unless a second vendor is actually present.
 
 **Phase 6 — switch default; update docs.**
 Default backend → Vulkan. CLAUDE.md build/verify sections updated in the same
-commit (DESIGN.md §12 was already updated when the plan was adopted). Dawn is
-retained through phase 7 purely as the cross-backend hash oracle — the browser
-requirement was dropped 2026-08-22, so once sparse residency is green and a
-second adapter has validated the hash sequence, Dawn (and its ~15-min
-first-configure fetch) is removed in a cleanup commit that also simplifies the
-RHI seam to a single live backend. The seam itself stays: it is what made the
-port testable and it costs nothing to keep.
+commit (DESIGN.md §12 was already updated when the plan was adopted). ~~Dawn is
+retained through phase 7 purely as the cross-backend hash oracle~~ —
+**SUPERSEDED 2026-08-22: the user relaxed cross-backend equality and Dawn was
+removed immediately, before phase 7 rather than after it. See the DAWN REMOVAL
+as-built note below.** The seam itself stays, as this paragraph always said: it
+is what made the port testable and it costs nothing to keep.
 
 > **[AS BUILT] Phase 6 — Vulkan is the default (2026-08-22). Phase 6 complete.**
 >
@@ -831,6 +834,87 @@ port testable and it costs nothing to keep.
 > default, parity is measured, and Dawn is retained because *its job is to
 > disagree*.
 
+> **[AS BUILT] DAWN REMOVAL — executed EARLY, out of phase order (2026-08-22,
+> user decision).** This plan said removal waits until phase 7's page table is
+> validated. It did not: **the user relaxed the cross-backend equality
+> requirement outright** — bit-equality across backends no longer matters, and
+> what matters is that determinism holds ON VULKAN going forward, anchored by
+> the pinned `7cfa2420`. Dawn was retired having already agreed with Vulkan on
+> all 23 gates, character for character, for a full phase (4b→6), so this is
+> early retirement of a proven oracle rather than an abandoned proof.
+>
+> **What was removed:** `rhi_dawn.{h,cpp}`, the Dawn path in `context.cpp`
+> (instance/adapter/surface/RequestDevice and the wgpu Resize/AcquireFrame/
+> Present), `rhi::BackendKind::Dawn` *the enumerator*, the second table walk in
+> `simulation.cpp` (plus `Simulation::BeginPass` and that file's local
+> `CondHolds`/`Extent`, dead with it — `vk_record.cpp` has always carried its
+> own pair), `ImGui_ImplWGPU_*` and `IMGUI_IMPL_WEBGPU_BACKEND_DAWN`, and
+> `dawn::webgpu_dawn`/`webgpu_cpp`/`webgpu_glfw` from every link line
+> including the two CPU-only test harnesses that only ever wanted the include
+> path. `--backend dawn` now REFUSES with an explanation and exit 2 — a run
+> reported as Dawn that was Vulkan all along is worse than no run, the same
+> principle behind phase 3b's refusal.
+>
+> **What was kept, and why the seam did not go with it:** the `rhi::` seam
+> including the polymorphic impl layer. An abstract base with one subclass is
+> one virtual hop on ~60 dispatches a tick, it is what made this port testable
+> phase by phase, and it is the slot phase 7's paged-residency `BufferImpl`
+> plugs into. Removing it is the change that would have to be undone.
+>
+> **Tint stays, and so does the Dawn CHECKOUT — this is the constraint the
+> removal turned on.** `tint_lang_wgsl_reader` + `tint_lang_spirv_writer` are
+> linked into sandvox (WGSL→SPIR-V at load and at every F5; a precompiled
+> `.spv` cannot work because F5 rebuilds the constant prelude from live tuning
+> values) and `tint.exe` is `check_shaders.sh`'s validator. The mechanism that
+> excludes the *engine* without touching Tint: Dawn's own CMakeLists gates
+> `add_subdirectory(src/dawn)` — which is what DEFINES dawn_native,
+> webgpu_dawn, webgpu_cpp and webgpu_glfw — on "at least one
+> `DAWN_ENABLE_<backend>` is ON". With all of them OFF those targets are never
+> declared, so nothing can link them by accident, while
+> `add_subdirectory(src/tint)` is unconditional. `C:/sv-deps` cache semantics
+> and the FetchContent declaration are untouched.
+>
+> **Three traps, all now commented in CMakeLists.txt:** (1)
+> `TINT_BUILD_SPV_WRITER`/`SPV_READER` default to `${DAWN_ENABLE_VULKAN}`, so
+> turning the Dawn Vulkan backend off silently turns off the SPIR-V writer the
+> engine is built on — both forced ON independently. (2) `DAWN_USE_GLFW` must
+> stay ON: that flag is what makes Dawn's `third_party` add the GLFW *library*
+> our `glfw` target comes from (Dawn's own `dawn_glfw` wgpu-surface helper is a
+> different thing, under `src/dawn`, excluded). (3) `Vulkan::Headers` is
+> declared by Dawn only for its own Vulkan backend, so it vanished too — the
+> sources are fetched under `dawn_standalone` regardless, so CMakeLists does
+> that `add_subdirectory` itself behind a `NOT TARGET` guard.
+>
+> **The smokes were repurposed, not deleted (D2).** `--vk-smoke` and
+> `--vk-smoke-loud` now check 5 and 19 probes against **pinned** hash
+> sequences — verbatim the values 10156bb and c0cc28f established under the
+> cross-backend diff. That is more coverage than the diff in one direction (it
+> catches a change that moves *everything* identically, which the diff could
+> not) and less in the other (no disagreement to localise a barrier bug by),
+> and the gap is covered by sync validation, which was always §6.2's PRIMARY
+> detector and needs no divergence to fire. A bug found doing this: the "tick
+> recording" stats line read `LastStats` after the loop and so described a
+> trailing rehash — it is now snapshotted at a representative tick and reprints
+> the phase-3b/4a records exactly (quiet 11/59/2/3/63, loud 20/64/38/5/104).
+>
+> **Measured:** `sandvox.exe` 13,326,336 → 8,099,840 bytes (−39%); 156
+> dawn_native TUs and a 178 MB `webgpu_dawn.lib` no longer built.
+>
+> **Checkpoint evidence (mtime-verified exe):** `--selftest` 23 gates exit 0,
+> `determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)`,
+> pond-freeze + mob known-failing; `--vk-smoke --vk-validation` 5/5 MATCH ZERO
+> messages; `--vk-smoke-loud --vk-validation` 19/19 MATCH ZERO messages, 8
+> shifts / 34059 chunks in store (identical to the phase-3c record);
+> `--frames 300 --vk-validation` clean exit, 0 validation messages;
+> `check_shaders.sh` 12 shaders OK; `check_invariants.py` and
+> `check_pass_table.py` silent.
+>
+> **Deliberately NOT taken, to keep this purely subtractive:** the
+> `simSlimBGL_` collapse (Dawn's 16-entry layout limit is gone; `--vk-info`
+> measures 1048576 per stage) and the indirect staging-copy elimination. Both
+> change descriptor sets or barrier scopes and are their own hash-gated
+> changes.
+
 **Phase 7 — sparse residency (the payoff) — REWRITTEN 2026-08-22 per
 `docs/ROADMAP_scale.md` §1 (user-reviewed): SOFTWARE PAGE TABLE, not
 `VK_KHR_sparse_binding`.** Hardware sparse was validated as *available* on
@@ -849,6 +933,15 @@ becomes moot.
 1. New gate: page alloc/free roundtrip under streaming + mutation.
 2. **Paged-vs-dense hash equality**: same seed, page table on/off, identical
    hash sequence over a scripted scenario including sky-boundary explosions.
+   **This is now THE equality matrix** — with Dawn removed, `vulkan-paged` vs
+   `vulkan-dense` replaces `dawn` vs `vulkan` as the two configurations a
+   sequence is diffed across. `--residency` should reuse the `--vk-smoke`
+   driver rather than build a second one: `RunScenario` in `src/gpu/vk_smoke.cpp`
+   still returns a full probe sequence (not a verdict) and `CompareAndReport`
+   still takes two sequences, kept in that shape deliberately for this.
+   Note what the diff is and is not worth: paged-vs-dense varies the
+   *residency mapping*, not the host layer or the shader compiler, so it is a
+   strong test of the page table and says nothing new about §14 risk #3.
 3. Settled-world resident memory reported; full gate green.
 Window growth (2048³ @ 5 cm per ROADMAP §2) remains its own later milestone
 with fresh measurements.
@@ -894,6 +987,23 @@ explicit heap placement. Re-run `--measure` after each.
 - 2026-08-22 (user): **browser build dropped.** DESIGN.md §1/§12 updated in the
   adoption commit. Dawn's remaining role is reference backend + hash oracle
   during the port; removed after phase 7 validates (see phase 6).
+- 2026-08-22 (user): **DAWN REMOVED EARLY — cross-backend bit-equality is no
+  longer a requirement.** Supersedes the line above: removal was scheduled
+  after phase 7 and executed before it. The user's framing, recorded because it
+  is what licenses the change: what matters is that determinism holds *on
+  Vulkan* going forward, with the pinned `7cfa2420` as the anchor — not that
+  two backends agree. Dawn had already agreed on all 23 gates for a full phase.
+  Consequences folded into the plan: `--vk-smoke`/`--vk-smoke-loud` become
+  pinned-sequence gates (D2), phase 7's equality matrix becomes vulkan-paged vs
+  vulkan-dense, §14 risk #3 narrows to "one vendor, one driver, one compiler,
+  one host layer" and still needs a second vendor to close. The Dawn CHECKOUT
+  and Tint stay — WGSL→SPIR-V at load and F5 depend on them; only the Dawn
+  ENGINE targets are excluded. The `rhi::` seam stays.
+- 2026-08-22: **the now-unlocked simplifications are deliberately deferred**,
+  so the removal commit stayed purely subtractive and its green gate means
+  what it says: `simSlimBGL_` collapse (Dawn's layout-entry limit is gone) and
+  indirect staging-copy elimination. Each changes descriptor sets or barrier
+  scopes, so each is its own hash-gated change.
 - 2026-08-22 (user): **commit at every completed unit of work.** Implementation
   agents commit at green checkpoints with the selftest result in the message;
   never sweep files outside their board claim into a commit.

@@ -26,8 +26,8 @@ constexpr uint32_t kWorldN = 512;
 // Note: at the same kWorldN, smaller voxels shrink the world's physical size.
 constexpr float kVoxelMeters = 0.10f;
 constexpr uint32_t kChunk = 16;
-constexpr uint32_t kNChunk = kWorldN / kChunk;          // 16
-constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 4096
+constexpr uint32_t kNChunk = kWorldN / kChunk;          // 32
+constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 32768
 constexpr uint32_t kChunkVol = kChunk * kChunk * kChunk;      // 4096
 constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
 

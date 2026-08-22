@@ -30,7 +30,7 @@ procedurally generated world, alchemy, spells, and online multiplayer.
 | Rendering | **Ray traversal (DDA) over the voxel grid**, not meshing | Geometry changes every frame; meshing churn would dominate |
 | Rigidbody physics | **Jolt Physics** + custom voxel-terrain collision via localized marching cubes | Don't write a rigidbody solver; Jolt is fast, free, battle-tested |
 | Multiplayer model | **Determinism-first sim discipline now; lockstep vs. server-authoritative decided at M9** | A disciplined integer GPU sim CAN be bit-deterministic across machines — both models stay viable (§10) |
-| Language / API | **C++20 + WGSL, migrating WebGPU (Dawn) → native Vulkan** (2026-08-22; see §12 and docs/PLAN_vulkan_port.md) | Browser requirement dropped 2026-08-22. Vulkan unlocks sparse residency (measured: 83% of the voxel buffer is empty pages — a 1024³ window for less memory than 512³ dense), explicit sync/memory control, async queues. WGSL stays the authoring language via Tint→SPIR-V — zero shader rewrites |
+| Language / API | **C++20 + WGSL on native Vulkan** — port complete, Dawn/WebGPU REMOVED 2026-08-22 (see §12 and docs/PLAN_vulkan_port.md) | Browser requirement dropped 2026-08-22. Vulkan unlocks sparse residency (measured: 83% of the voxel buffer is empty pages — a 1024³ window for less memory than 512³ dense), explicit sync/memory control, async queues. WGSL stays the authoring language via Tint→SPIR-V — zero shader rewrites, and Tint is why the Dawn *checkout* remains a dependency |
 
 ---
 
@@ -2094,11 +2094,11 @@ stays the authoring language** (compiled to SPIR-V via Tint at load, so the
 generated-prelude machinery, F5 hot-reload and `check_shaders.sh` are
 untouched); **the determinism rules survive verbatim** (integer sim kernels,
 no subgroup ops in sim state — Vulkan makes those *available*, not
-*permitted*); and **Dawn is retained during the port** as the reference
+*permitted*); and **Dawn was retained during the port** as the reference
 backend and cross-backend hash oracle (same seed + same tick ⇒ same world
-hash) until Vulkan is fully validated, after which its removal is a decision
-recorded in the plan's decision log. The rationale below is kept as the record
-of why WebGPU was the right call while web was a requirement.
+hash) until Vulkan was validated — it was then removed, per the update two
+paragraphs below. The rationale below is kept as the record of why WebGPU was
+the right call while web was a requirement.
 
 **Update (2026-08-22, phases 4–6): the port LANDED, and Vulkan is now the
 DEFAULT backend.** It runs headless and windowed, all 23 selftest gates, the
@@ -2118,16 +2118,47 @@ should not be quoted from a single run** — the selftest's 1080p sweep varies
 earlier gates leave behind, and the two backends trade places inside that
 spread.
 
-**Dawn is retained deliberately, and its remaining job is to disagree.** Its
-auto-generated barriers are the reference implementation of the barrier graph,
-so `--backend dawn` is the oracle that makes a generated-barrier mistake
-visible as a hash divergence — the only cheap check we have for rule 1 on a
-single-vendor machine (§14 risk #3 is still open; see phase 5 in the plan for
-what closing it needs). Removal waits until the phase-7 software page table is
-validated, and is then a cleanup commit that deletes impl subclasses without
-touching a caller. **The `rhi::` seam stays regardless**: confining the GPU API
-behind ~10 concepts is what made the port testable one phase at a time, and it
-costs nothing to keep.
+**Update (2026-08-22, user decision): DAWN IS REMOVED. The engine is
+Vulkan-only, and the determinism guarantee is now scoped to the Vulkan
+backend.** The previous paragraph planned to keep Dawn until the phase-7 page
+table was validated, because its auto-generated barriers were the reference
+implementation of the barrier graph. The user relaxed that requirement
+explicitly: **cross-backend bit-equality is no longer a goal**, and what
+matters is that rule 1 holds on Vulkan going forward, anchored by the pinned
+golden hash `7cfa2420` in `tests/baseline.json`. Dawn was retired having
+already done its job — it agreed with Vulkan on all 23 gates, character for
+character, for a full phase.
+
+What this costs and what replaces it, stated plainly because rule 1 is
+involved:
+
+- **Lost:** the ability to localise a generated-barrier mistake by
+  disagreement. `--vk-smoke`/`--vk-smoke-loud` no longer diff two backends;
+  they check the world hash at 5 and 19 probes against sequences **pinned as
+  constants** (the values the cross-backend diff agreed on and every phase
+  since has reproduced byte-for-byte). That is *more* coverage in one
+  direction — it catches a change that would have moved both backends
+  identically, which the diff was blind to — and less in the other.
+- **Kept, and it was always the stronger detector:** `VK_LAYER_KHRONOS_-
+  validation` with **synchronization validation**, which reports a hazard from
+  the recorded commands *without needing a divergence to occur*. Every
+  headless path fails the run on a single message. Two real barrier bugs were
+  found this way during the port, neither by hash divergence.
+- **§14 risk #3 stays open and its scope narrows honestly:** it was already
+  "one vendor, one driver, one shader compiler". It is now also one host
+  layer. Closing it still needs a second vendor's hash sequence (plan phase 5
+  option (b)); a CPU Vulkan ICD (lavapipe/SwiftShader) remains the cheap
+  partial step and is *unaffected* by this removal, since it plugs in below
+  our host layer.
+
+**The `rhi::` seam stays, including its polymorphic impl layer.** Confining the
+GPU API behind ~10 concepts is what made the port testable one phase at a time;
+an abstract impl with a single subclass costs one virtual hop on ~60 dispatches
+a tick, and it is the slot phase 7's paged-residency buffer plugs into.
+**Tint stays too, and with it the Dawn checkout** — WGSL→SPIR-V at load and at
+every F5 reload is what keeps WGSL the single shader source of truth. What was
+removed is the Dawn *engine* (dawn_native, webgpu_dawn, webgpu_cpp,
+webgpu_glfw), which is excluded by turning off every `DAWN_ENABLE_<backend>`.
 
 **Adopted (2026-08-19, browser requirement): C++20 + WebGPU + WGSL — Dawn
 (Google's WebGPU implementation, Vulkan backend) for native, Emscripten/WASM for
