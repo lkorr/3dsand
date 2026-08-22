@@ -2693,6 +2693,21 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
    state, or a driver-divergent intrinsic silently breaks cross-GPU reproducibility.
    Mitigation: per-tick world hash asserted in CI-style test runs from M1; validate
    on two GPU vendors early, not at M9.
+   *Status 2026-08-22 (Vulkan port phase 5): still OPEN, but narrowed.* The
+   200-tick hash is now **pinned** to a golden value in `tests/baseline.json`
+   (`7cfa2420`), so a silent drift is a REGRESSION rather than a
+   self-consistent green run — and the full 23-gate suite reproduces it, with
+   character-identical per-gate detail, on **two independent host layers**
+   (Dawn's auto-generated barriers and the Vulkan backend's table-generated
+   ones). That varies the API, the barrier regime and the SPIR-V producer; it
+   does **not** vary the thing this risk is about. This machine exposes exactly
+   one physical device (RTX 3060 Ti — `vulkaninfo --summary` reports one GPU,
+   `--adapter low` finds nothing else, and the i7-11700F has no iGPU), so one
+   vendor, one driver and one shader-compiler back end remain untested against.
+   What closes it is a second vendor's hash *sequence*; `docs/PLAN_vulkan_port.md`
+   phase 5 records the options (a CPU Vulkan ICD such as lavapipe/SwiftShader as
+   a shader-compiler cross-check, or a second physical machine, which is the
+   only one that truly closes it) with their costs.
 4. **Scope** — every system above is the *simple* version of itself on purpose.
    The Noita lesson: they shipped on rules a beginner could write; the magic is
    sleeping, bounding, and content, not clever kernels.

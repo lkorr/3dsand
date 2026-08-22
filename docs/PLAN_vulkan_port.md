@@ -676,6 +676,89 @@ this machine may expose only the 3060 Ti — if so, evaluate lavapipe/SwiftShade
 as a deterministic-CPU cross-check for the hash sequence). Progress on
 DESIGN.md risk #3, not closure, unless a second vendor is actually present.
 
+> **[AS BUILT] Phase 5 — one vendor is all this machine has, and the honest
+> outcome is a documented option list rather than a closed risk (2026-08-22).**
+>
+> **What was enumerated, three independent ways.** `--vk-info` (default) and
+> `--vk-info --adapter low` both select `NVIDIA GeForce RTX 3060 Ti`; the Dawn
+> path prints the same adapter for `--backend dawn` and `--backend dawn
+> --adapter low`; and the SDK's own `vulkaninfo --summary` — which enumerates
+> without any of our selection logic — reports exactly `GPU0`, no GPU1. The
+> `--adapter low` scoring in `Backend::PickPhysicalDevice` is working; there is
+> simply nothing for it to prefer. **The CPU is an i7-11700F** — the `F` suffix
+> is Intel's "no integrated graphics" part — so there is no iGPU to enable in
+> BIOS on this machine, and that option is not merely unused, it is unavailable.
+>
+> **What WAS validated: full 23-gate parity on the one vendor, both backends.**
+>
+> ```
+> $ sandvox --selftest --backend dawn --json p5_dawn.json
+> adapter: NVIDIA GeForce RTX 3060 Ti (backend 6)
+> === selftest === (23 gates, backend dawn)
+> determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)
+> known-failing at baseline (not yours): pond-freeze, mob
+> === selftest PASS === (2 known failures carried)          exit 0
+>
+> $ sandvox --selftest --backend vulkan --vk-validation --json p5_vk.json
+> adapter: NVIDIA GeForce RTX 3060 Ti (backend vulkan)
+> === selftest === (23 gates, backend vulkan)
+> determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)
+> known-failing at baseline (not yours): pond-freeze, mob
+> selftest: vulkan validation messages: 0 (clean)
+> === selftest PASS === (2 known failures carried)          exit 0
+> ```
+>
+> Diffing the two `--json` files gate-by-gate: 23 gates each, identical name
+> set, **zero status differences**, and **zero differences in the reported
+> detail strings** except `perf`, which reports wall-clock (`sim 2.11 ms/tick,
+> best frame 13.21 ms` on Dawn vs `2.06 / 12.57` on Vulkan). Every gate that
+> reports a measured value — hashes, voxel counts, pose angles, the two known
+> failures' assertion text — reports it character-for-character identically
+> across the two backends.
+>
+> **What that is worth, stated precisely.** It is a strong test of *this port*
+> and a weak test of *rule 1*. Two different API host layers, two different
+> barrier regimes (Dawn's auto-generated vs. this port's table-generated), two
+> different SPIR-V producers reaching the driver — agreeing bit-for-bit on 23
+> gates. What it does not vary is the thing risk #3 is actually about: **one
+> vendor, one driver, one shader compiler back end**. An FMA-contraction or
+> transcendental divergence lives below both of our host layers and would agree
+> with itself here just as happily.
+>
+> **Options for closing risk #3, for the user to choose.** None were installed —
+> the brief forbids installing software, and each has a real cost worth deciding
+> deliberately:
+>
+> * **(a) A CPU Vulkan implementation — lavapipe (Mesa) or SwiftShader.** The
+>   strongest available cross-check short of second hardware, and legitimately
+>   so: these are *different compilers* (LLVM/Subzero) emitting for a *different
+>   ISA* (x86 SIMD), so an integer sim kernel that divergently lowers on NVIDIA's
+>   compiler has a genuine chance of lowering differently there. Wiring is
+>   binary-only and needs no code change: drop the ICD and set
+>   `VK_ICD_FILENAMES=<path>\lvp_icd.x86_64.json` (or SwiftShader's
+>   `vk_swiftshader_icd.json`) — our loader is a plain `vulkan-1.dll` walk, so it
+>   picks the override up. Cost: slow. The 23-gate suite is ~50 s on a 3060 Ti;
+>   on lavapipe expect a large multiple, so the realistic scope is the
+>   determinism gate plus `--vk-smoke`/`--vk-smoke-loud`, which is exactly the
+>   hash *sequence* risk #3 wants. Caveat to record if we do it: a CPU ICD is
+>   evidence about the *shader compiler*, not about GPU scheduling — it cannot
+>   surface a race that only a real warp scheduler exposes, which is §7.1's
+>   failure mode.
+> * **(b) Run the suite on a second physical machine.** The only option that
+>   varies the vendor for real (AMD or Intel silicon, ideally). Already
+>   scriptable with no new code: `--selftest --json out.json` produces the
+>   machine-readable per-gate record this note just diffed, and a `.svd` save
+>   round-trips a world for byte-comparison. This is the option that actually
+>   closes risk #3; the others are progress toward it.
+> * **(c) Enable an iGPU in BIOS.** **Ruled out on this machine** — the
+>   i7-11700F has no integrated graphics die. Listed only so the next reader does
+>   not spend an evening in the BIOS looking for it.
+>
+> Risk #3 therefore stays **open**, with its DESIGN.md §14 text updated in the
+> same commit to say what is now true: the hash is pinned and reproduced across
+> two independent host layers on one vendor, and a second vendor's hash sequence
+> is what remains.
+
 **Phase 6 — switch default; update docs.**
 Default backend → Vulkan. CLAUDE.md build/verify sections updated in the same
 commit (DESIGN.md §12 was already updated when the plan was adopted). Dawn is
