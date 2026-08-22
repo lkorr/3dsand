@@ -169,8 +169,18 @@ class Backend {
   Buffer* CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char* label);
 
   // vkCmdFillBuffer(0) over every registered buffer, in one command buffer,
-  // submitted and waited. Called once after all buffers exist.
+  // submitted and waited. Called once after all buffers exist (--vk-info's
+  // explicit path; the seam relies on the queued per-buffer fill below).
   bool ZeroInitAll(std::string& err);
+
+  // Free a buffer created by CreateBuffer, DEFERRED until every submit that was
+  // in flight at the call has retired (phase 4a). The seam's rhi::Buffer
+  // handles are refcounted and gates create/drop large staging buffers freely —
+  // WebGPU frees them on release, so leaving them in the registry until
+  // Shutdown would leak a 512 MiB staging read per whole-world gate.
+  // Precondition kept by construction: only ad-hoc staging is ever destroyed
+  // this way; buffers referenced by descriptor sets live for the device's life.
+  void DestroyBufferDeferred(Buffer* b);
 
   // ---- uploads (barrier_graph §4.1) ----
   //
@@ -199,6 +209,9 @@ class Backend {
   // Ends and submits `cmd` with a fence from the pool. Returns the fence, which
   // the caller may poll; it is retired automatically once signalled.
   VkFence SubmitCommands(VkCommandBuffer cmd, std::string& err);
+  // Submit a command buffer the caller ALREADY ended (the seam's
+  // CommandEncoder::Finish ends it, matching wgpu's Finish/Submit split).
+  VkFence SubmitEnded(VkCommandBuffer cmd, std::string& err);
   bool WaitIdle(std::string& err);
   // Retire any signalled fences: reclaims staging-ring regions and command
   // buffers. Non-blocking; this is ProcessEvents()' replacement.
@@ -283,12 +296,29 @@ class Backend {
     // Class B: offset into the staging ring.
     uint64_t stagingOffset = 0;
     bool classA = true;
+    // Zero-init (§4.8, phase 4a form): a whole-buffer vkCmdFillBuffer(0),
+    // queued by CreateBuffer itself so it drains at the head of the next
+    // command buffer — BEFORE any recorded use of the buffer, in issue order,
+    // so a data upload queued after creation still wins. This replaced the
+    // one-shot ZeroInitAll submit when buffer creation moved behind the seam
+    // (buffers are now created at many times, not one init moment).
+    bool zeroFill = false;
   };
 
   struct InFlight {
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     uint64_t stagingHigh = 0;  // ring high-water at submit; reclaimed on retire
+    uint64_t serial = 0;       // submit order, for the buffer graveyard
+  };
+
+  // A buffer whose seam handle was released while submits that might reference
+  // it were still in flight. Freed once every submit with serial <= `serial`
+  // has retired.
+  struct Doomed {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    uint64_t serial = 0;
   };
 
   bool PickPhysicalDevice(bool lowPower, std::string& err);
@@ -322,6 +352,8 @@ class Backend {
   uint64_t stagingHead_ = 0;
 
   std::vector<InFlight> inFlight_;
+  uint64_t submitSerial_ = 0;
+  std::vector<Doomed> graveyard_;
   std::vector<VkFence> freeFences_;
   // Borrow counts for fences pinned by RetainFence. A fence with a non-zero
   // count is never returned to freeFences_, so a borrower's handle stays valid

@@ -40,7 +40,17 @@ class PassTimer {
 
   // Begin a compute pass with timestamps attached. Falls back to an untimed
   // pass if the query set is full or unavailable, so encoding never fails.
+  // DAWN PATH ONLY — the Vulkan recorder has no compute-pass concept and takes
+  // its (begin, end) indices through AllocPassPair below instead.
   rhi::ComputePass BeginPass(const rhi::CommandEncoder& enc, const char* name);
+
+  // Vulkan path (--measure --backend vulkan): hand out a (begin, end) query
+  // index pair for a named pass — the bookkeeping of BeginPass without the
+  // encoder. Returns false when the set is full or absent (pass goes untimed).
+  // The vk recorder writes the timestamps itself at its group transitions.
+  bool AllocPassPair(const char* name, uint32_t& beginIdx, uint32_t& endIdx);
+  // The query set handle, for the recorder's timestamp writes.
+  const rhi::QuerySet& NativeQuerySet() const { return querySet_; }
 
   // Called once per command buffer, immediately before enc.Finish(): resolves
   // the query set into the resolve buffer and copies it to the readback

@@ -126,6 +126,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
 void Recorder::Begin(VkCommandBuffer cmd) {
   cmd_ = cmd;
   for (auto& s : state_) s = BufState{};
+  extra_.clear();
   pending_.clear();
   hostWritten_.clear();
 
@@ -172,10 +173,30 @@ void Recorder::Sledgehammer() {
 //     written here. That is safe ONLY because of §3.4's head barrier; it does
 //     not mean buffers start clean.
 // ---------------------------------------------------------------------------
-void Recorder::TouchBuffer(pass::Buf id, pass::Acc acc) {
-  Buffer* buf = bind_.buffers[(int)id];
+void Recorder::TouchBuffer(pass::Buf id, pass::Acc acc, Buffer* explicitBuf) {
+  // The off-table paths pass the concrete buffer alongside the id (phase 4a),
+  // so the tracker works even in an encoder whose bindings were never set (the
+  // eviction command buffer). A table row leaves explicitBuf null and resolves
+  // through the bindings, exactly as before.
+  Buffer* buf = explicitBuf ? explicitBuf : bind_.buffers[(int)id];
   if (!buf || !buf->buf) return;  // not bound in this configuration
-  BufState& s = state_[(int)id];
+  TouchState(state_[(int)id], buf->buf, acc);
+}
+
+// §3.3 against a pointer-keyed side state, for buffers with no pass::Buf id.
+void Recorder::TouchExtra(Buffer* buf, pass::Acc acc) {
+  if (!buf || !buf->buf) return;
+  for (auto& e : extra_) {
+    if (e.first == buf) {
+      TouchState(e.second, buf->buf, acc);
+      return;
+    }
+  }
+  extra_.push_back({buf, BufState{}});
+  TouchState(extra_.back().second, buf->buf, acc);
+}
+
+void Recorder::TouchState(BufState& s, VkBuffer buf, pass::Acc acc) {
   const Scope u = Map(acc);
 
   if (u.write) {
@@ -189,7 +210,7 @@ void Recorder::TouchBuffer(pass::Buf id, pass::Acc acc) {
       b.dstAccessMask = u.access;
       b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      b.buffer = buf->buf;
+      b.buffer = buf;
       b.offset = 0;
       b.size = VK_WHOLE_SIZE;  // §2.2: whole-buffer granularity, deliberately
       pending_.push_back(b);
@@ -215,7 +236,7 @@ void Recorder::TouchBuffer(pass::Buf id, pass::Acc acc) {
       b.dstAccessMask = u.access;
       b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      b.buffer = buf->buf;
+      b.buffer = buf;
       b.offset = 0;
       b.size = VK_WHOLE_SIZE;
       pending_.push_back(b);
@@ -312,6 +333,53 @@ void Recorder::ApplyUses(const pass::Use* uses, int count, bool global) {
   FlushPending(global);
 }
 
+void Recorder::DeclareUse(Buffer* b, pass::Acc acc) {
+  if (!b || !b->buf) return;
+  bool table = false;
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    if (bind_.buffers[i] == b) {
+      TouchBuffer((pass::Buf)i, acc);
+      table = true;
+    }
+  if (!table) TouchExtra(b, acc);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+  if (b->mapped && Map(acc).write) hostWritten_.push_back(b);
+}
+
+void Recorder::SetTimer(VkQueryPool pool,
+                        std::function<bool(const char*, uint32_t&, uint32_t&)> alloc) {
+  timerPool_ = pool;
+  timerAlloc_ = std::move(alloc);
+}
+
+// --measure only. Begin latches at TOP_OF_PIPE (waits for nothing), end at
+// ALL_COMMANDS (all previous work complete) — the same span Dawn's
+// beginning/end-of-pass timestamp writes cover. The sim's recording is
+// serialized by the generated barriers anyway, so per-group spans do not
+// overlap and the numbers compare directly against the Dawn baseline.
+void Recorder::TimerOpen(const char* group) {
+  if (timerPool_ == VK_NULL_HANDLE || !timerAlloc_ || !group) return;
+  uint32_t b = 0, e = 0;
+  if (!timerAlloc_(group, b, e)) return;  // pool full: untimed, like BeginPass
+  be_.Fns().CmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, timerPool_, b);
+  timerGroup_ = group;
+  timerEndIdx_ = e;
+}
+
+void Recorder::TimerClose() {
+  if (timerGroup_ == nullptr) return;
+  if (timerEndIdx_ != UINT32_MAX)
+    be_.Fns().CmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, timerPool_,
+                                 timerEndIdx_);
+  timerGroup_ = nullptr;
+  timerEndIdx_ = UINT32_MAX;
+}
+
 void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
   const vkl::DeviceFns& f = be_.Fns();
 
@@ -328,6 +396,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     stats_.rows++;
 
     if (r.kind == pass::Kind::Fill) {
+      TimerClose();  // a Fill/Copy row ends the open Dawn pass; mirror it
       ApplyUses(r.uses, r.useCount, /*global=*/false);
       Buffer* b = bind_.buffers[(int)r.uses[0].buf];
       if (b && b->buf) f.CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
@@ -336,6 +405,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     }
 
     if (r.kind == pass::Kind::Copy) {
+      TimerClose();
       ApplyUses(r.uses, r.useCount, /*global=*/false);
       // Copy rows carry (srcOffset, dstOffset, size) in x/y/z and exactly two
       // uses: the transfer read, then the transfer write.
@@ -360,6 +430,13 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     // is purely a name here. Phase 4's PassTimer will hang timestamps off it.
     VkPipeline pipe = bind_.pipelines[(int)r.pipe];
     if (pipe == VK_NULL_HANDLE) continue;
+
+    // --measure: the row's `group` label is exactly where Dawn opens/closes a
+    // ComputePassEncoder, so the timestamp pair spans the same rows.
+    if (timerPool_ != VK_NULL_HANDLE && r.group != timerGroup_) {
+      TimerClose();
+      TimerOpen(r.group);
+    }
 
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -432,6 +509,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
       stats_.dispatches++;
     }
   }
+  TimerClose();
 }
 
 void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
@@ -439,19 +517,32 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
   if (!src || !dst || !src->buf || !dst->buf) return;
   // Off-table copies still go through the tracker: the source's last writer
   // must be ordered ahead of the transfer read, and the destination must be
-  // registered for the Finish() host barrier. There is no id for a staging
-  // buffer, so the source hazard is expressed directly rather than through a
-  // Buf enum — the ONE place a scope is written outside a table row, and it is
-  // a read of a buffer whose state the tracker already holds.
-  //
-  // The source is always `voxels` or `hash` in practice; look it up by pointer
-  // so the tracker state that exists is used rather than bypassed.
-  for (int i = 0; i < (int)pass::Buf::kCount; i++) {
-    if (bind_.buffers[i] == src) {
-      ApplyUses(nullptr, 0, false);  // flush anything pending first
-      pass::Use u{(pass::Buf)i, pass::Acc::TransferRead};
-      ApplyUses(&u, 1, false);
-      break;
+  // registered for the Finish() host barrier. A src/dst that is a bound table
+  // buffer is found by POINTER and uses its table state; one that is not (a
+  // staging buffer, the timer resolve buffer) is tracked by pointer in the
+  // side table, so ad-hoc transfer chains barrier correctly too. Either way
+  // the scope is DERIVED — nothing here writes one by hand.
+  {
+    bool srcTable = false, dstTable = false;
+    for (int i = 0; i < (int)pass::Buf::kCount; i++) {
+      if (bind_.buffers[i] == src) {
+        TouchBuffer((pass::Buf)i, pass::Acc::TransferRead);
+        srcTable = true;
+      }
+      if (bind_.buffers[i] == dst) {
+        TouchBuffer((pass::Buf)i, pass::Acc::TransferWrite);
+        dstTable = true;
+      }
+    }
+    if (!srcTable) TouchExtra(src, pass::Acc::TransferRead);
+    if (!dstTable) TouchExtra(dst, pass::Acc::TransferWrite);
+    if (mode_ == BarrierMode::Sledgehammer) {
+      // Same A/B discipline as ApplyUses: the tracker state was updated above,
+      // the derived barriers are discarded and replaced by a full one.
+      pending_.clear();
+      Sledgehammer();
+    } else {
+      FlushPending(/*global=*/false);
     }
   }
   VkBufferCopy region{};
@@ -463,6 +554,28 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
   if (dst->mapped) hostWritten_.push_back(dst);
 }
 
+void Recorder::FillUntracked(Buffer* dst, uint64_t offset, uint64_t size) {
+  if (!dst || !dst->buf) return;
+  bool dstTable = false;
+  for (int i = 0; i < (int)pass::Buf::kCount; i++) {
+    if (bind_.buffers[i] == dst) {
+      TouchBuffer((pass::Buf)i, pass::Acc::TransferWrite);
+      dstTable = true;
+    }
+  }
+  if (!dstTable) TouchExtra(dst, pass::Acc::TransferWrite);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+  be_.Fns().CmdFillBuffer(cmd_, dst->buf, offset,
+                          size == UINT64_MAX ? VK_WHOLE_SIZE : size, 0);
+  stats_.fills++;
+  if (dst->mapped) hostWritten_.push_back(dst);
+}
+
 // ---------------------------------------------------------------------------
 // Off-table copies with a TRACKED source (phase 3c). See vk_record.h for why
 // the readback and eviction copies are Uses rather than Rows.
@@ -471,12 +584,27 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
 // scope: each declares what it touches as a `pass::Use` and lets §3.3 derive
 // the barrier from the live tracker state, exactly as a row does.
 // ---------------------------------------------------------------------------
-void Recorder::CopyTracked(pass::Buf src, uint64_t srcOffset, Buffer* dst,
+void Recorder::CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buffer* dst,
                            uint64_t dstOffset, uint64_t size) {
-  Buffer* s = bind_.buffers[(int)src];
+  // The concrete buffer comes from the CALLER (phase 4a: seam call sites carry
+  // both the id and the buffer), so this works in an encoder whose bindings
+  // were never set — the eviction command buffer. When bindings ARE set they
+  // must agree with the caller; the tracker state is keyed by the id either way.
+  Buffer* s = src ? src : bind_.buffers[(int)srcId];
   if (!s || !s->buf || !dst || !dst->buf) return;
-  pass::Use u{src, pass::Acc::TransferRead};
-  ApplyUses(&u, 1, /*global=*/false);
+  TouchBuffer(srcId, pass::Acc::TransferRead, s);
+  // The destination is deliberately NOT write-tracked here: every CopyTracked
+  // destination is a readback slot or an eviction staging buffer whose copies
+  // land in DISJOINT ranges and whose only reader is the HOST behind a fence +
+  // the Finish() barrier — a per-copy WAW would order writes that cannot alias
+  // (and did not exist in the 3c recording this reproduces). The generic
+  // CopyToHost path, whose destinations can be re-read on the GPU, does track.
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
 
   VkBufferCopy region{};
   region.srcOffset = srcOffset;
@@ -487,14 +615,19 @@ void Recorder::CopyTracked(pass::Buf src, uint64_t srcOffset, Buffer* dst,
   if (dst->mapped) hostWritten_.push_back(dst);
 }
 
-void Recorder::FillTracked(pass::Buf dst) {
-  Buffer* b = bind_.buffers[(int)dst];
+void Recorder::FillTracked(pass::Buf id, Buffer* dst) {
+  Buffer* b = dst ? dst : bind_.buffers[(int)id];
   if (!b || !b->buf) return;
   // TransferWrite against a buffer the tracker has just seen a TransferRead on
   // produces the WAR barrier of §7.4 automatically. That is the entire point of
   // routing this through the tracker rather than calling CmdFillBuffer here.
-  pass::Use u{dst, pass::Acc::TransferWrite};
-  ApplyUses(&u, 1, /*global=*/false);
+  TouchBuffer(id, pass::Acc::TransferWrite, b);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
   be_.Fns().CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
   stats_.fills++;
 }

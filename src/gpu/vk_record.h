@@ -136,6 +136,13 @@ class Recorder {
   Recorder(Backend& be, const Bindings& bind, BarrierMode mode)
       : be_(be), bind_(bind), mode_(mode) {}
 
+  // Replace the bindings mid-recording. Exists for the seam encoder (rhi_vk.cpp),
+  // which is constructed before Simulation resolves the page-symbolic ids and
+  // receives them at the first RecordTable bridge call. Within one command
+  // buffer every caller supplies the SAME resolution (the page cannot flip
+  // mid-buffer — FlipPage runs after submit), so tracker state stays coherent.
+  void SetBindings(const Bindings& b) { bind_ = b; }
+
   // Open a recording on `cmd`. Emits the head-of-command-buffer global memory
   // barrier that makes "the tracker resets per command buffer" sound
   // (barrier_graph §3.4): submission order gives execution ordering between
@@ -154,12 +161,32 @@ class Recorder {
   // been walked would get behind an index-anchored barrier (§2.4 phase 7b).
   void Finish();
 
-  // Record a copy that is not a table row — the blocking-readback path, whose
-  // destination is a host-visible staging buffer. Still goes through the
-  // tracker (so the source's last writer is ordered ahead of the read) and
-  // still registers the destination for the Finish() host barrier.
+  // Record a copy that is not a table row and carries no pass::Buf id — the
+  // blocking-readback path and the seam's generic CopyBufferToBuffer. Still
+  // goes through the tracker: a src/dst that IS a bound table buffer is found
+  // by pointer and its hazard derived; one that is not is tracked by POINTER in
+  // the side table (see extra_ below), so ad-hoc transfer chains (query-resolve
+  // -> staging, repeated writes into one staging buffer) barrier correctly too.
+  // The destination is registered for the Finish() host barrier when mapped.
   void CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst, uint64_t dstOffset,
                   uint64_t size);
+  // vkCmdFillBuffer with no pass::Buf id — the seam's generic ClearBuffer.
+  // Same pointer-derived tracking as CopyToHost.
+  void FillUntracked(Buffer* dst, uint64_t offset, uint64_t size);
+
+  // Declare an access performed by a command the recorder does not itself
+  // issue (vkCmdCopyQueryPoolResults writing the timer resolve buffer). The
+  // hazard against/for it is still DERIVED by the tracker; call BEFORE
+  // recording the command, like every row's ApplyUses.
+  void DeclareUse(Buffer* b, pass::Acc acc);
+
+  // --measure (phase 4a D4): write a GPU timestamp pair around each run of
+  // rows sharing a `group` label, mirroring Dawn's per-ComputePassEncoder
+  // timestamps. `alloc` hands out (begin, end) query indices for a named pass
+  // and may refuse (pool full) — the pass then simply goes untimed, matching
+  // PassTimer::BeginPass's fallback.
+  void SetTimer(VkQueryPool pool,
+                std::function<bool(const char*, uint32_t&, uint32_t&)> alloc);
 
   // ---- off-table copies whose SOURCE is a tracked table buffer -------------
   //
@@ -189,18 +216,21 @@ class Recorder {
   // here writes a scope by hand.
 
   // Copy from a tracked table buffer into an untracked destination (a readback
-  // slot, an eviction staging buffer). The source hazard is derived; the
-  // destination is registered for the Finish() host barrier when host-visible.
-  void CopyTracked(pass::Buf src, uint64_t srcOffset, Buffer* dst, uint64_t dstOffset,
-                   uint64_t size);
+  // slot, an eviction staging buffer). The source hazard is derived from the id
+  // against the tracker; the destination is registered for the Finish() host
+  // barrier when host-visible. `src` is the CONCRETE buffer (phase 4a: the seam
+  // call sites carry both the id and the buffer, so this works in encoders
+  // whose bindings were never set — the eviction command buffer).
+  void CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buffer* dst,
+                   uint64_t dstOffset, uint64_t size);
 
   // vkCmdFillBuffer over a tracked table buffer, off-table. This exists for
-  // exactly one caller: `EncodeReadbacks`' `ClearBuffer(support)` immediately
-  // after copying support out (barrier_graph §7.4's T76 -> T77). That pair is a
+  // exactly one caller: `EncodeReadbacks`' support clear immediately after
+  // copying support out (barrier_graph §7.4's T76 -> T77). That pair is a
   // genuine transfer-read -> transfer-write WAR on one buffer and is the case
   // most likely to be dismissed as "just two copies"; routing the fill through
   // the tracker is what makes the WAR fall out instead of being remembered.
-  void FillTracked(pass::Buf dst);
+  void FillTracked(pass::Buf id, Buffer* dst);
 
   const RecordStats& Stats() const { return stats_; }
 
@@ -212,7 +242,14 @@ class Recorder {
   void ApplyUses(const pass::Use* uses, int count, bool global);
   // One buffer's worth of the above; appends to pending_ rather than emitting,
   // so a row's barriers batch into ONE vkCmdPipelineBarrier2 (§3.5).
-  void TouchBuffer(pass::Buf id, pass::Acc acc);
+  // `explicitBuf` overrides the bindings lookup (the off-table paths pass the
+  // concrete buffer alongside the id; table rows leave it null).
+  void TouchBuffer(pass::Buf id, pass::Acc acc, Buffer* explicitBuf = nullptr);
+  // §3.3 against a POINTER-keyed side state (untracked buffers: staging,
+  // query-resolve). Same algorithm, same pending_ batch.
+  void TouchExtra(Buffer* buf, pass::Acc acc);
+  // §3.3's core on one (buffer, state) pair; shared by the two Touch* above.
+  void TouchState(BufState& s, VkBuffer buf, pass::Acc acc);
   void FlushPending(bool global);
   // The sledgehammer: a full ALL_COMMANDS/MEMORY_READ|WRITE barrier. Emitted
   // before every command in that mode, INSTEAD of the derived ones.
@@ -222,18 +259,32 @@ class Recorder {
   static uint32_t Extent(uint32_t v, const RecordCtx& cx);
   static bool CondHolds(pass::Cond c, const RecordCtx& cx);
 
+  // --measure: open/close the timestamp pair at group transitions.
+  void TimerOpen(const char* group);
+  void TimerClose();
+
   Backend& be_;
   Bindings bind_;
   BarrierMode mode_ = BarrierMode::Precise;
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
 
   BufState state_[(int)pass::Buf::kCount] = {};
+  // Last-access state for buffers with no pass::Buf id (staging destinations,
+  // the timer resolve buffer), keyed by pointer. Never more than a handful per
+  // command buffer; linear scan is fine.
+  std::vector<std::pair<Buffer*, BufState>> extra_;
   std::vector<VkBufferMemoryBarrier2> pending_;
   // Host-visible buffers written during this recording, for the Finish()
   // barrier. Kept as a small vector rather than a set: it is never more than a
   // handful and order does not matter.
   std::vector<Buffer*> hostWritten_;
   RecordStats stats_{};
+
+  // --measure timer state (null/absent in every non-measure run).
+  VkQueryPool timerPool_ = VK_NULL_HANDLE;
+  std::function<bool(const char*, uint32_t&, uint32_t&)> timerAlloc_;
+  const char* timerGroup_ = nullptr;   // open group label, null when closed
+  uint32_t timerEndIdx_ = UINT32_MAX;  // end query index of the open pair
 };
 
 }  // namespace vk

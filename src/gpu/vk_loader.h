@@ -149,6 +149,8 @@ struct DeviceFns {
   PFN_vkDestroyQueryPool DestroyQueryPool = nullptr;
   PFN_vkCmdResetQueryPool CmdResetQueryPool = nullptr;
   PFN_vkCmdWriteTimestamp CmdWriteTimestamp = nullptr;
+  PFN_vkCmdWriteTimestamp2 CmdWriteTimestamp2 = nullptr;
+  PFN_vkCmdCopyQueryPoolResults CmdCopyQueryPoolResults = nullptr;
   PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
 };
 

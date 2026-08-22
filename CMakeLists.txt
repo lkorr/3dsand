@@ -216,8 +216,8 @@ add_executable(sandvox
   src/gpu/vk_vma.cpp
   src/gpu/vk_spirv.cpp
   src/gpu/rhi_vulkan.cpp
+  src/gpu/rhi_vk.cpp
   src/gpu/vk_record.cpp
-  src/gpu/vk_sim.cpp
   src/gpu/vk_info.cpp
   src/gpu/vk_smoke.cpp
   src/measure/measure.cpp

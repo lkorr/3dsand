@@ -6,14 +6,19 @@
 #include <webgpu/webgpu_glfw.h>
 
 #include "gpu/rhi_dawn.h"
+#include "gpu/rhi_vk.h"
+#include "gpu/rhi_vulkan.h"
 
-// Dawn-private state. Everything in this struct disappears when phase 3 adds a
-// Vulkan backend behind the same GpuContext API.
+// Backend-private state: the Dawn members when backendKind is Dawn, the
+// vk::Backend when it is Vulkan (phase 4a runtime selection).
 struct GpuContext::Backend {
   wgpu::Instance instance;
   wgpu::Adapter adapter;
   wgpu::Surface surface;
+  std::shared_ptr<vk::Backend> vk;
 };
+
+vk::Backend* GpuContext::VkBackend() const { return back_ ? back_->vk.get() : nullptr; }
 
 static void PrintDeviceError(const wgpu::Device&, wgpu::ErrorType type,
                              wgpu::StringView message) {
@@ -22,10 +27,46 @@ static void PrintDeviceError(const wgpu::Device&, wgpu::ErrorType type,
 }
 
 bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
-                      bool lowPowerAdapter, bool wantTimestamps) {
+                      bool lowPowerAdapter, bool wantTimestamps,
+                      rhi::BackendKind backend, bool vkValidation,
+                      bool vkSledgehammer) {
   width = w;
   height = h;
+  backendKind = backend;
   back_ = std::make_shared<Backend>();
+
+  if (backend == rhi::BackendKind::Vulkan) {
+    // HEADLESS ONLY until phase 4b: no swapchain, no surface, no ImGui. A
+    // windowed request is refused rather than silently served by Dawn — a run
+    // reported as Vulkan that was Dawn all along is worse than no run.
+    if (window) {
+      std::fprintf(stderr,
+                   "--backend vulkan cannot present until phase 4b (render "
+                   "path); use a headless mode\n");
+      return false;
+    }
+    back_->vk = std::make_shared<vk::Backend>();
+    std::string err;
+    // Sync validation follows validation: it is the barrier document's primary
+    // detector for a missing barrier (§6.2).
+    if (!back_->vk->Init(lowPowerAdapter, vkValidation, vkValidation, err)) {
+      std::fprintf(stderr, "Vulkan backend init failed: %s\n", err.c_str());
+      return false;
+    }
+    const vk::Caps& caps = back_->vk->GetCaps();
+    std::printf("adapter: %s (backend vulkan)\n", caps.deviceName.c_str());
+    if (caps.validationEnabled)
+      std::printf("  validation layer: ENABLED   sync validation: %s\n",
+                  caps.syncValidationEnabled ? "ENABLED" : "off");
+    device = rhi::vkr::WrapDevice(back_->vk, vkSledgehammer);
+    queue = device.GetQueue();
+    surfaceFormat = rhi::TextureFormat::RGBA8Unorm;  // headless placeholder
+    timestampsEnabled = wantTimestamps && caps.timestampQuery;
+    // Vulkan reports raw ticks; the period converts them to nanoseconds in
+    // PassTimer::Collect (1.0 on this device, but never assumed).
+    timestampPeriodNs = caps.timestampPeriodNs;
+    return true;
+  }
 
   wgpu::InstanceDescriptor idesc{};
   static const auto kTimedWaitAny = wgpu::InstanceFeatureName::TimedWaitAny;
@@ -150,6 +191,7 @@ void GpuContext::Resize(uint32_t w, uint32_t h) {
 }
 
 rhi::TextureView GpuContext::AcquireFrame() {
+  if (!back_ || !back_->surface) return {};
   wgpu::SurfaceTexture st{};
   back_->surface.GetCurrentTexture(&st);
   if (st.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
@@ -159,7 +201,9 @@ rhi::TextureView GpuContext::AcquireFrame() {
   return rhi::dawn::WrapTextureView(st.texture.CreateView());
 }
 
-void GpuContext::Present() { back_->surface.Present(); }
+void GpuContext::Present() {
+  if (back_ && back_->surface) back_->surface.Present();
+}
 
 void GpuContext::ProcessEvents() { device.ProcessEvents(); }
 

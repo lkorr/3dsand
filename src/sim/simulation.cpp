@@ -4,6 +4,7 @@
 #include <cstdio>
 
 #include "gpu/resources.h"
+#include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
 // when the Vulkan recorder became a second consumer of it — see the note there.
@@ -466,6 +467,19 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2");
   pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve");
 
+  // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
+  // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
+  // async error scope and always returns a valid handle, so this check is free
+  // there — but on Vulkan a null pipeline would make the recorder silently
+  // skip the row, which is a wrong SIM, not a crash. Fail the build instead.
+  if (!worldgen_ || !worldgenList_ || !farFill_ || !farDown_ || !mutate_ ||
+      !mutateCells_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
+      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_) {
+    if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
+    return false;
+  }
+
   raymarchModule_ = mRay;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
@@ -651,6 +665,43 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
 void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
                              const void* ctxOpaque) {
   const RecordCtx& cx = *(const RecordCtx*)ctxOpaque;
+
+  // -------------------------------------------------------------------------
+  // VULKAN (phase 4a): the SAME table, walked by the generated-barrier
+  // recorder. Barrier generation stays exactly the phase-3b shape — the rows
+  // are the recorder's loop variable, never a parameter — and what crosses the
+  // bridge is only the RESOLUTION: the page-symbolic ids and the pipelines,
+  // resolved by the very same PassBuffer/PassPipeline the Dawn walk below uses.
+  // This is what deleted vk_sim.cpp's parallel copy of that resolution.
+  // -------------------------------------------------------------------------
+  if (device_.Kind() == rhi::BackendKind::Vulkan) {
+    rhi::TableCtx tc{};
+    tc.opsCount = cx.opsCount;
+    tc.cellCount = cx.cellCount;
+    tc.expCount = cx.expCount;
+    tc.spawnCount = cx.spawnCount;
+    tc.genCount = cx.genCount;
+    tc.farCount = cx.farCount;
+    tc.hashEnable = cx.hashEnable;
+    tc.particlesActive = cx.particlesActive;
+
+    rhi::TableBindings tb{};
+    for (int i = 0; i < (int)pass::Buf::kCount; i++)
+      tb.buffers[i] = PassBuffer((pass::Buf)i);
+    for (int i = 1; i < (int)pass::Pipe::FarDown + 1; i++)
+      tb.pipelines[i] = PassPipeline((pass::Pipe)i);
+    tb.simLayout = simPL_;
+    tb.slimPartLayout = simPL2_;
+    tb.slimFarLayout = farPL_;
+    tb.simSet = simBG_[page_];
+    tb.slimSet = simSlimBG_[page_];
+    tb.particleSet = particleBG_[page_];
+    tb.farSet = farBG_;
+
+    rhi::RecordTableVulkan(enc, which, tc, tb,
+                           passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
+    return;
+  }
 
   rhi::ComputePass open;
   const char* openGroup = nullptr;

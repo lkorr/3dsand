@@ -138,6 +138,8 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(DestroyQueryPool);
   VKL_D(CmdResetQueryPool);
   VKL_D(CmdWriteTimestamp);
+  VKL_D(CmdWriteTimestamp2);
+  VKL_D(CmdCopyQueryPoolResults);
   VKL_D(GetQueryPoolResults);
 #undef VKL_D
 }

@@ -521,7 +521,49 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
   Buffer* raw = b.get();
   // The zero-init REGISTRY. Every buffer, no exceptions, no opt-out.
   buffers_.push_back(std::move(b));
+
+  // Zero-init, queued (§4.8, phase 4a form): a whole-buffer fill rides the
+  // pending-upload queue in ISSUE ORDER, so it drains at the head of the next
+  // recorded command buffer — before any recorded use, and before any data
+  // upload queued after creation (which therefore still wins). This is what
+  // lets buffers be created at ANY time behind the seam (gate staging, the
+  // eviction pool) and still start life zeroed the way WebGPU guarantees.
+  // Precondition: no command buffer that uses the new buffer is OPEN at
+  // creation time — true for every call site (buffers are always created
+  // before their encoder), and the seam keeps it that way.
+  //
+  // EXCEPTION: MapWrite (host-write staging — the Class B ring). Its contents
+  // are host-produced immediately before every GPU read, so a queued GPU fill
+  // is not just useless — it drains in the same flush as the copies that read
+  // the ring and ZEROES the freshly staged payloads. The material table went
+  // flat that way (a frozen world, not a crash); host-write staging is never
+  // GPU-zeroed.
+  if (!rhi::Any(usage, rhi::BufferUsage::MapWrite)) {
+    Pending p;
+    p.dst = raw;
+    p.dstOffset = 0;
+    p.size = size;
+    p.zeroFill = true;
+    p.classA = false;
+    pending_.push_back(std::move(p));
+  }
   return raw;
+}
+
+void Backend::DestroyBufferDeferred(Buffer* b) {
+  if (!b) return;
+  for (size_t i = 0; i < buffers_.size(); i++) {
+    if (buffers_[i].get() != b) continue;
+    // Drop any still-pending upload aimed at it (a queued zero-fill for a
+    // buffer nothing ever used, typically).
+    for (size_t k = 0; k < pending_.size();) {
+      if (pending_[k].dst == b) pending_.erase(pending_.begin() + k);
+      else k++;
+    }
+    if (b->buf) graveyard_.push_back({b->buf, b->alloc, submitSerial_});
+    buffers_.erase(buffers_.begin() + i);
+    return;
+  }
 }
 
 bool Backend::ZeroInitAll(std::string& err) {
@@ -583,8 +625,38 @@ void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t 
 }
 
 void Backend::FlushUploads(VkCommandBuffer cmd) {
+  // INTRA-FLUSH WAW. Two uploads to one buffer in one flush are transfer
+  // writes with no implicit ordering — vkCmdFillBuffer / vkCmdUpdateBuffer /
+  // vkCmdCopyBuffer may overlap, and "last write wins" (the queue's contract)
+  // only holds if a barrier orders them. This became reachable when zero-init
+  // moved into the queue (phase 4a): a buffer's creation fill is routinely
+  // followed by its first data upload in the SAME flush, and losing that race
+  // zeroed the material table — a frozen world, not a crash. The barrier is
+  // derived from buffer identity (same rule the §3.3 tracker applies), emitted
+  // only when a destination repeats; an ordinary flush emits none.
+  std::vector<Buffer*> touched;
+  auto touchedBefore = [&](Buffer* d) {
+    for (Buffer* t : touched) {
+      if (t == d) return true;
+    }
+    return false;
+  };
   for (const Pending& p : pending_) {
-    if (p.classA) {
+    if (touchedBefore(p.dst)) {
+      VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+      mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      di.memoryBarrierCount = 1;
+      di.pMemoryBarriers = &mb;
+      dfn_.CmdPipelineBarrier2(cmd, &di);
+      touched.clear();
+    }
+    if (p.zeroFill) {
+      dfn_.CmdFillBuffer(cmd, p.dst->buf, 0, VK_WHOLE_SIZE, 0);
+    } else if (p.classA) {
       dfn_.CmdUpdateBuffer(cmd, p.dst->buf, p.dstOffset, p.size, p.inlineData.data());
     } else {
       VkBufferCopy region{};
@@ -593,6 +665,7 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
       region.size = p.size;
       dfn_.CmdCopyBuffer(cmd, stagingRing_->buf, p.dst->buf, 1, &region);
     }
+    touched.push_back(p.dst);
   }
   pending_.clear();
 }
@@ -641,6 +714,10 @@ VkFence Backend::SubmitCommands(VkCommandBuffer cmd, std::string& err) {
     err = "vkEndCommandBuffer failed";
     return VK_NULL_HANDLE;
   }
+  return SubmitEnded(cmd, err);
+}
+
+VkFence Backend::SubmitEnded(VkCommandBuffer cmd, std::string& err) {
   VkFence fence = AcquireFence(err);
   if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
@@ -656,7 +733,7 @@ VkFence Backend::SubmitCommands(VkCommandBuffer cmd, std::string& err) {
     err = std::string("vkQueueSubmit failed: ") + vkl::ResultName(r);
     return VK_NULL_HANDLE;
   }
-  inFlight_.push_back({fence, cmd, stagingHead_});
+  inFlight_.push_back({fence, cmd, stagingHead_, ++submitSerial_});
   return fence;
 }
 
@@ -678,6 +755,21 @@ void Backend::PollFences() {
       inFlight_.erase(inFlight_.begin() + i);
     } else {
       i++;
+    }
+  }
+
+  // Drain the buffer graveyard: an entry is freeable once every submit that
+  // was in flight when its handle was released has retired.
+  if (!graveyard_.empty()) {
+    uint64_t minInFlight = UINT64_MAX;
+    for (const auto& f : inFlight_) minInFlight = f.serial < minInFlight ? f.serial : minInFlight;
+    for (size_t i = 0; i < graveyard_.size();) {
+      if (graveyard_[i].serial < minInFlight) {
+        vmaDestroyBuffer(allocator_, graveyard_[i].buf, graveyard_[i].alloc);
+        graveyard_.erase(graveyard_.begin() + i);
+      } else {
+        i++;
+      }
     }
   }
 }
@@ -928,6 +1020,9 @@ void Backend::Shutdown() {
   for (auto& b : buffers_)
     if (b->buf) vmaDestroyBuffer(allocator_, b->buf, b->alloc);
   buffers_.clear();
+  // Graveyard remnants: WaitIdle above drained the queue, so these are idle.
+  for (auto& g : graveyard_) vmaDestroyBuffer(allocator_, g.buf, g.alloc);
+  graveyard_.clear();
   stagingRing_ = nullptr;
 
   if (allocator_) vmaDestroyAllocator(allocator_);
