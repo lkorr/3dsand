@@ -129,6 +129,9 @@ void Recorder::Begin(VkCommandBuffer cmd) {
   extra_.clear();
   pending_.clear();
   hostWritten_.clear();
+  imgState_.clear();
+  pendingImg_.clear();
+  renderOpen_ = false;
 
   VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
   mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -630,6 +633,259 @@ void Recorder::FillTracked(pass::Buf id, Buffer* dst) {
   }
   be_.Fns().CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
   stats_.fills++;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4b: the render domain (barrier_graph §2.6/§3.2). See the block comment
+// in vk_record.h above BeginRendering for the design; the invariant here is
+// the same as everywhere else in this file — every scope is DERIVED from
+// tracked state, none is written at a call site.
+// ---------------------------------------------------------------------------
+
+namespace {
+// §3.2's render-domain read scope: what a draw can read of a buffer. One
+// constant pair, because §2.6 establishes that draws are read-only over
+// everything the tick wrote — a render-domain WRITE to a buffer does not exist
+// in this engine.
+constexpr VkPipelineStageFlags2 kRenderReadStages =
+    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+constexpr VkAccessFlags2 kRenderReadAccess = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                             VK_ACCESS_2_UNIFORM_READ_BIT |
+                                             VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+}  // namespace
+
+void Recorder::FlushForRenderDomain() {
+  auto flushOne = [&](BufState& s, VkBuffer buf) {
+    if (s.lastWriteStage == 0) return;  // never written in this recording
+    VkBufferMemoryBarrier2 b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    b.srcStageMask = s.lastWriteStage;
+    b.srcAccessMask = s.lastWriteAccess;
+    b.dstStageMask = kRenderReadStages;
+    b.dstAccessMask = kRenderReadAccess;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.buffer = buf;
+    b.offset = 0;
+    b.size = VK_WHOLE_SIZE;
+    pending_.push_back(b);
+    // Record the read so a post-render writer in the same recording WARs.
+    s.readStagesSince |= kRenderReadStages;
+    s.readAccessSince |= kRenderReadAccess;
+  };
+  for (int i = 0; i < (int)pass::Buf::kCount; i++) {
+    Buffer* b = bind_.buffers[i];
+    if (b && b->buf) flushOne(state_[i], b->buf);
+  }
+  for (auto& e : extra_)
+    if (e.first && e.first->buf) flushOne(e.second, e.first->buf);
+  FlushPending(/*global=*/false);
+}
+
+void Recorder::TransitionImage(Image* im, VkImageLayout newLayout,
+                               VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+  if (!im || im->img == VK_NULL_HANDLE) return;
+  BufState* s = nullptr;
+  for (auto& e : imgState_)
+    if (e.first == im) s = &e.second;
+  if (!s) {
+    imgState_.push_back({im, BufState{}});
+    s = &imgState_.back().second;
+  }
+  // Nothing to do only when the layout is already right AND nothing in THIS
+  // recording has touched the image (prior submits are ordered by the §3.4
+  // head barrier). A same-layout re-use within one recording still needs the
+  // execution/memory dependency, e.g. two renders into one offscreen target.
+  if (im->layout == newLayout && s->lastWriteStage == 0 && s->readStagesSince == 0)
+    return;
+  VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+  // First touch this recording: src NONE/0 is correct — availability of prior
+  // submits' writes came from the head barrier; this transition only needs the
+  // layout change itself ordered before dst.
+  b.srcStageMask = s->lastWriteStage | s->readStagesSince;
+  b.srcAccessMask = s->lastWriteAccess | s->readAccessSince;
+  b.dstStageMask = dstStage;
+  b.dstAccessMask = dstAccess;
+  b.oldLayout = im->layout;
+  b.newLayout = newLayout;
+  b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.image = im->img;
+  b.subresourceRange = {im->aspect, 0, 1, 0, 1};
+  pendingImg_.push_back(b);
+  im->layout = newLayout;
+  // Fold the destination use into the tracked state so the NEXT transition
+  // derives its source from it (attachment write -> transfer read is exactly
+  // this chain). Keeping read bits in a later src scope is legal and harmless.
+  s->lastWriteStage = dstStage;
+  s->lastWriteAccess = dstAccess;
+  s->readStagesSince = 0;
+  s->readAccessSince = 0;
+}
+
+void Recorder::FlushPendingImages() {
+  if (pendingImg_.empty()) return;
+  VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  di.imageMemoryBarrierCount = (uint32_t)pendingImg_.size();
+  di.pImageMemoryBarriers = pendingImg_.data();
+  be_.Fns().CmdPipelineBarrier2(cmd_, &di);
+  stats_.barrierCalls++;
+  stats_.imageBarriers += (uint32_t)pendingImg_.size();
+  pendingImg_.clear();
+}
+
+void Recorder::BeginRendering(const RenderAttachments& att) {
+  if (!att.color || att.color->img == VK_NULL_HANDLE || renderOpen_) return;
+
+  // 1. Resolve every buffer hazard BEFORE the rendering scope opens — barriers
+  //    are illegal inside it. Sledgehammer mode uses its full barrier instead,
+  //    exactly as it replaces the derived barriers everywhere else.
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushForRenderDomain();
+  }
+
+  // 2. Derived layout transitions for the attachments, batched into one call.
+  TransitionImage(att.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+  if (att.depth)
+    TransitionImage(att.depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+  FlushPendingImages();
+
+  // 3. The rendering scope itself.
+  VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  color.imageView = att.color->view;
+  color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color.loadOp =
+      att.clearColor ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+  color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  for (int i = 0; i < 4; i++)
+    color.clearValue.color.float32[i] = att.clearRGBA[i];
+
+  VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  if (att.depth) {
+    depth.imageView = att.depth->view;
+    depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depth.loadOp =
+        att.clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.clearValue.depthStencil.depth = att.depthClear;  // reversed-Z: 0 = far
+  }
+
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {att.color->width, att.color->height}};
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &color;
+  ri.pDepthAttachment = att.depth ? &depth : nullptr;
+  be_.Fns().CmdBeginRendering(cmd_, &ri);
+
+  // NEGATIVE-HEIGHT VIEWPORT (maintenance1, core 1.1): makes the viewport
+  // transform — and therefore framebuffer-space geometry AND winding — match
+  // WebGPU's Y-up NDC exactly. Paired with FRONT_FACE_COUNTER_CLOCKWISE in
+  // CreateGraphicsPipeline; change one and the other is wrong.
+  VkViewport vp{};
+  vp.x = 0.0f;
+  vp.y = (float)att.color->height;
+  vp.width = (float)att.color->width;
+  vp.height = -(float)att.color->height;
+  vp.minDepth = 0.0f;
+  vp.maxDepth = 1.0f;
+  be_.Fns().CmdSetViewport(cmd_, 0, 1, &vp);
+  VkRect2D sc{{0, 0}, {att.color->width, att.color->height}};
+  be_.Fns().CmdSetScissor(cmd_, 0, 1, &sc);
+  renderOpen_ = true;
+}
+
+void Recorder::EndRendering() {
+  if (!renderOpen_) return;
+  be_.Fns().CmdEndRendering(cmd_);
+  renderOpen_ = false;
+}
+
+void Recorder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+                    uint32_t firstInstance) {
+  if (!renderOpen_) return;
+  be_.Fns().CmdDraw(cmd_, vertexCount, instanceCount, firstVertex, firstInstance);
+  stats_.draws++;
+}
+
+void Recorder::DrawIndirect(Buffer* args, uint64_t offset) {
+  if (!renderOpen_ || !args || !args->buf) return;
+  // Note the read WITHOUT emitting: no barrier is legal here, and none is
+  // needed — the visibility was established by BeginRendering's flush (same
+  // recording) or the §3.4 head barrier (previous submits, §4.5's drawArgs
+  // edge). Recording it makes a post-render writer of the args buffer WAR.
+  auto note = [&](BufState& s) {
+    s.readStagesSince |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    s.readAccessSince |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+  };
+  bool table = false;
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    if (bind_.buffers[i] == args) {
+      note(state_[i]);
+      table = true;
+    }
+  if (!table) {
+    for (auto& e : extra_)
+      if (e.first == args) {
+        note(e.second);
+        table = true;
+      }
+    if (!table) {
+      extra_.push_back({args, BufState{}});
+      note(extra_.back().second);
+    }
+  }
+  be_.Fns().CmdDrawIndirect(cmd_, args->buf, offset, 1, 0);
+  stats_.draws++;
+}
+
+void Recorder::CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
+                                 uint32_t bytesPerRow, uint32_t w, uint32_t h) {
+  if (!src || src->img == VK_NULL_HANDLE || !dst || !dst->buf || renderOpen_) return;
+
+  // Destination hazard, same path as CopyToHost's dst half.
+  bool dstTable = false;
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    if (bind_.buffers[i] == dst) {
+      TouchBuffer((pass::Buf)i, pass::Acc::TransferWrite);
+      dstTable = true;
+    }
+  if (!dstTable) TouchExtra(dst, pass::Acc::TransferWrite);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+
+  // Source: derived transition from its tracked attachment write.
+  TransitionImage(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+  FlushPendingImages();
+
+  // bufferRowLength is in TEXELS, not bytes — the one WebGPU/Vulkan unit
+  // mismatch in this call. Only 4-byte color formats reach this path.
+  const uint32_t texelBytes = 4;
+  VkBufferImageCopy region{};
+  region.bufferOffset = dstOffset;
+  region.bufferRowLength = bytesPerRow / texelBytes;
+  region.bufferImageHeight = h;
+  region.imageSubresource = {src->aspect, 0, 0, 1};
+  region.imageExtent = {w, h, 1};
+  be_.Fns().CmdCopyImageToBuffer(cmd_, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 dst->buf, 1, &region);
+  stats_.copies++;
+  if (dst->mapped) hostWritten_.push_back(dst);
 }
 
 // ---------------------------------------------------------------------------

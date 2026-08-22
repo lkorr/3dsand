@@ -42,12 +42,12 @@ namespace rhi {
 namespace vkr {
 namespace {
 
-[[noreturn]] void NotUntil4b(const char* what) {
+[[noreturn]] void NotReachable(const char* what) {
   std::fprintf(stderr,
-               "FATAL: %s is not available on --backend vulkan until phase 4b "
-               "(render path). A gate or code path that reaches this was not "
-               "declared needsRender — fix the declaration, do not soften this "
-               "abort.\n",
+               "FATAL: %s has no Vulkan implementation because no code path "
+               "should reach it (sim recording goes through the RecordTable "
+               "bridge). A caller reaching this is bypassing the pass table — "
+               "wire it through the table/recorder, do not soften this abort.\n",
                what);
   std::abort();
 }
@@ -68,7 +68,6 @@ struct VkrState {
   };
   std::vector<PendingMap> maps;
   vk::RecordStats lastStats{};
-  bool warnedNoTexture = false;
 };
 
 // ------------------------------------------------------------- resources ----
@@ -95,6 +94,36 @@ vk::Buffer* NB(const Buffer& b) {
   return b ? static_cast<VkrBuffer*>(b.Get())->b : nullptr;
 }
 
+// ------------------------------------------------------- textures (4b) ----
+
+struct VkrTexture final : TextureImpl, std::enable_shared_from_this<VkrTexture> {
+  vk::Image* img = nullptr;
+  std::shared_ptr<VkrState> st;
+  ~VkrTexture() override {
+    if (img && st && st->be) st->be->DestroyImageDeferred(img);
+  }
+  TextureView CreateView() override;
+};
+
+// The view is non-owning of the VkImageView (it belongs to the vk::Image) but
+// holds the texture impl alive — wgpu view semantics, which EnsureDepth relies
+// on (the Texture handle and the view handle have independent lifetimes).
+struct VkrTextureView final : TextureViewImpl {
+  vk::Image* img = nullptr;
+  std::shared_ptr<TextureImpl> keepAlive;
+};
+
+TextureView VkrTexture::CreateView() {
+  auto v = std::make_shared<VkrTextureView>();
+  v->img = img;
+  v->keepAlive = shared_from_this();
+  return TextureView(std::move(v));
+}
+
+vk::Image* NI(const TextureView& v) {
+  return v ? static_cast<VkrTextureView*>(v.Get())->img : nullptr;
+}
+
 struct VkrShaderModule final : ShaderModuleImpl {
   // Compilation is DEFERRED to pipeline creation: Tint emits single-entry-point
   // SPIR-V, and the entry point arrives with CreateComputePipeline. The
@@ -113,6 +142,12 @@ struct VkrBindGroupLayout final : BindGroupLayoutImpl {
 struct VkrBindGroup final : BindGroupImpl { VkDescriptorSet set = VK_NULL_HANDLE; };
 struct VkrPipelineLayout final : PipelineLayoutImpl { VkPipelineLayout l = VK_NULL_HANDLE; };
 struct VkrComputePipeline final : ComputePipelineImpl { VkPipeline p = VK_NULL_HANDLE; };
+// The pipeline layout rides along because vkCmdBindDescriptorSets needs it at
+// SetBindGroup time — wgpu infers it from the bound pipeline, Vulkan does not.
+struct VkrRenderPipeline final : RenderPipelineImpl {
+  VkPipeline p = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+};
 struct VkrCommandBuffer final : CommandBufferImpl { VkCommandBuffer cmd = VK_NULL_HANDLE; };
 struct VkrQuerySet final : QuerySetImpl {
   VkQueryPool pool = VK_NULL_HANDLE;
@@ -122,6 +157,40 @@ struct VkrQuerySet final : QuerySetImpl {
 };
 
 // --------------------------------------------------------------- encoder ----
+
+// Render pass encoder (4b). Binds/draws record straight into the command
+// buffer through the shared vk::Recorder, which owns the rendering scope —
+// every barrier the scope needed was derived and emitted by BeginRendering,
+// and none is legal inside it. Holds raw pointers into the encoder; the caller
+// keeps the CommandEncoder alive for the pass's lifetime (wgpu semantics, and
+// what every call site already does).
+struct VkrRenderPass final : RenderPassImpl {
+  std::shared_ptr<VkrState> st;
+  vk::Recorder* rec = nullptr;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkPipelineLayout curLayout = VK_NULL_HANDLE;  // from the last SetPipeline
+
+  void SetPipeline(const RenderPipeline& p) override {
+    auto* rp = static_cast<VkrRenderPipeline*>(p.Get());
+    if (!rp || rp->p == VK_NULL_HANDLE) return;
+    st->be->Fns().CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rp->p);
+    curLayout = rp->layout;
+  }
+  void SetBindGroup(uint32_t index, const BindGroup& bg) override {
+    auto* g = static_cast<VkrBindGroup*>(bg.Get());
+    if (!g || g->set == VK_NULL_HANDLE || curLayout == VK_NULL_HANDLE) return;
+    st->be->Fns().CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, curLayout,
+                                        index, 1, &g->set, 0, nullptr);
+  }
+  void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+            uint32_t firstInstance) override {
+    rec->Draw(vertexCount, instanceCount, firstVertex, firstInstance);
+  }
+  void DrawIndirect(const Buffer& args, uint64_t offset) override {
+    rec->DrawIndirect(NB(args), offset);
+  }
+  void End() override { rec->EndRendering(); }
+};
 
 struct VkrEncoder final : CommandEncoderImpl {
   std::shared_ptr<VkrState> st;
@@ -154,9 +223,13 @@ struct VkrEncoder final : CommandEncoderImpl {
   void FillTracked(pass::Buf id, const Buffer& b) override {
     rec->FillTracked(id, NB(b));
   }
-  void CopyTextureToBuffer(const TexelCopyTexture&, const TexelCopyBuffer&,
-                           const Extent3D&) override {
-    NotUntil4b("CopyTextureToBuffer");
+  void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
+                           const Extent3D& extent) override {
+    vk::Image* im = src.texture
+                        ? static_cast<VkrTexture*>(src.texture.Get())->img
+                        : nullptr;
+    rec->CopyImageToBuffer(im, NB(dst.buffer), dst.offset, dst.bytesPerRow,
+                           extent.width, extent.height);
   }
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                        const Buffer& dst, uint64_t dstOffset) override;
@@ -164,10 +237,24 @@ struct VkrEncoder final : CommandEncoderImpl {
     // Nothing reaches this on Vulkan: sim recording goes through the
     // RecordTableVulkan bridge (the recorder walks the rows itself), and the
     // measure timer hangs its timestamps off the recorder's group transitions.
-    NotUntil4b("BeginComputePass (generic compute-pass encoding)");
+    NotReachable("BeginComputePass (generic compute-pass encoding)");
   }
-  RenderPass BeginRenderPass(const RenderPassDesc&) override {
-    NotUntil4b("BeginRenderPass");
+  RenderPass BeginRenderPass(const RenderPassDesc& d) override {
+    vk::RenderAttachments att{};
+    att.color = NI(d.color.view);
+    att.clearColor = d.color.loadOp == LoadOp::Clear;
+    for (int i = 0; i < 4; i++) att.clearRGBA[i] = (float)d.color.clearValue[i];
+    if (d.hasDepth) {
+      att.depth = NI(d.depth.view);
+      att.clearDepth = d.depth.loadOp == LoadOp::Clear;
+      att.depthClear = d.depth.clearValue;
+    }
+    rec->BeginRendering(att);
+    auto impl = std::make_shared<VkrRenderPass>();
+    impl->st = st;
+    impl->rec = rec.get();
+    impl->cmd = cmd;
+    return RenderPass(std::move(impl));
   }
   CommandBuffer Finish() override {
     rec->Finish();
@@ -262,16 +349,18 @@ struct VkrDevice final : DeviceImpl {
     return Buffer(std::move(impl));
   }
 
-  Texture CreateTexture(const Extent3D&, TextureFormat, TextureUsage,
+  Texture CreateTexture(const Extent3D& size, TextureFormat format, TextureUsage usage,
                         const char* label) override {
-    if (!st->warnedNoTexture) {
-      st->warnedNoTexture = true;
-      std::fprintf(stderr,
-                   "note: CreateTexture('%s') returns null on --backend vulkan "
-                   "until phase 4b (render path)\n",
+    vk::Image* im = st->be->CreateImage(size.width, size.height, format, usage, label);
+    if (!im) {
+      std::fprintf(stderr, "CreateTexture('%s') failed on --backend vulkan\n",
                    label ? label : "?");
+      return {};
     }
-    return {};
+    auto impl = std::make_shared<VkrTexture>();
+    impl->img = im;
+    impl->st = st;
+    return Texture(std::static_pointer_cast<TextureImpl>(impl));
   }
 
   QuerySet CreateTimestampQuerySet(uint32_t count, const char* label) override;
@@ -344,11 +433,37 @@ struct VkrDevice final : DeviceImpl {
   }
 
   RenderPipeline CreateRenderPipeline(const RenderPipelineDesc& d) override {
-    std::fprintf(stderr,
-                 "note: CreateRenderPipeline('%s') returns null on --backend "
-                 "vulkan until phase 4b\n",
-                 d.label ? d.label : "?");
-    return {};
+    auto* vm = static_cast<VkrShaderModule*>(d.vertexModule.Get());
+    auto* fm = static_cast<VkrShaderModule*>(d.fragmentModule.Get());
+    auto* pl = static_cast<VkrPipelineLayout*>(d.layout.Get());
+    if (!vm || !fm || !pl) return {};
+    const char* label = d.label ? d.label : "renderPipeline";
+    std::string diag;
+    VkShaderModule vs =
+        st->be->GetShaderModule(vm->source, vm->label, d.vertexEntry, 0, diag);
+    if (vs == VK_NULL_HANDLE) {
+      std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", vm->label.c_str(),
+                   d.vertexEntry, diag.c_str());
+      return {};
+    }
+    VkShaderModule fs =
+        st->be->GetShaderModule(fm->source, fm->label, d.fragmentEntry, 0, diag);
+    if (fs == VK_NULL_HANDLE) {
+      std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", fm->label.c_str(),
+                   d.fragmentEntry, diag.c_str());
+      return {};
+    }
+    VkPipeline p =
+        st->be->CreateGraphicsPipeline(pl->l, vs, d.vertexEntry, fs, d.fragmentEntry, d,
+                                       label);
+    if (p == VK_NULL_HANDLE) {
+      std::fprintf(stderr, "render pipeline creation failed for '%s'\n", label);
+      return {};
+    }
+    auto impl = std::make_shared<VkrRenderPipeline>();
+    impl->p = p;
+    impl->layout = pl->l;
+    return RenderPipeline(std::move(impl));
   }
 
   CommandEncoder CreateCommandEncoder(const char* label) override {

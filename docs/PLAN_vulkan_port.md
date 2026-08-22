@@ -495,6 +495,37 @@ screenshot/offscreen paths.
 *Checkpoint: full 20-gate selftest green on `--backend vulkan`; screenshots
 visually equivalent; render ms reported vs Dawn baseline.*
 
+> **[AS BUILT] Phase 4b D1 — offscreen render on Vulkan (2026-08-22).**
+> `CreateTexture`/`CreateRenderPipeline`/`BeginRenderPass`/`CopyTextureToBuffer`
+> are real on the Vulkan seam; `--shot --backend vulkan` and
+> `--shot-mob --backend vulkan` run end to end.
+>
+> * **Dynamic rendering, not render-pass objects.** `vkCmdBeginRendering`
+>   matches WebGPU's model 1:1 (no framebuffer/render-pass caching keyed by
+>   attachment combos), the barrier doc §1.2 already assumed it, and both
+>   `dynamicRendering` and `synchronization2` are MANDATORY core-1.3 features —
+>   the backend already refuses devices without the latter, so requiring the
+>   former adds no reachable hardware constraint. Both are probed and enabled
+>   explicitly (a core feature still needs enabling; the 3b lesson).
+> * **WebGPU coordinates via negative-height viewport + CCW front face** — the
+>   same pairing Dawn's own Vulkan backend uses. Framebuffer-space geometry and
+>   winding match, so screenshots are byte-comparable against Dawn.
+> * **Render barriers are generated, never hand-placed** (§2.6/§3.2 as-built
+>   notes): `Recorder::BeginRendering` flushes the tracker into the
+>   render-read domain before the scope opens (barriers are illegal inside);
+>   image layout transitions are derived from `vk::Image::layout` + a
+>   per-recording access state; the screenshot copy transitions
+>   attachment→TRANSFER_SRC the same way. Sledgehammer mode substitutes its
+>   full barrier at the same points, keeping the A/B honest.
+> * **Checkpoint evidence:** all 28 `--shot` screenshots wrote on Vulkan with
+>   sync validation ON; pixel-diff vs the same-build Dawn set: **23/28
+>   byte-identical, the rest differ on <0.001% of pixels with max channel
+>   delta 1/255** (raymarch is float; §3.2's "bytes may differ" allowance was
+>   barely needed). Validation messages are now REPORTED (and fail the run) at
+>   the end of --shot/--shot-mob — the messenger collects continuously but
+>   nothing popped a scope in these harnesses before, so a hazard could have
+>   gone unprinted.
+>
 > **[AS BUILT] Phase 4a — runtime-selectable backends; the real gates run on
 > Vulkan (2026-08-22).** Split off from phase 4: everything except the render
 > path itself.

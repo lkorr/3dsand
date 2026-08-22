@@ -58,6 +58,11 @@ class GpuContext {
   // The Vulkan backend object, or null on Dawn. Diagnostics only (--vk-smoke
   // prints caps + validation messages); nothing above src/gpu dereferences it.
   vk::Backend* VkBackend() const;
+  // Print every validation message the Vulkan debug messenger collected (they
+  // are gathered continuously, but only the F5-reload scope pops them during
+  // play). Returns the count, so a harness can assert ZERO and report honestly.
+  // No-op returning 0 on Dawn.
+  size_t ReportVkValidation(const char* tag) const;
   // True only when Init was asked for timestamps AND the adapter supports them.
   bool timestampsEnabled = false;
   // GPU timestamp period in nanoseconds per tick. Dawn already normalises

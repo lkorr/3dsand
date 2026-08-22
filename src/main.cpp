@@ -631,7 +631,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     render({(float)(kPx - 30), (float)(rim - 10), (float)(kPz - 30)}, 0.785f,
            0.04f, "screenshot_pond_sub.bmp");
   }
-  return 0;
+  // A hazard report with no message pop is a hazard report that goes nowhere:
+  // the debug messenger collects continuously, but only the F5-reload scope
+  // pops. Print (and count) whatever this run gathered.
+  return ctx.ReportVkValidation("--shot") > 0 ? 1 : 0;
 }
 
 // Count of chunks whose dirty flag is set (selftest only — blocking readback).
@@ -879,7 +882,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
         "screenshot_mob_quarter.bmp");
   shoot(fwd + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_front.bmp");
-  return 0;
+  return ctx.ReportVkValidation("--shot-mob") > 0 ? 1 : 0;
 }
 
 
@@ -1071,11 +1074,14 @@ int main(int argc, char** argv) {
   // is phase 4b, and a windowed request is still refused rather than silently
   // served by Dawn: a run reported as Vulkan that was Dawn all along is worse
   // than no run.
-  if (backendVulkan && !selftest && !measure && !vkSmoke && !vkSmokeLoud) {
+  if (backendVulkan && !selftest && !measure && !vkSmoke && !vkSmokeLoud && !shot &&
+      shotMob.empty()) {
     std::fprintf(stderr,
-                 "--backend vulkan cannot present until phase 4b (render path).\n"
+                 "--backend vulkan cannot present (windowed) until phase 4b D3 "
+                 "(swapchain) lands.\n"
                  "Use it with a headless mode:\n"
-                 "    sandvox --selftest --backend vulkan     (needsRender gates skip)\n"
+                 "    sandvox --selftest --backend vulkan\n"
+                 "    sandvox --shot / --shot-mob <def> --backend vulkan\n"
                  "    sandvox --measure  --backend vulkan\n"
                  "    sandvox --vk-smoke / --vk-smoke-loud    (cross-backend hashes)\n"
                  "Add --vk-validation for synchronization validation, and\n"

@@ -461,6 +461,28 @@ R1–R7 are read-only over everything the tick wrote, so **no barriers are neede
 between them**. The barriers that matter are R0→R1 (transfer→vertex/fragment
 shader read) and the cross-submit tick→frame edge (§3.5).
 
+> **[AS BUILT phase 4b] The render table is enforced at the ONE point where it
+> can matter, not re-declared row by row.** Barriers are illegal inside a
+> dynamic-rendering scope, and §2.6 establishes every draw is read-only over
+> buffers — so the render domain's whole hazard surface collapses to the
+> boundary before `vkCmdBeginRendering`. `Recorder::BeginRendering`
+> (vk_record.cpp) therefore flushes the live tracker: every buffer with a
+> recorded write in THIS command buffer gets one derived barrier, src = its
+> tracked last writer, dst = the full render-read domain
+> (`VERTEX|FRAGMENT` shader reads + `DRAW_INDIRECT`/`INDIRECT_COMMAND_READ`,
+> §3.2's stage-domain shift). Writers in previous submits — R0's uploads
+> (flushed at the command buffer's head, ahead of `Recorder::Begin`'s barrier)
+> and §4.5's tick-written `drawArgs` — are covered by the §3.4 head barrier,
+> exactly as for compute. In the common frame recording the flush emits
+> nothing, which is the correct output: the head barrier already did the work.
+> Draw calls record through the recorder (`Draw`/`DrawIndirect`, the latter
+> noting its args read so a post-render writer would WAR); image layout
+> transitions are likewise derived, from `vk::Image::layout` (persists across
+> command buffers) plus a per-recording image access state — UNDEFINED→
+> attachment at BeginRendering, attachment→TRANSFER_SRC inside
+> `CopyImageToBuffer` for the screenshot path. No hand-placed barrier exists on
+> the render path either.
+
 ---
 
 ## 3. Barrier derivation
@@ -498,6 +520,12 @@ For the render table, `StorageRead`/`Uniform` map to
 stays `DRAW_INDIRECT`. The stage is a property of the *table* (each table
 declares its shader-stage domain), not of the `Acc` enum, so one enum serves
 both.
+
+> **[AS BUILT phase 4b]** The domain shift is implemented as the
+> `kRenderReadStages`/`kRenderReadAccess` pair in vk_record.cpp, applied by
+> `BeginRendering`'s tracker flush rather than by re-mapping each row — see the
+> §2.6 as-built note for why the boundary before the rendering scope is the
+> only place a render-domain barrier can exist.
 
 **`StorageAtomicRMW` is `READ|WRITE`, not something weaker.** Vulkan has no
 atomic-specific access flag. Two consecutive atomic-only passes on the same

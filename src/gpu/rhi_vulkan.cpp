@@ -75,6 +75,77 @@ VkDescriptorType ToVkDescriptorType(rhi::BufferBindingType t, bool dynamic) {
   return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 }
 
+// ---- phase 4b: render-path mappings ---------------------------------------
+
+VkFormat ToVkFormat(rhi::TextureFormat f) {
+  switch (f) {
+    case rhi::TextureFormat::RGBA8Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
+    case rhi::TextureFormat::BGRA8Unorm: return VK_FORMAT_B8G8R8A8_UNORM;
+    case rhi::TextureFormat::Depth32Float: return VK_FORMAT_D32_SFLOAT;
+    case rhi::TextureFormat::Undefined: break;
+  }
+  return VK_FORMAT_UNDEFINED;
+}
+
+VkCompareOp ToVkCompare(rhi::CompareFunction f) {
+  switch (f) {
+    case rhi::CompareFunction::Never: return VK_COMPARE_OP_NEVER;
+    case rhi::CompareFunction::Less: return VK_COMPARE_OP_LESS;
+    case rhi::CompareFunction::LessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case rhi::CompareFunction::Greater: return VK_COMPARE_OP_GREATER;
+    case rhi::CompareFunction::GreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    case rhi::CompareFunction::Equal: return VK_COMPARE_OP_EQUAL;
+    case rhi::CompareFunction::NotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+    case rhi::CompareFunction::Always: return VK_COMPARE_OP_ALWAYS;
+  }
+  return VK_COMPARE_OP_ALWAYS;
+}
+
+VkCullModeFlags ToVkCull(rhi::CullMode m) {
+  switch (m) {
+    case rhi::CullMode::None: return VK_CULL_MODE_NONE;
+    case rhi::CullMode::Front: return VK_CULL_MODE_FRONT_BIT;
+    case rhi::CullMode::Back: return VK_CULL_MODE_BACK_BIT;
+  }
+  return VK_CULL_MODE_NONE;
+}
+
+VkPrimitiveTopology ToVkTopology(rhi::PrimitiveTopology t) {
+  switch (t) {
+    case rhi::PrimitiveTopology::PointList: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case rhi::PrimitiveTopology::LineList: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case rhi::PrimitiveTopology::LineStrip: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case rhi::PrimitiveTopology::TriangleList: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case rhi::PrimitiveTopology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+  }
+  return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+VkBlendFactor ToVkBlendFactor(rhi::BlendFactor f) {
+  switch (f) {
+    case rhi::BlendFactor::Zero: return VK_BLEND_FACTOR_ZERO;
+    case rhi::BlendFactor::One: return VK_BLEND_FACTOR_ONE;
+    case rhi::BlendFactor::SrcAlpha: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case rhi::BlendFactor::OneMinusSrcAlpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case rhi::BlendFactor::Src: return VK_BLEND_FACTOR_SRC_COLOR;
+    case rhi::BlendFactor::OneMinusSrc: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case rhi::BlendFactor::Dst: return VK_BLEND_FACTOR_DST_COLOR;
+    case rhi::BlendFactor::OneMinusDst: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+  }
+  return VK_BLEND_FACTOR_ONE;
+}
+
+VkBlendOp ToVkBlendOp(rhi::BlendOperation o) {
+  switch (o) {
+    case rhi::BlendOperation::Add: return VK_BLEND_OP_ADD;
+    case rhi::BlendOperation::Subtract: return VK_BLEND_OP_SUBTRACT;
+    case rhi::BlendOperation::ReverseSubtract: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case rhi::BlendOperation::Min: return VK_BLEND_OP_MIN;
+    case rhi::BlendOperation::Max: return VK_BLEND_OP_MAX;
+  }
+  return VK_BLEND_OP_ADD;
+}
+
 VkShaderStageFlags ToVkStages(rhi::ShaderStage s) {
   VkShaderStageFlags f = 0;
   if ((uint32_t)s & (uint32_t)rhi::ShaderStage::Vertex) f |= VK_SHADER_STAGE_VERTEX_BIT;
@@ -406,6 +477,7 @@ bool Backend::CreateLogicalDevice(std::string& err) {
     f2.pNext = &probe;
     ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
     caps_.synchronization2 = probe.synchronization2 != 0;
+    caps_.dynamicRendering = probe.dynamicRendering != 0;
   }
   if (!caps_.synchronization2) {
     err =
@@ -415,6 +487,18 @@ bool Backend::CreateLogicalDevice(std::string& err) {
     return false;
   }
   feat13.synchronization2 = VK_TRUE;
+  // Dynamic rendering is the render path's ONE recording model (phase 4b) —
+  // like synchronization2 it is core-1.3 but must still be enabled, and a
+  // device without it would need a VkRenderPass-object code path nothing else
+  // exercises. Both features are MANDATORY in core 1.3, so a 1.3 device that
+  // lacks either is out of spec; refuse rather than fork the recording model.
+  if (!caps_.dynamicRendering) {
+    err =
+        "device does not support VkPhysicalDeviceVulkan13Features::"
+        "dynamicRendering, which the phase-4b render path requires";
+    return false;
+  }
+  feat13.dynamicRendering = VK_TRUE;
 
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.queueCreateInfoCount = 1;
@@ -760,13 +844,22 @@ void Backend::PollFences() {
 
   // Drain the buffer graveyard: an entry is freeable once every submit that
   // was in flight when its handle was released has retired.
-  if (!graveyard_.empty()) {
+  if (!graveyard_.empty() || !imageGraveyard_.empty()) {
     uint64_t minInFlight = UINT64_MAX;
     for (const auto& f : inFlight_) minInFlight = f.serial < minInFlight ? f.serial : minInFlight;
     for (size_t i = 0; i < graveyard_.size();) {
       if (graveyard_[i].serial < minInFlight) {
         vmaDestroyBuffer(allocator_, graveyard_[i].buf, graveyard_[i].alloc);
         graveyard_.erase(graveyard_.begin() + i);
+      } else {
+        i++;
+      }
+    }
+    for (size_t i = 0; i < imageGraveyard_.size();) {
+      if (imageGraveyard_[i].serial < minInFlight) {
+        if (imageGraveyard_[i].view) dfn_.DestroyImageView(device_, imageGraveyard_[i].view, nullptr);
+        vmaDestroyImage(allocator_, imageGraveyard_[i].img, imageGraveyard_[i].alloc);
+        imageGraveyard_.erase(imageGraveyard_.begin() + i);
       } else {
         i++;
       }
@@ -911,6 +1004,194 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   return p;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4b: images and graphics pipelines.
+// ---------------------------------------------------------------------------
+
+Image* Backend::CreateImage(uint32_t w, uint32_t h, rhi::TextureFormat fmt,
+                            rhi::TextureUsage usage, const char* label) {
+  VkFormat vfmt = ToVkFormat(fmt);
+  if (vfmt == VK_FORMAT_UNDEFINED || w == 0 || h == 0) return nullptr;
+  const bool isDepth = fmt == rhi::TextureFormat::Depth32Float;
+
+  VkImageUsageFlags vusage = 0;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::CopySrc)
+    vusage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::CopyDst)
+    vusage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::TextureBinding)
+    vusage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::StorageBinding)
+    vusage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  if ((uint32_t)usage & (uint32_t)rhi::TextureUsage::RenderAttachment)
+    vusage |= isDepth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                      : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+  auto im = std::make_unique<Image>();
+  im->format = vfmt;
+  im->width = w;
+  im->height = h;
+  im->aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+  im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  im->label = label ? label : "";
+
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = vfmt;
+  ici.extent = {w, h, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = vusage;
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  VmaAllocationCreateInfo aci{};
+  aci.usage = VMA_MEMORY_USAGE_AUTO;
+  aci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+  if (vmaCreateImage(allocator_, &ici, &aci, &im->img, &im->alloc, nullptr) != VK_SUCCESS)
+    return nullptr;
+
+  VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = im->img;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = vfmt;
+  vci.subresourceRange = {im->aspect, 0, 1, 0, 1};
+  if (dfn_.CreateImageView(device_, &vci, nullptr, &im->view) != VK_SUCCESS) {
+    vmaDestroyImage(allocator_, im->img, im->alloc);
+    return nullptr;
+  }
+
+  Image* raw = im.get();
+  images_.push_back(std::move(im));
+  return raw;
+}
+
+void Backend::DestroyImageDeferred(Image* im) {
+  if (!im) return;
+  for (size_t i = 0; i < images_.size(); i++) {
+    if (images_[i].get() != im) continue;
+    if (im->img && im->alloc)  // swapchain-owned images have no allocation
+      imageGraveyard_.push_back({im->img, im->alloc, im->view, submitSerial_});
+    images_.erase(images_.begin() + i);
+    return;
+  }
+}
+
+VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModule vs,
+                                           const char* vsEntry, VkShaderModule fs,
+                                           const char* fsEntry,
+                                           const rhi::RenderPipelineDesc& d,
+                                           const char* /*label*/) {
+  if (!dfn_.CreateGraphicsPipelines || layout == VK_NULL_HANDLE ||
+      vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE)
+    return VK_NULL_HANDLE;
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vs;
+  stages[0].pName = vsEntry;
+  stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = fs;
+  stages[1].pName = fsEntry;
+
+  // No vertex buffers anywhere in the engine: every draw pulls from storage
+  // buffers by vertex index (raymarch's fullscreen tri, the cube expanders).
+  VkPipelineVertexInputStateCreateInfo vin{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+  VkPipelineInputAssemblyStateCreateInfo ia{
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ia.topology = ToVkTopology(d.topology);
+
+  VkPipelineViewportStateCreateInfo vp{
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vp.viewportCount = 1;
+  vp.scissorCount = 1;
+
+  // FRONT FACE: CCW, unchanged from WebGPU's default. The recorder sets a
+  // NEGATIVE-HEIGHT viewport (vk_record.cpp BeginRendering), which makes the
+  // viewport transform — and therefore framebuffer-space winding — identical to
+  // WebGPU's. Passing the front face through unchanged is correct ONLY together
+  // with that flip; this is the same pairing Dawn's own Vulkan backend uses.
+  VkPipelineRasterizationStateCreateInfo rs{
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = ToVkCull(d.cullMode);
+  rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rs.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo ms{
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineDepthStencilStateCreateInfo ds{
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  ds.depthTestEnable = VK_TRUE;
+  ds.depthWriteEnable = d.depth.depthWriteEnabled ? VK_TRUE : VK_FALSE;
+  ds.depthCompareOp = ToVkCompare(d.depth.depthCompare);
+
+  VkPipelineColorBlendAttachmentState att{};
+  att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  if (d.blend) {
+    att.blendEnable = VK_TRUE;
+    att.srcColorBlendFactor = ToVkBlendFactor(d.blend->color.srcFactor);
+    att.dstColorBlendFactor = ToVkBlendFactor(d.blend->color.dstFactor);
+    att.colorBlendOp = ToVkBlendOp(d.blend->color.operation);
+    att.srcAlphaBlendFactor = ToVkBlendFactor(d.blend->alpha.srcFactor);
+    att.dstAlphaBlendFactor = ToVkBlendFactor(d.blend->alpha.dstFactor);
+    att.alphaBlendOp = ToVkBlendOp(d.blend->alpha.operation);
+  }
+  VkPipelineColorBlendStateCreateInfo cb{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cb.attachmentCount = 1;
+  cb.pAttachments = &att;
+
+  // Viewport/scissor are dynamic so one pipeline serves any target size
+  // (resize, the offscreen sizes, the swapchain) — the recorder sets both at
+  // BeginRendering.
+  const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dstate{
+      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dstate.dynamicStateCount = 2;
+  dstate.pDynamicStates = dyn;
+
+  // Dynamic rendering: the attachment formats live on the PIPELINE, not on a
+  // render pass object.
+  VkFormat colorFmt = ToVkFormat(d.colorFormat);
+  VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachmentFormats = &colorFmt;
+  ri.depthAttachmentFormat = ToVkFormat(d.depth.format);
+
+  VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  ci.pNext = &ri;
+  ci.stageCount = 2;
+  ci.pStages = stages;
+  ci.pVertexInputState = &vin;
+  ci.pInputAssemblyState = &ia;
+  ci.pViewportState = &vp;
+  ci.pRasterizationState = &rs;
+  ci.pMultisampleState = &ms;
+  ci.pDepthStencilState = &ds;
+  ci.pColorBlendState = &cb;
+  ci.pDynamicState = &dstate;
+  ci.layout = layout;
+  ci.renderPass = VK_NULL_HANDLE;  // dynamic rendering
+
+  VkPipeline p = VK_NULL_HANDLE;
+  if (dfn_.CreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &p) !=
+      VK_SUCCESS)
+    return VK_NULL_HANDLE;
+  pipelines_.push_back(p);
+  return p;
+}
+
 VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
                                              const rhi::BindGroupLayoutEntry* layoutEntries,
                                              const rhi::BindGroupEntry* entries,
@@ -1023,6 +1304,16 @@ void Backend::Shutdown() {
   // Graveyard remnants: WaitIdle above drained the queue, so these are idle.
   for (auto& g : graveyard_) vmaDestroyBuffer(allocator_, g.buf, g.alloc);
   graveyard_.clear();
+  for (auto& im : images_) {
+    if (im->view) dfn_.DestroyImageView(device_, im->view, nullptr);
+    if (im->img && im->alloc) vmaDestroyImage(allocator_, im->img, im->alloc);
+  }
+  images_.clear();
+  for (auto& g : imageGraveyard_) {
+    if (g.view) dfn_.DestroyImageView(device_, g.view, nullptr);
+    vmaDestroyImage(allocator_, g.img, g.alloc);
+  }
+  imageGraveyard_.clear();
   stagingRing_ = nullptr;
 
   if (allocator_) vmaDestroyAllocator(allocator_);

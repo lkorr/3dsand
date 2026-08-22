@@ -20,6 +20,18 @@ struct GpuContext::Backend {
 
 vk::Backend* GpuContext::VkBackend() const { return back_ ? back_->vk.get() : nullptr; }
 
+size_t GpuContext::ReportVkValidation(const char* tag) const {
+  vk::Backend* be = VkBackend();
+  if (!be) return 0;
+  const std::vector<std::string>& msgs = be->ValidationMessages();
+  for (const std::string& m : msgs)
+    std::fprintf(stderr, "[vk-validation] %s\n", m.c_str());
+  if (be->GetCaps().validationEnabled)
+    std::printf("%s: vulkan validation messages: %zu%s\n", tag ? tag : "run",
+                msgs.size(), msgs.empty() ? " (clean)" : "  <-- REPORT VERBATIM");
+  return msgs.size();
+}
+
 static void PrintDeviceError(const wgpu::Device&, wgpu::ErrorType type,
                              wgpu::StringView message) {
   std::fprintf(stderr, "[webgpu error %d] %.*s\n", (int)type, (int)message.length,

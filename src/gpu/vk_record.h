@@ -120,9 +120,23 @@ struct RecordStats {
   uint32_t dispatches = 0;
   uint32_t copies = 0;
   uint32_t fills = 0;
+  uint32_t draws = 0;           // phase 4b: draw calls inside rendering scopes
   uint32_t barrierCalls = 0;    // vkCmdPipelineBarrier2 invocations
   uint32_t bufferBarriers = 0;  // VkBufferMemoryBarrier2 entries across them
   uint32_t globalBarriers = 0;  // VkMemoryBarrier2 entries (CA loop + head + host)
+  uint32_t imageBarriers = 0;   // VkImageMemoryBarrier2 entries (layout transitions)
+};
+
+// Phase 4b: one frame's attachments, resolved to backend images by the seam.
+// `color == nullptr` is invalid; `depth == nullptr` means no depth attachment
+// (rhi::RenderPassDesc::hasDepth == false).
+struct RenderAttachments {
+  Image* color = nullptr;
+  bool clearColor = true;
+  float clearRGBA[4] = {0, 0, 0, 1};
+  Image* depth = nullptr;
+  bool clearDepth = true;
+  float depthClear = 0.0f;  // reversed-Z: far
 };
 
 // Records one command buffer's worth of table rows, generating every barrier.
@@ -232,6 +246,41 @@ class Recorder {
   // the tracker is what makes the WAR fall out instead of being remembered.
   void FillTracked(pass::Buf id, Buffer* dst);
 
+  // ---- the render domain (phase 4b, barrier_graph §2.6/§3.2) ---------------
+  //
+  // §3.2's stage-parameter extension: for the render table, StorageRead/Uniform
+  // map to VERTEX|FRAGMENT instead of COMPUTE, and the attachments add
+  // COLOR_ATTACHMENT/DEPTH accesses. Rather than re-declaring §2.6's read-only
+  // rows one by one, the domain shift happens at the ONE point where it can
+  // matter: draws are read-only over everything the tick wrote (§2.6), and
+  // barriers are illegal inside a dynamic-rendering scope anyway, so every
+  // buffer hazard must resolve BEFORE vkCmdBeginRendering. BeginRendering()
+  // therefore flushes the tracker: every buffer written earlier in THIS
+  // recording gets one derived barrier src = its last writer, dst = the whole
+  // render-read domain (VERTEX|FRAGMENT shader reads + DRAW_INDIRECT's
+  // INDIRECT_COMMAND_READ — §4.5's drawArgs edge). Writers in PREVIOUS submits
+  // are covered by the §3.4 head barrier, exactly as they are for compute.
+  // Nothing is written by hand; the source scopes come from the tracker.
+  //
+  // Image layout transitions are derived the same way: Image::layout is the
+  // authoritative current layout (it persists across command buffers), and the
+  // per-recording image side state supplies the source stage/access. No
+  // hand-placed image barrier either.
+  void BeginRendering(const RenderAttachments& att);
+  void EndRendering();
+  // Draws record inside the open rendering scope. No barrier can be (or needs
+  // to be) emitted here; routing them through the recorder keeps the "every
+  // command is reachable only through the recorder" property plus stats, and
+  // DrawIndirect notes the args read so a later same-buffer writer WARs.
+  void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+            uint32_t firstInstance);
+  void DrawIndirect(Buffer* args, uint64_t offset);
+  // The screenshot path: transition `src` to TRANSFER_SRC (derived from its
+  // tracked attachment write) and copy into `dst` (registered for the Finish()
+  // host barrier when mapped). `bytesPerRow` is converted to texels here.
+  void CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
+                         uint32_t bytesPerRow, uint32_t w, uint32_t h);
+
   const RecordStats& Stats() const { return stats_; }
 
  private:
@@ -268,11 +317,28 @@ class Recorder {
   BarrierMode mode_ = BarrierMode::Precise;
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
 
+  // Emit the render-domain flush described above BeginRendering: one derived
+  // barrier per buffer with a live write in this recording, dst = the render
+  // read domain. Records the reads into the tracker so later writers WAR.
+  void FlushForRenderDomain();
+  // Derived image layout transition: src from the per-recording image state
+  // (0 = untouched this recording — prior submits are ordered by the §3.4 head
+  // barrier), oldLayout from Image::layout. Appends to pendingImg_; batched by
+  // the caller into one vkCmdPipelineBarrier2.
+  void TransitionImage(Image* im, VkImageLayout newLayout,
+                       VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess);
+  void FlushPendingImages();
+
   BufState state_[(int)pass::Buf::kCount] = {};
   // Last-access state for buffers with no pass::Buf id (staging destinations,
   // the timer resolve buffer), keyed by pointer. Never more than a handful per
   // command buffer; linear scan is fine.
   std::vector<std::pair<Buffer*, BufState>> extra_;
+  // Per-recording image access state (stage/access since the recording began);
+  // the LAYOUT itself lives on vk::Image and persists across recordings.
+  std::vector<std::pair<Image*, BufState>> imgState_;
+  std::vector<VkImageMemoryBarrier2> pendingImg_;
+  bool renderOpen_ = false;
   std::vector<VkBufferMemoryBarrier2> pending_;
   // Host-visible buffers written during this recording, for the Finish()
   // barrier. Kept as a small vector rather than a set: it is never more than a

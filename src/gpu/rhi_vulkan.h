@@ -112,6 +112,14 @@ struct Caps {
   bool validationEnabled = false;
   bool syncValidationEnabled = false;
 
+  // --- dynamic rendering (phase 4b) ---
+  // The render path records with vkCmdBeginRendering rather than VkRenderPass
+  // objects (barrier_graph §1.2 already assumes it). Mandatory in core 1.3 —
+  // like synchronization2 it still must be ENABLED at device creation, and the
+  // backend refuses to init without it rather than shipping a second (render
+  // pass object) code path nothing would exercise.
+  bool dynamicRendering = false;
+
   // --- synchronization2 (phase 3b) ---
   // vkCmdPipelineBarrier2 is the ONE barrier command the generated-barrier
   // recorder emits, and every scope in docs/vulkan_barrier_graph.md §3.2 is
@@ -132,6 +140,24 @@ struct Buffer {
   uint64_t size = 0;
   // Non-null for host-visible allocations (staging ring, readback slots).
   void* mapped = nullptr;
+  std::string label;
+};
+
+// --------------------------------------------------------------- image ----
+//
+// Phase 4b: render attachments (offscreen color, the depth buffer, swapchain
+// images) and the screenshot copy source. `layout` is the image's CURRENT
+// layout — a property of the image, not of a recording, so it persists across
+// command buffers and the recorder derives every transition from it
+// (vk_record.h: no hand-placed image barriers either).
+struct Image {
+  VkImage img = VK_NULL_HANDLE;
+  VmaAllocation alloc = nullptr;  // null when the swapchain owns the VkImage
+  VkImageView view = VK_NULL_HANDLE;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  uint32_t width = 0, height = 0;
+  VkImageAspectFlags aspect = 0;
+  VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
   std::string label;
 };
 
@@ -247,6 +273,27 @@ class Backend {
   // (§4.3 step 5), which is a genuine block exactly as `WaitAny` blocks today.
   bool WaitFence(VkFence f, std::string& err);
 
+  // ---- images + graphics pipelines (phase 4b) ----
+  //
+  // CreateImage allocates a device-local VkImage + view. No zero-init queue
+  // entry: attachments are initialized by their loadOp (Clear) and the
+  // UNDEFINED->attachment transition the recorder derives, which is the Vulkan
+  // idiom WebGPU's lazy-clear maps onto for render targets.
+  Image* CreateImage(uint32_t w, uint32_t h, rhi::TextureFormat fmt,
+                     rhi::TextureUsage usage, const char* label);
+  // Deferred like buffers: freed once every submit in flight at the call has
+  // retired (the depth target is recreated on resize; gates create and drop
+  // offscreen targets).
+  void DestroyImageDeferred(Image* im);
+
+  // Graphics pipeline against dynamic rendering (no VkRenderPass object).
+  // `d` supplies formats/blend/cull/topology/depth; vs/fs are Tint-compiled
+  // single-entry-point modules from GetShaderModule.
+  VkPipeline CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModule vs,
+                                    const char* vsEntry, VkShaderModule fs,
+                                    const char* fsEntry, const rhi::RenderPipelineDesc& d,
+                                    const char* label);
+
   // ---- shaders ----
   //
   // Compiles WGSL to SPIR-V through Tint and creates a VkShaderModule. Cached
@@ -320,6 +367,13 @@ class Backend {
     VmaAllocation alloc = nullptr;
     uint64_t serial = 0;
   };
+  // Same discipline for images (phase 4b).
+  struct DoomedImage {
+    VkImage img = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+    uint64_t serial = 0;
+  };
 
   bool PickPhysicalDevice(bool lowPower, std::string& err);
   void QueryCaps();
@@ -345,6 +399,9 @@ class Backend {
 
   // The zero-init registry (§4.8). Owning, so the backend can free everything.
   std::vector<std::unique_ptr<Buffer>> buffers_;
+  // Image registry (phase 4b). Owning, same lifetime rules as buffers_.
+  std::vector<std::unique_ptr<Image>> images_;
+  std::vector<DoomedImage> imageGraveyard_;
 
   // Pending uploads, in ISSUE ORDER. Never sorted, never coalesced.
   std::vector<Pending> pending_;
