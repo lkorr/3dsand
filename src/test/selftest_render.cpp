@@ -282,7 +282,10 @@ const std::vector<Gate>& RenderGates() {
   static const std::vector<Gate> g = {
       {"far-fog", "render", {}, false, GateFarFog},
       {"far-downsample", "render", {}, false, GateFarDownsample},
-      {"screenshots", "render", {}, false, GateScreenshots},
+      // The only gate in this file that actually DRAWS: far-fog and
+      // far-downsample exercise the far-field cascades through compute and a
+      // one-word readback, and never touch the offscreen target.
+      {"screenshots", "render", {}, false, GateScreenshots, /*needsRender=*/true},
   };
   return g;
 }

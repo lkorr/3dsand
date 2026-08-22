@@ -254,9 +254,16 @@ int List() {
       for (const char* d : g.deps) std::printf(" %s", d);
     }
     if (g.advisory) std::printf("  [advisory]");
+    // Declared, not inferred — see the Gate::needsRender comment. Printing it
+    // is what makes "which gates could run before the Vulkan render path
+    // exists" a question with an answer in the binary rather than in a commit
+    // message.
+    if (g.needsRender) std::printf("  [needs-render]");
     std::printf("\n");
   }
   std::printf("\nrun one:  sandvox --selftest --gate <name>\n");
+  std::printf("[needs-render] = drives the offscreen target / a draw; the rest\n"
+              "are compute + readback only (Vulkan port phase 4).\n");
   return 0;
 }
 

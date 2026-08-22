@@ -426,6 +426,45 @@ behavior change.*
 > one: a model where uploads ride their own submit passes the first three steps
 > and fails there.
 
+> **[AS BUILT] Phase 3c deliverable 3 — `--selftest --backend vulkan` is
+> REFUSED, and this is the deliverable's honest outcome rather than a gap.**
+>
+> The brief asked for the gates that do not render to run on Vulkan, with a
+> per-gate flag or a curated skip list as the mechanism. Neither mechanism is the
+> blocker, and discovering that is the result: **the gates never touch a
+> backend.** They drive `World`, `Simulation`, `Stream`, `Physics` and
+> `MobSystem`, and every GPU resource those own is an `rhi::` handle. `rhi::` has
+> exactly one implementation — `rhi_dawn.cpp`, where every impl struct is a
+> `wgpu::` holder. A second implementation of the same handle types cannot
+> coexist in one binary without making all ~50 of those methods virtual, which is
+> a restructure of the backend that is currently the port's only hash oracle.
+> Phase 2a declined that deliberately and phase 3 did not revisit it:
+> `vk::SimBackend` is a parallel set of resource DECLARATIONS driven by the
+> shared pass table, explicitly *not* an `rhi::` backend (`vk_sim.h` says so).
+>
+> There is therefore no way to hand a gate a Vulkan `World`, and the three
+> available responses were: run on Dawn and print "backend: vulkan" (a lie, and
+> exactly what 3b's refusal exists to prevent); skip every gate and report a
+> green run of nothing; or refuse and say what is missing. **The flag refuses,
+> with the reason and the alternative in the message.**
+>
+> What phase 3c ships in its place is `--vk-smoke-loud`, which drives the same
+> tick chain the gates drive and compares hashes against Dawn at 19 points. That
+> is the determinism property `--selftest --backend vulkan` was wanted for; it is
+> simply not spelled `--selftest`.
+>
+> **What DID land from this deliverable: `Gate::needsRender`, declared per gate
+> and printed by `--list`.** Three of the 23 gates need the render path —
+> `screenshots` (the only one in the render group that actually draws; `far-fog`
+> and `far-downsample` exercise the cascades through compute and a one-word
+> readback), `mob` (the 14-angle micro-body view sweep), and `perf` (no draw of
+> its own, but its verdict reads `bestFrameMs`, which only `screenshots` sets).
+> The other 20 are compute + readback only. That is the list phase 4/5 needs the
+> moment `rhi::` can carry two backends, and it is now a property of each gate
+> rather than a curated list in a commit message that goes stale the first time a
+> gate learns to draw. Nothing consumes it to skip a gate yet, and the header
+> comment says so.
+
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
 barriers generated from the pass table, indirect dispatch (keep the staging
@@ -437,6 +476,18 @@ on real fences, `vkCmdFillBuffer` zero-init for all buffers at creation,
 2. **Cross-backend hash equality**: same seed/ticks, Dawn vs Vulkan, identical
    world-hash sequence (scripted via `--selftest --json`).
 3. All compute-only gates green on Vulkan; default Dawn build still fully green.
+
+**[AS BUILT] Checkpoints 1 and 3 were written on a false premise and are
+superseded.** Both assume `--selftest` can be pointed at a backend. It cannot:
+the gates hold `rhi::` handles and `rhi::` has one implementation, so there is
+no Vulkan `World` to give them (phase 3c deliverable 3 below). What actually
+discharges the intent behind them is checkpoint 2, widened: `--vk-smoke` (quiet,
+3b) and `--vk-smoke-loud` (active, 3c) run the same tick chain on both backends
+and compare world hashes — 5 probes over a settled world, 19 over an active one
+with ops, explosions, particles, the readback ring and streaming. The Dawn
+selftest stays fully green throughout, which is the other half of checkpoint 3
+and is unaffected. Running the gate BODIES on Vulkan requires making `rhi::`
+polymorphic and is folded into phase 4/5.
 
 **Phase 4 — Vulkan render path.**
 Swapchain, the 6 raster pipelines, reversed-Z depth, `imgui_impl_vulkan`,

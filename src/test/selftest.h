@@ -107,6 +107,22 @@ struct Gate {
   std::vector<const char*> deps;
   bool advisory = false;          // reports, never fails the run (perf)
   Status (*fn)(Ctx&, std::string& detail);
+  // Does this gate need the RENDER path — the offscreen target, a render
+  // pipeline, a draw?
+  //
+  // Declared rather than inferred, for the Vulkan port. Phase 4 brings up the
+  // Vulkan render path, and the question "which gates could run before it
+  // exists" then has a machine-readable answer instead of a curated list in
+  // someone's commit message that goes stale the first time a gate learns to
+  // draw. `--list` prints it.
+  //
+  // The honest current status: NOTHING consumes this to skip a gate yet,
+  // because `--selftest --backend vulkan` does not run gates on Vulkan at all
+  // (see the refusal in main.cpp — the gates drive World/Simulation/Stream
+  // through rhi:: handles that only Dawn implements). It is declared now
+  // because the fact belongs next to the gate, and because a flag added later
+  // is a flag someone has to audit 23 gates to fill in correctly.
+  bool needsRender = false;
 };
 
 // The registry, in declaration order. Defined across src/test/selftest_*.cpp

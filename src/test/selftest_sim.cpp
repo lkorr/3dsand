@@ -818,7 +818,9 @@ const std::vector<Gate>& SimGates() {
       {"blood-stain", "sim", {}, false, GateBloodStain},
       {"flung-liquid", "sim", {}, false, GateFlungLiquid},
       {"prefab", "sim", {}, false, GatePrefab},
-      {"perf", "sim", {"screenshots"}, true, GatePerf},
+      // No draw of its own, but its verdict reads bestFrameMs, which only the
+      // screenshots gate sets — so it needs the render path transitively.
+      {"perf", "sim", {"screenshots"}, true, GatePerf, /*needsRender=*/true},
   };
   return g;
 }
