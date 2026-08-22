@@ -73,6 +73,23 @@ IVY = 80
 # the meadow set is present; resolved by name like everything else, and the
 # creeper falls back to its own green if it is not there.
 PETAL_PINK = 64
+PETAL_BLUE = 63
+# The meadow set. Same defaults-are-stale caveat: resolved by name below.
+FLOWER_BLUEBELL = 65
+FLOWER_FOXGLOVE = 66
+FLOWER_BUTTERCUP = 67
+FLOWER_CLOVER = 68
+FLOWER_WILDROSE = 69
+# The desert / pine / alpine set. These were referenced by the models below but
+# never declared or registered for name resolution, so this file raised
+# NameError and the committed .vox art for them could not be regenerated —
+# the same dead-end the meadow set was in. Same stale-defaults caveat.
+WOOD = 2               # the pre-existing trunk material, for woody stems
+CACTUS_BLOOM = 72
+DESERT_SCRUB = 73
+DRY_TUSSOCK = 74
+HEATH_SHRUB = 75
+ALPINE_CUSHION = 76
 
 # Every material name this file paints WITH or declares a model FOR. Palette
 # index == material id, so all of these must resolve or the .vox paints the
@@ -89,6 +106,18 @@ _ID_NAMES = {
     "LEAF_GREEN": "leaf_green",
     "STEM_GREEN": "stem_green",
     "PETAL_PINK": "petal_pink",
+    "PETAL_BLUE": "petal_blue",
+    "FLOWER_BLUEBELL": "flower_bluebell",
+    "FLOWER_FOXGLOVE": "flower_foxglove",
+    "FLOWER_BUTTERCUP": "flower_buttercup",
+    "FLOWER_CLOVER": "flower_clover",
+    "FLOWER_WILDROSE": "flower_wildrose",
+    "WOOD": "wood",
+    "CACTUS_BLOOM": "cactus_bloom",
+    "DESERT_SCRUB": "desert_scrub",
+    "DRY_TUSSOCK": "dry_tussock",
+    "HEATH_SHRUB": "heath_shrub",
+    "ALPINE_CUSHION": "alpine_cushion",
     "VINE_HANG": "vine_hang",
     "CREEPER_FLOWER": "creeper_flower",
     "MOSS_HANG": "moss_hang",
@@ -282,6 +311,176 @@ def flower_daisy():
     v += ring(3, 3, h, 1, 2.6, PETAL_WHITE)
     v += disc(3, 3, h, 1, PETAL_YELLOW)
     v.append((3, 3, h + 1, PETAL_YELLOW))
+    return v
+
+
+# ---- meadow flowers ---------------------------------------------------------
+# These five were authored once, lost when a concurrent session ran
+# `git reset --hard` on the shared tree, and are re-authored here. The .vox
+# binaries survived in the commit; the source did not, which made the art a
+# dead end nobody could edit. That is the whole reason this block exists.
+#
+# THE AUTHORING RULE FOR THIS SET is a third one, different from both the
+# stand-up models above and the hanging strands below: worldgen stacks a meadow
+# flower 1-5 cells tall (flowerAt/flowerHeight in worldgen.wgsl), repeating THE
+# SAME model in every cell of the stack. So each model has to work in two roles
+# at once:
+#
+#   * as a WHOLE PLANT, when the species is one cell tall (clover), and
+#   * as a SLICE of a taller plant, where it sits above a copy of itself.
+#
+# Which means the stem must reach z=0 AND z=S-1 (like a vine strand) or a tall
+# foxglove shows a gap at every cell boundary — but the blossom must NOT sit at
+# the very top, or a 4-cell plant grows four flower heads stacked like beads.
+# The resolution used here: put the flowering mass on the SIDES of the stalk
+# (bells, florets, hips) rather than as a cap on top. A side-flowering model
+# tiles into a continuous flowering spire, which is what a real foxglove or
+# bluebell actually looks like, and it is why none of these five are built like
+# the poppy/daisy above.
+#
+# The one exception is clover, which is always exactly one cell (height 1 in
+# flowerHeight) and therefore free to be a flat trefoil mat with no through-stem.
+
+
+def _stalk(x, y, mat, lean=0, s=S):
+    """A stem running the FULL height of the cell, z=0..s-1.
+
+    Full height is what makes a stacked flower one continuous plant instead of
+    a dashed line — the same constraint the vine cords below carry.
+    """
+    out = []
+    for z in range(s):
+        dx = (lean * z) // max(s - 1, 1)
+        px = x + dx
+        if 0 <= px < s:
+            out.append((px, y, z, mat))
+    return out
+
+
+def flower_bluebell(lean):
+    """A bowed stalk hung with one-sided nodding bells.
+
+    Bells hang off ONE side only, which is the bluebell's whole silhouette and
+    also what keeps a stacked spire from reading as radially symmetric mush.
+    """
+    v = []
+    v += _stalk(3, 3, STEM_GREEN, lean=lean)
+    # Bells down the length of the stalk, alternating slightly in reach so a
+    # stacked pair does not line its bells up into a straight column.
+    for z, reach in ((1, 1), (3, 2), (5, 1), (6, 2)):
+        dx = (lean * z) // max(S - 1, 1)
+        bx = 3 + dx + reach
+        if bx >= S:
+            continue
+        # each bell: a two-voxel drooping cup
+        v.append((bx, 3, z, PETAL_BLUE))
+        if z + 1 < S:
+            v.append((bx, 3, z + 1, PETAL_BLUE))
+        if bx + 1 < S and z > 0:
+            v.append((bx, 2, z, PETAL_BLUE))
+    # a strap leaf low down, the way a bluebell sits in the sward
+    v.append((2, 4, 0, LEAF_GREEN))
+    v.append((2, 4, 1, LEAF_GREEN))
+    return v
+
+
+def flower_foxglove(lean):
+    """The spire: a thick stalk sleeved in tubular florets on two faces.
+
+    This is the species that stacks tallest (up to 5 cells / 50 cm), so it is
+    authored strictly as a repeating SLICE — florets on the sides, nothing that
+    reads as a terminal tip, and a stalk touching both cell faces.
+    """
+    v = []
+    v += _stalk(3, 3, STEM_GREEN, lean=lean)
+    v += _stalk(4, 3, STEM_GREEN, lean=lean)  # a fat bole: it is a big plant
+    for z in range(0, S, 2):
+        dx = (lean * z) // max(S - 1, 1)
+        # florets left and right, offset in z so the two sides interleave
+        lx = 3 + dx - 1
+        rx = 4 + dx + 1
+        if 0 <= lx < S:
+            v.append((lx, 3, z, PETAL_PINK))
+            if z + 1 < S:
+                v.append((lx, 2, z + 1, PETAL_PINK))
+        if 0 <= rx < S and z + 1 < S:
+            v.append((rx, 3, z + 1, PETAL_PINK))
+            v.append((rx, 4, z, PETAL_PINK))
+    return v
+
+
+def flower_buttercup(lean):
+    """A branching cluster of small yellow cups on wiry stems."""
+    v = []
+    v += _stalk(3, 3, STEM_GREEN, lean=lean)
+    # two side stems carrying the cups out from the main axis
+    for (bx, by, bz) in ((2, 3, 3), (5, 4, 5)):
+        v.append((bx, by, bz, STEM_GREEN))
+        v.append((bx, by, bz + 1, STEM_GREEN)) if bz + 1 < S else None
+        # the cup: a tiny 5-voxel rosette, yellow
+        cz = min(bz + 2, S - 1)
+        v.append((bx, by, cz, PETAL_YELLOW))
+        for (ox, oy) in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            px, py = bx + ox, by + oy
+            if 0 <= px < S and 0 <= py < S:
+                v.append((px, py, cz, PETAL_YELLOW))
+    v.append((4, 2, 1, LEAF_GREEN))
+    v.append((2, 4, 2, LEAF_GREEN))
+    return v
+
+
+def flower_clover():
+    """A flat trefoil mat with a couple of round white heads.
+
+    ALWAYS one cell tall (flowerHeight returns 1), so this is the one model in
+    the set that does NOT need a through-stem — it is ground cover, and it
+    should read as lawn you could lie down in rather than as a stem.
+    """
+    v = []
+    # trefoil leaves: three small lobes on short petioles, lying low
+    for (cx, cy) in ((2, 2), (5, 3), (3, 5)):
+        v.append((cx, cy, 0, STEM_GREEN))
+        for (ox, oy) in ((0, 0), (1, 0), (0, 1)):
+            v.append((cx + ox, cy + oy, 1, LEAF_GREEN))
+    # two white flower heads just above the leaf mat
+    v.append((4, 5, 2, PETAL_WHITE))
+    v.append((2, 3, 2, PETAL_WHITE))
+    return v
+
+
+def flower_wildrose(lean):
+    """An arching woody briar: thorny cane, sparse leaves, a few pink blooms.
+
+    Placed at the canopy EDGE by worldgen rather than in the open meadow, and
+    stacks to 3-4 cells, so like the foxglove it is authored as a repeating
+    slice of cane rather than as a single shrub with a top.
+    """
+    v = []
+    # the cane, woody and slightly off-centre so a stack reads as arching
+    v += _stalk(4, 4, STEM_GREEN, lean=lean)
+    # thorns/short side shoots
+    for z in (1, 4, 6):
+        dx = (lean * z) // max(S - 1, 1)
+        sx = 4 + dx - 1
+        if 0 <= sx < S:
+            v.append((sx, 4, z, STEM_GREEN))
+    # compound leaves off the cane
+    for (lx, ly, lz) in ((2, 4, 2), (6, 3, 5), (3, 5, 6)):
+        if 0 <= lx < S and 0 <= ly < S and lz < S:
+            v.append((lx, ly, lz, LEAF_GREEN))
+            if lx + 1 < S:
+                v.append((lx + 1, ly, lz, LEAF_GREEN))
+    # blooms: five-petal flat faces on the side of the cane, never on top
+    for (bz, bx) in ((2, 6), (5, 2)):
+        dx = (lean * bz) // max(S - 1, 1)
+        px = bx + dx
+        if not (0 <= px < S):
+            continue
+        v.append((px, 4, bz, PETAL_PINK))
+        for (ox, oy) in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            qx, qy = px + ox, 4 + oy
+            if 0 <= qx < S and 0 <= qy < S:
+                v.append((qx, qy, bz, PETAL_PINK))
     return v
 
 
@@ -573,6 +772,16 @@ def main():
         ("foliage", [foliage()]),
         ("flower_poppy", [flower_poppy(0), flower_poppy(1)]),
         ("flower_daisy", [flower_daisy()]),
+        # ---- meadow flowers ----
+        # The four stalked species sway; clover is a flat mat with nothing to
+        # move. Every one of these is stacked 1-5 cells deep by worldgen, so the
+        # flipbook is paid once per MODEL and not once per cell of the stalk —
+        # the same economics the vine strands below rely on.
+        ("flower_bluebell", [flower_bluebell(0), flower_bluebell(1)]),
+        ("flower_foxglove", [flower_foxglove(0), flower_foxglove(1)]),
+        ("flower_buttercup", [flower_buttercup(0), flower_buttercup(1)]),
+        ("flower_clover", [flower_clover()]),
+        ("flower_wildrose", [flower_wildrose(0), flower_wildrose(1)]),
         # ---- vines / climbers / hanging moss ----
         # The two HANGING strands sway; the moss beard and the wall ivy do not.
         # Same brick-pool reasoning as the undergrowth above, with one addition:

@@ -97,6 +97,11 @@ const M_FOXGLOVE  : u32 = 66u;
 const M_BUTTERCUP : u32 = 67u;
 const M_CLOVER    : u32 = 68u;
 const M_WILDROSE  : u32 = 69u;
+// Tallest a meadow flower can be, in CELLS — must be >= the largest value
+// flowerHeight() can return (foxglove, 3 + 2 = 5). It bounds the Y range the
+// stalk branch scans, so an under-count silently beheads the tall species and
+// an over-count just costs a few wasted evaluations per column.
+const FLOWER_MAX_H : i32 = 5;
 // ---- shoreline: the wet fringe outside a pond (materials.json ids 81..87) ----
 // Placed by the shore-cover block in genCell against shoreAt(). Like the vine
 // block above, these landed at ids other than the ones reserved for them
@@ -1439,6 +1444,94 @@ fn cactusAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
 // Everything placed is INERT (rule 2): no reaction in reactions.json uses any
 // of these as `self` with an emit, so a generated forest floor settles and
 // sleeps exactly as the bare one did.
+// ---- meadow flowers: which species, and how tall --------------------------
+// A micro model is ONE world cell, and a cell is VOXEL_METERS = 10 cm. So a
+// single-cell flower is 10 cm tall whatever its model does, and every species
+// is the same height as every other — a "foxglove" (1-2 m in life) came out the
+// same size as clover. That is the tabletop-model-of-itself failure the tree
+// block above documents, in miniature.
+//
+// The fix is the reed pattern: a flower is a STACK of cells, and the model in
+// each cell is the same micro model repeated. Height is per-species (a briar is
+// not a clover) with a per-plant hash jitter on top, so a patch has a natural
+// height spread instead of being a mown lawn of identical stems.
+//
+// flowerSpecies() is the single source of truth for "what grows in this
+// column", called by BOTH the base-cell branch and the upper-stalk branch.
+// Sharing it is what makes a stalk one continuous plant rather than two
+// unrelated halves that happen to be adjacent — the same reason the reed block
+// tests the same hashes above and below the waterline.
+struct Flower {
+  mat    : u32,   // MAT_AIR when this column grows no flower
+  height : i32,   // total cells, >= 1
+};
+
+// Per-species base height in CELLS, jittered per plant. Ranges are chosen
+// against the 10 cm cell: clover is ground cover and stays 1 cell (10 cm),
+// while a foxglove spire reaches 4 (40 cm). These are deliberately at the low
+// end of life-size — a true 1.5 m foxglove is 15 cells, which at meadow density
+// would be a wall of stems the player cannot see over.
+fn flowerHeight(sp : u32, h : u32) -> i32 {
+  switch (sp) {
+    case M_CLOVER:    { return 1; }                        // 10 cm mat
+    case M_BUTTERCUP: { return 2 + i32(h % 2u); }           // 20-30 cm
+    case M_BLUEBELL:  { return 2 + i32(h % 2u); }           // 20-30 cm
+    case M_WILDROSE:  { return 3 + i32(h % 2u); }           // 30-40 cm briar
+    default:          { return 3 + i32(h % 3u); }           // foxglove 30-50 cm
+  }
+}
+
+// Which flower this column grows, and how tall. `cover` is the canopy cover
+// from undergrowthSite (wild rose is a woodland-margin plant, so it is placed
+// by cover rather than by the species field).
+//
+// Pure function of (x, z, seed, cover): the upper-stalk branch re-derives it
+// per cell WITHOUT re-running the 25-tile scan, by passing the cover it already
+// knows is irrelevant there (see the call site) — so a taller flower costs a
+// few hashes per extra cell, never another scan.
+fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
+  var f : Flower;
+  f.mat = MAT_AIR;
+  f.height = 0;
+
+  let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
+  let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
+  let biome = biomeAt(x, z, seed);
+  var thresh = 0u;
+  if (biome == B_MEADOW) { thresh = select(6u, 60u, clump > 165); }
+  else                   { thresh = select(2u, 16u, clump > 190); }
+  if ((fr % 1000u) >= thresh) { return f; }
+
+  let sp = vnoise(x + 911, z - 733, 40 * HSCALE, seed ^ 0xF1A5u);
+  let spj = sp + (vnoise(x, z, 11 * HSCALE, seed ^ 0xF1A6u) - 128) / 4;
+  let hBell = hash3(seed ^ 0xB1E7u, bitcast<u32>(x), bitcast<u32>(z));
+  let hFoxg = hash3(seed ^ 0xF0C9u, bitcast<u32>(x), bitcast<u32>(z));
+  let hButt = hash3(seed ^ 0x8B77u, bitcast<u32>(x), bitcast<u32>(z));
+  let hClov = hash3(seed ^ 0xC10Fu, bitcast<u32>(x), bitcast<u32>(z));
+  let hRose = hash3(seed ^ 0x8053u, bitcast<u32>(x), bitcast<u32>(z));
+
+  // Grass is the default: a meadow is grass WITH flowers in it. Grass and petal
+  // stay ONE cell — they are the ground layer the flowers rise out of.
+  var m = select(M_PETAL, M_GRASS, (fr >> 11u) % 4u != 0u);
+  if (spj < 55) {
+    if ((hBell % 3u) == 0u) { m = M_BLUEBELL; }
+  } else if (spj < 100) {
+    if ((hButt % 2u) == 0u) { m = M_BUTTERCUP; }
+  } else if (spj < 140) {
+    if ((hClov % 3u) != 0u) { m = M_CLOVER; }
+  } else if (spj < 175) {
+    if ((hFoxg % 7u) == 0u) { m = M_FOXGLOVE; }
+    else if ((hButt % 3u) == 0u) { m = M_BUTTERCUP; }
+  }
+  if (cover >= UG_COVER_EDGE && (hRose % 9u) == 0u) { m = M_WILDROSE; }
+
+  f.mat = m;
+  // Only the five flowers stack; grass and petal are the one-cell ground layer.
+  if (m == M_GRASS || m == M_PETAL) { f.height = 1; }
+  else { f.height = flowerHeight(m, hFoxg >> 7u); }
+  return f;
+}
+
 struct Undergrowth {
   cover   : i32,   // 0 = open sky, 255 = deep under a crown
   trunkD2 : i32,   // squared XZ distance to the nearest trunk, or a large value
@@ -1967,92 +2060,15 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
       // always meant to be the light-loving layer; it just had nothing to be
       // the complement of. Its rates are untouched.
       //
-      // clump mask: flowers grow in patches, not as uniform static
-      let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
-      // Tuned down deliberately: at ~15% coverage the flowers read as confetti
-      // sprayed over the whole map rather than as patches in a meadow. Keeping
-      // them inside the clump mask and rare outside it is what makes finding a
-      // flowery clearing feel like finding something.
-      var thresh = 0u;
-      if (biome == B_MEADOW) { thresh = select(6u, 60u, clump > 165); }
-      else                   { thresh = select(2u, 16u, clump > 190); }
-      let roll = fr % 1000u;
-      if (roll < thresh) {
-        // ---- WHICH flower: by PATCH, never per cell ----
-        // The species is read off its OWN low-frequency field rather than off
-        // the per-column hash, and that is the whole point of this block. A
-        // per-cell species roll gives a statistically perfect mixture, which
-        // reads as confetti: bluebell, buttercup, bluebell, foxglove, all
-        // within a metre. Real meadows are mosaics of near-monocultures, so a
-        // patch has to be ONE species over many cells, and the boundary between
-        // two patches is where the interest is.
-        //
-        // 40-voxel cells (2.5 m at the current scale) is deliberately COARSER
-        // than the 24-cell density clump: the density mask decides how thick the
-        // flowers are, the species mask decides which they are, and if the two
-        // shared a scale every patch would be one species at one density and the
-        // map would look tiled. Offsetting the sample point as well as the salt
-        // keeps the two lattices from lining up at their cell corners.
-        let sp = vnoise(x + 911, z - 733, 40 * HSCALE, seed ^ 0xF1A5u);
-        // A SECOND, finer field breaks the species boundaries up so patches
-        // interlock instead of meeting on a smooth vnoise contour — the same
-        // trick biomeAt uses on the biome edge, and for the same reason.
-        let spj = sp + (vnoise(x, z, 11 * HSCALE, seed ^ 0xF1A6u) - 128) / 4;
-        // Per-species salts. NOT bit-slices of `fr`: slices of one hash share
-        // entropy, so the rolls correlate and the species that happens to be
-        // tested first wins far more often than its rate says. Same failure the
-        // pond-life block above documents.
-        let hBell = hash3(seed ^ 0xB1E7u, bitcast<u32>(x), bitcast<u32>(z));
-        let hFoxg = hash3(seed ^ 0xF0C9u, bitcast<u32>(x), bitcast<u32>(z));
-        let hButt = hash3(seed ^ 0x8B77u, bitcast<u32>(x), bitcast<u32>(z));
-        let hClov = hash3(seed ^ 0xC10Fu, bitcast<u32>(x), bitcast<u32>(z));
-        let hRose = hash3(seed ^ 0x8053u, bitcast<u32>(x), bitcast<u32>(z));
-
-        // Grass is the default everywhere: a meadow is grass WITH flowers in
-        // it, and every species below only ever replaces the grass it would
-        // otherwise have been. That ordering is what bounds the whole block —
-        // no branch here can add a cell that `roll < thresh` did not already
-        // grant, so the total coverage is exactly what it was before.
-        mat = select(M_PETAL, M_GRASS, (fr >> 11u) % 4u != 0u);  // mostly tufts
-
-        // Within a patch a species takes only a FRACTION of the cells, so grass
-        // still shows between the flowers. The fractions differ per species
-        // because the plants differ: clover is ground cover and near-solid where
-        // it grows, buttercups are dense, bluebells thinner, and the foxglove
-        // spire is a punctuation mark — one every few metres, never a stand.
-        if (spj < 55) {
-          // BLUEBELLS: the shaded end of the open ground, nearest the trees.
-          if ((hBell % 3u) == 0u) { mat = M_BLUEBELL; }
-        } else if (spj < 100) {
-          // BUTTERCUPS: the dense sunlit sward. The commonest of the five.
-          if ((hButt % 2u) == 0u) { mat = M_BUTTERCUP; }
-        } else if (spj < 140) {
-          // CLOVER: ground cover, so the highest fraction of its patch. It is
-          // also the shortest, which is why a near-solid clover patch still
-          // reads as lawn rather than as a wall of flowers.
-          if ((hClov % 3u) != 0u) { mat = M_CLOVER; }
-        } else if (spj < 175) {
-          // FOXGLOVE: the spire. Rare INSIDE its own patch on purpose — this is
-          // the only species whose model fills its cell's full height, so a
-          // dense stand of them is a fence. One in seven gives a scatter of
-          // verticals over a buttercup-and-grass floor.
-          if ((hFoxg % 7u) == 0u) { mat = M_FOXGLOVE; }
-          else if ((hButt % 3u) == 0u) { mat = M_BUTTERCUP; }
-        } else {
-          // The rest of the field stays plain grass and petal, which is what
-          // makes the flowery patches read as patches. A species in every band
-          // would be a five-colour quilt with no plain ground between.
-        }
-
-        // WILD ROSE overrides all of the above, and is placed by CANOPY EDGE
-        // rather than by the species field: a briar is a shrub of the woodland
-        // margin, not a meadow plant, so its natural home is the half-lit ring
-        // this layer already computes for the litter fringe below. Gating it on
-        // ug.cover instead of on `spj` also means it never competes for patch
-        // area with the four meadow species — it grows where they thin out.
-        if (ug.cover >= UG_COVER_EDGE && (hRose % 9u) == 0u) {
-          mat = M_WILDROSE;
-        }
+      // clump mask, species field and per-species rolls all live in flowerAt()
+      // now, because the upper cells of a tall flower have to re-derive exactly
+      // the same answer. Everything the old inline block did is still done, in
+      // the same order, with the same salts and the same rates — see flowerAt.
+      let fl = flowerAt(x, z, seed, ug.cover);
+      if (fl.mat != MAT_AIR) {
+        // The base cell of the plant. Cells 1..height-1 are placed by the
+        // separate stalk branch below, which re-derives this same answer.
+        mat = fl.mat;
       } else if (ug.cover >= UG_COVER_EDGE &&
                  (hLit % UG_LITTER_EDGE_CHANCE) == 0u) {
         // The half-lit margin still gets litter, thinly. Without it the two
@@ -2062,6 +2078,42 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
         // looks like, and it costs one more roll on columns that grew nothing.
         mat = M_LITTER;
       }
+    }
+  }
+
+  // ---- meadow flowers, cells 2..height: the rest of the stalk ---------------
+  // The block above places only the BASE cell (y == h + 1). A flower taller
+  // than one cell continues here, exactly the way the reed block continues its
+  // stalk above the waterline: same column, same hashes, same species answer,
+  // so the plant is one continuous thing rather than two features that happen
+  // to touch.
+  //
+  // COST. This branch is deliberately NOT part of the block above, because that
+  // block runs undergrowthSite() — the 25-tile scan — and putting the stalk
+  // inside it would multiply the most expensive thing on the surface by the
+  // flower height. Here the scan is replaced by ONE cheap fact: the only
+  // species that needs canopy cover is the wild rose, and cover is a property
+  // of the COLUMN, not of Y. So the stalk asks flowerAt for the species with
+  // cover forced to the edge threshold, and then keeps the answer only if the
+  // base cell agrees — `mat` at the base is already the authority. Concretely:
+  // a column whose base grew a rose regrows a rose here; a column whose base
+  // grew something else regrows that. The one case the shortcut could differ on
+  // (cover below the rose threshold) is the case where flowerAt returns the
+  // non-rose species anyway, because the rose is the LAST override in the
+  // chain — so forcing cover high can only ever ADD a rose to a column that
+  // already rolled `hRose % 9 == 0`, and that column's base grew a rose too.
+  //
+  // Y range is bounded by the tallest flower (FLOWER_MAX_H), so a column pays
+  // at most that many extra evaluations and a settled world still costs nothing
+  // (rule 2 — nothing here is reactive).
+  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H &&
+      !inRim && pond < 0 && h < TREELINE &&
+      biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
+    let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
+    // Grass and petal are the one-cell ground layer and never stack.
+    if (fl.mat != MAT_AIR && fl.mat != M_GRASS && fl.mat != M_PETAL &&
+        (y - h) <= fl.height) {
+      mat = fl.mat;
     }
   }
 
