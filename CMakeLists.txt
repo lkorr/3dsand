@@ -203,6 +203,7 @@ endif()
 add_executable(sandvox
   src/main.cpp
   src/crash.cpp
+  src/gpu/rhi.cpp
   src/gpu/rhi_dawn.cpp
   src/gpu/context.cpp
   src/gpu/resources.cpp

@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "gpu/resources.h"
+#include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -125,9 +126,15 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
     if (!ChunkInWindow(wc)) continue;
     s.fetchIds.push_back(wc);
   }
+  // Every copy below is TRACKED (rhi::CommandEncoder::CopyTracked): the sources
+  // are pass-table buffers written by the tick rows earlier in this SAME
+  // command buffer, so under Vulkan each copy must declare its read to the
+  // generated-barrier tracker (vk_record.h §3.3). Under Dawn the tracked call
+  // is byte-identical to CopyBufferToBuffer.
   for (size_t i = 0; i < s.fetchIds.size(); i++) {
-    enc.CopyBufferToBuffer(voxels, (uint64_t)SlotChunkIndex(s.fetchIds[i]) * kChunkBytes,
-                           s.buf, kFetchOff + i * kChunkBytes, kChunkBytes);
+    enc.CopyTracked(pass::Buf::Voxels, voxels,
+                    (uint64_t)SlotChunkIndex(s.fetchIds[i]) * kChunkBytes, s.buf,
+                    kFetchOff + i * kChunkBytes, kChunkBytes);
   }
 
   // clamp the 3x3x3 mirror to the residency window (world chunk coords)
@@ -145,26 +152,32 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
       for (int dx = 0; dx < 3; dx++) {
         uint32_t ci = SlotChunkIndex({s.base.x + dx, s.base.y + dy, s.base.z + dz});
         uint64_t dst = (uint64_t)((dz * 3 + dy) * 3 + dx) * kChunkBytes;
-        enc.CopyBufferToBuffer(voxels, (uint64_t)ci * kChunkBytes, s.buf, dst,
-                               kChunkBytes);
+        enc.CopyTracked(pass::Buf::Voxels, voxels, (uint64_t)ci * kChunkBytes, s.buf,
+                        dst, kChunkBytes);
       }
   // dirty buffer note: caller copies the *next-tick* dirty buffer; we take a
   // buffer reference at encode time via these explicit copies instead.
-  enc.CopyBufferToBuffer(occupancy, 0, s.buf, kOccOff, kOccBytes);
-  enc.CopyBufferToBuffer(hash, 0, s.buf, kHashOff, 16);
-  enc.CopyBufferToBuffer(pick, 0, s.buf, kPickOff, 32);
-  enc.CopyBufferToBuffer(particleCounts, 0, s.buf, kPCountOff, 16);
+  enc.CopyTracked(pass::Buf::Occupancy, occupancy, 0, s.buf, kOccOff, kOccBytes);
+  enc.CopyTracked(pass::Buf::Hash, hash, 0, s.buf, kHashOff, 16);
+  enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
+  enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // support-loss flags are one-shot: consume into this slot, then clear so the
-  // next window of ticks accumulates fresh flags (no readback = they persist)
-  enc.CopyBufferToBuffer(support, 0, s.buf, kSupportOff, kSupportBytes);
-  enc.ClearBuffer(support, 0, rhi::kWholeSize);
+  // next window of ticks accumulates fresh flags (no readback = they persist).
+  // The copy-then-clear pair is a genuine transfer WAR (barrier_graph §7.4);
+  // routing the fill through the tracker is what makes it fall out on Vulkan.
+  enc.CopyTracked(pass::Buf::Support, support, 0, s.buf, kSupportOff, kSupportBytes);
+  enc.FillTracked(pass::Buf::Support, support);
   lastSlot_ = slot;
   return true;
 }
 
 void World::EncodeDirtyCopy(const rhi::CommandEncoder& enc, const rhi::Buffer& dirtyNext) {
   if (lastSlot_ < 0) return;
-  enc.CopyBufferToBuffer(dirtyNext, 0, slots_[lastSlot_].buf, kDirtyOff, kDirtyBytes);
+  // dirtyNext is Simulation::DirtyNext() — the buffer the tick just encoded
+  // writes as "active next tick", i.e. the table's symbolic DirtyOut (the page
+  // has not flipped yet at this point in SubmitTick).
+  enc.CopyTracked(pass::Buf::DirtyOut, dirtyNext, 0, slots_[lastSlot_].buf, kDirtyOff,
+                  kDirtyBytes);
 }
 
 void World::KickReadback() {

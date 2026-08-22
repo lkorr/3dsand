@@ -1,13 +1,16 @@
 // rhi_dawn.cpp — Dawn passthrough implementation of the rhi.h seam.
 //
-// Every function here is a translation of seam POD into a wgpu descriptor and a
-// forwarded call. No decisions, no caching, no reordering: phase 2a's whole
-// claim is that the command stream is byte-identical to what the call sites
-// built by hand before, and that is only auditable if this file is boring.
+// Every method here is a translation of seam POD into a wgpu descriptor and a
+// forwarded call. No decisions, no caching, no reordering: the command stream
+// must stay byte-identical to what the call sites built by hand before the
+// seam existed (and before the seam went polymorphic in phase 4a), and that is
+// only auditable if this file is boring. The pinned determinism hash in
+// tests/baseline.json is the mechanical check.
 
 #include "gpu/rhi_dawn.h"
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace rhi {
@@ -138,11 +141,471 @@ static wgpu::BlendOperation ToWgpu(BlendOperation o) {
   }
 }
 
+// ------------------------------------------------------- impl structs ----
+//
+// Each subclass holds the wgpu:: handle and forwards. The Dawn methods live on
+// the impls now (phase 4a polymorphism), but the CALLS they make are the same
+// calls the flat seam made — nothing about the recorded command stream changed.
+
+struct DawnBuffer final : BufferImpl {
+  wgpu::Buffer h;
+  void MapReadAsync(uint64_t offset, uint64_t size,
+                    std::function<void(const void*)> done) override {
+    wgpu::Buffer nb = h;
+    nb.MapAsync(wgpu::MapMode::Read, offset, size, wgpu::CallbackMode::AllowProcessEvents,
+                [nb, offset, size, done = std::move(done)](wgpu::MapAsyncStatus status,
+                                                           wgpu::StringView) {
+                  if (status != wgpu::MapAsyncStatus::Success) {
+                    done(nullptr);
+                    return;
+                  }
+                  done(nb.GetConstMappedRange(offset, size));
+                  nb.Unmap();
+                });
+  }
+};
+
+struct DawnTextureView final : TextureViewImpl { wgpu::TextureView h; };
+
+struct DawnTexture final : TextureImpl {
+  wgpu::Texture h;
+  TextureView CreateView() override {
+    auto p = std::make_shared<DawnTextureView>();
+    p->h = h.CreateView();
+    return TextureView(std::move(p));
+  }
+};
+
+struct DawnShaderModule final : ShaderModuleImpl { wgpu::ShaderModule h; };
+struct DawnBindGroupLayout final : BindGroupLayoutImpl { wgpu::BindGroupLayout h; };
+struct DawnBindGroup final : BindGroupImpl { wgpu::BindGroup h; };
+struct DawnPipelineLayout final : PipelineLayoutImpl { wgpu::PipelineLayout h; };
+struct DawnComputePipeline final : ComputePipelineImpl { wgpu::ComputePipeline h; };
+struct DawnRenderPipeline final : RenderPipelineImpl { wgpu::RenderPipeline h; };
+struct DawnCommandBuffer final : CommandBufferImpl { wgpu::CommandBuffer h; };
+struct DawnQuerySet final : QuerySetImpl { wgpu::QuerySet h; };
+
+// Downcast helpers. Valid only for handles this backend created; every caller
+// is on a Dawn-only code path (an encoder created by a Dawn device only ever
+// sees resources created by the same device).
+static const wgpu::Buffer& NB(const Buffer& b) {
+  return static_cast<DawnBuffer*>(b.Get())->h;
+}
+static const wgpu::BindGroup& NBG(const BindGroup& g) {
+  return static_cast<DawnBindGroup*>(g.Get())->h;
+}
+
+struct DawnComputePass final : ComputePassImpl {
+  wgpu::ComputePassEncoder h;
+  void SetPipeline(const ComputePipeline& pipe) override {
+    h.SetPipeline(static_cast<DawnComputePipeline*>(pipe.Get())->h);
+  }
+  void SetBindGroup(uint32_t index, const BindGroup& bg, uint32_t dynCount,
+                    const uint32_t* dynOffsets) override {
+    if (dynCount)
+      h.SetBindGroup(index, NBG(bg), dynCount, dynOffsets);
+    else
+      h.SetBindGroup(index, NBG(bg));
+  }
+  void Dispatch(uint32_t x, uint32_t y, uint32_t z) override {
+    h.DispatchWorkgroups(x, y, z);
+  }
+  void DispatchIndirect(const Buffer& args, uint64_t offset) override {
+    h.DispatchWorkgroupsIndirect(NB(args), offset);
+  }
+  void End() override { h.End(); }
+};
+
+struct DawnRenderPass final : RenderPassImpl {
+  wgpu::RenderPassEncoder h;
+  void SetPipeline(const RenderPipeline& pipe) override {
+    h.SetPipeline(static_cast<DawnRenderPipeline*>(pipe.Get())->h);
+  }
+  void SetBindGroup(uint32_t index, const BindGroup& bg) override {
+    h.SetBindGroup(index, NBG(bg));
+  }
+  void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+            uint32_t firstInstance) override {
+    h.Draw(vertexCount, instanceCount, firstVertex, firstInstance);
+  }
+  void DrawIndirect(const Buffer& args, uint64_t offset) override {
+    h.DrawIndirect(NB(args), offset);
+  }
+  void End() override { h.End(); }
+};
+
+struct DawnCommandEncoder final : CommandEncoderImpl {
+  wgpu::CommandEncoder h;
+
+  void ClearBuffer(const Buffer& b, uint64_t offset, uint64_t size) override {
+    h.ClearBuffer(NB(b), offset, size == kWholeSize ? wgpu::kWholeSize : size);
+  }
+  void CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
+                          uint64_t dstOffset, uint64_t size) override {
+    h.CopyBufferToBuffer(NB(src), srcOffset, NB(dst), dstOffset, size);
+  }
+  // The tracked variants ARE the plain calls under Dawn: it derives barriers
+  // from usage, so the id has nothing to tell it. Byte-identical recording is
+  // the point — the pinned hash checks it.
+  void CopyTracked(pass::Buf, const Buffer& src, uint64_t srcOffset, const Buffer& dst,
+                   uint64_t dstOffset, uint64_t size) override {
+    h.CopyBufferToBuffer(NB(src), srcOffset, NB(dst), dstOffset, size);
+  }
+  void FillTracked(pass::Buf, const Buffer& b) override {
+    h.ClearBuffer(NB(b), 0, wgpu::kWholeSize);
+  }
+  void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
+                           const Extent3D& extent) override {
+    wgpu::TexelCopyTextureInfo s{};
+    s.texture = static_cast<DawnTexture*>(src.texture.Get())->h;
+    s.mipLevel = src.mipLevel;
+    s.origin = {src.originX, src.originY, src.originZ};
+    wgpu::TexelCopyBufferInfo d{};
+    d.buffer = NB(dst.buffer);
+    d.layout.offset = dst.offset;
+    d.layout.bytesPerRow = dst.bytesPerRow;
+    d.layout.rowsPerImage = dst.rowsPerImage;
+    wgpu::Extent3D e{extent.width, extent.height, extent.depthOrArrayLayers};
+    h.CopyTextureToBuffer(&s, &d, &e);
+  }
+  void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
+                       const Buffer& dst, uint64_t dstOffset) override {
+    h.ResolveQuerySet(static_cast<DawnQuerySet*>(qs.Get())->h, firstQuery, queryCount,
+                      NB(dst), dstOffset);
+  }
+  ComputePass BeginComputePass(const char* label, const PassTimestampWrites* ts) override {
+    auto impl = std::make_shared<DawnComputePass>();
+    if (ts) {
+      wgpu::PassTimestampWrites tw{};
+      tw.querySet = static_cast<DawnQuerySet*>(ts->querySet.Get())->h;
+      tw.beginningOfPassWriteIndex = ts->beginIndex;
+      tw.endOfPassWriteIndex = ts->endIndex;
+      wgpu::ComputePassDescriptor d{};
+      d.label = label;
+      d.timestampWrites = &tw;
+      impl->h = h.BeginComputePass(&d);
+    } else if (label) {
+      wgpu::ComputePassDescriptor d{};
+      d.label = label;
+      impl->h = h.BeginComputePass(&d);
+    } else {
+      impl->h = h.BeginComputePass();
+    }
+    return ComputePass(std::move(impl));
+  }
+  RenderPass BeginRenderPass(const RenderPassDesc& desc) override {
+    wgpu::RenderPassColorAttachment ca{};
+    ca.view = static_cast<DawnTextureView*>(desc.color.view.Get())->h;
+    ca.loadOp = ToWgpu(desc.color.loadOp);
+    ca.storeOp = ToWgpu(desc.color.storeOp);
+    ca.clearValue = {desc.color.clearValue[0], desc.color.clearValue[1],
+                     desc.color.clearValue[2], desc.color.clearValue[3]};
+
+    wgpu::RenderPassDepthStencilAttachment da{};
+    if (desc.hasDepth) {
+      da.view = static_cast<DawnTextureView*>(desc.depth.view.Get())->h;
+      da.depthLoadOp = ToWgpu(desc.depth.loadOp);
+      da.depthStoreOp = ToWgpu(desc.depth.storeOp);
+      da.depthClearValue = desc.depth.clearValue;
+    }
+
+    wgpu::RenderPassDescriptor d{};
+    d.label = desc.label;
+    d.colorAttachmentCount = 1;
+    d.colorAttachments = &ca;
+    if (desc.hasDepth) d.depthStencilAttachment = &da;
+
+    auto impl = std::make_shared<DawnRenderPass>();
+    impl->h = h.BeginRenderPass(&d);
+    return RenderPass(std::move(impl));
+  }
+  CommandBuffer Finish() override {
+    auto impl = std::make_shared<DawnCommandBuffer>();
+    impl->h = h.Finish();
+    return CommandBuffer(std::move(impl));
+  }
+};
+
+struct DawnQueue final : QueueImpl {
+  wgpu::Queue h;
+  void WriteBuffer(const Buffer& b, uint64_t offset, const void* data,
+                   size_t size) override {
+    h.WriteBuffer(NB(b), offset, data, size);
+  }
+  void Submit(uint32_t count, const CommandBuffer* cmds) override {
+    std::vector<wgpu::CommandBuffer> native;
+    native.reserve(count);
+    for (uint32_t i = 0; i < count; i++)
+      native.push_back(static_cast<DawnCommandBuffer*>(cmds[i].Get())->h);
+    h.Submit(count, native.data());
+  }
+};
+
+// The device impl additionally keeps the instance, because WebGPU's blocking
+// primitives (WaitAny) hang off the instance rather than the device. The Vulkan
+// backend has no equivalent split.
+struct DawnDevice final : DeviceImpl {
+  wgpu::Device h;
+  wgpu::Instance instance;
+
+  BackendKind Kind() const override { return BackendKind::Dawn; }
+
+  Queue GetQueue() override { return WrapQueue(h.GetQueue()); }
+
+  Buffer CreateBuffer(uint64_t size, BufferUsage usage, const char* label) override {
+    wgpu::BufferDescriptor d{};
+    d.size = size;
+    d.usage = ToWgpu(usage);
+    d.label = label;
+    return WrapBuffer(h.CreateBuffer(&d), size);
+  }
+
+  Texture CreateTexture(const Extent3D& size, TextureFormat format, TextureUsage usage,
+                        const char* label) override {
+    wgpu::TextureDescriptor d{};
+    d.size = {size.width, size.height, size.depthOrArrayLayers};
+    d.format = ToWgpu(format);
+    d.usage = ToWgpu(usage);
+    d.label = label;
+    return WrapTexture(h.CreateTexture(&d));
+  }
+
+  QuerySet CreateTimestampQuerySet(uint32_t count, const char* label) override {
+    wgpu::QuerySetDescriptor d{};
+    d.type = wgpu::QueryType::Timestamp;
+    d.count = count;
+    d.label = label;
+    auto impl = std::make_shared<DawnQuerySet>();
+    impl->h = h.CreateQuerySet(&d);
+    if (!impl->h) return {};
+    return QuerySet(std::move(impl));
+  }
+
+  BindGroupLayout CreateBindGroupLayout(const BindGroupLayoutEntry* entries,
+                                        size_t count) override {
+    std::vector<wgpu::BindGroupLayoutEntry> ne(count);
+    for (size_t i = 0; i < count; i++) {
+      ne[i] = {};
+      ne[i].binding = entries[i].binding;
+      ne[i].visibility = ToWgpu(entries[i].visibility);
+      ne[i].buffer.type = ToWgpu(entries[i].type);
+      ne[i].buffer.hasDynamicOffset = entries[i].hasDynamicOffset;
+    }
+    wgpu::BindGroupLayoutDescriptor d{};
+    d.entryCount = (uint32_t)count;
+    d.entries = ne.data();
+    auto impl = std::make_shared<DawnBindGroupLayout>();
+    impl->h = h.CreateBindGroupLayout(&d);
+    return BindGroupLayout(std::move(impl));
+  }
+
+  PipelineLayout CreatePipelineLayout(const BindGroupLayout* groups,
+                                      size_t count) override {
+    std::vector<wgpu::BindGroupLayout> ng(count);
+    for (size_t i = 0; i < count; i++)
+      ng[i] = static_cast<DawnBindGroupLayout*>(groups[i].Get())->h;
+    wgpu::PipelineLayoutDescriptor d{};
+    d.bindGroupLayoutCount = (uint32_t)count;
+    d.bindGroupLayouts = ng.data();
+    auto impl = std::make_shared<DawnPipelineLayout>();
+    impl->h = h.CreatePipelineLayout(&d);
+    return PipelineLayout(std::move(impl));
+  }
+
+  BindGroup CreateBindGroup(const BindGroupLayout& layout, const BindGroupEntry* entries,
+                            size_t count, const char* label) override {
+    std::vector<wgpu::BindGroupEntry> ne(count);
+    for (size_t i = 0; i < count; i++) {
+      ne[i] = {};
+      ne[i].binding = entries[i].binding;
+      ne[i].buffer = NB(entries[i].buffer);
+      ne[i].offset = entries[i].offset;
+      // size 0 means "to the end of the buffer" in the seam; wgpu spells that
+      // kWholeSize, and leaving it 0 would be a zero-length binding.
+      ne[i].size = entries[i].size ? entries[i].size
+                                   : (entries[i].buffer.Size() - entries[i].offset);
+    }
+    wgpu::BindGroupDescriptor d{};
+    d.layout = static_cast<DawnBindGroupLayout*>(layout.Get())->h;
+    d.entryCount = (uint32_t)count;
+    d.entries = ne.data();
+    d.label = label;
+    auto impl = std::make_shared<DawnBindGroup>();
+    impl->h = h.CreateBindGroup(&d);
+    return BindGroup(std::move(impl));
+  }
+
+  ShaderModule CreateShaderModule(const std::string& wgsl, const char* label) override {
+    wgpu::ShaderSourceWGSL src{};
+    src.code = wgsl.c_str();
+    wgpu::ShaderModuleDescriptor d{};
+    d.nextInChain = &src;
+    d.label = label;
+    auto impl = std::make_shared<DawnShaderModule>();
+    impl->h = h.CreateShaderModule(&d);
+    if (!impl->h) return {};
+    return ShaderModule(std::move(impl));
+  }
+
+  ComputePipeline CreateComputePipeline(const PipelineLayout& layout,
+                                        const ShaderModule& module, const char* entry,
+                                        const char* label) override {
+    wgpu::ComputePipelineDescriptor d{};
+    d.layout = static_cast<DawnPipelineLayout*>(layout.Get())->h;
+    d.compute.module = static_cast<DawnShaderModule*>(module.Get())->h;
+    d.compute.entryPoint = entry;
+    d.label = label;
+    auto impl = std::make_shared<DawnComputePipeline>();
+    impl->h = h.CreateComputePipeline(&d);
+    return ComputePipeline(std::move(impl));
+  }
+
+  RenderPipeline CreateRenderPipeline(const RenderPipelineDesc& desc) override {
+    wgpu::BlendState blend{};
+    if (desc.blend) {
+      blend.color.srcFactor = ToWgpu(desc.blend->color.srcFactor);
+      blend.color.dstFactor = ToWgpu(desc.blend->color.dstFactor);
+      blend.color.operation = ToWgpu(desc.blend->color.operation);
+      blend.alpha.srcFactor = ToWgpu(desc.blend->alpha.srcFactor);
+      blend.alpha.dstFactor = ToWgpu(desc.blend->alpha.dstFactor);
+      blend.alpha.operation = ToWgpu(desc.blend->alpha.operation);
+    }
+
+    wgpu::ColorTargetState ct{};
+    ct.format = ToWgpu(desc.colorFormat);
+    if (desc.blend) ct.blend = &blend;
+
+    wgpu::DepthStencilState ds{};
+    ds.format = ToWgpu(desc.depth.format);
+    ds.depthWriteEnabled = desc.depth.depthWriteEnabled;
+    ds.depthCompare = ToWgpu(desc.depth.depthCompare);
+
+    wgpu::FragmentState fs{};
+    fs.module = static_cast<DawnShaderModule*>(desc.fragmentModule.Get())->h;
+    fs.entryPoint = desc.fragmentEntry;
+    fs.targetCount = 1;
+    fs.targets = &ct;
+
+    wgpu::RenderPipelineDescriptor d{};
+    d.label = desc.label;
+    d.layout = static_cast<DawnPipelineLayout*>(desc.layout.Get())->h;
+    d.vertex.module = static_cast<DawnShaderModule*>(desc.vertexModule.Get())->h;
+    d.vertex.entryPoint = desc.vertexEntry;
+    d.primitive.topology = ToWgpu(desc.topology);
+    d.primitive.cullMode = ToWgpu(desc.cullMode);
+    d.depthStencil = &ds;
+    d.fragment = &fs;
+
+    auto impl = std::make_shared<DawnRenderPipeline>();
+    impl->h = h.CreateRenderPipeline(&d);
+    return RenderPipeline(std::move(impl));
+  }
+
+  CommandEncoder CreateCommandEncoder(const char* label) override {
+    auto impl = std::make_shared<DawnCommandEncoder>();
+    if (label) {
+      wgpu::CommandEncoderDescriptor d{};
+      d.label = label;
+      impl->h = h.CreateCommandEncoder(&d);
+    } else {
+      impl->h = h.CreateCommandEncoder();
+    }
+    return CommandEncoder(std::move(impl));
+  }
+
+  void PushValidationScope() override {
+    h.PushErrorScope(wgpu::ErrorFilter::Validation);
+  }
+
+  bool PopValidationScopeBlocking() override {
+    bool hadError = false;
+    wgpu::Future f = h.PopErrorScope(
+        wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg) {
+          if (type != wgpu::ErrorType::NoError) {
+            hadError = true;
+            std::fprintf(stderr, "validation error: %.*s\n", (int)msg.length, msg.data);
+          }
+        });
+    instance.WaitAny(f, UINT64_MAX);
+    return hadError;
+  }
+
+  void ProcessEvents() override { instance.ProcessEvents(); }
+
+  void WaitIdle() override {
+    wgpu::Future f = h.GetQueue().OnSubmittedWorkDone(
+        wgpu::CallbackMode::WaitAnyOnly,
+        [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {});
+    instance.WaitAny(f, UINT64_MAX);
+  }
+
+  bool ReadBufferBlocking(const Buffer& src, uint64_t offset, void* out,
+                          size_t size) override {
+    const wgpu::Buffer& nb = NB(src);
+    bool ok = false;
+    wgpu::Future f = nb.MapAsync(
+        wgpu::MapMode::Read, offset, size, wgpu::CallbackMode::WaitAnyOnly,
+        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          if (status != wgpu::MapAsyncStatus::Success) return;
+          const void* p = nb.GetConstMappedRange(offset, size);
+          if (!p) return;
+          std::memcpy(out, p, size);
+          ok = true;
+        });
+    instance.WaitAny(f, UINT64_MAX);
+    if (ok) nb.Unmap();
+    return ok;
+  }
+
+  MapTicket MapReadDeferred(const Buffer& b, uint64_t offset, uint64_t size) override;
+};
+
+// -------------------------------------------------------------- tickets ----
+
+struct DawnMapTicket final : MapTicketImpl {
+  wgpu::Buffer buf;
+  wgpu::Instance instance;
+  wgpu::Future future{};
+  uint64_t offset = 0, size = 0;
+  // 0 = pending, 1 = mapped, 2 = failed. Heap-owned via the shared_ptr so the
+  // callback outlives any container reshuffle at the call site.
+  std::shared_ptr<uint32_t> status;
+
+  bool Ready() override {
+    return instance.WaitAny(future, 0) == wgpu::WaitStatus::Success;
+  }
+  void Wait() override { instance.WaitAny(future, UINT64_MAX); }
+  bool Succeeded() override { return *status == 1u; }
+  const void* Data() override {
+    if (*status != 1u) return nullptr;
+    return buf.GetConstMappedRange(offset, size);
+  }
+  void Unmap() override {
+    if (*status == 1u) buf.Unmap();
+  }
+};
+
+MapTicket DawnDevice::MapReadDeferred(const Buffer& b, uint64_t offset, uint64_t size) {
+  auto impl = std::make_shared<DawnMapTicket>();
+  impl->buf = NB(b);
+  impl->instance = instance;
+  impl->offset = offset;
+  impl->size = size;
+  impl->status = std::make_shared<uint32_t>(0);
+  impl->future = impl->buf.MapAsync(
+      wgpu::MapMode::Read, offset, size, wgpu::CallbackMode::WaitAnyOnly,
+      [st = impl->status](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        *st = status == wgpu::MapAsyncStatus::Success ? 1u : 2u;
+      });
+  return MapTicket(std::move(impl));
+}
+
 // ------------------------------------------------------- wrap / unwrap ----
 
 Device WrapDevice(const wgpu::Device& d, const wgpu::Instance& inst) {
   if (!d) return {};
-  auto p = std::make_shared<DeviceImpl>();
+  auto p = std::make_shared<DawnDevice>();
   p->h = d;
   p->instance = inst;
   return Device(std::move(p));
@@ -150,7 +613,7 @@ Device WrapDevice(const wgpu::Device& d, const wgpu::Instance& inst) {
 
 Buffer WrapBuffer(const wgpu::Buffer& b, uint64_t size) {
   if (!b) return {};
-  auto p = std::make_shared<BufferImpl>();
+  auto p = std::make_shared<DawnBuffer>();
   p->h = b;
   p->size = size;
   return Buffer(std::move(p));
@@ -158,21 +621,21 @@ Buffer WrapBuffer(const wgpu::Buffer& b, uint64_t size) {
 
 Texture WrapTexture(const wgpu::Texture& t) {
   if (!t) return {};
-  auto p = std::make_shared<TextureImpl>();
+  auto p = std::make_shared<DawnTexture>();
   p->h = t;
   return Texture(Texture_(std::move(p)));
 }
 
 TextureView WrapTextureView(const wgpu::TextureView& v) {
   if (!v) return {};
-  auto p = std::make_shared<TextureViewImpl>();
+  auto p = std::make_shared<DawnTextureView>();
   p->h = v;
   return TextureView(std::move(p));
 }
 
 Queue WrapQueue(const wgpu::Queue& q) {
   if (!q) return {};
-  auto p = std::make_shared<QueueImpl>();
+  auto p = std::make_shared<DawnQueue>();
   p->h = q;
   return Queue(std::move(p));
 }
@@ -187,483 +650,27 @@ static const wgpu::RenderPassEncoder kNullRenderPass{};
 static const wgpu::CommandEncoder kNullEncoder{};
 
 const wgpu::Device& Native(const Device& d) {
-  return d ? d.Get()->h : kNullDevice;
+  return d ? static_cast<DawnDevice*>(d.Get())->h : kNullDevice;
 }
 const wgpu::Instance& NativeInstance(const Device& d) {
-  return d ? d.Get()->instance : kNullInstance;
+  return d ? static_cast<DawnDevice*>(d.Get())->instance : kNullInstance;
 }
-const wgpu::Buffer& Native(const Buffer& b) { return b ? b.Get()->h : kNullBuffer; }
-const wgpu::Texture& Native(const Texture& t) { return t ? t.Get()->h : kNullTexture; }
+const wgpu::Buffer& Native(const Buffer& b) { return b ? NB(b) : kNullBuffer; }
+const wgpu::Texture& Native(const Texture& t) {
+  return t ? static_cast<DawnTexture*>(t.Get())->h : kNullTexture;
+}
 const wgpu::TextureView& Native(const TextureView& v) {
-  return v ? v.Get()->h : kNullView;
+  return v ? static_cast<DawnTextureView*>(v.Get())->h : kNullView;
 }
-const wgpu::Queue& Native(const Queue& q) { return q ? q.Get()->h : kNullQueue; }
+const wgpu::Queue& Native(const Queue& q) {
+  return q ? static_cast<DawnQueue*>(q.Get())->h : kNullQueue;
+}
 const wgpu::RenderPassEncoder& Native(const RenderPass& p) {
-  return p ? p.Get()->h : kNullRenderPass;
+  return p ? static_cast<DawnRenderPass*>(p.Get())->h : kNullRenderPass;
 }
 const wgpu::CommandEncoder& Native(const CommandEncoder& e) {
-  return e ? e.Get()->h : kNullEncoder;
+  return e ? static_cast<DawnCommandEncoder*>(e.Get())->h : kNullEncoder;
 }
 
 }  // namespace dawn
-
-// -------------------------------------------------------------- Buffer ----
-
-uint64_t Buffer::Size() const { return p_ ? p_->size : 0; }
-
-// ------------------------------------------------------------- Texture ----
-
-TextureView Texture::CreateView() const {
-  if (!*this) return {};
-  return dawn::WrapTextureView(Get()->h.CreateView());
-}
-
-// --------------------------------------------------------- ComputePass ----
-
-void ComputePass::SetPipeline(const ComputePipeline& pipe) const {
-  p_->h.SetPipeline(pipe.Get()->h);
-}
-
-void ComputePass::SetBindGroup(uint32_t index, const BindGroup& bg) const {
-  p_->h.SetBindGroup(index, bg.Get()->h);
-}
-
-void ComputePass::SetBindGroup(uint32_t index, const BindGroup& bg,
-                               uint32_t dynamicOffsetCount,
-                               const uint32_t* dynamicOffsets) const {
-  p_->h.SetBindGroup(index, bg.Get()->h, dynamicOffsetCount, dynamicOffsets);
-}
-
-void ComputePass::DispatchWorkgroups(uint32_t x, uint32_t y, uint32_t z) const {
-  p_->h.DispatchWorkgroups(x, y, z);
-}
-
-void ComputePass::DispatchWorkgroupsIndirect(const Buffer& args, uint64_t offset) const {
-  p_->h.DispatchWorkgroupsIndirect(args.Get()->h, offset);
-}
-
-void ComputePass::End() const { p_->h.End(); }
-
-// ---------------------------------------------------------- RenderPass ----
-
-void RenderPass::SetPipeline(const RenderPipeline& pipe) const {
-  p_->h.SetPipeline(pipe.Get()->h);
-}
-
-void RenderPass::SetBindGroup(uint32_t index, const BindGroup& bg) const {
-  p_->h.SetBindGroup(index, bg.Get()->h);
-}
-
-void RenderPass::Draw(uint32_t vertexCount, uint32_t instanceCount,
-                      uint32_t firstVertex, uint32_t firstInstance) const {
-  p_->h.Draw(vertexCount, instanceCount, firstVertex, firstInstance);
-}
-
-void RenderPass::DrawIndirect(const Buffer& args, uint64_t offset) const {
-  p_->h.DrawIndirect(args.Get()->h, offset);
-}
-
-void RenderPass::End() const { p_->h.End(); }
-
-// ------------------------------------------------------ CommandEncoder ----
-
-void CommandEncoder::ClearBuffer(const Buffer& b, uint64_t offset, uint64_t size) const {
-  p_->h.ClearBuffer(b.Get()->h, offset,
-                    size == kWholeSize ? wgpu::kWholeSize : size);
-}
-
-void CommandEncoder::CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset,
-                                        const Buffer& dst, uint64_t dstOffset,
-                                        uint64_t size) const {
-  p_->h.CopyBufferToBuffer(src.Get()->h, srcOffset, dst.Get()->h, dstOffset, size);
-}
-
-void CommandEncoder::CopyTextureToBuffer(const TexelCopyTexture& src,
-                                         const TexelCopyBuffer& dst,
-                                         const Extent3D& extent) const {
-  wgpu::TexelCopyTextureInfo s{};
-  s.texture = src.texture.Get()->h;
-  s.mipLevel = src.mipLevel;
-  s.origin = {src.originX, src.originY, src.originZ};
-  wgpu::TexelCopyBufferInfo d{};
-  d.buffer = dst.buffer.Get()->h;
-  d.layout.offset = dst.offset;
-  d.layout.bytesPerRow = dst.bytesPerRow;
-  d.layout.rowsPerImage = dst.rowsPerImage;
-  wgpu::Extent3D e{extent.width, extent.height, extent.depthOrArrayLayers};
-  p_->h.CopyTextureToBuffer(&s, &d, &e);
-}
-
-void CommandEncoder::ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery,
-                                     uint32_t queryCount, const Buffer& dst,
-                                     uint64_t dstOffset) const {
-  p_->h.ResolveQuerySet(qs.Get()->h, firstQuery, queryCount, dst.Get()->h, dstOffset);
-}
-
-ComputePass CommandEncoder::BeginComputePass(const char* label) const {
-  auto impl = std::make_shared<ComputePassImpl>();
-  if (label) {
-    wgpu::ComputePassDescriptor d{};
-    d.label = label;
-    impl->h = p_->h.BeginComputePass(&d);
-  } else {
-    impl->h = p_->h.BeginComputePass();
-  }
-  return ComputePass(std::move(impl));
-}
-
-ComputePass CommandEncoder::BeginComputePass(const char* label,
-                                             const PassTimestampWrites& ts) const {
-  wgpu::PassTimestampWrites tw{};
-  tw.querySet = ts.querySet.Get()->h;
-  tw.beginningOfPassWriteIndex = ts.beginIndex;
-  tw.endOfPassWriteIndex = ts.endIndex;
-  wgpu::ComputePassDescriptor d{};
-  d.label = label;
-  d.timestampWrites = &tw;
-  auto impl = std::make_shared<ComputePassImpl>();
-  impl->h = p_->h.BeginComputePass(&d);
-  return ComputePass(std::move(impl));
-}
-
-RenderPass CommandEncoder::BeginRenderPass(const RenderPassDesc& desc) const {
-  wgpu::RenderPassColorAttachment ca{};
-  ca.view = desc.color.view.Get()->h;
-  ca.loadOp = dawn::ToWgpu(desc.color.loadOp);
-  ca.storeOp = dawn::ToWgpu(desc.color.storeOp);
-  ca.clearValue = {desc.color.clearValue[0], desc.color.clearValue[1],
-                   desc.color.clearValue[2], desc.color.clearValue[3]};
-
-  wgpu::RenderPassDepthStencilAttachment da{};
-  if (desc.hasDepth) {
-    da.view = desc.depth.view.Get()->h;
-    da.depthLoadOp = dawn::ToWgpu(desc.depth.loadOp);
-    da.depthStoreOp = dawn::ToWgpu(desc.depth.storeOp);
-    da.depthClearValue = desc.depth.clearValue;
-  }
-
-  wgpu::RenderPassDescriptor d{};
-  d.label = desc.label;
-  d.colorAttachmentCount = 1;
-  d.colorAttachments = &ca;
-  if (desc.hasDepth) d.depthStencilAttachment = &da;
-
-  auto impl = std::make_shared<RenderPassImpl>();
-  impl->h = p_->h.BeginRenderPass(&d);
-  return RenderPass(std::move(impl));
-}
-
-CommandBuffer CommandEncoder::Finish() const {
-  auto impl = std::make_shared<CommandBufferImpl>();
-  impl->h = p_->h.Finish();
-  return CommandBuffer(std::move(impl));
-}
-
-// --------------------------------------------------------------- Queue ----
-
-void Queue::WriteBuffer(const Buffer& b, uint64_t offset, const void* data,
-                        size_t size) const {
-  p_->h.WriteBuffer(b.Get()->h, offset, data, size);
-}
-
-void Queue::Submit(const CommandBuffer& cmd) const {
-  wgpu::CommandBuffer c = cmd.Get()->h;
-  p_->h.Submit(1, &c);
-}
-
-void Queue::Submit(uint32_t count, const CommandBuffer* cmds) const {
-  std::vector<wgpu::CommandBuffer> native;
-  native.reserve(count);
-  for (uint32_t i = 0; i < count; i++) native.push_back(cmds[i].Get()->h);
-  p_->h.Submit(count, native.data());
-}
-
-// -------------------------------------------------------------- Device ----
-
-Queue Device::GetQueue() const { return dawn::WrapQueue(p_->h.GetQueue()); }
-
-Buffer Device::CreateBuffer(uint64_t size, BufferUsage usage, const char* label) const {
-  wgpu::BufferDescriptor d{};
-  d.size = size;
-  d.usage = dawn::ToWgpu(usage);
-  d.label = label;
-  return dawn::WrapBuffer(p_->h.CreateBuffer(&d), size);
-}
-
-Texture Device::CreateTexture(const Extent3D& size, TextureFormat format,
-                              TextureUsage usage, const char* label) const {
-  wgpu::TextureDescriptor d{};
-  d.size = {size.width, size.height, size.depthOrArrayLayers};
-  d.format = dawn::ToWgpu(format);
-  d.usage = dawn::ToWgpu(usage);
-  d.label = label;
-  return dawn::WrapTexture(p_->h.CreateTexture(&d));
-}
-
-QuerySet Device::CreateTimestampQuerySet(uint32_t count, const char* label) const {
-  wgpu::QuerySetDescriptor d{};
-  d.type = wgpu::QueryType::Timestamp;
-  d.count = count;
-  d.label = label;
-  auto impl = std::make_shared<QuerySetImpl>();
-  impl->h = p_->h.CreateQuerySet(&d);
-  if (!impl->h) return {};
-  return QuerySet(std::move(impl));
-}
-
-BindGroupLayout Device::CreateBindGroupLayout(const BindGroupLayoutEntry* entries,
-                                              size_t count) const {
-  std::vector<wgpu::BindGroupLayoutEntry> ne(count);
-  for (size_t i = 0; i < count; i++) {
-    ne[i] = {};
-    ne[i].binding = entries[i].binding;
-    ne[i].visibility = dawn::ToWgpu(entries[i].visibility);
-    ne[i].buffer.type = dawn::ToWgpu(entries[i].type);
-    ne[i].buffer.hasDynamicOffset = entries[i].hasDynamicOffset;
-  }
-  wgpu::BindGroupLayoutDescriptor d{};
-  d.entryCount = (uint32_t)count;
-  d.entries = ne.data();
-  auto impl = std::make_shared<BindGroupLayoutImpl>();
-  impl->h = p_->h.CreateBindGroupLayout(&d);
-  return BindGroupLayout(std::move(impl));
-}
-
-PipelineLayout Device::CreatePipelineLayout(const BindGroupLayout* groups,
-                                            size_t count) const {
-  std::vector<wgpu::BindGroupLayout> ng(count);
-  for (size_t i = 0; i < count; i++) ng[i] = groups[i].Get()->h;
-  wgpu::PipelineLayoutDescriptor d{};
-  d.bindGroupLayoutCount = (uint32_t)count;
-  d.bindGroupLayouts = ng.data();
-  auto impl = std::make_shared<PipelineLayoutImpl>();
-  impl->h = p_->h.CreatePipelineLayout(&d);
-  return PipelineLayout(std::move(impl));
-}
-
-BindGroup Device::CreateBindGroup(const BindGroupLayout& layout,
-                                  const BindGroupEntry* entries, size_t count,
-                                  const char* label) const {
-  std::vector<wgpu::BindGroupEntry> ne(count);
-  for (size_t i = 0; i < count; i++) {
-    ne[i] = {};
-    ne[i].binding = entries[i].binding;
-    ne[i].buffer = entries[i].buffer.Get()->h;
-    ne[i].offset = entries[i].offset;
-    // size 0 means "to the end of the buffer" in the seam; wgpu spells that
-    // kWholeSize, and leaving it 0 would be a zero-length binding.
-    ne[i].size = entries[i].size ? entries[i].size
-                                 : (entries[i].buffer.Size() - entries[i].offset);
-  }
-  wgpu::BindGroupDescriptor d{};
-  d.layout = layout.Get()->h;
-  d.entryCount = (uint32_t)count;
-  d.entries = ne.data();
-  d.label = label;
-  auto impl = std::make_shared<BindGroupImpl>();
-  impl->h = p_->h.CreateBindGroup(&d);
-  return BindGroup(std::move(impl));
-}
-
-ShaderModule Device::CreateShaderModule(const std::string& wgsl,
-                                        const char* label) const {
-  wgpu::ShaderSourceWGSL src{};
-  src.code = wgsl.c_str();
-  wgpu::ShaderModuleDescriptor d{};
-  d.nextInChain = &src;
-  d.label = label;
-  auto impl = std::make_shared<ShaderModuleImpl>();
-  impl->h = p_->h.CreateShaderModule(&d);
-  if (!impl->h) return {};
-  return ShaderModule(std::move(impl));
-}
-
-ComputePipeline Device::CreateComputePipeline(const PipelineLayout& layout,
-                                              const ShaderModule& module,
-                                              const char* entry,
-                                              const char* label) const {
-  wgpu::ComputePipelineDescriptor d{};
-  d.layout = layout.Get()->h;
-  d.compute.module = module.Get()->h;
-  d.compute.entryPoint = entry;
-  d.label = label;
-  auto impl = std::make_shared<ComputePipelineImpl>();
-  impl->h = p_->h.CreateComputePipeline(&d);
-  return ComputePipeline(std::move(impl));
-}
-
-RenderPipeline Device::CreateRenderPipeline(const RenderPipelineDesc& desc) const {
-  wgpu::BlendState blend{};
-  if (desc.blend) {
-    blend.color.srcFactor = dawn::ToWgpu(desc.blend->color.srcFactor);
-    blend.color.dstFactor = dawn::ToWgpu(desc.blend->color.dstFactor);
-    blend.color.operation = dawn::ToWgpu(desc.blend->color.operation);
-    blend.alpha.srcFactor = dawn::ToWgpu(desc.blend->alpha.srcFactor);
-    blend.alpha.dstFactor = dawn::ToWgpu(desc.blend->alpha.dstFactor);
-    blend.alpha.operation = dawn::ToWgpu(desc.blend->alpha.operation);
-  }
-
-  wgpu::ColorTargetState ct{};
-  ct.format = dawn::ToWgpu(desc.colorFormat);
-  if (desc.blend) ct.blend = &blend;
-
-  wgpu::DepthStencilState ds{};
-  ds.format = dawn::ToWgpu(desc.depth.format);
-  ds.depthWriteEnabled = desc.depth.depthWriteEnabled;
-  ds.depthCompare = dawn::ToWgpu(desc.depth.depthCompare);
-
-  wgpu::FragmentState fs{};
-  fs.module = desc.fragmentModule.Get()->h;
-  fs.entryPoint = desc.fragmentEntry;
-  fs.targetCount = 1;
-  fs.targets = &ct;
-
-  wgpu::RenderPipelineDescriptor d{};
-  d.label = desc.label;
-  d.layout = desc.layout.Get()->h;
-  d.vertex.module = desc.vertexModule.Get()->h;
-  d.vertex.entryPoint = desc.vertexEntry;
-  d.primitive.topology = dawn::ToWgpu(desc.topology);
-  d.primitive.cullMode = dawn::ToWgpu(desc.cullMode);
-  d.depthStencil = &ds;
-  d.fragment = &fs;
-
-  auto impl = std::make_shared<RenderPipelineImpl>();
-  impl->h = p_->h.CreateRenderPipeline(&d);
-  return RenderPipeline(std::move(impl));
-}
-
-CommandEncoder Device::CreateCommandEncoder(const char* label) const {
-  auto impl = std::make_shared<CommandEncoderImpl>();
-  if (label) {
-    wgpu::CommandEncoderDescriptor d{};
-    d.label = label;
-    impl->h = p_->h.CreateCommandEncoder(&d);
-  } else {
-    impl->h = p_->h.CreateCommandEncoder();
-  }
-  return CommandEncoder(std::move(impl));
-}
-
-void Device::PushValidationScope() const {
-  p_->h.PushErrorScope(wgpu::ErrorFilter::Validation);
-}
-
-bool Device::PopValidationScopeBlocking() const {
-  bool hadError = false;
-  wgpu::Future f = p_->h.PopErrorScope(
-      wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg) {
-        if (type != wgpu::ErrorType::NoError) {
-          hadError = true;
-          std::fprintf(stderr, "validation error: %.*s\n", (int)msg.length, msg.data);
-        }
-      });
-  p_->instance.WaitAny(f, UINT64_MAX);
-  return hadError;
-}
-
-void Device::ProcessEvents() const { p_->instance.ProcessEvents(); }
-
-void Device::WaitIdle() const {
-  wgpu::Future f = p_->h.GetQueue().OnSubmittedWorkDone(
-      wgpu::CallbackMode::WaitAnyOnly, [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {});
-  p_->instance.WaitAny(f, UINT64_MAX);
-}
-
-// -------------------------------------------------------- read helpers ----
-
-bool ReadBufferBlocking(const Device& dev, const Buffer& src, uint64_t offset,
-                        void* out, size_t size) {
-  if (!dev || !src || size == 0) return false;
-  bool ok = false;
-  wgpu::Future f = dawn::Native(src).MapAsync(
-      wgpu::MapMode::Read, offset, size, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status != wgpu::MapAsyncStatus::Success) return;
-        const void* p = dawn::Native(src).GetConstMappedRange(offset, size);
-        if (!p) return;
-        std::memcpy(out, p, size);
-        ok = true;
-      });
-  dawn::NativeInstance(dev).WaitAny(f, UINT64_MAX);
-  if (ok) dawn::Native(src).Unmap();
-  return ok;
-}
-
-bool ReadbackBlocking(const Device& dev, const Queue& queue, const Buffer& src,
-                      uint64_t srcOffset, void* out, size_t size, const char* label) {
-  if (!dev || !queue || !src || size == 0) return false;
-  Buffer staging =
-      dev.CreateBuffer(size, BufferUsage::MapRead | BufferUsage::CopyDst, label);
-  if (!staging) return false;
-  CommandEncoder enc = dev.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(src, srcOffset, staging, 0, size);
-  queue.Submit(enc.Finish());
-  return ReadBufferBlocking(dev, staging, 0, out, size);
-}
-
-void MapReadAsync(const Buffer& b, uint64_t offset, uint64_t size,
-                  std::function<void(const void*)> done) {
-  const wgpu::Buffer& nb = dawn::Native(b);
-  nb.MapAsync(wgpu::MapMode::Read, offset, size, wgpu::CallbackMode::AllowProcessEvents,
-              [nb, offset, size, done = std::move(done)](wgpu::MapAsyncStatus status,
-                                                         wgpu::StringView) {
-                if (status != wgpu::MapAsyncStatus::Success) {
-                  done(nullptr);
-                  return;
-                }
-                done(nb.GetConstMappedRange(offset, size));
-                nb.Unmap();
-              });
-}
-
-// -------------------------------------------------------------- tickets ----
-
-struct MapTicketImpl {
-  wgpu::Buffer buf;
-  wgpu::Instance instance;
-  wgpu::Future future{};
-  uint64_t offset = 0, size = 0;
-  // 0 = pending, 1 = mapped, 2 = failed. Heap-owned via the shared_ptr so the
-  // callback outlives any container reshuffle at the call site.
-  std::shared_ptr<uint32_t> status;
-};
-
-MapTicket MapReadDeferred(const Device& dev, const Buffer& b, uint64_t offset,
-                          uint64_t size) {
-  auto impl = std::make_shared<MapTicketImpl>();
-  impl->buf = dawn::Native(b);
-  impl->instance = dawn::NativeInstance(dev);
-  impl->offset = offset;
-  impl->size = size;
-  impl->status = std::make_shared<uint32_t>(0);
-  impl->future = impl->buf.MapAsync(
-      wgpu::MapMode::Read, offset, size, wgpu::CallbackMode::WaitAnyOnly,
-      [st = impl->status](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        *st = status == wgpu::MapAsyncStatus::Success ? 1u : 2u;
-      });
-  return MapTicket(std::move(impl));
-}
-
-bool MapTicket::Ready() const {
-  if (!p_) return false;
-  return p_->instance.WaitAny(p_->future, 0) == wgpu::WaitStatus::Success;
-}
-
-void MapTicket::Wait() const {
-  if (p_) p_->instance.WaitAny(p_->future, UINT64_MAX);
-}
-
-bool MapTicket::Succeeded() const { return p_ && *p_->status == 1u; }
-
-const void* MapTicket::Data() const {
-  if (!p_ || *p_->status != 1u) return nullptr;
-  return p_->buf.GetConstMappedRange(p_->offset, p_->size);
-}
-
-void MapTicket::Unmap() const {
-  if (p_ && *p_->status == 1u) p_->buf.Unmap();
-}
-
 }  // namespace rhi

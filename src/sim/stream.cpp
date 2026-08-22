@@ -6,6 +6,7 @@
 
 #include "gpu/context.h"
 #include "gpu/resources.h"
+#include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked eviction copy
 #include "sim/simulation.h"
 
 namespace {
@@ -162,9 +163,13 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     p.items.reserve(n);
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     for (size_t i = 0; i < n; i++) {
-      enc.CopyBufferToBuffer(world_->voxels,
-                             (uint64_t)toSave[off + i].first * kChunkBytes,
-                             p.staging, i * kChunkBytes, kChunkBytes);
+      // Tracked (pass::Buf id): in this dedicated command buffer the source was
+      // written only by previous submits (the head barrier covers that), but
+      // declaring the read keeps every off-table voxels copy on the same
+      // tracker path (barrier_graph §8) rather than special-casing this one.
+      enc.CopyTracked(pass::Buf::Voxels, world_->voxels,
+                      (uint64_t)toSave[off + i].first * kChunkBytes,
+                      p.staging, i * kChunkBytes, kChunkBytes);
       p.items.push_back(toSave[off + i].second);
       pendingChunks_[World::PackChunkKey(toSave[off + i].second.wc)]++;
     }

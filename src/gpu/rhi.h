@@ -43,7 +43,24 @@
 #include <string>
 #include <vector>
 
+// The pass-table buffer id (src/sim/pass_table.h). Forward-declared so the
+// tracked-copy methods below can carry it without making every rhi.h consumer
+// depend on the table header. Under Dawn the id is IGNORED (Dawn derives
+// barriers from usage); under Vulkan it is how an off-table copy expresses its
+// hazard to the generated-barrier tracker (vk_record.h) — see CopyTracked.
+namespace pass {
+enum class Buf : uint8_t;
+}
+
 namespace rhi {
+
+// Which backend a Device is. Phase 4a makes the seam polymorphic: every impl
+// struct in rhi_impl.h is an abstract base with a Dawn subclass (rhi_dawn.cpp)
+// and a Vulkan subclass (rhi_vk.cpp), selected at Device creation by
+// GpuContext::Init. Callers that must branch (the render path until phase 4b,
+// the table-recording bridge in simulation.cpp) ask the device rather than
+// carrying a parallel flag that could disagree with it.
+enum class BackendKind : uint32_t { Dawn, Vulkan };
 
 // ---------------------------------------------------------------- enums ----
 // Values are NOT assumed to match any backend's; every backend maps explicitly.
@@ -333,6 +350,28 @@ class CommandEncoder {
   void ClearBuffer(const Buffer& b, uint64_t offset = 0, uint64_t size = kWholeSize) const;
   void CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
                           uint64_t dstOffset, uint64_t size) const;
+
+  // ---- tracked off-table transfers (barrier_graph §8, phase 4a) ------------
+  //
+  // Under Dawn these are EXACTLY CopyBufferToBuffer / ClearBuffer — same wgpu
+  // call, byte-identical recording; the id is unused because Dawn derives its
+  // barriers from usage. Under Vulkan the id is how an off-table copy declares
+  // its hazard to the last-access tracker (vk_record.h CopyTracked/FillTracked):
+  // the source's last writer in this command buffer is ordered ahead of the
+  // transfer read by the ordinary §3.3 path, with no scope written by hand.
+  //
+  // Use these whenever the SOURCE (or the filled buffer) is a pass-table buffer
+  // that may have been written earlier in the SAME command buffer — the
+  // readback-ring copies after the tick rows are the canonical case. A copy
+  // whose source was written only by previous submits (a gate's staging read)
+  // is covered by the head-of-command-buffer barrier and may use the plain
+  // calls. Both the id and the concrete buffer are passed so the Dawn path
+  // needs no lookup and a mismatch between them is visible at the call site.
+  void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
+                   const Buffer& dst, uint64_t dstOffset, uint64_t size) const;
+  // vkCmdFillBuffer(0) / ClearBuffer over a tracked table buffer (whole buffer).
+  void FillTracked(pass::Buf id, const Buffer& b) const;
+
   void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                            const Extent3D& extent) const;
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
@@ -374,6 +413,9 @@ class Device {
   explicit Device(std::shared_ptr<struct DeviceImpl> p) : p_(std::move(p)) {}
   explicit operator bool() const { return p_ != nullptr; }
   struct DeviceImpl* Get() const { return p_.get(); }
+
+  // Which backend this device is (see BackendKind above).
+  BackendKind Kind() const;
 
   Queue GetQueue() const;
 
