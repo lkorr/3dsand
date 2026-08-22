@@ -27,10 +27,52 @@ to. Fixed in place, each tagged `[REVIEW …]` at the point of change:
 | m4 | the LIFO page-reproducibility claim was false; withdrawn | §3.7 |
 | m5 | `--shot` inherits C3; `--measure` runs dense-only | §5.4 |
 
+**Revision 3** (verification round; C1's dispute was adjudicated in this
+document's favour and the reviewer withdrew their alternative form):
+
+| # | finding | where |
+|---|---|---|
+| NEW-1 | `EncodeWakeAll` set `cpuDirty` but was never added to `C(N)` — a same-tick tightening could intersect its chunks away | §3.1a (c) |
+| NEW-2 | **`Stream::FillSlots` writes `dirty[0]`/`dirty[1]` per refilled slot** (`stream.cpp:271-273`) — a third CPU dirty-writer, entirely missed | §3.1a (d) |
+| NEW-3 | `materialize(N)` was enumerated in two places and composed in neither; op targets and particle chunks never composed with the `∩ nonSentinel` rule | §3.2 step (4) |
+| NEW-4 | the 2-ring write-reach bound and the 1-ring recurrence were both stated, neither reconciled | §3.2 |
+| NEW-5 | risk 2 still said "reset to ground truth", contradicting the §3.2 it cited | risk 2 |
+
 Three user decisions are folded in as settled, superseding the first draft:
 **exhaustion is a fatal error** (§3.8, Q4 closed), **`pageFaults` is
 unconditional and always bound** (§5.1, Q8 closed), and **Dawn is being removed
 entirely** (§6; Q9 and risk 7 moot, analysis retained rather than deleted).
+
+Revision 3 fixed a fifth finding of the same shape (NEW-1..5), and its lesson
+is the caveat below.
+
+> ## Read this before adding anything to this design
+>
+> **The reviewer's summary of every hole found across two rounds:** *"`C(N)`
+> and the materialization set are each enumerated in more than one place and
+> composed in none — every hole found in review so far has been a missing
+> contributor, not a wrong mechanism."*
+>
+> That is the failure mode of this document, and it is worth more than any
+> individual fix. The mechanisms — the intersection recurrence, the sentinel
+> encoding, the write-path no-op, the analytic hash — have all survived review.
+> What kept breaking was **coverage**: `EncodeWakeAll`, the five CPU byte-offset
+> sites, the render bind groups, `particleResolve`'s second write target,
+> `Stream::FillSlots`' dirty writes. Every one was a contributor nobody had
+> written into a list.
+>
+> So there are now exactly **two** normative lists, and they live in exactly
+> one place each:
+>
+> - **§3.1a** — the CPU dirty-writers, contributors (a)–(d) to `C(N)`.
+> - **§3.2's "THE NORMATIVE DEFINITIONS"** — the four composed formulas,
+>   including `materialize(N)`.
+>
+> **Adding a writer, a dirty-marker, or a materialization source means editing
+> those two places.** Any other section that appears to state a rule is
+> referencing them and says so. If you find yourself writing a set expression
+> anywhere else in this document, that is the bug this caveat exists to
+> prevent.
 
 This document is load-bearing in the sense CLAUDE.md rule 1 means. Every branch
 introduced here sits on the **address path of the hashed domain**: it decides
@@ -500,18 +542,57 @@ Not "the ones I can think of" — the enumeration is taken from
 | *(off-table)* `Stream::FillSlots` | `queue.WriteBuffer(voxels, slot*16KiB)` | the refilled slots |
 | *(off-table)* `LoadWorld` | whole-world upload | all slots |
 
-Plus three things that are not rows in that table and were missed by the first
+Plus two classes that are not rows in that table and were missed by the first
 draft's enumeration — recorded here so the list is complete where it claims to
 be:
 
 | not a row | why it matters |
 |---|---|
-| `EncodeWakeAll` (`simulation.cpp:821-828`) | not a table row at all — a bare `WriteBuffer` of 32,768 dirty flags. It does not write voxels, but it makes **every** chunk a CA target next tick. §3.2a |
 | the five CPU byte-offset sites | `world.cpp` mirror + fetch, `stream.cpp` evict + refill, selftest dumps — they read and write `voxels` from C++ at `slot * 16 KiB`. §2.1a |
 | `raymarch.wgsl`'s 17 reads | render-only, but they index `voxels` from a slot-derived address and would sample the wrong chunk. §5.2a |
 
 And one non-writer that still matters: `occupancyFull` **reads every slot**
 (`D_CHUNKS` = 32,768 workgroups), which §4.1 addresses.
+
+### 3.1a CPU DIRTY-WRITERS — the class, enumerated once
+
+**[REVIEW NEW-1/NEW-2 — FIXED. This is the enumeration whose absence produced
+three of the four critical findings.]** Separately from "who writes voxels"
+there is a second class: **who marks chunks dirty from the CPU**. Every member
+feeds `C(N)` in §3.2's recurrence, and every hole found in review so far has
+been a missing member of *this* list rather than a wrong mechanism. It is
+therefore enumerated here, once, and nothing else in this document may
+re-enumerate it — other sections reference `C(N)` and this table.
+
+| # | CPU dirty-writer | mechanism | found by |
+|---|---|---|---|
+| a | **brush / cell / explosion op targets** | the kernels' `markBoth(c)` on CPU-authored op streams — the CPU knows every target before the ops are uploaded (§3.3) | first draft |
+| b | **`particleChunks(N)`** | `resolve`'s `markDirtyNext` (`sim_particle.wgsl:242,:265`) dirties the 26-neighbourhood of a **GPU-decided** location; the CPU covers it with the swept-path set (§3.4) | review M1 |
+| c | **`EncodeWakeAll`** (`simulation.cpp:821-828`) | a bare `queue.WriteBuffer(dirty[page_], ones)` — **all 32,768 flags**, no table row, fired from `SubmitTick` (`support.cpp:155`) on a daylight crossing (§3.2a) | review C2 |
+| d | **`Stream::FillSlots`** (`stream.cpp:271-273`) | per store-hit slot, `WriteBuffer(dirty[0], s*4, 1)` **and** `dirty[1]` — the "wake once: neighbors may have changed since this chunk was saved" write. Mid-frame, between ticks, from its own path (§3.5d) | review NEW-2 |
+
+(d) is the same failure shape as (c) and is worth stating plainly: a refilled
+slot is dirty on the **next tick**, in **both** pages, decided by streaming
+rather than by the tick loop. Its target chunk was just written by streaming, so
+it is materialized by §3.5(d) anyway — but it must still enter `C(N)`, or a
+snapshot tightening (§3.2 (2)) in the same tick would intersect the refilled
+chunk's *neighbours* away, and the CA frontier that a stream-in creates would be
+invisible to the mirror.
+
+**Ordering rule for (c) and (d) within a tick — the one this needs to pin
+down.** Both write dirty flags at points that can straddle the snapshot
+tightening. **Decision: (c) and (d) are applied to `cpuDirty` STRICTLY AFTER
+the tightening intersection**, in the same order they issue their
+`WriteBuffer`s. Equivalently they are unioned into `cpuDirty(M)` after step (2)
+rather than contributed to the `C(j)` history that step (2) rolls forward.
+
+Both of the reviewer's options are sound; this one is chosen because it needs
+no ordering reasoning at all — a union applied after an intersection cannot be
+undone by it, so the wake's 32,768 chunks and the refill's slots survive
+regardless of when the snapshot happened to land. Putting them in `C(j)` would
+also work but requires the retention ring to carry a 32,768-entry all-ones set,
+which is both wasteful and a trap (`C(j)` sets are otherwise tiny and bounded
+by the op caps).
 
 ### 3.2 (a) The CA — and the one-tick-late dirty problem
 
@@ -587,21 +668,44 @@ from a kernel, or a CPU path. `markDirty(c)` is only ever called with a cell
 are within `N26(dirtyIn(N))` by the write-reach argument above, and `markDirty`
 itself reaches ≤1 chunk further — but a chunk marked by a cell *in* chunk `X`
 is in `N26({X})`, and `X ∈ N26(dirtyIn(N))` gives `N26(N26(dirtyIn(N)))`. That
-is a 2-ring, not a 1-ring. ∎ — **and that is the honest bound**: one tick of
-unknown dirty state costs a 2-ring dilation, not a 1-ring. (`mutate`,
-`mutateCells`, `explodeApply` and `particleSpawn` are all in `C(N)`, being
-CPU-op-driven; `particleResolve`'s landing cell is bounded by the particle's
-CPU-unknown flight, which §3.4 handles separately.)
+is a 2-ring, not a 1-ring. ∎ (`mutate`, `mutateCells`, `explodeApply` and
+`particleSpawn` are all in `C(N)`, being CPU-op-driven; `particleResolve`'s
+landing cell is bounded by the particle's CPU-unknown flight, which §3.4
+handles separately.)
 
-Iterating the lemma `k` times gives: if the CPU's newest snapshot is from tick
-`N−k`, then
+#### Which ring the recurrence uses, and why it is 1 and not 2
 
-```
-dirtyIn(N) ⊆ N26^(2k) ( dirtyFlags(snapshot) )  ∪  ⋃_{j=N-k}^{N-1} C(j)
-```
+**[REVIEW NEW-4 — FIXED. Stated explicitly, because an implementer reading the
+2-ring above and the `N26^1` below would otherwise have to guess.]**
 
-A `2k`-ring dilation. **[JUDGMENT] I reject this as the mechanism**, for two
-reasons that are worth stating because the reviewer may disagree:
+The two bounds describe **different compositions** and both are correct:
+
+- **The 2-ring above** composes *write reach* with *mark reach*: a cell in
+  chunk `X` writes ≤1 cell away (possibly into a neighbour chunk), and
+  `markDirty` on that written cell marks ≤1 chunk beyond *it*. That is the
+  bound on **"which chunks can a tick whose dirty set is `D` mark dirty,
+  measured from `D`"** — and it composes two hops because it passes through an
+  intermediate written cell.
+- **The recurrence below uses `N26^1` per tick**, and that is sufficient
+  because it propagates **`dirtyIn` → `dirtyIn`**, not `dirtyIn` → *written
+  cells* → `dirtyIn`. `markDirty(c)` (`sim_step.wgsl:66-88`) marks the 2×2×2
+  combination of `worldChunkOf(c)` with its ±1 boundary offsets — i.e. every
+  chunk it marks is in `N26({chunkOf(c)})`. And `chunkOf(c)` is a chunk the
+  kernel *acted in*, which is a member of `dirtyIn(N)` itself, because the CA
+  dispatches one workgroup per chunk **in the dirty list** and a thread only
+  acts on cells of its own chunk. So every chunk marked during tick `N` lies in
+  `N26(dirtyIn(N))` — one ring — and `dirtyOut(N) = dirtyIn(N+1)` follows.
+
+The distinction is exactly "where is the marking cell?": the 2-ring measures
+from the *source* chunk of a write that has already crossed a boundary; the
+1-ring measures from the *acting* chunk, which is in `dirtyIn` by construction.
+**The recurrence and the roll-forward both use `N26^1` per tick.** The 2-ring
+is retained above because it is the correct bound for the write-reach argument
+that §3.2a's materialization rule rests on.
+
+Iterating the 2-ring form `k` times would give a `2k`-ring dilation from a
+stale snapshot. **[JUDGMENT] I reject that as the mechanism**, for two reasons
+worth stating because they are what motivate the incremental design:
 
 - `k` is unbounded in principle (a long GPU stall saturates the ring
   indefinitely), so the dilation radius is unbounded, so the "conservative
@@ -615,27 +719,65 @@ reasons that are worth stating because the reviewer may disagree:
 incrementally, and use an arriving snapshot only to TIGHTEN it — never to
 replace it.**
 
-> **Decision.** The CPU keeps `cpuDirty[kNumChunks]` (a bitset, 4 KiB) and
-> updates it each tick by the *superset rule*, plus an optional intersection
-> whenever a snapshot lands:
+> ## THE NORMATIVE DEFINITIONS
+>
+> **[REVIEW NEW-3 — these four are the single source. Every other section of
+> this document REFERENCES them and none restates them.]** The CPU keeps
+> `cpuDirty[kNumChunks]` (a bitset, 4 KiB).
 >
 > ```
-> // (1) propagate — every tick, no GPU dependency
+> // ---- (0) the CPU dirty-writer contributions, enumerated ONCE in §3.1a ----
+> //     opTargets(N)      = chunks touched by brush / cell / explosion ops   (a)
+> //     particleChunks(N) = the conservative swept-particle set, §3.4        (b)
+> //     C(N)              = opTargets(N) ∪ particleChunks(N)
+> //     (c) EncodeWakeAll and (d) Stream::FillSlots are applied in step (3),
+> //     strictly AFTER (2) — see §3.1a's ordering rule.
+>
+> // ---- (1) propagate — every tick, no GPU dependency ----------------------
+> //     N26^1 per tick: dirtyIn -> dirtyIn is a ONE-ring, see above.
 > cpuDirty(N+1)  =  N26( cpuDirty(N) )  ∪  C(N)
 >
-> // (2) tighten — ONLY when a snapshot arrives, and only by intersection.
+> // ---- (2) tighten — ONLY when a snapshot arrives, ONLY by intersection ---
 > //     A snapshot stamped tick S is consumed while encoding tick M, M > S.
 > //     dirtyFlags(S) == dirtyIn(S+1) exactly, so rolling it forward the
-> //     (M-S-1) ticks that have since been encoded gives a SECOND superset
-> //     of dirtyIn(M) — usually much tighter than (1)'s, occasionally not.
+> //     (M-S-1) ticks since encoded gives a SECOND superset of dirtyIn(M) —
+> //     usually much tighter than (1)'s, occasionally not. NEVER an assignment.
 > cpuDirty(M)   ←  cpuDirty(M)  ∩  [ N26^(M-S-1)( dirtyFlags(S) )
 >                                    ∪  ⋃_{j=S+1}^{M-1} C(j) ]
+>
+> // ---- (3) union the unconditional CPU dirty-writers, AFTER (2) -----------
+> cpuDirty(M)   ∪=  allOnes            if EncodeWakeAll fired this tick   (c)
+> cpuDirty(M)   ∪=  refilledSlots(M)   from Stream::FillSlots             (d)
+>
+> // ---- (4) THE MATERIALIZATION SET — the one normative formula -----------
+> materialize(N) = [ (cpuDirty ∩ nonSentinel) ∪ N26(cpuDirty ∩ nonSentinel) ]
+>                  ∪ opTargets(N)
+>                  ∪ particleChunks(N)
 > ```
 >
-> Both operands of the `∩` are supersets of the true `dirtyIn(M)`, so their
-> intersection is also a superset and is at least as tight as either. That is
-> the whole correctness argument, and it is why the operation is an
-> intersection rather than an assignment.
+> **Both operands of the `∩` in (2) are supersets** of the true `dirtyIn(M)`,
+> so their intersection is also a superset and is at least as tight as either.
+> That is the whole correctness argument, and it is why (2) is an intersection
+> and never an assignment.
+>
+> **Read (4) carefully — the two halves have different sentinel rules, and
+> conflating them was the first draft's error:**
+>
+> - The **bracketed half** is filtered by `∩ nonSentinel`, because a dirty
+>   EMPTY chunk can only *receive* matter from a non-empty neighbour, and the
+>   ring around the non-empty set covers every such neighbour (§3.2a). This is
+>   what keeps a wake-all from demanding 32,768 pages.
+> - **`opTargets(N)` and `particleChunks(N)` are NOT filtered.** They
+>   materialize **regardless of sentinel state**, because they are writes into
+>   cells the CPU chose, and a CPU op genuinely writes into isolated empty sky:
+>   `sim_mutate.wgsl:79` paints wherever `voxMat(voxels[idx]) == MAT_AIR` — an
+>   op-mode-0 brush into a `PT_EMPTY` chunk with no non-empty chunk anywhere
+>   near it is an ordinary, intended operation. Filtering these through
+>   `∩ nonSentinel` would make the brush silently no-op in open sky, which is
+>   the single most visible thing a player can do.
+>
+> A particle can likewise come to rest in isolated sky (a ballistic voxel that
+> ran out of life), so `particleChunks` takes the same unfiltered treatment.
 
 **[REVIEW C1 — FIXED. The earlier draft of this section was wrong and the
 reviewer is right about why.** It wrote `cpuDirty ← dirtyFlags(snapshot)` — an
@@ -720,36 +862,44 @@ Verified at source, and the consequences are exactly as the reviewer states:
   `noon.dayNight.freeze = 1` (`:389`) — so `wasDay != isDay` is never true in
   the suite and `EncodeWakeAll` is never called. The bug would ship.
 
-**Fix, part 1 — the wake sets the mirror.** `EncodeWakeAll` sets
-`cpuDirty` to all-ones in the same call. The two must be one operation, not two
-that must agree: the wake *is* a dirty-set mutation, and the CPU mirror is a
-mirror of the dirty set. Give it a signature that makes the pairing structural
-(the wake takes the mirror, or the mirror lives beside `page_` and the wake
-updates both), so a future caller cannot get one without the other.
+**Fix, part 1 — the wake sets the mirror**, as contributor (c) in §3.1a, unioned
+in at step (3) of the normative definitions (strictly after the tightening).
+`EncodeWakeAll` sets `cpuDirty` to all-ones in the same call: the two must be
+one operation, not two that must agree — the wake *is* a dirty-set mutation and
+the CPU mirror is a mirror of the dirty set. Give it a signature that makes the
+pairing structural (the wake takes the mirror, or the mirror lives beside
+`page_` and the wake updates both), so a future caller cannot get one without
+the other.
 
-**Fix, part 2 — the materialization rule, which is what stops this from
-becoming a crash. [REVIEW M2 — FIXED: stated as its own rule.]** With
-`cpuDirty` all-ones, a naive "materialize everything dirty" would demand 32,768
-pages from an 8,192-page pool: guaranteed exhaustion, which under §3.8's
-settled policy is a guaranteed **abort**, twice per in-game day. The rule that
-prevents it is load-bearing, and it is a rule-2 statement in its own right
-independent of the wake-all case that exposed it:
+**Fix, part 2 — the bracketed half of the materialization formula is what stops
+this from becoming a crash. [REVIEW M2 — FIXED.]** With `cpuDirty` all-ones, a
+naive "materialize everything dirty" would demand 32,768 pages from an
+8,192-page pool: guaranteed exhaustion, which under §3.8's settled policy is a
+guaranteed **abort**, twice per in-game day.
 
-> **Materialize `(cpuDirty ∩ nonSentinel) ∪ N26(cpuDirty ∩ nonSentinel)`.**
->
+The rule is **step (4) of the normative definitions above** — not restated
+here, per NEW-3. What that section does not have room to argue is *why the
+`∩ nonSentinel` filter is sound*, which is this:
+
 > **Dirty ≠ non-empty.** A chunk that is dirty but is a sentinel holds no
 > matter, so nothing in it can move; the only way it can *receive* matter is
 > from a neighbouring chunk that has matter — and every such neighbour is in
 > `cpuDirty ∩ nonSentinel`, whose 26-ring is materialized. A dirty EMPTY chunk
 > with no non-empty chunk in its 26-neighbourhood is therefore provably
-> unwritable this tick and needs no page.
+> unwritable **by the CA** this tick and needs no page.
 
-This is sound for exactly the same reason the write-reach argument is: writes
-reach ≤1 cell, so matter crosses at most one chunk boundary per substep, so a
-chunk can only be written by a source within its 26-neighbourhood. Under a
-wake-all the materialization set collapses from 32,768 to *the non-empty
-chunks plus their ring* — i.e. to the same ~4,974 + ring the world already
-needs, which is why the pool sizing in §3.7 survives a wake-all at all.
+Note the qualifier **"by the CA"**: it is doing real work. The claim is only
+about matter *moving* under the automaton, which is why `opTargets` and
+`particleChunks` are unioned in *outside* the filter (step 4) — those are
+writes the CPU commanded into cells it chose, and they reach isolated sky where
+no CA write ever could.
+
+This is sound for the same reason the write-reach argument is: writes reach ≤1
+cell, so matter crosses at most one chunk boundary per substep, so a chunk can
+only be written by a CA source within its 26-neighbourhood. Under a wake-all
+the bracketed half collapses from 32,768 to *the non-empty chunks plus their
+ring* — the same ~4,974 + ring the world already needs, which is why the pool
+sizing in §3.7 survives a wake-all at all.
 
 **Fix, part 3 — the hysteresis interaction.** §3.6's free condition includes
 `AND the slot is not in cpuDirty`. With `cpuDirty` all-ones after a wake, **no
@@ -773,6 +923,13 @@ noting independently of paging.
 All three take CPU-authored op streams, so their targets are CPU-known **before
 the ops are written to their buffers** — which is the same place `SubmitTick`
 already computes `opsCount`/`expCount`/`cellCount` (`support.cpp:113-136`).
+
+**These chunks form `opTargets(N)`**, which enters the normative definitions in
+two places: as contributor (a) to `C(N)` (step 0), and — critically — as an
+**unfiltered** term of `materialize(N)` (step 4). They are *not* subject to
+`∩ nonSentinel`: `sim_mutate.wgsl:79` paints into any cell that reads as air,
+so a mode-0 brush into an isolated `PT_EMPTY` chunk is an ordinary operation
+and must have a page. Filtering it would make the brush no-op in open sky.
 
 | writer | materialization set | when |
 |---|---|---|
@@ -851,12 +1008,16 @@ it — with a hard fallback.** Specifically:
 particleChunks(N+1) = Ndilate( particleChunks(N), ceil(PART_MAX_VEL / CHUNK) + 1 )
                       ∪ chunks(spawnOps(N)) ∪ chunks(explosion centers(N))
 particleChunks(N+1) = ∅   when the readback says particleCount == 0
-
-// and, per M1 above, the set feeds the dirty mirror as well as the
-// materialization set — because resolve's markDirtyNext dirties a
-// 26-neighborhood the CPU never chose:
-cpuDirty(N+1)      ∪= N26( particleChunks(N+1) )
 ```
+
+**Where this set enters the normative definitions**, both per M1 above:
+
+- as contributor **(b) to `C(N)`** (step 0) — because `resolve`'s
+  `markDirtyNext` dirties the 26-neighbourhood of a GPU-decided location, so
+  `N26(particleChunks)` is already covered by step (1)'s dilation of `C(N)`;
+- as an **unfiltered** term of `materialize(N)` (step 4) — a particle can come
+  to rest, or a micro droplet can stain, in a chunk that is a sentinel, so
+  `∩ nonSentinel` must not apply to it.
 
 `ceil(6/16)+1 = 1`, so the dilation is a 1-ring per tick — the same shape as
 `cpuDirty`. And `snap.particleCount` (already read back, `world.h:487`) gives
@@ -1924,12 +2085,17 @@ brief's proposed rule (materialize `dirtyOut(last tick) ∪ neighbours`) is
 the CPU's newest `dirtyFlags` can be many ticks stale. A stale set
 under-approximates, and under-approximation is risk 1.
 
-**How neutralized.** The CPU maintains `cpuDirty` **incrementally** rather than
-inferring it: one 26-ring dilation per tick plus CPU op targets, reset to
-ground truth whenever a snapshot actually arrives (§3.2). It cannot
-under-approximate, because the recurrence is the closure lemma applied one tick
-at a time; it over-approximates by one ring per missed snapshot and self-heals
-on the next.
+**How neutralized.** **[REVIEW NEW-5 — FIXED; this paragraph previously said
+"reset to ground truth whenever a snapshot actually arrives", the exact framing
+§3.2 exists to refute, while citing §3.2.]** The CPU maintains `cpuDirty`
+**incrementally**: a one-ring dilation per tick plus the enumerated CPU
+dirty-writers (§3.1a), per step (1) of the normative definitions. An arriving
+snapshot is **a second superset — usually tighter, never ground truth about the
+tick being encoded** — and it is composed by **intersection** (step 2), never
+by assignment. Both operands are supersets, so the result is a superset that is
+at least as tight as either. It therefore cannot under-approximate; it
+over-approximates by one ring per missed snapshot and self-heals on the next
+one that lands.
 
 **What test.** A gate variant that **deliberately starves the readback ring**
 — hold all three slots in flight for 10 consecutive ticks while an active fire
@@ -2304,11 +2470,18 @@ fills, and a `pass_table.def` comment records the two new buffers.
    materially slower, is the workgroup-uniform hoist sufficient?
 6. **NEW — §3.2's `C(j)` retention ring.** The corrected recurrence needs the
    per-tick CPU-op sets kept for `M−S−1` ticks to roll a snapshot forward. That
-   is a small bounded ring, but it is new state with a new failure mode (a ring
-   too short to cover an unusually stale snapshot). My proposal: size it to the
+   is a small bounded ring, but it is new state. My proposal: size it to the
    readback ring depth × max ticks/frame = 3 × 4 = 12, and **skip the tightening
    entirely** when the snapshot is older than the ring can cover — never tighten
-   with an incomplete superset. Confirm that degradation is acceptable.
+   with an incomplete superset.
+
+   **Sizing is a performance knob, not a correctness one** (reviewer's note,
+   and it is the right framing): 12 bounds *frame-loop* staleness only, and a
+   long GPU stall can exceed it. When it does, the skip-tightening path handles
+   it correctly — `cpuDirty` simply stays at step (1)'s wider estimate until a
+   coverable snapshot arrives. An undersized ring costs extra materialized
+   pages, never a missed one. Confirm the degradation is acceptable; there is
+   no soundness question here.
 7. **NEW — §3.2a, the wake-all deallocation stall.** After a daylight boundary
    `cpuDirty` is all-ones, so *no* page is eligible to be freed until it
    shrinks. Bounded (the next snapshot collapses it) but it is a real resident
