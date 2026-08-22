@@ -1151,6 +1151,36 @@ mixed-material/stained — the last unknown in the 2048³ memory budget").
 > hand — streaming store-hit and `LoadWorld` (§3.5 d,e). Do NOT add a GPU
 > uniformity scan and do NOT demote from the tick path in phase 7.**
 
+> ### [MEASURED — commit 0, 2026-08-22, default seed, 300 ticks settled]
+>
+> `--measure`'s uniformity histogram (MEASUREMENT 1b, dense-only) over the
+> 32,768-chunk window:
+>
+> | bucket | chunks | % | note |
+> |---|---|---|---|
+> | all-air (`EMPTY`) | 27,793 | 84.82% | sentinel, 4 B |
+> | **all-one-WORD (`UNIFORM`)** | **41** | **0.13%** | sentinel, 4 B |
+> | all-one-MATERIAL, mixed state/stain | 2,115 | 6.45% | needs a page |
+> | mixed material | 2,819 | 8.60% | needs a page |
+>
+> Resident pages with `EMPTY` only: **4,975 = 77.7 MiB**. With `EMPTY` +
+> `UNIFORM`: **4,934 = 77.1 MiB**. **UNIFORM's marginal saving is 41 chunks =
+> 0.6 MiB, or 0.8% of the resident set.** All 41 are material 5 (water) — flat
+> pond interiors, whose fullness nibble is a uniform 8.
+>
+> **The 2,115 all-one-MATERIAL chunks are the interesting number, and they are
+> exactly what §2.3 predicted:** one material, differing state nibbles, so a
+> 12-bit-material sentinel cannot represent them. That is 6.45% of the window —
+> 33 MiB — sitting one bit-layout decision away, and it is unreachable without
+> widening the page-table entry to carry a state nibble, which is a different
+> design. Recorded as the finding, not acted on in phase 7.
+>
+> **Decision rule applied: the recommendation below stands unchanged.** 0.6 MiB
+> does not justify a GPU uniformity scan on the tick path. UNIFORM stays
+> representable and constructible on the paths that already hold the words
+> (streaming store-hit, `LoadWorld`), which costs nothing extra and keeps the
+> sentinel live and tested; discovery stays out.
+
 Reasons, and this is the call I most want challenged:
 
 1. **The payoff is unmeasured.** ROADMAP §5.1 says so outright. At the current
@@ -2454,7 +2484,10 @@ fills, and a `pass_table.def` comment records the two new buffers.
    worldgen means `kPoolPages` must be ≥ 32,768 or startup aborts.** That
    arguably settles it — batching is not a nicety, it is what lets the pool be
    smaller than dense at all. Confirm.
-2. **§3.6, UNIFORM scope.** Tick-path uniformity discovery deferred pending
+2. **§3.6, UNIFORM scope. ANSWERED by commit 0 — see the [MEASURED] block in
+   §3.6. 41 chunks of 32,768 are whole-word uniform (0.6 MiB). Tick-path
+   discovery is not worth building; the recommendation stands unchanged.**
+   Tick-path uniformity discovery deferred pending
    commit 0's measurement; UNIFORM implemented only where the CPU already has
    the words. If the 2,338 full chunks turn out mostly single-word, that flips.
 3. **§3.7, `kPoolPages = 8192` (128 MiB, 1.65×).** Sized against one seed. Under
