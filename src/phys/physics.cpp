@@ -680,13 +680,15 @@ bool Physics::GetLocalBounds(uint64_t handle, Vec3& outMin, Vec3& outMax) const 
   if (!bi.IsAdded(id)) return false;
   JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
   if (!shape) return false;
-  // Local bounds: the shape's own box, before the body transform. The overlay
-  // applies the live rotation itself, which is what makes the wireframe an
-  // ORIENTED box rather than a world-axis one.
   const JPH::AABox b = shape->GetLocalBounds();
+  const JPH::Vec3 com = shape->GetCenterOfMass();
   const float inv = 1.0f / kVoxelMeters;
-  outMin = Vec3{b.mMin.GetX() * inv, b.mMin.GetY() * inv, b.mMin.GetZ() * inv};
-  outMax = Vec3{b.mMax.GetX() * inv, b.mMax.GetY() * inv, b.mMax.GetZ() * inv};
+  outMin = Vec3{(b.mMin.GetX() + com.GetX()) * inv,
+                (b.mMin.GetY() + com.GetY()) * inv,
+                (b.mMin.GetZ() + com.GetZ()) * inv};
+  outMax = Vec3{(b.mMax.GetX() + com.GetX()) * inv,
+                (b.mMax.GetY() + com.GetY()) * inv,
+                (b.mMax.GetZ() + com.GetZ()) * inv};
   return true;
 }
 
@@ -701,6 +703,7 @@ size_t Physics::GetSubShapeBoxes(uint64_t handle,
   if (!shape || out.size() >= limit) return 0;
 
   const float inv = 1.0f / kVoxelMeters;
+  const JPH::Vec3 com = shape->GetCenterOfMass();
 
   // Jolt optimizes a single-sub-shape compound into a bare BoxShape or a
   // RotatedTranslatedShape wrapping one. Handle both so those limbs also
@@ -709,7 +712,7 @@ size_t Physics::GetSubShapeBoxes(uint64_t handle,
     const auto* box = static_cast<const JPH::BoxShape*>(shape.GetPtr());
     JPH::Vec3 half = box->GetHalfExtent();
     SubShapeBox b;
-    b.center = Vec3{};
+    b.center = Vec3{com.GetX() * inv, com.GetY() * inv, com.GetZ() * inv};
     b.halfExtents = Vec3{half.GetX() * inv, half.GetY() * inv,
                          half.GetZ() * inv};
     b.quat[0] = 0; b.quat[1] = 0; b.quat[2] = 0; b.quat[3] = 1;
@@ -723,7 +726,7 @@ size_t Physics::GetSubShapeBoxes(uint64_t handle,
     const JPH::Shape* inner = rt->GetInnerShape();
     if (inner && inner->GetSubType() == JPH::EShapeSubType::Box) {
       const auto* box = static_cast<const JPH::BoxShape*>(inner);
-      JPH::Vec3 pos = rt->GetPosition();
+      JPH::Vec3 pos = rt->GetPosition() + com;
       JPH::Quat rot = rt->GetRotation();
       JPH::Vec3 half = box->GetHalfExtent();
       SubShapeBox b;
@@ -748,7 +751,7 @@ size_t Physics::GetSubShapeBoxes(uint64_t handle,
     const JPH::CompoundShape::SubShape& ss = compound->GetSubShape(i);
     if (ss.mShape->GetSubType() != JPH::EShapeSubType::Box) continue;
     const auto* box = static_cast<const JPH::BoxShape*>(ss.mShape.GetPtr());
-    JPH::Vec3 pos = ss.GetPositionCOM();
+    JPH::Vec3 pos = ss.GetPositionCOM() + com;
     JPH::Vec3 half = box->GetHalfExtent();
     JPH::Quat rot = ss.GetRotation();
     SubShapeBox b;
