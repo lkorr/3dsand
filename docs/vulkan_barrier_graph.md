@@ -16,9 +16,34 @@ can be argued with; anything marked **JUDGMENT** is a call made here that a
 reviewer should re-derive rather than accept.
 
 Verified against the live tree 2026-08-22 (`simulation.cpp:622-776`,
-`world.cpp:105-235`, `support.cpp:104-173`, `stream.cpp:140-279`, and the WGSL
-binding declarations). Edges this document adds beyond the pass map are marked
-**[NEW EDGE]** and are listed together in §6.9.
+`world.cpp:105-235`, `support.cpp:104-173`, `stream.cpp:140-279`,
+`main.cpp:132-152`, and the WGSL binding declarations). Edges this document adds
+beyond the pass map are marked **[NEW EDGE]** and are listed together in §7.10.
+
+**Completeness is the whole of the guarantee.** Until every command the engine
+records appears in the table, "barriers are generated from the table" means
+"barriers are missing wherever the table is". A path that records GPU work
+outside the table gets no barriers at all — not weak ones, none — and that
+failure is silent in exactly the way this document exists to prevent. The
+enumeration below is therefore normative, not illustrative: adding a code path
+that submits a command buffer means adding its table here in the same commit.
+
+Paths covered by this document:
+
+| Path | Table | Recorded by |
+|---|---|---|
+| the sim tick | §2.4 | `Simulation::EncodeTick` + `EncodeFarFill` + `World::EncodeReadbacks` + `World::EncodeDirtyCopy` |
+| `--shot` far-fill drain loop | §2.5.6 `farFillOnly` | `RunShots`, `main.cpp:139-147` |
+| worldgen | §2.5.1 | `Simulation::EncodeWorldgen` |
+| streamed-chunk generation | §2.5.2 | `Simulation::EncodeGenList`, submitted by `Stream::FillSlots` |
+| load reset | §2.5.3 | `Simulation::EncodeLoadReset` |
+| hash-only rehash | §2.5.4 | `Simulation::EncodeHashOnly` |
+| day/night wake-all | §2.5.5 | `Simulation::EncodeWakeAll` (upload only) |
+| streaming slot uploads | §4.1 pending-upload queue | `Stream::FillSlots`, `stream.cpp:245-260` — **may submit nothing at all** |
+| eviction copies | §4.3 | `Stream::EvictSlots`, own encoder + submit |
+| readbacks | §2.4 phase 7a/7b | `World::EncodeReadbacks` / `EncodeDirtyCopy` — two separate functions |
+| the frame | §2.6 | `main.cpp:2822-2834` |
+| blocking selftest/screenshot reads | §4.2 | `ReadHashSync`, voxel dumps, `grab()` in `RunShots` |
 
 ---
 
@@ -163,7 +188,7 @@ cReadback      wantReadback && a free readback slot exists
 
 All ten are known on the CPU before recording begins. A row whose condition is
 false is **skipped entirely** — it contributes no barrier and does not update
-any buffer's last-access state. §6.4 covers why that is the only correct
+any buffer's last-access state. §7.5 covers why that is the only correct
 handling and what it implies.
 
 ### 2.4 The tick table
@@ -196,6 +221,17 @@ Note T12 reads `voxels` and T13 writes it: an intra-"pass" RAW that Dawn
 inserted for free. This is the mark/apply split CLAUDE.md documents as the fix
 for a kernel that both read and wrote a neighborhood — it only works if the
 barrier between them exists.
+
+**T15 writes all three dispatch-args words, not just the count.**
+`sim_compact.wgsl:22-25` has thread 0 `atomicStore(&args[1], 1u)` and
+`atomicStore(&args[2], 1u)` before the `atomicAdd(&args[0], 1u)` append. The `y`
+and `z` extents of `dispatchArgs` therefore come **from the shader**, not from
+the T01 fill — the fill only zeroes the count. Consequence for the barrier: the
+T01→T15 (and T55→T56, `sim_compact.wgsl:39-42`, identical) TransferWrite→
+StorageAtomicRMW WAW barrier is load-bearing for **dispatch validity**, not
+merely for count accuracy. If the fill lands after the shader's stores, the args
+read `{count, 0, 0}` — a dispatch of zero workgroups, i.e. a world that silently
+stops simulating rather than one that simulates slightly wrong. §7.3.
 
 **Phase 2 — indirect staging** (`simulation.cpp:672`)
 
@@ -251,7 +287,7 @@ easy to lose sight of because they were invisible.
 |---|---|---|---|---|---|---|
 | T60 | `farFill` | `farFill_` (`worldgen:far`) | Compute `(farCount,1,1)` wg`(64)` | `materials`:SR, `tickUBO`:U, `farList`:SR, `farUBO`:U | `farVox`:AtomicRMW, `farOcc`:AtomicRMW | cFar |
 
-**Phase 7 — readbacks** (`World::EncodeReadbacks`, `world.cpp:105-163`; all
+**Phase 7a — readbacks** (`World::EncodeReadbacks`, `world.cpp:105-163`;
 `cReadback`)
 
 | # | Name | Kind | Reads | Writes |
@@ -264,15 +300,42 @@ easy to lose sight of because they were invisible.
 | T75 | `copy.particleCounts` | Copy 16 B | `particleCounts`:TransferRead | `slot.buf`:TransferWrite |
 | T76 | `copy.support` | Copy 16 KiB | `support`:TransferRead | `slot.buf`:TransferWrite |
 | T77 | `fill.support` | Fill | — | `support`:TransferWrite |
-| T78 | `copy.dirtyNext` | Copy 16 KiB | `DirtyOut`:TransferRead | `slot.buf`:TransferWrite |
-| T79 | `barrier.hostRead` | Barrier only | `slot.buf`:HostRead | — |
+
+**Phase 7b — the dirty copy** (`World::EncodeDirtyCopy`, `world.cpp:165-168`)
+
+This is a **separate function**, called from `support.cpp:167` *after*
+`EncodeReadbacks` has already returned — including after T77's
+`ClearBuffer(support)` at `world.cpp:160`. It is guarded by
+`if (lastSlot_ < 0) return;` and by `SubmitTick`'s `if (doCopy)`, so its
+condition is "7a ran and claimed a slot", not `cReadback` independently.
+
+| # | Name | Kind | Reads | Writes | Cond |
+|---|---|---|---|---|---|
+| T78 | `copy.dirtyNext` | Copy 16 KiB | `DirtyOut`:TransferRead | `slot.buf`:TransferWrite @`kDirtyOff` | 7a claimed a slot |
 
 T70–T78 are all transfer→transfer against each other and need **no barriers
 between themselves** (they write disjoint ranges of `slot.buf` and read
 different sources) — with the single exception of T76→T77, which is a genuine
-transfer-read→transfer-write WAW/WAR on `support` and is the case most likely to
-be dropped as "just two copies" (§6.2). T79 is a synthetic row: it exists so the
-recorder emits the host-visibility barrier described in §3.2.
+transfer-read→transfer-write WAR on `support` and is the case most likely to be
+dropped as "just two copies" (§7.4).
+
+**The host-read barrier is not a table row.** An earlier draft of this document
+placed a `T79 barrier.hostRead` row at the end of phase 7, which was wrong: T78
+writes `slot.buf` and is recorded *after* phase 7a, so a barrier at a fixed
+index inside 7a would make the host read `dirtyFlags` (consumed at
+`world.cpp:186-192`) with no visibility guarantee at all. The correct rule:
+
+> **The recorder emits the host-visibility barrier at `Finish()` time — as the
+> last command in the command buffer, after every writer of every
+> host-visible buffer touched during the recording — never at a fixed table
+> index.**
+
+Mechanically: the recorder keeps the set of host-visible buffers written during
+this recording (readback slots, staging ring regions being read back) and, in
+`Finish()`, emits one `vkCmdPipelineBarrier2` with a `VkBufferMemoryBarrier2`
+per such buffer, `srcStage=COPY srcAccess=TRANSFER_WRITE →
+dstStage=HOST dstAccess=HOST_READ`. This is index-independent by construction,
+so a future path that appends another copy into `slot.buf` cannot get behind it.
 
 **Phase 8 — measurement**
 
@@ -282,26 +345,88 @@ recorder emits the host-visibility barrier described in §3.2.
 
 ### 2.5 The non-tick tables
 
-Same schema, separate arrays, each recorded into its own command buffer.
+Same schema, separate arrays, each recorded into its own command buffer. There
+are **six**, and the sixth is the one an implementer working only from
+`EncodeTick` will miss.
 
-**`worldgen`** (`simulation.cpp:550-566`): fills `dirty[0]`, `dirty[1]`, `hash`,
-`support`, `particleCounts`, `claim`, `drawArgs` (7 Fill rows, no hazards among
-them), then `worldgen_` direct `(4096,1,1)` reading `materials`/`tickUBO`,
-writing `voxels`:SW, `occupancy`:SW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW.
-Note the fills of `dirty[0/1]` DO hazard against the dispatch — `genChunk`
-`atomicStore`s both (worldgen.wgsl:2605-2609) — so a TRANSFER→COMPUTE barrier is
-required there and the "no hazards among them" applies only to the fills
-pairwise.
+**2.5.1 `worldgen`** (`simulation.cpp:550-566`): fills `dirty[0]`, `dirty[1]`,
+`hash`, `support`, `particleCounts`, `claim`, `drawArgs` (7 Fill rows, no
+hazards among them *pairwise*), then `worldgen_` direct `(4096,1,1)` reading
+`materials`/`tickUBO`, writing `voxels`:SW, `occupancy`:SW, `DirtyIn`:AtomicRMW,
+`DirtyOut`:AtomicRMW. The fills of `dirty[0/1]` **do** hazard against the
+dispatch — `genChunk` `atomicStore`s both (`worldgen.wgsl:2604-2610`) — so a
+TRANSFER→COMPUTE barrier is required there, and "no hazards among them" applies
+only to the fills against each other.
 
-**`genList`** (`simulation.cpp:568-576`): `worldgenList_` direct `(count,1,1)`,
-reads `genList`:SR, `materials`:SR, `tickUBO`:U; writes `voxels`:SW,
-`occupancy`:SW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW. Recorded in its own
-submit from `Stream::FillSlots`; §3.7.
+**2.5.2 `genList`** (`simulation.cpp:568-576`): `worldgenList_` direct
+`(count,1,1)`, reads `genList`:SR, `materials`:SR, `tickUBO`:U; writes
+`voxels`:SW, `occupancy`:SW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW.
+Recorded in its own encoder and submitted **mid-frame, between ticks**, from
+`Stream::FillSlots` (`stream.cpp:274-277`).
 
-**`loadReset`** (`:588-601`): 5 fills + `occupancy_` full.
-**`hashOnly`** (`:603-611`): fill `hash` + `occupancy_` full.
-**`wakeAll`** (`:613-620`): an upload only — no command buffer today; §3.1
-gives it one.
+Two things about this row that are easy to get wrong:
+
+- **It binds `simBG_` (all 17 bindings) but `worldgen:list`/`genChunk` touch
+  seven of them.** `dirtyList`, `argsStage`, `opsBuf`, `cellOps`, `support`,
+  `pick`, `hash`, `passUBO`, `reactions`, `renderUBO` are bound and never
+  referenced. The `uses` set is the seven, per §2.1 rule 1 — and this is
+  precisely the trap §6.1's finding-2 fix exists to keep the checker from
+  flagging, now on a mid-frame submit where a spurious barrier would be
+  charged against streaming latency.
+- **`genChunk` `atomicStore`s both `dirtyIn` and `dirtyOut`**
+  (`worldgen.wgsl:2604-2610`), while the concurrently-in-flight tick's
+  `markDirty`/`markBoth` are atomically writing the same two buffers. That is a
+  **cross-submit WAW against a shader atomic**, structurally identical to the
+  `particleCounts` case in §4.4/§7.7 and covered by the same mechanism: §3.4's
+  head-of-command-buffer global barrier orders the genList submit's writes after
+  every prior submit's. Naming it here so it is not rediscovered as a bug.
+  **[NEW EDGE]**
+
+**2.5.3 `loadReset`** (`:588-601`): 5 fills + `occupancy_` full.
+**2.5.4 `hashOnly`** (`:603-611`): fill `hash` + `occupancy_` full.
+**2.5.5 `wakeAll`** (`:613-620`): an upload only — no command buffer today;
+§4.1 gives it a home.
+
+**2.5.6 `farFillOnly`** — the `--shot` far-field drain loop
+(`RunShots`, `main.cpp:139-147`).
+
+This path records GPU work in a command buffer that contains **only** T60, in a
+loop, with no tick anywhere in it:
+
+```c++
+while ((n = far.PrepareTick(ctx.queue)) > 0) {   // writes farUBO (when dirty)
+  TickParams tp{0, kDefaultSeed, 0, 0};          //         + farList, every iter
+  tp.farCount = n;
+  ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+  enc = device.CreateCommandEncoder();
+  sim.EncodeFarFill(enc, n);                     // == T60, nothing else
+  queue.Submit(1, &enc.Finish());
+}
+```
+
+| # | Name | Kind | Reads | Writes | Cond |
+|---|---|---|---|---|---|
+| S00 | `upload.tickUBO` | Copy/Update 64 B | staging | `tickUBO`:TransferWrite | every iteration |
+| S01 | `upload.farUBO` | Copy/Update 128 B | staging | `farUBO`:TransferWrite | `uboDirty_` (`farfield.cpp:103-113`) |
+| S02 | `upload.farList` | Copy/Update ≤16 KiB | staging | `farList`:TransferWrite | every iteration |
+| S03 | `farFill` (= T60) | Compute `(n,1,1)` wg`(64)` | `materials`:SR, `tickUBO`:U, `farList`:SR, `farUBO`:U, `dispatchArgs`: — | `farVox`:AtomicRMW, `farOcc`:AtomicRMW | every iteration |
+
+**The upload→dispatch RAW on `tickUBO` is load-bearing per iteration, not
+once.** `farCount` is carried *in `tickUBO`* (`main.cpp:141`, read by
+`worldgen.wgsl:far` as `T.farCount` at its early-out) — it is not a push
+constant and not a dispatch dimension. So every iteration writes a different
+`farCount` into the same 64-byte uniform buffer and immediately dispatches
+against it. Miss the TRANSFER_WRITE→UNIFORM_READ barrier and iteration k
+dispatches `n_k` workgroups whose early-out tests `n_{k-1}`, silently dropping
+or duplicating cascade fills. Because each iteration is its own submit, §3.4's
+head barrier covers the cross-submit half; the intra-command-buffer half
+(S00/S02 → S03) is an ordinary table-derived barrier, which is exactly why this
+path must be *in* a table.
+
+`farVox`/`farOcc` carry an iteration-to-iteration WAW across submits, covered by
+§3.4. Nothing here is hashed (far-field is render-only, DESIGN.md §9), so this
+path cannot desync — but a wrong `farCount` produces the sky-hole artifacts
+`--shot` exists to inspect, which makes it self-defeating rather than harmless.
 
 ### 2.6 The render table
 
@@ -366,7 +491,7 @@ atomic-specific access flag. Two consecutive atomic-only passes on the same
 buffer (`farDown` then `farFill` on `farVox`) still need a WAW barrier: atomics
 guarantee per-operation atomicity, not visibility of one dispatch's results to
 the next. §3.6 covers whether that barrier can be relaxed. (It cannot; see
-§6.9's finding on `farFill`'s `atomicStore`.)
+§7.10's finding on `farFill`'s `atomicStore`.)
 
 ### 3.3 The algorithm
 
@@ -482,9 +607,37 @@ there: `voxels` was last written by `pResolve`/`ca[53]`, so T70's first read of
 
 ### 3.6 Special case: the CA loop
 
-Iteration k+1 reads `voxels` that iteration k wrote; both write `DirtyOut` and
-`support` atomically. The algorithm produces, between every pair, three buffer
-barriers:
+**Read this before touching anything in this section: the 54 iterations must
+never overlap, and that is a requirement of the color lattice, not of memory
+visibility.**
+
+`sim_step.wgsl:1-9` states the invariant the whole determinism argument rests
+on: within one dispatch, every acting cell shares one `colorPhase`, so any two
+acting cells are ≥3 apart on every axis while writes reach ≤1 cell, and
+destination writes are *provably disjoint*. The disjointness holds **within a
+color phase and nowhere else.** `colorPhase` changes every iteration — it
+arrives through the dynamic `passUBO` offset `k * kPassStride`
+(`simulation.cpp:682-683`), a different 256-byte slice per k. Two iterations
+running concurrently are two *different* colors running concurrently, and cells
+of different colors are adjacent by construction: their writes overlap, and the
+outcome depends on which workgroup got there first.
+
+So the inter-iteration barrier is not an optimization knob and not a
+cache-flush detail — **it is the mechanism that makes the color lattice mean
+anything.** Remove it and rule 1 is gone, not degraded: the sim becomes
+first-come-first-served at every color boundary, which CLAUDE.md rule 1 bans by
+name.
+
+The practical consequence: **batching CA iterations is the single easiest way
+to destroy determinism while believing you are optimizing barriers.** Any
+future change that merges iterations, drops "redundant" barriers between them,
+or moves them onto separate queues is a determinism change requiring a
+cross-vendor hash gate, regardless of how it is framed. This is restated as
+§7.1, the top risk.
+
+With that established — iteration k+1 also reads `voxels` that iteration k
+wrote, and both write `DirtyOut` and `support` atomically. The algorithm
+produces, between every pair, three buffer barriers:
 
 | buffer | src | dst |
 |---|---|---|
@@ -508,18 +661,55 @@ The two forms are:
 **Decision: (B), one global memory barrier per CA iteration.** Reasons, in the
 order that matters:
 
-1. **Correctness is strictly stronger.** A global memory barrier's scope covers
-   every buffer, including any binding a future edit adds to `sim_step.wgsl`
-   without updating the table. In the loop with 53 repetitions and the entire
-   determinism guarantee riding on it, a barrier that cannot be made too narrow
-   by a table mistake is worth more than a barrier that is minimal.
-2. **In practice every real driver implements a compute→compute buffer barrier
+1. **(B) is stronger than (A) *within the compute-storage access domain*, which
+   is where every hazard inside the loop lives.** It is **not** a superset of
+   (A) in general, and an earlier draft of this document claimed it was. A
+   `VkMemoryBarrier2` with `srcStage/dstStage = COMPUTE_SHADER` and
+   `srcAccess/dstAccess = SHADER_STORAGE_READ | SHADER_STORAGE_WRITE` covers
+   *every buffer* — including a binding a future edit adds to `sim_step.wgsl`
+   without updating the table — but only for *those stages and those access
+   types*. It does **not** cover `INDIRECT_COMMAND_READ` at `DRAW_INDIRECT`, and
+   `sim_step` consumes `dispatchArgs` as an indirect source on every iteration.
+
+   Why the loop is nonetheless sound: **nothing writes `dispatchArgs` inside the
+   loop.** T20 copies into it once, before iteration 0 (`simulation.cpp:672`);
+   the loop body is `SetBindGroup` + `DispatchWorkgroupsIndirect` and nothing
+   else (`simulation.cpp:681-685`). The tracker therefore emits the
+   `TRANSFER_WRITE → INDIRECT_COMMAND_READ` barrier once, ahead of the loop, and
+   correctly emits nothing for iterations 1–53. **That soundness comes from the
+   tracker, not from the global barrier**, and the distinction matters: if a
+   future change ever wrote `dispatchArgs` between iterations, form (B) would
+   silently fail to order it while form (A) — driven by the same tracker — would
+   not, because the tracker would emit a per-buffer barrier for it.
+
+   The design keeps (B) and makes the assumption checkable rather than implicit.
+   **Checker assertion (§6.1): no row carrying `useGlobalBarrier` may declare an
+   `IndirectRead` of a buffer that is written anywhere inside its own repeat
+   span.** T30 satisfies it. Widening the CA barrier to include
+   `DRAW_INDIRECT`/`INDIRECT_COMMAND_READ` in both scopes is the alternative and
+   is also correct; it is rejected only because it makes the barrier look like
+   it is doing something it is not, and the assertion is the honest form of the
+   same guarantee.
+
+2. **Atomic visibility is covered; indirect visibility is not — and that is the
+   same distinction.** §3.2 establishes that `StorageAtomicRMW` maps to
+   `SHADER_STORAGE_READ | SHADER_STORAGE_WRITE` because Vulkan has no
+   atomic-specific access flag, and that consecutive atomic-only passes still
+   need a real barrier. Form (B)'s access mask contains exactly those two bits,
+   so **the loop's atomic writes to `DirtyOut` and `support` are fully covered
+   by (B)**. The indirect read is the one access in the loop whose flag is
+   outside (B)'s mask, which is why it needs the argument in point 1 rather than
+   falling out of it. Answering the question directly: atomics — yes; indirect —
+   no.
+
+3. **In practice every real driver implements a compute→compute buffer barrier
    on a 512 MiB device-local buffer as a full cache flush + invalidate anyway.**
    Buffer barriers on VkBuffers do not carry layout information; the range is
    advisory to nearly all implementations. Form (A) buys measurable time only on
    implementations that do per-range tracking, which for storage buffers is
    uncommon.
-3. **It is one API call with one struct instead of three, in a loop that runs 54
+
+4. **It is one API call with one struct instead of three, in a loop that runs 54
    times per tick at 30 Hz** — a small but free CPU-side recording win.
 
 The cost of (B) is that it also orders `materials`, `reactions` and the UBOs
@@ -568,14 +758,14 @@ indirect fetch may still be in flight**. That is a WAR on `pDispatchArgs`
 (indirect read → transfer write) and the algorithm emits it from
 `readStagesSince = DRAW_INDIRECT`, `readAccessSince = INDIRECT_COMMAND_READ`.
 Losing this one is a classic: it produces a dispatch sized by the *wrong* args,
-intermittently. §6.3.
+intermittently. §7.2.
 
 ### 3.8 Special case: atomic-only WAW on `farVox` / `farOcc`
 
 T5A (`farDown`) and T60 (`farFill`) both touch `farVox`/`farOcc` with atomics
 only, in that order, in the same command buffer. The algorithm emits a
 COMPUTE→COMPUTE `READ|WRITE`→`READ|WRITE` barrier between them. That is correct
-and necessary — see §6.9 for why the "they're both atomic, atomics are coherent"
+and necessary — see §7.8 for why the "they're both atomic, atomics are coherent"
 intuition is wrong here specifically.
 
 The far-field buffers are render-only derived data (DESIGN.md §9), excluded from
@@ -585,7 +775,7 @@ desync the sim — it can only produce a visibly wrong cascade. That makes them
 
 ### 3.9 Special case: skipped conditional rows
 
-Covered as a risk in §6.4 because the failure mode is subtle. The mechanism is
+Covered as a risk in §7.5 because the failure mode is subtle. The mechanism is
 one line of the algorithm: a row whose condition is false is never visited, so
 it never touches `BufState`, so the next row that *is* visited computes its
 barrier against the last actual accessor. There is no "skipped pass" concept in
@@ -613,47 +803,125 @@ entirely by §3; the rest need mechanism.
 ### 4.1 (a) The upload path — replacing `queue.WriteBuffer` (assumption 5, 9)
 
 WebGPU's `queue.WriteBuffer` is defined to happen *at the start of the next
-submit*, in queue order, with no barrier needed by the caller. Vulkan has no
-such operation. Two mechanisms, chosen by size class:
+submit*, in queue order, with no barrier needed by the caller. Two things about
+that definition have to be reproduced, and only one of them is about barriers:
 
-**Class A — `vkCmdUpdateBuffer`, for ≤ 65536 B.** Recorded directly into the
-command buffer at the head. It is a transfer operation, so the recorder's
-`Fill`/`Copy` machinery already tracks it correctly as `TransferWrite` — no
-staging allocation, no host-visible memory, no extra lifetime. `vkCmdUpdateBuffer`'s
-limit is 65536 bytes and the data must be 4-byte-aligned in size and offset;
-both hold for every buffer in this class.
+- **"at the start of the next submit"** — the write is deferred, and it attaches
+  to whichever submit happens next, from whatever code path issues it.
+- **"in queue order"** — writes to the same range land in issue order, so the
+  last writer before a submit wins.
+
+The second is where a naive port breaks. `Stream::FillSlots`
+(`stream.cpp:245-260`) writes `voxels` (16 KiB), `occupancy` (4 B),
+`dirty[0]` (4 B) and `dirty[1]` (4 B) per store-hit slot — and **if every slot
+hits the store, it submits nothing at all**: the submit at `stream.cpp:274-277`
+is guarded by `if (!genSlots.empty())`. A model phrased as "uploads are recorded
+at the head of *that submit's* command buffer" has no home for those writes.
+They belong to the *next* command buffer submitted from *any* path, which is
+usually the next tick.
+
+#### The pending-upload queue
+
+```c++
+struct PendingUpload {
+  BufId    dst;
+  uint64_t dstOffset;
+  uint64_t size;
+  uint64_t stagingOffset;   // Class B: into the staging ring
+  const void* inlineData;   // Class A: captured at record time (see below)
+};
+std::vector<PendingUpload> pendingUploads_;   // issue order, never reordered
+```
+
+Every call site that calls `queue.WriteBuffer` today calls
+`Rhi::QueueWrite(dst, offset, data, size)` instead, which appends to
+`pendingUploads_` (copying the payload into the staging ring for Class B, or
+into a small CPU-side arena for Class A). **The recorder flushes the entire
+queue at the head of the next command buffer it records, from whichever path
+records it, in issue order, then clears it.** Nothing else drains it.
+
+This reproduces both halves of the WebGPU semantics:
+
+- *Deferred, attaches to the next submit*: by construction — the queue survives
+  across `FillSlots` returning without submitting, and drains into the next
+  tick's command buffer.
+- *In queue order, last-write-wins per range*: by preserving issue order and
+  never coalescing. The live case is `tickUBO`: `FillSlots` writes it at
+  `stream.cpp:268-273` for the genList submit; if that submit happens, the queue
+  drains there. If it does *not* happen (no `genSlots`), the streaming
+  `TickParams` sits in the queue and is then followed by `SubmitTick`'s own
+  `tickUBO` write (`support.cpp:126`), and the tick's write — issued later —
+  lands later and wins. Both orderings are correct, and both are the same
+  ordering WebGPU produces today.
+
+A consequence worth stating: **`pendingUploads_` must be flushed before
+`vkQueueWaitIdle`-style drains and at shutdown**, or a `FillSlots` that submitted
+nothing right before a `WaitIdle` leaves its writes unapplied. The recorder
+exposes `FlushUploads()` for exactly the `--shot`/save/load/shutdown call sites
+in §4.9.
+
+#### Class A — `vkCmdUpdateBuffer`
+
+**Rule: Class A iff `size ≤ 65536` AND the payload is available at record time
+AND the size is a multiple of 4 (`vkCmdUpdateBuffer` requires 4-byte-aligned
+offset and size).** Nothing else. This is the one consistent rule; an earlier
+draft applied it inconsistently (`farList` at 16 KiB in Class A while `passUBO`
+at 13.5 KiB was in Class B) and that inconsistency is resolved here in favor of
+the size rule.
+
+`vkCmdUpdateBuffer` **captures the data into the command buffer at record
+time**, which is why no staging allocation and no lifetime tracking are needed
+— and it is also why the `--shot` far-fill loop (§2.5.6) is safe in Class A:
+each iteration records its own `tickUBO` payload into its own command buffer, so
+the loop's rapid overwrites of one 64-byte buffer cannot alias.
 
 Class A covers: `tickUBO` (64 B), `renderUBO`, `farUBO` (128 B), `opsBuf`
-(≤2 KiB), `expOps` (≤256 B), `particleCounts` (4 B partial), `sprites`
-(≤2 KiB), `bodyXforms` (≤16 KiB), `farList` (≤16 KiB), `dirty[page]` on the
-day/night wake (16 KiB), `genList` (≤16 KiB), `mbInstBuf_` (≤8 KiB),
-`mbModelBuf_` (4 KiB), `debugBoxes`.
+(≤2 KiB), `expOps` (≤256 B), `particleCounts` (4 B partial write at
+`(1-page)*4`), `sprites` (≤2 KiB), `bodyXforms` (≤16 KiB), `farList` (≤16 KiB),
+`dirty[page]` on the day/night wake (16 KiB), `genList` (≤16 KiB), `mbInstBuf_`
+(≤8 KiB), `mbModelBuf_` (4 KiB), `passUBO` (13.5 KiB, once at init),
+`debugBoxes`, and the three streaming partial writes:
+
+- **`occupancy` @ `slot*4`, 4 B** (`stream.cpp:257`)
+- **`dirty[0]` @ `slot*4`, 4 B** (`stream.cpp:259`)
+- **`dirty[1]` @ `slot*4`, 4 B** (`stream.cpp:260`)
+
+These three are per-slot, so a streaming shift issues up to a few hundred of
+them. They are partial writes into live buffers — the same shape as
+`SetArtPalette` (assumption 9) — and each is one `vkCmdUpdateBuffer` of 4 bytes.
+The recorder tracks the whole buffer as `TransferWrite` (per §2.2's
+whole-buffer granularity), so the *first* one in a flush emits any needed
+barrier and the rest emit nothing.
 
 `debugBoxes` sits **exactly on the boundary**: `kMaxDebugBoxes = 1024`
 (`world.h:156`) × `sizeof(DebugBox) = 64` (`world.h:155` static_assert) = 65536
-bytes, and `vkCmdUpdateBuffer`'s limit is "≤ 65536", so a full-capacity write is
-legal by one byte. Same for `microTableBuf_` at `kMaterialSlots = 4096` ×
-`sizeof(MicroBrickGpu) = 16` = 65536. **The recorder must `static_assert` both
-sizes against the 65536 limit rather than trusting this**, because raising
-either constant by one entry silently turns a legal `vkCmdUpdateBuffer` into a
-validation error — and `microTableBuf_` is therefore assigned to Class B below
-despite fitting, so that a hot-reload path never sits on the boundary.
+bytes, and the limit is "≤ 65536", so a full-capacity write is legal by one
+byte. `microTableBuf_` is identical: `kMaterialSlots = 4096` ×
+`sizeof(MicroBrickGpu) = 16` (`microvox.h:67` static_assert) = 65536.
 
-**Class B — persistent-mapped staging ring + `vkCmdCopyBuffer`, for > 65536 B.**
+Both are Class A by the size rule, and both are one constant-bump away from
+being illegal. **The recorder `static_assert`s every Class A buffer's capacity
+against 65536** rather than relying on a reader noticing; raising
+`kMaxDebugBoxes` or `kMaterialSlots` then fails the build instead of producing
+a validation error at runtime. Do not instead move them to Class B "for safety"
+— a size-derived rule with two hand-made exceptions is the kind of rule that
+gets applied wrong by the next person.
+
+**Class B — persistent-mapped staging ring + `vkCmdCopyBuffer`, for > 65536 B**
+(or for any payload not available at record time).
 A ring of `HOST_VISIBLE | HOST_COHERENT` buffers, persistently mapped, sized to
 comfortably hold one frame's worth of large uploads (16 MiB is ample: the worst
 tick is `cellOps` 512 KiB + `spawnOps` 128 KiB + `bodyInstances` 4 MiB +
 `microPoolBuf_`/`mbPoolBuf_` 4 MiB each on a hot reload). The CPU memcpies into
-the ring at the same call site that calls `WriteBuffer` today, records a
-`vkCmdCopyBuffer` at the submit head, and advances the ring cursor. Ring regions
-are reclaimed by the same fence that retires the submit that consumed them.
+the ring inside `QueueWrite`, and the recorder emits a `vkCmdCopyBuffer` when
+the pending queue flushes. Ring regions are reclaimed by the fence of the submit
+that consumed them — **which is why §4.2 gives every submit a fence, not just
+the ones that carry a readback.**
 
 Class B covers: `cellOps` (≤512 KiB), `spawnOps` (≤128 KiB),
 `bodyInstances` (≤4 MiB), `materialBuf_` (4096 × `sizeof(MaterialGpu)`),
-`reactionBuf_`, `microTableBuf_` (64 KiB exactly — Class B by the boundary rule
-above), `microPoolBuf_` (4 MiB), `mbPoolBuf_` (4 MiB), `passUBO` (13.5 KiB,
-once at init — Class A would also work), and streaming's per-slot 16 KiB
-`voxels` writes.
+`reactionBuf_`, `microPoolBuf_` (4 MiB), `mbPoolBuf_` (4 MiB), and streaming's
+per-slot 16 KiB `voxels` writes (`stream.cpp:247-248`).
 
 **Why HOST_COHERENT and no `HOST_WRITE` barrier in the common path.** With
 coherent memory, host writes are automatically available to the device at the
@@ -666,25 +934,28 @@ written before the submit that reads it, and adding one is harmless noise. It
 submitted-but-unretired command buffer, which the ring's fence discipline
 prevents by construction.
 
-**Ordering.** All uploads for a submit are recorded at the **head** of that
-submit's command buffer, in the order the CPU issued them, before any pass row.
-This reproduces WebGPU's semantics exactly, including the semantics that make
-`SetArtPalette`'s partial write into a live `materialBuf_` (assumption 9) safe:
-a partial `vkCmdUpdateBuffer`/`vkCmdCopyBuffer` into a range no in-flight submit
-is reading, ordered ahead of every reader in this submit, is the same operation
-WebGPU performs. The recorder tracks `materialBuf_` as `TransferWrite` and the
-first shader read of it in the tick gets a TRANSFER→COMPUTE barrier for free.
+**Ordering and barriers.** The flush emits its uploads at the **head** of the
+command buffer, in issue order, before any pass row — and each one goes through
+the ordinary `TransferWrite` path in §3.3, so hazards against the rows that
+follow are derived, not assumed. This makes `SetArtPalette`'s partial write into
+a live `materialBuf_` (assumption 9) safe by the same mechanism as everything
+else: the recorder marks `materialBuf_` written, and the first shader read of it
+in the tick gets a TRANSFER→COMPUTE barrier automatically.
 
-**`EncodeWakeAll` gets a command buffer.** Today it is a bare
+**`EncodeWakeAll` needs no command buffer of its own.** Today it is a bare
 `queue.WriteBuffer` with no encoder (`simulation.cpp:613-620`), issued from
-`SubmitTick` before the tick's encoder is created. Under the upload path it
-becomes a Class A `vkCmdUpdateBuffer` recorded at the head of the *tick's* own
-command buffer, ahead of T00. This is a behavior-preserving simplification: the
-write must land before `compact` reads `DirtyIn`, and nothing between the two
-touches `dirty[page]`. **[NEW EDGE]**: note that T00 fills `dirty[1-page]` and
-the wake writes `dirty[page]` — different buffers, no hazard — but if the page
-ever aliased, the wake would be clobbered. The recorder's symbolic
-`DirtyIn`/`DirtyOut` resolution makes this checkable.
+`SubmitTick` (`support.cpp:155`) before the tick's encoder is created. Under the
+pending-upload queue it is simply a `QueueWrite` that drains at the head of the
+tick's command buffer, ahead of T00 — no special case at all, which is the
+point of the queue model. The write must land before `compact` (T15) reads
+`DirtyIn`, and the flush ordering guarantees it.
+
+**[NEW EDGE]** T00 fills `dirty[1-page]` while the wake writes `dirty[page]` —
+different buffers, no hazard *as long as the symbolic resolution is right*. If
+`DirtyIn`/`DirtyOut` ever resolved to the same id, T00's fill would silently
+clobber the wake and the world would fail to wake at a day/night boundary. The
+recorder's symbolic resolution (§2.2) makes this a checkable property rather
+than a coincidence; the checker asserts `DirtyIn != DirtyOut` after resolution.
 
 ### 4.2 (b) The readback ring on real fences (assumption 10)
 
@@ -704,11 +975,24 @@ struct Slot {
 };
 ```
 
-- **Which fence signals what.** The fence passed to `vkQueueSubmit` for the
-  **tick command buffer that contains rows T70–T79**. One fence per submit; the
-  slot borrows it. If a tick records no readback (`cReadback` false), it submits
-  with `VK_NULL_HANDLE` and no slot is claimed. This is a 1:1 mapping onto
-  today's `lastSlot_`.
+- **Every submit gets a fence. No exceptions.** An earlier draft said a tick
+  recording no readback "submits with `VK_NULL_HANDLE`", which is wrong for a
+  reason that has nothing to do with readbacks: **Class B staging-ring regions
+  are reclaimed by the fence of the submit that consumed them** (§4.1), so a
+  fenceless submit leaks its ring region permanently. The `--shot` far-fill loop
+  (§2.5.6) is the case that proves it — it submits in a tight loop, carries no
+  readback slot, and uploads `farList` every iteration; with fences only on
+  readback submits, that loop exhausts the ring and deadlocks.
+
+  So: the backend owns a small pool of fences, one per in-flight submit, and
+  `vkQueueSubmit` always takes one. Retiring a fence does two things —
+  reclaims any staging-ring regions charged to it, and releases the command
+  buffer for reuse (§4.4).
+- **Which fence signals a readback slot.** When a tick records rows T70–T78, the
+  claimed slot *borrows a reference to that submit's fence*. The slot does not
+  own a fence of its own; `Slot::fence` above is that borrowed handle. This
+  keeps the 1:1 mapping onto today's `lastSlot_` while decoupling fence
+  lifetime from readback lifetime.
 - **Where the CPU polls.** `ctx.ProcessEvents()`'s replacement, called at the
   same point in the frame (`main.cpp:2833`), walks the 3 slots and calls
   `vkGetFenceStatus`. On `VK_SUCCESS`: read the mapped pointer, run the exact
@@ -720,13 +1004,17 @@ struct Slot {
   Today's version is already correct for the same reason; the fence just makes
   the flag mean what it claims.
 - **Visibility.** With `HOST_COHERENT` slot memory, a fence-signalled submit's
-  writes are visible to the host. The T79 row emits
+  writes are visible to the host. On top of that, the recorder emits
   `srcStage=COPY, srcAccess=TRANSFER_WRITE → dstStage=HOST, dstAccess=HOST_READ`
-  as the last barrier in the command buffer. **JUDGMENT:** with coherent memory
-  and a fence wait this barrier is arguably redundant (the fence + coherent
-  memory is the documented sufficient condition), but it is one barrier per tick
-  and it makes the readback's visibility requirement explicit in the same table
-  everything else lives in. Keep it.
+  for every host-visible buffer written during the recording — **at `Finish()`
+  time, as the last command in the buffer**, per the rule in §2.4 phase 7b.
+  Emitting it at a fixed table index is the bug that rule exists to prevent:
+  `EncodeDirtyCopy` (T78) is a separate function called *after* `EncodeReadbacks`
+  returns, so an index-anchored barrier would leave `slot.buf`'s `kDirtyOff`
+  range — the `dirtyFlags` the host reads at `world.cpp:186-192` — behind the
+  barrier meant to make it visible. **JUDGMENT:** with coherent memory and a
+  fence this barrier is arguably redundant, but it is one barrier per submit and
+  it makes the visibility requirement explicit. Keep it.
 - **Blocking readbacks** (`ReadHashSync`, selftest voxel dumps, screenshots)
   become: record copies → submit with a fence → `vkWaitForFences(UINT64_MAX)` →
   read the map. The one sanctioned synchronous path stays exactly as sanctioned.
@@ -739,18 +1027,37 @@ overwrite the same `voxels` slots with `WriteBuffer`. The comment at
 `stream.cpp:172-174` states the guarantee explicitly: queue order makes the copy
 read the leaving plane's data even though the map completes ticks later.
 
-Vulkan preserves this, with one added requirement:
+Vulkan preserves this, but **the operative mechanism changes**, and it is worth
+being precise because the code comment's reasoning ("queue order") is no longer
+the whole story:
 
-1. **Same queue, submit order preserved.** v1 has one queue (§5), so the
-   eviction submit is ordered before the `FillSlots` uploads by
-   submission-order semantics. But submission order alone gives execution
-   ordering; the eviction copy's *read* of `voxels` and the fill's *write* of
-   `voxels` is a WAR across submits.
-2. **The §3.4 global barrier at the head of every command buffer resolves it.**
-   The `FillSlots`/`genList` command buffer opens with
+1. **The guarantee is no longer "the fill's submit comes after the eviction's
+   submit".** Under §4.1's pending-upload queue, `FillSlots`' `voxels` writes
+   are *deferred* — they do not belong to a submit of their own, and when every
+   slot hits the store there is **no `FillSlots` submit at all**
+   (`stream.cpp:261-278` is guarded by `if (!genSlots.empty())`). The writes
+   drain into whatever command buffer is recorded next, usually the next tick's.
+2. **What actually preserves the ordering is that the eviction submit is issued
+   during `EvictSlots`, before `FillSlots` runs at all, and the pending-upload
+   queue never reorders.** `Stream::Update` calls `EvictSlots` (which submits
+   immediately, `stream.cpp:174`) and *then* `FillSlots` (which only enqueues).
+   So the copy-out is already on the queue before the overwrite is even
+   enqueued, let alone recorded. Submission order still does the work — it just
+   orders "the eviction submit" against "some later submit that happens to carry
+   the fill", rather than against a fill submit of its own.
+3. **§3.4's head-of-command-buffer global barrier supplies the memory half of
+   the dependency.** Submission order gives execution ordering between submits; it
+   does not make the eviction copy's `voxels` read complete-before the later
+   transfer write is visible. The command buffer that drains the fill opens with
    `ALL_COMMANDS/MEMORY_WRITE → ALL_COMMANDS/MEMORY_READ|WRITE`, which orders
-   its transfer writes after every prior submit's reads. This is precisely the
+   its transfer writes after every prior submit's accesses. This is exactly the
    class of cross-submit hazard §3.4 exists to make un-reasonable-about.
+4. **Therefore the `stream.cpp:172-174` comment should be updated when this
+   lands** — its claim ("submit BEFORE FillSlots writes: queue order makes the
+   copy read the leaving plane's data") stays true, but the reason becomes
+   "EvictSlots submits eagerly while FillSlots only enqueues", not "both are
+   submits and submits are ordered". Same commit, per the CLAUDE.md rule about
+   docs that contradict code.
 3. **`CompleteOldest` becomes a fence wait.** Each `PendingEvict` carries the
    `VkFence` of its own submit. `CompleteOldest` does
    `vkWaitForFences(fence, UINT64_MAX)` — a genuine block, exactly as
@@ -856,11 +1163,23 @@ The next `SubmitTick` overwrites `tickUBO` with the real tick's params before
 its own submit. Correct today purely by queue order plus WebGPU's
 write-at-submit-head semantics.
 
-Under §4.1 this is preserved exactly: each submit's `tickUBO` upload is recorded
-at the head of *its own* command buffer, so the streaming submit reads the
-streaming params and the tick submit reads the tick params. The cross-submit
-WAW on `tickUBO` (streaming's write vs. the tick's write) is ordered by
-submission order + the head global barrier.
+Under §4.1's pending-upload queue this is preserved, in both of its two cases:
+
+- **`genSlots` non-empty (a genList submit happens).** The streaming `tickUBO`
+  write was enqueued at `stream.cpp:268-273`, immediately before the submit at
+  `:274-277`, so it drains at the head of *that* command buffer and
+  `worldgen:list` reads the streaming params. The next `SubmitTick` enqueues its
+  own `tickUBO` write, which drains into the tick's command buffer. Each
+  dispatch reads the params written for it.
+- **`genSlots` empty (no streaming submit at all).** No `tickUBO` write was ever
+  enqueued — `stream.cpp:268-273` is inside the `if (!genSlots.empty())` block —
+  so there is nothing to order. This is the case that a "record uploads at the
+  head of this path's submit" model gets wrong by having nowhere to put the
+  writes; the queue model has no such case because the enqueue and the submit
+  are independent.
+
+The cross-submit WAW on `tickUBO` (streaming's write vs. the tick's) is ordered
+by issue order within the queue plus §3.4's head global barrier across submits.
 
 **JUDGMENT / recommendation, not required for the port:** give streaming its own
 `streamTickUBO` rather than borrowing the shared one. It removes a cross-submit
@@ -873,34 +1192,52 @@ Vulkan landing.
 
 ### 4.8 (h) Zero-init policy (assumption 14)
 
-**Policy: `vkCmdFillBuffer(buf, 0, VK_WHOLE_SIZE, 0)` on every buffer at
-creation, without exception, in one command buffer submitted before anything
-else runs.** WebGPU guarantees zero-initialized buffers; Vulkan guarantees
-nothing. Matching the guarantee wholesale is one ~50-line loop over the buffer
-inventory, executed once at startup, and it eliminates an entire class of
-"works on my driver" bug.
+WebGPU guarantees zero-initialized buffers; Vulkan guarantees nothing.
 
-Do not attempt to enumerate which buffers need it. The load-bearing cases known
-today are:
+**Policy, stated as a mechanism rather than a list:** buffer creation goes
+through one function, and that function does three things unconditionally —
+adds `VK_BUFFER_USAGE_TRANSFER_DST_BIT` to the requested usage, records the
+buffer in a registry, and (at the end of `World::Init` / `Simulation::Init`)
+issues `vkCmdFillBuffer(buf, 0, VK_WHOLE_SIZE, 0)` for **every buffer in the
+registry**, in one command buffer submitted before anything else runs.
 
-- **`farVox` (128 MiB) and `farOcc` (128 KiB)** — `world.cpp:71-74` states it
-  outright: zero = air, so unfilled cascade regions render as sky rather than
-  garbage. `farOcc` has *no* `CopyDst` usage at all today
-  (`world.cpp:77-78`), so it is written only by shaders and is *entirely*
-  dependent on zero-init for every level-chunk the fill has not reached. Under
-  Vulkan it needs `VK_BUFFER_USAGE_TRANSFER_DST_BIT` added purely so it can be
-  filled. This is the single most likely buffer to be forgotten, because
-  nothing in the current code writes it from the host.
-- **`dirtyList` (no `CopyDst` today)** — same usage-flag consequence.
-- **`particles[0/1]`** (8 MiB each, no `CopyDst`) — read only up to
-  `particleCounts`, so garbage beyond the live count is unread, but "unread"
-  arguments are exactly what a zero-fill policy exists to stop having to make.
-- `hash`, `claim`, `support`, `particleCounts`, `drawArgs`, `occupancy`,
-  `dirty[0/1]` — all explicitly cleared by `EncodeWorldgen`/`EncodeLoadReset`
-  today, but only on those paths.
+```c++
+// gpu/resources.cpp — the ONLY buffer constructor.
+Buffer CreateBuffer(Device&, uint64_t size, Usage usage, const char* label) {
+  usage |= Usage::TransferDst;               // unconditional: zero-init needs it
+  Buffer b = /* vkCreateBuffer + VMA alloc */;
+  g_allBuffers.push_back(b);                 // registry, for ZeroInitAll()
+  return b;
+}
+void ZeroInitAll();   // vkCmdFillBuffer over g_allBuffers, one submit, once
+static_assert(/* every Buffer member is constructed via CreateBuffer */);
+```
 
-Every buffer therefore gains `VK_BUFFER_USAGE_TRANSFER_DST_BIT`. That flag is
-free on device-local memory and is the price of the policy.
+**The enumeration below is evidence that the mechanism is necessary, not a
+worklist.** An earlier draft of this document said "do not attempt to enumerate"
+and then enumerated four buffers — and missed two, one of them the worst case.
+That is the self-refuting shape this mechanism exists to avoid: any
+hand-maintained list of "buffers that need zeroing" will be wrong, including one
+written by someone who just finished explaining why it would be.
+
+The buffers created today **without** `CopyDst`, i.e. the ones whose usage flags
+must change and which no host code can currently write
+(`world.cpp:27-80`, all five verified by grep):
+
+| Buffer | Line | Why zero matters |
+|---|---|---|
+| `pArgsStage` | `world.cpp:50` (`Storage\|CopySrc`) | **The worst miss.** `pArgs[0..3]` are the indirect *draw* args, copied to `drawArgs` by T45. On the first tick before `args2` has ever run, garbage here becomes a `vkCmdDrawIndirect` instance count — the device-hang hazard §4.5 flags. |
+| `farVox` | `world.cpp:75-76` (`Storage\|CopySrc`) | `world.cpp:71-74` states it: zero = air, so unfilled cascade regions render as sky rather than garbage terrain. |
+| `farOcc` | `world.cpp:77-78` (`Storage` only) | Same, and it is the buffer *nothing in the codebase ever writes from the host*, so it is the one a manual audit skips. |
+| `dirtyList` | `world.cpp:31` (`Storage` only) | Indices consumed by 54 CA dispatches; garbage indices address arbitrary chunks. Bounded by `argsStage`'s count in practice — an "unread garbage" argument, i.e. the kind not worth making. |
+| `particles[0/1]` | `world.cpp:45-46` (`Storage` only) | 8 MiB each; read only up to `particleCounts`. Same argument, same reason not to rely on it. |
+
+Buffers that *are* cleared today, but only on the `EncodeWorldgen` /
+`EncodeLoadReset` paths — so a path that reaches the tick without one of those
+(`--shot-mob`, a future headless harness) inherits garbage: `hash`, `claim`,
+`support`, `particleCounts`, `drawArgs`, `occupancy`, `dirty[0/1]`.
+
+`TRANSFER_DST` is free on device-local memory and is the price of the policy.
 
 **A determinism note that matters more than the fill itself:** the world hash
 covers `voxels` bits 0..15 and 24..30 only, so garbage in the tick-stamp bits
@@ -917,6 +1254,11 @@ selftests. Replacement: `vkDeviceWaitIdle` (or `vkQueueWaitIdle` on the single
 queue — equivalent in v1; prefer `vkQueueWaitIdle` so a later async queue does
 not silently widen the drain).
 
+**Every drain must `FlushUploads()` first** (§4.1). A path that enqueues uploads
+and then drains without recording a command buffer would otherwise wait for work
+that does not include its own writes — and then destroy or read the buffers
+those writes were meant to fill.
+
 The call sites that matter:
 
 - **Shader/pipeline hot-reload** (`R`, `F5`): must drain before destroying
@@ -926,8 +1268,19 @@ The call sites that matter:
   first, then `EncodeLoadReset`, then drain again before the readback.
 - **Shutdown** (`main.cpp:2843`): drain before destroying anything. Extend to
   the staging rings, command pools, fences, and the readback slots.
-- **`--shot` / `--shot-mob`**: drain, then blocking readback of the offscreen
-  target.
+- **`--shot`, three distinct drains** (`RunShots`, `main.cpp:132-152`):
+  1. `ctx.WaitIdle()` after `SubmitWorldgen` (`main.cpp:134`) — before the
+     far-fill loop reads the world.
+  2. **The far-fill loop itself** (`main.cpp:139-147`) — this is not a drain but
+     it is the §2.5.6 path, and it is the reason every submit needs a fence
+     (§4.2): it submits in a tight loop with no readback, and its Class B
+     staging (if `farList` ever exceeds Class A) would leak without one. It also
+     needs `FlushUploads` semantics per iteration, which the queue model gives
+     it for free since each iteration records a command buffer.
+  3. `ctx.WaitIdle()` after the 120 settling ticks (`main.cpp:151`) — before the
+     offscreen render and blocking screenshot readback in `grab()`
+     (`main.cpp:160-189`).
+- **`--shot-mob`**: same shape as (3).
 
 ### 4.10 Assumption 13: WebGPU-only constraints
 
@@ -1025,34 +1378,81 @@ argument so the PostToolUse hook can run only the relevant half).
    `tuning_prelude.py`, and for the same reason: two lists that must agree are a
    silent bug, one list plus a generator is not.
 
-2. **The WGSL.** For each row's `(wgsl file, entry point)`:
-   - All `@group(G) @binding(B) var<storage, ACCESS> NAME` and
-     `var<uniform> NAME` declarations, plus the module-scope `var<workgroup>`
-     (ignored).
-   - Which of those names appear **inside the entry point's reachable call
-     graph**. This needs a light call-graph walk: `sim_step.wgsl:main` calls
-     `markDirty` which touches `dirtyOut`, and a naive "does the name appear in
-     the fn body" check would miss it. The walk is: collect all `fn NAME(...)`
-     bodies, build a callee map by identifier match, BFS from the entry point,
-     union the referenced globals. Approximate in the safe direction — a false
-     *inclusion* costs a spurious barrier, a false *exclusion* would be a real
-     bug, so the walk resolves ambiguity by including.
-   - Read vs. write per name: `NAME[...] =`, `atomicStore/Add/Max/Min/And/Or/
-     Xor/Exchange/CompareExchangeWeak(&NAME[...])` ⇒ write; any other appearance
-     ⇒ read. `atomicLoad` ⇒ read only.
+2. **The WGSL — a call-graph walk ROOTED AT THE ENTRY POINT.**
+
+   This is the part that must be specified precisely, because the obvious
+   implementation is wrong in a way that makes the checker useless. A WGSL file
+   declares its storage bindings at **module scope**, shared by every entry
+   point in the file. The set of bindings *declared in the file* is therefore
+   much larger than the set *any one entry point touches*, and a checker that
+   compares the table against module-scope declarations will disagree with a
+   correct table on most rows in this codebase.
+
+   **Algorithm.** For each row's `(wgsl file, entry point)`:
+
+   a. Parse all module-scope `@group(G) @binding(B) var<storage, ACCESS> NAME`
+      and `var<uniform> NAME` declarations into a *candidate* set. Ignore
+      `var<workgroup>`. **This set is not the answer** — it is only the
+      vocabulary of names to look for.
+   b. Collect every `fn NAME(...) { ... }` body in the file (plus
+      `common.wgsl`, which `LoadShader` prepends).
+   c. Build a callee map: function F calls G if identifier `G` appears in F's
+      body followed by `(`.
+   d. **BFS from the entry point only.** Union the candidate names referenced in
+      the bodies of the entry point and every function transitively reachable
+      from it.
+   e. A candidate name **not** reached in (d) is **excluded** — it is declared
+      at module scope for a *different* entry point in the same file, and it is
+      correct for the table to omit it.
+
+   Step (e) is the fix. An earlier draft said the walk should "resolve ambiguity
+   by including" on the grounds that a false inclusion only costs a spurious
+   barrier. That is true of genuine *ambiguity* (an indirect reference the walk
+   cannot resolve), and the rule is kept for that case — but it must not be
+   applied to names that are simply unreachable, because then the walk always
+   returns the whole module and every check below degenerates.
+
+   **Regression cases the checker must pass.** These are real, in-tree, and each
+   one breaks a module-scope implementation:
+
+   | File | Entry | Declared at module scope | Actually touched |
+   |---|---|---|---|
+   | `worldgen.wgsl` | `far` | `voxels`, `dirtyIn`, `dirtyOut`, `occupancy`, `genList` (`:31-37`) + the group-1 far bindings (`:2649-2653`) | **none of the group-0 storage buffers** — only `materials`, `T`, `farList`, `farUBO`, `farVox`, `farOcc` |
+   | `sim_particle.wgsl` | `args1`, `args2` | `voxels`, `dirtyOut`, `pRead`, `pWrite`, `claim`, `spawnOps` (`:12-22`) | only `counts`, `pArgs`, `T` |
+   | `sim_compact.wgsl` | `main` | `dirtyIn` **and** `dirtyOut` (`:13-14`) | only `dirtyIn` (`:27`) |
+   | `sim_compact.wgsl` | `mainNext` | same | only `dirtyOut` (`:44`) |
+   | `sim_step.wgsl` | `main` | — | `dirtyOut` **only via `markDirty`** (`:65`), which (b)–(d) must find |
+   | `worldgen.wgsl` | `list` | — | `dirtyIn`/`dirtyOut`/`occupancy`/`voxels` **only via `genChunk`** (`:2574-2612`) |
+
+   The last two are the reason the walk must be transitive rather than
+   body-local; the first four are the reason it must be rooted rather than
+   module-scope. A checker that fails any of these produces WARN spam on
+   correct rows, which trains implementers to ignore it — at which point the
+   checker is worse than not having one, because it launders a false sense of
+   coverage.
+
+   f. Read vs. write per name: `NAME[...] =`, `atomicStore/Add/Max/Min/And/Or/
+      Xor/Exchange/CompareExchangeWeak(&NAME[...])` ⇒ write; any other
+      appearance ⇒ read. `atomicLoad` ⇒ read only.
 
 **What it asserts.**
 
+All "the entry point" references below mean the **rooted-walk** result from
+step (d), never the module-scope candidate set.
+
 | Check | Severity |
 |---|---|
-| Every buffer the shader reads is in the row's read set (or write set, for RW) | **FAIL** — a missing read means a missing RAW barrier |
-| Every buffer the shader writes is in the row's write set | **FAIL** — a missing write means every later reader is unsynchronized |
-| Every buffer in the row's sets is actually referenced by the entry point | WARN — spurious barriers only |
-| A row declaring `StorageRead` on a binding the WGSL declares `read_write`, where the entry point never writes it | WARN, with the row required to carry a `// read-only in practice: <reason>` comment; missing comment ⇒ FAIL |
+| Every buffer the rooted walk says the entry point **reads** is in the row's read set (or write set, for RW) | **FAIL** — a missing read means a missing RAW barrier |
+| Every buffer the rooted walk says the entry point **writes** is in the row's write set | **FAIL** — a missing write means every later reader is unsynchronized |
+| Every buffer in the row's sets is reached by the rooted walk | WARN — spurious barriers only. **Must be silent on the six regression cases above**; if it is not, the walk is module-scope and the checker is broken |
+| A row declaring `StorageRead` on a binding the WGSL declares `read_write`, where the rooted walk finds no write | WARN, with the row required to carry a `// read-only in practice: <reason>` comment; missing comment ⇒ FAIL. Live cases: `dirtyList` in `sim_step.wgsl:23` (comment already in the shader) and in `sim_occupancy.wgsl:16` |
 | Every entry point in every `sim_*.wgsl` / `worldgen.wgsl` appears in at least one table row | **FAIL** — an unreferenced kernel is either dead or an untabled pass |
 | Every buffer id in the table exists as a `World`/`Simulation` member | **FAIL** |
-| The row's declared bind-group set contains every binding the entry point uses | **FAIL** — catches a kernel added to a pass whose layout cannot bind it |
+| The bind-group layout the row names contains every binding the entry point uses | **FAIL** — catches a kernel added to a pass whose layout cannot bind it. **Note the direction: layout ⊇ used, never layout = used.** `genList` binds `simBGL_`'s 17 bindings and uses 7 (§2.5.2); requiring equality would fail every correct row |
+| No `useGlobalBarrier` row declares an `IndirectRead` of a buffer written anywhere inside its own repeat span | **FAIL** — this is the §3.6 point-1 assumption made checkable: form (B)'s access mask does not cover `INDIRECT_COMMAND_READ`, and T30's soundness depends on nothing writing `dispatchArgs` between iterations |
 | Exactly the rows marked `useGlobalBarrier` are the ones §3.6 sanctions | **FAIL** |
+| `DirtyIn` and `DirtyOut` resolve to different buffer ids for every page value | **FAIL** — §4.1's wake-vs-T00 edge |
+| Every Class A buffer's declared capacity is ≤ 65536 | **FAIL** (also a C++ `static_assert`, §4.1) |
 
 **What it cannot check, stated so nobody assumes it does:** it validates the R/W
 *sets*, not the *order*. A table whose rows are in the wrong order passes this
@@ -1096,32 +1496,60 @@ world-hash *sequence*, not just the final hash.
 python scripts/diff_hashes.py precise.json sledge.json
 ```
 
+**What the oracle is actually good for — stated before the interpretation
+table, because an earlier draft of this section oversold it and an oversold test
+is worse than no test.**
+
+The oracle is **weak at detecting a missing barrier and strong at exonerating
+the barrier graph**. Both halves of that follow from the same fact: on this
+hardware, a compute→compute barrier on a 512 MiB device-local buffer is already
+a full cache flush, and back-to-back indirect dispatches of identical shape
+rarely overlap in the first place. So a *missing* barrier is expected to produce
+**identical hashes in both modes** — the hardware happens to serialize anyway.
+The oracle is nearly blind to precisely the failure this port fears.
+
+It also cannot distinguish two different mistakes: an absent barrier and a
+barrier whose access masks are too narrow. On desktop drivers an execution
+dependency alone usually suffices to make the data visible, so both mistakes
+produce the same (passing) result.
+
 Interpretation:
 
 | Result | Meaning |
 |---|---|
-| Sequences identical | No barrier in the precise recording is too weak *on this GPU, this run*. Necessary, not sufficient — a race can be latent. |
-| Sequences differ | **A barrier is definitively wrong.** The first differing tick localizes it; bisect by making rows sledgehammer one phase at a time (`--barriers=precise:except=ca`, etc.). |
-| Sledgehammer differs from **Dawn's** hash | Something other than a barrier is wrong (zero-init, upload ordering, a shader translation difference). Sledgehammer removes barriers from the suspect list, which is most of its value. |
+| Sequences identical | **Weak evidence.** It does not mean the barriers are right; it means this GPU serialized regardless. Do not report this as "barriers verified". |
+| Sequences differ | **A barrier is definitively wrong.** Rare, but unambiguous. The first differing tick localizes it; bisect by making rows sledgehammer one phase at a time (`--barriers=precise:except=ca`, etc.). |
+| Sledgehammer differs from **Dawn's** hash sequence | **The most valuable outcome.** Sledgehammer is maximally ordered, so barriers cannot be the cause — the bug is zero-init, upload ordering, table row order, or a shader translation difference. This *exonerates* the barrier graph and cuts the suspect list down, which is the oracle's real job. |
 
-Two additions that make this stronger than a single A/B:
+**Sync validation, not the oracle, is what detects a missing barrier.**
+`VK_LAYER_KHRONOS_validation` with
+`VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` reports a hazard
+from the *recorded commands*, without needing a divergence to occur — it does
+not care whether the hardware happened to serialize. It is the primary detector
+and it is assumed on for every debug run. Its known gaps are around indirect
+args and cross-submit hazards, i.e. exactly §4.5 and §4.3, so it is not
+sufficient alone either.
 
-- **Run both settings N times** (N=5) and compare all runs pairwise. A race that
-  is 1-in-20 shows up as precise-vs-precise disagreement without needing the
-  sledgehammer at all, and that is a cleaner signal.
-- **`--barriers=sledgehammer` should also be run with a deliberately hostile
-  scenario**: explosions at the residency-window edge, heavy particle traffic,
-  and streaming shifts in the same ticks — the combination that puts `voxels`,
-  `expMask`, `particles`, `claim` and the streaming submits all in flight.
-  A settled world exercises almost none of the graph.
+The layered position, in order of detection power for a missing barrier:
 
-**Validation layers are assumed on for every debug run.** `VK_LAYER_KHRONOS_validation`
-with **synchronization validation** (`VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`)
-detects most missing barriers directly and by construction, without needing a
-divergence to happen. It is strictly the first line of defense and the
-sledgehammer oracle is the second — sync validation has known gaps around
-indirect args and cross-submit hazards, which is exactly where §4.5 and §4.3
-live. Run both.
+1. **Sync validation** — detects the hazard directly. Primary.
+2. **Cross-backend hash equality vs. Dawn** (§6.3) — Dawn's auto-barriers are
+   the reference implementation of this graph. Strong, but only over the edges
+   the scenario exercises.
+3. **The sledgehammer A/B** — exoneration first, detection a distant second.
+
+**N=5 reruns do not help.** An earlier draft suggested running each mode five
+times to catch a 1-in-20 race. Scheduling for identical dispatch shapes on the
+same hardware is near-deterministic, so repeated runs sample the same
+interleaving rather than exploring the space. Spend the time on a hostile
+scenario instead.
+
+**Do run the hostile scenario.** A settled world exercises almost none of the
+graph. The scenario that matters puts `voxels`, `expMask`, `particles`, `claim`
+and the streaming submits in flight together: explosions at the
+residency-window edge, heavy particle traffic, and streaming shifts on the same
+ticks, with hash ticks (`tick % 15 == 0`) landing inside the burst so both
+phase-5 branches are taken.
 
 ### 6.3 The cross-backend gate that already exists
 
@@ -1138,7 +1566,50 @@ which is what §6.2's hostile-scenario note is about.
 Ranked by (probability of being gotten wrong) × (cost of being wrong). "Test"
 names the specific thing that would catch it, not "the selftest".
 
-### 7.1 — `pDispatchArgs` WAR: the second copy vs. the in-flight indirect fetch
+### 7.1 — The 54 CA iterations must never overlap (the color lattice)
+
+**The edge.** The inter-iteration barrier in the CA loop is a **correctness
+requirement of the 3×3×3 color lattice**, not a memory-visibility optimization.
+`sim_step.wgsl:1-9`: within one dispatch every acting cell shares one
+`colorPhase`, so acting cells are ≥3 apart on every axis while writes reach ≤1
+cell, and destination writes are *provably disjoint*. That disjointness is a
+property of a single color phase. `colorPhase` changes every iteration, via the
+dynamic `passUBO` offset `k * kPassStride` (`simulation.cpp:682-683`). Two
+iterations executing concurrently are two different colors executing
+concurrently — and cells of adjacent colors are adjacent by construction, so
+their writes collide and the winner is whichever workgroup arrived first.
+
+**Why this outranks everything else here.** Every other risk in this register is
+a specific barrier that might be omitted. This one is a *category* of change
+that looks like optimization and is actually the removal of rule 1: batching
+iterations, merging "redundant" barriers between them, splitting them across
+queues, or hoisting them into a single dispatch with a loop inside. Each of
+those is a natural thing to propose after reading "53 identical barriers in a
+loop" and thinking about overhead — the settled-tick finding in
+`PLAN_vulkan_port.md` (184.6 µs/tick of empty dispatches) actively invites it.
+And the failure mode is the worst available: not a crash, not a visual artifact,
+but first-come-first-served conflict resolution — which CLAUDE.md rule 1 bans by
+name — producing a world that is correct-looking, correct-on-this-GPU, and
+divergent on the next vendor.
+
+**Neutralized by.** §3.6 states the requirement at the top of the section rather
+than deriving it from memory visibility, so a reader optimizing the loop meets
+the lattice argument before the performance argument. The barrier itself is
+emitted by the tracker from T30's `repeat: 54` — the recorder has no "skip the
+barrier between repeats" path, and adding one would require deliberately
+special-casing the repeat span.
+
+**Test.** Cross-vendor hash equality is the only real proof, and it is exactly
+what DESIGN.md risk #3 says is still open. Short of that: the determinism gate
+detects it *if* the GPU happens to overlap the dispatches — which it may not
+(§6.2's honesty note applies here too, and is the reason this is a design-time
+invariant rather than a test-time one). **Sync validation does not catch this
+at all**: with the barrier removed, there is no unsynchronized-access hazard to
+report — every iteration legitimately reads and writes `voxels`, and the layer
+has no model of the color lattice. This risk is defended by the document and the
+code comment, not by tooling.
+
+### 7.2 — `pDispatchArgs` WAR: the second copy vs. the in-flight indirect fetch
 
 **The edge.** T44 (`copy pArgsStage@16 → pDispatchArgs`) overwrites the args
 that T42's `vkCmdDispatchIndirect` fetched. Without a barrier,
@@ -1161,7 +1632,7 @@ unconditionally consults it.
 Failing that: a gate that fires an explosion and asserts
 `particleCount` matches a Dawn-recorded reference sequence over 60 ticks.
 
-### 7.2 — `argsStage` double generation and the WAW at T55
+### 7.3 — `argsStage` double generation and the WAW at T55
 
 **The edge.** `argsStage` is: filled (T01) → atomically written by `compact`
 (T15) → copied out (T20) → **filled again (T55)** → atomically written by
@@ -1188,7 +1659,7 @@ state, not per-row-pair.
 nothing produces a frozen world, which the walk test and any settling assertion
 catch loudly — but only if the test *has* activity.
 
-### 7.3 — `ClearBuffer(support)` immediately after its copy-out (T76→T77)
+### 7.4 — `ClearBuffer(support)` immediately after its copy-out (T76→T77)
 
 **The edge.** `world.cpp:159-160`: copy `support` → slot, then
 `ClearBuffer(support)`. Transfer-read then transfer-write on the same buffer,
@@ -1211,7 +1682,7 @@ block because they're all transfers".
 tick, assert `Snap().supportFlags` has a non-zero entry in the affected chunk.
 Currently the only coverage is indirect. Worth adding as part of phase 3.
 
-### 7.4 — Skipped conditional rows leaving a stale "previous writer"
+### 7.5 — Skipped conditional rows leaving a stale "previous writer"
 
 **The edge.** `dirtyList` is written by T15 (`compact`) and read by T30 (`ca`).
 On a hash tick, T56 (`compactNext`) never runs — but T58/T5A never run either,
@@ -1238,30 +1709,54 @@ run 20 ticks with it forced on and forced off, comparing hash sequences against
 Dawn. Cheap (the conditions are CPU-side flags) and it is the only test that
 covers the combinatorics.
 
-### 7.5 — `farOcc` has no `CopyDst` usage and depends entirely on zero-init
+### 7.6 — The five buffers with no `CopyDst`, and why enumeration fails
 
-**The edge.** `world.cpp:77-78` creates `farOcc` with `Storage` only. Nothing on
-the host ever writes it. Its correct initial state (all zero = nothing occupied)
-comes purely from WebGPU's zero-init guarantee.
+**The edge.** Five buffers are created without `CopyDst`
+(`world.cpp:31, 45-46, 50, 75-78`) and therefore have **no host writer at all**
+today. Their correct initial state comes purely from WebGPU's zero-init
+guarantee, which Vulkan does not provide: `dirtyList`, `particles[0]`,
+`particles[1]`, `pArgsStage`, `farVox`, `farOcc`.
 
-**Why dangerous.** In Vulkan it is uninitialized device memory. `farOcc` gates
-whether the raymarcher descends into a far-field chunk; garbage means the
-renderer marches through cascade regions that contain nothing, or — worse —
-`farVox` garbage bytes get interpreted as material ids, producing rendered
-terrain out of uninitialized memory. It is not hashed, so **no determinism test
-catches it**; it is a visual bug that appears only at draw distance, only on
-first frames, only before the fill has covered the region.
+**Why dangerous — ranked, because they are not equally bad.**
 
-**Neutralized by.** §4.8's blanket fill-everything policy plus adding
-`TRANSFER_DST` to every buffer's usage flags. The specific mitigation is that
-the policy is blanket: an implementer enumerating "which buffers need zeroing"
-would skip `farOcc` precisely because nothing writes it.
+- **`pArgsStage` (`world.cpp:50`) is the severe one.** Words `[0..3]` are the
+  indirect *draw* args, copied verbatim into `drawArgs` by T45
+  (`simulation.cpp:713`). Before `args2` has ever run — the first tick with
+  `particlesActive`, or any frame after a `drawArgs` clear that precedes the
+  first `args2` — uninitialized memory reaches `vkCmdDrawIndirect` as an
+  instance count. §4.5 already flags an out-of-range indirect draw count as
+  undefined behavior that can hang a device. This is that hazard, sourced from
+  uninitialized memory rather than from a stale write.
+- **`farOcc` (`world.cpp:77-78`) is the one an audit misses.** It gates whether
+  the raymarcher descends into a far-field chunk. Garbage means marching
+  cascade regions that contain nothing, or `farVox` bytes read as material ids —
+  rendered terrain out of uninitialized memory. Not hashed, so **no determinism
+  test catches it**: a visual bug at draw distance, on early frames, before the
+  fill covers the region. It is the most likely buffer to be skipped precisely
+  *because* nothing in the codebase writes it.
+- `farVox`, `dirtyList`, `particles[0/1]` — real but bounded: each is read only
+  up to a count that a shader wrote (`argsStage`, `particleCounts`) or rendered
+  only where `farOcc` says something exists. The argument that they are safe is
+  an "unread garbage" argument, which is the kind §4.8 exists to stop having to
+  make.
+
+**Why dangerous as a class.** All five need `VK_BUFFER_USAGE_TRANSFER_DST_BIT`
+added *purely so they can be filled* — a usage-flag change with no other
+motivation, which is exactly the kind of prerequisite that gets dropped.
+
+**Neutralized by.** §4.8's mechanism: `CreateBuffer` adds `TRANSFER_DST`
+unconditionally and registers the buffer, and `ZeroInitAll()` iterates the
+registry. Not a list — an earlier draft of this very document wrote "do not
+attempt to enumerate", enumerated four, and missed `pArgsStage` and `farVox`.
+That is the evidence for the mechanism.
 
 **Test.** A gate asserting that immediately after `Init`, before any worldgen,
-reading back `farVox[0..N]` yields all zeros. Requires adding `CopySrc` to
-`farOcc` for the test — acceptable, `farVox` already has it "selftest-only".
+reading back each of the five yields all zeros. Requires adding `CopySrc` to
+`farOcc`, `dirtyList`, `particles[0/1]` for the test — acceptable, `farVox` and
+`pArgsStage` already have it (`world.cpp:50, 75-76`), and `farVox`'s is already
+documented as "selftest-only".
 
-### 7.6 — `particleCounts[1-page]` zeroed by an upload that races the previous tick
+### 7.7 — `particleCounts[1-page]` zeroed by an upload that races the previous tick
 
 **The edge (see §4.4, **[NEW EDGE]**).** `SubmitTick` writes zero to
 `particleCounts[(1-page)*4]` (`support.cpp:136-140`). At tick N+1, `1-page` is
@@ -1285,9 +1780,9 @@ written — a per-buffer cross-submit tracker would have to know that
 **Test.** Explosion gate over 60+ ticks asserting the particle count sequence
 matches Dawn's tick-for-tick. A dropped generation shows as a count discontinuity.
 
-### 7.7 — `farFill` (T60) overwrites what `farDown` (T5A) wrote, same submit
+### 7.8 — `farFill` (T60) overwrites what `farDown` (T5A) wrote, same submit
 
-**The edge (see §6.9, **[NEW EDGE]**).** Both write `farVox`/`farOcc` with
+**The edge (see §7.10, **[NEW EDGE]**).** Both write `farVox`/`farOcc` with
 atomics, but they are not the same *kind* of atomic write:
 `fardown` does `atomicAnd` + `atomicOr` (partial-byte RMW) and
 `atomicMax(&farOcc[...], 1)`; `far` does `atomicStore` of a full word and
@@ -1316,7 +1811,7 @@ bounded blast radius — which is why it is ranked here and not higher.
 word) extended to run a fill and a downsample targeting the same level-chunk in
 one tick, asserting the fill's value wins.
 
-### 7.8 — Two `dirtyList` generations, one buffer
+### 7.9 — Two `dirtyList` generations, one buffer
 
 **The edge.** T15 writes `dirtyList` (compacted `DirtyIn`); T30 ×54 reads it;
 T56 overwrites it (compacted `DirtyOut`); T58 and T5A read the new contents.
@@ -1339,16 +1834,16 @@ the T30→T56 boundary needs its own, which the tracker provides.
 **Test.** The determinism gate proper, and cross-backend hash equality. This one
 does show up in the hash, immediately.
 
-### 7.9 — Edges this document adds beyond `vulkan_pass_map.md`
+### 7.10 — Edges this document adds beyond `vulkan_pass_map.md`
 
 Collected for the reviewer.
 
 1. **`farFill`'s `atomicStore` overwrites `fardown`'s `atomicAnd`/`atomicOr`.**
-   §7.7. The map's "WAW, both atomic" understates it; the two entry points use
+   §7.8. The map's "WAW, both atomic" understates it; the two entry points use
    incompatible atomic idioms on the same words, and the ordering is semantic
    (fill wins), not incidental.
 2. **`particleCounts[1-page]` is zeroed from the host at tick N+1 against a page
-   the GPU was atomically writing at tick N.** §4.4 / §7.6. The map lists the
+   the GPU was atomically writing at tick N.** §4.4 / §7.7. The map lists the
    write in §5a but not the cross-submit WAW it constitutes.
 3. **Up to 4 tick submits occur per frame** (`main.cpp:1723`,
    `ticksThisFrame < 4`), so the `drawArgs` cross-submit hazard (map assumption
@@ -1362,23 +1857,67 @@ Collected for the reviewer.
    (`worldgen.wgsl:2604-2610`), so `EncodeWorldgen`'s seven leading
    `ClearBuffer`s include two that genuinely hazard against the following
    dispatch. The map lists the fills and the dispatch but not that edge.
-6. **`farOcc` and `dirtyList` and `particles[0/1]` have no `CopyDst` usage
-   today**, so the zero-init policy requires adding `TRANSFER_DST` to their
-   usage flags — an easily-missed prerequisite of §4.8, and `farOcc` is the case
-   where nothing in the code ever writes it from the host.
-7. **`pick` reads a one-frame-stale `renderUBO`.** `pick_` runs on the *tick*
-   path (T51/T59), but `WriteRenderParams` is called at `main.cpp:2569` —
-   *after* the tick loop (`main.cpp:1723`) and before the render encoder
-   (`main.cpp:2822`). So every pick in frame F reads the camera written at the
-   end of frame F−1, and all up-to-4 picks in a frame read the same one. This
-   is pre-existing behavior, harmless (`pick` output is CPU-consumed UI state,
-   never sim state, and one frame of camera lag on a crosshair raycast is
-   invisible), and **must be preserved rather than "fixed" during the port** —
-   moving the upload earlier would change what the pick returns. Structurally
-   it is the same cross-submit-chain shape as `drawArgs` and gets the same §3.4
-   coverage. The map lists `renderUBO` under both `pick` and the render passes
-   without noting that they are different submits or that the tick's read is
-   one frame behind.
+6. **Five buffers have no `CopyDst` usage today** — `dirtyList`,
+   `particles[0/1]`, `pArgsStage`, `farVox`, `farOcc` (`world.cpp:31, 45-46,
+   50, 75-78`) — so the zero-init policy requires adding `TRANSFER_DST` to their
+   usage flags, an easily-missed prerequisite of §4.8. `pArgsStage` is the
+   severe case (uninitialized indirect *draw* args) and `farOcc` the
+   easily-skipped one (nothing in the codebase writes it from the host). §7.6.
+7. **`pick` is stale in TWO independent ways, and both must be preserved.**
+   §7.10a below.
+8. **The `--shot` far-fill loop is a submit path with no tick in it**
+   (`main.cpp:139-147`), carrying a per-iteration upload→dispatch RAW on
+   `tickUBO` because `farCount` travels *inside* `tickUBO` rather than as a
+   dispatch dimension. The map's §1.6 documents `EncodeFarFill` as part of the
+   tick encoder and never mentions this standalone driver. §2.5.6.
+9. **`Stream::FillSlots` can write four buffers and submit nothing at all** —
+   the submit at `stream.cpp:274-277` is guarded by `if (!genSlots.empty())`,
+   while the `voxels`/`occupancy`/`dirty[0]`/`dirty[1]` writes at `:247-260`
+   happen for every store-hit slot. Any upload model phrased as "recorded at the
+   head of this path's submit" has no home for them. §4.1.
+10. **`worldgen:list`'s `genChunk` `atomicStore`s `dirtyIn`/`dirtyOut` from a
+    mid-frame submit**, concurrent with the in-flight tick's `markDirty`/
+    `markBoth` on the same two buffers — a cross-submit WAW against a shader
+    atomic, structurally identical to edge 2. §2.5.2.
+11. **`sim_compact`'s both entry points `atomicStore` `args[1]` and `args[2]`**
+    (`sim_compact.wgsl:22-25, 39-42`), so `dispatchArgs.y/.z` come from the
+    shader, not the fill. The fill→dispatch WAW is therefore load-bearing for
+    dispatch *validity* — a lost barrier yields `{count, 0, 0}`, i.e. zero
+    workgroups and a silently frozen world, not merely a wrong count. §7.3.
+
+#### 7.10a — `pick`'s two staleness relationships
+
+Both are pre-existing, both are harmless, and **both must be preserved rather
+than "fixed" during the port**. They are listed together because fixing either
+one in isolation is the tempting mistake.
+
+- **Stale camera.** `pick_` runs on the *tick* path (T51/T59), but
+  `WriteRenderParams` is called at `main.cpp:2569` — *after* the tick loop
+  (`main.cpp:1723`) and before the render encoder (`main.cpp:2822`). So every
+  pick in frame F reads the camera written at the end of frame F−1, and all
+  up-to-4 picks in a frame read the same one. Moving the upload earlier changes
+  what the pick returns.
+- **Stale window origin.** `sim_pick.wgsl:13` bounds-tests with
+  `inWindow(c, R.origin)` — the **render** params' window origin — while every
+  sim kernel uses `T.origin` (`sim_step.wgsl:34`, `worldgen.wgsl` `genChunk`,
+  `fardown`). After a mid-frame streaming shift, `R.origin` is the origin as of
+  the last `WriteRenderParams` and `T.origin` is the current one, so the pick
+  ray's residency test and the sim's disagree for the rest of the frame.
+
+The second is the dangerous one to "fix", because it looks like an obvious bug:
+a reader who notices `R.origin` in a sim-side shader will reach for `T.origin`.
+Doing so while leaving the camera in `R` produces a *mixed* frame — current
+origin, one-frame-old camera — which is a state that has never been tested and
+is not obviously better. Both fields come from the same struct written at the
+same instant; that coherence is the property worth keeping.
+
+`pick` output is CPU-consumed UI state (a paint cursor, `world.cpp:201`), never
+sim state, and `sim_pick.wgsl:1-4` already documents the readback as one tick
+latent. One frame of lag on a crosshair raycast is invisible. Structurally this
+is the same cross-submit-chain shape as `drawArgs` and gets the same §3.4
+coverage; the map lists `renderUBO` under both `pick` and the render passes
+without noting that they are different submits, that the tick's read is one
+frame behind, or that the origin fields diverge.
 
 ---
 
@@ -1388,11 +1927,22 @@ Collected for the reviewer.
   `src/sim/pass_table.def` in the same commit**, or `check_pass_table.py` fails.
   This is the same standing obligation `tuning_params.def` and
   `sound_schema.js` carry.
+- **A code path that submits a command buffer gets a table**, listed in the
+  header enumeration. Until every recorded command is in a table, "barriers are
+  generated from the table" means "barriers are missing wherever the table is".
 - **No barrier is ever written at a call site.** If a hazard needs expressing,
   it is expressed as a table row's `uses`.
-- **No static/precomputed barrier list.** §7.4.
+- **No static/precomputed barrier list.** §7.5.
+- **The CA loop's 53 inter-iteration barriers are not negotiable.** They are the
+  color lattice, not a cache flush. §7.1.
 - **v1 is one queue and keeps the indirect staging copies.** Both relaxations
   are legal in Vulkan and both are separate, hash-gated changes.
-- **Zero-fill every buffer at creation.** No enumeration, no exceptions.
-- **Every debug run has synchronization validation on**, and the sledgehammer
-  A/B is run before any checkpoint that claims the barrier graph is correct.
+- **Zero-init is a mechanism, not a list**: `CreateBuffer` adds `TRANSFER_DST`
+  and registers; `ZeroInitAll()` iterates the registry. §4.8.
+- **Every submit takes a fence**, for staging-ring reclamation and command
+  buffer reuse — not only the submits that carry a readback. §4.2.
+- **The host-read barrier is emitted at `Finish()`**, after every writer, never
+  at a fixed table index. §2.4 phase 7b.
+- **Synchronization validation is the primary detector of a missing barrier**;
+  the sledgehammer A/B is an exoneration tool and is weak evidence when it
+  passes. §6.2.
