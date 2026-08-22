@@ -663,13 +663,62 @@ VkFence Backend::SubmitCommands(VkCommandBuffer cmd, std::string& err) {
 void Backend::PollFences() {
   for (size_t i = 0; i < inFlight_.size();) {
     if (dfn_.GetFenceStatus(device_, inFlight_[i].fence) == VK_SUCCESS) {
+      VkFence f = inFlight_[i].fence;
       dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &inFlight_[i].cmd);
-      freeFences_.push_back(inFlight_[i].fence);
+      // A RETAINED fence must not go back to the pool: a borrower (a readback
+      // slot, an eviction batch) still holds the handle and still needs
+      // vkGetFenceStatus on it to mean THIS submit. Park it until the last
+      // ReleaseFence. See the RetainFence comment in rhi_vulkan.h for what
+      // recycling it under a borrower actually corrupts.
+      auto it = fenceRetain_.find(f);
+      if (it != fenceRetain_.end() && it->second > 0)
+        retiredRetained_.push_back(f);
+      else
+        freeFences_.push_back(f);
       inFlight_.erase(inFlight_.begin() + i);
     } else {
       i++;
     }
   }
+}
+
+void Backend::RetainFence(VkFence f) {
+  if (f == VK_NULL_HANDLE) return;
+  fenceRetain_[f]++;
+}
+
+void Backend::ReleaseFence(VkFence f) {
+  if (f == VK_NULL_HANDLE) return;
+  auto it = fenceRetain_.find(f);
+  if (it == fenceRetain_.end()) return;
+  if (it->second > 0) it->second--;
+  if (it->second != 0) return;
+  fenceRetain_.erase(it);
+  // If the submit already retired while retained, the fence was parked rather
+  // than pooled; hand it back now that nobody holds it.
+  for (size_t i = 0; i < retiredRetained_.size(); i++) {
+    if (retiredRetained_[i] == f) {
+      retiredRetained_.erase(retiredRetained_.begin() + i);
+      freeFences_.push_back(f);
+      return;
+    }
+  }
+}
+
+VkResult Backend::FenceStatus(VkFence f) const {
+  if (f == VK_NULL_HANDLE) return VK_ERROR_UNKNOWN;
+  return dfn_.GetFenceStatus(device_, f);
+}
+
+bool Backend::WaitFence(VkFence f, std::string& err) {
+  if (f == VK_NULL_HANDLE) return true;
+  VkResult r = dfn_.WaitForFences(device_, 1, &f, VK_TRUE, UINT64_MAX);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkWaitForFences failed: ") + vkl::ResultName(r);
+    return false;
+  }
+  PollFences();
+  return true;
 }
 
 bool Backend::WaitIdle(std::string& err) {
@@ -864,6 +913,12 @@ void Backend::Shutdown() {
   inFlight_.clear();
   for (VkFence f : freeFences_) dfn_.DestroyFence(device_, f, nullptr);
   freeFences_.clear();
+  // Fences whose submit retired while a borrower still held them. WaitIdle
+  // above drained the queue, so these are all signalled and unreferenced by the
+  // GPU; the borrowers are going away with the backend.
+  for (VkFence f : retiredRetained_) dfn_.DestroyFence(device_, f, nullptr);
+  retiredRetained_.clear();
+  fenceRetain_.clear();
 
   if (descPool_) dfn_.DestroyDescriptorPool(device_, descPool_, nullptr);
   descPool_ = VK_NULL_HANDLE;

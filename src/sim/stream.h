@@ -17,6 +17,20 @@ struct GpuContext;
 // Shared by streaming eviction and the region-file save format (chunkstore /
 // worldio). The word is 32-bit so the STAIN layer (bits 24..30) round-trips:
 // it is hashed sim state, and a 16-bit store dropped it silently on save.
+//
+// What the store keeps. Everything EXCEPT the tick-stamp byte (bits 16..23),
+// which is per-tick scheduling scratch rather than state — it is excluded from
+// the world hash for the same reason, and a restored voxel is re-stamped
+// kStampNever so it is born "has never acted" (CLAUDE.md's tick-stamp rule).
+//
+// This lives in the header rather than as a file-static in stream.cpp because a
+// second consumer now needs it: the Vulkan port's cross-backend smoke has to
+// reproduce the store round-trip EXACTLY to compare against Dawn, and a copy of
+// the literal there was already a "two places that must agree" bug in waiting —
+// it silently produced a divergence that read like a barrier race
+// (docs/PLAN_vulkan_port.md, phase 3c).
+inline constexpr uint32_t kPersistMask = 0xFF00FFFFu;  // everything but the stamp byte
+
 void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out);
 // out must hold kChunkVol words; returns false on malformed input.
 // Decoded voxels get kStampNever ("hasn't acted"): everything may move.

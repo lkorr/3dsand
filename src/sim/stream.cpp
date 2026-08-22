@@ -24,10 +24,13 @@ constexpr size_t kMaxPendingEvicts = 4;  // in-flight batches before we block
 // world was stained at save time) and became a hard save/load failure the
 // moment worldgen ponds started wetting their banks.
 //
-// Only the STAMP byte (bits 16..23) is stripped, which is what the mask below
-// keeps out — it is per-tick scheduling scratch, not state, and is deliberately
+// Only the STAMP byte (bits 16..23) is stripped, which is what the mask keeps
+// out — it is per-tick scheduling scratch, not state, and is deliberately
 // excluded from the hash for the same reason.
-constexpr uint32_t kPersistMask = 0xFF00FFFFu;  // everything but the stamp byte
+//
+// `kPersistMask` now lives in stream.h: the Vulkan port's cross-backend smoke
+// must reproduce this exact round-trip, and a second copy of the literal is the
+// "two places that must agree" bug this repo has a checker for.
 
 void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out) {
   out.clear();
@@ -165,8 +168,22 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       p.items.push_back(toSave[off + i].second);
       pendingChunks_[World::PackChunkKey(toSave[off + i].second.wc)]++;
     }
-    // submit BEFORE FillSlots writes: queue order makes the copy read the
-    // leaving plane's data even though the map completes ticks later
+    // Submit BEFORE FillSlots writes, so the copy reads the leaving plane's
+    // data even though the map completes ticks later.
+    //
+    // THE MECHANISM, precisely (docs/vulkan_barrier_graph.md §4.3, corrected
+    // when the Vulkan streaming path landed in phase 3c). It is tempting to say
+    // "both are submits and submits are ordered", but that is not what carries
+    // the guarantee: FillSlots does NOT necessarily submit. Its per-slot writes
+    // are deferred to the next submit from any path, and when every slot hits
+    // the store it issues no submit at all. What actually orders them is that
+    // EvictSlots submits EAGERLY, right here, while FillSlots only ENQUEUES —
+    // so the copy-out is already on the queue before the overwrite is even
+    // enqueued, let alone recorded.
+    //
+    // On Vulkan the memory half of the dependency comes from the
+    // head-of-command-buffer global barrier (§3.4) in whichever command buffer
+    // later drains the fill; under Dawn it is automatic.
     ctx_->queue.Submit(enc.Finish());
     p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, n * kChunkBytes);
     pending_.push_back(std::move(p));

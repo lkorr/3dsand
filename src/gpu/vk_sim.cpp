@@ -9,6 +9,7 @@
 
 #include "gpu/vk_sim.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -33,6 +34,39 @@ bool ReadFileText(const std::string& path, std::string& out) {
 // The blocking-hash staging buffer. 256 B is ample for the 16 B hash buffer and
 // keeps the allocation aligned to anything a driver might want.
 constexpr uint64_t kReadbackBytes = 256;
+
+// ---------------------------------------------------------------------------
+// The readback slot layout — COPIED VERBATIM from sim/world.cpp.
+//
+// These offsets are not an implementation detail of either backend: they are
+// the contract between the copies recorded on the GPU and the pointer
+// arithmetic the snapshot population does on the host. Dawn's copy of them
+// lives at the top of world.cpp; if the two ever disagree the CPU mirror reads
+// the wrong bytes and `KindAt` returns confident nonsense, which is a walking
+// player falling through visible ground rather than anything that looks like a
+// GPU bug.
+//
+// They are duplicated for the same reason vk_sim.h says the resource
+// declarations are: `World` owns rhi:: handles and cannot be instantiated
+// against this backend. What proves they agree is that a Vulkan-driven
+// snapshot and a Dawn-driven snapshot of the same world must produce the same
+// activeChunks / voxelTotal / hash — which is what the loud smoke compares.
+constexpr uint64_t kChunkBytes = kChunkVol * 4;
+constexpr uint64_t kMirrorBytes = 27 * kChunkBytes;
+constexpr uint64_t kDirtyOff = kMirrorBytes;
+constexpr uint64_t kDirtyBytes = kNumChunks * 4;
+constexpr uint64_t kOccOff = kDirtyOff + kDirtyBytes;
+constexpr uint64_t kOccBytes = kNumChunks * 4;
+constexpr uint64_t kHashOff = kOccOff + kOccBytes;
+constexpr uint64_t kPickOff = kHashOff + 256;
+constexpr uint64_t kPCountOff = kPickOff + 256;
+constexpr uint64_t kSupportOff = kPCountOff + 256;
+constexpr uint64_t kSupportBytes = kNumChunks * 4;
+constexpr uint64_t kFetchOff = kSupportOff + kSupportBytes;
+constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
+
+// Eviction staging: same batch bound as Stream's (256 chunks = 4 MB).
+constexpr uint32_t kEvictBatch = 256;
 
 }  // namespace
 
@@ -98,6 +132,18 @@ bool SimBackend::Init(const std::string& assetDir, const std::vector<MaterialDef
   res_.reactions = mk(sizeof(ReactionGpu) * kMaxReactions,
                       U::Storage | U::CopyDst, "reactions");
   res_.readback = mk(kReadbackBytes, U::MapRead | U::CopyDst, "hashReadback");
+
+  // The readback ring: 3 host-visible slots, same size and same layout as
+  // World::Init allocates (barrier_graph §4.2).
+  for (auto& s : slots_) {
+    s.buf = mk(kSlotBytes, U::MapRead | U::CopyDst, "readback");
+    s.inFlight = false;
+    s.fence = VK_NULL_HANDLE;
+  }
+  snap_.mirror.assign(27 * kChunkVol, 0);
+  snap_.dirtyFlags.assign(kNumChunks, 0);
+  snap_.supportFlags.assign(kNumChunks, 0);
+  snap_.occupancy.assign(kNumChunks, 0);
 
   for (Buffer* b : {res_.voxels, res_.dirty[0], res_.dirty[1], res_.materials,
                     res_.reactions, res_.readback}) {
@@ -600,6 +646,402 @@ bool SimBackend::ReadHash(uint32_t& out, std::string& err) {
   return true;
 }
 
-void SimBackend::Shutdown() { be_.Shutdown(); }
+Buffer* SimBackend::Buf(pass::Buf id) const { return Resolve().buffers[(int)id]; }
+
+// ---------------------------------------------------------------------------
+// The readback ring — barrier_graph §4.2 / §2.4 phase 7a+7b.
+//
+// This is `World::EncodeReadbacks` + `World::EncodeDirtyCopy` + the body of
+// `World::KickReadback`'s map callback, against the Vulkan resources. The
+// division into three functions there was forced by WebGPU's async map; here
+// the copies are one function and the callback body is `PopulateSnapshot`.
+//
+// EVERY COPY GOES THROUGH THE TRACKER. `CopyTracked` takes the source as a
+// `pass::Buf` id, so the RAW against whatever wrote `voxels` / `occupancy` /
+// `hash` / `support` earlier in this same command buffer is derived by §3.3,
+// not asserted here. The `support` copy-then-clear pair is the §7.4 WAR, and it
+// falls out because `FillTracked` declares a TransferWrite on the buffer the
+// tracker has just seen a TransferRead on.
+// ---------------------------------------------------------------------------
+bool SimBackend::EncodeReadbacks(Recorder& rec, IVec3 playerChunkBase,
+                                 uint32_t particleLivePage, uint32_t tick) {
+  int slot = -1;
+  for (int i = 0; i < kSlots; i++) {
+    if (!slots_[i].inFlight) { slot = i; break; }
+  }
+  // All three in flight: skip the copies entirely, exactly as world.cpp does.
+  // Under Dawn this was already a true statement about the GPU; here the flag
+  // is backed by a real fence, so it means what it claims rather than what a
+  // callback happened to have run.
+  if (slot < 0) return false;
+  ReadbackSlot& s = slots_[slot];
+  s.particleLivePage = particleLivePage;
+  s.tick = tick;
+  s.origin = origin_;
+
+  // NOTE: the chunk-fetch queue (World::RequestChunkFetch) has no Vulkan-side
+  // consumer yet — nothing on this backend reads the CPU chunk cache, because
+  // the cache feeds island detection and terrain meshing, both of which live
+  // above the seam in systems phase 3c does not drive. The fetch RANGE of the
+  // slot is still allocated and still copied-to-size-zero, so the layout is
+  // identical and a phase-4/5 consumer only has to fill fetchIds.
+  s.fetchIds.clear();
+
+  auto clampBase = [&](int v, int lo) {
+    if (v < lo) v = lo;
+    if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
+    return v;
+  };
+  s.base = {clampBase(playerChunkBase.x, origin_.x),
+            clampBase(playerChunkBase.y, origin_.y),
+            clampBase(playerChunkBase.z, origin_.z)};
+
+  for (int dz = 0; dz < 3; dz++)
+    for (int dy = 0; dy < 3; dy++)
+      for (int dx = 0; dx < 3; dx++) {
+        uint32_t ci = World::SlotChunkIndex({s.base.x + dx, s.base.y + dy, s.base.z + dz});
+        uint64_t dst = (uint64_t)((dz * 3 + dy) * 3 + dx) * kChunkBytes;
+        rec.CopyTracked(pass::Buf::Voxels, (uint64_t)ci * kChunkBytes, s.buf, dst,
+                        kChunkBytes);
+      }
+  rec.CopyTracked(pass::Buf::Occupancy, 0, s.buf, kOccOff, kOccBytes);
+  rec.CopyTracked(pass::Buf::Hash, 0, s.buf, kHashOff, 16);
+  rec.CopyTracked(pass::Buf::Pick, 0, s.buf, kPickOff, 32);
+  rec.CopyTracked(pass::Buf::ParticleCounts, 0, s.buf, kPCountOff, 16);
+  // Support-loss flags are one-shot: consume into this slot, then clear so the
+  // next window of ticks accumulates fresh flags. The clear is a genuine WAR
+  // against the copy immediately above it (§7.4) and is routed through the
+  // tracker for exactly that reason.
+  rec.CopyTracked(pass::Buf::Support, 0, s.buf, kSupportOff, kSupportBytes);
+  rec.FillTracked(pass::Buf::Support);
+
+  // Phase 7b: the dirty copy. In world.cpp this is a separate function called
+  // after EncodeReadbacks returns, which is what forced the host barrier to be
+  // emitted at Finish() rather than at a table index. Here it is recorded in
+  // line — but the host barrier STILL comes from Finish(), because making it
+  // depend on this call's position is precisely the fragility §2.4 phase 7b
+  // warns about.
+  rec.CopyTracked(pass::Buf::DirtyOut, 0, s.buf, kDirtyOff, kDirtyBytes);
+
+  lastSlot_ = slot;
+  return true;
+}
+
+// The body of Dawn's MapAsync callback (world.cpp), verbatim in effect. The
+// CPU-side consumers of WorldSnapshot must not be able to tell the backends
+// apart, so this reads the same offsets and derives the same fields — including
+// the occupancy word's low half (the GPU packs blockers<<16 | nonAir and every
+// CPU consumer wants the non-air count).
+void SimBackend::PopulateSnapshot(ReadbackSlot& s) {
+  const uint8_t* p = (const uint8_t*)s.buf->mapped;
+  if (!p) return;
+  std::memcpy(snap_.mirror.data(), p, kMirrorBytes);
+  snap_.mirrorBase = s.base;
+  snap_.windowOrigin = s.origin;
+  const uint32_t* dirtyW = (const uint32_t*)(p + kDirtyOff);
+  const uint32_t* occW = (const uint32_t*)(p + kOccOff);
+  uint32_t active = 0;
+  uint64_t total = 0;
+  for (uint32_t i = 0; i < kNumChunks; i++) {
+    snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
+    active += snap_.dirtyFlags[i];
+    snap_.occupancy[i] = occW[i] & 0xFFFFu;
+    total += occW[i] & 0xFFFFu;
+  }
+  snap_.activeChunks = active;
+  snap_.voxelTotal = total;
+  std::memcpy(&snap_.worldHash, p + kHashOff, 4);
+  std::memcpy(snap_.pick, p + kPickOff, 32);
+  const uint32_t* supW = (const uint32_t*)(p + kSupportOff);
+  for (uint32_t i = 0; i < kNumChunks; i++)
+    snap_.supportFlags[i] = supW[i] != 0 ? 1 : 0;
+  uint32_t pcounts[2];
+  std::memcpy(pcounts, p + kPCountOff, 8);
+  snap_.particleCount = std::min(pcounts[s.particleLivePage & 1], kParticleCap);
+  snap_.tick = s.tick;
+  snap_.valid = true;
+}
+
+// ctx.ProcessEvents()' replacement, at the same point in the frame. Polls, never
+// blocks (barrier_graph §4.2).
+void SimBackend::PollReadbacks() {
+  be_.PollFences();
+  for (auto& s : slots_) {
+    if (!s.inFlight) continue;
+    if (be_.FenceStatus(s.fence) != VK_SUCCESS) continue;
+    PopulateSnapshot(s);
+    // Release the borrow only AFTER reading: the retain is what kept this
+    // handle meaning this submit (see RetainFence in rhi_vulkan.h).
+    be_.ReleaseFence(s.fence);
+    s.fence = VK_NULL_HANDLE;
+    s.inFlight = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The full tick — test/support.cpp's SubmitTick against Vulkan resources.
+// ---------------------------------------------------------------------------
+bool SimBackend::SubmitTickFull(const TickInputs& in, std::string& err) {
+  origin_ = in.windowOrigin;
+
+  const uint32_t cellCount = std::min(in.cellCount, (uint32_t)kMaxCellOpsPerTick);
+  const uint32_t spawnCount = std::min(in.spawnCount, (uint32_t)kMaxParticleSpawnsPerTick);
+  // Identical derivation to SubmitTick: explosions and spawns force particles
+  // active. A backend that computed this differently would record the particle
+  // rows on one side and not the other, and the hashes would diverge — which is
+  // the loud smoke's job to catch, so it is written the same way rather than
+  // being made "obviously" right.
+  const bool particlesActive =
+      in.particlesActive || in.expCount > 0 || spawnCount > 0;
+
+  TickParams tp{};
+  tp.tick = in.tick;
+  tp.seed = in.seed;
+  tp.opsCount = in.opsCount;
+  tp.hashEnable = in.hashEnable ? 1u : 0u;
+  tp.expCount = in.expCount;
+  tp.page = page_;
+  tp.cellCount = cellCount;
+  tp.spawnCount = spawnCount;
+  tp.farCount = in.farCount;
+  const Tuning& t = CurrentTuning();
+  const uint32_t ticksPerDay =
+      (uint32_t)(t.dayNight.cycleMinutes < 1 ? 1 : t.dayNight.cycleMinutes) * 60u * 30u;
+  tp.dayPhase = DayPhaseForTick(in.tick, ticksPerDay, t.dayNight.freeze != 0,
+                                (uint32_t)t.dayNight.freezePhase);
+  tp.origin[0] = in.windowOrigin.x;
+  tp.origin[1] = in.windowOrigin.y;
+  tp.origin[2] = in.windowOrigin.z;
+  be_.QueueWrite(res_.tickUBO, 0, &tp, sizeof(tp));
+
+  if (in.opsCount) be_.QueueWrite(res_.opsBuf, 0, in.ops, in.opsCount * sizeof(BrushOp));
+  if (in.expCount)
+    be_.QueueWrite(res_.expOps, 0, in.exps, in.expCount * sizeof(ExplosionOp));
+  if (cellCount) be_.QueueWrite(res_.cellOps, 0, in.cells, cellCount * sizeof(CellOp));
+  if (spawnCount)
+    be_.QueueWrite(res_.spawnOps, 0, in.spawns, spawnCount * sizeof(ParticleSpawn));
+  if (particlesActive) {
+    // The write page starts each tick empty; survivors + emissions repopulate.
+    // This is the §7.7 partial write into a live buffer.
+    uint32_t zero = 0;
+    be_.QueueWrite(res_.particleCounts, (uint64_t)(1 - page_) * 4, &zero, 4);
+  }
+
+  RecordCtx cx{};
+  cx.opsCount = in.opsCount;
+  cx.cellCount = cellCount;
+  cx.expCount = in.expCount;
+  cx.spawnCount = spawnCount;
+  cx.farCount = in.farCount;
+  cx.hashEnable = in.hashEnable;
+  cx.particlesActive = particlesActive;
+
+  VkCommandBuffer cmd = be_.BeginCommands("tick");
+  if (cmd == VK_NULL_HANDLE) {
+    err = "could not begin the tick command buffer";
+    return false;
+  }
+  Recorder rec(be_, Resolve(), mode_);
+  rec.Begin(cmd);
+  rec.RecordTable(pass::Table::Tick, cx);
+  // EncodeFarFill rides the tick's command buffer after EncodeTick, exactly as
+  // support.cpp does. Its row is C_FARCOUNT, so farCount 0 records nothing.
+  rec.RecordTable(pass::Table::FarFill, cx);
+
+  bool doCopy = false;
+  if (in.wantReadback)
+    doCopy = EncodeReadbacks(rec, in.playerChunkBase, 1 - page_, in.tick);
+
+  rec.Finish();
+  lastStats_ = rec.Stats();
+  VkFence fence = be_.SubmitCommands(cmd, err);
+  if (fence == VK_NULL_HANDLE) return false;
+
+  // The page flip happens on the CPU immediately after submit (§4.4).
+  page_ = 1 - page_;
+
+  if (doCopy && lastSlot_ >= 0) {
+    // §4.2: the slot BORROWS this submit's fence. Retain it so the pool cannot
+    // recycle it out from under the poll — that recycle is the corruption
+    // described in rhi_vulkan.h's RetainFence comment.
+    ReadbackSlot& s = slots_[lastSlot_];
+    s.fence = fence;
+    s.inFlight = true;
+    be_.RetainFence(fence);
+    lastSlot_ = -1;
+  }
+  return true;
+}
+
+void SimBackend::WakeAll() {
+  // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn), matching
+  // Simulation::EncodeWakeAll exactly. 16 KB, Class A by the size rule.
+  static const std::vector<uint32_t> ones(kNumChunks, 1u);
+  be_.QueueWrite(res_.dirty[page_], 0, ones.data(), ones.size() * sizeof(uint32_t));
+}
+
+bool SimBackend::ReadBufferBlocking(pass::Buf src, uint64_t offset, void* out,
+                                    uint64_t size, std::string& err) {
+  if (size > kReadbackBytes) {
+    // The small staging buffer is sized for hash/counts reads. Anything larger
+    // borrows slot 0's buffer, which is idle whenever a blocking read is legal
+    // (the sanctioned synchronous path is test-only and never overlaps a frame).
+    if (!slots_[0].buf || size > slots_[0].buf->size) {
+      err = "blocking read larger than any staging buffer";
+      return false;
+    }
+  }
+  Buffer* dst = (size > kReadbackBytes) ? slots_[0].buf : res_.readback;
+
+  VkCommandBuffer cmd = be_.BeginCommands("blockingRead");
+  if (cmd == VK_NULL_HANDLE) {
+    err = "could not begin the blocking-read command buffer";
+    return false;
+  }
+  Recorder rec(be_, Resolve(), mode_);
+  rec.Begin(cmd);
+  rec.CopyTracked(src, offset, dst, 0, size);
+  rec.Finish();
+  if (be_.SubmitCommands(cmd, err) == VK_NULL_HANDLE) return false;
+  if (!be_.WaitIdle(err)) return false;
+  if (!dst->mapped) {
+    err = "staging buffer is not host-mapped";
+    return false;
+  }
+  std::memcpy(out, dst->mapped, size);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming — barrier_graph §4.3 (eviction) and §4.1/§4.7 (refill).
+//
+// THE ORDERING GUARANTEE, AND WHY ITS MECHANISM CHANGED.
+//
+// stream.cpp's comment says "submit BEFORE FillSlots writes: queue order makes
+// the copy read the leaving plane's data". That claim stays TRUE here, but the
+// reason is no longer "both are submits and submits are ordered": under the
+// pending-upload queue the refill writes are DEFERRED and, when every slot hits
+// the store, there is no refill submit at all. What actually orders them is
+// that `EvictSlots` submits EAGERLY while `FillSlots` only ENQUEUES — so the
+// copy-out is on the queue before the overwrite is even enqueued, let alone
+// recorded. §4.3 step 2, and the stream.cpp comment is corrected in this same
+// commit per CLAUDE.md's rule about docs that contradict code.
+//
+// The memory half of the dependency comes from §3.4's head-of-command-buffer
+// global barrier in whatever command buffer later drains the fill.
+// ---------------------------------------------------------------------------
+bool SimBackend::EvictSlots(const uint32_t* slots, uint32_t count, EvictBatch& out,
+                            std::string& err) {
+  if (count == 0) { out = EvictBatch{}; return true; }
+  if (count > kEvictBatch) count = kEvictBatch;
+
+  Buffer* staging = nullptr;
+  if (!stagingPool_.empty()) {
+    staging = stagingPool_.back();
+    stagingPool_.pop_back();
+  } else {
+    staging = be_.CreateBuffer((uint64_t)kEvictBatch * kChunkBytes,
+                               rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                               "evictStaging");
+    if (!staging) { err = "eviction staging allocation failed"; return false; }
+  }
+
+  VkCommandBuffer cmd = be_.BeginCommands("evict");
+  if (cmd == VK_NULL_HANDLE) { err = "could not begin the evict command buffer"; return false; }
+  Recorder rec(be_, Resolve(), mode_);
+  rec.Begin(cmd);
+  for (uint32_t i = 0; i < count; i++)
+    rec.CopyTracked(pass::Buf::Voxels, (uint64_t)slots[i] * kChunkBytes, staging,
+                    (uint64_t)i * kChunkBytes, kChunkBytes);
+  rec.Finish();
+  // EAGER submit. This is the whole ordering argument (§4.3 step 2).
+  VkFence fence = be_.SubmitCommands(cmd, err);
+  if (fence == VK_NULL_HANDLE) return false;
+  be_.RetainFence(fence);
+
+  out.staging = staging;
+  out.fence = fence;
+  out.count = count;
+  return true;
+}
+
+bool SimBackend::CompleteEvict(EvictBatch& b, const void*& data, std::string& err) {
+  data = nullptr;
+  if (!b.staging) return true;
+  // §4.3 step 5: CompleteOldest becomes a genuine fence wait, exactly as
+  // instance.WaitAny(p.future, UINT64_MAX) blocks today.
+  if (!be_.WaitFence(b.fence, err)) return false;
+  be_.ReleaseFence(b.fence);
+  data = b.staging->mapped;
+  stagingPool_.push_back(b.staging);
+  b = EvictBatch{};
+  return true;
+}
+
+void SimBackend::FillSlotFromStore(uint32_t slot, const uint32_t* voxels,
+                                   uint32_t occWord) {
+  const uint32_t one = 1;
+  // All four writes are DEFERRED and this function SUBMITS NOTHING — the case
+  // §4.1 names as the one a naive port has no home for. They drain into
+  // whichever command buffer is recorded next, which is normally the next tick.
+  be_.QueueWrite(res_.voxels, (uint64_t)slot * kChunkBytes, voxels, kChunkBytes);
+  be_.QueueWrite(res_.occupancy, (uint64_t)slot * 4, &occWord, 4);
+  // Wake once: neighbours may have changed since this chunk was saved.
+  be_.QueueWrite(res_.dirty[0], (uint64_t)slot * 4, &one, 4);
+  be_.QueueWrite(res_.dirty[1], (uint64_t)slot * 4, &one, 4);
+}
+
+bool SimBackend::FillSlotsByGen(const uint32_t* slots, uint32_t count, uint32_t seed,
+                                IVec3 windowOrigin, std::string& err) {
+  if (count == 0) return true;
+  origin_ = windowOrigin;
+  be_.QueueWrite(res_.genList, 0, slots, (uint64_t)count * 4);
+  TickParams tp{};
+  tp.seed = seed;
+  tp.genCount = count;
+  tp.origin[0] = windowOrigin.x;
+  tp.origin[1] = windowOrigin.y;
+  tp.origin[2] = windowOrigin.z;
+  // tickUBO LAST-WRITE-WINS (§4.1/§4.7). If this submit happens, the queue
+  // drains here and this TickParams is what genChunk reads. If a tick's own
+  // tickUBO write is issued later, the tick's write lands later and wins —
+  // which is the same ordering WebGPU produces today.
+  be_.QueueWrite(res_.tickUBO, 0, &tp, sizeof(tp));
+
+  RecordCtx cx{};
+  cx.genCount = count;
+  return RunTable(pass::Table::GenList, cx, err);
+}
+
+void SimBackend::UploadChunk(uint32_t slot, const uint32_t* voxels) {
+  be_.QueueWrite(res_.voxels, (uint64_t)slot * kChunkBytes, voxels, kChunkBytes);
+}
+
+void SimBackend::UploadDirtyWord(uint32_t slot, uint32_t value) {
+  be_.QueueWrite(res_.dirty[0], (uint64_t)slot * 4, &value, 4);
+  be_.QueueWrite(res_.dirty[1], (uint64_t)slot * 4, &value, 4);
+}
+
+bool SimBackend::SubmitLoadReset(uint32_t seed, std::string& err) {
+  TickParams tp{};
+  tp.seed = seed;
+  tp.origin[0] = origin_.x;
+  tp.origin[1] = origin_.y;
+  tp.origin[2] = origin_.z;
+  be_.QueueWrite(res_.tickUBO, 0, &tp, sizeof(tp));
+  RecordCtx cx{};
+  return RunTable(pass::Table::LoadReset, cx, err);
+}
+
+void SimBackend::Shutdown() {
+  // Release every borrowed fence before the backend tears the pool down, so the
+  // retain map is empty and nothing is double-destroyed.
+  for (auto& s : slots_) {
+    if (s.inFlight && s.fence != VK_NULL_HANDLE) be_.ReleaseFence(s.fence);
+    s.fence = VK_NULL_HANDLE;
+    s.inFlight = false;
+  }
+  be_.Shutdown();
+}
 
 }  // namespace vk

@@ -161,6 +161,47 @@ class Recorder {
   void CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst, uint64_t dstOffset,
                   uint64_t size);
 
+  // ---- off-table copies whose SOURCE is a tracked table buffer -------------
+  //
+  // WHY THESE ARE NOT TABLE ROWS (phase 3c's one schema judgement).
+  //
+  // A `pass::Row` encodes a Copy's (srcOffset, dstOffset, size) as the literal
+  // constants x/y/z. That is exact for every copy in the tick table — the
+  // indirect-args staging hops are always 12 bytes at offset 0 or 16. It cannot
+  // express the readback copies: `World::EncodeReadbacks` issues up to 64 chunk
+  // fetches at slot indices chosen at RUNTIME from a queue, plus 27 mirror
+  // copies whose source offsets come from the live window origin, into a
+  // destination slot picked from a 3-deep ring. Their COUNT and their OFFSETS
+  // are tick data, not table data.
+  //
+  // Making the table able to say that would mean adding runtime-parameterised
+  // offsets to the row schema — i.e. making a row a closure — which dissolves
+  // the property that makes the table checkable at all (`check_pass_table.py`
+  // reads the .def as static text). So the readback and eviction copies stay
+  // off-table and express their hazards as `pass::Use` against the SAME
+  // tracker, which is the mechanism `CopyToHost` established in 3b and which
+  // barrier_graph §8 already sanctions ("if a hazard needs expressing, it is
+  // expressed as a table row's `uses`" — a Use, not necessarily a Row).
+  //
+  // What is NOT given up: the hazard is still DERIVED. `CopyTracked` takes the
+  // source as a `pass::Buf` id, so the source's last writer in this recording
+  // is ordered ahead of the transfer read by the ordinary §3.3 path. Nothing
+  // here writes a scope by hand.
+
+  // Copy from a tracked table buffer into an untracked destination (a readback
+  // slot, an eviction staging buffer). The source hazard is derived; the
+  // destination is registered for the Finish() host barrier when host-visible.
+  void CopyTracked(pass::Buf src, uint64_t srcOffset, Buffer* dst, uint64_t dstOffset,
+                   uint64_t size);
+
+  // vkCmdFillBuffer over a tracked table buffer, off-table. This exists for
+  // exactly one caller: `EncodeReadbacks`' `ClearBuffer(support)` immediately
+  // after copying support out (barrier_graph §7.4's T76 -> T77). That pair is a
+  // genuine transfer-read -> transfer-write WAR on one buffer and is the case
+  // most likely to be dismissed as "just two copies"; routing the fill through
+  // the tracker is what makes the WAR fall out instead of being remembered.
+  void FillTracked(pass::Buf dst);
+
   const RecordStats& Stats() const { return stats_; }
 
  private:

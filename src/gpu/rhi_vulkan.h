@@ -204,6 +204,36 @@ class Backend {
   // buffers. Non-blocking; this is ProcessEvents()' replacement.
   void PollFences();
 
+  // ---- borrowed fences (barrier_graph §4.2) ------------------------------
+  //
+  // The readback ring and the eviction pool do not own fences: §4.2 says a
+  // readback slot "borrows a reference to that submit's fence", because every
+  // submit gets one anyway (for staging-ring reclamation) and a second fence
+  // per slot would decouple two lifetimes that should not be decoupled.
+  //
+  // BUT A BORROWED FENCE NEEDS A RETAIN, and phase 3c found this the hard way.
+  // `PollFences()` recycles a signalled fence into `freeFences_` immediately,
+  // and `BeginCommands()` calls `PollFences()` on EVERY command buffer. So a
+  // slot that submitted at tick N and had not yet been polled by tick N+1 held
+  // a handle that `AcquireFence` had already reset and handed to the tick-N+1
+  // submit. `vkGetFenceStatus` on it then reports the LATER submit's status:
+  // the slot reads its mapped memory when a completely different command buffer
+  // finishes, which for a 3-deep ring means reading a slot the GPU is still
+  // writing. That is silent data corruption in the CPU mirror, not a crash —
+  // exactly the class of bug the ring exists to prevent.
+  //
+  // So: `RetainFence` pins a fence against recycling; `ReleaseFence` unpins it,
+  // and the fence returns to the pool once BOTH the submit has retired and
+  // every borrower has released. A borrower must release exactly once.
+  void RetainFence(VkFence f);
+  void ReleaseFence(VkFence f);
+  // Non-blocking status of a retained fence. VK_SUCCESS = the submit that
+  // signalled it has completed.
+  VkResult FenceStatus(VkFence f) const;
+  // Blocking wait on a retained fence — the eviction pool's `CompleteOldest`
+  // (§4.3 step 5), which is a genuine block exactly as `WaitAny` blocks today.
+  bool WaitFence(VkFence f, std::string& err);
+
   // ---- shaders ----
   //
   // Compiles WGSL to SPIR-V through Tint and creates a VkShaderModule. Cached
@@ -293,6 +323,14 @@ class Backend {
 
   std::vector<InFlight> inFlight_;
   std::vector<VkFence> freeFences_;
+  // Borrow counts for fences pinned by RetainFence. A fence with a non-zero
+  // count is never returned to freeFences_, so a borrower's handle stays valid
+  // and keeps meaning the submit it was taken from. Entries are erased when the
+  // count reaches zero AND the submit has retired.
+  std::unordered_map<VkFence, uint32_t> fenceRetain_;
+  // Fences whose submit retired while still retained: signalled, valid, and
+  // waiting for the last ReleaseFence to hand them back to the pool.
+  std::vector<VkFence> retiredRetained_;
 
   std::unordered_map<std::string, VkShaderModule> moduleCache_;
   std::vector<VkDescriptorSetLayout> setLayouts_;

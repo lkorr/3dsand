@@ -464,6 +464,42 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
 }
 
 // ---------------------------------------------------------------------------
+// Off-table copies with a TRACKED source (phase 3c). See vk_record.h for why
+// the readback and eviction copies are Uses rather than Rows.
+//
+// The two functions below are the whole mechanism. Neither writes a barrier
+// scope: each declares what it touches as a `pass::Use` and lets §3.3 derive
+// the barrier from the live tracker state, exactly as a row does.
+// ---------------------------------------------------------------------------
+void Recorder::CopyTracked(pass::Buf src, uint64_t srcOffset, Buffer* dst,
+                           uint64_t dstOffset, uint64_t size) {
+  Buffer* s = bind_.buffers[(int)src];
+  if (!s || !s->buf || !dst || !dst->buf) return;
+  pass::Use u{src, pass::Acc::TransferRead};
+  ApplyUses(&u, 1, /*global=*/false);
+
+  VkBufferCopy region{};
+  region.srcOffset = srcOffset;
+  region.dstOffset = dstOffset;
+  region.size = size;
+  be_.Fns().CmdCopyBuffer(cmd_, s->buf, dst->buf, 1, &region);
+  stats_.copies++;
+  if (dst->mapped) hostWritten_.push_back(dst);
+}
+
+void Recorder::FillTracked(pass::Buf dst) {
+  Buffer* b = bind_.buffers[(int)dst];
+  if (!b || !b->buf) return;
+  // TransferWrite against a buffer the tracker has just seen a TransferRead on
+  // produces the WAR barrier of §7.4 automatically. That is the entire point of
+  // routing this through the tracker rather than calling CmdFillBuffer here.
+  pass::Use u{dst, pass::Acc::TransferWrite};
+  ApplyUses(&u, 1, /*global=*/false);
+  be_.Fns().CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
+  stats_.fills++;
+}
+
+// ---------------------------------------------------------------------------
 // barrier_graph §2.4 phase 7b: the host-visibility barrier is emitted at
 // Finish() time, as the LAST command, after every writer of every host-visible
 // buffer touched during the recording — NEVER at a fixed table index.
