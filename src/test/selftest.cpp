@@ -50,6 +50,7 @@ const char* const kOrder[] = {
     "screenshots", "player-walk", "player-waterjump", "player-plants", "debris",
     "prefab",      "mob",         "settle-back",    "player-body",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
+    "page-roundtrip", "daylight-boundary",
     "perf",
 };
 
