@@ -1,5 +1,6 @@
 #include "ui/overlay.h"
 
+#include <cmath>
 #include <cstdio>
 
 #include <imgui.h>
@@ -95,13 +96,145 @@ void Overlay::DrawHUD(const UIState& s) {
   bar(yMana, s.mana, s.manaMax, fromMana, IM_COL32(70, 120, 230, 235),
       IM_COL32(150, 200, 255, 245), "mp");
 
+  // ---- body condition, sitting directly above the hp bar -------------------
+  const float figureH = DrawBodyFigure(s, x, yHealth - gap);
+  const float yTop = yHealth - gap - figureH;
+
   if (!s.playerAlive) {
     const char* dead = "DEAD";
     const ImVec2 ts = ImGui::CalcTextSize(dead);
-    const ImVec2 tp(x, yHealth - ts.y - 6);
+    const ImVec2 tp(x, yTop - ts.y - 6);
     d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);
     d->AddText(tp, IM_COL32(255, 70, 60, 255), dead);
   }
+}
+
+// ---- the body-condition stick figure ----------------------------------------
+//
+// A limb is one thick line segment. Three states, in priority order, because
+// they are not independent — a severed limb cannot bleed and its damage is no
+// longer news:
+//
+//   severed   -> the segment is NOT drawn at all; a dim stump tick is left at
+//                the joint so the gap reads as "lost" rather than "the HUD
+//                forgot to draw an arm"
+//   bleeding  -> flashes between its damage colour and hot red, on a wall-clock
+//                sine (ImGui::GetTime) so the pulse is frame-rate independent
+//   damaged   -> lerp from bone-white at full hp to deep red at zero
+//
+// Drawn bottom-up from `yBottom` and returns its own height so the caller can
+// stack whatever comes next without restating the layout.
+float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom) {
+  // Proportions in figure-local units, then scaled. Origin is the pelvis.
+  const float unit = 5.0f;                 // px per figure unit
+  const float legLen = 3.0f, armLen = 2.6f, spineLen = 3.2f;
+  const float shoulder = 2.2f, hipW = 1.3f, headR = 1.5f * unit;
+  const float thick = 3.2f;
+  const float height = (spineLen + legLen * 2 + 3.4f) * unit;
+  if (!s.bodyValid) return height;
+
+  ImDrawList* d = ImGui::GetForegroundDrawList();
+
+  // Pelvis sits one leg-span up from the bottom edge; the head crown lands at
+  // the top of the reserved height.
+  const float px = x + 3.0f * unit;   // a little inset so arms have room
+  const float py = yBottom - legLen * 2.0f * unit - 2.0f;
+  auto P = [&](float fx, float fy) {  // figure units -> screen, +fy is UP
+    return ImVec2(px + fx * unit, py - fy * unit);
+  };
+
+  // Wall-clock flash for bleeding parts. One phase for the whole body so the
+  // wounds pulse together and read as one alarm rather than as noise.
+  const float flash =
+      0.5f + 0.5f * (float)sin(ImGui::GetTime() * 7.0f);
+
+  // Damage tint: bone -> deep red as hp drops. Bleeding parts blend toward a
+  // hot red on the flash phase.
+  auto tint = [&](const UIState::BodyPartUI& b) {
+    float f = b.hpFrac < 0 ? 0.0f : (b.hpFrac > 1 ? 1.0f : b.hpFrac);
+    int r = (int)(215 + (200 - 215) * (1.0f - f));
+    int g = (int)(220 * f * f + 30 * f);
+    int bl = (int)(225 * f * f + 30 * f);
+    if (b.bleeding) {
+      r = (int)(r + (255 - r) * flash);
+      g = (int)(g * (1.0f - 0.85f * flash));
+      bl = (int)(bl * (1.0f - 0.85f * flash));
+    }
+    return IM_COL32(r, g, bl, 245);
+  };
+
+  // One limb segment. Severed parts leave a stump tick at `a` instead.
+  auto seg = [&](int slot, ImVec2 a, ImVec2 b) {
+    const UIState::BodyPartUI& p = s.body[slot];
+    if (!p.present) return;
+    if (p.severed) {
+      // A short perpendicular tick at the joint: the wound, not the limb.
+      const float dx = b.x - a.x, dy = b.y - a.y;
+      const float len = sqrtf(dx * dx + dy * dy);
+      if (len > 0.001f) {
+        const float nx = -dy / len * 2.5f, ny = dx / len * 2.5f;
+        d->AddLine(ImVec2(a.x - nx, a.y - ny), ImVec2(a.x + nx, a.y + ny),
+                   IM_COL32(120, 40, 40, 200), 2.0f);
+      }
+      return;
+    }
+    d->AddLine(a, b, tint(p), thick);
+  };
+
+  // scrim, so the figure stays readable over a bright world
+  d->AddRectFilled(ImVec2(x - 4, yBottom - height), ImVec2(x + 13.5f * unit,
+                   yBottom + 2), IM_COL32(0, 0, 0, 70), 4.0f);
+
+  // ---- skeleton points (figure units, pelvis at origin) ----
+  const ImVec2 pelvis = P(0, 0);
+  const ImVec2 neck = P(0, spineLen);
+  const ImVec2 shL = P(-shoulder, spineLen * 0.92f);
+  const ImVec2 shR = P(shoulder, spineLen * 0.92f);
+  const ImVec2 elbL = P(-shoulder - armLen * 0.35f, spineLen * 0.92f - armLen);
+  const ImVec2 elbR = P(shoulder + armLen * 0.35f, spineLen * 0.92f - armLen);
+  const ImVec2 hndL = P(-shoulder - armLen * 0.6f,
+                        spineLen * 0.92f - armLen * 2.0f);
+  const ImVec2 hndR = P(shoulder + armLen * 0.6f,
+                        spineLen * 0.92f - armLen * 2.0f);
+  const ImVec2 hipL = P(-hipW, 0), hipR = P(hipW, 0);
+  const ImVec2 kneeL = P(-hipW * 1.1f, -legLen), kneeR = P(hipW * 1.1f, -legLen);
+  const ImVec2 ankL = P(-hipW * 1.2f, -legLen * 2.0f);
+  const ImVec2 ankR = P(hipW * 1.2f, -legLen * 2.0f);
+
+  // torso + hips are the spine; drawn first so limbs overlap them at the joints
+  seg(UIState::kSlotHips, pelvis, P(0, spineLen * 0.4f));
+  seg(UIState::kSlotTorso, P(0, spineLen * 0.4f), neck);
+  seg(UIState::kSlotArmUL, shL, elbL);
+  seg(UIState::kSlotArmLL, elbL, hndL);
+  seg(UIState::kSlotArmUR, shR, elbR);
+  seg(UIState::kSlotArmLR, elbR, hndR);
+  seg(UIState::kSlotLegUL, hipL, kneeL);
+  seg(UIState::kSlotLegLL, kneeL, ankL);
+  seg(UIState::kSlotLegUR, hipR, kneeR);
+  seg(UIState::kSlotLegLR, kneeR, ankR);
+
+  // hands and feet are dots rather than segments — too short to read as lines
+  auto dot = [&](int slot, ImVec2 at, float r) {
+    const UIState::BodyPartUI& p = s.body[slot];
+    if (!p.present || p.severed) return;
+    d->AddCircleFilled(at, r, tint(p), 8);
+  };
+  dot(UIState::kSlotHandL, hndL, 2.4f);
+  dot(UIState::kSlotHandR, hndR, 2.4f);
+  dot(UIState::kSlotFootL, ankL, 2.4f);
+  dot(UIState::kSlotFootR, ankR, 2.4f);
+
+  // head: a circle on the neck, or an empty socket outline when decapitated
+  const UIState::BodyPartUI& head = s.body[UIState::kSlotHead];
+  if (head.present) {
+    const ImVec2 hc(neck.x, neck.y - headR - 1.0f);
+    if (head.severed) {
+      d->AddCircle(hc, headR * 0.5f, IM_COL32(120, 40, 40, 170), 10, 1.5f);
+    } else {
+      d->AddCircleFilled(hc, headR, tint(head), 14);
+    }
+  }
+  return height;
 }
 
 void Overlay::Draw(UIState& s) {
