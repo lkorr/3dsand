@@ -1775,20 +1775,20 @@ int main(int argc, char** argv) {
         // which is what keeps it from chattering at the boundary: there is no
         // edge to cross twice, just a residual that is zero inside the cone.
         //
-        // BOTH MODES GET THE CONE, and third person needs it for a reason that
-        // is not obvious: movement is CAMERA-RELATIVE, so walking forward makes
-        // the travel direction identical to the camera heading. The body then
-        // chases the camera through `wantHeading` and the head-body offset
-        // collapses to zero — a character who never glances at anything while
-        // moving, which is precisely when you most want them to. Applying the
-        // residual here lets the body lag the camera by up to the cone while
-        // walking, and the head takes up that lag.
-        //
-        // Standing still, `wantHeading` is already pinned to `avatarHeading`
-        // one block up, so `d` is 0 and this changes nothing — the hold is the
-        // existing anti-spin rule and the head does all the work.
+        // FIRST PERSON ONLY. The cone is a rule about lagging the CAMERA, and
+        // it is only correct where the camera is what the body is trying to
+        // face. In third person the goal is the TRAVEL DIRECTION, and lagging
+        // that is simply wrong: holding W has to point the character where
+        // they are running, every time, with no 70-degree slack. An earlier
+        // version applied the residual in both modes on the theory that
+        // camera-relative movement collapses the head-body offset to zero
+        // while walking — true, but the fix for "the head never glances while
+        // running" cannot be "the body stops facing where it runs". Running
+        // forward SHOULD square the body to the direction of travel; the head
+        // then glances off that, which is exactly what the offset below
+        // computes once the body has turned.
         const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
-        if (headCone > 1e-3f) {
+        if (camMode == CameraMode::First && headCone > 1e-3f) {
           if (d > headCone) d -= headCone;
           else if (d < -headCone) d += headCone;
           else d = 0.0f;

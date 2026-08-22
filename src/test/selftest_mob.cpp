@@ -915,8 +915,13 @@ bool mobOk = false;
           Vec3 p;
           Quat q;
           if (!avatar.PartWorldTransform(part, p, q)) return 0.0f;
-          // Model +Z is forward; project the part's forward onto the ground
-          // plane and read its bearing.
+          // Bearing in the rig's own HEADING convention — forward is
+          // (sin h, ., cos h), i.e. atan2(x, z) — which is the convention
+          // SetLook's argument is expressed in and the one the body applies
+          // via AxisAngle({0,1,0}, heading_). Measuring in the same convention
+          // the input uses is the whole point: the first version of this gate
+          // measured correctly but asserted the OPPOSITE sign, so it passed
+          // green while the head turned the wrong way on screen.
           Vec3 f = QuatRotate(q, Vec3{0, 0, 1});
           return std::atan2(f.x, f.z) * 57.29578f;
         };
@@ -932,22 +937,25 @@ bool mobOk = false;
         avatar.SetLook(0.0f, 0.0f);
         for (int i = 0; i < 40; i++) avTick();
         const float headRest = relHeadYaw();
-        // Look 60 deg RIGHT — inside the 70 deg cone, so the body would not
-        // turn even if a driver were attached, and the head must take all of
-        // it. Camera yaw is positive to the right.
+        // +60 deg of heading delta — inside the 70 deg cone, so the head must
+        // take all of it. THE HEAD MUST FOLLOW THE SIGN OF THE INPUT: a
+        // positive look is a positive heading offset, the same direction the
+        // body would have turned had it been asked, so the measured head
+        // bearing must come out POSITIVE too. Asserting that is what catches
+        // an inverted head, which is exactly the bug this gate first missed.
         avatar.SetLook(60.0f / 57.29578f, 0.0f);
         for (int i = 0; i < 40; i++) avTick();
-        const float headRight = relHeadYaw() - headRest;
+        const float headPos = relHeadYaw() - headRest;
         avatar.SetLook(-60.0f / 57.29578f, 0.0f);
         for (int i = 0; i < 40; i++) avTick();
-        const float headLeft = relHeadYaw() - headRest;
+        const float headNeg = relHeadYaw() - headRest;
         // Sign, magnitude and symmetry. The head is asked for 60 deg and the
         // spine share (default 0.25) is applied at the TORSO, which the head
         // inherits — so head-vs-hips should recover very nearly the whole 60
         // either way. Generous bounds: this is gating "does it turn, the right
         // way, by roughly the right amount", not a tuning value.
-        bool lookTurns = headRight < -25.0f && headRight > -95.0f &&
-                         headLeft > 25.0f && headLeft < 95.0f;
+        bool lookTurns = headPos > 25.0f && headPos < 95.0f &&
+                         headNeg < -25.0f && headNeg > -95.0f;
         // A look must not drag the HIPS around: that is the bug above.
         avatar.SetLook(60.0f / 57.29578f, 0.0f);
         for (int i = 0; i < 40; i++) avTick();
@@ -1422,9 +1430,10 @@ bool mobOk = false;
         // Reported separately so a head-look regression cannot hide inside
         // the avatar line's long list of gait assertions.
         std::printf(
-            "avatar head look: %s (60 deg right -> head %.1f deg, left -> "
-            "%.1f deg, both vs hips; hips held %.1f deg)\n",
-            lookOk ? "PASS" : "FAIL", headRight, headLeft, hipsYaw);
+            "avatar head look: %s (look +60 deg -> head %+.1f deg, -60 -> "
+            "%+.1f deg, both vs hips and SIGN-MATCHING the input; "
+            "hips held %.1f deg)\n",
+            lookOk ? "PASS" : "FAIL", headPos, headNeg, hipsYaw);
         mobOk = mobOk && lookOk;
 
         // Reported separately from `avatar` so a gait-look regression and a

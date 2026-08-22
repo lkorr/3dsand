@@ -1179,12 +1179,23 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // rotating `rot` alone swings the head about the neck rather than about the
   // model origin. The springs directly above rely on the same property.
   //
-  // MODEL-SPACE HANDEDNESS, the same trap the weapon arm documents: the
-  // .vox -> engine load map is (x, z, -y), which negates y and flips
-  // handedness, so model +X is the character's LEFT and +Y-positive rotation
-  // takes forward toward that left. Camera yaw is positive to the RIGHT and
-  // camera pitch positive UP, so both are negated going in. Checked with
-  // scripts/geometry.py rather than reasoned about.
+  // THE YAW SIGN COMES FROM THE BODY, NOT FROM THE MODEL AXES. This is the
+  // trap, and the first version got it backwards: `lookYaw_` is a HEADING
+  // delta (camHeading - avatarHeading, both in the rig's heading convention),
+  // not a camera yaw. The body applies its own heading as
+  // AxisAngle({0,1,0}, heading_) — so a POSITIVE heading delta must be applied
+  // to the neck the same positive way, or the head turns opposite the camera.
+  //
+  // Reasoning about it via "model +X is the character's left" is what produced
+  // the inverted version: that fact is true, and it is why the weapon arm
+  // negates X, but it does not apply here. The arm converts a WORLD-space
+  // offset into the model frame and so meets the handedness flip head-on; this
+  // composes an angle that is already expressed in the same convention the
+  // body's own yaw uses, so it needs no flip at all.
+  //
+  // Pitch is the one that does get negated: camera pitch is positive UP, and a
+  // positive rotation about model +X pitches the nose DOWN (verified with
+  // scripts/geometry.py: +90 about X takes +Z to -Y).
   {
     const auto& av = CurrentTuning().avatar;
     const float hl = av.headLookHalflife;
@@ -1230,13 +1241,13 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
             if (sk.parts[i].tag != "spine" || (int)i == def_->rootLimb) continue;
             if (i < st.partAlive.size() && !st.partAlive[i]) continue;
             st.local[i].rot = QuatNormalize(
-                Mul(st.local[i].rot, AxisAngle({0, 1, 0}, -per)));
+                Mul(st.local[i].rot, AxisAngle({0, 1, 0}, per)));
             spineTotal += per;
           }
         }
       }
       const float headYaw = lookYaw_ - spineTotal;
-      Quat look = Mul(AxisAngle({0, 1, 0}, -headYaw),
+      Quat look = Mul(AxisAngle({0, 1, 0}, headYaw),
                       AxisAngle({1, 0, 0}, -lookPitch_));
       st.local[head].rot = QuatNormalize(Mul(st.local[head].rot, look));
     }
