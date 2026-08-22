@@ -1009,6 +1009,15 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "oilDarken", r.oilDarken, out, at);
     ReadF(*g, "oilIridescence", r.oilIridescence, out, at);
     ReadF(*g, "oilFilmScale", r.oilFilmScale, out, at);
+    ReadF(*g, "oilFloatSens", r.oilFloatSens, out, at);
+    r.oilFloatSens = std::max(r.oilFloatSens, 0.0f);
+    ReadF(*g, "oilEdgeBand", r.oilEdgeBand, out, at);
+    // A zero-width smoothstep band is a hard step, which puts the aliased cube
+    // silhouette straight back; too wide and the droplet goes translucent,
+    // which is the bug this parameter exists to fix.
+    r.oilEdgeBand = std::clamp(r.oilEdgeBand, 0.01f, 0.5f);
+    ReadF(*g, "oilDropReflect", r.oilDropReflect, out, at);
+    r.oilDropReflect = std::clamp(r.oilDropReflect, 0.0f, 1.0f);
     // Divides into the band phase; zero makes the whole surface one flat colour.
     r.oilFilmScale = std::max(r.oilFilmScale, 0.01f);
 

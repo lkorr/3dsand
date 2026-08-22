@@ -2876,6 +2876,52 @@ fn oiliness(m : Material) -> f32 {
   return 1.0 - smoothstep(TUNE_OIL_SAT_LOW, TUNE_OIL_SAT_HIGH, sat);
 }
 
+// ---- is this liquid FLOATING ON another one? ----
+// Returns 1 when a lighter liquid is lying on top of a heavier, different one
+// — oil on water — and 0 for a pool of the stuff on its own.
+//
+// This is the gate for the iridescent sheen, and the physics is the reason it
+// has to exist. Thin-film interference needs a FILM: two closely spaced
+// interfaces, so light bouncing off the top can interfere with light bouncing
+// off the bottom. Oil spread on water is exactly that (an air/oil interface a
+// few microns above an oil/water one) and it is why a puddle in a car park
+// shows rainbows. A deep pool of oil on rock has no second interface anywhere
+// near the surface — the bottom is metres down and the light never gets there
+// — so it is just a dark glossy liquid, and painting rainbows on it is the
+// giveaway that the effect is decoration rather than a model of anything.
+//
+// Probes DOWNWARD for a different liquid with a HIGHER density. Density is
+// what decides which floats (the sim already orders liquids by it), so this
+// asks the same question the sim does and cannot disagree with what the world
+// actually did. No material ids: any light liquid on any heavy one gets a
+// sheen, which is the correct generalisation.
+fn floatingOnLiquid(cell : vec3<i32>, mat : u32) -> f32 {
+  let m = materials[mat];
+  // A film is THIN. Probing far down would find the water under a metre-deep
+  // oil column and call it a film, which is the case this exists to exclude,
+  // so the probe reaches only a few voxels.
+  for (var i = 1; i <= 3; i++) {
+    let c = cell + vec3<i32>(0, -i, 0);
+    if (!inBounds(c)) { return 0.0; }
+    let w = voxels[cellIndexW(c)];
+    let bm = voxMat(w);
+    if (bm == MAT_AIR) { return 0.0; }        // nothing under it
+    if (bm == mat) { continue; }              // still our own liquid: keep going
+    let b = materials[bm];
+    if (b.klass != CLASS_LIQUID) { return 0.0; }  // resting on a solid bed
+    // A DIFFERENT liquid, and denser than us, so we are the one floating.
+    // Fade in with how much denser it is: a marginal difference is a mixture,
+    // a large one is a genuine layer boundary.
+    if (b.density > m.density) {
+      let ratio = f32(b.density - m.density) / max(f32(m.density), 1.0);
+      return clamp(ratio * TUNE_OIL_FLOAT_SENS, 0.0, 1.0);
+    }
+    return 0.0;
+  }
+  // Ran out of probe without finding anything: too deep to be a film.
+  return 0.0;
+}
+
 // ---- thin-film interference (the rainbow sheen on oil) ----
 // The one thing everybody recognises oil by. A film microns thick makes light
 // reflected off its TOP surface interfere with light reflected off its BOTTOM,
@@ -2896,8 +2942,13 @@ fn filmIridescence(p : vec3f, cosI : f32) -> vec3f {
   // Two octaves at different rates so the bands drift and stretch rather than
   // sliding rigidly, which is what reads as liquid rather than as a scrolling
   // texture.
-  let t1 = valueNoise(vec3f(pm.x * 1.7, pm.y * 1.7 + R.time * 0.05, pm.z * 1.7), 1.0);
-  let t2 = valueNoise(vec3f(pm.z * 3.1 - R.time * 0.03, pm.x * 3.1, pm.y * 3.1), 1.0);
+  // LOW spatial frequency, deliberately. At 1.7 and 3.1 cycles per metre the
+  // interference bands land near PIXEL scale across a slick at any real
+  // viewing distance, and the field aliases into a shimmering moire that reads
+  // as a broken screen rather than as oil. A real film's thickness varies over
+  // tens of centimetres, so the bands should be broad, soft and few.
+  let t1 = valueNoise(vec3f(pm.x * 0.45, pm.y * 0.45 + R.time * 0.05, pm.z * 0.45), 1.0);
+  let t2 = valueNoise(vec3f(pm.z * 0.8 - R.time * 0.03, pm.x * 0.8, pm.y * 0.8), 1.0);
   let thick = mix(t1, t2, 0.4) * TUNE_OIL_FILM_SCALE;
   // Optical path difference grows as the ray slants through the film, which is
   // why the bands crowd toward a grazing view. That angular term is most of
@@ -2905,8 +2956,12 @@ fn filmIridescence(p : vec3f, cosI : f32) -> vec3f {
   let opd = thick / max(cosI, 0.18);
   let ph = opd * 6.28318;
   let rgb = vec3f(cos(ph), cos(ph - 2.0944), cos(ph + 2.0944)) * 0.5 + vec3f(0.5);
-  // Squared so the bands read as saturated colour rather than pastel noise.
-  return rgb * rgb;
+  // Kept LINEAR rather than squared. Squaring deepens the gaps between bands
+  // and pushes them toward primaries, which on a real surface reads as a
+  // psychedelic decal instead of a faint oily sheen; the raw cosines are
+  // already pastel, which is what a slick looks like away from its thinnest
+  // fringes.
+  return rgb;
 }
 
 // Returns 0 for an isolated droplet / thin trail and 1 for the interior of a
@@ -3159,7 +3214,19 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // earns the ray far sooner.
     reflection = traceReflection(hitP, n, rd);
   } else {
-    reflection = reflectionSky(reflect(rd, n));
+    // The cheap fallback: a plain sky lookup. On a POOL that is a fine stand-in
+    // for a traced ray, but on a droplet or a thin trail it is the other half
+    // of oil reading as see-through. Fresnel at a grazing angle drives `color`
+    // almost entirely to this term, and a droplet returning full-brightness
+    // sky is indistinguishable from a droplet you are looking THROUGH.
+    //
+    // A real droplet does reflect the sky, but it is a tiny curved mirror
+    // scattering it in every direction, so what reaches the eye is far dimmer
+    // than the sky itself. Damping the fallback on unpooled oil models that,
+    // and it is what keeps a spray of droplets reading as dark specks of oil
+    // rather than as holes in the world.
+    let sky = reflectionSky(reflect(rd, n));
+    reflection = sky * mix(1.0, mix(TUNE_OIL_DROP_REFLECT, 1.0, pool), oily);
   }
   // Reflections off blood are TINTED by it — a dielectric this dark reflects a
   // dimmer, redder version of what a clean surface would.
@@ -3209,16 +3276,23 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
            + ambientAt(n) * ambientSheen;
 
     // ---- thin-film iridescence ----
-    // The rainbow slick. Weighted by FRESNEL, so it appears where the surface
-    // is being seen at a glancing angle and reflecting - which is exactly where
-    // a real film's interference is visible, and it keeps the effect off the
-    // head-on centre of a pool where it would look like spilled paint.
+    // The rainbow slick, and it ONLY appears where oil is floating on water.
     //
-    // Additive on top of the reflection rather than mixed into the body: the
-    // colour comes from light bouncing off the film, not from the oil itself.
+    // Interference needs a FILM — two interfaces close enough together that
+    // light off the top can interfere with light off the bottom. Oil lying on
+    // water is exactly that and is why a car-park puddle shows rainbows; a
+    // deep pool of oil on rock has no second interface within reach of the
+    // light, so it is simply a dark glossy liquid. Painting rainbows on one
+    // anyway was the tell that this was decoration rather than a model, and it
+    // made every isolated droplet and every standalone pool look wrong.
+    //
+    // Also weighted by FRESNEL, so within a real slick it shows at glancing
+    // angles and stays off the head-on centre, where it would read as paint.
     // Scaled by `oily`, so blood never gets a drop of it.
-    if (oily > 0.01 && !underwater) {
-      color += filmIridescence(hitP, cosI) * oily * fres * TUNE_OIL_IRIDESCENCE;
+    let onWater = floatingOnLiquid(cell, mat);
+    if (oily > 0.01 && onWater > 0.01 && !underwater) {
+      color += filmIridescence(hitP, cosI) * oily * onWater * fres *
+               TUNE_OIL_IRIDESCENCE;
     }
   }
 
@@ -3265,12 +3339,27 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Referencing the field's local peak instead makes the feather scale-free: it
   // trims the same fraction of the outer fringe off a droplet and off a pool,
   // and never eats into the body of either.
+  //
+  // OIL GETS A MUCH NARROWER FEATHER, and this is what stopped it reading as
+  // see-through. The 0.28 band is a large fraction of the field's range, so on
+  // a droplet or a thin film a big part of the visible surface — not just the
+  // outermost rim — sits inside the fade and gets mixed toward whatever is
+  // behind it. On blood that is an acceptable trade for killing the gelatin
+  // cube silhouette, because blood's own body colour is bright enough to keep
+  // reading through the blend. Oil's body is nearly black by design, so the
+  // same blend has almost nothing to hold up against the background and the
+  // droplet turns into a smear of the scene behind it.
+  //
+  // Narrowing the band to the true outer fringe keeps the anti-aliasing (the
+  // silhouette is still soft, which is the point of the term) while leaving
+  // the body of the blob opaque.
   let edgeField = liquidFieldAt(hitP - rd * 0.35, mat);
   // Peak the field can reach for this blob, floored so a full pool still uses
   // the authored feather rather than a vanishing one.
   let peak = max(liquidFieldAt(hitP - rd * 1.1, mat), 0.35);
   let lo = TUNE_BLOOD_EDGE_FEATHER * peak;
-  let solid = smoothstep(lo, lo + 0.28 * peak, edgeField);
+  let band = mix(0.28, TUNE_OIL_EDGE_BAND, oily);
+  let solid = smoothstep(lo, lo + band * peak, edgeField);
   color = mix(sceneBehind, color, clamp(solid, 0.0, 1.0));
 
   return color;

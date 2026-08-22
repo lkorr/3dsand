@@ -332,8 +332,11 @@ SPEC = [
     ("render", "oilSheen", "TUNE_OIL_SHEEN", "f", 1.6),
     ("render", "oilReflectTint", "TUNE_OIL_REFLECT_TINT", "f", 0.12),
     ("render", "oilDarken", "TUNE_OIL_DARKEN", "f", 0.35),
-    ("render", "oilIridescence", "TUNE_OIL_IRIDESCENCE", "f", 0.5),
-    ("render", "oilFilmScale", "TUNE_OIL_FILM_SCALE", "f", 3.5),
+    ("render", "oilIridescence", "TUNE_OIL_IRIDESCENCE", "f", 0.16),
+    ("render", "oilFilmScale", "TUNE_OIL_FILM_SCALE", "f", 1.1),
+    ("render", "oilFloatSens", "TUNE_OIL_FLOAT_SENS", "f", 9.0),
+    ("render", "oilEdgeBand", "TUNE_OIL_EDGE_BAND", "f", 0.07),
+    ("render", "oilDropReflect", "TUNE_OIL_DROP_REFLECT", "f", 0.3),
     ("render", "subMurkGlow", "TUNE_SUB_MURK_GLOW", "f", 2.2),
 ]
 

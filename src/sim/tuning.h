@@ -978,7 +978,23 @@ struct Tuning {
     float oilDarken = 0.35f;
     // Thin-film interference (the rainbow slick): strength, and the spatial
     // scale of the film-thickness field that sets the band spacing.
-    float oilIridescence = 0.50f, oilFilmScale = 3.5f;
+    float oilIridescence = 0.16f, oilFilmScale = 1.1f;
+    // The sheen appears ONLY where oil floats on a DENSER liquid - a film needs
+    // two interfaces close together, and a deep pool on rock has no second one
+    // within reach of the light (floatingOnLiquid in raymarch.wgsl). This
+    // scales how much denser the layer below must be to count as a real
+    // boundary; oil 900 on water 1000 is a ratio of 0.111.
+    float oilFloatSens = 9.0f;
+    // Silhouette-feather width for oil, against blood's 0.28. Blood can afford
+    // a wide fade because its body colour reads through the blend; oil's body
+    // is nearly black, so the same fade leaves a droplet as a smear of the
+    // scene behind it. This is most of why oil looked see-through.
+    float oilEdgeBand = 0.07f;
+    // How much plain sky reflection an UNPOOLED oil surface returns. A droplet
+    // is a tiny curved mirror scattering the sky everywhere, so far less
+    // reaches the eye than off a flat pool; at 1.0 a grazing droplet returns
+    // full-brightness sky and reads as a hole in the world.
+    float oilDropReflect = 0.30f;
 
     // blood / viscous liquids (shadeViscous in raymarch.wgsl)
     float bloodF0 = 0.030f;        // head-on reflectance

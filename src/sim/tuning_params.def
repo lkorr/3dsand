@@ -486,8 +486,25 @@ TP_F(render, oilReflectTint, TUNE_OIL_REFLECT_TINT, 0.12f)
 TP_F(render, oilDarken, TUNE_OIL_DARKEN, 0.35f)
 // Thin-film interference: the rainbow slick. Strength, and the spatial scale of
 // the film-thickness field that sets the band spacing.
-TP_F(render, oilIridescence, TUNE_OIL_IRIDESCENCE, 0.5f)
-TP_F(render, oilFilmScale, TUNE_OIL_FILM_SCALE, 3.5f)
+TP_F(render, oilIridescence, TUNE_OIL_IRIDESCENCE, 0.16f)
+TP_F(render, oilFilmScale, TUNE_OIL_FILM_SCALE, 1.1f)
+// How readily a density difference counts as "floating on". The iridescent
+// sheen only appears where oil lies on a DENSER liquid (floatingOnLiquid);
+// this scales how much denser the layer below has to be before it reads as a
+// real boundary rather than a mixture. Oil 900 on water 1000 is a ratio of
+// 0.111, so at 9.0 that saturates immediately.
+TP_F(render, oilFloatSens, TUNE_OIL_FLOAT_SENS, 9.0f)
+// Width of the silhouette-softening band for oil, against blood's 0.28. Blood
+// can afford a wide feather because its body colour reads through the blend;
+// oil's body is nearly black by design, so the same fade leaves a droplet with
+// nothing to hold up against the background and it becomes a smear of the
+// scene behind it. This is most of why oil looked see-through.
+TP_F(render, oilEdgeBand, TUNE_OIL_EDGE_BAND, 0.07f)
+// How much plain sky reflection an UNPOOLED oil surface returns. A droplet is
+// a tiny curved mirror scattering the sky in every direction, so far less
+// reaches the eye than off a flat pool; at 1.0 a grazing droplet returns
+// full-brightness sky and reads as a hole in the world.
+TP_F(render, oilDropReflect, TUNE_OIL_DROP_REFLECT, 0.3f)
 
 // Faint directional glow toward the surface when submerged in a medium too
 // dense to see through. Without it a dense liquid is a featureless field of
