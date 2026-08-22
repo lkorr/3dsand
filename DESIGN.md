@@ -2100,6 +2100,30 @@ hash) until Vulkan is fully validated, after which its removal is a decision
 recorded in the plan's decision log. The rationale below is kept as the record
 of why WebGPU was the right call while web was a requirement.
 
+**Update (2026-08-22, phases 4–6): the port LANDED, and Vulkan is now the
+DEFAULT backend.** It runs headless and windowed, all 23 selftest gates, the
+`--shot` harnesses and `--measure`; barriers are *generated* from
+`src/sim/pass_table.def` by a last-access tracker (`gpu/vk_record.cpp`) rather
+than hand-placed, exactly as `docs/vulkan_barrier_graph.md` specifies. Parity
+is measured, not assumed: both backends report the same pinned 200-tick world
+hash (`7cfa2420`), the same pass/fail set, and character-identical per-gate
+detail strings — the only difference across a gate-by-gate `--json` diff is
+`perf`, which reports wall clock. Vulkan is also cheaper: a settled tick is
+229 µs vs Dawn's 306, almost entirely in per-dispatch driver overhead on the
+54 empty CA dispatches (the §11 idle-cost debt phase 0 flagged), while the
+genuinely GPU-bound full-world occupancy scan is unchanged.
+
+**Dawn is retained deliberately, and its remaining job is to disagree.** Its
+auto-generated barriers are the reference implementation of the barrier graph,
+so `--backend dawn` is the oracle that makes a generated-barrier mistake
+visible as a hash divergence — the only cheap check we have for rule 1 on a
+single-vendor machine (§14 risk #3 is still open; see phase 5 in the plan for
+what closing it needs). Removal waits until the phase-7 software page table is
+validated, and is then a cleanup commit that deletes impl subclasses without
+touching a caller. **The `rhi::` seam stays regardless**: confining the GPU API
+behind ~10 concepts is what made the port testable one phase at a time, and it
+costs nothing to keep.
+
 **Adopted (2026-08-19, browser requirement): C++20 + WebGPU + WGSL — Dawn
 (Google's WebGPU implementation, Vulkan backend) for native, Emscripten/WASM for
 browser builds. Jolt Physics, GLFW, Dear ImGui (imgui_impl_wgpu), nlohmann/json,
