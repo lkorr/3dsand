@@ -65,35 +65,26 @@ but still far cheaper than the full run:
 ./build/Release/sandvox.exe --selftest --gate mob
 ```
 
-## In progress: melee "hilt in fist" (NOT baselined — deliberately red)
+## Resolved: melee "hilt in fist"
 
-The melee sub-gate now asserts that the sword's authored hilt box actually
-overlaps the hand's box while equipped, and **that assertion currently fails**
-(`hilt in fist=0`, gap ~2.75 world voxels). It is NOT in `baseline.json`, so
-the mob gate reports a REGRESSION and the run exits 1.
+The melee sub-gate asserts that the sword's authored hilt box overlaps the
+hand's box while equipped. It PASSES (gap about -1.5 world voxels, i.e. the
+hilt sits well inside the fist).
 
-That is intentional. The check was added because the sword was hanging at the
-character's feet while every existing melee assertion passed — an edge that has
-come loose from the hand still moves and still carves, so nothing caught it.
-Baselining the new check would recreate exactly the blind spot it exists to
-close.
+Worth recording because it took two independent fixes from two sessions:
 
-Fixed so far: the grip offset (was `-SWORD_GRIP` micro, authored as if the
-socket sat at the pommel butt rather than the fist centre), and the held slot's
-placement path (it now goes hilt-to-hand directly from the hand's live
-transform, instead of through the `anchorLimb`/`restOffset` pair, which is
-measured against the model corner and does not survive Jolt's centre-of-mass
-recentring of a compound shape).
+  * the grip offset and the held-slot placement path (this branch), and
+  * `c3431d4`, which fixed the debug collision boxes being offset by the shape
+    centre of mass.
 
-Remaining: the X axis lands inside the fist; Y and Z are still ~2.75 voxels
-out. The hilt box's scene→engine conversion has been verified against
-`scripts/geometry.py` and is correct, so the residual is elsewhere in the
-compose — most likely the socket point or the hand-frame rotation, not the
-item.
+The second one mattered here because the grip is derived from
+`Physics::GetLocalBounds`; while those bounds were off by the centre-of-mass
+shift, the sword was genuinely misplaced in y/z and no amount of reasoning
+about the item's own frame would have found it.
 
-```bash
-./build/Release/sandvox.exe --selftest --gate mob   # look for "melee:"
-```
+The check exists because the sword spent a while lying at the character's feet
+while every other melee assertion passed — an edge that has come loose from the
+hand still moves and still carves. Do not baseline it away.
 
 ## Updating
 
