@@ -318,7 +318,12 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // (y=68) and INSIDE the rim ring, which is raised to y=70 out at radius 42
     // - anything beyond that is looking at the outside of a stone wall. The
     // fluid disc is only 32 voxels across, so it sits close to the middle.
-    render({260 - 21, 70, 300 - 21}, 0.785f, -0.10f, "screenshot_oil.bmp");
+    // Pitch is a compromise. Too shallow (-0.10) and the ray clears the far
+    // rim entirely and the frame is sky; too steep and the Fresnel terms
+    // vanish. -0.42 from 5 voxels up puts the far side of the 32-voxel disc
+    // across the middle of the frame while still hitting it at a glancing
+    // enough angle for the reflection and glint to read.
+    render({260 - 24, 73, 300 - 24}, 0.785f, -0.42f, "screenshot_oil.bmp");
     render({260, 60, 300}, 0.785f, 0.10f, "screenshot_oil_sub.bmp");
     // Restore the origin window: the lava/blood/micro shots below all assume
     // it, and a regen here would otherwise silently relocate every one of them.

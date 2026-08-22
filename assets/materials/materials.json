@@ -1,5 +1,5 @@
 {
-  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here \u2014 append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune.",
+  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here — append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune.",
   "materials": [
     {
       "id": "stone",
@@ -689,8 +689,14 @@
         "model": "microvox/grass_tuft.vox",
         "subdiv": 8,
         "frames": [
-          { "model": 0, "ticks": 26 },
-          { "model": 1, "ticks": 26 }
+          {
+            "model": 0,
+            "ticks": 26
+          },
+          {
+            "model": 1,
+            "ticks": 26
+          }
         ],
         "yawVariants": true,
         "jitter": true
@@ -743,8 +749,14 @@
         "model": "microvox/flower_poppy.vox",
         "subdiv": 8,
         "frames": [
-          { "model": 0, "ticks": 34 },
-          { "model": 1, "ticks": 34 }
+          {
+            "model": 0,
+            "ticks": 34
+          },
+          {
+            "model": 1,
+            "ticks": 34
+          }
         ],
         "yawVariants": true,
         "jitter": true
@@ -1144,6 +1156,972 @@
         "organic",
         "dissolvable"
       ]
+    },
+    {
+      "//": "MEADOW WILDFLOWERS (this block: two petal colours + five micro flowers). The petal colours are ordinary materials the micro models PAINT with, exactly like petal_red/white/yellow above, so a blossom knocked loose by a blast behaves like a petal instead of vanishing into a special case.",
+      "id": "petal_blue",
+      "class": "solid",
+      "density": 290,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#4a5fc4",
+        "#3b4ea8",
+        "#6377dd"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "petal_pink",
+      "class": "solid",
+      "density": 290,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#d9739c",
+        "#bd5c84",
+        "#f090b6"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Bluebell: a nodding one-sided raceme of small blue bells on a slender stalk. Placed in the SHADED forest floor rather than in the open meadow, which is where it actually grows and which also keeps it from competing with the buttercups for the same clump mask.",
+      "id": "flower_bluebell",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 205,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "LOD colours = the MODEL'S AVERAGE, not the blossom's (see flower_poppy). A bluebell cell is a green stalk carrying a column of small blue bells, so the average is a desaturated blue-green — a saturated blue here turns a distant bluebell wood into a field of blue cubes.",
+      "colors": [
+        "#5c6f77",
+        "#4d5f68",
+        "#6d818b"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_bluebell.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 30
+          },
+          {
+            "model": 1,
+            "ticks": 30
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Foxglove: the tall SPIRE. Its whole job is vertical punctuation — every other meadow plant here is knee-high and reads as texture, so one species that fills its cell top to bottom is what stops a flower field looking like a flat carpet with dots on it. Correspondingly rare in worldgen.",
+      "id": "flower_foxglove",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 215,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Model average: a full-height green stalk with a one-sided column of pink bells over its top half. Green still wins, but less decisively than the low flowers — which is right, since a spire is mostly what you see of it.",
+      "colors": [
+        "#8a7285",
+        "#755f72",
+        "#a2879c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_foxglove.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 38
+          },
+          {
+            "model": 1,
+            "ticks": 38
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Buttercup: a low CLUSTER of several small yellow cups on branching stems, not one flower on one stalk. The cluster is the point — it is the species that makes a meadow read as dense rather than as scattered single blooms, so it carries the highest placement chance of the five.",
+      "id": "flower_buttercup",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 205,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Model average: several small yellow cups over a lot of green stem and leaf. Yellow only warms the green here; authored at cup-yellow a distant buttercup meadow reads as sand.",
+      "colors": [
+        "#87944a",
+        "#748040",
+        "#9daa5c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_buttercup.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 28
+          },
+          {
+            "model": 1,
+            "ticks": 28
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "White clover: trefoil leaves lying almost flat with a few round white heads just above them. The GROUND-COVER species — 2 units tall, so it fills the gaps between the taller flowers instead of competing with them, and it is the one that makes a meadow floor look continuous.",
+      "id": "flower_clover",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 200,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Model average: a flat mat of green trefoils with a few small white heads. Almost entirely green, which is what a clover lawn is at any distance.",
+      "colors": [
+        "#5f8c46",
+        "#4f783a",
+        "#77a05c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_clover.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Wild rose: an arching briar with a few five-petalled pink blooms and a yellow boss at each centre. The one WOODY flower in the set, so it reads as a shrub edge rather than as meadow — worldgen puts it at the forest/meadow boundary where a real dog rose grows.",
+      "id": "flower_wildrose",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 230,
+      "hardness": 3,
+      "rubble": "dust",
+      "//colors": "Model average: arching green canes and leaves carrying a few pink blooms. Greener than foxglove because the canes and foliage dominate the volume even though the blooms are what you notice.",
+      "colors": [
+        "#6f8556",
+        "#5e714a",
+        "#8a9268"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/flower_wildrose.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 34
+          },
+          {
+            "model": 1,
+            "ticks": 34
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "DESERT / HIGHLAND / ALPINE flora set (worldgen only), appended as one block by the non-forest flora pass. Same standing rules as the forest and aquatic sets above: every one of these is an INERT solid with no reaction rule of its own as `self`. Worldgen paints them across whole biomes, and anything that grew or spread would keep those chunks awake forever (CLAUDE.md rule 2). They carry organic/flammable so fire, acid, mites and the laser treat them exactly like the rest of the vegetation.",
+      "//scale": "A saguaro is an implicit worldgen SHAPE (cactusAt in worldgen.wgsl), not a micro model, because it is 3-5 m tall and a micro model is one 10 cm cell. The soft ground species below are micro models.",
+      "id": "cactus_flesh",
+      "footstep": "path",
+      "class": "solid",
+      "density": 700,
+      "hardness": 14,
+      "//absorb": "A saguaro is mostly water by mass, and that is the one fact about a cactus everyone knows. Real absorb capacity means cutting one open in a desert is a water source rather than scenery, and it makes the material behave sensibly under acid and fire with no new reaction rule.",
+      "absorb": {
+        "capacity": 15
+      },
+      "rubble": "dust",
+      "//colors": "Desaturated blue-green, NOT leaf green: a cactus against pale sand reads wrong at forest-foliage saturation, and the desert palette is the whole point of the biome. Lighter on the third variant so the ribbed column has some internal form.",
+      "colors": [
+        "#4a7a52",
+        "#3e6a46",
+        "#5c8c60"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "The ribbed skin/spine ridge of a saguaro, and the surface of its arms. Its own material rather than a colour variant of the flesh so the column reads as ribbed at distance (the ridges are what make a green cylinder a cactus in silhouette) and so a cut cactus exposes paler flesh under a darker skin.",
+      "id": "cactus_rib",
+      "footstep": "path",
+      "class": "solid",
+      "density": 760,
+      "hardness": 18,
+      "rubble": "dust",
+      "//colors": "Darker and yellower than the flesh: the shadowed groove between ribs plus the straw colour of the spine clusters riding on it, averaged, since one voxel is 10 cm and holds several areoles.",
+      "colors": [
+        "#3a6440",
+        "#325636",
+        "#6f7a45"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Crown bloom on a saguaro and the flower on a barrel cactus. Passable: it is a soft blossom sitting on top of a hard column, and the column beneath it is what actually blocks you.",
+      "id": "cactus_bloom",
+      "passable": true,
+      "class": "solid",
+      "density": 230,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Waxy cream-white with a yellow throat, the saguaro's real flower. Bright against the blue-green column on purpose: a blooming crown is what makes one cactus in a field read as the subject.",
+      "colors": [
+        "#f5edd2",
+        "#e8dcbb",
+        "#ffe9a8"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Low woody desert brush (creosote/sage). Passable, because the desert's readable feature is open ground you can cross, and a field of knee-high blocking cubes would turn it into a maze. Still an ordinary solid for the CA, the brush, fire and the laser.",
+      "id": "desert_scrub",
+      "passable": true,
+      "footstep": "branch",
+      "class": "solid",
+      "density": 250,
+      "hardness": 4,
+      "rubble": "dust",
+      "//colors": "Grey-green, dusty, nearly leafless, and deliberately close in VALUE to the sand it stands on. Desert brush does not contrast with the ground; authoring it at foliage saturation makes a desert look like a lawn with gaps. This is also the LOD colour, so it is the model average.",
+      "colors": [
+        "#6b7350",
+        "#5c6446",
+        "#7d855e"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/desert_scrub.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Dry bunchgrass tussock: the desert's answer to grass_tuft, and the species that does most of the work of making bare sand read as a place rather than a texture. Two flipbook frames so it moves in the wind exactly like the meadow tufts do.",
+      "id": "dry_tussock",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 190,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Bleached straw. This is the LOD colour too, so it has to be the model's AVERAGE over a mostly-empty cell of thin blades: pale and slightly warm, never the saturated gold a single blade would be.",
+      "colors": [
+        "#b8a066",
+        "#a68e58",
+        "#cbb47c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/dry_tussock.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 30
+          },
+          {
+            "model": 1,
+            "ticks": 30
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "The conifer-floor shrub: huckleberry and juniper, one material doing both jobs because at 10 cm a cell they differ by colour and habit rather than by shape. This is what fills the bare ground under a pine stand, which otherwise generates as nothing but needles and stone.",
+      "id": "heath_shrub",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 270,
+      "hardness": 4,
+      "rubble": "dust",
+      "//colors": "Dark blue-green, the value a shrub sitting in conifer shade actually has, but LIGHTER than pine_needles above it so the floor separates from the canopy instead of merging into one dark mass. The third variant carries the berry/juniper read.",
+      "colors": [
+        "#2f5c3c",
+        "#274d33",
+        "#43604d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/heath_shrub.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Alpine cushion plant, above the treeline. One material covering the whole hardy-alpine read: a tight moss cushion with a few tiny flowers in it, and at its flattest placement the lichen crust on exposed rock. Deliberately the ONLY thing that grows up there and deliberately sparse: the snowline is meant to read as harsh, and a densely planted ridge would say the opposite.",
+      "id": "alpine_cushion",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 220,
+      "hardness": 3,
+      "rubble": "dust",
+      "//colors": "Olive-grey-green with a pink-flowered variant. Against SNOW almost anything reads as a dark speck, so the value is pushed up from what a moss cushion would be at ground level: a correctly-dark cushion on white snow is a hole, not a plant.",
+      "colors": [
+        "#6d7a55",
+        "#5b6748",
+        "#9c7086"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/alpine_cushion.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "VINES AND CLIMBERS (worldgen only). The layer that makes a forest feel enclosed: strands hanging out of the canopy, beards on the ancient trees, ivy up the boles and over the ruin walls. Every one is an INERT solid placed once at generation, exactly like the forest and pond sets and for the same reason - material 22 'vine' is the REACTIVE garden vine, and painting a forest with it would keep every chunk awake forever (CLAUDE.md rule 2). They carry the organic/flammable tags, so fire, acid, mites and the laser treat them as the living things they are.",
+      "//passable": "All four are passable: you push through a curtain of vines rather than walking into an invisible wall. They stay real destructible solids for the CA, the brush and the renderer - passable only remaps the CPU collision class (see kMatFlagPassable).",
+      "id": "vine_hang",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 300,
+      "hardness": 4,
+      "rubble": "dust",
+      "//colors": "Read almost always against backlit canopy or deep shade, so these are a mid green pulled slightly toward blue-grey - a vine authored at leaf-green disappears into the foliage it hangs from instead of hanging in front of it.",
+      "colors": [
+        "#3f7a41",
+        "#356839",
+        "#4d8f4e"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/vine_hang.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 41
+          },
+          {
+            "model": 1,
+            "ticks": 41
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Flowering creeper: the same hanging strand carrying a trumpet bloom every few cells. Placed on a minority of vine columns, gated on the SAME column roll as the vine itself, so a flower can only appear where a strand actually grew - the lilypad/blossom precedent.",
+      "id": "creeper_flower",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 280,
+      "hardness": 3,
+      "rubble": "dust",
+      "//colors": "Model average: mostly the same vine green, lifted toward pink by the blooms it carries. Kept close to vine_hang on purpose - the flowers should be a detail you find on a strand, not a colour that repaints the whole curtain at distance.",
+      "colors": [
+        "#6b7c4a",
+        "#7e6d63",
+        "#8f7a6d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/creeper_flower.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 47
+          },
+          {
+            "model": 1,
+            "ticks": 47
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Spanish-moss beard, on the great oaks and the birches only. Not a strand hanging off the canopy but a fuzz clinging to the structure, which is what makes an old forest read as damp rather than merely green. Static (no flipbook) deliberately - it is placed densely and a beard reads as fuzz whether it moves or not.",
+      "id": "moss_hang",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 180,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Desaturated grey-green, the colour of a lichen rather than a leaf. This separation from leaves/vine_hang is the entire read: a beard the same green as the canopy it hangs under is invisible, and moss is one of the few plants that is genuinely grey in life.",
+      "colors": [
+        "#8a9a7c",
+        "#79876c",
+        "#9caf8d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/moss_hang.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Ivy: the one climber here that goes UP. Grows on a thin shell just outside a tree bole and over the arena and ruin stone walls, thinning toward the top so it reads as having climbed rather than been painted on. Its micro model is pressed flat against one cell face for the same reason.",
+      "id": "ivy",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 310,
+      "hardness": 4,
+      "rubble": "dust",
+      "//colors": "Darker and bluer than leaves. Ivy is seen against bark and grey stone rather than against sky, so it needs to be dark to read as a plant on a wall instead of as moss-coloured masonry.",
+      "colors": [
+        "#2f5f34",
+        "#28502c",
+        "#3b7440"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/ivy.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "SHORELINE SET (worldgen only). The wet fringe OUTSIDE a pond disc -- the band that used to go straight from water to the same plain grass as a hillside a kilometre inland. Like the aquatic set above, every one of these is an ORDINARY INERT SOLID with no reaction rule of its own: rule 2 says a settled shore has to sleep, and anything that spread or reacted on contact with the water it stands next to would keep every pond chunk awake forever. They are scenery.",
+      "id": "shore_mud",
+      "footstep": "path",
+      "class": "solid",
+      "density": 1450,
+      "hardness": 10,
+      "absorb": {
+        "capacity": 15
+      },
+      "rubble": "dirt",
+      "//colors": "Wet earth, NOT dirt's dry brown: darker, greyer and a touch cooler, because the whole job of this material is to read as damp next to the grass it interrupts. A mud that is merely a darker dirt reads as a shadow on the grass instead of as a different ground.",
+      "colors": [
+        "#4a3d2c",
+        "#3e3325",
+        "#574837"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable",
+        "soil",
+        "wet"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "Broad-leaved sedge tussock: the ground cover of the whole shore band, and the thing that makes the fringe read as marsh rather than as lawn running up to water. Denser and taller than grass_tuft, which is deliberate -- you push through this. Passable, like the pond plants, so walking into the reed bed does not feel like walking into a wall.",
+      "id": "marsh_grass",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 240,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MICRO LOD COLOURS -- the model's average, not its most interesting colour (sim/microvox.h). A sedge cell is all leaf, so this is a straight green; slightly bluer and duller than the upland grass so the shore band is visible as a band from a distance without anything having to draw a line.",
+      "colors": [
+        "#4a7d3c",
+        "#3f6d33",
+        "#5a8f46"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/marsh_grass.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 30
+          },
+          {
+            "model": 1,
+            "ticks": 30
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Cattail / bulrush STALK. Multi-cell: worldgen stacks these from the mud up, capped by cattail_head, so this is a plain material with no micro model -- a micro brick is one CELL and a cattail is twenty. This is the tall silhouette at the waterline, the thing you see before you see the water.",
+      "id": "cattail",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 270,
+      "hardness": 3,
+      "rubble": "dust",
+      "//colors": "Yellower and drier than the reed inside the pond: a cattail stands with its feet wet and its head in the sun, and reading the two species as the same green is what would make the shore look like the pond continued rather than like its edge.",
+      "colors": [
+        "#7d9142",
+        "#6b7d38",
+        "#8fa451"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "The brown seed head that caps a cattail stalk. Its own material rather than a colour variant so worldgen can cap only the top cells and so it keeps its palette without dragging the stalk's average toward brown -- the same reasoning lily_flower is separate from lilypad.",
+      "id": "cattail_head",
+      "passable": true,
+      "class": "solid",
+      "density": 300,
+      "hardness": 3,
+      "rubble": "dust",
+      "colors": [
+        "#6b4526",
+        "#5a381e",
+        "#7d5430"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Horsetail: the segmented mid-height stand that fills between the cattails at the water and the grass further up the bank. Multi-cell like the cattail and for the same reason. Its whole visual identity is that it is a bare jointed stalk with no leaves, so it is the one shore plant that is not green-on-green with its neighbours.",
+      "id": "horsetail",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 250,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Grey-green and slightly glaucous. Horsetails are silica-stiff and read almost blue next to grass, which is exactly the separation this band needs -- three greens at the same saturation would merge into one mush.",
+      "colors": [
+        "#5e7d63",
+        "#4f6b54",
+        "#6f9074"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Water iris / flag: a fan of sword leaves with one violet flower. The rare accent of the shore band -- you should notice one, not a field of them, which is why worldgen rolls it an order of magnitude rarer than the sedge.",
+      "id": "water_iris",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 230,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MICRO LOD COLOURS, so this is the MODEL'S AVERAGE. An iris cell is mostly green sword leaf with a small violet flag on top, so the LOD colour is a blue-green with a faint violet cast -- author it violet and a distant shore reads as a field of purple cubes, which is the exact failure the poppy's note documents.",
+      "colors": [
+        "#4d7a5e",
+        "#436b52",
+        "#5f8a72"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/water_iris.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 38
+          },
+          {
+            "model": 1,
+            "ticks": 38
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Wet moss on the stone at the waterline. A SKIN SWAP on ground that already exists rather than a plant placed above it, so it costs the world nothing: worldgen substitutes it for the stone that would have been the surface cell anyway. NOT passable -- you walk on this, and it is the one shore material that is still solid footing. Distinct from moss_beard (agent B's hanging Spanish moss on the trees), which is a different plant in a different place.",
+      "id": "wet_moss",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 420,
+      "hardness": 6,
+      "absorb": {
+        "capacity": 14
+      },
+      "rubble": "dirt",
+      "//colors": "Saturated and dark, with the yellow-green of moss rather than the blue-green of leaves. Moss on wet rock is the single greenest thing in the world at this scale, and letting it be that is what sells the rocks as damp.",
+      "colors": [
+        "#3f6b28",
+        "#345921",
+        "#4e7f33"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "FOREST UNDERGROWTH SET (worldgen only; ids are array positions). The layer that lives UNDER a closed canopy, as opposed to the grass and flowers that live in the light gaps between crowns: placement is driven by canopy cover in undergrowthSite() (worldgen.wgsl), not by biome. All seven are INERT solids -- no reaction uses them as `self` with an emit -- because worldgen paints them by the million and anything that grew would keep every forest chunk awake forever (CLAUDE.md rule 2). They carry organic/flammable so fire, acid, mites and the laser treat them exactly like the rest of the forest set, which is the point of tagging rather than enumerating.",
+      "id": "fern",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 240,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MICRO LOD COLOURS = the MODEL'S AVERAGE (see flower_poppy). A fern cell is entirely frond, so there is no vivid part to average away -- but it must still be the SHADE green a fern actually is. Ferns live where light does not reach and read darker and bluer than the sunlit grass skin they replace; authoring them at grass green makes the canopy floor look like a lawn with the lights off. Measured average of the generated model: #417e30, darkened.",
+      "colors": [
+        "#38702c",
+        "#2d5e24",
+        "#457f36"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/fern.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 41
+          },
+          {
+            "model": 1,
+            "ticks": 41
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Fly agaric: the red-capped mushroom, placed in a ring around tree boles and rarely in deep shade. Distinct from `fungus` (the pre-existing reactive-garden mauve) because this one is inert scenery and carries a micro model.",
+      "id": "mushroom_cluster",
+      "passable": true,
+      "class": "solid",
+      "density": 300,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE, and the entry where getting it wrong is most visible. A fly-agaric cell is three white stalks carrying three small red caps, so the average is a dusty PINK -- not the saturated cap red. Author the cap colour here and every distant tree base becomes a ring of red cubes, which is exactly the failure flower_poppy documents. Measured average of the generated model: #e08e84.",
+      "colors": [
+        "#dc8d84",
+        "#c87a72",
+        "#e8a099"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/mushroom_cluster.vox",
+        "subdiv": 8,
+        "frames": [
+          {
+            "model": 0,
+            "ticks": 55
+          },
+          {
+            "model": 1,
+            "ticks": 55
+          }
+        ],
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Pale toadstools: the COMMON ring around a bole, with the red fly agaric as the rarer accent among them. Short on purpose -- these are placed by the thousand around every trunk, and anything knee-high there would read as a fence around every tree.",
+      "id": "toadstool_pale",
+      "passable": true,
+      "class": "solid",
+      "density": 300,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE: white stalks under mauve `fungus` caps, so a pale lilac-grey. Measured: #bd99c7.",
+      "colors": [
+        "#b895c2",
+        "#a684b0",
+        "#c9a8d1"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/toadstool_pale.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "The damp carpet of a shaded floor, one to two micro-voxels tall and ~20% bare so the ground shows through -- a moss model that filled its cell would render exactly like the grass voxel it replaced, which is the failure the whole micro system exists to avoid. Distinct from wet_moss (waterline skin swap on stone) and moss_hang (Spanish moss on the trees): three plants, three places.",
+      "id": "moss_patch",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 260,
+      "hardness": 2,
+      "absorb": {
+        "capacity": 10
+      },
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE, and moss is the one plant here allowed to be VIVID: moss on a shaded floor is the most saturated green at this scale and the model is a solid carpet of it, so the average IS the colour. Measured: #3f9b32.",
+      "colors": [
+        "#3d9630",
+        "#328028",
+        "#4aab3c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/moss_patch.vox",
+        "subdiv": 8,
+        "yawVariants": true
+      }
+    },
+    {
+      "//": "A tree seedling waiting for a light gap. Deliberately RARE in worldgen: unlike everything else in this layer a sapling is a recognisable tree, so the eye finds it, and one every few metres reads as a nursery rather than a forest. It is also the entry that must never gain a growth reaction -- a sapling that grew into a tree is precisely the reaction-driven growth rule 2 forbids, and the one material here where that would be a tempting idea.",
+      "id": "sapling",
+      "passable": true,
+      "footstep": "branch",
+      "class": "solid",
+      "density": 350,
+      "hardness": 4,
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE: a bare wood stem for its lower half with a small leaf crown on top, so a brown-tinged olive rather than a leaf green. Measured: #5a6b30.",
+      "colors": [
+        "#5c6d32",
+        "#4d5c2a",
+        "#6d7f3e"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/sapling.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Thorny canes, in the HALF-lit margin rather than the deep shade -- a bramble is the plant of a woodland edge and a light gap, so worldgen gates it below the deep-cover threshold. Passable like the rest of the layer: brambles that blocked the player would make every forest edge a wall, and there is no `slows you down` short of one.",
+      "id": "bramble",
+      "passable": true,
+      "footstep": "branch",
+      "class": "solid",
+      "density": 320,
+      "hardness": 4,
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE: mostly woody-green cane with a couple of leaves caught in it. Measured: #497d34.",
+      "colors": [
+        "#4a7d34",
+        "#3d6a2b",
+        "#5a9241"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/bramble.vox",
+        "subdiv": 8,
+        "yawVariants": true,
+        "jitter": true
+      }
+    },
+    {
+      "//": "Fallen leaves and twigs: ONE micro-voxel tall, the cheapest and commonest cover in the layer and the last rule in the chain, so it fills whatever the plants above it did not take. It is also what feathers the canopy edge -- a thinning scatter of litter reaching past the crown rim stops the undergrowth and the flower meadow meeting on a visible seam.",
+      "id": "leaf_litter",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 280,
+      "hardness": 1,
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE of a flat layer of leaves with a few twigs through it, warmed toward brown by hand. Kept duller than `leaves`: this is FALLEN foliage, and authoring it at canopy green makes the floor read as a second, lower canopy. Measured: #4a7730.",
+      "colors": [
+        "#5c7434",
+        "#4d632b",
+        "#6d8440"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "model": "microvox/leaf_litter.vox",
+        "subdiv": 8,
+        "yawVariants": true
+      }
     }
   ]
 }

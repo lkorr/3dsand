@@ -1023,6 +1023,27 @@ struct Tuning {
     int lilyChance = 22, lilyFlowerChance = 5;
     int reedChance = 130, reedHeight = 16;
     int kelpChance = 120, kelpHeight = 10;
+    // Shoreline: the wet fringe OUTSIDE the pond disc, which used to go
+    // straight from water to plain hillside grass. shoreBand is how many
+    // voxels past the rim the fringe reaches AND the sole cost knob for
+    // shoreAt() — it is the width of the tile-edge strip where a column has to
+    // consult a second pond tile, so it must stay well under pondTile.
+    // shoreMudWidth is the (shorter) inner ring where the ground skin becomes
+    // wet mud instead of grass. The rest are 1-in-N placement rolls per shore
+    // column, same inert-solid contract as the pond vegetation above.
+    int shoreBand = 24, shoreMudWidth = 10;
+    // shoreLift is the VERTICAL half of the band: how far above the waterline
+    // a column may stand and still be shore. pondSurface is min(rim) - 2, so
+    // most of a rim is well above the water and a fringe cut by radius alone
+    // paints marsh up the abutting hillside; cutting on height instead puts
+    // the reed beds in the shallow bays. High leverage — at the default pond
+    // it keeps 5% of the raw band at 4 and 99% at 24.
+    int shoreLift = 12;
+    int shoreCattailChance = 12, shoreCattailReach = 9, shoreCattailHeight = 20;
+    int shoreSedgeChance = 4;
+    int shoreHorsetailChance = 10, shoreHorsetailHeight = 9;
+    int shoreIrisChance = 34;
+    int shoreMossChance = 3;         // 1-in-N wet stone faces wear moss
     // Vines, climbers and hanging moss. Same shape as the pond vegetation and
     // for the same reason: a 1-in-N roll per candidate COLUMN (never per cell,
     // or the strands come out dashed), placing inert solids once at

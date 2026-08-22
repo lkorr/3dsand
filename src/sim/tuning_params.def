@@ -390,6 +390,32 @@ TP_I(worldgen, ivyTwist, TUNE_IVY_TWIST, 5)
 // coverage always falls off toward the top of the wall so the coping stays
 // clear and the creeper reads as having climbed rather than been painted.
 TP_U(worldgen, wallIvyDensity, TUNE_WALL_IVY_DENSITY, 3)
+// ---- shoreline: the wet fringe outside a pond ----
+// RESTORED by agent E: these ten rows were dropped from this file during a
+// concurrent rollback while their declarations stayed in tuning.h and their
+// TUNE_* names stayed referenced by worldgen.wgsl. That combination passes
+// check_invariants' .h side and still fails tint with "unresolved value
+// TUNE_SHORE_BAND", which invalidates the worldgen pipeline and makes EVERY
+// gate fail as a determinism regression. Defaults below are read straight off
+// the declarations in tuning.h so they cannot disagree with it.
+TP_I(worldgen, shoreBand, TUNE_SHORE_BAND, 24)
+TP_I(worldgen, shoreMudWidth, TUNE_SHORE_MUD_WIDTH, 10)
+// How far ABOVE the waterline a column may stand and still count as shore, in
+// voxels. The most load-bearing knob in the feature: pondSurface is
+// min(rim) - 2, so most of a rim stands well above the water, and a fringe
+// defined by radius alone paints marsh up whatever hillside abuts the disc.
+// Cutting on height instead puts the reed beds in the shallow bays and leaves
+// the steep sides as dry bank. It moves coverage a long way — at the default
+// pond it keeps 5% of the raw band at 4 and 99% at 24.
+TP_I(worldgen, shoreLift, TUNE_SHORE_LIFT, 12)
+TP_U(worldgen, shoreCattailChance, TUNE_SHORE_CATTAIL_CHANCE, 12)
+TP_I(worldgen, shoreCattailReach, TUNE_SHORE_CATTAIL_REACH, 9)
+TP_I(worldgen, shoreCattailHeight, TUNE_SHORE_CATTAIL_HEIGHT, 20)
+TP_U(worldgen, shoreSedgeChance, TUNE_SHORE_SEDGE_CHANCE, 4)
+TP_U(worldgen, shoreHorsetailChance, TUNE_SHORE_HORSETAIL_CHANCE, 10)
+TP_I(worldgen, shoreHorsetailHeight, TUNE_SHORE_HORSETAIL_HEIGHT, 9)
+TP_U(worldgen, shoreIrisChance, TUNE_SHORE_IRIS_CHANCE, 34)
+TP_U(worldgen, shoreMossChance, TUNE_SHORE_MOSS_CHANCE, 3)
 // ---- desert / pine highland / alpine ground cover (worldgen agent E) ----
 // The three biomes that generated bare. All of these are 1-in-N per column
 // inside the relevant mask, or a percentage where noted, and every one of them
@@ -420,6 +446,10 @@ TP_I(worldgen, heathPatch, TUNE_HEATH_PATCH, 128)
 // planted at forest-floor density says the opposite. Raising this is the one
 // knob that can undo the whole intent of the alpine band.
 TP_U(worldgen, alpineChance, TUNE_ALPINE_CHANCE, 40)
+// RESTORED by agent E along with the shore rows above: these three were also
+// lost from this file during the concurrent rollback while their declarations
+// stayed in tuning.h, which is the combination that fails tint at
+// "unresolved value TUNE_CAVE_THRESHOLD1" rather than at compile time.
 TP_U(worldgen, ruinChance, TUNE_RUIN_CHANCE, 5)
 TP_U(worldgen, caveThreshold1, TUNE_CAVE_THRESHOLD1, 150)
 TP_U(worldgen, caveThreshold2, TUNE_CAVE_THRESHOLD2, 148)

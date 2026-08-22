@@ -1097,6 +1097,17 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "reedHeight", w.reedHeight, out, at);
     ReadI(*g, "kelpChance", w.kelpChance, out, at);
     ReadI(*g, "kelpHeight", w.kelpHeight, out, at);
+    ReadI(*g, "shoreBand", w.shoreBand, out, at);
+    ReadI(*g, "shoreMudWidth", w.shoreMudWidth, out, at);
+    ReadI(*g, "shoreLift", w.shoreLift, out, at);
+    ReadI(*g, "shoreCattailChance", w.shoreCattailChance, out, at);
+    ReadI(*g, "shoreCattailReach", w.shoreCattailReach, out, at);
+    ReadI(*g, "shoreCattailHeight", w.shoreCattailHeight, out, at);
+    ReadI(*g, "shoreSedgeChance", w.shoreSedgeChance, out, at);
+    ReadI(*g, "shoreHorsetailChance", w.shoreHorsetailChance, out, at);
+    ReadI(*g, "shoreHorsetailHeight", w.shoreHorsetailHeight, out, at);
+    ReadI(*g, "shoreIrisChance", w.shoreIrisChance, out, at);
+    ReadI(*g, "shoreMossChance", w.shoreMossChance, out, at);
     ReadI(*g, "vineChance", w.vineChance, out, at);
     ReadI(*g, "vineLenMin", w.vineLenMin, out, at);
     ReadI(*g, "vineLenSpan", w.vineLenSpan, out, at);
@@ -1150,6 +1161,43 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "pond; clamped to 34");
       w.pondDepth = 34;
     }
+    // Shoreline knobs. Every "chance" is a modulo divisor (zero is a
+    // div-by-zero in the shader); the band has two ceilings of its own.
+    atLeast("shoreBand", w.shoreBand, 0);      // 0 legally disables the fringe
+    atLeast("shoreMudWidth", w.shoreMudWidth, 0);
+    atLeast("shoreLift", w.shoreLift, 0);
+    atLeast("shoreCattailChance", w.shoreCattailChance, 1);
+    atLeast("shoreCattailHeight", w.shoreCattailHeight, 1);
+    atLeast("shoreSedgeChance", w.shoreSedgeChance, 1);
+    atLeast("shoreHorsetailChance", w.shoreHorsetailChance, 1);
+    atLeast("shoreHorsetailHeight", w.shoreHorsetailHeight, 1);
+    atLeast("shoreIrisChance", w.shoreIrisChance, 1);
+    atLeast("shoreMossChance", w.shoreMossChance, 1);
+    // shoreAt() resolves the distance past the rim by 8 steps of bisection over
+    // [0, shoreBand], which is exact only while the band fits in 2^8.
+    if (w.shoreBand > 255) {
+      out.warnings.push_back(
+          "worldgen.shoreBand > 255 exceeds shoreAt's 8-step bisection; "
+          "clamped to 255");
+      w.shoreBand = 255;
+    }
+    // shoreAt() checks the column's own pond tile plus AT MOST one neighbour
+    // per axis, which is only sound while a column can be within `band` of one
+    // tile edge at a time. Past pondTile/2 - 1 both edges of the same axis are
+    // in reach and the far side's pond would be missed — a marsh sliced off
+    // flat along a tile boundary. Half the tile is already absurdly wide
+    // (224 voxels at the default), so this never bites real tunings.
+    if (w.shoreBand > w.pondTile / 2 - 1) {
+      out.warnings.push_back(
+          "worldgen.shoreBand must stay under half of pondTile for shoreAt's "
+          "2x2 tile scan; clamped");
+      w.shoreBand = w.pondTile / 2 - 1;
+      if (w.shoreBand < 0) w.shoreBand = 0;
+    }
+    // The mud ring lives inside the band; a wider one would just be clipped
+    // silently, which reads as "shoreMudWidth stopped doing anything".
+    if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
+    if (w.shoreCattailReach > w.shoreBand) w.shoreCattailReach = w.shoreBand;
     atLeast("ruinChance", w.ruinChance, 1);
     atLeast("autumnFraction", w.autumnFraction, 1);
     // Vine/moss/ivy knobs: every "chance" is a modulo divisor and every "span"
