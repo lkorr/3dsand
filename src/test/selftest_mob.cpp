@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "game/avatar.h"
+#include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/camera.h"
 #include "game/player.h"
@@ -1435,6 +1436,74 @@ bool mobOk = false;
             "hips held %.1f deg)\n",
             lookOk ? "PASS" : "FAIL", headPos, headNeg, hipsYaw);
         mobOk = mobOk && lookOk;
+
+        // ---- body facing policy (ResolveAvatarHeading) ----
+        // Driven directly rather than through the frame loop, which is the
+        // point of having pulled it out of main.cpp: both bugs this policy has
+        // had were invisible to every gate because it only ran while
+        // rendering. Pure function, so a few hundred simulated ticks cost
+        // nothing.
+        const float kDt = kTickDt;
+        const float kWalk = 5.0f / kVoxelMeters;   // 5 m/s, comfortably moving
+        auto degOf = [](float rad) { return rad * 57.29578f; };
+        auto wrapDeg = [](float d) {
+          while (d > 180.0f) d -= 360.0f;
+          while (d < -180.0f) d += 360.0f;
+          return d;
+        };
+
+        // 1. THIRD PERSON SQUARES UP TO THE RUN, with no cone slack. Running
+        //    due +X while the camera looks somewhere else entirely must still
+        //    point the body at +X — "forward should always face the way they
+        //    are running".
+        float h3 = 0.0f;
+        const float camAway = 2.2f;   // camera pointed well off the travel dir
+        for (int i = 0; i < 400; i++)
+          h3 = ResolveAvatarHeading(CameraMode::Third, camAway, h3,
+                                    Vec3{kWalk, 0, 0}, kDt);
+        // heading convention: forward is (sin h, ., cos h), so +X is pi/2.
+        const float runErr3 = std::fabs(wrapDeg(degOf(h3) - 90.0f));
+        bool facesRun = runErr3 < 5.0f;
+
+        // 2. FIRST PERSON RECENTRES WHILE WALKING. Start the body 60 deg off
+        //    the view — inside the 70 deg cone, so the old code zeroed the
+        //    turn and the facing froze here forever, taking the arms with it.
+        //    Walking must converge it back toward the view.
+        const float camF = 0.0f;
+        float hFroze = 60.0f / 57.29578f;
+        for (int i = 0; i < 400; i++)
+          hFroze = ResolveAvatarHeading(CameraMode::First, camF, hFroze,
+                                        Vec3{kWalk, 0, 0}, kDt);
+        const float driftErr = std::fabs(wrapDeg(degOf(hFroze)));
+        bool recentres = driftErr < 15.0f;
+
+        // 3. STANDING STILL IT DOES NOT. That is the glance, and it is the
+        //    whole feature — a body that squares up while you stand there
+        //    would make every look a turn again.
+        float hStand = 60.0f / 57.29578f;
+        for (int i = 0; i < 400; i++)
+          hStand = ResolveAvatarHeading(CameraMode::First, camF, hStand,
+                                        Vec3{}, kDt);
+        const float standDeg = std::fabs(wrapDeg(degOf(hStand)));
+        bool holdsGlance = standDeg > 45.0f;
+
+        // 4. PAST THE CONE THE BODY IS DRAGGED even standing still, so the
+        //    neck is never asked for more than it has. 140 deg is well beyond
+        //    the 70 deg cone; the body must close to about the cone and stop.
+        float hFar = 140.0f / 57.29578f;
+        for (int i = 0; i < 400; i++)
+          hFar = ResolveAvatarHeading(CameraMode::First, camF, hFar, Vec3{},
+                                      kDt);
+        const float farDeg = std::fabs(wrapDeg(degOf(hFar)));
+        bool draggedToCone = farDeg > 55.0f && farDeg < 85.0f;
+
+        bool faceOk = facesRun && recentres && holdsGlance && draggedToCone;
+        std::printf(
+            "avatar body facing: %s (3rd person run +X -> %.1f deg off; 1st "
+            "person 60 deg off recentres to %.1f walking, holds %.1f standing; "
+            "140 deg dragged to %.1f (cone 70))\n",
+            faceOk ? "PASS" : "FAIL", runErr3, driftErr, standDeg, farDeg);
+        mobOk = mobOk && faceOk;
 
         // Reported separately from `avatar` so a gait-look regression and a
         // footstep-plumbing regression never hide behind one another.

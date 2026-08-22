@@ -257,6 +257,15 @@ struct Tuning {
     // keeps the head from stepping with the raw mouse; the body's own
     // firstPersonTurnHalflife sits behind it.
     float headLookHalflife = 0.07f;
+    // Half-life (seconds) of the FIRST-PERSON body squaring back up to the
+    // view while the player WALKS. Without this the head-look cone is a drift
+    // trap: inside the cone the body's turn is dropped to zero, so its facing
+    // is never driven back to anything and it freezes wherever the last big
+    // turn left it — with the arms welded to the torso, they end up stuck
+    // pointing off-view while you walk somewhere else. Standing still there is
+    // deliberately no recentring; that is the glance. Longer feels looser;
+    // 0 squares the body up immediately whenever you move.
+    float headLookRecenterHalflife = 0.35f;
     // Half-life (seconds) of the leg IK fading in and out as the gait starts
     // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
     // body really does leave the surface cresting each bump — and switching the

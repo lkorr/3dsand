@@ -1743,82 +1743,16 @@ int main(int argc, char** argv) {
         // so h = pi/2 - yaw. Getting this wrong makes the avatar face 90
         // degrees off its travel direction.
         const float camHeading = 1.5707963f - cam.yaw;
-        float wantHeading = camHeading;
-        if (camMode != CameraMode::First) {
-          Vec3 v{player.vel.x, 0, player.vel.z};
-          float sp = v.len() * kVoxelMeters;   // voxels/s -> m/s
-          if (sp > av.turnMinSpeed) wantHeading = std::atan2(v.x, v.z);
-          else wantHeading = avatarHeading;    // too slow: hold, don't spin
-        }
-        // Shortest-arc turn toward the goal, rate-limited.
-        float d = wantHeading - avatarHeading;
-        while (d > 3.14159265f) d -= 6.2831853f;
-        while (d < -3.14159265f) d += 6.2831853f;
-
-        // THE NECK ABSORBS THE FIRST 70 DEGREES.
-        //
-        // Turning the whole body the instant the mouse moves is what makes a
-        // character read as a turret: every glance pivots the feet, and in
-        // first person it also drags the arms (and a held sword) across the
-        // screen for a look you only meant with your eyes. Real bodies do it
-        // the other way round — the head leads, and the body is recruited only
-        // once the neck runs out.
-        //
-        // So the body's goal is not "face the camera", it is "keep the camera
-        // within headLookYaw of my facing". Inside the cone the requested turn
-        // is dropped to zero and the head takes all of it (PlayerAvatar::
-        // SetLook, fed below); outside, only the EXCESS is requested, so the
-        // body follows exactly as far as it must and the head sits pinned at
-        // its stop for the rest of the sweep.
-        //
-        // Stated as a geometric constraint rather than as an enter/exit state,
-        // which is what keeps it from chattering at the boundary: there is no
-        // edge to cross twice, just a residual that is zero inside the cone.
-        //
-        // FIRST PERSON ONLY. The cone is a rule about lagging the CAMERA, and
-        // it is only correct where the camera is what the body is trying to
-        // face. In third person the goal is the TRAVEL DIRECTION, and lagging
-        // that is simply wrong: holding W has to point the character where
-        // they are running, every time, with no 70-degree slack. An earlier
-        // version applied the residual in both modes on the theory that
-        // camera-relative movement collapses the head-body offset to zero
-        // while walking — true, but the fix for "the head never glances while
-        // running" cannot be "the body stops facing where it runs". Running
-        // forward SHOULD square the body to the direction of travel; the head
-        // then glances off that, which is exactly what the offset below
-        // computes once the body has turned.
-        const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
-        if (camMode == CameraMode::First && headCone > 1e-3f) {
-          if (d > headCone) d -= headCone;
-          else if (d < -headCone) d += headCone;
-          else d = 0.0f;
-        }
-        // FIRST PERSON EASES ON A SHORT HALF-LIFE, NOT ON turnRate.
-        //
-        // The third-person rate limit exists so the body pivots on its feet
-        // instead of snapping to face its travel direction, and applying that
-        // same 12 rad/s limit in first person is wrong for the reason it always
-        // was: the torso ends up yawed away from the view for most of a fast
-        // mouse turn, with the arms welded to it, hanging off one side of the
-        // screen. But snapping outright is not right either — the arms ARE
-        // on-screen, so an instant yaw step moves them across the view in a
-        // hard jump every tick you turn, which is a visible part of the "hands
-        // move like crazy" report.
-        //
-        // A half-life is the right shape for this where a rate limit is not: it
-        // is proportional, so a small turn is followed almost exactly (no
-        // perceptible lag) while a fast flick is smeared over a few ticks
-        // instead of stepping. Set the knob to 0 to get the old hard snap back.
-        if (camMode == CameraMode::First) {
-          const float hl = av.firstPersonTurnHalflife;
-          if (hl > 1e-4f)
-            avatarHeading += d * (1.0f - std::pow(0.5f, kTickDt / hl));
-          else
-            avatarHeading = wantHeading;
-        } else {
-          float maxStep = av.turnRate * kTickDt;
-          avatarHeading += std::clamp(d, -maxStep, maxStep);
-        }
+        // WHERE THE BODY FACES is a policy, not a rig property, and it now
+        // lives in ResolveAvatarHeading (game/thirdperson.h) rather than
+        // inline here. It was moved because both bugs it has had — an inverted
+        // glance, and a dead zone with no restoring term that froze the arms
+        // off-view — were invisible to every gate, for the simple reason that
+        // the policy only ever ran inside this render loop. It is pure, so the
+        // selftest can drive it directly.
+        avatarHeading = ResolveAvatarHeading(
+            camMode, camHeading, avatarHeading,
+            Vec3{player.vel.x, 0, player.vel.z}, kTickDt);
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:

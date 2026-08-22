@@ -27,6 +27,57 @@ const char* CameraModeName(CameraMode m) {
   }
 }
 
+float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
+                           Vec3 planarVel, float dt) {
+  const auto& av = CurrentTuning().avatar;
+  const float sp = planarVel.len() * kVoxelMeters;   // voxels/s -> m/s
+  const bool moving = sp > av.turnMinSpeed;
+
+  float wantHeading = camHeading;
+  if (mode != CameraMode::First) {
+    // Face where you RUN. Below the threshold hold the current facing rather
+    // than chasing a near-zero velocity vector, which would spin on the spot.
+    wantHeading = moving ? std::atan2(planarVel.x, planarVel.z) : heading;
+  }
+
+  float d = wantHeading - heading;
+  while (d > 3.14159265f) d -= 6.2831853f;
+  while (d < -3.14159265f) d += 6.2831853f;
+
+  // THE NECK ABSORBS THE FIRST headLookYaw DEGREES (first person only).
+  //
+  // The cone kills the SNAP, not the convergence. Zeroing `d` inside it
+  // outright makes the facing a value nothing ever drives back, so it freezes
+  // wherever the last big turn left it — and the arms, welded to the torso,
+  // freeze with it. Hence the recentre term while walking.
+  const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
+  if (mode == CameraMode::First && headCone > 1e-3f) {
+    const float excess = std::max(0.0f, std::fabs(d) - headCone);
+    const float sign = d < 0 ? -1.0f : 1.0f;
+    float want = sign * excess;      // past the cone: dragged by the excess
+    if (moving) {                    // inside it: square up while walking
+      const float hl = av.headLookRecenterHalflife;
+      const float rk = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
+      want += (d - sign * excess) * rk;
+    }
+    d = want;
+  }
+
+  // First person eases on a short half-life; third person is rate-limited so
+  // the body visibly pivots on its feet instead of snapping.
+  float out = heading;
+  if (mode == CameraMode::First) {
+    const float hl = av.firstPersonTurnHalflife;
+    out += hl > 1e-4f ? d * (1.0f - std::pow(0.5f, dt / hl)) : d;
+  } else {
+    const float maxStep = av.turnRate * dt;
+    out += std::clamp(d, -maxStep, maxStep);
+  }
+  while (out > 3.14159265f) out -= 6.2831853f;
+  while (out < -3.14159265f) out += 6.2831853f;
+  return out;
+}
+
 void ThirdPersonRig::Update(float dt, CameraMode mode, const Camera& cam,
                             Vec3 focusWorld, const AvatarLocomotion& loco,
                             const World& world,

@@ -419,6 +419,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     a.headLookSpine = std::clamp(a.headLookSpine, 0.0f, 1.0f);
     ReadF(*g, "headLookHalflife", a.headLookHalflife, out, at);
     a.headLookHalflife = std::clamp(a.headLookHalflife, 0.0f, 1.0f);
+    ReadF(*g, "headLookRecenterHalflife", a.headLookRecenterHalflife, out, at);
+    a.headLookRecenterHalflife =
+        std::clamp(a.headLookRecenterHalflife, 0.0f, 3.0f);
     ReadF(*g, "ikBlendHalflife", a.ikBlendHalflife, out, at);
     ReadF(*g, "airDebounce", a.airDebounce, out, at);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);

@@ -66,6 +66,7 @@
     "headLookPitchDown": 60,
     "headLookSpine": 0.25,
     "headLookHalflife": 0.07,
+    "headLookRecenterHalflife": 0.35,
     "ikBlendHalflife": 0.08,
     "airDebounce": 0.12,
     "firstPersonArms": true,
