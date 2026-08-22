@@ -145,6 +145,8 @@ void PlayerAvatar::ResolveParts() {
   parts_.handR = sk.FindPart("hand.R");
   parts_.armUL = sk.FindPart("armU.L");
   parts_.armUR = sk.FindPart("armU.R");
+  parts_.armLL = sk.FindPart("armL.L");
+  parts_.armLR = sk.FindPart("armL.R");
   parts_.footL = sk.FindPart("foot.L");
   parts_.footR = sk.FindPart("foot.R");
   parts_.legUL = sk.FindPart("legU.L");
@@ -1203,19 +1205,29 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       // instead of a head swivelling on a rigid torso. The head then only
       // needs the REMAINDER — it inherits the spine's share through the
       // flatten, so adding the full yaw at both joints would double it.
+      //
+      // THE ROOT LIMB IS NOT PART OF THE SPINE FOR THIS PURPOSE, even though
+      // it carries the "spine" tag. On mina the tag is on BOTH `hips` and
+      // `torso`, and hips is rootLimb — so rotating it yaws the entire rig,
+      // legs and all, rather than twisting the chest. That is not a subtle
+      // wrongness: the head turns with the body it is measured against, which
+      // reads on screen as the head not turning at all, which is exactly the
+      // bug this excludes. The tag means "part of the back" to the gait's
+      // counter-rotation, which wants the root; a look twist wants only the
+      // joints ABOVE it.
       const float spineShare = av.headLookSpine;
       float spineTotal = 0;
       if (spineShare > 1e-4f) {
         int nSpine = 0;
         for (size_t i = 0; i < sk.parts.size(); i++)
-          if (sk.parts[i].tag == "spine") nSpine++;
+          if (sk.parts[i].tag == "spine" && (int)i != def_->rootLimb) nSpine++;
         if (nSpine > 0) {
           // Split across however many spine joints the rig has, so a rig with
           // a three-segment back twists the same TOTAL amount as one with a
           // single torso rather than three times as far.
           const float per = lookYaw_ * spineShare / (float)nSpine;
           for (size_t i = 0; i < sk.parts.size(); i++) {
-            if (sk.parts[i].tag != "spine") continue;
+            if (sk.parts[i].tag != "spine" || (int)i == def_->rootLimb) continue;
             if (i < st.partAlive.size() && !st.partAlive[i]) continue;
             st.local[i].rot = QuatNormalize(
                 Mul(st.local[i].rot, AxisAngle({0, 1, 0}, -per)));

@@ -900,6 +900,65 @@ bool mobOk = false;
         phys.RemoveBody(avProxy);
         bool noSelfPush = selfPush < 0.001f;
 
+        // ---- head look (PlayerAvatar::SetLook) ----
+        // The head must turn RELATIVE TO THE BODY. Both halves of that matter
+        // and the first version of this feature got the second one wrong: it
+        // twisted every part tagged "spine", and on mina that tag is on `hips`
+        // — the ROOT limb — so the whole rig yawed together. The head moved in
+        // world space, the body moved with it, and on screen nothing turned at
+        // all. Measuring the head against the HIPS rather than against the
+        // world is what makes that failure visible here.
+        //
+        // Body heading is held at 0 throughout (avTick passes it), so any
+        // head-vs-hips angle is the look and nothing else.
+        auto yawOf = [&](int part) {
+          Vec3 p;
+          Quat q;
+          if (!avatar.PartWorldTransform(part, p, q)) return 0.0f;
+          // Model +Z is forward; project the part's forward onto the ground
+          // plane and read its bearing.
+          Vec3 f = QuatRotate(q, Vec3{0, 0, 1});
+          return std::atan2(f.x, f.z) * 57.29578f;
+        };
+        auto relHeadYaw = [&]() {
+          float d = yawOf(avatar.Parts().head) - yawOf(avatar.Parts().hips);
+          while (d > 180.0f) d -= 360.0f;
+          while (d < -180.0f) d += 360.0f;
+          return d;
+        };
+        pl.vel = Vec3{};
+        // Settle at neutral so the measurement starts from a known zero
+        // rather than from wherever the walk loop above left the neck.
+        avatar.SetLook(0.0f, 0.0f);
+        for (int i = 0; i < 40; i++) avTick();
+        const float headRest = relHeadYaw();
+        // Look 60 deg RIGHT — inside the 70 deg cone, so the body would not
+        // turn even if a driver were attached, and the head must take all of
+        // it. Camera yaw is positive to the right.
+        avatar.SetLook(60.0f / 57.29578f, 0.0f);
+        for (int i = 0; i < 40; i++) avTick();
+        const float headRight = relHeadYaw() - headRest;
+        avatar.SetLook(-60.0f / 57.29578f, 0.0f);
+        for (int i = 0; i < 40; i++) avTick();
+        const float headLeft = relHeadYaw() - headRest;
+        // Sign, magnitude and symmetry. The head is asked for 60 deg and the
+        // spine share (default 0.25) is applied at the TORSO, which the head
+        // inherits — so head-vs-hips should recover very nearly the whole 60
+        // either way. Generous bounds: this is gating "does it turn, the right
+        // way, by roughly the right amount", not a tuning value.
+        bool lookTurns = headRight < -25.0f && headRight > -95.0f &&
+                         headLeft > 25.0f && headLeft < 95.0f;
+        // A look must not drag the HIPS around: that is the bug above.
+        avatar.SetLook(60.0f / 57.29578f, 0.0f);
+        for (int i = 0; i < 40; i++) avTick();
+        float hipsYaw = yawOf(avatar.Parts().hips);
+        while (hipsYaw > 180.0f) hipsYaw -= 360.0f;
+        while (hipsYaw < -180.0f) hipsYaw += 360.0f;
+        bool hipsHeld = std::fabs(hipsYaw) < 12.0f;
+        bool lookOk = lookTurns && hipsHeld;
+        avatar.SetLook(0.0f, 0.0f);
+        for (int i = 0; i < 40; i++) avTick();
+
         // ---- gait quality AT THE PLAYER'S REAL SPEED ----
         // Everything above walks the player at 0.2 vox/tick = 6 vox/sec,
         // which is a sixth of walkSpeed and a tenth of sprintSpeed. That is
@@ -1305,6 +1364,14 @@ bool mobOk = false;
             legsNotInverted ? 1 : 0, worstJumpFlat, worstJump,
             poseContinuous ? 1 : 0);
         mobOk = mobOk && avOk;
+
+        // Reported separately so a head-look regression cannot hide inside
+        // the avatar line's long list of gait assertions.
+        std::printf(
+            "avatar head look: %s (60 deg right -> head %.1f deg, left -> "
+            "%.1f deg, both vs hips; hips held %.1f deg)\n",
+            lookOk ? "PASS" : "FAIL", headRight, headLeft, hipsYaw);
+        mobOk = mobOk && lookOk;
 
         // Reported separately from `avatar` so a gait-look regression and a
         // footstep-plumbing regression never hide behind one another.

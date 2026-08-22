@@ -1674,12 +1674,20 @@ int main(int argc, char** argv) {
         // which is what keeps it from chattering at the boundary: there is no
         // edge to cross twice, just a residual that is zero inside the cone.
         //
-        // Third person keeps the old motion-facing rule untouched — there the
-        // body faces where it WALKS, so the same offset already arises from
-        // strafing and the head-look below handles it with no turn policy of
-        // its own.
+        // BOTH MODES GET THE CONE, and third person needs it for a reason that
+        // is not obvious: movement is CAMERA-RELATIVE, so walking forward makes
+        // the travel direction identical to the camera heading. The body then
+        // chases the camera through `wantHeading` and the head-body offset
+        // collapses to zero — a character who never glances at anything while
+        // moving, which is precisely when you most want them to. Applying the
+        // residual here lets the body lag the camera by up to the cone while
+        // walking, and the head takes up that lag.
+        //
+        // Standing still, `wantHeading` is already pinned to `avatarHeading`
+        // one block up, so `d` is 0 and this changes nothing — the hold is the
+        // existing anti-spin rule and the head does all the work.
         const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
-        if (camMode == CameraMode::First && headCone > 1e-3f) {
+        if (headCone > 1e-3f) {
           if (d > headCone) d -= headCone;
           else if (d < -headCone) d += headCone;
           else d = 0.0f;
@@ -2132,8 +2140,14 @@ int main(int argc, char** argv) {
           if (camMode == CameraMode::First) {
             for (size_t i = 0; i < hide.size(); i++) hide[i] = 1;
             if (CurrentTuning().avatar.firstPersonArms) {
-              const int keep[7] = {p.armUL, p.armUR, p.handL, p.handR,
-                                   p.staff, heldPart, -1};
+              // THE WHOLE ARM, not just its ends. The forearms have to be in
+              // here explicitly: the rig is armU -> armL -> hand, so keeping
+              // only the upper arm and the hand left a floating fist with a
+              // gap where the forearm should be — the arm you see in first
+              // person is mostly forearm, so it is the one part that cannot be
+              // omitted.
+              const int keep[9] = {p.armUL, p.armUR, p.armLL, p.armLR,
+                                   p.handL, p.handR, p.staff, heldPart, -1};
               for (int k : keep)
                 if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
             }

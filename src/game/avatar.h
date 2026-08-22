@@ -45,6 +45,11 @@ struct AvatarParts {
   int head = -1, torso = -1, hips = -1;
   int handL = -1, handR = -1;
   int armUL = -1, armUR = -1;
+  // Lower arms (forearms). Needed as their own fields because the first-person
+  // keep list is built from THIS struct: with only the upper arms and the
+  // hands named, a first-person view showed a floating hand and a stub of
+  // bicep with the forearm missing between them.
+  int armLL = -1, armLR = -1;
   int footL = -1, footR = -1;
   int legUL = -1, legUR = -1;
   int staff = -1;
