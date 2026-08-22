@@ -63,11 +63,8 @@ inline void AppendXform(std::vector<BodyXformGpu>& out,
 // while this shows what is actually collided against. When they disagree, that
 // disagreement is the thing you opened the overlay to find.
 //
-// The shape's local bounds are centred on the body's own origin, which for
-// these colliders is the centre of mass — so the box centre is the body
-// position plus the bounds' own (usually tiny) offset, rotated into world
-// space. Skipping that offset is what makes a wireframe sit a fraction off the
-// limb it belongs to.
+// Physics returns bounds/sub-shapes in body-origin-local space (CoM offset
+// already baked in), so the box centre is xf.pos + rotate(bodyQ, localPos).
 inline void AppendDebugBox(std::vector<DebugBox>& out, const Vec3& lo,
                            const Vec3& hi, const BodyTransform& xf,
                            uint32_t color) {
