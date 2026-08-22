@@ -387,9 +387,54 @@ the checker only tells you that something disagrees.
 - Match surrounding style: 2-space indent, lowercase-underscore WGSL, `CamelCase`
   C++ functions. Comment density in the sim shaders is deliberately high because
   the rules encode non-obvious invariants — keep it.
-- Don't grow the 16-bit voxel. Extra per-voxel state goes in an optional sparse
-  auxiliary layer keyed by chunk (DESIGN.md §3). 16 bpv is what makes 100M+
-  resident voxels affordable.
+- **Don't grow the 32-bit voxel.** The word is a `u32` — 512³ voxels × 4 B =
+  512 MiB, which is *exactly* the storage limit `gpu/context.cpp` requests.
+  Going to 64 bpv means 1 GiB and blows that limit; extra per-voxel state goes
+  in an optional sparse auxiliary layer keyed by chunk (DESIGN.md §3). 32 bpv
+  is what makes 134M resident voxels affordable. (This bullet said "16-bit"
+  until 2026-08-22 — it had been wrong since the stain layer went in, and the
+  layout below is the authoritative version.)
+
+  | Bits | Field | Notes |
+  |---|---|---|
+  | 0..11 | material id | 4096 slots, ~48 used |
+  | 12..15 | state nibble | liquids: fullness 1..8. Others: render palette jitter (`paletteColor`, `state % 3`) |
+  | 16..18 | tick stamp | "already acted this substep" gate — see below |
+  | 19..23 | **FREE** | the only unallocated span |
+  | 24..27 | stain amount | 0..15 |
+  | 28..30 | stain type | 0 = clean, 1..7 palette slots |
+  | 31 | `kCellOpIfAir` | transient CPU→GPU flag, masked off before the store |
+
+  The allocation table lives in three places that must agree: the comment above
+  `voxMat` in `common.wgsl`, the mirror in `src/sim/world.h`, and this table.
+
+- **The tick stamp is 3 bits with a reserved sentinel, and `kStampNever` is the
+  only value a CPU path may write.** The stamp answers one question — "was this
+  word written during THIS substep?" — so it needs enough phases to make the
+  current one distinguishable, not enough to count ticks. `stampFor` cycles
+  1..7; `STAMP_NEVER`/`kStampNever` is 0 and no `stampFor` output equals it.
+
+  Everything that ENTERS the world unstamped must use the sentinel: worldgen
+  `genCell`, brush paints (`sim_mutate`), particle reinsertion, prefab stamps,
+  debris rubble, RLE decode after a stream-in or a load. Writing a live code
+  there costs that voxel a substep. This was a `0xFF` byte before 2026-08-22,
+  and `0xFF` masked into 3 bits is `7` — a *real* code — so any site still
+  writing the old literal is a bug, not a no-op.
+
+  Why the sentinel is load-bearing rather than tidy: a sleeping chunk is not
+  dispatched, so its voxels keep their last stamp indefinitely and are compared
+  against the current one on wake. With a short cycle, a chunk that slept an
+  exact multiple of the cycle would wake with *every* voxel falsely reading
+  "already acted" and stall for a substep — correlated and visible, unlike the
+  1-in-256 single-voxel skip the byte-wide field had. Birth-at-sentinel is what
+  bounds that to one voxel, one substep.
+
+  The stamp is per-tick scheduling scratch, not state: excluded from the world
+  hash (`sim_occupancy.wgsl` hashes bits 0..15 + the stain field) and stripped
+  on save (`kPersistMask` in `stream.cpp` clears bits 16..23). **Bits 19..23
+  inherit both properties** — anything stored there is scratch unless the hash
+  mask and `kPersistMask` are both widened to cover it, which is a save-format
+  and determinism change.
 - **Verify rotations with `scripts/geometry.py` — don't reason about quaternions
   in your head.** The engine is Y-up, quats are `(x,y,z,w)`, Euler order is
   X-then-Y-then-Z, heading 0 = +Z, and .vox files are Z-up (converted by

@@ -424,7 +424,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
           cellOps.push_back({cellIdx, 0u});  // vacate the grid cell
           continue;
         }
-        uint32_t word = (rub & 0xFFF) | (state << 12) | (0xFFu << 16);
+        uint32_t word = PackVoxNew(rub, state);
         cellOps.push_back({cellIdx, word});
       }
       lastCellWriteTick_ = tick;
@@ -664,7 +664,9 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
       // fill-air-only: occupied cells win on the GPU (deterministic — grid
       // state is hashed, and the op replays identically). Minor volume loss
       // where the world grew into the footprint is accepted (§B6).
-      uint32_t word = (uint32_t)v.payload | (0xFFu << 16) | kCellOpIfAir;
+      // payload already carries mat+state; add the unstamped stamp field.
+      uint32_t word = (uint32_t)v.payload | (kStampNever << kStampShift) |
+                      kCellOpIfAir;
       cellOps.push_back({World::SlotCellIndex(cell), word});
     }
     if (!inWindow) {
@@ -814,7 +816,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
                                  ? 7u  // LIQ_FULL_STATE
                                  : (rr >> 6u) % 3u;
             cellOps.push_back({World::SlotCellIndex(cell),
-                               pm | (state << 12u) | (0xFFu << 16u) | kCellOpIfAir});
+                               PackVoxNew(pm, state) | kCellOpIfAir});
             opsBudget--;
           }
         }
@@ -871,8 +873,8 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
             if (world.CellInWindow(t) && opsBudget > 0 &&
                 cellOps.size() < kMaxCellOpsPerTick) {
               cellOps.push_back({World::SlotCellIndex(t),
-                                 (r.prodNbr & 0xFFFu) | (((rr >> 8u) % 3u) << 12u) |
-                                     (0xFFu << 16u) | kCellOpIfAir});
+                                 PackVoxNew(r.prodNbr, (rr >> 8u) % 3u) |
+                                     kCellOpIfAir});
               opsBudget--;
             }
             fired = true;  // rule consumed even if the write missed the budget

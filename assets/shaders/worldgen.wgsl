@@ -2414,7 +2414,12 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   // liquids are born full (state nibble = fullness); solids get palette jitter
   var state = rnd % 3u;
   if (mat == M_WATER || mat == M_OIL || mat == M_LAVA) { state = LIQ_FULL_STATE; }
-  return packVox(mat, state, 0xFFu);
+  // STAMP_NEVER, not a live code: a generated voxel has not acted, so it must
+  // be free to move on the first tick it is simulated. (This was 0xFF when the
+  // stamp was a byte; masked into the 3-bit field that would be 7, a REAL
+  // stamp code, and every worldgen voxel would sit out one substep in 1 tick
+  // out of 7.)
+  return packVox(mat, state, STAMP_NEVER);
 }
 
 // ---- far-field surface skin (phase 4: distance look) ----

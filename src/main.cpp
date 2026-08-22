@@ -366,8 +366,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         // on, so it is the honest test.
         IVec3 c{kLx + dx, kSurf + 1, kLz + dz};
         if (!world.CellInWindow(c)) continue;
-        // Same word rules as a brush paint: liquid born full, stamp 0xFF.
-        uint32_t word = (kMatOil & 0xFFFu) | (7u << 12) | (0xFFu << 16);
+        // Same word rules as a brush paint: liquid born full, unstamped.
+        uint32_t word = PackVoxNew(kMatOil, 7u);
         slick.push_back({World::SlotCellIndex(c), word});
       }
     // Long settle: the layer has to spread and level before it reads as one.
@@ -417,8 +417,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       int oy = ((i * 29) % 3);
       IVec3 c{gx + ox * 2, gh + 1 + oy, gz + oz * 2};
       if (!world.CellInWindow(c)) continue;
-      // same word rules as a brush paint: liquid born full, stamp 0xFF
-      uint32_t word = (kMatLava & 0xFFFu) | (7u << 12) | (0xFFu << 16);
+      // same word rules as a brush paint: liquid born full, unstamped
+      uint32_t word = PackVoxNew(kMatLava, 7u);
       spatter.push_back({World::SlotCellIndex(c), word});
     }
     for (uint32_t t = 121; t <= 124; t++)
@@ -449,8 +449,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       IVec3 c{x, y, z};
       if (!world.CellInWindow(c)) return;
       uint32_t state = (mat == kMatAir) ? 0u : 7u;  // liquids are born full
-      gore.push_back({World::SlotCellIndex(c),
-                      (mat & 0xFFFu) | (state << 12) | (0xFFu << 16)});
+      gore.push_back({World::SlotCellIndex(c), PackVoxNew(mat, state)});
     };
     // A stone basin holding a pool: the "still pool" end of the blend, and the
     // surface that the surrounding stone gets stained by.
@@ -533,8 +532,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         else if (roll < 68u) { mat = kMatFlowerDaisy; }
         else if (roll < 72u) { mat = kMatFoliageBush; }
         else { continue; }  // bare ground between the tufts
-        // Same word rules as a brush paint on a solid: state 0, stamp 0xFF.
-        flora.push_back({World::SlotCellIndex(c), (mat & 0xFFFu) | (0xFFu << 16)});
+        // Same word rules as a brush paint on a solid: state 0, unstamped.
+        flora.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
       }
     }
     for (uint32_t t = 133; t <= 136; t++)

@@ -294,8 +294,37 @@ struct PassParams {
 
 // A voxel's "already acted" stamp for tick t, substep s. Movers can act once
 // per substep, so things fall SUBSTEPS cells per tick.
+//
+// WIDTH: 3 bits, cycling 1..7 — NOT a tick counter. The gate only ever asks
+// "was this word written during THIS substep?", so the field needs exactly
+// enough phases to make the current one distinguishable from any other, not
+// enough to count ticks. With 2 substeps the cycle length just has to be
+// coprime-ish with nothing in particular; 7 gives every substep in a tick a
+// distinct code and leaves 0 free as the sentinel below.
+//
+// WHY NOT WIDER: it used to be 8 bits (wrapping every 128 ticks), which spent
+// 5 bits buying a longer wrap that buys nothing — a stale stamp is either
+// STAMP_NEVER or it aliases, and the alias probability is 1/cycle regardless
+// of field width. See the sleep note on STAMP_NEVER for the case that made
+// this matter.
+const STAMP_SHIFT : u32 = 16u;
+const STAMP_MASK  : u32 = 0x7u;
+const STAMP_BITS  : u32 = 0x70000u;   // bits 16..18
+const STAMP_CYCLE : u32 = 7u;
+// "Has never acted": no stampFor() output equals this, so a voxel carrying it
+// is always free to move. Voxels are BORN with it — worldgen (genCell), RLE
+// decode after a stream-in or a load, prefab stamps, brush paints. That is
+// what makes narrowing this field safe across sleep: a chunk can sleep for any
+// number of ticks and its voxels keep whatever stamp they last had, and on
+// wake they are compared against the current one. With a short cycle a whole
+// chunk that slept an exact multiple of the cycle would otherwise wake with
+// every voxel falsely reading "already acted" and stall for a substep — a
+// correlated, visible hitch rather than the 1-in-256 single-voxel skip the
+// 8-bit field had. Anything that ENTERS the world unstamped uses this instead
+// of a live code, so the alias can only ever cost one voxel one substep.
+const STAMP_NEVER : u32 = 0u;
 fn stampFor(tick : u32, substep : u32) -> u32 {
-  return (tick * 2u + substep) & 0xFFu;
+  return ((tick * 2u + substep) % STAMP_CYCLE) + 1u;
 }
 
 struct BrushOp {
@@ -749,13 +778,21 @@ fn occTotal(occ : u32) -> u32 { return occ & 0xFFFFu; }
 fn occBlockers(occ : u32) -> u32 { return occ >> 16u; }
 fn packOcc(total : u32, blockers : u32) -> u32 { return total | (blockers << 16u); }
 
-// Voxel word: bits 0..11 material, 12..15 state, 16..23 tick-stamp,
-//             24..27 stain amount, 28..30 stain type, 31 reserved.
+// Voxel word: bits 0..11 material, 12..15 state, 16..18 tick-stamp,
+//             19..23 FREE, 24..27 stain amount, 28..30 stain type,
+//             31 CELLOP_IF_AIR (transient, never stored).
+//
+// Bits 19..23 are the only unallocated span in the word. They are NOT hashed
+// (sim_occupancy hashes bits 0..15 + the stain field) and NOT persisted
+// (kPersistMask in stream.cpp strips 16..23), so anything put there is
+// per-tick scratch unless BOTH of those are changed to cover it. Whatever
+// claims them must also say so here — this comment is the allocation table.
 fn voxMat(w : u32) -> u32 { return w & 0xFFFu; }
 fn voxState(w : u32) -> u32 { return (w >> 12u) & 0xFu; }
-fn voxStamp(w : u32) -> u32 { return (w >> 16u) & 0xFFu; }
+fn voxStamp(w : u32) -> u32 { return (w >> STAMP_SHIFT) & STAMP_MASK; }
 fn packVox(mat : u32, state : u32, stamp : u32) -> u32 {
-  return (mat & 0xFFFu) | ((state & 0xFu) << 12u) | ((stamp & 0xFFu) << 16u);
+  return (mat & 0xFFFu) | ((state & 0xFu) << 12u) |
+         ((stamp & STAMP_MASK) << STAMP_SHIFT);
 }
 
 // ---- the stain layer (DESIGN.md §3, §6) -------------------------------------
