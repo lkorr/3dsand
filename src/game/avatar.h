@@ -287,6 +287,42 @@ class PlayerAvatar {
   uint64_t PartBody(int part) const;
   int PartIndex(const std::string& name) const;
   int LivePartCount() const;
+  // ---- per-part condition, for the HUD body readout -----------------------
+  // The HUD shows damage per LIMB rather than one summed bar, so it needs the
+  // same three facts the gore code works in: how much hp the part has left,
+  // what it started with, and whether it is currently losing blood. All three
+  // are reads of state that already exists — nothing here is computed for the
+  // benefit of the UI, so the figure cannot drift from the body it describes.
+  //
+  // `part` indexes the same array PartAlive/PartBody take, which INCLUDES the
+  // borrowed item slot past the def's limb count; those slots report 0 hp and
+  // an empty name.
+  float PartHp(int part) const {
+    return part >= 0 && part < (int)parts.size() ? parts[part].hp : 0.0f;
+  }
+  // Authored ceiling for one part (MobLimbDef::hp), the denominator of the
+  // damage tint. Like HealthMax() it is never lowered by damage.
+  float PartHpMax(int part) const {
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].hp : 0.0f;
+  }
+  // Actively losing blood: either an arterial gush from a fresh stump
+  // (gushTicks) or an ordinary wound still owing whole voxels of blood
+  // (bleedBudget >= 1, the same threshold the bleed drive in PreTick uses).
+  bool PartBleeding(int part) const {
+    if (part < 0 || part >= (int)parts.size()) return false;
+    return parts[part].gushTicks > 0 || parts[part].bleedBudget >= 1.0f;
+  }
+  // Authored name / tag ("head", "arm", "leg", "spine", ...) of a limb, or ""
+  // for a borrowed item slot. The HUD lays the figure out by TAG so it works
+  // for any humanoid rig rather than only for mina's part names.
+  const char* PartName(int part) const {
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].name.c_str()
+                                                  : "";
+  }
+  const char* PartTag(int part) const {
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].tag.c_str()
+                                                  : "";
+  }
   int ActiveClips() const { return (int)anim_.clips.size(); }
   // Measured planar speed in world voxels/sec (presentation/diagnostics only).
   float SpeedNow() const { return speedNow_; }

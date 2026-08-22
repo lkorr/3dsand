@@ -1614,7 +1614,6 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   }
   if (!sk.chains.empty() && gaitActive) {
     Quat yaw = AxisAngle({0, 1, 0}, mob.heading);
-    Vec3 rootAnchor = sk.parts[def.rootLimb].anchorLocal;
     Vec3 pivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
     Vec3 bodyOrigin{mob.origin.x, mob.bodyY, mob.origin.z};
     for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
@@ -1624,7 +1623,15 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
       // world foot target -> model space (inverse of the submit transform)
       Vec3 rel = f.planted - bodyOrigin - pivot;
       Vec3 prefabPt = RotateInv(yaw, rel) + pivot;
-      AnimSolveTwoBone(sk, st, sk.chains[c], prefabPt - rootAnchor, weight);
+      // PREFAB-ABSOLUTE ON BOTH ENDS — nothing is rebased here. AnimFlatten
+      // seeds the root from its own rest.pos, which IS rootAnchor, so the hip
+      // AnimSolveTwoBone reads out of st.model[] already carries the root
+      // offset. Subtracting it from the target alone put the two ends in
+      // different frames and skewed (target - root) by exactly rootAnchor,
+      // which on a tall-hipped rig over-reaches the leg into its clamp and
+      // splays both legs the same way instead of mirroring. Matches the submit
+      // path below, which likewise does not re-add rootAnchor to modelPos.
+      AnimSolveTwoBone(sk, st, sk.chains[c], prefabPt, weight);
     }
   }
 

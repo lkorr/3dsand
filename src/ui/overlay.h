@@ -99,6 +99,32 @@ struct UIState {
   // so this is only ever a high-water mark the player moves away from.
   int32_t healthMax = 0;
   bool playerAlive = true;
+
+  // ---- body condition, drawn as a stick figure above the health bar -------
+  // The hp bar answers "how much life is left"; this answers "what part of me
+  // is broken", which is a different question the moment a limb can be severed
+  // independently of the total. One entry per BodySlot below, mirrored out of
+  // PlayerAvatar each frame — the overlay never reaches into the avatar itself.
+  //
+  // Laid out by limb TAG + side rather than by mina's part names, so any
+  // humanoid rig fills the same figure and a rig missing a part simply leaves
+  // that segment absent.
+  enum BodySlot {
+    kSlotHead = 0, kSlotTorso, kSlotHips,
+    kSlotArmUL, kSlotArmLL, kSlotHandL,
+    kSlotArmUR, kSlotArmLR, kSlotHandR,
+    kSlotLegUL, kSlotLegLL, kSlotFootL,
+    kSlotLegUR, kSlotLegLR, kSlotFootR,
+    kSlotCount
+  };
+  struct BodyPartUI {
+    bool present = false;   // rig HAS this part (false = never draw it)
+    bool severed = false;   // lost — drawn as a stump, not as a damaged limb
+    bool bleeding = false;  // actively losing blood — flashes
+    float hpFrac = 1.0f;    // 1 = untouched, 0 = destroyed; drives the tint
+  };
+  BodyPartUI body[kSlotCount];
+  bool bodyValid = false;   // false until the avatar has spawned
   int32_t spellCost = 0;          // running cost of the spoken sequence
   std::string spellText;          // "lava + trail + projectile"
   std::string spellVerdict;       // what the VM thinks it is
@@ -119,6 +145,14 @@ class Overlay {
   // and the HUD must not be.
   void DrawHUD(const UIState& s);
   void Draw(UIState& s);
+
+ private:
+  // The per-limb body readout that sits above the hp bar. Draws upward from
+  // `yBottom` and returns the height it reserved, so DrawHUD stacks the "DEAD"
+  // banner above it without duplicating the figure's proportions.
+  float DrawBodyFigure(const UIState& s, float x, float yBottom);
+
+ public:
   void Render(const wgpu::RenderPassEncoder& pass);
   void Shutdown();
 };

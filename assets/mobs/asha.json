@@ -5,7 +5,7 @@
     "material": "blood",
     "perDamage": 2.5
   },
-  "speed": 60,
+  "speed": 31.499999999999996,
   "gait": {
     "groups": [
       [
@@ -21,7 +21,7 @@
     "stepThreshold": 0.3,
     "stepDuration": 0.1,
     "stepHeight": 0.18,
-    "rideHeight": 1.22,
+    "rideHeight": 1.18,
     "bobAmp": 0.045,
     "bobFreqMul": 2,
     "swayAmp": 0.03,
@@ -45,9 +45,9 @@
       "vital": true,
       "tag": "spine",
       "anchor": [
-        20,
-        64,
-        16
+        16,
+        68,
+        10
       ]
     },
     {
@@ -59,14 +59,14 @@
       "vital": true,
       "tag": "head",
       "anchor": [
-        21,
-        90,
-        15
+        17,
+        102,
+        9
       ],
       "severImpactSpeed": 20,
       "spring": {
         "halflife": 0.12,
-        "gain": 0.18,
+        "gain": 0.16,
         "maxAngle": 0.3
       }
     },
@@ -78,9 +78,9 @@
       "severable": true,
       "tag": "arm",
       "anchor": [
-        32,
-        90,
-        16
+        28,
+        102,
+        10
       ],
       "severImpactSpeed": 15
     },
@@ -99,9 +99,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        32,
-        76,
-        16
+        28,
+        88,
+        10
       ],
       "severImpactSpeed": 13
     },
@@ -113,9 +113,9 @@
       "severable": true,
       "tag": "hand",
       "anchor": [
-        32,
-        64,
-        16
+        28,
+        76,
+        10
       ],
       "severImpactSpeed": 9
     },
@@ -127,9 +127,9 @@
       "severable": true,
       "tag": "arm",
       "anchor": [
-        8,
-        90,
-        16
+        4,
+        102,
+        10
       ],
       "severImpactSpeed": 15
     },
@@ -148,9 +148,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        8,
-        76,
-        16
+        4,
+        88,
+        10
       ],
       "severImpactSpeed": 13
     },
@@ -162,9 +162,9 @@
       "severable": true,
       "tag": "hand",
       "anchor": [
-        8,
-        64,
-        16
+        4,
+        76,
+        10
       ],
       "severImpactSpeed": 9
     },
@@ -176,9 +176,9 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        24,
-        52,
-        16
+        21,
+        48,
+        9
       ],
       "severImpactSpeed": 18
     },
@@ -197,9 +197,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        24,
-        30,
-        16
+        20,
+        28,
+        10
       ],
       "severImpactSpeed": 16
     },
@@ -218,9 +218,9 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        24,
-        6,
-        20
+        21,
+        4,
+        14
       ],
       "severImpactSpeed": 12
     },
@@ -232,9 +232,9 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        16,
-        52,
-        16
+        11,
+        48,
+        9
       ],
       "severImpactSpeed": 18
     },
@@ -253,9 +253,9 @@
       "minAngle": -2.4,
       "maxAngle": 0.05,
       "anchor": [
-        16,
-        30,
-        16
+        12,
+        28,
+        10
       ],
       "severImpactSpeed": 16
     },
@@ -274,9 +274,9 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        16,
-        6,
-        20
+        11,
+        4,
+        14
       ],
       "severImpactSpeed": 12
     }
@@ -286,9 +286,9 @@
       "name": "held_right",
       "part": "hand.R",
       "offset": [
-        8,
-        60,
-        16
+        4,
+        72,
+        10
       ],
       "rotation": [
         0,
@@ -534,9 +534,9 @@
               "t": 1100,
               "q": [
                 0,
-                0.0349,
+                0.0436,
                 0,
-                0.9994
+                0.999
               ],
               "ease": "quadInOut"
             },
@@ -544,9 +544,9 @@
               "t": 2300,
               "q": [
                 0,
-                -0.0262,
+                -0.0349,
                 0,
-                0.9997
+                0.9994
               ],
               "ease": "quadInOut"
             },

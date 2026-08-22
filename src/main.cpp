@@ -54,6 +54,72 @@ using namespace sandvox;
 
 namespace {
 
+// ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
+//
+// Maps the avatar's limbs onto the fixed stick-figure slots. The mapping is by
+// authored TAG ("head"/"spine"/"arm"/"hand"/"leg"/"foot") plus the ".L"/".R"
+// side suffix and an upper/lower discriminator, NOT by mina's exact part names
+// — a different humanoid rig with the same tags fills the same figure, and a
+// rig missing a part leaves that slot absent rather than mis-drawn.
+//
+// Upper vs lower within a limb is read from the name ("armU"/"armL"), which is
+// the convention the rigs already use; when a rig has only one segment per limb
+// it lands in the upper slot and the figure simply draws a shorter limb.
+int BodySlotFor(const char* name, const char* tag) {
+  const std::string n = name, t = tag;
+  const bool left = n.size() >= 2 && n.compare(n.size() - 2, 2, ".L") == 0;
+  const bool right = n.size() >= 2 && n.compare(n.size() - 2, 2, ".R") == 0;
+  // The segment letter is the character just before the side suffix:
+  // "armU.L" -> 'U' (upper), "armL.L" -> 'L' (lower). Anything without a side
+  // suffix, or with any other letter there, is treated as the upper segment.
+  const bool lower =
+      (left || right) && n.size() >= 3 && n[n.size() - 3] == 'L';
+
+  if (t == "head") return UIState::kSlotHead;
+  if (t == "spine") {
+    // The rig's root is the hips; every other spine part is the torso.
+    return n.find("hip") != std::string::npos ? UIState::kSlotHips
+                                              : UIState::kSlotTorso;
+  }
+  if (t == "hand") return left ? UIState::kSlotHandL : UIState::kSlotHandR;
+  if (t == "foot") return left ? UIState::kSlotFootL : UIState::kSlotFootR;
+  if (t == "arm") {
+    if (left) return lower ? UIState::kSlotArmLL : UIState::kSlotArmUL;
+    if (right) return lower ? UIState::kSlotArmLR : UIState::kSlotArmUR;
+  }
+  if (t == "leg") {
+    if (left) return lower ? UIState::kSlotLegLL : UIState::kSlotLegUL;
+    if (right) return lower ? UIState::kSlotLegLR : UIState::kSlotLegUR;
+  }
+  return -1;  // props, held items, anything the figure has no place for
+}
+
+void FillBodyUI(const PlayerAvatar& avatar, UIState& ui) {
+  for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i] = {};
+  const MobDef* def = avatar.Def();
+  ui.bodyValid = def != nullptr;
+  if (!def) return;
+  // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
+  // held-item slot, which is not part of the body.
+  const int limbCount = (int)def->limbs.size();
+  for (int i = 0; i < limbCount; i++) {
+    const int slot = BodySlotFor(avatar.PartName(i), avatar.PartTag(i));
+    if (slot < 0) continue;
+    UIState::BodyPartUI& b = ui.body[slot];
+    b.present = true;
+    if (!avatar.PartAlive(i)) {
+      b.severed = true;
+      b.hpFrac = 0.0f;
+      continue;  // a lost limb neither bleeds nor reports damage
+    }
+    const float max = avatar.PartHpMax(i);
+    const float hp = avatar.PartHp(i);
+    b.hpFrac = max > 0.0f ? hp / max : 1.0f;
+    if (b.hpFrac < 0.0f) b.hpFrac = 0.0f;
+    if (b.hpFrac > 1.0f) b.hpFrac = 1.0f;
+    b.bleeding = avatar.PartBleeding(i);
+  }
+}
 
 // --shot: minimal look-iteration harness. Worldgen, drain the far-field fill
 // queue, settle briefly, write the three standard screenshots, exit — so
@@ -890,9 +956,9 @@ int main(int argc, char** argv) {
   PrefabPlacer placer;
   // The player avatar shares MobSystem's def list rather than loading its own:
   // one micro-body pool, and a hot reload (R) rebuilds both at once. It points
-  // at whichever def is named `avatarDefName`, so swapping the player
-  // character is data, not code.
-  const std::string avatarDefName = kAvatarDefName;
+  // at whichever def is named by tuning.json player.model, so swapping
+  // the player character is data, not code.  F5 re-reads it.
+  std::string avatarDefName = CurrentTuning().player.model;
   PlayerAvatar avatar;
   avatar.Init(&phys, &world, &debris, mats);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
@@ -1161,6 +1227,7 @@ int main(int argc, char** argv) {
         for (const std::string& w : tune.warnings)
           std::fprintf(stderr, "tuning: %s\n", w.c_str());
         SetCurrentTuning(tune);
+        avatarDefName = CurrentTuning().player.model;
         // Gore variance is drawn per mob at spawn, so mobs already standing in
         // the world hold profiles from the OLD tuning. Re-draw them here or an
         // edit to the randomness controls appears to do nothing until the next
@@ -2230,6 +2297,11 @@ int main(int argc, char** argv) {
       ui.health = playerHealth.Get();
       ui.healthMax = avatar.HealthMax();
       ui.playerAlive = avatar.IsAlive();
+      // Body-condition readout: one figure slot per limb, keyed by the limb's
+      // authored TAG and side suffix rather than by part name, so any humanoid
+      // rig fills the same figure. A limb the rig does not have stays absent
+      // and simply is not drawn.
+      FillBodyUI(avatar, ui);
       ui.spellCost = caster.compiled.manaCost;
       ui.spellText = caster.readout.text;
       ui.spellVerdict = caster.readout.verdict;

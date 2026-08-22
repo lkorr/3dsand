@@ -93,6 +93,7 @@ int ApplyVarianceI(int base, const Variance& v, uint32_t seed, uint32_t tick,
 struct Tuning {
   // ---- player movement (meters / seconds; converted to voxels at use) ----
   struct Player {
+    std::string model = "mina";
     float flySpeed = 13.75f, flySprint = 32.5f;
     float walkSpeed = 4.5f, sprintSpeed = 8.0f;
     float gravity = 9.81f;

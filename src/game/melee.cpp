@@ -74,6 +74,54 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
 
   const float inv = 1.0f / (float)d.scale;
 
+  // THE NEGATED AXIS NEEDS THE MODEL'S DEPTH ADDED BACK.
+  //
+  // Scene(Z-up) -> engine(Y-up) is (x, z, -y). That third component is the
+  // problem: negating y sends the whole model to NEGATIVE engine z, spanning
+  // -depth..0 instead of 0..depth. LoadVoxFile then rebases the voxels onto
+  // their own min corner (voxload.cpp `em.cells[i] - em.mn`), so the geometry
+  // the runtime actually holds starts at zero again.
+  //
+  // `offset` does NOT record that shift — it is measured AFTER the rebase and
+  // reads (0,0,0) here — so a sidecar box converted by the same (x, z, -y) map
+  // is left a full model-depth below art that has already been moved up. The
+  // hilt centre came out at engine z -0.75 for a blade occupying 0..1.5: not
+  // merely off, but on the far side of the origin from its own art.
+  //
+  // Subtracting `sceneMin` is exactly the rebase the art received (voxload.h),
+  // so it lands both in one frame by construction rather than by a correction
+  // term someone has to keep true. Deriving the shift from `size` instead
+  // would be a second implementation of the same rule, and one that only
+  // agrees while the model sits at the scene origin unrotated.
+  //
+  // Every consumer measures from the min corner: `p.restOffset` is
+  // `item->offset` and `anchorLimb` is `gripLocal - restOffset` (avatar.cpp
+  // EquipItem), the same `anchor - restOffset` relationship a limb states, and
+  // mob.cpp documents its edge as measured from "the part's own ORIGIN (the
+  // model's min corner)". A limb never hit this because a rig's generator
+  // authors its boxes in the same scene frame it emits its anchors from, so
+  // both sides moved together.
+  //
+  // The symptom this produced: the -90 degree grip rotation about Y maps the
+  // item's z error onto WORLD X, so the whole 1.5-voxel mistake surfaced as
+  // pure sideways float — the sword hanging a couple of voxels to the right of
+  // the fist, correct in height and depth, which reads as a bad grip constant
+  // rather than a frame bug.
+  //
+  // ONE LAST TRAP ON THE SAME AXIS: `sceneMin` is a CELL INDEX, the sidecar's
+  // box is a CONTINUOUS extent. On an axis that merely shifts, the low cell and
+  // the low face are the same number and the distinction is invisible. On the
+  // NEGATED axis they are not: cells 0..n-1 map to cells -(n-1)..0, whose low
+  // face is at -n. Subtracting the cell index there leaves the box exactly one
+  // cell — a quarter of a world voxel at scale 4 — proud of the art, which is
+  // small enough to read as "close enough" and wrong enough to see.
+  //
+  // So bias the negated component by one cell to reach the face. Written per
+  // axis rather than as a blanket `+1` because only z is flipped by the
+  // (x, z, -y) map; x and y need the index as it stands.
+  const Vec3 modelOrigin{(float)m.sceneMin.x * inv, (float)m.sceneMin.y * inv,
+                         (float)(m.sceneMin.z - 1) * inv};
+
   // ---- grip contexts ------------------------------------------------------
   // Every context is read whole: no key inherits from another (see item.h).
   if (s.contains("grip") && s["grip"].is_object()) {
@@ -119,8 +167,39 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
         const Vec3 lo{mn.x, mn.z, -(mn.y + sz.y)};
         const Vec3 ex{sz.x, sz.z, sz.y};
         d.hilt.has = true;
-        d.hilt.center = (lo + ex * 0.5f) * inv;
+        // Rebased onto the model's min corner (see modelOrigin above), because
+        // that is the frame `gripLocal` is consumed in. The half-extents are a
+        // SIZE, not a position, so they take the conversion but not the shift.
+        d.hilt.center = (lo + ex * 0.5f) * inv - modelOrigin;
         d.hilt.halfExtents = ex * 0.5f * inv;
+        // THE HILT MUST LAND ON THE ITEM'S OWN ART.
+        //
+        // Every frame error above is silent at runtime: the placement code
+        // puts the hilt centre on the socket by construction, so the sword is
+        // always exactly where the hilt box SAYS the grip is — and a hilt box
+        // in the wrong frame simply moves the whole sword, with nothing left
+        // to disagree with it. The selftest's grip check inherits that
+        // circularity and cannot see the error either.
+        //
+        // What a wrong frame does break is the relationship to the GEOMETRY:
+        // the box stops containing any of the item it claims to be the grip
+        // of. That is checkable right here, where both are in hand, so check
+        // it rather than trusting the conversion.
+        int inside = 0;
+        for (const PrefabVoxel& v : d.voxels) {
+          const Vec3 c{((float)v.x + 0.5f) * inv, ((float)v.y + 0.5f) * inv,
+                       ((float)v.z + 0.5f) * inv};
+          const Vec3 dc = c - d.hilt.center;
+          if (std::fabs(dc.x) <= d.hilt.halfExtents.x &&
+              std::fabs(dc.y) <= d.hilt.halfExtents.y &&
+              std::fabs(dc.z) <= d.hilt.halfExtents.z)
+            inside++;
+        }
+        if (inside == 0)
+          errors += "items: \"" + d.name +
+                    "\" hilt box contains none of the item's own voxels — it "
+                    "is in the wrong frame, and the item will be held by empty "
+                    "space beside itself\n";
       } else {
         errors += "items: \"" + d.name +
                   "\" hilt has a non-positive size — ignored\n";
@@ -143,6 +222,18 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
             e["axis"][2].get<float>()};
     const Vec3 axEngine{ax.x, ax.z, -ax.y};
     d.hasEdge = true;
+    // NOT rebased like the hilt, deliberately. `from`/`to` are DISTANCES along
+    // `axis`, not points in the box, so the segment they describe already lies
+    // on the model's own origin line — there is no authored cross-section
+    // position for a rebase to correct, and subtracting the model origin only
+    // slides the segment off that line onto an arbitrary corner of the art.
+    //
+    // The real gap is that the sidecar cannot say WHERE ACROSS the blade the
+    // edge runs, so it rides the origin line rather than the blade's mid-plane
+    // (for the sword, y 0 / z 0 against a blade centred at y 0.5 / z 0.75).
+    // `halfWidth` is wide enough to cover the difference here, so this is a
+    // sharpness question rather than a placement bug — but it wants an
+    // authored offset, not a borrowed one, and that is a schema change.
     d.edgeFrom = axEngine * (e.value("from", 0.0f) * inv);
     d.edgeTo = axEngine * (e.value("to", 0.0f) * inv);
     d.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
