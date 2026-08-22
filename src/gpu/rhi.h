@@ -2,29 +2,32 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// The engine is being ported from WebGPU/Dawn to Vulkan (docs/PLAN_vulkan_port.md).
-// Phase 2a — this file — confines every `wgpu::` name to src/gpu/ so that phase 3
-// can add a Vulkan backend without touching sim/, test/, game/ or main.cpp. The
-// grep that keeps that true:
+// This seam carried the engine from WebGPU/Dawn to Vulkan
+// (docs/PLAN_vulkan_port.md). It confined every `wgpu::` name to src/gpu/, so
+// the Vulkan backend could be added — and then made the only one — without
+// sim/, test/, game/ or main.cpp changing at all. Dawn was removed 2026-08-22
+// and there is now exactly ONE implementation (rhi_vk.cpp) behind these
+// handles.
 //
-//     grep -rn "wgpu::" src        # must hit ONLY src/gpu/ and src/ui/overlay.*
-//
-// (src/ui/overlay.* is the one sanctioned exception: it holds ImGui_ImplWGPU_*
-// until PHASE 4 swaps it for imgui_impl_vulkan. It is marked there.)
+// THE SEAM STAYS, deliberately. It is what made the port testable (a gate
+// could be pointed at either backend and the world hash compared), it costs
+// one virtual hop on ~60 dispatches a tick, and it is where phase 7 plugs in
+// a paged-residency buffer implementation. Collapsing it back into direct
+// Vulkan calls would be a large edit that buys nothing and forfeits that.
 //
 // SHAPE
 // -----
-// Deliberately WGPU-SHAPED. Method names, argument order and semantics mirror
-// webgpu_cpp.h, because that is what makes phase 2a a mechanical rename with a
-// provably unchanged world hash — a seam that "improved" the API would have
-// hidden a behavior change inside a refactor. Phase 3 changes the *implementation*
-// under these names; if a name proves actively wrong for Vulkan, it is renamed
-// then, with the Dawn backend still present as the hash oracle.
+// Deliberately WGPU-SHAPED, and it stays that way. Method names, argument
+// order and semantics mirror webgpu_cpp.h — that is what made the migration a
+// mechanical rename with a provably unchanged world hash, and renaming them
+// now would be exactly the kind of churn that hides a behaviour change inside
+// a refactor. Where a name is genuinely wrong for Vulkan the comment says so
+// (e.g. ClearBuffer is vkCmdFillBuffer).
 //
-// Handles are value types with reference semantics (like wgpu::), each holding a
-// backend handle in a small impl struct. Encoding-path cost is irrelevant at this
-// scale (~5 compute passes and ~60 dispatches per tick, microseconds of CPU), so
-// clarity beats avoiding an indirection.
+// Handles are value types with reference semantics (like wgpu::), each holding
+// a backend handle in a small impl struct. Encoding-path cost is irrelevant at
+// this scale (~5 compute passes and ~60 dispatches per tick, microseconds of
+// CPU), so clarity beats avoiding an indirection.
 //
 // The ~10 concepts (docs/vulkan_pass_map.md §7):
 //   Buffer, CommandEncoder, ComputePassEncoder, RenderPassEncoder,
@@ -45,22 +48,25 @@
 
 // The pass-table buffer id (src/sim/pass_table.h). Forward-declared so the
 // tracked-copy methods below can carry it without making every rhi.h consumer
-// depend on the table header. Under Dawn the id is IGNORED (Dawn derives
-// barriers from usage); under Vulkan it is how an off-table copy expresses its
-// hazard to the generated-barrier tracker (vk_record.h) — see CopyTracked.
+// depend on the table header. It is how an off-table copy expresses its hazard
+// to the generated-barrier tracker (vk_record.h) — see CopyTracked.
 namespace pass {
 enum class Buf : uint8_t;
 }
 
 namespace rhi {
 
-// Which backend a Device is. Phase 4a makes the seam polymorphic: every impl
-// struct in rhi_impl.h is an abstract base with a Dawn subclass (rhi_dawn.cpp)
-// and a Vulkan subclass (rhi_vk.cpp), selected at Device creation by
-// GpuContext::Init. Callers that must branch (the render path until phase 4b,
-// the table-recording bridge in simulation.cpp) ask the device rather than
-// carrying a parallel flag that could disagree with it.
-enum class BackendKind : uint32_t { Dawn, Vulkan };
+// Which backend a Device is. There is exactly ONE since 2026-08-22 — Dawn was
+// removed (docs/PLAN_vulkan_port.md phase 6 decision log) and its enumerator
+// with it, so a stale `--backend dawn` fails loudly in main.cpp rather than
+// silently running Vulkan under the wrong name.
+//
+// The enum is KEPT rather than collapsed away, and so is the polymorphic impl
+// layer it selects (rhi_impl.h): an abstract base with one subclass costs
+// nothing at ~60 dispatches a tick, and it is the seam phase 7 plugs a
+// paged-residency BufferImpl into. Removing it is the change that would have
+// to be undone.
+enum class BackendKind : uint32_t { Vulkan };
 
 // ---------------------------------------------------------------- enums ----
 // Values are NOT assumed to match any backend's; every backend maps explicitly.
@@ -353,20 +359,18 @@ class CommandEncoder {
 
   // ---- tracked off-table transfers (barrier_graph §8, phase 4a) ------------
   //
-  // Under Dawn these are EXACTLY CopyBufferToBuffer / ClearBuffer — same wgpu
-  // call, byte-identical recording; the id is unused because Dawn derives its
-  // barriers from usage. Under Vulkan the id is how an off-table copy declares
-  // its hazard to the last-access tracker (vk_record.h CopyTracked/FillTracked):
-  // the source's last writer in this command buffer is ordered ahead of the
-  // transfer read by the ordinary §3.3 path, with no scope written by hand.
+  // The `pass::Buf` id is how an off-table copy declares its hazard to the
+  // last-access tracker (vk_record.h CopyTracked/FillTracked): the source's
+  // last writer in this command buffer is ordered ahead of the transfer read
+  // by the ordinary §3.3 path, with no scope written by hand.
   //
   // Use these whenever the SOURCE (or the filled buffer) is a pass-table buffer
   // that may have been written earlier in the SAME command buffer — the
   // readback-ring copies after the tick rows are the canonical case. A copy
   // whose source was written only by previous submits (a gate's staging read)
   // is covered by the head-of-command-buffer barrier and may use the plain
-  // calls. Both the id and the concrete buffer are passed so the Dawn path
-  // needs no lookup and a mismatch between them is visible at the call site.
+  // calls. Both the id and the concrete buffer are passed so a mismatch
+  // between them is visible at the call site.
   void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                    const Buffer& dst, uint64_t dstOffset, uint64_t size) const;
   // vkCmdFillBuffer(0) / ClearBuffer over a tracked table buffer (whole buffer).

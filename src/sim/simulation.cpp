@@ -500,14 +500,6 @@ bool Simulation::ReloadShaders(const rhi::Device& device) {
   return built && !hadError;
 }
 
-// Measurement seam: identical to enc.BeginComputePass() unless the --measure
-// harness has attached a PassTimer (see Simulation::SetPassTimer).
-rhi::ComputePass Simulation::BeginPass(const rhi::CommandEncoder& enc,
-                                               const char* name) const {
-  if (passTimer_ && passTimer_->Valid()) return passTimer_->BeginPass(enc, name);
-  return enc.BeginComputePass();
-}
-
 // ===========================================================================
 // TABLE-DRIVEN RECORDING (docs/PLAN_vulkan_port.md phase 2b)
 //
@@ -540,39 +532,12 @@ struct RecordCtx {
   bool particlesActive = false;
 };
 
-bool CondHolds(pass::Cond c, const RecordCtx& cx) {
-  switch (c) {
-    case pass::Cond::Always:    return true;
-    case pass::Cond::Ops:       return cx.opsCount > 0;
-    case pass::Cond::Cells:     return cx.cellCount > 0;
-    case pass::Cond::Exp:       return cx.expCount > 0;
-    case pass::Cond::Spawn:     return cx.spawnCount > 0;
-    case pass::Cond::Particles: return cx.particlesActive;
-    case pass::Cond::Hash:      return cx.hashEnable;
-    case pass::Cond::DirtyTick: return !cx.hashEnable;
-    case pass::Cond::GenCount:  return cx.genCount > 0;
-    case pass::Cond::FarCount:  return cx.farCount > 0;
-  }
-  return false;
-}
-
-// Dispatch extents. Values below kDynBase are literal; the rest are selectors
-// resolved from this tick's counts.
-uint32_t Extent(uint32_t v, const RecordCtx& cx) {
-  if (v < (uint32_t)pass::DispatchSel::kDynBase) return v;
-  switch ((pass::DispatchSel)v) {
-    case pass::DispatchSel::Ops:      return 4 * cx.opsCount;
-    case pass::DispatchSel::Cells:    return (cx.cellCount + 63) / 64;
-    case pass::DispatchSel::Exp:      return kExplosionWg * cx.expCount;
-    case pass::DispatchSel::ExpWg:    return kExplosionWg;
-    case pass::DispatchSel::Spawn:    return (cx.spawnCount + 63) / 64;
-    case pass::DispatchSel::Chunks:   return kNumChunks;
-    case pass::DispatchSel::Chunks64: return kNumChunks / 64;
-    case pass::DispatchSel::GenCount: return cx.genCount;
-    case pass::DispatchSel::FarCount: return cx.farCount;
-    default:                          return v;
-  }
-}
+// NOTE: the condition and dispatch-extent resolvers that used to live here
+// were the DAWN walk's copies. The Vulkan recorder has always carried its own
+// (Recorder::CondHolds / Recorder::Extent in gpu/vk_record.cpp), which is the
+// only pair left now that the Dawn walk is gone. They read the same
+// pass::Cond / pass::DispatchSel enums, so pass_table.def stays the one
+// declaration.
 
 }  // namespace
 
@@ -651,142 +616,49 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
 
 // Walk one table's rows and record them.
 //
-// The open compute pass is carried across rows: consecutive compute rows that
-// declare the same `group` string share one ComputePassEncoder, and a Fill or
-// Copy row (group == nullptr) closes it, because ClearBuffer and
-// CopyBufferToBuffer are encoder-level commands. That reproduces today's pass
-// structure exactly rather than approximating it.
-//
 // A row whose condition is false is skipped entirely — no pass is opened for
-// it, nothing is recorded, and in phase 3 no buffer's last-access state is
-// touched. barrier_graph §3.9/§7.5: that is the only correct handling, and it
-// is why barriers must be computed at record time against live state rather
-// than precomputed per adjacent table-index pair.
+// it, nothing is recorded, and no buffer's last-access state is touched.
+// barrier_graph §3.9/§7.5: that is the only correct handling, and it is why
+// barriers must be computed at record time against live state rather than
+// precomputed per adjacent table-index pair.
+//
+// SINCE THE DAWN REMOVAL (2026-08-22) there is one walker again. The second
+// one — an inline wgpu-shaped walk that opened a ComputePassEncoder per
+// `group` string and let Dawn derive barriers — is gone with the backend it
+// drove. What survives is the phase-3b/4a shape that mattered: the rows are
+// the Vulkan recorder's LOOP VARIABLE, never a parameter that a call site
+// could forget, and what crosses the bridge (rhi_record.h) is only the
+// RESOLUTION — page-symbolic buffer ids and pipelines, resolved here by
+// PassBuffer/PassPipeline.
 void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
                              const void* ctxOpaque) {
   const RecordCtx& cx = *(const RecordCtx*)ctxOpaque;
 
-  // -------------------------------------------------------------------------
-  // VULKAN (phase 4a): the SAME table, walked by the generated-barrier
-  // recorder. Barrier generation stays exactly the phase-3b shape — the rows
-  // are the recorder's loop variable, never a parameter — and what crosses the
-  // bridge is only the RESOLUTION: the page-symbolic ids and the pipelines,
-  // resolved by the very same PassBuffer/PassPipeline the Dawn walk below uses.
-  // This is what deleted vk_sim.cpp's parallel copy of that resolution.
-  // -------------------------------------------------------------------------
-  if (device_.Kind() == rhi::BackendKind::Vulkan) {
-    rhi::TableCtx tc{};
-    tc.opsCount = cx.opsCount;
-    tc.cellCount = cx.cellCount;
-    tc.expCount = cx.expCount;
-    tc.spawnCount = cx.spawnCount;
-    tc.genCount = cx.genCount;
-    tc.farCount = cx.farCount;
-    tc.hashEnable = cx.hashEnable;
-    tc.particlesActive = cx.particlesActive;
+  rhi::TableCtx tc{};
+  tc.opsCount = cx.opsCount;
+  tc.cellCount = cx.cellCount;
+  tc.expCount = cx.expCount;
+  tc.spawnCount = cx.spawnCount;
+  tc.genCount = cx.genCount;
+  tc.farCount = cx.farCount;
+  tc.hashEnable = cx.hashEnable;
+  tc.particlesActive = cx.particlesActive;
 
-    rhi::TableBindings tb{};
-    for (int i = 0; i < (int)pass::Buf::kCount; i++)
-      tb.buffers[i] = PassBuffer((pass::Buf)i);
-    for (int i = 1; i < (int)pass::Pipe::FarDown + 1; i++)
-      tb.pipelines[i] = PassPipeline((pass::Pipe)i);
-    tb.simLayout = simPL_;
-    tb.slimPartLayout = simPL2_;
-    tb.slimFarLayout = farPL_;
-    tb.simSet = simBG_[page_];
-    tb.slimSet = simSlimBG_[page_];
-    tb.particleSet = particleBG_[page_];
-    tb.farSet = farBG_;
+  rhi::TableBindings tb{};
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    tb.buffers[i] = PassBuffer((pass::Buf)i);
+  for (int i = 1; i < (int)pass::Pipe::FarDown + 1; i++)
+    tb.pipelines[i] = PassPipeline((pass::Pipe)i);
+  tb.simLayout = simPL_;
+  tb.slimPartLayout = simPL2_;
+  tb.slimFarLayout = farPL_;
+  tb.simSet = simBG_[page_];
+  tb.slimSet = simSlimBG_[page_];
+  tb.particleSet = particleBG_[page_];
+  tb.farSet = farBG_;
 
-    rhi::RecordTableVulkan(enc, which, tc, tb,
-                           passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
-    return;
-  }
-
-  rhi::ComputePass open;
-  const char* openGroup = nullptr;
-  auto closePass = [&]() {
-    if (openGroup) {
-      open.End();
-      open = rhi::ComputePass{};
-      openGroup = nullptr;
-    }
-  };
-
-  for (int i = 0; i < pass::kRowCount; i++) {
-    const pass::Row& r = pass::kRows[i];
-    if (r.table != which) continue;
-    if (!CondHolds(r.cond, cx)) continue;
-
-    if (r.kind == pass::Kind::Fill) {
-      closePass();
-      enc.ClearBuffer(PassBuffer(r.uses[0].buf), 0, rhi::kWholeSize);
-      continue;
-    }
-    if (r.kind == pass::Kind::Copy) {
-      closePass();
-      // Copy rows carry (srcOffset, dstOffset, size) in x/y/z, and exactly two
-      // uses: the transfer read then the transfer write.
-      enc.CopyBufferToBuffer(PassBuffer(r.uses[0].buf), r.x,
-                             PassBuffer(r.uses[1].buf), r.y, r.z);
-      continue;
-    }
-
-    // Compute / ComputeIndirect.
-    if (!openGroup || r.group != openGroup) {
-      closePass();
-      open = BeginPass(enc, r.group);
-      openGroup = r.group;
-    }
-
-    // Bind groups are set per ROW rather than once per pass. The hand-written
-    // recorder set them before each dispatch block inside the shared prep pass
-    // (mutate, mutateCells, explode, spawn and compact each re-bound), and
-    // SetBindGroup to the same group is idempotent, so per-row is both faithful
-    // and free of a "did the previous row leave the right groups bound?"
-    // question that a future row insertion would silently get wrong.
-    {
-      uint32_t off = 0;
-      switch (r.groups) {
-        case pass::Groups::Sim:
-          open.SetBindGroup(0, simBG_[page_], 1, &off);
-          break;
-        case pass::Groups::SlimPart:
-          open.SetBindGroup(0, simSlimBG_[page_]);
-          open.SetBindGroup(1, particleBG_[page_]);
-          break;
-        case pass::Groups::SlimFar:
-          open.SetBindGroup(0, simSlimBG_[page_]);
-          open.SetBindGroup(1, farBG_);
-          break;
-        default:
-          break;
-      }
-    }
-
-    open.SetPipeline(PassPipeline(r.pipe));
-
-    for (uint32_t k = 0; k < r.repeat; k++) {
-      if (r.dyn == pass::Dyn::Ca) {
-        // The per-iteration passUBO slice: colour phase + gravity substep. Two
-        // iterations are two DIFFERENT colours, which is exactly why they must
-        // never overlap — see the lattice note in pass_table.def's header.
-        uint32_t offset = k * kPassStride;
-        open.SetBindGroup(0, simBG_[page_], 1, &offset);
-      }
-      if (r.kind == pass::Kind::ComputeIndirect) {
-        const rhi::Buffer& args =
-            (pass::DispatchSel)r.x == pass::DispatchSel::IndPDispatchArgs
-                ? world_->pDispatchArgs
-                : world_->dispatchArgs;
-        open.DispatchWorkgroupsIndirect(args, 0);
-      } else {
-        open.DispatchWorkgroups(Extent(r.x, cx), Extent(r.y, cx),
-                                Extent(r.z, cx));
-      }
-    }
-  }
-  closePass();
+  rhi::RecordTableVulkan(enc, which, tc, tb,
+                         passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
 }
 
 void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc) {

@@ -970,11 +970,10 @@ int main(int argc, char** argv) {
   // comparison over an ACTIVE world (ops, explosions, particles, readback ring,
   // streaming) rather than a quiet one.
   bool vkSmokeLoud = false;
-  // The backend. VULKAN IS THE DEFAULT since port phase 6 (2026-08-22): it runs
-  // all 23 gates with results identical to Dawn's, renders windowed, and is
-  // ~25% cheaper on a settled tick. `--backend dawn` selects Dawn, which is
-  // retained through phase 7 as the cross-backend hash ORACLE — the thing that
-  // makes a rule-1 divergence visible — not as a fallback.
+  // The backend. VULKAN IS THE ONLY ONE since 2026-08-22 (user decision;
+  // docs/PLAN_vulkan_port.md phase 6 decision log): Dawn was removed after it
+  // ran all 23 gates with results identical to Vulkan's for a full phase. The
+  // variable stays because the rhi:: seam stays.
   rhi::BackendKind backend = rhi::BackendKind::Vulkan;
   bool sledgehammer = false;  // --barriers=sledgehammer (barrier_graph §6.2 oracle)
   bool vkValidation = false;  // --vk-validation: VK_LAYER_KHRONOS_validation + sync
@@ -1027,32 +1026,37 @@ int main(int argc, char** argv) {
     // `--vk-info` is the Vulkan port's phase-3a exit proof (src/gpu/vk_info.cpp):
     // create a VkDevice, print the capability record phase 7 needs, compile
     // every WGSL shader to SPIR-V through Tint, build every compute pipeline,
-    // zero-init and submit one fenced command buffer. Headless, and it does NOT
-    // touch Dawn or run any sim work — Vulkan executes nothing but the
-    // zero-init fills until phase 3b.
+    // zero-init and submit one fenced command buffer. Headless, and it runs no
+    // sim work — the only commands submitted are the zero-init fills.
     if (a == "--vk-info") vkInfo = true;
-    // `--vk-smoke` is the phase-3b exit proof (src/gpu/vk_smoke.cpp): the same
-    // seed worldgen'd and ticked on BOTH backends, with the world hashes
-    // compared. Dawn's auto-generated barriers are the reference implementation
-    // of docs/vulkan_barrier_graph.md, so this is the strongest single test the
-    // generated-barrier recorder has (§6.3).
+    // `--vk-smoke` runs a quiet 50-tick world and compares its hashes against
+    // the PINNED sequence (src/gpu/vk_smoke.cpp). It used to compare Dawn
+    // against Vulkan; with Dawn gone the pinned values ARE the reference, so
+    // the regression power the cross-backend diff provided is preserved.
     if (a == "--vk-smoke") vkSmoke = true;
-    // `--vk-smoke-loud` is the phase-3c exit proof. The quiet smoke above
-    // exercises every STRUCTURAL feature of the tick table; this one reaches
-    // everything gated behind a condition a quiet world never satisfies — the
-    // brush/cell mutation kernels, the explosion mark/apply split, the whole
-    // particle chain, the readback ring, and a streaming walk that forces
-    // eviction, store-hit refill and procgen fill.
+    // `--vk-smoke-loud` does the same over 120 ticks of an ACTIVE world,
+    // reaching everything a quiet world leaves dark — the brush/cell mutation
+    // kernels, the explosion mark/apply split, the whole particle chain, the
+    // readback ring, and a streaming walk that forces eviction and procgen
+    // refill. 19 pinned probes.
     if (a == "--vk-smoke-loud") vkSmokeLoud = true;
-    // `--backend dawn` selects the reference backend; `--backend vulkan` names
-    // the default explicitly. Both spellings stay accepted so existing
-    // invocations and scripts keep working across the phase-6 flip.
+    // `--backend vulkan` names the only backend explicitly, so existing
+    // invocations and scripts keep working. `--backend dawn` is REFUSED with
+    // an explanation rather than quietly served by Vulkan: a run reported as
+    // Dawn that was Vulkan all along is worse than no run — the same principle
+    // that made phase 3b refuse `--backend vulkan` before it could honour it.
     if (a == "--backend" && i + 1 < argc) {
       std::string b = argv[++i];
-      if (b == "vulkan") backend = rhi::BackendKind::Vulkan;
-      else if (b == "dawn") backend = rhi::BackendKind::Dawn;
-      else {
-        std::fprintf(stderr, "unknown --backend '%s' (expected dawn|vulkan)\n", b.c_str());
+      if (b == "vulkan") {
+        backend = rhi::BackendKind::Vulkan;
+      } else if (b == "dawn") {
+        std::fprintf(stderr,
+                     "--backend dawn: Dawn was REMOVED 2026-08-22 and the engine is\n"
+                     "Vulkan-only (docs/PLAN_vulkan_port.md phase 6 decision log).\n"
+                     "Drop the flag, or pass --backend vulkan.\n");
+        return 2;
+      } else {
+        std::fprintf(stderr, "unknown --backend '%s' (expected vulkan)\n", b.c_str());
         return 2;
       }
     }
@@ -1072,19 +1076,15 @@ int main(int argc, char** argv) {
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
 
-  // --vk-info likewise answers before any Dawn device exists: it is a Vulkan-only
-  // path, and running it ahead of GpuContext keeps the two backends from
-  // competing for the adapter while phase 3a is still headless.
+  // --vk-info answers before any GpuContext exists: it builds its own device
+  // to print the capability record, so it must not race the engine's for the
+  // adapter.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
-  // Every mode below runs its real body against whichever backend was selected
-  // — the 23 selftest gates, --shot/--shot-mob, --measure, and the windowed
-  // game (swapchain + imgui_impl_vulkan). Since phase 6 that is Vulkan unless
-  // --backend dawn says otherwise.
-  //
-  // The smokes run BOTH backends by construction, so they do not need
-  // --backend to select one; accepting the flag anyway keeps invocations
-  // uniform.
+  // Every mode below — the 23 selftest gates, --shot/--shot-mob, --measure and
+  // the windowed game (swapchain + imgui_impl_vulkan) — runs on Vulkan, the
+  // only backend. The smokes build their own GpuContext, so they run here
+  // before the game's asset load.
   if (vkSmoke) return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation);
   if (vkSmokeLoud)
     return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation);

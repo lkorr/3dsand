@@ -288,14 +288,13 @@ int Run(Ctx& c, const Options& opt) {
   }
   auto known = LoadBaseline(bpath);
 
-  std::printf("=== selftest === (%zu gate%s, backend %s)\n", plan.size(),
-              plan.size() == 1 ? "" : "s",
-              c.ctx.backendKind == rhi::BackendKind::Dawn ? "dawn" : "vulkan");
+  std::printf("=== selftest === (%zu gate%s, backend vulkan)\n", plan.size(),
+              plan.size() == 1 ? "" : "s");
 
-  // The shared offscreen target every render-touching gate draws into. Both
-  // backends since phase 4b — Gate::needsRender remains declared (and printed
-  // by --list) as documentation of which gates drive the render path, but
-  // nothing skips on it any more: all 23 gates run on --backend vulkan.
+  // The shared offscreen target every render-touching gate draws into.
+  // Gate::needsRender remains declared (and printed by --list) as
+  // documentation of which gates drive the render path, but nothing skips on
+  // it: all 23 gates run.
   c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
   c.view = c.offscreen.CreateView();
 
