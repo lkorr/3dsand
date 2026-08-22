@@ -69,10 +69,9 @@ bool fogOk = false;
     TickParams tp{0, kDefaultSeed, 0, 0};
     tp.farCount = n;
     ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeFarFill(enc, n);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    ctx.queue.Submit(enc.Finish());
     float r = far.SafeRadiusMeters();
     if (r < prevR) monotone = false;
     prevR = r;
@@ -121,23 +120,14 @@ bool farDownOk = false;
     uint32_t ch = ((z >> 4) * kFarNChunk + (y >> 4)) * kFarNChunk + (x >> 4);
     uint32_t lo = ((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15);
     uint64_t bi = (uint64_t)ch * kChunkVol + lo;
-    wgpu::Buffer staging = CreateBuffer(
-        ctx.device, 4, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer staging = CreateBuffer(
+        ctx.device, 4, rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
         "farVoxRead");
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     enc.CopyBufferToBuffer(world.farVox, bi & ~3ull, staging, 0, 4);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    ctx.queue.Submit(enc.Finish());
     uint32_t word = 0;
-    wgpu::Future f = staging.MapAsync(
-        wgpu::MapMode::Read, 0, 4, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          if (status == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(&word, staging.GetConstMappedRange(0, 4), 4);
-            staging.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    rhi::ReadBufferBlocking(ctx.device, staging, 0, &word, (size_t)(4));
     return (word >> ((bi & 3ull) * 8)) & 0xFFu;
   };
   auto scan = [&](uint32_t want) {
@@ -178,8 +168,8 @@ Status GateScreenshots(Ctx& c, std::string& detail) {
   Simulation& sim = c.sim;
   const uint32_t W = c.width;
   const uint32_t H = c.height;
-  wgpu::Texture& offscreen = c.offscreen;
-  wgpu::TextureView& view = c.view;
+  rhi::Texture& offscreen = c.offscreen;
+  rhi::TextureView& view = c.view;
 // render perf: offscreen 1080p. The target itself is created once by the
 // harness and shared with every other gate that draws (Ctx::offscreen).
 
@@ -199,14 +189,13 @@ for (int pass = 0; pass < 2; pass++) {
   double r0 = NowSeconds();
   for (int i = 0; i < 60; i++) {
     WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, shadows, 0);
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    wgpu::RenderPassEncoder rp =
-        sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
     sim.DrawParticles(rp);
     rp.End();
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    ctx.queue.Submit(enc.Finish());
   }
   ctx.WaitIdle();
   double ms = (NowSeconds() - r0) * 1000.0 / 60.0;
@@ -218,33 +207,22 @@ for (int pass = 0; pass < 2; pass++) {
 // Read the offscreen target back and write it out. Shared by the standard
 // screenshot and the far-field view below.
 auto grab = [&](const char* path) {
-  wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
-                                   wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+  rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                    "screenshot");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  wgpu::TexelCopyTextureInfo srcT{};
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::TexelCopyTexture srcT{};
   srcT.texture = offscreen;
-  wgpu::TexelCopyBufferInfo dstB{};
+  rhi::TexelCopyBuffer dstB{};
   dstB.buffer = shot;
-  dstB.layout.bytesPerRow = W * 4;
-  dstB.layout.rowsPerImage = H;
-  wgpu::Extent3D ext{W, H, 1};
-  enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  dstB.bytesPerRow = W * 4;
+  dstB.rowsPerImage = H;
+  rhi::Extent3D ext{W, H, 1};
+  enc.CopyTextureToBuffer(srcT, dstB, ext);
+  ctx.queue.Submit(enc.Finish());
   std::vector<uint8_t> pixels(W * H * 4);
   bool got = false;
-  wgpu::Future f = shot.MapAsync(
-      wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          std::memcpy(pixels.data(), shot.GetConstMappedRange(0, pixels.size()),
-                      pixels.size());
-          shot.Unmap();
-          got = true;
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  got = rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), (size_t)(pixels.size()));
   if (got && WriteBmpFile(path, pixels, W, H)) std::printf("wrote %s\n", path);
 };
 
@@ -265,13 +243,12 @@ grab("screenshot.bmp");
   // which is exactly what happened when worldgen grew taller trees.
   Vec3 farEye{140, 220, 140};
   WriteRenderParams(ctx.queue, world, farEye, farCam, (float)W / H, true, 0);
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  wgpu::RenderPassEncoder rp =
-      sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::RenderPass rp =
+      sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
   sim.DrawWorld(rp);
   rp.End();
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  ctx.queue.Submit(enc.Finish());
   ctx.WaitIdle();
   grab("screenshot_far.bmp");
 }
@@ -286,13 +263,12 @@ grab("screenshot.bmp");
   gCam.pitch = -0.02f;
   Vec3 gEye{108, (float)(World::TerrainHeight(108, 108, kDefaultSeed) + 28), 108};
   WriteRenderParams(ctx.queue, world, gEye, gCam, (float)W / H, true, 0);
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  wgpu::RenderPassEncoder rp =
-      sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::RenderPass rp =
+      sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
   sim.DrawWorld(rp);
   rp.End();
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  ctx.queue.Submit(enc.Finish());
   ctx.WaitIdle();
   grab("screenshot_ground.bmp");
 }

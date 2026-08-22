@@ -40,25 +40,9 @@ namespace {
 // 128 KiB at 512^3 / 16^3). Measurement harness only.
 std::vector<uint32_t> ReadOccupancySync(GpuContext& ctx, World& world) {
   const uint64_t bytes = (uint64_t)kNumChunks * 4;
-  wgpu::Buffer staging =
-      CreateBuffer(ctx.device, bytes,
-                   wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-                   "occRead");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(world.occupancy, 0, staging, 0, bytes);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
   std::vector<uint32_t> out(kNumChunks, 0);
-  wgpu::Future f = staging.MapAsync(
-      wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          std::memcpy(out.data(), staging.GetConstMappedRange(0, bytes),
-                      (size_t)bytes);
-          staging.Unmap();
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy, 0, out.data(),
+                        (size_t)bytes, "occRead");
   return out;
 }
 

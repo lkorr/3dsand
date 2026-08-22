@@ -79,9 +79,7 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
 
 void Stream::Update(IVec3 playerChunk) {
   // harvest evictions whose readback completed since last tick (non-blocking)
-  while (!pending_.empty() &&
-         ctx_->instance.WaitAny(pending_.front().future, 0) ==
-             wgpu::WaitStatus::Success)
+  while (!pending_.empty() && pending_.front().map.Ready())
     CompleteOldest(/*discard=*/false);
 
   // sticky modified set from the latest snapshot (slot-indexed, ~2 ticks
@@ -158,9 +156,8 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     size_t n = std::min(kEvictBatch, toSave.size() - off);
     PendingEvict p;
     p.staging = AcquireStaging();
-    p.mapStatus = std::make_shared<uint32_t>(0);
     p.items.reserve(n);
-    wgpu::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+    rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     for (size_t i = 0; i < n; i++) {
       enc.CopyBufferToBuffer(world_->voxels,
                              (uint64_t)toSave[off + i].first * kChunkBytes,
@@ -168,29 +165,24 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       p.items.push_back(toSave[off + i].second);
       pendingChunks_[World::PackChunkKey(toSave[off + i].second.wc)]++;
     }
-    wgpu::CommandBuffer cmd = enc.Finish();
     // submit BEFORE FillSlots writes: queue order makes the copy read the
     // leaving plane's data even though the map completes ticks later
-    ctx_->queue.Submit(1, &cmd);
-    p.future = p.staging.MapAsync(
-        wgpu::MapMode::Read, 0, n * kChunkBytes, wgpu::CallbackMode::WaitAnyOnly,
-        [st = p.mapStatus](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          *st = status == wgpu::MapAsyncStatus::Success ? 1u : 2u;
-        });
+    ctx_->queue.Submit(enc.Finish());
+    p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, n * kChunkBytes);
     pending_.push_back(std::move(p));
   }
 }
 
-wgpu::Buffer Stream::AcquireStaging() {
+rhi::Buffer Stream::AcquireStaging() {
   if (stagingPool_.empty() && pending_.size() >= kMaxPendingEvicts)
     CompleteOldest(/*discard=*/false);  // ring full: recycle the oldest
   if (!stagingPool_.empty()) {
-    wgpu::Buffer b = stagingPool_.back();
+    rhi::Buffer b = stagingPool_.back();
     stagingPool_.pop_back();
     return b;
   }
   return CreateBuffer(ctx_->device, kEvictBatch * kChunkBytes,
-                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                       "evictStaging");
 }
 
@@ -198,12 +190,11 @@ void Stream::CompleteOldest(bool discard) {
   if (pending_.empty()) return;
   PendingEvict p = std::move(pending_.front());
   pending_.pop_front();
-  ctx_->instance.WaitAny(p.future, UINT64_MAX);  // fires the map callback
+  p.map.Wait();  // resolves the map
 
-  if (*p.mapStatus == 1) {
+  if (p.map.Succeeded()) {
     if (!discard) {
-      const uint8_t* ptr = (const uint8_t*)p.staging.GetConstMappedRange(
-          0, p.items.size() * kChunkBytes);
+      const uint8_t* ptr = (const uint8_t*)p.map.Data();
       if (ptr) {
         std::vector<uint32_t> data(kChunkVol);
         std::vector<uint32_t> rle;
@@ -216,7 +207,7 @@ void Stream::CompleteOldest(bool discard) {
         }
       }
     }
-    p.staging.Unmap();
+    p.map.Unmap();
     stagingPool_.push_back(p.staging);
   }
   // a failed map (device error) loses the batch AND retires the buffer; keep going
@@ -271,10 +262,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     IVec3 o = world_->WindowOrigin();
     tp.origin[0] = o.x; tp.origin[1] = o.y; tp.origin[2] = o.z;
     ctx_->queue.WriteBuffer(world_->tickUBO, 0, &tp, sizeof(tp));
-    wgpu::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+    rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     sim_->EncodeGenList(enc, (uint32_t)genSlots.size());
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx_->queue.Submit(1, &cmd);
+    ctx_->queue.Submit(enc.Finish());
   }
 }
 

@@ -7,7 +7,7 @@
 
 static constexpr uint32_t kPassStride = 256;  // min uniform dynamic-offset alignment
 
-bool Simulation::Init(const wgpu::Device& device, World& world,
+bool Simulation::Init(const rhi::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
                       const std::vector<ReactionGpu>& reactions,
                       const MicroSet& micro,
@@ -15,13 +15,13 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
   world_ = &world;
   device_ = device;
   shaderDir_ = shaderDir;
-  wgpu::Queue queue = device.GetQueue();
+  rhi::Queue queue = device.GetQueue();
 
   materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
-                              wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "materials");
   reactionBuf_ = CreateBuffer(device, sizeof(ReactionGpu) * kMaxReactions,
-                              wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "reactions");
   UploadTables(queue, mats, reactions);
 
@@ -29,10 +29,10 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
   // ONLY to the raymarch pipeline: they are render data, and a sim shader that
   // could read them would put the renderer on the sim's dependency graph.
   microTableBuf_ = CreateBuffer(device, sizeof(MicroBrickGpu) * kMaterialSlots,
-                                wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                                 "microBricks");
   microPoolBuf_ = CreateBuffer(device, (uint64_t)kMicroPoolWords * 4,
-                               wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                                "microPool");
   UploadMicro(queue, micro);
 
@@ -40,13 +40,13 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
   // once the mob defs have loaded — mobs load after the Simulation exists, and
   // an empty table is a perfectly valid "no micro bodies" state.
   mbModelBuf_ = CreateBuffer(device, sizeof(MicroBodyModelGpu) * kMaxMicroBodyModels,
-                             wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                             rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                              "microBodyModels");
   mbPoolBuf_ = CreateBuffer(device, (uint64_t)kMicroBodyPoolWordsWorld * 4,
-                            wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                            rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                             "microBodyPool");
   mbInstBuf_ = CreateBuffer(device, sizeof(MicroBodyInstGpu) * kMaxBodySlots,
-                            wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                            rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                             "microBodyInsts");
   UploadMicroBodies(queue, MicroBodySet{});
 
@@ -66,17 +66,17 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
 
   // ---- bind group layouts ----
   {
-    auto entry = [](uint32_t binding, wgpu::BufferBindingType type,
+    auto entry = [](uint32_t binding, rhi::BufferBindingType type,
                     bool dynamic = false) {
-      wgpu::BindGroupLayoutEntry e{};
+      rhi::BindGroupLayoutEntry e{};
       e.binding = binding;
-      e.visibility = wgpu::ShaderStage::Compute;
-      e.buffer.type = type;
-      e.buffer.hasDynamicOffset = dynamic;
+      e.visibility = rhi::ShaderStage::Compute;
+      e.type = type;
+      e.hasDynamicOffset = dynamic;
       return e;
     };
-    using T = wgpu::BufferBindingType;
-    wgpu::BindGroupLayoutEntry entries[] = {
+    using T = rhi::BufferBindingType;
+    rhi::BindGroupLayoutEntry entries[] = {
         entry(0, T::Storage),          // voxels
         entry(1, T::Storage),          // dirtyIn
         entry(2, T::Storage),          // dirtyOut
@@ -95,27 +95,22 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(15, T::Storage),         // support-loss flags (sim_step writes)
         entry(16, T::ReadOnlyStorage), // genList (worldgen streaming slots)
     };
-    wgpu::BindGroupLayoutDescriptor d{};
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    simBGL_ = device.CreateBindGroupLayout(&d);
+    simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
     // slim group 0 (bindings 0..4 only) for particle/explosion pipelines:
     // pairing the full simBGL_ with particleBGL_ would exceed the
     // 16-storage-buffer per-stage layout limit
-    wgpu::BindGroupLayoutEntry sentries[] = {
+    rhi::BindGroupLayoutEntry sentries[] = {
         entry(0, T::Storage),          // voxels
         entry(1, T::Storage),          // dirtyIn
         entry(2, T::Storage),          // dirtyOut
         entry(3, T::ReadOnlyStorage),  // materials
         entry(4, T::Uniform),          // TickParams
     };
-    d.entryCount = std::size(sentries);
-    d.entries = sentries;
-    simSlimBGL_ = device.CreateBindGroupLayout(&d);
+    simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
     // group 1: particle machinery (explode/integrate/resolve/args kernels)
-    wgpu::BindGroupLayoutEntry pentries[] = {
+    rhi::BindGroupLayoutEntry pentries[] = {
         entry(0, T::Storage),          // particles read page
         entry(1, T::Storage),          // particles write page
         entry(2, T::Storage),          // counts
@@ -125,22 +120,20 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(6, T::Storage),          // explosion destruction scratch
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
     };
-    d.entryCount = std::size(pentries);
-    d.entries = pentries;
-    particleBGL_ = device.CreateBindGroupLayout(&d);
+    particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
   }
   {
-    auto entry = [](uint32_t binding, wgpu::BufferBindingType type,
-                    wgpu::ShaderStage vis) {
-      wgpu::BindGroupLayoutEntry e{};
+    auto entry = [](uint32_t binding, rhi::BufferBindingType type,
+                    rhi::ShaderStage vis) {
+      rhi::BindGroupLayoutEntry e{};
       e.binding = binding;
       e.visibility = vis;
-      e.buffer.type = type;
+      e.type = type;
       return e;
     };
-    using T = wgpu::BufferBindingType;
-    using S = wgpu::ShaderStage;
-    wgpu::BindGroupLayoutEntry entries[] = {
+    using T = rhi::BufferBindingType;
+    using S = rhi::ShaderStage;
+    rhi::BindGroupLayoutEntry entries[] = {
         entry(0, T::ReadOnlyStorage, S::Fragment),               // voxels
         entry(1, T::ReadOnlyStorage, S::Fragment),               // occupancy
         entry(2, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // materials
@@ -156,12 +149,9 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         entry(7, T::ReadOnlyStorage, S::Fragment),               // microBricks
         entry(8, T::ReadOnlyStorage, S::Fragment),               // microPool
     };
-    wgpu::BindGroupLayoutDescriptor d{};
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    renderBGL_ = device.CreateBindGroupLayout(&d);
+    renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
-    wgpu::BindGroupLayoutEntry pentries[] = {
+    rhi::BindGroupLayoutEntry pentries[] = {
         entry(0, T::ReadOnlyStorage, S::Vertex),  // particles (live page)
         entry(1, T::ReadOnlyStorage, S::Vertex),  // sprites
         entry(2, T::ReadOnlyStorage, S::Vertex),  // debris body voxel instances
@@ -171,9 +161,7 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         // off overlay costs nothing but this declaration.
         entry(4, T::ReadOnlyStorage, S::Vertex),  // debug wireframe boxes
     };
-    d.entryCount = std::size(pentries);
-    d.entries = pentries;
-    renderPartBGL_ = device.CreateBindGroupLayout(&d);
+    renderPartBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
 
     // Micro bodies get their OWN group 1 rather than extending renderPartBGL_.
     // Three reasons: the model/pool reads happen in the FRAGMENT stage (the
@@ -182,79 +170,62 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
     // stage — pairing renderBGL_'s 7 fragment storage entries with these 4
     // gives 11, comfortably under 16, whereas piling everything into one group
     // would have to be re-audited every time either side grows.
-    wgpu::BindGroupLayoutEntry mbentries[] = {
+    rhi::BindGroupLayoutEntry mbentries[] = {
         entry(0, T::ReadOnlyStorage, S::Vertex | S::Fragment),  // bodyXforms
         entry(1, T::ReadOnlyStorage, S::Vertex | S::Fragment),  // models
         entry(2, T::ReadOnlyStorage, S::Fragment),              // brick pool
         entry(3, T::ReadOnlyStorage, S::Vertex | S::Fragment),  // draw list
     };
-    d.entryCount = std::size(mbentries);
-    d.entries = mbentries;
-    microBodyBGL_ = device.CreateBindGroupLayout(&d);
+    microBodyBGL_ = device.CreateBindGroupLayout(mbentries, std::size(mbentries));
   }
   {
-    wgpu::PipelineLayoutDescriptor d{};
-    d.bindGroupLayoutCount = 1;
-    d.bindGroupLayouts = &simBGL_;
-    simPL_ = device.CreatePipelineLayout(&d);
+    simPL_ = device.CreatePipelineLayout(&simBGL_, 1);
 
-    wgpu::BindGroupLayout simGroups[] = {simSlimBGL_, particleBGL_};
-    d.bindGroupLayoutCount = 2;
-    d.bindGroupLayouts = simGroups;
-    simPL2_ = device.CreatePipelineLayout(&d);
+    rhi::BindGroupLayout simGroups[] = {simSlimBGL_, particleBGL_};
+    simPL2_ = device.CreatePipelineLayout(simGroups, 2);
 
-    wgpu::BindGroupLayout renderGroups[] = {renderBGL_, renderPartBGL_};
-    d.bindGroupLayoutCount = 2;
-    d.bindGroupLayouts = renderGroups;
-    renderPL_ = device.CreatePipelineLayout(&d);
+    rhi::BindGroupLayout renderGroups[] = {renderBGL_, renderPartBGL_};
+    renderPL_ = device.CreatePipelineLayout(renderGroups, 2);
 
-    wgpu::BindGroupLayout mbGroups[] = {renderBGL_, microBodyBGL_};
-    d.bindGroupLayoutCount = 2;
-    d.bindGroupLayouts = mbGroups;
-    microBodyPL_ = device.CreatePipelineLayout(&d);
+    rhi::BindGroupLayout mbGroups[] = {renderBGL_, microBodyBGL_};
+    microBodyPL_ = device.CreatePipelineLayout(mbGroups, 2);
   }
   {
     // far-field cascade fill + downsample: slim sim group 0 (`far` statically
     // uses only materials + TickParams; `fardown` adds voxels) + far buffers
     // as group 1. 4 storage entries in slim + 4 here = 8, well under Dawn's
     // 16-per-stage layout limit.
-    auto entry = [](uint32_t binding, wgpu::BufferBindingType type) {
-      wgpu::BindGroupLayoutEntry e{};
+    auto entry = [](uint32_t binding, rhi::BufferBindingType type) {
+      rhi::BindGroupLayoutEntry e{};
       e.binding = binding;
-      e.visibility = wgpu::ShaderStage::Compute;
-      e.buffer.type = type;
+      e.visibility = rhi::ShaderStage::Compute;
+      e.type = type;
       return e;
     };
-    using T = wgpu::BufferBindingType;
-    wgpu::BindGroupLayoutEntry entries[] = {
+    using T = rhi::BufferBindingType;
+    rhi::BindGroupLayoutEntry entries[] = {
         entry(0, T::Storage),          // farVox
         entry(1, T::Storage),          // farOcc
         entry(2, T::ReadOnlyStorage),  // farList
         entry(3, T::Uniform),          // FarParams
         entry(4, T::ReadOnlyStorage),  // dirtyList (phase-2 downsample work set)
     };
-    wgpu::BindGroupLayoutDescriptor d{};
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    farBGL_ = device.CreateBindGroupLayout(&d);
+    farBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
-    wgpu::BindGroupLayout farGroups[] = {simSlimBGL_, farBGL_};
-    wgpu::PipelineLayoutDescriptor pd{};
-    pd.bindGroupLayoutCount = 2;
-    pd.bindGroupLayouts = farGroups;
-    farPL_ = device.CreatePipelineLayout(&pd);
+    rhi::BindGroupLayout farGroups[] = {simSlimBGL_, farBGL_};
+    farPL_ = device.CreatePipelineLayout(farGroups, 2);
   }
 
   // ---- bind groups ----
-  auto b = [](uint32_t binding, const wgpu::Buffer& buf, uint64_t size = 0) {
-    wgpu::BindGroupEntry e{};
+  auto b = [](uint32_t binding, const rhi::Buffer& buf, uint64_t size = 0) {
+    rhi::BindGroupEntry e{};
     e.binding = binding;
     e.buffer = buf;
-    e.size = size ? size : wgpu::kWholeSize;
+    e.size = size;  // 0 = whole buffer, per rhi::BindGroupEntry
     return e;
   };
   for (int page = 0; page < 2; page++) {
-    wgpu::BindGroupEntry entries[] = {
+    rhi::BindGroupEntry entries[] = {
         b(0, world_->voxels),
         b(1, world_->dirty[page]),
         b(2, world_->dirty[1 - page]),
@@ -273,25 +244,19 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(15, world_->support),
         b(16, world_->genList),
     };
-    wgpu::BindGroupDescriptor d{};
-    d.layout = simBGL_;
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    simBG_[page] = device.CreateBindGroup(&d);
+    simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
-    wgpu::BindGroupEntry sentries[] = {
+    rhi::BindGroupEntry sentries[] = {
         b(0, world_->voxels),
         b(1, world_->dirty[page]),
         b(2, world_->dirty[1 - page]),
         b(3, materialBuf_),
         b(4, world_->tickUBO),
     };
-    d.layout = simSlimBGL_;
-    d.entryCount = std::size(sentries);
-    d.entries = sentries;
-    simSlimBG_[page] = device.CreateBindGroup(&d);
+    simSlimBG_[page] =
+        device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
 
-    wgpu::BindGroupEntry pentries[] = {
+    rhi::BindGroupEntry pentries[] = {
         b(0, world_->particles[page]),
         b(1, world_->particles[1 - page]),
         b(2, world_->particleCounts),
@@ -301,25 +266,21 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(6, world_->expMask),
         b(7, world_->spawnOps),
     };
-    d.layout = particleBGL_;
-    d.entryCount = std::size(pentries);
-    d.entries = pentries;
-    particleBG_[page] = device.CreateBindGroup(&d);
+    particleBG_[page] =
+        device.CreateBindGroup(particleBGL_, pentries, std::size(pentries), "particleBG");
 
-    wgpu::BindGroupEntry rpentries[] = {
+    rhi::BindGroupEntry rpentries[] = {
         b(0, world_->particles[page]),
         b(1, world_->sprites),
         b(2, world_->bodyInstances),
         b(3, world_->bodyXforms),
         b(4, world_->debugBoxes),
     };
-    d.layout = renderPartBGL_;
-    d.entryCount = std::size(rpentries);
-    d.entries = rpentries;
-    renderPartBG_[page] = device.CreateBindGroup(&d);
+    renderPartBG_[page] = device.CreateBindGroup(renderPartBGL_, rpentries,
+                                                 std::size(rpentries), "renderPartBG");
   }
   {
-    wgpu::BindGroupEntry entries[] = {
+    rhi::BindGroupEntry entries[] = {
         b(0, world_->voxels),
         b(1, world_->occupancy),
         b(2, materialBuf_),
@@ -330,38 +291,27 @@ bool Simulation::Init(const wgpu::Device& device, World& world,
         b(7, microTableBuf_),
         b(8, microPoolBuf_),
     };
-    wgpu::BindGroupDescriptor d{};
-    d.layout = renderBGL_;
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    renderBG_ = device.CreateBindGroup(&d);
+    renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
   {
-    wgpu::BindGroupEntry entries[] = {
+    rhi::BindGroupEntry entries[] = {
         b(0, world_->bodyXforms),
         b(1, mbModelBuf_),
         b(2, mbPoolBuf_),
         b(3, mbInstBuf_),
     };
-    wgpu::BindGroupDescriptor d{};
-    d.layout = microBodyBGL_;
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    microBodyBG_ = device.CreateBindGroup(&d);
+    microBodyBG_ =
+        device.CreateBindGroup(microBodyBGL_, entries, std::size(entries), "microBodyBG");
   }
   {
-    wgpu::BindGroupEntry entries[] = {
+    rhi::BindGroupEntry entries[] = {
         b(0, world_->farVox),
         b(1, world_->farOcc),
         b(2, world_->farList),
         b(3, world_->farUBO),
         b(4, world_->dirtyList),
     };
-    wgpu::BindGroupDescriptor d{};
-    d.layout = farBGL_;
-    d.entryCount = std::size(entries);
-    d.entries = entries;
-    farBG_ = device.CreateBindGroup(&d);
+    farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
   }
 
   std::string err;
@@ -389,7 +339,7 @@ void Simulation::ApplyArtPalette(std::vector<MaterialGpu>& table) const {
     table[kArtPaletteBaseGpu + i].color0 = ArtRgbToGpu(artPalette_[i]);
 }
 
-void Simulation::SetArtPalette(const wgpu::Queue& queue,
+void Simulation::SetArtPalette(const rhi::Queue& queue,
                                const std::vector<uint32_t>& rgb) {
   artPalette_ = rgb;
   if (artPalette_.size() > kArtPaletteSlotsGpu)
@@ -404,7 +354,7 @@ void Simulation::SetArtPalette(const wgpu::Queue& queue,
                     run.data(), run.size() * sizeof(MaterialGpu));
 }
 
-void Simulation::UploadTables(const wgpu::Queue& queue,
+void Simulation::UploadTables(const rhi::Queue& queue,
                               const std::vector<MaterialDef>& mats,
                               const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
@@ -436,7 +386,7 @@ void Simulation::UploadTables(const wgpu::Queue& queue,
   queue.WriteBuffer(reactionBuf_, 0, rtable.data(), rtable.size() * sizeof(ReactionGpu));
 }
 
-void Simulation::UploadMicro(const wgpu::Queue& queue, const MicroSet& micro) {
+void Simulation::UploadMicro(const rhi::Queue& queue, const MicroSet& micro) {
   // The table is exactly kMaterialSlots entries by construction (LoadMicroVox
   // sizes it), but a caller that hands over a default-constructed MicroSet
   // must still leave the GPU with a well-formed "nothing has a micro model"
@@ -451,7 +401,7 @@ void Simulation::UploadMicro(const wgpu::Queue& queue, const MicroSet& micro) {
   }
 }
 
-void Simulation::UploadMicroBodies(const wgpu::Queue& queue,
+void Simulation::UploadMicroBodies(const rhi::Queue& queue,
                                    const MicroBodySet& set) {
   // Fixed-size GPU buffers: pad the table so a shrinking reload cannot leave a
   // stale model behind a still-live index, and never write past the ceiling.
@@ -472,20 +422,20 @@ void Simulation::UploadMicroBodies(const wgpu::Queue& queue,
   SetArtPalette(queue, set.artColors);
 }
 
-bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
+bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   auto mod = [&](const char* name) { return LoadShader(device, shaderDir_, name); };
-  wgpu::ShaderModule mWorldgen = mod("worldgen.wgsl");
-  wgpu::ShaderModule mMutate = mod("sim_mutate.wgsl");
-  wgpu::ShaderModule mCompact = mod("sim_compact.wgsl");
-  wgpu::ShaderModule mStep = mod("sim_step.wgsl");
-  wgpu::ShaderModule mOcc = mod("sim_occupancy.wgsl");
-  wgpu::ShaderModule mPick = mod("sim_pick.wgsl");
-  wgpu::ShaderModule mExplode = mod("sim_explode.wgsl");
-  wgpu::ShaderModule mParticle = mod("sim_particle.wgsl");
-  wgpu::ShaderModule mRay = mod("raymarch.wgsl");
-  wgpu::ShaderModule mDebris = mod("debris.wgsl");
-  wgpu::ShaderModule mMicroBody = mod("microbody.wgsl");
-  wgpu::ShaderModule mDebugLines = mod("debug_lines.wgsl");
+  rhi::ShaderModule mWorldgen = mod("worldgen.wgsl");
+  rhi::ShaderModule mMutate = mod("sim_mutate.wgsl");
+  rhi::ShaderModule mCompact = mod("sim_compact.wgsl");
+  rhi::ShaderModule mStep = mod("sim_step.wgsl");
+  rhi::ShaderModule mOcc = mod("sim_occupancy.wgsl");
+  rhi::ShaderModule mPick = mod("sim_pick.wgsl");
+  rhi::ShaderModule mExplode = mod("sim_explode.wgsl");
+  rhi::ShaderModule mParticle = mod("sim_particle.wgsl");
+  rhi::ShaderModule mRay = mod("raymarch.wgsl");
+  rhi::ShaderModule mDebris = mod("debris.wgsl");
+  rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
+  rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mExplode || !mParticle || !mRay || !mDebris || !mMicroBody ||
       !mDebugLines) {
@@ -518,45 +468,40 @@ bool Simulation::BuildPipelines(const wgpu::Device& device, std::string* err) {
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
-  targetFormat_ = wgpu::TextureFormat::Undefined;  // force render pipeline rebuild
+  targetFormat_ = rhi::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
 }
 
-bool Simulation::ReloadShaders(const wgpu::Device& device, const wgpu::Instance& instance) {
-  device.PushErrorScope(wgpu::ErrorFilter::Validation);
+bool Simulation::ReloadShaders(const rhi::Device& device) {
+  // Validation errors during pipeline creation must not take the old (working)
+  // pipelines down with them — F5 on a broken shader keeps playing. The seam
+  // owns the scope because WebGPU resolves it through a Future on the instance
+  // while Vulkan reports compile failure inline.
+  device.PushValidationScope();
   std::string err;
   bool built = BuildPipelines(device, &err);
-  bool hadError = false;
-  wgpu::Future f = device.PopErrorScope(
-      wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg) {
-        if (type != wgpu::ErrorType::NoError) {
-          hadError = true;
-          std::fprintf(stderr, "shader reload error: %.*s\n", (int)msg.length, msg.data);
-        }
-      });
-  instance.WaitAny(f, UINT64_MAX);
+  bool hadError = device.PopValidationScopeBlocking();
   return built && !hadError;
 }
 
 // Measurement seam: identical to enc.BeginComputePass() unless the --measure
 // harness has attached a PassTimer (see Simulation::SetPassTimer).
-wgpu::ComputePassEncoder Simulation::BeginPass(const wgpu::CommandEncoder& enc,
+rhi::ComputePass Simulation::BeginPass(const rhi::CommandEncoder& enc,
                                                const char* name) const {
   if (passTimer_ && passTimer_->Valid()) return passTimer_->BeginPass(enc, name);
   return enc.BeginComputePass();
 }
 
-void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
+void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc) {
   page_ = 0;
-  enc.ClearBuffer(world_->dirty[0], 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->dirty[1], 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->support, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->particleCounts, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->drawArgs, 0, wgpu::kWholeSize);  // no ghost particles
-  wgpu::ComputePassEncoder pass = BeginPass(enc, "worldgen");
+  enc.ClearBuffer(world_->dirty[0], 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->dirty[1], 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->support, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->particleCounts, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->claim, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->drawArgs, 0, rhi::kWholeSize);  // no ghost particles
+  rhi::ComputePass pass = BeginPass(enc, "worldgen");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   // one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
@@ -565,9 +510,9 @@ void Simulation::EncodeWorldgen(const wgpu::CommandEncoder& enc) {
   pass.End();
 }
 
-void Simulation::EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count) {
+void Simulation::EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count) {
   if (count == 0) return;
-  wgpu::ComputePassEncoder pass = BeginPass(enc, "worldgenList");
+  rhi::ComputePass pass = BeginPass(enc, "worldgenList");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(worldgenList_);
@@ -575,9 +520,9 @@ void Simulation::EncodeGenList(const wgpu::CommandEncoder& enc, uint32_t count) 
   pass.End();
 }
 
-void Simulation::EncodeFarFill(const wgpu::CommandEncoder& enc, uint32_t count) {
+void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   if (count == 0) return;
-  wgpu::ComputePassEncoder pass = BeginPass(enc, "farFill");
+  rhi::ComputePass pass = BeginPass(enc, "farFill");
   pass.SetBindGroup(0, simSlimBG_[page_]);
   pass.SetBindGroup(1, farBG_);
   pass.SetPipeline(farFill_);
@@ -585,14 +530,14 @@ void Simulation::EncodeFarFill(const wgpu::CommandEncoder& enc, uint32_t count) 
   pass.End();
 }
 
-void Simulation::EncodeLoadReset(const wgpu::CommandEncoder& enc) {
+void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
   page_ = 0;
-  enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->support, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->particleCounts, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->drawArgs, 0, wgpu::kWholeSize);
-  wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyFull(loadReset)");
+  enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->support, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->particleCounts, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->claim, 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->drawArgs, 0, rhi::kWholeSize);
+  rhi::ComputePass pass = BeginPass(enc, "occupancyFull(loadReset)");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(occupancy_);
@@ -600,9 +545,9 @@ void Simulation::EncodeLoadReset(const wgpu::CommandEncoder& enc) {
   pass.End();
 }
 
-void Simulation::EncodeHashOnly(const wgpu::CommandEncoder& enc) {
-  enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
-  wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyFull(hashOnly)");
+void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
+  enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
+  rhi::ComputePass pass = BeginPass(enc, "occupancyFull(hashOnly)");
   uint32_t off = 0;
   pass.SetBindGroup(0, simBG_[page_], 1, &off);
   pass.SetPipeline(occupancy_);
@@ -610,7 +555,7 @@ void Simulation::EncodeHashOnly(const wgpu::CommandEncoder& enc) {
   pass.End();
 }
 
-void Simulation::EncodeWakeAll(const wgpu::Queue& queue) {
+void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
   // flag per chunk; 4096 chunks = 16 KB, far inside the ~1 MB/tick CPU->GPU
   // budget, and only written on a phase boundary.
@@ -619,20 +564,20 @@ void Simulation::EncodeWakeAll(const wgpu::Queue& queue) {
                     ones.size() * sizeof(uint32_t));
 }
 
-void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
+void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
                             uint32_t cellCount, uint32_t spawnCount) {
-  enc.ClearBuffer(world_->dirty[1 - page_], 0, wgpu::kWholeSize);
-  enc.ClearBuffer(world_->argsStage, 0, wgpu::kWholeSize);
-  if (particlesActive) enc.ClearBuffer(world_->claim, 0, wgpu::kWholeSize);
-  if (expCount > 0) enc.ClearBuffer(world_->expMask, 0, wgpu::kWholeSize);
-  if (hashEnable) enc.ClearBuffer(world_->hash, 0, wgpu::kWholeSize);
+  enc.ClearBuffer(world_->dirty[1 - page_], 0, rhi::kWholeSize);
+  enc.ClearBuffer(world_->argsStage, 0, rhi::kWholeSize);
+  if (particlesActive) enc.ClearBuffer(world_->claim, 0, rhi::kWholeSize);
+  if (expCount > 0) enc.ClearBuffer(world_->expMask, 0, rhi::kWholeSize);
+  if (hashEnable) enc.ClearBuffer(world_->hash, 0, rhi::kWholeSize);
 
   uint32_t off = 0;
 
   // Prep pass: mutate + explode + compact (compact writes argsStage + dirtyList).
   {
-    wgpu::ComputePassEncoder prep = BeginPass(enc, "prep(mutate+explode+compact)");
+    rhi::ComputePass prep = BeginPass(enc, "prep(mutate+explode+compact)");
     if (opsCount > 0) {
       prep.SetBindGroup(0, simBG_[page_], 1, &off);
       prep.SetPipeline(mutate_);
@@ -672,7 +617,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
   enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
 
   {
-    wgpu::ComputePassEncoder pass = BeginPass(enc, "ca(54 color x substep)");
+    rhi::ComputePass pass = BeginPass(enc, "ca(54 color x substep)");
     pass.SetBindGroup(0, simBG_[page_], 1, &off);
 
     // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
@@ -691,7 +636,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
   // dirtyOut, which the occupancy update below already covers.
   if (particlesActive) {
     {
-      wgpu::ComputePassEncoder pass = BeginPass(enc, "particleArgs1");
+      rhi::ComputePass pass = BeginPass(enc, "particleArgs1");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, particleBG_[page_]);
       pass.SetPipeline(pArgs1_);
@@ -700,7 +645,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     }
     enc.CopyBufferToBuffer(world_->pArgsStage, 16, world_->pDispatchArgs, 0, 12);
     {
-      wgpu::ComputePassEncoder pass = BeginPass(enc, "particleIntegrate+args2");
+      rhi::ComputePass pass = BeginPass(enc, "particleIntegrate+args2");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, particleBG_[page_]);
       pass.SetPipeline(pIntegrate_);
@@ -712,7 +657,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     enc.CopyBufferToBuffer(world_->pArgsStage, 16, world_->pDispatchArgs, 0, 12);
     enc.CopyBufferToBuffer(world_->pArgsStage, 0, world_->drawArgs, 0, 16);
     {
-      wgpu::ComputePassEncoder pass = BeginPass(enc, "particleResolve");
+      rhi::ComputePass pass = BeginPass(enc, "particleResolve");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, particleBG_[page_]);
       pass.SetPipeline(pResolve_);
@@ -723,7 +668,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
 
   if (hashEnable) {
     // hash ticks need the whole-world scan anyway; it also refreshes occupancy
-    wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyFull+pick(hashTick)");
+    rhi::ComputePass pass = BeginPass(enc, "occupancyFull+pick(hashTick)");
     pass.SetBindGroup(0, simBG_[page_], 1, &off);
     pass.SetPipeline(occupancy_);
     pass.DispatchWorkgroups(kNumChunks, 1, 1);
@@ -733,9 +678,9 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
   } else {
     // occupancy update over only the chunks written this tick: compact the
     // dirtyOut flags (superset of every voxel write) and dispatch indirect
-    enc.ClearBuffer(world_->argsStage, 0, wgpu::kWholeSize);
+    enc.ClearBuffer(world_->argsStage, 0, rhi::kWholeSize);
     {
-      wgpu::ComputePassEncoder pass = BeginPass(enc, "compactNext");
+      rhi::ComputePass pass = BeginPass(enc, "compactNext");
       pass.SetBindGroup(0, simBG_[page_], 1, &off);
       pass.SetPipeline(compactNext_);
       pass.DispatchWorkgroups(kNumChunks / 64, 1, 1);
@@ -743,7 +688,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     }
     enc.CopyBufferToBuffer(world_->argsStage, 0, world_->dispatchArgs, 0, 12);
     {
-      wgpu::ComputePassEncoder pass = BeginPass(enc, "occupancyDirty+pick");
+      rhi::ComputePass pass = BeginPass(enc, "occupancyDirty+pick");
       pass.SetBindGroup(0, simBG_[page_], 1, &off);
       pass.SetPipeline(occupancyDirty_);
       pass.DispatchWorkgroupsIndirect(world_->dispatchArgs, 0);
@@ -762,7 +707,7 @@ void Simulation::EncodeTick(const wgpu::CommandEncoder& enc, uint32_t opsCount,
     // downsamples then; only single-tick-then-settle edits landing exactly on
     // a hash tick propagate one tick late, which is invisible in practice.
     {
-      wgpu::ComputePassEncoder pass = BeginPass(enc, "farDown");
+      rhi::ComputePass pass = BeginPass(enc, "farDown");
       pass.SetBindGroup(0, simSlimBG_[page_]);
       pass.SetBindGroup(1, farBG_);
       pass.SetPipeline(farDown_);
@@ -779,72 +724,59 @@ void Simulation::EnsureDepth(uint32_t width, uint32_t height) {
   if (depthView_ && depthW_ == width && depthH_ == height) return;
   depthW_ = width;
   depthH_ = height;
-  wgpu::TextureDescriptor d{};
-  d.size = {width, height, 1};
-  d.format = kDepthFormat;
-  d.usage = wgpu::TextureUsage::RenderAttachment;
-  d.label = "depth";
-  depthTex_ = device_.CreateTexture(&d);
+  depthTex_ = device_.CreateTexture({width, height, 1}, kDepthFormat,
+                                    rhi::TextureUsage::RenderAttachment, "depth");
   depthView_ = depthTex_.CreateView();
 }
 
-void Simulation::EnsureRenderPipelines(wgpu::TextureFormat format) {
+void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   if (format == targetFormat_) return;
   targetFormat_ = format;
 
-  wgpu::DepthStencilState dsAlways{};
+  rhi::DepthState dsAlways{};
   dsAlways.format = kDepthFormat;
   dsAlways.depthWriteEnabled = true;
-  dsAlways.depthCompare = wgpu::CompareFunction::Always;
+  dsAlways.depthCompare = rhi::CompareFunction::Always;
 
-  wgpu::DepthStencilState dsTest{};
+  rhi::DepthState dsTest{};
   dsTest.format = kDepthFormat;
   dsTest.depthWriteEnabled = true;
-  dsTest.depthCompare = wgpu::CompareFunction::GreaterEqual;  // reversed-Z
-
-  wgpu::ColorTargetState ct{};
-  ct.format = format;
+  dsTest.depthCompare = rhi::CompareFunction::GreaterEqual;  // reversed-Z
 
   {
-    wgpu::FragmentState fs{};
-    fs.module = raymarchModule_;
-    fs.entryPoint = "fs";
-    fs.targetCount = 1;
-    fs.targets = &ct;
-    wgpu::RenderPipelineDescriptor d{};
-    d.layout = renderPL_;
-    d.vertex.module = raymarchModule_;
-    d.vertex.entryPoint = "vs";
-    d.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    d.depthStencil = &dsAlways;
-    d.fragment = &fs;
+    rhi::RenderPipelineDesc d{};
     d.label = "raymarch";
-    raymarch_ = device_.CreateRenderPipeline(&d);
+    d.layout = renderPL_;
+    d.vertexModule = raymarchModule_;
+    d.vertexEntry = "vs";
+    d.fragmentModule = raymarchModule_;
+    d.fragmentEntry = "fs";
+    d.colorFormat = format;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.depth = dsAlways;
+    raymarch_ = device_.CreateRenderPipeline(d);
   }
   {
-    wgpu::FragmentState fs{};
-    fs.module = debrisModule_;
-    fs.entryPoint = "fs";
-    fs.targetCount = 1;
-    fs.targets = &ct;
-    wgpu::RenderPipelineDescriptor d{};
-    d.layout = renderPL_;
-    d.vertex.module = debrisModule_;
-    d.vertex.entryPoint = "vsParticle";
-    d.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    d.primitive.cullMode = wgpu::CullMode::None;
-    d.depthStencil = &dsTest;
-    d.fragment = &fs;
+    rhi::RenderPipelineDesc d{};
     d.label = "particleDraw";
-    particleDraw_ = device_.CreateRenderPipeline(&d);
+    d.layout = renderPL_;
+    d.vertexModule = debrisModule_;
+    d.vertexEntry = "vsParticle";
+    d.fragmentModule = debrisModule_;
+    d.fragmentEntry = "fs";
+    d.colorFormat = format;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.cullMode = rhi::CullMode::None;
+    d.depth = dsTest;
+    particleDraw_ = device_.CreateRenderPipeline(d);
 
-    d.vertex.entryPoint = "vsSprite";
+    d.vertexEntry = "vsSprite";
     d.label = "spriteDraw";
-    spriteDraw_ = device_.CreateRenderPipeline(&d);
+    spriteDraw_ = device_.CreateRenderPipeline(d);
 
-    d.vertex.entryPoint = "vsBody";
+    d.vertexEntry = "vsBody";
     d.label = "bodyDraw";
-    bodyDraw_ = device_.CreateRenderPipeline(&d);
+    bodyDraw_ = device_.CreateRenderPipeline(d);
   }
   {
     // Collision-box wireframes. Its own module (debug_lines.wgsl) but the SAME
@@ -855,101 +787,93 @@ void Simulation::EnsureRenderPipelines(wgpu::TextureFormat format) {
     // need it — the reason to look at a limb's box is usually that the limb is
     // buried in something. Writes are off so the wireframe never occludes the
     // world it is annotating.
-    wgpu::DepthStencilState dsNone{};
+    rhi::DepthState dsNone{};
     dsNone.format = kDepthFormat;
     dsNone.depthWriteEnabled = false;
-    dsNone.depthCompare = wgpu::CompareFunction::Always;
+    dsNone.depthCompare = rhi::CompareFunction::Always;
 
     // Straight alpha over the frame: these are annotation, not lit geometry.
-    wgpu::BlendState blend{};
-    blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
-    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.color.operation = wgpu::BlendOperation::Add;
-    blend.alpha.srcFactor = wgpu::BlendFactor::One;
-    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.alpha.operation = wgpu::BlendOperation::Add;
-    wgpu::ColorTargetState cbt{};
-    cbt.format = format;
-    cbt.blend = &blend;
+    rhi::BlendState blend{};
+    blend.color.srcFactor = rhi::BlendFactor::SrcAlpha;
+    blend.color.dstFactor = rhi::BlendFactor::OneMinusSrcAlpha;
+    blend.color.operation = rhi::BlendOperation::Add;
+    blend.alpha.srcFactor = rhi::BlendFactor::One;
+    blend.alpha.dstFactor = rhi::BlendFactor::OneMinusSrcAlpha;
+    blend.alpha.operation = rhi::BlendOperation::Add;
 
-    wgpu::FragmentState fs{};
-    fs.module = debugLineModule_;
-    fs.entryPoint = "fsBox";
-    fs.targetCount = 1;
-    fs.targets = &cbt;
-    wgpu::RenderPipelineDescriptor d{};
-    d.layout = renderPL_;
-    d.vertex.module = debugLineModule_;
-    d.vertex.entryPoint = "vsBox";
-    d.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    d.primitive.cullMode = wgpu::CullMode::None;
-    d.depthStencil = &dsNone;
-    d.fragment = &fs;
+    rhi::RenderPipelineDesc d{};
     d.label = "debugBoxDraw";
-    debugBoxDraw_ = device_.CreateRenderPipeline(&d);
+    d.layout = renderPL_;
+    d.vertexModule = debugLineModule_;
+    d.vertexEntry = "vsBox";
+    d.fragmentModule = debugLineModule_;
+    d.fragmentEntry = "fsBox";
+    d.colorFormat = format;
+    d.blend = &blend;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.cullMode = rhi::CullMode::None;
+    d.depth = dsNone;
+    debugBoxDraw_ = device_.CreateRenderPipeline(d);
   }
   {
     // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
     // FRONT-face culling so only the far side of each OBB rasterizes. That is
     // what keeps a limb drawn when the camera is inside its box — the fragment
     // shader starts its march at the ray's slab entry, not at the triangle.
-    wgpu::FragmentState fs{};
-    fs.module = microBodyModule_;
-    fs.entryPoint = "fs";
-    fs.targetCount = 1;
-    fs.targets = &ct;
-    wgpu::RenderPipelineDescriptor d{};
-    d.layout = microBodyPL_;
-    d.vertex.module = microBodyModule_;
-    d.vertex.entryPoint = "vs";
-    d.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    d.primitive.cullMode = wgpu::CullMode::Front;
-    d.depthStencil = &dsTest;
-    d.fragment = &fs;
+    rhi::RenderPipelineDesc d{};
     d.label = "microBodyDraw";
-    microBodyDraw_ = device_.CreateRenderPipeline(&d);
+    d.layout = microBodyPL_;
+    d.vertexModule = microBodyModule_;
+    d.vertexEntry = "vs";
+    d.fragmentModule = microBodyModule_;
+    d.fragmentEntry = "fs";
+    d.colorFormat = format;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.cullMode = rhi::CullMode::Front;
+    d.depth = dsTest;
+    microBodyDraw_ = device_.CreateRenderPipeline(d);
   }
 }
 
-wgpu::RenderPassEncoder Simulation::BeginRenderPass(const wgpu::CommandEncoder& enc,
-                                                    const wgpu::TextureView& target,
-                                                    wgpu::TextureFormat format,
-                                                    uint32_t width, uint32_t height) {
+rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,
+                                            const rhi::TextureView& target,
+                                            rhi::TextureFormat format,
+                                            uint32_t width, uint32_t height) {
   EnsureRenderPipelines(format);
   EnsureDepth(width, height);
 
-  wgpu::RenderPassColorAttachment ca{};
-  ca.view = target;
-  ca.loadOp = wgpu::LoadOp::Clear;
-  ca.storeOp = wgpu::StoreOp::Store;
-  ca.clearValue = {0.1, 0.15, 0.25, 1.0};
-  wgpu::RenderPassDepthStencilAttachment da{};
-  da.view = depthView_;
-  da.depthLoadOp = wgpu::LoadOp::Clear;
-  da.depthStoreOp = wgpu::StoreOp::Store;
-  da.depthClearValue = 0.0f;  // reversed-Z: clear to far
-  wgpu::RenderPassDescriptor d{};
-  d.colorAttachmentCount = 1;
-  d.colorAttachments = &ca;
-  d.depthStencilAttachment = &da;
-  return enc.BeginRenderPass(&d);
+  rhi::RenderPassDesc d{};
+  d.label = "world";
+  d.color.view = target;
+  d.color.loadOp = rhi::LoadOp::Clear;
+  d.color.storeOp = rhi::StoreOp::Store;
+  d.color.clearValue[0] = 0.1;
+  d.color.clearValue[1] = 0.15;
+  d.color.clearValue[2] = 0.25;
+  d.color.clearValue[3] = 1.0;
+  d.hasDepth = true;
+  d.depth.view = depthView_;
+  d.depth.loadOp = rhi::LoadOp::Clear;
+  d.depth.storeOp = rhi::StoreOp::Store;
+  d.depth.clearValue = 0.0f;  // reversed-Z: clear to far
+  return enc.BeginRenderPass(d);
 }
 
-void Simulation::DrawWorld(const wgpu::RenderPassEncoder& pass) {
+void Simulation::DrawWorld(const rhi::RenderPass& pass) {
   pass.SetPipeline(raymarch_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(3);
 }
 
-void Simulation::DrawParticles(const wgpu::RenderPassEncoder& pass) {
+void Simulation::DrawParticles(const rhi::RenderPass& pass) {
   pass.SetPipeline(particleDraw_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.DrawIndirect(world_->drawArgs, 0);
 }
 
-void Simulation::DrawSprites(const wgpu::RenderPassEncoder& pass, uint32_t count) {
+void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;
   pass.SetPipeline(spriteDraw_);
   pass.SetBindGroup(0, renderBG_);
@@ -957,7 +881,7 @@ void Simulation::DrawSprites(const wgpu::RenderPassEncoder& pass, uint32_t count
   pass.Draw(36, count);
 }
 
-void Simulation::DrawDebugBoxes(const wgpu::RenderPassEncoder& pass,
+void Simulation::DrawDebugBoxes(const rhi::RenderPass& pass,
                                uint32_t count) {
   if (count == 0) return;   // overlay off: costs nothing
   pass.SetPipeline(debugBoxDraw_);
@@ -967,7 +891,7 @@ void Simulation::DrawDebugBoxes(const wgpu::RenderPassEncoder& pass,
   pass.Draw(72, count);
 }
 
-void Simulation::DrawBodies(const wgpu::RenderPassEncoder& pass, uint32_t voxInstances) {
+void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {
   if (voxInstances == 0) return;
   pass.SetPipeline(bodyDraw_);
   pass.SetBindGroup(0, renderBG_);
@@ -975,8 +899,8 @@ void Simulation::DrawBodies(const wgpu::RenderPassEncoder& pass, uint32_t voxIns
   pass.Draw(36, voxInstances);
 }
 
-void Simulation::DrawMicroBodies(const wgpu::RenderPassEncoder& pass,
-                                 const wgpu::Queue& queue,
+void Simulation::DrawMicroBodies(const rhi::RenderPass& pass,
+                                 const rhi::Queue& queue,
                                  const std::vector<MicroBodyInstGpu>& insts) {
   // Zero micro bodies costs exactly one branch: no upload, no bind, no draw.
   // The instance list is CPU-compacted rather than indirect because the count

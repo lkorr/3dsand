@@ -1,19 +1,20 @@
 #pragma once
 #include <string>
 
-#include <webgpu/webgpu_cpp.h>
+#include "gpu/rhi.h"
 
-// Small helpers over the raw API. No abstraction ambitions — just the
-// repetitive parts.
-wgpu::Buffer CreateBuffer(const wgpu::Device& device, uint64_t size,
-                          wgpu::BufferUsage usage, const char* label);
+// Small helpers over the seam. No abstraction ambitions — just the repetitive
+// parts. (The seam itself is gpu/rhi.h.)
+rhi::Buffer CreateBuffer(const rhi::Device& device, uint64_t size,
+                         rhi::BufferUsage usage, const char* label);
 
-// Loads assets/shaders/common.wgsl + the named file, concatenated, and
-// compiles the result. Returns an invalid module on read failure.
-wgpu::ShaderModule LoadShader(const wgpu::Device& device, const std::string& shaderDir,
-                              const std::string& name);
+// Loads assets/shaders/common.wgsl + the named file, concatenated behind the
+// generated world-constant + tuning preludes, and compiles the result. Returns
+// an invalid module on read failure.
+rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shaderDir,
+                             const std::string& name);
 
-wgpu::ComputePipeline MakeComputePipeline(const wgpu::Device& device,
-                                          const wgpu::PipelineLayout& layout,
-                                          const wgpu::ShaderModule& module,
-                                          const char* entry, const char* label);
+rhi::ComputePipeline MakeComputePipeline(const rhi::Device& device,
+                                         const rhi::PipelineLayout& layout,
+                                         const rhi::ShaderModule& module,
+                                         const char* entry, const char* label);

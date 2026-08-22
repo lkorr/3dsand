@@ -9,41 +9,30 @@ bool PassTimer::Init(GpuContext& ctx, uint32_t capacity) {
   if (!ctx.timestampsEnabled) return false;
   // Two queries per pass (begin + end).
   capacity_ = capacity * 2;
-  wgpu::QuerySetDescriptor qd{};
-  qd.type = wgpu::QueryType::Timestamp;
-  qd.count = capacity_;
-  qd.label = "passTimer";
-  querySet_ = ctx.device.CreateQuerySet(&qd);
+  querySet_ = ctx.device.CreateTimestampQuerySet(capacity_, "passTimer");
   if (!querySet_) return false;
   resolve_ = CreateBuffer(ctx.device, (uint64_t)capacity_ * 8,
-                          wgpu::BufferUsage::QueryResolve |
-                              wgpu::BufferUsage::CopySrc,
+                          rhi::BufferUsage::QueryResolve | rhi::BufferUsage::CopySrc,
                           "passTimerResolve");
   staging_ = CreateBuffer(ctx.device, (uint64_t)capacity_ * 8,
-                          wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                          rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                           "passTimerStaging");
   return true;
 }
 
-wgpu::ComputePassEncoder PassTimer::BeginPass(const wgpu::CommandEncoder& enc,
-                                              const char* name) {
+rhi::ComputePass PassTimer::BeginPass(const rhi::CommandEncoder& enc,
+                                      const char* name) {
   if (!querySet_ || used_ + 2 > capacity_) return enc.BeginComputePass();
-  // NOTE: this Dawn revision unifies compute and render into one
-  // wgpu::PassTimestampWrites (the older webgpu.h split them into
-  // ComputePassTimestampWrites / RenderPassTimestampWrites).
-  wgpu::PassTimestampWrites tw{};
+  rhi::PassTimestampWrites tw{};
   tw.querySet = querySet_;
-  tw.beginningOfPassWriteIndex = used_;
-  tw.endOfPassWriteIndex = used_ + 1;
-  wgpu::ComputePassDescriptor pd{};
-  pd.timestampWrites = &tw;
-  pd.label = name;
+  tw.beginIndex = used_;
+  tw.endIndex = used_ + 1;
   used_ += 2;
   pending_.emplace_back(name);
-  return enc.BeginComputePass(&pd);
+  return enc.BeginComputePass(name, tw);
 }
 
-void PassTimer::EncodeResolve(const wgpu::CommandEncoder& enc) {
+void PassTimer::EncodeResolve(const rhi::CommandEncoder& enc) {
   if (!querySet_ || used_ == 0) return;
   enc.ResolveQuerySet(querySet_, 0, used_, resolve_, 0);
   enc.CopyBufferToBuffer(resolve_, 0, staging_, 0, (uint64_t)used_ * 8);
@@ -57,16 +46,7 @@ void PassTimer::Collect(GpuContext& ctx) {
   }
   const uint64_t bytes = (uint64_t)used_ * 8;
   std::vector<uint64_t> ts(used_, 0);
-  wgpu::Future f = staging_.MapAsync(
-      wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          std::memcpy(ts.data(), staging_.GetConstMappedRange(0, bytes),
-                      (size_t)bytes);
-          staging_.Unmap();
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  rhi::ReadBufferBlocking(ctx.device, staging_, 0, ts.data(), (size_t)bytes);
 
   for (size_t p = 0; p < pending_.size(); p++) {
     uint64_t b = ts[p * 2], e = ts[p * 2 + 1];

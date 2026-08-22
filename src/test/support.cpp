@@ -50,7 +50,7 @@ SkyState SkyForTick(const Tuning& t, uint32_t tick) {
   return ComputeSkyState(t, phase, tpd ? tick / tpd : 0u);
 }
 
-void WriteRenderParams(const wgpu::Queue& queue, const World& world,
+void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
                        float fogDensity, float viewPx, uint32_t tick) {
@@ -155,7 +155,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     if (wasDay != isDay) sim.EncodeWakeAll(ctx.queue);
   }
 
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount);
   sim.EncodeFarFill(enc, farCount);
@@ -166,8 +166,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                    1 - sim.Page(), tick);
     if (doCopy) world.EncodeDirtyCopy(enc, sim.DirtyNext());
   }
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  ctx.queue.Submit(enc.Finish());
   sim.FlipPage();
   if (doCopy) world.KickReadback();
 }
@@ -177,10 +176,9 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeWorldgen(enc);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  ctx.queue.Submit(enc.Finish());
 }
 
 // (Body render plumbing lives in game/bodyreg.h — see the note in support.h.)
@@ -215,33 +213,17 @@ bool WriteBmpFile(const std::string& path, const std::vector<uint8_t>& rgba,
 
 // Synchronously read the 4-byte world hash (selftest only).
 uint32_t ReadHashSync(GpuContext& ctx, World& world) {
-  wgpu::Buffer staging = CreateBuffer(ctx.device, 16,
-                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-                                      "hashRead");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(world.hash, 0, staging, 0, 16);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
   uint32_t result = 0;
-  wgpu::Future f = staging.MapAsync(
-      wgpu::MapMode::Read, 0, 16, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          std::memcpy(&result, staging.GetConstMappedRange(0, 16), 4);
-          staging.Unmap();
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.hash, 0, &result, 4, "hashRead");
   return result;
 }
 
 uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
   TickParams tp{0, seed, 0, 1, 0, 0, 0, 0};
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeHashOnly(enc);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  ctx.queue.Submit(enc.Finish());
   return ReadHashSync(ctx, world);
 }
 
@@ -293,45 +275,17 @@ bool SelftestParticlesActive(uint32_t tick) { return tick >= kSelftestFirstExp; 
 
 // Synchronously read both particle page counts (selftest only).
 void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
-  wgpu::Buffer staging = CreateBuffer(ctx.device, 16,
-                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-                                      "countsRead");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(world.particleCounts, 0, staging, 0, 16);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
-  wgpu::Future f = staging.MapAsync(
-      wgpu::MapMode::Read, 0, 16, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          std::memcpy(out, staging.GetConstMappedRange(0, 16), 8);
-          staging.Unmap();
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.particleCounts, 0, out, 8,
+                        "countsRead");
 }
 
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {
-  wgpu::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
-                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-                                      "activeRead");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumChunks * 4);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  std::vector<uint32_t> flags(kNumChunks, 0);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
+                        kNumChunks * 4, "activeRead");
   uint32_t n = 0;
-  wgpu::Future f = staging.MapAsync(
-      wgpu::MapMode::Read, 0, kNumChunks * 4, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          const uint32_t* d =
-              (const uint32_t*)staging.GetConstMappedRange(0, kNumChunks * 4);
-          for (uint32_t i = 0; i < kNumChunks; i++)
-            if (d[i] != 0) n++;
-          staging.Unmap();
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  for (uint32_t i = 0; i < kNumChunks; i++)
+    if (flags[i] != 0) n++;
   return n;
 }
 

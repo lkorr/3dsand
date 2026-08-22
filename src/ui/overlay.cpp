@@ -7,17 +7,24 @@
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_wgpu.h>
 
-bool Overlay::Init(GLFWwindow* window, const wgpu::Device& device,
-                   wgpu::TextureFormat format) {
+// PHASE 4 EXCEPTION (docs/PLAN_vulkan_port.md): this file is the ONE place
+// outside src/gpu/ that may name wgpu::, because ImGui_ImplWGPU_* takes native
+// WebGPU handles. Phase 4 replaces this backend with imgui_impl_vulkan and the
+// exception goes away. The overlay's own INTERFACE (overlay.h) already speaks
+// only rhi::, so nothing above it has to care which backend ImGui is on.
+#include "gpu/rhi_dawn.h"
+
+bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
+                   rhi::TextureFormat format) {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGui::StyleColorsDark();
   ImGui::GetStyle().Alpha = 0.92f;
   if (!ImGui_ImplGlfw_InitForOther(window, true)) return false;
   ImGui_ImplWGPU_InitInfo info{};
-  info.Device = device.Get();
+  info.Device = rhi::dawn::Native(device).Get();
   info.NumFramesInFlight = 3;
-  info.RenderTargetFormat = (WGPUTextureFormat)format;
+  info.RenderTargetFormat = (WGPUTextureFormat)rhi::dawn::ToWgpu(format);
   // must match Simulation::kDepthFormat — the overlay draws into the same
   // render pass as the raymarch + debris pipelines
   info.DepthStencilFormat = WGPUTextureFormat_Depth32Float;
@@ -531,9 +538,10 @@ void Overlay::Draw(UIState& s) {
   ImGui::End();
 }
 
-void Overlay::Render(const wgpu::RenderPassEncoder& pass) {
+void Overlay::Render(const rhi::RenderPass& pass) {
   ImGui::Render();
-  ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), pass.Get());
+  ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(),
+                                rhi::dawn::Native(pass).Get());
 }
 
 void Overlay::Shutdown() {

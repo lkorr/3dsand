@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include <webgpu/webgpu_cpp.h>
+#include "gpu/rhi.h"
 
 struct GLFWwindow;
 
@@ -137,8 +137,8 @@ struct UIState {
 
 class Overlay {
  public:
-  bool Init(GLFWwindow* window, const wgpu::Device& device,
-            wgpu::TextureFormat format);
+  bool Init(GLFWwindow* window, const rhi::Device& device,
+            rhi::TextureFormat format);
   void BeginFrame();
   // The player-facing HUD: health + mana in the bottom-left corner. Separate
   // from Draw() and drawn unconditionally, because the dev panel is F1-hideable
@@ -153,6 +153,6 @@ class Overlay {
   float DrawBodyFigure(const UIState& s, float x, float yBottom);
 
  public:
-  void Render(const wgpu::RenderPassEncoder& pass);
+  void Render(const rhi::RenderPass& pass);
   void Shutdown();
 };

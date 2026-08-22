@@ -22,8 +22,8 @@ constexpr uint64_t kSupportBytes = kNumChunks * 4;
 constexpr uint64_t kFetchOff = kSupportOff + kSupportBytes;
 constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
 
-void World::Init(const wgpu::Device& device) {
-  using U = wgpu::BufferUsage;
+void World::Init(const rhi::Device& device) {
+  using U = rhi::BufferUsage;
   voxels = CreateBuffer(device, kVoxelCount * 4,
                         U::Storage | U::CopySrc | U::CopyDst, "voxels");
   dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
@@ -102,7 +102,7 @@ const CachedChunk* World::Cached(IVec3 worldChunk) const {
   return it == cache_.end() ? nullptr : &it->second;
 }
 
-bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc,
+bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                             IVec3 playerChunkBase, uint32_t particleLivePage,
                             uint32_t tick) {
   int slot = -1;
@@ -157,12 +157,12 @@ bool World::EncodeReadbacks(const wgpu::Device&, const wgpu::CommandEncoder& enc
   // support-loss flags are one-shot: consume into this slot, then clear so the
   // next window of ticks accumulates fresh flags (no readback = they persist)
   enc.CopyBufferToBuffer(support, 0, s.buf, kSupportOff, kSupportBytes);
-  enc.ClearBuffer(support, 0, wgpu::kWholeSize);
+  enc.ClearBuffer(support, 0, rhi::kWholeSize);
   lastSlot_ = slot;
   return true;
 }
 
-void World::EncodeDirtyCopy(const wgpu::CommandEncoder& enc, const wgpu::Buffer& dirtyNext) {
+void World::EncodeDirtyCopy(const rhi::CommandEncoder& enc, const rhi::Buffer& dirtyNext) {
   if (lastSlot_ < 0) return;
   enc.CopyBufferToBuffer(dirtyNext, 0, slots_[lastSlot_].buf, kDirtyOff, kDirtyBytes);
 }
@@ -173,12 +173,11 @@ void World::KickReadback() {
   s.inFlight = true;
   int slot = lastSlot_;
   lastSlot_ = -1;
-  s.buf.MapAsync(
-      wgpu::MapMode::Read, 0, kSlotBytes, wgpu::CallbackMode::AllowProcessEvents,
-      [this, slot](wgpu::MapAsyncStatus status, wgpu::StringView) {
+  rhi::MapReadAsync(
+      s.buf, 0, kSlotBytes, [this, slot](const void* mapped) {
         Slot& sl = slots_[slot];
-        if (status == wgpu::MapAsyncStatus::Success) {
-          const uint8_t* p = (const uint8_t*)sl.buf.GetConstMappedRange(0, kSlotBytes);
+        {
+          const uint8_t* p = (const uint8_t*)mapped;
           if (p) {
             std::memcpy(snap_.mirror.data(), p, kMirrorBytes);
             snap_.mirrorBase = sl.base;
@@ -228,7 +227,6 @@ void World::KickReadback() {
               }
             }
           }
-          sl.buf.Unmap();
         }
         sl.inFlight = false;
       });

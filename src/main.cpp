@@ -140,10 +140,9 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     TickParams tp{0, kDefaultSeed, 0, 0};
     tp.farCount = n;
     ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeFarFill(enc, n);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    ctx.queue.Submit(enc.Finish());
   }
   for (uint32_t t = 1; t <= 120; t++)  // powders settle so shots match play
     SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
@@ -151,40 +150,25 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   ctx.WaitIdle();
 
   const uint32_t W = 1920, H = 1080;
-  wgpu::TextureDescriptor td{};
-  td.size = {W, H, 1};
-  td.format = wgpu::TextureFormat::RGBA8Unorm;
-  td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
-  wgpu::Texture offscreen = ctx.device.CreateTexture(&td);
-  wgpu::TextureView view = offscreen.CreateView();
+  rhi::Texture offscreen = ctx.device.CreateTexture({W, H, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
+  rhi::TextureView view = offscreen.CreateView();
   auto grab = [&](const char* path) {
-    wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
-                                     wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                      "screenshot");
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    wgpu::TexelCopyTextureInfo srcT{};
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture srcT{};
     srcT.texture = offscreen;
-    wgpu::TexelCopyBufferInfo dstB{};
+    rhi::TexelCopyBuffer dstB{};
     dstB.buffer = shot;
-    dstB.layout.bytesPerRow = W * 4;
-    dstB.layout.rowsPerImage = H;
-    wgpu::Extent3D ext{W, H, 1};
-    enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
     std::vector<uint8_t> pixels(W * H * 4);
     bool got = false;
-    wgpu::Future f = shot.MapAsync(
-        wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          if (status == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(pixels.data(), shot.GetConstMappedRange(0, pixels.size()),
-                        pixels.size());
-            shot.Unmap();
-            got = true;
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    got = rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), (size_t)(pixels.size()));
     if (got && WriteBmpFile(path, pixels, W, H)) std::printf("wrote %s\n", path);
   };
   // Fixed, nonzero shot time: wave animation and flicker are driven by R.time,
@@ -206,13 +190,12 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     c.pitch = pitch;
     WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
                       kFarFogDensity, 1080.0f, shotTick);
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    wgpu::RenderPassEncoder rp =
-        sim.BeginRenderPass(enc, view, wgpu::TextureFormat::RGBA8Unorm, W, H);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
     rp.End();
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    ctx.queue.Submit(enc.Finish());
     ctx.WaitIdle();
     grab(path);
   };
@@ -833,10 +816,6 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   }
 
   const uint32_t W = 1280, H = 720;
-  wgpu::TextureDescriptor td{};
-  td.size = {W, H, 1};
-  td.format = wgpu::TextureFormat::RGBA8Unorm;
-  td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
   // Honour `--time` here the same way RunShots does. Passing a literal 0 tick
   // pinned every mob shot to MIDNIGHT, which is the worst possible light for
   // judging a character's silhouette — the whole point of this mode.
@@ -853,39 +832,31 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
     WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
                       kFarFogDensity, 1080.0f, mobShotTick);
-    wgpu::Texture tex = ctx.device.CreateTexture(&td);
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
-        enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+    rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "shotTarget");
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
     sim.DrawBodies(rp, (uint32_t)inst.size());
     if (!microInsts.empty()) sim.DrawMicroBodies(rp, ctx.queue, microInsts);
     rp.End();
-    wgpu::Buffer shotBuf = CreateBuffer(
+    rhi::Buffer shotBuf = CreateBuffer(
         ctx.device, (uint64_t)W * H * 4,
-        wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "mobShot");
-    wgpu::TexelCopyTextureInfo srcT{};
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "mobShot");
+    rhi::TexelCopyTexture srcT{};
     srcT.texture = tex;
-    wgpu::TexelCopyBufferInfo dstB{};
+    rhi::TexelCopyBuffer dstB{};
     dstB.buffer = shotBuf;
-    dstB.layout.bytesPerRow = W * 4;
-    dstB.layout.rowsPerImage = H;
-    wgpu::Extent3D ext{W, H, 1};
-    enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
     std::vector<uint8_t> pixels((size_t)W * H * 4, 0);
-    wgpu::Future f = shotBuf.MapAsync(
-        wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          if (status == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(pixels.data(),
-                        shotBuf.GetConstMappedRange(0, pixels.size()),
-                        pixels.size());
-            shotBuf.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    rhi::ReadBufferBlocking(ctx.device, shotBuf, 0, pixels.data(), (size_t)(pixels.size()));
     if (WriteBmpFile(path, pixels, W, H)) std::printf("wrote %s\n", path);
   };
   // Camera directions are relative to the mob's FACING (it turns while it
@@ -1500,7 +1471,7 @@ int main(int argc, char** argv) {
         ui.reloadMaterials = true;
       }
       std::printf("reloading shaders... %s\n",
-                  sim.ReloadShaders(ctx.device, ctx.instance) ? "ok" : "FAILED (kept old)");
+                  sim.ReloadShaders(ctx.device) ? "ok" : "FAILED (kept old)");
     }
     if (ui.reloadMaterials) {
       ui.reloadMaterials = false;
@@ -2395,7 +2366,7 @@ int main(int argc, char** argv) {
 
     // ---- render ----
     double tRender0 = NowSeconds();
-    wgpu::TextureView target = ctx.AcquireFrame();
+    rhi::TextureView target = ctx.AcquireFrame();
     if (target) {
       // ViewEyePos, not EyePos: the render camera rides the step-smoothing
       // offset so voxel steps glide instead of popping. Everything that can
@@ -2819,8 +2790,8 @@ int main(int argc, char** argv) {
         bodyReg.BuildMicroInsts(microInsts);
       }
 
-      wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-      wgpu::RenderPassEncoder rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
                                                        ctx.width, ctx.height);
       sim.DrawWorld(rp);
       sim.DrawParticles(rp);
@@ -2830,8 +2801,7 @@ int main(int argc, char** argv) {
       sim.DrawDebugBoxes(rp, debugBoxCount);
       overlay.Render(rp);
       rp.End();
-      wgpu::CommandBuffer cmd = enc.Finish();
-      ctx.queue.Submit(1, &cmd);
+      ctx.queue.Submit(enc.Finish());
       ctx.Present();
     }
     if (telemetry.Active() && ticksThisFrame > 0) {

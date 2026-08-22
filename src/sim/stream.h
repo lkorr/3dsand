@@ -82,13 +82,14 @@ class Stream {
   size_t PendingEvictions() const { return pending_.size(); }
 
  private:
-  // One in-flight eviction batch: a staging buffer whose mapAsync has been
-  // kicked but not yet consumed. mapStatus lives on the heap because the
-  // callback outlives deque reshuffles (0 pending, 1 ok, 2 failed).
+  // One in-flight eviction batch: a staging buffer whose map has been kicked
+  // but not yet consumed. The ticket owns its own completion state on the heap,
+  // so it survives deque reshuffles.
   struct PendingEvict {
-    wgpu::Buffer staging;
-    wgpu::Future future{};
-    std::shared_ptr<uint32_t> mapStatus;
+    rhi::Buffer staging;
+    // The map is issued at eviction time and consumed ticks later: Ready() is
+    // the per-tick non-blocking harvest, Wait() the ring-full / drain path.
+    rhi::MapTicket map;
     struct Item {
       IVec3 wc;
       uint8_t dropIfAir;  // all-air + never modified => procgen reproduces it
@@ -106,7 +107,7 @@ class Stream {
   void FillSlots(const std::vector<uint32_t>& slots);
   // Grab a pooled staging buffer, recycling the oldest pending batch if the
   // ring is full (bounds staging memory to kMaxPendingEvicts batches).
-  wgpu::Buffer AcquireStaging();
+  rhi::Buffer AcquireStaging();
   // Block on the oldest pending batch, RLE it into the store (unless
   // discarding), return its buffer to the pool.
   void CompleteOldest(bool discard);
@@ -121,6 +122,6 @@ class Stream {
   std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
   std::deque<PendingEvict> pending_;
-  std::vector<wgpu::Buffer> stagingPool_;
+  std::vector<rhi::Buffer> stagingPool_;
   std::unordered_map<uint64_t, uint32_t> pendingChunks_;  // packed wc -> count
 };

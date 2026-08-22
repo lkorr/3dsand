@@ -28,7 +28,7 @@ class FarField {
   // Pop up to kFarListCap queued fills, upload farList (+ farUBO when origins
   // changed), and return the dispatch count for this tick's
   // TickParams.farCount / EncodeFarFill.
-  uint32_t PrepareTick(const wgpu::Queue& queue);
+  uint32_t PrepareTick(const rhi::Queue& queue);
 
   // Re-derive every origin around the player and refill all levels, coarsest
   // first so a horizon exists immediately (startup, load, regen).

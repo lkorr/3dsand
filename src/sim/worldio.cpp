@@ -270,9 +270,9 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
     // upload path in FillSlots is sanctioned the same way worldgen's direct
     // writes are. All GAMEPLAY writes still flow through the MutationQueue.
     stream.ReloadWindow({origin[0], origin[1], origin[2]});
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeLoadReset(enc);
-    wgpu::CommandBuffer cmd = enc.Finish();
+    rhi::CommandBuffer cmd = enc.Finish();
     ctx.queue.Submit(1, &cmd);
   }
 

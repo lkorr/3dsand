@@ -4,7 +4,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <webgpu/webgpu_cpp.h>
+#include "gpu/rhi.h"
 
 #include "math3d.h"
 
@@ -504,13 +504,13 @@ struct CachedChunk {
 // Owns every GPU buffer of the simulation plus the async readback ring.
 class World {
  public:
-  void Init(const wgpu::Device& device);
+  void Init(const rhi::Device& device);
 
   // Records the per-tick readback copies into the encoder. Call after the sim
   // passes. Returns false if all ring slots are still in flight (skip copies).
   // particleLivePage: which particleCounts index holds the post-tick count.
   // tick: the sim tick being encoded (stamps the snapshot + fetched chunks).
-  bool EncodeReadbacks(const wgpu::Device& device, const wgpu::CommandEncoder& enc,
+  bool EncodeReadbacks(const rhi::Device& device, const rhi::CommandEncoder& enc,
                        IVec3 playerChunkBase, uint32_t particleLivePage,
                        uint32_t tick);
 
@@ -564,7 +564,7 @@ class World {
   static constexpr uint32_t kFetchPerTick = 64;  // 1 MB/tick ceiling
   // Copies the next-tick dirty buffer into the pending slot (caller knows
   // which of dirty[0]/dirty[1] that is this tick).
-  void EncodeDirtyCopy(const wgpu::CommandEncoder& enc, const wgpu::Buffer& dirtyNext);
+  void EncodeDirtyCopy(const rhi::CommandEncoder& enc, const rhi::Buffer& dirtyNext);
   // Kick MapAsync for the slot used by the last EncodeReadbacks. Call after
   // queue.Submit.
   void KickReadback();
@@ -584,52 +584,52 @@ class World {
   // Deterministic worldgen height — exact CPU mirror of worldgen.wgsl.
   static int TerrainHeight(int x, int z, uint32_t seed);
 
-  wgpu::Buffer voxels;      // kVoxelCount u32, chunk-major
-  wgpu::Buffer dirty[2];    // kNumChunks u32
-  wgpu::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
-  wgpu::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)
-  wgpu::Buffer dispatchArgs;// 3 u32 — indirect-only copy of argsStage; kept out of all
+  rhi::Buffer voxels;      // kVoxelCount u32, chunk-major
+  rhi::Buffer dirty[2];    // kNumChunks u32
+  rhi::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
+  rhi::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)
+  rhi::Buffer dispatchArgs;// 3 u32 — indirect-only copy of argsStage; kept out of all
                             // bind groups (Dawn forbids indirect + bound-writable usage
                             // of one buffer in the same pass, even if statically unused)
-  wgpu::Buffer occupancy;   // kNumChunks u32: (rayBlockers << 16) | nonAirCount
+  rhi::Buffer occupancy;   // kNumChunks u32: (rayBlockers << 16) | nonAirCount
                             // (see the occupancy packing note in common.wgsl)
-  wgpu::Buffer support;     // kNumChunks u32 — support-loss flags (sim_step writes,
+  rhi::Buffer support;     // kNumChunks u32 — support-loss flags (sim_step writes,
                             // readback consumes + clears; drives island checks)
-  wgpu::Buffer hash;        // 4 u32 (only [0] used)
-  wgpu::Buffer tickUBO;     // TickParams
-  wgpu::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
-  wgpu::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
-  wgpu::Buffer renderUBO;   // RenderParams
-  wgpu::Buffer pick;        // 8 u32
+  rhi::Buffer hash;        // 4 u32 (only [0] used)
+  rhi::Buffer tickUBO;     // TickParams
+  rhi::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
+  rhi::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
+  rhi::Buffer renderUBO;   // RenderParams
+  rhi::Buffer pick;        // 8 u32
 
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
-  wgpu::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered
-  wgpu::Buffer particleCounts;  // 4 u32: [0]/[1] = live count per page
-  wgpu::Buffer claim;           // kClaimSize u32 — reinsertion claim hash
-  wgpu::Buffer pArgsStage;      // 8 u32: [0..3] draw args, [4..6] dispatch args
-  wgpu::Buffer pDispatchArgs;   // 3 u32, indirect-only (see dispatchArgs note)
-  wgpu::Buffer drawArgs;        // 4 u32, indirect-only draw args for particles
-  wgpu::Buffer expOps;          // kMaxExplosionsPerTick ExplosionOp
-  wgpu::Buffer expMask;         // per-op destruction scratch (see sim_explode.wgsl)
-  wgpu::Buffer cellOps;         // kMaxCellOpsPerTick CellOp (island removal)
-  wgpu::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
-  wgpu::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
-  wgpu::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
-  wgpu::Buffer bodyInstances;   // debris-body voxel instances (render)
-  wgpu::Buffer bodyXforms;      // debris-body transforms (render)
-  wgpu::Buffer genList;         // worldgen streaming: slot indices to generate
+  rhi::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered
+  rhi::Buffer particleCounts;  // 4 u32: [0]/[1] = live count per page
+  rhi::Buffer claim;           // kClaimSize u32 — reinsertion claim hash
+  rhi::Buffer pArgsStage;      // 8 u32: [0..3] draw args, [4..6] dispatch args
+  rhi::Buffer pDispatchArgs;   // 3 u32, indirect-only (see dispatchArgs note)
+  rhi::Buffer drawArgs;        // 4 u32, indirect-only draw args for particles
+  rhi::Buffer expOps;          // kMaxExplosionsPerTick ExplosionOp
+  rhi::Buffer expMask;         // per-op destruction scratch (see sim_explode.wgsl)
+  rhi::Buffer cellOps;         // kMaxCellOpsPerTick CellOp (island removal)
+  rhi::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
+  rhi::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
+  rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
+  rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
+  rhi::Buffer bodyXforms;      // debris-body transforms (render)
+  rhi::Buffer genList;         // worldgen streaming: slot indices to generate
 
   // ---- far-field cascades (render-only; never bound in any sim pipeline) ----
-  wgpu::Buffer farVox;   // kFarLevels x 256^3 material bytes, packed 4/u32
+  rhi::Buffer farVox;   // kFarLevels x 256^3 material bytes, packed 4/u32
                          // (atomic in the fill/downsample kernels: partial-word
                          // byte updates from neighboring dirty chunks race)
-  wgpu::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
-  wgpu::Buffer farList;  // kFarListCap u32 fill entries: (level-1)<<12 | slot
-  wgpu::Buffer farUBO;   // FarParams
+  rhi::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
+  rhi::Buffer farList;  // kFarListCap u32 fill entries: (level-1)<<12 | slot
+  rhi::Buffer farUBO;   // FarParams
 
  private:
   struct Slot {
-    wgpu::Buffer buf;
+    rhi::Buffer buf;
     bool inFlight = false;
     IVec3 base{};      // world chunk coord of the mirror corner
     IVec3 origin{};    // window origin at encode time

@@ -104,30 +104,25 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
   ctx.WaitIdle();
   std::printf("sim settled: %.3f ms/tick\n", (NowSeconds() - s0) * 1000.0 / 100.0);
 
-  wgpu::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
-                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+  rhi::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
+                                      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                       "dirtyRead");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumChunks * 4);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  ctx.queue.Submit(enc.Finish());
   std::vector<uint32_t> awake;
-  wgpu::Future f = staging.MapAsync(
-      wgpu::MapMode::Read, 0, kNumChunks * 4, wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          const uint32_t* d =
-              (const uint32_t*)staging.GetConstMappedRange(0, kNumChunks * 4);
+  {
+    std::vector<uint32_t> d_((kNumChunks * 4) / 4, 0);
+    rhi::ReadBufferBlocking(ctx.device, staging, 0, d_.data(), (size_t)(kNumChunks * 4));
+    const uint32_t* d = d_.data();
+
           for (uint32_t i = 0; i < kNumChunks; i++) {
             if (d[i] != 0) {
               sleepActive++;
               awake.push_back(i);
             }
           }
-          staging.Unmap();
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  }
 
   // diagnosis on failure: where are the awake chunks, and what's in them?
   if (sleepActive >= 32 && !awake.empty()) {
@@ -139,27 +134,22 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     }
     std::printf("\n");
     // material histogram of the first awake chunks
-    wgpu::Buffer vstage = CreateBuffer(ctx.device, kChunkVol * 4 * 4,
-                                       wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer vstage = CreateBuffer(ctx.device, kChunkVol * 4 * 4,
+                                       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                        "voxRead");
-    wgpu::CommandEncoder e2 = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder e2 = ctx.device.CreateCommandEncoder();
     for (int k = 0; k < 4 && k < (int)awake.size(); k++)
       e2.CopyBufferToBuffer(world.voxels, (uint64_t)awake[k] * kChunkVol * 4, vstage,
                             (uint64_t)k * kChunkVol * 4, kChunkVol * 4);
-    wgpu::CommandBuffer c2 = e2.Finish();
-    ctx.queue.Submit(1, &c2);
+    ctx.queue.Submit(e2.Finish());
     uint32_t hist[64] = {};
-    wgpu::Future f2 = vstage.MapAsync(
-        wgpu::MapMode::Read, 0, kChunkVol * 4 * 4, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          if (status == wgpu::MapAsyncStatus::Success) {
-            const uint32_t* v =
-                (const uint32_t*)vstage.GetConstMappedRange(0, kChunkVol * 4 * 4);
+    {
+      std::vector<uint32_t> v_((kChunkVol * 4 * 4) / 4, 0);
+      rhi::ReadBufferBlocking(ctx.device, vstage, 0, v_.data(), (size_t)(kChunkVol * 4 * 4));
+      const uint32_t* v = v_.data();
+
             for (uint32_t i = 0; i < kChunkVol * 4; i++) hist[std::min(v[i] & 0xFFFu, 63u)]++;
-            vstage.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f2, UINT64_MAX);
+    }
     std::printf("  first-4-chunk contents:");
     for (uint32_t m = 1; m < 64; m++)
       if (hist[m]) std::printf(" %s=%u", m < mats.size() ? mats[m].name.c_str() : "?", hist[m]);
@@ -256,22 +246,13 @@ bool pondOk = false;
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
     const uint64_t bytes = (uint64_t)vox.size() * 4;
-    wgpu::Buffer st = CreateBuffer(ctx.device, bytes,
-                                   wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer st = CreateBuffer(ctx.device, bytes,
+                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                    "pondRead");
-    wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
     e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
-    wgpu::CommandBuffer c = e.Finish();
-    ctx.queue.Submit(1, &c);
-    wgpu::Future f = st.MapAsync(
-        wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
-          if (s2 == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(vox.data(), st.GetConstMappedRange(0, bytes), bytes);
-            st.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    ctx.queue.Submit(e.Finish());
+    rhi::ReadBufferBlocking(ctx.device, st, 0, vox.data(), (size_t)(bytes));
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -418,22 +399,13 @@ bool evapOk = false;
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
     const uint64_t bytes = (uint64_t)vox.size() * 4;
-    wgpu::Buffer st = CreateBuffer(ctx.device, bytes,
-                                   wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer st = CreateBuffer(ctx.device, bytes,
+                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                    "evapRead");
-    wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
     e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
-    wgpu::CommandBuffer c = e.Finish();
-    ctx.queue.Submit(1, &c);
-    wgpu::Future f = st.MapAsync(
-        wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
-          if (s2 == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(vox.data(), st.GetConstMappedRange(0, bytes), bytes);
-            st.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    ctx.queue.Submit(e.Finish());
+    rhi::ReadBufferBlocking(ctx.device, st, 0, vox.data(), (size_t)(bytes));
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -539,22 +511,13 @@ bool stainOk = false;
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
     const uint64_t bytes = (uint64_t)vox.size() * 4;
-    wgpu::Buffer sb = CreateBuffer(ctx.device, bytes,
-                                   wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer sb = CreateBuffer(ctx.device, bytes,
+                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                    "stainRead");
-    wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
     e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
-    wgpu::CommandBuffer c = e.Finish();
-    ctx.queue.Submit(1, &c);
-    wgpu::Future f = sb.MapAsync(
-        wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
-          if (s2 == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(vox.data(), sb.GetConstMappedRange(0, bytes), bytes);
-            sb.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    ctx.queue.Submit(e.Finish());
+    rhi::ReadBufferBlocking(ctx.device, sb, 0, vox.data(), (size_t)(bytes));
   }
 
   // Count stained floor voxels, and check every stain in the world is
@@ -688,22 +651,13 @@ bool fullOk = false;
   std::vector<uint32_t> fv(kNumChunks * (size_t)kChunkVol);
   {
     const uint64_t bytes = (uint64_t)fv.size() * 4;
-    wgpu::Buffer sb = CreateBuffer(
+    rhi::Buffer sb = CreateBuffer(
         ctx.device, bytes,
-        wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "fullRead");
-    wgpu::CommandEncoder e = ctx.device.CreateCommandEncoder();
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "fullRead");
+    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
     e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
-    wgpu::CommandBuffer c = e.Finish();
-    ctx.queue.Submit(1, &c);
-    wgpu::Future f = sb.MapAsync(
-        wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus s2, wgpu::StringView) {
-          if (s2 == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(fv.data(), sb.GetConstMappedRange(0, bytes), bytes);
-            sb.Unmap();
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    ctx.queue.Submit(e.Finish());
+    rhi::ReadBufferBlocking(ctx.device, sb, 0, fv.data(), (size_t)(bytes));
   }
   // Count landed blood and how much of it is at less than full fullness.
   // Blood FLOWS once it lands, and flowing splits a cell's fullness across

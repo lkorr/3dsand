@@ -43,7 +43,7 @@ double NowSeconds();
 uint32_t TicksPerDay(const Tuning& t);
 SkyState SkyForTick(const Tuning& t, uint32_t tick);
 
-void WriteRenderParams(const wgpu::Queue& queue, const World& world,
+void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
                        float fogDensity = kFarFogDensity,

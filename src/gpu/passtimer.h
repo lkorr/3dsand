@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include <webgpu/webgpu_cpp.h>
+#include "gpu/rhi.h"
 
 class GpuContext;
 
@@ -36,17 +36,16 @@ class PassTimer {
   // capacity = max timed passes per submitted command buffer. Each pass burns
   // two query slots (begin + end).
   bool Init(GpuContext& ctx, uint32_t capacity);
-  bool Valid() const { return querySet_ != nullptr; }
+  bool Valid() const { return (bool)querySet_; }
 
   // Begin a compute pass with timestamps attached. Falls back to an untimed
   // pass if the query set is full or unavailable, so encoding never fails.
-  wgpu::ComputePassEncoder BeginPass(const wgpu::CommandEncoder& enc,
-                                     const char* name);
+  rhi::ComputePass BeginPass(const rhi::CommandEncoder& enc, const char* name);
 
   // Called once per command buffer, immediately before enc.Finish(): resolves
   // the query set into the resolve buffer and copies it to the readback
   // staging buffer.
-  void EncodeResolve(const wgpu::CommandEncoder& enc);
+  void EncodeResolve(const rhi::CommandEncoder& enc);
 
   // Blocking map + accumulate into the per-name totals. Call after the queue
   // has gone idle. Measurement harness only — this is a synchronous readback.
@@ -69,9 +68,9 @@ class PassTimer {
   uint32_t PassesThisBuffer() const { return used_; }
 
  private:
-  wgpu::QuerySet querySet_;
-  wgpu::Buffer resolve_;
-  wgpu::Buffer staging_;
+  rhi::QuerySet querySet_;
+  rhi::Buffer resolve_;
+  rhi::Buffer staging_;
   uint32_t capacity_ = 0;
   uint32_t used_ = 0;                 // query slots consumed this command buffer
   std::vector<std::string> pending_;  // pass names in slot order, this buffer

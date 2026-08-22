@@ -98,7 +98,7 @@ void FarField::Update(IVec3 playerChunk) {
   }
 }
 
-uint32_t FarField::PrepareTick(const wgpu::Queue& queue) {
+uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
   if (!world_) return 0;
   if (uboDirty_) {
     FarParams fp{};

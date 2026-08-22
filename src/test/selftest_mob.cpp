@@ -41,7 +41,7 @@ Status GateMob(Ctx& c, std::string& detail) {
   const ItemLibrary& items = c.items;
   const uint32_t W = c.width;
   const uint32_t H = c.height;
-  wgpu::TextureView& view = c.view;
+  rhi::TextureView& view = c.view;
 // Milestone B mobs: spawn the generated dummy on terrain — it must stand
 // and walk (kinematic limbs over cached-chunk ground), lose an arm to
 // Sever (joint destroyed, limb adopted as debris), die to a vital hit
@@ -323,10 +323,6 @@ bool mobOk = false;
       // cube path (which would make both images identical).
       {
         const uint32_t W = 640, H = 360;
-        wgpu::TextureDescriptor td{};
-        td.size = {W, H, 1};
-        td.format = wgpu::TextureFormat::RGBA8Unorm;
-        td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
 
         // Slot lists exactly as the frame loop builds them: through the ONE
         // slot walk in game/bodyreg.h.
@@ -358,38 +354,31 @@ bool mobOk = false;
         }
 
         auto shoot = [&](bool withMicro, std::vector<uint8_t>& out) {
-          wgpu::Texture tex = ctx.device.CreateTexture(&td);
-          wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-          wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
-              enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+          rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "shotTarget");
+          rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+          rhi::RenderPass rp = sim.BeginRenderPass(
+              enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
           sim.DrawWorld(rp);
           sim.DrawBodies(rp, (uint32_t)inst.size());
           if (withMicro) sim.DrawMicroBodies(rp, ctx.queue, microInsts);
           rp.End();
-          wgpu::Buffer shot = CreateBuffer(
+          rhi::Buffer shot = CreateBuffer(
               ctx.device, (uint64_t)W * H * 4,
-              wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst, "microShot");
-          wgpu::TexelCopyTextureInfo srcT{};
+              rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "microShot");
+          rhi::TexelCopyTexture srcT{};
           srcT.texture = tex;
-          wgpu::TexelCopyBufferInfo dstB{};
+          rhi::TexelCopyBuffer dstB{};
           dstB.buffer = shot;
-          dstB.layout.bytesPerRow = W * 4;
-          dstB.layout.rowsPerImage = H;
-          wgpu::Extent3D ext{W, H, 1};
-          enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-          wgpu::CommandBuffer cmd = enc.Finish();
-          ctx.queue.Submit(1, &cmd);
+          dstB.bytesPerRow = W * 4;
+          dstB.rowsPerImage = H;
+          rhi::Extent3D ext{W, H, 1};
+          enc.CopyTextureToBuffer(srcT, dstB, ext);
+          ctx.queue.Submit(enc.Finish());
           out.assign((size_t)W * H * 4, 0);
-          wgpu::Future f = shot.MapAsync(
-              wgpu::MapMode::Read, 0, out.size(), wgpu::CallbackMode::WaitAnyOnly,
-              [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-                if (status == wgpu::MapAsyncStatus::Success) {
-                  std::memcpy(out.data(), shot.GetConstMappedRange(0, out.size()),
-                              out.size());
-                  shot.Unmap();
-                }
-              });
-          ctx.instance.WaitAny(f, UINT64_MAX);
+          rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), (size_t)(out.size()));
         };
 
         // VIEW SWEEP. One camera angle cannot test an OBB: the box has six
@@ -488,40 +477,31 @@ bool mobOk = false;
             // Draw ONLY the micro pass against the world, twice, so the diff
             // isolates this one body.
             auto shootSolo = [&](bool withMicro, std::vector<uint8_t>& out) {
-              wgpu::Texture tex = ctx.device.CreateTexture(&td);
-              wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-              wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
-                  enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+              rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "shotTarget");
+              rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+              rhi::RenderPass rp = sim.BeginRenderPass(
+                  enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
               sim.DrawWorld(rp);
               if (withMicro) sim.DrawMicroBodies(rp, ctx.queue, solo);
               rp.End();
-              wgpu::Buffer shot = CreateBuffer(
+              rhi::Buffer shot = CreateBuffer(
                   ctx.device, (uint64_t)W * H * 4,
-                  wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                  rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                   "microSolo");
-              wgpu::TexelCopyTextureInfo srcT{};
+              rhi::TexelCopyTexture srcT{};
               srcT.texture = tex;
-              wgpu::TexelCopyBufferInfo dstB{};
+              rhi::TexelCopyBuffer dstB{};
               dstB.buffer = shot;
-              dstB.layout.bytesPerRow = W * 4;
-              dstB.layout.rowsPerImage = H;
-              wgpu::Extent3D ext{W, H, 1};
-              enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-              wgpu::CommandBuffer cmd = enc.Finish();
-              ctx.queue.Submit(1, &cmd);
+              dstB.bytesPerRow = W * 4;
+              dstB.rowsPerImage = H;
+              rhi::Extent3D ext{W, H, 1};
+              enc.CopyTextureToBuffer(srcT, dstB, ext);
+              ctx.queue.Submit(enc.Finish());
               out.assign((size_t)W * H * 4, 0);
-              wgpu::Future fu = shot.MapAsync(
-                  wgpu::MapMode::Read, 0, out.size(),
-                  wgpu::CallbackMode::WaitAnyOnly,
-                  [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-                    if (status == wgpu::MapAsyncStatus::Success) {
-                      std::memcpy(out.data(),
-                                  shot.GetConstMappedRange(0, out.size()),
-                                  out.size());
-                      shot.Unmap();
-                    }
-                  });
-              ctx.instance.WaitAny(fu, UINT64_MAX);
+              rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), (size_t)(out.size()));
             };
             shootSolo(true, sWith);
             shootSolo(false, sWithout);

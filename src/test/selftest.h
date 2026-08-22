@@ -61,8 +61,8 @@ struct Ctx {
   // perf gate, the screenshot gates and the micro-body view sweep all draw
   // into this rather than each making their own 1080p texture.
   uint32_t width = 1920, height = 1080;
-  wgpu::Texture offscreen;
-  wgpu::TextureView view;
+  rhi::Texture offscreen;
+  rhi::TextureView view;
 
   // Carried between gates: `perf` measures these, and the verdict line prints
   // them. Advisory only — perf reports MARGINAL and never fails the run,

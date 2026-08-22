@@ -207,34 +207,23 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
 }  // namespace
 
 void Ctx::Grab(const char* path) {
-  wgpu::Buffer shot =
+  rhi::Buffer shot =
       CreateBuffer(ctx.device, (uint64_t)width * height * 4,
-                   wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                    "screenshot");
-  wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  wgpu::TexelCopyTextureInfo srcT{};
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  rhi::TexelCopyTexture srcT{};
   srcT.texture = offscreen;
-  wgpu::TexelCopyBufferInfo dstB{};
+  rhi::TexelCopyBuffer dstB{};
   dstB.buffer = shot;
-  dstB.layout.bytesPerRow = width * 4;
-  dstB.layout.rowsPerImage = height;
-  wgpu::Extent3D ext{width, height, 1};
-  enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-  wgpu::CommandBuffer cmd = enc.Finish();
-  ctx.queue.Submit(1, &cmd);
+  dstB.bytesPerRow = width * 4;
+  dstB.rowsPerImage = height;
+  rhi::Extent3D ext{width, height, 1};
+  enc.CopyTextureToBuffer(srcT, dstB, ext);
+  ctx.queue.Submit(enc.Finish());
   std::vector<uint8_t> pixels((size_t)width * height * 4);
   bool got = false;
-  wgpu::Future f = shot.MapAsync(
-      wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
-      [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        if (status == wgpu::MapAsyncStatus::Success) {
-          std::memcpy(pixels.data(), shot.GetConstMappedRange(0, pixels.size()),
-                      pixels.size());
-          shot.Unmap();
-          got = true;
-        }
-      });
-  ctx.instance.WaitAny(f, UINT64_MAX);
+  got = rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), (size_t)(pixels.size()));
   if (got && WriteBmpFile(path, pixels, width, height))
     std::printf("wrote %s\n", path);
 }
@@ -282,12 +271,7 @@ int Run(Ctx& c, const Options& opt) {
               plan.size() == 1 ? "" : "s");
 
   // The shared offscreen target every render-touching gate draws into.
-  wgpu::TextureDescriptor td{};
-  td.size = {c.width, c.height, 1};
-  td.format = wgpu::TextureFormat::RGBA8Unorm;
-  td.usage =
-      wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
-  c.offscreen = c.ctx.device.CreateTexture(&td);
+  c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
   c.view = c.offscreen.CreateView();
 
   std::vector<Result> results;

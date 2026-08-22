@@ -94,49 +94,34 @@ bool debrisOk = false;
                           xf.size() * sizeof(BodyXformGpu));
 
     const uint32_t W = 1280, H = 720;
-    wgpu::TextureDescriptor td{};
-    td.size = {W, H, 1};
-    td.format = wgpu::TextureFormat::RGBA8Unorm;
-    td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
-    wgpu::Texture tex = ctx.device.CreateTexture(&td);
+    rhi::Texture tex = ctx.device.CreateTexture({W, H, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
     Camera cam2;
     cam2.yaw = -2.356f;
     cam2.pitch = -0.32f;
     Vec3 eye{60.0f + 34, (float)h + 26, 60.0f + 34};
     WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0);
-    wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    wgpu::RenderPassEncoder rp = sim.BeginRenderPass(
-        enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
     sim.DrawParticles(rp);
     sim.DrawBodies(rp, (uint32_t)inst.size());
     rp.End();
-    wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
-                                     wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                      "debrisShot");
-    wgpu::TexelCopyTextureInfo srcT{};
+    rhi::TexelCopyTexture srcT{};
     srcT.texture = tex;
-    wgpu::TexelCopyBufferInfo dstB{};
+    rhi::TexelCopyBuffer dstB{};
     dstB.buffer = shot;
-    dstB.layout.bytesPerRow = W * 4;
-    dstB.layout.rowsPerImage = H;
-    wgpu::Extent3D ext{W, H, 1};
-    enc.CopyTextureToBuffer(&srcT, &dstB, &ext);
-    wgpu::CommandBuffer cmd = enc.Finish();
-    ctx.queue.Submit(1, &cmd);
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
     std::vector<uint8_t> pixels(W * H * 4);
     bool got = false;
-    wgpu::Future f = shot.MapAsync(
-        wgpu::MapMode::Read, 0, pixels.size(), wgpu::CallbackMode::WaitAnyOnly,
-        [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-          if (status == wgpu::MapAsyncStatus::Success) {
-            std::memcpy(pixels.data(), shot.GetConstMappedRange(0, pixels.size()),
-                        pixels.size());
-            shot.Unmap();
-            got = true;
-          }
-        });
-    ctx.instance.WaitAny(f, UINT64_MAX);
+    got = rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), (size_t)(pixels.size()));
     if (got && WriteBmpFile("screenshot_debris.bmp", pixels, W, H))
       std::printf("wrote screenshot_debris.bmp\n");
   }
