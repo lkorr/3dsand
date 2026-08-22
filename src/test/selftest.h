@@ -115,10 +115,10 @@ struct Gate {
   // answer instead of a curated list in someone's commit message that goes
   // stale the first time a gate learns to draw. `--list` prints it.
   //
-  // CONSUMED since phase 4a: `--selftest --backend vulkan` runs every gate
-  // with needsRender == false against a Vulkan-backed World, and skips the
-  // rest with a printed "needs the render path" reason (Run(), selftest.cpp).
-  // Phase 4b deletes the skip once the render path exists on both backends.
+  // NOTHING CONSUMES IT since phase 4b: both backends have a render path, so
+  // all 23 gates run on either, and the selftest defaults to Vulkan (phase 6).
+  // The flag survives as documentation — `--list` prints it, and it is the
+  // ready-made answer whenever a backend or a target is again partly built.
   bool needsRender = false;
 };
 

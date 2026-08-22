@@ -29,14 +29,15 @@ class GpuContext {
   // advertise the feature we simply do not request it, `timestampsEnabled`
   // stays false, and the caller falls back to wall-clock timing. Nothing in the
   // frame path looks at this.
-  // `backend` selects Dawn or Vulkan at runtime (phase 4a). Vulkan is
-  // HEADLESS-ONLY until phase 4b: passing a window with backend Vulkan is
-  // refused. `vkValidation` turns on VK_LAYER_KHRONOS_validation + sync
-  // validation; `vkSledgehammer` selects the barrier A/B oracle
-  // (barrier_graph §6.2). Both are ignored on Dawn.
+  // `backend` selects Dawn or Vulkan at runtime (phase 4a). Both are fully
+  // capable — headless and windowed — since phase 4b, and **Vulkan is the
+  // default** since phase 6; Dawn is kept as the cross-backend hash oracle.
+  // `vkValidation` turns on VK_LAYER_KHRONOS_validation + sync validation;
+  // `vkSledgehammer` selects the barrier A/B oracle (barrier_graph §6.2). Both
+  // are ignored on Dawn.
   bool Init(GLFWwindow* window, uint32_t width, uint32_t height,
             bool lowPowerAdapter = false, bool wantTimestamps = false,
-            rhi::BackendKind backend = rhi::BackendKind::Dawn,
+            rhi::BackendKind backend = rhi::BackendKind::Vulkan,
             bool vkValidation = false, bool vkSledgehammer = false);
   void Resize(uint32_t width, uint32_t height);
 
@@ -50,8 +51,9 @@ class GpuContext {
   rhi::Device device;
   rhi::Queue queue;
   // Which backend `device` is. Mirrors device.Kind(); kept as a field so a
-  // caller with only the context does not need a live device to ask.
-  rhi::BackendKind backendKind = rhi::BackendKind::Dawn;
+  // caller with only the context does not need a live device to ask. Set by
+  // Init from its argument — this initialiser only matters before Init runs.
+  rhi::BackendKind backendKind = rhi::BackendKind::Vulkan;
   rhi::TextureFormat surfaceFormat = rhi::TextureFormat::Undefined;
   uint32_t width = 0, height = 0;
 

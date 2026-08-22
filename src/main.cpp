@@ -970,10 +970,12 @@ int main(int argc, char** argv) {
   // comparison over an ACTIVE world (ops, explosions, particles, readback ring,
   // streaming) rather than a quiet one.
   bool vkSmokeLoud = false;
-  // --backend vulkan. Headless ONLY: the Vulkan render path is phase 4, so
-  // there is no swapchain to present to and asking for one is refused loudly
-  // rather than silently falling back to Dawn.
-  bool backendVulkan = false;
+  // The backend. VULKAN IS THE DEFAULT since port phase 6 (2026-08-22): it runs
+  // all 23 gates with results identical to Dawn's, renders windowed, and is
+  // ~25% cheaper on a settled tick. `--backend dawn` selects Dawn, which is
+  // retained through phase 7 as the cross-backend hash ORACLE — the thing that
+  // makes a rule-1 divergence visible — not as a fallback.
+  rhi::BackendKind backend = rhi::BackendKind::Vulkan;
   bool sledgehammer = false;  // --barriers=sledgehammer (barrier_graph §6.2 oracle)
   bool vkValidation = false;  // --vk-validation: VK_LAYER_KHRONOS_validation + sync
   bool lowPowerAdapter = false;
@@ -1042,12 +1044,14 @@ int main(int argc, char** argv) {
     // particle chain, the readback ring, and a streaming walk that forces
     // eviction, store-hit refill and procgen fill.
     if (a == "--vk-smoke-loud") vkSmokeLoud = true;
-    // `--backend vulkan` selects the Vulkan compute backend. Headless only in
-    // phase 3b — see the refusal below.
+    // `--backend dawn` selects the reference backend; `--backend vulkan` names
+    // the default explicitly. Both spellings stay accepted so existing
+    // invocations and scripts keep working across the phase-6 flip.
     if (a == "--backend" && i + 1 < argc) {
       std::string b = argv[++i];
-      if (b == "vulkan") backendVulkan = true;
-      else if (b != "dawn") {
+      if (b == "vulkan") backend = rhi::BackendKind::Vulkan;
+      else if (b == "dawn") backend = rhi::BackendKind::Dawn;
+      else {
         std::fprintf(stderr, "unknown --backend '%s' (expected dawn|vulkan)\n", b.c_str());
         return 2;
       }
@@ -1073,10 +1077,10 @@ int main(int argc, char** argv) {
   // competing for the adapter while phase 3a is still headless.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
-  // --backend vulkan: every mode runs its real body against a Vulkan-backed
-  // World since phase 4b — the 23 selftest gates, --shot/--shot-mob,
-  // --measure, the smokes, and the windowed game (swapchain +
-  // imgui_impl_vulkan, D3). Dawn remains the default until phase 6.
+  // Every mode below runs its real body against whichever backend was selected
+  // — the 23 selftest gates, --shot/--shot-mob, --measure, and the windowed
+  // game (swapchain + imgui_impl_vulkan). Since phase 6 that is Vulkan unless
+  // --backend dawn says otherwise.
   //
   // The smokes run BOTH backends by construction, so they do not need
   // --backend to select one; accepting the flag anyway keeps invocations
@@ -1164,8 +1168,7 @@ int main(int argc, char** argv) {
 
   GpuContext ctx;
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure,
-                backendVulkan ? rhi::BackendKind::Vulkan : rhi::BackendKind::Dawn,
-                vkValidation, sledgehammer))
+                backend, vkValidation, sledgehammer))
     return 1;
 
   Telemetry telemetry;
