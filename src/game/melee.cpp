@@ -254,8 +254,16 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   // maps to -up: a downward flick must cut downward, and getting this sign
   // wrong produces a weapon that mirrors the player's hand, which reads as
   // broken long before anyone works out why.
-  Vec3 screenDir = (right * mouseVel_.x + up * -mouseVel_.y);
-  if (screenDir.len() > 1e-4f) screenDir = screenDir.normalized();
+  //
+  // The per-axis gains (melee.h) are applied HERE, to the pose input only —
+  // `mouseSpeed_` above stays the true pixel speed the commit test needs. The
+  // gained magnitude is kept in `poseSpeed` rather than being thrown away by
+  // the normalize, because a gain that only rotated the direction would change
+  // which way the blade goes without changing how far it gets.
+  Vec3 gained =
+      right * (mouseVel_.x * tuning.xGain) + up * (-mouseVel_.y * tuning.yGain);
+  float poseSpeed = gained.len();
+  Vec3 screenDir = poseSpeed > 1e-4f ? gained.normalized() : Vec3{};
 
   if (!armed) {
     // Unarmed: collapse to idle and forget any half-built swing, so picking a
@@ -285,8 +293,14 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       // Track the mouse. The lean is what makes the blade feel connected to
       // the hand while merely aiming — it is the same input that will become
       // the cut, shown before it fires, so committing never feels arbitrary.
-      Vec3 want = screenDir * (mouseSpeed_ * tuning.trackGain);
-      const float kMaxLean = 2.4f;
+      // `poseSpeed`, not `mouseSpeed_`: the gains have to reach the hand, or
+      // the blade would merely point further without going further.
+      Vec3 want = screenDir * (poseSpeed * tuning.trackGain);
+      // Raised alongside the gains. At the old 2.4 the clamp bound long before
+      // a 5x vertical push did anything, so the extra sensitivity would have
+      // been invisible above roughly a fifth of the previous mouse travel —
+      // the exact complaint (having to look all the way up to raise the blade).
+      const float kMaxLean = 7.0f;
       if (want.len() > kMaxLean) want = want.normalized() * kMaxLean;
       lean_ = Lerp(lean_, want, SmoothAlpha(0.05f, dt));
 
@@ -296,6 +310,9 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       // slash ends: a cut that keeps steering with the mouse mid-swing feels
       // like dragging the blade through treacle, and it also makes the sweep
       // curve, which the damage code would then have to chord.
+      // screenDir is unit-or-zero, so this is the "there is a direction at
+      // all" guard; commitSpeed is still measured on TRUE mouse speed, which
+      // is what keeps the raised gains from turning a twitch into a cut.
       if (mouseSpeed_ > tuning.commitSpeed && screenDir.len() > 0.5f) {
         cutDir_ = screenDir;
         phase_ = SwingPhase::Slash;

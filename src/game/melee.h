@@ -85,6 +85,23 @@ struct MeleeTuning {
   // How strongly the guard pose follows the mouse, in world voxels per
   // (pixel/sec). Small — this is a lean, not a teleport.
   float trackGain = 0.0038f;
+  // Per-axis gain on the mouse BEFORE it becomes a cut direction and a lean.
+  // These shape the *pose*, not the commit test: `commitSpeed` is still
+  // compared against true mouse speed, so raising these makes the blade travel
+  // further per pixel without making it fire off a twitch.
+  //
+  // Vertical is much higher than horizontal on purpose. A screen-space pixel
+  // costs the same either way, but the arm's vertical range (hip to overhead)
+  // is short and the player runs out of mousepad long before the blade gets
+  // overhead; horizontal has the whole width of a sweep to play with.
+  //
+  // xGain is NEGATIVE: the raw screen-right vector is geometrically correct
+  // (it matches `cam.Right()`, which is the same basis strafe uses), but a cut
+  // that tracks the cursor reads as mirrored in the hand — you push the hilt
+  // right to bring the EDGE left through the target. Mirroring here is what
+  // makes a rightward flick cut rightward through what you are looking at.
+  float xGain = -2.0f;
+  float yGain = 5.0f;
   // Guard-pose offsets from the shoulder, world voxels.
   float guardForward = 2.2f, guardUp = 2.6f, guardSide = 1.6f;
   // Seconds of mouse history the swing direction is averaged over. One tick of
