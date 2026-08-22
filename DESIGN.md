@@ -30,7 +30,7 @@ procedurally generated world, alchemy, spells, and online multiplayer.
 | Rendering | **Ray traversal (DDA) over the voxel grid**, not meshing | Geometry changes every frame; meshing churn would dominate |
 | Rigidbody physics | **Jolt Physics** + custom voxel-terrain collision via localized marching cubes | Don't write a rigidbody solver; Jolt is fast, free, battle-tested |
 | Multiplayer model | **Determinism-first sim discipline now; lockstep vs. server-authoritative decided at M9** | A disciplined integer GPU sim CAN be bit-deterministic across machines — both models stay viable (§10) |
-| Language / API | **C++20 + WebGPU (Dawn native / Emscripten browser) + WGSL** (see §12) | Browser technical demos + browser multiplayer are a product requirement; Vulkan cannot run in browsers, while Dawn runs on Vulkan natively — one codebase, zero shader rewrites for web |
+| Language / API | **C++20 + WGSL, migrating WebGPU (Dawn) → native Vulkan** (2026-08-22; see §12 and docs/PLAN_vulkan_port.md) | Browser requirement dropped 2026-08-22. Vulkan unlocks sparse residency (measured: 83% of the voxel buffer is empty pages — a 1024³ window for less memory than 512³ dense), explicit sync/memory control, async queues. WGSL stays the authoring language via Tint→SPIR-V — zero shader rewrites |
 
 ---
 
@@ -2080,6 +2080,25 @@ Principles (Noita's lessons, taken as requirements):
   "I wasn't careful," not "the game is buggy").
 
 ## 12. Tech Stack
+
+**Update (2026-08-22): the browser requirement is dropped and a native Vulkan
+port is adopted.** The plan of record — measurements, phases, and the
+green-gate checkpoints — is `docs/PLAN_vulkan_port.md`; the measured pass/
+dependency map that seeds the hand-written barrier graph is
+`docs/vulkan_pass_map.md`. What the paragraph below called the "escape hatch"
+is now the road, taken for the capabilities parity cannot reach: sparse
+residency for the voxel buffer (measured 83% of pages empty on the default
+seed), explicit memory and synchronization control, and async compute for
+derived render-only passes. Three things survive the port unchanged: **WGSL
+stays the authoring language** (compiled to SPIR-V via Tint at load, so the
+generated-prelude machinery, F5 hot-reload and `check_shaders.sh` are
+untouched); **the determinism rules survive verbatim** (integer sim kernels,
+no subgroup ops in sim state — Vulkan makes those *available*, not
+*permitted*); and **Dawn is retained during the port** as the reference
+backend and cross-backend hash oracle (same seed + same tick ⇒ same world
+hash) until Vulkan is fully validated, after which its removal is a decision
+recorded in the plan's decision log. The rationale below is kept as the record
+of why WebGPU was the right call while web was a requirement.
 
 **Adopted (2026-08-19, browser requirement): C++20 + WebGPU + WGSL — Dawn
 (Google's WebGPU implementation, Vulkan backend) for native, Emscripten/WASM for
