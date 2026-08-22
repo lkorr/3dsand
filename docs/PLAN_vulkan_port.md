@@ -769,6 +769,55 @@ first-configure fetch) is removed in a cleanup commit that also simplifies the
 RHI seam to a single live backend. The seam itself stays: it is what made the
 port testable and it costs nothing to keep.
 
+> **[AS BUILT] Phase 6 — Vulkan is the default (2026-08-22). Phase 6 complete.**
+>
+> **The flip was small, and that is phase 4a's dividend rather than luck.** The
+> backend is chosen in exactly one place. What needed changing was the *shape* of
+> the variable holding it: `main.cpp` carried `bool backendVulkan = false`, a
+> flag named for the non-default, which cannot express "default Vulkan" without
+> reading backwards. It is now `rhi::BackendKind backend =
+> rhi::BackendKind::Vulkan`, and the ternary at the `GpuContext::Init` call site
+> is gone. Both `--backend dawn` and `--backend vulkan` stay accepted, so no
+> existing invocation or script changes meaning.
+>
+> **Nothing else genuinely needed plumbing, including the two places that looked
+> like they would.** There is no separate "selftest default": the harness prints
+> and runs against `ctx.backendKind`, so it followed the flip for free. The two
+> `BackendKind::Dawn` defaults in `context.h` (the `Init` default argument and
+> the field initialiser) were flipped for consistency, but both call sites pass
+> the argument explicitly — they were latent traps, not live behaviour. Recording,
+> the pass table, barrier generation and buffer creation are untouched, as the
+> brief required.
+>
+> **Checkpoint evidence, all on an mtime-verified exe:**
+>
+> | check | result |
+> |---|---|
+> | `--selftest` (no flag) | 23 gates, **exit 0**, `backend vulkan`, `determinism: PASS (final hash 7cfa2420 over 200 ticks, matches baseline)`, pond-freeze + mob known-failing |
+> | `--selftest --backend dawn` | 23 gates, **exit 0**, `backend dawn`, same `7cfa2420`, same two known failures |
+> | gate-by-gate `--json` diff | identical name set, **zero status differences, zero detail-string differences** except `perf` (wall clock: 2.10 vs 2.16 ms/tick) |
+> | `--vk-smoke-loud --vk-validation` | **19/19 MATCH**, ZERO validation messages, hashes byte-identical to the phase-3c record (worldgen `f97ba745` … t120 `cb036bd1`) |
+> | `check_pass_table.py` | `pass table OK` |
+> | `check_invariants.py` | `invariants OK` |
+> | `--frames 400 --vk-validation` | windowed default is Vulkan, F5 reload `ok`, clean exit, `session: vulkan validation messages: 0 (clean)` |
+> | `--frames 120 --backend dawn` | windowed Dawn unaffected |
+>
+> **`tests/baseline.json` is unchanged, and that is the point.** The golden hash
+> is backend-independent — it was already `7cfa2420` on both — so a default flip
+> has nothing to flip. If a gate ever behaves differently under a backend change,
+> the baseline is the wrong place to absorb it.
+>
+> **D3 — the docs.** CLAUDE.md gained a *"Two backends: Vulkan runs, Dawn
+> judges"* section in build/verify: default is Vulkan, `--backend dawn` is the
+> ORACLE rather than a fallback, `--vk-validation`/`--frames` exist, the
+> sync-validation-fails-the-run policy and *why* it must not be weakened,
+> `SANDVOX_NO_CRASH_DIALOG=1` + `crash.log`, and verify-the-exe-mtime. Plus the
+> header stack line, the `src/gpu/` layout row, the ImGui gotcha, and a new
+> gotcha for phase 3b's trap (a core feature still has to be *enabled*).
+> DESIGN.md §12 gained a second update paragraph: the port landed, Vulkan is
+> default, parity is measured, and Dawn is retained because *its job is to
+> disagree*.
+
 **Phase 7 — sparse residency (the payoff) — REWRITTEN 2026-08-22 per
 `docs/ROADMAP_scale.md` §1 (user-reviewed): SOFTWARE PAGE TABLE, not
 `VK_KHR_sparse_binding`.** Hardware sparse was validated as *available* on
