@@ -624,12 +624,34 @@ struct MicroHit {
 // draw the same frame, and no frame timing leaks in. (It is render-only either
 // way — this is about the animation being reproducible in a replay, not about
 // determinism of the world.)
-fn microFrameAt(b : MicroBrick, tick : u32) -> u32 {
+// Identity hashes for a micro cell's authored variation (yaw, jitter, frame
+// phase). The COLUMN hash ignores Y: everything that must agree up a stacked
+// plant (flipbook phase for all materials, yaw/jitter for swaying ones) keys
+// on it. The cell hash is the original per-cell draw, kept for non-swaying
+// materials so their fields keep the exact scatter they were tuned with.
+// The shading site (microNormalToWorld's caller) re-derives microCellHash, so
+// the two must never diverge.
+fn microColumnHash(cell : vec3<i32>) -> u32 {
+  return hash3(R.seed, bitcast<u32>(cell.x), bitcast<u32>(cell.z));
+}
+fn microCellHash(flags : u32, cell : vec3<i32>) -> u32 {
+  if ((flags & MICROF_SWAY) != 0u) { return microColumnHash(cell); }
+  return hash3(R.seed, 0u, cellIndexW(cell));
+}
+
+// `colH` is the per-COLUMN hash (see microColumnHash): offsetting the flipbook
+// phase by it is what stops every tuft in a meadow flipping its frames on the
+// same tick, which read as the whole field twitching in lockstep. Keyed on the
+// column rather than the cell because the stacked species (foxglove, reed,
+// tall grass) repeat one model up a column — a per-cell phase would put
+// adjacent cells of ONE plant on different frames and tear it at every cell
+// boundary.
+fn microFrameAt(b : MicroBrick, tick : u32, colH : u32) -> u32 {
   let n = microFrameCount(b);
   if (n <= 1u) { return 0u; }
   let period = microPeriod(b);
   if (period == 0u) { return 0u; }
-  let phase = tick % period;
+  let phase = (tick + (colH & 0x3FFu)) % period;
   // Linear scan over the cumulative-offset header. n is <= 255 by construction
   // and realistically 2-8, so a scan beats any cleverness and has no divides.
   for (var i = 0u; i < n; i++) {
@@ -664,14 +686,69 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
 
   let sl = b.subdivLog2;
   let S = i32(1u << sl);
-  let frame = microFrameAt(b, tick);
 
   // ---- per-cell variation, keyed on the cell, not on time ----
   // ONE hash draw feeds both the yaw and the jitter, so a cell's identity is a
   // single value and the two never decorrelate. hash3(seed, 0, cellIndexW) is
   // the same shape the sim's RNG uses; the middle argument is 0 because there
   // is no tick here — a tuft must not re-roll its orientation every frame.
-  let h = hash3(R.seed, 0u, cellIndexW(cell));
+  //
+  // Swaying materials key on the COLUMN instead (microCellHash): they are the
+  // ones worldgen stacks into multi-cell plants, and a per-cell yaw would give
+  // each cell of one blade a different quarter-turn.
+  let swaying = (b.flags & MICROF_SWAY) != 0u;
+  let colH = microColumnHash(cell);
+  let h = microCellHash(b.flags, cell);
+  let frame = microFrameAt(b, tick, colH);
+
+  // ---- wind, evaluated once per cell trace --------------------------------
+  // Render-only (rule 1 untouched): R.time never feeds voxel state, exactly
+  // like the water ripple field. The bend is applied further down as a shear
+  // on the SAMPLE coordinate — the DDA still marches the unsheared grid, so
+  // hit t/axis stay exact box faces and the cost is two rounds per sample row.
+  var swayVec = vec2f(0.0);
+  var riseBase = 0.0;
+  var riseNorm = 0.0;
+  if (swaying) {
+    // Where is this cell within its PLANT? Count contiguous swaying cells
+    // below and above (bounded at 8 — taller than anything worldgen stacks),
+    // so an 8-cell stand and a single tuft both bend from their own root to
+    // their own tip rather than by absolute cell height. Reading neighbour
+    // voxels here is fine: this whole path is primary-camera-ray only.
+    var below = 0;
+    for (var i = 1; i <= 8; i++) {
+      let cb = cell - vec3<i32>(0, i, 0);
+      if (!inBounds(cb)) { break; }
+      let mb = voxMat(voxels[cellIndexW(cb)]);
+      if (mb == 0u || (microBricks[mb].flags & MICROF_SWAY) == 0u) { break; }
+      below++;
+    }
+    var above = 0;
+    for (var i = 1; i <= 8; i++) {
+      let ca = cell + vec3<i32>(0, i, 0);
+      if (!inBounds(ca)) { break; }
+      let ma = voxMat(voxels[cellIndexW(ca)]);
+      if (ma == 0u || (microBricks[ma].flags & MICROF_SWAY) == 0u) { break; }
+      above++;
+    }
+    riseBase = f32(below);
+    riseNorm = 1.0 / f32(below + 1 + above);
+
+    // Two incommensurate sine bands per axis: a slow whole-field breath plus a
+    // faster flutter, never periodic together. `gustPos` makes the phase drift
+    // across the field so a gust travels rather than the whole meadow rocking
+    // as one; `ph` is the per-plant scatter on top (the "not all synced" part).
+    // X leads and Z trails at ~60% amplitude, so the motion is an ellipse with
+    // a dominant axis — wind has a direction, jiggle does not.
+    let ph = f32(colH & 1023u) * 0.006136;  // 0..2pi per column
+    let gustPos = f32(cell.x) * 0.11 + f32(cell.z) * 0.07;
+    let t = R.time * TUNE_MICRO_SWAY_SPEED;
+    let wx = sin(t + gustPos + ph) * 0.7 +
+             sin(t * 1.73 + gustPos * 0.5 + ph * 3.1) * 0.3;
+    let wz = sin(t * 0.83 + gustPos * 1.2 + ph + 2.1) * 0.45 +
+             sin(t * 2.19 + ph * 1.7) * 0.15;
+    swayVec = vec2f(wx, wz) * TUNE_MICRO_SWAY_AMP;
+  }
 
   // Local ray, in SUB-VOXEL units (0..S). Working in sub-voxels rather than in
   // 0..1 makes the DDA identical in shape to the world one, and `t` comes back
@@ -691,13 +768,19 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     if (q == 1u) {        // 90 deg:  (x, z) -> (z, S - x)
       p = vec3f(p.z, p.y, fS - p.x);
       d = vec3f(d.z, d.y, -d.x);
+      swayVec = vec2f(swayVec.y, -swayVec.x);
     } else if (q == 2u) { // 180 deg
       p = vec3f(fS - p.x, p.y, fS - p.z);
       d = vec3f(-d.x, d.y, -d.z);
+      swayVec = -swayVec;
     } else if (q == 3u) { // 270 deg
       p = vec3f(fS - p.z, p.y, p.x);
       d = vec3f(-d.z, d.y, d.x);
+      swayVec = vec2f(-swayVec.y, swayVec.x);
     }
+    // swayVec turns WITH the ray (same swap-and-negate as `d`): the wind is a
+    // world-space direction, and without this a field of yaw variants would
+    // bend four different ways under one gust.
   }
 
   // ---- sub-cell XZ jitter ----
@@ -711,6 +794,25 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     let jx = f32(i32((h >> 8u) & 3u) - 1) * 0.5;
     let jz = f32(i32((h >> 10u) & 3u) - 1) * 0.5;
     p = vec3f(p.x - jx, p.y, p.z - jz);
+  }
+
+  // ---- wind: shear the RAY, not the samples ----
+  // The bend displaces the model's content by D(y) = swayVec * riseFrac(y),
+  // which is LINEAR in y within one cell — so instead of quantising sample
+  // coordinates (which stepped 1.25 cm at a time and read as pixelated
+  // motion), transform the ray into the model's REST space: shift the origin
+  // by -D(p.y) and tilt the direction by the per-height shear. The sheared
+  // ray is still a straight line, the ordinary DDA below marches it
+  // untouched, and the content renders continuously displaced — smooth
+  // float motion, exact t values, same axis-aligned face normals.
+  // Applied after the yaw swizzle (swayVec was rotated with the ray) and
+  // after jitter, both of which are rigid offsets the shear composes with.
+  if (swaying) {
+    let fS = f32(S);
+    let disp = swayVec * ((riseBase + p.y / fS) * riseNorm);
+    let perY = swayVec * (riseNorm / fS);
+    p = vec3f(p.x - disp.x, p.y, p.z - disp.y);
+    d = vec3f(d.x - perY.x * d.y, d.y, d.z - perY.y * d.y);
   }
 
   // ---- Amanatides-Woo over the brick ----
@@ -736,9 +838,10 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
 
   var axis = 0;
   var tCur = 0.0;
-  // 3*S covers a full diagonal traverse; +4 is slack for the entry rounding
-  // above and for a jittered start that begins one voxel outside the box.
-  let maxSteps = 3 * S + 4;
+  // 3*S covers a full diagonal traverse; +8 is slack for the entry rounding
+  // above and for a start displaced outside the box — up to one voxel of
+  // jitter plus up to two sub-voxels of wind shear on the entry point.
+  let maxSteps = 3 * S + 8;
   for (var i = 0; i < maxSteps; i++) {
     if (c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < S && c.y < S && c.z < S) {
       let m = microVoxAt(b, frame, c);
@@ -769,6 +872,173 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     } else {
       c.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
     }
+  }
+  return out;
+}
+
+// ---- analytic strand plants (MICROF_STRANDS) --------------------------------
+// The cells of a strand material hold no brick. Instead each COLUMN carries a
+// small set of parametric blades — root position, own height, own wind phase —
+// and this function intersects the slice of them passing through `cell` in
+// closed form. This is the path for content that must move smoothly and
+// PER-STRAND: the brick sway above bends a whole cell's content as one rigid
+// piece on a sub-voxel lattice, while a strand here is a true entity whose
+// position is a continuous function of time. Nothing is quantised anywhere.
+//
+// Geometry: a blade is a vertical square-section rod bent by a quadratic
+// cantilever curve D(u) = wind * u^2 (root stiff, tip floppy), u = height /
+// plant height. Within one cell the curve is taken as linear (a 10 cm chord of
+// a gentle bend), which makes the rod a SHEARED BOX: substituting the shear
+// into the ray gives a still-straight ray, so the test collapses to the
+// classic three-slab AABB intersection — exact, no iteration. Chord endpoints
+// are exact curve evaluations, so consecutive cells of a column share them and
+// the blade is continuous across every cell boundary.
+//
+// Every strand attribute derives from hash(column, strandIndex): each cell of
+// a stack reconstructs the identical strand set independently, which is what
+// lets worldgen keep stacking plain voxel cells (segment + head materials)
+// while the renderer treats the column as one plant. The material of a hit is
+// the authored body until the strand's own tip fraction, where it switches to
+// the tip material — so dried tips land per-BLADE, not per-cell.
+//
+// Normals are reported as axis/sgn exactly like the brick DDA (the slab that
+// decided entry), so lighting shades a blade as a voxel-crisp rod and the
+// whole MicroHit pipeline downstream is unchanged.
+fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
+    -> MicroHit {
+  var out : MicroHit;
+  out.hit = false;
+  out.mat = 0u;
+  out.t = 0.0;
+  out.axis = 1;
+  out.sgn = -1.0;
+
+  // Pool layout: see the strands block in LoadMicroVox (sim/microvox.cpp).
+  let w0 = microPool[b.base];
+  let count = w0 & 0xFFu;
+  let bodyMat = (w0 >> 8u) & 0xFFu;
+  let tipMat = (w0 >> 16u) & 0xFFu;
+  if (b.base + 5u + count * 2u > MICRO_POOL_WORDS) { return out; }
+  let halfW = bitcast<f32>(microPool[b.base + 1u]);
+  let tipFrac = bitcast<f32>(microPool[b.base + 2u]);
+  let swayScale = bitcast<f32>(microPool[b.base + 3u]);
+  let heightVary = bitcast<f32>(microPool[b.base + 4u]);
+
+  let colH = microColumnHash(cell);
+
+  // Plant extent: same probe as traceMicro, same reasoning — a strand's bend
+  // and height are fractions of the PLANT, which only the column knows.
+  var below = 0;
+  for (var i = 1; i <= 8; i++) {
+    let cb = cell - vec3<i32>(0, i, 0);
+    if (!inBounds(cb)) { break; }
+    let mb = voxMat(voxels[cellIndexW(cb)]);
+    if (mb == 0u || (microBricks[mb].flags & MICROF_SWAY) == 0u) { break; }
+    below++;
+  }
+  var above = 0;
+  for (var i = 1; i <= 8; i++) {
+    let ca = cell + vec3<i32>(0, i, 0);
+    if (!inBounds(ca)) { break; }
+    let ma = voxMat(voxels[cellIndexW(ca)]);
+    if (ma == 0u || (microBricks[ma].flags & MICROF_SWAY) == 0u) { break; }
+    above++;
+  }
+  let totalH = f32(below + 1 + above);
+  let rise0 = f32(below);
+
+  // The two wind bands, shared with traceMicro's field (same speeds, same
+  // travelling-gust phase) so brick plants and strand plants visibly live in
+  // the same wind. Kept as separate vectors here: each strand blends them
+  // with its own hash-drawn weights, which is what decorrelates neighbouring
+  // blades without costing extra transcendentals per strand.
+  let ph = f32(colH & 1023u) * 0.006136;
+  let gustPos = f32(cell.x) * 0.11 + f32(cell.z) * 0.07;
+  let t = R.time * TUNE_MICRO_SWAY_SPEED;
+  let band1 = vec2f(sin(t + gustPos + ph),
+                    sin(t * 0.83 + gustPos * 1.2 + ph + 2.1) * 0.6);
+  let band2 = vec2f(sin(t * 1.73 + gustPos * 0.5 + ph * 3.1),
+                    sin(t * 2.19 + ph * 1.7) * 0.6);
+  // TUNE_MICRO_SWAY_AMP is authored in sub-voxels of a subdiv-8 cell; strands
+  // work in cell units, hence the /8.
+  let amp = TUNE_MICRO_SWAY_AMP * 0.125 * swayScale;
+
+  var bestT = 1e9;
+  for (var s = 0u; s < count; s++) {
+    let hs = hash3(colH, s, 0x57A4Du);
+    // This strand's own height: a fraction of the plant, so a stand's top is
+    // ragged per-blade rather than sheared flat at the column height.
+    let sH = totalH * (1.0 - heightVary * f32(hs & 255u) / 255.0);
+    if (rise0 >= sH) { continue; }
+    let yTop = min(1.0, sH - rise0);
+
+    // Root: the authored slot, plus a small per-column jitter so a field of
+    // columns is not the same 5 blades on a lattice.
+    let rt = vec2f(bitcast<f32>(microPool[b.base + 5u + s * 2u]),
+                   bitcast<f32>(microPool[b.base + 6u + s * 2u])) +
+             (vec2f(f32((hs >> 8u) & 15u), f32((hs >> 12u) & 15u)) - 7.5) *
+                 0.008;
+
+    // Per-strand wind: an individual blend of the two shared bands. THIS line
+    // is "each strand is its own entity" — two blades in one cell disagree
+    // about the gust by their weights, not by living in different fields.
+    let wind = (band1 * (0.55 + 0.45 * f32((hs >> 16u) & 255u) / 255.0) +
+                band2 * (0.20 + 0.55 * f32((hs >> 24u) & 255u) / 255.0)) * amp;
+
+    // Cantilever chord through this cell: exact curve points at the cell's
+    // bottom and top, clamped so root + bend + half-width never leaves the
+    // cell (the world DDA would never march the part that crossed over).
+    let u0 = rise0 / totalH;
+    let u1 = (rise0 + yTop) / totalH;
+    let lo = vec2f(halfW + 0.01) - rt;
+    let hi = vec2f(0.99 - halfW) - rt;
+    let d0 = clamp(wind * u0 * u0, lo, hi);
+    let d1 = clamp(wind * u1 * u1, lo, hi);
+    let shear = (d1 - d0) / max(yTop, 1e-4);
+
+    // Sheared-slab test. Substituting the linear centreline C(y) = rt + d0 +
+    // shear*y into the ray turns "distance to a slanted rod" into an ordinary
+    // AABB slab test on a resampled ray — same guard against near-zero
+    // components as the DDA above.
+    let dpx = rd.x - shear.x * rd.y;
+    let dpz = rd.z - shear.y * rd.y;
+    let ix = 1.0 / select(dpx, select(-1e-6, 1e-6, dpx >= 0.0), abs(dpx) < 1e-6);
+    let iy = 1.0 / select(rd.y, select(-1e-6, 1e-6, rd.y >= 0.0), abs(rd.y) < 1e-6);
+    let iz = 1.0 / select(dpz, select(-1e-6, 1e-6, dpz >= 0.0), abs(dpz) < 1e-6);
+    let ox = entry.x - rt.x - d0.x - shear.x * entry.y;
+    let oz = entry.z - rt.y - d0.y - shear.y * entry.y;
+    var t0x = (-halfW - ox) * ix;
+    var t1x = (halfW - ox) * ix;
+    if (t0x > t1x) { let tmp = t0x; t0x = t1x; t1x = tmp; }
+    var t0y = (0.0 - entry.y) * iy;
+    var t1y = (yTop - entry.y) * iy;
+    if (t0y > t1y) { let tmp = t0y; t0y = t1y; t1y = tmp; }
+    var t0z = (-halfW - oz) * iz;
+    var t1z = (halfW - oz) * iz;
+    if (t0z > t1z) { let tmp = t0z; t0z = t1z; t1z = tmp; }
+    let tEnter = max(max(t0x, t0y), t0z);
+    let tExit = min(min(t1x, t1y), t1z);
+    if (tEnter > tExit || tEnter < 0.0 || tEnter >= bestT) { continue; }
+
+    bestT = tEnter;
+    out.hit = true;
+    out.t = tEnter;  // cell units == world-voxel units: no conversion
+    if (t0y >= t0x && t0y >= t0z) {
+      out.axis = 1;
+      out.sgn = sign(rd.y);
+    } else if (t0x >= t0z) {
+      out.axis = 0;
+      out.sgn = sign(dpx);
+    } else {
+      out.axis = 2;
+      out.sgn = sign(dpz);
+    }
+    // Dried tips per BLADE: past this strand's own tip fraction — or the whole
+    // blade for the occasional dead one — the hit shades as the tip material.
+    let hitRise = rise0 + entry.y + rd.y * tEnter;
+    let dead = (hash3(colH, s, 0xD1EDu) & 7u) == 0u;
+    out.mat = bodyMat;
+    if (dead || hitRise > sH * (1.0 - tipFrac)) { out.mat = tipMat; }
   }
   return out;
 }
@@ -1004,8 +1274,14 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         // (the DDA sets it at the step that arrived here), so ro + rd*tCur
         // minus the cell corner is a 0..1 coordinate on each axis.
         let entry = (ro + rd * tCur) - vec3f(cell);
-        let mh = traceMicro(microBricks[mat], cell, clamp(entry, vec3f(0.0), vec3f(1.0)),
-                            rd, R.tick);
+        let mb = microBricks[mat];
+        var mh : MicroHit;
+        if ((mb.flags & MICROF_STRANDS) != 0u) {
+          mh = traceStrands(mb, cell, clamp(entry, vec3f(0.0), vec3f(1.0)), rd);
+        } else {
+          mh = traceMicro(mb, cell, clamp(entry, vec3f(0.0), vec3f(1.0)),
+                          rd, R.tick);
+        }
         microBudget -= 1;
         if (mh.hit) {
           out.hit = true;
@@ -3865,7 +4141,8 @@ fn fs(in : VSOut) -> FSOut {
       // swizzle, so its face normal has to be rotated back or a yaw-varied
       // tuft would light as though the sun had turned with it.
       n = microNormalToWorld(n, microBricks[voxMat(h.word)].flags,
-                             hash3(R.seed, 0u, cellIndexW(h.cell)));
+                             microCellHash(microBricks[voxMat(h.word)].flags,
+                                           h.cell));
     }
 
     // Voxel-scale grain: breaks up the white-noise palette confetti into

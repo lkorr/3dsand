@@ -1,5 +1,7 @@
 #include "sim/microvox.h"
 
+#include <algorithm>
+#include <bit>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -73,11 +75,101 @@ bool LoadMicroVox(const std::string& materialsPath, const std::string& assetDir,
       continue;
     }
 
+    // ---- analytic strand plants: a `strands` block instead of a model ------
+    // The cells of this material render N parametric blades, each a separate
+    // entity the shader bends smoothly (traceStrands in raymarch.wgsl) — the
+    // reusable path for per-strand motion. No .vox is involved; the pool holds
+    // the parameters:
+    //   w0            count (0..7) | bodyMat (8..15) | tipMat (16..23)
+    //   w1..w4        f32 bits: halfWidth (cell units), tipFrac (fraction of a
+    //                 strand's own height painted tipMat), swayScale, heightVary
+    //   w5..w5+2N-1   f32 bits: N (x, z) root positions in cell units
+    //
+    // AUTHORING RULES, both load-bearing:
+    //   * A stacked pair (tall_grass / tall_grass_head) must declare IDENTICAL
+    //     strands blocks apart from body/tip — every cell of a column derives
+    //     the same strand set independently, so differing params would tear
+    //     the plant at the material boundary.
+    //   * Roots + max bend + halfWidth must stay inside the cell: the shader
+    //     clamps the bend rather than let a blade cross into a neighbour cell
+    //     the world DDA never traces.
+    if (mi.contains("strands")) {
+      const json& st = mi["strands"];
+      if (!st.is_object() || !st.contains("roots") || !st["roots"].is_array()) {
+        log += materialsPath + ": material \"" + id +
+               "\": micro.strands needs a `roots` array of [x, z] pairs\n";
+        continue;
+      }
+      std::vector<std::pair<float, float>> roots;
+      bool badS = false;
+      for (const auto& r : st["roots"]) {
+        if (!r.is_array() || r.size() != 2) { badS = true; break; }
+        float x = r[0].get<float>(), z = r[1].get<float>();
+        if (x < 0.03f || x > 0.97f || z < 0.03f || z > 0.97f) {
+          log += materialsPath + ": material \"" + id +
+                 "\": strand root outside 0.03..0.97 (would clip the cell)\n";
+          badS = true;
+          break;
+        }
+        roots.push_back({x, z});
+      }
+      if (badS || roots.empty() || roots.size() > 16) {
+        log += materialsPath + ": material \"" + id +
+               "\": micro.strands.roots must be 1..16 [x, z] pairs\n";
+        continue;
+      }
+      const float halfW = std::clamp(st.value("halfWidth", 0.06f), 0.01f, 0.2f);
+      const float tipFrac = std::clamp(st.value("tipFrac", 0.0f), 0.0f, 1.0f);
+      const float heightVary = std::clamp(st.value("heightVary", 0.0f), 0.0f, 0.9f);
+      const float swayScale = std::clamp(st.value("swayScale", 1.0f), 0.0f, 4.0f);
+      // Palette materials by NAME (the glyphs.json precedent): body defaults
+      // to the material itself, tip to the body.
+      auto resolve = [&](const std::string& name, int fallback) -> int {
+        if (name.empty()) return fallback;
+        for (size_t i = 0; i < mats.size(); i++)
+          if (mats[i].name == name) return (int)i;
+        log += materialsPath + ": material \"" + id + "\": strands names unknown material \"" +
+               name + "\"\n";
+        return fallback;
+      };
+      const int body = resolve(st.value("body", ""), matId);
+      const int tip = resolve(st.value("tip", ""), body);
+      if (body > 255 || tip > 255) {
+        log += materialsPath + ": material \"" + id +
+               "\": strand materials must have ids 1..255 (8-bit pack)\n";
+        continue;
+      }
+      const uint32_t need = 5 + 2 * (uint32_t)roots.size();
+      if (out.pool.size() + need > kMicroPoolWords) {
+        log += materialsPath + ": micro brick pool full (" +
+               std::to_string(kMicroPoolWords) + " words)\n";
+        continue;
+      }
+      const uint32_t base = (uint32_t)out.pool.size();
+      out.pool.push_back((uint32_t)roots.size() | ((uint32_t)body << 8) |
+                         ((uint32_t)tip << 16));
+      out.pool.push_back(std::bit_cast<uint32_t>(halfW));
+      out.pool.push_back(std::bit_cast<uint32_t>(tipFrac));
+      out.pool.push_back(std::bit_cast<uint32_t>(swayScale));
+      out.pool.push_back(std::bit_cast<uint32_t>(heightVary));
+      for (const auto& r : roots) {
+        out.pool.push_back(std::bit_cast<uint32_t>(r.first));
+        out.pool.push_back(std::bit_cast<uint32_t>(r.second));
+      }
+      // frameCount 1 / period 0: the flipbook machinery is idle for strands.
+      out.table[matId] =
+          MicroBrickGpu{base, 0, 1u, kMicroSway | kMicroStrands};
+      mats[matId].gpu.flags |= kMatFlagMicro;
+      out.materialCount++;
+      continue;
+    }
+
     MicroSpec spec;
     spec.model = mi.value("model", "");
     spec.subdiv = mi.value("subdiv", 4u);
     if (mi.value("yawVariants", false)) spec.flags |= kMicroYawVariants;
     if (mi.value("jitter", false)) spec.flags |= kMicroJitter;
+    if (mi.value("sway", false)) spec.flags |= kMicroSway;
     if (spec.model.empty()) {
       log += materialsPath + ": material \"" + id + "\": micro.model is required\n";
       continue;

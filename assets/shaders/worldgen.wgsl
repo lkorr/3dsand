@@ -97,11 +97,22 @@ const M_FOXGLOVE  : u32 = 66u;
 const M_BUTTERCUP : u32 = 67u;
 const M_CLOVER    : u32 = 68u;
 const M_WILDROSE  : u32 = 69u;
+// ---- tall meadow grass (materials.json ids 95..96) ----
+// Dense stands of blade grass up to 8 cells (80 cm — about half the player).
+// Placed by flowerAt() like the flowers, because it IS the flower machinery:
+// a per-column species + height answer that the base cell and the stalk
+// branch re-derive identically. The head material caps the stack so a stand
+// has dried tan tips at ragged heights instead of a mown flat top. Same
+// array-position caveat as every block above: these are POSITIONS in
+// materials.json, recompute after any append lands ahead of this one.
+const M_TALLGRASS      : u32 = 95u;
+const M_TALLGRASS_HEAD : u32 = 96u;
 // Tallest a meadow flower can be, in CELLS — must be >= the largest value
-// flowerHeight() can return (foxglove, 3 + 2 = 5). It bounds the Y range the
-// stalk branch scans, so an under-count silently beheads the tall species and
-// an over-count just costs a few wasted evaluations per column.
-const FLOWER_MAX_H : i32 = 5;
+// flowerHeight() can return (now tall grass, 4 + 4 = 8; foxglove reaches 5).
+// It bounds the Y range the stalk branch scans, so an under-count silently
+// beheads the tall species and an over-count just costs a few wasted
+// evaluations per column.
+const FLOWER_MAX_H : i32 = 8;
 // ---- shoreline: the wet fringe outside a pond (materials.json ids 81..87) ----
 // Placed by the shore-cover block in genCell against shoreAt(). Like the vine
 // block above, these landed at ids other than the ones reserved for them
@@ -1497,6 +1508,34 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
   let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
   let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
   let biome = biomeAt(x, z, seed);
+
+  // ---- tall grass stands: the reed-bed of the open meadow ------------------
+  // Checked BEFORE the flower threshold because a stand is dense where flowers
+  // are sparse: up to ~90% of columns in a patch core grow a blade, which no
+  // per-mille flower rate reaches. The patch mask ramps both density and
+  // height from the fringe to the core, so a stand rises out of the lawn as a
+  // dome of blades rather than standing on a hard edge — the same reasoning
+  // as the crown-cover ramp in undergrowthSite. Columns inside a stand that
+  // roll NO blade fall through to the normal grass/flower chain, so a stand
+  // has an understory instead of bare dirt between the stems.
+  if (biome == B_MEADOW) {
+    let tg = vnoise(x + 501, z - 267, 15 * HSCALE, seed ^ 0x7A55u);
+    if (tg > 176) {
+      let hTall = hash3(seed ^ 0x7A56u, bitcast<u32>(x), bitcast<u32>(z));
+      let dens = min(u32(tg - 176) >> 3u, 8u);   // 0..8 in tenths of columns
+      if ((hTall % 10u) < dens + 1u) {
+        f.mat = M_TALLGRASS;
+        // 4..8 cells (40-80 cm): the cap ramps with patch depth so the core
+        // of a stand overtops its fringe, and the per-plant jitter under the
+        // cap is what keeps the top ragged — a bed cut to one height reads as
+        // a fence (the cattail block learned this first).
+        let hi = 4 + min((tg - 176) / 12, 4);
+        f.height = 4 + i32((hTall >> 8u) % u32(max(hi - 3, 1)));
+        return f;
+      }
+    }
+  }
+
   var thresh = 0u;
   if (biome == B_MEADOW) { thresh = select(6u, 60u, clump > 165); }
   else                   { thresh = select(2u, 16u, clump > 190); }
@@ -2114,6 +2153,13 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
     if (fl.mat != MAT_AIR && fl.mat != M_GRASS && fl.mat != M_PETAL &&
         (y - h) <= fl.height) {
       mat = fl.mat;
+      // Tall grass caps its stack with the head material — dried tips at the
+      // per-plant height, the way cattail_head caps the cattail stalk. Only
+      // the terminal cell: heights start at 4, so the base block below never
+      // needs the same test.
+      if (fl.mat == M_TALLGRASS && (y - h) == fl.height) {
+        mat = M_TALLGRASS_HEAD;
+      }
     }
   }
 

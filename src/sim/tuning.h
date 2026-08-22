@@ -1060,6 +1060,14 @@ struct Tuning {
     // cap a micro cell is treated as SOLID (not as air), because terminating
     // the ray is bounded and correct-ish while letting it fly is neither.
     int microMaxPerRay = 8;
+    // Wind bend at a swaying plant's TIP, in sub-voxels (subdiv 8 => 1.25 cm
+    // each). Clamped to 2.0: the models keep a 2-sub-voxel margin from their
+    // cell walls, and anything past that shears blade tips through the wall
+    // where the nested DDA never marches them — they vanish, not clip.
+    float microSwayAmp = 1.5f;
+    // Base wind frequency in rad/s. The shader derives its second flutter
+    // band from this (x1.73), so one knob moves the whole gait of the field.
+    float microSwaySpeed = 1.1f;
 
     // budgets
     int primarySteps = 4096;

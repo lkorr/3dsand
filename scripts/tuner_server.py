@@ -12,7 +12,8 @@ happens in this process rather than in the page:
                               + items/items.json
                               (+ spells/glyphs.json, READ-ONLY, for the Wiki)
   POST /api/save              write those files back
-  GET  /api/models            list .vox/.json under assets/{models,mobs,microvox,items}
+  GET  /api/models            list .vox/.json under
+                              assets/{models,mobs,microvox,items,limbs}
   GET  /api/model?path=...    read one of those files (bytes for .vox)
   POST /api/model?path=...    write one of those files
   GET  /api/shaders           list assets/shaders/*.wgsl with their text
@@ -115,8 +116,17 @@ def readable():
 # /api/model routes rather than /api/save, because those already carry the
 # path-containment check a per-file asset needs — items.json itself, being one
 # fixed file, goes through /api/save with the other three.
-MODEL_DIRS = ("models", "mobs", "microvox", "items")
+#
+# `limbs` is the limb LIBRARY: one saved body part (a single limb, or a limb
+# with its descendants) as a .vox of the geometry plus a .json of the rig
+# metadata that makes it a limb rather than a lump — hp, joint, tag, anchor.
+# Exactly the same .vox+.json shape as a mob, one rung down the hierarchy, so
+# it rides these routes unchanged. See assets/editor/limblib.js for the format.
+MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs")
 MODEL_EXTS = (".vox", ".json")
+# The one MODEL_DIRS entry with a delete route (/api/limb/delete). Named here
+# so that route cannot be pointed at another directory by editing one string.
+LIMB_DIR_NAME = "limbs"
 
 
 def model_dirs():
@@ -660,6 +670,38 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(500, {"ok": False, "error": repr(e)})
             return self._json(200, {"ok": True, "path": rel,
                                     "bytes": len(data)})
+
+        if p == "/api/limb/delete":
+            # Deleting a LIBRARY part only — the route refuses anything outside
+            # assets/limbs/, so a mob or a prefab can never be removed through
+            # it however the request is spelled. A saved limb is authored art,
+            # so like a sound take it is MOVED to .trash/ rather than unlinked;
+            # /api/models skips that folder because it lists files, not dirs.
+            name = self._body().get("name")
+            if not isinstance(name, str) or not _seg_ok(name):
+                return self._json(400, {"ok": False, "error": "bad limb name"})
+            moved = []
+            try:
+                trash = os.path.abspath(
+                    os.path.join(ASSETS, LIMB_DIR_NAME, TRASH_DIR))
+                for ext in (".vox", ".json"):
+                    src = _model_path("%s/%s%s" % (LIMB_DIR_NAME, name, ext))
+                    if not src or not os.path.isfile(src):
+                        continue
+                    os.makedirs(trash, exist_ok=True)
+                    dst = os.path.join(trash, name + ext)
+                    stem, e2 = os.path.splitext(dst)
+                    n = 1
+                    while os.path.exists(dst):
+                        dst = "%s (%d)%s" % (stem, n, e2)
+                        n += 1
+                    os.replace(src, dst)
+                    moved.append(os.path.basename(src))
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            if not moved:
+                return self._json(404, {"ok": False, "error": "not found"})
+            return self._json(200, {"ok": True, "trashed": moved})
 
         if p == "/api/note":
             name = self._query().get("name", [""])[0]

@@ -484,6 +484,13 @@ def flower_wildrose(lean):
     return v
 
 
+# ---- tall meadow grass: NOT HERE --------------------------------------------
+# tall_grass / tall_grass_head briefly had .vox models in this file; they are
+# now ANALYTIC STRANDS (a `strands` block in their micro JSON, traceStrands in
+# raymarch.wgsl) so each blade can bend smoothly and independently — a brick
+# can only move on the sub-voxel lattice. Author blade layout in the JSON
+# `roots` list, not here.
+
 # ---- vines, climbers and hanging moss ---------------------------------------
 # THE RULE FOR THIS SET, and it is the opposite of every model above: a strand
 # must touch BOTH z=0 and z=S-1. Worldgen stacks these cells vertically into a

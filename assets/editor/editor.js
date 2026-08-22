@@ -42,7 +42,7 @@ import {
   readVox, writeVox, roundTripTest, prefabRoundTripTest, axisSelfTest,
   gridToModel, prefabToVoxModels, tightenPrefab, makeGrid, gridGet, gridSet,
   paletteFromMaterials, gridColorGet, gridColorSet, gridColorLayer,
-  ArtPalette, ART_SLOTS, isArtIndex,
+  ArtPalette, ART_SLOTS, isArtIndex, paletteColor,
 } from './vox.js';
 
 // Editable box cap, matching what the .vox format allows.
@@ -818,6 +818,94 @@ function removeModel(i) {
   reboundDoc();
   setActiveModel(Math.min(i, doc.models.length - 1));
   markDirty();
+}
+
+/**
+ * Graft foreign models into this document — the load half of the limb library
+ * (assets/editor/limblib.js).
+ *
+ * `parts` are `{name, offset, dim, grid}` in the INCOMING part's own frame;
+ * `at` is where that frame's origin goes in this document. `names` that are
+ * already taken are the caller's problem (limblib.uniqueNames), because the
+ * part's internal parent references have to be renamed in step.
+ *
+ * ART COLOUR IS THE WHOLE REASON THIS IS NOT A `push`. `grid.color` holds art
+ * PALETTE INDICES, and an index is only meaningful next to the palette it was
+ * allocated from — index 250 is a scythe's rust in one file and a hood's blue
+ * in another. Pushing a foreign grid unchanged silently recolours the limb to
+ * whatever this document happens to have in those slots. So every incoming
+ * index is resolved to a hex through the SOURCE palette and re-allocated
+ * against ours, which is also where an over-full palette degrades gracefully:
+ * the voxel keeps its material and loses only its paint.
+ *
+ * `replace` is a list of model names to drop as the graft lands, so a swap is
+ * ONE operation. Doing it as remove-then-add would trip removeModel's "a file
+ * needs at least one model" guard when the part being swapped is the only one,
+ * and would leave the document briefly limbless if the graft then failed.
+ *
+ * Returns `{added, shift}`. `shift` is what the rebase moved every model by —
+ * the CALLER must add it to any anchor it places in the same frame as `at`,
+ * because anchors live in the sidecar and nothing here can see them.
+ */
+function graftModels(parts, at, srcPalette, replace) {
+  if (!doc || !parts.length) return [];
+  // Source art index -> our index. Cached per graft: a limb is thousands of
+  // voxels over a handful of distinct colours.
+  const remap = new Map();
+  const mapArt = idx => {
+    if (!idx) return 0;
+    if (remap.has(idx)) return remap.get(idx);
+    // paletteColor reads the source file's RGBA chunk at the index directly —
+    // no need to rebuild an ArtPalette, whose dense-from-the-top packing would
+    // have to be reconstructed for the whole used set to be meaningful.
+    const hex = srcPalette ? paletteColor(srcPalette, idx) : null;
+    const out = hex ? (artPalette.alloc(hex) || 0) : 0;
+    remap.set(idx, out);
+    return out;
+  };
+
+  for (const name of replace || []) {
+    const k = doc.models.findIndex(m => m.name === name);
+    if (k < 0) continue;
+    renameVisibility(name, null);
+    doc.models.splice(k, 1);
+  }
+
+  const added = [];
+  for (const p of parts) {
+    const g = makeGrid(p.dim);
+    g.data.set(p.grid.data);
+    if (p.grid.color) {
+      const dst = gridColorLayer(g);
+      for (let i = 0; i < p.grid.color.length; i++)
+        if (p.grid.color[i]) dst[i] = mapArt(p.grid.color[i]);
+    }
+    doc.models.push({
+      name: p.name,
+      offset: { x: p.offset.x + at.x, y: p.offset.y + at.y, z: p.offset.z + at.z },
+      dim: { ...p.dim }, grid: g,
+    });
+    added.push(p.name);
+  }
+  clearUndo();                 // model indices moved; the flat op log encodes them
+
+  // reboundDoc() keeps the prefab's min corner at 0, so a part grafted at a
+  // negative offset slides EVERY model — and anchors are not models, so they
+  // do not slide with them. Same trap moveModel documents; here the caller
+  // owns the sidecar, so the shift is returned rather than applied. Measured
+  // against a model that existed before the rebase, since `at` is in the
+  // pre-rebase frame the caller computed its anchors in.
+  const probe = doc.models[doc.models.length - 1];
+  const was = { ...probe.offset };
+  reboundDoc();
+  const shift = { x: probe.offset.x - was.x, y: probe.offset.y - was.y,
+                  z: probe.offset.z - was.z };
+
+  setActiveModel(doc.models.length - 1);
+  renderArtPalette();          // the graft may have allocated new art slots
+  markDirty();
+  hooks.onModelsChanged?.();
+  return { added, shift };
 }
 
 function renameModel(i, name) {
@@ -3822,6 +3910,9 @@ export function activate() {
   // point at which the section is visible and the flex row has a real width.
   restoreSideW();
   resize();
+  // Directories on disk may have changed while another tab was up — or in
+  // another session entirely, which is the normal case for the limb library.
+  hooks.onActivate?.();
   updateMirrorPlane();
   updateMicroGhost();
   updateGizmo();
@@ -3848,6 +3939,8 @@ export function saveFromHost() { return save(false); }
 export const getDoc = () => doc;
 export const getActiveModel = () => activeModel;
 export const getModels = () => (doc ? doc.models : []);
+/** File stem of the open document — a saved limb records where it came from. */
+export const getDocName = () => docName;
 export const getSelection = () => selection;
 export const getSidecar = () => sidecar;
 export const getMaterials = () => materials;
@@ -3860,7 +3953,11 @@ export function touchSidecar() { markDirty(); }
 
 export { setActiveModel, addModel, duplicateModel, removeModel, renameModel,
          splitSelectionToModel, upscaleDoc, downscaleDoc, markDirty, moveModel,
-         growModel, setSelection };
+         growModel, setSelection, graftModels };
+
+/** The document's art palette, so a limb saved out of it can carry its
+ *  colours (grid.color holds INDICES into this and nothing else). */
+export const getArtPalette = () => artPalette;
 
 /** Force a full instance rebuild (gait preview / onion skin drive this). */
 export function invalidate() { needsRebuild = true; }

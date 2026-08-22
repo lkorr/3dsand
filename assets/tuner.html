@@ -732,6 +732,29 @@
   input.cell.bad{border-color:var(--red);background:#2a1414}
   .edside button.on{background:#1d3a6e;border-color:#2c5cb0;color:#dce8ff}
 
+  /* Limb library shelf (assets/editor/limblib.js).
+
+     A shelf row is a MODEL row that is not part of this document, so it reuses
+     .rigrow for its metrics and then deliberately breaks the resemblance: no
+     pointer cursor and no .on state, because clicking the row selects nothing
+     — only its swap/add buttons do anything. Making it look clickable is the
+     one thing that would make the two lists confusable. */
+  /* Two rows, not one: name over metadata, with the buttons alongside. The
+     single-line version clipped "3 limbs  arm hand  8×34×8" to about 85px of
+     the 142px it needs, and the box size — the one field that tells two
+     similar arms apart — is the part that fell off the end. */
+  .riglib{cursor:default;align-items:center;padding:5px 6px;gap:8px}
+  .riglib:hover{background:#1a212c}
+  .riglibtext{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+  .riglibname{color:var(--fg);font-weight:600;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  /* Limb count, tags and box size: enough to tell two saved arms apart
+     without opening either. */
+  .riglibmeta{color:var(--faint);font-size:10px;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .riglib button.small{padding:1px 6px;font-size:11px;flex:none}
+  input.cell.riglibsearch{flex:1;width:auto;min-width:0;font-size:11.5px;padding:3px 6px}
+
   .edtimeline{
     margin-top:8px;background:var(--card);border:1px solid var(--line);
     border-radius:8px;padding:7px 9px;

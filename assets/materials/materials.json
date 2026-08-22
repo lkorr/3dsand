@@ -697,6 +697,7 @@
       "micro": {
         "model": "microvox/grass_tuft.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -757,6 +758,7 @@
       "micro": {
         "model": "microvox/flower_poppy.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1234,6 +1236,7 @@
       "micro": {
         "model": "microvox/flower_bluebell.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1273,6 +1276,7 @@
       "micro": {
         "model": "microvox/flower_foxglove.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1312,6 +1316,7 @@
       "micro": {
         "model": "microvox/flower_buttercup.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1380,6 +1385,7 @@
       "micro": {
         "model": "microvox/flower_wildrose.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1516,6 +1522,7 @@
       "micro": {
         "model": "microvox/dry_tussock.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1775,6 +1782,7 @@
       "micro": {
         "model": "microvox/marsh_grass.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1880,6 +1888,7 @@
       "micro": {
         "model": "microvox/water_iris.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -1944,6 +1953,7 @@
       "micro": {
         "model": "microvox/fern.vox",
         "subdiv": 8,
+        "sway": true,
         "frames": [
           {
             "model": 0,
@@ -2136,6 +2146,73 @@
         "model": "microvox/leaf_litter.vox",
         "subdiv": 8,
         "yawVariants": true
+      }
+    },
+    {
+      "//": "Tall meadow grass SEGMENT: worldgen stacks these 4-8 cells (40-80 cm, up to about half the player's height) in dense stands, capped by tall_grass_head. ANALYTIC STRANDS, not a .vox: each cell renders five parametric blades (micro.strands, traceStrands in raymarch.wgsl) that bend smoothly and independently in the wind -- each blade has its own root, its own height fraction and its own blend of the two wind bands. The strands block must stay IDENTICAL to tall_grass_head's apart from body/tip: every cell of a column re-derives the same strand set, and differing params would tear the plant at the material boundary.",
+      "id": "tall_grass",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 220,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MICRO LOD COLOURS -- the model's average (see flower_poppy). A segment cell is all green blade; slightly warmer than marsh_grass so a stand reads as dry meadow, not shore sedge.",
+      "colors": [
+        "#5f9440",
+        "#4f8034",
+        "#71a64d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "strands": {
+          "roots": [[0.26, 0.30], [0.62, 0.22], [0.78, 0.56], [0.32, 0.68], [0.57, 0.82]],
+          "halfWidth": 0.06,
+          "tip": "tall_grass_head",
+          "tipFrac": 0.22,
+          "heightVary": 0.45,
+          "swayScale": 1.0
+        }
+      }
+    },
+    {
+      "//": "Tall meadow grass HEAD: the terminal cell of a tall_grass stack, and the tan palette the strands' dried tips paint with. Its strands block is IDENTICAL to tall_grass's apart from body/tip (see the segment's note for why); blade tips landing at ragged per-strand heights is what breaks the flat-top silhouette, and it falls out of heightVary rather than out of authored geometry.",
+      "id": "tall_grass_head",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 210,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "MICRO LOD COLOURS -- the model's average: green blade bodies under tan tips, so the blend leans dry. This is what a distant stand's top surface shades as, and it is why it must NOT be pure tan -- a stand would read as a brown field with a hard green underline.",
+      "colors": [
+        "#8a9448",
+        "#75813c",
+        "#a3a355"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "strands": {
+          "roots": [[0.26, 0.30], [0.62, 0.22], [0.78, 0.56], [0.32, 0.68], [0.57, 0.82]],
+          "halfWidth": 0.06,
+          "body": "tall_grass",
+          "tip": "tall_grass_head",
+          "tipFrac": 0.22,
+          "heightVary": 0.45,
+          "swayScale": 1.0
+        }
       }
     }
   ]

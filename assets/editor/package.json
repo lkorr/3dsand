@@ -1,0 +1,5 @@
+{
+  "//": "Not a package — this exists ONLY so Node treats the .js files in this directory as ES modules, which the browser already does (they are loaded with <script type=module> from tuner.html). Without it `node scripts/test_limblib.mjs` reads vox.js as CommonJS and dies on the first `export`. Nothing installs from here and there are no dependencies.",
+  "type": "module",
+  "private": true
+}

@@ -71,6 +71,25 @@ constexpr uint32_t kMicroNoBrick = 0xFFFFFFFFu;
 // MicroBrickGpu.flags — must match MICROF_* in common.wgsl.
 constexpr uint32_t kMicroYawVariants = 1;  // hash-keyed quarter-turn yaw
 constexpr uint32_t kMicroJitter = 2;       // hash-keyed sub-cell XZ offset
+// Render-time wind: the raymarcher shears the RAY into the model's rest space
+// by a smooth per-column wind field (the shear is linear in height, so the
+// sheared ray is still a straight line and the ordinary brick DDA marches it
+// unchanged) — the content renders continuously displaced, with no spatial
+// quantisation. Also switches the yaw/jitter hash from per-CELL to per-COLUMN,
+// because a swaying material is one worldgen stacks into multi-cell plants — a
+// per-cell yaw would give each cell of one blade a different quarter-turn and
+// shred the plant at every cell boundary.
+constexpr uint32_t kMicroSway = 4;         // per-column wind bend (render-only)
+// ANALYTIC STRAND PLANTS: the material has no .vox at all. Its cells render a
+// small set of parametric blades — each an independent entity with its own
+// root, height and wind phase, bent by a quadratic cantilever curve and
+// ray-tested in closed form (sheared-slab, traceStrands in raymarch.wgsl).
+// This is the path for anything that must move SMOOTHLY and per-strand
+// (tall grass, and any future reeds/kelp/wheat): brick sway moves a whole
+// cell's content as one rigid piece, strands wiggle individually. Authored as
+// a `strands` block in the micro JSON (see LoadMicroVox); pool layout there.
+// Implies kMicroSway (the stack probes key on it).
+constexpr uint32_t kMicroStrands = 8;      // parametric blades, no brick
 
 // Hard ceiling on the pool, in u32 words. Defined in world.h (as
 // kMicroPoolWordsWorld) because the WGSL prelude is generated from that file

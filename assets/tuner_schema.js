@@ -487,6 +487,8 @@ const TUNING_SCHEMA = [
     params: [
       {k:'microLodDist', n:'micro LOD distance', d:'Past this distance a micro cell is drawn as a plain voxel instead of marching its fine model. The main perf lever for meadows.', min:0, max:200, step:1, u:'m'},
       {k:'microMaxPerRay', n:'micro bricks per ray', d:'Cap on nested micro marches for one camera ray. Beyond the cap a micro cell reads as solid, not air — grazing rays across grass stay bounded.', min:0, max:32, step:1, int:true},
+      {k:'microSwayAmp', n:'wind sway amplitude', d:'Lateral bend at a swaying plant\'s tip, in sub-voxels (1.25 cm each at subdiv 8). Hard-capped at 2: the models keep a 2-sub-voxel wall margin, and past it blade tips shear out of their cell and vanish. 0 turns the wind off.', min:0, max:2, step:0.05},
+      {k:'microSwaySpeed', n:'wind sway speed', d:'Base wind frequency in rad/s for the sway bend on grass, flowers and reeds. The flutter band scales with it, so this is the one knob for how agitated the whole field looks.', min:0, max:6, step:0.05, u:'rad/s'},
     ],
   },
 

@@ -337,6 +337,37 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     ctx.WaitIdle();
   }
 
+  // ---- A TALL-GRASS STAND: the stacked swaying meadow grass ----
+  // Tall grass is placed by patch noise in flowerAt() (worldgen.wgsl), and no
+  // other shot frames a stand: the meadow around spawn is flowers and single-
+  // cell tufts. The nearest dense stand to the origin sits at (336,96) —
+  // located by porting vnoise/biomeAt to Python against seed 1337 — which is
+  // outside the origin window, hence the same relocate-and-restore dance as
+  // the oil pool above. Two frames: the stand as a dome rising out of the
+  // lawn (the patch-ramped height doing its job), and an eye-level view into
+  // the blades where the head cells' tan tips and the per-column height
+  // jitter either read or don't. Both are stills; judging the SWAY needs the
+  // live app, but a frame mid-gust still shows the sheared blades leaning.
+  {
+    world.SetWindowOrigin({336 / (int)kChunk - 8, 0, 96 / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    int gh = World::TerrainHeight(336, 96, kDefaultSeed);
+    render({296, (float)(gh + 16), 56}, 0.785f, -0.18f, "screenshot_tallgrass.bmp");
+    render({322, (float)(gh + 6), 82}, 0.785f, 0.0f, "screenshot_tallgrass_eye.bmp");
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+  }
+
   // ---- AN OIL SLICK ON WATER: the case that SHOULD show the rainbow ----
   // The pool shot above is oil on stone and must show NO iridescence - a deep
   // pool has no second interface within reach of the light, so there is no film

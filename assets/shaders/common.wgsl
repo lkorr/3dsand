@@ -154,6 +154,14 @@ struct MicroBrick {
 const MICRO_NONE : u32 = 0xFFFFFFFFu;
 const MICROF_YAW    : u32 = 1u;  // hash-keyed quarter-turn yaw about Y
 const MICROF_JITTER : u32 = 2u;  // hash-keyed sub-cell XZ offset
+// Render-time wind bend (see traceMicro in raymarch.wgsl). Also keys the
+// yaw/jitter identity hash per-COLUMN instead of per-cell, because swaying
+// materials are the ones worldgen stacks into multi-cell plants.
+const MICROF_SWAY   : u32 = 4u;  // per-column wind bend (render-only)
+// Analytic strand plants: no brick, the pool holds parametric blade params and
+// traceStrands (raymarch.wgsl) intersects each blade in closed form. Always
+// set together with MICROF_SWAY (the plant-extent probes key on it).
+const MICROF_STRANDS : u32 = 8u; // parametric blades, no brick
 
 fn microFrameCount(b : MicroBrick) -> u32 { return b.frameInfo & 0xFFu; }
 fn microPeriod(b : MicroBrick) -> u32 { return b.frameInfo >> 8u; }

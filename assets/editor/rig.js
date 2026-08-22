@@ -30,6 +30,7 @@
 import * as ed from './editor.js';
 import * as AN from './anim.js';
 import * as VOX from './vox.js';
+import * as LIB from './limblib.js';
 
 /* ==========================================================================
    1. state + helpers
@@ -44,6 +45,19 @@ let selectedPart = null;      // limb name, or null
 // socket takes the gizmo over from the joint anchor — both are "a point on a
 // part", so they share one gizmo rather than fighting over the viewport.
 let selectedSocket = null;
+
+// --- limb library (assets/limbs/, see limblib.js) -------------------------
+//
+// The catalogue of saved parts, fetched once per tab activation and after
+// every save. Entries are {name, limbs, root, dim, from} — the .json's `meta`
+// plus enough of its limb list to describe the part without opening the .vox.
+// `libErr` carries the file:// degradation message, exactly as the item list
+// does: a file:// page cannot read assets/limbs/ and must say so rather than
+// showing an empty shelf that looks like "you have saved nothing".
+let libParts = null;          // null = not loaded yet, [] = loaded and empty
+let libErr = '';
+let libOpen = true;           // the section is expanded
+let libFilter = '';           // name/tag search box
 
 // --- held-item preview ----------------------------------------------------
 //
@@ -232,6 +246,186 @@ async function saveHeldItem() {
   } catch (e) {
     toast('item save failed: ' + (e.message || e), true);
   }
+  renderAllPanels();
+}
+
+/* --- limb library: catalogue, save, load ---------------------------------
+ *
+ * The three operations the library exists for, in the order you use them:
+ * `refreshLibrary` shows the shelf, `saveLimbToLibrary` puts a part on it,
+ * `loadLimbFromLibrary` wears one. The FORMAT lives in limblib.js; everything
+ * here is I/O and the UI's idea of what is selected.
+ */
+
+/** List assets/limbs/, pairing each .vox with its .json. */
+async function refreshLibrary() {
+  try {
+    const r = await fetch('/api/models');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const files = (j.files || []).filter(f => f.dir === LIB.LIMB_DIR);
+    const stems = [...new Set(files.filter(f => f.name.toLowerCase().endsWith('.vox'))
+                                   .map(f => f.name.slice(0, -4)))];
+    // The .json is fetched per part so the shelf can show limb count and tags
+    // without opening any .vox. A part with no .json still lists (it is a
+    // usable lump of voxels), it just shows no rig info.
+    libParts = await Promise.all(stems.sort().map(async name => {
+      const base = { name, limbs: [], root: '', dim: null, from: '' };
+      try {
+        const rj = await fetch('/api/model?path=' +
+                               encodeURIComponent(LIB.partJsonPath(name)));
+        if (!rj.ok) return base;
+        const meta = JSON.parse(await rj.text());
+        return {
+          name,
+          limbs: (meta.limbs || []).map(l => ({ name: l.name, tag: l.tag })),
+          root: meta.root || '',
+          dim: meta.meta?.dim || null,
+          from: meta.meta?.from || '',
+        };
+      } catch { return base; }
+    }));
+    libErr = '';
+  } catch (e) {
+    libParts = null;
+    libErr = 'needs the tuner server (python scripts/tuner_server.py) — ' +
+             'a file:// page cannot read assets/limbs/';
+  }
+}
+
+/**
+ * Save the selected limb (with its descendants, unless `single`) to the shelf.
+ *
+ * Writes the .vox first and the .json second: a part whose geometry landed but
+ * whose metadata did not is still loadable, whereas the reverse describes a
+ * limb that does not exist.
+ */
+async function saveLimbToLibrary(root, name, single) {
+  const doc = ed.getDoc();
+  if (!doc) return;
+  let part;
+  try {
+    part = LIB.partFromPrefab(doc, limbs(), root, {
+      group: !single, from: ed.getDocName?.() || '',
+    });
+  } catch (e) { return toast(String(e.message || e), true); }
+
+  try {
+    // The art palette is the DOCUMENT's, and the part's grids hold indices
+    // into it — writing the material palette alone would strip every painted
+    // colour off the saved limb.
+    const palette = VOX.paletteFromMaterials(ed.getMaterials() || []);
+    ed.getArtPalette().writeInto(palette);
+    const bytes = VOX.writeVox(VOX.prefabToVoxModels(part.prefab), palette,
+                               { scene: true });
+    const rv = await fetch('/api/model?path=' +
+                           encodeURIComponent(LIB.partVoxPath(name)),
+      { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' },
+        body: bytes });
+    if (!rv.ok) throw new Error('vox ' + rv.status);
+
+    const rj = await fetch('/api/model?path=' +
+                           encodeURIComponent(LIB.partJsonPath(name)),
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(part.json, null, 2) + '\n' });
+    if (!rj.ok) throw new Error('json ' + rj.status);
+
+    toast(`saved ${name} — ${part.names.length} limb` +
+          (part.names.length === 1 ? '' : 's'));
+    await refreshLibrary();
+  } catch (e) {
+    toast('limb save failed: ' + (e.message || e), true);
+  }
+  renderAllPanels();
+}
+
+/**
+ * Wear a saved part. `replace` is a limb name to swap out (its subtree goes
+ * with it); when null the part is ADDED under the selected limb.
+ *
+ * The joint is what makes this a swap rather than a paste: the incoming root's
+ * `anchorLocal` is aligned onto the anchor of whatever it replaces, so the
+ * skeleton keeps working and only the shape changes.
+ */
+async function loadLimbFromLibrary(name, replace) {
+  let part;
+  try {
+    const rv = await fetch('/api/model?path=' +
+                           encodeURIComponent(LIB.partVoxPath(name)));
+    if (!rv.ok) throw new Error(name + '.vox ' + rv.status);
+    const vox = await rv.arrayBuffer();
+    let meta = null;
+    try {
+      const rj = await fetch('/api/model?path=' +
+                             encodeURIComponent(LIB.partJsonPath(name)));
+      if (rj.ok) meta = JSON.parse(await rj.text());
+    } catch { /* a bare .vox is legal — it arrives unrigged */ }
+    part = LIB.readPart(vox, meta);
+  } catch (e) { return toast('limb load failed: ' + (e.message || e), true); }
+  if (!part.prefab.models.length) return toast(name + ' has no models', true);
+
+  const L = limbs();
+  const old = replace ? limbByName(replace) : null;
+  // WHERE IT LANDS. Replacing: the joint of the limb going away. Adding: the
+  // joint of the limb it is being parented to, which is the closest thing to
+  // "where a new part belongs" the rig knows. Neither exists on an unrigged
+  // file, and placementFor then drops it at the origin.
+  const host = replace ? old : limbByName(selectedPart);
+  const target = host && Array.isArray(host.anchor) ? host.anchor : null;
+  const parent = replace ? (old && old.parent) : (selectedPart || undefined);
+
+  // The subtree being replaced goes as one: swapping an upper arm cannot
+  // leave the old forearm and hand parented to a limb that is gone.
+  const doomed = replace ? LIB.subtreeNames(L, replace) : [];
+
+  const taken = new Set(ed.getModels().map(m => m.name)
+                          .filter(n => !doomed.includes(n)));
+  LIB.renameWithin(part, LIB.uniqueNames(part, taken));
+
+  const at = LIB.placementFor(part, target);
+  // Drop the doomed subtree from the SIDECAR here; its MODELS go inside the
+  // graft, which removes and adds in one step (see graftModels).
+  for (const n of doomed) {
+    const k = L.findIndex(l => l.name === n);
+    if (k >= 0) L.splice(k, 1);
+  }
+  // Anything that was parented to a limb now gone re-parents to the incoming
+  // root, which is standing in exactly that place. Left dangling it would be
+  // an orphan limb the engine refuses to load (mob.cpp:308).
+  for (const l of L)
+    if (doomed.includes(l.parent)) l.parent = part.root;
+
+  const { shift } = ed.graftModels(
+    part.prefab.models.filter(m => !VOX.isArtLayerName(m.name)),
+    at, part.palette, doomed);
+
+  // A part grafted below the origin rebases the whole document (graftModels
+  // returns by how much). Models moved; anchors did not, so both the incoming
+  // ones and every anchor already on the creature have to follow, or the
+  // skeleton detaches from the art by exactly this much.
+  const at2 = { x: at.x + shift.x, y: at.y + shift.y, z: at.z + shift.z };
+  if (shift.x || shift.y || shift.z) {
+    for (const l of L)
+      if (Array.isArray(l.anchor))
+        l.anchor = [l.anchor[0] + shift.x, l.anchor[1] + shift.y,
+                    l.anchor[2] + shift.z];
+    // A socket is the same kind of thing as an anchor — a point on a limb in
+    // prefab coords — so it rebases identically. Missing this puts the sword
+    // back where the hand used to be.
+    for (const s of sockets())
+      if (Array.isArray(s.offset))
+        s.offset = [s.offset[0] + shift.x, s.offset[1] + shift.y,
+                    s.offset[2] + shift.z];
+  }
+
+  for (const e of LIB.sidecarEntries(part, at2, parent)) L.push(e);
+
+  selectedPart = part.root;
+  selectedSocket = null;
+  touched();
+  bindGizmo();
+  ed.invalidate();
+  toast(`${replace ? 'swapped in' : 'added'} ${name}`);
   renderAllPanels();
 }
 
@@ -1160,7 +1354,167 @@ function limbBody(limb) {
 }
 
 /** Everything below the per-limb editors: chains, gait, clips. */
+/* ---- limb library shelf -------------------------------------------------
+ *
+ * Sits directly under the model list because that is where it is used: you
+ * pick a limb up there, then save it or swap it down here, and both buttons
+ * name the limb they will act on rather than "the selection". A part that
+ * cannot be applied says why on the button rather than being hidden — an
+ * absent control reads as a broken feature.
+ */
+function renderLibrary() {
+  const hdr = el('div', { class: 'righdr' }, 'Limb library',
+    el('span', { class: 'spacer' }),
+    el('button', {
+      class: 'icon', title: libOpen ? 'collapse' : 'expand',
+      onclick: () => { libOpen = !libOpen; renderAllPanels(); },
+    }, libOpen ? '▾' : '▸'),
+    el('button', {
+      class: 'icon', title: 'rescan assets/limbs/',
+      onclick: async () => { await refreshLibrary(); renderAllPanels(); },
+    }, '↻'));
+  sideEl.append(hdr);
+  if (!libOpen) return;
+
+  /* --- save the selected limb --- */
+  const sel = selectedPart ? limbByName(selectedPart) : null;
+  const kin = sel ? LIB.subtreeNames(limbs(), sel.name) : [];
+  const saveRow = el('div', { class: 'rigbtns' });
+  saveRow.append(el('button', {
+    class: 'small primary', disabled: !sel,
+    title: sel
+      ? `save "${sel.name}"${kin.length > 1 ? ` and its ${kin.length - 1} ` +
+          'descendant' + (kin.length > 2 ? 's' : '') : ''} to assets/limbs/`
+      : 'select a limb in the list above first',
+    onclick: () => promptSaveLimb(sel, false),
+  }, kin.length > 1 ? `save ${sel.name} + ${kin.length - 1}` :
+                      (sel ? `save ${sel.name}` : 'save limb')));
+  // Offered only when it differs from the group save, so the common case is
+  // one obvious button rather than two that look the same.
+  if (kin.length > 1)
+    saveRow.append(el('button', {
+      class: 'small', title: `save ONLY "${sel.name}", without its descendants`,
+      onclick: () => promptSaveLimb(sel, true),
+    }, 'this limb only'));
+  sideEl.append(saveRow);
+
+  /* --- the shelf --- */
+  if (libErr) return sideEl.append(el('div', { class: 'rignote' }, libErr));
+  if (libParts === null)
+    return sideEl.append(el('div', { class: 'rignote' }, 'scanning…'));
+  if (!libParts.length)
+    return sideEl.append(el('div', { class: 'rignote' },
+      'No saved limbs yet. Select a limb above and save it — then it can be ' +
+      'dropped onto any other creature, joint and all.'));
+
+  const listEl = el('div', { class: 'riglist' });
+  if (libParts.length > 6) {
+    const box = el('input', { class: 'cell riglibsearch', value: libFilter,
+                              placeholder: 'filter by name, tag or creature' });
+    box.addEventListener('input', () => {
+      libFilter = box.value;
+      // Re-render only the shelf; a full renderAllPanels() would rebuild the
+      // input and blur it on every keystroke.
+      renderLibraryList(listEl);
+    });
+    sideEl.append(el('div', { class: 'rigf' }, box));
+  }
+  sideEl.append(listEl);
+  renderLibraryList(listEl);
+}
+
+function renderLibraryList(host) {
+  host.innerHTML = '';
+  const q = libFilter.trim().toLowerCase();
+  const shown = (libParts || []).filter(p => !q ||
+    p.name.toLowerCase().includes(q) || p.from.toLowerCase().includes(q) ||
+    p.limbs.some(l => (l.tag || '').toLowerCase().includes(q)));
+  if (!shown.length)
+    return host.append(el('div', { class: 'rignote' }, 'nothing matches'));
+
+  const sel = selectedPart ? limbByName(selectedPart) : null;
+  for (const p of shown) {
+    const tags = [...new Set(p.limbs.map(l => l.tag).filter(Boolean))];
+    // Shown: what distinguishes two saved arms at a glance — how many limbs,
+    // what they are, how big. The source creature goes in the tooltip only:
+    // it is the field you want when you have forgotten where a part came
+    // from, not when you are picking between two, and including it pushed the
+    // BOX SIZE off the end of the line.
+    const meta = (p.limbs.length > 1 ? `${p.limbs.length} limbs` : '1 limb') +
+      (tags.length ? ' · ' + tags.join(' ') : '') +
+      (p.dim ? ` · ${p.dim[0]}×${p.dim[1]}×${p.dim[2]}` : '');
+    const row = el('div', { class: 'rigrow riglib' },
+      el('div', { class: 'riglibtext' },
+        el('span', { class: 'riglibname' }, p.name),
+        el('span', { class: 'riglibmeta',
+                     title: meta + (p.from ? '\nfrom ' + p.from : '') },
+           meta)),
+      // SWAP replaces the selected limb (and its subtree); ADD hangs the part
+      // off it as a new child. Two verbs because they are genuinely different
+      // edits, and guessing between them by context would be worse.
+      el('button', {
+        class: 'small', disabled: !sel,
+        title: sel ? `replace "${sel.name}" (and its descendants) with ${p.name}` +
+                     ' — the new part\'s joint lands on the old one\'s'
+                   : 'select the limb to replace, above',
+        onclick: () => loadLimbFromLibrary(p.name, sel.name),
+      }, 'swap'),
+      el('button', {
+        class: 'small', disabled: !sel,
+        title: sel ? `attach ${p.name} as a new child of "${sel.name}"`
+                   : 'select the parent limb, above',
+        onclick: () => loadLimbFromLibrary(p.name, null),
+      }, 'add'),
+      el('button', {
+        class: 'icon danger', title: 'delete this saved part',
+        onclick: async () => {
+          if (!confirm(`Delete the saved part "${p.name}"?\n\n` +
+                       'This removes it from the library only; creatures ' +
+                       'already wearing it keep their copy.')) return;
+          await deleteLibraryPart(p.name);
+        },
+      }, '✕'));
+    host.append(row);
+  }
+}
+
+/** Ask for a name, defaulting to the limb's own, and save. */
+function promptSaveLimb(limb, single) {
+  const suggest = limb.name.replace(/[^A-Za-z0-9._-]/g, '_');
+  const name = prompt(
+    single ? `Save "${limb.name}" alone to the limb library as:`
+           : `Save "${limb.name}" and its descendants to the limb library as:`,
+    suggest);
+  if (name === null) return;
+  const n = name.trim();
+  if (!LIB.nameOk(n))
+    return toast('name must be letters, digits, . _ - (max 64)', true);
+  const clash = (libParts || []).some(p => p.name === n);
+  if (clash && !confirm(`"${n}" already exists in the library. Overwrite it?`))
+    return;
+  saveLimbToLibrary(limb.name, n, single);
+}
+
+/** Remove a saved part. The server moves it to assets/limbs/.trash/ rather
+ *  than unlinking, so a mis-click costs a file-manager trip, not the art. */
+async function deleteLibraryPart(name) {
+  try {
+    const r = await fetch('/api/limb/delete',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || 'HTTP ' + r.status);
+    toast(`${name} moved to limbs/.trash/`);
+    await refreshLibrary();
+  } catch (e) {
+    toast('delete failed: ' + (e.message || e), true);
+  }
+  renderAllPanels();
+}
+
 function renderRigTail() {
+  renderLibrary();
+
   /* ---- sockets: where a held ITEM attaches ---- */
   //
   // Visible and draggable because the alternative is authoring a grip by
@@ -2887,6 +3241,9 @@ export function attach(opts) {
   timelineEl = p.timeline;
   rebuildSkeleton();
   renderAllPanels();
+  // The shelf itself is scanned by the onActivate hook, which fires on every
+  // tab entry including the first — doing it here as well would double every
+  // page load's listing for nothing.
 }
 
 /** The hooks editor.js consumes. */
@@ -2911,4 +3268,8 @@ export const hooks = {
   },
   onSelectionChanged: () => { renderRigPanel(); },
   onSave: () => { if (itemDirty) return saveHeldItem(); },
+  // Another session (or another tab) may have saved a limb since this page
+  // loaded; rescanning on tab entry is what keeps the shelf from going stale
+  // without making the user find the ↻ button.
+  onActivate: () => { refreshLibrary().then(renderAllPanels); },
 };

@@ -298,6 +298,8 @@ TP_F(render, gamma, TUNE_GAMMA, 2.2f)
 // ---- static micro-detail ----
 TP_F(render, microLodDist, TUNE_MICRO_LOD_DIST, 40.0f)
 TP_I(render, microMaxPerRay, TUNE_MICRO_MAX_PER_RAY, 8)
+TP_F(render, microSwayAmp, TUNE_MICRO_SWAY_AMP, 1.5f)
+TP_F(render, microSwaySpeed, TUNE_MICRO_SWAY_SPEED, 1.1f)
 TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096)
 TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
 

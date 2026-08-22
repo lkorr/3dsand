@@ -429,6 +429,8 @@
     "gamma": 2.2,
     "microLodDist": 40,
     "microMaxPerRay": 8,
+    "microSwayAmp": 1.5,
+    "microSwaySpeed": 1.1,
     "primarySteps": 4096,
     "farSteps": 384,
     "skyRayleigh": 12,
