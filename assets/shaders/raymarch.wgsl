@@ -2441,6 +2441,35 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
     color += ambientWater * motes * 2.0 + vec3f(motes * 0.05);
   }
 
+  // ---- the surface overhead, in a medium too dense to see through ----
+  // In a dense liquid the sky is gone (the Snell window above is gated off),
+  // and what that left was a completely featureless field of colour - correct
+  // in the sense that you genuinely cannot see anything, but it reads as a
+  // broken shader rather than as being submerged in oil. There is no cue for
+  // which way is up and nothing moves, so the frame looks static even as the
+  // camera turns.
+  //
+  // The physical answer is that even a near-opaque medium transmits a LITTLE
+  // light from above, and it arrives smeared into a soft directional gradient
+  // rather than an image. That is what this adds: a faint glow toward the
+  // surface, modulated by a slow churn field so it drifts and gives the volume
+  // orientation and motion without ever resolving into anything you could
+  // mistake for a view.
+  //
+  // Gated to the murky case - a clear liquid already has the Snell window and
+  // does not need a stand-in for it.
+  let murk = 1.0 - prof.clarity;
+  if (murk > 0.25) {
+    let up = clamp(rd.y, 0.0, 1.0);
+    let pm = (ro + rd * min(pathVox, 24.0)) * VOXEL_METERS;
+    let churn = valueNoise(vec3f(pm.x * 0.7, pm.z * 0.7, R.time * 0.08), 1.0);
+    let glow = pow(up, 2.5) * mix(0.55, 1.0, churn);
+    // Daylight that has struggled through the medium, so it carries both the
+    // key light's colour and the liquid's own tint.
+    color += scatterCol * keyLightColor() * sunUp * glow *
+             TUNE_SUB_MURK_GLOW * murk;
+  }
+
   // ---- vignette ----
   // Cheap, and a strong "you are inside a medium" cue: light reaching the edge
   // of your view underwater has travelled further through it. Keyed on the
@@ -2813,6 +2842,73 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
 //
 // All render-only float math on render-only data — the sim never sees it.
 
+// ---- how OILY is this viscous liquid? ----
+// 0 = a blood-like biological fluid, 1 = a petroleum-like one. Both take the
+// viscous surface path (isViscousLiquid), but they look nothing alike, and the
+// blood constants applied to oil are what made the oil pool render as a sheet
+// of flat beige mud: matte, desaturated, no highlight and no reflection.
+//
+// Three things separate them physically, and all three follow from this one
+// number: oil is GLOSSY (a smooth mirror-dark film, where blood is a diffuse
+// suspension), oil is DARK and near-neutral, and oil carries a thin-film
+// IRIDESCENCE that nothing biological does.
+//
+// Derived from the AUTHORED PALETTE, not from a material id and not from a new
+// JSON key - the same principle isViscousLiquid itself follows, and for the
+// same reason: any modder's petroleum-like liquid gets the treatment for free,
+// and nothing here has to be kept in step with materials.json.
+//
+// SATURATION is the discriminator. Blood's authored colour0 is 0.85 saturated;
+// oil's is 0.46. Biological fluids are strongly chromatic (haemoglobin,
+// chlorophyll, bile) because they are pigment suspensions; petroleum is a dark
+// near-neutral brown-black. The measure is scale-free, so authoring oil
+// lighter or darker changes how it reads, not what it IS.
+fn oiliness(m : Material) -> f32 {
+  let c = unpackColor(m.color0);
+  let mx = max(c.r, max(c.g, c.b));
+  let mn = min(c.r, min(c.g, c.b));
+  // HSV saturation. Pure black reads as fully oily, which is right: a black
+  // liquid is far closer to oil than to blood.
+  let sat = select((mx - mn) / max(mx, 1e-4), 0.0, mx < 1e-4);
+  // Wide band on purpose: blood (0.85) firmly at 0, oil (0.46) firmly at 1,
+  // with a real gradient between so a liquid authored in the middle blends
+  // rather than falling off a cliff.
+  return 1.0 - smoothstep(TUNE_OIL_SAT_LOW, TUNE_OIL_SAT_HIGH, sat);
+}
+
+// ---- thin-film interference (the rainbow sheen on oil) ----
+// The one thing everybody recognises oil by. A film microns thick makes light
+// reflected off its TOP surface interfere with light reflected off its BOTTOM,
+// and which wavelengths cancel depends on the optical path difference - so the
+// colour swims with viewing angle and with film thickness.
+//
+// Modelled the standard cheap way: drive a phase from (thickness / cos of the
+// refracted angle), then convert to RGB with three cosines 120 degrees apart.
+// That is not a spectral integral, but it produces the right BEHAVIOUR - bands
+// that slide across the surface as the eye moves and as the film varies -
+// which is the whole visual signature. A static rainbow texture is not.
+//
+// Thickness varies via the same value-noise field the rest of the renderer
+// uses, animated slowly: a real slick's film is dragged around by the fluid
+// under it, and a uniform film would show one flat colour rather than bands.
+fn filmIridescence(p : vec3f, cosI : f32) -> vec3f {
+  let pm = p * VOXEL_METERS;
+  // Two octaves at different rates so the bands drift and stretch rather than
+  // sliding rigidly, which is what reads as liquid rather than as a scrolling
+  // texture.
+  let t1 = valueNoise(vec3f(pm.x * 1.7, pm.y * 1.7 + R.time * 0.05, pm.z * 1.7), 1.0);
+  let t2 = valueNoise(vec3f(pm.z * 3.1 - R.time * 0.03, pm.x * 3.1, pm.y * 3.1), 1.0);
+  let thick = mix(t1, t2, 0.4) * TUNE_OIL_FILM_SCALE;
+  // Optical path difference grows as the ray slants through the film, which is
+  // why the bands crowd toward a grazing view. That angular term is most of
+  // what sells it as interference rather than as painted-on colour.
+  let opd = thick / max(cosI, 0.18);
+  let ph = opd * 6.28318;
+  let rgb = vec3f(cos(ph), cos(ph - 2.0944), cos(ph + 2.0944)) * 0.5 + vec3f(0.5);
+  // Squared so the bands read as saturated colour rather than pastel noise.
+  return rgb * rgb;
+}
+
 // Returns 0 for an isolated droplet / thin trail and 1 for the interior of a
 // pool. Sampled in ALL THREE axes, unlike moltenPooling's horizontal-only
 // probe: a one-voxel-deep sheet of lava spread on a floor is still a pool and
@@ -2943,6 +3039,9 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   let m = materials[mat];
   let upFacing = (axis == 1 && sgn < 0.0);
   let pool = bloodPooling(cell, mat);
+  // 0 = blood-like, 1 = petroleum-like. Every oil-specific term below rides
+  // this, so a liquid authored between the two blends rather than switching.
+  let oily = oiliness(m);
 
   // ---- normal ----
   // The smooth field gradient (see liquidFieldNormal) on EVERY face, not just
@@ -2980,7 +3079,17 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // grazing reflection is pulled down: an absorbing, slightly rough organic
   // fluid does not go to a 100% mirror at the horizon the way clean water does,
   // and letting it turns every pool edge into a bright white rim.
-  var fres = TUNE_BLOOD_F0 + (TUNE_BLOOD_GRAZE - TUNE_BLOOD_F0) *
+  //
+  // OIL IS THE OPPOSITE CASE. Blood's grazing reflectance is pulled down
+  // because it is a rough absorbing suspension; oil is a smooth dielectric film
+  // and really does approach a mirror at the horizon - that hard bright rim is
+  // the look, not the artifact the blood constant guards against. Oil also has
+  // a higher IOR (~1.47 vs water's 1.33), so its head-on reflectance is about
+  // double. Blending both endpoints on `oily` is what turns the flat matte
+  // pool into something that reads as wet.
+  let f0 = mix(TUNE_BLOOD_F0, TUNE_OIL_F0, oily);
+  let graze = mix(TUNE_BLOOD_GRAZE, TUNE_OIL_GRAZE, oily);
+  var fres = f0 + (graze - f0) *
              pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
   // Thin films are not mirrors — same reasoning as water's surfFull term.
   fres *= mix(0.45, 1.0, surfFull);
@@ -3007,6 +3116,14 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Pools are darker than droplets even at equal path length: more of the
   // light that enters a large body is absorbed before it can scatter back.
   body = mix(body, deep, pool * 0.35);
+  // Oil goes DARKER still, and this is the term that kills the beige. Blood's
+  // ramp is built around a suspension that backscatters brightly - thin blood
+  // genuinely reads lighter and more orange. Petroleum does the opposite: it
+  // absorbs almost everything that enters and reflects the rest off its
+  // surface, so its body should approach black and let the reflection and the
+  // glint carry the image. Rendering oil with blood's backscatter is what made
+  // a pool of it look like a pan of wet clay.
+  body = mix(body, deep * TUNE_OIL_DARKEN, oily);
 
   // What comes back out: the surface behind, filtered by the film, plus the
   // blood's own scattered colour. Blood scatters strongly (it is a suspension,
@@ -3032,14 +3149,29 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   var reflection : vec3f;
   if (underwater) {
     reflection = body * 1.4;
-  } else if (upFacing && pool > 0.5 && fres > TUNE_REFLECTION_CUTOFF) {
+  } else if (upFacing && pool > mix(0.5, 0.18, oily) &&
+             fres > TUNE_REFLECTION_CUTOFF) {
+    // The pooling threshold drops with oiliness. Blood needs a real pool before
+    // a traced reflection is worth a secondary ray - a droplet has no coherent
+    // surface to reflect anything. An oil slick is coherent at a much smaller
+    // scale (that is what a slick IS: a film that spreads flat), and the
+    // reflection is the DOMINANT term in its look rather than a garnish, so it
+    // earns the ray far sooner.
     reflection = traceReflection(hitP, n, rd);
   } else {
     reflection = reflectionSky(reflect(rd, n));
   }
   // Reflections off blood are TINTED by it — a dielectric this dark reflects a
   // dimmer, redder version of what a clean surface would.
-  reflection = mix(reflection, reflection * (bright + vec3f(0.25)), 0.5);
+  //
+  // Oil is barely tinted at all, and that difference matters: a smooth
+  // petroleum film is a near-NEUTRAL dark mirror, so what you see in it is the
+  // sky and the far bank rather than a brown wash of its own body colour.
+  // Pushing blood's tint onto oil was a large part of what flattened the pool
+  // into mud - it dragged the one term carrying real scene information back
+  // toward the same beige as everything else.
+  let tintAmt = mix(0.5, TUNE_OIL_REFLECT_TINT, oily);
+  reflection = mix(reflection, reflection * (bright + vec3f(0.25)), tintAmt);
 
   var color = mix(refracted, reflection, fres);
 
@@ -3059,7 +3191,12 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // highlight over its whole face, while a flat pool concentrates it — using
     // the pool exponent on a droplet gives a highlight so small it disappears
     // at any distance, which is exactly how blood ends up looking like paint.
-    let power = mix(TUNE_BLOOD_SHEEN_DROP, TUNE_BLOOD_SHEEN_POOL, pool);
+    // Oil's lobe is TIGHTER than blood's at both ends. Blood is a scattering
+    // suspension whose surface is microscopically rough, so its highlight is
+    // broad and soft; oil is a smooth film and gives a small hard glint. That
+    // narrowness is most of what the eye reads as "glossy" rather than "damp".
+    let power = mix(mix(TUNE_BLOOD_SHEEN_DROP, TUNE_BLOOD_SHEEN_POOL, pool),
+                    TUNE_OIL_GLOSS, oily);
     var spec = pow(max(dot(n, hv), 0.0), power);
     if (!upFacing) { spec *= 0.55; }
     // Ambient-lit sheen as well as key-lit: a wet surface in shadow still
@@ -3067,8 +3204,22 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // at night goes completely matte and dead.
     let ambientSheen = pow(1.0 - cosI, 4.0) * TUNE_BLOOD_AMBIENT_SHEEN;
     let tint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
-    color += tint * min(spec, 1.0) * TUNE_BLOOD_SHEEN * (0.35 + fres)
+    let sheenAmt = mix(TUNE_BLOOD_SHEEN, TUNE_OIL_SHEEN, oily);
+    color += tint * min(spec, 1.0) * sheenAmt * (0.35 + fres)
            + ambientAt(n) * ambientSheen;
+
+    // ---- thin-film iridescence ----
+    // The rainbow slick. Weighted by FRESNEL, so it appears where the surface
+    // is being seen at a glancing angle and reflecting - which is exactly where
+    // a real film's interference is visible, and it keeps the effect off the
+    // head-on centre of a pool where it would look like spilled paint.
+    //
+    // Additive on top of the reflection rather than mixed into the body: the
+    // colour comes from light bouncing off the film, not from the oil itself.
+    // Scaled by `oily`, so blood never gets a drop of it.
+    if (oily > 0.01 && !underwater) {
+      color += filmIridescence(hitP, cosI) * oily * fres * TUNE_OIL_IRIDESCENCE;
+    }
   }
 
   // ---- thin edge darkening ----
@@ -3077,8 +3228,12 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // oxidised. Keyed on a THIN column rather than on pooling, so it catches the
   // trailing edge of a run as well as the rim of a puddle.
   if (!underwater) {
+    // Faded out on oil: that browning is OXIDISED IRON specifically, a
+    // biological detail with no petroleum equivalent. A thinning oil film goes
+    // iridescent (above), it does not go rust-brown.
     let thin = 1.0 - smoothstep(0.0, TUNE_BLOOD_EDGE_DEPTH, depthM);
-    color = mix(color, color * TUNE_BLOOD_EDGE_TINT, thin * TUNE_BLOOD_EDGE_STRENGTH);
+    color = mix(color, color * TUNE_BLOOD_EDGE_TINT,
+                thin * TUNE_BLOOD_EDGE_STRENGTH * (1.0 - oily));
   }
 
   // ---- silhouette softening ----

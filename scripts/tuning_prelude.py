@@ -287,6 +287,19 @@ SPEC = [
     ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
+
+    # oil / petroleum-like viscous liquids (shadeViscous)
+    ("render", "oilSatLow", "TUNE_OIL_SAT_LOW", "f", 0.5),
+    ("render", "oilSatHigh", "TUNE_OIL_SAT_HIGH", "f", 0.78),
+    ("render", "oilF0", "TUNE_OIL_F0", "f", 0.043),
+    ("render", "oilGraze", "TUNE_OIL_GRAZE", "f", 0.97),
+    ("render", "oilGloss", "TUNE_OIL_GLOSS", "f", 620.0),
+    ("render", "oilSheen", "TUNE_OIL_SHEEN", "f", 1.6),
+    ("render", "oilReflectTint", "TUNE_OIL_REFLECT_TINT", "f", 0.12),
+    ("render", "oilDarken", "TUNE_OIL_DARKEN", "f", 0.35),
+    ("render", "oilIridescence", "TUNE_OIL_IRIDESCENCE", "f", 0.5),
+    ("render", "oilFilmScale", "TUNE_OIL_FILM_SCALE", "f", 3.5),
+    ("render", "subMurkGlow", "TUNE_SUB_MURK_GLOW", "f", 0.85),
 ]
 
 

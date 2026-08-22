@@ -889,6 +889,45 @@ struct Tuning {
     // widening this band makes more liquids inherit water's look.
     float subClearLow = 0.62f, subClearHigh = 0.82f;
 
+    // Faint directional glow toward the surface when submerged in a medium
+    // too dense to see through. A near-opaque liquid gates off Snell's window,
+    // and what that left was a featureless field of colour with no sense of up
+    // and nothing in motion - honest, but it reads as a broken shader rather
+    // than as being under the oil.
+    float subMurkGlow = 0.85f;
+
+    // ---- oil / petroleum-like viscous liquids ----
+    // Oil and blood share the viscous SURFACE path (isViscousLiquid) but look
+    // nothing alike, and blood's constants applied to oil rendered the pool as
+    // flat beige mud: matte, desaturated, no highlight, no reflection. These
+    // are the oil end of every term that differs.
+    //
+    // oiliness() in raymarch.wgsl derives the blend from the material's own
+    // authored palette SATURATION - no material ids, no new JSON key, the same
+    // principle isViscousLiquid itself follows. Blood's colour0 is 0.85
+    // saturated and oil's is 0.46: pigment suspensions are strongly chromatic,
+    // petroleum is a near-neutral brown-black.
+    float oilSatLow = 0.50f, oilSatHigh = 0.78f;
+    // Oil's IOR (~1.47 vs water's 1.33) puts F0 at roughly double water's, and
+    // unlike blood it approaches a real mirror at grazing - that hard bright
+    // rim is the look, not the artifact blood's lower graze guards against.
+    float oilF0 = 0.043f, oilGraze = 0.97f;
+    // Tighter lobe than blood's: a smooth film gives a small hard glint where
+    // a rough suspension gives a broad soft one, and that narrowness is most
+    // of what the eye reads as "glossy" rather than "damp".
+    float oilGloss = 620.0f, oilSheen = 1.6f;
+    // How much the reflection is tinted by the liquid itself. Near zero: a
+    // petroleum film is a near-NEUTRAL dark mirror, so what you see in it is
+    // the sky and the far bank, not a brown wash of its own body colour.
+    float oilReflectTint = 0.12f;
+    // How far the body colour is pushed toward black. Petroleum absorbs nearly
+    // everything entering it and reflects the rest off the surface - the
+    // opposite of blood's bright backscatter, and the term that kills the beige.
+    float oilDarken = 0.35f;
+    // Thin-film interference (the rainbow slick): strength, and the spatial
+    // scale of the film-thickness field that sets the band spacing.
+    float oilIridescence = 0.50f, oilFilmScale = 3.5f;
+
     // blood / viscous liquids (shadeViscous in raymarch.wgsl)
     float bloodF0 = 0.030f;        // head-on reflectance
     float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)
@@ -984,6 +1023,39 @@ struct Tuning {
     int lilyChance = 22, lilyFlowerChance = 5;
     int reedChance = 130, reedHeight = 16;
     int kelpChance = 120, kelpHeight = 10;
+    // Vines, climbers and hanging moss. Same shape as the pond vegetation and
+    // for the same reason: a 1-in-N roll per candidate COLUMN (never per cell,
+    // or the strands come out dashed), placing inert solids once at
+    // generation. Nothing here grows, so a settled forest still sleeps.
+    // The geometry is derived implicitly from the tree that hosts it — the
+    // canopy underside is solved in closed form from the crown parameters, so
+    // a strand costs one integer sqrt and no extra world scan.
+    int vineChance = 26;             // 1-in-N canopy columns carry a strand
+    int vineLenMin = 10, vineLenSpan = 26;   // strand length, voxels
+    int creeperFlowerChance = 9;     // 1-in-N strands are a flowering creeper
+    int mossChance = 14;             // 1-in-N columns carry a moss beard
+    int mossLenMin = 4, mossLenSpan = 9;
+    int ivyChance = 2;               // 1-in-N bole-shell cells grow ivy
+    int ivyTwist = 5;                // ivy rope spiral, 1/16 turn per voxel
+    int wallIvyDensity = 3;          // 1..8, arena + ruin stone-wall coverage
+    // ---- desert / pine highland / alpine ground cover ----
+    // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent
+    // of those that are tall saguaro columns rather than ground-level barrels.
+    // Saguaros are landmarks: keep them occasional or the desert reads as a
+    // planted grid rather than as somewhere you cross to find one.
+    int cactusChance = 26, saguaroFraction = 22;
+    // 1-in-N per desert column, inside desertPatch. Tussock is the common
+    // species (it is what makes bare sand read as ground rather than as a
+    // texture); scrub is the sparse woody accent.
+    int tussockChance = 9, scrubChance = 26;
+    int desertPatch = 130;           // vnoise 0..255 gate; higher = barer
+    // 1-in-N per pine-highland column, inside heathPatch: the huckleberry and
+    // juniper floor under a conifer stand.
+    int heathChance = 7, heathPatch = 128;
+    // 1-in-N per column above TREELINE. The sparsest density here on purpose —
+    // the snowline is meant to read as harsh, so this is the one knob that can
+    // undo the intent of the whole alpine band by being made generous.
+    int alpineChance = 40;
     int ruinChance = 5;
     int caveThreshold1 = 150, caveThreshold2 = 148;
   } worldgen;

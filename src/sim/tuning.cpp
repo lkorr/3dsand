@@ -941,6 +941,34 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       r.subClearHigh = r.subClearLow + 0.05f;
     }
 
+    ReadF(*g, "subMurkGlow", r.subMurkGlow, out, at);
+    r.subMurkGlow = std::max(r.subMurkGlow, 0.0f);
+
+    // ---- oil / petroleum-like viscous liquids ----
+    ReadF(*g, "oilSatLow", r.oilSatLow, out, at);
+    ReadF(*g, "oilSatHigh", r.oilSatHigh, out, at);
+    // Same smoothstep hazard as the clarity band above: low >= high collapses
+    // the blend into a hard switch, so a liquid authored near the boundary
+    // would flip between the blood and oil looks instead of crossing over.
+    if (r.oilSatHigh <= r.oilSatLow) {
+      out.warnings.push_back(
+          at + ".oilSatHigh <= oilSatLow; widened to keep a blend band");
+      r.oilSatHigh = r.oilSatLow + 0.05f;
+    }
+    ReadF(*g, "oilF0", r.oilF0, out, at);
+    ReadF(*g, "oilGraze", r.oilGraze, out, at);
+    ReadF(*g, "oilGloss", r.oilGloss, out, at);
+    // pow(x, e) with e <= 0 is 1 everywhere, which turns the specular lobe into
+    // a full-screen white wash.
+    r.oilGloss = std::max(r.oilGloss, 1.0f);
+    ReadF(*g, "oilSheen", r.oilSheen, out, at);
+    ReadF(*g, "oilReflectTint", r.oilReflectTint, out, at);
+    ReadF(*g, "oilDarken", r.oilDarken, out, at);
+    ReadF(*g, "oilIridescence", r.oilIridescence, out, at);
+    ReadF(*g, "oilFilmScale", r.oilFilmScale, out, at);
+    // Divides into the band phase; zero makes the whole surface one flat colour.
+    r.oilFilmScale = std::max(r.oilFilmScale, 0.01f);
+
     ReadF(*g, "bloodF0", r.bloodF0, out, at);
     ReadF(*g, "bloodGraze", r.bloodGraze, out, at);
     ReadF(*g, "bloodAbsorb", r.bloodAbsorb, out, at);
@@ -1069,6 +1097,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "reedHeight", w.reedHeight, out, at);
     ReadI(*g, "kelpChance", w.kelpChance, out, at);
     ReadI(*g, "kelpHeight", w.kelpHeight, out, at);
+    ReadI(*g, "vineChance", w.vineChance, out, at);
+    ReadI(*g, "vineLenMin", w.vineLenMin, out, at);
+    ReadI(*g, "vineLenSpan", w.vineLenSpan, out, at);
+    ReadI(*g, "creeperFlowerChance", w.creeperFlowerChance, out, at);
+    ReadI(*g, "mossChance", w.mossChance, out, at);
+    ReadI(*g, "mossLenMin", w.mossLenMin, out, at);
+    ReadI(*g, "mossLenSpan", w.mossLenSpan, out, at);
+    ReadI(*g, "ivyChance", w.ivyChance, out, at);
+    ReadI(*g, "ivyTwist", w.ivyTwist, out, at);
+    ReadI(*g, "wallIvyDensity", w.wallIvyDensity, out, at);
+    ReadI(*g, "cactusChance", w.cactusChance, out, at);
+    ReadI(*g, "saguaroFraction", w.saguaroFraction, out, at);
+    ReadI(*g, "tussockChance", w.tussockChance, out, at);
+    ReadI(*g, "scrubChance", w.scrubChance, out, at);
+    ReadI(*g, "desertPatch", w.desertPatch, out, at);
+    ReadI(*g, "heathChance", w.heathChance, out, at);
+    ReadI(*g, "heathPatch", w.heathPatch, out, at);
+    ReadI(*g, "alpineChance", w.alpineChance, out, at);
     ReadI(*g, "ruinChance", w.ruinChance, out, at);
     ReadI(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadI(*g, "caveThreshold2", w.caveThreshold2, out, at);
@@ -1106,6 +1152,37 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     }
     atLeast("ruinChance", w.ruinChance, 1);
     atLeast("autumnFraction", w.autumnFraction, 1);
+    // Vine/moss/ivy knobs: every "chance" is a modulo divisor and every "span"
+    // a modulo range, so zero is a div-by-zero in the shader.
+    atLeast("vineChance", w.vineChance, 1);
+    atLeast("vineLenMin", w.vineLenMin, 1);
+    atLeast("vineLenSpan", w.vineLenSpan, 1);
+    atLeast("creeperFlowerChance", w.creeperFlowerChance, 1);
+    atLeast("mossChance", w.mossChance, 1);
+    atLeast("mossLenMin", w.mossLenMin, 1);
+    atLeast("mossLenSpan", w.mossLenSpan, 1);
+    atLeast("ivyChance", w.ivyChance, 1);
+    atLeast("ivyTwist", w.ivyTwist, 0);
+    // wallIvyDensity is the NUMERATOR of a coverage ramp (32/d and 48/d). At 0
+    // it divides by zero; past 8 the integer division collapses to 4 and 6 and
+    // the knob stops doing anything, so the useful range is 1..8.
+    atLeast("wallIvyDensity", w.wallIvyDensity, 1);
+    if (w.wallIvyDensity > 8) {
+      out.warnings.push_back(
+          "worldgen.wallIvyDensity > 8 has no further effect; clamped to 8");
+      w.wallIvyDensity = 8;
+    }
+    // A strand that reaches the ground reads as a pillar and blocks a path the
+    // player expected to be open. The shader holds it clear of the trunk's own
+    // ground height, but a length past the tallest canopy is simply wasted
+    // work on cells that can never be reached — cap it at a great oak's crown.
+    if (w.vineLenMin + w.vineLenSpan > 160) {
+      out.warnings.push_back(
+          "worldgen.vineLenMin + vineLenSpan > 160 exceeds the tallest canopy; "
+          "clamped");
+      w.vineLenSpan = 160 - w.vineLenMin;
+      if (w.vineLenSpan < 1) { w.vineLenMin = 159; w.vineLenSpan = 1; }
+    }
   }
 
   return true;
