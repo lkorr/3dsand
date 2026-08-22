@@ -319,6 +319,41 @@ const TUNING_SCHEMA = [
   },
 
   {
+    id: 'underwater',
+    title: 'Underwater',
+    icon: '\u{1F93F}',
+    apply: 'shader',
+    group: 'render',
+    blurb: 'What the world looks like from INSIDE a liquid. Every knob here is ' +
+           'gated on the view ray being submerged, so none of it costs a dry ' +
+           'frame anything. Absorption is deliberately separate from the Water ' +
+           'tab’s: looking down through a surface wants a hard red kill (that ' +
+           'is the depth cue), but living inside the water at that strength ' +
+           'leaves you in a flat blue void with no visible distance at all.',
+    params: [
+      {k:'subAbsorb', n:'absorption', d:'Per-channel absorption per metre while submerged. Much weaker than the Water tab’s so you can actually see across a pond. Raise red for murk.', type:'vec3', min:0, max:4, step:0.005},
+      {k:'subScatter', n:'water colour', d:'The colour the volume tends toward with distance — what a far-off wall fades into rather than going black.', type:'color'},
+      {k:'subScatterGain', n:'scatter strength', d:'How strongly the volume adds its own colour. 0 gives clear glass water with no body to it.', min:0, max:4, step:0.02},
+      {k:'subVisibility', n:'visibility', d:'Metres at which the view has fully faded into the water colour. THE murky-pond vs clear-tropical knob.', min:0.5, max:60, step:0.5, u:'m'},
+      {k:'subVignette', n:'edge darkening', d:'Screen-edge darkening while submerged. A cheap, strong "you are in a medium" cue.', min:0, max:1, step:0.01},
+      {k:'subSnellGain', n:'snell window', d:'Brightness of the compressed disc of sky you see looking straight up from below. Outside that ~97° cone the surface mirrors the murk instead.', min:0, max:4, step:0.02},
+      {k:'subSurfaceRipple', n:'surface distortion', d:'How much the underside of the surface ripples your view of the sky through it.', min:0, max:8, step:0.05},
+      {k:'bedCausticGain', n:'caustic strength', d:'Brightness of the rippling light web painted onto sunlit surfaces UNDER the water. Separate from the Water tab’s caustics, which are the ones you see looking down from dry land.', min:0, max:10, step:0.05},
+      {k:'bedCausticCap', n:'caustic cap', d:'Ceiling on that brightening so lit surfaces do not blow out to white.', min:0, max:6, step:0.05},
+      {k:'bedCausticFade', n:'caustic depth', d:'Metres of water above a surface past which its caustics have washed out. Deep water gets none.', min:0.1, max:40, step:0.1, u:'m'},
+      {k:'bedCausticSharp', n:'caustic sharpness', d:'Higher gives thinner, brighter filaments; lower gives broad soft blotches.', min:0.1, max:8, step:0.05},
+      {k:'godRayStrength', n:'god ray strength', d:'Brightness of the volumetric sun shafts through the water.', min:0, max:4, step:0.02},
+      {k:'godRayAniso', n:'god ray focus', d:'Forward-scattering asymmetry. High values make shafts far brighter looking toward the sun than away from it, which is what makes them read as beams rather than uniform haze.', min:-0.95, max:0.95, step:0.01},
+      {k:'godRayRange', n:'god ray range', d:'Metres the shaft march covers. Past this the scatter has saturated anyway.', min:0.1, max:60, step:0.5, u:'m'},
+      {k:'godRaySteps', n:'god ray samples', d:'Samples along the view ray. A direct frame-time multiplier on submerged pixels only. 0 disables shafts entirely.', min:0, max:64, step:1, int:true},
+      {k:'godRayShadowSteps', n:'god ray shadow budget', d:'Steps each sample’s occlusion ray gets. This is what makes shafts break around the shore instead of passing through terrain — but steps × samples is the real cost.', min:0, max:64, step:1, int:true},
+      {k:'siltDensity', n:'silt density', d:'Drifting motes suspended in the water. They are most of why footage reads as underwater — the shafts need something to catch.', min:0, max:4, step:0.02},
+      {k:'siltBrightness', n:'silt brightness', d:'How brightly those motes catch the light.', min:0, max:4, step:0.02},
+      {k:'siltDrift', n:'silt drift', d:'How fast the particulate drifts. Very slow is correct; fast reads as snow.', min:0, max:1, step:0.005},
+    ],
+  },
+
+  {
     id: 'ice',
     title: 'Ice & Glass',
     icon: '\u{1F9CA}',

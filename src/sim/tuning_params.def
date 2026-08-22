@@ -156,6 +156,69 @@ TP_F(render, iceSpec, TUNE_ICE_SPEC, 0.55f)
 TP_F(render, iceDepthMax, TUNE_ICE_DEPTH_MAX, 3.0f)
 TP_F(render, iceReflectMin, TUNE_ICE_REFLECT_MIN, 0.12f)
 
+// ---- submerged view (raymarch.wgsl shadeSubmerged / godRays / bedCaustic) ----
+// These only ever apply when the ray is INSIDE a liquid, which above water is
+// never — every term below is gated on that, so a dry frame pays nothing.
+// Underwater absorption is deliberately its OWN set rather than reusing
+// waterAbsorb: looking THROUGH a lake from outside wants a strong red kill
+// (that is the depth cue), but living inside it at that strength leaves you in
+// a flat blue void with no visible distance at all. Underwater wants a longer
+// visibility range and a stronger scatter floor.
+TP_V3(render, subAbsorb, TUNE_SUB_ABSORB, 0.42f, 0.11f, 0.075f)
+TP_V3(render, subScatter, TUNE_SUB_SCATTER, 0.055f, 0.19f, 0.24f)
+// In-scatter strength and how fast the volume tint saturates with distance.
+TP_F(render, subScatterGain, TUNE_SUB_SCATTER_GAIN, 1.0f)
+// Distance (metres) at which the far view has fully faded to the scatter
+// colour. This is the underwater equivalent of fog distance and it is the
+// single knob that says "murky pond" vs "clear tropical water".
+TP_F(render, subVisibility, TUNE_SUB_VISIBILITY, 11.0f)
+// Screen-edge darkening while submerged — a cheap, strong "you are in a
+// medium" cue that costs one dot product.
+TP_F(render, subVignette, TUNE_SUB_VIGNETTE, 0.34f)
+// Snell's-window brightening: looking UP from under water compresses the whole
+// sky into a ~97 degree cone. Outside it the surface mirrors the murk.
+TP_F(render, subSnellGain, TUNE_SUB_SNELL_GAIN, 1.25f)
+
+// ---- caustics cast onto submerged surfaces ----
+// The existing causticGain/Cap drive the caustic seen looking DOWN through a
+// surface from outside. These drive the caustic painted on a lit voxel face
+// while the camera is under the water, which is a different projection (from
+// the surface above the SURFACE point, not the bed point) and wants its own
+// strength or one of the two views always looks wrong.
+TP_F(render, bedCausticGain, TUNE_BED_CAUSTIC_GAIN, 2.4f)
+TP_F(render, bedCausticCap, TUNE_BED_CAUSTIC_CAP, 1.5f)
+// Metres of water above a surface past which its caustics have washed out.
+TP_F(render, bedCausticFade, TUNE_BED_CAUSTIC_FADE, 6.0f)
+// Sharpness of the caustic web. Higher = thinner, brighter filaments.
+TP_F(render, bedCausticSharp, TUNE_BED_CAUSTIC_SHARP, 2.2f)
+
+// ---- volumetric light shafts (god rays) ----
+// Ray-marched with a real occlusion test per sample, so shafts break correctly
+// around the shore and any overhang. Sample count is a direct frame-time
+// multiplier on submerged pixels ONLY.
+TP_I(render, godRaySteps, TUNE_GODRAY_STEPS, 14)
+TP_F(render, godRayStrength, TUNE_GODRAY_STRENGTH, 0.55f)
+// Henyey-Greenstein forward-scattering asymmetry: shafts are much brighter
+// looking toward the sun than away from it, which is what makes them read as
+// beams rather than as uniform haze.
+TP_F(render, godRayAniso, TUNE_GODRAY_ANISO, 0.62f)
+// Metres the shaft march covers. Beyond this the scatter has saturated anyway.
+TP_F(render, godRayRange, TUNE_GODRAY_RANGE, 14.0f)
+// Steps the per-sample occlusion ray gets. Short on purpose: it only has to
+// find the surface or a nearby blocker, not resolve distant geometry.
+TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 20)
+
+// ---- drifting particulate (silt) ----
+// Render-only motes in the water volume. This is what gives the shafts
+// something to catch, and it is most of why footage reads as underwater.
+TP_F(render, siltDensity, TUNE_SILT_DENSITY, 0.55f)
+TP_F(render, siltBrightness, TUNE_SILT_BRIGHTNESS, 0.5f)
+TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f)
+
+// ---- surface-from-below ----
+// How much the underside of the water surface ripples the view of the sky.
+TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f)
+
 // ---- blood / viscous liquids ----
 TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.03f)
 TP_F(render, bloodGraze, TUNE_BLOOD_GRAZE, 0.55f)

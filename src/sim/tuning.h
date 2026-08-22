@@ -810,6 +810,62 @@ struct Tuning {
     // to one ray, so an ungated reflection here is a frame-time cliff.
     float iceReflectMin = 0.12f;
 
+    // ---- submerged view (shadeSubmerged in raymarch.wgsl) ----
+    // Everything in this block applies ONLY when the view ray is inside a
+    // liquid, so a dry frame is untouched by all of it.
+    //
+    // subAbsorb is deliberately NOT waterAbsorb. Looking down THROUGH a
+    // surface, a hard red kill is the depth cue that makes a lake read deep.
+    // Living inside the water at that same strength puts you in a featureless
+    // blue void two metres from your face — there is no distance information
+    // left to see. Underwater wants a much longer visibility range, so it gets
+    // its own (weaker) coefficients and its own scatter floor.
+    float subAbsorb[3] = {0.42f, 0.11f, 0.075f};   // per metre, per channel
+    float subScatter[3] = {0.055f, 0.19f, 0.24f};  // colour the volume tends to
+    float subScatterGain = 1.0f;    // in-scatter strength multiplier
+    // Metres at which the view has fully faded to the scatter colour. The
+    // underwater analogue of fog distance: this is the "murky pond" vs "clear
+    // tropical water" knob.
+    float subVisibility = 11.0f;
+    float subVignette = 0.34f;      // screen-edge darkening while submerged
+    // Snell's window: from below, the entire sky is compressed into a ~97
+    // degree cone straight up, and outside it the surface is a mirror of the
+    // murk. This scales how bright that window reads.
+    float subSnellGain = 1.25f;
+
+    // caustics cast onto submerged surfaces (bedCaustic in raymarch.wgsl).
+    // Separate from causticGain/Cap, which drive the caustic seen looking DOWN
+    // through a surface from dry land. This is a different projection — from
+    // the surface directly above the LIT POINT rather than above the bed the
+    // primary ray found — and sharing one gain makes one of the two views
+    // always wrong.
+    float bedCausticGain = 2.4f;
+    float bedCausticCap = 1.5f;
+    float bedCausticFade = 6.0f;    // metres of water above, past which it washes out
+    float bedCausticSharp = 2.2f;   // higher = thinner, brighter filaments
+
+    // volumetric light shafts (godRays in raymarch.wgsl). Ray-marched with a
+    // real per-sample occlusion test, so shafts break around the shore and any
+    // overhang instead of passing through terrain. Sample count is a direct
+    // frame-time multiplier, but on SUBMERGED pixels only.
+    int godRaySteps = 14;
+    float godRayStrength = 0.55f;
+    // Henyey-Greenstein asymmetry. Shafts are far brighter looking toward the
+    // sun than away from it; that anisotropy is what makes them read as beams
+    // rather than as a uniform brightening of the whole volume.
+    float godRayAniso = 0.62f;
+    float godRayRange = 14.0f;      // metres the shaft march covers
+    int godRayShadowSteps = 20;     // steps for the per-sample occlusion ray
+
+    // drifting particulate. Render-only motes suspended in the water, which is
+    // what gives the light shafts something visible to catch.
+    float siltDensity = 0.55f;
+    float siltBrightness = 0.50f;
+    float siltDrift = 0.05f;
+
+    // how strongly the underside of the surface ripples the view of the sky
+    float subSurfaceRipple = 1.6f;
+
     // blood / viscous liquids (shadeViscous in raymarch.wgsl)
     float bloodF0 = 0.030f;        // head-on reflectance
     float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)

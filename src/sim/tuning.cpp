@@ -852,6 +852,65 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "iceSpec", r.iceSpec, out, at);
     ReadF(*g, "iceDepthMax", r.iceDepthMax, out, at);
     ReadF(*g, "iceReflectMin", r.iceReflectMin, out, at);
+
+    // ---- submerged view ----
+    ReadV3(*g, "subAbsorb", r.subAbsorb, out, at);
+    ReadV3(*g, "subScatter", r.subScatter, out, at);
+    ReadF(*g, "subScatterGain", r.subScatterGain, out, at);
+    ReadF(*g, "subVisibility", r.subVisibility, out, at);
+    // A visibility of 0 divides by zero in the shader's fade and takes the
+    // whole submerged view to NaN, which renders as a black screen the moment
+    // the player's head goes under. Floor it well clear of that.
+    if (r.subVisibility < 0.5f) {
+      out.warnings.push_back(at + ".subVisibility < 0.5; clamped to 0.5");
+      r.subVisibility = 0.5f;
+    }
+    ReadF(*g, "subVignette", r.subVignette, out, at);
+    r.subVignette = std::clamp(r.subVignette, 0.0f, 1.0f);
+    ReadF(*g, "subSnellGain", r.subSnellGain, out, at);
+    ReadF(*g, "bedCausticGain", r.bedCausticGain, out, at);
+    ReadF(*g, "bedCausticCap", r.bedCausticCap, out, at);
+    ReadF(*g, "bedCausticFade", r.bedCausticFade, out, at);
+    if (r.bedCausticFade < 0.1f) {
+      out.warnings.push_back(at + ".bedCausticFade < 0.1; clamped to 0.1");
+      r.bedCausticFade = 0.1f;
+    }
+    ReadF(*g, "bedCausticSharp", r.bedCausticSharp, out, at);
+    r.bedCausticSharp = std::clamp(r.bedCausticSharp, 0.1f, 8.0f);
+
+    // ---- god rays ----
+    // Both step counts are a direct per-submerged-pixel frame-time multiplier
+    // (steps x shadowSteps is the real cost), so the ceilings here are a perf
+    // guard, not a taste judgement. 0 steps disables the effect cleanly.
+    ReadI(*g, "godRaySteps", r.godRaySteps, out, at);
+    if (r.godRaySteps < 0 || r.godRaySteps > 64) {
+      out.warnings.push_back(at + ".godRaySteps out of 0..64; clamped");
+      r.godRaySteps = std::clamp(r.godRaySteps, 0, 64);
+    }
+    ReadF(*g, "godRayStrength", r.godRayStrength, out, at);
+    ReadF(*g, "godRayAniso", r.godRayAniso, out, at);
+    // The Henyey-Greenstein phase function has a (1 - g^2) numerator and a
+    // denominator that goes to zero as |g| -> 1, so a g of exactly 1 is a
+    // division by zero and anything past it is not a valid phase function.
+    r.godRayAniso = std::clamp(r.godRayAniso, -0.95f, 0.95f);
+    ReadF(*g, "godRayRange", r.godRayRange, out, at);
+    if (r.godRayRange < 0.1f) {
+      out.warnings.push_back(at + ".godRayRange < 0.1; clamped to 0.1");
+      r.godRayRange = 0.1f;
+    }
+    ReadI(*g, "godRayShadowSteps", r.godRayShadowSteps, out, at);
+    if (r.godRayShadowSteps < 0 || r.godRayShadowSteps > 64) {
+      out.warnings.push_back(at + ".godRayShadowSteps out of 0..64; clamped");
+      r.godRayShadowSteps = std::clamp(r.godRayShadowSteps, 0, 64);
+    }
+
+    // ---- silt ----
+    ReadF(*g, "siltDensity", r.siltDensity, out, at);
+    r.siltDensity = std::clamp(r.siltDensity, 0.0f, 4.0f);
+    ReadF(*g, "siltBrightness", r.siltBrightness, out, at);
+    ReadF(*g, "siltDrift", r.siltDrift, out, at);
+    ReadF(*g, "subSurfaceRipple", r.subSurfaceRipple, out, at);
+
     ReadF(*g, "bloodF0", r.bloodF0, out, at);
     ReadF(*g, "bloodGraze", r.bloodGraze, out, at);
     ReadF(*g, "bloodAbsorb", r.bloodAbsorb, out, at);

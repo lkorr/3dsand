@@ -147,6 +147,35 @@ SPEC = [
     ("render", "iceDepthMax", "TUNE_ICE_DEPTH_MAX", "f", 3.0),
     ("render", "iceReflectMin", "TUNE_ICE_REFLECT_MIN", "f", 0.12),
 
+    # submerged view (raymarch.wgsl shadeSubmerged / godRays / bedCaustic)
+    ("render", "subAbsorb", "TUNE_SUB_ABSORB", "v3", [0.42, 0.11, 0.075]),
+    ("render", "subScatter", "TUNE_SUB_SCATTER", "v3", [0.055, 0.19, 0.24]),
+    ("render", "subScatterGain", "TUNE_SUB_SCATTER_GAIN", "f", 1.0),
+    ("render", "subVisibility", "TUNE_SUB_VISIBILITY", "f", 11.0),
+    ("render", "subVignette", "TUNE_SUB_VIGNETTE", "f", 0.34),
+    ("render", "subSnellGain", "TUNE_SUB_SNELL_GAIN", "f", 1.25),
+
+    # caustics cast onto submerged surfaces
+    ("render", "bedCausticGain", "TUNE_BED_CAUSTIC_GAIN", "f", 2.4),
+    ("render", "bedCausticCap", "TUNE_BED_CAUSTIC_CAP", "f", 1.5),
+    ("render", "bedCausticFade", "TUNE_BED_CAUSTIC_FADE", "f", 6.0),
+    ("render", "bedCausticSharp", "TUNE_BED_CAUSTIC_SHARP", "f", 2.2),
+
+    # volumetric light shafts (god rays)
+    ("render", "godRaySteps", "TUNE_GODRAY_STEPS", "i", 14),
+    ("render", "godRayStrength", "TUNE_GODRAY_STRENGTH", "f", 0.55),
+    ("render", "godRayAniso", "TUNE_GODRAY_ANISO", "f", 0.62),
+    ("render", "godRayRange", "TUNE_GODRAY_RANGE", "f", 14.0),
+    ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 20),
+
+    # drifting particulate (silt)
+    ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),
+    ("render", "siltBrightness", "TUNE_SILT_BRIGHTNESS", "f", 0.5),
+    ("render", "siltDrift", "TUNE_SILT_DRIFT", "f", 0.05),
+
+    # surface-from-below
+    ("render", "subSurfaceRipple", "TUNE_SUB_SURFACE_RIPPLE", "f", 1.6),
+
     # blood / viscous liquids
     ("render", "bloodF0", "TUNE_BLOOD_F0", "f", 0.03),
     ("render", "bloodGraze", "TUNE_BLOOD_GRAZE", "f", 0.55),
