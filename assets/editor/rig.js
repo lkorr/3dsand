@@ -29,6 +29,7 @@
 
 import * as ed from './editor.js';
 import * as AN from './anim.js';
+import * as VOX from './vox.js';
 
 /* ==========================================================================
    1. state + helpers
@@ -43,6 +44,29 @@ let selectedPart = null;      // limb name, or null
 // socket takes the gizmo over from the joint anchor — both are "a point on a
 // part", so they share one gizmo rather than fighting over the viewport.
 let selectedSocket = null;
+
+// --- held-item preview ----------------------------------------------------
+//
+// WHY THE ITEM IS LOADED HERE AT ALL. The rig says only WHERE the fist closes;
+// which way the blade POINTS is the item's `grip.rotation` (item.h, and the
+// note over sockets() below). Authoring that angle used to mean typing Euler
+// degrees on the tuner's Items tab, saving, launching the game and looking —
+// which is how the sword ended up laid along the forearm, i.e. inside the arm.
+// So the preview hangs the ITEM'S OWN ART off the socket and edits the ITEM'S
+// sidecar. The rig sidecar is not touched: nothing here writes socket.rotation,
+// which stays identity exactly as mob.h asks.
+//
+// `itemDoc` is the item's .vox parsed into editor models; `itemSc` is its
+// sidecar. Both are null until an item is picked, and the whole feature is
+// server-only for the same reason the Audio tab is: a file:// page cannot read
+// assets/items/.
+let itemList = null;          // [{id, name}] from items.json, or null
+let heldItemId = null;        // which item is previewed, or null for none
+let itemDoc = null;           // { models:[...] } parsed from the item's .vox
+let itemSc = null;            // the item's sidecar JSON, mutated in place
+let itemDirty = false;        // sidecar has unsaved grip edits
+let itemErr = null;           // load failure, shown in the panel
+let gripCtx = 'held_right';   // which grip context is being edited
 let gaitOn = false;
 // NB: the gait phase itself lives in anim.gaitPhase (the AnimState mirror),
 // not here — it is runtime state the transcribed pipeline owns.
@@ -126,6 +150,340 @@ const sockets = () => {
   return s.sockets;
 };
 const limbByName = n => limbs().find(l => l.name === n) || null;
+
+/* --- held-item preview: load / save --------------------------------------
+ *
+ * These ride the same /api/model routes the tuner's Items tab uses, so there
+ * is ONE path-containment check and one write format for a per-item file.
+ */
+
+/** The socket currently driving the preview, or null. */
+function activeSocket() {
+  const SK = sockets();
+  if (selectedSocket !== null && selectedSocket >= 0 && selectedSocket < SK.length)
+    return SK[selectedSocket];
+  return null;
+}
+
+/** items.json, fetched once. Null (with a note in the panel) under file://. */
+async function ensureItemList() {
+  if (itemList) return itemList;
+  try {
+    const r = await fetch('/api/model?path=' + encodeURIComponent('items/items.json'));
+    if (!r.ok) throw new Error('items.json ' + r.status);
+    const j = JSON.parse(await r.text());
+    // items.json is a LIST of defs; tolerate both the bare array and a wrapped
+    // object so this does not break if the schema grows a header.
+    const arr = Array.isArray(j) ? j : (j.items || []);
+    itemList = arr.map(it => ({ id: it.id || it.name, name: it.name || it.id }))
+                  .filter(it => it.id);
+  } catch (e) {
+    itemErr = 'needs the tuner server (python scripts/tuner_server.py) — ' +
+              'a file:// page cannot read assets/items/';
+    itemList = null;
+  }
+  return itemList;
+}
+
+/**
+ * Load one item's art + sidecar. The .vox comes back as BYTES and is parsed by
+ * the same vox.js the editor uses for everything else, so the preview shows the
+ * real art rather than a stand-in box.
+ */
+async function loadHeldItem(id) {
+  itemErr = null; itemDoc = null; itemSc = null; itemDirty = false;
+  if (!id) { heldItemId = null; return; }
+  heldItemId = id;
+  try {
+    const rs = await fetch('/api/model?path=' + encodeURIComponent('items/' + id + '.json'));
+    if (!rs.ok) throw new Error(id + '.json ' + rs.status);
+    itemSc = JSON.parse(await rs.text());
+
+    const modelName = itemSc.model || id;
+    const rv = await fetch('/api/model?path=' + encodeURIComponent('items/' + modelName + '.vox'));
+    if (!rv.ok) throw new Error(modelName + '.vox ' + rv.status);
+    // `.prefab` is the EDITOR-shaped parse (dim/grid/offset per model), the
+    // same one openPath() builds the document from — not the raw .vox models.
+    const parsed = VOX.readVox(await rv.arrayBuffer());
+    itemDoc = parsed.prefab;
+    if (!itemDoc?.models?.length) throw new Error('no models in ' + modelName + '.vox');
+    // Default the context to one the item actually declares, so the panel opens
+    // on something editable instead of an empty "held_right" that is not there.
+    const ctxs = Object.keys(itemSc.grip || {});
+    if (ctxs.length && !ctxs.includes(gripCtx)) gripCtx = ctxs[0];
+  } catch (e) {
+    itemErr = String(e.message || e);
+    itemDoc = null; itemSc = null;
+  }
+  ed.invalidate();
+  renderAllPanels();
+}
+
+/** Write the item's sidecar back. Separate from the rig save: different file. */
+async function saveHeldItem() {
+  if (!itemSc || !heldItemId) return;
+  try {
+    const r = await fetch('/api/model?path=' + encodeURIComponent('items/' + heldItemId + '.json'),
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(itemSc, null, 2) + '\n' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    itemDirty = false;
+    toast('saved items/' + heldItemId + '.json');
+  } catch (e) {
+    toast('item save failed: ' + (e.message || e), true);
+  }
+  renderAllPanels();
+}
+
+/* --- held-item preview: PLACEMENT ----------------------------------------
+ *
+ * TRANSCRIBED FROM src/game/avatar.cpp EquipItem (the SOCKET x GRIP block,
+ * ~L231-311). Same rule as the gait preview in section 5: this renders the
+ * exported data through the engine's own formula, it does not invent a
+ * placement. If avatar.cpp changes, this is wrong and must follow.
+ *
+ * The engine's steps, in order:
+ *   q         = socket.rotation * grip.rotation      (composed FORWARD)
+ *   gripLocal = hilt.center - grip.translation       (hilt box present)
+ *             = -grip.translation                    (no hilt box)
+ *   the item's ORIGIN goes where that gripLocal, rotated by q, lands the grip
+ *   point on the socket:  origin = socketW - Rotate(q, gripLocal)
+ *
+ * Lengths: the sidecar authors hilt/translation in MICRO units and the engine
+ * divides by `scale` at load (avatar.cpp:291 `inv`), so everything below is
+ * converted to world voxels before it is composed.
+ */
+
+/** Euler degrees (X then Y then Z, the engine's order) -> quaternion. */
+function eulerToQuat(d) {
+  const h = v => (v * Math.PI) / 360;                  // deg -> half-radians
+  const cx = Math.cos(h(d[0])), sx = Math.sin(h(d[0]));
+  const cy = Math.cos(h(d[1])), sy = Math.sin(h(d[1]));
+  const cz = Math.cos(h(d[2])), sz = Math.sin(h(d[2]));
+  // qz * qy * qx — X applied first, matching Euler order X-then-Y-then-Z.
+  return AN.qnorm({
+    x: sx * cy * cz - cx * sy * sz,
+    y: cx * sy * cz + sx * cy * sz,
+    z: cx * cy * sz - sx * sy * cz,
+    w: cx * cy * cz + sx * sy * sz,
+  });
+}
+
+// Rotation of a vector by a quaternion is AN.qrot (anim.cpp:40 QuatRotate) —
+// the engine's own transcription, not a second copy of the formula.
+const qrot = AN.qrot;
+
+/**
+ * Quaternion -> Euler degrees in the engine's X-then-Y-then-Z order, i.e. the
+ * exact inverse of eulerToQuat above. Used when a ring drag has to be written
+ * back as the three numbers the sidecar stores.
+ *
+ * Gimbal lock (|pitch| = 90) is handled the standard way: at the singularity
+ * roll and yaw are the same rotation, so roll is pinned to 0 and the whole
+ * angle is reported as yaw. Without that branch the atan2s go to 0/0 and the
+ * fields fill with NaN, which then writes NaN into the JSON.
+ */
+function quatToEuler(q) {
+  const { x, y, z, w } = AN.qnorm(q);
+  const deg = r => (r * 180) / Math.PI;
+  // The composed matrix is Rz*Ry*Rx (X applied first). Reading the angles off
+  // it gives pitch = asin(-m20), roll = atan2(m21, m22), yaw = atan2(m10, m00);
+  // the m-terms below are those elements written in quaternion form. Verified
+  // against scripts/geometry.py euler_to_quat for a spread of angles — do not
+  // swap these for the m02 form, which belongs to the opposite (Rx*Ry*Rz)
+  // order and silently returns a DIFFERENT rotation for any mixed-axis angle.
+  const m20 = 2 * (x * z - w * y);
+  const m21 = 2 * (y * z + w * x);
+  const m22 = 1 - 2 * (x * x + y * y);
+  const m10 = 2 * (x * y + w * z);
+  const m00 = 1 - 2 * (y * y + z * z);
+  const s = Math.max(-1, Math.min(1, -m20));
+  if (Math.abs(s) >= 0.999999) {
+    // Gimbal lock: at pitch = +-90 roll and yaw are the same rotation, so pin
+    // roll to 0 and report the whole angle as yaw. Without this branch both
+    // atan2s go to 0/0 and NaN reaches the JSON.
+    return [0, s > 0 ? 90 : -90, deg(Math.atan2(-2 * (x * y - w * z), 1 - 2 * (x * x + z * z)))];
+  }
+  return [
+    deg(Math.atan2(m21, m22)),
+    deg(Math.asin(s)),
+    deg(Math.atan2(m10, m00)),
+  ];
+}
+
+/**
+ * Where the socket sits in PREFAB-local space right now, and how it is turned.
+ *
+ * The socket offset is authored against the hand's rest pose, so under the gait
+ * / clip preview it has to ride the hand's animated transform — otherwise the
+ * sword hangs in space while the arm swings past it. modelTransform() already
+ * returns exactly the delta the viewport applies to that limb's voxels, so the
+ * socket goes through the same one and cannot drift from the art.
+ */
+function socketFrame(sock) {
+  const p = { x: +sock.offset[0] || 0, y: +sock.offset[1] || 0, z: +sock.offset[2] || 0 };
+  let q = { x: 0, y: 0, z: 0, w: 1 };
+  const mi = modelIndexByName(sock.part);
+  const xf = mi >= 0 ? modelTransform(mi) : null;
+  if (xf) {
+    // Same composition drawModel() applies: rotate about the pivot, then move.
+    const rel = { x: p.x - xf.pivot.x, y: p.y - xf.pivot.y, z: p.z - xf.pivot.z };
+    const r = qrot(xf.quat, rel);
+    p.x = r.x + xf.pivot.x + xf.pos.x;
+    p.y = r.y + xf.pivot.y + xf.pos.y;
+    p.z = r.z + xf.pivot.z + xf.pos.z;
+    q = xf.quat;
+  }
+  return { pos: p, quat: q };
+}
+
+/**
+ * The item's placement for the viewport: a pivot/quat/pos triple in the same
+ * shape modelTransform() returns, so rebuildInstances() draws it with no new
+ * code path.
+ *
+ * Returns null when there is nothing to place.
+ */
+function heldItemTransform() {
+  const sock = activeSocket();
+  if (!sock || !itemDoc || !itemSc) return null;
+  const grip = itemSc.grip?.[gripCtx];
+  if (!grip) return null;                 // item cannot be held this way
+
+  const scale = +itemSc.scale > 0 ? +itemSc.scale : 1;
+  const inv = 1 / scale;                  // micro -> world voxels (avatar.cpp:291)
+
+  const frame = socketFrame(sock);
+  // socket.rotation stays identity by design (mob.h), so the composed rotation
+  // is the hand's animated turn times the grip. Read it anyway rather than
+  // assuming, so an authored socket rotation would still preview correctly.
+  const sockRot = Array.isArray(sock.rotation) && sock.rotation.length === 3
+    ? eulerToQuat(sock.rotation.map(Number)) : { x: 0, y: 0, z: 0, w: 1 };
+  const gripRot = eulerToQuat((grip.rotation || [0, 0, 0]).map(Number));
+  const q = AN.qnorm(AN.qmul(AN.qmul(frame.quat, sockRot), gripRot));
+
+  const t = (grip.translation || [0, 0, 0]).map(Number);
+  const tr = { x: t[0] * inv, y: t[1] * inv, z: t[2] * inv };
+
+  // gripLocal: item-frame vector from the item's ORIGIN to the point the fist
+  // closes on (avatar.cpp:269-271).
+  let gl;
+  const hilt = itemSc.hilt;
+  if (hilt && Array.isArray(hilt.min) && Array.isArray(hilt.size)) {
+    // The sidecar authors the hilt as min+size; the engine's ItemHilt.center is
+    // the box CENTRE (gen_sword_item.py emits min/size, item.cpp derives it).
+    const c = {
+      x: (+hilt.min[0] + +hilt.size[0] / 2) * inv,
+      y: (+hilt.min[1] + +hilt.size[1] / 2) * inv,
+      z: (+hilt.min[2] + +hilt.size[2] / 2) * inv,
+    };
+    gl = { x: c.x - tr.x, y: c.y - tr.y, z: c.z - tr.z };
+  } else {
+    gl = { x: -tr.x, y: -tr.y, z: -tr.z };
+  }
+
+  // origin = socket - Rotate(q, gripLocal). The viewport's drawModel() rotates
+  // about `pivot` and then adds `pos`, so express the same thing that way:
+  // pivot at the item's own origin, and pos the vector that lands it.
+  const rg = qrot(q, gl);
+  return {
+    pivot: { x: 0, y: 0, z: 0 },
+    quat: q,
+    pos: { x: frame.pos.x - rg.x, y: frame.pos.y - rg.y, z: frame.pos.z - rg.z },
+    scale: inv * (+grip.scale > 0 ? +grip.scale : 1),
+    socket: frame.pos,
+  };
+}
+
+/**
+ * Point the viewport's three socket axis lines at the selected socket, turned
+ * by the frame a held item would actually be placed in (socket x grip). With
+ * no item loaded they show the bare socket frame, which is the hand's.
+ */
+function updateSocketAxes() {
+  const sock = activeSocket();
+  if (!sock) { ed.setSocketAxes(null); return; }
+  const frame = socketFrame(sock);
+  const sockRot = Array.isArray(sock.rotation) && sock.rotation.length === 3
+    ? eulerToQuat(sock.rotation.map(Number)) : { x: 0, y: 0, z: 0, w: 1 };
+  const grip = itemSc?.grip?.[gripCtx];
+  const gripRot = grip ? eulerToQuat((grip.rotation || [0, 0, 0]).map(Number))
+                       : { x: 0, y: 0, z: 0, w: 1 };
+  ed.setSocketAxes({
+    pos: [frame.pos.x, frame.pos.y, frame.pos.z],
+    quat: AN.qnorm(AN.qmul(AN.qmul(frame.quat, sockRot), gripRot)),
+  });
+}
+
+/**
+ * Draw the held item's voxels as extra instances on the editor's shared mesh.
+ * Called by editor.js's rebuildInstances via the appendExtraInstances hook.
+ *
+ * The item is a DIFFERENT document (its own .vox, its own origin), so it
+ * cannot ride the normal model loop — that is exactly the separation the
+ * item/rig split buys, and this is the one place the two are drawn together.
+ */
+function appendExtraInstances(cubes, n, cap, m4, col) {
+  const xf = heldItemTransform();
+  if (!xf || !itemDoc) return n;
+  const pal = itemDoc.palette || null;
+  for (const m of itemDoc.models) {
+    const d = m.dim, data = m.grid.data;
+    for (let z = 0; z < d.z; z++) {
+      for (let y = 0; y < d.y; y++) {
+        const row = y * d.x + z * d.x * d.y;
+        for (let x = 0; x < d.x; x++) {
+          const v = data[row + x];
+          if (!v || n >= cap) continue;
+          // Item voxels are authored at `scale` micro units per world voxel,
+          // so the whole model shrinks by `xf.scale` about the item's origin
+          // before it is rotated into the socket frame.
+          const p = qrot(xf.quat, {
+            x: (x + 0.5 + m.offset.x) * xf.scale,
+            y: (y + 0.5 + m.offset.y) * xf.scale,
+            z: (z + 0.5 + m.offset.z) * xf.scale,
+          });
+          m4.makeScale(xf.scale, xf.scale, xf.scale);
+          m4.setPosition(p.x + xf.pos.x, p.y + xf.pos.y, p.z + xf.pos.z);
+          cubes.setMatrixAt(n, m4);
+          // The item's palette is its own file's, NOT the rig's material list:
+          // an index means different things in the two documents.
+          col.set(itemVoxColor(pal, v));
+          cubes.setColorAt(n, col);
+          n++;
+        }
+      }
+    }
+  }
+  return n;
+}
+
+/**
+ * Colour for one item voxel. The .vox palette index IS the material id by
+ * convention (assets/prefabs, scripts/gen_palette.py), so ask the editor's
+ * material table first and fall back to the file's own palette.
+ */
+function itemVoxColor(pal, v) {
+  // Item .vox files carry no RGBA chunk (gen_sword_item.py writes indices, not
+  // colours), so the material table is the normal path and the palette branch
+  // below only fires for a hand-made file that does embed one.
+  const mats = ed.getMaterials?.();
+  if (mats && mats.length && v < mats.length) return ed.matColorOf(v);
+  const c = pal && pal[v];
+  if (c) return (c.r << 16) | (c.g << 8) | c.b;
+  return 0xc0c0c0;
+}
+
+/** The grip block for the active context, created lazily. */
+function activeGrip() {
+  if (!itemSc) return null;
+  const g = itemSc.grip || (itemSc.grip = {});
+  const b = g[gripCtx] || (g[gripCtx] = { translation: [0, 0, 0], rotation: [0, 0, 0], scale: 1 });
+  if (!Array.isArray(b.translation) || b.translation.length !== 3) b.translation = [0, 0, 0];
+  if (!Array.isArray(b.rotation) || b.rotation.length !== 3) b.rotation = [0, 0, 0];
+  if (!Number.isFinite(+b.scale)) b.scale = 1;
+  return b;
+}
 
 // Mutating the sidecar invalidates the preview skeleton — rebuild it so the
 // preview never runs against a stale rig. This is the single choke point for
@@ -809,6 +1167,7 @@ function renderRigTail() {
           return inp;
         })()));
     });
+    renderHeldItem();
   });
 
   /* ---- chains (read-only summary; authored by Split-to-model + this) ---- */
@@ -951,6 +1310,198 @@ function addChainFromSelection() {
   renderAllPanels();
 }
 
+/* --------------------------------------------------------------------------
+   Held-item preview UI: pick an item, see it in the fist, tune the angle.
+
+   This is the reason the socket panel exists at all. The rig only decides
+   WHERE the fist closes; the ANGLE a sword sits at is the item's own
+   grip.rotation, so the fields below write assets/items/<id>.json and leave
+   the rig sidecar alone. Two files, edited from one place, because they are
+   two halves of one visual question.
+   -------------------------------------------------------------------------- */
+
+const RPY_LABELS = ['roll (X)', 'pitch (Y)', 'yaw (Z)'];
+
+function renderHeldItem() {
+  sideEl.append(el('div', { class: 'righdr' }, 'Held item preview'));
+
+  if (itemErr && !itemList) {
+    sideEl.append(el('div', { class: 'rignote' }, itemErr));
+    return;
+  }
+  if (!itemList) {
+    // First paint: kick the fetch and re-render when it lands.
+    sideEl.append(el('div', { class: 'rignote' }, 'loading items…'));
+    ensureItemList().then(() => renderAllPanels());
+    return;
+  }
+
+  // --- which item ---
+  sideEl.append(el('div', { class: 'rigf' },
+    el('span', {}, 'item'),
+    (() => {
+      const sel = el('select');
+      sel.append(el('option', { value: '' }, '(none)'));
+      for (const it of itemList) {
+        const o = el('option', { value: it.id }, it.name || it.id);
+        if (it.id === heldItemId) o.selected = true;
+        sel.append(o);
+      }
+      sel.addEventListener('change', () => {
+        loadHeldItem(sel.value || null);
+      });
+      return sel;
+    })()));
+
+  if (!heldItemId) {
+    sideEl.append(el('div', { class: 'rignote' },
+      'Pick an item to hang it off this socket. It is drawn exactly where the ' +
+      'engine would put it — socket × grip, hilt box centred on the socket ' +
+      '(avatar.cpp EquipItem) — so what you see here is what the game does.'));
+    return;
+  }
+  if (itemErr) {
+    sideEl.append(el('div', { class: 'rignote' }, 'could not load: ' + itemErr));
+    return;
+  }
+  if (!itemSc) { sideEl.append(el('div', { class: 'rignote' }, 'loading…')); return; }
+
+  // --- which context ---
+  const ctxs = Object.keys(itemSc.grip || {});
+  if (!ctxs.length) {
+    sideEl.append(el('div', { class: 'rignote' },
+      'This item declares no grip contexts, so the engine refuses to equip it ' +
+      'at all. Add one below to author a pose for "' + (activeSocket()?.name || 'this socket') + '".'),
+      el('div', { class: 'rigbtns' }, el('button', {
+        class: 'small',
+        onclick: () => {
+          gripCtx = activeSocket()?.name || 'held_right';
+          activeGrip();                 // creates it
+          itemDirty = true;
+          bindGizmo(); ed.invalidate(); renderAllPanels();
+        },
+      }, '+ grip for "' + (activeSocket()?.name || 'held_right') + '"')));
+    return;
+  }
+  sideEl.append(el('div', { class: 'rigf' },
+    el('span', {}, 'context'),
+    (() => {
+      const sel = el('select');
+      for (const c of ctxs) {
+        const o = el('option', { value: c }, c);
+        if (c === gripCtx) o.selected = true;
+        sel.append(o);
+      }
+      sel.addEventListener('change', () => {
+        gripCtx = sel.value;
+        bindGizmo(); ed.invalidate(); renderAllPanels();
+      });
+      return sel;
+    })()));
+
+  const sockName = activeSocket()?.name || '';
+  if (sockName && gripCtx !== sockName) {
+    // Not an error — an author may be previewing a "ground" pose in the hand —
+    // but the engine matches socket name to grip key exactly, so a mismatch is
+    // worth saying out loud rather than letting it read as a broken preview.
+    sideEl.append(el('div', { class: 'rignote' },
+      `Previewing "${gripCtx}" on a socket named "${sockName}". The engine ` +
+      `looks the grip up BY THE SOCKET'S NAME, so in game this socket uses ` +
+      `"${sockName}" — which this item ` +
+      (ctxs.includes(sockName) ? 'does declare.' : 'does NOT declare, so it cannot be held here.')));
+  }
+
+  sideEl.append(el('div', { class: 'rignote' },
+    'Drag the coloured rings to turn the item, or type the angles. Euler ' +
+    'degrees applied X then Y then Z, written to assets/items/' + heldItemId +
+    '.json — the RIG is not modified.'));
+  sideEl.append(el('div', { id: 'gripFields' }));
+  renderGripFields();
+}
+
+/**
+ * The roll/pitch/yaw + translation rows. Split from renderHeldItem so a ring
+ * drag can refresh just the numbers without rebuilding the whole panel (which
+ * would drop focus out of whichever field is being typed into).
+ */
+function renderGripFields() {
+  // The host is created by renderHeldItem() during a full panel render, which
+  // is what puts it in the right place in the socket section. A ring drag
+  // calls this directly to refresh only the numbers — if the panel is not
+  // currently showing the grip (no socket selected, another tab), there is
+  // nothing to update and appending a stray host to the end of the sidebar
+  // would be worse than doing nothing.
+  const host = document.getElementById('gripFields');
+  if (!host) return;
+  host.innerHTML = '';
+  const g = itemSc ? itemSc.grip?.[gripCtx] : null;
+  if (!g) return;
+  const grip = activeGrip();
+
+  RPY_LABELS.forEach((label, k) => {
+    host.append(el('div', { class: 'rigf' },
+      el('span', {}, label),
+      (() => {
+        const inp = el('input', {
+          type: 'number', step: '5', value: String(+grip.rotation[k] || 0),
+        });
+        inp.addEventListener('change', () => {
+          const v = grip.rotation.slice();
+          v[k] = num(inp.value, 0);
+          grip.rotation = v;
+          itemDirty = true;
+          bindGizmo(); ed.invalidate(); updateSocketAxes(); renderAllPanels();
+        });
+        return inp;
+      })()));
+  });
+
+  // Translation is the residual nudge ON TOP of the hilt-box alignment
+  // (item.h), so it is zero for a well-authored item — shown because a
+  // non-zero value here explains an offset the angles cannot.
+  ['x', 'y', 'z'].forEach((ax, k) => {
+    host.append(el('div', { class: 'rigf' },
+      el('span', {}, 'nudge ' + ax),
+      (() => {
+        const inp = el('input', {
+          type: 'number', step: '1', value: String(+grip.translation[k] || 0),
+        });
+        inp.addEventListener('change', () => {
+          const v = grip.translation.slice();
+          v[k] = num(inp.value, 0);
+          grip.translation = v;
+          itemDirty = true;
+          ed.invalidate(); updateSocketAxes(); renderAllPanels();
+        });
+        return inp;
+      })()));
+  });
+
+  host.append(el('div', { class: 'rignote' },
+    itemSc.hilt
+      ? 'Nudge is in MICRO units and is a residual on top of the hilt box, ' +
+        'which is already centred on the socket. Zero is the healthy value.'
+      : 'This item declares NO hilt box, so placement falls back to nudge ' +
+        'alone — the arrangement that shipped the sword-at-the-feet bug. ' +
+        'Consider authoring a hilt in its generator.'));
+
+  host.append(el('div', { class: 'rigbtns' },
+    el('button', {
+      class: 'small' + (itemDirty ? ' on' : ''),
+      title: 'write assets/items/' + heldItemId + '.json',
+      onclick: () => saveHeldItem(),
+    }, itemDirty ? 'save item ●' : 'save item'),
+    el('button', {
+      class: 'small',
+      title: 'back to no rotation',
+      onclick: () => {
+        grip.rotation = [0, 0, 0];
+        itemDirty = true;
+        bindGizmo(); ed.invalidate(); updateSocketAxes(); renderAllPanels();
+      },
+    }, 'reset angles')));
+}
+
 /**
  * Add a socket on the selected limb, seeded at the CENTRE of that limb's model
  * box — which is what "where the fist closes" means for a hand, and what
@@ -1027,12 +1578,42 @@ function bindGizmo() {
         touched();
         ed.invalidate();
         renderAnchorFields(v);
+        updateSocketAxes();
       },
     });
-    ed.setRotGizmo(null);
+    updateSocketAxes();
+    // THE RINGS ROTATE THE ITEM'S GRIP, NOT THE SOCKET. A socket's frame is the
+    // hand's frame (mob.h: its rotation stays identity); what an author is
+    // actually tuning when they turn a sword in the fist is the ITEM's
+    // grip.rotation, in the item's own sidecar. So the rings appear only when
+    // an item is loaded, and they write there.
+    const grip = itemSc && itemSc.grip?.[gripCtx] ? activeGrip() : null;
+    if (grip) {
+      ed.setRotGizmo({
+        quat: eulerToQuat(grip.rotation.map(Number)),
+        onChange: (q, done) => {
+          // The rings hand back an absolute orientation in the gizmo's frame;
+          // the sidecar stores Euler degrees, so convert on the way in. Snapped
+          // to whole degrees because that is how the numbers are authored and
+          // an unsnapped drag writes 42.7000000001 into the JSON.
+          const e = quatToEuler(q).map(v => Math.round(v));
+          grip.rotation = e;
+          itemDirty = true;
+          ed.invalidate();
+          updateSocketAxes();
+          renderGripFields();
+        },
+      });
+    } else {
+      ed.setRotGizmo(null);
+    }
     poseEdit = null;
     return;
   }
+  // Past this point no socket is selected, so the frame axes have nothing to
+  // point at. Clearing here rather than in each branch below means a new
+  // early return cannot leave them stranded at the last socket's position.
+  ed.setSocketAxes(null);
 
   const limb = selectedPart ? limbByName(selectedPart) : null;
   if (!limb) {
@@ -2196,6 +2777,7 @@ export const hooks = {
   modelTransform,
   viewPlan,
   appendOnionInstances,
+  appendExtraInstances,
   onKey,
   tick,
   // bindGizmo re-reads the anchor: the move brush shifts a limb's anchor as

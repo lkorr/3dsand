@@ -106,6 +106,11 @@ let boundsBox = null;         // wireframe outline of the model bounds
 let mirrorPlane = null;
 let microGhost = null, microSubdiv = 0;
 let gizmo = null, gizmoBall = null, gizmoArc = null, gizmoAxis = null;
+// Three lines showing a SOCKET'S FRAME — which way the held item's own X/Y/Z
+// end up pointing once socket x grip is composed. Separate from the rotation
+// rings (which are drag handles at fixed world orientation): these are pure
+// readout, and they turn with the grip so "roll 30" has a visible meaning.
+let socketAxes = null;
 let gridHelper = null, axes = null;
 let canvas = null, host = null;
 let initialised = false, initFailed = false;
@@ -763,6 +768,7 @@ function buildScene() {
   scene.add(gizmo);
 
   buildRotRings();
+  buildSocketAxes();
 
   gridHelper = new THREE.GridHelper(1, 1, 0x39445a, 0x232c3b);
   scene.add(gridHelper);
@@ -1055,6 +1061,11 @@ function rebuildInstances() {
   // they cost no extra draw call. rig.js decides which frames and what tint.
   const liveCount = n;
   n = hooks.appendOnionInstances?.(cubes, n, cap, _m4, _col) ?? n;
+  // Same mechanism for geometry that is NOT in this document at all: the held
+  // item preview draws an item's own .vox hanging off a socket. It cannot go
+  // through the loop above, which walks doc.models — the item is a separate
+  // file with its own origin, which is the entire point of the item/rig split.
+  n = hooks.appendExtraInstances?.(cubes, n, cap, _m4, _col) ?? n;
 
   // Hitting the cap silently drops voxels, which looks like data loss even
   // though the document is intact. Say so once per occurrence rather than
@@ -1314,6 +1325,73 @@ function buildRotRings() {
 export function setRotGizmo(state) {
   rotState = state;
   updateRotRings();
+}
+
+/* ---- socket frame axes --------------------------------------------------
+   Three lines out of a socket showing the frame a held item is placed in.
+   RED = the item's own +X, GREEN = +Y, BLUE = +Z, the same colour convention
+   as AxesHelper and as the rotation rings above, so the two read together.
+
+   This is a READOUT, not a handle. It exists because "rotation: [0,-90,0]" in
+   a JSON file says nothing about whether the blade ends up along the forearm
+   or across it, and that is precisely the mistake the numbers keep hiding. */
+
+const SOCKET_AXIS_COLORS = [0xff6b6b, 0x7cf03a, 0x6ea8fe];   // X, Y, Z
+const SOCKET_AXIS_LEN = 4.0;                                 // world voxels
+
+function buildSocketAxes() {
+  socketAxes = new THREE.Group();
+  socketAxes.visible = false;
+  for (let i = 0; i < 3; i++) {
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(
+        [new THREE.Vector3(), new THREE.Vector3()]),
+      new THREE.LineBasicMaterial({
+        color: SOCKET_AXIS_COLORS[i], depthTest: false,
+        transparent: true, opacity: 0.95,
+      }));
+    line.renderOrder = 1000;
+    socketAxes.add(line);
+    // A cone at the far end so +X reads as distinct from -X. Without it the
+    // three lines are ambiguous about direction, which is half the question.
+    const tip = new THREE.Mesh(
+      new THREE.ConeGeometry(0.22, 0.7, 10),
+      new THREE.MeshBasicMaterial({
+        color: SOCKET_AXIS_COLORS[i], depthTest: false,
+        transparent: true, opacity: 0.95,
+      }));
+    tip.renderOrder = 1000;
+    socketAxes.add(tip);
+  }
+  scene.add(socketAxes);
+}
+
+/**
+ * Show the socket frame at `pos`, turned by quaternion `q`.
+ * Pass null to hide. rig.js calls this from its gizmo binding.
+ */
+export function setSocketAxes(state) {
+  if (!socketAxes) return;
+  if (!state) { socketAxes.visible = false; return; }
+  socketAxes.visible = true;
+  const q = state.quat || { x: 0, y: 0, z: 0, w: 1 };
+  const _q = new THREE.Quaternion(q.x, q.y, q.z, q.w).normalize();
+  socketAxes.position.set(state.pos[0], state.pos[1], state.pos[2]);
+  const len = state.len || SOCKET_AXIS_LEN;
+  for (let i = 0; i < 3; i++) {
+    const dir = new THREE.Vector3(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0)
+      .applyQuaternion(_q);
+    const line = socketAxes.children[i * 2];
+    line.geometry.dispose();
+    line.geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(),
+      dir.clone().multiplyScalar(len),
+    ]);
+    const tip = socketAxes.children[i * 2 + 1];
+    tip.position.copy(dir.clone().multiplyScalar(len));
+    // The cone's own axis is +Y; aim it down the line.
+    tip.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+  }
 }
 
 function updateRotRings() {
