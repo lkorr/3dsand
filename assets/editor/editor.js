@@ -115,6 +115,7 @@ let gizmo = null, gizmoBall = null, gizmoArc = null, gizmoAxis = null;
 let socketAxes = null;
 let gridHelper = null, axes = null;
 let selectionOutline = null;
+let hiltBox = null;            // wireframe outline of the item's hilt region
 let resizeHandles = [];        // 6 spheres, one per bounding-box face
 let canvas = null, host = null;
 let initialised = false, initFailed = false;
@@ -819,6 +820,58 @@ function upscaleDoc() {
   return true;
 }
 
+function downscaleDoc() {
+  if (!doc) return false;
+  for (const m of doc.models) {
+    if (m.dim.x < 2 && m.dim.y < 2 && m.dim.z < 2) {
+      hooks.toast(`cannot downscale: "${m.name}" is already 1×1×1`, true);
+      return false;
+    }
+  }
+  for (const m of doc.models) {
+    const nd = {
+      x: Math.max(1, Math.floor(m.dim.x / 2)),
+      y: Math.max(1, Math.floor(m.dim.y / 2)),
+      z: Math.max(1, Math.floor(m.dim.z / 2)),
+    };
+    const g = makeGrid(nd);
+    const od = m.dim, src = m.grid.data;
+    for (let z = 0; z < nd.z; z++)
+      for (let y = 0; y < nd.y; y++)
+        for (let x = 0; x < nd.x; x++) {
+          // Take the most common non-zero material in the 2×2×2 source block.
+          const counts = {};
+          let best = 0, bestN = 0;
+          for (let dz = 0; dz < 2; dz++)
+            for (let dy = 0; dy < 2; dy++)
+              for (let dx = 0; dx < 2; dx++) {
+                const sx = x * 2 + dx, sy = y * 2 + dy, sz = z * 2 + dz;
+                if (sx >= od.x || sy >= od.y || sz >= od.z) continue;
+                const v = src[sx + sy * od.x + sz * od.x * od.y];
+                if (!v) continue;
+                const c = (counts[v] = (counts[v] || 0) + 1);
+                if (c > bestN) { bestN = c; best = v; }
+              }
+          g.data[x + y * nd.x + z * nd.x * nd.y] = best;
+        }
+    m.dim = nd;
+    m.grid = g;
+    m.offset = {
+      x: Math.round(m.offset.x / 2),
+      y: Math.round(m.offset.y / 2),
+      z: Math.round(m.offset.z / 2),
+    };
+  }
+  clearUndo();
+  setSelection(null);
+  reboundDoc();
+  grid = doc.models[activeModel].grid;
+  markDirty();
+  if (initialised) { frameCamera(); updateMirrorPlane(); needsRebuild = true; }
+  hooks.onModelsChanged?.();
+  return true;
+}
+
 // Fresh single-model document.
 function newModel(dx, dy, dz, name = 'untitled') {
   dx = Math.max(1, Math.min(MAX_EDIT_DIM, dx | 0));
@@ -928,6 +981,14 @@ function buildScene() {
   selectionOutline.renderOrder = 998;
   selectionOutline.visible = false;
   scene.add(selectionOutline);
+
+  // Hilt box: wireframe showing where the hand closes on a held item.
+  hiltBox = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+    new THREE.LineBasicMaterial({ color: 0xffb454, transparent: true, opacity: 0.85 }));
+  hiltBox.renderOrder = 999;
+  hiltBox.visible = false;
+  scene.add(hiltBox);
 
   // Resize handles: 6 spheres on each face of the active model's bounding box.
   const FACE_DEFS = [
@@ -1647,6 +1708,22 @@ export function setSocketAxes(state) {
     // The cone's own axis is +Y; aim it down the line.
     tip.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
   }
+}
+
+/**
+ * Show/hide the hilt-box wireframe. `state` is
+ *   { pos:[x,y,z], size:[x,y,z], quat:{x,y,z,w} }
+ * where pos is the box CENTRE in viewport coords and size is the full extent.
+ * Pass null to hide.
+ */
+export function setHiltBox(state) {
+  if (!hiltBox) return;
+  if (!state) { hiltBox.visible = false; return; }
+  hiltBox.visible = true;
+  hiltBox.position.set(state.pos[0], state.pos[1], state.pos[2]);
+  hiltBox.scale.set(state.size[0], state.size[1], state.size[2]);
+  const q = state.quat || { x: 0, y: 0, z: 0, w: 1 };
+  hiltBox.quaternion.set(q.x, q.y, q.z, q.w).normalize();
 }
 
 function updateRotRings() {
@@ -3102,6 +3179,7 @@ async function save(saveAs) {
     docName = path.split('/').pop().replace(/\.vox$/i, '');
     clearDirty();
     await refreshFileList();
+    await hooks.onSave?.();
     hooks.toast(`saved ${path} (${rt.bytes} bytes, round-trip ok${sidecarNote})`);
   } catch (e) {
     hooks.toast('save failed: ' + (e.message || e), true);
@@ -3241,8 +3319,8 @@ export function setSidecar(s) { sidecar = s; }
 export function touchSidecar() { markDirty(); }
 
 export { setActiveModel, addModel, duplicateModel, removeModel, renameModel,
-         splitSelectionToModel, upscaleDoc, markDirty, moveModel, growModel,
-         setSelection };
+         splitSelectionToModel, upscaleDoc, downscaleDoc, markDirty, moveModel,
+         growModel, setSelection };
 
 /** Force a full instance rebuild (gait preview / onion skin drive this). */
 export function invalidate() { needsRebuild = true; }

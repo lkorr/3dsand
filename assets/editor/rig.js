@@ -350,47 +350,44 @@ function heldItemTransform() {
   const grip = itemSc.grip?.[gripCtx];
   if (!grip) return null;                 // item cannot be held this way
 
-  const scale = +itemSc.scale > 0 ? +itemSc.scale : 1;
-  const inv = 1 / scale;                  // micro -> world voxels (avatar.cpp:291)
+  const itemScale = +itemSc.scale > 0 ? +itemSc.scale : 1;
+  const rigScale = +(sc().skinScale ?? sc().scale) || 1;
+  // The viewport unit is one RIG file voxel. One item file voxel covers
+  // (rigScale / itemScale) viewport units — so a sword at scale 4 on a rig at
+  // skinScale 8 draws each item voxel as a 2-unit cube, matching the real size
+  // ratio the engine applies.
+  const voxRatio = rigScale / itemScale * (+grip.scale > 0 ? +grip.scale : 1);
 
   const frame = socketFrame(sock);
-  // socket.rotation stays identity by design (mob.h), so the composed rotation
-  // is the hand's animated turn times the grip. Read it anyway rather than
-  // assuming, so an authored socket rotation would still preview correctly.
   const sockRot = Array.isArray(sock.rotation) && sock.rotation.length === 3
     ? eulerToQuat(sock.rotation.map(Number)) : { x: 0, y: 0, z: 0, w: 1 };
   const gripRot = eulerToQuat((grip.rotation || [0, 0, 0]).map(Number));
   const q = AN.qnorm(AN.qmul(AN.qmul(frame.quat, sockRot), gripRot));
 
+  // Grip translation and hilt are in item micro units; convert to viewport
+  // units (rig micro) by the same ratio.
   const t = (grip.translation || [0, 0, 0]).map(Number);
-  const tr = { x: t[0] * inv, y: t[1] * inv, z: t[2] * inv };
+  const tr = { x: t[0] * voxRatio, y: t[1] * voxRatio, z: t[2] * voxRatio };
 
-  // gripLocal: item-frame vector from the item's ORIGIN to the point the fist
-  // closes on (avatar.cpp:269-271).
   let gl;
   const hilt = itemSc.hilt;
   if (hilt && Array.isArray(hilt.min) && Array.isArray(hilt.size)) {
-    // The sidecar authors the hilt as min+size; the engine's ItemHilt.center is
-    // the box CENTRE (gen_sword_item.py emits min/size, item.cpp derives it).
     const c = {
-      x: (+hilt.min[0] + +hilt.size[0] / 2) * inv,
-      y: (+hilt.min[1] + +hilt.size[1] / 2) * inv,
-      z: (+hilt.min[2] + +hilt.size[2] / 2) * inv,
+      x: (+hilt.min[0] + +hilt.size[0] / 2) * voxRatio,
+      y: (+hilt.min[1] + +hilt.size[1] / 2) * voxRatio,
+      z: (+hilt.min[2] + +hilt.size[2] / 2) * voxRatio,
     };
     gl = { x: c.x - tr.x, y: c.y - tr.y, z: c.z - tr.z };
   } else {
     gl = { x: -tr.x, y: -tr.y, z: -tr.z };
   }
 
-  // origin = socket - Rotate(q, gripLocal). The viewport's drawModel() rotates
-  // about `pivot` and then adds `pos`, so express the same thing that way:
-  // pivot at the item's own origin, and pos the vector that lands it.
   const rg = qrot(q, gl);
   return {
     pivot: { x: 0, y: 0, z: 0 },
     quat: q,
     pos: { x: frame.pos.x - rg.x, y: frame.pos.y - rg.y, z: frame.pos.z - rg.z },
-    scale: inv * (+grip.scale > 0 ? +grip.scale : 1),
+    scale: voxRatio,
     socket: frame.pos,
   };
 }
@@ -402,7 +399,7 @@ function heldItemTransform() {
  */
 function updateSocketAxes() {
   const sock = activeSocket();
-  if (!sock) { ed.setSocketAxes(null); return; }
+  if (!sock) { ed.setSocketAxes(null); ed.setHiltBox?.(null); return; }
   const frame = socketFrame(sock);
   const sockRot = Array.isArray(sock.rotation) && sock.rotation.length === 3
     ? eulerToQuat(sock.rotation.map(Number)) : { x: 0, y: 0, z: 0, w: 1 };
@@ -412,6 +409,30 @@ function updateSocketAxes() {
   ed.setSocketAxes({
     pos: [frame.pos.x, frame.pos.y, frame.pos.z],
     quat: AN.qnorm(AN.qmul(AN.qmul(frame.quat, sockRot), gripRot)),
+  });
+  updateHiltBox();
+}
+
+/**
+ * Position the hilt-box wireframe over the held item so the author can see
+ * exactly which voxels the fist closes around.
+ */
+function updateHiltBox() {
+  const xf = heldItemTransform();
+  const hilt = itemSc?.hilt;
+  if (!xf || !hilt || !Array.isArray(hilt.min) || !Array.isArray(hilt.size)) {
+    ed.setHiltBox?.(null);
+    return;
+  }
+  const s = xf.scale;
+  const cx = (+hilt.min[0] + +hilt.size[0] / 2) * s;
+  const cy = (+hilt.min[1] + +hilt.size[1] / 2) * s;
+  const cz = (+hilt.min[2] + +hilt.size[2] / 2) * s;
+  const r = qrot(xf.quat, { x: cx, y: cy, z: cz });
+  ed.setHiltBox?.({
+    pos: [r.x + xf.pos.x, r.y + xf.pos.y, r.z + xf.pos.z],
+    size: [+hilt.size[0] * s, +hilt.size[1] * s, +hilt.size[2] * s],
+    quat: xf.quat,
   });
 }
 
@@ -511,12 +532,15 @@ function touched() {
 function upscale2x() {
   const s = sc();
   const scl = +(s.skinScale ?? s.scale) || 1;
-  if (isRigged() && scl >= 8) {
-    toast('already at skinScale 8 — the finest the engine accepts (mob.cpp)', true);
+  const isItem = !isRigged() && s.scale != null;
+  if ((isRigged() || isItem) && scl >= 8) {
+    toast('already at scale 8 — the finest the engine accepts', true);
     return;
   }
-  if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' +
-      (isRigged() ? `, anchors/keys double, and skinScale goes ${scl} → ${scl * 2}` : '') +
+  const scaleNote = isRigged() ? `, anchors/keys double, and skinScale goes ${scl} → ${scl * 2}`
+    : isItem ? `, scale goes ${scl} → ${scl * 2} (same world size, finer detail)`
+    : '';
+  if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' + scaleNote +
       '. This clears the undo history.')) return;
   if (!ed.upscaleDoc()) return;          // toasts its own reason on failure
   for (const l of limbs())
@@ -535,6 +559,23 @@ function upscale2x() {
   if (isRigged()) {
     delete s.scale;             // one key wins (see the scale dropdown)
     s.skinScale = scl * 2;
+  } else if (s.scale != null) {
+    // Standalone item (sword, torch, …): `scale` is item micro units per world
+    // voxel. Doubling geometry + scale keeps the same world size, same as
+    // skinScale does for mobs. Also double hilt.min since it is in micro units.
+    s.scale = scl * 2;
+    if (s.hilt && Array.isArray(s.hilt.min))
+      s.hilt.min = s.hilt.min.map(v => v * 2);
+    if (s.hilt && Array.isArray(s.hilt.size))
+      s.hilt.size = s.hilt.size.map(v => v * 2);
+    if (s.edge) {
+      if (s.edge.from != null) s.edge.from *= 2;
+      if (s.edge.to != null) s.edge.to *= 2;
+      if (s.edge.halfWidth != null) s.edge.halfWidth *= 2;
+    }
+    for (const ctx of Object.values(s.grip || {}))
+      if (Array.isArray(ctx.translation))
+        ctx.translation = ctx.translation.map(v => v * 2);
   }
   touched();
   bindGizmo();
@@ -543,7 +584,47 @@ function upscale2x() {
   renderAllPanels();
   toast('upscaled 2×' + (isRigged()
     ? ` — skinScale ${scl * 2}: same world size, ${scl * 2}× voxel density`
-    : ' — the model is twice the resolution (and twice the world size)'));
+    : isItem
+      ? ` — scale ${scl * 2}: same world size, ${scl * 2}× voxel density`
+      : ' — the model is twice the resolution (and twice the world size)'));
+}
+
+function growSize2x() {
+  const s = sc();
+  const scl = +(s.skinScale ?? s.scale) || 1;
+  if (scl <= 1) {
+    toast('already at scale 1 — cannot grow further (would need scale < 1)', true);
+    return;
+  }
+  if (isRigged()) {
+    delete s.scale;
+    s.skinScale = scl / 2;
+    if (s.skinScale <= 1) delete s.skinScale;
+  } else if (s.scale != null) {
+    s.scale = scl / 2;
+    if (s.scale <= 1) s.scale = 1;
+  }
+  touched(); ed.refreshMicroGhost?.(); ed.invalidate();
+  renderAllPanels();
+  toast(`scale ${scl} → ${scl / 2}: same voxels, twice the world size`);
+}
+
+function shrinkSize2x() {
+  const s = sc();
+  const scl = +(s.skinScale ?? s.scale) || 1;
+  if (scl >= 8) {
+    toast('already at scale 8 — the finest the engine accepts', true);
+    return;
+  }
+  if (isRigged()) {
+    delete s.scale;
+    s.skinScale = scl * 2;
+  } else if (s.scale != null) {
+    s.scale = scl * 2;
+  }
+  touched(); ed.refreshMicroGhost?.(); ed.invalidate();
+  renderAllPanels();
+  toast(`scale ${scl} → ${scl * 2}: same voxels, half the world size`);
 }
 
 // A limb entry for every model that does not have one yet. This is how a
@@ -817,7 +898,17 @@ function renderRigPanel() {
         title: 'double the resolution: every voxel becomes 2×2×2, anchors and ' +
           'pos keys double, scale bumps — same world size, finer voxels',
         onclick: upscale2x,
-      }, '2×'),
+      }, '2× detail'),
+      el('button', {
+        class: 'small',
+        title: 'double world size: halve the scale so each voxel is bigger — no geometry change, fully reversible',
+        onclick: growSize2x,
+      }, '2× size'),
+      el('button', {
+        class: 'small',
+        title: 'halve world size: double the scale so each voxel is smaller — no geometry change, fully reversible',
+        onclick: shrinkSize2x,
+      }, '/2 size'),
       el('button', {
         class: 'small', title: 'add an empty model to this file',
         onclick: () => {
@@ -1462,6 +1553,21 @@ function renderGripFields() {
       })()));
   });
 
+  const rotBtn = (label, axis, sign) => el('button', {
+    class: 'small', title: `${sign > 0 ? '+' : '-'}90° ${['roll','pitch','yaw'][axis]}`,
+    onclick: () => {
+      const v = grip.rotation.slice();
+      v[axis] = ((+v[axis] || 0) + sign * 90) % 360;
+      grip.rotation = v;
+      itemDirty = true;
+      bindGizmo(); ed.invalidate(); updateSocketAxes(); renderAllPanels();
+    },
+  }, label);
+  host.append(el('div', { class: 'rigbtns' },
+    rotBtn('+90 roll',  0,  1), rotBtn('-90 roll',  0, -1),
+    rotBtn('+90 pitch', 1,  1), rotBtn('-90 pitch', 1, -1),
+    rotBtn('+90 yaw',   2,  1), rotBtn('-90 yaw',   2, -1)));
+
   // Translation is the residual nudge ON TOP of the hilt-box alignment
   // (item.h), so it is zero for a well-authored item — shown because a
   // non-zero value here explains an offset the angles cannot.
@@ -1620,6 +1726,7 @@ function bindGizmo() {
   // point at. Clearing here rather than in each branch below means a new
   // early return cannot leave them stranded at the last socket's position.
   ed.setSocketAxes(null);
+  ed.setHiltBox?.(null);
 
   const limb = selectedPart ? limbByName(selectedPart) : null;
   if (!limb) {
@@ -2803,4 +2910,5 @@ export const hooks = {
     bindGizmo(); renderAllPanels();
   },
   onSelectionChanged: () => { renderRigPanel(); },
+  onSave: () => { if (itemDirty) return saveHeldItem(); },
 };
