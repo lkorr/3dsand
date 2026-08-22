@@ -97,18 +97,42 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(14, T::ReadOnlyStorage), // exact-cell ops (island removal)
         entry(15, T::Storage),         // support-loss flags (sim_step writes)
         entry(16, T::ReadOnlyStorage), // genList (worldgen streaming slots)
+        // ---- the software page table (PLAN_page_table.md §5.2) ----
+        // Group 0 is not negotiable, and that is what makes the shared
+        // accessors in common.wgsl work: common.wgsl is prepended to every
+        // shader, so the accessors must name a group whose meaning is
+        // identical everywhere. Group 1 differs by pipeline, so a group-1
+        // pageTable would have to be declared per shader, which dissolves the
+        // single-seam property the whole design rests on.
+        //
+        // Bindings 17/18 in BOTH simBGL_ and simSlimBGL_, not 17/18 here and
+        // 5/6 there: one WGSL identifier cannot carry two binding numbers
+        // across modules that share common.wgsl, and 5/6 are already taken in
+        // simBGL_ (PassParams, brush ops). The slim group therefore stops
+        // being a dense prefix and becomes 0..4 + 17..18, which Vulkan is
+        // perfectly happy with — sparse binding numbers are legal, and
+        // maxPerStageDescriptorStorageBuffers here is 1,048,576.
+        //
+        // The consequence §5.2a wanted still holds and is now deliberate
+        // rather than lucky: any pipeline built on simSlimBGL_ inherits
+        // translation, which is how worldgen:fardown (on farPL_) gets it.
+        entry(17, T::ReadOnlyStorage), // pageTable
+        entry(18, T::Storage),         // pageFaults (atomic counter)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
-    // slim group 0 (bindings 0..4 only) for particle/explosion pipelines:
-    // pairing the full simBGL_ with particleBGL_ would exceed the
-    // 16-storage-buffer per-stage layout limit
+    // slim group 0 for the particle/explosion/far pipelines: bindings 0..4
+    // plus the two page buffers at 17/18, which must keep the SAME binding
+    // numbers they have in simBGL_ (see the note above). Those pipelines
+    // genuinely do not need the other 12 bindings.
     rhi::BindGroupLayoutEntry sentries[] = {
         entry(0, T::Storage),          // voxels
         entry(1, T::Storage),          // dirtyIn
         entry(2, T::Storage),          // dirtyOut
         entry(3, T::ReadOnlyStorage),  // materials
         entry(4, T::Uniform),          // TickParams
+        entry(17, T::ReadOnlyStorage), // pageTable
+        entry(18, T::Storage),         // pageFaults
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -151,6 +175,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // shader usage (see the simSlimBGL_ comment).
         entry(7, T::ReadOnlyStorage, S::Fragment),               // microBricks
         entry(8, T::ReadOnlyStorage, S::Fragment),               // microPool
+        // Software page table (PLAN_page_table.md §5.2a). raymarch.wgsl does
+        // 17 raw voxel reads; under paging every one indexes the POOL with a
+        // SLOT-derived address and samples the wrong chunk wherever the target
+        // is a sentinel — the world would render as garbage while hashing
+        // perfectly, because the render path is outside the hashed domain and
+        // no determinism gate could catch it.
+        //
+        // ReadOnlyStorage, matching `voxels` at binding 0, and no pageFaults:
+        // the renderer must never write the world. microBodyBGL_ shares
+        // renderBGL_ as group 0 and inherits this for free — microbody.wgsl
+        // reads its own brick pool, not voxels, so it needs nothing itself.
+        entry(9, T::ReadOnlyStorage, S::Fragment),               // pageTable
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -246,6 +282,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(14, world_->cellOps),
         b(15, world_->support),
         b(16, world_->genList),
+        b(17, world_->pageTable),
+        b(18, world_->pageFaults),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -255,6 +293,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(2, world_->dirty[1 - page]),
         b(3, materialBuf_),
         b(4, world_->tickUBO),
+        b(17, world_->pageTable),
+        b(18, world_->pageFaults),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -293,6 +333,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(6, world_->farUBO),
         b(7, microTableBuf_),
         b(8, microPoolBuf_),
+        b(9, world_->pageTable),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -586,6 +627,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarOcc:         return world_->farOcc;
     case B::FarList:        return world_->farList;
     case B::FarUBO:         return world_->farUBO;
+    case B::PageTable:      return world_->pageTable;
+    case B::PageFaults:     return world_->pageFaults;
     default:                return world_->voxels;
   }
 }

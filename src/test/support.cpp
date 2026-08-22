@@ -289,4 +289,33 @@ uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {
   return n;
 }
 
+void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
+                    uint32_t count, uint32_t* out, const char* label) {
+  // One copy per RUN of consecutive resident slots whose pages are also
+  // consecutive, so the dense case (the identity map) is still exactly one
+  // copy of the whole range — which is what it was before paging.
+  uint32_t i = 0;
+  while (i < count) {
+    const uint64_t off = world.PageOffsetOfSlot(firstSlot + i);
+    if (off == World::kNoPage) {
+      // Sentinel: synthesize, through the same rule the shader uses.
+      const uint32_t w = SynthWord(world.PageEntryOfSlot(firstSlot + i));
+      uint32_t* dst = out + (size_t)i * kChunkVol;
+      for (uint32_t k = 0; k < kChunkVol; k++) dst[k] = w;
+      i++;
+      continue;
+    }
+    uint32_t run = 1;
+    while (i + run < count) {
+      const uint64_t nxt = world.PageOffsetOfSlot(firstSlot + i + run);
+      if (nxt != off + (uint64_t)run * kChunkVol * 4) break;
+      run++;
+    }
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels, off,
+                          out + (size_t)i * kChunkVol,
+                          (size_t)run * kChunkVol * 4, label);
+    i += run;
+  }
+}
+
 }  // namespace sandvox

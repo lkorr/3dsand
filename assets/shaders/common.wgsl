@@ -867,3 +867,138 @@ fn lateralDir(i : u32) -> vec2<i32> {
     default: { return vec2<i32>( 0,-1); }
   }
 }
+
+// ============================ PAGE TABLE ACCESSORS ==========================
+// docs/PLAN_page_table.md §2. THE SEAM: every world-coordinate voxel access in
+// every kernel routes through these, so no sim kernel's own code has to know
+// there is a page table (ROADMAP §1: "the CA is unaware of it"). That property
+// is not aspiration — it holds because sim_step.wgsl never names a buffer
+// offset it did not get from cellIndexW.
+//
+// STANDING OBLIGATION: a kernel that computes a `voxels[]` subscript by any
+// means other than these helpers bypasses the page table and reads physical
+// memory that may belong to another chunk. The three chunk-linear paths
+// (sim_occupancy's whole-chunk sweeps, worldgen's genChunk) use pageBaseOf
+// instead, which is the same resolve hoisted out of their inner loop.
+//
+// THIS BLOCK IS STRIPPED for shaders that do not address voxels (sim_compact,
+// debris, microbody, debug_lines) — see kPageBlockBegin in gpu/resources.cpp.
+// It is delimited rather than conditionally generated so that this file stays
+// the one place the translation is written.
+//
+// Integer-only throughout (rule 1): every operation is a u32 mask, shift,
+// compare or multiply-add. There is no arithmetic a compiler can contract or
+// reassociate into a different answer, and pageTable is READ-ONLY during a
+// dispatch — it is written only by CPU-driven fills between dispatches, never
+// by a sim kernel and never by an atomic. Two threads translating the same
+// address in the same dispatch get the same answer because the input did not
+// change. The page table is not sim state; it is dispatch-invariant
+// configuration.
+// >>>PAGE_TABLE_BEGIN<<<
+
+// The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):
+// bit-identical to what a materialized page holds, because the materializing
+// vkCmdFillBuffer pattern comes from this same rule (mirrored in C++ as
+// SynthWord in world.h, which the page-roundtrip gate asserts agrees).
+//
+// synthWord(PT_EMPTY) == 0u, and that is not a coincidence to rely on loosely:
+// it is why the empty case is free. An all-air materialized page is a
+// fillBuffer(0), which is what every buffer already gets at creation. Zero is
+// air by construction and always has been.
+//
+// STAMP_NEVER, not a live stamp: a sentinel chunk is by definition one that has
+// not been simulated in place, so every voxel in it must be free to act on the
+// first tick it is dispatched. A live stamp here would be the 0xFF-masked-to-7
+// bug correlated across a whole chunk.
+//
+// State nibble 0: a UNIFORM sentinel carries only 12 bits of material and
+// cannot represent a chunk whose cells differ in state, which is why promotion
+// is by WHOLE-WORD equality and never by material equality (§2.3, risk 3).
+fn synthWord(entry : u32) -> u32 {
+  let mat = entry & PT_MAT_MASK;
+  if (mat == MAT_AIR) { return 0u; }
+  return packVox(mat, 0u, STAMP_NEVER);
+}
+
+// The table entry for a slot chunk index. The three chunk-linear paths resolve
+// once with this and index their page directly, which is what they want anyway.
+fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
+
+// THE read accessor. Replaces every `voxels[cellIndexW(c)]` in a sim kernel.
+// Callers must have checked inWindow() first — that test is unchanged and
+// still the outer guard. A sentinel is a statement about a RESIDENT chunk's
+// contents; out-of-window is a statement about residency. Two different tests.
+fn voxWordAt(c : vec3<i32>) -> u32 {
+  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
+  let e = pageTable[chunkIndexOf(s)];
+  if ((e & PT_SENTINEL_BIT) != 0u) { return synthWord(e); }
+  let lo = s % CHUNK;
+  return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
+}
+
+// The ONLY way to obtain a WRITABLE word index. Returns PT_NO_WORD for a
+// sentinel chunk — which is a BUG at every sim call site, because §3
+// guarantees every chunk a kernel may write is materialized before dispatch.
+//
+// This is the invariant the whole phase rests on, and it is a SHAPE rather
+// than a rule to remember: there is no writable accessor that takes a
+// sentinel. The write accessor takes a physical word index, and the only way
+// to get one is a function that returns a distinguished no-word value.
+fn voxWordIndex(c : vec3<i32>) -> u32 {
+  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
+  let e = pageTable[chunkIndexOf(s)];
+  if ((e & PT_SENTINEL_BIT) != 0u) { return PT_NO_WORD; }
+  let lo = s % CHUNK;
+  return e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+}
+
+// Word index within a chunk-linear path: the page base for a slot plus a local
+// offset. Returns PT_NO_WORD for a sentinel, same contract as voxWordIndex.
+// This is the entry point for the three chunk-linear sites — sim_occupancy's
+// two whole-chunk sweeps and worldgen's genChunk — which already have the
+// chunk index in hand and want the resolve hoisted out of their inner loop.
+fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
+  let e = pageTable[chunkSlot];
+  if ((e & PT_SENTINEL_BIT) != 0u) { return PT_NO_WORD; }
+  return e * CHUNK_VOL + localIdx;
+}
+
+// The chunk-linear READ: the word at (chunkSlot, localIdx), synthesized when
+// the chunk is a sentinel. A branch rather than a select, because select
+// evaluates both arms and voxels[PT_NO_WORD] is an out-of-bounds subscript.
+fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
+  let e = pageTable[chunkSlot];
+  if ((e & PT_SENTINEL_BIT) != 0u) { return synthWord(e); }
+  return voxels[e * CHUNK_VOL + localIdx];
+}
+
+// >>>PAGE_TABLE_END<<<
+
+// ---- the WRITE half, for the read_write shaders only -----------------------
+// Split from the block above because raymarch.wgsl declares `voxels` as `read`
+// (it is the render path and must never write the world) and has no
+// `pageFaults` binding at all. A function that stores into `voxels` cannot
+// resolve there, so the renderer gets translation without the write path —
+// which is exactly the access the render path should have.
+// >>>PAGE_TABLE_WRITE_BEGIN<<<
+
+// Every sim write goes through this. A sentinel write is a NO-OP and is ALWAYS
+// counted — the counter is unconditional, permanently bound, and every gate
+// asserts it is zero (§5.1, user decision). The cost in a correct build is a
+// branch that never fires; the benefit is that "zero page faults" is a claim
+// the suite makes on EVERY run rather than in a special configuration, and
+// that there is exactly one bind-group layout and one pass_table.def.
+//
+// A sentinel write is a no-op, not an out-of-bounds store: PT_NO_WORD is not
+// an index into voxels, it is a value tested BEFORE indexing. The failure mode
+// is a lost voxel (bad, visible in the hash) rather than a corrupted stranger
+// (worse, invisible until it isn't). There is no harmless somewhere to write —
+// any physical index is some other chunk's voxel.
+fn voxStore(idx : u32, w : u32) {
+  if (idx == PT_NO_WORD) {
+    atomicAdd(&pageFaults[0], 1u);
+    return;
+  }
+  voxels[idx] = w;
+}
+// >>>PAGE_TABLE_WRITE_END<<<

@@ -364,7 +364,21 @@ int Run(Ctx& c, const Options& opt) {
   // turn the run red — a sync-validation message IS a barrier bug (§6.2).
   const size_t vkMsgs = c.ctx.ReportVkValidation("selftest");
 
-  if (!regressions.empty() || vkMsgs > 0) {
+  // Page faults, over the WHOLE suite (PLAN_page_table.md §2.4, §4.4). The
+  // counter is monotonic and unconditional, so this one read covers every gate
+  // that ran — it is what turns "a kernel can never write through a sentinel"
+  // from a structural claim into a measurement made on every run. Non-zero
+  // means some chunk a kernel wrote was not materialized before its dispatch,
+  // which is risk 1 and is always a bug.
+  uint32_t pageFaults = 0;
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.pageFaults, 0,
+                        &pageFaults, 4, "pageFaults");
+  std::printf("page faults over the suite: %u%s\n", pageFaults,
+              pageFaults == 0 ? " (a sentinel write is a lost voxel: 0 is the"
+                                " only acceptable value)"
+                              : "  *** SENTINEL WRITES LOST VOXELS ***");
+
+  if (!regressions.empty() || vkMsgs > 0 || pageFaults != 0) {
     if (!regressions.empty()) {
       std::printf("\nREGRESSIONS (%zu): ", regressions.size());
       for (size_t i = 0; i < regressions.size(); i++)
@@ -374,6 +388,10 @@ int Run(Ctx& c, const Options& opt) {
     if (vkMsgs > 0)
       std::printf("\nvulkan validation reported %zu message%s (see above)",
                   vkMsgs, vkMsgs == 1 ? "" : "s");
+    if (pageFaults != 0)
+      std::printf("\n%u page fault%s: a sim kernel wrote through a sentinel and"
+                  " the voxel was LOST (PLAN_page_table.md risk 1)",
+                  pageFaults, pageFaults == 1 ? "" : "s");
     std::printf("\n=== selftest FAIL ===\n");
     return 1;
   }

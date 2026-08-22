@@ -29,6 +29,8 @@
 // CPU to queue island checks (debris.cpp), never fed back into voxel state,
 // so determinism is unaffected (all writers store the same value 1).
 @group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
+@group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
 // Unloaded space is solid and inert (DESIGN.md §3): the sim's world edge is
 // the residency window, not a fixed cube.
@@ -51,7 +53,7 @@ fn flagSupportLoss(c : vec3<i32>, oldKlass : u32, newMat : u32) {
     if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
     let n = c + faceDir(i);
     if (!inBounds(n)) { continue; }
-    let nmat = voxMat(voxels[cellIndexW((n))]);
+    let nmat = voxMat(voxWordAt((n)));
     if (nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID) {
       atomicStore(&supportOut[chunkIndexW(n)], 1u);
       return;
@@ -101,17 +103,18 @@ fn canDisplace(myDensity : i32, rising : bool, tw : u32) -> bool {
 
 fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, rising : bool) -> bool {
   if (!inBounds(dst)) { return false; }
-  let di = cellIndexW((dst));
-  let tw = voxels[di];
+  let di = voxWordIndex((dst));
+  let tw = voxWordAt((dst));
   if (!canDisplace(myDensity, rising, tw)) { return false; }
   let stamp = stampFor(T.tick, P.substep);
   // Stain travels WITH the voxel, not with the cell: a stained pebble that
   // falls is still stained, and the air it left behind is not. Both sides of
   // the swap therefore carry their own source word's stain bits.
-  voxels[di] = packVoxKeepStain(voxMat(myWord), voxState(myWord), stamp, myWord);
+  voxStore(di, packVoxKeepStain(voxMat(myWord), voxState(myWord), stamp, myWord));
   // displaced fluid (or air) swaps into the source cell, stamped so it does
   // not act again this tick
-  voxels[cellIndexW((src))] = packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw);
+  voxStore(voxWordIndex((src)),
+           packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
   markDirty(src);
   markDirty(dst);
   // a powder sliding out from under a solid may leave it floating
@@ -125,8 +128,8 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
 fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
                   sf : u32, df : u32, t : u32) {
   let stamp = stampFor(T.tick, P.substep);
-  let si = cellIndexW((src));
-  let di = cellIndexW((dst));
+  let si = voxWordIndex((src));
+  let di = voxWordIndex((dst));
   // Stain and flowing liquid: the DESTINATION keeps its own stain, and the
   // source keeps its own. A liquid moving through a cell does not pick the
   // cell's stain up and carry it downstream — stain marks the SURFACE that was
@@ -137,11 +140,11 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   // A source cell that empties completely goes to 0 — full air, no stain. That
   // is deliberate: the stain belonged to the liquid that just left, and an
   // empty cell of air has no surface to hold it.
-  let sw = voxels[si];
-  let dw = voxels[di];
-  if (t >= sf) { voxels[si] = 0u; }
-  else { voxels[si] = packVoxKeepStain(mat, sf - t - 1u, stamp, sw); }
-  voxels[di] = packVoxKeepStain(mat, df + t - 1u, stamp, dw);
+  let sw = voxWordAt((src));
+  let dw = voxWordAt((dst));
+  if (t >= sf) { voxStore(si, 0u); }
+  else { voxStore(si, packVoxKeepStain(mat, sf - t - 1u, stamp, sw)); }
+  voxStore(di, packVoxKeepStain(mat, df + t - 1u, stamp, dw));
   markDirty(src);
   markDirty(dst);
 }
@@ -205,7 +208,7 @@ fn seesSky(c : vec3<i32>) -> bool {
   let n = c + vec3<i32>(0, 1, 0);
   // Left the window going up = open sky above.
   if (!inBounds(n)) { return true; }
-  let nmat = voxMat(voxels[cellIndexW(n)]);
+  let nmat = voxMat(voxWordAt(n));
   if (nmat == MAT_AIR) { return true; }
   // Translucent things (water, glass, smoke, steam) let light through; only a
   // ray blocker really shades the cell below it.
@@ -282,7 +285,7 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
     // rather than like more water.
     var hit = false;
     if (inBounds(n)) {
-      let nmat = voxMat(voxels[cellIndexW(n)]);
+      let nmat = voxMat(voxWordAt(n));
       // MAT_AIR has no Material entry worth matching on tags/class, so an
       // air neighbour only counts via an exact nbrMat == 0 predicate.
       if (nmat == MAT_AIR) { hit = rule.nbrMat == MAT_AIR; }
@@ -359,8 +362,8 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if ((rr % REACT_CHANCE_DEN) < chance) {
-        if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
-        else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
+        if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
+        else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
         markDirty(c);
         flagSupportLoss(c, m.klass, rule.prodSelf);  // ember->ash drops the wood above
         return true;
@@ -372,16 +375,16 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
-        let ni = cellIndexW((n));
-        if (voxMat(voxels[ni]) != MAT_AIR) { continue; }
+        let ni = voxWordIndex((n));
+        if (voxMat(voxWordAt((n))) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
         if ((rr % REACT_CHANCE_DEN) < rule.chance) {
-          voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp);
+          voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markDirty(n);
           markDirty(c);
           if (rule.prodSelf != PROD_KEEP) {
-            if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
-            else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
+            if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
+            else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
             flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
           }
@@ -395,22 +398,22 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
-        let ni = cellIndexW((n));
-        let nw = voxels[ni];
+        let ni = voxWordIndex((n));
+        let nw = voxWordAt((n));
         let nmat = voxMat(nw);
         if (nmat == MAT_AIR) { continue; }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
         keepAwake = keepAwake || !lightGated;
         if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           if (rule.prodNbr != PROD_KEEP) {
-            if (rule.prodNbr == 0u) { voxels[ni] = 0u; }
-            else { voxels[ni] = packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp); }
+            if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
+            else { voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
             markDirty(n);
             flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
           }
           if (rule.prodSelf != PROD_KEEP) {
-            if (rule.prodSelf == 0u) { voxels[idx] = 0u; }
-            else { voxels[idx] = packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp); }
+            if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
+            else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
             markDirty(c);
             flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
@@ -516,7 +519,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
 
   // This cell's own fullness, for the absorption debit below. Re-read rather
   // than passed in: a reaction earlier this tick may have rewritten it.
-  let selfWord = voxels[idx];
+  let selfWord = voxWordAt(c);
   let selfMat = voxMat(selfWord);
   let selfIsLiquid = materials[selfMat].klass == CLASS_LIQUID;
 
@@ -525,8 +528,17 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     let di = (i + rot) % 6u;
     let n = c + faceDir(di);
     if (!inBounds(n)) { continue; }
-    let ni = cellIndexW(n);
-    let nw = voxels[ni];
+    // TWO BASES, and conflating them is a silent desync (§4.1's rule applied
+    // to an RNG key rather than to the hash): `niSlot` is the SLOT cell index
+    // and is what the consumption roll below hashes on, so the RNG stream is a
+    // property of WHERE the cell is in the world and not of which page happens
+    // to hold it. `ni` is the physical word index and is only ever a memory
+    // address. Feeding a page index into hash3 would make the sim's random
+    // stream depend on allocation history — the world would still be
+    // self-consistent and would still diverge from a dense run.
+    let niSlot = cellIndexW(n);
+    let ni = voxWordIndex(n);
+    let nw = voxWordAt(n);
     let nmat = voxMat(nw);
     if (nmat == MAT_AIR) { continue; }
     // Don't stain other liquids or gases: a stain is something that soaks into
@@ -571,7 +583,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
       let washed = cur - 1u;
       var washedType = curType;
       if (washed == 0u) { washedType = 0u; }
-      voxels[ni] = (nw & ~STAIN_BITS) | packStain(washedType, washed);
+      voxStore(ni, (nw & ~STAIN_BITS) | packStain(washedType, washed));
       markDirty(n);
       markDirty(c);
       break;
@@ -595,7 +607,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     } else if (curType == stainType) {
       amt = min(cur + addAmt, ceiling);
     }
-    voxels[ni] = (nw & ~STAIN_BITS) | packStain(stainType, amt);
+    voxStore(ni, (nw & ~STAIN_BITS) | packStain(stainType, amt));
     markDirty(n);
 
     // ---- absorption: the liquid SPENDS itself soaking in ----
@@ -618,9 +630,9 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     if (capacity > 0u && selfIsLiquid && amt > cur) {
       let sf = voxState(selfWord) + 1u;  // fullness 1..8
       if (sf <= 1u) {
-        voxels[idx] = 0u;                // last eighth soaked in — gone
+        voxStore(idx, 0u);               // last eighth soaked in — gone
       } else {
-        voxels[idx] = packVoxKeepStain(selfMat, sf - 2u, stamp, selfWord);
+        voxStore(idx, packVoxKeepStain(selfMat, sf - 2u, stamp, selfWord));
       }
     }
 
@@ -628,9 +640,9 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     // DIFFERENT slice of the hash than the stain roll, so the two are
     // independent — reusing the same bits would correlate "stained" with
     // "consumed" and every stain would either always or never eat.
-    let croll = hash3(rnd, 0x51A17u, ni) % 1000u;
+    let croll = hash3(rnd, 0x51A17u, niSlot) % 1000u;
     if (croll < matStainConsume(m)) {
-      voxels[ni] = 0u;
+      voxStore(ni, 0u);
       // The voxel that vanished may have been holding a solid up.
       flagSupportLoss(n, nk, MAT_AIR);
     }
@@ -657,7 +669,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   // 1) down: a partial same-liquid cell to top up, or anything displaceable.
   let below = c + vec3<i32>(0, -1, 0);
   if (inBounds(below)) {
-    let bw = voxels[cellIndexW(below)];
+    let bw = voxWordAt(below);
     if (voxMat(bw) == mat) {
       if (voxState(bw) + 1u < 8u) { return true; }
     } else if (canDisplace(m.density, false, bw)) {
@@ -670,7 +682,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
     let d = lateralDir(i);
     let n = c + vec3<i32>(d.x, -1, d.y);
     if (!inBounds(n)) { continue; }
-    if (canDisplace(m.density, false, voxels[cellIndexW(n)])) { return true; }
+    if (canDisplace(m.density, false, voxWordAt(n))) { return true; }
   }
 
   // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
@@ -679,7 +691,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
     let d = lateralDir(i);
     let n = c + vec3<i32>(d.x, 0, d.y);
     if (!inBounds(n)) { continue; }
-    let nw = voxels[cellIndexW(n)];
+    let nw = voxWordAt(n);
     let nmat = voxMat(nw);
     if (nmat == mat) {
       if (voxState(nw) + 1u + TUNE_LIQUID_EQUALIZE <= f) { return true; }
@@ -699,7 +711,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   // 1) below: fill a partial same-liquid cell, else whole-cell move/swap
   let below = c + vec3<i32>(0, -1, 0);
   if (inBounds(below)) {
-    let bw = voxels[cellIndexW((below))];
+    let bw = voxWordAt((below));
     let bmat = voxMat(bw);
     if (bmat == mat) {
       let bf = voxState(bw) + 1u;
@@ -727,7 +739,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     let d = lateralDir(i + r2);
     let n = c + vec3<i32>(d.x, 0, d.y);
     if (!inBounds(n)) { continue; }
-    let nw = voxels[cellIndexW((n))];
+    let nw = voxWordAt((n));
     let nmat = voxMat(nw);
     if (nmat == mat) {
       let nf = voxState(nw) + 1u;
@@ -767,14 +779,22 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (local.x >= i32(CHUNK) || local.y >= i32(CHUNK) || local.z >= i32(CHUNK)) { return; }
   let c = base + local;  // world cell this thread acts on
 
-  let idx = cellIndexW(c);
-  let w = voxels[idx];
+  // TWO BASES (§4.1). `slotIdx` is the SLOT cell index and keys the per-cell
+  // RNG below; `idx` is the physical word index and is only a memory address.
+  // Under the identity map they are equal, which is why commit 1 could
+  // introduce the split while it cannot differ — but keying the RNG on a page
+  // index would make every cell's random stream a function of allocation
+  // history, and a paged run would diverge from a dense one with no other
+  // symptom.
+  let slotIdx = cellIndexW(c);
+  let idx = voxWordIndex(c);
+  let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return; }
   if (voxStamp(w) == stampFor(T.tick, P.substep)) { return; }  // already acted this substep
 
   let m = materials[mat];
-  let rnd = hash3(T.seed, T.tick * 2u + P.substep, idx);
+  let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
   if (P.substep == 0u && m.reactCount > 0u) {
@@ -790,7 +810,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     // Absorption can have emptied this cell (the liquid soaked away) or docked
     // its fullness and stamped it. Re-read before the movement code below acts
     // on a stale word: moving an already-spent eighth would create mass.
-    let after = voxels[idx];
+    let after = voxWordAt(c);
     if (voxMat(after) == MAT_AIR) { return; }
     if (voxStamp(after) == stampFor(T.tick, P.substep)) { return; }
   }
@@ -821,7 +841,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   if (m.klass == CLASS_LIQUID) {
     // re-read: a reaction may have rewritten this cell's fullness
-    stepLiquid(c, idx, voxels[idx], mat, m, rnd);
+    stepLiquid(c, idx, voxWordAt(c), mat, m, rnd);
     return;
   }
 

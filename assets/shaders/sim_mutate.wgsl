@@ -18,6 +18,8 @@ struct CellOp {
   word    : u32,
 };
 @group(0) @binding(14) var<storage, read> cellOps : array<CellOp>;
+@group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
@@ -56,27 +58,30 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let c = vec3<i32>(op.cx, op.cy, op.cz) + local;
   if (!inBounds(c)) { return; }
 
-  let idx = cellIndexW(c);
-  if (op.mode == 0u && voxMat(voxels[idx]) != MAT_AIR) { return; }  // paint fills air only
+  // TWO BASES (§4.1): slotIdx keys the palette-variant RNG, idx addresses
+  // memory. See the note in sim_step:main.
+  let slotIdx = cellIndexW(c);
+  let idx = voxWordIndex(c);
+  if (op.mode == 0u && voxMat(voxWordAt(c)) != MAT_AIR) { return; }  // paint fills air only
 
   var mat = op.material;
   if (op.mode == 2u) {
     // melt (laser, PLAN §C1): each cell converts to ITS OWN molten product
     // from the material table — stone becomes lava while the sand next to it
     // becomes molten glass. Air stays air, 255-hardness matter is immune.
-    let cur = voxMat(voxels[idx]);
+    let cur = voxMat(voxWordAt(c));
     if (cur == MAT_AIR || materials[cur].hardness >= 255u) { return; }
     mat = materials[cur].molten;
   }
 
-  let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, idx);
+  let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, slotIdx);
   // liquids are born full (their state nibble is fullness); everything else
   // gets a palette variant. STAMP_NEVER = "hasn't acted": falls this tick.
   var state = rnd % 3u;
   if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
     state = LIQ_FULL_STATE;
   }
-  voxels[idx] = packVox(mat, state, STAMP_NEVER);
+  voxStore(idx, packVox(mat, state, STAMP_NEVER));
   markBoth(c);
 }
 
@@ -90,16 +95,26 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   let op = cellOps[gid.x];
   if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
   var word = op.word;
-  // prefab paint mode: fill air only (flag is spare-bit metadata, never stored)
-  if ((word & CELLOP_IF_AIR) != 0u) {
-    if (voxMat(voxels[op.cellIdx]) != MAT_AIR) { return; }
-    word &= ~CELLOP_IF_AIR;
-  }
-  voxels[op.cellIdx] = word;
-
-  // cellIdx is a SLOT index: reconstruct the world cell through the window
+  // cellIdx is a SLOT index, so under paging it is NOT a physical word index
+  // (§5.5). Decompose it — which this entry point already did below, to
+  // reconstruct the world cell for markBoth — and translate through the table.
+  // The same decomposition the CPU uses to build the materialization set is
+  // the one the shader uses to index the table, which is the point.
   let ci = op.cellIdx / CHUNK_VOL;
   let lo = op.cellIdx % CHUNK_VOL;
+  let wordIdx = voxWordInChunk(ci, lo);
+  // prefab paint mode: fill air only (flag is spare-bit metadata, never stored)
+  //
+  // Reading a sentinel HERE is legal and correct: a paint-into-air op against
+  // an EMPTY chunk should see air and proceed. That it can proceed is the
+  // CPU's obligation — §3.3 materializes every op target unfiltered, precisely
+  // so a brush into open sky is not silently a no-op.
+  if ((word & CELLOP_IF_AIR) != 0u) {
+    if (voxMat(voxWordInChunkAt(ci, lo)) != MAT_AIR) { return; }
+    word &= ~CELLOP_IF_AIR;
+  }
+  voxStore(wordIdx, word);
+
   let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
                                ci / (NCHUNK * NCHUNK)));
   let l = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));

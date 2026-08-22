@@ -119,13 +119,15 @@ PASS(fill_hash, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, 
 // D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
 // tick's counts at record time (see PassDispatchExtent in pass_table.cpp).
 PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUTE, D_OPS,4,4,   GRP_SIM,       DYN_ZERO, C_OPS, 1,
-     USES(R(Materials) U(TickUBO) R(OpsBuf) RW(Voxels) A(DirtyIn) A(DirtyOut)))
+     USES(R(Materials) U(TickUBO) R(OpsBuf) RW(Voxels) A(DirtyIn) A(DirtyOut)
+          R(PageTable) A(PageFaults)))
 // No R(Materials): `cells` writes the authored word straight into the grid and
 // never consults the material table (unlike `main`, which does). The barrier
 // doc's T11 row lists materials; the rooted walk says otherwise and the walk is
 // right — check_pass_table.py caught this.
 PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_COMPUTE, D_CELLS,1,1, GRP_SIM,       DYN_ZERO, C_CELLS, 1,
-     USES(U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)))
+     USES(U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)
+          R(PageTable) A(PageFaults)))
 // mark reads the neighborhood, apply writes it. The two-phase split is what
 // makes the explosion kernel race-free (CLAUDE.md build gotchas); it only works
 // if the barrier between them exists, which under Dawn was free.
@@ -133,12 +135,13 @@ PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_C
 // writes it; `mark` is the pure-read half of that split and must stay so — a
 // kernel that both reads and writes this neighborhood races itself.
 PASS(explodeMark, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_MARK, K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) R(ExpOps) W(ExpMask) A(DirtyIn) A(DirtyOut)))
+     USES(R(Voxels) R(Materials) U(TickUBO) R(ExpOps) W(ExpMask) A(DirtyIn) A(DirtyOut)
+          R(PageTable)))
 // read-only in practice: `expMask` is read_write for the module because `mark`
 // writes it. `apply` consumes the mask `mark` produced and never amends it.
 PASS(explodeApply, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_APPLY,K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
      USES(R(Materials) U(TickUBO) R(ExpOps) R(ExpMask) RW(Voxels) A(DirtyIn) A(DirtyOut)
-          A(ParticleCounts) W(ParticlesRead)))
+          A(ParticleCounts) W(ParticlesRead) R(PageTable) A(PageFaults)))
 // CPU particle spawns (debris shatter) append to the READ page here, before
 // args1 sizes the integrate dispatch — same page explosion ejecta uses.
 PASS(particleSpawn, "prep(mutate+explode+compact)", PT_TICK, PIPE_P_SPAWN,     K_COMPUTE, D_SPAWN,1,1,GRP_SLIM_PART, DYN_NONE, C_SPAWN, 1,
@@ -169,7 +172,7 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // access modes for one binding across the module's entry points.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_ALWAYS, 54,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyList) I(DispatchArgs)
-          RW(Voxels) A(DirtyOut) A(Support)))
+          RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)))
 
 // ---- phase 4: particles ---------------------------------------------------
 // Runs after the CA so flights see settled ground. Grid writes land in
@@ -188,7 +191,7 @@ PASS(copy_pArgs_pDispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NO
 PASS(particleIntegrate, "particleIntegrate+args2", PT_TICK, PIPE_P_INTEGRATE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) RW(ParticlesRead) I(PDispatchArgs)
-          W(ParticlesWrite) A(ParticleCounts) A(Claim)))
+          W(ParticlesWrite) A(ParticleCounts) A(Claim) R(PageTable)))
 PASS(particleArgs2, "particleIntegrate+args2", PT_TICK, PIPE_P_ARGS2, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
 // This second copy overwrites the args the integrate dispatch above FETCHED —
@@ -201,13 +204,13 @@ PASS(copy_pArgs_drawArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,16, GRP_NONE,
 PASS(particleResolve, "particleResolve", PT_TICK, PIPE_P_RESOLVE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Materials) U(TickUBO) A(Claim) A(ParticleCounts) I(PDispatchArgs)
-          RW(Voxels) RW(ParticlesWrite) A(DirtyOut)))
+          RW(Voxels) RW(ParticlesWrite) A(DirtyOut) R(PageTable) A(PageFaults)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash)))
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))
 PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
-     USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick)))
+     USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -224,9 +227,10 @@ PASS(copy_argsStage_dispatchArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, 
 // entry points, which do write it.
 PASS(occupancyDirty, "occupancyDirty+pick", PT_TICK, PIPE_OCCUPANCY_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
-     USES(R(Voxels) R(Materials) R(DirtyList) I(DispatchArgs) W(Occupancy)))
+     USES(R(Voxels) R(Materials) R(DirtyList) I(DispatchArgs) W(Occupancy)
+          R(PageTable)))
 PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
-     USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick)))
+     USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
 // Far-field phase 2: downsample the same compacted dirtyOut list into the
 // cascades, so edits stay visible after the player walks away (render-only
 // derived data — DESIGN.md §9). Rides the SAME indirect args as the occupancy
@@ -242,7 +246,7 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc)))
+          A(FarVox) A(FarOcc) R(PageTable)))
 
 // ========================================================= PT_WORLDGEN =====
 // Simulation::EncodeWorldgen. barrier_graph §2.5.1. The fills of dirty[0]/[1]
@@ -265,7 +269,8 @@ PASS(wg_fill_drawArgs, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE,
      USES(TW(DrawArgs)))
 // one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
 PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
-     USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)))
+     USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
+          R(PageTable) A(PageFaults)))
 
 // ========================================================== PT_GENLIST =====
 // Simulation::EncodeGenList — its own encoder, submitted MID-FRAME between
@@ -277,7 +282,8 @@ PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, 
 // head-of-command-buffer global barrier, not by anything in this row.
 PASS(worldgenList, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
      GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
-     USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)))
+     USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
+          R(PageTable) A(PageFaults)))
 
 // ======================================================== PT_LOADRESET =====
 // Simulation::EncodeLoadReset. barrier_graph §2.5.3: clears transient state
@@ -296,7 +302,7 @@ PASS(lr_fill_drawArgs, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE
      USES(TW(DrawArgs)))
 PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash)))
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))
 
 // ========================================================= PT_HASHONLY =====
 // Simulation::EncodeHashOnly — standalone whole-world hash pass (save/load
@@ -305,7 +311,7 @@ PASS(ho_fill_hash, nullptr, PT_HASHONLY, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN
      USES(TW(Hash)))
 PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash)))
+     USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))
 
 // ========================================================== PT_FARFILL =====
 // Simulation::EncodeFarFill. Encoded into the tick's command buffer AFTER

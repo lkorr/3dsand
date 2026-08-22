@@ -167,10 +167,27 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       // written only by previous submits (the head barrier covers that), but
       // declaring the read keeps every off-table voxels copy on the same
       // tracker path (barrier_graph §8) rather than special-casing this one.
-      enc.CopyTracked(pass::Buf::Voxels, world_->voxels,
-                      (uint64_t)toSave[off + i].first * kChunkBytes,
-                      p.staging, i * kChunkBytes, kChunkBytes);
+      //
+      // THE CPU SEAM (§2.1a): the source offset resolves through
+      // PageOffsetOfSlot, never through slot * kChunkBytes. Getting this wrong
+      // saves the WRONG CHUNK to disk, silently and permanently.
+      //
+      // §4.2's fast path for a sentinel slot is therefore not an optimization
+      // but MANDATORY: there is nothing to copy, because the CPU already knows
+      // the chunk's entire content from the table entry and synthesizes its
+      // RLE directly (see the sentinel branch in CompleteOldest). That also
+      // removes the largest single source of streaming traffic on a shift
+      // plane that is mostly sky — and it drops the copy from the tracked
+      // path, which is why the recorded copy count moves (§5.6).
+      const uint64_t srcOff = world_->PageOffsetOfSlot(toSave[off + i].first);
       p.items.push_back(toSave[off + i].second);
+      p.sentinel.push_back(srcOff == World::kNoPage
+                               ? world_->PageEntryOfSlot(toSave[off + i].first)
+                               : 0u);
+      if (srcOff != World::kNoPage) {
+        enc.CopyTracked(pass::Buf::Voxels, world_->voxels, srcOff, p.staging,
+                        i * kChunkBytes, kChunkBytes);
+      }
       pendingChunks_[World::PackChunkKey(toSave[off + i].second.wc)]++;
     }
     // Submit BEFORE FillSlots writes, so the copy reads the leaving plane's
@@ -220,7 +237,18 @@ void Stream::CompleteOldest(bool discard) {
         std::vector<uint32_t> data(kChunkVol);
         std::vector<uint32_t> rle;
         for (size_t i = 0; i < p.items.size(); i++) {
-          std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
+          // A sentinel slot was never copied (§4.2's mandatory fast path): the
+          // CPU already knows its whole content from the table entry, so the
+          // RLE is synthesized directly. RLE compresses a uniform chunk to a
+          // single {4096, w} pair anyway, so a sentinel chunk and a
+          // materialized uniform chunk produce BYTE-IDENTICAL RLE — which is
+          // what makes the save format need no change at all (§4.2).
+          const uint32_t e = i < p.sentinel.size() ? p.sentinel[i] : 0u;
+          if (e != 0u) {
+            std::fill(data.begin(), data.end(), SynthWord(e));
+          } else {
+            std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
+          }
           RleEncodeChunk(data.data(), rle);
           bool air = rle.size() == 2 && rle[1] == 0;
           if (air && p.items[i].dropIfAir) continue;
@@ -256,8 +284,11 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       CompleteOldest(/*discard=*/false);
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
-      ctx_->queue.WriteBuffer(world_->voxels, (uint64_t)s * kChunkBytes,
-                              data.data(), kChunkBytes);
+      // THE CPU SEAM (§2.1a): without translation this writes the decoded RLE
+      // into ANOTHER chunk's page. In commit 1 the identity map makes it the
+      // same address; the resolve is introduced here while it cannot differ.
+      const uint64_t dstOff = world_->PageOffsetOfSlot(s);
+      ctx_->queue.WriteBuffer(world_->voxels, dstOff, data.data(), kChunkBytes);
       uint32_t occ = 0, blockers = 0;
       for (uint32_t w : data) {
         uint32_t m = w & 0xFFFu;

@@ -72,6 +72,21 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
 
+# Software page table (docs/PLAN_page_table.md §2.2). Same rule as every other
+# world constant: world.h is the source, this script scrapes it. PT_EMPTY is
+# PT_SENTINEL_BIT | kMatAir and kMatAir is 0, so it needs no separate scrape —
+# EMPTY being UNIFORM(air) is the design, not a coincidence.
+W_PTSENT="$(cpp_const_hex kPtSentinelBit)"
+W_PTMAT="$(cpp_const_hex kPtMatMask)"
+W_PTPAGE="$(cpp_const_hex kPtPageMask)"
+W_PTUNRES="$(cpp_const_hex kPtUnresident)"
+W_PTNOWORD="$(cpp_const_hex kPtNoWord)"
+if [ -z "$W_PTSENT" ] || [ -z "$W_PTMAT" ] || [ -z "$W_PTPAGE" ] \
+   || [ -z "$W_PTUNRES" ] || [ -z "$W_PTNOWORD" ]; then
+  echo "check_shaders: cannot parse kPt* page-table constants from $WORLD_H" >&2
+  exit 1
+fi
+
 # Stain palette base — kStainPaletteBase is defined as an expression in world.h
 # (kMaterialSlots - 8), so scrape the slot count and redo the arithmetic here
 # rather than trying to parse the expression.
@@ -127,6 +142,12 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_MASK : i32 = $((W_N - 1));" \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
+  "const PT_SENTINEL_BIT : u32 = ${W_PTSENT}u;" \
+  "const PT_MAT_MASK : u32 = ${W_PTMAT}u;" \
+  "const PT_EMPTY : u32 = ${W_PTSENT}u;" \
+  "const PT_PAGE_MASK : u32 = ${W_PTPAGE}u;" \
+  "const PT_UNRESIDENT : u32 = ${W_PTUNRES}u;" \
+  "const PT_NO_WORD : u32 = ${W_PTNOWORD}u;" \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
   "const ART_PALETTE_BASE : u32 = ${W_ARTBASE}u;" \
   "const ART_SLOT_MIN : u32 = ${W_ARTSLOTMIN}u;" \
@@ -185,8 +206,31 @@ for f in "${FILES[@]}"; do
 
   [ -f "$f" ] || { echo "check_shaders: no such file: $f" >&2; failed=1; continue; }
 
+  # common.wgsl's page-table accessor block references voxels/pageTable/
+  # pageFaults, which only the shaders that address voxels declare. LoadShader
+  # (gpu/resources.cpp, StripPageBlock) blanks it for the others; do the same
+  # here, blanking the lines rather than deleting them so OFFSET stays exact.
+  # Two blocks: the READ half needs voxels + pageTable, the WRITE half also
+  # needs voxels to be read_write and needs pageFaults. raymarch has the first
+  # and not the second.
+  commonSrc="$COMMON"
+  stripRead=0; stripWrite=0
+  grep -q '> voxels' "$f" || { stripRead=1; stripWrite=1; }
+  grep -q 'read_write> voxels' "$f" || stripWrite=1
+  if [ "$stripRead" -eq 1 ] || [ "$stripWrite" -eq 1 ]; then
+    commonSrc="$TMP/common_${name}"
+    awk -v sr="$stripRead" -v sw="$stripWrite" '
+      /PAGE_TABLE_WRITE_BEGIN/ { print; s = sw; next }
+      /PAGE_TABLE_WRITE_END/   { print; s = 0;  next }
+      /PAGE_TABLE_BEGIN/       { print; s = sr; next }
+      /PAGE_TABLE_END/         { print; s = 0;  next }
+      s                        { print ""; next }
+      { print }
+    ' "$COMMON" > "$commonSrc"
+  fi
+
   combined="$TMP/$name"
-  { printf '%s\n\n' "$PRELUDE_TEXT"; cat "$COMMON"; printf '\n'; cat "$f"; } > "$combined"
+  { printf '%s\n\n' "$PRELUDE_TEXT"; cat "$commonSrc"; printf '\n'; cat "$f"; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.
   # (`-f none` is advertised in --help but rejected by this build.) A missing

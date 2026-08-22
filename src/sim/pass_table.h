@@ -62,6 +62,22 @@ enum class Buf : uint8_t {
   FarOcc,
   FarList,
   FarUBO,
+  // ---- the software page table (docs/PLAN_page_table.md §5.1) ----
+  // PageTable is READ by every row whose entry point touches a voxel and
+  // written by nothing on the tick path — it is dispatch-invariant
+  // configuration, not sim state.
+  //
+  // PageFaults is permanent, always-bound and UNCONDITIONAL: no PAGE_ASSERT
+  // prelude flag, no conditional binding, no #if in the .def. It gets an
+  // A(PageFaults) use on every row that can call voxStore. The atomic
+  // increment sits on a branch never taken in a correct build, so its
+  // production cost is a branch that never fires — and in exchange there is
+  // ONE bind-group layout, ONE .def, and no configuration under which the
+  // pass table and the shaders disagree. A conditionally-declared binding
+  // would be two layouts that must agree, which is the shape this repo has a
+  // checker to prevent.
+  PageTable,
+  PageFaults,
   kCount,
 };
 
@@ -162,7 +178,11 @@ enum class DispatchSel : uint32_t {
 // Max `uses` entries on any row. Asserted against the widest row at compile
 // time in pass_table.cpp, so growing a row past this fails the build rather
 // than silently truncating a hazard.
-inline constexpr int kMaxUses = 10;
+// Raised 10 -> 12 by the page table (PLAN_page_table.md §5.3): `ca` goes
+// 9 -> 10 with R(PageTable) -> 11 with A(PageFaults), which exceeded the old
+// ceiling and stopped the build, as the static_assert is meant to. Raised to
+// 12 rather than 11 so the next row addition does not repeat it.
+inline constexpr int kMaxUses = 12;
 
 struct Row {
   const char* name;

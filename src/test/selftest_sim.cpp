@@ -171,21 +171,16 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     }
     std::printf("\n");
     // material histogram of the first awake chunks
-    rhi::Buffer vstage = CreateBuffer(ctx.device, kChunkVol * 4 * 4,
-                                       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                       "voxRead");
-    rhi::CommandEncoder e2 = ctx.device.CreateCommandEncoder();
-    for (int k = 0; k < 4 && k < (int)awake.size(); k++)
-      e2.CopyBufferToBuffer(world.voxels, (uint64_t)awake[k] * kChunkVol * 4, vstage,
-                            (uint64_t)k * kChunkVol * 4, kChunkVol * 4);
-    ctx.queue.Submit(e2.Finish());
     uint32_t hist[64] = {};
     {
-      std::vector<uint32_t> v_((kChunkVol * 4 * 4) / 4, 0);
-      rhi::ReadBufferBlocking(ctx.device, vstage, 0, v_.data(), (size_t)(kChunkVol * 4 * 4));
+      // Through the CPU seam (§2.1a) — one call per awake slot, since they are
+      // arbitrary slot indices rather than a contiguous range.
+      std::vector<uint32_t> v_((size_t)kChunkVol * 4, 0);
+      for (int k = 0; k < 4 && k < (int)awake.size(); k++)
+        ReadVoxelsSync(ctx, world, awake[k], 1,
+                       v_.data() + (size_t)k * kChunkVol, "voxRead");
       const uint32_t* v = v_.data();
-
-            for (uint32_t i = 0; i < kChunkVol * 4; i++) hist[std::min(v[i] & 0xFFFu, 63u)]++;
+      for (uint32_t i = 0; i < kChunkVol * 4; i++) hist[std::min(v[i] & 0xFFFu, 63u)]++;
     }
     std::printf("  first-4-chunk contents:");
     for (uint32_t m = 1; m < 64; m++)
@@ -282,14 +277,10 @@ bool pondOk = false;
   // blocking map each would be far slower than one copy.
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)vox.size() * 4;
-    rhi::Buffer st = CreateBuffer(ctx.device, bytes,
-                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                   "pondRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, st, 0, vox.data(), (size_t)(bytes));
+    // Through the CPU seam (§2.1a): sentinel slots are synthesized, so the
+    // result is a dense-looking snapshot in SLOT order and the
+    // World::SlotCellIndex indexing below is right in either residency mode.
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "pondRead");
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -435,14 +426,7 @@ bool evapOk = false;
 
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)vox.size() * 4;
-    rhi::Buffer st = CreateBuffer(ctx.device, bytes,
-                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                   "evapRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, st, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, st, 0, vox.data(), (size_t)(bytes));
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "evapRead");  // §2.1a
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -547,14 +531,7 @@ bool stainOk = false;
 
   std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)vox.size() * 4;
-    rhi::Buffer sb = CreateBuffer(ctx.device, bytes,
-                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                   "stainRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, sb, 0, vox.data(), (size_t)(bytes));
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "stainRead");  // §2.1a
   }
 
   // Count stained floor voxels, and check every stain in the world is
@@ -687,14 +664,7 @@ bool fullOk = false;
 
   std::vector<uint32_t> fv(kNumChunks * (size_t)kChunkVol);
   {
-    const uint64_t bytes = (uint64_t)fv.size() * 4;
-    rhi::Buffer sb = CreateBuffer(
-        ctx.device, bytes,
-        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "fullRead");
-    rhi::CommandEncoder e = ctx.device.CreateCommandEncoder();
-    e.CopyBufferToBuffer(world.voxels, 0, sb, 0, bytes);
-    ctx.queue.Submit(e.Finish());
-    rhi::ReadBufferBlocking(ctx.device, sb, 0, fv.data(), (size_t)(bytes));
+    ReadVoxelsSync(ctx, world, 0, kNumChunks, fv.data(), "fullRead");  // §2.1a
   }
   // Count landed blood and how much of it is at less than full fullness.
   // Blood FLOWS once it lands, and flowing splits a cell's fullness across

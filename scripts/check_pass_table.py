@@ -142,6 +142,8 @@ BUF_TO_WGSL = {
     "FarOcc": {"farOcc"},
     "FarList": {"farList"},
     "FarUBO": {"F"},
+    "PageTable": {"pageTable"},
+    "PageFaults": {"pageFaults"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -166,9 +168,14 @@ WRITE_ACCS = {"W", "RW", "A", "TW"}
 _SIM_GROUP0 = {
     "voxels", "dirtyIn", "dirtyOut", "materials", "T", "P", "ops", "occupancy",
     "worldHash", "pick", "R", "reactions", "dirtyList", "args", "cellOps",
-    "supportOut", "genList",
+    "supportOut", "genList", "pageTable", "pageFaults",
 }
-_SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T"}
+# The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
+# prefix any more. One WGSL identifier cannot carry two binding numbers
+# across modules that share common.wgsl, so pageTable/pageFaults keep the
+# same numbers here that they have in simBGL_ (PLAN_page_table.md §5.2).
+_SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
+                "pageTable", "pageFaults"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty"}

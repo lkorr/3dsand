@@ -1,5 +1,6 @@
 #include "gpu/resources.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -46,6 +47,23 @@ std::string ShaderConstantPrelude() {
   o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
   o << "const CELLOP_IF_AIR : u32 = 0x" << std::hex << kCellOpIfAir << std::dec
     << "u;\n";
+  // Software page table (docs/PLAN_page_table.md §2.2). One u32 per chunk SLOT:
+  // bit 31 clear = a page index into the physical pool, bit 31 set = a sentinel
+  // carrying a material id in bits 0..11. EMPTY is UNIFORM(air), so there is
+  // one sentinel decode path and "empty" is not a special case in the shader.
+  // PT_NO_WORD is not a valid word index — voxWordIndex returns it for a
+  // sentinel chunk and voxStore tests it before indexing.
+  o << "const PT_SENTINEL_BIT : u32 = 0x" << std::hex << kPtSentinelBit
+    << std::dec << "u;\n";
+  o << "const PT_MAT_MASK : u32 = 0x" << std::hex << kPtMatMask << std::dec
+    << "u;\n";
+  o << "const PT_EMPTY : u32 = 0x" << std::hex << kPtEmpty << std::dec << "u;\n";
+  o << "const PT_PAGE_MASK : u32 = 0x" << std::hex << kPtPageMask << std::dec
+    << "u;\n";
+  o << "const PT_UNRESIDENT : u32 = 0x" << std::hex << kPtUnresident << std::dec
+    << "u;\n";
+  o << "const PT_NO_WORD : u32 = 0x" << std::hex << kPtNoWord << std::dec
+    << "u;\n";
   // Stain palette: reserved material-table entries holding stain-type colours
   // (world.h). The renderer indexes materials[STAIN_PALETTE_BASE + type].
   o << "const STAIN_PALETTE_BASE : u32 = " << kStainPaletteBase << "u;\n";
@@ -82,6 +100,54 @@ std::string ShaderConstantPrelude() {
   return o.str();
 }
 
+// The page-table accessor block in common.wgsl references `voxels`,
+// `pageTable` and `pageFaults`, which only the shaders that address voxels
+// declare. WGSL resolves module-scope references whether or not the function is
+// reachable, so leaving the block in a shader that has no voxel bindings is a
+// compile error — hence the strip.
+//
+// Delimited rather than conditionally generated so common.wgsl stays the ONE
+// place the translation is written; this is a filter, not a second copy. The
+// predicate is "does the body declare `voxels`", read off the body itself
+// rather than kept as a list here, so adding a shader cannot desync a list.
+// scripts/check_shaders.sh does the same strip, and preserves the line count so
+// its error-line remapping stays exact.
+// Two blocks, because the two capabilities have different prerequisites:
+// the READ half needs `voxels` + `pageTable`, the WRITE half additionally
+// needs `voxels` to be read_write and needs `pageFaults`. raymarch.wgsl has
+// the first and not the second, which is exactly the access the render path
+// should have.
+constexpr const char* kPageBlockBegin = ">>>PAGE_TABLE_BEGIN<<<";
+constexpr const char* kPageBlockEnd = ">>>PAGE_TABLE_END<<<";
+constexpr const char* kPageWriteBegin = ">>>PAGE_TABLE_WRITE_BEGIN<<<";
+constexpr const char* kPageWriteEnd = ">>>PAGE_TABLE_WRITE_END<<<";
+
+bool BodyAddressesVoxels(const std::string& body) {
+  return body.find("> voxels") != std::string::npos;
+}
+bool BodyWritesVoxels(const std::string& body) {
+  return body.find("read_write> voxels") != std::string::npos;
+}
+
+// Replace the block's contents with blank lines, so every shader sees
+// common.wgsl at the same length and a diagnostic's line number still maps.
+std::string StripBlock(const std::string& common, const char* beginTag,
+                       const char* endTag) {
+  size_t b = common.find(beginTag);
+  size_t e = common.find(endTag);
+  if (b == std::string::npos || e == std::string::npos || e < b) return common;
+  // Cut from the newline after the BEGIN marker's line to the start of the
+  // END marker's line, so both marker comments survive intact.
+  b = common.find('\n', b);
+  if (b == std::string::npos) return common;
+  size_t eLine = common.rfind('\n', e);
+  if (eLine == std::string::npos || eLine < b) return common;
+  size_t lines = (size_t)std::count(common.begin() + (long)b + 1,
+                                    common.begin() + (long)eLine + 1, '\n');
+  return common.substr(0, b + 1) + std::string(lines, '\n') +
+         common.substr(eLine + 1);
+}
+
 rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shaderDir,
                              const std::string& name) {
   std::string common, body;
@@ -92,6 +158,12 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
   if (!ReadFileText(shaderDir + "/" + name, body)) {
     std::fprintf(stderr, "cannot read %s/%s\n", shaderDir.c_str(), name.c_str());
     return {};
+  }
+  if (!BodyAddressesVoxels(body)) {
+    common = StripBlock(common, kPageBlockBegin, kPageBlockEnd);
+    common = StripBlock(common, kPageWriteBegin, kPageWriteEnd);
+  } else if (!BodyWritesVoxels(body)) {
+    common = StripBlock(common, kPageWriteBegin, kPageWriteEnd);
   }
   // Tuning constants sit between the world prelude and common.wgsl: they may
   // reference nothing, but common.wgsl and every shader body may reference

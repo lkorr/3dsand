@@ -109,6 +109,10 @@ class Stream {
       uint8_t dropIfAir;  // all-air + never modified => procgen reproduces it
     };
     std::vector<Item> items;
+    // Parallel to `items`: the page-table entry of a slot that was a SENTINEL
+    // at eviction time and therefore had NO copy issued (§2.1a / §4.2). 0 means
+    // a real copy landed in the staging buffer for that index.
+    std::vector<uint32_t> sentinel;
   };
 
   void ShiftAxis(int axis, int dir);

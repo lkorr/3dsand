@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
@@ -204,6 +205,80 @@ inline uint32_t PackVoxNew(uint32_t mat, uint32_t state) {
 // kPersistMask in stream.cpp are BOTH widened to cover them. Claiming them
 // means saying so here and in the common.wgsl allocation table.
 constexpr uint32_t kFreeBits = 0x00F80000u;
+
+// ---- the software page table (docs/PLAN_page_table.md) ---------------------
+// DERIVED DATA ONLY: the page table is a physical-layout index, not world
+// state. It is not hashed, not persisted, and not replicated. It is rebuilt
+// from the chunk contents on every load, stream-in and worldgen (§4.2).
+//
+// One u32 per CHUNK SLOT (not per world chunk coord — memory is slot-indexed
+// and never shifts, so the table shifts the way the voxels do, which is to say
+// not at all). Indexed by exactly what SlotChunkIndex / chunkIndexOf produce.
+//
+//   bit 31 = 0  RESIDENT.  bits 0..30 = PAGE INDEX into the physical pool.
+//   bit 31 = 1  SENTINEL.  bits 12..30 = tag (all zero today),
+//                          bits 0..11 = material id.
+//
+// EMPTY is UNIFORM(air): kPtEmpty == kPtSentinelBit | kMatAir with kMatAir 0,
+// so there is ONE sentinel decode path and "empty" is not a special case
+// anywhere in the shader. The material field shares the voxel word's material
+// position, so synthesizing a word from a sentinel is a mask, not a repack.
+//
+// These are mirrored into WGSL by ShaderConstantPrelude() (gpu/resources.cpp)
+// per the "world constants are generated from world.h, never redeclared in
+// WGSL" invariant — do not restate them in common.wgsl.
+constexpr uint32_t kPtSentinelBit = 0x80000000u;
+constexpr uint32_t kPtMatMask = 0x00000FFFu;
+constexpr uint32_t kPtEmpty = kPtSentinelBit | kMatAir;   // 0x80000000
+constexpr uint32_t kPtPageMask = 0x7FFFFFFFu;
+// A sentinel holding material 0xFFF — an id that cannot exist (ids are handed
+// out from the bottom, ~48 used, and the top entries are the inert stain/art
+// palettes). NOT used on the tick path: it is the poison value an entry holds
+// between "freed" and "rewritten", and a read through it synthesizes a
+// material whose table entry is zeroed — class 0 (solid), density 0. That is
+// deliberately VISIBLE: a translation bug shows up as a wall of impossible
+// solid rather than as silent air.
+constexpr uint32_t kPtUnresident = 0xFFFFFFFFu;
+// Not a valid word index. voxWordIndex() returns it for a sentinel chunk and
+// voxStore() tests for it BEFORE indexing, which is what makes "a kernel can
+// never write through a sentinel" a property of the signatures rather than of
+// anyone remembering a rule (§2.4).
+constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
+
+// Physical pages in the pool under --residency paged. 8,192 pages = 128 MiB,
+// a 1.65x headroom over the 4,974-page (77.7 MiB) measured steady state at the
+// default seed and a 4x reduction from dense's 32,768 pages / 512 MiB.
+//
+// The headroom is for: the materialization over-approximation (a 1-ring around
+// every dirty chunk), transient activity (an explosion fills chunks that were
+// sky), worldgen batching, and a different seed. Under the fatal-exhaustion
+// policy (§3.8) this number is SAFETY-CRITICAL rather than advisory — too
+// tight is a crash, too loose is wasted VRAM — so `--measure` reports the
+// high-water mark and the daylight-boundary and low-pool gates probe it.
+//
+// Note what 128 MiB is and is not: it is the RESERVED POOL, not resident
+// content. The comparable number to the 77.7 MiB measurement is
+// pagesInUse_ * 16 KiB, and conflating the two is how a phase claims a win it
+// did not get (§3.7).
+constexpr uint32_t kPoolPages = 8192;
+
+// The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):
+// it must be bit-identical to what a materialized page would hold, which is
+// guaranteed structurally — the materializing fill pattern, the shader read
+// accessor and the analytic hash branch all come from this one rule, mirrored
+// once into WGSL as synthWord(). synthWord(kPtEmpty) == 0.
+//
+// The state nibble is 0 and the stamp is kStampNever, both load-bearing:
+// a UNIFORM sentinel carries only 12 bits of material and so cannot represent
+// a chunk whose cells differ in state, which is why promotion is by WHOLE-WORD
+// equality and never by material equality (§2.3, risk 3). And a sentinel chunk
+// is by definition one that has not been simulated in place, so every voxel in
+// it must be free to act on the first tick it is dispatched.
+inline uint32_t SynthWord(uint32_t entry) {
+  const uint32_t mat = entry & kPtMatMask;
+  if (mat == kMatAir) return 0u;
+  return PackVoxNew(mat, 0u);
+}
 
 // ---- the stain layer (DESIGN.md §3) ----
 // Bits 24..30 of the voxel word: 4-bit amount, 3-bit type. EXACT mirror of the
@@ -492,6 +567,12 @@ struct WorldSnapshot {
   // One-shot: the GPU buffer is cleared after each copy. Feeds island checks.
   std::vector<uint8_t> supportFlags;
   std::vector<uint32_t> occupancy;    // per-slot non-air counts (streaming evict)
+  // Page faults since process start — voxStore()'s sentinel no-op path
+  // (PLAN_page_table.md §2.4). MONOTONIC and never cleared: a non-zero value is
+  // a permanent "this build has a bug" latch. Every gate asserts it is zero,
+  // which is what turns §2.4's structural claim into a measurement made on
+  // every run rather than in a special configuration.
+  uint32_t pageFaults = 0;
 };
 
 // One CPU-cached chunk of voxel data, fetched on demand through the async
@@ -552,6 +633,47 @@ class World {
     return u(wc.x) | (u(wc.y) << 21) | (u(wc.z) << 42);
   }
 
+  // ---- the page table: THE SECOND SEAM (PLAN_page_table.md §2.1a) ----------
+  //
+  // > Normative: any CPU path that computes a byte offset into `voxels` from a
+  // > slot index must resolve through PageOffsetOfSlot(slot). There is no other
+  // > way to address `voxels` from C++.
+  //
+  // The shader seam (voxWordAt / voxWordIndex in common.wgsl) covers every
+  // world-coordinate access in every kernel. It says nothing about C++ that
+  // computes `slot * kChunkBytes` — and every such site assumed slot s lives at
+  // s * 16 KiB, which is exactly the assumption paging deletes. The five sites
+  // are the chunk-fetch copy and the 3x3x3 mirror copy (world.cpp), eviction
+  // and store-hit refill (stream.cpp), and the selftest voxel dumps.
+  //
+  // The mirror is the worst of them, because its failure is invisible to
+  // everything else: it is CPU-only collision data, so a corrupted mirror is
+  // the player falling through the floor with a CORRECT world hash.
+
+  // Byte offset of slot `slot`'s page within `voxels`, or kNoPage if the slot
+  // is a sentinel and has no physical page. Callers must test.
+  static constexpr uint64_t kNoPage = ~(uint64_t)0;
+  uint64_t PageOffsetOfSlot(uint32_t slot) const {
+    const uint32_t e = pageTableCpu_[slot];
+    if ((e & kPtSentinelBit) != 0u) return kNoPage;
+    return (uint64_t)e * kChunkVol * 4;
+  }
+  // The raw table entry for a slot — for the paths that need to know WHICH
+  // sentinel (eviction synthesizing RLE, the mirror synthesizing words).
+  uint32_t PageEntryOfSlot(uint32_t slot) const { return pageTableCpu_[slot]; }
+
+  // Residency mode. `dense` is the identity map — page i for slot i — which
+  // makes every address bit-identical to pre-paging code while still running
+  // the whole translation path (the load, the branch, the multiply-add). It is
+  // the only live differential oracle the engine has now that Dawn is gone
+  // (§6.3), so it is load-bearing test infrastructure, not a fallback: never
+  // selected automatically, always available.
+  enum class Residency { Dense, Paged };
+  Residency residency = Residency::Dense;
+  uint32_t PoolPages() const {
+    return residency == Residency::Dense ? kNumChunks : kPoolPages;
+  }
+
   // ---- on-demand chunk fetches (island detection / terrain meshing) ----
   // Keyed by WORLD chunk coords: slots get recycled by streaming, world
   // chunks don't. Queue a chunk for CPU readback; duplicates are coalesced;
@@ -584,7 +706,21 @@ class World {
   // Deterministic worldgen height — exact CPU mirror of worldgen.wgsl.
   static int TerrainHeight(int x, int z, uint32_t seed);
 
-  rhi::Buffer voxels;      // kVoxelCount u32, chunk-major
+  rhi::Buffer voxels;      // the PHYSICAL PAGE POOL: PoolPages() * kChunkVol
+                            // u32. Under --residency dense this is kNumChunks
+                            // pages and the page table is the identity map, so
+                            // it is address-identical to the pre-paging dense
+                            // buffer. Never index it from a slot without going
+                            // through PageOffsetOfSlot (C++) or voxWordAt /
+                            // voxWordIndex (WGSL) — see the seam note below.
+  rhi::Buffer pageTable;   // kNumChunks u32, one per chunk SLOT. Derived data:
+                            // not hashed, not persisted, not replicated.
+  rhi::Buffer pageFaults;  // 4 u32 ([0] = the atomic counter). Permanently
+                            // bound and unconditional: voxStore() increments it
+                            // on the sentinel no-op path, every gate asserts it
+                            // is zero, and there is exactly ONE bind-group
+                            // layout and one pass_table.def rather than a
+                            // flag-dependent pair (PLAN_page_table.md §5.1).
   rhi::Buffer dirty[2];    // kNumChunks u32
   rhi::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
   rhi::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)
@@ -636,6 +772,11 @@ class World {
     uint32_t particleLivePage = 0;
     uint32_t tick = 0;
     std::vector<IVec3> fetchIds;  // world chunks riding this slot
+    // Sentinel slots are not copied at all (§2.1a); their table entry is
+    // recorded here at encode time and their 4,096 words are synthesized on
+    // consumption. 0 means "a real copy was issued for this index".
+    std::vector<uint32_t> fetchSentinel;
+    std::array<uint32_t, 27> mirrorSentinel{};
   };
   static constexpr int kSlots = 3;
   Slot slots_[kSlots];
@@ -646,4 +787,10 @@ class World {
   std::vector<IVec3> fetchQueue_;
   std::unordered_map<uint64_t, uint8_t> fetchQueued_;   // dedup (packed key)
   std::unordered_map<uint64_t, CachedChunk> cache_;     // packed world key
+
+  // CPU mirror of the page table — the authority for every C++ translation.
+  // The GPU buffer is written FROM this, never read back into it: the table is
+  // a pure function of CPU-side allocation history (§2.5), so a readback would
+  // be asking the GPU about a decision the CPU made.
+  std::vector<uint32_t> pageTableCpu_;
 };
