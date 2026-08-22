@@ -284,7 +284,6 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // Oil pond (260,300) and lava pool (220,520): the non-water liquid paths.
   // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
   // still render as a surface hit, untouched by any of the water work.
-  render({236, 80, 276}, 0.785f, -0.45f, "screenshot_oil.bmp");
   // SUBMERGED IN OIL. The generic per-liquid profile (submergedProfile) has to
   // be judged on a liquid that is NOT water, and oil is the far end of the
   // range: opacity 235 against water's 90. What this frame must show is a
@@ -306,6 +305,20 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
                  false, false);
     ctx.WaitIdle();
+    // The oil SURFACE, from just above it at a grazing angle. Moved inside this
+    // window-relocated block along with the submerged shot, and for the same
+    // reason: from the origin window the pool is FAR-FIELD, which shades a
+    // liquid as flat colour with no Fresnel, no reflection and no specular at
+    // all - the exact terms this frame exists to judge. Shot from out there it
+    // was a blurred grey haze.
+    //
+    // Grazing on purpose: oil's look is carried by the reflection and by a
+    // tight glint, both Fresnel-weighted, so a top-down view is the one angle
+    // where neither shows up. The camera has to sit just above the surface
+    // (y=68) and INSIDE the rim ring, which is raised to y=70 out at radius 42
+    // - anything beyond that is looking at the outside of a stone wall. The
+    // fluid disc is only 32 voxels across, so it sits close to the middle.
+    render({260 - 21, 70, 300 - 21}, 0.785f, -0.10f, "screenshot_oil.bmp");
     render({260, 60, 300}, 0.785f, 0.10f, "screenshot_oil_sub.bmp");
     // Restore the origin window: the lava/blood/micro shots below all assume
     // it, and a regen here would otherwise silently relocate every one of them.
