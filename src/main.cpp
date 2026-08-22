@@ -1063,67 +1063,21 @@ int main(int argc, char** argv) {
   // competing for the adapter while phase 3a is still headless.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
-  // --backend vulkan, phase 3b. THE VULKAN RENDER PATH DOES NOT EXIST: phase 4
-  // adds the swapchain, the six raster pipelines and imgui_impl_vulkan. So a
-  // request for the Vulkan backend in a mode that needs to present is refused
-  // with a message rather than silently served by Dawn — a quiet fallback would
-  // mean a run reported as "Vulkan" that was Dawn all along, which is exactly
-  // the kind of result that makes cross-backend evidence worthless.
-  //
-  // The one headless mode Vulkan can actually serve today is --vk-smoke, which
-  // drives the compute tables end to end and compares hashes against Dawn.
-  // `--selftest --backend vulkan` is REFUSED, and the refusal is the honest
-  // answer rather than a missing feature dressed up as one.
-  //
-  // The gates do not talk to a backend. They drive `World`, `Simulation`,
-  // `Stream`, `Physics` and `MobSystem`, and every GPU resource those own is an
-  // `rhi::` handle — `rhi::Buffer`, `rhi::Texture`, `rhi::ComputePipeline`. That
-  // seam has exactly ONE implementation: `rhi_dawn.cpp`, where every impl struct
-  // is a `wgpu::` holder (see rhi_dawn.h). A second implementation of the same
-  // handle types cannot coexist in one binary without making every one of them
-  // virtual, which is a restructure of the backend that is currently the port's
-  // only hash oracle. Phase 2a chose not to, deliberately, and phase 3 did not
-  // revisit it: `vk::SimBackend` is a parallel set of resource DECLARATIONS
-  // driven by the shared pass table, not an `rhi::` backend.
-  //
-  // So there is no way to hand a gate a Vulkan `World`. The options were:
-  //
-  //   (a) run the gates on Dawn and print "backend: vulkan" — a lie, and
-  //       precisely the failure mode the 3b refusal exists to prevent;
-  //   (b) skip every gate and report a green run of nothing;
-  //   (c) refuse, and say exactly what is missing.
-  //
-  // (c). What phase 3c DOES deliver as cross-backend evidence is
-  // `--vk-smoke-loud`, which drives the same tick chain the gates drive — ops,
-  // explosions, the particle chain, the readback ring, streaming — and compares
-  // world hashes against Dawn at 19 points. That is the determinism claim the
-  // selftest-on-Vulkan was wanted for; it just is not spelled `--selftest`.
-  if (selftest && backendVulkan) {
+  // --backend vulkan, phase 4a: the rhi:: seam is polymorphic, so the HEADLESS
+  // modes — --selftest, --measure, the smokes — run their real bodies against a
+  // Vulkan-backed World. Gates that need the render path (Gate::needsRender:
+  // screenshots, mob, perf) are SKIPPED with a printed reason, never silently
+  // passed — the render path (swapchain, raster pipelines, imgui_impl_vulkan)
+  // is phase 4b, and a windowed request is still refused rather than silently
+  // served by Dawn: a run reported as Vulkan that was Dawn all along is worse
+  // than no run.
+  if (backendVulkan && !selftest && !measure && !vkSmoke && !vkSmokeLoud) {
     std::fprintf(stderr,
-        "--selftest --backend vulkan is NOT AVAILABLE, and will not silently run\n"
-        "on Dawn.\n\n"
-        "Why: the gates drive World/Simulation/Stream/Physics, whose GPU\n"
-        "resources are rhi:: handles. rhi:: has one implementation (rhi_dawn.cpp,\n"
-        "every impl a wgpu:: holder), so there is no Vulkan World to hand a gate.\n"
-        "vk::SimBackend is a parallel set of resource declarations driven by the\n"
-        "shared pass table -- not an rhi:: backend. Making rhi:: polymorphic is a\n"
-        "phase-4/5 change, not a flag.\n\n"
-        "The cross-backend determinism evidence phase 3c does deliver:\n"
-        "    sandvox --vk-smoke-loud --vk-validation\n"
-        "which runs the same tick chain the gates run (brush + cell ops,\n"
-        "explosions, the full particle chain, the readback ring, an 8-shift\n"
-        "streaming walk) on BOTH backends and compares world hashes at 19 points.\n\n"
-        "    sandvox --selftest --list        shows which gates need the render\n"
-        "                                     path at all ([needs-render]).\n");
-    return 2;
-  }
-  if (backendVulkan && !vkSmoke && !vkSmokeLoud) {
-    std::fprintf(stderr,
-                 "--backend vulkan is HEADLESS-ONLY in phase 3c: the Vulkan render\n"
-                 "path (swapchain, raster pipelines, ImGui) is phase 4.\n"
+                 "--backend vulkan cannot present until phase 4b (render path).\n"
                  "Use it with a headless mode:\n"
-                 "    sandvox --backend vulkan --vk-smoke\n"
-                 "    sandvox --backend vulkan --vk-smoke-loud\n"
+                 "    sandvox --selftest --backend vulkan     (needsRender gates skip)\n"
+                 "    sandvox --measure  --backend vulkan\n"
+                 "    sandvox --vk-smoke / --vk-smoke-loud    (cross-backend hashes)\n"
                  "Add --vk-validation for synchronization validation, and\n"
                  "--barriers=sledgehammer for the barrier A/B oracle.\n");
     return 2;
@@ -1213,7 +1167,9 @@ int main(int argc, char** argv) {
   }
 
   GpuContext ctx;
-  if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure))
+  if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure,
+                backendVulkan ? rhi::BackendKind::Vulkan : rhi::BackendKind::Dawn,
+                vkValidation, sledgehammer))
     return 1;
 
   Telemetry telemetry;

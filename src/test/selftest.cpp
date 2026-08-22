@@ -287,12 +287,20 @@ int Run(Ctx& c, const Options& opt) {
   }
   auto known = LoadBaseline(bpath);
 
-  std::printf("=== selftest === (%zu gate%s)\n", plan.size(),
-              plan.size() == 1 ? "" : "s");
+  // The render path exists only on Dawn until phase 4b. On Vulkan the
+  // needsRender gates (declared per gate, printed by --list) are skipped WITH A
+  // PRINTED REASON — never silently passed, which would be a green run of
+  // nothing — and the shared offscreen target is not created at all.
+  const bool renderAvail = c.ctx.backendKind == rhi::BackendKind::Dawn;
+
+  std::printf("=== selftest === (%zu gate%s, backend %s)\n", plan.size(),
+              plan.size() == 1 ? "" : "s", renderAvail ? "dawn" : "vulkan");
 
   // The shared offscreen target every render-touching gate draws into.
-  c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
-  c.view = c.offscreen.CreateView();
+  if (renderAvail) {
+    c.offscreen = c.ctx.device.CreateTexture({c.width, c.height, 1}, rhi::TextureFormat::RGBA8Unorm, rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "offscreen");
+    c.view = c.offscreen.CreateView();
+  }
 
   std::vector<Result> results;
   std::unordered_map<std::string, Status> outcome;
@@ -307,7 +315,14 @@ int Run(Ctx& c, const Options& opt) {
     }
     Result r;
     r.name = g->name;
-    if (blockedBy) {
+    if (!renderAvail && g->needsRender) {
+      // Skipped-for-backend, loudly. Distinct from a dependency skip so the
+      // summary reads honestly: these gates were not attempted, not passed.
+      r.status = Status::Skip;
+      r.detail = "needs the render path; not available on --backend vulkan "
+                 "until phase 4b";
+      std::printf("%s: SKIP (%s)\n", r.name.c_str(), r.detail.c_str());
+    } else if (blockedBy) {
       r.status = Status::Skip;
       r.detail = std::string("depends on ") + blockedBy + ", which did not pass";
       std::printf("%s: SKIP (%s)\n", r.name.c_str(), r.detail.c_str());

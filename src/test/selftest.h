@@ -110,18 +110,15 @@ struct Gate {
   // Does this gate need the RENDER path — the offscreen target, a render
   // pipeline, a draw?
   //
-  // Declared rather than inferred, for the Vulkan port. Phase 4 brings up the
-  // Vulkan render path, and the question "which gates could run before it
-  // exists" then has a machine-readable answer instead of a curated list in
-  // someone's commit message that goes stale the first time a gate learns to
-  // draw. `--list` prints it.
+  // Declared rather than inferred, for the Vulkan port. The question "which
+  // gates can run before the Vulkan render path exists" has a machine-readable
+  // answer instead of a curated list in someone's commit message that goes
+  // stale the first time a gate learns to draw. `--list` prints it.
   //
-  // The honest current status: NOTHING consumes this to skip a gate yet,
-  // because `--selftest --backend vulkan` does not run gates on Vulkan at all
-  // (see the refusal in main.cpp — the gates drive World/Simulation/Stream
-  // through rhi:: handles that only Dawn implements). It is declared now
-  // because the fact belongs next to the gate, and because a flag added later
-  // is a flag someone has to audit 23 gates to fill in correctly.
+  // CONSUMED since phase 4a: `--selftest --backend vulkan` runs every gate
+  // with needsRender == false against a Vulkan-backed World, and skips the
+  // rest with a printed "needs the render path" reason (Run(), selftest.cpp).
+  // Phase 4b deletes the skip once the render path exists on both backends.
   bool needsRender = false;
 };
 
