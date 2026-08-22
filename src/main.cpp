@@ -959,6 +959,10 @@ int main(int argc, char** argv) {
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
   bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
+  // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
+  // comparison over an ACTIVE world (ops, explosions, particles, readback ring,
+  // streaming) rather than a quiet one.
+  bool vkSmokeLoud = false;
   // --backend vulkan. Headless ONLY: the Vulkan render path is phase 4, so
   // there is no swapchain to present to and asking for one is refused loudly
   // rather than silently falling back to Dawn.
@@ -1021,6 +1025,13 @@ int main(int argc, char** argv) {
     // of docs/vulkan_barrier_graph.md, so this is the strongest single test the
     // generated-barrier recorder has (§6.3).
     if (a == "--vk-smoke") vkSmoke = true;
+    // `--vk-smoke-loud` is the phase-3c exit proof. The quiet smoke above
+    // exercises every STRUCTURAL feature of the tick table; this one reaches
+    // everything gated behind a condition a quiet world never satisfies — the
+    // brush/cell mutation kernels, the explosion mark/apply split, the whole
+    // particle chain, the readback ring, and a streaming walk that forces
+    // eviction, store-hit refill and procgen fill.
+    if (a == "--vk-smoke-loud") vkSmokeLoud = true;
     // `--backend vulkan` selects the Vulkan compute backend. Headless only in
     // phase 3b — see the refusal below.
     if (a == "--backend" && i + 1 < argc) {
@@ -1061,20 +1072,24 @@ int main(int argc, char** argv) {
   //
   // The one headless mode Vulkan can actually serve today is --vk-smoke, which
   // drives the compute tables end to end and compares hashes against Dawn.
-  if (backendVulkan && !vkSmoke) {
+  if (backendVulkan && !vkSmoke && !vkSmokeLoud && !selftest) {
     std::fprintf(stderr,
-                 "--backend vulkan is HEADLESS-ONLY in phase 3b: the Vulkan render\n"
+                 "--backend vulkan is HEADLESS-ONLY in phase 3c: the Vulkan render\n"
                  "path (swapchain, raster pipelines, ImGui) is phase 4.\n"
                  "Use it with a headless mode:\n"
                  "    sandvox --backend vulkan --vk-smoke\n"
+                 "    sandvox --backend vulkan --vk-smoke-loud\n"
+                 "    sandvox --backend vulkan --selftest\n"
                  "Add --vk-validation for synchronization validation, and\n"
                  "--barriers=sledgehammer for the barrier A/B oracle.\n");
     return 2;
   }
-  // --vk-smoke runs BOTH backends by construction, so it does not need
-  // --backend to select one; accepting the flag anyway keeps the invocation in
-  // the refusal message above honest.
+  // The smokes run BOTH backends by construction, so they do not need --backend
+  // to select one; accepting the flag anyway keeps the invocations in the
+  // refusal message above honest.
   if (vkSmoke) return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation);
+  if (vkSmokeLoud)
+    return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation);
 
   std::string assetDir = AssetDir();
   // Tuning first: LoadShader() bakes these into every shader's constant

@@ -1025,6 +1025,22 @@ struct Slot {
   own a fence of its own; `Slot::fence` above is that borrowed handle. This
   keeps the 1:1 mapping onto today's `lastSlot_` while decoupling fence
   lifetime from readback lifetime.
+
+  **[AS BUILT, phase 3c] A borrowed fence needs a RETAIN, and the first
+  implementation without one was silently wrong.** The fence pool recycles a
+  signalled fence into its free list as soon as `PollFences` observes it, and
+  `BeginCommands` calls `PollFences` on *every* command buffer. So a slot that
+  submitted at tick N and had not yet been polled by tick N+1 held a handle
+  `AcquireFence` had already reset and handed to the tick-N+1 submit.
+  `vkGetFenceStatus` on it then reports **a different submit's** status: the
+  slot reads its mapped memory when some unrelated command buffer finishes,
+  which for a 3-deep ring means reading a slot the GPU is still writing. That is
+  silent corruption of the CPU mirror — no crash, no validation message, and the
+  consumers (`KindAt`, the streaming evict filter, the sleep assertion) simply
+  get wrong answers. `Backend::RetainFence`/`ReleaseFence` refcount the borrow;
+  a retained fence whose submit retires is *parked* rather than pooled and
+  returns to the pool on the last release. The borrowed-fence model here is
+  right; what it was missing was the retain that makes "borrowed" true.
 - **Where the CPU polls.** `ctx.ProcessEvents()`'s replacement, called at the
   same point in the frame (`main.cpp:2833`), walks the 3 slots and calls
   `vkGetFenceStatus`. On `VK_SUCCESS`: read the mapped pointer, run the exact
@@ -1089,7 +1105,13 @@ the whole story:
    copy read the leaving plane's data") stays true, but the reason becomes
    "EvictSlots submits eagerly while FillSlots only enqueues", not "both are
    submits and submits are ordered". Same commit, per the CLAUDE.md rule about
-   docs that contradict code.
+   docs that contradict code. **[AS BUILT, phase 3c] Done** — the comment now
+   states the mechanism, and notes that the memory half comes from §3.4's head
+   barrier on Vulkan and is automatic under Dawn. `kPersistMask` moved from a
+   stream.cpp file-static to `stream.h` in the same commit: the cross-backend
+   smoke has to reproduce the store round-trip exactly, and a second copy of the
+   literal is a "two places that must agree" bug — it had already produced one
+   false divergence that read like a barrier race.
 5. **`CompleteOldest` becomes a fence wait.** Each `PendingEvict` carries the
    `VkFence` of its own submit. `CompleteOldest` does
    `vkWaitForFences(fence, UINT64_MAX)` — a genuine block, exactly as
@@ -2029,10 +2051,33 @@ frame behind, or that the origin fields diverge.
   header enumeration. Until every recorded command is in a table, "barriers are
   generated from the table" means "barriers are missing wherever the table is".
   *(Phase 2b tabled the six `Simulation::Encode*` paths — §2.4 and §2.5.1–2.5.4,
-  2.5.6. Still untabled and therefore still owed a table before phase 3 can
-  claim completeness: the readback copies §2.4 phase 7a/7b — `World::EncodeReadbacks`
-  / `EncodeDirtyCopy` — the eviction copies §4.3, and the render chain §2.6,
-  which phase 4 covers. §2.5.5 `wakeAll` records no commands and needs none.)*
+  2.5.6. §2.5.5 `wakeAll` records no commands and needs none — phase 3c
+  confirmed this: on Vulkan it is a `QueueWrite` draining at the head of the
+  tick's command buffer, with no special case at all.)*
+
+  **RESOLVED for the readback copies (§2.4 phase 7a/7b) and the eviction copies
+  (§4.3), phase 3c — and the resolution is "a Use, not a Row".** A `pass::Row`
+  encodes a Copy's offsets as the literal constants `x/y/z`. That is exact for
+  every copy in the tick table, and it CANNOT express these: `EncodeReadbacks`
+  issues up to 64 chunk fetches at slot indices chosen at runtime from a queue,
+  27 mirror copies whose source offsets come from the live window origin, into a
+  destination slot picked from a 3-deep ring; `EvictSlots` copies a
+  runtime-sized batch out of runtime-chosen slots. Their count and their offsets
+  are **tick data, not table data**. Widening the schema to carry
+  runtime-parameterised offsets would make a row a closure and dissolve the
+  property that lets `check_pass_table.py` read the `.def` as static text.
+
+  So they go through `Recorder::CopyTracked` / `Recorder::FillTracked`, which
+  take the *tracked* endpoint as a `pass::Buf` id and let §3.3 derive the
+  barrier exactly as a row does. The bullet below already permitted this — "if a
+  hazard needs expressing, it is expressed as a table row's `uses`" is satisfied
+  by a `Use`, and `CopyToHost` established the pattern in 3b. Nothing is
+  hand-written: `CopyTracked` declares a `TransferRead` on its source, and
+  `FillTracked` declares a `TransferWrite`, which is what makes the §7.4
+  `support` copy-then-clear WAR fall out instead of being remembered.
+  `src/sim/pass_table.def` is UNCHANGED by phase 3c.
+
+  **Still untabled: the render chain §2.6, which phase 4 covers.**
 - **No barrier is ever written at a call site.** If a hazard needs expressing,
   it is expressed as a table row's `uses`. *(Live since phase 3b: the tracker is
   `gpu/vk_record.cpp`, and the Vulkan recorder reaches a command only by walking

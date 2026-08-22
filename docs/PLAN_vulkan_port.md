@@ -315,6 +315,117 @@ behavior change.*
 > every structural feature of the tick table except the particle and explosion
 > chains, which need ops to reach.
 
+> **[AS BUILT] Phase 3c deliverables 1+2 — the rest of the per-tick machinery,
+> and streaming.** `vk::SimBackend` grew the readback ring (3 slots, the
+> `World::Init` layout verbatim), `SubmitTickFull` (the full input set — ops,
+> explosions, cells, spawns, far-fill, readback — i.e. `test/support.cpp`'s
+> `SubmitTick` against Vulkan resources), `PollReadbacks` (`ProcessEvents`'
+> replacement, at the same frame point), `WakeAll`, `EvictSlots`/`CompleteEvict`,
+> `FillSlotFromStore`, `FillSlotsByGen`, `SubmitLoadReset` and
+> `ReadBufferBlocking`.
+>
+> **The readback and eviction copies are Uses, NOT table rows — and that is a
+> decision, not a shortcut.** A `pass::Row` encodes a Copy's offsets as the
+> literal constants `x/y/z`, which is exact for every copy in the tick table (the
+> indirect-args hops are always 12 B at offset 0 or 16). It cannot express
+> `EncodeReadbacks`: up to 64 chunk fetches at slot indices chosen at runtime
+> from a queue, 27 mirror copies whose offsets come from the live window origin,
+> into a slot picked from a 3-deep ring. Their count and offsets are *tick data*.
+> Making the schema carry runtime-parameterised offsets would make a row a
+> closure and dissolve the property that lets `check_pass_table.py` read the
+> `.def` as static text. So they express their hazards as `pass::Use` against the
+> same tracker, which is the mechanism `CopyToHost` established in 3b and which
+> §8 already sanctions ("expressed as a table row's `uses`" — a Use, not
+> necessarily a Row). Two new recorder entry points carry it: `CopyTracked`
+> (source is a `pass::Buf`, so the RAW against its last writer is derived) and
+> `FillTracked` (the `ClearBuffer(support)` WAW of §7.4, which falls out because
+> the fill declares a TransferWrite on a buffer the tracker just saw read).
+> `pass_table.def` is therefore UNCHANGED by 3c, and the checker stays silent.
+>
+> **One real bug, and it was in the fence pool.** §4.2 says a readback slot
+> "borrows a reference to that submit's fence". `Backend::PollFences` recycled a
+> signalled fence into the free list immediately, and `BeginCommands` calls
+> `PollFences` on *every* command buffer — so a slot that submitted at tick N and
+> had not yet been polled held a handle `AcquireFence` had already reset and
+> handed to the tick-N+1 submit. `vkGetFenceStatus` on it then reports a
+> different submit's status, and the slot reads its mapped memory while the GPU
+> is still writing it: silent CPU-mirror corruption, no crash. Fixed with
+> `RetainFence`/`ReleaseFence` refcounts — a retained fence is parked rather than
+> pooled when its submit retires, and returns to the pool on the last release.
+> The borrowed-fence model in §4.2 is correct; what it needed was a retain.
+>
+> **`EncodeWakeAll` needed no special case,** exactly as §4.1 predicted: it is a
+> `QueueWrite` that drains at the head of the tick's command buffer ahead of the
+> first row. The `stream.cpp:172` eviction-ordering comment was corrected in the
+> same commit per §4.3 step 4 — the guarantee is not "both are submits and
+> submits are ordered" but "EvictSlots submits eagerly while FillSlots only
+> enqueues", and `kPersistMask` moved from a stream.cpp file-static to `stream.h`
+> because the smoke now has to reproduce the store round-trip exactly.
+>
+> **[AS BUILT] Phase 3c deliverable 4 — `--vk-smoke-loud`, the port's
+> determinism acceptance evidence for phase 3.** 120 ticks of an ACTIVE world on
+> both backends: brush + melt ops, three explosions (the mark/apply split, the
+> expMask, the whole spawn/integrate/resolve particle chain), exact-cell ops, the
+> readback ring live every tick, and an 8-shift streaming walk with eviction and
+> procgen refill. Hashes compared at 19 points throughout, validation ON.
+>
+> ```
+> === validation ===
+>   ZERO messages (no synchronization hazards reported)
+>
+> === streaming ===
+>   Dawn:   8 window shifts, 34059 chunks in store
+>   Vulkan: 8 window shifts, 8192 chunks evicted, 64 store-hit refills, 8192 procgen refills
+>   store-hit refill self-check: PASS (100.00% of the plane restored through
+>       deferred, submit-less writes flushed by the next tick)
+>
+>   worldgen f97ba745   f97ba745   MATCH      t60      f4fd73c6   f4fd73c6   MATCH
+>   t15      958d2cd1   958d2cd1   MATCH      t75      3c954bbf   3c954bbf   MATCH
+>   t30      9d6c5841   9d6c5841   MATCH      t76      20fd330a   20fd330a   MATCH
+>   t45      896e2082   896e2082   MATCH      t84      95a876da   95a876da   MATCH
+>   t46      5436693c   5436693c   MATCH      t85      4850717a   4850717a   MATCH
+>   t47      22ec46d9   22ec46d9   MATCH      t86      38802cbb   38802cbb   MATCH
+>   t52      c50f2236   c50f2236   MATCH      t87      250cd625   250cd625   MATCH
+>   t53      663bc868   663bc868   MATCH      t88      1a9022a2   1a9022a2   MATCH
+>   t90      2fe6536b   2fe6536b   MATCH      t105     16c239c7   16c239c7   MATCH
+>   t120     cb036bd1   cb036bd1   MATCH
+>
+> === --vk-smoke-loud PASS ===
+> ```
+>
+> An active tick records **20 rows, 64 dispatches, 38 copies, 5 fills, 104
+> barrier calls (67 buffer + 55 global)** against the quiet tick's 11/59/2/3/63 —
+> the difference is the conditional chains plus the readback ring's copies.
+> `--barriers=sledgehammer` produces identical hashes (exoneration per §6.2, and
+> still weak evidence on one GPU).
+>
+> **What the streaming leg deliberately does NOT compare, and why that is not a
+> gap being papered over.** The walk is one-directional. A return leg re-enters
+> evicted planes, which is the only route to the store-hit refill — but the
+> store-hit path's *content* comes from a store, and the two backends cannot
+> share one: Dawn drives the real `Stream` (sticky `modified_` set, `dropIfAir =
+> modified_[s] == 0`, RLE through the region-file `ChunkStore`, force-completion
+> of in-flight evictions), while the Vulkan side has no `Stream` at all — the
+> same `rhi::`-ownership reason `vk_sim.h` exists. Any store the smoke emulates
+> makes different refill decisions, so the worlds diverge in CONTENT.
+>
+> This was confirmed rather than assumed, and the confirmation is the useful
+> part: with a return leg, **both backends were bit-stable run to run** (Dawn
+> `c4c5178f`, Vulkan `2879f83e`, reproducing exactly) and diverged only after the
+> reversal. A barrier race varies between runs; a policy difference does not.
+> Three different emulated store policies each matched through the entire
+> outbound leg and each diverged on the return. Two of those attempts were
+> themselves instructive: storing raw evicted words (rather than applying
+> `kPersistMask` + re-stamping `kStampNever`) and dropping all-air chunks
+> unconditionally (rather than Dawn's `modified_`-gated `dropIfAir`) each produced
+> a divergence with the exact signature of a barrier race and neither was one.
+> So the store-hit path is proven by a direct Vulkan-side round-trip assertion
+> instead — evict a plane, clobber those slots with procgen from a bogus origin,
+> refill from the captured words through the deferred submit-less path, run one
+> ordinary tick, and re-evict. It restores 100%, and step 4 is the load-bearing
+> one: a model where uploads ride their own submit passes the first three steps
+> and fails there.
+
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
 barriers generated from the pass table, indirect dispatch (keep the staging

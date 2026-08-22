@@ -43,4 +43,35 @@ namespace sandvox {
 // `validation` turns on VK_LAYER_KHRONOS_validation + synchronization validation.
 int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation);
 
+// `--vk-smoke-loud` — PHASE 3c's determinism acceptance evidence.
+//
+// WHY A SECOND SMOKE, AND WHAT IT ADDS
+// ------------------------------------
+// The quiet smoke above proves the STRUCTURE of the tick table: fills, compact,
+// the indirect staging hops, 54 CA iterations with per-iteration dynamic
+// offsets, both hash-tick branches, farDown. What it cannot reach is everything
+// gated behind a condition that a quiet world never satisfies — and those are
+// exactly the chains phase 3c adds machinery for:
+//
+//   * `C_OPS` / `C_CELLS`   brush and exact-cell mutation (T10, T11)
+//   * `C_EXP`               the explosion mark/apply split and its expMask
+//                           (T12, T13) — the two-phase kernel whose RAW Dawn
+//                           inserted for free
+//   * `C_PARTICLES`         the whole particle chain: args1, the pArgs staging
+//                           copy, integrate (indirect), args2, the SECOND copy
+//                           that overwrites args an in-flight indirect read
+//                           already fetched (§7.2), drawArgs, resolve
+//   * `C_SPAWN`             CPU particle spawns appending to the read page
+//   * the readback ring     3 slots on borrowed fences, polled not blocked
+//   * streaming             eviction (eager submit, fence wait) AND store-hit
+//                           refill (deferred, submit-less) AND procgen fill
+//
+// A hash that matches across backends through all of that is a materially
+// stronger statement than the quiet one, because every one of those paths is a
+// place where a missing barrier has somewhere to hide. Hashes are compared at
+// INTERVALS throughout rather than only at the end: an end-only comparison
+// cannot distinguish "never diverged" from "diverged and reconverged", and the
+// tick at which a divergence first appears is the diagnosis (§6.2).
+int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation);
+
 }  // namespace sandvox
