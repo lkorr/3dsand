@@ -215,9 +215,19 @@ def main():
     # not the case here, and it drags in a scale hazard.
     #
     # ROTATION, degrees, applied X then Y then Z. The blade is authored along
-    # +x; the arm extends along -y in the rig. Identity rotation keeps the
-    # blade along +x, which IS perpendicular to the forearm — constraint 1
-    # in this file's docstring. No rotation needed.
+    # +x; the arm extends along -y in the rig.
+    #
+    # -90 ABOUT Y POINTS THE BLADE AWAY FROM THE CHARACTER. Heading 0 faces +Z,
+    # and -90 about Y carries the authored +x onto +Z, so the sword points out
+    # front rather than across the body. Verified rather than reasoned:
+    #
+    #   python scripts/geometry.py rotate_point 0 1 0 -90 -- 1 0 0
+    #   -> [0, 0, 1]                     (blade +x lands on +Z, i.e. forward)
+    #
+    # Constraint 1 in this file's docstring still holds: a rotation about Y
+    # keeps the blade horizontal, so it stays perpendicular to a forearm that
+    # runs along -y. The angle is carried by the grip, not by the art, so the
+    # blade is still authored pommel-at-low-x and nothing about the mesh moves.
     #
     # TRANSLATION is a RESIDUAL NUDGE in MICRO units, and is zero here. Where
     # the fist closes is stated by the `hilt` box below, and the runtime puts
@@ -249,7 +259,7 @@ def main():
         "grip": {
             "held_right": {
                 "translation": [0, 0, 0],
-                "rotation": [0, 0, 0],
+                "rotation": [0, -90, 0],
                 "scale": 1.0,
             }
         },
