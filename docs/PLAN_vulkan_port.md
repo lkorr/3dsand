@@ -495,6 +495,94 @@ screenshot/offscreen paths.
 *Checkpoint: full 20-gate selftest green on `--backend vulkan`; screenshots
 visually equivalent; render ms reported vs Dawn baseline.*
 
+> **[AS BUILT] Phase 4a — runtime-selectable backends; the real gates run on
+> Vulkan (2026-08-22).** Split off from phase 4: everything except the render
+> path itself.
+>
+> **The seam design: abstract impl bases, chosen over handle+vtable and
+> variant.** Every impl struct behind the rhi.h handles is now an abstract base
+> (`rhi_impl.h`) with two subclasses — `rhi_dawn.cpp` (the same wgpu calls, one
+> virtual hop; recording byte-identical, proven by the pinned hash) and
+> `rhi_vk.cpp` (translating onto `vk::Backend`). Virtual dispatch was picked
+> for clarity and phase-7 headroom: a sparse-resident voxels buffer is just
+> another `BufferImpl` subclass, and phase 6's Dawn removal deletes subclasses
+> without touching a caller. Dispatch cost is irrelevant at ~60 dispatches +
+> a handful of copies per tick.
+>
+> **Barrier generation kept the phase-3b shape exactly.** The Vulkan encoder
+> does NOT derive barriers from the wgpu-shaped calls: `Simulation::RecordTable`
+> branches on `device.Kind()` and hands the page-resolved ids/pipelines/sets
+> across a bridge (`rhi_record.h`) to the encoder's `vk::Recorder`, which walks
+> `pass::kRows` itself. What was deleted is `vk_sim.{h,cpp}` — the phase-3b/3c
+> parallel copy of every resource declaration — so there is ONE World again.
+> Off-table copies go through new `CommandEncoder::CopyTracked/FillTracked`
+> (a `pass::Buf` id + the concrete buffer; under Dawn byte-identical to the
+> plain calls), and buffers with no id (staging, the timer resolve) are tracked
+> BY POINTER in a recorder side table — still derived, never hand-placed.
+> `pass_table.def` unchanged; `check_pass_table.py` silent.
+>
+> **The readback ring, chunk-fetch queue and eviction tickets are World's/
+> Stream's own code on both backends** (closing 3c's "fetchIds has no Vulkan
+> consumer" gap by deletion): `rhi::MapReadAsync` on Vulkan borrows the
+> producing submit's fence (RetainFence) over the persistently mapped slot and
+> fires from `ProcessEvents`; `MapTicket` is the same borrow consumed by
+> poll/wait. Buffer handles are refcounted like wgpu's — released staging is
+> freed through a serial-stamped graveyard once in-flight submits retire
+> (a whole-world gate read is 512 MiB; leaking those to Shutdown was not an
+> option).
+>
+> **Two real bugs, both found by sync validation + hash divergence, both in
+> the new queued zero-init** (barrier_graph §4.1/§4.8 phase-4a notes):
+> intra-flush WAW (a creation fill racing the first data upload — the material
+> table lost and the world froze inert), and the Class B staging ring's own
+> zero-fill wiping freshly host-staged payloads (MapWrite staging is now never
+> GPU-zeroed). Neither existed in 3c because zero-init was one early submit.
+>
+> **`--selftest --backend vulkan` runs 20 of 23 gate bodies for real.** 19
+> PASS; pond-freeze FAILs with the character-for-character identical assertion
+> and measured values as Dawn ("rim 0/96 vs middle 0/25 ice at 250 night
+> ticks; 0 ice voxels, 0 frozen with 0 non-water neighbours") — a known-fail
+> failing the SAME WAY cross-backend. The determinism gate reports the pinned
+> golden hash ON VULKAN: `final hash 7cfa2420 over 200 ticks, matches
+> baseline`. save/load round-trips a real `.svd` (247105c6 → cd6022f6 →
+> restored 247105c6, values identical to Dawn), streaming matches Dawn's hash
+> sequence over 232 shifts (store 36013 chunks, identical). The three
+> `needsRender` gates (screenshots, mob, perf) print
+> `SKIP (needs the render path; not available on --backend vulkan until phase
+> 4b)` — never silently pass; the Vulkan encoder ABORTS on any render entry
+> point, which is how the debris gate's Dawn-only diagnostic screenshot (a
+> draw appended after its compute-only verdict) was found and gated.
+>
+> **The smokes now drive both backends through the identical driver** (real
+> `Stream` + `ChunkStore` on the Vulkan side, previously impossible):
+> `--vk-smoke` 5/5 MATCH, `--vk-smoke-loud` 19/19 MATCH with validation ON and
+> ZERO messages, hashes byte-identical to the phase-3c record (worldgen
+> f97ba745 … t120 cb036bd1) — the folded path reproduces the 3c world
+> bit-for-bit, and even the 34059-chunk stores match.
+>
+> **D4 — `--measure --backend vulkan` works, and the idle-overhead claim has
+> its first cross-API data point** (same machine, same scenarios as the phase-0
+> baseline; Vulkan timestamps via `VkQueryPool` + `vkCmdWriteTimestamp2` around
+> the recorder's group transitions, the same spans Dawn's per-pass writes
+> cover):
+>
+> | pass (settled world) | Dawn phase 0 | Vulkan 4a |
+> |---|---|---|
+> | prep (mutate+explode+compact) | 7.1 µs | 2.6 µs |
+> | CA (54 empty indirect dispatches) | **184.6 µs** | **119.9 µs** |
+> | compactNext | 3.8 µs | 2.7 µs |
+> | occupancyDirty+pick | 9.8 µs | 4.1 µs |
+> | farDown | 5.5 µs | 2.2 µs |
+> | occupancyFull+pick (1-in-15) | 95.6 µs | 97.8 µs |
+> | **settled tick total** | **306 µs** | **229 µs** |
+>
+> The settled tick is ~25% cheaper on Vulkan with identical work: the empty CA
+> dispatches drop from ~3.4 to ~2.2 µs each (driver overhead, exactly the
+> rule-2 violation phase 0 flagged), while the genuinely GPU-bound full-world
+> occupancy scan is unchanged (95.6 vs 97.8 µs) — the port's perf case is
+> idle overhead, and the remaining ~120 µs of empty dispatches is still the
+> phase-8 skip-encode target. Active world: 501 µs (Vulkan) vs 565 µs (Dawn).
+
 **Phase 5 — second-adapter validation.**
 Run the Vulkan selftest on every enumerable device (`--adapter low` equivalent;
 this machine may expose only the 3060 Ti — if so, evaluate lavapipe/SwiftShader

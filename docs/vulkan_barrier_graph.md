@@ -989,6 +989,21 @@ clobber the wake and the world would fail to wake at a day/night boundary. The
 recorder's symbolic resolution (§2.2) makes this a checkable property rather
 than a coincidence; the checker asserts `DirtyIn != DirtyOut` after resolution.
 
+> **[AS BUILT phase 4a] Intra-flush WAW.** When zero-init moved into the queue
+> (§4.8), one flush could legally carry TWO transfer writes to the same buffer —
+> a creation fill followed by the first data upload — and `vkCmdFillBuffer` /
+> `vkCmdUpdateBuffer` have no implicit ordering, so "applied in issue order"
+> silently stopped being true. Sync validation caught it; the hash divergence it
+> caused (the material table zeroed → a frozen, inert world) is recorded in the
+> phase-4a commit. `FlushUploads` now emits one derived
+> `ALL_TRANSFER/TRANSFER_WRITE → ALL_TRANSFER/TRANSFER_WRITE` memory barrier
+> whenever a destination repeats within a single flush — buffer-identity
+> derived, like every barrier here; an ordinary flush (no repeat) emits none.
+> Relatedly, the Class B staging ring (a `MapWrite` buffer) is NEVER GPU-zeroed:
+> its contents are host-produced immediately before each read, and a queued fill
+> for it drains in the same flush as the copies reading it and wipes the staged
+> payloads. Host-write staging is the one exception to §4.8's "fill everything".
+
 ### 4.2 (b) The readback ring on real fences (assumption 10)
 
 Today: `Slot::inFlight` is a bool, set before `MapAsync`, cleared in the map
@@ -1066,6 +1081,20 @@ struct Slot {
 - **Blocking readbacks** (`ReadHashSync`, selftest voxel dumps, screenshots)
   become: record copies → submit with a fence → `vkWaitForFences(UINT64_MAX)` →
   read the map. The one sanctioned synchronous path stays exactly as sanctioned.
+
+> **[AS BUILT phase 4a] The ring is World's own code on both backends.** The
+> phase-3c Vulkan-side mirror of the ring (vk_sim.cpp's `ReadbackSlot` /
+> `PollReadbacks` / `PopulateSnapshot`) is deleted. The seam now implements
+> `rhi::MapReadAsync` on Vulkan as exactly this section's design: the call —
+> always issued AFTER the producing submit (`KickReadback`) — borrows that
+> submit's fence via `RetainFence`, and `Device::ProcessEvents` (the
+> `ProcessEvents()` slot in the frame) polls the pending maps and fires each
+> callback from the persistently mapped allocation when its fence signals, then
+> releases the borrow. `MapTicket` (the eviction pool) is the same borrow
+> consumed through Ready()/Wait()/Unmap(). Consequence: the chunk-fetch queue,
+> the CPU chunk cache and the 3×3×3 mirror populate identically on both
+> backends — the phase-3c "fetchIds has no Vulkan consumer" gap closed by
+> deletion rather than by a second implementation.
 
 ### 4.3 (c) Eviction staging pool cross-submit ordering (assumption 7)
 
@@ -1301,6 +1330,22 @@ partial zero-init policy could therefore produce a divergence that the
 determinism gate catches one tick late and attributes to the wrong change. Fill
 everything.
 
+> **[AS BUILT phase 4a] The one-shot `ZeroInitAll` submit became a QUEUED
+> per-buffer fill.** Once buffer creation moved behind the polymorphic seam,
+> buffers are created at many moments (gate staging, the eviction pool, the
+> screenshot readback), not in one init phase — so there is no single "after
+> all buffers exist" moment to submit a registry sweep from. `CreateBuffer` now
+> queues a whole-buffer `vkCmdFillBuffer(0)` on the pending-upload queue
+> (§4.1), which drains at the head of the next recorded command buffer — before
+> any recorded use, and in issue order, so a data upload queued after creation
+> still wins. Same mechanism-not-a-list property; two new consequences are
+> documented in §4.1's phase-4a note (the intra-flush WAW barrier, and the
+> MapWrite staging-ring exception — the one buffer that must NOT be zeroed).
+> `ZeroInitAll` survives only for `--vk-info`'s explicit exercise.
+> Precondition kept by construction: buffers are always created BEFORE the
+> encoder that first uses them (true at every call site; a buffer created while
+> an encoder is open would get its fill one command buffer too late).
+
 ### 4.9 (i) `WaitIdle` / `OnSubmittedWorkDone` (assumption 11)
 
 `GpuContext::WaitIdle` is used by `--shot`, save/load, hot-reload and the
@@ -1335,6 +1380,11 @@ The call sites that matter:
      offscreen render and blocking screenshot readback in `grab()`
      (`main.cpp:160-189`).
 - **`--shot-mob`**: same shape as (3).
+
+> **[AS BUILT phase 4a]** The seam enforces this mechanically: the Vulkan
+> `Device::WaitIdle` checks `PendingUploadCount()` and, if non-zero, records and
+> submits a trivial command buffer (whose `BeginCommands` flushes the queue)
+> before `vkQueueWaitIdle`. No caller has to remember the rule.
 
 ### 4.10 Assumption 13: WebGPU-only constraints
 

@@ -63,8 +63,15 @@ int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation);
 //                           already fetched (§7.2), drawArgs, resolve
 //   * `C_SPAWN`             CPU particle spawns appending to the read page
 //   * the readback ring     3 slots on borrowed fences, polled not blocked
-//   * streaming             eviction (eager submit, fence wait) AND store-hit
-//                           refill (deferred, submit-less) AND procgen fill
+//   * streaming             eviction (eager submit, fence wait) and procgen
+//                           fill, through a REAL Stream + ChunkStore on both
+//                           backends (phase 4a: one World, one driver). The
+//                           walk stays one-directional — a return leg's
+//                           content depends on store policy that rides
+//                           snapshot timing, not on barriers (see the note in
+//                           vk_smoke.cpp); the store-hit round trip is proven
+//                           by the save-load/region-store gates on
+//                           `--selftest --backend vulkan`.
 //
 // A hash that matches across backends through all of that is a materially
 // stronger statement than the quiet one, because every one of those paths is a
