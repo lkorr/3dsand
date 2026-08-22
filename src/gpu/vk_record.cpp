@@ -900,6 +900,18 @@ void Recorder::CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
 // that appends another copy into a slot cannot get behind it.
 // ---------------------------------------------------------------------------
 void Recorder::Finish() {
+  // Presentable (swapchain) images touched this recording go to PRESENT_SRC
+  // as the last image operation — derived like every other transition (src is
+  // the tracked attachment write). dst is ALL_COMMANDS with no access: the
+  // present engine's visibility comes from the queue-submit semaphore, not
+  // from an access mask.
+  for (auto& e : imgState_) {
+    if (e.first->presentable && e.first->layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+      TransitionImage(e.first, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+  }
+  FlushPendingImages();
+
   if (hostWritten_.empty()) return;
   std::vector<VkBufferMemoryBarrier2> bs;
   bs.reserve(hostWritten_.size());

@@ -9,6 +9,10 @@
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
 
+// After the Vulkan headers (via rhi_vulkan.h) so glfw3.h sees VK_VERSION_1_0
+// and declares glfwCreateWindowSurface / glfwGetRequiredInstanceExtensions.
+#include <GLFW/glfw3.h>
+
 // Backend-private state: the Dawn members when backendKind is Dawn, the
 // vk::Backend when it is Vulkan (phase 4a runtime selection).
 struct GpuContext::Backend {
@@ -48,20 +52,23 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
   back_ = std::make_shared<Backend>();
 
   if (backend == rhi::BackendKind::Vulkan) {
-    // HEADLESS ONLY until phase 4b: no swapchain, no surface, no ImGui. A
-    // windowed request is refused rather than silently served by Dawn — a run
-    // reported as Vulkan that was Dawn all along is worse than no run.
-    if (window) {
-      std::fprintf(stderr,
-                   "--backend vulkan cannot present until phase 4b (render "
-                   "path); use a headless mode\n");
-      return false;
-    }
     back_->vk = std::make_shared<vk::Backend>();
     std::string err;
+    // Windowed: GLFW supplies the surface instance extensions
+    // (VK_KHR_surface + VK_KHR_win32_surface here) and creates the surface.
+    const char** glfwExts = nullptr;
+    uint32_t glfwExtCount = 0;
+    if (window) {
+      glfwExts = glfwGetRequiredInstanceExtensions(&glfwExtCount);
+      if (!glfwExts || glfwExtCount == 0) {
+        std::fprintf(stderr, "GLFW reports no Vulkan surface support\n");
+        return false;
+      }
+    }
     // Sync validation follows validation: it is the barrier document's primary
     // detector for a missing barrier (§6.2).
-    if (!back_->vk->Init(lowPowerAdapter, vkValidation, vkValidation, err)) {
+    if (!back_->vk->Init(lowPowerAdapter, vkValidation, vkValidation, err, glfwExts,
+                         glfwExtCount, /*wantSwapchain=*/window != nullptr)) {
       std::fprintf(stderr, "Vulkan backend init failed: %s\n", err.c_str());
       return false;
     }
@@ -72,7 +79,22 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
                   caps.syncValidationEnabled ? "ENABLED" : "off");
     device = rhi::vkr::WrapDevice(back_->vk, vkSledgehammer);
     queue = device.GetQueue();
-    surfaceFormat = rhi::TextureFormat::RGBA8Unorm;  // headless placeholder
+    if (window) {
+      VkSurfaceKHR surface = VK_NULL_HANDLE;
+      VkResult sr = glfwCreateWindowSurface(back_->vk->Instance(), window, nullptr,
+                                            &surface);
+      if (sr != VK_SUCCESS || surface == VK_NULL_HANDLE) {
+        std::fprintf(stderr, "glfwCreateWindowSurface failed (%d)\n", (int)sr);
+        return false;
+      }
+      if (!back_->vk->ConfigureSwapchain(surface, width, height, err)) {
+        std::fprintf(stderr, "swapchain creation failed: %s\n", err.c_str());
+        return false;
+      }
+      surfaceFormat = back_->vk->SwapchainFormat();
+    } else {
+      surfaceFormat = rhi::TextureFormat::RGBA8Unorm;  // headless offscreen
+    }
     timestampsEnabled = wantTimestamps && caps.timestampQuery;
     // Vulkan reports raw ticks; the period converts them to nanoseconds in
     // PassTimer::Collect (1.0 on this device, but never assumed).
@@ -189,6 +211,15 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
 }
 
 void GpuContext::Resize(uint32_t w, uint32_t h) {
+  if (back_ && back_->vk) {
+    if (w == 0 || h == 0) return;
+    width = w;
+    height = h;
+    std::string err;
+    if (!back_->vk->ConfigureSwapchain(VK_NULL_HANDLE, w, h, err))
+      std::fprintf(stderr, "swapchain resize failed: %s\n", err.c_str());
+    return;
+  }
   if (!back_ || !back_->surface || w == 0 || h == 0) return;
   width = w;
   height = h;
@@ -203,6 +234,10 @@ void GpuContext::Resize(uint32_t w, uint32_t h) {
 }
 
 rhi::TextureView GpuContext::AcquireFrame() {
+  if (back_ && back_->vk) {
+    vk::Image* im = back_->vk->AcquireSwapchainImage();
+    return im ? rhi::vkr::WrapSwapchainImage(im) : rhi::TextureView{};
+  }
   if (!back_ || !back_->surface) return {};
   wgpu::SurfaceTexture st{};
   back_->surface.GetCurrentTexture(&st);
@@ -214,6 +249,10 @@ rhi::TextureView GpuContext::AcquireFrame() {
 }
 
 void GpuContext::Present() {
+  if (back_ && back_->vk) {
+    back_->vk->PresentAcquired();
+    return;
+  }
   if (back_ && back_->surface) back_->surface.Present();
 }
 

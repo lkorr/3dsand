@@ -139,10 +139,17 @@ add_library(imgui_lib STATIC
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-target_link_libraries(imgui_lib PUBLIC glfw dawn::webgpu_dawn)
+# IMGUI_IMPL_VULKAN_NO_PROTOTYPES: the whole engine loads Vulkan dynamically
+# (VK_NO_PROTOTYPES; src/gpu/vk_loader.*), so ImGui's Vulkan backend must too —
+# overlay.cpp feeds it entry points via ImGui_ImplVulkan_LoadFunctions. PUBLIC
+# because the flag must match between imgui_impl_vulkan.cpp and every includer
+# of its header.
+target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+                                            IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+target_link_libraries(imgui_lib PUBLIC glfw dawn::webgpu_dawn Vulkan::Headers)
 
 # ---------------------------------------------------------------------------
 # Jolt Physics (rigid bodies for debris islands, DESIGN.md §7)

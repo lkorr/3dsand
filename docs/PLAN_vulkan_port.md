@@ -526,6 +526,34 @@ visually equivalent; render ms reported vs Dawn baseline.*
 >   nothing popped a scope in these harnesses before, so a hazard could have
 >   gone unprinted.
 >
+> **[AS BUILT] Phase 4b D3 — windowed Vulkan (2026-08-22). Phase 4b complete.**
+> Swapchain (FIFO, matching Dawn's present mode), resize, AcquireFrame/Present
+> through the seam, and imgui_impl_vulkan behind the same Overlay interface.
+>
+> * **Semaphores stay exactly where §5.1 allows them**: per-image render-done
+>   semaphores plus a fence-paced ring of 3 acquire semaphores (a semaphore
+>   handed to vkAcquireNextImageKHR must be provably idle; the fence of the
+>   submit that consumed it is the proof — the same Retain/Release discipline
+>   as the readback ring). The presenting submit is detected by the encoder
+>   (its render pass targeted a `presentable` image), not declared by callers.
+> * **PRESENT_SRC transitions are derived like every other image barrier**:
+>   `Recorder::Finish()` transitions any presentable image touched in the
+>   recording, src = its tracked attachment write.
+> * **ImGui**: `imgui_impl_vulkan` (1.92.4) with dynamic rendering, entry
+>   points fed from the engine's own loader (`IMGUI_IMPL_VULKAN_NO_PROTOTYPES`
+>   — one source of Vulkan entry points, by construction). overlay.cpp is now
+>   the sanctioned dual-native exception; `rhi::dawn::Native` and
+>   `rhi::vkr::NativeCmd` are its two doors.
+> * **`--frames N` harness**: runs the windowed game N frames, fires one F5
+>   shader reload midway (the Tint recompile path), exits cleanly, and prints
+>   collected validation messages. Verified: window opens, the world renders
+>   (a window capture shows the raymarched world, grass strands, ImGui panel +
+>   HUD at 98 fps), `reloading shaders... ok`, clean exit,
+>   `session: vulkan validation messages: 0 (clean)` over 1500 frames.
+>   Windowed avg render+present 10.6–12.4 ms under FIFO on both backends; the
+>   honest render-cost comparison is the selftest 1080p sweep — 17.4 ms
+>   shadows-on / 12.4 off (Vulkan) vs 18.8 / 12.8 (Dawn).
+>
 > **[AS BUILT] Phase 4b D2 — all 23 gates run on both backends (2026-08-22).**
 > The `needsRender` skip is gone (the flag survives as documentation in
 > `--list`), the shared offscreen target is created on both backends, and the

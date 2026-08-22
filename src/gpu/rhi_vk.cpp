@@ -148,7 +148,12 @@ struct VkrRenderPipeline final : RenderPipelineImpl {
   VkPipeline p = VK_NULL_HANDLE;
   VkPipelineLayout layout = VK_NULL_HANDLE;
 };
-struct VkrCommandBuffer final : CommandBufferImpl { VkCommandBuffer cmd = VK_NULL_HANDLE; };
+struct VkrCommandBuffer final : CommandBufferImpl {
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  // True when a render pass in this buffer targeted a swapchain image: the
+  // submit must wait the acquire semaphore and signal render-done (D3).
+  bool presenting = false;
+};
 struct VkrQuerySet final : QuerySetImpl {
   VkQueryPool pool = VK_NULL_HANDLE;
   uint32_t count = 0;
@@ -239,9 +244,12 @@ struct VkrEncoder final : CommandEncoderImpl {
     // measure timer hangs its timestamps off the recorder's group transitions.
     NotReachable("BeginComputePass (generic compute-pass encoding)");
   }
+  bool presenting = false;  // set when a pass targets a swapchain image
+
   RenderPass BeginRenderPass(const RenderPassDesc& d) override {
     vk::RenderAttachments att{};
     att.color = NI(d.color.view);
+    if (att.color && att.color->presentable) presenting = true;
     att.clearColor = d.color.loadOp == LoadOp::Clear;
     for (int i = 0; i < 4; i++) att.clearRGBA[i] = (float)d.color.clearValue[i];
     if (d.hasDepth) {
@@ -267,6 +275,7 @@ struct VkrEncoder final : CommandEncoderImpl {
     }
     auto impl = std::make_shared<VkrCommandBuffer>();
     impl->cmd = cmd;
+    impl->presenting = presenting;
     return CommandBuffer(std::move(impl));
   }
 };
@@ -285,7 +294,8 @@ struct VkrQueue final : QueueImpl {
       if (!cmds[i]) continue;
       auto* c = static_cast<VkrCommandBuffer*>(cmds[i].Get());
       std::string err;
-      VkFence f = st->be->SubmitEnded(c->cmd, err);
+      VkFence f = c->presenting ? st->be->SubmitEndedPresenting(c->cmd, err)
+                                : st->be->SubmitEnded(c->cmd, err);
       if (f == VK_NULL_HANDLE) {
         std::fprintf(stderr, "vulkan submit failed: %s\n", err.c_str());
         continue;
@@ -627,6 +637,17 @@ Stats LastStats(const Device& d) {
   out.bufferBarriers = s.bufferBarriers;
   out.globalBarriers = s.globalBarriers;
   return out;
+}
+
+TextureView WrapSwapchainImage(vk::Image* img) {
+  if (!img) return {};
+  auto v = std::make_shared<VkrTextureView>();
+  v->img = img;  // swapchain-owned; no keepAlive
+  return TextureView(std::move(v));
+}
+
+VkCommandBuffer NativeCmd(const RenderPass& p) {
+  return p ? static_cast<VkrRenderPass*>(p.Get())->cmd : VK_NULL_HANDLE;
 }
 
 }  // namespace vkr

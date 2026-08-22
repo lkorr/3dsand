@@ -60,6 +60,10 @@ using namespace sandvox;
 
 namespace {
 
+// --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
+uint64_t g_harnessFrames = 0;
+double g_harnessRenderMs = 0.0;
+
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
 //
 // Maps the avatar's limbs onto the fixed stick-figure slots. The mapping is by
@@ -996,6 +1000,9 @@ int main(int argc, char** argv) {
     if (a == "--json" && i + 1 < argc) stOpt.jsonPath = argv[++i];
     if (a == "--baseline" && i + 1 < argc) stOpt.baselinePath = argv[++i];
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
+    // `--frames N` runs the WINDOWED game for N frames, fires one F5 shader
+    // reload midway, and exits cleanly — the phase-4b D3 verification harness.
+    if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
     // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
@@ -1066,29 +1073,14 @@ int main(int argc, char** argv) {
   // competing for the adapter while phase 3a is still headless.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
-  // --backend vulkan: every headless mode — --selftest (all 23 gates since
-  // phase 4b), --shot, --shot-mob, --measure, the smokes — runs its real body
-  // against a Vulkan-backed World. Windowed (swapchain + imgui_impl_vulkan) is
-  // phase 4b D3; until it lands a windowed request is refused rather than
-  // silently served by Dawn: a run reported as Vulkan that was Dawn all along
-  // is worse than no run.
-  if (backendVulkan && !selftest && !measure && !vkSmoke && !vkSmokeLoud && !shot &&
-      shotMob.empty()) {
-    std::fprintf(stderr,
-                 "--backend vulkan cannot present (windowed) until phase 4b D3 "
-                 "(swapchain) lands.\n"
-                 "Use it with a headless mode:\n"
-                 "    sandvox --selftest --backend vulkan\n"
-                 "    sandvox --shot / --shot-mob <def> --backend vulkan\n"
-                 "    sandvox --measure  --backend vulkan\n"
-                 "    sandvox --vk-smoke / --vk-smoke-loud    (cross-backend hashes)\n"
-                 "Add --vk-validation for synchronization validation, and\n"
-                 "--barriers=sledgehammer for the barrier A/B oracle.\n");
-    return 2;
-  }
-  // The smokes run BOTH backends by construction, so they do not need --backend
-  // to select one; accepting the flag anyway keeps the invocations in the
-  // refusal message above honest.
+  // --backend vulkan: every mode runs its real body against a Vulkan-backed
+  // World since phase 4b — the 23 selftest gates, --shot/--shot-mob,
+  // --measure, the smokes, and the windowed game (swapchain +
+  // imgui_impl_vulkan, D3). Dawn remains the default until phase 6.
+  //
+  // The smokes run BOTH backends by construction, so they do not need
+  // --backend to select one; accepting the flag anyway keeps invocations
+  // uniform.
   if (vkSmoke) return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation);
   if (vkSmokeLoud)
     return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation);
@@ -1379,7 +1371,20 @@ int main(int argc, char** argv) {
   // ease outward as the bands land.
   float fogSmooth = kFarFogDensityMax;
 
+  // --frames N harness (phase 4b D3 verification): run N frames windowed,
+  // fire one F5 shader reload midway (the Tint recompile path), then close
+  // cleanly through the normal shutdown — so "window opens, world renders,
+  // reload works, clean exit" is checkable without a human at the keyboard.
+  uint64_t frameCounter = 0;
   while (!glfwWindowShouldClose(window)) {
+    if (g_harnessFrames > 0) {
+      frameCounter++;
+      if (frameCounter == g_harnessFrames / 2) {
+        std::printf("--frames harness: triggering shader reload (F5 path)\n");
+        ui.reloadShaders = true;
+      }
+      if (frameCounter >= g_harnessFrames) glfwSetWindowShouldClose(window, 1);
+    }
     glfwPollEvents();
     double now = NowSeconds();
     float dt = (float)(now - lastTime);
@@ -2905,12 +2910,24 @@ int main(int argc, char** argv) {
       TelemetryStage rs = {"render", renderMs};
       telemetry.Broadcast(tick, &rs, 1);
     }
+    if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tRender0) * 1000.0;
     ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
     telemetry.Poll();
   }
 
+  if (g_harnessFrames > 0 && frameCounter > 0) {
+    std::printf("--frames harness: %llu frames, avg render+present %.2f ms "
+                "(FIFO/vsync-paced; offscreen render cost is the selftest "
+                "'render 1080p' sweep)\n",
+                (unsigned long long)frameCounter,
+                g_harnessRenderMs / (double)frameCounter);
+  }
+
   telemetry.Shutdown();
   ctx.WaitIdle();
+  // Windowed Vulkan: print (and count) everything the debug messenger
+  // collected over the session — nothing pops a scope except F5 reloads.
+  ctx.ReportVkValidation("session");
   // Audio down before anything it points at: Shutdown stops the device, which
   // is the only thread that can still be inside the mixer.
   if (audioCues.Enabled()) {

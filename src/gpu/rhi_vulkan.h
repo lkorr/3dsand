@@ -158,6 +158,10 @@ struct Image {
   uint32_t width = 0, height = 0;
   VkImageAspectFlags aspect = 0;
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  // Swapchain image: the recorder's Finish() transitions it to PRESENT_SRC
+  // after the last touch, and the submit that rendered it waits the acquire
+  // semaphore / signals the per-image render-done semaphore.
+  bool presentable = false;
   std::string label;
 };
 
@@ -177,12 +181,46 @@ class Backend {
   // barrier document names the PRIMARY detector for a missing barrier. Both are
   // plumbed now even though nothing records barriers yet, because the moment
   // phase 3b starts generating them is the moment it needs to already be here.
-  bool Init(bool lowPower, bool validation, bool syncValidation, std::string& err);
+  // `instanceExts`/`instanceExtCount` (phase 4b D3): extra instance extensions,
+  // i.e. GLFW's surface extensions when windowed. `wantSwapchain` additionally
+  // enables VK_KHR_swapchain on the device (refused if absent).
+  bool Init(bool lowPower, bool validation, bool syncValidation, std::string& err,
+            const char* const* instanceExts = nullptr, uint32_t instanceExtCount = 0,
+            bool wantSwapchain = false);
   void Shutdown();
 
   const Caps& GetCaps() const { return caps_; }
   VkDevice Device() const { return device_; }
   const vkl::DeviceFns& Fns() const { return dfn_; }
+  // For the windowed path + imgui_impl_vulkan (src/ui/overlay.cpp via rhi_vk.h).
+  VkInstance Instance() const { return instance_; }
+  VkPhysicalDevice PhysicalDevice() const { return phys_; }
+  VkQueue GpuQueue() const { return queue_; }
+  uint32_t QueueFamily() const { return queueFamily_; }
+  // vkGetInstanceProcAddr against the live instance — ImGui's function loader.
+  PFN_vkVoidFunction InstanceProc(const char* name) const;
+
+  // ---- swapchain (phase 4b D3) ----
+  //
+  // FIFO present mode, matching Dawn's PresentMode::Fifo. `surface` is taken
+  // on the FIRST call and owned by the backend from then on; pass
+  // VK_NULL_HANDLE to recreate at a new size (resize). Recreation drains the
+  // queue first.
+  bool ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
+                          std::string& err);
+  // Acquire the next image. Null on OUT_OF_DATE (caller skips the frame; the
+  // resize path reconfigures) or if no swapchain exists.
+  Image* AcquireSwapchainImage();
+  // Present the acquired image (after the presenting submit). Tolerates
+  // SUBOPTIMAL/OUT_OF_DATE — the next resize reconfigures.
+  void PresentAcquired();
+  rhi::TextureFormat SwapchainFormat() const;
+  uint32_t SwapchainImageCount() const { return (uint32_t)swapImages_.size(); }
+  // SubmitEnded, plus the swapchain semaphores: waits the pending acquire
+  // semaphore at COLOR_ATTACHMENT_OUTPUT and signals the acquired image's
+  // render-done semaphore (which PresentAcquired waits on). Used by the seam
+  // for any command buffer whose render pass targeted a swapchain image.
+  VkFence SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err);
 
   // ---- buffers (barrier_graph §4.8) ----
   //
@@ -381,6 +419,8 @@ class Backend {
   bool InitAllocator(std::string& err);
   VkFence AcquireFence(std::string& err);
 
+  bool swapchainRequested_ = false;  // Init(wantSwapchain): enable VK_KHR_swapchain
+
   vkl::GlobalFns gfn_{};
   vkl::InstanceFns ifn_{};
   vkl::DeviceFns dfn_{};
@@ -402,6 +442,26 @@ class Backend {
   // Image registry (phase 4b). Owning, same lifetime rules as buffers_.
   std::vector<std::unique_ptr<Image>> images_;
   std::vector<DoomedImage> imageGraveyard_;
+
+  // ---- swapchain state (phase 4b D3) ----
+  void DestroySwapchainObjects();  // views/semaphores/swapchain, not the surface
+  VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+  VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+  VkFormat swapFormat_ = VK_FORMAT_UNDEFINED;
+  std::vector<std::unique_ptr<Image>> swapImages_;  // wrap swapchain VkImages
+  std::vector<VkSemaphore> renderDone_;             // one per swapchain image
+  // Acquire semaphores: a small ring paced by the fence of the submit that
+  // consumed each one — a semaphore handed to vkAcquireNextImageKHR must be
+  // unsignaled and unused, and the fence wait is what proves it.
+  struct AcquireSlot {
+    VkSemaphore sem = VK_NULL_HANDLE;
+    VkFence lastUse = VK_NULL_HANDLE;  // retained; released before reuse
+  };
+  static constexpr int kAcquireSlots = 3;
+  AcquireSlot acquireSlots_[kAcquireSlots];
+  int acquireCursor_ = 0;
+  AcquireSlot* pendingAcquireSlot_ = nullptr;  // consumed by the next presenting submit
+  uint32_t acquiredIndex_ = UINT32_MAX;
 
   // Pending uploads, in ISSUE ORDER. Never sorted, never coalesced.
   std::vector<Pending> pending_;

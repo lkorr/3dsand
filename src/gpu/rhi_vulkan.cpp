@@ -174,8 +174,10 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
 Backend::~Backend() { Shutdown(); }
 
 bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
-                   std::string& err) {
+                   std::string& err, const char* const* instanceExts,
+                   uint32_t instanceExtCount, bool wantSwapchain) {
   if (!vkl::LoadGlobal(gfn_, err)) return false;
+  swapchainRequested_ = wantSwapchain;
 
   // ---- layers/extensions ----
   std::vector<const char*> layers;
@@ -234,6 +236,9 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
     if (debugUtilsAvailable) exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     caps_.validationEnabled = true;
   }
+  // Windowed (phase 4b D3): the caller's surface extensions — GLFW's
+  // VK_KHR_surface + VK_KHR_win32_surface on this platform.
+  for (uint32_t i = 0; i < instanceExtCount; i++) exts.push_back(instanceExts[i]);
 
   // Synchronization validation is the PRIMARY detector for a missing barrier
   // (barrier_graph §6.2's detection ladder puts it above cross-backend hash
@@ -500,11 +505,34 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   }
   feat13.dynamicRendering = VK_TRUE;
 
+  // Windowed: VK_KHR_swapchain, verified present rather than assumed. A
+  // headless run enables nothing — the device is unchanged from phase 3.
+  std::vector<const char*> devExts;
+  if (swapchainRequested_) {
+    bool have = false;
+    uint32_t n = 0;
+    ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> props(n);
+    if (n) {
+      ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &n, props.data());
+      for (uint32_t i = 0; i < n; i++)
+        if (std::strcmp(props[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+          have = true;
+    }
+    if (!have) {
+      err = "device does not support VK_KHR_swapchain (windowed --backend vulkan)";
+      return false;
+    }
+    devExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  }
+
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   dci.pEnabledFeatures = &want;
   dci.pNext = &feat13;
+  dci.enabledExtensionCount = (uint32_t)devExts.size();
+  dci.ppEnabledExtensionNames = devExts.data();
 
   VkResult r = ifn_.CreateDevice(phys_, &dci, nullptr, &device_);
   if (r != VK_SUCCESS) {
@@ -1221,6 +1249,229 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
   return p;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4b D3: the swapchain. FIFO to match Dawn's present mode; per-image
+// render-done semaphores; a fence-paced ring of acquire semaphores.
+// ---------------------------------------------------------------------------
+
+PFN_vkVoidFunction Backend::InstanceProc(const char* name) const {
+  return gfn_.GetInstanceProcAddr ? gfn_.GetInstanceProcAddr(instance_, name) : nullptr;
+}
+
+void Backend::DestroySwapchainObjects() {
+  for (auto& im : swapImages_)
+    if (im->view) dfn_.DestroyImageView(device_, im->view, nullptr);
+  swapImages_.clear();
+  for (VkSemaphore s : renderDone_)
+    if (s) dfn_.DestroySemaphore(device_, s, nullptr);
+  renderDone_.clear();
+  for (auto& slot : acquireSlots_) {
+    if (slot.lastUse != VK_NULL_HANDLE) {
+      ReleaseFence(slot.lastUse);
+      slot.lastUse = VK_NULL_HANDLE;
+    }
+    if (slot.sem) dfn_.DestroySemaphore(device_, slot.sem, nullptr);
+    slot.sem = VK_NULL_HANDLE;
+  }
+  if (swapchain_ && dfn_.DestroySwapchainKHR)
+    dfn_.DestroySwapchainKHR(device_, swapchain_, nullptr);
+  swapchain_ = VK_NULL_HANDLE;
+  pendingAcquireSlot_ = nullptr;
+  acquiredIndex_ = UINT32_MAX;
+}
+
+bool Backend::ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
+                                 std::string& err) {
+  if (surface != VK_NULL_HANDLE) surface_ = surface;
+  if (surface_ == VK_NULL_HANDLE) {
+    err = "ConfigureSwapchain: no surface";
+    return false;
+  }
+  if (!dfn_.CreateSwapchainKHR || !ifn_.GetPhysicalDeviceSurfaceCapabilitiesKHR) {
+    err = "swapchain entry points missing (device created without VK_KHR_swapchain?)";
+    return false;
+  }
+
+  // Present support on the one queue family v1 uses (barrier_graph §5.1). A
+  // machine where the graphics+compute family cannot present would need a
+  // second queue, which the single-queue rule forbids — refuse and say so.
+  VkBool32 canPresent = VK_FALSE;
+  ifn_.GetPhysicalDeviceSurfaceSupportKHR(phys_, queueFamily_, surface_, &canPresent);
+  if (!canPresent) {
+    err = "queue family cannot present to this surface (single-queue rule, §5.1)";
+    return false;
+  }
+
+  // Recreate: drain first (in-flight frames reference the old images/views).
+  std::string werr;
+  WaitIdle(werr);
+  DestroySwapchainObjects();
+
+  VkSurfaceCapabilitiesKHR caps{};
+  ifn_.GetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_, &caps);
+  VkExtent2D extent = caps.currentExtent;
+  if (extent.width == UINT32_MAX) {  // surface lets us choose
+    extent.width = w;
+    extent.height = h;
+  }
+  if (extent.width == 0 || extent.height == 0) {
+    // Minimized: leave the swapchain absent; AcquireSwapchainImage returns
+    // null and the frame loop skips rendering, same as Dawn's invalid view.
+    return true;
+  }
+
+  uint32_t imageCount = caps.minImageCount + 1;
+  if (caps.maxImageCount && imageCount > caps.maxImageCount)
+    imageCount = caps.maxImageCount;
+
+  // Format: prefer BGRA8 UNORM (what Dawn negotiates on this platform); fall
+  // back to RGBA8, else the first offered.
+  uint32_t fmtCount = 0;
+  ifn_.GetPhysicalDeviceSurfaceFormatsKHR(phys_, surface_, &fmtCount, nullptr);
+  std::vector<VkSurfaceFormatKHR> fmts(fmtCount);
+  ifn_.GetPhysicalDeviceSurfaceFormatsKHR(phys_, surface_, &fmtCount, fmts.data());
+  VkSurfaceFormatKHR chosen = fmts.empty()
+                                  ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM,
+                                                       VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}
+                                  : fmts[0];
+  for (const auto& f : fmts)
+    if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+      chosen = f;
+      break;
+    }
+  swapFormat_ = chosen.format;
+
+  VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+  sci.surface = surface_;
+  sci.minImageCount = imageCount;
+  sci.imageFormat = chosen.format;
+  sci.imageColorSpace = chosen.colorSpace;
+  sci.imageExtent = extent;
+  sci.imageArrayLayers = 1;
+  sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  sci.preTransform = caps.currentTransform;
+  sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+  // FIFO: always available, and it is Dawn's PresentMode::Fifo — the vsync
+  // pacing the game already has.
+  sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  sci.clipped = VK_TRUE;
+
+  VkResult r = dfn_.CreateSwapchainKHR(device_, &sci, nullptr, &swapchain_);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkCreateSwapchainKHR failed: ") + vkl::ResultName(r);
+    return false;
+  }
+
+  uint32_t n = 0;
+  dfn_.GetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
+  std::vector<VkImage> vkImages(n);
+  dfn_.GetSwapchainImagesKHR(device_, swapchain_, &n, vkImages.data());
+
+  VkSemaphoreCreateInfo semCi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  for (uint32_t i = 0; i < n; i++) {
+    auto im = std::make_unique<Image>();
+    im->img = vkImages[i];
+    im->alloc = nullptr;  // swapchain-owned
+    im->format = swapFormat_;
+    im->width = extent.width;
+    im->height = extent.height;
+    im->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    im->presentable = true;
+    im->label = "swapchain";
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = im->img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = swapFormat_;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn_.CreateImageView(device_, &vci, nullptr, &im->view) != VK_SUCCESS) {
+      err = "vkCreateImageView failed for a swapchain image";
+      return false;
+    }
+    swapImages_.push_back(std::move(im));
+    VkSemaphore s = VK_NULL_HANDLE;
+    dfn_.CreateSemaphore(device_, &semCi, nullptr, &s);
+    renderDone_.push_back(s);
+  }
+  for (auto& slot : acquireSlots_) {
+    dfn_.CreateSemaphore(device_, &semCi, nullptr, &slot.sem);
+    slot.lastUse = VK_NULL_HANDLE;
+  }
+  acquireCursor_ = 0;
+  return true;
+}
+
+rhi::TextureFormat Backend::SwapchainFormat() const {
+  switch (swapFormat_) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return rhi::TextureFormat::BGRA8Unorm;
+    case VK_FORMAT_R8G8B8A8_UNORM: return rhi::TextureFormat::RGBA8Unorm;
+    default: return rhi::TextureFormat::Undefined;
+  }
+}
+
+Image* Backend::AcquireSwapchainImage() {
+  if (swapchain_ == VK_NULL_HANDLE) return nullptr;
+  AcquireSlot& slot = acquireSlots_[acquireCursor_];
+  // The semaphore must be unsignaled AND not in use by a previous acquire.
+  // The fence of the submit that consumed it is the proof.
+  if (slot.lastUse != VK_NULL_HANDLE) {
+    std::string err;
+    WaitFence(slot.lastUse, err);
+    ReleaseFence(slot.lastUse);
+    slot.lastUse = VK_NULL_HANDLE;
+  }
+  uint32_t idx = 0;
+  VkResult r = dfn_.AcquireNextImageKHR(device_, swapchain_, UINT64_MAX, slot.sem,
+                                        VK_NULL_HANDLE, &idx);
+  if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return nullptr;  // OUT_OF_DATE etc.
+  acquiredIndex_ = idx;
+  pendingAcquireSlot_ = &slot;
+  acquireCursor_ = (acquireCursor_ + 1) % kAcquireSlots;
+  return swapImages_[idx].get();
+}
+
+VkFence Backend::SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err) {
+  if (pendingAcquireSlot_ == nullptr || acquiredIndex_ == UINT32_MAX)
+    return SubmitEnded(cmd, err);  // no acquire outstanding: plain submit
+  VkFence fence = AcquireFence(err);
+  if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+  VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.waitSemaphoreCount = 1;
+  si.pWaitSemaphores = &pendingAcquireSlot_->sem;
+  si.pWaitDstStageMask = &waitStage;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  si.signalSemaphoreCount = 1;
+  si.pSignalSemaphores = &renderDone_[acquiredIndex_];
+  VkResult r = dfn_.QueueSubmit(queue_, 1, &si, fence);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkQueueSubmit (present) failed: ") + vkl::ResultName(r);
+    return VK_NULL_HANDLE;
+  }
+  inFlight_.push_back({fence, cmd, stagingHead_, ++submitSerial_});
+  // Pin this submit's fence to the acquire slot: reuse of the semaphore waits
+  // on it (see AcquireSwapchainImage).
+  RetainFence(fence);
+  pendingAcquireSlot_->lastUse = fence;
+  pendingAcquireSlot_ = nullptr;
+  return fence;
+}
+
+void Backend::PresentAcquired() {
+  if (acquiredIndex_ == UINT32_MAX || swapchain_ == VK_NULL_HANDLE) return;
+  VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+  pi.waitSemaphoreCount = 1;
+  pi.pWaitSemaphores = &renderDone_[acquiredIndex_];
+  pi.swapchainCount = 1;
+  pi.pSwapchains = &swapchain_;
+  pi.pImageIndices = &acquiredIndex_;
+  dfn_.QueuePresentKHR(queue_, &pi);  // SUBOPTIMAL/OUT_OF_DATE: resize handles
+  acquiredIndex_ = UINT32_MAX;
+}
+
 VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
                                              const rhi::BindGroupLayoutEntry* layoutEntries,
                                              const rhi::BindGroupEntry* entries,
@@ -1321,6 +1572,11 @@ void Backend::Shutdown() {
   for (VkFence f : retiredRetained_) dfn_.DestroyFence(device_, f, nullptr);
   retiredRetained_.clear();
   fenceRetain_.clear();
+
+  DestroySwapchainObjects();
+  if (surface_ != VK_NULL_HANDLE && ifn_.DestroySurfaceKHR)
+    ifn_.DestroySurfaceKHR(instance_, surface_, nullptr);
+  surface_ = VK_NULL_HANDLE;
 
   if (descPool_) dfn_.DestroyDescriptorPool(device_, descPool_, nullptr);
   descPool_ = VK_NULL_HANDLE;

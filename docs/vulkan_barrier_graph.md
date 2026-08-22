@@ -1466,7 +1466,10 @@ vendor. Two variables at once is how a race gets shipped.
 
 Concretely this means:
 - No `VkSemaphore` between tick and frame. Only the swapchain's acquire/present
-  semaphores, which are unrelated to the buffer graph.
+  semaphores, which are unrelated to the buffer graph. **[AS BUILT phase 4b]**
+  Exactly those exist: per-image render-done semaphores + a fence-paced ring of
+  acquire semaphores (`Backend::AcquireSwapchainImage`/`SubmitEndedPresenting`).
+  Nothing else in the engine creates a semaphore.
 - No queue-family ownership transfers anywhere, so `VkBufferMemoryBarrier2`
   always has `srcQueueFamilyIndex = dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED`.
   (This is the correct value for a same-queue barrier and the reason §3's
