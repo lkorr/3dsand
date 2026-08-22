@@ -92,10 +92,9 @@ release_lock() {
   rm -rf "$LOCK_DIR"
 }
 
-# ── Kill any running sandvox.exe (prevents LNK1104) ───────────────────────
-taskkill //F //IM sandvox.exe 2>/dev/null || true
-
 # ── Configure if requested or needed ──────────────────────────────────────
+# Outside the lock on purpose: configure only writes build system files, and
+# making every agent queue for it would serialize the cheap part too.
 if [ "$RUN_CONFIGURE" = true ] || [ ! -d "$ROOT/build" ]; then
   echo "build.sh: configuring..."
   cmake -S "$ROOT" -B "$ROOT/build" -G "Visual Studio 17 2022" -A x64
@@ -105,22 +104,42 @@ fi
 acquire_lock
 echo "build.sh: building $TARGET ($CONFIG) with max $MAX_JOBS parallel jobs..."
 
+# Kill any running sandvox.exe INSIDE the lock. This used to run before
+# acquire_lock, which made it useless under the load it exists to handle: agent
+# A killed the exe, then waited minutes behind the mutex, and by the time it
+# linked, agent B had launched a fresh sandvox.exe — LNK1104 anyway, after the
+# full wait. Killing here means nothing can start an exe between the kill and
+# our link, because starting one requires this same lock (see the selftest
+# below). Our own --selftest is the only sanctioned launcher.
+taskkill //F //IM sandvox.exe 2>/dev/null || true
+
 export CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS
-cmake --build "$ROOT/build" --config "$CONFIG" --target "$TARGET" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+# `set -e` would abort the script here on a failed build, skipping the
+# diagnostics below, so the failure is captured rather than propagated.
+BUILD_EXIT=0
+cmake --build "$ROOT/build" --config "$CONFIG" --target "$TARGET" \
+  "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || BUILD_EXIT=$?
 
-BUILD_EXIT=$?
-release_lock
-trap - EXIT
-
-if [ $BUILD_EXIT -ne 0 ]; then
+if [ "$BUILD_EXIT" -ne 0 ]; then
+  release_lock
+  trap - EXIT
   echo "build.sh: BUILD FAILED (exit $BUILD_EXIT)" >&2
-  exit $BUILD_EXIT
+  exit "$BUILD_EXIT"
 fi
 
 echo "build.sh: build succeeded."
 
-# ── Selftest (also serialized — it runs the exe) ──────────────────────────
+# ── Selftest — runs while we STILL HOLD the lock ──────────────────────────
+# The exe must not be live while another agent links, and this is the only
+# place the script starts one. Releasing the lock first (the old behaviour)
+# put every selftest run in direct competition with every other agent's link
+# step, which is the other half of the LNK1104 problem.
+SELFTEST_EXIT=0
 if [ "$RUN_SELFTEST" = true ]; then
   echo "build.sh: running selftest..."
-  "$ROOT/build/$CONFIG/sandvox.exe" --selftest
+  "$ROOT/build/$CONFIG/sandvox.exe" --selftest || SELFTEST_EXIT=$?
 fi
+
+release_lock
+trap - EXIT
+exit "$SELFTEST_EXIT"
