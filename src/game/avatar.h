@@ -242,6 +242,23 @@ class PlayerAvatar {
   void SelfDestruct(Vec3 atWorldVoxel, float radiusVox, World& world,
                     std::vector<ParticleSpawn>& spawns);
 
+  // ---- persistence (sim/worldio.h, entities.sve section 'AVTR') -----------
+  // The avatar is a mob def driven by the player, so it persists like a mob:
+  // per-part hp and sever state, def by NAME. Parts carry no lattices in v1 —
+  // the avatar has no per-voxel carve path (attached parts are always the
+  // def's authored art; see the note in SelfDestruct), so the lattices are
+  // fully re-derived by Spawn(). When avatar carving arrives, bump the version
+  // and add them, mirroring the MOBS section.
+  //
+  // LoadState runs while the avatar is despawned (the load reset), so it only
+  // RECORDS the state; the next Spawn() applies it to the fresh rig and clears
+  // it. A dead avatar is saved as absent: its corpse is debris ('DBRS'), and
+  // the player respawns whole.
+  static constexpr uint32_t kSaveVersion = 1;
+  void SaveState(std::vector<uint8_t>& out) const;
+  bool LoadState(const uint8_t* data, size_t len, uint32_t version);
+  void ClearPendingRestore() { restore_.valid = false; }
+
   bool IsAlive() const { return alive_; }
   bool PartAlive(int i) const {
     return i >= 0 && i < (int)anim_.partAlive.size() && anim_.partAlive[i];
@@ -379,6 +396,19 @@ class PlayerAvatar {
 
   void DetachPart(int index, bool adopt);
   void Die();
+
+  // Damage state read from a save (LoadState), applied at the end of the next
+  // Spawn() — the rig it applies to only exists once Spawn has built it.
+  struct SavedState {
+    bool valid = false;
+    std::string defName;
+    struct P {
+      uint8_t alive = 1;
+      float hp = 0;
+    };
+    std::vector<P> parts;
+  };
+  SavedState restore_;
   void PlayClip(const std::string& name);
   // `grounded` comes from the player's own collision sweep. The gait is a
   // WALKING system — it only means anything when there is a floor under the

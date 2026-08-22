@@ -49,7 +49,8 @@ const char* const kOrder[] = {
     "blood-stain", "flung-liquid", "far-fog",       "far-downsample",
     "screenshots", "player-walk", "debris",         "prefab",
     "mob",         "settle-back", "player-body",    "save-load",
-    "region-store", "streaming",  "spells",         "perf",
+    "save-entities", "region-store", "streaming",   "spells",
+    "perf",
 };
 
 const std::vector<Gate>& Registry() {

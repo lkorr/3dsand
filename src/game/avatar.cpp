@@ -9,6 +9,7 @@
 #include <cstdlib>
 
 #include "game/rigrender.h"
+#include "sim/bytestream.h"
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -610,6 +611,18 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   hidden_.assign(def.limbs.size(), 0);
   spawned_ = true;
   instancesDirty_ = true;
+
+  // A loaded save's damage state applies HERE (avatar.h persistence note):
+  // LoadState ran while the avatar was despawned, so it parked the state and
+  // the fresh rig built above is what it applies to. One-shot — an ordinary
+  // respawn later in the session must come back whole.
+  if (restore_.valid && restore_.defName == defName_) {
+    const size_t n = std::min(restore_.parts.size(), parts.size());
+    for (size_t i = 0; i < n; i++) parts[i].hp = restore_.parts[i].hp;
+    for (size_t i = 0; i < n; i++)
+      if (!restore_.parts[i].alive && parts[i].body) DetachPart((int)i, false);
+  }
+  restore_.valid = false;
   return true;
 }
 
@@ -1953,6 +1966,52 @@ void PlayerAvatar::Die() {
 void PlayerAvatar::Revive(const Player& player, float heading) {
   Despawn();
   Spawn(player, heading);
+}
+
+// ---- persistence (entities.sve section 'AVTR') ------------------------------
+
+void PlayerAvatar::SaveState(std::vector<uint8_t>& out) const {
+  ByteWriter w{out};
+  // A despawned or dead avatar saves as absent: the corpse (if any) is debris
+  // already, and the player respawns whole — see avatar.h.
+  const bool present = spawned_ && alive_ && def_ != nullptr;
+  w.U32(present ? 1u : 0u);
+  if (!present) return;
+  w.Str(defName_);
+  // Only the DEF's parts: a borrowed item slot past them is inventory, not
+  // body, and is re-equipped through EquipItem rather than persisted here.
+  const size_t n = std::min(parts.size(), def_->limbs.size());
+  w.U32((uint32_t)n);
+  for (size_t i = 0; i < n; i++) {
+    w.Pod((uint8_t)(parts[i].body ? 1 : 0));
+    w.F32(parts[i].hp);
+  }
+}
+
+bool PlayerAvatar::LoadState(const uint8_t* data, size_t len,
+                             uint32_t version) {
+  restore_ = SavedState{};
+  if (version != kSaveVersion) {
+    std::printf("avatar: unknown AVTR section version %u\n", version);
+    return false;
+  }
+  ByteReader r{data, len};
+  uint32_t present = 0;
+  r.U32(present);
+  if (!r.ok || !present) return r.ok;
+  SavedState s;
+  r.Str(s.defName);
+  uint32_t n = 0;
+  r.U32(n);
+  s.parts.resize(n);
+  for (uint32_t i = 0; i < n && r.ok; i++) {
+    r.Pod(s.parts[i].alive);
+    r.F32(s.parts[i].hp);
+  }
+  if (!r.ok) return false;
+  s.valid = true;
+  restore_ = std::move(s);  // applied by the next Spawn()
+  return true;
 }
 
 // ---- queries ----------------------------------------------------------------

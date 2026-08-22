@@ -151,6 +151,26 @@ grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
   directory per session; regen detaches without deleting files, so the last
   explicit save survives until the next save overwrites it. The old
   monolithic `.svx` (SVX2) format is retired.
+- **Save-format hardening + entity persistence (2026-08-22, worldio.h):**
+  `meta.svm` is `'SVM4'` and now records the exact BIT PATTERN of
+  `kVoxelMeters` and the full material NAME table alongside `kWorldN`/`kChunk`;
+  a load refuses any mismatch and names the exact field (down to "material id
+  12 was 'lava', build has 'acid'") — material ids are baked into every saved
+  chunk, and a silent voxel-size or table change is world corruption with a
+  green build. The directory also gains an optional `entities.sve`: a TLV
+  container of independently VERSIONED sections (`DBRS` debris bodies, `MOBS`
+  mob instances incl. sever/carve state, `AVTR` the player avatar), written
+  before `meta.svm` so meta's completed-save guarantee covers it. Unknown
+  section ids are skipped (forward compat); adding a persistable system means
+  adding a section via `game/persist.cpp`, never changing the container — so
+  no category of game state is structurally unable to persist. Micro bricks
+  are NOT serialized: they are derived render state, re-packed on load from
+  the authoritative voxel lattices (§3's "derived data must be
+  reconstructible"). Jolt bodies reload at their saved transform with zero
+  velocity, DEACTIVATED — a settled pile reloads settled (§11's sleep
+  invariant holds from tick one); anything saved mid-flight lands where it
+  was, accepted. Entity state is CPU-float gameplay state outside the hashed
+  domain (§7), so the grid hash round-trip is unchanged.
 - **Unloaded space is treated as solid and inert** so liquids can't drain off the
   edge of the loaded world (Burkelbear's solution; adopt it verbatim).
 - Overworld draw distance beyond the window is handled by the render-only

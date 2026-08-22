@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "game/bodyreg.h"
 #include "game/brush.h"
 #include "game/camera.h"
 #include "game/player.h"
@@ -79,13 +80,15 @@ bool debrisOk = false;
               debris.PendingEvents());
 
   // visual proof: render the settled debris field to screenshot_debris.bmp
+  // (through the ONE slot walk — game/bodyreg.h — like every render path)
   if (debris.BodyCount() > 0) {
+    BodyRegistry bodyReg(debris, c.mobs, nullptr);
     std::vector<BodyVoxInst> inst;
-    debris.BuildInstances(inst);
+    bodyReg.BuildInstances(inst);
     ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
                           inst.size() * sizeof(BodyVoxInst));
     std::vector<BodyXformGpu> xf;
-    debris.BuildXforms(xf);
+    bodyReg.BuildXforms(xf);
     ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
                           xf.size() * sizeof(BodyXformGpu));
 
@@ -105,7 +108,7 @@ bool debrisOk = false;
         enc, tex.CreateView(), wgpu::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
     sim.DrawParticles(rp);
-    sim.DrawBodies(rp, debris.InstanceCount());
+    sim.DrawBodies(rp, (uint32_t)inst.size());
     rp.End();
     wgpu::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
                                      wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
@@ -245,8 +248,10 @@ bool settleOk = false;
                               bspawns);
     uint32_t after = 0;
     {
+      // Counted through the registry (no mobs exist in this gate, so the count
+      // is the body's surviving voxels) — no slot-space list is built by hand.
       std::vector<BodyVoxInst> bi2;
-      debris.BuildInstances(bi2);
+      BodyRegistry(debris, c.mobs, nullptr).BuildInstances(bi2);
       after = (uint32_t)bi2.size();
     }
     bool blastOk = after < barVox && debris.BodyCount() >= 2;
@@ -288,7 +293,7 @@ bool settleOk = false;
     uint32_t lafter = 0;
     {
       std::vector<BodyVoxInst> bi3;
-      debris.BuildInstances(bi3);
+      BodyRegistry(debris, c.mobs, nullptr).BuildInstances(bi3);
       lafter = (uint32_t)bi3.size();
     }
     bool kerfOk = lafter < rodVox && debris.BodyCount() >= 2;
@@ -334,7 +339,7 @@ bool settleOk = false;
     debris.PostStep();
   }
   std::vector<BodyVoxInst> burnInst;
-  debris.BuildInstances(burnInst);
+  BodyRegistry(debris, c.mobs, nullptr).BuildInstances(burnInst);
   bool burnOk = fireOps > 5 && (uint32_t)burnInst.size() < plankVoxels;
   std::printf("body burn: %s (%u fire ops emitted, %u -> %zu voxels)\n",
               burnOk ? "PASS" : "FAIL", fireOps, plankVoxels,

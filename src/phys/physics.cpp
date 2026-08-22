@@ -771,6 +771,11 @@ bool Physics::IsActive(uint64_t handle) const {
   return system_->GetBodyInterface().IsActive(ToBodyID(handle));
 }
 
+void Physics::DeactivateBody(uint64_t handle) {
+  if (!system_ || handle == 0) return;
+  system_->GetBodyInterface().DeactivateBody(ToBodyID(handle));
+}
+
 void Physics::ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels,
                                  float impulse) {
   if (!system_) return;

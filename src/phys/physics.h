@@ -166,6 +166,10 @@ class Physics {
   void RemoveBody(uint64_t handle);
   bool GetTransform(uint64_t handle, BodyTransform& out) const;
   bool IsActive(uint64_t handle) const;
+  // Put a body to sleep immediately. Used by world LOAD: recreated bodies
+  // must start asleep so a settled pile reloads settled (CLAUDE.md rule 2)
+  // instead of every piece re-simulating its rest on the first tick.
+  void DeactivateBody(uint64_t handle);
   // Local-space bounds of a body's actual COLLIDER, in voxels, relative to its
   // own origin. For the collision-box debug overlay.
   //
