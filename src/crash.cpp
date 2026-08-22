@@ -124,7 +124,21 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
   SymCleanup(proc);
 
   summary[sizeof(summary) - 1] = '\0';
-  MessageBoxA(NULL, summary, "sandvox crashed", MB_OK | MB_ICONERROR);
+
+  // Mirror the summary to stderr so a captured console run (selftest, agents,
+  // CI) contains the stack trace without anyone having to find crash.log.
+  fputs(summary, stderr);
+  fflush(stderr);
+
+  // The modal dialog hangs an unattended run until someone clicks it.
+  // SANDVOX_NO_CRASH_DIALOG=1 (any value but "0") skips it; crash.log and
+  // stderr carry the full report either way.
+  char noDialog[8];
+  DWORD nd = GetEnvironmentVariableA("SANDVOX_NO_CRASH_DIALOG", noDialog,
+                                     sizeof(noDialog));
+  if (nd == 0 || noDialog[0] == '0') {
+    MessageBoxA(NULL, summary, "sandvox crashed", MB_OK | MB_ICONERROR);
+  }
 
   TerminateProcess(GetCurrentProcess(), code);
   return EXCEPTION_EXECUTE_HANDLER;
