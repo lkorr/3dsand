@@ -51,6 +51,11 @@ const M_PINE   : u32 = 35u;
 const M_AUTUMN : u32 = 36u;
 const M_BIRCH  : u32 = 37u;
 const M_PETAL  : u32 = 38u;
+// ---- aquatic plants (materials.json ids 59..62) ----
+const M_LILYPAD : u32 = 59u;
+const M_LILYFLR : u32 = 60u;
+const M_REED    : u32 = 61u;
+const M_KELP    : u32 = 62u;
 
 // Biomes, from the low-frequency biome field (see biomeAt).
 const B_FOREST : u32 = 0u;   // dominant: grass over dirt, dense trees
@@ -238,10 +243,19 @@ fn pondAt(x : i32, z : i32, seed : u32) -> vec2<i32> {
     wmin = min(wmin, baseHeight(cx + (s.x * r) / 256, cz + (s.y * r) / 256, seed));
   }
   let surf = wmin - 2;
-  // parabolic bowl: 2 voxels deep at the rim, 8 at the center, carved below
-  // the water surface (terrain that is already lower stays — water just fills
-  // deeper there, still capped by the rim-derived surface)
-  let depth = 2 + ((r * r - d2) * 6) / (r * r);
+  // Parabolic bowl, carved below the water surface (terrain that is already
+  // lower stays — water just fills deeper there, still capped by the
+  // rim-derived surface).
+  //
+  // DEPTH IS THE WHOLE POINT: at kVoxelMeters 0.10 the player capsule is 17
+  // voxels tall, so the original 8-voxel centre depth was 0.8 m and a pond
+  // could only ever be waded through. TUNE_POND_DEPTH now puts the centre well
+  // over the player's head while TUNE_POND_DEPTH_RIM keeps the edge shallow,
+  // so you walk in off a beach rather than stepping off a wall.
+  // LoadTuning clamps the depth under the cave layer — a bowl that breaches a
+  // tunnel drains the pond and the world never settles.
+  let depth = TUNE_POND_DEPTH_RIM +
+              ((r * r - d2) * (TUNE_POND_DEPTH - TUNE_POND_DEPTH_RIM)) / (r * r);
   return vec2<i32>(surf - depth, surf);
 }
 
@@ -823,6 +837,81 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
     }
   } else if (fluidTop >= 0 && y <= fluidTop) {
     mat = fluid;
+  }
+
+  // ---- pond life: kelp, reeds, lilypads ----
+  // Placed into cells that would otherwise be pond WATER, so nothing here can
+  // displace terrain or spill outside the bowl. Restricted to `pond >= 0`
+  // (the disc ponds) rather than to any fluid: the authored lava and oil pools
+  // are the same `fluid` machinery and should obviously not grow weeds, and
+  // the disc pond is the only body whose floor and surface are both known here
+  // as pure functions of the column.
+  //
+  // Everything is an INERT solid placed once at generation. Nothing grows,
+  // spreads or reacts with the water it stands in — a plant that did would
+  // keep every pond chunk awake forever and break the sleep budget (rule 2).
+  //
+  // All placement hashes are pure functions of (x, z, seed), like every other
+  // worldgen feature, so a plant straddling a chunk border generates
+  // identically from either chunk and regrows the same after an eviction.
+  // SEPARATE HASHES PER SPECIES, not bit-slices of one. Slicing (fr, fr>>3,
+  // fr>>17) looks independent and is not: the slices share entropy, so the
+  // three rolls correlate and a column that grew one plant is far more likely
+  // than chance to grow another. That is what turned a scattered planting into
+  // a solid wall of stalks. Three distinct salts cost two extra hashes per
+  // pond column and are actually independent.
+  if (mat == M_WATER && pond >= 0) {
+    let bed = min(h, pw.x);          // the carved bowl floor at this column
+    let depth = pond - bed;          // water column height in voxels
+    let above = pond - y;            // how far under the surface this cell is
+    let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
+    let hReed = hash3(seed ^ 0x2E3Du, bitcast<u32>(x), bitcast<u32>(z));
+    let hKelp = hash3(seed ^ 0xC5B1u, bitcast<u32>(x), bitcast<u32>(z));
+
+    // LILYPADS: a single cell floating ON the surface. Needs enough water
+    // under it that a pad reads as floating rather than as lying on mud.
+    if (y == pond && depth >= 10 && (hLily % TUNE_LILY_CHANCE) == 0u) {
+      mat = M_LILYPAD;
+    } else if (depth >= 4 && depth <= 14 && above >= 0 &&
+               y - bed < TUNE_REED_HEIGHT &&
+               (hReed % TUNE_REED_CHANCE) == 0u) {
+      // REEDS: emergent, in the SHALLOW MARGIN only — a narrow depth band, so
+      // they form a fringe around the shore rather than filling the bowl. They
+      // grow from the bed and break the surface, which is what makes them read
+      // as reeds rather than as underwater grass, so the height test is
+      // against the BED, not against the waterline.
+      mat = M_REED;
+    } else if (depth > 16 && above > 4 && y - bed < TUNE_KELP_HEIGHT &&
+               (hKelp % TUNE_KELP_CHANCE) == 0u) {
+      // KELP: fully submerged, in the DEEP MIDDLE only (depth > 16 excludes
+      // the whole shallow ring the reeds occupy, so the two never interleave).
+      // `above > 4` keeps a clear margin below the surface so kelp never pokes
+      // through — that margin is the difference between kelp and a reed. This
+      // is the plant that gives the submerged view its vertical structure for
+      // the light shafts to cut across.
+      mat = M_KELP;
+    }
+  }
+  // Above the waterline over a pond: the emergent half of the reeds, and the
+  // lily blossoms that sit proud of their pads. Both are placed in AIR cells,
+  // so they are the same features as the water-cell block above continued
+  // upward — same hashes, same column tests, so a reed is one continuous stalk
+  // through the surface rather than two unrelated halves.
+  if (mat == MAT_AIR && pond >= 0 && y > pond) {
+    let bed = min(h, pw.x);
+    let depth = pond - bed;
+    let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
+    let hReed = hash3(seed ^ 0x2E3Du, bitcast<u32>(x), bitcast<u32>(z));
+    if (depth >= 4 && depth <= 14 && y - bed < TUNE_REED_HEIGHT &&
+        (hReed % TUNE_REED_CHANCE) == 0u) {
+      mat = M_REED;
+    } else if (y == pond + 1 && depth >= 10 &&
+               (hLily % TUNE_LILY_CHANCE) == 0u &&
+               ((hLily >> 9u) % TUNE_LILY_FLOWER_CHANCE) == 0u) {
+      // Blossom on a minority of pads. Gated on the SAME pad roll, so a flower
+      // can only ever appear on a cell that actually grew a pad under it.
+      mat = M_LILYFLR;
+    }
   }
 
   // ---- surface cover: trees, then ground flora ----

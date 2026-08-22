@@ -1061,6 +1061,85 @@
         "organic",
         "dissolvable"
       ]
+    },
+    {
+      "//": "AQUATIC PLANTS. Placed by worldgen on and under pond surfaces. All four are ordinary inert solids with no reaction rules of their own, which is deliberate: rule 2 (cost scales with activity) says a settled pond has to sleep, and anything that grows, spreads or reacts on contact with water would keep every pond chunk awake forever. They are scenery, and they are the thing the light shafts and caustics need in order to have something to fall on.",
+      "id": "lilypad",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 260,
+      "hardness": 2,
+      "rubble": "dust",
+      "//colors": "Read from ABOVE against dark water almost all the time, so these are the top-face greens: a yellow-tinted mid green with a darker underside variant. Deliberately lighter and yellower than leaf_green, or a pad on a pond reads as a hole in the water rather than as something floating on it.",
+      "colors": [
+        "#4f8f3a",
+        "#437c31",
+        "#63a349"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "The blossom that sits on a lilypad. Its own material rather than a colour variant of the pad so worldgen can place it sparsely (most pads carry no flower) and so it keeps its own palette without dragging the pad's average colour toward white.",
+      "id": "lily_flower",
+      "class": "solid",
+      "density": 240,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#f2e7f0",
+        "#e6d3e4",
+        "#ffd9ef"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Emergent shore reed. Grows from the shallow pond bed up THROUGH the surface, so it is the one plant that reads both above and below the waterline, and it is what gives the underwater view vertical structure for the light shafts to cut across.",
+      "id": "reed",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 280,
+      "hardness": 3,
+      "rubble": "dust",
+      "colors": [
+        "#6f8f3e",
+        "#5c7a33",
+        "#84a24d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Fully submerged kelp/pondweed. Darker and bluer than the emergent reed because everything it grows in has already filtered the red out of the light reaching it — a plant authored at surface-green looks wrong down there even with correct water absorption on top, since the eye reads the two against each other.",
+      "id": "kelp",
+      "class": "solid",
+      "density": 320,
+      "hardness": 3,
+      "rubble": "dust",
+      "colors": [
+        "#2f6b45",
+        "#265839",
+        "#3c8253"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ]
     }
   ]
 }
