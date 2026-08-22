@@ -102,7 +102,11 @@ void PlayerAvatar::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
   classOf_.clear();
   for (const MaterialDef& m : mats) {
     densityOf_.push_back((float)m.gpu.density);
-    classOf_.push_back(m.gpu.klass);
+    // Collision class, not raw klass: passable vegetation reads as gas so the
+    // avatar's foot probe passes through reeds and kelp rather than planting
+    // on them (sim/materials.h kMatFlagPassable).
+    classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
+                                                        : m.gpu.klass);
   }
 }
 

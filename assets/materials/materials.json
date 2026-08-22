@@ -1,5 +1,5 @@
 {
-  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here \u2014 append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune.",
+  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here \u2014 append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune.",
   "materials": [
     {
       "id": "stone",
@@ -1065,6 +1065,7 @@
     {
       "//": "AQUATIC PLANTS. Placed by worldgen on and under pond surfaces. All four are ordinary inert solids with no reaction rules of their own, which is deliberate: rule 2 (cost scales with activity) says a settled pond has to sleep, and anything that grows, spreads or reacts on contact with water would keep every pond chunk awake forever. They are scenery, and they are the thing the light shafts and caustics need in order to have something to fall on.",
       "id": "lilypad",
+      "passable": true,
       "footstep": "leaf",
       "class": "solid",
       "density": 260,
@@ -1087,6 +1088,7 @@
     {
       "//": "The blossom that sits on a lilypad. Its own material rather than a colour variant of the pad so worldgen can place it sparsely (most pads carry no flower) and so it keeps its own palette without dragging the pad's average colour toward white.",
       "id": "lily_flower",
+      "passable": true,
       "class": "solid",
       "density": 240,
       "hardness": 2,
@@ -1106,6 +1108,7 @@
     {
       "//": "Emergent shore reed. Grows from the shallow pond bed up THROUGH the surface, so it is the one plant that reads both above and below the waterline, and it is what gives the underwater view vertical structure for the light shafts to cut across.",
       "id": "reed",
+      "passable": true,
       "footstep": "leaf",
       "class": "solid",
       "density": 280,
@@ -1127,6 +1130,7 @@
     {
       "//": "Fully submerged kelp/pondweed. Darker and bluer than the emergent reed because everything it grows in has already filtered the red out of the light reaching it — a plant authored at surface-green looks wrong down there even with correct water absorption on top, since the eye reads the two against each other.",
       "id": "kelp",
+      "passable": true,
       "class": "solid",
       "density": 320,
       "hardness": 3,

@@ -305,10 +305,10 @@ TP_U(worldgen, treeChancePine, TUNE_TREE_CHANCE_PINE, 70)
 TP_U(worldgen, treeChanceMeadow, TUNE_TREE_CHANCE_MEADOW, 22)
 TP_U(worldgen, treeChanceDesert, TUNE_TREE_CHANCE_DESERT, 6)
 TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
-TP_I(worldgen, pondTile, TUNE_POND_TILE, 224)
+TP_I(worldgen, pondTile, TUNE_POND_TILE, 448)
 TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
-TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 34)
-TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 30)
+TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 68)
+TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 60)
 // Bowl depth in VOXELS at the pond centre, tapering to pondDepthRim at the
 // edge. At kVoxelMeters 0.10 the player capsule is 17 voxels tall, so the old
 // 8-voxel centre depth was 0.8 m — ankle deep, and it made "swim in a pond"

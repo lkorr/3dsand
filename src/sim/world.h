@@ -206,6 +206,21 @@ inline uint32_t PackStain(uint32_t type, uint32_t amt) {
 constexpr uint32_t kMaterialSlots = 4096;
 constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
 
+// ---- the art palette ----
+// Same trick as the stain palette above, for the same reason. A mob's skin
+// carries a per-voxel ART COLOUR that is independent of its material — a
+// creature is "meat" everywhere and painted all over — so the renderer needs
+// slot -> colour for something that is not a material id. These 128 entries
+// sit just below the stain palette, are filled by Simulation::UploadTables
+// from the loaded prefabs' art palettes, and are inert as materials (nothing
+// can reference them: ids are assigned from the bottom up).
+//
+// 128 matches kArtPaletteSlots in sim/voxload.h, which is the .vox side of the
+// same range; the two must agree. Art colour is render-only and never reaches
+// a world cell, so none of this can move the world hash (rule 1).
+constexpr uint32_t kArtPaletteSlotsGpu = 128;
+constexpr uint32_t kArtPaletteBaseGpu = kStainPaletteBase - kArtPaletteSlotsGpu;
+
 // ---- static micro-detail brick pool (render-only — sim/microvox.h) ----------
 // The raymarcher substitutes a subdiv^3 voxel model for cells of a MATF_MICRO
 // material. All frames of all such materials live in ONE pool buffer, indexed
@@ -523,6 +538,11 @@ class World {
   const WorldSnapshot& Snap() const { return snap_; }
 
   // Voxel word at cell from the mirror; kind Unknown outside mirror coverage.
+  //
+  // `classOf` is a COLLISION class table, not simply a copy of each material's
+  // klass — build it with BuildCollisionClasses() below. The difference is
+  // materials flagged passable (soft vegetation), which report as Air here so
+  // bodies move through them while staying ordinary solids everywhere else.
   CellKind KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const;
 
   // Deterministic worldgen height — exact CPU mirror of worldgen.wgsl.

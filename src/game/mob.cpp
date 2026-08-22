@@ -167,6 +167,10 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   // pointing at the wrong bricks.
   micro.models.clear();
   micro.pool.clear();
+  // Same reasoning for the art palette: slots are positions in this merged
+  // list, so carrying one across a reload would repaint every def with the
+  // previous load's colours.
+  micro.artColors.clear();
   std::error_code ec;
   std::vector<std::string> voxPaths;
   for (auto& e : std::filesystem::directory_iterator(dir, ec))
@@ -184,6 +188,18 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
     }
     log += warn;
     def.name = def.prefab.name;
+
+    // Fold this file's art colours into the one palette every def resolves
+    // against, and rewrite its voxels' slots to the merged numbering NOW —
+    // before anything copies them into a limb, a flipbook frame or a micro
+    // brick. Doing it here means exactly one place understands the remap.
+    if (!def.prefab.artColors.empty()) {
+      const std::vector<uint8_t> remap =
+          MicroBodyMergeArt(micro, def.prefab.artColors, def.name, log);
+      for (PrefabModel& pm : def.prefab.models)
+        for (PrefabVoxel& v : pm.voxels)
+          if (v.color) v.color = remap[v.color];
+    }
 
     std::string jp = vp.substr(0, vp.size() - 4) + ".json";
     std::ifstream f(jp);
@@ -747,7 +763,11 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
   classOf_.clear();
   for (const auto& m : mats) {
     densityOf_.push_back((float)m.gpu.density);
-    classOf_.push_back(m.gpu.klass);
+    // Collision class, not raw klass: passable vegetation reads as gas so a
+    // mob's ground probe walks through reeds instead of standing on them or
+    // treating a reed bed as a wall (sim/materials.h kMatFlagPassable).
+    classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
+                                                        : m.gpu.klass);
   }
 }
 
@@ -876,8 +896,10 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
       limb.skinVoxels.reserve(model.voxels.size());
       for (const PrefabVoxel& v : model.voxels) {
         uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+        // `color` rides along untouched: it is ART, independent of the
+        // material, and only the material reaches the collider below.
         limb.skinVoxels.push_back(
-            {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12))});
+            {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12)), v.color});
       }
       bool overflow = false;
       limb.voxels = DownsampleSkin(limb.skinVoxels, ratio, &overflow);
@@ -897,7 +919,7 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
       limb.voxels.reserve(model.voxels.size());
       for (const PrefabVoxel& v : model.voxels) {
         uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-        limb.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
+        limb.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
                                (uint16_t)(v.material | (variant << 12))});
       }
     }
@@ -980,7 +1002,7 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
       dst.reserve(fm.voxels.size());
       for (const PrefabVoxel& v : fm.voxels) {
         uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-        dst.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
+        dst.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
                        (uint16_t)(v.material | (variant << 12))});
       }
     }

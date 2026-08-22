@@ -176,8 +176,9 @@ bool streamOk = false;
   // position clamp produced exactly this bug: an invisible wall at x=254).
   bool crossed = false;
   {
-    std::vector<uint32_t> classOf;
-    for (auto& m : mats) classOf.push_back(m.gpu.klass);
+    // Same COLLISION table the game builds (passable vegetation reads as
+    // gas — sim/materials.h), so this gate tests real behaviour.
+    std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
     Player p2;
     p2.fly = true;
     p2.pos = Vec3{140.5f, 110.0f, 140.5f};  // above the tallest hills (~90)

@@ -30,8 +30,10 @@ Status GatePlayerWalk(Ctx& c, std::string& detail) {
 // player walk test: drop onto terrain through the real async-mirror path
 bool walkOk = false;
 {
-  std::vector<uint32_t> classOf;
-  for (auto& m : mats) classOf.push_back(m.gpu.klass);
+  // Same COLLISION table the game builds, so a gate can never pass against
+  // collision behaviour the player does not actually have (passable
+  // vegetation reads as gas — sim/materials.h).
+  std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
   Player player;
   player.fly = false;
   int h = World::TerrainHeight(140, 140, kDefaultSeed);
@@ -314,12 +316,99 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- player-plants -----------------------------------------------------
+//
+// Soft vegetation must not stop a moving body. Pond weed, reeds and kelp are
+// ordinary solid voxels — the CA runs on them, they burn, the brush and the
+// laser remove them — but the player has to swim straight through, and before
+// kMatFlagPassable a reed bed was a wall of solid cubes you could stand on in
+// the middle of a pond.
+//
+// THE NEGATIVE HALF IS THE POINT. "The player moved" passes trivially if
+// collision is broken outright, so this walks the SAME body the SAME distance
+// into a wall built from the same fixture and requires it to be stopped. One
+// assertion without the other proves nothing.
+//
+// The material table is the REAL one (c.mats), not a synthetic flag: the thing
+// under test is that the shipped materials.json actually authors `passable` on
+// the plants and that BuildCollisionClasses honours it. A hand-made table here
+// would pass while the game still walled the player out of every pond.
+Status GatePlayerPlants(Ctx& c, std::string& detail) {
+  const std::vector<MaterialDef>& mats = c.mats;
+  std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
+
+  // Look up the shipped plant materials and a known-solid control by NAME.
+  auto idOf = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t kReed = idOf("reed");
+  const uint32_t kKelp = idOf("kelp");
+  const uint32_t kPad = idOf("lilypad");
+  const uint32_t kStone = idOf("stone");
+  const bool found = kReed && kKelp && kPad && kStone;
+
+  // Every plant must classify as non-blocking, and stone must not. This is the
+  // table-level assertion; the sweep below is the behavioural one.
+  auto passable = [&](uint32_t m) {
+    return m < classOf.size() && classOf[m] != CLASS_SOLID &&
+           classOf[m] != CLASS_POWDER;
+  };
+  const bool tableOk = found && passable(kReed) && passable(kKelp) &&
+                       passable(kPad) && !passable(kStone);
+
+  // Synthetic fixture, same reasoning as the waterjump gate above: floor at
+  // y<100, and a slab of FILL from x>=140 that the player walks into. Running
+  // it twice — once filled with reed, once with stone — isolates the material
+  // as the only variable.
+  auto runInto = [&](uint32_t fill) {
+    auto kindAt = [&](IVec3 p) {
+      if (p.y < 100) return CellKind::Solid;
+      if (p.x >= 140 && p.y < 130) {
+        uint32_t k = fill < classOf.size() ? classOf[fill] : (uint32_t)CLASS_SOLID;
+        if (k == CLASS_SOLID || k == CLASS_POWDER) return CellKind::Solid;
+        if (k == CLASS_LIQUID) return CellKind::Liquid;
+        return CellKind::Gas;
+      }
+      return CellKind::Air;
+    };
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{130.0f, 100.0f + Player::kHalfY, 130.5f};
+    PlayerInput in{};
+    in.forward = 1.0f;  // +x, straight at the slab
+    const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+    for (int i = 0; i < 200; i++) p.Update(1.0f / 30.0f, in, fwd, right, fwd, kindAt);
+    return p.pos.x;
+  };
+
+  const float reedX = runInto(kReed);
+  const float stoneX = runInto(kStone);
+  // Through the reeds: well past the x=140 face. Into the stone: stopped at
+  // it (the capsule half-width keeps the centre just short of 140).
+  const bool sweptThrough = reedX > 150.0f;
+  const bool stoppedByStone = stoneX < 141.0f;
+
+  const bool ok = tableOk && sweptThrough && stoppedByStone;
+  char buf[224];
+  std::snprintf(buf, sizeof(buf),
+                "table ok=%d (reed/kelp/pad passable, stone not); walked into "
+                "reeds x=%.1f (through=%d), into stone x=%.1f (stopped=%d)",
+                tableOk ? 1 : 0, reedX, sweptThrough ? 1 : 0, stoneX,
+                stoppedByStone ? 1 : 0);
+  detail = buf;
+  std::printf("player plants: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
   static const std::vector<Gate> g = {
       {"player-walk", "player", {}, false, GatePlayerWalk},
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
+      {"player-plants", "player", {}, false, GatePlayerPlants},
   };
   return g;
 }

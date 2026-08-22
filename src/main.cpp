@@ -470,8 +470,13 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // window a pond is a flat blue disc that tells you nothing. So re-centre on
   // it and regenerate. Chunk units, min corner, 16 chunks to a 256-voxel window.
   {
-    // Pond at (361,537) radius 52 for kDefaultSeed, from pondAt's tile hash.
-    const int kPx = 361, kPz = 537;
+    // Pond at (258,-235) radius 109 for kDefaultSeed, from pondAt's tile hash.
+    // A pond is now up to radius 127, so the widest ones no longer fit inside
+    // the 256-voxel window with any margin — centring the window on the pond
+    // puts its far shore right at the window edge. That is fine for a look
+    // shot (the near half is what these frames are about) but it is why the
+    // camera sits close to the middle rather than back on the bank.
+    const int kPx = 258, kPz = -235;
     world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
@@ -483,20 +488,24 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // Anchor to terrain OUTSIDE the bowl (the rim), not the centre —
     // TerrainHeight in the middle of a pond reports the carved floor, 2.6 m
     // down, and a camera placed relative to that sits underground.
-    int rim = World::TerrainHeight(kPx + 85, kPz + 85, kDefaultSeed);
+    // Offsets scale with the pond: these were sized for the old radius-52
+    // bowl and a doubled pond puts the far shore out of frame at those
+    // distances. kOff sits just outside the rim of this pond.
+    const int kR = 109, kOff = kR + 22;
+    int rim = World::TerrainHeight(kPx + kOff, kPz + kOff, kDefaultSeed);
     // From off the +x/+z side looking back at the centre: atan2(-1,-1) =
     // -135 degrees. The pad-strewn surface, the reed fringe and the shore.
-    render({(float)(kPx + 85), (float)(rim + 18), (float)(kPz + 85)}, -2.356f,
-           -0.26f, "screenshot_pond.bmp");
+    render({(float)(kPx + kOff), (float)(rim + 26), (float)(kPz + kOff)},
+           -2.356f, -0.24f, "screenshot_pond.bmp");
     // Straight down over the centre: the framing-independent check that the
     // bowl, the lilypad scatter and the plant density are what worldgen
     // intended, without depending on getting an eye-level camera right.
-    render({(float)kPx, (float)(rim + 60), (float)kPz}, 0.785f, -1.50f,
+    render({(float)kPx, (float)(rim + 118), (float)kPz}, 0.785f, -1.50f,
            "screenshot_pond_top.bmp");
     // INSIDE the pond, under the waterline: kelp silhouettes, the caustic web
     // on the bed and the light shafts all have to read at once. The surface
     // sits 2 under the lowest rim sample, the centre TUNE_POND_DEPTH below it.
-    render({(float)(kPx - 16), (float)(rim - 10), (float)(kPz - 16)}, 0.785f,
+    render({(float)(kPx - 30), (float)(rim - 10), (float)(kPz - 30)}, 0.785f,
            0.04f, "screenshot_pond_sub.bmp");
   }
   return 0;
@@ -1035,9 +1044,10 @@ int main(int argc, char** argv) {
     ui.materialColors.push_back(m.gpu.color0);
   }
 
-  // material class LUT for the player's mirror queries
-  std::vector<uint32_t> classOf;
-  for (auto& m : mats) classOf.push_back(m.gpu.klass);
+  // Material COLLISION class LUT for the player's mirror queries. Not raw
+  // klass: BuildCollisionClasses remaps passable vegetation to gas so the
+  // capsule sweep moves through reeds and kelp (sim/materials.h).
+  std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
 
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
 
@@ -1422,8 +1432,7 @@ int main(int argc, char** argv) {
         ui.mobNames.clear();
         for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
         if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
-        classOf.clear();
-        for (auto& m : mats) classOf.push_back(m.gpu.klass);
+        classOf = BuildCollisionClasses(mats);
         ui.materialNames.clear();
         ui.materialColors.clear();
         for (auto& m : mats) {

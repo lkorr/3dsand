@@ -20,6 +20,23 @@ constexpr uint32_t kMatFlagOpaque = 2;  // liquid renders as surface hit (lava)
 // it is SET BY THE MICRO LOADER on any material whose "micro" block resolved to
 // a valid brick, so the flag and the brick table can never disagree.
 constexpr uint32_t kMatFlagMicro = 4;
+// PASSABLE: a solid that moving bodies pass straight through — pond weed,
+// reeds, kelp, and anything else authored as soft vegetation. Authored in
+// materials.json as `"passable": true`.
+//
+// This is a COLLISION property only, and deliberately not a class. The cells
+// stay ordinary solids everywhere else: the CA still runs on them, the brush,
+// explosions and the laser still remove them, they still burn if flammable,
+// and the renderer still draws them as solid geometry. All that changes is
+// that the player capsule, mob ground probes and spell projectiles read them
+// as empty space rather than as a wall.
+//
+// Making them a new CLASS instead was the obvious alternative and it is wrong:
+// class drives density ordering and the whole displacement/settling model in
+// the sim, so a "passable" class would have to re-answer every one of those
+// questions for no benefit. A flag on a solid changes exactly the one thing
+// that needs changing.
+constexpr uint32_t kMatFlagPassable = 8;
 
 // GPU-side layout, 64 bytes — must match struct Material in common.wgsl.
 struct MaterialGpu {
@@ -237,3 +254,22 @@ struct MaterialDef {
 bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPath,
                 std::vector<MaterialDef>& mats, std::vector<ReactionGpu>& reactions,
                 std::string& errors);
+
+// Builds the material-id -> COLLISION class table that World::KindAt reads.
+//
+// This is not just `m.gpu.klass` per material, and the difference is the whole
+// point: a material flagged PASSABLE (soft vegetation — reeds, kelp, lilypads)
+// is reported as CLASS_GAS here, so KindAt returns Gas and every CPU collision
+// path already treats it as empty space. The player capsule sweep, the mob and
+// avatar ground probes and the spell projectile march all test against Solid,
+// so none of them needs to learn about the flag.
+//
+// Gas rather than a new kind, because Gas is the class those paths ALREADY
+// mean "you can move through this" for — smoke and steam. Reusing it means the
+// behaviour drops out of the existing tests instead of adding a fourth case to
+// each of them, and a caller that forgets to handle passable simply cannot
+// exist.
+//
+// Everything else still sees a solid: the CA, fire, the brush, explosions, the
+// laser and the renderer all read gpu.klass directly and are untouched.
+std::vector<uint32_t> BuildCollisionClasses(const std::vector<MaterialDef>& mats);

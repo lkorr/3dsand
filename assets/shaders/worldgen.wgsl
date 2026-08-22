@@ -214,12 +214,25 @@ fn pondAt(x : i32, z : i32, seed : u32) -> vec2<i32> {
   let pz = fdiv(z, POND_TILE);
   let rh = hash3(seed ^ 0xB0A7u, bitcast<u32>(pt), bitcast<u32>(pz));
   if (rh % TUNE_POND_CHANCE != 0u) { return none; }              // ~1 pond per 4 tiles
-  let r = TUNE_POND_RADIUS_MIN + i32((rh >> 4u) % TUNE_POND_RADIUS_SPAN);              // radius 20..36 (2.5-4.5 m)
-  // Center insets by 60 > max radius + margin: the disc never leaves its own
-  // tile, so callers only ever consult ONE tile (no neighborhood scan).
-  let span = u32(POND_TILE - 120);
-  let cx = pt * POND_TILE + 60 + i32((rh >> 9u) % span);
-  let cz = pz * POND_TILE + 60 + i32((rh >> 17u) % span);
+  let r = TUNE_POND_RADIUS_MIN + i32((rh >> 4u) % TUNE_POND_RADIUS_SPAN);
+  // The disc must never leave its own tile: pondAt is consulted for ONE tile
+  // per column (no neighbourhood scan), so a pond that overhung its tile edge
+  // would simply vanish from the columns on the other side — half a bowl,
+  // carved terrain with no water in it.
+  //
+  // The inset is therefore DERIVED from the largest radius this tuning can
+  // produce, not a hardcoded constant. It used to be a literal 60, which was
+  // correct only for the original radius 20..36; the moment the radii grew
+  // past it the guarantee silently broke. `maxR + 4` keeps a small margin for
+  // the rim samples.
+  let maxR = TUNE_POND_RADIUS_MIN + i32(TUNE_POND_RADIUS_SPAN) - 1;
+  let inset = maxR + 4;
+  // A tile that cannot contain the biggest possible disc holds no pond at all,
+  // rather than one that silently clips. max(1) keeps the modulo legal.
+  let span = u32(max(POND_TILE - 2 * inset, 1));
+  if (POND_TILE - 2 * inset < 1) { return none; }
+  let cx = pt * POND_TILE + inset + i32((rh >> 9u) % span);
+  let cz = pz * POND_TILE + inset + i32((rh >> 17u) % span);
   // Keep-out zones, by DISC (center + radius), not by column: the spawn
   // clearing + fixture pads, the streaming ball column (408,128) whose test
   // assumes TerrainHeight() is the surface, and the three authored pools

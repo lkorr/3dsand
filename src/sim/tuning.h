@@ -948,7 +948,7 @@ struct Tuning {
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
-    int pondTile = 224, pondChance = 4, pondRadiusMin = 34, pondRadiusSpan = 30;
+    int pondTile = 448, pondChance = 4, pondRadiusMin = 68, pondRadiusSpan = 60;
     // Bowl depth in VOXELS: pondDepth at the centre, pondDepthRim at the edge.
     // At kVoxelMeters 0.10 the player is 17 voxels tall, so a pond has to reach
     // roughly 20 before you can actually submerge in one — the previous

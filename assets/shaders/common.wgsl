@@ -31,6 +31,13 @@ const MATF_OPAQUE : u32 = 2u;  // liquid renders as a surface hit (lava), not me
 // material's cells (see MicroBrick below and trace() in raymarch.wgsl). Set by
 // the CPU micro loader, never authored — sim/microvox.h.
 const MATF_MICRO  : u32 = 4u;
+// Soft vegetation (pond weed, reeds, kelp): moving bodies pass through it.
+// A COLLISION property only — the CPU capsule sweep, the mob ground probes and
+// spell projectiles read these cells as empty. Everything on the GPU still
+// treats them as ordinary solids: the CA runs on them, they burn, the brush and
+// explosions remove them, and the renderer draws them as solid geometry. Kept
+// here so the flag bits cannot drift from sim/materials.h (kMatFlagPassable).
+const MATF_PASSABLE : u32 = 8u;
 
 struct Material {
   klass       : u32,
