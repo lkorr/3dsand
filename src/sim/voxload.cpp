@@ -290,6 +290,9 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
     PrefabModel pm;
     pm.name = std::move(em.name);
     pm.offset = {em.mn.x - pmn.x, em.mn.y - pmn.y, em.mn.z - pmn.z};
+    // Exactly what the rebase below subtracts, kept so a sidecar box authored
+    // in the .vox's own coordinates can be brought onto this art (voxload.h).
+    pm.sceneMin = em.mn;
     pm.size = {em.mx.x - em.mn.x + 1, em.mx.y - em.mn.y + 1, em.mx.z - em.mn.z + 1};
     pm.voxels.reserve(em.cells.size());
     for (size_t i = 0; i < em.cells.size(); i++) {

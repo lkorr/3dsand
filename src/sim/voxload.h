@@ -31,6 +31,27 @@ struct PrefabModel {
   std::string name;   // scene-graph node name, or "modelN"
   IVec3 size{};       // engine-axis extents of this model
   IVec3 offset{};     // model min corner in PREFAB frame (prefab min = 0)
+  // This model's min corner in the RAW ENGINE SCENE frame — exactly what was
+  // subtracted from every cell to rebase `voxels` onto zero.
+  //
+  // Needed by anything that converts an AUTHORED BOX out of a sidecar (an
+  // item's hilt or cutting edge) and has to land it on this art. The
+  // scene -> engine map is (x, z, -y), so the negated axis puts a model at
+  // NEGATIVE engine coordinates; the loader then rebases the voxels but
+  // nothing rebases the sidecar's numbers, leaving the two a full model-depth
+  // apart. Subtracting this puts them in one frame by construction.
+  //
+  // `offset` cannot stand in for it: that is measured AFTER the rebase and is
+  // (0,0,0) for a single-model file. Nor can it be reconstructed from `size` —
+  // that only matches while the model sits at the scene origin unrotated, and
+  // a scene-graph translate or a rotated instance breaks it silently.
+  //
+  // A CELL INDEX, not a face. On the negated axis those differ by one cell, so
+  // a caller converting a continuous box has to bias for it — see the note at
+  // the one caller (game/melee.cpp), which is also where leaving this
+  // un-recorded put a sword's hilt box on the far side of its own origin from
+  // the blade.
+  IVec3 sceneMin{};
   std::vector<PrefabVoxel> voxels;
 };
 

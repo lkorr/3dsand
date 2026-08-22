@@ -91,12 +91,14 @@ let brushSize = 1;            // spherical radius for voxel/noise brushes (1 = s
 let noiseDensity = 0.35;      // fraction of surface cells the noise brush hits
 
 // --- undo ----------------------------------------------------------------
-// A stroke is a flat array of [modelIndex, cellIndex, oldMat, newMat] quads.
-// Flat because a long box drag can be tens of thousands of cells and an array
-// of objects costs more than the edit itself. Carrying the model index is
-// what lets one stroke span models (whole-model mode) and lets the undo log
-// survive switching the active model.
+// Entries are {type, data}. Voxel: data is a flat [modelIndex, cellIndex,
+// oldMat, newMat] quad array. Color: data is {matIndex, variant, oldHex,
+// newHex}. The typed wrapper lets voxel strokes and color-wheel edits share
+// one Ctrl+Z stack without changing the voxel path's flat-array perf.
 let undoStack = [], redoStack = [], stroke = null;
+
+// --- clipboard -----------------------------------------------------------
+let clipboard = null;  // { dim:{x,y,z}, data:Uint8Array }
 
 // --- three ---------------------------------------------------------------
 let renderer = null, scene = null, camera = null, controls = null;
@@ -112,6 +114,8 @@ let gizmo = null, gizmoBall = null, gizmoArc = null, gizmoAxis = null;
 // readout, and they turn with the grip so "roll 30" has a visible meaning.
 let socketAxes = null;
 let gridHelper = null, axes = null;
+let selectionOutline = null;
+let resizeHandles = [];        // 6 spheres, one per bounding-box face
 let canvas = null, host = null;
 let initialised = false, initFailed = false;
 let needsRebuild = false;
@@ -247,7 +251,7 @@ function applyOps(cells, value) {
 
 function endStroke() {
   if (stroke && stroke.length) {
-    undoStack.push(stroke);
+    undoStack.push({ type: 'voxel', data: stroke });
     redoStack.length = 0;
     markDirty();
     needsRebuild = true;
@@ -259,28 +263,207 @@ function endStroke() {
 // grid sizes, so the quad-format log cannot survive them.
 function clearUndo() { undoStack = []; redoStack = []; stroke = null; }
 
-function undo() {
-  const s = undoStack.pop();
-  if (!s) { hooks.toast('nothing to undo'); return; }
+function undoVoxel(s) {
   for (let i = s.length - 4; i >= 0; i -= 4)
     doc.models[s[i]].grid.data[s[i + 1]] = s[i + 2];
-  redoStack.push(s);
-  markDirty(); needsRebuild = true;
+  needsRebuild = true;
   hooks.toast('undo (' + (s.length / 4) + ' voxel' + (s.length === 4 ? '' : 's') + ')');
+}
+function redoVoxel(s) {
+  for (let i = 0; i < s.length; i += 4)
+    doc.models[s[i]].grid.data[s[i + 1]] = s[i + 3];
+  needsRebuild = true;
+  hooks.toast('redo (' + (s.length / 4) + ' voxels)');
+}
+function undoColor(d) {
+  const m = materials[d.matIndex];
+  if (m && Array.isArray(m.colors)) m.colors[d.variant] = d.oldHex;
+  hooks.touchMaterials?.();
+  renderPalette();
+  needsRebuild = true;
+  hooks.toast('undo colour');
+}
+function redoColor(d) {
+  const m = materials[d.matIndex];
+  if (m && Array.isArray(m.colors)) m.colors[d.variant] = d.newHex;
+  hooks.touchMaterials?.();
+  renderPalette();
+  needsRebuild = true;
+  hooks.toast('redo colour');
+}
+
+function applyGrowSnapshot(d, which) {
+  const snap = d[which];
+  const m = doc.models[d.modelIndex];
+  if (!m) return;
+  m.grid = { dim: { ...snap.dim }, data: new Uint8Array(snap.data) };
+  m.dim = { ...snap.dim };
+  m.offset = { ...snap.offset };
+  if (d.modelIndex === activeModel) grid = m.grid;
+  if (snap.anchors && sidecar && Array.isArray(sidecar.limbs))
+    for (const [name, a] of snap.anchors) {
+      const l = sidecar.limbs.find(l => l.name === name);
+      if (l && Array.isArray(l.anchor)) { l.anchor[0] = a[0]; l.anchor[1] = a[1]; l.anchor[2] = a[2]; }
+    }
+  reboundDoc();
+  if (initialised) { frameCamera(); updateResizeHandles(); }
+  needsRebuild = true;
+  hooks.onModelsChanged?.();
+  hooks.toast(which === 'before' ? 'undo resize' : 'redo resize');
+}
+
+function dispatchUndo(e) {
+  if (e.type === 'voxel') undoVoxel(e.data);
+  else if (e.type === 'color') undoColor(e.data);
+  else if (e.type === 'grow') applyGrowSnapshot(e.data, 'before');
+}
+function dispatchRedo(e) {
+  if (e.type === 'voxel') redoVoxel(e.data);
+  else if (e.type === 'color') redoColor(e.data);
+  else if (e.type === 'grow') applyGrowSnapshot(e.data, 'after');
+}
+
+function undo() {
+  const e = undoStack.pop();
+  if (!e) { hooks.toast('nothing to undo'); return; }
+  dispatchUndo(e);
+  redoStack.push(e);
+  markDirty();
 }
 
 function redo() {
-  const s = redoStack.pop();
-  if (!s) { hooks.toast('nothing to redo'); return; }
-  for (let i = 0; i < s.length; i += 4)
-    doc.models[s[i]].grid.data[s[i + 1]] = s[i + 3];
-  undoStack.push(s);
-  markDirty(); needsRebuild = true;
-  hooks.toast('redo (' + (s.length / 4) + ' voxels)');
+  const e = redoStack.pop();
+  if (!e) { hooks.toast('nothing to redo'); return; }
+  dispatchRedo(e);
+  undoStack.push(e);
+  markDirty();
 }
 
 function markDirty() { docDirty = true; hooks.onDirty(true); updateStatus(); }
 function clearDirty() { docDirty = false; hooks.onDirty(false); updateStatus(); }
+
+/* ---- selection + clipboard -------------------------------------------- */
+
+function setSelection(sel) {
+  selection = sel;
+  hooks.onSelectionChanged?.(selection);
+  if (selection && selectionOutline) {
+    const lo = selection.lo, hi = selection.hi;
+    const o = activeDef()?.offset || { x: 0, y: 0, z: 0 };
+    const cx = o.x + (lo[0] + hi[0]) / 2 + 0.5;
+    const cy = o.y + (lo[1] + hi[1]) / 2 + 0.5;
+    const cz = o.z + (lo[2] + hi[2]) / 2 + 0.5;
+    selectionOutline.visible = true;
+    selectionOutline.scale.set(hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1);
+    selectionOutline.position.set(cx, cy, cz);
+  } else if (selectionOutline) {
+    selectionOutline.visible = false;
+  }
+  updateStatus();
+}
+
+function selectAll() {
+  if (!grid || !doc) return;
+  const d = grid.dim;
+  setSelection({ lo: [0, 0, 0], hi: [d.x - 1, d.y - 1, d.z - 1], model: activeModel });
+  hooks.toast(`selected all (${d.x}×${d.y}×${d.z})`);
+}
+
+function deleteSelection() {
+  if (!selection || !doc) {
+    hooks.toast('no selection', true); return;
+  }
+  if (activeModel !== selection.model) setActiveModel(selection.model);
+  const { lo, hi } = selection;
+  const cells = [];
+  for (let z = lo[2]; z <= hi[2]; z++)
+    for (let y = lo[1]; y <= hi[1]; y++)
+      for (let x = lo[0]; x <= hi[0]; x++)
+        if (gridGet(grid, x, y, z)) cells.push([x, y, z]);
+  if (!cells.length) { hooks.toast('selection is empty', true); return; }
+  const savedMirror = mirror;
+  mirror = { x: false, y: false, z: false };
+  beginStroke();
+  applyOps(cells, 0);
+  endStroke();
+  mirror = savedMirror;
+  hooks.toast(`deleted ${cells.length} voxel${cells.length === 1 ? '' : 's'}`);
+}
+
+function copySelection() {
+  if (!selection || !doc) {
+    hooks.toast('no selection — Select [V], Ctrl+A, or click a limb', true); return;
+  }
+  if (activeModel !== selection.model) setActiveModel(selection.model);
+  const { lo, hi } = selection;
+  const dx = hi[0] - lo[0] + 1, dy = hi[1] - lo[1] + 1, dz = hi[2] - lo[2] + 1;
+  const dim = { x: dx, y: dy, z: dz };
+  const data = new Uint8Array(dx * dy * dz);
+  let count = 0;
+  for (let z = 0; z < dz; z++)
+    for (let y = 0; y < dy; y++)
+      for (let x = 0; x < dx; x++) {
+        const v = gridGet(grid, lo[0] + x, lo[1] + y, lo[2] + z);
+        data[x + y * dx + z * dx * dy] = v;
+        if (v) count++;
+      }
+  if (!count) { hooks.toast('selection contains no voxels', true); return; }
+  clipboard = { dim, data };
+  hooks.toast(`copied ${count} voxel${count === 1 ? '' : 's'} (${dx}×${dy}×${dz})`);
+}
+
+function cutSelection() {
+  copySelection();
+  if (clipboard) deleteSelection();
+}
+
+function pasteClipboard() {
+  if (!clipboard) { hooks.toast('clipboard empty — Ctrl+C first', true); return; }
+  if (!grid || !doc) return;
+  let ox = 0, oy = 0, oz = 0;
+  if (hover) { const t = targetOf(hover); ox = t[0]; oy = t[1]; oz = t[2]; }
+  const d = clipboard.dim;
+  const byMat = new Map();
+  let clipped = 0;
+  for (let z = 0; z < d.z; z++)
+    for (let y = 0; y < d.y; y++)
+      for (let x = 0; x < d.x; x++) {
+        const v = clipboard.data[x + y * d.x + z * d.x * d.y];
+        if (!v) continue;
+        const px = ox + x, py = oy + y, pz = oz + z;
+        if (!inBounds(px, py, pz)) { clipped++; continue; }
+        if (!byMat.has(v)) byMat.set(v, []);
+        byMat.get(v).push([px, py, pz]);
+      }
+  if (!byMat.size) {
+    hooks.toast(`paste: all ${clipped} voxels outside bounds`, true); return;
+  }
+  const savedMirror = mirror;
+  mirror = { x: false, y: false, z: false };
+  beginStroke();
+  for (const [mat, cells] of byMat) applyOps(cells, mat);
+  endStroke();
+  mirror = savedMirror;
+  let n = 0; for (const c of byMat.values()) n += c.length;
+  let msg = `pasted ${n} voxel${n === 1 ? '' : 's'}`;
+  if (clipped) msg += ` (${clipped} clipped)`;
+  hooks.toast(msg);
+}
+
+function fillSelection() {
+  if (!selection || !doc) { hooks.toast('no selection', true); return; }
+  if (activeModel !== selection.model) setActiveModel(selection.model);
+  const { lo, hi } = selection;
+  const cells = [];
+  for (let z = lo[2]; z <= hi[2]; z++)
+    for (let y = lo[1]; y <= hi[1]; y++)
+      for (let x = lo[0]; x <= hi[0]; x++)
+        cells.push([x, y, z]);
+  beginStroke();
+  applyOps(cells, activeMat);
+  endStroke();
+  hooks.toast(`filled ${cells.length} cells with ${matName(activeMat)}`);
+}
 
 /* ---- multi-model document ---------------------------------------------- */
 
@@ -360,6 +543,7 @@ function moveModel(i, d, moveAnchor = true) {
   // still clear, because it reallocates the grid and renumbers flat indices.
   markDirty();
   needsRebuild = true;
+  if (initialised) updateResizeHandles();
   hooks.onModelsChanged?.();
   updateStatus();
   return true;
@@ -375,6 +559,17 @@ function moveModel(i, d, moveAnchor = true) {
  * Voxels keep their world position: the grid is re-blitted at the new offset,
  * and the anchor is untouched because nothing moved on screen.
  */
+function snapshotModel(i) {
+  const m = doc.models[i];
+  const snap = { dim: { ...m.dim }, offset: { ...m.offset }, data: new Uint8Array(m.grid.data) };
+  if (sidecar && Array.isArray(sidecar.limbs)) {
+    snap.anchors = sidecar.limbs
+      .filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
+      .map(l => [l.name, l.anchor.slice()]);
+  }
+  return snap;
+}
+
 function growModel(i, pad) {
   if (!doc) return false;
   const m = doc.models[i];
@@ -386,10 +581,10 @@ function growModel(i, pad) {
   const dim = { x: m.dim.x + p.lo.x + p.hi.x, y: m.dim.y + p.lo.y + p.hi.y,
                 z: m.dim.z + p.lo.z + p.hi.z };
   if (dim.x < 1 || dim.y < 1 || dim.z < 1) return false;
+
+  const before = snapshotModel(i);
+
   const g = makeGrid(dim);
-  // Negative padding CROPS, so the destination must be range-checked: a raw
-  // gridSet with a negative index writes into the neighbouring row instead of
-  // failing, which would smear voxels across the model rather than cut them.
   let cropped = 0;
   for (let z = 0; z < m.dim.z; z++)
     for (let y = 0; y < m.dim.y; y++)
@@ -403,13 +598,8 @@ function growModel(i, pad) {
       }
   if (cropped) hooks.toast(`cropped ${cropped} voxel` + (cropped === 1 ? '' : 's'), true);
   m.grid = g; m.dim = dim;
-  // Growing on the low side moves the box's min corner outward, so the offset
-  // has to walk back by the same amount or the content would jump.
   m.offset.x -= p.lo.x; m.offset.y -= p.lo.y; m.offset.z -= p.lo.z;
   if (i === activeModel) grid = g;
-  // Same rebase hazard as moveModel: growing below the origin makes
-  // reboundDoc shift every offset, and anchors must follow or every OTHER
-  // limb's joint silently desyncs from its mesh.
   const expect = { x: m.offset.x, y: m.offset.y, z: m.offset.z };
   reboundDoc();
   const rb = { x: m.offset.x - expect.x, y: m.offset.y - expect.y,
@@ -419,9 +609,14 @@ function growModel(i, pad) {
       if (Array.isArray(l.anchor) && l.anchor.length === 3) {
         l.anchor[0] += rb.x; l.anchor[1] += rb.y; l.anchor[2] += rb.z;
       }
-  clearUndo();
+
+  const after = snapshotModel(i);
+  undoStack.push({ type: 'grow', data: { modelIndex: i, before, after } });
+  redoStack.length = 0;
+
   markDirty();
   needsRebuild = true;
+  if (initialised) updateResizeHandles();
   hooks.onModelsChanged?.();
   updateStatus();
   return true;
@@ -435,6 +630,7 @@ function setActiveModel(i) {
   // active model; only an in-flight stroke is dropped.
   stroke = null;
   needsRebuild = true;
+  if (initialised) updateResizeHandles();
   hooks.onModelsChanged?.();
   updateStatus();
 }
@@ -570,8 +766,7 @@ function splitSelectionToModel(name) {
   // part; the split is structural, so it takes the whole log with it.
   clearUndo();
   reboundDoc();
-  selection = null;
-  hooks.onSelectionChanged?.(null);
+  setSelection(null);
   setActiveModel(doc.models.length - 1);
   markDirty();
   hooks.toast(`split ${count} voxels into "${doc.models[activeModel].name}"`);
@@ -615,8 +810,7 @@ function upscaleDoc() {
     m.offset = { x: m.offset.x * 2, y: m.offset.y * 2, z: m.offset.z * 2 };
   }
   clearUndo();
-  selection = null;
-  hooks.onSelectionChanged?.(null);
+  setSelection(null);
   reboundDoc();
   grid = doc.models[activeModel].grid;
   markDirty();
@@ -639,6 +833,7 @@ function newModel(dx, dy, dz, name = 'untitled') {
   grid = doc.models[0].grid;
   docPath = null; docName = name; sidecar = null; sidecarPath = null;
   undoStack = []; redoStack = []; stroke = null;
+  setSelection(null);
   clearDirty();
   if (initialised) { frameCamera(); needsRebuild = true; }
   hooks.onModelsChanged?.();
@@ -726,6 +921,33 @@ function buildScene() {
     new THREE.LineBasicMaterial({ color: 0x39445a }));
   scene.add(boundsBox);
 
+  // Selection outline (persistent green wireframe, separate from hover ghost).
+  selectionOutline = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+    new THREE.LineBasicMaterial({ color: 0x7cf03a, transparent: true, opacity: 0.7 }));
+  selectionOutline.renderOrder = 998;
+  selectionOutline.visible = false;
+  scene.add(selectionOutline);
+
+  // Resize handles: 6 spheres on each face of the active model's bounding box.
+  const FACE_DEFS = [
+    { axis: 0, sign: +1 }, { axis: 0, sign: -1 },
+    { axis: 1, sign: +1 }, { axis: 1, sign: -1 },
+    { axis: 2, sign: +1 }, { axis: 2, sign: -1 },
+  ];
+  resizeHandles = FACE_DEFS.map(f => {
+    const m = new THREE.Mesh(
+      new THREE.SphereGeometry(0.55, 12, 10),
+      new THREE.MeshBasicMaterial({
+        color: 0x00cccc, depthTest: false, transparent: true, opacity: 0.9,
+      }));
+    m.renderOrder = 997;
+    m.visible = false;
+    m.userData = f;
+    scene.add(m);
+    return m;
+  });
+
   // Mirror plane (translucent quad, both sides).
   mirrorPlane = new THREE.Mesh(
     new THREE.PlaneGeometry(1, 1),
@@ -802,6 +1024,38 @@ function updateMicroGhost() {
 /** rig.js pokes this when the sidecar's scale changes. */
 export function refreshMicroGhost() { updateMicroGhost(); updateStatus(); }
 
+function updateResizeHandles() {
+  if (!resizeHandles.length || !doc) return;
+  const m = activeDef();
+  if (!m) { resizeHandles.forEach(h => { h.visible = false; }); return; }
+  const o = m.offset, d = m.dim;
+  const cx = o.x + d.x / 2, cy = o.y + d.y / 2, cz = o.z + d.z / 2;
+  const pos = [
+    [o.x + d.x, cy, cz],  [o.x,       cy, cz],       // +X, -X
+    [cx, o.y + d.y, cz],  [cx,       o.y, cz],        // +Y, -Y
+    [cx, cy, o.z + d.z],  [cx,       cy, o.z],         // +Z, -Z
+  ];
+  for (let i = 0; i < 6; i++) {
+    const h = resizeHandles[i];
+    h.position.set(pos[i][0], pos[i][1], pos[i][2]);
+    h.visible = true;
+  }
+}
+
+function resizeHandleHitTest(px, py) {
+  if (!resizeHandles.length || !resizeHandles[0].visible) return -1;
+  const r = canvas.getBoundingClientRect();
+  let best = -1, bestD = 22;
+  for (let i = 0; i < resizeHandles.length; i++) {
+    _v3.copy(resizeHandles[i].position).project(camera);
+    const sx = r.left + ((_v3.x + 1) / 2) * r.width;
+    const sy = r.top + ((1 - _v3.y) / 2) * r.height;
+    const dd = Math.hypot(px - sx, py - sy);
+    if (dd < bestD) { bestD = dd; best = i; }
+  }
+  return best;
+}
+
 // Re-fit helpers and camera to the current grid dimensions.
 function frameCamera() {
   const d = (doc && doc.size) || grid.dim;
@@ -811,6 +1065,7 @@ function frameCamera() {
   boundsBox.scale.set(d.x, d.y, d.z);
   boundsBox.position.copy(c);
   updateMicroGhost();
+  updateResizeHandles();
 
   const span = Math.max(d.x, d.z) * 2;
   gridHelper.scale.set(span, 1, span);
@@ -1685,6 +1940,26 @@ function onPointerDown(ev) {
     }
   }
 
+  // Resize handles: grab one of the 6 face spheres to grow/shrink the model.
+  {
+    const ri = resizeHandleHitTest(ev.clientX, ev.clientY);
+    if (ri >= 0) {
+      ev.preventDefault();
+      const m = activeDef();
+      const f = resizeHandles[ri].userData;  // { axis, sign }
+      const handlePos = resizeHandles[ri].position.clone();
+      drag = {
+        resize: true, face: f, handleIndex: ri,
+        startDim: { ...m.dim }, startOffset: { ...m.offset },
+        beforeResize: snapshotModel(activeModel),
+        p0: handlePos,
+        n: new THREE.Vector3(0, 0, 0).setComponent(f.axis, 1),
+      };
+      canvas.setPointerCapture(ev.pointerId);
+      return;
+    }
+  }
+
   const h = pickCell(ev.clientX, ev.clientY);
   if (!h) return;
   ev.preventDefault();
@@ -1780,6 +2055,46 @@ function onPointerMove(ev) {
     }
     return;
   }
+  if (drag && drag.resize) {
+    // Intersect with a plane that CONTAINS the drag axis and faces the camera,
+    // so screen-space movement along the axis maps to world-space movement.
+    const r = canvas.getBoundingClientRect();
+    _ndc.set(((ev.clientX - r.left) / r.width) * 2 - 1,
+             -((ev.clientY - r.top) / r.height) * 2 + 1);
+    const ro = camera.position.clone();
+    const rd = new THREE.Vector3(_ndc.x, _ndc.y, 0.5).unproject(camera).sub(ro).normalize();
+    const camDir = camera.getWorldDirection(new THREE.Vector3());
+    // Plane normal = cross(axis, camDir), then cross(axis, that) gives a normal
+    // perpendicular to the axis but facing the camera. Simpler: use the camera-
+    // facing plane and read only the axis component of the hit.
+    const n = camDir.clone().negate();
+    const denom = n.dot(rd);
+    if (Math.abs(denom) < 1e-6) return;
+    const t = n.dot(drag.p0.clone().sub(ro)) / denom;
+    if (t <= 0) return;
+    const hit = ro.addScaledVector(rd, t);
+    const delta = Math.round(
+      (hit.getComponent(drag.face.axis) - drag.p0.getComponent(drag.face.axis))
+      * drag.face.sign) * drag.face.sign;
+    if (!delta) return;
+    const zero = { x: 0, y: 0, z: 0 };
+    const pad = { lo: { ...zero }, hi: { ...zero } };
+    const ax = ['x', 'y', 'z'][drag.face.axis];
+    if (drag.face.sign > 0) pad.hi[ax] = delta;
+    else pad.lo[ax] = -delta;
+    const m = activeDef();
+    if (!m) return;
+    const newDim = m.dim[ax] + (drag.face.sign > 0 ? delta : -delta);
+    if (newDim < 1) return;
+    if (growModel(activeModel, pad)) {
+      drag.p0.setComponent(drag.face.axis,
+        drag.p0.getComponent(drag.face.axis) + delta);
+      updateResizeHandles();
+      frameCamera();
+      hooks.onModelsChanged?.();
+    }
+    return;
+  }
   if (drag && drag.move) {
     if (!drag.p0) return;
     const p = movePlanePoint(ev.clientX, ev.clientY, null, drag.n, drag.p0);
@@ -1848,6 +2163,24 @@ function onPointerUp(ev) {
     rotState?.onChange?.(rotState.quat, true);
     return;
   }
+  if (drag.resize) {
+    // Replace all per-increment grow entries with one coalesced entry for the
+    // whole drag gesture.
+    const before = drag.beforeResize;
+    // Pop every grow entry that growModel pushed during this drag.
+    while (undoStack.length && undoStack[undoStack.length - 1].type === 'grow')
+      undoStack.pop();
+    const after = snapshotModel(activeModel);
+    // Only push if something actually changed.
+    if (before.dim.x !== after.dim.x || before.dim.y !== after.dim.y ||
+        before.dim.z !== after.dim.z) {
+      undoStack.push({ type: 'grow', data: { modelIndex: activeModel, before, after } });
+      redoStack.length = 0;
+    }
+    drag = null;
+    updateResizeHandles();
+    return;
+  }
   if (drag.move) {
     const d = drag.applied, name = doc.models[drag.mi]?.name || 'model';
     drag = null;
@@ -1860,17 +2193,17 @@ function onPointerUp(ev) {
     return;
   }
   if (drag.select) {
-    selection = {
+    const sel = {
       lo: [0, 1, 2].map(a => Math.min(drag.anchor[a], drag.last[a])),
       hi: [0, 1, 2].map(a => Math.max(drag.anchor[a], drag.last[a])),
       model: activeModel,
     };
     drag = null;
-    hooks.onSelectionChanged?.(selection);
-    const n = (selection.hi[0] - selection.lo[0] + 1) *
-              (selection.hi[1] - selection.lo[1] + 1) *
-              (selection.hi[2] - selection.lo[2] + 1);
-    hooks.toast(`selected ${n} cells — use Make Part / Split to model`);
+    setSelection(sel);
+    const n = (sel.hi[0] - sel.lo[0] + 1) *
+              (sel.hi[1] - sel.lo[1] + 1) *
+              (sel.hi[2] - sel.lo[2] + 1);
+    hooks.toast(`selected ${n} cells — Ctrl+C copy · Del delete · Ctrl+Shift+F fill`);
     return;
   }
   if (drag.paint) { endStroke(); drag = null; updateHover(ev); return; }
@@ -1897,19 +2230,24 @@ function typingInField(ev) {
 function onKeyDown(ev) {
   if (!isActive() || typingInField(ev)) return;
 
-  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'z') {
+  const ctrl = ev.ctrlKey || ev.metaKey;
+  const k = ev.key.toLowerCase();
+
+  if (ctrl && k === 'z') {
     ev.preventDefault(); ev.shiftKey ? redo() : undo(); return;
   }
-  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'y') {
-    ev.preventDefault(); redo(); return;
-  }
-  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;   // Ctrl+S stays the page's
+  if (ctrl && k === 'y') { ev.preventDefault(); redo(); return; }
+  if (ctrl && k === 'a') { ev.preventDefault(); selectAll(); return; }
+  if (ctrl && k === 'c') { ev.preventDefault(); copySelection(); return; }
+  if (ctrl && k === 'v') { ev.preventDefault(); pasteClipboard(); return; }
+  if (ctrl && k === 'x') { ev.preventDefault(); cutSelection(); return; }
+  if (ctrl && ev.shiftKey && k === 'f') { ev.preventDefault(); fillSelection(); return; }
+  if (ctrl || ev.metaKey || ev.altKey) return;   // Ctrl+S stays the page's
 
   // Timeline / animation keys belong to rig.js; give it first refusal so the
   // two key maps stay in one place each instead of interleaved here.
   if (hooks.onKey?.(ev)) { ev.preventDefault(); return; }
 
-  const k = ev.key.toLowerCase();
   if (k === 't') { setMode('attach'); ev.preventDefault(); }
   else if (k === 'r') { setMode('erase'); ev.preventDefault(); }
   else if (k === 'e') { setMode('paint'); ev.preventDefault(); }
@@ -1921,10 +2259,8 @@ function onKeyDown(ev) {
   else if (k === 'n') { setBrush('noise'); ev.preventDefault(); }
   else if (k === 'w') { setWholeMode(!wholeMode); ev.preventDefault(); }
   else if (k === 'm') { mirror.x = !mirror.x; updateMirrorPlane(); renderToolbar(); ev.preventDefault(); }
-  else if (k === 'escape') {
-    if (selection) { selection = null; hooks.onSelectionChanged?.(null); ghost.visible = false; }
-    ev.preventDefault();
-  }
+  else if (k === 'escape') { setSelection(null); ev.preventDefault(); }
+  else if (k === 'delete') { deleteSelection(); ev.preventDefault(); }
   else if (k >= '1' && k <= '9') {
     const i = +k;                       // 1..9 -> material ID 1..9
     if (materials[i - 1]) { activeMat = i; renderPalette(); }
@@ -1957,7 +2293,7 @@ function setBrush(b) {
 function setWholeMode(on) {
   wholeMode = !!on;
   drag = null;
-  if (wholeMode && selection) { selection = null; hooks.onSelectionChanged?.(null); }
+  if (wholeMode && selection) setSelection(null);
   if (wholeMode && brush === 'select') brush = 'voxel';
   // The mirror of the select guard above. Move needs every box visible so
   // ownerOf can say which limb was grabbed; with whole mode off ownerOf
@@ -2042,6 +2378,36 @@ function renderPalette() {
    object and marks materials.json dirty via hooks.touchMaterials.       */
 
 let wheel = { variant: 0, h: 0, s: 0, v: 1 };
+let wheelDragStart = null; // {matIndex, variant, hex} snapshot before a drag
+
+function commitWheelUndo() {
+  if (!wheelDragStart) return;
+  const colors = wheelColors();
+  const newHex = colors ? colors[Math.min(wheelDragStart.variant, colors.length - 1)] : null;
+  if (newHex && newHex !== wheelDragStart.hex) {
+    undoStack.push({
+      type: 'color',
+      data: {
+        matIndex: wheelDragStart.matIndex,
+        variant: wheelDragStart.variant,
+        oldHex: wheelDragStart.hex,
+        newHex,
+      },
+    });
+    redoStack.length = 0;
+  }
+  wheelDragStart = null;
+}
+
+function snapshotWheel() {
+  const colors = wheelColors();
+  if (!colors) return;
+  wheelDragStart = {
+    matIndex: activeMat - 1,
+    variant: Math.min(wheel.variant, colors.length - 1),
+    hex: colors[Math.min(wheel.variant, colors.length - 1)],
+  };
+}
 
 function hsvToHex(h, s, v) {
   const f = n => {
@@ -2178,9 +2544,11 @@ function buildWheelPanel() {
   };
   ui.wheelCanvas.addEventListener('pointerdown', ev => {
     ev.preventDefault();
+    snapshotWheel();
     pick(ev);
     const mv = e => pick(e);
-    const up = () => { window.removeEventListener('pointermove', mv);
+    const up = () => { commitWheelUndo();
+                       window.removeEventListener('pointermove', mv);
                        window.removeEventListener('pointerup', up); };
     window.addEventListener('pointermove', mv);
     window.addEventListener('pointerup', up);
@@ -2188,18 +2556,22 @@ function buildWheelPanel() {
 
   ui.wheelVal = el('input', { type: 'range', min: '0', max: '100', value: '100',
                               class: 'edslider', title: 'brightness' });
+  ui.wheelVal.addEventListener('pointerdown', () => snapshotWheel());
   ui.wheelVal.addEventListener('input', () => {
     wheel.v = +ui.wheelVal.value / 100;
     drawWheel();
     applyWheelColor();
   });
+  ui.wheelVal.addEventListener('change', () => commitWheelUndo());
 
   ui.wheelHex = el('input', { class: 'cell id edwheelhex', placeholder: '#rrggbb' });
   ui.wheelHex.addEventListener('change', () => {
     if (!/^#?[0-9a-f]{6}$/i.test(ui.wheelHex.value.trim())) return;
+    snapshotWheel();
     const hex = '#' + ui.wheelHex.value.trim().replace('#', '').toLowerCase();
     loadWheelFrom(hex);
     applyWheelColor();
+    commitWheelUndo();
   });
 
   ui.wheelSwatches = el('div', { class: 'edwheelsw' });
@@ -2366,10 +2738,9 @@ function buildUI(section) {
   ui.timeline = el('div', { class: 'edtimeline' });  // ...and this
 
   ui.note = el('div', { class: 'hint edhelp' },
-    'left-drag paints · X moves a whole limb · right-drag orbits · ' +
-    'middle-drag pans · wheel zooms · ' +
-    'alt-click eyedropper · 1-9 material · Ctrl+Z/Y undo · Esc clear selection · ' +
-    '? for the full cheat sheet');
+    'left-drag paints · X moves · right-drag orbits · mid-drag pans · ' +
+    'Ctrl+A select all · Ctrl+C/V/X copy/paste/cut · Del delete · ' +
+    'Ctrl+Shift+F fill · Ctrl+Z/Y undo · ? cheat sheet');
 
   section.append(bar1, bar2, ui.help, buildWheelPanel(), ui.palette,
     el('div', { class: 'edmain' }, host, ui.grip, ui.side),
@@ -2469,18 +2840,23 @@ function buildHelpPanel() {
       'density slider\'s chance. M mirrors across X. W = WHOLE mode: edit ' +
       'every model as one canvas (paint/erase/noise cross limb boundaries). ' +
       'Alt-click = eyedropper, 1-9 = material, Ctrl+Z / Ctrl+Y = undo / ' +
-      'redo, Ctrl+S = save.'),
+      'redo, Ctrl+S = save. Ctrl+A select all · Ctrl+C copy · Ctrl+V paste · ' +
+      'Ctrl+X cut · Del delete selection · Ctrl+Shift+F fill selection.'),
     row('colour', 'Click the material chip for the colour wheel: it edits the ' +
       'ACTIVE MATERIAL\'s shade variants (voxels store a material ID, not a ' +
       'colour — the engine hash-picks a variant per voxel). Changes land in ' +
-      'materials.json; R hot-reloads them in-game.'),
+      'materials.json; R hot-reloads them in-game. Wheel changes are undoable ' +
+      'with Ctrl+Z.'),
     row('camera', 'right-drag orbit · middle-drag pan · wheel zoom. The left ' +
       'button never moves the camera — it always edits.'),
     row('parts', 'Select [V] a box around a limb → "Split to model" extracts ' +
       'it as its own named model (the engine needs one model per limb). ' +
-      '"sync" in Limbs gives every model a limb entry; set root, parents and ' +
-      'joints there. The orange ball is the joint anchor — drag it into the ' +
-      'socket; the blue line is the swing axis.'),
+      'Clicking a limb in the Models panel selects it entirely (ready for ' +
+      'Ctrl+C / Del / fill). Cyan spheres on the bounding-box faces are resize ' +
+      'handles — drag them to grow or shrink the box. "sync" in Limbs gives ' +
+      'every model a limb entry; set root, parents and joints there. ' +
+      'The orange ball is the joint anchor — drag it into the socket; the ' +
+      'blue line is the swing axis.'),
     row('move', 'Move [X] drags a WHOLE limb: grab any limb and slide it, on ' +
       'the plane facing the camera, snapped to whole voxels. Its joint anchor ' +
       'moves with it, so the joint stays where it sits in the mesh — that is ' +
@@ -2562,7 +2938,7 @@ async function openPath(path) {
     docPath = path;
     docName = path.split('/').pop().replace(/\.vox$/i, '');
     undoStack = []; redoStack = []; stroke = null;
-    selection = null;
+    setSelection(null);
 
     // Sidecar is optional; a missing one is normal for a fresh model. It is
     // kept as the PARSED OBJECT and written back whole, so fields this editor
@@ -2831,6 +3207,7 @@ export function activate() {
   updateMirrorPlane();
   updateMicroGhost();
   updateGizmo();
+  updateResizeHandles();
   renderToolbar();
   // Models may have changed under us (nothing else edits them today, but the
   // skeleton is cheap to rebuild). Do NOT fire onSidecarChanged here: that
@@ -2864,7 +3241,8 @@ export function setSidecar(s) { sidecar = s; }
 export function touchSidecar() { markDirty(); }
 
 export { setActiveModel, addModel, duplicateModel, removeModel, renameModel,
-         splitSelectionToModel, upscaleDoc, markDirty, moveModel, growModel };
+         splitSelectionToModel, upscaleDoc, markDirty, moveModel, growModel,
+         setSelection };
 
 /** Force a full instance rebuild (gait preview / onion skin drive this). */
 export function invalidate() { needsRebuild = true; }

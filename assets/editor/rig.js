@@ -743,6 +743,12 @@ function renderRigPanel() {
       class: 'rigrow' + (i === ed.getActiveModel() ? ' on' : ''),
       onclick: () => {
         ed.setActiveModel(i);
+        // Select the whole model so Ctrl+C / Del / fill work on it immediately.
+        ed.setSelection({
+          lo: [0, 0, 0],
+          hi: [m.dim.x - 1, m.dim.y - 1, m.dim.z - 1],
+          model: i,
+        });
         // Toggle the inline limb editor. A model with no limb entry still
         // selects (for painting); "sync" in Limbs is what gives it an entry.
         selectedPart = (limbHere && !openHere) ? m.name : null;
@@ -2695,8 +2701,8 @@ function onKey(ev) {
   if (k === 'd') { duplicateFrame(); return true; }
   if (k === 'delete') {
     // Del removes the selected KEY when the clip lane owns the selection,
-    // otherwise a flipbook frame. Two meanings, but never ambiguous: a key is
-    // only selected while a clip is open.
+    // otherwise a flipbook frame. Falls through to the editor's delete-selection
+    // when neither applies.
     if (selectedKey) {
       const c = clipObj(), tr = c?.tracks?.[selectedKey.part];
       if (tr) {
@@ -2707,9 +2713,12 @@ function onKey(ev) {
         if (!tr.rot && !tr.pos) delete c.tracks[selectedKey.part];
         selectedKey = null;
         touched(); renderAllPanels();
+        return true;
       }
-    } else deleteFrame();
-    return true;
+    }
+    const f = frameList();
+    if (f && f.length > 1) { deleteFrame(); return true; }
+    return false;
   }
   return false;
 }
