@@ -336,6 +336,60 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
                  false, false);
     ctx.WaitIdle();
   }
+
+  // ---- AN OIL SLICK ON WATER: the case that SHOULD show the rainbow ----
+  // The pool shot above is oil on stone and must show NO iridescence - a deep
+  // pool has no second interface within reach of the light, so there is no film
+  // to interfere. This is the other half of that test: oil spilled onto the
+  // water lake, where floatingOnLiquid() finds water underneath and the sheen
+  // switches on. Two frames that differ only in what is UNDER the oil.
+  //
+  // Oil is density 900 against water's 1000, so the sim floats it without any
+  // help here; the ops just place it at the surface and let it spread.
+  {
+    const int kLx = 420, kLz = 420, kSurf = 68;   // authored lake, surface y=68
+    world.SetWindowOrigin({kLx / (int)kChunk - 8, 0, kLz / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> slick;
+    // A disc of oil laid ON the water surface. Deterministic, no rand(), like
+    // every other look shot.
+    for (int dx = -26; dx <= 26; dx++)
+      for (int dz = -26; dz <= 26; dz++) {
+        if (dx * dx + dz * dz > 26 * 26) continue;
+        // ABOVE the surface, not AT it. Writing into the surface cell itself
+        // replaces scattered water voxels with oil and leaves the rest water,
+        // which at a grazing angle reads as a hard 1:1 checkerboard of two
+        // very differently shaded liquids rather than as a slick. Dropped from
+        // one voxel up, the oil settles into a continuous layer ON the water -
+        // which is also the only configuration floatingOnLiquid() should fire
+        // on, so it is the honest test.
+        IVec3 c{kLx + dx, kSurf + 1, kLz + dz};
+        if (!world.CellInWindow(c)) continue;
+        // Same word rules as a brush paint: liquid born full, stamp 0xFF.
+        uint32_t word = (kMatOil & 0xFFFu) | (7u << 12) | (0xFFu << 16);
+        slick.push_back({World::SlotCellIndex(c), word});
+      }
+    // Long settle: the layer has to spread and level before it reads as one.
+    for (uint32_t t = 1; t <= 200; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 t == 1 ? slick : std::vector<CellOp>{}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    // Grazing, like the pool shot, since the sheen is Fresnel-weighted.
+    // Inside the slick, not outside it: the disc is radius 26 and a camera 40
+    // voxels out looks straight past it at open water.
+    render({(float)(kLx - 14), (float)(kSurf + 4), (float)(kLz - 14)}, 0.785f,
+           -0.16f, "screenshot_oil_slick.bmp");
+
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+  }
   // Lava pool (220,520), surface y=64, rim y=66: close and low, the angle
   // where crust structure and the glow from the cracks have to carry the look.
   render({196, 74, 496}, 0.785f, -0.30f, "screenshot_lava.bmp");
