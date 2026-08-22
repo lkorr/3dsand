@@ -1986,9 +1986,18 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
 // truncation artifact.
 const SUB_DEPTH_STEPS : i32 = 40;
 
-fn waterAbove(cell : vec3<i32>) -> f32 {
+// Takes the CONTINUOUS hit point, not the cell. That matters: quantising the
+// depth to the cell makes every pixel on one voxel face share a single depth
+// value, so the caustic strength (which ramps and then fades with depth) jumps
+// in hard steps at every cell boundary. On the vertical rim wall of a pool
+// that renders as exactly what it is — a barcode of flat stripes, one per
+// voxel row — and it was the most obvious artifact in the first cut. Carrying
+// the fractional part of the start height removes the stair entirely for the
+// cost of one subtraction.
+fn waterAbove(p : vec3f) -> f32 {
+  let cell = vec3<i32>(floor(p));
   var n = 0.0;
-  for (var i = 1; i <= SUB_DEPTH_STEPS; i++) {
+  for (var i = 0; i <= SUB_DEPTH_STEPS; i++) {
     let c = cell + vec3<i32>(0, i, 0);
     // Out of the window reads as "no more water". Unloaded space is solid and
     // inert (CLAUDE.md), so treating it as more water would paint caustics
@@ -2001,7 +2010,10 @@ fn waterAbove(cell : vec3<i32>) -> f32 {
     // Only a TRANSLUCENT liquid counts as water overhead. An opaque one (lava)
     // transmits nothing, and a solid lid ends the column.
     if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { break; }
-    n += f32(voxState(w) + 1u) / 8.0;
+    var f = f32(voxState(w) + 1u) / 8.0;
+    // The cell the point is IN contributes only the part above the point.
+    if (i == 0) { f = max(f - fract(p.y), 0.0); }
+    n += f;
   }
   return n * VOXEL_METERS;
 }
@@ -2149,7 +2161,7 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     // moving structure as the caustics on the bed — the beams and the web on
     // the floor are the same light, and having them animate independently is
     // an immediate tell.
-    let dAbove = waterAbove(c);
+    let dAbove = waterAbove(p);
     let shaft = 1.0 + bedCaustic(p, kd, dAbove) * 0.6;
     acc += shaft * dt;
   }
@@ -2266,14 +2278,22 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
     behind = mix(scatterCol * keyLightColor() * sunUp * 1.2, windowSky, window);
   }
 
-  let trans = exp(-absorbK * distM);
-  // Fade to the water colour over the visibility distance. The exponential
-  // above is the physical part; this is the artistic ceiling that guarantees
-  // a far wall reaches the water colour by `subVisibility` metres no matter
-  // how the coefficients are tuned, which is what makes that knob predictable.
-  let vis = 1.0 - exp(-distM / TUNE_SUB_VISIBILITY);
-  var color = mix(behind * trans + ambientWater * (vec3f(1.0) - trans),
-                  ambientWater, vis);
+  // ---- extinction ----
+  // ONE transmittance term, not two. The first cut applied Beer-Lambert AND
+  // then mixed the result toward the water colour again over `subVisibility`,
+  // which double-counts the same falloff: every surface past a couple of
+  // metres landed on the scatter colour twice and the whole view flattened
+  // into a uniform pale wash with no contrast left in it. The bed rendered as
+  // a featureless white sheet — brighter than the water, which is backwards.
+  //
+  // So `subVisibility` folds INTO the extinction coefficient rather than
+  // being a second blend on top of it. It stays the predictable "distance at
+  // which things disappear" knob (at distM == subVisibility the view is
+  // 1/e ~ 37% original), and the per-channel absorption still tilts the hue
+  // with depth on top of it.
+  let extinction = absorbK + vec3f(1.0 / TUNE_SUB_VISIBILITY);
+  let trans = exp(-extinction * distM);
+  var color = behind * trans + ambientWater * (vec3f(1.0) - trans);
 
   // ---- god rays ----
   // Added, not mixed: scattered light is light ARRIVING at the eye from the
@@ -3567,7 +3587,13 @@ fn fs(in : VSOut) -> FSOut {
         let um = voxMat(uw);
         if (um != MAT_AIR && materials[um].klass == CLASS_LIQUID &&
             (materials[um].flags & MATF_OPAQUE) == 0u) {
-          let dAbove = waterAbove(h.cell);
+          // Probe from just OFF the face, not from the hit point itself: a hit
+          // point sits exactly on a cell boundary, and floor() there lands
+          // inside the solid half the time, which reads the surface's own
+          // material as the column and returns zero depth in a speckled
+          // pattern. Nudging along the normal puts the probe unambiguously in
+          // the water.
+          let dAbove = waterAbove(hp + n * 0.5);
           let cw = bedCaustic(hp, n, dAbove);
           color *= 1.0 + min(cw * TUNE_BED_CAUSTIC_GAIN, TUNE_BED_CAUSTIC_CAP);
         }
