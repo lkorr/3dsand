@@ -5,6 +5,7 @@
 #include <sstream>
 
 #include "sim/tuning.h"
+#include "sim/voxload.h"  // kArtPaletteBase, mirrored into the WGSL prelude
 #include "sim/world.h"
 
 wgpu::Buffer CreateBuffer(const wgpu::Device& device, uint64_t size,
@@ -52,6 +53,14 @@ std::string ShaderConstantPrelude() {
   // Stain palette: reserved material-table entries holding stain-type colours
   // (world.h). The renderer indexes materials[STAIN_PALETTE_BASE + type].
   o << "const STAIN_PALETTE_BASE : u32 = " << kStainPaletteBase << "u;\n";
+  // Art palette: reserved material-table entries holding a mob skin's per-voxel
+  // ART colours, which are independent of its material (world.h). The micro and
+  // cube body passes index materials[ART_PALETTE_BASE + slot].
+  o << "const ART_PALETTE_BASE : u32 = " << kArtPaletteBaseGpu << "u;\n";
+  // Lowest .vox palette index that means "art colour" rather than material id
+  // (kArtPaletteBase, sim/voxload.h). Slot s maps to ART_PALETTE_BASE + s -
+  // ART_SLOT_MIN.
+  o << "const ART_SLOT_MIN : u32 = " << kArtPaletteBase << "u;\n";
   // Static micro-detail (render-only, DESIGN.md §9): the size of the brick pool
   // the raymarcher bounds-checks its nested DDA fetches against.
   o << "const MICRO_POOL_WORDS : u32 = " << kMicroPoolWordsWorld << "u;\n";

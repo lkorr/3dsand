@@ -4,8 +4,22 @@
 
 namespace {
 
-// Word count for a brick of `cellCount` micro voxels (4 per word).
-inline size_t WordsFor(size_t cellCount) { return (cellCount + 3) / 4; }
+// Word count for a brick of `cellCount` micro voxels (2 per word).
+//
+// 16 bits per micro voxel: the low byte is the material id (what the voxel IS
+// — meat, wood) and the high byte is an art palette slot (what it LOOKS like,
+// 0 = just use the material's colour). A mob is one material all over and
+// painted per voxel, so the two cannot share a channel.
+//
+// This halves the pool's voxel capacity, which is affordable at real asset
+// sizes: every .vox in assets/ together occupies ~49k of the 1 MiW pool at
+// 4 bpw, so ~98k at 2 bpw — under 10% either way.
+inline size_t WordsFor(size_t cellCount) { return (cellCount + 1) / 2; }
+
+// Pack/unpack the 16-bit micro voxel.
+inline uint16_t MicroVox(uint8_t mat, uint8_t color) {
+  return (uint16_t)mat | ((uint16_t)color << 8);
+}
 
 // Take `words` from the free list if an exact-size block is waiting, else bump
 // the pool's high-water mark. Returns UINT32_MAX when the ceiling is hit.
@@ -40,8 +54,13 @@ void PoolFree(MicroBodySet& set, uint32_t base, size_t words) {
   set.freeList.push_back({(uint32_t)words, {base}});
 }
 
-// Flatten `voxels` into the pool block at `base`, 4 packed 8-bit material ids
-// per word. Cells not covered by a voxel read 0 (empty).
+// Flatten `voxels` into the pool block at `base`, 2 packed 16-bit micro voxels
+// per word (see WordsFor). Cells not covered by a voxel read 0 (empty).
+//
+// The material is MASKED to its 12 bits before the range check. Callers hand
+// us skinVoxels straight out of a limb, and those carry a cosmetic palette
+// variant in bits 12-13 (mob.cpp) — testing the raw uint16 against 255 made
+// every variant>=1 voxel silently vanish from the re-skinned body.
 void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
                 const std::vector<PrefabVoxel>& voxels, IVec3 origin) {
   const size_t cellCount = (size_t)dims.x * dims.y * dims.z;
@@ -51,13 +70,49 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
     int x = v.x - origin.x, y = v.y - origin.y, z = v.z - origin.z;
     if (x < 0 || y < 0 || z < 0 || x >= dims.x || y >= dims.y || z >= dims.z)
       continue;
-    if (v.material == 0 || v.material > 255) continue;
+    const uint16_t mat = v.material & 0xFFF;
+    if (mat == 0 || mat > 255) continue;
     size_t idx = ((size_t)z * dims.y + y) * dims.x + x;
-    set.pool[base + idx / 4] |= (uint32_t)(uint8_t)v.material << ((idx % 4) * 8);
+    set.pool[base + idx / 2] |=
+        (uint32_t)MicroVox((uint8_t)mat, v.color) << ((idx % 2) * 16);
   }
 }
 
 }  // namespace
+
+std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
+                                       const std::vector<uint32_t>& artColors,
+                                       const std::string& label,
+                                       std::string& log) {
+  // Identity by default, so a prefab that painted nothing costs nothing and
+  // every unpainted voxel keeps color 0.
+  std::vector<uint8_t> remap(256, 0);
+  if (artColors.empty()) return remap;
+
+  uint32_t dropped = 0;
+  for (size_t i = 0; i < artColors.size() && i < (size_t)kArtPaletteSlots; i++) {
+    const uint32_t rgb = artColors[i];
+    const int srcSlot = kArtPaletteBase + (int)i;
+    if (srcSlot > kArtPaletteTop) break;
+    // Colours are deduplicated across prefabs: two mobs painted the same red
+    // share one slot, which is what keeps 128 slots enough for a whole cast.
+    auto it = std::find(set.artColors.begin(), set.artColors.end(), rgb);
+    size_t at;
+    if (it != set.artColors.end()) {
+      at = (size_t)(it - set.artColors.begin());
+    } else {
+      if (set.artColors.size() >= (size_t)kArtPaletteSlots) { dropped++; continue; }
+      at = set.artColors.size();
+      set.artColors.push_back(rgb);
+    }
+    remap[srcSlot] = (uint8_t)(kArtPaletteBase + at);
+  }
+  if (dropped)
+    log += label + ": art palette full (" + std::to_string(kArtPaletteSlots) +
+           " colours across all loaded models); " + std::to_string(dropped) +
+           " colour(s) fall back to the material colour\n";
+  return remap;
+}
 
 int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
                   IVec3 dims, uint32_t scale, const std::string& label,
@@ -78,34 +133,37 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   }
 
   const size_t cellCount = (size_t)dims.x * dims.y * dims.z;
-  const size_t words = (cellCount + 3) / 4;
+  const size_t words = WordsFor(cellCount);
   if (set.pool.size() + words > kMicroBodyPoolWordsWorld) {
     log += label + ": micro body brick pool full (" +
            std::to_string(kMicroBodyPoolWordsWorld) + " words)\n";
     return -1;
   }
 
-  std::vector<uint8_t> cells(cellCount, 0);
+  std::vector<uint16_t> cells(cellCount, 0);
   for (const PrefabVoxel& v : voxels) {
     if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= dims.x || v.y >= dims.y ||
         v.z >= dims.z)
       continue;  // loader guarantees in-box; a stray voxel is just dropped
-    if (v.material == 0 || v.material > 255) {
-      // 8 bits per micro voxel is what makes the pool affordable; naming the
-      // limit beats a silently truncated id painting the wrong colour.
-      log += label + ": micro body voxel material id " +
-             std::to_string(v.material) + " out of range 1..255\n";
+    // Mask off the cosmetic variant nibble before range-checking (WriteBrick).
+    const uint16_t mat = v.material & 0xFFF;
+    if (mat == 0 || mat > 255) {
+      // 8 bits of the 16 go to the material id; naming the limit beats a
+      // silently truncated id painting the wrong colour.
+      log += label + ": micro body voxel material id " + std::to_string(mat) +
+             " out of range 1..255\n";
       return -1;
     }
-    cells[((size_t)v.z * dims.y + v.y) * dims.x + v.x] = (uint8_t)v.material;
+    cells[((size_t)v.z * dims.y + v.y) * dims.x + v.x] =
+        MicroVox((uint8_t)mat, v.color);
   }
 
   const uint32_t base = (uint32_t)set.pool.size();
   for (size_t w = 0; w < words; w++) {
     uint32_t word = 0;
-    for (size_t b = 0; b < 4; b++) {
-      size_t idx = w * 4 + b;
-      if (idx < cellCount) word |= (uint32_t)cells[idx] << (b * 8);
+    for (size_t b = 0; b < 2; b++) {
+      size_t idx = w * 2 + b;
+      if (idx < cellCount) word |= (uint32_t)cells[idx] << (b * 16);
     }
     set.pool.push_back(word);
   }

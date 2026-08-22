@@ -34,6 +34,14 @@ class Simulation {
   // Re-upload the dynamic micro-BODY model table + brick pool (mob defs load /
   // hot reload — sim/microbody.h). Render-only, same doctrine as UploadMicro.
   void UploadMicroBodies(const wgpu::Queue& queue, const MicroBodySet& set);
+  // Publish the ART palette: per-voxel skin colours from loaded prefabs, which
+  // are NOT material colours (a creature is one material all over and painted
+  // per voxel — sim/voxload.h). They live in reserved material-table entries
+  // (kArtPaletteBaseGpu, world.h), so they are CACHED here and re-applied by
+  // UploadTables: a materials hot-reload rewrites the whole table and would
+  // otherwise wipe them, repainting every mob in its raw material colours.
+  // Render-only; nothing here can reach a world cell or the hash.
+  void SetArtPalette(const wgpu::Queue& queue, const std::vector<uint32_t>& rgb);
 
   void EncodeWorldgen(const wgpu::CommandEncoder& enc);
   // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
@@ -116,12 +124,17 @@ class Simulation {
   bool BuildPipelines(const wgpu::Device& device, std::string* err);
   void EnsureDepth(uint32_t width, uint32_t height);
   void EnsureRenderPipelines(wgpu::TextureFormat format);
+  // Stamp the cached art palette into a material table being (re)built.
+  void ApplyArtPalette(std::vector<MaterialGpu>& table) const;
 
   World* world_ = nullptr;
   wgpu::Device device_;
   std::string shaderDir_;
   wgpu::Buffer materialBuf_;
   wgpu::Buffer reactionBuf_;
+  // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a
+  // materials hot-reload can restore it — see SetArtPalette.
+  std::vector<uint32_t> artPalette_;
   // Static micro-detail (render-only). Deliberately NOT in any sim bind group.
   wgpu::Buffer microTableBuf_, microPoolBuf_;
   // Dynamic micro BODIES (render-only, same doctrine): per-def limb models, the

@@ -23,7 +23,9 @@ struct Sprite {
 // voxel-crisp instead of marching-cubes-smooth.
 struct BodyVoxInst {
   lx : f32, ly : f32, lz : f32,  // body-local voxel min corner
-  packed : u32,                  // bits 0..15 payload, bits 16..27 body slot
+  // bits 0..11 material, 12..15 state, 16..27 body slot, 28..31 art colour
+  // (0 = unpainted). See the bit-budget note on BodyVoxInst in phys/debris.h.
+  packed : u32,
 };
 struct BodyXform {
   pos : vec3f, _p : f32,         // voxel units
@@ -105,7 +107,16 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 
   let mat = b.packed & 0xFFFu;
   let m = materials[mat];
-  let albedo = paletteColor(m, (b.packed >> 12u) & 0xFu);
+  // A painted voxel shows its ART colour (a 1-based index into the reserved
+  // art run) rather than the material's cosmetic palette variant. Colour is
+  // art; the material is what this voxel becomes if it lands in the grid.
+  let art = (b.packed >> 28u) & 0xFu;
+  var albedo : vec3f;
+  if (art != 0u) {
+    albedo = unpackColor(materials[ART_PALETTE_BASE + (art - 1u)].color0);
+  } else {
+    albedo = paletteColor(m, (b.packed >> 12u) & 0xFu);
+  }
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);

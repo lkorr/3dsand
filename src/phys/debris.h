@@ -24,10 +24,25 @@
 // the op stream, so recording that stream still replays the grid exactly.
 
 // GPU instance layouts — must match debris.wgsl.
+//
+// `packed` bit budget, and why it is laid out this way:
+//   0..11   material id (12 bits, the world-cell convention)
+//   12..15  state nibble — the cosmetic 3-variant palette index
+//   16..27  body slot (12 bits; kMaxBodySlots is 512, so 3 bits spare)
+//   28..31  ART COLOUR, 4 bits (0 = unpainted, 1..15 = art slot 1..15)
+// The art field is deliberately NARROW here. This is the coincident-skin path
+// (skinScale == 1) — plain debris and the one test mob; every real character
+// has skinScale > 1 and renders through microbody.wgsl, which carries a full
+// 8-bit art channel. Widening this instead would cost a megabyte on a 262144-
+// instance buffer for art nobody paints at this resolution, so a model that
+// uses more than 15 colours AND renders as cubes gets its extra colours
+// clamped, with a warning at load rather than silence.
 struct BodyVoxInst {
   float lx, ly, lz;   // body-local voxel min corner
-  uint32_t packed;    // bits 0..15 payload, bits 16..27 body slot
+  uint32_t packed;
 };
+// Art slots representable on the cube path (1..kCubeArtMax).
+constexpr uint32_t kCubeArtMax = 15;
 struct BodyXformGpu {
   float pos[3];
   float pad = 0;

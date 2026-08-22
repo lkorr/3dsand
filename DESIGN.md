@@ -100,6 +100,40 @@ Material ID 0 = air/empty. If we ever need more per-voxel state (temperature,
 velocity fields), add an *optional sparse auxiliary layer* keyed by chunk — do not
 grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
 
+### Art colour: mob/prefab skins are painted, world voxels are not
+
+A creature is `meat` everywhere — that is what the CA reacts to, what a severed
+limb becomes when it lands in the grid, what a fire spreads through — but its
+skin is *painted per voxel*: different colours for eyes, tongue, claws, belly.
+Material and colour are therefore two independent facts about a skin voxel, and
+they live in two separate channels.
+
+**This does not touch the world voxel.** Art colour exists only on mob/prefab
+skins, which are a different representation from the grid (`PrefabVoxel`,
+`DebrisVoxel`, the micro brick pool — all CPU rigidbody + render data, outside
+the hashed domain). The 16-bit world cell is unchanged, so the rule above still
+holds and rule 1 is untouched by construction: nothing here can reach a hashed
+cell. The `settle-back` gate asserts exactly that — a *painted* body dropped
+into the world settles as its plain material.
+
+Where it lives, end to end:
+
+| Stage | Carrier |
+|---|---|
+| authoring | editor paints a colour grid parallel to the material grid |
+| `.vox` | a second model per limb, `"<limb>.col"`, same cells, byte = art palette slot |
+| palette | art slots occupy the .vox palette from **255 downward**; material IDs still run upward from 1 (`kArtPaletteBase` = 128) |
+| load | `voxload.cpp` pairs `.col` with its limb, folds it into `PrefabVoxel::color`, and **drops** the layer so it is not a limb and does not widen the prefab AABB |
+| micro skin | brick payload is **16 bpv**: low byte material, high byte art slot |
+| cube skin | `DebrisVoxel::color` (was padding); 4 bits on the GPU instance — this path is coincident-resolution only, and real characters all use the micro path |
+| GPU | a reserved run of the material table (`kArtPaletteBaseGpu`), same trick as the stain palette — no new buffer, no new binding |
+
+Two consequences worth stating. **Opacity is a brush property, not stored
+state**: painting at 40% mixes into whatever colour the voxel already shows and
+stores the *result*, so glazes layer the way real paint does while a voxel stays
+one opaque colour. And **the palette is per-document, merged at load**: colours
+are deduplicated across mob defs, so 128 slots cover a whole cast.
+
 ### Chunks
 - **16³ voxels = 8 KB per chunk.**
 - Resident region: a rolling N³-chunk cube centered on the player (initial target
