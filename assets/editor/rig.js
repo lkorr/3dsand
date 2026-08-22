@@ -1847,8 +1847,6 @@ function stepPreview(dt) {
     // mob.cpp:849 — world foot target -> model space. heading is 0 here so the
     // inverse yaw is identity; bodyOrigin uses the derived bodyY.
     const pivot = AN.v3(previewCtx.prefabSize.x * 0.5, 0, previewCtx.prefabSize.z * 0.5);
-    const rootAnchor = skel.rootLimb >= 0
-      ? skel.parts[skel.rootLimb].anchorLocal : AN.v3();
     const bodyOrigin = AN.v3(previewOrigin.x, anim.bodyY, previewOrigin.z);
     for (let c = 0; c < skel.chains.length && c < anim.feet.length; c++) {
       const f = anim.feet[c];
@@ -1856,8 +1854,12 @@ function stepPreview(dt) {
       if (weight <= 0) continue;
       const rel = AN.vsub(AN.vsub(f.planted, bodyOrigin), pivot);
       const prefabPt = AN.vadd(rel, pivot);          // heading 0 => RotateInv = id
-      AN.animSolveTwoBone(skel, anim, skel.chains[c],
-        AN.vsub(prefabPt, rootAnchor), weight);
+      // PREFAB-ABSOLUTE, AND NOT REBASED — matches avatar.cpp / mob.cpp. The
+      // hip animSolveTwoBone reads out of anim.model already carries the root
+      // offset (animFlatten seeds the root from its own rest.pos, which IS the
+      // root anchor), so subtracting rootAnchor from the target alone put the
+      // two ends in different frames and splayed both legs sideways.
+      AN.animSolveTwoBone(skel, anim, skel.chains[c], prefabPt, weight);
     }
   }
   ed.invalidate();

@@ -777,8 +777,8 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
     // 2.5 voxels FORWARD and 2 sideways of where the legs actually hang. The
     // gait then stepped correctly about a stance that was never under the body,
     // the IK stretched to reach it, and the legs raked out behind: the
-    // "naruto run". The IK below closes the loop by subtracting rootAnchor from
-    // the prefab point, which is the other half of this same convention.
+    // "naruto run". The IK below stays in this same prefab-absolute frame and
+    // rebases nothing — see the note at the AnimSolveTwoBone call.
     Vec3 stancePrefab = restLocal;
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
     Vec3 stance = Vec3{origin_.x, bodyY_, origin_.z} + pivot +
@@ -1200,7 +1200,6 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // stance instead of snapping to the rest hang.
   if (!sk.chains.empty() && gaitWeight_ > 0.0f) {
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
-    Vec3 rootAnchor = sk.parts[def_->rootLimb].anchorLocal;
     Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
     Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
     for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
@@ -1220,7 +1219,22 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       // remaining fade is dropped rather than pointed at a ghost.
       if (rel.len() > f.legLength * 1.6f) continue;
       Vec3 prefabPt = RotateInv(yaw, rel) + pivot;
-      AnimSolveTwoBone(sk, st, sk.chains[c], prefabPt - rootAnchor, weight);
+      // THE TARGET IS PREFAB-ABSOLUTE, AND SO IS THE HIP IT IS SOLVED AGAINST.
+      // Nothing is rebased here. AnimFlatten seeds the root with its own
+      // rest.pos, which IS rootAnchor, so every st.model[].pos already carries
+      // the root offset — including st.model[hip].pos, which AnimSolveTwoBone
+      // reads as its chain root. Subtracting rootAnchor from the target while
+      // the hip keeps it moved the two ends into different frames and the
+      // solver's (target - root) came out wrong by exactly rootAnchor: on this
+      // rig a spurious (-2, -11, -0.6) that swamped the +-0.6 hip split, so
+      // BOTH legs chased one identical point 11.2 voxels away against a 5.55
+      // reach. The solver clamped to its annulus every frame, which pinned a
+      // fixed ~10 degree splay toward model -X (the character's left, since
+      // these rigs author .L at the higher engine x) and left the stride only
+      // able to rotate an already-straight leg — halving the visible swing.
+      // Same convention as the submit path below, which likewise does not
+      // re-add rootAnchor to modelPos, and for exactly the same reason.
+      AnimSolveTwoBone(sk, st, sk.chains[c], prefabPt, weight);
     }
   }
 
@@ -1249,7 +1263,6 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // solve itself, which AnimSolveTwoBone already supports.
   if (weaponWeight_ > 0.0f && heldPartIndex_ >= 0 && !sk.chains.empty()) {
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
-    Vec3 rootAnchor = sk.parts[def_->rootLimb].anchorLocal;
     // The weapon arm is the one whose hand is this prop's ancestor. Deriving it
     // from the rig rather than hardcoding "arm.R" means a left-handed rig, or
     // a second weapon, needs no change here.
@@ -1264,20 +1277,30 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       // (main.cpp built it from the camera basis), so it is un-yawed into the
       // rig's frame here — the same conversion the legs do one block up.
       //
-      // THEN X IS NEGATED, and that is not a fudge. The .vox -> engine load map
-      // is (x, z, -y): it negates y, which FLIPS HANDEDNESS, so model +X is the
-      // character's LEFT (the limb table has .L at engine x 14..18 and .R at
-      // 2..6). Un-yawing alone therefore lands camera-RIGHT on the model's
-      // LEFT: measured at six yaws, RotateInv(yaw, camera Right) is model +X
-      // every time. Without this flip the mouse drives the weapon arm to the
-      // mirrored side — you could reach across your chest but not out to the
-      // side you were actually pointing at. Z (forward) is unaffected: the
-      // toe of the shoe sits at model +Z, which is where camera-forward lands.
+      // THEN X IS NEGATED, and that is not a fudge — but the reason is the ART,
+      // not the loader. (An earlier note here blamed the .vox -> engine map
+      // (x, z, -y) for "flipping handedness". It does not: that matrix has
+      // determinant +1 and voxload.cpp says so at the conversion — chirality is
+      // preserved. Believing otherwise invites "fixing" the legs one block up
+      // by adding a matching negation, which would be wrong.)
+      //
+      // The real cause is that these rigs are AUTHORED mirrored: every def puts
+      // .L at the HIGHER engine x and .R at the lower (asha: armU.L x=28 vs
+      // armU.R x=4, legU.L x=21 vs legU.R x=11), so model +X is the character's
+      // LEFT. Un-yawing alone therefore lands camera-RIGHT on the model's LEFT:
+      // measured at six yaws, RotateInv(yaw, camera Right) is model +X every
+      // time. Without this flip the mouse drives the weapon arm to the mirrored
+      // side — you could reach across your chest but not out to the side you
+      // were actually pointing at. Z (forward) is unaffected: the toe of the
+      // shoe sits at model +Z, which is where camera-forward lands.
+      //
+      // The target is prefab-absolute, like the legs: `shoulder` is anchorLocal
+      // and st.model[] already carries the root offset, so nothing is rebased.
       Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
       Vec3 handRig = RotateInv(yaw, weaponHand_);
       handRig.x = -handRig.x;
       Vec3 targetLocal = shoulder + handRig;
-      AnimSolveTwoBone(sk, st, ch, targetLocal - rootAnchor, weight);
+      AnimSolveTwoBone(sk, st, ch, targetLocal, weight);
       break;
     }
     // NOTHING ROTATES THE BLADE HERE, deliberately — see the note above. The

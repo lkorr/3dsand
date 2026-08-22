@@ -958,6 +958,28 @@ bool mobOk = false;
           if (axis.y > 0) axis = axis * -1.0f;
           return std::atan2(axis.z, -axis.y) * 57.29578f;
         };
+        // SIGNED LATERAL splay: how far the limb leans out of vertical
+        // SIDEWAYS, in the plane the swing never uses. Walking at heading 0,
+        // a healthy leg's whole motion is in Z (see swingOf), so this stays
+        // near 0 for the entire stride and any persistent offset is a bug.
+        //
+        // This is the axis the fore/aft and elevation measures above are both
+        // blind to, and the one that caught the IK frame mismatch: the target
+        // was rebased by -rootAnchor while the hip it solves against was not,
+        // so the solver saw a target ~2x out of reach, clamped to its annulus,
+        // and pinned BOTH legs at a fixed ~10 degree lean toward the
+        // character's left. The elevation stayed high, the legs still
+        // alternated fore and aft, and every assertion below passed — the
+        // pose was simply leaning the whole time. Measure the third axis or
+        // this class of failure is invisible.
+        auto lateralOf = [&](int part) {
+          Vec3 p;
+          Quat q;
+          if (!avatar.PartWorldTransform(part, p, q)) return 0.0f;
+          Vec3 axis = QuatRotate(q, Vec3{0, 1, 0});
+          if (axis.y > 0) axis = axis * -1.0f;   // fold down, as swingOf does
+          return std::atan2(axis.x, -axis.y) * 57.29578f;
+        };
         const int legParts[4] = {avatar.PartIndex("legU.L"),
                                  avatar.PartIndex("legU.R"),
                                  avatar.PartIndex("legL.L"),
@@ -971,6 +993,12 @@ bool mobOk = false;
         // measure can tell that apart from a healthy stride.
         float minLegSwing[2] = {999.0f, 999.0f};
         float maxLegSwing[2] = {-999.0f, -999.0f};
+        // Worst lateral lean seen on any leg part, and the mean lean per leg
+        // (a CONSTANT splay averages to itself, while a healthy leg's small
+        // symmetric wobble averages to ~0).
+        float maxLegLateral = 0.0f;
+        float sumLegLateral[2] = {0.0f, 0.0f};
+        int nLegLateral = 0;
         const float walkStep =
             (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
         // State the velocity this teleport represents — the avatar reads the
@@ -1010,7 +1038,13 @@ bool mobOk = false;
               float e = swingOf(legParts[s]);
               minLegSwing[s] = std::min(minLegSwing[s], e);
               maxLegSwing[s] = std::max(maxLegSwing[s], e);
+              sumLegLateral[s] += lateralOf(legParts[s]);
             }
+          nLegLateral++;
+          for (int lp : legParts)
+            if (lp >= 0)
+              maxLegLateral =
+                  std::max(maxLegLateral, std::fabs(lateralOf(lp)));
           for (int ap : armParts)
             if (ap >= 0) {
               float e = swingOf(ap);
@@ -1029,12 +1063,13 @@ bool mobOk = false;
           if (getenv("SANDVOX_GAITDBG")) {
             std::printf(
                 "  t%02d spd=%4.1f arm %6.1f/%6.1f  legU %6.1f/%6.1f  "
-                "legElev %5.1f/%5.1f shin %5.1f/%5.1f\n",
+                "legElev %5.1f/%5.1f shin %5.1f/%5.1f  lat %6.1f/%6.1f\n",
                 i, avatar.SpeedNow(), swingOf(armParts[0]),
                 swingOf(armParts[1]), swingOf(legParts[0]),
                 swingOf(legParts[1]), elevationOf(legParts[0]),
                 elevationOf(legParts[1]), elevationOf(legParts[2]),
-                elevationOf(legParts[3]));
+                elevationOf(legParts[3]), lateralOf(legParts[0]),
+                lateralOf(legParts[1]));
           }
         }
         // A walking leg should never lie down. A healthy stride bottoms out
@@ -1058,6 +1093,22 @@ bool mobOk = false;
         for (int s = 0; s < 2; s++)
           legsAlternate = legsAlternate && maxLegSwing[s] > 5.0f &&
                           minLegSwing[s] < -5.0f;
+
+        // THE LEGS MUST NOT LEAN SIDEWAYS. Walking at heading 0 the entire
+        // stride lives in Z, so any sustained X lean is spurious — see the
+        // note at lateralOf. Two separate conditions because they fail
+        // differently: a per-sample bound catches a big transient splay, and
+        // the per-leg MEAN catches a small constant one that a bound on the
+        // extreme would let through. 12 degrees is comfortably under the ~10
+        // the frame mismatch produced at walk pace (it grows with speed) while
+        // leaving room for the honest couple of degrees a bent knee shows.
+        float meanLegLateral[2] = {0.0f, 0.0f};
+        if (nLegLateral > 0)
+          for (int s = 0; s < 2; s++)
+            meanLegLateral[s] = sumLegLateral[s] / (float)nLegLateral;
+        bool legsNotSplayed = maxLegLateral < 12.0f &&
+                              std::fabs(meanLegLateral[0]) < 6.0f &&
+                              std::fabs(meanLegLateral[1]) < 6.0f;
 
         // Arms must SWING and must stay roughly under the shoulder. In the
         // signed measure, 0 is hanging straight down and +-90 is held
@@ -1284,14 +1335,15 @@ bool mobOk = false;
         bool avOk = spawned && allBodies && follows && tracksY &&
                     noSelfPush && monotone && slowed && noJump &&
                     statesSeen > 0 && partsGone && becameDebris && tornDown &&
-                    legsUpright && legsAlternate && legsNotInverted &&
-                    armsHang && armsSwing && poseContinuous;
+                    legsUpright && legsAlternate && legsNotSplayed &&
+                    legsNotInverted && armsHang && armsSwing && poseContinuous;
         std::printf(
             "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
             "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
             "speed 1.00->%.2f monotone=%d canJump=%d, %u parts left, "
             "%zu debris, torn down=%d; walking legElev>=%.0f arm %.0f..%.0f "
             "legL %.0f..%.0f legR %.0f..%.0f "
+            "lateral max %.1f mean %.1f/%.1f notSplayed=%d; "
             "upright=%d alternate=%d hang=%d swing=%d; "
             "falling hipToFootY %.2f notInverted=%d; "
             "pose jump flat %.1f deg vs ragged %.1f deg continuous=%d)\n",
@@ -1300,7 +1352,9 @@ bool mobOk = false;
             stateNow, prevSpeed, monotone ? 1 : 0, canJumpNow ? 1 : 0,
             partsLeft, debrisNow, tornDown ? 1 : 0, minLegElev, minArmElev,
             maxArmElev, minLegSwing[0], maxLegSwing[0], minLegSwing[1],
-            maxLegSwing[1], legsUpright ? 1 : 0, legsAlternate ? 1 : 0,
+            maxLegSwing[1], maxLegLateral, meanLegLateral[0],
+            meanLegLateral[1], legsNotSplayed ? 1 : 0,
+            legsUpright ? 1 : 0, legsAlternate ? 1 : 0,
             armsHang ? 1 : 0, armsSwing ? 1 : 0, worstLegUp,
             legsNotInverted ? 1 : 0, worstJumpFlat, worstJump,
             poseContinuous ? 1 : 0);

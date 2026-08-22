@@ -378,16 +378,30 @@ export function animSolveTwoBone(sk, st, chain, targetModel, weight) {
   const tx = dc, ty = 0;                                       // :367
   const angle1 = Math.atan2(ty * adj - tx * opp, tx * adj + ty * opp);  // :368
 
-  const dirTarget = vnorm(toTarget);                           // :370
-  let pole = vnorm(chain.pole || v3(0, 0, 1));                 // :373
+  const dirTarget = vnorm(toTarget);                           // :481
+  let pole = vnorm(chain.pole || v3(0, 0, 1));                 // :484
   if (vlen(pole) < 1e-6) pole = v3(0, 0, 1);
-  let bendAxis = vcross(dirTarget, pole);                      // :375
-  if (vlen(bendAxis) < 1e-4) {                                 // :376
+  // ORTHOGONALIZE THE POLE AGAINST THE TARGET (Gram-Schmidt) rather than
+  // crossing with it raw — anim.cpp:490. The old raw cross collapsed to zero
+  // when the pole was (anti)parallel to the target and fell back to bending
+  // about world-up, i.e. sideways, and it SNAPPED in discontinuously as the
+  // limb swung through that direction.
+  let polePerp = vsub(pole, vmul(dirTarget, vdot(dirTarget, pole)));  // :513
+  if (vlen(polePerp) < 1e-4) {                                 // :514
+    // No information left: choose a plane CONSISTENTLY or the joint spins as
+    // the target crosses this axis.
     const alt = Math.abs(dirTarget.y) < 0.9 ? v3(0, 1, 0) : v3(1, 0, 0);
-    bendAxis = vcross(dirTarget, alt);
+    polePerp = vsub(alt, vmul(dirTarget, vdot(dirTarget, alt)));
   }
+  if (vlen(polePerp) < 1e-6) return;
+  polePerp = vnorm(polePerp);
+  // NOTE THE ORDER: polePerp x dirTarget, not dirTarget x polePerp
+  // (anim.cpp:524). angle1 comes out NEGATIVE, so crossing the other way
+  // swings the joint AWAY from the pole — which put the KNEE BACKWARD at
+  // every target and bulged the elbow forward.
+  let bendAxis = vcross(polePerp, dirTarget);                  // :526
+  if (vlen(bendAxis) < 1e-4) return;                           // :527
   bendAxis = vnorm(bendAxis);
-  if (vlen(bendAxis) < 1e-4) return;                           // :382
 
   const curDir = vnorm(vsub(joint, root));                     // :386
   const aim = qfromto(curDir, dirTarget);                      // :387
