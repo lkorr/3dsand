@@ -108,13 +108,44 @@ class Cues {
   // `intensity` is in [0,1] and means whatever the event needs it to — the
   // fraction of max hp removed for Hurt, blow severity for Sever. It drives
   // gain and a downward pitch bend, the same shape Land and Impact use.
-  enum class MobEvent { Hurt, Death, Sever, Idle, Alert, Attack };
+  //
+  // Dismember is the CUT, not the cry: flesh parting under a blade. It is a
+  // separate event from Sever because the two have different causes — every
+  // sever has a voice, but only a bladed one saws through anything, and an
+  // explosion that takes the same arm off must not play it. A sword blow
+  // fires both.
+  enum class MobEvent { Hurt, Death, Sever, Idle, Alert, Attack, Dismember };
   void MobSound(const MobDef& def, MobEvent ev, const Vec3& posVox,
                 float intensity = 1.0f, uint64_t sourceId = 0);
 
   // Resolve one mob slot to a library id, or -1. Exposed so callers can skip
   // building an event for a mob that binds nothing.
   int MobSetId(const MobDef& def, MobEvent ev) const;
+
+  // ---- bleeding -----------------------------------------------------------
+  // A positioned wet loop for a creature losing a lot of blood, keyed by a
+  // caller-chosen id (mob id, or a limb key) so several wounds can sound at
+  // once and each can be updated independently.
+  //
+  // `intensity` in [0,1] is how hard the wound is pumping. Call it every frame
+  // for every heavily-bleeding wound: the loop starts itself when intensity
+  // first exceeds the on-threshold, tracks gain while it runs, and stops when
+  // intensity falls back under the off-threshold (which is LOWER, so a wound
+  // hovering at the boundary does not stutter the voice on and off).
+  //
+  // Wounds not updated on a frame are reaped, so a caller that stops
+  // reporting a mob — because it died, despawned or stopped bleeding — does
+  // not have to remember to stop its loop.
+  void MobBleed(uint64_t sourceId, const Vec3& posVox, float intensity);
+
+  // ---- world ambience -----------------------------------------------------
+  // The night bed: rare, quiet, and non-diegetic. `want` in [0,1] is how much
+  // of it should be audible right now — main.cpp drives that from the day
+  // phase, so it eases in after dusk and out at dawn — and `allowStart` gates
+  // whether a NEW pass may begin, which is where the rarity lives. A pass that
+  // has already started is never cut off by allowStart going false; only `want`
+  // reaching 0 stops it.
+  void SetNightAmbience(const Vec3& listenerPosVox, float want, bool allowStart);
 
   // ---- ambience -----------------------------------------------------------
   // A positioned looping bed, e.g. a lava lake or a waterfall. Returns a handle
@@ -141,7 +172,8 @@ class Cues {
   // gait producing steps at all" separately from "can I hear them" — the two
   // failure modes look identical from the speakers.
   struct Stats {
-    uint32_t steps = 0, lands = 0, impacts = 0, breaks = 0, mobs = 0, dropped = 0;
+    uint32_t steps = 0, lands = 0, impacts = 0, breaks = 0, mobs = 0,
+             bleeds = 0, dropped = 0;
   };
   const Stats& GetStats() const { return stats_; }
 
@@ -177,6 +209,26 @@ class Cues {
 
   // Last variant played per set, so a set never repeats a sample back to back.
   std::vector<int> lastVariant_;
+
+  // ---- bleed loops --------------------------------------------------------
+  // One live loop per heavily-bleeding wound. `seen` is the reap flag: Update
+  // clears it, MobBleed sets it, and anything still clear at the end of the
+  // frame stopped bleeding (or its owner died) and is stopped. That inverted
+  // ownership is deliberate -- the caller cannot leak a voice by forgetting to
+  // close one, which for a mob that can be dismembered, ragdolled and
+  // despawned on the same frame is a real hazard.
+  struct BleedLoop {
+    int handle = -1;
+    float gain = 0.0f;   // eased, so a wound does not click on and off
+    bool seen = false;
+  };
+  std::map<uint64_t, BleedLoop> bleeds_;
+  void ReapBleeds();
+
+  // ---- night bed ----------------------------------------------------------
+  int nightHandle_ = -1;
+  float nightGain_ = 0.0f;   // eased toward the caller's `want`
+  bool nightPlaying_ = false;
 
   std::vector<std::string> warnings_;
   std::string soundDir_;

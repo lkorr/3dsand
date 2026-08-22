@@ -101,7 +101,16 @@ const std::map<std::string, std::string> Cues::kSlotPrefix = {
     // together in one folder tree.
     {"hurt", "mobs"},          {"death", "mobs"},      {"sever", "mobs"},
     {"idle", "mobs"},          {"alert", "mobs"},      {"attack", "mobs"},
-    {"step", "footsteps"},
+    {"step", "footsteps"},     {"dismember", "mobs"},
+    // Bleeding lives under gore/ rather than mobs/: it is the sound of BLOOD,
+    // not of a particular creature, and every mob that bleeds wants the same
+    // wet bed. Keeping it out of mobs/ is what lets one set serve all of them
+    // without pretending it is any one creature's voice.
+    {"bleed", "gore"},
+    // World beds (see the `world` owner in sound_schema.js). One owner, so the
+    // set name is fixed in code; the slot exists here so the tuner and the
+    // wiki can describe it.
+    {"night", "ambience"},
 };
 
 namespace {
@@ -115,6 +124,7 @@ const char* MobSlotName(Cues::MobEvent ev) {
     case Cues::MobEvent::Idle:   return "idle";
     case Cues::MobEvent::Alert:  return "alert";
     case Cues::MobEvent::Attack: return "attack";
+    case Cues::MobEvent::Dismember: return "dismember";
   }
   return "";
 }
@@ -271,6 +281,12 @@ void Cues::Update(float dt, const Vec3& listenerPosVox, float yaw, float pitch,
   ApplyTuning();
   // Republished every frame because a materials hot-reload can change it.
   world_.SetAcoustics(acoustics_);
+
+  // Close out any bleed loop whose wound was not reported this frame. Runs
+  // AFTER the game has had its say (Update is called at the end of the frame,
+  // past the MobBleed calls) so "not seen" genuinely means "stopped bleeding"
+  // and not "not reported yet".
+  ReapBleeds();
 
   ListenerPose lp;
   lp.posVox = listenerPosVox;
@@ -442,8 +458,9 @@ void Cues::MobSound(const MobDef& def, MobEvent ev, const Vec3& posVox,
   // ONE VOICE PER SOURCE PER WINDOW. A body taking a burst of laser damage
   // generates a damage event per tick; without this a single hit reads as a
   // machine-gun of overlapping copies of the same sample, which is both the
-  // loudest possible bug and a straight waste of the voice pool. Death and
-  // Sever are state changes that happen once, so they bypass it.
+  // loudest possible bug and a straight waste of the voice pool. Death, Sever
+  // and Dismember are state changes that happen once, so they bypass it -- and
+  // a blow that takes two limbs at once SHOULD be two cuts.
   const bool limited = (ev == MobEvent::Hurt || ev == MobEvent::Attack ||
                         ev == MobEvent::Alert || ev == MobEvent::Idle);
   if (limited && sourceId) {
@@ -473,10 +490,119 @@ void Cues::MobSound(const MobDef& def, MobEvent ev, const Vec3& posVox,
   std::uniform_real_distribution<float> d(-t.mobPitchJitter, t.mobPitchJitter);
   cfg.rate = std::clamp(1.0f + d(rng_) - 0.18f * k, 0.5f, 2.0f);
 
+  if (ev == MobEvent::Dismember) {
+    // The cut is a physical event, not a voice, so it takes its own trim and a
+    // wider jitter than the creature slots: four takes cover a whole fight and
+    // the ear finds the repeat quickly without it. `k` here is blade speed,
+    // and a faster cut reads LOWER -- more mass parting at once.
+    cfg.gain = t.dismemberVolume * (0.6f + 0.6f * k);
+    std::uniform_real_distribution<float> dd(-t.dismemberPitchJitter,
+                                             t.dismemberPitchJitter);
+    cfg.rate = std::clamp(1.0f + dd(rng_) - 0.15f * k, 0.5f, 2.0f);
+  }
+
   if (world_.PlayOneShot(buf, posVox, cfg))
     stats_.mobs++;
   else
     stats_.dropped++;
+}
+
+void Cues::MobBleed(uint64_t sourceId, const Vec3& posVox, float intensity) {
+  if (!enabled_) return;
+  const Tuning::Audio& t = CurrentTuning().audio;
+  const float k = std::clamp(intensity, 0.0f, 1.0f);
+
+  BleedLoop& b = bleeds_[sourceId];
+  b.seen = true;
+
+  // Hysteresis: start above `on`, keep going until below `off`. A single
+  // threshold makes a wound sitting exactly at it retrigger the voice every
+  // frame, which is both audible and a voice-pool leak.
+  if (b.handle < 0) {
+    if (k < t.bleedOnThreshold) return;
+    const int id = lib_.Find("gore/bleed");
+    if (id < 0) return;
+    b.gain = 0.0f;
+    b.handle = StartAmbience("gore/bleed", posVox, 0.0f, t.bleedRadius);
+    if (b.handle < 0) return;   // pool full; retried next frame
+    stats_.bleeds++;
+  }
+
+  // Track the wound. Eased rather than snapped so a drip-by-drip budget does
+  // not chatter the gain.
+  b.gain += (k * t.bleedVolume - b.gain) * 0.25f;
+  world_.SetLoopPos(b.handle, posVox);
+  world_.SetLoopGain(b.handle, b.gain);
+}
+
+void Cues::ReapBleeds() {
+  const Tuning::Audio& t = CurrentTuning().audio;
+  for (auto it = bleeds_.begin(); it != bleeds_.end();) {
+    BleedLoop& b = it->second;
+    // Not reported this frame: the wound closed, or its owner is gone. Fade
+    // out rather than cutting, then drop the entry once it is silent.
+    if (!b.seen) {
+      b.gain *= 0.80f;
+      if (b.handle >= 0) {
+        if (b.gain < 0.005f) {
+          world_.StopLoop(b.handle);
+          it = bleeds_.erase(it);
+          continue;
+        }
+        world_.SetLoopGain(b.handle, b.gain);
+      } else {
+        it = bleeds_.erase(it);
+        continue;
+      }
+    } else if (b.handle >= 0 && b.gain < t.bleedOffThreshold * t.bleedVolume) {
+      // Still reported, but the wound has slowed past the off-threshold.
+      world_.StopLoop(b.handle);
+      b.handle = -1;
+      b.gain = 0.0f;
+    }
+    b.seen = false;   // cleared for the next frame; MobBleed sets it again
+    ++it;
+  }
+}
+
+void Cues::SetNightAmbience(const Vec3& listenerPosVox, float want,
+                            bool allowStart) {
+  if (!enabled_) return;
+  const Tuning::Audio& t = CurrentTuning().audio;
+  const float k = std::clamp(want, 0.0f, 1.0f);
+
+  if (!nightPlaying_) {
+    // Only a caller-approved roll starts a pass -- that is where the rarity
+    // lives. Deliberately checked before the set lookup so a project with no
+    // night bed costs nothing here.
+    if (!allowStart || k <= 0.0f) return;
+    const int id = lib_.Find("ambience/starlight");
+    if (id < 0) return;
+    nightGain_ = 0.0f;
+    // Centred ON the listener: this is a non-diegetic bed, not a thing at a
+    // place, so it must not pan or occlude as the player turns. Occlusion
+    // scale 0 for the same reason -- a wall between you and "the night" is
+    // not a meaningful idea.
+    nightHandle_ = StartAmbience("ambience/starlight", listenerPosVox, 0.0f,
+                                 t.nightRadius, 0.0f /*no occlusion*/);
+    if (nightHandle_ < 0) return;
+    nightPlaying_ = true;
+  }
+
+  // Ease toward the target. Slow on purpose: this bed should arrive and leave
+  // without the player catching the moment it did either.
+  nightGain_ += (k * t.nightVolume - nightGain_) * t.nightFadeRate;
+  world_.SetLoopPos(nightHandle_, listenerPosVox);
+  world_.SetLoopGain(nightHandle_, nightGain_);
+
+  // Daybreak, or the pass was told to end: once faded out, release the voice
+  // so the pool is free and the next night rolls fresh.
+  if (k <= 0.0f && nightGain_ < 0.004f) {
+    world_.StopLoop(nightHandle_);
+    nightHandle_ = -1;
+    nightPlaying_ = false;
+    nightGain_ = 0.0f;
+  }
 }
 
 int Cues::StartAmbience(const std::string& setName, const Vec3& posVox, float gain,

@@ -462,6 +462,33 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "mobVolume", a.mobVolume, out, at);
     ReadF(*g, "mobRadius", a.mobRadius, out, at);
     ReadF(*g, "mobPitchJitter", a.mobPitchJitter, out, at);
+    ReadF(*g, "dismemberVolume", a.dismemberVolume, out, at);
+    ReadF(*g, "dismemberPitchJitter", a.dismemberPitchJitter, out, at);
+    ReadF(*g, "bleedVolume", a.bleedVolume, out, at);
+    ReadF(*g, "bleedRadius", a.bleedRadius, out, at);
+    ReadF(*g, "bleedOnThreshold", a.bleedOnThreshold, out, at);
+    ReadF(*g, "bleedOffThreshold", a.bleedOffThreshold, out, at);
+    ReadF(*g, "nightVolume", a.nightVolume, out, at);
+    ReadF(*g, "nightRadius", a.nightRadius, out, at);
+    ReadF(*g, "nightChance", a.nightChance, out, at);
+    ReadF(*g, "nightRetrySeconds", a.nightRetrySeconds, out, at);
+    ReadF(*g, "nightFadeRate", a.nightFadeRate, out, at);
+    a.bleedOnThreshold = std::clamp(a.bleedOnThreshold, 0.0f, 1.0f);
+    a.bleedOffThreshold = std::clamp(a.bleedOffThreshold, 0.0f, 1.0f);
+    // The hysteresis only works while off < on. Equal (or inverted) collapses
+    // it to a single threshold and the loop chatters on and off every frame at
+    // the boundary, so pull `off` down rather than trusting the author.
+    if (a.bleedOffThreshold >= a.bleedOnThreshold) {
+      out.warnings.push_back(
+          at + ".bleedOffThreshold >= bleedOnThreshold; lowered to keep the "
+               "loop from retriggering every frame");
+      a.bleedOffThreshold = a.bleedOnThreshold * 0.5f;
+    }
+    a.nightChance = std::clamp(a.nightChance, 0.0f, 1.0f);
+    // A zero retry period would roll every frame, which is not "rare" at any
+    // chance; a zero fade rate would leave the bed stuck silent forever.
+    a.nightRetrySeconds = std::max(a.nightRetrySeconds, 1.0f);
+    a.nightFadeRate = std::clamp(a.nightFadeRate, 0.0001f, 1.0f);
     ReadF(*g, "reverbWet", a.reverbWet, out, at);
     ReadB(*g, "occlusion", a.occlusion, out, at);
     ReadF(*g, "occlusionMaxDb", a.occlusionMaxDb, out, at);

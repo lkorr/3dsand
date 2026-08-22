@@ -345,6 +345,37 @@ struct Tuning {
     float mobRadius = 45.0f;
     float mobPitchJitter = 0.07f;
 
+    // The blade cut itself, separate from the creature's cry (which is the
+    // `sever` slot on mobVolume). Its own trim because a wet mechanical sound
+    // and a voice sit differently in the mix, and a wider jitter because four
+    // takes have to cover a whole fight.
+    float dismemberVolume = 1.0f;
+    float dismemberPitchJitter = 0.12f;
+
+    // Bleeding: a positioned wet loop while a wound is pumping hard.
+    float bleedVolume = 0.9f;
+    float bleedRadius = 18.0f;
+    // Intensity (0..1 of the bleed budget cap) to START the loop, and the
+    // lower level it must fall back through to STOP. Two thresholds, not one:
+    // a wound sitting exactly on a single threshold retriggers the voice every
+    // frame. On > off is required and enforced at load.
+    float bleedOnThreshold = 0.35f;
+    float bleedOffThreshold = 0.12f;
+
+    // The night bed (assets/sounds/ambience/starlight). Rare by design.
+    float nightVolume = 0.5f;
+    // Audible radius. Large because the bed is centred on the listener and is
+    // meant to sit around them rather than to come from a place.
+    float nightRadius = 60.0f;
+    // Chance, per retry, that a new pass begins. With the defaults below that
+    // is one roll a minute at 8%, so most nights stay silent and the bed is an
+    // event rather than a backing track.
+    float nightChance = 0.08f;
+    float nightRetrySeconds = 60.0f;
+    // Per-frame easing factor for the fade in and out. Small = slow: the bed
+    // should arrive and leave without the player catching either moment.
+    float nightFadeRate = 0.004f;
+
     // Reverb send for world sounds, 0..1. The engine's FDN reverb is what
     // makes a cave read as a cave; keep it modest for outdoor-heavy worlds.
     float reverbWet = 0.16f;
