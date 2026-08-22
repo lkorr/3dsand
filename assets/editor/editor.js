@@ -401,7 +401,8 @@ function applyGrowSnapshot(d, which) {
   const snap = d[which];
   const m = doc.models[d.modelIndex];
   if (!m) return;
-  m.grid = { dim: { ...snap.dim }, data: new Uint8Array(snap.data) };
+  m.grid = { dim: { ...snap.dim }, data: new Uint8Array(snap.data),
+             color: snap.color ? new Uint8Array(snap.color) : null };
   m.dim = { ...snap.dim };
   m.offset = { ...snap.offset };
   if (d.modelIndex === activeModel) grid = m.grid;
@@ -504,16 +505,23 @@ function copySelection() {
   const dx = hi[0] - lo[0] + 1, dy = hi[1] - lo[1] + 1, dz = hi[2] - lo[2] + 1;
   const dim = { x: dx, y: dy, z: dz };
   const data = new Uint8Array(dx * dy * dz);
-  let count = 0;
+  // Colours travel as HEX, not as palette indices: the clipboard outlives the
+  // document (paste into another model, or after a reload) and an index only
+  // means something against the art palette that allocated it.
+  const colors = new Array(dx * dy * dz).fill(null);
+  let count = 0, painted = 0;
   for (let z = 0; z < dz; z++)
     for (let y = 0; y < dy; y++)
       for (let x = 0; x < dx; x++) {
         const v = gridGet(grid, lo[0] + x, lo[1] + y, lo[2] + z);
-        data[x + y * dx + z * dx * dy] = v;
+        const i = x + y * dx + z * dx * dy;
+        data[i] = v;
         if (v) count++;
+        const a = gridColorGet(grid, lo[0] + x, lo[1] + y, lo[2] + z);
+        if (v && a) { colors[i] = artPalette.colorAt(a); painted++; }
       }
   if (!count) { hooks.toast('selection contains no voxels', true); return; }
-  clipboard = { dim, data };
+  clipboard = { dim, data, colors: painted ? colors : null };
   hooks.toast(`copied ${count} voxel${count === 1 ? '' : 's'} (${dx}×${dy}×${dz})`);
 }
 
@@ -528,26 +536,34 @@ function pasteClipboard() {
   let ox = 0, oy = 0, oz = 0;
   if (hover) { const t = targetOf(hover); ox = t[0]; oy = t[1]; oz = t[2]; }
   const d = clipboard.dim;
-  const byMat = new Map();
+  // Batch by (material, colour) so one applyOps call covers every cell that
+  // shares both — a pasted block is usually a handful of such pairs, not one
+  // call per voxel.
+  const byPair = new Map();
   let clipped = 0;
   for (let z = 0; z < d.z; z++)
     for (let y = 0; y < d.y; y++)
       for (let x = 0; x < d.x; x++) {
-        const v = clipboard.data[x + y * d.x + z * d.x * d.y];
+        const i = x + y * d.x + z * d.x * d.y;
+        const v = clipboard.data[i];
         if (!v) continue;
         const px = ox + x, py = oy + y, pz = oz + z;
         if (!inBounds(px, py, pz)) { clipped++; continue; }
-        if (!byMat.has(v)) byMat.set(v, []);
-        byMat.get(v).push([px, py, pz]);
+        const hex = clipboard.colors ? clipboard.colors[i] : null;
+        const k = v + '|' + (hex || '');
+        if (!byPair.has(k)) byPair.set(k, { mat: v, hex, cells: [] });
+        byPair.get(k).cells.push([px, py, pz]);
       }
-  if (!byMat.size) {
+  if (!byPair.size) {
     hooks.toast(`paste: all ${clipped} voxels outside bounds`, true); return;
   }
   const savedMirror = mirror;
   mirror = { x: false, y: false, z: false };
   beginStroke();
-  for (const [mat, cells] of byMat) applyOps(cells, mat);
+  for (const { mat, hex, cells } of byPair.values())
+    applyOps(cells, mat, hex ? (allocArt(hex) ?? 0) : 0);
   endStroke();
+  artFullWarned = false;
   mirror = savedMirror;
   let n = 0; for (const c of byMat.values()) n += c.length;
   let msg = `pasted ${n} voxel${n === 1 ? '' : 's'}`;
@@ -565,9 +581,11 @@ function fillSelection() {
       for (let x = lo[0]; x <= hi[0]; x++)
         cells.push([x, y, z]);
   beginStroke();
-  applyOps(cells, activeMat);
+  applyOps(cells, activeMat, colorForBrush());
   endStroke();
-  hooks.toast(`filled ${cells.length} cells with ${matName(activeMat)}`);
+  artFullWarned = false;
+  hooks.toast(`filled ${cells.length} cells with ${matName(activeMat)}` +
+              (artColor !== null ? ` · ${artColor}` : ''));
 }
 
 /* ---- multi-model document ---------------------------------------------- */
@@ -666,7 +684,9 @@ function moveModel(i, d, moveAnchor = true) {
  */
 function snapshotModel(i) {
   const m = doc.models[i];
-  const snap = { dim: { ...m.dim }, offset: { ...m.offset }, data: new Uint8Array(m.grid.data) };
+  const snap = { dim: { ...m.dim }, offset: { ...m.offset },
+                 data: new Uint8Array(m.grid.data),
+                 color: m.grid.color ? new Uint8Array(m.grid.color) : null };
   if (sidecar && Array.isArray(sidecar.limbs)) {
     snap.anchors = sidecar.limbs
       .filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
@@ -700,6 +720,8 @@ function growModel(i, pad) {
         if (nx < 0 || ny < 0 || nz < 0 ||
             nx >= dim.x || ny >= dim.y || nz >= dim.z) { cropped++; continue; }
         gridSet(g, nx, ny, nz, v);
+        const a = gridColorGet(m.grid, x, y, z);
+        if (a) gridColorSet(g, nx, ny, nz, a);
       }
   if (cropped) hooks.toast(`cropped ${cropped} voxel` + (cropped === 1 ? '' : 's'), true);
   m.grid = g; m.dim = dim;
@@ -852,6 +874,8 @@ function splitSelectionToModel(name) {
         const v = gridGet(src.grid, x, y, z);
         if (!v) continue;
         gridSet(g, x - mn[0], y - mn[1], z - mn[2], v);
+        const a = gridColorGet(src.grid, x, y, z);
+        if (a) gridColorSet(g, x - mn[0], y - mn[1], z - mn[2], a);
         moved.push([x, y, z]);
       }
   // Erase from the source through applyOps so the extraction is undoable.
@@ -898,17 +922,23 @@ function upscaleDoc() {
   for (const m of doc.models) {
     const nd = { x: m.dim.x * 2, y: m.dim.y * 2, z: m.dim.z * 2 };
     const g = makeGrid(nd);
-    const od = m.dim, src = m.grid.data;
+    const od = m.dim, src = m.grid.data, srcC = m.grid.color;
+    const dstC = srcC ? gridColorLayer(g) : null;
     for (let z = 0; z < od.z; z++)
       for (let y = 0; y < od.y; y++)
         for (let x = 0; x < od.x; x++) {
-          const v = src[x + y * od.x + z * od.x * od.y];
+          const si = x + y * od.x + z * od.x * od.y;
+          const v = src[si];
           if (!v) continue;
+          const a = srcC ? srcC[si] : 0;
           for (let dz = 0; dz < 2; dz++)
             for (let dy = 0; dy < 2; dy++)
-              for (let dx = 0; dx < 2; dx++)
-                g.data[(x * 2 + dx) + (y * 2 + dy) * nd.x +
-                       (z * 2 + dz) * nd.x * nd.y] = v;
+              for (let dx = 0; dx < 2; dx++) {
+                const di = (x * 2 + dx) + (y * 2 + dy) * nd.x +
+                           (z * 2 + dz) * nd.x * nd.y;
+                g.data[di] = v;
+                if (dstC) dstC[di] = a;
+              }
         }
     m.dim = nd;
     m.grid = g;
@@ -939,24 +969,36 @@ function downscaleDoc() {
       z: Math.max(1, Math.floor(m.dim.z / 2)),
     };
     const g = makeGrid(nd);
-    const od = m.dim, src = m.grid.data;
+    const od = m.dim, src = m.grid.data, srcC = m.grid.color;
+    const dstC = srcC ? gridColorLayer(g) : null;
     for (let z = 0; z < nd.z; z++)
       for (let y = 0; y < nd.y; y++)
         for (let x = 0; x < nd.x; x++) {
-          // Take the most common non-zero material in the 2×2×2 source block.
-          const counts = {};
-          let best = 0, bestN = 0;
+          // Take the most common non-zero material in the 2×2×2 source block,
+          // and — independently — the most common colour among the cells that
+          // survived. Colour is voted separately because a block can be one
+          // material in two different colours, and picking the colour of the
+          // winning material's first cell would make the choice order-dependent.
+          const counts = {}, ccounts = {};
+          let best = 0, bestN = 0, bestC = 0, bestCN = 0;
           for (let dz = 0; dz < 2; dz++)
             for (let dy = 0; dy < 2; dy++)
               for (let dx = 0; dx < 2; dx++) {
                 const sx = x * 2 + dx, sy = y * 2 + dy, sz = z * 2 + dz;
                 if (sx >= od.x || sy >= od.y || sz >= od.z) continue;
-                const v = src[sx + sy * od.x + sz * od.x * od.y];
+                const si = sx + sy * od.x + sz * od.x * od.y;
+                const v = src[si];
                 if (!v) continue;
                 const c = (counts[v] = (counts[v] || 0) + 1);
                 if (c > bestN) { bestN = c; best = v; }
+                const a = srcC ? srcC[si] : 0;
+                if (!a) continue;
+                const ac = (ccounts[a] = (ccounts[a] || 0) + 1);
+                if (ac > bestCN) { bestCN = ac; bestC = a; }
               }
-          g.data[x + y * nd.x + z * nd.x * nd.y] = best;
+          const di = x + y * nd.x + z * nd.x * nd.y;
+          g.data[di] = best;
+          if (dstC && best) dstC[di] = bestC;
         }
     m.dim = nd;
     m.grid = g;
@@ -1414,7 +1456,7 @@ function rebuildInstances() {
   // One model's grid appended at an arbitrary offset/brightness/transform.
   // Shared by the normal editing view and the composed preview below.
   const drawModel = (m, off, bright, xf) => {
-    const d = m.dim, data = m.grid.data;
+    const d = m.dim, data = m.grid.data, cols = m.grid.color;
     for (let z = 0; z < d.z; z++) {
       for (let y = 0; y < d.y; y++) {
         const row = y * d.x + z * d.x * d.y;
@@ -1431,7 +1473,7 @@ function rebuildInstances() {
             _m4.makeTranslation(x + 0.5 + off.x, y + 0.5 + off.y, z + 0.5 + off.z);
           }
           cubes.setMatrixAt(n, _m4);
-          _col.set(matColor(v));
+          _col.set(shownColor(v, cols ? cols[row + x] : 0));
           if (bright < 1) _col.multiplyScalar(bright);
           cubes.setColorAt(n, _col);
           n++;
@@ -2061,6 +2103,20 @@ function brushCells(h) {
     out.push([x, y, z]);
   }
   return out;
+}
+
+// Copy the colour layer along with a block of cells. Used by the clipboard
+// and by any op that relocates voxels: paint belongs to the voxel, so it has
+// to travel with it or a pasted limb comes back grey.
+function colorAtCell(x, y, z) {
+  if (!wholeMode) return gridColorGet(grid, x, y, z);
+  for (let mi = 0; mi < doc.models.length; mi++) {
+    if (!modelVisible(mi)) continue;
+    const m = doc.models[mi];
+    const lx = x - m.offset.x, ly = y - m.offset.y, lz = z - m.offset.z;
+    if (gridGet(m.grid, lx, ly, lz)) return gridColorGet(m.grid, lx, ly, lz);
+  }
+  return 0;
 }
 
 /**
