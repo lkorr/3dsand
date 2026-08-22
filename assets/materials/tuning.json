@@ -33,7 +33,9 @@
   "camera": {
     "mouseSensitivity": 0.0022,
     "fovY": 1.2,
-    "pitchClamp": 1.55
+    "pitchClamp": 1.55,
+    "meleeSensitivity": 0.5,
+    "meleeSensHalflife": 0.08
   },
   "thirdPerson": {
     "distance": 3.2,
@@ -58,6 +60,11 @@
     "turnMinSpeed": 0.35,
     "velocityHalflife": 0.08,
     "firstPersonTurnHalflife": 0.05,
+    "headLookYaw": 70,
+    "headLookPitchUp": 55,
+    "headLookPitchDown": 60,
+    "headLookSpine": 0.25,
+    "headLookHalflife": 0.07,
     "ikBlendHalflife": 0.08,
     "airDebounce": 0.12,
     "firstPersonArms": true,

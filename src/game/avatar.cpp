@@ -410,6 +410,19 @@ void PlayerAvatar::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
   weaponWeight_ = weight < 0 ? 0 : (weight > 1 ? 1 : weight);
 }
 
+void PlayerAvatar::SetLook(float yawRel, float pitch) {
+  const auto& a = CurrentTuning().avatar;
+  const float kDeg = 3.14159265f / 180.0f;
+  // Wrap defensively: the caller wraps too, but a stale unwrapped angle here
+  // would clamp to the wrong stop rather than to the near one.
+  while (yawRel > 3.14159265f) yawRel -= 6.2831853f;
+  while (yawRel < -3.14159265f) yawRel += 6.2831853f;
+  const float yLim = a.headLookYaw * kDeg;
+  lookYawGoal_ = std::clamp(yawRel, -yLim, yLim);
+  lookPitchGoal_ =
+      std::clamp(pitch, -a.headLookPitchDown * kDeg, a.headLookPitchUp * kDeg);
+}
+
 uint64_t PlayerAvatar::PartBody(int part) const {
   return (part >= 0 && part < (int)parts.size()) ? parts[part].body : 0;
 }
@@ -462,6 +475,12 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   bodyUp_ = Vec3{0, 1, 0};
   footInit_ = false;
   alive_ = true;
+  // A respawn must not inherit the corpse's last glance: the goal is refreshed
+  // from the camera on the next tick anyway, but the SMOOTHED value would ease
+  // out of a stale twist and the new body would be born looking over its
+  // shoulder for a tenth of a second.
+  lookYaw_ = lookYawGoal_ = 0;
+  lookPitch_ = lookPitchGoal_ = 0;
 
   // The rig this instance animates is a COPY of the def's (see avatar.h): a
   // held item borrows a slot by APPENDING a part, and the shared def must not
@@ -1136,6 +1155,79 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     Quat jiggle = Mul(AxisAngle({1, 0, 0}, s.x),
                       Mul(AxisAngle({0, 1, 0}, s.y), AxisAngle({0, 0, 1}, s.z)));
     st.local[i].rot = QuatNormalize(Mul(st.local[i].rot, jiggle));
+  }
+
+  // ---- head look ------------------------------------------------------------
+  // THE HEAD LEADS, THE BODY FOLLOWS. main.cpp holds the body's facing still
+  // while the camera stays inside the neck's cone (avatar.headLookYaw) and only
+  // drags the feet around once the view leaves it; this is the other half of
+  // that — the head actually pointing where the camera is looking, so a glance
+  // to the side reads as a glance rather than as the whole character strafing
+  // with a fixed stare.
+  //
+  // WHY IT IS APPLIED HERE, BEFORE THE FLATTEN, and not as a post-process the
+  // way the IK is: `local[i].rot` is a joint rotation and the head has
+  // children (hat, hair — and on another rig, anything socketed to it), so
+  // composing it at the joint is what carries them along. AnimFlatten runs
+  // one line below and does exactly that. The IK is a post-process for the
+  // opposite reason: it needs the flattened pose to solve against.
+  //
+  // The pivot is free: rest.pos is the parent-relative anchor delta (mob.cpp
+  // builds it that way), so a part's local origin already IS its joint, and
+  // rotating `rot` alone swings the head about the neck rather than about the
+  // model origin. The springs directly above rely on the same property.
+  //
+  // MODEL-SPACE HANDEDNESS, the same trap the weapon arm documents: the
+  // .vox -> engine load map is (x, z, -y), which negates y and flips
+  // handedness, so model +X is the character's LEFT and +Y-positive rotation
+  // takes forward toward that left. Camera yaw is positive to the RIGHT and
+  // camera pitch positive UP, so both are negated going in. Checked with
+  // scripts/geometry.py rather than reasoned about.
+  {
+    const auto& av = CurrentTuning().avatar;
+    const float hl = av.headLookHalflife;
+    const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
+    lookYaw_ += (lookYawGoal_ - lookYaw_) * k;
+    lookPitch_ += (lookPitchGoal_ - lookPitch_) * k;
+
+    const int head = parts_.head;
+    // A severed head does not look at anything. `partAlive` is the same gate
+    // the rest of the pose pipeline uses, and skipping it here also keeps a
+    // detached head's debris pose from being written every tick.
+    const bool haveHead = head >= 0 && head < (int)sk.parts.size() &&
+                          head < (int)st.local.size() &&
+                          (head >= (int)st.partAlive.size() || st.partAlive[head]);
+    if (haveHead && (std::fabs(lookYaw_) > 1e-4f ||
+                     std::fabs(lookPitch_) > 1e-4f)) {
+      // Spine carries a share of the yaw so the chest twists into the look
+      // instead of a head swivelling on a rigid torso. The head then only
+      // needs the REMAINDER — it inherits the spine's share through the
+      // flatten, so adding the full yaw at both joints would double it.
+      const float spineShare = av.headLookSpine;
+      float spineTotal = 0;
+      if (spineShare > 1e-4f) {
+        int nSpine = 0;
+        for (size_t i = 0; i < sk.parts.size(); i++)
+          if (sk.parts[i].tag == "spine") nSpine++;
+        if (nSpine > 0) {
+          // Split across however many spine joints the rig has, so a rig with
+          // a three-segment back twists the same TOTAL amount as one with a
+          // single torso rather than three times as far.
+          const float per = lookYaw_ * spineShare / (float)nSpine;
+          for (size_t i = 0; i < sk.parts.size(); i++) {
+            if (sk.parts[i].tag != "spine") continue;
+            if (i < st.partAlive.size() && !st.partAlive[i]) continue;
+            st.local[i].rot = QuatNormalize(
+                Mul(st.local[i].rot, AxisAngle({0, 1, 0}, -per)));
+            spineTotal += per;
+          }
+        }
+      }
+      const float headYaw = lookYaw_ - spineTotal;
+      Quat look = Mul(AxisAngle({0, 1, 0}, -headYaw),
+                      AxisAngle({1, 0, 0}, -lookPitch_));
+      st.local[head].rot = QuatNormalize(Mul(st.local[head].rot, look));
+    }
   }
 
   AnimFlatten(sk, st);

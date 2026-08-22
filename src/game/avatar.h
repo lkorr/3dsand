@@ -114,6 +114,20 @@ class PlayerAvatar {
   // After Physics::Step: refresh limb transforms from Jolt.
   void PostStep();
 
+  // ---- head look ------------------------------------------------------------
+  // Where the character is LOOKING, as an offset from where the body is
+  // FACING. Pushed in once per tick by main.cpp before PreTick, same division
+  // of labour as heading and the weapon pose: main.cpp owns the policy (it is
+  // the thing that knows the camera), the avatar owns the rig.
+  //
+  // `yawRel` is camera yaw minus body heading, radians, already wrapped to
+  // (-pi, pi]; `pitch` is the camera pitch, radians, positive up. Both are
+  // CLAMPED here against the neck limits in tuning.json rather than trusted:
+  // main.cpp's turn policy uses the same limit to decide when the BODY has to
+  // start turning, and a rig that silently over-rotates when those two
+  // disagree is a much worse failure than a head that stops at its stop.
+  void SetLook(float yawRel, float pitch);
+
   // ---- footfall events (presentation only) --------------------------------
   // A foot touching down, produced by the gait's own plant moment rather than
   // by a distance accumulator — so a step sounds exactly when the art shows
@@ -431,6 +445,12 @@ class PlayerAvatar {
   Vec3 gripBody_{};
   Vec3 weaponHand_{}, weaponDir_{0, 1, 0}, weaponUp_{0, 0, 1};
   float weaponWeight_ = 0;
+
+  // Head look: the goal set by SetLook, and the smoothed value the rig is
+  // actually posed at. Two of them so the head EASES onto the mouse rather
+  // than stepping with it — the same reason the body yaw has a half-life.
+  float lookYawGoal_ = 0, lookPitchGoal_ = 0;
+  float lookYaw_ = 0, lookPitch_ = 0;
 
   static constexpr float kSeverHoldSeconds = 0.25f;
   // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)

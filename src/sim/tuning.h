@@ -144,6 +144,17 @@ struct Tuning {
     float mouseSensitivity = 0.0022f;  // radians per pixel
     float fovY = 1.2f;                 // radians (~69 deg)
     float pitchClamp = 1.55f;
+    // Multiplier on look sensitivity while a melee weapon is up (any swing
+    // phase but Idle). The same mouse motion both turns the view and steers
+    // the blade (game/melee.h), so at 1.0 a cut you want to watch also whips
+    // the camera off the target. Slowing the VIEW while leaving the blade on
+    // full gain is what makes a swing readable: the mouse travel buys mostly
+    // arm, not mostly yaw. The melee state machine never sees this scale —
+    // it is fed the raw delta, so commitSpeed still means true mouse pixels.
+    float meleeSensitivity = 0.5f;
+    // Half-life (seconds) of the scale easing in and out. Stepping the gain
+    // on the click edge is a visible jolt in a mid-turn mouse stroke.
+    float meleeSensHalflife = 0.08f;
   } camera;
 
   // ---- third-person camera rig ----
@@ -223,6 +234,28 @@ struct Tuning {
     // half-life keeps them attached to the view without visible lag. 0 restores
     // the old hard snap.
     float firstPersonTurnHalflife = 0.05f;
+    // ---- head look (the body does not turn until the neck runs out) --------
+    // How far the HEAD may yaw away from the body's facing before the BODY
+    // has to start turning, in degrees. Inside this cone a mouse turn is a
+    // glance: only the head (and a fraction of the spine) rotates, the feet
+    // stay planted and the arms stay where they were. Past it the body is
+    // dragged along so that the offset never exceeds this angle — which is
+    // why there is no separate "recenter" rate and no hysteresis to chatter
+    // on: the constraint is geometric, not a state machine.
+    float headLookYaw = 70.0f;
+    // Head pitch range, degrees up/down. The camera pitch clamp is ~89°, and
+    // a neck does not do that, so this clamps separately.
+    float headLookPitchUp = 55.0f;
+    float headLookPitchDown = 60.0f;
+    // Fraction of the head's yaw that is ALSO applied to the spine, so a look
+    // to the side twists the chest a little instead of swivelling a head on a
+    // rigid torso. Small on purpose: the arms are welded to the spine, so this
+    // moves a held weapon across the screen. 0 = head only.
+    float headLookSpine = 0.25f;
+    // Half-life (seconds) of the head easing to the look angle. This is what
+    // keeps the head from stepping with the raw mouse; the body's own
+    // firstPersonTurnHalflife sits behind it.
+    float headLookHalflife = 0.07f;
     // Half-life (seconds) of the leg IK fading in and out as the gait starts
     // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
     // body really does leave the surface cresting each bump — and switching the

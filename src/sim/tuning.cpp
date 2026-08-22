@@ -1,5 +1,6 @@
 #include "sim/tuning.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -357,6 +358,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "mouseSensitivity", c.mouseSensitivity, out, at);
     ReadF(*g, "fovY", c.fovY, out, at);
     ReadF(*g, "pitchClamp", c.pitchClamp, out, at);
+    ReadF(*g, "meleeSensitivity", c.meleeSensitivity, out, at);
+    // A scale of 0 would freeze the view while guarding, which reads as the
+    // game having locked up rather than as a feel choice; above 1 it is a
+    // speed-up, which is a legitimate thing to try, so only the floor is hard.
+    c.meleeSensitivity = std::clamp(c.meleeSensitivity, 0.05f, 2.0f);
+    ReadF(*g, "meleeSensHalflife", c.meleeSensHalflife, out, at);
+    c.meleeSensHalflife = std::clamp(c.meleeSensHalflife, 0.0f, 1.0f);
   }
 
   if (const json* g = Find(j, "thirdPerson")) {
@@ -387,6 +395,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "turnMinSpeed", a.turnMinSpeed, out, at);
     ReadF(*g, "velocityHalflife", a.velocityHalflife, out, at);
     ReadF(*g, "firstPersonTurnHalflife", a.firstPersonTurnHalflife, out, at);
+    ReadF(*g, "headLookYaw", a.headLookYaw, out, at);
+    // 0 is meaningful (body always faces the camera, the old behaviour); the
+    // ceiling stops a value that would let the head face backwards.
+    a.headLookYaw = std::clamp(a.headLookYaw, 0.0f, 110.0f);
+    ReadF(*g, "headLookPitchUp", a.headLookPitchUp, out, at);
+    a.headLookPitchUp = std::clamp(a.headLookPitchUp, 0.0f, 89.0f);
+    ReadF(*g, "headLookPitchDown", a.headLookPitchDown, out, at);
+    a.headLookPitchDown = std::clamp(a.headLookPitchDown, 0.0f, 89.0f);
+    ReadF(*g, "headLookSpine", a.headLookSpine, out, at);
+    a.headLookSpine = std::clamp(a.headLookSpine, 0.0f, 1.0f);
+    ReadF(*g, "headLookHalflife", a.headLookHalflife, out, at);
+    a.headLookHalflife = std::clamp(a.headLookHalflife, 0.0f, 1.0f);
     ReadF(*g, "ikBlendHalflife", a.ikBlendHalflife, out, at);
     ReadF(*g, "airDebounce", a.airDebounce, out, at);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);

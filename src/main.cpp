@@ -922,6 +922,9 @@ int main(int argc, char** argv) {
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
+  // Look sensitivity scale while a melee weapon is up, eased rather than
+  // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
+  float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack;
@@ -1024,15 +1027,39 @@ int main(int argc, char** argv) {
     }
     double mx, my;
     glfwGetCursorPos(window, &mx, &my);
-    if (captured) cam.ApplyMouse((float)(mx - mx0), (float)(my - my0));
-    // The SAME mouse motion drives the swing (game/melee.h). Fed per FRAME,
-    // because that is the rate the mouse is sampled at; the tick loop below
-    // runs 0..4 times per frame and integrating it there would multiply-count
-    // a fast flick into a much faster one.
+    // THE VIEW SLOWS WHILE THE BLADE IS UP; THE BLADE DOES NOT.
     //
-    // Sharing the delta with the look camera is deliberate: while guarding,
-    // moving the mouse both turns you and loads the blade, which is what makes
-    // the weapon feel attached to the hand rather than to a separate input.
+    // The same delta drives both the camera and the swing, which is what makes
+    // the weapon feel attached to the hand — but at equal gain a cut you want
+    // to WATCH also whips the view off the target, so the swing you just made
+    // leaves the screen before you see it land. Scaling only the look leaves
+    // the mouse stroke buying mostly arm instead of mostly yaw, which is the
+    // whole point: you are steering a blade, not aiming a gun.
+    //
+    // Eased on a half-life rather than switched, because clicking mid-stroke
+    // would otherwise step the view. Keyed off the swing PHASE rather than the
+    // button so the slowdown covers the recover tail too and hands the view
+    // back as the weapon settles. One frame latent (the phase is advanced in
+    // the tick loop below) and imperceptibly so.
+    {
+      const auto& ct = CurrentTuning().camera;
+      const bool bladeUp = melee.Phase() != SwingPhase::Idle;
+      const float want = bladeUp ? ct.meleeSensitivity : 1.0f;
+      const float hl = ct.meleeSensHalflife;
+      const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
+      lookSensNow += (want - lookSensNow) * k;
+    }
+    if (captured)
+      cam.ApplyMouse((float)(mx - mx0) * lookSensNow,
+                     (float)(my - my0) * lookSensNow);
+    // The swing gets the RAW delta — deliberately not scaled with the view
+    // above. MeleeTuning::commitSpeed is calibrated in true mouse pixels per
+    // second, so damping the input here would move the commit threshold every
+    // time somebody retunes the camera, and it would also shrink the cut the
+    // player physically made. Fed per FRAME, because that is the rate the
+    // mouse is sampled at; the tick loop below runs 0..4 times per frame and
+    // integrating it there would multiply-count a fast flick into a much
+    // faster one.
     if (captured) melee.AddMouse((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
     my0 = my;
@@ -1626,6 +1653,37 @@ int main(int argc, char** argv) {
         float d = wantHeading - avatarHeading;
         while (d > 3.14159265f) d -= 6.2831853f;
         while (d < -3.14159265f) d += 6.2831853f;
+
+        // THE NECK ABSORBS THE FIRST 70 DEGREES.
+        //
+        // Turning the whole body the instant the mouse moves is what makes a
+        // character read as a turret: every glance pivots the feet, and in
+        // first person it also drags the arms (and a held sword) across the
+        // screen for a look you only meant with your eyes. Real bodies do it
+        // the other way round — the head leads, and the body is recruited only
+        // once the neck runs out.
+        //
+        // So the body's goal is not "face the camera", it is "keep the camera
+        // within headLookYaw of my facing". Inside the cone the requested turn
+        // is dropped to zero and the head takes all of it (PlayerAvatar::
+        // SetLook, fed below); outside, only the EXCESS is requested, so the
+        // body follows exactly as far as it must and the head sits pinned at
+        // its stop for the rest of the sweep.
+        //
+        // Stated as a geometric constraint rather than as an enter/exit state,
+        // which is what keeps it from chattering at the boundary: there is no
+        // edge to cross twice, just a residual that is zero inside the cone.
+        //
+        // Third person keeps the old motion-facing rule untouched — there the
+        // body faces where it WALKS, so the same offset already arises from
+        // strafing and the head-look below handles it with no turn policy of
+        // its own.
+        const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
+        if (camMode == CameraMode::First && headCone > 1e-3f) {
+          if (d > headCone) d -= headCone;
+          else if (d < -headCone) d += headCone;
+          else d = 0.0f;
+        }
         // FIRST PERSON EASES ON A SHORT HALF-LIFE, NOT ON turnRate.
         //
         // The third-person rate limit exists so the body pivots on its feet
@@ -1691,6 +1749,23 @@ int main(int argc, char** argv) {
             avatar.SetWeaponPose(melee.HandOffset(), melee.BladeDir(),
                                  melee.BladeUp(), w);
           }
+        }
+        // Head look, the other half of the turn policy above: whatever yaw the
+        // body did NOT take is what the head is asked for. Computed from the
+        // post-turn heading so the two never disagree by a tick — and passed
+        // unclamped, because SetLook clamps against the same headLookYaw this
+        // block just used and a rig that quietly over-rotates when the two
+        // drift is worse than a head that stops at its stop.
+        //
+        // Third person gets it too, and it is arguably more valuable there:
+        // the body faces its travel direction, so strafing or running past a
+        // target is exactly when you want the character visibly looking where
+        // the player is looking.
+        if (avatar.Spawned()) {
+          float lookRel = camHeading - avatarHeading;
+          while (lookRel > 3.14159265f) lookRel -= 6.2831853f;
+          while (lookRel < -3.14159265f) lookRel += 6.2831853f;
+          avatar.SetLook(lookRel, cam.pitch);
         }
         if (avatar.Spawned())
           avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
