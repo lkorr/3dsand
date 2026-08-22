@@ -206,6 +206,115 @@ behavior change.*
 > on Vulkan — a separate, hash-gated change, explicitly out of scope for v1
 > (barrier_graph §4.10).
 
+> **[AS BUILT] Phase 3b deliverable 1 — recording with GENERATED barriers.**
+> `src/gpu/vk_record.{h,cpp}` is the last-access tracker of barrier_graph §3.3,
+> implemented verbatim: per-buffer `{lastWriteStage, lastWriteAccess,
+> readStagesSince, readAccessSince}`, WAR falling out of the write branch
+> folding the accumulated reads into its own source scope, read-after-read
+> emitting nothing, §3.4's head-of-command-buffer global barrier, §3.6's global
+> form on the CA repeat span, §3.7's indirect handling falling out of the
+> tracker rather than being special-cased, and §2.4 phase 7b's host-read barrier
+> emitted at `Finish()` instead of at a table index. `--barriers=sledgehammer`
+> is §6.2's A/B oracle. **No barrier is written at a call site**; the one
+> off-table recording path (`CopyToHost`, the blocking hash read) expresses its
+> source hazard as a `pass::Use` against the same tracker.
+>
+> **How the PassRow R/W sets reach the tracker — the seam this phase adds.**
+> The rejected option was widening `rhi::`'s wgpu-shaped encoder with a
+> `DeclareUses()` that only one backend honours: an API where forgetting a call
+> silently removes barriers is the wrong shape for the one thing rule 1 depends
+> on. Instead the Vulkan backend walks the SAME `pass::kRows` itself
+> (`Recorder::RecordTable`), so the row is not a parameter that can be omitted —
+> it is the loop variable, and every command the recorder can issue is reachable
+> only from a row. Two walkers (Dawn's in `simulation.cpp`, Vulkan's in
+> `vk_record.cpp`) read one table; `check_pass_table.py` plus cross-backend hash
+> equality is what proves they agree.
+>
+> **Three bugs found en route, two of them the kind that only faults:**
+>
+> 1. **`vkCmdPipelineBarrier2` needs `synchronization2` ENABLED, not just a 1.3
+>    device.** Promotion to core makes the entry point *resolve*; it does not
+>    make the call legal. `CreateLogicalDevice` now queries
+>    `VkPhysicalDeviceVulkan13Features`, enables it explicitly, and REFUSES to
+>    initialise without it — a down-converted 1.0-barrier fallback would mean a
+>    silently weaker barrier, which is the exact failure rule 1 cannot absorb.
+> 2. **`CreateDescriptorSet` hardcoded `STORAGE_BUFFER` for every write.**
+>    Phase 3a never noticed because `--vk-info` created no descriptor *sets*.
+>    Every uniform binding — including `passUBO`, the dynamic one — was being
+>    written with the wrong descriptor type, which is undefined behaviour that
+>    corrupts the set and faults later in a dispatch. The type now comes from the
+>    layout, matched **by binding number** rather than array position, because
+>    the two arrays are written independently at each call site.
+> 3. **`passUBO` must be bound with a 16-byte range, not the whole buffer.**
+>    With a dynamic offset, `offset + range` must stay in bounds, so binding all
+>    13.5 KiB puts every k > 0 past the end. Dawn's binding already used the
+>    16-byte window; reproducing it was necessary, not cosmetic.
+>
+> **[AS BUILT] Phase 3b deliverable 2 — `--backend vulkan`, headless.**
+> `src/gpu/vk_sim.{h,cpp}` builds the sim's buffers, layouts, descriptor sets
+> and 19 compute pipelines against `vk::Backend` from the same descriptions
+> `World::Init`/`Simulation::Init` use, and drives the recorded paths. It is a
+> second set of resource DECLARATIONS rather than a second backend behind
+> `rhi::`, because `rhi::` handles hold `shared_ptr<XImpl>` with every impl
+> defined as a `wgpu::` holder — a second implementation needs virtual dispatch
+> through the backend that is currently the port's only hash oracle, for no
+> phase-3b benefit. What is duplicated is the resource description; what decides
+> the world hash — the table — is shared. `--backend vulkan` without a headless
+> mode is **refused with a message**, never quietly served by Dawn: a run
+> reported as Vulkan that was Dawn all along is worse than no run.
+>
+> **[AS BUILT] Phase 3b deliverable 3 — `--vk-smoke`, and the port's first
+> determinism evidence. Checkpoint 2 (cross-backend hash equality) is MET.**
+>
+> ```
+> === sandvox --vk-smoke (Vulkan port phase 3b) ===
+> mode: barriers=precise validation=ON adapter=default seed=1337 ticks=50
+> loaded 97 materials, 74 reactions
+> adapter: NVIDIA GeForce RTX 3060 Ti (backend 6)
+> Vulkan device: NVIDIA GeForce RTX 3060 Ti
+>   validation layer: ENABLED   sync validation: ENABLED
+>   tick recording: 11 rows, 59 dispatches, 2 copies, 3 fills, 63 barrier calls (15 buffer + 55 global)
+>
+> === validation ===
+>   ZERO messages (no synchronization hazards reported)
+>
+> === hashes ===
+>   stage              Dawn         Vulkan
+>   worldgen           f97ba745     f97ba745     MATCH
+>   tick 1             d5c8944c     d5c8944c     MATCH
+>   tick 15            f153ce74     f153ce74     MATCH
+>   tick 30            434268e6     434268e6     MATCH
+>   tick 50            b3c643a2     b3c643a2     MATCH
+>
+> === --vk-smoke PASS ===
+> ```
+>
+> `b3c643a2` at tick 50 is the same settled hash this document's measured
+> baseline recorded independently, which is a small extra corroboration.
+> The 55 global barriers are 1 head + 54 CA iterations; the 53 inter-iteration
+> ones ARE the colour lattice (§7.1), not a cache-flush detail.
+>
+> **Validation is now live and it changes the evidence quality.** The LunarG SDK
+> was installed mid-phase, so `VK_LAYER_KHRONOS_validation` enumerates and
+> synchronization validation runs. The smoke passes with **zero** messages,
+> which is §6.2's *primary* detector reporting clean — materially stronger than
+> the hash match alone. Layer selection was hardened at the same time: the SDK
+> registered eight explicit layers, and instance creation requests
+> `khronos_validation` by exact name only, never whatever enumerates.
+>
+> **The sledgehammer A/B agrees and that is WEAK evidence, as designed.**
+> `--barriers=sledgehammer` (65 barrier calls, all global) produces byte-identical
+> hashes. Per §6.2 that is *exoneration* — it says the barrier graph is not the
+> cause of anything — and specifically NOT a verification that the precise
+> barriers are right, because this hardware serialises back-to-back identical
+> dispatches regardless. Reported as such rather than as a second PASS.
+>
+> **Still owed before phase 3 can claim completeness** (barrier_graph §8): the
+> readback ring and streaming on Vulkan (3c), and tables for the readback copies
+> (§2.4 phase 7a/7b) and eviction copies (§4.3). The quiet-world smoke exercises
+> every structural feature of the tick table except the particle and explosion
+> chains, which need ops to reach.
+
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
 barriers generated from the pass table, indirect dispatch (keep the staging
