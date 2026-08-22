@@ -86,7 +86,7 @@ the same commit, or the checker fails.
 | Copy → dispatch / dispatch → copy | same barrier call, with `TRANSFER` stage on one side |
 | Copy → indirect dispatch/draw | same barrier call, `TRANSFER_WRITE` → `INDIRECT_COMMAND_READ` at `DRAW_INDIRECT` stage |
 | Host write → device read | staging upload recorded at submit head (§3.1); no `HOST_WRITE` barrier needed in the common path |
-| Submit → submit on one queue | implicit: submission order on a single queue with no semaphores still guarantees *submission* order for the implicit ordering guarantee, but **not** memory visibility — see §3.0 |
+| Submit → submit on one queue | implicit: submission order on a single queue with no semaphores still guarantees *submission* order for the implicit ordering guarantee, but **not** memory visibility — see §3.4 |
 | Device work → host read | `VkFence` per readback ring slot, plus a `HOST_READ` barrier before end-of-command-buffer (§3.2) |
 | Full drain (`WaitIdle`) | `vkQueueWaitIdle` / `vkDeviceWaitIdle` (§3.9) |
 | Render pass attachments | `VkRenderingInfo` (dynamic rendering) with `loadOp = CLEAR`; image layout transitions are the swapchain's, unrelated to the buffer graph |
@@ -227,7 +227,7 @@ barrier between them exists.
 `atomicStore(&args[2], 1u)` before the `atomicAdd(&args[0], 1u)` append. The `y`
 and `z` extents of `dispatchArgs` therefore come **from the shader**, not from
 the T01 fill — the fill only zeroes the count. Consequence for the barrier: the
-T01→T15 (and T55→T56, `sim_compact.wgsl:39-42`, identical) TransferWrite→
+T01→T15 (and T55→T56, `sim_compact.wgsl:40-43`, identical) TransferWrite→
 StorageAtomicRMW WAW barrier is load-bearing for **dispatch validity**, not
 merely for count accuracy. If the fill lands after the shader's stores, the args
 read `{count, 0, 0}` — a dispatch of zero workgroups, i.e. a world that silently
@@ -409,7 +409,7 @@ while ((n = far.PrepareTick(ctx.queue)) > 0) {   // writes farUBO (when dirty)
 | S00 | `upload.tickUBO` | Copy/Update 64 B | staging | `tickUBO`:TransferWrite | every iteration |
 | S01 | `upload.farUBO` | Copy/Update 128 B | staging | `farUBO`:TransferWrite | `uboDirty_` (`farfield.cpp:103-113`) |
 | S02 | `upload.farList` | Copy/Update ≤16 KiB | staging | `farList`:TransferWrite | every iteration |
-| S03 | `farFill` (= T60) | Compute `(n,1,1)` wg`(64)` | `materials`:SR, `tickUBO`:U, `farList`:SR, `farUBO`:U, `dispatchArgs`: — | `farVox`:AtomicRMW, `farOcc`:AtomicRMW | every iteration |
+| S03 | `farFill` (= T60) | Compute `(n,1,1)` wg`(64)` | `materials`:SR, `tickUBO`:U, `farList`:SR, `farUBO`:U | `farVox`:AtomicRMW, `farOcc`:AtomicRMW | every iteration |
 
 **The upload→dispatch RAW on `tickUBO` is load-bearing per iteration, not
 once.** `farCount` is carried *in `tickUBO`* (`main.cpp:141`, read by
@@ -435,7 +435,7 @@ is what it reads that the tick wrote.
 
 | # | Name | Kind | Reads (buffers) |
 |---|---|---|---|
-| R0 | `hoisted uploads` | Copy | writes `mbInstBuf_`, `bodyInstances`, `bodyXforms`, `sprites`, `debugBoxes`, `renderUBO`, `mbModelBuf_`, `mbPoolBuf_` — **before** `vkCmdBeginRendering` (§3.6) |
+| R0 | `hoisted uploads` | Copy | writes `mbInstBuf_`, `bodyInstances`, `bodyXforms`, `sprites`, `debugBoxes`, `renderUBO`, `mbModelBuf_`, `mbPoolBuf_` — **before** `vkCmdBeginRendering` (§4.6) |
 | R1 | `raymarch` | Draw(3) | `voxels`, `occupancy`, `materials`, `renderUBO`, `farVox`, `farOcc`, `farUBO`, `microTable`, `microPool` |
 | R2 | `particles` | DrawIndirect `drawArgs@0` | `materials`, `renderUBO`, `Particles[page]`, `drawArgs`:IndirectRead |
 | R3 | `bodies` | Draw(36,n) | `materials`, `renderUBO`, `bodyInstances`, `bodyXforms` |
@@ -1058,7 +1058,7 @@ the whole story:
    "EvictSlots submits eagerly while FillSlots only enqueues", not "both are
    submits and submits are ordered". Same commit, per the CLAUDE.md rule about
    docs that contradict code.
-3. **`CompleteOldest` becomes a fence wait.** Each `PendingEvict` carries the
+5. **`CompleteOldest` becomes a fence wait.** Each `PendingEvict` carries the
    `VkFence` of its own submit. `CompleteOldest` does
    `vkWaitForFences(fence, UINT64_MAX)` — a genuine block, exactly as
    `instance.WaitAny(p.future, UINT64_MAX)` blocks today (`stream.cpp:201`) —
@@ -1066,7 +1066,7 @@ the whole story:
    the buffer to `stagingPool_`. The `kMaxPendingEvicts = 4` ring and the
    "ring full: recycle the oldest" path in `AcquireStaging`
    (`stream.cpp:184-195`) are unchanged in shape.
-4. **`FillSlots`'s `while (pendingChunks_.count(...)) CompleteOldest()` loop**
+6. **`FillSlots`'s `while (pendingChunks_.count(...)) CompleteOldest()` loop**
    (`stream.cpp:243-244`) is the same blocking wait and needs no change beyond
    (3). Its purpose — a chunk whose eviction is still in flight must be
    completed before the store is queried — is a CPU-side data dependency, not a
@@ -1880,7 +1880,7 @@ Collected for the reviewer.
     `markBoth` on the same two buffers — a cross-submit WAW against a shader
     atomic, structurally identical to edge 2. §2.5.2.
 11. **`sim_compact`'s both entry points `atomicStore` `args[1]` and `args[2]`**
-    (`sim_compact.wgsl:22-25, 39-42`), so `dispatchArgs.y/.z` come from the
+    (`sim_compact.wgsl:22-25, 40-43`), so `dispatchArgs.y/.z` come from the
     shader, not the fill. The fill→dispatch WAW is therefore load-bearing for
     dispatch *validity* — a lost barrier yields `{count, 0, 0}`, i.e. zero
     workgroups and a silently frozen world, not merely a wrong count. §7.3.
