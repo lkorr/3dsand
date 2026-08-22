@@ -334,7 +334,7 @@ SPEC = [
     ("render", "oilDarken", "TUNE_OIL_DARKEN", "f", 0.35),
     ("render", "oilIridescence", "TUNE_OIL_IRIDESCENCE", "f", 0.5),
     ("render", "oilFilmScale", "TUNE_OIL_FILM_SCALE", "f", 3.5),
-    ("render", "subMurkGlow", "TUNE_SUB_MURK_GLOW", "f", 0.85),
+    ("render", "subMurkGlow", "TUNE_SUB_MURK_GLOW", "f", 2.2),
 ]
 
 

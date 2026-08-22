@@ -946,7 +946,7 @@ struct Tuning {
     // and what that left was a featureless field of colour with no sense of up
     // and nothing in motion - honest, but it reads as a broken shader rather
     // than as being under the oil.
-    float subMurkGlow = 0.85f;
+    float subMurkGlow = 2.2f;
 
     // ---- oil / petroleum-like viscous liquids ----
     // Oil and blood share the viscous SURFACE path (isViscousLiquid) but look

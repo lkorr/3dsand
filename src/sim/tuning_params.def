@@ -493,6 +493,6 @@ TP_F(render, oilFilmScale, TUNE_OIL_FILM_SCALE, 3.5f)
 // dense to see through. Without it a dense liquid is a featureless field of
 // colour with no sense of up and nothing in motion - physically honest, but it
 // reads as a broken shader rather than as being under the oil.
-TP_F(render, subMurkGlow, TUNE_SUB_MURK_GLOW, 0.85f)
+TP_F(render, subMurkGlow, TUNE_SUB_MURK_GLOW, 2.2f)
 
 // clang-format on

@@ -314,7 +314,7 @@
     "waterFetchHigh": 0.85,
     "bloodTransmit": 0.35,
     "bloodMaxTransmit": 0.06,
-    "subMurkGlow": 0.85,
+    "subMurkGlow": 2.2,
     "oilSatLow": 0.5,
     "oilSatHigh": 0.78,
     "oilF0": 0.043,
