@@ -2061,7 +2061,21 @@ fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
 
   // Only CONVERGING curvature makes a bright band; diverging is the dark gap
   // between bands, and it is already dark by being unlit.
-  var c = max(-curv, 0.0);
+  //
+  // NORMALISE BEFORE THE EXPONENT. This is not cosmetic — getting it wrong
+  // silently deletes the whole effect. The raw Laplacian of this wave field
+  // peaks around 0.15, and raising a number that far below 1 to a power >1
+  // SHRINKS it (0.15^2.2 = 0.015): the "sharpen" step was cutting the signal
+  // by an order of magnitude, so the finished caustic came out at ~3% of the
+  // surface brightness and was invisible against the bed. Scaling into 0..1
+  // first means the exponent does what it is meant to do — redistribute
+  // contrast into thin filaments — while leaving the peak at full strength.
+  //
+  // CAUSTIC_NORM is the reciprocal of that measured peak. It is a property of
+  // the ripple band table (amplitudes x wavenumbers), so if those change, this
+  // wants re-measuring: sample -curv over the field and take the max.
+  const CAUSTIC_NORM : f32 = 6.7;
+  var c = clamp(max(-curv, 0.0) * CAUSTIC_NORM, 0.0, 1.0);
   // Sharpen into filaments. A raw curvature field is a smooth blob pattern;
   // real caustics are thin bright lines with wide dark gaps, and the exponent
   // is what turns one into the other.
@@ -2239,8 +2253,15 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
 
   // The scatter colour is lit by the key light, so a pond at night is dark
   // water rather than the same daytime turquoise at lower brightness.
+  //
+  // The 0.45 is not a fudge: in-scattered light has been scattered out of the
+  // beam before reaching the eye, so it is intrinsically dimmer than the
+  // direct sun that a surface reflects. Driving it at full keyLightColor()
+  // makes the water itself as bright as a sunlit surface, which flattens the
+  // entire view into one luminance and is what "washed out" looks like.
   let sunUp = clamp(keyLightDir().y * 1.5, 0.05, 1.0);
-  let ambientWater = scatterCol * keyLightColor() * sunUp * TUNE_SUB_SCATTER_GAIN;
+  let ambientWater =
+      scatterCol * keyLightColor() * sunUp * TUNE_SUB_SCATTER_GAIN * 0.45;
 
   // ---- the surface, seen from underneath (Snell's window) ----
   // A ray that reached the sky left through the underside of the surface, and
@@ -3594,7 +3615,35 @@ fn fs(in : VSOut) -> FSOut {
           // pattern. Nudging along the normal puts the probe unambiguously in
           // the water.
           let dAbove = waterAbove(hp + n * 0.5);
-          let cw = bedCaustic(hp, n, dAbove);
+
+          // ---- the sunlight reaching this surface came THROUGH the water ----
+          // and it is neither white nor at full strength when it arrives. This
+          // is the term whose absence made the pond bed render BRIGHTER than
+          // the water above it — a lit slab of pale stone, shaded as though it
+          // were sitting in open air, then only tinted on the way back to the
+          // eye. The bed has to be darkened and colour-shifted by the column
+          // standing on it BEFORE anything else, or no amount of tuning on the
+          // return path will stop it reading as white sand under blue fog.
+          //
+          // Beer-Lambert down the sun's slant path (longer than the vertical
+          // depth at any angle off noon), using the same coefficients the
+          // return trip uses, so a bed 2 m down loses most of its red exactly
+          // as the water does.
+          let kdc = keyLightDir();
+          let slant = dAbove / max(kdc.y, 0.15);
+          let downTrans = exp(-TUNE_SUB_ABSORB * slant);
+          color *= mix(vec3f(1.0), downTrans, clamp(dAbove * 4.0, 0.0, 1.0));
+
+          // Scaled by `lambert`, NOT gated on it. The enclosing `lambert > 0`
+          // is only an early-out for fully shadowed pixels; using it as an
+          // on/off switch for the caustic is what turned the soft shadow
+          // gradient on the pool's rim wall into hard vertical stripes. That
+          // wall is a stack of voxels whose shadow ray alternately clears and
+          // clips the terrace lip above it, so `lambert` there is a fine
+          // gradient — and multiplying a smooth gradient by a binary mask
+          // quantises it into a barcode. Riding the same gradient keeps the
+          // caustic continuous across it.
+          let cw = bedCaustic(hp, n, dAbove) * lambert;
           color *= 1.0 + min(cw * TUNE_BED_CAUSTIC_GAIN, TUNE_BED_CAUSTIC_CAP);
         }
       }

@@ -1031,6 +1031,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "pondChance", w.pondChance, out, at);
     ReadI(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
     ReadI(*g, "pondRadiusSpan", w.pondRadiusSpan, out, at);
+    ReadI(*g, "pondDepth", w.pondDepth, out, at);
+    ReadI(*g, "pondDepthRim", w.pondDepthRim, out, at);
+    ReadI(*g, "lilyChance", w.lilyChance, out, at);
+    ReadI(*g, "lilyFlowerChance", w.lilyFlowerChance, out, at);
+    ReadI(*g, "reedChance", w.reedChance, out, at);
+    ReadI(*g, "reedHeight", w.reedHeight, out, at);
+    ReadI(*g, "kelpChance", w.kelpChance, out, at);
+    ReadI(*g, "kelpHeight", w.kelpHeight, out, at);
     ReadI(*g, "ruinChance", w.ruinChance, out, at);
     ReadI(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadI(*g, "caveThreshold2", w.caveThreshold2, out, at);
@@ -1049,6 +1057,23 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     atLeast("pondTile", w.pondTile, 8);
     atLeast("pondChance", w.pondChance, 1);
     atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
+    atLeast("lilyChance", w.lilyChance, 1);
+    atLeast("lilyFlowerChance", w.lilyFlowerChance, 1);
+    atLeast("reedChance", w.reedChance, 1);
+    atLeast("kelpChance", w.kelpChance, 1);
+    atLeast("pondDepthRim", w.pondDepthRim, 1);
+    atLeast("pondDepth", w.pondDepth, w.pondDepthRim);
+    // The bowl is carved DOWN from the water surface, and the cave system
+    // starts 40 voxels under the terrain surface. A bowl deeper than that
+    // breaches a tunnel, the pond drains into the cave network, and the world
+    // never settles — which shows up as a sleep-gate failure a long way from
+    // this file. 34 keeps a margin under the 40.
+    if (w.pondDepth > 34) {
+      out.warnings.push_back(
+          "worldgen.pondDepth > 34 would breach the cave layer and drain the "
+          "pond; clamped to 34");
+      w.pondDepth = 34;
+    }
     atLeast("ruinChance", w.ruinChance, 1);
     atLeast("autumnFraction", w.autumnFraction, 1);
   }

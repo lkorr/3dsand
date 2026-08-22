@@ -275,6 +275,12 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     float sunYaw = std::atan2(ss.sunDir[2], ss.sunDir[0]);
     render({414, 54, 414}, sunYaw, 0.35f, "screenshot_sub_shaft.bmp");
   }
+  // ---- a GENERATED pond, with its vegetation ----
+  // The authored lake above is a bare stone tub; it exercises the water and
+  // submerged shading but has no plant life, because pond flora is placed by
+  // pondAt() and the authored pools are explicitly excluded from it. This is
+  // the one shot that shows lilypads, reeds and kelp, and the one that would
+  // catch worldgen placing them somewhere absurd (floating, or on dry land).
   // Oil pond (260,300) and lava pool (220,520): the non-water liquid paths.
   // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
   // still render as a surface hit, untouched by any of the water work.
@@ -444,6 +450,54 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // near/far handoff is visible as a single image rather than two shots.
     render({(float)(gx - 60), (float)(mh + 30), (float)(gz - 60)}, 0.785f, -0.30f,
            "screenshot_micro_far.bmp");
+  }
+
+  // ---- a GENERATED pond, with its vegetation ----
+  // LAST on purpose: this block MOVES THE RESIDENCY WINDOW and regenerates the
+  // world, so anything shot after it would be looking at a different region.
+  //
+  // The authored lake shot earlier is a bare stone tub — it exercises the water
+  // and submerged shading but has no plant life, because pond flora is placed
+  // by pondAt() and the authored pools are explicitly excluded from it. This is
+  // the only shot that shows lilypads, reeds and kelp, and the one that would
+  // catch worldgen putting them somewhere absurd (floating, or on dry land).
+  //
+  // WHY THE WINDOW HAS TO MOVE: every pond site is deliberately outside the
+  // spawn keep-out box (-44..264), so no generated pond can fall inside the
+  // residency window while that window sits at the origin. Outside the window
+  // a lake shades through the FAR-FIELD cascade, which paints liquids as flat
+  // colour with no Fresnel, no refraction and no visible bed — from the origin
+  // window a pond is a flat blue disc that tells you nothing. So re-centre on
+  // it and regenerate. Chunk units, min corner, 16 chunks to a 256-voxel window.
+  {
+    // Pond at (361,537) radius 52 for kDefaultSeed, from pondAt's tile hash.
+    const int kPx = 361, kPz = 537;
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 60; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+
+    // Anchor to terrain OUTSIDE the bowl (the rim), not the centre —
+    // TerrainHeight in the middle of a pond reports the carved floor, 2.6 m
+    // down, and a camera placed relative to that sits underground.
+    int rim = World::TerrainHeight(kPx + 85, kPz + 85, kDefaultSeed);
+    // From off the +x/+z side looking back at the centre: atan2(-1,-1) =
+    // -135 degrees. The pad-strewn surface, the reed fringe and the shore.
+    render({(float)(kPx + 85), (float)(rim + 18), (float)(kPz + 85)}, -2.356f,
+           -0.26f, "screenshot_pond.bmp");
+    // Straight down over the centre: the framing-independent check that the
+    // bowl, the lilypad scatter and the plant density are what worldgen
+    // intended, without depending on getting an eye-level camera right.
+    render({(float)kPx, (float)(rim + 60), (float)kPz}, 0.785f, -1.50f,
+           "screenshot_pond_top.bmp");
+    // INSIDE the pond, under the waterline: kelp silhouettes, the caustic web
+    // on the bed and the light shafts all have to read at once. The surface
+    // sits 2 under the lowest rim sample, the centre TUNE_POND_DEPTH below it.
+    render({(float)(kPx - 16), (float)(rim - 10), (float)(kPz - 16)}, 0.785f,
+           0.04f, "screenshot_pond_sub.bmp");
   }
   return 0;
 }

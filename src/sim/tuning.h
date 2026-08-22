@@ -948,7 +948,19 @@ struct Tuning {
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
-    int pondTile = 224, pondChance = 4, pondRadiusMin = 20, pondRadiusSpan = 17;
+    int pondTile = 224, pondChance = 4, pondRadiusMin = 34, pondRadiusSpan = 30;
+    // Bowl depth in VOXELS: pondDepth at the centre, pondDepthRim at the edge.
+    // At kVoxelMeters 0.10 the player is 17 voxels tall, so a pond has to reach
+    // roughly 20 before you can actually submerge in one — the previous
+    // 8-voxel bowl was 0.8 m and could only be waded through.
+    int pondDepth = 26, pondDepthRim = 3;
+    // Pond vegetation. Each is a 1-in-N placement roll per candidate column,
+    // plus a height in voxels where the plant is more than one cell tall.
+    // These are ordinary inert solids placed once at generation: nothing here
+    // grows or reacts, so a settled pond still sleeps (rule 2).
+    int lilyChance = 22, lilyFlowerChance = 5;
+    int reedChance = 130, reedHeight = 16;
+    int kelpChance = 120, kelpHeight = 10;
     int ruinChance = 5;
     int caveThreshold1 = 150, caveThreshold2 = 148;
   } worldgen;

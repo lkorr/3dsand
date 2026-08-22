@@ -307,8 +307,28 @@ TP_U(worldgen, treeChanceDesert, TUNE_TREE_CHANCE_DESERT, 6)
 TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
 TP_I(worldgen, pondTile, TUNE_POND_TILE, 224)
 TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
-TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 20)
-TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 17)
+TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 34)
+TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 30)
+// Bowl depth in VOXELS at the pond centre, tapering to pondDepthRim at the
+// edge. At kVoxelMeters 0.10 the player capsule is 17 voxels tall, so the old
+// 8-voxel centre depth was 0.8 m — ankle deep, and it made "swim in a pond"
+// impossible anywhere except the one authored lake. 26 puts the centre at
+// 2.6 m, comfortably over the player's head, while the rim stays shallow
+// enough to wade in from.
+TP_I(worldgen, pondDepth, TUNE_POND_DEPTH, 26)
+TP_I(worldgen, pondDepthRim, TUNE_POND_DEPTH_RIM, 3)
+// 1-in-N chance a surface cell over deep enough water carries a lilypad, and
+// 1-in-N that a pad carries a blossom.
+TP_U(worldgen, lilyChance, TUNE_LILY_CHANCE, 22)
+TP_U(worldgen, lilyFlowerChance, TUNE_LILY_FLOWER_CHANCE, 5)
+// 1-in-N chance a shallow-margin column grows a reed clump, and how tall the
+// clump runs (voxels above the bed, so a reed in deeper water is still cut off
+// at the surface by the emergent check in genCell).
+TP_U(worldgen, reedChance, TUNE_REED_CHANCE, 130)
+TP_I(worldgen, reedHeight, TUNE_REED_HEIGHT, 16)
+// 1-in-N chance a deeper bed column grows kelp, and its height in voxels.
+TP_U(worldgen, kelpChance, TUNE_KELP_CHANCE, 120)
+TP_I(worldgen, kelpHeight, TUNE_KELP_HEIGHT, 10)
 TP_U(worldgen, ruinChance, TUNE_RUIN_CHANCE, 5)
 TP_U(worldgen, caveThreshold1, TUNE_CAVE_THRESHOLD1, 150)
 TP_U(worldgen, caveThreshold2, TUNE_CAVE_THRESHOLD2, 148)
