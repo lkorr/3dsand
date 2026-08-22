@@ -208,13 +208,17 @@ add_executable(sandvox
   src/gpu/resources.cpp
   src/gpu/passtimer.cpp
   # Vulkan backend (phase 3). Compiled into the default build but NOT reachable
-  # from the frame path: only --vk-info constructs a VkDevice today. Dawn stays
-  # the backend for everything else until phase 3b adds --backend.
+  # from the frame path: only --vk-info, --vk-smoke and `--backend vulkan`
+  # construct a VkDevice, and all three are headless. Dawn stays the backend for
+  # everything else until phase 4 ports the render path.
   src/gpu/vk_loader.cpp
   src/gpu/vk_vma.cpp
   src/gpu/vk_spirv.cpp
   src/gpu/rhi_vulkan.cpp
+  src/gpu/vk_record.cpp
+  src/gpu/vk_sim.cpp
   src/gpu/vk_info.cpp
+  src/gpu/vk_smoke.cpp
   src/measure/measure.cpp
   src/sim/world.cpp
   src/sim/worldio.cpp

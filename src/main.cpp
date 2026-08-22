@@ -32,6 +32,7 @@
 #include "gpu/context.h"
 #include "gpu/resources.h"
 #include "gpu/vk_info.h"
+#include "gpu/vk_smoke.h"
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -957,6 +958,13 @@ int main(int argc, char** argv) {
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
   bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
+  bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
+  // --backend vulkan. Headless ONLY: the Vulkan render path is phase 4, so
+  // there is no swapchain to present to and asking for one is refused loudly
+  // rather than silently falling back to Dawn.
+  bool backendVulkan = false;
+  bool sledgehammer = false;  // --barriers=sledgehammer (barrier_graph §6.2 oracle)
+  bool vkValidation = false;  // --vk-validation: VK_LAYER_KHRONOS_validation + sync
   bool lowPowerAdapter = false;
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   bool telemetryEnabled = false;
@@ -1007,6 +1015,32 @@ int main(int argc, char** argv) {
     // touch Dawn or run any sim work — Vulkan executes nothing but the
     // zero-init fills until phase 3b.
     if (a == "--vk-info") vkInfo = true;
+    // `--vk-smoke` is the phase-3b exit proof (src/gpu/vk_smoke.cpp): the same
+    // seed worldgen'd and ticked on BOTH backends, with the world hashes
+    // compared. Dawn's auto-generated barriers are the reference implementation
+    // of docs/vulkan_barrier_graph.md, so this is the strongest single test the
+    // generated-barrier recorder has (§6.3).
+    if (a == "--vk-smoke") vkSmoke = true;
+    // `--backend vulkan` selects the Vulkan compute backend. Headless only in
+    // phase 3b — see the refusal below.
+    if (a == "--backend" && i + 1 < argc) {
+      std::string b = argv[++i];
+      if (b == "vulkan") backendVulkan = true;
+      else if (b != "dawn") {
+        std::fprintf(stderr, "unknown --backend '%s' (expected dawn|vulkan)\n", b.c_str());
+        return 2;
+      }
+    }
+    // `--barriers=sledgehammer` is the A/B oracle of barrier_graph §6.2: every
+    // command preceded by a full ALL_COMMANDS/MEMORY_READ|WRITE barrier, i.e.
+    // maximally-ordered execution of the same total order. Read §6.2 before
+    // trusting a green run — it is WEAK at detecting a missing barrier and
+    // STRONG at exonerating the barrier graph.
+    if (a == "--barriers=sledgehammer") sledgehammer = true;
+    if (a == "--barriers=precise") sledgehammer = false;
+    // Turns on VK_LAYER_KHRONOS_validation with SYNCHRONIZATION validation —
+    // the primary detector for a missing barrier (§6.2's detection ladder).
+    if (a == "--vk-validation") vkValidation = true;
   }
 
   // --list is pure metadata: answering it before any device or asset init
@@ -1017,6 +1051,30 @@ int main(int argc, char** argv) {
   // path, and running it ahead of GpuContext keeps the two backends from
   // competing for the adapter while phase 3a is still headless.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
+
+  // --backend vulkan, phase 3b. THE VULKAN RENDER PATH DOES NOT EXIST: phase 4
+  // adds the swapchain, the six raster pipelines and imgui_impl_vulkan. So a
+  // request for the Vulkan backend in a mode that needs to present is refused
+  // with a message rather than silently served by Dawn — a quiet fallback would
+  // mean a run reported as "Vulkan" that was Dawn all along, which is exactly
+  // the kind of result that makes cross-backend evidence worthless.
+  //
+  // The one headless mode Vulkan can actually serve today is --vk-smoke, which
+  // drives the compute tables end to end and compares hashes against Dawn.
+  if (backendVulkan && !vkSmoke) {
+    std::fprintf(stderr,
+                 "--backend vulkan is HEADLESS-ONLY in phase 3b: the Vulkan render\n"
+                 "path (swapchain, raster pipelines, ImGui) is phase 4.\n"
+                 "Use it with a headless mode:\n"
+                 "    sandvox --backend vulkan --vk-smoke\n"
+                 "Add --vk-validation for synchronization validation, and\n"
+                 "--barriers=sledgehammer for the barrier A/B oracle.\n");
+    return 2;
+  }
+  // --vk-smoke runs BOTH backends by construction, so it does not need
+  // --backend to select one; accepting the flag anyway keeps the invocation in
+  // the refusal message above honest.
+  if (vkSmoke) return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation);
 
   std::string assetDir = AssetDir();
   // Tuning first: LoadShader() bakes these into every shader's constant
