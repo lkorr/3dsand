@@ -389,12 +389,15 @@ That same hook (`scripts/post_edit_check.sh`) also runs:
 ```bash
 python scripts/check_invariants.py          # all pairs
 python scripts/check_invariants.py <file>   # just the ones that file can break
+python scripts/check_pass_table.py          # pass table vs the WGSL bindings
+python scripts/check_pass_table.py --selfcheck   # prove the WGSL walk still works
 ```
 
-which mechanically enforces the "two places that must agree" pairs listed below
-— sound slots, `TUNE_*` constants, `RENDER_PATHS`, world constants. Every one of
-those is a *silent* failure otherwise: green build, working tuner, wrong
-behaviour at runtime. It is quiet unless something actually disagrees.
+which mechanically enforce the "two places that must agree" pairs listed below
+— sound slots, `TUNE_*` constants, `RENDER_PATHS`, world constants, and the pass
+table's R/W sets. Every one of those is a *silent* failure otherwise: green
+build, working tuner, wrong behaviour at runtime. Both are quiet unless
+something actually disagrees.
 
 Tuning by eye/ear goes through the tuner, which finds `assets/` itself and
 whose **Build** / **Play** buttons run the two commands above:
@@ -452,11 +455,12 @@ The exe must sit in the project root: it edits this checkout in place, so
 | `scripts/build_tuner_exe.py` | packages the above into `sandvox_tuner.exe` |
 
 **Invariants that have already cost debugging time — don't rediscover them.**
-The four "two places that must agree" entries below (sound slots, `TUNE_*`,
-`RENDER_PATHS`, world constants) are now checked mechanically by
-`scripts/check_invariants.py`, which the PostToolUse hook runs on every edit.
-The prose stays because it explains *why* each pair exists and what breaks —
-the checker only tells you that something disagrees.
+The five "two places that must agree" entries below (sound slots, `TUNE_*`,
+`RENDER_PATHS`, world constants, the pass table) are now checked mechanically by
+`scripts/check_invariants.py` and `scripts/check_pass_table.py`, which the
+PostToolUse hook runs on every edit. The prose stays because it explains *why*
+each pair exists and what breaks — the checkers only tell you that something
+disagrees.
 
 - **The 3×3×3 color lattice is GLOBAL in WORLD coordinates, not chunk- or
   slot-local.** Chunk-local dispatch must offset by the WORLD chunk coordinate
@@ -532,6 +536,21 @@ the checker only tells you that something disagrees.
   `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of
   `common.wgsl`. `world.h` is the single source of truth — adding a constant
   means adding it there and to the prelude, not to `common.wgsl`.
+- **The pass table's R/W sets and the WGSL bindings its kernels touch must
+  agree.** `src/sim/pass_table.def` declares, per recorded command, every buffer
+  the kernel reads and writes; `Simulation::Encode*` records by walking it, and
+  the Vulkan backend (port phase 3) *generates* its barriers from the same rows
+  — no barrier is ever hand-written at a call site. So a row that omits a read
+  its kernel performs means phase 3 emits **no** barrier for that hazard, not a
+  weak one. Under Dawn, which generates barriers itself, that costs nothing and
+  the selftest stays green: the bug is invisible until it surfaces as a
+  cross-vendor world-hash divergence, which is rule 1's whole nightmare.
+  `scripts/check_pass_table.py` diffs the two by walking each entry point's call
+  graph — **rooted at the entry point**, since a WGSL file's module-scope
+  bindings are shared by every entry point in it and comparing against those
+  flags most correct rows — and classifies read vs write by actual access, not
+  by the `read_write` qualifier. Adding a binding to a sim kernel means a `uses`
+  entry in the same commit.
 
 ## Conventions
 

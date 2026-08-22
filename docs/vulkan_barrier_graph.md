@@ -211,7 +211,7 @@ read by the same pass (`StorageRW`).
 | # | Name | Pipeline | Kind | Reads | Writes | Cond |
 |---|---|---|---|---|---|---|
 | T10 | `mutate` | `mutate_` (`sim_mutate:main`) | Compute `(4*ops,4,4)` wg`(4,4,4)` | `materials`:SR, `tickUBO`:U, `opsBuf`:SR | `voxels`:RW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW | cOps |
-| T11 | `mutateCells` | `mutateCells_` (`sim_mutate:cells`) | Compute `((cells+63)/64,1,1)` wg`(64)` | `materials`:SR, `tickUBO`:U, `cellOps`:SR | `voxels`:RW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW | cCells |
+| T11 | `mutateCells` | `mutateCells_` (`sim_mutate:cells`) | Compute `((cells+63)/64,1,1)` wg`(64)` | `tickUBO`:U, `cellOps`:SR | `voxels`:RW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW | cCells |
 | T12 | `explodeMark` | `explodeMark_` (`sim_explode:mark`) | Compute `(11*exp,11,11)` wg`(4,4,4)` | `voxels`:SR, `materials`:SR, `tickUBO`:U, `expOps`:SR | `expMask`:SW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW | cExp |
 | T13 | `explodeApply` | `explodeApply_` (`sim_explode:apply`) | Compute `(11*exp,11,11)` wg`(4,4,4)` | `materials`:SR, `tickUBO`:U, `expOps`:SR, `expMask`:SR | `voxels`:RW, `DirtyIn`:AtomicRMW, `DirtyOut`:AtomicRMW, `particleCounts`:AtomicRMW, `Particles[page]`:SW | cExp |
 | T14 | `particleSpawn` | `pSpawn_` (`sim_particle:spawn`) | Compute `((spawn+63)/64,1,1)` wg`(64)` | `spawnOps`:SR, `tickUBO`:U | `particleCounts`:AtomicRMW, `Particles[page]`:SW | cSpawn |
@@ -254,6 +254,19 @@ stops simulating rather than one that simulates slightly wrong. §7.3.
 | T40 | `pArgs1` | `pArgs1_` (`sim_particle:args1`) | Compute `(1,1,1)` wg`(1)` | `particleCounts`:AtomicRMW(read), `tickUBO`:U | `pArgsStage`:SW |
 | T41 | `copy.pArgs→pDispatch` | Copy `pArgsStage@16 → pDispatchArgs@0`, 12 B | `pArgsStage`:TransferRead | `pDispatchArgs`:TransferWrite |
 | T42 | `pIntegrate` | `pIntegrate_` (`sim_particle:integrate`) | ComputeIndirect `pDispatchArgs@0` wg`(64)` | `voxels`:SR, `materials`:SR, `tickUBO`:U, `Particles[page]`:RW, `pDispatchArgs`:IndirectRead | `Particles[1-page]`:SW, `particleCounts`:AtomicRMW, `claim`:AtomicRMW |
+
+**T11 and T42 were both corrected by the checker when phase 2b built it**, and
+the corrections are recorded here rather than only in `pass_table.def` because
+this table is what a reviewer reads. `sim_mutate:cells` does **not** read
+`materials` — it writes the authored word straight into the grid, unlike
+`sim_mutate:main` which does consult the table; the `materials`:SR above was
+wrong. `sim_particle:integrate` does **not** touch `dirtyOut` — `markDirtyNext`
+is the module's only writer of it and is called only from `resolve`
+(`sim_particle.wgsl:242, :265`); the earlier draft listed `dirtyOut`:AtomicRMW
+on T42 and it has been dropped. Both were over-declarations, i.e. spurious
+barriers rather than missing ones, so neither was a correctness bug — but both
+are exactly the drift §6.1's rooted walk exists to find, and finding them on the
+day the checker was written is the argument for having it.
 | T43 | `pArgs2` | `pArgs2_` (`sim_particle:args2`) | Compute `(1,1,1)` wg`(1)` | `particleCounts`:AtomicRMW(read), `tickUBO`:U | `pArgsStage`:SW |
 | T44 | `copy.pArgs→pDispatch` | Copy `pArgsStage@16 → pDispatchArgs@0`, 12 B | `pArgsStage`:TransferRead | `pDispatchArgs`:TransferWrite |
 | T45 | `copy.pArgs→drawArgs` | Copy `pArgsStage@0 → drawArgs@0`, 16 B | `pArgsStage`:TransferRead | `drawArgs`:TransferWrite |
@@ -1357,6 +1370,13 @@ the shaders; the second keeps the barriers honest against physics.
 
 ### 6.1 `scripts/check_pass_table.py` — the table vs. the WGSL
 
+**Status: IMPLEMENTED (phase 2b), and it passes clean on the tree.** What
+follows is the design; where the implementation diverged, it is marked
+**[AS BUILT]** inline. Run it with `--selfcheck` to prove the walk itself still
+behaves — that mode asserts the seven regression cases below are silent
+independently of whatever the table currently says, so a walk that regresses to
+module-scope is caught even if the table happens to agree with it.
+
 Shaped after `scripts/check_invariants.py` (same output conventions, same
 exit-code contract: 0 = agree, 1 = real mismatch; accepts an optional edited-file
 argument so the PostToolUse hook can run only the relevant half).
@@ -1377,6 +1397,27 @@ argument so the PostToolUse hook can run only the relevant half).
    it. Same play as `tuning_params.def` → `TuningWgslBlock()` →
    `tuning_prelude.py`, and for the same reason: two lists that must agree are a
    silent bug, one list plus a generator is not.
+
+   **[AS BUILT]** The row form gained three things this sketch does not have,
+   each because the recorder needs it to reproduce today's command buffer:
+
+   - a **`passGroup`** string (2nd argument) naming the `ComputePassEncoder` the
+     row is recorded into. Consecutive compute rows sharing it go into one pass;
+     `nullptr` on Fill/Copy rows, which are encoder-level and close any open
+     pass. The splits are stated rather than inferred from adjacency because
+     "which rows share a pass" is precisely the thing phase 2b must not change.
+   - a **`table`** selector (`PT_TICK`, `PT_WORLDGEN`, …) rather than six
+     separate arrays, so §2.5's six non-tick tables and the tick table are one
+     list that the checker walks once.
+   - **dispatch-extent selectors** (`D_OPS`, `D_EXP`, `D_CHUNKS`, …) resolved
+     from the tick's counts at record time, since a row's extents are a function
+     of `opsCount`/`expCount`/etc. and cannot be literals.
+
+   Reads and writes are one `USES(...)` list rather than two columns, tagged per
+   entry (`R W RW A U I TR TW`); splitting them was redundant with the tag.
+   `pass_table.cpp` expands the `.def` **twice** — once for the rows, once to
+   count each row's uses — because a braced initializer cannot report its own
+   length and a padding entry is indistinguishable from a real `R(voxels)`.
 
 2. **The WGSL — a call-graph walk ROOTED AT THE ENTRY POINT.**
 
@@ -1431,6 +1472,17 @@ argument so the PostToolUse hook can run only the relevant half).
    checker is worse than not having one, because it launders a false sense of
    coverage.
 
+   **[AS BUILT]** These are encoded as `REGRESSIONS` in the script and asserted
+   by `--selfcheck`, which checks them against the *walk* rather than against
+   the table — so a walk that regresses to module-scope fails even if the table
+   has been edited to agree with the broken walk. The list is **seven** rows,
+   not six: the table above counts `sim_particle`'s `args1`/`args2` as one row
+   because they have identical binding sets, but they are separate entry points
+   and are asserted separately. Each case states both what the walk must
+   EXCLUDE (module-scope bindings belonging to another entry point) and what it
+   must INCLUDE (bindings reached only transitively), so neither half can
+   regress silently.
+
    f. Read vs. write per name: `NAME[...] =`, `atomicStore/Add/Max/Min/And/Or/
       Xor/Exchange/CompareExchangeWeak(&NAME[...])` ⇒ write; any other
       appearance ⇒ read. `atomicLoad` ⇒ read only.
@@ -1445,14 +1497,15 @@ step (d), never the module-scope candidate set.
 | Every buffer the rooted walk says the entry point **reads** is in the row's read set (or write set, for RW) | **FAIL** — a missing read means a missing RAW barrier |
 | Every buffer the rooted walk says the entry point **writes** is in the row's write set | **FAIL** — a missing write means every later reader is unsynchronized |
 | Every buffer in the row's sets is reached by the rooted walk | WARN — spurious barriers only. **Must be silent on the six regression cases above**; if it is not, the walk is module-scope and the checker is broken |
-| A row declaring `StorageRead` on a binding the WGSL declares `read_write`, where the rooted walk finds no write | WARN, with the row required to carry a `// read-only in practice: <reason>` comment; missing comment ⇒ FAIL. Live cases: `dirtyList` in `sim_step.wgsl:23` (comment already in the shader) and in `sim_occupancy.wgsl:16` |
+| A row declaring `StorageRead` on a binding the WGSL declares `read_write`, where the rooted walk finds no write **and another entry point in the same module does write it** | FAIL without a `// read-only in practice: <reason>` comment on the row. **[AS BUILT]** the emphasised clause is a narrowing the spec did not have, and it is load-bearing: WGSL has no per-entry-point access modes, so `voxels` is declared `read_write` in *every* sim shader including the ones that only read it. Without the clause the rule fires on 11 rows, 9 of them unremarkable — the WARN spam this section elsewhere says makes a checker worse than none. With it, it fires on exactly the shape worth explaining: a row whose `R()` looks like an oversight against its own file. Five live cases, not two: `dirtyList` in `sim_step` and `sim_occupancy:mainDirty` as the spec predicted, plus `voxels` in `sim_explode:mark` (the pure-read half of the mark/apply split), `expMask` in `sim_explode:apply`, `voxels` in `sim_particle:integrate`, and `voxels` in `worldgen:fardown` |
 | Every entry point in every `sim_*.wgsl` / `worldgen.wgsl` appears in at least one table row | **FAIL** — an unreferenced kernel is either dead or an untabled pass |
 | Every buffer id in the table exists as a `World`/`Simulation` member | **FAIL** |
 | The bind-group layout the row names contains every binding the entry point uses | **FAIL** — catches a kernel added to a pass whose layout cannot bind it. **Note the direction: layout ⊇ used, never layout = used.** `genList` binds `simBGL_`'s 17 bindings and uses 7 (§2.5.2); requiring equality would fail every correct row |
-| No `useGlobalBarrier` row declares an `IndirectRead` of a buffer written anywhere inside its own repeat span | **FAIL** — this is the §3.6 point-1 assumption made checkable: form (B)'s access mask does not cover `INDIRECT_COMMAND_READ`, and T30's soundness depends on nothing writing `dispatchArgs` between iterations |
-| Exactly the rows marked `useGlobalBarrier` are the ones §3.6 sanctions | **FAIL** |
-| `DirtyIn` and `DirtyOut` resolve to different buffer ids for every page value | **FAIL** — §4.1's wake-vs-T00 edge |
-| Every Class A buffer's declared capacity is ≤ 65536 | **FAIL** (also a C++ `static_assert`, §4.1) |
+| No `useGlobalBarrier` row declares an `IndirectRead` of a buffer written anywhere inside its own repeat span | **FAIL** — this is the §3.6 point-1 assumption made checkable: form (B)'s access mask does not cover `INDIRECT_COMMAND_READ`, and T30's soundness depends on nothing writing `dispatchArgs` between iterations. **[AS BUILT]** implemented against `repeat > 1` rather than against a `useGlobalBarrier` flag, because that flag is a phase-3 construct and does not exist yet. The two coincide: `repeat > 1` is true of T30 alone, and §3.6 sanctions the global barrier for exactly the repeat span. When phase 3 adds the flag, tighten this to the flag |
+| Exactly the rows marked `useGlobalBarrier` are the ones §3.6 sanctions | **FAIL**. **[AS BUILT]** deferred to phase 3 with the flag itself — there is nothing to check while the only marked row is implied by `repeat > 1` |
+| `DirtyIn` and `DirtyOut` resolve to different buffer ids for every page value | **FAIL** — §4.1's wake-vs-T00 edge. **[AS BUILT]** checked structurally against `Simulation::PassBuffer`: the two cases must resolve to different expressions and both must mention `page_`. That is stronger than testing two page values, since it rejects a resolution that stops being symbolic at all |
+| Every Class A buffer's declared capacity is ≤ 65536 | **FAIL** (also a C++ `static_assert`, §4.1). **[AS BUILT]** not implemented — Class A/B is the phase-3 upload path (§4.1) and no code declares a class yet. Lands with that path, where the `static_assert` is the primary guard anyway |
+| The pipeline **layout** the row's kernel is built against can bind every binding the rooted walk finds | **FAIL** — **[AS BUILT]** the layout is scraped from the `MakeComputePipeline` call in `BuildPipelines` rather than declared on the row, so the row cannot lie about it. Direction is layout ⊇ used, as specified |
 
 **What it cannot check, stated so nobody assumes it does:** it validates the R/W
 *sets*, not the *order*. A table whose rows are in the wrong order passes this
@@ -1463,6 +1516,17 @@ check and produces a wrong world. That is what §6.2 is for.
 `src/sim/pass_table.def`. Under phase 2 (RHI seam under Dawn) this checker is
 already meaningful — the table exists and drives `EncodeTick` before Vulkan does
 — which is the point of doing the restructure under Dawn first.
+**[AS BUILT]** it also triggers on `src/sim/simulation.cpp`, because the
+pipeline → `(shader, entry)` mapping and the `DirtyIn`/`DirtyOut` symbolic
+resolution are both scraped from there; an edit to either can break the pair
+without touching the `.def`. CLAUDE.md's invariant list carries the standing
+obligation.
+
+**It earned its keep on day one.** Building it against the live tree turned up
+two over-declared rows in this document's own §2.4 (T11's `materials`, T42's
+`dirtyOut` — both now corrected there), which is a useful calibration of how
+much a hand-authored table drifts: the tick table was written carefully, reviewed
+adversarially, and still had two wrong cells out of ~50 rows.
 
 ### 6.2 The sledgehammer oracle — barriers vs. physics
 
@@ -1926,10 +1990,18 @@ frame behind, or that the origin fields diverge.
 - **A tick-path edit that changes any kernel's bindings updates
   `src/sim/pass_table.def` in the same commit**, or `check_pass_table.py` fails.
   This is the same standing obligation `tuning_params.def` and
-  `sound_schema.js` carry.
+  `sound_schema.js` carry. *(Live since phase 2b: the table exists, drives
+  recording, and the checker runs from the PostToolUse hook. The obligation also
+  covers `simulation.cpp`, which the checker scrapes for the pipeline → entry
+  point mapping and the symbolic page resolution.)*
 - **A code path that submits a command buffer gets a table**, listed in the
   header enumeration. Until every recorded command is in a table, "barriers are
   generated from the table" means "barriers are missing wherever the table is".
+  *(Phase 2b tabled the six `Simulation::Encode*` paths — §2.4 and §2.5.1–2.5.4,
+  2.5.6. Still untabled and therefore still owed a table before phase 3 can
+  claim completeness: the readback copies §2.4 phase 7a/7b — `World::EncodeReadbacks`
+  / `EncodeDirtyCopy` — the eviction copies §4.3, and the render chain §2.6,
+  which phase 4 covers. §2.5.5 `wakeAll` records no commands and needs none.)*
 - **No barrier is ever written at a call site.** If a hazard needs expressing,
   it is expressed as a table row's `uses`.
 - **No static/precomputed barrier list.** §7.5.

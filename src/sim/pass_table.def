@@ -120,13 +120,22 @@ PASS(fill_hash, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, 
 // tick's counts at record time (see PassDispatchExtent in pass_table.cpp).
 PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUTE, D_OPS,4,4,   GRP_SIM,       DYN_ZERO, C_OPS, 1,
      USES(R(Materials) U(TickUBO) R(OpsBuf) RW(Voxels) A(DirtyIn) A(DirtyOut)))
+// No R(Materials): `cells` writes the authored word straight into the grid and
+// never consults the material table (unlike `main`, which does). The barrier
+// doc's T11 row lists materials; the rooted walk says otherwise and the walk is
+// right — check_pass_table.py caught this.
 PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_COMPUTE, D_CELLS,1,1, GRP_SIM,       DYN_ZERO, C_CELLS, 1,
-     USES(R(Materials) U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)))
+     USES(U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)))
 // mark reads the neighborhood, apply writes it. The two-phase split is what
 // makes the explosion kernel race-free (CLAUDE.md build gotchas); it only works
 // if the barrier between them exists, which under Dawn was free.
+// read-only in practice: `voxels` is read_write for the module because `apply`
+// writes it; `mark` is the pure-read half of that split and must stay so — a
+// kernel that both reads and writes this neighborhood races itself.
 PASS(explodeMark, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_MARK, K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(ExpOps) W(ExpMask) A(DirtyIn) A(DirtyOut)))
+// read-only in practice: `expMask` is read_write for the module because `mark`
+// writes it. `apply` consumes the mask `mark` produced and never amends it.
 PASS(explodeApply, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_APPLY,K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
      USES(R(Materials) U(TickUBO) R(ExpOps) R(ExpMask) RW(Voxels) A(DirtyIn) A(DirtyOut)
           A(ParticleCounts) W(ParticlesRead)))
@@ -169,10 +178,17 @@ PASS(particleArgs1, "particleArgs1", PT_TICK, PIPE_P_ARGS1, K_COMPUTE, 1,1,1, GR
      USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
 PASS(copy_pArgs_pDispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_PARTICLES, 1,
      USES(TR(PArgsStage) TW(PDispatchArgs)))
+// No A(DirtyOut): `markDirtyNext` is the only writer of dirtyOut in this module
+// and it is called only from `resolve` (sim_particle.wgsl:242, :265), never from
+// `integrate`. The barrier doc's T42 row lists dirtyOut; the rooted walk says
+// otherwise and the walk is right — check_pass_table.py caught this.
+// read-only in practice: `voxels` is read_write for the module because
+// `resolve` writes it when a particle rejoins the grid. `integrate` only tests
+// cells for blockage along the flight path.
 PASS(particleIntegrate, "particleIntegrate+args2", PT_TICK, PIPE_P_INTEGRATE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) RW(ParticlesRead) I(PDispatchArgs)
-          W(ParticlesWrite) A(ParticleCounts) A(Claim) A(DirtyOut)))
+          W(ParticlesWrite) A(ParticleCounts) A(Claim)))
 PASS(particleArgs2, "particleIntegrate+args2", PT_TICK, PIPE_P_ARGS2, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
 // This second copy overwrites the args the integrate dispatch above FETCHED —
@@ -219,6 +235,10 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 // NOTE: hash ticks skip this — they take the whole-world occupancy branch and
 // never compact dirtyOut, so there is no work list. A chunk edited on a hash
 // tick is still dirty the next tick and downsamples then.
+// read-only in practice: `voxels` is read_write for the module because
+// `genChunk` (main/list) writes it. `fardown` only samples the live grid to
+// downsample into the cascades — far-field is derived, render-only data and
+// never writes back (DESIGN.md §9).
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)

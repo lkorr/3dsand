@@ -5,6 +5,7 @@
 #
 #   *.wgsl                  -> scripts/check_shaders.sh   (tint --validate)
 #   any "agree in two places" file -> scripts/check_invariants.py
+#   *.wgsl / pass_table.* / simulation.cpp -> scripts/check_pass_table.py
 #
 # Lives in a script rather than inline in settings.json because the inline
 # version was already an unreadable one-liner with three nested seds, and the
@@ -41,6 +42,15 @@ esac
 # one of the documented pairs, and exits 0 when it does not.
 if [ -f scripts/check_invariants.py ]; then
   python scripts/check_invariants.py "$f" || rc=1
+fi
+
+# The pass table vs the WGSL bindings its rows describe. Same contract: it takes
+# the edited file, decides whether that file can break the pair, and exits 0 when
+# it cannot. Kept separate from check_invariants.py because it parses WGSL call
+# graphs rather than regexing two lists, and because a Vulkan-port check that
+# fails should say so in those terms.
+if [ -f scripts/check_pass_table.py ]; then
+  python scripts/check_pass_table.py "$f" || rc=1
 fi
 
 exit $rc
