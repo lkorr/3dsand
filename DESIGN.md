@@ -2108,10 +2108,15 @@ than hand-placed, exactly as `docs/vulkan_barrier_graph.md` specifies. Parity
 is measured, not assumed: both backends report the same pinned 200-tick world
 hash (`7cfa2420`), the same pass/fail set, and character-identical per-gate
 detail strings — the only difference across a gate-by-gate `--json` diff is
-`perf`, which reports wall clock. Vulkan is also cheaper: a settled tick is
-229 µs vs Dawn's 306, almost entirely in per-dispatch driver overhead on the
-54 empty CA dispatches (the §11 idle-cost debt phase 0 flagged), while the
-genuinely GPU-bound full-world occupancy scan is unchanged.
+`perf`, which reports wall clock. Vulkan is also cheaper on the sim, by
+`--measure`'s GPU timestamps: a settled tick is 229–236 µs vs Dawn's 306,
+almost entirely in per-dispatch driver overhead on the 54 empty CA dispatches
+(the §11 idle-cost debt phase 0 flagged), while the genuinely GPU-bound
+full-world occupancy scan is unchanged at ~98 µs. **Render cost is a wash and
+should not be quoted from a single run** — the selftest's 1080p sweep varies
+8–19 ms/frame across runs depending on machine load and the world state
+earlier gates leave behind, and the two backends trade places inside that
+spread.
 
 **Dawn is retained deliberately, and its remaining job is to disagree.** Its
 auto-generated barriers are the reference implementation of the barrier graph,

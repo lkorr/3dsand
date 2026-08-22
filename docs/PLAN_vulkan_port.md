@@ -807,6 +807,19 @@ port testable and it costs nothing to keep.
 > has nothing to flip. If a gate ever behaves differently under a backend change,
 > the baseline is the wrong place to absorb it.
 >
+> **A correction to how the render numbers in the 4a/4b notes should be read.**
+> The sim comparison is solid — `--measure` GPU timestamps put a settled tick at
+> 229–236 µs on Vulkan vs 306 on Dawn, reproduced here. The *render* sweep is
+> not: the selftest's 1080p figure moved between 8.0 and 18.8 ms/frame across
+> runs of the same binary in this phase, depending on machine load and on what
+> world state earlier gates left behind (the perf gate in isolation reports
+> ~8 ms; inside a full run, ~17–19), and across those runs the two backends
+> traded places. The 4b note's "17.4/12.4 Vulkan vs 18.8/12.8 Dawn" is one
+> sample from inside that spread, not a measured advantage. **Do not quote a
+> render delta from a single run**; if the render cost ever matters, it needs a
+> harness that pins the scene and repeats, which `--measure` does for compute
+> and nothing yet does for the frame.
+>
 > **D3 — the docs.** CLAUDE.md gained a *"Two backends: Vulkan runs, Dawn
 > judges"* section in build/verify: default is Vulkan, `--backend dawn` is the
 > ORACLE rather than a fallback, `--vk-validation`/`--frames` exist, the
