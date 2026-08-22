@@ -156,15 +156,15 @@ void PlayerAvatar::ResolveParts() {
   parts_.legUL = sk.FindPart("legU.L");
   parts_.legUR = sk.FindPart("legU.R");
   parts_.staff = sk.FindPart("staff");
-  // Re-resolve the held prop against the new def: a hot reload replaces the
-  // skeleton, so a cached part index from the old one would point at whatever
-  // limb happens to sit there now.
   // Same reasoning as the parts above, for the clips the per-tick locomotion
   // path selects between.
   locoClips_.idle = sk.FindClip("idle");
   locoClips_.walk = sk.FindClip("walk");
   locoClips_.run = sk.FindClip("run");
   locoClips_.fall = sk.FindClip("fall");
+  // Re-resolve the held prop against the new def: a hot reload replaces the
+  // skeleton, so a cached part index from the old one would point at whatever
+  // limb happens to sit there now.
   heldPartIndex_ = heldPart_.empty() ? -1 : sk.FindPart(heldPart_);
 }
 
@@ -1603,11 +1603,11 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
           inst.stopping = true;
       }
     }
-    // Deliberately NOT `PlayClipIndex(want)`: when airborne `want` is `fall`,
-    // but this line has always started `idle` there (`moving` is false while
-    // airborne), and the airborne branch above owns starting `fall`. Keeping
-    // idle's blend alive under a jump is what stops the arms snapping on
-    // landing, so the airborne case must stay idle, not want.
+    // Deliberately NOT `PlayClipIndex(want)`: when airborne
+    // `want` is `fall`, but this line has always started `idle` there (`moving`
+    // is false while airborne), and the airborne branch above owns starting
+    // `fall`. Keeping idle's blend alive under a jump is what stops the arms
+    // snapping on landing, so the airborne case must stay idle, not want.
     PlayClipIndex(moving ? (running ? locoClips_.run : locoClips_.walk)
                          : locoClips_.idle);
 
