@@ -3871,12 +3871,19 @@ fn fs(in : VSOut) -> FSOut {
       // ripples, a wet sheen that works on a lone droplet, and a
       // moving-vs-pooled blend. See shadeViscous for why this is not
       // shadeWater with different constants.
-      if (isViscousLiquid(materials[lm])) {
-        color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
-                             h.liqPath, max(h.mediaSurf, 0.125), color,
-                             underwater);
-        color = applyAerial(color, rd, h.liqT);
-      } else if (underwater) {
+      // SUBMERSION IS TESTED FIRST, ahead of the viscous split. The viscous
+      // model (shadeViscous) is a SURFACE model — a wet sheen on a droplet, a
+      // pooled-vs-moving blend — and it is the right answer for blood or oil
+      // seen from outside. It is the wrong answer for being INSIDE the stuff,
+      // where there is no surface in front of you at all.
+      //
+      // Ordering these the other way round is what sent submerged oil to the
+      // blood shader: oil satisfies isViscousLiquid (liquid, not opaque,
+      // moveEvery 2, opacity 235), so it never reached shadeSubmerged and a
+      // camera under the oil pool rendered as flat grey. Every liquid you can
+      // be inside now takes the submerged path, and submergedProfile derives
+      // its look from that liquid's own palette and opacity.
+      if (underwater) {
         // ---- the eye is INSIDE the liquid ----
         // A separate model, not shadeWater with a flag. From in here the
         // medium covers the entire view, so there is no interface in front of
@@ -3899,6 +3906,15 @@ fn fs(in : VSOut) -> FSOut {
         let sawSky = !h.hit && !h.saturated && !far.hit;
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
+      } else if (isViscousLiquid(materials[lm])) {
+        // Seen from OUTSIDE: blood and oil take their own surface model — no
+        // travelling ripples, a wet sheen that works on a lone droplet, and a
+        // moving-vs-pooled blend. See shadeViscous for why this is not
+        // shadeWater with different constants.
+        color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+                             h.liqPath, max(h.mediaSurf, 0.125), color,
+                             underwater);
+        color = applyAerial(color, rd, h.liqT);
       } else {
         color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                            h.liqPath, max(h.mediaSurf, 0.125), color,
