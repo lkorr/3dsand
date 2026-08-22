@@ -4,10 +4,33 @@ Phase 7 of `docs/PLAN_vulkan_port.md`, rewritten per `docs/ROADMAP_scale.md` §1
 (user-reviewed): a **flat u32 software page table with `EMPTY` and
 `UNIFORM(material)` sentinels**, not `VK_KHR_sparse_binding`, not an octree.
 
-Status: design, 2026-08-22. No code has been written. Companion docs:
-`docs/vulkan_barrier_graph.md` (the barrier design this must extend),
-`docs/vulkan_pass_map.md` (the buffer inventory), `src/sim/pass_table.def`
-(the table this must add `uses` entries to).
+Status: design, 2026-08-22, **revision 2 — post adversarial review**. No code
+has been written. Companion docs: `docs/vulkan_barrier_graph.md` (the barrier
+design this must extend), `docs/vulkan_pass_map.md` (the buffer inventory),
+`src/sim/pass_table.def` (the table this must add `uses` entries to).
+
+**Revision 2 changelog.** Review returned REWORK on 4 critical + 4 major + 5
+minor findings, all concentrated in **coverage** — the first draft's mechanisms
+were sound where they applied and the failures were things they did not apply
+to. Fixed in place, each tagged `[REVIEW …]` at the point of change:
+
+| # | finding | where |
+|---|---|---|
+| C1 | the snapshot reset **under-approximated** — it assigned where it must intersect | §3.2 |
+| C2 | `EncodeWakeAll` dirties all 32,768 chunks and was **entirely unmodelled**; no gate can catch it because the suite freezes the day phase | §3.2a |
+| C3 | the **render** bind groups were omitted; `raymarch.wgsl` has 17 raw voxel reads | §5.2a |
+| C4 | a whole missed class: **five CPU-side raw slot-offset** accesses to `voxels` | §2.1a |
+| M1 | `particleResolve` has **two** write targets; the micro-stain one parks on the contact cell | §3.4 |
+| M2 | the `∩ nonSentinel` materialization rule, stated as its own rule | §3.2a |
+| M3 | the hash must key on the **slot** base while the load uses the **page** base | §4.1 |
+| M4 | commit 2 was not independently green — merged with commit 3 | §8 |
+| m4 | the LIFO page-reproducibility claim was false; withdrawn | §3.7 |
+| m5 | `--shot` inherits C3; `--measure` runs dense-only | §5.4 |
+
+Three user decisions are folded in as settled, superseding the first draft:
+**exhaustion is a fatal error** (§3.8, Q4 closed), **`pageFaults` is
+unconditional and always bound** (§5.1, Q8 closed), and **Dawn is being removed
+entirely** (§6; Q9 and risk 7 moot, analysis retained rather than deleted).
 
 This document is load-bearing in the sense CLAUDE.md rule 1 means. Every branch
 introduced here sits on the **address path of the hashed domain**: it decides
@@ -64,8 +87,9 @@ dense, with the memory saving measured.** Concretely:
    write into a page, because a GPU kernel cannot allocate mid-dispatch.
 4. Page deallocation tied to the occupancy readback the CPU already receives,
    with hysteresis — so a settled world pays no per-tick scan (rule 2).
-5. Gates: paged-vs-dense-vs-Dawn hash equality on the `--vk-smoke-loud`
-   scenario, plus a new `page-roundtrip` selftest gate.
+5. Gates: paged-vs-dense hash equality on the `--vk-smoke-loud` scenario (and
+   both against its pinned constants), a new `page-roundtrip` selftest gate,
+   and a **daylight-boundary** gate the suite has never had (§3.2a).
 6. A reported resident-memory number against the 86.9 MiB estimate.
 
 Success is defined negatively, and that is the point: **the world hash sequence
@@ -97,8 +121,11 @@ reasons cannot be attributed to either.
   phase 7 must not be credited or blamed for it.
 - **Dropping the indirect staging copies or `simSlimBGL_`** (barrier_graph
   §4.10). Separate, hash-gated.
-- **Removing Dawn.** Phase 6 says Dawn is retained *through* phase 7 as the hash
-  oracle. §6 decides what happens after.
+- **Removing Dawn.** Already decided and **running in parallel as its own
+  project** (user decision). This phase does not do it and does not wait for
+  it, but it does inherit the consequences — §6 works through them, and the two
+  projects share `vk_smoke.cpp` and `simulation.cpp`, so they must coordinate
+  on the board.
 
 ### 1.3 The one thing this phase buys that hardware sparse cannot
 
@@ -147,15 +174,71 @@ So the indirection needs **two** entry points, not one per call site:
   have the chunk index in hand and want it hoisted out of their inner loop
   anyway.
 
-**This is the seam, and it is the only seam.** ROADMAP §1's "the CA is unaware
-of it" is not aspiration — it is a property that holds because `sim_step.wgsl`
-never names a buffer offset it did not get from `cellIndexW`.
+ROADMAP §1's "the CA is unaware of it" is not aspiration — it is a property
+that holds because `sim_step.wgsl` never names a buffer offset it did not get
+from `cellIndexW`.
 
-**Standing obligation, stated here because it is now load-bearing:** a sim
-kernel that computes a `voxels[]` subscript by any means other than these two
-helpers bypasses the page table and reads physical memory that may belong to
-another chunk. Under Dawn-dense that is invisible. §5 gives the checker rule
+**Standing obligation:** a sim kernel that computes a `voxels[]` subscript by
+any means other than these two helpers bypasses the page table and reads
+physical memory that may belong to another chunk. §5 gives the checker rule
 that catches it.
+
+**This is the shader seam. It is not the only seam** — see §2.1a, which the
+first draft of this document missed entirely.
+
+### 2.1a The SECOND seam: CPU byte offsets into `voxels`
+
+**[REVIEW C4 — FIXED. A whole missed class, and the miss was methodological:
+I audited shaders and never audited the CPU.]** The survey above is complete
+*for shaders*. It says nothing about C++ that computes a byte offset into
+`voxels` from a slot index — and every such site assumes **slot `s` lives at
+`s * 16 KiB`**, which is exactly the assumption paging deletes.
+
+Five sites, all verified at source:
+
+| site | what it does | what breaks under paging |
+|---|---|---|
+| `world.cpp:135-137` | chunk-fetch copy, `SlotChunkIndex(fetchIds[i]) * kChunkBytes` | the CPU chunk cache gets **another chunk's voxels** → island detection and terrain collision meshing operate on wrong data |
+| `world.cpp:153-156` | the 3×3×3 **mirror** copy, `ci * kChunkBytes` | `World::KindAt` returns wrong materials → **the player falls through the floor**. **Outside the hashed domain**, so no determinism gate catches it |
+| `stream.cpp:170-172` | eviction `CopyTracked(Voxels, s * kChunkBytes → staging)` | **saves the wrong chunk to disk**, silently and permanently |
+| `stream.cpp:260-261` | store-hit refill `WriteBuffer(voxels, s * kChunkBytes)` | writes decoded RLE into **another chunk's page** |
+| `selftest_sim.cpp:179-181`, `:290` | gate voxel dumps: `awake[k] * kChunkVol * 4`, and a whole-buffer copy from offset 0 indexed by `World::SlotCellIndex` | gates read the pool as if dense → assertions about the wrong voxels |
+
+The mirror case is the worst of the five, because its failure is invisible to
+everything else this document relies on: the mirror is CPU-only collision data,
+so a corrupted mirror is a gameplay bug with a **correct world hash**.
+
+> **Second seam statement, normative: any CPU path that computes a byte offset
+> into `voxels` from a slot index must resolve through
+> `World::PageOffsetOfSlot(slot)`**, returning either a byte offset into the
+> pool or a "no page" marker. There is no other way to address `voxels` from
+> C++.
+
+Per-site resolution:
+
+- **Mirror and chunk-fetch** (`world.cpp`): skip sentinel slots in the copy
+  loop; **synthesize** their 4,096 words CPU-side from the table entry when the
+  snapshot is consumed. Strictly cheaper than today — a sentinel chunk costs a
+  4-byte table read instead of a 16 KiB GPU→CPU copy — and it reduces the
+  readback traffic `kFetchPerTick = 64` exists to bound. The synthesis must use
+  the same rule as the shader, so a C++ `SynthWord` goes in `world.h` beside
+  `PackVoxNew` and the §4.4 gate asserts the two agree.
+- **Eviction** (`stream.cpp:170-172`): §4.2's fast path stops being an
+  optimization and becomes **mandatory** — a sentinel slot is not copied at
+  all; the CPU synthesizes its RLE (`{4096, synthWord}`) directly.
+- **Store-hit refill** (`stream.cpp:260-261`): translate through
+  `PageOffsetOfSlot`, allocating first per §3.5(d) — the same branch already
+  classifies the decoded chunk, so allocation and offset come from one place.
+- **Selftest dumps** (`selftest_sim.cpp`): **decided per gate, listed in §8
+  commit 5.** The `pond-freeze` whole-buffer copy at `:290` is a dense-layout
+  read by construction; gates that dump raw voxels run under
+  `--residency dense` (they test sim behaviour, not residency), while
+  `page-roundtrip` is the gate that reads *through* the translation.
+
+**Why this class was missed, recorded so the next audit is not shaped the same
+way:** the shader survey was a `grep` for `voxels[`, which by construction
+cannot see C++. The correct sweep is "every reader of `World::voxels`, in both
+languages". §8 commit 1 carries it as a checklist item.
 
 ### 2.2 The table layout
 
@@ -321,28 +404,25 @@ fn voxWordIndex(c : vec3<i32>) -> u32 {
   return e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
 }
 
-// Every sim write goes through this. A sentinel write is a NO-OP, plus a
-// detectable assertion when PAGE_ASSERT is on.
+// Every sim write goes through this. A sentinel write is a NO-OP and is
+// ALWAYS counted — the counter is unconditional (§5.1).
 fn voxStore(idx : u32, w : u32) {
   if (idx == PT_NO_WORD) {
-    if (PAGE_ASSERT != 0u) { atomicAdd(&pageFaults[0], 1u); }
+    atomicAdd(&pageFaults[0], 1u);
     return;
   }
   voxels[idx] = w;
 }
 ```
 
-**`PAGE_ASSERT` is a generated prelude constant, not a preprocessor define** —
-WGSL has no preprocessor. It joins `WORLD_N`, `CHUNK` and the rest in
-`ShaderConstantPrelude()` (`gpu/resources.cpp`), emitted as
-`const PAGE_ASSERT : u32 = 0u;` or `1u;` from a C++ flag. Two consequences,
-both good: the branch is a compile-time-known constant so Tint folds it away
-entirely in the off case (zero cost, verifiable in the SPIR-V), and flipping it
-is an F5 shader reload rather than a rebuild. The `pageFaults` binding is
-declared unconditionally and bound to a 16-byte buffer either way — a bound
-buffer nothing writes costs nothing, and a conditionally-declared binding would
-mean two bind-group layouts, which is exactly the "two things that must agree"
-shape to avoid.
+**`pageFaults` is permanently bound and the increment is unconditional** — no
+prelude flag, no conditional binding, no conditional `USES(...)` (§5.1, user
+decision). The cost in a correct build is a branch that never fires, since
+§3 guarantees every writable chunk is materialized; the benefit is that "zero
+page faults" is a claim the suite can make on *every* run rather than in a
+special configuration, and that there is exactly one bind-group layout and one
+`pass_table.def`. A conditionally-declared binding would mean two layouts that
+must agree — the shape this repo has a checker to prevent.
 
 Three properties, in the order that matters:
 
@@ -351,12 +431,10 @@ Three properties, in the order that matters:
    The failure mode is a *lost voxel* (bad, visible in the hash) rather than a
    *corrupted stranger* (worse, invisible until it isn't). §7 risk 1 argues
    why this is the right choice of failure.
-2. **It is detectable, cheaply, and only when asked.** `SANDVOX_PAGE_ASSERT` is
-   a shader-prelude define (the prelude is regenerated per load, so this is a
-   flag, not a rebuild) that binds a tiny `pageFaults` atomic counter. The new
-   selftest gate (§4.4) runs with it on and asserts the counter is **zero**.
-   Production runs bind nothing and the branch compiles out. This converts
-   "structurally impossible" from a claim into a measurement.
+2. **It is detectable, always.** A permanently-bound `pageFaults` atomic
+   counter (§5.1) is incremented on the no-op path, unconditionally. Every gate
+   asserts it is **zero**. This converts "structurally impossible" from a claim
+   into a measurement made on every run, not in a special configuration.
 3. **`cellIndexW` keeps its name and meaning for readers.** The mechanical
    edit is: every `voxels[cellIndexW(X)]` **read** becomes `voxWordAt(X)`;
    every `voxels[<idx>] = W` **write** becomes `voxStore(<idx>, W)` where
@@ -422,7 +500,17 @@ Not "the ones I can think of" — the enumeration is taken from
 | *(off-table)* `Stream::FillSlots` | `queue.WriteBuffer(voxels, slot*16KiB)` | the refilled slots |
 | *(off-table)* `LoadWorld` | whole-world upload | all slots |
 
-Plus one non-writer that still matters: `occupancyFull` **reads every slot**
+Plus three things that are not rows in that table and were missed by the first
+draft's enumeration — recorded here so the list is complete where it claims to
+be:
+
+| not a row | why it matters |
+|---|---|
+| `EncodeWakeAll` (`simulation.cpp:821-828`) | not a table row at all — a bare `WriteBuffer` of 32,768 dirty flags. It does not write voxels, but it makes **every** chunk a CA target next tick. §3.2a |
+| the five CPU byte-offset sites | `world.cpp` mirror + fetch, `stream.cpp` evict + refill, selftest dumps — they read and write `voxels` from C++ at `slot * 16 KiB`. §2.1a |
+| `raymarch.wgsl`'s 17 reads | render-only, but they index `voxels` from a slot-derived address and would sample the wrong chunk. §5.2a |
+
+And one non-writer that still matters: `occupancyFull` **reads every slot**
 (`D_CHUNKS` = 32,768 workgroups), which §4.1 addresses.
 
 ### 3.2 (a) The CA — and the one-tick-late dirty problem
@@ -523,47 +611,80 @@ reasons that are worth stating because the reviewer may disagree:
   itself a full-world scan — the exact rule-2 violation the phase is supposed
   not to add.
 
-**The mechanism instead: make the CPU's dirty knowledge exact by construction,
-not by inference.**
+**The mechanism instead: maintain a CPU-side conservative mirror of `dirtyOut`
+incrementally, and use an arriving snapshot only to TIGHTEN it — never to
+replace it.**
 
-> **Decision: maintain a CPU-side mirror of `dirtyOut` incrementally, from the
-> same information the GPU has, and materialize from it.** Specifically, the
-> CPU keeps `cpuDirty[kNumChunks]` (a bitset, 4 KiB) and updates it each tick
-> with the *superset rule*:
+> **Decision.** The CPU keeps `cpuDirty[kNumChunks]` (a bitset, 4 KiB) and
+> updates it each tick by the *superset rule*, plus an optional intersection
+> whenever a snapshot lands:
 >
 > ```
-> cpuDirty(N+1)  =  N26( cpuDirty(N) )  ∪  C(N)          // CPU-side, no GPU dep
-> cpuDirty(N+1) ←  dirtyFlags(snapshot)                  // EXACT reset, when a
->                                                        // snapshot for tick N
->                                                        // actually arrives
+> // (1) propagate — every tick, no GPU dependency
+> cpuDirty(N+1)  =  N26( cpuDirty(N) )  ∪  C(N)
+>
+> // (2) tighten — ONLY when a snapshot arrives, and only by intersection.
+> //     A snapshot stamped tick S is consumed while encoding tick M, M > S.
+> //     dirtyFlags(S) == dirtyIn(S+1) exactly, so rolling it forward the
+> //     (M-S-1) ticks that have since been encoded gives a SECOND superset
+> //     of dirtyIn(M) — usually much tighter than (1)'s, occasionally not.
+> cpuDirty(M)   ←  cpuDirty(M)  ∩  [ N26^(M-S-1)( dirtyFlags(S) )
+>                                    ∪  ⋃_{j=S+1}^{M-1} C(j) ]
 > ```
 >
-> The first line is the conservative propagation the lemma licenses, applied
-> **one tick at a time** so the dilation is a 1-ring per tick rather than a
-> `2k`-ring in one go. The second line is the correction: whenever a snapshot
-> lands, its `dirtyFlags` are the *exact* `dirtyIn` for the tick after the one
-> it was stamped with, so the CPU replaces its conservative estimate with
-> ground truth and the accumulated over-approximation is discarded.
+> Both operands of the `∩` are supersets of the true `dirtyIn(M)`, so their
+> intersection is also a superset and is at least as tight as either. That is
+> the whole correctness argument, and it is why the operation is an
+> intersection rather than an assignment.
+
+**[REVIEW C1 — FIXED. The earlier draft of this section was wrong and the
+reviewer is right about why.** It wrote `cpuDirty ← dirtyFlags(snapshot)` — an
+*assignment*, described as "EXACT reset ... ground truth". It is not ground
+truth at consumption time. `dirtyFlags(S)` is exact for `dirtyIn(S+1)`, but the
+snapshot is consumed while encoding some later tick `M`: the ring declines a
+tick entirely when all three slots are in flight (`world.cpp:110-113`, and
+`EncodeDirtyCopy` is guarded by `if (lastSlot_ < 0) return;`), and the frame
+loop runs up to 4 ticks per `ProcessEvents` (`main.cpp:1795`,
+`ticksThisFrame < 4`). Assigning therefore *discards* `M−S−1` ticks of
+legitimate dilation and installs a frontier stale by exactly the latency the
+mechanism exists to survive — an under-approximation, which is risk 1. The
+intersection form has no such failure: it can only ever remove chunks that
+*both* estimates agree are clean.**]**
+
+`snap.tick` is already carried (`world.h:488`, set at
+`world.cpp:118`), so `M−S` is known at consumption with no new plumbing. The
+per-tick `C(j)` sets must be retained in a small ring for the roll-forward —
+they are bounded by `kMaxOpsPerTick = 64`, `kMaxExplosionsPerTick = 8` and the
+cell-op count, and only the last few ticks are ever needed.
+
+**[JUDGMENT] The simpler variant, and why I am not taking it.** The reviewer
+offers `cpuDirty ← cpuDirty ∩ N26^(M-S-1)(dirtyFlags(S))` without the `C(j)`
+union. That is *not* a superset — a CPU op issued at tick `S+1` marks chunks
+the snapshot never saw, and intersecting them away loses them. The `C(j)` union
+is mandatory, and it is cheap because those sets are exactly the ones the CPU
+already computes for §3.3. (If the roll-forward's bookkeeping is judged not
+worth it, the safe degradation is to **skip the tightening entirely** when
+`M−S > 1` and let (1) carry — never to tighten with an incomplete superset.)
 
 Why this is the right shape:
 
-- **It is exact in the common case.** The ring almost always has a slot; the
-  snapshot almost always lands within a frame. In a settled world `cpuDirty`
-  is empty and the reset confirms it empty — the settled cost is *zero
-  materializations and a scan of an empty set*, which is the rule-2 story.
-- **It degrades by one ring per missed tick, and self-heals.** Three missed
-  snapshots cost a 3-ring around the true frontier, i.e. a handful of extra
-  chunks materialized around an active fire. The next snapshot clamps it back.
-  There is no unbounded growth path that a *live* world does not already have
-  (a spreading fire's true dirty set grows too; the over-approximation is a
-  constant ring around it).
-- **It is a set operation on a bitset, not a scan.** The `N26` dilation is
-  performed over the *members* of `cpuDirty` (a small vector of indices in
-  practice), never over all 32,768 slots. A settled world iterates zero
-  elements.
+- **It is tight in the common case.** With a healthy ring `M = S+1`, the
+  roll-forward is the identity, and the intersection reduces `cpuDirty` to
+  exactly `dirtyIn(M)`. The common case is exact — it just is not exact *by
+  assignment*, it is exact because the intersection happens to be.
+- **It degrades gracefully and never unsoundly.** Missed snapshots widen the
+  ring; the next intersection narrows it. A settled world's `cpuDirty` is empty
+  and stays empty (both operands empty).
+- **It is a set operation over members, not a scan.** The `N26` dilation
+  iterates the *members* of the set, never all 32,768 slots. A settled world
+  iterates zero elements. This is the rule-2 story.
 - **It never under-approximates**, which is the only property correctness
   needs. Over-approximating costs a materialized page that turns out empty and
   is freed by §3.6's hysteresis a few ticks later.
+
+**Headline, stated precisely so it is not misremembered:** *the snapshot is a
+second superset, usually tighter — never ground truth about the tick being
+encoded.*
 
 **[JUDGMENT] The alternative I considered and rejected: a GPU-side
 materialization pre-pass.** Shape: a kernel reads `dirtyIn`, computes the
@@ -579,6 +700,73 @@ CPU-derivable and the GPU has no monopoly on it.
 around every dirty chunk permanently.** Simpler, but it makes the resident set
 a function of activity *history* rather than activity, and nothing frees it
 promptly. Rejected on rule 2.
+
+### 3.2a `EncodeWakeAll` — the writer that is not an op and not a kernel
+
+**[REVIEW C2 — FIXED. This was a genuine hole and it was the most dangerous one
+in the document.]** The earlier draft's `C(N)` enumerated CPU *ops*.
+`Simulation::EncodeWakeAll` (`simulation.cpp:821-828`) is neither an op nor a
+table row — it is a bare `queue.WriteBuffer(world_->dirty[page_], ones)` that
+sets **all 32,768 dirty flags to 1**, called from `SubmitTick`
+(`support.cpp:155`) on any tick where `DaylightStrengthCpu` crosses zero.
+
+Verified at source, and the consequences are exactly as the reviewer states:
+
+- Every chunk in the window becomes `dirtyIn` on the next tick, so every chunk
+  dispatches and may write — while `cpuDirty` is near-empty because the world
+  was settled. **Silent voxel loss at every dawn and every dusk.**
+- **No gate catches it.** The selftest pins the day phase in both directions —
+  `night.dayNight.freeze = 1; freezePhase = 0` (`selftest_sim.cpp:242-243`) and
+  `noon.dayNight.freeze = 1` (`:389`) — so `wasDay != isDay` is never true in
+  the suite and `EncodeWakeAll` is never called. The bug would ship.
+
+**Fix, part 1 — the wake sets the mirror.** `EncodeWakeAll` sets
+`cpuDirty` to all-ones in the same call. The two must be one operation, not two
+that must agree: the wake *is* a dirty-set mutation, and the CPU mirror is a
+mirror of the dirty set. Give it a signature that makes the pairing structural
+(the wake takes the mirror, or the mirror lives beside `page_` and the wake
+updates both), so a future caller cannot get one without the other.
+
+**Fix, part 2 — the materialization rule, which is what stops this from
+becoming a crash. [REVIEW M2 — FIXED: stated as its own rule.]** With
+`cpuDirty` all-ones, a naive "materialize everything dirty" would demand 32,768
+pages from an 8,192-page pool: guaranteed exhaustion, which under §3.8's
+settled policy is a guaranteed **abort**, twice per in-game day. The rule that
+prevents it is load-bearing, and it is a rule-2 statement in its own right
+independent of the wake-all case that exposed it:
+
+> **Materialize `(cpuDirty ∩ nonSentinel) ∪ N26(cpuDirty ∩ nonSentinel)`.**
+>
+> **Dirty ≠ non-empty.** A chunk that is dirty but is a sentinel holds no
+> matter, so nothing in it can move; the only way it can *receive* matter is
+> from a neighbouring chunk that has matter — and every such neighbour is in
+> `cpuDirty ∩ nonSentinel`, whose 26-ring is materialized. A dirty EMPTY chunk
+> with no non-empty chunk in its 26-neighbourhood is therefore provably
+> unwritable this tick and needs no page.
+
+This is sound for exactly the same reason the write-reach argument is: writes
+reach ≤1 cell, so matter crosses at most one chunk boundary per substep, so a
+chunk can only be written by a source within its 26-neighbourhood. Under a
+wake-all the materialization set collapses from 32,768 to *the non-empty
+chunks plus their ring* — i.e. to the same ~4,974 + ring the world already
+needs, which is why the pool sizing in §3.7 survives a wake-all at all.
+
+**Fix, part 3 — the hysteresis interaction.** §3.6's free condition includes
+`AND the slot is not in cpuDirty`. With `cpuDirty` all-ones after a wake, **no
+page is eligible to be freed until the mirror shrinks**, which it does over the
+following ticks as the intersection in §3.2 (2) tightens it against arriving
+snapshots — a settled world's next snapshot reports almost nothing dirty and
+collapses the mirror in one step. So deallocation stalls for a few ticks and
+then resumes; it does not deadlock. Stated explicitly because "all deallocation
+freezes" is alarming if discovered rather than predicted, and because it is a
+real (bounded) resident-memory spike at dawn.
+
+**The gate this needs, because the suite structurally cannot catch it**
+(§8 commit 4): settle a world, then run across a daylight boundary **with
+`dayNight.freeze` OFF**, and assert (a) the hash matches a dense run,
+(b) `pagesInUse_ < kPoolPages` throughout, (c) `pageFaults == 0`. This is the
+only gate in the suite that exercises `EncodeWakeAll` at all — which is worth
+noting independently of paging.
 
 ### 3.3 (b) sim_mutate / sim_explode / particleSpawn
 
@@ -608,12 +796,43 @@ over-approximation is freed by hysteresis.
 
 ### 3.4 (b cont.) particleResolve — the one writer with no CPU-known target
 
-`sim_particle:resolve` writes `voxels` where a particle **lands**, and the
-landing cell is computed on the GPU from integrated fixed-point flight
-(`sim_particle.wgsl:180,202`). The CPU does not know it. This is the writer the
-brief flags as "can land anywhere along a flight path", and it is real.
+`sim_particle:resolve` writes `voxels` at a GPU-decided location. The CPU does
+not know it. This is the writer the brief flags as "can land anywhere along a
+flight path", and it is real.
 
-Three facts bound it:
+**[REVIEW M1 — FIXED. There are TWO write targets, not one, and the earlier
+draft described only the first.]**
+
+1. **Reinsertion** — an ordinary particle backs off to the **last air cell**
+   before the blockage (`sim_particle.wgsl:178-180`, `p.px = lastAir.x` …) and
+   `resolve` writes a whole voxel there (`:248-250`).
+2. **Micro-stain** — a MICRO particle does **not** back off. It parks at the
+   **contact cell**, i.e. the first *blocked* sample (`:170-176`; the comment
+   there says so outright: "the droplet is parked at the CONTACT point (first
+   blocked sample), not backed off to the last air cell"), and `resolve` writes
+   a stain into that occupied cell (`:241`,
+   `voxels[tgt] = (w & ~STAIN_BITS) | packStain(...)`).
+
+That difference matters here for two reasons. The stain target is a **solid,
+non-air** cell — a cell reinsertion logic would never choose — so a
+materialization set derived from "where can a particle come to rest in air"
+misses it. And stain is **hashed state** (bits 24..30, `sim_occupancy.wgsl:83`),
+so losing one moves the world hash.
+
+**Both targets are within the swept path**, so one conservative set covers
+both — but the set must be built from the swept path, not from a notion of
+"landing spot".
+
+**Second consequence, and this one feeds back into §3.2:** `resolve` calls
+`markDirtyNext(cell)` on the stain path (`:242`) and on the reinsertion path
+(`:265`), which dirties the **26-neighbourhood of a location the CPU never
+chose**. So particle activity seeds next tick's CA reach through a channel
+`cpuDirty`'s own recurrence does not model. **`particleChunks(N)` must be
+UNIONed into `cpuDirty(N+1)`**, not merely materialized alongside it —
+otherwise the CA frontier that particles create is invisible to the mirror
+until a snapshot happens to report it.
+
+Three facts bound the swept set:
 
 1. **Particles are capped**: `kParticleCap = 262144`, and `particlesActive` is a
    CPU-known boolean (`support.cpp:111`) that is false in a settled world.
@@ -632,12 +851,19 @@ it — with a hard fallback.** Specifically:
 particleChunks(N+1) = Ndilate( particleChunks(N), ceil(PART_MAX_VEL / CHUNK) + 1 )
                       ∪ chunks(spawnOps(N)) ∪ chunks(explosion centers(N))
 particleChunks(N+1) = ∅   when the readback says particleCount == 0
+
+// and, per M1 above, the set feeds the dirty mirror as well as the
+// materialization set — because resolve's markDirtyNext dirties a
+// 26-neighborhood the CPU never chose:
+cpuDirty(N+1)      ∪= N26( particleChunks(N+1) )
 ```
 
 `ceil(6/16)+1 = 1`, so the dilation is a 1-ring per tick — the same shape as
 `cpuDirty`. And `snap.particleCount` (already read back, `world.h:487`) gives
-the exact reset condition: no live particles means the set is empty, which is
-the settled case.
+the reset condition: no live particles means the set is empty, which is the
+settled case. Note the reset is subject to the same staleness as every other
+snapshot field — `particleCount == 0` in a snapshot stamped `S` licenses
+clearing the set only if no spawn has been issued since, which the CPU knows.
 
 **[JUDGMENT] The fallback, and I want the reviewer's opinion on it.** The
 dilation is only sound if `PART_MAX_VEL` genuinely bounds per-tick travel and
@@ -647,8 +873,8 @@ this silently under-approximates and we lose a voxel. Two ways to make that
 non-silent:
 
 - **(i)** `voxStore`'s no-op path is already the containment (§2.4) and the
-  `SANDVOX_PAGE_ASSERT` counter catches it in the gate. Cheap, but only in the
-  gate.
+  `pageFaults` counter catches it — on every run, since the counter is
+  unconditional.
 - **(ii)** Add a `static_assert`-shaped CPU check: the dilation radius is
   computed from `TUNE_PART_MAX_VEL` at load rather than hardcoded, so raising
   the tuning value automatically widens the ring. Since `TUNE_*` values are
@@ -805,6 +1031,22 @@ conjuncts are needed and each blocks a different thrash:
   impossible rather than merely unlikely: a chunk cannot be simultaneously
   "in the materialization set" and "eligible to free".
 
+**Two corrections this condition inherits from §3.2 and §3.2a:**
+
+1. **`occTotal == 0` is itself stale** — it comes from the same snapshot whose
+   staleness C1 is about. That is *safe here and only here*, because the free
+   condition is a conjunction with `!cpuDirty`: a chunk that became non-empty
+   since the snapshot was stamped was written by something, and anything that
+   writes it puts it in `cpuDirty` (that is §3.2's whole guarantee), so the
+   second conjunct rejects it. **The staleness of `occTotal` is covered by the
+   freshness of `cpuDirty`, not by luck** — and this is why `cpuDirty` must be
+   the *conservative* mirror rather than the snapshot's own dirty flags. Using
+   `snap.dirtyFlags` here instead would make both conjuncts stale in the same
+   direction and the argument would collapse.
+2. **After a wake-all, `cpuDirty` is all-ones, so nothing is freeable** until
+   it shrinks (§3.2a fix 3). Bounded, self-clearing, and called out as open
+   question 7 because it is a real resident-memory spike at dawn and dusk.
+
 **Who scans, at what cadence, at what cost when settled.** The consecutive-zero
 counter is maintained in the snapshot callback, which already walks all
 `kNumChunks` entries (`world.cpp:200-210` — an existing loop, not a new one).
@@ -834,13 +1076,22 @@ uint32_t              pagesInUse_;
 uint32_t              pagesHighWater_;   // reported by --measure
 ```
 
-**Allocation is a pop; free is a push.** LIFO deliberately: a recently-freed
-page is the one most likely still resident in whatever cache hierarchy cares,
-and — more importantly — LIFO makes the sequence of page indices a *pure
-function of the allocation/free order*, which is a pure function of the tick
-inputs. That matters for §7 risk 4: it makes page assignment reproducible run
-to run, which is not required for hash equality (the table is not hashed) but
-makes divergence debugging tractable.
+**Allocation is a pop; free is a push.** LIFO for cache locality: a
+recently-freed page is the one most likely still resident in whatever cache
+hierarchy cares.
+
+**[REVIEW m4 — FIXED.]** The first draft additionally claimed LIFO makes page
+assignment "reproducible run to run" and therefore aids debugging. **That is
+false and the claim is withdrawn.** Free order depends on the *snapshot
+cadence* — which slots' occupancy readbacks arrive on which tick, and whether
+the ring declined (§3.2) — and that cadence is a function of GPU timing and
+frame pacing, not of tick inputs. So two runs of the same seed can assign
+different page indices to the same chunk.
+
+This is **harmless to correctness**: the page table is not hashed and not
+saved (§4.2), so page assignment is not part of the world. It only means the
+stated debugging benefit does not exist, and a debugger comparing two runs
+should compare *table entries by slot*, never *page indices*.
 
 **Initialization on allocation.** A freshly allocated page must be filled with
 the synthesized content of the sentinel it is replacing, **before** the
@@ -884,53 +1135,55 @@ numbers and the acceptance criterion in §8 must report both: the high-water
 `pagesInUse_ × 16 KiB` (compare to 77.7 MiB) and the pool reservation (128 MiB).
 Conflating them is how a phase claims a win it did not get.
 
-### 3.8 Exhaustion — and why it must be deterministic
+### 3.8 Exhaustion is a FATAL ERROR
 
-If `freePages_` is empty when the materialization set needs a page, something
-must give. **Any behaviour that changes voxel state is hash-relevant**, so this
-is a rule-1 decision, not an error-handling detail.
+> **Decision (user, settled): if `freePages_` cannot satisfy the
+> materialization set, the engine aborts with a clear
+> `page pool exhausted: N needed, M free` error. In every mode — game,
+> selftest, `--shot`, `--measure`. There is no fallback, no refusal, no
+> degradation.**
 
-The options and their consequences:
+The reasoning is short and it is better than the first draft's: **if the pool
+can exhaust in normal play, the pool is mis-sized.** That is a bug in
+`kPoolPages`, and the correct response to a bug is to fail loudly at the
+moment of detection, not to invent a graceful behaviour that hides it and
+mutates the world while doing so.
 
-| option | consequence |
-|---|---|
-| **Refuse the op** | a brush stroke silently does nothing. Deterministic *if* the refusal order is deterministic — and it is not obviously so, because the pool state depends on allocation history. |
-| **Fall back dense** | requires 512 MiB of pool to exist, i.e. the phase bought nothing. |
-| **Grow the pool** | a `vkCreateBuffer` mid-frame, a full copy, and a descriptor rewrite while command buffers are in flight. |
-| **Drop the write** | `voxStore`'s no-op. Deterministic but silently loses matter. |
+This replaces the first draft's three-tier priority-refusal scheme entirely.
+**That scheme is dead** — and it deserves a sentence on why, because it looked
+reasonable: it made exhaustion *survivable* at the cost of making it *silent*,
+so a mis-sized pool would present as occasional lost matter and hash divergence
+in the field rather than as a crash in testing. It also required
+`voxStore`'s no-op path to become an expected outcome, which would have
+undermined §2.4's guarantee that a page fault is always a bug.
 
-> **Decision: exhaustion is a hard, loud, deterministic failure — the tick is
-> refused before it is encoded, the engine logs and aborts in the selftest, and
-> in the game it clamps by refusing *the lowest-priority members of the
-> materialization set in a fixed order*.**
+Consequences of the settled policy:
 
-Spelled out, because "deterministic" is the whole requirement:
+- **The determinism guarantee is not qualified.** The first draft proposed a
+  DESIGN.md amendment saying exhaustion "voids the hash guarantee". That is no
+  longer needed and would be wrong: an aborted process produces no hash to
+  diverge. The DESIGN.md note says **fatal error**, in the same register as an
+  out-of-memory allocation failure — a condition the engine detects and refuses
+  to continue past, not a caveat on rule 1.
+- **`pageFaults` stays a pure bug detector.** Nothing in normal operation can
+  make it fire, because the only path that could (a refused materialization) no
+  longer exists. That is what makes "assert it is zero" meaningful (§4.4).
+- **Pool sizing becomes load-bearing rather than advisory**, which is the
+  honest position. §3.7's `kPoolPages = 8192` (1.65× the measured steady state)
+  must be validated against the worst case the gates can produce, and
+  `pagesHighWater_` must be reported on every `--measure` run so the margin is
+  a tracked number. §8 commit 6 does this.
+- **The wake-all case is where sizing is actually tested** (§3.2a): without the
+  `∩ nonSentinel` materialization rule a daylight boundary would demand 32,768
+  pages and, under this policy, **crash twice per in-game day**. That rule is
+  therefore not an optimization — it is what keeps the abort unreachable.
 
-1. **Priority order is fixed and total**, and it is by *provenance*, not by
-   slot index: (1) CPU-op targets — refusing these loses an authored mutation;
-   (2) chunks in `cpuDirty` — refusing these loses CA writes; (3) the
-   over-approximation ring — refusing these is *free*, because a chunk in the
-   ring that is not truly dirty was never going to be written. Within a tier,
-   ascending slot index. This is a pure function of the tick's inputs, so two
-   machines make the same refusals.
-2. **The ring tier is where the clamp lands in practice**, and refusing it is
-   sound because the ring is an over-approximation: if a write *does* arrive at
-   a refused ring chunk, `voxStore` no-ops it and `pageFaults` increments. So
-   the failure escalates from "free" to "detectable" rather than to "silent".
-3. **Tiers 1 and 2 refusing is a hard error.** The engine logs
-   `page pool exhausted: N needed, M free` and, under `--selftest`, **fails the
-   run**. In the game it continues with the refusal (matter is lost, the world
-   diverges from a replay) but the log line is the evidence. It must not be
-   swallowed.
-4. **The pool is sized so tiers 1 and 2 cannot plausibly exhaust it** (§3.7's
-   1.65× headroom over a measured steady state), and `pagesHighWater_` is
-   reported so the margin is observable rather than assumed.
-
-**Recording this in the doc trail:** because exhaustion behaviour *can* alter
-voxel state, it must be listed in DESIGN.md's determinism section as a
-condition under which the hash guarantee is void — the same way out-of-memory
-is. **[JUDGMENT]** I would rather have a loud, documented "the guarantee does
-not hold here" than a quiet fallback that makes the guarantee false everywhere.
+**What the gates owe this policy.** An abort is only acceptable if the
+condition is genuinely unreachable in normal play, so the suite must probe the
+margin rather than merely avoid it: the daylight-boundary gate (§3.2a), the
+sky-boundary explosion (§4.4), and a deliberate low-`kPoolPages` run asserting
+the abort fires cleanly with the right message (§8 commit 5) — testing that the
+failure mode *works*, since it is now the only one.
 
 ---
 
@@ -989,9 +1242,11 @@ if ((e & PT_SENTINEL_BIT) != 0u) {
   // exactly as the dense loop does — there is no reason to serialize it.
   let w = synthWord(e);
   let v = (w & 0xFFFFu) | ((w & STAIN_BITS) >> 8u);
-  let base = wg.x * CHUNK_VOL;
+  let hashBase = wg.x * CHUNK_VOL;          // SLOT index — the hash key
   var h = 0u;
-  for (var i = li; i < CHUNK_VOL; i += 64u) { h += pcg((base + i) ^ (v * 0x9E3779B9u)); }
+  for (var i = li; i < CHUNK_VOL; i += 64u) {
+    h += pcg((hashBase + i) ^ (v * 0x9E3779B9u));
+  }
   if (T.hashEnable != 0u) { atomicAdd(&wgHash, h); }
   workgroupBarrier();
   if (li == 0u) {
@@ -1001,8 +1256,37 @@ if ((e & PT_SENTINEL_BIT) != 0u) {
   }
   return;
 }
-// ... existing dense path, with `base` resolved from the page index ...
+
+// ---- resident: TWO DIFFERENT BASES, and conflating them is a silent desync --
+let loadBase = e * CHUNK_VOL;               // PAGE index  — where the words are
+let hashBase = wg.x * CHUNK_VOL;            // SLOT index  — what the hash keys on
+for (var i = li; i < CHUNK_VOL; i += 64u) {
+  let w = voxels[loadBase + i];             // <-- page
+  let v = (w & 0xFFFFu) | ((w & STAIN_BITS) >> 8u);
+  let m = v & 0xFFFu;
+  if (m != MAT_AIR) {
+    count += 1u;
+    if (isRayBlocker(materials[m])) { block += 1u; }
+    if (T.hashEnable != 0u) { h += pcg((hashBase + i) ^ (v * 0x9E3779B9u)); }  // <-- slot
+  }
+}
 ```
+
+**[REVIEW M3 — FIXED.]** The first draft's trailing comment said the dense path
+runs "with `base` resolved from the page index", which would feed the *page*
+base into `pcg`. That is wrong and it is the kind of wrong that produces a
+paged-vs-dense hash mismatch with no other symptom: today's code uses one `base`
+for both purposes (`sim_occupancy.wgsl:64`) because under a dense layout page
+index **is** slot index. Paging splits them, and **only the load follows the
+page; the hash must keep keying on the slot** or every non-identity page
+assignment changes the world hash. This is on commit 1's checklist as an
+explicit item, and it is a good argument for landing commit 1 as the identity
+map: under `pageTable[i] == i` the two bases are equal, so the split can be
+introduced and proven hash-neutral before it can possibly differ.
+
+The same split applies to `mainDirty` (`sim_occupancy.wgsl:35`,
+`base = dirtyList[wg.x] * CHUNK_VOL`) — but `mainDirty` computes no hash, so it
+needs only the load base. Stated so nobody "fixes" it symmetrically.
 
 Note the `wgHash` workgroup atomic must be zeroed in the same `li == 0`
 prologue the existing entry point already has (`sim_occupancy.wgsl:57-62`) —
@@ -1036,13 +1320,21 @@ undoing itself, and it would make the hash tick a materialization storm. The
 only argument for it is "the analytic path might diverge", and the answer to
 that is the shared `synthWord` plus the §4.4 gate, not abandoning sparsity.
 
-**`mainDirty` needs the same treatment**, and it is easier: it is dispatched
-over `dirtyList`, and every chunk in `dirtyList` is in the materialization set
-by §3.2 — **so `mainDirty` can never see a sentinel**. It should nonetheless
-handle one, by taking the same analytic branch, because "can never" arguments
-that are load-bearing deserve a cheap belt. Under `SANDVOX_PAGE_ASSERT` the
-branch increments `pageFaults` — a sentinel in the dirty list means §3.2's
-closure argument is broken, and that is exactly what we want to hear about.
+**`mainDirty` needs the same treatment, and its sentinel branch is
+MANDATORY — not a belt.** **[REVIEW M3, second half — FIXED.]** The first draft
+claimed `mainDirty` "can never see a sentinel" because every chunk in
+`dirtyList` is in the materialization set. **That was true only under the first
+draft's materialization rule, and §3.2a deleted it.** Under the corrected rule
+(§3.2a fix 2) the set is `(cpuDirty ∩ nonSentinel) ∪ N26(...)`, which
+deliberately does **not** materialize a dirty EMPTY chunk with no non-empty
+neighbour — and a wake-all makes *every* chunk dirty, so after any daylight
+boundary `dirtyList` is full of sentinel chunks. `mainDirty` sees them
+routinely, by design.
+
+It takes the same analytic branch (occupancy only — no hash). It must **not**
+increment `pageFaults`: a sentinel here is now expected, not a fault. That
+distinction matters, because a counter that fires in normal operation is a
+counter nobody looks at.
 
 ### 4.2 The page table is derived state and is never serialized
 
@@ -1082,23 +1374,28 @@ on it implicitly.
 
 ### 4.4 The gates
 
-**Gate A — paged-vs-dense hash equality on the loud scenario.** Reuse
-`--vk-smoke-loud`'s 19-probe driver verbatim, per the phase-6 handoff. The
-scenario is already exactly what this phase needs to stress: brush + melt ops,
-three explosions at t45/t52/t75 (the mark/apply split, the whole particle
-chain), exact-cell stamps anchored to `world.WindowOrigin()`, the readback ring
-live every tick, and an **8-shift streaming walk with eviction and procgen
-refill** at t85–t100. That last leg is the page alloc/free/realloc path under
-streaming, for free.
+**Gate A — paged-vs-dense hash equality on the loud scenario, plus the pinned
+sequence.** Reuse `--vk-smoke-loud`'s 19-probe driver, which is being
+repurposed as a **Vulkan-only pinned-hash-sequence regression gate** (its 19
+known values become expected constants — §6.1). The scenario is already exactly
+what this phase needs to stress: brush + melt ops, three explosions at
+t45/t52/t75 (the mark/apply split, the whole particle chain), exact-cell stamps
+anchored to `world.WindowOrigin()`, the readback ring live every tick, and an
+**8-shift streaming walk with eviction and procgen refill** at t85–t100. That
+last leg is the page alloc/free/realloc path under streaming, for free.
 
-The comparison machinery in `src/gpu/vk_smoke.cpp` is already backend-agnostic
-once labelled: `RunScenario(kind, loud, ...)` at `:128` and
-`CompareAndReport(name, a, b, validation)` at `:214`. What needs changing:
+So Gate A asserts two things, not one: paged **==** dense (the live
+differential), and both **==** the pinned constants (the historical oracle).
 
-- `RunScenario` gains a residency mode parameter (see §6 for the flag).
-- `CompareAndReport`'s hardcoded `"  stage              Dawn         Vulkan\n"`
-  header (`:228`) and `KindName` (`:123`) need label parameters. Small, and the
-  right change regardless.
+The comparison machinery in `src/gpu/vk_smoke.cpp` needs the axis changed from
+backend to residency: `RunScenario(kind, loud, ...)` at `:128` gains a
+residency parameter and loses its `kind` variation; `CompareAndReport(name, a,
+b, validation)` at `:214` needs label parameters, since its column header is the
+hardcoded `"  stage              Dawn         Vulkan\n"` (`:228`) and `KindName`
+(`:123`) hardcodes the two backend names. **Coordinate with the Dawn-removal
+agent** — that project is touching the same function for the same reason, and
+two sessions rewriting `CompareAndReport` independently is the collision
+CLAUDE.md's board exists to prevent.
 
 **One scenario gap to close.** The loud scenario's explosions are placed
 relative to the window origin but not specifically at a **sky boundary**, which
@@ -1127,38 +1424,60 @@ asserts, in order:
    store-hit refill of an all-air chunk sets `PT_EMPTY` and uploads **zero
    bytes**, and that a refill of a mixed chunk materializes.
 6. **Explosion at a sky boundary**: assert the hash matches a dense run.
-7. **`pageFaults == 0`** under `SANDVOX_PAGE_ASSERT` for the whole gate. This
-   is the assertion that turns §2.4's structural claim into evidence.
+7. **`pageFaults == 0`** for the whole gate — always available, since the
+   counter is unconditional (§5.1). This is the assertion that turns §2.4's
+   structural claim into evidence.
+8. **CPU/GPU synthesis agreement** (§2.1a): assert the C++ `SynthWord` and the
+   shader's `synthWord` produce identical words for every sentinel kind in
+   play, by comparing a mirror-synthesized chunk against a GPU readback of the
+   same chunk after forcing materialization.
 
 The gate must anchor to `world.WindowOrigin()`, not a fixed world position —
 gates run in `kOrder` sequence and the streaming gate leaves the origin ~20
 chunks out (the documented trap that made the spell gate detonate on tick 1).
 
-**Gate C — the existing suite, unchanged.** 23 gates green on both backends,
-`determinism` reporting the pinned `7cfa2420`, both known failures failing the
-same way. If any gate's *detail string* changes, the phase changed behaviour.
+**Gate D — the daylight-boundary gate (§3.2a), and the suite structurally
+cannot do without it.** `EncodeWakeAll` is never called anywhere in the current
+suite, because every day/night gate pins the phase
+(`selftest_sim.cpp:242-243` freezes at midnight, `:389` at noon). So the
+wake-all path — which sets all 32,768 dirty flags — has **zero** test coverage
+today, paging or no paging. This gate: settle a world, run across a daylight
+transition with `dayNight.freeze` **off**, and assert
+(a) the hash matches a dense run, (b) `pagesInUse_ < kPoolPages` at every tick
+(the abort in §3.8 must stay unreachable), (c) `pageFaults == 0`, (d) chunks
+return to sleep afterwards.
+
+**Gate E — the existing suite.** All gates green in **both residency modes**
+(dense is now the only oracle — §6.3), `determinism` reporting the pinned
+`7cfa2420`, both known failures failing the same way. If any gate's *detail
+string* changes, the phase changed behaviour.
 
 ---
 
 ## 5. Pass table and barriers
 
 The phase-6 handoff's warning is exact and applies here verbatim: **a missed
-`uses` entry means the generator emits no barrier for that hazard, and it is
-invisible under Dawn.** Everything in this section lands in the *same commit*
-as the shader change that needs it.
+`uses` entry means the generator emits no barrier for that hazard.** (The
+warning's original form said "invisible under Dawn"; with Dawn removed it is
+invisible full stop, which makes the checker more important, not less.)
+Everything in this section lands in the *same commit* as the shader change that
+needs it.
 
 ### 5.1 New buffer ids
 
 `pass::Buf` (`src/sim/pass_table.h:29-65`) gains **`PageTable`** and
 **`PageFaults`** before `kCount`.
 
-`PageFaults` (16 bytes, an atomic counter, §2.4) is a *diagnostic* buffer, but
-it is written by sim kernels and therefore is not exempt from any of this: it
-needs its `Buf` id, its binding, and an `A(PageFaults)` use on every row that
-can write it — which is every row that calls `voxStore`. Declaring it
-unconditionally (rather than only when `PAGE_ASSERT` is on) is what keeps the
-bind-group layout, the pass table and the checker all agreeing in both modes,
-which is worth 16 bytes.
+**`PageFaults` is permanent, always-bound and unconditional** (16 bytes, an
+atomic counter, §2.4). No `PAGE_ASSERT` prelude flag, no conditional binding,
+no `#if` in `pass_table.def`. It gets its `Buf` id, a permanent binding, and an
+`A(PageFaults)` use on every row that calls `voxStore`. The atomic increment
+sits on a branch that is never taken in a correct build, so its production cost
+is a branch that never fires — and in exchange there is **one** bind-group
+layout, **one** `.def`, and no configuration under which the pass table and the
+shaders disagree. *(This supersedes the first draft's conditional design, which
+created a flag-dependent layout — the exact "two things that must agree" shape
+this repo has a checker to prevent. See §9 Q8, closed.)*
 
 Each enumerator obliges four edits, all mechanical, all checked:
 
@@ -1193,62 +1512,92 @@ the checker caught twice before, so verify the checker stays silent on
 
 ### 5.2 Binding placement
 
-`pageTable` must be bound in **group 0**, alongside `voxels`, in both `simBGL_`
-(binding 17 — the first free slot after `genList` at 16) and `simSlimBGL_`
-(binding 5, extending 0–4).
+`pageTable` and `pageFaults` bind in **group 0**, alongside `voxels`:
+`simBGL_` bindings 17 and 18 (the first free slots after `genList` at 16), and
+`simSlimBGL_` bindings 5 and 6 (extending 0–4).
 
-**Dawn's limit is 16 storage buffers per stage across ALL bind groups in one
-pipeline layout** (barrier_graph §4.10 — it is why `simSlimBGL_` exists at
-all). Vulkan does not care
-(`maxPerStageDescriptorStorageBuffers` = 1,048,576, phase 3a), but Dawn must
-keep building or the oracle is gone. Counted from `simulation.cpp:82-121` and
-`:209-219` — **storage entries only**, uniforms do not count:
+**Group 0 is not negotiable, and that is what makes §2.1's shared accessor
+work.** `common.wgsl` is prepended to every shader, so the accessors must name
+a group whose meaning is identical everywhere. Group 1 differs by pipeline
+(`particleBGL_` vs `farBGL_` vs `renderPartBGL_`), so a group-1 `pageTable`
+would have to be declared per shader rather than once — which dissolves the
+single-seam property the whole design rests on.
 
-| layout | groups | storage today | +`pageTable` +`pageFaults` | margin |
+#### 5.2a The render layouts — **[REVIEW C3 — FIXED]**
+
+The first draft counted `simPL_`, `simPL2_` and `farPL_` and **omitted the
+render pipelines entirely**. That is a correctness hole, not an accounting one:
+`raymarch.wgsl` performs **17 raw `voxels[cellIndexW(...)]` reads** — verified
+by grep, at lines 722, 730, 935, 943, 1181, 1829, 2028, 2282, 2437, 3182, 3262,
+3304, 3816, 3855, 4241, 4381, 4464. Under paging every one of those indexes the
+*pool* with a *slot-derived* index and samples **the wrong chunk** wherever the
+target is a sentinel. The world would render as garbage while hashing
+perfectly — the render path is outside the hashed domain, so no determinism
+gate could ever catch it.
+
+So the seam covers the renderer too, and `renderBGL_` gains `pageTable`.
+
+**Layout counts, storage entries only** (uniforms do not count), from
+`simulation.cpp:82-121`, `:139-155`, `:209-219`:
+
+| layout | groups | storage today | + page bufs | note |
 |---|---|---|---|---|
-| `simPL_` | `simBGL_` | 14 (bindings 0,1,2,3,6,7,8,9,11,12,13,14,15,16) | **16** | **0** |
-| `simPL2_` | `simSlimBGL_` (4) + `particleBGL_` (8) | 12 | **14** | 2 |
-| `farPL_` | `simSlimBGL_` (4) + `farBGL_` (4) | 8 | **10** | 6 |
+| `simPL_` | `simBGL_` | 14 | **16** | sim |
+| `simPL2_` | `simSlimBGL_` (4) + `particleBGL_` (8) | 12 | **14** | sim |
+| `farPL_` | `simSlimBGL_` (4) + `farBGL_` (4) | 8 | **10** | see below |
+| `renderPL_` | `renderBGL_` (7) + `renderPartBGL_` | 7+ | **8+** | **was missing** |
+| `microBodyPL_` | `renderBGL_` (7) + `microBodyBGL_` | 7+ | **8+** | **was missing** |
 
-**`simPL_` lands at exactly 16 of 16 — the limit, with zero margin.** It fits,
-and nothing else ever will. That is too tight to land deliberately, and it
-changes a decision:
+`renderBGL_` has ample headroom — 7 fragment storage entries today (bindings 0,
+1, 2, 4, 5, 7, 8; bindings 3 and 6 are uniforms), and the comment at
+`simulation.cpp:145-149` already reasons about this ceiling. `pageTable` takes
+binding 9. It is `ReadOnlyStorage, S::Fragment`, matching `voxels` at binding 0.
 
-> **`pageFaults` goes in `simSlimBGL_`, not `simBGL_`.** `simSlimBGL_` is
-> bindings 0–4 of the *same* group 0 and is a strict prefix of `simBGL_`'s
-> layout — so if `pageFaults` takes `simSlimBGL_` binding 6 (after `pageTable`
-> at 5) it must also occupy `simBGL_` binding 6, which is `opsBuf`. It does not
-> fit as a prefix.
+`microBodyBGL_` does **not** need `pageTable` itself — `microbody.wgsl` reads
+its own brick pool, not `voxels` — but it shares `renderBGL_` as group 0, so it
+inherits the binding for free. Confirmed: the `cellIndexW` grep reports 0 hits
+in `microbody.wgsl`, `debris.wgsl` and `debug_lines.wgsl`.
 
-**[JUDGMENT] Resolution: make `pageFaults` a `PAGE_ASSERT`-only binding after
-all, and accept the two-layout cost — but pay it in the ONE place it is
-cheap.** The assert build is a developer configuration, not a shipping one, so:
-`PAGE_ASSERT` off (the default, and what every normal run and most gates use)
-declares no `pageFaults` binding and the layouts are the table above minus one
-column — `simPL_` at **15 of 16**, one slot spare. `PAGE_ASSERT` on adds the
-binding at `simBGL_` 18 / `simSlimBGL_` 6, putting `simPL_` at 16 of 16, which
-is legal and is only ever built in the assert configuration.
+**`fardown` is covered, and the coverage is now deliberate rather than lucky.**
+`worldgen.wgsl:fardown` reads `voxels` and runs on `farPL_` = `simSlimBGL_` +
+`farBGL_`. Because `pageTable` goes into `simSlimBGL_` at binding 5 — the *slim
+prefix*, not just the full `simBGL_` — `fardown` gets it automatically. That is
+a consequence of putting the page buffers in the slim prefix and it should be
+stated, not discovered: **any future pipeline built on `simSlimBGL_` inherits
+translation, and any built on a group 0 that is not `simBGL_`/`simSlimBGL_`/
+`renderBGL_` does not.** Those three are the complete list of group-0 layouts
+that can address `voxels`.
 
-The cost is real and must be named: **the bind-group layout now depends on a
-flag**, which is a "two things that must agree" shape. Contain it by deriving
-both the layout entry and the WGSL declaration from the same `PAGE_ASSERT` C++
-constant that generates the prelude, so there is one condition, not two. And
-run the `page-roundtrip` gate (§4.4 Gate B) in the assert configuration as its
-*normal* mode, so the assert layout is exercised on every suite run rather than
-rotting.
+#### 5.2b Slot pressure — **RESOLVED BY DAWN REMOVAL**
 
-**Either way, `simBGL_` has room for at most one more storage buffer after this
-phase.** Note it on the board and in a comment above `simBGL_`'s entry list —
-see risk 7.
+The first draft spent considerable space on `simPL_` landing at 15–16 of Dawn's
+**16 storage buffers per stage across all bind groups in one pipeline layout**
+(barrier_graph §4.10 — the limit that `simSlimBGL_` exists to work around), and
+derived a flag-conditional `pageFaults` binding to stay under it.
 
-**[JUDGMENT]** If a reviewer would rather not spend the last slot, the
-alternative is binding `pageTable` in group 1 of each layout instead — it fits
-with more room there (3 and 7 spare) at the cost of a less uniform layout and
-an extra `@group(1)` in `common.wgsl`'s accessors, which is awkward precisely
-because `common.wgsl` is shared by shaders whose group 1 differs
-(`particleBGL_` vs `farBGL_`) — the accessor would have to be declared per
-shader rather than once. **That awkwardness is decisive: keep it in group 0.**
-It is the reason the shared-accessor design in §2.1 works at all.
+**That constraint no longer exists.** Dawn is being removed entirely (user
+decision, in progress in parallel). Vulkan's
+`maxPerStageDescriptorStorageBuffers` on this hardware is **1,048,576**
+(phase 3a capability record) — the limit was always a *Dawn* limit, and the
+phase-3a record said so at the time.
+
+Consequences, recorded rather than deleted because the analysis is what
+justifies the conclusion:
+
+- `simPL_` at 16 storage buffers is fine. So is 30.
+- `pageFaults` is unconditional and permanently bound (§5.1). The
+  `PAGE_ASSERT`-conditional layout is dead.
+- **§9 Q9 (should this phase pre-emptively split `simBGL_` to leave room for
+  ROADMAP §3.1's cell masks?) is moot** — there is no ceiling to leave room
+  under. Cell masks can simply take a binding.
+- Risk 7 is closed for the same reason.
+
+One thing *not* moot: `simSlimBGL_` still exists and is still worth keeping, but
+its justification changes from "Dawn's layout limit forces it" to "the
+particle/explosion/far pipelines genuinely do not need 17 bindings". Worth a
+comment correction in `simulation.cpp:104-105`, whose current text cites the
+Dawn limit — **but that comment belongs to the Dawn-removal commit, not this
+phase.** Flag it to that agent rather than editing it here.
 
 ### 5.3 The `uses` rows
 
@@ -1275,22 +1624,10 @@ Rows that must **not** gain it: `compact`, `compactNext` (dirty flags only),
 `particleArgs1`/`Args2` (counts only), `farFill` (writes cascades from
 worldgen, reads no voxels), and every Fill/Copy row.
 
-**`A(PageFaults)` — only in the `PAGE_ASSERT` configuration, and only on rows
-that WRITE voxels**: `mutate`, `mutateCells`, `explodeApply`, `ca`,
-`particleResolve`, `worldgen`, `worldgenList`. Reading a sentinel is legal, so
-read-only rows can never fault. This makes the `.def` conditional on a build
-flag for the first time — **[JUDGMENT]** the cleanest way to express that is a
-`C_PAGE_ASSERT` condition on a *separate* set of rows rather than an `#if`
-inside a row's `USES(...)`, since a row whose condition is false is skipped
-entirely and touches no buffer state (§3.9 of the barrier graph). But
-`pageFaults` is written by the *same* dispatch, not a separate one, so that
-does not work either. The honest answer is an `#if` around the use in the
-`.def` and a matching branch in `check_pass_table.py`'s parser. **This is the
-ugliest consequence of the assert design and the reviewer may prefer to drop
-the shader-side counter entirely** and rely on hash divergence plus the
-CPU-side `pagesInUse_` invariants to catch risk 1. I keep it because "provably
-zero page faults" is a much stronger statement than "the hash happened to
-match", and risk 1 is the phase's top risk.
+**`A(PageFaults)` on every row that WRITES voxels**: `mutate`, `mutateCells`,
+`explodeApply`, `ca`, `particleResolve`, `worldgen`, `worldgenList`.
+Unconditional — no `#if`, no flag-dependent row (§5.1). Reading a sentinel is
+legal, so read-only rows can never fault and must not declare it.
 
 **Barrier consequence, and it is benign.** `pageTable` is written only by
 uploads and fills that drain at the *head* of a command buffer (§5.4), and read
@@ -1298,14 +1635,15 @@ by ~20 rows thereafter. The §3.3 tracker emits **one** TRANSFER→COMPUTE barri
 at the first reading row and **nothing** for the rest (read-after-read emits
 nothing). In the CA loop specifically it emits nothing after iteration 0, for
 the same reason `materials` and `reactions` do — and the CA's global barrier
-(form B, `SHADER_STORAGE_READ|WRITE` at `COMPUTE_SHADER`) covers `pageTable`'s
-access domain anyway.
+(form B, `SHADER_STORAGE_READ|WRITE` at `COMPUTE_SHADER`) covers both new
+buffers' access domain anyway, including `pageFaults`' atomic.
 
-**One thing the addition genuinely changes**: `ca`'s `uses` count goes from 9
-to 10. `kMaxUses = 10` (`pass_table.h:164`), and `AllUsesFit()` is a
-`static_assert` at `pass_table.cpp:154`. **`ca` lands exactly on the ceiling.**
-Raise `kMaxUses` to 12 in the same commit; do not land at exactly the limit and
-leave the next person to discover it.
+**One thing the addition genuinely changes**: `ca`'s `uses` count goes 9 → 10
+(`R(PageTable)`) → **11** (`A(PageFaults)`). `kMaxUses = 10`
+(`pass_table.h:164`) with `AllUsesFit()` a `static_assert` at
+`pass_table.cpp:154`, so **the current ceiling is exceeded and the build stops
+until it is raised.** Raise `kMaxUses` to 12 in commit 1 — not to 11, so the
+next row addition does not repeat this.
 
 ### 5.4 The new commands: fills and page-table writes
 
@@ -1364,10 +1702,36 @@ reordered after* a dispatch that reads the page. Two sub-cases:
   would produce two fills to the same range in one flush, which is precisely
   the repeat-destination case that barrier handles.
 
+**(3) `pageFaults` rides the readback ring.** Risk 1's residual mitigation folds
+the 16-byte counter into `World::EncodeReadbacks`' existing copies (alongside
+`hash`, `pick`, `particleCounts` — all the same shape). That is one more
+`CopyTracked` per readback tick and one more `pass::Buf` id in the slot layout
+(`kSlotBytes`), plus a 256-padded region. It is not a table row, for the same
+reason none of the readback copies are (phase 3c's ruling). No clear-after-copy
+is needed — unlike `support`, the counter is monotonic and a non-zero value is
+a permanent "this build has a bug" latch, which is the desired semantics.
+
 **The `--shot` far-fill loop and the streaming genList submit** both record
 command buffers outside the tick. Each opens with the §3.4 head global barrier
 and drains the pending queue, so a page fill enqueued before either of them
 lands correctly. No special case.
+
+**[REVIEW m5 — the headless harnesses.]** `--shot` and `--shot-mob` **render**,
+so they inherit C3 entirely: they need `pageTable` bound in `renderBGL_` and
+they exercise the raymarch translation path. Nothing extra is required beyond
+§5.2a — noted so the render-path fix is not scoped to "the game" and quietly
+skipped for the shot harnesses, which are exactly where a sentinel-sampling bug
+would be most visible (they photograph sky boundaries by design).
+
+`--measure` is the other headless path, and commit 0's uniformity histogram
+does a **blocking whole-buffer read of `voxels`** — the C4 shape. **Decision:
+`--measure`'s histogram runs `--residency dense` only**, and says so in a
+`printf` at the top of the measurement so a reader cannot mistake a dense
+number for a paged one. The measurement exists to *size* the pool, so it wants
+the dense ground truth anyway; making it page-aware would mean synthesizing
+sentinel chunks to count them, which is circular. The separate
+`pagesInUse_`/`pagesHighWater_` reporting (commit 5) is what covers the paged
+side.
 
 ### 5.5 `mutateCells` and the slot-index assumption
 
@@ -1403,31 +1767,56 @@ do not treat a changed copy count as a regression signal.
 
 ---
 
-## 6. Dawn oracle strategy
+## 6. The oracle strategy — **DAWN IS GONE**
 
-Dawn stays. Phase 6 is explicit that its job is to *disagree*, and it has
-already earned that twice in this port (the phase-4a material-table WAW and the
-micro-body pool fill). Removing it while landing the riskiest remaining change
-would be exactly backwards.
+**Decision (user, settled): Dawn is being removed entirely, in parallel with
+this work.** The first draft of this section assumed Dawn survived through
+phase 7 as the hash oracle (phase 6's stated plan) and built a three-way
+equality matrix on it. That plan is superseded.
 
-### 6.1 The equality matrix
+This *removes* a safety net at the moment of the port's riskiest change, so
+what replaces it has to be named precisely rather than waved at.
 
-Three configurations, one hash sequence:
+### 6.1 The equality matrix — two configurations, plus a pinned sequence
 
 | # | configuration | role |
 |---|---|---|
 | 1 | **vulkan-paged** | the new thing |
-| 2 | **vulkan-dense** | isolates *paging* from *Vulkan* |
-| 3 | **dawn-dense** | the oracle, unchanged, pinned to `7cfa2420` |
+| 2 | **vulkan-dense** | the oracle: identity map, address-identical to pre-phase code |
+| — | `tests/baseline.json` `7cfa2420` + `--vk-smoke-loud`'s 19 pinned values | the *historical* oracle, frozen in the repo |
 
-All three must produce identical hashes at every probe. The pairwise diffs are
-what make a failure attributable, and this is the whole reason for keeping
-three rather than two:
+Both configurations must produce identical hashes at every probe, and both must
+reproduce the pinned constants.
 
-- **1 ≠ 2, 2 == 3** → the bug is in paging. The common case, and the one we
-  want to be easy.
-- **1 == 2, 2 ≠ 3** → the bug is in the Vulkan backend and predates this phase.
-- **1 ≠ 2 ≠ 3** → two bugs, or a shader-prelude change that affected both.
+**What is lost, stated honestly:** the first draft's `1 == 2, 2 ≠ 3` diagnosis —
+"the bug is in the Vulkan backend and predates this phase" — is no longer
+available as a *live* experiment. Nothing can re-derive the expected hash
+independently any more.
+
+**What replaces it, and why it is adequate here:**
+
+1. **The pinned values are the oracle, and they are already Dawn-derived.**
+   `7cfa2420` and the 19 `--vk-smoke-loud` probes (`f97ba745` … `cb036bd1`)
+   were produced and cross-validated while Dawn existed. They are frozen
+   constants in the repo now. A cross-backend oracle answers "do two
+   implementations agree today"; a pinned constant answers "does this build
+   agree with the world we shipped" — which for *this* phase is the stronger
+   question, because phase 7's whole claim is that nothing changes.
+2. **`--vk-smoke-loud` is being repurposed as exactly that**: a Vulkan-only
+   pinned-hash-sequence regression gate, where the 19 known values become
+   expected constants rather than a live Dawn-vs-Vulkan comparison. This phase
+   consumes it in that form (§4.4).
+3. **The identity map is a *within-backend* oracle for the part that matters.**
+   `--residency dense` produces bit-identical *addresses* to pre-phase code
+   (§6.2), so `1 ≠ 2` still isolates paging from everything else — which is the
+   diagnosis this phase actually needs. Losing the Dawn leg costs the ability
+   to blame the Vulkan backend, not the ability to blame paging.
+
+**A note for whoever sequences these two projects:** if Dawn removal and phase 7
+land close together and a pinned hash moves, the first question is which
+project moved it. Landing commit 1 (a provable no-op) *before* Dawn removal
+completes would settle that cheaply — but this is a scheduling preference, not
+a dependency, and the pinned constants make it recoverable either way.
 
 ### 6.2 The mechanism for the paged/dense switch
 
@@ -1476,10 +1865,12 @@ pre-materialization loop, not a second implementation of anything. Compare to
 `--barriers=sledgehammer`, which phase 3b kept for exactly this reason and which
 has since been used as an A/B oracle repeatedly.
 
-**Dawn's removal**, per phase 6, is unblocked once phase 7's checkpoints are
-green — but it is a *separate cleanup commit*, and I would sequence it after
-the phase-7 measurements are recorded, so that the phase's evidence was
-produced with the oracle still present.
+**With Dawn gone, `--residency dense` is no longer merely convenient — it is
+the only live oracle the engine has.** That raises its status from "developer
+flag worth keeping" to "load-bearing test infrastructure", and it means the
+dense path must stay exercised: **every gate runs in both residency modes** in
+the suite (§8 commit 5), not just the page gate. A dense mode that quietly
+stops working would remove the phase's only differential test.
 
 ---
 
@@ -1492,8 +1883,8 @@ Ranked by (probability × cost of a late discovery).
 **Why dangerous.** It is the determinism nightmare in its purest form. The
 write either lands nowhere (a lost voxel) or, in a naive implementation, lands
 in *another chunk's* memory (a corrupted bystander). Either way the world hash
-diverges at a tick and a location with no causal relationship to the bug, and
-under Dawn-dense it cannot reproduce at all.
+diverges at a tick and a location with no causal relationship to the bug — and
+with Dawn gone there is no second implementation to reproduce it against.
 
 **How neutralized — structurally, not by care.**
 
@@ -1504,8 +1895,8 @@ under Dawn-dense it cannot reproduce at all.
 2. **`PT_NO_WORD` is not a valid index**, so even a hypothetical unguarded
    `voxels[PT_NO_WORD]` is an out-of-bounds access that WGSL clamps, rather
    than a plausible-looking in-range address.
-3. **`SANDVOX_PAGE_ASSERT` counts every occurrence** into a `pageFaults`
-   atomic, converting "impossible" into "measured zero".
+3. **`pageFaults` counts every occurrence**, unconditionally and on every run,
+   converting "impossible" into "measured zero".
 4. **§3's materialization set is a proven superset**, with the corner-chunk
    correction (26-neighbourhood, not 6) and the incremental CPU mirror that
    never under-approximates.
@@ -1516,10 +1907,13 @@ assert enabled in a dedicated CI-style invocation. And the loud scenario's
 paged-vs-dense hash equality is the end-to-end detector: a lost voxel moves the
 hash.
 
-**Residual.** The assert is off in production, so a page fault in a scenario no
-gate covers is silent until it moves a hash. Mitigation: leave the assert
-cheaply enableable (a prelude define, no rebuild) and name it in the
-troubleshooting section of CLAUDE.md.
+**Residual — much smaller than the first draft's.** The counter is always live,
+so a page fault is *recorded* even in a scenario no gate covers; what remains
+is only that nothing in the game loop *reads* it every frame. Mitigation: the
+readback ring already carries a slot's worth of small counters, so fold
+`pageFaults` into the existing snapshot copy and log once if it is ever
+non-zero. Cheap, and it makes the detector work in ordinary play rather than
+only under test.
 
 ### Risk 2 — the one-tick-late dirty knowledge is insufficient
 
@@ -1572,24 +1966,33 @@ be promoted to a uniform sentinel and every cell's state nibble would silently
 change. **Promotion is by whole-word equality, and the test above is what
 proves it.**
 
-### Risk 4 — pool exhaustion mid-tick
+### Risk 4 — pool exhaustion — the risk changes SHAPE under the fatal policy
 
-**Why dangerous.** Any behaviour change on exhaustion that alters voxel state
-is hash-relevant. A non-deterministic exhaustion order (e.g. "whichever
-allocation happened to be last") makes two machines diverge under load.
+**Why dangerous, restated.** Under §3.8's settled policy exhaustion is a
+**fatal error**, so the risk is no longer "the world diverges under load" — it
+is "**the game crashes**". That is a better failure (loud, immediate,
+attributable) but a more consequential one, and it moves the entire weight of
+this risk onto **pool sizing** and onto the materialization set staying tight.
 
-**How neutralized.** §3.8: a fixed three-tier priority by provenance, ascending
-slot index within a tier — a pure function of the tick's inputs. The clamp
-lands on the over-approximation ring, where refusal is *free* by construction.
-Tiers 1–2 exhausting is a logged hard error that fails the selftest, not a
-silent fallback. Pool sized at 1.65× the measured steady state, with
-`pagesHighWater_` reported.
+**How neutralized.**
 
-**What test.** A gate that sets `kPoolPages` artificially low (a runtime knob
-alongside `--residency`) and asserts: (a) the refusal order is identical across
-two runs, (b) the log line fires, (c) `pageFaults` accounts for exactly the
-refused-ring writes. Plus `--measure` reporting the high-water mark on the loud
-scenario, so the margin is a number rather than a hope.
+1. **The `∩ nonSentinel` rule (§3.2a / M2) is what keeps the abort
+   unreachable.** Without it a daylight wake-all demands 32,768 pages from an
+   8,192-page pool and crashes twice per in-game day. With it, a wake-all
+   demands the non-empty set plus a ring — the same order as steady state.
+2. **`kPoolPages = 8192` is 1.65× the measured steady state** (§3.7), and
+   `pagesHighWater_` is reported on every `--measure` run so the margin is a
+   tracked number rather than an assumption.
+3. **Over-approximation is bounded per tick** (a 1-ring per missed snapshot,
+   §3.2), so the materialization set cannot drift upward without bound.
+
+**What test.** Three, and they are the phase's real safety net now:
+(a) the **daylight-boundary gate** (§3.2a / Gate D) asserting
+`pagesInUse_ < kPoolPages` throughout — the worst realistic spike;
+(b) a **deliberate low-`kPoolPages` run** asserting the abort fires cleanly
+with the right message, i.e. testing that the failure mode *works*, since it is
+now the only one; (c) `pagesHighWater_` on the loud scenario and on
+`--measure`, so the margin is measured rather than hoped for.
 
 ### Risk 5 — freeing a page that an in-flight readback still refers to
 
@@ -1655,25 +2058,39 @@ zero page frees over the last 50 ticks of the settle**. That is the direct
 statement of "costs nothing when idle" for this subsystem, and it is the
 assertion that would catch a demotion policy that never converges.
 
-### Risk 7 — the Dawn storage-buffer layout limit (COUNTED: it fits, barely)
+### Risk 7 — the Dawn storage-buffer layout limit — **CLOSED (Dawn removed)**
 
-**Why dangerous.** A blocked Dawn build removes the oracle at the exact moment
-it is most needed.
+**Why it was dangerous.** A blocked Dawn build would have removed the hash
+oracle at the moment it was most needed. `simBGL_` at 14 storage buffers plus
+two new ones lands at 16 — exactly Dawn's per-stage layout ceiling.
 
-**Status: measured, not a risk to this phase.** §5.2 counts all three pipeline
-layouts: `simPL_` goes 14 → **15** of Dawn's 16, `simPL2_` 12 → 13, `farPL_`
-8 → 9. It fits.
+**Status: moot.** Dawn is being removed entirely (§6). Vulkan reports
+`maxPerStageDescriptorStorageBuffers` = **1,048,576** (phase 3a) — the ceiling
+was always a Dawn limit, as the phase-3a record noted at the time. The analysis
+is retained in §5.2b rather than deleted, because it is what justifies calling
+this closed rather than merely unlikely.
 
-**The residual risk is for the phase AFTER this one.** `simBGL_` will have
-exactly **one** free storage slot left, and the next feature that wants a group-0
-sim buffer — cell-level active masks (ROADMAP §3.1) is the obvious candidate,
-and it wants a per-chunk bitmask buffer — takes the last one. After that, Dawn
-cannot bind the layout and the oracle dies, or `simSlimBGL_`-style splitting has
-to be repeated. Say so in a comment above `simBGL_` and in the ROADMAP §3.1
-entry, so it is discovered at design time rather than at link time.
+**Consequence for the risk that replaces it:** with no cross-implementation
+oracle, `--residency dense` is the only live differential test the phase has
+(§6.3), so the real risk moves to "dense mode silently rots". That is why every
+gate runs in both residency modes rather than just the page gate.
 
-**What test.** The Dawn build itself, at commit 1 of §8 — the earliest possible
-discovery point, which is one of the reasons translation lands before sentinels.
+### Risk 7b — no cross-implementation oracle for the CA rewrite
+
+**Why dangerous.** Commit 1 rewrites every voxel access in every sim *and*
+render shader. Previously such a change was checked by two independent
+implementations agreeing; now it is checked against pinned constants only.
+
+**How neutralized.** The identity map (§6.2) makes commit 1 address-identical
+to pre-phase code, so the pinned `7cfa2420` and the 19 `--vk-smoke-loud` values
+are a *complete* check of it — they were produced by the code being replaced,
+and any arithmetic error moves them. This is precisely why commit 1 is
+structured as a provable no-op rather than landing translation and sentinels
+together.
+
+**What test.** Commit 1's gate, which is the strongest checkpoint in the plan
+and the one not to weaken: *every* pinned value, unchanged, plus
+`check_pass_table.py` and `check_invariants.py` silent.
 
 ### Risk 8 — translation cost on the CA hot path
 
@@ -1698,10 +2115,13 @@ Ordered commits, each independently verifiable, each ending green. The
 sequencing principle: **land the translation machinery while it is provably a
 no-op, so that when sentinels arrive the only new variable is sentinels.**
 
-Every checkpoint = `bash scripts/build.sh --selftest` green (pond-freeze and
-mob known-failing) **on both backends**, with the actual output in the commit
-message. Board discipline per CLAUDE.md: `claim` before editing, `done` with
-what landed, `note` for the cross-cutting constants.
+Every checkpoint = `bash scripts/build.sh --selftest` green (known failures
+carried), with the actual output in the commit message. From commit 2 onward
+that means **both residency modes** — dense is the oracle now (§6.3). Board
+discipline per CLAUDE.md: `claim` before editing, `done` with what landed,
+`note` for the cross-cutting constants — and in particular **coordinate with the
+Dawn-removal agent**, which is touching `vk_smoke.cpp` and `simulation.cpp`
+concurrently.
 
 ---
 
@@ -1728,132 +2148,169 @@ chunk-base resolve. **The table is initialized to the identity map
 *This is the largest commit and it is deliberately the one with no semantic
 content.* Every address computed is bit-identical to today's (§6.2).
 
-*Gate: full suite green on both backends; `determinism` reports `7cfa2420`;
-`--vk-smoke-loud` 19/19 MATCH with hashes byte-identical to the phase-3c
-record; `check_pass_table.py` OK; `check_invariants.py` OK; zero validation
-messages.* Any hash movement here is a translation bug and must be fixed, not
-absorbed.
+*Gate: full suite green; `determinism` reports `7cfa2420`; `--vk-smoke-loud`
+19/19 against the pinned constants; `check_pass_table.py` OK;
+`check_invariants.py` OK; zero validation messages.* Any hash movement here is
+a translation bug and must be fixed, not absorbed.
 *Also: `--measure` on all three scenarios, to isolate risk 8's cost before
 sentinels muddy it.*
 
----
+**Commit 1's explicit checklist** (the items most likely to be skipped):
 
-**Commit 2 — `EMPTY` sentinels, read-only, for provably-never-written chunks.**
-`--residency dense|paged` flag. In `paged` mode, a chunk is `PT_EMPTY` **only**
-if it was all-air at worldgen and has never been in any materialization set —
-which at this commit means: worldgen classifies, and *nothing ever demotes or
-materializes*. Any chunk that would need a write is materialized permanently at
-worldgen and never freed. `SANDVOX_PAGE_ASSERT` + `pageFaults` land here, and
-the gate runs with them on.
-
-This is the smallest possible step that makes a sentinel real: it exercises the
-read path, the analytic hash branch (§4.1), and the assert, with **no lifecycle
-at all**. The pool is still effectively dense in the worst case, so exhaustion
-cannot happen.
-
-*Gate: suite green in both residency modes; paged-vs-dense-vs-Dawn hash
-equality on the loud scenario; `pageFaults == 0`.*
-
----
-
-**Commit 3 — materialization.**
-`cpuDirty` (§3.2), the CPU-op target sets (§3.3), the particle set (§3.4), the
-free-list allocator, queued page fills through the pending-upload queue (§5.4),
-worldgen batching (§3.5c), and the streaming/`LoadWorld` classification
-(§3.5d,e). Exhaustion policy (§3.8) with the logged hard error. **No
-deallocation yet** — pages are allocated and never freed, so `pagesInUse_` is
-monotonic and the pool must hold the union of everything ever touched.
-
-Splitting allocation from deallocation is what makes each half debuggable: at
-this commit a hash divergence is definitively an *under*-materialization
-(risk 1/2), because nothing has been taken away.
-
-*Gate: suite green both modes; loud-scenario equality including the new
-sky-boundary explosion; the ring-starvation test (risk 2) passes; `pageFaults
-== 0`; `pagesHighWater_` reported.*
+- [ ] **Render shaders too** (§5.2a, C3): `raymarch.wgsl`'s 17 raw reads;
+      `pageTable` in `renderBGL_` binding 9.
+- [ ] **The CPU seam** (§2.1a, C4): `World::PageOffsetOfSlot` and all five
+      sites — mirror, chunk-fetch, eviction, store-hit refill, selftest dumps.
+      At the identity map every one is a no-op, which is exactly why they can
+      be converted here and proven harmless.
+- [ ] **Two bases in `sim_occupancy:main`** (§4.1, M3): load from the page,
+      hash on the slot. Equal under the identity map — introduce the split
+      while it cannot differ.
+- [ ] `kMaxUses` 10 → 12 (`ca` goes to 11 uses).
+- [ ] Stale comments: `world.h:29-30` (`kNChunk`/`kNumChunks`) and
+      `vulkan_pass_map.md §3a`.
+- [ ] `--measure` runs dense-only or iterates the table (m5) — decide and say
+      so in the code.
 
 ---
 
-**Commit 4 — deallocation with hysteresis.**
+**Commit 2 — `EMPTY` sentinels + materialization, together.**
+
+**[REVIEW M4 — FIXED, by merging what were commits 2 and 3.]** The first draft
+made commit 2 "sentinels exist, no materialization machinery", claiming the
+pool stayed effectively dense so exhaustion could not happen. **That commit was
+not independently green**: the moment a sentinel exists, any gate that paints
+into sky (the brush gates, `player-plants`, the spell gate) writes into a chunk
+with no page, `voxStore` no-ops it, and matter is lost — a red suite, not a
+checkpoint. There is no coherent halfway state where sentinels exist and
+nothing can create a page, because *the gates create pages*.
+
+The reviewer's alternative (b) — mark `EMPTY` only for chunks that are all-air
+**and** have no non-air chunk in their 26-neighbourhood **and** are outside
+CPU-op reach — would be independently green, but it is a throwaway predicate
+that exists for one commit and is then deleted, and it duplicates the
+materialization rule it is standing in for. **Merging is the better trade.**
+
+So this commit lands: `--residency dense|paged`; worldgen classification into
+`PT_EMPTY`; `cpuDirty` (§3.2) with the intersection-tightening rule;
+`EncodeWakeAll` setting the mirror (§3.2a); the `∩ nonSentinel` materialization
+rule (§3.2a / M2); CPU-op target sets (§3.3); the particle set (§3.4) unioned
+into `cpuDirty`; the free-list allocator; queued page fills (§5.4); worldgen
+batching (§3.5c); streaming/`LoadWorld` classification (§3.5d,e); the fatal
+exhaustion check (§3.8). **No deallocation** — pages are allocated and never
+freed, so `pagesInUse_` is monotonic and a hash divergence is definitively an
+*under*-materialization (risk 1/2) rather than a premature free.
+
+*Gate: suite green in both residency modes; paged == dense on the loud
+scenario including the new sky-boundary explosion; both == the pinned
+constants; the ring-starvation test (risk 2); the daylight-boundary test
+(§3.2a / C2) — which at this commit is the one that proves the wake-all does
+not exhaust the pool; `pageFaults == 0`; `pagesHighWater_` reported.*
+
+---
+
+**Commit 3 — deallocation with hysteresis.**
 The consecutive-zero counter in the snapshot callback, the `!cpuDirty`
 conjunct, `kPageFreeTicks`, the serial-stamped retire queue (risk 5), and the
-eviction fast path for sentinel slots (§4.2). If commit 0 said UNIFORM is
-worth it, streaming/load-path demotion lands here too.
+eviction fast path for sentinel slots (§4.2 — mandatory per C4, not optional).
+If commit 0 said UNIFORM is worth it, streaming/load-path demotion lands here.
 
-*Gate: suite green both modes; the extended `sleep` gate asserting zero fills
-and zero frees over the last 50 settled ticks (risk 6); the outstanding-eviction
-streaming test (risk 5); loud-scenario equality.*
-
----
-
-**Commit 5 — the gates.**
-`page-roundtrip` in `selftest_sim.cpp` + `kOrder` (all 7 steps, §4.4 Gate B);
-the pool-exhaustion determinism test (risk 4); the ring-starvation test
-promoted from a manual run to a gate; `--vk-smoke-loud` gaining the residency
-axis and the labelled `CompareAndReport`.
-
-*Gate: 24 gates green on both backends, both residency modes.*
+*Gate: suite green both modes; the extended `sleep` gate asserting zero page
+fills and zero frees over the last 50 settled ticks (risk 6); the
+outstanding-eviction streaming test (risk 5); loud-scenario equality; the
+daylight gate re-run to confirm deallocation resumes after a wake-all
+(§3.2a fix 3).*
 
 ---
 
-**Commit 6 — measurement, docs, and the acceptance record.**
+**Commit 4 — the gates.**
+`page-roundtrip` in `selftest_sim.cpp` + `kOrder` (all 8 steps, §4.4 Gate B);
+the daylight-boundary gate (Gate D) promoted from a manual run; the
+low-`kPoolPages` abort test (§3.8); the ring-starvation test promoted to a
+gate; `--vk-smoke-loud` gaining the residency axis (coordinate with the
+Dawn-removal agent, §4.4); **the per-gate residency decision list** (§2.1a):
+which gates run dense-only because they dump raw voxels, and which run both.
+
+*Gate: 25 gates green, both residency modes.*
+
+---
+
+**Commit 5 — measurement, docs, and the acceptance record.**
 `--measure` reports `pagesInUse_`, `pagesHighWater_`, the pool reservation, and
 the sentinel-kind histogram. `PLAN_vulkan_port.md` phase 7 gains its
-`[AS BUILT]` block. `DESIGN.md` gains the page table in §3 (it is a residency
-mechanism, which §3 owns) plus §14's note that pool exhaustion voids the
-determinism guarantee (§3.8). This document gains the measured numbers.
-`docs/vulkan_barrier_graph.md` gains a §2.4 note for the queued page fills.
+`[AS BUILT]` block. `DESIGN.md` gains the page table in §3 (a residency
+mechanism, which §3 owns) plus a §14 note that **pool exhaustion is a fatal
+error** (§3.8 — not a caveat on rule 1). This document gains the measured
+numbers. `docs/vulkan_barrier_graph.md` gains a §2.4 note for the queued page
+fills, and a `pass_table.def` comment records the two new buffers.
 
 ### Final acceptance
 
 | criterion | target |
 |---|---|
-| paged vs dense vs Dawn, loud scenario | **19+/19+ MATCH**, all three, including the sky-boundary probe |
-| `determinism` gate, both backends, both modes | `7cfa2420` over 200 ticks |
-| full suite | 24 gates, exit 0, both backends, pond-freeze + mob known-failing with **character-identical** detail strings |
+| paged vs dense, loud scenario | **19+/19+ MATCH**, including the sky-boundary probe |
+| both modes vs the pinned constants | `f97ba745` … `cb036bd1`, unchanged |
+| `determinism` gate, both modes | `7cfa2420` over 200 ticks |
+| full suite | 25 gates, exit 0, both residency modes, known failures with **character-identical** detail strings |
+| daylight-boundary gate | passes with `dayNight.freeze` OFF; `pagesInUse_ < kPoolPages` throughout |
 | sync validation | **0 messages** |
-| `pageFaults` | **0** across the suite with the assert on |
+| `pageFaults` | **0** across the suite |
 | resident memory, settled | `pagesInUse_ × 16 KiB` reported against **77.7 MiB** measured / **86.9 MiB** estimated; pool reservation reported separately (§3.7) |
 | settled tick | reported against **229–236 µs**; a regression beyond ~5% is a finding, not a footnote |
 | `check_pass_table.py`, `check_invariants.py` | silent |
 
 ---
 
-## 9. Open questions for the reviewer
+## 9. Open questions
 
-Marked **[JUDGMENT]** in place; collected here so none is missed.
+### Closed by user decision
+
+- **Q4 — exhaustion policy. CLOSED: fatal error, all modes.** Not a documented
+  hole in rule 1, not tiered refusal. If the pool can exhaust in normal play it
+  is mis-sized. §3.8 rewritten; the three-tier priority scheme is deleted.
+- **Q8 — the `pageFaults` counter. CLOSED: keep, unconditional.** Permanently
+  bound in `simSlimBGL_`/`simBGL_`, no `PAGE_ASSERT` prelude flag, no
+  conditional `USES(...)`. The increment lives on a branch never taken in a
+  correct build. One layout, one `.def`. §5.1/§5.3 rewritten.
+- **Q9 — `simBGL_` slot pressure. MOOT: Dawn removed.** The 16-storage-buffer
+  ceiling was a Dawn limit; Vulkan reports 1,048,576. §5.2b records the
+  analysis and marks it resolved. Risk 7 closed on the same grounds.
+- **Q6 — `--residency dense` as a permanent mode. CLOSED: yes, and it is now
+  load-bearing rather than convenient** — with Dawn gone it is the only live
+  differential oracle, so every gate runs in both modes (§6.3).
+
+### Still open
 
 1. **§3.5c, worldgen's dense transient.** I recommend batching (16 submits of
    2,048 slots) over a dense-for-one-submit peak, because the latter forfeits
-   the saving exactly at startup and becomes impossible at a grown window. Is
-   the batching complexity worth it at 512³, or is a 512 MiB startup transient
-   acceptable for now?
-2. **§3.6, UNIFORM scope.** I defer tick-path uniformity discovery pending
-   commit 0's measurement, and implement UNIFORM only where the CPU already has
-   the words. If the reviewer believes the 2,338 full chunks are mostly
-   single-word, that flips.
-3. **§3.7, `kPoolPages = 8192` (128 MiB, 1.65×).** Sized against one seed's
-   measurement. Too tight, too loose?
-4. **§3.8, exhaustion voids the determinism guarantee.** I chose a loud,
-   documented hole over a quiet fallback. This is a rule-1 amendment and needs
-   an explicit yes.
-5. **§3.4(ii), deriving the particle dilation radius from
-   `TUNE_PART_MAX_VEL` at load.** Correct, but it makes a *tuning* value
-   load-bearing for *memory correctness*, which is a new kind of coupling in
-   this codebase. Better alternative?
-6. **§6.3, `--residency dense` as a permanent developer flag.** Cheap and
-   useful, or a second path that will rot?
-7. **§2.3's translation cost (risk 8).** Unmeasured. If commit 1 shows the CA
-   materially slower, is the workgroup-uniform hoist sufficient, or does that
-   change the phase's cost/benefit?
-8. **§5.2/§5.3, the `pageFaults` counter.** It is the only thing that turns
-   "a sentinel write is structurally impossible" into a measured zero, and
-   risk 1 is the top risk — but it costs a flag-dependent bind-group layout and
-   the first conditional `USES(...)` in `pass_table.def`, both of which are
-   shapes this repo has a checker to prevent. Keep it, or rely on hash
-   divergence alone? **This is the question I am least confident about.**
-9. **§5.2, `simBGL_` at 15 of 16.** After this phase there is one storage slot
-   left, and ROADMAP §3.1's cell-level active masks want it. Should this phase
-   pre-emptively split `simBGL_` (the way `simSlimBGL_` was split) so the next
-   feature is not the one that discovers the ceiling — or is that speculative
-   generality that should wait for the feature that needs it?
+   the saving exactly at startup and becomes impossible at a grown window.
+   **Now sharper under the fatal-exhaustion policy: a dense transient at
+   worldgen means `kPoolPages` must be ≥ 32,768 or startup aborts.** That
+   arguably settles it — batching is not a nicety, it is what lets the pool be
+   smaller than dense at all. Confirm.
+2. **§3.6, UNIFORM scope.** Tick-path uniformity discovery deferred pending
+   commit 0's measurement; UNIFORM implemented only where the CPU already has
+   the words. If the 2,338 full chunks turn out mostly single-word, that flips.
+3. **§3.7, `kPoolPages = 8192` (128 MiB, 1.65×).** Sized against one seed. Under
+   the fatal-abort policy this number is now safety-critical rather than
+   advisory: too tight is a crash, too loose is wasted VRAM. The
+   daylight-boundary and low-pool gates probe it, but the honest answer needs
+   commit 5's high-water measurements across real scenarios.
+4. **§3.4, deriving the particle dilation radius from `TUNE_PART_MAX_VEL` at
+   load.** It makes a *tuning* value load-bearing for *memory correctness* — a
+   new kind of coupling here, and hot-reloadable (F5), so the radius must be
+   recomputed on reload. Better alternative?
+5. **§2.3's translation cost (risk 8).** Unmeasured. If commit 1 shows the CA
+   materially slower, is the workgroup-uniform hoist sufficient?
+6. **NEW — §3.2's `C(j)` retention ring.** The corrected recurrence needs the
+   per-tick CPU-op sets kept for `M−S−1` ticks to roll a snapshot forward. That
+   is a small bounded ring, but it is new state with a new failure mode (a ring
+   too short to cover an unusually stale snapshot). My proposal: size it to the
+   readback ring depth × max ticks/frame = 3 × 4 = 12, and **skip the tightening
+   entirely** when the snapshot is older than the ring can cover — never tighten
+   with an incomplete superset. Confirm that degradation is acceptable.
+7. **NEW — §3.2a, the wake-all deallocation stall.** After a daylight boundary
+   `cpuDirty` is all-ones, so *no* page is eligible to be freed until it
+   shrinks. Bounded (the next snapshot collapses it) but it is a real resident
+   spike at dawn and dusk. Acceptable, or should the free condition use a
+   different dirtiness test that a wake-all does not saturate?
