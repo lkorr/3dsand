@@ -77,6 +77,9 @@ struct RecordCtx {
   uint32_t farCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
+  // False under --residency paged: worldgen's whole-world dispatch is
+  // replaced by batched worldgenList submits (PLAN_page_table.md §3.5c).
+  bool denseWorldgen = true;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one
@@ -245,6 +248,13 @@ class Recorder {
   // most likely to be dismissed as "just two copies"; routing the fill through
   // the tracker is what makes the WAR fall out instead of being remembered.
   void FillTracked(pass::Buf id, Buffer* dst);
+  // Ranged fill with a 32-bit pattern (page materialization, §5.4). Same
+  // tracker path as the whole-buffer form; only the vkCmdFillBuffer arguments
+  // differ. The tracker is range-agnostic, which is CONSERVATIVE and correct:
+  // it treats a ranged fill as touching the whole buffer, so a barrier is
+  // emitted where a finer tracker might elide one. Never the other way round.
+  void FillTrackedRange(pass::Buf id, Buffer* dst, uint64_t offset,
+                        uint64_t size, uint32_t pattern);
 
   // ---- the render domain (phase 4b, barrier_graph §2.6/§3.2) ---------------
   //

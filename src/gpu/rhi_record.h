@@ -35,6 +35,8 @@ struct TableCtx {
   uint32_t farCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
+  // False under --residency paged (PLAN_page_table.md §3.5c).
+  bool denseWorldgen = true;
 };
 
 // The live resources a table row resolves against, as SEAM handles. The

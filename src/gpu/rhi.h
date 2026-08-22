@@ -375,6 +375,15 @@ class CommandEncoder {
                    const Buffer& dst, uint64_t dstOffset, uint64_t size) const;
   // vkCmdFillBuffer(0) / ClearBuffer over a tracked table buffer (whole buffer).
   void FillTracked(pass::Buf id, const Buffer& b) const;
+  // Ranged variant with a 32-bit pattern, for page-table materialization
+  // (docs/PLAN_page_table.md §5.4 (2)): the destination offset is chosen at
+  // RUNTIME from the allocator, so it cannot be a table row — a pass::Row
+  // encodes offsets as literal constants. Same tracker path, so the
+  // TRANSFER->COMPUTE hazard against the first row with RW(Voxels) is derived
+  // rather than hand-placed, and a page freed and immediately reallocated in
+  // one flush gets the intra-flush WAW barrier for free.
+  void FillTracked(pass::Buf id, const Buffer& b, uint64_t offset,
+                   uint64_t size, uint32_t pattern) const;
 
   void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                            const Extent3D& extent) const;

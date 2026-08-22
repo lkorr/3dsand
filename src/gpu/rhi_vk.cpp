@@ -228,6 +228,10 @@ struct VkrEncoder final : CommandEncoderImpl {
   void FillTracked(pass::Buf id, const Buffer& b) override {
     rec->FillTracked(id, NB(b));
   }
+  void FillTrackedRange(pass::Buf id, const Buffer& b, uint64_t offset,
+                        uint64_t size, uint32_t pattern) override {
+    rec->FillTrackedRange(id, NB(b), offset, size, pattern);
+  }
   void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                            const Extent3D& extent) override {
     vk::Image* im = src.texture

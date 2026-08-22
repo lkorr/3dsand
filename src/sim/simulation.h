@@ -43,7 +43,7 @@ class Simulation {
   // Render-only; nothing here can reach a world cell or the hash.
   void SetArtPalette(const rhi::Queue& queue, const std::vector<uint32_t>& rgb);
 
-  void EncodeWorldgen(const rhi::CommandEncoder& enc);
+  void EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen = true);
   // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
   // world.genList (and whose count + window origin are in tickUBO).
   void EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count);

@@ -192,6 +192,7 @@ struct RunResult {
 // comparison is the same function called twice with a different residency
 // mode, which is why it still returns a whole RunResult rather than a verdict.
 bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
+                 bool paged,
                  const std::vector<MaterialDef>& mats,
                  const std::vector<ReactionGpu>& reactions, const std::string& assetDir,
                  RunResult& out) {
@@ -202,6 +203,9 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
     return false;
   }
   World world;
+  // The residency axis (§4.4 Gate A): one driver, two configurations. Both must
+  // produce identical hashes at every probe AND reproduce the pinned constants.
+  world.residency = paged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
   Simulation sim;
   MicroSet micro;
@@ -360,10 +364,12 @@ bool LoadSmokeAssets(std::vector<MaterialDef>& mats, std::vector<ReactionGpu>& r
   return true;
 }
 
-int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
+int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
+             bool paged) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const char* name = loud ? "--vk-smoke-loud" : "--vk-smoke";
-  std::printf("=== sandvox %s (Vulkan, pinned hash sequence) ===\n", name);
+  std::printf("=== sandvox %s (Vulkan, pinned hash sequence, residency %s) ===\n",
+              name, paged ? "paged" : "dense");
   std::printf("mode: barriers=%s validation=%s adapter=%s seed=%u ticks=%u\n",
               sledgehammer ? "sledgehammer" : "precise", validation ? "ON" : "off",
               lowPower ? "low" : "default", kDefaultSeed,
@@ -384,8 +390,8 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
   }
 
   RunResult run;
-  if (!RunScenario(loud, lowPower, sledgehammer, validation, mats, reactions, assetDir,
-                   run)) {
+  if (!RunScenario(loud, lowPower, sledgehammer, validation, paged, mats, reactions,
+                   assetDir, run)) {
     std::printf("\n=== %s FAIL ===\n", name);
     return 1;
   }
@@ -406,12 +412,12 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
 
 }  // namespace
 
-int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation) {
-  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation);
+int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation, bool paged) {
+  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation, paged);
 }
 
-int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation) {
-  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation);
+int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation, bool paged) {
+  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation, paged);
 }
 
 }  // namespace sandvox

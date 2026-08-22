@@ -1475,6 +1475,43 @@ explicit item, and it is a good argument for landing commit 1 as the identity
 map: under `pageTable[i] == i` the two bases are equal, so the split can be
 introduced and proven hash-neutral before it can possibly differ.
 
+#### 4.1a The two-base rule is NOT only about the hash — [AS BUILT, commit 1]
+
+**[FOUND IN IMPLEMENTATION. The mechanism above is right; its scope was too
+narrow, which is this document's documented failure mode — a missing
+contributor, not a wrong rule.]**
+
+M3 states the rule for the world hash: *the load follows the page; the key
+keys on the slot.* Implementing commit 1 turned up **five more sites with the
+same shape and none of them a hash**, every one of which would make a paged run
+diverge from a dense one while staying perfectly self-consistent:
+
+| site | what the index keys | what breaks under a page index |
+|---|---|---|
+| `sim_step:main` | `hash3(T.seed, tick*2+substep, idx)` — the per-cell RNG for every reaction, stain and movement roll | every cell's random stream becomes a function of allocation history |
+| `sim_step:doStaining` | `hash3(rnd, 0x51A17u, ni)` — the stain-consumption roll | same, per neighbour |
+| `sim_explode:apply` | `hash3(T.seed^0xB0011u, tick, idx)` — ejecta velocity/jitter | same, per destroyed cell |
+| `sim_explode:apply` | `hash3(rnd, 0x6217u, idx)` — the micro-grit roll | same |
+| `sim_mutate:main` | `hash3(T.seed^0x5EEDu, tick, idx)` — the palette-variant roll | a brush paints different state nibbles depending on which page it landed in |
+| `sim_particle:resolve` | `claimSlot(tgt)` — the reinsertion claim lattice | two particles targeting one world cell could hash to different claim slots after a reallocation and **both win** |
+
+**The generalized rule, which is what §4.1 should have said from the start:**
+
+> **A voxel index used as an IDENTITY — an RNG key, a hash key, a claim-lattice
+> key, anything whose value must be a property of *where a cell is in the
+> world* — must be the SLOT index. Only a memory address may be the PAGE
+> index.** The two are equal under the identity map, which is exactly why the
+> split is introduced in commit 1 and provable there.
+
+As built, each site carries both: a `slotIdx` / `tgtSlot` from `cellIndexW` for
+keying, and an `idx` from `voxWordIndex` for addressing. The comment at each
+site says which is which and why.
+
+**Standing obligation, in the same register as §2.1's:** a kernel that derives
+a value from a voxel index must say whether that value is an address or an
+identity. `voxWordIndex` returns an address; `cellIndexW` returns an identity.
+Nothing else may be used for either.
+
 The same split applies to `mainDirty` (`sim_occupancy.wgsl:35`,
 `base = dirtyList[wg.x] * CHUNK_VOL`) — but `mainDirty` computes no hash, so it
 needs only the load base. Stated so nobody "fixes" it symmetrically.

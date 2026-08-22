@@ -4,6 +4,7 @@
 #include <cstdio>
 
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
@@ -573,6 +574,9 @@ struct RecordCtx {
   uint32_t farCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
+  // False under --residency paged: worldgen's whole-world dispatch is replaced
+  // by batched worldgenList submits (PLAN_page_table.md §3.5c).
+  bool denseWorldgen = true;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -688,6 +692,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.farCount = cx.farCount;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
+  tc.denseWorldgen = cx.denseWorldgen;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -706,9 +711,13 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
 }
 
-void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc) {
+void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   page_ = 0;
   RecordCtx cx{};
+  // Under --residency paged the caller runs worldgen BATCHED through
+  // worldgenList instead (§3.5c) and passes false, which suppresses only the
+  // whole-world dispatch — the fill rows still clear the transient buffers.
+  cx.denseWorldgen = denseGen;
   RecordTable(enc, pass::Table::Worldgen, &cx);
 }
 
@@ -737,11 +746,33 @@ void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
 
 void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
-  // flag per chunk; 4096 chunks = 16 KB, far inside the ~1 MB/tick CPU->GPU
+  // flag per chunk; 32768 chunks = 128 KB, far inside the ~1 MB/tick CPU->GPU
   // budget, and only written on a phase boundary.
   static const std::vector<uint32_t> ones(kNumChunks, 1u);
   queue.WriteBuffer(world_->dirty[page_], 0, ones.data(),
                     ones.size() * sizeof(uint32_t));
+
+  // THE WAKE IS A DIRTY-SET MUTATION, so it mutates the CPU mirror of the
+  // dirty set in the SAME CALL (PLAN_page_table.md §3.2a fix 1). Two
+  // operations that must agree is the shape this repo has a checker for; one
+  // operation cannot disagree with itself.
+  //
+  // Why this was the most dangerous hole in the design: without it, every
+  // chunk in the window becomes dirtyIn next tick and may write, while
+  // cpuDirty is near-empty because the world was settled — SILENT VOXEL LOSS
+  // AT EVERY DAWN AND EVERY DUSK. And no gate would catch it: the suite pins
+  // the day phase in both directions (selftest_sim.cpp freezes at midnight and
+  // at noon), so wasDay != isDay is never true and this function is never
+  // called. Gate D exists precisely because of that.
+  //
+  // Unioned at step (3) of the normative definitions — strictly AFTER the
+  // tightening — so the 32,768 chunks survive regardless of when a snapshot
+  // happened to land. What stops this demanding 32,768 PAGES from an
+  // 8,192-page pool (a guaranteed abort twice per in-game day, under §3.8) is
+  // the `n nonSentinel` filter on the bracketed half of the materialization
+  // set: a dirty EMPTY chunk holds no matter, so nothing in it can move, and
+  // the only way it can receive matter is from a neighbour that has some.
+  if (world_->pages) world_->pages->WakeAll();
 }
 
 void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,

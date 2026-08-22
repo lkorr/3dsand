@@ -92,6 +92,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::Hash:      return cx.hashEnable;
     case pass::Cond::DirtyTick: return !cx.hashEnable;
     case pass::Cond::GenCount:  return cx.genCount > 0;
+    case pass::Cond::DenseWorldgen: return cx.denseWorldgen;
     case pass::Cond::FarCount:  return cx.farCount > 0;
   }
   return false;
@@ -632,6 +633,21 @@ void Recorder::FillTracked(pass::Buf id, Buffer* dst) {
     FlushPending(/*global=*/false);
   }
   be_.Fns().CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
+  stats_.fills++;
+}
+
+void Recorder::FillTrackedRange(pass::Buf id, Buffer* dst, uint64_t offset,
+                                uint64_t size, uint32_t pattern) {
+  Buffer* b = dst ? dst : bind_.buffers[(int)id];
+  if (!b || !b->buf) return;
+  TouchBuffer(id, pass::Acc::TransferWrite, b);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+  be_.Fns().CmdFillBuffer(cmd_, b->buf, offset, size, pattern);
   stats_.fills++;
 }
 

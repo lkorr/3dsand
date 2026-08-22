@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
 #include "sim/rng.h"
 #include "sim/tuning.h"
@@ -37,17 +38,15 @@ void World::Init(const rhi::Device& device) {
   pageFaults = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                             "pageFaults");
 
-  // The identity map, and nothing writes the table after this in commit 1.
-  // Under it voxWordAt(c) resolves to exactly voxels[cellIndexW(c)] — the same
-  // physical address — so the whole translation path (the load, the branch,
-  // the multiply-add) executes while producing bit-identical addresses to
-  // pre-paging code. That is what makes this commit a provable no-op, and it
-  // is why any later paged-vs-dense divergence is definitionally about
-  // sentinels and page assignment rather than about the arithmetic (§6.2).
-  pageTableCpu_.assign(kNumChunks, 0u);
-  for (uint32_t i = 0; i < kNumChunks; i++) pageTableCpu_[i] = i;
-  device.GetQueue().WriteBuffer(pageTable, 0, pageTableCpu_.data(),
-                                (uint64_t)kNumChunks * 4);
+  // The allocator + conservative dirty mirror + materialization rule. It
+  // installs the initial table: the IDENTITY MAP in both modes, because
+  // worldgen writes every slot and its post-pass compaction is what demotes
+  // the all-air chunks (§3.5c). Under the identity map voxWordAt(c) resolves
+  // to exactly voxels[cellIndexW(c)] — the same physical address — so the
+  // whole translation path executes while producing bit-identical addresses to
+  // pre-paging code, which is why --residency dense is the phase's oracle.
+  pages = new PageTable();
+  pages->Init(device, *this);
   dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
   dirty[1] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyB");
   dirtyList = CreateBuffer(device, kNumChunks * 4, U::Storage, "dirtyList");
