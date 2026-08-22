@@ -96,6 +96,41 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
     errors += "items: \"" + d.name +
               "\" declares no grip contexts — it cannot be held\n";
 
+  // ---- the hilt box -------------------------------------------------------
+  // Where the fist closes on this item, authored as a box in the item's own
+  // micro units (item.h ItemHilt). Same micro -> world conversion as every
+  // other length here. Stored as centre + half-extents because the centre is
+  // what the socket alignment actually wants and the half-extents are what the
+  // debug overlay and the selftest want; deriving either at each use site is
+  // how two call sites end up disagreeing about the same box.
+  if (s.contains("hilt") && s["hilt"].is_object()) {
+    const json& h = s["hilt"];
+    if (h.contains("min") && h["min"].size() == 3 &&
+        h.contains("size") && h["size"].size() == 3) {
+      const Vec3 mn{h["min"][0].get<float>(), h["min"][1].get<float>(),
+                    h["min"][2].get<float>()};
+      const Vec3 sz{h["size"][0].get<float>(), h["size"][1].get<float>(),
+                    h["size"][2].get<float>()};
+      if (sz.x > 0 && sz.y > 0 && sz.z > 0) {
+        // Scene(Z-up) -> engine(Y-up) is (x, z, -y), the same map the edge
+        // block takes. A box is axis-aligned in both frames, so converting the
+        // two corners and re-deriving min/extent is enough — but the y/z swap
+        // means the naive "min maps to min" is false on the negated axis.
+        const Vec3 lo{mn.x, mn.z, -(mn.y + sz.y)};
+        const Vec3 ex{sz.x, sz.z, sz.y};
+        d.hilt.has = true;
+        d.hilt.center = (lo + ex * 0.5f) * inv;
+        d.hilt.halfExtents = ex * 0.5f * inv;
+      } else {
+        errors += "items: \"" + d.name +
+                  "\" hilt has a non-positive size — ignored\n";
+      }
+    } else {
+      errors += "items: \"" + d.name +
+                "\" hilt needs both \"min\" and \"size\" (3 each) — ignored\n";
+    }
+  }
+
   // ---- cutting edge -------------------------------------------------------
   // Same shape and the same micro -> world conversion as a rig part's edge
   // (mob.cpp), including the scene(Z-up) -> engine(Y-up) axis map, so the

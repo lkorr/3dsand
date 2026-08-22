@@ -244,15 +244,71 @@ bool PlayerAvatar::EquipItem(const ItemDef* item, const char* context) {
   // The slot's rest position, relative to the hand part, is the socket offset
   // measured from the hand's own model corner.
   const Vec3 socketLocal = sock.offset - hand.restOffset;
-  ap.rest.pos = socketLocal + QuatRotate(q, grip->translation);
+
+  // ---- put the HILT BOX on the socket -------------------------------------
+  //
+  // The socket is the centre of the hand's authored limb box; the hilt is the
+  // centre of the item's authored hilt box (item.h ItemHilt). Aligning the two
+  // is the whole placement, and both sides come from the LIMB/ART definitions
+  // rather than from a collider or a hand-tuned constant — so re-authoring
+  // either one keeps the sword in the fist instead of silently sliding it out.
+  //
+  // Subtracted, not added: the hilt centre is measured from the ITEM's origin,
+  // and what we need is where to put that origin so the hilt lands on the
+  // socket. Rotated first, because the item is placed rotated.
+  //
+  // WITHOUT a hilt box this falls back to translation alone, which is how the
+  // sword used to be placed — and which was wrong by 2.5 world voxels against
+  // a fist 1 voxel wide, so the blade hung outboard and low. `translation` now
+  // means a residual nudge on top of a correct alignment, and is zero for a
+  // well-authored item.
+  // `gripLocal` is the vector, IN THE ITEM'S OWN FRAME, from the item's origin
+  // to the point the fist closes on. With a hilt box that is the hilt centre
+  // (plus any residual nudge); without one it degrades to the bare translation,
+  // which is the arrangement that shipped the bug.
+  const Vec3 gripLocal =
+      item->hilt.has ? item->hilt.center - grip->translation
+                     : (grip->translation * -1.0f);
+  // REST.POS IS THE ANCHOR, exactly as it is for every other part.
+  //
+  // This is the convention the whole rig runs on and the item must not be the
+  // exception: AnimFlatten chains rest.pos parent-to-child, the drive loop
+  // recovers the body corner with `anchorW - Rotate(rot, anchorLimb)`, and
+  // WeaponEdge/DetachPart go the other way with `xf.pos + Rotate(q,
+  // anchorLimb)`. Placing the item's ORIGIN here instead — the intuitive
+  // reading, since the grip is expressed from the origin — silently redefines
+  // anchorLimb for this one part and every one of those call sites then
+  // disagrees with it by the grip vector, rotated by the animated hand. That
+  // reads as the blade wandering during a swing rather than as a fixed offset,
+  // which is why it does not look like a placement bug at all.
+  ap.rest.pos = socketLocal;
   ap.anchorLocal = sock.offset;
 
   Part& p = parts[slot];
   p.hp = item->hp;
   p.size = item->size;
   p.microModel = item->microModel;
-  p.restOffset = ap.rest.pos;
   const float inv = 1.0f / (float)(item->scale ? item->scale : 1);
+  // restOffset MEANS THE MODEL'S MIN CORNER, in the part's own frame — that is
+  // the contract every other part in this file keeps (see the note above
+  // Spawn, and mob.cpp's limb.restOffset), and it is what the kinematic drive
+  // loop assumes when it does `pos = anchorW - Rotate(rot, anchorLimb)`.
+  //
+  // It used to be set to ap.rest.pos here, which is a completely different
+  // quantity: the item's ORIGIN measured relative to the HAND. Mixing the two
+  // spaces made anchorLimb meaningless, and the drive loop then placed the
+  // sword body several voxels from the fist every tick — the "sword lying at
+  // the character's feet" symptom, which survived fixing the grip offset
+  // because the two bugs are independent.
+  p.restOffset = Vec3{(float)item->offset.x, (float)item->offset.y,
+                      (float)item->offset.z} * inv;
+  // anchorLimb: the anchor measured from this part's own min corner, in the
+  // part's own frame — the identical relationship `anchor - restOffset` states
+  // for a limb. Here the anchor sits `gripLocal` from the item's ORIGIN, and
+  // restOffset is that origin's offset to the corner, so the two compose.
+  // Set BEFORE the body is created, because the initial placement below runs
+  // the same two steps the drive loop does and needs this term.
+  p.anchorLimb = gripLocal - p.restOffset;
   p.voxels.reserve(item->voxels.size());
   for (const PrefabVoxel& v : item->voxels) {
     uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
@@ -262,10 +318,20 @@ bool PlayerAvatar::EquipItem(const ItemDef* item, const char* context) {
 
   // Body at the composed pose, on the avatar layer like every other part (your
   // own sword must not shove you any more than your own elbow may).
+  //
+  // The body sits at the item's MIN CORNER, not at its anchor — the same place
+  // Spawn puts a limb's body.
   BodyTransform bxf{};
-  bxf.pos = hand.xf.pos + QuatRotate(
-      Quat{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2], hand.xf.quat[3]},
-      ap.rest.pos);
+  const Quat handQ{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2],
+                   hand.xf.quat[3]};
+  const Quat worldQ = QuatMul(handQ, q);
+  // Same two steps the drive loop takes, in the same order, so the pose on the
+  // equip frame matches the pose on every frame after it: reach the anchor
+  // through the hand, then back off to the corner the collider is built around.
+  // Doing only the first step leaves the body one anchor-offset out for one
+  // tick, which is a visible pop as the sword snaps into the fist.
+  bxf.pos = hand.xf.pos + QuatRotate(handQ, ap.rest.pos) -
+            QuatRotate(worldQ, p.anchorLimb);
   bxf.quat[0] = q.x; bxf.quat[1] = q.y; bxf.quat[2] = q.z; bxf.quat[3] = q.w;
   p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, densityOf_, true, inv);
   if (p.body == 0) {
@@ -277,9 +343,35 @@ bool PlayerAvatar::EquipItem(const ItemDef* item, const char* context) {
   }
   phys_->SetBodyKinematic(p.body, true);
   phys_->SetBodyAvatarLayer(p.body, true);
+
+  // THE GRIP POINT IN THE BODY'S OWN FRAME.
+  //
+  // Everything above is in the item's AUTHORED frame, where the origin is the
+  // model's corner. Jolt does not keep that frame: a compound shape is
+  // RE-CENTRED on its centre of mass, so the body position GetTransform hands
+  // back is the middle of the blade, not the corner — the sword's local bounds
+  // run about -5.2..+5.8 rather than 0..11. That recentring is the reason
+  // every offset derived against the authored corner came out wrong.
+  //
+  // So ask the shape where its own corner ended up and rebase the grip point
+  // on it, rather than modelling Jolt's recentring here (which would be a
+  // second source of truth for it). Same reasoning the collision-box overlay
+  // uses: read the shape that exists, not the one we meant to build.
+  {
+    Vec3 clo, chi;
+    if (phys_->GetLocalBounds(p.body, clo, chi)) gripBody_ = clo + gripLocal;
+    else gripBody_ = gripLocal;
+    // Place it once, right now, by the SAME expression the drive loop uses —
+    // so the equip frame and every frame after it agree and the sword does not
+    // pop into position on the first tick.
+    const Vec3 socketW = hand.xf.pos + QuatRotate(handQ, ap.rest.pos);
+    bxf.pos = socketW - QuatRotate(worldQ, gripBody_);
+    float bq[4] = {q.x, q.y, q.z, q.w};
+    phys_->MoveKinematicBody(p.body, bxf.pos, bq, 0.0f);
+  }
+
   p.xf = bxf;
   p.anchorRoot = sock.offset;
-  p.anchorLimb = p.anchorRoot - p.restOffset;
   p.joint = phys_->CreateJoint(hand.body, p.body, ld.joint,
                                p.xf.pos, ld.axis, ld.minAngle, ld.maxAngle);
 
@@ -1383,6 +1475,53 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       Vec3 pos = anchorW - Rotate(rot, p.anchorLimb);
       float q[4] = {rot.x, rot.y, rot.z, rot.w};
       phys_->MoveKinematicBody(p.body, pos, q, dt);
+      p.xf.pos = pos;
+      p.xf.quat[0] = rot.x; p.xf.quat[1] = rot.y;
+      p.xf.quat[2] = rot.z; p.xf.quat[3] = rot.w;
+    }
+
+    // ---- THE HELD ITEM: HILT ONTO THE HAND ---------------------------------
+    //
+    // Placed directly, from the hand's just-computed world transform, rather
+    // than through the anchorLimb/restOffset pair every other part uses. Those
+    // two fields describe a JOINT BETWEEN LIMBS OF ONE PREFAB — they are
+    // measured in prefab-local space against the model's own corner, and they
+    // are the right tool for a forearm hanging off an elbow. An item is not
+    // that: it is a foreign object with its own origin whose entire
+    // relationship to the rig is "this point of me sits at that point of the
+    // hand". Stated that way it is one rotate and one subtract, and there is
+    // no convention left to get subtly wrong.
+    //
+    // (Getting it wrong through the generic path is what put the sword at the
+    // character's feet: the two frames differ by the model corner AND by
+    // Jolt's centre-of-mass recentring, and an offset that absorbs both is a
+    // magic number nobody can check.)
+    if (heldSlot_ >= 0 && heldSlot_ < (int)parts.size()) {
+      Part& item = parts[heldSlot_];
+      const int handIdx = skel_.parts[heldSlot_].parent;
+      if (item.body && item.holdSeconds <= 0 && handIdx >= 0 &&
+          handIdx < (int)parts.size() && parts[handIdx].body) {
+        const Part& hand = parts[handIdx];
+        const Quat handQ{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2],
+                         hand.xf.quat[3]};
+        // The socket, in world space: a point in the hand's own frame, carried
+        // by whatever pose the hand is in this tick.
+        const Vec3 socketW =
+            hand.xf.pos + Rotate(handQ, skel_.parts[heldSlot_].rest.pos);
+        // The item's orientation is the hand's, composed with the authored
+        // grip rotation — so the blade keeps its angle in the fist through a
+        // swing instead of being re-aimed (melee.h's rule).
+        const Quat itemQ =
+            QuatNormalize(Mul(handQ, skel_.parts[heldSlot_].rest.rot));
+        // Put the grip point on the socket. gripBody_ is already in the item's
+        // BODY frame, so this needs no corner or recentring correction.
+        const Vec3 pos = socketW - Rotate(itemQ, gripBody_);
+        float q[4] = {itemQ.x, itemQ.y, itemQ.z, itemQ.w};
+        phys_->MoveKinematicBody(item.body, pos, q, dt);
+        item.xf.pos = pos;
+        item.xf.quat[0] = q[0]; item.xf.quat[1] = q[1];
+        item.xf.quat[2] = q[2]; item.xf.quat[3] = q[3];
+      }
     }
   }
 

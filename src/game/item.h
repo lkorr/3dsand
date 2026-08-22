@@ -72,9 +72,34 @@ enum class ItemKind : uint8_t {
 //     Every context is explicit. Inheritance here means an item that looks
 //     right in the hand silently drifts when someone adds a ground pose.
 struct ItemGrip {
-  Vec3 translation{};      // item-local, WORLD voxels (converted at load)
+  // Item-local, WORLD voxels at runtime; authored in the item's own MICRO
+  // units and divided by `scale` at load, like every other length in the
+  // sidecar. A residual nudge ON TOP of the hilt/socket alignment below, so
+  // for a well-authored item it is zero.
+  Vec3 translation{};
   Quat rotation{};
   float scale = 1.0f;
+};
+
+// WHERE THE FIST CLOSES ON THIS ITEM, in the item's own frame.
+//
+// The limb system is the model here, deliberately. A rig says what a hand IS
+// by declaring a named box (MobLimbDef's model box) — not by measuring the
+// Jolt collider, which is a greedy box merge inflated by a convex radius and
+// therefore describes what is COLLIDED AGAINST rather than what was authored.
+// An item says where its hilt is the same way: an authored box, in the same
+// micro units as the art, emitted from the same constants that build the mesh.
+//
+// The runtime puts this box's CENTRE on the socket point. That is what makes
+// the alignment self-correcting: re-author the hilt or resize the hand and the
+// sword stays in the fist, because neither side is a hand-tuned constant. It
+// also generalizes past one-end grips — a staff held mid-shaft or a shield
+// gripped at its boss declares a hilt box in the middle of itself and needs no
+// new code.
+struct ItemHilt {
+  bool has = false;
+  Vec3 center{};           // item-local, WORLD voxels (converted at load)
+  Vec3 halfExtents{};      // ditto; kept for the debug overlay and tests
 };
 
 struct ItemDef {
@@ -107,6 +132,12 @@ struct ItemDef {
     auto it = grip.find(context);
     return it == grip.end() ? nullptr : &it->second;
   }
+
+  // The hilt box (see ItemHilt). One per item rather than one per context: a
+  // sword is gripped by the same part of itself whichever hand holds it, and
+  // the CONTEXT differences (which way it points, where it rides when stowed)
+  // are already the grip rotation's job.
+  ItemHilt hilt;
 
   // Rig durability while worn: the borrowed slot takes these, so an item is
   // as severable and as knock-loose-able as the limb it replaces.
