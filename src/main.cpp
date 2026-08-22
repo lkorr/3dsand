@@ -31,6 +31,7 @@
 #include "game/thirdperson.h"
 #include "gpu/context.h"
 #include "gpu/resources.h"
+#include "gpu/vk_info.h"
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -955,6 +956,7 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
+  bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool lowPowerAdapter = false;
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   bool telemetryEnabled = false;
@@ -998,11 +1000,23 @@ int main(int argc, char** argv) {
     // `--adapter low` picks the LowPower adapter (iGPU) so the selftest hash
     // can be compared across GPU vendors (DESIGN.md §14 risk 3).
     if (a == "--adapter" && i + 1 < argc) lowPowerAdapter = std::string(argv[++i]) == "low";
+    // `--vk-info` is the Vulkan port's phase-3a exit proof (src/gpu/vk_info.cpp):
+    // create a VkDevice, print the capability record phase 7 needs, compile
+    // every WGSL shader to SPIR-V through Tint, build every compute pipeline,
+    // zero-init and submit one fenced command buffer. Headless, and it does NOT
+    // touch Dawn or run any sim work — Vulkan executes nothing but the
+    // zero-init fills until phase 3b.
+    if (a == "--vk-info") vkInfo = true;
   }
 
   // --list is pure metadata: answering it before any device or asset init
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
+
+  // --vk-info likewise answers before any Dawn device exists: it is a Vulkan-only
+  // path, and running it ahead of GpuContext keeps the two backends from
+  // competing for the adapter while phase 3a is still headless.
+  if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
   std::string assetDir = AssetDir();
   // Tuning first: LoadShader() bakes these into every shader's constant

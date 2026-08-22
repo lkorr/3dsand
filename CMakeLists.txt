@@ -74,6 +74,54 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(dawn)
 
 # ---------------------------------------------------------------------------
+# Vulkan backend dependencies (docs/PLAN_vulkan_port.md phase 3).
+#
+# THREE things, none of which adds a system SDK dependency:
+#
+# 1. Vulkan HEADERS come from Dawn's own dep tree, which already fetched
+#    Vulkan-Headers and exports `Vulkan::Headers` as an INTERFACE target. We do
+#    NOT link a loader: Dawn's tree does not build one, and the engine already
+#    proves vulkan-1.dll is loadable at runtime (DAWN_FORCE_SYSTEM_COMPONENT_LOAD
+#    above exists precisely because Dawn loads it dynamically). src/gpu/vk_loader.*
+#    does the same volk-style LoadLibrary + vkGetInstanceProcAddr walk, so a
+#    machine with a driver needs nothing installed and a machine without one gets
+#    a clean error instead of a link failure. VK_NO_PROTOTYPES enforces this: any
+#    direct call to a vk* symbol becomes a COMPILE error rather than an
+#    accidental static link against a loader we do not ship.
+#
+# 2. TINT is Dawn's WGSL compiler, already built here (it is what tint.exe is).
+#    Linking `tint_lang_wgsl_reader` + `tint_lang_spirv_writer` gives the Vulkan
+#    backend WGSL->SPIR-V in-process, which is what keeps WGSL the single shader
+#    source of truth and keeps F5 hot-reload working (the alternative — invoking
+#    tint.exe offline at build time — cannot hot-reload). Both targets are
+#    declared EXCLUDE_FROM_ALL by tint_add_target, so they only build because we
+#    name them here. They carry their own PUBLIC include directories, so no
+#    manual path into the dep cache is needed and nothing here hardcodes
+#    C:/sv-deps.
+#
+# 3. VMA (VulkanMemoryAllocator) is VENDORED at src/gpu/vma/, not fetched. It is
+#    a single header, so there is nothing to build and no target to link — the
+#    include directory below is the whole integration, and VMA_IMPLEMENTATION is
+#    compiled in exactly one TU (src/gpu/vk_vma.cpp), the same single-TU pattern
+#    miniaudio uses above.
+#
+#    FetchContent was tried first and is WRONG HERE, for a reason that is not
+#    obvious and cost real debugging time: `FETCHCONTENT_FULLY_DISCONNECTED` is
+#    ON in a configured build tree (it is what stops CMake re-checking the
+#    network for Dawn on every configure). Under that flag a NEWLY declared
+#    dependency is never downloaded — and CMake does not fail. It warns, leaves
+#    ${vulkanmemoryallocator_SOURCE_DIR} pointing at a directory that does not
+#    exist, and exits 0. The empty include path that produced then broke the
+#    build somewhere else entirely. A new FetchContent dependency here is only
+#    correct for someone who also wipes their build directory, which is not a
+#    reasonable thing to require of the next agent.
+#
+#    See src/gpu/vma/VENDORED_FROM.md for the upstream tag and the upgrade
+#    procedure. Dawn's own third_party/vulkan_memory_allocator directory exists
+#    but is EMPTY (Dawn does not fetch it), so it cannot be reused either.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Dear ImGui (GLFW + WebGPU backends)
 # ---------------------------------------------------------------------------
 FetchContent_Declare(
@@ -159,6 +207,14 @@ add_executable(sandvox
   src/gpu/context.cpp
   src/gpu/resources.cpp
   src/gpu/passtimer.cpp
+  # Vulkan backend (phase 3). Compiled into the default build but NOT reachable
+  # from the frame path: only --vk-info constructs a VkDevice today. Dawn stays
+  # the backend for everything else until phase 3b adds --backend.
+  src/gpu/vk_loader.cpp
+  src/gpu/vk_vma.cpp
+  src/gpu/vk_spirv.cpp
+  src/gpu/rhi_vulkan.cpp
+  src/gpu/vk_info.cpp
   src/measure/measure.cpp
   src/sim/world.cpp
   src/sim/worldio.cpp
@@ -227,8 +283,20 @@ add_executable(sandvox
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
 # resolves unmodified — the sandvox-side audio code uses "audio/xyzpan/..."
 # instead, matching the project's src-relative convention.
-target_include_directories(sandvox PRIVATE src src/audio ${miniaudio_SOURCE_DIR})
+target_include_directories(sandvox PRIVATE src src/audio ${miniaudio_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/src/gpu/vma)
 target_compile_definitions(sandvox PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+# VK_NO_PROTOTYPES is load-bearing, not hygiene: it removes the vk* function
+# declarations from vulkan.h so every entry point MUST come through the
+# dynamically-loaded table in src/gpu/vk_loader.h. Without it, a typo'd direct
+# call compiles and then fails to LINK (no loader library) or, worse, silently
+# links against a stray import lib. VMA is told the same via
+# VMA_STATIC_VULKAN_FUNCTIONS=0, and gets its pointers from the same table.
+target_compile_definitions(sandvox PRIVATE
+  VK_NO_PROTOTYPES
+  VMA_STATIC_VULKAN_FUNCTIONS=0
+  VMA_DYNAMIC_VULKAN_FUNCTIONS=0
+)
 target_link_libraries(sandvox PRIVATE
   dawn::webgpu_dawn
   webgpu_cpp
@@ -239,6 +307,11 @@ target_link_libraries(sandvox PRIVATE
   Jolt
   ws2_32
   dbghelp
+  # Vulkan backend: headers only (no loader — see the block above), plus Tint's
+  # WGSL front end and SPIR-V back end for in-process shader compilation.
+  Vulkan::Headers
+  tint_lang_wgsl_reader
+  tint_lang_spirv_writer
 )
 
 # Run from any cwd: bake the asset dir absolute path for dev builds.

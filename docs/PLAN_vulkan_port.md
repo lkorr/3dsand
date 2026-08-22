@@ -127,6 +127,41 @@ behavior change.*
 > that is legitimate and when it is someone silencing a real regression. This
 > protects every remaining phase of the port: cross-backend hash equality is
 > only meaningful if the reference value is itself pinned.
+>
+> **[AS BUILT] Phase 3a deliverable 1 — build plumbing.** Three decisions:
+>
+> * **Vulkan headers, no loader.** `Vulkan::Headers` comes from Dawn's own
+>   dependency tree; the loader is checked out there but never built, so there
+>   is no import library to link and requiring a system SDK was rejected.
+>   `src/gpu/vk_loader.*` does a volk-style `LoadLibraryA("vulkan-1.dll")` +
+>   `vkGetInstanceProcAddr` walk across three tiers (global/instance/device).
+>   The whole target compiles with `VK_NO_PROTOTYPES`, which makes a direct
+>   `vk*` call a compile error rather than an accidental static bind — the
+>   property that keeps "we do not ship a loader" true by construction.
+>   Measured: instance version **1.4.341** on this machine.
+> * **Tint links as a library, in process.** `tint_lang_wgsl_reader` +
+>   `tint_lang_spirv_writer`, both `EXCLUDE_FROM_ALL` upstream so they build
+>   only because we name them, and both carrying their own PUBLIC include
+>   directories (nothing hardcodes a path into the dep cache). The pipeline is
+>   `wgsl::reader::Parse` → `ProgramToLoweredIR` → `spirv::writer::Generate`,
+>   the same sequence `tint.exe` runs. The offline fallback (precompiling .spv
+>   at build time) was NOT needed, which matters: it could not have survived
+>   phase 3c, because F5 rebuilds the constant prelude from live tuning values
+>   and a precompiled blob freezes them.
+> * **VMA is VENDORED at `src/gpu/vma/`, not fetched** — and the reason is a
+>   trap worth knowing. `FETCHCONTENT_FULLY_DISCONNECTED` is ON in a configured
+>   build tree (it is what stops CMake re-checking the network for Dawn every
+>   configure). Under that flag a *newly declared* FetchContent dependency is
+>   never downloaded **and CMake still exits 0**: it warns, and leaves
+>   `${vulkanmemoryallocator_SOURCE_DIR}` pointing at a nonexistent directory.
+>   The resulting empty include path broke the build in an unrelated place (an
+>   ImGui/Dawn header failure) and took a while to trace back. Any new
+>   FetchContent dependency in this repo is correct only for someone who also
+>   wipes their build directory. See `src/gpu/vma/VENDORED_FROM.md`.
+>
+> Proven, not assumed: `--vk-info` compiled a WGSL compute shader to 230 SPIR-V
+> words with the correct `07230203` magic, and loaded the Vulkan library.
+
 Device init (require timestamp queries; report sparse + strict-residency caps),
 VMA allocation, WGSL→SPIR-V via Tint, descriptor sets, command recording with
 barriers generated from the pass table, indirect dispatch (keep the staging
