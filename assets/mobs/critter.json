@@ -5,6 +5,10 @@
     "material": "blood",
     "perDamage": 2
   },
+  "sounds": {
+    "dismember": "dismember",
+    "bleed": "bleed"
+  },
   "speed": 6,
   "locomotion": {
     "turnRate": 5.2,

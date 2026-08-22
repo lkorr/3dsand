@@ -5,6 +5,10 @@
     "material": "blood",
     "perDamage": 2.5
   },
+  "sounds": {
+    "dismember": "dismember",
+    "bleed": "bleed"
+  },
   "speed": 60,
   "gait": {
     "groups": [

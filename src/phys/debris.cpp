@@ -158,6 +158,10 @@ void DebrisSystem::Reset() {
   pendingSupport_.clear();
   supportPending_.clear();
   supportCooldown_.clear();
+  // Undrained breaks belong to the world that just went away; voicing them
+  // after a regen or a LoadWorld would fire a burst of snaps at coordinates
+  // that now mean something else entirely.
+  breaks_.clear();
   instancesDirty_ = true;
   instanceCount_ = 0;
   // Body serials seed the burn RNG (Hash3(serial, tick, rule)), so a counter
@@ -462,6 +466,32 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     body.radiusVoxels = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) + 2.0f;
     body.serial = nextSerial_++;
     RecountBurn(body);
+
+    // Audible break. The material is the piece's MOST COMMON one, not the
+    // first voxel's: an island is usually one substance, but a burnt stem
+    // carries a few ash voxels and a wall a few of whatever hit it, and
+    // picking voxel 0 would let that minority decide what the break sounds
+    // like. Counted over a small map rather than a full histogram because the
+    // voxel count here is already bounded by kMaxBodyVoxels.
+    {
+      std::unordered_map<uint32_t, uint32_t> tally;
+      for (const DebrisVoxel& v : body.voxels) tally[v.payload & 0xFFFu]++;
+      uint32_t domMat = 0, domCount = 0;
+      for (const auto& [mat, count] : tally) {
+        // Ties break toward the lower id for determinism of the REPORT: the
+        // hash never sees this, but an unstable pick would make the cue flip
+        // between runs and make a bug here hard to reproduce.
+        if (count > domCount || (count == domCount && mat < domMat)) {
+          domMat = mat;
+          domCount = count;
+        }
+      }
+      breaks_.push_back(BreakEvent{
+          Vec3{(float)origin.x + 0.5f * ex, (float)origin.y + 0.5f * ey,
+               (float)origin.z + 0.5f * ez},
+          domMat, (int32_t)body.voxels.size()});
+    }
+
     bodies_.push_back(std::move(body));
     instancesDirty_ = true;
     madeThisScan++;

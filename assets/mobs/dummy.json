@@ -4,6 +4,10 @@
     "material": "blood",
     "perDamage": 2.0
   },
+  "sounds": {
+    "dismember": "dismember",
+    "bleed": "bleed"
+  },
   "speed": 5.0,
   "limbs": [
     {

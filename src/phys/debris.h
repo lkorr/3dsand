@@ -173,6 +173,20 @@ class DebrisSystem {
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
 
+  // ---- break events -------------------------------------------------------
+  // One entry per island that detached into a rigidbody this tick. Reported
+  // rather than voiced here: this layer knows nothing about audio, the same
+  // way it hands cellOps back instead of writing the grid itself. main.cpp
+  // drains these into audio::Cues::Break after the tick, which also keeps the
+  // cue out of the headless selftest path for free.
+  struct BreakEvent {
+    Vec3 posVoxel;        // centre of the piece, world voxels
+    uint32_t material;    // dominant material of the piece
+    int32_t sizeVoxels;   // how big it was — drives pitch
+  };
+  const std::vector<BreakEvent>& BreakEvents() const { return breaks_; }
+  void ClearBreakEvents() { breaks_.clear(); }
+
  private:
   struct Event {
     uint32_t tick;
@@ -344,4 +358,7 @@ class DebrisSystem {
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
+  // Drained by main.cpp each frame; bounded by the same per-tick body budget
+  // that bounds island creation, so this cannot grow without limit.
+  std::vector<BreakEvent> breaks_;
 };

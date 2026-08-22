@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1118,6 +1119,13 @@ int main(int argc, char** argv) {
   float avatarHeading = 0.0f;   // body facing, radians about +Y
   float fovNow = CurrentTuning().camera.fovY;
   float respawnTimer = 0.0f;
+  // Night-ambience rarity roll. Deliberately a plain PRNG and NOT the sim's
+  // counter-based hash: this decides whether a mood bed plays, never anything
+  // that touches voxel state, so it is outside the determinism domain (rule 1
+  // constrains the sim). Seeding it from the clock would be wrong for a
+  // different reason — a replay should sound the same — so it is fixed.
+  std::mt19937 nightRng{0x9147A1};
+  float nightRollTimer = 0.0f;
   // Clear-then-fill, matching the hot-reload path below. These run once here,
   // but an append-only build of a list the UI indexes into is exactly how a
   // duplicate entry (and the ImGui ID collision that follows) gets introduced.
@@ -2133,6 +2141,14 @@ int main(int argc, char** argv) {
                   // is what makes dismemberment geometric rather than a
                   // threshold (DESIGN.md §7 "Carving living bodies").
                   const float dmg = heldItem->damage * power;
+                  // Everything severed inside this scope is a BLADE cut, and
+                  // gets the wet dismember sound on top of the creature's own
+                  // cry. Both calls below can sever several frames deep —
+                  // Damage() at zero hp or over the impact threshold,
+                  // CarveLimbRadial() when the limb collapses — so the cause
+                  // is marked around them rather than passed down through a
+                  // chain the laser and explosions also use.
+                  MobSystem::BladeCutScope blade(mobs, power);
                   if (mobs.Damage(hb, dmg, at, tipSpeed)) {
                     mobs.CarveLimbRadial(hb, at, radius * (0.6f + 0.4f * power),
                                          true /*ragged*/, true /*eject*/, world,
@@ -2361,9 +2377,72 @@ int main(int argc, char** argv) {
           else
             audioCues.Footstep(ff.mat, ff.posVox, ff.speed, ff.foot);
         }
+        // Terrain that came loose this frame. Drained here for the same reason
+        // as the footfalls: PreTick runs once per tick and the tick loop runs
+        // up to 4 times a frame, so voicing from inside it would stack several
+        // snaps on one instant.
+        for (const DebrisSystem::BreakEvent& be : debris.BreakEvents())
+          audioCues.Break(be.material, be.posVoxel, be.sizeVoxels);
+
+        // Limbs that came off this frame. The creature's cry fires for every
+        // sever; the wet CUT only for one made by a blade, because an
+        // explosion that takes the same arm off did not saw through anything.
+        for (const MobSystem::SeverEvent& se : mobs.SeverEvents()) {
+          if (se.defIndex < 0 || se.defIndex >= (int)mobs.Defs().size()) continue;
+          const MobDef& md = mobs.Defs()[(size_t)se.defIndex];
+          audioCues.MobSound(md, audio::Cues::MobEvent::Sever, se.posVoxel,
+                             se.severity, se.mobId);
+          if (se.byBlade)
+            audioCues.MobSound(md, audio::Cues::MobEvent::Dismember,
+                               se.posVoxel, se.severity, se.mobId);
+        }
+
+        // Wounds still pumping. Reported every frame while they bleed; the
+        // audio layer starts, tracks and reaps the loop from that alone, so
+        // nothing here has to remember a handle.
+        for (const MobSystem::BleedSource& bs : mobs.BleedSources())
+          audioCues.MobBleed(bs.key, bs.posVoxel, bs.intensity);
+
+        // The night bed. `want` eases the bed in after dusk and out at dawn;
+        // `allowStart` is rolled at most once every nightRetrySeconds and is
+        // what makes it rare rather than a permanent night-time backing track.
+        {
+          const Tuning::Audio& ta = CurrentTuning().audio;
+          // Derived from the tick, exactly as the sim and the sky do — not
+          // from wall time — so the bed rises and falls with the same clock
+          // the world is lit by, and a replay hears it at the same moment.
+          const Tuning& tt = CurrentTuning();
+          const uint32_t phase =
+              DayPhaseForTick(tick, TicksPerDay(tt), tt.dayNight.freeze != 0,
+                              (uint32_t)tt.dayNight.freezePhase);
+          // DaylightStrengthCpu is 0 through the whole night and climbs after
+          // sunrise, so this is 1 at night and 0 by day, with the twilight
+          // wedge doing the crossfade for free.
+          const float day = (float)DaylightStrengthCpu(phase) / 255.0f;
+          const float want = std::clamp(1.0f - day * 4.0f, 0.0f, 1.0f);
+          bool allowStart = false;
+          if (want > 0.0f) {
+            nightRollTimer += dt;
+            if (nightRollTimer >= ta.nightRetrySeconds) {
+              nightRollTimer = 0.0f;
+              std::uniform_real_distribution<float> d(0.0f, 1.0f);
+              allowStart = d(nightRng) < ta.nightChance;
+            }
+          } else {
+            // Roll immediately on the first night after a day, rather than
+            // making the player wait out a full retry period past dusk.
+            nightRollTimer = ta.nightRetrySeconds;
+          }
+          audioCues.SetNightAmbience(eye, want, allowStart);
+        }
+
         audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
       }
       avatar.ClearFootfalls();
+      // Cleared unconditionally, like the footfalls: a queue that only drains
+      // when audio happens to be on is a slow leak on a silent machine.
+      debris.ClearBreakEvents();
+      mobs.ClearSeverEvents();
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
@@ -2662,8 +2741,10 @@ int main(int argc, char** argv) {
   // is the only thread that can still be inside the mixer.
   if (audioCues.Enabled()) {
     const audio::Cues::Stats& as = audioCues.GetStats();
-    std::printf("[audio] %u steps, %u landings, %u impacts, %u dropped\n",
-                as.steps, as.lands, as.impacts, as.dropped);
+    std::printf("[audio] %u steps, %u landings, %u impacts, %u breaks, "
+                "%u creature, %u bleeds, %u dropped\n",
+                as.steps, as.lands, as.impacts, as.breaks, as.mobs, as.bleeds,
+                as.dropped);
   }
   audioCues.Shutdown();
   overlay.Shutdown();

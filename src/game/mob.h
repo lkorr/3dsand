@@ -269,6 +269,60 @@ class MobSystem {
   // standing there, instead of only on the next ones spawned.
   void RefreshGoreProfiles();
 
+  // ---- sever events -------------------------------------------------------
+  // One entry per limb that came off, reported rather than voiced here: this
+  // system knows nothing about audio, the same way it hands particle spawns
+  // back instead of emitting them. main.cpp drains these after the tick.
+  //
+  // Sever() is reached from a dozen call sites (explosion, laser, hp loss,
+  // carve collapse) and none of them know what CAUSED the cut, which is the
+  // one thing the audio needs: only a BLADE plays the dismember sound. So the
+  // cause is set by the caller around the call — see BladeCutScope — rather
+  // than threaded through every signature.
+  struct SeverEvent {
+    Vec3 posVoxel;      // the cut point, world voxels
+    uint64_t mobId = 0;
+    int limbIndex = -1;
+    // Index into Defs(). Carried on the event rather than looked up by mobId
+    // afterwards, because a killing blow can despawn the mob before the frame
+    // drains this — the def outlives it, the mob does not.
+    int defIndex = -1;
+    bool byBlade = false;  // a weapon edge did this, not a blast or a beam
+    float severity = 1.0f; // 0..1, blade speed for a cut
+  };
+  const std::vector<SeverEvent>& SeverEvents() const { return severs_; }
+  void ClearSeverEvents() { severs_.clear(); }
+
+  // RAII: marks every Sever() reached inside its lifetime as a blade cut.
+  // Scoped rather than a parameter because the melee sweep calls Damage() and
+  // CarveLimbRadial(), each of which may sever internally several frames deep;
+  // adding a `byBlade` argument to that whole chain would touch the laser and
+  // explosion paths too, for a fact only the audio cares about.
+  struct BladeCutScope {
+    MobSystem& sys;
+    float prevSeverity;
+    bool prevBlade;
+    BladeCutScope(MobSystem& s, float severity) : sys(s) {
+      prevBlade = sys.bladeCut_;
+      prevSeverity = sys.bladeSeverity_;
+      sys.bladeCut_ = true;
+      sys.bladeSeverity_ = severity;
+    }
+    ~BladeCutScope() {
+      sys.bladeCut_ = prevBlade;
+      sys.bladeSeverity_ = prevSeverity;
+    }
+  };
+
+  // Wounds that are bleeding hard enough to be worth hearing. Rebuilt each
+  // tick in PreTick; main.cpp turns each into a positioned loop.
+  struct BleedSource {
+    Vec3 posVoxel;
+    uint64_t key = 0;      // stable per (mob, limb) so one loop tracks one wound
+    float intensity = 0;   // 0..1 of the bleed budget cap
+  };
+  const std::vector<BleedSource>& BleedSources() const { return bleeds_; }
+
   // Render plumbing: limbs append after the debris bodies' slots.
   bool InstancesDirty() const { return instancesDirty_; }
   void AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
@@ -588,6 +642,16 @@ class MobSystem {
   // caller's spawn list from there would mean Sever needs it threaded through
   // every one of those paths. Drained (and cleared) at the top of PreTick.
   std::vector<ParticleSpawn> pendingSpawns_;
+
+  // Drained by main.cpp each frame. Bounded by the same limits that bound
+  // severing itself: a mob has a fixed limb count and kMaxMobs of them exist.
+  std::vector<SeverEvent> severs_;
+  std::vector<BleedSource> bleeds_;
+  // Set by BladeCutScope for the duration of the melee sweep, so Sever() can
+  // record what caused it without every caller having to say.
+  bool bladeCut_ = false;
+  float bladeSeverity_ = 1.0f;
+  friend struct BladeCutScope;
 
   static constexpr uint32_t kMaxMobs = 16;
   // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)

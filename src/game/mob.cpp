@@ -1690,6 +1690,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
            (float)(wo.z * (int)kChunk)};
   int bleedOps = 0;
 
+  // Rebuilt from scratch each tick: a wound that stopped bleeding, or a mob
+  // that despawned, simply stops appearing, and the audio layer reaps the
+  // loop. Nothing has to remember to remove an entry.
+  bleeds_.clear();
+
   // Drain particles authored since the last tick (dismemberment blood voxels).
   // Dropped rather than carried over when the tick's budget is already full:
   // stale gore arriving a tick late would spawn from a wound that has since
@@ -1890,6 +1895,23 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                                          life, gore.microScale));
           }
           limb.gushTicks--;
+        }
+
+        // Report the wound for audio BEFORE the budget/op-rate early-outs
+        // below. Those exist to bound how much MATTER enters the CA per tick;
+        // a wound that is out of drip ops this tick is still bleeding, and
+        // gating the sound on them would make the loop stutter with the drip
+        // rate instead of tracking the wound.
+        if (limb.bleedBudget >= 1.0f) {
+          const float cap = std::max(1.0f, gore.bleedBudgetCap);
+          Vec3 wpos = limb.body
+                          ? limb.xf.pos + Rotate(lq, limb.woundLocal)
+                          : bodyFrame(limb.anchorRoot);
+          // Key on (mob, limb) so one loop follows one wound across ticks
+          // even as limbs are severed and the vector is reshuffled.
+          bleeds_.push_back(BleedSource{
+              wpos, (mob.id << 8) ^ (uint64_t)(li + 1),
+              std::clamp(limb.bleedBudget / cap, 0.0f, 1.0f)});
         }
 
         if (limb.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
@@ -2660,6 +2682,13 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
       Quat cq{cut.xf.quat[0], cut.xf.quat[1], cut.xf.quat[2], cut.xf.quat[3]};
       Vec3 anchorW = cut.body ? cut.xf.pos + Rotate(cq, cut.anchorLimb)
                               : mob.origin + cut.anchorRoot;
+
+      // Report the cut for audio. Recorded HERE, before DetachLimb, because
+      // anchorW is the one place the wound's world position is known — after
+      // the detach the limb has its own frame and the joint is gone.
+      severs_.push_back(SeverEvent{anchorW, mob.id, limbIndex,
+                                   (int)mob.defIndex, bladeCut_,
+                                   bladeCut_ ? bladeSeverity_ : 1.0f});
 
       DetachLimb(mob, limbIndex, true);
       // the stump bleeds: wound at the joint on the PARENT side

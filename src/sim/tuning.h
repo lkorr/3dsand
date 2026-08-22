@@ -345,12 +345,64 @@ struct Tuning {
     // Physical impacts (debris, bodies).
     float impactVolume = 0.9f;
     float impactRadius = 30.0f;
+
+    // Something coming apart: terrain losing support and detaching as a
+    // rigidbody, or being dug/blasted loose.
+    float breakVolume = 1.0f;
+    // Breaks carry further than impacts — a tree limb giving way is a loud,
+    // low event and hearing it from off-screen is most of its value.
+    float breakRadius = 45.0f;
+    // Half-range of the per-event random detune, in SEMITONES. Expressed in
+    // semitones rather than as a rate multiplier because that is the unit the
+    // ear (and whoever is tuning this) actually thinks in; cues.cpp converts
+    // with 2^(n/12). 5 is wide — deliberately, since one support scan can free
+    // several islands in the same tick and identical repeats read as a
+    // machine. Beyond ~7 the material stops sounding like itself.
+    float breakPitchSemitones = 5.0f;
+    // Pitch centre by piece size: a lone voxel snapping is a twig, a large
+    // island is a log. These are the rate multipliers at the two ends, and a
+    // piece's voxel count maps between them (see breakBigVoxels).
+    float breakSmallRate = 1.25f;
+    float breakBigRate = 0.8f;
+    // Voxel count that counts as "big" for the mapping above.
+    float breakBigVoxels = 400.0f;
     // Creature voices (hurt/death/sever/...). Kept separate from impacts
     // because a mob crying out and a rock landing are mixed against each
     // other, and one trim cannot serve both.
     float mobVolume = 1.0f;
     float mobRadius = 45.0f;
     float mobPitchJitter = 0.07f;
+
+    // The blade cut itself, separate from the creature's cry (which is the
+    // `sever` slot on mobVolume). Its own trim because a wet mechanical sound
+    // and a voice sit differently in the mix, and a wider jitter because four
+    // takes have to cover a whole fight.
+    float dismemberVolume = 1.0f;
+    float dismemberPitchJitter = 0.12f;
+
+    // Bleeding: a positioned wet loop while a wound is pumping hard.
+    float bleedVolume = 0.9f;
+    float bleedRadius = 18.0f;
+    // Intensity (0..1 of the bleed budget cap) to START the loop, and the
+    // lower level it must fall back through to STOP. Two thresholds, not one:
+    // a wound sitting exactly on a single threshold retriggers the voice every
+    // frame. On > off is required and enforced at load.
+    float bleedOnThreshold = 0.35f;
+    float bleedOffThreshold = 0.12f;
+
+    // The night bed (assets/sounds/ambience/starlight). Rare by design.
+    float nightVolume = 0.5f;
+    // Audible radius. Large because the bed is centred on the listener and is
+    // meant to sit around them rather than to come from a place.
+    float nightRadius = 60.0f;
+    // Chance, per retry, that a new pass begins. With the defaults below that
+    // is one roll a minute at 8%, so most nights stay silent and the bed is an
+    // event rather than a backing track.
+    float nightChance = 0.08f;
+    float nightRetrySeconds = 60.0f;
+    // Per-frame easing factor for the fade in and out. Small = slow: the bed
+    // should arrive and leave without the player catching either moment.
+    float nightFadeRate = 0.004f;
 
     // Reverb send for world sounds, 0..1. The engine's FDN reverb is what
     // makes a cave read as a cave; keep it modest for outdoor-heavy worlds.

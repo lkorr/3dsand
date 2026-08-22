@@ -75,9 +75,11 @@ const SOUND_SCHEMA = {
        pitch:'heavier impact → lower'},
 
       {k:'break', n:'break / shatter', prefix:'breaks',
-       d:'This material being destroyed — dug out, blasted, or shattered into rubble.',
-       fires:'not wired yet — bind it and the set is ready when it is',
-       fallback:'silent.'},
+       d:'This material coming apart. Fires when a chunk of it loses its support and detaches as a rigidbody — a limb cut off a tree, a ledge undermined, a wall blasted through. The piece’s dominant material decides the sound, so a mostly-wood island snaps like wood even with a little ash in it.',
+       fires:'audio::Cues::Break — src/audio/cues.cpp, from DebrisSystem::BreakEvents()',
+       fallback:'silent — a step is not a shatter, so there is deliberately no surrogate.',
+       gain:'scales with the size of the piece',
+       pitch:'centre set by piece size (twig high, log low), then a random ±breakPitchSemitones per event'},
 
       {k:'ambience', n:'ambience loop', prefix:'ambience',
        d:'A positioned looping bed for a body of this material, e.g. a lava lake or a waterfall. Started per emitter with a radius, not per voxel.',
@@ -110,9 +112,22 @@ const SOUND_SCHEMA = {
        fallback:'silent.'},
 
       {k:'sever', n:'limb severed', prefix:'mobs',
-       d:'A limb comes off. Distinct from taking damage because dismemberment is a state change the player should hear, not merely a bigger hit.',
+       d:'A limb comes off. Distinct from taking damage because dismemberment is a state change the player should hear, not merely a bigger hit. This is the CREATURE’s voice; the wet mechanical sound of the cut itself is the `dismember` slot, and a sword hit plays both.',
        fires:'audio::Cues::MobSound(Sever) — src/audio/cues.cpp',
        fallback:'the hurt set, if one is bound.'},
+
+      {k:'dismember', n:'cut apart (blade)', prefix:'mobs',
+       d:'The CUT — flesh and bone parting under an edge, as opposed to the creature’s cry, which is `sever`. Fires only when a limb is taken off by a BLADE: an explosion or a laser removes the same limb without this sound, because neither one saws through anything. Both this and `sever` fire for one sword blow.',
+       fires:'audio::Cues::MobSound(Dismember) — from the melee sweep in main.cpp',
+       fallback:'silent.',
+       gain:'scales with blade speed',
+       pitch:'random jitter, and lower for a faster cut'},
+
+      {k:'bleed', n:'bleeding (loop)', prefix:'gore',
+       d:'A positioned loop that runs while this creature is losing a lot of blood, and fades out as the wound does. Started when the bleed budget crosses the on-threshold — a scratch is silent, an amputation is not — and its gain tracks how hard the wound is still pumping, so one loop covers everything from a deep cut to a fresh stump.',
+       fires:'audio::Cues::MobBleed — src/audio/cues.cpp, driven from main.cpp',
+       fallback:'silent.',
+       gain:'tracks the wound’s remaining bleed budget'},
 
       {k:'idle', n:'idle vocal', prefix:'mobs',
        d:'Occasional noise while alive and unaware. The cheapest way to make a world feel inhabited — and the fastest way to make it maddening, so keep the interval long.',
@@ -133,6 +148,29 @@ const SOUND_SCHEMA = {
        d:'This mob’s own step, overriding the surface it walks on. For creatures whose feet are the story — something hooved or metal reads by its gait, not by the ground.',
        fires:'audio::Cues::Footstep, when the mob overrides the surface',
        fallback:'the SURFACE material’s footstep set (the usual case).'},
+    ],
+  },
+
+  // ---- the world itself -------------------------------------------------
+  // Beds that belong to no material and no creature. There is exactly one
+  // owner, so these are NOT authored per entity: the set name is fixed in
+  // audio/cues.cpp and what the tuner exposes is when and how loudly it plays
+  // (the audio.night* group). Listed here anyway so the Audio tab and the wiki
+  // can show the slot and say honestly what triggers it.
+  world: {
+    store: 'none',
+    title: 'World ambience',
+    icon: '\u{1F319}',
+    blurb: 'Non-diegetic beds tied to world state rather than to an object. ' +
+           'One owner, so the binding lives in code and the TUNING is what ' +
+           'you author — see the Audio group for the night bed’s volume, ' +
+           'its chance of starting, and how long it waits between plays.',
+    slots: [
+      {k:'night', n:'night bed', prefix:'ambience',
+       d:'A rare, quiet bed for deep night. Not a permanent loop: once past dusk the engine rolls against nightChance every nightRetrySeconds, plays one pass, then waits again — so the night is mostly silent and the bed is an event when it does arrive. Fades out at dawn. The asset is pre-folded to loop seamlessly (scripts/import_sounds.py), because the engine’s loop path wraps the playhead with no crossfade of its own.',
+       fires:'audio::Cues::SetNightAmbience — driven from main.cpp off the day phase',
+       fallback:'silent.',
+       gain:'audio.nightVolume, eased in and out across dusk/dawn'},
     ],
   },
 };
