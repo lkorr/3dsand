@@ -6,6 +6,7 @@
 
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
+#include "sim/bytestream.h"
 #include "sim/rng.h"
 
 namespace {
@@ -1934,4 +1935,99 @@ uint32_t DebrisSystem::ActiveBodyCount() const {
   for (const Body& b : bodies_)
     if (phys_->IsActive(b.handle)) n++;
   return n;
+}
+
+// ---- persistence (entities.sve section 'DBRS') ------------------------------
+
+void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
+  ByteWriter w{out};
+  w.U32((uint32_t)bodies_.size());
+  for (const Body& b : bodies_) {
+    w.Pod(b.xf);
+    w.U32(b.physScale);
+    w.U32(b.micro.skinScale);
+    // Only "did it render as micro" travels; the model index is meaningless
+    // across sessions (the pool is rebuilt), so load re-packs a brick from the
+    // lattice below.
+    w.U32(b.micro.Valid() ? 1u : 0u);
+    w.U32(b.bleedMat);
+    w.PodVec(b.voxels);
+    w.PodVec(b.skinVoxels);
+  }
+}
+
+bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
+  if (version != kSaveVersion) {
+    std::fprintf(stderr, "debris: unknown DBRS section version %u\n", version);
+    return false;
+  }
+  ByteReader r{data, len};
+  uint32_t count = 0;
+  r.U32(count);
+  for (uint32_t i = 0; i < count && r.ok; i++) {
+    BodyTransform xf{};
+    uint32_t physScale = 1, skinScale = 1, hadMicro = 0, bleedMat = 0;
+    std::vector<DebrisVoxel> voxels;
+    std::vector<PrefabVoxel> skinVoxels;
+    r.Pod(xf);
+    r.U32(physScale);
+    r.U32(skinScale);
+    r.U32(hadMicro);
+    r.U32(bleedMat);
+    r.PodVec(voxels);
+    r.PodVec(skinVoxels);
+    if (!r.ok || voxels.empty()) continue;
+    if (bodies_.size() >= kMaxBodies) break;  // same ceiling spawning obeys
+
+    physScale = std::max(1u, physScale);
+    const float pitch = 1.0f / (float)physScale;
+    uint64_t h = phys_->CreateDebrisBodyXf(voxels, xf, densityOf_, false, pitch);
+    if (h == 0) {
+      std::fprintf(stderr, "debris: Jolt refused a loaded body (skipped)\n");
+      continue;
+    }
+
+    // Re-pack the micro brick from the authoritative lattice — the same
+    // skin-first rule ReskinMicro applies — and mark it OWNED so ReleaseBody
+    // returns its words to the pool like any copy-on-write clone. Variant bits
+    // are stripped: the brick stores plain 8-bit material ids.
+    MicroBodyRef micro{};
+    if (hadMicro && microSet_) {
+      std::vector<PrefabVoxel> mv;
+      const bool fine = skinScale > physScale && !skinVoxels.empty();
+      const std::vector<PrefabVoxel>* src = fine ? &skinVoxels : nullptr;
+      if (src) {
+        mv.reserve(src->size());
+        for (const PrefabVoxel& v : *src)
+          mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu)});
+      } else {
+        mv.reserve(voxels.size());
+        for (const DebrisVoxel& v : voxels)
+          mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                        (uint16_t)(v.payload & 0xFFu)});
+      }
+      IVec3 mx{0, 0, 0};
+      for (const PrefabVoxel& v : mv) {
+        mx.x = std::max<int>(mx.x, v.x);
+        mx.y = std::max<int>(mx.y, v.y);
+        mx.z = std::max<int>(mx.z, v.z);
+      }
+      std::string plog;
+      int mi = MicroBodyPack(*microSet_, mv, {mx.x + 1, mx.y + 1, mx.z + 1},
+                             skinScale, "load", plog);
+      if (mi >= 0) {
+        microSet_->owned[mi] = 1;  // freeable: this body is the sole holder
+        micro = MicroBodyRef{(uint32_t)mi, skinScale};
+      } else if (!plog.empty()) {
+        std::fprintf(stderr, "%s", plog.c_str());
+      }
+    }
+
+    AdoptBody(h, std::move(voxels), xf, micro, physScale, std::move(skinVoxels),
+              bleedMat);
+    // Reload ASLEEP with zero velocity (worldio.h's rigidbody rule): a settled
+    // pile reloads settled, and rule 2's sleep invariant holds from tick one.
+    phys_->DeactivateBody(h);
+  }
+  return r.ok;
 }

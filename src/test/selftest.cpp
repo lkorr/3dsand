@@ -49,7 +49,7 @@ const char* const kOrder[] = {
     "blood-stain", "flung-liquid", "far-fog",       "far-downsample",
     "screenshots", "player-walk", "player-waterjump", "player-plants", "debris",
     "prefab",      "mob",         "settle-back",    "player-body",
-    "save-load",   "region-store", "streaming",     "spells",
+    "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "perf",
 };
 

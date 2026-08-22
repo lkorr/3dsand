@@ -12,6 +12,7 @@
 
 #include "game/rigrender.h"
 #include "phys/lattice.h"
+#include "sim/bytestream.h"
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -3089,4 +3090,139 @@ uint32_t MobSystem::LimbBodyCount() const {
     for (const Limb& limb : mob.limbs)
       if (limb.body) n++;
   return n;
+}
+
+// ---- persistence (entities.sve section 'MOBS') ------------------------------
+
+void MobSystem::SaveState(std::vector<uint8_t>& out) const {
+  ByteWriter w{out};
+  uint32_t count = 0;
+  for (const Mob& m : mobs_)
+    if (m.alive && m.defIndex >= 0 && m.defIndex < (int)defs_.size()) count++;
+  w.U32(count);
+  for (const Mob& m : mobs_) {
+    if (!(m.alive && m.defIndex >= 0 && m.defIndex < (int)defs_.size()))
+      continue;  // dead mobs are debris already (see mob.h)
+    w.Str(defs_[m.defIndex].name);
+    w.Pod(m.origin);
+    w.F32(m.heading);
+    w.F32(m.bodyY);
+    w.U32((uint32_t)m.limbs.size());
+    for (const Limb& L : m.limbs) {
+      w.U32(L.body ? 1u : 0u);  // 0 = severed (sever state IS this flag)
+      w.F32(L.hp);
+      // The rig offsets travel because a carve SHIFTS them (ReskinLimbMicro):
+      // restoring def values under carved art would slide the wound.
+      w.Pod(L.restOffset);
+      w.Pod(L.anchorRoot);
+      w.Pod(L.anchorLimb);
+      w.Pod(L.xf);
+      w.Pod(L.size);
+      w.PodVec(L.voxels);
+      w.PodVec(L.skinVoxels);
+    }
+  }
+}
+
+bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
+  if (version != kSaveVersion) {
+    std::printf("mob: unknown MOBS section version %u\n", version);
+    return false;
+  }
+  ByteReader r{data, len};
+  uint32_t count = 0;
+  r.U32(count);
+  for (uint32_t mi = 0; mi < count && r.ok; mi++) {
+    std::string defName;
+    Vec3 origin{};
+    float heading = 0, bodyY = 0;
+    uint32_t nLimbs = 0;
+    r.Str(defName);
+    r.Pod(origin);
+    r.F32(heading);
+    r.F32(bodyY);
+    r.U32(nLimbs);
+    struct LimbState {
+      uint32_t alive = 1;
+      float hp = 0;
+      Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
+      BodyTransform xf{};
+      IVec3 size{};
+      std::vector<DebrisVoxel> voxels;
+      std::vector<PrefabVoxel> skinVoxels;
+    };
+    std::vector<LimbState> ls(nLimbs);
+    for (LimbState& s : ls) {
+      r.U32(s.alive);
+      r.F32(s.hp);
+      r.Pod(s.restOffset);
+      r.Pod(s.anchorRoot);
+      r.Pod(s.anchorLimb);
+      r.Pod(s.xf);
+      r.Pod(s.size);
+      r.PodVec(s.voxels);
+      r.PodVec(s.skinVoxels);
+    }
+    if (!r.ok) break;
+
+    // Resolve the def BY NAME: index order is whatever the directory listing
+    // was the day the save was written. A missing def skips the mob (the save
+    // stays loadable when a creature is retired) — loudly, so retired art
+    // silently eating saved mobs cannot masquerade as a load bug.
+    int defIndex = -1;
+    for (size_t d = 0; d < defs_.size(); d++)
+      if (defs_[d].name == defName) defIndex = (int)d;
+    if (defIndex < 0) {
+      std::printf("mob: saved def '%s' no longer exists; skipping\n",
+                  defName.c_str());
+      continue;
+    }
+    // Spawn() first: it derives everything the save deliberately does not
+    // carry (anim state, joints, rest sole, flipbooks, gore profile) from the
+    // def, exactly as a fresh mob would. The saved damage overlays that.
+    uint64_t id = Spawn(defIndex, {ifloor(origin.x), ifloor(origin.y),
+                                   ifloor(origin.z)});
+    if (id == 0) {
+      std::printf("mob: could not respawn saved '%s' (limit or physics)\n",
+                  defName.c_str());
+      continue;
+    }
+    Mob& m = mobs_.back();
+    m.origin = origin;
+    m.heading = m.desiredHeading = heading;
+    m.bodyY = bodyY;
+    m.anim.lastPos = origin;
+    const MobDef& def = defs_[defIndex];
+    const uint32_t nApply = std::min<uint32_t>(nLimbs, (uint32_t)m.limbs.size());
+
+    // Carve state first, on limbs that are still attached: a lattice that
+    // differs from the def's means the limb was carved, so the saved lattice
+    // (and the rig offsets the carve shifted) replace the authored ones, the
+    // brick is re-derived, and the Jolt body is rebuilt to the carved shape.
+    for (uint32_t i = 0; i < nApply; i++) {
+      if (!ls[i].alive) continue;
+      Limb& L = m.limbs[i];
+      L.hp = ls[i].hp;
+      const bool differs = ls[i].voxels.size() != L.voxels.size() ||
+                           ls[i].skinVoxels.size() != L.skinVoxels.size();
+      if (!differs || ls[i].voxels.empty()) continue;
+      L.voxels = std::move(ls[i].voxels);
+      L.skinVoxels = std::move(ls[i].skinVoxels);
+      L.size = ls[i].size;
+      L.restOffset = ls[i].restOffset;
+      L.anchorRoot = ls[i].anchorRoot;
+      L.anchorLimb = ls[i].anchorLimb;
+      if (L.microModel >= 0)
+        ReskinLimbMicro(m, L, def.skinScale, def.physScale);
+      RebuildLimbBody(m, (int)i);
+    }
+    // Severs second: DetachLimb recurses into children, and doing it after
+    // the carve pass means it never operates on a limb the loop still needs.
+    // adopt=false — the severed piece is not re-created here, it already
+    // travels in the 'DBRS' section as the debris it became.
+    for (uint32_t i = 0; i < nApply; i++)
+      if (!ls[i].alive && m.limbs[i].body) DetachLimb(m, (int)i, false);
+  }
+  instancesDirty_ = true;
+  return r.ok;
 }

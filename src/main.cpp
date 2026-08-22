@@ -17,7 +17,9 @@
 
 #include "audio/cues.h"
 #include "game/avatar.h"
+#include "game/bodyreg.h"
 #include "game/brush.h"
+#include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
 #include "game/item.h"
@@ -794,17 +796,20 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     }
   }
 
-  // body upload, same slot agreement as the frame loop: debris first, mobs after
+  // Body upload through the ONE slot walk (game/bodyreg.h). This harness has
+  // no avatar, which the registry represents explicitly (nullptr) — all three
+  // arrays still agree with each other by construction, which is the property
+  // the hand-rolled version here had silently lost.
+  BodyRegistry bodyReg(debris, mobs, nullptr);
   std::vector<BodyXformGpu> xf;
-  BuildBodyXforms(debris, mobs, nullptr, xf);
+  bodyReg.BuildXforms(xf);
   if (!xf.empty())
     ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
                           xf.size() * sizeof(BodyXformGpu));
   std::vector<MicroBodyInstGpu> microInsts;
-  BuildMicroInsts(debris, mobs, nullptr, microInsts);
+  bodyReg.BuildMicroInsts(microInsts);
   std::vector<BodyVoxInst> inst;
-  debris.BuildInstances(inst);
-  mobs.AppendInstances(inst, debris.BodyCount());
+  bodyReg.BuildInstances(inst);
   if (!inst.empty())
     ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
                           inst.size() * sizeof(BodyVoxInst));
@@ -1609,17 +1614,22 @@ int main(int argc, char** argv) {
     if (ui.saveWorld) {
       ui.saveWorld = false;
       ctx.WaitIdle();
-      SaveWorld(ctx, world, stream, "world.svd");
+      // Grid + entities: everything outside the voxel grid rides the
+      // entities.sve sections registered in game/persist.cpp.
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar);
+      SaveWorld(ctx, world, stream, "world.svd", mats, &eio);
     }
     if (ui.loadWorld) {
       ui.loadWorld = false;
       ctx.WaitIdle();
-      if (LoadWorld(ctx, world, sim, stream, "world.svd")) {
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar);
+      if (LoadWorld(ctx, world, sim, stream, "world.svd", mats, &eio)) {
+        // Debris/mobs were reset and reloaded by their sections; the avatar
+        // was despawned by its reset and respawns on the next tick, applying
+        // the saved damage state (avatar.h persistence note). Only main's own
+        // transient state is cleared here.
         grenades.clear();
         everExploded = false;
-        debris.Reset();
-        mobs.Reset();
-        avatar.Despawn();
         tpRig.Snap();
       }
     }
@@ -1744,8 +1754,18 @@ int main(int argc, char** argv) {
         IVec3 hit{};
         if (lsnap.valid && lsnap.pick[0] != 0) {
           hit = {(int)lsnap.pick[2], (int)lsnap.pick[3], (int)lsnap.pick[4]};
+          // PROJECTED onto fwd, not the euclidean distance from the muzzle.
+          // The two distances compared below have to be the same measurement,
+          // and they come from two DIFFERENT rays: bodyDist is along fwd from
+          // the muzzle, while this pick cell was found by sim_pick.wgsl casting
+          // from R.camPos (the EYE) — the muzzle is offset right and down of
+          // that line, so a euclidean distance mixes in the ~0.86 vox lateral
+          // displacement. That inflates nothing but shortens plenty: the eye
+          // ray clips ground or a wall edge the muzzle ray misses, gridDist
+          // comes back shorter than the mob actually is, and the body branch
+          // never runs — which is "the laser stopped hurting mobs".
           gridDist =
-              (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - muzzle).len();
+              (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - muzzle).dot(fwd);
         }
         float frac = 1.0f;
         const float kLaserRange = CurrentTuning().tools.laserRange;
@@ -2769,13 +2789,10 @@ int main(int argc, char** argv) {
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mbSet.dirty = false;
       }
-      if (debris.InstancesDirty() || mobs.InstancesDirty() ||
-          avatar.InstancesDirty()) {
+      BodyRegistry bodyReg(debris, mobs, &avatar);
+      if (bodyReg.AnyInstancesDirty()) {
         std::vector<BodyVoxInst> inst;
-        debris.BuildInstances(inst);
-        mobs.AppendInstances(inst, debris.BodyCount());
-        avatar.AppendInstances(inst,
-                               debris.BodyCount() + mobs.LimbBodyCount());
+        bodyReg.BuildInstances(inst);
         bodyInstCount = (uint32_t)inst.size();
         if (!inst.empty())
           ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
@@ -2786,13 +2803,11 @@ int main(int argc, char** argv) {
       // are hoisted out of the loop so a steady-state frame reuses their
       // capacity instead of allocating — clear() keeps the storage.
       microInsts.clear();
-      if (debris.BodyCount() + mobs.LimbBodyCount() +
-              avatar.LimbBodyCount() >
-          0) {
-        BuildBodyXforms(debris, mobs, &avatar, bodyXf);
+      if (bodyReg.TotalSlots() > 0) {
+        bodyReg.BuildXforms(bodyXf);
         ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
                               bodyXf.size() * sizeof(BodyXformGpu));
-        BuildMicroInsts(debris, mobs, &avatar, microInsts);
+        bodyReg.BuildMicroInsts(microInsts);
       }
 
       wgpu::CommandEncoder enc = ctx.device.CreateCommandEncoder();

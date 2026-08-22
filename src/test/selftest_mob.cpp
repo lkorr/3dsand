@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "game/avatar.h"
+#include "game/bodyreg.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -327,17 +328,18 @@ bool mobOk = false;
         td.format = wgpu::TextureFormat::RGBA8Unorm;
         td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
 
-        // Slot lists exactly as the frame loop builds them.
+        // Slot lists exactly as the frame loop builds them: through the ONE
+        // slot walk in game/bodyreg.h.
+        BodyRegistry bodyReg(debris, mobs, nullptr);
         std::vector<BodyXformGpu> xf;
-        BuildBodyXforms(debris, mobs, nullptr, xf);
+        bodyReg.BuildXforms(xf);
         if (!xf.empty())
           ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
                                 xf.size() * sizeof(BodyXformGpu));
         std::vector<MicroBodyInstGpu> microInsts;
-        BuildMicroInsts(debris, mobs, nullptr, microInsts);
+        bodyReg.BuildMicroInsts(microInsts);
         std::vector<BodyVoxInst> inst;
-        debris.BuildInstances(inst);
-        mobs.AppendInstances(inst, debris.BodyCount());
+        bodyReg.BuildInstances(inst);
         if (!inst.empty())
           ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
                                 inst.size() * sizeof(BodyVoxInst));

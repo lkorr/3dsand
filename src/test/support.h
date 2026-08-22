@@ -63,15 +63,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
                     uint32_t seed);
 
-// Body render plumbing. Debris takes slots [0, D), mob limbs stack after, and
-// the player avatar's parts stack after those — the three systems must always
-// be walked in that order and with those bases. `avatar` may be null.
-void BuildBodyXforms(const DebrisSystem& debris, const MobSystem& mobs,
-                     const PlayerAvatar* avatar,
-                     std::vector<BodyXformGpu>& out);
-void BuildMicroInsts(const DebrisSystem& debris, const MobSystem& mobs,
-                     const PlayerAvatar* avatar,
-                     std::vector<MicroBodyInstGpu>& out);
+// Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE
+// definition of the debris | mob | avatar slot walk, and all three parallel
+// arrays (xforms, cube instances, micro insts) are built through it. The free
+// BuildBodyXforms/BuildMicroInsts helpers that lived here covered only two of
+// the three arrays, which left the instance walk hand-rolled at every call
+// site — the exact drift they existed to prevent.
 
 bool WriteBmpFile(const std::string& path, const std::vector<uint8_t>& rgba,
                   uint32_t w, uint32_t h);

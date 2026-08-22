@@ -173,6 +173,19 @@ class DebrisSystem {
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
 
+  // ---- persistence (sim/worldio.h, entities.sve section 'DBRS') -----------
+  // Everything a body IS travels: collider + skin lattices, transform, scales,
+  // bleed material. Jolt handles do NOT survive a session — load recreates
+  // each body at its saved pose with zero velocity, ASLEEP (worldio.h's
+  // rigidbody rule), so a settled pile reloads settled. The micro brick is
+  // NOT serialized: it is derived render state, re-packed on load from the
+  // authoritative lattice the same way ReskinMicro derives it after a carve
+  // (CLAUDE.md architecture guideline 3: derived data is reconstructible).
+  static constexpr uint32_t kSaveVersion = 1;
+  void SaveState(std::vector<uint8_t>& out) const;
+  // Contract (worldio LoadEntities): Reset() has already run.
+  bool LoadState(const uint8_t* data, size_t len, uint32_t version);
+
   // ---- break events -------------------------------------------------------
   // One entry per island that detached into a rigidbody this tick. Reported
   // rather than voiced here: this layer knows nothing about audio, the same

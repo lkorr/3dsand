@@ -183,32 +183,7 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   ctx.queue.Submit(1, &cmd);
 }
 
-// Body render plumbing shared by the frame loop and the selftest. Debris takes
-// slots [0, D), mob limbs stack after, and the player avatar's parts stack
-// after those — so the three systems must always be walked in that order and
-// with those bases, which is exactly the sort of agreement that rots when it
-// is spelled out at two call sites.
-//
-// `avatar` may be null (selftest paths that never spawn one); the slot walk is
-// then identical to what it was before the avatar existed.
-void BuildBodyXforms(const DebrisSystem& debris, const MobSystem& mobs,
-                     const PlayerAvatar* avatar,
-                     std::vector<BodyXformGpu>& out) {
-  debris.BuildXforms(out);
-  mobs.AppendXforms(out);
-  if (avatar) avatar->AppendXforms(out);
-}
-// Micro bodies (PLAN §C): already compacted, so `out.size()` IS the draw's
-// instance count and an empty result means the pass is skipped entirely.
-void BuildMicroInsts(const DebrisSystem& debris, const MobSystem& mobs,
-                     const PlayerAvatar* avatar,
-                     std::vector<MicroBodyInstGpu>& out) {
-  out.clear();
-  debris.AppendMicroInsts(out);
-  mobs.AppendMicroInsts(out, debris.BodyCount());
-  if (avatar)
-    avatar->AppendMicroInsts(out, debris.BodyCount() + mobs.LimbBodyCount());
-}
+// (Body render plumbing lives in game/bodyreg.h — see the note in support.h.)
 
 bool WriteBmpFile(const std::string& path, const std::vector<uint8_t>& rgba,
               uint32_t w, uint32_t h) {

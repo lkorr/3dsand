@@ -269,6 +269,20 @@ class MobSystem {
   // standing there, instead of only on the next ones spawned.
   void RefreshGoreProfiles();
 
+  // ---- persistence (sim/worldio.h, entities.sve section 'MOBS') -----------
+  // Live mobs round-trip: def BY NAME (an index is load-order dependent and
+  // rots — CLAUDE.md "author by name, resolve at load"), origin/heading, and
+  // per-limb hp, sever state and carve lattices (with the rig offsets a carve
+  // shifted, mob.h Limb notes). Load re-runs Spawn() so every derived quantity
+  // — anim state, joints, rest sole, flipbooks — comes from the def exactly as
+  // a fresh mob's does, then overlays the saved damage. DEAD mobs are not
+  // saved: their limbs were adopted into DebrisSystem at death and travel in
+  // the 'DBRS' section as the debris they already are.
+  static constexpr uint32_t kSaveVersion = 1;
+  void SaveState(std::vector<uint8_t>& out) const;
+  // Contract (worldio LoadEntities): Reset() has already run.
+  bool LoadState(const uint8_t* data, size_t len, uint32_t version);
+
   // ---- sever events -------------------------------------------------------
   // One entry per limb that came off, reported rather than voiced here: this
   // system knows nothing about audio, the same way it hands particle spawns
@@ -343,6 +357,12 @@ class MobSystem {
   uint32_t MobCount() const { return (uint32_t)mobs_.size(); }
 
   // introspection (selftest / overlay)
+  // Id of the i'th mob record, 0 past the end. A LOADED mob gets a fresh id
+  // (ids are session-local), so a test that saved one id needs this to find
+  // the reincarnation.
+  uint64_t MobIdAt(uint32_t i) const {
+    return i < mobs_.size() ? mobs_[i].id : 0;
+  }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
   Vec3 MobOrigin(uint64_t mobId) const;

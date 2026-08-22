@@ -173,6 +173,8 @@ add_executable(sandvox
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  src/game/bodyreg.cpp
+  src/game/persist.cpp
   src/game/anim.cpp
   src/game/avatar.cpp
   src/game/thirdperson.cpp

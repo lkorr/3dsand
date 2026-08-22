@@ -134,6 +134,161 @@ the selftest's blocking hash read is the one sanctioned exception.
 
 ---
 
+## Architecting a new system: guidelines
+
+Distilled from John Lin's *The Perfect Voxel Engine* (voxely.net, 2021),
+mirrored at **`docs/refs/perfect_voxel_engine.md`** — read it before a big
+architectural call. His thesis, in one line: **voxel engines die from their
+data format, not their renderer** — developers pick the structure that renders
+fastest, build every other system on top of it, and then discover it is hostile
+to collision, pathfinding, GI, dynamic objects, and new per-voxel attributes,
+by which point changing it means rewriting everything.
+
+These are guidelines for *designing* a feature, not invariants like the three
+rules above. Where this engine deliberately departs from the post, that is said
+outright below — sandvox is a specific game with a hard 16 bpv budget, not a
+general-purpose engine, and some of Lin's advice is wrong when applied here.
+
+### 1. Design the data format before the renderer, and design it for the system that will hate it most
+
+Lin's core observation: *"It's important to answer these questions ahead of
+time because most of the systems we build need to incorporate the format into
+their designs."* Sparse voxel octrees look brilliant until you ask them for
+collision detection, and *"storage and rendering are the only things they are
+acceptable (not even great) at."*
+
+Before adding a representation, write down how it answers the awkward
+questions, not the easy one:
+
+- How does a **physics query** hit it? A single-cell point sample and a swept
+  capsule are different questions.
+- How does it **serialize**, and does it round-trip bit-exactly? (The stain
+  bits shipped broken because the save format silently truncated hashed state.)
+- How does it **replicate** — can it be expressed as MutationQueue ops, or
+  does it need a second channel? A representation that cannot be expressed as
+  ops is a future networking bug (rule 3).
+- What does **worldgen** or an importer have to emit to produce one?
+- How does it **LOD out**, and what does it look like at the handoff?
+- What happens when it is **half-loaded** at the residency-window edge?
+
+If the answer to one of those is "we'll figure it out later", that is the
+system that will force the rewrite.
+
+### 2. Attributes go in a side table keyed by where they exist — never widened onto the base voxel
+
+This is the post's sharpest point, via a thought experiment: given a ray-tracing
+API taking `struct vertex_t { vec3 position; vec3 normal; }`, do you (A) add
+`vec3 color` to the vertex and update every consumer, or (B) accept opaque data
+with an offset/stride and bake *indices* instead of attributes? B is correct,
+and *"imagine replacing Vertex with Voxel and suddenly with answer A you've
+described Efficient Sparse Voxel Octrees."* The failure mode has a name in the
+post — `dumb_voxel_grid_t`, a grid carrying `material_ids`, `albedo`, `normal`,
+`vegetation_type`, `vegetation_state`, `redstone_strength` for every cell,
+everywhere, forever. His test: *"We don't want to store vegetation growth state
+deep underground in some cave where vegetation isn't growing anyway."*
+
+The existing rule "don't grow the 16-bit voxel; extra per-voxel state goes in
+an optional sparse auxiliary layer keyed by chunk" (DESIGN.md §3) is exactly
+answer B, and it holds. Concretely, when a feature wants new per-voxel state:
+
+- **Ask where it actually exists.** If it is meaningful in <10% of cells, it is
+  a sparse layer keyed by chunk, not a field.
+- **Ask whether it must be world state at all.** The cheapest attribute is one
+  that is *derived*: `microvox` gives grass and flowers per-cell sub-geometry
+  with *zero* per-instance storage, zero new world state and zero sim cost,
+  because the world cell stays an ordinary 16-bit voxel and only the raymarcher
+  substitutes the finer model. Reach for that shape first.
+- **The state nibble is not spare space.** Its meaning is already per-material
+  (variant / fullness / burn stage). Overloading it for a sixth meaning is
+  widening the voxel by stealth.
+
+**Where we depart from Lin:** he wants runtime-typed attributes with a name,
+bit width and type enum in a header, so modders can add fields the engine never
+heard of. We do not, and should not, put that indirection on the base voxel —
+16 bpv with a compile-time-known layout is what buys 100M+ resident voxels and
+integer-only deterministic kernels (rule 1). Our extensibility seam is
+different and already exists: **behavior is data via materials/reactions/tags,
+not via runtime-typed voxel fields.** Adding behavior means JSON and tags, not
+a new attribute. Keep the modding surface there.
+
+### 3. Use the format that fits the job, and make the conversion the seam
+
+*"The solution is actually rather obvious: to use whatever voxel format is best
+for the job! This means not having one or two, but as many as are necessary."*
+The precedent Lin cites is meshes: engines import obj/ply/fbx through a common
+interchange, then convert to whatever the GPU wants. Multiple representations
+are fine — *unowned, undocumented, silently-diverging* representations are not.
+
+This engine already runs several by design: the 16-bit world grid (sim truth),
+RLE region files (storage), far-field cascades (render-only LOD), micro bricks
+(render-only detail), `.vox` prefabs (authoring), microbody skins vs. derived
+colliders (skin authoritative, collider by majority-fill), and the MutationQueue
+op stream (mutation, save, replay, network). That is the pattern working.
+
+So when a system wants a different layout, add the *conversion*, don't fork the
+truth:
+
+- **Name one authoritative source per fact.** Every other representation is
+  derived, and says so in a header comment the way `farfield.h` does
+  ("Derived data only: no readbacks, no persistence, no sim interaction, not
+  hashed"). Two things that can both be edited are a desync waiting to happen.
+- **Derived data must be reconstructible and disposable.** If it cannot be
+  rebuilt from the authoritative source, it is not derived — it is a second
+  copy of the truth, and it belongs in the save format and the world hash.
+- **Put the conversion in one function with an obvious name.** Lin's point that
+  conversion operators are *"black boxes"* is the useful part: voxelizing a
+  mesh, importing a map, generating collision data, building a compressor and
+  baking an LOD are all the same shape of thing. A new importer or exporter
+  should be a new converter against an existing format, never a new format.
+- **A conversion is a natural test seam.** Round-trip it in a gate.
+
+### 4. No system should be closed-ended
+
+*"My main goal was to design everything in such a way that no system was
+closed-ended, and that developers could always iterate on or expand the engine
+without any codebase overhauls."* The Jobs quote he leans on is the test:
+*"what happens when you think of a great idea six months from now?"*
+
+Applied here — a new system should be open along the axis it will actually grow:
+
+- **Author content by name, resolve to ids at load.** Materials, glyphs, sound
+  sets and mob defs all do this; it is what makes hot-reload possible.
+- **Take a callback where you would otherwise take a concrete owner.** The
+  spell VM is not player-coupled — health arrives via `CasterHealth`, so a mob
+  casts through the identical path. `ApplySpellEffect` is one
+  position-parameterized payload, so casting at the muzzle and backfiring into
+  your own chest are the same call with different arguments. Prefer that shape.
+- **One authoring surface per kind of thing**, listed in exactly one place
+  (`sound_schema.js` for sound slots, `tuning_params.def` for `TUNE_*`). A
+  second list is the "two places that must agree" bug the invariant checker
+  exists to catch.
+- **Don't hardcode material IDs in shaders.** Shaders test authored *fields*
+  and tags; that is why behavior can be added as data.
+
+**Also note where Lin is honest about the cost.** His own reflection layer
+"requires pre-coding the supported type combos" and he calls it *"a little
+weak"*. Generality has a price, and this engine pays it selectively:
+determinism, the 16-bit voxel and integer-only sim kernels all beat flexibility
+where they conflict. Rules 1–3 above win every time. Openness is for the
+*authoring* and *composition* layers, not for the inner loop.
+
+### 5. Rendering is the small part — budget for the rest
+
+The post opens on why micro-voxel engines are *"basically synonymous with
+vaporware"*: the showcase renders billions of voxels and then goes quiet,
+because lighting, serialization, network sync, physics, AI, dynamic objects,
+procgen, per-voxel interaction and voxel characters were never designed for.
+
+Practical use here: when a feature looks done because it looks right on screen,
+it isn't. Ask what it does about persistence (does it survive save/load and
+chunk eviction?), determinism (does it touch hashed state — rule 1), idle cost
+(does it let chunks sleep — rule 2), the CPU mirror (does it query the grid
+outside the 3×3×3 window), and mutation (does it go through the queue — rule 3).
+A visually-correct system that fails those is the vaporware pattern in
+miniature.
+
+---
+
 ## Build and verify
 
 ```bash
