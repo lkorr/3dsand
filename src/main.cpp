@@ -254,6 +254,27 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // Standing over the middle looking down: the low-Fresnel angle, where
   // refraction, per-channel depth absorption and the visible bed carry it.
   render({420, 88, 452}, -1.571f, -0.75f, "screenshot_water_down.bmp");
+  // ---- SUBMERGED shots: the camera is INSIDE the lake ----
+  // These are the only views that exercise shadeSubmerged (god rays, silt,
+  // Snell's window, and the caustic web painted on the bed), and none of the
+  // above reach it: every one of them is a ray entering the water from dry
+  // air, which is a different code path entirely. The lake spans y=44 (floor)
+  // to y=68 (surface), so an eye at y=56 is comfortably mid-column with both
+  // the bed and the surface in reach.
+  //   _sub_up:    looking up at the underside of the surface — Snell's window,
+  //               the bright compressed disc of sky ringed by total internal
+  //               reflection. The single most recognisable underwater cue.
+  //   _sub_bed:   looking down/across at the lit bed — the caustic web is the
+  //               whole subject of this frame.
+  //   _sub_shaft: level and aimed toward the sun's azimuth, where the
+  //               forward-scattering phase makes the light shafts brightest.
+  render({420, 56, 420}, 0.785f, 1.20f, "screenshot_sub_up.bmp");
+  render({412, 58, 412}, 0.785f, -0.55f, "screenshot_sub_bed.bmp");
+  {
+    SkyState ss = SkyForTick(shotTun, shotTick);
+    float sunYaw = std::atan2(ss.sunDir[2], ss.sunDir[0]);
+    render({414, 54, 414}, sunYaw, 0.35f, "screenshot_sub_shaft.bmp");
+  }
   // Oil pond (260,300) and lava pool (220,520): the non-water liquid paths.
   // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
   // still render as a surface hit, untouched by any of the water work.
