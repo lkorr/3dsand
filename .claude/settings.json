@@ -1,14 +1,11 @@
 {
-  "worktree": {
-    "baseRef": "head"
-  },
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/worktree_brief.sh\""
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/board_brief.sh\""
           }
         ]
       }

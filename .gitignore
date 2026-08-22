@@ -27,12 +27,8 @@ dist/
 # tuner Notes tab — local engineering notes, not part of the engine
 notes/
 
-# Stale agent-board log from before worktrees replaced it (scripts/board.sh and
-# AGENTS_BOARD.md are both gone). Kept ignored so an old checkout's leftover
-# log does not show up as untracked in a fresh worktree.
+# Append-only agent coordination board (scripts/board.sh)
 AGENTS_BOARD.md
 
-# Claude Code worktrees: one isolated checkout per parallel agent session
-# (CLAUDE.md "Parallel sessions"). Contents are real checkouts of this repo,
-# so they must never show up as untracked files in the main one.
+# Leftover worktree checkouts (may still exist under .claude/worktrees/)
 .claude/worktrees/
