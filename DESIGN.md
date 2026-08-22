@@ -1000,6 +1000,12 @@ keeps its wounds as debris with no special case.
   status effects; some materials are absorbed on contact (Noita stain system —
   and remember its lesson: players will invent rules for anything you surface
   in the UI, so communicate statuses deliberately).
+  Traversal assists, all in `player.cpp`: step-up absorbs sub-step ledges, the
+  water-edge mantle climbs out of pools, and ledge grabbing covers everything
+  taller — airborne with space held, a lip between shoulders and fingertips
+  latches into a dead hang, and W pulls up (a committed mantle when the lip is
+  standable, an arm boost to the next grab when it is not, which chains up
+  rough walls).
 - **Projectiles** (spells, thrown things): no colliders — swept ray each frame
   (position + velocity look-ahead, anti-tunneling). Spell modifiers attach as
   **tags with per-frame logic** (material trail, AoE on hit, bounce, acceleration

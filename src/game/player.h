@@ -66,6 +66,26 @@ class Player {
   // at any bank height, which is what the move is actually for.
   float mantleTimer = 0.0f;
   Vec3 mantleTarget{};
+  // Climb rate of the active mantle, m/s — set alongside mantleTarget by
+  // whichever move latched it (waterMantleSpeed or ledgeMantleSpeed), so the
+  // one drive loop serves both without re-deciding whose climb this is.
+  float mantleSpeed = 0.0f;
+
+  // ---- ledge grab (procedural climbing) ----
+  // Airborne with space held and the arms facing a voxel lip within hand
+  // reach, the body latches on and dangles (LedgeGrabAhead in player.cpp).
+  // Pressing forward pulls it up: onto the lip through the same committed
+  // mantle the water edge uses when there is room to stand, or as a ballistic
+  // arm boost when there is not (a noisy wall's one-voxel ledge) — from the
+  // top of that boost the next lip is within reach, which is how a rough wall
+  // is scaled: grab, boost, grab. All feel numbers live in tuning.json
+  // player.ledge* (reach, hang drop, boost, mantle speed/timeout).
+  bool hanging = false;       // dangling from hangLip by the hands
+  bool ledgeGrabbed = false;  // one frame, when a grab latches (cues/tests)
+  IVec3 hangLip{};            // the solid voxel the hands are on
+  Vec3 hangAnchor{};          // where the body settles while dangling
+  Vec3 hangStand{};           // standing spot on the lip, re-validated at pull-up
+  Vec3 hangDir{1, 0, 0};      // horizontal facing at grab time, toward the wall
 
   // Jump grace windows, seconds remaining. coyoteTimer keeps a jump legal
   // briefly after leaving the ground; jumpBuffer remembers a press made just

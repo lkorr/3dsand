@@ -136,6 +136,30 @@ struct Tuning {
     // the bank collapsed, something shoved into the target — returns control
     // instead of holding movement hostage.
     float waterMantleTime = 0.9f;
+    // ---- ledge grab (procedural climbing) ----
+    // Airborne with space held and the arms facing a voxel lip within hand
+    // reach, the body latches on and dangles; W pulls it up (player.cpp
+    // LedgeGrabAhead + the hanging block in Player::Update).
+    //
+    // How far above the crown of the head the hands reach (meters). A 1.7 m
+    // body's standing reach is ~2.25 m, so ~0.55 past the top. Physical like
+    // stepUp, so voxel-size changes never change how much real wall is
+    // grabbable. 0 disables ledge grabbing entirely.
+    float ledgeReach = 0.55f;
+    // Dangling drop: the top of the head hangs this far below the held lip
+    // (arms extended overhead, slightly bent).
+    float ledgeHangDrop = 0.35f;
+    // Upward velocity of the ARM BOOST — the pull-up used when there is no
+    // room to stand on the lip (a rough wall's one-voxel ledge): ballistic,
+    // so the next lip up can catch near the apex and the climb chains.
+    // Matches jumpSpeed by default so a boost feels like a jump's worth of
+    // pull. 0 turns W-on-an-unstandable-lip into simply letting go.
+    float ledgeBoostSpeed = 5.25f;
+    // Speed and timeout of the committed pull-up onto a standable lip, and of
+    // the settle into the dead hang. Same semantics as the water mantle pair
+    // above — the timeout exists for a climb blocked partway by a live world.
+    float ledgeMantleSpeed = 4.5f;
+    float ledgeMantleTime = 0.9f;
     float halfWidth = 0.30f, halfHeight = 0.85f, eyeOffset = 0.65f;
     // Camera step smoothing: half-life (seconds) of the render-only eye
     // offset that cancels the vertical pop when the body steps up/down a

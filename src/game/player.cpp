@@ -253,6 +253,94 @@ bool WaterLedgeAhead(const Vec3& pos, const Vec3& dir, float surfaceY,
   return false;
 }
 
+// LEDGE GRAB: is there a lip within hand reach in the facing direction?
+//
+// The airborne sibling of WaterLedgeAhead, and the same kind of question asked
+// in a different frame of reference. The water jump measures from the
+// WATERLINE because a swimmer's body height above the surface is equilibrium
+// noise; a jumper has no waterline, so this measures from the BODY — but from
+// the HANDS, not the feet. The gesture is "arms up, facing the wall": anything
+// whose top surface sits between the shoulders and the fingertips
+// (ledgeReach above the head) is catchable, and anything below that is not a
+// grab, it is a step — kMaxStepUpVoxels already owns that regime.
+//
+// `dir` is the horizontal FACING (the arms point where the camera points), not
+// the pressed direction the water jump uses: mid-jump the player may have no
+// horizontal input at all — momentum is carrying them — and the grab is what
+// space is held FOR.
+//
+// Three probe columns (two hands and the centerline) at two depths, because a
+// hand can catch a lip slightly to the side or slightly farther out than the
+// face the body is pressed against. Each column is scanned TOP-DOWN and only
+// its FIRST solid cell can be the lip: if that cell has solid above it the
+// wall simply continues past reach and the column refuses — which is what
+// keeps a sheer wall ungrabbable at any fall speed. Requiring two clear cells
+// above the lip is hand room: a one-voxel slot between two slabs is a crack,
+// not a ledge.
+//
+// The HIGHEST lip across all columns wins. On a noisy wall that is the natural
+// climbing choice, and for a jump that fell short it is the surface the hands
+// pass last.
+struct LedgeHit {
+  IVec3 lip;    // the solid voxel the hands land on
+  Vec3 anchor;  // where the body settles while dangling (hands on lip)
+  Vec3 stand;   // standing position on top of the lip, validated at pull-up
+};
+bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir,
+                    const Player::KindFn& kindAt, LedgeHit* out) {
+  if (T().ledgeReach <= 0.0f) return false;  // knob at 0 disables grabbing
+  const Vec3 perp{-dir.z, 0.0f, dir.x};
+  const float reachUp = T().ledgeReach / kVoxelMeters;
+  // Shoulders up to fingertips. The lower bound matters as much as the upper:
+  // without it a chest-high lip "grabs" and the dangle settle yanks the body
+  // a full arm-plus-torso downward, which reads as the wall swallowing you.
+  const int yLo = ifloor(pos.y + 0.5f * Player::kHalfY);
+  const int yHi = ifloor(pos.y + Player::kHalfY + reachUp);
+  const float depths[2] = {Player::kHalfXZ + 0.6f, Player::kHalfXZ + 1.4f};
+  const float lats[3] = {0.0f, -0.6f * Player::kHalfXZ, 0.6f * Player::kHalfXZ};
+
+  bool found = false;
+  IVec3 bestLip{};
+  float bestAx = 0, bestAz = 0, bestLat = 0;
+  for (float ahead : depths) {
+    for (float lat : lats) {
+      const float ax = pos.x + dir.x * ahead + perp.x * lat;
+      const float az = pos.z + dir.z * ahead + perp.z * lat;
+      const int cx = ifloor(ax), cz = ifloor(az);
+      for (int y = yHi; y >= yLo; y--) {
+        if (kindAt({cx, y, cz}) != CellKind::Solid) continue;
+        // First solid from the top. A lip only if the hands have room on it.
+        if (kindAt({cx, y + 1, cz}) != CellKind::Solid &&
+            kindAt({cx, y + 2, cz}) != CellKind::Solid &&
+            (!found || y > bestLip.y)) {
+          found = true;
+          bestLip = {cx, y, cz};
+          bestAx = ax;
+          bestAz = az;
+          bestLat = lat;
+        }
+        break;  // solid with solid above: wall past reach, column refuses
+      }
+    }
+  }
+  if (!found) return false;
+  if (out) {
+    const float lipTop = (float)(bestLip.y + 1);
+    out->lip = bestLip;
+    // Dangle straight down from where the winning hand caught: same x/z as
+    // the body (shifted to the hand's column), head ledgeHangDrop below the
+    // lip. No pull toward the wall — the sweep-driven settle cannot penetrate
+    // anything, and drifting the body sideways on latch reads as suction.
+    out->anchor = {pos.x + perp.x * bestLat,
+                   lipTop - T().ledgeHangDrop / kVoxelMeters - Player::kHalfY,
+                   pos.z + perp.z * bestLat};
+    // Standing on the lip, centered over the probe point — the same shape
+    // WaterLedgeAhead hands back, consumed by the same mantle.
+    out->stand = {bestAx, lipTop + Player::kHalfY, bestAz};
+  }
+  return true;
+}
+
 // Try to advance horizontally by (dx, dz) using the classic Quake/Source
 // three-attempt step move, and take whichever attempt travelled farther
 // horizontally. Returns the height climbed IN VOXELS (0 if the flat move won).
@@ -321,6 +409,7 @@ float StepSlide(Vec3& pos, float dx, float dz, const Player::KindFn& kindAt) {
 void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
                     const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
   dt = std::min(dt, 0.05f);
+  ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
 
   // Decay the render-only step-smoothing offset toward zero (frame-rate
   // independent: a fixed half-life, so the eye covers half the remaining
@@ -446,7 +535,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   if (mantleTimer > 0.0f && !fly) {
     mantleTimer -= dt;
     Vec3 d = mantleTarget - pos;
-    const float rise = (T().waterMantleSpeed / kVoxelMeters) * dt;
+    const float rise = (mantleSpeed / kVoxelMeters) * dt;
     float yBefore = pos.y;
     if (d.y > 1e-3f) {
       SweepAxis(pos, std::min(d.y, rise), 1, kindAt);
@@ -479,6 +568,82 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     return;  // scripted: no gravity, no swim, no walk this frame
   }
 
+  // ---- ledge grab: dangling from a lip by the hands ----
+  //
+  // The same shape as the water mantle above: a scripted state that replaces
+  // the normal move while it holds. The latch itself happens at the END of the
+  // walk branch (post-move, so it judges where the body actually ended up);
+  // this block is everything that happens after it.
+  //
+  // Space held is the grip. Releasing it — or pressing crouch — lets go and
+  // drops from rest; gravity resumes THIS frame by falling through to the
+  // normal move. And because the world is a live cellular automaton, the lip
+  // is re-validated every frame: the voxel the hands are on can burn away,
+  // dissolve, or be sealed over between one frame and the next, and a grip on
+  // a cell that no longer exists must open on its own.
+  if (hanging && !fly) {
+    const bool lipOk =
+        kindAt(hangLip) == CellKind::Solid &&
+        kindAt({hangLip.x, hangLip.y + 1, hangLip.z}) != CellKind::Solid;
+    if (!in.up || in.down || !lipOk || inLiquid) {
+      hanging = false;  // let go: fall through, gravity resumes this frame
+    } else if (in.forward > 0.3f) {
+      // Pull up. Two regimes, chosen by whether the body can actually STAND
+      // on the lip — asked NOW, not at latch time, because the world may have
+      // changed while we dangled:
+      //
+      // Room to stand -> the same committed, rate-limited mantle the water
+      // edge uses (mantleTimer above). Reliable at any lip height, cannot
+      // overshoot, ends standing on the thing you climbed.
+      //
+      // No room (a one-voxel ledge on a rough wall, an overhang above) -> a
+      // ballistic ARM BOOST straight up. It cannot land you on this lip — a
+      // dead-hang body is a full arm-plus-height below it and a jump's worth
+      // of rise does not cover that — but it does not need to: near the apex
+      // the hands are a boost higher than they were, the latch below runs
+      // again, and the next lip up catches. Grab, boost, grab is how a noisy
+      // wall becomes climbable, which is exactly what this feature is for.
+      hanging = false;
+      if (!Collides(hangStand, kindAt)) {
+        mantleTarget = hangStand;
+        mantleSpeed = T().ledgeMantleSpeed;
+        mantleTimer = T().ledgeMantleTime;
+        vel = Vec3{0, 0, 0};
+        return;  // the mantle block above drives from the next frame
+      }
+      // Arms, not legs: deliberately not scaled by jumpScale — a wizard with
+      // no legs can still do a pull-up.
+      vel = Vec3{0, 0, 0};
+      vel.y = T().ledgeBoostSpeed / kVoxelMeters;
+      // fall through: the boost integrates through the normal move this frame
+    } else {
+      // Dangle. Velocity is zeroed and the body settles toward the anchor
+      // (hands on the lip, head ledgeHangDrop below it) — rate-limited at
+      // the mantle speed and moved through the SWEEPS, never by assignment,
+      // for the same live-world reasons the mantle lists.
+      vel = Vec3{0, 0, 0};
+      grounded = false;
+      coyoteTimer = 0.0f;
+      Vec3 d = hangAnchor - pos;
+      const float step = (T().ledgeMantleSpeed / kVoxelMeters) * dt;
+      const float yBefore = pos.y;
+      if (std::abs(d.y) > 1e-3f)
+        SweepAxis(pos, std::clamp(d.y, -step, step), 1, kindAt);
+      const float remain = std::sqrt(d.x * d.x + d.z * d.z);
+      if (remain > 1e-3f) {
+        const float s = std::min(1.0f, step / remain);
+        SweepAxis(pos, d.x * s, 0, kindAt);
+        SweepAxis(pos, d.z * s, 2, kindAt);
+      }
+      // Bank the settle into the view offset like every other scripted
+      // vertical move, so the eye eases down to the dead hang.
+      viewYOffset -= pos.y - yBefore;
+      viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
+                               (float)kMaxStepUpVoxels);
+      return;  // scripted: no gravity, no walk this frame
+    }
+  }
+
   if (fly) {
     float speed = (in.sprint ? T().flySprint : T().flySpeed) / kVoxelMeters;
     Vec3 wish = lookFwd * in.forward + right * in.strafe;
@@ -487,6 +652,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     vel = wish.len() > 1e-3f ? wish.normalized() * speed : Vec3{0, 0, 0};
     pos += vel * dt;
     grounded = false;
+    hanging = false;  // no timer guards the grip, so fly must open it
     coyoteTimer = 0.0f;
     viewYOffset = 0.0f;  // fly motion is deliberate: never smooth it
   } else {
@@ -560,6 +726,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         Vec3 target;
         if (WaterLedgeAhead(pos, dir, waterSurfaceY, kindAt, &target)) {
           mantleTarget = target;
+          mantleSpeed = T().waterMantleSpeed;
           mantleTimer = T().waterMantleTime;
           jumpBuffer = 0.0f;  // consume, or it re-fires every frame in contact
           waterJumped = true;
@@ -634,6 +801,34 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     grounded = !rising && !inLiquid &&
                GroundProbe(pos, 0.1f, kindAt) >= 0.0f;
     if (grounded) coyoteTimer = T().coyoteTime;
+
+    // ---- ledge grab latch (see the hanging block above) ----
+    //
+    // Airborne, space held — the same reach-up gesture swimming uses — and
+    // not powering upward: the vel.y gate is nonJumpSpeed, the constant that
+    // already means "unambiguously leaving the ground under own power". While
+    // a jump or an arm boost is still driving up, the hands stay off the
+    // wall; that is also what stops a boost from instantly re-latching the
+    // lip it just left. Judged AFTER the move, against where the body
+    // actually ended the frame.
+    if (!hanging && !grounded && !inLiquid && mantleTimer <= 0.0f && in.up &&
+        !in.down && vel.y <= nonJumpSpeed) {
+      Vec3 dir = flatFwd;
+      dir.y = 0.0f;
+      if (dir.len() > 1e-3f) {
+        dir = dir.normalized();
+        LedgeHit hit;
+        if (LedgeGrabAhead(pos, dir, kindAt, &hit)) {
+          hanging = true;
+          ledgeGrabbed = true;
+          hangLip = hit.lip;
+          hangAnchor = hit.anchor;
+          hangStand = hit.stand;
+          hangDir = dir;
+          vel = Vec3{0, 0, 0};  // the grip arrests the fall
+        }
+      }
+    }
 
     // Surface roughness is free; only real ledges cost speed. Without this
     // exemption, fine voxels turn every noisy floor into a constant drag.
