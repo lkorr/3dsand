@@ -356,6 +356,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "liquidDrag", p.liquidDrag, out, at);
     ReadF(*g, "liquidGravityScale", p.liquidGravityScale, out, at);
     ReadF(*g, "liquidSpeedScale", p.liquidSpeedScale, out, at);
+    ReadF(*g, "waterMantleSpeed", p.waterMantleSpeed, out, at);
+    ReadF(*g, "waterMantleTime", p.waterMantleTime, out, at);
     ReadF(*g, "halfWidth", p.halfWidth, out, at);
     ReadF(*g, "halfHeight", p.halfHeight, out, at);
     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);

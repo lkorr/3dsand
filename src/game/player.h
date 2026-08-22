@@ -44,6 +44,28 @@ class Player {
   bool fly = true;          // start in fly mode until the first mirror arrives
   bool grounded = false;
   bool inLiquid = false;
+  // Fraction of the body under liquid, 0..1. Every liquid effect (drag,
+  // buoyancy, wade speed) scales with this rather than switching on the first
+  // submerged sample, so ankle-deep and fully-under are different states.
+  float submersion = 0.0f;
+
+  // ---- water-edge mantle (climbing out of a pool) ----
+  // Set for one frame when a jump pressed into a water's edge is accepted;
+  // informational for the caller (cues, avatar animation, tests).
+  bool waterJumped = false;
+  // While non-zero, the body is being pulled up onto `mantleTarget` — the
+  // standing position on top of the ledge that WaterLedgeAhead validated.
+  // Counts down in seconds; the climb is rate-limited rather than a teleport.
+  //
+  // A mantle rather than a ballistic impulse because a floating swimmer's feet
+  // dangle most of a body below the waterline (buoyancy is a gravity scale, so
+  // equilibrium sits deep), which makes the lip of an ordinary pool an 11-voxel
+  // lift from a dead float — past what a jump reaches. Tuning the impulse up to
+  // cover it would launch you off shallow banks by the same amount. Committing
+  // to a validated target instead makes climbing out reliable at any depth and
+  // at any bank height, which is what the move is actually for.
+  float mantleTimer = 0.0f;
+  Vec3 mantleTarget{};
 
   // Jump grace windows, seconds remaining. coyoteTimer keeps a jump legal
   // briefly after leaving the ground; jumpBuffer remembers a press made just

@@ -117,6 +117,25 @@ struct Tuning {
     float liquidDrag = 8.3f;
     float liquidGravityScale = 0.25f;
     float liquidSpeedScale = 0.55f;
+    // ---- water-edge mantle (climbing out of a pool) ----
+    // Swim thrust is drag-limited on purpose, which means it cannot climb out
+    // of anything: at a pool wall you bob against the rim forever. So a jump
+    // pressed INTO a climbable bank while in liquid pulls the body up onto it
+    // (Player::Update, WaterLedgeAhead).
+    //
+    // A mantle rather than a bigger jump because a floating body's feet dangle
+    // most of a body below the waterline, which puts an ordinary pool lip ~11
+    // voxels above them — an impulse big enough to clear that from a dead float
+    // would fling you off a shallow bank by the same amount. See player.h.
+    //
+    // How fast (m/s) the body climbs. Fast enough not to feel like a cutscene,
+    // slow enough to read as pulling yourself out rather than teleporting.
+    float waterMantleSpeed = 4.5f;
+    // Hard cap (seconds) on one climb. This is a timeout, not a duration: the
+    // mantle normally ends on arrival. It exists so a climb blocked partway —
+    // the bank collapsed, something shoved into the target — returns control
+    // instead of holding movement hostage.
+    float waterMantleTime = 0.9f;
     float halfWidth = 0.30f, halfHeight = 0.85f, eyeOffset = 0.65f;
     // Camera step smoothing: half-life (seconds) of the render-only eye
     // offset that cancels the vertical pop when the body steps up/down a

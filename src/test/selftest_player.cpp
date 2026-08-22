@@ -155,11 +155,171 @@ bool walkOk = false;
   return walkOk ? Status::Pass : Status::Fail;
 }
 
+// ---- player-waterjump --------------------------------------------------
+//
+// Getting OUT of a pool. Swim thrust is drag-limited by design, so it cannot
+// climb anything on its own — before the water-edge jump, pressing into the rim
+// of a pool left you bobbing against it indefinitely. The mechanic under test
+// turns a jump pressed INTO a climbable ledge while in liquid into a real jump
+// impulse (player.cpp WaterLedgeAhead).
+//
+// The world here is SYNTHETIC — a pure kindAt lambda, no GPU, no terrain. That
+// is deliberate on two counts. The geometry this needs (a pool with a rim at a
+// known height, and a sheer wall with no rim) does not occur at a known
+// location in generated terrain, and gates run in sequence with the streaming
+// gate leaving the window origin ~20 chunks out, so anything anchored to a
+// world position is fragile. A lambda states the fixture exactly and the code
+// under test cannot tell the difference.
+//
+// Three assertions, and the negative ones carry the weight: an unconditional
+// "jump works in water" would pass the first alone.
+Status GatePlayerWaterJump(Ctx&, std::string& detail) {
+  // Pool: solid floor at y < 100, water in 100..129 for x < 140, and a solid
+  // bank from x >= 140 rising to y = 134. So the water surface is y=130 and the
+  // lip is 4 voxels above it.
+  //
+  // TWO NUMBERS HERE ARE LOAD-BEARING, and both were wrong in earlier versions
+  // of this fixture in ways that made it test nothing:
+  //
+  // The pool is 30 voxels deep against a 17-voxel body so the player actually
+  // SWIMS. At 10 voxels the body just stood on the bottom with its head out,
+  // which is wading, not swimming.
+  //
+  // The bank is 4 voxels proud of the water because kMaxStepUpVoxels is ~6:
+  // a 2-voxel lip is an ordinary STEP, and a floating body whose feet have
+  // risen above the waterline simply walks over it with no water-edge logic
+  // involved at all. The gate passed that way once and was measuring the step
+  // code. It must be tall enough that only the mantle can clear it, and low
+  // enough to still be a bank you would expect to climb.
+  const float kWater = 130.0f, kRim = 134.0f;
+  auto poolKind = [&](IVec3 c) {
+    if (c.y < 100) return CellKind::Solid;
+    if (c.x >= 140) return c.y < (int)kRim ? CellKind::Solid : CellKind::Air;
+    return c.y < (int)kWater ? CellKind::Liquid : CellKind::Air;
+  };
+  // Sheer wall: same pool, but the barrier runs up forever. Nothing to land on,
+  // so the boost must NOT fire — otherwise you climb any wall from any depth.
+  auto cliffKind = [&](IVec3 c) {
+    if (c.y < 100) return CellKind::Solid;
+    if (c.x >= 140) return CellKind::Solid;
+    return c.y < (int)kWater ? CellKind::Liquid : CellKind::Air;
+  };
+
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  const float dt = 1.0f / 60.0f;
+
+  // Float the body at the surface, right up against the rim, and run it until
+  // the swim/drag state settles so the measurement starts from equilibrium
+  // rather than from whatever the drop-in left behind.
+  //
+  // `up` is held for the whole settle, and that is not incidental: buoyancy is
+  // only a gravity SCALE (liquidGravityScale 0.25), so a body that stops
+  // paddling sinks to the pool floor. Treading water at the surface is what a
+  // player about to climb out is actually doing, and it is the only state in
+  // which the rim is within a step. The first version of this fixture pressed
+  // forward alone, settled on the bottom 12 voxels down, and read as a failure
+  // of the mechanic when it was really a failure to be at the surface.
+  auto settleAtRim = [&](const Player::KindFn& kindAt) {
+    Player p;
+    p.fly = false;
+    // Start clear of the wall and let the swim press close the gap. The AABB is
+    // kHalfXZ wide, so spawning at the wall face (139.4, the first version of
+    // this fixture) puts the box INSIDE the rim: every sweep then vetoes from
+    // an overlapping start, the body cannot move on any axis, and the gate
+    // reads as "the mechanic did nothing" when really nothing was ever able to
+    // move. Two body-widths back is comfortably clear.
+    p.pos = Vec3{140.0f - 3.0f * Player::kHalfXZ, kWater - 1.0f, 140.5f};
+    PlayerInput swim;
+    swim.forward = 1.0f;  // press into the rim the whole time
+    swim.up = true;       // tread water, or buoyancy alone sinks us
+    for (int i = 0; i < 120; i++) p.Update(dt, swim, fwd, right, fwd, kindAt);
+    return p;
+  };
+
+  // (a) POOL: pressing into the rim and jumping must put the feet ABOVE the lip.
+  // The assertion is positional, not "did velocity go up": a boost that lifts
+  // you a little and drops you back in is the bug this exists to catch, so the
+  // only statement worth making is that the body ends up out of the water and
+  // on top of the rim.
+  Player::KindFn poolFn = poolKind;
+  Player pool = settleAtRim(poolFn);
+  float floatFeet = pool.pos.y - Player::kHalfY;
+  // Precondition, asserted not assumed: treading water at the SURFACE, clear
+  // of the pool floor at y=100. Standing on the bottom would make every
+  // negative assertion below pass for the wrong reason (nothing is within a
+  // step of the bottom, so nothing would fire regardless of the mechanic).
+  bool wasSwimming = pool.inLiquid && floatFeet > 105.0f;
+  {
+    PlayerInput jump;
+    jump.forward = 1.0f;
+    jump.jumpPressed = true;
+    jump.up = true;
+    pool.Update(dt, jump, fwd, right, fwd, poolFn);
+  }
+  bool fired = pool.waterJumped;
+  // Let the climb play out and then some. Input keeps pressing forward
+  // (jumpPressed is a single frame, exactly as main.cpp delivers it). The extra
+  // frames past the mantle timeout matter: they are what catches a climb that
+  // reaches the lip and then slides back into the pool, which is the failure
+  // this whole mechanic exists to prevent.
+  {
+    PlayerInput hold;
+    hold.forward = 1.0f;
+    for (int i = 0; i < 180; i++) pool.Update(dt, hold, fwd, right, fwd, poolFn);
+  }
+  float outFeet = pool.pos.y - Player::kHalfY;
+  // OUT means standing on the bank: feet at the rim top, body past the wall,
+  // and no longer in the water. All three, because each alone has a way to be
+  // true while still stuck — hanging on the lip, or clipped into the rim.
+  // Past the wall means the whole BOX is over the bank, not just the centre —
+  // the AABB is kHalfXZ wide, so a centre barely past 140 is still hanging over
+  // the water.
+  bool climbedOut = outFeet >= kRim - 0.5f &&
+                    pool.pos.x > 140.0f + Player::kHalfXZ && !pool.inLiquid;
+
+  // (b) SHEER WALL: same press, same jump, no ledge. Must not fire.
+  Player::KindFn cliffFn = cliffKind;
+  Player cliff = settleAtRim(cliffFn);
+  {
+    PlayerInput jump;
+    jump.forward = 1.0f;
+    jump.jumpPressed = true;
+    jump.up = true;
+    cliff.Update(dt, jump, fwd, right, fwd, cliffFn);
+  }
+  bool cliffFired = cliff.waterJumped;
+
+  // (c) OPEN WATER: pressing away from the rim, into nothing. Must not fire —
+  // this is what keeps ordinary swimming unchanged.
+  Player open = settleAtRim(poolFn);
+  bool openFired = false;
+  {
+    PlayerInput jump;
+    jump.forward = -1.0f;  // away from the rim
+    jump.jumpPressed = true;
+    jump.up = true;
+    open.Update(dt, jump, fwd, right, fwd, poolFn);
+    openFired = open.waterJumped;
+  }
+
+  bool ok = wasSwimming && fired && climbedOut && !cliffFired && !openFired;
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "floated feet y=%.1f -> out y=%.1f x=%.1f (rim %.0f), "
+                "fired=%d cliff=%d open=%d",
+                floatFeet, outFeet, pool.pos.x, kRim, fired ? 1 : 0,
+                cliffFired ? 1 : 0, openFired ? 1 : 0);
+  detail = buf;
+  std::printf("player waterjump: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
   static const std::vector<Gate> g = {
       {"player-walk", "player", {}, false, GatePlayerWalk},
+      {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
   };
   return g;
 }

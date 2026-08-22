@@ -87,6 +87,8 @@ const TUNING_SCHEMA = [
       {k:'liquidSpeedScale', n:'wade speed', d:'Horizontal speed multiplier in liquid.', min:0.05, max:1, step:0.01},
       {k:'liquidAccel', n:'liquid accel', d:'Steering authority in liquid — low is sluggish.', min:0.1, max:60, step:0.1, u:'/s'},
       {k:'liquidDrag', n:'liquid drag', d:'Vertical damping in liquid. Higher sinks/rises more reluctantly.', min:0, max:40, step:0.1, u:'/s'},
+      {k:'waterMantleSpeed', n:'climb-out speed', d:'How fast the body pulls itself onto a bank when you press INTO the water\'s edge and jump. Swim thrust is drag-limited and cannot climb anything on its own, so this is the way out of a pool. It is a mantle rather than a bigger jump because a floating body\'s feet dangle most of a body below the waterline — an impulse able to clear a pool lip from a dead float would fling you off a shallow bank. 0 disables the climb-out entirely.', min:0, max:20, step:0.1, u:'m/s'},
+      {k:'waterMantleTime', n:'climb-out timeout', d:'Hard cap on one climb-out. A timeout, not a duration — the climb normally ends on arrival. This is what returns control if the bank collapses or something blocks the target partway up.', min:0.1, max:3, step:0.05, u:'s'},
       {k:'halfWidth', n:'body half-width', d:'Half the AABB width — controls the tightest gap you fit through.', min:0.05, max:1.5, step:0.01, u:'m', warn:'Collision geometry: a large change can wedge the player in tight terrain.'},
       {k:'halfHeight', n:'body half-height', d:'Half the body height (0.85 = a 1.7 m player).', min:0.2, max:3, step:0.01, u:'m', warn:'Collision geometry. Must stay well under 3 chunks or collision breaks.'},
       {k:'eyeOffset', n:'eye height', d:'Camera offset above the AABB centre.', min:-1, max:2, step:0.01, u:'m'},

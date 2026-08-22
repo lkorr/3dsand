@@ -24,6 +24,8 @@
     "liquidDrag": 8.3,
     "liquidGravityScale": 0.25,
     "liquidSpeedScale": 0.55,
+    "waterMantleSpeed": 4.5,
+    "waterMantleTime": 0.9,
     "halfWidth": 0.3,
     "halfHeight": 0.85,
     "eyeOffset": 0.65,

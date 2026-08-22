@@ -176,6 +176,83 @@ float UnstickRise(const Vec3& pos, float maxRise, const Player::KindFn& kindAt) 
   return -1.0f;  // buried deeper than the cap allows: leave them in it
 }
 
+// WATER-EDGE JUMP: is there a bank in front of us that a jump would put us on?
+//
+// Swimming is drag-limited by design (liquidDrag), so the swim thrust alone
+// tops out at a slow crawl and cannot climb out of anything — at a pool wall
+// you bob against the edge indefinitely. Every engine that has water solves
+// this the same way: while in liquid, a jump pressed INTO the bank becomes a
+// real jump impulse rather than swim thrust (Quake/Source `waterjump`,
+// Minecraft's horizontal-collision + step check). This is the predicate.
+//
+// THE FRAME OF REFERENCE IS THE WATERLINE, NOT THE BODY. That is the whole
+// subtlety here, and the first version of this function got it wrong by
+// probing the AABB the way the ground step-up does. A floating swimmer does
+// not stand on anything: the body straddles the surface with its feet dangling
+// however deep the equilibrium between swimUp and buoyancy puts them — in this
+// engine about 9 of 17 voxels submerged. Measured against those feet, the lip
+// of an ordinary pool is ~11 voxels up, three times the step budget, so an
+// AABB-relative test refuses every real pool edge while the player is visibly
+// bobbing right at it. The question that actually matters is about the water's
+// edge — "is there a bank at the surface in front of me, with room above it" —
+// and the answer must not change when the body floats a little higher or lower.
+//
+// `dir` is the horizontal direction the player is pressing, already normalized.
+// `surfaceY` is the height of the first non-liquid cell above the body, i.e.
+// the waterline. True when both hold:
+//   (1) the cell just across the water's edge, at the waterline, is solid —
+//       the "against a bank or a wall" part, and the reason a jump in open
+//       water is unaffected;
+//   (2) there is room for the body to stand on top of it. A bank you cannot
+//       fit on is not a way out, it is an overhang; boosting into it just
+//       bonks your head and drops you back in.
+//
+// Deliberately NOT gated on how deep the body is. Depth limits this on its own:
+// the impulse is a fixed velocity fighting liquidDrag, so from the bottom of a
+// deep lake it buys a fraction of a meter, while at the surface — where the
+// body leaves the liquid and the drag stops applying — the same impulse carries
+// the full jump. That falls out of the physics rather than needing a threshold.
+// `out` receives the position the body would STAND at on top of the ledge —
+// the same point the fit test below validates, handed back so the caller does
+// not have to re-derive it (and cannot derive it differently).
+bool WaterLedgeAhead(const Vec3& pos, const Vec3& dir, float surfaceY,
+                     const Player::KindFn& kindAt, Vec3* out) {
+  // How far ahead to probe: just past the AABB face, so we are asking about
+  // the voxel we are pressed against, not one we are merely near.
+  const float kProbeAhead = Player::kHalfXZ + 0.6f;
+  const float ax = pos.x + dir.x * kProbeAhead;
+  const float az = pos.z + dir.z * kProbeAhead;
+
+  // (1) is the water's edge a wall? Sample AT the waterline — the cell the
+  // surface runs into. A bank one voxel proud of the water and a cliff a
+  // hundred voxels tall both answer yes here; (2) is what separates them.
+  if (kindAt({ifloor(ax), ifloor(surfaceY), ifloor(az)}) != CellKind::Solid)
+    return false;
+
+  // (2) can the body stand on it? Place the AABB on top of that cell and ask
+  // whether it fits. This is the test that refuses a sheer cliff: on a pool rim
+  // the space above the lip is open and the body fits, whereas against a wall
+  // that keeps going the same box is buried in rock. It also refuses an
+  // overhang, since the ceiling is what the box collides with there.
+  //
+  // A LEDGE MAY BE SEVERAL VOXELS PROUD of the water, so scan upward rather
+  // than testing only the cell directly above: a pool with a raised coping, or
+  // a bank the terrain generator left two voxels high, is exactly the case a
+  // player expects to climb. The scan is capped at the step budget so this
+  // stays "a ledge you could have walked up had you been on land" rather than
+  // a general-purpose wall climb.
+  const float lipY = std::floor(surfaceY) + 1.0f;
+  const float maxLip = lipY + (float)Player::kMaxStepUpVoxels;
+  for (float top = lipY; top <= maxLip + 1e-4f; top += 1.0f) {
+    Vec3 stand{ax, top + Player::kHalfY, az};
+    if (!Collides(stand, kindAt)) {
+      if (out) *out = stand;
+      return true;
+    }
+  }
+  return false;
+}
+
 // Try to advance horizontally by (dx, dz) using the classic Quake/Source
 // three-attempt step move, and take whichever attempt travelled farther
 // horizontally. Returns the height climbed IN VOXELS (0 if the flat move won).
@@ -299,11 +376,108 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     if (kindAt(c) == CellKind::Liquid) liquidCells++;
   }
   inLiquid = liquidCells > 0;
+  // HOW MUCH of the body is under, 0..1 — not just whether any of it is.
+  //
+  // The count was already being taken here and then thrown away on a `> 0`,
+  // which made every liquid effect all-or-nothing: a body with its toes in a
+  // puddle got the same full drag, buoyancy and wade-speed penalty as one
+  // fully submerged. That is what made the water-edge jump impossible to tune
+  // rather than merely weak. A floating swimmer's feet sit below the waterline
+  // by construction, so `inLiquid` stayed true for the entire jump arc and the
+  // full liquidDrag ate the impulse ~6 voxels up, every time, no matter how
+  // large the impulse was. Drag you cannot escape by rising is not drag, it is
+  // a ceiling.
+  //
+  // Scaling by submersion removes the ceiling without special-casing the jump:
+  // as the body clears the surface the drag naturally releases, which is also
+  // the correct answer for wading, for a swimmer's head breaking the surface,
+  // and for standing in shallow water — all of which previously read as "fully
+  // in the sea".
+  const float submersion =
+      (float)liquidCells / (float)kLiquidSamples;
+
+  // WATERLINE: the first non-liquid cell above the deepest liquid we are in.
+  // The water-edge jump is measured against this rather than against the body
+  // (see WaterLedgeAhead), so it needs the actual surface height, not a sample.
+  //
+  // Scanned from the feet UP, and only as far as a body height above the head:
+  // the surface we care about is the one WE are floating in, and a submerged
+  // swimmer under an air pocket should read the top of their own water column,
+  // not some other surface far above. Bounded so a deep dive cannot turn this
+  // into a long walk up the column every frame.
+  float waterSurfaceY = 0.0f;
+  bool haveSurface = false;
+  if (inLiquid) {
+    const int feet = ifloor(pos.y - kHalfY);
+    const int ceiling = ifloor(pos.y + kHalfY) + (int)(2.0f * kHalfY);
+    const int cx = ifloor(pos.x), cz = ifloor(pos.z);
+    for (int y = feet; y <= ceiling; y++) {
+      if (kindAt({cx, y, cz}) != CellKind::Liquid) {
+        waterSurfaceY = (float)y;
+        haveSurface = true;
+        break;
+      }
+    }
+  }
 
   // Timers run every frame regardless of mode so they never go stale in fly.
   if (coyoteTimer > 0.0f) coyoteTimer -= dt;
   if (jumpBuffer > 0.0f) jumpBuffer -= dt;
   if (in.jumpPressed) jumpBuffer = T().jumpBufferTime;
+
+  // ---- water-edge mantle: drive the body onto the ledge it committed to ----
+  //
+  // A scripted climb, so it runs INSTEAD of the normal move rather than
+  // alongside it: normal movement is what cannot get out of the water in the
+  // first place (see the mantleTimer note in player.h), and letting gravity and
+  // drag keep acting during the climb just fights it. Velocity stays zeroed and
+  // position is driven straight at the validated target.
+  //
+  // It still moves through the SWEEPS, never by assignment. The target was
+  // validated as free when the mantle latched, but the world is a live cellular
+  // automaton — the bank can collapse, or a powder can pour into the spot,
+  // between the latch and the arrival. Sweeping means the worst case is being
+  // stopped short and dropped back in the water, which is recoverable, rather
+  // than being teleported inside solid rock, which is the welded-in-place state
+  // UnstickRise exists to dig out of.
+  //
+  // UP FIRST, then across. Reversed, the body drives into the wall it is
+  // climbing and the mantle stalls against it every time.
+  if (mantleTimer > 0.0f && !fly) {
+    mantleTimer -= dt;
+    Vec3 d = mantleTarget - pos;
+    const float rise = (T().waterMantleSpeed / kVoxelMeters) * dt;
+    float yBefore = pos.y;
+    if (d.y > 1e-3f) {
+      SweepAxis(pos, std::min(d.y, rise), 1, kindAt);
+    } else {
+      // At height: cross onto the bank. Only now, so the horizontal press
+      // cannot start until there is somewhere to press onto.
+      float remain = std::sqrt(d.x * d.x + d.z * d.z);
+      if (remain > 1e-3f) {
+        float s = std::min(1.0f, rise / remain);
+        SweepAxis(pos, d.x * s, 0, kindAt);
+        SweepAxis(pos, d.z * s, 2, kindAt);
+      }
+    }
+    // Bank the climb into the view offset like a step-up, so the camera glides
+    // out of the water instead of snapping up it.
+    viewYOffset -= pos.y - yBefore;
+    viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
+                             (float)kMaxStepUpVoxels);
+
+    // Done when we arrive, or when the timer runs out — the timeout is what
+    // stops a mantle that got blocked mid-climb (collapsed bank, a body shoved
+    // into the way) from holding movement hostage forever.
+    Vec3 left = mantleTarget - pos;
+    if (left.len() < 0.35f || mantleTimer <= 0.0f) {
+      mantleTimer = 0.0f;
+      vel = Vec3{0, 0, 0};
+      grounded = true;
+      coyoteTimer = T().coyoteTime;
+    }
+    return;  // scripted: no gravity, no swim, no walk this frame
+  }
 
   if (fly) {
     float speed = (in.sprint ? T().flySprint : T().flySpeed) / kVoxelMeters;
@@ -330,12 +504,20 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     if (onGround) coyoteTimer = T().coyoteTime;
 
     const float gravity = T().gravity / kVoxelMeters;
-    float accel = inLiquid ? T().liquidGravityScale : 1.0f;
+    // Buoyancy lerps in with submersion rather than switching on at the first
+    // sample: at 1/5 under you are barely lightened, fully under you get the
+    // authored liquidGravityScale. Same value at full submersion as before, so
+    // swimming proper is unchanged; what changes is the shallow end.
+    float accel =
+        inLiquid ? (1.0f + (T().liquidGravityScale - 1.0f) * submersion) : 1.0f;
     vel.y -= gravity * accel * dt;
 
+    // Wade speed also scales with submersion: ankle-deep water should barely
+    // slow you, chest-deep should be the authored liquidSpeedScale.
+    float wade =
+        inLiquid ? (1.0f + (T().liquidSpeedScale - 1.0f) * submersion) : 1.0f;
     float speed = ((in.sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
-                  (inLiquid ? T().liquidSpeedScale : 1.0f) *
-                  (speedScale > 0.0f ? speedScale : 0.0f);
+                  wade * (speedScale > 0.0f ? speedScale : 0.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
@@ -351,10 +533,52 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
 
     // ---- jump: buffered press + coyote window, both consumed on use ----
     bool jumped = false;
+    waterJumped = false;
     if (inLiquid) {
-      vel.y *= std::exp(-T().liquidDrag * dt);  // drag (frame-rate independent)
-      if (in.up) vel.y += (T().swimUp / kVoxelMeters) * dt;  // swim
-      if (in.down) vel.y -= (T().swimDown / kVoxelMeters) * dt;
+      // Drag proportional to how much of the body is actually in the water
+      // (frame-rate independent). This is the one that matters most: at full
+      // submersion it is exactly the authored liquidDrag, so swimming feels as
+      // tuned, but a body rising out of the water sheds it continuously
+      // instead of dragging until the last sample pops clear. Without this the
+      // water-edge jump cannot work at any impulse — see the note on
+      // `submersion` above.
+      vel.y *= std::exp(-T().liquidDrag * submersion * dt);
+
+      // Water-edge mantle. Gated on the same canJump/jumpScale the dry jump is
+      // — a wizard with no legs cannot pull themselves out of a pool either.
+      //
+      // The direction probed is the one the player is PRESSING, not the one
+      // they are looking at: pressing into the edge is the gesture, and using
+      // look direction instead would fire whenever you glanced at a nearby wall
+      // while swimming past it. With no horizontal input there is nothing to
+      // climb toward and the branch simply does not apply.
+      Vec3 dir = wish;
+      dir.y = 0;
+      if (mantleTimer <= 0.0f && jumpBuffer > 0.0f && canJump &&
+          jumpScale > 0.0f && haveSurface && dir.len() > 1e-3f) {
+        dir = dir.normalized();
+        Vec3 target;
+        if (WaterLedgeAhead(pos, dir, waterSurfaceY, kindAt, &target)) {
+          mantleTarget = target;
+          mantleTimer = T().waterMantleTime;
+          jumpBuffer = 0.0f;  // consume, or it re-fires every frame in contact
+          waterJumped = true;
+          vel = Vec3{0, 0, 0};  // the climb drives position, not velocity
+        }
+      }
+
+      if (!waterJumped && mantleTimer <= 0.0f) {
+        // Swim thrust scales with submersion for the same reason drag does:
+        // you can only push against water you are actually in. This is not a
+        // refinement, it is what keeps the surface a surface — swimUp is much
+        // larger than gravity, so an unscaled thrust against a drag that fades
+        // as you rise levitates the body clear out of the pool and leaves it
+        // hovering with only its feet wet. Scaled, thrust and buoyancy fall off
+        // together and the body settles AT the waterline, which is what
+        // floating is.
+        if (in.up) vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
+        if (in.down) vel.y -= (T().swimDown / kVoxelMeters) * submersion * dt;
+      }
     } else if (jumpBuffer > 0.0f && coyoteTimer > 0.0f && canJump &&
                jumpScale > 0.0f) {
       vel.y = (T().jumpSpeed / kVoxelMeters) * jumpScale;
