@@ -599,12 +599,27 @@ first-configure fetch) is removed in a cleanup commit that also simplifies the
 RHI seam to a single live backend. The seam itself stays: it is what made the
 port testable and it costs nothing to keep.
 
-**Phase 7 — sparse residency (the payoff).**
-4 GiB virtual voxels buffer (verify `maxStorageBufferRange`), 64 KiB pages = 4
-consecutive chunk slots; bind on write-need (worldgen/stream-in/mutation into
-an unbound page), unbind when all 4 chunks report `occTotal == 0` with
-hysteresis; sparse-queue binds fenced before the tick submit. Gated by
-`residencyNonResidentStrict` (else dense fallback).
+**Phase 7 — sparse residency (the payoff) — REWRITTEN 2026-08-22 per
+`docs/ROADMAP_scale.md` §1 (user-reviewed): SOFTWARE PAGE TABLE, not
+`VK_KHR_sparse_binding`.** Hardware sparse was validated as *available* on
+this GPU (phase 3a: all three caps YES) and rejected on evidence: measured
+`vkQueueBindSparse` cost degrading superlinearly with page count on NVIDIA
+(bind is a CPU queue submit, never GPU-driven), `maxStorageBufferRange`
+spec-capped at 4 GiB and 2 GiB on some AMD drivers (3a measured 4 GiB−1 here),
+and no way to express a `UNIFORM(material)` page — the sentinel that makes
+downward window growth (solid bulk) nearly free. Shape: flat u32 table, chunk
+slot → page index into a pooled physical buffer, or `EMPTY`/`UNIFORM(mat)`
+sentinel; one dependent load per chunk entered; the CA is unaware of it; NOT
+an octree (O(1), in-place mutation). Determinism by construction — no
+driver-dependent unbound-read behavior, so `residencyNonResidentStrict`
+becomes moot.
+*Checkpoints (unchanged in substance):*
+1. New gate: page alloc/free roundtrip under streaming + mutation.
+2. **Paged-vs-dense hash equality**: same seed, page table on/off, identical
+   hash sequence over a scripted scenario including sky-boundary explosions.
+3. Settled-world resident memory reported; full gate green.
+Window growth (2048³ @ 5 cm per ROADMAP §2) remains its own later milestone
+with fresh measurements.
 *Checkpoints:*
 1. New gate: unbind/rebind roundtrip under streaming + mutation.
 2. **Sparse-vs-dense hash equality**: same seed, sparse on/off, identical hash
