@@ -285,6 +285,38 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // Oil exercises the palette-derived absorption; lava is MATF_OPAQUE and must
   // still render as a surface hit, untouched by any of the water work.
   render({236, 80, 276}, 0.785f, -0.45f, "screenshot_oil.bmp");
+  // SUBMERGED IN OIL. The generic per-liquid profile (submergedProfile) has to
+  // be judged on a liquid that is NOT water, and oil is the far end of the
+  // range: opacity 235 against water's 90. What this frame must show is a
+  // near-blind brown-black press — visibility about a metre, no Snell window,
+  // no god rays, no silt — where the same code on water gives an 11 m view
+  // with light shafts in it. If this looks like brown water, the clarity curve
+  // is not separating them. The pool spans y=50 (floor) to y=68 (surface).
+  //
+  // Needs the window moved onto it, exactly like the pond shots at the end of
+  // this function and for the same reason: the pool centre (260,300) sits
+  // outside the origin window, and outside the window a liquid shades through
+  // the far-field cascade as flat colour with no submerged path at all. Shot
+  // from the origin window this frame is a grey slab of far-field stone.
+  {
+    world.SetWindowOrigin({260 / (int)kChunk - 8, 0, 300 / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    render({260, 60, 300}, 0.785f, 0.10f, "screenshot_oil_sub.bmp");
+    // Restore the origin window: the lava/blood/micro shots below all assume
+    // it, and a regen here would otherwise silently relocate every one of them.
+    world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 40; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+  }
   // Lava pool (220,520), surface y=64, rim y=66: close and low, the angle
   // where crust structure and the glow from the cracks have to carry the look.
   render({196, 74, 496}, 0.785f, -0.30f, "screenshot_lava.bmp");
