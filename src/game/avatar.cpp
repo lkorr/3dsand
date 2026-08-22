@@ -1812,7 +1812,7 @@ void PlayerAvatar::DetachPart(int index, bool adopt) {
     // Hand the micro description over with the body — that is what keeps a
     // severed microvoxel limb detailed as ordinary debris.
     debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
-                       def.physScale, std::move(p.skinVoxels));
+                       def.physScale, std::move(p.skinVoxels), def.bleedMat);
     p.skinVoxels.clear();
     p.holdBody = p.body;
     p.holdSeconds = kSeverHoldSeconds;
@@ -1834,7 +1834,7 @@ void PlayerAvatar::Die() {
     Part& p = parts[i];
     if (!p.body) continue;
     debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
-                       def.physScale, std::move(p.skinVoxels));
+                       def.physScale, std::move(p.skinVoxels), def.bleedMat);
     p.skinVoxels.clear();
     phys_->SetBodyKinematic(p.body, false);
     phys_->ClearCollisionGroup(p.body);
