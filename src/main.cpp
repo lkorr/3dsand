@@ -1526,8 +1526,18 @@ int main(int argc, char** argv) {
         IVec3 hit{};
         if (lsnap.valid && lsnap.pick[0] != 0) {
           hit = {(int)lsnap.pick[2], (int)lsnap.pick[3], (int)lsnap.pick[4]};
+          // PROJECTED onto fwd, not the euclidean distance from the muzzle.
+          // The two distances compared below have to be the same measurement,
+          // and they come from two DIFFERENT rays: bodyDist is along fwd from
+          // the muzzle, while this pick cell was found by sim_pick.wgsl casting
+          // from R.camPos (the EYE) — the muzzle is offset right and down of
+          // that line, so a euclidean distance mixes in the ~0.86 vox lateral
+          // displacement. That inflates nothing but shortens plenty: the eye
+          // ray clips ground or a wall edge the muzzle ray misses, gridDist
+          // comes back shorter than the mob actually is, and the body branch
+          // never runs — which is "the laser stopped hurting mobs".
           gridDist =
-              (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - muzzle).len();
+              (Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f} - muzzle).dot(fwd);
         }
         float frac = 1.0f;
         const float kLaserRange = CurrentTuning().tools.laserRange;
