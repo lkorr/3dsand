@@ -370,6 +370,36 @@ export function readVox(buf) {
     });
   }
 
+  // ---- fold the art-colour layers into their material layers --------------
+  // "<name>.col" is a parallel lattice of art-palette indices over the same
+  // cells as "<name>" (see ART_SUFFIX). It is matched by name and REMOVED from
+  // the model list: leaving it in would make it a limb of its own, and its
+  // box would widen the prefab AABB — which is the creature's gameplay size.
+  const colParts = new Map();
+  for (const p of parts) if (isArtLayerName(p.name)) colParts.set(artLayerBase(p.name), p);
+  if (colParts.size) {
+    const kept = [];
+    for (const p of parts) {
+      if (isArtLayerName(p.name)) continue;
+      const c = colParts.get(p.name);
+      if (c) {
+        // Key by absolute (already placed) cell, so the two layers line up
+        // even if their tight boxes differ.
+        const at = new Map();
+        for (let i = 0; i < c.cells.length; i++)
+          at.set(c.cells[i].x + ',' + c.cells[i].y + ',' + c.cells[i].z, c.mats[i]);
+        p.cols = p.cells.map(e => at.get(e.x + ',' + e.y + ',' + e.z) || 0);
+        colParts.delete(p.name);
+      }
+      kept.push(p);
+    }
+    for (const [name] of colParts)
+      warnings.push(`colour layer "${artLayerName(name)}" has no model named ` +
+                    `"${name}" — ignored`);
+    parts.length = 0;
+    parts.push(...kept);
+  }
+
   let prefab = null;
   if (parts.length) {
     let pmn = { x: Infinity, y: Infinity, z: Infinity };
@@ -383,9 +413,13 @@ export function readVox(buf) {
       models: parts.map(p => {
         const dim = { x: p.mx.x - p.mn.x + 1, y: p.mx.y - p.mn.y + 1, z: p.mx.z - p.mn.z + 1 };
         const g = makeGrid(dim);
-        for (let i = 0; i < p.cells.length; i++)
+        for (let i = 0; i < p.cells.length; i++) {
           gridSet(g, p.cells[i].x - p.mn.x, p.cells[i].y - p.mn.y,
                   p.cells[i].z - p.mn.z, p.mats[i]);
+          if (p.cols && p.cols[i])
+            gridColorSet(g, p.cells[i].x - p.mn.x, p.cells[i].y - p.mn.y,
+                         p.cells[i].z - p.mn.z, p.cols[i]);
+        }
         return {
           name: p.name,
           modelId: p.modelId,
@@ -1030,6 +1064,17 @@ export function prefabRoundTripTest(prefab, palette) {
       for (let c = 0; c < a.grid.data.length; c++)
         if (a.grid.data[c] !== b.grid.data[c])
           return { ok: false, bytes, error: `model ${i} (${a.name}) voxel drift at index ${c}` };
+      // The colour layer gets the same treatment as the material layer: a
+      // paint job that does not survive the save is exactly as broken as
+      // geometry that does not, and it is far harder to notice by eye.
+      for (let c = 0; c < a.grid.data.length; c++) {
+        const wa = (a.grid.color && a.grid.data[c]) ? a.grid.color[c] : 0;
+        const wb = (b.grid.color && b.grid.data[c]) ? b.grid.color[c] : 0;
+        if (wa !== wb)
+          return { ok: false, bytes,
+                   error: `model ${i} (${a.name}) art colour drift at index ${c}: ` +
+                          `${wb} != ${wa}` };
+      }
     }
     return { ok: true, bytes };
   } catch (e) {

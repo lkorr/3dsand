@@ -41,7 +41,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   readVox, writeVox, roundTripTest, prefabRoundTripTest, axisSelfTest,
   gridToModel, prefabToVoxModels, tightenPrefab, makeGrid, gridGet, gridSet,
-  paletteFromMaterials,
+  paletteFromMaterials, gridColorGet, gridColorSet, gridColorLayer,
+  ArtPalette, ART_SLOTS, isArtIndex,
 } from './vox.js';
 
 // Editable box cap, matching what the .vox format allows.
@@ -90,11 +91,39 @@ let wholeMode = false;
 let brushSize = 1;            // spherical radius for voxel/noise brushes (1 = single cell)
 let noiseDensity = 0.35;      // fraction of surface cells the noise brush hits
 
+/* --- art colour ----------------------------------------------------------
+   A voxel carries two independent facts: its MATERIAL (what it is made of —
+   meat, wood, stone; this is what the sim reacts to, and what a dismembered
+   limb becomes when its voxels land back in the grid) and its COLOUR (what
+   it looks like). A creature is meat everywhere and painted all over, so the
+   two cannot be the same channel.
+
+   `artColor` is the brush colour, null meaning "paint the material's own
+   colour", i.e. clear any art colour on the cell. `artAlpha` is coverage: at
+   1 the brush colour replaces, below 1 it is mixed into whatever colour the
+   voxel already shows, which is what makes layering translucent glazes work.
+   The mix happens at WRITE time against the resolved colour of each cell —
+   there is no stored alpha, because a voxel is opaque; only the brush is not. */
+let artColor = null;          // "#rrggbb" or null (= material colour)
+let artAlpha = 1;             // 0..1 brush coverage
+let artPalette = new ArtPalette();   // per-document; indices live in grid.color
+let recentColors = [];        // most-recent-first, deduped, capped
+const kRecentMax = 12;
+// Paint mode with a colour selected touches COLOUR ONLY, leaving the material
+// alone. That is what you want almost always: a creature is meat everywhere
+// and you are painting its skin, not restaining it into a different substance.
+// Turn it off to repaint colour and material in one stroke.
+let artColorOnly = true;
+
 // --- undo ----------------------------------------------------------------
-// Entries are {type, data}. Voxel: data is a flat [modelIndex, cellIndex,
-// oldMat, newMat] quad array. Color: data is {matIndex, variant, oldHex,
-// newHex}. The typed wrapper lets voxel strokes and color-wheel edits share
-// one Ctrl+Z stack without changing the voxel path's flat-array perf.
+// Entries are {type, data}. Voxel: data is a flat array of
+// [modelIndex, cellIndex, oldMat, newMat, oldArt, newArt] tuples — material
+// and art colour move together so one Ctrl+Z takes back a whole brush stroke
+// rather than half of it. Color: data is {matIndex, variant, oldHex, newHex}
+// (the MATERIAL colour wheel, a different thing from per-voxel art colour).
+// The typed wrapper lets these share one stack without changing the voxel
+// path's flat-array perf.
+const kOpStride = 6;
 let undoStack = [], redoStack = [], stroke = null;
 
 // --- clipboard -----------------------------------------------------------
@@ -150,6 +179,45 @@ const matName = id => (materials[id - 1]?.id) || ('#' + id);
 const matColor = id => (id > 0 && materials[id - 1])
   ? ((materials[id - 1].colors || [])[0] || '#888888')
   : '#888888';
+
+/* ---- art colour resolution ---------------------------------------------
+   What a voxel actually LOOKS like: its art colour when it has been painted,
+   otherwise its material's colour. Every display path (viewport, thumbnail,
+   eyedropper, the blend below) goes through this one function, so painted
+   and unpainted voxels can never disagree about what is on screen.       */
+
+const hexToRgb = hex => {
+  const s = String(hex || '#888888').replace('#', '');
+  const n = parseInt(s.length === 3
+    ? s[0] + s[0] + s[1] + s[1] + s[2] + s[2] : s.slice(0, 6), 16) | 0;
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+const rgbToHex = (r, g, b) =>
+  '#' + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v)))
+                            .toString(16).padStart(2, '0')).join('');
+
+// Colour of a cell given its material id and art index (0 = unpainted).
+function shownColor(mat, art) {
+  if (art) {
+    const c = artPalette.colorAt(art);
+    if (c) return c;
+  }
+  return matColor(mat);
+}
+
+/** Mix `over` onto `under` at coverage `a`. Plain source-over on straight RGB. */
+function blendHex(under, over, a) {
+  if (a >= 1) return over;
+  const u = hexToRgb(under), o = hexToRgb(over);
+  return rgbToHex(u[0] + (o[0] - u[0]) * a,
+                  u[1] + (o[1] - u[1]) * a,
+                  u[2] + (o[2] - u[2]) * a);
+}
+
+function pushRecent(hex) {
+  if (!hex) return;
+  recentColors = [hex, ...recentColors.filter(c => c !== hex)].slice(0, kRecentMax);
+}
 
 /* ==========================================================================
    3. model document — grid, ops, undo
@@ -226,14 +294,31 @@ function mirrored(x, y, z) {
   return uniq;
 }
 
+// Sentinel material for "keep whatever is already in the cell". Deliberately
+// outside 0..255 so it can never collide with a real material ID.
+const KEEP_MAT = -1;
+
 function beginStroke() { stroke = []; }
 
 /**
  * Write cells. `cells` is an array of [x,y,z] in EDIT space; `value` is the
  * material ID (0 = erase). Mirror expansion, bounds rejection, model routing,
  * no-op filtering and undo recording all happen here.
+ *
+ * `value` may be KEEP_MAT, meaning "leave the material as it is" — a
+ * colour-only stroke. A KEEP_MAT write to an EMPTY cell does nothing: paint
+ * needs a voxel to sit on and must never conjure one.
+ *
+ * `color` decides what happens to the ART COLOUR layer on each written cell:
+ *   undefined  leave it alone (material-only edits: attach, plain paint)
+ *   0          clear it — the voxel goes back to showing its material colour
+ *   a function (mat, art) => artIndex, evaluated PER CELL. Blending needs
+ *              this: the result depends on what colour that particular voxel
+ *              is already showing, so one scalar cannot express it.
+ * Erasing (value 0) always clears colour: paint must not outlive its voxel
+ * and reappear when the cell is filled again.
  */
-function applyOps(cells, value) {
+function applyOps(cells, value, color) {
   if (!stroke) beginStroke();
   for (const [cx, cy, cz] of cells) {
     for (const [x, y, z] of mirrored(cx, cy, cz)) {
@@ -243,9 +328,21 @@ function applyOps(cells, value) {
       const g = doc.models[o.mi].grid;
       const i = o.lx + o.ly * g.dim.x + o.lz * g.dim.x * g.dim.y;
       const old = g.data[i];
-      if (old === value) continue;         // no-op: keeps undo honest
-      g.data[i] = value;
-      stroke.push(o.mi, i, old, value);
+      const val = value === KEEP_MAT ? old : value;
+      if (!val) {
+        // Nothing here to paint on (or an erase of empty space): make sure a
+        // colour-only stroke cannot leave orphan paint behind.
+        if (value === KEEP_MAT) continue;
+      }
+      const oldArt = g.color ? g.color[i] : 0;
+      let art = oldArt;
+      if (val === 0) art = 0;
+      else if (typeof color === 'function') art = color(old, oldArt) | 0;
+      else if (color !== undefined) art = color | 0;
+      if (old === val && art === oldArt) continue;  // no-op: keeps undo honest
+      g.data[i] = val;
+      if (art !== oldArt) gridColorLayer(g)[i] = art;
+      stroke.push(o.mi, i, old, val, oldArt, art);
     }
   }
 }
@@ -265,16 +362,23 @@ function endStroke() {
 function clearUndo() { undoStack = []; redoStack = []; stroke = null; }
 
 function undoVoxel(s) {
-  for (let i = s.length - 4; i >= 0; i -= 4)
-    doc.models[s[i]].grid.data[s[i + 1]] = s[i + 2];
+  for (let i = s.length - kOpStride; i >= 0; i -= kOpStride) {
+    const g = doc.models[s[i]].grid;
+    g.data[s[i + 1]] = s[i + 2];
+    if (s[i + 4] !== s[i + 5]) gridColorLayer(g)[s[i + 1]] = s[i + 4];
+  }
   needsRebuild = true;
-  hooks.toast('undo (' + (s.length / 4) + ' voxel' + (s.length === 4 ? '' : 's') + ')');
+  const n = s.length / kOpStride;
+  hooks.toast('undo (' + n + ' voxel' + (n === 1 ? '' : 's') + ')');
 }
 function redoVoxel(s) {
-  for (let i = 0; i < s.length; i += 4)
-    doc.models[s[i]].grid.data[s[i + 1]] = s[i + 3];
+  for (let i = 0; i < s.length; i += kOpStride) {
+    const g = doc.models[s[i]].grid;
+    g.data[s[i + 1]] = s[i + 3];
+    if (s[i + 4] !== s[i + 5]) gridColorLayer(g)[s[i + 1]] = s[i + 5];
+  }
   needsRebuild = true;
-  hooks.toast('redo (' + (s.length / 4) + ' voxels)');
+  hooks.toast('redo (' + (s.length / kOpStride) + ' voxels)');
 }
 function undoColor(d) {
   const m = materials[d.matIndex];
@@ -1959,7 +2063,60 @@ function brushCells(h) {
   return out;
 }
 
-const valueForMode = () => (mode === 'erase' ? 0 : activeMat);
+/**
+ * The material an op writes. KEEP_MAT means "whatever is already there":
+ * painting COLOUR onto a voxel must not change what it is made of, and a
+ * brush covers many cells of possibly different materials, so the decision
+ * has to be per cell rather than one value chosen up front.
+ */
+function valueForMode() {
+  if (mode === 'erase') return 0;
+  if (mode === 'paint' && artColor !== null && artColorOnly) return KEEP_MAT;
+  return activeMat;
+}
+
+/**
+ * The `color` argument for applyOps under the current brush settings.
+ *
+ * At full alpha this is a constant index, so it costs one palette lookup for
+ * the whole stroke. Below full alpha it must be a per-cell function: the
+ * result is the brush colour mixed into whatever THAT voxel already shows,
+ * which is the whole point of glazing translucent paint over existing work.
+ *
+ * Returns undefined when colour should be left alone entirely, so an attach
+ * or a plain material paint does not disturb an existing paint job.
+ */
+function colorForBrush() {
+  if (mode === 'erase') return 0;
+  // No colour selected in paint mode means "paint the material's own colour",
+  // i.e. strip any art colour off the cell so the material shows through.
+  if (artColor === null) return mode === 'paint' ? 0 : undefined;
+  if (artAlpha >= 1) {
+    const idx = allocArt(artColor);
+    return idx === null ? undefined : idx;
+  }
+  return (mat, art) => {
+    const idx = allocArt(blendHex(shownColor(mat, art), artColor, artAlpha));
+    return idx === null ? art : idx;
+  };
+}
+
+/**
+ * Art-palette index for `hex`, or null when the palette is full (the caller
+ * then leaves the cell alone rather than painting an arbitrary colour). The
+ * ceiling is reported once per stroke, not once per voxel.
+ */
+let artFullWarned = false;
+function allocArt(hex) {
+  const idx = artPalette.alloc(hex);
+  if (idx) return idx;
+  if (!artFullWarned) {
+    artFullWarned = true;
+    hooks.toast(`art palette full (${ART_SLOTS} colours) — pick an existing ` +
+                'colour, or lower opacity blends less', true);
+  }
+  return null;
+}
 
 /* ==========================================================================
    8. input
@@ -2095,11 +2252,16 @@ function onPointerDown(ev) {
     return;
   }
 
-  // Noise always paints the active material, whatever the mode says.
-  const val = brush === 'noise' ? activeMat : valueForMode();
+  // Noise always paints the active material, whatever the mode says — unless
+  // a colour is selected, in which case it scatters COLOUR over the surface
+  // and leaves the material alone (speckling a skin, not restaining it).
+  const val = brush === 'noise'
+    ? (artColor !== null && artColorOnly ? KEEP_MAT : activeMat)
+    : valueForMode();
   beginStroke();
-  applyOps(brushCells(h), val);
+  applyOps(brushCells(h), val, colorForBrush());
   endStroke();
+  artFullWarned = false;
   // Voxel and noise brushes drag along a surface; face brush is a one-shot.
   if (brush === 'voxel' || brush === 'noise') {
     drag = { paint: true, seen: new Set() };
@@ -2222,7 +2384,10 @@ function onPointerMove(ev) {
       if (!drag.seen.has(k)) {
         drag.seen.add(k);
         if (!stroke) beginStroke();
-        applyOps(brushCells(h), brush === 'noise' ? activeMat : valueForMode());
+        const v = brush === 'noise'
+          ? (artColor !== null && artColorOnly ? KEEP_MAT : activeMat)
+          : valueForMode();
+        applyOps(brushCells(h), v, colorForBrush());
         needsRebuild = true;
       }
     }
@@ -2286,8 +2451,9 @@ function onPointerUp(ev) {
   if (drag.paint) { endStroke(); drag = null; updateHover(ev); return; }
   const b = drag.last;
   beginStroke();
-  applyOps(boxCells(drag.anchor, b), valueForMode());
+  applyOps(boxCells(drag.anchor, b), valueForMode(), colorForBrush());
   endStroke();
+  artFullWarned = false;
   drag = null;
   updateHover(ev);
 }

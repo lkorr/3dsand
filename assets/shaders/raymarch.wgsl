@@ -1946,6 +1946,359 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   return mix(reflectionSky(rr), applyAerial(c, rr, h.t), horizon);
 }
 
+// ============================================================================
+// SUBMERGED VIEW — being UNDER the water (DESIGN.md §9)
+// ============================================================================
+// Everything above this point shades water seen from OUTSIDE. Being inside it
+// is a different problem and it was previously handled by two lines in
+// shadeWater (flip the normal, swap the reflection for a scatter constant),
+// which is why going under produced a flat blue wash with no light in it.
+//
+// Four terms carry the whole look, in rising order of cost:
+//
+//   1. absorption + in-scatter over the WHOLE view. Not a bounded depth: under
+//      water every ray is inside the medium for its entire length, so this is
+//      the underwater equivalent of aerial perspective and it replaces it.
+//   2. CAUSTICS on every sunlit surface below the waterline. This is the term
+//      the request is really about — the rippling web of light on the rocks.
+//      It is deliberately NOT the caustic term inside shadeWater: that one is
+//      a multiplier on `sceneBehind` at the moment a ray from dry land crosses
+//      a surface. There is no such crossing when you are already under, so
+//      from below the old code applied no caustics to anything at all.
+//   3. GOD RAYS — a ray-marched, occlusion-tested volumetric integral. The
+//      shafts have to break around the shore and any overhang, which is what
+//      a real shadow test buys and what an analytic approximation cannot.
+//   4. SILT — drifting motes. Cheap, and it is most of what makes the shafts
+//      legible: a light shaft is only visible because something is IN it.
+//
+// All render-only float math on render-only data. The sim never sees any of
+// it, so determinism rule #1 is untouched (it scopes to sim state).
+
+// ---- how much water is above this point? ----
+// Walks UP from a surface point counting liquid cells until it reaches air.
+// Returns metres of water overhead, or -1 if the point is not under any.
+//
+// The step count is the cost, and it is bounded rather than complete on
+// purpose: this runs per lit surface pixel, and a point under more water than
+// the cap is one whose caustics have washed out entirely anyway (they fade to
+// nothing by bedCausticFade, which is well inside the cap at any sane setting).
+// Reporting the cap as "deep" is therefore the correct answer, not a
+// truncation artifact.
+const SUB_DEPTH_STEPS : i32 = 40;
+
+fn waterAbove(cell : vec3<i32>) -> f32 {
+  var n = 0.0;
+  for (var i = 1; i <= SUB_DEPTH_STEPS; i++) {
+    let c = cell + vec3<i32>(0, i, 0);
+    // Out of the window reads as "no more water". Unloaded space is solid and
+    // inert (CLAUDE.md), so treating it as more water would paint caustics
+    // under every overhang at the window edge.
+    if (!inBounds(c)) { break; }
+    let w = voxels[cellIndexW(c)];
+    let mt = voxMat(w);
+    if (mt == MAT_AIR) { break; }
+    let m = materials[mt];
+    // Only a TRANSLUCENT liquid counts as water overhead. An opaque one (lava)
+    // transmits nothing, and a solid lid ends the column.
+    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { break; }
+    n += f32(voxState(w) + 1u) / 8.0;
+  }
+  return n * VOXEL_METERS;
+}
+
+// ---- the caustic web itself ----
+// Same physical idea as the caustic term in shadeWater — the intensity tracks
+// the CONVERGENCE of rays refracted through the wave surface, which for a
+// small-slope surface is the curvature (Laplacian) of the wave height field —
+// but projected differently, and that difference is the entire reason this is
+// a separate function rather than a shared one.
+//
+// shadeWater projects from the point where the PRIMARY RAY crossed the
+// surface. That is correct for looking down into water from dry land, and it
+// is meaningless from below, where the primary ray never crossed anything.
+//
+// Here the projection runs from the patch of surface DIRECTLY ABOVE the lit
+// point, drifted along the sun direction by the depth — i.e. where the
+// sunlight landing on this point actually entered the water. That makes the
+// pattern correct from any viewpoint, including from underneath looking up at
+// a lit wall, and it makes it stable when the camera moves (it is a property
+// of the surface and the sun, not of the eye).
+fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
+  if (depthM <= 0.0) { return 0.0; }
+  let kd = keyLightDir();
+  // Sun below the horizon: no caustics. Guarded before the divide.
+  if (kd.y < 0.05) { return 0.0; }
+  // Trace back up the sun direction to the surface: the entry point is the lit
+  // point plus the sun vector scaled to cover `depthM` of vertical rise.
+  let up = depthM / max(kd.y, 0.05);
+  let entry = p * VOXEL_METERS + kd * up;
+  let cp = vec2f(entry.x, entry.z);
+
+  // Curvature by finite difference of the slope field. The baseline and the
+  // band-damping footprint are the same as the shadeWater caustic and for the
+  // same reason: differencing at the scale of the shortest (22 cm) chop
+  // samples curvature that focuses far below any real bed and renders as a
+  // fine dotted grid of per-pixel noise. Only the long swell has the focal
+  // length to reach a bed metres down.
+  let e = 0.22;   // metres — finite-difference baseline
+  let cf = 0.5;   // metres — band damping footprint
+  let s0 = rippleSlope(cp, R.time, cf);
+  let sx = rippleSlope(cp + vec2f(e, 0.0), R.time, cf);
+  let sz = rippleSlope(cp + vec2f(0.0, e), R.time, cf);
+  let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
+
+  // Only CONVERGING curvature makes a bright band; diverging is the dark gap
+  // between bands, and it is already dark by being unlit.
+  var c = max(-curv, 0.0);
+  // Sharpen into filaments. A raw curvature field is a smooth blob pattern;
+  // real caustics are thin bright lines with wide dark gaps, and the exponent
+  // is what turns one into the other.
+  c = pow(c, TUNE_BED_CAUSTIC_SHARP);
+
+  // Focus grows with depth (longer lever arm from surface to bed) then washes
+  // out as scattering smears the pattern. Both ends matter: no depth ramp and
+  // a surface right at the waterline gets full-strength caustics it physically
+  // cannot have; no fade and the deepest water is the brightest, which is
+  // backwards.
+  let focus = clamp(depthM * 1.5, 0.0, 1.4) *
+              (1.0 - smoothstep(0.0, TUNE_BED_CAUSTIC_FADE, depthM));
+
+  // Caustics land on a surface in proportion to how square-on it faces the
+  // sun, exactly like any other direct light — a wall parallel to the incoming
+  // shafts catches almost none. Without this the web wraps uniformly around
+  // every face of a rock and reads as glowing paint rather than as projected
+  // light.
+  let facing = max(dot(n, kd), 0.0);
+
+  return c * focus * facing;
+}
+
+// ---- Henyey-Greenstein phase function ----
+// The standard single-parameter model for how strongly a medium scatters
+// forward vs backward. g > 0 is forward-scattering, which is what makes a
+// light shaft blaze when you look toward the sun and fade to almost nothing
+// when you look away — the single term that separates "god rays" from "the
+// whole volume got brighter".
+fn phaseHG(cosTheta : f32, g : f32) -> f32 {
+  let g2 = g * g;
+  let d = 1.0 + g2 - 2.0 * g * cosTheta;
+  // d can reach 0 only at g = 1, which LoadTuning clamps away from; the max()
+  // is belt-and-braces against a hand-edited prelude.
+  return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(d, 1e-4), 1.5));
+}
+
+// ---- volumetric light shafts ----
+// Marches the view ray through the water and, at each sample, asks whether the
+// sun reaches that point. The occlusion test is a real trace, so a shaft is
+// cut by the shore, by an overhang, by a rock — which is the whole reason to
+// pay for it. An analytic shaft (modulating in-scatter by the ripple field
+// alone) is nearly free but passes straight through solid terrain, and under
+// water you are constantly looking at beams that ought to be interrupted by
+// the bank you are swimming next to.
+//
+// Cost: godRaySteps x godRayShadowSteps texture-ish reads per submerged pixel.
+// It is gated on being submerged, so a dry frame pays nothing at all, and both
+// counts are clamped in LoadTuning because their product is the frame time.
+fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
+  let steps = TUNE_GODRAY_STEPS;
+  if (steps <= 0) { return 0.0; }
+  let kd = keyLightDir();
+  // No shafts with the key light at or below the horizon: at that angle the
+  // refracted light is running nearly horizontally and there is nothing to
+  // see. Cheap early-out that skips the whole march at night.
+  if (kd.y < 0.08) { return 0.0; }
+
+  let rangeVox = TUNE_GODRAY_RANGE / VOXEL_METERS;
+  let march = min(maxDistVox, rangeVox);
+  if (march <= 0.0) { return 0.0; }
+  let dt = march / f32(steps);
+
+  // Dither the start offset per pixel so the fixed sample count does not
+  // produce visible banding — the classic slice artifact of any volumetric
+  // march. Screen-space and TIME-FREE, matching farDither's reasoning: a
+  // time-varying jitter would crawl, and this is a still-frame-stable pattern
+  // that the eye integrates spatially instead.
+  let jitter = fract(dot(px, vec2f(0.7548776662, 0.5698402909)));
+
+  // Forward-scattering phase, constant along the ray (the sun is directional).
+  let phase = phaseHG(dot(rd, kd), TUNE_GODRAY_ANISO);
+
+  var acc = 0.0;
+  for (var i = 0; i < steps; i++) {
+    let t = (f32(i) + jitter) * dt;
+    let p = ro + rd * t;
+    // Is this sample still inside water? A view ray under water can leave the
+    // liquid (through the surface, or into an air pocket), and scattering must
+    // stop where the medium does or shafts extend out into the sky.
+    let c = vec3<i32>(floor(p));
+    if (!inBounds(c)) { break; }
+    let w = voxels[cellIndexW(c)];
+    let mt = voxMat(w);
+    if (mt == MAT_AIR) { continue; }
+    let m = materials[mt];
+    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { continue; }
+
+    // Occlusion: can the sun reach this point? Short budget on purpose — this
+    // ray only has to find the surface just above or a nearby blocker, and the
+    // chunk-skip in trace() covers open water in a few steps.
+    let s = trace(p, kd, TUNE_GODRAY_SHADOW_STEPS, false);
+    if (s.hit) { continue; }
+
+    // Reaching here means sunlight lands on this sample. Weight it by the
+    // ripple curvature at the surface above, so the shafts inherit the same
+    // moving structure as the caustics on the bed — the beams and the web on
+    // the floor are the same light, and having them animate independently is
+    // an immediate tell.
+    let dAbove = waterAbove(c);
+    let shaft = 1.0 + bedCaustic(p, kd, dAbove) * 0.6;
+    acc += shaft * dt;
+  }
+
+  // dt is in voxels; convert to metres so the strength knob is scale-free.
+  return acc * VOXEL_METERS * phase * TUNE_GODRAY_STRENGTH;
+}
+
+// ---- suspended particulate ----
+// Motes drifting in the water. Render-only, procedural, no particles and no
+// buffer: a 3D value-noise field thresholded hard so it reads as discrete
+// specks rather than as fog, sampled along the view ray at a few depths.
+//
+// This is the cheapest term here and one of the most effective. A light shaft
+// in clear water is invisible — you see a shaft precisely because there is
+// something suspended in it to scatter off — so silt and god rays are really
+// one effect, and the silt is what gives the water a sense of volume and
+// motion when you turn your head.
+fn siltMotes(ro : vec3f, rd : vec3f, maxDistVox : f32, lit : f32) -> f32 {
+  if (TUNE_SILT_DENSITY <= 0.0) { return 0.0; }
+  var acc = 0.0;
+  // Four slabs at increasing distance. Sampling more than this does not read
+  // as more particles, it reads as fog — the eye wants sparse discrete specks.
+  for (var i = 0; i < 4; i++) {
+    let t = maxDistVox * (0.12 + 0.24 * f32(i));
+    if (t <= 0.0) { continue; }
+    var p = ro + rd * t;
+    // Slow vertical drift plus a lateral sway, so the field is alive without
+    // reading as falling snow. Deliberately very slow: real particulate in
+    // still water barely moves, and anything fast immediately looks like a
+    // weather effect happening indoors.
+    p.y -= R.time * TUNE_SILT_DRIFT / VOXEL_METERS;
+    p.x += sin(R.time * 0.11 + p.y * 0.05) * 0.6;
+    // Hard threshold on a noise field = sparse specks. The 1/(1+t) falloff
+    // keeps distant motes from stacking into a haze, which is what happens if
+    // every slab contributes equally.
+    let nz = valueNoise(p, 0.9);
+    let spec = smoothstep(0.82, 0.97, nz);
+    acc += spec / (1.0 + t * VOXEL_METERS * 0.35);
+  }
+  return acc * TUNE_SILT_DENSITY * TUNE_SILT_BRIGHTNESS * (0.25 + lit);
+}
+
+// ---- the full submerged shade ----
+// Replaces the old two-line `underwater` branch. `sceneBehind` is whatever the
+// primary march resolved — a rock, the bed, or the underside of the surface —
+// and `pathVox` is how far the ray travelled through the liquid to get there.
+//
+// Returns the final colour for a pixel whose ray is inside the liquid for its
+// whole length. Because the medium covers the entire view, this REPLACES
+// aerial perspective rather than composing with it: fogging air in front of
+// water that the eye is already inside would double-count the same haze.
+fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
+                  sceneBehind : vec3f, px : vec2f, sawSky : bool) -> vec3f {
+  let m = materials[mat];
+  let distM = max(pathVox, 0.0) * VOXEL_METERS;
+
+  // ---- absorption + in-scatter ----
+  // Underwater absorption is its own tuning set, NOT waterAbsorb. See
+  // tuning.h: the coefficients that make a lake read deep when you look down
+  // into it leave you inside a featureless blue void when you are under it,
+  // because there is no distance information left within arm's reach.
+  var absorbK = TUNE_SUB_ABSORB;
+  var scatterCol = TUNE_SUB_SCATTER;
+  let isWater = (m.tagMask != 0u) && (f32(m.opacity) / 255.0 < 0.45);
+  if (!isWater) {
+    // Any other liquid you can be inside (oil, acid) derives its coefficients
+    // from its own authored palette and opacity, exactly as shadeWater does —
+    // no material IDs in the shader (CLAUDE.md conventions).
+    let base = (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
+    let k = (f32(m.opacity) / 255.0) * 6.0;
+    absorbK = (vec3f(1.0) - base) * k + vec3f(0.05);
+    scatterCol = base * 0.3;
+  }
+
+  // The scatter colour is lit by the key light, so a pond at night is dark
+  // water rather than the same daytime turquoise at lower brightness.
+  let sunUp = clamp(keyLightDir().y * 1.5, 0.05, 1.0);
+  let ambientWater = scatterCol * keyLightColor() * sunUp * TUNE_SUB_SCATTER_GAIN;
+
+  // ---- the surface, seen from underneath (Snell's window) ----
+  // A ray that reached the sky left through the underside of the surface, and
+  // that interface is emphatically not a window: going water -> air the light
+  // bends AWAY from the normal, so the entire 180-degree hemisphere above
+  // compresses into a cone of about 97 degrees straight up. Outside that cone
+  // there is TOTAL internal reflection — the surface is a mirror showing you
+  // the murk below, not the sky.
+  //
+  // That bright disc ringed by dark mirror is the single most recognisable
+  // thing about looking up underwater, and without it a submerged view of the
+  // sky is just the normal sky slightly tinted, which reads as a bug.
+  var behind = sceneBehind;
+  if (sawSky) {
+    // Angle off vertical. The critical angle for water is asin(1/1.333) =
+    // 48.6 degrees, i.e. cos = 0.661 — that is the edge of the window.
+    let cosUp = clamp(rd.y, -1.0, 1.0);
+    const CRIT_COS : f32 = 0.661;
+    // Ripple the boundary rather than letting it be a clean circle: the real
+    // edge shimmers because the surface itself is moving, and a hard analytic
+    // ring immediately reads as a post-effect. Reuse the ripple field so the
+    // distortion agrees with the waves being drawn everywhere else.
+    let pm = vec2f(ro.x + rd.x * pathVox, ro.z + rd.z * pathVox) * VOXEL_METERS;
+    let s = rippleSlope(pm, R.time, 0.0) * TUNE_SUB_SURFACE_RIPPLE;
+    let edge = CRIT_COS + (s.x + s.y) * 0.35;
+    // Inside the window: the sky, but squeezed. Outside: the murk, mirrored.
+    let window = smoothstep(edge - 0.10, edge + 0.06, cosUp);
+    // The sky inside the window is compressed toward the zenith. Scaling the
+    // horizontal component of the direction toward vertical is a cheap,
+    // monotonic stand-in for the real refraction map and gets the important
+    // part right: the horizon ring crowds into the rim of the disc.
+    var skyDir = normalize(vec3f(rd.x * 0.62, max(rd.y, 0.05), rd.z * 0.62));
+    skyDir += vec3f(s.x, 0.0, s.y) * 0.25;
+    let windowSky = skyColorNoBodies(normalize(skyDir)) * TUNE_SUB_SNELL_GAIN;
+    behind = mix(scatterCol * keyLightColor() * sunUp * 1.2, windowSky, window);
+  }
+
+  let trans = exp(-absorbK * distM);
+  // Fade to the water colour over the visibility distance. The exponential
+  // above is the physical part; this is the artistic ceiling that guarantees
+  // a far wall reaches the water colour by `subVisibility` metres no matter
+  // how the coefficients are tuned, which is what makes that knob predictable.
+  let vis = 1.0 - exp(-distM / TUNE_SUB_VISIBILITY);
+  var color = mix(behind * trans + ambientWater * (vec3f(1.0) - trans),
+                  ambientWater, vis);
+
+  // ---- god rays ----
+  // Added, not mixed: scattered light is light ARRIVING at the eye from the
+  // volume, on top of whatever survived from behind.
+  let shafts = godRays(ro, rd, max(pathVox, 1.0), px);
+  color += ambientWater * shafts;
+
+  // ---- silt ----
+  // Lit by the same shaft integral, so motes inside a beam flare and motes in
+  // shadow stay dim — which is what makes the beams look like they occupy
+  // space rather than being painted over the image.
+  let motes = siltMotes(ro, rd, max(pathVox, 1.0), shafts);
+  color += ambientWater * motes * 2.0 + vec3f(motes * 0.05);
+
+  // ---- vignette ----
+  // Cheap, and a strong "you are inside a medium" cue: light reaching the edge
+  // of your view underwater has travelled further through it. Keyed on the
+  // angle off the view axis rather than on screen UV so it does not stretch
+  // with aspect ratio.
+  let off = 1.0 - clamp(dot(rd, R.camFwd), 0.0, 1.0);
+  color *= 1.0 - clamp(off * TUNE_SUB_VIGNETTE * 2.5, 0.0, TUNE_SUB_VIGNETTE);
+
+  return color;
+}
+
 // ---- the full water shade ----
 // `sceneBehind` is whatever the primary march already resolved BEHIND the
 // water (lake bed, terrain, or sky) — this function decides how much of it
@@ -3183,6 +3536,44 @@ fn fs(in : VSOut) -> FSOut {
     let sun = keyLightColor() * lambert;
     color = albedo * face * (ambientAt(n) * ao + sun);
 
+    // ---- caustics on a submerged surface ----
+    // The rippling web of focused sunlight on anything under water. This is
+    // the term that makes a pond bed read as being underwater rather than as
+    // dry ground with a blue sheet over it, and it applies to every lit
+    // surface below a waterline — the bed, a boulder, a reed, the shore's
+    // underwater slope — seen from ABOVE or BELOW the surface alike.
+    //
+    // Distinct from the caustic inside shadeWater, which is a multiplier
+    // applied where a ray from dry land crosses the surface. That one cannot
+    // fire at all when the camera is already submerged (no crossing happens),
+    // which is why looking around underwater used to show no caustics on
+    // anything. See bedCaustic for the projection difference.
+    //
+    // MULTIPLICATIVE, for the same reason as the other caustic path: caustics
+    // redistribute the sunlight already landing on a surface, so they scale
+    // what is there. Bright sand goes brighter, dark stone stays dark. Adding
+    // a constant instead makes unlit rock glow, which reads as the surface
+    // emitting light rather than as light playing over it.
+    //
+    // COST: gated hard. waterAbove() walks up to 40 cells, so it must not run
+    // on every terrain pixel in the frame. `lambert > 0` skips everything in
+    // shadow (a shadowed surface has no direct sun to redistribute anyway),
+    // and the cell directly above must be a liquid before the walk starts —
+    // which is one buffer read, false for essentially the whole world.
+    if (lambert > 0.0) {
+      let up1 = h.cell + vec3<i32>(0, 1, 0);
+      if (inBounds(up1)) {
+        let uw = voxels[cellIndexW(up1)];
+        let um = voxMat(uw);
+        if (um != MAT_AIR && materials[um].klass == CLASS_LIQUID &&
+            (materials[um].flags & MATF_OPAQUE) == 0u) {
+          let dAbove = waterAbove(h.cell);
+          let cw = bedCaustic(hp, n, dAbove);
+          color *= 1.0 + min(cw * TUNE_BED_CAUSTIC_GAIN, TUNE_BED_CAUSTIC_CAP);
+        }
+      }
+    }
+
     // ---- wet sheen on a fresh stain ----
     // A stain is WET, and the specular highlight is what says so. Without it a
     // blood-soaked floor is just a floor with a red patch on it; with it the
@@ -3296,15 +3687,39 @@ fn fs(in : VSOut) -> FSOut {
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              underwater);
+        color = applyAerial(color, rd, h.liqT);
+      } else if (underwater) {
+        // ---- the eye is INSIDE the liquid ----
+        // A separate model, not shadeWater with a flag. From in here the
+        // medium covers the entire view, so there is no interface in front of
+        // anything, no Fresnel split to make, and no bounded depth to absorb
+        // over: it is volumetric for the whole ray. See shadeSubmerged.
+        //
+        // Aerial perspective is deliberately NOT applied afterwards. That term
+        // models haze in the AIR between eye and surface, and there is no such
+        // air — shadeSubmerged's own absorption is the distance cue, and
+        // fogging on top of it would double-count and wash the view to sky
+        // colour, which is exactly what hid the bed before.
+        //
+        // pathVox is how far the ray ran inside liquid. For a ray that exits
+        // to open sky it is the whole underwater stretch; for one that ends on
+        // a rock it is the distance to that rock.
+        // `sawSky` says the ray left the water and reached open sky rather
+        // than ending on a surface — that is the case that has to render
+        // Snell's window. A ray that ends on the bed never crossed the
+        // interface and must not get one.
+        let sawSky = !h.hit && !h.saturated && !far.hit;
+        color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
+                               sawSky);
       } else {
         color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
+        // The water surface itself is at liqT, nearer than whatever is behind
+        // it, so aerial perspective applies from the SURFACE — otherwise a
+        // distant lake gets the fog of its own bed and reads too hazy.
+        color = applyAerial(color, rd, h.liqT);
       }
-      // The water surface itself is at liqT, nearer than whatever is behind
-      // it, so aerial perspective applies from the SURFACE — otherwise a
-      // distant lake gets the fog of its own bed and reads too hazy.
-      color = applyAerial(color, rd, h.liqT);
     }
   }
 
