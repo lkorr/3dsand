@@ -79,6 +79,8 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   opTargets_.Clear();
   cRing_.clear();
   pendingFills_.clear();
+  retire_.clear();
+  zeroStreak_.assign(kNumChunks, 0);
 }
 
 void PageTable::ResetIdentity(const rhi::Queue& queue) {
@@ -108,6 +110,8 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   opTargets_.Clear();
   cRing_.clear();
   pendingFills_.clear();
+  retire_.clear();
+  zeroStreak_.assign(kNumChunks, 0);
 }
 
 uint32_t PageTable::Alloc() {
@@ -233,10 +237,35 @@ void PageTable::UpdateParticles(bool particlesActive, uint32_t liveCount,
   // The reset is subject to the same staleness as every other snapshot field,
   // so it licenses clearing only when no spawn has been issued since — which
   // `particlesActive` is exactly (§3.4).
-  if (!particlesActive && liveCount == 0) {
+  // The reset, per §3.4's normative form: EMPTY when the readback says
+  // particleCount == 0. Subject to the same staleness as every other snapshot
+  // field, so it licenses clearing only if no spawn has been issued since —
+  // which `particlesActive` is exactly.
+  if (liveCount == 0 && !particlesActive) {
     particleChunks_.Clear();
     return;
   }
+
+  // ---- KNOWN LIMITATION, and it is a conflict with §3.4's normative form ---
+  //
+  // The recurrence below is exactly what §3.4 specifies, and it is a correct
+  // SUPERSET — but it is not BOUNDED. Dilating the previous dilation one ring
+  // per tick makes the set a k-ring after k ticks, i.e. (2k+1)^3 chunks, and
+  // nothing shrinks it until particleCount reaches zero. Measured on the loud
+  // scenario, one explosion's debris drives it 1, 27, 125, 343, 729, 1331,
+  // 2197, 3375 over eight ticks — 3375 = 15^3 — and that alone pushes the
+  // materialization set past an 8,192-page pool.
+  //
+  // This is NOT fixed here. Bounding it means changing a reviewed formula, and
+  // the options each have a different soundness argument that wants review:
+  //   - age the set (rebuild from spawns inside a lifetime window),
+  //   - track per-spawn sets and expire them individually,
+  //   - read particle positions back and rebuild exactly (a new readback).
+  // See the phase-7 [AS BUILT] block in PLAN_page_table.md.
+  //
+  // The consequence is contained and loud rather than silent: the pool
+  // exhausts and §3.8's fatal abort fires with a clear message. It cannot
+  // corrupt a world.
   if (!particleChunks_.Empty()) {
     // ceil(PART_MAX_VEL / CHUNK) + 1 == 1 at the shipped tuning (~6 voxels per
     // tick terminal, 16-voxel chunks), so the dilation is a 1-ring per tick —
@@ -399,6 +428,42 @@ void PageTable::Materialize(const rhi::Queue& queue) {
     MarkTableDirty(s);
   }
   FlushTableWrites(queue);
+}
+
+void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
+                                 uint32_t tick) {
+  if (!paged_) return;
+  if (zeroStreak_.size() != kNumChunks) zeroStreak_.assign(kNumChunks, 0);
+  const auto& t = world_->pageTableCpu();
+  for (uint32_t s = 0; s < kNumChunks; s++) {
+    if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
+    if (zeroStreak_[s] < 255) zeroStreak_[s]++;
+    // The free DECISION iterates only slots whose counter just reached the
+    // threshold, which in a settled world is ZERO slots after the first
+    // quarter second and stays zero forever.
+    if (zeroStreak_[s] != kPageFreeTicks) continue;
+    if ((t[s] & kPtSentinelBit) != 0u) continue;   // already a sentinel
+    // The second conjunct. Without it a chunk empty right now but adjacent to
+    // activity would be freed and re-materialized on the very next tick —
+    // and page fills are GPU commands, so an oscillating boundary means a
+    // settled-looking world issuing fills forever (risk 6, a rule-2 violation
+    // that presents as a perf mystery).
+    if (cpuDirty_.Has(s)) { zeroStreak_[s] = kPageFreeTicks - 1; continue; }
+    const uint32_t page = t[s];
+    world_->pageTableCpuMutable()[s] = kPtEmpty;
+    MarkTableDirty(s);
+    // Parked, not pushed: see the retire-queue note in the header.
+    retire_.push_back({page, tick});
+    pagesInUse_--;
+    pagesFreed_++;
+  }
+}
+
+void PageTable::RetirePages(uint32_t tick) {
+  while (!retire_.empty() && tick - retire_.front().tick >= kRetireTicks) {
+    freePages_.push_back(retire_.front().page);
+    retire_.pop_front();
+  }
 }
 
 void PageTable::FlushTableWrites(const rhi::Queue& queue) {

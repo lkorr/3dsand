@@ -167,6 +167,40 @@ class PageTable {
   // buffer, exactly like the three existing per-slot streaming writes.
   void FlushTableWrites(const rhi::Queue& queue);
 
+  // ---- deallocation with hysteresis (§3.6) --------------------------------
+  //
+  // Driven from the occupancy readback the CPU ALREADY receives every tick in
+  // the snapshot. No new readback, no new scan, no new GPU work — that is the
+  // rule-2 answer: a settled world pays nothing new, because the data was
+  // already arriving and the decision is a comparison against a per-slot
+  // counter the CPU already keeps.
+  //
+  //   A resident page is freed when it has reported occTotal == 0 on
+  //   kPageFreeTicks CONSECUTIVE snapshots AND its slot is not in cpuDirty.
+  //
+  // BOTH conjuncts are needed and each blocks a different thrash. The
+  // consecutive count blocks the SAMPLING thrash (a chunk that empties and
+  // refills within the readback latency). The !cpuDirty conjunct blocks the
+  // CAUSAL thrash (a chunk empty right now but adjacent to activity and about
+  // to be written), and it is what makes materialize/demote oscillation
+  // STRUCTURALLY impossible rather than merely unlikely: cpuDirty is exactly
+  // the materialization set, so a chunk cannot be eligible to free and
+  // scheduled to materialize on the same tick (risk 6).
+  //
+  // Note `occTotal == 0` is itself STALE — it comes from the same snapshot
+  // whose staleness C1 is about. That is safe HERE AND ONLY HERE, because the
+  // condition is a conjunction with !cpuDirty: a chunk that became non-empty
+  // since the snapshot was stamped was written by something, and anything that
+  // writes it puts it in cpuDirty. The staleness of occTotal is covered by the
+  // FRESHNESS of cpuDirty, not by luck — which is why cpuDirty must be the
+  // conservative mirror and not the snapshot's own dirty flags.
+  void ConsumeOccupancy(const std::vector<uint32_t>& occupancy, uint32_t tick);
+
+  // Retire the free list: pages parked by ConsumeOccupancy become reusable
+  // once enough ticks have passed for any in-flight eviction copy referencing
+  // them to have completed (risk 5).
+  void RetirePages(uint32_t tick);
+
   // ---- reporting ----
   uint32_t PagesInUse() const { return pagesInUse_; }
   uint32_t PagesHighWater() const { return pagesHighWater_; }
@@ -222,6 +256,35 @@ class PageTable {
   // Pages whose initialization fill is queued for the next command buffer.
   struct PendingFill { uint32_t page; uint32_t word; };
   std::vector<PendingFill> pendingFills_;
+
+  // Consecutive snapshots reporting occTotal == 0, per slot. Maintained in the
+  // loop that already walks all kNumChunks occupancy entries, so a settled
+  // world does one extra uint8 increment per chunk inside a loop it was
+  // already running and takes NO further action. That is the rule-2 story, and
+  // it is honest: not free, but not a new scan either.
+  std::vector<uint8_t> zeroStreak_;
+  static constexpr uint8_t kPageFreeTicks = 8;   // ~a quarter second at 30 Hz
+
+  // THE RETIRE QUEUE (risk 5). The existing code is safe against
+  // free-then-reallocate only because SLOTS NEVER MOVE: a slot's 16 KiB is at
+  // a fixed offset forever, so an eviction copy reads that offset and gets
+  // that slot's data whatever happened to it. Paging breaks that assumption —
+  // a chunk's physical location becomes mutable — so a page freed and
+  // reallocated while an eviction copy of the OLD chunk is outstanding would
+  // have the copy read the NEW chunk's data and store the wrong world.
+  //
+  // A freed page is therefore PARKED with the tick that freed it and only
+  // becomes reusable once enough ticks have passed for any in-flight copy to
+  // have completed. kRetireTicks bounds that: the eviction ring holds
+  // kMaxPendingEvicts (4) batches and CompleteOldest is called when it fills,
+  // so a copy cannot outlive that many drains — 16 is comfortable headroom and
+  // costs only that many pages of latency in the free list.
+  //
+  // §4.2's sentinel fast path sidesteps most of this entirely: a sentinel slot
+  // is not copied at all, so it has no in-flight reference to have.
+  struct Retired { uint32_t page; uint32_t tick; };
+  std::deque<Retired> retire_;
+  static constexpr uint32_t kRetireTicks = 16;
 
   uint32_t tick_ = 0;
 

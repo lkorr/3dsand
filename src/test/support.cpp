@@ -200,6 +200,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
   }
   pt.Materialize(ctx.queue);
+  // ---- deallocation (§3.6), AFTER materialization -------------------------
+  // Order matters: cpuDirty is the materialization set, and the free
+  // condition's second conjunct tests against it. Running the free decision
+  // before Materialize would test a mirror that had not yet absorbed this
+  // tick's ops, and could free a chunk this very tick is about to write.
+  //
+  // Both steps read data the CPU already has: the occupancy the snapshot
+  // already carries, and a tick counter. No new readback, no new scan.
+  if (world.Snap().valid) pt.ConsumeOccupancy(world.Snap().occupancy, tick);
+  pt.RetirePages(tick);
 
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   // The fills go in at the HEAD of the command buffer, before any row (§5.4):
