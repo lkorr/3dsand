@@ -100,6 +100,42 @@ Material ID 0 = air/empty. If we ever need more per-voxel state (temperature,
 velocity fields), add an *optional sparse auxiliary layer* keyed by chunk — do not
 grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
 
+### Paged residency: the voxel buffer is a page POOL, not a dense array
+
+**As of the Vulkan port's phase 7 (`docs/PLAN_page_table.md`), where a chunk's
+voxels live is an indirection, not an address.** A flat `pageTable` of one u32
+per chunk SLOT holds either a page index into a pooled physical buffer or a
+SENTINEL: `EMPTY`, or `UNIFORM(material)` for a chunk whose 4,096 words are
+identical. A settled default-seed world is 84.8% sky, so it costs **4,975 pages
+= 77.7 MiB resident instead of 512 MiB dense** — a 6.6x reduction, and the
+mechanism that makes growing the window downward into solid bulk affordable.
+
+Three properties this rests on, all load-bearing:
+
+- **The CA is unaware of it.** Every world-coordinate voxel access in every
+  kernel already routed through `cellIndexW`, so the indirection lives in the
+  shared accessors in `common.wgsl` (`voxWordAt` / `voxWordIndex` / `voxStore`)
+  and no sim kernel's own code changed. A kernel that computes a `voxels[]`
+  subscript by any other means bypasses the table and reads another chunk's
+  memory.
+- **The table is DERIVED DATA.** Not hashed, not persisted, not replicated;
+  rebuilt from chunk contents on every load, stream-in and worldgen. Two
+  different page assignments for the same logical world ARE the same world,
+  which is why `--residency dense` (the identity map) and `--residency paged`
+  produce bit-identical hash sequences — the gate that proves the whole thing.
+- **An index used as an IDENTITY is the SLOT index; only a memory address is
+  the PAGE index.** The world hash, every per-cell RNG key, and the particle
+  claim lattice all key on the slot. Feeding a page index into any of them
+  would make the simulation a function of allocation history.
+
+A GPU kernel cannot allocate, so every page a kernel might write is
+materialized from the CPU BEFORE the command buffer is submitted, driven by a
+conservative CPU mirror of the dirty set. Writes are structurally incapable of
+reaching an unmaterialized page: the only way to obtain a writable word index
+returns a distinguished no-word value for a sentinel chunk, and `voxStore`
+tests it before indexing. A sentinel write is therefore a counted no-op, never
+a corrupted bystander — and the counter is asserted zero by every gate.
+
 ### Art colour: mob/prefab skins are painted, world voxels are not
 
 A creature is `meat` everywhere — that is what the CA reacts to, what a severed
@@ -2743,6 +2779,20 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
   Steam networking, temperature layer, structural stress.
 
 ## 14. Risks (ranked)
+
+0. **Page-pool exhaustion is a FATAL ERROR, not a caveat on rule 1.** Under
+   paged residency (§3) the CPU materializes every page a kernel might write
+   before the command buffer is submitted; if the pool cannot satisfy that set,
+   the engine aborts with a clear `page pool exhausted` message, in every mode.
+   The reasoning: if the pool can exhaust in normal play then the pool is
+   MIS-SIZED, and the right response to a bug is to fail loudly at the moment
+   of detection rather than to invent a graceful behaviour that hides it and
+   mutates the world while doing so. This is a condition the engine detects and
+   refuses to continue past — the same register as an out-of-memory allocation
+   failure — and it does NOT qualify the determinism guarantee: an aborted
+   process produces no hash to diverge. Pool sizing (`kPoolPages`, world.h) is
+   therefore load-bearing rather than advisory, and `--measure` reports the
+   high-water mark so the margin stays a tracked number.
 
 1. **Island detection** — flagged by the one team that's done it as "hardest, not
    completely solved." Mitigation: bounded fills, chunk-face metadata, accept
