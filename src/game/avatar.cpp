@@ -159,6 +159,12 @@ void PlayerAvatar::ResolveParts() {
   // Re-resolve the held prop against the new def: a hot reload replaces the
   // skeleton, so a cached part index from the old one would point at whatever
   // limb happens to sit there now.
+  // Same reasoning as the parts above, for the clips the per-tick locomotion
+  // path selects between.
+  locoClips_.idle = sk.FindClip("idle");
+  locoClips_.walk = sk.FindClip("walk");
+  locoClips_.run = sk.FindClip("run");
+  locoClips_.fall = sk.FindClip("fall");
   heldPartIndex_ = heldPart_.empty() ? -1 : sk.FindPart(heldPart_);
 }
 
@@ -648,8 +654,12 @@ void PlayerAvatar::SetHiddenParts(const std::vector<uint8_t>& hidden) {
 
 void PlayerAvatar::PlayClip(const std::string& name) {
   if (!def_) return;
-  int ci = skel_.FindClip(name);
-  if (ci < 0) return;
+  PlayClipIndex(skel_.FindClip(name));
+}
+
+void PlayerAvatar::PlayClipIndex(int ci) {
+  if (!def_) return;
+  if (ci < 0 || ci >= (int)skel_.clips.size()) return;
   for (ClipInstance& inst : anim_.clips)
     if (inst.clip == ci && !inst.stopping) {
       // ALREADY PLAYING: leave it alone. This used to rewind to timeMs = 0,
@@ -1577,10 +1587,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // why the legs kept reading wrong on the ground after any jump or drop.
       // Landing must retire it; it is exclusive with the three locomotion
       // clips by construction (you are either on the ground or you are not).
-      const int ic = def.skel.FindClip("idle");
-      const int wc = def.skel.FindClip("walk");
-      const int rc = def.skel.FindClip("run");
-      const int fc = def.skel.FindClip("fall");
+      // Resolved once per def load in ResolveParts, not per tick — see
+      // AvatarLocoClips. This block runs on every one of PreTick's four calls a
+      // frame, and FindClip is a linear scan of std::string compares.
+      const int ic = locoClips_.idle;
+      const int wc = locoClips_.walk;
+      const int rc = locoClips_.run;
+      const int fc = locoClips_.fall;
       const int want = airborneNow ? fc : (!moving ? ic : (running ? rc : wc));
       for (ClipInstance& inst : anim_.clips) {
         if (inst.clip < 0) continue;
@@ -1590,8 +1603,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
           inst.stopping = true;
       }
     }
-    if (moving) PlayClip(running ? "run" : "walk");
-    else PlayClip("idle");
+    // Deliberately NOT `PlayClipIndex(want)`: when airborne `want` is `fall`,
+    // but this line has always started `idle` there (`moving` is false while
+    // airborne), and the airborne branch above owns starting `fall`. Keeping
+    // idle's blend alive under a jump is what stops the arms snapping on
+    // landing, so the airborne case must stay idle, not want.
+    PlayClipIndex(moving ? (running ? locoClips_.run : locoClips_.walk)
+                         : locoClips_.idle);
 
     // ---- submit kinematic targets ----
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
