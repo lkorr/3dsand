@@ -21,6 +21,9 @@
     },
     {
       "id": "wood",
+      "sounds": {
+        "break": "branch"
+      },
       "footstep": "branch",
       "class": "solid",
       "density": 600,
@@ -338,6 +341,9 @@
     },
     {
       "id": "stem",
+      "sounds": {
+        "break": "branch"
+      },
       "class": "solid",
       "density": 450,
       "hardness": 12,
@@ -632,6 +638,9 @@
     },
     {
       "id": "birch_wood",
+      "sounds": {
+        "break": "branch"
+      },
       "footstep": "branch",
       "class": "solid",
       "density": 560,
@@ -851,6 +860,9 @@
     },
     {
       "id": "stem_green",
+      "sounds": {
+        "break": "branch"
+      },
       "class": "solid",
       "density": 340,
       "hardness": 4,
@@ -978,6 +990,9 @@
     },
     {
       "id": "staff_wood",
+      "sounds": {
+        "break": "branch"
+      },
       "footstep": "branch",
       "class": "solid",
       "density": 620,

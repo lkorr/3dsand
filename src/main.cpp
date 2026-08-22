@@ -2293,9 +2293,18 @@ int main(int argc, char** argv) {
           else
             audioCues.Footstep(ff.mat, ff.posVox, ff.speed, ff.foot);
         }
+        // Terrain that came loose this frame. Drained here for the same reason
+        // as the footfalls: PreTick runs once per tick and the tick loop runs
+        // up to 4 times a frame, so voicing from inside it would stack several
+        // snaps on one instant.
+        for (const DebrisSystem::BreakEvent& be : debris.BreakEvents())
+          audioCues.Break(be.material, be.posVoxel, be.sizeVoxels);
         audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
       }
       avatar.ClearFootfalls();
+      // Cleared unconditionally, like the footfalls: a queue that only drains
+      // when audio happens to be on is a slow leak on a silent machine.
+      debris.ClearBreakEvents();
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
@@ -2594,8 +2603,8 @@ int main(int argc, char** argv) {
   // is the only thread that can still be inside the mixer.
   if (audioCues.Enabled()) {
     const audio::Cues::Stats& as = audioCues.GetStats();
-    std::printf("[audio] %u steps, %u landings, %u impacts, %u dropped\n",
-                as.steps, as.lands, as.impacts, as.dropped);
+    std::printf("[audio] %u steps, %u landings, %u impacts, %u breaks, %u dropped\n",
+                as.steps, as.lands, as.impacts, as.breaks, as.dropped);
   }
   audioCues.Shutdown();
   overlay.Shutdown();

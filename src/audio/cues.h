@@ -84,6 +84,21 @@ class Cues {
   // A physical impact (debris, a thrown body) carrying `energy` in [0,1].
   void Impact(uint32_t matId, const Vec3& posVox, float energy);
 
+  // This material coming apart: a chunk of terrain losing its support and
+  // detaching as a rigidbody, dug out, or blasted loose.
+  //
+  // `sizeVoxels` is the voxel count of the piece that broke off. It selects
+  // the pitch CENTRE -- a big log snaps lower than a twig -- around which a
+  // random ±kBreakSemitones detune is applied per event. That randomization is
+  // not decoration: a break is the one cue most likely to fire several times
+  // in a second (one support scan can free a dozen islands), and identical
+  // repeats of a one-second sample read as a stuck machine gun.
+  //
+  // Deliberately NOT tied to the world hash — audio is presentation, so this
+  // uses the plain rng_ rather than the sim's counter-based hash (rule 1
+  // constrains the sim, and a cue can never feed back into it).
+  void Break(uint32_t matId, const Vec3& posVox, int sizeVoxels);
+
   // ---- creature events ----------------------------------------------------
   // Bound per mob in its .json sidecar (MobDef::sounds), keyed by the slot
   // names in assets/sound_schema.js. There is deliberately no fallback: a mob
@@ -126,7 +141,7 @@ class Cues {
   // gait producing steps at all" separately from "can I hear them" — the two
   // failure modes look identical from the speakers.
   struct Stats {
-    uint32_t steps = 0, lands = 0, impacts = 0, mobs = 0, dropped = 0;
+    uint32_t steps = 0, lands = 0, impacts = 0, breaks = 0, mobs = 0, dropped = 0;
   };
   const Stats& GetStats() const { return stats_; }
 

@@ -317,6 +317,27 @@ struct Tuning {
     // Physical impacts (debris, bodies).
     float impactVolume = 0.9f;
     float impactRadius = 30.0f;
+
+    // Something coming apart: terrain losing support and detaching as a
+    // rigidbody, or being dug/blasted loose.
+    float breakVolume = 1.0f;
+    // Breaks carry further than impacts — a tree limb giving way is a loud,
+    // low event and hearing it from off-screen is most of its value.
+    float breakRadius = 45.0f;
+    // Half-range of the per-event random detune, in SEMITONES. Expressed in
+    // semitones rather than as a rate multiplier because that is the unit the
+    // ear (and whoever is tuning this) actually thinks in; cues.cpp converts
+    // with 2^(n/12). 5 is wide — deliberately, since one support scan can free
+    // several islands in the same tick and identical repeats read as a
+    // machine. Beyond ~7 the material stops sounding like itself.
+    float breakPitchSemitones = 5.0f;
+    // Pitch centre by piece size: a lone voxel snapping is a twig, a large
+    // island is a log. These are the rate multipliers at the two ends, and a
+    // piece's voxel count maps between them (see breakBigVoxels).
+    float breakSmallRate = 1.25f;
+    float breakBigRate = 0.8f;
+    // Voxel count that counts as "big" for the mapping above.
+    float breakBigVoxels = 400.0f;
     // Creature voices (hurt/death/sever/...). Kept separate from impacts
     // because a mob crying out and a rock landing are mixed against each
     // other, and one trim cannot serve both.

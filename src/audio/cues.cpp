@@ -362,6 +362,48 @@ void Cues::Impact(uint32_t matId, const Vec3& posVox, float energy) {
   if (world_.PlayOneShot(buf, posVox, cfg)) stats_.impacts++;
 }
 
+void Cues::Break(uint32_t matId, const Vec3& posVox, int sizeVoxels) {
+  if (!enabled_ || matId >= break_.size()) return;
+  const FootstepMapping& bm = break_[matId];
+  // No surrogate: a step is not a shatter, so an unbound material is silent
+  // (see RebuildMaterialTable). This is the early-out that keeps the cue free
+  // for the 50-odd materials with nothing recorded yet.
+  if (bm.setId < 0) return;
+  const Tuning::Audio& t = CurrentTuning().audio;
+
+  // Size -> pitch centre. sqrt, not linear: perceived size goes with a piece's
+  // linear dimension rather than its volume, so a 400-voxel island and a
+  // 40-voxel one should not be a full mapping apart.
+  const float big = std::max(1.0f, t.breakBigVoxels);
+  const float k =
+      std::clamp(std::sqrt((float)std::max(0, sizeVoxels) / big), 0.0f, 1.0f);
+  const float centre = t.breakSmallRate + (t.breakBigRate - t.breakSmallRate) * k;
+
+  // Random detune in SEMITONES, converted to a rate multiplier. Uniform in
+  // semitones (not in rate) so the shift is symmetric to the ear: ±5 st is
+  // ×1.335 up but only ×0.749 down, and randomizing the rate directly would
+  // bias every break upward.
+  std::uniform_real_distribution<float> d(-t.breakPitchSemitones,
+                                          t.breakPitchSemitones);
+  const float rate = centre * std::pow(2.0f, d(rng_) / 12.0f);
+
+  if ((int)lastVariant_.size() <= bm.setId) lastVariant_.assign((size_t)lib_.Count(), -1);
+  const std::vector<float>* buf = PickStep(bm.setId, lastVariant_[(size_t)bm.setId]);
+
+  VoiceConfig cfg;
+  cfg.gain = t.breakVolume * bm.gain * (0.7f + 0.5f * k);
+  cfg.audibleRadius = t.breakRadius;
+  cfg.verbWet = t.reverbWet;
+  // Doppler off: the piece is not moving yet at the instant it breaks — it
+  // detaches at rest and only then falls.
+  cfg.doppler = false;
+  cfg.rate = std::clamp(rate, 0.25f, 4.0f);
+  if (world_.PlayOneShot(buf, posVox, cfg))
+    stats_.breaks++;
+  else
+    stats_.dropped++;
+}
+
 int Cues::MobSetId(const MobDef& def, MobEvent ev) const {
   const char* slot = MobSlotName(ev);
   const std::string& authored = def.Sound(slot);

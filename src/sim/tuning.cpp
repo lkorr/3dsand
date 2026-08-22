@@ -443,6 +443,22 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "landFullSpeed", a.landFullSpeed, out, at);
     ReadF(*g, "impactVolume", a.impactVolume, out, at);
     ReadF(*g, "impactRadius", a.impactRadius, out, at);
+    ReadF(*g, "breakVolume", a.breakVolume, out, at);
+    ReadF(*g, "breakRadius", a.breakRadius, out, at);
+    ReadF(*g, "breakPitchSemitones", a.breakPitchSemitones, out, at);
+    ReadF(*g, "breakSmallRate", a.breakSmallRate, out, at);
+    ReadF(*g, "breakBigRate", a.breakBigRate, out, at);
+    ReadF(*g, "breakBigVoxels", a.breakBigVoxels, out, at);
+    // An octave of detune either way is already past the point where the
+    // material stops sounding like itself; beyond that it is a bug, not taste.
+    a.breakPitchSemitones = std::clamp(a.breakPitchSemitones, 0.0f, 12.0f);
+    // Rates are clamped to what the resampler can do without turning a break
+    // into a click or a drone.
+    a.breakSmallRate = std::clamp(a.breakSmallRate, 0.25f, 4.0f);
+    a.breakBigRate = std::clamp(a.breakBigRate, 0.25f, 4.0f);
+    // Guard the size mapping's divisor: a 0 here would make every break the
+    // "big" pitch via a division by zero.
+    a.breakBigVoxels = std::max(a.breakBigVoxels, 1.0f);
     ReadF(*g, "mobVolume", a.mobVolume, out, at);
     ReadF(*g, "mobRadius", a.mobRadius, out, at);
     ReadF(*g, "mobPitchJitter", a.mobPitchJitter, out, at);

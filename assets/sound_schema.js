@@ -75,9 +75,11 @@ const SOUND_SCHEMA = {
        pitch:'heavier impact → lower'},
 
       {k:'break', n:'break / shatter', prefix:'breaks',
-       d:'This material being destroyed — dug out, blasted, or shattered into rubble.',
-       fires:'not wired yet — bind it and the set is ready when it is',
-       fallback:'silent.'},
+       d:'This material coming apart. Fires when a chunk of it loses its support and detaches as a rigidbody — a limb cut off a tree, a ledge undermined, a wall blasted through. The piece’s dominant material decides the sound, so a mostly-wood island snaps like wood even with a little ash in it.',
+       fires:'audio::Cues::Break — src/audio/cues.cpp, from DebrisSystem::BreakEvents()',
+       fallback:'silent — a step is not a shatter, so there is deliberately no surrogate.',
+       gain:'scales with the size of the piece',
+       pitch:'centre set by piece size (twig high, log low), then a random ±breakPitchSemitones per event'},
 
       {k:'ambience', n:'ambience loop', prefix:'ambience',
        d:'A positioned looping bed for a body of this material, e.g. a lava lake or a waterfall. Started per emitter with a radius, not per voxel.',
