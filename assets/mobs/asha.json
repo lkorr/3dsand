@@ -5,7 +5,7 @@
     "material": "blood",
     "perDamage": 2.5
   },
-  "speed": 60.0,
+  "speed": 31.499999999999996,
   "gait": {
     "groups": [
       [
@@ -46,8 +46,8 @@
       "tag": "spine",
       "anchor": [
         16.0,
-        64.0,
-        14.0
+        68.0,
+        10.0
       ]
     },
     {
@@ -60,8 +60,8 @@
       "tag": "head",
       "anchor": [
         17.0,
-        98.0,
-        13.0
+        102.0,
+        9.0
       ],
       "severImpactSpeed": 20.0,
       "spring": {
@@ -79,8 +79,8 @@
       "tag": "arm",
       "anchor": [
         28.0,
-        98.0,
-        14.0
+        102.0,
+        10.0
       ],
       "severImpactSpeed": 15.0
     },
@@ -100,8 +100,8 @@
       "maxAngle": 0.05,
       "anchor": [
         28.0,
-        84.0,
-        14.0
+        88.0,
+        10.0
       ],
       "severImpactSpeed": 13.0
     },
@@ -114,8 +114,8 @@
       "tag": "hand",
       "anchor": [
         28.0,
-        72.0,
-        14.0
+        76.0,
+        10.0
       ],
       "severImpactSpeed": 9.0
     },
@@ -128,8 +128,8 @@
       "tag": "arm",
       "anchor": [
         4.0,
-        98.0,
-        14.0
+        102.0,
+        10.0
       ],
       "severImpactSpeed": 15.0
     },
@@ -149,8 +149,8 @@
       "maxAngle": 0.05,
       "anchor": [
         4.0,
-        84.0,
-        14.0
+        88.0,
+        10.0
       ],
       "severImpactSpeed": 13.0
     },
@@ -163,8 +163,8 @@
       "tag": "hand",
       "anchor": [
         4.0,
-        72.0,
-        14.0
+        76.0,
+        10.0
       ],
       "severImpactSpeed": 9.0
     },
@@ -176,9 +176,9 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        20.0,
-        44.0,
-        14.0
+        21.0,
+        48.0,
+        9.0
       ],
       "severImpactSpeed": 18.0
     },
@@ -198,8 +198,8 @@
       "maxAngle": 0.05,
       "anchor": [
         20.0,
-        26.0,
-        14.0
+        28.0,
+        10.0
       ],
       "severImpactSpeed": 16.0
     },
@@ -218,9 +218,9 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        20.0,
+        21.0,
         4.0,
-        18.0
+        14.0
       ],
       "severImpactSpeed": 12.0
     },
@@ -232,9 +232,9 @@
       "severable": true,
       "tag": "leg",
       "anchor": [
-        12.0,
-        44.0,
-        14.0
+        11.0,
+        48.0,
+        9.0
       ],
       "severImpactSpeed": 18.0
     },
@@ -254,8 +254,8 @@
       "maxAngle": 0.05,
       "anchor": [
         12.0,
-        26.0,
-        14.0
+        28.0,
+        10.0
       ],
       "severImpactSpeed": 16.0
     },
@@ -274,9 +274,9 @@
       "minAngle": -0.6,
       "maxAngle": 0.6,
       "anchor": [
-        12.0,
+        11.0,
         4.0,
-        18.0
+        14.0
       ],
       "severImpactSpeed": 12.0
     }
@@ -287,8 +287,8 @@
       "part": "hand.R",
       "offset": [
         4.0,
-        68.0,
-        14.0
+        72.0,
+        10.0
       ],
       "rotation": [
         0,
