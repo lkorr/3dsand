@@ -2874,7 +2874,23 @@ function tuneRow(tab,pr,g){
   row.append(el('div',{class:'nm',title:pr.k},
     el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)));
 
-  if(pr.type==='color'||pr.type==='vec3'){
+  if(pr.type==='select'){
+    const sel=document.createElement('select');
+    sel.className='cell';
+    sel.style.cssText='cursor:pointer;padding:5px 8px;min-width:120px';
+    for(const o of (pr.options||[])){
+      const opt=document.createElement('option');
+      opt.value=o;opt.textContent=o;
+      sel.append(opt);
+    }
+    sel.value=cur??pr.options[0]??'';
+    sel.addEventListener('change',()=>{
+      setTuned(g,pr.k,sel.value);
+      touchTune();mark();
+    });
+    row.append(sel);
+    row.append(el('span',{}));
+  }else if(pr.type==='color'||pr.type==='vec3'){
     row.append(vecEditor(pr,g,mark));
     row.append(el('span',{}));   // triples have no single numeric box
   }else if(pr.bool){

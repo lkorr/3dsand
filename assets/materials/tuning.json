@@ -1,10 +1,11 @@
 {
   "comment": "Look-and-feel parameters, edited with assets/tuner.html (Tuning tabs). Render values are compiled into every shader as TUNE_* constants by TuningWgslBlock() (src/sim/tuning.cpp) and picked up by F5 'reload shaders' with no rebuild. Player/camera/physics/debris/grenade/tools values are read directly by the C++ systems and apply on the same F5. The 'sim' group is DETERMINISM-CRITICAL (CLAUDE.md rule 1): integer-only, feeds voxel state, and changing anything there changes the world hash - re-run --selftest after touching it. The 'worldgen' group only takes effect on a new world (regen world / new seed). Anything omitted from this file keeps its compiled-in default, so a partial file is valid.",
   "player": {
+    "model": "mina",
     "flySpeed": 13.75,
     "flySprint": 32.5,
-    "walkSpeed": 3.5,
-    "sprintSpeed": 6,
+    "walkSpeed": 1.6,
+    "sprintSpeed": 3.15,
     "gravity": 9.81,
     "jumpSpeed": 5.25,
     "swimUp": 17.5,

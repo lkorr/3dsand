@@ -890,9 +890,9 @@ int main(int argc, char** argv) {
   PrefabPlacer placer;
   // The player avatar shares MobSystem's def list rather than loading its own:
   // one micro-body pool, and a hot reload (R) rebuilds both at once. It points
-  // at whichever def is named `avatarDefName`, so swapping the player
-  // character is data, not code.
-  const std::string avatarDefName = kAvatarDefName;
+  // at whichever def is named by tuning.json player.model, so swapping
+  // the player character is data, not code.  F5 re-reads it.
+  std::string avatarDefName = CurrentTuning().player.model;
   PlayerAvatar avatar;
   avatar.Init(&phys, &world, &debris, mats);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
@@ -1134,6 +1134,7 @@ int main(int argc, char** argv) {
         for (const std::string& w : tune.warnings)
           std::fprintf(stderr, "tuning: %s\n", w.c_str());
         SetCurrentTuning(tune);
+        avatarDefName = CurrentTuning().player.model;
         // Gore variance is drawn per mob at spawn, so mobs already standing in
         // the world hold profiles from the OLD tuning. Re-draw them here or an
         // edit to the randomness controls appears to do nothing until the next

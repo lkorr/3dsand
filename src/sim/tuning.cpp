@@ -61,6 +61,17 @@ void ReadI(const json& j, const char* key, int& dst, Tuning& t,
 // Booleans are read strictly rather than accepting 0/1: a checkbox that
 // silently accepts a number is a checkbox that silently accepts a typo, and
 // these gate whole subsystems (avatar on/off, camera collision on/off).
+void ReadStr(const json& j, const char* key, std::string& dst, Tuning& t,
+             const std::string& at) {
+  const json* v = Find(j, key);
+  if (!v) return;
+  if (!v->is_string()) {
+    t.warnings.push_back(at + "." + key + ": expected a string");
+    return;
+  }
+  dst = v->get<std::string>();
+}
+
 void ReadB(const json& j, const char* key, bool& dst, Tuning& t,
            const std::string& at) {
   const json* v = Find(j, key);
@@ -321,6 +332,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
   if (const json* g = Find(j, "player")) {
     auto& p = out.player;
     const std::string at = "player";
+    ReadStr(*g, "model", p.model, out, at);
     ReadF(*g, "flySpeed", p.flySpeed, out, at);
     ReadF(*g, "flySprint", p.flySprint, out, at);
     ReadF(*g, "walkSpeed", p.walkSpeed, out, at);
