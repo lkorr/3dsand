@@ -219,10 +219,19 @@ def main():
     # blade along +x, which IS perpendicular to the forearm — constraint 1
     # in this file's docstring. No rotation needed.
     #
-    # TRANSLATION is in MICRO units, in the item's own frame, and moves the
-    # item so the point the fist closes on lands on the socket. The fist grips
-    # SWORD_GRIP micro up from the pommel, so the item shifts back by that
-    # much along its own long axis.
+    # TRANSLATION is a RESIDUAL NUDGE in MICRO units, and is zero here. Where
+    # the fist closes is stated by the `hilt` box below, and the runtime puts
+    # that box's centre on the rig's socket — so the placement needs no tuned
+    # constant at all.
+    #
+    # IT USED TO BE [-SWORD_GRIP, 0, 0], AND THAT WAS THE BUG. It was chosen as
+    # if the socket sat at the pommel butt, but the socket is the CENTRE of the
+    # hand's limb box, and mina's hand is one world voxel across. -10 micro is
+    # -2.5 world voxels, so the item's origin was parked two and a half voxels
+    # outboard of a one-voxel fist and the blade — which grows from that origin
+    # along +x — hung down and away from the hand. It also never centred the
+    # blade's cross-section in y or z, so even the intended axis was off by
+    # half the guard. Aligning boxes removes all three errors at once.
     sidecar = {
         "comment": (
             "The sword as a standalone item: its own art, its own origin. "
@@ -239,10 +248,30 @@ def main():
         "severImpactSpeed": 7.0,
         "grip": {
             "held_right": {
-                "translation": [-SWORD_GRIP, 0, 0],
+                "translation": [0, 0, 0],
                 "rotation": [0, 0, 0],
                 "scale": 1.0,
             }
+        },
+        # WHERE THE FIST CLOSES, in the item's own frame and micro units — the
+        # wrapped grip between the pommel knob and the crossguard, which is
+        # exactly the span sword_vox() fills with GRIP leather. Emitted from
+        # the same constants that build the mesh, for the same reason the edge
+        # block is: re-measuring it by eye would rot the moment the art moved.
+        #
+        # This is the item's answer to the question the LIMB SYSTEM answers for
+        # a hand. The rig states what a hand is by declaring a box; the item
+        # states where its hilt is by declaring a box; the runtime puts the two
+        # centres together (src/game/avatar.cpp EquipItem). Neither side is a
+        # tuned number, so neither can drift.
+        #
+        # x: the leather runs from the pommel (x < 2 is the knob) to the guard.
+        # y/z: the full cross-section, so the centre lands on the blade's axis
+        #      rather than on its corner — the omission that left the old
+        #      placement off by half the guard even along the axis it did set.
+        "hilt": {
+            "min": [2, 0, 0],
+            "size": [SWORD_GRIP - 2, 2 * SWORD_HALF_W, 4],
         },
         # The cutting edge, in the ITEM's own local frame and micro units,
         # from the ricasso (where the sharpened part starts, just past the

@@ -1434,16 +1434,84 @@ bool mobOk = false;
                          !avatar.OwnsBody(0);
               if (foreign) phys.RemoveBody(foreign);
             }
+            // ---- THE HILT IS IN THE FIST ---------------------------------
+            //
+            // Everything above proves the blade CUTS; none of it proves the
+            // sword is anywhere near the hand. It was not: the grip
+            // translation was authored as if the socket sat at the pommel
+            // butt, so the item's origin was parked 2.5 world voxels outboard
+            // of a fist one voxel wide and the sword hung at the avatar's
+            // feet. Every assertion in this gate still passed, because an
+            // edge that has come loose from the hand is still an edge that
+            // moves and still carves what it touches.
+            //
+            // So assert the thing that was actually broken: the item's
+            // authored hilt box (item.h ItemHilt) and the hand's authored
+            // limb box overlap, measured in WORLD space off the two live
+            // bodies. Distance between centres, against the sum of the two
+            // half-extents on each axis — a box overlap test, not a radius,
+            // because both boxes are strongly anisotropic (the hilt is long
+            // and thin) and a sphere test would pass with the pommel poking
+            // out through the wrist.
+            bool hiltInFist = false;
+            float gripGap = -1.0f;
+            if (equipped && swordItem->hilt.has) {
+              const int handPart = avatar.PartIndex("hand.R");
+              const uint64_t handBody =
+                  handPart >= 0 ? avatar.PartBody(handPart) : 0;
+              const uint64_t swordBody2 = avatar.PartBody(swordPart);
+              BodyTransform hxf{}, sxf{};
+              Vec3 hlo, hhi;
+              if (handBody && swordBody2 &&
+                  phys.GetTransform(handBody, hxf) &&
+                  phys.GetTransform(swordBody2, sxf) &&
+                  phys.GetLocalBounds(handBody, hlo, hhi)) {
+                // Hand box centre/half-extent in world space. The collider is
+                // only used to LOCATE the hand here (its own greedy-merge
+                // padding is not what decides the grip) — the placement
+                // itself is limb-derived, and this is the independent check.
+                const Quat hq{hxf.quat[0], hxf.quat[1], hxf.quat[2],
+                              hxf.quat[3]};
+                const Vec3 handC =
+                    hxf.pos + QuatRotate(hq, (hlo + hhi) * 0.5f);
+                const Vec3 handHalf = (hhi - hlo) * 0.5f;
+                // Hilt centre in world space, through the sword's own pose.
+                const Quat sq{sxf.quat[0], sxf.quat[1], sxf.quat[2],
+                              sxf.quat[3]};
+                const Vec3 hiltC =
+                    sxf.pos + QuatRotate(sq, swordItem->hilt.center);
+                const Vec3 d = hiltC - handC;
+                const Vec3 hh = swordItem->hilt.halfExtents;
+                // Axis-wise overlap. Slack of half a world voxel absorbs the
+                // spring jiggle the grip deliberately has (sword.json's
+                // "spring"), which is motion the fist is supposed to allow.
+                const float slack = 0.5f;
+                const float ox = std::fabs(d.x) - (handHalf.x + hh.x + slack);
+                const float oy = std::fabs(d.y) - (handHalf.y + hh.y + slack);
+                const float oz = std::fabs(d.z) - (handHalf.z + hh.z + slack);
+                hiltInFist = ox <= 0 && oy <= 0 && oz <= 0;
+                gripGap = std::max(ox, std::max(oy, oz));
+              }
+            } else if (equipped && !swordItem->hilt.has) {
+              // No hilt box authored: placement falls back to the raw grip
+              // translation, which is the arrangement that shipped the bug.
+              // Don't silently pass — say so.
+              std::printf(
+                  "melee: NOTE (sword declares no hilt box; grip falls back "
+                  "to the raw translation)\n");
+            }
+
             bool meleeOk = equipped && edgeOk && movedOk && hitRight &&
-                           missedFar && selfSafe;
+                           missedFar && selfSafe && hiltInFist;
             std::printf(
                 "melee: %s (equipped=%d slot=%d, edge len ok=%d moved=%d, "
                 "struck limb %u->%u, far limb %u->%u untouched=%d, "
-                "self-hit guarded=%d)\n",
+                "self-hit guarded=%d, hilt in fist=%d gap %.2f vox)\n",
                 meleeOk ? "PASS" : "FAIL", equipped ? 1 : 0, swordPart,
                 edgeOk ? 1 : 0, movedOk ? 1 : 0,
                 targetBefore, targetAfter, farBefore, farAfter,
-                missedFar ? 1 : 0, selfSafe ? 1 : 0);
+                missedFar ? 1 : 0, selfSafe ? 1 : 0,
+                hiltInFist ? 1 : 0, gripGap);
             mobOk = mobOk && meleeOk;
           }
         }

@@ -418,6 +418,17 @@ class PlayerAvatar {
   // presentation, like everything else here.
   std::string heldPart_;
   int heldPartIndex_ = -1;
+  // Where the fist closes on the held item, in that item's BODY frame (i.e.
+  // after Jolt's centre-of-mass recentring, so it can be used directly against
+  // a live body transform). Set by EquipItem; meaningless when heldSlot_ < 0.
+  //
+  // This exists because the held slot is placed DIRECTLY from the hand's live
+  // transform rather than through the anchorLimb/restOffset pair the rig's
+  // other parts use. Those fields describe a joint between two limbs of one
+  // prefab; an item is a foreign object whose only relationship to the rig is
+  // "this point of me sits at that point of the hand", and saying that in one
+  // subtraction is both shorter and impossible to get subtly wrong.
+  Vec3 gripBody_{};
   Vec3 weaponHand_{}, weaponDir_{0, 1, 0}, weaponUp_{0, 0, 1};
   float weaponWeight_ = 0;
 
