@@ -108,6 +108,19 @@ class PageTable {
   // materialization, with the tick's op targets already declared.
   void BeginTick(uint32_t tick);
 
+  // True while the world is in its POST-RESET SETTLE WINDOW: the first
+  // kSettleWindowTicks ticks after a ResetAllEmpty/ResetIdentity (worldgen,
+  // LoadWorld), anchored by the first BeginTick that follows the reset. The
+  // freshly generated world's dirty set is at its lifetime maximum then, so
+  // SubmitTick's paged snapshot cadence must be strict (per-tick drain) —
+  // an absolute-tick predicate broke on --shot, whose scenes re-worldgen at
+  // arbitrary tick values.
+  bool InSettleWindow(uint32_t tick) const {
+    return settleAnchor_ < 0 ||
+           tick < (uint32_t)settleAnchor_ + kSettleWindowTicks;
+  }
+  static constexpr uint32_t kSettleWindowTicks = 32;
+
   // Contributor (a) to C(N): a chunk touched by a brush / cell / explosion op.
   // Declared as the op vectors are assembled, which is where the CPU already
   // computes opsCount/expCount/cellCount.
@@ -252,6 +265,10 @@ class PageTable {
 
   // ---- reporting ----
   uint32_t PagesInUse() const { return pagesInUse_; }
+  // Debug attribution (SANDVOX_PT_DEBUG): allocations since BeginTick, split
+  // by entry point — Materialize's sentinel fills vs EnsurePageForOverwrite
+  // (streaming refill / genList / worldgen batches).
+  uint32_t allocsMat_ = 0, allocsOvr_ = 0, refills_ = 0;
   uint32_t PagesHighWater() const { return pagesHighWater_; }
   uint32_t PoolPages() const { return poolPages_; }
   uint64_t FillsIssued() const { return fillsIssued_; }
@@ -353,6 +370,8 @@ class PageTable {
   static constexpr uint32_t kRetireTicks = 16;
 
   uint32_t tick_ = 0;
+  // First tick seen after a reset; -1 = reset happened, tick not yet known.
+  int64_t settleAnchor_ = -1;
 
  public:
   // Drain the queued page-initialization fills into `enc`. MUST be called at

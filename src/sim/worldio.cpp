@@ -269,6 +269,9 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
     // Snapshot restore (worldgen-equivalent), not a live mutation: the direct
     // upload path in FillSlots is sanctioned the same way worldgen's direct
     // writes are. All GAMEPLAY writes still flow through the MutationQueue.
+    // The held readback snapshot describes the PRE-LOAD world and must not be
+    // consumable afterwards (see World::InvalidateSnapshot).
+    world.InvalidateSnapshot();
     stream.ReloadWindow({origin[0], origin[1], origin[2]});
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeLoadReset(enc);

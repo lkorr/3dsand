@@ -304,8 +304,43 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // A readback is a pure copy out plus a map — it mutates no world state — so
   // the only thing a gate can observe from this is Snap() becoming valid in
   // paged mode, which is exactly what it needs to be.
+  // PAGED SELF-DEFENSE AGAINST SNAPSHOT STARVATION. §3.2's tightening is the
+  // ONLY thing that shrinks cpuDirty; without a snapshot the mirror dilates a
+  // ring per tick and the materialization set walks toward the whole window —
+  // measured at game startup: the worldgen-sized dirty set went 8,379 →
+  // 20,601 chunks over the four ticks the first frame runs before any
+  // snapshot fence can retire, and hysteresis stacked the materialized pages
+  // straight through the 16,384-page pool (§3.8 abort on the FIRST windowed
+  // paged run). The same starvation kills every headless path that ticks
+  // without readbacks (--shot settles worldgen over hundreds of such ticks).
+  //
+  // So paged mode enforces its own snapshot cadence: when no snapshot exists,
+  // or the one in hand is older than the tick can tolerate, request the
+  // readback and DRAIN it exactly like the harness does. Two thresholds:
+  //   - the SETTLE WINDOW (PageTable::InSettleWindow — the first ticks after
+  //     ANY world reset, anchored by the page table itself, because --shot's
+  //     scenes re-worldgen at arbitrary tick values and an absolute-tick
+  //     predicate missed every scene after the first) drains per-tick
+  //     (gap 0): the dirty set is at its lifetime maximum, and even a 2-4
+  //     tick lag — each stale snapshot dilated one ring per tick of lag —
+  //     measured 16,347 pages in use by tick 8, vs 9,396 peak for the same
+  //     settle under the harness's strict per-tick drain;
+  //   - after it, kPagedSnapshotMaxGap: the settled world's dirty set is
+  //     small, a few rings of it are cheap, and in steady play the game's own
+  //     readbacks keep the snapshot 1-3 ticks fresh so this never triggers —
+  //     it exists for hitches and for headless tick loops.
+  // Shot paths WaitIdle every tick anyway, so the added pump costs nothing
+  // there. Dense mode takes none of this — the identity map has no mirror to
+  // starve.
+  constexpr uint32_t kPagedSnapshotMaxGap = 4;
+  const bool paged = world.residency == World::Residency::Paged;
+  const uint32_t maxGap =
+      world.pages->InSettleWindow(tick) ? 0u : kPagedSnapshotMaxGap;
+  const bool snapshotStale =
+      paged &&
+      (!world.Snap().valid || (tick > world.Snap().tick + maxGap));
   const bool needSnapshotForPaging =
-      HarnessSnapshotDrain() && world.residency == World::Residency::Paged;
+      paged && (HarnessSnapshotDrain() || snapshotStale);
   bool doCopy = false;
   if (wantReadback || needSnapshotForPaging) {
     doCopy = world.EncodeReadbacks(ctx.device, enc,
@@ -315,16 +350,24 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   ctx.queue.Submit(enc.Finish());
   sim.FlipPage();
-  if (doCopy) {
-    world.KickReadback();
-    // Harness only, off by default (see SetHarnessSnapshotDrain in support.h).
-    // Wait for the submit's fence, then pump — which is what a game frame does
-    // for free by having real time elapse between the two. The game's frame
-    // loop shares SubmitTick and must never take this path.
-    if (HarnessSnapshotDrain()) {
-      ctx.WaitIdle();
-      ctx.ProcessEvents();
-    }
+  if (doCopy) world.KickReadback();
+  // Wait for the submit's fence, then pump — which is what a game frame does
+  // for free by having real time elapse between the two. Taken by the harness
+  // drain (SetHarnessSnapshotDrain, off by default) and by paged mode's
+  // staleness fallback above; the game's frame loop only pays it in the
+  // startup/hitch cases the fallback exists for.
+  //
+  // The pump runs EVEN WHEN NO COPY WAS ENCODED, and that is load-bearing:
+  // EncodeReadbacks DECLINES while all three ring slots are in flight, and in
+  // a headless tick loop only this pump ever retires them. Gating the pump on
+  // doCopy deadlocks the whole cadence — request declined, so no pump, so the
+  // slots never retire, so every later request is declined too — measured on
+  // --shot's oil-slick scene as a snapshot-starved mirror dilating a ring per
+  // tick straight through the pool (materialize allocations 35 → 3,447/tick
+  // over 13 ticks, no tighten ever running).
+  if (HarnessSnapshotDrain() || snapshotStale) {
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
   }
 }
 
@@ -338,6 +381,13 @@ void SetHarnessSnapshotDrain(bool on) { g_harnessSnapshotDrain = on; }
 bool HarnessSnapshotDrain() { return g_harnessSnapshotDrain; }
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
+  // The held snapshot describes the OLD world; scenes and gates also restart
+  // their tick counters, which can make its stamp read as newer than the new
+  // world's early ticks. See World::InvalidateSnapshot. Measured on --shot's
+  // oil-slick scene: the stale stamp suppressed every tightening AND the
+  // staleness fallback at once, and the unsnapshotted mirror dilated a ring
+  // per tick through the pool.
+  world.InvalidateSnapshot();
   TickParams tp{0, seed, 0, 0};
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;

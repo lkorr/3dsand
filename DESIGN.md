@@ -110,6 +110,15 @@ identical. A settled default-seed world is 84.8% sky, so it costs **4,975 pages
 = 77.7 MiB resident instead of 512 MiB dense** — a 6.6x reduction, and the
 mechanism that makes growing the window downward into solid bulk affordable.
 
+**Paged is the DEFAULT residency mode** (2026-08-23, after both modes passed
+the full suite at the phase-7 close). `--residency dense` remains the identity
+map and the only live differential oracle: same scenario, dense vs paged,
+bit-identical hashes — that comparison is the first diagnostic for any
+suspected paging bug. Paged mode defends its own snapshot cadence in
+`SubmitTick` (per-tick drains through the post-worldgen settle window, then a
+bounded-staleness fallback), because §3.2's mirror starves without snapshots
+and the pool is sized for a tightened mirror, not an unsnapshotted one.
+
 Three properties this rests on, all load-bearing:
 
 - **The CA is unaware of it.** Every world-coordinate voxel access in every

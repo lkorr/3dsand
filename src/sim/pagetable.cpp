@@ -92,6 +92,7 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   shellActive_ = false;
   shellLinger_ = false;
   lastSpawnTick_ = -1;
+  settleAnchor_ = -1;
   cRing_.clear();
   pendingFills_.clear();
   retire_.clear();
@@ -144,6 +145,7 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   shellActive_ = false;
   shellLinger_ = false;
   lastSpawnTick_ = -1;
+  settleAnchor_ = -1;
   cRing_.clear();
   pendingFills_.clear();
   retire_.clear();
@@ -205,23 +207,50 @@ uint64_t PageTable::EnsurePageForOverwrite(uint32_t slot) {
   if ((t[slot] & kPtSentinelBit) == 0u)
     return (uint64_t)t[slot] * kChunkVol * 4;
   const uint32_t p = Alloc();
+  allocsOvr_++;
   t[slot] = p;
   MarkTableDirty(slot);
   return (uint64_t)p * kChunkVol * 4;
 }
 
+// The stainless-air test: material bits must be air and stain/bit31 clear;
+// the state nibble and stamp byte are passenger bits on air (audited — see
+// Classify and the free-path comment in ConsumeOccupancy). ONE definition,
+// shared by classification and the hysteresis free probe, because two copies
+// of this mask would be a "two places must agree" bug in waiting.
+constexpr uint32_t kAirDemoteMask = 0xFF000FFFu;  // material | stain | bit31
+
 uint32_t PageTable::Classify(const uint32_t* words) {
-  // Whole-WORD equality, never material equality (§2.3, risk 3). A UNIFORM
-  // sentinel carries only 12 bits of material, so a chunk of one material
-  // whose cells differ in their state nibble cannot be represented — and
-  // worldgen assigns a `rnd % 3` palette variant per cell, so a stone chunk
-  // almost certainly is not single-word. Commit 0 measured this: 41 chunks of
-  // 32,768 are whole-word uniform, against 2,115 that are one material with
-  // mixed state.
+  // EMPTY first, by STAINLESS-AIR masking rather than exact zeros: material
+  // must be air and stain/bit31 clear in every cell, while the state nibble
+  // (12..15) and the stamp byte (16..23) are ignored — they are audited
+  // passenger bits on air. sim_mutate paints EVERY voxel with a palette
+  // jitter, air included (`state = rnd % 3`, sim_mutate.wgsl:80), and the CA
+  // stamps vacated cells, so an all-air chunk from any played or saved world
+  // is virtually never all-zeros. Exact-zero EMPTY made the store-hit refill
+  // classify every such chunk as needing a page — a whole-window load from
+  // world.svd re-materialized ~half the window and exhausted the pool at game
+  // startup. Soundness of ignoring those bits (hash-blind: the hash skips
+  // MAT_AIR cells; behavior-inert: the only stamp reader is the acting cell's
+  // no-op act, and every neighbour state-nibble read is behind a same-material
+  // guard; the stamp byte is save-stripped anyway): the free-path comment in
+  // ConsumeOccupancy carries the line-level citations.
+  {
+    bool air = true;
+    for (uint32_t i = 0; i < kChunkVol; i++)
+      if ((words[i] & kAirDemoteMask) != 0u) { air = false; break; }
+    if (air) return kPtEmpty;
+  }
+  // UNIFORM: whole-WORD equality, never material equality (§2.3, risk 3). A
+  // UNIFORM sentinel carries only 12 bits of material, so a chunk of one
+  // material whose cells differ in their state nibble cannot be represented —
+  // and worldgen assigns a `rnd % 3` palette variant per cell, so a stone
+  // chunk almost certainly is not single-word. Commit 0 measured this: 41
+  // chunks of 32,768 are whole-word uniform, against 2,115 that are one
+  // material with mixed state.
   const uint32_t w0 = words[0];
   for (uint32_t i = 1; i < kChunkVol; i++)
     if (words[i] != w0) return kNeedsPage;
-  if (w0 == 0u) return kPtEmpty;
   // Only promote to UNIFORM when the word is EXACTLY what synthWord would
   // produce for it. A chunk of one word that carries a live tick stamp or a
   // stain cannot round-trip through a 12-bit sentinel, and promoting it would
@@ -235,7 +264,16 @@ uint32_t PageTable::Classify(const uint32_t* words) {
 // ---- the §3.2 recurrence --------------------------------------------------
 
 void PageTable::BeginTick(uint32_t tick) {
+  if (getenv("SANDVOX_PT_DEBUG") && (allocsMat_ | allocsOvr_))
+    std::printf("[pt] tick %u..%u allocs: mat=%u ovr=%u refills=%u inUse=%u origin=%d,%d,%d\n",
+                tick_, tick, allocsMat_, allocsOvr_, refills_, pagesInUse_,
+                world_->WindowOrigin().x, world_->WindowOrigin().y,
+                world_->WindowOrigin().z);
+  if (settleAnchor_ < 0) settleAnchor_ = (int64_t)tick;
   tick_ = tick;
+  refills_ = 0;
+  allocsMat_ = 0;
+  allocsOvr_ = 0;
   opTargets_.Clear();
   materialized_.Clear();
 }
@@ -394,6 +432,7 @@ void PageTable::WakeAll() {
 }
 
 void PageTable::RefilledSlot(uint32_t slot) {
+  refills_++;
   // Contributor (d): Stream::FillSlots writes dirty[0] AND dirty[1] for a
   // store-hit slot. Its target was just written by streaming so it is
   // materialized anyway, but it must still enter cpuDirty or a tightening in
@@ -631,9 +670,10 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   materialized_.UnionWith(particleChunks_);
 
   if (getenv("SANDVOX_PT_DEBUG")) {
-    std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu inUse=%u\n",
+    std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu inUse=%u aM=%u aO=%u\n",
                 tick_, cpuDirty_.Size(), hasMatterCount, materialized_.Size(),
-                opTargets_.Size(), particleChunks_.Size(), pagesInUse_);
+                opTargets_.Size(), particleChunks_.Size(), pagesInUse_,
+                allocsMat_, allocsOvr_);
   }
   for (uint32_t s : materialized_.Members()) {
     const uint32_t e = t[s];
@@ -647,6 +687,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
     // the streaming+spells gates, most of them exactly this.
     zeroStreak_[s] = 0;
     const uint32_t page = Alloc();
+    allocsMat_++;
     // A freshly allocated page must hold the synthesized content of the
     // sentinel it replaces, BEFORE the consuming dispatch. vkCmdFillBuffer
     // takes a 32-bit pattern, so EMPTY (4,096 zeros) and UNIFORM (4,096
@@ -754,7 +795,6 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
       // sequences are the empirical check). Classify keeps its exact-word
       // strictness where it is needed — UNIFORM promotion must reproduce
       // resident words bit-exactly.
-      constexpr uint32_t kAirDemoteMask = 0xFF000FFFu;  // material | stain | bit31
       bool demotable = true;
       for (uint32_t i = 0; i < kChunkVol; i++)
         if ((freeProbe_[i] & kAirDemoteMask) != 0u) { demotable = false; break; }

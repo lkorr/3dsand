@@ -1088,7 +1088,12 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
-  bool residencyPaged = false;  // --residency paged|dense (dense is the oracle)
+  // PAGED IS THE DEFAULT (2026-08-23, user decision): 4,975 resident pages =
+  // 77.7 MiB against 512 MiB dense, both residency suites green at the phase-7
+  // close. `--residency dense` stays available as the identity map and the
+  // only live differential oracle — if paged ever misbehaves, the first
+  // diagnostic step is the same scenario under dense.
+  bool residencyPaged = true;  // --residency paged|dense
   bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
   // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
@@ -1137,9 +1142,10 @@ int main(int argc, char** argv) {
     // TimestampQuery device feature.
     if (a == "--measure") measure = true;
     // `--residency paged|dense` selects the voxel buffer's residency
-    // (docs/PLAN_page_table.md §6.2). ONE variable with a total order of
-    // values rather than two flags, per the phase-6 lesson that a flag named
-    // for the non-default cannot express a default flip.
+    // (docs/PLAN_page_table.md §6.2). Paged is the default; dense is the
+    // identity-map oracle. ONE variable with a total order of values rather
+    // than two flags, per the phase-6 lesson that a flag named for the
+    // non-default cannot express a default flip.
     //
     // `dense` is the identity map: address-identical to pre-paging code while
     // still running the whole translation path. With Dawn gone it is the ONLY

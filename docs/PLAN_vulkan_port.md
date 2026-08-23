@@ -1245,3 +1245,14 @@ explicit heap placement. Re-run `--measure` after each.
 - 2026-08-22 (user): **commit at every completed unit of work.** Implementation
   agents commit at green checkpoints with the selftest result in the message;
   never sweep files outside their board claim into a commit.
+- 2026-08-23 (user): **PAGED IS THE DEFAULT RESIDENCY.** Flipped the day after
+  the phase-7 close put both modes green. `--residency dense` stays as the
+  identity-map differential oracle. The flip's FIRST real windowed run exposed
+  a startup crash the harness structurally could not see (it drains a snapshot
+  every tick; the game's first frames run 4 ticks before any snapshot fence
+  retires, the worldgen-sized mirror dilated 8,379 → 20,601 chunks, and
+  hysteresis stacked materializations through the 16,384-page pool). Fixed in
+  `SubmitTick`: paged mode enforces its own snapshot cadence — per-tick drain
+  through the post-worldgen settle window (first 32 ticks), then a
+  bounded-staleness drain (gap > 4) for hitches and headless tick loops
+  (--shot never requests readbacks). Steady-state play never triggers either.
