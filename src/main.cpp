@@ -2749,7 +2749,8 @@ int main(int argc, char** argv) {
         char lg[160];
         if (player.hanging) {
           std::snprintf(lg, sizeof lg,
-                        "HANGING lip(%d,%d,%d) — W: pull up, ctrl: drop",
+                        "HANGING lip(%d,%d,%d) — hold W: pull up, A/D: "
+                        "shimmy, re-tap space: jump, ctrl: drop",
                         player.hangLip.x, player.hangLip.y, player.hangLip.z);
         } else if (player.ledgeInReach) {
           std::snprintf(

@@ -27,7 +27,7 @@
     "waterMantleSpeed": 4.5,
     "waterMantleTime": 0.9,
     "ledgeReach": 0.55,
-    "ledgeHangDrop": 0.15,
+    "ledgeHangDrop": -0.15,
     "ledgeBoostSpeed": 5.25,
     "ledgeMantleSpeed": 1.5,
     "ledgeMantleTime": 2.8,

@@ -1491,10 +1491,14 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     const float lipTopY = (float)(hangLipW_.y + 1);
     // How far ahead the lip actually is, measured to the held cell rather
     // than assumed from the probe constant, so hands reach a recessed lip.
+    // The hands aim at the lip's NEAR TOP CORNER (cell centre minus half a
+    // cell, plus a finger's width onto the surface): every fraction of a
+    // voxel of horizontal reach is a fraction the arms — short on a chibi
+    // rig — do not have to spend.
     const float aheadRaw = ((float)hangLipW_.x + 0.5f - cx) * dir.x +
                            ((float)hangLipW_.z + 0.5f - cz) * dir.z;
-    const float ahead = std::clamp(aheadRaw - 0.4f, Player::kHalfXZ * 0.7f,
-                                   Player::kHalfXZ + 2.0f);
+    const float ahead = std::clamp(aheadRaw - 0.55f, Player::kHalfXZ * 0.6f,
+                                   Player::kHalfXZ + 1.2f);
     for (size_t c = 0; c < sk.chains.size(); c++) {
       const IkChain& ch = sk.chains[c];
       if (ch.tag != "arm" || ch.parts.empty() || ch.effector < 0) continue;
@@ -1503,15 +1507,13 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       const Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
       const float latM = shoulder.x - pivot.x;  // this arm's own spread
       // Palm rest point on the lip: fingers just over the top surface.
-      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead, lipTopY + 0.3f,
+      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead, lipTopY + 0.2f,
                  cz + leftW.z * latM + dir.z * ahead};
       Vec3 rel = palmW - bodyOrigin - pivot;
       Vec3 palmPrefab = RotateInv(yaw, rel) + pivot;
       // The solver places the EFFECTOR's joint (the wrist). The grip point is
-      // the hand's item socket — resolve its current model-space offset from
-      // the wrist and aim the wrist short of the lip by exactly that. The
-      // hand's post-clip rotation moves a little as the solve settles, so
-      // this converges over a couple of frames, which a static hang absorbs.
+      // the hand's item socket — resolve its offset from the wrist and aim
+      // the wrist short of the lip by exactly that.
       Vec3 sockLocal{};
       bool found = false, mirrored = false;
       for (const MobSocketDef& sock : def_->sockets) {
@@ -1539,18 +1541,56 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
         }
       }
       if (mirrored) sockLocal.x = -sockLocal.x;
-      if (ch.effector < (int)st.model.size()) {
-        Vec3 palmOff = QuatRotate(st.model[ch.effector].rot, sockLocal);
-        palmPrefab = palmPrefab - palmOff;
+      if (ch.parts.size() < 2) continue;
+      const int i0 = ch.parts[0], i1 = ch.parts[1], ie = ch.effector;
+      if (ie >= (int)st.model.size() || i1 >= (int)st.model.size()) continue;
+      if (!st.partAlive.empty() && (!st.partAlive[i0] || !st.partAlive[i1]))
+        continue;  // limb lost: the chain has gone silent, so must this
+
+      // Rough wrist target from the pre-solve hand rotation; refined by the
+      // second pass below. (The flatten restarts from the clips every frame,
+      // so a single pass never converges — the correction must be measured
+      // from the SOLVED pose inside the same frame.)
+      Vec3 palmOff = QuatRotate(st.model[ie].rot, sockLocal);
+      Vec3 wristT = palmPrefab - palmOff;
+
+      const Vec3 root = st.model[i0].pos;
+      const float L1 = (st.model[i1].pos - root).len();
+      const float L2 = ie == i1 ? sk.parts[i1].rest.pos.len()
+                                : (st.model[ie].pos - st.model[i1].pos).len();
+      const float armReach = (L1 + L2) * 0.98f;
+      Vec3 toT = wristT - root;
+      const float shortBy = toT.len() - armReach;
+      // Ghost guard, same geometry rule as the legs — but only while FADING
+      // OUT: a live hang is allowed to be short (the shrug covers it), a
+      // stale lip receding as the body falls away is not worth aiming at.
+      if (!hangActive_ && shortBy > 3.0f) continue;
+
+      // ---- SHOULDER SHRUG: the stretch that makes short arms reach -------
+      // Two-bone IK clamps to its annulus, so a rig whose arms cannot span
+      // shoulder->lip (mina's are ~3.3 voxels against a ~5+ voxel gap —
+      // chibi proportions) lands its hands exactly the shortfall below the
+      // lip, which is the reported bug. Rather than fake it with a pose, the
+      // whole chain TRANSLATES toward the target by the (capped) shortfall —
+      // shoulders pulled up out of the socket by the body's weight, the way
+      // a real dead hang stretches them. Bounded, weight-faded, and ZERO for
+      // any rig whose arms genuinely reach: long-armed models never shrug.
+      if (shortBy > 0.0f && toT.len() > 1e-4f) {
+        constexpr float kShrugCapVox = 2.5f;
+        const Vec3 shift =
+            toT * (std::min(shortBy, kShrugCapVox) / toT.len() * weight);
+        st.model[i0].pos += shift;
+        st.model[i1].pos += shift;
+        if (ie != i1) st.model[ie].pos += shift;
       }
-      // Ghost guard, same geometry rule as the legs: while the weight fades
-      // out after a drop the lip is stale, and once it is beyond the arm's
-      // reach there is nothing sensible to solve for.
-      float reach = 0.0f;
-      for (size_t i = 1; i < ch.parts.size(); i++)
-        reach += sk.parts[ch.parts[i]].rest.pos.len();
-      if ((palmPrefab - shoulder).len() > reach * 1.7f + 1.0f) continue;
-      AnimSolveTwoBone(sk, st, ch, palmPrefab, weight);
+
+      // Pass 1 settles the chain onto the rough target; pass 2 re-measures
+      // the palm from the solved hand rotation and corrects. The residual
+      // after pass 2 is second-order (the correction barely re-rotates the
+      // hand) — sub-voxel in practice.
+      AnimSolveTwoBone(sk, st, ch, wristT, weight);
+      palmOff = QuatRotate(st.model[ie].rot, sockLocal);
+      AnimSolveTwoBone(sk, st, ch, palmPrefab - palmOff, weight);
     }
   }
 }
