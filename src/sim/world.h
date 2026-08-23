@@ -127,6 +127,42 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
 
+// ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; side-by-side demo) ---
+// An EXPERIMENTAL second liquid representation living alongside the CA liquid:
+// GPU particles simulated by a fixed-point MLS-MPM solver (sim_fluid.wgsl).
+// Deliberately OUTSIDE the hashed sim domain in this prototype — the fluid
+// never writes a voxel, never touches dirty flags, and no CA kernel reads any
+// fluid buffer, so the world hash is untouched by construction. The fluid is
+// still bit-deterministic in its own right (integer-only math, integer-atomic
+// P2G scatter — addition is associative, so accumulation order cannot matter),
+// which the `fluid_det` selftest gate verifies twice-run. That is the plan's
+// Phase-0 determinism spike, run inside the engine.
+//
+// The particle COUNT is CPU-owned (main loop / selftest gate): particles are
+// only ever appended by the spawn kernel at CPU-known offsets and never die,
+// so every dispatch extent is a pure function of the op stream. Not persisted:
+// save/load and worldgen drop the fluid (count resets to 0), per the plan's
+// force-settle-on-save policy — acceptable for a comparison prototype.
+constexpr uint32_t kFluidCap = 262144;            // hard particle budget (rule 2)
+constexpr uint32_t kMaxFluidSpawnsPerTick = 4096; // spawn-op stream cap
+// Sparse scratch-grid blocks: one 16^3 node block per ACTIVE chunk slot,
+// allocated per substep by a deterministic scan. 256 blocks * 4096 nodes *
+// 16 B = 16 MiB, and bounds simultaneously-active fluid to 256 chunks.
+constexpr uint32_t kFluidBlocks = 256;
+// MPM substeps per 30 Hz tick. CFL: |v| <= 0.45 cell/substep, so the fluid's
+// terminal speed is 0.45 * 6 = 2.7 cells/tick (~8.1 m/s at 0.10 m voxels).
+constexpr uint32_t kFluidSubsteps = 6;
+
+// One CPU-authored fluid particle spawn (32 B) — must match FluidSpawnOp in
+// common.wgsl. Positions are ABSOLUTE world cells in Q16.16 fixed point
+// (fraction bits matter: particles sit at sub-cell lattice offsets), velocity
+// is Q16.16 cells/tick. Part of the per-tick input stream like ParticleSpawn.
+struct FluidSpawnOp {
+  int32_t px, py, pz;   // position, fixed 16.16 world cells
+  int32_t vx, vy, vz;   // velocity, fixed 16.16 cells/tick
+  uint32_t pad0 = 0, pad1 = 0;
+};
+
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
 // slot in bits 16..27, so the hard ceiling is 4096). Debris bodies take slots
 // [0, debrisCount), mob limbs stack after them.
@@ -392,7 +428,12 @@ struct TickParams {
   // Feeds voxel state through the daylight-gated reactions, so it is
   // determinism-critical: derived from `tick` only, never from frame timing.
   uint32_t dayPhase = 0;
-  uint32_t pad3 = 0, pad4 = 0;
+  // MLS-MPM fluid prototype: live particle count BEFORE this tick's spawns
+  // (also the append base the spawn kernel writes at), and this tick's spawn-op
+  // count. Both CPU-owned and pure functions of the op stream (see the fluid
+  // block above kFluidCap).
+  uint32_t fluidBase = 0;
+  uint32_t fluidSpawnCount = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -750,6 +791,19 @@ class World {
   rhi::Buffer cellOps;         // kMaxCellOpsPerTick CellOp (island removal)
   rhi::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   rhi::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
+
+  // ---- MLS-MPM fluid prototype (see the fluid block above kFluidCap) ----
+  // None of these is hashed, persisted or read by any CA kernel; fluidGrid,
+  // fluidBlockMap and fluidBlockList are per-substep scratch, cleared and
+  // rebuilt inside the tick. fluidParticles is the only carried state, and it
+  // is reconstructible from the op stream (deterministic solver + spawn ops).
+  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (64 B, see common.wgsl)
+  rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
+  rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
+  rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
+  rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 4 i32 (mass, mom xyz)
+  rhi::Buffer fluidArgsStage;    // 4 u32: [0..2] node-pass dispatch args, [3] count
+  rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
   rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
   rhi::Buffer bodyXforms;      // debris-body transforms (render)

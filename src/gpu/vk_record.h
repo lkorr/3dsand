@@ -75,6 +75,8 @@ struct RecordCtx {
   uint32_t spawnCount = 0;
   uint32_t genCount = 0;
   uint32_t farCount = 0;
+  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
+  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   bool hashEnable = false;
   bool particlesActive = false;
 };
@@ -94,10 +96,12 @@ struct Bindings {
   VkPipelineLayout simLayout = VK_NULL_HANDLE;      // GRP_SIM: one set
   VkPipelineLayout slimPartLayout = VK_NULL_HANDLE; // GRP_SLIM_PART: slim + particle
   VkPipelineLayout slimFarLayout = VK_NULL_HANDLE;  // GRP_SLIM_FAR: slim + far
+  VkPipelineLayout slimFluidLayout = VK_NULL_HANDLE;// GRP_SLIM_FLUID: slim + fluid
   VkDescriptorSet simSet = VK_NULL_HANDLE;          // simBG_[page]
   VkDescriptorSet slimSet = VK_NULL_HANDLE;         // simSlimBG_[page]
   VkDescriptorSet particleSet = VK_NULL_HANDLE;     // particleBG_[page]
   VkDescriptorSet farSet = VK_NULL_HANDLE;          // farBG_
+  VkDescriptorSet fluidSet = VK_NULL_HANDLE;        // fluidBG_
 };
 
 // Per-buffer last-access state. barrier_graph §3.1: the standard minimal

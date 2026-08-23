@@ -1309,7 +1309,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
@@ -1358,6 +1358,12 @@ int main(int argc, char** argv) {
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
+  // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the CPU-owned particle
+  // count. The GPU never allocates fluid particles, so this is the single
+  // truth for every dispatch extent and the draw count. Not persisted: saves
+  // and worldgen drop the fluid (plan's force-settle-on-save policy, prototype
+  // version).
+  uint32_t fluidCount = 0;
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -1513,6 +1519,9 @@ int main(int argc, char** argv) {
     if (captured && eM.Pressed(key(GLFW_KEY_M))) ui.spawnMob = true;
     if (captured && eB.Pressed(key(GLFW_KEY_B))) ui.placePrefab = true;
     if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
+    // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
+    // tick loop like every other one-shot input — see the cast-key note).
+    if (captured && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
     // C cycles first -> third -> over-shoulder. Snapping the rig on a change
     // stops the boom easing across the world when the mode flips.
     if (captured && eC.Pressed(key(GLFW_KEY_C))) {
@@ -1683,6 +1692,7 @@ int main(int argc, char** argv) {
       tick = 0;
       grenades.clear();
       everExploded = false;
+      fluidCount = 0;  // MPM fluid does not survive a regen
       debris.Reset();
       mobs.Reset();
       // The avatar's severed parts live in DebrisSystem and its live limbs are
@@ -1711,6 +1721,7 @@ int main(int argc, char** argv) {
         // transient state is cleared here.
         grenades.clear();
         everExploded = false;
+        fluidCount = 0;  // MPM fluid is not in the save format (prototype)
         tpRig.Snap();
       }
     }
@@ -2013,6 +2024,54 @@ int main(int argc, char** argv) {
           }
           if (sh) debris.AdoptBody(sh, std::move(ball), sxf, ref);
         }
+      }
+
+      // ---- MLS-MPM fluid pour (docs/PLAN_mpm_fluids.md prototype) ----------
+      // Hold LMB with the mpm tool: a small sphere of cells above the brush
+      // target gains 8 particles each (the rest density), per tick, budget
+      // permitting. Spawn data is part of the tick's input stream — positions
+      // are jittered by a hash of (tick, index), never by frame state, so a
+      // replayed op stream reproduces the pour exactly.
+      std::vector<FluidSpawnOp> fluidSpawns;
+      if (ui.clearFluid) {
+        ui.clearFluid = false;
+        fluidCount = 0;  // spawns restart at slot 0; stale GPU data unreachable
+      }
+      if (ui.tool == UIState::kToolFluid && !ui.magicMode && mouseL) {
+        const WorldSnapshot& fsnap = world.Snap();
+        IVec3 at;
+        if (fsnap.valid && fsnap.pick[0] != 0) {
+          at = {(int)fsnap.pick[5], (int)fsnap.pick[6] + 2, (int)fsnap.pick[7]};
+        } else {
+          Vec3 p = player.EyePos() + cam.Forward() * 24.0f;
+          at = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
+        }
+        const int rr = std::min(std::max(ui.brushRadius / 2, 1), 3);
+        for (int z = -rr; z <= rr && fluidSpawns.size() < kMaxFluidSpawnsPerTick; z++)
+          for (int y = -rr; y <= rr; y++)
+            for (int x = -rr; x <= rr; x++) {
+              if (x * x + y * y + z * z > rr * rr) continue;
+              // Budget charged BEFORE emitting (rule 2): a cell that does not
+              // fit its 8 particles is refused whole.
+              if (fluidCount + fluidSpawns.size() + 8 > kFluidCap) break;
+              if (fluidSpawns.size() + 8 > kMaxFluidSpawnsPerTick) break;
+              for (int s = 0; s < 8; s++) {
+                // 8 per cell on the half-cell lattice (rest density), with a
+                // deterministic sub-lattice jitter so columns don't stack into
+                // visible strings.
+                uint32_t h = (tick * 9781u + (uint32_t)fluidSpawns.size() * 6271u) *
+                                 747796405u + 2891336453u;
+                FluidSpawnOp op{};
+                op.px = ((at.x + x) << 16) + ((s & 1) ? 49152 : 16384) +
+                        (int32_t)(h % 8192u) - 4096;
+                op.py = ((at.y + y) << 16) + ((s & 2) ? 49152 : 16384) +
+                        (int32_t)((h >> 13) % 8192u) - 4096;
+                op.pz = ((at.z + z) << 16) + ((s & 4) ? 49152 : 16384) +
+                        (int32_t)((h >> 19) % 8192u) - 4096;
+                op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
+                fluidSpawns.push_back(op);
+              }
+            }
       }
 
       BrushOp op;
@@ -2438,7 +2497,9 @@ int main(int argc, char** argv) {
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
-                 spawns, farCount);
+                 spawns, farCount, fluidSpawns, fluidCount);
+      fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(), kFluidCap);
+      ui.fluidCount = fluidCount;
       double tSubmit1 = NowSeconds();
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
       double tPhys1 = NowSeconds();
@@ -2899,6 +2960,7 @@ int main(int argc, char** argv) {
                                                        ctx.width, ctx.height);
       sim.DrawWorld(rp);
       sim.DrawParticles(rp);
+      sim.DrawFluid(rp, fluidCount);
       sim.DrawBodies(rp, bodyInstCount);
       sim.DrawMicroBodies(rp, microCount);
       sim.DrawSprites(rp, (uint32_t)sprv.size());

@@ -267,7 +267,11 @@ struct TickParams {
   // alone. Gates the daylight reactions, so it is determinism-critical:
   // integer only, and never sourced from frame timing.
   dayPhase   : u32,
-  _p3 : u32, _p4 : u32,
+  // MLS-MPM fluid prototype: live particle count BEFORE this tick's spawns
+  // (the spawn kernel's append base) and this tick's spawn-op count. Both
+  // CPU-owned, pure functions of the op stream (world.h fluid block).
+  fluidBase       : u32,
+  fluidSpawnCount : u32,
 };
 
 // ---- day phase helpers (integer; sim-side) ----
@@ -627,6 +631,43 @@ fn microStainPriority(p : Particle) -> u32 {
           pcg(u32(p.vx) ^ pcg(u32(p.vy) ^ pcg(u32(p.vz) ^ p.payload))))));
   return (h | 2u) & ~1u;  // nonzero, and always even
 }
+
+// ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl) -----
+// A SECOND, experimental liquid representation alongside the CA liquid, for
+// side-by-side comparison. Everything below is integer fixed point (rule 1
+// discipline applied to a system that is deliberately OUTSIDE the world hash:
+// the fluid never writes a voxel — its determinism is gated separately by the
+// fluid_det selftest gate, twice-run over the particle buffer).
+//
+// Units: 1 grid cell = 1 world voxel = 1.0; 1 tick = 1.0.
+//   position  Q16.16 absolute world cells (range +-32768 cells — fine for the
+//             playable region this prototype targets)
+//   velocity  Q16.16 cells/tick
+//   C matrix  Q16.16 1/tick (APIC affine velocity field)
+//   J         Q16    volume ratio, 1.0 = 65536
+// Must match FluidParticle consumers: sim_fluid.wgsl and debris.wgsl vsFluid.
+const FLUID_CAP       : u32 = 262144u;  // kFluidCap
+const FLUID_BLOCKS    : u32 = 256u;     // kFluidBlocks
+const FLUID_SUBSTEPS  : i32 = 6;        // kFluidSubsteps
+const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
+
+struct FluidParticle {
+  px : i32, py : i32, pz : i32,   // Q16.16 world cells
+  vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
+  // APIC affine matrix C, row-major (c00 c01 c02 / c10 c11 c12 / c20 c21 c22),
+  // Q16.16. The traceless part carries angular momentum; the trace updates J.
+  c00 : i32, c01 : i32, c02 : i32,
+  c10 : i32, c11 : i32, c12 : i32,
+  c20 : i32, c21 : i32, c22 : i32,
+  j   : i32,                      // Q16 volume ratio
+};
+
+// Must match FluidSpawnOp in world.h (32 bytes).
+struct FluidSpawnOp {
+  px : i32, py : i32, pz : i32,   // Q16.16 world cells
+  vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
+  _f0 : u32, _f1 : u32,
+};
 
 // Must match ExplosionOp in world.h (32 bytes).
 struct ExplosionOp {

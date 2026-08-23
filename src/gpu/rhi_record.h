@@ -33,6 +33,8 @@ struct TableCtx {
   uint32_t spawnCount = 0;
   uint32_t genCount = 0;
   uint32_t farCount = 0;
+  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
+  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   bool hashEnable = false;
   bool particlesActive = false;
 };
@@ -47,10 +49,12 @@ struct TableBindings {
   PipelineLayout simLayout;       // GRP_SIM (simPL_)
   PipelineLayout slimPartLayout;  // GRP_SLIM_PART (simPL2_)
   PipelineLayout slimFarLayout;   // GRP_SLIM_FAR (farPL_)
+  PipelineLayout slimFluidLayout; // GRP_SLIM_FLUID (fluidPL_)
   BindGroup simSet;               // simBG_[page]
   BindGroup slimSet;              // simSlimBG_[page]
   BindGroup particleSet;          // particleBG_[page]
   BindGroup farSet;               // farBG_
+  BindGroup fluidSet;             // fluidBG_
 };
 
 // Record one table through the encoder's generated-barrier recorder. This is

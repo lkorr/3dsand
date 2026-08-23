@@ -687,6 +687,134 @@ bool fullOk = false;
   return fullOk ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-det -----------------------------------------------------------
+// The MLS-MPM prototype's determinism spike (docs/PLAN_mpm_fluids.md Phase 0,
+// run in-engine): drop a block of fluid particles into a stone basin, run the
+// solver, and require the ENTIRE particle buffer to hash identically across
+// two from-worldgen runs. This is the gate on the plan's central bet — that
+// fixed-point integer-atomic P2G accumulation makes a GPU MPM scatter
+// scheduling-independent. It also asserts basic physical sanity (the basin
+// held the fluid; velocities and J stayed inside the solver's clamps) and
+// that the WORLD hash is identical across runs too — the fluid must never
+// leak into CA state (it writes no voxels by construction).
+Status GateFluidDet(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  const int kTicks = 80;
+  // Window-local basin placement (slot space via SlotCellIndex, same as the
+  // pond gates — each run re-worldgens, so these are stable).
+  const int px = 96, py = 120, pz = 96, R = 8, H = 8;
+
+  // The spawn block: 4^3 cells x 8 particles on the half-cell lattice with a
+  // hash jitter — a pure function of the index, so both runs see identical
+  // ops (the twice-run comparison's precondition, like SelftestOps).
+  auto detSpawns = [&]() {
+    std::vector<FluidSpawnOp> fs;
+    for (int cz = -2; cz < 2; cz++)
+      for (int cy = 0; cy < 4; cy++)
+        for (int cx = -2; cx < 2; cx++)
+          for (int s = 0; s < 8; s++) {
+            uint32_t h = ((uint32_t)fs.size() * 6271u + 12345u) * 747796405u +
+                         2891336453u;
+            FluidSpawnOp op{};
+            op.px = ((px + cx) << 16) + ((s & 1) ? 49152 : 16384) +
+                    (int32_t)(h % 8192u) - 4096;
+            op.py = ((py + 3 + cy) << 16) + ((s & 2) ? 49152 : 16384) +
+                    (int32_t)((h >> 13) % 8192u) - 4096;
+            op.pz = ((pz + cz) << 16) + ((s & 4) ? 49152 : 16384) +
+                    (int32_t)((h >> 19) % 8192u) - 4096;
+            fs.push_back(op);
+          }
+    return fs;
+  };
+
+  uint64_t partHash[2] = {0, 0};
+  uint32_t worldHash[2] = {0, 0};
+  uint32_t count = 0;
+  std::vector<uint32_t> last;  // run-2 particle words, for the sanity sweep
+  for (int run = 0; run < 2; run++) {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+
+    std::vector<CellOp> basin;
+    auto put = [&](int x, int y, int z, uint32_t m) {
+      basin.push_back({World::SlotCellIndex({x, y, z}),
+                       (uint32_t)((m & 0xFFFu))});
+    };
+    for (int z = -R - 1; z <= R + 1; z++)
+      for (int x = -R - 1; x <= R + 1; x++) {
+        put(px + x, py - 1, pz + z, kMatStone);
+        bool rim = (x < -R || x > R || z < -R || z > R);
+        for (int y = 0; y < H; y++)
+          put(px + x, py + y, pz + z, rim ? kMatStone : kMatAir);
+      }
+
+    uint32_t fluidN = 0;
+    uint32_t ft = 30000;
+    for (int i = 0; i < kTicks; i++) {
+      std::vector<FluidSpawnOp> fs;
+      if (i == 1) fs = detSpawns();
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {},
+                 i == 0 ? basin : std::vector<CellOp>{}, false, {6, 7, 6},
+                 /*wantReadback=*/false, /*particlesActive=*/false,
+                 {}, 0, fs, fluidN);
+      fluidN += (uint32_t)fs.size();
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+    }
+    count = fluidN;
+
+    std::vector<uint32_t> buf((size_t)count * 16);
+    if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidParticles, 0,
+                               buf.data(), buf.size() * 4, "fluidDet")) {
+      detail = "fluid particle readback failed";
+      std::printf("fluid det: FAIL (readback failed)\n");
+      return Status::Fail;
+    }
+    uint64_t h = 1469598103934665603ull;  // FNV-1a over the raw words
+    for (uint32_t w : buf) {
+      h ^= w;
+      h *= 1099511628211ull;
+    }
+    partHash[run] = h;
+    worldHash[run] = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    if (run == 1) last.swap(buf);
+  }
+
+  // Physical sanity on the final state: the basin held (positions inside the
+  // walls, nothing tunneled through the floor), and every particle respects
+  // the solver's own clamps. Bounds are deliberately slack — this is "the
+  // solver did not explode", not a look test.
+  uint32_t escaped = 0, badV = 0, badJ = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    const int32_t* p = (const int32_t*)&last[(size_t)i * 16];
+    int x = p[0] >> 16, y = p[1] >> 16, z = p[2] >> 16;
+    if (x < px - R - 2 || x > px + R + 2 || y < py - 2 || y > py + H + 8 ||
+        z < pz - R - 2 || z > pz + R + 2)
+      escaped++;
+    for (int a = 3; a < 6; a++)
+      if (p[a] < -200000 || p[a] > 200000) { badV++; break; }
+    if (p[15] < 30000 || p[15] > 100000) badJ++;
+  }
+
+  bool det = partHash[0] == partHash[1];
+  bool worldOk = worldHash[0] == worldHash[1];
+  bool sane = count > 0 && escaped == 0 && badV == 0 && badJ == 0;
+  bool ok = det && worldOk && sane;
+  std::printf(
+      "fluid det: %s (%u particles, %d ticks: particle hash %016llx %s, "
+      "world hash %s, %u escaped, %u bad vel, %u bad J)\n",
+      ok ? "PASS" : "FAIL", count, kTicks, (unsigned long long)partHash[0],
+      det ? "matches" : "DIVERGED", worldOk ? "matches" : "DIVERGED", escaped,
+      badV, badJ);
+  detail = Format("%u particles, hash %016llx, det %s, world %s", count,
+                  (unsigned long long)partHash[0], det ? "ok" : "DIVERGED",
+                  worldOk ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- prefab ------------------------------------------------------------
 Status GatePrefab(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -787,6 +915,7 @@ const std::vector<Gate>& SimGates() {
       {"evaporation", "sim", {}, false, GateEvaporation},
       {"blood-stain", "sim", {}, false, GateBloodStain},
       {"flung-liquid", "sim", {}, false, GateFlungLiquid},
+      {"fluid-det", "sim", {}, false, GateFluidDet},
       {"prefab", "sim", {}, false, GatePrefab},
       // No draw of its own, but its verdict reads bestFrameMs, which only the
       // screenshots gate sets — so it needs the render path transitively.

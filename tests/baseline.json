@@ -10,6 +10,7 @@
   "evaporation": "pass",
   "blood-stain": "pass",
   "flung-liquid": "pass",
+  "fluid-det": "pass",
   "far-fog": "pass",
   "far-downsample": "pass",
   "screenshots": "pass",

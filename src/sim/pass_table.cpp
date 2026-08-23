@@ -23,6 +23,7 @@ namespace {
 #define PT_LOADRESET  Table::LoadReset
 #define PT_HASHONLY   Table::HashOnly
 #define PT_FARFILL    Table::FarFill
+#define PT_FLUID      Table::Fluid
 
 #define PIPE_NONE            Pipe::None
 #define PIPE_WORLDGEN        Pipe::Worldgen
@@ -44,16 +45,24 @@ namespace {
 #define PIPE_P_RESOLVE       Pipe::PResolve
 #define PIPE_FAR_FILL        Pipe::FarFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
+#define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
+#define PIPE_FLUID_MARK      Pipe::FluidMark
+#define PIPE_FLUID_ALLOC     Pipe::FluidAlloc
+#define PIPE_FLUID_CLEAR     Pipe::FluidClear
+#define PIPE_FLUID_P2G       Pipe::FluidP2G
+#define PIPE_FLUID_GRIDUP    Pipe::FluidGridUp
+#define PIPE_FLUID_G2P       Pipe::FluidG2P
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
 #define K_COPY     Kind::Copy
 #define K_FILL     Kind::Fill
 
-#define GRP_NONE      Groups::None
-#define GRP_SIM       Groups::Sim
-#define GRP_SLIM_PART Groups::SlimPart
-#define GRP_SLIM_FAR  Groups::SlimFar
+#define GRP_NONE       Groups::None
+#define GRP_SIM        Groups::Sim
+#define GRP_SLIM_PART  Groups::SlimPart
+#define GRP_SLIM_FAR   Groups::SlimFar
+#define GRP_SLIM_FLUID Groups::SlimFluid
 
 #define DYN_NONE Dyn::None
 #define DYN_ZERO Dyn::Zero
@@ -69,6 +78,7 @@ namespace {
 #define C_DIRTYTICK Cond::DirtyTick
 #define C_GENCOUNT  Cond::GenCount
 #define C_FARCOUNT  Cond::FarCount
+#define C_FLUIDSPAWN Cond::FluidSpawn
 
 #define D_OPS       (uint32_t)DispatchSel::Ops
 #define D_CELLS     (uint32_t)DispatchSel::Cells
@@ -81,6 +91,9 @@ namespace {
 #define D_FARCOUNT  (uint32_t)DispatchSel::FarCount
 #define IND_DISPATCHARGS  (uint32_t)DispatchSel::IndDispatchArgs
 #define IND_PDISPATCHARGS (uint32_t)DispatchSel::IndPDispatchArgs
+#define D_FLUIDP          (uint32_t)DispatchSel::FluidP
+#define D_FLUIDSPAWN      (uint32_t)DispatchSel::FluidSpawnSel
+#define IND_FLUIDARGS     (uint32_t)DispatchSel::IndFluidArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},
