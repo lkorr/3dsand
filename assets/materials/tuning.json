@@ -222,7 +222,14 @@
     "expMicroLifeTicks": 40,
     "expMicroScaleIdx": 2,
     "fluidStiffness": 393216,
-    "fluidGravity": 7144
+    "fluidGravity": 7144,
+    "fluidRestDensity": 524288,
+    "fluidEosPower": 4,
+    "fluidCohesion": 6554,
+    "fluidAttractSame": 3277,
+    "fluidAttractDiff": -6554,
+    "fluidViscosity": 6554,
+    "fluidDamping": 0
   },
   "render": {
     "skyGradient": 1.4,
@@ -242,6 +249,25 @@
       0.42,
       0.85
     ],
+    "fluidColor1": [
+      0.92,
+      0.34,
+      0.1
+    ],
+    "fluidColor2": [
+      0.22,
+      0.78,
+      0.28
+    ],
+    "fluidColor3": [
+      0.88,
+      0.72,
+      0.25
+    ],
+    "fluidParticleSize": 0.58,
+    "fluidStretch": 0.4,
+    "fluidDensityShade": 0.45,
+    "fluidFoam": 0.35,
     "sunTint": [
       1,
       0.9,

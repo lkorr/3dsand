@@ -2047,6 +2047,9 @@ int main(int argc, char** argv) {
           at = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
         }
         const int rr = std::min(std::max(ui.brushRadius / 2, 1), 3);
+        // Keys 1-4 pick the species (the same number row that picks the brush
+        // material — the mpm tool just reads the low bits of that selection).
+        const uint32_t fluidSpecies = (uint32_t)(ui.brushMaterial - 1) & 3u;
         for (int z = -rr; z <= rr && fluidSpawns.size() < kMaxFluidSpawnsPerTick; z++)
           for (int y = -rr; y <= rr; y++)
             for (int x = -rr; x <= rr; x++) {
@@ -2069,6 +2072,7 @@ int main(int argc, char** argv) {
                 op.pz = ((at.z + z) << 16) + ((s & 4) ? 49152 : 16384) +
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
+                op.species = fluidSpecies;
                 fluidSpawns.push_back(op);
               }
             }

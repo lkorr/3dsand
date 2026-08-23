@@ -702,6 +702,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "expMicroScaleIdx", s.expMicroScaleIdx, out, at);
     ReadI(*g, "fluidStiffness", s.fluidStiffness, out, at);
     ReadI(*g, "fluidGravity", s.fluidGravity, out, at);
+    ReadI(*g, "fluidRestDensity", s.fluidRestDensity, out, at);
+    ReadI(*g, "fluidEosPower", s.fluidEosPower, out, at);
+    ReadI(*g, "fluidCohesion", s.fluidCohesion, out, at);
+    ReadI(*g, "fluidAttractSame", s.fluidAttractSame, out, at);
+    ReadI(*g, "fluidAttractDiff", s.fluidAttractDiff, out, at);
+    ReadI(*g, "fluidViscosity", s.fluidViscosity, out, at);
+    ReadI(*g, "fluidDamping", s.fluidDamping, out, at);
     // MLS-MPM fluid: the P2G overflow audit in sim_fluid.wgsl assumes the
     // stress scalar stays inside the staged-multiply range. A negative
     // stiffness would invert the EOS (compression attracts), a huge one blows
@@ -714,6 +721,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("sim.fluidGravity out of 0..2.0 (Q16.16); clamped");
       s.fluidGravity = s.fluidGravity < 0 ? 0 : (2 << 16);
     }
+    // The density-EOS overflow audit in sim_fluid.wgsl p2g2 assumes rho is
+    // clamped to 4*rest with rest inside [1.0, 32.0] before the fixed-point
+    // ratio staging; the other ranges keep every stress-matrix entry inside
+    // the mq() staging bounds. Out-of-range values would wrap i32 mid-kernel,
+    // not merely look wrong, so clamp rather than trust the file.
+    auto clampWarn = [&](int& v, int lo, int hi, const char* name) {
+      if (v < lo || v > hi) {
+        out.warnings.push_back(std::string("sim.") + name + " out of range; clamped");
+        v = v < lo ? lo : hi;
+      }
+    };
+    clampWarn(s.fluidRestDensity, 1 << 16, 32 << 16, "fluidRestDensity");
+    clampWarn(s.fluidEosPower, 1, 7, "fluidEosPower");
+    clampWarn(s.fluidCohesion, 0, 1 << 20, "fluidCohesion");
+    clampWarn(s.fluidAttractSame, -(1 << 19), 1 << 19, "fluidAttractSame");
+    clampWarn(s.fluidAttractDiff, -(1 << 19), 1 << 19, "fluidAttractDiff");
+    clampWarn(s.fluidViscosity, 0, 8 << 16, "fluidViscosity");
+    clampWarn(s.fluidDamping, 0, 58982 /*0.9*/, "fluidDamping");
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.
@@ -802,6 +827,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadV3(*g, "skyHorizon", r.skyHorizon, out, at);
     ReadV3(*g, "skyZenith", r.skyZenith, out, at);
     ReadV3(*g, "fluidColor", r.fluidColor, out, at);
+    ReadV3(*g, "fluidColor1", r.fluidColor1, out, at);
+    ReadV3(*g, "fluidColor2", r.fluidColor2, out, at);
+    ReadV3(*g, "fluidColor3", r.fluidColor3, out, at);
+    ReadF(*g, "fluidParticleSize", r.fluidParticleSize, out, at);
+    ReadF(*g, "fluidStretch", r.fluidStretch, out, at);
+    ReadF(*g, "fluidDensityShade", r.fluidDensityShade, out, at);
+    ReadF(*g, "fluidFoam", r.fluidFoam, out, at);
     ReadV3(*g, "sunTint", r.sunTint, out, at);
     ReadF(*g, "sunDiscPower", r.sunDiscPower, out, at);
     ReadF(*g, "sunDiscGain", r.sunDiscGain, out, at);

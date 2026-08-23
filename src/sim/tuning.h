@@ -662,6 +662,27 @@ struct Tuning {
                                   // impulses (CFL clamps keep it stable).
     int fluidGravity = 7144;      // Q16.16 cells/tick^2 (0.109 = 9.81 m/s^2
                                   // at 0.10 m voxels, 30 Hz ticks)
+    // Density EOS (grantkot MLS-MPM shape): pressure = stiffness *
+    // ((rho/rest)^power - 1), clamped below at -cohesion. rho is sampled from
+    // the P2G mass grid each substep, so cramming particles into a cavity
+    // builds real ejecting pressure instead of saturating a per-particle J.
+    int fluidRestDensity = 524288;  // Q16.16 particle masses per cell (8.0 =
+                                    // the 8-per-cell spawn lattice at rest)
+    int fluidEosPower = 4;          // integer exponent 1..7; higher = harder
+                                    // incompressibility knee, sharper splashes
+    int fluidCohesion = 6554;       // Q16.16 max NEGATIVE pressure (0.1).
+                                    // Surface tension: how hard under-dense
+                                    // fluid pulls itself together into blobs
+    // Species interaction, both Q16.16 and SIGNED. attractSame > 0 pulls a
+    // particle toward its own species (blobbing/fusing); attractDiff < 0
+    // pushes different species apart (immiscible layers that sit on each
+    // other instead of interpenetrating), > 0 encourages mixing.
+    int fluidAttractSame = 3277;    // +0.05
+    int fluidAttractDiff = -6554;   // -0.1
+    int fluidViscosity = 6554;      // Q16.16 dynamic viscosity (0.1): resists
+                                    // shear via the APIC C matrix. High = honey
+    int fluidDamping = 0;           // Q16.16 fraction of velocity lost per
+                                    // tick (0..0.9). Non-physical settle aid
   } sim;
 
   // ---- day/night cycle ----
@@ -757,8 +778,23 @@ struct Tuning {
     // ---- night sky ----
     float nightZenith[3] = {0.006f, 0.010f, 0.028f};
     float nightHorizon[3] = {0.030f, 0.036f, 0.062f};
-    // MLS-MPM fluid prototype droplet albedo (debris.wgsl vsFluid).
+    // MLS-MPM fluid prototype (debris.wgsl vsFluid). fluidColor is species 0
+    // (water); 1..3 are the other pourable species (keys 1-4 in the mpm tool).
     float fluidColor[3] = {0.20f, 0.42f, 0.85f};
+    float fluidColor1[3] = {0.92f, 0.34f, 0.10f};
+    float fluidColor2[3] = {0.22f, 0.78f, 0.28f};
+    float fluidColor3[3] = {0.88f, 0.72f, 0.25f};
+    // Cube half-extent per particle, in cells. 0.5 tiles the rest lattice
+    // exactly; slightly over closes the gaps so a pool reads as a surface.
+    float fluidParticleSize = 0.58f;
+    // How much a particle elongates along its velocity (0 = always a cube).
+    // Motion blur for free: falling streams read as streaks, not dice.
+    float fluidStretch = 0.4f;
+    // Albedo darkening with compression (density above rest), so pressure
+    // visibly travels through a pool.
+    float fluidDensityShade = 0.45f;
+    // Speed-driven whitening: fast, loose particles read as spray/foam.
+    float fluidFoam = 0.35f;
     float starBrightness = 1.0f;
     float starDensity = 150.0f;     // direction-grid cells per unit
     // PSF core radius in PIXELS, not radians. Sizing in pixels is what keeps a

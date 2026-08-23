@@ -50,6 +50,7 @@ namespace {
 #define PIPE_FLUID_ALLOC     Pipe::FluidAlloc
 #define PIPE_FLUID_CLEAR     Pipe::FluidClear
 #define PIPE_FLUID_P2G       Pipe::FluidP2G
+#define PIPE_FLUID_P2G2      Pipe::FluidP2G2
 #define PIPE_FLUID_GRIDUP    Pipe::FluidGridUp
 #define PIPE_FLUID_G2P       Pipe::FluidG2P
 
