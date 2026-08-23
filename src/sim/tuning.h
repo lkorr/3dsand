@@ -146,10 +146,15 @@ struct Tuning {
     // stepUp, so voxel-size changes never change how much real wall is
     // grabbable. 0 disables ledge grabbing entirely.
     float ledgeReach = 0.55f;
-    // Dangling drop: the top of the head hangs this far below the held lip
-    // (arms overhead, elbows slightly bent — the hang clip's reach pose is
-    // sized so the hands land on the lip at this drop).
-    float ledgeHangDrop = 0.15f;
+    // Dangling drop: how far below the held lip the top of the head hangs.
+    // NEGATIVE means the head rides ABOVE the lip. The default is negative
+    // deliberately: these are chibi rigs — mina's arm chain is ~3.3 voxels
+    // against a ~5 voxel shoulder-to-lip gap — and hands can only actually
+    // touch the lip (avatar.cpp hang IK, shrug included) with the face at
+    // the ledge edge, the way toon games hang. Long-armed rigs tolerate a
+    // deeper drop; raise this and the hands stay planted as far as the
+    // shrug allows.
+    float ledgeHangDrop = -0.15f;
     // Upward velocity of the ARM BOOST — the pull-up used when there is no
     // room to stand on the lip (a rough wall's one-voxel ledge): ballistic,
     // so the next lip up can catch near the apex and the climb chains.

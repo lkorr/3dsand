@@ -2631,6 +2631,7 @@ int main(int argc, char** argv) {
           // Same call shape as the debris line above — that parallel is the
           // point (game/mob.h).
           mobs.CarveMobsRadial(ec, edr, world, spawns);
+          avatar.CarveRadial(ec, edr, world, spawns);
           phys.ApplyRadialImpulse(
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
@@ -2899,7 +2900,8 @@ int main(int argc, char** argv) {
         char lg[160];
         if (player.hanging) {
           std::snprintf(lg, sizeof lg,
-                        "HANGING lip(%d,%d,%d) — W: pull up, ctrl: drop",
+                        "HANGING lip(%d,%d,%d) — hold W: pull up, A/D: "
+                        "shimmy, re-tap space: jump, ctrl: drop",
                         player.hangLip.x, player.hangLip.y, player.hangLip.z);
         } else if (player.ledgeInReach) {
           std::snprintf(

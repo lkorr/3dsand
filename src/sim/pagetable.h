@@ -147,6 +147,28 @@ class PageTable {
   // writes dirty[0] AND dirty[1] for it. Same ordering rule as (c).
   void RefilledSlot(uint32_t slot);
 
+  // Step (3), contributor (e): the PARTICLE FLIGHT SHELL (§3.4, amended at
+  // phase-7 close). While a particle may be in flight, unions
+  // occMatter(S) u N26(occMatter(S)) into cpuDirty, where occMatter is the
+  // set of chunks whose latest-snapshot occupancy is non-zero.
+  //
+  // This closes the GPU-ORIGINATED-WAKE hole: a landing particle marks dirty
+  // via markDirtyNext at a location the CPU never chose, mid-flight snapshots
+  // legitimately tighten cpuDirty to empty (an airborne particle dirties
+  // nothing), and the intersection can never ADD — so without this the landed
+  // chunk and every chunk its CA flow reaches are invisible to the mirror
+  // forever. The shell covers every landing write (§3.4's adjacency argument:
+  // a particle write is <= 1 cell from a blocking cell, and blocking cells
+  // live in occMatter chunks) AND injects the landed chunk into the mirror,
+  // after which the ordinary recurrence tracks the flow: the chunk is
+  // genuinely dirty, so it survives every later tightening, and step (1)'s
+  // N26 follows the frontier at the 1-chunk/tick it can move.
+  //
+  // Seeded from OCCUPANCY, not residency — see the .cpp for why a
+  // residency-seeded shell feeds back on itself and dilates a ring per tick.
+  // Same ordering rule as (c)/(d): strictly AFTER the tightening.
+  void ApplyParticleShell(const WorldSnapshot& snap, bool particlesActive);
+
   // Step (4): materialize. Allocates a page for every chunk in
   //   [(cpuDirty n nonSentinel) u N26(cpuDirty n nonSentinel)]
   //     u opTargets(N) u particleChunks(N)
@@ -264,6 +286,18 @@ class PageTable {
   SlotSet opTargets_;                     // C(N) contributor (a), this tick
   SlotSet particleChunks_;                // C(N) contributor (b), carried
   SlotSet materialized_;                  // step (4)'s result, this tick
+  SlotSet shellSeed_;                     // contributor (e): occMatter, to the mirror
+  SlotSet shell_;                         // seed + ring: ConsumeOccupancy's guard
+  bool shellPending_ = false;             // seed awaits Materialize's union
+  bool shellActive_ = false;              // guard live: particles may be in flight
+  bool shellLinger_ = false;              // one application past the off condition
+
+  // Most recent tick any particle-spawning input (spawn op or explosion) was
+  // submitted; -1 = never. The flight-shell's off condition needs it: a
+  // snapshot counting zero live particles proves nothing about spawns
+  // submitted AFTER it was stamped, so the shell stays up until a snapshot
+  // that POSTDATES the last spawn reports zero.
+  int64_t lastSpawnTick_ = -1;
 
   // The C(j) retention ring for the snapshot roll-forward (§3.2 step 2).
   // Sized to the readback ring depth x max ticks/frame = 3 x 4 = 12; when a
@@ -293,6 +327,9 @@ class PageTable {
   std::function<bool(uint32_t, uint32_t*)> probeChunk_;
   std::vector<uint32_t> freeProbe_;
   static constexpr uint8_t kPageFreeTicks = 8;   // ~a quarter second at 30 Hz
+  // Free-probe budget per tick: each probe is a blocking WaitIdle + 16 KiB
+  // readback, so mass-demotion events must drain over ticks, not stall one.
+  static constexpr size_t kMaxFreeProbesPerTick = 128;
 
   // THE RETIRE QUEUE (risk 5). The existing code is safe against
   // free-then-reallocate only because SLOTS NEVER MOVE: a slot's 16 KiB is at

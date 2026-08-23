@@ -70,6 +70,12 @@ class Player {
   // whichever move latched it (waterMantleSpeed or ledgeMantleSpeed), so the
   // one drive loop serves both without re-deciding whose climb this is.
   float mantleSpeed = 0.0f;
+  // True while the active mantle is a ledge pull-up. A pull-up is a HOLD:
+  // releasing W mid-climb cancels it and lowers the body back to the hang
+  // (space still gripping) instead of finishing a fire-and-forget event.
+  // Water climb-outs stay committed — they were triggered by a discrete jump
+  // press and have no hold to release.
+  bool mantleFromHang = false;
 
   // ---- ledge grab (procedural climbing) ----
   // Airborne with space held and the arms facing a voxel lip within hand

@@ -190,7 +190,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //   AddOp*           -> contributor (a), opTargets(N)
   //   UpdateParticles  -> contributor (b), particleChunks(N)
   //   TightenFromSnapshot -> step (2), INTERSECTION only, never assignment
-  //   WakeAll/Refilled -> step (3), strictly AFTER the tightening
+  //   WakeAll/Refilled/ParticleShell -> step (3), strictly AFTER the tightening
   //   Materialize      -> step (1) propagate, then step (4) allocate + fill
   //
   // EncodeWakeAll above has already unioned all-ones into the mirror (§3.2a
@@ -235,6 +235,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   {
     const WorldSnapshot& sn = world.Snap();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
+    // Contributor (e), the particle flight shell — strictly AFTER the
+    // tightening, like (c)/(d): a union applied after an intersection cannot
+    // be undone by it. Covers the GPU-decided landing writes an airborne
+    // particle will make (a mid-flight snapshot legitimately tightens the
+    // mirror to empty — a flying particle dirties nothing — and the
+    // intersection can never ADD the landing back). See §3.4.
+    pt.ApplyParticleShell(sn, particlesActive);
   }
   pt.Materialize(ctx.queue);
   // ---- deallocation (§3.6), AFTER materialization -------------------------
@@ -259,8 +266,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                  particlesActive, cellCount, spawnCount,
                  fluidBase + fluidSpawnCount, fluidSpawnCount);
   sim.EncodeFarFill(enc, farCount);
+  // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
+  // for one even when the caller did not. §3.2 step (2)'s intersection is the
+  // ONLY thing that tightens cpuDirty; without a snapshot the mirror is only
+  // ever the step-(1) recurrence, which dilates by a ring every tick and walks
+  // the materialization set through the whole window in ~10 ticks — the pool
+  // then exhausts and §3.8 aborts. Most selftest gates pass wantReadback=false
+  // (they read the world through blocking hash/occupancy reads, not through
+  // Snap()), so under --residency paged every gate hit that abort.
+  //
+  // PRE-EXISTING and independent of phase 7's two fixes: proven by stashing
+  // them and rebuilding. The condition is narrow on purpose:
+  //   - HarnessSnapshotDrain() — main.cpp's frame loop shares SubmitTick and
+  //     already requests readbacks on its own schedule; it must not be touched.
+  //   - Residency::Paged — under dense the page table is the identity map,
+  //     nothing is ever materialized or freed, and cpuDirty is inert. Forcing
+  //     a readback there would change dense timing for no reason, so the dense
+  //     path stays byte-identical (verified: world hash 7cfa2420 unchanged).
+  // A readback is a pure copy out plus a map — it mutates no world state — so
+  // the only thing a gate can observe from this is Snap() becoming valid in
+  // paged mode, which is exactly what it needs to be.
+  const bool needSnapshotForPaging =
+      HarnessSnapshotDrain() && world.residency == World::Residency::Paged;
   bool doCopy = false;
-  if (wantReadback) {
+  if (wantReadback || needSnapshotForPaging) {
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
                                    1 - sim.Page(), tick);
@@ -360,6 +389,23 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       }
       world.pages->FlushTableWrites(ctx.queue);
     }
+    // ZERO THE FAULT COUNTER AFTER WORLDGEN, and only here.
+    //
+    // Worldgen is the one writer that legitimately stores through sentinels:
+    // genChunk writes all 4,096 cells of every slot in its batch, and the
+    // batches it does NOT currently hold are PT_EMPTY by construction (that is
+    // what makes a 8,192-page pool able to generate 32,768 slots at all). Those
+    // stores no-op and count, so the counter reaches exactly
+    // kNumChunks * kChunkVol = 134,217,728 before tick 1 — in a run that is
+    // otherwise perfectly correct. Measured identically on quiet-paged, which
+    // is 5/5 MATCH, so it is a startup artifact and not a lost voxel.
+    //
+    // The invariant the gates actually assert is about the TICK LOOP: no sim
+    // kernel may write through a sentinel. Zeroing here is what makes the
+    // counter mean that, and it is why the dense run (identity map, nothing to
+    // fault on) reads 0 both before and after this line.
+    const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+    ctx.queue.WriteBuffer(world.pageFaults, 0, faultZero, sizeof(faultZero));
     std::printf("worldgen (paged, %u-slot batches): %u pages in use "
                 "(%.1f MiB of %.1f MiB pool), high water %u\n",
                 kGenBatch, world.pages->PagesInUse(),

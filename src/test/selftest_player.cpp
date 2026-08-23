@@ -351,10 +351,10 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   // more wall rises right behind it (x>=151 up to y=127). There is no room to
   // stand on that one-voxel ledge, so the pull-up must become the arm boost,
   // and the NEXT lip (y=127) must catch on the way down from the boost apex —
-  // the chain. The tier height leaves ~6 voxels between the apex (anchor
-  // y=105 at ledgeHangDrop 0.15 m, + 14 voxels of jumpSpeed rise) and the
-  // bottom of lip2's latch window, so a modest jumpSpeed or hang-drop retune
-  // does not silently break the gate.
+  // the chain. The tier height leaves headroom between the apex (anchor
+  // y=108 at ledgeHangDrop -0.15 m, + 14 voxels of jumpSpeed rise = ~122)
+  // and lip2's latch window (bottom y=113), so a modest jumpSpeed or
+  // hang-drop retune does not silently break the gate.
   auto noisyKind = [](IVec3 c) {
     if (c.y < 60) return CellKind::Solid;
     if (c.x < 140) return c.y < 100 ? CellKind::Solid : CellKind::Air;
@@ -474,17 +474,73 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   bool dOk = d.everHung && d.p.grounded && !d.p.hanging &&
              std::abs(dFeet - 128.0f) < 0.75f && d.firstHangFrames >= 10;
 
-  bool ok = aOk && bOk && cOk && dOk;
-  char buf[256];
+  // (e) the pull-up is a HOLD, and letting go of the grip converts to a jump.
+  // One scripted body: latch, serve the delay, TAP W (climb must start),
+  // release W with space still held (the climb must CANCEL and lower back to
+  // the hang, not run to completion), then release space and re-tap it (the
+  // coyote window must turn the press into a full jump off the wall).
+  bool eLatched = false, eClimbStarted = false, eBackToHang = false,
+       eJumped = false;
+  {
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{132.0f, 100.0f + Player::kHalfY, 200.5f};
+    Player::KindFn kf = plateauKind;
+    auto frames = [&](PlayerInput in, int n) {
+      for (int i = 0; i < n; i++) p.Update(dt, in, fwd, right, fwd, kf);
+    };
+    {  // run-up and jump at the wall, space held from the jump on
+      PlayerInput in;
+      in.sprint = true;
+      in.forward = 1.0f;
+      int guard = 0;
+      while (!(p.grounded && p.pos.x > 135.0f) && ++guard < 400)
+        p.Update(dt, in, fwd, right, fwd, kf);
+      in.jumpPressed = true;
+      in.up = true;
+      p.Update(dt, in, fwd, right, fwd, kf);
+      in.jumpPressed = false;
+      guard = 0;
+      while (!p.hanging && ++guard < 400)
+        p.Update(dt, in, fwd, right, fwd, kf);
+      eLatched = p.hanging;
+    }
+    {  // serve the pull delay, then tap W for 8 frames
+      PlayerInput in;
+      in.up = true;
+      frames(in, 30);
+      in.forward = 1.0f;
+      frames(in, 8);
+      eClimbStarted = p.mantleTimer > 0.0f;
+      in.forward = 0.0f;  // W released mid-climb, space still gripping
+      frames(in, 60);
+      eBackToHang = p.hanging && p.mantleTimer <= 0.0f && !p.grounded &&
+                    p.pos.y - Player::kHalfY < 110.0f;
+    }
+    {  // parkour: release space one frame, re-press the next
+      PlayerInput in;
+      frames(in, 1);
+      in.jumpPressed = true;
+      in.up = true;
+      frames(in, 1);
+      eJumped = p.vel.y > 0.8f * (5.25f / kVoxelMeters);
+    }
+  }
+  bool eOk = eLatched && eClimbStarted && eBackToHang && eJumped;
+
+  bool ok = aOk && bOk && cOk && dOk && eOk;
+  char buf[320];
   std::snprintf(buf, sizeof(buf),
                 "plateau: hung=%d dropped=%d feet=%.1f x=%.1f (want 115, "
                 ">153) shimmy=%.1f (want>2); cliff hung=%d feet=%.1f; "
                 "no-space hung=%d feet=%.1f; chain hung=%d feet=%.1f (want "
-                "128) firstHang=%df (want>=10)",
+                "128) firstHang=%df (want>=10); hold: latch=%d climb=%d "
+                "cancel->hang=%d retap-jump=%d",
                 a.everHung ? 1 : 0, a.droppedWhileWaiting ? 1 : 0, aFeet,
                 a.p.pos.x, a.shimmyDz, b.everHung ? 1 : 0, bFeet,
                 c.everHung ? 1 : 0, cFeet, d.everHung ? 1 : 0, dFeet,
-                d.firstHangFrames);
+                d.firstHangFrames, eLatched ? 1 : 0, eClimbStarted ? 1 : 0,
+                eBackToHang ? 1 : 0, eJumped ? 1 : 0);
   detail = buf;
   std::printf("player ledgegrab: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
   return ok ? Status::Pass : Status::Fail;
