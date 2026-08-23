@@ -641,6 +641,130 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   return ctx.ReportVkValidation("--shot") > 0 ? 1 : 0;
 }
 
+// --shot-fluid: the MPM water counterpart of --shot. Worldgen, pour a pool of
+// MLS-MPM fluid onto open terrain with the same spawn-op shape the game's mpm
+// tool emits, let it slosh, then keep a narrow stream falling and write
+// screenshots — the pool at a grazing angle (Fresnel/reflection/glint), from
+// above (refraction/absorption/bed), and mid-splash (foam, crown, droplets).
+// Exists because the water look can otherwise only be judged by hand-pouring
+// in a live session.
+int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
+                 const std::vector<MaterialDef>& mats) {
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Splash droplets carry the water material, resolved BY NAME at load like
+  // all content (CLAUDE.md conventions). Missing name = no droplets, not a
+  // crash — the surface still renders.
+  uint32_t splashMats[4] = {0, 0, 0, 0};
+  for (size_t i = 0; i < mats.size(); i++)
+    if (mats[i].name == "water") { splashMats[0] = (uint32_t)i; break; }
+
+  const int cx = 108, cz = 108;
+  const int h = World::TerrainHeight(cx, cz, kDefaultSeed);
+  uint32_t fluidCount = 0;
+
+  // One tick of pour: a sphere of cells above `at`, 8 particles per cell on
+  // the half-cell lattice with deterministic jitter — the mpm tool's shape.
+  auto pour = [&](uint32_t tick, IVec3 at, int rr,
+                  std::vector<FluidSpawnOp>& out) {
+    for (int z = -rr; z <= rr; z++)
+      for (int y = -rr; y <= rr; y++)
+        for (int x = -rr; x <= rr; x++) {
+          if (x * x + y * y + z * z > rr * rr) continue;
+          if (fluidCount + out.size() + 8 > kFluidCap) return;
+          if (out.size() + 8 > kMaxFluidSpawnsPerTick) return;
+          for (int s = 0; s < 8; s++) {
+            uint32_t hh = (tick * 9781u + (uint32_t)out.size() * 6271u) *
+                              747796405u + 2891336453u;
+            FluidSpawnOp op{};
+            op.px = ((at.x + x) << 16) + ((s & 1) ? 49152 : 16384) +
+                    (int32_t)(hh % 8192u) - 4096;
+            op.py = ((at.y + y) << 16) + ((s & 2) ? 49152 : 16384) +
+                    (int32_t)((hh >> 13) % 8192u) - 4096;
+            op.pz = ((at.z + z) << 16) + ((s & 4) ? 49152 : 16384) +
+                    (int32_t)((hh >> 19) % 8192u) - 4096;
+            op.vx = 0; op.vy = -19661; op.vz = 0;
+            op.species = 0;
+            out.push_back(op);
+          }
+        }
+  };
+
+  uint32_t tick = 0;
+  auto step = [&](int n, int pourR, int pourHeight) {
+    for (int i = 0; i < n; i++) {
+      tick++;
+      std::vector<FluidSpawnOp> spawns;
+      if (pourR > 0) pour(tick, {cx, h + pourHeight, cz}, pourR, spawns);
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, {}, {}, {}, false,
+                 {cx / (int)kChunk, h / (int)kChunk, cz / (int)kChunk}, false,
+                 /*particlesActive=*/true, {}, 0, spawns, fluidCount,
+                 splashMats);
+      fluidCount = std::min(fluidCount + (uint32_t)spawns.size(), kFluidCap);
+    }
+  };
+
+  const uint32_t W = 1920, H = 1080;
+  rhi::Texture offscreen = ctx.device.CreateTexture(
+      {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+      "offscreen");
+  rhi::TextureView view = offscreen.CreateView();
+  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+    Camera c;
+    c.yaw = yaw;
+    c.pitch = pitch;
+    uint32_t shotTick = (uint32_t)(0.30 * (double)TicksPerDay(CurrentTuning()));
+    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, 11.7f,
+                      kFarFogDensity, 1080.0f, shotTick, fluidCount);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    sim.DrawParticles(rp);  // the splash droplets
+    if (CurrentTuning().render.fluidSurface < 0.5f)
+      sim.DrawFluid(rp, fluidCount);
+    rp.End();
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+    rhi::Buffer shot = CreateBuffer(
+        ctx.device, (uint64_t)W * H * 4,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "screenshot");
+    rhi::CommandEncoder enc2 = ctx.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = offscreen;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shot;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    enc2.CopyTextureToBuffer(srcT, dstB, {W, H, 1});
+    ctx.queue.Submit(enc2.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4);
+    if (rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(),
+                                pixels.size()) &&
+        WriteBmpFile(path, pixels, W, H))
+      std::printf("wrote %s\n", path);
+  };
+
+  // Fill a pool (~55k particles), let it slosh down but not to glass...
+  step(70, 3, 12);
+  step(40, 0, 0);
+  std::printf("--shot-fluid: %u particles after pour+settle\n", fluidCount);
+  render({(float)(cx - 16), (float)(h + 4), (float)(cz - 16)}, 0.785f, -0.10f,
+         "screenshot_fluid.bmp");
+  render({(float)cx, (float)(h + 26), (float)(cz + 10)}, -1.571f, -1.10f,
+         "screenshot_fluid_top.bmp");
+  // ...then a thin stream from higher up, shot mid-impact: crown, foam,
+  // droplets in flight.
+  step(18, 1, 22);
+  render({(float)(cx - 12), (float)(h + 8), (float)(cz - 12)}, 0.785f, -0.28f,
+         "screenshot_fluid_splash.bmp");
+  render({(float)(cx - 7), (float)(h + 3), (float)cz}, 0.0f, 0.05f,
+         "screenshot_fluid_low.bmp");
+  return ctx.ReportVkValidation("--shot-fluid") > 0 ? 1 : 0;
+}
+
 // Count of chunks whose dirty flag is set (selftest only — blocking readback).
 
 // --shot-mob <def>[:limb,limb,...] — the mob counterpart of --shot: worldgen,
@@ -983,6 +1107,7 @@ int main(int argc, char** argv) {
   bool telemetryEnabled = false;
   uint16_t telemetryPort = 8080;
   std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
+  bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -1002,6 +1127,7 @@ int main(int argc, char** argv) {
     if (a == "--json" && i + 1 < argc) stOpt.jsonPath = argv[++i];
     if (a == "--baseline" && i + 1 < argc) stOpt.baselinePath = argv[++i];
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
+    if (a == "--shot-fluid") shotFluid = true;  // MPM water look shots
     // `--frames N` runs the WINDOWED game for N frames, fires one F5 shader
     // reload midway, and exits cleanly — the phase-4b D3 verification harness.
     if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
@@ -1251,6 +1377,7 @@ int main(int argc, char** argv) {
 
   if (measure) return RunMeasure(ctx, world, sim);
   if (shot) return RunShots(ctx, world, sim);
+  if (shotFluid) return RunFluidShot(ctx, world, sim, mats);
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);
   if (selftest) {
@@ -1387,6 +1514,13 @@ int main(int argc, char** argv) {
   // and worldgen drop the fluid (plan's force-settle-on-save policy, prototype
   // version).
   uint32_t fluidCount = 0;
+  // Material id each MPM species splashes micro droplets as, recorded from the
+  // pour's brush material (TickParams.fluidSplashMat). 0 until a species is
+  // first poured — no pour, no droplets.
+  uint32_t fluidSpeciesMat[4] = {0, 0, 0, 0};
+  // Last tick the MPM fluid was live: keeps the particle passes awake for the
+  // splash droplets (see particlesActive below).
+  uint32_t lastFluidTick = 0;
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -2073,6 +2207,9 @@ int main(int argc, char** argv) {
         // Keys 1-4 pick the species (the same number row that picks the brush
         // material — the mpm tool just reads the low bits of that selection).
         const uint32_t fluidSpecies = (uint32_t)(ui.brushMaterial - 1) & 3u;
+        // This pour defines what the species IS — its splash droplets carry
+        // the brush material, so they stain (or not) as that material would.
+        fluidSpeciesMat[fluidSpecies] = (uint32_t)ui.brushMaterial & 0xFFFu;
         for (int z = -rr; z <= rr && fluidSpawns.size() < kMaxFluidSpawnsPerTick; z++)
           for (int y = -rr; y <= rr; y++)
             for (int x = -rr; x <= rr; x++) {
@@ -2516,6 +2653,14 @@ int main(int argc, char** argv) {
       bool particlesActive =
           everExploded &&
           (tick - lastExplosionTick < 400 || world.Snap().particleCount > 0);
+      // MPM fluid sheds micro droplets into the particle system (sim_fluid
+      // g2p), so live fluid must keep the particle passes awake too — and for
+      // a droplet-lifetime tail after the fluid clears, so spray in flight
+      // finishes its arc instead of freezing mid-air. Derived from the
+      // CPU-owned count + tick only (rule 1).
+      if (fluidCount > 0) lastFluidTick = tick;
+      particlesActive = particlesActive ||
+          (lastFluidTick != 0 && tick - lastFluidTick < 300);
 
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
@@ -2524,7 +2669,7 @@ int main(int argc, char** argv) {
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
-                 spawns, farCount, fluidSpawns, fluidCount);
+                 spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat);
       fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(), kFluidCap);
       ui.fluidCount = fluidCount;
       double tSubmit1 = NowSeconds();
@@ -2728,7 +2873,8 @@ int main(int argc, char** argv) {
       fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
       WriteRenderParams(ctx.queue, world, eye, cam,
                         (float)ctx.width / (float)ctx.height, ui.shadows,
-                        (float)now, fogSmooth, (float)ctx.height, tick);
+                        (float)now, fogSmooth, (float)ctx.height, tick,
+                        fluidCount);
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;
@@ -3014,7 +3160,10 @@ int main(int argc, char** argv) {
                                                        ctx.width, ctx.height);
       sim.DrawWorld(rp);
       sim.DrawParticles(rp);
-      sim.DrawFluid(rp, fluidCount);
+      // Cube-debug mode only: in surface mode (the default) the raymarcher
+      // draws the fluid as a real water surface and the cubes would z-fight it.
+      if (CurrentTuning().render.fluidSurface < 0.5f)
+        sim.DrawFluid(rp, fluidCount);
       sim.DrawBodies(rp, bodyInstCount);
       sim.DrawMicroBodies(rp, microCount);
       sim.DrawSprites(rp, (uint32_t)sprv.size());

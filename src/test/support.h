@@ -43,11 +43,14 @@ double NowSeconds();
 uint32_t TicksPerDay(const Tuning& t);
 SkyState SkyForTick(const Tuning& t, uint32_t tick);
 
+// fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
+// march in raymarch.wgsl; zero costs the renderer nothing.
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
                        float fogDensity = kFarFogDensity,
-                       float viewPx = 1080.0f, uint32_t tick = 0);
+                       float viewPx = 1080.0f, uint32_t tick = 0,
+                       uint32_t fluidCount = 0);
 
 // Encode + submit one sim tick. `particlesActive` must be derived only from
 // tick-deterministic inputs (explosion history + a settled particle count),
@@ -64,7 +67,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ParticleSpawn>& spawns = {},
                 uint32_t farCount = 0,
                 const std::vector<FluidSpawnOp>& fluidSpawns = {},
-                uint32_t fluidBase = 0);
+                uint32_t fluidBase = 0,
+                // Material id each MPM species splashes micro droplets as
+                // (TickParams.fluidSplashMat). Null = no splash coupling.
+                const uint32_t* fluidSplashMat = nullptr);
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
                     uint32_t seed);

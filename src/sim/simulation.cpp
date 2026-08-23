@@ -160,6 +160,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(3, T::Storage),          // fluidBlockList
         entry(4, T::Storage),          // fluidGrid (atomic accumulators)
         entry(5, T::Storage),          // fluidArgs staging
+        // Splash coupling (sim_fluid.wgsl g2p): the ballistic particle
+        // system's WRITE page + counts, so fast free-surface fluid particles
+        // can shed micro droplets. Paged like particleBG_ — see fluidBG_.
+        entry(6, T::Storage),          // pWrite (particles, this tick's write page)
+        entry(7, T::Storage),          // counts (atomic)
     };
     fluidBGL_ = device.CreateBindGroupLayout(fentries, std::size(fentries));
   }
@@ -201,6 +206,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // renderBGL_ as group 0 and inherits this for free — microbody.wgsl
         // reads its own brick pool, not voxels, so it needs nothing itself.
         entry(9, T::ReadOnlyStorage, S::Fragment),               // pageTable
+        // MPM fluid surface (raymarch.wgsl MPM FLUID SURFACE block): the
+        // solver's block map + node grid, read exactly like `voxels` — the
+        // renderer samples the last substep's mass/velocity/species field
+        // directly, zero upload. ReadOnly: the arrow points sim -> render.
+        entry(10, T::ReadOnlyStorage, S::Fragment),              // fluidBlockMap
+        entry(11, T::ReadOnlyStorage, S::Fragment),              // fluidGrid
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -353,6 +364,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(7, microTableBuf_),
         b(8, microPoolBuf_),
         b(9, world_->pageTable),
+        b(10, world_->fluidBlockMap),
+        b(11, world_->fluidGrid),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -376,7 +389,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     };
     farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
   }
-  {
+  for (int page = 0; page < 2; page++) {
     rhi::BindGroupEntry entries[] = {
         b(0, world_->fluidParticles),
         b(1, world_->fluidSpawnOps),
@@ -384,8 +397,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(3, world_->fluidBlockList),
         b(4, world_->fluidGrid),
         b(5, world_->fluidArgsStage),
+        // The particle WRITE page for this parity: fluid substeps run after
+        // particleResolve, so droplets appended here are picked up by NEXT
+        // tick's integrate (the page flip makes this the read page then).
+        b(6, world_->particles[1 - page]),
+        b(7, world_->particleCounts),
     };
-    fluidBG_ = device.CreateBindGroup(fluidBGL_, entries, std::size(entries), "fluidBG");
+    fluidBG_[page] =
+        device.CreateBindGroup(fluidBGL_, entries, std::size(entries), "fluidBG");
   }
 
   std::string err;
@@ -767,7 +786,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.slimSet = simSlimBG_[page_];
   tb.particleSet = particleBG_[page_];
   tb.farSet = farBG_;
-  tb.fluidSet = fluidBG_;
+  tb.fluidSet = fluidBG_[page_];
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);

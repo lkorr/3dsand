@@ -225,6 +225,8 @@ class Simulation {
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   rhi::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
-  rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_;
+  // fluidBG_ pages like particleBG_: binding 6 is THIS tick's particle write
+  // page (next tick's read page), the splash droplets' destination.
+  rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2];
   int page_ = 0;
 };

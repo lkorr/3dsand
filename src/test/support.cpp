@@ -55,8 +55,10 @@ SkyState SkyForTick(const Tuning& t, uint32_t tick) {
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
-                       float fogDensity, float viewPx, uint32_t tick) {
+                       float fogDensity, float viewPx, uint32_t tick,
+                       uint32_t fluidCount) {
   RenderParams rp{};
+  rp.fluidCount = fluidCount;  // 0 skips the MPM fluid surface march entirely
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
   rp.camPos[0] = eye.x; rp.camPos[1] = eye.y; rp.camPos[2] = eye.z;
   rp.camRight[0] = r.x; rp.camRight[1] = r.y; rp.camRight[2] = r.z;
@@ -111,7 +113,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
-                uint32_t fluidBase) {
+                uint32_t fluidBase,
+                const uint32_t* fluidSplashMat) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
@@ -128,6 +131,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
   tp.fluidBase = fluidBase;
   tp.fluidSpawnCount = fluidSpawnCount;
+  if (fluidSplashMat) {
+    for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
+  }
   // Day phase for THIS tick. Derived from `tick` alone — the daylight-gated
   // reactions read it, so anything frame-timed here would break determinism.
   const Tuning& dtun = CurrentTuning();

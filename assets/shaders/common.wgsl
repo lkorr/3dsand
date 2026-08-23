@@ -272,6 +272,12 @@ struct TickParams {
   // CPU-owned, pure functions of the op stream (world.h fluid block).
   fluidBase       : u32,
   fluidSpawnCount : u32,
+  // Material id each MPM species splashes micro droplets as (0 = species was
+  // never poured, so it emits none). CPU-owned, recorded from the pour's brush
+  // material — blood MPM sprays blood droplets that stain, water sprays water.
+  // Part of the tick input stream like every field above, so replays and the
+  // determinism gates capture it for free.
+  fluidSplashMat  : vec4<u32>,
 };
 
 // ---- day phase helpers (integer; sim-side) ----
@@ -370,7 +376,9 @@ struct RenderParams {
   // and would not reproduce in a replay, which is why it is the tick.
   tick       : u32,
   seed       : u32,
-  _pdn0      : u32,
+  // Live MPM fluid particle count (0 = none anywhere, so the fluid surface
+  // march in raymarch.wgsl is skipped wholesale — rule 2 for the render path).
+  fluidCount : u32,
   _pdn1      : u32,
   _pdn2      : u32,
 };
@@ -650,6 +658,12 @@ const FLUID_CAP       : u32 = 262144u;  // kFluidCap
 const FLUID_BLOCKS    : u32 = 256u;     // kFluidBlocks
 const FLUID_SUBSTEPS  : i32 = 6;        // kFluidSubsteps
 const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
+// Words per fluid grid node: [0] mass Q10, [1..3] momentum->velocity Q16.16,
+// [4..6] species 1..3 mass Q10, [7] unused. Shared by the solver
+// (sim_fluid.wgsl) and the surface renderer (raymarch.wgsl reads mass,
+// velocity and species words of the LAST substep's grid); world.cpp sizes
+// fluidGrid by this.
+const FLUID_GW        : u32 = 8u;
 
 struct FluidParticle {
   px : i32, py : i32, pz : i32,   // Q16.16 world cells

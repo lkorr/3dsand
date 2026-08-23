@@ -693,36 +693,50 @@ struct Tuning {
     int expMicroPerMille = 900;
     int expMicroLifeTicks = 40;
     int expMicroScaleIdx = 2;    // 0=2, 1=3, 2=4, 3=6 micro voxels per voxel
-    // MLS-MPM fluid prototype (sim_fluid.wgsl). In the sim group because they
-    // are integers feeding a deterministic solver — they do NOT touch the
-    // world hash (the fluid never writes voxels) but they DO change the
-    // fluid_det gate's particle hash, so re-run --selftest after changing.
-    int fluidStiffness = 393216;  // EOS stiffness E, Q16.16 (6.0). Higher =
-                                  // less compressible water, stronger substep
-                                  // impulses (CFL clamps keep it stable).
-    int fluidGravity = 7144;      // Q16.16 cells/tick^2 (0.109 = 9.81 m/s^2
-                                  // at 0.10 m voxels, 30 Hz ticks)
+    // MLS-MPM fluid (sim_fluid.wgsl), HUMAN UNITS: real voxels-and-seconds
+    // values, converted to Q16.16-per-tick integers at shader compile time by
+    // sim_fluid.wgsl's const-eval block (IEEE-exact, so identical JSON gives
+    // identical solver constants everywhere — the deliberate, documented
+    // exception to "sim.* is integer-only"). They do NOT touch the world hash
+    // (the fluid never writes voxels) but they DO change the fluid_det gate's
+    // particle hash, so re-run --selftest after changing defaults.
+    float fluidStiffness = 5400.0f;  // EOS stiffness, (vox/s)^2 — the square
+                                     // of a pseudo speed of sound (~73 vox/s
+                                     // = 7.3 m/s). Higher = less compressible,
+                                     // sharper splashes (CFL clamps keep it
+                                     // stable).
+    float fluidGravity = 98.1f;      // fall acceleration, voxels/s^2
+                                     // (98.1 = 9.81 m/s^2 at 0.10 m voxels)
     // Density EOS (grantkot MLS-MPM shape): pressure = stiffness *
     // ((rho/rest)^power - 1), clamped below at -cohesion. rho is sampled from
     // the P2G mass grid each substep, so cramming particles into a cavity
     // builds real ejecting pressure instead of saturating a per-particle J.
-    int fluidRestDensity = 524288;  // Q16.16 particle masses per cell (8.0 =
-                                    // the 8-per-cell spawn lattice at rest)
+    float fluidRestDensity = 8.0f;  // particle masses per voxel at rest (8 =
+                                    // the 8-per-cell spawn lattice exactly)
     int fluidEosPower = 4;          // integer exponent 1..7; higher = harder
                                     // incompressibility knee, sharper splashes
-    int fluidCohesion = 6554;       // Q16.16 max NEGATIVE pressure (0.1).
+    float fluidCohesion = 90.0f;    // max NEGATIVE pressure, (vox/s)^2.
                                     // Surface tension: how hard under-dense
                                     // fluid pulls itself together into blobs
-    // Species interaction, both Q16.16 and SIGNED. attractSame > 0 pulls a
+    // Species interaction, both (vox/s)^2 and SIGNED. attractSame > 0 pulls a
     // particle toward its own species (blobbing/fusing); attractDiff < 0
     // pushes different species apart (immiscible layers that sit on each
     // other instead of interpenetrating), > 0 encourages mixing.
-    int fluidAttractSame = 3277;    // +0.05
-    int fluidAttractDiff = -6554;   // -0.1
-    int fluidViscosity = 6554;      // Q16.16 dynamic viscosity (0.1): resists
-                                    // shear via the APIC C matrix. High = honey
-    int fluidDamping = 0;           // Q16.16 fraction of velocity lost per
-                                    // tick (0..0.9). Non-physical settle aid
+    float fluidAttractSame = 45.0f;
+    float fluidAttractDiff = -90.0f;
+    float fluidViscosity = 1.5f;    // vox^2/s: resists shear via the APIC C
+                                    // matrix. ~0 = splashy water, high = honey
+    float fluidDamping = 0.0f;      // fraction of velocity shed per SECOND
+                                    // (0..20). Non-physical settle aid
+    // Splash coupling (sim_fluid.wgsl g2p): fluid particles that are FAST and
+    // at LOW density (spray, breaking crests) shed PFLAG_MICRO droplets into
+    // the ballistic particle system, carrying the species' pour material —
+    // so MPM blood spatters stains and MPM water is pure sparkle.
+    float fluidSplashRate = 4.0f;        // droplets/s per eligible particle
+    float fluidSplashSpeed = 18.0f;      // vox/s a particle must exceed
+    float fluidSplashMaxDensity = 0.7f;  // eligible below this x rest density
+    float fluidSplashLife = 1.1f;        // droplet lifetime, seconds (<= 8.5)
+    int fluidSplashScaleIdx = 2;         // droplet size: 0=1/2,1=1/3,2=1/4,3=1/6 vox
   } sim;
 
   // ---- day/night cycle ----
@@ -833,6 +847,20 @@ struct Tuning {
     // Albedo darkening with compression (density above rest), so pressure
     // visibly travels through a pool.
     float fluidDensityShade = 0.45f;
+    // ---- MPM fluid SURFACE rendering (raymarch.wgsl MPM FLUID SURFACE) ----
+    // The Splash-style water look: the solver's node grid marched as a smooth
+    // isosurface with traced reflection/refraction. All render-only.
+    float fluidSurface = 1.0f;   // 1 = surface rendering, 0 = debug cubes
+    float fluidIso = 0.30f;      // isosurface threshold, fraction of rest
+                                 // density. Lower = fatter, more merged fluid
+    float fluidSmooth = 1.3f;    // normal-gradient baseline, voxels. Higher
+                                 // smooths harder at the cost of small shapes
+    float fluidIor = 1.33f;      // refraction index (water 1.33, oil ~1.47)
+    float fluidClarity = 1.3f;   // metres of fluid to ~1/e absorption
+    float fluidReflect = 1.0f;   // traced/sky reflection gain
+    float fluidSpecular = 1.0f;  // sun glint gain
+    float fluidFoamSpeed = 22.0f; // surface speed (vox/s) for full churn foam
+    float fluidWobble = 0.5f;    // sub-voxel normal shimmer on moving fluid
     // Speed-driven whitening: fast, loose particles read as spray/foam.
     float fluidFoam = 0.35f;
     float starBrightness = 1.0f;

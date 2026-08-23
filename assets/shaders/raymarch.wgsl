@@ -25,6 +25,15 @@
 // it. Read-only here and no pageFaults binding: the renderer must never write
 // the world, so it gets translation without the write path.
 @group(0) @binding(9) var<storage, read> pageTable : array<u32>;
+// MPM fluid surface (see the MPM FLUID SURFACE block below). The renderer
+// samples the solver's LAST substep's node grid directly — mass for the
+// isosurface, velocity for foam, species masses for colour. Both are the sim's
+// own device-local buffers, read here exactly like `voxels`: zero upload, and
+// the arrow still only points sim -> render. Declared plain (non-atomic) over
+// the same memory sim_fluid.wgsl accumulates atomically — the tick's writes
+// are ordered before this submit, so there is no concurrent access to race.
+@group(0) @binding(10) var<storage, read> fluidBlockMapR : array<u32>;
+@group(0) @binding(11) var<storage, read> fluidGridR : array<i32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -2201,9 +2210,19 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   let h = trace(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, false);
   if (!h.hit) { return reflectionSky(rr); }
 
-  // Shade the reflected hit with the same terms as a primary hit, minus the
-  // secondary shadow ray (a shadow test on a reflection is invisible at this
-  // budget and doubles the cost).
+  // Reflected geometry is seen across the water plus its own distance, so it
+  // takes aerial perspective too — without this, a reflected far hillside is
+  // sharper than the real one and the reflection reads as a decal.
+  return mix(reflectionSky(rr), applyAerial(shadeSecondaryHit(h), rr, h.t),
+             horizon);
+}
+
+// Shade a SECONDARY ray's hit with the same terms as a primary hit, minus the
+// shadow ray and AO (neither is resolvable at a one-bounce budget, and each
+// would double the cost). Shared by traceReflection above and the MPM fluid's
+// traced refraction — the two must not drift, or the same shore looks
+// different reflected off the surface vs seen through it.
+fn shadeSecondaryHit(h : Hit) -> vec3f {
   let m = materials[voxMat(h.word)];
   var albedo = paletteColor(m, voxState(h.word));
   if (m.klass == CLASS_LIQUID) { albedo = unpackColor(m.color0); }
@@ -2213,21 +2232,16 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   if (h.axis == 0) { face = TUNE_FACE_X; }
   else if (h.axis == 2) { face = TUNE_FACE_Z; }
   if (m.klass != CLASS_LIQUID) { albedo *= surfaceGrain(h.cell, TUNE_GRAIN_AMP); }
-  // Stains show in reflections too — a pool of blood reflecting the stained
-  // wall beside it should not reflect a clean wall. Albedo-only (the sheen is
-  // not resolvable at this budget), same as the grain above.
+  // Stains show in secondary rays too — a pool reflecting (or revealing) the
+  // stained wall beside it should not show a clean wall. Albedo-only (the
+  // sheen is not resolvable at this budget), same as the grain above.
   var rwet = 0.0;
   albedo = applyStain(albedo, h.word, h.cell, &rwet);
   let lam = wrapDiffuse(dot(rn, keyLightDir()), 0.55);
-  // Same lighting model as a primary hit (minus AO and the shadow ray, which
-  // are not resolvable in a reflection at this budget).
   var c = albedo * face * (ambientAt(rn) + keyLightColor() * lam * 0.52);
   let emis = f32(m.emission) / 255.0;
   if (emis > 0.0) { c += albedo * emis * 1.7; }
-  // Reflected geometry is seen across the water plus its own distance, so it
-  // takes aerial perspective too — without this, a reflected far hillside is
-  // sharper than the real one and the reflection reads as a decal.
-  return mix(reflectionSky(rr), applyAerial(c, rr, h.t), horizon);
+  return c;
 }
 
 // ============================================================================
@@ -3992,6 +4006,341 @@ struct FSOut {
   @builtin(frag_depth) depth : f32,
 };
 
+// ============================================================================
+// MPM FLUID SURFACE — the Splash-style water look for the MLS-MPM liquid
+// (sim_fluid.wgsl). Where Splash (matsuoka-601) renders its MLS-MPM fluid in
+// SCREEN SPACE (depth sprites -> narrow-range filter -> thickness -> compose),
+// this engine has no sampled textures at all — everything is buffers — so the
+// same visual result is built the way this renderer builds everything: by
+// MARCHING A FIELD. The solver's node grid (mass per node, one node per cell)
+// IS the fluid's density field; sampled trilinearly it is continuous, its
+// gradient is a smooth normal, and the screen-space filter chain falls away
+// because the field is already 3D-smooth. What screen space cannot give and
+// this can: pixel-exact depth against terrain for free, TRUE refraction (the
+// bent ray re-marches the world and shows you the actually-refracted shore),
+// and reflections via the same real secondary rays the CA water uses.
+//
+// COST DISCIPLINE (rule 2 applied to the render path):
+//   * R.fluidCount == 0 or the tuner's surface toggle off -> not one
+//     instruction of this runs;
+//   * the march skips CHUNK-SIZED strides through space with no fluid block
+//     (one buffer read per skipped chunk — the same trick the terrain DDA's
+//     occupancy skip uses);
+//   * fine steps and the 48-tap gradient run only near an actual surface;
+//   * the traced refraction/reflection rays run only for pixels that hit
+//     fluid, with the same step budget as water reflections.
+//
+// The grid holds the LAST substep's state: mass (Q10) at word 0, post-BC node
+// velocity (Q16.16 cells/tick) at words 1..3, species masses at 4..6. The
+// block map is valid until the next tick rebuilds it. A chunk past the
+// kFluidBlocks budget has no block, so its fluid is invisible for that tick —
+// the same bounded degradation the solver itself accepts (particles there are
+// frozen too).
+
+// First WORD of node c's grid row, or -1 when the node has no block.
+fn fluidNodeBase(c : vec3<i32>) -> i32 {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, R.origin)) { return -1; }
+  let bm = fluidBlockMapR[chunkSlotIndex(wc)];
+  if (bm == 0u) { return -1; }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  return i32(((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
+             FLUID_GW);
+}
+
+fn fluidMassAt(c : vec3<i32>) -> f32 {
+  let b = fluidNodeBase(c);
+  if (b < 0) { return 0.0; }
+  return f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
+}
+
+// Trilinear density, NORMALIZED so 1.0 = rest density. Nodes sit at cell
+// centres (hence the -0.5) — same lattice convention as liquidFieldAt, and the
+// same reason: a continuous field has a continuous gradient, and the cube
+// structure dissolves into one smooth surface.
+fn fluidFieldAt(p : vec3f) -> f32 {
+  let g = p - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let c0 = vec3<i32>(b);
+  var acc = 0.0;
+  for (var i = 0; i < 8; i++) {
+    let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+    let w = mix(1.0 - f, f, vec3f(o));
+    acc += fluidMassAt(c0 + o) * w.x * w.y * w.z;
+  }
+  return acc / max(TUNE_FLUID_REST_DENSITY, 1.0);
+}
+
+// Gradient of the field = the smooth outward surface normal. Central
+// differences at the tuner's baseline; 6 field samples x 8 taps = 48 reads,
+// which is why this runs once per fluid pixel and never inside the march loop.
+fn fluidNormalAt(p : vec3f) -> vec3f {
+  let e = max(TUNE_FLUID_SMOOTH, 0.4);
+  let gx = fluidFieldAt(p + vec3f(e, 0.0, 0.0)) - fluidFieldAt(p - vec3f(e, 0.0, 0.0));
+  let gy = fluidFieldAt(p + vec3f(0.0, e, 0.0)) - fluidFieldAt(p - vec3f(0.0, e, 0.0));
+  let gz = fluidFieldAt(p + vec3f(0.0, 0.0, e)) - fluidFieldAt(p - vec3f(0.0, 0.0, e));
+  let g = vec3f(-gx, -gy, -gz);
+  let len = length(g);
+  if (len < 1e-4) { return vec3f(0.0, 1.0, 0.0); }
+  return g / len;
+}
+
+// Mass-weighted velocity (voxels/SECOND — human units for the foam knobs) and
+// species-blended albedo at a point, in one gather so the shade pays the eight
+// node lookups once.
+struct FluidSample {
+  vel : vec3f,
+  col : vec3f,
+};
+
+fn fluidSampleAt(p : vec3f) -> FluidSample {
+  let g = p - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let c0 = vec3<i32>(b);
+  var mass = 0.0;
+  var vel = vec3f(0.0);
+  var sp = vec4f(0.0);
+  for (var i = 0; i < 8; i++) {
+    let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+    let wv = mix(1.0 - f, f, vec3f(o));
+    let w = wv.x * wv.y * wv.z;
+    let nb = fluidNodeBase(c0 + o);
+    if (nb < 0) { continue; }
+    let m = f32(fluidGridR[u32(nb)]) * (1.0 / 1024.0);
+    if (m <= 0.0) { continue; }
+    mass += w * m;
+    // words 1..3 hold node VELOCITY after the last grid update, Q16.16
+    // cells/tick; weight by mass so near-empty nodes cannot swing the average.
+    vel += vec3f(f32(fluidGridR[u32(nb) + 1u]),
+                 f32(fluidGridR[u32(nb) + 2u]),
+                 f32(fluidGridR[u32(nb) + 3u])) * (w * m * (1.0 / 65536.0));
+    let m1 = max(f32(fluidGridR[u32(nb) + 4u]) * (1.0 / 1024.0), 0.0);
+    let m2 = max(f32(fluidGridR[u32(nb) + 5u]) * (1.0 / 1024.0), 0.0);
+    let m3 = max(f32(fluidGridR[u32(nb) + 6u]) * (1.0 / 1024.0), 0.0);
+    sp += vec4f(max(m - m1 - m2 - m3, 0.0), m1, m2, m3) * w;
+  }
+  var out : FluidSample;
+  out.vel = vec3f(0.0);
+  if (mass > 1e-4) { out.vel = vel * (30.0 / mass); }   // cells/tick -> vox/s
+  let tot = max(sp.x + sp.y + sp.z + sp.w, 1e-4);
+  out.col = (TUNE_FLUID_COLOR * sp.x + TUNE_FLUID_COLOR1 * sp.y +
+             TUNE_FLUID_COLOR2 * sp.z + TUNE_FLUID_COLOR3 * sp.w) / tot;
+  return out;
+}
+
+fn fluidChunkActive(c : vec3<i32>) -> bool {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, R.origin)) { return false; }
+  return fluidBlockMapR[chunkSlotIndex(wc)] != 0u;
+}
+
+// t at which the ray leaves the CHUNK containing cell c — the chunk-stride
+// skip for empty space. `inv` is the caller's precomputed 1/rd.
+fn fluidChunkExit(ro : vec3f, inv : vec3f, c : vec3<i32>, t : f32) -> f32 {
+  let base = vec3f(c & vec3<i32>(~CHUNK_MASK));
+  let t0 = (base - ro) * inv;
+  let t1 = (base + f32(CHUNK) - ro) * inv;
+  let tf = max(t0, t1);
+  return max(min(min(tf.x, tf.y), tf.z), t + 0.05);
+}
+
+struct FluidHit {
+  hit    : bool,
+  t      : f32,    // entry distance along the ray (0 when the camera is inside)
+  thick  : f32,    // in-fluid path length behind the entry, fine voxels
+  inside : bool,   // camera started submerged in the fluid
+};
+
+fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
+  var out : FluidHit;
+  out.hit = false;
+  out.t = 0.0;
+  out.thick = 0.0;
+  out.inside = false;
+  if (tMax <= 0.0) { return out; }
+
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let iso = max(TUNE_FLUID_ISO, 0.05);
+
+  // Camera inside the fluid: no interface in front, the whole view absorbs.
+  if (fluidFieldAt(ro) >= iso) {
+    out.hit = true;
+    out.inside = true;
+  } else {
+    var t = 0.0;
+    var tPrev = 0.0;
+    var found = false;
+    // Step budget = worst case fine-marching straight down a full window
+    // diagonal of solid fluid; the chunk skip means open scenes never get
+    // close. A budget miss renders no surface for one frame of one pixel —
+    // invisible — rather than a hitch.
+    for (var i = 0; i < 320; i++) {
+      if (t >= tMax) { break; }
+      let p = ro + rd * t;
+      let c = vec3<i32>(floor(p));
+      if (!fluidChunkActive(c)) {
+        tPrev = t;
+        t = fluidChunkExit(ro, inv, c, t);
+        continue;
+      }
+      let d = fluidFieldAt(p);
+      if (d >= iso) { found = true; break; }
+      tPrev = t;
+      // Adaptive stride: far below the iso the field cannot reach it within
+      // one cell (B-spline support is 1.5 cells), so stride harder.
+      t += select(0.5, 1.25, d < iso * 0.25);
+    }
+    if (!found) { return out; }
+    // Bisect the crossing to sub-step precision — this is what keeps the
+    // surface from shimmering as the camera moves.
+    var lo = tPrev;
+    var hi = t;
+    for (var i = 0; i < 5; i++) {
+      let mid = (lo + hi) * 0.5;
+      if (fluidFieldAt(ro + rd * mid) >= iso) { hi = mid; } else { lo = mid; }
+    }
+    out.hit = true;
+    out.t = hi;
+  }
+
+  // Thickness: how much fluid the ray crosses behind the entry, bounded by the
+  // scene surface (a pool on a bed is exactly bed-deep) and by an absorption
+  // horizon past which more water cannot change the pixel.
+  var tt = out.t + 0.5;
+  var thick = 0.5;
+  for (var i = 0; i < 28; i++) {
+    if (tt >= tMax || thick > 40.0) { break; }
+    if (fluidFieldAt(ro + rd * tt) >= iso * 0.75) { thick += 1.25; }
+    tt += 1.25;
+  }
+  out.thick = min(thick, max(tMax - out.t, 0.25));
+  return out;
+}
+
+// A refracted ray re-marches the WORLD: this is what makes the shore bend at
+// the surface and the bed swim when the water sloshes — the one effect a
+// background-copy approximation can never give. Misses fall back to the
+// straight-ray scene (thin films) or the sky (rays bent upward).
+fn traceRefraction(p : vec3f, rdr : vec3f, fallback : vec3f) -> vec3f {
+  let h = trace(p, rdr, TUNE_REFLECTION_STEPS, false);
+  if (!h.hit) {
+    if (rdr.y > 0.05) { return reflectionSky(rdr); }
+    return fallback;
+  }
+  return applyAerial(shadeSecondaryHit(h), rdr, h.t);
+}
+
+// The full water shade. sceneBehind is what the primary march resolved along
+// the straight ray (bed / terrain / sky, already lit); shadeWater's role model,
+// rebuilt for a field surface: field-gradient normals instead of column
+// heights, velocity-driven foam instead of authored ripples, and species
+// colours instead of a material palette.
+fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
+                 sceneBehind : vec3f) -> vec3f {
+  let hitP = ro + rd * fh.t;
+  // Colour/velocity sampled half a cell INTO the body so a grazing entry does
+  // not read the empty half of the boundary cells.
+  let s = fluidSampleAt(hitP + rd * 0.5);
+  let speed = length(s.vel);                        // vox/s
+  let churn = clamp(speed / max(TUNE_FLUID_FOAM_SPEED, 1.0), 0.0, 1.0);
+
+  // ---- absorption + body (shared by the submerged and surface paths) ----
+  // Beer-Lambert per channel, coefficients derived from the species albedo:
+  // what the fluid does NOT reflect it absorbs, at a rate set by the clarity
+  // knob (metres to roughly 1/e). The body term is the light the water itself
+  // scatters back — it replaces the absorbed fraction so deep water goes to
+  // the fluid's colour, never to black.
+  let thickM = fh.thick * VOXEL_METERS;
+  let clar = max(TUNE_FLUID_CLARITY, 0.05);
+  let absorb = (vec3f(1.06) - s.col) * (1.0 / clar);
+  let trans = exp(-absorb * thickM);
+  // Squaring the albedo into the scatter tint is what keeps deep water
+  // SATURATED: single-scatter with a flat albedo washes toward the light's
+  // own (near-white) colour, and the pool read as grey milk.
+  let body = s.col * mix(s.col, vec3f(1.0), 0.25) *
+             (ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.85 + keyLightColor() * 0.35);
+
+  if (fh.inside) {
+    // Submerged: volumetric only — no interface, no Fresnel split. The
+    // thickness already stopped at the scene surface, so this is the whole
+    // underwater stretch of the view ray.
+    return sceneBehind * trans + body * (1.0 - trans);
+  }
+
+  // ---- normal ----
+  var n = fluidNormalAt(hitP);
+  // Sub-voxel shimmer, scaled by how hard the fluid is moving: a still pool
+  // holds a glassy surface, a sloshing one boils. The REAL waves come from the
+  // sim; this only supplies the sub-grid frequency the 10 cm lattice cannot.
+  let pm = hitP * VOXEL_METERS;
+  let wob = TUNE_FLUID_WOBBLE * (0.06 + 0.30 * churn);
+  n = normalize(n + vec3f(
+      sin(pm.x * 21.0 + R.time * 2.9) + 0.5 * sin(pm.z * 33.0 - R.time * 4.1),
+      0.0,
+      cos(pm.z * 24.0 + R.time * 3.3) + 0.5 * cos(pm.x * 29.0 + R.time * 3.7)) *
+      (wob * 0.12));
+
+  let v = -rd;
+  let cosI = clamp(dot(n, v), 0.0, 1.0);
+
+  // ---- Fresnel (Schlick, F0 from the tuner's IOR) ----
+  let ior = max(TUNE_FLUID_IOR, 1.01);
+  let f0 = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0));
+  var fres = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+  // A film thinner than a couple of cells is not a coherent mirror.
+  fres *= clamp(fh.thick * 0.65, 0.3, 1.0);
+
+  // ---- refraction ----
+  let refr = refract(rd, n, 1.0 / ior);
+  var behind = sceneBehind;
+  if (fh.thick > 0.75 && length(refr) > 0.5) {
+    behind = traceRefraction(hitP + refr * 0.75, refr, sceneBehind);
+  }
+  var refracted = behind * trans + body * (1.0 - trans);
+
+  // ---- reflection ----
+  var reflection : vec3f;
+  if (TUNE_FLUID_REFLECT > 0.01 && n.y > 0.25 &&
+      fres > TUNE_REFLECTION_CUTOFF && fh.thick > 1.0) {
+    // A real traced bounce — the shore, the tower, the debris beside the pool.
+    reflection = traceReflection(hitP, n, rd);
+  } else {
+    reflection = reflectionSky(reflect(rd, n));
+  }
+  reflection *= TUNE_FLUID_REFLECT;
+
+  var color = mix(refracted, reflection, clamp(fres, 0.0, 1.0));
+
+  // ---- sun glint ----
+  // Tight Blinn-Phong lobe; the wobble normal breaks it into the moving
+  // sparkle field that says "liquid" from any distance.
+  let kd = keyLightDir();
+  let hv = normalize(kd + v);
+  let spec = pow(max(dot(n, hv), 0.0), 380.0);
+  color += keyLightColor() * spec * TUNE_FLUID_SPECULAR * (3.0 * fres + 0.15);
+
+  // ---- foam ----
+  // Churn (fast surface) whitens, broken by animated fbm so it reads as
+  // bubbles and streaks being dragged along rather than as white paint. The
+  // splash droplets the solver sheds (sim_fluid g2p) land in the same places,
+  // so the foam and the spray agree about where the action is.
+  var foam = TUNE_FLUID_FOAM * churn;
+  if (foam > 0.003) {
+    let fn1 = fbm(hitP * 0.85 + vec3f(R.time * 1.9, 0.0, -R.time * 1.4), 3u);
+    foam *= 0.30 + 0.70 * fn1;
+    let foamCol = vec3f(0.93, 0.96, 0.99) *
+                  (ambientAt(n) + keyLightColor() * 0.55);
+    color = mix(color, foamCol, clamp(foam, 0.0, 0.85));
+  }
+  return color;
+}
+
 @fragment
 fn fs(in : VSOut) -> FSOut {
   let ndc = in.uv;
@@ -4009,6 +4358,17 @@ fn fs(in : VSOut) -> FSOut {
     // in.pos.xy is the fragment's pixel coordinate — the dither key (see
     // farDither: screen-space, time-free, stable per pixel)
     far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
+  }
+
+  // ---- MPM fluid surface march (see the MPM FLUID SURFACE block) ----
+  // Bounded by the terrain hit, or by the window exit for rays that leave
+  // (the fluid only exists inside the window). Zero fluid anywhere, or the
+  // tuner's cube-debug mode, skips all of it.
+  var mf : FluidHit;
+  mf.hit = false;
+  if (R.fluidCount > 0u && TUNE_FLUID_SURFACE > 0.5) {
+    let sceneT = select(h.tExit, h.t, h.hit || h.saturated);
+    mf = fluidMarch(R.camPos, rd, sceneT);
   }
 
   // reversed-Z depth so raster geometry (particles/debris) composites in.
@@ -4051,6 +4411,13 @@ fn fs(in : VSOut) -> FSOut {
   // front of anything and depth belongs to whatever the ray actually found).
   if (h.liqT > 0.05 && (tDepth < 0.0 || h.liqT < tDepth)) {
     tDepth = h.liqT;
+  }
+  // MPM fluid interface: same nearest-wins rule as the CA liquid above, and
+  // the same "> 0.05" skip for a submerged camera. Raster geometry (droplet
+  // spray, debris) behind the surface is covered by it; spray in front of it
+  // draws over it — which is exactly what a splash should do.
+  if (mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
+    tDepth = mf.t;
   }
   var depth = 0.0;  // sky = far
   if (tDepth >= 0.0) {
@@ -4477,6 +4844,19 @@ fn fs(in : VSOut) -> FSOut {
       // Fog from the ice surface, not from whatever is behind it.
       color = applyAerial(color, rd, h.tsT);
     }
+  }
+
+  // ---- MPM fluid surface ----
+  // Composited LAST in the back-to-front stack: everything above (terrain, CA
+  // water, ice, gas tint) is what sits behind the MPM surface, and shadeMpmFluid
+  // decides what survives the trip back out. The one ordering this simple
+  // stack concedes: a CA liquid interface NEARER than the MPM surface (looking
+  // at poured water THROUGH a lake) skips the MPM shade rather than layering
+  // wrongly over it — the two-liquid overlap is rare and the failure is an
+  // absence, not an artifact.
+  if (mf.hit && !(h.liqT > 0.05 && h.liqT < mf.t)) {
+    color = shadeMpmFluid(R.camPos, rd, mf, color);
+    if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
   }
 
   // NOTE: rising embers over lava were attempted here and REMOVED. The

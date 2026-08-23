@@ -708,45 +708,54 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "expMicroPerMille", s.expMicroPerMille, out, at);
     ReadI(*g, "expMicroLifeTicks", s.expMicroLifeTicks, out, at);
     ReadI(*g, "expMicroScaleIdx", s.expMicroScaleIdx, out, at);
-    ReadI(*g, "fluidStiffness", s.fluidStiffness, out, at);
-    ReadI(*g, "fluidGravity", s.fluidGravity, out, at);
-    ReadI(*g, "fluidRestDensity", s.fluidRestDensity, out, at);
+    ReadF(*g, "fluidStiffness", s.fluidStiffness, out, at);
+    ReadF(*g, "fluidGravity", s.fluidGravity, out, at);
+    ReadF(*g, "fluidRestDensity", s.fluidRestDensity, out, at);
     ReadI(*g, "fluidEosPower", s.fluidEosPower, out, at);
-    ReadI(*g, "fluidCohesion", s.fluidCohesion, out, at);
-    ReadI(*g, "fluidAttractSame", s.fluidAttractSame, out, at);
-    ReadI(*g, "fluidAttractDiff", s.fluidAttractDiff, out, at);
-    ReadI(*g, "fluidViscosity", s.fluidViscosity, out, at);
-    ReadI(*g, "fluidDamping", s.fluidDamping, out, at);
-    // MLS-MPM fluid: the P2G overflow audit in sim_fluid.wgsl assumes the
-    // stress scalar stays inside the staged-multiply range. A negative
-    // stiffness would invert the EOS (compression attracts), a huge one blows
-    // the i32 staging; same shape for gravity.
-    if (s.fluidStiffness < 0 || s.fluidStiffness > (48 << 16)) {
-      out.warnings.push_back("sim.fluidStiffness out of 0..48.0 (Q16.16); clamped");
-      s.fluidStiffness = s.fluidStiffness < 0 ? 0 : (48 << 16);
-    }
-    if (s.fluidGravity < 0 || s.fluidGravity > (2 << 16)) {
-      out.warnings.push_back("sim.fluidGravity out of 0..2.0 (Q16.16); clamped");
-      s.fluidGravity = s.fluidGravity < 0 ? 0 : (2 << 16);
-    }
-    // The density-EOS overflow audit in sim_fluid.wgsl p2g2 assumes rho is
-    // clamped to 4*rest with rest inside [1.0, 32.0] before the fixed-point
-    // ratio staging; the other ranges keep every stress-matrix entry inside
-    // the mq() staging bounds. Out-of-range values would wrap i32 mid-kernel,
-    // not merely look wrong, so clamp rather than trust the file.
-    auto clampWarn = [&](int& v, int lo, int hi, const char* name) {
-      if (v < lo || v > hi) {
+    ReadF(*g, "fluidCohesion", s.fluidCohesion, out, at);
+    ReadF(*g, "fluidAttractSame", s.fluidAttractSame, out, at);
+    ReadF(*g, "fluidAttractDiff", s.fluidAttractDiff, out, at);
+    ReadF(*g, "fluidViscosity", s.fluidViscosity, out, at);
+    ReadF(*g, "fluidDamping", s.fluidDamping, out, at);
+    ReadF(*g, "fluidSplashRate", s.fluidSplashRate, out, at);
+    ReadF(*g, "fluidSplashSpeed", s.fluidSplashSpeed, out, at);
+    ReadF(*g, "fluidSplashMaxDensity", s.fluidSplashMaxDensity, out, at);
+    ReadF(*g, "fluidSplashLife", s.fluidSplashLife, out, at);
+    ReadI(*g, "fluidSplashScaleIdx", s.fluidSplashScaleIdx, out, at);
+    // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
+    // seconds), converted to Q16.16-per-tick at shader compile time
+    // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
+    // inside the ranges the kernel's i32 overflow audit assumes — the human
+    // bound is the fixed-point bound expressed in the human unit (x900 for
+    // per-tick² quantities, x30 for per-tick). Out-of-range values would wrap
+    // i32 mid-kernel, not merely look wrong, so clamp rather than trust the
+    // file.
+    auto clampWarnF = [&](float& v, float lo, float hi, const char* name) {
+      if (!(v >= lo) || v > hi) {  // !(>=) also catches NaN
         out.warnings.push_back(std::string("sim.") + name + " out of range; clamped");
-        v = v < lo ? lo : hi;
+        v = !(v >= lo) ? lo : hi;
       }
     };
-    clampWarn(s.fluidRestDensity, 1 << 16, 32 << 16, "fluidRestDensity");
-    clampWarn(s.fluidEosPower, 1, 7, "fluidEosPower");
-    clampWarn(s.fluidCohesion, 0, 1 << 20, "fluidCohesion");
-    clampWarn(s.fluidAttractSame, -(1 << 19), 1 << 19, "fluidAttractSame");
-    clampWarn(s.fluidAttractDiff, -(1 << 19), 1 << 19, "fluidAttractDiff");
-    clampWarn(s.fluidViscosity, 0, 8 << 16, "fluidViscosity");
-    clampWarn(s.fluidDamping, 0, 58982 /*0.9*/, "fluidDamping");
+    clampWarnF(s.fluidStiffness, 0.0f, 43200.0f, "fluidStiffness");   // 48 c²/t²
+    clampWarnF(s.fluidGravity, 0.0f, 1800.0f, "fluidGravity");        // 2 c/t²
+    clampWarnF(s.fluidRestDensity, 1.0f, 32.0f, "fluidRestDensity");
+    if (s.fluidEosPower < 1 || s.fluidEosPower > 7) {
+      out.warnings.push_back("sim.fluidEosPower out of 1..7; clamped");
+      s.fluidEosPower = s.fluidEosPower < 1 ? 1 : 7;
+    }
+    clampWarnF(s.fluidCohesion, 0.0f, 14400.0f, "fluidCohesion");     // 16 c²/t²
+    clampWarnF(s.fluidAttractSame, -7200.0f, 7200.0f, "fluidAttractSame");
+    clampWarnF(s.fluidAttractDiff, -7200.0f, 7200.0f, "fluidAttractDiff");
+    clampWarnF(s.fluidViscosity, 0.0f, 240.0f, "fluidViscosity");     // 8 c²/t
+    clampWarnF(s.fluidDamping, 0.0f, 20.0f, "fluidDamping");          // <0.9/tick
+    clampWarnF(s.fluidSplashRate, 0.0f, 180.0f, "fluidSplashRate");   // <=1/substep
+    clampWarnF(s.fluidSplashSpeed, 0.0f, 90.0f, "fluidSplashSpeed");  // < VMAX
+    clampWarnF(s.fluidSplashMaxDensity, 0.0f, 4.0f, "fluidSplashMaxDensity");
+    clampWarnF(s.fluidSplashLife, 0.05f, 8.5f, "fluidSplashLife");    // 255 ticks
+    if (s.fluidSplashScaleIdx < 0 || s.fluidSplashScaleIdx > 3) {
+      out.warnings.push_back("sim.fluidSplashScaleIdx out of 0..3; clamped");
+      s.fluidSplashScaleIdx = s.fluidSplashScaleIdx < 0 ? 0 : 3;
+    }
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.
@@ -842,6 +851,15 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidStretch", r.fluidStretch, out, at);
     ReadF(*g, "fluidDensityShade", r.fluidDensityShade, out, at);
     ReadF(*g, "fluidFoam", r.fluidFoam, out, at);
+    ReadF(*g, "fluidSurface", r.fluidSurface, out, at);
+    ReadF(*g, "fluidIso", r.fluidIso, out, at);
+    ReadF(*g, "fluidSmooth", r.fluidSmooth, out, at);
+    ReadF(*g, "fluidIor", r.fluidIor, out, at);
+    ReadF(*g, "fluidClarity", r.fluidClarity, out, at);
+    ReadF(*g, "fluidReflect", r.fluidReflect, out, at);
+    ReadF(*g, "fluidSpecular", r.fluidSpecular, out, at);
+    ReadF(*g, "fluidFoamSpeed", r.fluidFoamSpeed, out, at);
+    ReadF(*g, "fluidWobble", r.fluidWobble, out, at);
     ReadV3(*g, "sunTint", r.sunTint, out, at);
     ReadF(*g, "sunDiscPower", r.sunDiscPower, out, at);
     ReadF(*g, "sunDiscGain", r.sunDiscGain, out, at);

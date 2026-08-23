@@ -72,9 +72,48 @@
 @group(1) @binding(3) var<storage, read_write> fluidBlockList : array<u32>;
 @group(1) @binding(4) var<storage, read_write> fluidGrid : array<atomic<i32>>;
 @group(1) @binding(5) var<storage, read_write> fluidArgs : array<u32>;
+// Splash coupling: g2p appends micro droplets into the ballistic particle
+// system's WRITE page (this tick's, which is next tick's read page — the fluid
+// substeps run after particleResolve). Same append idiom sim_particle.wgsl
+// uses; behaviour keys on particle state, never on the slot the atomicAdd
+// hands out, so the grid stays deterministic (DESIGN.md §2/§4).
+@group(1) @binding(6) var<storage, read_write> pWrite : array<Particle>;
+@group(1) @binding(7) var<storage, read_write> counts : array<atomic<u32>>;
 
-// Words per grid node (see GRID LAYOUT above; world.cpp mirrors this).
-const FLUID_GW : u32 = 8u;
+// ---- human-unit tuning -> per-tick fixed point ------------------------------
+// The fluid tuning values arrive from tuning.json in HUMAN units (voxels/s²,
+// voxels/s, vox²/s, seconds — see the MPM Fluid tuner section). They are
+// converted here, ONCE, at shader compile time: WGSL const-expressions are
+// folded by Tint under IEEE-exact rules, so the same tuning.json produces the
+// same integer constants on every machine and the kernel below stays
+// integer-only (rule 1 discipline — no runtime f32 ever touches fluid state).
+// 30 Hz tick, FLUID_SUBSTEPS substeps; internal units are cells and ticks.
+const FLUID_GRAVITY : i32 =                    // vox/s² -> Q16.16 cells/tick²
+    i32(round(TUNE_FLUID_GRAVITY * 65536.0 / 900.0));
+const FLUID_STIFFNESS : i32 =                  // (vox/s)² -> Q16.16 cells²/tick²
+    i32(round(TUNE_FLUID_STIFFNESS * 65536.0 / 900.0));
+const FLUID_REST_DENSITY : i32 =               // particles/voxel -> Q16.16
+    i32(round(TUNE_FLUID_REST_DENSITY * 65536.0));
+const FLUID_COHESION : i32 =                   // (vox/s)² -> Q16.16 cells²/tick²
+    i32(round(TUNE_FLUID_COHESION * 65536.0 / 900.0));
+const FLUID_ATTRACT_SAME : i32 =               // (vox/s)² -> Q16.16 cells²/tick²
+    i32(round(TUNE_FLUID_ATTRACT_SAME * 65536.0 / 900.0));
+const FLUID_ATTRACT_DIFF : i32 =               // (vox/s)² -> Q16.16 cells²/tick²
+    i32(round(TUNE_FLUID_ATTRACT_DIFF * 65536.0 / 900.0));
+const FLUID_VISCOSITY : i32 =                  // vox²/s -> Q16.16 cells²/tick
+    i32(round(TUNE_FLUID_VISCOSITY * 65536.0 / 30.0));
+const FLUID_DAMPING : i32 =                    // fraction/s -> Q16.16 /tick
+    i32(round(TUNE_FLUID_DAMPING * 65536.0 / 30.0));
+// Splash droplets (see the g2p emission block): rate is droplets/second per
+// eligible particle spread over the substeps, speed the eligibility threshold.
+const FLUID_SPLASH_CHANCE : i32 =              // per-substep probability, Q16
+    i32(round(TUNE_FLUID_SPLASH_RATE * 65536.0 / (30.0 * f32(FLUID_SUBSTEPS))));
+const FLUID_SPLASH_SPEED : i32 =               // vox/s -> Q16.16 cells/tick
+    i32(round(TUNE_FLUID_SPLASH_SPEED * 65536.0 / 30.0));
+const FLUID_SPLASH_MAX_RHO : i32 =             // fraction of rest -> Q16.16
+    i32(round(TUNE_FLUID_SPLASH_MAXDENS * TUNE_FLUID_REST_DENSITY * 65536.0));
+const FLUID_SPLASH_LIFE : u32 =                // seconds -> ticks (life field)
+    u32(clamp(TUNE_FLUID_SPLASH_LIFE * 30.0, 1.0, 255.0));
 // 0.5 cell in Q16.16 — the cell-center offset of the node lattice.
 const FLUID_HALF : i32 = 32768;
 // CFL cap: 0.45 cell/substep * FLUID_SUBSTEPS, Q16.16 cells/tick (~8.1 m/s).
@@ -365,7 +404,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // EOS: pressure = stiffness * ((rho/rest)^power - 1), floored at -cohesion
   // so a free surface pulls itself together instead of tearing apart.
-  let rest = clamp(TUNE_FLUID_REST_DENSITY, 1 << 16, 32 << 16);
+  let rest = clamp(FLUID_REST_DENSITY, 1 << 16, 32 << 16);
   let ratio = densityRatio(clamp(rho, 0, rest * 4), rest);
   let sameRatio = densityRatio(clamp(same, 0, rest * 4), rest);
   let otherRatio = max(ratio - sameRatio, 0);
@@ -373,12 +412,12 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var e = 1; e < clamp(TUNE_FLUID_EOS_POWER, 1, 7); e++) {
     pw = min(mq(pw, ratio), 1 << 22);     // ratio^power, capped at 64.0
   }
-  var pr = mq(TUNE_FLUID_STIFFNESS, clamp(pw - FLUID_ONE, -(1 << 16), 16 << 16));
-  pr = max(pr, -TUNE_FLUID_COHESION);
+  var pr = mq(FLUID_STIFFNESS, clamp(pw - FLUID_ONE, -(1 << 16), 16 << 16));
+  pr = max(pr, -FLUID_COHESION);
   // Species attraction: extra negative (pulling) pressure proportional to how
   // much same/other fluid is around. attractDiff < 0 flips to a push — that is
   // what keeps two species layered against each other instead of interleaved.
-  pr -= mq(TUNE_FLUID_ATTRACT_SAME, sameRatio) + mq(TUNE_FLUID_ATTRACT_DIFF, otherRatio);
+  pr -= mq(FLUID_ATTRACT_SAME, sameRatio) + mq(FLUID_ATTRACT_DIFF, otherRatio);
   pr = clamp(pr, -(1 << 20), 1 << 25);
 
   // Fold dt (1/substeps), M_p^-1 = 4 and the particle volume (mass/rho, capped
@@ -388,7 +427,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   let inv = (1 << 30) / max(max(rho, 1 << 16) >> 2u, 1);   // 1/rho, Q16.16
   let sv = mq(inv, (4 * FLUID_ONE) / FLUID_SUBSTEPS);
   let scalar = clamp(mq(sv, pr), -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
-  let vs = mq(sv, TUNE_FLUID_VISCOSITY);
+  let vs = mq(sv, FLUID_VISCOSITY);
   let m00 = clamp(scalar - mq(vs, p.c00 + p.c00), -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
   let m11 = clamp(scalar - mq(vs, p.c11 + p.c11), -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
   let m22 = clamp(scalar - mq(vs, p.c22 + p.c22), -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
@@ -450,7 +489,7 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     let r = mom - q * m;
     v[a] = q * 1024 + (r * 1024) / m;
   }
-  v.y -= TUNE_FLUID_GRAVITY / FLUID_SUBSTEPS;
+  v.y -= FLUID_GRAVITY / FLUID_SUBSTEPS;
 
   // Node cell from the block's chunk slot + this thread's local coords.
   let slot = fluidBlockList[block];
@@ -522,9 +561,9 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
       }
     }
   }
-  // Tunable settle aid: shave TUNE_FLUID_DAMPING of the velocity per tick
+  // Tunable settle aid: shave FLUID_DAMPING of the velocity per tick
   // (spread across the substeps). mq is symmetric, so damping cannot drift.
-  let damp = FLUID_ONE - TUNE_FLUID_DAMPING / FLUID_SUBSTEPS;
+  let damp = FLUID_ONE - FLUID_DAMPING / FLUID_SUBSTEPS;
   p.vx = clamp(mq(v.x, damp), -FLUID_VMAX, FLUID_VMAX);
   p.vy = clamp(mq(v.y, damp), -FLUID_VMAX, FLUID_VMAX);
   p.vz = clamp(mq(v.z, damp), -FLUID_VMAX, FLUID_VMAX);
@@ -550,4 +589,58 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   p.py += p.vy / FLUID_SUBSTEPS;
   p.pz += p.vz / FLUID_SUBSTEPS;
   fluidParticles[gid.x] = p;
+
+  // ---- splash: fast free-surface particles shed micro droplets --------------
+  // A fluid particle that is moving hard AND sits at low density (spray, a
+  // breaking crest, the sheet of a slosh — not the interior of a pool) has a
+  // chance per substep of emitting one PFLAG_MICRO droplet into the ballistic
+  // particle system: the same sub-voxel spray gore and explosions use. The
+  // droplet flies, catches light as a tiny cube, and on contact deposits its
+  // material's authored stain (or nothing, if the material does not stain) —
+  // so MPM water leaves wet marks and MPM blood leaves blood.
+  //
+  // DETERMINISM. The fluid slot index IS a stable identity here (fluid
+  // particles are appended at CPU-known offsets and never die), so hashing
+  // (slot, tick, position) is state-keyed, not scheduling-keyed; the position
+  // term varies per substep, so one particle does not roll the same dice six
+  // times a tick. The droplet's own behaviour (claim hash on landing) keys on
+  // droplet state exactly like every other particle. The only scheduling
+  // freedom is WHICH pWrite slot the atomicAdd hands out, which nothing keys
+  // on (DESIGN.md §4) — same contract as explosion ejecta.
+  //
+  // BOUNDED (rule 2): expected droplets = rate * eligible particles, eligible
+  // requires sustained speed, droplets age out by FLUID_SPLASH_LIFE, and the
+  // append drops on the floor at PARTICLE_CAP. A settled pool emits nothing.
+  let splashMat = T.fluidSplashMat[min(p.species, 3u)];
+  if (splashMat != 0u && FLUID_SPLASH_CHANCE > 0 &&
+      p.density < FLUID_SPLASH_MAX_RHO) {
+    // Speed² in Q16.16 (cells/tick)²: (v >> 8)² sums stay well inside i32
+    // (|v| <= VMAX 176947 -> 691² * 3 ≈ 1.4e6).
+    let sx = p.vx >> 8u; let sy = p.vy >> 8u; let sz = p.vz >> 8u;
+    let s2 = sx * sx + sy * sy + sz * sz;
+    let th = FLUID_SPLASH_SPEED >> 8u;
+    if (s2 > th * th) {
+      let h = pcg(gid.x ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^
+              pcg(u32(p.pz) ^ pcg(T.tick ^ T.seed)))));
+      if ((h & 0xFFFFu) < u32(FLUID_SPLASH_CHANCE)) {
+        var d : Particle;
+        // Q16.16 cells -> the particle system's 24.8 fixed point.
+        d.px = p.px >> 8u; d.py = p.py >> 8u; d.pz = p.pz >> 8u;
+        // Droplets leave a touch faster than the surface that shed them (the
+        // sheet breaks and the film's tension lets go), plus a per-droplet
+        // upward kick keyed off the hash so a churning surface fizzes rather
+        // than emitting parallel streaks.
+        d.vx = (p.vx * 5 / 4) >> 8u;
+        d.vy = ((p.vy * 5 / 4) >> 8u) + i32((h >> 16u) & 63u);
+        d.vz = (p.vz * 5 / 4) >> 8u;
+        d.payload = splashMat & 0xFFFu;
+        d.flags = PFLAG_ALIVE | PFLAG_MICRO |
+                  ((u32(TUNE_FLUID_SPLASH_SCALE_IDX) & PMICRO_SCALE_MASK)
+                   << PMICRO_SCALE_SHIFT) |
+                  (FLUID_SPLASH_LIFE << PMICRO_LIFE_SHIFT);
+        let slot = atomicAdd(&counts[1u - T.page], 1u);
+        if (slot < PARTICLE_CAP) { pWrite[slot] = d; }
+      }
+    }
+  }
 }

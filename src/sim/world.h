@@ -435,6 +435,10 @@ struct TickParams {
   // block above kFluidCap).
   uint32_t fluidBase = 0;
   uint32_t fluidSpawnCount = 0;
+  // Material id each MPM species splashes micro droplets as (0 = species never
+  // poured -> no droplets). Recorded from the pour's brush material by the main
+  // loop; vec4<u32> on the WGSL side, so keep this 16-byte aligned.
+  uint32_t fluidSplashMat[4] = {0, 0, 0, 0};
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -524,7 +528,10 @@ struct RenderParams {
   // struct that ends mid-row is rejected outright ("bound with size 140 ...
   // requires at least 144"). Keep the total a multiple of 4 scalars.
   uint32_t seed = 0;
-  uint32_t pad_dn0 = 0, pad_dn1 = 0, pad_dn2 = 0;
+  // Live MPM fluid particle count. 0 skips the fluid surface march entirely
+  // (raymarch.wgsl), so a world with no fluid pays nothing for the feature.
+  uint32_t fluidCount = 0;
+  uint32_t pad_dn1 = 0, pad_dn2 = 0;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

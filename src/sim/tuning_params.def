@@ -64,7 +64,19 @@ TP_V3(render, fluidColor3, TUNE_FLUID_COLOR3, 0.88f, 0.72f, 0.25f)
 TP_F(render, fluidParticleSize, TUNE_FLUID_PARTICLE_SIZE, 0.58f)
 TP_F(render, fluidStretch, TUNE_FLUID_STRETCH, 0.4f)
 TP_F(render, fluidDensityShade, TUNE_FLUID_DENSITY_SHADE, 0.45f)
-TP_F(render, fluidFoam, TUNE_FLUID_FOAM, 0.35f)
+TP_F(render, fluidFoam, TUNE_FLUID_FOAM, 0.55f)
+// MPM fluid SURFACE rendering (raymarch.wgsl MPM FLUID SURFACE block):
+// surface 1/0 toggle, iso x rest density, smooth in voxels, clarity metres,
+// foamSpeed vox/s.
+TP_F(render, fluidSurface, TUNE_FLUID_SURFACE, 1.0f)
+TP_F(render, fluidIso, TUNE_FLUID_ISO, 0.30f)
+TP_F(render, fluidSmooth, TUNE_FLUID_SMOOTH, 1.3f)
+TP_F(render, fluidIor, TUNE_FLUID_IOR, 1.33f)
+TP_F(render, fluidClarity, TUNE_FLUID_CLARITY, 1.3f)
+TP_F(render, fluidReflect, TUNE_FLUID_REFLECT, 1.0f)
+TP_F(render, fluidSpecular, TUNE_FLUID_SPECULAR, 1.0f)
+TP_F(render, fluidFoamSpeed, TUNE_FLUID_FOAM_SPEED, 22.0f)
+TP_F(render, fluidWobble, TUNE_FLUID_WOBBLE, 0.5f)
 TP_F(render, starBrightness, TUNE_STAR_BRIGHTNESS, 1.0f)
 TP_F(render, starDensity, TUNE_STAR_DENSITY, 150.0f)
 TP_F(render, starSize, TUNE_STAR_SIZE, 0.85f)
@@ -325,15 +337,32 @@ TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900)
 TP_U(sim, expMicroLifeTicks, TUNE_EXP_MICRO_LIFE, 40)
 TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
-TP_I(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 393216)
-TP_I(sim, fluidGravity, TUNE_FLUID_GRAVITY, 7144)
-TP_I(sim, fluidRestDensity, TUNE_FLUID_REST_DENSITY, 524288)
+// ---- MLS-MPM fluid, HUMAN units ----
+// These are floats in real units (voxels/s², voxels/s, vox²/s, seconds) —
+// the ONE deliberate exception to "sim.* is integer-only". The kernel still
+// never sees a runtime float: sim_fluid.wgsl converts each to Q16.16-per-tick
+// at SHADER COMPILE TIME (WGSL const-eval, IEEE-exact, identical on every
+// machine for identical JSON), so rule 1's actual guarantee is intact and the
+// fluid-det gate stays the enforcement.
+// Units: stiffness/cohesion/attract in (vox/s)^2, gravity vox/s^2, rest
+// density particles/voxel, viscosity vox^2/s, damping fraction/s, splash rate
+// droplets/s, splash speed vox/s, splash life seconds.
+TP_F(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 5400.0f)
+TP_F(sim, fluidGravity, TUNE_FLUID_GRAVITY, 98.1f)
+TP_F(sim, fluidRestDensity, TUNE_FLUID_REST_DENSITY, 8.0f)
 TP_I(sim, fluidEosPower, TUNE_FLUID_EOS_POWER, 4)
-TP_I(sim, fluidCohesion, TUNE_FLUID_COHESION, 6554)
-TP_I(sim, fluidAttractSame, TUNE_FLUID_ATTRACT_SAME, 3277)
-TP_I(sim, fluidAttractDiff, TUNE_FLUID_ATTRACT_DIFF, -6554)
-TP_I(sim, fluidViscosity, TUNE_FLUID_VISCOSITY, 6554)
-TP_I(sim, fluidDamping, TUNE_FLUID_DAMPING, 0)
+TP_F(sim, fluidCohesion, TUNE_FLUID_COHESION, 90.0f)
+TP_F(sim, fluidAttractSame, TUNE_FLUID_ATTRACT_SAME, 45.0f)
+TP_F(sim, fluidAttractDiff, TUNE_FLUID_ATTRACT_DIFF, -90.0f)
+TP_F(sim, fluidViscosity, TUNE_FLUID_VISCOSITY, 1.5f)
+TP_F(sim, fluidDamping, TUNE_FLUID_DAMPING, 0.0f)
+// Splash coupling: fast free-surface particles shed micro droplets into the
+// ballistic particle system (sim_fluid.wgsl g2p).
+TP_F(sim, fluidSplashRate, TUNE_FLUID_SPLASH_RATE, 4.0f)
+TP_F(sim, fluidSplashSpeed, TUNE_FLUID_SPLASH_SPEED, 18.0f)
+TP_F(sim, fluidSplashMaxDensity, TUNE_FLUID_SPLASH_MAXDENS, 0.7f)
+TP_F(sim, fluidSplashLife, TUNE_FLUID_SPLASH_LIFE, 1.1f)
+TP_U(sim, fluidSplashScaleIdx, TUNE_FLUID_SPLASH_SCALE_IDX, 2)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)

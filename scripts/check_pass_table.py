@@ -196,7 +196,9 @@ _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty"}
 _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
-                 "fluidBlockList", "fluidGrid", "fluidArgs"}
+                 "fluidBlockList", "fluidGrid", "fluidArgs",
+                 # splash coupling: particle write page + counts (bindings 6/7)
+                 "pWrite", "counts"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,

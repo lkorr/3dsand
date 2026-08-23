@@ -453,23 +453,61 @@ and the species terms: particles carry a species id (0..3), the grid carries
 per-species mass channels, and `attractSame`/`attractDiff` add signed pulling
 pressure per species — cohesion within a liquid, repulsion (layering) or
 mixing between different liquids. Every solver constant is a `sim.fluid*`
-tuning row (tuner section "MPM Fluid"): stiffness, rest density, EOS power,
-cohesion, attract same/different, viscosity, damping, gravity — all Q16.16
-integers, F5-reloadable, clamped in LoadTuning to the kernel's overflow-audit
-ranges. All fixed-point multiplies truncate on the MAGNITUDE (round toward
-zero): flooring negative products biased every force toward -x/-y/-z and the
-whole fluid crept along that diagonal on a flat floor.
+tuning row (tuner section "MPM Fluid") in HUMAN units — gravity in voxels/s²,
+stiffness/cohesion/attract in (vox/s)², viscosity in vox²/s, damping per
+second — converted to Q16.16-per-tick integers at SHADER COMPILE TIME by the
+const-eval block at the top of `sim_fluid.wgsl` (IEEE-exact folding, so
+identical JSON yields identical solver constants everywhere; the kernel never
+sees a runtime float). This is the one documented exception to "sim.* is
+integer-only"; LoadTuning clamps the human values to ranges whose conversions
+satisfy the kernel's i32 overflow audit. All fixed-point multiplies truncate
+on the MAGNITUDE (round toward zero): flooring negative products biased every
+force toward -x/-y/-z and the whole fluid crept along that diagonal on a flat
+floor.
+
+RENDERING (v3, 2026-08-23) — the fluid draws as a real water SURFACE, not as
+particle cubes. Where Splash (matsuoka-601) filters depth sprites in screen
+space, this engine has no sampled textures, so the same result is built the
+way this renderer builds everything: `raymarch.wgsl`'s MPM FLUID SURFACE block
+marches the solver's own node grid (last substep's mass field, read straight
+from `fluidGrid`/`fluidBlockMap` — zero upload) as a trilinear isosurface.
+Gradient normals, Schlick Fresnel, TRACED reflections and TRACED refraction
+(the bent ray re-marches the world through `shadeSecondaryHit`, so the shore
+genuinely bends at the surface), per-channel Beer-Lambert absorption derived
+from the species colour, mass-weighted grid velocity driving churn foam and
+sub-voxel shimmer, and a camera-submerged volumetric path. Chunk-stride
+skipping over the block map bounds the cost; `RenderParams.fluidCount == 0`
+(or `render.fluidSurface = 0`, which restores the old debug cubes via
+`debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
+Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
+gains, foam amount/speed, shimmer, per-species colours. Depth is written at
+the fluid interface, so raster spray in front composites over it and debris
+behind it is covered.
+
+SPLASH COUPLING — fast fluid particles at low density (spray, breaking
+crests) shed `PFLAG_MICRO` droplets into the ballistic particle system from
+`g2p` (bindings 6/7 of the fluid group are the particle write page + counts;
+the appends land after `particleResolve`, so droplets fly next tick). Each
+droplet carries the material its species was POURED as
+(`TickParams.fluidSplashMat`, recorded from the brush by the main loop) — so
+MPM blood spatters real stains through the existing claim-hash stain path and
+MPM water is pure sparkle. Emission is hash-keyed on particle state + tick
+(the fluid slot index is a stable identity — particles never die), bounded by
+rate/speed/density thresholds (`sim.fluidSplash*`), droplet lifetime, and
+`PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
+droplet-lifetime tail) so the spray integrates without an explosion ever
+having happened.
 
 Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pick the species, U
-clears), rendered as instanced cubes via `debris.wgsl:vsFluid` with tunable
-size/velocity-stretch/density-shading/foam and per-species colours (tuner
-section "MPM Fluid Look"). CPU-owned particle count (spawns are ops at
-CPU-known offsets; nothing ever allocates on the GPU), hard `kFluidCap`
-budget charged before emission, zero recorded work when no fluid exists.
-Not persisted: saves and worldgen drop it (the plan's force-settle-on-save,
-prototype grade). Excite/settle conversion against the CA grid — the plan's
-§7 seam — is deliberately NOT built here; that decision comes after the
-side-by-side comparison this prototype exists to enable.
+clears). `--shot-fluid` is the look-iteration harness: worldgen, pour a pool
++ a falling stream with the tool's own spawn shape, write
+`screenshot_fluid{,_top,_splash,_low}.bmp`. CPU-owned particle count (spawns
+are ops at CPU-known offsets; nothing ever allocates on the GPU), hard
+`kFluidCap` budget charged before emission, zero recorded work when no fluid
+exists. Not persisted: saves and worldgen drop it (the plan's
+force-settle-on-save, prototype grade). Excite/settle conversion against the
+CA grid — the plan's §7 seam — is deliberately NOT built here; that decision
+comes after the side-by-side comparison this prototype exists to enable.
 
 ---
 

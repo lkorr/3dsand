@@ -160,7 +160,9 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   var cols = array<vec3f, 4>(TUNE_FLUID_COLOR, TUNE_FLUID_COLOR1,
                              TUNE_FLUID_COLOR2, TUNE_FLUID_COLOR3);
   var albedo = cols[min(p.species, 3u)];
-  let rest = max(f32(TUNE_FLUID_REST_DENSITY), 1.0);
+  // p.density is Q16.16 masses/cell; TUNE_FLUID_REST_DENSITY is the tuner's
+  // human-unit particles/voxel (see sim_fluid.wgsl's conversion block).
+  let rest = max(TUNE_FLUID_REST_DENSITY, 1.0) * 65536.0;
   let compress = clamp(f32(p.density) / rest - 1.0, 0.0, 1.0);
   albedo *= 1.0 - TUNE_FLUID_DENSITY_SHADE * compress;
   let foam = clamp(speed * TUNE_FLUID_FOAM * 0.5, 0.0, 0.85);
