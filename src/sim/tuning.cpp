@@ -363,6 +363,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "ledgeBoostSpeed", p.ledgeBoostSpeed, out, at);
     ReadF(*g, "ledgeMantleSpeed", p.ledgeMantleSpeed, out, at);
     ReadF(*g, "ledgeMantleTime", p.ledgeMantleTime, out, at);
+    ReadF(*g, "ledgePullDelay", p.ledgePullDelay, out, at);
     ReadF(*g, "halfWidth", p.halfWidth, out, at);
     ReadF(*g, "halfHeight", p.halfHeight, out, at);
     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);

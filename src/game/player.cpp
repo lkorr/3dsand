@@ -588,7 +588,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         kindAt({hangLip.x, hangLip.y + 1, hangLip.z}) != CellKind::Solid;
     if (!in.up || in.down || !lipOk || inLiquid) {
       hanging = false;  // let go: fall through, gravity resumes this frame
-    } else if (in.forward > 0.3f) {
+    } else if (in.forward > 0.3f && hangTime >= T().ledgePullDelay) {
+      // The delay is what makes the hang EXIST on screen: W is almost always
+      // still held from the jump approach, and honouring it on the first hang
+      // frame turned every grab into an instant mantle — the catch was
+      // invisible. A grab now always lands in the dangle for at least the
+      // delay; W (held or pressed) pulls up once it elapses.
       // Pull up. Two regimes, chosen by whether the body can actually STAND
       // on the lip — asked NOW, not at latch time, because the world may have
       // changed while we dangled:
@@ -625,6 +630,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       vel = Vec3{0, 0, 0};
       grounded = false;
       coyoteTimer = 0.0f;
+      hangTime += dt;
       ledgeInReach = true;  // holding one, by definition
       ledgeLip = hangLip;
       Vec3 d = hangAnchor - pos;
@@ -829,6 +835,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
               vel.y <= nonJumpSpeed) {
             hanging = true;
             ledgeGrabbed = true;
+            hangTime = 0.0f;
             hangLip = hit.lip;
             hangAnchor = hit.anchor;
             hangStand = hit.stand;

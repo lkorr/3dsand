@@ -375,6 +375,8 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   struct RunResult {
     Player p;
     bool everHung = false, droppedWhileWaiting = false;
+    int firstHangFrames = 0;      // dangle length of the first latch
+    bool firstHangEnded = false;
   };
   auto run = [&](const Player::KindFn& kindAt, bool space, bool pauseAtHang,
                  int frames) {
@@ -395,6 +397,14 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
         if (++hangHeld >= 30) stage = 3;
       } else if (stage == 3 && r.p.hanging) {
         r.everHung = true;  // chained re-grabs during the climb
+      }
+      // Length of the FIRST hang, in frames. This is what proves the settle
+      // delay: with W and space both held straight through the latch, the
+      // grab must still dangle for ledgePullDelay before the pull-up honours
+      // the held W — the instant-mantle regression made the catch invisible.
+      if (r.everHung && !r.firstHangEnded) {
+        if (r.p.hanging) r.firstHangFrames++;
+        else r.firstHangEnded = true;
       }
       PlayerInput in;
       in.sprint = true;
@@ -442,21 +452,25 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
 
   // (d) chained climb up the noisy wall: first lip unstandable -> arm boost
   // -> second lip -> mantle onto the top. Everything after the jump is just
-  // "hold W and space", which is the point of the feature.
+  // "hold W and space", which is the point of the feature — and BECAUSE W is
+  // held straight through the latch, the first hang's length is the settle
+  // assertion: it must last most of ledgePullDelay (10 frames ~ 0.17 s of the
+  // 0.25 s default) before the held W is honoured. An instant mantle here is
+  // the "hanging doesn't work" regression.
   RunResult d = run(noisyKind, true, false, 900);
   float dFeet = d.p.pos.y - Player::kHalfY;
   bool dOk = d.everHung && d.p.grounded && !d.p.hanging &&
-             std::abs(dFeet - 128.0f) < 0.75f;
+             std::abs(dFeet - 128.0f) < 0.75f && d.firstHangFrames >= 10;
 
   bool ok = aOk && bOk && cOk && dOk;
   char buf[256];
   std::snprintf(buf, sizeof(buf),
                 "plateau: hung=%d dropped=%d feet=%.1f x=%.1f (want 115, "
                 ">153); cliff hung=%d feet=%.1f; no-space hung=%d feet=%.1f; "
-                "chain hung=%d feet=%.1f (want 128)",
+                "chain hung=%d feet=%.1f (want 128) firstHang=%df (want>=10)",
                 a.everHung ? 1 : 0, a.droppedWhileWaiting ? 1 : 0, aFeet,
                 a.p.pos.x, b.everHung ? 1 : 0, bFeet, c.everHung ? 1 : 0,
-                cFeet, d.everHung ? 1 : 0, dFeet);
+                cFeet, d.everHung ? 1 : 0, dFeet, d.firstHangFrames);
   detail = buf;
   std::printf("player ledgegrab: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
   return ok ? Status::Pass : Status::Fail;

@@ -160,6 +160,11 @@ struct Tuning {
     // above — the timeout exists for a climb blocked partway by a live world.
     float ledgeMantleSpeed = 4.5f;
     float ledgeMantleTime = 0.9f;
+    // Minimum time a grab hangs before W (held or pressed) pulls up. W is
+    // almost always still held from the jump approach, so without this floor
+    // the mantle fires on the first hang frame and the catch never appears on
+    // screen. 0 restores instant pull-up.
+    float ledgePullDelay = 0.25f;
     float halfWidth = 0.30f, halfHeight = 0.85f, eyeOffset = 0.65f;
     // Camera step smoothing: half-life (seconds) of the render-only eye
     // offset that cancels the vertical pop when the body steps up/down a

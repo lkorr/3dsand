@@ -92,6 +92,12 @@ class Player {
   // LedgeGrabAhead per frame (~a hundred cell reads), nothing when flying.
   bool ledgeInReach = false;  // a grabbable lip is within hand reach right now
   IVec3 ledgeLip{};           // which lip (valid while ledgeInReach or hanging)
+  // Seconds spent in the current hang. The pull-up honours W only after
+  // tuning.json player.ledgePullDelay of it: W is almost always still held
+  // from the jump approach, and without the delay the mantle fired on the
+  // very first hang frame — the catch-and-dangle beat never existed on
+  // screen, which read as "hanging doesn't work".
+  float hangTime = 0.0f;
 
   // Jump grace windows, seconds remaining. coyoteTimer keeps a jump legal
   // briefly after leaving the ground; jumpBuffer remembers a press made just
