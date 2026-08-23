@@ -2490,6 +2490,7 @@ int main(int argc, char** argv) {
           // Same call shape as the debris line above — that parallel is the
           // point (game/mob.h).
           mobs.CarveMobsRadial(ec, edr, world, spawns);
+          avatar.CarveRadial(ec, edr, world, spawns);
           phys.ApplyRadialImpulse(
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
