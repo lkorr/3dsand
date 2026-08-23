@@ -282,33 +282,50 @@ constexpr uint32_t kPtUnresident = 0xFFFFFFFFu;
 // anyone remembering a rule (§2.4).
 constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 
-// Physical pages in the pool under --residency paged. 24,576 pages = 384 MiB,
-// a 25% reservation cut from dense's 32,768 pages / 512 MiB. This constant is
-// the RESERVED pool, not resident content; conflating the two is how a phase
-// claims a win it did not get (§3.7).
+// Physical pages in the pool under --residency paged. 32,768 pages = 512 MiB,
+// which is EXACTLY the dense reservation. This constant is the RESERVED pool,
+// not resident content; conflating the two is how a phase claims a win it did
+// not get (§3.7). The paging win is now entirely a TYPICAL-case win — half the
+// resident set in ordinary play — and explicitly NOT a worst-case one.
 //
-// SIZED FROM THE REAL GAME, NOT THE HARNESS (2026-08-23, the default-flip
-// lesson). The selftest window sits in mostly-sky coordinates and settles at
-// 4,975 resident pages (77.7 MiB) with a suite high-water of 14,934 — those
-// were the phase-7 sizing numbers, and they are true but UNREPRESENTATIVE:
-// the GAME's window centers on a player standing on terrain, half of it
-// underground solid, and settles at 16,420 resident pages (peak 16,744
-// during the startup window slide, measured with a dense-size pool). A pool
-// of 16,384 therefore aborted ON LAUNCH — the first windowed paged run ever
-// made. 24,576 is 1.47x the game's measured steady state (comfortably above
-// the 1.25x headroom rule) and holds the suite's 14,934 with room.
+// SIZED FROM THE ADVERSARIAL TRAVERSAL, which is the only sizing input that
+// ever held up. The history is worth keeping because each number was honestly
+// measured and each was still too small:
 //
-// "Synthetic numbers lie": if this is ever re-tuned, measure with the GAME
-// window (--frames + SANDVOX_PT_DEBUG prints per-tick residency), not just
-// the suite. Under §3.8 exhaustion stays a loud abort, and the suite
-// re-measures its own margin on every paged run (the high-water line at the
-// end of --selftest).
+//   4,975 resident / 14,934 suite high-water   — the phase-7 harness numbers.
+//     True, but the harness window is mostly SKY. A pool sized here aborts.
+//   16,420 settled / 16,744 peak (game window) — the default-flip numbers, a
+//     player STANDING on terrain, half the window underground. A 16,384 pool
+//     aborted ON LAUNCH. This is what 24,576 was sized to, at "1.47x steady
+//     state" against a self-invented "1.25x headroom rule".
+//   23,236 peak (game window, FLYING)          — sustained sprint-flight runs
+//     a ~20,230 working set. 24,576 is 1.06x THAT, not 1.47x anything, and
+//     sustained flight duly aborted the process (2026-08-23).
+//   32,365 peak (ADVERSARIAL: diagonal + descending into solid rock)
+//     — 98.8% OF DENSE. cpuDirty stayed 1,500-4,800 throughout, so this is
+//     genuine residency, not mirror dilation: underground there is no sky to
+//     sentinel away and nearly every slot needs a real page.
 //
-// The real lever on the underground working set is a follow-up, not a bigger
-// pool: ~all of it is single-material-with-state chunks a widened sentinel
-// could represent (PLAN_page_table.md §3.6's 2,115-chunk finding, which the
-// game window multiplies).
-constexpr uint32_t kPoolPages = 24576;
+// THE STRUCTURAL CONCLUSION, which is why this is 32,768 and not 28,000: the
+// page table's worst case IS dense, so no pool below dense can make exhaustion
+// impossible, and any value in between only picks how unlucky the player has
+// to be. §3.8 keeps exhaustion fatal — with the pool at dense that abort
+// becomes a genuine assertion (an allocator bug) rather than a routine
+// outcome a fast descent can provoke.
+//
+// "Synthetic numbers lie", now twice over: measure with the GAME window AND an
+// adversarial path. `--autofly-hard` (main.cpp) is that path — diagonal strafe
+// plus descent on a fixed TICK schedule so it is reproducible run to run —
+// and `SANDVOX_PT_DEBUG=1` prints per-tick residency.
+//
+// The real lever on the underground working set is compression, not a bigger
+// pool (there is no bigger pool): ~all of it is single-material-with-state
+// chunks a WIDENED SENTINEL could represent (PLAN_page_table.md §3.6's
+// 2,115-chunk finding, which the game window multiplies). That matters most
+// for the 5 cm / extended-radius target, where volume grows 8x and bulk
+// terrain gets MORE internally uniform, not less — sentinel compression
+// improves at finer resolution while sky compression stays flat.
+constexpr uint32_t kPoolPages = 32768;
 
 // The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):
 // it must be bit-identical to what a materialized page would hold, which is
