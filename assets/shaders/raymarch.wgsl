@@ -4086,12 +4086,19 @@ fn fluidNormalAt(p : vec3f) -> vec3f {
   return g / len;
 }
 
-// Mass-weighted velocity (voxels/SECOND — human units for the foam knobs) and
-// species-blended albedo at a point, in one gather so the shade pays the eight
-// node lookups once.
+// Mass-weighted velocity (voxels/SECOND — human units for the foam knobs),
+// species-blended albedo and the advected FOAM FIELD at a point, in one gather
+// so the shade pays the eight node lookups once.
+//
+// The foam field is grid word 7, written by sim_fluid.wgsl's g2p from the
+// Ihmsen trapped-air / wave-crest / kinetic-energy potentials. It is a real
+// simulated quantity that persists and decays, which is why foam TRAILS a
+// breaking wave here instead of blinking on and off with the local velocity
+// the way the churn term alone does.
 struct FluidSample {
-  vel : vec3f,
-  col : vec3f,
+  vel  : vec3f,
+  col  : vec3f,
+  foam : f32,
 };
 
 fn fluidSampleAt(p : vec3f) -> FluidSample {
@@ -4102,6 +4109,7 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   var mass = 0.0;
   var vel = vec3f(0.0);
   var sp = vec4f(0.0);
+  var foam = 0.0;
   for (var i = 0; i < 8; i++) {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
     let wv = mix(1.0 - f, f, vec3f(o));
@@ -4111,6 +4119,9 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
     let m = f32(fluidGridR[u32(nb)]) * (1.0 / 1024.0);
     if (m <= 0.0) { continue; }
     mass += w * m;
+    // Word 7 = the foam field, Q16 saturated at 1.0. Trilinear like the rest,
+    // so the foam has a continuous gradient and does not show the node lattice.
+    foam += w * clamp(f32(fluidGridR[u32(nb) + 7u]) * (1.0 / 65536.0), 0.0, 1.0);
     // words 1..3 hold node VELOCITY after the last grid update, Q16.16
     // cells/tick; weight by mass so near-empty nodes cannot swing the average.
     vel += vec3f(f32(fluidGridR[u32(nb) + 1u]),
@@ -4127,7 +4138,37 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   let tot = max(sp.x + sp.y + sp.z + sp.w, 1e-4);
   out.col = (TUNE_FLUID_COLOR * sp.x + TUNE_FLUID_COLOR1 * sp.y +
              TUNE_FLUID_COLOR2 * sp.z + TUNE_FLUID_COLOR3 * sp.w) / tot;
+  out.foam = clamp(foam, 0.0, 1.0);
   return out;
+}
+
+// ---- DEPTH GRADIENT --------------------------------------------------------
+// The species albedo says WHAT the liquid is; this says how its colour changes
+// with how much of it you are looking through. Real water is not one colour
+// attenuated — the shallow edge of a pool and its deep middle differ in HUE,
+// because absorption is strongly wavelength-dependent (red goes first) and the
+// short path simply never removes enough red to matter.
+//
+// Rather than fake that with a tint, the ramped colour is fed BACK into the
+// Beer-Lambert coefficients, so shallow water genuinely absorbs like the
+// shallow tint and deep water like the deep one. Setting fluidGradient to 0
+// collapses this to the flat species albedo (the pre-gradient look).
+//
+// The ramp is exponential, not linear: it matches the shape of the absorption
+// it is driving, so the hue shift tracks the brightness falloff instead of
+// crossing it. `depth` is the metres over which the ramp substantially
+// completes.
+fn fluidGradientColor(base : vec3f, thickM : f32) -> vec3f {
+  let g = clamp(TUNE_FLUID_GRADIENT, 0.0, 1.0);
+  if (g <= 0.001) { return base; }
+  let d = max(TUNE_FLUID_DEPTH, 0.05);
+  let t = 1.0 - exp(-thickM / d);
+  // The species albedo modulates the ramp rather than being replaced by it:
+  // pouring the green species still reads green, but it now has a shallow
+  // edge and a deep body. Species 1 (the water default) sits at ~(0.2,0.42,
+  // 0.85), so this preserves the authored identity while adding the depth cue.
+  let ramp = mix(TUNE_FLUID_SHALLOW, TUNE_FLUID_DEEP, t);
+  return mix(base, base * ramp * 2.0, g);
 }
 
 fn fluidChunkActive(c : vec3<i32>) -> bool {
@@ -4258,12 +4299,16 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
   // the fluid's colour, never to black.
   let thickM = fh.thick * VOXEL_METERS;
   let clar = max(TUNE_FLUID_CLARITY, 0.05);
-  let absorb = (vec3f(1.06) - s.col) * (1.0 / clar);
+  // The depth-ramped colour, not the raw species albedo, is what drives the
+  // absorption — see the DEPTH GRADIENT block. This is the whole gradient:
+  // a thin film absorbs like the shallow tint, a deep body like the deep one.
+  let gcol = fluidGradientColor(s.col, thickM);
+  let absorb = (vec3f(1.06) - gcol) * (1.0 / clar);
   let trans = exp(-absorb * thickM);
   // Squaring the albedo into the scatter tint is what keeps deep water
   // SATURATED: single-scatter with a flat albedo washes toward the light's
   // own (near-white) colour, and the pool read as grey milk.
-  let body = s.col * mix(s.col, vec3f(1.0), 0.25) *
+  let body = gcol * mix(gcol, vec3f(1.0), 0.25) *
              (ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.85 + keyLightColor() * 0.35);
 
   if (fh.inside) {
@@ -4326,17 +4371,37 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
   color += keyLightColor() * spec * TUNE_FLUID_SPECULAR * (3.0 * fres + 0.15);
 
   // ---- foam ----
-  // Churn (fast surface) whitens, broken by animated fbm so it reads as
-  // bubbles and streaks being dragged along rather than as white paint. The
-  // splash droplets the solver sheds (sim_fluid g2p) land in the same places,
-  // so the foam and the spray agree about where the action is.
-  var foam = TUNE_FLUID_FOAM * churn;
+  // TWO sources, and they answer different questions:
+  //
+  //   * the FOAM FIELD (s.foam) is the simulated one — sim_fluid.wgsl's g2p
+  //     accumulates the Ihmsen trapped-air/wave-crest/energy potentials into
+  //     grid word 7, and that field DECAYS rather than tracking velocity. It
+  //     is what makes foam persist in the wake of a breaking wave and drift
+  //     with the water after the impact that made it has passed. This is the
+  //     physically-motivated term.
+  //   * CHURN is the cheap instantaneous one that was here before: fast
+  //     surface = white. Kept because it responds with zero latency and reads
+  //     well on thin fast sheets that never live long enough to build a field.
+  //
+  // They are combined by max(), not added: both are already "how white is
+  // this", and summing them double-counts a breaking crest (which scores high
+  // on both) into flat white paint.
+  let fieldFoam = s.foam * max(TUNE_FLUID_FOAM_FIELD, 0.0);
+  var foam = TUNE_FLUID_FOAM * max(churn, fieldFoam);
   if (foam > 0.003) {
+    // Animated fbm break-up so it reads as bubbles and streaks being dragged
+    // along rather than as white paint. Scaled by the texture knob: at 0 the
+    // foam is flat coverage, at 1 it is fully broken into structure.
+    let tex = clamp(TUNE_FLUID_FOAM_TEXTURE, 0.0, 1.0);
     let fn1 = fbm(hitP * 0.85 + vec3f(R.time * 1.9, 0.0, -R.time * 1.4), 3u);
-    foam *= 0.30 + 0.70 * fn1;
+    foam *= (1.0 - tex) + tex * (0.30 + 0.70 * fn1);
+    // Foam is not just white paint: it is a rough, air-filled scattering layer.
+    // Killing the specular under it (the mix below already replaces the shaded
+    // colour) and lifting it with ambient is what stops it reading as a
+    // gloss decal on top of the water.
     let foamCol = vec3f(0.93, 0.96, 0.99) *
                   (ambientAt(n) + keyLightColor() * 0.55);
-    color = mix(color, foamCol, clamp(foam, 0.0, 0.85));
+    color = mix(color, foamCol, clamp(foam, 0.0, 0.90));
   }
   return color;
 }

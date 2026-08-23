@@ -742,6 +742,31 @@ struct Tuning {
     float fluidSplashMaxDensity = 0.7f;  // eligible below this x rest density
     float fluidSplashLife = 1.1f;        // droplet lifetime, seconds (<= 8.5)
     int fluidSplashScaleIdx = 2;         // droplet size: 0=1/2,1=1/3,2=1/4,3=1/6 vox
+    // ---- diffuse material: spray / foam / bubbles ----
+    // Ihmsen et al., "Unified Spray, Foam and Bubbles for Particle-Based
+    // Fluids" (CGI 2012). Three potentials — trapped air, wave crest, kinetic
+    // energy — each clamped to 0..1 by the paper's Phi(), then combined as
+    //   n_d = I_k * (kta * I_ta + kwc * I_wc) * dt.
+    // Generated particles are classified by local fluid density into spray
+    // (ballistic), foam (advected by the fluid, ages out) and bubbles
+    // (buoyant, dragged by the fluid) — the classification the paper does by
+    // neighbour COUNT, which here is the density the solver already gathered.
+    float fluidFoamRate = 90.0f;      // kta: foam particles/s from trapped air
+    float fluidFoamCrestRate = 120.0f; // kwc: foam particles/s from wave crests
+    float fluidTrappedMin = 1.5f;     // Phi thresholds on the convergence-
+    float fluidTrappedMax = 11.0f;    //   weighted relative velocity, vox/s
+    float fluidCrestMin = 0.25f;       // Phi thresholds on gated curvature,
+    float fluidCrestMax = 2.0f;       //   dimensionless
+    float fluidFoamEnergyMin = 8.0f;  // Phi thresholds on kinetic energy,
+    float fluidFoamEnergyMax = 260.0f; //   (vox/s)^2
+    float fluidFoamLife = 2.2f;       // foam lifetime at full potential, s
+    float fluidFoamLifeMin = 0.5f;    // lifetime at the generation threshold, s
+    float fluidBubbleBuoyancy = 1.6f; // kb: bubble rise, x gravity, upward
+    float fluidFoamDrag = 0.72f;      // kd: how hard the fluid drags foam and
+                                      //   bubbles toward its own velocity
+    float fluidBubbleDensity = 1.05f; // above this x rest -> bubble
+    float fluidSprayDensity = 0.42f;  // below this x rest -> spray
+    int fluidFoamScaleIdx = 3;        // foam particle size (0=1/2 .. 3=1/6 vox)
   } sim;
 
   // ---- day/night cycle ----
@@ -868,6 +893,24 @@ struct Tuning {
     float fluidWobble = 0.5f;    // sub-voxel normal shimmer on moving fluid
     // Speed-driven whitening: fast, loose particles read as spray/foam.
     float fluidFoam = 0.35f;
+    // ---- depth colour gradient (raymarch.wgsl DEPTH GRADIENT) ----
+    // A thin film reads as `fluidShallow`, the deep body tends toward
+    // `fluidDeep`, ramped over `fluidDepth` metres of in-fluid path. The ramped
+    // colour is what drives the per-channel Beer-Lambert absorption, so the
+    // gradient is a real absorption change, not a tint painted on top.
+    float fluidShallow[3] = {0.42f, 0.86f, 0.82f};
+    float fluidDeep[3] = {0.02f, 0.15f, 0.42f};
+    float fluidDepth = 2.6f;     // metres over which the ramp completes
+    float fluidGradient = 1.0f;  // 0 = flat species albedo (old look), 1 = full
+    // ---- grid foam field (sim_fluid.wgsl foam potentials) ----
+    float fluidFoamField = 1.0f;   // gain on the advected foam field's whitening
+    float fluidFoamTexture = 0.65f; // fbm break-up of the foam field, 0 = flat
+    // Foam PARTICLE colour (debris.wgsl, PPAY_FOAM). Foam is entrained air,
+    // not a substance, so it has no material to take an albedo from — it is
+    // coloured from here, jittered per particle by foamColorVar so a burst
+    // reads as many bubbles rather than one flat white mass.
+    float foamColor[3] = {0.97f, 0.98f, 1.0f};
+    float foamColorVar = 0.18f;
     float starBrightness = 1.0f;
     float starDensity = 150.0f;     // direction-grid cells per unit
     // PSF core radius in PIXELS, not radians. Sizing in pixels is what keeps a

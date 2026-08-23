@@ -50,7 +50,11 @@
 // GRID LAYOUT: 8 i32 words per node —
 //   [0] mass (Q10)   [1..3] momentum -> velocity (Q16.16)
 //   [4..6] mass of species 1..3 (Q10; species 0 mass = [0] - [4] - [5] - [6])
-//   [7] unused (cleared with the rest)
+//   [7] FOAM FIELD (Q16, saturated at 1.0) — the ONLY word that is NOT
+//       cleared per substep. It accumulates the Ihmsen diffuse-material
+//       potentials in g2p and decays geometrically in gridUpdate, so foam
+//       persists in the wake of a splash instead of tracking the instantaneous
+//       velocity. The renderer samples it trilinearly as the surface's white.
 // world.cpp sizes fluidGrid by FLUID_GW; keep them in step.
 //
 // Overflow audit (worst cases, all < 2^31): node mass 2000 crowded particles
@@ -114,6 +118,62 @@ const FLUID_SPLASH_MAX_RHO : i32 =             // fraction of rest -> Q16.16
     i32(round(TUNE_FLUID_SPLASH_MAXDENS * TUNE_FLUID_REST_DENSITY * 65536.0));
 const FLUID_SPLASH_LIFE : u32 =                // seconds -> ticks (life field)
     u32(clamp(TUNE_FLUID_SPLASH_LIFE * 30.0, 1.0, 255.0));
+
+// ---- diffuse material: spray / foam / bubbles (Ihmsen et al. 2012) ---------
+// Same const-eval discipline as the rows above: every human-unit knob becomes
+// an integer here at SHADER COMPILE TIME, so the kernel is integer-only and
+// bit-deterministic (rule 1). LoadTuning has already ordered every min/max
+// pair, so none of these divisions can be by zero.
+//
+// Trapped-air thresholds: vox/s -> Q16.16 cells/tick.
+const FLUID_TA_MIN : i32 = i32(round(TUNE_FLUID_TRAPPED_MIN * 65536.0 / 30.0));
+const FLUID_TA_MAX : i32 = i32(round(TUNE_FLUID_TRAPPED_MAX * 65536.0 / 30.0));
+// Wave-crest thresholds are dimensionless; keep them in Q16.16 too.
+const FLUID_WC_MIN : i32 = i32(round(TUNE_FLUID_CREST_MIN * 65536.0));
+const FLUID_WC_MAX : i32 = i32(round(TUNE_FLUID_CREST_MAX * 65536.0));
+// Kinetic-energy thresholds: (vox/s)^2 -> (Q16.16 cells/tick)^2 measured the
+// same way g2p measures speed², i.e. on (v >> 8) so the square fits i32.
+// (vox/s)² -> (cells/tick)² is /900; then (Q16.16 >> 8) scales by (256)².
+const FLUID_EK_MIN : i32 =
+    i32(round(TUNE_FLUID_FOAM_EMIN * 65536.0 * 65536.0 / (900.0 * 65536.0)));
+const FLUID_EK_MAX : i32 =
+    i32(round(TUNE_FLUID_FOAM_EMAX * 65536.0 * 65536.0 / (900.0 * 65536.0)));
+// Generation rates (Eq. 8): particles/second -> per-substep probability in
+// Q16, i.e. the chance THIS substep that this particle sheds one foam particle
+// at full potential. Bounded by construction (rule 2): expected foam per tick
+// = (kta + kwc) / 30 per ELIGIBLE particle, and eligibility needs all three
+// potentials non-zero, which a settled pool never has.
+const FLUID_FOAM_KTA : i32 =
+    i32(round(TUNE_FLUID_FOAM_RATE * 65536.0 / (30.0 * f32(FLUID_SUBSTEPS))));
+const FLUID_FOAM_KWC : i32 =
+    i32(round(TUNE_FLUID_FOAM_CREST_RATE * 65536.0 / (30.0 * f32(FLUID_SUBSTEPS))));
+// Foam lifetime band, ticks. The paper sets lifetime in proportion to the
+// generation potential so dense clusters outlive isolated specks.
+const FLUID_FOAM_LIFE : u32 =
+    u32(clamp(TUNE_FLUID_FOAM_LIFE * 30.0, 1.0, 255.0));
+const FLUID_FOAM_LIFE_MIN : u32 =
+    u32(clamp(TUNE_FLUID_FOAM_LIFE_MIN * 30.0, 1.0, 255.0));
+// Classification thresholds on the density the solver already gathered. The
+// paper classifies by NEIGHBOUR COUNT; density is the same measurement with
+// the kernel weights already applied, and it costs nothing extra here.
+const FLUID_BUBBLE_RHO : i32 =
+    i32(round(TUNE_FLUID_BUBBLE_RHO * TUNE_FLUID_REST_DENSITY * 65536.0));
+const FLUID_SPRAY_RHO : i32 =
+    i32(round(TUNE_FLUID_SPRAY_RHO * TUNE_FLUID_REST_DENSITY * 65536.0));
+// Foam field: what a full-potential emission adds to grid word 7, Q16. The
+// field saturates at FLUID_FOAM_FULL and decays by FOAM_DECAY per tick, so a
+// churning region builds a persistent white patch that then fades — this is
+// what makes foam TRAIL a splash instead of blinking with the velocity.
+const FLUID_FOAM_FULL : i32 = 65536;
+const FLUID_FOAM_GAIN : i32 = 26214;   // 0.4 per full-potential substep
+// Per-SUBSTEP survival, Q16. Applied once per substep in gridUpdate, it
+// compounds over FLUID_SUBSTEPS to the per-tick survival implied by the foam
+// lifetime — so the tuner's "seconds" really are seconds. Expressed as the
+// substep-th root via exp/log at const-eval time (the shader compiler folds
+// it; no float ever reaches the kernel).
+const FLUID_FOAM_DECAY : i32 = i32(round(65536.0 *
+    exp(log(max(1.0 - 1.0 / max(TUNE_FLUID_FOAM_LIFE * 30.0, 2.0), 0.001)) /
+        f32(FLUID_SUBSTEPS))));
 // 0.5 cell in Q16.16 — the cell-center offset of the node lattice.
 const FLUID_HALF : i32 = 32768;
 // CFL cap: 0.45 cell/substep * FLUID_SUBSTEPS, Q16.16 cells/tick (~8.1 m/s).
@@ -145,6 +205,27 @@ const FLUID_MASS_MIN : i32 = 16;
 fn mq(a : i32, b : i32) -> i32 {
   let m = ((abs(a) >> 6u) * (abs(b) >> 6u)) >> 4u;
   return select(m, -m, (a ^ b) < 0);
+}
+
+// The paper's clamping function (Eq. 1), in Q16.16 throughout:
+//   Phi(I, tmin, tmax) = (min(I,tmax) - min(I,tmin)) / (tmax - tmin)
+// Result is Q16 in [0, 65536]. LoadTuning guarantees tmax > tmin, so the
+// divisor is never zero; the shift keeps the numerator inside i32 for the
+// widest threshold pair the tuner allows.
+// Signed wrapper over common.wgsl's exact integer isqrt. The foam potentials
+// need a magnitude from a squared sum, and rule 1 forbids f32 in the CA: a
+// hardware sqrt is free to differ in the last ulp between vendors, which is
+// precisely the class of divergence the pinned world hash exists to catch.
+fn isqrtI(x : i32) -> i32 {
+  if (x <= 0) { return 0; }
+  return i32(isqrt(u32(x)));
+}
+
+fn phiQ(v : i32, tmin : i32, tmax : i32) -> i32 {
+  let num = min(v, tmax) - min(v, tmin);
+  let den = max(tmax - tmin, 1);
+  if (num <= 0) { return 0; }
+  return clamp((num >> 4u) * 65536 / max(den >> 4u, 1), 0, 65536);
 }
 
 // Quadratic B-spline weights of fx in [0.5, 1.5] (Q16.16 in, Q16.16 out).
@@ -299,12 +380,26 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
 // Only active blocks are touched (indirect over blocks*16 workgroups); stale
 // data in inactive blocks is unreachable because every access goes through the
 // freshly rebuilt blockMap.
+// The FOAM FIELD (word 7) is the one accumulator that must SURVIVE this clear.
+// Everything else here is a per-substep scatter target and is meaningless
+// carried forward; the foam field is a persistent state variable whose whole
+// job is to outlive the event that created it (Ihmsen §3.2 dissolution — foam
+// ages out on its own clock rather than tracking the instantaneous velocity).
+// Zeroing it every substep, as the first version of this did, is exactly what
+// makes foam blink on and off with the flow instead of trailing a wave.
+//
+// Its decay lives in gridUpdate, NOT here: this kernel has no way to tell one
+// substep from another (sim_fluid binds only TickParams, which carries no
+// fluid substep index), so decaying here would apply the per-tick rate
+// FLUID_SUBSTEPS times and silently divide the tuner's "seconds" by six.
+// gridUpdate runs once per substep too, but it uses the per-SUBSTEP rate,
+// which compounds to exactly the per-tick rate over a tick.
 @compute @workgroup_size(256)
 fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
              @builtin(local_invocation_index) li : u32) {
   let node = wg.x * 256u + li;   // wg.x spans blocks*16, so node < blocks*4096
   let b = node * FLUID_GW;
-  for (var w = 0u; w < FLUID_GW; w++) {
+  for (var w = 0u; w < 7u; w++) {
     atomicStore(&fluidGrid[b + w], 0);
   }
 }
@@ -475,6 +570,23 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
   let block = wg.x >> 4u;
   let localIdx = (wg.x & 15u) * 256u + li;
   let ni = (block * CHUNK_VOL + localIdx) * FLUID_GW;
+
+  // ---- foam field decay (word 7) ----
+  // BEFORE the low-mass early-out on purpose: foam left behind by water that
+  // has since drained away must still fade, and those are exactly the nodes
+  // that fail the mass test. Skipping them would strand a permanent white
+  // patch in mid-air wherever a splash once was.
+  // One thread owns one node, so this is a plain read-modify-write with no
+  // contention — order-independent by construction (rule 1).
+  {
+    let f = atomicLoad(&fluidGrid[ni + 7u]);
+    if (f > 0) {
+      // The -1 floor guarantees termination: a pure Q16 multiply by a factor
+      // < 1 stalls at small values, leaving a faint permanent haze.
+      atomicStore(&fluidGrid[ni + 7u], max(mq(f, FLUID_FOAM_DECAY) - 1, 0));
+    }
+  }
+
   let m = atomicLoad(&fluidGrid[ni + 0u]);
   if (m < FLUID_MASS_MIN) {
     atomicStore(&fluidGrid[ni + 1u], 0);
@@ -538,6 +650,17 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   var c0 = vec3<i32>(0, 0, 0);   // row 0 of C (x-velocity gradients)
   var c1 = vec3<i32>(0, 0, 0);
   var c2 = vec3<i32>(0, 0, 0);
+  // ---- diffuse-material potentials, gathered on the SAME 27 node taps ------
+  // vdiff (Eq. 2): sum over neighbours of |vij| * (1 - vij_hat . xij_hat) * W.
+  // The convergence factor is what separates an IMPACT (two fronts closing,
+  // factor -> 2) from laminar flow (factor -> 0): the paper's whole reason for
+  // preferring relative velocity over the curl. Accumulated in Q16.16 cells
+  // per tick, weighted by the node's own B-spline weight as W(xij, h).
+  var vdiff : i32 = 0;
+  // Mass-weighted density gradient — the surface normal, and (via how sharply
+  // it turns across the neighbourhood) the curvature that flags a wave crest.
+  var grad = vec3<i32>(0, 0, 0);
+  var massSum : i32 = 0;
   for (var k = 0; k < 3; k++) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
@@ -558,6 +681,56 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
         c0 += vec3<i32>(mq(tx, dx) << 2u, mq(tx, dy) << 2u, mq(tx, dz) << 2u);
         c1 += vec3<i32>(mq(ty, dx) << 2u, mq(ty, dy) << 2u, mq(ty, dz) << 2u);
         c2 += vec3<i32>(mq(tz, dx) << 2u, mq(tz, dy) << 2u, mq(tz, dz) << 2u);
+
+        // ---- foam gather (costs the mass word this loop did not read) ----
+        let nm = atomicLoad(&fluidGrid[ni + 0u]);     // Q10 node mass
+        if (nm < FLUID_MASS_MIN) { continue; }
+        massSum += nm;
+        // Density gradient: mass * direction FROM the particle TO the node.
+        // dpos is already that direction; a >>6 keeps the Q10*Q16.16 product
+        // inside i32 across all 27 taps (|dpos| <= 1.5 cells, mass <= ~2000).
+        grad += vec3<i32>((nm * (dx >> 8u)) >> 6u,
+                          (nm * (dy >> 8u)) >> 6u,
+                          (nm * (dz >> 8u)) >> 6u);
+        // Relative velocity of this node against the particle, and how much
+        // the pair is CONVERGING.
+        //
+        // SCALING, and why it is not the obvious >>8. Fluid velocities are a
+        // FRACTION of a cell per tick (CFL caps them at 0.45), so in Q16.16
+        // they are ~10^4 and a >>8 leaves values in the tens. Squaring those
+        // and then shifting again — the first version of this — underflowed
+        // every intermediate to 0 or 1: |rv| rounded to zero, and the cosine's
+        // divisor clamped to 1 and saturated. The whole potential read as
+        // exactly zero and no foam was ever generated.
+        //
+        // Instead: keep the RAW Q16.16 difference for the magnitude (isqrt of
+        // a Q32 square is a Q16 magnitude — exact, no shift needed), and do
+        // the cosine on a >>4 scale where the products still have real
+        // precision. |rv| <= 2*VMAX ~ 2^18.4, so rv2 needs the >>4 pair to fit.
+        let rvx = nv.x - p.vx; let rvy = nv.y - p.vy; let rvz = nv.z - p.vz;
+        let sx = rvx >> 4u; let sy = rvy >> 4u; let sz = rvz >> 4u;
+        let rv2 = sx * sx + sy * sy + sz * sz;      // (Q12.12)^2
+        if (rv2 <= 0) { continue; }
+        // dpos is at most 1.5 cells, so >>4 keeps it exact enough and matches
+        // the velocity scale for the dot product below.
+        let qx = dx >> 4u; let qy = dy >> 4u; let qz = dz >> 4u;
+        let px2 = qx * qx + qy * qy + qz * qz;
+        if (px2 <= 0) { continue; }
+        // dot < 0 means node and particle are approaching (dpos points at the
+        // node, relative velocity points back) -> converging -> trapped air.
+        let dotp = sx * qx + sy * qy + sz * qz;
+        // cos^2 in Q16 = dot^2 / (rv2 * px2), with the sign carried — no
+        // square root, and no normalize. Both operands are >>10'd before the
+        // multiply so the product cannot overflow i32 at the CFL ceiling.
+        let dnum = ((abs(dotp) >> 10u) * (abs(dotp) >> 10u)) << 16u;
+        let dq = clamp(dnum / max((rv2 >> 10u) * max(px2 >> 10u, 1), 1),
+                       0, 65536);
+        // (1 - cos) in [0,2] Q16: converging (dot<0) gives 1+|cos|.
+        let conv = select(65536 - dq, 65536 + dq, dotp < 0);
+        // |rv| as a Q16.16 magnitude: isqrt of the (Q12.12)^2 square gives a
+        // Q12.12 magnitude, so <<4 restores Q16.16 cells/tick.
+        let mag = isqrtI(rv2) << 4u;
+        vdiff += mq(mq(mag, conv), w);
       }
     }
   }
@@ -640,6 +813,198 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
                   (FLUID_SPLASH_LIFE << PMICRO_LIFE_SHIFT);
         let slot = atomicAdd(&counts[1u - T.page], 1u);
         if (slot < PARTICLE_CAP) { pWrite[slot] = d; }
+      }
+    }
+  }
+
+  // ---- diffuse material: spray / foam / bubbles ----------------------------
+  // Ihmsen et al. 2012 (CGI), "Unified Spray, Foam and Bubbles for
+  // Particle-Based Fluids". Three potentials, each mapped to [0,1] by Phi
+  // (Eq. 1), combined into a generation count (Eq. 8):
+  //
+  //   n_d = I_k * (k_ta * I_ta + k_wc * I_wc) * dt
+  //
+  // Multiplying by I_k is the paper's key structural claim, and it is what
+  // makes this cheap AND well-behaved: air mixes with water at a crest or on
+  // an impact, but in BOTH cases the amount scales with kinetic energy, so a
+  // slow-but-convergent flow (a pool settling under its own weight, which is
+  // convergent everywhere) generates nothing. Without the I_k factor every
+  // still pool foams at its own floor.
+  //
+  // The whole block is gated on foam being switched on and the particle having
+  // non-zero energy, so a settled pool costs one compare — rule 2.
+  if ((FLUID_FOAM_KTA > 0 || FLUID_FOAM_KWC > 0) && massSum >= FLUID_MASS_MIN) {
+    // --- I_k: kinetic energy. Measured on (v >> 8) exactly as the splash
+    // test is, so the two eligibility bands are directly comparable in the
+    // tuner (both read in the same human units).
+    let kx = p.vx >> 8u; let ky = p.vy >> 8u; let kz = p.vz >> 8u;
+    let ek = kx * kx + ky * ky + kz * kz;
+    let iK = phiQ(ek, FLUID_EK_MIN, FLUID_EK_MAX);
+    if (iK > 0) {
+      // --- I_ta: trapped air, from the convergence-weighted relative
+      // velocity gathered above (Eq. 2).
+      let iTa = phiQ(vdiff, FLUID_TA_MIN, FLUID_TA_MAX);
+
+      // --- I_wc: wave crest (Eq. 5-7). The paper sums (1 - ni.nj) over
+      // neighbours and keeps only CONVEX regions, then gates on the particle
+      // moving along its own normal (Eq. 7, threshold 0.6). Here the surface
+      // normal is the normalized density gradient, and "convex" is exactly
+      // "the neighbourhood mass sits BEHIND the particle relative to the
+      // outward normal" — which the gradient magnitude measures directly: a
+      // particle deep inside the fluid has neighbours on all sides and a near
+      // zero gradient, one on a crest has them all to one side and a large
+      // one. So |grad| / mass IS the convex-curvature estimate, and it needs
+      // no second pass over the neighbourhood.
+      let gx = grad.x >> 4u; let gy = grad.y >> 4u; let gz = grad.z >> 4u;
+      let g2 = gx * gx + gy * gy + gz * gz;
+      var iWc : i32 = 0;
+      if (g2 > 0) {
+        let gmag = isqrtI(g2);                       // scaled |grad|
+        // Normalize by the mass that produced it -> a shape measure that does
+        // not change when the pool gets denser. Q16.
+        let kappa = clamp((gmag << 12u) / max(massSum >> 4u, 1), 0, 1 << 20);
+        // Eq. 7: only count it if the fluid is moving OUTWARD along the
+        // normal (a crest breaking), not if it is merely a static edge — this
+        // is what stops every corner of a resting block of water foaming.
+        // cos(v, n) >= 0.6, evaluated SQUARED to avoid both magnitudes.
+        //
+        // Velocity and gradient must be compared on the SAME scale, and both
+        // must keep precision: p.v is Q16.16 but only ~10^4 in practice, so
+        // the >>8 used for the energy term is far too coarse here (it rounds a
+        // real velocity to single digits and the comparison becomes noise).
+        // Both sides are reduced to a common >>6 scale instead.
+        let vx6 = p.vx >> 6u; let vy6 = p.vy >> 6u; let vz6 = p.vz >> 6u;
+        let v6sq = vx6 * vx6 + vy6 * vy6 + vz6 * vz6;
+        let vdotg = vx6 * gx + vy6 * gy + vz6 * gz;
+        var moving = false;
+        if (vdotg > 0 && v6sq > 0) {
+          // (v.g)^2 >= 0.36 * |v|^2 * |g|^2. Shifted by 10 on each factor so
+          // the products stay inside i32 for the largest gradient a full
+          // neighbourhood can produce.
+          let lhs = (vdotg >> 10u) * (vdotg >> 10u);
+          let rhs = ((v6sq >> 10u) * (g2 >> 10u) / 256) * 92;  // 92/256 ~= 0.36
+          moving = lhs >= rhs;
+        }
+        if (moving) { iWc = phiQ(kappa, FLUID_WC_MIN, FLUID_WC_MAX); }
+      }
+
+      // --- Eq. 8. Both rate constants are already per-substep probabilities
+      // in Q16 at full potential, so the product with the potentials IS the
+      // per-substep chance in Q16. Bounded above by (kta + kwc), which
+      // LoadTuning caps at one emission per substep.
+      // NOT mq() here. mq stages its operands as (|a|>>6)*(|b|>>6)>>4, which
+      // is exact enough for the Q16.16 quantities it was written for but
+      // throws away the low 6 bits of BOTH factors — and these factors are
+      // small Q16 probabilities (a few thousand), so a nested mq chain
+      // truncated the result to zero and no foam was ever emitted despite
+      // both potentials being healthy. The operands here are bounded by
+      // 65536 * 65536 = 2^32... so do the reduction in two exact steps
+      // instead, each of which provably fits i32.
+      //   inner = (KTA*iTa + KWC*iWc) >> 16   <= (kta+kwc) <= 65536
+      //   nd    = (iK * inner) >> 16          <= 65536
+      // KTA,KWC <= 65536 and iTa,iWc <= 65536, so each product is <= 2^32;
+      // shifting each term individually before the add keeps every
+      // intermediate inside i32.
+      // Each potential is Q16 (<= 65536) and each rate is Q16 (<= 65536), so a
+      // direct product is up to 2^32 — one bit too wide. Shifting the
+      // POTENTIAL down by 8 (keeping 8 bits of it) and the rate not at all
+      // bounds the product at 65536 * 256 = 2^24 with room to spare, and
+      // costs a factor-256 quantisation on a term that is already a
+      // probability. Shifting BOTH operands (the previous version) threw away
+      // ~8 bits of signal and drove nd under the roll threshold everywhere.
+      let inner = (FLUID_FOAM_KTA * (iTa >> 8u) +
+                   FLUID_FOAM_KWC * (iWc >> 8u)) >> 8u;
+      let nd = (min(inner, 65536) * (iK >> 8u)) >> 8u;
+      if (nd > 0) {
+        // The foam FIELD (grid word 7) is written for every generating
+        // particle, not only the ones that win the dice roll: it is a
+        // continuous measure of "how aerated is this region", and the
+        // renderer marches it as the surface's white. Scattering it to the
+        // nearest node with an atomicAdd is order-independent (rule 1) —
+        // addition commutes, and nothing keys on which thread got there
+        // first. Saturated so a long-running churn cannot overflow.
+        let nb = nodeBlock(cell);
+        if (nb != 0u) {
+          let fi = nodeWordBase(nb, cell) + 7u;
+          // nd is a per-substep probability in Q16; scale it up so a sustained
+          // moderate churn still saturates the field, then cap at 1.0.
+          let add = mq(FLUID_FOAM_GAIN, min(nd << 4u, 65536));
+          if (add > 0) {
+            let prev = atomicLoad(&fluidGrid[fi]);
+            if (prev < FLUID_FOAM_FULL) {
+              atomicAdd(&fluidGrid[fi], min(add, FLUID_FOAM_FULL - prev));
+            }
+          }
+        }
+
+        // Roll for an actual particle. Hashed on (slot, position, tick) for
+        // the same reason the splash roll is: the fluid slot is a stable
+        // IDENTITY (particles are appended at CPU-known offsets and never
+        // die), so this is state-keyed, not scheduling-keyed. A distinct
+        // salt from the splash hash keeps foam and spray from firing on
+        // exactly the same particles every time.
+        let fh = pcg(0x9E3779B9u ^ gid.x ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^
+                 pcg(u32(p.pz) ^ pcg(T.tick ^ T.seed)))));
+        if ((fh & 0xFFFFu) < u32(nd)) {
+          // --- classification (paper §3.2): by local fluid density, which is
+          // the neighbour count the paper uses with the kernel weights already
+          // applied. Spray is airborne and ballistic; bubbles are submerged
+          // and buoyant; foam is the surface film between them.
+          let rho = p.density;
+          var fv = vec3<i32>(p.vx, p.vy, p.vz);
+          let kd = i32(round(TUNE_FLUID_FOAM_DRAG * 65536.0));
+          if (rho >= FLUID_BUBBLE_RHO) {
+            // BUBBLE: dragged toward the fluid velocity (kd) and pushed UP by
+            // buoyancy counteracting gravity. v is already the fluid velocity
+            // here (this particle IS fluid), so the drag term degenerates to
+            // "match the flow" — the buoyancy is what distinguishes it.
+            let buoy = i32(round(TUNE_FLUID_BUBBLE_BUOY * 65536.0 / 30.0));
+            fv.y += mq(buoy, 65536);
+          } else if (rho <= FLUID_SPRAY_RHO) {
+            // SPRAY: ballistic. Leaves a little faster than the sheet that
+            // threw it, exactly as the splash droplets do.
+            fv = vec3<i32>((fv.x * 5) / 4, (fv.y * 5) / 4, (fv.z * 5) / 4);
+          } else {
+            // FOAM: advected by the fluid, damped toward it by kd so it rides
+            // the surface rather than flying off it.
+            fv = vec3<i32>(mq(fv.x, kd), mq(fv.y, kd), mq(fv.z, kd));
+          }
+          // Scatter the spawn off the particle centre so a churning cell
+          // fizzes instead of emitting a single stacked column (the paper
+          // samples a cylinder; one hashed sub-voxel jitter is the same idea
+          // at this resolution and costs no extra state).
+          let jx = i32((fh >> 4u) & 0x3FFFu) - 8192;
+          let jy = i32((fh >> 12u) & 0x3FFFu) - 8192;
+          let jz = i32((fh >> 20u) & 0x3FFFu) - 8192;
+          var d : Particle;
+          d.px = (p.px + jx) >> 8u;
+          d.py = (p.py + jy) >> 8u;
+          d.pz = (p.pz + jz) >> 8u;
+          d.vx = fv.x >> 8u;
+          d.vy = fv.y >> 8u;
+          d.vz = fv.z >> 8u;
+          // Foam is WHITE, and it gets that from the RENDER tuning (see
+          // PPAY_FOAM in common.wgsl) rather than from a material id — foam is
+          // entrained air, not a substance, so there is no material to name.
+          // The fluid's own material rides along in the low bits so the
+          // droplet still lands and stains correctly: MPM blood foams
+          // pink-white and leaves red.
+          d.payload = (splashMat & 0xFFFu) |
+                      ((fh >> 8u) & 0x7000u) |  // per-particle colour jitter
+                      PPAY_FOAM;
+          // Lifetime scales with the generation potential: the paper's
+          // observation that large foam clusters are more stable than small
+          // ones, captured without ever computing the foam AREA.
+          let lifeSpan = i32(FLUID_FOAM_LIFE) - i32(FLUID_FOAM_LIFE_MIN);
+          let life = u32(clamp(i32(FLUID_FOAM_LIFE_MIN) +
+                               ((lifeSpan * iK) >> 16u), 1, 255));
+          d.flags = PFLAG_ALIVE | PFLAG_MICRO |
+                    ((u32(TUNE_FLUID_FOAM_SCALE_IDX) & PMICRO_SCALE_MASK)
+                     << PMICRO_SCALE_SHIFT) |
+                    (life << PMICRO_LIFE_SHIFT);
+          let fslot = atomicAdd(&counts[1u - T.page], 1u);
+          if (fslot < PARTICLE_CAP) { pWrite[fslot] = d; }
+        }
       }
     }
   }

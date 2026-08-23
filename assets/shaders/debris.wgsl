@@ -85,7 +85,18 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
 
   let mat = p.payload & 0xFFFu;
   let m = materials[mat];
-  let albedo = paletteColor(m, p.payload >> 12u);
+  var albedo = paletteColor(m, p.payload >> 12u);
+
+  // FOAM particles (bit 31 of payload, set by sim_fluid.wgsl's g2p) are not
+  // made of any material — they are air in water. Colouring them by a material
+  // id would mean authoring a "foam" material whose only job is to be white,
+  // and would tie the look to the material table instead of the tuner. They
+  // take their colour straight from the render tuning, jittered per particle so
+  // a burst reads as many bubbles rather than one flat white mass.
+  if ((p.payload & PPAY_FOAM) != 0u) {
+    let j = f32((p.payload >> 12u) & 7u) * (1.0 / 7.0);
+    albedo = TUNE_FOAM_COLOR * (1.0 - TUNE_FOAM_COLOR_VAR * j);
+  }
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);

@@ -722,6 +722,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidSplashMaxDensity", s.fluidSplashMaxDensity, out, at);
     ReadF(*g, "fluidSplashLife", s.fluidSplashLife, out, at);
     ReadI(*g, "fluidSplashScaleIdx", s.fluidSplashScaleIdx, out, at);
+    ReadF(*g, "fluidFoamRate", s.fluidFoamRate, out, at);
+    ReadF(*g, "fluidFoamCrestRate", s.fluidFoamCrestRate, out, at);
+    ReadF(*g, "fluidTrappedMin", s.fluidTrappedMin, out, at);
+    ReadF(*g, "fluidTrappedMax", s.fluidTrappedMax, out, at);
+    ReadF(*g, "fluidCrestMin", s.fluidCrestMin, out, at);
+    ReadF(*g, "fluidCrestMax", s.fluidCrestMax, out, at);
+    ReadF(*g, "fluidFoamEnergyMin", s.fluidFoamEnergyMin, out, at);
+    ReadF(*g, "fluidFoamEnergyMax", s.fluidFoamEnergyMax, out, at);
+    ReadF(*g, "fluidFoamLife", s.fluidFoamLife, out, at);
+    ReadF(*g, "fluidFoamLifeMin", s.fluidFoamLifeMin, out, at);
+    ReadF(*g, "fluidBubbleBuoyancy", s.fluidBubbleBuoyancy, out, at);
+    ReadF(*g, "fluidFoamDrag", s.fluidFoamDrag, out, at);
+    ReadF(*g, "fluidBubbleDensity", s.fluidBubbleDensity, out, at);
+    ReadF(*g, "fluidSprayDensity", s.fluidSprayDensity, out, at);
+    ReadI(*g, "fluidFoamScaleIdx", s.fluidFoamScaleIdx, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -755,6 +770,47 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (s.fluidSplashScaleIdx < 0 || s.fluidSplashScaleIdx > 3) {
       out.warnings.push_back("sim.fluidSplashScaleIdx out of 0..3; clamped");
       s.fluidSplashScaleIdx = s.fluidSplashScaleIdx < 0 ? 0 : 3;
+    }
+    // Diffuse material (spray/foam/bubbles). Same discipline as the splash
+    // rows: these become Q16.16-per-tick constants and bit fields at shader
+    // compile time, so an out-of-range value wraps i32 or bleeds into the
+    // neighbouring flag field rather than merely looking wrong.
+    clampWarnF(s.fluidFoamRate, 0.0f, 180.0f, "fluidFoamRate");   // <=1/substep
+    clampWarnF(s.fluidFoamCrestRate, 0.0f, 180.0f, "fluidFoamCrestRate");
+    clampWarnF(s.fluidTrappedMin, 0.0f, 400.0f, "fluidTrappedMin");
+    clampWarnF(s.fluidTrappedMax, 0.0f, 400.0f, "fluidTrappedMax");
+    clampWarnF(s.fluidCrestMin, 0.0f, 64.0f, "fluidCrestMin");
+    clampWarnF(s.fluidCrestMax, 0.0f, 64.0f, "fluidCrestMax");
+    clampWarnF(s.fluidFoamEnergyMin, 0.0f, 8100.0f, "fluidFoamEnergyMin");
+    clampWarnF(s.fluidFoamEnergyMax, 0.0f, 8100.0f, "fluidFoamEnergyMax");
+    clampWarnF(s.fluidFoamLife, 0.05f, 8.5f, "fluidFoamLife");     // 255 ticks
+    clampWarnF(s.fluidFoamLifeMin, 0.05f, 8.5f, "fluidFoamLifeMin");
+    clampWarnF(s.fluidBubbleBuoyancy, -4.0f, 8.0f, "fluidBubbleBuoyancy");
+    clampWarnF(s.fluidFoamDrag, 0.0f, 1.0f, "fluidFoamDrag");      // kd in 0..1
+    clampWarnF(s.fluidBubbleDensity, 0.0f, 4.0f, "fluidBubbleDensity");
+    clampWarnF(s.fluidSprayDensity, 0.0f, 4.0f, "fluidSprayDensity");
+    // Phi(I, tmin, tmax) divides by (tmax - tmin): an inverted or degenerate
+    // pair is a divide-by-zero in a const-eval expression, which is a SHADER
+    // COMPILE failure, not a bad-looking frame. Order them here instead.
+    auto orderPair = [&](float& lo, float& hi, float minGap, const char* name) {
+      if (!(hi > lo + minGap)) {
+        out.warnings.push_back(std::string("sim.") + name +
+                               " max must exceed min; raised");
+        hi = lo + minGap;
+      }
+    };
+    orderPair(s.fluidTrappedMin, s.fluidTrappedMax, 0.5f, "fluidTrapped");
+    orderPair(s.fluidCrestMin, s.fluidCrestMax, 0.05f, "fluidCrest");
+    orderPair(s.fluidFoamEnergyMin, s.fluidFoamEnergyMax, 1.0f, "fluidFoamEnergy");
+    // Foam lifetime is scaled between min and max by the generation potential
+    // (the paper's "large clusters are more stable" rule), so min <= max.
+    if (s.fluidFoamLifeMin > s.fluidFoamLife) {
+      out.warnings.push_back("sim.fluidFoamLifeMin above fluidFoamLife; clamped");
+      s.fluidFoamLifeMin = s.fluidFoamLife;
+    }
+    if (s.fluidFoamScaleIdx < 0 || s.fluidFoamScaleIdx > 3) {
+      out.warnings.push_back("sim.fluidFoamScaleIdx out of 0..3; clamped");
+      s.fluidFoamScaleIdx = s.fluidFoamScaleIdx < 0 ? 0 : 3;
     }
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
@@ -858,6 +914,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidClarity", r.fluidClarity, out, at);
     ReadF(*g, "fluidReflect", r.fluidReflect, out, at);
     ReadF(*g, "fluidSpecular", r.fluidSpecular, out, at);
+    ReadV3(*g, "fluidShallow", r.fluidShallow, out, at);
+    ReadV3(*g, "fluidDeep", r.fluidDeep, out, at);
+    ReadF(*g, "fluidDepth", r.fluidDepth, out, at);
+    ReadF(*g, "fluidGradient", r.fluidGradient, out, at);
+    ReadF(*g, "fluidFoamField", r.fluidFoamField, out, at);
+    ReadF(*g, "fluidFoamTexture", r.fluidFoamTexture, out, at);
+    ReadV3(*g, "foamColor", r.foamColor, out, at);
+    ReadF(*g, "foamColorVar", r.foamColorVar, out, at);
     ReadF(*g, "fluidFoamSpeed", r.fluidFoamSpeed, out, at);
     ReadF(*g, "fluidWobble", r.fluidWobble, out, at);
     ReadV3(*g, "sunTint", r.sunTint, out, at);

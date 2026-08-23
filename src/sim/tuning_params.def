@@ -77,6 +77,20 @@ TP_F(render, fluidReflect, TUNE_FLUID_REFLECT, 1.0f)
 TP_F(render, fluidSpecular, TUNE_FLUID_SPECULAR, 1.0f)
 TP_F(render, fluidFoamSpeed, TUNE_FLUID_FOAM_SPEED, 22.0f)
 TP_F(render, fluidWobble, TUNE_FLUID_WOBBLE, 0.5f)
+// Depth colour gradient (raymarch.wgsl, DEPTH GRADIENT block). The shallow
+// tint is what a thin film reads as, the deep tint what the body tends toward;
+// depth is the metres of path over which the ramp completes.
+TP_V3(render, fluidShallow, TUNE_FLUID_SHALLOW, 0.42f, 0.86f, 0.82f)
+TP_V3(render, fluidDeep, TUNE_FLUID_DEEP, 0.02f, 0.15f, 0.42f)
+TP_F(render, fluidDepth, TUNE_FLUID_DEPTH, 2.6f)
+TP_F(render, fluidGradient, TUNE_FLUID_GRADIENT, 1.0f)
+// Grid foam field (sim_fluid.wgsl foam potentials, raymarch surface whitening).
+TP_F(render, fluidFoamField, TUNE_FLUID_FOAM_FIELD, 1.0f)
+TP_F(render, fluidFoamTexture, TUNE_FLUID_FOAM_TEXTURE, 0.65f)
+// Foam PARTICLE colour (debris.wgsl vsParticle, PPAY_FOAM). Foam is
+// entrained air, so it has no material - it is coloured from here.
+TP_V3(render, foamColor, TUNE_FOAM_COLOR, 0.97f, 0.98f, 1.0f)
+TP_F(render, foamColorVar, TUNE_FOAM_COLOR_VAR, 0.18f)
 TP_F(render, starBrightness, TUNE_STAR_BRIGHTNESS, 1.0f)
 TP_F(render, starDensity, TUNE_STAR_DENSITY, 150.0f)
 TP_F(render, starSize, TUNE_STAR_SIZE, 0.85f)
@@ -363,6 +377,29 @@ TP_F(sim, fluidSplashSpeed, TUNE_FLUID_SPLASH_SPEED, 18.0f)
 TP_F(sim, fluidSplashMaxDensity, TUNE_FLUID_SPLASH_MAXDENS, 0.7f)
 TP_F(sim, fluidSplashLife, TUNE_FLUID_SPLASH_LIFE, 1.1f)
 TP_U(sim, fluidSplashScaleIdx, TUNE_FLUID_SPLASH_SCALE_IDX, 2)
+// ---- diffuse material: spray / foam / bubbles (Ihmsen et al. 2012, CGI) ----
+// Three potentials, each mapped to 0..1 by the paper's clamping function
+//   Phi(I, tmin, tmax) = (min(I,tmax) - min(I,tmin)) / (tmax - tmin),
+// then combined as  n_d = I_k * (k_ta * I_ta + k_wc * I_wc) * dt   (Eq. 8).
+// Trapped air is a convergence-weighted relative-velocity sum over the node
+// neighbourhood; wave crest is a convexity-gated curvature of the density
+// gradient; energy is the particle's kinetic energy. Thresholds are in the
+// natural unit of each measure so the tuner reads in vox/s and (vox/s)^2.
+TP_F(sim, fluidFoamRate, TUNE_FLUID_FOAM_RATE, 90.0f)
+TP_F(sim, fluidFoamCrestRate, TUNE_FLUID_FOAM_CREST_RATE, 120.0f)
+TP_F(sim, fluidTrappedMin, TUNE_FLUID_TRAPPED_MIN, 1.5f)
+TP_F(sim, fluidTrappedMax, TUNE_FLUID_TRAPPED_MAX, 11.0f)
+TP_F(sim, fluidCrestMin, TUNE_FLUID_CREST_MIN, 0.25f)
+TP_F(sim, fluidCrestMax, TUNE_FLUID_CREST_MAX, 2.0f)
+TP_F(sim, fluidFoamEnergyMin, TUNE_FLUID_FOAM_EMIN, 8.0f)
+TP_F(sim, fluidFoamEnergyMax, TUNE_FLUID_FOAM_EMAX, 260.0f)
+TP_F(sim, fluidFoamLife, TUNE_FLUID_FOAM_LIFE, 2.2f)
+TP_F(sim, fluidFoamLifeMin, TUNE_FLUID_FOAM_LIFE_MIN, 0.5f)
+TP_F(sim, fluidBubbleBuoyancy, TUNE_FLUID_BUBBLE_BUOY, 1.6f)
+TP_F(sim, fluidFoamDrag, TUNE_FLUID_FOAM_DRAG, 0.72f)
+TP_F(sim, fluidBubbleDensity, TUNE_FLUID_BUBBLE_RHO, 1.05f)
+TP_F(sim, fluidSprayDensity, TUNE_FLUID_SPRAY_RHO, 0.42f)
+TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)

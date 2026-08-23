@@ -604,10 +604,21 @@ fn withMicroLife(flags : u32, life : u32) -> u32 {
 }
 fn isMicro(p : Particle) -> bool { return (p.flags & PFLAG_MICRO) != 0u; }
 
+// PAYLOAD bit 31 — "this is FOAM": render it in the tuner's foam colour rather
+// than by looking its material up in the table. Foam is entrained air, not a
+// substance; giving it a material id would mean authoring a material whose
+// only job is to be white, and would put its colour in materials.json instead
+// of next to the other fluid look knobs. The material bits are still valid
+// underneath (foam inherits the fluid's material for its LANDING behaviour —
+// stain, wetness — so MPM blood still foams pink-white and stains red).
+// Written by sim_fluid.wgsl's g2p, read by debris.wgsl's vsParticle.
+const PPAY_FOAM : u32 = 0x80000000u;
+
 struct Particle {
   px : i32, py : i32, pz : i32,   // position, fixed 24.8 voxels
   vx : i32, vy : i32, vz : i32,   // velocity, fixed 24.8 voxels/tick
-  payload : u32,                  // bits 0..11 material, 12..15 state
+  payload : u32,                  // bits 0..11 material, 12..15 state,
+                                  // bit 31 PPAY_FOAM
   flags   : u32,                  // PFLAG_*
 };
 

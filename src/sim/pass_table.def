@@ -447,10 +447,16 @@ PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND
 // atomicAdd + slot store — the same order-independent append integrate uses;
 // nothing keys on the slot). This runs AFTER particleResolve in the tick, so
 // the appends land beyond the resolved count and fly next tick.
-// read-only in practice: `fluidBlockMap` is written by mark/alloc and
-// `fluidGrid` by clear/p2g/gridUpdate; g2p only atomicLoads both.
+// read-only in practice: `fluidBlockMap` is written by mark/alloc and g2p
+// only atomicLoads it.
+// `fluidGrid` is READ-WRITE here: g2p atomicLoads the mass/velocity/species
+// words, but it also atomicAdds the DIFFUSE-MATERIAL potential into word 7
+// (the foam field — see the Ihmsen block in sim_fluid.wgsl). That word is the
+// one grid accumulator that survives the per-substep clear, so the next
+// substep's clear/p2g and the RENDERER both read what this pass wrote and the
+// hazard is real, not notional.
 PASS(fluidG2p, "fluid(substep)", PT_FLUID, PIPE_FLUID_G2P, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(U(TickUBO) RW(FluidParticles) R(FluidBlockMap) R(FluidGrid)
+     USES(U(TickUBO) RW(FluidParticles) R(FluidBlockMap) RW(FluidGrid)
           W(ParticlesWrite) A(ParticleCounts)))
 
 // clang-format on
