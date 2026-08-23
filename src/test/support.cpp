@@ -253,8 +253,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                  particlesActive, cellCount, spawnCount,
                  fluidBase + fluidSpawnCount, fluidSpawnCount);
   sim.EncodeFarFill(enc, farCount);
+  // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
+  // for one even when the caller did not. §3.2 step (2)'s intersection is the
+  // ONLY thing that tightens cpuDirty; without a snapshot the mirror is only
+  // ever the step-(1) recurrence, which dilates by a ring every tick and walks
+  // the materialization set through the whole window in ~10 ticks — the pool
+  // then exhausts and §3.8 aborts. Most selftest gates pass wantReadback=false
+  // (they read the world through blocking hash/occupancy reads, not through
+  // Snap()), so under --residency paged every gate hit that abort.
+  //
+  // PRE-EXISTING and independent of phase 7's two fixes: proven by stashing
+  // them and rebuilding. The condition is narrow on purpose:
+  //   - HarnessSnapshotDrain() — main.cpp's frame loop shares SubmitTick and
+  //     already requests readbacks on its own schedule; it must not be touched.
+  //   - Residency::Paged — under dense the page table is the identity map,
+  //     nothing is ever materialized or freed, and cpuDirty is inert. Forcing
+  //     a readback there would change dense timing for no reason, so the dense
+  //     path stays byte-identical (verified: world hash 7cfa2420 unchanged).
+  // A readback is a pure copy out plus a map — it mutates no world state — so
+  // the only thing a gate can observe from this is Snap() becoming valid in
+  // paged mode, which is exactly what it needs to be.
+  const bool needSnapshotForPaging =
+      HarnessSnapshotDrain() && world.residency == World::Residency::Paged;
   bool doCopy = false;
-  if (wantReadback) {
+  if (wantReadback || needSnapshotForPaging) {
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
                                    1 - sim.Page(), tick);
