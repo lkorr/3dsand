@@ -768,7 +768,8 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
     }
     count = fluidN;
 
-    std::vector<uint32_t> buf((size_t)count * 16);
+    // 18 words per particle — the FluidParticle stride in common.wgsl.
+    std::vector<uint32_t> buf((size_t)count * 18);
     if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidParticles, 0,
                                buf.data(), buf.size() * 4, "fluidDet")) {
       detail = "fluid particle readback failed";
@@ -791,7 +792,7 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
   // solver did not explode", not a look test.
   uint32_t escaped = 0, badV = 0, badJ = 0;
   for (uint32_t i = 0; i < count; i++) {
-    const int32_t* p = (const int32_t*)&last[(size_t)i * 16];
+    const int32_t* p = (const int32_t*)&last[(size_t)i * 18];
     int x = p[0] >> 16, y = p[1] >> 16, z = p[2] >> 16;
     if (x < px - R - 2 || x > px + R + 2 || y < py - 2 || y > py + H + 8 ||
         z < pz - R - 2 || z > pz + R + 2)
@@ -926,6 +927,16 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
   const bool paged = world.residency == World::Residency::Paged;
   PageTable& pt = *world.pages;
 
+  // Standalone (--gate) the world is the untouched identity map: every pool
+  // page is claimed by ResetIdentity and the free list is EMPTY, so the paint
+  // below would hit §3.8's fatal-exhaustion abort before testing anything.
+  // In-suite the previous gates have long since generated and demoted, so
+  // this never fires there.
+  if (paged && pt.PagesInUse() == pt.PoolPages()) {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+  }
+
   // Paint into provably-empty sky, well above any terrain. The window origin
   // is in CHUNK units; +24 chunks of Y from the origin is 384 voxels up.
   const IVec3 o = world.WindowOrigin();
@@ -998,6 +1009,28 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
       heldThroughHysteresis = false;  // freed too early
   }
   const uint32_t afterFree = pt.PagesInUse();
+  // The free assertion is SLOT-LEVEL: the painted chunk's entry is a sentinel
+  // again once hysteresis has run. It was originally a global count
+  // (afterFree <= afterAlloc), which is the wrong invariant on a live world:
+  // this gate runs after the spells gate, whose fires are still spreading, so
+  // background materialization legitimately outpaces the one freed page and
+  // the count RISES while the roundtrip under test works perfectly. The
+  // slot-level form is also strictly stronger for the property under test —
+  // the global count could pass with this chunk never freed at all, carried
+  // by unrelated demotions. (Same class as gotcha "a world-wide sweep must
+  // assert invariants, not that every stain is blood".)
+  //
+  // The wait is BOUNDED, not fixed: free probes are capped per tick
+  // (kMaxFreeProbesPerTick), so on a live world this chunk queues behind
+  // whatever demotion backlog the previous gates left, and a fixed 6-tick
+  // grace reads a working mechanism as a leak. The early-free assertion
+  // above already pinned the hysteresis floor; this loop just gives the
+  // capped drain time to reach our slot.
+  bool freedAtEnd = (world.PageEntryOfSlot(skySlot) & kPtSentinelBit) != 0u;
+  for (int i = 0; i < 400 && paged && !freedAtEnd; i++) {
+    tick({});
+    freedAtEnd = (world.PageEntryOfSlot(skySlot) & kPtSentinelBit) != 0u;
+  }
 
   // ---- step 7: pageFaults == 0 ------------------------------------------
   // The assertion that turns §2.4's structural claim into evidence. Read
@@ -1012,19 +1045,20 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
   // must prove is that the translation path produces the same voxels.
   const bool allocOk =
       !paged || (wasSentinel && nowResident && afterAlloc > before);
-  const bool freeOk = !paged || (afterFree <= afterAlloc);
+  const bool freeOk = !paged || freedAtEnd;
   const bool ok = allocOk && freeOk && painted > 0 && faults == 0 &&
                   synthEmptyZero && synthAgrees && heldThroughHysteresis;
 
   char buf[512];
   std::snprintf(buf, sizeof(buf),
                 "%s: sky slot %u sentinel->resident %d->%d, pages %u->%u->%u, "
-                "%u sand voxels painted through the table, hysteresis held=%d, "
-                "synthWord(EMPTY)==0 %d, CPU/GPU synth agree %d, pageFaults %u",
+                "%u sand voxels painted through the table, hysteresis held=%d "
+                "freed at end=%d, synthWord(EMPTY)==0 %d, CPU/GPU synth agree "
+                "%d, pageFaults %u",
                 paged ? "paged" : "dense", skySlot, (int)wasSentinel,
                 (int)nowResident, before, afterAlloc, afterFree, painted,
-                (int)heldThroughHysteresis, (int)synthEmptyZero,
-                (int)synthAgrees, faults);
+                (int)heldThroughHysteresis, (int)(!paged || freedAtEnd),
+                (int)synthEmptyZero, (int)synthAgrees, faults);
   detail = buf;
   return ok ? Status::Pass : Status::Fail;
 }

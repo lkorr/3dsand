@@ -129,10 +129,16 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 }
 
 // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). One cube
-// per fluid particle, positions Q16.16 world cells. 8 particles per rest cell
-// sit on a half-cell lattice, so 0.55 of a cell overlaps neighbours slightly —
-// resting water reads as a surface rather than as a bag of dice. Compression
-// (J < 1) darkens the albedo a touch, which makes pressure visibly travel.
+// per fluid particle, positions Q16.16 world cells. Everything that makes a
+// bag of dice read as one connected liquid is tunable (MPM Fluid Look):
+//   * TUNE_FLUID_PARTICLE_SIZE oversizes the cube past the rest lattice pitch
+//     so resting neighbours fuse into a surface;
+//   * TUNE_FLUID_STRETCH elongates the cube along its velocity — free motion
+//     blur, so a falling stream reads as streaks rather than droplets;
+//   * TUNE_FLUID_DENSITY_SHADE darkens where p2g2 measured compression, so
+//     pressure visibly travels through a pool;
+//   * TUNE_FLUID_FOAM whitens with speed — spray and churn wash toward white;
+//   * four species each carry their own albedo (TUNE_FLUID_COLOR..COLOR3).
 @group(1) @binding(5) var<storage, read> fluid : array<FluidParticle>;
 
 @vertex
@@ -140,11 +146,25 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
            @builtin(instance_index) inst : u32) -> VSOut {
   let p = fluid[inst];
   var n : vec3f;
-  let off = cubeOffset(vi, &n) * 0.55;
+  var off = cubeOffset(vi, &n) * TUNE_FLUID_PARTICLE_SIZE;
   let center = vec3f(f32(p.px), f32(p.py), f32(p.pz)) / 65536.0;
+  let v = vec3f(f32(p.vx), f32(p.vy), f32(p.vz)) / 65536.0;  // cells/tick
+  let speed = length(v);
+  if (speed > 0.05) {
+    // Shear the cube along the motion direction. The normal is left alone —
+    // at these sizes the lighting error is invisible and the stretch is not.
+    let dir = v / speed;
+    off += dir * dot(off, dir) * (TUNE_FLUID_STRETCH * min(speed, 3.0));
+  }
   let world = center + off;
-  let squeeze = clamp(f32(p.j) / 65536.0, 0.75, 1.0);
-  let albedo = TUNE_FLUID_COLOR * (0.55 + 0.45 * squeeze);
+  var cols = array<vec3f, 4>(TUNE_FLUID_COLOR, TUNE_FLUID_COLOR1,
+                             TUNE_FLUID_COLOR2, TUNE_FLUID_COLOR3);
+  var albedo = cols[min(p.species, 3u)];
+  let rest = max(f32(TUNE_FLUID_REST_DENSITY), 1.0);
+  let compress = clamp(f32(p.density) / rest - 1.0, 0.0, 1.0);
+  albedo *= 1.0 - TUNE_FLUID_DENSITY_SHADE * compress;
+  let foam = clamp(speed * TUNE_FLUID_FOAM * 0.5, 0.0, 0.85);
+  albedo = mix(albedo, vec3f(0.92, 0.95, 0.98), foam);
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
   out.color = litColor(albedo, n, world, 0.0, R);

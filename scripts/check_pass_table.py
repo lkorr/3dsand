@@ -109,6 +109,7 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_ALLOC": "fluidAlloc_",
     "PIPE_FLUID_CLEAR": "fluidClear_",
     "PIPE_FLUID_P2G": "fluidP2g_",
+    "PIPE_FLUID_P2G2": "fluidP2g2_",
     "PIPE_FLUID_GRIDUP": "fluidGridUp_",
     "PIPE_FLUID_G2P": "fluidG2p_",
 }

@@ -85,7 +85,7 @@ void World::Init(const rhi::Device& device) {
   // MLS-MPM fluid prototype (world.h fluid block). CopySrc on fluidParticles
   // is selftest-only: the fluid_det gate hashes the buffer twice-run; the
   // frame path never reads it back.
-  fluidParticles = CreateBuffer(device, (uint64_t)kFluidCap * 64,
+  fluidParticles = CreateBuffer(device, (uint64_t)kFluidCap * 72,
                                 U::Storage | U::CopySrc, "fluidParticles");
   fluidSpawnOps = CreateBuffer(device, kMaxFluidSpawnsPerTick * sizeof(FluidSpawnOp),
                                U::Storage | U::CopyDst, "fluidSpawnOps");
@@ -93,7 +93,10 @@ void World::Init(const rhi::Device& device) {
                                U::Storage | U::CopyDst, "fluidBlockMap");
   fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4, U::Storage,
                                 "fluidBlockList");
-  fluidGrid = CreateBuffer(device, (uint64_t)kFluidBlocks * kChunkVol * 16,
+  // 8 i32 words per node (FLUID_GW in sim_fluid.wgsl): mass, momentum xyz,
+  // per-species mass x3, one spare — 32 MiB of per-substep scratch at 256
+  // blocks.
+  fluidGrid = CreateBuffer(device, (uint64_t)kFluidBlocks * kChunkVol * 32,
                            U::Storage, "fluidGrid");
   fluidArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc, "fluidArgsStage");
   fluidDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst,

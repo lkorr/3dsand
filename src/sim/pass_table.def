@@ -396,13 +396,23 @@ PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_F
      USES(W(FluidGrid) I(FluidDispatchArgs)))
 // P2G's scatter is the plan's §5.1 bet made real: i32 atomicAdd accumulation,
 // associative, so the sum cannot depend on scheduling. The fill->mark->alloc
-// chain above already ordered the map; the barrier this row needs is the
+// chain above already ordered the map; the barrier p2g1 needs is the
 // clear->scatter WAW on fluidGrid, generated from the two rows' uses.
 // read-only in practice: `fluidParticles` is read_write for the module (spawn
-// and g2p write it); p2g only reads particle state to scatter it. Likewise
+// and g2p write it); p2g1 only reads particle state to scatter it. Likewise
 // `fluidBlockMap` is written by mark/alloc; p2g only atomicLoads the mapping.
-PASS(fluidP2g, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+PASS(fluidP2g1, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticles) R(FluidBlockMap) A(FluidGrid)))
+// p2g2 is the density-EOS half of the grantkot two-pass P2G: it needs p2g1's
+// COMPLETE mass field (the A->A WAW barrier between these rows orders it),
+// gathers density per particle, and scatters stress as momentum. Within the
+// pass it reads only mass words and adds only to momentum words — disjoint,
+// and both order-independent. RW on fluidParticles is real: p2g2 writes
+// p.density (render shading reads it).
+// read-only in practice: `fluidBlockMap` is written by mark/alloc; p2g2 only
+// atomicLoads the mapping, exactly like p2g1 above.
+PASS(fluidP2g2, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G2, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) RW(FluidParticles) R(FluidBlockMap) A(FluidGrid)))
 // Terrain boundary conditions read the LIVE voxel buffer through voxWordAt —
 // carve under a pool and the wall simply stops being there next substep
 // (plan §6.1). Reads only; the fluid never writes a voxel, which is what keeps

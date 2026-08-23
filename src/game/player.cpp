@@ -534,39 +534,61 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // UP FIRST, then across. Reversed, the body drives into the wall it is
   // climbing and the mantle stalls against it every time.
   if (mantleTimer > 0.0f && !fly) {
-    mantleTimer -= dt;
-    Vec3 d = mantleTarget - pos;
-    const float rise = (mantleSpeed / kVoxelMeters) * dt;
-    float yBefore = pos.y;
-    if (d.y > 1e-3f) {
-      SweepAxis(pos, std::min(d.y, rise), 1, kindAt);
-    } else {
-      // At height: cross onto the bank. Only now, so the horizontal press
-      // cannot start until there is somewhere to press onto.
-      float remain = std::sqrt(d.x * d.x + d.z * d.z);
-      if (remain > 1e-3f) {
-        float s = std::min(1.0f, rise / remain);
-        SweepAxis(pos, d.x * s, 0, kindAt);
-        SweepAxis(pos, d.z * s, 2, kindAt);
-      }
-    }
-    // Bank the climb into the view offset like a step-up, so the camera glides
-    // out of the water instead of snapping up it.
-    viewYOffset -= pos.y - yBefore;
-    viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
-                             (float)kMaxStepUpVoxels);
-
-    // Done when we arrive, or when the timer runs out — the timeout is what
-    // stops a mantle that got blocked mid-climb (collapsed bank, a body shoved
-    // into the way) from holding movement hostage forever.
-    Vec3 left = mantleTarget - pos;
-    if (left.len() < 0.35f || mantleTimer <= 0.0f) {
+    // A ledge pull-up climbs only WHILE W is held. Releasing it cancels the
+    // mantle and — if space still grips and the lip still exists — lowers
+    // the body back into the dead hang, where the settle ease walks it back
+    // down to the anchor. hangTime keeps its served delay so re-holding W
+    // resumes the climb at once. No return here: the hang block right below
+    // runs this same frame, so control is continuous.
+    if (mantleFromHang && in.forward <= 0.3f) {
       mantleTimer = 0.0f;
+      mantleFromHang = false;
       vel = Vec3{0, 0, 0};
-      grounded = true;
-      coyoteTimer = T().coyoteTime;
+      const bool lipOk =
+          kindAt(hangLip) == CellKind::Solid &&
+          kindAt({hangLip.x, hangLip.y + 1, hangLip.z}) != CellKind::Solid;
+      if (in.up && !in.down && lipOk && !inLiquid) {
+        hanging = true;
+        hangTime = T().ledgePullDelay;
+      } else {
+        coyoteTimer = T().coyoteTime;  // let go mid-climb: same jump grace
+      }
+    } else {
+      mantleTimer -= dt;
+      Vec3 d = mantleTarget - pos;
+      const float rise = (mantleSpeed / kVoxelMeters) * dt;
+      float yBefore = pos.y;
+      if (d.y > 1e-3f) {
+        SweepAxis(pos, std::min(d.y, rise), 1, kindAt);
+      } else {
+        // At height: cross onto the bank. Only now, so the horizontal press
+        // cannot start until there is somewhere to press onto.
+        float remain = std::sqrt(d.x * d.x + d.z * d.z);
+        if (remain > 1e-3f) {
+          float s = std::min(1.0f, rise / remain);
+          SweepAxis(pos, d.x * s, 0, kindAt);
+          SweepAxis(pos, d.z * s, 2, kindAt);
+        }
+      }
+      // Bank the climb into the view offset like a step-up, so the camera glides
+      // out of the water instead of snapping up it.
+      viewYOffset -= pos.y - yBefore;
+      viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
+                               (float)kMaxStepUpVoxels);
+
+      // Done when we arrive, or when the timer runs out — the timeout is what
+      // stops a mantle that got blocked mid-climb (collapsed bank, a body shoved
+      // into the way) from holding movement hostage forever.
+      Vec3 left = mantleTarget - pos;
+      if (left.len() < 0.35f || mantleTimer <= 0.0f) {
+        mantleTimer = 0.0f;
+        mantleFromHang = false;
+        vel = Vec3{0, 0, 0};
+        grounded = true;
+        coyoteTimer = T().coyoteTime;
+      }
+      return;  // scripted: no gravity, no swim, no walk this frame
     }
-    return;  // scripted: no gravity, no swim, no walk this frame
   }
 
   // ---- ledge grab: dangling from a lip by the hands ----
@@ -588,6 +610,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         kindAt({hangLip.x, hangLip.y + 1, hangLip.z}) != CellKind::Solid;
     if (!in.up || in.down || !lipOk || inLiquid) {
       hanging = false;  // let go: fall through, gravity resumes this frame
+      // The parkour seam: letting go grants the same jump grace walking off
+      // an edge does, so releasing space and tapping it again inside the
+      // window fires an ordinary full jump off the wall — from which the next
+      // lip up can be caught. No new jump path: buffer + coyote already
+      // compose exactly this.
+      coyoteTimer = T().coyoteTime;
     } else if (in.forward > 0.3f && hangTime >= T().ledgePullDelay) {
       // The delay is what makes the hang EXIST on screen: W is almost always
       // still held from the jump approach, and honouring it on the first hang
@@ -614,6 +642,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         mantleTarget = hangStand;
         mantleSpeed = T().ledgeMantleSpeed;
         mantleTimer = T().ledgeMantleTime;
+        mantleFromHang = true;  // a HOLD: W released mid-climb cancels
         vel = Vec3{0, 0, 0};
         return;  // the mantle block above drives from the next frame
       }

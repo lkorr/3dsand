@@ -73,7 +73,8 @@ const PipelineSpec kComputePipelines[] = {
     {"sim_fluid.wgsl", "mark", "fluidMark"},
     {"sim_fluid.wgsl", "alloc", "fluidAlloc"},
     {"sim_fluid.wgsl", "clearGrid", "fluidClear"},
-    {"sim_fluid.wgsl", "p2g", "fluidP2g"},
+    {"sim_fluid.wgsl", "p2g1", "fluidP2g1"},
+    {"sim_fluid.wgsl", "p2g2", "fluidP2g2"},
     {"sim_fluid.wgsl", "gridUpdate", "fluidGridUp"},
     {"sim_fluid.wgsl", "g2p", "fluidG2p"},
 };

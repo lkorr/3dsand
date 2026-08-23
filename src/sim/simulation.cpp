@@ -544,7 +544,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark");
   fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc");
   fluidClear_ = MakeComputePipeline(device, fluidPL_, mFluid, "clearGrid", "fluidClear");
-  fluidP2g_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g", "fluidP2g");
+  fluidP2g_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g1", "fluidP2g1");
+  fluidP2g2_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g2", "fluidP2g2");
   fluidGridUp_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridUpdate", "fluidGridUp");
   fluidG2p_ = MakeComputePipeline(device, fluidPL_, mFluid, "g2p", "fluidG2p");
 
@@ -558,7 +559,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
-      !fluidGridUp_ || !fluidG2p_) {
+      !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -717,6 +718,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidAlloc:     return fluidAlloc_;
     case P::FluidClear:     return fluidClear_;
     case P::FluidP2G:       return fluidP2g_;
+    case P::FluidP2G2:      return fluidP2g2_;
     case P::FluidGridUp:    return fluidGridUp_;
     case P::FluidG2P:       return fluidG2p_;
     default:                return step_;

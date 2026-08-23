@@ -265,7 +265,7 @@ class Simulation {
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;
   rhi::ComputePipeline fluidSpawn_, fluidMark_, fluidAlloc_, fluidClear_,
-      fluidP2g_, fluidGridUp_, fluidG2p_;
+      fluidP2g_, fluidP2g2_, fluidGridUp_, fluidG2p_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
       microBodyDraw_, debugBoxDraw_, fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,

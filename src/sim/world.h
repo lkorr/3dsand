@@ -160,7 +160,8 @@ constexpr uint32_t kFluidSubsteps = 6;
 struct FluidSpawnOp {
   int32_t px, py, pz;   // position, fixed 16.16 world cells
   int32_t vx, vy, vz;   // velocity, fixed 16.16 cells/tick
-  uint32_t pad0 = 0, pad1 = 0;
+  uint32_t species = 0; // 0..3: which liquid this is (colour + attraction id)
+  uint32_t pad1 = 0;
 };
 
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
@@ -281,22 +282,33 @@ constexpr uint32_t kPtUnresident = 0xFFFFFFFFu;
 // anyone remembering a rule (§2.4).
 constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 
-// Physical pages in the pool under --residency paged. 8,192 pages = 128 MiB,
-// a 1.65x headroom over the 4,974-page (77.7 MiB) measured steady state at the
-// default seed and a 4x reduction from dense's 32,768 pages / 512 MiB.
+// Physical pages in the pool under --residency paged. 16,384 pages = 256 MiB,
+// a 2x reduction from dense's 32,768 pages / 512 MiB. The resident steady
+// state is unchanged at 4,975 pages = 77.7 MiB; this constant is the RESERVED
+// pool, and conflating the two is how a phase claims a win it did not get
+// (§3.7).
 //
-// The headroom is for: the materialization over-approximation (a 1-ring around
-// every dirty chunk), transient activity (an explosion fills chunks that were
-// sky), worldgen batching, and a different seed. Under the fatal-exhaustion
-// policy (§3.8) this number is SAFETY-CRITICAL rather than advisory — too
-// tight is a crash, too loose is wasted VRAM — so `--measure` reports the
-// high-water mark and the daylight-boundary and low-pool gates probe it.
+// SIZED FROM MEASUREMENT (2026-08-22, phase-7 close, dense-size pool so the
+// true demand was observable): the full --selftest --residency paged suite's
+// high-water is 14,934 pages, stable across repeated runs (14,934 / 15,185 /
+// 15,185 before the demotion-leak fixes; 14,934 after — the sawtooth band of
+// the worst gate is 12.4k-14.5k, +-1.7% run to run). The driver is the
+// STREAMING gate's flight-speed window churn: each shift puts the whole
+// refilled plane into cpuDirty (§3.1a contributor (d)) and its matter chunks'
+// 26-rings materialize, with an 8-tick hysteresis + capped probe drain behind
+// them. That is real demand under the normative formulas, not a leak — the
+// leaks (zeroStreak saturation, stamped-air Classify refusal) were found and
+// fixed in the same close.
 //
-// Note what 128 MiB is and is not: it is the RESERVED POOL, not resident
-// content. The comparable number to the 77.7 MiB measurement is
-// pagesInUse_ * 16 KiB, and conflating the two is how a phase claims a win it
-// did not get (§3.7).
-constexpr uint32_t kPoolPages = 8192;
+// The sizing rule "high-water x 1.25 rounded up to a power of two" lands on
+// 32,768 — the dense size, i.e. NO reservation win at all — so the rounding
+// half of the rule is deliberately not honoured: 16,384 gives 1.10x headroom
+// over the measured worst case, which is the suite's deliberately-hostile
+// flight-speed streaming, far above anything walking-pace play produces.
+// Under §3.8 exhaustion stays a loud abort, and the suite itself re-measures
+// the margin on every paged run (the high-water line at the end of
+// --selftest).
+constexpr uint32_t kPoolPages = 16384;
 
 // The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):
 // it must be bit-identical to what a materialized page would hold, which is
@@ -811,11 +823,12 @@ class World {
   // fluidBlockMap and fluidBlockList are per-substep scratch, cleared and
   // rebuilt inside the tick. fluidParticles is the only carried state, and it
   // is reconstructible from the op stream (deterministic solver + spawn ops).
-  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (64 B, see common.wgsl)
+  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (72 B, see common.wgsl)
   rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
   rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
-  rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 4 i32 (mass, mom xyz)
+  rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
+                                 // mom xyz, species mass x3, pad — FLUID_GW)
   rhi::Buffer fluidArgsStage;    // 4 u32: [0..2] node-pass dispatch args, [3] count
   rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)

@@ -566,10 +566,11 @@ re-enumerate it — other sections reference `C(N)` and this table.
 
 | # | CPU dirty-writer | mechanism | found by |
 |---|---|---|---|
-| a | **brush / cell / explosion op targets** | the kernels' `markBoth(c)` on CPU-authored op streams — the CPU knows every target before the ops are uploaded (§3.3) | first draft |
+| a | **brush / cell / explosion op targets** | the kernels' `markBoth(c)` on CPU-authored op streams — the CPU knows every target before the ops are uploaded (§3.3). **Materializes DILATED BY ONE RING** — `N26(opTargets(N))`, the induction base case for matter created in empty sky (§3.2 step (4), §3.4). Bounded by the op caps (`kMaxOpsPerTick`, `kMaxExplosionsPerTick`) and recomputed each tick, never carried | first draft; ring added phase 7 |
 | b | **`particleSpawnChunks(N)`** | `resolve`'s `markDirtyNext` (`sim_particle.wgsl:242,:265`) dirties the 26-neighbourhood of a **GPU-decided** location; step (1)'s `N26` of `C(N)` covers that. The set itself is THIS tick's spawn sites plus one ring, recomputed from scratch — bounded by `kMaxParticleSpawnsPerTick` + `kMaxExplosionsPerTick`, **independent of flight duration** (§3.4, amended) | review M1; bound amended |
 | c | **`EncodeWakeAll`** (`simulation.cpp:821-828`) | a bare `queue.WriteBuffer(dirty[page_], ones)` — **all 32,768 flags**, no table row, fired from `SubmitTick` (`support.cpp:155`) on a daylight crossing (§3.2a) | review C2 |
 | d | **`Stream::FillSlots`** (`stream.cpp:271-273`) | per store-hit slot, `WriteBuffer(dirty[0], s*4, 1)` **and** `dirty[1]` — the "wake once: neighbors may have changed since this chunk was saved" write. Mid-frame, between ticks, from its own path (§3.5d) | review NEW-2 |
+| e | **the PARTICLE FLIGHT SHELL** (`PageTable::ApplyParticleShell`) | while a particle may be in flight, `occMatter(S)` — every chunk whose latest-snapshot occupancy is non-zero — is unioned into `cpuDirty`, applied at step (3) strictly after the tightening, **after** step (1)'s propagate, and one application PAST the off condition. This is what closes the GPU-ORIGINATED-WAKE hole: `resolve`'s landing `markDirtyNext` is the one dirty-writer with no CPU-known target at its own tick, and the intersection in step (2) can never ADD it back once a mid-flight snapshot has (correctly) tightened the mirror to empty (§3.4, phase-7 close) | phase-7 close |
 
 (d) is the same failure shape as (c) and is worth stating plainly: a refilled
 slot is dirty on the **next tick**, in **both** pages, decided by streaming
@@ -750,12 +751,26 @@ replace it.**
 > // ---- (3) union the unconditional CPU dirty-writers, AFTER (2) -----------
 > cpuDirty(M)   ∪=  allOnes            if EncodeWakeAll fired this tick   (c)
 > cpuDirty(M)   ∪=  refilledSlots(M)   from Stream::FillSlots             (d)
+> cpuDirty(M)   ∪=  occMatter(S)       while particles may be in flight   (e)
+>     // (e) is applied AFTER step (1)'s propagate rather than before it, so
+>     // it is not dilated in the tick it is computed; its 26-ring is then
+>     // materialized by step (4)'s bracketed half (the seed is in
+>     // cpuDirty ∩ hasMatter), which is what keeps the flight shell at
+>     // matter + ONE ring. §3.4's amendment carries the full argument.
 >
 > // ---- (4) THE MATERIALIZATION SET — the one normative formula -----------
 > materialize(N) = [ (cpuDirty ∩ hasMatter) ∪ N26(cpuDirty ∩ hasMatter) ]
->                  ∪ opTargets(N)
+>                  ∪ opTargets(N)  ∪  N26( opTargets(N) )
 >                  ∪ particleSpawnChunks(N)
 > ```
+>
+> **`N26(opTargets(N))` is the INDUCTION BASE CASE, added in phase 7 after it
+> cost a real page fault** — see §3.4's soundness note. The bracketed half is
+> evaluated against `hasMatter` *at encode time*, so an op that creates matter
+> in previously-`PT_EMPTY` sky is invisible to it, and the CA moves that matter
+> one cell in the SAME tick. One ring around the op targets covers every such
+> write; two are not needed, because sim write reach is 1. It is bounded by the
+> op caps and recomputed each tick, exactly like `particleSpawnChunks(N)`.
 >
 > **Both operands of the `∩` in (2) are supersets** of the true `dirtyIn(M)`,
 > so their intersection is also a superset and is at least as tight as either.
@@ -1068,6 +1083,141 @@ explosion would then un-sparse the entire world for as long as its debris
 flies — turning the most common "something is happening" case into the
 worst-case memory footprint. That defeats the phase.
 
+#### The induction base case the adjacency argument does not cover — [AS BUILT, phase 7]
+
+The argument above, and §3.2's recurrence generally, is an induction whose step
+is sound and whose **base case was missing**. The step: a write at tick `N`
+places matter that exists at `N+1`, `markDirtyNext` marks its chunk, so `N+1`'s
+`(cpuDirty ∩ hasMatter)` and its ring see it. That closes for every tick after
+matter exists.
+
+It does **not** close for the tick in which an op FIRST creates matter in
+previously-empty sky. The bracketed half of `materialize(N)` is evaluated
+against `hasMatter` **at encode time**, when those chunks are still `PT_EMPTY`
+and contribute nothing — and then the CA runs in that same tick and moves the
+new matter one cell, off the op chunk and into a neighbour that is in neither
+half of the set. Measured: the loud scenario's WATER brush at `(176,150,176)`
+r5 spans the `y=9` chunks only; water fell into a `y=8` chunk within tick 8 and
+that write was lost — one page fault, slot 11531, `pageTable` entry
+`0x80000000`. Sand does not expose it, because it is painted adjacent to
+existing matter and the bracketed half already covers its neighbourhood; water
+spreads and falls on the first tick.
+
+**Fix: `materialize(N)` dilates op targets by one ring** — the
+`∪ N26(opTargets(N))` term now in §3.2 step (4).
+
+**Soundness, and why ONE ring is exactly right.** The CA this tick acts only on
+chunks dirty at compaction time, which is `previously-dirty ∪ op-marked`.
+Previously-dirty chunks have matter, so they and their ring are already in the
+bracketed half. Op-marked acting cells write at reach ≤ 1 cell — rule 1's
+lattice bound, which the whole race-freedom argument already rests on — so
+every write they can make lands within `N26(opChunks)`. One ring is therefore
+sufficient, and a second is not needed: the reach is 1, not 2.
+
+**Bounded, per rule 2.** Op counts are capped (`kMaxOpsPerTick = 64`,
+`kMaxExplosionsPerTick = 8`) and the set is recomputed from CPU-known inputs
+every tick and never carried, so it cannot grow with time. It mirrors
+`particleSpawnChunks`'s reviewed 1-ring treatment exactly — same shape, same
+reason, same bound.
+
+**How it stayed hidden:** `pageFaults` recorded this fault all along and nobody
+could read the register. `vk_smoke` printed a hardcoded `0` (`RunResult::pageFaults`
+was never assigned), and the counter buffer was never zeroed, so it started at
+driver garbage (measured 2²⁷ on a 3060 Ti). Both are fixed — the counter is a
+real blocking readback after `WaitIdle`, and it is zeroed in `ResetAllEmpty` /
+`ResetIdentity` and once after paged worldgen (see the comment there for why
+worldgen's own sentinel stores legitimately count). §3.4's standing rule — *if
+`pageFaults` is ever non-zero, find the path; do not widen the ring to make it
+go away* — is only enforceable now that the number is real.
+
+#### The GPU-originated-wake hole — the second missing case, and the flight shell — [AS BUILT, phase-7 close]
+
+The adjacency argument above says every particle write after the first tick of
+flight is covered by the bracketed half. **That claim silently assumed the
+landing chunk would be in `cpuDirty`, and the recurrence cannot put it there.**
+Measured, gate `flung-liquid` in paged mode: blood particles fly ~6 ticks over
+a slab; while airborne they dirty nothing, so a fresh snapshot correctly
+tightens `cpuDirty` to **0** (the snapshot genuinely contains no dirty gate
+chunks). The chunks under the slab then demote to `PT_EMPTY` under §3.6. The
+landing itself succeeds — the slab is resident — but the landed blood then
+flows as CA liquid off the slab edge into the demoted chunks and is lost: 62
+page faults, `cpuDirty == 0` for 37 straight ticks, 21 landed voxels at max
+fullness 1 against dense's 76 at 7.
+
+**The formula gap, stated exactly.** `cpuDirty`'s only additive contributors
+are the CPU-known events (a)–(d) plus `N26` of itself, and the tightening is
+an intersection — it can only ever REMOVE. `resolve`'s landing `markDirtyNext`
+is a dirty-writer at a tick the CPU never chose (§3.4's own "second
+consequence" said so), so once a mid-flight snapshot has tightened the mirror
+to empty, **0 stays 0**: the closure lemma in §3.2 is missing a term for
+landings, and both operands of the intersection stop being supersets the
+moment a particle lands inside the gap. The spawn ring covers only the birth
+tick; nothing covers the death tick.
+
+**The fix: contributor (e), the flight shell.** While a particle may be in
+flight, union `occMatter(S)` — every chunk whose latest-snapshot occupancy is
+non-zero — into `cpuDirty`, at step (3), strictly after the tightening. The
+bracketed half then materializes `N26(occMatter)` by its own rule. Soundness
+rides on the same adjacency argument as the collapse above: every particle
+write is ≤1 cell from a blocking cell, blocking cells need matter, and
+occupancy sees ALL matter (it reads through `voxWordAt`, so `UNIFORM`
+sentinels report their synthesized counts). Matter created SINCE the snapshot
+was stamped is not in `occMatter` and does not need to be: op-created matter
+is covered by `N26(opTargets)` (the induction base case), and landed or
+CA-moved matter is genuinely dirty, hence in `cpuDirty` by the marks the
+tightening keeps, resident, and ringed by the bracketed half.
+
+Four design points that took a wrong build each to learn:
+
+1. **Seed from OCCUPANCY, not the page table.** `hasMatter` (any non-`EMPTY`
+   entry) cannot tell a resident-but-all-air chunk from one holding matter, so
+   a residency-seeded shell FEEDS BACK: materializing the ring makes it
+   resident, the next shell rings the ring, and the set dilates one ring per
+   tick for as long as a particle flies — the exact unbounded growth this
+   section's amendment deleted. Occupancy counts actual non-air cells, which
+   materializing an empty page cannot change; the fixed point is pinned to
+   real matter.
+2. **The seed enters the MIRROR, not just the materialization set.** The
+   landed chunk must end up in `cpuDirty`, or the CA flow the landing seeds
+   faults the moment the last particle dies: materialization alone covers the
+   landing write but the intersection can never ADD the landed chunk later.
+   In the mirror it survives every later tightening on its own merits — it is
+   genuinely dirty, so it is in BOTH operands — and step (1)'s `N26` tracks
+   the flow frontier at the 1-chunk/tick it can move.
+3. **Applied after step (1)'s propagate, and the ring stays OUT of the
+   mirror.** Union the ringed shell before the propagate and three dilations
+   compound (shell ring, propagate ring, bracket ring): fixed point matter +
+   3 rings, measured past an 8,192-page pool on `flung-liquid` alone. Seed
+   only, post-propagate: matter + 1 ring. The ring chunks are instead kept as
+   an explicit **demotion guard** (`shell_`, consulted by §3.6's free
+   decision), preserving the structural property that nothing in the
+   materialization set is eligible to free — without it, hysteresis frees the
+   very chunks a particle is about to land in, which is the measured trace.
+4. **The shell LINGERS one application past its off condition.** The last
+   landing (tick Z) first shows occupancy in the snapshot stamped Z — the
+   same snapshot whose `particleCount == 0` lowers the shell. One more
+   application seeded from THAT snapshot is what carries the landed chunk
+   into the mirror. The off condition itself is conservative: a zero count
+   only counts if the snapshot POSTDATES the last particle-spawning
+   submission (`lastSpawnTick_`), because a count proves nothing about spawns
+   after its stamp.
+
+**The rejected candidates, for the record.** *(a) Carry the spawn ring while
+particles fly* — the birth ring does not track a ballistic arc; making it
+track one means dilating per tick, which is the deleted unbounded set.
+*(b) Suppress demotion while `particleCount > 0`* — fixes the measured trace
+(the faulted chunks were resident and demoted mid-flight) but not a landing
+in never-resident airspace, and not the post-landing flow; it also falls out
+of (e) for free via the existing `!cpuDirty` conjunct plus the ring guard.
+
+**Bounded, per rule 2.** The shell exists only while `particlesActive` gates
+a live particle pipeline AND the latest snapshot cannot prove every particle
+has landed; a settled world pays one branch. Its size is `occMatter` + one
+ring ≈ matter + surface, recomputed per tick, never carried, independent of
+flight duration. Measured on `flung-liquid`: `occMatter` 4,978, shell 8,070,
+flat across the flight — and the gate now lands **76 voxels at max fullness
+7/7, bit-identical to dense, `pageFaults == 0`**.
+
 ### 3.5 (c,d,e) worldgen, streaming fill, LoadWorld
 
 These are the easy ones, because they all **replace whole chunks** and are
@@ -1271,6 +1421,59 @@ returned to the free list and its contents are stale garbage. When it is next
 allocated, the allocation path zero-fills it (§3.7). Freeing is a page-table
 write plus a free-list push; no GPU command at all.
 
+#### Demotion in practice — four amendments — [AS BUILT, phase-7 close]
+
+The first full paged suite (which only became runnable at the close) showed
+~14,400 pages still resident after the streaming and spells gates and pages
+that could never free at all. Four amendments, each with its measured cause:
+
+1. **The free predicate is "every cell is STAINLESS AIR", not `Classify`'s
+   exact-word rule.** Two passenger-bit classes survive on air cells after a
+   chunk empties: the tick stamp (the CA deliberately stamps vacated cells,
+   `sim_step.wgsl:114` — words like `0x00030000`) and the state nibble
+   (`sim_mutate` paints EVERY voxel with a palette jitter, air included,
+   `sim_mutate.wgsl:80` — an erase brush leaves `0x00002000`). `Classify`
+   refuses both forever, so every chunk the CA or a brush ever touched leaked
+   its page permanently. Ignoring bits 12..23 on an AIR word is sound on
+   grounds verifiable at source: the hash skips `MAT_AIR` cells entirely
+   (`sim_occupancy.wgsl:161`); the only stamp reader is the acting cell's own
+   early-out (`sim_step.wgsl:802`) and an air cell's act is a no-op; every
+   sim read of a NEIGHBOUR's state nibble is behind a same-material guard
+   (`sim_step.wgsl:682,:705,:724,:753`) and the flow-into-air branch passes
+   an explicit 0 for air's fullness; `tryMove` copies both fields through the
+   swap without branching. STAIN stays load-bearing — it is hashed — and a
+   stained all-air chunk keeps its page, which is the erode-then-demote hash
+   bug the words-probe exists to prevent. `Classify` keeps exact-word
+   strictness where it is needed: `UNIFORM` promotion must reproduce resident
+   words bit-exactly.
+2. **The hysteresis counter re-arms on materialization.** `zeroStreak_`
+   saturates at 255 and the free triggers on the EXACT pass through
+   `kPageFreeTicks`; a chunk materialized while all-air (every ring chunk is)
+   whose counter had saturated during its long sentinel life could never pass
+   through the trigger again — occupancy stays 0, nothing resets it — and
+   its page leaked for the run. The counter now means "consecutive empty
+   snapshots since residency began" and is zeroed when the page is allocated.
+3. **Free probes are capped per tick** (`kMaxFreeProbesPerTick = 64`, the
+   overflow held at `kPageFreeTicks - 1` so it re-arms rather than sailing
+   past the exact-== trigger). Each probe is a blocking `WaitIdle` + 16 KiB
+   readback, and a mass-demotion event — a whole-window load, a wake-all,
+   the streaming gate's window churn — can mint thousands of candidates on
+   one tick; uncapped, that measured as a minutes-long stall that presented
+   as a hang. The backlog drains at the cap rate.
+4. **The flight shell's ring guards demotion** (§3.4's amendment, point 3):
+   while particles may be in flight, `shell_ = occMatter ∪ N26(occMatter)` is
+   a third conjunct on the free condition, because the ring chunks are
+   deliberately NOT in `cpuDirty` and hysteresis would otherwise free the
+   chunks a particle is about to land in — the exact measured `flung-liquid`
+   failure.
+
+One stale-occupancy quirk, recorded so nobody chases it: streaming refills
+write voxels directly and occupancy refreshes with the chunk's next dirty
+tick, so a freshly refilled slot can sit a few snapshots with `occ == 0`
+while holding matter. The words-probe refuses those correctly (`0x00000001`-
+class refusals in the debug trace); the cost is a wasted probe, not a wrong
+free.
+
 ### 3.7 The pool, the free list, fragmentation
 
 **Layout.** One `voxels` buffer, `kPoolPages × kChunkVol` u32, unchanged in
@@ -1343,6 +1546,31 @@ is *resident content*; 128 MiB is *reserved pool*. They are not comparable
 numbers and the acceptance criterion in §8 must report both: the high-water
 `pagesInUse_ × 16 KiB` (compare to 77.7 MiB) and the pool reservation (128 MiB).
 Conflating them is how a phase claims a win it did not get.
+
+#### Pool re-sized from measurement: `kPoolPages = 16384` — [AS BUILT, phase-7 close]
+
+The 8,192 recommendation above did not survive the first full paged suite.
+Measured with a dense-size pool so true demand was observable (and with
+`ResetIdentity` no longer latching `pagesHighWater_` by construction — the bug
+that invalidated the first sizing attempt; the high-water is real demand only
+if its sole writer is `Alloc()`):
+
+| number | value |
+|---|---|
+| full paged suite high-water | **14,934 pages = 233.3 MiB**, stable across four builds (14,934 / 14,934 / 15,185 / 15,185) |
+| the driver | the STREAMING gate's flight-speed churn: each shift puts the refilled plane into `cpuDirty` (contributor (d)) and its matter chunks' rings materialize, behind an 8-tick hysteresis + capped drain; sawtooth band 12.4k–14.5k, ±1.7% run to run |
+| flight-shell contribution | `flung-liquid` gate high-water 8,406 (of which 4,975 is the settled world) |
+| resident settled | unchanged: **4,975 pages = 77.7 MiB** |
+| **`kPoolPages = 16384`** | **256 MiB reserved, 2× under dense, 1.10× over the measured worst case** |
+
+The sizing rule "high-water × 1.25 rounded up to a power of two" lands on
+32,768 — the dense size, i.e. no reservation win at all — so the rounding half
+of the rule is deliberately not honoured. The judgment: the measured worst
+case is the suite's deliberately-hostile flight-speed streaming, far above
+walking-pace play; the number is stable across runs; §3.8's abort stays loud;
+and the suite re-measures the margin on every paged run (the high-water line
+at the end of `--selftest`, `selftest.cpp`). If the margin erodes, the number
+moves — that is what a tracked number is for.
 
 ### 3.8 Exhaustion is a FATAL ERROR
 
@@ -1481,6 +1709,13 @@ for (var i = li; i < CHUNK_VOL; i += 64u) {
 }
 ```
 
+**Stated once, in the strongest form, because phase 7 found a seventh site that
+this section's narrower wording did not cover: an index used as an IDENTITY —
+an RNG key, a hash key, a claim-lattice key — is the SLOT index, NEVER the
+page index; only a memory address may be the page.** See §4.1a for the
+enumeration and for `sim_step:doReactions`, the violation that `main()`'s own
+comment predicted verbatim.
+
 **[REVIEW M3 — FIXED.]** The first draft's trailing comment said the dense path
 runs "with `base` resolved from the page index", which would feed the *page*
 base into `pcg`. That is wrong and it is the kind of wrong that produces a
@@ -1501,8 +1736,10 @@ contributor, not a wrong rule.]**
 
 M3 states the rule for the world hash: *the load follows the page; the key
 keys on the slot.* Implementing commit 1 turned up **five more sites with the
-same shape and none of them a hash**, every one of which would make a paged run
-diverge from a dense one while staying perfectly self-consistent:
+same shape and none of them a hash** — and phase 7's paged bring-up turned up a
+**sixth, `doReactions`, which is the last row below**. Every one of them would
+make a paged run diverge from a dense one while staying perfectly
+self-consistent:
 
 | site | what the index keys | what breaks under a page index |
 |---|---|---|
@@ -1512,6 +1749,7 @@ diverge from a dense one while staying perfectly self-consistent:
 | `sim_explode:apply` | `hash3(rnd, 0x6217u, idx)` — the micro-grit roll | same |
 | `sim_mutate:main` | `hash3(T.seed^0x5EEDu, tick, idx)` — the palette-variant roll | a brush paints different state nibbles depending on which page it landed in |
 | `sim_particle:resolve` | `claimSlot(tgt)` — the reinsertion claim lattice | two particles targeting one world cell could hash to different claim slots after a reallocation and **both win** |
+| `sim_step:doReactions` | `hash3(rnd, ri, idx)` — the per-rule reaction roll | **[FOUND IN PHASE 7, the seventh site and the one this list missed.]** `doReactions` took only `idx` (the page-resolved address) and keyed the RNG on it, so every reaction roll became a function of allocation history. Invisible under the identity map — dense and paged agree until a page is assigned non-identically. Reproduced as a deterministic lava/stone swap at slot 9450, words 893/1149, in `--vk-smoke-loud --residency paged`. Now takes `slotIdx` alongside `idx`, exactly as `main` does |
 
 **The generalized rule, which is what §4.1 should have said from the start:**
 
@@ -1529,6 +1767,17 @@ site says which is which and why.
 a value from a voxel index must say whether that value is an address or an
 identity. `voxWordIndex` returns an address; `cellIndexW` returns an identity.
 Nothing else may be used for either.
+
+**Phase 7 note on how the sixth site escaped, because the lesson is about the
+review method rather than the rule.** The five sites above were found by
+auditing *call sites of `hash3`*, and `doReactions`' `hash3` call is inside a
+helper whose caller passed `idx` correctly for its addressing use. `main()`'s
+own comment predicted this failure in words — the split is documented right
+above the call that got it right — so the rule was never in doubt; only its
+propagation across a function boundary was. A helper that takes a voxel index
+must take **both** bases, or take the one it needs and be named for it. All
+`hash3` sites in the sim shaders were re-audited at that commit and this was
+the only remaining offender.
 
 The same split applies to `mainDirty` (`sim_occupancy.wgsl:35`,
 `base = dirtyList[wg.x] * CHUNK_VOL`) — but `mainDirty` computes no hash, so it

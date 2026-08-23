@@ -18,6 +18,7 @@
 #include <unordered_set>
 
 #include "gpu/resources.h"
+#include "sim/pagetable.h"  // PagesHighWater for the pool-margin report
 #include "test/support.h"
 
 using namespace sandvox;
@@ -384,6 +385,22 @@ int Run(Ctx& c, const Options& opt) {
               pageFaults == 0 ? " (a sentinel write is a lost voxel: 0 is the"
                                 " only acceptable value)"
                               : "  *** SENTINEL WRITES LOST VOXELS ***");
+
+  // Pool high-water over the WHOLE suite. Under §3.8's fatal-exhaustion policy
+  // kPoolPages is safety-critical rather than advisory, and §3.8 requires the
+  // margin to be a TRACKED NUMBER rather than an assumption: the suite is the
+  // worst case the gates can produce, so its high-water is what kPoolPages must
+  // be sized against. Reported unconditionally in paged mode so a change that
+  // eats the headroom shows up as a moving number long before it shows up as an
+  // abort. Dense is the identity map and has no pool, so it is omitted there.
+  if (c.world.residency == World::Residency::Paged && c.world.pages) {
+    const uint32_t hw = c.world.pages->PagesHighWater();
+    std::printf("page pool high water over the suite: %u of %u (%.1f%%, "
+                "%.1f MiB of %.1f MiB reserved)\n",
+                hw, kPoolPages, 100.0 * (double)hw / (double)kPoolPages,
+                (double)hw * kChunkVol * 4.0 / (1024.0 * 1024.0),
+                (double)kPoolPages * kChunkVol * 4.0 / (1024.0 * 1024.0));
+  }
 
   if (!regressions.empty() || vkMsgs > 0 || pageFaults != 0) {
     if (!regressions.empty()) {
