@@ -660,7 +660,7 @@
   .edmain{display:flex;gap:0;align-items:stretch}
   .edmain .edviewport{flex:1;min-width:220px}
   .edside{
-    width:320px;flex:none;overflow-y:auto;overflow-x:hidden;
+    width:380px;flex:none;overflow-y:auto;overflow-x:hidden;
     max-height:calc(100vh - 340px);
     background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;
   }
@@ -692,12 +692,22 @@
   }
   .righdr:first-child{margin-top:0}
   .riglist{display:flex;flex-direction:column;gap:2px}
+  .riggroup{
+    display:flex;align-items:center;gap:5px;padding:4px 6px 3px;margin-top:4px;
+    cursor:pointer;font-size:11px;font-family:var(--mono);text-transform:uppercase;
+    letter-spacing:.5px;color:var(--dim);border-radius:4px;user-select:none;
+  }
+  .riggroup:first-child{margin-top:0}
+  .riggroup:hover{background:#1a1f28}
+  .rigarrow{font-size:10px;flex:none;width:12px;text-align:center}
+  .rigglabel{flex:1}
   .rigrow{
     display:flex;align-items:center;gap:6px;padding:3px 6px;border-radius:5px;
     cursor:pointer;font-size:12.5px;font-family:var(--mono);
   }
   .rigrow:hover{background:#1e2530}
   .rigrow.on{background:#1d3a6e;color:#dce8ff}
+  .rigrow.multi{background:#2a3a4e;color:#c8daf0}
   .rigrow .rigdim{color:var(--faint);font-size:10.5px;min-width:56px}
   /* Editable box size in the model row: three tight number cells. Spinners
      are hidden — the row is cramped and the value is usually typed.
