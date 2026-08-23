@@ -772,10 +772,12 @@ void PageTable::Materialize(const rhi::Queue& queue) {
 }
 
 void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
+                                 const std::vector<uint8_t>& occStain,
                                  uint32_t tick) {
   if (!paged_) return;
   if (zeroStreak_.size() != kNumChunks) zeroStreak_.assign(kNumChunks, 0);
   const auto& t = world_->pageTableCpu();
+  const bool haveStainFlags = occStain.size() == kNumChunks;
   std::vector<uint32_t> candidates;
   for (uint32_t s = 0; s < kNumChunks; s++) {
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
@@ -785,40 +787,52 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // quarter second and stays zero forever.
     if (zeroStreak_[s] != kPageFreeTicks) continue;
     if ((t[s] & kPtSentinelBit) != 0u) continue;   // already a sentinel
-    // Cap the probes per tick. Each candidate costs a blocking WaitIdle +
-    // 16 KiB readback, and a mass-demotion event (a whole-window load, a
-    // wake-all, the streaming gate's window churn) can mint thousands of
-    // candidates on ONE tick — measured as a minutes-long stall that
-    // presented as a hang. The overflow is HELD AT kPageFreeTicks-1, not
-    // skipped: the exact-== trigger above fires once per pass through the
-    // threshold, so a skipped candidate whose streak kept counting would
-    // never be probed again and its page would leak. Held at -1 it re-arms
-    // next tick, and the backlog drains at the cap rate.
-    if (candidates.size() >= kMaxFreeProbesPerTick) {
-      zeroStreak_[s] = kPageFreeTicks - 1;
-      continue;
-    }
+    // THE STAIN TEST, and it is now free (packOccStain, common.wgsl).
     //
-    // `occTotal == 0` is NOT sufficient to demote to PT_EMPTY, and this cost a
-    // debugging cycle. occupancy counts NON-AIR cells; the world hash ALSO
-    // covers the STAIN layer (bits 24..30, sim_occupancy.wgsl). A chunk can be
-    // entirely air and still carry stain — blood spray on a floor that then
-    // erodes away, water that soaked a bank before evaporating — and demoting
-    // it to PT_EMPTY makes the analytic branch report a clean chunk, silently
-    // dropping hashed state. That is gotcha-save-format-drops-stain in a new
-    // place, and it moved the loud scenario's hash from tick 15 onward.
+    // occupancy counts NON-AIR cells, but the world hash also covers the stain
+    // layer, so `nonAir == 0` alone cannot authorize a demotion to PT_EMPTY: a
+    // chunk can be entirely air and still carry stain, and demoting it drops
+    // hashed state silently. Establishing that used to mean reading the
+    // chunk's 16 KiB of words back with a blocking WaitIdle, PER CANDIDATE,
+    // which is why this path was capped at kMaxFreeProbesPerTick = 128 slots
+    // per tick — against a measured 1,270 allocations per tick under flight.
+    // Reclamation could not keep up by an order of magnitude, and the 128
+    // probes it did run were themselves a large part of the frame.
     //
-    // So the words decide, through the one promotion rule (§2.3). This is a
-    // blocking read, but it happens only for a slot that has ALREADY reported
-    // empty for kPageFreeTicks consecutive snapshots and is not in cpuDirty —
-    // in a settled world, zero slots per tick.
+    // sim_occupancy now folds "any cell here carries stain" into bit 31 of the
+    // occupancy word, so that question is answered from the snapshot the CPU
+    // already has — for the REJECT direction only, which is the next test.
+    //
+    // THE FLAG IS A REJECTION TEST, NEVER AN AUTHORIZATION, and the asymmetry
+    // is not fussiness. The flag rides the SNAPSHOT, which lags the GPU by the
+    // readback ring depth. Rejecting on stale data is conservative: a chunk
+    // that carried stain as of the snapshot keeps its page, and if it has since
+    // been cleaned a later snapshot frees it. ACCEPTING on stale data loses
+    // voxels — a chunk stained since the snapshot still reads clean, and
+    // freeing it drops hashed state. Measured directly: trusting the flag to
+    // authorize a free took the streaming gate from 217 to 240 page faults.
+    // The live words keep the final say, through probeChunk_ below.
+    if (haveStainFlags && occStain[s] != 0) { zeroStreak_[s] = 0; continue; }
+    // THE PER-TICK CAP IS GONE, and that is the actual fix for the leak.
+    //
+    // It bounded RECLAMATION while nothing bounded ALLOCATION: measured under
+    // flight, 1,270 pages allocated per tick against 128 reclaimed, so the pool
+    // lost ~1,140 every tick until it either exhausted (pre-JITTER, a fatal
+    // abort) or degraded paged play to a p50 of 99 ms against dense's 16 ms. A
+    // reclaim path that cannot outrun its allocator is a leak with extra steps.
+    //
+    // What made the cap necessary was the COST of a probe, and the stain test
+    // above has already removed most probes before they are queued. What is
+    // left is slots that are quiet, out of cpuDirty, and stainless as of the
+    // last snapshot — in a settled world, none at all.
     candidates.push_back(s);
   }
 
   // Second pass: confirm each candidate is REALLY empty by reading its words.
-  // Kept out of the loop above so the readbacks are batched and so the common
-  // case — no candidates at all, which is every tick of a settled world — costs
-  // nothing beyond the increments.
+  // Kept out of the loop above so the common case — no candidates at all,
+  // which is every tick of a settled world — costs nothing beyond the
+  // increments. The stain flag has already rejected the chunks it can; these
+  // are the ones only the live words can decide.
   for (uint32_t s : candidates) {
     if (probeChunk_) {
       if (freeProbe_.size() != kChunkVol) freeProbe_.assign(kChunkVol, 0);

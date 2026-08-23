@@ -20,6 +20,18 @@
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgBlock : atomic<u32>;
 var<workgroup> wgHash  : atomic<u32>;
+// "Any cell in this chunk carries STAIN bits" — bit 31 of the occupancy word
+// (packOccStain in common.wgsl). Accumulated as an OR, expressed as an atomic
+// max so it needs no separate reduction: any thread that saw stain stores 1.
+//
+// This is what makes a page reclaimable WITHOUT a readback. It must be counted
+// OUTSIDE the `m != MAT_AIR` branch that guards the count/blocker/hash
+// accumulation, because stain on an AIR cell is exactly the case that matters:
+// an all-air chunk that still carries stain is hashed state and MUST NOT be
+// demoted to PT_EMPTY. Folding it into the non-air branch would report those
+// chunks as clean and silently drop the stain — the failure this bit exists to
+// prevent.
+var<workgroup> wgStain : atomic<u32>;
 
 // mainDirty: occupancy update over only the chunks written this tick
 // (indirect over the compacted dirtyOut list) — the per-tick sim cost stays
@@ -31,6 +43,7 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
   if (li == 0u) {
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
+    atomicStore(&wgStain, 0u);
   }
   workgroupBarrier();
 
@@ -58,9 +71,14 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
   let base = select(e * CHUNK_VOL, 0u, sentinel);
   var count = 0u;
   var block = 0u;
+  var stain = 0u;
   if (!sentinel) {
     for (var i = li; i < CHUNK_VOL; i += 64u) {
-      let m = voxels[base + i] & 0xFFFu;
+      let w = voxels[base + i];
+      // OUTSIDE the non-air test on purpose: stain on an air cell is the whole
+      // point (see the wgStain note above).
+      if ((w & STAIN_BITS) != 0u) { stain = 1u; }
+      let m = w & 0xFFFu;
       if (m != MAT_AIR) {
         count += 1u;
         if (isRayBlocker(materials[m])) { block += 1u; }
@@ -69,6 +87,7 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
   }
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
+  atomicMax(&wgStain, stain);
   workgroupBarrier();
 
   if (li == 0u) {
@@ -79,6 +98,11 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
       // non-air cells and ray blockers, both material-only decisions. Do not
       // "fix" this to be positional — it would cost 4,096 hash evaluations to
       // compute a value that cannot change.
+      // A sentinel carries NO stain by construction: synthWord builds a word
+      // from a material and (for JITTER) a state nibble, and neither form has
+      // stain bits. So the stain flag is 0 here, which is also what keeps the
+      // demote/rematerialize round trip stable — a chunk demoted BECAUSE it
+      // was stainless must not come back claiming stain.
       let m = synthWord(e) & 0xFFFu;
       if (m == MAT_AIR) {
         occupancy[slot] = packOcc(0u, 0u);
@@ -87,7 +111,8 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
             select(0u, CHUNK_VOL, isRayBlocker(materials[m])));
       }
     } else {
-      occupancy[slot] = packOcc(atomicLoad(&wgCount), atomicLoad(&wgBlock));
+      occupancy[slot] = packOccStain(atomicLoad(&wgCount), atomicLoad(&wgBlock),
+                                     atomicLoad(&wgStain) != 0u);
     }
   }
 }
@@ -96,6 +121,7 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
   if (li == 0u) {
+    atomicStore(&wgStain, 0u);
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgHash, 0u);
@@ -162,6 +188,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let hashBase = wg.x * CHUNK_VOL;   // SLOT index — what the hash keys on
   var count = 0u;
   var block = 0u;
+  var stain = 0u;
   var h = 0u;
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     // What counts as "state identity" for the determinism hash: material +
@@ -179,6 +206,9 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     // transient CELLOP_IF_AIR message flag and is never stored.
     let w = voxels[loadBase + i];
     let v = (w & 0xFFFFu) | ((w & STAIN_BITS) >> 8u);
+    // OUTSIDE the non-air branch below, deliberately: an all-air chunk that
+    // still carries stain is hashed state and must keep its page (see wgStain).
+    if ((w & STAIN_BITS) != 0u) { stain = 1u; }
     let m = v & 0xFFFu;
     if (m != MAT_AIR) {
       count += 1u;
@@ -190,11 +220,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
+  atomicMax(&wgStain, stain);
   if (T.hashEnable != 0u) { atomicAdd(&wgHash, h); }
   workgroupBarrier();
 
   if (li == 0u) {
-    occupancy[wg.x] = packOcc(atomicLoad(&wgCount), atomicLoad(&wgBlock));
+    occupancy[wg.x] = packOccStain(atomicLoad(&wgCount), atomicLoad(&wgBlock),
+                                   atomicLoad(&wgStain) != 0u);
     if (T.hashEnable != 0u) {
       atomicAdd(&worldHash[0], atomicLoad(&wgHash));
     }

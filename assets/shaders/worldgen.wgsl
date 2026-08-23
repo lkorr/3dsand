@@ -2609,7 +2609,13 @@ fn genChunk(slot : u32, li : u32) {
 
   if (li == 0u) {
     let n = atomicLoad(&wgCount);
-    // in-kernel so the renderer never sees a stale 0
+    // in-kernel so the renderer never sees a stale 0.
+    //
+    // packOcc, not packOccStain, and that is correct rather than an omission:
+    // worldgen writes no stain bits at all, so a freshly generated chunk is
+    // stainless by construction and bit 31 must read 0. The page-table free
+    // path relies on exactly that — a generated sky chunk has to be demotable
+    // on sight, without a readback.
     occupancy[slot] = packOcc(n, atomicLoad(&wgBlock));
     if (n > 0u) {          // wake once; loose material settles, then sleeps
       atomicStore(&dirtyIn[slot], 1u);

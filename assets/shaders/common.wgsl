@@ -854,9 +854,33 @@ fn isRayBlocker(m : Material) -> bool {
   return m.klass == CLASS_SOLID || m.klass == CLASS_POWDER ||
          (m.klass == CLASS_LIQUID && (m.flags & MATF_OPAQUE) != 0u);
 }
+// OCCUPANCY WORD: [31] anyStain | [30..16] rayBlockers | [15..0] nonAir count.
+//
+// Both counts are bounded by CHUNK_VOL = 4,096, so each needs 13 bits and bit
+// 31 was dead space. It now carries "some cell in this chunk has STAIN bits
+// set", which is what lets the page-table free path decide from the snapshot
+// the CPU ALREADY HAS instead of reading the chunk's 16 KiB of words back.
+//
+// Why the free path needs it at all: occupancy counts NON-AIR cells, but the
+// determinism hash also covers the stain layer (bits 24..30 of a voxel word).
+// A chunk can be entirely air and still carry stain — blood on a floor that
+// then eroded, a bank that water soaked before evaporating — so `nonAir == 0`
+// alone is NOT enough to demote a page to PT_EMPTY; doing that silently drops
+// hashed state (gotcha-save-format-drops-stain, in a new place). Confirming
+// that used to cost a blocking WaitIdle + 16 KiB readback PER CANDIDATE, which
+// is why reclamation was capped at 128 chunks/tick against an allocation rate
+// measured at 1,270/tick. With the answer folded in here it is one bit test.
+//
+// occBlockers MASKS to 15 bits: it used to be a bare `>> 16`, which would now
+// read the stain flag as a blocker count of 32,768 and make every stained
+// chunk fully opaque to the raymarcher's chunk-skip test.
 fn occTotal(occ : u32) -> u32 { return occ & 0xFFFFu; }
-fn occBlockers(occ : u32) -> u32 { return occ >> 16u; }
+fn occBlockers(occ : u32) -> u32 { return (occ >> 16u) & 0x7FFFu; }
+fn occAnyStain(occ : u32) -> bool { return (occ & 0x80000000u) != 0u; }
 fn packOcc(total : u32, blockers : u32) -> u32 { return total | (blockers << 16u); }
+fn packOccStain(total : u32, blockers : u32, anyStain : bool) -> u32 {
+  return total | (blockers << 16u) | select(0u, 0x80000000u, anyStain);
+}
 
 // Voxel word: bits 0..11 material, 12..15 state, 16..18 tick-stamp,
 //             19..23 FREE, 24..27 stain amount, 28..30 stain type,

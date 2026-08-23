@@ -252,7 +252,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Both steps read data the CPU already has: the occupancy the snapshot
   // already carries, and a tick counter. No new readback, no new scan.
-  if (world.Snap().valid) pt.ConsumeOccupancy(world.Snap().occupancy, tick);
+  if (world.Snap().valid)
+    pt.ConsumeOccupancy(world.Snap().occupancy, world.Snap().occStain, tick);
   pt.RetirePages(tick);
 
   // ---- the §3.4 settled-skip latch ----------------------------------------

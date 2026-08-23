@@ -716,6 +716,13 @@ struct WorldSnapshot {
   // One-shot: the GPU buffer is cleared after each copy. Feeds island checks.
   std::vector<uint8_t> supportFlags;
   std::vector<uint32_t> occupancy;    // per-slot non-air counts (streaming evict)
+  // Per-slot "this chunk carries stain bits", bit 31 of the GPU occupancy word
+  // (packOccStain, common.wgsl). Separate from `occupancy` so existing readers
+  // of that array keep seeing a plain count. This is what lets the page-table
+  // free path demote WITHOUT reading the chunk's words back: occupancy alone
+  // cannot answer it, because a chunk can be all air and still carry hashed
+  // stain state.
+  std::vector<uint8_t> occStain;
   // Page faults since process start — voxStore()'s sentinel no-op path
   // (PLAN_page_table.md §2.4). MONOTONIC and never cleared: a non-zero value is
   // a permanent "this build has a bug" latch. Every gate asserts it is zero,

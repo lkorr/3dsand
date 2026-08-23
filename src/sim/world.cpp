@@ -136,6 +136,7 @@ void World::Init(const rhi::Device& device) {
   snap_.dirtyFlags.assign(kNumChunks, 0);
   snap_.supportFlags.assign(kNumChunks, 0);
   snap_.occupancy.assign(kNumChunks, 0);
+  snap_.occStain.assign(kNumChunks, 0);
 }
 
 void World::RequestChunkFetch(IVec3 worldChunk) {
@@ -312,9 +313,15 @@ void World::KickReadback() {
             for (uint32_t i = 0; i < kNumChunks; i++) {
               snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
               active += snap_.dirtyFlags[i];
-              // GPU word packs (blockers << 16) | nonAir; CPU consumers
-              // (streaming evict, voxelTotal) want the non-air count
+              // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
+              // nonAir (packOccStain, common.wgsl). Existing CPU consumers
+              // (streaming evict, voxelTotal) want the non-air COUNT, so that
+              // stays the stored value — but the STAIN FLAG is carried across
+              // in its own array rather than masked away, because the page
+              // table's free path needs it and reading it back per candidate
+              // was costing a blocking WaitIdle + 16 KiB per chunk.
               snap_.occupancy[i] = occW[i] & 0xFFFFu;
+              snap_.occStain[i] = (occW[i] >> 31) & 1u;
               total += occW[i] & 0xFFFFu;
             }
             snap_.activeChunks = active;

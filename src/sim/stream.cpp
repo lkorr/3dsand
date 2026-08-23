@@ -392,14 +392,23 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // NEIGHBOURS away and the CA frontier a stream-in creates would be
       // invisible to the mirror.
       world_->pages->RefilledSlot(s);
-      uint32_t occ = 0, blockers = 0;
+      uint32_t occ = 0, blockers = 0, anyStain = 0;
       for (uint32_t w : data) {
+        // OUTSIDE the air test, like sim_occupancy: a restored chunk can be
+        // entirely air and still carry stain, and that chunk must NOT be
+        // demotable. This path decodes REAL SAVED WORLDS, so unlike worldgen
+        // it genuinely can produce stain — getting this wrong would let the
+        // free path drop a stained chunk's page and lose hashed state on the
+        // first reload of a world that had ever bled or been soaked.
+        if ((w & kStainBits) != 0u) anyStain = 1;
         uint32_t m = w & 0xFFFu;
         if (m == 0) continue;
         occ++;
         if (m < blockerOf_.size() && blockerOf_[m]) blockers++;
       }
-      occ |= blockers << 16;  // packing per common.wgsl packOcc
+      // packing per common.wgsl packOccStain
+      occ |= blockers << 16;
+      occ |= anyStain << 31;
       ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
       // wake once: neighbors may have changed since this chunk was saved
       ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
@@ -509,6 +518,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // read, never what the rule is (PageTable::Classify stays the one
       // promotion rule, §2.3). Measured on a shift plane: ~1,024 candidates
       // down to the ~350 that actually demote.
+      // A failed read assigns all zeros, which is the CONSERVATIVE direction
+      // here and only here: a zeroed entry fails the `nonAir != 0` test below,
+      // so every slot falls through into `paged` and gets its words read. The
+      // prefilter degrades to "test everything", never to "demote everything".
       std::vector<uint32_t> occ(kNumChunks);
       if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->occupancy, 0,
                                  occ.data(), (size_t)kNumChunks * 4, "genOcc"))
@@ -516,6 +529,45 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
 
       // Collect the candidates: a sentinel slot has nothing to read and is
       // already in its demoted form; a PARTIALLY-full slot cannot demote.
+      // ---- ALL-AIR DEMOTES WITHOUT READING ANY WORDS ----------------------
+      //
+      // The occupancy word now carries "this chunk has stain" in bit 31
+      // (packOccStain), which was the only thing `nonAir == 0` could not
+      // establish on its own. An all-air, stainless chunk is by definition
+      // PT_EMPTY's content, so it can be demoted straight from the occupancy
+      // read we already did — no voxel copy, no map, no wait.
+      //
+      // That matters because this is the COMMON case by a wide margin: a shift
+      // plane is mostly sky, and every one of those slots was allocated a page
+      // by EnsurePageForOverwrite just above (genChunk cannot allocate), so
+      // without this they all round-trip allocate -> fill -> read back 16 KiB
+      // -> demote, every shift. Measured on the adversarial descent: ovr=1,024
+      // allocations per tick, the entire plane.
+      //
+      // The FULL case (nonAir == CHUNK_VOL -> UNIFORM or JITTER) still needs
+      // the words: those sentinels must reproduce the resident content
+      // bit-exactly, which is Classify's exact-word rule and not something an
+      // occupancy count can decide.
+      // WHY THIS IS STILL A READBACK, having just added a stain bit that looks
+      // like it should remove one.
+      //
+      // The tempting move is to demote `nonAir == 0 && !anyStain` straight from
+      // the occupancy word, skipping the voxel copy for the ~85% of a shift
+      // plane that generates as sky. It was tried and it LOSES VOXELS: the
+      // streaming gate went 217 -> 240 page faults. Occupancy answers "how many
+      // non-air cells" and now "any stain", but Classify's demote test is
+      // kAirDemoteMask, which ALSO covers bit 31 (kCellOpIfAir) — a transient
+      // "CPU write in flight" flag that occupancy does not and cannot report.
+      // A chunk with a pending op reads as empty by count and is not empty.
+      //
+      // The occupancy prefilter therefore stays what it was: a way to narrow
+      // WHICH chunks are read, never a substitute for reading them. The words
+      // keep deciding, through the one promotion rule (§2.3).
+      //
+      // The stain bit still pays for itself where it CAN be trusted, on the
+      // tick path in PageTable::ConsumeOccupancy: that path already required
+      // the slot to be out of cpuDirty and quiet for kPageFreeTicks, which is
+      // exactly the condition an in-flight op violates.
       std::vector<uint32_t> paged;
       paged.reserve(genSlots.size());
       for (uint32_t gs : genSlots) {

@@ -266,7 +266,13 @@ class PageTable {
   // writes it puts it in cpuDirty. The staleness of occTotal is covered by the
   // FRESHNESS of cpuDirty, not by luck — which is why cpuDirty must be the
   // conservative mirror and not the snapshot's own dirty flags.
-  void ConsumeOccupancy(const std::vector<uint32_t>& occupancy, uint32_t tick);
+  // `occStain` is the per-slot "chunk carries stain bits" flag from the same
+  // snapshot (WorldSnapshot::occStain, bit 31 of the GPU occupancy word). With
+  // it, a demotion is decided entirely from data the CPU already holds. Pass an
+  // empty vector to fall back to the blocking word probe — same decision, same
+  // result, just capped and slow. Correctness does not depend on it; rate does.
+  void ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
+                        const std::vector<uint8_t>& occStain, uint32_t tick);
 
   // How ConsumeOccupancy CONFIRMS a candidate is really empty before freeing
   // its page. `occTotal == 0` is not sufficient: occupancy counts NON-AIR
@@ -388,6 +394,20 @@ class PageTable {
   static constexpr uint8_t kPageFreeTicks = 8;   // ~a quarter second at 30 Hz
   // Free-probe budget per tick: each probe is a blocking WaitIdle + 16 KiB
   // readback, so mass-demotion events must drain over ticks, not stall one.
+  //
+  // NO LONGER ON THE NORMAL PATH. The occupancy word now carries "this chunk
+  // carries stain" in bit 31 (packOccStain), which was the ONLY question the
+  // probe existed to answer, so a snapshot with stain flags decides every
+  // eligible slot per tick with no readback and no budget. This cap now bounds
+  // only the FALLBACK — a caller that passes no stain flags — and is kept so
+  // that path behaves exactly as it did before.
+  //
+  // It is worth stating why the cap was harmful rather than merely slow: it
+  // bounded RECLAMATION while nothing bounded ALLOCATION. Measured under
+  // flight, allocation ran at 1,270 pages/tick against this 128, so the pool
+  // lost ~1,140 pages every tick and paged play degraded to a p50 of 99 ms
+  // against dense's 16 ms. A reclaim path must be able to outrun its
+  // allocator; one that cannot is a leak with extra steps.
   static constexpr size_t kMaxFreeProbesPerTick = 128;
 
   // THE RETIRE QUEUE (risk 5). The existing code is safe against
