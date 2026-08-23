@@ -73,6 +73,12 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
 
   if (li == 0u) {
     if (sentinel) {
+      // synthWord, NOT synthWordAt, and that is correct for JITTER too: this
+      // path reads only the MATERIAL, which a JITTER sentinel holds uniformly
+      // (it varies the state nibble and nothing else). Occupancy counts
+      // non-air cells and ray blockers, both material-only decisions. Do not
+      // "fix" this to be positional — it would cost 4,096 hash evaluations to
+      // compute a value that cannot change.
       let m = synthWord(e) & 0xFFFu;
       if (m == MAT_AIR) {
         occupancy[slot] = packOcc(0u, 0u);
@@ -114,11 +120,26 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     // word comes from synthWord instead of memory. Spread across all 64
     // threads exactly as the dense loop does — there is no reason to
     // serialize it, and it saves the 16 KiB of traffic, not the ALU.
-    let sv = (sw & 0xFFFFu) | ((sw & STAIN_BITS) >> 8u);
+    //
+    // JITTER: identical in shape, but the word varies per cell, so `sv` moves
+    // INSIDE the loop and comes from synthWordAt at that cell's world
+    // position. The hash still keys on the SLOT base (§4.1, review M3) —
+    // only the VALUE is positional, never the key. Splitting the loop rather
+    // than branching per iteration keeps the uniform case exactly as cheap as
+    // it was.
     let sHashBase = wg.x * CHUNK_VOL;          // SLOT index — the hash key
     var sh = 0u;
-    for (var i = li; i < CHUNK_VOL; i += 64u) {
-      sh += pcg((sHashBase + i) ^ (sv * 0x9E3779B9u));
+    if ((e & PT_JITTER_BIT) != 0u) {
+      for (var i = li; i < CHUNK_VOL; i += 64u) {
+        let jw = synthWordAt(e, worldCellOfSlotLocal(wg.x, i), T.seed);
+        let jv = (jw & 0xFFFFu) | ((jw & STAIN_BITS) >> 8u);
+        sh += pcg((sHashBase + i) ^ (jv * 0x9E3779B9u));
+      }
+    } else {
+      let sv = (sw & 0xFFFFu) | ((sw & STAIN_BITS) >> 8u);
+      for (var i = li; i < CHUNK_VOL; i += 64u) {
+        sh += pcg((sHashBase + i) ^ (sv * 0x9E3779B9u));
+      }
     }
     if (T.hashEnable != 0u) { atomicAdd(&wgHash, sh); }
     workgroupBarrier();

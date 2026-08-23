@@ -87,6 +87,7 @@ def read(p):
 PIPE_TO_MEMBER = {
     "PIPE_WORLDGEN": "worldgen_",
     "PIPE_WORLDGEN_LIST": "worldgenList_",
+    "PIPE_PAGEFILL": "pageFill_",
     "PIPE_MUTATE": "mutate_",
     "PIPE_MUTATE_CELLS": "mutateCells_",
     "PIPE_COMPACT": "compact_",
@@ -138,6 +139,7 @@ BUF_TO_WGSL = {
     "CellOps": {"cellOps"},
     "Support": {"supportOut"},
     "GenList": {"genList"},
+    "PageFillList": {"pageFillList"},
     "ParticlesRead": {"pRead", "pReadBuf"},
     "ParticlesWrite": {"pWrite"},
     "ParticleCounts": {"counts"},
@@ -184,7 +186,7 @@ WRITE_ACCS = {"W", "RW", "A", "TW"}
 _SIM_GROUP0 = {
     "voxels", "dirtyIn", "dirtyOut", "materials", "T", "P", "ops", "occupancy",
     "worldHash", "pick", "R", "reactions", "dirtyList", "args", "cellOps",
-    "supportOut", "genList", "pageTable", "pageFaults",
+    "supportOut", "genList", "pageFillList", "pageTable", "pageFaults",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

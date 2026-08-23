@@ -56,6 +56,13 @@ void DilateN26(const SlotSet& in, SlotSet& out) {
 void PageTable::Init(const rhi::Device& device, World& world) {
   world_ = &world;
   paged_ = world.residency == World::Residency::Paged;
+  // SANDVOX_NO_JITTER=1 turns JITTER promotion off, which makes Classify behave
+  // exactly as it did before the sentinel existed. That is the differential
+  // oracle for the feature: paged-with-JITTER must hash identically to
+  // paged-without, because a sentinel is a storage decision and storage cannot
+  // change the world.
+  if (const char* nj = getenv("SANDVOX_NO_JITTER"))
+    jitterEnabled_ = !(nj[0] == '1');
   poolPages_ = world.PoolPages();
   tableDirtyMark_.assign(kNumChunks, 0);
   ResetIdentity(device.GetQueue());
@@ -95,6 +102,7 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   settleAnchor_ = -1;
   cRing_.clear();
   pendingFills_.clear();
+  pendingJitterFills_.clear();
   retire_.clear();
   zeroStreak_.assign(kNumChunks, 0);
 }
@@ -148,6 +156,7 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   settleAnchor_ = -1;
   cRing_.clear();
   pendingFills_.clear();
+  pendingJitterFills_.clear();
   retire_.clear();
   zeroStreak_.assign(kNumChunks, 0);
 }
@@ -220,7 +229,7 @@ uint64_t PageTable::EnsurePageForOverwrite(uint32_t slot) {
 // of this mask would be a "two places must agree" bug in waiting.
 constexpr uint32_t kAirDemoteMask = 0xFF000FFFu;  // material | stain | bit31
 
-uint32_t PageTable::Classify(const uint32_t* words) {
+uint32_t PageTable::Classify(uint32_t slot, const uint32_t* words) const {
   // EMPTY first, by STAINLESS-AIR masking rather than exact zeros: material
   // must be air and stain/bit31 clear in every cell, while the state nibble
   // (12..15) and the stamp byte (16..23) are ignored — they are audited
@@ -249,15 +258,67 @@ uint32_t PageTable::Classify(const uint32_t* words) {
   // chunks of 32,768 are whole-word uniform, against 2,115 that are one
   // material with mixed state.
   const uint32_t w0 = words[0];
+  bool allSame = true;
   for (uint32_t i = 1; i < kChunkVol; i++)
-    if (words[i] != w0) return kNeedsPage;
-  // Only promote to UNIFORM when the word is EXACTLY what synthWord would
-  // produce for it. A chunk of one word that carries a live tick stamp or a
-  // stain cannot round-trip through a 12-bit sentinel, and promoting it would
-  // silently rewrite those bits.
+    if (words[i] != w0) { allSame = false; break; }
+  if (allSame) {
+    // Only promote to UNIFORM when the word is EXACTLY what synthWord would
+    // produce for it. A chunk of one word that carries a live tick stamp or a
+    // stain cannot round-trip through a 12-bit sentinel, and promoting it would
+    // silently rewrite those bits.
+    const uint32_t mat = w0 & kPtMatMask;
+    const uint32_t entry = kPtSentinelBit | mat;
+    if (SynthWord(entry) == w0) return entry;
+    return kNeedsPage;
+  }
+  // ---- JITTER: one material, worldgen's per-cell palette variant ----------
+  // The chunk is not single-word, which is the common case underground: every
+  // solid cell carries `hash3(...) % 3` in its state nibble. If EVERY cell is
+  // the same material AND its word is exactly what a JITTER sentinel would
+  // synthesize at that cell's world position, the whole 16 KiB page is
+  // describable by 4 bytes plus the formula.
+  //
+  // This is what the phase-7 measurement was pointing at: 41 chunks are
+  // whole-word uniform against 2,115 that are one material with mixed state,
+  // and the 2,115 are the buried bulk the player never touches.
+  //
+  // THE COMPARISON IS EXACT, INCLUDING THE TICK STAMP — and the stamp is the
+  // subtle one, so it is spelled out here.
+  //
+  // A JITTER sentinel synthesizes kStampNever for every cell. sim_step's
+  // "already acted this substep" gate (sim_step.wgsl:802,
+  // `voxStamp(w) == stampFor(...)`) reads that stamp, so a chunk promoted while
+  // ANY of its cells carried a live stamp would come back with that stamp
+  // erased, and those cells would be free to act a second time in the same
+  // substep. Measured: it moved the determinism hash with no other symptom.
+  //
+  // This is the opposite of the EMPTY rule's kAirDemoteMask, and deliberately
+  // so: that mask ignores the stamp because it only ever applies to AIR cells,
+  // whose act is a no-op either way. These cells are SOLID and act, so the
+  // stamp is behaviour, not a passenger bit. Do not "unify" the two masks.
+  //
+  // Practically this costs nothing: a settled buried chunk carries
+  // kStampNever everywhere, which is exactly what worldgen wrote and what
+  // SynthWordAt reproduces. A chunk the CA has just swept is refused for a few
+  // ticks and promotes once it settles — which is the correct behaviour, since
+  // an actively simulating chunk is not one to compress.
+  //
+  // Needs the WORLD position of the chunk, which a slot index alone does not
+  // give (the window is toroidal) — hence the world_ lookup.
+  if (!jitterEnabled_) return kNeedsPage;
   const uint32_t mat = w0 & kPtMatMask;
-  const uint32_t entry = kPtSentinelBit | mat;
-  if (SynthWord(entry) != w0) return kNeedsPage;
+  if (mat == kMatAir) return kNeedsPage;   // air is EMPTY's business
+  const uint32_t entry = kPtSentinelBit | kPtJitterBit | mat;
+  const IVec3 wc = world_->SlotToWorldChunk(slot);
+  const IVec3 base{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
+  for (uint32_t i = 0; i < kChunkVol; i++) {
+    const int lx = (int)(i % kChunk);
+    const int ly = (int)((i / kChunk) % kChunk);
+    const int lz = (int)(i / (kChunk * kChunk));
+    if (SynthWordAt(entry, base.x + lx, base.y + ly, base.z + lz, seed_) !=
+        words[i])
+      return kNeedsPage;
+  }
   return entry;
 }
 
@@ -694,7 +755,16 @@ void PageTable::Materialize(const rhi::Queue& queue) {
     // synthWords) are ONE fill command each — UNIFORM costs exactly what EMPTY
     // costs, which is a small real argument for the sentinel design over
     // hardware sparse, which can only produce zeros (§3.7).
-    pendingFills_.push_back({page, SynthWord(e)});
+    //
+    // JITTER is the exception and the reason DrainFills has two halves: its
+    // words vary per cell, so no 32-bit pattern describes them and the page is
+    // filled by the `pagefill` dispatch instead. The SLOT and the ENTRY both
+    // travel, because the table row is about to be overwritten with the page.
+    if ((e & kPtJitterBit) != 0u) {
+      pendingJitterFills_.push_back({s, e});
+    } else {
+      pendingFills_.push_back({page, SynthWord(e)});
+    }
     t[s] = page;
     MarkTableDirty(s);
   }
@@ -865,6 +935,27 @@ void PageTable::FlushTableWrites(const rhi::Queue& queue) {
   }
   for (uint32_t s : tableDirty_) tableDirtyMark_[s] = 0;
   tableDirty_.clear();
+}
+
+// The JITTER half: upload this tick's (slot, entry) pairs into genList and
+// return how many there are, so the caller can record the `pagefill` dispatch.
+// Split from DrainFills because it needs the QUEUE (a buffer write) while the
+// fill half needs only the encoder, and because the dispatch must be recorded
+// through Simulation's pass table rather than as a raw command.
+uint32_t PageTable::UploadJitterFills(const rhi::Queue& queue) {
+  if (pendingJitterFills_.empty()) return 0;
+  jitterUpload_.clear();
+  jitterUpload_.reserve(pendingJitterFills_.size() * 2);
+  for (const PendingJitterFill& f : pendingJitterFills_) {
+    jitterUpload_.push_back(f.slot);
+    jitterUpload_.push_back(f.entry);
+  }
+  const uint32_t count = (uint32_t)pendingJitterFills_.size();
+  queue.WriteBuffer(world_->pageFillList, 0, jitterUpload_.data(),
+                    jitterUpload_.size() * 4);
+  jitterFillsIssued_ += count;
+  pendingJitterFills_.clear();
+  return count;
 }
 
 void PageTable::DrainFills(const rhi::CommandEncoder& enc) {

@@ -108,6 +108,14 @@ void World::Init(const rhi::Device& device) {
   bodyXforms = CreateBuffer(device, (uint64_t)kMaxBodySlots * 32,
                             U::Storage | U::CopyDst, "bodyXforms");
   genList = CreateBuffer(device, kNumChunks * 4, U::Storage | U::CopyDst, "genList");
+  // JITTER page materialization gets its OWN list, deliberately NOT genList.
+  // Two u32 per entry (slot, sentinel entry) against genList's one, and — the
+  // reason it cannot be shared — Stream::FillSlots writes genList MID-FRAME
+  // while a page fill drains at the head of the next command buffer, so the two
+  // deferred writes interleave. Sharing produced a stale-list read that
+  // diverged the world hash only after a window shift (loud smoke ticks 86/88).
+  pageFillList = CreateBuffer(device, (uint64_t)kNumChunks * 8,
+                              U::Storage | U::CopyDst, "pageFillList");
 
   // Far-field cascades (render-only LOD). Zero-initialized = air, so unfilled
   // regions render as sky, never garbage.
@@ -267,12 +275,33 @@ void World::KickReadback() {
             // now, through the SAME rule the shader uses. SynthWord (world.h)
             // and synthWord (common.wgsl) are the two halves of one contract —
             // the page-roundtrip gate asserts they agree.
+            //
+            // A JITTER sentinel is POSITIONAL, so its cells cannot be one
+            // repeated word: each takes the palette variant for its own world
+            // coordinate. The mirror knows the world chunk of every one of its
+            // 27 slots from sl.base, which is what makes that reconstructible
+            // here. Getting this wrong would be invisible to the world hash and
+            // would show up only as the player colliding with the wrong thing —
+            // the mirror is CPU-only collision data.
             for (size_t m = 0; m < sl.mirrorSentinel.size(); m++) {
               const uint32_t e = sl.mirrorSentinel[m];
               if (e == 0u) continue;  // a real copy landed for this cell
-              const uint32_t w = SynthWord(e);
               uint32_t* dst = snap_.mirror.data() + m * kChunkVol;
-              for (uint32_t i = 0; i < kChunkVol; i++) dst[i] = w;
+              const int mx = (int)(m % 3), my = (int)((m / 3) % 3),
+                        mz = (int)(m / 9);
+              const IVec3 wc{sl.base.x + mx, sl.base.y + my, sl.base.z + mz};
+              if ((e & kPtJitterBit) == 0u) {
+                const uint32_t w = SynthWord(e);
+                for (uint32_t i = 0; i < kChunkVol; i++) dst[i] = w;
+              } else {
+                const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                          bz = wc.z * (int)kChunk;
+                for (uint32_t i = 0; i < kChunkVol; i++)
+                  dst[i] = SynthWordAt(e, bx + (int)(i % kChunk),
+                                       by + (int)((i / kChunk) % kChunk),
+                                       bz + (int)(i / (kChunk * kChunk)),
+                                       mirrorSeed_);
+              }
             }
             snap_.mirrorBase = sl.base;
             snap_.windowOrigin = sl.origin;
@@ -312,7 +341,18 @@ void World::KickReadback() {
                 const uint32_t e =
                     i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
                 if (e != 0u) {
-                  cc.voxels.assign(kChunkVol, SynthWord(e));  // §2.1a
+                  cc.voxels.assign(kChunkVol, 0u);  // §2.1a
+                  const IVec3 wc = sl.fetchIds[i];
+                  const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                            bz = wc.z * (int)kChunk;
+                  // Positional for JITTER, one repeated word otherwise —
+                  // SynthWordAt collapses to SynthWord when the bit is clear,
+                  // so this one loop is correct for every sentinel form.
+                  for (uint32_t k = 0; k < kChunkVol; k++)
+                    cc.voxels[k] = SynthWordAt(
+                        e, bx + (int)(k % kChunk),
+                        by + (int)((k / kChunk) % kChunk),
+                        bz + (int)(k / (kChunk * kChunk)), mirrorSeed_);
                 } else {
                   cc.voxels.assign(
                       (const uint32_t*)(p + kFetchOff + i * kChunkBytes),

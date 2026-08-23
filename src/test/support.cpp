@@ -273,6 +273,15 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     if (sn.valid) sim.NoteSnapshot(sn.tick, sn.activeChunks);
   }
 
+  // THE genList UPLOAD MUST HAPPEN BEFORE THE ENCODER EXISTS, and this is a
+  // trap worth stating: rhi::Queue::WriteBuffer is a DEFERRED host write
+  // (Backend::QueueWrite) that drains "at the head of the NEXT command buffer".
+  // Called after CreateCommandEncoder, the write drains into the command buffer
+  // AFTER this one, so the pageFill dispatch below read the PREVIOUS tick's
+  // genList — every JITTER page materialized as zeros and 2,114 chunks of stone
+  // silently became air.
+  const uint32_t jitterFills = pt.UploadJitterFills(ctx.queue);
+
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   // The fills go in at the HEAD of the command buffer, before any row (§5.4):
   // FillTracked declares TransferWrite on Voxels, and the first row with
@@ -280,6 +289,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // after a dispatch that reads the page is exactly the hazard this ordering
   // exists to prevent.
   pt.DrainFills(enc);
+  // The JITTER half of materialization, same position and same reason: a page
+  // whose words vary per cell cannot be a fill pattern, so it is a dispatch.
+  // Recorded BEFORE EncodeTick so the tick's first voxel read sees the filled
+  // page (the recorder derives the COMPUTE->COMPUTE barrier from the W(Voxels)
+  // in the pageFill row against the tick's first RW(Voxels)).
+  sim.EncodePageFill(enc, jitterFills);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
                  fluidBase + fluidSpawnCount, fluidSpawnCount);
@@ -452,7 +467,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       // eagerly once per batch rather than on the hysteresis cadence.
       ReadVoxelsSync(ctx, world, base, n, vox.data(), "wgClassify");
       for (uint32_t k = 0; k < n; k++) {
-        const uint32_t e = PageTable::Classify(vox.data() + (size_t)k * kChunkVol);
+        const uint32_t e =
+            world.pages->Classify(base + k, vox.data() + (size_t)k * kChunkVol);
         if (e != PageTable::kNeedsPage) world.pages->SetSentinel(base + k, e);
       }
       world.pages->FlushTableWrites(ctx.queue);
@@ -523,6 +539,17 @@ uint32_t ReadHashSync(GpuContext& ctx, World& world) {
 
 uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
   TickParams tp{0, seed, 0, 1, 0, 0, 0, 0};
+  // THE ORIGIN IS LOAD-BEARING HERE, and it was not before the JITTER sentinel
+  // existed. This standalone rehash builds a fresh TickParams, and `origin`
+  // defaults to {0,0,0} — harmless while nothing in the hash path used it.
+  // sim_occupancy's analytic sentinel branch now resolves a JITTER chunk's
+  // WORLD position from (slot, origin) to synthesize its palette variants, so a
+  // zero origin after a window shift hashes every jittered chunk at the wrong
+  // coordinates. Symptom: --vk-smoke-loud diverged at ticks 86/88 — the first
+  // two shifts — with the chunk CONTENTS provably identical (a per-chunk digest
+  // diff showed zero differing slots), because only the hash was wrong.
+  const IVec3 wo = world.WindowOrigin();
+  tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   sim.EncodeHashOnly(enc);
@@ -602,9 +629,21 @@ void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
     const uint64_t off = world.PageOffsetOfSlot(firstSlot + i);
     if (off == World::kNoPage) {
       // Sentinel: synthesize, through the same rule the shader uses.
-      const uint32_t w = SynthWord(world.PageEntryOfSlot(firstSlot + i));
+      // POSITIONAL: SynthWordAt collapses to SynthWord for EMPTY/UNIFORM, so
+      // one loop serves every sentinel form. A JITTER chunk read back through
+      // here (the worldgen compaction classifier does exactly that) must see
+      // the same words the GPU would, or classification would refuse chunks it
+      // had itself just promoted.
+      const uint32_t e = world.PageEntryOfSlot(firstSlot + i);
+      const IVec3 wc = world.SlotToWorldChunk(firstSlot + i);
+      const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                bz = wc.z * (int)kChunk;
       uint32_t* dst = out + (size_t)i * kChunkVol;
-      for (uint32_t k = 0; k < kChunkVol; k++) dst[k] = w;
+      for (uint32_t k = 0; k < kChunkVol; k++)
+        dst[k] = SynthWordAt(e, bx + (int)(k % kChunk),
+                             by + (int)((k / kChunk) % kChunk),
+                             bz + (int)(k / (kChunk * kChunk)),
+                             world.pages->WorldSeed());
       i++;
       continue;
     }

@@ -981,6 +981,39 @@ fn synthWord(entry : u32) -> u32 {
   return packVox(mat, 0u, STAMP_NEVER);
 }
 
+// ---- JITTER synthesis: the positional half of the hash contract -----------
+// A JITTER(mat) sentinel says "every cell is `mat`, stainless, STAMP_NEVER,
+// state = the worldgen palette variant for that cell's WORLD position". The
+// variant is a pure function of position and seed, so the chunk is describable
+// by 4 bytes and this formula instead of a 16 KiB page. See the JITTER block
+// in world.h for why this exists (2,115 buried chunks vs UNIFORM's 41).
+//
+// EXACT MIRROR of genCell (worldgen.wgsl) and of JitterStateFor / SynthWordAt
+// (world.h). All four must agree bit-for-bit or a materialized page differs
+// from what the sentinel read as, which is a lost voxel the hash reports one
+// tick later somewhere unrelated. The page-roundtrip gate asserts the
+// agreement rather than trusting it.
+//
+// THE SEED IS A PARAMETER here, supplied by callers from ptSeed() (see
+// voxWordAt). These two stay pure so the page-roundtrip gate can evaluate them
+// against the C++ mirror without a uniform in scope.
+fn synthJitterState(c : vec3<i32>, seed : u32) -> u32 {
+  let rnd = hash3(seed ^ 0xC0FFEEu,
+                  bitcast<u32>(c.x) ^ (bitcast<u32>(c.z) << 12u),
+                  bitcast<u32>(c.y));
+  return rnd % 3u;
+}
+
+// The word the cell at WORLD position `c` reads as under sentinel `entry`.
+// Falls through to synthWord for EMPTY and plain UNIFORM, so this is the one
+// synthesis entry point every positional reader wants.
+fn synthWordAt(entry : u32, c : vec3<i32>, seed : u32) -> u32 {
+  let mat = entry & PT_MAT_MASK;
+  if (mat == MAT_AIR) { return 0u; }
+  if ((entry & PT_JITTER_BIT) == 0u) { return packVox(mat, 0u, STAMP_NEVER); }
+  return packVox(mat, synthJitterState(c, seed), STAMP_NEVER);
+}
+
 // The table entry for a slot chunk index. The three chunk-linear paths resolve
 // once with this and index their page directly, which is what they want anyway.
 fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
@@ -989,10 +1022,16 @@ fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
 // Callers must have checked inWindow() first — that test is unchanged and
 // still the outer guard. A sentinel is a statement about a RESIDENT chunk's
 // contents; out-of-window is a statement about residency. Two different tests.
+// The JITTER sentinel needs the world seed to synthesize a cell's palette
+// variant. It comes from ptSeed(), a one-line accessor GENERATED per shader by
+// LoadShader (gpu/resources.cpp) because the uniform holding the seed is named
+// `T` in a sim kernel and `R` in the renderer, and common.wgsl is prepended
+// before either is declared. Generating the accessor keeps all 46 voxWordAt
+// call sites unchanged and keeps the seed out of every signature.
 fn voxWordAt(c : vec3<i32>) -> u32 {
   let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
   let e = pageTable[chunkIndexOf(s)];
-  if ((e & PT_SENTINEL_BIT) != 0u) { return synthWord(e); }
+  if ((e & PT_SENTINEL_BIT) != 0u) { return synthWordAt(e, c, ptSeed()); }
   let lo = s % CHUNK;
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
 }
@@ -1027,9 +1066,32 @@ fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
 // The chunk-linear READ: the word at (chunkSlot, localIdx), synthesized when
 // the chunk is a sentinel. A branch rather than a select, because select
 // evaluates both arms and voxels[PT_NO_WORD] is an out-of-bounds subscript.
+// A JITTER sentinel's word depends on the cell's WORLD position, and a slot
+// index is not one: the residency window is toroidal, so recovering the world
+// chunk needs the window origin (ptOrigin(), generated next to ptSeed()). This
+// is the one place where "slot index" and "world position" genuinely differ and
+// the difference is load-bearing — using the slot directly would give every
+// chunk in the window the variant pattern of whichever world chunk last
+// occupied that slot.
+fn worldCellOfSlotLocal(chunkSlot : u32, localIdx : u32) -> vec3<i32> {
+  let sc = vec3<i32>(i32(chunkSlot % NCHUNK),
+                     i32((chunkSlot / NCHUNK) % NCHUNK),
+                     i32(chunkSlot / (NCHUNK * NCHUNK)));
+  let wc = slotToWorldChunk(sc, ptOrigin());
+  let lo = vec3<i32>(i32(localIdx % CHUNK),
+                     i32((localIdx / CHUNK) % CHUNK),
+                     i32(localIdx / (CHUNK * CHUNK)));
+  return wc * i32(CHUNK) + lo;
+}
+
 fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
   let e = pageTable[chunkSlot];
-  if ((e & PT_SENTINEL_BIT) != 0u) { return synthWord(e); }
+  if ((e & PT_SENTINEL_BIT) != 0u) {
+    if ((e & PT_JITTER_BIT) != 0u) {
+      return synthWordAt(e, worldCellOfSlotLocal(chunkSlot, localIdx), ptSeed());
+    }
+    return synthWord(e);
+  }
   return voxels[e * CHUNK_VOL + localIdx];
 }
 

@@ -101,6 +101,26 @@ class PageTable {
   // `residency` decides the pool size and whether sentinels ever exist.
   void Init(const rhi::Device& device, World& world);
 
+  // The world seed, for the JITTER sentinel's palette-variant formula
+  // (world.h's JITTER block). Must be set before any Classify call that could
+  // return a JITTER entry — Stream::Init pushes it at the same point it seeds
+  // itself, so the two can never disagree about which world this is.
+  //
+  // SETTING A WRONG SEED IS NOT A SILENT COSMETIC BUG: Classify would refuse
+  // every jittered chunk (the words would not match), so the failure mode is a
+  // lost optimization, not a corrupted world. The dangerous direction —
+  // changing the seed while JITTER entries already exist — cannot happen,
+  // because every path that changes the seed regenerates or reloads the world
+  // and resets the table (ResetAllEmpty / ResetIdentity).
+  void SetWorldSeed(uint32_t seed) { seed_ = seed; }
+  uint32_t WorldSeed() const { return seed_; }
+
+  // JITTER promotion off => Classify behaves exactly as it did before the
+  // sentinel existed. The differential oracle for the whole feature: a paged
+  // run with it off must produce the same world hash as one with it on.
+  void SetJitterEnabled(bool on) { jitterEnabled_ = on; }
+  bool JitterEnabled() const { return jitterEnabled_; }
+
   // ---- the §3.2 recurrence, in the order the normative definitions give ----
 
   // Step (0)+(1): propagate. cpuDirty(N+1) = N26(cpuDirty(N)) u C(N), where
@@ -198,9 +218,14 @@ class PageTable {
   // ---- classification: the paths that already hold the words ---------------
   // A chunk whose 4,096 words the CPU has in hand is classified for free —
   // the caller is already looping over every word. Returns the table entry to
-  // install: PT_EMPTY, a UNIFORM sentinel, or kNeedsPage.
+  // install: PT_EMPTY, a UNIFORM sentinel, a JITTER sentinel, or kNeedsPage.
+  //
+  // TAKES THE SLOT, and is no longer static, because the JITTER test is
+  // POSITIONAL: it asks whether each word equals the worldgen palette variant
+  // for that cell's WORLD position, which a slot index only yields through the
+  // toroidal window origin. `slot` must be the slot these words came from.
   static constexpr uint32_t kNeedsPage = 0u;  // never a valid sentinel
-  static uint32_t Classify(const uint32_t* words);
+  uint32_t Classify(uint32_t slot, const uint32_t* words) const;
 
   // Install a sentinel for a slot, freeing any page it held. Used by
   // worldgen's post-pass compaction and by streaming/LoadWorld classification.
@@ -272,6 +297,8 @@ class PageTable {
   uint32_t PagesHighWater() const { return pagesHighWater_; }
   uint32_t PoolPages() const { return poolPages_; }
   uint64_t FillsIssued() const { return fillsIssued_; }
+  // JITTER pages materialized by dispatch (the fills a pattern cannot express).
+  uint64_t JitterFillsIssued() const { return jitterFillsIssued_; }
   uint64_t PagesFreed() const { return pagesFreed_; }
   const SlotSet& CpuDirty() const { return cpuDirty_; }
 
@@ -296,6 +323,8 @@ class PageTable {
   uint32_t pagesInUse_ = 0;
   uint32_t pagesHighWater_ = 0;
   uint64_t fillsIssued_ = 0;
+  uint64_t jitterFillsIssued_ = 0;
+  std::vector<uint32_t> jitterUpload_;   // (slot, entry) pairs, reused
   uint64_t pagesFreed_ = 0;
 
   SlotSet cpuDirty_;
@@ -334,6 +363,19 @@ class PageTable {
   // Pages whose initialization fill is queued for the next command buffer.
   struct PendingFill { uint32_t page; uint32_t word; };
   std::vector<PendingFill> pendingFills_;
+
+  // JITTER pages awaiting materialization, as (slot, sentinel entry) pairs.
+  // Separate from pendingFills_ because these cannot be a vkCmdFillBuffer: the
+  // words vary per cell, so they are filled by the `pagefill` dispatch. The
+  // ENTRY is carried because by dispatch time the table already holds the new
+  // page and the sentinel it replaced is unreadable from it.
+  struct PendingJitterFill { uint32_t slot; uint32_t entry; };
+  std::vector<PendingJitterFill> pendingJitterFills_;
+
+  // The world seed the JITTER palette-variant formula keys on, and the master
+  // switch for JITTER promotion (the differential oracle).
+  uint32_t seed_ = 0;
+  bool jitterEnabled_ = true;
 
   // Consecutive snapshots reporting occTotal == 0, per slot. Maintained in the
   // loop that already walks all kNumChunks occupancy entries, so a settled
@@ -381,6 +423,12 @@ class PageTable {
   // recorded after a dispatch that reads the page is the hazard this ordering
   // exists to prevent.
   void DrainFills(const rhi::CommandEncoder& enc);
+  // Upload the pending JITTER (slot, entry) pairs into genList; returns the
+  // count to pass to Simulation::EncodePageFill. Call alongside DrainFills, at
+  // the head of the tick's command buffer. Returns 0 when there is nothing to
+  // do, which is every tick of a settled world.
+  uint32_t UploadJitterFills(const rhi::Queue& queue);
+  bool HasPendingJitterFills() const { return !pendingJitterFills_.empty(); }
   bool HasPendingFills() const { return !pendingFills_.empty(); }
 };
 

@@ -35,6 +35,11 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(7) var<storage, read_write> occupancy : array<u32>;
 @group(0) @binding(16) var<storage, read> genList : array<u32>;
+// JITTER materialization list: (slot, sentinel entry) pairs. Its OWN buffer,
+// never genList — Stream::FillSlots writes genList mid-frame while a page fill
+// drains at the head of the next command buffer, and the deferred writes
+// interleave (see world.cpp).
+@group(0) @binding(19) var<storage, read> pageFillList : array<u32>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
@@ -2629,6 +2634,68 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
   if (wg.x >= T.genCount) { return; }
   genChunk(genList[wg.x], li);
+}
+
+// ---- JITTER page materialization (world.h's JITTER block) ----------------
+// Filling a page that replaces a JITTER sentinel cannot be a vkCmdFillBuffer:
+// the sentinel's words vary per cell, and a fill takes ONE 32-bit pattern.
+// EMPTY and UNIFORM keep the cheap one-command fill; only JITTER comes here.
+//
+// This lives in worldgen.wgsl rather than its own file because it needs
+// exactly what genChunk needs — the slot->world mapping, T.origin, T.seed —
+// and sharing the file is what keeps the two positional rules from drifting.
+// It does NOT call genCell: a JITTER chunk's material is whatever the sentinel
+// says (it may be the result of play, not of worldgen), and only the palette
+// VARIANT follows worldgen's formula. Calling genCell here would silently
+// revert a mined-out chunk to pristine terrain.
+//
+// Reuses genList/T.genCount: page fills and worldgen list-fills are always
+// separate submits (page fills are drained at the head of a tick's command
+// buffer, worldgen list-fills are their own mid-frame encoder), so the two
+// never contend for the buffer.
+//
+// The list holds SLOT indices whose table entry is ALREADY the freshly
+// allocated page — the CPU rewrote it before this dispatch — so the entry no
+// longer says JITTER and cannot be read back here. The material and jitter
+// flag therefore travel in the list itself: two u32 per entry, slot then the
+// sentinel entry it is replacing.
+@compute @workgroup_size(64)
+fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
+            @builtin(local_invocation_index) li : u32) {
+  // NO `wg.x >= T.genCount` GUARD, deliberately — and this cost a debugging
+  // cycle, so it is written down.
+  //
+  // T.genCount belongs to the TICK UBO, which only Stream::FillSlots writes
+  // (stream.cpp, before EncodeGenList). EncodePageFill sets the recorder's
+  // dispatch EXTENT from its own count but never touches the uniform, so
+  // T.genCount here still holds the previous tick's value — 0 in every normal
+  // tick. With the guard, every one of the dispatched workgroups returned
+  // immediately, the pages materialized as ALL ZEROS, and 2,114 chunks of
+  // stone silently became air (measured: the world hash moved and slot 0
+  // digested 76EFDDC5 instead of 360F1DC5).
+  //
+  // The extent IS the bound: D_GENCOUNT dispatches exactly one workgroup per
+  // (slot, entry) pair, so wg.x is in range by construction. `list` above needs
+  // its guard because it shares the tick's UBO write; this entry point does not
+  // share that write and must not read that field.
+  let slot  = pageFillList[wg.x * 2u];
+  let entry = pageFillList[wg.x * 2u + 1u];
+  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
+                               slot / (NCHUNK * NCHUNK)));
+  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  for (var i = li; i < CHUNK_VOL; i += 64u) {
+    let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK,
+                                i / (CHUNK * CHUNK)));
+    // The SAME synthesis the sentinel read as, so the page is bit-identical to
+    // what every reader saw one instruction earlier. That equality IS the hash
+    // contract; the page-roundtrip gate asserts it.
+    voxStore(voxWordInChunk(slot, i), synthWordAt(entry, base + l, T.seed));
+  }
+  // No occupancy or dirty writes here, deliberately: materialization does not
+  // CHANGE the world, it only changes where the world is stored. The chunk's
+  // occupancy already reflects these words (sim_occupancy's analytic sentinel
+  // branch computed them), and waking it would make a storage decision into a
+  // simulation event — exactly the feedback that dilates the dirty set.
 }
 
 // ---- far-field cascade fill: the worldgen "sieve" ----

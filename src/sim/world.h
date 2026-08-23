@@ -8,6 +8,7 @@
 #include "gpu/rhi.h"
 
 #include "math3d.h"
+#include "sim/rng.h"   // rng::Hash3 — the JITTER palette-variant formula
 
 // World constants. These are the SINGLE source of truth: the matching WGSL
 // consts are generated from them by ShaderConstantPrelude() (gpu/resources.cpp)
@@ -253,13 +254,46 @@ constexpr uint32_t kFreeBits = 0x00F80000u;
 // not at all). Indexed by exactly what SlotChunkIndex / chunkIndexOf produce.
 //
 //   bit 31 = 0  RESIDENT.  bits 0..30 = PAGE INDEX into the physical pool.
-//   bit 31 = 1  SENTINEL.  bits 12..30 = tag (all zero today),
+//   bit 31 = 1  SENTINEL.  bit 30 = JITTER tag, bits 12..29 = spare (zero),
 //                          bits 0..11 = material id.
 //
 // EMPTY is UNIFORM(air): kPtEmpty == kPtSentinelBit | kMatAir with kMatAir 0,
 // so there is ONE sentinel decode path and "empty" is not a special case
 // anywhere in the shader. The material field shares the voxel word's material
 // position, so synthesizing a word from a sentinel is a mask, not a repack.
+//
+// ---- the JITTER sentinel (bit 30) ----
+// UNIFORM's whole-word rule is exact but nearly useless underground: worldgen
+// gives every solid cell a palette variant `hash3(...) % 3` in the state
+// nibble, so a chunk of plain stone has three distinct words and cannot be
+// one. Commit 0 measured the gap: 41 of 32,768 chunks are whole-word uniform
+// against 2,115 that are ONE MATERIAL with mixed state. Those 2,115 are the
+// buried bulk — the voxels the player never touches until they dig.
+//
+// JITTER(mat) means "every cell is `mat`, stainless, kStampNever, and its
+// state nibble is exactly the worldgen palette variant for that cell's WORLD
+// position". That is representable because the variant is not random: it is
+// `hash3(seed ^ 0xC0FFEE, x ^ (z << 12), y) % 3`, a pure function of position
+// and seed (worldgen.wgsl genCell). So the chunk's 4,096 words are describable
+// by 4 bytes plus a formula, and readers, the hash and materialization all
+// reconstruct them on demand.
+//
+// TWO CONSEQUENCES, both load-bearing:
+//   1. Synthesis is POSITIONAL. SynthWord(entry) alone cannot serve a JITTER
+//      sentinel — it needs the cell's world coordinate. Every synthesis site
+//      therefore takes a world cell, and the chunk-linear sites (which hold a
+//      SLOT index) must recover the world chunk through the window origin.
+//      A slot index is NOT a world position: the window is toroidal.
+//   2. Materialization is no longer a vkCmdFillBuffer. A 32-bit fill pattern
+//      cannot express per-cell variation, so a JITTER page is filled by a
+//      small compute kernel (sim_pagefill.wgsl) instead. EMPTY and UNIFORM
+//      keep the one-command fill.
+//
+// Liquids are excluded by construction: worldgen writes LIQ_FULL_STATE, not a
+// variant, so a liquid chunk's cells are whole-word uniform and UNIFORM already
+// covers them. JITTER is offered only for materials whose worldgen state is the
+// `% 3` variant — see JitterStateFor.
+constexpr uint32_t kPtJitterBit = 0x40000000u;
 //
 // These are mirrored into WGSL by ShaderConstantPrelude() (gpu/resources.cpp)
 // per the "world constants are generated from world.h, never redeclared in
@@ -275,6 +309,13 @@ constexpr uint32_t kPtPageMask = 0x7FFFFFFFu;
 // material whose table entry is zeroed — class 0 (solid), density 0. That is
 // deliberately VISIBLE: a translation bug shows up as a wall of impossible
 // solid rather than as silent air.
+//
+// NB (JITTER): 0xFFFFFFFF also has the JITTER bit set, so a read through it
+// now synthesizes a POSITION-VARYING impossible material rather than a uniform
+// one. That is still exactly as visible and still impossible, so the diagnostic
+// property above is intact. This value is never COMPARED against anywhere
+// (grep: it is declared here and mirrored to WGSL, and that is all) — it is a
+// payload, not a tag, so widening the tag space cannot alias it.
 constexpr uint32_t kPtUnresident = 0xFFFFFFFFu;
 // Not a valid word index. voxWordIndex() returns it for a sentinel chunk and
 // voxStore() tests for it BEFORE indexing, which is what makes "a kernel can
@@ -326,6 +367,37 @@ inline uint32_t SynthWord(uint32_t entry) {
   const uint32_t mat = entry & kPtMatMask;
   if (mat == kMatAir) return 0u;
   return PackVoxNew(mat, 0u);
+}
+
+// ---- the JITTER synthesis rule: the SECOND half of the hash contract -------
+// EXACT mirror of genCell's variant assignment (worldgen.wgsl) and of
+// synthJitterState / synthWordAt in common.wgsl. Four copies of one formula is
+// three too many, but the alternatives are worse: worldgen is a shader, the
+// hash path is a shader, and the CPU needs it for eviction and the mirror. The
+// page-roundtrip gate asserts all of them agree, which is what makes this a
+// checked duplication rather than a "two places must agree" bug in waiting.
+//
+// Integer-only (rule 1): pcg/hash3 are the same u32 mask-shift-multiply chain
+// the sim RNG uses, so there is no arithmetic a compiler may contract. It uses
+// rng::Hash3 — the ONE CPU mirror of common.wgsl's hash3 — rather than a local
+// copy, for exactly the reason rng.h's header comment gives.
+//
+// The palette variant worldgen gives the cell at world position (x,y,z).
+// Mirrors worldgen.wgsl genCell: rnd = hash3(seed ^ 0xC0FFEE,
+// x ^ (z << 12), y), state = rnd % 3. The bitcast to u32 of a negative
+// coordinate is two's complement in both languages (the documented WGSL
+// bitcast trap) — C++ gets it from the same (uint32_t) cast.
+inline uint32_t JitterStateFor(int x, int y, int z, uint32_t seed) {
+  const uint32_t rnd = rng::Hash3(seed ^ 0xC0FFEEu,
+                                  (uint32_t)x ^ ((uint32_t)z << 12), (uint32_t)y);
+  return rnd % 3u;
+}
+// The word a JITTER(mat) sentinel's cell at world (x,y,z) reads as.
+inline uint32_t SynthWordAt(uint32_t entry, int x, int y, int z, uint32_t seed) {
+  const uint32_t mat = entry & kPtMatMask;
+  if (mat == kMatAir) return 0u;
+  if ((entry & kPtJitterBit) == 0u) return PackVoxNew(mat, 0u);
+  return PackVoxNew(mat, JitterStateFor(x, y, z, seed));
 }
 
 // ---- the stain layer (DESIGN.md §3) ----
@@ -722,6 +794,10 @@ class World {
   // sentinel (eviction synthesizing RLE, the mirror synthesizing words).
   uint32_t PageEntryOfSlot(uint32_t slot) const { return pageTableCpu_[slot]; }
 
+  // See mirrorSeed_. Set by Stream::Init at the same point the page table's
+  // copy is set.
+  void SetMirrorSeed(uint32_t s) { mirrorSeed_ = s; }
+
   // Residency mode. `dense` is the identity map — page i for slot i — which
   // makes every address bit-identical to pre-paging code while still running
   // the whole translation path (the load, the branch, the multiply-add). It is
@@ -849,6 +925,7 @@ class World {
   rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
   rhi::Buffer bodyXforms;      // debris-body transforms (render)
   rhi::Buffer genList;         // worldgen streaming: slot indices to generate
+  rhi::Buffer pageFillList;    // JITTER materialization: (slot, entry) pairs
 
   // ---- far-field cascades (render-only; never bound in any sim pipeline) ----
   rhi::Buffer farVox;   // kFarLevels x 256^3 material bytes, packed 4/u32
@@ -888,4 +965,9 @@ class World {
   // a pure function of CPU-side allocation history (§2.5), so a readback would
   // be asking the GPU about a decision the CPU made.
   std::vector<uint32_t> pageTableCpu_;
+  // The world seed, for reconstructing a JITTER sentinel's per-cell palette
+  // variant in the CPU mirror (the readback callback synthesizes the words of
+  // chunks that were never copied). Set alongside PageTable::SetWorldSeed so
+  // the two synthesis paths cannot disagree.
+  uint32_t mirrorSeed_ = 0;
 };

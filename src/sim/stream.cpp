@@ -67,6 +67,12 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   world_ = world;
   sim_ = sim;
   seed_ = seed;
+  // The JITTER sentinel's palette-variant formula keys on this same seed
+  // (world.h's JITTER block). Pushed here, at the one point the world's seed is
+  // established, so the page table cannot disagree with worldgen about which
+  // world it is classifying.
+  if (world_->pages) world_->pages->SetWorldSeed(seed);
+  world_->SetMirrorSeed(seed);
   modified_.assign(kNumChunks, 0);
 }
 
@@ -244,9 +250,21 @@ void Stream::CompleteOldest(bool discard) {
           // single {4096, w} pair anyway, so a sentinel chunk and a
           // materialized uniform chunk produce BYTE-IDENTICAL RLE — which is
           // what makes the save format need no change at all (§4.2).
+          //
+          // A JITTER sentinel does NOT compress to one RLE pair — its cells
+          // differ — so it is synthesized per cell here and then RLE-encoded
+          // like any ordinary chunk. The saved bytes are exactly what a
+          // materialized page would have produced, which is what keeps the save
+          // format unchanged and makes the round-trip lossless.
           const uint32_t e = i < p.sentinel.size() ? p.sentinel[i] : 0u;
           if (e != 0u) {
-            std::fill(data.begin(), data.end(), SynthWord(e));
+            const IVec3 wc = p.items[i].wc;
+            const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                      bz = wc.z * (int)kChunk;
+            for (uint32_t k = 0; k < kChunkVol; k++)
+              data[k] = SynthWordAt(e, bx + (int)(k % kChunk),
+                                    by + (int)((k / kChunk) % kChunk),
+                                    bz + (int)(k / (kChunk * kChunk)), seed_);
           } else {
             std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
           }
@@ -297,7 +315,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // 0's measurement behind it): the paths that already hold the words get
       // demotion, and the tick path does not get a GPU uniformity scan.
       const uint32_t entry = world_->residency == World::Residency::Paged
-                                 ? PageTable::Classify(data.data())
+                                 ? world_->pages->Classify(s, data.data())
                                  : PageTable::kNeedsPage;
       if (entry != PageTable::kNeedsPage) {
         world_->pages->SetSentinel(s, entry);
@@ -406,7 +424,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->voxels,
                                    off, vox.data(), kChunkBytes, "genClassify"))
           break;
-        const uint32_t e = PageTable::Classify(vox.data());
+        const uint32_t e = world_->pages->Classify(gs, vox.data());
         if (e == PageTable::kNeedsPage) continue;
         world_->pages->SetSentinel(gs, e);
         demoted++;

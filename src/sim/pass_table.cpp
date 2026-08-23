@@ -24,6 +24,7 @@ namespace {
 #define PT_HASHONLY   Table::HashOnly
 #define PT_FARFILL    Table::FarFill
 #define PT_FLUID      Table::Fluid
+#define PT_PAGEFILL   Table::PageFill
 
 #define PIPE_NONE            Pipe::None
 #define PIPE_WORLDGEN        Pipe::Worldgen
@@ -43,6 +44,7 @@ namespace {
 #define PIPE_P_INTEGRATE     Pipe::PIntegrate
 #define PIPE_P_ARGS2         Pipe::PArgs2
 #define PIPE_P_RESOLVE       Pipe::PResolve
+#define PIPE_PAGEFILL        Pipe::PageFill
 #define PIPE_FAR_FILL        Pipe::FarFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn

@@ -59,6 +59,7 @@
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
 #include "sim/materials.h"
+#include "sim/pagetable.h"   // WorldSeed(), for the JITTER digest
 #include "sim/simulation.h"
 #include "sim/stream.h"
 #include "sim/tuning.h"
@@ -316,8 +317,19 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
                                     words.data(), kChunkVol * 4, "digest");
               for (uint32_t w : words) { h ^= w; h *= 16777619u; }
             } else {
-              const uint32_t sw = SynthWord(entry);
-              for (uint32_t i = 0; i < kChunkVol; i++) { h ^= sw; h *= 16777619u; }
+              // Positional, so a JITTER chunk digests as the page it would
+              // materialize into — otherwise the digest would report a
+              // paged/dense difference that does not exist in the world.
+              const IVec3 wc = world.SlotToWorldChunk(s);
+              const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                        bz = wc.z * (int)kChunk;
+              for (uint32_t i = 0; i < kChunkVol; i++) {
+                const uint32_t sw = SynthWordAt(
+                    entry, bx + (int)(i % kChunk),
+                    by + (int)((i / kChunk) % kChunk),
+                    bz + (int)(i / (kChunk * kChunk)), world.pages->WorldSeed());
+                h ^= sw; h *= 16777619u;
+              }
             }
             std::printf("[dig] %u %08X\n", s, h);
             if (const char* ws = getenv("SANDVOX_PT_WORDS")) {
