@@ -82,6 +82,11 @@ struct RecordCtx {
   // False under --residency paged: worldgen's whole-world dispatch is
   // replaced by batched worldgenList submits (PLAN_page_table.md §3.5c).
   bool denseWorldgen = true;
+  // False ONLY when the CPU can prove the dirty set is empty (ROADMAP_scale.md
+  // §3.4). Drops compact + the args staging copy + all 54 CA iterations, which
+  // is the whole of a settled tick's CA cost. Defaults TRUE so a caller that
+  // never sets it records the CA exactly as before — the safe direction.
+  bool caActive = true;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one

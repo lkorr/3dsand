@@ -331,9 +331,16 @@ struct Scenario {
 };
 
 void PrintPassTable(const char* label, const PassTimer& timer, uint32_t ticks,
-                    double wallMsPerTick, uint32_t passesPerTick) {
+                    double wallMsPerTick, uint32_t passesPerTick,
+                    uint64_t caSkips) {
   std::printf("\n  --- %s (%u ticks, %u ComputePassEncoders/tick) ---\n", label,
               ticks, passesPerTick);
+  // ROADMAP_scale.md §3.4: how many of these ticks recorded NO CA rows at all.
+  // Reported unconditionally, including the 0 case, because "the skip did not
+  // fire" is the thing a reader most needs to know when a settled number looks
+  // higher than expected — a silent 0 reads as "no such mechanism".
+  std::printf("    CA skipped on %" PRIu64 " / %u ticks (settled-tick skip)\n",
+              caSkips, ticks);
   std::printf("    %-34s %10s %10s %8s\n", "pass", "us/tick", "% of sim",
               "ticks");
   double sum = 0;
@@ -356,9 +363,11 @@ void PrintPassTable(const char* label, const PassTimer& timer, uint32_t ticks,
 // is a per-tick LATENCY, not throughput. Reported as such.
 double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
                      PassTimer& timer, uint32_t firstTick, uint32_t ticks,
-                     bool withExplosions, uint32_t* passesPerTick) {
+                     bool withExplosions, uint32_t* passesPerTick,
+                     uint64_t* caSkips) {
   double t0 = NowSeconds();
   uint32_t passes = 0;
+  const uint64_t skips0 = sim.CaSkipCount();
   for (uint32_t i = 0; i < ticks; i++) {
     uint32_t t = firstTick + i;
     std::vector<ExplosionOp> exps;
@@ -369,14 +378,22 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
       int h = World::TerrainHeight(100, 100, kDefaultSeed);
       exps.push_back({100, h, 100, 14, 400, 0, 0, 0});
     }
+    // wantReadback = TRUE. It used to be false, which made this harness cheaper
+    // per tick but also made it measure a configuration the game never runs:
+    // the §3.4 settled skip is licensed by an arriving SNAPSHOT, and a harness
+    // that never asks for one can never take the skip. The settled numbers were
+    // therefore reporting the un-skipped CA cost while the game was already
+    // paying nothing — a measurement that flatters the OLD code. The game and
+    // every gate pass true here, so this makes --measure agree with them.
     SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, exps, {},
-               t % 15 == 0, {8, 3, 8}, false, withExplosions);
+               t % 15 == 0, {8, 3, 8}, true, withExplosions);
     if (i == 0) passes = timer.PassesThisBuffer() / 2;
     ctx.WaitIdle();
     timer.Collect(ctx);
   }
   double dt = NowSeconds() - t0;
   if (passesPerTick) *passesPerTick = passes;
+  if (caSkips) *caSkips = sim.CaSkipCount() - skips0;
   return dt / (double)ticks;
 }
 
@@ -466,21 +483,23 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
   {
     timer.ResetStats();
     uint32_t ppt = 0;
+    uint64_t skips = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, kSettleTicks + 1,
-                                kPerScenario, false, &ppt);
+                                kPerScenario, false, &ppt, &skips);
     PrintPassTable("(c) SETTLED world (no edits, chunks asleep)", timer,
-                   kPerScenario, wall, ppt);
+                   kPerScenario, wall, ppt, skips);
   }
 
   // (b) ACTIVE — periodic explosions keep chunks awake and particles flying.
   {
     timer.ResetStats();
     uint32_t ppt = 0;
+    uint64_t skips = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer,
                                 kSettleTicks + kPerScenario + 1, kPerScenario,
-                                true, &ppt);
+                                true, &ppt, &skips);
     PrintPassTable("(b) ACTIVE world (explosion every 20 ticks + particles)",
-                   timer, kPerScenario, wall, ppt);
+                   timer, kPerScenario, wall, ppt, skips);
   }
 
   // (a) SETTLING — regenerate the world and time the first ticks, when
@@ -496,10 +515,11 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     if (haveTimer) sim.SetPassTimer(&timer);
     timer.ResetStats();
     uint32_t ppt = 0;
+    uint64_t skips = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, 1, kPerScenario, false,
-                                &ppt);
+                                &ppt, &skips);
     PrintPassTable("(a) SETTLING world (first ticks after worldgen)", timer,
-                   kPerScenario, wall, ppt);
+                   kPerScenario, wall, ppt, skips);
   }
 
   sim.SetPassTimer(nullptr);

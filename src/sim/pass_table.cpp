@@ -80,6 +80,7 @@ namespace {
 #define C_DENSEWG   Cond::DenseWorldgen
 #define C_FARCOUNT  Cond::FarCount
 #define C_FLUIDSPAWN Cond::FluidSpawn
+#define C_CAACTIVE  Cond::CaActive
 
 #define D_OPS       (uint32_t)DispatchSel::Ops
 #define D_CELLS     (uint32_t)DispatchSel::Cells
