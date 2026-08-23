@@ -262,6 +262,75 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
       out.shifts += stream.ShiftCount() - before;
     }
 
+    // PAGED-DIVERGENCE DIAGNOSTICS, all behind SANDVOX_PT_DEBUG and each behind
+    // its own variable, so a normal run pays nothing (not even a readback).
+    // These are the tools that localised BOTH phase-7 bugs and they are kept
+    // deliberately: a dense-vs-paged hash mismatch is otherwise a 32,768-chunk
+    // haystack, and this is the dump-and-diff that reduces it to one voxel.
+    //
+    //   SANDVOX_PT_DUMPSLOT=<slot>   per-tick contents + page-table entry of one
+    //                                slot. Found the induction base case: slot
+    //                                11531 sat at PT_EMPTY through tick 8 in
+    //                                paged while dense already held the water.
+    //   SANDVOX_PT_DIGEST=<tick>     per-chunk FNV digest of the WHOLE world at
+    //                                that tick. Diff a dense run against a paged
+    //                                run to get the exact divergent slots.
+    //   SANDVOX_PT_WORDS=<slot>      with DIGEST, dump that slot's non-zero
+    //                                words. Found the RNG bug: one lava voxel
+    //                                and its neighbour SWAPPED, nothing lost.
+    if (getenv("SANDVOX_PT_DEBUG")) {
+      if (const char* ds = getenv("SANDVOX_PT_DUMPSLOT")) {
+        const uint32_t slot = (uint32_t)atoi(ds);
+        const uint32_t entry = world.PageEntryOfSlot(slot);
+        uint32_t nonZero = 0, fullSum = 0, solid = 0;
+        if ((entry & kPtSentinelBit) == 0u) {
+          std::vector<uint32_t> words(kChunkVol);
+          rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels,
+                                (uint64_t)entry * kChunkVol * 4, words.data(),
+                                kChunkVol * 4, "slotDump");
+          for (uint32_t w : words)
+            if (w != 0) {
+              nonZero++;
+              fullSum += (w >> 12) & 0xFu;
+              if ((w & 0xFFFu) != 0u) solid++;
+            }
+        }
+        std::printf("[pin] tick %u slot %u entry=0x%08X nonZero=%u mat!=0=%u "
+                    "fullSum=%u\n",
+                    tick, slot, entry, nonZero, solid, fullSum);
+      }
+      // SANDVOX_PT_DIGEST=<tick>: per-chunk digest of the WHOLE world at that
+      // tick, so a dense run and a paged run can be diffed to the exact slot.
+      // This is the dump-and-diff that localises a divergence instead of
+      // guessing at it.
+      if (const char* dt = getenv("SANDVOX_PT_DIGEST")) {
+        if (tick == (uint32_t)atoi(dt)) {
+          ctx.WaitIdle();
+          std::vector<uint32_t> words(kChunkVol);
+          for (uint32_t s = 0; s < kNumChunks; s++) {
+            const uint32_t entry = world.PageEntryOfSlot(s);
+            uint32_t h = 2166136261u;
+            if ((entry & kPtSentinelBit) == 0u) {
+              rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels,
+                                    (uint64_t)entry * kChunkVol * 4,
+                                    words.data(), kChunkVol * 4, "digest");
+              for (uint32_t w : words) { h ^= w; h *= 16777619u; }
+            } else {
+              const uint32_t sw = SynthWord(entry);
+              for (uint32_t i = 0; i < kChunkVol; i++) { h ^= sw; h *= 16777619u; }
+            }
+            std::printf("[dig] %u %08X\n", s, h);
+            if (const char* ws = getenv("SANDVOX_PT_WORDS")) {
+              if (s == (uint32_t)atoi(ws) && (entry & kPtSentinelBit) == 0u)
+                for (uint32_t i = 0; i < kChunkVol; i++)
+                  if (words[i] != 0u)
+                    std::printf("[wrd] %u %u %08X\n", s, i, words[i]);
+            }
+          }
+        }
+      }
+    }
+
     const bool probe = loud ? LoudProbe(tick) : QuietProbe(tick);
     if (!probe) continue;
     // A hash tick's value is already in world.hash; anything else needs a
@@ -276,6 +345,20 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
     out.storeCount = stream.Store().Count();
   }
   ctx.WaitIdle();
+
+  // READ THE REAL FAULT COUNTER. This used to be a never-assigned zero, so the
+  // "=== page faults === 0" line was a hardcoded literal that never touched the
+  // GPU — which is why a genuine lost write (the induction base case, one fault
+  // at tick 8) went unseen for the whole phase while the counter it was
+  // supposed to trip reported clean. The snapshot path cannot serve here: its
+  // async map never retires in a headless harness, so this is a blocking read,
+  // taken once after WaitIdle rather than per tick.
+  {
+    uint32_t pf[4] = {0u, 0u, 0u, 0u};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.pageFaults, 0, pf,
+                          sizeof(pf), "pageFaultRead");
+    out.pageFaults = pf[0];
+  }
 
   if (vk::Backend* be = ctx.VkBackend()) {
     out.validationMsgCount = be->ValidationMessages().size();

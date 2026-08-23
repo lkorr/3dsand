@@ -253,6 +253,12 @@ class PlayerAvatar {
   // reuses CarveLimbRadial + the existing gore pipeline rather than adding any.
   void SelfDestruct(Vec3 atWorldVoxel, float radiusVox, World& world,
                     std::vector<ParticleSpawn>& spawns);
+  // Explosion damage to the avatar's body: every live part within the blast
+  // takes hp damage that falls off with distance, bleeds from the wound, and
+  // severs when hp reaches zero. Same call shape as MobSystem::CarveMobsRadial
+  // so the explosion loop in main.cpp treats the avatar and mobs identically.
+  void CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
+                   std::vector<ParticleSpawn>& spawns);
 
   // ---- persistence (sim/worldio.h, entities.sve section 'AVTR') -----------
   // The avatar is a mob def driven by the player, so it persists like a mob:

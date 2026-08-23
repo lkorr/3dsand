@@ -2063,6 +2063,59 @@ void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
   Die();
 }
 
+void PlayerAvatar::CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                               World& world,
+                               std::vector<ParticleSpawn>& spawns) {
+  (void)world;
+  (void)spawns;
+  if (!spawned_ || !def_ || !alive_ || radiusVoxels <= 0.0f) return;
+  const MobDef& def = *def_;
+  const float physInv =
+      1.0f / (float)std::max(1u, def.physScale);
+
+  // Collect which parts to damage FIRST: Sever() mutates parts and can
+  // cascade to children, so deciding everything against the pre-damage state
+  // and acting afterwards avoids walking a list that reshapes underneath us.
+  struct Hit {
+    int index;
+    float dist;
+    float fraction;  // 0 at centre, 1 at edge
+  };
+  std::vector<Hit> hits;
+  for (size_t i = 0; i < parts.size(); i++) {
+    if (!PartAlive((int)i) || !parts[i].body) continue;
+    const Part& p = parts[i];
+    float r = 0.5f * Vec3{(float)p.size.x, (float)p.size.y,
+                          (float)p.size.z}.len() * physInv;
+    float dist = (p.xf.pos - centerWorldVoxel).len();
+    if (dist > radiusVoxels + r + 2.0f) continue;
+    float t = dist / std::max(1.0f, radiusVoxels);
+    if (t > 1.0f) t = 1.0f;
+    hits.push_back({(int)i, dist, t});
+  }
+  if (hits.empty()) return;
+
+  // Damage falls off quadratically from the centre: full damage at the core,
+  // zero at the rim. The base damage is the authored limb hp so a dead-centre
+  // blast on a full-health part severs it outright.
+  std::vector<int> severed;
+  for (const Hit& h : hits) {
+    Part& p = parts[h.index];
+    const MobLimbDef& ld = limbs_[h.index];
+    float strength = (1.0f - h.fraction * h.fraction);
+    float damage = ld.hp * strength;
+    p.hp -= damage;
+    Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
+    p.woundLocal = RotateInv(q, centerWorldVoxel - p.xf.pos);
+    if (def.bleedMat)
+      p.bleedBudget = AddBleedBudget(p.bleedBudget,
+                                     damage * def.bleedPerDamage);
+    if (p.hp <= 0.0f) severed.push_back(h.index);
+  }
+  for (int i : severed)
+    if (PartAlive(i)) Sever(i);
+}
+
 bool PlayerAvatar::SeverByName(const std::string& name) {
   int i = PartIndex(name);
   if (i < 0 || !PartAlive(i)) return false;

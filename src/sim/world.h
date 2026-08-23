@@ -160,7 +160,8 @@ constexpr uint32_t kFluidSubsteps = 6;
 struct FluidSpawnOp {
   int32_t px, py, pz;   // position, fixed 16.16 world cells
   int32_t vx, vy, vz;   // velocity, fixed 16.16 cells/tick
-  uint32_t pad0 = 0, pad1 = 0;
+  uint32_t species = 0; // 0..3: which liquid this is (colour + attraction id)
+  uint32_t pad1 = 0;
 };
 
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
@@ -811,11 +812,12 @@ class World {
   // fluidBlockMap and fluidBlockList are per-substep scratch, cleared and
   // rebuilt inside the tick. fluidParticles is the only carried state, and it
   // is reconstructible from the op stream (deterministic solver + spawn ops).
-  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (64 B, see common.wgsl)
+  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (72 B, see common.wgsl)
   rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
   rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
-  rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 4 i32 (mass, mom xyz)
+  rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
+                                 // mom xyz, species mass x3, pad — FLUID_GW)
   rhi::Buffer fluidArgsStage;    // 4 u32: [0..2] node-pass dispatch args, [3] count
   rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)

@@ -442,8 +442,28 @@ entire particle buffer to hash identically. Passing on the RTX 3060 Ti, this
 is the first affirmative evidence for the plan's fixed-point-atomics bet;
 cross-vendor remains open exactly as it does for the CA itself.
 
-Usage: the `mpm` tool (Tab; hold LMB to pour, U clears), rendered as instanced
-cubes via `debris.wgsl:vsFluid`. CPU-owned particle count (spawns are ops at
+The solver (2026-08-22, second pass) follows grantkot's WebGPU MLS-MPM shape:
+P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter
+(`p2g2`), so pressure comes from the REAL local density sampled off the grid —
+`stiffness * ((rho/rest)^power - 1)`, floored at `-cohesion` — rather than
+from a per-particle volume ratio J (which saturated at its clamp and let a
+small cavity swallow unbounded particles; the density EOS makes over-packing
+eject instead). p2g2 also applies dynamic viscosity through the APIC C matrix
+and the species terms: particles carry a species id (0..3), the grid carries
+per-species mass channels, and `attractSame`/`attractDiff` add signed pulling
+pressure per species — cohesion within a liquid, repulsion (layering) or
+mixing between different liquids. Every solver constant is a `sim.fluid*`
+tuning row (tuner section "MPM Fluid"): stiffness, rest density, EOS power,
+cohesion, attract same/different, viscosity, damping, gravity — all Q16.16
+integers, F5-reloadable, clamped in LoadTuning to the kernel's overflow-audit
+ranges. All fixed-point multiplies truncate on the MAGNITUDE (round toward
+zero): flooring negative products biased every force toward -x/-y/-z and the
+whole fluid crept along that diagonal on a flat floor.
+
+Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pick the species, U
+clears), rendered as instanced cubes via `debris.wgsl:vsFluid` with tunable
+size/velocity-stretch/density-shading/foam and per-species colours (tuner
+section "MPM Fluid Look"). CPU-owned particle count (spawns are ops at
 CPU-known offsets; nothing ever allocates on the GPU), hard `kFluidCap`
 budget charged before emission, zero recorded work when no fluid exists.
 Not persisted: saves and worldgen drop it (the plan's force-settle-on-save,

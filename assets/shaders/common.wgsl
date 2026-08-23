@@ -656,17 +656,23 @@ struct FluidParticle {
   vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
   // APIC affine matrix C, row-major (c00 c01 c02 / c10 c11 c12 / c20 c21 c22),
   // Q16.16. The traceless part carries angular momentum; the trace updates J.
+  // (18 words / 72 B — world.cpp sizes the buffer and the fluid-det gate
+  // strides by this count; species and density are the two words after j.)
   c00 : i32, c01 : i32, c02 : i32,
   c10 : i32, c11 : i32, c12 : i32,
   c20 : i32, c21 : i32, c22 : i32,
-  j   : i32,                      // Q16 volume ratio
+  j   : i32,                      // Q16 volume ratio (diagnostic; the EOS uses
+                                  // the grid density below, not J)
+  species : u32,                  // 0..3, the pour's liquid identity
+  density : i32,                  // Q16.16 masses/cell sampled by p2g2 last
+                                  // substep (render shading + attraction)
 };
 
 // Must match FluidSpawnOp in world.h (32 bytes).
 struct FluidSpawnOp {
   px : i32, py : i32, pz : i32,   // Q16.16 world cells
   vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
-  _f0 : u32, _f1 : u32,
+  species : u32, _f1 : u32,
 };
 
 // Must match ExplosionOp in world.h (32 bytes).

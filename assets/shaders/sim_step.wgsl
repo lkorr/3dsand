@@ -319,7 +319,15 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
 // Matching-but-unfired rules mark the chunk dirty so reactive neighborhoods
 // stay awake until they resolve — sleeping stays activity-bounded because
 // every chain (fire, growth, decay) terminates by transforming its inputs.
-fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : u32) -> bool {
+// TWO BASES (§4.1), exactly as in main: `idx` is the PHYSICAL word index and is
+// only ever a memory address for voxStore; `slotIdx` is the SLOT cell index and
+// is the only thing that may key the RNG. Passing `idx` to hash3 here made every
+// reaction roll a function of ALLOCATION HISTORY, so a paged run diverged from a
+// dense one with no other symptom — silently, because under the identity map
+// (dense) the two are equal. Found as a deterministic, reproducible lava/stone
+// swap at slot 9450 t43 in --vk-smoke-loud --residency paged.
+fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
+               m : Material, rnd : u32) -> bool {
   var keepAwake = false;
   let stamp = stampFor(T.tick, P.substep);
 
@@ -327,7 +335,7 @@ fn doReactions(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd :
     let rule = reactions[m.reactOffset + ri];
     let kind = rule.packed & 3u;
     let dmask = (rule.packed >> 2u) & 7u;
-    let rr = hash3(rnd, ri, idx);
+    let rr = hash3(rnd, ri, slotIdx);  // SLOT index: never the page index
     let rot = rr >> 12u;
 
     // Light/phase gate. A rule whose condition is not met is skipped WITHOUT
@@ -798,7 +806,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
   if (P.substep == 0u && m.reactCount > 0u) {
-    if (doReactions(c, idx, w, mat, m, rnd)) { return; }
+    if (doReactions(c, idx, slotIdx, w, mat, m, rnd)) { return; }
   }
 
   // Staining, same once-per-tick budget as reactions. Gated on the material

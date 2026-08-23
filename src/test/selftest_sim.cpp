@@ -768,7 +768,8 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
     }
     count = fluidN;
 
-    std::vector<uint32_t> buf((size_t)count * 16);
+    // 18 words per particle — the FluidParticle stride in common.wgsl.
+    std::vector<uint32_t> buf((size_t)count * 18);
     if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidParticles, 0,
                                buf.data(), buf.size() * 4, "fluidDet")) {
       detail = "fluid particle readback failed";
@@ -791,7 +792,7 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
   // solver did not explode", not a look test.
   uint32_t escaped = 0, badV = 0, badJ = 0;
   for (uint32_t i = 0; i < count; i++) {
-    const int32_t* p = (const int32_t*)&last[(size_t)i * 16];
+    const int32_t* p = (const int32_t*)&last[(size_t)i * 18];
     int x = p[0] >> 16, y = p[1] >> 16, z = p[2] >> 16;
     if (x < px - R - 2 || x > px + R + 2 || y < py - 2 || y > py + H + 8 ||
         z < pz - R - 2 || z > pz + R + 2)

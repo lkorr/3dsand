@@ -127,7 +127,8 @@ enum class Pipe : uint8_t {
   // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
   // new pipeline is silently never handed to the recorder (a skipped row, not
   // a crash).
-  FluidSpawn, FluidMark, FluidAlloc, FluidClear, FluidP2G, FluidGridUp, FluidG2P,
+  FluidSpawn, FluidMark, FluidAlloc, FluidClear, FluidP2G, FluidP2G2,
+  FluidGridUp, FluidG2P,
   FarFill, FarDown,
 };
 
