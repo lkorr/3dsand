@@ -120,6 +120,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // translation, which is how worldgen:fardown (on farPL_) gets it.
         entry(17, T::ReadOnlyStorage), // pageTable
         entry(18, T::Storage),         // pageFaults (atomic counter)
+        // JITTER materialization list, (slot, entry) pairs. Its own buffer
+        // rather than genList: Stream::FillSlots writes genList mid-frame while
+        // this drains at the head of the next command buffer, and the two
+        // deferred writes interleave (world.cpp's note).
+        entry(19, T::ReadOnlyStorage), // pageFillList
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -314,6 +319,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(16, world_->genList),
         b(17, world_->pageTable),
         b(18, world_->pageFaults),
+        b(19, world_->pageFillList),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -540,6 +546,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
 
   worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
   worldgenList_ = MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
+  // Same module as worldgen: the JITTER page fill shares genChunk's slot->world
+  // mapping and must not drift from it (world.h's JITTER block).
+  pageFill_ = MakeComputePipeline(device, simPL_, mWorldgen, "pagefill", "pageFill");
   farFill_ = MakeComputePipeline(device, farPL_, mWorldgen, "far", "farFill");
   farDown_ = MakeComputePipeline(device, farPL_, mWorldgen, "fardown", "farDown");
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
@@ -573,7 +582,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // async error scope and always returns a valid handle, so this check is free
   // there — but on Vulkan a null pipeline would make the recorder silently
   // skip the row, which is a wrong SIM, not a crash. Fail the build instead.
-  if (!worldgen_ || !worldgenList_ || !farFill_ || !farDown_ || !mutate_ ||
+  if (!worldgen_ || !worldgenList_ || !pageFill_ || !farFill_ || !farDown_ || !mutate_ ||
       !mutateCells_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
@@ -682,6 +691,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::CellOps:        return world_->cellOps;
     case B::Support:        return world_->support;
     case B::GenList:        return world_->genList;
+    case B::PageFillList:   return world_->pageFillList;
     case B::DispatchArgs:   return world_->dispatchArgs;
     case B::ParticlesRead:  return world_->particles[page_];
     case B::ParticlesWrite: return world_->particles[1 - page_];
@@ -715,6 +725,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
   switch (p) {
     case P::Worldgen:       return worldgen_;
     case P::WorldgenList:   return worldgenList_;
+    case P::PageFill:       return pageFill_;
     case P::Mutate:         return mutate_;
     case P::MutateCells:    return mutateCells_;
     case P::Compact:        return compact_;
@@ -824,6 +835,18 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   RecordCtx cx{};
   cx.farCount = count;
   RecordTable(enc, pass::Table::FarFill, &cx);
+}
+
+// Materialize `count` JITTER pages from the (slot, entry) pairs the caller has
+// already written into genList. Deliberately does NOT call NoteWakeAll: unlike
+// worldgen and genList, this changes only WHERE the world is stored, never what
+// it is, so it must not invalidate the settled-skip latch (world.h's JITTER
+// block, and the kernel's closing comment).
+void Simulation::EncodePageFill(const rhi::CommandEncoder& enc, uint32_t count) {
+  if (count == 0) return;
+  RecordCtx cx{};
+  cx.genCount = count;
+  RecordTable(enc, pass::Table::PageFill, &cx);
 }
 
 void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {

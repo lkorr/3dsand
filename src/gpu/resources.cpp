@@ -57,6 +57,13 @@ std::string ShaderConstantPrelude() {
     << std::dec << "u;\n";
   o << "const PT_MAT_MASK : u32 = 0x" << std::hex << kPtMatMask << std::dec
     << "u;\n";
+  // Bit 30 of a sentinel: the chunk is one material carrying worldgen's
+  // per-cell palette variant, so its words vary by POSITION and are
+  // synthesized by synthWordAt/synthJitterState rather than synthWord. This is
+  // what collapses the buried bulk that UNIFORM's whole-word rule refuses
+  // (world.h's JITTER block).
+  o << "const PT_JITTER_BIT : u32 = 0x" << std::hex << kPtJitterBit << std::dec
+    << "u;\n";
   o << "const PT_EMPTY : u32 = 0x" << std::hex << kPtEmpty << std::dec << "u;\n";
   o << "const PT_PAGE_MASK : u32 = 0x" << std::hex << kPtPageMask << std::dec
     << "u;\n";
@@ -125,6 +132,31 @@ constexpr const char* kPageWriteEnd = ">>>PAGE_TABLE_WRITE_END<<<";
 bool BodyAddressesVoxels(const std::string& body) {
   return body.find("> voxels") != std::string::npos;
 }
+
+// The world seed, for the JITTER sentinel's per-cell palette variant
+// (common.wgsl synthWordAt). common.wgsl is prepended BEFORE the shader body,
+// and the uniform carrying the seed is `T : TickParams` in a sim kernel but
+// `R : RenderParams` in the render/pick path — one name does not serve both.
+// So the accessor is GENERATED per shader from whichever uniform the body
+// declares, which is what keeps all 46 voxWordAt call sites untouched.
+//
+// Emitted only for shaders that address voxels; the others have the whole page
+// block stripped and would not compile a reference to either uniform. A shader
+// that addresses voxels and declares NEITHER uniform is a build-time error
+// rather than a silent wrong seed — a wrong seed here is a synthesized word
+// that differs from the materialized page, i.e. a lost voxel.
+// ptOrigin() rides along for the same reason: the chunk-linear read
+// (voxWordInChunkAt) holds a SLOT index, and recovering the world position a
+// JITTER variant keys on needs the toroidal window origin. Both uniforms carry
+// `origin` in CHUNK units under the same field name.
+std::string PtSeedAccessor(const std::string& body) {
+  const bool hasT = body.find("uniform> T :") != std::string::npos;
+  const bool hasR = body.find("uniform> R :") != std::string::npos;
+  const char* u = hasT ? "T" : (hasR ? "R" : nullptr);
+  if (!u) return "";
+  return std::string("fn ptSeed() -> u32 { return ") + u + ".seed; }\n" +
+         "fn ptOrigin() -> vec3<i32> { return " + u + ".origin; }\n";
+}
 bool BodyWritesVoxels(const std::string& body) {
   return body.find("read_write> voxels") != std::string::npos;
 }
@@ -159,19 +191,37 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
     std::fprintf(stderr, "cannot read %s/%s\n", shaderDir.c_str(), name.c_str());
     return {};
   }
+  // The seed accessor the page block's JITTER synthesis calls. Empty unless
+  // this shader addresses voxels, which is exactly when the block survives.
+  std::string ptSeed;
   if (!BodyAddressesVoxels(body)) {
     common = StripBlock(common, kPageBlockBegin, kPageBlockEnd);
     common = StripBlock(common, kPageWriteBegin, kPageWriteEnd);
-  } else if (!BodyWritesVoxels(body)) {
-    common = StripBlock(common, kPageWriteBegin, kPageWriteEnd);
+  } else {
+    if (!BodyWritesVoxels(body)) {
+      common = StripBlock(common, kPageWriteBegin, kPageWriteEnd);
+    }
+    ptSeed = PtSeedAccessor(body);
+    if (ptSeed.empty()) {
+      std::fprintf(stderr,
+                   "%s addresses voxels but declares neither `T : TickParams` "
+                   "nor `R : RenderParams`, so the page table cannot resolve a "
+                   "world seed for JITTER synthesis. Add one, or the sentinel "
+                   "reads would differ from the page they synthesize.\n",
+                   name.c_str());
+      return {};
+    }
   }
   // Tuning constants sit between the world prelude and common.wgsl: they may
   // reference nothing, but common.wgsl and every shader body may reference
   // them. Re-read from the live Tuning on every load, which is what makes F5
   // (ReloadShaders) pick up an edited tuning.json without a rebuild.
+  // ptSeed sits BEFORE common.wgsl: the page block calls it. WGSL module scope
+  // is order-independent, but keeping the definition ahead of its use matches
+  // how every other generated declaration here reads.
   std::string src = ShaderConstantPrelude() + "\n" +
-                    TuningWgslBlock(CurrentTuning()) + "\n" + common + "\n" +
-                    body;
+                    TuningWgslBlock(CurrentTuning()) + "\n" + ptSeed + common +
+                    "\n" + body;
 
   return device.CreateShaderModule(src, name.c_str());
 }

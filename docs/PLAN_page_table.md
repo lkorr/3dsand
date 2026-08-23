@@ -2824,3 +2824,152 @@ fills, and a `pass_table.def` comment records the two new buffers.
    shrinks. Bounded (the next snapshot collapses it) but it is a real resident
    spike at dawn and dusk. Acceptable, or should the free condition use a
    different dirtiness test that a wake-all does not saturate?
+
+---
+
+# §9. The JITTER sentinel [AS BUILT 2026-08-23]
+
+The follow-up `world.h`'s `kPoolPages` note called for: *"~all of [the
+underground working set] is single-material-with-state chunks a widened sentinel
+could represent (§3.6's 2,115-chunk finding, which the game window multiplies)."*
+This is that widened sentinel.
+
+## 9.1 What it is
+
+A third sentinel form, `JITTER(mat)` — bit 30 of a sentinel entry — meaning
+**"every cell is `mat`, stainless, `kStampNever`, and its state nibble is the
+worldgen palette variant for that cell's world position."**
+
+It exists because `UNIFORM`'s whole-word rule is exact but nearly useless
+underground. `genCell` gives every solid cell a variant
+`hash3(seed ^ 0xC0FFEE, x ^ (z<<12), y) % 3`, so a chunk of plain stone holds
+three distinct words and cannot be `UNIFORM`. Commit 0 measured the gap: **41 of
+32,768 chunks are whole-word uniform against 2,115 that are one material with
+mixed state.**
+
+The variant is not random — it is a pure function of position and seed — so the
+chunk's 4,096 words are describable by 4 bytes plus a formula.
+
+## 9.2 The two consequences that shaped the implementation
+
+1. **Synthesis is POSITIONAL.** `SynthWord(entry)` cannot serve a JITTER
+   sentinel; every synthesis site needs the cell's world coordinate. The
+   chunk-linear sites hold a SLOT index, and a slot is not a position — the
+   window is toroidal — so they recover the world chunk through the window
+   origin. New: `SynthWordAt` / `JitterStateFor` (C++), `synthWordAt` /
+   `synthJitterState` / `worldCellOfSlotLocal` (WGSL).
+2. **Materialization is no longer a `vkCmdFillBuffer`.** A 32-bit pattern cannot
+   express per-cell variation, so a JITTER page is filled by a dispatch —
+   `worldgen.wgsl:pagefill`, table `PT_PAGEFILL`, over its own
+   `pageFillList` buffer of (slot, entry) pairs. EMPTY and UNIFORM keep the
+   one-command fill.
+
+## 9.3 Measured
+
+| | pages | resident | determinism hash |
+|---|---|---|---|
+| dense | — | 512 MiB | `7cfa2420` |
+| paged, JITTER off | 4,975 | 77.7 MiB | `7cfa2420` |
+| paged, JITTER on | **2,861** | **44.7 MiB** | `7cfa2420` |
+
+Suite high-water 14,934 → 11,284 of 24,576.
+
+**The game window gains far less: 16,420 → 15,545 pages (5%), against the
+harness's 42%.** This is the §3.7 "synthetic numbers lie" lesson again and it is
+recorded here rather than buried: the selftest window is sky-heavy with a large
+pristine stone bulk, while the real player-centred window is full of disturbed,
+mixed-material and cave-boundary terrain that no single-material sentinel can
+represent. `kPoolPages` is therefore left at 24,576 — this change does not
+license a smaller pool.
+
+## 9.4 The four bugs, because each was a class
+
+Every one produced a world-hash divergence with `pageFaults == 0`, and none was
+in the synthesis formula (which was correct from the first build — verified by
+recomputing slot 0's words by hand against the resident page).
+
+1. **`T.genCount` in the fill kernel.** `pagefill` guarded on `wg.x >=
+   T.genCount`, but the tick UBO's `genCount` is written only by
+   `Stream::FillSlots`. `EncodePageFill` sets the recorder's dispatch *extent*
+   and never touches the uniform, so the guard read the previous tick's value —
+   0 — and every workgroup returned immediately. 2,114 chunks of stone
+   materialized as all-zero pages, i.e. silently became air. **The dispatch
+   extent IS the bound; the guard was removed.**
+2. **Deferred-write ordering.** `rhi::Queue::WriteBuffer` is a *deferred* host
+   write that drains at the head of the NEXT command buffer. The upload was
+   written as an argument to `EncodePageFill(enc, UploadJitterFills(queue))`,
+   i.e. after `CreateCommandEncoder`, so the list drained one command buffer too
+   late and the dispatch read stale pairs. The upload now happens **before the
+   encoder exists**.
+3. **`genList` aliasing.** Sharing `genList` was documented as safe because "page
+   fills and worldgen list-fills are always separate submits" — false, because
+   `Stream::FillSlots` writes it mid-frame while a page fill drains at the head
+   of the next buffer, and the two deferred writes interleave. Page fills got
+   their own buffer (`pageFillList`, binding 19).
+4. **`HashWorldNow` left `origin` at `{0,0,0}`.** The standalone `PT_HASHONLY`
+   rehash builds a fresh `TickParams` and never set `origin` — harmless while
+   nothing in the hash path used it. The analytic sentinel branch now resolves a
+   JITTER chunk's world position from (slot, origin), so after a window shift it
+   hashed every jittered chunk at the wrong coordinates. Symptom:
+   `--vk-smoke-loud` diverged at ticks 86/88 (the first two shifts) with chunk
+   CONTENTS provably identical — a per-chunk digest diff showed **zero**
+   differing slots, which is what localised it to the hash rather than the world.
+
+The generalisable lesson, and it is the same one §3.2's caveat states: **every
+one of these was a contributor nobody had written into a list** — a uniform
+field, an ordering, a buffer, an origin. None was a wrong mechanism.
+
+## 9.5 The promotion test is EXACT, including the stamp
+
+`Classify` compares each word against `SynthWordAt` bit-for-bit. The tick stamp
+is deliberately **not** masked, which is the opposite of the EMPTY rule's
+`kAirDemoteMask`, and the asymmetry is load-bearing: that mask ignores the stamp
+because it only applies to AIR cells, whose act is a no-op. JITTER cells are
+SOLID and act, and `sim_step`'s "already acted this substep" gate reads the
+stamp — so a chunk promoted while any cell carried a live stamp would come back
+with it erased and act twice. In practice this costs nothing: settled buried
+terrain carries `kStampNever` everywhere, and an actively-simulating chunk is not
+one worth compressing.
+
+`SANDVOX_NO_JITTER=1` disables promotion, which is the differential oracle:
+paged-with must hash identically to paged-without.
+
+## 9.6 Not done
+
+- **Coverage is single-material only.** Cave walls, ore seams and biome
+  boundaries still cost a full page. A "pristine" sentinel (§9's flavour 2 —
+  "this chunk is exactly what worldgen produces here") would cover those, but it
+  must run the whole terrain function — trees, ivy, grass — on every read, and is
+  a much deeper change than this one.
+- **No eviction to the chunk store** for disturbed-then-abandoned buried chunks.
+
+## 9.7 The adversarial-descent number [MEASURED post-merge, 2026-08-23]
+
+Merging onto `2debd8a` brought `--autofly-hard`, the adversarial traversal that
+CLAUDE.md's page-pool invariant was written against: a diagonal flight plus a
+descent into solid rock, which is the residency worst case (the harness window
+and a standing player both under-report by ~2x).
+
+**That scenario is where this change actually pays.**
+
+| scenario | JITTER off | JITTER on | |
+|---|---|---|---|
+| selftest window | 4,975 | 2,861 | −42% |
+| real game, standing | 16,420 | 15,545 | −5% |
+| **`--autofly-hard`** | **32,395** | **14,697** | **−55%** |
+
+The invariant previously read: *"UNSOLVED: sustained fast flight still exhausts
+the pool and aborts, even at dense size — it is a MEMORY-CONSUMPTION problem,
+not a sizing or speed one, and the fix is reducing the resident working set
+(sparse/buried-chunk compression, a widened sentinel that can represent
+single-material-with-state chunks), not a bigger pool."*
+
+That is precisely this sentinel, and the descent now settles at 14,697 of 32,768
+with no exhaustion, no page faults and a clean exit. The invariant is updated
+rather than deleted, because the reasoning behind it is still correct: `kPoolPages`
+stays dense-sized, since **a chunk the player has DUG is not representable by any
+sentinel** and a sufficiently destructive session still trends toward dense.
+
+Note the ordering lesson for whoever measures next: the 5% standing-player figure
+and the 55% descent figure are the SAME build. Residency wins are scenario-shaped,
+so quote the scenario with the number or the number means nothing.

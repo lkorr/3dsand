@@ -47,6 +47,7 @@ enum class Buf : uint8_t {
   CellOps,
   Support,
   GenList,
+  PageFillList,     // JITTER materialization: (slot, entry) pairs
   DispatchArgs,
   ParticlesRead,    // symbolic: particles[page_]
   ParticlesWrite,   // symbolic: particles[1 - page_]
@@ -129,6 +130,9 @@ enum class Pipe : uint8_t {
   // a crash).
   FluidSpawn, FluidMark, FluidAlloc, FluidClear, FluidP2G, FluidP2G2,
   FluidGridUp, FluidG2P,
+  // Materializes a JITTER page (world.h's JITTER block): the one fill a
+  // vkCmdFillBuffer cannot do, because the words vary per cell.
+  PageFill,
   FarFill, FarDown,
 };
 
@@ -199,7 +203,7 @@ enum class Cond : uint8_t {
 // (grid WAW against the next clear, particle RAW into the next mark) are
 // generated exactly like intra-table ones.
 enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill,
-                             Fluid };
+                             Fluid, PageFill };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put

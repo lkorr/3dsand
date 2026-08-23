@@ -55,6 +55,10 @@ class Simulation {
   // caller wrote to world.farList (count also in tickUBO.farCount). Render-
   // only derived data — safe to encode anywhere in the tick (DESIGN.md §9).
   void EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count);
+  // JITTER page materialization: `count` (slot, entry) pairs already in
+  // genList. Recorded at the HEAD of the tick's command buffer by
+  // PageTable::DrainFills, alongside the one-pattern fills.
+  void EncodePageFill(const rhi::CommandEncoder& enc, uint32_t count);
   // Standalone whole-world hash pass (save/load verification): caller writes
   // TickParams with hashEnable=1 first, reads world.hash after submit.
   void EncodeHashOnly(const rhi::CommandEncoder& enc);
@@ -264,6 +268,7 @@ class Simulation {
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;
+  rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
   rhi::ComputePipeline fluidSpawn_, fluidMark_, fluidAlloc_, fluidClear_,
       fluidP2g_, fluidP2g2_, fluidGridUp_, fluidG2p_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,

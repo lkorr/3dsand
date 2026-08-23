@@ -67,6 +67,12 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   world_ = world;
   sim_ = sim;
   seed_ = seed;
+  // The JITTER sentinel's palette-variant formula keys on this same seed
+  // (world.h's JITTER block). Pushed here, at the one point the world's seed is
+  // established, so the page table cannot disagree with worldgen about which
+  // world it is classifying.
+  if (world_->pages) world_->pages->SetWorldSeed(seed);
+  world_->SetMirrorSeed(seed);
   modified_.assign(kNumChunks, 0);
 }
 
@@ -244,9 +250,21 @@ void Stream::CompleteOldest(bool discard) {
           // single {4096, w} pair anyway, so a sentinel chunk and a
           // materialized uniform chunk produce BYTE-IDENTICAL RLE — which is
           // what makes the save format need no change at all (§4.2).
+          //
+          // A JITTER sentinel does NOT compress to one RLE pair — its cells
+          // differ — so it is synthesized per cell here and then RLE-encoded
+          // like any ordinary chunk. The saved bytes are exactly what a
+          // materialized page would have produced, which is what keeps the save
+          // format unchanged and makes the round-trip lossless.
           const uint32_t e = i < p.sentinel.size() ? p.sentinel[i] : 0u;
           if (e != 0u) {
-            std::fill(data.begin(), data.end(), SynthWord(e));
+            const IVec3 wc = p.items[i].wc;
+            const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                      bz = wc.z * (int)kChunk;
+            for (uint32_t k = 0; k < kChunkVol; k++)
+              data[k] = SynthWordAt(e, bx + (int)(k % kChunk),
+                                    by + (int)((k / kChunk) % kChunk),
+                                    bz + (int)(k / (kChunk * kChunk)), seed_);
           } else {
             std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
           }
@@ -297,7 +315,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // 0's measurement behind it): the paths that already hold the words get
       // demotion, and the tick path does not get a GPU uniformity scan.
       const uint32_t entry = world_->residency == World::Residency::Paged
-                                 ? PageTable::Classify(data.data())
+                                 ? world_->pages->Classify(s, data.data())
                                  : PageTable::kNeedsPage;
       if (entry != PageTable::kNeedsPage) {
         world_->pages->SetSentinel(s, entry);
@@ -413,13 +431,20 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // ---- PREFILTER ON OCCUPANCY, so the voxel read is sized to the ANSWER --
       //
       // genChunk computes each chunk's occupancy in-kernel and writes it in the
-      // same dispatch (worldgen.wgsl:2608), so the demote candidates are known
-      // from a 128 KiB buffer instead of 16 MiB of voxels. Only occ == 0 slots
-      // can possibly demote — Classify returns a sentinel only for a chunk of
-      // identical words, and a chunk with any non-air cell is either non-uniform
-      // or uniform non-air, and a UNIFORM non-air chunk is not something
-      // worldgen produces (a solid-stone chunk underground is uniform in
-      // MATERIAL but its state nibble carries per-cell palette jitter).
+      // same dispatch (worldgen.wgsl), so the demote candidates are known from a
+      // 128 KiB buffer instead of 16 MiB of voxels.
+      //
+      // TWO occupancy values can demote, not one, and the second is the whole
+      // point of the JITTER sentinel (world.h's JITTER block):
+      //   occ == 0          all air         -> PT_EMPTY
+      //   occ == CHUNK_VOL  completely full -> UNIFORM or JITTER
+      // The original form of this prefilter tested `occ == 0` only, on the
+      // reasoning that "a UNIFORM non-air chunk is not something worldgen
+      // produces, because a solid-stone chunk is uniform in MATERIAL but its
+      // state nibble carries per-cell palette jitter". That reasoning was exactly
+      // right and is exactly what JITTER now represents — so the chunks it
+      // excluded are the ones worth compressing. A partially-full chunk still
+      // cannot demote: no sentinel form can describe a mix of air and matter.
       //
       // The stain caveat that makes `occ == 0` unsafe on the tick path does NOT
       // apply here: worldgen writes no stain bits at all, so a freshly
@@ -434,12 +459,13 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         occ.assign(kNumChunks, 0);  // read failed: fall back to testing all
 
       // Collect the candidates: a sentinel slot has nothing to read and is
-      // already in its demoted form; a non-empty slot cannot demote.
+      // already in its demoted form; a PARTIALLY-full slot cannot demote.
       std::vector<uint32_t> paged;
       paged.reserve(genSlots.size());
       for (uint32_t gs : genSlots) {
         if (world_->PageOffsetOfSlot(gs) == World::kNoPage) continue;
-        if ((occ[gs] & 0xFFFFu) != 0u) continue;  // low 16 = non-air count
+        const uint32_t nonAir = occ[gs] & 0xFFFFu;  // low 16 = non-air count
+        if (nonAir != 0u && nonAir != kChunkVol) continue;
         paged.push_back(gs);
       }
 
@@ -462,7 +488,8 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
           std::memcpy(vox.data(), map.Data(), n * kChunkBytes);
           map.Unmap();
           for (size_t i = 0; i < n; i++) {
-            const uint32_t e = PageTable::Classify(vox.data() + i * kChunkVol);
+            const uint32_t e = world_->pages->Classify(paged[off + i],
+                                                       vox.data() + i * kChunkVol);
             if (e == PageTable::kNeedsPage) continue;
             world_->pages->SetSentinel(paged[off + i], e);
             demoted++;

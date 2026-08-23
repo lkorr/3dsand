@@ -316,6 +316,23 @@ PASS(worldgenList, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_
      USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
           R(PageTable) A(PageFaults)))
 
+// ========================================================= PT_PAGEFILL =====
+// PageTable::DrainFills — materializes the JITTER pages of ONE tick, recorded
+// at the HEAD of that tick's command buffer, before any row that reads voxels
+// (§5.4's ordering, the same reason the vkCmdFillBuffer path is drained there).
+//
+// This is the fill a 32-bit pattern cannot express: a JITTER sentinel's words
+// vary per cell, so the page is filled by a dispatch instead. EMPTY and UNIFORM
+// still go through FillTracked and never reach this table.
+//
+// W(Voxels), not RW: the kernel only stores. It reads genList for the
+// (slot, entry) pairs and TickUBO for origin/seed, and it deliberately does NOT
+// touch Occupancy or the dirty buffers — materialization relocates the world,
+// it does not change it (see the kernel's closing comment).
+PASS(pageFill, "pageFill", PT_PAGEFILL, PIPE_PAGEFILL, K_COMPUTE, D_GENCOUNT,1,1,
+     GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
+     USES(R(PageFillList) U(TickUBO) W(Voxels) R(PageTable) A(PageFaults)))
+
 // ======================================================== PT_LOADRESET =====
 // Simulation::EncodeLoadReset. barrier_graph §2.5.3: clears transient state
 // (hash/particles/claims) and rebuilds occupancy over freshly uploaded voxels.
