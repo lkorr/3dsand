@@ -35,3 +35,6 @@ AGENTS_BOARD.md
 
 # per-session debug scratch (agents park logs/diffs/screenshots here)
 .scratch/
+
+# PreToolUse redundancy-check scratch ledger (scripts/test_redundancy_check.sh)
+.claude/.test-ledger
