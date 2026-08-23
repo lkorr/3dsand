@@ -448,6 +448,44 @@
     }
   ],
   "clips": {
+    "hang": {
+      "durationMs": 1600,
+      "loop": true,
+      "mode": "override",
+      "blendInMs": 120,
+      "blendOutMs": 180,
+      "mask": ["armU.L", "armL.L", "armU.R", "armL.R"],
+      "tracks": {
+        "armU.L": {
+          "rot": [
+            {"t": 0, "q": [-0.9537, 0, 0, 0.3007], "ease": "quadInOut"},
+            {"t": 800, "q": [-0.9613, 0, 0, 0.2756], "ease": "quadInOut"},
+            {"t": 1600, "q": [-0.9537, 0, 0, 0.3007]}
+          ]
+        },
+        "armL.L": {
+          "rot": [
+            {"t": 0, "q": [-0.1736, 0, 0, 0.9848], "ease": "quadInOut"},
+            {"t": 800, "q": [-0.1736, 0, 0, 0.9848], "ease": "quadInOut"},
+            {"t": 1600, "q": [-0.1736, 0, 0, 0.9848]}
+          ]
+        },
+        "armU.R": {
+          "rot": [
+            {"t": 0, "q": [-0.9537, 0, 0, 0.3007], "ease": "quadInOut"},
+            {"t": 800, "q": [-0.9613, 0, 0, 0.2756], "ease": "quadInOut"},
+            {"t": 1600, "q": [-0.9537, 0, 0, 0.3007]}
+          ]
+        },
+        "armL.R": {
+          "rot": [
+            {"t": 0, "q": [-0.1736, 0, 0, 0.9848], "ease": "quadInOut"},
+            {"t": 800, "q": [-0.1736, 0, 0, 0.9848], "ease": "quadInOut"},
+            {"t": 1600, "q": [-0.1736, 0, 0, 0.9848]}
+          ]
+        }
+      }
+    },
     "idle": {
       "durationMs": 3200,
       "loop": true,

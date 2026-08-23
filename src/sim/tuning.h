@@ -147,8 +147,9 @@ struct Tuning {
     // grabbable. 0 disables ledge grabbing entirely.
     float ledgeReach = 0.55f;
     // Dangling drop: the top of the head hangs this far below the held lip
-    // (arms extended overhead, slightly bent).
-    float ledgeHangDrop = 0.35f;
+    // (arms overhead, elbows slightly bent — the hang clip's reach pose is
+    // sized so the hands land on the lip at this drop).
+    float ledgeHangDrop = 0.15f;
     // Upward velocity of the ARM BOOST — the pull-up used when there is no
     // room to stand on the lip (a rough wall's one-voxel ledge): ballistic,
     // so the next lip up can catch near the apex and the climb chains.

@@ -64,7 +64,7 @@ struct AvatarParts {
 // AvatarParts, for the same reason: a hot reload swaps the skeleton, and a
 // stale index would point at whatever clip now sits in that slot.
 struct AvatarLocoClips {
-  int idle = -1, walk = -1, run = -1, fall = -1;
+  int idle = -1, walk = -1, run = -1, fall = -1, hang = -1;
 };
 
 // What the avatar wants the rest of the game to do about its current state.
@@ -484,6 +484,10 @@ class PlayerAvatar {
   // note in UpdateAnimation.
   float gaitWeight_ = 0.0f;
   bool wasGrounded_ = true;
+  // Was the support a LEDGE HANG last tick? Losing that support (a drop, or
+  // the arm boost) must not fire the "jump" clip — the arms are already up in
+  // the hang pose and the flourish reads as a spasm on release.
+  bool wasHanging_ = false;
   // Seconds spent continuously off the ground. `grounded` flickers false for a
   // tick at a time crossing bumpy terrain, and the air-state clips used to fire
   // on that raw edge — retriggering the arms-up `jump` one-shot on every bump.

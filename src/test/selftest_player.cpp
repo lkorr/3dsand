@@ -351,9 +351,10 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   // more wall rises right behind it (x>=151 up to y=127). There is no room to
   // stand on that one-voxel ledge, so the pull-up must become the arm boost,
   // and the NEXT lip (y=127) must catch on the way down from the boost apex —
-  // the chain. The tier height leaves ~4 voxels between the apex (anchor
-  // y=103 + 14 voxels of jumpSpeed rise) and the bottom of lip2's latch
-  // window, so a modest jumpSpeed retune does not silently break the gate.
+  // the chain. The tier height leaves ~6 voxels between the apex (anchor
+  // y=105 at ledgeHangDrop 0.15 m, + 14 voxels of jumpSpeed rise) and the
+  // bottom of lip2's latch window, so a modest jumpSpeed or hang-drop retune
+  // does not silently break the gate.
   auto noisyKind = [](IVec3 c) {
     if (c.y < 60) return CellKind::Solid;
     if (c.x < 140) return c.y < 100 ? CellKind::Solid : CellKind::Air;
