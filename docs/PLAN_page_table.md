@@ -566,7 +566,7 @@ re-enumerate it — other sections reference `C(N)` and this table.
 
 | # | CPU dirty-writer | mechanism | found by |
 |---|---|---|---|
-| a | **brush / cell / explosion op targets** | the kernels' `markBoth(c)` on CPU-authored op streams — the CPU knows every target before the ops are uploaded (§3.3) | first draft |
+| a | **brush / cell / explosion op targets** | the kernels' `markBoth(c)` on CPU-authored op streams — the CPU knows every target before the ops are uploaded (§3.3). **Materializes DILATED BY ONE RING** — `N26(opTargets(N))`, the induction base case for matter created in empty sky (§3.2 step (4), §3.4). Bounded by the op caps (`kMaxOpsPerTick`, `kMaxExplosionsPerTick`) and recomputed each tick, never carried | first draft; ring added phase 7 |
 | b | **`particleSpawnChunks(N)`** | `resolve`'s `markDirtyNext` (`sim_particle.wgsl:242,:265`) dirties the 26-neighbourhood of a **GPU-decided** location; step (1)'s `N26` of `C(N)` covers that. The set itself is THIS tick's spawn sites plus one ring, recomputed from scratch — bounded by `kMaxParticleSpawnsPerTick` + `kMaxExplosionsPerTick`, **independent of flight duration** (§3.4, amended) | review M1; bound amended |
 | c | **`EncodeWakeAll`** (`simulation.cpp:821-828`) | a bare `queue.WriteBuffer(dirty[page_], ones)` — **all 32,768 flags**, no table row, fired from `SubmitTick` (`support.cpp:155`) on a daylight crossing (§3.2a) | review C2 |
 | d | **`Stream::FillSlots`** (`stream.cpp:271-273`) | per store-hit slot, `WriteBuffer(dirty[0], s*4, 1)` **and** `dirty[1]` — the "wake once: neighbors may have changed since this chunk was saved" write. Mid-frame, between ticks, from its own path (§3.5d) | review NEW-2 |
@@ -753,9 +753,17 @@ replace it.**
 >
 > // ---- (4) THE MATERIALIZATION SET — the one normative formula -----------
 > materialize(N) = [ (cpuDirty ∩ hasMatter) ∪ N26(cpuDirty ∩ hasMatter) ]
->                  ∪ opTargets(N)
+>                  ∪ opTargets(N)  ∪  N26( opTargets(N) )
 >                  ∪ particleSpawnChunks(N)
 > ```
+>
+> **`N26(opTargets(N))` is the INDUCTION BASE CASE, added in phase 7 after it
+> cost a real page fault** — see §3.4's soundness note. The bracketed half is
+> evaluated against `hasMatter` *at encode time*, so an op that creates matter
+> in previously-`PT_EMPTY` sky is invisible to it, and the CA moves that matter
+> one cell in the SAME tick. One ring around the op targets covers every such
+> write; two are not needed, because sim write reach is 1. It is bounded by the
+> op caps and recomputed each tick, exactly like `particleSpawnChunks(N)`.
 >
 > **Both operands of the `∩` in (2) are supersets** of the true `dirtyIn(M)`,
 > so their intersection is also a superset and is at least as tight as either.
@@ -1067,6 +1075,53 @@ whenever `particlesActive`. That is correct and trivially safe, but a single
 explosion would then un-sparse the entire world for as long as its debris
 flies — turning the most common "something is happening" case into the
 worst-case memory footprint. That defeats the phase.
+
+#### The induction base case the adjacency argument does not cover — [AS BUILT, phase 7]
+
+The argument above, and §3.2's recurrence generally, is an induction whose step
+is sound and whose **base case was missing**. The step: a write at tick `N`
+places matter that exists at `N+1`, `markDirtyNext` marks its chunk, so `N+1`'s
+`(cpuDirty ∩ hasMatter)` and its ring see it. That closes for every tick after
+matter exists.
+
+It does **not** close for the tick in which an op FIRST creates matter in
+previously-empty sky. The bracketed half of `materialize(N)` is evaluated
+against `hasMatter` **at encode time**, when those chunks are still `PT_EMPTY`
+and contribute nothing — and then the CA runs in that same tick and moves the
+new matter one cell, off the op chunk and into a neighbour that is in neither
+half of the set. Measured: the loud scenario's WATER brush at `(176,150,176)`
+r5 spans the `y=9` chunks only; water fell into a `y=8` chunk within tick 8 and
+that write was lost — one page fault, slot 11531, `pageTable` entry
+`0x80000000`. Sand does not expose it, because it is painted adjacent to
+existing matter and the bracketed half already covers its neighbourhood; water
+spreads and falls on the first tick.
+
+**Fix: `materialize(N)` dilates op targets by one ring** — the
+`∪ N26(opTargets(N))` term now in §3.2 step (4).
+
+**Soundness, and why ONE ring is exactly right.** The CA this tick acts only on
+chunks dirty at compaction time, which is `previously-dirty ∪ op-marked`.
+Previously-dirty chunks have matter, so they and their ring are already in the
+bracketed half. Op-marked acting cells write at reach ≤ 1 cell — rule 1's
+lattice bound, which the whole race-freedom argument already rests on — so
+every write they can make lands within `N26(opChunks)`. One ring is therefore
+sufficient, and a second is not needed: the reach is 1, not 2.
+
+**Bounded, per rule 2.** Op counts are capped (`kMaxOpsPerTick = 64`,
+`kMaxExplosionsPerTick = 8`) and the set is recomputed from CPU-known inputs
+every tick and never carried, so it cannot grow with time. It mirrors
+`particleSpawnChunks`'s reviewed 1-ring treatment exactly — same shape, same
+reason, same bound.
+
+**How it stayed hidden:** `pageFaults` recorded this fault all along and nobody
+could read the register. `vk_smoke` printed a hardcoded `0` (`RunResult::pageFaults`
+was never assigned), and the counter buffer was never zeroed, so it started at
+driver garbage (measured 2²⁷ on a 3060 Ti). Both are fixed — the counter is a
+real blocking readback after `WaitIdle`, and it is zeroed in `ResetAllEmpty` /
+`ResetIdentity` and once after paged worldgen (see the comment there for why
+worldgen's own sentinel stores legitimately count). §3.4's standing rule — *if
+`pageFaults` is ever non-zero, find the path; do not widen the ring to make it
+go away* — is only enforceable now that the number is real.
 
 ### 3.5 (c,d,e) worldgen, streaming fill, LoadWorld
 
@@ -1481,6 +1536,13 @@ for (var i = li; i < CHUNK_VOL; i += 64u) {
 }
 ```
 
+**Stated once, in the strongest form, because phase 7 found a seventh site that
+this section's narrower wording did not cover: an index used as an IDENTITY —
+an RNG key, a hash key, a claim-lattice key — is the SLOT index, NEVER the
+page index; only a memory address may be the page.** See §4.1a for the
+enumeration and for `sim_step:doReactions`, the violation that `main()`'s own
+comment predicted verbatim.
+
 **[REVIEW M3 — FIXED.]** The first draft's trailing comment said the dense path
 runs "with `base` resolved from the page index", which would feed the *page*
 base into `pcg`. That is wrong and it is the kind of wrong that produces a
@@ -1501,8 +1563,10 @@ contributor, not a wrong rule.]**
 
 M3 states the rule for the world hash: *the load follows the page; the key
 keys on the slot.* Implementing commit 1 turned up **five more sites with the
-same shape and none of them a hash**, every one of which would make a paged run
-diverge from a dense one while staying perfectly self-consistent:
+same shape and none of them a hash** — and phase 7's paged bring-up turned up a
+**sixth, `doReactions`, which is the last row below**. Every one of them would
+make a paged run diverge from a dense one while staying perfectly
+self-consistent:
 
 | site | what the index keys | what breaks under a page index |
 |---|---|---|
@@ -1512,6 +1576,7 @@ diverge from a dense one while staying perfectly self-consistent:
 | `sim_explode:apply` | `hash3(rnd, 0x6217u, idx)` — the micro-grit roll | same |
 | `sim_mutate:main` | `hash3(T.seed^0x5EEDu, tick, idx)` — the palette-variant roll | a brush paints different state nibbles depending on which page it landed in |
 | `sim_particle:resolve` | `claimSlot(tgt)` — the reinsertion claim lattice | two particles targeting one world cell could hash to different claim slots after a reallocation and **both win** |
+| `sim_step:doReactions` | `hash3(rnd, ri, idx)` — the per-rule reaction roll | **[FOUND IN PHASE 7, the seventh site and the one this list missed.]** `doReactions` took only `idx` (the page-resolved address) and keyed the RNG on it, so every reaction roll became a function of allocation history. Invisible under the identity map — dense and paged agree until a page is assigned non-identically. Reproduced as a deterministic lava/stone swap at slot 9450, words 893/1149, in `--vk-smoke-loud --residency paged`. Now takes `slotIdx` alongside `idx`, exactly as `main` does |
 
 **The generalized rule, which is what §4.1 should have said from the start:**
 
@@ -1529,6 +1594,17 @@ site says which is which and why.
 a value from a voxel index must say whether that value is an address or an
 identity. `voxWordIndex` returns an address; `cellIndexW` returns an identity.
 Nothing else may be used for either.
+
+**Phase 7 note on how the sixth site escaped, because the lesson is about the
+review method rather than the rule.** The five sites above were found by
+auditing *call sites of `hash3`*, and `doReactions`' `hash3` call is inside a
+helper whose caller passed `idx` correctly for its addressing use. `main()`'s
+own comment predicted this failure in words — the split is documented right
+above the call that got it right — so the rule was never in doubt; only its
+propagation across a function boundary was. A helper that takes a voxel index
+must take **both** bases, or take the one it needs and be named for it. All
+`hash3` sites in the sim shaders were re-audited at that commit and this was
+the only remaining offender.
 
 The same split applies to `mainDirty` (`sim_occupancy.wgsl:35`,
 `base = dirtyList[wg.x] * CHUNK_VOL`) — but `mainDirty` computes no hash, so it

@@ -73,6 +73,14 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   for (uint32_t i = poolPages_; i-- > 0;) freePages_.push_back(i);
   pagesInUse_ = 0;
   queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumChunks * 4);
+  // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
+  // ever resets, and CreateBuffer does not zero — so without this it starts at
+  // whatever the driver left behind (measured 134,217,728 == 2^27 on a 3060
+  // Ti). Every gate asserts this counter is zero, so an unzeroed counter made
+  // that assertion unreadable; combined with the reporting bug below it made
+  // "pageFaults == 0" vacuous for the whole phase.
+  const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+  queue.WriteBuffer(world_->pageFaults, 0, faultZero, sizeof(faultZero));
   tableDirty_.clear();
   std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
   cpuDirty_.Clear();
@@ -104,6 +112,14 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   // poolPages_ <= kNumChunks in both modes.
   pagesHighWater_ = std::max(pagesHighWater_, pagesInUse_);
   queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumChunks * 4);
+  // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
+  // ever resets, and CreateBuffer does not zero — so without this it starts at
+  // whatever the driver left behind (measured 134,217,728 == 2^27 on a 3060
+  // Ti). Every gate asserts this counter is zero, so an unzeroed counter made
+  // that assertion unreadable; combined with the reporting bug below it made
+  // "pageFaults == 0" vacuous for the whole phase.
+  const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+  queue.WriteBuffer(world_->pageFaults, 0, faultZero, sizeof(faultZero));
   tableDirty_.clear();
   std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
   cpuDirty_.Clear();
@@ -424,14 +440,46 @@ void PageTable::Materialize(const rhi::Queue& queue) {
     const bool empty = (e & kPtSentinelBit) != 0u && (e & kPtMatMask) == kMatAir;
     if (!empty) scratch_.Add(s);   // hasMatter
   }
+  const size_t hasMatterCount = scratch_.Size();  // for the debug line below
   materialized_.Clear();
   DilateN26(scratch_, materialized_);
-  materialized_.UnionWith(opTargets_);
+  // opTargets is dilated by ONE RING — N26(opChunks(N)) — and this is the
+  // INDUCTION BASE CASE the ordering argument above does not cover.
+  //
+  // The ordering argument closes for tick N+1 onward: a write at N places
+  // matter that is present at N+1, markDirtyNext marks its chunk, so N+1's
+  // (cpuDirty n hasMatter) sees it. It does NOT close for the tick in which an
+  // op FIRST creates matter in previously-empty sky, because the bracketed
+  // half is evaluated against hasMatter AT ENCODE TIME, when those chunks are
+  // still PT_EMPTY. The CA then runs in that SAME tick and moves the new
+  // matter one cell — off the op chunk and into a neighbour that is in neither
+  // half of the set. Measured: the loud scenario's WATER brush at (176,150,176)
+  // r5 spans y=9 chunks only; water falls into the y=8 chunks within tick 8 and
+  // that write was lost (one page fault, slot 11531).
+  //
+  // Sand does not expose it because it is painted next to existing matter, so
+  // the bracketed half already covers its neighbourhood; water spreads and
+  // falls on tick one.
+  //
+  // SOUNDNESS: the CA this tick acts only on chunks dirty at compact time =
+  // previously-dirty u op-marked. Previously-dirty chunks have matter (or are
+  // covered by the bracketed half and its ring). Op-marked acting cells write
+  // at reach <= 1 cell (rule 1's lattice bound), so every write they can make
+  // lands within N26(opChunks). One ring is therefore sufficient, and a second
+  // is not needed: reach is 1, not 2.
+  //
+  // BOUNDED: op counts are capped (kMaxOpsPerTick = 64, kMaxExplosionsPerTick
+  // = 8) and this is recomputed from CPU-known inputs every tick, never
+  // carried, so it cannot grow with time. It mirrors particleSpawnChunks's
+  // reviewed 1-ring treatment exactly — same shape, same reason.
+  scratch_.Clear();
+  DilateN26(opTargets_, scratch_);
+  materialized_.UnionWith(scratch_);
   materialized_.UnionWith(particleChunks_);
 
   if (getenv("SANDVOX_PT_DEBUG")) {
-    std::printf("[pt] tick %u cpuDirty=%zu nonSent=%zu mat=%zu ops=%zu part=%zu inUse=%u\n",
-                tick_, cpuDirty_.Size(), scratch_.Size(), materialized_.Size(),
+    std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu inUse=%u\n",
+                tick_, cpuDirty_.Size(), hasMatterCount, materialized_.Size(),
                 opTargets_.Size(), particleChunks_.Size(), pagesInUse_);
   }
   for (uint32_t s : materialized_.Members()) {

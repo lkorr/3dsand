@@ -1069,28 +1069,52 @@ allocated a page for every slot on an incoming shift plane and never demoted
 the ~85% that generate as pure sky, leaking ~880 pages per shift. It now
 classifies and demotes exactly as batched worldgen and the store-hit path do.
 
-#### STILL OPEN — the loud scenario's paged hash
+#### CLOSED — the loud scenario's paged hash — [AS BUILT, phase 7 close]
 
-`--vk-smoke-loud --residency paged` reports **1/19** against the pinned
-constants, diverging from **tick 15** onward. Everything else is green:
+`--vk-smoke-loud --residency paged` was **1/19** against the pinned constants,
+diverging from tick 15 onward, while quiet-paged was 5/5 and loud-dense 19/19.
+It is now **19/19 == dense == pinned**, and it was **two independent bugs plus
+a broken evidence chain that hid the first of them**.
 
-- `--vk-smoke --residency paged` is **5/5 MATCH** (the quiet scenario paints
-  no ops).
-- `--vk-smoke-loud --residency dense` is **19/19 MATCH**.
-- `pageFaults == 0` on every run, so **no write is being lost** — the
-  divergence is not unmaterialized memory.
-- Bisected with A/B switches: disabling `UNIFORM` promotion, disabling
-  deallocation entirely, and adding a words-based (rather than
-  occupancy-based) free confirmation each leave the mismatch **unchanged**.
-  Worldgen itself hashes `f97ba745` — **MATCH** — so the sentinel encoding and
-  the analytic hash branch are correct at rest.
+**(1) The induction base case — `materialize` did not dilate op targets.**
+`materialize(N)`'s bracketed half is evaluated against `hasMatter` *at encode
+time*, so an op that paints matter into `PT_EMPTY` sky is invisible to it, and
+the CA moves that new matter one cell in the SAME tick — into a chunk that is
+neither an op target nor ring-reachable from any chunk that had matter. The
+loud scenario's WATER brush at `(176,150,176)` r5 spans the `y=9` chunks; water
+fell into a `y=8` chunk at tick 8 and the write was lost (slot 11531,
+`pageTable` entry `0x80000000`). Sand never exposed it because sand is painted
+next to existing matter. Fix: `materialize` unions `N26(opTargets(N))`. One
+ring is sufficient because op-marked acting cells write at reach ≤ 1; bounded
+because op counts are capped and the set is recomputed each tick. Normative
+formula and soundness argument: `PLAN_page_table.md` §3.2 step (4) and §3.4.
 
-That narrows it to the paged **op path**: the loud scenario's brush paints into
-open sky at y=170 from tick 3, which is the `opTargets`-unfiltered case, and
-the quiet scenario never exercises it. The next step is to dump the painted
-chunk's words in both modes at tick 15 and diff them — the fault is in what
-that brush writes or in when its page's initialization fill lands relative to
-`mutate`, not in the particle formula this amendment was about.
+**(2) An RNG keyed on the physical page.** `sim_step:doReactions` called
+`hash3(rnd, ri, idx)` with `idx` the page-resolved word index, making every
+reaction roll a function of **allocation history**. Invisible under the
+identity map (dense), so it could only ever appear once a page was assigned
+non-identically. Reproduced as a deterministic lava/stone swap at slot 9450,
+words 893/1149. Fix: it takes `slotIdx` alongside `idx`, exactly as `main`
+does — whose comment predicted this failure verbatim. This is the sixth entry
+in `PLAN_page_table.md` §4.1a's table; the five before it were found by
+auditing `hash3` *call sites*, and this one hid one function-call deep. All
+`hash3` sites in the sim shaders were re-audited; it was the only offender.
+
+**(3) Why (1) went unseen for the whole phase: `pageFaults == 0` was vacuous.**
+The bullet above claiming "`pageFaults == 0` on every run, so no write is being
+lost" was **false in two ways at once**. `vk_smoke` printed a hardcoded `0` —
+`RunResult::pageFaults` was declared and never assigned — and the counter
+buffer was never zeroed, so it began at whatever the driver left behind
+(measured 134,217,728 == 2²⁷ on a 3060 Ti). The GPU had recorded the tick-8
+fault correctly all along; nothing ever read the register. Fixed: a real
+blocking readback after `WaitIdle`, and zeroing in `ResetAllEmpty` /
+`ResetIdentity` plus once after paged worldgen (worldgen legitimately stores
+through sentinels for the batches it does not hold, which is what lets an
+8,192-page pool generate 32,768 slots; the invariant the gates assert is about
+the tick loop). The standing rule in §3.4 — *if `pageFaults` is ever non-zero,
+find the path, do not widen the ring* — is only enforceable now that the
+number is real. **The lesson worth carrying forward is procedural: a green
+counter is evidence only if something has proven the counter can go red.**
 
 #### DEFERRED follow-ups (severable, recorded per the pacing directive)
 
