@@ -354,6 +354,23 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       }
       world.pages->FlushTableWrites(ctx.queue);
     }
+    // ZERO THE FAULT COUNTER AFTER WORLDGEN, and only here.
+    //
+    // Worldgen is the one writer that legitimately stores through sentinels:
+    // genChunk writes all 4,096 cells of every slot in its batch, and the
+    // batches it does NOT currently hold are PT_EMPTY by construction (that is
+    // what makes a 8,192-page pool able to generate 32,768 slots at all). Those
+    // stores no-op and count, so the counter reaches exactly
+    // kNumChunks * kChunkVol = 134,217,728 before tick 1 — in a run that is
+    // otherwise perfectly correct. Measured identically on quiet-paged, which
+    // is 5/5 MATCH, so it is a startup artifact and not a lost voxel.
+    //
+    // The invariant the gates actually assert is about the TICK LOOP: no sim
+    // kernel may write through a sentinel. Zeroing here is what makes the
+    // counter mean that, and it is why the dense run (identity map, nothing to
+    // fault on) reads 0 both before and after this line.
+    const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+    ctx.queue.WriteBuffer(world.pageFaults, 0, faultZero, sizeof(faultZero));
     std::printf("worldgen (paged, %u-slot batches): %u pages in use "
                 "(%.1f MiB of %.1f MiB pool), high water %u\n",
                 kGenBatch, world.pages->PagesInUse(),
