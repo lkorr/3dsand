@@ -1451,6 +1451,108 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     // against whatever the arm solve produced, so it rides the fist with its
     // authored grip angle intact.
   }
+
+  // ---- ledge-hang arms: pin the PALMS to the held lip ----------------------
+  //
+  // The hang clip gets the arms into the neighbourhood; this solve makes the
+  // contact EXACT, and it is what makes the pose work on any rig out of the
+  // box: chain lengths come from the skeleton, the hand spread comes from each
+  // chain's own shoulder anchor, and the contact point is the ITEM SOCKET —
+  // the same "held_right" frame a sword hangs from — so "where does this rig's
+  // palm sit inside its hand part" is answered by the rig, never by a per-def
+  // pose constant.
+  //
+  // POST-PROCESS, LIKE THE LEGS AND THE WEAPON ARM, and faded through
+  // hangIkWeight_ for the same reason gaitWeight_ exists: the ticks around a
+  // grab and a release are exactly the ones that must blend, and a hard
+  // switch snaps the arms between the solved reach and whatever pose the
+  // clips left. Targets are WORLD points un-yawed the way the legs un-yaw
+  // `planted` (no x negation — that flip is for CAMERA-space offsets, see the
+  // weapon note above), so if the camera yaws the body inside its hold cone
+  // the hands stay planted on the lip and the shoulders turn under them.
+  {
+    const float hl = CurrentTuning().avatar.ikBlendHalflife;
+    const float want = hangActive_ ? 1.0f : 0.0f;
+    const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
+    hangIkWeight_ += (want - hangIkWeight_) * k;
+    if (hangIkWeight_ < 1e-3f) hangIkWeight_ = 0.0f;
+    if (hangIkWeight_ > 0.999f) hangIkWeight_ = 1.0f;
+  }
+  if (hangIkWeight_ > 0.0f && !sk.chains.empty()) {
+    const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+    const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+    const Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
+    // The body's centre column in world, and the wall geometry off the lip.
+    const float cx = origin_.x + pivot.x, cz = origin_.z + pivot.z;
+    const Vec3 dir = hangDirW_;
+    // Model +X is the character's LEFT on these rigs (see the weapon note);
+    // facing `dir`, that lateral maps to (dir.z, 0, -dir.x) in world.
+    const Vec3 leftW{dir.z, 0.0f, -dir.x};
+    const float lipTopY = (float)(hangLipW_.y + 1);
+    // How far ahead the lip actually is, measured to the held cell rather
+    // than assumed from the probe constant, so hands reach a recessed lip.
+    const float aheadRaw = ((float)hangLipW_.x + 0.5f - cx) * dir.x +
+                           ((float)hangLipW_.z + 0.5f - cz) * dir.z;
+    const float ahead = std::clamp(aheadRaw - 0.4f, Player::kHalfXZ * 0.7f,
+                                   Player::kHalfXZ + 2.0f);
+    for (size_t c = 0; c < sk.chains.size(); c++) {
+      const IkChain& ch = sk.chains[c];
+      if (ch.tag != "arm" || ch.parts.empty() || ch.effector < 0) continue;
+      const float weight = ch.weight * hangIkWeight_;
+      if (weight <= 0) continue;
+      const Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
+      const float latM = shoulder.x - pivot.x;  // this arm's own spread
+      // Palm rest point on the lip: fingers just over the top surface.
+      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead, lipTopY + 0.3f,
+                 cz + leftW.z * latM + dir.z * ahead};
+      Vec3 rel = palmW - bodyOrigin - pivot;
+      Vec3 palmPrefab = RotateInv(yaw, rel) + pivot;
+      // The solver places the EFFECTOR's joint (the wrist). The grip point is
+      // the hand's item socket — resolve its current model-space offset from
+      // the wrist and aim the wrist short of the lip by exactly that. The
+      // hand's post-clip rotation moves a little as the solve settles, so
+      // this converges over a couple of frames, which a static hang absorbs.
+      Vec3 sockLocal{};
+      bool found = false, mirrored = false;
+      for (const MobSocketDef& sock : def_->sockets) {
+        if (sock.partIndex < 0) continue;
+        if (sock.partIndex == ch.effector) {
+          sockLocal = sock.offset - parts[sock.partIndex].restOffset;
+          found = true;
+          mirrored = false;
+          break;
+        }
+        // No socket on THIS hand: borrow one from another ARM's hand and
+        // mirror its lateral component. Palms are near-centred in a hand's
+        // width, so the residual error is a fraction of a voxel — and a rig
+        // that wants it exact just authors a socket on both hands. A socket
+        // on anything that is not a hand (a back scabbard, say) must not be
+        // borrowed, hence the effector check.
+        if (found) continue;
+        for (const IkChain& other : sk.chains) {
+          if (other.tag == "arm" && other.effector == sock.partIndex) {
+            sockLocal = sock.offset - parts[sock.partIndex].restOffset;
+            found = true;
+            mirrored = true;
+            break;
+          }
+        }
+      }
+      if (mirrored) sockLocal.x = -sockLocal.x;
+      if (ch.effector < (int)st.model.size()) {
+        Vec3 palmOff = QuatRotate(st.model[ch.effector].rot, sockLocal);
+        palmPrefab = palmPrefab - palmOff;
+      }
+      // Ghost guard, same geometry rule as the legs: while the weight fades
+      // out after a drop the lip is stale, and once it is beyond the arm's
+      // reach there is nothing sensible to solve for.
+      float reach = 0.0f;
+      for (size_t i = 1; i < ch.parts.size(); i++)
+        reach += sk.parts[ch.parts[i]].rest.pos.len();
+      if ((palmPrefab - shoulder).len() > reach * 1.7f + 1.0f) continue;
+      AnimSolveTwoBone(sk, st, ch, palmPrefab, weight);
+    }
+  }
 }
 
 // ---- per-tick ---------------------------------------------------------------
@@ -1498,6 +1600,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
                    player.pos.z - def.worldSize.z * 0.5f};
     heading_ = heading;
 
+    // Mirror the hang state for the arm-IK block; UpdateAnimation itself
+    // stays player-free by design.
+    hangActive_ = player.hanging;
+    if (player.hanging) {
+      hangLipW_ = player.hangLip;
+      hangDirW_ = player.hangDir;
+    }
     UpdateAnimation(dt, world, player.grounded, player.vel);
 
     // ---- air state clips ----

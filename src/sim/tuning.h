@@ -156,11 +156,21 @@ struct Tuning {
     // Matches jumpSpeed by default so a boost feels like a jump's worth of
     // pull. 0 turns W-on-an-unstandable-lip into simply letting go.
     float ledgeBoostSpeed = 5.25f;
-    // Speed and timeout of the committed pull-up onto a standable lip, and of
-    // the settle into the dead hang. Same semantics as the water mantle pair
-    // above — the timeout exists for a climb blocked partway by a live world.
-    float ledgeMantleSpeed = 4.5f;
-    float ledgeMantleTime = 0.9f;
+    // Speed and timeout of the committed pull-up onto a standable lip. Same
+    // semantics as the water mantle pair above — the timeout exists for a
+    // climb blocked partway by a live world. Deliberately SLOW (a body-length
+    // climb takes over a second): at the old 4.5 the pull-up read as a big
+    // jump, not as hauling yourself up. The timeout must cover the full climb
+    // at this speed or it aborts mid-pull.
+    float ledgeMantleSpeed = 1.5f;
+    float ledgeMantleTime = 2.8f;
+    // How fast the body settles into the dead hang after a catch. Split from
+    // the mantle speed on purpose: slowing the pull-up must not make the
+    // catch itself feel sluggish.
+    float ledgeSettleSpeed = 4.5f;
+    // Sideways hand-over-hand speed along the ledge (A/D while hanging).
+    // Slow by design — it is a traverse, not a strafe. 0 disables.
+    float ledgeShimmySpeed = 0.8f;
     // Minimum time a grab hangs before W (held or pressed) pulls up. W is
     // almost always still held from the jump approach, so without this floor
     // the mantle fires on the first hang frame and the catch never appears on

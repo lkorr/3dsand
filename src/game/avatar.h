@@ -488,6 +488,13 @@ class PlayerAvatar {
   // the arm boost) must not fire the "jump" clip — the arms are already up in
   // the hang pose and the flourish reads as a spasm on release.
   bool wasHanging_ = false;
+  // ---- ledge-hang arm IK (see the block after the weapon arm) ----
+  // Mirrored out of Player each PreTick so UpdateAnimation (whose signature
+  // deliberately stays player-free) can pin the palms to the held lip.
+  bool hangActive_ = false;
+  IVec3 hangLipW_{};        // the held lip voxel, world
+  Vec3 hangDirW_{1, 0, 0};  // horizontal facing at grab time, toward the wall
+  float hangIkWeight_ = 0.0f;  // faded like gaitWeight_, never a hard switch
   // Seconds spent continuously off the ground. `grounded` flickers false for a
   // tick at a time crossing bumpy terrain, and the air-state clips used to fire
   // on that raw edge — retriggering the arms-up `jump` one-shot on every bump.

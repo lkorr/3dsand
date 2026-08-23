@@ -633,8 +633,35 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       hangTime += dt;
       ledgeInReach = true;  // holding one, by definition
       ledgeLip = hangLip;
+
+      // ---- shimmy: hand-over-hand along the ledge (A/D) ----
+      // Sideways only, slow, and only where the ledge continues: after the
+      // slide the lip is re-probed in the ORIGINAL grab direction (hangDir,
+      // not the camera — looking around must not steer the hands), and if no
+      // lip answers there the move is undone. Running off the end of a ledge
+      // therefore stops the hands at its last cell instead of dropping.
+      if (std::abs(in.strafe) > 0.3f && T().ledgeShimmySpeed > 0.0f) {
+        const Vec3 rightW{-hangDir.z, 0.0f, hangDir.x};
+        const float step =
+            (T().ledgeShimmySpeed / kVoxelMeters) * dt * in.strafe;
+        const Vec3 before = pos;
+        SweepAxis(pos, rightW.x * step, 0, kindAt);
+        SweepAxis(pos, rightW.z * step, 2, kindAt);
+        LedgeHit hit;
+        if (LedgeGrabAhead(pos, hangDir, kindAt, &hit)) {
+          // The grip follows: lip, anchor and the pull-up spot all track the
+          // new position, so a pull-up after a traverse climbs where you are.
+          hangLip = hit.lip;
+          hangAnchor = hit.anchor;
+          hangStand = hit.stand;
+          ledgeLip = hangLip;
+        } else {
+          pos = before;  // end of the ledge: the hands stay on the last lip
+        }
+      }
+
       Vec3 d = hangAnchor - pos;
-      const float step = (T().ledgeMantleSpeed / kVoxelMeters) * dt;
+      const float step = (T().ledgeSettleSpeed / kVoxelMeters) * dt;
       const float yBefore = pos.y;
       if (std::abs(d.y) > 1e-3f)
         SweepAxis(pos, std::clamp(d.y, -step, step), 1, kindAt);
