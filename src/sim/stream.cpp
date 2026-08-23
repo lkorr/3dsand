@@ -14,7 +14,22 @@ namespace {
 constexpr uint64_t kChunkBytes = kChunkVol * 4;
 constexpr int kHysteresis = 2;        // chunks past center before a shift
 constexpr size_t kEvictBatch = 256;   // staging bound: 4 MB per readback batch
-constexpr size_t kMaxPendingEvicts = 4;  // in-flight batches before we block
+// THE RING MUST BE DEEPER THAN ONE SHIFT, or every shift blocks.
+//
+// A shift plane is kNChunk^2 = 1,024 slots = exactly 4 batches of kEvictBatch.
+// At the old depth of 4 the ring was full the instant a shift finished
+// evicting, so the next AcquireStaging - the paged demote path's, or the next
+// axis's - called CompleteOldest and waited on a map submitted microseconds
+// earlier. Moving diagonally shifts up to 3 axes in ONE frame (kHysteresis is
+// per-axis), which is 12 batches through those 4 slots: the measured 10 fps.
+//
+// 16 covers three axes of shift (12) plus the demote path's own batches with
+// slack, so the maps land ticks later on the harvest path in Update() as the
+// design intends. Cost is bounded and paid only if actually used: staging
+// buffers are pooled and allocated lazily by AcquireStaging, at 4 MiB each
+// (kEvictBatch * kChunkBytes), so this is a 64 MiB ceiling on a 512 MiB pool
+// budget, not a 64 MiB reservation.
+constexpr size_t kMaxPendingEvicts = 16;  // in-flight batches before we block
 }  // namespace
 
 // The persisted word is 32-bit, not 16. It was 16 while the low half was the
@@ -104,10 +119,28 @@ void Stream::Update(IVec3 playerChunk) {
   int half = (int)kNChunk / 2;
   int d[3] = {playerChunk.x - (o.x + half), playerChunk.y - (o.y + half),
               playerChunk.z - (o.z + half)};
+  // ONE AXIS PER CALL, and the axis that is furthest out of centre first.
+  //
+  // A shift cannot be split across frames - the whole plane must be evicted
+  // and refilled before the next tick observes the new origin, which is why
+  // Update is documented as a between-ticks call. What CAN be spread is the
+  // number of AXES: moving diagonally puts two or three axes past kHysteresis
+  // on the same frame, and shifting all of them here meant up to 3,072 slots
+  // (12 eviction batches, 3 genChunk dispatches, 3 demote passes) inside one
+  // frame. That is a 3x spike on top of an already expensive frame.
+  //
+  // Deferring the other axes costs nothing in correctness: kHysteresis is 2
+  // chunks, so an axis that is 2 out stays resident and correct for another
+  // 2 chunks of travel - a whole chunk of slack at any sane speed - and the
+  // next frame's Update picks it up. Taking the LARGEST |d| first is what
+  // keeps that true under sustained diagonal flight: the deferred axes cannot
+  // starve, because each frame serves whichever has drifted furthest.
+  int best = -1, bestMag = kHysteresis - 1;
   for (int a = 0; a < 3; a++) {
-    if (d[a] >= kHysteresis) ShiftAxis(a, 1);
-    else if (d[a] <= -kHysteresis) ShiftAxis(a, -1);
+    const int mag = d[a] < 0 ? -d[a] : d[a];
+    if (mag > bestMag) { bestMag = mag; best = a; }
   }
+  if (best >= 0) ShiftAxis(best, d[best] > 0 ? 1 : -1);
 }
 
 void Stream::MarkModifiedBox(IVec3 lo, IVec3 hi) {
@@ -135,6 +168,13 @@ void Stream::ShiftAxis(int axis, int dir) {
       slots.push_back(World::SlotChunkIndex(wc));
     }
 
+  // Mark the plane as "evicted by THIS shift" before evicting it, so the
+  // refill below can tell its own eviction (whose bytes it does not need)
+  // from a genuine earlier doubled-back one (whose bytes it does). See the
+  // shiftEvicted_ note in stream.h.
+  if (shiftEvicted_.size() != kNumChunks) shiftEvicted_.assign(kNumChunks, 0);
+  for (uint32_t s : slots) shiftEvicted_[s] = 1;
+
   EvictSlots(slots, /*filter=*/true);
 
   IVec3 no = o;
@@ -143,6 +183,11 @@ void Stream::ShiftAxis(int axis, int dir) {
   else no.z += dir;
   world_->SetWindowOrigin(no);
   FillSlots(slots);
+  // Cleared per shift, not per frame: a multi-axis frame runs ShiftAxis once
+  // per axis, and axis 2's fill must still be able to wait on axis 1's
+  // eviction if they happen to share a slot (the planes intersect along an
+  // edge). Scoping the exemption to one shift keeps that case correct.
+  for (uint32_t s : slots) shiftEvicted_[s] = 0;
   shifts_++;
 }
 
@@ -297,10 +342,21 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
   for (uint32_t s : slots) {
     modified_[s] = 0;
     IVec3 wc = world_->SlotToWorldChunk(s);
-    // the chunk's own eviction may still be in flight (player doubled back
-    // within the map latency): complete it so the store lookup sees it
-    while (pendingChunks_.count(World::PackChunkKey(wc)))
-      CompleteOldest(/*discard=*/false);
+    // The chunk's own eviction may still be in flight (player doubled back
+    // within the map latency): complete it so the store lookup below sees it.
+    //
+    // EXCEPT when THIS shift is what evicted it. Then the store lookup does
+    // not want the pending bytes at all: the slot is being refilled for a
+    // DIFFERENT world chunk under the new origin, so the pending eviction's
+    // data belongs to the chunk that just left and is only owed to the SAVE,
+    // which the pending batch already owns and will complete asynchronously.
+    // Draining here bought nothing and cost the whole frame - it fired on the
+    // first slot of every shift, because EvictSlots had just inserted all
+    // 1,024 of them. This is the residency-INDEPENDENT half of the shift
+    // hitch: it runs identically under dense and paged.
+    if (!(s < shiftEvicted_.size() && shiftEvicted_[s]))
+      while (pendingChunks_.count(World::PackChunkKey(wc)))
+        CompleteOldest(/*discard=*/false);
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
       // ---- store-hit classification (PLAN_page_table.md §3.5d) ------------

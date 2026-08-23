@@ -121,6 +121,23 @@ class Stream {
   // (streaming); filter=false saves everything including air (whole-window
   // flush). Returns without blocking.
   void EvictSlots(const std::vector<uint32_t>& slots, bool filter);
+  // The SHIFT-LOCAL eviction snapshot (the same-frame stall fix).
+  //
+  // EvictSlots inserts every slot of the leaving plane into pendingChunks_,
+  // and FillSlots is then handed THAT SAME PLANE. Its "player doubled back"
+  // drain therefore hit on the first slot of every shift and blocked the frame
+  // on maps submitted microseconds earlier — four batches through a four-slot
+  // ring, so the ring was always full too. Both stalls have one cause: the
+  // refill asks the GPU for bytes the CPU is about to overwrite anyway.
+  //
+  // The resolution is that a shift does not NEED those bytes. A slot leaving
+  // the window is refilled from the store or from procgen under the NEW
+  // origin — its old contents matter only to the SAVE, which the pending batch
+  // already owns. So the fill path must not consult pendingChunks_ for slots
+  // this shift itself evicted; it may only wait for an eviction from an
+  // EARLIER shift, which is the genuine doubled-back case the drain was
+  // written for. This set is those slots, live for the duration of one shift.
+  std::vector<uint8_t> shiftEvicted_;
   // Fill slots from store/procgen under the CURRENT window origin.
   void FillSlots(const std::vector<uint32_t>& slots);
   // Grab a pooled staging buffer, recycling the oldest pending batch if the
