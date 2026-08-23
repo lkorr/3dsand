@@ -338,6 +338,20 @@ class PageTable {
   SlotSet opTargets_;                     // C(N) contributor (a), this tick
   SlotSet particleChunks_;                // C(N) contributor (b), carried
   SlotSet materialized_;                  // step (4)'s result, this tick
+  // Contributor (d): the ACT SET of the slots Stream::FillSlots refilled
+  // since the last Materialize — free surfaces and full-chunks-touching-air,
+  // never pure sky or air-isolated bulk (FillSlots applies the narrowing at
+  // declaration; see the act-set note there).
+  //
+  // Buffered rather than added to cpuDirty_ on the spot because FillSlots runs
+  // BETWEEN ticks: a direct Add landed BEFORE the next tick's
+  // TightenFromSnapshot, on the wrong side of step (2)'s intersection, and got
+  // tightened away — after which the slot was never materialized while its
+  // dirty flags still made the CA dispatch on it, so writes went through a
+  // sentinel and were lost (the streaming gate's 217 page faults). Materialize
+  // consumes it into cpuDirty AFTER the tightening and records it in the C(j)
+  // ring for later roll-forwards. See RefilledSlot for the full argument.
+  SlotSet refilled_;
   SlotSet shellSeed_;                     // contributor (e): occMatter, to the mirror
   SlotSet shell_;                         // seed + ring: ConsumeOccupancy's guard
   bool shellPending_ = false;             // seed awaits Materialize's union

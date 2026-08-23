@@ -417,6 +417,38 @@ inline uint32_t SynthWordAt(uint32_t entry, int x, int y, int z, uint32_t seed) 
   return PackVoxNew(mat, JitterStateFor(x, y, z, seed));
 }
 
+// ---- the ROW form of the JITTER rule: same words, two thirds the work ------
+//
+// SynthWordAt is the DEFINITION and stays the definition. This is a strictly
+// derived helper for the two paths that synthesize or verify a whole chunk
+// (eviction's sentinel RLE, Classify's JITTER test), both of which walk cells
+// in x-fastest order and therefore call the definition 4,096 times with only
+// `x` changing across each 16-cell row.
+//
+// Hash3(a,b,c) = Pcg(a ^ Pcg(b ^ Pcg(c))), and the JITTER key is
+// a = seed^0xC0FFEE, b = x ^ (z << 12), c = y. Across one row y and z are
+// FIXED, so Pcg(c) is loop-invariant and only the outer two rounds vary. The
+// row form hoists it, which is a pure strength reduction: the arithmetic that
+// remains is bit-identical to what the definition computes, so every word this
+// produces equals SynthWordAt's for the same cell. It is not a second rule and
+// must never become one — if the definition changes, this changes with it, and
+// the page-roundtrip gate compares them.
+//
+// Measured motivation: eviction synthesized 1.37 M chunks (5.6 G hash evals)
+// over one --autofly-hard run, at 55% of the paged frame cost. Removing one of
+// three PCG rounds is the cheapest third of that, and it is hash-invisible by
+// construction.
+inline uint32_t JitterRowSeed(int y, int z, uint32_t seed) {
+  // Everything in Hash3's inner round that does not depend on x: Pcg(y), and
+  // the z half of b. `x` is xor'd in by JitterStateInRow below.
+  (void)seed;
+  return rng::Pcg((uint32_t)y) ^ ((uint32_t)z << 12);
+}
+inline uint32_t JitterStateInRow(uint32_t rowSeed, int x, uint32_t seed) {
+  // rowSeed = Pcg(y) ^ (z << 12); b ^ Pcg(c) = (x ^ (z<<12)) ^ Pcg(y) = x ^ rowSeed
+  return (rng::Pcg((seed ^ 0xC0FFEEu) ^ rng::Pcg((uint32_t)x ^ rowSeed))) % 3u;
+}
+
 // ---- the stain layer (DESIGN.md §3) ----
 // Bits 24..30 of the voxel word: 4-bit amount, 3-bit type. EXACT mirror of the
 // STAIN_* consts in common.wgsl — that file is the one the shaders see, this

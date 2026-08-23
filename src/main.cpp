@@ -2035,7 +2035,7 @@ int main(int argc, char** argv) {
       // most one 1-chunk shift per axis)
       IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                            ifloor(player.pos.z) >> 4};
-      stream.Update(playerChunkNow);
+      stream.Update(playerChunkNow, tick);
       // far-field cascades track the player the same way (render-only)
       far.Update(playerChunkNow);
       uint32_t farCount = far.PrepareTick(ctx.queue);

@@ -18,6 +18,7 @@
 #include "test/support.h"
 
 #include "sim/pagetable.h"
+#include "sim/stream.h"  // RleEncodeChunk / RleEncodeSentinelChunk (fusion gate)
 
 using namespace sandvox;
 
@@ -926,6 +927,50 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
 
   const bool paged = world.residency == World::Residency::Paged;
   PageTable& pt = *world.pages;
+
+  // ---- step 0: the SENTINEL RLE FUSION is byte-identical (CPU only) --------
+  //
+  // RleEncodeSentinelChunk computes the RLE a sentinel chunk would produce
+  // WITHOUT materializing its 4,096 words — it fuses SynthWordAt's synthesis
+  // loop into RleEncodeChunk's run scan, and (for the EMPTY/UNIFORM shape)
+  // skips the loop entirely. That is only legitimate if it is a fusion rather
+  // than a second encoding, so assert the equality directly against the
+  // definition: synthesize with SynthWordAt, encode with RleEncodeChunk, and
+  // demand the same bytes. The save format depends on this (§4.2), and a
+  // divergence here would corrupt evicted chunks silently and permanently.
+  //
+  // Covers all three sentinel shapes and NEGATIVE world-chunk coordinates —
+  // the two's-complement bitcast is the documented trap in the jitter formula.
+  {
+    std::vector<uint32_t> words(kChunkVol), refRle, fusedRle;
+    const uint32_t seed = pt.WorldSeed();
+    const uint32_t entries[] = {
+        kPtEmpty,
+        kPtSentinelBit | kMatStone,
+        kPtSentinelBit | kPtJitterBit | kMatStone,
+        kPtSentinelBit | kPtJitterBit | kMatSand,
+    };
+    const IVec3 coords[] = {{0, 0, 0}, {3, 5, 7}, {-4, -1, -9}, {130, -7, 22}};
+    for (uint32_t e : entries)
+      for (const IVec3& wc : coords) {
+        const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                  bz = wc.z * (int)kChunk;
+        for (uint32_t k = 0; k < kChunkVol; k++)
+          words[k] = SynthWordAt(e, bx + (int)(k % kChunk),
+                                 by + (int)((k / kChunk) % kChunk),
+                                 bz + (int)(k / (kChunk * kChunk)), seed);
+        RleEncodeChunk(words.data(), refRle);
+        RleEncodeSentinelChunk(e, wc, seed, fusedRle);
+        if (refRle != fusedRle) {
+          detail = "sentinel RLE fusion diverged: entry " + std::to_string(e) +
+                   " at chunk " + std::to_string(wc.x) + "," +
+                   std::to_string(wc.y) + "," + std::to_string(wc.z) +
+                   " (" + std::to_string(refRle.size()) + " vs " +
+                   std::to_string(fusedRle.size()) + " words)";
+          return Status::Fail;
+        }
+      }
+  }
 
   // Standalone (--gate) the world is the untouched identity map: every pool
   // page is claimed by ResetIdentity and the free list is EMPTY, so the paint

@@ -208,7 +208,14 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.SetChunkProbe([pctx, pw](uint32_t slot, uint32_t* out) {
       const uint64_t off = pw->PageOffsetOfSlot(slot);
       if (off == World::kNoPage) return false;
-      pctx->WaitIdle();
+      // NO WaitIdle HERE. It was a full mid-frame device drain per candidate
+      // and it was buying nothing: ReadbackBlocking submits its own copy, so
+      // the copy is queue-ordered behind every prior submit, and its
+      // ReadBufferBlocking then does the wait itself (rhi_vk.cpp:518-527,
+      // "WaitIdle + memcpy from the persistent map"). Deferred host writes are
+      // covered too — VkrDevice::WaitIdle flushes PendingUploadCount through a
+      // trivial submit before waiting (rhi_vk.cpp:504-516). So the explicit
+      // drain was one redundant full-queue stall per probe.
       return rhi::ReadbackBlocking(pctx->device, pctx->queue, pw->voxels, off,
                                    out, (size_t)kChunkVol * 4, "freeProbe");
     });
