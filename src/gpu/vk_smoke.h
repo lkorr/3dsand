@@ -46,7 +46,8 @@ namespace sandvox {
 // `lowPower` mirrors `--adapter low` (it selects among Vulkan physical devices).
 // `sledgehammer` selects the §6.2 A/B oracle barrier mode.
 // `validation` turns on VK_LAYER_KHRONOS_validation + synchronization validation.
-int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation);
+int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation,
+               bool paged = false);
 
 // `--vk-smoke-loud` — the ACTIVE-world pinned sequence (19 probes).
 //
@@ -82,6 +83,7 @@ int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation);
 // checked at INTERVALS rather than only at the end: an end-only check cannot
 // distinguish "never diverged" from "diverged and reconverged", and the tick
 // at which a divergence first appears is the diagnosis (§6.2).
-int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation);
+int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation,
+                   bool paged = false);
 
 }  // namespace sandvox

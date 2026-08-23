@@ -85,6 +85,11 @@ void CommandEncoder::FillTracked(pass::Buf id, const Buffer& b) const {
   p_->FillTracked(id, b);
 }
 
+void CommandEncoder::FillTracked(pass::Buf id, const Buffer& b, uint64_t offset,
+                                 uint64_t size, uint32_t pattern) const {
+  p_->FillTrackedRange(id, b, offset, size, pattern);
+}
+
 void CommandEncoder::CopyTextureToBuffer(const TexelCopyTexture& src,
                                          const TexelCopyBuffer& dst,
                                          const Extent3D& extent) const {

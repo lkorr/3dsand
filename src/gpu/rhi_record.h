@@ -37,6 +37,8 @@ struct TableCtx {
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   bool hashEnable = false;
   bool particlesActive = false;
+  // False under --residency paged (PLAN_page_table.md §3.5c).
+  bool denseWorldgen = true;
 };
 
 // The live resources a table row resolves against, as SEAM handles. The

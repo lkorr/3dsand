@@ -316,6 +316,167 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- player-ledgegrab --------------------------------------------------
+//
+// Ledge grabbing: airborne with space held, arms facing a voxel lip within
+// hand reach, the body latches on and dangles; W pulls it up (player.cpp
+// LedgeGrabAhead + the hanging block). The gesture this exists for: jump a
+// gap, fall a bit short, catch the lip, pull up — and on a wall of small
+// ledges, chain grab/boost/grab to scale it.
+//
+// Synthetic kindAt fixtures for the same reasons the waterjump gate lists.
+// The geometry is chosen so the jump ALONE always falls short: jumpSpeed
+// 5.25 m/s buys 1.40 m of rise against a plateau 1.5 m above the feet, so any
+// body that ends up on top provably went through the grab. The negative
+// fixtures carry the weight — a sheer wall must never latch at any fall
+// speed, and without space held nothing may latch at all.
+Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
+  // Launch floor for x<140 (top y=100), a pit floor at y=60 under the gap so
+  // a missed grab lands somewhere provable, and the grab wall at x>=150.
+  // (a) plateau: wall top y=115 -> lip cell y=114, open sky above.
+  auto plateauKind = [](IVec3 c) {
+    if (c.y < 60) return CellKind::Solid;  // pit floor
+    if (c.x < 140) return c.y < 100 ? CellKind::Solid : CellKind::Air;
+    if (c.x >= 150) return c.y < 115 ? CellKind::Solid : CellKind::Air;
+    return CellKind::Air;
+  };
+  // (b) sheer wall: same launch, the wall runs far past any hand reach.
+  auto cliffKind = [](IVec3 c) {
+    if (c.y < 60) return CellKind::Solid;
+    if (c.x < 140) return c.y < 100 ? CellKind::Solid : CellKind::Air;
+    if (c.x >= 150) return c.y < 200 ? CellKind::Solid : CellKind::Air;
+    return CellKind::Air;
+  };
+  // (d) noisy wall: the face column (x=150) stops at the same y=114 lip, but
+  // more wall rises right behind it (x>=151 up to y=127). There is no room to
+  // stand on that one-voxel ledge, so the pull-up must become the arm boost,
+  // and the NEXT lip (y=127) must catch on the way down from the boost apex —
+  // the chain. The tier height leaves ~6 voxels between the apex (anchor
+  // y=105 at ledgeHangDrop 0.15 m, + 14 voxels of jumpSpeed rise) and the
+  // bottom of lip2's latch window, so a modest jumpSpeed or hang-drop retune
+  // does not silently break the gate.
+  auto noisyKind = [](IVec3 c) {
+    if (c.y < 60) return CellKind::Solid;
+    if (c.x < 140) return c.y < 100 ? CellKind::Solid : CellKind::Air;
+    if (c.x >= 151) return c.y < 128 ? CellKind::Solid : CellKind::Air;
+    if (c.x == 150) return c.y < 115 ? CellKind::Solid : CellKind::Air;
+    return CellKind::Air;
+  };
+
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  const float dt = 1.0f / 60.0f;
+
+  // Sprint at the wall, jump just before the edge, then fly with W (and space,
+  // when `space`) pressed into it — exactly the inputs a player makes. When
+  // `pauseAtHang`, W is released for half a second once the latch fires, so
+  // the DANGLE itself is what is being measured: the grip must hold with no
+  // input but space, and must not drift. Then W again pulls up, and keeps
+  // pressing past the top (same reasoning as the waterjump's extra frames — a
+  // climb that slides back off the lip must read as a failure).
+  struct RunResult {
+    Player p;
+    bool everHung = false, droppedWhileWaiting = false;
+    int firstHangFrames = 0;      // dangle length of the first latch
+    bool firstHangEnded = false;
+  };
+  auto run = [&](const Player::KindFn& kindAt, bool space, bool pauseAtHang,
+                 int frames) {
+    RunResult r;
+    r.p.fly = false;
+    r.p.pos = Vec3{132.0f, 100.0f + Player::kHalfY, 200.5f};
+    int stage = 0, hangHeld = 0;
+    for (int i = 0; i < frames; i++) {
+      // Stage transitions are judged on the player's CURRENT state, before
+      // this frame's input is built. Folded into the input branches (the
+      // first version of this loop), the latch frame was followed by one more
+      // W frame and the pull-up fired before the dangle was ever measured.
+      if (stage == 1 && r.p.hanging) {
+        r.everHung = true;
+        stage = pauseAtHang ? 2 : 3;
+      } else if (stage == 2) {
+        if (!r.p.hanging) r.droppedWhileWaiting = true;
+        if (++hangHeld >= 30) stage = 3;
+      } else if (stage == 3 && r.p.hanging) {
+        r.everHung = true;  // chained re-grabs during the climb
+      }
+      // Length of the FIRST hang, in frames. This is what proves the settle
+      // delay: with W and space both held straight through the latch, the
+      // grab must still dangle for ledgePullDelay before the pull-up honours
+      // the held W — the instant-mantle regression made the catch invisible.
+      if (r.everHung && !r.firstHangEnded) {
+        if (r.p.hanging) r.firstHangFrames++;
+        else r.firstHangEnded = true;
+      }
+      PlayerInput in;
+      in.sprint = true;
+      if (stage == 0) {  // run-up
+        in.forward = 1.0f;
+        if (r.p.grounded && r.p.pos.x > 135.0f) {
+          in.jumpPressed = true;
+          in.up = space;
+          stage = 1;
+        }
+      } else if (stage == 1) {  // flight, pressed into the wall
+        in.forward = 1.0f;
+        in.up = space;
+      } else if (stage == 2) {  // dangle: hands only, W released
+        in.up = space;
+      } else {  // pull up and keep walking over the top
+        in.forward = 1.0f;
+        in.up = space;
+      }
+      r.p.Update(dt, in, fwd, right, fwd, kindAt);
+    }
+    return r;
+  };
+
+  // (a) the headline move: grab, hold a half-second dead hang, pull up, stand.
+  RunResult a = run(plateauKind, true, true, 600);
+  float aFeet = a.p.pos.y - Player::kHalfY;
+  bool aOk = a.everHung && !a.droppedWhileWaiting && a.p.grounded &&
+             !a.p.hanging && std::abs(aFeet - 115.0f) < 0.75f &&
+             a.p.pos.x > 150.0f + Player::kHalfXZ;
+
+  // (b) sheer wall: same press, same fall, nothing within reach ends in air
+  // with room above it. Must never latch — otherwise every wall in the world
+  // is climbable — and the body must therefore end on the pit floor, which is
+  // also the proof the fixture gave it nothing else to land on.
+  RunResult b = run(cliffKind, true, false, 400);
+  float bFeet = b.p.pos.y - Player::kHalfY;
+  bool bOk = !b.everHung && bFeet < 62.0f;
+
+  // (c) space never held: the identical jump at the grabbable plateau must
+  // sail past it into the pit. Space IS the grip; W alone must not climb.
+  RunResult c = run(plateauKind, false, false, 400);
+  float cFeet = c.p.pos.y - Player::kHalfY;
+  bool cOk = !c.everHung && cFeet < 62.0f;
+
+  // (d) chained climb up the noisy wall: first lip unstandable -> arm boost
+  // -> second lip -> mantle onto the top. Everything after the jump is just
+  // "hold W and space", which is the point of the feature — and BECAUSE W is
+  // held straight through the latch, the first hang's length is the settle
+  // assertion: it must last most of ledgePullDelay (10 frames ~ 0.17 s of the
+  // 0.25 s default) before the held W is honoured. An instant mantle here is
+  // the "hanging doesn't work" regression.
+  RunResult d = run(noisyKind, true, false, 900);
+  float dFeet = d.p.pos.y - Player::kHalfY;
+  bool dOk = d.everHung && d.p.grounded && !d.p.hanging &&
+             std::abs(dFeet - 128.0f) < 0.75f && d.firstHangFrames >= 10;
+
+  bool ok = aOk && bOk && cOk && dOk;
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "plateau: hung=%d dropped=%d feet=%.1f x=%.1f (want 115, "
+                ">153); cliff hung=%d feet=%.1f; no-space hung=%d feet=%.1f; "
+                "chain hung=%d feet=%.1f (want 128) firstHang=%df (want>=10)",
+                a.everHung ? 1 : 0, a.droppedWhileWaiting ? 1 : 0, aFeet,
+                a.p.pos.x, b.everHung ? 1 : 0, bFeet, c.everHung ? 1 : 0,
+                cFeet, d.everHung ? 1 : 0, dFeet, d.firstHangFrames);
+  detail = buf;
+  std::printf("player ledgegrab: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- player-plants -----------------------------------------------------
 //
 // Soft vegetation must not stop a moving body. Pond weed, reeds and kelp are
@@ -408,6 +569,7 @@ const std::vector<Gate>& PlayerGates() {
   static const std::vector<Gate> g = {
       {"player-walk", "player", {}, false, GatePlayerWalk},
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
+      {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
       {"player-plants", "player", {}, false, GatePlayerPlants},
   };
   return g;

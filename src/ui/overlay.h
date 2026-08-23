@@ -79,6 +79,12 @@ struct UIState {
   const char* swingPhase = "";          // melee state, for the HUD readout
   float swingSpeed = 0;                 // mouse speed driving the swing
 
+  // Ledge-grab readout (dev panel). main.cpp composes the text from the
+  // player's per-frame probe so a refused grab says WHICH latch gate refused;
+  // state drives the colour: 0 = no lip in reach, 1 = in reach, 2 = hanging.
+  int ledgeState = 0;
+  std::string ledgeText;
+
   // prefab placement tool (PLAN §A3)
   int prefabSelected = 0;        // index into prefabNames (O cycles)
   int prefabRot = 0;             // 90° Y steps (T rotates)

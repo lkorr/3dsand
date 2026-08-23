@@ -964,6 +964,7 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
+  bool residencyPaged = false;  // --residency paged|dense (dense is the oracle)
   bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
   // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
@@ -1009,6 +1010,23 @@ int main(int argc, char** argv) {
     // timings. Headless, off by default, and the ONLY thing that requests the
     // TimestampQuery device feature.
     if (a == "--measure") measure = true;
+    // `--residency paged|dense` selects the voxel buffer's residency
+    // (docs/PLAN_page_table.md §6.2). ONE variable with a total order of
+    // values rather than two flags, per the phase-6 lesson that a flag named
+    // for the non-default cannot express a default flip.
+    //
+    // `dense` is the identity map: address-identical to pre-paging code while
+    // still running the whole translation path. With Dawn gone it is the ONLY
+    // live differential oracle the engine has, which makes it load-bearing
+    // test infrastructure rather than a fallback — never selected
+    // automatically, always available (§6.3).
+    if (a == "--residency" && i + 1 < argc) {
+      const std::string v = argv[++i];
+      if (v == "paged") residencyPaged = true;
+      else if (v == "dense") residencyPaged = false;
+      else { std::fprintf(stderr, "--residency wants paged|dense, got '%s'\n",
+                          v.c_str()); return 1; }
+    }
     if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
     if (a == "--noaudio") noAudio = true;
     if (a == "--telemetry") telemetryEnabled = true;
@@ -1085,9 +1103,12 @@ int main(int argc, char** argv) {
   // the windowed game (swapchain + imgui_impl_vulkan) — runs on Vulkan, the
   // only backend. The smokes build their own GpuContext, so they run here
   // before the game's asset load.
-  if (vkSmoke) return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation);
+  if (vkSmoke)
+    return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation,
+                               residencyPaged);
   if (vkSmokeLoud)
-    return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation);
+    return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation,
+                                   residencyPaged);
 
   std::string assetDir = AssetDir();
   // Tuning first: LoadShader() bakes these into every shader's constant
@@ -1175,6 +1196,8 @@ int main(int argc, char** argv) {
   if (telemetryEnabled) telemetry.Start(telemetryPort);
 
   World world;
+  world.residency =
+      residencyPaged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
   Simulation sim;
   if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders"))
@@ -2721,6 +2744,33 @@ int main(int argc, char** argv) {
       ui.activeBodyCount = debris.ActiveBodyCount();
       ui.prefabPending = (uint32_t)placer.PendingCount();
       ui.mobCount = mobs.MobCount();
+      // Ledge-grab readout: the probe result plus every latch gate, so "why
+      // didn't it grab" is readable in the panel rather than inferred. The
+      // gates mirror the latch condition in Player::Update exactly.
+      {
+        const float nonJump =
+            CurrentTuning().player.nonJumpSpeed / kVoxelMeters;
+        char lg[160];
+        if (player.hanging) {
+          std::snprintf(lg, sizeof lg,
+                        "HANGING lip(%d,%d,%d) — W: pull up, ctrl: drop",
+                        player.hangLip.x, player.hangLip.y, player.hangLip.z);
+        } else if (player.ledgeInReach) {
+          std::snprintf(
+              lg, sizeof lg,
+              "lip(%d,%d,%d) IN REACH — air=%d space=%d velOk=%d%s",
+              player.ledgeLip.x, player.ledgeLip.y, player.ledgeLip.z,
+              player.grounded ? 0 : 1, pin.up ? 1 : 0,
+              player.vel.y <= nonJump ? 1 : 0,
+              player.grounded ? "  (jump at it holding space)" : "");
+        } else {
+          std::snprintf(lg, sizeof lg,
+                        "no lip in reach (need a wall top between shoulders "
+                        "and fingertips)");
+        }
+        ui.ledgeState = player.hanging ? 2 : (player.ledgeInReach ? 1 : 0);
+        ui.ledgeText = lg;
+      }
       // magic readout: cost must be visible BEFORE the cast, which is what
       // makes the mana/health crossover a decision rather than a surprise.
       ui.mana = caster.mana.mana;

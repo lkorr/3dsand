@@ -183,6 +183,8 @@ struct RunResult {
   std::vector<Probe> probes;
   uint32_t shifts = 0;
   size_t storeCount = 0;
+  // Load-bearing evidence for §3.4's adjacency argument (see RunSmoke).
+  uint32_t pageFaults = 0;
   rhi::vkr::Stats stats{};       // last recorded command buffer
   size_t validationMsgCount = 0;
   std::vector<std::string> validationMsgs;
@@ -192,6 +194,7 @@ struct RunResult {
 // comparison is the same function called twice with a different residency
 // mode, which is why it still returns a whole RunResult rather than a verdict.
 bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
+                 bool paged,
                  const std::vector<MaterialDef>& mats,
                  const std::vector<ReactionGpu>& reactions, const std::string& assetDir,
                  RunResult& out) {
@@ -201,7 +204,11 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
     std::printf("device init: FAIL\n");
     return false;
   }
+  SetHarnessSnapshotDrain(true);  // see test/support.h
   World world;
+  // The residency axis (§4.4 Gate A): one driver, two configurations. Both must
+  // produce identical hashes at every probe AND reproduce the pinned constants.
+  world.residency = paged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
   Simulation sim;
   MicroSet micro;
@@ -360,10 +367,12 @@ bool LoadSmokeAssets(std::vector<MaterialDef>& mats, std::vector<ReactionGpu>& r
   return true;
 }
 
-int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
+int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
+             bool paged) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const char* name = loud ? "--vk-smoke-loud" : "--vk-smoke";
-  std::printf("=== sandvox %s (Vulkan, pinned hash sequence) ===\n", name);
+  std::printf("=== sandvox %s (Vulkan, pinned hash sequence, residency %s) ===\n",
+              name, paged ? "paged" : "dense");
   std::printf("mode: barriers=%s validation=%s adapter=%s seed=%u ticks=%u\n",
               sledgehammer ? "sledgehammer" : "precise", validation ? "ON" : "off",
               lowPower ? "low" : "default", kDefaultSeed,
@@ -384,8 +393,8 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
   }
 
   RunResult run;
-  if (!RunScenario(loud, lowPower, sledgehammer, validation, mats, reactions, assetDir,
-                   run)) {
+  if (!RunScenario(loud, lowPower, sledgehammer, validation, paged, mats, reactions,
+                   assetDir, run)) {
     std::printf("\n=== %s FAIL ===\n", name);
     return 1;
   }
@@ -399,6 +408,16 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
     std::printf("\n=== streaming ===\n  %u window shifts, %zu chunks in store\n",
                 run.shifts, run.storeCount);
 
+  // pageFaults is LOAD-BEARING EVIDENCE for §3.4's adjacency argument, not a
+  // formality: the argument claims every particle write after the first tick
+  // of flight lands within one cell of matter that already exists, so the
+  // bracketed half of materialize(N) already covers it. Non-zero means a write
+  // escaped that claim — find the path; do NOT widen the ring.
+  std::printf("\n=== page faults ===\n  %u%s\n", run.pageFaults,
+              run.pageFaults == 0
+                  ? "  (every sim write reached a materialized page)"
+                  : "  *** A WRITE ESCAPED THE ADJACENCY ARGUMENT ***");
+
   const Pinned* pinned = loud ? kLoudPinned : kQuietPinned;
   const size_t count = loud ? std::size(kLoudPinned) : std::size(kQuietPinned);
   return CompareAndReport(name, run, pinned, count, validation);
@@ -406,12 +425,12 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation) {
 
 }  // namespace
 
-int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation) {
-  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation);
+int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation, bool paged) {
+  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation, paged);
 }
 
-int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation) {
-  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation);
+int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation, bool paged) {
+  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation, paged);
 }
 
 }  // namespace sandvox

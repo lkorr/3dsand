@@ -90,6 +90,8 @@ struct CommandEncoderImpl {
   virtual void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                            const Buffer& dst, uint64_t dstOffset, uint64_t size) = 0;
   virtual void FillTracked(pass::Buf id, const Buffer& b) = 0;
+  virtual void FillTrackedRange(pass::Buf id, const Buffer& b, uint64_t offset,
+                                uint64_t size, uint32_t pattern) = 0;
   virtual void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                                    const Extent3D& extent) = 0;
   virtual void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,

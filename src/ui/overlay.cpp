@@ -298,6 +298,14 @@ void Overlay::Draw(UIState& s) {
               s.activeBodyCount, s.mobCount);
   ImGui::Text("pos %.0f %.0f %.0f  (%s)", s.playerPos[0], s.playerPos[1],
               s.playerPos[2], s.fly ? "fly" : "walk");
+  // Ledge-grab state: green while hanging, yellow when a lip is in reach,
+  // dim otherwise — with the latch gate flags spelled out (see UIState).
+  {
+    const ImVec4 c = s.ledgeState == 2   ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
+                     : s.ledgeState == 1 ? ImVec4(1.0f, 0.85f, 0.30f, 1.0f)
+                                         : ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
+    ImGui::TextColored(c, "ledge: %s", s.ledgeText.c_str());
+  }
 
   // crosshair readout: what material the centre ray landed on. The swatch is
   // the same gpu color0 the material combo uses, so eyeballing "is that ice or

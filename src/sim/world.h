@@ -716,6 +716,20 @@ class World {
     return residency == Residency::Dense ? kNumChunks : kPoolPages;
   }
 
+  // The CPU table itself. Read freely; the MUTABLE accessor is for PageTable
+  // (sim/pagetable.h) alone — it owns the allocator and the materialization
+  // rule, and there must be exactly one writer or the table and the free list
+  // drift apart.
+  const std::vector<uint32_t>& pageTableCpu() const { return pageTableCpu_; }
+  std::vector<uint32_t>& pageTableCpuMutable() { return pageTableCpu_; }
+
+  // The allocator + the conservative dirty mirror + the materialization rule
+  // (sim/pagetable.h). Owned by World so every path that has a World has it —
+  // there is no configuration in which the voxel buffer exists and the thing
+  // that decides its layout does not. Held by pointer to keep pagetable.h out
+  // of world.h's include set, which is otherwise the whole engine's.
+  class PageTable* pages = nullptr;
+
   // ---- on-demand chunk fetches (island detection / terrain meshing) ----
   // Keyed by WORLD chunk coords: slots get recycled by streaming, world
   // chunks don't. Queue a chunk for CPU readback; duplicates are coalesced;

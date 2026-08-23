@@ -300,6 +300,7 @@ add_executable(sandvox
   src/gpu/vk_smoke.cpp
   src/measure/measure.cpp
   src/sim/world.cpp
+  src/sim/pagetable.cpp
   src/sim/worldio.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp

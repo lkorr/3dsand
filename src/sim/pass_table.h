@@ -168,6 +168,13 @@ enum class Cond : uint8_t {
   DirtyTick,  // !hashEnable
   GenCount,   // EncodeGenList count > 0
   FarCount,   // EncodeFarFill count > 0
+  // Whole-world worldgen: the D_CHUNKS dispatch that writes all 32,768 slots.
+  // Suppressed under --residency paged, where worldgen runs BATCHED through
+  // worldgenList instead (PLAN_page_table.md §3.5c): a kernel cannot allocate,
+  // so every slot genChunk touches must have a page before the dispatch, and
+  // all 32,768 at once would need a dense pool — i.e. no saving at the moment
+  // of worldgen, and under §3.8's fatal policy an abort at startup.
+  DenseWorldgen,
   FluidSpawn, // fluidSpawnCount > 0 (MLS-MPM spawn row in PT_TICK)
 };
 

@@ -277,7 +277,14 @@ PASS(wg_fill_claim, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DY
 PASS(wg_fill_drawArgs, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(DrawArgs)))
 // one workgroup per slot chunk; occupancy + dirty flags computed in-kernel
-PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+// C_DENSEWG, not C_ALWAYS: under --residency paged this whole-world dispatch
+// is replaced by batched worldgenList submits (PLAN_page_table.md §3.5c),
+// because genChunk writes all 4,096 cells of every slot it touches and a
+// kernel cannot allocate — all 32,768 at once would need a dense pool. The
+// FILL rows above it still run in both modes: they clear the transient
+// buffers (hash, support, particle counts, both dirty pages) that worldgen
+// resets regardless of how the voxels get written.
+PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
      USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
           R(PageTable) A(PageFaults)))
 

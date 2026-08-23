@@ -1,734 +1,118 @@
 # sandvox — working rules
 
-3D falling-sand voxel engine. GPU-resident cellular automaton over a 256³
-toroidal residency window into an infinite streamed world, raymarched from the
-sim buffers. C++20 + Vulkan + WGSL (compiled to SPIR-V by Tint at load).
-Vulkan-only since 2026-08-22 — Dawn/WebGPU was removed once the port was
-proven; Tint is still built from the Dawn checkout, which is why that
-dependency stays.
+3D falling-sand voxel engine. GPU CA over a 256³ toroidal window into an infinite world, raymarched from sim buffers. C++20 / Vulkan / WGSL (Tint compiles to SPIR-V at load+F5). Vulkan-only since 2026-08-22; Dawn checkout stays for Tint only. **`DESIGN.md` is architecture truth** — read before changing a system, update in the same commit if contradicted.
 
-**`DESIGN.md` is the source of truth for architecture and rationale.** Read the
-relevant section before changing a system; if a change contradicts DESIGN.md,
-update DESIGN.md in the same commit or don't make the change.
+## Parallel sessions
 
----
-
-## You are probably not alone in this tree
-
-Several Claude sessions routinely work this repo **at the same time**. They have
-already, on separate occasions: dropped an authored block out of
-`materials.json` while every shader still compiled, swept another session's
-half-finished work into an unrelated commit, and left conflict markers inside
-JSON via a stash/pop. All of it was silent — green build, normal `git status`.
-
-`AGENTS_BOARD.md` (gitignored, append-only) is the shared scratchpad the
-sessions use to see each other. A `SessionStart` hook prints the open claims and
-the last 12 hours into your context automatically, so you start already knowing
-who is holding what.
-
-**Write to it only through `scripts/board.sh`** — it appends one line, which is
-safe under concurrent writes. Editing the board with Edit/Write rewrites the
-whole file and silently drops whatever another agent appended a second earlier.
+Multiple Claude sessions work this repo concurrently. Coordinate via `AGENTS_BOARD.md` (gitignored, append-only) using **only** `scripts/board.sh` (never Edit/Write the board — rewrites drop concurrent appends):
 
 ```bash
-bash scripts/board.sh active                     # who holds what right now
-bash scripts/board.sh claim "<files>" "<what>"   # BEFORE you start editing
-bash scripts/board.sh done "<what landed>"       # when you stop, or hand off
-bash scripts/board.sh note "<heads-up>"          # no claim, just information
+bash scripts/board.sh active                     # who holds what
+bash scripts/board.sh claim "<files>" "<what>"   # before editing shared files
+bash scripts/board.sh done "<what landed>"       # when you stop
+bash scripts/board.sh note "<heads-up>"          # cross-cutting info
 ```
 
-What is actually required of you:
+Claim before editing: `world.h`, `common.wgsl`, `simulation.cpp`, `main.cpp`, `CLAUDE.md`, `DESIGN.md`, `assets/materials/`, `assets/spells/`, `assets/tuner*`. Re-check board before build/commit/selftest. Stale claims (hours old, untouched files) are abandoned — note and proceed. Also `ls --time-style=full-iso` hub files you depend on.
 
-- **Claim before editing anything shared** — `world.h`, `common.wgsl`,
-  `simulation.cpp`, `main.cpp`, `CLAUDE.md`, `DESIGN.md`, and every file under
-  `assets/materials/`, `assets/spells/`, `assets/tuner*`. `claim` warns you if
-  someone already holds an overlapping path; treat that warning as a reason to
-  re-read the file and reconcile, not as something to ride past.
-- **Re-check the board before a build, a commit, or a `--selftest` run.** These
-  are the three operations that collide hardest: `LNK1104` means someone's
-  `sandvox.exe` is live, and a selftest failure may belong to their tree rather
-  than yours (see the attribution rule below).
-- **Post a `done` with what actually landed**, not "finished". The next session
-  reads that line to know whether the thing it depends on exists yet.
-- **`note` anything cross-cutting the moment you decide it** — a constant you
-  changed, a JSON block you added, a file you are about to regenerate. The
-  `kVoxelMeters` and `stain`-block incidents were both one `note` away from
-  being non-events.
-- **A stale claim is not a lock.** If a claim is hours old and the file looks
-  untouched, it is abandoned; say so with a `note` and proceed. The board is
-  information, never a mutex — nothing blocks on it.
+## Three inviolable rules
 
-This does not replace the freshness checks. Still run
-`ls --time-style=full-iso` on a hub file whose content you are depending on, and
-still re-`grep` an authored JSON block back out after a parallel-edit warning.
-The board tells you who is nearby; the mtime tells you what actually changed.
+### 1. Bit-deterministic simulation
+Same seed+tick+inputs → same world hash everywhere. Integer-only sim math (no f32 in CA). Stateless counter-based RNG: `hash3(seed,tick,cellIndex)`. No scheduling-dependent outcomes (no atomics-CAS, no subgroup ops). Write reach ≤1 cell. **Gate:** `--selftest` runs sim twice, compares hashes. Pinned hash: `7cfa2420`. If it moves, you broke the sim — stop and report.
 
----
+### 2. Cost scales with activity, not world size
+Every system sleeps when idle. Dispatch over compacted dirty-chunk list via `DispatchWorkgroupsIndirect`, never full world. Chunks clear dirty flags and sleep when settled. Reaction growth must be subcritical (expected offspring/tick < 1). Selftest asserts ≤32 active chunks at rest. Bound every emergent process.
 
-## The three rules that outrank everything
-
-Every one of these is cheap to honor now and near-impossible to retrofit. A change
-that violates one is wrong even if it looks correct and runs fast.
-
-### 1. The simulation must be bit-deterministic
-
-Same seed + same tick + same inputs → same world hash, on every machine and every
-GPU vendor. This is what keeps lockstep multiplayer and replay debugging viable
-(DESIGN.md §2, §4, §10). Concretely, inside any sim shader:
-
-- **Integer-only sim state and math.** No `f32` anywhere a value can influence
-  voxel state. Floats are fine for rendering (`raymarch.wgsl`) and for CPU-side
-  camera/player, never for the CA. Shader compilers diverge across vendors on FMA
-  contraction, fast-math, and transcendentals — integers sidestep it entirely.
-- **Stateless counter-based RNG only**: `hash3(seed, tick, cellIndex)` as used in
-  `sim_step.wgsl`. Never a stateful stream, never anything seeded by thread or
-  dispatch order.
-- **No scheduling-dependent outcomes.** No atomics-CAS to claim cells, no subgroup
-  or wave ops, no order-dependent reductions, no append-buffer ordering leaking
-  into sim state. Conflict resolution is by the color lattice or by a fixed
-  priority rule — never first-come-first-served.
-- **Write reach must stay ≤ 1 cell.** The whole race-freedom argument depends on
-  it. A rule that writes 2 cells away silently breaks the lattice guarantee.
-
-**The gate:** `--selftest` runs the sim twice and compares world hashes. It must
-pass before any sim change is considered done. Use `--adapter low` to run on a
-different adapter for cross-vendor hash comparison.
-
-Determinism is still only verified on one vendor (RTX 3060 Ti) — DESIGN.md risk
-#3 is open. Don't add anything that would make it harder to close.
-
-### 2. Cost must scale with activity, not world size
-
-A settled world costs ~nothing. This is the product, not an optimization
-(DESIGN.md §11).
-
-- Every system needs a "costs nothing when idle" state. CA passes, reactions,
-  occupancy — all dispatch over the compacted dirty-chunk list via
-  `DispatchWorkgroupsIndirect`, never over the full world. Full-world scans happen
-  only on hash ticks.
-- Anything that changes marks its chunk dirty; a chunk with no movement and no
-  active reactions clears its flag and sleeps. A voxel moving across a chunk
-  boundary must set the *neighbor's* dirty flag.
-- **Reaction-driven growth must be decisively subcritical.** A rule whose expected
-  offspring per tick is ≥1 means chunks never sleep and the sim never settles —
-  it looks like a perf bug but it's a content bug. See the stem note in
-  `reactions.json`.
-- The selftest asserts a settled world stays under 32 active chunks (currently
-  measures 4). If that number climbs, something stopped sleeping.
-- **Bound every emergent process** — flood fills, reaction cascades, particle
-  counts. Unbounded emergence kills perf and level design both.
-
-### 3. All world mutations flow through the MutationQueue
-
-Brush edits, spells, explosions, worldgen — everything CPU→GPU goes through the
-queue and lands via `sim_mutate.wgsl` (brush + exact-cell ops) or
-`sim_explode.wgsl` (explosion ops). No direct writes to voxel buffers from
-anywhere else. The two sanctioned exceptions are snapshot restores: worldgen
-and `LoadWorld` (worldio.cpp), which replace the whole world rather than
-mutating it.
-
-This queue is also the save format, the replay log, and the network replication
-stream (DESIGN.md §2, §10). Building every new tool against it from day one is the
-entire anti-tech-debt play; a bypass is a future networking bug.
-
-Related: keep CPU↔GPU traffic under ~1 MB/tick, always batched, always async (one
-tick latent via `mapAsync`). Never add a synchronous readback to the frame path —
-the selftest's blocking hash read is the one sanctioned exception.
-
----
-
-## Architecting a new system: guidelines
-
-Distilled from John Lin's *The Perfect Voxel Engine* (voxely.net, 2021),
-mirrored at **`docs/refs/perfect_voxel_engine.md`** — read it before a big
-architectural call. His thesis, in one line: **voxel engines die from their
-data format, not their renderer** — developers pick the structure that renders
-fastest, build every other system on top of it, and then discover it is hostile
-to collision, pathfinding, GI, dynamic objects, and new per-voxel attributes,
-by which point changing it means rewriting everything.
-
-These are guidelines for *designing* a feature, not invariants like the three
-rules above. Where this engine deliberately departs from the post, that is said
-outright below — sandvox is a specific game with a hard 16 bpv budget, not a
-general-purpose engine, and some of Lin's advice is wrong when applied here.
-
-### 1. Design the data format before the renderer, and design it for the system that will hate it most
-
-Lin's core observation: *"It's important to answer these questions ahead of
-time because most of the systems we build need to incorporate the format into
-their designs."* Sparse voxel octrees look brilliant until you ask them for
-collision detection, and *"storage and rendering are the only things they are
-acceptable (not even great) at."*
-
-Before adding a representation, write down how it answers the awkward
-questions, not the easy one:
-
-- How does a **physics query** hit it? A single-cell point sample and a swept
-  capsule are different questions.
-- How does it **serialize**, and does it round-trip bit-exactly? (The stain
-  bits shipped broken because the save format silently truncated hashed state.)
-- How does it **replicate** — can it be expressed as MutationQueue ops, or
-  does it need a second channel? A representation that cannot be expressed as
-  ops is a future networking bug (rule 3).
-- What does **worldgen** or an importer have to emit to produce one?
-- How does it **LOD out**, and what does it look like at the handoff?
-- What happens when it is **half-loaded** at the residency-window edge?
-
-If the answer to one of those is "we'll figure it out later", that is the
-system that will force the rewrite.
-
-### 2. Attributes go in a side table keyed by where they exist — never widened onto the base voxel
-
-This is the post's sharpest point, via a thought experiment: given a ray-tracing
-API taking `struct vertex_t { vec3 position; vec3 normal; }`, do you (A) add
-`vec3 color` to the vertex and update every consumer, or (B) accept opaque data
-with an offset/stride and bake *indices* instead of attributes? B is correct,
-and *"imagine replacing Vertex with Voxel and suddenly with answer A you've
-described Efficient Sparse Voxel Octrees."* The failure mode has a name in the
-post — `dumb_voxel_grid_t`, a grid carrying `material_ids`, `albedo`, `normal`,
-`vegetation_type`, `vegetation_state`, `redstone_strength` for every cell,
-everywhere, forever. His test: *"We don't want to store vegetation growth state
-deep underground in some cave where vegetation isn't growing anyway."*
-
-The existing rule "don't grow the 16-bit voxel; extra per-voxel state goes in
-an optional sparse auxiliary layer keyed by chunk" (DESIGN.md §3) is exactly
-answer B, and it holds. Concretely, when a feature wants new per-voxel state:
-
-- **Ask where it actually exists.** If it is meaningful in <10% of cells, it is
-  a sparse layer keyed by chunk, not a field.
-- **Ask whether it must be world state at all.** The cheapest attribute is one
-  that is *derived*: `microvox` gives grass and flowers per-cell sub-geometry
-  with *zero* per-instance storage, zero new world state and zero sim cost,
-  because the world cell stays an ordinary 16-bit voxel and only the raymarcher
-  substitutes the finer model. Reach for that shape first.
-- **The state nibble is not spare space.** Its meaning is already per-material
-  (variant / fullness / burn stage). Overloading it for a sixth meaning is
-  widening the voxel by stealth.
-
-**Where we depart from Lin:** he wants runtime-typed attributes with a name,
-bit width and type enum in a header, so modders can add fields the engine never
-heard of. We do not, and should not, put that indirection on the base voxel —
-16 bpv with a compile-time-known layout is what buys 100M+ resident voxels and
-integer-only deterministic kernels (rule 1). Our extensibility seam is
-different and already exists: **behavior is data via materials/reactions/tags,
-not via runtime-typed voxel fields.** Adding behavior means JSON and tags, not
-a new attribute. Keep the modding surface there.
-
-### 3. Use the format that fits the job, and make the conversion the seam
-
-*"The solution is actually rather obvious: to use whatever voxel format is best
-for the job! This means not having one or two, but as many as are necessary."*
-The precedent Lin cites is meshes: engines import obj/ply/fbx through a common
-interchange, then convert to whatever the GPU wants. Multiple representations
-are fine — *unowned, undocumented, silently-diverging* representations are not.
-
-This engine already runs several by design: the 16-bit world grid (sim truth),
-RLE region files (storage), far-field cascades (render-only LOD), micro bricks
-(render-only detail), `.vox` prefabs (authoring), microbody skins vs. derived
-colliders (skin authoritative, collider by majority-fill), and the MutationQueue
-op stream (mutation, save, replay, network). That is the pattern working.
-
-So when a system wants a different layout, add the *conversion*, don't fork the
-truth:
-
-- **Name one authoritative source per fact.** Every other representation is
-  derived, and says so in a header comment the way `farfield.h` does
-  ("Derived data only: no readbacks, no persistence, no sim interaction, not
-  hashed"). Two things that can both be edited are a desync waiting to happen.
-- **Derived data must be reconstructible and disposable.** If it cannot be
-  rebuilt from the authoritative source, it is not derived — it is a second
-  copy of the truth, and it belongs in the save format and the world hash.
-- **Put the conversion in one function with an obvious name.** Lin's point that
-  conversion operators are *"black boxes"* is the useful part: voxelizing a
-  mesh, importing a map, generating collision data, building a compressor and
-  baking an LOD are all the same shape of thing. A new importer or exporter
-  should be a new converter against an existing format, never a new format.
-- **A conversion is a natural test seam.** Round-trip it in a gate.
-
-### 4. No system should be closed-ended
-
-*"My main goal was to design everything in such a way that no system was
-closed-ended, and that developers could always iterate on or expand the engine
-without any codebase overhauls."* The Jobs quote he leans on is the test:
-*"what happens when you think of a great idea six months from now?"*
-
-Applied here — a new system should be open along the axis it will actually grow:
-
-- **Author content by name, resolve to ids at load.** Materials, glyphs, sound
-  sets and mob defs all do this; it is what makes hot-reload possible.
-- **Take a callback where you would otherwise take a concrete owner.** The
-  spell VM is not player-coupled — health arrives via `CasterHealth`, so a mob
-  casts through the identical path. `ApplySpellEffect` is one
-  position-parameterized payload, so casting at the muzzle and backfiring into
-  your own chest are the same call with different arguments. Prefer that shape.
-- **One authoring surface per kind of thing**, listed in exactly one place
-  (`sound_schema.js` for sound slots, `tuning_params.def` for `TUNE_*`). A
-  second list is the "two places that must agree" bug the invariant checker
-  exists to catch.
-- **Don't hardcode material IDs in shaders.** Shaders test authored *fields*
-  and tags; that is why behavior can be added as data.
-
-**Also note where Lin is honest about the cost.** His own reflection layer
-"requires pre-coding the supported type combos" and he calls it *"a little
-weak"*. Generality has a price, and this engine pays it selectively:
-determinism, the 16-bit voxel and integer-only sim kernels all beat flexibility
-where they conflict. Rules 1–3 above win every time. Openness is for the
-*authoring* and *composition* layers, not for the inner loop.
-
-### 5. Rendering is the small part — budget for the rest
-
-The post opens on why micro-voxel engines are *"basically synonymous with
-vaporware"*: the showcase renders billions of voxels and then goes quiet,
-because lighting, serialization, network sync, physics, AI, dynamic objects,
-procgen, per-voxel interaction and voxel characters were never designed for.
-
-Practical use here: when a feature looks done because it looks right on screen,
-it isn't. Ask what it does about persistence (does it survive save/load and
-chunk eviction?), determinism (does it touch hashed state — rule 1), idle cost
-(does it let chunks sleep — rule 2), the CPU mirror (does it query the grid
-outside the 3×3×3 window), and mutation (does it go through the queue — rule 3).
-A visually-correct system that fails those is the vaporware pattern in
-miniature.
-
----
+### 3. All mutations flow through MutationQueue
+Brush edits, spells, explosions, worldgen — everything CPU→GPU via `sim_mutate.wgsl`/`sim_explode.wgsl`. No direct voxel buffer writes. Exceptions: snapshot restores (worldgen, `LoadWorld`). The queue is also save format, replay log, and future network stream. Keep CPU↔GPU traffic <1 MB/tick, async, one-tick latent. Never add synchronous readback to frame path.
 
 ## Build and verify
 
 ```bash
-bash scripts/build.sh                    # build sandvox (Release)
-bash scripts/build.sh --selftest         # build + run selftest
-bash scripts/build.sh --configure        # force cmake configure first
+bash scripts/build.sh                    # Release build (mutex-protected, 6-core cap)
+bash scripts/build.sh --selftest         # build + selftest
+bash scripts/build.sh --configure       # force cmake reconfigure
 ```
 
-**Always use `scripts/build.sh`, never raw `cmake --build`.** The script
-acquires a machine-global mutex (`C:/sv-build-lock`) so only one MSVC
-compilation runs at a time — multiple simultaneous unbounded MSBuild instances
-will brick the machine. It also caps parallelism to 6 `cl.exe` jobs (half of
-16 cores), leaving headroom for editing, searching, and the OS. Agents keep
-working while waiting for the lock; only the compile+link serializes.
-
-The underlying commands, for reference or manual use:
-```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64   # configure (first run fetches the Dawn repo, ~15 min)
-cmake --build build --config Release --target sandvox    # DO NOT run this directly from agents
-./build/Release/sandvox.exe --selftest
-```
-
-**The Dawn CHECKOUT stays even though the Dawn ENGINE is gone, and that is not
-leftovers.** Tint — Dawn's WGSL compiler — is fetched and built from it, and
-the engine cannot work without it: `tint_lang_wgsl_reader` +
-`tint_lang_spirv_writer` are linked into sandvox and are how the live WGSL
-string becomes SPIR-V at load *and* at every F5 reload (precompiling `.spv`
-offline cannot replace this — F5 rebuilds the constant prelude from live tuning
-values, so a precompiled blob would freeze them), and `tint.exe` is
-`check_shaders.sh`'s validator. What is excluded is `add_subdirectory(src/dawn)`
-— dawn_native, webgpu_dawn, webgpu_cpp, webgpu_glfw — which Dawn's own
-CMakeLists gates on "at least one `DAWN_ENABLE_<backend>` is ON". All of them
-are OFF, so those targets are never *declared*; `src/tint` is added
-unconditionally and is unaffected.
-
-Three things in that block are load-bearing and commented in CMakeLists.txt —
-don't rediscover them: `TINT_BUILD_SPV_WRITER`/`SPV_READER` default to
-`${DAWN_ENABLE_VULKAN}` and so must be forced ON *independently*;
-`DAWN_USE_GLFW` must stay ON because that flag is what supplies the `glfw`
-library target (Dawn's own `dawn_glfw` helper is a different thing and is
-excluded); and `Vulkan::Headers` is declared by Dawn only for its own Vulkan
-backend, so CMakeLists does that `add_subdirectory` itself.
-
-Third-party sources (the Dawn repo, Jolt, ImGui, …) are fetched into a
-**shared** cache outside the checkout — `C:/sv-deps`, set by
-`FETCHCONTENT_BASE_DIR` in CMakeLists.txt — so a fresh configure does not
-re-clone or re-build them. Only the first configure on the machine pays the
-~15 min. Override with `-DFETCHCONTENT_BASE_DIR=...` or `$SANDVOX_DEPS` for a
-private cache; delete `C:/sv-deps` to force a clean refetch.
-
-Two things about that path are load-bearing, both learned by breaking them:
-
-- **It is set before `include(FetchContent)`.** The module defines
-  `FETCHCONTENT_BASE_DIR` itself at include time, so a guard placed after the
-  include never fires and every build silently gets a private cache — the
-  ~15 min this exists to avoid.
-- **It is short (`C:/sv-deps`, not under your home dir).** Dawn's tint test
-  corpus has ~200-char filenames; a deep path exceeds the Windows 260-char
-  `MAX_PATH` and the fetch dies with `Filename too long`. Don't lengthen it.
-
-`--selftest` is the acceptance gate: it checks the twice-run world hash, the sleep
-assertion, perf, a walk test, and writes `screenshot.bmp`. Run it after any sim,
-shader, or material change and report the actual result — never claim a sim change
-works without it.
-
-### One backend: Vulkan
-
-**Vulkan is the only backend** — headless, windowed and every selftest gate.
-**Dawn was REMOVED 2026-08-22** (user decision) after it had run all 23 gates
-with results character-for-character identical to Vulkan's for a full phase;
-cross-backend bit-equality is explicitly no longer a goal, and the determinism
-guarantee is scoped to Vulkan. `docs/PLAN_vulkan_port.md` is the plan of record
-and carries an `[AS BUILT]` note per phase; `docs/vulkan_barrier_graph.md` is
-the authored sync design that the backend *generates* its barriers from.
-
-The `rhi::` seam survives the removal deliberately: it is what made the port
-testable, an abstract impl with one subclass costs one virtual hop on ~60
-dispatches a tick, and phase 7 plugs a paged-residency `BufferImpl` into that
-same slot. Don't collapse it.
+**Always use `scripts/build.sh`**, never raw cmake — it holds a machine-global mutex. Kill stale instances: `taskkill //F //IM sandvox.exe`. Set `export SANDVOX_NO_CRASH_DIALOG=1` in every shell. Read `crash.log` after crashes. Verify exe mtime before trusting results.
 
 ```bash
-./build/Release/sandvox.exe --selftest                    # 23 gates
-./build/Release/sandvox.exe --selftest --vk-validation    # + sync validation
-./build/Release/sandvox.exe --vk-smoke-loud --vk-validation  # 19 PINNED hash probes
-./build/Release/sandvox.exe --frames 400                  # run the WINDOWED game N frames, then exit
-./build/Release/sandvox.exe --vk-info                     # device caps, no sim work
+./build/Release/sandvox.exe --selftest --gate <name>      # one gate (~4-20s vs ~50s full)
+./build/Release/sandvox.exe --selftest --list             # list gates
+./build/Release/sandvox.exe --selftest --json out.json    # machine-readable
+./build/Release/sandvox.exe --vk-smoke-loud --vk-validation  # 19 pinned hash probes + sync validation
+./build/Release/sandvox.exe --frames 400                  # windowed N frames then exit
+bash scripts/check_shaders.sh                             # validate WGSL without rebuild
+python scripts/check_invariants.py                        # "two places must agree" checks
+python scripts/check_pass_table.py                        # pass table vs WGSL bindings
 ```
 
-`--backend vulkan` is still accepted (so old invocations keep working);
-`--backend dawn` **refuses with an explanation and exit 2** rather than
-silently running Vulkan under the wrong name. `--adapter low` is unaffected —
-it selects among Vulkan physical devices.
+`--vk-validation` enables sync validation; **a validation message FAILS the run**. `tests/baseline.json` records known-failing gates (exit 0); new failures are regressions (exit 1). `--backend dawn` refuses with exit 2.
 
-**The smokes are pinned-sequence gates, not cross-backend diffs.**
-`--vk-smoke` (quiet, 5 probes) and `--vk-smoke-loud` (active world: ops,
-explosions, the particle chain, the readback ring, an 8-shift streaming walk;
-19 probes) check the world hash at each probe against constants pinned in
-`src/gpu/vk_smoke.cpp`. That is *more* coverage than the old Dawn-vs-Vulkan
-diff in one direction — it catches a change that would have moved both
-backends identically, which the diff was blind to — and less in another: it
-cannot catch a barrier bug by disagreement. **Sync validation is what covers
-that now**, which is why the next paragraph is not optional. Flipping a pinned
-value to make a run go green is the same act as flipping a known failure in
-`tests/baseline.json`.
+### Build gotchas
+- Dawn checkout stays for Tint; `DAWN_ENABLE_*` all OFF. Turning one ON re-declares the whole Dawn engine (~156 TUs).
+- `TINT_BUILD_SPV_WRITER`/`SPV_READER` default to `${DAWN_ENABLE_VULKAN}`, forced ON independently. `DAWN_USE_GLFW` stays ON (supplies `glfw` target). `Vulkan::Headers` has its own `add_subdirectory`.
+- Shared dep cache at `C:/sv-deps` (`FETCHCONTENT_BASE_DIR`), set BEFORE `include(FetchContent)`. Keep path short (Dawn filenames hit MAX_PATH).
+- Jolt: `USE_STATIC_MSVC_RUNTIME_LIBRARY=OFF` or 139 `/MT` vs `/MD` link errors.
+- `simSlimBGL_` is a vestige of Dawn's 16-storage-buffer layout limit — can collapse now, but is its own hash-gated change.
+- `synchronization2`/`dynamicRendering` must be explicitly ENABLED even in Vulkan 1.3. `target` is reserved in WGSL. Mark+apply two-phase for kernels that read+write neighborhoods.
 
-The determinism gate's pinned world hash is `7cfa2420` (`tests/baseline.json`).
-**If it moves, you broke the sim** — stop and report it rather than adjusting
-the baseline.
-
-**A sync-validation message FAILS the run, everywhere it can be collected.**
-`--vk-validation` turns on `VK_LAYER_KHRONOS_validation` with synchronization
-validation, and `GpuContext::ReportVkValidation` prints and fails on any
-message in every headless path. This is deliberate and must not be weakened: a
-missing barrier is invisible in a green gate (the CA is deterministic *because*
-of the barriers, not observably) and shows up as a cross-vendor hash divergence
-much later — rule 1's whole nightmare. A hazard is a bug even when all 23 gates
-pass; two real barrier bugs were found exactly this way.
-
-**Every sandvox run wants `SANDVOX_NO_CRASH_DIALOG=1`.** Without it a crash
-pops a modal box and the process hangs forever holding `sandvox.exe`, which
-then fails the next link with `LNK1104`:
-
-```bash
-export SANDVOX_NO_CRASH_DIALOG=1     # do this once per shell
-tail -40 crash.log                   # read this after ANY crash — it has the summary
-```
-
-**Verify the exe you are about to measure.** `build.sh` has printed
-`build succeeded` off a stale binary; `ls --time-style=full-iso -l
-build/Release/sandvox.exe` before trusting a result, and use
-`bash scripts/build.sh --configure` to surface a real configure error that a
-plain build swallows.
-
-### Run ONE gate, not all twenty
-
-The suite is a registry of named gates (`src/test/selftest*.cpp`). The full run
-is ~50 s; a single gate is usually 4–20 s, so iterate on one and run the whole
-thing once before you land:
-
-```bash
-./build/Release/sandvox.exe --selftest --list          # names + deps, no GPU needed
-./build/Release/sandvox.exe --selftest --gate prefab   # just this one (~4 s)
-./build/Release/sandvox.exe --selftest --json out.json # machine-readable results
-```
-
-`--gate` pulls in whatever that gate declares as a dependency, and gates run in
-the order `kOrder` (selftest.cpp) pins — **which is load-bearing**. Gates share
-one `World`/`Simulation` and several rely on state an earlier gate left behind;
-the streaming gate in particular leaves the window origin ~20 chunks out. Adding
-a gate means a row in its domain file *and* a name in `kOrder`; one that is
-missing from `kOrder` prints a warning and never runs.
-
-### A red run tells you whether it is yours
-
-`tests/baseline.json` records which gates already fail. A gate failing there is
-reported as *known-failing at baseline (not yours)* and the run still exits 0;
-anything else that fails is a **REGRESSION** and exits 1. Fix one, flip it to
-`"pass"` in the same commit — the run prints `FIXED since baseline` to remind
-you. `tests/BASELINE.md` says why each known failure is there and how to
-reproduce it.
-
-This replaces the old ritual of rebuilding clean `HEAD` to prove a failure was
-not yours. Reach for that only when the baseline itself is in doubt.
-
-**A running `sandvox.exe` may be killed without asking.** The link step fails with
-`LNK1104: cannot open file ...sandvox.exe` whenever an instance still holds the
-binary. That instance is essentially always me poking at the build, and there is
-no unsaved state to lose — worlds live in `.svx` files written explicitly. So kill
-it and rebuild rather than stopping to ask:
-
-```bash
-taskkill //F //IM sandvox.exe   # git-bash needs the doubled slashes
-```
-
-Validate shaders without a full rebuild (seconds, not minutes):
-
-```bash
-bash scripts/check_shaders.sh
-```
-
-This concatenates `common.wgsl + <file>` exactly the way `LoadShader` does and runs
-each through `tint --validate`. It runs automatically on WGSL edits via the
-PostToolUse hook in `.claude/settings.json`.
-
-That same hook (`scripts/post_edit_check.sh`) also runs:
-
-```bash
-python scripts/check_invariants.py          # all pairs
-python scripts/check_invariants.py <file>   # just the ones that file can break
-python scripts/check_pass_table.py          # pass table vs the WGSL bindings
-python scripts/check_pass_table.py --selfcheck   # prove the WGSL walk still works
-```
-
-which mechanically enforce the "two places that must agree" pairs listed below
-— sound slots, `TUNE_*` constants, `RENDER_PATHS`, world constants, and the pass
-table's R/W sets. Every one of those is a *silent* failure otherwise: green
-build, working tuner, wrong behaviour at runtime. Both are quiet unless
-something actually disagrees.
-
-Tuning by eye/ear goes through the tuner, which finds `assets/` itself and
-whose **Build** / **Play** buttons run the two commands above:
-
-```bash
-./sandvox_tuner.exe                   # desktop app (build it once, below)
-python scripts/tuner_server.py        # same UI in a browser, for devtools
-python scripts/build_tuner_exe.py     # (re)build sandvox_tuner.exe
-```
-
-The exe must sit in the project root: it edits this checkout in place, so
-`assets/` and `build/` are deliberately NOT bundled into it. Building it needs
-`pip install pywebview pyinstaller` once; it is gitignored.
-
-### Build gotchas (learned the hard way)
-
-- **Turning a `DAWN_ENABLE_<backend>` back ON re-declares the whole Dawn
-  engine.** All of them are OFF so that `add_subdirectory(src/dawn)` never
-  runs; flipping one drags dawn_native and ~156 TUs back into the build. If you
-  need `Vulkan::Headers` or `glfw`, they are handled explicitly — see the Tint
-  block above and the comments in CMakeLists.txt.
-- ImGui must be ≥1.92 for `imgui_impl_vulkan` (`ui/overlay.cpp` is the
-  sanctioned native exception, and feeds it entry points from the engine's own
-  loader).
-- The compile log is large (Tint/abseil). Filter for `src/` and `assets/`
-  paths; don't read `build_compile.log` whole.
-- Jolt needs `USE_STATIC_MSVC_RUNTIME_LIBRARY=OFF` or the link fails with 139
-  `/MT` vs `/MD` runtime mismatches.
-- **`simSlimBGL_` exists for a limit that no longer applies — it is a live
-  follow-up, not a mystery.** Dawn's pipeline-layout limit counted *layout
-  entries, not shader usage*: max 16 storage buffers per stage across all bind
-  groups in one layout. That is why the particle/explosion pipelines pair a
-  slim group-0 (`simSlimBGL_`, bindings 0–4) with group 1 instead of reusing
-  the full sim layout. It was never hardware — `--vk-info` measures 1048576 per
-  stage — and Dawn is gone, so the split can collapse. It was deliberately NOT
-  collapsed in the removal commit, which was kept purely subtractive: this
-  changes descriptor sets and bind points, so it is its own hash-gated change
-  (barrier_graph §4.10).
-- **A core Vulkan feature still has to be ENABLED, not just present.**
-  `synchronization2` and `dynamicRendering` are mandatory in core 1.3, and
-  promotion only makes the entry point *resolve*; calling it without enabling
-  the feature is illegal. The backend probes and refuses a device lacking
-  either, because a silently down-converted barrier is exactly the weakening
-  rule 1 cannot absorb.
-- `target` is a reserved word in WGSL; a buffer used as `Indirect` must not be
-  bound in any bind group of the same pass (stage via a Storage copy).
-- A kernel that both reads a neighborhood and writes into it races itself and
-  breaks determinism — split into mark (pure read) + apply phases. This bit the
-  explosion kernel; the two-phase structure in `sim_explode.wgsl` is the fix.
-
----
-
-## Layout
+## Layout (key paths)
 
 | Path | What |
 |---|---|
-| `src/main.cpp` | frame loop, arg parsing, `--shot`/`--shot-mob` harnesses |
-| `src/test/` | the acceptance gate. `support.*` is the sim/render plumbing shared with `main.cpp` (`SubmitTick`, `WriteRenderParams`, the sync readbacks) — ONE definition, so a test can never pass against behaviour the game does not have. `selftest.*` is the harness: gate registry, `kOrder`, baseline diffing, `--gate`/`--list`/`--json`. One `selftest_<domain>.cpp` per domain, which is also what stops two agents colliding in one hub file |
-| `src/sim/` | world storage, sim dispatch, JSON material/reaction compilation, `.vox` prefab loader |
-| `src/gpu/` | the GPU seam and the Vulkan backend. `rhi.h` is the ONLY GPU API the rest of the engine sees (`vk::` is confined below it); `rhi_impl.h` declares the abstract impls that `rhi_vk.cpp` subclasses — one subclass since the Dawn removal, kept because phase 7's paged-residency buffer is the next one. `vk_*.cpp` is the backend proper — `vk_loader` (a volk-style `vulkan-1.dll` walk; the target builds with `VK_NO_PROTOTYPES`, so a direct `vk*` call is a compile error), `vk_spirv` (WGSL→SPIR-V through Tint, at load and at every F5), `rhi_vulkan` (device/VMA/pipelines/uploads), `vk_record` (the last-access tracker that GENERATES every barrier from `pass_table.def` — no barrier is ever hand-written at a call site), `vk_info`, `vk_smoke` (the pinned hash-sequence gates). `context.*` owns the device and swapchain |
-| `src/game/` | player controller, camera, brush, prefab placer, mob system, player avatar (`avatar.*`) + third-person rig (`thirdperson.*`) |
-| `src/audio/` | spatialized sound (DESIGN.md §12b). `cues.*` is the ONLY header the rest of the game includes — it speaks game events (`Footstep`, `Land`, `Impact`, ambience). Below it: `world.*` voice pools + the one place voxels/Y-up become meters/Z-up, `voice.*` one emitter (lock-free handoff + pre-engine occlusion filter), `occlusion.*` voxel-ray muffling, `library.*` folder-per-set asset registry, `device.*` miniaudio. `xyzpan/` is a VENDORED spatializer — read its `VENDORED_FROM.md` before editing, and keep it dependency-free. Assets are MONO (the panner builds the stereo image); the audio thread must never touch a game object or `CurrentTuning()` |
-| `assets/sounds/` | mono one-shots, one FOLDER per sound set (`footsteps/leaf/leaf_01.wav` = set `footsteps/leaf`). A material names sets in its `"sounds"` block (the flat `"footstep"` key still works); a mob names them in its `.json` sidecar. `raw/` holds the uncut source takes and `.trash/` holds tuner-deleted ones — both SKIPPED by the loader; `scripts/split_footsteps.py` cuts raw takes into per-step files on the transient |
-| `assets/sound_schema.js` | the only list of sound SLOTS (material `footstep`/`impact`/`break`…, mob `hurt`/`death`/`sever`…). The tuner's Audio tab and wiki Audio section are built entirely from it; each slot's `prefix` must match `Cues::kSlotPrefix` in `audio/cues.cpp` or the tuner writes bindings the engine cannot resolve |
-| `src/game/spell.*`, `src/game/caster.*` | the magic system (DESIGN.md §8). `spell.*` is the caster VM: glyphs are functions on a typed stack, `CompileSpell` folds them into a `Spell`, and `ApplySpellEffect` is the ONE position-parameterized payload — casting at the muzzle and backfiring into your own chest are the same call with different arguments. Integer 24.8 fixed point throughout (NOT rule 1 — spell state is outside the hashed domain; it is for lockstep MP + replay, so don't "simplify" it to float). Not player-coupled: health arrives via a `CasterHealth` callback so a mob can cast through the same path. `caster.*` is the player's inventory + spoken stack only |
-| `assets/spells/glyphs.json` | glyph CONTENT (materials.json precedent, not tuning.json). Materials by NAME, resolved at load; hot-reloads with R alongside materials — it MUST, since a glyph holds a resolved 12-bit id. Every sustained effect declares a finite budget here and is clamped against engine ceilings at load (rule 2) |
-| `assets/prefabs/`, `assets/mobs/` | `.vox` art (palette index == material ID; `scripts/gen_palette.py`), mob `.vox`+`.json` pairs (`scripts/gen_test_mob.py` emits the example dummy; `gen_mina.py` emits the PLAYER AVATAR rig, which is a mob def driven by `game/avatar.cpp` rather than by mob AI — `gen_wizard.py` is a second, unused character). The avatar's height is NOT free: it is derived from `Player::kHalfY`/`kEyeOffset` at the current `kVoxelMeters` (17 world voxels, eyes at voxel 15) and asserted in the generator. `kAvatarDefName` in `main.cpp` picks which def the player wears |
-| `assets/shaders/*.wgsl` | `common.wgsl` is prepended to every other shader by `LoadShader` (behind a generated `world.h` constant prelude) — shared structs and helpers live there, and it is not a standalone module |
-| `assets/materials/*.json` | materials and reactions, hot-reloadable (R in-game); `tuning.json` is look/feel params, hot-reloadable (F5) |
-| `assets/tuner.html` + `tuner_schema.js` | browser editor for all three JSONs; the schema file is the only list of tunable params. Also hosts the **Wiki** tab (every fact about one material/tag/tuning group/shader/sound set, assembled live from all four sources), the **Audio** tab (set browser, waveform audition, drag-drop import, slot bindings — needs the server/app, since a `file://` page cannot touch `assets/sounds/`) and the **Notes** tab (markdown pages autosaved to `notes/`, gitignored) |
-| `scripts/tuner_app.py` + `tuner_server.py` | the tuner as a desktop app / local server: auto-loads assets, Build + Play buttons |
-| `scripts/build_tuner_exe.py` | packages the above into `sandvox_tuner.exe` |
+| `src/main.cpp` | frame loop, arg parsing, `--shot`/`--shot-mob` |
+| `src/test/` | selftest harness: `selftest.*` (registry, `kOrder`, baseline), `support.*` (shared sim/render plumbing), one `selftest_<domain>.cpp` per domain |
+| `src/sim/` | world storage, sim dispatch, material/reaction JSON compilation, `.vox` loader |
+| `src/gpu/` | `rhi.h` = only GPU API the engine sees. `rhi_vk.cpp` = Vulkan backend. `vk_record.cpp` generates ALL barriers from `pass_table.def`. `context.*` = device+swapchain |
+| `src/game/` | player, camera, brush, mobs, avatar (`avatar.*`), spells (`spell.*`+`caster.*`) |
+| `src/audio/` | `cues.*` = public API (game events). Vendored `xyzpan/` spatializer. Mono assets, meters+Z-up internally |
+| `assets/shaders/` | `common.wgsl` prepended to all shaders by `LoadShader` |
+| `assets/materials/` | `tuning.json` (F5 hot-reload), materials+reactions JSON (R hot-reload) |
+| `assets/tuner.html`+`tuner_schema.js` | browser editor for JSONs, Wiki, Audio, Notes tabs |
+| `assets/sound_schema.js` | only list of sound slots; must match `Cues::kSlotPrefix` in `audio/cues.cpp` |
+| `assets/spells/glyphs.json` | glyph content, materials by name, hot-reloads with R |
+| `assets/prefabs/`, `assets/mobs/` | `.vox` art + mob `.json` sidecars |
 
-**Invariants that have already cost debugging time — don't rediscover them.**
-The five "two places that must agree" entries below (sound slots, `TUNE_*`,
-`RENDER_PATHS`, world constants, the pass table) are now checked mechanically by
-`scripts/check_invariants.py` and `scripts/check_pass_table.py`, which the
-PostToolUse hook runs on every edit. The prose stays because it explains *why*
-each pair exists and what breaks — the checkers only tell you that something
-disagrees.
+## Design guidelines (from [Lin 2021](docs/refs/perfect_voxel_engine.md))
 
-- **The 3×3×3 color lattice is GLOBAL in WORLD coordinates, not chunk- or
-  slot-local.** Chunk-local dispatch must offset by the WORLD chunk coordinate
-  (16 ≡ 1 mod 3), and coloring by slot coords instead of world coords races at
-  the toroidal wrap (world-adjacent cells whose slots are WORLD_N apart share a
-  color). Getting this wrong produces a sim that looks right and is subtly race-y.
-- **Kernels think in world coords; memory is slot-indexed.** World cell → slot
-  is a bitmask (`cellIndexW`/`chunkIndexW`); every neighbor access must bounds-
-  check against the residency window (`inWindow` with the origin uniform), not
-  a fixed 0..N box. Unloaded space is solid and inert.
-- **Look/feel constants belong in `tuning.json`, not as literals in shaders.**
-  `TuningWgslBlock()` (`sim/tuning.cpp`) emits them as `TUNE_*` WGSL consts into
-  the same prelude, so F5 re-tunes the renderer with no rebuild. The `TUNE_*`
-  set has ONE source: the table in **`src/sim/tuning_params.def`**, which the
-  emitter expands and which `scripts/tuning_prelude.py` is *generated* from
-  (`python scripts/gen_tuning_prelude.py`; `check_invariants.py` fails if you
-  forget). Adding a shader-visible knob means: a row in the `.def`, the
-  declaration + doc comment in `sim/tuning.h`, a `Read*` in `LoadTuning` (that
-  is where per-parameter clamping lives, so it stays hand-written), a default in
-  `assets/materials/tuning.json`, and a row in `assets/tuner_schema.js`. Values
-  under `sim.*` are integer-only and change the world hash — rule 1 applies, and
-  `--selftest` must be re-run.
-- **`matRow`/`ruleRow`/`condPanel` are shared by two tabs — re-render through
-  `rerenderRules()`, never `renderReactions()`.** The Wiki embeds the very same
-  row editors the Materials/Reactions tabs use, so an edit made in either place
-  is the same edit. A *structural* change (kind switch, duplicate, delete,
-  reorder) has to rebuild the list it lives in, and that list differs by tab —
-  hardcoding `renderReactions()` there throws you back to the Reactions tab
-  mid-edit and silently discards the wiki page you were on.
-- **The tuner Wiki's render-path table restates shader predicates — keep it in
-  step.** Shaders never name a material (that is the point: behavior is data),
-  so the Wiki tab derives "which render path does water take, and why" by
-  re-evaluating the same authored-field tests the shaders use —
-  `isViscousLiquid` (class+opacity+moveEvery), `isTranslucentSolid` (opacity on
-  a solid), `MATF_OPAQUE`, `MATF_MICRO`. That table is `RENDER_PATHS` in
-  `assets/tuner.html`, and the flag key names in it must match the ones
-  `materials.cpp` reads (`opaque`, `wanders`, a `micro` block). Change a
-  predicate in `common.wgsl` without changing `RENDER_PATHS` and the wiki will
-  confidently explain the wrong thing.
-- **A sound slot is defined in two places that must agree.** `assets/sound_schema.js`
-  says which slots exist and which namespace each binds into; `Cues::kSlotPrefix`
-  in `audio/cues.cpp` does the same concatenation at runtime. The tuner offers
-  set lists per slot from the first table and the engine resolves through the
-  second, so a slot present in one and not the other means the tuner writes a
-  binding that silently resolves to nothing. Adding a slot = a row in each, plus
-  a call site that fires it. The wiki's `resolveMaterialSound()` additionally
-  restates `FallbackFootstep()` (cues.cpp) so a material page can say what will
-  actually play rather than only what was authored — same standing obligation
-  `RENDER_PATHS` carries for the shader predicates.
-- **The CPU mirror is 3×3×3 chunks around the PLAYER, so a fast projectile
-  leaves it inside one tick.** `World::KindAt` returns `Unknown` past ~48
-  voxels. The player controller treats Unknown as blocking, which is right for
-  a capsule that never leaves its neighbourhood; a spell projectile must treat
-  it as PASSABLE or every bolt detonates in the caster's face. Out-of-window is
-  still solid (the residency-window rule) — those are two different tests and
-  conflating them is the bug. Anything else that flies fast and queries the
-  grid on the CPU inherits this; the real fix is a swept `RequestChunkFetch`
-  along the path.
-- **A selftest gate that fires into the world must anchor to the LIVE window
-  origin, not a fixed world position.** Gates run in sequence and the streaming
-  gate leaves the origin ~20 chunks out, so a hardcoded `x=140` lands outside
-  the window, where space is solid — the spell gate detonated on tick 1 and
-  read as a budget failure. `world.WindowOrigin()` is the fix.
-- **A budget must be charged BEFORE the op is emitted, and the op refused if it
-  does not fit.** The natural ordering (emit → subtract → check `<= 0`) lets
-  the last op overrun by nearly its whole volume, and anything that sub-steps
-  within a tick overruns once per sub-step. "Bounded eventually" is not what
-  rule 2 asks for. Related: a trail marks per whole VOXEL of travel, not per
-  sub-step — the sweep is subdivided for anti-tunneling, so a per-sub-step mark
-  spends the entire budget in one tick on a handful of overlapping cells.
-- **World constants are generated from `world.h`, never redeclared in WGSL.**
-  `ShaderConstantPrelude()` (`gpu/resources.cpp`) emits `WORLD_N`, `CHUNK`,
-  `VOXEL_METERS`, the toroidal masks, etc. as WGSL text prepended ahead of
-  `common.wgsl`. `world.h` is the single source of truth — adding a constant
-  means adding it there and to the prelude, not to `common.wgsl`.
-- **The pass table's R/W sets and the WGSL bindings its kernels touch must
-  agree.** `src/sim/pass_table.def` declares, per recorded command, every buffer
-  the kernel reads and writes; `Simulation::Encode*` records by walking it, and
-  the backend *generates* its barriers from the same rows — no barrier is ever
-  hand-written at a call site. So a row that omits a read its kernel performs
-  means **no** barrier is emitted for that hazard, not a weak one. It will
-  usually still pass: the selftest stays green because the hardware happens to
-  order those dispatches anyway, and the bug stays invisible until it surfaces
-  as a cross-vendor world-hash divergence, which is rule 1's whole nightmare.
-  This is why `--vk-validation` is not optional evidence — sync validation
-  reports the hazard from the recorded commands without needing it to fire.
-  `scripts/check_pass_table.py` diffs the two by walking each entry point's call
-  graph — **rooted at the entry point**, since a WGSL file's module-scope
-  bindings are shared by every entry point in it and comparing against those
-  flags most correct rows — and classifies read vs write by actual access, not
-  by the `read_write` qualifier. Adding a binding to a sim kernel means a `uses`
-  entry in the same commit.
+1. **Design data format for the hardest consumer** (physics, serialization, replication), not just rendering.
+2. **Attributes in side tables**, not widened onto the voxel. 32 bpv is the budget. Extra state → sparse auxiliary layer keyed by chunk. Prefer derived data (e.g. `microvox`: zero storage, zero sim cost).
+3. **Multiple representations are fine; unowned diverging ones aren't.** One authoritative source per fact; derived data is reconstructible+disposable. Conversions in named functions.
+4. **No closed-ended systems.** Author content by name, resolve at load. Behavior is data (JSON+tags), not runtime-typed voxel fields. One authoring surface per kind.
+5. **Rendering is the small part.** A system isn't done because it looks right — check persistence, determinism, idle cost, CPU mirror, mutation path.
+
+## Voxel word layout (32-bit `u32`)
+
+| Bits | Field | Notes |
+|---|---|---|
+| 0–11 | material id | 4096 slots |
+| 12–15 | state nibble | liquids: fullness 1..8; others: palette jitter |
+| 16–18 | tick stamp | substep gate, cycles 1..7; `STAMP_NEVER`=0 for all new voxels |
+| 19–23 | FREE | scratch only unless hash mask + `kPersistMask` widened |
+| 24–27 | stain amount | 0..15 |
+| 28–30 | stain type | 0=clean, 1..7 palette slots |
+| 31 | `kCellOpIfAir` | transient CPU→GPU flag |
+
+Allocation must agree in: `common.wgsl` (`voxMat`), `world.h`, and this table. Stamp+bits 19–23 excluded from world hash and stripped on save.
+
+## Critical invariants
+
+- **Color lattice is GLOBAL** (world coords, not chunk-local). Chunk dispatch offsets by world chunk coord.
+- **World coords for logic, slot-index for memory.** Neighbor access bounds-checks against residency window (`inWindow`), not fixed 0..N.
+- **The voxel buffer is a PAGE POOL, not a dense array** (`docs/PLAN_page_table.md`). `pageTable[slot]` is a page index or an `EMPTY`/`UNIFORM(mat)` sentinel; 77.7 MiB resident vs 512 MiB dense. Address voxels ONLY through `voxWordAt`/`voxWordIndex`/`voxStore` (WGSL) or `World::PageOffsetOfSlot` (C++) — any other subscript reads another chunk's memory. An index used as an **identity** (hash key, RNG key, claim slot) is the SLOT index; only a memory address is the PAGE index. The table is derived data: not hashed, not saved. Pool exhaustion is a **fatal abort**. `--residency dense` is the identity map and the only live differential oracle.
+- **`TUNE_*` pipeline:** row in `tuning_params.def` → decl in `tuning.h` → `Read*` in `LoadTuning` → default in `tuning.json` → row in `tuner_schema.js`. `sim.*` values are integer-only (rule 1).
+- **Pass table R/W sets must match WGSL bindings** — omitting a read means NO barrier for that hazard. `check_pass_table.py` catches this.
+- **World constants generated from `world.h`** via `ShaderConstantPrelude()`, never redeclared in WGSL.
+- **CPU mirror is 3×3×3 chunks around player.** `KindAt` returns `Unknown` past ~48 voxels. Projectiles treat Unknown as passable (unlike player). Selftest anchors to `world.WindowOrigin()`.
+- **Budgets charged BEFORE emission**, op refused if it doesn't fit. Trails mark per whole voxel, not per sub-step.
+- **`RENDER_PATHS`** in `tuner.html` must match shader predicates in `common.wgsl`.
+- **Sound slots** defined in `sound_schema.js` AND `Cues::kSlotPrefix` — must agree.
 
 ## Conventions
 
-- Materials and reactions are data, not code. Adding behavior means editing JSON
-  and adding tags — reactions target tags (`flammable`, `organic`) rather than
-  enumerating materials. This is the guard against the N×M interaction explosion;
-  don't hardcode material IDs in shaders.
-- Match surrounding style: 2-space indent, lowercase-underscore WGSL, `CamelCase`
-  C++ functions. Comment density in the sim shaders is deliberately high because
-  the rules encode non-obvious invariants — keep it.
-- **Don't grow the 32-bit voxel.** The word is a `u32` — 512³ voxels × 4 B =
-  512 MiB, which is *exactly* the storage limit `gpu/context.cpp` requests.
-  Going to 64 bpv means 1 GiB and blows that limit; extra per-voxel state goes
-  in an optional sparse auxiliary layer keyed by chunk (DESIGN.md §3). 32 bpv
-  is what makes 134M resident voxels affordable. (This bullet said "16-bit"
-  until 2026-08-22 — it had been wrong since the stain layer went in, and the
-  layout below is the authoritative version.)
-
-  | Bits | Field | Notes |
-  |---|---|---|
-  | 0..11 | material id | 4096 slots, ~48 used |
-  | 12..15 | state nibble | liquids: fullness 1..8. Others: render palette jitter (`paletteColor`, `state % 3`) |
-  | 16..18 | tick stamp | "already acted this substep" gate — see below |
-  | 19..23 | **FREE** | the only unallocated span |
-  | 24..27 | stain amount | 0..15 |
-  | 28..30 | stain type | 0 = clean, 1..7 palette slots |
-  | 31 | `kCellOpIfAir` | transient CPU→GPU flag, masked off before the store |
-
-  The allocation table lives in three places that must agree: the comment above
-  `voxMat` in `common.wgsl`, the mirror in `src/sim/world.h`, and this table.
-
-- **The tick stamp is 3 bits with a reserved sentinel, and `kStampNever` is the
-  only value a CPU path may write.** The stamp answers one question — "was this
-  word written during THIS substep?" — so it needs enough phases to make the
-  current one distinguishable, not enough to count ticks. `stampFor` cycles
-  1..7; `STAMP_NEVER`/`kStampNever` is 0 and no `stampFor` output equals it.
-
-  Everything that ENTERS the world unstamped must use the sentinel: worldgen
-  `genCell`, brush paints (`sim_mutate`), particle reinsertion, prefab stamps,
-  debris rubble, RLE decode after a stream-in or a load. Writing a live code
-  there costs that voxel a substep. This was a `0xFF` byte before 2026-08-22,
-  and `0xFF` masked into 3 bits is `7` — a *real* code — so any site still
-  writing the old literal is a bug, not a no-op.
-
-  Why the sentinel is load-bearing rather than tidy: a sleeping chunk is not
-  dispatched, so its voxels keep their last stamp indefinitely and are compared
-  against the current one on wake. With a short cycle, a chunk that slept an
-  exact multiple of the cycle would wake with *every* voxel falsely reading
-  "already acted" and stall for a substep — correlated and visible, unlike the
-  1-in-256 single-voxel skip the byte-wide field had. Birth-at-sentinel is what
-  bounds that to one voxel, one substep.
-
-  The stamp is per-tick scheduling scratch, not state: excluded from the world
-  hash (`sim_occupancy.wgsl` hashes bits 0..15 + the stain field) and stripped
-  on save (`kPersistMask` in `stream.cpp` clears bits 16..23). **Bits 19..23
-  inherit both properties** — anything stored there is scratch unless the hash
-  mask and `kPersistMask` are both widened to cover it, which is a save-format
-  and determinism change.
-- **Verify rotations with `scripts/geometry.py` — don't reason about quaternions
-  in your head.** The engine is Y-up, quats are `(x,y,z,w)`, Euler order is
-  X-then-Y-then-Z, heading 0 = +Z, and .vox files are Z-up (converted by
-  `vox_to_engine`). Use the script to confirm any rotation does what you intend:
-  ```bash
-  python scripts/geometry.py describe_quat 0 0.707 0 0.707   # what does this quat do?
-  python scripts/geometry.py qy 90                            # 90° about Y
-  python scripts/geometry.py rotate_point 0 1 0 45 -- 1 0 0   # where does (1,0,0) end up?
-  python scripts/geometry.py vox_to_engine 10 5 20             # scene -> engine coords
-  python scripts/geometry.py euler_to_quat 30 45 0             # euler -> quat
-  python scripts/geometry.py look_at 0 0 0 -- 5 0 5            # quat to face a target
-  ```
+- Materials/reactions are data (JSON+tags), not code. Don't hardcode material IDs in shaders.
+- 2-space indent, `snake_case` WGSL, `CamelCase` C++. High comment density in sim shaders (non-obvious invariants).
+- Don't grow the 32-bit voxel. Extra state → sparse auxiliary layer.
+- Rotations: Y-up, quats `(x,y,z,w)`, Euler X→Y→Z, heading 0=+Z, `.vox` is Z-up. Use `python scripts/geometry.py`.
+- Tuner: `./sandvox_tuner.exe` or `python scripts/tuner_server.py`. Build/Play buttons run build+selftest.

@@ -47,9 +47,11 @@ const std::vector<Gate>& SpellGates();
 const char* const kOrder[] = {
     "determinism", "sleep",       "pond-freeze",    "evaporation",
     "blood-stain", "flung-liquid", "fluid-det",     "far-fog",  "far-downsample",
-    "screenshots", "player-walk", "player-waterjump", "player-plants", "debris",
+    "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
+    "player-plants", "debris",
     "prefab",      "mob",         "settle-back",    "player-body",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
+    "page-roundtrip", "daylight-boundary",
     "perf",
 };
 
@@ -269,6 +271,11 @@ int List() {
 }
 
 int Run(Ctx& c, const Options& opt) {
+  // Make a harness tick behave like a game frame: block for the readback map
+  // after a kicked readback so World::Snap() actually becomes valid. See the
+  // block comment on SetHarnessSnapshotDrain (test/support.h) for why the
+  // harnesses need this and the game does not.
+  SetHarnessSnapshotDrain(true);
   std::vector<const Gate*> plan = Plan(opt.only);
   if (plan.empty()) {
     std::fprintf(stderr, "selftest: nothing to run\n");

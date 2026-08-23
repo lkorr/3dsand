@@ -163,6 +163,7 @@ void PlayerAvatar::ResolveParts() {
   locoClips_.walk = sk.FindClip("walk");
   locoClips_.run = sk.FindClip("run");
   locoClips_.fall = sk.FindClip("fall");
+  locoClips_.hang = sk.FindClip("hang");
   // Re-resolve the held prop against the new def: a hot reload replaces the
   // skeleton, so a cached part index from the old one would point at whatever
   // limb happens to sit there now.
@@ -1523,14 +1524,24 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // — the gait still wants the instantaneous value, and the footfall/landing
     // logic below keys off this debounced view instead.
     const float debounce = CurrentTuning().avatar.airDebounce;
-    if (player.grounded) airOffTime_ = 0.0f;
+    // A hanging body and a mantling one are SUPPORTED, not airborne: the
+    // hands (or the committed climb) hold the weight, so neither may trigger
+    // the jump/fall clips nor a landing when it ends. Without the mantle
+    // half, every water climb-out and ledge pull-up fired "jump" mid-climb
+    // the moment the debounce elapsed.
+    const bool hangingNow = player.hanging;
+    const bool supported =
+        player.grounded || hangingNow || player.mantleTimer > 0.0f;
+    if (supported) airOffTime_ = 0.0f;
     else airOffTime_ += dt;
     const bool airborneNow = airOffTime_ > debounce;
 
     // `wasGrounded_` now tracks the DEBOUNCED state, so these edges fire once
     // per real takeoff/landing rather than once per bump.
     if (!airborneNow) {
-      if (!wasGrounded_ && airTime_ > 0.25f) {
+      // Catching a ledge is not a landing: the feet never arrive, so neither
+      // the land clip nor its footfall may fire on the grab frame.
+      if (!wasGrounded_ && airTime_ > 0.25f && !hangingNow) {
         PlayClip("land");
         // A landing is its own sound, not a footstep: both feet arrive at once
         // and the impact carries the fall. Uses the fall speed remembered from
@@ -1551,7 +1562,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       }
       airTime_ = 0;
     } else {
-      if (wasGrounded_) PlayClip("jump");
+      if (wasGrounded_ && !wasHanging_) PlayClip("jump");
       airTime_ += dt;
       if (airTime_ > 0.45f) PlayClip("fall");
       // Remember how fast we are falling; the landing tick needs it after the
@@ -1562,6 +1573,11 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // edge detection straight back on the flickering signal this block exists
     // to filter, and the jump clip would retrigger on every bump again.
     wasGrounded_ = !airborneNow;
+    // Updated only WHILE supported: the jump-clip edge fires a debounce
+    // interval after the support was lost, so a per-frame copy would already
+    // read false by then. This holds "was the most recent support a hang"
+    // until the next real support replaces it.
+    if (supported) wasHanging_ = hangingNow;
 
     // ---- locomotion clips ----
     // Additive arm swing over the IK legs; `run` replaces `walk` past half of
@@ -1607,11 +1623,18 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       const int wc = locoClips_.walk;
       const int rc = locoClips_.run;
       const int fc = locoClips_.fall;
-      const int want = airborneNow ? fc : (!moving ? ic : (running ? rc : wc));
+      const int hc = locoClips_.hang;
+      // Hang joins the exclusive family: while dangling from a ledge the
+      // arms belong to the reach-up pose and nothing else. A def without a
+      // hang clip (hc < 0) simply falls back to idle arms.
+      const int want = hangingNow && hc >= 0
+                           ? hc
+                           : airborneNow ? fc
+                                         : (!moving ? ic : (running ? rc : wc));
       for (ClipInstance& inst : anim_.clips) {
         if (inst.clip < 0) continue;
         if ((inst.clip == ic || inst.clip == wc || inst.clip == rc ||
-             inst.clip == fc) &&
+             inst.clip == fc || inst.clip == hc) &&
             inst.clip != want)
           inst.stopping = true;
       }
@@ -1621,8 +1644,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // is false while airborne), and the airborne branch above owns starting
     // `fall`. Keeping idle's blend alive under a jump is what stops the arms
     // snapping on landing, so the airborne case must stay idle, not want.
-    PlayClipIndex(moving ? (running ? locoClips_.run : locoClips_.walk)
-                         : locoClips_.idle);
+    // Hanging is the exception: the hang pose is started HERE (there is no
+    // edge-driven owner for it the way jump/fall have one), and it must be,
+    // or the retire block above would empty the family and leave rest arms.
+    PlayClipIndex(hangingNow && locoClips_.hang >= 0
+                      ? locoClips_.hang
+                      : moving ? (running ? locoClips_.run : locoClips_.walk)
+                               : locoClips_.idle);
 
     // ---- submit kinematic targets ----
     Quat yaw = AxisAngle({0, 1, 0}, heading_);

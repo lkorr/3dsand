@@ -21,7 +21,7 @@ to. Fixed in place, each tagged `[REVIEW …]` at the point of change:
 | C3 | the **render** bind groups were omitted; `raymarch.wgsl` has 17 raw voxel reads | §5.2a |
 | C4 | a whole missed class: **five CPU-side raw slot-offset** accesses to `voxels` | §2.1a |
 | M1 | `particleResolve` has **two** write targets; the micro-stain one parks on the contact cell | §3.4 |
-| M2 | the `∩ nonSentinel` materialization rule, stated as its own rule | §3.2a |
+| M2 | the `∩ hasMatter` materialization rule, stated as its own rule | §3.2a |
 | M3 | the hash must key on the **slot** base while the load uses the **page** base | §4.1 |
 | M4 | commit 2 was not independently green — merged with commit 3 | §8 |
 | m4 | the LIFO page-reproducibility claim was false; withdrawn | §3.7 |
@@ -34,7 +34,7 @@ document's favour and the reviewer withdrew their alternative form):
 |---|---|---|
 | NEW-1 | `EncodeWakeAll` set `cpuDirty` but was never added to `C(N)` — a same-tick tightening could intersect its chunks away | §3.1a (c) |
 | NEW-2 | **`Stream::FillSlots` writes `dirty[0]`/`dirty[1]` per refilled slot** (`stream.cpp:271-273`) — a third CPU dirty-writer, entirely missed | §3.1a (d) |
-| NEW-3 | `materialize(N)` was enumerated in two places and composed in neither; op targets and particle chunks never composed with the `∩ nonSentinel` rule | §3.2 step (4) |
+| NEW-3 | `materialize(N)` was enumerated in two places and composed in neither; op targets and particle chunks never composed with the `∩ hasMatter` rule | §3.2 step (4) |
 | NEW-4 | the 2-ring write-reach bound and the 1-ring recurrence were both stated, neither reconciled | §3.2 |
 | NEW-5 | risk 2 still said "reset to ground truth", contradicting the §3.2 it cited | risk 2 |
 
@@ -567,7 +567,7 @@ re-enumerate it — other sections reference `C(N)` and this table.
 | # | CPU dirty-writer | mechanism | found by |
 |---|---|---|---|
 | a | **brush / cell / explosion op targets** | the kernels' `markBoth(c)` on CPU-authored op streams — the CPU knows every target before the ops are uploaded (§3.3) | first draft |
-| b | **`particleChunks(N)`** | `resolve`'s `markDirtyNext` (`sim_particle.wgsl:242,:265`) dirties the 26-neighbourhood of a **GPU-decided** location; the CPU covers it with the swept-path set (§3.4) | review M1 |
+| b | **`particleSpawnChunks(N)`** | `resolve`'s `markDirtyNext` (`sim_particle.wgsl:242,:265`) dirties the 26-neighbourhood of a **GPU-decided** location; step (1)'s `N26` of `C(N)` covers that. The set itself is THIS tick's spawn sites plus one ring, recomputed from scratch — bounded by `kMaxParticleSpawnsPerTick` + `kMaxExplosionsPerTick`, **independent of flight duration** (§3.4, amended) | review M1; bound amended |
 | c | **`EncodeWakeAll`** (`simulation.cpp:821-828`) | a bare `queue.WriteBuffer(dirty[page_], ones)` — **all 32,768 flags**, no table row, fired from `SubmitTick` (`support.cpp:155`) on a daylight crossing (§3.2a) | review C2 |
 | d | **`Stream::FillSlots`** (`stream.cpp:271-273`) | per store-hit slot, `WriteBuffer(dirty[0], s*4, 1)` **and** `dirty[1]` — the "wake once: neighbors may have changed since this chunk was saved" write. Mid-frame, between ticks, from its own path (§3.5d) | review NEW-2 |
 
@@ -728,8 +728,10 @@ replace it.**
 > ```
 > // ---- (0) the CPU dirty-writer contributions, enumerated ONCE in §3.1a ----
 > //     opTargets(N)      = chunks touched by brush / cell / explosion ops   (a)
-> //     particleChunks(N) = the conservative swept-particle set, §3.4        (b)
-> //     C(N)              = opTargets(N) ∪ particleChunks(N)
+> //     particleSpawnChunks(N) = THIS tick's spawn sites + 1 ring, §3.4      (b)
+> //                              recomputed each tick, never carried; bounded
+> //                              by the op caps, NOT by flight duration
+> //     C(N)              = opTargets(N) ∪ particleSpawnChunks(N)
 > //     (c) EncodeWakeAll and (d) Stream::FillSlots are applied in step (3),
 > //     strictly AFTER (2) — see §3.1a's ordering rule.
 >
@@ -750,9 +752,9 @@ replace it.**
 > cpuDirty(M)   ∪=  refilledSlots(M)   from Stream::FillSlots             (d)
 >
 > // ---- (4) THE MATERIALIZATION SET — the one normative formula -----------
-> materialize(N) = [ (cpuDirty ∩ nonSentinel) ∪ N26(cpuDirty ∩ nonSentinel) ]
+> materialize(N) = [ (cpuDirty ∩ hasMatter) ∪ N26(cpuDirty ∩ hasMatter) ]
 >                  ∪ opTargets(N)
->                  ∪ particleChunks(N)
+>                  ∪ particleSpawnChunks(N)
 > ```
 >
 > **Both operands of the `∩` in (2) are supersets** of the true `dirtyIn(M)`,
@@ -763,21 +765,32 @@ replace it.**
 > **Read (4) carefully — the two halves have different sentinel rules, and
 > conflating them was the first draft's error:**
 >
-> - The **bracketed half** is filtered by `∩ nonSentinel`, because a dirty
+> - The **bracketed half** is filtered by `∩ hasMatter`, because a dirty
 >   EMPTY chunk can only *receive* matter from a non-empty neighbour, and the
 >   ring around the non-empty set covers every such neighbour (§3.2a). This is
 >   what keeps a wake-all from demanding 32,768 pages.
-> - **`opTargets(N)` and `particleChunks(N)` are NOT filtered.** They
+> - **`opTargets(N)` and `particleSpawnChunks(N)` are NOT filtered.** They
 >   materialize **regardless of sentinel state**, because they are writes into
 >   cells the CPU chose, and a CPU op genuinely writes into isolated empty sky:
 >   `sim_mutate.wgsl:79` paints wherever `voxMat(voxels[idx]) == MAT_AIR` — an
 >   op-mode-0 brush into a `PT_EMPTY` chunk with no non-empty chunk anywhere
 >   near it is an ordinary, intended operation. Filtering these through
->   `∩ nonSentinel` would make the brush silently no-op in open sky, which is
+>   `∩ hasMatter` would make the brush silently no-op in open sky, which is
 >   the single most visible thing a player can do.
 >
-> A particle can likewise come to rest in isolated sky (a ballistic voxel that
-> ran out of life), so `particleChunks` takes the same unfiltered treatment.
+> `particleSpawnChunks` is unfiltered for a narrower and truer reason: on the
+> FIRST TICK OF FLIGHT a particle has not yet encountered anything, so its
+> spawn ring is not yet pinned to existing matter. Every LATER particle write
+> is adjacent to matter that already exists and is covered by the bracketed
+> half — see §3.4. (An earlier draft said a particle can come to rest in
+> isolated sky having "run out of life". That is FALSE: ordinary particles have
+> no life counter and come to rest against matter.)
+
+**Ordering, and it is what closes the induction.** The bracketed half is
+evaluated against `hasMatter` **at encode time for tick N**. A tick-N
+reinsertion places matter that is present at N+1, and `markDirtyNext` marks its
+chunk, so N+1's `(cpuDirty ∩ hasMatter)` includes it. The set is therefore
+correct at every tick without ever tracking a particle in flight.
 
 **[REVIEW C1 — FIXED. The earlier draft of this section was wrong and the
 reviewer is right about why.** It wrote `cpuDirty ← dirtyFlags(snapshot)` — an
@@ -879,18 +892,26 @@ guaranteed **abort**, twice per in-game day.
 
 The rule is **step (4) of the normative definitions above** — not restated
 here, per NEW-3. What that section does not have room to argue is *why the
-`∩ nonSentinel` filter is sound*, which is this:
+`∩ hasMatter` filter is sound*, which is this:
 
-> **Dirty ≠ non-empty.** A chunk that is dirty but is a sentinel holds no
+> **`hasMatter` excludes only `PT_EMPTY`.** A `UNIFORM(mat)` sentinel with
+> `mat != MAT_AIR` HOLDS MATTER and is included, because a particle or a CA
+> write can land against it — `blocksParticle` reads through `voxWordAt`, and a
+> UNIFORM sentinel BLOCKS, so a particle can legitimately come to rest against
+> a chunk of uniform water. This is a strict WIDENING of the earlier
+> `∩ nonSentinel`: the ~4,974 non-empty chunks ARE the `hasMatter` set, so the
+> wake-all argument below is untouched.
+>
+> **Dirty ≠ has matter.** A chunk that is dirty but is `PT_EMPTY` holds no
 > matter, so nothing in it can move; the only way it can *receive* matter is
 > from a neighbouring chunk that has matter — and every such neighbour is in
-> `cpuDirty ∩ nonSentinel`, whose 26-ring is materialized. A dirty EMPTY chunk
+> `cpuDirty ∩ hasMatter`, whose 26-ring is materialized. A dirty EMPTY chunk
 > with no non-empty chunk in its 26-neighbourhood is therefore provably
 > unwritable **by the CA** this tick and needs no page.
 
 Note the qualifier **"by the CA"**: it is doing real work. The claim is only
 about matter *moving* under the automaton, which is why `opTargets` and
-`particleChunks` are unioned in *outside* the filter (step 4) — those are
+`particleSpawnChunks` are unioned in *outside* the filter (step 4) — those are
 writes the CPU commanded into cells it chose, and they reach isolated sky where
 no CA write ever could.
 
@@ -927,7 +948,7 @@ already computes `opsCount`/`expCount`/`cellCount` (`support.cpp:113-136`).
 **These chunks form `opTargets(N)`**, which enters the normative definitions in
 two places: as contributor (a) to `C(N)` (step 0), and — critically — as an
 **unfiltered** term of `materialize(N)` (step 4). They are *not* subject to
-`∩ nonSentinel`: `sim_mutate.wgsl:79` paints into any cell that reads as air,
+`∩ hasMatter`: `sim_mutate.wgsl:79` paints into any cell that reads as air,
 so a mode-0 brush into an isolated `PT_EMPTY` chunk is an ordinary operation
 and must have a page. Filtering it would make the brush no-op in open sky.
 
@@ -984,65 +1005,62 @@ both — but the set must be built from the swept path, not from a notion of
 `markDirtyNext(cell)` on the stain path (`:242`) and on the reinsertion path
 (`:265`), which dirties the **26-neighbourhood of a location the CPU never
 chose**. So particle activity seeds next tick's CA reach through a channel
-`cpuDirty`'s own recurrence does not model. **`particleChunks(N)` must be
+`cpuDirty`'s own recurrence does not model. **`particleSpawnChunks(N)` must be
 UNIONed into `cpuDirty(N+1)`**, not merely materialized alongside it —
 otherwise the CA frontier that particles create is invisible to the mirror
 until a snapshot happens to report it.
 
-Three facts bound the swept set:
+**THE ADJACENCY ARGUMENT — [AMENDED, and this REPLACES the swept set
+entirely].** The first draft tracked a carried, dilated set of chunks a
+particle might BE in. That is a correct superset but it is unbounded: dilating
+the previous dilation one ring per tick makes it a k-ring after k ticks —
+(2k+1)³ chunks — and measured on the loud scenario one explosion's debris drove
+it 1, 27, 125, 343, 729, 1331, 2197, 3375 over eight ticks, past an 8,192-page
+pool on its own.
 
-1. **Particles are capped**: `kParticleCap = 262144`, and `particlesActive` is a
-   CPU-known boolean (`support.cpp:111`) that is false in a settled world.
-2. **Velocity is capped**: `PART_MAX_VEL = TUNE_PART_MAX_VEL` (~6 voxels/tick
-   terminal). A particle moves at most a bounded number of *voxels* per tick,
-   hence at most a bounded number of *chunks*.
-3. **Particles are spawned by CPU-known events** — explosion ejecta
-   (`explodeApply`, whose center the CPU knows) and `spawnOps` (CPU-authored) —
-   and thereafter integrate deterministically.
+**The set is deleted.** Every particle write lands within one cell of matter
+that already exists, so the bracketed half of `materialize(N)` already covers
+all of them after the first tick of flight:
 
-**Decision: track a CPU-side conservative particle-occupancy set, seeded from
-spawn sites and dilated by the max flight distance per tick, and materialize
-it — with a hard fallback.** Specifically:
+- **A STAIN write targets a non-air cell DIRECTLY.** `resolve` guards on
+  `hit == MAT_AIR` and then on class (`sim_particle.wgsl:229`, `:234`), and the
+  buried branch sits behind `blocksParticle(startCell)` (`:130-139`). A stained
+  cell therefore HAS MATTER by construction, so its own chunk is in
+  `cpuDirty ∩ hasMatter`.
+- **A REINSERTION targets `lastAir`**, which is ≤ 1 cell from a blocking sample
+  because the sweep subdivides to ≤ half a voxel
+  (`n = max(1, (maxc + 127) / 128)`, `:153-154`). The blocking sample has
+  matter, so `lastAir`'s chunk is within `N26` of a `hasMatter` chunk.
+- **The only gap is the FIRST TICK OF FLIGHT**, before a particle has
+  encountered anything — and that is exactly what the spawn ring covers.
+
+> **The old formula tracked where a particle might BE, which grows with flight
+> time. This one tracks where a particle might WRITE, which is pinned to matter
+> that already exists.**
+
+**What remains is `particleSpawnChunks(N)`:**
 
 ```
-particleChunks(N+1) = Ndilate( particleChunks(N), ceil(PART_MAX_VEL / CHUNK) + 1 )
-                      ∪ chunks(spawnOps(N)) ∪ chunks(explosion centers(N))
-particleChunks(N+1) = ∅   when the readback says particleCount == 0
+particleSpawnChunks(N) = chunks(spawnOps(N)) ∪ chunks(explosionCenters(N)),
+                         dilated ceil(PART_MAX_VEL / CHUNK) + 1 = 1 ring
 ```
 
-**Where this set enters the normative definitions**, both per M1 above:
+**RECOMPUTED FROM SCRATCH each tick from CPU-known inputs, never carried.** It
+is bounded by `kMaxParticleSpawnsPerTick` and `kMaxExplosionsPerTick` and is
+**independent of flight duration** — which is the whole point.
 
-- as contributor **(b) to `C(N)`** (step 0) — because `resolve`'s
-  `markDirtyNext` dirties the 26-neighbourhood of a GPU-decided location, so
-  `N26(particleChunks)` is already covered by step (1)'s dilation of `C(N)`;
-- as an **unfiltered** term of `materialize(N)` (step 4) — a particle can come
-  to rest, or a micro droplet can stain, in a chunk that is a sentinel, so
-  `∩ nonSentinel` must not apply to it.
+It stays contributor **(b)** to `C(N)` in §3.1a: `resolve`'s `markDirtyNext`
+still dirties the 26-neighbourhood of a GPU-decided location, and step (1)'s
+`N26` of `C(N)` covers that.
 
-`ceil(6/16)+1 = 1`, so the dilation is a 1-ring per tick — the same shape as
-`cpuDirty`. And `snap.particleCount` (already read back, `world.h:487`) gives
-the reset condition: no live particles means the set is empty, which is the
-settled case. Note the reset is subject to the same staleness as every other
-snapshot field — `particleCount == 0` in a snapshot stamped `S` licenses
-clearing the set only if no spawn has been issued since, which the CPU knows.
+**Fallback (ii) is kept:** the ring radius is derived from
+`TUNE_PART_MAX_VEL` at load rather than hardcoded, so raising the tuning value
+automatically widens it — and since `TUNE_*` is hot-reloadable (F5), it is
+recomputed on reload.
 
-**[JUDGMENT] The fallback, and I want the reviewer's opinion on it.** The
-dilation is only sound if `PART_MAX_VEL` genuinely bounds per-tick travel and
-the sweep is subdivided (it is — anti-tunneling subdivides the sweep, per the
-budget gotcha in CLAUDE.md). If a future change lets a particle move further,
-this silently under-approximates and we lose a voxel. Two ways to make that
-non-silent:
-
-- **(i)** `voxStore`'s no-op path is already the containment (§2.4) and the
-  `pageFaults` counter catches it — on every run, since the counter is
-  unconditional.
-- **(ii)** Add a `static_assert`-shaped CPU check: the dilation radius is
-  computed from `TUNE_PART_MAX_VEL` at load rather than hardcoded, so raising
-  the tuning value automatically widens the ring. Since `TUNE_*` values are
-  hot-reloadable (F5), this must be recomputed on reload.
-
-**Take both.** (ii) is the mechanism, (i) is the detector. The general principle
-matches the repo's habit: derive the constant, don't restate it.
+**`pageFaults == 0` on the loud scenario is the EVIDENCE for this argument, not
+a formality.** If it is ever non-zero, a write escaped the adjacency claim and
+the path must be found — do not widen the ring to make it go away.
 
 **A simpler option exists and I am not taking it:** materialize the whole window
 whenever `particlesActive`. That is correct and trivially safe, but a single
@@ -1365,7 +1383,7 @@ Consequences of the settled policy:
   `pagesHighWater_` must be reported on every `--measure` run so the margin is
   a tracked number. §8 commit 6 does this.
 - **The wake-all case is where sizing is actually tested** (§3.2a): without the
-  `∩ nonSentinel` materialization rule a daylight boundary would demand 32,768
+  `∩ hasMatter` materialization rule a daylight boundary would demand 32,768
   pages and, under this policy, **crash twice per in-game day**. That rule is
   therefore not an optimization — it is what keeps the abort unreachable.
 
@@ -1475,6 +1493,43 @@ explicit item, and it is a good argument for landing commit 1 as the identity
 map: under `pageTable[i] == i` the two bases are equal, so the split can be
 introduced and proven hash-neutral before it can possibly differ.
 
+#### 4.1a The two-base rule is NOT only about the hash — [AS BUILT, commit 1]
+
+**[FOUND IN IMPLEMENTATION. The mechanism above is right; its scope was too
+narrow, which is this document's documented failure mode — a missing
+contributor, not a wrong rule.]**
+
+M3 states the rule for the world hash: *the load follows the page; the key
+keys on the slot.* Implementing commit 1 turned up **five more sites with the
+same shape and none of them a hash**, every one of which would make a paged run
+diverge from a dense one while staying perfectly self-consistent:
+
+| site | what the index keys | what breaks under a page index |
+|---|---|---|
+| `sim_step:main` | `hash3(T.seed, tick*2+substep, idx)` — the per-cell RNG for every reaction, stain and movement roll | every cell's random stream becomes a function of allocation history |
+| `sim_step:doStaining` | `hash3(rnd, 0x51A17u, ni)` — the stain-consumption roll | same, per neighbour |
+| `sim_explode:apply` | `hash3(T.seed^0xB0011u, tick, idx)` — ejecta velocity/jitter | same, per destroyed cell |
+| `sim_explode:apply` | `hash3(rnd, 0x6217u, idx)` — the micro-grit roll | same |
+| `sim_mutate:main` | `hash3(T.seed^0x5EEDu, tick, idx)` — the palette-variant roll | a brush paints different state nibbles depending on which page it landed in |
+| `sim_particle:resolve` | `claimSlot(tgt)` — the reinsertion claim lattice | two particles targeting one world cell could hash to different claim slots after a reallocation and **both win** |
+
+**The generalized rule, which is what §4.1 should have said from the start:**
+
+> **A voxel index used as an IDENTITY — an RNG key, a hash key, a claim-lattice
+> key, anything whose value must be a property of *where a cell is in the
+> world* — must be the SLOT index. Only a memory address may be the PAGE
+> index.** The two are equal under the identity map, which is exactly why the
+> split is introduced in commit 1 and provable there.
+
+As built, each site carries both: a `slotIdx` / `tgtSlot` from `cellIndexW` for
+keying, and an `idx` from `voxWordIndex` for addressing. The comment at each
+site says which is which and why.
+
+**Standing obligation, in the same register as §2.1's:** a kernel that derives
+a value from a voxel index must say whether that value is an address or an
+identity. `voxWordIndex` returns an address; `cellIndexW` returns an identity.
+Nothing else may be used for either.
+
 The same split applies to `mainDirty` (`sim_occupancy.wgsl:35`,
 `base = dirtyList[wg.x] * CHUNK_VOL`) — but `mainDirty` computes no hash, so it
 needs only the load base. Stated so nobody "fixes" it symmetrically.
@@ -1516,7 +1571,7 @@ MANDATORY — not a belt.** **[REVIEW M3, second half — FIXED.]** The first dr
 claimed `mainDirty` "can never see a sentinel" because every chunk in
 `dirtyList` is in the materialization set. **That was true only under the first
 draft's materialization rule, and §3.2a deleted it.** Under the corrected rule
-(§3.2a fix 2) the set is `(cpuDirty ∩ nonSentinel) ∪ N26(...)`, which
+(§3.2a fix 2) the set is `(cpuDirty ∩ hasMatter) ∪ N26(...)`, which
 deliberately does **not** materialize a dirty EMPTY chunk with no non-empty
 neighbour — and a wake-all makes *every* chunk dirty, so after any daylight
 boundary `dirtyList` is full of sentinel chunks. `mainDirty` sees them
@@ -2172,7 +2227,7 @@ this risk onto **pool sizing** and onto the materialization set staying tight.
 
 **How neutralized.**
 
-1. **The `∩ nonSentinel` rule (§3.2a / M2) is what keeps the abort
+1. **The `∩ hasMatter` rule (§3.2a / M2) is what keeps the abort
    unreachable.** Without it a daylight wake-all demands 32,768 pages from an
    8,192-page pool and crashes twice per in-game day. With it, a wake-all
    demands the non-empty set plus a ring — the same order as steady state.
@@ -2389,7 +2444,7 @@ materialization rule it is standing in for. **Merging is the better trade.**
 
 So this commit lands: `--residency dense|paged`; worldgen classification into
 `PT_EMPTY`; `cpuDirty` (§3.2) with the intersection-tightening rule;
-`EncodeWakeAll` setting the mirror (§3.2a); the `∩ nonSentinel` materialization
+`EncodeWakeAll` setting the mirror (§3.2a); the `∩ hasMatter` materialization
 rule (§3.2a / M2); CPU-op target sets (§3.3); the particle set (§3.4) unioned
 into `cpuDirty`; the free-list allocator; queued page fills (§5.4); worldgen
 batching (§3.5c); streaming/`LoadWorld` classification (§3.5d,e); the fatal

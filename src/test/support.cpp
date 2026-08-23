@@ -4,6 +4,8 @@
 
 #include "test/support.h"
 
+#include "sim/pagetable.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -169,7 +171,84 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     if (wasDay != isDay) sim.EncodeWakeAll(ctx.queue);
   }
 
+  // ---- the page table: MATERIALIZE BEFORE THE ENCODER (§3) ----------------
+  //
+  // A GPU kernel cannot allocate, so every page a kernel might write must
+  // exist before the command buffer is submitted. This is the whole reason
+  // the phase has a CPU-side conservative dirty mirror: the question
+  // "at encode time, what is the set of chunks this tick could write?" is
+  // CPU-derivable, and the GPU has no monopoly on it.
+  //
+  // The order below is the §3.2 normative definitions, in their stated order:
+  //   BeginTick        -> clears this tick's C(N) contributors
+  //   AddOp*           -> contributor (a), opTargets(N)
+  //   UpdateParticles  -> contributor (b), particleChunks(N)
+  //   TightenFromSnapshot -> step (2), INTERSECTION only, never assignment
+  //   WakeAll/Refilled -> step (3), strictly AFTER the tightening
+  //   Materialize      -> step (1) propagate, then step (4) allocate + fill
+  //
+  // EncodeWakeAll above has already unioned all-ones into the mirror (§3.2a
+  // fix 1: the wake IS a dirty-set mutation and the two must be ONE operation,
+  // not two that must agree).
+  PageTable& pt = *world.pages;
+  // Install the free-confirmation probe once (see SetChunkProbe): a page is
+  // only released when the chunk's WORDS say empty, because occupancy does not
+  // see the stain layer and the hash does.
+  static bool probeInstalled = false;
+  if (!probeInstalled) {
+    probeInstalled = true;
+    GpuContext* pctx = &ctx;
+    World* pw = &world;
+    pt.SetChunkProbe([pctx, pw](uint32_t slot, uint32_t* out) {
+      const uint64_t off = pw->PageOffsetOfSlot(slot);
+      if (off == World::kNoPage) return false;
+      pctx->WaitIdle();
+      return rhi::ReadbackBlocking(pctx->device, pctx->queue, pw->voxels, off,
+                                   out, (size_t)kChunkVol * 4, "freeProbe");
+    });
+  }
+  pt.BeginTick(tick);
+  for (const BrushOp& o : ops)
+    pt.AddOpSphere({o.x, o.y, o.z}, o.radius, world);
+  for (const ExplosionOp& e : exps)
+    pt.AddOpBox({e.x, e.y, e.z}, kMaxExplosionRadius, world);  // EXP_BOX
+  for (uint32_t i = 0; i < cellCount; i++)
+    pt.AddOpTarget(cells[i].cellIdx / kChunkVol);  // already a slot chunk index
+  {
+    std::vector<IVec3> spawnCells, expCenters;
+    spawnCells.reserve(spawnCount);
+    for (uint32_t i = 0; i < spawnCount; i++)
+      spawnCells.push_back({spawns[i].px >> 8, spawns[i].py >> 8,
+                            spawns[i].pz >> 8});
+    for (const ExplosionOp& e : exps) expCenters.push_back({e.x, e.y, e.z});
+    // particleSpawnChunks(N): THIS tick's spawn sites, one ring, recomputed
+    // from scratch. Not carried — see the adjacency argument in
+    // PageTable::UpdateSpawnRing.
+    pt.UpdateSpawnRing(spawnCells, expCenters, world);
+  }
+  {
+    const WorldSnapshot& sn = world.Snap();
+    if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
+  }
+  pt.Materialize(ctx.queue);
+  // ---- deallocation (§3.6), AFTER materialization -------------------------
+  // Order matters: cpuDirty is the materialization set, and the free
+  // condition's second conjunct tests against it. Running the free decision
+  // before Materialize would test a mirror that had not yet absorbed this
+  // tick's ops, and could free a chunk this very tick is about to write.
+  //
+  // Both steps read data the CPU already has: the occupancy the snapshot
+  // already carries, and a tick counter. No new readback, no new scan.
+  if (world.Snap().valid) pt.ConsumeOccupancy(world.Snap().occupancy, tick);
+  pt.RetirePages(tick);
+
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  // The fills go in at the HEAD of the command buffer, before any row (§5.4):
+  // FillTracked declares TransferWrite on Voxels, and the first row with
+  // RW(Voxels) then gets a derived TRANSFER->COMPUTE barrier. A fill recorded
+  // after a dispatch that reads the page is exactly the hazard this ordering
+  // exists to prevent.
+  pt.DrainFills(enc);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
                  fluidBase + fluidSpawnCount, fluidSpawnCount);
@@ -183,17 +262,106 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   ctx.queue.Submit(enc.Finish());
   sim.FlipPage();
-  if (doCopy) world.KickReadback();
+  if (doCopy) {
+    world.KickReadback();
+    // Harness only, off by default (see SetHarnessSnapshotDrain in support.h).
+    // Wait for the submit's fence, then pump — which is what a game frame does
+    // for free by having real time elapse between the two. The game's frame
+    // loop shares SubmitTick and must never take this path.
+    if (HarnessSnapshotDrain()) {
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+    }
+  }
 }
+
+namespace {
+// Off by default: main.cpp's frame loop shares SubmitTick and must never pay
+// this sync point. Only --selftest / --vk-smoke / --measure opt in.
+bool g_harnessSnapshotDrain = false;
+}  // namespace
+
+void SetHarnessSnapshotDrain(bool on) { g_harnessSnapshotDrain = on; }
+bool HarnessSnapshotDrain() { return g_harnessSnapshotDrain; }
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
   TickParams tp{0, seed, 0, 0};
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
-  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  sim.EncodeWorldgen(enc);
-  ctx.queue.Submit(enc.Finish());
+  if (world.residency != World::Residency::Paged) {
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeWorldgen(enc);
+    ctx.queue.Submit(enc.Finish());
+    return;
+  }
+
+  // ---- BATCHED worldgen (PLAN_page_table.md §3.5c, §9 open question 1) ----
+  //
+  // genChunk writes all 4,096 cells of every target slot and does NOT know in
+  // advance which it will fill with air, so every slot it touches must have a
+  // page before the dispatch — a kernel cannot allocate. Doing all 32,768 at
+  // once would need a dense pool (512 MiB), i.e. no saving at all at the
+  // moment of worldgen, and under §3.8's fatal policy it would simply ABORT at
+  // startup with kPoolPages = 8192.
+  //
+  // So: materialize a batch, dispatch it through `worldgenList` (which already
+  // takes a slot list — the primitive was there), read its occupancy, demote
+  // the empties, and let those pages come back for the next batch. The
+  // transient is bounded by the batch size and it costs 32768/2048 = 16
+  // submits at startup, which is nothing off the frame path. It also
+  // generalizes to a grown window, where a dense transient would be 4 GiB and
+  // simply impossible.
+  {
+    const uint32_t kGenBatch = 2048;
+    // The first submit still has to clear the transient buffers (hash,
+    // support, particle counts, both dirty pages) exactly as EncodeWorldgen
+    // does, so run it over an EMPTY slot list: the fills land, the dispatch
+    // covers zero slots.
+    world.pages->ResetAllEmpty(ctx.queue);
+    {
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeWorldgen(enc, /*denseGen=*/false);
+      ctx.queue.Submit(enc.Finish());
+    }
+    std::vector<uint32_t> batch;
+    std::vector<uint32_t> vox((size_t)kGenBatch * kChunkVol);
+    batch.reserve(kGenBatch);
+    for (uint32_t base = 0; base < kNumChunks; base += kGenBatch) {
+      const uint32_t n = std::min(kGenBatch, kNumChunks - base);
+      batch.clear();
+      for (uint32_t k = 0; k < n; k++) {
+        batch.push_back(base + k);
+        world.pages->EnsurePageForOverwrite(base + k);
+      }
+      world.pages->FlushTableWrites(ctx.queue);
+      ctx.queue.WriteBuffer(world.genList, 0, batch.data(), batch.size() * 4);
+      TickParams gp{};
+      gp.seed = seed;
+      gp.genCount = (uint32_t)batch.size();
+      gp.origin[0] = wo.x; gp.origin[1] = wo.y; gp.origin[2] = wo.z;
+      ctx.queue.WriteBuffer(world.tickUBO, 0, &gp, sizeof(gp));
+      rhi::CommandEncoder ge = ctx.device.CreateCommandEncoder();
+      sim.EncodeGenList(ge, (uint32_t)batch.size());
+      ctx.queue.Submit(ge.Finish());
+      // Classify and demote, which returns the all-air pages to the free list
+      // for the next batch. This is the compaction §3.5c calls for, run
+      // eagerly once per batch rather than on the hysteresis cadence.
+      ReadVoxelsSync(ctx, world, base, n, vox.data(), "wgClassify");
+      for (uint32_t k = 0; k < n; k++) {
+        const uint32_t e = PageTable::Classify(vox.data() + (size_t)k * kChunkVol);
+        if (e != PageTable::kNeedsPage) world.pages->SetSentinel(base + k, e);
+      }
+      world.pages->FlushTableWrites(ctx.queue);
+    }
+    std::printf("worldgen (paged, %u-slot batches): %u pages in use "
+                "(%.1f MiB of %.1f MiB pool), high water %u\n",
+                kGenBatch, world.pages->PagesInUse(),
+                (double)world.pages->PagesInUse() * kChunkVol * 4.0 / 1048576.0,
+                (double)world.pages->PoolPages() * kChunkVol * 4.0 / 1048576.0,
+                world.pages->PagesHighWater());
+    return;
+  }
 }
 
 // (Body render plumbing lives in game/bodyreg.h — see the note in support.h.)

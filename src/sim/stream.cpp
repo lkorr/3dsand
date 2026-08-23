@@ -6,6 +6,7 @@
 
 #include "gpu/context.h"
 #include "gpu/resources.h"
+#include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked eviction copy
 #include "sim/simulation.h"
 
@@ -284,11 +285,39 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       CompleteOldest(/*discard=*/false);
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
-      // THE CPU SEAM (§2.1a): without translation this writes the decoded RLE
-      // into ANOTHER chunk's page. In commit 1 the identity map makes it the
-      // same address; the resolve is introduced here while it cannot differ.
-      const uint64_t dstOff = world_->PageOffsetOfSlot(s);
-      ctx_->queue.WriteBuffer(world_->voxels, dstOff, data.data(), kChunkBytes);
+      // ---- store-hit classification (PLAN_page_table.md §3.5d) ------------
+      //
+      // The CPU has the decoded 16 KiB in `data` before it uploads, so it
+      // knows for FREE — it is already looping over every word below to
+      // compute occ/blockers — whether the chunk is all-air or all-one-word.
+      // All-air or uniform => install the sentinel and SKIP THE 16 KiB UPLOAD
+      // ENTIRELY, which is a bandwidth win on top of the memory win.
+      //
+      // This is also the ONE place UNIFORM discovery lives (§3.6, with commit
+      // 0's measurement behind it): the paths that already hold the words get
+      // demotion, and the tick path does not get a GPU uniformity scan.
+      const uint32_t entry = world_->residency == World::Residency::Paged
+                                 ? PageTable::Classify(data.data())
+                                 : PageTable::kNeedsPage;
+      if (entry != PageTable::kNeedsPage) {
+        world_->pages->SetSentinel(s, entry);
+      } else {
+        // THE CPU SEAM (§2.1a): without translation this writes the decoded
+        // RLE into ANOTHER chunk's page. EnsurePageForOverwrite allocates when
+        // the slot is a sentinel — the same branch that classifies is the one
+        // that allocates, so allocation and offset come from one place.
+        const uint64_t dstOff = world_->pages->EnsurePageForOverwrite(s);
+        ctx_->queue.WriteBuffer(world_->voxels, dstOff, data.data(), kChunkBytes);
+      }
+      world_->pages->FlushTableWrites(ctx_->queue);
+      // Contributor (d) to the CPU dirty mirror (§3.1a): the two dirty writes
+      // below wake this slot on the next tick, in BOTH pages, decided by
+      // streaming rather than by the tick loop. Its own chunk is materialized
+      // by the branch above either way, but it must still enter cpuDirty or a
+      // tightening in the same tick would intersect the refilled chunk's
+      // NEIGHBOURS away and the CA frontier a stream-in creates would be
+      // invisible to the mirror.
+      world_->pages->RefilledSlot(s);
       uint32_t occ = 0, blockers = 0;
       for (uint32_t w : data) {
         uint32_t m = w & 0xFFFu;
@@ -306,6 +335,17 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     }
   }
   if (!genSlots.empty()) {
+    // genChunk overwrites the WHOLE chunk of every slot in the list, so every
+    // one of them needs a page before the dispatch — a kernel cannot allocate
+    // (§3.5c at batch size = the genList count, which the shift plane already
+    // bounds). No fill is queued: the kernel is about to write all 4,096 words.
+    if (world_->residency == World::Residency::Paged) {
+      for (uint32_t gs : genSlots) world_->pages->EnsurePageForOverwrite(gs);
+      world_->pages->FlushTableWrites(ctx_->queue);
+      // Same contributor (d) reasoning as the store-hit branch: genChunk's own
+      // in-kernel dirty write wakes the slot next tick.
+      for (uint32_t gs : genSlots) world_->pages->RefilledSlot(gs);
+    }
     ctx_->queue.WriteBuffer(world_->genList, 0, genSlots.data(),
                             genSlots.size() * 4);
     TickParams tp{};
@@ -317,6 +357,54 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     sim_->EncodeGenList(enc, (uint32_t)genSlots.size());
     ctx_->queue.Submit(enc.Finish());
+
+    // ---- and DEMOTE the result (§3.5c's compaction, on the streaming path) --
+    //
+    // Without this the shift plane LEAKS: genChunk needs a page for every slot
+    // it writes, but ~85% of a shift plane generates as pure sky, and a page
+    // that is never demoted is never freed either — §3.6's free condition only
+    // fires for slots reporting occTotal == 0 on kPageFreeTicks CONSECUTIVE
+    // snapshots, and a slot that scrolled out stops being reported at all.
+    // Measured before this landed: ~880 pages leaked per window shift
+    // (5832 -> 6711 -> 7584 over three shifts of the loud scenario), which
+    // exhausted the pool while the materialization set itself sat flat at
+    // ~1,200. It is the same classification the store-hit branch does and that
+    // batched worldgen does; this was the one path missing it.
+    //
+    // CLASSIFY ON THE WORDS, never on `occupancy`. Two reasons, both learned
+    // the hard way here:
+    //   - occupancy counts NON-AIR cells, but the hash also covers the STAIN
+    //     layer (bits 24..30, sim_occupancy.wgsl). A chunk can be all-air and
+    //     still carry stain, and demoting it to PT_EMPTY would silently drop
+    //     hashed state — which is exactly gotcha-save-format-drops-stain in a
+    //     new place.
+    //   - PageTable::Classify is the ONE promotion rule (whole-word equality,
+    //     §2.3), so using it here keeps a single definition rather than a
+    //     second predicate that must agree with it.
+    //
+    // The WaitIdle is required, not defensive: genChunk writes the voxels in
+    // this submit, and reading before it completes returns the PREVIOUS
+    // contents — for a freshly scrolled-in slot, zeros, so every generated
+    // chunk would be demoted and its matter lost. Blocking is fine here:
+    // FillSlots already runs mid-frame on its own submit and a window shift is
+    // a streaming event, not a per-tick cost.
+    if (world_->residency == World::Residency::Paged) {
+      ctx_->device.WaitIdle();
+      std::vector<uint32_t> vox(kChunkVol);
+      uint32_t demoted = 0;
+      for (uint32_t gs : genSlots) {
+        const uint64_t off = world_->PageOffsetOfSlot(gs);
+        if (off == World::kNoPage) continue;
+        if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->voxels,
+                                   off, vox.data(), kChunkBytes, "genClassify"))
+          break;
+        const uint32_t e = PageTable::Classify(vox.data());
+        if (e == PageTable::kNeedsPage) continue;
+        world_->pages->SetSentinel(gs, e);
+        demoted++;
+      }
+      if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
+    }
   }
 }
 
