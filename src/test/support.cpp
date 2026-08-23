@@ -177,6 +177,22 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // fix 1: the wake IS a dirty-set mutation and the two must be ONE operation,
   // not two that must agree).
   PageTable& pt = *world.pages;
+  // Install the free-confirmation probe once (see SetChunkProbe): a page is
+  // only released when the chunk's WORDS say empty, because occupancy does not
+  // see the stain layer and the hash does.
+  static bool probeInstalled = false;
+  if (!probeInstalled) {
+    probeInstalled = true;
+    GpuContext* pctx = &ctx;
+    World* pw = &world;
+    pt.SetChunkProbe([pctx, pw](uint32_t slot, uint32_t* out) {
+      const uint64_t off = pw->PageOffsetOfSlot(slot);
+      if (off == World::kNoPage) return false;
+      pctx->WaitIdle();
+      return rhi::ReadbackBlocking(pctx->device, pctx->queue, pw->voxels, off,
+                                   out, (size_t)kChunkVol * 4, "freeProbe");
+    });
+  }
   pt.BeginTick(tick);
   for (const BrushOp& o : ops)
     pt.AddOpSphere({o.x, o.y, o.z}, o.radius, world);
@@ -191,9 +207,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       spawnCells.push_back({spawns[i].px >> 8, spawns[i].py >> 8,
                             spawns[i].pz >> 8});
     for (const ExplosionOp& e : exps) expCenters.push_back({e.x, e.y, e.z});
-    const WorldSnapshot& sn = world.Snap();
-    pt.UpdateParticles(particlesActive, sn.valid ? sn.particleCount : 0,
-                       spawnCells, expCenters, world);
+    // particleSpawnChunks(N): THIS tick's spawn sites, one ring, recomputed
+    // from scratch. Not carried — see the adjacency argument in
+    // PageTable::UpdateSpawnRing.
+    pt.UpdateSpawnRing(spawnCells, expCenters, world);
   }
   {
     const WorldSnapshot& sn = world.Snap();

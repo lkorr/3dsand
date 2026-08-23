@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <vector>
 
 #include "gpu/rhi.h"
@@ -114,9 +115,20 @@ class PageTable {
   void AddOpSphere(IVec3 centerCell, int radius, const World& world);
   void AddOpBox(IVec3 centerCell, int halfExtent, const World& world);
 
-  // Contributor (b) to C(N): the conservative swept-particle set (§3.4).
-  void UpdateParticles(bool particlesActive, uint32_t liveCount,
-                       const std::vector<IVec3>& spawnCells,
+  // Contributor (b) to C(N): particleSpawnChunks(N) — the spawn sites of THIS
+  // tick, dilated one ring (§3.4). RECOMPUTED FROM SCRATCH each tick from
+  // CPU-known inputs and never carried, so it is bounded by
+  // kMaxParticleSpawnsPerTick + kMaxExplosionsPerTick and is INDEPENDENT OF
+  // FLIGHT DURATION.
+  //
+  // This replaces the carried/dilated swept set the first draft of §3.4
+  // specified. That set tracked where a particle might BE, which grows with
+  // flight time — measured at 1, 27, 125, 343, 729, 1331, 2197, 3375 chunks
+  // over eight ticks of one explosion's debris. This one tracks where a
+  // particle might WRITE, which is pinned to matter that already exists, so
+  // the bracketed half of materialize(N) already covers every particle write
+  // after the first tick of flight. See the argument in the .cpp.
+  void UpdateSpawnRing(const std::vector<IVec3>& spawnCells,
                        const std::vector<IVec3>& explosionCenters,
                        const World& world);
 
@@ -196,6 +208,21 @@ class PageTable {
   // conservative mirror and not the snapshot's own dirty flags.
   void ConsumeOccupancy(const std::vector<uint32_t>& occupancy, uint32_t tick);
 
+  // How ConsumeOccupancy CONFIRMS a candidate is really empty before freeing
+  // its page. `occTotal == 0` is not sufficient: occupancy counts NON-AIR
+  // cells, while the world hash also covers the STAIN layer, so an all-air
+  // chunk can still carry hashed state. The probe reads the chunk's words and
+  // Classify decides. Injected rather than called directly because PageTable
+  // has no GpuContext — and it is optional: with no probe installed, no page
+  // is ever freed, which is safe (monotonic) if wasteful.
+  //
+  // Called only for a slot that has already reported empty for kPageFreeTicks
+  // CONSECUTIVE snapshots and is not in cpuDirty — zero slots per tick in a
+  // settled world.
+  void SetChunkProbe(std::function<bool(uint32_t, uint32_t*)> probe) {
+    probeChunk_ = std::move(probe);
+  }
+
   // Retire the free list: pages parked by ConsumeOccupancy become reusable
   // once enough ticks have passed for any in-flight eviction copy referencing
   // them to have completed (risk 5).
@@ -263,6 +290,8 @@ class PageTable {
   // already running and takes NO further action. That is the rule-2 story, and
   // it is honest: not free, but not a new scan either.
   std::vector<uint8_t> zeroStreak_;
+  std::function<bool(uint32_t, uint32_t*)> probeChunk_;
+  std::vector<uint32_t> freeProbe_;
   static constexpr uint8_t kPageFreeTicks = 8;   // ~a quarter second at 30 Hz
 
   // THE RETIRE QUEUE (risk 5). The existing code is safe against
