@@ -183,6 +183,8 @@ struct RunResult {
   std::vector<Probe> probes;
   uint32_t shifts = 0;
   size_t storeCount = 0;
+  // Load-bearing evidence for §3.4's adjacency argument (see RunSmoke).
+  uint32_t pageFaults = 0;
   rhi::vkr::Stats stats{};       // last recorded command buffer
   size_t validationMsgCount = 0;
   std::vector<std::string> validationMsgs;
@@ -405,6 +407,16 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
   if (loud)
     std::printf("\n=== streaming ===\n  %u window shifts, %zu chunks in store\n",
                 run.shifts, run.storeCount);
+
+  // pageFaults is LOAD-BEARING EVIDENCE for §3.4's adjacency argument, not a
+  // formality: the argument claims every particle write after the first tick
+  // of flight lands within one cell of matter that already exists, so the
+  // bracketed half of materialize(N) already covers it. Non-zero means a write
+  // escaped that claim — find the path; do NOT widen the ring.
+  std::printf("\n=== page faults ===\n  %u%s\n", run.pageFaults,
+              run.pageFaults == 0
+                  ? "  (every sim write reached a materialized page)"
+                  : "  *** A WRITE ESCAPED THE ADJACENCY ARGUMENT ***");
 
   const Pinned* pinned = loud ? kLoudPinned : kQuietPinned;
   const size_t count = loud ? std::size(kLoudPinned) : std::size(kQuietPinned);

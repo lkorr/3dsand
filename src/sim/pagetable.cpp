@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked page fills
+#include "sim/tuning.h"      // TUNE_PART_MAX_VEL, for the spawn-ring radius
 
 // Global scope, matching world.h and sim/world.h's World — this type is a
 // peer of World, not a game-layer type.
@@ -226,63 +227,65 @@ void PageTable::AddOpBox(IVec3 c, int half, const World& world) {
       }
 }
 
-void PageTable::UpdateParticles(bool particlesActive, uint32_t liveCount,
-                                const std::vector<IVec3>& spawnCells,
+void PageTable::UpdateSpawnRing(const std::vector<IVec3>& spawnCells,
                                 const std::vector<IVec3>& explosionCenters,
                                 const World& world) {
-  // particleChunks(N+1) = Ndilate(particleChunks(N), ceil(PART_MAX_VEL/CHUNK)+1)
-  //                       u chunks(spawnOps(N)) u chunks(explosion centers(N))
-  // particleChunks(N+1) = {} when the readback says particleCount == 0.
+  // particleSpawnChunks(N) = chunks(spawnOps(N)) u chunks(explosionCenters(N)),
+  //                          dilated ceil(PART_MAX_VEL / CHUNK) + 1 = 1 ring.
   //
-  // The reset is subject to the same staleness as every other snapshot field,
-  // so it licenses clearing only when no spawn has been issued since — which
-  // `particlesActive` is exactly (§3.4).
-  // The reset, per §3.4's normative form: EMPTY when the readback says
-  // particleCount == 0. Subject to the same staleness as every other snapshot
-  // field, so it licenses clearing only if no spawn has been issued since —
-  // which `particlesActive` is exactly.
-  if (liveCount == 0 && !particlesActive) {
-    particleChunks_.Clear();
-    return;
-  }
+  // RECOMPUTED FROM SCRATCH EVERY TICK from CPU-known inputs, never carried.
+  // That is the whole change: the old formula tracked where a particle might
+  // BE, which grows with flight time; this tracks where a particle might
+  // WRITE, which is pinned to matter that already exists.
+  //
+  // Why one ring of the spawn sites is enough, and why nothing else is needed
+  // (§3.4, the adjacency argument):
+  //
+  //   - A STAIN write targets a non-air cell DIRECTLY. resolve guards on
+  //     `hit == MAT_AIR` and then on class (sim_particle.wgsl:229,:234), and
+  //     the buried branch is behind `blocksParticle(startCell)` (:130-139). A
+  //     stained cell therefore HAS MATTER by construction, so its own chunk is
+  //     in (cpuDirty n hasMatter) and is materialized by the bracketed half.
+  //   - A REINSERTION targets `lastAir`, which is <= 1 cell from a blocking
+  //     sample because the sweep subdivides to <= half a voxel
+  //     (`n = max(1, (maxc + 127) / 128)`, :153-154). The blocking sample has
+  //     matter, so lastAir's chunk is within N26 of a hasMatter chunk — again
+  //     the bracketed half.
+  //   - The ONLY gap is the FIRST TICK OF FLIGHT, before a particle has
+  //     encountered anything, and that is exactly what this one-ring spawn set
+  //     covers: a particle cannot travel more than PART_MAX_VEL in the tick it
+  //     is born.
+  //
+  // Bounded by kMaxParticleSpawnsPerTick and kMaxExplosionsPerTick,
+  // INDEPENDENT OF FLIGHT DURATION. That is what makes it not grow.
+  //
+  // It remains contributor (b) to C(N) in §3.1a: resolve's markDirtyNext still
+  // dirties the 26-neighbourhood of a GPU-decided location, and step (1)'s N26
+  // of C(N) covers that.
+  particleChunks_.Clear();
+  if (spawnCells.empty() && explosionCenters.empty()) return;
 
-  // ---- KNOWN LIMITATION, and it is a conflict with §3.4's normative form ---
-  //
-  // The recurrence below is exactly what §3.4 specifies, and it is a correct
-  // SUPERSET — but it is not BOUNDED. Dilating the previous dilation one ring
-  // per tick makes the set a k-ring after k ticks, i.e. (2k+1)^3 chunks, and
-  // nothing shrinks it until particleCount reaches zero. Measured on the loud
-  // scenario, one explosion's debris drives it 1, 27, 125, 343, 729, 1331,
-  // 2197, 3375 over eight ticks — 3375 = 15^3 — and that alone pushes the
-  // materialization set past an 8,192-page pool.
-  //
-  // This is NOT fixed here. Bounding it means changing a reviewed formula, and
-  // the options each have a different soundness argument that wants review:
-  //   - age the set (rebuild from spawns inside a lifetime window),
-  //   - track per-spawn sets and expire them individually,
-  //   - read particle positions back and rebuild exactly (a new readback).
-  // See the phase-7 [AS BUILT] block in PLAN_page_table.md.
-  //
-  // The consequence is contained and loud rather than silent: the pool
-  // exhausts and §3.8's fatal abort fires with a clear message. It cannot
-  // corrupt a world.
-  if (!particleChunks_.Empty()) {
-    // ceil(PART_MAX_VEL / CHUNK) + 1 == 1 at the shipped tuning (~6 voxels per
-    // tick terminal, 16-voxel chunks), so the dilation is a 1-ring per tick —
-    // the same shape as cpuDirty. Derived rather than restated: see the note
-    // in the caller that recomputes it from the live tuning on reload (§3.4
-    // fallback (ii)).
+  SlotSet seeds;
+  auto seed = [&](const IVec3& c) {
+    if (!world.CellInWindow(c)) return;   // out-of-window is inert
+    seeds.Add(World::SlotChunkIndex({c.x >> 4, c.y >> 4, c.z >> 4}));
+  };
+  for (const IVec3& c : spawnCells) seed(c);
+  for (const IVec3& c : explosionCenters) seed(c);
+
+  // The ring radius is DERIVED from the live tuning rather than restated, so
+  // raising TUNE_PART_MAX_VEL automatically widens it — and because TUNE_*
+  // values are hot-reloadable (F5), it is recomputed here on every tick rather
+  // than cached (§3.4 fallback (ii)). ceil(6/16) + 1 = 1 at the shipped value.
+  const int velVox = (int)(CurrentTuning().sim.partMaxVel / 256);  // 24.8 fixed
+  const int rings = (velVox + (int)kChunk - 1) / (int)kChunk + 1;
+  for (int r = 0; r < rings; r++) {
     scratch_.Clear();
-    DilateN26(particleChunks_, scratch_);
-    particleChunks_.Clear();
-    particleChunks_.UnionWith(scratch_);
+    DilateN26(seeds, scratch_);
+    seeds.Clear();
+    seeds.UnionWith(scratch_);
   }
-  for (const IVec3& c : spawnCells)
-    if (world.CellInWindow(c)) particleChunks_.Add(World::SlotChunkIndex(
-        {c.x >> 4, c.y >> 4, c.z >> 4}));
-  for (const IVec3& c : explosionCenters)
-    if (world.CellInWindow(c)) particleChunks_.Add(World::SlotChunkIndex(
-        {c.x >> 4, c.y >> 4, c.z >> 4}));
+  particleChunks_.UnionWith(seeds);
 }
 
 void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
@@ -385,24 +388,42 @@ void PageTable::Materialize(const rhi::Queue& queue) {
 
   // Step (4): the materialization set.
   //
-  //   [ (cpuDirty n nonSentinel) u N26(cpuDirty n nonSentinel) ]
-  //     u opTargets(N) u particleChunks(N)
+  //   [ (cpuDirty n hasMatter) u N26(cpuDirty n hasMatter) ]
+  //     u opTargets(N) u particleSpawnChunks(N)
   //
-  // The BRACKETED half is filtered by `n nonSentinel`, and that filter is what
-  // keeps a daylight wake-all from demanding 32,768 pages from an 8,192-page
-  // pool — i.e. what keeps §3.8's abort unreachable rather than firing twice
-  // per in-game day. It is sound because DIRTY != NON-EMPTY: a dirty sentinel
-  // chunk holds no matter, so nothing in it can move, and the only way it can
-  // RECEIVE matter is from a neighbouring chunk that has matter — every such
-  // neighbour is in (cpuDirty n nonSentinel), whose 26-ring is materialized.
+  // hasMatter = a resident page OR a UNIFORM(mat) sentinel with mat != AIR.
+  // ONLY PT_EMPTY is excluded. That matters and is not pedantry: a UNIFORM
+  // sentinel HOLDS MATTER, and blocksParticle reads through voxWordAt, so a
+  // particle can legitimately come to rest against a chunk of uniform water
+  // and a CA write can land against it. Excluding it would lose those writes.
   //
-  // The qualifier "by the CA" in that argument is load-bearing, which is why
-  // opTargets and particleChunks are unioned in OUTSIDE the filter: those are
-  // writes the CPU commanded into cells it chose, and they reach isolated sky
-  // where no CA write ever could.
+  // It is also a strict WIDENING of the old `n nonSentinel`, so §3.2a's
+  // wake-all argument is untouched: the ~4,974 non-empty chunks ARE the
+  // hasMatter set, and a wake-all still collapses to them plus a ring rather
+  // than demanding 32,768 pages from an 8,192-page pool.
+  //
+  // The filter is sound because DIRTY != HAS MATTER: a dirty EMPTY chunk holds
+  // nothing, so nothing in it can move, and the only way it can RECEIVE matter
+  // is from a neighbour that has some — every such neighbour is in
+  // (cpuDirty n hasMatter), whose 26-ring is materialized.
+  //
+  // ORDERING, and this is what closes the induction: the bracketed half is
+  // evaluated against hasMatter AT ENCODE TIME FOR TICK N. A tick-N
+  // reinsertion places matter that is present at N+1, and markDirtyNext marks
+  // its chunk, so N+1's (cpuDirty n hasMatter) includes it.
+  //
+  // opTargets and particleSpawnChunks are unioned in OUTSIDE the filter: a CPU
+  // op genuinely writes into isolated empty sky (a mode-0 brush paints
+  // wherever it reads air), and a particle's FIRST tick of flight is before it
+  // has encountered anything. Every LATER particle write is adjacent to matter
+  // that already exists and is covered by the bracketed half — see the
+  // adjacency argument in UpdateSpawnRing.
   scratch_.Clear();
-  for (uint32_t s : cpuDirty_.Members())
-    if ((t[s] & kPtSentinelBit) == 0u) scratch_.Add(s);
+  for (uint32_t s : cpuDirty_.Members()) {
+    const uint32_t e = t[s];
+    const bool empty = (e & kPtSentinelBit) != 0u && (e & kPtMatMask) == kMatAir;
+    if (!empty) scratch_.Add(s);   // hasMatter
+  }
   materialized_.Clear();
   DilateN26(scratch_, materialized_);
   materialized_.UnionWith(opTargets_);
@@ -435,6 +456,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   if (!paged_) return;
   if (zeroStreak_.size() != kNumChunks) zeroStreak_.assign(kNumChunks, 0);
   const auto& t = world_->pageTableCpu();
+  std::vector<uint32_t> candidates;
   for (uint32_t s = 0; s < kNumChunks; s++) {
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
     if (zeroStreak_[s] < 255) zeroStreak_[s]++;
@@ -443,6 +465,36 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // quarter second and stays zero forever.
     if (zeroStreak_[s] != kPageFreeTicks) continue;
     if ((t[s] & kPtSentinelBit) != 0u) continue;   // already a sentinel
+    //
+    // `occTotal == 0` is NOT sufficient to demote to PT_EMPTY, and this cost a
+    // debugging cycle. occupancy counts NON-AIR cells; the world hash ALSO
+    // covers the STAIN layer (bits 24..30, sim_occupancy.wgsl). A chunk can be
+    // entirely air and still carry stain — blood spray on a floor that then
+    // erodes away, water that soaked a bank before evaporating — and demoting
+    // it to PT_EMPTY makes the analytic branch report a clean chunk, silently
+    // dropping hashed state. That is gotcha-save-format-drops-stain in a new
+    // place, and it moved the loud scenario's hash from tick 15 onward.
+    //
+    // So the words decide, through the one promotion rule (§2.3). This is a
+    // blocking read, but it happens only for a slot that has ALREADY reported
+    // empty for kPageFreeTicks consecutive snapshots and is not in cpuDirty —
+    // in a settled world, zero slots per tick.
+    candidates.push_back(s);
+  }
+
+  // Second pass: confirm each candidate is REALLY empty by reading its words.
+  // Kept out of the loop above so the readbacks are batched and so the common
+  // case — no candidates at all, which is every tick of a settled world — costs
+  // nothing beyond the increments.
+  for (uint32_t s : candidates) {
+    if (probeChunk_) {
+      if (freeProbe_.size() != kChunkVol) freeProbe_.assign(kChunkVol, 0);
+      if (!probeChunk_(s, freeProbe_.data())) continue;
+      if (Classify(freeProbe_.data()) != kPtEmpty) {
+        zeroStreak_[s] = 0;   // carries stain, or is not uniform: keep the page
+        continue;
+      }
+    }
     // The second conjunct. Without it a chunk empty right now but adjacent to
     // activity would be freed and re-materialized on the very next tick —
     // and page fills are GPU commands, so an oscillating boundary means a

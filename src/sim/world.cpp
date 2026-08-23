@@ -81,6 +81,23 @@ void World::Init(const rhi::Device& device) {
                           U::Storage | U::CopyDst, "spawnOps");
   sprites = CreateBuffer(device, kMaxSprites * sizeof(Sprite), U::Storage | U::CopyDst,
                          "sprites");
+
+  // MLS-MPM fluid prototype (world.h fluid block). CopySrc on fluidParticles
+  // is selftest-only: the fluid_det gate hashes the buffer twice-run; the
+  // frame path never reads it back.
+  fluidParticles = CreateBuffer(device, (uint64_t)kFluidCap * 64,
+                                U::Storage | U::CopySrc, "fluidParticles");
+  fluidSpawnOps = CreateBuffer(device, kMaxFluidSpawnsPerTick * sizeof(FluidSpawnOp),
+                               U::Storage | U::CopyDst, "fluidSpawnOps");
+  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+                               U::Storage | U::CopyDst, "fluidBlockMap");
+  fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4, U::Storage,
+                                "fluidBlockList");
+  fluidGrid = CreateBuffer(device, (uint64_t)kFluidBlocks * kChunkVol * 16,
+                           U::Storage, "fluidGrid");
+  fluidArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc, "fluidArgsStage");
+  fluidDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst,
+                                   "fluidDispatchArgs");
   debugBoxes = CreateBuffer(device, (uint64_t)kMaxDebugBoxes * sizeof(DebugBox),
                             U::Storage | U::CopyDst, "debugBoxes");
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,

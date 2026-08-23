@@ -104,6 +104,13 @@ PIPE_TO_MEMBER = {
     "PIPE_P_RESOLVE": "pResolve_",
     "PIPE_FAR_FILL": "farFill_",
     "PIPE_FAR_DOWN": "farDown_",
+    "PIPE_FLUID_SPAWN": "fluidSpawn_",
+    "PIPE_FLUID_MARK": "fluidMark_",
+    "PIPE_FLUID_ALLOC": "fluidAlloc_",
+    "PIPE_FLUID_CLEAR": "fluidClear_",
+    "PIPE_FLUID_P2G": "fluidP2g_",
+    "PIPE_FLUID_GRIDUP": "fluidGridUp_",
+    "PIPE_FLUID_G2P": "fluidG2p_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -144,12 +151,20 @@ BUF_TO_WGSL = {
     "FarUBO": {"F"},
     "PageTable": {"pageTable"},
     "PageFaults": {"pageFaults"},
+    # MLS-MPM fluid prototype (sim_fluid.wgsl).
+    "FluidParticles": {"fluidParticles", "fluid"},
+    "FluidSpawnOps": {"fluidSpawnOps"},
+    "FluidBlockMap": {"fluidBlockMap"},
+    "FluidBlockList": {"fluidBlockList"},
+    "FluidGrid": {"fluidGrid"},
+    "FluidArgsStage": {"fluidArgs"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
     "DispatchArgs": set(),
     "PDispatchArgs": set(),
     "DrawArgs": set(),
+    "FluidDispatchArgs": set(),
 }
 
 READ_ACCS = {"R", "U", "I", "TR"}
@@ -179,11 +194,14 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty"}
+_FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
+                 "fluidBlockList", "fluidGrid", "fluidArgs"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,
     "simPL2_": _SLIM_GROUP0 | _PARTICLE_GROUP1,
     "farPL_": _SLIM_GROUP0 | _FAR_GROUP1,
+    "fluidPL_": _SLIM_GROUP0 | _FLUID_GROUP1,
 }
 
 

@@ -128,6 +128,29 @@ fn vsBody(@builtin(vertex_index) vi : u32,
   return out;
 }
 
+// MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). One cube
+// per fluid particle, positions Q16.16 world cells. 8 particles per rest cell
+// sit on a half-cell lattice, so 0.55 of a cell overlaps neighbours slightly —
+// resting water reads as a surface rather than as a bag of dice. Compression
+// (J < 1) darkens the albedo a touch, which makes pressure visibly travel.
+@group(1) @binding(5) var<storage, read> fluid : array<FluidParticle>;
+
+@vertex
+fn vsFluid(@builtin(vertex_index) vi : u32,
+           @builtin(instance_index) inst : u32) -> VSOut {
+  let p = fluid[inst];
+  var n : vec3f;
+  let off = cubeOffset(vi, &n) * 0.55;
+  let center = vec3f(f32(p.px), f32(p.py), f32(p.pz)) / 65536.0;
+  let world = center + off;
+  let squeeze = clamp(f32(p.j) / 65536.0, 0.75, 1.0);
+  let albedo = TUNE_FLUID_COLOR * (0.55 + 0.45 * squeeze);
+  var out : VSOut;
+  out.pos = projectView(world - R.camPos, R);
+  out.color = litColor(albedo, n, world, 0.0, R);
+  return out;
+}
+
 @vertex
 fn vsSprite(@builtin(vertex_index) vi : u32,
             @builtin(instance_index) inst : u32) -> VSOut {

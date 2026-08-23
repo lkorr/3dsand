@@ -109,14 +109,25 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<CellOp>& cells, bool hashEnable,
                 IVec3 playerChunk, bool wantReadback, bool particlesActive,
                 const std::vector<ParticleSpawn>& spawns,
-                uint32_t farCount) {
+                uint32_t farCount,
+                const std::vector<FluidSpawnOp>& fluidSpawns,
+                uint32_t fluidBase) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
+  // MLS-MPM fluid prototype: budget is charged by the CALLER before emitting
+  // (rule 2 — emit-then-check overruns); this clamp is the belt to that brace.
+  uint32_t fluidSpawnCount = std::min((uint32_t)fluidSpawns.size(),
+                                      kMaxFluidSpawnsPerTick);
+  fluidBase = std::min(fluidBase, kFluidCap);
+  if (fluidSpawnCount > kFluidCap - fluidBase)
+    fluidSpawnCount = kFluidCap - fluidBase;
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
   tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
+  tp.fluidBase = fluidBase;
+  tp.fluidSpawnCount = fluidSpawnCount;
   // Day phase for THIS tick. Derived from `tick` alone — the daylight-gated
   // reactions read it, so anything frame-timed here would break determinism.
   const Tuning& dtun = CurrentTuning();
@@ -135,6 +146,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   if (spawnCount > 0)
     ctx.queue.WriteBuffer(world.spawnOps, 0, spawns.data(),
                           spawnCount * sizeof(ParticleSpawn));
+  if (fluidSpawnCount > 0)
+    ctx.queue.WriteBuffer(world.fluidSpawnOps, 0, fluidSpawns.data(),
+                          fluidSpawnCount * sizeof(FluidSpawnOp));
   if (particlesActive) {
     // the write page starts each tick empty; survivors + emissions repopulate
     uint32_t zero = 0;
@@ -177,6 +191,22 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // fix 1: the wake IS a dirty-set mutation and the two must be ONE operation,
   // not two that must agree).
   PageTable& pt = *world.pages;
+  // Install the free-confirmation probe once (see SetChunkProbe): a page is
+  // only released when the chunk's WORDS say empty, because occupancy does not
+  // see the stain layer and the hash does.
+  static bool probeInstalled = false;
+  if (!probeInstalled) {
+    probeInstalled = true;
+    GpuContext* pctx = &ctx;
+    World* pw = &world;
+    pt.SetChunkProbe([pctx, pw](uint32_t slot, uint32_t* out) {
+      const uint64_t off = pw->PageOffsetOfSlot(slot);
+      if (off == World::kNoPage) return false;
+      pctx->WaitIdle();
+      return rhi::ReadbackBlocking(pctx->device, pctx->queue, pw->voxels, off,
+                                   out, (size_t)kChunkVol * 4, "freeProbe");
+    });
+  }
   pt.BeginTick(tick);
   for (const BrushOp& o : ops)
     pt.AddOpSphere({o.x, o.y, o.z}, o.radius, world);
@@ -191,9 +221,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       spawnCells.push_back({spawns[i].px >> 8, spawns[i].py >> 8,
                             spawns[i].pz >> 8});
     for (const ExplosionOp& e : exps) expCenters.push_back({e.x, e.y, e.z});
-    const WorldSnapshot& sn = world.Snap();
-    pt.UpdateParticles(particlesActive, sn.valid ? sn.particleCount : 0,
-                       spawnCells, expCenters, world);
+    // particleSpawnChunks(N): THIS tick's spawn sites, one ring, recomputed
+    // from scratch. Not carried — see the adjacency argument in
+    // PageTable::UpdateSpawnRing.
+    pt.UpdateSpawnRing(spawnCells, expCenters, world);
   }
   {
     const WorldSnapshot& sn = world.Snap();
@@ -219,7 +250,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // exists to prevent.
   pt.DrainFills(enc);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
-                 particlesActive, cellCount, spawnCount);
+                 particlesActive, cellCount, spawnCount,
+                 fluidBase + fluidSpawnCount, fluidSpawnCount);
   sim.EncodeFarFill(enc, farCount);
   bool doCopy = false;
   if (wantReadback) {

@@ -78,6 +78,16 @@ enum class Buf : uint8_t {
   // checker to prevent.
   PageTable,
   PageFaults,
+  // ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl) ----
+  // None of these is read by any CA kernel or covered by the world hash;
+  // FluidDispatchArgs is indirect-only and never bound (dispatchArgs note).
+  FluidParticles,
+  FluidSpawnOps,
+  FluidBlockMap,
+  FluidBlockList,
+  FluidGrid,
+  FluidArgsStage,
+  FluidDispatchArgs,
   kCount,
 };
 
@@ -112,11 +122,17 @@ enum class Pipe : uint8_t {
   Pick,
   ExplodeMark, ExplodeApply,
   PArgs1, PSpawn, PIntegrate, PArgs2, PResolve,
+  // MLS-MPM fluid prototype. Inserted BEFORE FarDown deliberately: the
+  // pipeline-copy loop in Simulation::RecordTable is bounded by
+  // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
+  // new pipeline is silently never handed to the recorder (a skipped row, not
+  // a crash).
+  FluidSpawn, FluidMark, FluidAlloc, FluidClear, FluidP2G, FluidGridUp, FluidG2P,
   FarFill, FarDown,
 };
 
 // Bind-group set. GRP_SIM also carries the dynamic passUBO offset.
-enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar };
+enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar, SlimFluid };
 
 // Dynamic passUBO offset selector.
 //   None  no dynamic offset (the row's groups have none)
@@ -158,10 +174,19 @@ enum class Cond : uint8_t {
   // all 32,768 at once would need a dense pool — i.e. no saving at the moment
   // of worldgen, and under §3.8's fatal policy an abort at startup.
   DenseWorldgen,
+  FluidSpawn, // fluidSpawnCount > 0 (MLS-MPM spawn row in PT_TICK)
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
-enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill };
+// Fluid is the exception to "one per entry point" and deliberately so: it is
+// ONE MLS-MPM SUBSTEP, recorded kFluidSubsteps times per tick from EncodeTick
+// into the tick's own command buffer (precedent: FarFill is also recorded into
+// the tick's buffer). The recorder's last-access tracker persists across
+// RecordTable calls within a command buffer, so the inter-substep barriers
+// (grid WAW against the next clear, particle RAW into the next mark) are
+// generated exactly like intra-table ones.
+enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill,
+                             Fluid };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put
@@ -180,6 +205,10 @@ enum class DispatchSel : uint32_t {
   FarCount,   // EncodeFarFill count
   IndDispatchArgs,   // indirect: world.dispatchArgs @ 0
   IndPDispatchArgs,  // indirect: world.pDispatchArgs @ 0
+  // ---- MLS-MPM fluid prototype ----
+  FluidP,            // (fluidCount + 63)/64 — fluidCount = base + spawns
+  FluidSpawnSel,     // (fluidSpawnCount + 63)/64
+  IndFluidArgs,      // indirect: world.fluidDispatchArgs @ 0
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

@@ -1031,29 +1031,66 @@ harness tick behave like a game frame. The game's frame loop shares
 
 ---
 
-#### OPEN — §3.4's particle set is a correct superset but is NOT BOUNDED
+#### RESOLVED — §3.4's particle set collapsed to a per-tick spawn ring
 
-The one formula that did not survive implementation, stated plainly because it
-is the blocker on `--vk-smoke-loud --residency paged`.
+The one formula that did not survive implementation. §3.4 originally carried
+and dilated a set of chunks a particle might BE in; that is a correct superset
+but unbounded, and measured on the loud scenario one explosion's debris drove
+it **1, 27, 125, 343, 729, 1331, 2197, 3375** chunks over eight ticks
+(3375 = 15³), past an 8,192-page pool on its own.
 
-§3.4 dilates `particleChunks` one ring per tick and resets only at
-`particleCount == 0`. Dilating the previous dilation makes the set a k-ring
-after k ticks — (2k+1)³ chunks — and nothing shrinks it while any particle is
-alive. Measured on the loud scenario, one explosion's debris drives it
-**1, 27, 125, 343, 729, 1331, 2197, 3375** over eight ticks (3375 = 15³), which
-alone pushes the materialization set past an 8,192-page pool.
+**Adjudicated by review as a COLLAPSE, not a bound.** Every particle write
+lands within one cell of matter that already exists, so the bracketed half of
+`materialize(N)` already covers all of them after the first tick of flight:
+a stain write targets a non-air cell directly (guards at
+`sim_particle.wgsl:229`, `:234`, and the buried branch at `:130-139`); a
+reinsertion targets `lastAir`, ≤ 1 cell from a blocking sample because the
+sweep subdivides to ≤ ½ voxel (`:153-154`). What remains is
+`particleSpawnChunks(N)` — this tick's spawn sites plus one ring, recomputed
+from scratch, bounded by the op caps and **independent of flight duration**.
 
-Not fixed here: bounding it means changing a reviewed formula, and the
-candidate forms each carry a different soundness argument —
+*The old formula tracked where a particle might BE, which grows with flight
+time; this one tracks where a particle might WRITE, which is pinned to matter
+that already exists.*
 
-- age the set against a particle-lifetime window and rebuild from spawns;
-- track per-spawn sets and expire them individually;
-- read particle positions back and rebuild exactly (a new readback).
+The predicate was renamed `nonSentinel` → `hasMatter` and widened: only
+`PT_EMPTY` is excluded, since a `UNIFORM(mat)` sentinel holds matter and
+`blocksParticle` reads through `voxWordAt`, so a particle can legitimately land
+against uniform water. A strict widening, so §3.2a's wake-all argument is
+untouched.
 
-**The consequence is contained and loud, never silent:** the pool exhausts and
-§3.8's fatal abort fires with a clear message. It cannot corrupt a world, does
-not affect dense mode, and does not affect any scenario without live
-particles — `--vk-smoke --residency paged` runs clean end to end.
+**Result: the pool is stable.** The full 120-tick loud scenario now completes
+at **~5,890 pages of 8,192**, with the materialization set flat at ~1,200 —
+against exhaustion at tick 52 before. `pageFaults == 0` across the whole run,
+which is the *evidence* for the adjacency argument rather than a formality.
+
+A second leak was found and fixed alongside it: the streaming `genList` path
+allocated a page for every slot on an incoming shift plane and never demoted
+the ~85% that generate as pure sky, leaking ~880 pages per shift. It now
+classifies and demotes exactly as batched worldgen and the store-hit path do.
+
+#### STILL OPEN — the loud scenario's paged hash
+
+`--vk-smoke-loud --residency paged` reports **1/19** against the pinned
+constants, diverging from **tick 15** onward. Everything else is green:
+
+- `--vk-smoke --residency paged` is **5/5 MATCH** (the quiet scenario paints
+  no ops).
+- `--vk-smoke-loud --residency dense` is **19/19 MATCH**.
+- `pageFaults == 0` on every run, so **no write is being lost** — the
+  divergence is not unmaterialized memory.
+- Bisected with A/B switches: disabling `UNIFORM` promotion, disabling
+  deallocation entirely, and adding a words-based (rather than
+  occupancy-based) free confirmation each leave the mismatch **unchanged**.
+  Worldgen itself hashes `f97ba745` — **MATCH** — so the sentinel encoding and
+  the analytic hash branch are correct at rest.
+
+That narrows it to the paged **op path**: the loud scenario's brush paints into
+open sky at y=170 from tick 3, which is the `opTargets`-unfiltered case, and
+the quiet scenario never exercises it. The next step is to dump the painted
+chunk's words in both modes at tick 15 and diff them — the fault is in what
+that brush writes or in when its page's initialization fill lands relative to
+`mutate`, not in the particle formula this amendment was about.
 
 #### DEFERRED follow-ups (severable, recorded per the pacing directive)
 

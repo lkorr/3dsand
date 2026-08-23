@@ -357,6 +357,54 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     sim_->EncodeGenList(enc, (uint32_t)genSlots.size());
     ctx_->queue.Submit(enc.Finish());
+
+    // ---- and DEMOTE the result (§3.5c's compaction, on the streaming path) --
+    //
+    // Without this the shift plane LEAKS: genChunk needs a page for every slot
+    // it writes, but ~85% of a shift plane generates as pure sky, and a page
+    // that is never demoted is never freed either — §3.6's free condition only
+    // fires for slots reporting occTotal == 0 on kPageFreeTicks CONSECUTIVE
+    // snapshots, and a slot that scrolled out stops being reported at all.
+    // Measured before this landed: ~880 pages leaked per window shift
+    // (5832 -> 6711 -> 7584 over three shifts of the loud scenario), which
+    // exhausted the pool while the materialization set itself sat flat at
+    // ~1,200. It is the same classification the store-hit branch does and that
+    // batched worldgen does; this was the one path missing it.
+    //
+    // CLASSIFY ON THE WORDS, never on `occupancy`. Two reasons, both learned
+    // the hard way here:
+    //   - occupancy counts NON-AIR cells, but the hash also covers the STAIN
+    //     layer (bits 24..30, sim_occupancy.wgsl). A chunk can be all-air and
+    //     still carry stain, and demoting it to PT_EMPTY would silently drop
+    //     hashed state — which is exactly gotcha-save-format-drops-stain in a
+    //     new place.
+    //   - PageTable::Classify is the ONE promotion rule (whole-word equality,
+    //     §2.3), so using it here keeps a single definition rather than a
+    //     second predicate that must agree with it.
+    //
+    // The WaitIdle is required, not defensive: genChunk writes the voxels in
+    // this submit, and reading before it completes returns the PREVIOUS
+    // contents — for a freshly scrolled-in slot, zeros, so every generated
+    // chunk would be demoted and its matter lost. Blocking is fine here:
+    // FillSlots already runs mid-frame on its own submit and a window shift is
+    // a streaming event, not a per-tick cost.
+    if (world_->residency == World::Residency::Paged) {
+      ctx_->device.WaitIdle();
+      std::vector<uint32_t> vox(kChunkVol);
+      uint32_t demoted = 0;
+      for (uint32_t gs : genSlots) {
+        const uint64_t off = world_->PageOffsetOfSlot(gs);
+        if (off == World::kNoPage) continue;
+        if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->voxels,
+                                   off, vox.data(), kChunkBytes, "genClassify"))
+          break;
+        const uint32_t e = PageTable::Classify(vox.data());
+        if (e == PageTable::kNeedsPage) continue;
+        world_->pages->SetSentinel(gs, e);
+        demoted++;
+      }
+      if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
+    }
   }
 }
 

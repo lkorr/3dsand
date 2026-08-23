@@ -485,9 +485,18 @@ void Overlay::Draw(UIState& s) {
   ImGui::RadioButton("mob", &s.tool, UIState::kToolMob);
   ImGui::SameLine();
   ImGui::RadioButton("sword", &s.tool, UIState::kToolMelee);
+  ImGui::SameLine();
+  ImGui::RadioButton("mpm", &s.tool, UIState::kToolFluid);
 
   if (s.tool == UIState::kToolMelee) {
     ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
+  }
+  if (s.tool == UIState::kToolFluid) {
+    ImGui::TextDisabled("hold LMB: pour experimental MLS-MPM liquid (compare "
+                        "with CA water)");
+    ImGui::Text("mpm particles: %u / 262144", s.fluidCount);
+    ImGui::SameLine();
+    if (ImGui::Button("clear (U)")) s.clearFluid = true;
   }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
