@@ -491,7 +491,15 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   // one instead of freefalling and jello-popping. Poured particles spawn at
   // J = 1 (zero term) and g2p relaxes J toward 1, so the term self-retires
   // as the real density gradient establishes.
-  pw += clamp(FLUID_ONE - p.j, 0, FLUID_ONE / 2);
+  //
+  // SYMMETRIC on purpose. The first version clamped at [0, ..] — J below 1
+  // added pressure, J above 1 added nothing — and that one-sided clamp
+  // RECTIFIED the tr(C) noise around J = 1 into net outward pressure: a
+  // sealed drained pool held ~0.45 cells/tick of churn indefinitely against
+  // 3%/tick damping, a perpetual-motion pump made of a clamp. Symmetric,
+  // J > 1 pulls back in (elastic tension) and the fluctuation averages to
+  // zero.
+  pw += clamp(FLUID_ONE - p.j, -FLUID_ONE / 2, FLUID_ONE / 2);
   var pr = mq(FLUID_STIFFNESS, clamp(pw - FLUID_ONE, -(1 << 16), 16 << 16));
   pr = max(pr, -FLUID_COHESION);
   // Species attraction: extra negative (pulling) pressure proportional to how

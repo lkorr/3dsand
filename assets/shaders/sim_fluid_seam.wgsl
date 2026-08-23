@@ -209,6 +209,7 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_REFUSED], 0u);
     atomicStore(&fluidArgs[FA_SETBLOCKS], 0u);
     atomicStore(&fluidArgs[FA_EMITTED], 0u);
+    atomicStore(&fluidArgs[15u], 0u);  // FA_BINNED
   }
   workgroupBarrier();
   var base = wgScan[li];
@@ -320,10 +321,12 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // below. This is the disturbance trigger (carve, explosion, mutation);
     // while the CA still owns liquid movement it stays off by default.
     var excite = false;
+    var byFall = false;
     if (T.fluidExciteEnable != 0u) {
       let below = c + vec3<i32>(0, -1, 0);
       if (inWindow(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
         excite = true;
+        byFall = true;
       }
     }
     // Trigger (b), always on: progressive wake. A face neighbor's grid node
@@ -358,11 +361,22 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // Depth to the free surface: contiguous same-liquid cells above, capped
     // at the 4-bit field. Computed HERE, against pre-write state — emit runs
     // while neighbouring chunks are being cleared and could not scan safely.
+    //
+    // FALL-trigger cells only. A wake-excited cell seeds J = 1 (and rest
+    // velocity, see emit): the settle/wake pair must be strictly DISSIPATIVE
+    // — settle discards kinetic energy, so excite must not hand any back, or
+    // a churning pool that wakes its own freshly-settled bank becomes a
+    // perpetual-motion loop (measured: a sealed drained pool held ~14 vox/s
+    // of churn indefinitely when wake re-seeded velocity + pre-compression;
+    // the surrounding flow re-accelerates a rest-seeded particle through P2G
+    // within a substep anyway).
     var depth = 0u;
-    for (var d = 1; d <= 15; d++) {
-      let a = c + vec3<i32>(0, d, 0);
-      if (!inWindow(a, T.origin) || voxMat(voxWordAt(a)) != mat) { break; }
-      depth += 1u;
+    if (byFall) {
+      for (var d = 1; d <= 15; d++) {
+        let a = c + vec3<i32>(0, d, 0);
+        if (!inWindow(a, T.origin) || voxMat(voxWordAt(a)) != mat) { break; }
+        depth += 1u;
+      }
     }
     voxels[idx] = (w & ~EXCITE_SCRATCH_BITS) | EXCITE_PEND_BIT |
                   (depth << EXCITE_DEPTH_SHIFT);
@@ -552,18 +566,11 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     // p2g2 turns (1 - J) into pressure). Without this every drained lake
     // bounces like jelly — plan §7 O-4.
     let j0 = max(FLUID_ONE - i32(depth) * SEAM_HYDRO, SEAM_JFLOOR);
-    // Wake velocity: the cell's own grid node, if the solver already covers
-    // it (progressive wake at an interface); a calm lake's cells have no
-    // block and seed at rest.
-    var wv = vec3<i32>(0, 0, 0);
-    let bm = fluidBlockMapR[chunkSlotIndex(wc)];
-    if (bm != 0u) {
-      let nb = seamNodeBase(bm, c);
-      if (fluidGridR[nb] >= 16) {
-        wv = vec3<i32>(fluidGridR[nb + 1u] / 2, fluidGridR[nb + 2u] / 2,
-                       fluidGridR[nb + 3u] / 2);
-      }
-    }
+    // Every excite seeds at REST. The task-book option of seeding wake cells
+    // with the local grid velocity is an energy injection when paired with
+    // settle (see the dissipation note in detect); P2G hands the new
+    // particles the neighbourhood's momentum on the very next substep, which
+    // is both gentler and free.
     let cellSlotIdx = cellIndexW(c);
     let h = hash3(T.seed, T.tick, cellSlotIdx);
     for (var k = 0u; k < fullness; k++) {
@@ -582,7 +589,7 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
       p.px = (c.x << 16u) + clamp(ox, 2048, 63488);
       p.py = (c.y << 16u) + clamp(oy, 2048, 63488);
       p.pz = (c.z << 16u) + clamp(oz, 2048, 63488);
-      p.vx = wv.x; p.vy = wv.y; p.vz = wv.z;
+      p.vx = 0; p.vy = 0; p.vz = 0;
       p.c00 = 0; p.c01 = 0; p.c02 = 0;
       p.c10 = 0; p.c11 = 0; p.c12 = 0;
       p.c20 = 0; p.c21 = 0; p.c22 = 0;
@@ -706,6 +713,7 @@ fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
   let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
   atomicAdd(&settleScratch[b], fpFullness(p.attr));
+  atomicAdd(&fluidArgs[15u], fpFullness(p.attr));  // FA_BINNED (mass audit)
   atomicMax(&settleScratch[b + 1u],
             (fpMat(p.attr) << 16u) | (fpStainAmt(p.attr) << 3u) |
             fpStainType(p.attr));
@@ -729,39 +737,75 @@ fn seamSupport(c : vec3<i32>) -> bool {
 // binned eighths), refill the segment bottom-up. `write` distinguishes the
 // feasibility pass from the commit pass — both run the identical arithmetic,
 // which is what makes all-or-nothing refusal sound.
+//
+// SPILL: the walk continues up to SETTLE_SPILL cells into the CHUNK ABOVE.
+// A gravity-compressed pool holds MORE than 8 eighths per cell (the weakly
+// compressible EOS packs the bottom ~5-15% over rest), so the bottom block
+// of any real pool carries 1-2 eighths per column past its own top — without
+// the spill every pick refused and the pool deadlocked as particles forever
+// (measured: 66/66 refusals on a fully calm pool). Writing above is safe:
+// the adjacency exclusion means no concurrently-settling block can touch
+// those cells, and the fluid-chunk N26 ring materialized them.
 // Returns false if the column is infeasible (content with no floor, content
-// past the block top, or trapped under a blocker).
+// past the spill ceiling, or trapped under a blocker).
+const SETTLE_SPILL : i32 = 8;
 fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
                 write : bool) -> bool {
   var floorOk = seamSupport(base + vec3<i32>(cx, -1, cz));
   var pool = 0u;         // eighths waiting to be placed in this segment
   var poolMatStain = 0u; // packed identity of the pooled content
-  for (var y = 0; y <= 16; y++) {
-    var blocked = y == 16;  // the block top ends the last segment
+  for (var y = 0; y <= 16 + SETTLE_SPILL; y++) {
+    var blocked = y == 16 + SETTLE_SPILL;  // the spill ceiling ends the walk
     var w = 0u;
     var idx = PT_NO_WORD;
-    if (y < 16) {
+    if (y < 16 + SETTLE_SPILL) {
       let c = base + vec3<i32>(cx, y, cz);
       idx = voxWordIndex(c);
       if (idx != PT_NO_WORD) { w = voxels[idx]; }
       let mat = voxMat(w);
       if (mat != MAT_AIR && !seamLiquid(mat)) { blocked = true; }
+      // An unmapped word can only mean the coverage guarantee failed (the
+      // walk stays inside the settling chunk + its materialized N26 ring);
+      // treating it as a blocker refuses the block instead of dropping mass
+      // — voxStore's belt-and-braces, applied to the one non-voxStore write.
+      if (idx == PT_NO_WORD) { blocked = true; }
     }
     if (blocked) {
       // Close the segment: everything pooled must have been placed.
       if (pool > 0u) { return false; }
       floorOk = true;  // content above rests on this blocker
+      // A particle can end its calm life FRACTIONALLY inside a blocker (the
+      // node BC stops momentum at the face, not the cell centre), which bins
+      // its eighth at the blocked cell. That mass pops UP: it seeds the pool
+      // of the segment ABOVE the blocker. Dropping it instead was the
+      // 2-in-1280 leak the first sealed settle-gate run caught.
+      if (y < 16) {
+        let blo = vec3<u32>((base + vec3<i32>(cx, y, cz)) &
+                            vec3<i32>(CHUNK_MASK));
+        let bIdx = (blo.z * CHUNK + blo.y) * CHUNK + blo.x;
+        let bb = SP_BINS + (listIdx * CHUNK_VOL + bIdx) * 2u;
+        pool = atomicLoad(&settleScratch[bb]);
+        poolMatStain = atomicLoad(&settleScratch[bb + 1u]);
+      }
       continue;
     }
     // Open cell: pool its content, then place bottom-first as we walk. A
     // cell's own binned + existing eighths join the pool at its own height,
     // and the pool drains into the LOWEST open cells — that is the
-    // bottom-packing an equilibrium column must have.
-    let lo = vec3<u32>((base + vec3<i32>(cx, y, cz)) & vec3<i32>(CHUNK_MASK));
-    let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
-    let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
-    let binned = atomicLoad(&settleScratch[b]);
-    let packed = atomicLoad(&settleScratch[b + 1u]);
+    // bottom-packing an equilibrium column must have. Bins exist only for
+    // the settling block's own 16 cells; the spill cells above contribute
+    // existing content only (the CHUNK_MASK wrap would otherwise alias a
+    // spill cell onto the bottom rows' bins).
+    var binned = 0u;
+    var packed = 0u;
+    if (y < 16) {
+      let lo = vec3<u32>((base + vec3<i32>(cx, y, cz)) &
+                         vec3<i32>(CHUNK_MASK));
+      let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+      let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
+      binned = atomicLoad(&settleScratch[b]);
+      packed = atomicLoad(&settleScratch[b + 1u]);
+    }
     let mat = voxMat(w);
     var existing = 0u;
     if (mat != MAT_AIR) { existing = voxState(w) + 1u; }
@@ -774,6 +818,13 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     }
     pool += binned + existing;
     poolMatStain = max(poolMatStain, idHere);
+    // FA_SETTLED counts NET NEW eighths: re-placed existing water cancels
+    // out (atomicSub here against the atomicAdd of `place` below), so the
+    // counter equals the particle mass CONVERTED — the number the mass
+    // audits and the splash sound cue actually want.
+    if (write && existing > 0u) {
+      atomicSub(&fluidArgs[FA_SETTLED], existing);
+    }
     if (pool > 0u && !floorOk) { return false; }
     let place = min(pool, 8u);
     pool -= place;
