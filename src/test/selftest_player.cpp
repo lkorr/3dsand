@@ -378,6 +378,8 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
     bool everHung = false, droppedWhileWaiting = false;
     int firstHangFrames = 0;      // dangle length of the first latch
     bool firstHangEnded = false;
+    float shimmyDz = 0.0f;        // lateral travel during the measured dangle
+    float zAtHang = 0.0f;
   };
   auto run = [&](const Player::KindFn& kindAt, bool space, bool pauseAtHang,
                  int frames) {
@@ -392,9 +394,11 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
       // W frame and the pull-up fired before the dangle was ever measured.
       if (stage == 1 && r.p.hanging) {
         r.everHung = true;
+        r.zAtHang = r.p.pos.z;
         stage = pauseAtHang ? 2 : 3;
       } else if (stage == 2) {
         if (!r.p.hanging) r.droppedWhileWaiting = true;
+        r.shimmyDz = r.p.pos.z - r.zAtHang;
         if (++hangHeld >= 30) stage = 3;
       } else if (stage == 3 && r.p.hanging) {
         r.everHung = true;  // chained re-grabs during the climb
@@ -421,6 +425,10 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
         in.up = space;
       } else if (stage == 2) {  // dangle: hands only, W released
         in.up = space;
+        // Shimmy while dangling: D held the whole half-second. The wall runs
+        // forever in z here, so the traverse must actually travel — the
+        // assertion below is what proves the hands slide AND the grip holds.
+        in.strafe = 1.0f;
       } else {  // pull up and keep walking over the top
         in.forward = 1.0f;
         in.up = space;
@@ -430,12 +438,15 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
     return r;
   };
 
-  // (a) the headline move: grab, hold a half-second dead hang, pull up, stand.
+  // (a) the headline move: grab, hold a half-second dead hang (shimmying
+  // right the whole time), pull up, stand. The shimmy assertion carries two
+  // statements at once: the hands traverse (dz well past noise) and the grip
+  // survives the traverse (droppedWhileWaiting stays false through it).
   RunResult a = run(plateauKind, true, true, 600);
   float aFeet = a.p.pos.y - Player::kHalfY;
   bool aOk = a.everHung && !a.droppedWhileWaiting && a.p.grounded &&
              !a.p.hanging && std::abs(aFeet - 115.0f) < 0.75f &&
-             a.p.pos.x > 150.0f + Player::kHalfXZ;
+             a.p.pos.x > 150.0f + Player::kHalfXZ && a.shimmyDz > 2.0f;
 
   // (b) sheer wall: same press, same fall, nothing within reach ends in air
   // with room above it. Must never latch — otherwise every wall in the world
@@ -467,11 +478,13 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   char buf[256];
   std::snprintf(buf, sizeof(buf),
                 "plateau: hung=%d dropped=%d feet=%.1f x=%.1f (want 115, "
-                ">153); cliff hung=%d feet=%.1f; no-space hung=%d feet=%.1f; "
-                "chain hung=%d feet=%.1f (want 128) firstHang=%df (want>=10)",
+                ">153) shimmy=%.1f (want>2); cliff hung=%d feet=%.1f; "
+                "no-space hung=%d feet=%.1f; chain hung=%d feet=%.1f (want "
+                "128) firstHang=%df (want>=10)",
                 a.everHung ? 1 : 0, a.droppedWhileWaiting ? 1 : 0, aFeet,
-                a.p.pos.x, b.everHung ? 1 : 0, bFeet, c.everHung ? 1 : 0,
-                cFeet, d.everHung ? 1 : 0, dFeet, d.firstHangFrames);
+                a.p.pos.x, a.shimmyDz, b.everHung ? 1 : 0, bFeet,
+                c.everHung ? 1 : 0, cFeet, d.everHung ? 1 : 0, dFeet,
+                d.firstHangFrames);
   detail = buf;
   std::printf("player ledgegrab: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
   return ok ? Status::Pass : Status::Fail;
