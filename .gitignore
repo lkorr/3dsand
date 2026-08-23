@@ -32,3 +32,6 @@ AGENTS_BOARD.md
 
 # Leftover worktree checkouts (may still exist under .claude/worktrees/)
 .claude/worktrees/
+
+# per-session debug scratch (agents park logs/diffs/screenshots here)
+.scratch/
