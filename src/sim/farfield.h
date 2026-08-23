@@ -61,7 +61,7 @@ class FarField {
 
   World* world_ = nullptr;
   IVec3 origins_[kFarLevels] = {};  // per level, level-chunk units
-  std::deque<uint32_t> queue_;      // packed (level-1) << 12 | slot
+  std::deque<uint32_t> queue_;  // packed (level-1) << kFarSlotShift | slot
   // Outstanding entries per level, mirroring queue_ (the queue is FIFO across
   // levels, so scanning it per frame would be O(24576); these counters make
   // SafeRadiusMeters O(kFarLevels)). Incremented on every enqueue, decremented

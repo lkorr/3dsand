@@ -227,6 +227,22 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
   render({108, (float)(h108 + 28), 108}, 0.785f, -0.02f, "screenshot_ground.bmp");
+  // CASCADE shot: the only capture here that is actually MOSTLY far field.
+  // The two shots above look down from moderate height, so nearly every pixel
+  // lands inside the residency window and the cascades barely appear — neither
+  // could catch a far-field regression. Measured on this exact frame: 50% of
+  // its pixels come from traceFar (checked by stubbing the far march out), so
+  // it is the one that would notice.
+  //
+  // Both numbers below are load-bearing. The camera must be well ABOVE the
+  // terrain, because the residency window is only half a window edge in radius
+  // (25.6 m at kWorldN=512, kVoxelMeters=0.10) and any eye-height view is
+  // walled in by near terrain — an earlier version of this shot sat at
+  // h108+12 and differed by ONE pixel in 2,073,600 between two very different
+  // cascade configurations, i.e. it tested nothing. And the pitch must be
+  // near-horizontal: aimed steeply down, the frame fills with the window again.
+  render({108, (float)(h108 + 300), 108}, 0.785f, -0.06f,
+         "screenshot_cascade.bmp");
   // Combat arena POI, centered at (180,110): from outside the -x/-z corner
   // looking across the deck, high enough to see the far wall and both doorways.
   {

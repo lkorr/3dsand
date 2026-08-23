@@ -1599,6 +1599,27 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 // — a sun ray leaves the hit level's box within a few dozen cells, and
 // cross-level shadow reach buys nothing visible through fog at that range.
 // Render-only float math on render-only data (CLAUDE.md rule 1 scopes to sim).
+// ---- THE REACH MUST BE A DISTANCE, NOT A STEP COUNT ----
+// This loop used to run a bare `for (i = 0; i < 128; i++)`, which silently ties
+// the shadow's WORLD-SPACE reach to the level's cell size: 128 steps is 128
+// cells, so a level whose cells are half as wide casts a shadow ray half as
+// far. That coupling is invisible until the cascade's shift base moves - when
+// every cell halved (see kFarShiftBase in world.h), the near levels' rays
+// stopped terminating on a caster inside their budget and every one of them
+// burned the full 128 steps plus occupancy lookups, turning a 10.5 ms frame
+// into a 606 ms one: a 58x cliff out of a constant that reads like a safety
+// cap.
+//
+// The budget below is therefore expressed in METERS and converted into this
+// level's cells, so the shadow reaches the same distance into the world at
+// every level and the step count falls out of the geometry. The clamp bounds
+// both ends: never so few steps that a coarse level cannot leave its own cell,
+// never more than the old cap, which is what protects the frame.
+fn farShadowSteps(level : u32) -> i32 {
+  let cellM = f32(1u << farCellShift(level)) * VOXEL_METERS;
+  return clamp(i32(TUNE_FAR_SHADOW_REACH / max(cellM, 1e-4)), 8, 128);
+}
+
 fn farShadowed(level : u32, roFine : vec3f) -> bool {
   var rd = keyLightDir();
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -1622,7 +1643,8 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
     tMax[a] = (boundary - roL[a]) * inv[a];
   }
   var tCur = 0.0;
-  for (var i = 0; i < 128; i++) {
+  let steps = farShadowSteps(level);
+  for (var i = 0; i < steps; i++) {
     if (!farInBox(cell, org)) { return false; }
     if (farOcc[farOccIndex(level, cell)] == 0u) {
       // empty level chunk: jump to its exit face (seam-safe, as in traceFar)

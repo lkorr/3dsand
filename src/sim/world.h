@@ -681,23 +681,95 @@ static_assert(sizeof(RenderParams) % 16 == 0,
 // fine voxels, with kFarShiftBase = log2(kWorldN / kFarN) — chosen so level
 // k's box edge is always 2^k WINDOW edges (half-extent = 2^k window radii)
 // whatever kWorldN is. All cascade distances therefore scale WITH the window.
+//
+// ---- kFarN IS THE ONLY KNOB THAT CHANGES FAR-FIELD DETAIL ----
+// A level's cell size and its box extent are rigidly coupled: level k holds
+// kFarN^3 cells of 2^(k + kFarShiftBase) fine voxels, so the count of cells
+// across a level's half-extent is the CONSTANT kFarN/2, whatever k is. A ray
+// at distance d is served by the level whose box just contains d, so the cell
+// serving it is always ~d / (kFarN/2) — and the projected size of that cell,
+//     px_per_cell = (d / (kFarN/2)) / (2 d tan(fov/2) / H)
+//                 = H / (kFarN * tan(fov/2)),
+// has the distance cancel out. The far field renders at a CONSTANT angular
+// resolution everywhere, fixed by kFarN alone.
+//
+// The corollary cost real time to learn, so state it plainly: changing
+// kFarShiftBase or kFarLevels CANNOT change how detailed the far field looks.
+// Shifting the base one step finer and adding a level renumbers the cascade
+// (level 1 becomes what level 2 was) but leaves the cell size serving any
+// given distance bit-identical — measured: a 9-level/finer-base build differed
+// from the 8-level build by 26 pixels out of 2,073,600 in a view that is 50%
+// cascade. Those two constants trade horizon distance against near coverage;
+// only kFarN trades memory against detail.
+//
+// At kFarN=256 and 1080p/70deg that constant was ~6 px per cell, which is the
+// LOD's real weakness: every cascade cell is a visible 6-pixel block, so a
+// distant structure is quantised ~6x coarser than the screen can resolve and
+// visibly restructures as it crosses into the residency window. 512 halves
+// that to ~3 px, for 8x the per-level memory (kFarN^3).
+//
+// That 8x is paid for by DROPPING LEVELS, not by adding VRAM: see kFarLevels.
 constexpr uint32_t kFarN = 256;
 constexpr uint32_t kFarNChunk = kFarN / kChunk;  // 16
-constexpr uint32_t kFarNumChunks = kFarNChunk * kFarNChunk * kFarNChunk;  // 4096
+constexpr uint32_t kFarNumChunks = kFarNChunk * kFarNChunk * kFarNChunk;
+// Fill-queue entries pack (level-1) above a chunk SLOT index. The shift must
+// be wide enough for kFarNumChunks slots — it was hardcoded to 12 (exactly
+// right for the 4096 slots of kFarN=256, and silently wrong for anything
+// bigger: at kFarN=512 a slot index runs to 32767 and would overflow into the
+// level field, filling the wrong cascade level). Derived so it tracks kFarN.
+constexpr uint32_t kFarSlotShift = [] {
+  uint32_t s = 0;
+  while ((1u << s) < kFarNumChunks) s++;
+  return s;
+}();
+constexpr uint32_t kFarSlotMask = (1u << kFarSlotShift) - 1u;
 constexpr uint32_t kFarVox = kFarN * kFarN * kFarN;  // cells per level
-constexpr uint32_t kFarShiftBase = [] {
+// kFarShiftAlign = log2(kWorldN / kFarN): the shift that makes a level's box
+// edge equal the WINDOW edge, so level k's box is 2^k window edges across.
+// kFarShiftBase sits here; moving it renumbers the cascade without changing
+// how detailed any distance looks (see the kFarN note above).
+constexpr uint32_t kFarShiftAlign = [] {
   uint32_t s = 0;
   while ((kFarN << s) < kWorldN) s++;
   return s;
 }();
-static_assert(kWorldN >= kFarN && (kFarN << kFarShiftBase) == kWorldN,
+static_assert(kWorldN >= kFarN && (kFarN << kFarShiftAlign) == kWorldN,
               "kFarN must divide kWorldN by a power of two");
-// 8 levels: outermost half-extent = (kWorldN << 8)/2 voxels = 4096 m at the
-// 512 window and 6.25 cm voxels. farVox = kFarLevels * 16 MiB = 128 MiB.
+constexpr uint32_t kFarShiftBase = kFarShiftAlign;
+// 6 levels at kFarN=512: outermost half-extent 1638 m at the 512 window and
+// 10 cm voxels, farVox = 6 x 128 MiB = 768 MiB.
+//
+// Two levels were REMOVED to pay for the resolution above, and the horizon
+// they carried (6554 m) is worth much less than it sounds: fog is pinned so
+// opacity reaches ~99% at the outermost half-extent, so level 7 sat behind
+// ~90% fog and level 8 behind ~99%. Dropping them trades terrain almost
+// nobody can see for 2x the angular detail on the terrain everyone looks at.
+// Raising this back to 8 is legal (it costs 256 MiB more) if the horizon ever
+// matters more than the near detail — the fog pin follows automatically.
 constexpr uint32_t kFarLevels = 8;
 static_assert((uint64_t)kFarLevels * kFarVox < (1ull << 32),
               "farVox byte indices must fit u32");
+static_assert(((uint64_t)(kFarLevels - 1) << kFarSlotShift) < (1ull << 32),
+              "fill-queue packing (level-1)<<kFarSlotShift | slot must fit u32");
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
+
+// ---- cascade geometry, derived in ONE place ----
+// Level k (1-based) holds kFarN cells per axis of 2^(k + kFarShiftBase) fine
+// voxels, so its box edge is kFarN << (k + kFarShiftBase) fine voxels. Every
+// distance below derives from these two, so changing kFarN, kFarLevels or the
+// shift base moves fog, the trusted radius and the horizon together instead of
+// leaving a hardcoded "2^k window edges" relation behind to drift.
+constexpr uint32_t kFarCellVox(uint32_t k) {  // fine voxels per level-k cell
+  return 1u << (k + kFarShiftBase);
+}
+constexpr float kFarHalfExtentMeters(uint32_t k) {  // level-k half-extent, m
+  return (float)kFarN * 0.5f * (float)kFarCellVox(k) * kVoxelMeters;
+}
+// The residency window's own half-extent: the distance at which a ray leaves
+// simulated voxels and picks up the cascade, and so the cold-start trusted
+// radius before any level has filled.
+constexpr float kWindowHalfExtentMeters = (float)(kWorldN >> 1) * kVoxelMeters;
+
 // Fog reaches ~full opacity (exp(-4.5) ~= 1%) at whatever radius it is pinned
 // to; kFogOpticalDepths is that budget, shared by the static pin below and by
 // the adaptive term in WriteRenderParams.
@@ -707,15 +779,15 @@ constexpr float kFogOpticalDepths = 4.5f;
 // the fully-filled cascade is the farthest anything is ever visible, so fog is
 // never thinner than this.
 constexpr float kFarFogDensity =
-    kFogOpticalDepths / ((float)(kWorldN << kFarLevels) * kVoxelMeters * 0.5f);
+    kFogOpticalDepths / kFarHalfExtentMeters(kFarLevels);
 // Ceiling of the adaptive density (phase 3B). While a cold start / teleport
 // has cascade fills outstanding, fog closes in to hide the unfilled bands —
-// but never nearer than cascade level 2's half-extent, which is 4x the
-// residency window's own half-extent. That keeps the *simulated* world (the
-// thing the player is standing in and editing) fully visible no matter how
-// backlogged the fill queue is; only the LOD horizon ever gets fogged away.
+// but never nearer than 4x the residency window's own half-extent. That keeps
+// the *simulated* world (the thing the player is standing in and editing)
+// fully visible no matter how backlogged the fill queue is; only the LOD
+// horizon ever gets fogged away.
 constexpr float kFarFogDensityMax =
-    kFogOpticalDepths / ((float)(kWorldN << 2) * kVoxelMeters * 0.5f);
+    kFogOpticalDepths / (kWindowHalfExtentMeters * 4.0f);
 // Per-frame exponential approach of fog density toward its target. Cascade
 // bands land in whole planes, so an instantly-applied density steps visibly as
 // the queue drains; ~0.08/frame fades the horizon open over ~0.5 s instead.
@@ -988,7 +1060,7 @@ class World {
                          // (atomic in the fill/downsample kernels: partial-word
                          // byte updates from neighboring dirty chunks race)
   rhi::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
-  rhi::Buffer farList;  // kFarListCap u32 fill entries: (level-1)<<12 | slot
+  rhi::Buffer farList;  // kFarListCap entries: (level-1)<<kFarSlotShift | slot
   rhi::Buffer farUBO;   // FarParams
 
  private:

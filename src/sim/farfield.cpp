@@ -22,7 +22,7 @@ IVec3 DesiredOrigin(IVec3 fineChunk, uint32_t k) {
 }  // namespace
 
 void FarField::Enqueue(uint32_t k, uint32_t slot) {
-  queue_.push_back((k << 12) | slot);
+  queue_.push_back((k << kFarSlotShift) | slot);
   pending_[k]++;
 }
 
@@ -57,21 +57,17 @@ void FarField::FullRefill(IVec3 playerChunk) {
 }
 
 float FarField::SafeRadiusMeters() const {
-  // Half-extent of cascade level k (1-based) in meters: the level's box edge
-  // is kFarN << (k + kFarShiftBase) = kWorldN << k fine voxels (the shift base
-  // pins box size to WINDOW edges), so half of it is
-  // (kWorldN / 2) * 2^k * kVoxelMeters. Derived from world.h, never hardcoded.
-  auto halfExtent = [](uint32_t k) {
-    return (float)(kWorldN >> 1) * (float)(1u << k) * kVoxelMeters;
-  };
+  // Half-extent of cascade level k (1-based) comes from world.h
+  // (kFarHalfExtentMeters), so this tracks kFarN / kFarShiftBase / kFarLevels
+  // automatically instead of restating the box-size relation.
   for (uint32_t k = 0; k < kFarLevels; k++) {
     if (pending_[k] == 0) continue;
     // level k+1 (1-based) is incomplete; trust out to level k's half-extent,
-    // or — if even level 1 is incomplete — only the residency window itself
-    // (half of kWorldN fine voxels), which is the pre-cascade draw distance.
-    return k == 0 ? (float)(kWorldN >> 1) * kVoxelMeters : halfExtent(k);
+    // or — if even level 1 is incomplete — only the residency window itself,
+    // which is the pre-cascade draw distance.
+    return k == 0 ? kWindowHalfExtentMeters : kFarHalfExtentMeters(k);
   }
-  return halfExtent(kFarLevels);   // everything filled: the full horizon
+  return kFarHalfExtentMeters(kFarLevels);   // everything filled: full horizon
 }
 
 void FarField::Update(IVec3 playerChunk) {
@@ -120,7 +116,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
     // The dispatch is encoded in THIS tick's submit, so the entry counts as
     // filled from here on — SafeRadiusMeters is read on the render path of the
     // same frame, one submit behind at worst.
-    pending_[list[i] >> 12]--;
+    pending_[list[i] >> kFarSlotShift]--;
   }
   queue.WriteBuffer(world_->farList, 0, list.data(), count * 4);
   return count;

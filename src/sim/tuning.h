@@ -1235,6 +1235,11 @@ struct Tuning {
     // budgets
     int primarySteps = 4096;
     int farSteps = 384;
+    // How far a far-field sun shadow ray reaches, in METERS. Converted to a
+    // per-level step count by farShadowSteps() in raymarch.wgsl so the reach
+    // is the same world distance at every cascade level (a raw step count is
+    // not: it scales with the level's cell size — see the comment there).
+    float farShadowReach = 60.0f;
   } render;
 
   // ---- worldgen (integer; regenerating the world is required to see edits) ----

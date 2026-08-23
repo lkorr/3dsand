@@ -523,6 +523,7 @@
     "microSwaySpeed": 1.1,
     "primarySteps": 4096,
     "farSteps": 384,
+    "farShadowReach": 60,
     "skyRayleigh": 12,
     "skyMie": 1,
     "skyMieG": 0.76,
