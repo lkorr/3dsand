@@ -331,9 +331,28 @@ struct Scenario {
 };
 
 void PrintPassTable(const char* label, const PassTimer& timer, uint32_t ticks,
-                    double wallMsPerTick, uint32_t passesPerTick) {
+                    double wallMsPerTick, uint32_t passesPerTick,
+                    uint64_t caSkips, double avgActive, uint32_t maxActive) {
   std::printf("\n  --- %s (%u ticks, %u ComputePassEncoders/tick) ---\n", label,
               ticks, passesPerTick);
+  // ROADMAP_scale.md §3.4: how many of these ticks recorded NO CA rows at all.
+  // Reported unconditionally, including the 0 case, because "the skip did not
+  // fire" is the thing a reader most needs to know when a settled number looks
+  // higher than expected — a silent 0 reads as "no such mechanism".
+  std::printf("    CA skipped on %" PRIu64 " / %u ticks (settled-tick skip)\n",
+              caSkips, ticks);
+  // §5.4: active chunks, and the per-chunk cost derived from THIS scenario's
+  // own CA time rather than carried over from another one. The CA row is 54
+  // dispatches over the same chunk list, so µs/chunk/tick divided by 54 is the
+  // per-chunk-per-PASS figure; the budget in §2 is quoted per tick, so that is
+  // what is printed.
+  double caUs = 0;
+  for (const PassTimer::Stat& s : timer.Stats())
+    if (s.name.find("ca(") == 0) caUs = (double)s.totalNs / 1000.0 / (double)ticks;
+  std::printf("    active chunks/tick: %.1f avg, %u max", avgActive, maxActive);
+  if (avgActive > 0.5 && caUs > 0)
+    std::printf("   -> CA %.3f us/chunk/tick", caUs / avgActive);
+  std::printf("\n");
   std::printf("    %-34s %10s %10s %8s\n", "pass", "us/tick", "% of sim",
               "ticks");
   double sum = 0;
@@ -356,9 +375,19 @@ void PrintPassTable(const char* label, const PassTimer& timer, uint32_t ticks,
 // is a per-tick LATENCY, not throughput. Reported as such.
 double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
                      PassTimer& timer, uint32_t firstTick, uint32_t ticks,
-                     bool withExplosions, uint32_t* passesPerTick) {
+                     bool withExplosions, uint32_t* passesPerTick,
+                     uint64_t* caSkips, double* avgActive, uint32_t* maxActive,
+                     uint32_t heavyEvery = 0, int heavyRadius = 0) {
   double t0 = NowSeconds();
   uint32_t passes = 0;
+  const uint64_t skips0 = sim.CaSkipCount();
+  // ROADMAP_scale.md §5.4: the active-chunk count is the unit the whole compute
+  // budget is denominated in ("~30-50k active chunks/tick"), and it was being
+  // extrapolated from a single settling measurement. Sampling it per scenario
+  // costs nothing — the snapshot already carries it — and it is what turns the
+  // 0.2 µs/chunk anchor into something checkable.
+  uint64_t activeSum = 0;
+  uint32_t activeMax = 0, activeSamples = 0;
   for (uint32_t i = 0; i < ticks; i++) {
     uint32_t t = firstTick + i;
     std::vector<ExplosionOp> exps;
@@ -369,14 +398,45 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
       int h = World::TerrainHeight(100, 100, kDefaultSeed);
       exps.push_back({100, h, 100, 14, 400, 0, 0, 0});
     }
+    // ROADMAP_scale.md §5.4: a THIRD point on the cost curve, far from the
+    // other two. The active/settling scenarios sit at ~3 and ~25 active chunks,
+    // which are close enough together that a two-point fit of
+    // "cost = fixed + k*chunks" is badly conditioned — and that fit is what the
+    // whole compute budget in §2 rests on. Walking the blast around the world
+    // keeps successive explosions from landing in the crater the last one made.
+    if (heavyEvery > 0 && (t % heavyEvery) == 0) {
+      const int gx = 80 + (int)((t / heavyEvery * 37u) % 300u);
+      const int gz = 80 + (int)((t / heavyEvery * 53u) % 300u);
+      int h = World::TerrainHeight(gx, gz, kDefaultSeed);
+      exps.push_back({gx, h, gz, heavyRadius, 400, 0, 0, 0});
+    }
+    // wantReadback = TRUE. It used to be false, which made this harness cheaper
+    // per tick but also made it measure a configuration the game never runs:
+    // the §3.4 settled skip is licensed by an arriving SNAPSHOT, and a harness
+    // that never asks for one can never take the skip. The settled numbers were
+    // therefore reporting the un-skipped CA cost while the game was already
+    // paying nothing — a measurement that flatters the OLD code. The game and
+    // every gate pass true here, so this makes --measure agree with them.
     SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, exps, {},
-               t % 15 == 0, {8, 3, 8}, false, withExplosions);
+               t % 15 == 0, {8, 3, 8}, true, withExplosions);
     if (i == 0) passes = timer.PassesThisBuffer() / 2;
     ctx.WaitIdle();
     timer.Collect(ctx);
+    // SetHarnessSnapshotDrain(true) is on for --measure, so the snapshot this
+    // reads is the one this tick produced rather than an arbitrarily old one.
+    const WorldSnapshot& sn = world.Snap();
+    if (sn.valid) {
+      activeSum += sn.activeChunks;
+      activeMax = std::max(activeMax, sn.activeChunks);
+      activeSamples++;
+    }
   }
   double dt = NowSeconds() - t0;
   if (passesPerTick) *passesPerTick = passes;
+  if (caSkips) *caSkips = sim.CaSkipCount() - skips0;
+  if (avgActive)
+    *avgActive = activeSamples ? (double)activeSum / (double)activeSamples : 0.0;
+  if (maxActive) *maxActive = activeMax;
   return dt / (double)ticks;
 }
 
@@ -466,21 +526,26 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
   {
     timer.ResetStats();
     uint32_t ppt = 0;
+    uint64_t skips = 0;
+    double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, kSettleTicks + 1,
-                                kPerScenario, false, &ppt);
+                                kPerScenario, false, &ppt, &skips, &avgAct,
+                                &maxAct);
     PrintPassTable("(c) SETTLED world (no edits, chunks asleep)", timer,
-                   kPerScenario, wall, ppt);
+                   kPerScenario, wall, ppt, skips, avgAct, maxAct);
   }
 
   // (b) ACTIVE — periodic explosions keep chunks awake and particles flying.
   {
     timer.ResetStats();
     uint32_t ppt = 0;
+    uint64_t skips = 0;
+    double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer,
                                 kSettleTicks + kPerScenario + 1, kPerScenario,
-                                true, &ppt);
+                                true, &ppt, &skips, &avgAct, &maxAct);
     PrintPassTable("(b) ACTIVE world (explosion every 20 ticks + particles)",
-                   timer, kPerScenario, wall, ppt);
+                   timer, kPerScenario, wall, ppt, skips, avgAct, maxAct);
   }
 
   // (a) SETTLING — regenerate the world and time the first ticks, when
@@ -496,10 +561,36 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     if (haveTimer) sim.SetPassTimer(&timer);
     timer.ResetStats();
     uint32_t ppt = 0;
+    uint64_t skips = 0;
+    double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, 1, kPerScenario, false,
-                                &ppt);
+                                &ppt, &skips, &avgAct, &maxAct);
     PrintPassTable("(a) SETTLING world (first ticks after worldgen)", timer,
-                   kPerScenario, wall, ppt);
+                   kPerScenario, wall, ppt, skips, avgAct, maxAct);
+  }
+
+  // (d) HEAVY — the third point on the cost curve (§5.4). A large blast every
+  // 4 ticks, walked around the world so each one lands on intact terrain.
+  // This is the only scenario that puts the CA in the regime the 5 cm / 2048³
+  // plan actually cares about, where the per-chunk term dominates the fixed
+  // per-dispatch floor.
+  {
+    sim.SetPassTimer(nullptr);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 200; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false,
+                 {8, 3, 8}, true, false);
+    ctx.WaitIdle();
+    if (haveTimer) sim.SetPassTimer(&timer);
+    timer.ResetStats();
+    uint32_t ppt = 0;
+    uint64_t skips = 0;
+    double avgAct = 0; uint32_t maxAct = 0;
+    double wall = RunTimedTicks(ctx, world, sim, timer, 201, kPerScenario, false,
+                                &ppt, &skips, &avgAct, &maxAct, 4, 30);
+    PrintPassTable("(d) HEAVY world (r=30 blast every 4 ticks, walked)", timer,
+                   kPerScenario, wall, ppt, skips, avgAct, maxAct);
   }
 
   sim.SetPassTimer(nullptr);

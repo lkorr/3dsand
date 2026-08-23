@@ -176,6 +176,18 @@ enum class Cond : uint8_t {
   // of worldgen, and under §3.8's fatal policy an abort at startup.
   DenseWorldgen,
   FluidSpawn, // fluidSpawnCount > 0 (MLS-MPM spawn row in PT_TICK)
+  // The CA loop and its compaction/staging setup, suppressed when the CPU can
+  // PROVE the dirty set is empty (ROADMAP_scale.md §3.4, Simulation::
+  // NoteTickInputs). A settled world otherwise records 54 indirect dispatches
+  // of (0,1,1) — 141.7 µs/tick measured for provably zero invocations, and the
+  // cost is per-DISPATCH so it survives every other optimization and grows 8x
+  // at a 2048³ window.
+  //
+  // Skipping a zero-workgroup dispatch removes no invocation, so the voxel
+  // writes are bit-identical and the pinned hash is the gate on that claim.
+  // The proof obligation is entirely on the CPU mirror being CONSERVATIVE:
+  // wrong-active costs microseconds, wrong-idle loses world state.
+  CaActive,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.

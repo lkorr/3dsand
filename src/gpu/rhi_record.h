@@ -39,6 +39,9 @@ struct TableCtx {
   bool particlesActive = false;
   // False under --residency paged (PLAN_page_table.md §3.5c).
   bool denseWorldgen = true;
+  // False ONLY when the CPU can prove the dirty set is empty, dropping compact
+  // + the args copy + all 54 CA iterations (ROADMAP_scale.md §3.4).
+  bool caActive = true;
 };
 
 // The live resources a table row resolves against, as SEAM handles. The

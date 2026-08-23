@@ -330,6 +330,14 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // wake once: neighbors may have changed since this chunk was saved
       ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
       ctx_->queue.WriteBuffer(world_->dirty[1], (uint64_t)s * 4, &one, 4);
+      // This is the ONE waking path that writes dirtyIn without going through
+      // a Simulation::Encode* entry point, so it declares itself to the §3.4
+      // settled-skip latch here. Without it a store-hit refill into a settled
+      // world would wake chunks the CA had been skipped for, and the refilled
+      // terrain would sit frozen until something else happened to dirty the
+      // world — which is exactly the silent-state-loss failure the latch's
+      // conservative direction exists to prevent.
+      sim_->NoteWakeAll();
     } else {
       genSlots.push_back(s);
     }

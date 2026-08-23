@@ -712,6 +712,16 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.fluidSpawnCount = cx.fluidSpawnCount;
   cxv.hashEnable = cx.hashEnable;
   cxv.particlesActive = cx.particlesActive;
+  // Both of these were missing from this copy until ROADMAP §3.4 added
+  // caActive next to denseWorldgen and the omission became load-bearing.
+  // denseWorldgen defaulting to true meant --residency paged still recorded
+  // the whole-world worldgen dispatch it is supposed to suppress; it was
+  // invisible because the paged path ALSO runs the batched genList and the
+  // extra dispatch is idempotent over the same slots. Fixed here rather than
+  // left, because a field that silently does not cross the seam is exactly
+  // the "two structs that must agree" failure this bridge exists to avoid.
+  cxv.denseWorldgen = cx.denseWorldgen;
+  cxv.caActive = cx.caActive;
   e->rec->RecordTable(which, cxv);
 }
 

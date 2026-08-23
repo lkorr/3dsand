@@ -148,7 +148,17 @@ PASS(particleSpawn, "prep(mutate+explode+compact)", PT_TICK, PIPE_P_SPAWN,     K
      USES(R(SpawnOps) U(TickUBO) A(ParticleCounts) W(ParticlesRead)))
 // compact dirtyIn -> dense chunk list + indirect args, AFTER mutate/explode so
 // freshly touched chunks simulate this tick.
-PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMPUTE, D_CHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+// C_CAACTIVE, not C_ALWAYS: this row exists ONLY to build the CA's dispatch
+// list, so when the CA is skipped it is pure cost (a 512-workgroup scan of all
+// 32,768 dirty flags). The three rows below it — the staging copy and the 54
+// CA iterations — form one unit that is recorded or skipped together, and they
+// share the condition rather than each testing a variant of it. §3.4.
+//
+// fill_argsStage above STAYS C_ALWAYS deliberately: argsStage is the shared
+// compaction target for BOTH compact (here) and compactNext (phase 5b), and
+// phase 5b re-fills it anyway. Zeroing a 12-byte buffer is free; making its
+// fill conditional would couple two phases that are otherwise independent.
+PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMPUTE, D_CHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(DirtyIn) W(DirtyList) A(ArgsStage)))
 
 // ---- phase 2: indirect staging -------------------------------------------
@@ -156,7 +166,12 @@ PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMP
 // indirect + bound-writable usage of one buffer in the same pass, and
 // sim_step.wgsl deliberately omits binding 13 to keep argsStage outside the CA
 // pass's usage scope. v1 keeps the staging copy (barrier_graph §4.10).
-PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+// C_CAACTIVE with compact: this copy stages the count compact just produced.
+// With compact skipped there is nothing new to stage, and copying the zeroed
+// argsStage would write {0,0,0} into dispatchArgs — which phase 5b's own copy
+// then overwrites anyway. Skipping both keeps dispatchArgs holding the last
+// real value, which nothing reads while the CA rows are absent.
+PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(ArgsStage) TW(DispatchArgs)))
 
 // ---- phase 3: the CA loop -------------------------------------------------
@@ -170,7 +185,7 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // point only READS it (dirtyList[wg.x] at the top of main).
 // read-only in practice: declared read_write only because WGSL cannot mix
 // access modes for one binding across the module's entry points.
-PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_ALWAYS, 54,
+PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)))
 

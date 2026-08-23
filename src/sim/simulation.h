@@ -89,6 +89,60 @@ class Simulation {
                   uint32_t cellCount, uint32_t spawnCount = 0,
                   uint32_t fluidCount = 0, uint32_t fluidSpawnCount = 0);
 
+  // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
+  //
+  // A fully settled world still recorded 54 `DispatchWorkgroupsIndirect` calls
+  // whose indirect args said (0,1,1): 141.7 µs/tick measured, ~53% of a settled
+  // tick, for provably zero work. That is a rule-2 violation, and it scales
+  // with the DISPATCH COUNT, not the world — so it survives every other
+  // optimization and costs 8x more at a 2048³ window.
+  //
+  // The fix is to not record the rows at all when the dirty set is provably
+  // empty. "Provably" is the whole difficulty: the count lives in a GPU buffer
+  // (sim_compact writes dispatchArgs), and reading it back synchronously to
+  // decide would put a stall in the frame path — forbidden by rule 3's traffic
+  // budget and far more expensive than the dispatches it saves.
+  //
+  // So the decision is made from a CONSERVATIVE CPU MIRROR, on exactly the
+  // model `particlesActive` already uses at the main.cpp call site: the skip
+  // is taken ONLY when every input that could dirty a chunk says no. The
+  // asymmetry is deliberate and is the safety property —
+  //
+  //     a WRONG "active" costs 141 µs.   a WRONG "idle" loses world state.
+  //
+  // so every uncertain case must resolve to "active". Uncertainty here is
+  // mostly staleness: the snapshot is one tick latent (DESIGN.md §2) and can be
+  // older when the readback ring is saturated, so `SettledSnapshot` requires
+  // the snapshot to be NEWER than the last tick anything could have dirtied,
+  // never merely non-zero.
+  //
+  // Determinism (rule 1) is not at risk here in the way a sim change would be,
+  // and the reason is worth stating precisely rather than assuming: skipping
+  // a dispatch whose workgroup count is zero removes NO invocation, so the
+  // sequence of writes to the voxel buffer is bit-identical either way. The
+  // skip is a pure recording-side decision, like a PassRow condition. What it
+  // must NOT do is skip a dispatch that would have run one workgroup, which is
+  // what the conservative mirror exists to prevent. The gate is the pinned
+  // hash: a skip that ever fires wrongly moves 7cfa2420 immediately.
+  //
+  // Call once per tick BEFORE EncodeTick, with everything the CPU knows.
+  // `dirtiedNow` is true if this tick has ANY input that marks a chunk: ops,
+  // explosions, cell ops, spawns, streaming refills, a wake-all, a load.
+  void NoteTickInputs(uint32_t tick, bool dirtiedNow);
+  // Feed an arriving snapshot. `activeChunks` is its dirty-flag count and
+  // `snapTick` the tick it was stamped at. Only a snapshot showing ZERO active
+  // chunks, stamped at or after the last dirtying tick, can license a skip.
+  void NoteSnapshot(uint32_t snapTick, uint32_t activeChunks);
+  // Everything that wakes chunks outside the op path funnels here, so a caller
+  // that forgets one keeps the CA running rather than silently losing it.
+  // Stamps the current tick — NOT a forever-dirty sentinel; see the .cpp for
+  // why a sentinel silently disabled the skip for the life of the process.
+  void NoteWakeAll();
+  // Whether the CA rows would be recorded for the NEXT tick. Measurement and
+  // gates only — nothing in the sim may branch on this.
+  bool CaSkipped() const { return caSkipped_; }
+  uint64_t CaSkipCount() const { return caSkipCount_; }
+
   // Render pass with the shared depth target (raymarch writes frag_depth,
   // raster geometry depth-tests against it). Caller draws UI into same pass.
   rhi::RenderPass BeginRenderPass(const rhi::CommandEncoder& enc,
@@ -229,4 +283,20 @@ class Simulation {
   // page (next tick's read page), the splash droplets' destination.
   rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2];
   int page_ = 0;
+
+  // ---- settled-tick skip state (§3.4) -------------------------------------
+  // The last tick a CPU input could have dirtied a chunk. A snapshot licenses
+  // the skip only when it is stamped at or after this (Simulation::
+  // NoteSnapshot), so a stale snapshot can never speak for a newer write.
+  //
+  // Starts at 0 rather than a never-reachable sentinel, and that is safe
+  // because it is not what gates the FIRST skip: settledProven_ starts false,
+  // and only a snapshot reporting zero active chunks can set it. Every path
+  // that creates a world — worldgen, load, genList — calls NoteWakeAll() and
+  // re-stamps this with a real tick anyway.
+  uint32_t lastDirtyTick_ = 0;
+  uint32_t curTick_ = 0;        // tick being encoded (NoteTickInputs)
+  bool settledProven_ = false;  // a fresh snapshot showed 0 active chunks
+  bool caSkipped_ = false;      // last EncodeTick omitted the CA rows
+  uint64_t caSkipCount_ = 0;    // how many ticks skipped (measurement only)
 };

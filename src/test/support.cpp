@@ -255,6 +255,24 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   if (world.Snap().valid) pt.ConsumeOccupancy(world.Snap().occupancy, tick);
   pt.RetirePages(tick);
 
+  // ---- the §3.4 settled-skip latch ----------------------------------------
+  // Fed here because this is the one function BOTH the game loop and every
+  // harness tick go through, so the latch cannot see a different world than
+  // the encoder does. Declared BEFORE EncodeTick, which reads it.
+  //
+  // `dirtiedNow` deliberately over-declares: farCount is render-only derived
+  // data that cannot dirty a sim chunk, but it costs nothing to be wrong in
+  // the safe direction and the list stays a plain "did anything arrive".
+  sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
+                               spawnCount > 0 || particlesActive ||
+                               fluidBase + fluidSpawnCount > 0);
+  {
+    // A snapshot can only license a skip if it is BOTH valid and fresh enough
+    // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_).
+    const WorldSnapshot& sn = world.Snap();
+    if (sn.valid) sim.NoteSnapshot(sn.tick, sn.activeChunks);
+  }
+
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   // The fills go in at the HEAD of the command buffer, before any row (§5.4):
   // FillTracked declares TransferWrite on Voxels, and the first row with

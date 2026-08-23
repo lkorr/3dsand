@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 #include "gpu/resources.h"
 #include "sim/pagetable.h"
@@ -639,6 +640,9 @@ struct RecordCtx {
   // False under --residency paged: worldgen's whole-world dispatch is replaced
   // by batched worldgenList submits (PLAN_page_table.md §3.5c).
   bool denseWorldgen = true;
+  // False ONLY when the CPU can prove the dirty set is empty (§3.4). Mirrors
+  // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
+  bool caActive = true;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -772,6 +776,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
+  tc.caActive = cx.caActive;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -800,12 +805,19 @@ void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   // whole-world dispatch — the fill rows still clear the transient buffers.
   cx.denseWorldgen = denseGen;
   RecordTable(enc, pass::Table::Worldgen, &cx);
+  // A freshly generated world is maximally unsettled — the first hundreds of
+  // ticks ARE the settling. Same self-declaration rule (§3.4).
+  NoteWakeAll();
 }
 
 void Simulation::EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count) {
   RecordCtx cx{};
   cx.genCount = count;
   RecordTable(enc, pass::Table::GenList, &cx);
+  // Streamed-in chunks arrive with fresh terrain that has never settled, and
+  // worldgenList marks them dirty. Same self-declaration rule as EncodeWakeAll
+  // (§3.4): the function that dirties the set invalidates the latch.
+  NoteWakeAll();
 }
 
 void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
@@ -818,6 +830,10 @@ void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
   page_ = 0;
   RecordCtx cx{};
   RecordTable(enc, pass::Table::LoadReset, &cx);
+  // A load replaces every voxel in the window and the caller has already
+  // written both dirty pages (worldio.cpp). Nothing the latch believed about
+  // the previous world survives that (§3.4).
+  NoteWakeAll();
 }
 
 void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
@@ -854,6 +870,76 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // set: a dirty EMPTY chunk holds no matter, so nothing in it can move, and
   // the only way it can receive matter is from a neighbour that has some.
   if (world_->pages) world_->pages->WakeAll();
+  // Same doctrine, second mirror: the §3.4 settled-skip latch is also a CPU
+  // mirror of the dirty set, so the wake invalidates it HERE rather than at a
+  // call site. This function is the only writer of all-ones into dirtyIn, and
+  // it is now the only place that has to know that.
+  NoteWakeAll();
+}
+
+// ---------------------------------------------------------------------------
+// The settled-tick skip (ROADMAP_scale.md §3.4). See simulation.h for why this
+// is safe; what follows is why it is CORRECT, which is a different question.
+//
+// The CA may be skipped for tick T only if dirtyIn(T) is empty. The CPU cannot
+// read dirtyIn — it lives on the GPU — so it proves the statement from two
+// facts it does own:
+//
+//   (1) a snapshot stamped at tick S reported ZERO active chunks. The snapshot
+//       carries dirtyOut(S), and dirtyOut(S) IS dirtyIn(S+1) (the page flip is
+//       the only thing between them — pagetable.cpp:296 states the same
+//       identity for the same reason). So dirtyIn(S+1) is empty.
+//
+//   (2) no CPU input has dirtied a chunk since S. Every such input is declared
+//       through NoteTickInputs / NoteWakeAll, which stamp lastDirtyTick_.
+//
+// Given both, dirtyIn stays empty for every tick after S+1: the CA is the only
+// thing that writes dirtyOut, an empty dirtyIn dispatches no CA workgroups, and
+// no workgroups write no dirty flags. The world is a fixed point, and it stays
+// one until a CPU input breaks it. That is the induction the skip rests on, and
+// it is why fact (2) must cover EVERY waking path rather than just brush ops.
+//
+// The failure mode to design against is staleness, not logic: `valid` snapshots
+// arrive one tick latent at best and can lag when the readback ring saturates.
+// Requiring snapTick >= lastDirtyTick_ handles it — a snapshot older than the
+// last dirtying input proves nothing about the state that input created, and is
+// rejected rather than trusted.
+// ---------------------------------------------------------------------------
+void Simulation::NoteTickInputs(uint32_t tick, bool dirtiedNow) {
+  curTick_ = tick;
+  if (dirtiedNow) {
+    lastDirtyTick_ = tick;
+    // A fresh input invalidates any settled proof immediately: the snapshot
+    // that proved it predates the write this tick is about to make.
+    settledProven_ = false;
+  }
+}
+
+void Simulation::NoteWakeAll() {
+  // Stamped with the CURRENT tick rather than a forever-dirty sentinel. One
+  // that no snapshot tick can ever exceed is not "conservative", it is a
+  // permanent latch: the world settles, every snapshot reports zero, and the
+  // skip never fires again for the life of the process. That is what the first
+  // draft of this did, and --measure reporting `CA skipped on 0 / 120` in a
+  // provably settled world is what caught it.
+  //
+  // A real tick number is both conservative AND recoverable: no snapshot
+  // stamped BEFORE the wake can satisfy `snapTick >= lastDirtyTick_`, so the
+  // wake's dirty flags can never be reasoned away, but a snapshot taken after
+  // the woken chunks settle again can.
+  lastDirtyTick_ = curTick_;
+  settledProven_ = false;
+}
+
+void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks) {
+  if (activeChunks != 0) {
+    settledProven_ = false;
+    return;
+  }
+  // Zero active chunks. Conclusive only if nothing dirtied the world at or
+  // after the tick this snapshot was stamped at — an older snapshot describes
+  // a world that no longer exists.
+  if (snapTick >= lastDirtyTick_) settledProven_ = true;
 }
 
 void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
@@ -869,6 +955,27 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.fluidSpawnCount = fluidSpawnCount;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
+
+  // §3.4. The counts are re-tested here as a BACKSTOP, not as the primary
+  // signal: NoteTickInputs is the declaration and a caller that forgets it
+  // would otherwise skip a tick that mutates the world. Testing what this call
+  // actually carries means the ONE thing that can silently break the skip —
+  // an undeclared op — cannot break it through the op path itself.
+  //
+  // particlesActive is in the disjunction because a particle can rejoin the
+  // grid (sim_particle resolve writes voxels and marks dirtyOut), so a world
+  // with particles in flight is not settled even with no ops this tick.
+  const bool inputsThisTick = opsCount > 0 || expCount > 0 || cellCount > 0 ||
+                              spawnCount > 0 || particlesActive ||
+                              fluidCount > 0 || fluidSpawnCount > 0;
+  if (inputsThisTick) {
+    lastDirtyTick_ = curTick_;
+    settledProven_ = false;
+  }
+  cx.caActive = !settledProven_;
+  caSkipped_ = !cx.caActive;
+  if (caSkipped_) caSkipCount_++;
+
   RecordTable(enc, pass::Table::Tick, &cx);
 
   // MLS-MPM fluid prototype: the substep table, kFluidSubsteps times, into

@@ -89,13 +89,112 @@ Pay it once; do not do 10→5 and later 5→2.5.
 
 ## 3. Simulation optimizations, ranked by payoff
 
+> **[MEASURED 2026-08-22] The ranking below was written against a compute
+> anchor that is wrong by ~35x, and item 1 has since been built, measured, and
+> REVERTED as a net loss. Read §3.0 before acting on anything in this list.**
+
+### 3.0 The measured cost model (supersedes the §2 anchor)
+
+`--measure` now samples `Snap().activeChunks` per tick and carries a fourth
+scenario (d) HEAVY specifically to put a third, distant point on the cost
+curve. Least-squares over the three (RTX 3060 Ti, seed 1337, CA-running ticks):
+
+```
+CA per tick = 54 x (4.65 us  +  0.245 us x activeChunks)
+              ^^^^^^^^^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^
+              251 us/tick       13.3 us per chunk per tick
+              FIXED FLOOR       (not the 0.2 us §2 assumed)
+```
+
+Residuals are ±15% at the two low points, so chunk CONTENTS matter too and the
+per-chunk figure is good to about a factor of two. Measured points:
+
+| active chunks | CA µs/tick | floor share |
+|---|---|---|
+| 3.0 | 343 | 86% |
+| 25.0 | 504 | 43% |
+| 68.7 | 1188 | 22% |
+
+**Where §2's 0.2 µs/chunk came from, so it is not re-derived:** §0 records
+"473 µs CA while ~2,600 chunks were settling", and 473/2600 ≈ 0.2. But 2,636 is
+the count of MIXED (non-empty) chunks in the whole 32,768-chunk window — a
+static occupancy statistic — not the ACTIVE dirty chunks in that tick. The
+settling scenario really runs ~25 active chunks. The denominator was ~100x too
+large.
+
+**Consequence:** at 8 ms/tick the CA affords roughly **600 active chunks**, not
+30–50k. Every event-size row in §2's table is optimistic by a large factor.
+
+**And it splits the problem in two, which the old single-number budget hid:**
+
+- **the FLOOR** (54 dispatches x 4.65 µs, content-free) dominates at today's
+  event sizes and is attacked only by ISSUING FEWER DISPATCHES.
+- **the PER-CHUNK term** dominates above ~200 active chunks — i.e. exactly the
+  regime the 5 cm / 2048³ plan targets — and is attacked by doing less work per
+  chunk.
+
+An optimization aimed at one does nothing for the other. Item 1 aimed at the
+per-chunk term and was measured in the floor-dominated regime.
+
+### 3.1 was BUILT AND REVERTED — cell masks are a net loss
+
+Implemented in full: `sim_mask.wgsl` deriving a 4³-block bitmask (2 u32/chunk)
+over the dirty list, consumed by `sim_step` before its voxel read. Proven
+correct — **bit-identical hash `7cfa2420`** — after two real bugs, both worth
+recording:
+
+1. **A comment killed the shader.** `LoadShader` decides whether to keep
+   `common.wgsl`'s page-table WRITE block by substring-searching the body for
+   `read_write> voxels` (`resources.cpp: BodyWritesVoxels`). A COMMENT in
+   sim_mask.wgsl containing that exact phrase matched, the block was kept, it
+   referenced an undeclared `pageFaults`, and the shader failed to compile.
+   The failure was silent: `vk_record` does `if (pipe == VK_NULL_HANDLE)
+   continue`, so the row was skipped, the mask buffer held garbage, and the
+   build was green. Symptom was a wrong world hash with no error printed.
+2. **Intra-chunk dilation is not enough.** An all-air chunk is in the dirty
+   list because `markDirty` marks every chunk a written cell BORDERS — and a
+   grain falling in from the chunk above must act on a LATER colour phase of
+   the same tick. Masking it out freezes that grain. Bisected: identity mask
+   PASS `7cfa2420`; only-air-inert + whole-chunk dilation FAIL `2f3896ac`. The
+   fix is a one-cell READ MARGIN per block (crossing chunk boundaries through
+   `voxWordAt`), which is exact because the CA's write reach is ≤1 cell.
+
+Measured with the correct version (µs/tick):
+
+| scenario | CA before | CA after | mask pass | net |
+|---|---|---|---|---|
+| active | 348.3 | 348.2 | 34.9 | **+34.9** |
+| settling | 506.3 | 497.1 | 35.0 | **+25.8** |
+| heavy | 1059.2 | 1067.3 | 65.7 | **+73.8** |
+
+A net loss in every scenario. A first version that staged the mask in
+workgroup memory was far worse (+39% to +82% on the CA alone) because the
+`workgroupBarrier()` it needs is paid by all 216 threads of all 54 dispatches;
+removing the barrier for a direct global read restored the CA to baseline but
+left the mask pass itself as pure added cost.
+
+**Why it cannot be rescued by tuning the granularity:** the mask attacks the
+per-chunk term only, and recovers none of the 251 µs floor. In the regime it
+was measured in, the floor is 43–86% of the cost. A coarser whole-chunk mask
+is worse than useless — it would re-derive what chunk sleeping already does,
+since a chunk is only in the dirty list because something in it or beside it
+moved.
+
+**When to revisit:** only above ~200 active chunks/tick, where the per-chunk
+term dominates. That is a real regime for the 5 cm target, so this is
+"measured, not viable yet" rather than "wrong idea". The shader is recoverable
+from git history if so.
+
+---
+
 The sim is the bottleneck (memory closes comfortably; compute caps event
 size). GPU note: "batch 8 adjacent voxels per evaluation" does not help —
 cells already run 216-wide per workgroup; ALU is free, memory touches /
 dispatches / substeps are the cost. The wins are: don't visit dead cells,
 move bulk matter as objects, and don't multiply substeps.
 
-1. **Cell-level active bitmasks inside dirty chunks** (~5–15× on CA traffic).
+1. **~~Cell-level active bitmasks inside dirty chunks~~ — BUILT AND REVERTED,
+   see §3.1 above. The estimate below was never realised.** (~5–15× on CA traffic).
    Per-chunk 16³ bitmask (512 B/chunk) of cells that can act this tick; passes
    skip clear bits. 3D analog of Noita's dirty rects. Hash-neutral by
    construction → acceptance test = **bit-identical world hash with masks
@@ -113,9 +212,16 @@ move bulk matter as objects, and don't multiply substeps.
    cell/substep is ballistic and belongs in particles (velocity-integrated,
    deterministically reinserted — already the pattern). Halves the 5 cm tax:
    ×16 → ×8.
-4. **Settled-tick fixes** (already in port plan phase 3/8, 8× more important
-   at 2048³): skip-encode CA passes when the dirty count is zero, merge the
-   54 encoder submissions, sentinel-aware hash/occupancy scans.
+4. **Settled-tick fixes** — **LANDED 2026-08-22 (commit 2dd5073)**, and the
+   biggest realised win so far. `Cond::CaActive` drops `compact`, the args
+   staging copy and all 54 CA iterations when a conservative CPU latch proves
+   the dirty set empty. Measured: settled CA **141.7 → 1.0 µs/tick (141×)**,
+   settled tick wall clock **2.080 → 0.445 ms**, skip firing on 119/120 settled
+   ticks, hash `7cfa2420` unchanged, `perf` gate MARGINAL → PASS. The
+   sentinel-aware scan half of this item was ALREADY DONE by the page table
+   (`sim_occupancy.wgsl:main` has an analytic sentinel branch); the full scan
+   also runs only on hash ticks (1-in-15), so it amortizes to ~7 µs/tick and
+   was never the bottleneck it appeared to be.
 5. **Temporal rate LOD for slow reactions.** Chunks whose only activity is
    slow (smolder, growth) dispatch every Nth tick, N a pure function of
    (tick, chunk coord, rule rate) — deterministic. Needs conservative wake at

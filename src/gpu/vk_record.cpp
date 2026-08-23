@@ -95,6 +95,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::DenseWorldgen: return cx.denseWorldgen;
     case pass::Cond::FarCount:  return cx.farCount > 0;
     case pass::Cond::FluidSpawn: return cx.fluidSpawnCount > 0;
+    case pass::Cond::CaActive:  return cx.caActive;
   }
   return false;
 }
