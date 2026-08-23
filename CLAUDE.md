@@ -50,6 +50,42 @@ python scripts/check_pass_table.py                        # pass table vs WGSL b
 
 `--vk-validation` enables sync validation; **a validation message FAILS the run**. `tests/baseline.json` records known-failing gates (exit 0); new failures are regressions (exit 1). `--backend dawn` refuses with exit 2.
 
+### When to run what — verification is a BUDGET, not a reflex
+
+The suites are slow (full `--selftest` ~50 s x2 modes, `--vk-smoke-loud` ~40 s x2
+modes) and this repo's determinism culture makes "run it again" feel free. It is
+not. Before every run, answer **"what claim does this establish that is not
+already established?"** If there is no answer, skip it. Sessions here have spent
+2.5 h on ~45 binary invocations for 20 min of code.
+
+**The rules, in order of how much time they save:**
+
+1. **A tree that did not change does not need re-testing.** After a merge, run
+   `git diff --stat <branch> HEAD` FIRST. Empty output = the trees are identical
+   = the suite you already ran on one of them is a valid result for the other.
+   Re-running a full acceptance block on both sides of a clean merge is the
+   single biggest waste available, and it is pure ceremony.
+2. **Never run a gate and then the suite that contains it.** Pick one. Use
+   `--gate <name>` while iterating; run the full suite once, at the end.
+3. **Reverting a file to its committed state cannot change behaviour.** No
+   rebuild-and-retest needed to "confirm" a `git checkout --` .
+4. **Cache the invariant arm of a differential.** When A/B-ing (JITTER on/off,
+   paged/dense), the control side usually does not change across the whole
+   session. Save its output to a file once and diff against that.
+5. **Match the tool to the question.** `--gate determinism` (~5 s) answers "did
+   the world change". `--vk-smoke-loud` (~40 s) answers "WHERE did it change" —
+   it has per-tick probes. `SANDVOX_PT_DEBUG=1 --vk-smoke-loud` with
+   `SANDVOX_PT_DIGEST=<tick>` answers "WHICH CHUNK" — dump and diff, do not
+   guess. Escalate in that order; do not start at the top.
+
+**Full acceptance is an END-OF-WORK event, run ONCE**, on the tree you intend to
+ship: both suites, both smokes, `--vk-validation`, both checkers. Not after every
+edit, not on both sides of a merge, not "to be safe".
+
+**A green run you did not need still costs the user minutes.** Reporting
+"verified, and here is the one command that proves the rest was unnecessary" is a
+better answer than eight redundant green runs.
+
 ### Build gotchas
 - Dawn checkout stays for Tint; `DAWN_ENABLE_*` all OFF. Turning one ON re-declares the whole Dawn engine (~156 TUs).
 - `TINT_BUILD_SPV_WRITER`/`SPV_READER` default to `${DAWN_ENABLE_VULKAN}`, forced ON independently. `DAWN_USE_GLFW` stays ON (supplies `glfw` target). `Vulkan::Headers` has its own `add_subdirectory`.
