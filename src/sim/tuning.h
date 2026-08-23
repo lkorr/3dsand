@@ -767,6 +767,29 @@ struct Tuning {
     float fluidBubbleDensity = 1.05f; // above this x rest -> bubble
     float fluidSprayDensity = 0.42f;  // below this x rest -> spray
     int fluidFoamScaleIdx = 3;        // foam particle size (0=1/2 .. 3=1/6 vox)
+    // ---- MLS-MPM settle / excite seam: the CA <-> particle handover ----
+    int fluidExciteMode = 0;      // 0 = disturbance-excite off: the CA owns
+                                  // disturbed settled liquid (Phase-2 default,
+                                  // keeps the pinned world hash); 1 = settled
+                                  // liquid with air below converts to MPM
+                                  // particles
+    float fluidSettleEps = 0.9f;  // vox/s: a fluid block whose FASTEST
+                                  // particle stays below this counts as calm
+                                  // and may settle back into CA voxels
+    float fluidWakeSpeed = 3.6f;  // vox/s: grid-node speed at an active/
+                                  // settled interface above this excites the
+                                  // neighbouring settled liquid (progressive
+                                  // wake). Keep ~4x settleEps: the gap is the
+                                  // hysteresis
+    int fluidSettleTicks = 45;    // consecutive calm ticks before a block
+                                  // settles. The >= 8 floor is a HARD
+                                  // requirement: it covers the CPU-side
+                                  // page-materialization readback latency, so
+                                  // the settle converter never writes voxels
+                                  // into a chunk the mirror has not seen
+    float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
+                                  // stains an adjacent solid cell — the MPM
+                                  // counterpart of CA liquid staining
   } sim;
 
   // ---- day/night cycle ----

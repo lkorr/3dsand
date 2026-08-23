@@ -689,6 +689,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
                     (int32_t)((hh >> 19) % 8192u) - 4096;
             op.vx = 0; op.vy = -19661; op.vz = 0;
             op.species = 0;
+            op.mat = splashMats[0];  // water: the particle's settled identity
             out.push_back(op);
           }
         }
@@ -1519,12 +1520,18 @@ int main(int argc, char** argv) {
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
-  // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the CPU-owned particle
-  // count. The GPU never allocates fluid particles, so this is the single
-  // truth for every dispatch extent and the draw count. Not persisted: saves
-  // and worldgen drop the fluid (plan's force-settle-on-save policy, prototype
-  // version).
+  // MLS-MPM fluid (docs/PLAN_mpm_fluids.md): the CPU's CONSERVATIVE live
+  // estimate — the GPU owns the real count now (settle kills particles,
+  // excite births them; the seam's compaction maintains fluidArgs[FA_LIVE]).
+  // Refreshed from the snapshot readback each frame, bumped by spawns
+  // submitted since that snapshot's tick so a fresh pour never reads as
+  // empty. Drives record/skip, draw counts and the HUD only — every kernel
+  // re-bounds itself on the GPU count. Not persisted.
   uint32_t fluidCount = 0;
+  // Spawns submitted after the newest snapshot's tick: (tick, count) pairs,
+  // dropped once a snapshot at/after their tick arrives (the GPU count now
+  // includes them).
+  std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
   // Material id each MPM species splashes micro droplets as, recorded from the
   // pour's brush material (TickParams.fluidSplashMat). 0 until a species is
   // first poured — no pour, no droplets.
@@ -1887,7 +1894,8 @@ int main(int argc, char** argv) {
       tick = 0;
       grenades.clear();
       everExploded = false;
-      fluidCount = 0;  // MPM fluid does not survive a regen
+      fluidCount = 0;  // MPM fluid does not survive a regen (the worldgen
+      fluidPendingSpawns.clear();  // table zeroes the GPU count + calm state)
       debris.Reset();
       mobs.Reset();
       // The avatar's severed parts live in DebrisSystem and its live limbs are
@@ -1916,7 +1924,9 @@ int main(int argc, char** argv) {
         // transient state is cleared here.
         grenades.clear();
         everExploded = false;
-        fluidCount = 0;  // MPM fluid is not in the save format (prototype)
+        fluidCount = 0;  // MPM fluid is not in the save format: saves
+        fluidPendingSpawns.clear();  // force-settle (loadReset zeroes the
+                                     // GPU count + calm state)
         tpRig.Snap();
       }
     }
@@ -2256,7 +2266,15 @@ int main(int argc, char** argv) {
       std::vector<FluidSpawnOp> fluidSpawns;
       if (ui.clearFluid) {
         ui.clearFluid = false;
-        fluidCount = 0;  // spawns restart at slot 0; stale GPU data unreachable
+        // The count is GPU-owned now: zero the live word directly. Deferred
+        // queue writes drain at the head of the NEXT command buffer — this
+        // tick's — so the seam's compaction reads 0 and every particle is
+        // gone before the substeps run (the deferred-WriteBuffer ordering
+        // gotcha, used in the right direction for once).
+        uint32_t zero = 0;
+        ctx.queue.WriteBuffer(world.fluidArgsStage, 7 * 4, &zero, 4);
+        fluidCount = 0;
+        fluidPendingSpawns.clear();
       }
       if (ui.tool == UIState::kToolFluid && !ui.magicMode && mouseL) {
         const WorldSnapshot& fsnap = world.Snap();
@@ -2297,6 +2315,11 @@ int main(int argc, char** argv) {
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
                 op.species = fluidSpecies;
+                // The particle knows what it IS (attr word): settle writes
+                // this material back as voxels, splashes and staining key on
+                // it. The species table above is just the render/attraction
+                // grouping now.
+                op.mat = (uint32_t)ui.brushMaterial & 0xFFFu;
                 fluidSpawns.push_back(op);
               }
             }
@@ -2735,7 +2758,27 @@ int main(int argc, char** argv) {
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat);
-      fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(), kFluidCap);
+      // Conservative estimate refresh: the newest snapshot's GPU-owned count
+      // plus every spawn batch it has not seen yet. Settles decay it (the
+      // snapshot count shrinks); excites grow it one snapshot late, which the
+      // seam's recording predicate covers (Simulation::EncodeTick).
+      if (!fluidSpawns.empty())
+        fluidPendingSpawns.push_back({tick, (uint32_t)fluidSpawns.size()});
+      {
+        const WorldSnapshot& fsn = world.Snap();
+        uint32_t pend = 0;
+        if (fsn.valid) {
+          std::erase_if(fluidPendingSpawns,
+                        [&](const std::pair<uint32_t, uint32_t>& p) {
+                          return p.first <= fsn.tick;
+                        });
+          for (const auto& p : fluidPendingSpawns) pend += p.second;
+          fluidCount = std::min(fsn.fluidLive + pend, kFluidCap);
+        } else {
+          fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(),
+                                kFluidCap);
+        }
+      }
       ui.fluidCount = fluidCount;
       double tSubmit1 = NowSeconds();
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick

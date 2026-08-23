@@ -50,16 +50,18 @@ struct TableCtx {
 // place in the flow (record time) it always has.
 struct TableBindings {
   Buffer buffers[(int)pass::Buf::kCount];
-  ComputePipeline pipelines[32];  // indexed by (int)pass::Pipe
+  ComputePipeline pipelines[64];  // indexed by (int)pass::Pipe
   PipelineLayout simLayout;       // GRP_SIM (simPL_)
   PipelineLayout slimPartLayout;  // GRP_SLIM_PART (simPL2_)
   PipelineLayout slimFarLayout;   // GRP_SLIM_FAR (farPL_)
   PipelineLayout slimFluidLayout; // GRP_SLIM_FLUID (fluidPL_)
+  PipelineLayout slimFluidSeamLayout; // GRP_SLIM_FLUIDSEAM (fluidSeamPL_)
   BindGroup simSet;               // simBG_[page]
   BindGroup slimSet;              // simSlimBG_[page]
   BindGroup particleSet;          // particleBG_[page]
   BindGroup farSet;               // farBG_
   BindGroup fluidSet;             // fluidBG_
+  BindGroup fluidSeamSet;         // fluidSeamBG_[page]
 };
 
 // Record one table through the encoder's generated-barrier recorder. This is

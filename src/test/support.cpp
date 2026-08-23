@@ -113,23 +113,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
-                uint32_t fluidBase,
+                uint32_t fluidLive,
                 const uint32_t* fluidSplashMat) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
-  // MLS-MPM fluid prototype: budget is charged by the CALLER before emitting
-  // (rule 2 — emit-then-check overruns); this clamp is the belt to that brace.
+  // MLS-MPM fluid: `fluidLive` is the caller's CONSERVATIVE live estimate
+  // (snapshot count + spawns since — the GPU owns the real number). The spawn
+  // budget is charged by the CALLER before emitting (rule 2); this clamp is
+  // the belt to that brace, and the GPU excite scan enforces the cap exactly.
   uint32_t fluidSpawnCount = std::min((uint32_t)fluidSpawns.size(),
                                       kMaxFluidSpawnsPerTick);
-  fluidBase = std::min(fluidBase, kFluidCap);
-  if (fluidSpawnCount > kFluidCap - fluidBase)
-    fluidSpawnCount = kFluidCap - fluidBase;
+  fluidLive = std::min(fluidLive, kFluidCap);
+  if (fluidSpawnCount > kFluidCap - fluidLive)
+    fluidSpawnCount = kFluidCap - fluidLive;
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
   tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
-  tp.fluidBase = fluidBase;
+  // The disturbance-excite switch rides the tick input stream (the dayPhase
+  // precedent): tuning is read CPU-side, HERE, so replays and the twice-run
+  // determinism gates capture it and a per-gate SetCurrentTuning overrides it
+  // with no pipeline rebuild.
+  tp.fluidExciteEnable =
+      CurrentTuning().sim.fluidExciteMode != 0 ? 1u : 0u;
   tp.fluidSpawnCount = fluidSpawnCount;
   if (fluidSplashMat) {
     for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
@@ -233,6 +240,25 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.UpdateSpawnRing(spawnCells, expCenters, world);
   }
   {
+    // fluidChunks(N): every chunk the MLS-MPM seam may write a voxel into —
+    // the active block slots from the one-tick-latent snapshot readback plus
+    // this tick's CPU-known fluid spawn cells, dilated one ring inside
+    // UpdateFluidChunks. The settle converter's >= 8 calm-tick floor is what
+    // makes the readback latency safe (world.h fluid block).
+    const WorldSnapshot& sn = world.Snap();
+    std::vector<uint32_t> blockSlots;
+    if (sn.valid && sn.fluidBlockCount > 0) {
+      blockSlots.assign(sn.fluidBlocks.begin(),
+                        sn.fluidBlocks.begin() + sn.fluidBlockCount);
+    }
+    std::vector<IVec3> fluidCells;
+    fluidCells.reserve(fluidSpawnCount);
+    for (uint32_t i = 0; i < fluidSpawnCount; i++)
+      fluidCells.push_back({fluidSpawns[i].px >> 16, fluidSpawns[i].py >> 16,
+                            fluidSpawns[i].pz >> 16});
+    pt.UpdateFluidChunks(blockSlots, fluidCells, world);
+  }
+  {
     const WorldSnapshot& sn = world.Snap();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
     // Contributor (e), the particle flight shell — strictly AFTER the
@@ -266,7 +292,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // the safe direction and the list stays a plain "did anything arrive".
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
                                spawnCount > 0 || particlesActive ||
-                               fluidBase + fluidSpawnCount > 0);
+                               fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
     // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_).
@@ -298,7 +324,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.EncodePageFill(enc, jitterFills);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
-                 fluidBase + fluidSpawnCount, fluidSpawnCount);
+                 fluidLive + fluidSpawnCount, fluidSpawnCount);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the

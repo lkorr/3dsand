@@ -92,6 +92,7 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
   cpuDirty_.Clear();
   particleChunks_.Clear();
+  fluidChunks_.Clear();
   opTargets_.Clear();
   shell_.Clear();
   shellSeed_.Clear();
@@ -146,6 +147,7 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
   cpuDirty_.Clear();
   particleChunks_.Clear();
+  fluidChunks_.Clear();
   opTargets_.Clear();
   shell_.Clear();
   shellSeed_.Clear();
@@ -426,6 +428,41 @@ void PageTable::UpdateSpawnRing(const std::vector<IVec3>& spawnCells,
   particleChunks_.UnionWith(seeds);
 }
 
+void PageTable::UpdateFluidChunks(const std::vector<uint32_t>& blockSlots,
+                                  const std::vector<IVec3>& spawnCells,
+                                  const World& world) {
+  // Contributor for the MPM fluid seam, and the same shape as UpdateSpawnRing
+  // for the same reason: RECOMPUTED FROM SCRATCH each call from CPU-known
+  // inputs, never carried, so it is bounded by the live block count plus this
+  // tick's spawns and cannot grow with time.
+  //
+  //   - blockSlots is the one-tick-latent block-list readback: every chunk
+  //     the excite/settle converters may write voxels into. The latency is
+  //     safe because the settle converter only fires after >= 8 consecutive
+  //     calm ticks (fluidSettleTicks is clamped to >= 8 for exactly this), so
+  //     a block that is about to write voxels has been in the readback for
+  //     many ticks already.
+  //   - spawnCells covers the latency's other direction — blocks born THIS
+  //     tick, which no readback can know yet.
+  //   - ONE N26 ring covers sub-chunk particle drift since the snapshot was
+  //     stamped: a fluid particle cannot cross more than a chunk per tick.
+  fluidChunks_.Clear();
+  if (blockSlots.empty() && spawnCells.empty()) return;
+
+  SlotSet seeds;
+  for (uint32_t s : blockSlots)
+    if (s < kNumChunks) seeds.Add(s);
+  for (const IVec3& c : spawnCells) {
+    if (!world.CellInWindow(c)) continue;   // out-of-window is inert
+    seeds.Add(World::SlotChunkIndex({c.x >> 4, c.y >> 4, c.z >> 4}));
+  }
+  scratch_.Clear();
+  DilateN26(seeds, scratch_);
+  seeds.Clear();
+  seeds.UnionWith(scratch_);
+  fluidChunks_.UnionWith(seeds);
+}
+
 void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
                                     uint32_t snapTick, uint32_t encodeTick) {
   if (!paged_) return;
@@ -631,13 +668,16 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   }
   cpuDirty_.UnionWith(opTargets_);
   cpuDirty_.UnionWith(particleChunks_);
+  cpuDirty_.UnionWith(fluidChunks_);
 
   // Retain C(N) for the snapshot roll-forward.
   CEntry ce;
   ce.tick = tick_;
-  ce.slots.reserve(opTargets_.Size() + particleChunks_.Size());
+  ce.slots.reserve(opTargets_.Size() + particleChunks_.Size() +
+                   fluidChunks_.Size());
   for (uint32_t s : opTargets_.Members()) ce.slots.push_back(s);
   for (uint32_t s : particleChunks_.Members()) ce.slots.push_back(s);
+  for (uint32_t s : fluidChunks_.Members()) ce.slots.push_back(s);
   cRing_.push_back(std::move(ce));
   while (cRing_.size() > kCRing) cRing_.pop_front();
 
@@ -729,12 +769,16 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   DilateN26(opTargets_, scratch_);
   materialized_.UnionWith(scratch_);
   materialized_.UnionWith(particleChunks_);
+  // The fluid seam's chunks join OUTSIDE the hasMatter filter: settled water
+  // writes into empty-sky chunks (a block's underside is air), same argument
+  // as ops.
+  materialized_.UnionWith(fluidChunks_);
 
   if (getenv("SANDVOX_PT_DEBUG")) {
-    std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu inUse=%u aM=%u aO=%u\n",
+    std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu fluid=%zu inUse=%u aM=%u aO=%u\n",
                 tick_, cpuDirty_.Size(), hasMatterCount, materialized_.Size(),
-                opTargets_.Size(), particleChunks_.Size(), pagesInUse_,
-                allocsMat_, allocsOvr_);
+                opTargets_.Size(), particleChunks_.Size(), fluidChunks_.Size(),
+                pagesInUse_, allocsMat_, allocsOvr_);
   }
   for (uint32_t s : materialized_.Members()) {
     const uint32_t e = t[s];

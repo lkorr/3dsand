@@ -267,11 +267,13 @@ struct TickParams {
   // alone. Gates the daylight reactions, so it is determinism-critical:
   // integer only, and never sourced from frame timing.
   dayPhase   : u32,
-  // MLS-MPM fluid prototype: live particle count BEFORE this tick's spawns
-  // (the spawn kernel's append base) and this tick's spawn-op count. Both
-  // CPU-owned, pure functions of the op stream (world.h fluid block).
-  fluidBase       : u32,
-  fluidSpawnCount : u32,
+  // MLS-MPM fluid: the disturbance-excite switch (sim.fluidExciteMode, read
+  // CPU-side each tick like dayPhase — part of the tick input stream, so
+  // replays and the determinism gates capture it) and this tick's spawn-op
+  // count. The live particle count is GPU-owned now (fluidArgs[FA_LIVE]); the
+  // old CPU append base is gone with it.
+  fluidExciteEnable : u32,
+  fluidSpawnCount   : u32,
   // Material id each MPM species splashes micro droplets as (0 = species was
   // never poured, so it emits none). CPU-owned, recorded from the pour's brush
   // material — blood MPM sprays blood droplets that stain, water sprays water.
@@ -651,12 +653,14 @@ fn microStainPriority(p : Particle) -> u32 {
   return (h | 2u) & ~1u;  // nonzero, and always even
 }
 
-// ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl) -----
-// A SECOND, experimental liquid representation alongside the CA liquid, for
-// side-by-side comparison. Everything below is integer fixed point (rule 1
-// discipline applied to a system that is deliberately OUTSIDE the world hash:
-// the fluid never writes a voxel — its determinism is gated separately by the
-// fluid_det selftest gate, twice-run over the particle buffer).
+// ---- MLS-MPM fluid (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl + seam) --------
+// The EXCITED state of liquid: particles simulated by the fixed-point MLS-MPM
+// solver. Settled liquid is voxels, exactly as always. The two converters in
+// sim_fluid_seam.wgsl (excite: cells -> particles, settle: particles -> cells)
+// are the only seam between the representations, and they DO write voxels —
+// deterministically (integer math, slot-order scans, state-keyed RNG), so the
+// world hash moves only when and where fluid actually converts. A world that
+// never spawns fluid is byte-identical to one before this system existed.
 //
 // Units: 1 grid cell = 1 world voxel = 1.0; 1 tick = 1.0.
 //   position  Q16.16 absolute world cells (range +-32768 cells — fine for the
@@ -664,41 +668,116 @@ fn microStainPriority(p : Particle) -> u32 {
 //   velocity  Q16.16 cells/tick
 //   C matrix  Q16.16 1/tick (APIC affine velocity field)
 //   J         Q16    volume ratio, 1.0 = 65536
-// Must match FluidParticle consumers: sim_fluid.wgsl and debris.wgsl vsFluid.
+// Must match FluidParticle consumers: sim_fluid.wgsl, sim_fluid_seam.wgsl and
+// debris.wgsl vsFluid.
 const FLUID_CAP       : u32 = 262144u;  // kFluidCap
 const FLUID_BLOCKS    : u32 = 256u;     // kFluidBlocks
 const FLUID_SUBSTEPS  : i32 = 6;        // kFluidSubsteps
 const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // Words per fluid grid node: [0] mass Q10, [1..3] momentum->velocity Q16.16,
-// [4..6] species 1..3 mass Q10, [7] unused. Shared by the solver
-// (sim_fluid.wgsl) and the surface renderer (raymarch.wgsl reads mass,
+// [4..6] species 1..3 mass Q10, [7] foam field (persistent). Shared by the
+// solver (sim_fluid.wgsl) and the surface renderer (raymarch.wgsl reads mass,
 // velocity and species words of the LAST substep's grid); world.cpp sizes
 // fluidGrid by this.
 const FLUID_GW        : u32 = 8u;
 
+// The fluid particle, 32 words / 128 B (power-of-two stride for coalesced
+// access; world.cpp sizes the two ping-pong buffers and the fluid-det gate
+// strides by this count). Words 0..17 are the solver state the kernels touch
+// every substep; 18..19 are the seam's identity words; 20..31 are reserved
+// (zeroed at spawn) so the next attribute does not force another restride.
 struct FluidParticle {
   px : i32, py : i32, pz : i32,   // Q16.16 world cells
   vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
   // APIC affine matrix C, row-major (c00 c01 c02 / c10 c11 c12 / c20 c21 c22),
   // Q16.16. The traceless part carries angular momentum; the trace updates J.
-  // (18 words / 72 B — world.cpp sizes the buffer and the fluid-det gate
-  // strides by this count; species and density are the two words after j.)
   c00 : i32, c01 : i32, c02 : i32,
   c10 : i32, c11 : i32, c12 : i32,
   c20 : i32, c21 : i32, c22 : i32,
-  j   : i32,                      // Q16 volume ratio (diagnostic; the EOS uses
-                                  // the grid density below, not J)
-  species : u32,                  // 0..3, the pour's liquid identity
+  j   : i32,                      // Q16 volume ratio. Diagnostic for a poured
+                                  // particle (the EOS reads density), but the
+                                  // excite converter seeds it from hydrostatic
+                                  // depth so a reawakened column starts
+                                  // pre-compressed instead of jello-popping.
+  species : u32,                  // 0..3, grid species-mass slot (render color
+                                  // + attraction). Derived from attr's mat at
+                                  // excite time; the pour picks it directly.
   density : i32,                  // Q16.16 masses/cell sampled by p2g2 last
                                   // substep (render shading + attraction)
+  // ---- seam identity (word 18): what this particle IS in voxel terms ------
+  // mat (bits 0..11): the actual material id — reactions, staining and settle
+  //   write-back all key on it. mat == 0 means DEAD: the slot is a corpse the
+  //   next compaction pass removes. fullness == 0 means the same.
+  // fullness (bits 12..14): how many voxel-eighths this particle carries.
+  //   1 by default (8 particles == one full voxel); settle sums these, so the
+  //   round trip is exact integer mass accounting.
+  // stainType (bits 15..17) / stainAmt (bits 18..21): the stain the particle
+  //   was excited with (voxel bits 28..30 / 24..27). Settle writes it back;
+  //   contact staining spreads it to surfaces it touches.
+  attr : u32,
+  birthTick : u32,                // T.tick at spawn/excite (age diagnostics,
+                                  // future force-settle-oldest under pressure)
+  _r0 : i32, _r1 : i32, _r2 : i32, _r3 : i32,
+  _r4 : i32, _r5 : i32, _r6 : i32, _r7 : i32,
+  _r8 : i32, _r9 : i32, _r10 : i32, _r11 : i32,
 };
 
-// Must match FluidSpawnOp in world.h (32 bytes).
+// attr accessors — the one definition of the packing above.
+fn fpMat(attr : u32) -> u32 { return attr & 0xFFFu; }
+fn fpFullness(attr : u32) -> u32 { return (attr >> 12u) & 0x7u; }
+fn fpStainType(attr : u32) -> u32 { return (attr >> 15u) & 0x7u; }
+fn fpStainAmt(attr : u32) -> u32 { return (attr >> 18u) & 0xFu; }
+fn fpAlive(attr : u32) -> bool {
+  return (attr & 0xFFFu) != 0u && ((attr >> 12u) & 0x7u) != 0u;
+}
+fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
+  return (mat & 0xFFFu) | ((fullness & 0x7u) << 12u) |
+         ((stainType & 0x7u) << 15u) | ((stainAmt & 0xFu) << 18u);
+}
+
+// ---- fluidArgsStage word map (16 u32) --------------------------------------
+// [0..3]  node-pass dispatch args + active block count (alloc, per substep)
+// [4..6]  per-particle-pass dispatch args ((live+63)/64, 1, 1) — written by
+//         the seam's excite scan once per tick, copied to the indirect buffer
+// [7]     LIVE PARTICLE COUNT — the authoritative population, GPU-owned.
+//         compact writes the survivor count, spawn ops and excite add to it.
+//         Every per-particle kernel bounds itself on this word.
+// [8]     dead-this-tick counter (settle kills, reaction consumption)
+// [9]     excite-emitted particle count this tick
+// [10]    settled eighths this tick (event counter: sound cues, mass audits)
+// [11]    excited eighths this tick (event counter)
+// [12]    excite refusals this tick (budget pressure diagnostics)
+// [13]    settling block count this tick
+// [14]    last excite chunk slot (sound cue positioning, coarse)
+// [15]    spare
+const FA_LIVE      : u32 = 7u;
+const FA_DEAD      : u32 = 8u;
+const FA_EMITTED   : u32 = 9u;
+const FA_SETTLED   : u32 = 10u;
+const FA_EXCITED   : u32 = 11u;
+const FA_REFUSED   : u32 = 12u;
+const FA_SETBLOCKS : u32 = 13u;
+const FA_LASTSLOT  : u32 = 14u;
+
+// Must match FluidSpawnOp in world.h (32 bytes). mat carries the pour's brush
+// material into the particle's attr word (stainless, fullness 1).
 struct FluidSpawnOp {
   px : i32, py : i32, pz : i32,   // Q16.16 world cells
   vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
-  species : u32, _f1 : u32,
+  species : u32, mat : u32,
 };
+
+// ---- excite scratch bits (voxel word bits 19..23, per the allocation table
+// in the voxMat block above) -------------------------------------------------
+// exciteDetect marks a candidate cell by setting EXCITE_PEND and stashing the
+// cell's hydrostatic depth (capped 15) in the four bits above it; exciteEmit
+// consumes the mark the SAME tick — either converting the cell to particles or
+// (budget refusal) clearing the bits and leaving the water settled. The bits
+// are excluded from the world hash and stripped on save, and no other kernel
+// runs between the two passes, so they can never leak.
+const EXCITE_PEND_BIT   : u32 = 0x80000u;       // bit 19
+const EXCITE_DEPTH_SHIFT : u32 = 20u;           // bits 20..23
+const EXCITE_SCRATCH_BITS : u32 = 0xF80000u;    // bits 19..23
 
 // Must match ExplosionOp in world.h (32 bytes).
 struct ExplosionOp {
@@ -891,6 +970,10 @@ fn packOccStain(total : u32, blockers : u32, anyStain : bool) -> u32 {
 // (kPersistMask in stream.cpp strips 16..23), so anything put there is
 // per-tick scratch unless BOTH of those are changed to cover it. Whatever
 // claims them must also say so here — this comment is the allocation table.
+// CURRENT CLAIM: the MPM excite converter (sim_fluid_seam.wgsl) uses bit 19
+// as its candidate mark and 20..23 as the hydrostatic depth, set by
+// exciteDetect and consumed by exciteEmit within the same command buffer —
+// see EXCITE_PEND_BIT below the FluidParticle block.
 fn voxMat(w : u32) -> u32 { return w & 0xFFFu; }
 fn voxState(w : u32) -> u32 { return (w >> 12u) & 0xFu; }
 fn voxStamp(w : u32) -> u32 { return (w >> STAMP_SHIFT) & STAMP_MASK; }

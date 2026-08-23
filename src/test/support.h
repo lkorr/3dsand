@@ -55,7 +55,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
 // Encode + submit one sim tick. `particlesActive` must be derived only from
 // tick-deterministic inputs (explosion history + a settled particle count),
 // never from frame timing — see DESIGN.md §2/§4.
-// fluidBase is the MLS-MPM particle count BEFORE this tick's fluidSpawns —
+// fluidLive is the caller's CONSERVATIVE MLS-MPM live estimate (the GPU owns
+// the real count via the seam; snapshot count + spawns since) —
 // CPU-owned (docs/PLAN_mpm_fluids.md prototype; world.h fluid block). The
 // caller owns the running count and must add fluidSpawns.size() to it after
 // this returns. Both default to nothing, which records zero fluid work.
@@ -67,7 +68,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ParticleSpawn>& spawns = {},
                 uint32_t farCount = 0,
                 const std::vector<FluidSpawnOp>& fluidSpawns = {},
-                uint32_t fluidBase = 0,
+                uint32_t fluidLive = 0,
                 // Material id each MPM species splashes micro droplets as
                 // (TickParams.fluidSplashMat). Null = no splash coupling.
                 const uint32_t* fluidSplashMat = nullptr);

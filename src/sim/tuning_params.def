@@ -400,6 +400,18 @@ TP_F(sim, fluidFoamDrag, TUNE_FLUID_FOAM_DRAG, 0.72f)
 TP_F(sim, fluidBubbleDensity, TUNE_FLUID_BUBBLE_RHO, 1.05f)
 TP_F(sim, fluidSprayDensity, TUNE_FLUID_SPRAY_RHO, 0.42f)
 TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
+// ---- MLS-MPM settle / excite seam ----
+// The CA <-> particle handover. Units: settle/wake speeds vox/s, settle
+// window in ticks, stain rate chances/s. exciteMode is a switch: 0 = the CA
+// owns disturbed settled liquid (Phase-2 default, keeps the pinned world
+// hash), 1 = settled liquid with air below converts to MPM particles.
+// wakeSpeed defaults to 4x settleEps — that gap is the hysteresis that stops
+// blocks flickering between the two states.
+TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 0)
+TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 0.9f)
+TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 3.6f)
+TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 45)
+TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)

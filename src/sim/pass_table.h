@@ -79,16 +79,25 @@ enum class Buf : uint8_t {
   // checker to prevent.
   PageTable,
   PageFaults,
-  // ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl) ----
-  // None of these is read by any CA kernel or covered by the world hash;
-  // FluidDispatchArgs is indirect-only and never bound (dispatchArgs note).
-  FluidParticles,
+  // ---- MLS-MPM fluid (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl + seam) ----
+  // The particle pair is SYMBOLIC like ParticlesRead/Write: page_ resolves
+  // which concrete buffer each names. FluidParticlesWrite is the tick's
+  // working buffer (compaction target, solver state, render source);
+  // FluidParticlesRead is last tick's, read only by the compaction.
+  // FluidDispatchArgs / FluidPDispatchArgs are indirect-only, never bound.
+  FluidParticlesRead,
+  FluidParticlesWrite,
   FluidSpawnOps,
   FluidBlockMap,
   FluidBlockList,
   FluidGrid,
   FluidArgsStage,
   FluidDispatchArgs,
+  FluidPDispatchArgs,
+  FluidExciteScratch,
+  FluidCalm,
+  FluidSettleScratch,
+  FluidCompactScratch,
   kCount,
 };
 
@@ -123,13 +132,18 @@ enum class Pipe : uint8_t {
   Pick,
   ExplodeMark, ExplodeApply,
   PArgs1, PSpawn, PIntegrate, PArgs2, PResolve,
-  // MLS-MPM fluid prototype. Inserted BEFORE FarDown deliberately: the
+  // MLS-MPM fluid. Inserted BEFORE FarDown deliberately: the
   // pipeline-copy loop in Simulation::RecordTable is bounded by
   // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
   // new pipeline is silently never handed to the recorder (a skipped row, not
   // a crash).
   FluidSpawn, FluidMark, FluidAlloc, FluidClear, FluidP2G, FluidP2G2,
   FluidGridUp, FluidG2P,
+  // The excite/settle seam (sim_fluid_seam.wgsl).
+  FluidCompactCount, FluidCompactScan, FluidCompactScatter,
+  FluidExciteDetect, FluidExciteScan, FluidExciteEmit,
+  FluidPTick, FluidSettleJudge, FluidSettleScan, FluidSettleBin,
+  FluidSettleCheck, FluidSettleCommit, FluidSettleKill,
   // Materializes a JITTER page (world.h's JITTER block): the one fill a
   // vkCmdFillBuffer cannot do, because the words vary per cell.
   PageFill,
@@ -137,7 +151,8 @@ enum class Pipe : uint8_t {
 };
 
 // Bind-group set. GRP_SIM also carries the dynamic passUBO offset.
-enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar, SlimFluid };
+enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar, SlimFluid,
+                              SlimFluidSeam };
 
 // Dynamic passUBO offset selector.
 //   None  no dynamic offset (the row's groups have none)
@@ -203,7 +218,7 @@ enum class Cond : uint8_t {
 // (grid WAW against the next clear, particle RAW into the next mark) are
 // generated exactly like intra-table ones.
 enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill,
-                             Fluid, PageFill };
+                             Fluid, FluidSeam, FluidSettle, PageFill };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put
@@ -222,10 +237,12 @@ enum class DispatchSel : uint32_t {
   FarCount,   // EncodeFarFill count
   IndDispatchArgs,   // indirect: world.dispatchArgs @ 0
   IndPDispatchArgs,  // indirect: world.pDispatchArgs @ 0
-  // ---- MLS-MPM fluid prototype ----
-  FluidP,            // (fluidCount + 63)/64 — fluidCount = base + spawns
+  // ---- MLS-MPM fluid ----
   FluidSpawnSel,     // (fluidSpawnCount + 63)/64
   IndFluidArgs,      // indirect: world.fluidDispatchArgs @ 0
+  IndFluidPArgs,     // indirect: world.fluidPDispatchArgs @ 0 — the seam's
+                     // per-particle passes and its list-shaped dispatches
+                     // (the seam re-copies the buffer between uses)
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

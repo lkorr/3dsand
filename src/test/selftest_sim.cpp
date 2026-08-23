@@ -709,6 +709,17 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
   // pond gates — each run re-worldgens, so these are stable).
   const int px = 96, py = 120, pz = 96, R = 8, H = 8;
 
+  // The particle's settled identity: what the settle converter writes back as
+  // voxels. A zero mat is a DEAD particle to the seam's compaction, so this
+  // is load-bearing, not cosmetic.
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) {
+    detail = "no 'water' material";
+    return Status::Fail;
+  }
+
   // The spawn block: 4^3 cells x 8 particles on the half-cell lattice with a
   // hash jitter — a pure function of the index, so both runs see identical
   // ops (the twice-run comparison's precondition, like SelftestOps).
@@ -727,6 +738,7 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
                     (int32_t)((h >> 13) % 8192u) - 4096;
             op.pz = ((pz + cz) << 16) + ((s & 4) ? 49152 : 16384) +
                     (int32_t)((h >> 19) % 8192u) - 4096;
+            op.mat = waterId;
             fs.push_back(op);
           }
     return fs;
@@ -734,8 +746,10 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
 
   uint64_t partHash[2] = {0, 0};
   uint32_t worldHash[2] = {0, 0};
-  uint32_t count = 0;
-  std::vector<uint32_t> last;  // run-2 particle words, for the sanity sweep
+  uint32_t spawned = 0;
+  uint32_t live = 0;
+  std::vector<uint32_t> last;  // run-2 live particle words, for the sanity sweep
+  uint32_t settledEighths = 0;
   for (int run = 0; run < 2; run++) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
@@ -766,12 +780,23 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
       ctx.WaitIdle();
       ctx.ProcessEvents();
     }
-    count = fluidN;
+    spawned = fluidN;
 
-    // 18 words per particle — the FluidParticle stride in common.wgsl.
-    std::vector<uint32_t> buf((size_t)count * 18);
-    if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidParticles, 0,
-                               buf.data(), buf.size() * 4, "fluidDet")) {
+    // The live count is GPU-owned now (the seam's compaction — settle may
+    // have converted some or all of the pool back to voxels inside the run).
+    uint32_t fa[16] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                          64, "fluidDetArgs");
+    live = std::min(fa[7], kFluidCap);
+
+    // Hash the LIVE particles only (kFluidParticleWords stride): slots past
+    // the live count are compaction leftovers — deterministic garbage within
+    // a run but stale across runs, so they must not enter the hash.
+    std::vector<uint32_t> buf((size_t)live * kFluidParticleWords);
+    if (live > 0 &&
+        !rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                               world.fluidParticles[sim.Page()], 0, buf.data(),
+                               buf.size() * 4, "fluidDet")) {
       detail = "fluid particle readback failed";
       std::printf("fluid det: FAIL (readback failed)\n");
       return Status::Fail;
@@ -781,18 +806,44 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
       h ^= w;
       h *= 1099511628211ull;
     }
-    partHash[run] = h;
+    partHash[run] = h ^ ((uint64_t)live << 32);
     worldHash[run] = HashWorldNow(ctx, world, sim, kDefaultSeed);
     if (run == 1) last.swap(buf);
+
+    // Settled water in the basin: mass that left the particle pool through
+    // the settle converter. Counted in eighths from the voxel words — the
+    // seam's whole claim is that this plus the live pool equals the spawn.
+    if (run == 1) {
+      settledEighths = 0;
+      std::vector<uint32_t> cbuf((size_t)kChunkVol);
+      for (int cy = (py - 2) / 16; cy <= (py + H + 8) / 16; cy++)
+        for (int cz2 = (pz - R - 2) / 16; cz2 <= (pz + R + 2) / 16; cz2++)
+          for (int cx2 = (px - R - 2) / 16; cx2 <= (px + R + 2) / 16; cx2++) {
+            uint32_t slot =
+                World::SlotChunkIndex({cx2, cy, cz2});
+            ReadVoxelsSync(ctx, world, slot, 1, cbuf.data(), "fluidDetVox");
+            for (uint32_t i = 0; i < kChunkVol; i++) {
+              int lx = (int)(i % 16) + cx2 * 16, ly = (int)((i / 16) % 16) + cy * 16,
+                  lz = (int)(i / 256) + cz2 * 16;
+              if (lx < px - R || lx > px + R || lz < pz - R || lz > pz + R ||
+                  ly < py || ly > py + H)
+                continue;
+              uint32_t w = cbuf[i];
+              if ((w & 0xFFFu) == waterId)
+                settledEighths += ((w >> 12) & 0xFu) + 1u;
+            }
+          }
+    }
   }
 
-  // Physical sanity on the final state: the basin held (positions inside the
-  // walls, nothing tunneled through the floor), and every particle respects
-  // the solver's own clamps. Bounds are deliberately slack — this is "the
-  // solver did not explode", not a look test.
+  // Physical sanity on the final live pool: the basin held (positions inside
+  // the walls, nothing tunneled through the floor), and every particle
+  // respects the solver's own clamps. Bounds are deliberately slack — this is
+  // "the solver did not explode", not a look test.
   uint32_t escaped = 0, badV = 0, badJ = 0;
-  for (uint32_t i = 0; i < count; i++) {
-    const int32_t* p = (const int32_t*)&last[(size_t)i * 18];
+  uint32_t liveEighths = 0;
+  for (uint32_t i = 0; i < live; i++) {
+    const int32_t* p = (const int32_t*)&last[(size_t)i * kFluidParticleWords];
     int x = p[0] >> 16, y = p[1] >> 16, z = p[2] >> 16;
     if (x < px - R - 2 || x > px + R + 2 || y < py - 2 || y > py + H + 8 ||
         z < pz - R - 2 || z > pz + R + 2)
@@ -800,21 +851,29 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
     for (int a = 3; a < 6; a++)
       if (p[a] < -200000 || p[a] > 200000) { badV++; break; }
     if (p[15] < 30000 || p[15] > 100000) badJ++;
+    liveEighths += ((uint32_t)p[18] >> 12) & 0x7u;  // attr fullness
   }
 
   bool det = partHash[0] == partHash[1];
   bool worldOk = worldHash[0] == worldHash[1];
-  bool sane = count > 0 && escaped == 0 && badV == 0 && badJ == 0;
-  bool ok = det && worldOk && sane;
+  // Mass conservation across the seam: every spawned particle is either still
+  // live (its fullness eighths) or settled into basin voxels. Exact integer
+  // accounting — the seam's core claim.
+  bool massOk = liveEighths + settledEighths == spawned;
+  bool sane = spawned > 0 && escaped == 0 && badV == 0 && badJ == 0;
+  bool ok = det && worldOk && sane && massOk;
   std::printf(
-      "fluid det: %s (%u particles, %d ticks: particle hash %016llx %s, "
-      "world hash %s, %u escaped, %u bad vel, %u bad J)\n",
-      ok ? "PASS" : "FAIL", count, kTicks, (unsigned long long)partHash[0],
-      det ? "matches" : "DIVERGED", worldOk ? "matches" : "DIVERGED", escaped,
-      badV, badJ);
-  detail = Format("%u particles, hash %016llx, det %s, world %s", count,
+      "fluid det: %s (%u spawned -> %u live + %u settled eighths, %d ticks: "
+      "particle hash %016llx %s, world hash %s, %u escaped, %u bad vel, "
+      "%u bad J)\n",
+      ok ? "PASS" : "FAIL", spawned, live, settledEighths, kTicks,
+      (unsigned long long)partHash[0], det ? "matches" : "DIVERGED",
+      worldOk ? "matches" : "DIVERGED", escaped, badV, badJ);
+  detail = Format("%u spawned, %u live, %u settled, hash %016llx, det %s, "
+                  "world %s, mass %s",
+                  spawned, live, settledEighths,
                   (unsigned long long)partHash[0], det ? "ok" : "DIVERGED",
-                  worldOk ? "ok" : "DIVERGED");
+                  worldOk ? "ok" : "DIVERGED", massOk ? "ok" : "LOST");
   return ok ? Status::Pass : Status::Fail;
 }
 

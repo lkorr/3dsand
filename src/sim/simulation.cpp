@@ -6,6 +6,7 @@
 
 #include "gpu/resources.h"
 #include "sim/pagetable.h"
+#include "sim/tuning.h"      // fluidExciteMode gates the seam recording
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
@@ -173,6 +174,24 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(7, T::Storage),          // counts (atomic)
     };
     fluidBGL_ = device.CreateBindGroupLayout(fentries, std::size(fentries));
+
+    // group 1: the excite/settle seam (sim_fluid_seam.wgsl). Pairs with the
+    // slim group 0 (which carries voxels RW, dirtyOut, materials, TickUBO,
+    // pageTable, pageFaults — everything the converters' voxel writes need).
+    rhi::BindGroupLayoutEntry sfentries[] = {
+        entry(0, T::ReadOnlyStorage),  // fluidParticles[page] (compact src)
+        entry(1, T::Storage),          // fluidParticles[1-page] (working)
+        entry(2, T::ReadOnlyStorage),  // fluidSpawnOps
+        entry(3, T::ReadOnlyStorage),  // fluidBlockMap (last substep's)
+        entry(4, T::ReadOnlyStorage),  // fluidGrid (last substep's)
+        entry(5, T::Storage),          // fluidArgsStage (FA_* words, atomic)
+        entry(6, T::Storage),          // dirtyList (read; shared entry is RW)
+        entry(7, T::Storage),          // fluidExciteScratch
+        entry(8, T::Storage),          // fluidCalm
+        entry(9, T::Storage),          // fluidSettleScratch
+        entry(10, T::Storage),         // fluidCompactScratch
+    };
+    fluidSeamBGL_ = device.CreateBindGroupLayout(sfentries, std::size(sfentries));
   }
   {
     auto entry = [](uint32_t binding, rhi::BufferBindingType type,
@@ -288,6 +307,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
 
     rhi::BindGroupLayout fluidGroups[] = {simSlimBGL_, fluidBGL_};
     fluidPL_ = device.CreatePipelineLayout(fluidGroups, 2);
+
+    rhi::BindGroupLayout fluidSeamGroups[] = {simSlimBGL_, fluidSeamBGL_};
+    fluidSeamPL_ = device.CreatePipelineLayout(fluidSeamGroups, 2);
   }
 
   // ---- bind groups ----
@@ -354,7 +376,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(2, world_->bodyInstances),
         b(3, world_->bodyXforms),
         b(4, world_->debugBoxes),
-        b(5, world_->fluidParticles),
+        // The fluid pair pages exactly like the ballistic particles: after
+        // FlipPage, fluidParticles[Page()] is the buffer the tick just wrote.
+        b(5, world_->fluidParticles[page]),
     };
     renderPartBG_[page] = device.CreateBindGroup(renderPartBGL_, rpentries,
                                                  std::size(rpentries), "renderPartBG");
@@ -398,7 +422,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   }
   for (int page = 0; page < 2; page++) {
     rhi::BindGroupEntry entries[] = {
-        b(0, world_->fluidParticles),
+        // The tick's WORKING buffer (the seam's compaction destination; the
+        // renderer's source after the flip) — fluidParticles[1 - page_].
+        b(0, world_->fluidParticles[1 - page]),
         b(1, world_->fluidSpawnOps),
         b(2, world_->fluidBlockMap),
         b(3, world_->fluidBlockList),
@@ -412,6 +438,22 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     };
     fluidBG_[page] =
         device.CreateBindGroup(fluidBGL_, entries, std::size(entries), "fluidBG");
+
+    rhi::BindGroupEntry sentries[] = {
+        b(0, world_->fluidParticles[page]),      // compact source (last tick)
+        b(1, world_->fluidParticles[1 - page]),  // working buffer
+        b(2, world_->fluidSpawnOps),
+        b(3, world_->fluidBlockMap),
+        b(4, world_->fluidGrid),
+        b(5, world_->fluidArgsStage),
+        b(6, world_->dirtyList),
+        b(7, world_->fluidExciteScratch),
+        b(8, world_->fluidCalm),
+        b(9, world_->fluidSettleScratch),
+        b(10, world_->fluidCompactScratch),
+    };
+    fluidSeamBG_[page] = device.CreateBindGroup(fluidSeamBGL_, sentries,
+                                                std::size(sentries), "fluidSeamBG");
   }
 
   std::string err;
@@ -533,13 +575,14 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mExplode = mod("sim_explode.wgsl");
   rhi::ShaderModule mParticle = mod("sim_particle.wgsl");
   rhi::ShaderModule mFluid = mod("sim_fluid.wgsl");
+  rhi::ShaderModule mFluidSeam = mod("sim_fluid_seam.wgsl");
   rhi::ShaderModule mRay = mod("raymarch.wgsl");
   rhi::ShaderModule mDebris = mod("debris.wgsl");
   rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
   rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
-      !mExplode || !mParticle || !mFluid || !mRay || !mDebris || !mMicroBody ||
-      !mDebugLines) {
+      !mExplode || !mParticle || !mFluid || !mFluidSeam || !mRay || !mDebris ||
+      !mMicroBody || !mDebugLines) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -568,7 +611,6 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2");
   pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve");
 
-  fluidSpawn_ = MakeComputePipeline(device, fluidPL_, mFluid, "spawn", "fluidSpawn");
   fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark");
   fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc");
   fluidClear_ = MakeComputePipeline(device, fluidPL_, mFluid, "clearGrid", "fluidClear");
@@ -576,6 +618,23 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidP2g2_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g2", "fluidP2g2");
   fluidGridUp_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridUpdate", "fluidGridUp");
   fluidG2p_ = MakeComputePipeline(device, fluidPL_, mFluid, "g2p", "fluidG2p");
+
+  // The excite/settle seam (sim_fluid_seam.wgsl; fluidSpawn_ moved here —
+  // appends go through the seam's GPU-owned count now).
+  fluidSpawn_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "spawnAppend", "seamSpawn");
+  fluidCompactCount_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactCount", "seamCompactCount");
+  fluidCompactScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactScan", "seamCompactScan");
+  fluidCompactScatter_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactScatter", "seamCompactScatter");
+  fluidExciteDetect_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteDetect", "seamExciteDetect");
+  fluidExciteScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteScan", "seamExciteScan");
+  fluidExciteEmit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteEmit", "seamExciteEmit");
+  fluidPTick_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "particleTick", "seamParticleTick");
+  fluidSettleJudge_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleJudge", "seamSettleJudge");
+  fluidSettleScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleScan", "seamSettleScan");
+  fluidSettleBin_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleBin", "seamSettleBin");
+  fluidSettleCheck_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCheck", "seamSettleCheck");
+  fluidSettleCommit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCommit", "seamSettleCommit");
+  fluidSettleKill_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleKill", "seamSettleKill");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -587,7 +646,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
-      !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_) {
+      !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
+      !fluidCompactScan_ || !fluidCompactScatter_ || !fluidExciteDetect_ ||
+      !fluidExciteScan_ || !fluidExciteEmit_ || !fluidPTick_ ||
+      !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
+      !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -709,13 +772,19 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarUBO:         return world_->farUBO;
     case B::PageTable:      return world_->pageTable;
     case B::PageFaults:     return world_->pageFaults;
-    case B::FluidParticles:    return world_->fluidParticles;
+    case B::FluidParticlesRead:  return world_->fluidParticles[page_];
+    case B::FluidParticlesWrite: return world_->fluidParticles[1 - page_];
     case B::FluidSpawnOps:     return world_->fluidSpawnOps;
     case B::FluidBlockMap:     return world_->fluidBlockMap;
     case B::FluidBlockList:    return world_->fluidBlockList;
     case B::FluidGrid:         return world_->fluidGrid;
     case B::FluidArgsStage:    return world_->fluidArgsStage;
     case B::FluidDispatchArgs: return world_->fluidDispatchArgs;
+    case B::FluidPDispatchArgs: return world_->fluidPDispatchArgs;
+    case B::FluidExciteScratch: return world_->fluidExciteScratch;
+    case B::FluidCalm:          return world_->fluidCalm;
+    case B::FluidSettleScratch: return world_->fluidSettleScratch;
+    case B::FluidCompactScratch: return world_->fluidCompactScratch;
     default:                return world_->voxels;
   }
 }
@@ -751,6 +820,19 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidP2G2:      return fluidP2g2_;
     case P::FluidGridUp:    return fluidGridUp_;
     case P::FluidG2P:       return fluidG2p_;
+    case P::FluidCompactCount:   return fluidCompactCount_;
+    case P::FluidCompactScan:    return fluidCompactScan_;
+    case P::FluidCompactScatter: return fluidCompactScatter_;
+    case P::FluidExciteDetect:   return fluidExciteDetect_;
+    case P::FluidExciteScan:     return fluidExciteScan_;
+    case P::FluidExciteEmit:     return fluidExciteEmit_;
+    case P::FluidPTick:          return fluidPTick_;
+    case P::FluidSettleJudge:    return fluidSettleJudge_;
+    case P::FluidSettleScan:     return fluidSettleScan_;
+    case P::FluidSettleBin:      return fluidSettleBin_;
+    case P::FluidSettleCheck:    return fluidSettleCheck_;
+    case P::FluidSettleCommit:   return fluidSettleCommit_;
+    case P::FluidSettleKill:     return fluidSettleKill_;
     default:                return step_;
   }
 }
@@ -798,11 +880,13 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.slimPartLayout = simPL2_;
   tb.slimFarLayout = farPL_;
   tb.slimFluidLayout = fluidPL_;
+  tb.slimFluidSeamLayout = fluidSeamPL_;
   tb.simSet = simBG_[page_];
   tb.slimSet = simSlimBG_[page_];
   tb.particleSet = particleBG_[page_];
   tb.farSet = farBG_;
   tb.fluidSet = fluidBG_[page_];
+  tb.fluidSeamSet = fluidSeamBG_[page_];
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
@@ -1001,15 +1085,24 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
 
   RecordTable(enc, pass::Table::Tick, &cx);
 
-  // MLS-MPM fluid prototype: the substep table, kFluidSubsteps times, into
-  // the SAME command buffer (FarFill precedent). The recorder's last-access
-  // tracker persists across RecordTable calls, so inter-substep barriers are
-  // generated exactly like intra-table ones. A world with no fluid particles
-  // records nothing here at all (rule 2), and whether it records is a pure
-  // function of the CPU-owned count — never of frame timing.
-  if (fluidCount > 0) {
+  // MLS-MPM fluid: seam front half (compaction, spawns, excite), the substep
+  // table kFluidSubsteps times, then the seam back half (settle) — all into
+  // the SAME command buffer (FarFill precedent), so the recorder's persistent
+  // last-access tracker generates every inter-table barrier. Recorded while
+  // the seam is LIVE: particles may exist (the CPU's conservative estimate),
+  // spawns arrive this tick, or the disturbance-excite mode is on with an
+  // active CA (excite can birth particles into an empty pool — and once it
+  // does, the emitted dirt keeps caActive true until the readback catches
+  // up, so this predicate can never strand live particles unsimulated).
+  // Every input here is tick-deterministic — never frame timing (rule 1).
+  const bool exciteOn = CurrentTuning().sim.fluidExciteMode != 0;
+  const bool seamActive =
+      fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);
+  if (seamActive) {
+    RecordTable(enc, pass::Table::FluidSeam, &cx);
     for (uint32_t s = 0; s < kFluidSubsteps; s++)
       RecordTable(enc, pass::Table::Fluid, &cx);
+    RecordTable(enc, pass::Table::FluidSettle, &cx);
   }
 
   // Measurement only: no-op unless --measure attached a PassTimer.

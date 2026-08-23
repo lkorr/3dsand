@@ -156,6 +156,17 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 fn vsFluid(@builtin(vertex_index) vi : u32,
            @builtin(instance_index) inst : u32) -> VSOut {
   let p = fluid[inst];
+  // The CPU draw count is a CONSERVATIVE estimate (the seam owns the real
+  // population and the snapshot is a tick or three behind), so slots past the
+  // live range hold compaction leftovers. Their attr is dead (or the slot is
+  // stale garbage from a prior tick) — collapse the cube to nothing rather
+  // than draw a ghost.
+  if (!fpAlive(p.attr)) {
+    var dead : VSOut;
+    dead.pos = vec4f(0.0, 0.0, -2.0, 1.0);  // clipped: behind the near plane
+    dead.color = vec3f(0.0);
+    return dead;
+  }
   var n : vec3f;
   var off = cubeOffset(vi, &n) * TUNE_FLUID_PARTICLE_SIZE;
   let center = vec3f(f32(p.px), f32(p.py), f32(p.pz)) / 65536.0;

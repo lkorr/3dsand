@@ -113,6 +113,20 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_P2G2": "fluidP2g2_",
     "PIPE_FLUID_GRIDUP": "fluidGridUp_",
     "PIPE_FLUID_G2P": "fluidG2p_",
+    # The excite/settle seam (sim_fluid_seam.wgsl).
+    "PIPE_FLUID_COMPACT_COUNT": "fluidCompactCount_",
+    "PIPE_FLUID_COMPACT_SCAN": "fluidCompactScan_",
+    "PIPE_FLUID_COMPACT_SCATTER": "fluidCompactScatter_",
+    "PIPE_FLUID_EXCITE_DETECT": "fluidExciteDetect_",
+    "PIPE_FLUID_EXCITE_SCAN": "fluidExciteScan_",
+    "PIPE_FLUID_EXCITE_EMIT": "fluidExciteEmit_",
+    "PIPE_FLUID_PTICK": "fluidPTick_",
+    "PIPE_FLUID_SETTLE_JUDGE": "fluidSettleJudge_",
+    "PIPE_FLUID_SETTLE_SCAN": "fluidSettleScan_",
+    "PIPE_FLUID_SETTLE_BIN": "fluidSettleBin_",
+    "PIPE_FLUID_SETTLE_CHECK": "fluidSettleCheck_",
+    "PIPE_FLUID_SETTLE_COMMIT": "fluidSettleCommit_",
+    "PIPE_FLUID_SETTLE_KILL": "fluidSettleKill_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -154,13 +168,21 @@ BUF_TO_WGSL = {
     "FarUBO": {"F"},
     "PageTable": {"pageTable"},
     "PageFaults": {"pageFaults"},
-    # MLS-MPM fluid prototype (sim_fluid.wgsl).
-    "FluidParticles": {"fluidParticles", "fluid"},
+    # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
+    # is symbolic: the solver and every seam pass except the compaction source
+    # bind the WRITE (working) buffer as `fluidParticles`; the seam's
+    # compaction binds the READ page as `fluidSrc`.
+    "FluidParticlesRead": {"fluidSrc"},
+    "FluidParticlesWrite": {"fluidParticles", "fluid"},
     "FluidSpawnOps": {"fluidSpawnOps"},
-    "FluidBlockMap": {"fluidBlockMap"},
+    "FluidBlockMap": {"fluidBlockMap", "fluidBlockMapR"},
     "FluidBlockList": {"fluidBlockList"},
-    "FluidGrid": {"fluidGrid"},
+    "FluidGrid": {"fluidGrid", "fluidGridR"},
     "FluidArgsStage": {"fluidArgs"},
+    "FluidExciteScratch": {"exciteScratch"},
+    "FluidCalm": {"fluidCalm"},
+    "FluidSettleScratch": {"settleScratch"},
+    "FluidCompactScratch": {"compactScratch"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -168,6 +190,7 @@ BUF_TO_WGSL = {
     "PDispatchArgs": set(),
     "DrawArgs": set(),
     "FluidDispatchArgs": set(),
+    "FluidPDispatchArgs": set(),
 }
 
 READ_ACCS = {"R", "U", "I", "TR"}
@@ -201,12 +224,17 @@ _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
                  "fluidBlockList", "fluidGrid", "fluidArgs",
                  # splash coupling: particle write page + counts (bindings 6/7)
                  "pWrite", "counts"}
+_FLUID_SEAM_GROUP1 = {"fluidSrc", "fluidParticles", "fluidSpawnOps",
+                      "fluidBlockMapR", "fluidGridR", "fluidArgs", "dirtyList",
+                      "exciteScratch", "fluidCalm", "settleScratch",
+                      "compactScratch"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,
     "simPL2_": _SLIM_GROUP0 | _PARTICLE_GROUP1,
     "farPL_": _SLIM_GROUP0 | _FAR_GROUP1,
     "fluidPL_": _SLIM_GROUP0 | _FLUID_GROUP1,
+    "fluidSeamPL_": _SLIM_GROUP0 | _FLUID_SEAM_GROUP1,
 }
 
 

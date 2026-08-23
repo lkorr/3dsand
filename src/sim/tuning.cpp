@@ -737,6 +737,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidBubbleDensity", s.fluidBubbleDensity, out, at);
     ReadF(*g, "fluidSprayDensity", s.fluidSprayDensity, out, at);
     ReadI(*g, "fluidFoamScaleIdx", s.fluidFoamScaleIdx, out, at);
+    ReadI(*g, "fluidExciteMode", s.fluidExciteMode, out, at);
+    ReadF(*g, "fluidSettleEps", s.fluidSettleEps, out, at);
+    ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
+    ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
+    ReadF(*g, "fluidStainRate", s.fluidStainRate, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -812,6 +817,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("sim.fluidFoamScaleIdx out of 0..3; clamped");
       s.fluidFoamScaleIdx = s.fluidFoamScaleIdx < 0 ? 0 : 3;
     }
+    // Settle/excite seam. Floats through the same clampWarnF discipline; the
+    // int windows are open-coded like fluidEosPower. The settleTicks floor of
+    // 8 is a HARD requirement — it covers the CPU-side page-materialization
+    // readback latency (see tuning.h), so it clamps rather than warns-only.
+    if (s.fluidExciteMode < 0 || s.fluidExciteMode > 1) {
+      out.warnings.push_back("sim.fluidExciteMode out of 0..1; clamped");
+      s.fluidExciteMode = s.fluidExciteMode < 0 ? 0 : 1;
+    }
+    clampWarnF(s.fluidSettleEps, 0.05f, 20.0f, "fluidSettleEps");
+    clampWarnF(s.fluidWakeSpeed, 0.1f, 50.0f, "fluidWakeSpeed");
+    if (s.fluidSettleTicks < 8 || s.fluidSettleTicks > 600) {
+      out.warnings.push_back("sim.fluidSettleTicks out of 8..600; clamped");
+      s.fluidSettleTicks = s.fluidSettleTicks < 8 ? 8 : 600;
+    }
+    clampWarnF(s.fluidStainRate, 0.0f, 30.0f, "fluidStainRate");
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.
