@@ -94,6 +94,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::GenCount:  return cx.genCount > 0;
     case pass::Cond::DenseWorldgen: return cx.denseWorldgen;
     case pass::Cond::FarCount:  return cx.farCount > 0;
+    case pass::Cond::FluidSpawn: return cx.fluidSpawnCount > 0;
   }
   return false;
 }
@@ -110,6 +111,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::Chunks64: return kNumChunks / 64;
     case pass::DispatchSel::GenCount: return cx.genCount;
     case pass::DispatchSel::FarCount: return cx.farCount;
+    case pass::DispatchSel::FluidP:   return (cx.fluidCount + 63) / 64;
+    case pass::DispatchSel::FluidSpawnSel: return (cx.fluidSpawnCount + 63) / 64;
     default:                          return v;
   }
 }
@@ -463,6 +466,12 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         sets[1] = bind_.farSet;
         setCount = 2;
         break;
+      case pass::Groups::SlimFluid:
+        layout = bind_.slimFluidLayout;
+        sets[0] = bind_.slimSet;
+        sets[1] = bind_.fluidSet;
+        setCount = 2;
+        break;
       default:
         break;
     }
@@ -496,10 +505,18 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
                               sets, dynCount, dynCount ? &dynOff : nullptr);
 
       if (r.kind == pass::Kind::ComputeIndirect) {
-        Buffer* args =
-            (pass::DispatchSel)r.x == pass::DispatchSel::IndPDispatchArgs
-                ? bind_.buffers[(int)pass::Buf::PDispatchArgs]
-                : bind_.buffers[(int)pass::Buf::DispatchArgs];
+        Buffer* args;
+        switch ((pass::DispatchSel)r.x) {
+          case pass::DispatchSel::IndPDispatchArgs:
+            args = bind_.buffers[(int)pass::Buf::PDispatchArgs];
+            break;
+          case pass::DispatchSel::IndFluidArgs:
+            args = bind_.buffers[(int)pass::Buf::FluidDispatchArgs];
+            break;
+          default:
+            args = bind_.buffers[(int)pass::Buf::DispatchArgs];
+            break;
+        }
         if (args && args->buf) f.CmdDispatchIndirect(cmd_, args->buf, 0);
       } else {
         uint32_t x = Extent(r.x, cx), y = Extent(r.y, cx), z = Extent(r.z, cx);

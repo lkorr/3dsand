@@ -149,6 +149,19 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
     };
     particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
+
+    // group 1: MLS-MPM fluid prototype (sim_fluid.wgsl). Same slim-group-0
+    // pairing as the particle pipelines. fluidDispatchArgs is deliberately
+    // absent — Indirect buffers are never bound (world.h dispatchArgs note).
+    rhi::BindGroupLayoutEntry fentries[] = {
+        entry(0, T::Storage),          // fluidParticles
+        entry(1, T::ReadOnlyStorage),  // fluidSpawnOps
+        entry(2, T::Storage),          // fluidBlockMap (atomic)
+        entry(3, T::Storage),          // fluidBlockList
+        entry(4, T::Storage),          // fluidGrid (atomic accumulators)
+        entry(5, T::Storage),          // fluidArgs staging
+    };
+    fluidBGL_ = device.CreateBindGroupLayout(fentries, std::size(fentries));
   }
   {
     auto entry = [](uint32_t binding, rhi::BufferBindingType type,
@@ -200,6 +213,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // the overlay is on; the draw is skipped entirely at zero boxes, so an
         // off overlay costs nothing but this declaration.
         entry(4, T::ReadOnlyStorage, S::Vertex),  // debug wireframe boxes
+        entry(5, T::ReadOnlyStorage, S::Vertex),  // MLS-MPM fluid particles
     };
     renderPartBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
 
@@ -254,6 +268,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
 
     rhi::BindGroupLayout farGroups[] = {simSlimBGL_, farBGL_};
     farPL_ = device.CreatePipelineLayout(farGroups, 2);
+
+    rhi::BindGroupLayout fluidGroups[] = {simSlimBGL_, fluidBGL_};
+    fluidPL_ = device.CreatePipelineLayout(fluidGroups, 2);
   }
 
   // ---- bind groups ----
@@ -319,6 +336,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(2, world_->bodyInstances),
         b(3, world_->bodyXforms),
         b(4, world_->debugBoxes),
+        b(5, world_->fluidParticles),
     };
     renderPartBG_[page] = device.CreateBindGroup(renderPartBGL_, rpentries,
                                                  std::size(rpentries), "renderPartBG");
@@ -357,6 +375,17 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(4, world_->dirtyList),
     };
     farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
+  }
+  {
+    rhi::BindGroupEntry entries[] = {
+        b(0, world_->fluidParticles),
+        b(1, world_->fluidSpawnOps),
+        b(2, world_->fluidBlockMap),
+        b(3, world_->fluidBlockList),
+        b(4, world_->fluidGrid),
+        b(5, world_->fluidArgsStage),
+    };
+    fluidBG_ = device.CreateBindGroup(fluidBGL_, entries, std::size(entries), "fluidBG");
   }
 
   std::string err;
@@ -477,12 +506,13 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mPick = mod("sim_pick.wgsl");
   rhi::ShaderModule mExplode = mod("sim_explode.wgsl");
   rhi::ShaderModule mParticle = mod("sim_particle.wgsl");
+  rhi::ShaderModule mFluid = mod("sim_fluid.wgsl");
   rhi::ShaderModule mRay = mod("raymarch.wgsl");
   rhi::ShaderModule mDebris = mod("debris.wgsl");
   rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
   rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
-      !mExplode || !mParticle || !mRay || !mDebris || !mMicroBody ||
+      !mExplode || !mParticle || !mFluid || !mRay || !mDebris || !mMicroBody ||
       !mDebugLines) {
     if (err) *err = "shader file read failure";
     return false;
@@ -509,6 +539,14 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2");
   pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve");
 
+  fluidSpawn_ = MakeComputePipeline(device, fluidPL_, mFluid, "spawn", "fluidSpawn");
+  fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark");
+  fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc");
+  fluidClear_ = MakeComputePipeline(device, fluidPL_, mFluid, "clearGrid", "fluidClear");
+  fluidP2g_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g", "fluidP2g");
+  fluidGridUp_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridUpdate", "fluidGridUp");
+  fluidG2p_ = MakeComputePipeline(device, fluidPL_, mFluid, "g2p", "fluidG2p");
+
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
   // async error scope and always returns a valid handle, so this check is free
@@ -517,7 +555,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !farFill_ || !farDown_ || !mutate_ ||
       !mutateCells_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
-      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_) {
+      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
+      !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
+      !fluidGridUp_ || !fluidG2p_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -572,6 +612,8 @@ struct RecordCtx {
   uint32_t spawnCount = 0;
   uint32_t genCount = 0;
   uint32_t farCount = 0;
+  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
+  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced
@@ -633,6 +675,13 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarUBO:         return world_->farUBO;
     case B::PageTable:      return world_->pageTable;
     case B::PageFaults:     return world_->pageFaults;
+    case B::FluidParticles:    return world_->fluidParticles;
+    case B::FluidSpawnOps:     return world_->fluidSpawnOps;
+    case B::FluidBlockMap:     return world_->fluidBlockMap;
+    case B::FluidBlockList:    return world_->fluidBlockList;
+    case B::FluidGrid:         return world_->fluidGrid;
+    case B::FluidArgsStage:    return world_->fluidArgsStage;
+    case B::FluidDispatchArgs: return world_->fluidDispatchArgs;
     default:                return world_->voxels;
   }
 }
@@ -659,6 +708,13 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::PResolve:       return pResolve_;
     case P::FarFill:        return farFill_;
     case P::FarDown:        return farDown_;
+    case P::FluidSpawn:     return fluidSpawn_;
+    case P::FluidMark:      return fluidMark_;
+    case P::FluidAlloc:     return fluidAlloc_;
+    case P::FluidClear:     return fluidClear_;
+    case P::FluidP2G:       return fluidP2g_;
+    case P::FluidGridUp:    return fluidGridUp_;
+    case P::FluidG2P:       return fluidG2p_;
     default:                return step_;
   }
 }
@@ -690,6 +746,8 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.spawnCount = cx.spawnCount;
   tc.genCount = cx.genCount;
   tc.farCount = cx.farCount;
+  tc.fluidCount = cx.fluidCount;
+  tc.fluidSpawnCount = cx.fluidSpawnCount;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -702,10 +760,12 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.simLayout = simPL_;
   tb.slimPartLayout = simPL2_;
   tb.slimFarLayout = farPL_;
+  tb.slimFluidLayout = fluidPL_;
   tb.simSet = simBG_[page_];
   tb.slimSet = simSlimBG_[page_];
   tb.particleSet = particleBG_[page_];
   tb.farSet = farBG_;
+  tb.fluidSet = fluidBG_;
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
@@ -777,15 +837,29 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
 
 void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
-                            uint32_t cellCount, uint32_t spawnCount) {
+                            uint32_t cellCount, uint32_t spawnCount,
+                            uint32_t fluidCount, uint32_t fluidSpawnCount) {
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
   cx.expCount = expCount;
   cx.spawnCount = spawnCount;
+  cx.fluidCount = fluidCount;
+  cx.fluidSpawnCount = fluidSpawnCount;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
   RecordTable(enc, pass::Table::Tick, &cx);
+
+  // MLS-MPM fluid prototype: the substep table, kFluidSubsteps times, into
+  // the SAME command buffer (FarFill precedent). The recorder's last-access
+  // tracker persists across RecordTable calls, so inter-substep barriers are
+  // generated exactly like intra-table ones. A world with no fluid particles
+  // records nothing here at all (rule 2), and whether it records is a pure
+  // function of the CPU-owned count — never of frame timing.
+  if (fluidCount > 0) {
+    for (uint32_t s = 0; s < kFluidSubsteps; s++)
+      RecordTable(enc, pass::Table::Fluid, &cx);
+  }
 
   // Measurement only: no-op unless --measure attached a PassTimer.
   EncodeTimerResolve(enc);
@@ -849,6 +923,14 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.vertexEntry = "vsBody";
     d.label = "bodyDraw";
     bodyDraw_ = device_.CreateRenderPipeline(d);
+
+    // MLS-MPM fluid prototype: same module, same layout, own entry point.
+    // Opaque cubes for now — translucency across thousands of unsorted cubes
+    // is a z-fighting mess, and the comparison the prototype exists for reads
+    // fine with solid water-coloured droplets.
+    d.vertexEntry = "vsFluid";
+    d.label = "fluidDraw";
+    fluidDraw_ = device_.CreateRenderPipeline(d);
   }
   {
     // Collision-box wireframes. Its own module (debug_lines.wgsl) but the SAME
@@ -948,6 +1030,14 @@ void Simulation::DrawParticles(const rhi::RenderPass& pass) {
 void Simulation::DrawSprites(const rhi::RenderPass& pass, uint32_t count) {
   if (count == 0) return;
   pass.SetPipeline(spriteDraw_);
+  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  pass.Draw(36, count);
+}
+
+void Simulation::DrawFluid(const rhi::RenderPass& pass, uint32_t count) {
+  if (count == 0) return;   // no fluid placed: costs nothing
+  pass.SetPipeline(fluidDraw_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(36, count);

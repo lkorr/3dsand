@@ -69,6 +69,13 @@ const PipelineSpec kComputePipelines[] = {
     {"sim_particle.wgsl", "integrate", "pIntegrate"},
     {"sim_particle.wgsl", "args2", "pArgs2"},
     {"sim_particle.wgsl", "resolve", "pResolve"},
+    {"sim_fluid.wgsl", "spawn", "fluidSpawn"},
+    {"sim_fluid.wgsl", "mark", "fluidMark"},
+    {"sim_fluid.wgsl", "alloc", "fluidAlloc"},
+    {"sim_fluid.wgsl", "clearGrid", "fluidClear"},
+    {"sim_fluid.wgsl", "p2g", "fluidP2g"},
+    {"sim_fluid.wgsl", "gridUpdate", "fluidGridUp"},
+    {"sim_fluid.wgsl", "g2p", "fluidG2p"},
 };
 
 // The render-only shaders. Phase 3a creates NO render pipelines (no swapchain,
@@ -80,6 +87,7 @@ const PipelineSpec kRenderShaders[] = {
     {"debris.wgsl", "vsParticle", "debris.vsParticle"},
     {"debris.wgsl", "vsBody", "debris.vsBody"},
     {"debris.wgsl", "vsSprite", "debris.vsSprite"},
+    {"debris.wgsl", "vsFluid", "debris.vsFluid"},
     {"debris.wgsl", "fs", "debris.fs"},
     {"microbody.wgsl", "vs", "microbody.vs"},
     {"microbody.wgsl", "fs", "microbody.fs"},

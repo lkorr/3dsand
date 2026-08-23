@@ -680,10 +680,12 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   bd.simLayout = layout(tb.simLayout);
   bd.slimPartLayout = layout(tb.slimPartLayout);
   bd.slimFarLayout = layout(tb.slimFarLayout);
+  bd.slimFluidLayout = layout(tb.slimFluidLayout);
   bd.simSet = set(tb.simSet);
   bd.slimSet = set(tb.slimSet);
   bd.particleSet = set(tb.particleSet);
   bd.farSet = set(tb.farSet);
+  bd.fluidSet = set(tb.fluidSet);
 
   e->rec->SetBindings(bd);
 
@@ -706,6 +708,8 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.spawnCount = cx.spawnCount;
   cxv.genCount = cx.genCount;
   cxv.farCount = cx.farCount;
+  cxv.fluidCount = cx.fluidCount;
+  cxv.fluidSpawnCount = cx.fluidSpawnCount;
   cxv.hashEnable = cx.hashEnable;
   cxv.particlesActive = cx.particlesActive;
   e->rec->RecordTable(which, cxv);

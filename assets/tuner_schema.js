@@ -232,6 +232,7 @@ const TUNING_SCHEMA = [
       {k:'fogOpticalDepths', n:'fog thickness', d:'Optical-depth budget: fog reaches ~99% opacity at the far-field horizon. Higher = thicker haze.', min:0.5, max:20, step:0.1},
       {k:'fogLerpPerFrame', n:'fog settle speed', d:'How fast the horizon opens up as distant terrain finishes loading.', min:0.005, max:1, step:0.005},
       {k:'sunDir', n:'sun direction (legacy)', d:'Only used as a fallback; the live sun direction comes from the day/night cycle. Left here so an old tuning.json still loads.', type:'vec3', min:-1, max:1, step:0.01},
+      {k:'fluidColor', n:'MPM fluid colour', d:'Droplet albedo of the experimental MLS-MPM liquid (the side-by-side comparison prototype). Render-only.', type:'vec3', min:0, max:1, step:0.01},
     ],
   },
 
@@ -675,6 +676,8 @@ const TUNING_SCHEMA = [
       {k:'expMicroPerMille', n:'blast grit', d:'Sub-voxel spall an explosion throws, per mille of the cells it destroys. Pure visual grit alongside the real flying voxels — it adds no matter and does not change how much is destroyed, but it IS rolled by a sim kernel, so it changes the world hash.', min:0, max:1000, step:10, int:true},
       {k:'expMicroLifeTicks', n:'blast grit life', d:'How long blast grit lives before evaporating. Shorter than blood spray so dust snaps out rather than hanging in the air. 30 ticks = 1 second.', min:1, max:255, step:1, int:true, u:'ticks'},
       {k:'expMicroScaleIdx', n:'blast grit fineness', d:'How fine the grit is: 0 = half a voxel, 1 = a third, 2 = a quarter, 3 = a sixth.', min:0, max:3, step:1, int:true},
+      {k:'fluidStiffness', n:'MPM fluid stiffness', d:'EOS stiffness of the experimental MLS-MPM liquid, in Q16.16 (65536 = 1.0). Higher resists compression harder and splashes sharper. Does not touch the world hash — the MPM fluid never writes voxels — but it does change the fluid_det gate hash.', min:0, max:3145728, step:65536, int:true},
+      {k:'fluidGravity', n:'MPM fluid gravity', d:'Fall acceleration of the MLS-MPM liquid, Q16.16 cells per tick squared. 7144 is 9.81 m/s² at 10 cm voxels and 30 Hz.', min:0, max:131072, step:64, int:true},
     ],
   },
 

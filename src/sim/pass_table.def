@@ -248,6 +248,15 @@ PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
           A(FarVox) A(FarOcc) R(PageTable)))
 
+// ---- phase 6: MLS-MPM fluid spawn (docs/PLAN_mpm_fluids.md prototype) ------
+// CPU spawn-op stream -> particles, once per tick, BEFORE the substep table
+// (PT_FLUID) that EncodeTick records kFluidSubsteps times after this table.
+// No atomics: the append base (tickUBO.fluidBase) and count are CPU-owned, so
+// slot assignment is a pure function of the op index.
+PASS(fluidSpawn, "fluidSpawn", PT_TICK, PIPE_FLUID_SPAWN, K_COMPUTE, D_FLUIDSPAWN,1,1,
+     GRP_SLIM_FLUID, DYN_NONE, C_FLUIDSPAWN, 1,
+     USES(U(TickUBO) R(FluidSpawnOps) W(FluidParticles)))
+
 // ========================================================= PT_WORLDGEN =====
 // Simulation::EncodeWorldgen. barrier_graph §2.5.1. The fills of dirty[0]/[1]
 // DO hazard against the dispatch — genChunk atomicStores both — so "no hazards
@@ -335,5 +344,65 @@ PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K
 PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarVox) A(FarOcc)))
+
+// =========================================================== PT_FLUID ======
+// ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded
+// kFluidSubsteps times per tick from EncodeTick, into the TICK's command
+// buffer, only when fluid particles exist — a world that never placed the
+// prototype fluid records none of this (rule 2). The spawn row is NOT here:
+// it runs once per tick and lives at the end of PT_TICK below.
+//
+// The recorder's last-access tracker persists across RecordTable calls within
+// one command buffer, so repeating this table generates the inter-substep
+// barriers (grid WAW into the next clear, particle RAW into the next mark)
+// exactly like intra-table ones. Determinism does not ride on any of these
+// conditions: every row is C_ALWAYS within the table, and whether the table
+// is recorded at all is a pure function of the CPU-owned particle count.
+//
+// The scratch grid is rebuilt from scratch every substep: fill zeroes the
+// chunk->block map, mark flags chunks under particle support (atomicOr — the
+// final map state is order-independent), alloc assigns block indices by a
+// single-workgroup scan in slot order (deterministic) and emits the node-pass
+// dispatch args, clear zeroes exactly the active blocks' accumulators.
+PASS(fluid_fill_blockMap, nullptr, PT_FLUID, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(FluidBlockMap)))
+// read-only in practice: `fluidParticles` is read_write for the module because
+// spawn and g2p write it. mark only reads positions to flag chunks.
+PASS(fluidMark, "fluid(substep)", PT_FLUID, PIPE_FLUID_MARK, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) R(FluidParticles) A(FluidBlockMap)))
+PASS(fluidAlloc, "fluid(substep)", PT_FLUID, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(RW(FluidBlockMap) W(FluidBlockList) W(FluidArgsStage)))
+// Same staging-copy shape as argsStage -> dispatchArgs: the indirect-only
+// buffer is never bound in any bind group.
+PASS(copy_fluidArgs, nullptr, PT_FLUID, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(FluidArgsStage) TW(FluidDispatchArgs)))
+PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
+     GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(W(FluidGrid) I(FluidDispatchArgs)))
+// P2G's scatter is the plan's §5.1 bet made real: i32 atomicAdd accumulation,
+// associative, so the sum cannot depend on scheduling. The fill->mark->alloc
+// chain above already ordered the map; the barrier this row needs is the
+// clear->scatter WAW on fluidGrid, generated from the two rows' uses.
+// read-only in practice: `fluidParticles` is read_write for the module (spawn
+// and g2p write it); p2g only reads particle state to scatter it. Likewise
+// `fluidBlockMap` is written by mark/alloc; p2g only atomicLoads the mapping.
+PASS(fluidP2g, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) R(FluidParticles) R(FluidBlockMap) A(FluidGrid)))
+// Terrain boundary conditions read the LIVE voxel buffer through voxWordAt —
+// carve under a pool and the wall simply stops being there next substep
+// (plan §6.1). Reads only; the fluid never writes a voxel, which is what keeps
+// the world hash out of this system's blast radius.
+// read-only in practice: `fluidBlockList` is read_write for the module because
+// alloc writes it; the grid update only reads its block's chunk slot.
+PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND_FLUIDARGS,0,0,
+     GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
+          RW(FluidGrid) I(FluidDispatchArgs)))
+// Pure gather: each thread writes only its own particle, so g2p cannot race
+// itself (the mark/apply split rule does not bite here).
+// read-only in practice: `fluidBlockMap` is written by mark/alloc and
+// `fluidGrid` by clear/p2g/gridUpdate; g2p only atomicLoads both.
+PASS(fluidG2p, "fluid(substep)", PT_FLUID, PIPE_FLUID_G2P, K_COMPUTE, D_FLUIDP,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) RW(FluidParticles) R(FluidBlockMap) R(FluidGrid)))
 
 // clang-format on

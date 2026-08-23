@@ -225,7 +225,9 @@
     "wanderHopMask": 7,
     "expMicroPerMille": 900,
     "expMicroLifeTicks": 40,
-    "expMicroScaleIdx": 2
+    "expMicroScaleIdx": 2,
+    "fluidStiffness": 393216,
+    "fluidGravity": 7144
   },
   "render": {
     "skyGradient": 1.4,
@@ -238,6 +240,11 @@
     "skyZenith": [
       0.25,
       0.47,
+      0.85
+    ],
+    "fluidColor": [
+      0.2,
+      0.42,
       0.85
     ],
     "sunTint": [

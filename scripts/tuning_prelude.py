@@ -48,6 +48,7 @@ SPEC = [
     # night sky
     ("render", "nightZenith", "TUNE_NIGHT_ZENITH", "v3", [0.006, 0.01, 0.028]),
     ("render", "nightHorizon", "TUNE_NIGHT_HORIZON", "v3", [0.03, 0.036, 0.062]),
+    ("render", "fluidColor", "TUNE_FLUID_COLOR", "v3", [0.2, 0.42, 0.85]),
     ("render", "starBrightness", "TUNE_STAR_BRIGHTNESS", "f", 1.0),
     ("render", "starDensity", "TUNE_STAR_DENSITY", "f", 150.0),
     ("render", "starSize", "TUNE_STAR_SIZE", "f", 0.85),
@@ -256,6 +257,8 @@ SPEC = [
     ("sim", "expMicroPerMille", "TUNE_EXP_MICRO_PERMILLE", "u", 900),
     ("sim", "expMicroLifeTicks", "TUNE_EXP_MICRO_LIFE", "u", 40),
     ("sim", "expMicroScaleIdx", "TUNE_EXP_MICRO_SCALE_IDX", "u", 2),
+    ("sim", "fluidStiffness", "TUNE_FLUID_STIFFNESS", "i", 393216),
+    ("sim", "fluidGravity", "TUNE_FLUID_GRAVITY", "i", 7144),
 
     # worldgen (integer; needs a world regen to take effect)
     ("worldgen", "treeline", "TUNE_TREELINE", "i", 72),

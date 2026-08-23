@@ -60,9 +60,17 @@ struct UIState {
   // tool rather than a mode because LMB already routes per-tool, so the sword
   // gets the attack button without taking it from the brush.
   enum Tool {
-    kToolBrush = 0, kToolLaser, kToolPrefab, kToolMob, kToolMelee, kToolCount
+    kToolBrush = 0, kToolLaser, kToolPrefab, kToolMob, kToolMelee, kToolFluid,
+    kToolCount
   };
   int tool = kToolBrush;
+
+  // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the experimental
+  // particle liquid, placeable side by side with CA water for comparison.
+  // fluidCount is mirrored from the main loop's CPU-owned count for the HUD;
+  // clearFluid is a one-shot request consumed inside the tick loop.
+  uint32_t fluidCount = 0;
+  bool clearFluid = false;
 
   // hotbar (game/item.h): mirrored out of Inventory each frame for the HUD.
   // The overlay never owns inventory state — it only draws it.

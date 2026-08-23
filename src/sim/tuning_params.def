@@ -57,6 +57,7 @@ TP_F(render, sunReddening, TUNE_SUN_REDDENING, 1.0f)
 // ---- night sky ----
 TP_V3(render, nightZenith, TUNE_NIGHT_ZENITH, 0.006f, 0.01f, 0.028f)
 TP_V3(render, nightHorizon, TUNE_NIGHT_HORIZON, 0.03f, 0.036f, 0.062f)
+TP_V3(render, fluidColor, TUNE_FLUID_COLOR, 0.20f, 0.42f, 0.85f)
 TP_F(render, starBrightness, TUNE_STAR_BRIGHTNESS, 1.0f)
 TP_F(render, starDensity, TUNE_STAR_DENSITY, 150.0f)
 TP_F(render, starSize, TUNE_STAR_SIZE, 0.85f)
@@ -317,6 +318,8 @@ TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900)
 TP_U(sim, expMicroLifeTicks, TUNE_EXP_MICRO_LIFE, 40)
 TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
+TP_I(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 393216)
+TP_I(sim, fluidGravity, TUNE_FLUID_GRAVITY, 7144)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)

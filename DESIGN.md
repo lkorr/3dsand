@@ -422,6 +422,35 @@ Noita's "Bloody Zombies" technique, on GPU:
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
 
+### MLS-MPM liquid prototype (2026-08-22; `sim_fluid.wgsl`, docs/PLAN_mpm_fluids.md)
+
+An EXPERIMENTAL second liquid representation, placeable side by side with the
+CA liquid so the two can be compared in-world before the plan's full rewrite
+is committed to. It is the plan's Phase 0+1 run inside the engine: the
+MLS-MPM core (Hu et al. 2018) ported to Q16.16 integer fixed point, P2G
+scattering through i32 `atomicAdd` (associative, so scheduling cannot move the
+sum), sparse 16³-node grid blocks allocated per substep over exactly the
+chunks that hold particles, terrain boundary conditions read live from the
+voxel buffer through `voxWordAt`, 6 substeps per tick.
+
+Deliberately OUTSIDE the hashed sim domain: the fluid never writes a voxel,
+no CA kernel reads a fluid buffer, and the world hash is untouched by
+construction (the pinned determinism gate proves it stays 7cfa2420). The
+fluid's own bit-determinism — the plan's kill criterion — is gated separately
+by `fluid-det`, which runs a basin drop twice from worldgen and requires the
+entire particle buffer to hash identically. Passing on the RTX 3060 Ti, this
+is the first affirmative evidence for the plan's fixed-point-atomics bet;
+cross-vendor remains open exactly as it does for the CA itself.
+
+Usage: the `mpm` tool (Tab; hold LMB to pour, U clears), rendered as instanced
+cubes via `debris.wgsl:vsFluid`. CPU-owned particle count (spawns are ops at
+CPU-known offsets; nothing ever allocates on the GPU), hard `kFluidCap`
+budget charged before emission, zero recorded work when no fluid exists.
+Not persisted: saves and worldgen drop it (the plan's force-settle-on-save,
+prototype grade). Excite/settle conversion against the CA grid — the plan's
+§7 seam — is deliberately NOT built here; that decision comes after the
+side-by-side comparison this prototype exists to enable.
+
 ---
 
 ## 6. Material & Interaction Authoring (the moddable core)

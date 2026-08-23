@@ -79,9 +79,15 @@ class Simulation {
   // produced here before encoding the next tick. particlesActive lets a
   // settled world skip the particle passes entirely; the caller must derive it
   // ONLY from tick-deterministic inputs (see main.cpp) or determinism breaks.
+  // fluidCount/fluidSpawnCount drive the MLS-MPM fluid prototype
+  // (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl): fluidCount is the particle
+  // count AFTER this tick's spawns (CPU-owned — the fluid never allocates on
+  // the GPU), fluidSpawnCount is this tick's spawn-op count. Zero both and
+  // nothing fluid-related is recorded at all.
   void EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                   bool hashEnable, uint32_t expCount, bool particlesActive,
-                  uint32_t cellCount, uint32_t spawnCount = 0);
+                  uint32_t cellCount, uint32_t spawnCount = 0,
+                  uint32_t fluidCount = 0, uint32_t fluidSpawnCount = 0);
 
   // Render pass with the shared depth target (raymarch writes frag_depth,
   // raster geometry depth-tests against it). Caller draws UI into same pass.
@@ -91,6 +97,9 @@ class Simulation {
                                           uint32_t width, uint32_t height);
   void DrawWorld(const rhi::RenderPass& pass);
   void DrawParticles(const rhi::RenderPass& pass);
+  // MLS-MPM fluid prototype: instanced cubes from the fluid particle buffer.
+  // `count` is the CPU-owned particle count; 0 draws nothing at all.
+  void DrawFluid(const rhi::RenderPass& pass, uint32_t count);
   void DrawSprites(const rhi::RenderPass& pass, uint32_t count);
   // Collision-box debug overlay: one oriented wireframe box per physics body.
   // Drawn LAST of the world passes (after the micro bodies, before ImGui) with
@@ -194,15 +203,17 @@ class Simulation {
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   rhi::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
-      farBGL_, microBodyBGL_;
-  rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_;
+      farBGL_, microBodyBGL_, fluidBGL_;
+  rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;
+  rhi::ComputePipeline fluidSpawn_, fluidMark_, fluidAlloc_, fluidClear_,
+      fluidP2g_, fluidGridUp_, fluidG2p_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
-      microBodyDraw_, debugBoxDraw_;
+      microBodyDraw_, debugBoxDraw_, fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
       debugLineModule_;
   rhi::TextureFormat targetFormat_ = rhi::TextureFormat::Undefined;
@@ -214,6 +225,6 @@ class Simulation {
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   rhi::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
-  rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_;
+  rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_;
   int page_ = 0;
 };

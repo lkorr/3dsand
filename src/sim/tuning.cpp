@@ -705,6 +705,20 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "expMicroPerMille", s.expMicroPerMille, out, at);
     ReadI(*g, "expMicroLifeTicks", s.expMicroLifeTicks, out, at);
     ReadI(*g, "expMicroScaleIdx", s.expMicroScaleIdx, out, at);
+    ReadI(*g, "fluidStiffness", s.fluidStiffness, out, at);
+    ReadI(*g, "fluidGravity", s.fluidGravity, out, at);
+    // MLS-MPM fluid: the P2G overflow audit in sim_fluid.wgsl assumes the
+    // stress scalar stays inside the staged-multiply range. A negative
+    // stiffness would invert the EOS (compression attracts), a huge one blows
+    // the i32 staging; same shape for gravity.
+    if (s.fluidStiffness < 0 || s.fluidStiffness > (48 << 16)) {
+      out.warnings.push_back("sim.fluidStiffness out of 0..48.0 (Q16.16); clamped");
+      s.fluidStiffness = s.fluidStiffness < 0 ? 0 : (48 << 16);
+    }
+    if (s.fluidGravity < 0 || s.fluidGravity > (2 << 16)) {
+      out.warnings.push_back("sim.fluidGravity out of 0..2.0 (Q16.16); clamped");
+      s.fluidGravity = s.fluidGravity < 0 ? 0 : (2 << 16);
+    }
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.
@@ -792,6 +806,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "skyHorizonOffset", r.skyHorizonOffset, out, at);
     ReadV3(*g, "skyHorizon", r.skyHorizon, out, at);
     ReadV3(*g, "skyZenith", r.skyZenith, out, at);
+    ReadV3(*g, "fluidColor", r.fluidColor, out, at);
     ReadV3(*g, "sunTint", r.sunTint, out, at);
     ReadF(*g, "sunDiscPower", r.sunDiscPower, out, at);
     ReadF(*g, "sunDiscGain", r.sunDiscGain, out, at);

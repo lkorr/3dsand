@@ -677,6 +677,15 @@ struct Tuning {
     int expMicroPerMille = 900;
     int expMicroLifeTicks = 40;
     int expMicroScaleIdx = 2;    // 0=2, 1=3, 2=4, 3=6 micro voxels per voxel
+    // MLS-MPM fluid prototype (sim_fluid.wgsl). In the sim group because they
+    // are integers feeding a deterministic solver — they do NOT touch the
+    // world hash (the fluid never writes voxels) but they DO change the
+    // fluid_det gate's particle hash, so re-run --selftest after changing.
+    int fluidStiffness = 393216;  // EOS stiffness E, Q16.16 (6.0). Higher =
+                                  // less compressible water, stronger substep
+                                  // impulses (CFL clamps keep it stable).
+    int fluidGravity = 7144;      // Q16.16 cells/tick^2 (0.109 = 9.81 m/s^2
+                                  // at 0.10 m voxels, 30 Hz ticks)
   } sim;
 
   // ---- day/night cycle ----
@@ -772,6 +781,8 @@ struct Tuning {
     // ---- night sky ----
     float nightZenith[3] = {0.006f, 0.010f, 0.028f};
     float nightHorizon[3] = {0.030f, 0.036f, 0.062f};
+    // MLS-MPM fluid prototype droplet albedo (debris.wgsl vsFluid).
+    float fluidColor[3] = {0.20f, 0.42f, 0.85f};
     float starBrightness = 1.0f;
     float starDensity = 150.0f;     // direction-grid cells per unit
     // PSF core radius in PIXELS, not radians. Sizing in pixels is what keeps a
