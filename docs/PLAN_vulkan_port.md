@@ -1116,6 +1116,61 @@ find the path, do not widen the ring* — is only enforceable now that the
 number is real. **The lesson worth carrying forward is procedural: a green
 counter is evidence only if something has proven the counter can go red.**
 
+#### CLOSED — the flight shell, the demotion leaks, and the measured pool — [AS BUILT, phase-7 FULLY closed, 2026-08-22]
+
+**Both residency modes are green end-to-end.** `--selftest --residency paged`
+exits 0 for the first time: hash `7cfa2420`, `pond-freeze` + `mob` the only
+baseline failures, `pageFaults 0`, high-water 14,934 of 16,384. Dense is
+byte-identical to before (hash unchanged). `--vk-smoke-loud --residency paged
+--vk-validation` 19/19 vs pinned with ZERO validation messages; `--vk-smoke`
+5/5 both modes.
+
+**(1) The last formula gap: GPU-originated wakes during particle flight.**
+Gate `flung-liquid` paged lost blood (21 voxels at fullness 1 vs dense's
+76 at 7, 62 real page faults). Mechanism: airborne particles dirty nothing, a
+fresh snapshot correctly tightens `cpuDirty` to 0, the chunks under the
+flight path demote — and when the particles land, `resolve`'s `markDirtyNext`
+has NO CPU-side contributor to re-enter the mirror (the intersection can only
+remove; 0 stays 0 — measured for 37 straight ticks while faults climbed).
+Fix: §3.1a contributor **(e), the particle flight shell** — while particles
+may be in flight, `occMatter(S)` (chunks with non-zero snapshot occupancy) is
+unioned into `cpuDirty` post-tighten, post-propagate, lingering one
+application past the off condition; the bracketed half materializes its ring.
+Seeded from OCCUPANCY because a residency-seeded shell feeds back one ring
+per tick (measured to 3 rings, past an 8,192 pool on one gate); the ring
+guards demotion instead of entering the mirror. Full soundness argument:
+`PLAN_page_table.md` §3.4, "The GPU-originated-wake hole". Result:
+`flung-liquid` paged **76/7, bit-identical to dense, 0 faults**.
+
+**(2) Two permanent demotion leaks, found by the first suite that could run.**
+`Classify` refused stamped air (`0x00030000` — the CA stamps vacated cells)
+and jittered air (`0x00002000` — `sim_mutate` gives every painted voxel a
+palette-jitter state, air included), so any chunk ever touched leaked its
+page: ~14,400 resident after streaming+spells. The free predicate is now
+"every cell is stainless air" (bits 12..23 are audited passenger bits on air;
+stain stays load-bearing). Also: `zeroStreak_` re-arms on materialization
+(the saturated-counter leak), and free probes are capped at 64/tick with
+held-at-7 retry (uncapped, a whole-window load minted thousands of blocking
+WaitIdle+readback probes on one tick — a minutes-long stall that presented as
+a hang). `PLAN_page_table.md` §3.6, "Demotion in practice".
+
+**(3) The pool, measured honestly this time.** The first attempt read 32,768
+by construction — `ResetIdentity` latched `pagesHighWater_ = pagesInUse_` at
+seeding, so raising the pool to measure raised the answer. The latch is gone
+(high-water's sole writer is `Alloc()`), and the suite prints its high-water
+on every paged run. Measured: **14,934 pages stable across four builds**,
+driven by the streaming gate's flight-speed churn, not by the shell
+(`flung-liquid` peaks at 8,406). **`kPoolPages = 16384` = 256 MiB reserved**,
+2× under dense, 1.10× over the measured worst case — the "×1.25 → power of
+two" rule would land on 32,768 = dense = no win, and is deliberately not
+honoured; rationale in `PLAN_page_table.md` §3.7 and `world.h`.
+
+**Gate fix in the same commit:** `page-roundtrip`'s free assertion was a
+global page count, which reads a working roundtrip as a failure on a live
+world (spell fires materialize faster than one page frees) — it now asserts
+the painted SLOT returns to sentinel, waits bounded for the capped drain, and
+seeds a world when run standalone against the identity map.
+
 #### DEFERRED follow-ups (severable, recorded per the pacing directive)
 
 - **Ring-starvation gate.** Hold all three readback slots in flight for ~10
@@ -1126,6 +1181,16 @@ counter is evidence only if something has proven the counter can go red.**
 - **Low-`kPoolPages` abort gate.** Run with a deliberately tiny pool and assert
   the abort fires cleanly with the right message — testing that the failure
   mode *works*, since under §3.8 it is now the only one.
+- **Sanitize air's state nibble at the sources** (`sim_mutate.wgsl:80`,
+  `productState`): writing `state = 0` for `MAT_AIR` would stop minting the
+  passenger bits the free path now masks. Audited inert, so it is a cleanup,
+  not a correctness item — but it touches sim kernels, so it is its own
+  hash-gated change.
+- **Streaming churn residency** (the 12.4k–14.5k plateau): contributor (d)
+  puts whole refilled planes into `cpuDirty` and their rings materialize
+  behind the hysteresis; if the pool margin ever matters, an occupancy-
+  filtered bracketed half (with op-ring retention for snapshot staleness) is
+  the formula-level lever — sketched during the close, not taken.
 
 **Phase 8 — capability exploitation (each its own measured change).**
 Async compute/transfer queues (readbacks, far-field fill off the main queue);

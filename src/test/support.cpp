@@ -184,7 +184,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //   AddOp*           -> contributor (a), opTargets(N)
   //   UpdateParticles  -> contributor (b), particleChunks(N)
   //   TightenFromSnapshot -> step (2), INTERSECTION only, never assignment
-  //   WakeAll/Refilled -> step (3), strictly AFTER the tightening
+  //   WakeAll/Refilled/ParticleShell -> step (3), strictly AFTER the tightening
   //   Materialize      -> step (1) propagate, then step (4) allocate + fill
   //
   // EncodeWakeAll above has already unioned all-ones into the mirror (§3.2a
@@ -229,6 +229,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   {
     const WorldSnapshot& sn = world.Snap();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
+    // Contributor (e), the particle flight shell — strictly AFTER the
+    // tightening, like (c)/(d): a union applied after an intersection cannot
+    // be undone by it. Covers the GPU-decided landing writes an airborne
+    // particle will make (a mid-flight snapshot legitimately tightens the
+    // mirror to empty — a flying particle dirties nothing — and the
+    // intersection can never ADD the landing back). See §3.4.
+    pt.ApplyParticleShell(sn, particlesActive);
   }
   pt.Materialize(ctx.queue);
   // ---- deallocation (§3.6), AFTER materialization -------------------------

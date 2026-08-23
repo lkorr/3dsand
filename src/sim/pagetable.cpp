@@ -86,6 +86,12 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   cpuDirty_.Clear();
   particleChunks_.Clear();
   opTargets_.Clear();
+  shell_.Clear();
+  shellSeed_.Clear();
+  shellPending_ = false;
+  shellActive_ = false;
+  shellLinger_ = false;
+  lastSpawnTick_ = -1;
   cRing_.clear();
   pendingFills_.clear();
   retire_.clear();
@@ -110,7 +116,14 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   for (uint32_t i = poolPages_; i < kNumChunks; i++) t[i] = kPtEmpty;
   // Pages past the slot count would be free; there are none, since
   // poolPages_ <= kNumChunks in both modes.
-  pagesHighWater_ = std::max(pagesHighWater_, pagesInUse_);
+  //
+  // pagesHighWater_ is deliberately NOT latched here. Identity seeding claims
+  // min(kNumChunks, poolPages_) pages BY CONSTRUCTION — in paged mode a
+  // transient state that batched worldgen immediately replaces via
+  // ResetAllEmpty. Latching it made every high-water report read the pool
+  // size regardless of real demand, which is what invalidated the first
+  // kPoolPages sizing attempt. The high-water is real demand only if its sole
+  // writer is Alloc().
   queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumChunks * 4);
   // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
   // ever resets, and CreateBuffer does not zero — so without this it starts at
@@ -125,6 +138,12 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   cpuDirty_.Clear();
   particleChunks_.Clear();
   opTargets_.Clear();
+  shell_.Clear();
+  shellSeed_.Clear();
+  shellPending_ = false;
+  shellActive_ = false;
+  shellLinger_ = false;
+  lastSpawnTick_ = -1;
   cRing_.clear();
   pendingFills_.clear();
   retire_.clear();
@@ -280,6 +299,10 @@ void PageTable::UpdateSpawnRing(const std::vector<IVec3>& spawnCells,
   // of C(N) covers that.
   particleChunks_.Clear();
   if (spawnCells.empty() && explosionCenters.empty()) return;
+  // Any particle-spawning input arms the flight shell (contributor (e)) until
+  // a snapshot that postdates this tick reports zero live particles. Set even
+  // if every spawn lands out of window — a dead-cheap over-approximation.
+  lastSpawnTick_ = (int64_t)tick_;
 
   SlotSet seeds;
   auto seed = [&](const IVec3& c) {
@@ -365,6 +388,9 @@ void PageTable::WakeAll() {
   // ordering reasoning at all, and C(j) would have to carry a 32,768-entry
   // all-ones set (§3.1a).
   cpuDirty_.SetAll();
+  if (getenv("SANDVOX_PT_DEBUG"))
+    std::printf("[pt] tick %u WAKE-ALL: inUse=%u highWater=%u\n", tick_,
+                pagesInUse_, pagesHighWater_);
 }
 
 void PageTable::RefilledSlot(uint32_t slot) {
@@ -374,6 +400,123 @@ void PageTable::RefilledSlot(uint32_t slot) {
   // the same tick would intersect the refilled chunk's NEIGHBOURS away, and
   // the CA frontier a stream-in creates would be invisible to the mirror.
   cpuDirty_.Add(slot);
+}
+
+void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
+                                   bool particlesActive) {
+  if (!paged_) return;
+  // No particle pass will be encoded this tick (particlesActive gates the
+  // whole particle pipeline in EncodeTick), or nothing was ever spawned: no
+  // resolve can run, so no GPU-decided write and no landing mark exist to
+  // cover. The guard drops too — a stale shell must not block demotion after
+  // the particle pipeline stops. This is the settled-world exit and the
+  // rule-2 story: a world with no particles pays one branch here, nothing
+  // else.
+  if (!particlesActive || lastSpawnTick_ < 0) {
+    shellActive_ = false;
+    shellLinger_ = false;
+    return;
+  }
+  // The OFF condition, and both conjuncts matter: a snapshot counting zero
+  // live particles proves nothing about spawns submitted after it was
+  // stamped, so it only lowers the shell when it POSTDATES the last spawn.
+  //
+  // The shell LINGERS one application past the off condition. The last
+  // landing (tick Z) puts blood in a chunk that first shows occupancy in the
+  // snapshot stamped Z — the same snapshot whose particleCount==0 turns the
+  // shell off. One more application seeded from THAT snapshot is what carries
+  // the landed chunk into cpuDirty; from then on it survives every tightening
+  // on its own merits (genuinely dirty, so in both operands) and the ordinary
+  // recurrence tracks the flow it seeds. Without the linger, the intersection
+  // could never ADD it, and the flow would fault the tick the shell dropped.
+  if (snap.valid && snap.particleCount == 0 &&
+      (int64_t)snap.tick >= lastSpawnTick_) {
+    if (!shellLinger_) {
+      shellActive_ = false;
+      return;
+    }
+    shellLinger_ = false;
+  } else {
+    shellLinger_ = true;
+  }
+  shellActive_ = true;
+
+  // occMatter: every chunk whose latest-snapshot occupancy is non-zero.
+  //
+  // SEEDED FROM OCCUPANCY, NOT FROM THE PAGE TABLE, and this is load-bearing:
+  // hasMatter (= any non-EMPTY entry) cannot tell a resident-but-all-air
+  // chunk from one holding matter, so a residency-seeded shell FEEDS BACK on
+  // itself — materializing the ring makes it resident, next tick's shell
+  // rings the ring, and the set dilates one ring per tick for as long as a
+  // particle flies. That is exactly the unbounded growth §3.4's amendment
+  // deleted. Occupancy counts actual non-air cells, which materializing an
+  // empty page cannot change, so the shell is pinned to real matter and its
+  // fixed point is one ring around it.
+  //
+  // Blockers need matter, and occupancy sees ALL matter: occupancyFull reads
+  // through voxWordAt, so UNIFORM sentinels report their synthesized count. A
+  // stain-only chunk reports zero, and correctly so — stained air does not
+  // block a particle. Matter created SINCE the snapshot was stamped is not
+  // here, and does not need to be: op-created matter is covered by
+  // N26(opTargets) (the induction base case), and landed/CA-moved matter is
+  // in cpuDirty by the marks the tightening keeps, resident, and therefore
+  // ringed by the bracketed half.
+  //
+  // The scan below is O(kNumChunks) per tick WHILE PARTICLES FLY — bounded by
+  // the same activity that pays for the particle passes themselves, and zero
+  // when the world settles.
+  scratch_.Clear();
+  if (snap.valid && snap.occupancy.size() == kNumChunks) {
+    for (uint32_t s = 0; s < kNumChunks; s++)
+      if (snap.occupancy[s] != 0u) scratch_.Add(s);
+  } else {
+    // No snapshot yet (startup, or the ring declined every slot so far):
+    // fall back to the page table, which is a strict superset of occMatter (a
+    // chunk holding matter is never PT_EMPTY). Wider, and it would feed back
+    // as above if sustained — but it is bounded by the first snapshot's
+    // arrival, after which the occupancy seed takes over.
+    const auto& t = world_->pageTableCpu();
+    for (uint32_t s = 0; s < kNumChunks; s++) {
+      const uint32_t e = t[s];
+      const bool empty =
+          (e & kPtSentinelBit) != 0u && (e & kPtMatMask) == kMatAir;
+      if (!empty) scratch_.Add(s);
+    }
+  }
+  // What goes WHERE, and why the split keeps the shell at ONE ring:
+  //
+  //   - occMatter (the SEED, no ring) is unioned into the MIRROR — deferred
+  //     to Materialize, strictly AFTER step (1)'s propagate. The bracketed
+  //     half then materializes N26(occMatter) by its own rule: the seed is in
+  //     (cpuDirty n hasMatter), so its 26-ring is exactly the shell. Nothing
+  //     rings the ring: the tightening cuts the seed back every tick before
+  //     it is re-applied, so the resident fixed point during flight is matter
+  //     + ONE ring. (Earlier shapes of this fix put the ringed shell in the
+  //     mirror BEFORE propagate; the three compounding dilations — shell
+  //     ring, propagate ring, bracket ring — ran the fixed point to matter +
+  //     three rings, past an 8,192-page pool on flung-liquid alone.)
+  //   - shell_ = occMatter u N26(occMatter) is kept as the DEMOTION GUARD for
+  //     ConsumeOccupancy. The ring chunks are all-air and not in cpuDirty, so
+  //     without the guard hysteresis would free them mid-flight — which is
+  //     the exact measured failure (the chunks under the flung-liquid slab
+  //     demoted while the blood was airborne). The guard preserves §3.6's
+  //     structural property: nothing in the materialization set is eligible
+  //     to free.
+  //
+  // The mirror entry is what closes the POST-flight story: the landed chunk
+  // survives every later tightening on its own merits (genuinely dirty, so in
+  // both operands), and step (1)'s N26 tracks the flow frontier from then on.
+  // Materializing alone would cover the landing write but leave the landed
+  // chunk invisible to cpuDirty, and the CA flow the landing seeds would
+  // fault the moment the shell came down.
+  shellSeed_.Clear();
+  shellSeed_.UnionWith(scratch_);
+  shell_.Clear();
+  DilateN26(scratch_, shell_);
+  shellPending_ = true;
+  if (getenv("SANDVOX_PT_DEBUG"))
+    std::printf("[pt] tick %u flight shell: occMatter=%zu shell=%zu\n",
+                tick_, scratch_.Size(), shell_.Size());
 }
 
 void PageTable::Materialize(const rhi::Queue& queue) {
@@ -399,6 +542,16 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   while (cRing_.size() > kCRing) cRing_.pop_front();
 
   if (!paged_) return;  // dense: every slot is already resident
+
+  // Contributor (e), the particle flight shell SEED, applied AFTER the
+  // propagate above so it is not dilated in the tick it is computed — see the
+  // fixed-point note in ApplyParticleShell. The seed reaches the bracketed
+  // half below (that is the point: its 26-ring is the shell), and next tick's
+  // propagate dilates whatever of it the next tightening keeps.
+  if (shellPending_) {
+    cpuDirty_.UnionWith(shellSeed_);
+    shellPending_ = false;
+  }
 
   auto& t = world_->pageTableCpuMutable();
 
@@ -485,6 +638,14 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   for (uint32_t s : materialized_.Members()) {
     const uint32_t e = t[s];
     if ((e & kPtSentinelBit) == 0u) continue;  // already resident
+    // Re-arm the hysteresis counter: it means "consecutive empty snapshots
+    // SINCE RESIDENCY BEGAN". Without this, a chunk materialized while
+    // all-air (every ring chunk is) whose counter had already saturated at
+    // 255 during its long sentinel life can never pass through the exact-8
+    // trigger again — occupancy stays 0, so nothing resets it — and its page
+    // leaks for the rest of the run. Measured: ~14,400 pages resident after
+    // the streaming+spells gates, most of them exactly this.
+    zeroStreak_[s] = 0;
     const uint32_t page = Alloc();
     // A freshly allocated page must hold the synthesized content of the
     // sentinel it replaces, BEFORE the consuming dispatch. vkCmdFillBuffer
@@ -513,6 +674,19 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // quarter second and stays zero forever.
     if (zeroStreak_[s] != kPageFreeTicks) continue;
     if ((t[s] & kPtSentinelBit) != 0u) continue;   // already a sentinel
+    // Cap the probes per tick. Each candidate costs a blocking WaitIdle +
+    // 16 KiB readback, and a mass-demotion event (a whole-window load, a
+    // wake-all, the streaming gate's window churn) can mint thousands of
+    // candidates on ONE tick — measured as a minutes-long stall that
+    // presented as a hang. The overflow is HELD AT kPageFreeTicks-1, not
+    // skipped: the exact-== trigger above fires once per pass through the
+    // threshold, so a skipped candidate whose streak kept counting would
+    // never be probed again and its page would leak. Held at -1 it re-arms
+    // next tick, and the backlog drains at the cap rate.
+    if (candidates.size() >= kMaxFreeProbesPerTick) {
+      zeroStreak_[s] = kPageFreeTicks - 1;
+      continue;
+    }
     //
     // `occTotal == 0` is NOT sufficient to demote to PT_EMPTY, and this cost a
     // debugging cycle. occupancy counts NON-AIR cells; the world hash ALSO
@@ -538,8 +712,61 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     if (probeChunk_) {
       if (freeProbe_.size() != kChunkVol) freeProbe_.assign(kChunkVol, 0);
       if (!probeChunk_(s, freeProbe_.data())) continue;
-      if (Classify(freeProbe_.data()) != kPtEmpty) {
-        zeroStreak_[s] = 0;   // carries stain, or is not uniform: keep the page
+      // The free test is "every cell is STAINLESS AIR", NOT Classify's
+      // exact-word rule, and the distinction is the difference between a
+      // working demotion path and a permanent leak. Two passenger-bit classes
+      // survive on air cells after a chunk empties, and Classify refuses both
+      // forever:
+      //   - the tick stamp: the CA deliberately stamps vacated cells
+      //     (sim_step.wgsl:114, "displaced fluid (or air) swaps into the
+      //     source cell, stamped") — words like 0x00030000;
+      //   - the state nibble: sim_mutate paints EVERY voxel with a palette
+      //     jitter (`state = rnd % 3`, sim_mutate.wgsl:80), air included, so
+      //     an erase brush leaves words like 0x00002000.
+      // Measured on the first full paged suite as ~14,400 pages still
+      // resident after the streaming and spells gates, nearly all of them
+      // this.
+      //
+      // Ignoring bits 12..23 on an AIR word is SOUND on three independent
+      // grounds, each verifiable at its source:
+      //   1. HASH-BLIND: the determinism hash skips MAT_AIR cells entirely
+      //      (sim_occupancy.wgsl:161, `if (m != MAT_AIR)`), so nothing in
+      //      those bits can move the hash.
+      //   2. BEHAVIOR-INERT: the only stamp reader is the acting cell's own
+      //      early-out (sim_step.wgsl:802), and an air cell's act is a no-op
+      //      either way. Every sim read of a NEIGHBOUR's state nibble is
+      //      behind a same-material guard (sim_step.wgsl:682,:705,:724,:753)
+      //      and the flow-into-air branch passes an explicit 0 for air's
+      //      fullness (transferLiquid call, :760) — air's state nibble is
+      //      never read. tryMove copies both fields through the swap without
+      //      branching on them: pure passengers.
+      //   3. The stamp byte is additionally SAVE-STRIPPED (kPersistMask,
+      //      stream.cpp:41) — every save/evict round-trip already zeroes it.
+      // STAIN stays load-bearing: it is hashed on non-air cells, and a
+      // stained but all-air chunk must keep its page (the erode-then-demote
+      // hash bug this probe was built to prevent). Bit 31 is kept in the
+      // mask out of caution — a set transient flag means something is
+      // mid-flight and the chunk is not settled anyway.
+      //
+      // So a chunk of stainless air is the SAME WORLD CONTENT as PT_EMPTY,
+      // and demoting it at a snapshot-cadence-dependent time cannot influence
+      // hashed state or evolution (rule 1 intact; the --vk-smoke pinned
+      // sequences are the empirical check). Classify keeps its exact-word
+      // strictness where it is needed — UNIFORM promotion must reproduce
+      // resident words bit-exactly.
+      constexpr uint32_t kAirDemoteMask = 0xFF000FFFu;  // material | stain | bit31
+      bool demotable = true;
+      for (uint32_t i = 0; i < kChunkVol; i++)
+        if ((freeProbe_[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
+      if (!demotable) {
+        if (getenv("SANDVOX_PT_DEBUG")) {
+          uint32_t w = 0, at = 0;
+          for (uint32_t i = 0; i < kChunkVol; i++)
+            if ((freeProbe_[i] & kAirDemoteMask) != 0u) { w = freeProbe_[i]; at = i; break; }
+          std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
+                      tick_, s, w, at);
+        }
+        zeroStreak_[s] = 0;   // carries persistent state: keep the page
         continue;
       }
     }
@@ -549,6 +776,16 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // settled-looking world issuing fills forever (risk 6, a rule-2 violation
     // that presents as a perf mystery).
     if (cpuDirty_.Has(s)) { zeroStreak_[s] = kPageFreeTicks - 1; continue; }
+    // The third conjunct, live only while particles fly: the flight shell's
+    // RING chunks are all-air and deliberately NOT in cpuDirty (that is what
+    // keeps the shell at one ring), so this is what stops hysteresis from
+    // freeing a chunk a particle may land in mid-flight — the exact measured
+    // flung-liquid failure. It preserves §3.6's structural property: nothing
+    // in the materialization set is eligible to free.
+    if (shellActive_ && shell_.Has(s)) {
+      zeroStreak_[s] = kPageFreeTicks - 1;
+      continue;
+    }
     const uint32_t page = t[s];
     world_->pageTableCpuMutable()[s] = kPtEmpty;
     MarkTableDirty(s);
