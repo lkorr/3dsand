@@ -126,6 +126,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // this drains at the head of the next command buffer, and the two
         // deferred writes interleave (world.cpp's note).
         entry(19, T::ReadOnlyStorage), // pageFillList
+        // MLS-MPM excited-fluid coupling (sim_step.wgsl bindings 20..22):
+        // block map + node grid read-only, the seam's intent/flags scratch
+        // read_write (the consume flag is the CA's one write into it).
+        entry(20, T::ReadOnlyStorage), // fluidBlockMap
+        entry(21, T::ReadOnlyStorage), // fluidGrid
+        entry(22, T::Storage),         // fluidCellScratch
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -190,6 +196,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(8, T::Storage),          // fluidCalm
         entry(9, T::Storage),          // fluidSettleScratch
         entry(10, T::Storage),         // fluidCompactScratch
+        entry(11, T::Storage),         // fluidCellScratch (intents + flags)
+        entry(12, T::Storage),         // fluidBlockList (stainApply's slots)
     };
     fluidSeamBGL_ = device.CreateBindGroupLayout(sfentries, std::size(sfentries));
   }
@@ -342,6 +350,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(17, world_->pageTable),
         b(18, world_->pageFaults),
         b(19, world_->pageFillList),
+        b(20, world_->fluidBlockMap),
+        b(21, world_->fluidGrid),
+        b(22, world_->fluidCellScratch),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -451,6 +462,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(8, world_->fluidCalm),
         b(9, world_->fluidSettleScratch),
         b(10, world_->fluidCompactScratch),
+        b(11, world_->fluidCellScratch),
+        b(12, world_->fluidBlockList),
     };
     fluidSeamBG_[page] = device.CreateBindGroup(fluidSeamBGL_, sentries,
                                                 std::size(sentries), "fluidSeamBG");
@@ -635,6 +648,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidSettleCheck_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCheck", "seamSettleCheck");
   fluidSettleCommit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCommit", "seamSettleCommit");
   fluidSettleKill_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleKill", "seamSettleKill");
+  fluidConsumeApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "consumeApply", "seamConsumeApply");
+  fluidStainApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "stainApply", "seamStainApply");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -650,7 +665,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidCompactScan_ || !fluidCompactScatter_ || !fluidExciteDetect_ ||
       !fluidExciteScan_ || !fluidExciteEmit_ || !fluidPTick_ ||
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
-      !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_) {
+      !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_ ||
+      !fluidConsumeApply_ || !fluidStainApply_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -785,6 +801,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FluidCalm:          return world_->fluidCalm;
     case B::FluidSettleScratch: return world_->fluidSettleScratch;
     case B::FluidCompactScratch: return world_->fluidCompactScratch;
+    case B::FluidCellScratch:    return world_->fluidCellScratch;
     default:                return world_->voxels;
   }
 }
@@ -833,6 +850,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidSettleCheck:    return fluidSettleCheck_;
     case P::FluidSettleCommit:   return fluidSettleCommit_;
     case P::FluidSettleKill:     return fluidSettleKill_;
+    case P::FluidConsumeApply:   return fluidConsumeApply_;
+    case P::FluidStainApply:     return fluidStainApply_;
     default:                return step_;
   }
 }

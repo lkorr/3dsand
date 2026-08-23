@@ -81,6 +81,15 @@
 // Compaction spans: [0..SPANS) survivor count per 256-particle span,
 // [SPANS..2*SPANS) exclusive bases. Rewritten every tick before use.
 @group(1) @binding(10) var<storage, read_write> compactScratch : array<u32>;
+// Per active-block cell (2 words, world.h layout): [0] the intent word the
+// seam writes for the CA — the cell's fluid material + carried stain — and
+// [1] the flags the CA writes back (bit0: a reaction consumed this cell's
+// excited fluid). Fill-cleared at the head of the settle phase, so the CA
+// always reads LAST tick's intents (one tick latent, deterministic).
+@group(1) @binding(11) var<storage, read_write> fluidCellScratch : array<atomic<u32>>;
+// blockIdx -> chunk slot, from the last substep's alloc. read_write to match
+// the solver's shared entry; this shader only reads.
+@group(1) @binding(12) var<storage, read_write> fluidBlockList : array<u32>;
 
 // ---- layout constants -------------------------------------------------------
 const SPANS : u32 = FLUID_CAP / 256u;         // compaction spans
@@ -209,7 +218,9 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_REFUSED], 0u);
     atomicStore(&fluidArgs[FA_SETBLOCKS], 0u);
     atomicStore(&fluidArgs[FA_EMITTED], 0u);
-    atomicStore(&fluidArgs[15u], 0u);  // FA_BINNED
+    atomicStore(&fluidArgs[FA_BINNED], 0u);
+    atomicStore(&fluidArgs[FA_CONSUMED], 0u);
+    atomicStore(&fluidArgs[FA_STAINED], 0u);
   }
   workgroupBarrier();
   var base = wgScan[li];
@@ -615,12 +626,50 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
 }
 
 // ============================================================================
+// CA COUPLING — consumption, occupancy intents, contact staining.
+// ============================================================================
+
+// consumeApply (seam FRONT half, after the compaction): a CA reaction that
+// matched excited fluid as its neighbour this tick set bit0 of the cell's
+// flags word (sim_step doReactions). The WHOLE cell bin dies — consumption
+// granularity is the voxel-eighth, and a reaction that takes the neighbour
+// takes all of it, exactly as it would a fullness voxel. Order-free: every
+// particle tests its own cell's flag; which particles die is a pure function
+// of position. The block map here is still the LAST substep's (this runs
+// before the substeps rebuild it), which is the same addressing the CA used
+// to set the flag.
+@compute @workgroup_size(64)
+fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= min(atomicLoad(&exciteScratch[EX_COMPACT_LIVE]), FLUID_CAP)) {
+    return;
+  }
+  var p = fluidParticles[gid.x];
+  if (!fpAlive(p.attr)) { return; }
+  let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
+  if (!inWindow(cell, T.origin)) { return; }
+  let bm = fluidBlockMapR[chunkSlotIndex(worldChunkOf(cell))];
+  if (bm == 0u) { return; }
+  let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
+  let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  if ((atomicLoad(&fluidCellScratch[ci * 2u + 1u]) & 1u) == 0u) { return; }
+  atomicAdd(&fluidArgs[FA_CONSUMED], fpFullness(p.attr));
+  atomicAdd(&fluidArgs[FA_DEAD], 1u);
+  p.attr = 0u;
+  fluidParticles[gid.x] = p;
+}
+
+// ============================================================================
 // SETTLE — calm particles -> fullness voxels.
 // ============================================================================
 
-// particleTick: once per tick per particle (after the substeps). Feeds the
-// per-slot speed maxima the calm judgement reads. atomicMax is commutative —
-// order-free (rule 1).
+// particleTick: once per tick per particle (after the substeps). Three jobs
+// on one pass over the pool:
+//   * per-slot speed maxima for the calm judgement (atomicMax, order-free);
+//   * the cell's OCCUPANCY INTENT for the CA (material + carried stain,
+//     atomicMax — deterministic dominant pick), read one tick later by
+//     doReactions' excited-fluid synthesis;
+//   * CONTACT STAIN intents on solid/powder face neighbours, the MPM
+//     counterpart of CA liquid staining (stainApply rolls and writes them).
 @compute @workgroup_size(64)
 fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return; }
@@ -632,6 +681,98 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   let sx = p.vx >> 8u; let sy = p.vy >> 8u; let sz = p.vz >> 8u;
   let s2 = u32(sx * sx + sy * sy + sz * sz);
   atomicMax(&settleScratch[SP_SPEED + slot], s2 + 1u);
+
+  // The stain this particle applies: what it CARRIES (excited out of a
+  // stained voxel) wins over its material's authored stain — blood-stained
+  // water marks walls with blood, plain water wets them.
+  let mat = fpMat(p.attr);
+  let m = materials[mat];
+  var sType = fpStainType(p.attr);
+  var sAmt = fpStainAmt(p.attr);
+  if (sType == 0u && matStains(m)) {
+    sType = matStainType(m);
+    sAmt = matStainAmount(m);
+  }
+  let intent = (mat << 16u) | (sAmt << 3u) | sType;
+
+  // Own cell: occupancy intent for the CA.
+  let bm = fluidBlockMapR[slot];
+  if (bm != 0u) {
+    let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
+    let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+    atomicMax(&fluidCellScratch[ci * 2u], intent);
+  }
+  if (sType == 0u) { return; }
+
+  // Solid/powder face neighbours: stain intents (applied by stainApply).
+  for (var f = 0u; f < 6u; f++) {
+    var d = vec3<i32>(0, 0, 0);
+    if (f == 0u) { d.x = 1; } else if (f == 1u) { d.x = -1; }
+    else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
+    else if (f == 4u) { d.z = 1; } else { d.z = -1; }
+    let n = cell + d;
+    if (!inWindow(n, T.origin)) { continue; }
+    let nmat = voxMat(voxWordAt(n));
+    if (nmat == MAT_AIR) { continue; }
+    let nk = materials[nmat].klass;
+    if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
+    let nwc = worldChunkOf(n);
+    let nbm = fluidBlockMapR[chunkSlotIndex(nwc)];
+    if (nbm == 0u) { continue; }  // outside particle support: no block, and
+                                  // no contact that matters
+    let nlo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
+    let nci = (nbm - 1u) * CHUNK_VOL + (nlo.z * CHUNK + nlo.y) * CHUNK + nlo.x;
+    atomicMax(&fluidCellScratch[nci * 2u], intent);
+  }
+}
+
+// stainApply: one thread per active-block cell (the node-pass indirect args
+// from the last substep). A SOLID cell with a stain intent rolls the seam's
+// stain chance and takes the stain, following the CA's merge rules: same
+// type climbs toward the substrate's ceiling, a foreign type starts over.
+// One thread owns one cell — no write races, and the roll keys on
+// hash3(seed, tick, cellSlot): state, never scheduling (rule 1).
+const SEAM_STAIN_CHANCE : u32 =
+    u32(round(clamp(TUNE_FLUID_STAIN_RATE, 0.0, 30.0) * 65536.0 / 30.0));
+
+@compute @workgroup_size(256)
+fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
+              @builtin(local_invocation_index) li : u32) {
+  let block = wg.x >> 4u;
+  let localIdx = (wg.x & 15u) * 256u + li;
+  let intent = atomicLoad(&fluidCellScratch[(block * CHUNK_VOL + localIdx) * 2u]);
+  let sType = intent & 0x7u;
+  let sAmt = (intent >> 3u) & 0xFu;
+  if (sType == 0u || sAmt == 0u) { return; }
+  let slot = fluidBlockList[block];
+  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
+                     i32(slot / (NCHUNK * NCHUNK)));
+  let wc = slotToWorldChunk(sc, T.origin);
+  let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
+                     i32(localIdx >> 8u));
+  let c = wc * i32(CHUNK) + lo;
+  let idx = voxWordIndex(c);
+  if (idx == PT_NO_WORD) { return; }
+  let w = voxels[idx];
+  let nmat = voxMat(w);
+  if (nmat == MAT_AIR) { return; }
+  let nk = materials[nmat].klass;
+  if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return; }
+  let h = hash3(T.seed ^ 0x5741u, T.tick, cellIndexW(c));
+  if ((h & 0xFFFFu) >= SEAM_STAIN_CHANCE) { return; }
+  // The CA's merge rules (doStaining): the substrate's absorb capacity caps
+  // how deep a stain it takes; same type climbs one level per contact on
+  // absorbent ground and jumps to the ceiling on plain stone; foreign types
+  // restart.
+  let ceiling = min(sAmt, max(matAbsorbCapacity(materials[nmat]), 1u));
+  let cur = voxStainAmt(w);
+  let curType = voxStainType(w);
+  var amt = ceiling;
+  if (curType == sType && cur >= ceiling) { return; }  // saturated: sleep
+  if (curType == sType) { amt = min(cur + 1u, ceiling); }
+  voxels[idx] = (w & ~STAIN_BITS) | packStain(sType, amt);
+  atomicAdd(&fluidArgs[FA_STAINED], 1u);
+  markDirtyNext(c);
 }
 
 // settleJudge: one thread per chunk slot. Speed 0 means "no particles here" —
@@ -713,7 +854,7 @@ fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
   let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
   atomicAdd(&settleScratch[b], fpFullness(p.attr));
-  atomicAdd(&fluidArgs[15u], fpFullness(p.attr));  // FA_BINNED (mass audit)
+  atomicAdd(&fluidArgs[FA_BINNED], fpFullness(p.attr));  // mass audit
   atomicMax(&settleScratch[b + 1u],
             (fpMat(p.attr) << 16u) | (fpStainAmt(p.attr) << 3u) |
             fpStainType(p.attr));

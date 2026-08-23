@@ -996,6 +996,14 @@ class World {
                                   // kFluidSettleMax * kChunkVol * 2 words
   rhi::Buffer fluidCompactScratch; // per-256-span survivor counts + bases
                                    // (kFluidCap/256 * 2 u32)
+  rhi::Buffer fluidCellScratch;   // per active-block cell, 2 u32: [0] intent
+                                  // (mat<<16 | stainAmt<<3 | stainType,
+                                  // atomicMax by the seam's particleTick) and
+                                  // [1] flags (bit0 = a CA reaction consumed
+                                  // this cell's excited fluid, atomicOr by
+                                  // sim_step). The occupancy/consumption
+                                  // bridge between the CA and the particles;
+                                  // fill-cleared each fluid tick.
   rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
   rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
   rhi::Buffer bodyXforms;      // debris-body transforms (render)

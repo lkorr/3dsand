@@ -735,7 +735,7 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
          ((stainType & 0x7u) << 15u) | ((stainAmt & 0xFu) << 18u);
 }
 
-// ---- fluidArgsStage word map (16 u32) --------------------------------------
+// ---- fluidArgsStage word map (32 u32) --------------------------------------
 // [0..3]  node-pass dispatch args + active block count (alloc, per substep)
 // [4..6]  per-particle-pass dispatch args ((live+63)/64, 1, 1) — written by
 //         the seam's excite scan once per tick, copied to the indirect buffer
@@ -749,7 +749,10 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // [12]    excite refusals this tick (budget pressure diagnostics)
 // [13]    settling block count this tick
 // [14]    last excite chunk slot (sound cue positioning, coarse)
-// [15]    spare
+// [15]    eighths binned by settle this tick (mass audits)
+// [16]    eighths consumed by CA reactions this tick (mass audits)
+// [17]    contact stains applied this tick (parity gates, telemetry)
+// [18..31] spare
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;
@@ -758,6 +761,9 @@ const FA_EXCITED   : u32 = 11u;
 const FA_REFUSED   : u32 = 12u;
 const FA_SETBLOCKS : u32 = 13u;
 const FA_LASTSLOT  : u32 = 14u;
+const FA_BINNED    : u32 = 15u;
+const FA_CONSUMED  : u32 = 16u;
+const FA_STAINED   : u32 = 17u;
 
 // Must match FluidSpawnOp in world.h (32 bytes). mat carries the pour's brush
 // material into the particle's attr word (stainless, fullness 1).

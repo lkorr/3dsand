@@ -70,6 +70,8 @@ namespace {
 #define PIPE_FLUID_SETTLE_CHECK    Pipe::FluidSettleCheck
 #define PIPE_FLUID_SETTLE_COMMIT   Pipe::FluidSettleCommit
 #define PIPE_FLUID_SETTLE_KILL     Pipe::FluidSettleKill
+#define PIPE_FLUID_CONSUME_APPLY   Pipe::FluidConsumeApply
+#define PIPE_FLUID_STAIN_APPLY     Pipe::FluidStainApply
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect

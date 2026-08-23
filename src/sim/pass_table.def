@@ -185,9 +185,15 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // point only READS it (dirtyList[wg.x] at the top of main).
 // read-only in practice: declared read_write only because WGSL cannot mix
 // access modes for one binding across the module's entry points.
+// The three MLS-MPM buffers are the excited-fluid coupling (DESIGN.md §5):
+// doReactions synthesizes an excited cell as a liquid neighbour from LAST
+// tick's block map + node mass + the seam's intent word, and flags the cell
+// for consumption when a rule takes it. All three are last-tick state during
+// the whole 54-iteration loop — no intra-loop hazard, one inter-table one.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyList) I(DispatchArgs)
-          RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)))
+          RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
+          R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch)))
 
 // ---- phase 4: particles ---------------------------------------------------
 // Runs after the CA so flights see settled ground. Grid writes land in
@@ -508,6 +514,12 @@ PASS(seam_compact_scatter, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_SCATTER
 PASS(seam_spawn, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_SPAWN, K_COMPUTE, D_FLUIDSPAWN,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_FLUIDSPAWN, 1,
      USES(U(TickUBO) R(FluidSpawnOps) W(FluidParticlesWrite)
           A(FluidExciteScratch)))
+// Reactions that took excited fluid this tick (the CA's consume flags): the
+// whole cell bin dies before the substeps run. Addressed via LAST substep's
+// block map, exactly the addressing the CA used to set the flags.
+PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_COMPUTE, 4096,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) RW(FluidParticlesWrite) R(FluidBlockMap)
+          A(FluidCellScratch) A(FluidArgsStage) A(FluidExciteScratch)))
 // C_CAACTIVE: detect runs over THIS tick's compacted dirty list; when the CA
 // proved the world settled the list was not rebuilt and there is nothing
 // disturbed to excite.
@@ -522,8 +534,8 @@ PASS(seam_excite_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_SCAN, K_COMP
 PASS(copy_exciteArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TR(FluidExciteScratch) TW(FluidPDispatchArgs)))
 PASS(seam_excite_emit, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_EMIT, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_CAACTIVE, 1,
-     USES(RW(Voxels) U(TickUBO) R(PageTable) A(DirtyOut) R(FluidBlockMap)
-          R(FluidGrid) A(FluidExciteScratch) A(FluidArgsStage)
+     USES(RW(Voxels) U(TickUBO) R(PageTable) A(DirtyOut)
+          A(FluidExciteScratch) A(FluidArgsStage)
           W(FluidParticlesWrite) I(FluidPDispatchArgs)))
 // Per-particle dispatch args for the substeps and the settle half —
 // (live + 63) / 64, written by the excite scan into fluidArgs[4..6].
@@ -536,12 +548,27 @@ PASS(copy_fluidPArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 16,0,12, GRP_NON
 // particles. All voxel writes land in >= 8-tick-calm fluid-block chunks,
 // which the block-list readback has fed to PageTable::UpdateFluidChunks for
 // at least that long.
+// The intent/flags scratch clears HERE, at the head of the settle phase:
+// the CA has already read last tick's intents and consumeApply has already
+// read this tick's flags, and particleTick refills the intents next.
+PASS(seam_fill_cellScratch, nullptr, PT_FLUIDSETTLE, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(FluidCellScratch)))
 // read-only in practice: `fluidParticles` is read_write for the module
 // (compaction/spawn/emit/kill write it); particleTick only reads state to
-// fold each particle's speed into its slot's maximum.
+// fold each particle's speed into its slot's maximum and scatter its
+// occupancy + contact-stain intents.
 PASS(seam_particle_tick, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_PTICK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticlesWrite) A(FluidSettleScratch)
-          A(FluidArgsStage) I(FluidPDispatchArgs)))
+          A(FluidArgsStage) R(Voxels) R(Materials) R(PageTable)
+          R(FluidBlockMap) A(FluidCellScratch) I(FluidPDispatchArgs)))
+// Contact staining: one thread per active-block cell (the node-pass args of
+// the LAST substep), applying the intents particleTick just scattered —
+// solid surfaces touched by excited fluid take its stain, the CA's
+// doStaining semantics on the particle side.
+PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_INDIRECT, IND_FLUIDARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+     USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
+          R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
+          I(FluidDispatchArgs)))
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidSettleScratch) A(FluidCalm)))
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,

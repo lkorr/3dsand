@@ -1316,6 +1316,292 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-stain ---------------------------------------------------------
+// Staining parity across the seam (plan §6.2, task 4a): water voxels placed
+// CARRYING a foreign stain (type 3 — "blood-water") are excited, drain
+// through the box, and must (a) stain the solid surfaces the particles touch
+// with that SAME carried type (the CA's own staining would apply water's
+// authored "wet" type, so type 3 on a wall can only have come through the
+// particle attr word), and (b) re-settle still carrying the stain bits.
+// Twice-run world-hash equality as always.
+Status GateFluidStain(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+  const uint32_t kSType = 3u, kSAmt = 12u;
+
+  Tuning t = CurrentTuning();
+  t.dayNight.freeze = 1;
+  t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  t.sim.fluidExciteMode = 1;
+  t.sim.fluidDamping = 0.9f;      // the excite gate's sealed-box overrides
+  t.sim.fluidStiffness = 2400.0f;
+  t.sim.fluidSettleEps = 6.0f;
+  t.sim.fluidWakeSpeed = 24.0f;
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(t);
+  sim.ReloadShaders(ctx.device);
+
+  const int px = 96, pz = 96, RB = 8;
+  const int floorY = 109, upperY = 119, roofY = 126;
+  const int kCarveTick = 30, kMaxTicks = 260;
+  uint32_t worldHash[2] = {0, 0};
+  uint32_t stainedWalls = 0, stainedWater = 0, appliedSum = 0;
+  for (int run = 0; run < 2; run++) {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> box;
+    auto put = [&](int x, int y, int z, uint32_t w) {
+      box.push_back({World::SlotCellIndex({x, y, z}), w});
+    };
+    const uint32_t stainedWaterWord =
+        waterId | (7u << 12) | (kSAmt << 24) | (kSType << 28);
+    for (int y = floorY - 1; y <= roofY + 1; y++)
+      for (int z = -RB; z <= RB; z++)
+        for (int x = -RB; x <= RB; x++) {
+          bool shell = x <= -RB + 1 || x >= RB - 1 || z <= -RB + 1 ||
+                       z >= RB - 1 || y <= floorY || y >= roofY ||
+                       y == upperY || y == upperY + 1;
+          if (shell) put(px + x, y, pz + z, kMatStone);
+          else if (y >= upperY + 2 && y <= upperY + 3)
+            put(px + x, y, pz + z, stainedWaterWord);
+          else put(px + x, y, pz + z, 0u);
+        }
+    std::vector<CellOp> carve;
+    for (int z = -2; z < 2; z++)
+      for (int x = -2; x < 2; x++) {
+        carve.push_back({World::SlotCellIndex({px + x, upperY, pz + z}), 0u});
+        carve.push_back(
+            {World::SlotCellIndex({px + x, upperY + 1, pz + z}), 0u});
+      }
+
+    uint32_t ft = 60000;
+    uint32_t liveEst = 0;
+    for (int i = 0; i < kMaxTicks; i++) {
+      std::vector<CellOp> cops;
+      if (i == 0) cops = box;
+      else if (i == kCarveTick) cops = carve;
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {}, cops, false,
+                 {6, 7, 6}, false, false, {}, 0, {}, liveEst);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      if (i >= kCarveTick) {
+        uint32_t fa[32] = {};
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
+                              fa, 128, "stainArgs");
+        liveEst = std::min(fa[7], kFluidCap);
+        appliedSum += fa[17];  // FA_STAINED
+        // Wall sweep MID-DRAIN: the settled pool later WASHES the walls it
+        // touches (water's authored `washes: true` rinsing the foreign
+        // type — the same behaviour that lets CA water clean blood off
+        // stone), so the deposited stains must be observed while the flow
+        // is live, not at the washed end state.
+        if (i == kCarveTick + 50) {
+          stainedWalls = 0;
+          std::vector<uint32_t> cb2((size_t)kChunkVol);
+          for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+            for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
+              for (int cx2 = (px - RB) / 16; cx2 <= (px + RB) / 16; cx2++) {
+                ReadVoxelsSync(ctx, world,
+                               World::SlotChunkIndex({cx2, cy, cz2}), 1,
+                               cb2.data(), "stainMid");
+                for (uint32_t k = 0; k < kChunkVol; k++) {
+                  uint32_t w = cb2[k];
+                  if (((w >> 28) & 0x7u) == kSType &&
+                      ((w >> 24) & 0xFu) != 0 && (w & 0xFFFu) == kMatStone)
+                    stainedWalls++;
+                }
+              }
+        }
+      }
+    }
+    worldHash[run] = HashWorldNow(ctx, world, sim, kDefaultSeed);
+
+    stainedWater = 0;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+      for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
+        for (int cx2 = (px - RB) / 16; cx2 <= (px + RB) / 16; cx2++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx2, cy, cz2}), 1,
+                         cbuf.data(), "stainVox");
+          for (uint32_t i = 0; i < kChunkVol; i++) {
+            uint32_t w = cbuf[i];
+            if (((w >> 28) & 0x7u) == kSType && ((w >> 24) & 0xFu) != 0 &&
+                (w & 0xFFFu) == waterId)
+              stainedWater++;
+          }
+        }
+  }
+  SetCurrentTuning(saved);
+  sim.ReloadShaders(ctx.device);
+
+  bool det = worldHash[0] == worldHash[1];
+  // stainedWalls is a STEADY-STATE snapshot: application (~27%/tick/cell)
+  // races the pool's wash (~26%/tick/contact), so only a couple of wall
+  // cells are visibly stained at any instant. The volume claim lives in
+  // appliedSum; the snapshot just proves the bits land on real voxels.
+  bool ok = appliedSum >= 50 && stainedWalls >= 1 && stainedWater >= 20 && det;
+  std::printf(
+      "fluid stain: %s (%u contact stains applied, %u wall cells carried the "
+      "excited type mid-drain, %u settled water cells kept it to the end, "
+      "world hash %s)\n",
+      ok ? "PASS" : "FAIL", appliedSum, stainedWalls, stainedWater,
+      det ? "matches" : "DIVERGED");
+  detail = Format("%u applied, %u walls, %u water, det %s", appliedSum,
+                  stainedWalls, stainedWater, det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- fluid-react ---------------------------------------------------------
+// CA reactions consume EXCITED fluid (plan §6.2, task 4b): plants next to
+// water grow into it (`neighborBecomes: plant` — a water-consuming rule).
+// A plant bed on the catch floor eats from the drained pool: consumption
+// must occur while the water is PARTICLES (the doReactions synthesis + the
+// seam's consume flags), and the mass account must stay exact:
+// placed == standing water + live fullness + consumed eighths.
+Status GateFluidReact(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0, plantId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "water") waterId = (uint32_t)i;
+    if (c.mats[i].name == "plant") plantId = (uint32_t)i;
+  }
+  if (waterId == 0 || plantId == 0) {
+    detail = "no water/plant material";
+    return Status::Fail;
+  }
+
+  Tuning t = CurrentTuning();
+  t.dayNight.freeze = 1;
+  t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  t.sim.fluidExciteMode = 1;
+  t.sim.fluidDamping = 0.9f;
+  t.sim.fluidStiffness = 2400.0f;
+  t.sim.fluidSettleEps = 6.0f;
+  t.sim.fluidWakeSpeed = 24.0f;
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(t);
+  sim.ReloadShaders(ctx.device);
+
+  const int px = 96, pz = 96, RB = 8;
+  const int floorY = 109, upperY = 119, roofY = 126;
+  const int kCarveTick = 30, kMaxTicks = 260;
+  const uint32_t kWaterEighths = 13u * 13u * 2u * 8u;  // 2 deep this time
+  uint32_t worldHash[2] = {0, 0};
+  uint32_t consumedSum = 0, standing = 0, liveEighths = 0, plantsEnd = 0;
+  const uint32_t kPlantsStart = 5 * 5;
+  for (int run = 0; run < 2; run++) {
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> box;
+    auto put = [&](int x, int y, int z, uint32_t w) {
+      box.push_back({World::SlotCellIndex({x, y, z}), w});
+    };
+    for (int y = floorY - 1; y <= roofY + 1; y++)
+      for (int z = -RB; z <= RB; z++)
+        for (int x = -RB; x <= RB; x++) {
+          bool shell = x <= -RB + 1 || x >= RB - 1 || z <= -RB + 1 ||
+                       z >= RB - 1 || y <= floorY || y >= roofY ||
+                       y == upperY || y == upperY + 1;
+          if (shell) put(px + x, y, pz + z, kMatStone);
+          else if (y >= upperY + 2 && y <= upperY + 3)
+            put(px + x, y, pz + z, waterId | (7u << 12));
+          else if (y == floorY + 1 && std::abs(x) <= 2 && std::abs(z) <= 2)
+            put(px + x, y, pz + z, plantId);  // the plant bed (5x5)
+          else put(px + x, y, pz + z, 0u);
+        }
+    std::vector<CellOp> carve;
+    for (int z = -2; z < 2; z++)
+      for (int x = -2; x < 2; x++) {
+        carve.push_back({World::SlotCellIndex({px + x, upperY, pz + z}), 0u});
+        carve.push_back(
+            {World::SlotCellIndex({px + x, upperY + 1, pz + z}), 0u});
+      }
+
+    uint32_t ft = 70000;
+    uint32_t liveEst = 0;
+    consumedSum = 0;
+    for (int i = 0; i < kMaxTicks; i++) {
+      std::vector<CellOp> cops;
+      if (i == 0) cops = box;
+      else if (i == kCarveTick) cops = carve;
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {}, cops, false,
+                 {6, 7, 6}, false, false, {}, 0, {}, liveEst);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      if (i >= kCarveTick) {
+        uint32_t fa[32] = {};
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
+                              fa, 128, "reactArgs");
+        liveEst = std::min(fa[7], kFluidCap);
+        consumedSum += fa[16];  // FA_CONSUMED
+      }
+    }
+    worldHash[run] = HashWorldNow(ctx, world, sim, kDefaultSeed);
+
+    // Final live fullness for the mass equation.
+    liveEighths = 0;
+    uint32_t fa[32] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                          128, "reactArgsEnd");
+    uint32_t live = std::min(fa[7], kFluidCap);
+    if (live > 0) {
+      std::vector<uint32_t> pbuf((size_t)live * kFluidParticleWords);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                            world.fluidParticles[sim.Page()], 0, pbuf.data(),
+                            pbuf.size() * 4, "reactEndP");
+      for (uint32_t k = 0; k < live; k++)
+        liveEighths += (pbuf[k * kFluidParticleWords + 18] >> 12) & 0x7u;
+    }
+
+    standing = 0;
+    plantsEnd = 0;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+      for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
+        for (int cx2 = (px - RB) / 16; cx2 <= (px + RB) / 16; cx2++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx2, cy, cz2}), 1,
+                         cbuf.data(), "reactVox");
+          for (uint32_t i = 0; i < kChunkVol; i++) {
+            int lx = (int)(i % 16) + cx2 * 16,
+                ly = (int)((i / 16) % 16) + cy * 16,
+                lz = (int)(i / 256) + cz2 * 16;
+            if (lx < px - RB + 2 || lx > px + RB - 2 || lz < pz - RB + 2 ||
+                lz > pz + RB - 2 || ly <= floorY || ly >= roofY)
+              continue;
+            uint32_t m = cbuf[i] & 0xFFFu;
+            if (m == waterId) standing += ((cbuf[i] >> 12) & 0xFu) + 1u;
+            if (m == plantId) plantsEnd++;
+          }
+        }
+  }
+  SetCurrentTuning(saved);
+  sim.ReloadShaders(ctx.device);
+
+  bool det = worldHash[0] == worldHash[1];
+  bool consumed = consumedSum > 0;
+  bool grew = plantsEnd > kPlantsStart;
+  bool massOk = standing + liveEighths + consumedSum == kWaterEighths;
+  bool ok = consumed && grew && massOk && det;
+  std::printf(
+      "fluid react: %s (%u eighths consumed by reactions, plants %u -> %u, "
+      "%u standing + %u live + %u consumed of %u placed, world hash %s)\n",
+      ok ? "PASS" : "FAIL", consumedSum, kPlantsStart, plantsEnd, standing,
+      liveEighths, consumedSum, kWaterEighths, det ? "matches" : "DIVERGED");
+  detail = Format("%u consumed, plants %u->%u, mass %u+%u+%u/%u, det %s",
+                  consumedSum, kPlantsStart, plantsEnd, standing, liveEighths,
+                  consumedSum, kWaterEighths, det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- prefab ------------------------------------------------------------
 Status GatePrefab(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -1650,6 +1936,8 @@ const std::vector<Gate>& SimGates() {
       {"fluid-det", "sim", {}, false, GateFluidDet},
       {"fluid-settle", "sim", {}, false, GateFluidSettle},
       {"fluid-excite", "sim", {}, false, GateFluidExcite},
+      {"fluid-stain", "sim", {}, false, GateFluidStain},
+      {"fluid-react", "sim", {}, false, GateFluidReact},
       {"prefab", "sim", {}, false, GatePrefab},
       {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},

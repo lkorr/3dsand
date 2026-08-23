@@ -98,6 +98,7 @@ enum class Buf : uint8_t {
   FluidCalm,
   FluidSettleScratch,
   FluidCompactScratch,
+  FluidCellScratch,
   kCount,
 };
 
@@ -144,6 +145,7 @@ enum class Pipe : uint8_t {
   FluidExciteDetect, FluidExciteScan, FluidExciteEmit,
   FluidPTick, FluidSettleJudge, FluidSettleScan, FluidSettleBin,
   FluidSettleCheck, FluidSettleCommit, FluidSettleKill,
+  FluidConsumeApply, FluidStainApply,
   // Materializes a JITTER page (world.h's JITTER block): the one fill a
   // vkCmdFillBuffer cannot do, because the words vary per cell.
   PageFill,
@@ -252,7 +254,9 @@ enum class DispatchSel : uint32_t {
 // 9 -> 10 with R(PageTable) -> 11 with A(PageFaults), which exceeded the old
 // ceiling and stopped the build, as the static_assert is meant to. Raised to
 // 12 rather than 11 so the next row addition does not repeat it.
-inline constexpr int kMaxUses = 12;
+// Raised 12 -> 16 by the MPM seam: `ca` gains the excited-fluid coupling
+// (R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch)) -> 14 uses.
+inline constexpr int kMaxUses = 16;
 
 struct Row {
   const char* name;

@@ -127,6 +127,8 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_SETTLE_CHECK": "fluidSettleCheck_",
     "PIPE_FLUID_SETTLE_COMMIT": "fluidSettleCommit_",
     "PIPE_FLUID_SETTLE_KILL": "fluidSettleKill_",
+    "PIPE_FLUID_CONSUME_APPLY": "fluidConsumeApply_",
+    "PIPE_FLUID_STAIN_APPLY": "fluidStainApply_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -175,14 +177,15 @@ BUF_TO_WGSL = {
     "FluidParticlesRead": {"fluidSrc"},
     "FluidParticlesWrite": {"fluidParticles", "fluid"},
     "FluidSpawnOps": {"fluidSpawnOps"},
-    "FluidBlockMap": {"fluidBlockMap", "fluidBlockMapR"},
+    "FluidBlockMap": {"fluidBlockMap", "fluidBlockMapR", "fluidBlockMapS"},
     "FluidBlockList": {"fluidBlockList"},
-    "FluidGrid": {"fluidGrid", "fluidGridR"},
+    "FluidGrid": {"fluidGrid", "fluidGridR", "fluidGridS"},
     "FluidArgsStage": {"fluidArgs"},
     "FluidExciteScratch": {"exciteScratch"},
     "FluidCalm": {"fluidCalm"},
     "FluidSettleScratch": {"settleScratch"},
     "FluidCompactScratch": {"compactScratch"},
+    "FluidCellScratch": {"fluidCellScratch"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -210,6 +213,7 @@ _SIM_GROUP0 = {
     "voxels", "dirtyIn", "dirtyOut", "materials", "T", "P", "ops", "occupancy",
     "worldHash", "pick", "R", "reactions", "dirtyList", "args", "cellOps",
     "supportOut", "genList", "pageFillList", "pageTable", "pageFaults",
+    "fluidBlockMapS", "fluidGridS", "fluidCellScratch",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -227,7 +231,7 @@ _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
 _FLUID_SEAM_GROUP1 = {"fluidSrc", "fluidParticles", "fluidSpawnOps",
                       "fluidBlockMapR", "fluidGridR", "fluidArgs", "dirtyList",
                       "exciteScratch", "fluidCalm", "settleScratch",
-                      "compactScratch"}
+                      "compactScratch", "fluidCellScratch", "fluidBlockList"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,
