@@ -410,6 +410,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
                     const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
   dt = std::min(dt, 0.05f);
   ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
+  ledgeInReach = false;  // recomputed below (hang block or the walk probe)
 
   // Decay the render-only step-smoothing offset toward zero (frame-rate
   // independent: a fixed half-life, so the eye covers half the remaining
@@ -624,6 +625,8 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       vel = Vec3{0, 0, 0};
       grounded = false;
       coyoteTimer = 0.0f;
+      ledgeInReach = true;  // holding one, by definition
+      ledgeLip = hangLip;
       Vec3 d = hangAnchor - pos;
       const float step = (T().ledgeMantleSpeed / kVoxelMeters) * dt;
       const float yBefore = pos.y;
@@ -804,28 +807,34 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
 
     // ---- ledge grab latch (see the hanging block above) ----
     //
-    // Airborne, space held — the same reach-up gesture swimming uses — and
-    // not powering upward: the vel.y gate is nonJumpSpeed, the constant that
-    // already means "unambiguously leaving the ground under own power". While
-    // a jump or an arm boost is still driving up, the hands stay off the
-    // wall; that is also what stops a boost from instantly re-latching the
-    // lip it just left. Judged AFTER the move, against where the body
+    // The PROBE runs unconditionally so the HUD can report a lip in reach
+    // even while a latch gate refuses it (ledgeInReach). The LATCH itself
+    // needs: airborne, space held — the same reach-up gesture swimming uses —
+    // and not powering upward: the vel.y gate is nonJumpSpeed, the constant
+    // that already means "unambiguously leaving the ground under own power".
+    // While a jump or an arm boost is still driving up, the hands stay off
+    // the wall; that is also what stops a boost from instantly re-latching
+    // the lip it just left. Judged AFTER the move, against where the body
     // actually ended the frame.
-    if (!hanging && !grounded && !inLiquid && mantleTimer <= 0.0f && in.up &&
-        !in.down && vel.y <= nonJumpSpeed) {
+    if (!hanging && mantleTimer <= 0.0f) {
       Vec3 dir = flatFwd;
       dir.y = 0.0f;
       if (dir.len() > 1e-3f) {
         dir = dir.normalized();
         LedgeHit hit;
         if (LedgeGrabAhead(pos, dir, kindAt, &hit)) {
-          hanging = true;
-          ledgeGrabbed = true;
-          hangLip = hit.lip;
-          hangAnchor = hit.anchor;
-          hangStand = hit.stand;
-          hangDir = dir;
-          vel = Vec3{0, 0, 0};  // the grip arrests the fall
+          ledgeInReach = true;
+          ledgeLip = hit.lip;
+          if (!grounded && !inLiquid && in.up && !in.down &&
+              vel.y <= nonJumpSpeed) {
+            hanging = true;
+            ledgeGrabbed = true;
+            hangLip = hit.lip;
+            hangAnchor = hit.anchor;
+            hangStand = hit.stand;
+            hangDir = dir;
+            vel = Vec3{0, 0, 0};  // the grip arrests the fall
+          }
         }
       }
     }

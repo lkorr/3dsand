@@ -86,6 +86,12 @@ class Player {
   Vec3 hangAnchor{};          // where the body settles while dangling
   Vec3 hangStand{};           // standing spot on the lip, re-validated at pull-up
   Vec3 hangDir{1, 0, 0};      // horizontal facing at grab time, toward the wall
+  // Live HUD readout: the lip probe runs EVERY walk frame — grounded, rising,
+  // space or not — so the dev panel can say "a lip is in reach and here is the
+  // latch gate that refused" rather than the player inferring it. Costs one
+  // LedgeGrabAhead per frame (~a hundred cell reads), nothing when flying.
+  bool ledgeInReach = false;  // a grabbable lip is within hand reach right now
+  IVec3 ledgeLip{};           // which lip (valid while ledgeInReach or hanging)
 
   // Jump grace windows, seconds remaining. coyoteTimer keeps a jump legal
   // briefly after leaving the ground; jumpBuffer remembers a press made just

@@ -2679,6 +2679,33 @@ int main(int argc, char** argv) {
       ui.activeBodyCount = debris.ActiveBodyCount();
       ui.prefabPending = (uint32_t)placer.PendingCount();
       ui.mobCount = mobs.MobCount();
+      // Ledge-grab readout: the probe result plus every latch gate, so "why
+      // didn't it grab" is readable in the panel rather than inferred. The
+      // gates mirror the latch condition in Player::Update exactly.
+      {
+        const float nonJump =
+            CurrentTuning().player.nonJumpSpeed / kVoxelMeters;
+        char lg[160];
+        if (player.hanging) {
+          std::snprintf(lg, sizeof lg,
+                        "HANGING lip(%d,%d,%d) — W: pull up, ctrl: drop",
+                        player.hangLip.x, player.hangLip.y, player.hangLip.z);
+        } else if (player.ledgeInReach) {
+          std::snprintf(
+              lg, sizeof lg,
+              "lip(%d,%d,%d) IN REACH — air=%d space=%d velOk=%d%s",
+              player.ledgeLip.x, player.ledgeLip.y, player.ledgeLip.z,
+              player.grounded ? 0 : 1, pin.up ? 1 : 0,
+              player.vel.y <= nonJump ? 1 : 0,
+              player.grounded ? "  (jump at it holding space)" : "");
+        } else {
+          std::snprintf(lg, sizeof lg,
+                        "no lip in reach (need a wall top between shoulders "
+                        "and fingertips)");
+        }
+        ui.ledgeState = player.hanging ? 2 : (player.ledgeInReach ? 1 : 0);
+        ui.ledgeText = lg;
+      }
       // magic readout: cost must be visible BEFORE the cast, which is what
       // makes the mana/health crossover a decision rather than a surprise.
       ui.mana = caster.mana.mana;
