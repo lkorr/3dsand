@@ -408,26 +408,96 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     //     §2.3), so using it here keeps a single definition rather than a
     //     second predicate that must agree with it.
     //
-    // The WaitIdle is required, not defensive: genChunk writes the voxels in
-    // this submit, and reading before it completes returns the PREVIOUS
-    // contents — for a freshly scrolled-in slot, zeros, so every generated
-    // chunk would be demoted and its matter lost. Blocking is fine here:
-    // FillSlots already runs mid-frame on its own submit and a window shift is
-    // a streaming event, not a per-tick cost.
+    // The read must not start before genChunk's submit completes: reading early
+    // returns the PREVIOUS contents — for a freshly scrolled-in slot, zeros, so
+    // every generated chunk would be demoted and its matter lost. The batch's
+    // own copy is submitted after genChunk's on the same queue, so queue order
+    // carries that dependency; the only block is the single map at the end.
+    //
+    // ONE COPY PER BATCH, NOT ONE PER SLOT. This loop is the whole cost of a
+    // window shift. Per-slot rhi::ReadbackBlocking creates a buffer, submits a
+    // command buffer, waits the queue idle and maps — once per chunk — and a
+    // shift plane is kNChunk^2 = 1,024 chunks: measured at 92 ms of readback
+    // plus a 14 ms WaitIdle per shift, ~105 ms total, against 0.5 ms for the
+    // same shift under dense residency. Sprint-flying shifts on consecutive
+    // frames, so that stall landed on nearly every frame and pinned the game at
+    // ~7 fps while moving. Batching into kEvictBatch-sized copies (the bound
+    // the eviction path already uses for exactly this reason, 4 MB of staging)
+    // makes it one submit and one map per 256 chunks.
     if (world_->residency == World::Residency::Paged) {
-      ctx_->device.WaitIdle();
-      std::vector<uint32_t> vox(kChunkVol);
       uint32_t demoted = 0;
+      std::vector<uint32_t> vox(kEvictBatch * kChunkVol);
+
+      // ---- PREFILTER ON OCCUPANCY, so the voxel read is sized to the ANSWER --
+      //
+      // genChunk computes each chunk's occupancy in-kernel and writes it in the
+      // same dispatch (worldgen.wgsl), so the demote candidates are known from a
+      // 128 KiB buffer instead of 16 MiB of voxels.
+      //
+      // TWO occupancy values can demote, not one, and the second is the whole
+      // point of the JITTER sentinel (world.h's JITTER block):
+      //   occ == 0          all air         -> PT_EMPTY
+      //   occ == CHUNK_VOL  completely full -> UNIFORM or JITTER
+      // The original form of this prefilter tested `occ == 0` only, on the
+      // reasoning that "a UNIFORM non-air chunk is not something worldgen
+      // produces, because a solid-stone chunk is uniform in MATERIAL but its
+      // state nibble carries per-cell palette jitter". That reasoning was exactly
+      // right and is exactly what JITTER now represents — so the chunks it
+      // excluded are the ones worth compressing. A partially-full chunk still
+      // cannot demote: no sentinel form can describe a mix of air and matter.
+      //
+      // The stain caveat that makes `occ == 0` unsafe on the tick path does NOT
+      // apply here: worldgen writes no stain bits at all, so a freshly
+      // generated all-air chunk carries no hashed state. The words are still
+      // read and Classify still decides — this only narrows WHICH chunks are
+      // read, never what the rule is (PageTable::Classify stays the one
+      // promotion rule, §2.3). Measured on a shift plane: ~1,024 candidates
+      // down to the ~350 that actually demote.
+      std::vector<uint32_t> occ(kNumChunks);
+      if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->occupancy, 0,
+                                 occ.data(), (size_t)kNumChunks * 4, "genOcc"))
+        occ.assign(kNumChunks, 0);  // read failed: fall back to testing all
+
+      // Collect the candidates: a sentinel slot has nothing to read and is
+      // already in its demoted form; a PARTIALLY-full slot cannot demote.
+      std::vector<uint32_t> paged;
+      paged.reserve(genSlots.size());
       for (uint32_t gs : genSlots) {
-        const uint64_t off = world_->PageOffsetOfSlot(gs);
-        if (off == World::kNoPage) continue;
-        if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->voxels,
-                                   off, vox.data(), kChunkBytes, "genClassify"))
-          break;
-        const uint32_t e = world_->pages->Classify(gs, vox.data());
-        if (e == PageTable::kNeedsPage) continue;
-        world_->pages->SetSentinel(gs, e);
-        demoted++;
+        if (world_->PageOffsetOfSlot(gs) == World::kNoPage) continue;
+        const uint32_t nonAir = occ[gs] & 0xFFFFu;  // low 16 = non-air count
+        if (nonAir != 0u && nonAir != kChunkVol) continue;
+        paged.push_back(gs);
+      }
+
+      for (size_t off = 0; off < paged.size(); off += kEvictBatch) {
+        const size_t n = std::min(kEvictBatch, paged.size() - off);
+        rhi::Buffer staging = AcquireStaging();
+        rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+        for (size_t i = 0; i < n; i++) {
+          // Tracked, like the eviction copy: every off-table voxels read goes
+          // through the barrier tracker rather than special-casing this one.
+          enc.CopyTracked(pass::Buf::Voxels, world_->voxels,
+                          world_->PageOffsetOfSlot(paged[off + i]), staging,
+                          i * kChunkBytes, kChunkBytes);
+        }
+        ctx_->queue.Submit(enc.Finish());
+        rhi::MapTicket map =
+            rhi::MapReadDeferred(ctx_->device, staging, 0, n * kChunkBytes);
+        map.Wait();
+        if (map.Succeeded() && map.Data()) {
+          std::memcpy(vox.data(), map.Data(), n * kChunkBytes);
+          map.Unmap();
+          for (size_t i = 0; i < n; i++) {
+            const uint32_t e = world_->pages->Classify(paged[off + i],
+                                                       vox.data() + i * kChunkVol);
+            if (e == PageTable::kNeedsPage) continue;
+            world_->pages->SetSentinel(paged[off + i], e);
+            demoted++;
+          }
+        } else {
+          map.Unmap();
+        }
+        stagingPool_.push_back(staging);
       }
       if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
     }

@@ -62,6 +62,9 @@ namespace {
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
+bool g_autofly = false;
+bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool sizing
+std::vector<double> g_frameMs;  // --frames: whole-frame wall clock, for percentiles
 double g_harnessRenderMs = 0.0;
 
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
@@ -1136,6 +1139,8 @@ int main(int argc, char** argv) {
     // `--frames N` runs the WINDOWED game for N frames, fires one F5 shader
     // reload midway, and exits cleanly — the phase-4b D3 verification harness.
     if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
+    if (a == "--autofly") g_autofly = true;
+    if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
     // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
@@ -1565,6 +1570,9 @@ int main(int argc, char** argv) {
     // instantaneous 1/dt over-weights the fast frames whenever the CPU races
     // ahead of a GPU-bound present queue (several ~5 ms loops, one long
     // block), and reads 100+ while the screen updates at <10.
+    // Skip the first 60 frames: worldgen and first-use pipeline creation are
+    // startup cost, not the steady-state stall being measured.
+    if (g_harnessFrames > 0 && frameCounter > 60) g_frameMs.push_back(dt * 1000.0);
     fpsWinFrames++;
     fpsWinWorst = std::max(fpsWinWorst, (double)dt);
     if (now - fpsWinStart >= 0.5) {
@@ -1716,6 +1724,30 @@ int main(int argc, char** argv) {
     pin.down = key(GLFW_KEY_LEFT_CONTROL);
     pin.sprint = key(GLFW_KEY_LEFT_SHIFT);
     pin.jumpPressed = eJump.Pressed(key(GLFW_KEY_SPACE));
+    // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
+    // reproduce the streaming-shift stutter, which only appears when the window
+    // origin moves several chunks per second.
+    if (g_autofly) {
+      player.fly = true;
+      ui.fly = true;
+      pin.forward = 1.f;
+      pin.strafe = 0.f;
+      pin.sprint = true;
+      // --autofly-hard: the ADVERSARIAL traversal, which is what actually sizes
+      // the pool (production streaming guidance is explicit that teleports,
+      // 180-degree turns and fast diagonal traversal define a pool, not steady
+      // state — and a window shift is structurally a teleport). Strafes and
+      // descends at the same time, so all three axes shift together and the
+      // window drives DOWN into solid underground bulk, where almost every
+      // chunk needs a real page instead of an EMPTY sentinel.
+      if (g_autoflyHard) {
+        // Turn on a fixed tick schedule, never on wall-clock: this has to be
+        // reproducible run to run.
+        const uint32_t phase = (uint32_t)(tick / 90u) & 3u;
+        pin.strafe = (phase == 1) ? 1.f : (phase == 3) ? -1.f : 0.f;
+        pin.down = true;   // descend into solid rock: worst case for residency
+      }
+    }
 
     if (ui.reloadShaders) {
       ui.reloadShaders = false;
@@ -1972,6 +2004,32 @@ int main(int argc, char** argv) {
       ui.stepOnce = false;
       tick++;
       ticksThisFrame++;
+
+      // PUMP THE READBACK RING BETWEEN TICKS, NOT ONCE PER FRAME.
+      //
+      // Paged residency makes snapshot FRESHNESS load-bearing, and freshness is
+      // per TICK, not per frame. §3.2's intersection is the only thing that
+      // shrinks cpuDirty, and TightenFromSnapshot rolls a stale snapshot
+      // forward by dilating it one N26 ring per tick of lag — the same ring
+      // step (1) applies to cpuDirty itself. So at a 2-tick lag the two
+      // operands have grown by the same factor and the intersection stops
+      // removing anything: measured `tighten from snap 51 (2 rolls):
+      // 6563 -> 6563`, a no-op, after which the mirror compounds ~2.3x/tick
+      // and materializes straight through the pool (FATAL at ~23.4k of 24,576
+      // pages while sprint-flying).
+      //
+      // The pump was at the BOTTOM of the frame loop, so a frame running the
+      // 4-tick backlog cap got ONE snapshot for four ticks and three of them
+      // tightened against roll-stale data. Over a 300-frame flight only 34 of
+      // 206 tightenings ran at 0 rolls. This is NOT the readback ring running
+      // out of slots — EncodeReadbacks declined just twice in that run.
+      //
+      // ProcessEvents is non-blocking (PollFences + fire-ready callbacks), so
+      // a tick whose snapshot has not landed pays a fence status check and
+      // moves on. It is called before the tick that will CONSUME the snapshot,
+      // so a fence that signalled during the previous tick's GPU work is
+      // observed on the very next tick instead of a frame later.
+      ctx.ProcessEvents();
 
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
@@ -3197,6 +3255,24 @@ int main(int argc, char** argv) {
                 "'render 1080p' sweep)\n",
                 (unsigned long long)frameCounter,
                 g_harnessRenderMs / (double)frameCounter);
+    // WHOLE-FRAME wall clock, which is what a stall shows up in. The average
+    // above is render+present only and a streaming hitch is invisible in it;
+    // the percentiles below are the number that matches "it drops to a crawl".
+    std::sort(g_frameMs.begin(), g_frameMs.end());
+    auto pct = [&](double p) {
+      return g_frameMs.empty() ? 0.0
+                               : g_frameMs[(size_t)(p * (g_frameMs.size() - 1))];
+    };
+    size_t over33 = 0, over100 = 0;
+    for (double m : g_frameMs) {
+      if (m > 33.0) over33++;
+      if (m > 100.0) over100++;
+    }
+    std::printf("--frames harness: whole-frame ms  p50 %.1f  p95 %.1f  p99 %.1f "
+                " max %.1f | >33ms %zu (%.1f%%)  >100ms %zu\n",
+                pct(0.50), pct(0.95), pct(0.99),
+                g_frameMs.empty() ? 0.0 : g_frameMs.back(), over33,
+                100.0 * over33 / (double)g_frameMs.size(), over100);
   }
 
   telemetry.Shutdown();

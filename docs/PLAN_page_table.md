@@ -2942,3 +2942,34 @@ paged-with must hash identically to paged-without.
   must run the whole terrain function — trees, ivy, grass — on every read, and is
   a much deeper change than this one.
 - **No eviction to the chunk store** for disturbed-then-abandoned buried chunks.
+
+## 9.7 The adversarial-descent number [MEASURED post-merge, 2026-08-23]
+
+Merging onto `2debd8a` brought `--autofly-hard`, the adversarial traversal that
+CLAUDE.md's page-pool invariant was written against: a diagonal flight plus a
+descent into solid rock, which is the residency worst case (the harness window
+and a standing player both under-report by ~2x).
+
+**That scenario is where this change actually pays.**
+
+| scenario | JITTER off | JITTER on | |
+|---|---|---|---|
+| selftest window | 4,975 | 2,861 | −42% |
+| real game, standing | 16,420 | 15,545 | −5% |
+| **`--autofly-hard`** | **32,395** | **14,697** | **−55%** |
+
+The invariant previously read: *"UNSOLVED: sustained fast flight still exhausts
+the pool and aborts, even at dense size — it is a MEMORY-CONSUMPTION problem,
+not a sizing or speed one, and the fix is reducing the resident working set
+(sparse/buried-chunk compression, a widened sentinel that can represent
+single-material-with-state chunks), not a bigger pool."*
+
+That is precisely this sentinel, and the descent now settles at 14,697 of 32,768
+with no exhaustion, no page faults and a clean exit. The invariant is updated
+rather than deleted, because the reasoning behind it is still correct: `kPoolPages`
+stays dense-sized, since **a chunk the player has DUG is not representable by any
+sentinel** and a sufficiently destructive session still trends toward dense.
+
+Note the ordering lesson for whoever measures next: the 5% standing-player figure
+and the 55% descent figure are the SAME build. Residency wins are scenario-shaped,
+so quote the scenario with the number or the number means nothing.
