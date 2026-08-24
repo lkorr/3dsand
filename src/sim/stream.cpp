@@ -935,14 +935,53 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // tick path in PageTable::ConsumeOccupancy: that path already required
       // the slot to be out of cpuDirty and quiet for kPageFreeTicks, which is
       // exactly the condition an in-flight op violates.
+      // ---- THE SKY SHARE DEMOTES WITH NO COPY AT ALL ----------------------
+      //
+      // The refusal above is about chunks IN GENERAL, and it is right about
+      // them. These slots are not chunks in general: every one of them was
+      // overwritten end to end by the genChunk dispatch this very call
+      // submitted, and the occupancy being read is that dispatch's own
+      // in-kernel count. So the two things occupancy cannot see do not exist
+      // here — genCell returns packVox(mat, state, STAMP_NEVER) and can set
+      // neither bit 31 (kCellOpIfAir) nor a stain bit, and worldgen writes no
+      // stain at all, which is exactly why genChunk writes packOcc and not
+      // packOccStain. `nonAir == 0` on a freshly generated slot therefore does
+      // not merely suggest PT_EMPTY's content, it IS PT_EMPTY's content.
+      //
+      // What about a write LATER in this same tick? It is covered, and by the
+      // machinery that already exists rather than by luck:
+      //   - a CPU op is assembled AFTER this call and lands in opTargets, an
+      //     UNFILTERED term of materialize(N), which runs later in this tick
+      //     and re-allocates the page before the dispatch;
+      //   - a CA neighbour pushing a voxel in is covered by that neighbour's
+      //     own membership: it is mixed, so the act set above woke it, and
+      //     materialize allocates N26(cpuDirty). This is the same protection
+      //     every OTHER sky chunk in the window already lives on.
+      //
+      // The win is that this is the COMMON case by a wide margin: a shift
+      // plane is mostly sky, and each of those slots was costing a 16 KiB
+      // copy out, a 16 KiB memcpy back, and a 4,096-word Classify to be told
+      // what its occupancy count already said.
+      //
+      // The FULL case (nonAir == kChunkVol -> UNIFORM or JITTER) still needs
+      // the words: those sentinels must reproduce the resident content
+      // bit-exactly, which is Classify's exact-word rule and not something a
+      // count can decide.
       std::vector<uint32_t> paged;
       paged.reserve(genSlots.size());
+      uint32_t skyDemoted = 0;
       for (uint32_t gs : genSlots) {
         if (world_->PageOffsetOfSlot(gs) == World::kNoPage) continue;
         const uint32_t nonAir = occ[gs] & 0xFFFFu;  // low 16 = non-air count
+        if (occValid && nonAir == 0u) {
+          world_->pages->SetSentinel(gs, kPtEmpty);
+          skyDemoted++;
+          continue;
+        }
         if (nonAir != 0u && nonAir != kChunkVol) continue;
         paged.push_back(gs);
       }
+      if (skyDemoted) world_->pages->FlushTableWrites(ctx_->queue);
 
       // ---- ISSUE the copies now, CLASSIFY on a later frame's harvest -------
       //
@@ -960,9 +999,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
       IssueDemoteCopies(paged, keys, lastTick_);
       if (dbg)
-        std::printf("[pt-time] shift demote: gen=%zu cands=%zu issued "
+        std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u issued "
                     "total %.2f ms (pre %.2f, occ %.2f)\n",
-                    genSlots.size(), paged.size(), PtNowMs() - dT0, preMs, occMs);
+                    genSlots.size(), paged.size(), skyDemoted, PtNowMs() - dT0,
+                    preMs, occMs);
     }
   }
 }
