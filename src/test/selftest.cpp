@@ -51,7 +51,7 @@ const char* const kOrder[] = {
     "fluid-excite", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
-    "prefab",      "settle-back",    "player-body",
+    "prefab",      "settle-back",    "player-body", "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     "perf",

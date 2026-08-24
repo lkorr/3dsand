@@ -386,8 +386,7 @@ bool PlayerAvatar::EquipItem(const ItemDef* item, const char* context) {
 
   p.xf = bxf;
   p.anchorRoot = sock.offset;
-  p.joint = phys_->CreateJoint(hand.body, p.body, ld.joint,
-                               p.xf.pos, ld.axis, ld.minAngle, ld.maxAngle);
+  p.joint = phys_->CreateJoint(hand.body, p.body, JointDescFor(ld, p.xf.pos));
 
   // The new body must not collide with the rest of the avatar, exactly as
   // Spawn arranges for the limbs — a sword resting against the thigh would
@@ -587,9 +586,8 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
     Vec3 anchor = def.skel.parts[i].anchorLocal;
     parts[i].anchorRoot = anchor;
     parts[i].anchorLimb = anchor - parts[i].restOffset;
-    parts[i].joint = phys_->CreateJoint(parts[pi].body, parts[i].body, ld.joint,
-                                        origin_ + anchor, ld.axis, ld.minAngle,
-                                        ld.maxAngle);
+    parts[i].joint = phys_->CreateJoint(parts[pi].body, parts[i].body,
+                                        JointDescFor(ld, origin_ + anchor));
   }
   {
     std::vector<uint64_t> handles;

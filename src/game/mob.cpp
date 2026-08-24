@@ -155,6 +155,41 @@ bool TopoSortLimbs(std::vector<MobLimbDef>& limbs, int& rootLimb) {
   return true;
 }
 
+// ---- ball-joint limits, by tag ---------------------------------------------
+//
+// A ball joint used to be a bare point constraint: position welded, rotation
+// completely free. Alive that never showed, because live limbs are kinematic
+// and a constraint cannot move infinite mass. Dead, it is the whole ragdoll —
+// and since one mob's limbs are excluded from colliding with each other
+// (DisableCollisionsAmong, or they fight their own joints and never sleep),
+// the cone is the ONLY thing that keeps a corpse's parts out of each other. A
+// waist that can fold 180 degrees puts the torso inside the pelvis.
+//
+// Angles are half-angles in radians, measured from the limb's rest direction.
+// `fwd` is swing in the limb's fore/aft plane and `side` is out of it, which
+// is the distinction that lets a hip take a full stride without doing the
+// splits. Nothing here is anatomy for its own sake — these are the loosest
+// values at which the parts still read as attached.
+struct JointLimits {
+  float fwd, side, twist, friction;
+};
+
+JointLimits DefaultJointLimits(const std::string& tag) {
+  constexpr float kDeg = 3.14159265f / 180.0f;
+  // The two the corpses actually broke on. The waist carries the torso's whole
+  // mass on one joint, so it is the one that reads worst when it is wrong.
+  if (tag == "spine") return {40 * kDeg, 25 * kDeg, 25 * kDeg, 0.35f};
+  if (tag == "leg") return {80 * kDeg, 30 * kDeg, 20 * kDeg, 0.25f};
+  if (tag == "arm") return {90 * kDeg, 70 * kDeg, 50 * kDeg, 0.15f};
+  if (tag == "head") return {50 * kDeg, 35 * kDeg, 60 * kDeg, 0.30f};
+  if (tag == "hand" || tag == "foot") return {50 * kDeg, 50 * kDeg, 60 * kDeg, 0.15f};
+  if (tag == "tail") return {60 * kDeg, 60 * kDeg, 35 * kDeg, 0.10f};
+  // Untagged (dummy.json) and anything new: the 90 degrees that is the whole
+  // point — a limb may reach square to its parent and no further, so it can
+  // never end up inside it.
+  return {90 * kDeg, 90 * kDeg, 60 * kDeg, 0.15f};
+}
+
 }  // namespace
 
 // ---- sidecar + .vox pairing -------------------------------------------------
@@ -300,6 +335,22 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                    l["axis"][2].get<float>()};
       ld.minAngle = l.value("minAngle", -1.2f);
       ld.maxAngle = l.value("maxAngle", 1.2f);
+      // Ball-joint cone, by TAG. Every rig in the tree already tags its parts
+      // ("spine", "leg", "arm", ...) for the gait and the IK chains, so the
+      // tag is the authoring surface that already exists — a per-limb angle in
+      // every sidecar would be five files restating the same anatomy. A limb
+      // that wants something else says so and overrides.
+      {
+        const JointLimits jl = DefaultJointLimits(ld.tag);
+        const float cone = l.value("cone", jl.fwd);
+        ld.coneFwd = cone;
+        // "coneSide" defaults to "cone" when only the one number is authored,
+        // so `"cone": 0.5` means a plain symmetric cone and nothing surprising
+        // leaks in from the tag table.
+        ld.coneSide = l.value("coneSide", l.contains("cone") ? cone : jl.side);
+        ld.twistLimit = l.value("twist", jl.twist);
+        ld.jointFriction = l.value("jointFriction", jl.friction);
+      }
       if (l.contains("anchor") && l["anchor"].size() == 3) {
         ld.anchor = {l["anchor"][0].get<float>(), l["anchor"][1].get<float>(),
                      l["anchor"][2].get<float>()};
@@ -448,6 +499,27 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
           mld.edgeFrom = mld.edgeFrom * inv;
           mld.edgeTo = mld.edgeTo * inv;
           mld.edgeHalfWidth *= inv;
+        }
+        // THE BONE: from the joint anchor to the limb's own centre, in the
+        // rest pose. This is the centre line of the ball joint's swing cone
+        // (mob.h MobLimbDef::boneAxis), and it is derived from the same two
+        // pieces of rig geometry the pose pipeline uses rather than authored,
+        // for the same reason the anchor is not restated per consumer: a cone
+        // centred anywhere but the rest direction parks the limb against its
+        // own limit while it is still standing.
+        //
+        // Both terms are in SKIN units, and it is normalised, so no conversion
+        // is needed — the scale cancels.
+        if ((int)i != def.rootLimb && mi >= 0) {
+          const PrefabModel& m = def.prefab.models[mi];
+          const Vec3 centre{(float)m.offset.x + m.size.x * 0.5f,
+                            (float)m.offset.y + m.size.y * 0.5f,
+                            (float)m.offset.z + m.size.z * 0.5f};
+          const Vec3 bone = centre - anchor;
+          // A limb whose centre IS its anchor (a ball-shaped head sat exactly
+          // on the neck) has no direction to speak of; straight down is the
+          // rig-neutral guess and the cone stays symmetric about it.
+          mld.boneAxis = bone.len() > 1e-4f ? bone.normalized() : Vec3{0, -1, 0};
         }
       }
       for (size_t i = 0; i < def.limbs.size(); i++) {
@@ -967,9 +1039,8 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
     limb.anchorRoot = anchor;
     limb.anchorLimb = anchor - limb.restOffset;
     Vec3 anchorWorld = mob.origin + anchor;
-    limb.joint = phys_->CreateJoint(mob.limbs[pi].body, limb.body, ld.joint,
-                                    anchorWorld, ld.axis, ld.minAngle,
-                                    ld.maxAngle);
+    limb.joint = phys_->CreateJoint(mob.limbs[pi].body, limb.body,
+                                    JointDescFor(ld, anchorWorld));
   }
   // limbs of one mob never collide with each other (they'd fight the joints
   // and jitter forever); different mobs and debris still collide normally
@@ -2208,9 +2279,8 @@ bool MobSystem::RebuildLimbBody(Mob& mob, int limbIndex) {
             child.xf.quat[3]};
     Vec3 anchorW = child.xf.pos + Rotate(cq, child.anchorLimb);
     phys_->DestroyJoint(child.joint);
-    child.joint = phys_->CreateJoint(nh, child.body, def.limbs[k].joint, anchorW,
-                                     def.limbs[k].axis, def.limbs[k].minAngle,
-                                     def.limbs[k].maxAngle);
+    child.joint = phys_->CreateJoint(nh, child.body,
+                                     JointDescFor(def.limbs[k], anchorW));
   }
   bool kinematic = mob.alive;
   phys_->RemoveBody(limb.body);
@@ -2227,11 +2297,9 @@ bool MobSystem::RebuildLimbBody(Mob& mob, int limbIndex) {
       if (!mob.limbs[k].body) break;  // parent already severed: no joint to make
       Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
       Vec3 anchorW = limb.xf.pos + Rotate(q, limb.anchorLimb);
-      limb.joint = phys_->CreateJoint(mob.limbs[k].body, limb.body,
-                                      def.limbs[limbIndex].joint, anchorW,
-                                      def.limbs[limbIndex].axis,
-                                      def.limbs[limbIndex].minAngle,
-                                      def.limbs[limbIndex].maxAngle);
+      limb.joint = phys_->CreateJoint(
+          mob.limbs[k].body, limb.body,
+          JointDescFor(def.limbs[limbIndex], anchorW));
       break;
     }
   }

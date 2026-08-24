@@ -31,6 +31,7 @@
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
 #include <Jolt/Physics/Constraints/PointConstraint.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/Body/BodyLockInterface.h>
 #include <Jolt/Physics/Body/BodyLockMulti.h>
 #include <Jolt/Physics/Collision/GroupFilterTable.h>
@@ -117,6 +118,29 @@ float VoxToM(float v) { return v * kVoxelMeters; }
 JPH::BodyID ToBodyID(uint64_t h) { return JPH::BodyID((uint32_t)(h - 1)); }
 uint64_t FromBodyID(JPH::BodyID id) { return (uint64_t)id.GetIndexAndSequenceNumber() + 1; }
 
+// Joint friction, N*m, from the dimensionless JointDesc::friction.
+//
+// The authored number is a fraction of the torque this limb's OWN WEIGHT
+// exerts about the anchor, because that is the only scale-free way to say
+// "stiff". A fixed N*m would be a hinge on a finger and nothing at all on a
+// torso, and every rig at a new kVoxelMeters would need it retuned — mass goes
+// as the cube of the voxel size. At `frac` < 1 gravity still wins and the limb
+// still falls; it just stops behaving like wet rope.
+//
+// GetInverseMassUnchecked, not GetInverseMass: mob limbs are KINEMATIC at
+// spawn (they animate) and Jolt asserts on the checked accessor for those,
+// even though the mass it would return is the correct one.
+float FrictionTorque(const JPH::Body& child, JPH::RVec3Arg anchor, float frac) {
+  if (frac <= 0.0f) return 0.0f;
+  const JPH::MotionProperties* mp = child.GetMotionPropertiesUnchecked();
+  if (!mp) return 0.0f;
+  const float invMass = mp->GetInverseMassUnchecked();
+  if (invMass <= 0.0f) return 0.0f;  // static: nothing to hold up
+  const float lever = (float)(child.GetCenterOfMassPosition() - anchor).Length();
+  const float g = CurrentTuning().physics.gravity;
+  return frac * (1.0f / invMass) * g * lever;
+}
+
 }  // namespace
 
 struct Physics::LayerImpls {
@@ -131,6 +155,10 @@ struct Physics::JointImpls {
   struct Entry {
     JPH::Ref<JPH::Constraint> constraint;
     uint64_t bodyA = 0, bodyB = 0;
+    // Rest-frame bone direction (JointDesc::boneAxis) for ball joints, so
+    // JointSwingAngle can measure against the same line the cone is built on
+    // without re-deriving it. Zero for hinge/fixed.
+    JPH::Vec3 boneAxis = JPH::Vec3::sZero();
   };
   std::unordered_map<uint64_t, Entry> joints;                 // handle -> entry
   std::unordered_map<uint64_t, std::vector<uint64_t>> byBody; // body -> joints
@@ -453,9 +481,8 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {
   return Vec3{push.GetX(), push.GetY(), push.GetZ()} * (1.0f / kVoxelMeters);
 }
 
-uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB, JointType type,
-                              Vec3 anchorVoxel, Vec3 axis, float minAngle,
-                              float maxAngle) {
+uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
+                              const JointDesc& d) {
   if (!system_ || bodyA == 0 || bodyB == 0) return 0;
   // TwoBodyConstraintSettings::Create wants Body&: lock both bodies
   const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
@@ -465,10 +492,20 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB, JointType type,
   JPH::Body* b = lock.GetBody(1);
   if (!a || !b) return 0;
 
-  JPH::RVec3 anchor(VoxToM(anchorVoxel.x), VoxToM(anchorVoxel.y),
-                    VoxToM(anchorVoxel.z));
+  JPH::RVec3 anchor(VoxToM(d.anchorVoxel.x), VoxToM(d.anchorVoxel.y),
+                    VoxToM(d.anchorVoxel.z));
+
+  // REST FRAME -> WORLD, per body. Jolt's settings are world-space and it
+  // immediately converts them back through each body's rotation, so feeding it
+  // `bodyRotation * restDirection` lands the constraint's local frame exactly
+  // on the rest direction — whatever pose the bodies are in right now. See the
+  // JointDesc comment in physics.h for why that matters.
+  const JPH::Quat ra = a->GetRotation();
+  const JPH::Quat rb = b->GetRotation();
+
   JPH::Ref<JPH::Constraint> constraint;
-  switch (type) {
+  JPH::Vec3 boneOut = JPH::Vec3::sZero();
+  switch (d.type) {
     case JointType::Fixed: {
       JPH::FixedConstraintSettings s;
       s.mAutoDetectPoint = true;
@@ -478,20 +515,60 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB, JointType type,
     case JointType::Hinge: {
       JPH::HingeConstraintSettings s;
       s.mPoint1 = s.mPoint2 = anchor;
-      JPH::Vec3 ax(axis.x, axis.y, axis.z);
+      JPH::Vec3 ax(d.axis.x, d.axis.y, d.axis.z);
       if (ax.LengthSq() < 1e-6f) ax = JPH::Vec3::sAxisX();
       ax = ax.Normalized();
-      s.mHingeAxis1 = s.mHingeAxis2 = ax;
-      s.mNormalAxis1 = s.mNormalAxis2 = ax.GetNormalizedPerpendicular();
-      s.mLimitsMin = std::max(minAngle, -JPH::JPH_PI);
-      s.mLimitsMax = std::min(maxAngle, JPH::JPH_PI);
+      const JPH::Vec3 nrm = ax.GetNormalizedPerpendicular();
+      s.mHingeAxis1 = ra * ax;
+      s.mHingeAxis2 = rb * ax;
+      // Angle zero is where the two normal axes align, so rotating the SAME
+      // rest-frame vector into each body puts zero at the rest pose — the
+      // frame every authored minAngle/maxAngle in the sidecars was measured
+      // from.
+      s.mNormalAxis1 = ra * nrm;
+      s.mNormalAxis2 = rb * nrm;
+      s.mLimitsMin = std::max(d.minAngle, -JPH::JPH_PI);
+      s.mLimitsMax = std::min(d.maxAngle, JPH::JPH_PI);
+      s.mMaxFrictionTorque = FrictionTorque(*b, anchor, d.friction);
       constraint = s.Create(*a, *b);
       break;
     }
     case JointType::Ball: {
-      JPH::PointConstraintSettings s;
-      s.mPoint1 = s.mPoint2 = anchor;
+      JPH::Vec3 bone(d.boneAxis.x, d.boneAxis.y, d.boneAxis.z);
+      if (bone.LengthSq() < 1e-6f) bone = -JPH::Vec3::sAxisY();
+      bone = bone.Normalized();
+      // The fore/aft plane. Rigs are authored Y-up facing +Z, so the lateral
+      // axis is world X at rest and the plane through it and the bone is the
+      // one a stride or a reach happens in. A bone that IS lateral (an arm
+      // modelled straight out) has no such plane, so fall back to any
+      // perpendicular and let the two half-angles mean "in a plane" and "out
+      // of it" without promising which is which.
+      JPH::Vec3 plane = JPH::Vec3::sAxisX() - bone * bone.GetX();
+      plane = plane.LengthSq() < 1e-4f ? bone.GetNormalizedPerpendicular()
+                                       : plane.Normalized();
+
+      JPH::SwingTwistConstraintSettings s;
+      s.mPosition1 = s.mPosition2 = anchor;
+      s.mTwistAxis1 = ra * bone;
+      s.mTwistAxis2 = rb * bone;
+      s.mPlaneAxis1 = ra * plane;
+      s.mPlaneAxis2 = rb * plane;
+      s.mSwingType = JPH::ESwingType::Cone;
+      // Jolt's normal axis is plane x twist, and its limit naming is off by
+      // one from that: mNormalHalfConeAngle bounds the swing ABOUT the plane
+      // axis (fore/aft, since the plane axis is lateral) and
+      // mPlaneHalfConeAngle bounds the swing about the normal (out of plane).
+      // Reading it the other way round gives a hip that does the splits but
+      // cannot take a step.
+      const float kMax = JPH::JPH_PI - 0.01f;
+      s.mNormalHalfConeAngle = std::clamp(d.coneFwd, 0.0f, kMax);
+      s.mPlaneHalfConeAngle = std::clamp(d.coneSide, 0.0f, kMax);
+      const float tw = std::clamp(d.twist, 0.0f, kMax);
+      s.mTwistMinAngle = -tw;
+      s.mTwistMaxAngle = tw;
+      s.mMaxFrictionTorque = FrictionTorque(*b, anchor, d.friction);
       constraint = s.Create(*a, *b);
+      boneOut = bone;
       break;
     }
   }
@@ -499,10 +576,31 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB, JointType type,
   system_->AddConstraint(constraint);
 
   uint64_t h = nextJointId_++;
-  joints_->joints[h] = {constraint, bodyA, bodyB};
+  joints_->joints[h] = {constraint, bodyA, bodyB, boneOut};
   joints_->byBody[bodyA].push_back(h);
   joints_->byBody[bodyB].push_back(h);
   return h;
+}
+
+bool Physics::JointSwingAngle(uint64_t joint, float& outRadians) const {
+  outRadians = 0;
+  if (!system_ || !joints_) return false;
+  auto it = joints_->joints.find(joint);
+  if (it == joints_->joints.end()) return false;
+  const JPH::Vec3 bone = it->second.boneAxis;
+  if (bone.LengthSq() < 0.5f) return false;  // not a ball joint
+
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  JPH::BodyID ids[2] = {ToBodyID(it->second.bodyA), ToBodyID(it->second.bodyB)};
+  JPH::BodyLockMultiRead lock(bli, ids, 2);
+  const JPH::Body* a = lock.GetBody(0);
+  const JPH::Body* b = lock.GetBody(1);
+  if (!a || !b) return false;
+  // Where the child's bone points, expressed in the PARENT's frame. Comparing
+  // in world space instead would report the parent's own tumble as bend.
+  const JPH::Vec3 inParent = a->GetRotation().Conjugated() * (b->GetRotation() * bone);
+  outRadians = std::acos(std::clamp(inParent.Dot(bone), -1.0f, 1.0f));
+  return true;
 }
 
 void Physics::DestroyJoint(uint64_t joint) {

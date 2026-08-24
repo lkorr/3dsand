@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "game/bodyreg.h"
@@ -464,6 +465,179 @@ bool pushOk = false;
   return pushOk ? Status::Pass : Status::Fail;
 }
 
+// ---- ragdoll-joints ----------------------------------------------------
+//
+// A ball joint used to be a bare point constraint: position welded, rotation
+// completely free. That never showed while a mob was alive — limbs are
+// kinematic then, and a constraint cannot move infinite mass — but a corpse
+// could fold its thigh 180 degrees up through its own pelvis, and since one
+// mob's limbs are deliberately excluded from colliding with each other
+// (DisableCollisionsAmong), nothing else in the scene ever objected.
+//
+// Three claims, and the mob gate can make none of them: it loses every joint
+// handle at death (MobSystem::Die hands the bodies to DebrisSystem), so the
+// fixture has to be built here out of the primitive itself.
+//
+//   1. a limited joint CONTAINS a whipped limb,
+//   2. an unlimited one does not — so claim 1 has teeth rather than measuring
+//      a limb that was never pushed hard enough to reach its limit,
+//   3. the limit is measured from the rig's REST pose even when the joint is
+//      BUILT at a bent one. That is not hypothetical: MobSystem::Rebuild-
+//      LimbBody re-creates a carved limb's joints from the live pose, so a
+//      pose-relative frame would quietly re-centre every cone on a corpse
+//      mid-fold and let it bend that far again from there.
+Status GateRagdollJoints(Ctx& c, std::string& detail) {
+  Physics& phys = c.phys;
+  const std::vector<MaterialDef>& mats = c.mats;
+  std::vector<float> dens;
+  for (const auto& m : mats) dens.push_back((float)m.gpu.density);
+
+  auto box = [](int sx, int sy, int sz) {
+    std::vector<DebrisVoxel> v;
+    for (int z = 0; z < sz; z++)
+      for (int y = 0; y < sy; y++)
+        for (int x = 0; x < sx; x++)
+          v.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+    return v;
+  };
+  // Well clear of the terrain the earlier phys gates leave behind: the thigh
+  // has to be held by its joint, not caught by the floor.
+  const Vec3 kHip{600.0f, 400.0f, 600.0f};
+  const Vec3 kThighAnchorLocal{2.0f, 10.0f, 2.0f};  // top centre of a 4x10x4
+
+  // Hang a "thigh" off a pinned "pelvis", whip it about every axis in turn,
+  // and report the furthest it ever gets from its REST direction (straight
+  // down). `preBend` rotates the child about the anchor BEFORE the joint is
+  // created — the RebuildLimbBody case.
+  auto whip = [&](float coneRad, float preBendRad) {
+    const float s = std::sin(preBendRad), co = std::cos(preBendRad);
+    // Rotate the local anchor about Z so the body origin lands where the
+    // anchor still coincides with the hip: a constraint built on two points
+    // that do not already agree yanks the bodies together on the first step,
+    // and that transient is not what this is measuring.
+    const Vec3 a = kThighAnchorLocal;
+    const Vec3 rotA{a.x * co - a.y * s, a.x * s + a.y * co, a.z};
+
+    BodyTransform hipXf{};
+    hipXf.pos = kHip - Vec3{3.0f, 0.0f, 3.0f};
+    hipXf.quat[3] = 1;
+    uint64_t pelvis = phys.CreateDebrisBodyXf(box(6, 5, 6), hipXf, dens, true);
+    phys.SetBodyKinematic(pelvis, true);  // pinned: the parent frame is world
+
+    BodyTransform thighXf{};
+    thighXf.pos = kHip - rotA;
+    thighXf.quat[2] = std::sin(preBendRad * 0.5f);
+    thighXf.quat[3] = std::cos(preBendRad * 0.5f);
+    uint64_t thigh = phys.CreateDebrisBodyXf(box(4, 10, 4), thighXf, dens, true);
+    phys.DisableCollisionsAmong({pelvis, thigh});  // as a real rig does
+
+    Physics::JointDesc jd;
+    jd.type = Physics::JointType::Ball;
+    jd.anchorVoxel = kHip;
+    jd.boneAxis = Vec3{0, -1, 0};  // the thigh's rest direction
+    jd.coneFwd = jd.coneSide = coneRad;
+    jd.twist = 0.35f;
+    jd.friction = 0.0f;  // friction would flatter the limit; test it bare
+    uint64_t joint = phys.CreateJoint(pelvis, thigh, jd);
+
+    // Four one-shot whips, one per swing axis and both signs, each given time
+    // to be resolved. A one-shot velocity is the honest load — it is what an
+    // explosion impulse looks like — whereas re-setting the velocity every
+    // step would just be overwriting the solver's answer and would beat any
+    // constraint ever written.
+    const Vec3 kWhips[4] = {{22, 0, 0}, {0, 0, 22}, {-22, 0, 0}, {0, 0, -22}};
+    float worst = 0, atCreate = 0;
+    phys.JointSwingAngle(joint, atCreate);
+    for (int w = 0; w < 4; w++) {
+      phys.SetBodyVelocities(thigh, Vec3{}, kWhips[w]);
+      for (int i = 0; i < 45; i++) {
+        phys.Step(kTickDt);
+        float ang = 0;
+        if (phys.JointSwingAngle(joint, ang)) worst = std::max(worst, ang);
+      }
+    }
+    phys.DestroyJoint(joint);
+    phys.RemoveBody(thigh);
+    phys.RemoveBody(pelvis);
+    return std::pair<float, float>{worst, atCreate};
+  };
+
+  constexpr float kDeg = 3.14159265f / 180.0f;
+  // 45 degrees: tight enough that a limb reaching it is unmistakably past
+  // square to its parent, loose enough that the solver is not permanently
+  // saturated.
+  const float cone = 45 * kDeg;
+  auto limited = whip(cone, 0.0f);
+  auto preBent = whip(cone, 30 * kDeg);
+  auto free = whip(179 * kDeg, 0.0f);
+
+  // MEASURED, not guessed: the solver clamps the velocity at the limit before
+  // it integrates, so the overshoot is one sub-step of residual — 5 degrees on
+  // the RTX 3060 Ti (held to 50 and 47 against a 45 degree cone). 14 leaves
+  // most of the gap to the 90 the assertion actually cares about, and it is a
+  // bound rather than a tolerance: losing the limit does not creep past it,
+  // it goes straight to the 102 the unlimited arm below reports.
+  const float kSlack = 14 * kDeg;
+  const bool heldOk = limited.first <= cone + kSlack;
+  // The pre-bent joint must be held to the SAME cone about the rest
+  // direction, not to cone + 30 about wherever it was built.
+  const bool restFrameOk = preBent.first <= cone + kSlack &&
+                           std::abs(preBent.second - 30 * kDeg) < 2 * kDeg;
+  const bool teethOk = free.first > 90 * kDeg;
+
+  // ---- and the rigs are actually wired to it ------------------------------
+  //
+  // The three claims above are about the primitive. This is about the DATA
+  // reaching it, which is the other half and fails differently: a bone axis
+  // that came out inverted centres the cone 180 degrees from the rest pose, so
+  // the limb is pinned at its limit while standing and free exactly where it
+  // should be held — the worst outcome available here, and one that no angle
+  // bound would catch because the angles would all be legal.
+  //
+  // Asserted on the loaded defs, with no simulation: it is a wiring check, and
+  // an assertion that spends 90 ticks of physics to read a load-time constant
+  // is a slow way to test nothing extra.
+  int ballJoints = 0, badBone = 0, wideCone = 0, waistChecked = 0;
+  for (const MobDef& def : c.mobs.Defs()) {
+    for (size_t i = 0; i < def.limbs.size(); i++) {
+      const MobLimbDef& ld = def.limbs[i];
+      if ((int)i == def.rootLimb || ld.joint != Physics::JointType::Ball) continue;
+      ballJoints++;
+      if (std::abs(ld.boneAxis.len() - 1.0f) > 1e-3f) badBone++;
+      // The user-facing rule: no ball joint may reach past square to its
+      // parent, or the limb ends up inside it.
+      if (ld.coneFwd > 90 * kDeg + 1e-4f || ld.coneSide > 90 * kDeg + 1e-4f)
+        wideCone++;
+      // The two the corpses broke on, by NAME and by direction: the torso
+      // hangs UP off the waist and the thighs hang DOWN off it. Anything else
+      // means the bone was derived from the wrong pair of boxes.
+      if (ld.parent == "hips") {
+        waistChecked++;
+        const bool up = ld.name == "torso";
+        if (up ? ld.boneAxis.y < 0.7f : ld.boneAxis.y > -0.7f) badBone++;
+      }
+    }
+  }
+  // 9 = 3 humanoid rigs (wizard, asha, mina) x {torso, legU.L, legU.R}. A
+  // count, not just a per-limb loop, because the loop passes vacuously if the
+  // rigs ever stop naming their root "hips" — and the waist is the joint the
+  // whole change is about, so "we checked nothing" must not read as PASS.
+  const bool wiredOk = ballJoints > 0 && badBone == 0 && wideCone == 0 &&
+                       waistChecked == 9;
+
+  const bool ok = heldOk && restFrameOk && teethOk && wiredOk;
+  detail = Format(
+      "cone %.0f deg: held to %.0f, built pre-bent %.0f held to %.0f, "
+      "unlimited reached %.0f; %d ball joints wired (%d bad bone axis, "
+      "%d over 90 deg, %d waist joints)",
+      cone / kDeg, limited.first / kDeg, preBent.second / kDeg,
+      preBent.first / kDeg, free.first / kDeg, ballJoints, badBone, wideCone,
+      waistChecked);
+  std::printf("ragdoll joints: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& BodyGates() {
@@ -471,6 +645,7 @@ const std::vector<Gate>& BodyGates() {
       {"debris", "phys", {}, false, GateDebris},
       {"settle-back", "phys", {}, false, GateSettleBack},
       {"player-body", "phys", {}, false, GatePlayerBody},
+      {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
   };
   return g;
 }

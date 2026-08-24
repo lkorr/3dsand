@@ -93,15 +93,70 @@ class Physics {
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);
 
   // ---- joints (PLAN §B1) ----
-  // Anchors/axes in world-space voxel units at creation time. Ball is a free
-  // point constraint (no limits); Hinge takes min/max angle in radians about
-  // `axis`. Returns an opaque handle (0 = failure). Joints attached to a body
-  // are destroyed automatically when that body is removed.
   enum class JointType { Fixed, Hinge, Ball };
-  uint64_t CreateJoint(uint64_t bodyA, uint64_t bodyB, JointType type,
-                       Vec3 anchorVoxel, Vec3 axis, float minAngle,
-                       float maxAngle);
+
+  // Everything a joint needs, in one struct.
+  //
+  // TWO KINDS OF GEOMETRY LIVE HERE AND THEY ARE NOT IN THE SAME FRAME.
+  // `anchorVoxel` is a POSITION, in world voxels, at the moment of creation.
+  // Every other vector is a DIRECTION in the rig's REST pose, and CreateJoint
+  // rotates it into each body's current pose before handing it to Jolt.
+  //
+  // That split is the whole point. A Jolt constraint captures its reference
+  // frame from the bodies as they stand when it is created, so a joint built
+  // from world-space directions puts angle zero at whatever pose the bodies
+  // happen to be in. At spawn that is the rest pose and it reads correctly;
+  // from MobSystem::RebuildLimbBody — which re-creates a carved limb's joints
+  // from the LIVE pose, mid-ragdoll — it silently re-centres every limit on a
+  // bent corpse, and the limb is then free to bend that far again. Passing
+  // rest-frame directions makes the limits mean the same thing wherever the
+  // joint is built from.
+  struct JointDesc {
+    JointType type = JointType::Ball;
+    Vec3 anchorVoxel{};          // WORLD voxels, the pivot
+    // ---- Hinge ----
+    Vec3 axis{1, 0, 0};          // rest-frame hinge axis
+    float minAngle = -1.2f, maxAngle = 1.2f;  // radians, about `axis`
+    // ---- Ball ----
+    // A swing-twist cone (the joint Jolt's own Ragdoll class uses), NOT a bare
+    // point constraint. A point constraint has no angular limit whatsoever,
+    // which is what let a corpse fold its thigh 180 degrees up through its own
+    // pelvis and its torso back through its hips: nothing in the scene objects,
+    // because a mob's limbs are excluded from colliding with each other
+    // (DisableCollisionsAmong) precisely so they cannot fight their own joints.
+    // The angular limit is therefore the ONLY thing keeping a rig's parts out
+    // of each other, and it was missing.
+    //
+    // `boneAxis` is the direction this limb points at rest — from the joint
+    // anchor toward the limb's own centre — and is the cone's CENTRE LINE. It
+    // has to come from the rig (mob.cpp derives it from the same anchor and
+    // model box the pose pipeline uses); a cone centred on anything else parks
+    // the limb against its own limit at rest.
+    Vec3 boneAxis{0, -1, 0};
+    // Half-angles, radians. `coneFwd` is swing in the limb's fore/aft plane
+    // (a thigh stepping, a shoulder reaching), `coneSide` is swing out of it
+    // (abduction). Split because a hip that should allow a full stride must
+    // not also allow the splits, and one symmetric cone cannot say that.
+    float coneFwd = 1.5707963f;   // 90 degrees
+    float coneSide = 1.5707963f;
+    float twist = 1.0471976f;     // roll about `boneAxis`, +-60 degrees
+    // Joint friction as a FRACTION OF THE LIMB'S OWN WEIGHT TORQUE about this
+    // anchor, so one number means the same thing on a finger and on a thigh
+    // (CreateJoint multiplies by mass * g * lever arm). Below 1 a limb still
+    // falls under its own weight, just not like wet rope — which is the
+    // difference between a corpse and a rubber toy. 0 disables it.
+    float friction = 0.15f;
+  };
+
+  // Returns an opaque handle (0 = failure). Joints attached to a body are
+  // destroyed automatically when that body is removed.
+  uint64_t CreateJoint(uint64_t bodyA, uint64_t bodyB, const JointDesc& desc);
   void DestroyJoint(uint64_t joint);  // <- this is dismemberment
+  // How far body B currently sits from the REST direction its ball joint was
+  // built around, in radians (0 when the joint is not a ball joint or is
+  // dead). The limit test in selftest_mob.cpp asks this rather than
+  // re-deriving the cone frame, which would be a second implementation of it.
+  bool JointSwingAngle(uint64_t joint, float& outRadians) const;
 
   // ---- mob locomotion plumbing (PLAN §B4) ----
   // Requires the body to have been created with allowKinematic.

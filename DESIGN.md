@@ -1534,7 +1534,18 @@ handmade art becomes matter the existing destruction pipeline already breaks.
 - **Mobs (`game/mob`):** one Jolt body per limb (scene-graph partitioned, each
   limb independently inside `DebrisVoxel`'s int8 range), joined by the new
   joint API in `Physics` (Fixed/Hinge/Ball, voxel-unit anchors, auto-derived
-  from limb AABB adjacency or overridden in the JSON sidecar). Bodies are
+  from limb AABB adjacency or overridden in the JSON sidecar). **Ball is a
+  LIMITED swing-twist cone** (Jolt's own ragdoll joint), not a free point
+  constraint: since intra-mob collisions are disabled two sentences down, the
+  cone is the only thing keeping a corpse's parts out of each other, and
+  without it a ragdoll folded its thigh 180° up through its own pelvis. The
+  cone's centre line is derived at load from the rig (anchor → limb centre)
+  and its half-angles come from the limb's `tag` (waist 40°/25°, hip 80°/30°,
+  shoulder 90°/70°, untagged 90°), overridable per limb. Joint DIRECTIONS are
+  passed in the REST frame and rotated into each body's live pose inside
+  `CreateJoint` — a world-space frame would re-centre every limit on whatever
+  pose the bodies were in, which is wrong exactly where it matters, in
+  `RebuildLimbBody`'s mid-ragdoll rebuild. Gate: `ragdoll-joints`. Bodies are
   CPU-float gameplay state outside the hashed grid domain; blood, severed
   limbs and corpses reach the grid exclusively through the op stream, so
   determinism rule #1 is untouched. Alive = kinematic keyframe walk (ground

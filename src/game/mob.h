@@ -35,6 +35,22 @@ struct MobLimbDef {
   bool vital = false;          // severing/destroying this kills the mob
   Vec3 axis{1, 0, 0};          // hinge axis
   float minAngle = -1.2f, maxAngle = 1.2f;
+  // ---- ball-joint (swing-twist) limits; see Physics::JointDesc ------------
+  // Ball joints used to be bare point constraints with NO angular limit, and a
+  // mob's limbs are deliberately excluded from colliding with each other, so
+  // nothing at all stopped a corpse folding its thigh up through its pelvis.
+  //
+  // `boneAxis` is DERIVED at load (anchor -> the limb model's centre) rather
+  // than authored: it is the same rig geometry the anchors are, and asking a
+  // sidecar to restate it is asking for the two to disagree.
+  Vec3 boneAxis{0, -1, 0};
+  // Defaults come from the limb's `tag` (DefaultJointLimits in mob.cpp), so no
+  // existing sidecar needs an edit; "cone"/"coneSide"/"twist"/"jointFriction"
+  // override per limb, in radians like every other angle here.
+  float coneFwd = 1.5707963f;
+  float coneSide = 1.5707963f;
+  float twistLimit = 1.0471976f;
+  float jointFriction = 0.15f;
   // anchor override in prefab-local voxels; auto-derived from the AABB gap
   // between limb and parent when absent (anchorAuto)
   Vec3 anchor{};
@@ -69,6 +85,28 @@ struct MobLimbDef {
   // real size).
   int microModel = -1;
 };
+
+// The one place a limb def turns into a physics joint.
+//
+// There are four call sites (mob spawn, mob limb rebuild, avatar spawn, and
+// the joint a rebuild re-makes for each CHILD), and before the limits existed
+// each of them spelled the conversion out by hand. Adding a field then meant
+// finding all four; missing one meant a joint that silently kept the old,
+// unlimited behaviour, which is invisible until a corpse folds in half.
+inline Physics::JointDesc JointDescFor(const MobLimbDef& ld, Vec3 anchorWorld) {
+  Physics::JointDesc d;
+  d.type = ld.joint;
+  d.anchorVoxel = anchorWorld;
+  d.axis = ld.axis;
+  d.minAngle = ld.minAngle;
+  d.maxAngle = ld.maxAngle;
+  d.boneAxis = ld.boneAxis;
+  d.coneFwd = ld.coneFwd;
+  d.coneSide = ld.coneSide;
+  d.twist = ld.twistLimit;
+  d.friction = ld.jointFriction;
+  return d;
+}
 
 // An attachment point on a rig: the frame a held item is placed in.
 //
