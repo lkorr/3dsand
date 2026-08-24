@@ -72,7 +72,7 @@ const TUNING_SCHEMA = [
       {k:'maxFall', n:'terminal velocity', d:'Downward speed cap while falling.', min:1, max:120, step:0.5, u:'m/s'},
       {k:'fallDamageSpeed', n:'fall damage onset', d:'Minimum landing speed for fall damage. Below this, no damage.', min:0, max:60, step:0.5, u:'m/s'},
       {k:'fallSplatSpeed', n:'fall splat speed', d:'Landing speed for instant death + body explosion. Limbs fly off, blood everywhere.', min:1, max:120, step:0.5, u:'m/s'},
-      {k:'fallDamageScale', n:'fall damage scale', d:'HP damage per m/s above the onset threshold. At 1.5 and 17 m/s excess, deals ~25 hp.', min:0, max:10, step:0.1},
+      {k:'fallDamageScale', n:'fall damage scale', d:'HP damage per (m/s)² above the onset threshold. Quadratic: gentle falls scratch, medium falls hurt, high falls kill. At 0.75 and 14 m/s excess, deals ~147 hp.', min:0, max:10, step:0.05},
       {k:'groundAccel', n:'ground accel', d:'How fast you reach top speed on the ground, and how fast you stop. High = snappy and skate-free.', min:1, max:120, step:0.5, u:'/s'},
       {k:'airAccel', n:'air control', d:'Steering authority while airborne. Low means jumps are committed.', min:0, max:60, step:0.1, u:'/s'},
       {k:'coyoteTime', n:'coyote time', d:'A jump stays legal for this long after walking off a ledge.', min:0, max:0.5, step:0.01, u:'s'},
@@ -738,7 +738,7 @@ const TUNING_SCHEMA = [
     blurb: 'The MLS-MPM particle liquid (mpm tool: Tab to it, hold LMB to pour, keys 1–4 pick the species, U clears). All values are in REAL units — voxels and seconds — and are converted to the solver’s fixed point at shader compile time, so the solver stays deterministic. None of these touch the WORLD hash (the fluid never writes voxels), but every one changes the fluid-det gate hash. Pressure comes from a real density sample each substep: pressure = stiffness × ((density∕rest)^power − 1), floored at −cohesion.',
     params: [
       {k:'fluidGravity', n:'gravity', d:'Fall acceleration. 98.1 vox/s² is Earth gravity at 10 cm voxels; crank it for cartoonishly heavy water.', min:0, max:1800, step:0.1, u:'vox/s²', log:true, lo:9.8},
-      {k:'fluidStiffness', n:'stiffness', d:'How hard the water resists compression — the square of a pseudo speed of sound (3600 → 60 vox/s = 0.33 cells/substep, honest headroom under the 0.45 CFL cap). Much higher and the VMAX clamp eats the dynamics: the water goes mushy, not stiffer — watch the clamp counter in --fluid-bench.', min:0, max:43200, step:100, u:'(vox/s)²', log:true, lo:200},
+      {k:'fluidStiffness', n:'stiffness', d:'How hard the water resists compression — the square of a pseudo speed of sound. The 14000 default is a chosen-by-eye fast-water look paired with 9× gravity, and sits ABOVE the CFL cap (118 vox/s = 0.66 cells/substep vs the 0.45 VMAX ceiling); 3600 is the honest-headroom value (0.33). Past the cap the clamp starts eating dynamics and water goes mushy rather than stiffer — watch the clamp counter in --fluid-bench.', min:0, max:43200, step:100, u:'(vox/s)²', log:true, lo:200},
       {k:'fluidRestDensity', n:'rest density', d:'Particles per voxel at equilibrium. The pour lays down 8 per voxel, so 8 means a fresh pool is exactly at rest. Lower = the same particles spread thinner; higher = they pack tighter before pushing back.', min:1, max:32, step:0.5, u:'per vox'},
       {k:'fluidEosPower', n:'EOS power', d:'Exponent on density∕rest in the pressure law. 1 is a soft spring; 4–7 is a hard knee that makes over-packing a cavity eject violently instead of silently absorbing more fluid.', min:1, max:7, step:1, int:true},
       {k:'fluidCohesion', n:'cohesion', d:'Surface tension: how much negative pressure under-dense fluid may pull with. 0 = droplets never pull together; high values bead the fluid into blobs and hold a pool’s surface tight.', min:0, max:14400, step:10, u:'(vox/s)²', log:true, lo:0.1},
@@ -780,6 +780,7 @@ const TUNING_SCHEMA = [
     title: 'MPM Fluid Look',
     icon: '\u{1FAE7}',
     apply: 'shader',
+    deferred: true,
     group: 'render',
     blurb: 'How the MPM liquid is drawn. Surface mode (the default) marches the solver’s own density grid as a smooth isosurface — real traced reflections and refraction, per-channel absorption, sun glint, churn foam: the Splash look. Cube mode is the old one-cube-per-particle debug view. All render-only.',
     params: [

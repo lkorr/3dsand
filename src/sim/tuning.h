@@ -102,7 +102,7 @@ struct Tuning {
     float maxFall = 30.0f;
     float fallDamageSpeed = 8.0f;
     float fallSplatSpeed = 25.0f;
-    float fallDamageScale = 1.5f;
+    float fallDamageScale = 0.75f;
     float stepUp = 0.58f;
     float smoothBump = 0.12f;
     float stepSpeedPenaltyPerM = 2.8f;
@@ -708,15 +708,26 @@ struct Tuning {
     // exception to "sim.* is integer-only"). They do NOT touch the world hash
     // (the fluid never writes voxels) but they DO change the fluid_det gate's
     // particle hash, so re-run --selftest after changing defaults.
-    float fluidStiffness = 3600.0f;  // EOS stiffness, (vox/s)^2 — the square
-                                     // of a pseudo speed of sound (3600 ->
-                                     // c = 60 vox/s = 2 cells/tick = 0.33
-                                     // cells/substep at 6 substeps: honest
-                                     // headroom under the 0.45 FLUID_VMAX
-                                     // CFL cap. 5400 sat AT the edge and the
-                                     // clamp ate the dynamics — plan §1.2.
-    float fluidGravity = 98.1f;      // fall acceleration, voxels/s^2
-                                     // (98.1 = 9.81 m/s^2 at 0.10 m voxels)
+    float fluidStiffness = 14000.0f;  // EOS stiffness, (vox/s)^2 — the square
+                                     // of a pseudo speed of sound. CHOSEN BY
+                                     // EYE in the fluid lab (2026-08-24) and
+                                     // DELIBERATELY above the CFL cap: 14000
+                                     // -> c = 118 vox/s = 0.66 cells/substep
+                                     // vs the 0.45 FLUID_VMAX ceiling. The
+                                     // WP2 analysis (plan §1.2) says that
+                                     // regime mushes out, and 3600 (0.33
+                                     // cells/substep) is the honest-headroom
+                                     // value — but this pairs with 9x gravity
+                                     // below, which is a fast-water look the
+                                     // owner picked over the physical one.
+                                     // DO NOT "fix" this back without asking:
+                                     // check FA_CLAMPED in --fluid-bench for
+                                     // what the clamp is actually doing, and
+                                     // raise kFluidSubsteps if it engages.
+    float fluidGravity = 900.0f;     // fall acceleration, voxels/s^2. 98.1 is
+                                     // Earth at 0.10 m voxels; 900 is ~9x,
+                                     // the owner's snappy-water default (see
+                                     // stiffness above — the two go together)
     // Density EOS (grantkot MLS-MPM shape): pressure = stiffness *
     // ((rho/rest)^power - 1), clamped below at -cohesion. rho is sampled from
     // the P2G mass grid each substep, so cramming particles into a cavity
@@ -739,10 +750,11 @@ struct Tuning {
     // default: negative-pressure terms are the classic sticky-ropes look.
     float fluidAttractSame = 0.0f;
     float fluidAttractDiff = 0.0f;
-    float fluidViscosity = 0.1f;    // vox^2/s: resists shear via the APIC C
-                                    // matrix. ~0 = splashy water, high =
-                                    // honey. References run 0.02-0.1 grid
-                                    // units; 1.5 read as syrup.
+    float fluidViscosity = 0.0f;    // vox^2/s: resists shear via the APIC C
+                                    // matrix. 0 = the owner's default, every
+                                    // shear-damping term off (APIC's own
+                                    // smoothing is the only one left).
+                                    // References run 0.02-0.1; 1.5 was syrup.
     float fluidDamping = 0.0f;      // fraction of velocity shed per SECOND
                                     // (0..20). Non-physical settle aid
     float fluidFriction = 0.0f;     // fraction/s of TANGENTIAL velocity shed
