@@ -1792,10 +1792,34 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
   return 0;
 }
 
-fn genCell(c : vec3<i32>, seed : u32) -> u32 {
-  let x = c.x; let y = c.y; let z = c.z;
+// ---- THE COLUMN HALF, hoisted out of the per-cell path --------------------
+//
+// Everything from baseHeight down to the shore band is a pure function of
+// (x, z) — no `y` appears anywhere in it — and none of it is cheap: baseHeight
+// and biomeAt are eight hashes each, pondAt is a tile lookup, and shoreAt can
+// cost a pondSurface, which is 24 more baseHeight samples. genCell recomputed
+// the lot for every one of the 16 cells in a chunk column, so a chunk paid it
+// 4,096 times for 256 distinct answers.
+//
+// Split out so genChunk can evaluate it ONCE per column and hand the result to
+// the 16 cells that share it. The arithmetic is untouched and in the same
+// order, so the words produced are identical — the world hash is the gate on
+// that, and genCell below still composes the two halves for the callers that
+// evaluate one isolated cell.
+struct Col {
+  h           : i32,         // ground height, after pool and pond carving
+  biome       : u32,
+  pond        : i32,         // disc-pond water surface Y, or -1
+  pw          : vec2<i32>,   // pondAt's (bowl floor, surface)
+  fluid       : u32,         // standing fluid material at this column
+  fluidTop    : i32,         // its surface Y, or -1
+  inPoolFloor : bool,
+  inRim       : bool,
+  shore       : Shore,
+};
+
+fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   var h = baseHeight(x, z, seed);
-  var mat = MAT_AIR;
   var fluidTop = -1;     // top of any standing fluid at this column
   var fluid = MAT_AIR;
 
@@ -1886,6 +1910,36 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
       shore.onShore = false;
     }
   }
+
+  var col : Col;
+  col.h = h;
+  col.biome = biome;
+  col.pond = pond;
+  col.pw = pw;
+  col.fluid = fluid;
+  col.fluidTop = fluidTop;
+  col.inPoolFloor = inPoolFloor;
+  col.inRim = inRim;
+  col.shore = shore;
+  return col;
+}
+
+// ---- THE CELL HALF: everything that actually depends on y -----------------
+//
+// Unpacks the column into exactly the local names the body below has always
+// used, so the body is unchanged line for line. Every one of these is read-only
+// from here down — the only thing this half writes is `mat`.
+fn genCellIn(col : Col, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  let h = col.h;
+  let biome = col.biome;
+  let pond = col.pond;
+  let pw = col.pw;
+  let fluid = col.fluid;
+  let fluidTop = col.fluidTop;
+  let inPoolFloor = col.inPoolFloor;
+  let inRim = col.inRim;
+  let shore = col.shore;
+  var mat = MAT_AIR;
 
   if (y <= h) {
     let submerged = pond >= 0;
@@ -2579,6 +2633,16 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   return packVox(mat, state, STAMP_NEVER);
 }
 
+// The one-shot form: one isolated cell, column and all. This is what genCell
+// has always been, and it stays the definition for the callers that sample a
+// single scattered cell and have no column to amortize over — the far-field
+// cascade sampler and the ruin skin lookup. genChunk does NOT use it; it walks
+// columns and calls the two halves itself, which is the whole point of the
+// split.
+fn genCell(c : vec3<i32>, seed : u32) -> u32 {
+  return genCellIn(genColumn(c.x, c.z, seed), c.x, c.y, c.z, seed);
+}
+
 // ---- far-field surface skin (phase 4: distance look) ----
 // Terrain surface height for a column, mirroring genCell's `h` EXACTLY
 // (baseHeight + the authored pool floor/rim overrides, same order). Keep the
@@ -2694,17 +2758,33 @@ fn genChunk(slot : u32, li : u32) {
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
   var count = 0u;
   var block = 0u;
-  for (var i = li; i < CHUNK_VOL; i += 64u) {
-    let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK, i / (CHUNK * CHUNK)));
-    let w = genCell(base + l, T.seed);
-    // Chunk-linear: the slot's page resolved once, per §2.1's second entry
-    // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
-    // every target slot before the dispatch (§3.5c) and this never faults.
-    voxStore(voxWordInChunk(slot, i), w);
-    let m = w & 0xFFFu;
-    if (m != MAT_AIR) {
-      count += 1u;
-      if (isRayBlocker(materials[m])) { block += 1u; }
+  // COLUMN-MAJOR, and that is the whole point of the genColumn/genCellIn
+  // split: the column half is evaluated ONCE per (x, z) and shared by the 16
+  // cells stacked on it, instead of being recomputed by every one of them.
+  // 256 columns over 64 threads is four columns each, 16 cells apiece — the
+  // same 4,096 cells and the same per-thread count as the flat loop this
+  // replaces, just grouped so the invariant work can be hoisted.
+  //
+  // The writes stay coalesced enough: within one height step threads 0..15
+  // hold x = 0..15 of the same z and write 16 CONSECUTIVE words, so the wave
+  // issues four 64-byte runs instead of one 256-byte one.
+  for (var ci = li; ci < CHUNK * CHUNK; ci += 64u) {
+    let lx = ci % CHUNK;
+    let lz = ci / CHUNK;
+    let col = genColumn(base.x + i32(lx), base.z + i32(lz), T.seed);
+    for (var ly = 0u; ly < CHUNK; ly += 1u) {
+      let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
+      let w = genCellIn(col, base.x + i32(lx), base.y + i32(ly),
+                        base.z + i32(lz), T.seed);
+      // Chunk-linear: the slot's page resolved once, per §2.1's second entry
+      // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
+      // every target slot before the dispatch (§3.5c) and this never faults.
+      voxStore(voxWordInChunk(slot, i), w);
+      let m = w & 0xFFFu;
+      if (m != MAT_AIR) {
+        count += 1u;
+        if (isRayBlocker(materials[m])) { block += 1u; }
+      }
     }
   }
   atomicAdd(&wgCount, count);
