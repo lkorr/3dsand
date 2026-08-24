@@ -22,7 +22,17 @@ constexpr uint64_t kPCountOff = kPickOff + 256;
 constexpr uint64_t kSupportOff = kPCountOff + 256;
 constexpr uint64_t kSupportBytes = kNumChunks * 4;
 constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
-constexpr uint64_t kFetchOff = kPageFaultOff + 256;
+// MLS-MPM fluid seam: fluidArgsStage (16 u32, the FA_* map) + the block list
+// (kFluidBlocks u32). Small enough to ride every snapshot; the block list
+// feeds PageTable::UpdateFluidChunks and the FA words feed the CPU's
+// conservative live count + the splash sound cue.
+constexpr uint64_t kFluidArgsOff = kPageFaultOff + 256;
+constexpr uint64_t kFluidBlocksOff = kFluidArgsOff + 256;
+constexpr uint64_t kFluidBlocksBytes = kFluidBlocks * 4;
+// The excited-fluid mirror fold: one byte per mirror cell, packed 4/word.
+constexpr uint64_t kFluidMirrorOff = kFluidBlocksOff + kFluidBlocksBytes;
+constexpr uint64_t kFluidMirrorBytes = 27ull * kChunkVol;
+constexpr uint64_t kFetchOff = kFluidMirrorOff + kFluidMirrorBytes;
 constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
 
 void World::Init(const rhi::Device& device) {
@@ -82,25 +92,54 @@ void World::Init(const rhi::Device& device) {
   sprites = CreateBuffer(device, kMaxSprites * sizeof(Sprite), U::Storage | U::CopyDst,
                          "sprites");
 
-  // MLS-MPM fluid prototype (world.h fluid block). CopySrc on fluidParticles
-  // is selftest-only: the fluid_det gate hashes the buffer twice-run; the
-  // frame path never reads it back.
-  fluidParticles = CreateBuffer(device, (uint64_t)kFluidCap * 72,
-                                U::Storage | U::CopySrc, "fluidParticles");
+  // MLS-MPM fluid (world.h fluid block). CopySrc on the particle pair is for
+  // the fluid gates' mass audits; the frame path reads back only the small
+  // fluidArgsStage + block list through the snapshot ring.
+  fluidParticles[0] = CreateBuffer(device,
+                                   (uint64_t)kFluidCap * kFluidParticleWords * 4,
+                                   U::Storage | U::CopySrc, "fluidParticlesA");
+  fluidParticles[1] = CreateBuffer(device,
+                                   (uint64_t)kFluidCap * kFluidParticleWords * 4,
+                                   U::Storage | U::CopySrc, "fluidParticlesB");
   fluidSpawnOps = CreateBuffer(device, kMaxFluidSpawnsPerTick * sizeof(FluidSpawnOp),
                                U::Storage | U::CopyDst, "fluidSpawnOps");
   fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 4,
                                U::Storage | U::CopyDst, "fluidBlockMap");
-  fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4, U::Storage,
-                                "fluidBlockList");
+  fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4,
+                                U::Storage | U::CopySrc, "fluidBlockList");
   // 8 i32 words per node (FLUID_GW in sim_fluid.wgsl): mass, momentum xyz,
-  // per-species mass x3, one spare — 32 MiB of per-substep scratch at 256
-  // blocks.
+  // per-species mass x3, foam — 32 MiB of per-substep scratch at 256 blocks.
   fluidGrid = CreateBuffer(device, (uint64_t)kFluidBlocks * kChunkVol * 32,
                            U::Storage, "fluidGrid");
-  fluidArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc, "fluidArgsStage");
+  // 32 u32 — the FA_* word map in common.wgsl. CopyDst: the seam relies on a
+  // zeroed live count after worldgen/reset (fill-cleared there).
+  fluidArgsStage = CreateBuffer(device, 128,
+                                U::Storage | U::CopySrc | U::CopyDst,
+                                "fluidArgsStage");
   fluidDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst,
                                    "fluidDispatchArgs");
+  fluidPDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst,
+                                    "fluidPDispatchArgs");
+  // Seam scratch (layouts documented at the members in world.h). The excite
+  // scratch is 16 header words + counts + bases + the slot list; the settle
+  // scratch is speed maxima + marks + the settle list + the bins.
+  fluidExciteScratch = CreateBuffer(device,
+                                    (uint64_t)(16 + 3 * kNumChunks) * 4,
+                                    U::Storage | U::CopyDst, "fluidExciteScratch");
+  fluidCalm = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+                           U::Storage | U::CopyDst, "fluidCalm");
+  fluidSettleScratch = CreateBuffer(
+      device,
+      (uint64_t)(2 * kNumChunks + 16 + 2 +
+                 kFluidSettleMax * kChunkVol * 2) * 4,
+      U::Storage | U::CopyDst, "fluidSettleScratch");
+  fluidCompactScratch = CreateBuffer(device, (uint64_t)(kFluidCap / 256) * 2 * 4,
+                                     U::Storage, "fluidCompactScratch");
+  fluidCellScratch = CreateBuffer(
+      device, (uint64_t)kFluidBlocks * kChunkVol * 2 * 4,
+      U::Storage | U::CopyDst, "fluidCellScratch");
+  fluidMirror = CreateBuffer(device, 27ull * kChunkVol,
+                             U::Storage | U::CopySrc, "fluidMirror");
   debugBoxes = CreateBuffer(device, (uint64_t)kMaxDebugBoxes * sizeof(DebugBox),
                             U::Storage | U::CopyDst, "debugBoxes");
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
@@ -137,6 +176,8 @@ void World::Init(const rhi::Device& device) {
   snap_.supportFlags.assign(kNumChunks, 0);
   snap_.occupancy.assign(kNumChunks, 0);
   snap_.occStain.assign(kNumChunks, 0);
+  snap_.fluidBlocks.assign(kFluidBlocks, 0);
+  snap_.fluidMirror.assign(27ull * kChunkVol, 0);
 }
 
 void World::RequestChunkFetch(IVec3 worldChunk) {
@@ -199,15 +240,11 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                     kFetchOff + i * kChunkBytes, kChunkBytes);
   }
 
-  // clamp the 3x3x3 mirror to the residency window (world chunk coords)
-  auto clampBase = [&](int v, int lo) {
-    if (v < lo) v = lo;
-    if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
-    return v;
-  };
-  s.base = {clampBase(playerChunkBase.x, origin_.x),
-            clampBase(playerChunkBase.y, origin_.y),
-            clampBase(playerChunkBase.z, origin_.z)};
+  // clamp the 3x3x3 mirror to the residency window (world chunk coords).
+  // MirrorBaseFor is the ONE clamp — the seam's mirrorFold kernel gets the
+  // same value through TickParams.mirrorBase, or the fluid-occupancy fold
+  // and the voxel mirror would describe two different cubes.
+  s.base = MirrorBaseFor(playerChunkBase);
 
   // THE CPU SEAM again, and this is the worst of the five sites (§2.1a): the
   // mirror is CPU-only collision data, so a corrupted mirror is the player
@@ -246,6 +283,15 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // wanted. That is what makes the detector work in ordinary play rather than
   // only under test.
   enc.CopyTracked(pass::Buf::PageFaults, pageFaults, 0, s.buf, kPageFaultOff, 16);
+  // MLS-MPM fluid seam: the live count + event counters and the active block
+  // list. 1.3 KB per snapshot; the block list is what keeps every chunk the
+  // seam may write materialized (PageTable::UpdateFluidChunks).
+  enc.CopyTracked(pass::Buf::FluidArgsStage, fluidArgsStage, 0, s.buf,
+                  kFluidArgsOff, 128);
+  enc.CopyTracked(pass::Buf::FluidBlockList, fluidBlockList, 0, s.buf,
+                  kFluidBlocksOff, kFluidBlocksBytes);
+  enc.CopyTracked(pass::Buf::FluidMirror, fluidMirror, 0, s.buf,
+                  kFluidMirrorOff, kFluidMirrorBytes);
   lastSlot_ = slot;
   return true;
 }
@@ -336,6 +382,29 @@ void World::KickReadback() {
             std::memcpy(pcounts, p + kPCountOff, 8);
             snap_.particleCount =
                 std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
+            // MLS-MPM fluid seam: live count, event counters, block list.
+            {
+              uint32_t fa[32];
+              std::memcpy(fa, p + kFluidArgsOff, 128);
+              snap_.fluidLive = std::min(fa[7], kFluidCap);
+              snap_.fluidSettledEighths = fa[10];
+              snap_.fluidExcitedEighths = fa[11];
+              snap_.fluidExciteRefused = fa[12];
+              snap_.fluidLastSlot = fa[14];
+              snap_.fluidBlockCount = std::min(fa[3], kFluidBlocks);
+              std::memcpy(snap_.fluidBlocks.data(), p + kFluidBlocksOff,
+                          kFluidBlocksBytes);
+              // The occupancy fold is only meaningful while fluid is live —
+              // the seam stops recording (and refreshing the buffer) at
+              // zero, so a stale fold must read as no water.
+              if (snap_.fluidLive > 0) {
+                std::memcpy(snap_.fluidMirror.data(), p + kFluidMirrorOff,
+                            kFluidMirrorBytes);
+              } else {
+                std::fill(snap_.fluidMirror.begin(), snap_.fluidMirror.end(),
+                          (uint8_t)0);
+              }
+            }
             snap_.tick = sl.tick;
             snap_.valid = true;
 

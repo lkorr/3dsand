@@ -126,23 +126,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
-                uint32_t fluidBase,
+                uint32_t fluidLive,
                 const uint32_t* fluidSplashMat) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
-  // MLS-MPM fluid prototype: budget is charged by the CALLER before emitting
-  // (rule 2 — emit-then-check overruns); this clamp is the belt to that brace.
+  // MLS-MPM fluid: `fluidLive` is the caller's CONSERVATIVE live estimate
+  // (snapshot count + spawns since — the GPU owns the real number). The spawn
+  // budget is charged by the CALLER before emitting (rule 2); this clamp is
+  // the belt to that brace, and the GPU excite scan enforces the cap exactly.
   uint32_t fluidSpawnCount = std::min((uint32_t)fluidSpawns.size(),
                                       kMaxFluidSpawnsPerTick);
-  fluidBase = std::min(fluidBase, kFluidCap);
-  if (fluidSpawnCount > kFluidCap - fluidBase)
-    fluidSpawnCount = kFluidCap - fluidBase;
+  fluidLive = std::min(fluidLive, kFluidCap);
+  if (fluidSpawnCount > kFluidCap - fluidLive)
+    fluidSpawnCount = kFluidCap - fluidLive;
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
   tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
-  tp.fluidBase = fluidBase;
+  // The disturbance-excite switch rides the tick input stream (the dayPhase
+  // precedent): tuning is read CPU-side, HERE, so replays and the twice-run
+  // determinism gates capture it and a per-gate SetCurrentTuning overrides it
+  // with no pipeline rebuild.
+  tp.fluidExciteEnable =
+      CurrentTuning().sim.fluidExciteMode != 0 ? 1u : 0u;
   tp.fluidSpawnCount = fluidSpawnCount;
   if (fluidSplashMat) {
     for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
@@ -165,6 +172,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                 (uint32_t)dtun.dayNight.freezePhase);
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
+  // The mirror corner for the seam's fluid-occupancy fold: the SAME clamp
+  // EncodeReadbacks applies to the same input below, so the fold and the
+  // voxel mirror describe one cube.
+  IVec3 mb = world.MirrorBaseFor(
+      {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
+  tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
@@ -237,12 +250,59 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     probeInstalled = true;
     GpuContext* pctx = &ctx;
     World* pw = &world;
-    pt.SetChunkProbe([pctx, pw](uint32_t slot, uint32_t* out) {
-      const uint64_t off = pw->PageOffsetOfSlot(slot);
-      if (off == World::kNoPage) return false;
-      pctx->WaitIdle();
-      return rhi::ReadbackBlocking(pctx->device, pctx->queue, pw->voxels, off,
-                                   out, (size_t)kChunkVol * 4, "freeProbe");
+    pt.SetChunkProbe([pctx, pw](const std::vector<uint32_t>& slots,
+                                uint32_t* out) {
+      // ONE COPY AND ONE MAP FOR THE WHOLE BATCH, not one drain per slot.
+      //
+      // The per-slot form called rhi::ReadbackBlocking once per candidate, and
+      // that call waits the whole device idle before mapping (rhi_vk.cpp). It
+      // was correct and it was invisible in every scenario it had been
+      // measured in, because those scenarios produce no candidates. Surface
+      // flight produces 665-804 per tick and it cost 198 ms of a 488 ms frame
+      // — see the SetChunkProbe comment for why they are manufactured by a
+      // stale snapshot rather than being real work.
+      //
+      // Gathering into one staging buffer makes it one submit and one wait for
+      // the batch. The copies are queue-ordered behind every prior submit, so
+      // they read post-tick data exactly as the per-slot copies did; the only
+      // thing removed is the repetition of the drain.
+      std::vector<bool> ok(slots.size(), false);
+      if (slots.empty()) return ok;
+      const size_t stride = (size_t)kChunkVol * 4;
+      static rhi::Buffer staging;
+      static size_t stagingSlots = 0;
+      if (stagingSlots < slots.size()) {
+        stagingSlots = slots.size();
+        staging = CreateBuffer(
+            pctx->device, (uint64_t)stagingSlots * stride,
+            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "freeProbe");
+      }
+      rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
+      size_t copied = 0;
+      for (size_t i = 0; i < slots.size(); i++) {
+        const uint64_t off = pw->PageOffsetOfSlot(slots[i]);
+        // A slot can lose its page between selection and here (evicted,
+        // demoted). No source, no copy, and ok[i] stays false — the caller
+        // simply does not free it, which is the conservative direction.
+        if (off == World::kNoPage) continue;
+        enc.CopyTracked(pass::Buf::Voxels, pw->voxels, off, staging,
+                        i * stride, stride);
+        ok[i] = true;
+        copied++;
+      }
+      if (copied == 0) return ok;
+      pctx->queue.Submit(enc.Finish());
+      rhi::MapTicket m = rhi::MapReadDeferred(pctx->device, staging, 0,
+                                             (uint64_t)slots.size() * stride);
+      m.Wait();
+      if (!m.Succeeded() || !m.Data()) {
+        m.Unmap();
+        std::fill(ok.begin(), ok.end(), false);
+        return ok;
+      }
+      std::memcpy(out, m.Data(), slots.size() * stride);
+      m.Unmap();
+      return ok;
     });
   }
   pt.BeginTick(tick);
@@ -263,6 +323,25 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // from scratch. Not carried — see the adjacency argument in
     // PageTable::UpdateSpawnRing.
     pt.UpdateSpawnRing(spawnCells, expCenters, world);
+  }
+  {
+    // fluidChunks(N): every chunk the MLS-MPM seam may write a voxel into —
+    // the active block slots from the one-tick-latent snapshot readback plus
+    // this tick's CPU-known fluid spawn cells, dilated one ring inside
+    // UpdateFluidChunks. The settle converter's >= 8 calm-tick floor is what
+    // makes the readback latency safe (world.h fluid block).
+    const WorldSnapshot& sn = world.Snap();
+    std::vector<uint32_t> blockSlots;
+    if (sn.valid && sn.fluidBlockCount > 0) {
+      blockSlots.assign(sn.fluidBlocks.begin(),
+                        sn.fluidBlocks.begin() + sn.fluidBlockCount);
+    }
+    std::vector<IVec3> fluidCells;
+    fluidCells.reserve(fluidSpawnCount);
+    for (uint32_t i = 0; i < fluidSpawnCount; i++)
+      fluidCells.push_back({fluidSpawns[i].px >> 16, fluidSpawns[i].py >> 16,
+                            fluidSpawns[i].pz >> 16});
+    pt.UpdateFluidChunks(blockSlots, fluidCells, world);
   }
   {
     const WorldSnapshot& sn = world.Snap();
@@ -298,7 +377,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // the safe direction and the list stays a plain "did anything arrive".
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
                                spawnCount > 0 || particlesActive ||
-                               fluidBase + fluidSpawnCount > 0);
+                               fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
     // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_).
@@ -330,7 +409,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.EncodePageFill(enc, jitterFills);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
-                 fluidBase + fluidSpawnCount, fluidSpawnCount);
+                 fluidLive + fluidSpawnCount, fluidSpawnCount);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the

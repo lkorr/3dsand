@@ -269,31 +269,43 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
 
-// ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; side-by-side demo) ---
-// An EXPERIMENTAL second liquid representation living alongside the CA liquid:
-// GPU particles simulated by a fixed-point MLS-MPM solver (sim_fluid.wgsl).
-// Deliberately OUTSIDE the hashed sim domain in this prototype — the fluid
-// never writes a voxel, never touches dirty flags, and no CA kernel reads any
-// fluid buffer, so the world hash is untouched by construction. The fluid is
-// still bit-deterministic in its own right (integer-only math, integer-atomic
-// P2G scatter — addition is associative, so accumulation order cannot matter),
-// which the `fluid_det` selftest gate verifies twice-run. That is the plan's
-// Phase-0 determinism spike, run inside the engine.
+// ---- MLS-MPM fluid (docs/PLAN_mpm_fluids.md; excite/settle seam Phase 2) ----
+// The EXCITED state of liquid: GPU particles simulated by the fixed-point
+// MLS-MPM solver (sim_fluid.wgsl). Settled liquid stays voxels. The seam
+// (sim_fluid_seam.wgsl) converts both ways: excite turns disturbed settled
+// cells into particles (one per fullness eighth), settle bins calm particles
+// back into fullness voxels — exact integer mass accounting in both
+// directions. The seam DOES write voxels, deterministically, so the world
+// hash moves only when fluid converts; a world that never spawns fluid is
+// bit-identical to one before this system existed (the pinned determinism
+// hash is the gate on that claim).
 //
-// The particle COUNT is CPU-owned (main loop / selftest gate): particles are
-// only ever appended by the spawn kernel at CPU-known offsets and never die,
-// so every dispatch extent is a pure function of the op stream. Not persisted:
-// save/load and worldgen drop the fluid (count resets to 0), per the plan's
-// force-settle-on-save policy — acceptable for a comparison prototype.
+// The particle COUNT is GPU-OWNED (fluidArgsStage[7]): settle kills
+// particles and excite births them on the GPU, so no CPU-side count can be
+// authoritative. A deterministic ping-pong compaction at the head of each
+// fluid tick (slot-order scans, no atomicAdd slot assignment) removes the
+// corpses; per-particle passes dispatch indirectly. The CPU keeps a
+// CONSERVATIVE estimate from the async readback (world.Snap().fluidLive) for
+// record/skip and render decisions only. Not persisted: save/load and
+// worldgen drop the fluid, per the plan's force-settle-on-save policy.
 constexpr uint32_t kFluidCap = 262144;            // hard particle budget (rule 2)
 constexpr uint32_t kMaxFluidSpawnsPerTick = 4096; // spawn-op stream cap
 // Sparse scratch-grid blocks: one 16^3 node block per ACTIVE chunk slot,
 // allocated per substep by a deterministic scan. 256 blocks * 4096 nodes *
-// 16 B = 16 MiB, and bounds simultaneously-active fluid to 256 chunks.
+// 32 B = 32 MiB, and bounds simultaneously-active fluid to 256 chunks.
 constexpr uint32_t kFluidBlocks = 256;
 // MPM substeps per 30 Hz tick. CFL: |v| <= 0.45 cell/substep, so the fluid's
 // terminal speed is 0.45 * 6 = 2.7 cells/tick (~8.1 m/s at 0.10 m voxels).
 constexpr uint32_t kFluidSubsteps = 6;
+// FluidParticle stride in u32 words — must match the struct in common.wgsl
+// (32 words / 128 B, power-of-two for coalesced access).
+constexpr uint32_t kFluidParticleWords = 32;
+// Settle converts at most this many blocks per tick. Bounds the bin scratch
+// (kFluidSettleMax * kChunkVol * 2 words) and, with the adjacency exclusion
+// in the settle scan, guarantees no two concurrently-committing blocks can
+// read each other's writes. A lake's worth of calm blocks drains through
+// this in a few ticks; settle latency is invisible next to the calm window.
+constexpr uint32_t kFluidSettleMax = 16;
 
 // One CPU-authored fluid particle spawn (32 B) — must match FluidSpawnOp in
 // common.wgsl. Positions are ABSOLUTE world cells in Q16.16 fixed point
@@ -302,8 +314,10 @@ constexpr uint32_t kFluidSubsteps = 6;
 struct FluidSpawnOp {
   int32_t px, py, pz;   // position, fixed 16.16 world cells
   int32_t vx, vy, vz;   // velocity, fixed 16.16 cells/tick
-  uint32_t species = 0; // 0..3: which liquid this is (colour + attraction id)
-  uint32_t pad1 = 0;
+  uint32_t species = 0; // 0..3: grid species-mass slot (colour + attraction)
+  uint32_t mat = 0;     // material id for the particle's attr word — settle
+                        // writes this back as the voxel, splash droplets and
+                        // staining key on it
 };
 
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
@@ -558,6 +572,38 @@ inline uint32_t SynthWordAt(uint32_t entry, int x, int y, int z, uint32_t seed) 
   return PackVoxNew(mat, JitterStateFor(x, y, z, seed));
 }
 
+// ---- the ROW form of the JITTER rule: same words, two thirds the work ------
+//
+// SynthWordAt is the DEFINITION and stays the definition. This is a strictly
+// derived helper for the two paths that synthesize or verify a whole chunk
+// (eviction's sentinel RLE, Classify's JITTER test), both of which walk cells
+// in x-fastest order and therefore call the definition 4,096 times with only
+// `x` changing across each 16-cell row.
+//
+// Hash3(a,b,c) = Pcg(a ^ Pcg(b ^ Pcg(c))), and the JITTER key is
+// a = seed^0xC0FFEE, b = x ^ (z << 12), c = y. Across one row y and z are
+// FIXED, so Pcg(c) is loop-invariant and only the outer two rounds vary. The
+// row form hoists it, which is a pure strength reduction: the arithmetic that
+// remains is bit-identical to what the definition computes, so every word this
+// produces equals SynthWordAt's for the same cell. It is not a second rule and
+// must never become one — if the definition changes, this changes with it, and
+// the page-roundtrip gate compares them.
+//
+// Measured motivation: eviction synthesized 1.37 M chunks (5.6 G hash evals)
+// over one --autofly-hard run, at 55% of the paged frame cost. Removing one of
+// three PCG rounds is the cheapest third of that, and it is hash-invisible by
+// construction.
+inline uint32_t JitterRowSeed(int y, int z, uint32_t seed) {
+  // Everything in Hash3's inner round that does not depend on x: Pcg(y), and
+  // the z half of b. `x` is xor'd in by JitterStateInRow below.
+  (void)seed;
+  return rng::Pcg((uint32_t)y) ^ ((uint32_t)z << 12);
+}
+inline uint32_t JitterStateInRow(uint32_t rowSeed, int x, uint32_t seed) {
+  // rowSeed = Pcg(y) ^ (z << 12); b ^ Pcg(c) = (x ^ (z<<12)) ^ Pcg(y) = x ^ rowSeed
+  return (rng::Pcg((seed ^ 0xC0FFEEu) ^ rng::Pcg((uint32_t)x ^ rowSeed))) % 3u;
+}
+
 // ---- the stain layer (DESIGN.md §3) ----
 // Bits 24..30 of the voxel word: 4-bit amount, 3-bit type. EXACT mirror of the
 // STAIN_* consts in common.wgsl — that file is the one the shaders see, this
@@ -670,16 +716,25 @@ struct TickParams {
   // Feeds voxel state through the daylight-gated reactions, so it is
   // determinism-critical: derived from `tick` only, never from frame timing.
   uint32_t dayPhase = 0;
-  // MLS-MPM fluid prototype: live particle count BEFORE this tick's spawns
-  // (also the append base the spawn kernel writes at), and this tick's spawn-op
-  // count. Both CPU-owned and pure functions of the op stream (see the fluid
-  // block above kFluidCap).
-  uint32_t fluidBase = 0;
+  // MLS-MPM fluid: the disturbance-excite switch (sim.fluidExciteMode read
+  // CPU-side each tick, the dayPhase precedent — tick input stream, so
+  // replays and determinism gates capture it) and this tick's spawn-op count.
+  // The live count is GPU-owned (fluidArgsStage[7]); see the fluid block
+  // above kFluidCap.
+  uint32_t fluidExciteEnable = 0;
   uint32_t fluidSpawnCount = 0;
   // Material id each MPM species splashes micro droplets as (0 = species never
   // poured -> no droplets). Recorded from the pour's brush material by the main
   // loop; vec4<u32> on the WGSL side, so keep this 16-byte aligned.
   uint32_t fluidSplashMat[4] = {0, 0, 0, 0};
+  // WORLD chunk coord of the 3x3x3 CPU-mirror corner (World::MirrorBaseFor of
+  // the player chunk — the SAME clamp EncodeReadbacks uses, or the fold and
+  // the voxel mirror would describe different cubes). The seam's mirrorFold
+  // kernel packs excited-fluid occupancy for exactly these 27 chunks so
+  // swimming sees particles the way it sees fullness voxels. vec3<i32> + pad
+  // on the WGSL side.
+  int32_t mirrorBase[3] = {0, 0, 0};
+  uint32_t padMb = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -824,23 +879,95 @@ static_assert(sizeof(RenderParams) % 16 == 0,
 // fine voxels, with kFarShiftBase = log2(kWorldN / kFarN) — chosen so level
 // k's box edge is always 2^k WINDOW edges (half-extent = 2^k window radii)
 // whatever kWorldN is. All cascade distances therefore scale WITH the window.
+//
+// ---- kFarN IS THE ONLY KNOB THAT CHANGES FAR-FIELD DETAIL ----
+// A level's cell size and its box extent are rigidly coupled: level k holds
+// kFarN^3 cells of 2^(k + kFarShiftBase) fine voxels, so the count of cells
+// across a level's half-extent is the CONSTANT kFarN/2, whatever k is. A ray
+// at distance d is served by the level whose box just contains d, so the cell
+// serving it is always ~d / (kFarN/2) — and the projected size of that cell,
+//     px_per_cell = (d / (kFarN/2)) / (2 d tan(fov/2) / H)
+//                 = H / (kFarN * tan(fov/2)),
+// has the distance cancel out. The far field renders at a CONSTANT angular
+// resolution everywhere, fixed by kFarN alone.
+//
+// The corollary cost real time to learn, so state it plainly: changing
+// kFarShiftBase or kFarLevels CANNOT change how detailed the far field looks.
+// Shifting the base one step finer and adding a level renumbers the cascade
+// (level 1 becomes what level 2 was) but leaves the cell size serving any
+// given distance bit-identical — measured: a 9-level/finer-base build differed
+// from the 8-level build by 26 pixels out of 2,073,600 in a view that is 50%
+// cascade. Those two constants trade horizon distance against near coverage;
+// only kFarN trades memory against detail.
+//
+// At kFarN=256 and 1080p/70deg that constant was ~6 px per cell, which is the
+// LOD's real weakness: every cascade cell is a visible 6-pixel block, so a
+// distant structure is quantised ~6x coarser than the screen can resolve and
+// visibly restructures as it crosses into the residency window. 512 halves
+// that to ~3 px, for 8x the per-level memory (kFarN^3).
+//
+// That 8x is paid for by DROPPING LEVELS, not by adding VRAM: see kFarLevels.
 constexpr uint32_t kFarN = 256;
 constexpr uint32_t kFarNChunk = kFarN / kChunk;  // 16
-constexpr uint32_t kFarNumChunks = kFarNChunk * kFarNChunk * kFarNChunk;  // 4096
+constexpr uint32_t kFarNumChunks = kFarNChunk * kFarNChunk * kFarNChunk;
+// Fill-queue entries pack (level-1) above a chunk SLOT index. The shift must
+// be wide enough for kFarNumChunks slots — it was hardcoded to 12 (exactly
+// right for the 4096 slots of kFarN=256, and silently wrong for anything
+// bigger: at kFarN=512 a slot index runs to 32767 and would overflow into the
+// level field, filling the wrong cascade level). Derived so it tracks kFarN.
+constexpr uint32_t kFarSlotShift = [] {
+  uint32_t s = 0;
+  while ((1u << s) < kFarNumChunks) s++;
+  return s;
+}();
+constexpr uint32_t kFarSlotMask = (1u << kFarSlotShift) - 1u;
 constexpr uint32_t kFarVox = kFarN * kFarN * kFarN;  // cells per level
-constexpr uint32_t kFarShiftBase = [] {
+// kFarShiftAlign = log2(kWorldN / kFarN): the shift that makes a level's box
+// edge equal the WINDOW edge, so level k's box is 2^k window edges across.
+// kFarShiftBase sits here; moving it renumbers the cascade without changing
+// how detailed any distance looks (see the kFarN note above).
+constexpr uint32_t kFarShiftAlign = [] {
   uint32_t s = 0;
   while ((kFarN << s) < kWorldN) s++;
   return s;
 }();
-static_assert(kWorldN >= kFarN && (kFarN << kFarShiftBase) == kWorldN,
+static_assert(kWorldN >= kFarN && (kFarN << kFarShiftAlign) == kWorldN,
               "kFarN must divide kWorldN by a power of two");
-// 8 levels: outermost half-extent = (kWorldN << 8)/2 voxels = 4096 m at the
-// 512 window and 6.25 cm voxels. farVox = kFarLevels * 16 MiB = 128 MiB.
+constexpr uint32_t kFarShiftBase = kFarShiftAlign;
+// 6 levels at kFarN=512: outermost half-extent 1638 m at the 512 window and
+// 10 cm voxels, farVox = 6 x 128 MiB = 768 MiB.
+//
+// Two levels were REMOVED to pay for the resolution above, and the horizon
+// they carried (6554 m) is worth much less than it sounds: fog is pinned so
+// opacity reaches ~99% at the outermost half-extent, so level 7 sat behind
+// ~90% fog and level 8 behind ~99%. Dropping them trades terrain almost
+// nobody can see for 2x the angular detail on the terrain everyone looks at.
+// Raising this back to 8 is legal (it costs 256 MiB more) if the horizon ever
+// matters more than the near detail — the fog pin follows automatically.
 constexpr uint32_t kFarLevels = 8;
 static_assert((uint64_t)kFarLevels * kFarVox < (1ull << 32),
               "farVox byte indices must fit u32");
+static_assert(((uint64_t)(kFarLevels - 1) << kFarSlotShift) < (1ull << 32),
+              "fill-queue packing (level-1)<<kFarSlotShift | slot must fit u32");
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
+
+// ---- cascade geometry, derived in ONE place ----
+// Level k (1-based) holds kFarN cells per axis of 2^(k + kFarShiftBase) fine
+// voxels, so its box edge is kFarN << (k + kFarShiftBase) fine voxels. Every
+// distance below derives from these two, so changing kFarN, kFarLevels or the
+// shift base moves fog, the trusted radius and the horizon together instead of
+// leaving a hardcoded "2^k window edges" relation behind to drift.
+constexpr uint32_t kFarCellVox(uint32_t k) {  // fine voxels per level-k cell
+  return 1u << (k + kFarShiftBase);
+}
+constexpr float kFarHalfExtentMeters(uint32_t k) {  // level-k half-extent, m
+  return (float)kFarN * 0.5f * (float)kFarCellVox(k) * kVoxelMeters;
+}
+// The residency window's own half-extent: the distance at which a ray leaves
+// simulated voxels and picks up the cascade, and so the cold-start trusted
+// radius before any level has filled.
+constexpr float kWindowHalfExtentMeters = (float)(kWorldN >> 1) * kVoxelMeters;
+
 // Fog reaches ~full opacity (exp(-4.5) ~= 1%) at whatever radius it is pinned
 // to; kFogOpticalDepths is that budget, shared by the static pin below and by
 // the adaptive term in WriteRenderParams.
@@ -850,15 +977,15 @@ constexpr float kFogOpticalDepths = 4.5f;
 // the fully-filled cascade is the farthest anything is ever visible, so fog is
 // never thinner than this.
 constexpr float kFarFogDensity =
-    kFogOpticalDepths / ((float)(kWorldN << kFarLevels) * kVoxelMeters * 0.5f);
+    kFogOpticalDepths / kFarHalfExtentMeters(kFarLevels);
 // Ceiling of the adaptive density (phase 3B). While a cold start / teleport
 // has cascade fills outstanding, fog closes in to hide the unfilled bands —
-// but never nearer than cascade level 2's half-extent, which is 4x the
-// residency window's own half-extent. That keeps the *simulated* world (the
-// thing the player is standing in and editing) fully visible no matter how
-// backlogged the fill queue is; only the LOD horizon ever gets fogged away.
+// but never nearer than 4x the residency window's own half-extent. That keeps
+// the *simulated* world (the thing the player is standing in and editing)
+// fully visible no matter how backlogged the fill queue is; only the LOD
+// horizon ever gets fogged away.
 constexpr float kFarFogDensityMax =
-    kFogOpticalDepths / ((float)(kWorldN << 2) * kVoxelMeters * 0.5f);
+    kFogOpticalDepths / (kWindowHalfExtentMeters * 4.0f);
 // Per-frame exponential approach of fog density toward its target. Cascade
 // bands land in whole planes, so an instantly-applied density steps visibly as
 // the queue drains; ~0.08/frame fades the horizon open over ~0.5 s instead.
@@ -904,6 +1031,26 @@ struct WorldSnapshot {
   // which is what turns §2.4's structural claim into a measurement made on
   // every run rather than in a special configuration.
   uint32_t pageFaults = 0;
+  // ---- MLS-MPM fluid (seam) ----
+  // The GPU-owned live particle count and the fluidArgsStage event counters
+  // (the FA_* map in common.wgsl) as of this snapshot's tick. fluidLive is
+  // the CPU's ONLY view of the population — conservative for record/skip
+  // decisions, exact for the selftest's mass audits after a WaitIdle.
+  uint32_t fluidLive = 0;
+  uint32_t fluidSettledEighths = 0;   // event counter, that tick only
+  uint32_t fluidExcitedEighths = 0;   // event counter, that tick only
+  uint32_t fluidExciteRefused = 0;    // budget refusals, that tick only
+  uint32_t fluidLastSlot = 0;         // coarse position for the splash cue
+  // Active fluid block slots at capture (first fluidBlockCount entries of the
+  // block list). Feeds PageTable::UpdateFluidChunks so every chunk the seam
+  // may write is materialized — the settle converter's >= 8 calm-tick floor
+  // is what makes this latency safe.
+  uint32_t fluidBlockCount = 0;
+  std::vector<uint32_t> fluidBlocks;
+  // Excited-fluid eighths per mirror cell (27 x 4096 bytes, mirrorBase
+  // addressing — the same cube as `mirror`). Zeroed whenever no fluid is
+  // live, so a stale fold can never report ghost water.
+  std::vector<uint8_t> fluidMirror;
 };
 
 // One CPU-cached chunk of voxel data, fetched on demand through the async
@@ -925,6 +1072,38 @@ class World {
   bool EncodeReadbacks(const rhi::Device& device, const rhi::CommandEncoder& enc,
                        IVec3 playerChunkBase, uint32_t particleLivePage,
                        uint32_t tick);
+
+  // Excited-fluid eighths (0..8) at a world cell, from the snapshot's fluid
+  // mirror fold. 0 outside the 3x3x3 mirror, when no snapshot exists, or
+  // when no fluid is live — the same Unknown-is-conservative shape KindAt
+  // has, in the direction that never invents water.
+  uint32_t FluidEighthsAt(IVec3 cell) const {
+    if (!snap_.valid || snap_.fluidLive == 0 || snap_.fluidMirror.empty())
+      return 0;
+    IVec3 mc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+    IVec3 d{mc.x - snap_.mirrorBase.x, mc.y - snap_.mirrorBase.y,
+            mc.z - snap_.mirrorBase.z};
+    if (d.x < 0 || d.x > 2 || d.y < 0 || d.y > 2 || d.z < 0 || d.z > 2)
+      return 0;
+    size_t m = (size_t)((d.z * 3 + d.y) * 3 + d.x);
+    IVec3 lo{cell.x & 15, cell.y & 15, cell.z & 15};
+    return snap_.fluidMirror[m * kChunkVol +
+                             (size_t)((lo.z * 16 + lo.y) * 16 + lo.x)];
+  }
+
+  // The 3x3x3 mirror's clamped corner for a desired player-chunk corner.
+  // Shared by EncodeReadbacks and the tick's mirrorBase (TickParams) so the
+  // voxel mirror and the fluid-occupancy fold always describe the same cube.
+  IVec3 MirrorBaseFor(IVec3 playerChunkBase) const {
+    auto clampBase = [&](int v, int lo) {
+      if (v < lo) v = lo;
+      if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
+      return v;
+    };
+    return {clampBase(playerChunkBase.x, origin_.x),
+            clampBase(playerChunkBase.y, origin_.y),
+            clampBase(playerChunkBase.z, origin_.z)};
+  }
 
   // ---- toroidal residency window (DESIGN.md §3) ----
   // The resident cube covers world chunks [origin, origin+kNChunk) per axis;
@@ -1107,19 +1286,53 @@ class World {
   rhi::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   rhi::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
 
-  // ---- MLS-MPM fluid prototype (see the fluid block above kFluidCap) ----
-  // None of these is hashed, persisted or read by any CA kernel; fluidGrid,
-  // fluidBlockMap and fluidBlockList are per-substep scratch, cleared and
-  // rebuilt inside the tick. fluidParticles is the only carried state, and it
-  // is reconstructible from the op stream (deterministic solver + spawn ops).
-  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (72 B, see common.wgsl)
+  // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
+  // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,
+  // cleared and rebuilt inside the tick. fluidParticles[2] is the carried
+  // state: a ping-pong pair the seam's deterministic compaction copies
+  // between once per tick (read page_, write 1-page_, exactly the ballistic
+  // particles' parity convention), reconstructible from the op stream.
+  // The seam's converters write VOXELS (excite clears cells, settle fills
+  // them) — the settled side of the fluid lives in the hashed world domain.
+  rhi::Buffer fluidParticles[2]; // kFluidCap FluidParticle (128 B, common.wgsl)
   rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
   rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
   rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
-                                 // mom xyz, species mass x3, pad — FLUID_GW)
-  rhi::Buffer fluidArgsStage;    // 4 u32: [0..2] node-pass dispatch args, [3] count
+                                 // mom xyz, species mass x3, foam — FLUID_GW)
+  rhi::Buffer fluidArgsStage;    // 16 u32 — the FA_* word map in common.wgsl:
+                                 // node args + live count + event counters
   rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
+  rhi::Buffer fluidPDispatchArgs; // 3 u32, indirect-only: per-particle passes
+                                  // + the seam's list-shaped dispatches (the
+                                  // seam re-copies between uses)
+  // Seam scratch (sim_fluid_seam.wgsl). All fill-cleared per fluid tick
+  // except fluidCalm, which persists (per-slot calm counters, cleared on
+  // worldgen/reset).
+  rhi::Buffer fluidExciteScratch; // [0..15] header, [16..16+N) per-slot counts,
+                                  // [16+N..16+2N) per-slot bases, then the
+                                  // slot list (N = kNumChunks)
+  rhi::Buffer fluidCalm;          // kNumChunks u32: consecutive calm ticks
+  rhi::Buffer fluidSettleScratch; // [0..N) per-slot max speed, [N..2N) settle
+                                  // marks (list idx | flags), [2N..2N+16]
+                                  // settle list header+slots, then bins:
+                                  // kFluidSettleMax * kChunkVol * 2 words
+  rhi::Buffer fluidCompactScratch; // per-256-span survivor counts + bases
+                                   // (kFluidCap/256 * 2 u32)
+  rhi::Buffer fluidMirror;        // 27 mirror chunks x 4096 cells, one byte
+                                  // of excited-fluid eighths per cell packed
+                                  // 4/word — the swimming query's view of the
+                                  // particles, folded by the seam's
+                                  // mirrorFold and read back with the
+                                  // snapshot (World::FluidEighthsAt)
+  rhi::Buffer fluidCellScratch;   // per active-block cell, 2 u32: [0] intent
+                                  // (mat<<16 | stainAmt<<3 | stainType,
+                                  // atomicMax by the seam's particleTick) and
+                                  // [1] flags (bit0 = a CA reaction consumed
+                                  // this cell's excited fluid, atomicOr by
+                                  // sim_step). The occupancy/consumption
+                                  // bridge between the CA and the particles;
+                                  // fill-cleared each fluid tick.
   rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
   rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
   rhi::Buffer bodyXforms;      // debris-body transforms (render)
@@ -1131,7 +1344,7 @@ class World {
                          // (atomic in the fill/downsample kernels: partial-word
                          // byte updates from neighboring dirty chunks race)
   rhi::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
-  rhi::Buffer farList;  // kFarListCap u32 fill entries: (level-1)<<12 | slot
+  rhi::Buffer farList;  // kFarListCap entries: (level-1)<<kFarSlotShift | slot
   rhi::Buffer farUBO;   // FarParams
 
  private:

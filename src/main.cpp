@@ -64,7 +64,29 @@ namespace {
 uint64_t g_harnessFrames = 0;
 bool g_autofly = false;
 bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool sizing
+// --autofly-surface: the RENDERER's adversarial traversal, the complement of
+// --autofly-hard. Where the hard descent drives the window into solid bulk to
+// stress residency, this one flies OVER the terrain to stress ray length: the
+// surface case is where the frame cost lives (docs/PLAN_surface_flight_perf.md
+// Part A), and it is exactly the case the descent cannot reach.
+bool g_autoflySurface = false;
+// Which of the two --autofly-surface regimes the current frame is in, set from
+// the tick phase in the input block and consumed by the altitude pin after
+// player.Update. Two sites because the phase is known where every other autofly
+// decision is made, but the pin has to land after the integrator.
+bool g_autoflySurfaceHigh = false;
+// Voxels of clearance for each regime. The low skim wants to be just over the
+// canopy — trees run ~30 voxels above the ground they stand on — so it is
+// canopy + 5. The high cruise is +150 voxels (15 m at kVoxelMeters 0.10), well
+// clear of anything worldgen builds, which is what isolates the altitude term.
+constexpr float kAutoflySurfaceLowVox = 35.0f;
+constexpr float kAutoflySurfaceHighVox = 150.0f;
 std::vector<double> g_frameMs;  // --frames: whole-frame wall clock, for percentiles
+// --autofly-surface splits the SAME samples by regime. A pooled p50 over a run
+// that alternates low skim and high cruise is the median of a bimodal
+// distribution and answers neither question: the altitude term is the whole
+// point of the harness, so the two arms are reported separately as well.
+std::vector<double> g_frameMsLow, g_frameMsHigh;
 double g_harnessRenderMs = 0.0;
 
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
@@ -227,6 +249,22 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
   render({108, (float)(h108 + 28), 108}, 0.785f, -0.02f, "screenshot_ground.bmp");
+  // CASCADE shot: the only capture here that is actually MOSTLY far field.
+  // The two shots above look down from moderate height, so nearly every pixel
+  // lands inside the residency window and the cascades barely appear — neither
+  // could catch a far-field regression. Measured on this exact frame: 50% of
+  // its pixels come from traceFar (checked by stubbing the far march out), so
+  // it is the one that would notice.
+  //
+  // Both numbers below are load-bearing. The camera must be well ABOVE the
+  // terrain, because the residency window is only half a window edge in radius
+  // (25.6 m at kWorldN=512, kVoxelMeters=0.10) and any eye-height view is
+  // walled in by near terrain — an earlier version of this shot sat at
+  // h108+12 and differed by ONE pixel in 2,073,600 between two very different
+  // cascade configurations, i.e. it tested nothing. And the pitch must be
+  // near-horizontal: aimed steeply down, the frame fills with the window again.
+  render({108, (float)(h108 + 300), 108}, 0.785f, -0.06f,
+         "screenshot_cascade.bmp");
   // Combat arena POI, centered at (180,110): from outside the -x/-z corner
   // looking across the deck, high enough to see the far wall and both doorways.
   {
@@ -689,6 +727,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
                     (int32_t)((hh >> 19) % 8192u) - 4096;
             op.vx = 0; op.vy = -19661; op.vz = 0;
             op.species = 0;
+            op.mat = splashMats[0];  // water: the particle's settled identity
             out.push_back(op);
           }
         }
@@ -1141,6 +1180,7 @@ int main(int argc, char** argv) {
     if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
     if (a == "--autofly") g_autofly = true;
     if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
+    if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
     // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
@@ -1519,12 +1559,18 @@ int main(int argc, char** argv) {
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
-  // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the CPU-owned particle
-  // count. The GPU never allocates fluid particles, so this is the single
-  // truth for every dispatch extent and the draw count. Not persisted: saves
-  // and worldgen drop the fluid (plan's force-settle-on-save policy, prototype
-  // version).
+  // MLS-MPM fluid (docs/PLAN_mpm_fluids.md): the CPU's CONSERVATIVE live
+  // estimate — the GPU owns the real count now (settle kills particles,
+  // excite births them; the seam's compaction maintains fluidArgs[FA_LIVE]).
+  // Refreshed from the snapshot readback each frame, bumped by spawns
+  // submitted since that snapshot's tick so a fresh pour never reads as
+  // empty. Drives record/skip, draw counts and the HUD only — every kernel
+  // re-bounds itself on the GPU count. Not persisted.
   uint32_t fluidCount = 0;
+  // Spawns submitted after the newest snapshot's tick: (tick, count) pairs,
+  // dropped once a snapshot at/after their tick arrives (the GPU count now
+  // includes them).
+  std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
   // Material id each MPM species splashes micro droplets as, recorded from the
   // pour's brush material (TickParams.fluidSplashMat). 0 until a species is
   // first poured — no pour, no droplets.
@@ -1532,6 +1578,13 @@ int main(int argc, char** argv) {
   // Last tick the MPM fluid was live: keeps the particle passes awake for the
   // splash droplets (see particlesActive below).
   uint32_t lastFluidTick = 0;
+  // Splash sound cue: fired once per snapshot tick that reports a burst of
+  // excitement, voiced through water's Impact slot (the Break precedent —
+  // audio is presentation-only and reads the same readback).
+  uint32_t lastFluidCueTick = 0;
+  uint32_t fluidCueMat = 0;
+  for (size_t i = 0; i < mats.size(); i++)
+    if (mats[i].name == "water") { fluidCueMat = (uint32_t)i; break; }
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -1572,7 +1625,16 @@ int main(int argc, char** argv) {
     // block), and reads 100+ while the screen updates at <10.
     // Skip the first 60 frames: worldgen and first-use pipeline creation are
     // startup cost, not the steady-state stall being measured.
-    if (g_harnessFrames > 0 && frameCounter > 60) g_frameMs.push_back(dt * 1000.0);
+    if (g_harnessFrames > 0 && frameCounter > 60) {
+      g_frameMs.push_back(dt * 1000.0);
+      // Bucketed by the regime this frame was FLOWN in, which is the flag the
+      // altitude pin used, not a re-derivation of the tick phase here — the
+      // two would disagree on the frames straddling a phase flip.
+      if (g_autoflySurface) {
+        (g_autoflySurfaceHigh ? g_frameMsHigh : g_frameMsLow)
+            .push_back(dt * 1000.0);
+      }
+    }
     fpsWinFrames++;
     fpsWinWorst = std::max(fpsWinWorst, (double)dt);
     if (now - fpsWinStart >= 0.5) {
@@ -1747,6 +1809,33 @@ int main(int argc, char** argv) {
         pin.strafe = (phase == 1) ? 1.f : (phase == 3) ? -1.f : 0.f;
         pin.down = true;   // descend into solid rock: worst case for residency
       }
+      // --autofly-surface: the RENDERER's worst case. Fly forward over the
+      // terrain at two altitudes on the same fixed `tick/90` phase form the
+      // hard descent uses, so the two harnesses are directly comparable and
+      // both are reproducible run to run.
+      //
+      // WHY THE ALTITUDE IS HELD ANALYTICALLY, not by pin.up/pin.down: the
+      // quantity under test is RAY LENGTH THROUGH UNSKIPPED CHUNKS, which is a
+      // function of height above the terrain, and a fly-mode climb driven by an
+      // input axis wanders with frame time. World::TerrainHeight is the exact
+      // integer CPU mirror of worldgen's baseHeight (world.cpp), so the target
+      // is a pure function of (x, z, seed) — no world reads, no residency
+      // dependence, nothing that could vary between a paged and a dense run
+      // being differenced. The pin itself is applied AFTER player.Update (see
+      // the autofly-surface block down at the Update call), because fly mode
+      // integrates velocity and would otherwise fight the assignment.
+      //
+      // Phase bit alternates the two regimes that bracket the collapse:
+      //   low skim   — just over the canopy: micro/strand and half-full foliage
+      //                chunks dominate, rays are short but never skippable.
+      //   high cruise— well above everything: rays run the full window diagonal
+      //                and the altitude term is the whole cost.
+      if (g_autoflySurface) {
+        const uint32_t phase = (uint32_t)(tick / 90u) & 1u;
+        pin.up = false;
+        pin.down = false;
+        g_autoflySurfaceHigh = (phase == 1u);
+      }
     }
 
     if (ui.reloadShaders) {
@@ -1887,7 +1976,8 @@ int main(int argc, char** argv) {
       tick = 0;
       grenades.clear();
       everExploded = false;
-      fluidCount = 0;  // MPM fluid does not survive a regen
+      fluidCount = 0;  // MPM fluid does not survive a regen (the worldgen
+      fluidPendingSpawns.clear();  // table zeroes the GPU count + calm state)
       debris.Reset();
       mobs.Reset();
       // The avatar's severed parts live in DebrisSystem and its live limbs are
@@ -1916,14 +2006,23 @@ int main(int argc, char** argv) {
         // transient state is cleared here.
         grenades.clear();
         everExploded = false;
-        fluidCount = 0;  // MPM fluid is not in the save format (prototype)
+        fluidCount = 0;  // MPM fluid is not in the save format: saves
+        fluidPendingSpawns.clear();  // force-settle (loadReset zeroes the
+                                     // GPU count + calm state)
         tpRig.Snap();
       }
     }
 
     // ---- player (per frame, against the latest one-tick-latent mirror) ----
     player.fly = ui.fly;
-    auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
+    // Excited MPM water folds into the liquid answer BEFORE the voxel
+    // mirror: swimming, buoyancy and the waterline frame work identically
+    // whichever representation the water happens to be in (plan §6.5). The
+    // >= 2 eighths floor keeps a lone stray droplet from reading as a pool.
+    auto kindAt = [&](IVec3 c) {
+      if (world.FluidEighthsAt(c) >= 2) return CellKind::Liquid;
+      return world.KindAt(c, classOf);
+    };
     // Dismemberment drives movement: the active AnimStateRule's speedScale and
     // the leg-liveness-derived jump scale come straight from the avatar, so
     // losing a leg slows the player down and losing both stops them jumping.
@@ -1937,6 +2036,21 @@ int main(int argc, char** argv) {
       player.canJump = couple ? loco.canJump : true;
     }
     player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(), kindAt);
+    // --autofly-surface altitude pin. Held analytically against the worldgen
+    // heightfield rather than flown, so the measured quantity (ray length
+    // through unskipped chunks) depends only on the tick schedule — see the
+    // block beside g_autoflyHard for why. Fly mode has no terrain collision, so
+    // assigning the position outright is legal here; vel.y is zeroed so the
+    // integrator does not carry an accumulated climb into the next frame and
+    // fight this every step.
+    if (g_autoflySurface) {
+      const int gh = World::TerrainHeight((int)std::floor(player.pos.x),
+                                          (int)std::floor(player.pos.z),
+                                          kDefaultSeed);
+      player.pos.y = (float)gh + (g_autoflySurfaceHigh ? kAutoflySurfaceHighVox
+                                                       : kAutoflySurfaceLowVox);
+      player.vel.y = 0.0f;
+    }
     ui.fly = player.fly;
 
     // ---- fixed-tick simulation ----
@@ -2035,7 +2149,7 @@ int main(int argc, char** argv) {
       // most one 1-chunk shift per axis)
       IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                            ifloor(player.pos.z) >> 4};
-      stream.Update(playerChunkNow);
+      stream.Update(playerChunkNow, tick);
       // far-field cascades track the player the same way (render-only)
       far.Update(playerChunkNow);
       uint32_t farCount = far.PrepareTick(ctx.queue);
@@ -2256,7 +2370,15 @@ int main(int argc, char** argv) {
       std::vector<FluidSpawnOp> fluidSpawns;
       if (ui.clearFluid) {
         ui.clearFluid = false;
-        fluidCount = 0;  // spawns restart at slot 0; stale GPU data unreachable
+        // The count is GPU-owned now: zero the live word directly. Deferred
+        // queue writes drain at the head of the NEXT command buffer — this
+        // tick's — so the seam's compaction reads 0 and every particle is
+        // gone before the substeps run (the deferred-WriteBuffer ordering
+        // gotcha, used in the right direction for once).
+        uint32_t zero = 0;
+        ctx.queue.WriteBuffer(world.fluidArgsStage, 7 * 4, &zero, 4);
+        fluidCount = 0;
+        fluidPendingSpawns.clear();
       }
       if (ui.tool == UIState::kToolFluid && !ui.magicMode && mouseL) {
         const WorldSnapshot& fsnap = world.Snap();
@@ -2297,6 +2419,11 @@ int main(int argc, char** argv) {
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
                 op.species = fluidSpecies;
+                // The particle knows what it IS (attr word): settle writes
+                // this material back as voxels, splashes and staining key on
+                // it. The species table above is just the render/attraction
+                // grouping now.
+                op.mat = (uint32_t)ui.brushMaterial & 0xFFFu;
                 fluidSpawns.push_back(op);
               }
             }
@@ -2748,7 +2875,27 @@ int main(int argc, char** argv) {
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat);
-      fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(), kFluidCap);
+      // Conservative estimate refresh: the newest snapshot's GPU-owned count
+      // plus every spawn batch it has not seen yet. Settles decay it (the
+      // snapshot count shrinks); excites grow it one snapshot late, which the
+      // seam's recording predicate covers (Simulation::EncodeTick).
+      if (!fluidSpawns.empty())
+        fluidPendingSpawns.push_back({tick, (uint32_t)fluidSpawns.size()});
+      {
+        const WorldSnapshot& fsn = world.Snap();
+        uint32_t pend = 0;
+        if (fsn.valid) {
+          std::erase_if(fluidPendingSpawns,
+                        [&](const std::pair<uint32_t, uint32_t>& p) {
+                          return p.first <= fsn.tick;
+                        });
+          for (const auto& p : fluidPendingSpawns) pend += p.second;
+          fluidCount = std::min(fsn.fluidLive + pend, kFluidCap);
+        } else {
+          fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(),
+                                kFluidCap);
+        }
+      }
       ui.fluidCount = fluidCount;
       double tSubmit1 = NowSeconds();
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
@@ -2879,6 +3026,30 @@ int main(int argc, char** argv) {
         // snaps on one instant.
         for (const DebrisSystem::BreakEvent& be : debris.BreakEvents())
           audioCues.Break(be.material, be.posVoxel, be.sizeVoxels);
+
+        // A burst of MPM excitement (rock in a lake, floor carved under a
+        // pool) reads as an impact through the water material's existing
+        // slot — the Break precedent, driven from the same snapshot
+        // readback. Once per snapshot tick, positioned at the last exciting
+        // chunk's centre (coarse is fine for a splash).
+        {
+          const WorldSnapshot& fsn = world.Snap();
+          if (fsn.valid && fsn.tick != lastFluidCueTick &&
+              fsn.fluidExcitedEighths >= 64 && fluidCueMat != 0) {
+            lastFluidCueTick = fsn.tick;
+            uint32_t s = fsn.fluidLastSlot;
+            IVec3 sc{(int)(s % kNChunk), (int)((s / kNChunk) % kNChunk),
+                     (int)(s / (kNChunk * kNChunk))};
+            IVec3 o = fsn.windowOrigin;
+            int m = (int)kNChunk - 1;
+            IVec3 wc{o.x + ((sc.x - o.x) & m), o.y + ((sc.y - o.y) & m),
+                     o.z + ((sc.z - o.z) & m)};
+            Vec3 pos{wc.x * 16.0f + 8.0f, wc.y * 16.0f + 8.0f,
+                     wc.z * 16.0f + 8.0f};
+            audioCues.Impact(fluidCueMat, pos,
+                             std::min(fsn.fluidExcitedEighths / 64.0f, 8.0f));
+          }
+        }
 
         // Limbs that came off this frame. The creature's cry fires for every
         // sever; the wet CUT only for one made by a blade, because an
@@ -3300,6 +3471,19 @@ int main(int argc, char** argv) {
                 pct(0.50), pct(0.95), pct(0.99),
                 g_frameMs.empty() ? 0.0 : g_frameMs.back(), over33,
                 100.0 * over33 / (double)g_frameMs.size(), over100);
+    // Per-regime arms (see g_frameMsLow/High). The HIGH number is the one the
+    // altitude work is judged on; the LOW one is the canopy/meadow skim.
+    if (g_autoflySurface) {
+      auto arm = [](const char* name, std::vector<double>& v) {
+        if (v.empty()) return;
+        std::sort(v.begin(), v.end());
+        auto q = [&](double p) { return v[(size_t)(p * (v.size() - 1))]; };
+        std::printf("--autofly-surface %s: n %zu  p50 %.1f  p95 %.1f  max %.1f\n",
+                    name, v.size(), q(0.50), q(0.95), v.back());
+      };
+      arm("low-skim  ", g_frameMsLow);
+      arm("high-cruise", g_frameMsHigh);
+    }
   }
 
   telemetry.Shutdown();

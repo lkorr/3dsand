@@ -1259,7 +1259,68 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     // need the per-cell march whenever anything at all is present.
     let occ = chunkOcc(cell);
     let occN = select(occBlockers(occ), occTotal(occ), wantMedia);
-    if (occN == 0u) {
+
+    // ---- SENTINEL-AWARE CHUNK RESOLUTION (PLAN_surface_flight_perf.md A5) ----
+    // The page table is not just a memory map; it is a compressed DESCRIPTION
+    // of a chunk's contents, and the renderer used to be blind to it. A
+    // UNIFORM/JITTER chunk reports occupancy FULL (sim_occupancy.wgsl), so the
+    // occupancy test below never fired for one and the ray marched 16-48 cells
+    // through a body of stone it could have answered in one lookup — paying a
+    // hash3 per cell on top, for JITTER.
+    //
+    // One extra load (the entry is in the same cache line neighbourhood
+    // voxWordAt is about to touch anyway) buys two exits:
+    //   blocker material  -> the whole chunk is solid, so the CURRENT cell is
+    //                        solid: report the hit right here. No chunk-face
+    //                        geometry needed — the DDA already arrived at this
+    //                        cell through its entry face, and tCur/axis are
+    //                        that crossing.
+    //   non-blocking      -> nothing in the chunk can stop this ray class, so
+    //                        take the same exit-face jump an empty chunk takes.
+    //
+    // The non-blocking arm is deliberately NARROW: it fires only for MAT_AIR
+    // (which is PT_EMPTY, already covered by occupancy, but free to include)
+    // and for a media-blind ray meeting a micro material — the case where a
+    // whole chunk of grass must not stop a shadow ray, which is exactly
+    // isRayBlocker's micro exclusion restated at chunk granularity. Anything
+    // else (gas, translucent liquid, ice, a micro material under a PRIMARY
+    // ray) still falls through to the per-cell march, because those cells
+    // contribute to the pixel and skipping them would drop the media, the
+    // Beer-Lambert path or the grass model itself.
+    let ptEntry = pageEntryOf(chunkIndexW(cell));
+    var chunkSkip = (occN == 0u);
+    if ((ptEntry & PT_SENTINEL_BIT) != 0u) {
+      let sMat = ptEntry & PT_MAT_MASK;
+      if (sMat == MAT_AIR) {
+        chunkSkip = true;
+      } else if (isRayBlocker(materials[sMat]) &&
+                 !(wantMedia && isTranslucentSolid(materials[sMat]))) {
+        // Uniform blocker: this cell is that material. synthWordAt is the same
+        // word voxWordAt would have produced, so stain/state/stamp are exactly
+        // what the per-cell path would have reported.
+        //
+        // The isTranslucentSolid exclusion is load-bearing and easy to miss:
+        // ice and glass are CLASS_SOLID and so ARE ray blockers (a shadow ray
+        // must stop on them — see the translucent-solid branch below), but a
+        // PRIMARY ray must keep marching through them to accumulate tsPath.
+        // Reporting an opaque hit at the near face of a glacier would erase
+        // the Beer-Lambert tint and everything behind it. Media-blind rays
+        // keep the fast path, which is where a solid ice chunk is a pure win.
+        out.hit = true;
+        out.t = tCur;
+        out.cell = cell;
+        out.axis = axis;
+        out.sgn = sign(rd[axis]);
+        out.word = synthWordAt(ptEntry, cell, ptSeed());
+        return out;
+      } else if (!wantMedia && (materials[sMat].flags & MATF_MICRO) != 0u) {
+        // A chunk of nothing but grass, seen by a shadow ray: passes straight
+        // through, per the micro shadow policy at the top of trace().
+        chunkSkip = true;
+      }
+    }
+
+    if (chunkSkip) {
       // empty chunk: jump straight to its exit face
       let ch = worldChunkOf(cell);
       let lo = vec3f(ch * i32(CHUNK));
@@ -1699,6 +1760,27 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 // — a sun ray leaves the hit level's box within a few dozen cells, and
 // cross-level shadow reach buys nothing visible through fog at that range.
 // Render-only float math on render-only data (CLAUDE.md rule 1 scopes to sim).
+// ---- THE REACH MUST BE A DISTANCE, NOT A STEP COUNT ----
+// This loop used to run a bare `for (i = 0; i < 128; i++)`, which silently ties
+// the shadow's WORLD-SPACE reach to the level's cell size: 128 steps is 128
+// cells, so a level whose cells are half as wide casts a shadow ray half as
+// far. That coupling is invisible until the cascade's shift base moves - when
+// every cell halved (see kFarShiftBase in world.h), the near levels' rays
+// stopped terminating on a caster inside their budget and every one of them
+// burned the full 128 steps plus occupancy lookups, turning a 10.5 ms frame
+// into a 606 ms one: a 58x cliff out of a constant that reads like a safety
+// cap.
+//
+// The budget below is therefore expressed in METERS and converted into this
+// level's cells, so the shadow reaches the same distance into the world at
+// every level and the step count falls out of the geometry. The clamp bounds
+// both ends: never so few steps that a coarse level cannot leave its own cell,
+// never more than the old cap, which is what protects the frame.
+fn farShadowSteps(level : u32) -> i32 {
+  let cellM = f32(1u << farCellShift(level)) * VOXEL_METERS;
+  return clamp(i32(TUNE_FAR_SHADOW_REACH / max(cellM, 1e-4)), 8, 128);
+}
+
 fn farShadowed(level : u32, roFine : vec3f) -> bool {
   var rd = keyLightDir();
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -1722,7 +1804,8 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
     tMax[a] = (boundary - roL[a]) * inv[a];
   }
   var tCur = 0.0;
-  for (var i = 0; i < 128; i++) {
+  let steps = farShadowSteps(level);
+  for (var i = 0; i < steps; i++) {
     if (!farInBox(cell, org)) { return false; }
     if (farOcc[farOccIndex(level, cell)] == 0u) {
       // empty level chunk: jump to its exit face (seam-safe, as in traceFar)
@@ -4155,9 +4238,27 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
 }
 
 fn fluidMassAt(c : vec3<i32>) -> f32 {
+  var m = 0.0;
   let b = fluidNodeBase(c);
-  if (b < 0) { return 0.0; }
-  return f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
+  if (b >= 0) {
+    m = f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
+  }
+  // Seam continuity (plan §6.7): SETTLED liquid voxels contribute their
+  // fullness as virtual mass, so the isosurface's boundary taps see the
+  // voxel water next door and the two surfaces meet instead of leaving a
+  // gap. A full settled cell reads exactly rest density. Render-only — the
+  // sim's grid never sees this. The whole-lake case costs nothing: the
+  // march only queries cells near active blocks (fluidChunkActive skips the
+  // rest), and lakes with no excited water never enter the march at all
+  // (R.fluidCount == 0). max(), not +: a cell mid-conversion briefly holds
+  // both representations of the SAME water.
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
+  if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
+    m = max(m, f32(voxState(w) + 1u) * (1.0 / 8.0) *
+                   max(TUNE_FLUID_REST_DENSITY, 1.0));
+  }
+  return m;
 }
 
 // Trilinear density, NORMALIZED so 1.0 = rest density. Nodes sit at cell

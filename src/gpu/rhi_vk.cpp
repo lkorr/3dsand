@@ -666,7 +666,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
 
   vk::Bindings bd{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++) bd.buffers[i] = NB(tb.buffers[i]);
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < 64; i++) {
     bd.pipelines[i] =
         tb.pipelines[i] ? static_cast<VkrComputePipeline*>(tb.pipelines[i].Get())->p
                         : VK_NULL_HANDLE;
@@ -681,11 +681,13 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   bd.slimPartLayout = layout(tb.slimPartLayout);
   bd.slimFarLayout = layout(tb.slimFarLayout);
   bd.slimFluidLayout = layout(tb.slimFluidLayout);
+  bd.slimFluidSeamLayout = layout(tb.slimFluidSeamLayout);
   bd.simSet = set(tb.simSet);
   bd.slimSet = set(tb.slimSet);
   bd.particleSet = set(tb.particleSet);
   bd.farSet = set(tb.farSet);
   bd.fluidSet = set(tb.fluidSet);
+  bd.fluidSeamSet = set(tb.fluidSeamSet);
 
   e->rec->SetBindings(bd);
 

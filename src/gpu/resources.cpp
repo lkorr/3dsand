@@ -96,6 +96,9 @@ std::string ShaderConstantPrelude() {
   o << "const FAR_N : u32 = " << kFarN << "u;\n";
   o << "const FAR_NCHUNK : u32 = " << kFarNChunk << "u;\n";
   o << "const FAR_NUM_CHUNKS : u32 = " << kFarNumChunks << "u;\n";
+  // Fill-queue packing: (level-1) << FAR_SLOT_SHIFT | chunk slot.
+  o << "const FAR_SLOT_SHIFT : u32 = " << kFarSlotShift << "u;\n";
+  o << "const FAR_SLOT_MASK : u32 = " << kFarSlotMask << "u;\n";
   o << "const FAR_VOX : u32 = " << kFarVox << "u;\n";
   o << "const FAR_MASK : i32 = " << (kFarN - 1) << ";\n";
   o << "const FAR_NCHUNK_MASK : i32 = " << (kFarNChunk - 1) << ";\n";

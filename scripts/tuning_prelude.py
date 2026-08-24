@@ -270,6 +270,7 @@ SPEC = [
     ("render", "microSwaySpeed", "TUNE_MICRO_SWAY_SPEED", "f", 1.1),
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
+    ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
 
     # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),
@@ -318,6 +319,13 @@ SPEC = [
     ("sim", "fluidBubbleDensity", "TUNE_FLUID_BUBBLE_RHO", "f", 1.05),
     ("sim", "fluidSprayDensity", "TUNE_FLUID_SPRAY_RHO", "f", 0.42),
     ("sim", "fluidFoamScaleIdx", "TUNE_FLUID_FOAM_SCALE_IDX", "u", 3),
+
+    # MLS-MPM settle / excite seam
+    ("sim", "fluidExciteMode", "TUNE_FLUID_EXCITE_MODE", "i", 0),
+    ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 0.9),
+    ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 3.6),
+    ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 45),
+    ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
 
     # worldgen (integer; needs a world regen to take effect)
     ("worldgen", "treeline", "TUNE_TREELINE", "i", 72),

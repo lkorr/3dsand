@@ -83,11 +83,12 @@ class Simulation {
   // produced here before encoding the next tick. particlesActive lets a
   // settled world skip the particle passes entirely; the caller must derive it
   // ONLY from tick-deterministic inputs (see main.cpp) or determinism breaks.
-  // fluidCount/fluidSpawnCount drive the MLS-MPM fluid prototype
-  // (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl): fluidCount is the particle
-  // count AFTER this tick's spawns (CPU-owned — the fluid never allocates on
-  // the GPU), fluidSpawnCount is this tick's spawn-op count. Zero both and
-  // nothing fluid-related is recorded at all.
+  // fluidCount is the CPU's CONSERVATIVE MLS-MPM live estimate (the GPU owns
+  // the real count — world.Snap().fluidLive plus spawns since that snapshot);
+  // fluidSpawnCount is this tick's spawn-op count. The fluid seam + substeps
+  // record while either is non-zero OR the disturbance-excite tuning mode is
+  // on with an active CA (excite can birth particles from a world that has
+  // none). All three inputs are tick-deterministic.
   void EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                   bool hashEnable, uint32_t expCount, bool particlesActive,
                   uint32_t cellCount, uint32_t spawnCount = 0,
@@ -261,8 +262,9 @@ class Simulation {
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   rhi::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
-      farBGL_, microBodyBGL_, fluidBGL_;
-  rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_;
+      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_;
+  rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
+      fluidSeamPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
@@ -271,6 +273,12 @@ class Simulation {
   rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
   rhi::ComputePipeline fluidSpawn_, fluidMark_, fluidAlloc_, fluidClear_,
       fluidP2g_, fluidP2g2_, fluidGridUp_, fluidG2p_;
+  // The excite/settle seam (sim_fluid_seam.wgsl).
+  rhi::ComputePipeline fluidCompactCount_, fluidCompactScan_,
+      fluidCompactScatter_, fluidExciteDetect_, fluidExciteScan_,
+      fluidExciteEmit_, fluidPTick_, fluidSettleJudge_, fluidSettleScan_,
+      fluidSettleBin_, fluidSettleCheck_, fluidSettleCommit_, fluidSettleKill_,
+      fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
       microBodyDraw_, debugBoxDraw_, fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
@@ -285,8 +293,13 @@ class Simulation {
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   rhi::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
   // fluidBG_ pages like particleBG_: binding 6 is THIS tick's particle write
-  // page (next tick's read page), the splash droplets' destination.
-  rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2];
+  // page (next tick's read page), the splash droplets' destination. Binding 0
+  // is the tick's WORKING fluid particle buffer, fluidParticles[1 - page]
+  // (the seam's compaction target — same convention as ParticlesWrite).
+  // fluidSeamBG_ additionally binds fluidParticles[page] as the compaction
+  // source.
+  rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2],
+      fluidSeamBG_[2];
   int page_ = 0;
 
   // ---- settled-tick skip state (§3.4) -------------------------------------

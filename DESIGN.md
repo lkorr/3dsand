@@ -511,25 +511,103 @@ Noita's "Bloody Zombies" technique, on GPU:
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
 
-### MLS-MPM liquid prototype (2026-08-22; `sim_fluid.wgsl`, docs/PLAN_mpm_fluids.md)
+### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 
-An EXPERIMENTAL second liquid representation, placeable side by side with the
-CA liquid so the two can be compared in-world before the plan's full rewrite
-is committed to. It is the plan's Phase 0+1 run inside the engine: the
-MLS-MPM core (Hu et al. 2018) ported to Q16.16 integer fixed point, P2G
-scattering through i32 `atomicAdd` (associative, so scheduling cannot move the
-sum), sparse 16³-node grid blocks allocated per substep over exactly the
-chunks that hold particles, terrain boundary conditions read live from the
-voxel buffer through `voxWordAt`, 6 substeps per tick.
+The EXCITED state of liquid: an MLS-MPM particle solver (plan Phases 0+1)
+plus the plan's §7 excite/settle SEAM (Phase 2, 2026-08-23) converting both
+ways between settled fullness voxels and particles. The MLS-MPM core (Hu et
+al. 2018) is ported to Q16.16 integer fixed point, P2G scattering through i32
+`atomicAdd` (associative, so scheduling cannot move the sum), sparse 16³-node
+grid blocks allocated per substep over exactly the chunks that hold
+particles, terrain boundary conditions read live from the voxel buffer
+through `voxWordAt`, 6 substeps per tick.
 
-Deliberately OUTSIDE the hashed sim domain: the fluid never writes a voxel,
-no CA kernel reads a fluid buffer, and the world hash is untouched by
-construction (the pinned determinism gate proves it stays 7cfa2420). The
-fluid's own bit-determinism — the plan's kill criterion — is gated separately
-by `fluid-det`, which runs a basin drop twice from worldgen and requires the
-entire particle buffer to hash identically. Passing on the RTX 3060 Ti, this
-is the first affirmative evidence for the plan's fixed-point-atomics bet;
-cross-vendor remains open exactly as it does for the CA itself.
+THE SEAM (`sim_fluid_seam.wgsl`) is the only fluid code that writes voxels,
+and it is INSIDE the hashed sim domain — deterministically. Per tick, around
+the solver substeps: a slot-order ping-pong COMPACTION removes dead particles
+and rebuilds the GPU-OWNED live count (`fluidArgsStage[7]` — settle kills and
+excite births mean no CPU count can be authoritative; per-particle passes
+dispatch indirectly); CPU spawn ops append; EXCITE converts disturbed settled
+liquid to particles (one per fullness eighth, jittered sub-cell lattice via
+`hash3`, hydrostatic pre-compression seeded into J from a per-column depth
+scan so a reawakened lake holds its own weight instead of jello-popping);
+after the substeps, SETTLE converts calm blocks back (per-slot max-speed
+calm counters, `sim.fluidSettleTicks` consecutive ticks under
+`sim.fluidSettleEps`, ≤16 non-adjacent blocks per tick, per-column
+segment-pooled bottom-up refill, all-or-nothing refusal per block — mass is
+EXACT integer eighths in both directions, and stains ride the particle's attr
+word round-trip). Excite triggers: (a) settled liquid with air below —
+gated by `sim.fluidExciteMode`, DEFAULT OFF until Phase 3 deletes the CA
+liquid movement (the CA still owns disturbed water, which is what keeps the
+pinned hash at 7cfa2420); (b) progressive wake — a grid node at an
+active/settled interface moving above `sim.fluidWakeSpeed` (4× the settle
+threshold: hysteresis) wakes the neighbouring settled cell, always on,
+hash-safe because it needs existing particles. Excite marks candidates in
+voxel scratch bits 19..23 (set by detect, consumed the same tick by emit —
+budget refusals restore the word), assigns emission offsets by a slot-order
+scan (never first-come atomics), and refuses whole slots past the
+`kFluidCap` budget — refused water simply stays settled and retries.
+Materialization: the seam never tests the page table (readback-timing state —
+a branch on it would be nondeterministic); instead excite writes only into
+this tick's dirty chunks (§3-covered) and settle only into ≥8-tick-calm
+fluid blocks, which the block-list snapshot readback has long since fed to
+`PageTable::UpdateFluidChunks`. `pageFaults == 0` on every gate is the
+tripwire.
+
+A world that never spawns fluid is byte-identical to one before this system
+existed (the pinned determinism gate proves 7cfa2420 stands). The fluid's own
+bit-determinism is gated by `fluid-det`, which now also audits the seam:
+twice-run particle-buffer + world-hash equality AND exact mass conservation
+(spawned eighths == live fullness + settled voxel eighths — the 2026-08-23
+run settles the whole 512-eighth pour back to basin voxels). Passing on the
+RTX 3060 Ti; cross-vendor remains open exactly as it does for the CA itself.
+
+Particles carry their IDENTITY in a packed attr word (32-word / 128 B struct,
+power-of-two stride): material id (settle writes it back; splash droplets and
+staining key on it), fullness eighths, and stain type/amount excited out of
+the voxel's stain bits. The species id (0..3) survives as the grid's
+mass-channel / render-colour grouping, derived from the material at excite
+time.
+
+ENVIRONMENT PARITY (Phase 2's §6 slice) runs through ONE per-cell bridge
+buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
+
+- REACTIONS: `doReactions` synthesizes an excited cell as a liquid neighbour
+  of the particles' material (last tick's block map + node mass + intent),
+  so authored PAIR rules — freezing, absorption, plants drinking — work
+  against excited water with zero new authoring surface. A rule that TAKES
+  the neighbour sets the cell's consume flag; the seam's `consumeApply`
+  kills the whole cell bin the same tick (consumption granularity is the
+  voxel-eighth, order-free, mass-exact — the fluid-react gate audits
+  standing + live + consumed == placed). Transitions that PRODUCE matter
+  write ordinary voxels into the (air) cell; every phase change crosses the
+  seam through the voxel form (plan §6.6).
+- CONTACT STAINING: `particleTick` scatters each particle's stain (carried
+  attr stain beats the material's authored one) onto solid/powder face
+  neighbours as intents; `stainApply` rolls `sim.fluidStainRate` per cell
+  and merges with the CA's rules. Settled water then WASHES foreign stains
+  exactly as CA water does — the fluid-stain gate observes both halves.
+- SWIMMING: `mirrorFold` packs excited-fluid eighths for the 27 CPU-mirror
+  chunks (one byte per cell, `TickParams.mirrorBase` = the readback's own
+  clamp) into the snapshot; `World::FluidEighthsAt` folds it into the
+  player's `kindAt` ahead of the voxel mirror, so `inLiquid`/submersion/the
+  waterline frame see particles as water. Zeroed whenever no fluid is live.
+- SOUND: a burst of excitement in one snapshot (>= 64 eighths) fires water's
+  Impact cue at the last exciting chunk's centre — the Break-event
+  precedent: presentation-only, driven from the readback, never in the
+  hashed domain.
+- RENDER SEAM: `fluidMassAt` (the one producer under the MPM isosurface)
+  takes max(particle mass, settled-liquid fullness x rest), so the
+  isosurface's boundary taps meet the voxel surface without a gap; the
+  back-to-front stack still prefers a nearer CA liquid interface.
+
+KNOWN LIMITS (Phase 2): excite converts non-viscous liquids only
+(moveEvery <= 1 — lava/blood stay CA until per-material fluid dynamics,
+plan Phase 7); splash droplets from STAINED water carry the material, not
+the carried stain; frontier neighbour-count scaling sees excited fluid as
+air; a sealed, undamped pool at stock stiffness can churn indefinitely
+(sim.fluidDamping defaults to 0 — the settle gates document the tuning that
+calms adversarial geometry, and Phase 7 owns the defaults).
 
 The solver (2026-08-22, second pass) follows grantkot's WebGPU MLS-MPM shape:
 P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter
@@ -577,26 +655,30 @@ SPLASH COUPLING — fast fluid particles at low density (spray, breaking
 crests) shed `PFLAG_MICRO` droplets into the ballistic particle system from
 `g2p` (bindings 6/7 of the fluid group are the particle write page + counts;
 the appends land after `particleResolve`, so droplets fly next tick). Each
-droplet carries the material its species was POURED as
-(`TickParams.fluidSplashMat`, recorded from the brush by the main loop) — so
-MPM blood spatters real stains through the existing claim-hash stain path and
-MPM water is pure sparkle. Emission is hash-keyed on particle state + tick
-(the fluid slot index is a stable identity — particles never die), bounded by
-rate/speed/density thresholds (`sim.fluidSplash*`), droplet lifetime, and
-`PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
+droplet carries the particle's OWN material (the attr word; the poured-species
+table is the fallback) — so MPM blood spatters real stains through the
+existing claim-hash stain path and MPM water is pure sparkle. Emission is
+hash-keyed on particle state + tick (the fluid slot index is a stable
+identity — assigned by the seam's deterministic slot-order compaction),
+bounded by rate/speed/density thresholds (`sim.fluidSplash*`), droplet
+lifetime, and `PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
 droplet-lifetime tail) so the spray integrates without an explosion ever
 having happened.
 
 Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pick the species, U
-clears). `--shot-fluid` is the look-iteration harness: worldgen, pour a pool
-+ a falling stream with the tool's own spawn shape, write
-`screenshot_fluid{,_top,_splash,_low}.bmp`. CPU-owned particle count (spawns
-are ops at CPU-known offsets; nothing ever allocates on the GPU), hard
-`kFluidCap` budget charged before emission, zero recorded work when no fluid
-exists. Not persisted: saves and worldgen drop it (the plan's
-force-settle-on-save, prototype grade). Excite/settle conversion against the
-CA grid — the plan's §7 seam — is deliberately NOT built here; that decision
-comes after the side-by-side comparison this prototype exists to enable.
+clears — which now zeroes the GPU-owned count directly). `--shot-fluid` is
+the look-iteration harness: worldgen, pour a pool + a falling stream with the
+tool's own spawn shape, write `screenshot_fluid{,_top,_splash,_low}.bmp`. The
+CPU keeps only a CONSERVATIVE live estimate (snapshot readback + spawns since
+— drives record/skip, the draw count and the HUD; every kernel re-bounds
+itself on the GPU count, and `vsFluid` collapses dead/stale slots). Hard
+`kFluidCap` budget charged before emission on the CPU and enforced exactly by
+the excite scan on the GPU; zero recorded work when no fluid exists and the
+excite mode is off. Not persisted: saves and worldgen drop the particles
+(they force-settle in spirit; the settle converter has usually already made
+them voxels, which DO persist normally). The CA liquid movement rules are
+still live — Phase 3 (deleting them, flipping `fluidExciteMode` default,
+re-baselining the pinned hash) is a separate, later step.
 
 ---
 

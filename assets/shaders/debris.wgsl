@@ -94,6 +94,25 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   // take their colour straight from the render tuning, jittered per particle so
   // a burst reads as many bubbles rather than one flat white mass.
   if ((p.payload & PPAY_FOAM) != 0u) {
+    // DISTANCE LOD: foam particles are micro (1/6 voxel at scale index 3) and
+    // cover less than a pixel past ~32 cells. Rasterizing sub-pixel cubes that
+    // are invisible against the raymarched surface wastes fill rate — over open
+    // water at surface level the particle count dominates the frame. Cull them
+    // past a fixed horizon and probabilistically thin them in the transition
+    // band so the pop-off is invisible. The raymarched foam field (grid word 7)
+    // still covers the far surface — this only gates the debris particles.
+    let d2 = dot(center - R.camPos, center - R.camPos);
+    let fadeBegin = 28.0 * 28.0;   // voxels^2: full density inside
+    let fadeEnd   = 48.0 * 48.0;   // voxels^2: fully culled outside
+    if (d2 > fadeEnd) { return clipped(); }
+    if (d2 > fadeBegin) {
+      // Probabilistic thin: hash the instance to a uniform [0,1) and keep the
+      // particle with probability that ramps linearly from 1 at fadeBegin to 0
+      // at fadeEnd. Stable per instance (no flicker).
+      let rnd = f32(pcg(inst * 2917u + 0x1234u) & 0xFFFFu) * (1.0 / 65536.0);
+      let keep = 1.0 - (d2 - fadeBegin) / (fadeEnd - fadeBegin);
+      if (rnd > keep) { return clipped(); }
+    }
     let j = f32((p.payload >> 12u) & 7u) * (1.0 / 7.0);
     albedo = TUNE_FOAM_COLOR * (1.0 - TUNE_FOAM_COLOR_VAR * j);
   }
@@ -156,6 +175,17 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 fn vsFluid(@builtin(vertex_index) vi : u32,
            @builtin(instance_index) inst : u32) -> VSOut {
   let p = fluid[inst];
+  // The CPU draw count is a CONSERVATIVE estimate (the seam owns the real
+  // population and the snapshot is a tick or three behind), so slots past the
+  // live range hold compaction leftovers. Their attr is dead (or the slot is
+  // stale garbage from a prior tick) — collapse the cube to nothing rather
+  // than draw a ghost.
+  if (!fpAlive(p.attr)) {
+    var dead : VSOut;
+    dead.pos = vec4f(0.0, 0.0, -2.0, 1.0);  // clipped: behind the near plane
+    dead.color = vec3f(0.0);
+    return dead;
+  }
   var n : vec3f;
   var off = cubeOffset(vi, &n) * TUNE_FLUID_PARTICLE_SIZE;
   let center = vec3f(f32(p.px), f32(p.py), f32(p.pz)) / 65536.0;

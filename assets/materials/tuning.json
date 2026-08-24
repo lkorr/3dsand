@@ -257,7 +257,12 @@
     "fluidFoamDrag": 0.72,
     "fluidBubbleDensity": 1.05,
     "fluidSprayDensity": 0.42,
-    "fluidFoamScaleIdx": 3
+    "fluidFoamScaleIdx": 3,
+    "fluidExciteMode": 0,
+    "fluidSettleEps": 0.9,
+    "fluidWakeSpeed": 3.6,
+    "fluidSettleTicks": 45,
+    "fluidStainRate": 8.0
   },
   "render": {
     "skyGradient": 1.4,
@@ -523,6 +528,7 @@
     "microSwaySpeed": 1.1,
     "primarySteps": 4096,
     "farSteps": 384,
+    "farShadowReach": 60,
     "skyRayleigh": 12,
     "skyMie": 1,
     "skyMieG": 0.76,

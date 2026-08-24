@@ -112,7 +112,6 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::Chunks64: return kNumChunks / 64;
     case pass::DispatchSel::GenCount: return cx.genCount;
     case pass::DispatchSel::FarCount: return cx.farCount;
-    case pass::DispatchSel::FluidP:   return (cx.fluidCount + 63) / 64;
     case pass::DispatchSel::FluidSpawnSel: return (cx.fluidSpawnCount + 63) / 64;
     default:                          return v;
   }
@@ -473,6 +472,12 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         sets[1] = bind_.fluidSet;
         setCount = 2;
         break;
+      case pass::Groups::SlimFluidSeam:
+        layout = bind_.slimFluidSeamLayout;
+        sets[0] = bind_.slimSet;
+        sets[1] = bind_.fluidSeamSet;
+        setCount = 2;
+        break;
       default:
         break;
     }
@@ -513,6 +518,9 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
             break;
           case pass::DispatchSel::IndFluidArgs:
             args = bind_.buffers[(int)pass::Buf::FluidDispatchArgs];
+            break;
+          case pass::DispatchSel::IndFluidPArgs:
+            args = bind_.buffers[(int)pass::Buf::FluidPDispatchArgs];
             break;
           default:
             args = bind_.buffers[(int)pass::Buf::DispatchArgs];

@@ -259,7 +259,7 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
       IVec3 target{wo.x + (int)kNChunk / 2 + 2, wo.y + (int)kNChunk / 2,
                    wo.z + (int)kNChunk / 2};
       uint32_t before = stream.ShiftCount();
-      stream.Update(target);
+      stream.Update(target, tick);
       out.shifts += stream.ShiftCount() - before;
     }
 

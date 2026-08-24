@@ -279,7 +279,45 @@ becomes `farCount`; `RenderParams` spare `_p1` becomes `fogDensity`.
    end at 512³: sleep 0/32768 after ~500 ticks (with the disc-pond worldgen
    rework that replaced leaking basin-contour ponds), 1080p shadows-on
    8.8 ms/frame (114 fps) on the RTX 3060 Ti.
-6. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
+6. **The cascade's resolution law (measured 2026-08-23).** Detail in the far
+   field is set by **kFarN and nothing else**. A level's cell size and its box
+   extent are rigidly coupled, so the number of cells across a level's
+   half-extent is the constant kFarN/2 whatever the level; a ray at distance d
+   is served by the level whose box just contains d, so its cell is always
+   ~d/(kFarN/2), and the projected size
+   `px_per_cell = (d/(kFarN/2)) / (2 d tan(fov/2) / H) = H / (kFarN tan(fov/2))`
+   has **d cancel out**. The far field renders at a constant angular
+   resolution everywhere — ~6 px/cell at kFarN=256, 1080p, 70° — which is the
+   LOD's real weakness and the source of the "structures restructure as you
+   approach" artifact: every cascade cell is a visible 6-pixel block.
+   - **Corollary that cost real time to learn:** changing `kFarShiftBase` or
+     `kFarLevels` CANNOT change how detailed the far field looks. Shifting the
+     base one step finer and adding a level renumbers the cascade (level 1
+     becomes what level 2 was) and leaves the cell serving any given distance
+     bit-identical. Measured: a 9-level/finer-base build differed from the
+     8-level build by **26 pixels out of 2,073,600** in a view that is 50%
+     cascade. Those two constants trade horizon distance against near
+     coverage; only kFarN trades memory against detail.
+   - **The cost of actually fixing it:** kFarN=512 halves px/cell to ~3 but
+     costs 8× per level (128 MiB/level), and it makes kFarShiftAlign 0, which
+     overflows the fill queue's hardcoded 12-bit slot field — now derived as
+     `kFarSlotShift` from kFarNumChunks, so it tracks kFarN. An attempt at
+     kFarN=512 measured 450–520 ms/frame shadows-on regardless of level count
+     (tested down to 128 MiB total) and **with `traceFar` stubbed out
+     entirely**, so the cost is NOT in the cascade march, the cascade memory,
+     or the far shadow budget — all three were controlled. Unresolved; the
+     shipped configuration stays kFarN=256. Anyone retrying this should start
+     by profiling the NEAR shadow path at kFarShiftBase=0, not the far one.
+   - **The far shadow reach must be a DISTANCE, not a step count.**
+     `farShadowed` ran `for (i = 0; i < 128; i++)`, which ties the shadow's
+     world-space reach to the level's cell size. Harmless until cells shrink,
+     then every near-level ray burns its whole budget without terminating:
+     **10.5 ms → 606 ms**, a 45× cliff out of a constant that reads like a
+     safety cap. Now `farShadowSteps(level)` converts `TUNE_FAR_SHADOW_REACH`
+     (metres) into that level's cells, clamped [8, 128]. Verified load-bearing
+     by A/B: restoring the fixed cap reproduced 451 ms.
+
+7. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
    shows in profiles — the strongest structural win per the survey (ESVO-style
    low-res conservative pre-pass; also lets near-field-occluded pixels skip
    the far march entirely); cascade persistence alongside region files;

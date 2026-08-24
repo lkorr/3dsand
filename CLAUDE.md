@@ -36,6 +36,8 @@ bash scripts/build.sh --configure       # force cmake reconfigure
 
 **Always use `scripts/build.sh`**, never raw cmake — it holds a machine-global mutex. Kill stale instances: `taskkill //F //IM sandvox.exe`. Set `export SANDVOX_NO_CRASH_DIALOG=1` in every shell. Read `crash.log` after crashes. Verify exe mtime before trusting results.
 
+**Never launch `sandvox.exe` directly — wrap EVERY run in `bash scripts/run.sh <cmd>`** (e.g. `bash scripts/run.sh ./build/Release/sandvox.exe --selftest --gate determinism`). It shares the build mutex, so runs, builds, and links serialize across all sessions/worktrees. Concurrent exe runs saturate the GPU, throttle the machine, and make every measured number garbage. Worktree agents: call it by absolute path from the main checkout if your worktree predates it. (`build.sh --selftest` already runs under the lock and stays sanctioned.)
+
 ```bash
 ./build/Release/sandvox.exe --selftest --gate <name>      # one gate (~4-20s vs ~50s full)
 ./build/Release/sandvox.exe --selftest --list             # list gates

@@ -77,12 +77,13 @@ W_NCHUNK=$((W_N / W_CHUNK))
 # PT_SENTINEL_BIT | kMatAir and kMatAir is 0, so it needs no separate scrape —
 # EMPTY being UNIFORM(air) is the design, not a coincidence.
 W_PTSENT="$(cpp_const_hex kPtSentinelBit)"
+W_PTJIT="$(cpp_const_hex kPtJitterBit)"
 W_PTMAT="$(cpp_const_hex kPtMatMask)"
 W_PTPAGE="$(cpp_const_hex kPtPageMask)"
 W_PTUNRES="$(cpp_const_hex kPtUnresident)"
 W_PTNOWORD="$(cpp_const_hex kPtNoWord)"
 if [ -z "$W_PTSENT" ] || [ -z "$W_PTMAT" ] || [ -z "$W_PTPAGE" ] \
-   || [ -z "$W_PTUNRES" ] || [ -z "$W_PTNOWORD" ]; then
+   || [ -z "$W_PTUNRES" ] || [ -z "$W_PTNOWORD" ] || [ -z "$W_PTJIT" ]; then
   echo "check_shaders: cannot parse kPt* page-table constants from $WORLD_H" >&2
   exit 1
 fi
@@ -143,6 +144,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
   "const PT_SENTINEL_BIT : u32 = ${W_PTSENT}u;" \
+  "const PT_JITTER_BIT : u32 = ${W_PTJIT}u;" \
   "const PT_MAT_MASK : u32 = ${W_PTMAT}u;" \
   "const PT_EMPTY : u32 = ${W_PTSENT}u;" \
   "const PT_PAGE_MASK : u32 = ${W_PTPAGE}u;" \
@@ -229,8 +231,32 @@ for f in "${FILES[@]}"; do
     ' "$COMMON" > "$commonSrc"
   fi
 
+  # LoadShader also GENERATES the ptSeed()/ptOrigin() accessors for shaders
+  # that address voxels (PtSeedAccessor, gpu/resources.cpp): the page block's
+  # JITTER synthesis calls them, and their body is `T.seed` in a sim kernel
+  # but `R.seed` in the render pass — whichever uniform the shader declares.
+  # A voxel-addressing shader with neither uniform is the same build error the
+  # engine raises (a wrong seed is a synthesized word that differs from the
+  # materialized page, i.e. a lost voxel).
+  ptseed=""
+  ptseedLines=0
+  if [ "$stripRead" -eq 0 ]; then
+    if grep -q 'uniform> T :' "$f"; then u=T
+    elif grep -q 'uniform> R :' "$f"; then u=R
+    else
+      failed=1
+      echo "FAIL $name (addresses voxels but declares neither T : TickParams nor R : RenderParams)"
+      continue
+    fi
+    ptseed="fn ptSeed() -> u32 { return ${u}.seed; }
+fn ptOrigin() -> vec3<i32> { return ${u}.origin; }"
+    ptseedLines=2
+  fi
+
   combined="$TMP/$name"
-  { printf '%s\n\n' "$PRELUDE_TEXT"; cat "$commonSrc"; printf '\n'; cat "$f"; } > "$combined"
+  { printf '%s\n\n' "$PRELUDE_TEXT"
+    [ -n "$ptseed" ] && printf '%s\n' "$ptseed"
+    cat "$commonSrc"; printf '\n'; cat "$f"; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.
   # (`-f none` is advertised in --help but rejected by this build.) A missing
@@ -244,7 +270,7 @@ for f in "${FILES[@]}"; do
     # the path to the real shader and subtract the common.wgsl prologue so line
     # numbers point where the user can actually edit. Diagnostics at or above the
     # offset came from common.wgsl itself and are labelled as such.
-    printf '%s\n' "$out" | awk -v off="$OFFSET" -v real="$f" -v common="$COMMON" '
+    printf '%s\n' "$out" | awk -v off="$((OFFSET + ptseedLines))" -v real="$f" -v common="$COMMON" '
       # Match a trailing :LINE:COL after any path (handles C:/... drive letters).
       match($0, /:[0-9]+:[0-9]+/) {
         head = substr($0, 1, RSTART - 1)          # the path

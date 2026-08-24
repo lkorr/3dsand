@@ -401,7 +401,7 @@ bool streamOk = false;
     uint32_t t = 5000;
     for (int i = 0; i < 300; i++) {
       IVec3 pc{8 + i / 10, 8, 8};  // one chunk every 10 ticks -> 30 shifts
-      stream.Update(pc);
+      stream.Update(pc, t);
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, true, pc,
                  false, false);
       shash[run].push_back(ReadHashSync(ctx, world));
@@ -416,7 +416,7 @@ bool streamOk = false;
   ctx.WaitIdle();
   uint32_t t = 7000;
   auto tickAt = [&](IVec3 pc, std::vector<BrushOp> ops) {
-    stream.Update(pc);
+    stream.Update(pc, t);
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, ops, {}, {}, false, pc,
                true, false);
     ctx.WaitIdle();
@@ -471,7 +471,7 @@ bool streamOk = false;
     for (int i = 0; i < 1200 && !crossed; i++) {
       IVec3 pc{ifloor(p2.pos.x) >> 4, ifloor(p2.pos.y) >> 4,
                ifloor(p2.pos.z) >> 4};
-      stream.Update(pc);
+      stream.Update(pc, t);
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, pc,
                  true, false);
       ctx.WaitIdle();

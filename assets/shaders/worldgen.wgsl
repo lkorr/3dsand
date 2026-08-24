@@ -2713,7 +2713,7 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 // render as opaque surfaces at distance. Features thinner than a coarse cell
 // vanish — correct LOD behavior, not data loss.
 //
-// One workgroup per farList entry: (level-1) << 12 | chunk slot. Each thread
+// One workgroup per farList entry: (level-1) << FAR_SLOT_SHIFT | slot. Each thread
 // owns 64 CONSECUTIVE cells = 16 whole u32 words of the byte-packed farVox,
 // so there are no partial-word writes and no atomics on the voxel data.
 // farVox/farOcc are declared ATOMIC because the phase-2 downsample entry
@@ -2740,8 +2740,8 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
 
   let packed = farList[wg.x];
-  let level = (packed >> 12u) + 1u;   // 1-based
-  let slot = packed & 0xFFFu;
+  let level = (packed >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  let slot = packed & FAR_SLOT_MASK;
   let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
                                slot / (FAR_NCHUNK * FAR_NCHUNK)));
   // base LEVEL-cell coord of this level chunk (origins are level-chunk units)

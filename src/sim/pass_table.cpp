@@ -24,6 +24,8 @@ namespace {
 #define PT_HASHONLY   Table::HashOnly
 #define PT_FARFILL    Table::FarFill
 #define PT_FLUID      Table::Fluid
+#define PT_FLUIDSEAM  Table::FluidSeam
+#define PT_FLUIDSETTLE Table::FluidSettle
 #define PT_PAGEFILL   Table::PageFill
 
 #define PIPE_NONE            Pipe::None
@@ -55,6 +57,22 @@ namespace {
 #define PIPE_FLUID_P2G2      Pipe::FluidP2G2
 #define PIPE_FLUID_GRIDUP    Pipe::FluidGridUp
 #define PIPE_FLUID_G2P       Pipe::FluidG2P
+#define PIPE_FLUID_COMPACT_COUNT   Pipe::FluidCompactCount
+#define PIPE_FLUID_COMPACT_SCAN    Pipe::FluidCompactScan
+#define PIPE_FLUID_COMPACT_SCATTER Pipe::FluidCompactScatter
+#define PIPE_FLUID_EXCITE_DETECT   Pipe::FluidExciteDetect
+#define PIPE_FLUID_EXCITE_SCAN     Pipe::FluidExciteScan
+#define PIPE_FLUID_EXCITE_EMIT     Pipe::FluidExciteEmit
+#define PIPE_FLUID_PTICK           Pipe::FluidPTick
+#define PIPE_FLUID_SETTLE_JUDGE    Pipe::FluidSettleJudge
+#define PIPE_FLUID_SETTLE_SCAN     Pipe::FluidSettleScan
+#define PIPE_FLUID_SETTLE_BIN      Pipe::FluidSettleBin
+#define PIPE_FLUID_SETTLE_CHECK    Pipe::FluidSettleCheck
+#define PIPE_FLUID_SETTLE_COMMIT   Pipe::FluidSettleCommit
+#define PIPE_FLUID_SETTLE_KILL     Pipe::FluidSettleKill
+#define PIPE_FLUID_CONSUME_APPLY   Pipe::FluidConsumeApply
+#define PIPE_FLUID_STAIN_APPLY     Pipe::FluidStainApply
+#define PIPE_FLUID_MIRROR_FOLD     Pipe::FluidMirrorFold
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -66,6 +84,7 @@ namespace {
 #define GRP_SLIM_PART  Groups::SlimPart
 #define GRP_SLIM_FAR   Groups::SlimFar
 #define GRP_SLIM_FLUID Groups::SlimFluid
+#define GRP_SLIM_FLUIDSEAM Groups::SlimFluidSeam
 
 #define DYN_NONE Dyn::None
 #define DYN_ZERO Dyn::Zero
@@ -96,9 +115,9 @@ namespace {
 #define D_FARCOUNT  (uint32_t)DispatchSel::FarCount
 #define IND_DISPATCHARGS  (uint32_t)DispatchSel::IndDispatchArgs
 #define IND_PDISPATCHARGS (uint32_t)DispatchSel::IndPDispatchArgs
-#define D_FLUIDP          (uint32_t)DispatchSel::FluidP
 #define D_FLUIDSPAWN      (uint32_t)DispatchSel::FluidSpawnSel
 #define IND_FLUIDARGS     (uint32_t)DispatchSel::IndFluidArgs
+#define IND_FLUIDPARGS    (uint32_t)DispatchSel::IndFluidPArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

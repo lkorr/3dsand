@@ -353,6 +353,7 @@ function applyOps(cells, value, color) {
 
 function endStroke() {
   if (stroke && stroke.length) {
+    commitSidecarUndo();
     undoStack.push({ type: 'voxel', data: stroke });
     redoStack.length = 0;
     markDirty();
@@ -363,7 +364,7 @@ function endStroke() {
 
 // Structural edits (add/remove/reorder models) renumber model indices and
 // grid sizes, so the quad-format log cannot survive them.
-function clearUndo() { undoStack = []; redoStack = []; stroke = null; }
+function clearUndo() { undoStack = []; redoStack = []; stroke = null; _sidecarBefore = null; }
 
 function undoVoxel(s) {
   for (let i = s.length - kOpStride; i >= 0; i -= kOpStride) {
@@ -422,15 +423,50 @@ function applyGrowSnapshot(d, which) {
   hooks.toast(which === 'before' ? 'undo resize' : 'redo resize');
 }
 
+function applyMoveEntry(d, which) {
+  const offsets = which === 'before' ? d.before : d.after;
+  for (const e of offsets) {
+    const m = doc.models[e.mi];
+    if (!m) continue;
+    m.offset.x = e.offset.x; m.offset.y = e.offset.y; m.offset.z = e.offset.z;
+  }
+  if (d.anchors) {
+    const ancs = which === 'before' ? d.anchors.before : d.anchors.after;
+    if (sidecar && Array.isArray(sidecar.limbs))
+      for (const [name, a] of ancs) {
+        const l = sidecar.limbs.find(x => x.name === name &&
+          Array.isArray(x.anchor) && x.anchor.length === 3);
+        if (l) { l.anchor[0] = a[0]; l.anchor[1] = a[1]; l.anchor[2] = a[2]; }
+      }
+  }
+  needsRebuild = true;
+  if (initialised) updateResizeHandles();
+  hooks.onModelsChanged?.();
+  hooks.toast(which === 'before' ? 'undo move' : 'redo move');
+}
+
+function applySidecarSnapshot(json) {
+  if (!json) return;
+  const restored = JSON.parse(json);
+  Object.keys(sidecar).forEach(k => delete sidecar[k]);
+  Object.assign(sidecar, restored);
+  needsRebuild = true;
+  hooks.onSidecarChanged?.();
+}
+
 function dispatchUndo(e) {
   if (e.type === 'voxel') undoVoxel(e.data);
   else if (e.type === 'color') undoColor(e.data);
   else if (e.type === 'grow') applyGrowSnapshot(e.data, 'before');
+  else if (e.type === 'move') applyMoveEntry(e.data, 'before');
+  else if (e.type === 'sidecar') applySidecarSnapshot(e.data.before);
 }
 function dispatchRedo(e) {
   if (e.type === 'voxel') redoVoxel(e.data);
   else if (e.type === 'color') redoColor(e.data);
   else if (e.type === 'grow') applyGrowSnapshot(e.data, 'after');
+  else if (e.type === 'move') applyMoveEntry(e.data, 'after');
+  else if (e.type === 'sidecar') applySidecarSnapshot(e.data.after);
 }
 
 function undo() {
@@ -661,13 +697,42 @@ function moveModel(i, d, moveAnchor = true) {
         l.anchor[0] += rb.x; l.anchor[1] += rb.y; l.anchor[2] += rb.z;
       }
 
-  // The undo log DELIBERATELY survives a move. Its quads are
-  // (modelIndex, flatGridIndex, old, new): a move rewrites no voxels, keeps
-  // every grid and model index identical, and touches only `offset`, so every
-  // entry still replays into exactly the cell it came from. Clearing here also
-  // meant a drag — which calls this once per voxel of travel — wiped unrelated
-  // paint history a voxel at a time. growModel is the opposite case and does
-  // still clear, because it reallocates the grid and renumbers flat indices.
+  // The undo log survives a move: voxel entries are (modelIndex, flatGridIndex,
+  // old, new), and a move rewrites no voxels or indices. The caller pushes a
+  // 'move' entry on pointer-up; this helper is called per-pixel during drag.
+  markDirty();
+  needsRebuild = true;
+  if (initialised) updateResizeHandles();
+  hooks.onModelsChanged?.();
+  updateStatus();
+  return true;
+}
+
+function moveModels(indices, d) {
+  if (!doc) return false;
+  const dx = d.x | 0, dy = d.y | 0, dz = d.z | 0;
+  if (!dx && !dy && !dz) return false;
+  const names = new Set(indices.map(i => doc.models[i]?.name).filter(Boolean));
+  for (const i of indices) {
+    const m = doc.models[i];
+    if (!m) continue;
+    m.offset.x += dx; m.offset.y += dy; m.offset.z += dz;
+    if (sidecar && Array.isArray(sidecar.limbs))
+      for (const l of sidecar.limbs)
+        if (l.name === m.name && Array.isArray(l.anchor) && l.anchor.length === 3) {
+          l.anchor[0] += dx; l.anchor[1] += dy; l.anchor[2] += dz;
+        }
+  }
+  const ref = doc.models[indices[0]];
+  const expect = { x: ref.offset.x, y: ref.offset.y, z: ref.offset.z };
+  reboundDoc();
+  const rb = { x: ref.offset.x - expect.x, y: ref.offset.y - expect.y,
+               z: ref.offset.z - expect.z };
+  if ((rb.x || rb.y || rb.z) && sidecar && Array.isArray(sidecar.limbs))
+    for (const l of sidecar.limbs)
+      if (!names.has(l.name) && Array.isArray(l.anchor) && l.anchor.length === 3) {
+        l.anchor[0] += rb.x; l.anchor[1] += rb.y; l.anchor[2] += rb.z;
+      }
   markDirty();
   needsRebuild = true;
   if (initialised) updateResizeHandles();
@@ -742,6 +807,7 @@ function growModel(i, pad) {
       }
 
   const after = snapshotModel(i);
+  commitSidecarUndo();
   undoStack.push({ type: 'grow', data: { modelIndex: i, before, after } });
   redoStack.length = 0;
 
@@ -787,6 +853,7 @@ function addModel(dx, dy, dz, name) {
     name: uniqueModelName(name || 'model'),
     offset: { x: 0, y: 0, z: 0 }, dim, grid: makeGrid(dim),
   });
+  clearUndo();
   reboundDoc();
   setActiveModel(doc.models.length - 1);
   markDirty();
@@ -1386,6 +1453,21 @@ function frameCamera() {
   controls.update();
 }
 
+function updateBoundsAndGrid() {
+  const d = (doc && doc.size) || grid.dim;
+  const c = new THREE.Vector3(d.x / 2, d.y / 2, d.z / 2);
+  const r = Math.max(d.x, d.y, d.z);
+  boundsBox.scale.set(d.x, d.y, d.z);
+  boundsBox.position.copy(c);
+  updateMicroGhost();
+  const span = Math.max(d.x, d.z) * 2;
+  gridHelper.scale.set(span, 1, span);
+  gridHelper.position.set(d.x / 2, 0, d.z / 2);
+  axes.scale.setScalar(Math.max(3, r * 0.35));
+  camera.far = Math.max(2000, r * 40);
+  camera.updateProjectionMatrix();
+}
+
 function updateMirrorPlane() {
   const on = mirror.x || mirror.y || mirror.z;
   mirrorPlane.visible = on;
@@ -1549,6 +1631,7 @@ function rebuildInstances() {
   // Parts highlighting: when a limb is selected in the rig panel, everything
   // else drops right back so the limb reads clearly.
   const sel = hooks.selectedPart?.() || null;
+  const selMulti = hooks.selectedParts?.() || null;
 
   // One model's grid appended at an arbitrary offset/brightness/transform.
   // Shared by the normal editing view and the composed preview below.
@@ -1611,7 +1694,8 @@ function rebuildInstances() {
       const isActive = mi === activeModel;
       // Whole mode edits everything, so everything reads at full strength.
       let dim = (isActive || wholeMode || (plan && plan.allBright)) ? 1 : DIM_INACTIVE;
-      if (sel) dim = (m.name === sel) ? 1 : DIM_UNSELECTED;
+      if (selMulti && selMulti.size) dim = selMulti.has(m.name) ? 1 : DIM_UNSELECTED;
+      else if (sel) dim = (m.name === sel) ? 1 : DIM_UNSELECTED;
       drawModel(m, m.offset, dim, xf);
     }
   }
@@ -2372,10 +2456,29 @@ function onPointerDown(ev) {
     const mi = own ? own.mi : activeModel;
     const m = doc.models[mi];
     if (!m) return;
+    // Build the set of model indices to move together. If the grabbed model
+    // is part of a multi-selection, move them all; otherwise just the one.
+    const selParts = hooks.selectedParts?.() || null;
+    const moveIndices = [mi];
+    if (selParts && selParts.size > 0 && selParts.has(m.name)) {
+      for (let j = 0; j < doc.models.length; j++)
+        if (j !== mi && selParts.has(doc.models[j].name)) moveIndices.push(j);
+    }
+    // Snapshot all moved models' positions for undo.
+    const beforeMove = moveIndices.map(j => ({
+      mi: j, offset: { ...doc.models[j].offset },
+    }));
+    let anchorsBefore = null;
+    if (sidecar && Array.isArray(sidecar.limbs)) {
+      anchorsBefore = sidecar.limbs
+        .filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
+        .map(l => [l.name, l.anchor.slice()]);
+    }
     drag = {
-      move: true, mi,
+      move: true, mi, moveIndices,
       start: { x: m.offset.x, y: m.offset.y, z: m.offset.z },
       applied: { x: 0, y: 0, z: 0 },
+      beforeMove, anchorsBefore,
       // Drag on the plane through the grabbed cell facing the camera, and
       // remember where on it the grab started, so the model tracks the cursor
       // instead of jumping its centre there.
@@ -2491,7 +2594,7 @@ function onPointerMove(ev) {
       drag.p0.setComponent(drag.face.axis,
         drag.p0.getComponent(drag.face.axis) + delta);
       updateResizeHandles();
-      frameCamera();
+      updateBoundsAndGrid();
       hooks.onModelsChanged?.();
     }
     return;
@@ -2518,7 +2621,12 @@ function onPointerMove(ev) {
     // Deliberately NOT onSidecarChanged: that hook means "a different sidecar
     // was loaded" and resets the rig panel's selected part, which would drop
     // the limb being dragged. moveModel already fired onModelsChanged.
-    if (moveModel(drag.mi, step)) drag.applied = want;
+    // Move all selected models together.
+    if (drag.moveIndices.length > 1) {
+      if (moveModels(drag.moveIndices, step)) drag.applied = want;
+    } else {
+      if (moveModel(drag.mi, step)) drag.applied = want;
+    }
     return;
   }
   if (drag && drag.select) {
@@ -2560,7 +2668,7 @@ function onPointerMove(ev) {
 function onPointerUp(ev) {
   if (!drag) return;
   try { canvas.releasePointerCapture(ev.pointerId); } catch { /* not captured */ }
-  if (drag.gizmo) { drag = null; markDirty(); return; }
+  if (drag.gizmo) { drag = null; commitSidecarUndo(); markDirty(); return; }
   if (drag.ring !== undefined) {
     drag = null;
     // `true` = the drag finished, which is what auto-key listens for.
@@ -2587,13 +2695,31 @@ function onPointerUp(ev) {
   }
   if (drag.move) {
     const d = drag.applied, name = doc.models[drag.mi]?.name || 'model';
-    drag = null;
     if (d.x || d.y || d.z) {
+      const afterMove = drag.moveIndices.map(j => ({
+        mi: j, offset: { ...doc.models[j].offset },
+      }));
+      let anchorsAfter = null;
+      if (sidecar && Array.isArray(sidecar.limbs)) {
+        anchorsAfter = sidecar.limbs
+          .filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
+          .map(l => [l.name, l.anchor.slice()]);
+      }
+      commitSidecarUndo();
+      undoStack.push({ type: 'move', data: {
+        before: drag.beforeMove, after: afterMove,
+        anchors: (drag.anchorsBefore || anchorsAfter) ? {
+          before: drag.anchorsBefore || [], after: anchorsAfter || [],
+        } : null,
+      }});
+      redoStack.length = 0;
       const scl = +(sidecar?.skinScale ?? sidecar?.scale) || 1;
-      hooks.toast(`moved ${name} by ${d.x},${d.y},${d.z}` +
+      const count = drag.moveIndices.length;
+      hooks.toast(`moved ${count > 1 ? count + ' parts' : name} by ${d.x},${d.y},${d.z}` +
         (scl > 1 ? ` (${(d.x / scl).toFixed(2)},${(d.y / scl).toFixed(2)},` +
                    `${(d.z / scl).toFixed(2)} world voxels)` : ''));
     }
+    drag = null;
     return;
   }
   if (drag.select) {
@@ -2897,6 +3023,7 @@ function commitWheelUndo() {
   const colors = wheelColors();
   const newHex = colors ? colors[Math.min(wheelDragStart.variant, colors.length - 1)] : null;
   if (newHex && newHex !== wheelDragStart.hex) {
+    commitSidecarUndo();
     undoStack.push({
       type: 'color',
       data: {
@@ -3948,12 +4075,61 @@ export const matColorOf = matColor;
 
 export function setSidecar(s) { sidecar = s; }
 
-/** Mutate the sidecar and flag the document dirty in one step. */
-export function touchSidecar() { markDirty(); }
+let _sidecarBefore = null;
+function snapshotSidecar() {
+  return sidecar ? JSON.stringify(sidecar) : null;
+}
+export function touchSidecar() {
+  if (!_sidecarBefore) _sidecarBefore = snapshotSidecar();
+  markDirty();
+}
+export function commitSidecarUndo() {
+  if (!_sidecarBefore) return;
+  const after = snapshotSidecar();
+  if (after === _sidecarBefore) { _sidecarBefore = null; return; }
+  undoStack.push({ type: 'sidecar', data: { before: _sidecarBefore, after } });
+  redoStack.length = 0;
+  _sidecarBefore = null;
+}
+export function discardSidecarUndo() { _sidecarBefore = null; }
+
+let _moveUndoBefore = null;
+function pushMoveUndo(indices) {
+  _moveUndoBefore = {
+    offsets: indices.map(j => ({ mi: j, offset: { ...doc.models[j].offset } })),
+    anchors: (sidecar && Array.isArray(sidecar.limbs))
+      ? sidecar.limbs.filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
+                      .map(l => [l.name, l.anchor.slice()])
+      : null,
+  };
+}
+function finishMoveUndo(indices) {
+  if (!_moveUndoBefore) return;
+  const after = indices.map(j => ({ mi: j, offset: { ...doc.models[j].offset } }));
+  const anchorsAfter = (sidecar && Array.isArray(sidecar.limbs))
+    ? sidecar.limbs.filter(l => Array.isArray(l.anchor) && l.anchor.length === 3)
+                    .map(l => [l.name, l.anchor.slice()])
+    : null;
+  const b = _moveUndoBefore;
+  _moveUndoBefore = null;
+  const changed = b.offsets.some((e, k) => {
+    const a = after[k]; return a.offset.x !== e.offset.x ||
+      a.offset.y !== e.offset.y || a.offset.z !== e.offset.z;
+  });
+  if (!changed) return;
+  commitSidecarUndo();
+  undoStack.push({ type: 'move', data: {
+    before: b.offsets, after,
+    anchors: (b.anchors || anchorsAfter) ? {
+      before: b.anchors || [], after: anchorsAfter || [],
+    } : null,
+  }});
+  redoStack.length = 0;
+}
 
 export { setActiveModel, addModel, duplicateModel, removeModel, renameModel,
          splitSelectionToModel, upscaleDoc, downscaleDoc, markDirty, moveModel,
-         growModel, setSelection, graftModels };
+         growModel, setSelection, graftModels, pushMoveUndo, finishMoveUndo };
 
 /** The document's art palette, so a limb saved out of it can carry its
  *  colours (grid.color holds INDICES into this and nothing else). */

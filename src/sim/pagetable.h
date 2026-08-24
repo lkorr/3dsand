@@ -165,6 +165,14 @@ class PageTable {
                        const std::vector<IVec3>& explosionCenters,
                        const World& world);
 
+  // Contributor for the MPM fluid seam (docs/PLAN_mpm_fluids.md §7). blockSlots
+  // are chunk SLOT indices from the one-tick-latent fluid block-list readback;
+  // spawnCells are this tick's CPU-known fluid spawn positions (world cells).
+  // The settle converter only fires after >= 8 calm ticks, so the readback
+  // latency is covered; the N26 ring covers sub-chunk drift since the snapshot.
+  void UpdateFluidChunks(const std::vector<uint32_t>& blockSlots,
+                         const std::vector<IVec3>& spawnCells, const World& world);
+
   // Step (2): tighten against an arriving snapshot, by INTERSECTION only.
   // `snapTick` is the tick the snapshot was stamped at; `encodeTick` the tick
   // being encoded. Skips entirely when the gap exceeds what the C(j) ring can
@@ -285,7 +293,33 @@ class PageTable {
   // Called only for a slot that has already reported empty for kPageFreeTicks
   // CONSECUTIVE snapshots and is not in cpuDirty — zero slots per tick in a
   // settled world.
-  void SetChunkProbe(std::function<bool(uint32_t, uint32_t*)> probe) {
+  //
+  // ---- THE PROBE IS A BATCH, and that is the whole point of its shape ------
+  //
+  // It used to be one slot per call, and each call was an
+  // rhi::ReadbackBlocking — which submits a copy and WAITS THE WHOLE DEVICE
+  // IDLE (rhi_vk.cpp) before mapping. One full GPU drain to read 16 KiB, per
+  // candidate. In a settled world that is free because there are no
+  // candidates, which is the regime the per-slot form was designed and
+  // measured in.
+  //
+  // SURFACE FLIGHT IS NOT THAT REGIME. Measured on --autofly-surface: 665-804
+  // candidates in a single tick, at ~0.25 ms of drain each — 198 ms in one
+  // tick, three times the next-largest cost in the frame and the single
+  // biggest term in a 488 ms frame. Worse, it is self-reinforcing: the drains
+  // make the frame slow, a slow frame lets the readback snapshot go stale,
+  // and a stale snapshot reports resident terrain as empty, which manufactures
+  // MORE candidates (the refusal words are materials 0x001/0x022/0x04d, not
+  // air with passenger bits — these chunks are full of stone).
+  //
+  // Taking a whole batch lets the implementation issue ONE copy and ONE map
+  // for all of them, exactly as the shift-demote path already does via
+  // Stream::IssueDemoteCopies. `out` is n * kChunkVol words, slot i's chunk at
+  // i * kChunkVol. Returns a per-slot validity vector: a slot whose page went
+  // away between selection and copy reports false and is simply not freed.
+  void SetChunkProbe(
+      std::function<std::vector<bool>(const std::vector<uint32_t>&, uint32_t*)>
+          probe) {
     probeChunk_ = std::move(probe);
   }
 
@@ -337,7 +371,26 @@ class PageTable {
   SlotSet scratch_;                       // dilation target, reused
   SlotSet opTargets_;                     // C(N) contributor (a), this tick
   SlotSet particleChunks_;                // C(N) contributor (b), carried
+  // C(N) contributor for the MPM fluid seam — chunks the excite/settle
+  // converters may write voxels into this tick; recomputed per call from the
+  // block-list readback + this tick's spawn cells, dilated one N26 ring to
+  // cover one tick of particle drift.
+  SlotSet fluidChunks_;
   SlotSet materialized_;                  // step (4)'s result, this tick
+  // Contributor (d): the ACT SET of the slots Stream::FillSlots refilled
+  // since the last Materialize — free surfaces and full-chunks-touching-air,
+  // never pure sky or air-isolated bulk (FillSlots applies the narrowing at
+  // declaration; see the act-set note there).
+  //
+  // Buffered rather than added to cpuDirty_ on the spot because FillSlots runs
+  // BETWEEN ticks: a direct Add landed BEFORE the next tick's
+  // TightenFromSnapshot, on the wrong side of step (2)'s intersection, and got
+  // tightened away — after which the slot was never materialized while its
+  // dirty flags still made the CA dispatch on it, so writes went through a
+  // sentinel and were lost (the streaming gate's 217 page faults). Materialize
+  // consumes it into cpuDirty AFTER the tightening and records it in the C(j)
+  // ring for later roll-forwards. See RefilledSlot for the full argument.
+  SlotSet refilled_;
   SlotSet shellSeed_;                     // contributor (e): occMatter, to the mirror
   SlotSet shell_;                         // seed + ring: ConsumeOccupancy's guard
   bool shellPending_ = false;             // seed awaits Materialize's union
@@ -389,18 +442,26 @@ class PageTable {
   // already running and takes NO further action. That is the rule-2 story, and
   // it is honest: not free, but not a new scan either.
   std::vector<uint8_t> zeroStreak_;
-  std::function<bool(uint32_t, uint32_t*)> probeChunk_;
+  std::function<std::vector<bool>(const std::vector<uint32_t>&, uint32_t*)>
+      probeChunk_;
   std::vector<uint32_t> freeProbe_;
   static constexpr uint8_t kPageFreeTicks = 8;   // ~a quarter second at 30 Hz
   // Free-probe budget per tick: each probe is a blocking WaitIdle + 16 KiB
   // readback, so mass-demotion events must drain over ticks, not stall one.
   //
-  // NO LONGER ON THE NORMAL PATH. The occupancy word now carries "this chunk
-  // carries stain" in bit 31 (packOccStain), which was the ONLY question the
-  // probe existed to answer, so a snapshot with stain flags decides every
-  // eligible slot per tick with no readback and no budget. This cap now bounds
-  // only the FALLBACK — a caller that passes no stain flags — and is kept so
-  // that path behaves exactly as it did before.
+  // MOSTLY off the normal path, but NOT always — and the difference is a
+  // scenario, not a subtlety. The occupancy word carries "this chunk carries
+  // stain" in bit 31 (packOccStain), which answers the stain question from the
+  // snapshot and rejects most candidates with no readback at all. In a settled
+  // world, and on the adversarial DESCENT, what survives that test is nothing.
+  //
+  // Under SURFACE FLIGHT it is 665-804 slots per tick (measured,
+  // --autofly-surface). Those survive because the snapshot itself has gone
+  // stale — slow frame, readback ring behind, resident stone reported as
+  // empty — so the stain flag is answering about a chunk state that no longer
+  // holds. The probe then reads the live words, correctly refuses to free
+  // them, and the whole exchange is pure cost. That is why the batched probe
+  // shape matters (SetChunkProbe) and why this cap is live again below.
   //
   // It is worth stating why the cap was harmful rather than merely slow: it
   // bounded RECLAMATION while nothing bounded ALLOCATION. Measured under

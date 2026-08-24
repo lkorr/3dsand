@@ -77,10 +77,13 @@ bool fogOk = false;
     prevR = r;
   }
   ctx.WaitIdle();
-  // cold start: level 1 still pending -> only the residency window is trusted
-  const float wantCold = (float)(kWorldN >> 1) * kVoxelMeters;
-  const float wantFull =
-      (float)(kWorldN >> 1) * (float)(1u << kFarLevels) * kVoxelMeters;
+  // cold start: level 1 still pending -> only the residency window is trusted.
+  // Both bounds come from world.h's cascade helpers rather than restating the
+  // box-size relation: this gate previously hardcoded "half-extent = 2^k
+  // window edges", which silently became wrong the moment the shift base
+  // moved, failing the gate for a change that was correct.
+  const float wantCold = kWindowHalfExtentMeters;
+  const float wantFull = kFarHalfExtentMeters(kFarLevels);
   fogOk = std::abs(coldR - wantCold) < 1e-3f && monotone &&
           std::abs(prevR - wantFull) < 1e-3f;
   std::printf("far fog radius: %s (cold %.1f m -> filled %.1f m, monotone=%d)\n",
