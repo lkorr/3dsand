@@ -406,7 +406,14 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     cam.pitch = pitch;
     const IVec3 pc{CX / (int)kChunk, G / (int)kChunk, CZ / (int)kChunk};
 
-    // Per-tick series.
+    // Per-tick series. renderMs is the whole offscreen frame; the three
+    // attribution series below are the WP4 render breakdown (plan §7 item 5).
+    // Without them "render is 11-27 ms" is a number with no owner: the frame
+    // contains a fluid isosurface march, the rasterized splash/foam droplets,
+    // and the ordinary world+sky raymarch, and only one of those is fluid
+    // rendering. Sampled every kAttribEvery ticks so the extra passes cost
+    // ~20% of the run rather than 3x.
+    std::vector<double> renderNoFluidMs, renderWorldOnlyMs;
     std::vector<double> frameMs, renderMs;
     std::map<std::string, uint64_t> prevNs;
     std::map<std::string, std::vector<double>> passMs;
@@ -470,6 +477,36 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       const double r1 = NowSeconds();
       renderMs.push_back((r1 - r0) * 1000.0);
       frameMs.push_back((r1 - f0) * 1000.0);
+
+      // ---- render attribution (every kAttribEvery ticks) -----------------
+      // (b) the same frame with the fluid surface march switched off — passing
+      //     fluidCount 0 makes raymarch.wgsl skip it wholesale, so
+      //     renderMs - renderNoFluidMs IS the fluid march.
+      // (c) (b) minus the rasterized droplets — so renderNoFluidMs -
+      //     renderWorldOnlyMs is the splash/foam particle raster and
+      //     renderWorldOnlyMs is the world+sky floor this scene can never go
+      //     under. Same camera, same target: only the work differs.
+      // Never on the LAST tick: these passes overwrite the offscreen target and
+      // the screenshot below is taken from it.
+      constexpr uint32_t kAttribEvery = 16;
+      if (st % kAttribEvery == 0 && st != N) {
+        for (int mode = 0; mode < 2; mode++) {
+          const double a0 = NowSeconds();
+          WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true,
+                            11.7f, kFarFogDensity, (float)H, skyTick, 0);
+          rhi::CommandEncoder aenc = ctx.device.CreateCommandEncoder();
+          rhi::RenderPass arp = sim.BeginRenderPass(
+              aenc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+          sim.DrawWorld(arp);
+          if (mode == 0) sim.DrawParticles(arp);
+          arp.End();
+          ctx.queue.Submit(aenc.Finish());
+          ctx.WaitIdle();
+          const double a1 = NowSeconds();
+          if (mode == 0) renderNoFluidMs.push_back((a1 - a0) * 1000.0);
+          else renderWorldOnlyMs.push_back((a1 - a0) * 1000.0);
+        }
+      }
     }
     sim.SetPassTimer(nullptr);
 
@@ -548,6 +585,12 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         tickOfSettle, massExact ? "EXACT" : "LEAK",
         (unsigned long long)poured, (unsigned long long)standingEighths,
         (unsigned long long)carriedEighths);
+    std::printf(
+        "    render split: fluid march %.2f ms | droplet raster %.2f ms | "
+        "world+sky %.2f ms  (of %.2f ms)\n",
+        avg(renderMs) - avg(renderNoFluidMs),
+        avg(renderNoFluidMs) - avg(renderWorldOnlyMs), avg(renderWorldOnlyMs),
+        avg(renderMs));
     for (auto& [name, v] : passMs)
       if (avg(v) > 0.0005)
         std::printf("    %-24s avg %7.3f ms  p95 %7.3f ms\n", name.c_str(),
@@ -569,6 +612,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
          << ", \"p99\": " << Pct(frameMs, 0.99) << "},\n";
     json << "    \"renderMsWall\": {\"avg\": " << avg(renderMs)
          << ", \"p95\": " << Pct(renderMs, 0.95) << "},\n";
+    json << "    \"renderSplitMs\": {\"fluidMarch\": "
+         << avg(renderMs) - avg(renderNoFluidMs)
+         << ", \"dropletRaster\": "
+         << avg(renderNoFluidMs) - avg(renderWorldOnlyMs)
+         << ", \"worldSky\": " << avg(renderWorldOnlyMs) << "},\n";
     json << "    \"passesMs\": {";
     bool first = true;
     for (auto& [name, v] : passMs) {

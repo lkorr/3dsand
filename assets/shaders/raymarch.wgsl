@@ -4360,10 +4360,15 @@ struct FSOut {
 // COST DISCIPLINE (rule 2 applied to the render path):
 //   * R.fluidCount == 0 or the tuner's surface toggle off -> not one
 //     instruction of this runs;
+//   * R.fluidLo/fluidHi is the world AABB of the live fluid; a ray that misses
+//     it pays ONE slab test and nothing else, and a ray that hits it marches
+//     only the [enter, exit] span. This is what makes off-screen fluid free
+//     and a settled pool free — see fluidBoundsSpan;
 //   * the march skips CHUNK-SIZED strides through space with no fluid block
 //     (one buffer read per skipped chunk — the same trick the terrain DDA's
 //     occupancy skip uses);
-//   * fine steps and the 48-tap gradient run only near an actual surface;
+//   * fine steps and the 32-tap tetrahedral gradient run only near an actual
+//     surface;
 //   * the traced refraction/reflection rays run only for pixels that hit
 //     fluid, with the same step budget as water reflections.
 //
@@ -4427,15 +4432,29 @@ fn fluidFieldAt(p : vec3f) -> f32 {
   return acc / max(TUNE_FLUID_REST_DENSITY, 1.0);
 }
 
-// Gradient of the field = the smooth outward surface normal. Central
-// differences at the tuner's baseline; 6 field samples x 8 taps = 48 reads,
-// which is why this runs once per fluid pixel and never inside the march loop.
+// Gradient of the field = the smooth outward surface normal.
+//
+// TETRAHEDRAL, not central differences. A central difference needs 6 field
+// samples (2 per axis) and each field sample is 8 trilinear taps: 48 buffer
+// reads for one normal, per fluid pixel. The four vertices of a regular
+// tetrahedron span the same 3 dimensions with 4 samples — 32 reads, a third
+// off — and the estimate is the same first-order gradient, because
+// sum(k_i * f(p + k_i*h)) over the tetrahedron's k_i is 4h * grad(f) + O(h^2)
+// exactly as the central pair is 2h * grad(f) + O(h^2).
+//
+// The taps are placed at RADIUS `e`, not at offset e per axis: the k_i are
+// unit-cube diagonals of length sqrt(3), so h = e/sqrt(3) keeps the smoothing
+// radius the tuner's `fluidSmooth` slider is calibrated against. Without that
+// scaling the surface would quietly get 73% softer the day this landed.
 fn fluidNormalAt(p : vec3f) -> vec3f {
-  let e = max(TUNE_FLUID_SMOOTH, 0.4);
-  let gx = fluidFieldAt(p + vec3f(e, 0.0, 0.0)) - fluidFieldAt(p - vec3f(e, 0.0, 0.0));
-  let gy = fluidFieldAt(p + vec3f(0.0, e, 0.0)) - fluidFieldAt(p - vec3f(0.0, e, 0.0));
-  let gz = fluidFieldAt(p + vec3f(0.0, 0.0, e)) - fluidFieldAt(p - vec3f(0.0, 0.0, e));
-  let g = vec3f(-gx, -gy, -gz);
+  let h = max(TUNE_FLUID_SMOOTH, 0.4) * 0.5773503;   // 1/sqrt(3)
+  let k0 = vec3f( 1.0, -1.0, -1.0);
+  let k1 = vec3f(-1.0, -1.0,  1.0);
+  let k2 = vec3f(-1.0,  1.0, -1.0);
+  let k3 = vec3f( 1.0,  1.0,  1.0);
+  // Negated: the field grows INTO the fluid, the surface normal points out.
+  let g = -(k0 * fluidFieldAt(p + k0 * h) + k1 * fluidFieldAt(p + k1 * h) +
+            k2 * fluidFieldAt(p + k2 * h) + k3 * fluidFieldAt(p + k3 * h));
   let len = length(g);
   if (len < 1e-4) { return vec3f(0.0, 1.0, 0.0); }
   return g / len;
@@ -4526,10 +4545,22 @@ fn fluidGradientColor(base : vec3f, thickM : f32) -> vec3f {
   return mix(base, base * ramp * 2.0, g);
 }
 
-fn fluidChunkActive(c : vec3<i32>) -> bool {
-  let wc = worldChunkOf(c);
-  if (!chunkInWindow(wc, R.origin)) { return false; }
-  if (fluidBlockMapR[chunkSlotIndex(wc)] != 0u) { return true; }
+// How much of a chunk a node block's isosurface can reach into its NEIGHBOUR.
+// The B-spline support is 1.5 cells and the trilinear tap cube adds half a
+// cell, so 2 is conservative. This is the whole reason the seam ring exists.
+const FLUID_SEAM_SHELL : i32 = 2;
+
+// Chunk classification for the march: 0 = nothing here, 1 = the chunk owns a
+// node block, 2 = SEAM RING — no block of its own, but a face neighbour has
+// one, so the isosurface can reach FLUID_SEAM_SHELL cells in from that face.
+//
+// The ring used to be classified as plain "active", which made the march fine-
+// step through a whole 16-cell chunk of air for a surface that can only reach
+// 2 cells into it. Over open scenes that ring is most of the marched volume:
+// a camera looking along a poured sheet crosses several ring chunks per ray.
+fn fluidChunkClass(wc : vec3<i32>) -> u32 {
+  if (!chunkInWindow(wc, R.origin)) { return 0u; }
+  if (fluidBlockMapR[chunkSlotIndex(wc)] != 0u) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
   // fluidMassAt still returns non-zero density there (virtual mass from
   // voxel fullness).  If a face-neighbor IS active, the isosurface may
@@ -4539,10 +4570,44 @@ fn fluidChunkActive(c : vec3<i32>) -> bool {
       var nc = wc;
       nc[a] += s;
       if (chunkInWindow(nc, R.origin)
+          && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return 2u; }
+    }
+  }
+  return 0u;
+}
+
+// Is cell c inside the seam shell — within FLUID_SEAM_SHELL cells of a face
+// whose neighbour chunk owns a block? Only tests the faces c is actually near,
+// so a cell in the middle of a ring chunk costs zero buffer reads.
+fn fluidSeamShell(c : vec3<i32>) -> bool {
+  let wc = worldChunkOf(c);
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  for (var a = 0; a < 3; a++) {
+    if (lo[a] < FLUID_SEAM_SHELL) {
+      var nc = wc;
+      nc[a] -= 1;
+      if (chunkInWindow(nc, R.origin)
+          && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return true; }
+    }
+    if (lo[a] >= i32(CHUNK) - FLUID_SEAM_SHELL) {
+      var nc = wc;
+      nc[a] += 1;
+      if (chunkInWindow(nc, R.origin)
           && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return true; }
     }
   }
   return false;
+}
+
+// The region the march actually samples: c's own chunk owns a block, or c is
+// in the seam shell. The `mpmOwned` test in fs() must use THIS and not the
+// chunk class, or a settled cell the march never visits would have its
+// shadeWater suppressed and render as nothing.
+fn fluidCellMarched(c : vec3<i32>) -> bool {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, R.origin)) { return false; }
+  if (fluidBlockMapR[chunkSlotIndex(wc)] != 0u) { return true; }
+  return fluidSeamShell(c);
 }
 
 // t at which the ray leaves the CHUNK containing cell c — the chunk-stride
@@ -4562,6 +4627,32 @@ struct FluidHit {
   inside : bool,   // camera started submerged in the fluid
 };
 
+// ---- THE FLUID AABB (plan §7 item 5) ---------------------------------------
+// R.fluidLo/fluidHi is the inclusive world-voxel box of everything the march
+// can possibly hit this frame (world.h RenderParams; built on the CPU from the
+// snapshot's active block list plus the tick's spawns, dilated two chunks).
+//
+// Why this is THE render fix and not a micro-optimisation: without it every
+// one of the ~2M pixels ran the chunk-stride loop, and a SKY pixel is the
+// worst case — it has no terrain hit, so tMax is the window exit and the loop
+// strides ~32 chunks reading `fluidChunkActive` (up to 7 buffer reads) at each
+// one, for a pool that occupies a hundredth of the screen. Measured at 11-27 ms
+// of an 15-37 ms lab frame (plan §9 WP1 baselines).
+//
+// Returns (tEnter, tExit) along the ray, both unclamped; tExit < tEnter or
+// tExit <= 0 means the ray misses the box. The empty box (lo > hi, the no-fluid
+// state) makes tEnter > tExit on every ray by construction, so "no fluid" and
+// "ray points away from the fluid" take the same early-out.
+fn fluidBoundsSpan(ro : vec3f, inv : vec3f) -> vec2f {
+  let lo = vec3f(R.fluidLo);
+  let hi = vec3f(R.fluidHi) + vec3f(1.0);   // inclusive cell -> its far face
+  let t0 = (lo - ro) * inv;
+  let t1 = (hi - ro) * inv;
+  let tn = min(t0, t1);
+  let tf = max(t0, t1);
+  return vec2f(max(max(tn.x, tn.y), tn.z), min(min(tf.x, tf.y), tf.z));
+}
+
 fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
   var out : FluidHit;
   out.hit = false;
@@ -4577,25 +4668,55 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
   let inv = 1.0 / rd;
   let iso = max(TUNE_FLUID_ISO, 0.05);
 
+  // Clip the whole march to the fluid AABB. `span.x <= 0` is exactly "the
+  // camera is inside the box", which is also the only case in which the
+  // submerged test below can be true — so a camera nowhere near the water no
+  // longer pays a field sample for it either.
+  let span = fluidBoundsSpan(ro, inv);
+  if (span.y <= 0.0 || span.x > span.y) { return out; }
+  let tStart = max(span.x, 0.0);
+  let tEnd = min(span.y, tMax);
+  if (tStart >= tEnd) { return out; }
+
   // Camera inside the fluid: no interface in front, the whole view absorbs.
-  if (fluidFieldAt(ro) >= iso) {
+  if (span.x <= 0.0 && fluidFieldAt(ro) >= iso) {
     out.hit = true;
     out.inside = true;
   } else {
-    var t = 0.0;
-    var tPrev = 0.0;
+    var t = tStart;
+    var tPrev = tStart;
     var found = false;
+    // The chunk class only changes at chunk boundaries, but the march steps
+    // every 0.5-1.25 cells — so it was being recomputed (up to 7 buffer reads)
+    // about 13 times per chunk for an answer that could not have changed.
+    var heldSlot : u32 = 0xFFFFFFFFu;
+    var heldClass : u32 = 0u;
     // Step budget = worst case fine-marching straight down a full window
     // diagonal of solid fluid; the chunk skip means open scenes never get
     // close. A budget miss renders no surface for one frame of one pixel —
     // invisible — rather than a hitch.
     for (var i = 0; i < 320; i++) {
-      if (t >= tMax) { break; }
+      if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
-      if (!fluidChunkActive(c)) {
+      let slot = chunkSlotIndex(worldChunkOf(c));
+      if (slot != heldSlot) {
+        heldSlot = slot;
+        heldClass = fluidChunkClass(worldChunkOf(c));
+      }
+      if (heldClass == 0u) {
         tPrev = t;
         t = fluidChunkExit(ro, inv, c, t);
+        continue;
+      }
+      if (heldClass == 2u && !fluidSeamShell(c)) {
+        // Seam ring, away from the active face: no node within the tap cube
+        // can carry mass, so a field sample here is guaranteed zero. Stride to
+        // just inside the chunk's far shell rather than to its exit, so the
+        // shell facing the NEXT chunk still gets its fine steps.
+        tPrev = t;
+        t = max(fluidChunkExit(ro, inv, c, t) - f32(FLUID_SEAM_SHELL),
+                t + 0.5);
         continue;
       }
       let d = fluidFieldAt(p);
@@ -4619,16 +4740,27 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
   }
 
   // Thickness: how much fluid the ray crosses behind the entry, bounded by the
-  // scene surface (a pool on a bed is exactly bed-deep) and by an absorption
-  // horizon past which more water cannot change the pixel.
+  // scene surface (a pool on a bed is exactly bed-deep), by the AABB (there is
+  // no fluid past it, by construction) and by an absorption horizon past which
+  // more water cannot change the pixel.
+  //
+  // GEOMETRIC STRIDE. This walk was 28 fixed 1.25-cell samples — on a pixel
+  // that hits water it was HALF of every field sample the pixel ever took, for
+  // a quantity that feeds exp(-absorb * thickness). That exponential is
+  // exquisitely sensitive to the first couple of cells (a thin film vs a sheet)
+  // and almost blind past ten (the light is gone either way), so the step grows
+  // 1.25 -> 1.25 -> 1.5 -> 1.8 ... and reaches the same ~40-cell absorption
+  // horizon in 12 samples instead of 28. Thin films keep full precision.
   var tt = out.t + 0.5;
   var thick = 0.5;
-  for (var i = 0; i < 28; i++) {
-    if (tt >= tMax || thick > 40.0) { break; }
-    if (fluidFieldAt(ro + rd * tt) >= iso * 0.75) { thick += 1.25; }
-    tt += 1.25;
+  var step = 1.25;
+  for (var i = 0; i < 14; i++) {
+    if (tt >= tEnd || thick > 40.0) { break; }
+    if (fluidFieldAt(ro + rd * tt) >= iso * 0.75) { thick += step; }
+    tt += step;
+    if (i >= 1) { step = min(step * 1.35, 8.0); }
   }
-  out.thick = min(thick, max(tMax - out.t, 0.25));
+  out.thick = min(thick, max(tEnd - out.t, 0.25));
   return out;
 }
 
@@ -5207,9 +5339,12 @@ fn fs(in : VSOut) -> FSOut {
       // from any MPM activity from being claimed — fluidFieldAt would read 1.0
       // on any full water cell (via virtual mass), which would incorrectly
       // suppress shadeWater's caustics and ripple normals.
+      // fluidCellMarched, not the chunk class: the march only samples a ring
+      // chunk's 2-cell seam shell, so claiming the whole ring would suppress
+      // shadeWater on cells no MPM surface was ever drawn for.
       let mpmOwned = mf.hit
                      && materials[lm].moveEvery <= 1u
-                     && fluidChunkActive(h.liqCell);
+                     && fluidCellMarched(h.liqCell);
 
       if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit;

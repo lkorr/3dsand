@@ -451,6 +451,16 @@ struct RenderParams {
   // On its own row: a vec3 aligns to 16 bytes and cannot start mid-row.
   poleDir    : vec3f,
   _pdn3      : f32,
+  // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ----
+  // Inclusive world-voxel AABB of everything the fluid surface march can hit.
+  // Rays that miss it skip the march entirely; rays that hit march only the
+  // [enter, exit] span. fluidLo > fluidHi on any axis = no fluid at all, which
+  // is the post-settle idle state (see the RenderParams block in world.h — the
+  // CPU-side fluidCount is monotone, so this box is what actually sleeps).
+  fluidLo    : vec3<i32>,
+  _pfb0      : i32,
+  fluidHi    : vec3<i32>,
+  _pfb1      : i32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
