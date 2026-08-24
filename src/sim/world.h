@@ -873,6 +873,30 @@ struct RenderParams {
   // Fraction of moon B's disc hidden behind moon A. Render-only.
   float lunarEclipse = 0.0f;
   float pad_dn1 = 0.0f, pad_dn2 = 0.0f;
+
+  // The CELESTIAL POLE in the local horizon frame — the axis the starfield
+  // wheels about. It is an OUTPUT of latitude (the pole sits at elevation =
+  // latitude, due north), which is why there is no knob for it: the stars and
+  // the sun have to agree about where the axis is, and they only do if both
+  // read the same latitude.
+  //
+  // DO NOT DELETE THIS ROW WITHOUT DELETING IT FROM common.wgsl. It was
+  // removed once (ec764e8, "the shader derives it from latitude") while
+  // raymarch.wgsl went on reading R.poleDir, so the shader read 16 bytes past
+  // the end of what WriteRenderParams uploads. Robust buffer access returns
+  // zero, normalize(vec3f(0)) is NaN, and both starField() and nightGlow()
+  // rotate about that axis — so the NaN spread across the entire night sky and
+  // skyAirglow's max(c, 0.0) collapsed it to pure black. Stars, Milky Way,
+  // nebulae and aurora all vanished at once, silently, with no validation
+  // error: an under-sized uniform binding is not a Vulkan error, it is just
+  // zeros. check_invariants.py's `params` check now compares the two structs
+  // field by field so this cannot recur.
+  //
+  // Starts its OWN std140 row: a vec3 aligns to 16 bytes, so it cannot begin
+  // partway through the row solarEclipse opens. The two pads above are what
+  // close that row, and the one below closes this one.
+  float poleDir[3] = {0.0f, 1.0f, 0.0f};
+  float pad_dn3 = 0.0f;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
