@@ -198,6 +198,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(10, T::Storage),         // fluidCompactScratch
         entry(11, T::Storage),         // fluidCellScratch (intents + flags)
         entry(12, T::Storage),         // fluidBlockList (stainApply's slots)
+        entry(13, T::Storage),         // fluidMirror (swimming fold)
     };
     fluidSeamBGL_ = device.CreateBindGroupLayout(sfentries, std::size(sfentries));
   }
@@ -464,6 +465,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(10, world_->fluidCompactScratch),
         b(11, world_->fluidCellScratch),
         b(12, world_->fluidBlockList),
+        b(13, world_->fluidMirror),
     };
     fluidSeamBG_[page] = device.CreateBindGroup(fluidSeamBGL_, sentries,
                                                 std::size(sentries), "fluidSeamBG");
@@ -650,6 +652,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidSettleKill_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleKill", "seamSettleKill");
   fluidConsumeApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "consumeApply", "seamConsumeApply");
   fluidStainApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "stainApply", "seamStainApply");
+  fluidMirrorFold_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "mirrorFold", "seamMirrorFold");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -666,7 +669,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidExciteScan_ || !fluidExciteEmit_ || !fluidPTick_ ||
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
       !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_ ||
-      !fluidConsumeApply_ || !fluidStainApply_) {
+      !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -802,6 +805,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FluidSettleScratch: return world_->fluidSettleScratch;
     case B::FluidCompactScratch: return world_->fluidCompactScratch;
     case B::FluidCellScratch:    return world_->fluidCellScratch;
+    case B::FluidMirror:         return world_->fluidMirror;
     default:                return world_->voxels;
   }
 }
@@ -852,6 +856,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidSettleKill:     return fluidSettleKill_;
     case P::FluidConsumeApply:   return fluidConsumeApply_;
     case P::FluidStainApply:     return fluidStainApply_;
+    case P::FluidMirrorFold:     return fluidMirrorFold_;
     default:                return step_;
   }
 }

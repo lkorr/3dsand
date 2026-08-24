@@ -4049,9 +4049,27 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
 }
 
 fn fluidMassAt(c : vec3<i32>) -> f32 {
+  var m = 0.0;
   let b = fluidNodeBase(c);
-  if (b < 0) { return 0.0; }
-  return f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
+  if (b >= 0) {
+    m = f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
+  }
+  // Seam continuity (plan §6.7): SETTLED liquid voxels contribute their
+  // fullness as virtual mass, so the isosurface's boundary taps see the
+  // voxel water next door and the two surfaces meet instead of leaving a
+  // gap. A full settled cell reads exactly rest density. Render-only — the
+  // sim's grid never sees this. The whole-lake case costs nothing: the
+  // march only queries cells near active blocks (fluidChunkActive skips the
+  // rest), and lakes with no excited water never enter the march at all
+  // (R.fluidCount == 0). max(), not +: a cell mid-conversion briefly holds
+  // both representations of the SAME water.
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
+  if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
+    m = max(m, f32(voxState(w) + 1u) * (1.0 / 8.0) *
+                   max(TUNE_FLUID_REST_DENSITY, 1.0));
+  }
+  return m;
 }
 
 // Trilinear density, NORMALIZED so 1.0 = rest density. Nodes sit at cell

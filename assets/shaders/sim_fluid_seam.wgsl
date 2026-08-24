@@ -90,6 +90,10 @@
 // blockIdx -> chunk slot, from the last substep's alloc. read_write to match
 // the solver's shared entry; this shader only reads.
 @group(1) @binding(12) var<storage, read_write> fluidBlockList : array<u32>;
+// The swimming query's view of the particles: excited-fluid eighths per
+// CPU-mirror cell, one byte each packed 4/word, written by mirrorFold and
+// read back with the snapshot.
+@group(1) @binding(13) var<storage, read_write> fluidMirror : array<u32>;
 
 // ---- layout constants -------------------------------------------------------
 const SPANS : u32 = FLUID_CAP / 256u;         // compaction spans
@@ -1029,6 +1033,35 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
   let cz = i32(li >> 4u);
   settleColumn(wg.x, base, cx, cz, true);
   if (li == 0u) { atomicStore(&fluidCalm[ci], 0u); }
+}
+
+// mirrorFold: pack excited-fluid occupancy (eighths per cell, from the last
+// substep's node mass) for the 27 CPU-mirror chunks, so the player's
+// swimming query sees particles the way it sees fullness voxels (plan §6.5
+// — `inLiquid` is a fraction, and node mass gives one naturally). One
+// workgroup per mirror chunk; 4 cells pack into each written word.
+@compute @workgroup_size(256)
+fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
+              @builtin(local_invocation_index) li : u32) {
+  let m = wg.x;
+  let wc = T.mirrorBase + vec3<i32>(i32(m % 3u), i32((m / 3u) % 3u),
+                                    i32(m / 9u));
+  var bm = 0u;
+  if (chunkInWindow(wc, T.origin)) {
+    bm = fluidBlockMapR[chunkSlotIndex(wc)];
+  }
+  for (var wpos = li * 4u; wpos < li * 4u + 4u; wpos++) {
+    var packed = 0u;
+    if (bm != 0u) {
+      for (var b = 0u; b < 4u; b++) {
+        let cellIdx = wpos * 4u + b;
+        let mass = fluidGridR[((bm - 1u) * CHUNK_VOL + cellIdx) * FLUID_GW];
+        let e = clamp(mass >> 10u, 0, 8);   // Q10 mass -> whole particles
+        packed |= u32(e) << (b * 8u);
+      }
+    }
+    fluidMirror[m * (CHUNK_VOL / 4u) + wpos] = packed;
+  }
 }
 
 // settleKill: particles of committed blocks die. Their eighths are voxels

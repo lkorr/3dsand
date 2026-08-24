@@ -99,6 +99,7 @@ enum class Buf : uint8_t {
   FluidSettleScratch,
   FluidCompactScratch,
   FluidCellScratch,
+  FluidMirror,
   kCount,
 };
 
@@ -145,7 +146,7 @@ enum class Pipe : uint8_t {
   FluidExciteDetect, FluidExciteScan, FluidExciteEmit,
   FluidPTick, FluidSettleJudge, FluidSettleScan, FluidSettleBin,
   FluidSettleCheck, FluidSettleCommit, FluidSettleKill,
-  FluidConsumeApply, FluidStainApply,
+  FluidConsumeApply, FluidStainApply, FluidMirrorFold,
   // Materializes a JITTER page (world.h's JITTER block): the one fill a
   // vkCmdFillBuffer cannot do, because the words vary per cell.
   PageFill,

@@ -554,6 +554,14 @@ struct TickParams {
   // poured -> no droplets). Recorded from the pour's brush material by the main
   // loop; vec4<u32> on the WGSL side, so keep this 16-byte aligned.
   uint32_t fluidSplashMat[4] = {0, 0, 0, 0};
+  // WORLD chunk coord of the 3x3x3 CPU-mirror corner (World::MirrorBaseFor of
+  // the player chunk — the SAME clamp EncodeReadbacks uses, or the fold and
+  // the voxel mirror would describe different cubes). The seam's mirrorFold
+  // kernel packs excited-fluid occupancy for exactly these 27 chunks so
+  // swimming sees particles the way it sees fullness voxels. vec3<i32> + pad
+  // on the WGSL side.
+  int32_t mirrorBase[3] = {0, 0, 0};
+  uint32_t padMb = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -760,6 +768,10 @@ struct WorldSnapshot {
   // is what makes this latency safe.
   uint32_t fluidBlockCount = 0;
   std::vector<uint32_t> fluidBlocks;
+  // Excited-fluid eighths per mirror cell (27 x 4096 bytes, mirrorBase
+  // addressing — the same cube as `mirror`). Zeroed whenever no fluid is
+  // live, so a stale fold can never report ghost water.
+  std::vector<uint8_t> fluidMirror;
 };
 
 // One CPU-cached chunk of voxel data, fetched on demand through the async
@@ -781,6 +793,38 @@ class World {
   bool EncodeReadbacks(const rhi::Device& device, const rhi::CommandEncoder& enc,
                        IVec3 playerChunkBase, uint32_t particleLivePage,
                        uint32_t tick);
+
+  // Excited-fluid eighths (0..8) at a world cell, from the snapshot's fluid
+  // mirror fold. 0 outside the 3x3x3 mirror, when no snapshot exists, or
+  // when no fluid is live — the same Unknown-is-conservative shape KindAt
+  // has, in the direction that never invents water.
+  uint32_t FluidEighthsAt(IVec3 cell) const {
+    if (!snap_.valid || snap_.fluidLive == 0 || snap_.fluidMirror.empty())
+      return 0;
+    IVec3 mc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+    IVec3 d{mc.x - snap_.mirrorBase.x, mc.y - snap_.mirrorBase.y,
+            mc.z - snap_.mirrorBase.z};
+    if (d.x < 0 || d.x > 2 || d.y < 0 || d.y > 2 || d.z < 0 || d.z > 2)
+      return 0;
+    size_t m = (size_t)((d.z * 3 + d.y) * 3 + d.x);
+    IVec3 lo{cell.x & 15, cell.y & 15, cell.z & 15};
+    return snap_.fluidMirror[m * kChunkVol +
+                             (size_t)((lo.z * 16 + lo.y) * 16 + lo.x)];
+  }
+
+  // The 3x3x3 mirror's clamped corner for a desired player-chunk corner.
+  // Shared by EncodeReadbacks and the tick's mirrorBase (TickParams) so the
+  // voxel mirror and the fluid-occupancy fold always describe the same cube.
+  IVec3 MirrorBaseFor(IVec3 playerChunkBase) const {
+    auto clampBase = [&](int v, int lo) {
+      if (v < lo) v = lo;
+      if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
+      return v;
+    };
+    return {clampBase(playerChunkBase.x, origin_.x),
+            clampBase(playerChunkBase.y, origin_.y),
+            clampBase(playerChunkBase.z, origin_.z)};
+  }
 
   // ---- toroidal residency window (DESIGN.md §3) ----
   // The resident cube covers world chunks [origin, origin+kNChunk) per axis;
@@ -996,6 +1040,12 @@ class World {
                                   // kFluidSettleMax * kChunkVol * 2 words
   rhi::Buffer fluidCompactScratch; // per-256-span survivor counts + bases
                                    // (kFluidCap/256 * 2 u32)
+  rhi::Buffer fluidMirror;        // 27 mirror chunks x 4096 cells, one byte
+                                  // of excited-fluid eighths per cell packed
+                                  // 4/word — the swimming query's view of the
+                                  // particles, folded by the seam's
+                                  // mirrorFold and read back with the
+                                  // snapshot (World::FluidEighthsAt)
   rhi::Buffer fluidCellScratch;   // per active-block cell, 2 u32: [0] intent
                                   // (mat<<16 | stainAmt<<3 | stainType,
                                   // atomicMax by the seam's particleTick) and

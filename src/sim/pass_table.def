@@ -593,5 +593,10 @@ PASS(seam_settle_commit, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_COMMIT
 PASS(seam_settle_kill, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_KILL, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) A(FluidSettleScratch)
           A(FluidArgsStage) I(FluidPDispatchArgs)))
+// The swimming fold: excited-fluid eighths for the 27 CPU-mirror chunks,
+// packed for the snapshot readback (plan §6.5). Last so it reads the tick's
+// final node mass.
+PASS(seam_mirror_fold, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_MIRROR_FOLD, K_COMPUTE, 27,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+     USES(U(TickUBO) R(FluidBlockMap) R(FluidGrid) W(FluidMirror)))
 
 // clang-format on

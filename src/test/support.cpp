@@ -149,6 +149,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                 (uint32_t)dtun.dayNight.freezePhase);
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
+  // The mirror corner for the seam's fluid-occupancy fold: the SAME clamp
+  // EncodeReadbacks applies to the same input below, so the fold and the
+  // voxel mirror describe one cube.
+  IVec3 mb = world.MirrorBaseFor(
+      {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
+  tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));

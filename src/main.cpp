@@ -1539,6 +1539,13 @@ int main(int argc, char** argv) {
   // Last tick the MPM fluid was live: keeps the particle passes awake for the
   // splash droplets (see particlesActive below).
   uint32_t lastFluidTick = 0;
+  // Splash sound cue: fired once per snapshot tick that reports a burst of
+  // excitement, voiced through water's Impact slot (the Break precedent —
+  // audio is presentation-only and reads the same readback).
+  uint32_t lastFluidCueTick = 0;
+  uint32_t fluidCueMat = 0;
+  for (size_t i = 0; i < mats.size(); i++)
+    if (mats[i].name == "water") { fluidCueMat = (uint32_t)i; break; }
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -1933,7 +1940,14 @@ int main(int argc, char** argv) {
 
     // ---- player (per frame, against the latest one-tick-latent mirror) ----
     player.fly = ui.fly;
-    auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
+    // Excited MPM water folds into the liquid answer BEFORE the voxel
+    // mirror: swimming, buoyancy and the waterline frame work identically
+    // whichever representation the water happens to be in (plan §6.5). The
+    // >= 2 eighths floor keeps a lone stray droplet from reading as a pool.
+    auto kindAt = [&](IVec3 c) {
+      if (world.FluidEighthsAt(c) >= 2) return CellKind::Liquid;
+      return world.KindAt(c, classOf);
+    };
     // Dismemberment drives movement: the active AnimStateRule's speedScale and
     // the leg-liveness-derived jump scale come straight from the avatar, so
     // losing a leg slows the player down and losing both stops them jumping.
@@ -2909,6 +2923,30 @@ int main(int argc, char** argv) {
         // snaps on one instant.
         for (const DebrisSystem::BreakEvent& be : debris.BreakEvents())
           audioCues.Break(be.material, be.posVoxel, be.sizeVoxels);
+
+        // A burst of MPM excitement (rock in a lake, floor carved under a
+        // pool) reads as an impact through the water material's existing
+        // slot — the Break precedent, driven from the same snapshot
+        // readback. Once per snapshot tick, positioned at the last exciting
+        // chunk's centre (coarse is fine for a splash).
+        {
+          const WorldSnapshot& fsn = world.Snap();
+          if (fsn.valid && fsn.tick != lastFluidCueTick &&
+              fsn.fluidExcitedEighths >= 64 && fluidCueMat != 0) {
+            lastFluidCueTick = fsn.tick;
+            uint32_t s = fsn.fluidLastSlot;
+            IVec3 sc{(int)(s % kNChunk), (int)((s / kNChunk) % kNChunk),
+                     (int)(s / (kNChunk * kNChunk))};
+            IVec3 o = fsn.windowOrigin;
+            int m = (int)kNChunk - 1;
+            IVec3 wc{o.x + ((sc.x - o.x) & m), o.y + ((sc.y - o.y) & m),
+                     o.z + ((sc.z - o.z) & m)};
+            Vec3 pos{wc.x * 16.0f + 8.0f, wc.y * 16.0f + 8.0f,
+                     wc.z * 16.0f + 8.0f};
+            audioCues.Impact(fluidCueMat, pos,
+                             std::min(fsn.fluidExcitedEighths / 64.0f, 8.0f));
+          }
+        }
 
         // Limbs that came off this frame. The creature's cry fires for every
         // sever; the wet CUT only for one made by a blade, because an

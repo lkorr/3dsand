@@ -280,6 +280,11 @@ struct TickParams {
   // Part of the tick input stream like every field above, so replays and the
   // determinism gates capture it for free.
   fluidSplashMat  : vec4<u32>,
+  // WORLD chunk coord of the 3x3x3 CPU-mirror corner (the same clamp the
+  // readback uses). The seam's mirrorFold packs excited-fluid occupancy for
+  // these 27 chunks — the swimming query's view of the particles.
+  mirrorBase : vec3<i32>,
+  padMb      : u32,
 };
 
 // ---- day phase helpers (integer; sim-side) ----

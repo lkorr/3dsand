@@ -29,7 +29,10 @@ constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
 constexpr uint64_t kFluidArgsOff = kPageFaultOff + 256;
 constexpr uint64_t kFluidBlocksOff = kFluidArgsOff + 256;
 constexpr uint64_t kFluidBlocksBytes = kFluidBlocks * 4;
-constexpr uint64_t kFetchOff = kFluidBlocksOff + kFluidBlocksBytes;
+// The excited-fluid mirror fold: one byte per mirror cell, packed 4/word.
+constexpr uint64_t kFluidMirrorOff = kFluidBlocksOff + kFluidBlocksBytes;
+constexpr uint64_t kFluidMirrorBytes = 27ull * kChunkVol;
+constexpr uint64_t kFetchOff = kFluidMirrorOff + kFluidMirrorBytes;
 constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
 
 void World::Init(const rhi::Device& device) {
@@ -135,6 +138,8 @@ void World::Init(const rhi::Device& device) {
   fluidCellScratch = CreateBuffer(
       device, (uint64_t)kFluidBlocks * kChunkVol * 2 * 4,
       U::Storage | U::CopyDst, "fluidCellScratch");
+  fluidMirror = CreateBuffer(device, 27ull * kChunkVol,
+                             U::Storage | U::CopySrc, "fluidMirror");
   debugBoxes = CreateBuffer(device, (uint64_t)kMaxDebugBoxes * sizeof(DebugBox),
                             U::Storage | U::CopyDst, "debugBoxes");
   bodyInstances = CreateBuffer(device, 262144ull * 16, U::Storage | U::CopyDst,
@@ -172,6 +177,7 @@ void World::Init(const rhi::Device& device) {
   snap_.occupancy.assign(kNumChunks, 0);
   snap_.occStain.assign(kNumChunks, 0);
   snap_.fluidBlocks.assign(kFluidBlocks, 0);
+  snap_.fluidMirror.assign(27ull * kChunkVol, 0);
 }
 
 void World::RequestChunkFetch(IVec3 worldChunk) {
@@ -234,15 +240,11 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                     kFetchOff + i * kChunkBytes, kChunkBytes);
   }
 
-  // clamp the 3x3x3 mirror to the residency window (world chunk coords)
-  auto clampBase = [&](int v, int lo) {
-    if (v < lo) v = lo;
-    if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
-    return v;
-  };
-  s.base = {clampBase(playerChunkBase.x, origin_.x),
-            clampBase(playerChunkBase.y, origin_.y),
-            clampBase(playerChunkBase.z, origin_.z)};
+  // clamp the 3x3x3 mirror to the residency window (world chunk coords).
+  // MirrorBaseFor is the ONE clamp — the seam's mirrorFold kernel gets the
+  // same value through TickParams.mirrorBase, or the fluid-occupancy fold
+  // and the voxel mirror would describe two different cubes.
+  s.base = MirrorBaseFor(playerChunkBase);
 
   // THE CPU SEAM again, and this is the worst of the five sites (§2.1a): the
   // mirror is CPU-only collision data, so a corrupted mirror is the player
@@ -288,6 +290,8 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                   kFluidArgsOff, 128);
   enc.CopyTracked(pass::Buf::FluidBlockList, fluidBlockList, 0, s.buf,
                   kFluidBlocksOff, kFluidBlocksBytes);
+  enc.CopyTracked(pass::Buf::FluidMirror, fluidMirror, 0, s.buf,
+                  kFluidMirrorOff, kFluidMirrorBytes);
   lastSlot_ = slot;
   return true;
 }
@@ -390,6 +394,16 @@ void World::KickReadback() {
               snap_.fluidBlockCount = std::min(fa[3], kFluidBlocks);
               std::memcpy(snap_.fluidBlocks.data(), p + kFluidBlocksOff,
                           kFluidBlocksBytes);
+              // The occupancy fold is only meaningful while fluid is live —
+              // the seam stops recording (and refreshing the buffer) at
+              // zero, so a stale fold must read as no water.
+              if (snap_.fluidLive > 0) {
+                std::memcpy(snap_.fluidMirror.data(), p + kFluidMirrorOff,
+                            kFluidMirrorBytes);
+              } else {
+                std::fill(snap_.fluidMirror.begin(), snap_.fluidMirror.end(),
+                          (uint8_t)0);
+              }
             }
             snap_.tick = sl.tick;
             snap_.valid = true;

@@ -489,6 +489,46 @@ the voxel's stain bits. The species id (0..3) survives as the grid's
 mass-channel / render-colour grouping, derived from the material at excite
 time.
 
+ENVIRONMENT PARITY (Phase 2's §6 slice) runs through ONE per-cell bridge
+buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
+
+- REACTIONS: `doReactions` synthesizes an excited cell as a liquid neighbour
+  of the particles' material (last tick's block map + node mass + intent),
+  so authored PAIR rules — freezing, absorption, plants drinking — work
+  against excited water with zero new authoring surface. A rule that TAKES
+  the neighbour sets the cell's consume flag; the seam's `consumeApply`
+  kills the whole cell bin the same tick (consumption granularity is the
+  voxel-eighth, order-free, mass-exact — the fluid-react gate audits
+  standing + live + consumed == placed). Transitions that PRODUCE matter
+  write ordinary voxels into the (air) cell; every phase change crosses the
+  seam through the voxel form (plan §6.6).
+- CONTACT STAINING: `particleTick` scatters each particle's stain (carried
+  attr stain beats the material's authored one) onto solid/powder face
+  neighbours as intents; `stainApply` rolls `sim.fluidStainRate` per cell
+  and merges with the CA's rules. Settled water then WASHES foreign stains
+  exactly as CA water does — the fluid-stain gate observes both halves.
+- SWIMMING: `mirrorFold` packs excited-fluid eighths for the 27 CPU-mirror
+  chunks (one byte per cell, `TickParams.mirrorBase` = the readback's own
+  clamp) into the snapshot; `World::FluidEighthsAt` folds it into the
+  player's `kindAt` ahead of the voxel mirror, so `inLiquid`/submersion/the
+  waterline frame see particles as water. Zeroed whenever no fluid is live.
+- SOUND: a burst of excitement in one snapshot (>= 64 eighths) fires water's
+  Impact cue at the last exciting chunk's centre — the Break-event
+  precedent: presentation-only, driven from the readback, never in the
+  hashed domain.
+- RENDER SEAM: `fluidMassAt` (the one producer under the MPM isosurface)
+  takes max(particle mass, settled-liquid fullness x rest), so the
+  isosurface's boundary taps meet the voxel surface without a gap; the
+  back-to-front stack still prefers a nearer CA liquid interface.
+
+KNOWN LIMITS (Phase 2): excite converts non-viscous liquids only
+(moveEvery <= 1 — lava/blood stay CA until per-material fluid dynamics,
+plan Phase 7); splash droplets from STAINED water carry the material, not
+the carried stain; frontier neighbour-count scaling sees excited fluid as
+air; a sealed, undamped pool at stock stiffness can churn indefinitely
+(sim.fluidDamping defaults to 0 — the settle gates document the tuning that
+calms adversarial geometry, and Phase 7 owns the defaults).
+
 The solver (2026-08-22, second pass) follows grantkot's WebGPU MLS-MPM shape:
 P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter
 (`p2g2`), so pressure comes from the REAL local density sampled off the grid —

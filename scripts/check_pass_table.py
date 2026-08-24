@@ -129,6 +129,7 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_SETTLE_KILL": "fluidSettleKill_",
     "PIPE_FLUID_CONSUME_APPLY": "fluidConsumeApply_",
     "PIPE_FLUID_STAIN_APPLY": "fluidStainApply_",
+    "PIPE_FLUID_MIRROR_FOLD": "fluidMirrorFold_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -186,6 +187,7 @@ BUF_TO_WGSL = {
     "FluidSettleScratch": {"settleScratch"},
     "FluidCompactScratch": {"compactScratch"},
     "FluidCellScratch": {"fluidCellScratch"},
+    "FluidMirror": {"fluidMirror"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -231,7 +233,8 @@ _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
 _FLUID_SEAM_GROUP1 = {"fluidSrc", "fluidParticles", "fluidSpawnOps",
                       "fluidBlockMapR", "fluidGridR", "fluidArgs", "dirtyList",
                       "exciteScratch", "fluidCalm", "settleScratch",
-                      "compactScratch", "fluidCellScratch", "fluidBlockList"}
+                      "compactScratch", "fluidCellScratch", "fluidBlockList",
+                      "fluidMirror"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,
