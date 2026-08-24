@@ -55,6 +55,99 @@ std::vector<uint32_t> ReadOccupancySync(GpuContext& ctx, World& world) {
   return out;
 }
 
+// The sub-chunk bitmask that follows the counts in the same buffer (world.h
+// kSubOccShift). Read separately so the histogram above keeps its exact shape.
+std::vector<uint32_t> ReadSubOccSync(GpuContext& ctx, World& world) {
+  const uint64_t bytes = (uint64_t)kNumChunks * kSubOccStride * 4;
+  std::vector<uint32_t> out((size_t)kNumChunks * kSubOccStride, 0);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy,
+                        (uint64_t)kNumChunks * 4, out.data(), (size_t)bytes,
+                        "subOccRead");
+  return out;
+}
+
+// ---- how much can the sub-chunk mask ACTUALLY skip? ------------------------
+// The whole premise of A2 is that half-full canopy/meadow chunks hold a lot of
+// empty sub-blocks. That is a claim about CONTENT, and it decides the ceiling
+// on the optimisation before a single frame is timed — so measure it directly
+// off the mask the producers write, rather than inferring it from frame times.
+//
+// The number that matters is NOT "what fraction of all blocks are empty"
+// (dominated by all-air chunks, which the chunk-level skip already handles for
+// free). It is: OF THE CHUNKS A RAY MUST MARCH — the ones with a non-zero,
+// non-full count — what fraction of their blocks are empty? That is the share
+// of per-voxel stepping the mask is able to remove, and nothing else is.
+void MeasureSubOcc(GpuContext& ctx, World& world) {
+  std::vector<uint32_t> occ = ReadOccupancySync(ctx, world);
+  std::vector<uint32_t> sub = ReadSubOccSync(ctx, world);
+  const uint32_t blocksPerChunk = kSubOccDim * kSubOccDim * kSubOccDim;
+
+  struct Acc {
+    uint64_t chunks = 0, blocks = 0, setBlocks = 0, allSet = 0, noneSet = 0;
+    uint64_t slabs = 0, emptySlabs = 0;
+  };
+  Acc mixed, full;  // "mixed" = 1..CHUNK_VOL-1 cells, "full" = all cells
+  for (uint32_t i = 0; i < kNumChunks; i++) {
+    const uint32_t count = occ[i] & 0xFFFFu;
+    if (count == 0) continue;  // chunk-level skip already handles these
+    uint32_t set = 0;
+    for (uint32_t w = 0; w < kSubOccWords; w++) {
+      uint32_t word = sub[(size_t)i * kSubOccStride + w];
+      // Bits past the block grid are written as ones by the conservative
+      // fills; mask them off or a shift-3 build reads 100% everywhere.
+      if (blocksPerChunk < 32 * (w + 1)) {
+        const uint32_t used = blocksPerChunk - 32 * w;
+        word &= used >= 32 ? 0xFFFFFFFFu : ((1u << used) - 1u);
+      }
+      for (uint32_t b = 0; b < 32; b++) set += (word >> b) & 1u;
+    }
+    // ---- the Y-SLAB question ----------------------------------------------
+    // Terrain is a HEIGHTFIELD, so the empty part of a surface chunk is not
+    // scattered blocks: it is the top of the chunk, all the way across. A
+    // horizontal slab (CHUNK x block x CHUNK) that is entirely empty can be
+    // jumped in ONE step, and for a near-level ray that step is up to 22
+    // voxels of chord instead of a block's 2.7 — which is the difference
+    // between a jump that pays for itself and one that does not. Counted here
+    // with the SAME bits, so the number is comparable to the block row above.
+    for (uint32_t by = 0; by < kSubOccDim; by++) {
+      bool any = false;
+      for (uint32_t bz = 0; bz < kSubOccDim && !any; bz++)
+        for (uint32_t bx = 0; bx < kSubOccDim && !any; bx++) {
+          const uint32_t b = (bz * kSubOccDim + by) * kSubOccDim + bx;
+          if ((sub[(size_t)i * kSubOccStride + (b >> 5)] >> (b & 31)) & 1u)
+            any = true;
+        }
+      Acc& sa = count >= kChunkVol ? full : mixed;
+      sa.slabs++;
+      if (!any) sa.emptySlabs++;
+    }
+    Acc& a = count >= kChunkVol ? full : mixed;
+    a.chunks++;
+    a.blocks += blocksPerChunk;
+    a.setBlocks += set;
+    if (set == blocksPerChunk) a.allSet++;
+    if (set == 0) a.noneSet++;
+  }
+
+  std::printf("\n=== MEASUREMENT 1d: sub-chunk occupancy mask (world.h "
+              "kSubOccShift=%u) ===\n", kSubOccShift);
+  std::printf("  block grid: %ux%ux%u per chunk, %u voxels per block edge\n",
+              kSubOccDim, kSubOccDim, kSubOccDim, 1u << kSubOccShift);
+  auto row = [&](const char* label, const Acc& a) {
+    std::printf("  %-22s chunks %6" PRIu64 "  blocks set %6.2f%%  "
+                "all-set chunks %5.1f%%  empty y-slabs %6.2f%%\n",
+                label, a.chunks,
+                a.blocks ? 100.0 * (double)a.setBlocks / (double)a.blocks : 0.0,
+                a.chunks ? 100.0 * (double)a.allSet / (double)a.chunks : 0.0,
+                a.slabs ? 100.0 * (double)a.emptySlabs / (double)a.slabs : 0.0);
+  };
+  row("partly-filled chunks", mixed);
+  row("100%-full chunks", full);
+  std::printf("  READ THIS AS THE CEILING: the mask can only remove per-voxel\n"
+              "  stepping inside the partly-filled row, and only for the\n"
+              "  (100 - blocks set)%% of it that is empty.\n");
+}
+
 // Six fullness buckets, matching the brief. Boundaries chosen so "exactly 0"
 // and "exactly full" are their OWN buckets: those two are the ones sparse
 // binding and a compressed-page scheme care about, and folding them into a
@@ -472,6 +565,7 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     std::printf("settled. world hash = %08x\n", hash);
   }
   MeasureOccupancy(ctx, world);
+  MeasureSubOcc(ctx, world);
   MeasureUniformity(ctx, world);
 
   // ---- resident memory, the phase-7 acceptance number (§3.7) --------------

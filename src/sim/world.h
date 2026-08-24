@@ -421,6 +421,39 @@ inline uint32_t PackVoxNew(uint32_t mat, uint32_t state) {
 // means saying so here and in the common.wgsl allocation table.
 constexpr uint32_t kFreeBits = 0x00F80000u;
 
+// ---- sub-chunk occupancy bitmask (PLAN_surface_flight_perf.md A2) ----------
+// RENDER-ONLY DERIVED DATA, appended to the `occupancy` buffer after the
+// per-chunk count words. Deliberately NOT its own rhi::Buffer: every barrier,
+// every pass_table.def `uses` row and every bind-group entry for Occupancy
+// already exists and already covers it, and a new buffer with a missing `uses`
+// row is a cross-vendor desync that reproduces on no local machine.
+//
+// The chunk-level skip is all-or-nothing at 1.6 m and keyed on a COUNT, so one
+// grass voxel in 4,096 forces 16-48 per-voxel steps through the chunk. Two
+// content classes make that systematic: micro/grass is excluded from the
+// blocker count (isRayBlocker) but still counts in the total that PRIMARY rays
+// test, and tree foliage has no micro block at all, so a canopy is a wall of
+// half-full chunks. This mask lets both skip INTERNALLY.
+//
+// TWO CLASSES, because the two ray kinds ask different questions and one mask
+// cannot answer both: primary rays test occTotal (any non-air cell), media-
+// blind shadow/reflection rays test occBlockers. Using the blocker mask for a
+// primary ray would skip gas, water and grass; using the total mask for a
+// shadow ray is merely pessimistic. Both are stored, `wantMedia` picks.
+//
+// GRANULARITY IS THE KNOB. kSubOccShift is the block edge as a shift in
+// voxels: 2 => 4-voxel (40 cm) blocks on a 4^3 grid, 3 => 8-voxel blocks on a
+// 2^3 grid. Storage is FIXED at two words per class either way, so the shader
+// is identical for both and the choice is a one-constant A/B (shift 3 simply
+// leaves 56 of the 64 bits unused). Anything finer than shift 2 would need a
+// third word and dynamic indexing in the producers' per-thread accumulators.
+constexpr uint32_t kSubOccShift = 2;
+constexpr uint32_t kSubOccDim = kChunk >> kSubOccShift;   // blocks per chunk edge
+constexpr uint32_t kSubOccWords = 2;                      // 64 bits per class
+constexpr uint32_t kSubOccStride = kSubOccWords * 2;      // total words, then blocker words
+static_assert(kSubOccDim * kSubOccDim * kSubOccDim <= kSubOccWords * 32,
+              "sub-chunk block grid does not fit in kSubOccWords");
+
 // ---- the software page table (docs/PLAN_page_table.md) ---------------------
 // DERIVED DATA ONLY: the page table is a physical-layout index, not world
 // state. It is not hashed, not persisted, and not replicated. It is rebuilt
@@ -1321,7 +1354,11 @@ class World {
                             // bind groups (Dawn forbids indirect + bound-writable usage
                             // of one buffer in the same pass, even if statically unused)
   rhi::Buffer occupancy;   // kNumChunks u32: (rayBlockers << 16) | nonAirCount
-                            // (see the occupancy packing note in common.wgsl)
+                            // (see the occupancy packing note in common.wgsl),
+                            // FOLLOWED BY kNumChunks * kSubOccStride u32 of
+                            // sub-chunk bitmask (the kSubOccShift block above).
+                            // One buffer on purpose: the barriers and bind-group
+                            // entries for Occupancy already cover it.
   rhi::Buffer support;     // kNumChunks u32 — support-loss flags (sim_step writes,
                             // readback consumes + clears; drives island checks)
   rhi::Buffer hash;        // 4 u32 (only [0] used)

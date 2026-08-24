@@ -2243,6 +2243,18 @@ streaming; no sim kernel reads it and the hash does not cover it. The `total`
 count is deliberately untouched — a grass voxel IS present, and save/stream
 worthiness keys off that.
 
+The `occupancy` buffer additionally carries a **sub-chunk bitmask** in its tail,
+past the per-chunk count words: two u32 per chunk per class (TOTAL, BLOCKERS),
+one bit per 4-voxel block, written by the same three producers in the same
+sweeps (`world.h` `kSubOccShift`, `common.wgsl` SUB-CHUNK OCCUPANCY). It is one
+buffer rather than two so every `pass_table.def` `uses` row, barrier and
+bind-group entry for `Occupancy` already covers it. **The raymarcher's consumer
+is DEFAULT OFF** (`const SUBOCC_SKIP` in `raymarch.wgsl`): measured, it makes
+the frame slower, because the mean chord of a 4-voxel box is 2.7 voxels and a
+box-exit jump costs 3-4 DDA steps. Kept as a re-runnable refutation with the
+content number it turns on reported by `--measure` (MEASUREMENT 1d); the full
+argument is Correction 6 of `docs/PLAN_surface_flight_perf.md`.
+
 Worldgen does not place these yet (Wave 1a deliberately does not touch it); the
 `--shot` harness paints a demo meadow, and they are brush-selectable like any
 other material.

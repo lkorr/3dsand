@@ -47,6 +47,14 @@ std::string ShaderConstantPrelude() {
   o << "const NCHUNK_MASK : i32 = " << (kNChunk - 1) << ";\n";
   o << "const CELLOP_IF_AIR : u32 = 0x" << std::hex << kCellOpIfAir << std::dec
     << "u;\n";
+  // Sub-chunk occupancy bitmask (world.h kSubOccShift, PLAN_surface_flight_perf
+  // A2). Lives in the tail of the `occupancy` buffer, past the count words, so
+  // SUBOCC_BASE is a WORD offset and not a separate binding.
+  o << "const SUBOCC_SHIFT : u32 = " << kSubOccShift << "u;\n";
+  o << "const SUBOCC_DIM : u32 = " << kSubOccDim << "u;\n";
+  o << "const SUBOCC_WORDS : u32 = " << kSubOccWords << "u;\n";
+  o << "const SUBOCC_STRIDE : u32 = " << kSubOccStride << "u;\n";
+  o << "const SUBOCC_BASE : u32 = " << kNumChunks << "u;\n";
   // Software page table (docs/PLAN_page_table.md §2.2). One u32 per chunk SLOT:
   // bit 31 clear = a page index into the physical pool, bit 31 set = a sentinel
   // carrying a material id in bits 0..11. EMPTY is UNIFORM(air), so there is

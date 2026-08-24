@@ -330,6 +330,111 @@ visible: ~0.2 fps — cost scales with how much world the camera can *see*.
 > band-1 cave across the whole window, the `sleep` gate reports **0 / 32768 chunks
 > active**. Zero, in-window, observed.
 
+> **CORRECTION 6 (2026-08-24). A2 IS REFUTED, A4 IS REFUTED, A6 HAS NO HEADROOM, AND
+> THE RENDERER IS NOT 9-10 ms.** Part A is now finished, and it is finished by
+> measurement rather than by implementation. Every item in it has been either landed
+> small (A1, A5) or shown not to work (A2, A3, A4, A6).
+>
+> **THE LAW THAT KILLS A2, and the thing to inherit if nothing else.** The mean chord of
+> a ray through a convex box of side s is `4V/S = (2/3)s`. A box-exit jump costs a
+> `floor()`, three `tMax` rebuilds, a divergent branch — call it 3-4 DDA steps. **A skip
+> level only pays when `(2/3)s` comfortably exceeds that.** The CHUNK skip pays because
+> `(2/3)*16 = 10.7` voxels. The plan's proposed 4-voxel sub-block is `(2/3)*4 = 2.7`
+> voxels: **it jumps over less ray than the jump costs.** That is arithmetic about the
+> granularity, not a property of any implementation, and it is why 4³ was never going to
+> work. 8-voxel blocks (`kSubOccShift = 3`, the other supported setting) give 5.3 and are
+> still marginal, on strictly less volume.
+>
+> **Built anyway, and measured, because the law alone is not evidence.** Two u32 per
+> chunk per class, TWO classes (primary rays test the TOTAL mask, media-blind rays the
+> BLOCKER mask — one cannot serve both: skipping on blockers under a primary ray drops
+> gas, water and grass). Appended to the TAIL of the `occupancy` buffer rather than made
+> a new buffer, so every existing `pass_table.def` `uses` row, barrier and bind-group
+> entry covers it — the classic missing-`uses` desync is not reachable by construction.
+> Three producers, all writing it in a sweep they were already doing: `sim_occupancy`
+> (both entry points), `worldgen` `genChunk`, `Stream::FillSlots`. Interleaved arms, one
+> binary, quiet machine, offscreen 1080p:
+>
+> ```
+>                          elevated on   elevated off   ground on   ground off
+>  base                       5.64           4.96          6.22        6.18
+>  + sub-block JUMP           5.70           5.26          6.44        6.43
+>  + sub-block LOAD-ELIDE     5.63           5.26          6.40        6.43
+>  + per-chunk cache only     5.79           5.04          6.22        6.26
+> ```
+>
+> The **load-elision** form was tried precisely because it dodges the chord law: the mask
+> says "no cell of this ray's class here", so the ray skips the `voxWordAt` and takes an
+> ordinary DDA step — no jump, no divergence, benefit proportional to skipped VOLUME
+> rather than to chord length. **It loses too.** The per-cell TEST alone (~8 ALU on every
+> step of every ray) costs more than any skipping it enables. That is the real ceiling on
+> the whole idea and it does not care about granularity.
+>
+> **THE CEILING, measured, and it should have been measured first.** Capping the fine
+> primary march at 2 m instead of the shipped 24 m — i.e. deleting all the marching A2
+> could ever optimise — gives ground **6.22 -> 4.97** and elevated-off **5.00 -> 3.89**.
+> *The entire in-window fine primary march is ~1.26 ms of a 6.2 ms frame.* Anyone
+> proposing a new empty-space-skipping scheme should run that probe (one `min()` on
+> `tExit`) before writing a line of it.
+>
+> **THE CONTENT NUMBER, and how to re-derive it.** `--measure` now prints MEASUREMENT 1d.
+> Of the 2,636 partly-filled chunks — the only ones a ray must actually march, out of
+> 32,768 — **64.11% of 4-voxel blocks are occupied, and 26.7% of those chunks have every
+> block occupied.** So the mask can remove at most ~36% of that stepping. The Y-SLAB
+> variant (one `16x4x16` jump, the right shape for a heightfield, where the empty part of
+> a surface chunk is its top and not scattered blocks) covers only **17.88%** — half as
+> much volume, for a jump that is ~4x better per firing. Net expected saving ~0.09 ms
+> against a ~0.2 ms test cost, so it was not built.
+>
+> **FOUR THINGS THAT CONTRADICT THE FRAMING THIS SESSION WAS GIVEN.**
+>
+> 1. **The offscreen renderer is 5.6-6.3 ms, not 9-10.** The 9.02 ms figure in Correction
+>    2 no longer reproduces; the same gate on the same machine reads 5.6-5.7 shadows-on.
+>    Judge Part A against ~6 ms.
+> 2. **Shadow rays are NOT a large share of the cost.** Elevated: 5.64 on vs 4.96 off =
+>    **0.68 ms (12%)**. Ground, near-level horizon: 6.22 vs 6.18 = **0.04 ms (0.6%)**.
+>    The premise that "shadow rays are a large share and the honest lever on them is
+>    terminating the fine ray sooner" has no room to be true. A fine shadow ray really is
+>    cheap — A3's refutation explained why, and this is the same fact seen from the other
+>    side.
+> 3. **A4 is refuted.** Hoisting the `pageTable[]` load out of `voxWordAt` into a
+>    per-chunk register (`voxWordAtEntry`, so the `voxels[]` address no longer depends on
+>    it) measures ZERO: ground 6.22 cached vs 6.18-6.25 uncached. `pageTable` is 128 KiB
+>    and a ray re-reads the same entry for 16-48 steps, so it was always an L1 hit and the
+>    latency was always hidden. The plan called this "multiplies against A1-A3"; it
+>    multiplies against nothing.
+> 4. **A6 has no headroom on this instrument.** Forcing `microBudget = 0` — deleting the
+>    micro/strand march entirely, which is strictly more than hoisting its column probes
+>    could ever save — gives **5.65 / 4.92 / 6.18** against a base of 5.64 / 4.96 / 6.22.
+>    Indistinguishable. `TUNE_MICRO_MAX_PER_RAY = 8` and the `TUNE_MICRO_LOD_DIST` cutoff
+>    already bound it below measurability on these cameras. A6 was not implemented and
+>    should not be until a camera exists that can see it cost something.
+>
+> **A NEW INSTRUMENT, which is the durable half of this session.** The `screenshots` gate
+> timed only the ELEVATED camera (12 m up, looking down at the forest), where nearly every
+> ray terminates in a few metres. That is not the shape of the frame this plan is about.
+> It now also times the GROUND camera (eye height, near-level horizon, the pre-existing
+> `screenshot_ground.bmp` pose), shadows on and off:
+> `render 1080p ground shadows on/off`. Deliberately NOT folded into `bestFrameMs`, which
+> is a `min()` feeding the `perf` gate's `< 16 ms` assertion. Two traps it exposed:
+> **the first `shadows on` pass after ANY shader edit reads 530-590 ms** (pipeline
+> compile on first draw, not a measurement) — discard it and re-run; and the elevated arm
+> alone would have hidden every number above.
+>
+> **WHAT LANDED.** The mask, its three producers and its buffer tail are kept with the
+> consumer behind `const SUBOCC_SKIP : bool = false` in `raymarch.wgsl`, exactly the way
+> A3 is kept: flip one line and the experiment re-runs, `--measure` still reports the
+> content number that decides it, and Tint folds the constant so an off build pays
+> nothing. Also kept, all measured image-bit-identical on three cameras: the per-chunk
+> lookup cache + `voxWordAtEntry`, and one real latent bug — **the chunk-skip jump never
+> updated `axis`**, so a ray that skipped sky the whole way and then hit matter in the
+> very first cell after landing reported the WINDOW entry face as its normal. Rare at
+> 16-voxel boxes, which is why it survived; it would have been loud at 4.
+>
+> **Determinism `7cfa2420` throughout, in both residency modes.** Renderer changes are
+> outside the hashed domain, so the gate's real job here was to prove the three producers
+> did not touch sim state — and it did.
+
 **Diagnosis in one line:** the frame cost is dominated by the raymarcher, whose per-ray
 cost scales linearly with ray length through non-empty chunks and which has **no LOD
 anywhere inside the 512³ window**; streaming adds a second, smaller cost that is specific
@@ -471,12 +576,18 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
    cascade shadow has no early-out; the fine one does. Code kept default-off
    (`shadowMaxDist = 999`) as a re-runnable experiment. See Correction 2 and the
    comment on `sunShadowAt`.
-6. **A2 (if still needed after 4-5):** sub-chunk occupancy bitmask (4³ bits = 2 u32 per
-   chunk) so half-full canopy/meadow chunks skip internally. NB: the sim cell-mask
-   experiment reverted in ROADMAP_scale.md:139-186 was measured in a dispatch-floor
-   regime — that negative result does NOT transfer to the render path.
-7. **A6 (surface skim polish):** hoist/caches the per-cell column probes in
-   `traceMicro`/`traceStrands`.
+6. ~~**A2:** sub-chunk occupancy bitmask (4³ bits = 2 u32 per chunk) so half-full
+   canopy/meadow chunks skip internally.~~ **BUILT, MEASURED, REFUTED, DEFAULT-OFF**
+   (`const SUBOCC_SKIP` in `raymarch.wgsl`). A 4-voxel box has a mean chord of 2.7
+   voxels and the jump costs 3-4 DDA steps, so it skips less ray than it costs; the
+   jump-free load-elision form loses too, because the per-cell TEST outweighs the
+   saving. Ground frame 6.18-6.22 base vs 6.40-6.44 either way. And the whole fine
+   in-window primary march is only 1.26 ms of a 6.2 ms frame. See Correction 6. (The
+   reverted sim cell-mask in ROADMAP_scale.md:139-186 was indeed a different regime and
+   did not transfer — but the render path said no for its own, unrelated reason.)
+7. ~~**A6 (surface skim polish):** hoist/cache the per-cell column probes in
+   `traceMicro`/`traceStrands`.~~ **NO HEADROOM.** Deleting the micro march outright
+   (`microBudget = 0`) is indistinguishable from base on both cameras. Correction 6.
 
 ### Phase 2 — streaming (owns part of the low-altitude 5 fps)
 8. **B2:** ~~async-ify the shift-demote occupancy prefilter (one-shift-latent is fine).~~
@@ -550,8 +661,14 @@ altitude curve is gone. What is left in the surface frame is **render + CA**, no
 
 Ranked, for whoever picks this up:
 
-1. **Part A (renderer).** A2's sub-chunk occupancy bitmask and A6's column-probe hoist,
-   against a ~9-10 ms offscreen budget. This is now the largest term.
+1. ~~**Part A (renderer).** A2's sub-chunk occupancy bitmask and A6's column-probe
+   hoist, against a ~9-10 ms offscreen budget.~~ **PART A IS CLOSED — see Correction 6.**
+   The offscreen budget is ~6 ms, not 9-10; the entire in-window fine primary march is
+   1.26 ms of it; A2, A3, A4 are refuted and A6 is unmeasurable. **There is no renderer
+   item left in this plan worth doing.** A future renderer win has to come from
+   somewhere this plan never named — the far cascade, the lighting/AO pass, or the
+   water surface — and whoever goes looking should first run the 2 m `tExit` cap and
+   the `microBudget = 0` probe to find out what ISN'T the cost.
 2. **The fence's remaining half** — CPU/GPU serialisation, not the readback. Removing it
    recovers only the CPU work that cannot currently overlap on a shift frame, which the
    measurements above suggest is single-digit ms. The act-set staleness argument in

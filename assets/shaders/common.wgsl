@@ -1085,6 +1085,59 @@ fn packOccStain(total : u32, blockers : u32, anyStain : bool) -> u32 {
   return total | (blockers << 16u) | select(0u, 0x80000000u, anyStain);
 }
 
+// ---- SUB-CHUNK OCCUPANCY BITMASK (PLAN_surface_flight_perf.md A2) ----------
+// The chunk skip above is all-or-nothing at 1.6 m and keyed on a COUNT, so a
+// single grass voxel in 4,096 defeats it and the ray steps 16-48 voxels through
+// the chunk. A meadow is a slab of never-skippable chunks (micro is excluded
+// from `blockers` but not from `total`, and `total` is what primary rays test);
+// a canopy is a wall of half-full ones (foliage has no micro block at all, so
+// leaves are plain solid voxels). This mask lets both skip INTERNALLY.
+//
+// SUBOCC_DIM^3 blocks per chunk, each (1 << SUBOCC_SHIFT) voxels on a side, one
+// bit each: set = "this block holds at least one cell of this class". It lives
+// in the TAIL OF THE `occupancy` BUFFER, past the count words, and not in a
+// buffer of its own — see the world.h block for why (every Occupancy barrier,
+// pass_table `uses` row and bind-group entry already covers it).
+//
+// TWO CLASSES per chunk, in this order: TOTAL (any non-air cell, what a primary
+// ray needs) then BLOCKERS (isRayBlocker, what a media-blind shadow/reflection
+// ray needs). They are NOT interchangeable in one direction: skipping on the
+// blocker mask under a primary ray would drop gas, water and grass. The other
+// direction is merely pessimistic. Exactly the occTotal/occBlockers split one
+// level down, which is what keeps the chunk test and the block test from
+// disagreeing about the same meadow.
+//
+// The blocker mask is also EXACTLY what a media-blind ray treats as a hit, cell
+// by cell: gas and thin liquid fall through `if (wantMedia)`, micro falls
+// through its own branch, ice/glass are CLASS_SOLID and so ARE blockers. So
+// skipping a clear blocker block cannot change a shadow ray's answer.
+//
+// CONSERVATIVE DIRECTION: a set bit costs a march, a clear bit skips. Every
+// producer that cannot compute the exact mask must therefore write ONES, never
+// zeros — sentinels do, and JITTER page materialization deliberately leaves the
+// sentinel's all-ones mask in place.
+const SUBOCC_BLOCK : u32 = 1u << SUBOCC_SHIFT;    // voxels per block edge
+// cls: 0 = total, 1 = blockers. Word w of that class for this chunk SLOT.
+fn subOccIndex(slot : u32, cls : u32, w : u32) -> u32 {
+  return SUBOCC_BASE + slot * SUBOCC_STRIDE + cls * SUBOCC_WORDS + w;
+}
+// Block bit for a chunk-local cell (0..CHUNK-1 per axis).
+fn subOccBitLocal(lo : vec3<u32>) -> u32 {
+  let b = lo >> vec3<u32>(SUBOCC_SHIFT);
+  return (b.z * SUBOCC_DIM + b.y) * SUBOCC_DIM + b.x;
+}
+// Same, from the chunk-linear index the producers already iterate:
+// i = (lz * CHUNK + ly) * CHUNK + lx.
+fn subOccBitOfLocalIdx(i : u32) -> u32 {
+  return subOccBitLocal(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK,
+                                  i / (CHUNK * CHUNK)));
+}
+// "Every block occupied" — the conservative fill, and what a non-air sentinel
+// reports. SUBOCC_DIM^3 may be under 32 (shift 3 uses 8 of 64 bits); the extra
+// ones are never tested, so setting them costs nothing and keeps the constant
+// free of a per-word special case.
+fn subOccAllOnes() -> u32 { return 0xFFFFFFFFu; }
+
 // Voxel word: bits 0..11 material, 12..15 state, 16..18 tick-stamp,
 //             19..23 FREE, 24..27 stain amount, 28..30 stain type,
 //             31 CELLOP_IF_AIR (transient, never stored).
@@ -1275,6 +1328,23 @@ fn voxWordAt(c : vec3<i32>) -> u32 {
   let e = pageTable[chunkIndexOf(s)];
   if ((e & PT_SENTINEL_BIT) != 0u) { return synthWordAt(e, c, ptSeed()); }
   let lo = s % CHUNK;
+  return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
+}
+
+// voxWordAt for a caller that ALREADY HAS the chunk's table entry. The
+// raymarcher's DDA is such a caller: it reads pageTable[] once per chunk for
+// the sentinel test and then walks 16-48 cells of that same chunk, so the
+// generic accessor above re-issues an identical, already-cached load on every
+// step — and worse, makes the `voxels[]` address DEPEND on it, serialising two
+// round trips per cell (PLAN_surface_flight_perf.md A4). Hoisting the entry
+// turns that into one independent load.
+//
+// `e` MUST be pageTable[chunkIndexOf(c & WORLD_MASK)] for this exact c, which
+// is why this takes the entry rather than a chunk index: a caller that cannot
+// say which chunk the entry came from should use voxWordAt.
+fn voxWordAtEntry(e : u32, c : vec3<i32>) -> u32 {
+  if ((e & PT_SENTINEL_BIT) != 0u) { return synthWordAt(e, c, ptSeed()); }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
 }
 

@@ -265,6 +265,37 @@ grab("screenshot.bmp");
   gCam.yaw = 0.785f;
   gCam.pitch = -0.02f;
   Vec3 gEye{108, (float)(World::TerrainHeight(108, 108, kDefaultSeed) + 28), 108};
+  // ---- the GRAZING arm of the render benchmark ----------------------------
+  // The elevated pass above looks DOWN at the forest from 12 m, so nearly every
+  // ray terminates within a few metres and the whole 1080p frame is ~5 ms with
+  // shadows costing ~0.5 ms of it. That is not the shape of the frame the
+  // surface-flight work is about: a near-level eye ray runs tens of metres
+  // through meadow and canopy, and its shadow ray then runs back through the
+  // same canopy toward the sun. It is the case chunk-skipping is worst at, so
+  // it is the case any empty-space-skipping change has to be judged on.
+  //
+  // Deliberately NOT folded into bestFrameMs: that is a MIN across passes and
+  // feeds the `perf` gate's < 16 ms assertion, so adding a slower arm to it
+  // would change nothing except to make the assertion read as if it covered
+  // this view. It does not; this arm is reported and not asserted.
+  for (int pass = 0; pass < 2; pass++) {
+    bool gShadows = pass == 0;
+    ctx.WaitIdle();
+    double g0 = NowSeconds();
+    for (int i = 0; i < 60; i++) {
+      WriteRenderParams(ctx.queue, world, gEye, gCam, (float)W / H, gShadows, 0);
+      rhi::CommandEncoder genc = ctx.device.CreateCommandEncoder();
+      rhi::RenderPass grp =
+          sim.BeginRenderPass(genc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(grp);
+      grp.End();
+      ctx.queue.Submit(genc.Finish());
+    }
+    ctx.WaitIdle();
+    double gms = (NowSeconds() - g0) * 1000.0 / 60.0;
+    std::printf("render 1080p ground %s: %.2f ms/frame (%.0f fps)\n",
+                gShadows ? "shadows on " : "shadows off", gms, 1000.0 / gms);
+  }
   WriteRenderParams(ctx.queue, world, gEye, gCam, (float)W / H, true, 0);
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   rhi::RenderPass rp =

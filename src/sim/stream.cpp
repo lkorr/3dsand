@@ -609,7 +609,17 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // paying the neighbour test here without the occupancy buffer in hand.
       if (entry != kPtEmpty) world_->pages->RefilledSlot(s);
       uint32_t occ = 0, blockers = 0, anyStain = 0;
-      for (uint32_t w : data) {
+      // Sub-chunk occupancy bitmask, built in the SAME sweep (world.h
+      // kSubOccShift; layout per common.wgsl subOccIndex): [0..1] TOTAL,
+      // [2..3] BLOCKERS. This is the third producer of the mask and it must
+      // agree with sim_occupancy and genChunk exactly — a bit this path leaves
+      // clear over matter is a chunk the raymarcher skips through.
+      uint32_t sub[kSubOccStride] = {};
+      // Indexed rather than range-for because the sub-chunk bit is a function
+      // of the CHUNK-LINEAR INDEX, which the `continue` below would desync from
+      // a counter incremented at the bottom of the loop.
+      for (uint32_t li = 0; li < kChunkVol; li++) {
+        const uint32_t w = data[li];
         // OUTSIDE the air test, like sim_occupancy: a restored chunk can be
         // entirely air and still carry stain, and that chunk must NOT be
         // demotable. This path decodes REAL SAVED WORLDS, so unlike worldgen
@@ -620,12 +630,27 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         uint32_t m = w & 0xFFFu;
         if (m == 0) continue;
         occ++;
-        if (m < blockerOf_.size() && blockerOf_[m]) blockers++;
+        // Mirror of common.wgsl subOccBitLocal: (bz * DIM + by) * DIM + bx over
+        // the chunk-linear layout (lz * CHUNK + ly) * CHUNK + lx.
+        const uint32_t bx = (li % kChunk) >> kSubOccShift;
+        const uint32_t by = ((li / kChunk) % kChunk) >> kSubOccShift;
+        const uint32_t bz = (li / (kChunk * kChunk)) >> kSubOccShift;
+        const uint32_t sbit = (bz * kSubOccDim + by) * kSubOccDim + bx;
+        const uint32_t sm = 1u << (sbit & 31u);
+        sub[sbit >> 5] |= sm;
+        if (m < blockerOf_.size() && blockerOf_[m]) {
+          blockers++;
+          sub[kSubOccWords + (sbit >> 5)] |= sm;
+        }
       }
       // packing per common.wgsl packOccStain
       occ |= blockers << 16;
       occ |= anyStain << 31;
       ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
+      // ...and the sub-chunk mask in the tail of the same buffer (world.h).
+      ctx_->queue.WriteBuffer(world_->occupancy,
+                              ((uint64_t)kNumChunks + (uint64_t)s * kSubOccStride) * 4,
+                              sub, sizeof(sub));
       // wake once: neighbors may have changed since this chunk was saved
       ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
       ctx_->queue.WriteBuffer(world_->dirty[1], (uint64_t)s * 4, &one, 4);

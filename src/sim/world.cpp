@@ -15,7 +15,12 @@ constexpr uint64_t kMirrorBytes = 27 * kChunkBytes;             // 432 KB
 constexpr uint64_t kDirtyOff = kMirrorBytes;
 constexpr uint64_t kDirtyBytes = kNumChunks * 4;
 constexpr uint64_t kOccOff = kDirtyOff + kDirtyBytes;
+// The COUNT half of the occupancy buffer — the only half the snapshot ring
+// carries. The sub-chunk bitmask that follows it on the GPU is render-only and
+// no CPU reader wants it, so the staging slot stays exactly the size it was.
 constexpr uint64_t kOccBytes = kNumChunks * 4;
+// Render-only tail of the same GPU buffer; never staged, never read back.
+constexpr uint64_t kSubOccBytes = (uint64_t)kNumChunks * kSubOccStride * 4;
 constexpr uint64_t kHashOff = kOccOff + kOccBytes;
 constexpr uint64_t kPickOff = kHashOff + 256;
 constexpr uint64_t kPCountOff = kPickOff + 256;
@@ -62,7 +67,15 @@ void World::Init(const rhi::Device& device) {
   dirtyList = CreateBuffer(device, kNumChunks * 4, U::Storage, "dirtyList");
   argsStage = CreateBuffer(device, 12, U::Storage | U::CopySrc | U::CopyDst, "argsStage");
   dispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "dispatchArgs");
-  occupancy = CreateBuffer(device, kOccBytes, U::Storage | U::CopySrc | U::CopyDst, "occupancy");
+  // Counts first, then the sub-chunk bitmask (world.h kSubOccShift). One
+  // buffer so every existing Occupancy barrier and bind-group entry covers the
+  // mask too. Uninitialised content is not a hazard the way it would be for a
+  // standalone buffer: every producer of the counts is also a producer of the
+  // mask, and the first thing that ever runs over all kNumChunks slots is
+  // worldgen `main` (or lr_occupancyFull on a load) — the same pass the counts
+  // already depend on for not being garbage.
+  occupancy = CreateBuffer(device, kOccBytes + kSubOccBytes,
+                           U::Storage | U::CopySrc | U::CopyDst, "occupancy");
   support = CreateBuffer(device, kSupportBytes, U::Storage | U::CopySrc | U::CopyDst,
                          "supportFlags");
   hash = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst, "worldHash");

@@ -2837,12 +2837,31 @@ var<workgroup> wgBlock : atomic<u32>;
 // rather than a reuse of wgCount because occupancy needs the total and the
 // wake needs this one, and they are different questions about the same sweep.
 var<workgroup> wgAct : atomic<u32>;
+// Sub-chunk occupancy bitmask (common.wgsl SUB-CHUNK OCCUPANCY block):
+// [0..1] TOTAL class, [2..3] BLOCKER class. genChunk is a full producer of it
+// and not merely of the counts — a conservative all-ones fill here would be
+// safe but would give up the whole point, because a generated canopy or meadow
+// chunk is inert (matCanAct false), never woken, and so never revisited by
+// sim_occupancy's dirty pass. Streamed-in terrain would keep its pessimistic
+// mask for as long as the player stayed near it.
+var<workgroup> wgSub : array<atomic<u32>, 4>;
+
+fn storeSubOcc(slot : u32, t0 : u32, t1 : u32, b0 : u32, b1 : u32) {
+  occupancy[subOccIndex(slot, 0u, 0u)] = t0;
+  occupancy[subOccIndex(slot, 0u, 1u)] = t1;
+  occupancy[subOccIndex(slot, 1u, 0u)] = b0;
+  occupancy[subOccIndex(slot, 1u, 1u)] = b1;
+}
 
 fn genChunk(slot : u32, li : u32) {
   if (li == 0u) {
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgAct, 0u);
+    atomicStore(&wgSub[0], 0u);
+    atomicStore(&wgSub[1], 0u);
+    atomicStore(&wgSub[2], 0u);
+    atomicStore(&wgSub[3], 0u);
   }
   workgroupBarrier();
 
@@ -2852,6 +2871,8 @@ fn genChunk(slot : u32, li : u32) {
   var count = 0u;
   var block = 0u;
   var act = 0u;
+  var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
+  var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
   // COLUMN-MAJOR, and that is the whole point of the genColumn/genCellIn
   // split: the column half is evaluated ONCE per (x, z) and shared by the 16
   // cells stacked on it, instead of being recomputed by every one of them.
@@ -2878,7 +2899,15 @@ fn genChunk(slot : u32, li : u32) {
       if (m != MAT_AIR) {
         count += 1u;
         let md = materials[m];
-        if (isRayBlocker(md)) { block += 1u; }
+        // The sub-chunk bit for this cell keys on the SAME chunk-linear index
+        // the store above used, so a change to either layout moves both.
+        let sbit = subOccBitOfLocalIdx(i);
+        let sm = 1u << (sbit & 31u);
+        if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
+        if (isRayBlocker(md)) {
+          block += 1u;
+          if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
+        }
         if (matCanAct(md)) { act += 1u; }
       }
     }
@@ -2886,6 +2915,10 @@ fn genChunk(slot : u32, li : u32) {
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
   atomicAdd(&wgAct, act);
+  atomicOr(&wgSub[0], sm0);
+  atomicOr(&wgSub[1], sm1);
+  atomicOr(&wgSub[2], sb0);
+  atomicOr(&wgSub[3], sb1);
   workgroupBarrier();
 
   if (li == 0u) {
@@ -2898,6 +2931,8 @@ fn genChunk(slot : u32, li : u32) {
     // path relies on exactly that — a generated sky chunk has to be demotable
     // on sight, without a readback.
     occupancy[slot] = packOcc(n, atomicLoad(&wgBlock));
+    storeSubOcc(slot, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
+                atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     // ---- THE STREAMING WAKE (CLAUDE.md rule 2) -------------------------
     //
     // Wake once so loose material settles and then sleeps. The question is

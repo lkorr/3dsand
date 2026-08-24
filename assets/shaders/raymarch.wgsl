@@ -1189,6 +1189,8 @@ fn microNormalToWorld(n : vec3f, flags : u32, h : u32) -> vec3f {
   return n;
 }
 
+const SUBOCC_SKIP : bool = false;
+
 fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   var out : Hit;
   out.hit = false;
@@ -1319,14 +1321,62 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // a smoke optimization and must not cut a ray short inside clear water.
   var gasTau = 0.0;
 
+  // ---- PER-CHUNK LOOKUP CACHE ----
+  // The loop needs four chunk-scope words (occupancy count, page-table entry,
+  // two sub-chunk mask words) and every one of them is invariant for as long as
+  // the ray stays inside a chunk — which is 16-48 steps in exactly the content
+  // this function is slow on. Fetching them once per CHUNK instead of once per
+  // CELL removes a load per step and, with voxWordAtEntry below, removes the
+  // DEPENDENCY between the page-table load and the voxel load (plan item A4).
+  //
+  // MEASURED AT ZERO. Offscreen 1080p, ground camera: 6.22 ms cached against
+  // 6.18-6.25 uncached; elevated 5.04-5.08 against 4.96-5.44. So A4's "the
+  // page table made every step more expensive" is not true on this hardware —
+  // pageTable[] is 128 KiB and the ray re-reads the same entry, so it was
+  // already an L1 hit and the latency was already hidden. Kept because it is
+  // strictly less work and it is what the mask below needs, not because it
+  // bought anything.
+  //
+  // Safe because the buffers are read-only for the whole draw, and a ray cannot
+  // revisit a slot index it has left: chunkIndexW aliases world cells WORLD_N
+  // apart, but inBounds() breaks the loop at the window face long before a ray
+  // could wrap onto its own slots.
+  //
+  // 0xFFFFFFFF is not a valid chunk index (they are < NUM_CHUNKS), so the first
+  // iteration always misses and no separate priming step is needed.
+  var cchIdx = 0xFFFFFFFFu;
+  var cchOcc = 0u;
+  var cchPt = 0u;
+  var cchMask0 = 0u;
+  var cchMask1 = 0u;
+  // Which sub-chunk class this ray reads, decided once: media-aware primary
+  // rays need TOTAL, media-blind shadow/reflection rays need BLOCKERS. Same
+  // split as occTotal/occBlockers below, one level down.
+  let subClass = select(1u, 0u, wantMedia);
+  // With SUBOCC_SKIP false the two loads below are dead and Tint removes them,
+  // so an off build pays nothing for the experiment being kept.
+  let subLoad = SUBOCC_SKIP;
+
   for (var i = 0; i < 4096; i++) {
     if (i >= maxSteps) { break; }
     if (!inBounds(cell)) { break; }
 
+    let chIdx = chunkIndexW(cell);
+    if (chIdx != cchIdx) {
+      cchIdx = chIdx;
+      cchOcc = occupancy[chIdx];
+      cchPt = pageEntryOf(chIdx);
+      if (subLoad) {
+        let mbase = subOccIndex(chIdx, subClass, 0u);
+        cchMask0 = occupancy[mbase];
+        cchMask1 = occupancy[mbase + 1u];
+      }
+    }
+
     // Chunk skip. Media-blind rays (shadows) skip on the BLOCKER count, so a
     // chunk holding only smoke/steam is as cheap as air; media-aware rays
     // need the per-cell march whenever anything at all is present.
-    let occ = chunkOcc(cell);
+    let occ = cchOcc;
     let occN = select(occBlockers(occ), occTotal(occ), wantMedia);
 
     // ---- SENTINEL-AWARE CHUNK RESOLUTION (PLAN_surface_flight_perf.md A5) ----
@@ -1356,7 +1406,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     // ray) still falls through to the per-cell march, because those cells
     // contribute to the pixel and skipping them would drop the media, the
     // Beer-Lambert path or the grass model itself.
-    let ptEntry = pageEntryOf(chunkIndexW(cell));
+    let ptEntry = cchPt;
     var chunkSkip = (occN == 0u);
     if ((ptEntry & PT_SENTINEL_BIT) != 0u) {
       let sMat = ptEntry & PT_MAT_MASK;
@@ -1389,16 +1439,78 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       }
     }
 
-    if (chunkSkip) {
-      // empty chunk: jump straight to its exit face
-      let ch = worldChunkOf(cell);
-      let lo = vec3f(ch * i32(CHUNK));
-      let hi = lo + f32(CHUNK);
+    // ---- SUB-CHUNK BLOCK SKIP (PLAN_surface_flight_perf.md A2) ----
+    // IMPLEMENTED, MEASURED, DEFAULT OFF — the premise does not survive its
+    // own arithmetic. Kept in the same shape A3's refutation is kept: flip
+    // SUBOCC_SKIP and the experiment re-runs, and `--measure` (MEASUREMENT 1d)
+    // still reports the content number that decides it.
+    //
+    // THE LAW, which is the part worth inheriting: the mean chord of a ray
+    // through a box of side s is 4V/S = (2/3)s. A box-exit jump costs a floor(),
+    // three tMax rebuilds and a divergent branch — call it 3-4 DDA steps. So a
+    // skip level only pays when (2/3)s comfortably exceeds that. The CHUNK skip
+    // pays because (2/3)*16 = 10.7 voxels. A 4-voxel block is (2/3)*4 = 2.7
+    // voxels: it jumps over LESS ray than the jump itself costs. That is a
+    // property of the granularity, not of this implementation, and no amount of
+    // tuning the producer changes it.
+    //
+    // MEASURED, offscreen 1080p, interleaved arms on one binary:
+    //   ground cam   base 6.18-6.22   jump 6.43-6.44   load-elide 6.39-6.43
+    //   elevated off base 4.96-5.00   jump 5.26        load-elide 5.26
+    // The load-elision form (mask says air -> skip voxWordAt, keep the DDA
+    // step, no jump at all, so no divergence) was tried precisely because it
+    // has no chord threshold. It loses too: the per-cell TEST alone costs more
+    // than it saves.
+    //
+    // AND THE CEILING SAYS IT COULD NEVER HAVE BEEN MUCH. Capping the fine
+    // primary march at 2 m instead of the shipped 24 m — i.e. deleting all the
+    // marching this could ever optimise — takes the ground frame 6.22 -> 4.97
+    // and the elevated 5.00 -> 3.89. The whole in-window fine march is ~1.26 ms
+    // of a 6.2 ms frame, and `--measure` says only 35.9% of the volume of the
+    // 2,636 chunks a ray must actually march is empty at this granularity
+    // (26.7% of them have every block occupied). The y-slab variant — one
+    // 16x4x16 jump, the right shape for a heightfield — covers only 17.88%.
+    // The chunk test above is all-or-nothing at 1.6 m and keyed on a COUNT, so
+    // one grass voxel in 4,096 forces the ray to march every cell of the chunk.
+    // The mask (common.wgsl SUB-CHUNK OCCUPANCY) answers the same question for
+    // a (1 << SUBOCC_SHIFT)-voxel block, in the class this ray actually cares
+    // about, and a clear bit means "no cell of that class in this block" —
+    // EXACTLY the premise the chunk skip already runs on, so the jump below is
+    // the chunk jump with a smaller box and needs no new argument about
+    // correctness.
+    //
+    // The blocker class is not an approximation for a media-blind ray: gas and
+    // thin liquid fall through `if (wantMedia)`, micro falls through its own
+    // branch, ice/glass are CLASS_SOLID and so ARE blockers. Every cell a clear
+    // blocker block can contain is a cell that ray would have stepped past.
+    //
+    // Sentinels never reach here: the branch above either returned a hit, set
+    // chunkSkip, or left a chunk whose mask is conservatively all-ones.
+    // Everything on the MARCHING path costs every step of every ray in the
+    // frame, so the test is the whole of it: an AND with a chunk-local mask,
+    // two shifts and a bit test against a value already in a register. The
+    // block corner is derived only in the branch that jumps.
+    var subSkip = false;
+    if (SUBOCC_SKIP && !chunkSkip) {
+      let sbit = subOccBitLocal(vec3<u32>(cell & vec3<i32>(CHUNK_MASK)));
+      let mw = select(cchMask1, cchMask0, sbit < 32u);
+      subSkip = (mw & (1u << (sbit & 31u))) == 0u;
+    }
+
+    if (chunkSkip || subSkip) {
+      // empty box (whole chunk, or one sub-chunk block): jump to its exit face.
+      // Masking off the low bits is floor-to-box-corner for negative world
+      // coords too, and is cheaper than the shift-and-multiply worldChunkOf
+      // pair it replaces.
+      let blkSize = select(i32(CHUNK), i32(SUBOCC_BLOCK), subSkip);
+      let blkLo = cell & vec3<i32>(~(blkSize - 1));
+      let lo = vec3f(blkLo);
+      let hi = lo + f32(blkSize);
       let e0 = (lo - ro) * inv;
       let e1 = (hi - ro) * inv;
       let ex = max(e0, e1);
       // The jump target must never sit behind the ray: a cell floor()ed onto a
-      // shared face belongs to a chunk the ray is already exiting, so the raw
+      // shared face belongs to a box the ray is already exiting, so the raw
       // exit t can be <= tCur and the march would stall in place.
       let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
       t = tOut + 1e-4;
@@ -1406,14 +1518,28 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       p = ro + rd * t;
       var nc = vec3<i32>(floor(p));
       // Force the crossing on the exit axis: float noise at a shared face can
-      // floor() back into the chunk just exited, which reads as a see-through
-      // seam along chunk boundaries.
+      // floor() back into the box just exited, which reads as a see-through
+      // seam along box boundaries.
+      //
+      // `axis` IS updated here, and it was not before A2 — a latent wart the
+      // sub-chunk skip would have made loud. The DDA carries `axis` as "which
+      // face did the ray enter the current cell through", and a jump that left
+      // it alone reported the last DDA step's face (often the WINDOW entry face,
+      // for a ray that skipped sky the whole way) as the normal of whatever it
+      // hit in the very first cell after landing. Rare when boxes are 16 voxels
+      // and a chunk usually has air above its terrain; common when boxes are 4
+      // and the ray lands right on the surface. The box exit face is exactly the
+      // face the new cell is entered through, so this is the same answer the DDA
+      // would have produced had it stepped there one cell at a time.
       if (ex.x <= ex.y && ex.x <= ex.z) {
-        nc.x = select(ch.x * i32(CHUNK) - 1, (ch.x + 1) * i32(CHUNK), rd.x > 0.0);
+        nc.x = select(blkLo.x - 1, blkLo.x + blkSize, rd.x > 0.0);
+        axis = 0;
       } else if (ex.y <= ex.z) {
-        nc.y = select(ch.y * i32(CHUNK) - 1, (ch.y + 1) * i32(CHUNK), rd.y > 0.0);
+        nc.y = select(blkLo.y - 1, blkLo.y + blkSize, rd.y > 0.0);
+        axis = 1;
       } else {
-        nc.z = select(ch.z * i32(CHUNK) - 1, (ch.z + 1) * i32(CHUNK), rd.z > 0.0);
+        nc.z = select(blkLo.z - 1, blkLo.z + blkSize, rd.z > 0.0);
+        axis = 2;
       }
       if (!inBounds(nc)) { break; }
       cell = nc;
@@ -1425,7 +1551,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       continue;
     }
 
-    let w = voxWordAt(cell);
+    // The chunk's table entry is already in a register (see the per-chunk
+    // lookup cache), so this is one INDEPENDENT load instead of voxWordAt's
+    // dependent pair.
+    let w = voxWordAtEntry(cchPt, cell);
     let mat = voxMat(w);
     var weight = 0.0;   // this cell's media contribution per unit length
     var cellOp = 0.0;   // this cell's opacity (per-cell, not first-material)

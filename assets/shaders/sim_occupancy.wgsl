@@ -32,6 +32,24 @@ var<workgroup> wgHash  : atomic<u32>;
 // chunks as clean and silently drop the stain — the failure this bit exists to
 // prevent.
 var<workgroup> wgStain : atomic<u32>;
+// Sub-chunk occupancy bitmask (common.wgsl SUB-CHUNK OCCUPANCY block):
+// [0..1] = TOTAL class, [2..3] = BLOCKER class, laid out exactly as
+// subOccIndex expects so the store at the end is a straight copy.
+//
+// Accumulated per-thread in REGISTERS and OR-ed in once, not per cell: a naive
+// atomicOr per non-air voxel would be up to 4,096 workgroup atomics per chunk
+// on a loop whose whole job is to be cheap. Four atomics per thread instead.
+var<workgroup> wgSub : array<atomic<u32>, 4>;
+
+// The mask store, so the three exits below (EMPTY sentinel, uniform sentinel,
+// resident) cannot drift apart on the layout. SUBOCC_WORDS is 2, and this is
+// the one place that assumes it.
+fn storeSubOcc(slot : u32, t0 : u32, t1 : u32, b0 : u32, b1 : u32) {
+  occupancy[subOccIndex(slot, 0u, 0u)] = t0;
+  occupancy[subOccIndex(slot, 0u, 1u)] = t1;
+  occupancy[subOccIndex(slot, 1u, 0u)] = b0;
+  occupancy[subOccIndex(slot, 1u, 1u)] = b1;
+}
 
 // mainDirty: occupancy update over only the chunks written this tick
 // (indirect over the compacted dirtyOut list) — the per-tick sim cost stays
@@ -44,6 +62,10 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgStain, 0u);
+    atomicStore(&wgSub[0], 0u);
+    atomicStore(&wgSub[1], 0u);
+    atomicStore(&wgSub[2], 0u);
+    atomicStore(&wgSub[3], 0u);
   }
   workgroupBarrier();
 
@@ -72,6 +94,8 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
   var count = 0u;
   var block = 0u;
   var stain = 0u;
+  var sm0 = 0u; var sm1 = 0u;   // TOTAL class, bits 0..31 / 32..63
+  var sb0 = 0u; var sb1 = 0u;   // BLOCKER class
   if (!sentinel) {
     for (var i = li; i < CHUNK_VOL; i += 64u) {
       let w = voxels[base + i];
@@ -81,13 +105,25 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
       let m = w & 0xFFFu;
       if (m != MAT_AIR) {
         count += 1u;
-        if (isRayBlocker(materials[m])) { block += 1u; }
+        // Sub-chunk bit for this cell. Costs one shift-and-or on a path that
+        // has already paid for the load and the material fetch.
+        let sbit = subOccBitOfLocalIdx(i);
+        let sm = 1u << (sbit & 31u);
+        if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
+        if (isRayBlocker(materials[m])) {
+          block += 1u;
+          if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
+        }
       }
     }
   }
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
   atomicMax(&wgStain, stain);
+  atomicOr(&wgSub[0], sm0);
+  atomicOr(&wgSub[1], sm1);
+  atomicOr(&wgSub[2], sb0);
+  atomicOr(&wgSub[3], sb1);
   workgroupBarrier();
 
   if (li == 0u) {
@@ -106,13 +142,19 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
       let m = synthWord(e) & 0xFFFu;
       if (m == MAT_AIR) {
         occupancy[slot] = packOcc(0u, 0u);
+        storeSubOcc(slot, 0u, 0u, 0u, 0u);
       } else {
-        occupancy[slot] = packOcc(CHUNK_VOL,
-            select(0u, CHUNK_VOL, isRayBlocker(materials[m])));
+        let isB = isRayBlocker(materials[m]);
+        occupancy[slot] = packOcc(CHUNK_VOL, select(0u, CHUNK_VOL, isB));
+        // Uniform matter: every block of every class it belongs to is full.
+        let bo = select(0u, subOccAllOnes(), isB);
+        storeSubOcc(slot, subOccAllOnes(), subOccAllOnes(), bo, bo);
       }
     } else {
       occupancy[slot] = packOccStain(atomicLoad(&wgCount), atomicLoad(&wgBlock),
                                      atomicLoad(&wgStain) != 0u);
+      storeSubOcc(slot, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
+                  atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     }
   }
 }
@@ -125,6 +167,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgHash, 0u);
+    atomicStore(&wgSub[0], 0u);
+    atomicStore(&wgSub[1], 0u);
+    atomicStore(&wgSub[2], 0u);
+    atomicStore(&wgSub[3], 0u);
   }
   workgroupBarrier();
 
@@ -139,7 +185,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       // EXACT, and with no arithmetic at all: the dense loop's
       // `if (m != MAT_AIR)` guard means an all-air chunk contributes 0 to
       // count, blockers AND hash. The analytic path for EMPTY is: skip.
-      if (li == 0u) { occupancy[wg.x] = packOcc(0u, 0u); }
+      if (li == 0u) {
+        occupancy[wg.x] = packOcc(0u, 0u);
+        storeSubOcc(wg.x, 0u, 0u, 0u, 0u);
+      }
       return;
     }
     // UNIFORM: the same 4096 hash evaluations the dense path does, but the
@@ -170,8 +219,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     if (T.hashEnable != 0u) { atomicAdd(&wgHash, sh); }
     workgroupBarrier();
     if (li == 0u) {
-      occupancy[wg.x] = packOcc(CHUNK_VOL,
-          select(0u, CHUNK_VOL, isRayBlocker(materials[smat])));
+      let sIsB = isRayBlocker(materials[smat]);
+      occupancy[wg.x] = packOcc(CHUNK_VOL, select(0u, CHUNK_VOL, sIsB));
+      let sbo = select(0u, subOccAllOnes(), sIsB);
+      storeSubOcc(wg.x, subOccAllOnes(), subOccAllOnes(), sbo, sbo);
       if (T.hashEnable != 0u) {
         atomicAdd(&worldHash[0], atomicLoad(&wgHash));
       }
@@ -190,6 +241,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   var block = 0u;
   var stain = 0u;
   var h = 0u;
+  var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
+  var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     // What counts as "state identity" for the determinism hash: material +
     // state nibble (bits 0..15) and the STAIN layer (bits 24..30).
@@ -212,7 +265,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     let m = v & 0xFFFu;
     if (m != MAT_AIR) {
       count += 1u;
-      if (isRayBlocker(materials[m])) { block += 1u; }
+      let sbit = subOccBitOfLocalIdx(i);
+      let sm = 1u << (sbit & 31u);
+      if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
+      if (isRayBlocker(materials[m])) {
+        block += 1u;
+        if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
+      }
       if (T.hashEnable != 0u) {
         h += pcg((hashBase + i) ^ (v * 0x9E3779B9u));
       }
@@ -221,12 +280,18 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
   atomicMax(&wgStain, stain);
+  atomicOr(&wgSub[0], sm0);
+  atomicOr(&wgSub[1], sm1);
+  atomicOr(&wgSub[2], sb0);
+  atomicOr(&wgSub[3], sb1);
   if (T.hashEnable != 0u) { atomicAdd(&wgHash, h); }
   workgroupBarrier();
 
   if (li == 0u) {
     occupancy[wg.x] = packOccStain(atomicLoad(&wgCount), atomicLoad(&wgBlock),
                                    atomicLoad(&wgStain) != 0u);
+    storeSubOcc(wg.x, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
+                atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     if (T.hashEnable != 0u) {
       atomicAdd(&worldHash[0], atomicLoad(&wgHash));
     }

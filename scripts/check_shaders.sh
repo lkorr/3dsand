@@ -72,6 +72,18 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
 
+# Sub-chunk occupancy bitmask (world.h kSubOccShift block). kSubOccDim and
+# kSubOccStride are expressions there, so scrape the two literals and redo the
+# arithmetic the same way world.h does.
+W_SUBSHIFT="$(cpp_const kSubOccShift)"
+W_SUBWORDS="$(cpp_const kSubOccWords)"
+if [ -z "$W_SUBSHIFT" ] || [ -z "$W_SUBWORDS" ]; then
+  echo "check_shaders: cannot parse kSubOccShift/kSubOccWords from $WORLD_H" >&2
+  exit 1
+fi
+W_SUBDIM=$((W_CHUNK >> W_SUBSHIFT))
+W_SUBSTRIDE=$((W_SUBWORDS * 2))
+
 # Fluid-lab flat-slab height (world.h kLabSlabY -> prelude LAB_SLAB_Y).
 W_LABY="$(cpp_const kLabSlabY)"
 [ -n "$W_LABY" ] || {
@@ -158,6 +170,11 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_MASK : i32 = $((W_N - 1));" \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
+  "const SUBOCC_SHIFT : u32 = ${W_SUBSHIFT}u;" \
+  "const SUBOCC_DIM : u32 = ${W_SUBDIM}u;" \
+  "const SUBOCC_WORDS : u32 = ${W_SUBWORDS}u;" \
+  "const SUBOCC_STRIDE : u32 = ${W_SUBSTRIDE}u;" \
+  "const SUBOCC_BASE : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
   "const LAB_SLAB_Y : i32 = ${W_LABY};" \
   "const PT_SENTINEL_BIT : u32 = ${W_PTSENT}u;" \
   "const PT_JITTER_BIT : u32 = ${W_PTJIT}u;" \
