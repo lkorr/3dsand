@@ -13,6 +13,12 @@ struct UIState {
   float fps = 0;
   float frameMs = 0;         // window average
   float frameMsWorst = 0;    // worst frame in the window (hitch visibility)
+  // Tail percentiles over a LONGER window than the average/worst (512 frames,
+  // ~5-11 s). `worst` is a single sample and moves on any one-off hiccup;
+  // these say whether a stutter is systematic. See the sampling comment in
+  // main.cpp for why the window cannot be the same 0.5 s the others use.
+  float frameMsP95 = 0;
+  float frameMsP99 = 0;
   float tickCpuMs = 0;       // CPU encode+submit per tick
   uint32_t tick = 0;
   uint32_t activeChunks = 0;
@@ -87,18 +93,69 @@ struct UIState {
   // clearFluid is a one-shot request consumed inside the tick loop.
   uint32_t fluidCount = 0;
   bool clearFluid = false;
-  // Live tuning copies — main.cpp seeds these from CurrentTuning().sim on
+  // Live tuning copies — main.cpp seeds these from CurrentTuning() on
   // startup.  The overlay draws sliders; main.cpp detects changes (via
   // fluidTuningDirty) and writes them back + reloads shaders.
+  bool fluidWindowOpen = false;
+  // ---- sim tab ----
   float fGravity = 98.1f;
   float fStiffness = 5400.0f;
+  float fRestDensity = 8.0f;
   int   fEosPower = 4;
   float fCohesion = 90.0f;
   float fAttractSame = 45.0f;
   float fAttractDiff = -90.0f;
   float fViscosity = 1.5f;
   float fDamping = 0.0f;
+  float fSplashRate = 4.0f;
+  float fSplashSpeed = 18.0f;
+  float fSplashMaxDensity = 0.7f;
+  float fSplashLife = 1.1f;
+  int   fSplashScaleIdx = 2;
+  float fFoamRate = 90.0f;
+  float fFoamCrestRate = 120.0f;
+  float fTrappedMin = 1.5f;
+  float fTrappedMax = 11.0f;
+  float fCrestMin = 0.25f;
+  float fCrestMax = 2.0f;
+  float fFoamEnergyMin = 8.0f;
+  float fFoamEnergyMax = 260.0f;
+  float fFoamLife = 2.2f;
+  float fFoamLifeMin = 0.5f;
+  float fBubbleBuoyancy = 1.6f;
+  float fFoamDrag = 0.72f;
+  float fBubbleDensity = 1.05f;
+  float fSprayDensity = 0.42f;
+  int   fFoamScaleIdx = 3;
   int   fExciteMode = 0;
+  float fSettleEps = 0.9f;
+  float fWakeSpeed = 3.6f;
+  int   fSettleTicks = 45;
+  float fStainRate = 8.0f;
+  // ---- look tab (render) ----
+  float fSurface = 1.0f;
+  float fColor[3] = {0.20f, 0.42f, 0.85f};
+  float fColor1[3] = {0.92f, 0.34f, 0.10f};
+  float fColor2[3] = {0.22f, 0.78f, 0.28f};
+  float fColor3[3] = {0.88f, 0.72f, 0.25f};
+  float fIso = 0.30f;
+  float fSmooth = 1.3f;
+  float fIor = 1.33f;
+  float fClarity = 1.3f;
+  float fReflect = 1.0f;
+  float fSpecular = 1.0f;
+  float fShallow[3] = {0.42f, 0.86f, 0.82f};
+  float fDeep[3] = {0.02f, 0.15f, 0.42f};
+  float fDepth = 2.6f;
+  float fGradientStr = 1.0f;
+  float fRFoam = 0.55f;
+  float fRFoamField = 1.0f;
+  float fRFoamTexture = 0.65f;
+  float fRFoamSpeed = 22.0f;
+  float fWobble = 0.5f;
+  float fParticleSize = 0.58f;
+  float fStretch = 0.4f;
+  float fDensityShade = 0.45f;
   bool  fluidTuningDirty = false;
 
   // hotbar (game/item.h): mirrored out of Inventory each frame for the HUD.

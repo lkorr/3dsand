@@ -1741,13 +1741,62 @@ int main(int argc, char** argv) {
     const auto& fs = CurrentTuning().sim;
     ui.fGravity     = fs.fluidGravity;
     ui.fStiffness   = fs.fluidStiffness;
+    ui.fRestDensity = fs.fluidRestDensity;
     ui.fEosPower    = fs.fluidEosPower;
     ui.fCohesion    = fs.fluidCohesion;
     ui.fAttractSame = fs.fluidAttractSame;
     ui.fAttractDiff = fs.fluidAttractDiff;
     ui.fViscosity   = fs.fluidViscosity;
     ui.fDamping     = fs.fluidDamping;
-    ui.fExciteMode  = fs.fluidExciteMode;
+    ui.fSplashRate       = fs.fluidSplashRate;
+    ui.fSplashSpeed      = fs.fluidSplashSpeed;
+    ui.fSplashMaxDensity = fs.fluidSplashMaxDensity;
+    ui.fSplashLife       = fs.fluidSplashLife;
+    ui.fSplashScaleIdx   = fs.fluidSplashScaleIdx;
+    ui.fFoamRate         = fs.fluidFoamRate;
+    ui.fFoamCrestRate    = fs.fluidFoamCrestRate;
+    ui.fTrappedMin       = fs.fluidTrappedMin;
+    ui.fTrappedMax       = fs.fluidTrappedMax;
+    ui.fCrestMin         = fs.fluidCrestMin;
+    ui.fCrestMax         = fs.fluidCrestMax;
+    ui.fFoamEnergyMin    = fs.fluidFoamEnergyMin;
+    ui.fFoamEnergyMax    = fs.fluidFoamEnergyMax;
+    ui.fFoamLife         = fs.fluidFoamLife;
+    ui.fFoamLifeMin      = fs.fluidFoamLifeMin;
+    ui.fBubbleBuoyancy   = fs.fluidBubbleBuoyancy;
+    ui.fFoamDrag         = fs.fluidFoamDrag;
+    ui.fBubbleDensity    = fs.fluidBubbleDensity;
+    ui.fSprayDensity     = fs.fluidSprayDensity;
+    ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
+    ui.fExciteMode       = fs.fluidExciteMode;
+    ui.fSettleEps        = fs.fluidSettleEps;
+    ui.fWakeSpeed        = fs.fluidWakeSpeed;
+    ui.fSettleTicks      = fs.fluidSettleTicks;
+    ui.fStainRate        = fs.fluidStainRate;
+    const auto& fr = CurrentTuning().render;
+    ui.fSurface      = fr.fluidSurface;
+    std::memcpy(ui.fColor,  fr.fluidColor,  sizeof(ui.fColor));
+    std::memcpy(ui.fColor1, fr.fluidColor1, sizeof(ui.fColor1));
+    std::memcpy(ui.fColor2, fr.fluidColor2, sizeof(ui.fColor2));
+    std::memcpy(ui.fColor3, fr.fluidColor3, sizeof(ui.fColor3));
+    ui.fIso          = fr.fluidIso;
+    ui.fSmooth       = fr.fluidSmooth;
+    ui.fIor          = fr.fluidIor;
+    ui.fClarity      = fr.fluidClarity;
+    ui.fReflect      = fr.fluidReflect;
+    ui.fSpecular     = fr.fluidSpecular;
+    std::memcpy(ui.fShallow, fr.fluidShallow, sizeof(ui.fShallow));
+    std::memcpy(ui.fDeep,    fr.fluidDeep,    sizeof(ui.fDeep));
+    ui.fDepth        = fr.fluidDepth;
+    ui.fGradientStr  = fr.fluidGradient;
+    ui.fRFoam        = fr.fluidFoam;
+    ui.fRFoamField   = fr.fluidFoamField;
+    ui.fRFoamTexture = fr.fluidFoamTexture;
+    ui.fRFoamSpeed   = fr.fluidFoamSpeed;
+    ui.fWobble       = fr.fluidWobble;
+    ui.fParticleSize = fr.fluidParticleSize;
+    ui.fStretch      = fr.fluidStretch;
+    ui.fDensityShade = fr.fluidDensityShade;
   }
   for (auto& m : mats) {
     ui.materialNames.push_back(m.name);
@@ -1921,8 +1970,31 @@ int main(int argc, char** argv) {
   double lastTime = NowSeconds();
   double accumulator = 0;
   float fpsSmooth = 0, frameMsSmooth = 0, tickMsSmooth = 0, frameMsWorst = 0;
+  float frameMsP95 = 0, frameMsP99 = 0;
   double fpsWinStart = lastTime, fpsWinWorst = 0;
   int fpsWinFrames = 0;
+  // ---- LIVE TAIL PERCENTILES, over a much longer window than the 0.5 s the
+  // average and the worst use, and the length is the whole point.
+  //
+  // `worst` is ONE sample, so it is whatever the unluckiest frame in the last
+  // half second did — a background process waking up reads the same as a real
+  // regression. p95/p99 are the numbers that say whether a stutter is
+  // systematic, and they only mean anything with enough samples underneath
+  // them: over a 0.5 s window (~15-50 frames) p99 IS the max, and reporting it
+  // beside the max would be two names for one number.
+  //
+  // 512 frames is ~11 s at 45 fps and ~5 s at 100. p99 is then the ~6th worst
+  // frame and p95 the ~26th, both genuinely distinct from the max. The cost is
+  // a 512-float sort twice a second, which is microseconds and happens on the
+  // same 0.5 s boundary the other stats already update on.
+  //
+  // Sampled unconditionally, not under the --frames harness guard, because
+  // this readout is for playing the game and watching the panel.
+  constexpr size_t kTailWindow = 512;
+  std::vector<float> tailRing;
+  tailRing.reserve(kTailWindow);
+  size_t tailNext = 0;
+  std::vector<float> tailSorted;
   // Adaptive fog (plan phase 3B): the queue is drained by whole planes, so the
   // trusted radius jumps in steps. Start at the cold-start ceiling (nothing is
   // filled yet at this point — FullRefill above just queued everything) and
@@ -1971,10 +2043,25 @@ int main(int argc, char** argv) {
     }
     fpsWinFrames++;
     fpsWinWorst = std::max(fpsWinWorst, (double)dt);
+    // Ring, so the tail window is the last kTailWindow frames regardless of
+    // how the 0.5 s reporting boundary happens to fall.
+    if (tailRing.size() < kTailWindow) {
+      tailRing.push_back((float)(dt * 1000.0));
+    } else {
+      tailRing[tailNext] = (float)(dt * 1000.0);
+      tailNext = (tailNext + 1) % kTailWindow;
+    }
     if (now - fpsWinStart >= 0.5) {
       fpsSmooth = (float)(fpsWinFrames / (now - fpsWinStart));
       frameMsSmooth = (float)(1000.0 * (now - fpsWinStart) / fpsWinFrames);
       frameMsWorst = (float)(fpsWinWorst * 1000.0);
+      // Sort a COPY: the ring is in arrival order and stays that way, or the
+      // next frame would overwrite whatever slot sorting moved into tailNext.
+      tailSorted = tailRing;
+      std::sort(tailSorted.begin(), tailSorted.end());
+      const size_t n = tailSorted.size();
+      frameMsP95 = tailSorted[(size_t)(0.95 * (double)(n - 1))];
+      frameMsP99 = tailSorted[(size_t)(0.99 * (double)(n - 1))];
       fpsWinFrames = 0;
       fpsWinWorst = 0;
       fpsWinStart = now;
@@ -2232,13 +2319,62 @@ int main(int argc, char** argv) {
           const auto& fs = tune.sim;
           ui.fGravity     = fs.fluidGravity;
           ui.fStiffness   = fs.fluidStiffness;
+          ui.fRestDensity = fs.fluidRestDensity;
           ui.fEosPower    = fs.fluidEosPower;
           ui.fCohesion    = fs.fluidCohesion;
           ui.fAttractSame = fs.fluidAttractSame;
           ui.fAttractDiff = fs.fluidAttractDiff;
           ui.fViscosity   = fs.fluidViscosity;
           ui.fDamping     = fs.fluidDamping;
-          ui.fExciteMode  = fs.fluidExciteMode;
+          ui.fSplashRate       = fs.fluidSplashRate;
+          ui.fSplashSpeed      = fs.fluidSplashSpeed;
+          ui.fSplashMaxDensity = fs.fluidSplashMaxDensity;
+          ui.fSplashLife       = fs.fluidSplashLife;
+          ui.fSplashScaleIdx   = fs.fluidSplashScaleIdx;
+          ui.fFoamRate         = fs.fluidFoamRate;
+          ui.fFoamCrestRate    = fs.fluidFoamCrestRate;
+          ui.fTrappedMin       = fs.fluidTrappedMin;
+          ui.fTrappedMax       = fs.fluidTrappedMax;
+          ui.fCrestMin         = fs.fluidCrestMin;
+          ui.fCrestMax         = fs.fluidCrestMax;
+          ui.fFoamEnergyMin    = fs.fluidFoamEnergyMin;
+          ui.fFoamEnergyMax    = fs.fluidFoamEnergyMax;
+          ui.fFoamLife         = fs.fluidFoamLife;
+          ui.fFoamLifeMin      = fs.fluidFoamLifeMin;
+          ui.fBubbleBuoyancy   = fs.fluidBubbleBuoyancy;
+          ui.fFoamDrag         = fs.fluidFoamDrag;
+          ui.fBubbleDensity    = fs.fluidBubbleDensity;
+          ui.fSprayDensity     = fs.fluidSprayDensity;
+          ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
+          ui.fExciteMode       = fs.fluidExciteMode;
+          ui.fSettleEps        = fs.fluidSettleEps;
+          ui.fWakeSpeed        = fs.fluidWakeSpeed;
+          ui.fSettleTicks      = fs.fluidSettleTicks;
+          ui.fStainRate        = fs.fluidStainRate;
+          const auto& fr = tune.render;
+          ui.fSurface      = fr.fluidSurface;
+          std::memcpy(ui.fColor,  fr.fluidColor,  sizeof(ui.fColor));
+          std::memcpy(ui.fColor1, fr.fluidColor1, sizeof(ui.fColor1));
+          std::memcpy(ui.fColor2, fr.fluidColor2, sizeof(ui.fColor2));
+          std::memcpy(ui.fColor3, fr.fluidColor3, sizeof(ui.fColor3));
+          ui.fIso          = fr.fluidIso;
+          ui.fSmooth       = fr.fluidSmooth;
+          ui.fIor          = fr.fluidIor;
+          ui.fClarity      = fr.fluidClarity;
+          ui.fReflect      = fr.fluidReflect;
+          ui.fSpecular     = fr.fluidSpecular;
+          std::memcpy(ui.fShallow, fr.fluidShallow, sizeof(ui.fShallow));
+          std::memcpy(ui.fDeep,    fr.fluidDeep,    sizeof(ui.fDeep));
+          ui.fDepth        = fr.fluidDepth;
+          ui.fGradientStr  = fr.fluidGradient;
+          ui.fRFoam        = fr.fluidFoam;
+          ui.fRFoamField   = fr.fluidFoamField;
+          ui.fRFoamTexture = fr.fluidFoamTexture;
+          ui.fRFoamSpeed   = fr.fluidFoamSpeed;
+          ui.fWobble       = fr.fluidWobble;
+          ui.fParticleSize = fr.fluidParticleSize;
+          ui.fStretch      = fr.fluidStretch;
+          ui.fDensityShade = fr.fluidDensityShade;
         }
         avatarDefName = CurrentTuning().player.model;
         // Gore variance is drawn per mob at spawn, so mobs already standing in
@@ -3588,6 +3724,8 @@ int main(int argc, char** argv) {
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;
       ui.frameMsWorst = frameMsWorst;
+      ui.frameMsP95 = frameMsP95;
+      ui.frameMsP99 = frameMsP99;
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;
@@ -3701,21 +3839,63 @@ int main(int argc, char** argv) {
         Tuning t = CurrentTuning();
         t.sim.fluidGravity     = ui.fGravity;
         t.sim.fluidStiffness   = ui.fStiffness;
+        t.sim.fluidRestDensity = ui.fRestDensity;
         t.sim.fluidEosPower    = ui.fEosPower;
         t.sim.fluidCohesion    = ui.fCohesion;
         t.sim.fluidAttractSame = ui.fAttractSame;
         t.sim.fluidAttractDiff = ui.fAttractDiff;
         t.sim.fluidViscosity   = ui.fViscosity;
         t.sim.fluidDamping     = ui.fDamping;
-        t.sim.fluidExciteMode  = ui.fExciteMode;
+        t.sim.fluidSplashRate       = ui.fSplashRate;
+        t.sim.fluidSplashSpeed      = ui.fSplashSpeed;
+        t.sim.fluidSplashMaxDensity = ui.fSplashMaxDensity;
+        t.sim.fluidSplashLife       = ui.fSplashLife;
+        t.sim.fluidSplashScaleIdx   = ui.fSplashScaleIdx;
+        t.sim.fluidFoamRate         = ui.fFoamRate;
+        t.sim.fluidFoamCrestRate    = ui.fFoamCrestRate;
+        t.sim.fluidTrappedMin       = ui.fTrappedMin;
+        t.sim.fluidTrappedMax       = ui.fTrappedMax;
+        t.sim.fluidCrestMin         = ui.fCrestMin;
+        t.sim.fluidCrestMax         = ui.fCrestMax;
+        t.sim.fluidFoamEnergyMin    = ui.fFoamEnergyMin;
+        t.sim.fluidFoamEnergyMax    = ui.fFoamEnergyMax;
+        t.sim.fluidFoamLife         = ui.fFoamLife;
+        t.sim.fluidFoamLifeMin      = ui.fFoamLifeMin;
+        t.sim.fluidBubbleBuoyancy   = ui.fBubbleBuoyancy;
+        t.sim.fluidFoamDrag         = ui.fFoamDrag;
+        t.sim.fluidBubbleDensity    = ui.fBubbleDensity;
+        t.sim.fluidSprayDensity     = ui.fSprayDensity;
+        t.sim.fluidFoamScaleIdx     = ui.fFoamScaleIdx;
+        t.sim.fluidExciteMode       = ui.fExciteMode;
+        t.sim.fluidSettleEps        = ui.fSettleEps;
+        t.sim.fluidWakeSpeed        = ui.fWakeSpeed;
+        t.sim.fluidSettleTicks      = ui.fSettleTicks;
+        t.sim.fluidStainRate        = ui.fStainRate;
+        std::memcpy(t.render.fluidColor,  ui.fColor,  sizeof(ui.fColor));
+        std::memcpy(t.render.fluidColor1, ui.fColor1, sizeof(ui.fColor1));
+        std::memcpy(t.render.fluidColor2, ui.fColor2, sizeof(ui.fColor2));
+        std::memcpy(t.render.fluidColor3, ui.fColor3, sizeof(ui.fColor3));
+        t.render.fluidSurface      = ui.fSurface;
+        t.render.fluidIso          = ui.fIso;
+        t.render.fluidSmooth       = ui.fSmooth;
+        t.render.fluidIor          = ui.fIor;
+        t.render.fluidClarity      = ui.fClarity;
+        t.render.fluidReflect      = ui.fReflect;
+        t.render.fluidSpecular     = ui.fSpecular;
+        std::memcpy(t.render.fluidShallow, ui.fShallow, sizeof(ui.fShallow));
+        std::memcpy(t.render.fluidDeep,    ui.fDeep,    sizeof(ui.fDeep));
+        t.render.fluidDepth        = ui.fDepth;
+        t.render.fluidGradient     = ui.fGradientStr;
+        t.render.fluidFoam         = ui.fRFoam;
+        t.render.fluidFoamField    = ui.fRFoamField;
+        t.render.fluidFoamTexture  = ui.fRFoamTexture;
+        t.render.fluidFoamSpeed    = ui.fRFoamSpeed;
+        t.render.fluidWobble       = ui.fWobble;
+        t.render.fluidParticleSize = ui.fParticleSize;
+        t.render.fluidStretch      = ui.fStretch;
+        t.render.fluidDensityShade = ui.fDensityShade;
         SetCurrentTuning(t);
         sim.ReloadShaders(ctx.device);
-        // Lab only: an explicit ImGui edit is the ONE thing that may write
-        // tuning.json while the file watcher is live, and only when the file
-        // on disk is not newer than what this process last loaded — the
-        // running-app-clobbers-tuning-json gotcha, resolved as last-writer-
-        // wins with an mtime check (plan §4.3). Non-lab sessions keep the
-        // old behaviour: never write the file at all.
         if (labScene >= 0) LabPatchTuningJson(labTuningPath, t, &labTuningMtime);
       }
 

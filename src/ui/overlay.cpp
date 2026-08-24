@@ -289,8 +289,17 @@ void Overlay::Draw(UIState& s) {
   ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
   ImGui::Begin("sandvox", nullptr, ImGuiWindowFlags_NoFocusOnAppearing);
 
-  ImGui::Text("%.0f fps  (%.1f ms avg, %.0f ms worst, %.2f ms tick cpu)",
-              s.fps, s.frameMs, s.frameMsWorst, s.tickCpuMs);
+  ImGui::Text("%.0f fps  (%.1f ms avg, %.2f ms tick cpu)",
+              s.fps, s.frameMs, s.tickCpuMs);
+  // The tail gets its own line: four numbers do not fit beside the fps at this
+  // panel width, and when you are chasing a stutter this line is the one you
+  // watch. `worst` is a SINGLE frame out of the last half second, so it reacts
+  // to any one-off hiccup; p95/p99 are over ~512 frames and are what say
+  // whether the stutter is systematic. A high fps beside a high p99 is the
+  // reading that matters — it means the average is being carried by cheap
+  // frames while one in a hundred is visibly long.
+  ImGui::Text("frame ms   p95 %.0f   p99 %.0f   worst %.0f",
+              s.frameMsP95, s.frameMsP99, s.frameMsWorst);
   ImGui::Text("tick %u   active chunks %u / 4096", s.tick, s.activeChunks);
   ImGui::Text("voxels %.2f M   particles %u   hash %08x %s", s.voxelTotal / 1e6,
               s.particleCount, s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
@@ -559,28 +568,8 @@ void Overlay::Draw(UIState& s) {
     ImGui::Text("mpm particles: %u / 262144", s.fluidCount);
     ImGui::SameLine();
     if (ImGui::Button("clear (U)")) s.clearFluid = true;
-
-    auto fslider = [&](const char* label, float* v, float lo, float hi) {
-      if (ImGui::SliderFloat(label, v, lo, hi, "%.2f"))
-        s.fluidTuningDirty = true;
-    };
-    ImGui::Separator();
-    fslider("gravity##f",     &s.fGravity,     0.0f, 400.0f);
-    fslider("stiffness##f",   &s.fStiffness,   10.0f, 20000.0f);
-    if (ImGui::SliderInt("EOS power##f", &s.fEosPower, 1, 7))
-      s.fluidTuningDirty = true;
-    fslider("cohesion##f",    &s.fCohesion,    0.0f, 200.0f);
-    fslider("attract same##f",&s.fAttractSame, -200.0f, 200.0f);
-    fslider("attract diff##f",&s.fAttractDiff, -200.0f, 200.0f);
-    fslider("viscosity##f",   &s.fViscosity,   0.0f, 20.0f);
-    fslider("damping##f",     &s.fDamping,     0.0f, 5.0f);
-    {
-      bool ex = s.fExciteMode != 0;
-      if (ImGui::Checkbox("excite mode##f", &ex)) {
-        s.fExciteMode = ex ? 1 : 0;
-        s.fluidTuningDirty = true;
-      }
-    }
+    if (ImGui::Button("fluid tuning..."))
+      s.fluidWindowOpen = !s.fluidWindowOpen;
   }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
@@ -668,6 +657,123 @@ void Overlay::Draw(UIState& s) {
   ImGui::TextDisabled("Tab switch tool  1-8 material  Esc cursor  F1 UI");
   ImGui::TextDisabled("G grenade  X detonate  F laser  M spawn mob  B place");
   ImGui::End();
+
+  // ---- separate MPM fluid tuning window ----
+  if (s.fluidWindowOpen) {
+    ImGui::SetNextWindowPos(ImVec2(370, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340, 600), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("MPM Fluid Tuning", &s.fluidWindowOpen)) {
+      auto fslider = [&](const char* label, float* v, float lo, float hi) {
+        ImGui::SliderFloat(label, v, lo, hi, "%.2f");
+        if (ImGui::IsItemDeactivatedAfterEdit())
+          s.fluidTuningDirty = true;
+      };
+      auto islider = [&](const char* label, int* v, int lo, int hi) {
+        ImGui::SliderInt(label, v, lo, hi);
+        if (ImGui::IsItemDeactivatedAfterEdit())
+          s.fluidTuningDirty = true;
+      };
+      auto fcheck = [&](const char* label, int* v) {
+        bool on = *v != 0;
+        if (ImGui::Checkbox(label, &on)) {
+          *v = on ? 1 : 0;
+          s.fluidTuningDirty = true;
+        }
+      };
+      auto fcolor = [&](const char* label, float col[3]) {
+        ImGui::ColorEdit3(label, col, ImGuiColorEditFlags_Float);
+        if (ImGui::IsItemDeactivatedAfterEdit())
+          s.fluidTuningDirty = true;
+      };
+
+      if (ImGui::BeginTabBar("##fluidtabs")) {
+        if (ImGui::BeginTabItem("Sim")) {
+          ImGui::Text("particles: %u / 262144", s.fluidCount);
+          ImGui::Separator();
+          if (ImGui::CollapsingHeader("Core", ImGuiTreeNodeFlags_DefaultOpen)) {
+            fslider("gravity",      &s.fGravity,      0.0f, 1800.0f);
+            fslider("stiffness",    &s.fStiffness,    0.0f, 43200.0f);
+            fslider("rest density", &s.fRestDensity,   1.0f, 32.0f);
+            islider("EOS power",    &s.fEosPower,      1, 7);
+            fslider("cohesion",     &s.fCohesion,      0.0f, 14400.0f);
+            fslider("attract same", &s.fAttractSame,  -7200.0f, 7200.0f);
+            fslider("attract diff", &s.fAttractDiff,  -7200.0f, 7200.0f);
+            fslider("viscosity",    &s.fViscosity,     0.0f, 240.0f);
+            fslider("damping",      &s.fDamping,       0.0f, 20.0f);
+          }
+          if (ImGui::CollapsingHeader("Splash")) {
+            fslider("splash rate",    &s.fSplashRate,       0.0f, 60.0f);
+            fslider("splash speed",   &s.fSplashSpeed,      0.0f, 90.0f);
+            fslider("splash surface", &s.fSplashMaxDensity, 0.0f, 2.0f);
+            fslider("splash life",    &s.fSplashLife,       0.05f, 8.5f);
+            islider("splash size",    &s.fSplashScaleIdx,   0, 3);
+          }
+          if (ImGui::CollapsingHeader("Foam / Diffuse")) {
+            fslider("trapped-air rate",  &s.fFoamRate,      0.0f, 180.0f);
+            fslider("wave-crest rate",   &s.fFoamCrestRate, 0.0f, 180.0f);
+            fslider("trapped min",       &s.fTrappedMin,    0.0f, 400.0f);
+            fslider("trapped max",       &s.fTrappedMax,    0.0f, 400.0f);
+            fslider("crest min",         &s.fCrestMin,      0.0f, 64.0f);
+            fslider("crest max",         &s.fCrestMax,      0.0f, 64.0f);
+            fslider("energy min",        &s.fFoamEnergyMin, 0.0f, 8100.0f);
+            fslider("energy max",        &s.fFoamEnergyMax, 0.0f, 8100.0f);
+            fslider("foam life",         &s.fFoamLife,      0.05f, 8.5f);
+            fslider("foam life (weak)",  &s.fFoamLifeMin,   0.05f, 8.5f);
+            fslider("bubble buoyancy",   &s.fBubbleBuoyancy,-4.0f, 8.0f);
+            fslider("foam drag",         &s.fFoamDrag,      0.0f, 1.0f);
+            fslider("bubble threshold",  &s.fBubbleDensity, 0.0f, 4.0f);
+            fslider("spray threshold",   &s.fSprayDensity,  0.0f, 4.0f);
+            islider("foam particle size",&s.fFoamScaleIdx,   0, 3);
+          }
+          if (ImGui::CollapsingHeader("Settle / Excite")) {
+            fcheck("excite mode",       &s.fExciteMode);
+            fslider("settle below",     &s.fSettleEps,   0.05f, 20.0f);
+            fslider("wake above",       &s.fWakeSpeed,   0.1f, 50.0f);
+            islider("settle ticks",     &s.fSettleTicks, 8, 600);
+            fslider("stain rate",       &s.fStainRate,   0.0f, 30.0f);
+          }
+          ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Look")) {
+          if (ImGui::CollapsingHeader("Surface", ImGuiTreeNodeFlags_DefaultOpen)) {
+            fslider("surface mode##l",    &s.fSurface,  0.0f, 1.0f);
+            fslider("surface threshold##l",&s.fIso,     0.08f, 1.0f);
+            fslider("smoothing##l",       &s.fSmooth,   0.4f, 3.0f);
+            fslider("refraction index##l",&s.fIor,      1.01f, 2.0f);
+            fslider("clarity##l",         &s.fClarity,  0.05f, 20.0f);
+            fslider("reflection##l",      &s.fReflect,  0.0f, 2.0f);
+            fslider("sun glint##l",       &s.fSpecular, 0.0f, 4.0f);
+            fslider("shimmer##l",         &s.fWobble,   0.0f, 2.0f);
+          }
+          if (ImGui::CollapsingHeader("Colour")) {
+            fcolor("species 1##l", s.fColor);
+            fcolor("species 2##l", s.fColor1);
+            fcolor("species 3##l", s.fColor2);
+            fcolor("species 4##l", s.fColor3);
+            ImGui::Separator();
+            fcolor("shallow tint##l", s.fShallow);
+            fcolor("deep tint##l",    s.fDeep);
+            fslider("gradient depth##l",   &s.fDepth,       0.05f, 20.0f);
+            fslider("gradient strength##l",&s.fGradientStr,  0.0f, 1.0f);
+          }
+          if (ImGui::CollapsingHeader("Foam (render)")) {
+            fslider("foam amount##l",  &s.fRFoam,        0.0f, 2.0f);
+            fslider("foam field##l",   &s.fRFoamField,   0.0f, 3.0f);
+            fslider("foam break-up##l",&s.fRFoamTexture,  0.0f, 1.0f);
+            fslider("foam speed##l",   &s.fRFoamSpeed,   1.0f, 90.0f);
+          }
+          if (ImGui::CollapsingHeader("Debug cubes")) {
+            fslider("cube size##l",          &s.fParticleSize, 0.2f, 1.2f);
+            fslider("cube stretch##l",       &s.fStretch,      0.0f, 1.5f);
+            fslider("cube pressure shade##l",&s.fDensityShade, 0.0f, 1.0f);
+          }
+          ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+      }
+    }
+    ImGui::End();
+  }
 }
 
 void Overlay::Render(const rhi::RenderPass& pass) {
