@@ -947,11 +947,41 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   const bool ptDbg = getenv("SANDVOX_PT_DEBUG") != nullptr;
   const double probeT0 = ptDbg ? PtNowMs() : 0.0;
   uint32_t probesRun = 0;
-  for (uint32_t s : candidates) {
+
+  // ---- ONE BATCHED READ FOR THE WHOLE CANDIDATE SET -----------------------
+  //
+  // See SetChunkProbe for the measurement that forced this shape: the per-slot
+  // form was a full device drain each, 198 ms for one tick's 804 candidates.
+  //
+  // The batch is CAPPED (kMaxFreeProbesPerTick), and the cap is back for a
+  // different reason than the one that made it harmful before. It used to
+  // bound reclamation below the allocation rate, which is a leak. Here it
+  // bounds the STAGING BYTES of a single read — 128 chunks is 2 MiB — while
+  // the candidates it defers are not lost: their zeroStreak_ is held AT the
+  // threshold, so they are re-offered on the very next tick rather than
+  // restarting their eight-snapshot wait. Reclamation is therefore still
+  // unbounded ACROSS ticks; only one tick's read is bounded.
+  std::vector<uint32_t> batch;
+  std::vector<bool> ok;
+  if (probeChunk_ && !candidates.empty()) {
+    const size_t n = std::min(candidates.size(), kMaxFreeProbesPerTick);
+    batch.assign(candidates.begin(), candidates.begin() + n);
+    if (freeProbe_.size() != (size_t)kChunkVol * n)
+      freeProbe_.assign((size_t)kChunkVol * n, 0);
+    ok = probeChunk_(batch, freeProbe_.data());
+    probesRun = (uint32_t)n;
+    // Deferred candidates keep their place in the queue: held one short of a
+    // re-increment so the next snapshot re-offers them immediately.
+    for (size_t i = n; i < candidates.size(); i++)
+      zeroStreak_[candidates[i]] = kPageFreeTicks - 1;
+    candidates.resize(n);
+  }
+
+  for (size_t ci = 0; ci < candidates.size(); ci++) {
+    const uint32_t s = candidates[ci];
     if (probeChunk_) {
-      if (freeProbe_.size() != kChunkVol) freeProbe_.assign(kChunkVol, 0);
-      probesRun++;
-      if (!probeChunk_(s, freeProbe_.data())) continue;
+      if (ci >= ok.size() || !ok[ci]) continue;
+      const uint32_t* words = freeProbe_.data() + ci * (size_t)kChunkVol;
       // The free test is "every cell is STAINLESS AIR", NOT Classify's
       // exact-word rule, and the distinction is the difference between a
       // working demotion path and a permanent leak. Two passenger-bit classes
@@ -996,12 +1026,12 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
       // resident words bit-exactly.
       bool demotable = true;
       for (uint32_t i = 0; i < kChunkVol; i++)
-        if ((freeProbe_[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
+        if ((words[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
       if (!demotable) {
-        if (getenv("SANDVOX_PT_DEBUG")) {
+        if (ptDbg) {
           uint32_t w = 0, at = 0;
           for (uint32_t i = 0; i < kChunkVol; i++)
-            if ((freeProbe_[i] & kAirDemoteMask) != 0u) { w = freeProbe_[i]; at = i; break; }
+            if ((words[i] & kAirDemoteMask) != 0u) { w = words[i]; at = i; break; }
           std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
                       tick_, s, w, at);
         }

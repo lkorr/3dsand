@@ -64,7 +64,29 @@ namespace {
 uint64_t g_harnessFrames = 0;
 bool g_autofly = false;
 bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool sizing
+// --autofly-surface: the RENDERER's adversarial traversal, the complement of
+// --autofly-hard. Where the hard descent drives the window into solid bulk to
+// stress residency, this one flies OVER the terrain to stress ray length: the
+// surface case is where the frame cost lives (docs/PLAN_surface_flight_perf.md
+// Part A), and it is exactly the case the descent cannot reach.
+bool g_autoflySurface = false;
+// Which of the two --autofly-surface regimes the current frame is in, set from
+// the tick phase in the input block and consumed by the altitude pin after
+// player.Update. Two sites because the phase is known where every other autofly
+// decision is made, but the pin has to land after the integrator.
+bool g_autoflySurfaceHigh = false;
+// Voxels of clearance for each regime. The low skim wants to be just over the
+// canopy — trees run ~30 voxels above the ground they stand on — so it is
+// canopy + 5. The high cruise is +150 voxels (15 m at kVoxelMeters 0.10), well
+// clear of anything worldgen builds, which is what isolates the altitude term.
+constexpr float kAutoflySurfaceLowVox = 35.0f;
+constexpr float kAutoflySurfaceHighVox = 150.0f;
 std::vector<double> g_frameMs;  // --frames: whole-frame wall clock, for percentiles
+// --autofly-surface splits the SAME samples by regime. A pooled p50 over a run
+// that alternates low skim and high cruise is the median of a bimodal
+// distribution and answers neither question: the altitude term is the whole
+// point of the harness, so the two arms are reported separately as well.
+std::vector<double> g_frameMsLow, g_frameMsHigh;
 double g_harnessRenderMs = 0.0;
 
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
@@ -1157,6 +1179,7 @@ int main(int argc, char** argv) {
     if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
     if (a == "--autofly") g_autofly = true;
     if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
+    if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
     // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
@@ -1588,7 +1611,16 @@ int main(int argc, char** argv) {
     // block), and reads 100+ while the screen updates at <10.
     // Skip the first 60 frames: worldgen and first-use pipeline creation are
     // startup cost, not the steady-state stall being measured.
-    if (g_harnessFrames > 0 && frameCounter > 60) g_frameMs.push_back(dt * 1000.0);
+    if (g_harnessFrames > 0 && frameCounter > 60) {
+      g_frameMs.push_back(dt * 1000.0);
+      // Bucketed by the regime this frame was FLOWN in, which is the flag the
+      // altitude pin used, not a re-derivation of the tick phase here — the
+      // two would disagree on the frames straddling a phase flip.
+      if (g_autoflySurface) {
+        (g_autoflySurfaceHigh ? g_frameMsHigh : g_frameMsLow)
+            .push_back(dt * 1000.0);
+      }
+    }
     fpsWinFrames++;
     fpsWinWorst = std::max(fpsWinWorst, (double)dt);
     if (now - fpsWinStart >= 0.5) {
@@ -1762,6 +1794,33 @@ int main(int argc, char** argv) {
         const uint32_t phase = (uint32_t)(tick / 90u) & 3u;
         pin.strafe = (phase == 1) ? 1.f : (phase == 3) ? -1.f : 0.f;
         pin.down = true;   // descend into solid rock: worst case for residency
+      }
+      // --autofly-surface: the RENDERER's worst case. Fly forward over the
+      // terrain at two altitudes on the same fixed `tick/90` phase form the
+      // hard descent uses, so the two harnesses are directly comparable and
+      // both are reproducible run to run.
+      //
+      // WHY THE ALTITUDE IS HELD ANALYTICALLY, not by pin.up/pin.down: the
+      // quantity under test is RAY LENGTH THROUGH UNSKIPPED CHUNKS, which is a
+      // function of height above the terrain, and a fly-mode climb driven by an
+      // input axis wanders with frame time. World::TerrainHeight is the exact
+      // integer CPU mirror of worldgen's baseHeight (world.cpp), so the target
+      // is a pure function of (x, z, seed) — no world reads, no residency
+      // dependence, nothing that could vary between a paged and a dense run
+      // being differenced. The pin itself is applied AFTER player.Update (see
+      // the autofly-surface block down at the Update call), because fly mode
+      // integrates velocity and would otherwise fight the assignment.
+      //
+      // Phase bit alternates the two regimes that bracket the collapse:
+      //   low skim   — just over the canopy: micro/strand and half-full foliage
+      //                chunks dominate, rays are short but never skippable.
+      //   high cruise— well above everything: rays run the full window diagonal
+      //                and the altitude term is the whole cost.
+      if (g_autoflySurface) {
+        const uint32_t phase = (uint32_t)(tick / 90u) & 1u;
+        pin.up = false;
+        pin.down = false;
+        g_autoflySurfaceHigh = (phase == 1u);
       }
     }
 
@@ -1953,6 +2012,21 @@ int main(int argc, char** argv) {
       player.canJump = couple ? loco.canJump : true;
     }
     player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(), kindAt);
+    // --autofly-surface altitude pin. Held analytically against the worldgen
+    // heightfield rather than flown, so the measured quantity (ray length
+    // through unskipped chunks) depends only on the tick schedule — see the
+    // block beside g_autoflyHard for why. Fly mode has no terrain collision, so
+    // assigning the position outright is legal here; vel.y is zeroed so the
+    // integrator does not carry an accumulated climb into the next frame and
+    // fight this every step.
+    if (g_autoflySurface) {
+      const int gh = World::TerrainHeight((int)std::floor(player.pos.x),
+                                          (int)std::floor(player.pos.z),
+                                          kDefaultSeed);
+      player.pos.y = (float)gh + (g_autoflySurfaceHigh ? kAutoflySurfaceHighVox
+                                                       : kAutoflySurfaceLowVox);
+      player.vel.y = 0.0f;
+    }
     ui.fly = player.fly;
 
     // ---- fixed-tick simulation ----
@@ -3289,6 +3363,19 @@ int main(int argc, char** argv) {
                 pct(0.50), pct(0.95), pct(0.99),
                 g_frameMs.empty() ? 0.0 : g_frameMs.back(), over33,
                 100.0 * over33 / (double)g_frameMs.size(), over100);
+    // Per-regime arms (see g_frameMsLow/High). The HIGH number is the one the
+    // altitude work is judged on; the LOW one is the canopy/meadow skim.
+    if (g_autoflySurface) {
+      auto arm = [](const char* name, std::vector<double>& v) {
+        if (v.empty()) return;
+        std::sort(v.begin(), v.end());
+        auto q = [&](double p) { return v[(size_t)(p * (v.size() - 1))]; };
+        std::printf("--autofly-surface %s: n %zu  p50 %.1f  p95 %.1f  max %.1f\n",
+                    name, v.size(), q(0.50), q(0.95), v.back());
+      };
+      arm("low-skim  ", g_frameMsLow);
+      arm("high-cruise", g_frameMsHigh);
+    }
   }
 
   telemetry.Shutdown();

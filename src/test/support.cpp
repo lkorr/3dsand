@@ -205,19 +205,59 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     probeInstalled = true;
     GpuContext* pctx = &ctx;
     World* pw = &world;
-    pt.SetChunkProbe([pctx, pw](uint32_t slot, uint32_t* out) {
-      const uint64_t off = pw->PageOffsetOfSlot(slot);
-      if (off == World::kNoPage) return false;
-      // NO WaitIdle HERE. It was a full mid-frame device drain per candidate
-      // and it was buying nothing: ReadbackBlocking submits its own copy, so
-      // the copy is queue-ordered behind every prior submit, and its
-      // ReadBufferBlocking then does the wait itself (rhi_vk.cpp:518-527,
-      // "WaitIdle + memcpy from the persistent map"). Deferred host writes are
-      // covered too — VkrDevice::WaitIdle flushes PendingUploadCount through a
-      // trivial submit before waiting (rhi_vk.cpp:504-516). So the explicit
-      // drain was one redundant full-queue stall per probe.
-      return rhi::ReadbackBlocking(pctx->device, pctx->queue, pw->voxels, off,
-                                   out, (size_t)kChunkVol * 4, "freeProbe");
+    pt.SetChunkProbe([pctx, pw](const std::vector<uint32_t>& slots,
+                                uint32_t* out) {
+      // ONE COPY AND ONE MAP FOR THE WHOLE BATCH, not one drain per slot.
+      //
+      // The per-slot form called rhi::ReadbackBlocking once per candidate, and
+      // that call waits the whole device idle before mapping (rhi_vk.cpp). It
+      // was correct and it was invisible in every scenario it had been
+      // measured in, because those scenarios produce no candidates. Surface
+      // flight produces 665-804 per tick and it cost 198 ms of a 488 ms frame
+      // — see the SetChunkProbe comment for why they are manufactured by a
+      // stale snapshot rather than being real work.
+      //
+      // Gathering into one staging buffer makes it one submit and one wait for
+      // the batch. The copies are queue-ordered behind every prior submit, so
+      // they read post-tick data exactly as the per-slot copies did; the only
+      // thing removed is the repetition of the drain.
+      std::vector<bool> ok(slots.size(), false);
+      if (slots.empty()) return ok;
+      const size_t stride = (size_t)kChunkVol * 4;
+      static rhi::Buffer staging;
+      static size_t stagingSlots = 0;
+      if (stagingSlots < slots.size()) {
+        stagingSlots = slots.size();
+        staging = CreateBuffer(
+            pctx->device, (uint64_t)stagingSlots * stride,
+            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "freeProbe");
+      }
+      rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
+      size_t copied = 0;
+      for (size_t i = 0; i < slots.size(); i++) {
+        const uint64_t off = pw->PageOffsetOfSlot(slots[i]);
+        // A slot can lose its page between selection and here (evicted,
+        // demoted). No source, no copy, and ok[i] stays false — the caller
+        // simply does not free it, which is the conservative direction.
+        if (off == World::kNoPage) continue;
+        enc.CopyTracked(pass::Buf::Voxels, pw->voxels, off, staging,
+                        i * stride, stride);
+        ok[i] = true;
+        copied++;
+      }
+      if (copied == 0) return ok;
+      pctx->queue.Submit(enc.Finish());
+      rhi::MapTicket m = rhi::MapReadDeferred(pctx->device, staging, 0,
+                                             (uint64_t)slots.size() * stride);
+      m.Wait();
+      if (!m.Succeeded() || !m.Data()) {
+        m.Unmap();
+        std::fill(ok.begin(), ok.end(), false);
+        return ok;
+      }
+      std::memcpy(out, m.Data(), slots.size() * stride);
+      m.Unmap();
+      return ok;
     });
   }
   pt.BeginTick(tick);
