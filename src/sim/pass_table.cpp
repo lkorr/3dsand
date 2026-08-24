@@ -73,6 +73,7 @@ namespace {
 #define PIPE_FLUID_CONSUME_APPLY   Pipe::FluidConsumeApply
 #define PIPE_FLUID_STAIN_APPLY     Pipe::FluidStainApply
 #define PIPE_FLUID_MIRROR_FOLD     Pipe::FluidMirrorFold
+#define PIPE_FLUID_CELL_CLEAR      Pipe::FluidCellClear
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect

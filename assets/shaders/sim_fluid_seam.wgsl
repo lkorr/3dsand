@@ -197,6 +197,14 @@ fn compactCount(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }
 
+// Spans that can hold a live particle. compactCount/compactScatter dispatch
+// exactly this many workgroups (fluidArgs[FA_ARGS_COMPACT], staged into
+// fluidPDispatchArgs), so compactScratch beyond it is STALE and this scan must
+// not read it — that is the whole contract of making those two rows indirect.
+fn liveSpans() -> u32 {
+  return (min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP) + 255u) / 256u;
+}
+
 @compute @workgroup_size(256)
 fn compactScan(@builtin(local_invocation_index) li : u32) {
   // 256 threads x (SPANS/256) spans each; thread 0 turns the partials into
@@ -204,8 +212,11 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
   // first seam pass of the tick, so last tick's values have already ridden
   // the snapshot readback out.
   let per = SPANS / 256u;
+  let spans = liveSpans();
   var n = 0u;
-  for (var s = li * per; s < (li + 1u) * per; s++) { n += compactScratch[s]; }
+  for (var s = li * per; s < (li + 1u) * per; s++) {
+    if (s < spans) { n += compactScratch[s]; }
+  }
   wgScan[li] = n;
   workgroupBarrier();
   if (li == 0u) {
@@ -216,6 +227,10 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
       sum += c;
     }
     atomicStore(&exciteScratch[EX_COMPACT_LIVE], sum);
+    // consumeApply's dispatch: one thread per SURVIVOR, not per pool slot.
+    atomicStore(&fluidArgs[FA_ARGS_CONSUME + 0u], (min(sum, FLUID_CAP) + 63u) / 64u);
+    atomicStore(&fluidArgs[FA_ARGS_CONSUME + 1u], 1u);
+    atomicStore(&fluidArgs[FA_ARGS_CONSUME + 2u], 1u);
     atomicStore(&fluidArgs[FA_DEAD], 0u);
     atomicStore(&fluidArgs[FA_SETTLED], 0u);
     atomicStore(&fluidArgs[FA_EXCITED], 0u);
@@ -229,6 +244,7 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
   workgroupBarrier();
   var base = wgScan[li];
   for (var s = li * per; s < (li + 1u) * per; s++) {
+    if (s >= spans) { break; }
     let c = compactScratch[s];
     compactScratch[SPANS + s] = base;
     base += c;
@@ -477,6 +493,13 @@ fn exciteScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[4u], (live + 63u) / 64u);
     atomicStore(&fluidArgs[5u], 1u);
     atomicStore(&fluidArgs[6u], 1u);
+    // NEXT tick's compaction dispatch: one workgroup per 256-slot span that
+    // can hold a survivor. This is the tick's authoritative population, so it
+    // is the one place that can size the compaction — which is why the args
+    // are written here rather than by the compaction itself (plan §7 item 1).
+    atomicStore(&fluidArgs[FA_ARGS_COMPACT + 0u], (live + 255u) / 256u);
+    atomicStore(&fluidArgs[FA_ARGS_COMPACT + 1u], 1u);
+    atomicStore(&fluidArgs[FA_ARGS_COMPACT + 2u], 1u);
   }
   workgroupBarrier();
   // Per-span assignment for the fully-accepted / fully-refused spans (the
@@ -662,6 +685,26 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   fluidParticles[gid.x] = p;
 }
 
+// cellClear: zero the per-cell intent/flags scratch for the ACTIVE BLOCKS only.
+//
+// This replaces an 8 MiB vkCmdFillBuffer that ran every single tick, forever,
+// for a buffer sized by the kFluidBlocks CEILING (256) while the measured lab
+// scenes allocate 8-22 blocks (plan §7 item 1; the fill was 8 MiB, the real
+// working set is 250-700 KB). Dispatched off the node-pass indirect args of the
+// LAST substep — the same blocks:16-workgroups shape stainApply uses — so it is
+// zero work when the solver has no blocks, which is what "sleep" means here.
+//
+// Block indices past the current count keep whatever they last held: nothing
+// can address them, because every access resolves through the block map, whose
+// entries only ever name indices below the count.
+@compute @workgroup_size(256)
+fn cellClear(@builtin(workgroup_id) wg : vec3<u32>,
+             @builtin(local_invocation_index) li : u32) {
+  let cell = (wg.x >> 4u) * CHUNK_VOL + (wg.x & 15u) * 256u + li;
+  atomicStore(&fluidCellScratch[cell * 2u], 0u);
+  atomicStore(&fluidCellScratch[cell * 2u + 1u], 0u);
+}
+
 // ============================================================================
 // SETTLE — calm particles -> fullness voxels.
 // ============================================================================
@@ -806,14 +849,33 @@ var<workgroup> ssPart : array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn settleScan(@builtin(local_invocation_index) li : u32) {
+  // TRUE SLEEP (plan §7 item 2). This scan and the solver's `alloc` are the
+  // only fluid passes whose cost does NOT come from an indirect arg — both are
+  // single-workgroup walks of all NUM_CHUNKS slots, so a world that poured once
+  // and settled kept paying them forever (the CPU-side fluidCount is monotone
+  // by design, so the TABLE keeps being recorded — that is the determinism
+  // contract, and the sanctioned way to make it free is exactly this).
+  // With no particles alive, no slot can have a calm counter to find: settleJudge
+  // resets a slot the moment its speed reads zero.
+  // (The early-out cannot `return` before the workgroupBarrier below — a
+  // storage read is non-uniform to the compiler, and a barrier in non-uniform
+  // control flow is a WGSL validation error. Skipping the WORK is enough.)
+  let asleep = atomicLoad(&fluidArgs[FA_LIVE]) == 0u;
   let span = NUM_CHUNKS / 256u;
   var n = 0u;
-  for (var s = li * span; s < (li + 1u) * span; s++) {
-    if (atomicLoad(&fluidCalm[s]) >= SEAM_CALM_TICKS) { n += 1u; }
+  if (!asleep) {
+    for (var s = li * span; s < (li + 1u) * span; s++) {
+      if (atomicLoad(&fluidCalm[s]) >= SEAM_CALM_TICKS) { n += 1u; }
+    }
   }
   ssPart[li] = n;
   workgroupBarrier();
   if (li != 0u) { return; }
+  if (asleep) {
+    atomicStore(&settleScratch[SP_COUNT], 0u);
+    atomicStore(&fluidArgs[FA_SETBLOCKS], 0u);
+    return;
+  }
   var picked = array<vec3<i32>, 16>();
   var count = 0u;
   for (var t = 0u; t < 256u && count < SETTLE_MAX; t++) {

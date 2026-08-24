@@ -146,7 +146,7 @@ enum class Pipe : uint8_t {
   FluidExciteDetect, FluidExciteScan, FluidExciteEmit,
   FluidPTick, FluidSettleJudge, FluidSettleScan, FluidSettleBin,
   FluidSettleCheck, FluidSettleCommit, FluidSettleKill,
-  FluidConsumeApply, FluidStainApply, FluidMirrorFold,
+  FluidConsumeApply, FluidStainApply, FluidMirrorFold, FluidCellClear,
   // Materializes a JITTER page (world.h's JITTER block): the one fill a
   // vkCmdFillBuffer cannot do, because the words vary per cell.
   PageFill,

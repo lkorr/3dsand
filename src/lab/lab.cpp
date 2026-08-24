@@ -311,7 +311,8 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
   struct BenchRun {
     int scene;
     int excite;         // sim.fluidExciteMode for the run
-    std::string tag;    // scene name, or "hill0" for the excite-0 A/B
+    std::string tag;    // scene name, "hill0" (excite-0 A/B), "pool-settle"
+    bool settleTuning = false;  // the fluid-excite gate's settle overrides
   };
   std::vector<BenchRun> runs;
   if (sceneArg.empty() || sceneArg == "all") {
@@ -321,8 +322,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // trapdoor until WP3 closes it (plan §4.2).
       if (s == kLabHill) runs.push_back({s, 0, "hill0"});
     }
+    runs.push_back({kLabPool, 1, "pool-settle", true});
   } else if (sceneArg == "hill0") {
     runs.push_back({kLabHill, 0, "hill0"});
+  } else if (sceneArg == "pool-settle") {
+    runs.push_back({kLabPool, 1, "pool-settle", true});
   } else {
     int s = LabSceneFromName(sceneArg);
     if (s < 0) {
@@ -387,7 +391,33 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       t.sim.fluidExciteMode = run.excite;
       t.dayNight.freeze = 1;
       t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+      // THE SLEEP RUN (plan §7 item 2). At stock tuning nothing settles in any
+      // scene (§9's headline finding — the WP2 CFL problem), so "fluid GPU time
+      // after settle" is unmeasurable there. These are the fluid-excite gate's
+      // overrides verbatim (selftest_sim.cpp): a softer, damped, tension-free
+      // water that a sealed pool can actually calm out of. Every sim.fluid*
+      // value is a WGSL compile-time const, so the run has to recompile — the
+      // F5 path, exactly as the lab's tuning watcher uses it.
+      if (run.settleTuning) {
+        t.sim.fluidSettleEps = 6.0f;
+        t.sim.fluidWakeSpeed = 24.0f;
+        t.sim.fluidDamping = 0.9f;
+        t.sim.fluidStiffness = 2400.0f;
+        t.sim.fluidAttractSame = 0.0f;
+        t.sim.fluidAttractDiff = 0.0f;
+        t.sim.fluidCohesion = 0.0f;
+      }
       SetCurrentTuning(t);
+      // Recompile only when the compiled-in fluid consts actually change: a
+      // reload is seconds of Tint, and every other run wants stock tuning.
+      static bool shadersSettleTuned = false;
+      if (run.settleTuning != shadersSettleTuned) {
+        if (!sim.ReloadShaders(ctx.device)) {
+          std::fprintf(stderr, "--fluid-bench: shader reload FAILED\n");
+          return 1;
+        }
+        shadersSettleTuned = run.settleTuning;
+      }
     }
 
     sim.SetPassTimer(nullptr);  // a timed worldgen would dangle its queries
@@ -421,6 +451,8 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     uint64_t poured = 0, settledSum = 0, excitedSum = 0, deadSum = 0,
              binnedSum = 0, consumedSum = 0, emittedSum = 0, refusedSum = 0;
     int tickOfSettle = -1;
+    double idleFluidMs = -1.0;
+    uint32_t idleFluidTicks = 0;
     uint32_t liveEst = 0;
     uint32_t tick = 0;
 
@@ -585,6 +617,32 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         tickOfSettle, massExact ? "EXACT" : "LEAK",
         (unsigned long long)poured, (unsigned long long)standingEighths,
         (unsigned long long)carriedEighths);
+    // ---- IDLE COST (plan §7 item 2) ---------------------------------------
+    // The sum of every fluid pass on the ticks where the GPU-owned live count
+    // read ZERO. The tick tables are still RECORDED on those ticks — the CPU's
+    // fluidCount is monotone precisely so that recording never depends on
+    // readback timing — so this is the number that says whether "recorded but
+    // asleep" really is free.
+    {
+      // MEDIAN, and tick 1 excluded: tick 1 carries the scene's whole CellOp
+      // build (43,400 ops for hill) and the first-tick pipeline warm-up, which
+      // an average of a handful of samples is entirely at the mercy of.
+      std::vector<double> idle;
+      for (size_t i = 1; i < liveCurve.size(); i++) {
+        if (liveCurve[i] != 0) continue;
+        double s = 0.0;
+        for (auto& [name, v] : passMs)
+          if (i < v.size() && name.rfind("fluid", 0) == 0) s += v[i];
+        idle.push_back(s);
+      }
+      if (!idle.empty())
+        std::printf(
+            "    idle fluid GPU: %.4f ms/tick median over %u live==0 ticks "
+            "(tables recorded, nothing alive)\n",
+            Pct(idle, 0.50), (unsigned)idle.size());
+      idleFluidMs = idle.empty() ? -1.0 : Pct(idle, 0.50);
+      idleFluidTicks = (uint32_t)idle.size();
+    }
     std::printf(
         "    render split: fluid march %.2f ms | droplet raster %.2f ms | "
         "world+sky %.2f ms  (of %.2f ms)\n",
@@ -627,6 +685,8 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     }
     json << "},\n";
     json << "    \"tickOfSettle\": " << tickOfSettle << ",\n";
+    json << "    \"idleFluidMs\": " << idleFluidMs
+         << ", \"idleFluidTicks\": " << idleFluidTicks << ",\n";
     json << "    \"massLedger\": {\"pouredEighths\": " << poured
          << ", \"standingEighths\": " << standingEighths
          << ", \"carriedEighths\": " << carriedEighths

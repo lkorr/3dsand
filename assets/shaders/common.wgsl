@@ -880,7 +880,16 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // [15]    eighths binned by settle this tick (mass audits)
 // [16]    eighths consumed by CA reactions this tick (mass audits)
 // [17]    contact stains applied this tick (parity gates, telemetry)
-// [18..31] spare
+// [18]    spare
+// [19..21] COMPACTION dispatch args ((live+255)/256, 1, 1) — written by the
+//         excite scan alongside FA_LIVE, staged into fluidPDispatchArgs at the
+//         head of the seam. compactCount/compactScatter used to dispatch 1024
+//         fixed workgroups (all 262,144 pool slots) whatever the population was
+//         (plan §7 item 1).
+// [22..24] CONSUME dispatch args ((compactLive+63)/64, 1, 1) — written by the
+//         compaction scan, staged before consumeApply, which used to dispatch
+//         4,096 fixed workgroups.
+// [25..31] spare
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;
@@ -892,6 +901,10 @@ const FA_LASTSLOT  : u32 = 14u;
 const FA_BINNED    : u32 = 15u;
 const FA_CONSUMED  : u32 = 16u;
 const FA_STAINED   : u32 = 17u;
+// Byte offsets of the two arg triples are what pass_table.def's copy rows use;
+// keep the three in step (76 = 19*4, 88 = 22*4).
+const FA_ARGS_COMPACT : u32 = 19u;
+const FA_ARGS_CONSUME : u32 = 22u;
 
 // Must match FluidSpawnOp in world.h (32 bytes). mat carries the pour's brush
 // material into the particle's attr word (stainless, fullness 1).

@@ -319,10 +319,25 @@ var<workgroup> allocTotal : u32;
 
 @compute @workgroup_size(256)
 fn alloc(@builtin(local_invocation_index) li : u32) {
+  // TRUE SLEEP (plan §7 item 2). Every other row of this table dispatches off
+  // an indirect arg and so costs nothing with no particles; this one is a fixed
+  // single-workgroup walk of all NUM_CHUNKS slots (the seam's settleScan is the
+  // other). Whether the table is RECORDED stays a pure function of the
+  // CPU-owned monotone count — never a readback, that is the determinism trap
+  // in plan §7 — so a world that poured once and settled goes on recording
+  // these passes forever, and making them free is the only sanctioned fix.
+  // With no live particles `mark` wrote nothing, so the map is all zero and the
+  // scan below could only ever produce zero.
+  // (The early-out must not `return` before the workgroupBarriers below — a
+  // storage read is non-uniform to the compiler, and a barrier in non-uniform
+  // control flow is a WGSL validation error. Skipping the WORK is enough.)
+  let asleep = min(fluidArgs[FA_LIVE], FLUID_CAP) == 0u;
   let span = NUM_CHUNKS / 256u;   // 128 slots per thread
   var n = 0u;
-  for (var s = li * span; s < (li + 1u) * span; s++) {
-    if (atomicLoad(&fluidBlockMap[s]) != 0u) { n += 1u; }
+  if (!asleep) {
+    for (var s = li * span; s < (li + 1u) * span; s++) {
+      if (atomicLoad(&fluidBlockMap[s]) != 0u) { n += 1u; }
+    }
   }
   allocPartial[li] = n;
   workgroupBarrier();
@@ -341,6 +356,7 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
     fluidArgs[3] = blocks;
   }
   workgroupBarrier();
+  if (asleep) { return; }
   var idx = allocPartial[li];
   for (var s = li * span; s < (li + 1u) * span; s++) {
     if (atomicLoad(&fluidBlockMap[s]) == 0u) { continue; }

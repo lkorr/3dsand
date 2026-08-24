@@ -653,6 +653,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidConsumeApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "consumeApply", "seamConsumeApply");
   fluidStainApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "stainApply", "seamStainApply");
   fluidMirrorFold_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "mirrorFold", "seamMirrorFold");
+  fluidCellClear_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "cellClear", "seamCellClear");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -669,7 +670,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidExciteScan_ || !fluidExciteEmit_ || !fluidPTick_ ||
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
       !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_ ||
-      !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_) {
+      !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_ ||
+      !fluidCellClear_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -857,6 +859,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidConsumeApply:   return fluidConsumeApply_;
     case P::FluidStainApply:     return fluidStainApply_;
     case P::FluidMirrorFold:     return fluidMirrorFold_;
+    case P::FluidCellClear:      return fluidCellClear_;
     default:                return step_;
   }
 }
