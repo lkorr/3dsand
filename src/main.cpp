@@ -88,6 +88,17 @@ std::vector<double> g_frameMs;  // --frames: whole-frame wall clock, for percent
 // distribution and answers neither question: the altitude term is the whole
 // point of the harness, so the two arms are reported separately as well.
 std::vector<double> g_frameMsLow, g_frameMsHigh;
+// The SIM LOAD the frame times above were produced under. The CA cost model in
+// docs/ROADMAP_scale.md §3.0 is
+//   CA/tick = 54 x (4.65 us + 0.245 us x activeChunks)
+// which splits into a fixed 251 us DISPATCH FLOOR and a per-chunk term, and the
+// two are attacked by completely different optimizations — fewer dispatches vs
+// less work per chunk. Which one dominates is decided entirely by this number,
+// and the harness reported frame milliseconds without ever saying which regime
+// produced them. The model was fitted on scripted scenes at 3-69 active chunks;
+// sustained flight is a different regime (every window shift wakes the chunks
+// genChunk just generated with matter), so it needs its own reading.
+std::vector<double> g_activeChunks;
 double g_harnessRenderMs = 0.0;
 
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
@@ -980,14 +991,28 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   Vec3 target = mobs.MobOrigin(id) +
                 Vec3{def.worldSize.x * 0.5f, def.worldSize.y * 0.3f,
                      def.worldSize.z * 0.5f};
+  float corpseSpread = 0;  // 0 while the mob is alive; see below
   {
     std::vector<BodyXformGpu> mt;
     mobs.AppendXforms(mt);
-    if (!mt.empty()) {
+    // A KILLED mob has no live limbs at all: Die() hands every body to
+    // DebrisSystem and drops the husk, so AppendXforms is empty and MobOrigin
+    // above is a dead id. `xf` is the registry's whole-world walk, and in this
+    // harness the only bodies in the world are this mob's corpse — so it is
+    // the corpse's centroid, which is what "sever a vital limb and look at the
+    // ragdoll" needs the camera to find.
+    const std::vector<BodyXformGpu>& src = mt.empty() ? xf : mt;
+    if (!src.empty()) {
       Vec3 sum{};
-      for (const BodyXformGpu& m : mt)
+      for (const BodyXformGpu& m : src)
         sum += Vec3{m.pos[0], m.pos[1], m.pos[2]};
-      target = sum * (1.0f / (float)mt.size()) + Vec3{0, 1, 0};
+      target = sum * (1.0f / (float)src.size()) + Vec3{0, 1, 0};
+      // How far the pieces actually spread, for the framing below. A corpse is
+      // lying down and half its def's standing height across, so framing it by
+      // the def's box leaves it a speck in the middle of a landscape shot.
+      for (const BodyXformGpu& m : src)
+        corpseSpread = std::max(
+            corpseSpread, (Vec3{m.pos[0], m.pos[1], m.pos[2]} - target).len());
     }
   }
 
@@ -1042,13 +1067,16 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // shows limb placement.
   Vec3 fwd = mobs.MobFacing(id);
   Vec3 right{fwd.z, 0, -fwd.x};
-  // Frame by the def's own SIZE rather than a fixed 18 voxels: the dummy and
-  // critter are ~8 voxels tall but a humanoid rig is ~28, and a constant
-  // distance either crops the tall one or leaves the short one a speck.
+  // Frame by the corpse's measured spread once the mob is dead, and by the
+  // def's own SIZE while it is alive: the dummy and critter are ~8 voxels tall
+  // but a humanoid rig is ~28, and a constant distance either crops the tall
+  // one or leaves the short one a speck.
   const float shotDist =
-      std::max(18.0f, 2.4f * std::max(def.worldSize.y,
-                                      std::max(def.worldSize.x,
-                                               def.worldSize.z)));
+      corpseSpread > 0.5f
+          ? std::max(14.0f, 3.2f * corpseSpread)
+          : std::max(18.0f, 2.4f * std::max(def.worldSize.y,
+                                            std::max(def.worldSize.x,
+                                                     def.worldSize.z)));
   shoot(right + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_side.bmp");
   shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
         "screenshot_mob_quarter.bmp");
@@ -1640,6 +1668,9 @@ int main(int argc, char** argv) {
     // startup cost, not the steady-state stall being measured.
     if (g_harnessFrames > 0 && frameCounter > 60) {
       g_frameMs.push_back(dt * 1000.0);
+      // Snapshot-latent by ~2 ticks, which is irrelevant at percentile scale.
+      if (world.Snap().valid)
+        g_activeChunks.push_back((double)world.Snap().activeChunks);
       // Bucketed by the regime this frame was FLOWN in, which is the flag the
       // altitude pin used, not a re-derivation of the tick phase here — the
       // two would disagree on the frames straddling a phase flip.
@@ -3529,6 +3560,26 @@ int main(int argc, char** argv) {
                 pct(0.50), pct(0.95), pct(0.99),
                 g_frameMs.empty() ? 0.0 : g_frameMs.back(), over33,
                 100.0 * over33 / (double)g_frameMs.size(), over100);
+    // Which half of the CA cost model this run lived in (see g_activeChunks).
+    if (!g_activeChunks.empty()) {
+      std::sort(g_activeChunks.begin(), g_activeChunks.end());
+      auto apct = [&](double p) {
+        return g_activeChunks[(size_t)(p * (g_activeChunks.size() - 1))];
+      };
+      double sum = 0.0;
+      for (double a : g_activeChunks) sum += a;
+      const double mean = sum / (double)g_activeChunks.size();
+      // The model of ROADMAP_scale.md §3.0, evaluated at the mean, so the
+      // floor share is reported rather than left to be recomputed by hand.
+      const double floorUs = 54.0 * 4.65;
+      const double perChunkUs = 54.0 * 0.245 * mean;
+      std::printf("--frames harness: active chunks  p50 %.0f  p95 %.0f  max %.0f"
+                  "  mean %.0f | modelled CA %.0f us/tick = %.0f floor + %.0f "
+                  "per-chunk (floor %.0f%%)\n",
+                  apct(0.50), apct(0.95), g_activeChunks.back(), mean,
+                  floorUs + perChunkUs, floorUs, perChunkUs,
+                  100.0 * floorUs / (floorUs + perChunkUs));
+    }
     // Per-regime arms (see g_frameMsLow/High). The HIGH number is the one the
     // altitude work is judged on; the LOW one is the canopy/meadow skim.
     if (g_autoflySurface) {
