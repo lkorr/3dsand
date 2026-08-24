@@ -29,7 +29,8 @@ happens in this process rather than in the page:
   POST /api/note?name=...     write one note page (autosave)
   POST /api/note/delete       delete one note page
   POST /api/build             cmake --build ... --target sandvox
-  POST /api/play              launch build/Release/sandvox.exe
+  POST /api/play              launch build/Release/sandvox.exe (body {mode,scene}:
+                              "game", or "lab" = fluid testing world --lab <scene>)
   GET  /api/status            build state + whether the exe is running
 
 Usage:
@@ -60,9 +61,10 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
     move the file to assets/sounds/.trash/ rather than unlinking it — a
     recorded take is not reproducible, so the destructive path is the one place
     here that must not be trusted to a click.
-  - /api/build and /api/play run one hardcoded command each with a fixed
-    argument list and shell=False. Nothing from the request reaches a command
-    line.
+  - /api/build runs one hardcoded command; /api/play picks its argv from a
+    hardcoded whitelist keyed by the request's {mode, scene} (game, or the
+    --lab fluid scenes). Both shell=False. No request TEXT ever reaches a
+    command line — the body selects between fixed argument lists.
 Anyone exposing this beyond localhost is opting into arbitrary local builds.
 """
 import argparse
@@ -868,8 +870,25 @@ class Handler(BaseHTTPRequestHandler):
             if not os.path.isfile(EXE):
                 return self._json(400, {"ok": False,
                                         "error": "sandvox.exe not found — build first"})
+            # Launch mode from the tuner's run dropdown. WHITELISTED, never
+            # spliced from client text: the browser picks a mode, this table
+            # owns the argv. "lab" is the fluid testing world
+            # (docs/PLAN_fluid_overhaul.md §4, `--lab <scene>`).
+            body = self._body()
+            mode = body.get("mode", "game")
+            scene = body.get("scene", "basin")
+            if mode == "game":
+                argv = [EXE, "--telemetry"]
+            elif mode == "lab":
+                if scene not in ("basin", "hill", "faucet", "pool", "slosh"):
+                    return self._json(400, {"ok": False,
+                                            "error": "unknown lab scene %r" % (scene,)})
+                argv = [EXE, "--lab", scene, "--telemetry"]
+            else:
+                return self._json(400, {"ok": False,
+                                        "error": "unknown mode %r" % (mode,)})
             try:
-                q = subprocess.Popen([EXE, "--telemetry"], cwd=ROOT, shell=False)
+                q = subprocess.Popen(argv, cwd=ROOT, shell=False)
                 _play_procs.append(q)
                 return self._json(200, {"ok": True, "pid": q.pid})
             except Exception as e:

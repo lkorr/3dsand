@@ -760,6 +760,11 @@
   button.busy{opacity:.6;cursor:progress}
   #btnBuild.ok{border-color:#2f6030;color:#9ee89a}
   #btnBuild.bad{border-color:var(--red);color:var(--red)}
+  #selRun{
+    background:var(--card2);color:var(--fg);border:1px solid var(--line2);border-radius:6px;
+    padding:6px 8px;cursor:pointer;font-size:13px;font-family:var(--sans);
+  }
+  #selRun:hover{background:#273143;border-color:var(--acc)}
   #buildPanel{
     position:fixed;right:14px;bottom:46px;z-index:70;width:640px;max-width:92vw;
     background:#11151d;border:1px solid var(--line2);border-radius:10px;
@@ -1378,6 +1383,14 @@
   <button id="btnReload" disabled>Reload from disk</button>
   <span class="hsep" id="runSep" hidden></span>
   <button id="btnBuild" hidden>&#9874; Build</button>
+  <select id="selRun" hidden title="what Play launches">
+    <option value="game">game</option>
+    <option value="lab:basin">fluid lab &mdash; basin</option>
+    <option value="lab:hill">fluid lab &mdash; hill</option>
+    <option value="lab:faucet">fluid lab &mdash; faucet</option>
+    <option value="lab:pool">fluid lab &mdash; pool</option>
+    <option value="lab:slosh">fluid lab &mdash; slosh</option>
+  </select>
   <button id="btnPlay" hidden>&#9654; Play</button>
   <span class="pill" id="pillMat"><span class="dot"></span>materials.json</span>
   <span class="pill" id="pillRx"><span class="dot"></span>reactions.json</span>
@@ -3695,9 +3708,16 @@ async function doPlay(){
   // Same reasoning as build: launching against stale files on disk looks like
   // the edit did nothing.
   if(dirty.mat||dirty.rx||dirty.tune){ if(!await serverSave())return; }
-  const r=await fetch('/api/play',{method:'POST'});
+  // The run-mode dropdown picks what Play launches: the normal game, or the
+  // fluid lab (docs/PLAN_fluid_overhaul.md §4) with a scene. The server
+  // whitelists the mode/scene — this value is a request, not a command line.
+  const v=$('#selRun').value||'game';
+  const body=v.startsWith('lab:')?{mode:'lab',scene:v.slice(4)}:{mode:'game'};
+  const r=await fetch('/api/play',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json().catch(()=>({ok:false}));
-  toast(j.ok?'launched sandvox':(j.error||'could not launch'),!j.ok);
+  const what=body.mode==='lab'?('fluid lab — '+body.scene):'sandvox';
+  toast(j.ok?('launched '+what):(j.error||'could not launch'),!j.ok);
 }
 
 $('#btnBuild').addEventListener('click',doBuild);
@@ -3707,7 +3727,13 @@ $('#buildClose').addEventListener('click',()=>showBuild(false));
 (async()=>{
   server=await detectServer();
   if(!server)return;
-  for(const id of ['#runSep','#btnBuild','#btnPlay'])$(id).hidden=false;
+  for(const id of ['#runSep','#btnBuild','#selRun','#btnPlay'])$(id).hidden=false;
+  // Run mode survives reloads; fall back to 'game' if a stored value stops
+  // being an option (e.g. a scene is renamed).
+  const selRun=$('#selRun');
+  selRun.value=localStorage.getItem('sv_runMode')||'game';
+  if(!selRun.value)selRun.value='game';
+  selRun.addEventListener('change',()=>localStorage.setItem('sv_runMode',selRun.value));
   // The picker is redundant once the server has told us where assets/ is.
   $('#btnOpen').hidden=true;
   $('#btnReload').disabled=false;
