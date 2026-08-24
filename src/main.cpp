@@ -2595,6 +2595,18 @@ int main(int argc, char** argv) {
         } else {
           respawnTimer = 0;
         }
+        // Drain the impact latch on the FIRST tick of the frame batch that
+        // sees it — the same consume-and-clear every other one-shot here uses
+        // (cast, prefab stamp, mob spawn). Player::Update writes it per FRAME
+        // and peak-holds because this loop runs zero times on most frames at
+        // 60+ fps against a 30 Hz tick; without the hold a landing is
+        // overwritten unread and fall damage never fires.
+        //
+        // Cleared even when no avatar consumed it (fly mode, avatar disabled,
+        // dead and awaiting respawn). A peak-hold that is never drained only
+        // ratchets upward, and the next avatar to spawn would inherit the
+        // hardest hit the session ever recorded and die on its first tick.
+        player.impactDeltaV = Vec3{0, 0, 0};
       }
 
       // ---- magic (game/spell.h) ---------------------------------------------

@@ -100,6 +100,9 @@ struct Tuning {
     float jumpSpeed = 5.25f;
     float swimUp = 17.5f, swimDown = 7.5f;
     float maxFall = 30.0f;
+    float fallDamageSpeed = 8.0f;
+    float fallSplatSpeed = 25.0f;
+    float fallDamageScale = 1.5f;
     float stepUp = 0.58f;
     float smoothBump = 0.12f;
     float stepSpeedPenaltyPerM = 2.8f;

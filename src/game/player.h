@@ -135,6 +135,30 @@ class Player {
   float jumpScale = 1.0f;
   bool canJump = true;
 
+  // Largest single-frame velocity LOSS to a collision sweep since the avatar
+  // last drained this, in voxels/sec. Magnitude = how hard the body hit
+  // something: a fall arrested by the ground, or a horizontal slam into a wall.
+  // The avatar reads it for impact damage instead of relying on landing
+  // detection, so one code path covers both.
+  //
+  // A LATCH, not a per-frame value, and that distinction IS the feature.
+  // Update() runs once per FRAME; the avatar consumes this inside the fixed-tick
+  // loop, which runs ZERO times on any frame where the accumulator has not
+  // reached a whole tick — at 60+ fps against the 30 Hz tick that is most
+  // frames. An impact is a single-frame event, so a plain per-frame assignment
+  // is overwritten by the next frame's ~0 (the body is grounded by then) before
+  // any tick ever reads it, and fall damage never fires at all. This is the same
+  // trap the RMB cast latch documents in main.cpp, and every other one-shot here
+  // (prefab stamp, mob spawn, detonate) is sticky for exactly this reason.
+  //
+  // PEAK-HOLD, not accumulate: gravity contributes ~1.6 vox/s of cancelled
+  // velocity on every grounded frame, so summing would reach a lethal total
+  // just standing still. The largest single arrest is the impact.
+  //
+  // Cleared by main.cpp on the first tick of the frame batch that sees it —
+  // which is also what stops a multi-tick frame applying the same hit 4 times.
+  Vec3 impactDeltaV{0, 0, 0};
+
   static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
   static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall
   static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // eyes near the top

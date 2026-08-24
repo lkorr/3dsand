@@ -1728,6 +1728,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // until the next real support replaces it.
     if (supported) wasHanging_ = hangingNow;
 
+    // Impact damage. Deliberately OUTSIDE the landing edge above: the latch
+    // already means "a sweep just refused this much velocity", which is true of
+    // a wall slam that never touches the ground and of a landing whose grounded
+    // edge is still inside its debounce. main.cpp clears the latch after this
+    // tick, so a 4-tick frame cannot bill the same hit four times.
+    ApplyFallDamage(player.impactDeltaV, player.pos, tick, world, ops, spawns);
+
     // ---- locomotion clips ----
     // Additive arm swing over the IK legs; `run` replaces `walk` past half of
     // the def's top speed. Both are retriggered every tick, which PlayClip
@@ -2114,6 +2121,114 @@ void PlayerAvatar::CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   }
   for (int i : severed)
     if (PartAlive(i)) Sever(i);
+}
+
+void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
+                                   uint32_t tick,
+                                   World& world, std::vector<BrushOp>& ops,
+                                   std::vector<ParticleSpawn>& spawns) {
+  if (!spawned_ || !alive_ || !def_) return;
+  const float impactVox = impactDeltaV.len();
+  if (impactVox < 1e-3f) return;
+  const auto& pt = CurrentTuning().player;
+  const float impactMs = impactVox * kVoxelMeters;
+  if (impactMs < pt.fallDamageSpeed) return;
+
+  const MobDef& def = *def_;
+  const auto& gore = CurrentTuning().gore;
+  const Vec3 center = centerWorldVoxel;
+
+  float excess = impactMs - pt.fallDamageSpeed;
+  float damage = excess * pt.fallDamageScale;
+
+  bool lethal = impactMs >= pt.fallSplatSpeed ||
+                damage >= (float)TotalHealth();
+
+  if (lethal) {
+    // --- splat: carve voxels out of the body, sever some limbs, die ---
+
+    // CarveRadial blows chunks out of every live limb like an explosion would:
+    // voxels get ejected as particles, parts losing >75% of volume collapse.
+    float carveRadius = 4.0f + impactMs * 0.1f;
+    CarveRadial(center, carveRadius, world, spawns);
+
+    // Sever roughly half the remaining severable limbs at random.
+    std::vector<int> severable;
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (!PartAlive((int)i) || !parts[i].body) continue;
+      const MobLimbDef& ld = limbs_[i];
+      if ((int)i == def.rootLimb || ld.vital || !ld.severable) continue;
+      severable.push_back((int)i);
+    }
+    for (size_t j = 0; j < severable.size(); j++) {
+      uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)j);
+      if ((h & 1) == 0) continue;
+      int i = severable[j];
+      if (PartAlive(i)) {
+        Sever(i);
+        if (parts[i].holdBody) parts[i].holdSeconds = 0.0f;
+      }
+    }
+    Die();
+
+    // Radial impulse scatters debris outward from the impact.
+    if (phys_)
+      phys_->ApplyRadialImpulse(center, 8.0f, impactMs * 2.0f);
+
+    // Blood micro-spray burst.
+    if (def.bleedMat != 0) {
+      int droplets = 400;
+      for (int k = 0; k < droplets; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)(k + 100));
+        Vec3 dir{SignedUnit(h),
+                 0.3f + 0.7f * (float)(Pcg(h ^ 0xA001u) & 0xFFFFu) / 65535.0f,
+                 SignedUnit(Pcg(h ^ 0xB002u))};
+        float len = dir.len();
+        if (len > 1e-4f) dir = dir * (1.0f / len);
+        float sp = gore.severSpraySpeed *
+                   (0.5f + 1.0f * (float)(Pcg(h ^ 0xC003u) & 0xFFFFu) / 65535.0f);
+        int life = std::clamp(gore.microLifeTicks, 1, 255);
+        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, true,
+                                     life, gore.microScale));
+      }
+      // Whole-voxel blood thrown outward — pools and persists.
+      for (int k = 0; k < 30; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        uint32_t h = Hash3((uint32_t)id_ ^ 0xB10Du, tick, (uint32_t)(k + 500));
+        Vec3 dir{SignedUnit(h),
+                 0.2f + 0.4f * (float)(Pcg(h ^ 0xD004u) & 0xFFFFu) / 65535.0f,
+                 SignedUnit(Pcg(h ^ 0xE005u))};
+        float len = dir.len();
+        if (len > 1e-4f) dir = dir * (1.0f / len);
+        float sp = gore.severVoxelSpeed *
+                   (0.6f + 0.8f * (float)(Pcg(h ^ 0xF006u) & 0xFFFFu) / 65535.0f);
+        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, false,
+                                     0, 0));
+      }
+      // Blood stain at the impact site.
+      ops.push_back({ifloor(center.x), ifloor(center.y),
+                     ifloor(center.z), 2, def.bleedMat, 0, 0, 0});
+    }
+    return;
+  }
+
+  // --- sub-lethal impact: proportional damage, bleed on legs ---
+  SpendHealth((int32_t)std::lround(damage));
+  if (def.bleedMat != 0) {
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (!PartAlive((int)i) || !parts[i].body) continue;
+      const MobLimbDef& ld = limbs_[i];
+      if (ld.name.find("leg") == std::string::npos &&
+          ld.name.find("foot") == std::string::npos)
+        continue;
+      parts[i].bleedBudget =
+          AddBleedBudget(parts[i].bleedBudget, damage * 0.3f * def.bleedPerDamage);
+      Quat q{parts[i].xf.quat[0], parts[i].xf.quat[1],
+             parts[i].xf.quat[2], parts[i].xf.quat[3]};
+      parts[i].woundLocal = RotateInv(q, center - parts[i].xf.pos);
+    }
+  }
 }
 
 bool PlayerAvatar::SeverByName(const std::string& name) {

@@ -446,7 +446,18 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       float step = std::min(rise, (T().unstickSpeed / kVoxelMeters) * dt);
       pos.y += step;
       viewYOffset -= step;
-      if (vel.y < 0.0f) vel.y = 0.0f;
+      if (vel.y < 0.0f) {
+        // Being dug out of solid is a landing too: the body got here fast
+        // enough to end up buried (a fall the sweep resolved into an overlap,
+        // or a powder that poured over it). Latch the cancelled downward speed
+        // as an impact BEFORE dropping it — this runs ahead of the sweeps
+        // below, so without it that landing is the one case impact damage
+        // silently misses. Ejection is rate-limited over several frames, but
+        // only the first carries any speed, so this cannot double-count.
+        const Vec3 lost{0, vel.y, 0};
+        if (lost.len() > impactDeltaV.len()) impactDeltaV = lost;
+        vel.y = 0.0f;
+      }
       // Being lifted out counts as standing on the thing you were inside:
       // without this the frame reports airborne, which strobes every
       // grounded-gated system for as long as the ejection takes.
@@ -587,6 +598,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         grounded = true;
         coyoteTimer = T().coyoteTime;
       }
+      impactDeltaV = {0, 0, 0};
       return;  // scripted: no gravity, no swim, no walk this frame
     }
   }
@@ -644,6 +656,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         mantleTimer = T().ledgeMantleTime;
         mantleFromHang = true;  // a HOLD: W released mid-climb cancels
         vel = Vec3{0, 0, 0};
+        impactDeltaV = {0, 0, 0};
         return;  // the mantle block above drives from the next frame
       }
       // Arms, not legs: deliberately not scaled by jumpScale — a wizard with
@@ -705,6 +718,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       viewYOffset -= pos.y - yBefore;
       viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
                                (float)kMaxStepUpVoxels);
+      impactDeltaV = {0, 0, 0};
       return;  // scripted: no gravity, no walk this frame
     }
   }
@@ -720,6 +734,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     hanging = false;  // no timer guards the grip, so fly must open it
     coyoteTimer = 0.0f;
     viewYOffset = 0.0f;  // fly motion is deliberate: never smooth it
+    impactDeltaV = {0, 0, 0};
   } else {
     const float nonJumpSpeed = T().nonJumpSpeed / kVoxelMeters;
 
@@ -822,6 +837,8 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     const float vmax = T().maxFall / kVoxelMeters;
     vel.y = std::clamp(vel.y, -vmax, vmax);
 
+    const Vec3 velBeforeSweep = vel;
+
     // ---- vertical move ----
     bool blockedY = SweepAxis(pos, vel.y * dt, 1, kindAt);
     if (blockedY) vel.y = 0;
@@ -835,13 +852,20 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     viewYOffset -= climbed;
     if (!onGround) {
       // Airborne: plain slide, no stepping (both Quake and Source refuse to
-      // step while off the ground). Zeroing the blocked component here is
-      // wrong for the same reason it was wrong before — against a voxel
-      // staircase a diagonal run alternates X and Z blocks and would lose both
-      // components — so a blocked axis just stops advancing this frame and
-      // keeps its velocity for the next.
-      SweepAxis(pos, vel.x * dt, 0, kindAt);
-      SweepAxis(pos, vel.z * dt, 2, kindAt);
+      // step while off the ground).
+      //
+      // A blocked axis DOES lose its velocity, which reverses the older rule
+      // here. That rule kept the component so an airborne diagonal against a
+      // voxel staircase could not have both axes eaten by alternating blocks —
+      // but a body that keeps its full speed into a wall it cannot pass is not
+      // sliding, it is a stopped body that the sim still believes is moving at
+      // 30 m/s, and it is why a horizontal slam registered no impact at all.
+      // The staircase case it protected is already airborne, so step-up is off
+      // and the riser stops you either way until you land.
+      bool blockedX = SweepAxis(pos, vel.x * dt, 0, kindAt);
+      bool blockedZ = SweepAxis(pos, vel.z * dt, 2, kindAt);
+      if (blockedX) vel.x = 0;
+      if (blockedZ) vel.z = 0;
     }
 
     // ---- stay on ground: snap back down onto the surface after moving ----
@@ -860,6 +884,14 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         if (vel.y < 0.0f) vel.y = 0.0f;
       }
     }
+
+    // Whatever the sweeps refused is what the body hit. PEAK-HOLD into the
+    // latch rather than assigning: the tick loop that consumes it runs zero
+    // times on most frames, so an impact merely assigned here is overwritten
+    // unread on the next frame and the hit is never seen. See
+    // Player::impactDeltaV for the full reasoning.
+    const Vec3 lost = velBeforeSweep - vel;
+    if (lost.len() > impactDeltaV.len()) impactDeltaV = lost;
 
     // Re-probe after the move so `grounded` reported to the rest of the frame
     // reflects where we ended up, not where we started.

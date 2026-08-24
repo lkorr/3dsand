@@ -260,6 +260,21 @@ class PlayerAvatar {
   void CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                    std::vector<ParticleSpawn>& spawns);
 
+  // Impact damage, driven by Player::impactDeltaV — the velocity a collision
+  // sweep refused. Covers falls and horizontal wall slams with one path, since
+  // both are "the body was moving this fast and then abruptly was not".
+  // Below the onset threshold nothing happens; between onset and splat,
+  // proportional hp drain plus bleeding; at or above splat speed the body is
+  // carved open, roughly half the severable limbs come off, and it explodes.
+  //
+  // `centerWorldVoxel` is the blast origin in WORLD voxel coords — the player
+  // AABB centre, which is mid-torso. Not origin_/bodyY_: those are the min
+  // CORNER of the body box at the feet, and centring a 7-voxel blast there
+  // puts it half a body off in x/z and a full half-height low.
+  void ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel, uint32_t tick,
+                       World& world, std::vector<BrushOp>& ops,
+                       std::vector<ParticleSpawn>& spawns);
+
   // ---- persistence (sim/worldio.h, entities.sve section 'AVTR') -----------
   // The avatar is a mob def driven by the player, so it persists like a mob:
   // per-part hp and sever state, def by NAME. Parts carry no lattices in v1 —

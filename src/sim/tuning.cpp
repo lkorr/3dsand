@@ -295,6 +295,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "swimUp", p.swimUp, out, at);
     ReadF(*g, "swimDown", p.swimDown, out, at);
     ReadF(*g, "maxFall", p.maxFall, out, at);
+    ReadF(*g, "fallDamageSpeed", p.fallDamageSpeed, out, at);
+    ReadF(*g, "fallSplatSpeed", p.fallSplatSpeed, out, at);
+    ReadF(*g, "fallDamageScale", p.fallDamageScale, out, at);
     ReadF(*g, "stepUp", p.stepUp, out, at);
     ReadF(*g, "smoothBump", p.smoothBump, out, at);
     ReadF(*g, "stepSpeedPenaltyPerM", p.stepSpeedPenaltyPerM, out, at);
