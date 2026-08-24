@@ -223,6 +223,113 @@ visible: ~0.2 fps — cost scales with how much world the camera can *see*.
 > readings of it, and its population grows with the plane size the 5 cm / 2048³ target
 > implies. It is recorded here as measuring **zero** so it is not re-measured hopefully.
 
+> **CORRECTION 5 (2026-08-24). Worldgen now lays the deep lava down AT REST. The
+> settling transient is GONE — and it buys far less frame time than Correction 4's
+> ceiling implied, which is the more useful half of this entry.**
+>
+> Correction 4 named the lever ("worldgen could lay that lava down already at rest") and
+> put a 9 ms ceiling on it. The lever has been pulled. `caveAt` (`worldgen.wgsl`) now
+> routes **every** carve through `caveFill(y)`: a carved cell at or below
+> `LAVA_LEVEL = -80` is lava, above it is air.
+>
+> **Why that form, given `genCell` is a pure per-cell function.** "At rest" for a liquid
+> normally means "flat, at the level its basin sets", and a per-cell function with no
+> flood fill cannot find a basin. The way out is that a flat cut does not need to: the
+> cave's own complement is already the container. Fill on DEPTH ALONE and at every
+> y ≤ `LAVA_LEVEL` a cell is lava exactly when it is carved and stone otherwise — so the
+> lateral boundary is stone at every level, everything under a lava cell is lava or
+> stone, and the only lava/air interface in the world is the single plane y = -80.
+> `stepLiquid` falls through all three of its rules to the "settled: no markDirty" tail.
+> **The flatness comes from the constant and the containment comes from geometry that was
+> already there.** The cut must live in `caveFill` and not in band 2, because band 1's
+> floor reaches h-100 and a band-1 AIR cell beside a band-2 LAVA cell at the same y is a
+> hole in the container; and the level must be a CONSTANT, because any per-column level
+> reintroduces a step, and a step in a liquid is a flow.
+>
+> **The settle curve, which is the route-free measurement** (`--autofly-park`,
+> `SANDVOX_PARK_SETTLE=3000`, same session, quiet machine, one run each):
+>
+> ```
+>            t300  t375  t675  t975  t1275  t1575  t2000  t2475  t2775  t3250
+>  before     521   570   450   342    241    200    393    197    152     75
+>  after        8     0     0     0      0      0      0      0      0      0
+> ```
+>
+> Not "faster to settle" — **settled**, from t325 to the end of the run. The park
+> histogram loses the whole lava band (`active-by-worldChunkY` `-4:103 -3:24 1:67 2:93`
+> becomes `1:67 2:98 4:10`) and lava disappears from the active set entirely.
+>
+> **Interleaved `--autofly-surface --frames 600`, 6 pairs** (one pair discarded: two
+> `sandvox.exe` were live, one of them not through `run.sh`, and it put a p95 of 1257 ms
+> into that arm — Correction 2's trap, still biting):
+>
+> ```
+>                      before        after
+> active chunks p50      470            23      -95%
+> active chunks mean     502            78      -84%
+> modelled CA         ~6900 us/tick  ~1250      -82%
+> whole-frame p50       23.4 ms       22.3      paired deltas -3.7 -3.0 -1.8 0.0 +0.2
+> whole-frame p95       51.2          51.7      flat
+> whole-frame p99       62.6          62.5      flat
+> ```
+>
+> **Read that carefully: the active-chunk count collapsed by 95% and the frame moved
+> ~1.5-2 ms at p50, with p95 and p99 flat.** Correction 4's 9 ms ceiling does NOT
+> decompose into "half lava, half ponds"; that experiment (`wgAct > 99999`) also froze
+> all streamed-in matter, and it is now clear most of its 9 ms was that freeze rather
+> than the CA the wake causes. Two things are worth inheriting:
+>
+> 1. **The ROADMAP §3.0 CA cost model overstates badly when extrapolated.** It was fitted
+>    at 3-69 active chunks and is being read here at ~500 — a 7x extrapolation. It claims
+>    5.5 ms/tick was removed; the frame says under 2 ms. Most of those 500 chunks are a
+>    lava pool where nearly every thread returns immediately, not an average chunk. Treat
+>    the model as an ordering, not a budget.
+> 2. **The remaining surface-flight frame is render, not CA.** Correction 3 already said
+>    so; this confirms it from the other direction, by removing nearly all the CA and
+>    watching p95/p99 not move.
+>
+> **The route-free per-event numbers, from the `streaming` gate (fixed route, so these
+> are directly comparable):**
+>
+> ```
+> chunks stored per streaming gate   5,177 -> 2,958   (-43%)
+> page pool high water              14,909 -> 13,338  (-11%)
+> ```
+>
+> `--autofly-hard` (the descent, the control arm) does not regress — p50 2.2 ms both
+> arms — and it stops being an active scenario at all: **active chunks p95 501 -> 0,
+> max 595 -> 19, mean 42 -> 0**, modelled CA 808 -> 253 us/tick, which is the bare
+> 54-dispatch floor. A descent through the cave band used to be a descent through
+> flowing lava.
+>
+> Both are consequences of the same thing: matter that never moves is never modified, so
+> it is never stored, and a fully-flooded cavern chunk is one material and demotes to a
+> `UNIFORM` sentinel instead of costing a 16 KiB page. The pool got *less* pressured, not
+> more, despite 3.7x the lava volume.
+>
+> **The content change, sized before it was made** (exact Python replica of `caveAt`'s
+> integer arithmetic, so these are not estimates): lava goes from 0.34 to 1.26 voxels per
+> column and from 11.5% to 14.0% of columns, i.e. roughly the same chance of meeting lava
+> in a deep cavern, in pools ~4x deeper instead of a 3-voxel skin, still in world chunk Y
+> -7..-5. It floods ~14% of band 2's void, so caverns stay walkable. `LAVA_LEVEL` is the
+> one knob: -70 is 9x the volume, -95 is a quarter of it.
+>
+> **THE PINNED HASH DID NOT MOVE, and that is a finding about the gate, not about this
+> change.** `7cfa2420` holds in both residency modes. The reason is that the `determinism`
+> gate's world sits at the DEFAULT window origin `(0,0,0)` (`world.h`, `origin_{0,0,0}`)
+> and never shifts, so its window is **y 0..511** — it contains no band-2 cavern at all
+> (band 2 lives entirely below y = -2) and only the y ≥ 0 slice of band 1. **A worldgen
+> change to the entire cave and lava band of the world moves no gate hash whatsoever.**
+> Verified deliberately rather than assumed: setting `LAVA_LEVEL = 10` (inside the
+> harness window) moves the hash to `f3236b6f`, and -80 does not. Anyone changing
+> worldgen below y = 0 should know the golden hash is blind to it and lean on
+> `--gate streaming` instead, which does fly.
+>
+> That same experiment is also the cleanest proof of the rest property, and a better one
+> than the settle curve: at `LAVA_LEVEL = 10`, with lava flooding the bottom of every
+> band-1 cave across the whole window, the `sleep` gate reports **0 / 32768 chunks
+> active**. Zero, in-window, observed.
+
 **Diagnosis in one line:** the frame cost is dominated by the raymarcher, whose per-ray
 cost scales linearly with ray length through non-empty chunks and which has **no LOD
 anywhere inside the 512³ window**; streaming adds a second, smaller cost that is specific
@@ -433,7 +540,9 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
 genChunk per shift         5.37 ms    (was 20.76)
 demote candidates/shift    270        (was 850; 592 demote with no copy)
 chunks stored per shift    28         (was 397)
-store after streaming gate 5,177      (was 35,471)
+store after streaming gate 2,958      (5,177 before Correction 5; 35,471 before Correction 3)
+page pool high water       13,338     (14,909 before Correction 5)
+active chunks under flight p50 23     (was 470 — Correction 5; the frame moved ~1.5 ms)
 ```
 
 Success criteria from Phase 0 are met: high-cruise is now the *cheaper* arm, and the

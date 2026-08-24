@@ -1764,12 +1764,73 @@ fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
 // horizontally connected to full columns at the mask boundary), which matters
 // because the island detector would correctly-but-noisily convert generated
 // floaters into debris the moment anything moved nearby.
-// Returns 0 = solid, 1 = carve to air, 2 = carve to lava (deep cavern floors).
+// Returns 0 = solid, 1 = carve to air, 2 = carve to lava (below the magma
+// table — see caveFill).
 // Cavern masks scale horizontally like everything else (a 40-voxel mask cell
 // made 2.5 m caves); the vertical spans grow only ~2x, matching the hills, so
 // a cavern is a passage you walk through rather than a crawl space. The
 // 10-voxel surface shell becomes 40 (2.5 m) so caves can't breach the new,
 // thicker soil layer from below.
+//
+// ---- THE MAGMA TABLE: generated matter has to be generated AT REST ---------
+//
+// Worldgen used to lay the deep lava down as a 3-voxel FULL-fullness slab on
+// the raw cavern floor (`y <= f2 + 2 && m2 > 190`). That is not a rest state:
+// f2 swings 70 voxels across a 40-voxel noise cell, so the slab was a sheet of
+// full lava on a ~25-degree hillside. It took ~2,700 ticks (~90 s of sim) to
+// flow level, and EVERY WINDOW SHIFT regenerated a fresh unsettled band — so
+// under sustained flight the world was permanently mid-settle. That band was
+// 97% of the still-active chunks in the `--autofly-park` histogram and about
+// half the whole surface-flight active set (docs/PLAN_surface_flight_perf.md,
+// corrections 4-5). Cost scales with activity (CLAUDE.md rule 2), so matter
+// that takes 90 seconds to stop moving is a rule-2 bug in the AUTHORING, not
+// in the CA.
+//
+// The hard part is that genCell is a PURE PER-CELL FUNCTION of (world coords,
+// seed): no flood fill, no neighbourhood walk, no way to find the rim of a
+// basin. "At rest" for a liquid normally means "flat, at whatever level its
+// basin sets", and the basin is precisely what a per-cell function cannot see.
+//
+// The way out is that a flat cut does not NEED to find the basin, because the
+// cave's own complement already is one. Fill every carved cell at or below
+// LAVA_LEVEL with lava and every carved cell above it with air, and then at
+// each y <= LAVA_LEVEL a cell is lava exactly when it is carved and stone
+// otherwise. So:
+//
+//   * laterally, every lava cell's neighbours are lava or STONE, at every
+//     level — containment is a property of the carve, not of the fill;
+//   * vertically, everything under a lava cell is lava or stone;
+//   * the only lava/air interface in the world is the single plane
+//     y == LAVA_LEVEL.
+//
+// Full cells, full cells beneath them, no lateral fullness difference and
+// nowhere to spread — stepLiquid (sim_step.wgsl) falls through all three of
+// its rules to the "settled: no markDirty" tail, and the chunk sleeps after
+// one tick like the stone around it. A pure per-cell test buys a globally
+// correct rest state because the FLATNESS comes from the constant and the
+// CONTAINMENT comes from the geometry that was already there.
+//
+// Two properties that must not be broken:
+//
+//   * The cut applies to BOTH BANDS, which is why it lives in caveFill and not
+//     in band 2. Band 1's floor reaches h - 100, which dips below LAVA_LEVEL
+//     wherever a pond bowl has carved h down, and a band-1 AIR cell beside a
+//     band-2 LAVA cell at the same y would be a hole in the container. Routing
+//     every carve through one function makes containment independent of which
+//     band cut the hole — today, and for any band added later.
+//   * The level must be a CONSTANT. Any per-column or per-noise-cell level
+//     reintroduces a step in the surface, and a step in a liquid is a flow.
+//     This is also the honest cost of the rule: the magma table is at the same
+//     height everywhere, which you could notice by comparing two distant
+//     caverns. A basin-local level is not computable here at any price.
+const LAVA_LEVEL : i32 = -80;
+
+// What a carved cell is filled with. The one place the magma table is applied.
+fn caveFill(y : i32) -> i32 {
+  if (y <= LAVA_LEVEL) { return 2; }   // flooded, and flat, and therefore still
+  return 1;                            // open cave
+}
+
 fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
   // band 1: near-surface caverns following the terrain
   let m1 = vnoise(x, z, 40 * HSCALE, seed ^ 5u);
@@ -1777,17 +1838,18 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
     let f1 = h - 40 - (vnoise(x, z, 32 * HSCALE, seed ^ 6u) * 60) / 255;
     let c1 = min(f1 + 10 + (vnoise(x, z, 12 * HSCALE, seed ^ 7u) * 20) / 255,
                  h - 40);
-    if (y >= f1 && y <= c1) { return 1; }
+    if (y >= f1 && y <= c1) { return caveFill(y); }
   }
   // band 2: deep caverns at absolute depth (streamed depth is real terrain)
   let m2 = vnoise(x + 7717, z - 4177, 48 * HSCALE, seed ^ 8u);
   if (m2 > i32(TUNE_CAVE_THRESHOLD2)) {
     let f2 = -40 - (vnoise(x, z, 40 * HSCALE, seed ^ 9u) * 70) / 255;
     let c2 = f2 + 12 + (vnoise(x, z, 16 * HSCALE, seed ^ 10u) * 26) / 255;
-    if (y >= f2 && y <= c2 && y <= h - 40) {
-      if (y <= f2 + 2 && m2 > 190) { return 2; }  // lava pools where mask peaks
-      return 1;
-    }
+    // No `m2 > 190` lava test here any more: gating the fill on the cavern
+    // MASK put a vertical lava wall against open air wherever m2 crossed 190,
+    // which is a flow the moment the world ticks. Depth is the only thing the
+    // fill may depend on.
+    if (y >= f2 && y <= c2 && y <= h - 40) { return caveFill(y); }
   }
   return 0;
 }

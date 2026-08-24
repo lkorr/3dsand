@@ -53,6 +53,21 @@ finding (DESIGN.md risk #3), not a reason to re-record.
 Deleting the key disables the check: the gate reports `not pinned` and passes on
 self-consistency alone, i.e. the old behaviour.
 
+**What it cannot see: anything below y = 0.** The determinism gate's world sits at
+the DEFAULT residency-window origin `(0, 0, 0)` (`world.h`, `origin_{0, 0, 0}`) and
+never shifts — only the `streaming` gate flies. So the hashed window is **y 0..511**,
+and worldgen's whole deep-cave layer is outside it: `caveAt`'s band 2 lives entirely
+below y = -2, and only the y >= 0 slice of band 1 is in range. A worldgen change that
+rewrites every cavern and every lava pool in the world can therefore leave `7cfa2420`
+completely untouched, which looks like "my change was hash-neutral" and is not the
+same statement at all.
+
+Measured, not assumed (2026-08-24, the magma-table change): moving the lava fill level
+to `LAVA_LEVEL = 10`, inside the window, moves the hash to `f3236b6f`; moving it to
+-80, below the window, does not move it at all. If you are changing worldgen below
+y = 0, the golden hash is not your gate — `--gate streaming` is, because it flies away
+and back and compares hash sequences across 226 shifts.
+
 The file is a **flat string→string map** with no comments: the parser is a
 deliberately strict hand-rolled scanner (no JSON dependency, since it runs
 before anything else is initialised), and prose keys in the file itself once
