@@ -124,12 +124,22 @@ const MARK_LIST_MASK : u32 = 0x1Fu;
 // solver: WGSL const-expressions fold IEEE-exactly, the kernel stays integer).
 // Settle/wake thresholds compare on the splash test's (v >> 8) scale so the
 // tuner's vox/s reads identically across all three.
-const SEAM_SETTLE8 : i32 =
-    i32(round(TUNE_FLUID_SETTLE_EPS * 65536.0 / 30.0)) >> 8u;
-const SEAM_SETTLE2 : i32 = SEAM_SETTLE8 * SEAM_SETTLE8;
-const SEAM_WAKE8 : i32 =
-    i32(round(TUNE_FLUID_WAKE_SPEED * 65536.0 / 30.0)) >> 8u;
-const SEAM_WAKE2 : i32 = SEAM_WAKE8 * SEAM_WAKE8;
+//
+// PRECISION (plan §5's SEAM_SETTLE8 fix): the threshold used to be truncated
+// to Q8.8 BEFORE squaring (>>8), which quantized the settleEps slider to
+// ~0.117 vox/s steps — non-monotone tuner behaviour right in the interesting
+// range. Truncate to Q12.4 instead (>>4), square, and shift the SQUARE down 8
+// so the compare stays in the measured side's exact (v >> 8)^2 units; the
+// slider now steps at ~0.0073 vox/s.
+// Overflow audit: LoadTuning clamps settleEps/wakeSpeed well under VMAX, but
+// audit at the absolute ceiling anyway — VMAX is 176947 Q16.16, so
+// (176947 >> 4)^2 = 11059^2 = 1.223e8 < 2^31. Fits i32 with 17x headroom.
+const SEAM_SETTLE4 : i32 =
+    i32(round(TUNE_FLUID_SETTLE_EPS * 65536.0 / 30.0)) >> 4u;
+const SEAM_SETTLE2 : i32 = (SEAM_SETTLE4 * SEAM_SETTLE4) >> 8u;
+const SEAM_WAKE4 : i32 =
+    i32(round(TUNE_FLUID_WAKE_SPEED * 65536.0 / 30.0)) >> 4u;
+const SEAM_WAKE2 : i32 = (SEAM_WAKE4 * SEAM_WAKE4) >> 8u;
 const SEAM_CALM_TICKS : u32 = u32(clamp(TUNE_FLUID_SETTLE_TICKS, 8, 600));
 // Hydrostatic compression per cell of depth, Q16: how much smaller than 1 the
 // seeded J gets per submerged cell. g/K with the /900 human-unit conversions
