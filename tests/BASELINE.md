@@ -106,48 +106,59 @@ but still far cheaper than the full run:
 ./build/Release/sandvox.exe --selftest --gate mob
 ```
 
-### `daylight-boundary` — recorded at `f8c1bc7`, 2026-08-23, RTX 3060 Ti
+## `daylight-boundary` passes in the suite and FAILS ALONE — and that is the finding
+
+Marked `"pass"`, because it passes in the full run, which is what the entry
+means. But `--gate daylight-boundary` on its own **fails**, on clean `f8c1bc7`
+and on `HEAD`:
 
 ```
-paged: 1 daylight crossing(s) with freeze OFF (EncodeWakeAll fired),
-       peak pages 32768 / 32768, exhausted=1, pageFaults 0,
-       0 chunks active after, hash 00000000
+solo:     peak pages 32768 / 32768, exhausted=1, pageFaults 0   FAIL
+in-suite: (same gate)                                           PASS
 ```
 
-**This is not a cosmetic entry, and it should not be left sitting here.** The
-gate exists to prove exactly one thing — that `PLAN_page_table.md` §3.8's fatal
-`std::abort()` on pool exhaustion stays unreachable in normal play — and it is
-currently reporting the pool at **32,768 / 32,768, `exhausted=1`**: a daylight
-boundary drives paged residency to 100% of the pool. Nothing aborts, because
-`everExhausted` is a `>=` watermark rather than a real allocation failure, and
-`pageFaults` is still 0, so no voxel was lost. But the margin the gate was
-written to measure is gone.
+Do not "fix" this by baselining it to `"fail"` — that was tried, and it is
+wrong in the direction that matters: it would turn the *suite's* green into a
+recorded failure and hide a real regression later.
 
-Two things it is NOT:
+**Why the two disagree.** The gate asserts `PagesInUse() < PoolPages()`
+throughout a daylight crossing, to prove `PLAN_page_table.md` §3.8's fatal
+`std::abort()` stays unreachable. Run alone, the gate starts on a freshly
+generated full window with the pool near its worldgen high-water and
+`EncodeWakeAll` then dirties all 32,768 slots at once. Run in the suite,
+earlier gates have already demoted a large fraction of the window to
+EMPTY/UNIFORM/JITTER sentinels, so the same wake-all lands with real headroom
+(the suite reports a 15,861/32,768 high water). Same code, different starting
+residency.
 
-  * **Not the renderer's.** It reproduces on clean `f8c1bc7` with no shader
-    changes, and the far-field/LOD work is render-only (`farVox` is derived
-    data, never paged).
-  * **Not visible under `--residency dense`.** Dense is the identity map, so
-    `PagesInUse() == PoolPages()` by construction and the gate deliberately
-    gates `everExhausted` on `paged`. Dense reports the same `32768 / 32768`
-    and passes. Do not read that pass as evidence the pool is healthy.
+**So the margin the gate measures is a function of what ran before it, which
+means the gate currently does not measure what it claims to.** The abort is
+unreachable *in the suite's world*; the solo run is the honest adversarial
+case, and it says a daylight boundary on a fully-materialized window has zero
+margin. Nothing aborts even then — `everExhausted` is a `>=` watermark, not an
+allocation failure, and `pageFaults` stays 0, so no voxel is lost.
 
-Where to look: `EncodeWakeAll` sets all 32,768 dirty flags, and §3.8's
-"intersect nonSentinel" filter on the materialization set is what is supposed
-to stop that becoming 32,768 page demands. The filter is present (or the abort
-would fire, twice per in-game day — the gate's own header says so), so the
-question is why the surviving non-sentinel set is still the whole window at a
-boundary. A day/night transition re-lights the surface band, and a JITTER chunk
-whose light changes is no longer representable by its sentinel — which would
-make the boundary a mass sentinel-to-real-page conversion event. That is a
-hypothesis, not a diagnosis; `SANDVOX_PT_DEBUG=1` around the crossing tick will
-say.
+Two ways it misleads, both worth knowing before touching it:
 
-Reproduce in ~0.5 s:
+  * **`--residency dense` reports the identical `32768 / 32768` and PASSES.**
+    Dense is the identity map, so `PagesInUse() == PoolPages()` by
+    construction; the gate deliberately gates `everExhausted` on `paged`. That
+    pass is not evidence the pool is healthy.
+  * **It is not the renderer's.** It reproduces with no shader changes, and
+    the far-field/LOD work is render-only (`farVox` is derived data, never
+    paged).
+
+Worth fixing properly: either have the gate establish its own residency
+precondition (materialize the window first, so solo and in-suite agree), or
+narrow §3.8's "intersect nonSentinel" materialization filter so a wake-all
+cannot demand the whole window regardless of starting state. The first makes
+the gate honest; the second makes the engine safe. They are not the same job.
+
+Reproduce the disagreement in ~1 s:
 
 ```bash
-./build/Release/sandvox.exe --selftest --gate daylight-boundary --json day.json
+./build/Release/sandvox.exe --selftest --gate daylight-boundary --json day.json  # FAIL
+./build/Release/sandvox.exe --selftest                                           # PASS
 ```
 
 ## Resolved: melee "hilt in fist"

@@ -28,6 +28,52 @@ visible: ~0.2 fps — cost scales with how much world the camera can *see*.
 > Lesson for the next reader: get the whole-frame-vs-render split before believing a
 > renderer diagnosis. `--frames` prints both.
 
+> **CORRECTION 2 (2026-08-23, Phase 1 / Part A implemented and measured).**
+> Part A is real but **small**, and the "~46 ms of render+present" above was a
+> measurement artifact. Both are worth stating plainly because the first correction
+> above is what sent the next session at Part A expecting a 46 ms prize.
+>
+> **The measurement environment was contaminated.** An unrelated `sandvox.exe` was
+> being respawned continuously by a tuner instance — not launched through
+> `scripts/run.sh`, so the run mutex never serialised it. The *same* gate, same
+> binary, same config, measured **101.75 / 14.60 / 127.87 ms** on three back-to-back
+> runs. Every "render+present" figure in Correction 1, and the first round of A1/A3
+> numbers, were taken under that load. On a quiet machine the offscreen 1080p sweep
+> is **~10 ms/frame with shadows, ~5 ms without** — the renderer was never spending
+> 46 ms.
+>
+> **A1 (in-window LOD handoff): LANDED, ~8-11%, saturates at 22-24 m.**
+> Implemented as a `min()` clamp on `trace()`'s `tExit`, so `fs()`'s existing
+> `traceFar(.., h.tExit, ..)` handoff picks up at the LOD distance and all the
+> cascade machinery (level selection, one-sided seam dither, `tPrev` ordering) is
+> reused untouched. Measured, shadows on: 10.36 off / 9.65 at 22 m / **9.02 at
+> 24 m** / 9.22 at 18 m. Image A/B at 18 m: near field bit-identical, silhouettes
+> and positions preserved, but mid-field per-blade grass visibly becomes 40 cm
+> blocks — so the default is **24 m**, which keeps nearly all of a small win and
+> costs almost no visible detail. It does NOT flatten the altitude curve; f8c1bc7
+> had already done that.
+>
+> **A3 (shadow-ray LOD): IMPLEMENTED, MEASURED, DEFAULT-OFF — the premise is wrong.**
+> Routing distant receivers' shadows through `farShadowed` was expected to roughly
+> halve open-terrain cost. Measured: 10.35 ms control / 10.26 ms at 12 m (noise) /
+> **497.46 ms at 0 m — 48x WORSE**. The reason A3 cannot work as specified: a fine
+> shadow ray is cheap *because it terminates on the first blocker*, typically a few
+> voxels away, with chunk-occupancy skipping the rest. A cascade shadow ray has no
+> such early exit — it must cross the whole `TUNE_FAR_SHADOW_REACH` (60 m) before it
+> may conclude "unshadowed", and for a NEAR receiver `farLevelForDist` picks level 1
+> whose cells are only 4 voxels, so that reach costs the full 128-step clamp plus an
+> occupancy lookup per step. The nearer the receiver, the worse the trade — exactly
+> backwards from an LOD. The cascade shadow is not a cheaper shadow; it is the
+> shadow that exists where there are no fine voxels to march. Code kept behind
+> `shadowMaxDist = 999` so the experiment is re-runnable and the refutation is
+> recorded where the idea lives (`sunShadowAt` in `raymarch.wgsl`).
+>
+> **What this means for the ranking below.** Item 5 (A3) is refuted. The remaining
+> honest levers on shadow cost are making the fine ray *terminate sooner* (A2's
+> sub-chunk occupancy bitmask) or casting *fewer* of them — not swapping which
+> volume it marches. And since the whole quiet-machine frame is ~10 ms, Part A's
+> remaining items should be judged against that, not against 46 ms.
+
 **Diagnosis in one line:** the frame cost is dominated by the raymarcher, whose per-ray
 cost scales linearly with ray length through non-empty chunks and which has **no LOD
 anywhere inside the 512³ window**; streaming adds a second, smaller cost that is specific
@@ -157,18 +203,18 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
    budget; cache the control arms.**
 
 ### Phase 1 — renderer (owns the altitude curve; biggest wins)
-3. **A5 first (small, safe, immediate):** sentinel-aware trace loop. Read the
-   `pageTable[]` entry beside `chunkOcc`; UNIFORM/JITTER blocker → hit at entry face,
-   non-blocking → reuse the EMPTY exit-face jump (`raymarch.wgsl:1163-1195`).
-   Render-only; hash must not move.
-4. **A1 (the big one):** in-window LOD handoff. Let the primary march switch to the far
-   cascade when projected cell size < ~1 px (distance threshold is an acceptable v1),
-   instead of only at window exit. The representation already exists
-   (`farCellShift(1)`); this is ROADMAP_scale.md:264 made real. Expect this alone to
-   flatten the altitude curve.
-5. **A3:** shadow-ray LOD — cap shadow length by camera distance and/or route
-   beyond-a-few-metres shadows through the cascade (`farShadowed` at `:1602` is the
-   template).
+3. ~~**A5 first (small, safe, immediate):** sentinel-aware trace loop.~~ **DONE**
+   (f8c1bc7). Reads the `pageTable[]` entry beside `chunkOcc`; UNIFORM/JITTER blocker
+   → hit at entry face, non-blocking → reuses the EMPTY exit-face jump.
+4. ~~**A1 (the big one):** in-window LOD handoff.~~ **DONE, and it is not the big
+   one** — ~8-11%, saturating at 22-24 m, default 24. See Correction 2. Implemented
+   as a `min()` on `trace()`'s `tExit` so the existing `traceFar` handoff is reused
+   verbatim; `TUNE_LOD_HANDOFF_DIST`, hot-reloadable, >= 25.6 disables.
+5. ~~**A3:** shadow-ray LOD — route beyond-a-few-metres shadows through the cascade.~~
+   **REFUTED BY MEASUREMENT** — 48x worse at full effect (497 ms vs 10.35 ms). The
+   cascade shadow has no early-out; the fine one does. Code kept default-off
+   (`shadowMaxDist = 999`) as a re-runnable experiment. See Correction 2 and the
+   comment on `sunShadowAt`.
 6. **A2 (if still needed after 4-5):** sub-chunk occupancy bitmask (4³ bits = 2 u32 per
    chunk) so half-full canopy/meadow chunks skip internally. NB: the sim cell-mask
    experiment reverted in ROADMAP_scale.md:139-186 was measured in a dispatch-floor
@@ -177,11 +223,45 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
    `traceMicro`/`traceStrands`.
 
 ### Phase 2 — streaming (owns part of the low-altitude 5 fps)
-8. **B2:** async-ify the shift-demote occupancy prefilter (same shape as
-   `HarvestDemotes`: one-shift-latent result is fine).
+8. **B2:** ~~async-ify the shift-demote occupancy prefilter (one-shift-latent is fine).~~
+   **ATTRIBUTED AND DOCUMENTED, NOT DONE — "one-shift-latent is fine" is false.**
+   This IS the remaining surface-band cost, and it is not close. Measured under
+   `--autofly-surface` with `SANDVOX_PT_DEBUG=1`:
+
+   ```
+   [pt-time] shift demote: gen=1024 cands=815 issued total 39.78 ms (occ 39.55)
+   [pt-time] tick 941 materialize: 0.38 ms   freeprobe: 1.12 ms
+   [pt-time] evict harvest: 256 items total 6.56 ms
+   ```
+
+   **39.55 of 39.78 ms is the `omap.Wait()`**, against sub-millisecond materialize
+   and single-digit freeprobe/harvest. It explains the whole ~40 ms paged p50.
+
+   It cannot simply be deferred, because the buffer has **two consumers with
+   opposite staleness requirements** (full argument at the site in `stream.cpp`):
+   the demote prefilter is stale-tolerant (`HarvestDemotes` re-verifies every
+   candidate from the copied words — identity, freshness, `CpuDirty`, `Classify`),
+   but the **act-set wake is stale-fatal and has no downstream verification** —
+   `nonAir == 0u → continue` skips `RefilledSlot`, so a stale "pure sky" verdict on
+   a chunk holding matter is silent voxel loss, i.e. the 217-page-fault bug.
+   The conservative directions are opposites: zeros mean "test everything" for
+   demotion and "wake nothing" for the act set. Waking the whole plane instead is
+   closed too — measured twice as fatal pool exhaustion.
+
+   **The real fix is to compute the act set on the GPU beside `genChunk` and read
+   back only the (stale-tolerant) demote filter.** That is a design change, not an
+   async-ification, and it is the single highest-value item left in this plan.
 9. **B3:** replace the `WaitIdle` staleness drain with a bounded catch-up (skip/defer
    the snapshot consumer instead of draining the device).
-10. **B5:** `std::move` into `ChunkStore::Put`; amortize `SpillOverBudget`.
+10. **B5:** ~~`std::move` into `ChunkStore::Put`; amortize `SpillOverBudget`.~~ **DONE
+    (the move); the scan half was a misreading.** Both call sites now move — `Put`
+    takes by value and already moves internally, so an lvalue copied the whole RLE
+    for nothing, worst exactly on the mixed surface chunks that do not compress.
+    Safe from the reused scratch buffers because both encoders `clear()` their `out`
+    first. **`SpillOverBudget` was NOT the per-Put linear scan described here**: the
+    `while (regions_.size() > kMaxRamRegions)` guard runs first, so an under-budget
+    Put costs one `size()` compare, and the O(64) scan happens only on an actual
+    eviction, one region per pass. Left alone, with a comment saying so.
 11. **B4 (only if the `inUse=` curve from Phase 0 shows dilation):** narrow the mixed-
     chunk wake — e.g. wake only mixed chunks with a non-settled neighbourhood, or cap
     per-shift refill admissions and carry the remainder.
@@ -194,6 +274,31 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
 - Success criteria: high-cruise `--autofly-surface` within ~2× of underground frame
   time; low-skim p50 comparable to the landed descent p50 (~3 ms); no new faults; pool
   `inUse=` stable under sustained surface flight.
+
+### Where it actually stands (2026-08-23, quiet machine, after A1 + A5 + B5)
+
+**Success criteria NOT met, and the reason is B2, not the renderer.**
+
+```
+--autofly-surface  paged   low-skim p50 39.6   high-cruise p50 50.8
+--autofly-surface  dense   low-skim p50 71.0   high-cruise p50 69.5
+--autofly-hard     paged   p50 4.6   p95 35.6   >100ms 0        (no regression)
+offscreen 1080p            9.02 ms shadows on / ~4.6 ms off     (the renderer)
+```
+
+Three things to carry forward:
+
+1. **The renderer is ~9 ms and is no longer the problem.** The remaining ~40 ms of
+   the paged surface frame is the B2 `omap.Wait()`, attributed above by direct
+   measurement. Do not spend more effort on Part A items expecting frame-time wins;
+   A2/A6 are worth doing for their own sake, against a 9 ms budget.
+2. **Paged is now FASTER than dense on this scenario** (44.1 vs 70.0 ms whole-frame
+   p50), reversing the earlier reading. The old "dense is 25x faster" measurement was
+   taken under GPU contention and should not be quoted.
+3. **Every number in this document that predates Correction 2 is suspect.** The
+   contention was invisible — a second process, not launched through `scripts/run.sh`,
+   so the run mutex never serialised it. Check `tasklist | grep sandvox` before
+   trusting a measurement, and take any timing twice.
 
 ### Explicitly out of scope for now
 - New sentinel classes for the surface band (heightfield/partial-page): real but large;

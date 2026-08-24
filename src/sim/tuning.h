@@ -1240,6 +1240,43 @@ struct Tuning {
     // is the same world distance at every cascade level (a raw step count is
     // not: it scales with the level's cell size — see the comment there).
     float farShadowReach = 60.0f;
+
+    // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
+    // Distance in METERS past which the PRIMARY march stops resolving fine
+    // 10 cm voxels and hands the rest of the ray to the far-field cascade,
+    // instead of only doing so when the ray leaves the 25.6 m window.
+    //
+    // The trade, stated plainly: at the handoff a 1-voxel cell becomes a
+    // FAR_CELL1_VOX-voxel one (4 voxels = 40 cm here), so terrain past this
+    // distance quantises 4x coarser. Silhouettes and positions are preserved
+    // — an A/B at 18 m vs off showed trees, hillsides and structures in the
+    // same places with the same shapes — but per-blade grass detail in the
+    // mid field visibly becomes 40 cm blocks.
+    //
+    // MEASURED (offscreen 1080p sweep, camera 12 m over canopy, quiet
+    // machine, shadows on): 10.36 ms off / 9.65 ms at 22 / 9.02 ms at 24 /
+    // 9.22 ms at 18. The win is ~8-11% and it SATURATES around 22-24 m:
+    // pushing the handoff nearer buys nothing more and only spends image
+    // quality. That is why the default is 24 and not the 18 first tried, and
+    // it is also the honest verdict on the plan's expectation that A1 alone
+    // would "flatten the altitude curve" — it does not. It is a single-digit
+    // percentage win, not the 46 ms the plan attributed to Part A.
+    //
+    // Set >= WINDOW_HALF_EXTENT_METERS (25.6 m) to disable the handoff
+    // entirely and get the old "switch only at window exit" behaviour — which
+    // is exactly how to A/B it without a rebuild (F5 reloads it).
+    float lodHandoffDist = 24.0f;
+    // Distance in METERS past which a PRIMARY hit takes the cascade shadow
+    // (farShadowed) instead of a real per-voxel sun ray (A3).
+    //
+    // DEFAULT 999 = OFF, because it was measured and it does not pay: 10.35 ms
+    // control vs 10.26 ms at 12 m (noise) and 497 ms at 0 m — 48x WORSE, not
+    // better. A fine shadow ray terminates on the first blocker a few voxels
+    // away; a cascade ray must cross farShadowReach (60 m) at level-1 cell
+    // size before it may conclude "unshadowed". See the long comment on
+    // sunShadowAt in raymarch.wgsl for why, and for what would actually work.
+    // Kept as a knob so the experiment is re-runnable, not as a feature.
+    float shadowMaxDist = 999.0f;
   } render;
 
   // ---- worldgen (integer; regenerating the world is required to see edits) ----

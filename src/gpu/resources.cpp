@@ -107,6 +107,17 @@ std::string ShaderConstantPrelude() {
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);
   o << "const VOXEL_METERS : f32 = " << kVoxelMeters << ";\n";
+  // The residency window's half-extent in metres (world.h's
+  // kWindowHalfExtentMeters). The in-window LOD handoff clamps against this:
+  // beyond it there are no fine voxels to march anyway, so a handoff distance
+  // past the window is the old "switch only at window exit" behaviour.
+  o << "const WINDOW_HALF_EXTENT_METERS : f32 = " << kWindowHalfExtentMeters
+    << ";\n";
+  // Fine voxels per level-1 cascade cell (world.h's kFarCellVox(1)). This is
+  // what the handoff actually trades away: at the switch distance a 1-voxel
+  // cell becomes a FAR_CELL1_VOX-voxel one, so it is the honest measure of the
+  // quantisation the LOD introduces.
+  o << "const FAR_CELL1_VOX : f32 = " << (float)kFarCellVox(1) << ";\n";
   return o.str();
 }
 

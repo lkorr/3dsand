@@ -114,6 +114,12 @@ bool ChunkStore::WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut) {
 
 void ChunkStore::SpillOverBudget() {
   if (dir_.empty()) return;  // unbound: nowhere to spill
+  // NOT the per-Put linear scan PLAN_surface_flight_perf.md B5 describes:
+  // the loop guard runs first, so a Put that is under budget costs one size()
+  // compare and nothing else. The O(regions) scan happens only on an actual
+  // eviction, and each pass of it evicts one region — so it is O(64) per
+  // spill, not per Put. Left alone deliberately after re-reading it; the copy
+  // at the two call sites was the real find in that item and is fixed.
   while (regions_.size() > kMaxRamRegions) {
     auto lru = regions_.begin();
     for (auto it = regions_.begin(); it != regions_.end(); ++it)

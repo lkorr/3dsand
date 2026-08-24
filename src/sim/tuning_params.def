@@ -338,6 +338,10 @@ TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096)
 TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
 TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
 
+// ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
+TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
+TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
+
 // ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
 TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22)
 TP_I(sim, partMaxVel, TUNE_PART_MAX_VEL, 1536)

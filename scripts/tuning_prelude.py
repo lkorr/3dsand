@@ -268,6 +268,10 @@ SPEC = [
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
 
+    # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
+    ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
+    ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
+
     # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),
     ("sim", "partMaxVel", "TUNE_PART_MAX_VEL", "i", 1536),

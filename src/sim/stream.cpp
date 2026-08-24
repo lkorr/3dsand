@@ -326,7 +326,13 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       // A modified (or unfiltered-flush) sentinel is stored synchronously:
       // pure CPU, ~4 us a chunk, and the store is current before FillSlots
       // could possibly look this chunk up again.
-      store_.Put(wc, sentRle);
+      // std::move: Put takes the vector BY VALUE and moves it into the region
+      // map, so an lvalue here copied the whole RLE (allocate + memcpy) for
+      // nothing. Moving is safe even though sentRle is a reused scratch buffer
+      // — RleEncodeSentinelChunk clear()s and refills `out` on every call, so
+      // the next iteration never reads the moved-from state. The trade is one
+      // copy for one regrow, and the regrow is the cheaper half.
+      store_.Put(wc, std::move(sentRle));
       continue;
     }
     toSave.push_back({s, {world_->SlotToWorldChunk(s), dropIfAir}});
@@ -446,7 +452,12 @@ void Stream::CompleteOldest(bool discard) {
           }
           bool air = rle.size() == 2 && rle[1] == 0;
           if (air && p.items[i].dropIfAir) continue;
-          store_.Put(p.items[i].wc, rle);
+          // Moved for the same reason as the sentinel Put above: this is the
+          // site that hurts most, because a mixed SURFACE chunk is exactly the
+          // one whose RLE does not compress (PLAN_surface_flight_perf.md B5).
+          // Both encoders clear() their `out` first, so the scratch buffer is
+          // safe to move from inside the loop.
+          store_.Put(p.items[i].wc, std::move(rle));
         }
       }
     }
@@ -673,6 +684,48 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // removes the create/destroy; the copy+map is still queue-ordered behind
       // genChunk's submit, which is the dependency that matters (reading early
       // returns the PREVIOUS contents and would demote every generated chunk).
+      // ---- WHY THIS WAIT IS STILL HERE (PLAN_surface_flight_perf.md B2) ----
+      // Measured under --autofly-surface with SANDVOX_PT_DEBUG=1, this is THE
+      // remaining cost of the surface band and it is not close:
+      //
+      //   [pt-time] shift demote: gen=1024 cands=815 total 39.78 ms (occ 39.55)
+      //
+      // 39.55 of 39.78 ms is this map wait, against materialize 0.3-0.4 ms,
+      // freeprobe 1-6 ms and evict harvest 4-6 ms. It is a fence behind a
+      // saturated queue on a band where the CA has real work, so it is
+      // absorbing that work rather than adding its own.
+      //
+      // The obvious fix -- defer the wait a shift and filter on last shift's
+      // occupancy -- was analysed and is UNSAFE, for a reason worth writing
+      // down because the buffer has TWO consumers with OPPOSITE staleness
+      // requirements:
+      //
+      //   * the DEMOTE prefilter below (the `paged` loop) is stale-TOLERANT.
+      //     It only picks CANDIDATES; HarvestDemotes re-verifies every one
+      //     from the actually-copied words (identity via PackChunkKey, still
+      //     paged, kDemoteFreshTicks, CpuDirty, then Classify). A stale occ
+      //     can only add a candidate Classify then rejects, or omit one that
+      //     demotes a shift later. This is the same stale-filter/exact-verify
+      //     shape as the batched free probe in ConsumeOccupancy.
+      //
+      //   * the ACT SET wake above it is stale-FATAL, and has NO downstream
+      //     verification at all. `nonAir == 0u -> continue` SKIPS
+      //     RefilledSlot, so one chunk that stale data calls "pure sky" while
+      //     it holds matter is a chunk that never wakes -- silent voxel loss,
+      //     which is precisely the 217-page-fault bug. The two conservative
+      //     directions are opposites (zeros mean "test everything" for demote
+      //     and "wake nothing" for the act set), so there is no single stale
+      //     read that is safe for both.
+      //
+      // Waking the whole plane instead, so the act set needs no occupancy, is
+      // the other exit and it is closed too: that is the blanket form the
+      // comment below describes, measured TWICE as fatal pool exhaustion.
+      //
+      // So B2 does not reduce to "make it async". It needs the act set to get
+      // fresh occupancy by a route that is not a CPU fence -- computing the
+      // act set on the GPU beside genChunk and reading back only the demote
+      // filter, most likely. That is a real design change, not a deferral,
+      // and it is left undone deliberately rather than shipped racy.
       std::vector<uint32_t>& occ = genOccScratch_;
       if (occ.size() != kNumChunks) occ.assign(kNumChunks, 0);
       bool occValid = false;

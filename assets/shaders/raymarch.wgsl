@@ -1124,7 +1124,60 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   let tmin = min(tt0, tt1);
   let tmax = max(tt0, tt1);
   let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
-  let tExit = min(tmax.x, min(tmax.y, tmax.z));
+  var tExit = min(tmax.x, min(tmax.y, tmax.z));
+
+  // ---- IN-WINDOW LOD HANDOFF (PLAN_surface_flight_perf.md A1) ----
+  // The far-field cascade used to be reachable only after a ray left the whole
+  // window, so everything within 25.6 m marched at full 10 cm resolution and a
+  // hillside 25 m out cost the same per pixel as a wall 2 m out.
+  //
+  // WHAT THIS ACTUALLY BOUGHT, since the plan predicted much more: ~8-11% on
+  // the offscreen 1080p sweep, saturating at 22-24 m (see tuning.h). The plan
+  // held Part A responsible for ~46 ms of a 51 ms dense frame and expected
+  // this to flatten the altitude curve; it does not. The altitude curve was
+  // already gone before this change — f8c1bc7's free-probe batching removed
+  // it, and the residual "46 ms render+present" the plan cited was measured on
+  // a machine with competing GPU work (an unrelated app was respawning under
+  // the harness; the same gate read 101 / 14 / 127 ms on three back-to-back
+  // runs). On a quiet machine the whole offscreen frame is ~10 ms.
+  //
+  // So this is a real but small win, kept because it is also the mechanism any
+  // future in-window LOD needs, not because it rescued the frame.
+  //
+  // The fix is to end the FINE march early and let the cascade cover the rest.
+  // It is deliberately implemented as a clamp on tExit and nothing else,
+  // because tExit is ALREADY the contract with the caller: fs() hands
+  // h.tExit to traceFar as the start distance, so shortening it moves the
+  // handoff without touching the handoff machinery (level selection, the
+  // one-sided seam dither, the tPrev ordering that stops levels re-covering
+  // each other). The cascade then starts at the LOD distance instead of at
+  // the window face, which is the whole feature.
+  //
+  // Why a distance and not a projected-size test: px_per_cell for a fine cell
+  // is VOXEL_METERS*H / (2*d*tan(fov/2)), so a true 1-px rule solves to a
+  // distance anyway. Making that distance the knob keeps it inspectable and
+  // hot-reloadable (F5) rather than burying it in a per-ray divide, and the
+  // plan explicitly accepts a distance threshold as v1.
+  //
+  // THE CLAMP IS ONLY EVER A SHORTENING (min), which is what keeps it safe:
+  //   * A ray whose window exit is already nearer than the handoff distance
+  //     is untouched, so nothing changes underground or in interiors — where
+  //     rays terminate in 1-3 m and the renderer was never the problem.
+  //   * Shortening cannot open a gap the way a lengthened handoff could: the
+  //     cascade's levels tile t-space from wherever they are told to start,
+  //     and traceFar's own tPrev max() clamps against re-covering. The finer
+  //     representation simply stops earlier and the coarser one takes over.
+  //
+  // SHADOW AND REFLECTION RAYS ARE EXCLUDED (wantMedia gates it). Those rays
+  // are already budget-capped and, more importantly, a shadow ray that gave up
+  // at 18 m would report "lit" for a receiver whose blocker is at 20 m --
+  // unshadowing terrain rather than coarsening it. A3 handles shadow cost by
+  // routing the whole ray through the cascade instead, which still answers the
+  // occlusion question.
+  if (wantMedia && TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
+    tExit = min(tExit, max(tEnter, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
+  }
+
   if (tExit <= tEnter) { return out; }
   out.tExit = tExit;
 
@@ -1681,6 +1734,30 @@ fn farShadowSteps(level : u32) -> i32 {
   return clamp(i32(TUNE_FAR_SHADOW_REACH / max(cellM, 1e-4)), 8, 128);
 }
 
+// Which cascade level covers a point, given as a distance from the camera in
+// FINE voxels. The levels are nested boxes centred on the camera whose
+// half-extents double (world.h: level k's half-extent is 2^k window radii), so
+// the covering level is the first whose box contains the point.
+//
+// This exists for A3: a hit found by the FINE march has no `level` of its own,
+// but routing its shadow through the cascade needs one. Walking the levels
+// rather than computing a log keeps it agreeing with kFarHalfExtentMeters by
+// construction — the same derivation traceFar's box tests use — instead of
+// re-deriving the geometry with a formula that could drift from it.
+//
+// Clamped to FAR_LEVELS: a point past the outermost box is behind ~99% fog
+// anyway (see the fog pin in world.h), so the outermost level is the right
+// answer for it and there is nothing beyond to fall through to.
+fn farLevelForDist(distFine : f32) -> u32 {
+  let dM = distFine * VOXEL_METERS;
+  for (var k = 1u; k <= FAR_LEVELS; k++) {
+    // Level k half-extent in metres = FAR_N/2 * 2^(k+FAR_SHIFT_BASE) * VOXEL_METERS.
+    let halfM = f32(FAR_N) * 0.5 * f32(1u << farCellShift(k)) * VOXEL_METERS;
+    if (dM <= halfM) { return k; }
+  }
+  return FAR_LEVELS;
+}
+
 fn farShadowed(level : u32, roFine : vec3f) -> bool {
   var rd = keyLightDir();
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -2000,7 +2077,55 @@ fn voxelAO(cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32, uv : vec2f) -> f
 // Cast from the KEY light, so at night the shadows are the moon's and point
 // the other way — a scene whose shadows still track the sun after dark reads
 // as broken immediately.
-fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
+// ---- SHADOW-RAY LOD (PLAN_surface_flight_perf.md A3) — MEASURED, DOES NOT PAY
+// DEFAULT-OFF (TUNE_SHADOW_MAX_DIST = 999). Kept because the measurement is
+// the point: the plan's A3 premise is WRONG, and the next person to read
+// "sunShadow is 384 steps on every lit pixel with no falloff" will have the
+// same idea unless the refutation is written down where the idea lives.
+//
+// The premise was that farShadowed is the cheap shadow and the fine trace is
+// the expensive one, so routing distant receivers through the cascade should
+// roughly halve open-terrain render cost. Measured on the offscreen 1080p
+// sweep (camera 12 m over canopy, the surface-flight case), quiet machine:
+//
+//   shadowMaxDist 999 (all fine, control) : 10.35 ms
+//   shadowMaxDist 12  (mixed)             : 10.26 ms   ~1%, at the noise floor
+//   shadowMaxDist 0   (all cascade)       : 497.46 ms  48x WORSE
+//
+// The 48x is the explanation. A fine shadow ray is cheap for the reason the
+// plan overlooked: it TERMINATES on the first blocker, which over terrain is
+// usually a few voxels away, and the chunk-occupancy skip covers the rest. A
+// cascade shadow ray does not get to be cheap — farShadowed has to cross
+// TUNE_FAR_SHADOW_REACH (60 m) of world before it may conclude "unshadowed",
+// and for a NEAR receiver farLevelForDist picks level 1, whose cells are only
+// FAR_CELL1_VOX voxels wide, so that reach costs the full 128-step clamp plus
+// an occupancy lookup per step. Swapping a ray that stops at 3 voxels for one
+// that always walks 60 m is a pessimisation, and the nearer the receiver the
+// worse it gets — exactly backwards from an LOD.
+//
+// So the cascade shadow is not a cheaper shadow; it is the shadow that exists
+// where there are no fine voxels to march. That is why the far field uses it
+// and why it is right there and wrong here.
+//
+// Whatever does eventually cut shadow cost, this is the shape of the answer it
+// has to beat. The remaining honest levers are making the fine ray terminate
+// sooner (A2's sub-chunk occupancy bitmask, so a half-full canopy chunk skips
+// internally instead of being marched per voxel) or casting fewer of them —
+// not swapping which volume it marches.
+//
+// The code below is correct and hot-reloadable; set shadowMaxDist to a real
+// distance to re-run the experiment. It is not on any frame's critical path
+// while the default stands.
+fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
+  if (camDistFine * VOXEL_METERS > TUNE_SHADOW_MAX_DIST) {
+    // Lift the start point off the face by half a CASCADE cell, not half a
+    // voxel: at this level the receiver's own cell is what the ray would
+    // otherwise immediately hit, exactly as the far-field call site does.
+    let lvl = farLevelForDist(camDistFine);
+    let off = n * (0.55 * f32(1u << farCellShift(lvl)));
+    if (farShadowed(lvl, hp + off)) { return TUNE_SHADOW_FAR_LIFT; }
+    return 1.0;
+  }
   let s = trace(hp + n * TUNE_SHADOW_BIAS, keyLightDir(), TUNE_SHADOW_STEPS, false);
   if (!s.hit) { return 1.0; }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
@@ -2015,6 +2140,13 @@ fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
   // blocker only partially covers the solar disc, so its shadow lifts toward
   // ~0.45 of full sun, while a contact shadow stays at 0.
   return clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) * TUNE_SHADOW_LIFT, 0.0, 1.0);
+}
+
+// Callers that shade a surface whose camera distance is not to hand (the
+// translucent-solid path, which is already gated to near ice by its own
+// reflection budget) keep the full-quality near shadow.
+fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
+  return sunShadowAt(hp, n, px, 0.0);
 }
 
 // ============================================================================
@@ -4725,7 +4857,9 @@ fn fs(in : VSOut) -> FSOut {
     // gradient between them to read as slope. Widening the wrap fills that gap.
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
-      lambert *= sunShadow(R.camPos + rd * (h.t - 1e-3), n, in.pos.xy);
+      // h.t is the receiver's distance from the camera in fine voxels, which
+      // is what picks the near (per-voxel) or cascade shadow — see sunShadowAt.
+      lambert *= sunShadowAt(R.camPos + rd * (h.t - 1e-3), n, in.pos.xy, h.t);
     }
     // Direct sun + hemisphere ambient. Ambient is occluded by AO (it is sky
     // light, and AO measures how much sky the point can see); direct sun is

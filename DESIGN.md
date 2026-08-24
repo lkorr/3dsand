@@ -1669,10 +1669,23 @@ world hash.
   writes collide, so `farVox`/`farOcc` are atomic in both far kernels
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
   keeps it conservative: never falsely zero). Atomics are legal here precisely
-  because cascades carry no determinism requirement. Rays that exit the fine
-  window without a hit continue through the cascade boxes with the same
+  because cascades carry no determinism requirement. Rays that leave the fine
+  march without a hit continue through the cascade boxes with the same
   occupancy-skipped DDA in level-cell units; t-ordering (each level starts at
   the previous box's exit) keeps coarse data from ever occluding fine data.
+  **A ray leaves the fine march at whichever comes first: the window exit, or
+  the in-window LOD handoff** (`TUNE_LOD_HANDOFF_DIST`, 24 m default, render
+  group). The handoff is a `min()` clamp on `trace()`'s `tExit`, so it moves
+  where the cascade takes over without touching the handoff machinery — the
+  cascade start distance, the one-sided seam dither and the `tPrev` ordering
+  all read `tExit` exactly as before. PRIMARY rays only (`wantMedia`): a shadow
+  ray that gave up at 24 m would report "lit" for a receiver whose blocker is
+  further, which unshadows terrain rather than coarsening it. Setting the knob
+  ≥ the window half-extent (25.6 m) restores window-exit-only behaviour.
+  Measured worth ~8-11% of the offscreen frame, saturating at 22-24 m; past
+  the handoff, terrain quantises to level-1 cells (40 cm), which preserves
+  silhouettes but coarsens mid-field grass detail
+  (`docs/PLAN_surface_flight_perf.md` A1).
   **Distance look (phase 4, 2026-08-19):** kFarLevels is 8 (128 MiB farVox —
   exactly the WebGPU default storage-binding limit; the horizon sits 2 km out
   at 6.25 cm voxels). Cell COLOR is decoupled from cell SHAPE: shape still

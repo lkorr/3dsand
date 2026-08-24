@@ -483,6 +483,8 @@ const TUNING_SCHEMA = [
       {k:'primarySteps', n:'primary ray budget', d:'Max DDA steps for a camera ray. Lower is faster but clips distant geometry into the fog.', min:64, max:8192, step:64, int:true},
       {k:'farSteps', n:'cascade ray budget', d:'Max steps per LOD cascade level.', min:16, max:2048, step:16, int:true},
       {k:'farShadowReach', n:'cascade shadow reach (m)', d:'How far a far-field sun shadow ray travels, in metres. Converted to a step count per cascade level, so the reach is the same distance at every level rather than scaling with cell size.', min:5, max:400, step:5},
+      {k:'lodHandoffDist', n:'in-window LOD handoff (m)', d:'Distance past which the primary ray stops marching fine 10 cm voxels and hands off to the far-field cascade, instead of only when it leaves the 25.6 m window. Terrain past this quantises to 40 cm cells: silhouettes hold, but mid-field grass detail becomes blocks. Measured win is only ~8-11% and it SATURATES at 22-24 m, so going nearer spends image quality for nothing. Set 26+ to disable (that is the A/B, no rebuild).', min:2, max:60, step:1},
+      {k:'shadowMaxDist', n:'sharp shadow distance (m)', d:'MEASURED AND IT DOES NOT PAY - left at 999 (off). Routing shadows through the cascade was expected to be cheaper; it is 48x MORE expensive at 0 (497ms vs 10.35ms control), because a fine shadow ray stops at the first blocker while a cascade ray must cross the whole 60 m farShadowReach at level-1 cell size. Kept so the experiment is re-runnable. See sunShadowAt in raymarch.wgsl.', min:0, max:999, step:1},
     ],
   },
 

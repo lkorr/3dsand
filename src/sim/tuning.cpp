@@ -1205,6 +1205,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
+    ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
+    ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -1264,6 +1266,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // A zero/negative reach would clamp to the 8-step floor everywhere and
     // silently drop far shadows; keep it positive.
     if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }
+    // The LOD handoff must not land in front of the near clip: a zero here
+    // would hand EVERY ray to the cascade at t=0 and render the world as
+    // 40 cm blocks from the camera outward. Floored at 2 m, which is still
+    // absurdly near but is a knob setting rather than a broken frame. There is
+    // deliberately no ceiling — >= 25.6 m disables the handoff, which is the
+    // documented way to A/B it.
+    if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
+    // 0 is meaningful here (all shadows go through the cascade), so only
+    // negatives are refused.
+    if (r.shadowMaxDist < 0.0f) { r.shadowMaxDist = 0.0f; }
   }
 
   if (const json* g = Find(j, "worldgen")) {

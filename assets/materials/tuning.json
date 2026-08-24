@@ -524,6 +524,8 @@
     "primarySteps": 4096,
     "farSteps": 384,
     "farShadowReach": 60,
+    "lodHandoffDist": 24,
+    "shadowMaxDist": 999,
     "skyRayleigh": 12,
     "skyMie": 1,
     "skyMieG": 0.76,
