@@ -102,6 +102,11 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.solarEclipse = sky.solarEclipse;
   rp.lunarEclipse = sky.lunarEclipse;
   rp.eclipseBody = sky.eclipseBody;
+  // The axis the starfield wheels about — derived from latitude, so the stars
+  // turn about the same pole the sun arcs around.
+  rp.poleDir[0] = sky.poleDir[0];
+  rp.poleDir[1] = sky.poleDir[1];
+  rp.poleDir[2] = sky.poleDir[2];
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both

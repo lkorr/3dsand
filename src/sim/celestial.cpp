@@ -313,6 +313,17 @@ SkyState ComputeSky(const Tuning& tun, double celestialTick) {
     return D3{hz.x * cy + hz.z * sy, hz.y, -hz.x * sy + hz.z * cy};
   };
 
+  // The celestial pole: the spin axis, which in the polar frame IS +z. Step 2
+  // of eclipticToHorizon is a rotation ABOUT that axis, so the pole is the one
+  // direction the spin leaves fixed — which is why it can be carried through
+  // steps 3 and 4 alone rather than being transformed like a body direction.
+  // The result sits at elevation = latitude, due north, and yaws with the
+  // observer so the stars wheel about the same axis the sun arcs around.
+  const D3 poleH = Norm([&] {
+    const D3 hz{0.0, cc, -sc};  // step 3 applied to (0, 0, 1)
+    return D3{hz.x * cy + hz.z * sy, hz.y, -hz.x * sy + hz.z * cy};
+  }());
+
   const D3 sunH = Norm(eclipticToHorizon(sunEcl));
   Store(sunH, s.sunDir);
   s.sun.dir[0] = s.sunDir[0];
@@ -457,6 +468,9 @@ SkyState ComputeSky(const Tuning& tun, double celestialTick) {
   // whole reason the constellations drift a few minutes earlier each night,
   // and with a short game year the drift is fast enough to notice.
   s.starRot = (float)(kTau * Wrap(t / siderealDayTicks, 1.0) * (double)d.starRotSpeed);
+  s.poleDir[0] = (float)poleH.x;
+  s.poleDir[1] = (float)poleH.y;
+  s.poleDir[2] = (float)poleH.z;
   return s;
 }
 

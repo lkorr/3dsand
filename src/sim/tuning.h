@@ -997,6 +997,13 @@ struct Tuning {
     float starTwinkle = 0.35f;
     float milkyWayStrength = 0.55f;
     float milkyWayColor[3] = {0.52f, 0.56f, 0.78f};
+    // Pole of the galactic plane, in the STAR SPHERE's frame (it wheels with
+    // the stars). The band is drawn perpendicular to this, so rotating it
+    // moves the Milky Way across the constellations.
+    float galaxyNormal[3] = {0.36f, 0.52f, -0.77f};
+    // Half-width of the band in |cos| from that plane, before the fbm that
+    // ragged-edges it. Small values give a tight bright river.
+    float galaxyWidth = 0.17f;
     float nebulaStrength = 0.40f;
     float nebulaCool[3] = {0.16f, 0.30f, 0.62f};
     float nebulaWarm[3] = {0.55f, 0.20f, 0.38f};
@@ -1013,12 +1020,18 @@ struct Tuning {
     // is. A render-side radius knob would be a second, diverging answer.
     float moonBrightness = 1.6f;
     float moonColor[3] = {0.92f, 0.93f, 0.88f};
+    // Offsets the fbm that carves this moon's maria and craters. Not a colour
+    // and not a position — it is the only thing making a moon a distinct rock
+    // rather than the same face drawn twice, so changing it rerolls the
+    // surface wholesale.
+    float moonMariaSeed[3] = {4.0f, 1.0f, 9.0f};
     float moonGlow = 0.35f;
     float moonEarthshine = 0.055f;
     float moonLightColor[3] = {0.55f, 0.68f, 1.0f};
     float moonLightIntensity = 0.16f;
     // Moon B: a smaller, colder, dimmer body. Look only.
     float moon2Color[3] = {0.78f, 0.80f, 0.86f};
+    float moon2MariaSeed[3] = {-21.0f, 13.0f, 37.0f};
     float moon2Brightness = 0.72f;
     float moon2LightIntensity = 0.055f;
     float moon2LightColor[3] = {0.62f, 0.62f, 0.86f};
@@ -1026,6 +1039,11 @@ struct Tuning {
     // night value; lower keeps some daylight so totality reads as
     // daytime-gone-wrong rather than as night.
     float eclipseDarkness = 0.93f;
+    // Perceptual exponent on covered AREA before that darkening applies. 3 is
+    // the old hardcoded cube: the world stays bright until the last sliver of
+    // sun goes, which is how a real partial eclipse reads. 1 tracks area
+    // linearly and looks like someone sliding the exposure down.
+    float eclipseCurve = 3.0f;
 
     // ---- night ambient ----
     float nightAmbSky[3] = {0.055f, 0.075f, 0.135f};

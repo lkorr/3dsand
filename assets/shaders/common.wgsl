@@ -411,6 +411,12 @@ struct RenderParams {
   lunarEclipse : f32,
   _pdn1      : f32,
   _pdn2      : f32,
+  // The celestial pole in the horizon frame — the axis the starfield wheels
+  // about. Derived from latitude on the CPU (see RenderParams in world.h);
+  // there is no knob because the stars and the sun must agree on the axis.
+  // On its own row: a vec3 aligns to 16 bytes and cannot start mid-row.
+  poleDir    : vec3f,
+  _pdn3      : f32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -498,13 +504,14 @@ fn moonContribP(mDir : vec3f, mPhase : f32, intensity : f32) -> f32 {
 }
 
 // Daylight weight AFTER an eclipse. R.solarEclipse is the fraction of the
-// sun's area a moon covers; the cube is the perceptual curve (a half-eclipsed
-// sun is barely dimmer to the eye — the collapse is in the last few percent).
-// Mirrors dayWeight()/eclipseDim() in raymarch.wgsl; the two MUST agree or the
-// world lights at a different brightness than the sky it stands under.
+// sun's area a moon covers; TUNE_ECLIPSE_CURVE is the perceptual curve (a
+// half-eclipsed sun is barely dimmer to the eye — the collapse is in the last
+// few percent). Mirrors dayWeight()/eclipseDim() in raymarch.wgsl; the two
+// MUST agree, including the exponent, or the world lights at a different
+// brightness than the sky it stands under.
 fn eclipseDayWeightP(R : RenderParams) -> f32 {
   let f = clamp(R.solarEclipse, 0.0, 1.0);
-  return R.sunUp * (1.0 - f * f * f * TUNE_ECLIPSE_DARKNESS);
+  return R.sunUp * (1.0 - pow(f, TUNE_ECLIPSE_CURVE) * TUNE_ECLIPSE_DARKNESS);
 }
 
 // Direct light: sun by day, the brighter moon by night. Returns colour x

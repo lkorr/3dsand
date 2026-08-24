@@ -135,9 +135,14 @@ fn starField(dir : vec3f) -> vec3f {
   // Wheel the sky about the celestial pole. A tilted axis (not straight up)
   // means stars rise and set at an angle, which is most of what makes a night
   // sky read as a rotating dome rather than a static texture.
+  //
+  // The axis comes from the orbital solve (elevation = latitude, due north),
+  // NOT from a constant: it used to be vec3(0.28, 0.92, 0), which tips ~18
+  // degrees toward the EAST and ignores latitude, so the stars wheeled about
+  // one axis while the sun arced about another.
   let ca = cos(R.starRot);
   let sa = sin(R.starRot);
-  let axis = normalize(vec3f(0.28, 0.92, 0.0));
+  let axis = normalize(R.poleDir);
   // Rodrigues rotation about `axis`.
   let d = normalize(dir * ca + cross(axis, dir) * sa +
                     axis * dot(axis, dir) * (1.0 - ca));
@@ -260,13 +265,16 @@ fn nightGlow(rd : vec3f) -> vec3f {
 
   // Galactic band: a great circle tilted off the horizon, thickened with fbm
   // so its edges are ragged rather than a clean stripe.
+  // Same celestial pole the starfield turns about (see starField): the galaxy
+  // is fixed to the star sphere, so if these two axes disagree the band slides
+  // through the constellations over a night.
   let ca = cos(R.starRot);
   let sa = sin(R.starRot);
-  let axis = normalize(vec3f(0.28, 0.92, 0.0));
+  let axis = normalize(R.poleDir);
   let d = rd * ca + cross(axis, rd) * sa + axis * dot(axis, rd) * (1.0 - ca);
-  let galNormal = normalize(vec3f(0.36, 0.52, -0.77));
+  let galNormal = normalize(TUNE_GALAXY_NORMAL);
   let bandDist = abs(dot(normalize(d), galNormal));
-  let bandWidth = 0.17 + 0.10 * fbm(d * 3.1, 3u);
+  let bandWidth = TUNE_GALAXY_WIDTH * (1.0 + 0.59 * fbm(d * 3.1, 3u));
   let band = 1.0 - smoothstep(0.0, bandWidth, bandDist);
   // Dust lanes: dark filaments cutting through the band, which is what makes
   // it read as a galaxy rather than a painted smear.
@@ -403,12 +411,15 @@ fn moonDisc(rd : vec3f, mDir : vec3f, mPhase : f32, mSign : f32, mRad : f32,
 // moon-on-moon eclipse, and it is correct because A's own disc is drawn on top
 // at exactly the covering geometry.
 fn moonLayer(rd : vec3f) -> vec3f {
+  // The seed vectors are the only thing making the two moons different ROCK
+  // rather than the same face drawn twice — they offset the fbm that carves
+  // maria and craters, so changing one rerolls that moon's surface entirely.
   var c = moonDisc(rd, R.moon2Dir, R.moon2Phase, R.moon2PhaseSign,
-                   R.moon2AngRadius, vec3f(-21.0, 13.0, 37.0),
+                   R.moon2AngRadius, TUNE_MOON2_MARIA_SEED,
                    TUNE_MOON2_COLOR, TUNE_MOON2_BRIGHTNESS) *
           (1.0 - R.lunarEclipse);
   c += moonDisc(rd, R.moonDir, R.moonPhase, R.moonPhaseSign, R.moonAngRadius,
-                vec3f(4.0, 1.0, 9.0), TUNE_MOON_COLOR, 1.0);
+                TUNE_MOON_MARIA_SEED, TUNE_MOON_COLOR, 1.0);
   return c;
 }
 
@@ -546,7 +557,12 @@ fn sunDisc(rd : vec3f) -> vec3f {
 // someone turning the exposure down.
 fn eclipseDim() -> f32 {
   let f = clamp(R.solarEclipse, 0.0, 1.0);
-  return f * f * f * TUNE_ECLIPSE_DARKNESS;
+  // The exponent is the PERCEPTUAL curve, not the physics: covered area falls
+  // linearly, but the eye's adaptation means half a sun still reads as broad
+  // daylight. A high power keeps the world bright until the last sliver goes,
+  // which is what real partial eclipses feel like; 1.0 makes the dimming track
+  // the covered area directly and reads as someone pulling the exposure down.
+  return pow(f, TUNE_ECLIPSE_CURVE) * TUNE_ECLIPSE_DARKNESS;
 }
 
 // The effective daylight weight during an eclipse. Everything that keyed off

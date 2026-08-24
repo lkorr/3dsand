@@ -983,6 +983,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "starTwinkle", r.starTwinkle, out, at);
     ReadF(*g, "milkyWayStrength", r.milkyWayStrength, out, at);
     ReadV3(*g, "milkyWayColor", r.milkyWayColor, out, at);
+    ReadV3(*g, "galaxyNormal", r.galaxyNormal, out, at);
+    ReadF(*g, "galaxyWidth", r.galaxyWidth, out, at);
     ReadF(*g, "nebulaStrength", r.nebulaStrength, out, at);
     ReadV3(*g, "nebulaCool", r.nebulaCool, out, at);
     ReadV3(*g, "nebulaWarm", r.nebulaWarm, out, at);
@@ -993,15 +995,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // moons
     ReadF(*g, "moonBrightness", r.moonBrightness, out, at);
     ReadV3(*g, "moonColor", r.moonColor, out, at);
+    ReadV3(*g, "moonMariaSeed", r.moonMariaSeed, out, at);
     ReadF(*g, "moonGlow", r.moonGlow, out, at);
     ReadF(*g, "moonEarthshine", r.moonEarthshine, out, at);
     ReadV3(*g, "moonLightColor", r.moonLightColor, out, at);
     ReadF(*g, "moonLightIntensity", r.moonLightIntensity, out, at);
     ReadV3(*g, "moon2Color", r.moon2Color, out, at);
+    ReadV3(*g, "moon2MariaSeed", r.moon2MariaSeed, out, at);
     ReadF(*g, "moon2Brightness", r.moon2Brightness, out, at);
     ReadF(*g, "moon2LightIntensity", r.moon2LightIntensity, out, at);
     ReadV3(*g, "moon2LightColor", r.moon2LightColor, out, at);
     ReadF(*g, "eclipseDarkness", r.eclipseDarkness, out, at);
+    ReadF(*g, "eclipseCurve", r.eclipseCurve, out, at);
     // night ambient
     ReadV3(*g, "nightAmbSky", r.nightAmbSky, out, at);
     ReadV3(*g, "nightAmbGround", r.nightAmbGround, out, at);
@@ -1272,6 +1277,31 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.eclipseDarkness < 0.0f || r.eclipseDarkness > 1.0f) {
       out.warnings.push_back("render.eclipseDarkness outside 0..1; clamped");
       r.eclipseDarkness = r.eclipseDarkness < 0.0f ? 0.0f : 1.0f;
+    }
+    // eclipseCurve is an exponent on a 0..1 fraction. At or below 0, pow()
+    // takes the uncovered sky (f = 0) to infinity rather than to zero, so a
+    // clear day would render as permanent totality.
+    if (r.eclipseCurve < 0.05f) {
+      out.warnings.push_back("render.eclipseCurve < 0.05; clamped");
+      r.eclipseCurve = 0.05f;
+    }
+    // galaxyWidth is a smoothstep edge; at 0 the band is a zero-width slit and
+    // the divide inside smoothstep degenerates.
+    if (r.galaxyWidth < 0.001f) {
+      out.warnings.push_back("render.galaxyWidth < 0.001; clamped");
+      r.galaxyWidth = 0.001f;
+    }
+    // galaxyNormal is normalize()d in the shader, where a zero vector is NaN
+    // and NaN spreads across the whole night sky rather than failing locally.
+    {
+      const float* n = r.galaxyNormal;
+      if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] < 1e-8f) {
+        out.warnings.push_back(
+            "render.galaxyNormal is degenerate (zero length); reset");
+        r.galaxyNormal[0] = 0.36f;
+        r.galaxyNormal[1] = 0.52f;
+        r.galaxyNormal[2] = -0.77f;
+      }
     }
     if (r.skyMieG <= -0.99f || r.skyMieG >= 0.99f) {
       out.warnings.push_back("render.skyMieG must be within (-0.99, 0.99); clamped");

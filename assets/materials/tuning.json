@@ -561,6 +561,8 @@
       0.56,
       0.78
     ],
+    "galaxyNormal": [0.36, 0.52, -0.77],
+    "galaxyWidth": 0.17,
     "nebulaStrength": 0.4,
     "nebulaCool": [
       0.16,
@@ -590,6 +592,7 @@
       0.93,
       0.88
     ],
+    "moonMariaSeed": [4, 1, 9],
     "moonGlow": 0.35,
     "moonEarthshine": 0.055,
     "moonLightColor": [
@@ -599,10 +602,12 @@
     ],
     "moonLightIntensity": 0.16,
     "moon2Color": [0.78, 0.8, 0.86],
+    "moon2MariaSeed": [-21, 13, 37],
     "moon2Brightness": 0.72,
     "moon2LightIntensity": 0.055,
     "moon2LightColor": [0.62, 0.62, 0.86],
     "eclipseDarkness": 0.93,
+    "eclipseCurve": 3,
     "nightAmbSky": [
       0.055,
       0.075,

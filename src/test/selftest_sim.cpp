@@ -2223,6 +2223,45 @@ Status GateCelestial(Ctx& c, std::string& detail) {
   for (int i = 0; i < 100; i++) half.Advance();
   require(half.ticks == 50, "fractional time scale drifts");
 
+  // (h) THE CELESTIAL POLE IS THE LATITUDE. The starfield wheels about
+  // SkyState::poleDir, and the sun arcs about the same axis implicitly — they
+  // agree only if the pole is derived from latitude rather than assumed. The
+  // shader used to rotate the stars about a hardcoded vec3(0.28, 0.92, 0):
+  // ~18 deg off vertical toward the EAST, which is not where any pole is and
+  // ignores latitude, so the stars turned about one axis while the sun tracked
+  // another. Nothing caught it, because a wheeling starfield looks plausible
+  // whatever it wheels about.
+  //
+  // Probe the two independent claims: elevation == latitude, and due north
+  // (zero east component). Sweep several latitudes, since a constant would
+  // pass at exactly one of them by luck.
+  double worstPoleElev = 0.0, worstPoleEast = 0.0;
+  for (int latI = -80; latI <= 80; latI += 20) {
+    Tuning lt = tun;
+    lt.dayNight.latitudeDeg = (float)latI;
+    lt.dayNight.sunAzimuth = 0.0f;  // yaw rotates the pole with everything else
+    SetCurrentTuning(lt);
+    const SkyState ps = SkyForTick(lt, 12345u);
+    const double elev =
+        std::asin(std::max(-1.0, std::min(1.0, (double)ps.poleDir[1]))) * kRad;
+    worstPoleElev = std::max(worstPoleElev, std::abs(elev - (double)latI));
+    worstPoleEast = std::max(worstPoleEast, std::abs((double)ps.poleDir[0]));
+  }
+  require(worstPoleElev < 0.01,
+          "the celestial pole is not at elevation == latitude");
+  require(worstPoleEast < 1e-4, "the celestial pole is not due north");
+
+  // The pole must also be the axis the sky actually turns about: the one
+  // direction the spin leaves fixed. Compare it across a half-day of rotation.
+  SetCurrentTuning(tun);
+  const SkyState p0 = SkyForTick(tun, 0u);
+  const SkyState p1 = SkyForTick(tun, (uint32_t)(tpd / 2.0));
+  const double poleDrift =
+      std::abs((double)p0.poleDir[0] - (double)p1.poleDir[0]) +
+      std::abs((double)p0.poleDir[1] - (double)p1.poleDir[1]) +
+      std::abs((double)p0.poleDir[2] - (double)p1.poleDir[2]);
+  require(poleDrift < 1e-5, "the celestial pole moves as the planet spins");
+
   SetCurrentTuning(saved);
 
   char buf[700];
@@ -2232,11 +2271,13 @@ Status GateCelestial(Ctx& c, std::string& detail) {
                 "peak %.1f vs %.1f expected); synodic A %.2f / B %.2f days "
                 "(authored %d / %d); nearest phase-pair repeat day %d at "
                 "%.3f; eclipses %.4f%% of samples, max coverage %.2f; "
+                "pole elev err %.4f deg east %.1e drift %.1e; "
                 "pure=%d finite=%d clock=%d%s%s",
                 accum, dayCloseErr, worstNoon,
                 swing, (double)d.axialTilt, noonHi, wantPeak,
                 synA, synB, d.lunarPeriodDays, d.moon2PeriodDays,
                 nearestDay, nearestPair, eclFrac * 100.0, maxCover,
+                worstPoleElev, worstPoleEast, poleDrift,
                 (int)pure, (int)finite, (int)identity,
                 fail.empty() ? "" : " -- FAILED: ", fail.c_str());
   detail = buf;

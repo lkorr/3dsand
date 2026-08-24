@@ -862,6 +862,21 @@ struct RenderParams {
   // Fraction of moon B's disc hidden behind moon A. Render-only.
   float lunarEclipse = 0.0f;
   float pad_dn1 = 0.0f, pad_dn2 = 0.0f;
+
+  // The CELESTIAL POLE in the local horizon frame — the axis the starfield
+  // wheels about. It is an OUTPUT of latitude (the pole sits at elevation =
+  // latitude, due north), which is why there is no knob for it: the stars and
+  // the sun have to agree about where the axis is, and they only do if both
+  // read the same latitude. The shader used to rotate about a hardcoded
+  // vec3(0.28, 0.92, 0) — ~18 degrees off vertical toward the EAST, which is
+  // not where any pole is and ignored latitude entirely, so the starfield
+  // wheeled about one axis while the sun tracked another.
+  //
+  // Starts its OWN std140 row: a vec3 aligns to 16 bytes, so it cannot begin
+  // partway through the row solarEclipse opens. The two pads above are what
+  // close that row, and the one below closes this one.
+  float poleDir[3] = {0.0f, 1.0f, 0.0f};
+  float pad_dn3 = 0.0f;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

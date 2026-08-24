@@ -106,6 +106,13 @@ struct SkyState {
   // vernal-equivalent, 0.25 = a quarter year on. Drives nothing in the shader
   // yet; it is what a season readout or a seasonal reaction gate would key on.
   float yearT;
+
+  // The celestial pole in the local horizon frame: the axis the star sphere
+  // turns about. A pure consequence of latitude — elevation = latitude, due
+  // north — so it is deliberately NOT a tuning row. The sun's path and the
+  // stars' rotation are the same geometry seen two ways, and they agree only
+  // while both read one latitude.
+  float poleDir[3];
 };
 
 // ---- orbital elements -------------------------------------------------------
