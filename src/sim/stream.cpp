@@ -283,14 +283,47 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
   std::vector<std::pair<uint32_t, PendingEvict::Item>> toSave;
   toSave.reserve(slots.size());
   std::vector<uint32_t> sentRle;
+  uint32_t unmodReal = 0;
   for (uint32_t s : slots) {
     bool worth = true;
     if (filter && snap.valid)
       worth = snap.occupancy[s] > 0 || modified_[s] != 0;
     if (!worth) continue;
-    // all-air and never modified => procgen reproduces it; don't store
-    // (only trustable with a live snapshot — flushes store everything)
-    uint8_t dropIfAir = filter && snap.valid && modified_[s] == 0;
+    // ---- AN UNMODIFIED CHUNK IS ALREADY REPRODUCIBLE ----------------------
+    //
+    // This is the SAME argument the sentinel branch below makes, and nothing
+    // in it depended on the slot being a sentinel. If nothing has written a
+    // chunk since it entered the window, whatever it holds is recoverable
+    // without the store: either genChunk produced it, and genChunk is a pure
+    // function of (world chunk, seed) that reproduces it exactly on re-entry;
+    // or FillSlots decoded it FROM the store, which still holds those bytes
+    // (Get does not consume). A chunk changed since either event has
+    // modified_ set, because every writer declares itself — CPU ops through
+    // MarkModifiedBox immediately, CA activity through the snapshot's dirty
+    // flags — and modified_ is STICKY, never cleared until the slot is
+    // refilled, so one dirty report is enough forever.
+    //
+    // Measured under --autofly-surface: 363 of the 397 real-page slots on a
+    // leaving plane are unmodified — 91%. Every one of them was paying a
+    // 16 KiB GPU copy, a 4,096-word RLE encode and a store insert, and the
+    // RLE of a mixed surface chunk EXPANDS to 32 KiB because worldgen's
+    // per-cell palette jitter makes nearly every word its own run. Flying
+    // across untouched terrain was filling the store, and the frame, with a
+    // re-derivable copy of the world.
+    //
+    // This REPLACES `dropIfAir`, which was the same idea reached one step too
+    // late: it copied and encoded the chunk first and only then dropped it if
+    // the words turned out to be air. Every case it caught is caught here
+    // without the copy, and the non-air unmodified chunks it had to keep are
+    // exactly the ones the argument above says are re-derivable too.
+    //
+    // Gated on `filter` and a live snapshot, exactly as dropIfAir was: a
+    // FlushResident (the save path) passes filter=false and still stores
+    // every resident chunk, air included.
+    if (filter && snap.valid && modified_[s] == 0) {
+      unmodReal++;
+      continue;
+    }
 
     // ---- SENTINEL SLOTS NEVER TOUCH THE GPU ------------------------------
     //
@@ -308,19 +341,13 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     // the single largest block of paged frame time (118 s of map.Wait over
     // one --autofly-hard run).
     //
-    // Better still, an UNMODIFIED sentinel needs no store write at all, under
-    // exactly dropIfAir's trust conditions. Whatever the store holds for this
-    // chunk is already right: a store-hit slot became a sentinel only by
-    // Classify's exact-word test against the loaded bytes (store == synth ==
-    // content), a procgen slot has no store entry and genChunk reproduces its
-    // own deterministic output on re-entry, and a chunk changed SINCE either
-    // event cannot be an unmodified sentinel — the change either kept it
-    // resident or is >= the demote hysteresis old, far beyond modified_'s
-    // snapshot lag. Skipping the Put here is what keeps JITTER planes from
-    // bloating the store with per-cell RLE they never needed.
+    // An UNMODIFIED sentinel needs no store write at all either — that test
+    // used to live here and has moved UP, above this branch, now that the same
+    // argument is known to hold for real pages too. Skipping the Put is what
+    // keeps JITTER planes from bloating the store with per-cell RLE they never
+    // needed; it now keeps mixed surface planes out of it as well.
     const uint64_t off0 = world_->PageOffsetOfSlot(s);
     if (off0 == World::kNoPage) {
-      if (filter && snap.valid && modified_[s] == 0) continue;
       const IVec3 wc = world_->SlotToWorldChunk(s);
       RleEncodeSentinelChunk(world_->PageEntryOfSlot(s), wc, seed_, sentRle);
       // A modified (or unfiltered-flush) sentinel is stored synchronously:
@@ -333,10 +360,18 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       // the next iteration never reads the moved-from state. The trade is one
       // copy for one regrow, and the regrow is the cheaper half.
       store_.Put(wc, std::move(sentRle));
+      sentRle.reserve(kChunkVol * 2);  // see the re-reserve in CompleteOldest
       continue;
     }
-    toSave.push_back({s, {world_->SlotToWorldChunk(s), dropIfAir}});
+    toSave.push_back({s, {world_->SlotToWorldChunk(s)}});
   }
+  // What the leaving plane actually costs: how many of its slots still need a
+  // GPU copy and a store insert, against how many the re-derivability test
+  // above skipped. Under --autofly-surface the skipped count is ~91% of the
+  // real pages, which is the whole reason that test exists.
+  if (PtDbg())
+    std::printf("[pt-time] evict issue: slots=%zu stored=%zu skipUnmod=%u\n",
+                slots.size(), toSave.size(), unmodReal);
 
   for (size_t off = 0; off < toSave.size(); off += kEvictBatch) {
     size_t n = std::min(kEvictBatch, toSave.size() - off);
@@ -467,14 +502,23 @@ void Stream::CompleteOldest(bool discard) {
             RleEncodeChunk((const uint32_t*)(ptr + i * kChunkBytes), rle);
             if (dbg) rleMs += PtNowMs() - ts;
           }
-          bool air = rle.size() == 2 && rle[1] == 0;
-          if (air && p.items[i].dropIfAir) continue;
           // Moved for the same reason as the sentinel Put above: this is the
           // site that hurts most, because a mixed SURFACE chunk is exactly the
           // one whose RLE does not compress (PLAN_surface_flight_perf.md B5).
           // Both encoders clear() their `out` first, so the scratch buffer is
           // safe to move from inside the loop.
           store_.Put(p.items[i].wc, std::move(rle));
+          // RE-RESERVE AFTER THE MOVE, or the move costs more than the copy it
+          // replaced. std::move leaves the scratch with NO CAPACITY, so the
+          // next chunk regrows it geometrically from zero — ~13 reallocations
+          // copying ~64 KiB, against the ONE exact-size allocation an lvalue
+          // copy would have cost. The trade was assumed to favour the move and
+          // without this it does not, worst exactly on the mixed surface chunks
+          // the move was added for: their per-cell palette jitter makes almost
+          // every word its own run, so the RLE is 8,192 words (32 KiB) and
+          // actually EXPANDS the 16 KiB chunk. One reserve makes it one
+          // allocation and no copying either way.
+          rle.reserve(kChunkVol * 2);
         }
       }
     }
@@ -999,6 +1043,7 @@ void Stream::HarvestDemotes(uint32_t tick) {
   constexpr uint32_t kDemoteFreshTicks = 3;
   const bool dbg = PtDbg();
   uint32_t demoted = 0, retried = 0, harvested = 0;
+  double cpyMs = 0.0, clsMs = 0.0;
   while (!demotes_.empty() && demotes_.front().map.Ready()) {
     PendingDemote d = std::move(demotes_.front());
     demotes_.pop_front();
@@ -1010,8 +1055,10 @@ void Stream::HarvestDemotes(uint32_t tick) {
       // One sequential copy out of write-combined map memory; Classify then
       // reads cached RAM. Reading the mapped pointer directly is legal but
       // pays uncached-read cost per word.
+      const double c0 = dbg ? PtNowMs() : 0.0;
       std::memcpy(demoteScratch_.data(), d.map.Data(),
                   d.slots.size() * kChunkBytes);
+      if (dbg) cpyMs += PtNowMs() - c0;
       d.map.Unmap();
       const bool fresh = tick >= d.copyTick && tick - d.copyTick <= kDemoteFreshTicks;
       std::vector<uint32_t> retry;
@@ -1032,8 +1079,10 @@ void Stream::HarvestDemotes(uint32_t tick) {
           continue;
         }
         if (world_->pages->CpuDirty().Has(s)) continue;  // written since the copy
+        const double k0 = dbg ? PtNowMs() : 0.0;
         const uint32_t e =
             world_->pages->Classify(s, demoteScratch_.data() + i * kChunkVol);
+        if (dbg) clsMs += PtNowMs() - k0;
         if (e == PageTable::kNeedsPage) continue;
         world_->pages->SetSentinel(s, e);
         demoted++;
@@ -1050,8 +1099,8 @@ void Stream::HarvestDemotes(uint32_t tick) {
   if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
   if (dbg && (harvested || retried))
     std::printf("[pt-time] demote harvest: batches=%u demoted=%u retried=%u "
-                "queued=%zu\n",
-                harvested, demoted, retried, demotes_.size());
+                "queued=%zu (memcpy %.2f ms, classify %.2f ms)\n",
+                harvested, demoted, retried, demotes_.size(), cpyMs, clsMs);
 }
 
 void Stream::FlushResident() {

@@ -118,9 +118,12 @@ class Stream {
     // The map is issued at eviction time and consumed ticks later: Ready() is
     // the per-tick non-blocking harvest, Wait() the ring-full / drain path.
     rhi::MapTicket map;
+    // No `dropIfAir` any more: "never modified => it is re-derivable, don't
+    // store it" is now decided in EvictSlots BEFORE the copy is issued, for
+    // every slot rather than only for the ones whose words turn out to be air.
+    // Nothing that reaches this struct is droppable.
     struct Item {
       IVec3 wc;
-      uint8_t dropIfAir;  // all-air + never modified => procgen reproduces it
     };
     std::vector<Item> items;
     // Parallel to `items`: the page-table entry of a slot that was a SENTINEL
