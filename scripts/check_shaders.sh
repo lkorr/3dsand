@@ -135,6 +135,16 @@ W_FARNCHUNK=$((W_FARN / W_CHUNK))
 W_FARSHIFT=0
 while [ $((W_FARN << W_FARSHIFT)) -lt "$W_N" ]; do W_FARSHIFT=$((W_FARSHIFT + 1)); done
 
+# Fill-queue packing + cascade geometry (world.h kFarSlotShift/kFarSlotMask,
+# kWindowHalfExtentMeters, kFarCellVox(1)) — derived exactly as world.h derives
+# them, since the constexpr lambdas cannot be scraped as literals.
+W_FARNUM=$((W_FARNCHUNK * W_FARNCHUNK * W_FARNCHUNK))
+W_FARSLOTSHIFT=0
+while [ $((1 << W_FARSLOTSHIFT)) -lt "$W_FARNUM" ]; do W_FARSLOTSHIFT=$((W_FARSLOTSHIFT + 1)); done
+W_FARSLOTMASK=$(( (1 << W_FARSLOTSHIFT) - 1 ))
+W_WINHALF="$(awk "BEGIN{print ($W_N / 2) * $W_VOX}")"
+W_FARCELL1=$((1 << (1 + W_FARSHIFT)))
+
 W_SHIFT=0
 while [ $((1 << W_SHIFT)) -lt "$W_CHUNK" ]; do W_SHIFT=$((W_SHIFT + 1)); done
 PRELUDE_TEXT="$(printf '%s\n' \
@@ -170,6 +180,10 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const FAR_MASK : i32 = $((W_FARN - 1));" \
   "const FAR_NCHUNK_MASK : i32 = $((W_FARNCHUNK - 1));" \
   "const FAR_SHIFT_BASE : u32 = ${W_FARSHIFT}u;" \
+  "const FAR_SLOT_SHIFT : u32 = ${W_FARSLOTSHIFT}u;" \
+  "const FAR_SLOT_MASK : u32 = ${W_FARSLOTMASK}u;" \
+  "const WINDOW_HALF_EXTENT_METERS : f32 = ${W_WINHALF};" \
+  "const FAR_CELL1_VOX : f32 = ${W_FARCELL1}.0;" \
   "const VOXEL_METERS : f32 = ${W_VOX};")"
 
 # LoadShader() also prepends the tuning constants (TuningWgslBlock, from
