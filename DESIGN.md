@@ -518,9 +518,15 @@ plus the plan's §7 excite/settle SEAM (Phase 2, 2026-08-23) converting both
 ways between settled fullness voxels and particles. The MLS-MPM core (Hu et
 al. 2018) is ported to Q16.16 integer fixed point, P2G scattering through i32
 `atomicAdd` (associative, so scheduling cannot move the sum), sparse 16³-node
-grid blocks allocated per substep over exactly the chunks that hold
-particles, terrain boundary conditions read live from the voxel buffer
-through `voxWordAt`, 6 substeps per tick.
+grid blocks over exactly the chunks that hold particles, terrain boundary
+conditions read live from the voxel buffer through `voxWordAt`, 6 substeps per
+tick. The chunk→block MAP is built ONCE per tick (`PT_FLUIDMAP`), not once per
+substep: displacement is CFL-capped at 2.7 cells/tick and `mark` pads its
+support by 3, so the padded set is a superset of every substep's exact set.
+The node ACCUMULATORS are still cleared per substep. Every fluid dispatch is
+indirect off a GPU-owned count, so a world that has poured water and settled it
+records the tables (the CPU count is monotone by design — recording must never
+depend on readback timing) and costs ~0 ms.
 
 THE SEAM (`sim_fluid_seam.wgsl`) is the only fluid code that writes voxels,
 and it is INSIDE the hashed sim domain — deterministically. Per tick, around
@@ -642,8 +648,14 @@ Gradient normals, Schlick Fresnel, TRACED reflections and TRACED refraction
 (the bent ray re-marches the world through `shadeSecondaryHit`, so the shore
 genuinely bends at the surface), per-channel Beer-Lambert absorption derived
 from the species colour, mass-weighted grid velocity driving churn foam and
-sub-voxel shimmer, and a camera-submerged volumetric path. Chunk-stride
-skipping over the block map bounds the cost; `RenderParams.fluidCount == 0`
+sub-voxel shimmer, and a camera-submerged volumetric path. Cost is bounded in
+three nested steps: `RenderParams.fluidLo/fluidHi` is the world AABB of live
+fluid, so a ray that misses it pays one slab test and a ray that hits it marches
+only the [enter, exit] span; chunk-stride skipping over the block map crosses
+empty chunks; and the block map's second half is a per-chunk Y-OCCUPANCY mask
+(gravity-fed fluid is a thin horizontal layer, and `mark`'s 3-cell pad means an
+allocated block is routinely all air) so an empty y slab is skipped on one
+buffer read. `RenderParams.fluidCount == 0`
 (or `render.fluidSurface = 0`, which restores the old debug cubes via
 `debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
 Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
