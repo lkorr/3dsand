@@ -484,10 +484,15 @@ PASS(fluidP2g2, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G2, K_INDIRECT, IND_FLU
 // mass lights its y level so the RENDERER can skip empty y slabs. Render-only
 // derived data, but the hazard is real — the next substep's p2g reads the index
 // half of the same buffer, and the renderer reads the mask half.
+// A(FluidArgsStage) is the FA_CLAMPED counter (the CFL-honesty probe): the
+// only fluid substep pass that WRITES the args buffer mid-substep. The next
+// consumer is the seam front of the NEXT tick (compactScan zeroes it) and the
+// bench readback; the hazard edge is real either way.
 PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
-          RW(FluidGrid) A(FluidBlockMap) I(FluidDispatchArgs)))
+          RW(FluidGrid) A(FluidBlockMap) A(FluidArgsStage)
+          I(FluidDispatchArgs)))
 // Pure gather for the fluid itself: each thread writes only its own particle,
 // so g2p cannot race itself (the mark/apply split rule does not bite here).
 // The splash coupling adds two writes: fast free-surface particles append

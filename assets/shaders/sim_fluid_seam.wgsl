@@ -254,6 +254,7 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_BINNED], 0u);
     atomicStore(&fluidArgs[FA_CONSUMED], 0u);
     atomicStore(&fluidArgs[FA_STAINED], 0u);
+    atomicStore(&fluidArgs[FA_CLAMPED], 0u);
   }
   workgroupBarrier();
   var base = wgScan[li];

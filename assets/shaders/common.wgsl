@@ -907,7 +907,9 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // [15]    eighths binned by settle this tick (mass audits)
 // [16]    eighths consumed by CA reactions this tick (mass audits)
 // [17]    contact stains applied this tick (parity gates, telemetry)
-// [18]    spare
+// [18]    node-substeps the FLUID_VMAX clamp truncated this tick (gridUpdate;
+//         the CFL-honesty probe — plan §5 item 1). ~0 in steady flow, or the
+//         stiffness/substep budget is wrong. Diagnostic only, never keyed on.
 // [19..21] COMPACTION dispatch args ((live+255)/256, 1, 1) — written by the
 //         excite scan alongside FA_LIVE, staged into fluidPDispatchArgs at the
 //         head of the seam. compactCount/compactScatter used to dispatch 1024
@@ -928,6 +930,7 @@ const FA_LASTSLOT  : u32 = 14u;
 const FA_BINNED    : u32 = 15u;
 const FA_CONSUMED  : u32 = 16u;
 const FA_STAINED   : u32 = 17u;
+const FA_CLAMPED   : u32 = 18u;
 // Byte offsets of the two arg triples are what pass_table.def's copy rows use;
 // keep the three in step (76 = 19*4, 88 = 22*4).
 const FA_ARGS_COMPACT : u32 = 19u;

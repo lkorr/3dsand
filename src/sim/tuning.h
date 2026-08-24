@@ -708,11 +708,13 @@ struct Tuning {
     // exception to "sim.* is integer-only"). They do NOT touch the world hash
     // (the fluid never writes voxels) but they DO change the fluid_det gate's
     // particle hash, so re-run --selftest after changing defaults.
-    float fluidStiffness = 5400.0f;  // EOS stiffness, (vox/s)^2 — the square
-                                     // of a pseudo speed of sound (~73 vox/s
-                                     // = 7.3 m/s). Higher = less compressible,
-                                     // sharper splashes (CFL clamps keep it
-                                     // stable).
+    float fluidStiffness = 3600.0f;  // EOS stiffness, (vox/s)^2 — the square
+                                     // of a pseudo speed of sound (3600 ->
+                                     // c = 60 vox/s = 2 cells/tick = 0.33
+                                     // cells/substep at 6 substeps: honest
+                                     // headroom under the 0.45 FLUID_VMAX
+                                     // CFL cap. 5400 sat AT the edge and the
+                                     // clamp ate the dynamics — plan §1.2.
     float fluidGravity = 98.1f;      // fall acceleration, voxels/s^2
                                      // (98.1 = 9.81 m/s^2 at 0.10 m voxels)
     // Density EOS (grantkot MLS-MPM shape): pressure = stiffness *
@@ -723,19 +725,30 @@ struct Tuning {
                                     // the 8-per-cell spawn lattice exactly)
     int fluidEosPower = 4;          // integer exponent 1..7; higher = harder
                                     // incompressibility knee, sharper splashes
-    float fluidCohesion = 90.0f;    // max NEGATIVE pressure, (vox/s)^2.
+    float fluidCohesion = 0.0f;     // max NEGATIVE pressure, (vox/s)^2.
                                     // Surface tension: how hard under-dense
-                                    // fluid pulls itself together into blobs
+                                    // fluid pulls itself together into blobs.
+                                    // 0 = water's zero-tension default (the
+                                    // EOS floor is then exactly p >= 0);
+                                    // non-zero is the honey/goo authoring
+                                    // surface — plan §5 item 3.
     // Species interaction, both (vox/s)^2 and SIGNED. attractSame > 0 pulls a
     // particle toward its own species (blobbing/fusing); attractDiff < 0
     // pushes different species apart (immiscible layers that sit on each
-    // other instead of interpenetrating), > 0 encourages mixing.
-    float fluidAttractSame = 45.0f;
-    float fluidAttractDiff = -90.0f;
-    float fluidViscosity = 1.5f;    // vox^2/s: resists shear via the APIC C
-                                    // matrix. ~0 = splashy water, high = honey
+    // other instead of interpenetrating), > 0 encourages mixing. Both 0 by
+    // default: negative-pressure terms are the classic sticky-ropes look.
+    float fluidAttractSame = 0.0f;
+    float fluidAttractDiff = 0.0f;
+    float fluidViscosity = 0.1f;    // vox^2/s: resists shear via the APIC C
+                                    // matrix. ~0 = splashy water, high =
+                                    // honey. References run 0.02-0.1 grid
+                                    // units; 1.5 read as syrup.
     float fluidDamping = 0.0f;      // fraction of velocity shed per SECOND
                                     // (0..20). Non-physical settle aid
+    float fluidFriction = 0.0f;     // fraction/s of TANGENTIAL velocity shed
+                                    // while touching solid (gridUpdate's
+                                    // separate BC). 0 = free-slip water;
+                                    // authoring knob for mud/goo.
     // Splash coupling (sim_fluid.wgsl g2p): fluid particles that are FAST and
     // at LOW density (spray, breaking crests) shed PFLAG_MICRO droplets into
     // the ballistic particle system, carrying the species' pour material —
