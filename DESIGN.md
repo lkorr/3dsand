@@ -638,6 +638,34 @@ on the MAGNITUDE (round toward zero): flooring negative products biased every
 force toward -x/-y/-z and the whole fluid crept along that diagonal on a flat
 floor.
 
+WATER, NOT GOO (WP2, 2026-08-24; docs/PLAN_fluid_overhaul.md §5). Three
+structural fixes turned the solver's output from mucus into water:
+- **Separate BC with tangential preservation** (`gridUpdate`): only the
+  velocity component pointing INTO a solid is removed. A node whose own cell
+  is solid used to be zeroed outright — but a particle sliding down a slope
+  has in-solid nodes inside its 3³ support, so it lost tangential velocity
+  every substep and water piled on inclines instead of sheeting down. Now an
+  in-solid surface node keeps the axis components that run parallel to its
+  exposed face (both neighbours solid = tangential under the face), removes
+  only into-solid normal motion, and zeroes an axis outright only in the
+  1-cell-wall ambiguous case (anti-tunneling). `sim.fluidFriction` (default
+  0 = free-slip water) optionally decays the surviving tangential part —
+  the mud/goo authoring knob.
+- **CFL honesty**: stock stiffness 3600 (c = 60 vox/s = 0.33 cells/substep at
+  6 substeps) under the 0.45 `FLUID_VMAX` cap, gravity 98.1 (real). The old
+  5400-11500 range sat at/over the cap, and the clamp silently converted
+  pressure work into energy loss — the "mushy under agitation" regime where
+  tuning stops doing anything. `fluidArgs[FA_CLAMPED]` counts node-substeps
+  the clamp truncates (zeroed per tick by the seam's compact scan, surfaced
+  in `--fluid-bench`); it reads 0 across every lab scene at stock, and a
+  persistent non-zero count means the stiffness/substep budget is dishonest
+  again — fix it there, never with damping.
+- **Zero tension by default**: cohesion/attractSame/attractDiff all default
+  0, so the EOS floor is exactly `p >= 0` — negative-pressure terms are the
+  classic sticky-ropes look and are now purely an authoring surface for
+  other liquids. Viscosity defaults 0.1 vox²/s (references run 0.02-0.1
+  grid units; a lab A/B at 0.5 moved nothing but the look toward syrup).
+
 RENDERING (v3, 2026-08-23) — the fluid draws as a real water SURFACE, not as
 particle cubes. Where Splash (matsuoka-601) filters depth sprites in screen
 space, this engine has no sampled textures, so the same result is built the
