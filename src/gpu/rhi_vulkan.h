@@ -482,6 +482,8 @@ class Backend {
   std::vector<VkFence> retiredRetained_;
 
   std::unordered_map<std::string, VkShaderModule> moduleCache_;
+  VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
+  std::string pipelineCachePath_;
   std::vector<VkDescriptorSetLayout> setLayouts_;
   std::vector<VkPipelineLayout> pipeLayouts_;
   std::vector<VkPipeline> pipelines_;

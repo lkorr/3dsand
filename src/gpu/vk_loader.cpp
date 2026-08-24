@@ -148,6 +148,9 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(DestroyPipelineLayout);
   VKL_D(CreateComputePipelines);
   VKL_D(DestroyPipeline);
+  VKL_D(CreatePipelineCache);
+  VKL_D(DestroyPipelineCache);
+  VKL_D(GetPipelineCacheData);
   VKL_D(CreateDescriptorPool);
   VKL_D(DestroyDescriptorPool);
   VKL_D(AllocateDescriptorSets);

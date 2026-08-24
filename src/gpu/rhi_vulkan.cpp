@@ -1,6 +1,8 @@
 #include "gpu/rhi_vulkan.h"
 
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 
 #include "gpu/vk_spirv.h"
@@ -317,6 +319,35 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
   if (r != VK_SUCCESS) {
     err = std::string("vkCreateDescriptorPool failed: ") + vkl::ResultName(r);
     return false;
+  }
+
+  // Pipeline cache: driver-compiled ISA cached across runs so startup skips
+  // both Tint WGSL->SPIR-V and the driver's own compilation on subsequent
+  // launches with unchanged shaders.
+  {
+    pipelineCachePath_ = "sandvox_pipeline_cache.bin";
+    std::vector<uint8_t> blob;
+    if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "rb")) {
+      std::fseek(f, 0, SEEK_END);
+      long sz = std::ftell(f);
+      if (sz > 0) {
+        blob.resize((size_t)sz);
+        std::fseek(f, 0, SEEK_SET);
+        size_t got = std::fread(blob.data(), 1, blob.size(), f);
+        if (got != blob.size()) blob.clear();
+      }
+      std::fclose(f);
+    }
+    VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    pcci.initialDataSize = blob.size();
+    pcci.pInitialData = blob.empty() ? nullptr : blob.data();
+    r = dfn_.CreatePipelineCache(device_, &pcci, nullptr, &pipelineCache_);
+    if (r != VK_SUCCESS) {
+      // Non-fatal: fall back to uncached pipelines.
+      std::fprintf(stderr, "pipeline cache creation failed (%s), proceeding uncached\n",
+                   vkl::ResultName(r));
+      pipelineCache_ = VK_NULL_HANDLE;
+    }
   }
 
   // The Class B staging ring: host-visible, coherent, persistently mapped.
@@ -984,21 +1015,71 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // key because Tint emits a SINGLE-entry-point module: the engine builds
   // several pipelines from one .wgsl file (worldgen.wgsl alone yields main /
   // list / far / fardown), and those are genuinely different SPIR-V modules.
+  size_t srcHash = std::hash<std::string>{}(wgsl);
   std::string key = label + "\x1f" + entryPoint + "\x1f" +
-                    std::to_string(std::hash<std::string>{}(wgsl));
+                    std::to_string(srcHash);
   auto it = moduleCache_.find(key);
   if (it != moduleCache_.end()) return it->second;
 
-  vkspv::CompileResult cr = vkspv::Compile(wgsl, label, entryPoint, bodyLineOffset);
-  diagnostics = cr.diagnostics;
-  if (!cr.ok) return VK_NULL_HANDLE;
+  // SPIR-V disk cache: skip Tint entirely on subsequent launches when the
+  // assembled WGSL hasn't changed. The key is a hash of (source, entry point);
+  // any edit to a shader, common.wgsl, or tuning.json changes the assembled
+  // source and produces a new hash, so stale cache entries are harmless (just
+  // unreferenced files). F5 hot-reload bypasses this via the in-memory cache
+  // above, which is populated on the first compile or disk-cache hit.
+  namespace fs = std::filesystem;
+  static const fs::path cacheDir = [] {
+    fs::path d("shader_cache");
+    std::error_code ec;
+    fs::create_directories(d, ec);
+    return d;
+  }();
+  // Combine source hash and entry-point hash into a filename.
+  size_t epHash = std::hash<std::string>{}(entryPoint);
+  char cacheName[64];
+  std::snprintf(cacheName, sizeof(cacheName), "%016zx_%016zx.spv", srcHash, epHash);
+  fs::path cachePath = cacheDir / cacheName;
+
+  std::vector<uint32_t> spirv;
+  bool fromDisk = false;
+  {
+    std::error_code ec;
+    auto fsize = fs::file_size(cachePath, ec);
+    if (!ec && fsize > 0 && (fsize % sizeof(uint32_t)) == 0) {
+      if (FILE* f = std::fopen(cachePath.string().c_str(), "rb")) {
+        spirv.resize(fsize / sizeof(uint32_t));
+        size_t got = std::fread(spirv.data(), 1, fsize, f);
+        std::fclose(f);
+        if (got == fsize)
+          fromDisk = true;
+        else
+          spirv.clear();
+      }
+    }
+  }
+
+  if (!fromDisk) {
+    vkspv::CompileResult cr = vkspv::Compile(wgsl, label, entryPoint, bodyLineOffset);
+    diagnostics = cr.diagnostics;
+    if (!cr.ok) return VK_NULL_HANDLE;
+    spirv = std::move(cr.spirv);
+    if (FILE* f = std::fopen(cachePath.string().c_str(), "wb")) {
+      std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), f);
+      std::fclose(f);
+    }
+  }
 
   VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-  sci.codeSize = cr.spirv.size() * sizeof(uint32_t);
-  sci.pCode = cr.spirv.data();
+  sci.codeSize = spirv.size() * sizeof(uint32_t);
+  sci.pCode = spirv.data();
   VkShaderModule m = VK_NULL_HANDLE;
   if (dfn_.CreateShaderModule(device_, &sci, nullptr, &m) != VK_SUCCESS) {
     diagnostics += "vkCreateShaderModule rejected the SPIR-V Tint produced\n";
+    if (fromDisk) {
+      // Stale or corrupt cache entry — remove it and retry via Tint.
+      std::error_code ec;
+      fs::remove(cachePath, ec);
+    }
     return VK_NULL_HANDLE;
   }
   moduleCache_[key] = m;
@@ -1054,7 +1135,7 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   ci.layout = layout;
 
   VkPipeline p = VK_NULL_HANDLE;
-  if (dfn_.CreateComputePipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &p) !=
+  if (dfn_.CreateComputePipelines(device_, pipelineCache_, 1, &ci, nullptr, &p) !=
       VK_SUCCESS)
     return VK_NULL_HANDLE;
   pipelines_.push_back(p);
@@ -1242,7 +1323,7 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
   ci.renderPass = VK_NULL_HANDLE;  // dynamic rendering
 
   VkPipeline p = VK_NULL_HANDLE;
-  if (dfn_.CreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &p) !=
+  if (dfn_.CreateGraphicsPipelines(device_, pipelineCache_, 1, &ci, nullptr, &p) !=
       VK_SUCCESS)
     return VK_NULL_HANDLE;
   pipelines_.push_back(p);
@@ -1558,6 +1639,25 @@ void Backend::Shutdown() {
   setLayouts_.clear();
   for (auto& kv : moduleCache_) dfn_.DestroyShaderModule(device_, kv.second, nullptr);
   moduleCache_.clear();
+
+  if (pipelineCache_ && dfn_.GetPipelineCacheData && !pipelineCachePath_.empty()) {
+    size_t sz = 0;
+    if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, nullptr) == VK_SUCCESS &&
+        sz > 0) {
+      std::vector<uint8_t> blob(sz);
+      if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, blob.data()) ==
+          VK_SUCCESS) {
+        if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "wb")) {
+          std::fwrite(blob.data(), 1, sz, f);
+          std::fclose(f);
+        }
+      }
+    }
+  }
+  if (pipelineCache_) {
+    dfn_.DestroyPipelineCache(device_, pipelineCache_, nullptr);
+    pipelineCache_ = VK_NULL_HANDLE;
+  }
 
   for (auto& f : inFlight_) {
     dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &f.cmd);

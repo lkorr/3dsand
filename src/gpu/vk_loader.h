@@ -153,6 +153,9 @@ struct DeviceFns {
   PFN_vkDestroyPipelineLayout DestroyPipelineLayout = nullptr;
   PFN_vkCreateComputePipelines CreateComputePipelines = nullptr;
   PFN_vkDestroyPipeline DestroyPipeline = nullptr;
+  PFN_vkCreatePipelineCache CreatePipelineCache = nullptr;
+  PFN_vkDestroyPipelineCache DestroyPipelineCache = nullptr;
+  PFN_vkGetPipelineCacheData GetPipelineCacheData = nullptr;
   PFN_vkCreateDescriptorPool CreateDescriptorPool = nullptr;
   PFN_vkDestroyDescriptorPool DestroyDescriptorPool = nullptr;
   PFN_vkAllocateDescriptorSets AllocateDescriptorSets = nullptr;
