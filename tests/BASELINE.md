@@ -106,6 +106,50 @@ but still far cheaper than the full run:
 ./build/Release/sandvox.exe --selftest --gate mob
 ```
 
+### `daylight-boundary` — recorded at `f8c1bc7`, 2026-08-23, RTX 3060 Ti
+
+```
+paged: 1 daylight crossing(s) with freeze OFF (EncodeWakeAll fired),
+       peak pages 32768 / 32768, exhausted=1, pageFaults 0,
+       0 chunks active after, hash 00000000
+```
+
+**This is not a cosmetic entry, and it should not be left sitting here.** The
+gate exists to prove exactly one thing — that `PLAN_page_table.md` §3.8's fatal
+`std::abort()` on pool exhaustion stays unreachable in normal play — and it is
+currently reporting the pool at **32,768 / 32,768, `exhausted=1`**: a daylight
+boundary drives paged residency to 100% of the pool. Nothing aborts, because
+`everExhausted` is a `>=` watermark rather than a real allocation failure, and
+`pageFaults` is still 0, so no voxel was lost. But the margin the gate was
+written to measure is gone.
+
+Two things it is NOT:
+
+  * **Not the renderer's.** It reproduces on clean `f8c1bc7` with no shader
+    changes, and the far-field/LOD work is render-only (`farVox` is derived
+    data, never paged).
+  * **Not visible under `--residency dense`.** Dense is the identity map, so
+    `PagesInUse() == PoolPages()` by construction and the gate deliberately
+    gates `everExhausted` on `paged`. Dense reports the same `32768 / 32768`
+    and passes. Do not read that pass as evidence the pool is healthy.
+
+Where to look: `EncodeWakeAll` sets all 32,768 dirty flags, and §3.8's
+"intersect nonSentinel" filter on the materialization set is what is supposed
+to stop that becoming 32,768 page demands. The filter is present (or the abort
+would fire, twice per in-game day — the gate's own header says so), so the
+question is why the surviving non-sentinel set is still the whole window at a
+boundary. A day/night transition re-lights the surface band, and a JITTER chunk
+whose light changes is no longer representable by its sentinel — which would
+make the boundary a mass sentinel-to-real-page conversion event. That is a
+hypothesis, not a diagnosis; `SANDVOX_PT_DEBUG=1` around the crossing tick will
+say.
+
+Reproduce in ~0.5 s:
+
+```bash
+./build/Release/sandvox.exe --selftest --gate daylight-boundary --json day.json
+```
+
 ## Resolved: melee "hilt in fist"
 
 The melee sub-gate asserts that the sword's authored hilt box overlaps the
