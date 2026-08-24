@@ -68,8 +68,12 @@ uint32_t SceneMatAt(int scene, int x, int y, int z) {
         floorTop = G + kHillTop - HillDrop(x);
         floorTop = std::max(floorTop, G - 1);
         wallTop = floorTop + 6;
-      } else if (x <= 269) {       // catch basin interior (floor = the slab)
-        floorTop = G - 1;
+      } else if (x <= 269) {       // catch basin interior, carved into the slab
+        // 9 deep below the slab surface: 22 x 16 x 17 air layers = 47,872
+        // eighths of capacity against the 39,600-eighth pour. The original
+        // slab-level floor held 22,528 — the basin CAPTURE metric was capped
+        // at 57% by geometry once WP2 actually delivered the water.
+        floorTop = G - 10;
         wallTop = G + 7;
       } else {                     // far wall
         return y <= G + 7 ? kMatStone : kMatAir;
@@ -232,7 +236,8 @@ void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
 void LabSceneBuildOps(int scene, uint32_t sceneTick, uint32_t /*waterMat*/,
                       std::vector<CellOp>& out) {
   // The whole build lands on scene tick 1: every scene volume is well under
-  // kMaxCellOpsPerTick (largest is hill at 43,400 of 65,536).
+  // kMaxCellOpsPerTick (largest is hill at 57,400 of 65,536 — the carved
+  // catch basin added 10 y layers).
   if (sceneTick != 1) return;
   IVec3 lo, hi;
   LabSceneBounds(scene, lo, hi);
@@ -294,7 +299,7 @@ uint32_t LabSceneBenchTicks(int scene) {
 void LabSceneBounds(int scene, IVec3& lo, IVec3& hi) {
   switch (scene) {
     case kLabBasin:  lo = {242, G, 242}; hi = {269, G + 23, 269}; return;
-    case kLabHill:   lo = {202, G, 246}; hi = {271, G + 30, 265}; return;
+    case kLabHill:   lo = {202, G - 10, 246}; hi = {271, G + 30, 265}; return;
     case kLabFaucet: lo = {244, G, 244}; hi = {267, G + 26, 267}; return;
     case kLabPool:   lo = {246, G, 246}; hi = {265, G + 24, 265}; return;
     case kLabSlosh:  lo = {230, G, 249}; hi = {281, G + 15, 262}; return;
@@ -398,14 +403,13 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // water that a sealed pool can actually calm out of. Every sim.fluid*
       // value is a WGSL compile-time const, so the run has to recompile — the
       // F5 path, exactly as the lab's tuning watcher uses it.
+      // WP2 shrank the override set to the settle trio: stock is CFL-honest
+      // and zero-tension now, so the gate's old stiffness/cohesion/attract
+      // overrides are simply stock (keep this block mirroring the gate).
       if (run.settleTuning) {
         t.sim.fluidSettleEps = 6.0f;
         t.sim.fluidWakeSpeed = 24.0f;
         t.sim.fluidDamping = 0.9f;
-        t.sim.fluidStiffness = 2400.0f;
-        t.sim.fluidAttractSame = 0.0f;
-        t.sim.fluidAttractDiff = 0.0f;
-        t.sim.fluidCohesion = 0.0f;
       }
       SetCurrentTuning(t);
       // Recompile only when the compiled-in fluid consts actually change: a
@@ -447,9 +451,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     std::vector<double> frameMs, renderMs;
     std::map<std::string, uint64_t> prevNs;
     std::map<std::string, std::vector<double>> passMs;
-    std::vector<uint32_t> liveCurve, blockCurve;
+    std::vector<uint32_t> liveCurve, blockCurve, clampCurve;
     uint64_t poured = 0, settledSum = 0, excitedSum = 0, deadSum = 0,
-             binnedSum = 0, consumedSum = 0, emittedSum = 0, refusedSum = 0;
+             binnedSum = 0, consumedSum = 0, emittedSum = 0, refusedSum = 0,
+             clampedSum = 0;
     int tickOfSettle = -1;
     double idleFluidMs = -1.0;
     uint32_t idleFluidTicks = 0;
@@ -481,12 +486,16 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
           v.push_back((double)d * 1e-6);
         }
       }
-      uint32_t fa[16] = {};
+      // The whole 128-byte FA_* buffer: the old 64-byte read made fa[16]
+      // (consumed) an out-of-bounds stack read.
+      uint32_t fa[32] = {};
       rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
-                            64, "benchArgs");
+                            128, "benchArgs");
       liveEst = std::min(fa[7], kFluidCap);  // exact after the WaitIdle
       liveCurve.push_back(liveEst);
       blockCurve.push_back(fa[3]);
+      clampCurve.push_back(fa[18]);  // FA_CLAMPED: VMAX truncations this tick
+      clampedSum += fa[18];
       settledSum += fa[10];
       excitedSum += fa[11];
       deadSum += fa[8];
@@ -551,19 +560,43 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // In: every spawned particle carries one eighth (8 per cell at rest
     // density — the fluid-settle gate's equivalence). Out: live particles'
     // carried fullness + standing water eighths inside the scene bounds.
+    // Catch-basin capture (plan §5 acceptance, hill scenes only): the fraction
+    // of the poured ledger that ended INSIDE the catch basin at end-of-run —
+    // standing water voxels plus particles still swimming there. This is the
+    // quantitative form of "the water sheets down and arrives": mid-slope
+    // freeze shows up directly as capture loss.
+    const bool hasBasin = scene == kLabHill;
+    const IVec3 basinLo{248, G - 9, 248}, basinHi{269, G + 7, 263};
+    auto inBasin = [&](int x, int y, int z) {
+      return x >= basinLo.x && x <= basinHi.x && y >= basinLo.y &&
+             y <= basinHi.y && z >= basinLo.z && z <= basinHi.z;
+    };
+    uint64_t basinEighths = 0;
     uint64_t carriedEighths = 0;
     if (liveEst > 0) {
       std::vector<uint32_t> pbuf((size_t)liveEst * kFluidParticleWords);
       rhi::ReadbackBlocking(ctx.device, ctx.queue,
                             world.fluidParticles[sim.Page()], 0, pbuf.data(),
                             pbuf.size() * 4, "benchEndP");
-      for (uint32_t k = 0; k < liveEst; k++)
-        carriedEighths += (pbuf[k * kFluidParticleWords + 18] >> 12) & 0x7u;
+      for (uint32_t k = 0; k < liveEst; k++) {
+        const uint32_t* pw = pbuf.data() + (size_t)k * kFluidParticleWords;
+        const uint32_t f = (pw[18] >> 12) & 0x7u;
+        carriedEighths += f;
+        if (hasBasin && inBasin((int32_t)pw[0] >> 16, (int32_t)pw[1] >> 16,
+                                (int32_t)pw[2] >> 16))
+          basinEighths += f;
+      }
     }
     uint64_t standingEighths = 0;
     {
       IVec3 lo, hi;
       LabSceneBounds(scene, lo, hi);
+      // AUDIT-ONLY widening: splash carries over a scene's walls and settles
+      // on the slab outside the build volume — WP4 recorded pool's ledger as
+      // LEAK for exactly this (53 eighths on the slab past the sweep). The
+      // scene geometry still builds from the tight bounds; only the mass
+      // audit looks wider.
+      lo.x -= 12; lo.z -= 12; hi.x += 12; hi.z += 12;
       std::vector<uint32_t> cbuf((size_t)kChunkVol);
       for (int cy = lo.y / 16; cy <= hi.y / 16; cy++)
         for (int cz = lo.z / 16; cz <= hi.z / 16; cz++)
@@ -577,12 +610,17 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
               if (x < lo.x || x > hi.x || y < lo.y || y > hi.y || z < lo.z ||
                   z > hi.z)
                 continue;
-              if ((cbuf[i] & 0xFFFu) == waterId)
-                standingEighths += ((cbuf[i] >> 12) & 0xFu) + 1u;
+              if ((cbuf[i] & 0xFFFu) == waterId) {
+                const uint64_t e = ((cbuf[i] >> 12) & 0xFu) + 1u;
+                standingEighths += e;
+                if (hasBasin && inBasin(x, y, z)) basinEighths += e;
+              }
             }
           }
     }
     const bool massExact = standingEighths + carriedEighths == poured;
+    const double basinCapture =
+        (hasBasin && poured) ? (double)basinEighths / (double)poured : -1.0;
 
     // ---- screenshot (look acceptance is judged on these, plan §9) ----------
     {
@@ -622,6 +660,24 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         tickOfSettle, massExact ? "EXACT" : "LEAK",
         (unsigned long long)poured, (unsigned long long)standingEighths,
         (unsigned long long)carriedEighths);
+    // The CFL-honesty probe (plan §5 item 1): node-substeps the VMAX clamp
+    // truncated. Near-zero in steady flow is the acceptance; a persistent
+    // count means the stiffness/substep budget is dishonest again.
+    std::printf(
+        "    VMAX clamp engagements: total %llu | per-tick max %u | ticks>0 "
+        "%u of %u\n",
+        (unsigned long long)clampedSum,
+        clampCurve.empty()
+            ? 0u
+            : *std::max_element(clampCurve.begin(), clampCurve.end()),
+        (unsigned)std::count_if(clampCurve.begin(), clampCurve.end(),
+                                [](uint32_t c) { return c != 0; }),
+        (unsigned)clampCurve.size());
+    if (hasBasin)
+      std::printf("    basin capture: %.1f%% (%llu of %llu eighths inside the "
+                  "catch basin)\n",
+                  basinCapture * 100.0, (unsigned long long)basinEighths,
+                  (unsigned long long)poured);
     // ---- IDLE COST (plan §7 item 2) ---------------------------------------
     // The sum of every fluid pass on the ticks where the GPU-owned live count
     // read ZERO. The tick tables are still RECORDED on those ticks — the CPU's
@@ -690,6 +746,16 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     }
     json << "},\n";
     json << "    \"tickOfSettle\": " << tickOfSettle << ",\n";
+    json << "    \"clampEngagements\": {\"total\": " << clampedSum
+         << ", \"perTickMax\": "
+         << (clampCurve.empty()
+                 ? 0u
+                 : *std::max_element(clampCurve.begin(), clampCurve.end()))
+         << ", \"ticksNonzero\": "
+         << std::count_if(clampCurve.begin(), clampCurve.end(),
+                          [](uint32_t c) { return c != 0; })
+         << "},\n";
+    json << "    \"basinCapture\": " << basinCapture << ",\n";
     json << "    \"idleFluidMs\": " << idleFluidMs
          << ", \"idleFluidTicks\": " << idleFluidTicks << ",\n";
     json << "    \"massLedger\": {\"pouredEighths\": " << poured
