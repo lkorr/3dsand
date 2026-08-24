@@ -250,60 +250,59 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     probeInstalled = true;
     GpuContext* pctx = &ctx;
     World* pw = &world;
-    pt.SetChunkProbe([pctx, pw](const std::vector<uint32_t>& slots,
-                                uint32_t* out) {
-      // ONE COPY AND ONE MAP FOR THE WHOLE BATCH, not one drain per slot.
-      //
-      // The per-slot form called rhi::ReadbackBlocking once per candidate, and
-      // that call waits the whole device idle before mapping (rhi_vk.cpp). It
-      // was correct and it was invisible in every scenario it had been
-      // measured in, because those scenarios produce no candidates. Surface
-      // flight produces 665-804 per tick and it cost 198 ms of a 488 ms frame
-      // — see the SetChunkProbe comment for why they are manufactured by a
-      // stale snapshot rather than being real work.
-      //
-      // Gathering into one staging buffer makes it one submit and one wait for
-      // the batch. The copies are queue-ordered behind every prior submit, so
-      // they read post-tick data exactly as the per-slot copies did; the only
-      // thing removed is the repetition of the drain.
-      std::vector<bool> ok(slots.size(), false);
-      if (slots.empty()) return ok;
-      const size_t stride = (size_t)kChunkVol * 4;
-      static rhi::Buffer staging;
-      static size_t stagingSlots = 0;
-      if (stagingSlots < slots.size()) {
-        stagingSlots = slots.size();
-        staging = CreateBuffer(
-            pctx->device, (uint64_t)stagingSlots * stride,
-            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "freeProbe");
-      }
-      rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
-      size_t copied = 0;
-      for (size_t i = 0; i < slots.size(); i++) {
-        const uint64_t off = pw->PageOffsetOfSlot(slots[i]);
-        // A slot can lose its page between selection and here (evicted,
-        // demoted). No source, no copy, and ok[i] stays false — the caller
-        // simply does not free it, which is the conservative direction.
-        if (off == World::kNoPage) continue;
-        enc.CopyTracked(pass::Buf::Voxels, pw->voxels, off, staging,
-                        i * stride, stride);
-        ok[i] = true;
-        copied++;
-      }
-      if (copied == 0) return ok;
-      pctx->queue.Submit(enc.Finish());
-      rhi::MapTicket m = rhi::MapReadDeferred(pctx->device, staging, 0,
-                                             (uint64_t)slots.size() * stride);
-      m.Wait();
-      if (!m.Succeeded() || !m.Data()) {
-        m.Unmap();
-        std::fill(ok.begin(), ok.end(), false);
-        return ok;
-      }
-      std::memcpy(out, m.Data(), slots.size() * stride);
-      m.Unmap();
-      return ok;
-    });
+    struct ProbeState {
+      rhi::Buffer staging;
+      rhi::MapTicket map;
+      size_t stagingSlots = 0;
+      size_t lastBatchSize = 0;
+    };
+    auto state = std::make_shared<ProbeState>();
+
+    pt.SetChunkProbe(
+        // SUBMIT: encode copies, kick deferred map, return per-slot validity.
+        [pctx, pw, state](const std::vector<uint32_t>& slots)
+            -> std::vector<bool> {
+          std::vector<bool> ok(slots.size(), false);
+          if (slots.empty()) return ok;
+          const size_t stride = (size_t)kChunkVol * 4;
+          if (state->stagingSlots < slots.size()) {
+            state->stagingSlots = slots.size();
+            state->staging = CreateBuffer(
+                pctx->device, (uint64_t)state->stagingSlots * stride,
+                rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                "freeProbe");
+          }
+          rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
+          size_t copied = 0;
+          for (size_t i = 0; i < slots.size(); i++) {
+            const uint64_t off = pw->PageOffsetOfSlot(slots[i]);
+            if (off == World::kNoPage) continue;
+            enc.CopyTracked(pass::Buf::Voxels, pw->voxels, off,
+                            state->staging, i * stride, stride);
+            ok[i] = true;
+            copied++;
+          }
+          if (copied == 0) return ok;
+          pctx->queue.Submit(enc.Finish());
+          state->map = rhi::MapReadDeferred(pctx->device, state->staging, 0,
+                                            (uint64_t)slots.size() * stride);
+          state->lastBatchSize = slots.size();
+          return ok;
+        },
+        // HARVEST: non-blocking Ready() check; copy data out if complete.
+        [state](uint32_t* out) -> bool {
+          if (!state->map.Ready()) return false;
+          state->map.Wait();
+          if (!state->map.Succeeded() || !state->map.Data()) {
+            state->map.Unmap();
+            return false;
+          }
+          const size_t stride = (size_t)kChunkVol * 4;
+          std::memcpy(out, state->map.Data(),
+                      state->lastBatchSize * stride);
+          state->map.Unmap();
+          return true;
+        });
   }
   pt.BeginTick(tick);
   for (const BrushOp& o : ops)

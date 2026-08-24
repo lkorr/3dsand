@@ -965,7 +965,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // voxels — a chunk stained since the snapshot still reads clean, and
     // freeing it drops hashed state. Measured directly: trusting the flag to
     // authorize a free took the streaming gate from 217 to 240 page faults.
-    // The live words keep the final say, through probeChunk_ below.
+    // The live words keep the final say, through the deferred probe below.
     if (haveStainFlags && occStain[s] != 0) { zeroStreak_[s] = 0; continue; }
     // THE PER-TICK CAP IS GONE, and that is the actual fix for the leak.
     //
@@ -982,133 +982,100 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     candidates.push_back(s);
   }
 
-  // Second pass: confirm each candidate is REALLY empty by reading its words.
-  // Kept out of the loop above so the common case — no candidates at all,
-  // which is every tick of a settled world — costs nothing beyond the
-  // increments. The stain flag has already rejected the chunks it can; these
-  // are the ones only the live words can decide.
+  // ---- HARVEST last tick's deferred probe, then SUBMIT this tick's ----------
+  //
+  // The old shape was: collect candidates, copy 2 MiB from the GPU, WAIT for
+  // the map, scan the words, all in one tick. The Wait is a fence behind
+  // whatever GPU work is queued (~1.6 ms/tick measured, 3.2 ms/frame at 2
+  // ticks/frame under surface flight).
+  //
+  // Deferring the readback removes the fence: submit on tick N, harvest on
+  // tick N+1 when the map has had a full frame to complete. The candidates
+  // are 1 tick staler, which is immaterial against an 8-tick hysteresis.
+  //
+  // IDENTITY CHECK: between submit and harvest a shift can reassign the slot
+  // to a different world chunk. The slot-to-worldchunk key recorded at submit
+  // time is compared at harvest time; a mismatch skips the slot (conservative:
+  // keeps the page, exactly like a vanished-page skip).
   const bool ptDbg = getenv("SANDVOX_PT_DEBUG") != nullptr;
   const double probeT0 = ptDbg ? PtNowMs() : 0.0;
-  uint32_t probesRun = 0;
+  uint32_t probesRun = 0, probesHarvested = 0;
 
-  // ---- ONE BATCHED READ FOR THE WHOLE CANDIDATE SET -----------------------
-  //
-  // See SetChunkProbe for the measurement that forced this shape: the per-slot
-  // form was a full device drain each, 198 ms for one tick's 804 candidates.
-  //
-  // The batch is CAPPED (kMaxFreeProbesPerTick), and the cap is back for a
-  // different reason than the one that made it harmful before. It used to
-  // bound reclamation below the allocation rate, which is a leak. Here it
-  // bounds the STAGING BYTES of a single read — 128 chunks is 2 MiB — while
-  // the candidates it defers are not lost: their zeroStreak_ is held AT the
-  // threshold, so they are re-offered on the very next tick rather than
-  // restarting their eight-snapshot wait. Reclamation is therefore still
-  // unbounded ACROSS ticks; only one tick's read is bounded.
-  std::vector<uint32_t> batch;
-  std::vector<bool> ok;
-  if (probeChunk_ && !candidates.empty()) {
+  // ---- HARVEST phase: process the previous tick's probe -------------------
+  if (probePending_ && probeHarvest_) {
+    if (freeProbe_.size() < pendingProbeSlots_.size() * (size_t)kChunkVol)
+      freeProbe_.assign(pendingProbeSlots_.size() * (size_t)kChunkVol, 0);
+    if (probeHarvest_(freeProbe_.data())) {
+      probesHarvested = (uint32_t)pendingProbeSlots_.size();
+      for (size_t ci = 0; ci < pendingProbeSlots_.size(); ci++) {
+        const uint32_t s = pendingProbeSlots_[ci];
+        if (ci < pendingProbeOk_.size() && !pendingProbeOk_[ci]) continue;
+        if ((t[s] & kPtSentinelBit) != 0u) continue;  // already freed
+        // Identity: the slot must still map to the same world chunk it did
+        // when the copy was issued. A shift between submit and harvest
+        // reassigns the slot; classifying the old chunk's words against the
+        // new chunk's page would silently free the wrong data.
+        if (ci < pendingProbeKeys_.size() &&
+            World::PackChunkKey(world_->SlotToWorldChunk(s)) !=
+                pendingProbeKeys_[ci])
+          continue;
+        const uint32_t* words = freeProbe_.data() + ci * (size_t)kChunkVol;
+        bool demotable = true;
+        for (uint32_t i = 0; i < kChunkVol; i++)
+          if ((words[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
+        if (!demotable) {
+          if (ptDbg) {
+            uint32_t w = 0, at = 0;
+            for (uint32_t i = 0; i < kChunkVol; i++)
+              if ((words[i] & kAirDemoteMask) != 0u) { w = words[i]; at = i; break; }
+            std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
+                        tick_, s, w, at);
+          }
+          zeroStreak_[s] = 0;
+          continue;
+        }
+        if (cpuDirty_.Has(s)) { zeroStreak_[s] = kPageFreeTicks - 1; continue; }
+        if (shellActive_ && shell_.Has(s)) {
+          zeroStreak_[s] = kPageFreeTicks - 1;
+          continue;
+        }
+        const uint32_t page = t[s];
+        world_->pageTableCpuMutable()[s] = kPtEmpty;
+        MarkTableDirty(s);
+        retire_.push_back({page, tick});
+        pagesInUse_--;
+        pagesFreed_++;
+      }
+      pendingProbeSlots_.clear();
+      probePending_ = false;
+    }
+    // If not ready yet, keep probePending_ true — harvest again next tick.
+  }
+
+  // ---- SUBMIT phase: kick a new probe for this tick's candidates ----------
+  if (probeSubmit_ && !candidates.empty() && !probePending_) {
     const size_t n = std::min(candidates.size(), kMaxFreeProbesPerTick);
-    batch.assign(candidates.begin(), candidates.begin() + n);
-    if (freeProbe_.size() != (size_t)kChunkVol * n)
-      freeProbe_.assign((size_t)kChunkVol * n, 0);
-    ok = probeChunk_(batch, freeProbe_.data());
+    pendingProbeSlots_.assign(candidates.begin(), candidates.begin() + n);
+    pendingProbeKeys_.resize(n);
+    for (size_t i = 0; i < n; i++)
+      pendingProbeKeys_[i] =
+          World::PackChunkKey(world_->SlotToWorldChunk(pendingProbeSlots_[i]));
+    pendingProbeOk_ = probeSubmit_(pendingProbeSlots_);
+    probePending_ = true;
     probesRun = (uint32_t)n;
-    // Deferred candidates keep their place in the queue: held one short of a
-    // re-increment so the next snapshot re-offers them immediately.
     for (size_t i = n; i < candidates.size(); i++)
       zeroStreak_[candidates[i]] = kPageFreeTicks - 1;
-    candidates.resize(n);
   }
+  if (ptDbg && (probesRun || probesHarvested))
+    std::printf("[pt-time] tick %u freeprobe: cands=%zu submitted=%u "
+                "harvested=%u %.2f ms\n",
+                tick, candidates.size(), probesRun, probesHarvested,
+                PtNowMs() - probeT0);
+}
 
-  for (size_t ci = 0; ci < candidates.size(); ci++) {
-    const uint32_t s = candidates[ci];
-    if (probeChunk_) {
-      if (ci >= ok.size() || !ok[ci]) continue;
-      const uint32_t* words = freeProbe_.data() + ci * (size_t)kChunkVol;
-      // The free test is "every cell is STAINLESS AIR", NOT Classify's
-      // exact-word rule, and the distinction is the difference between a
-      // working demotion path and a permanent leak. Two passenger-bit classes
-      // survive on air cells after a chunk empties, and Classify refuses both
-      // forever:
-      //   - the tick stamp: the CA deliberately stamps vacated cells
-      //     (sim_step.wgsl:114, "displaced fluid (or air) swaps into the
-      //     source cell, stamped") — words like 0x00030000;
-      //   - the state nibble: sim_mutate paints EVERY voxel with a palette
-      //     jitter (`state = rnd % 3`, sim_mutate.wgsl:80), air included, so
-      //     an erase brush leaves words like 0x00002000.
-      // Measured on the first full paged suite as ~14,400 pages still
-      // resident after the streaming and spells gates, nearly all of them
-      // this.
-      //
-      // Ignoring bits 12..23 on an AIR word is SOUND on three independent
-      // grounds, each verifiable at its source:
-      //   1. HASH-BLIND: the determinism hash skips MAT_AIR cells entirely
-      //      (sim_occupancy.wgsl:161, `if (m != MAT_AIR)`), so nothing in
-      //      those bits can move the hash.
-      //   2. BEHAVIOR-INERT: the only stamp reader is the acting cell's own
-      //      early-out (sim_step.wgsl:802), and an air cell's act is a no-op
-      //      either way. Every sim read of a NEIGHBOUR's state nibble is
-      //      behind a same-material guard (sim_step.wgsl:682,:705,:724,:753)
-      //      and the flow-into-air branch passes an explicit 0 for air's
-      //      fullness (transferLiquid call, :760) — air's state nibble is
-      //      never read. tryMove copies both fields through the swap without
-      //      branching on them: pure passengers.
-      //   3. The stamp byte is additionally SAVE-STRIPPED (kPersistMask,
-      //      stream.cpp:41) — every save/evict round-trip already zeroes it.
-      // STAIN stays load-bearing: it is hashed on non-air cells, and a
-      // stained but all-air chunk must keep its page (the erode-then-demote
-      // hash bug this probe was built to prevent). Bit 31 is kept in the
-      // mask out of caution — a set transient flag means something is
-      // mid-flight and the chunk is not settled anyway.
-      //
-      // So a chunk of stainless air is the SAME WORLD CONTENT as PT_EMPTY,
-      // and demoting it at a snapshot-cadence-dependent time cannot influence
-      // hashed state or evolution (rule 1 intact; the --vk-smoke pinned
-      // sequences are the empirical check). Classify keeps its exact-word
-      // strictness where it is needed — UNIFORM promotion must reproduce
-      // resident words bit-exactly.
-      bool demotable = true;
-      for (uint32_t i = 0; i < kChunkVol; i++)
-        if ((words[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
-      if (!demotable) {
-        if (ptDbg) {
-          uint32_t w = 0, at = 0;
-          for (uint32_t i = 0; i < kChunkVol; i++)
-            if ((words[i] & kAirDemoteMask) != 0u) { w = words[i]; at = i; break; }
-          std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
-                      tick_, s, w, at);
-        }
-        zeroStreak_[s] = 0;   // carries persistent state: keep the page
-        continue;
-      }
-    }
-    // The second conjunct. Without it a chunk empty right now but adjacent to
-    // activity would be freed and re-materialized on the very next tick —
-    // and page fills are GPU commands, so an oscillating boundary means a
-    // settled-looking world issuing fills forever (risk 6, a rule-2 violation
-    // that presents as a perf mystery).
-    if (cpuDirty_.Has(s)) { zeroStreak_[s] = kPageFreeTicks - 1; continue; }
-    // The third conjunct, live only while particles fly: the flight shell's
-    // RING chunks are all-air and deliberately NOT in cpuDirty (that is what
-    // keeps the shell at one ring), so this is what stops hysteresis from
-    // freeing a chunk a particle may land in mid-flight — the exact measured
-    // flung-liquid failure. It preserves §3.6's structural property: nothing
-    // in the materialization set is eligible to free.
-    if (shellActive_ && shell_.Has(s)) {
-      zeroStreak_[s] = kPageFreeTicks - 1;
-      continue;
-    }
-    const uint32_t page = t[s];
-    world_->pageTableCpuMutable()[s] = kPtEmpty;
-    MarkTableDirty(s);
-    // Parked, not pushed: see the retire-queue note in the header.
-    retire_.push_back({page, tick});
-    pagesInUse_--;
-    pagesFreed_++;
-  }
-  if (ptDbg && (probesRun || !candidates.empty()))
-    std::printf("[pt-time] tick %u freeprobe: cands=%zu probes=%u %.2f ms\n",
-                tick, candidates.size(), probesRun, PtNowMs() - probeT0);
+void PageTable::ResetStreaks(const std::vector<uint32_t>& slots) {
+  if (zeroStreak_.size() != kNumChunks) return;
+  for (uint32_t s : slots) zeroStreak_[s] = 0;
 }
 
 void PageTable::RetirePages(uint32_t tick) {

@@ -444,9 +444,6 @@ void Stream::CompleteOldest(bool discard) {
             RleEncodeSentinelChunk(e, p.items[i].wc, seed_, rle);
             if (dbg) { synthMs += PtNowMs() - ts; synthChunks++; }
           } else {
-            // Straight off the mapped staging buffer: RleEncodeChunk only reads
-            // the words, so the intermediate 16 KiB copy this used to make was
-            // pure overhead. (The mapping stays alive until Unmap below.)
             RleEncodeChunk((const uint32_t*)(ptr + i * kChunkBytes), rle);
             if (dbg) rleMs += PtNowMs() - ts;
           }
@@ -482,6 +479,8 @@ void Stream::DrainEvictions(bool discard) {
 }
 
 void Stream::FillSlots(const std::vector<uint32_t>& slots) {
+  if (world_->residency == World::Residency::Paged)
+    world_->pages->ResetStreaks(slots);
   std::vector<uint32_t> data(kChunkVol);
   std::vector<uint32_t> genSlots;
   const uint32_t one = 1;

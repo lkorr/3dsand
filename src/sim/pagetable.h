@@ -317,11 +317,27 @@ class PageTable {
   // Stream::IssueDemoteCopies. `out` is n * kChunkVol words, slot i's chunk at
   // i * kChunkVol. Returns a per-slot validity vector: a slot whose page went
   // away between selection and copy reports false and is simply not freed.
+  // Deferred two-phase probe: submit on tick N, harvest on tick N+1.
+  // Submit: encode GPU copies for the given slots, kick a deferred map.
+  //         Returns per-slot validity (false = page vanished, no copy issued).
+  // Harvest: non-blocking Ready() check; if complete, copies the mapped data
+  //          to `out` and returns true. Caller must not call harvest without
+  //          a preceding submit.
   void SetChunkProbe(
-      std::function<std::vector<bool>(const std::vector<uint32_t>&, uint32_t*)>
-          probe) {
-    probeChunk_ = std::move(probe);
+      std::function<std::vector<bool>(const std::vector<uint32_t>&)> submit,
+      std::function<bool(uint32_t*)> harvest) {
+    probeSubmit_ = std::move(submit);
+    probeHarvest_ = std::move(harvest);
   }
+
+  // A shift puts a DIFFERENT world chunk into every slot of the plane. The
+  // zeroStreak counter is slot-indexed, so a streak accumulated for the OLD
+  // chunk would carry over to the NEW one — and with a 2-tick snapshot lag the
+  // new chunk's actual occupancy hasn't arrived yet. Without a reset, the
+  // counter can reach kPageFreeTicks on the WRONG chunk, the candidate passes
+  // every pre-filter, and only the word probe catches it (measured: ~5-7% of
+  // 128 candidates per tick under --autofly-surface are shift-race refusals).
+  void ResetStreaks(const std::vector<uint32_t>& slots);
 
   // Retire the free list: pages parked by ConsumeOccupancy become reusable
   // once enough ticks have passed for any in-flight eviction copy referencing
@@ -442,9 +458,13 @@ class PageTable {
   // already running and takes NO further action. That is the rule-2 story, and
   // it is honest: not free, but not a new scan either.
   std::vector<uint8_t> zeroStreak_;
-  std::function<std::vector<bool>(const std::vector<uint32_t>&, uint32_t*)>
-      probeChunk_;
+  std::function<std::vector<bool>(const std::vector<uint32_t>&)> probeSubmit_;
+  std::function<bool(uint32_t*)> probeHarvest_;
   std::vector<uint32_t> freeProbe_;
+  std::vector<uint32_t> pendingProbeSlots_;
+  std::vector<uint64_t> pendingProbeKeys_;   // world chunk key at submit time
+  std::vector<bool> pendingProbeOk_;
+  bool probePending_ = false;
   static constexpr uint8_t kPageFreeTicks = 8;   // ~a quarter second at 30 Hz
   // Free-probe budget per tick: each probe is a blocking WaitIdle + 16 KiB
   // readback, so mass-demotion events must drain over ticks, not stall one.
