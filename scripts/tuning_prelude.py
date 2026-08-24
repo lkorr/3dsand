@@ -297,14 +297,15 @@ SPEC = [
     ("sim", "expMicroScaleIdx", "TUNE_EXP_MICRO_SCALE_IDX", "u", 2),
 
     # MLS-MPM fluid, HUMAN units
-    ("sim", "fluidStiffness", "TUNE_FLUID_STIFFNESS", "f", 3600.0),
-    ("sim", "fluidGravity", "TUNE_FLUID_GRAVITY", "f", 98.1),
+    ("sim", "fluidSubsteps", "TUNE_FLUID_SUBSTEPS", "i", 9),
+    ("sim", "fluidStiffness", "TUNE_FLUID_STIFFNESS", "f", 14000.0),
+    ("sim", "fluidGravity", "TUNE_FLUID_GRAVITY", "f", 900.0),
     ("sim", "fluidRestDensity", "TUNE_FLUID_REST_DENSITY", "f", 8.0),
     ("sim", "fluidEosPower", "TUNE_FLUID_EOS_POWER", "i", 4),
     ("sim", "fluidCohesion", "TUNE_FLUID_COHESION", "f", 0.0),
     ("sim", "fluidAttractSame", "TUNE_FLUID_ATTRACT_SAME", "f", 0.0),
     ("sim", "fluidAttractDiff", "TUNE_FLUID_ATTRACT_DIFF", "f", 0.0),
-    ("sim", "fluidViscosity", "TUNE_FLUID_VISCOSITY", "f", 0.1),
+    ("sim", "fluidViscosity", "TUNE_FLUID_VISCOSITY", "f", 0.0),
     ("sim", "fluidDamping", "TUNE_FLUID_DAMPING", "f", 0.0),
     ("sim", "fluidFriction", "TUNE_FLUID_FRICTION", "f", 0.0),
     ("sim", "fluidSplashRate", "TUNE_FLUID_SPLASH_RATE", "f", 4.0),

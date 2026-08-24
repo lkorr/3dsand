@@ -419,10 +419,12 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
 // slot order (deterministic) and emits the node-pass dispatch args.
 //
 // WHY ONCE IS ENOUGH, and what pays for it: a particle's velocity is CFL-capped
-// at FLUID_VMAX = 0.45 cell/substep, so it travels at most 2.7 cells in a whole
-// tick. `mark` pads its support by FLUID_MARK_PAD = 3 cells in every direction,
-// which covers that with room to spare, so a particle can never reach a chunk
-// this map does not already cover. (A particle whose chunk has no block simply
+// at 0.45 cell/substep, so it travels at most 0.45*sim.fluidSubsteps cells in a
+// whole tick (4.05 at the 9-substep default, 2.7 at the historical 6). `mark`
+// pads its support by FLUID_MARK_PAD = ceil(that) cells in every direction —
+// derived from the same knob in common.wgsl, so the pad cannot fall behind a
+// substep bump — and a particle can never reach a chunk this map does not
+// already cover. (A particle whose chunk has no block simply
 // freezes for the substep — deterministic, mass-preserving, and the same
 // bounded degradation the kFluidBlocks budget already accepts — so the pad is
 // belt AND braces, not the only guard.)

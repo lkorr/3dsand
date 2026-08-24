@@ -1135,7 +1135,15 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
     // and the PT_FLUIDMAP block in pass_table.def). Recorded after the seam
     // because exciteEmit and spawnAppend create particles it must cover.
     RecordTable(enc, pass::Table::FluidMap, &cx);
-    for (uint32_t s = 0; s < kFluidSubsteps; s++)
+    // The substep count is a tuning knob (sim.fluidSubsteps): the CFL budget
+    // and the solver's price are the same number. Reading CurrentTuning() at
+    // record time is the same shape as exciteOn above — tuning is a
+    // tick-deterministic input, never frame timing. The shader side derives
+    // FLUID_SUBSTEPS from the identical knob, so the recorded count and the
+    // compiled-in divisors cannot disagree.
+    const uint32_t substeps = (uint32_t)std::clamp(
+        CurrentTuning().sim.fluidSubsteps, 1, 32);
+    for (uint32_t s = 0; s < substeps; s++)
       RecordTable(enc, pass::Table::Fluid, &cx);
     RecordTable(enc, pass::Table::FluidSettle, &cx);
   }

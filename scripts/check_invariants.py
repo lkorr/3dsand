@@ -444,8 +444,38 @@ def check_world_consts():
                     f"(gpu/resources.cpp) -- add it to world.h and the prelude")
 
 
+# ------------------------------------------------------------ fluid substeps
+def check_fluid_substeps():
+    """world.h's kFluidSubsteps must equal the sim.fluidSubsteps .def default.
+
+    The substep count is a tuning knob, but world.h still carries the fallback
+    constant and every comment that reasons about the CFL cap (VMAX =
+    0.45*substeps cells/tick, the block-map pad, the ~8/12 m/s terminal speed)
+    is written against it. A .def default that drifts from world.h would make
+    those comments quietly wrong and, worse, make a fresh tuning.json disagree
+    with the C++ fallback about how many times EncodeTick records the substep
+    table.
+    """
+    wh = read("src/sim/world.h")
+    dfn = read("src/sim/tuning_params.def")
+    if not wh or not dfn:
+        return
+    m = re.search(r"constexpr\s+uint32_t\s+kFluidSubsteps\s*=\s*(\d+)", wh)
+    d = re.search(r"TP_I\(sim,\s*fluidSubsteps,\s*TUNE_FLUID_SUBSTEPS,\s*(\d+)\)",
+                  dfn)
+    if not m or not d:
+        return
+    checked.append("fluid substeps")
+    if m.group(1) != d.group(1):
+        problems.append(
+            f"world.h kFluidSubsteps = {m.group(1)} but tuning_params.def "
+            f"sim.fluidSubsteps defaults to {d.group(1)} -- the fallback and "
+            f"the knob's default must agree")
+
+
 ALL = {
     "sound": check_sound_slots,
+    "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
     "render": check_render_paths,
     "world": check_world_consts,
@@ -459,13 +489,13 @@ RELEVANT = {
     "src/audio/cues.cpp": ["sound"],
     "src/sim/tuning.cpp": ["tuning"],
     "src/sim/tuning.h": ["tuning"],
-    "src/sim/tuning_params.def": ["tuning"],
+    "src/sim/tuning_params.def": ["tuning", "substeps"],
     "scripts/tuning_prelude.py": ["tuning"],
     "assets/tuner.html": ["render", "arch"],
     "src/sim/materials.cpp": ["render"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
-    "src/sim/world.h": ["world", "params"],
+    "src/sim/world.h": ["world", "params", "substeps"],
 }
 
 if __name__ == "__main__":

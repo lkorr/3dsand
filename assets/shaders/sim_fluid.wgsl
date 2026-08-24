@@ -187,12 +187,20 @@ const FLUID_FOAM_DECAY : i32 = i32(round(65536.0 *
         f32(FLUID_SUBSTEPS))));
 // 0.5 cell in Q16.16 — the cell-center offset of the node lattice.
 const FLUID_HALF : i32 = 32768;
-// CFL cap: 0.45 cell/substep * FLUID_SUBSTEPS, Q16.16 cells/tick (~8.1 m/s).
-const FLUID_VMAX : i32 = 176947;
+// FLUID_VMAX (the CFL cap, 0.45 cell/substep expressed in cells/TICK) and
+// FLUID_MARK_PAD now live in common.wgsl next to FLUID_SUBSTEPS, because all
+// three are the same decision and the substep count is a tuning knob.
 // Bound on the fused velocity+stress+affine term before the staged multiply.
-const FLUID_VEFF_MAX : i32 = 393216;   // 6.0 cells/tick
-// Affine matrix clamp, Q16.16 per tick.
-const FLUID_CMAX : i32 = 262144;       // 4.0 /tick
+// 6.0 cells/tick at the historical 6 substeps; scales with the CFL cap so a
+// higher substep budget does not clip terms the solver is now allowed to
+// produce (2*VMAX is the worst fused magnitude). The `max` keeps 6 substeps
+// bit-identical to before the substep knob existed. Overflow audit: at the
+// 32-substep ceiling this is 1,887,436 < 2^21, so every mq() operand still
+// obeys the file-header bound.
+const FLUID_VEFF_MAX : i32 = max(393216, FLUID_VMAX * 2);
+// Affine matrix clamp, Q16.16 per tick. A velocity difference of VMAX across
+// one cell IS a C of VMAX, so the clamp must not sit below it.
+const FLUID_CMAX : i32 = max(262144, FLUID_VMAX);
 // J clamps, Q16: [0.6, 1.4]. J is diagnostic now (the EOS reads density), but
 // the clamp keeps the fluid-det sanity band meaningful.
 const FLUID_JMIN : i32 = 39322;
@@ -302,13 +310,13 @@ fn liveTotal() -> u32 { return min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP); 
 // instantaneous 3-cell node support was exact. Building it once per tick
 // (plan §7 item 4) means it must also cover where the particle will BE by the
 // last substep. Displacement is bounded by the CFL clamp: g2p advects
-// v / FLUID_SUBSTEPS per substep with |v| <= FLUID_VMAX (0.45 cell/substep x 6),
-// so a particle moves at most FLUID_VMAX = 2.7 cells over the whole tick,
-// whatever the pressure field does to it in between. 3 cells covers that.
-//
-// The padded span is [base-3, base+5] = 9 cells, and 9 <= CHUNK, so it still
-// touches at most 2 chunks per axis and the 8-corner loop is still exhaustive.
-const FLUID_MARK_PAD : i32 = 3;
+// v / FLUID_SUBSTEPS per substep with |v| <= FLUID_VMAX (0.45 cell/substep x
+// FLUID_SUBSTEPS), so a particle moves at most 0.45*substeps cells over the
+// whole tick, whatever the pressure field does to it in between.
+// FLUID_MARK_PAD (common.wgsl, derived from the substep knob) is exactly that
+// rounded up: 3 cells at the historical 6 substeps, 5 at the 9-substep
+// default. The padded span is [base-pad, base+2+pad] and the pad is capped so
+// that stays <= CHUNK, which is what keeps the 8-corner loop below exhaustive.
 
 @compute @workgroup_size(64)
 fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {

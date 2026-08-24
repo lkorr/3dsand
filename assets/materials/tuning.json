@@ -232,6 +232,7 @@
     "expMicroPerMille": 900,
     "expMicroLifeTicks": 40,
     "expMicroScaleIdx": 2,
+    "fluidSubsteps": 9,
     "fluidStiffness": 14000,
     "fluidGravity": 900,
     "fluidRestDensity": 8,

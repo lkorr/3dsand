@@ -800,7 +800,27 @@ fn microStainPriority(p : Particle) -> u32 {
 // debris.wgsl vsFluid.
 const FLUID_CAP       : u32 = 262144u;  // kFluidCap
 const FLUID_BLOCKS    : u32 = 256u;     // kFluidBlocks
-const FLUID_SUBSTEPS  : i32 = 6;        // kFluidSubsteps
+// MPM substeps per 30 Hz tick — the CFL BUDGET, and a tuning knob since WP3
+// (sim.fluidSubsteps; EncodeTick records the substep table this many times, so
+// the C++ side reads the same knob and world.h's kFluidSubsteps is only the
+// fallback default). Everything CFL-derived hangs off it, right here, so the
+// three numbers can never drift apart:
+//   FLUID_VMAX     0.45 cell/substep, expressed in cells/TICK (velocity is a
+//                  per-tick quantity everywhere in the solver; g2p advects
+//                  v/FLUID_SUBSTEPS). This is the fluid's terminal velocity.
+//   FLUID_MARK_PAD the block map is built once per tick, so `mark` must cover
+//                  a whole tick of travel: ceil(0.45 * substeps) cells.
+// The pseudo sound speed sqrt(stiffness)/30 must fit under 0.45 cells/substep
+// or the clamp starts eating pressure work as energy loss (plan §1.2 item 1),
+// which is the arithmetic behind the default: sqrt(14000)/13.5 = 8.7 -> 9.
+const FLUID_SUBSTEPS  : i32 = clamp(TUNE_FLUID_SUBSTEPS, 1, 32);
+const FLUID_VMAX      : i32 = i32(round(0.45 * f32(FLUID_SUBSTEPS) * 65536.0));
+// Capped at 7 so the padded span [base-pad, base+2+pad] stays <= CHUNK (16)
+// and `mark`'s 8-corner loop remains exhaustive over the chunks it touches.
+// The cap binds only past 15 substeps, where a particle at terminal velocity
+// can outrun the map and simply freezes for the substep — the same bounded,
+// deterministic degradation the kFluidBlocks budget already accepts.
+const FLUID_MARK_PAD  : i32 = min(i32(ceil(0.45 * f32(FLUID_SUBSTEPS))), 7);
 const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // Words per fluid grid node: [0] mass Q10, [1..3] momentum->velocity Q16.16,
 // [4..6] species 1..3 mass Q10, [7] foam field (persistent). Shared by the

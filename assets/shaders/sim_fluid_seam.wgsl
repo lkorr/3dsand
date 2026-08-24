@@ -131,9 +131,11 @@ const MARK_LIST_MASK : u32 = 0x1Fu;
 // range. Truncate to Q12.4 instead (>>4), square, and shift the SQUARE down 8
 // so the compare stays in the measured side's exact (v >> 8)^2 units; the
 // slider now steps at ~0.0073 vox/s.
-// Overflow audit: LoadTuning clamps settleEps/wakeSpeed well under VMAX, but
-// audit at the absolute ceiling anyway — VMAX is 176947 Q16.16, so
-// (176947 >> 4)^2 = 11059^2 = 1.223e8 < 2^31. Fits i32 with 17x headroom.
+// Overflow audit: LoadTuning clamps settleEps/wakeSpeed to <= 50 vox/s, i.e.
+// 109227 Q16.16, so (109227 >> 4)^2 = 6826^2 = 4.66e7 < 2^31 whatever the
+// substep budget does to FLUID_VMAX. (Audited at the absolute VMAX ceiling
+// too: 32 substeps -> 943718 Q16.16, (943718 >> 4)^2 = 3.48e9, which would
+// NOT fit — hence the audit is on the tuner's 50 vox/s clamp, not on VMAX.)
 const SEAM_SETTLE4 : i32 =
     i32(round(TUNE_FLUID_SETTLE_EPS * 65536.0 / 30.0)) >> 4u;
 const SEAM_SETTLE2 : i32 = (SEAM_SETTLE4 * SEAM_SETTLE4) >> 8u;
@@ -299,9 +301,12 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   let op = fluidSpawnOps[gid.x];
   var p : FluidParticle;
   p.px = op.px; p.py = op.py; p.pz = op.pz;
-  p.vx = clamp(op.vx, -176947, 176947);
-  p.vy = clamp(op.vy, -176947, 176947);
-  p.vz = clamp(op.vz, -176947, 176947);
+  // The CFL cap is derived from the substep knob (common.wgsl), so a spawn op
+  // authored against one substep budget cannot smuggle a super-CFL velocity
+  // into a world running another.
+  p.vx = clamp(op.vx, -FLUID_VMAX, FLUID_VMAX);
+  p.vy = clamp(op.vy, -FLUID_VMAX, FLUID_VMAX);
+  p.vz = clamp(op.vz, -FLUID_VMAX, FLUID_VMAX);
   p.c00 = 0; p.c01 = 0; p.c02 = 0;
   p.c10 = 0; p.c11 = 0; p.c12 = 0;
   p.c20 = 0; p.c21 = 0; p.c22 = 0;

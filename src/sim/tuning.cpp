@@ -663,6 +663,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "expMicroPerMille", s.expMicroPerMille, out, at);
     ReadI(*g, "expMicroLifeTicks", s.expMicroLifeTicks, out, at);
     ReadI(*g, "expMicroScaleIdx", s.expMicroScaleIdx, out, at);
+    ReadI(*g, "fluidSubsteps", s.fluidSubsteps, out, at);
     ReadF(*g, "fluidStiffness", s.fluidStiffness, out, at);
     ReadF(*g, "fluidGravity", s.fluidGravity, out, at);
     ReadF(*g, "fluidRestDensity", s.fluidRestDensity, out, at);
@@ -712,6 +713,15 @@ bool LoadTuning(const std::string& path, Tuning& out) {
         v = !(v >= lo) ? lo : hi;
       }
     };
+    // Substeps: the CFL budget and the solver's price. The 32 ceiling is the
+    // pass-table/timer sanity bound (the substep table is recorded this many
+    // times per tick); the 1 floor keeps every /FLUID_SUBSTEPS in the kernels
+    // legal. Not warned against stiffness here — an under-budgeted stiffness
+    // is legal, just clamped (FA_CLAMPED is the probe that says so).
+    if (s.fluidSubsteps < 1 || s.fluidSubsteps > 32) {
+      out.warnings.push_back("sim.fluidSubsteps out of 1..32; clamped");
+      s.fluidSubsteps = s.fluidSubsteps < 1 ? 1 : 32;
+    }
     clampWarnF(s.fluidStiffness, 0.0f, 43200.0f, "fluidStiffness");   // 48 c²/t²
     clampWarnF(s.fluidGravity, 0.0f, 1800.0f, "fluidGravity");        // 2 c/t²
     clampWarnF(s.fluidRestDensity, 1.0f, 32.0f, "fluidRestDensity");

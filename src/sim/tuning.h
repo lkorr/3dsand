@@ -708,6 +708,18 @@ struct Tuning {
     // exception to "sim.* is integer-only"). They do NOT touch the world hash
     // (the fluid never writes voxels) but they DO change the fluid_det gate's
     // particle hash, so re-run --selftest after changing defaults.
+    //
+    // fluidSubsteps is the CFL BUDGET, and the only knob that buys the
+    // stiffness above its legality. Everything downstream is derived from it
+    // at shader compile time (common.wgsl): FLUID_VMAX = 0.45*substeps
+    // cells/tick, FLUID_MARK_PAD = ceil(0.45*substeps) cells, and the
+    // per-substep divisors of gravity/viscosity/splash. It is also the whole
+    // per-tick price of the solver — the substep table is ~linear in it — so
+    // the look and the cost are one number here on purpose.
+    // 9 is sqrt(14000)/(30*0.45) rounded up: at 6 the sound speed did not fit
+    // and the VMAX clamp engaged on ~575 of 600 bench ticks, which is the
+    // "mushy under agitation" regime (plan §1.2 item 1).
+    int fluidSubsteps = 9;
     float fluidStiffness = 14000.0f;  // EOS stiffness, (vox/s)^2 — the square
                                      // of a pseudo speed of sound. CHOSEN BY
                                      // EYE in the fluid lab (2026-08-24) and
