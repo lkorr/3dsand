@@ -37,6 +37,7 @@
 #include "phys/debris.h"
 #include "phys/physics.h"
 #include "sim/farfield.h"
+#include "sim/celestial.h"
 #include "sim/materials.h"
 #include "sim/microbody.h"
 #include "sim/microvox.h"
@@ -3123,13 +3124,15 @@ int main(int argc, char** argv) {
       WriteRenderParams(ctx.queue, world, eye, cam,
                         (float)ctx.width / (float)ctx.height, ui.shadows,
                         (float)now, fogSmooth, (float)ctx.height, tick,
-                        fluidCount);
+                        fluidCount,
+                        (float)(accumulator / kTickDt));
 
       // Celestial readout for the panel. Recomputed rather than cached out of
       // WriteRenderParams because the solve is a handful of trig calls once a
       // frame — cheaper than the plumbing to carry it, and it cannot go stale.
       {
-        const SkyState sky = SkyForTick(CurrentTuning(), tick);
+        const SkyState sky = ComputeSky(CurrentTuning(),
+            Celestial().RenderTickInterp(tick, accumulator / kTickDt));
         ui.skyDayT = sky.dayT;
         ui.skyYearT = sky.yearT;
         ui.skyMoonPhase = sky.moonPhase;

@@ -55,7 +55,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
                        float fogDensity, float viewPx, uint32_t tick,
-                       uint32_t fluidCount) {
+                       uint32_t fluidCount, float frameFrac) {
   RenderParams rp{};
   rp.fluidCount = fluidCount;  // 0 skips the MPM fluid surface march entirely
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
@@ -77,7 +77,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // disabled (cycleMinutes clamped, freeze pinned) and as the tuner's manual
   // handle. See ComputeSkyState.
   const Tuning& tun = CurrentTuning();
-  SkyState sky = SkyForTick(tun, tick);
+  SkyState sky = ComputeSky(tun, Celestial().RenderTickInterp(tick, (double)frameFrac));
   rp.sunDir[0] = sky.sunDir[0];
   rp.sunDir[1] = sky.sunDir[1];
   rp.sunDir[2] = sky.sunDir[2];
@@ -102,11 +102,6 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.solarEclipse = sky.solarEclipse;
   rp.lunarEclipse = sky.lunarEclipse;
   rp.eclipseBody = sky.eclipseBody;
-  // The axis the starfield wheels about — derived from latitude, so the stars
-  // turn about the same pole the sun arcs around.
-  rp.poleDir[0] = sky.poleDir[0];
-  rp.poleDir[1] = sky.poleDir[1];
-  rp.poleDir[2] = sky.poleDir[2];
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both

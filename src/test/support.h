@@ -50,7 +50,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        bool shadows, float time,
                        float fogDensity = kFarFogDensity,
                        float viewPx = 1080.0f, uint32_t tick = 0,
-                       uint32_t fluidCount = 0);
+                       uint32_t fluidCount = 0,
+                       float frameFrac = 0.0f);
 
 // Encode + submit one sim tick. `particlesActive` must be derived only from
 // tick-deterministic inputs (explosion history + a settled particle count),

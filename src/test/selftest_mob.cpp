@@ -1715,11 +1715,7 @@ bool mobOk = false;
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
-  static const std::vector<Gate> g = {
-      // Draws: the micro-body view sweep renders the critter from 14 angles
-      // into the shared offscreen target.
-      {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
-  };
+  static const std::vector<Gate> g = {};
   return g;
 }
 

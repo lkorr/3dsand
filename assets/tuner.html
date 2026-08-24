@@ -297,6 +297,65 @@
   #splash .big{font-size:15px;color:var(--fg)}
   kbd{background:var(--card2);border:1px solid var(--line2);border-radius:4px;padding:1px 6px;font-family:var(--mono);font-size:12px}
 
+  /* ---------- architecture diagram ---------- */
+  .arch-section{margin:0 0 28px}
+  .arch-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 12px}
+  .arch-controls button{
+    font:11px/1 var(--mono);padding:4px 10px;background:var(--card2);border:1px solid var(--line);
+    border-radius:5px;color:var(--dim);cursor:pointer;transition:all .15s;
+  }
+  .arch-controls button:hover{border-color:var(--line2);color:var(--fg)}
+  .arch-controls button.active{border-color:var(--acc);color:var(--acc);background:rgba(110,168,254,.08)}
+  .arch-controls .spacer{flex:1}
+  .arch-controls .arch-legend{display:flex;gap:10px;font:11px/1 var(--mono);color:var(--faint)}
+  .arch-controls .arch-legend i{
+    display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:middle;margin-right:3px;
+  }
+  .arch-graph-wrap{
+    position:relative;border:1px solid var(--line);border-radius:10px;
+    background:var(--bg2);overflow:hidden;min-height:300px;
+  }
+  .arch-graph-inner{
+    overflow:auto;padding:16px;cursor:grab;user-select:none;
+  }
+  .arch-graph-inner:active{cursor:grabbing}
+  .arch-graph-inner svg{display:block;margin:0 auto}
+  .arch-graph-inner .node rect,
+  .arch-graph-inner .node polygon,
+  .arch-graph-inner .node circle{cursor:pointer;transition:filter .15s}
+  .arch-graph-inner .node:hover rect,
+  .arch-graph-inner .node:hover polygon{filter:brightness(1.3)}
+  .arch-detail{
+    position:absolute;top:12px;right:12px;width:340px;max-height:calc(100% - 24px);
+    overflow-y:auto;background:var(--card);border:1px solid var(--line2);border-radius:10px;
+    padding:16px 18px;display:none;z-index:10;box-shadow:0 8px 32px rgba(0,0,0,.5);
+  }
+  .arch-detail.open{display:block}
+  .arch-detail-close{
+    position:absolute;top:8px;right:10px;background:none;border:none;color:var(--faint);
+    font-size:16px;cursor:pointer;padding:4px;line-height:1;
+  }
+  .arch-detail-close:hover{color:var(--fg)}
+  .arch-detail h3{margin:0 0 4px;font-size:15px;color:var(--fg)}
+  .arch-detail .arch-dtag{
+    font:10px/1 var(--mono);padding:2px 7px;border-radius:4px;display:inline-block;margin:0 0 10px;
+    text-transform:uppercase;letter-spacing:.06em;
+  }
+  .arch-detail p{font-size:13px;color:var(--dim);margin:8px 0;line-height:1.5}
+  .arch-detail code{font:12px/1.4 var(--mono);background:var(--bg);padding:1px 5px;border-radius:3px;color:#a9c7ff}
+  .arch-detail ul{font-size:13px;color:var(--dim);padding-left:18px;margin:6px 0}
+  .arch-detail li{margin:4px 0}
+  .arch-detail .arch-files{margin:10px 0 0;padding:8px 10px;background:var(--bg);border-radius:6px;font:11px/1.6 var(--mono);color:var(--faint)}
+  .arch-detail .arch-files b{color:var(--dim);font-weight:600;display:block;margin-bottom:2px}
+
+  /* mermaid dark theme overrides */
+  .arch-graph-inner .edgePath path{stroke:var(--line2)!important;stroke-width:1.5px}
+  .arch-graph-inner .edgeLabel{background:var(--bg2)!important;color:var(--dim)!important;font-size:11px!important}
+  .arch-graph-inner .cluster rect{fill:var(--card)!important;stroke:var(--line)!important;rx:8!important}
+  .arch-graph-inner .cluster .nodeLabel{color:var(--faint)!important;font-weight:600!important}
+  .arch-graph-inner .node .nodeLabel{color:var(--fg)!important;font-size:12px!important}
+  .arch-graph-inner marker path{fill:var(--line2)!important;stroke:var(--line2)!important}
+
   /* ---------- engine ---------- */
   .eng-bar{
     display:flex;align-items:center;gap:14px;flex-wrap:wrap;
@@ -6150,6 +6209,365 @@ document.addEventListener('keydown',e=>{
 (function(){
 'use strict';
 
+/* ---- Interactive architecture diagram ---- */
+
+const ARCH_NODES={
+  // Top-level systems
+  frameLoop:{label:'Frame Loop',tag:'cpu',desc:'Fixed 30 Hz sim tick + uncapped render. CLI dispatch, --shot/--shot-mob harnesses.',files:['src/main.cpp'],children:['simTick','renderPass','postStep']},
+
+  // Simulation
+  simTick:{label:'Simulation Tick',tag:'gpu',desc:'One 30 Hz tick: mutate → explode → compact → 54× CA → particles → fluid → occupancy → readback. All dispatches are indirect over the compacted dirty list — a settled world dispatches nothing.',files:['src/sim/simulation.h','src/sim/simulation.cpp'],children:['mutQueue','explode','compact','caLoop','particleSys','fluidSys','occupancy','readback']},
+  mutQueue:{label:'MutationQueue',tag:'gpu',desc:'The ONLY write path to the voxel grid. Every brush edit, explosion, island removal, and spell enters through typed ops uploaded per tick. The op stream is simultaneously the save format, replay log, and future network replication stream.',files:['src/sim/simulation.cpp','assets/shaders/sim_mutate.wgsl'],details:'<b>Op types:</b><ul><li><b>BrushOp</b> (32B, ≤64/tick) — paint/erase</li><li><b>CellOp</b> (8B, ≤65536/tick) — exact-cell writes</li><li><b>ExplosionOp</b> — ray-cast destruction</li><li><b>ParticleSpawn</b> — CPU-authored spawns</li><li><b>FluidSpawnOp</b> — MLS-MPM spawns</li></ul>'},
+  explode:{label:'Explosions',tag:'gpu',desc:'Two-pass (mark then apply): rays cast from blast center, DDA-traversing outward spending a hardness budget. Ejecta become particles. Cost O(r²) rays, volume O(r³).',files:['assets/shaders/sim_explode.wgsl'],details:'Radius hard-capped at 20 voxels (<code>kMaxExplosionRadius</code>). ≤8 per tick.'},
+  compact:{label:'Dirty Compaction',tag:'gpu',desc:'Scans 4096 per-chunk dirty flags into a dense index list + indirect dispatch args. This is what makes the whole engine scale — subsequent passes dispatch exactly one workgroup per dirty chunk.',files:['assets/shaders/sim_compact.wgsl']},
+  caLoop:{label:'CA — 54 Passes',tag:'gpu',desc:'The core simulation. 27 color phases × 2 gravity substeps = 54 indirect dispatches. Each processes one 6³-thread workgroup per dirty chunk. The 3×3×3 cell-coloring lattice guarantees provably disjoint writes — race-free, bit-deterministic, no atomics on voxel data.',files:['assets/shaders/sim_step.wgsl'],details:'<b>Per cell:</b><ul><li>Stamp check (prevents double-move)</li><li>Reactions (pair/decay/emit, substep 0 only)</li><li>Movement (powder/liquid/gas rules)</li><li>Density displacement (lighter fluids float)</li></ul>'},
+  particleSys:{label:'Particles',tag:'gpu',desc:'GPU ballistic voxels in flight: 24.8 fixed-point, sub-voxel DDA collision, atomicMax claim-based reinsertion. Double-buffered ring, ≤262,144 capacity.',files:['assets/shaders/sim_particle.wgsl'],details:'Pipeline: spawn → integrate (ballistic) → resolve (reinsertion + stain). Deterministic conflict via atomicMax priority.'},
+  fluidSys:{label:'MLS-MPM Fluid',tag:'gpu',desc:'Material Point Method fluid solver: Q16.16 fixed-point, density EOS pressure, per-species mass channels, excite/settle seam coupling to the CA grid.',files:['assets/shaders/sim_fluid.wgsl','assets/shaders/sim_fluid_seam.wgsl'],details:'Pipeline: spawn → mark blocks → alloc grid → P2G → grid update → G2P. Excite converts CA voxels to particles; settle converts back.'},
+  occupancy:{label:'Occupancy + Pick',tag:'gpu',desc:'Per-chunk non-air counts and ray-blocker counts for render skipping. World hash accumulation (every 15th tick). GPU picking ray for crosshair material query.',files:['assets/shaders/sim_occupancy.wgsl','assets/shaders/sim_pick.wgsl']},
+  readback:{label:'Async Readback',tag:'xfer',desc:'3-slot ring buffer, one tick latent. The CPU\'s only window into GPU state. 3×3×3 chunk mirror for player collision, dirty flags, hash, particle counts, support flags, on-demand fetches for island detection.',files:['src/sim/world.h'],details:'<b>Per-tick payload:</b><ul><li>27-chunk mirror (432 KB) → player collision</li><li>On-demand fetches (≤64 chunks) → islands, terrain meshing</li><li>Dirty flags (4 KB) → mesh invalidation</li><li>Hash + counts (<64 B) → determinism, HUD</li></ul>'},
+
+  // World storage
+  worldStorage:{label:'World Storage',tag:'gpu',desc:'A 512³ toroidal residency window of 32³ = 32,768 chunk slots, each 16³ voxels. The buffer never shifts — moving the window recycles trailing slot planes in-place via bitmask wrapping.',files:['src/sim/world.h','src/sim/world.cpp'],children:['pageTable','voxelBuf','streaming','chunkStore','farField']},
+  pageTable:{label:'Page Table',tag:'gpu',desc:'Software page table: 32,768 u32 entries mapping chunk slots to physical pages or sentinels. Derived data — not hashed, not saved. Three sentinel types (EMPTY, UNIFORM, JITTER) compress buried bulk: measured 4,975 pages resident (77.7 MiB) vs 512 MiB dense.',files:['src/sim/pagetable.h','src/sim/pagetable.cpp'],details:'<b>Entry encoding:</b><ul><li>bit 31=0: RESIDENT → bits 0..30 = page index</li><li>PT_EMPTY = 0x80000000 (air)</li><li>UNIFORM(mat) = 0x80000000 | mat</li><li>JITTER(mat) = sentinel + worldgen variant</li></ul><b>Materialization:</b> CPU pre-allocates pages before dispatch based on cpuDirty. Pool exhaustion = fatal abort.'},
+  voxelBuf:{label:'Voxel Buffer',tag:'gpu',desc:'Physical page pool: PoolPages × 4096 u32 words. Indexed ONLY through the page table. 32-bit voxel word: material (12b) + state (4b) + stamp (3b) + free (5b) + stain (7b).',files:['src/sim/world.h','assets/shaders/common.wgsl'],details:'Access ONLY through <code>voxWordAt</code>/<code>voxStore</code> (WGSL) or <code>World::PageOffsetOfSlot</code> (C++). Any other subscript reads another chunk\'s memory.'},
+  streaming:{label:'Toroidal Streaming',tag:'xfer',desc:'Recenters the residency window one chunk per axis per tick with 2-chunk hysteresis. Evicts leaving planes asynchronously (RLE into ChunkStore), fills entering planes from store or procgen.',files:['src/sim/stream.h','src/sim/stream.cpp']},
+  chunkStore:{label:'ChunkStore',tag:'cpu',desc:'Region-file chunk persistence. World saved as a directory of region files (r_x_y_z.svr) with RLE-compressed chunks. Format SVM4 with material name validation.',files:['src/sim/chunkstore.h','src/sim/worldio.h']},
+  farField:{label:'Far-Field Cascades',tag:'render',desc:'8 nested toroidal 256³ volumes, 128 MiB total, ~4 km horizon. Render-only LOD — never read by sim, never hashed. Fills drain through worldgen at kFarListCap=4096 level-chunks/tick.',files:['src/sim/farfield.h','src/sim/farfield.cpp']},
+
+  // Materials & data
+  dataPipeline:{label:'Data Pipeline',tag:'cpu',desc:'All game content is data (JSON + tags), not code. Materials, reactions, tuning, prefabs, mobs, items, glyphs — all hot-reloadable. Compiled at load into flat GPU tables.',files:['src/sim/materials.h','src/sim/materials.cpp'],children:['materials','reactions','tuning','prefabs','mobDefs','itemDefs','glyphs']},
+  materials:{label:'Materials',tag:'cpu',desc:'4,096-slot material table. Each defines: class (solid/powder/liquid/gas), density, 3 color variants, emission, flags, reaction bucket, viscosity, opacity, hardness, stain behavior, sounds.',files:['assets/materials/materials.json','src/sim/materials.h'],details:'Resolved by name, not ID — IDs are file-local. Tags compose behaviors (e.g. "flammable", "organic"). MATF_MICRO flags trigger sub-voxel model substitution.'},
+  reactions:{label:'Reactions',tag:'cpu',desc:'Pair, decay, and emission rules with per-mille chances, tag matching, daylight conditions, neighbor-count scaling, weather gating. Growth must be subcritical (offspring/tick < 1).',files:['assets/materials/reactions.json']},
+  tuning:{label:'Tuning',tag:'cpu',desc:'168+ runtime-tunable parameters. F5 hot-reloads WGSL shader constants. Covers: player, camera, avatar, audio, physics, debris, gore, sim, dayNight, render, weather, MLS-MPM.',files:['assets/materials/tuning.json','src/sim/tuning.h','src/sim/tuning.cpp'],details:'Pipeline: row in <code>tuning_params.def</code> → decl in <code>tuning.h</code> → <code>Read*</code> in <code>LoadTuning</code> → default in <code>tuning.json</code> → row in <code>tuner_schema.js</code>.'},
+  prefabs:{label:'Prefabs',tag:'cpu',desc:'.vox files placed into the world as CellOps. Art palette is per-file (indices are NOT portable between files).',files:['assets/prefabs/','src/sim/voxload.h']},
+  mobDefs:{label:'Mob Definitions',tag:'cpu',desc:'Per-creature .vox art + .json sidecar defining: limbs (joints, HP, springs, edge), sockets, AnimSkeleton, skinScale/physScale, locomotion states.',files:['assets/mobs/']},
+  itemDefs:{label:'Items',tag:'cpu',desc:'Standalone .vox + .json assets. Grip transform, edge segment (melee), damage profile. Placed via EquipItem on the avatar rig.',files:['assets/items/']},
+  glyphs:{label:'Glyphs',tag:'cpu',desc:'Spell composition: Element (material), Form (Spray/Projectile), Modifier (Trail, TransmuteTo). Hot-reloads with R.',files:['assets/spells/glyphs.json']},
+
+  // Rendering
+  renderPass:{label:'Rendering',tag:'render',desc:'Raymarched — no meshing. The voxel grid is DDA-stepped directly, using occupancy flags for empty-space skipping. Sim buffers are already GPU-resident so rendering costs zero upload.',files:['src/sim/simulation.cpp'],children:['raymarch','drawParticles','drawBodies','drawMicro','drawFluid','drawSprites','drawDebug','sky']},
+  raymarch:{label:'Raymarch',tag:'render',desc:'Full-screen voxel terrain. Primary DDA through chunks + sun shadow ray. Water/liquid surface shading (Fresnel, traced reflections, Beer-Lambert absorption, caustics). Media accumulation (fire, smoke). Far-field cascade continuation. Micro-detail substitution.',files:['assets/shaders/raymarch.wgsl'],details:'<b>Measured (RTX 3060 Ti, 1080p):</b><ul><li>Shadows on: 2.66 ms (376 fps)</li><li>Shadows off: 1.41 ms (709 fps)</li></ul>Cost scales with screen pixels × traversal depth, not activity. No LOD.'},
+  drawParticles:{label:'Draw Particles',tag:'render',desc:'Instanced lit cubes for ballistic particles. Indirect draw from GPU particle count. Distance LOD (p50 13.6→10.6ms after LOD).',files:['assets/shaders/debris.wgsl']},
+  drawBodies:{label:'Draw Bodies',tag:'render',desc:'Instanced boxes for non-micro debris/body voxels, transformed by body quaternion.',files:['assets/shaders/debris.wgsl']},
+  drawMicro:{label:'Draw Micro Bodies',tag:'render',desc:'OBB rasterizer for high-res microvoxel mob limbs. Per-fragment DDA march inside the brick. CullMode::Front.',files:['assets/shaders/microbody.wgsl']},
+  drawFluid:{label:'Draw Fluid',tag:'render',desc:'MLS-MPM water surface: trilinear isosurface march with traced reflections and refractions, Beer-Lambert absorption, Fresnel.',files:['assets/shaders/raymarch.wgsl']},
+  drawSprites:{label:'Draw Sprites',tag:'render',desc:'CPU-authored markers and projectiles, ≤64.',files:['assets/shaders/debris.wgsl']},
+  drawDebug:{label:'Debug Boxes',tag:'render',desc:'Oriented wireframe boxes for collision-box overlay. Alpha blend, no depth test.',files:['assets/shaders/debug_lines.wgsl']},
+  sky:{label:'Sky & Celestial',tag:'render',desc:'Rayleigh + Mie scattering model with Kasten-Young air mass. Night sky: stars, galactic band, nebulae, aurora, moon phases/maria. Keplerian orbits for sun + two moons. Eclipses.',files:['src/sim/celestial.h','src/sim/celestial.cpp','assets/shaders/raymarch.wgsl']},
+
+  // Game layer
+  gameSystems:{label:'Game Systems',tag:'cpu',desc:'Player, avatar, mobs, brush, spells, melee — all CPU-side. World writes go ONLY through MutationQueue. Physics through Jolt.',files:['src/game/'],children:['player','avatar','mobSys','brush','spellSys','melee','itemSys','camera','thirdPerson']},
+  player:{label:'Player',tag:'cpu',desc:'AABB character controller against 1-tick-latent voxel mirror. Walk/fly/swim, gravity, jump (coyote + buffer), step-up, submersion fraction, water-edge mantle, ledge grab (catch/dangle/shimmy/pull-up).',files:['src/game/player.h','src/game/player.cpp']},
+  avatar:{label:'Player Avatar',tag:'cpu',desc:'The player\'s visible, dismemberable body. A mob def ("wizard") driven by Player input instead of wander AI. Full animation runtime: clips, IK, gait, springs, dismemberment states, held-weapon pose, head-look IK.',files:['src/game/avatar.h','src/game/avatar.cpp']},
+  mobSys:{label:'Mob System',tag:'cpu',desc:'Up to 16 articulated multi-body mobs. Each has kinematic Jolt bodies per limb (flip to dynamic ragdoll on death). 4-stage locomotion: Sense → Intent (AI seam) → Steer → Drive.',files:['src/game/mob.h','src/game/mob.cpp'],details:'<ul><li>Animation: clips, IK, procedural gait, springs</li><li>Dismemberment: per-voxel carving, severing, bleeding, gore profiles</li><li>Locomotion states: stand, walk, crawl, prone (from sidecar)</li></ul>'},
+  brush:{label:'Brush',tag:'cpu',desc:'Converts GPU pick result + UI state into BrushOps (paint/erase). Emits through MutationQueue.',files:['src/game/brush.h','src/game/brush.cpp']},
+  spellSys:{label:'Spell System',tag:'cpu',desc:'Caster VM: ONLY output is op-stream emissions. Integer 24.8 fixed-point. Glyph types: Element, Form (Spray/Projectile), Modifier (Trail, TransmuteTo). Player-agnostic — mobs can cast too.',files:['src/game/spell.h','src/game/spell.cpp','src/game/caster.h']},
+  melee:{label:'Melee',tag:'cpu',desc:'Mouse-directed melee: Guard → Wind → Slash → Recover. The pose IS the hitbox — damage sweeps the blade\'s edge segment from last-tick to this-tick. Speed is damage.',files:['src/game/melee.h','src/game/melee.cpp']},
+  itemSys:{label:'Items',tag:'cpu',desc:'Standalone .vox + .json assets held via borrowed rig slot. Sword grip/edge/damage authored in the tuner.',files:['src/game/item.h']},
+  camera:{label:'Camera',tag:'cpu',desc:'FPS orientation (yaw, pitch, fovY). Provides Forward/Right/Up/FlatForward basis vectors.',files:['src/game/camera.h','src/game/camera.cpp']},
+  thirdPerson:{label:'Third-Person Rig',tag:'cpu',desc:'Orbit boom with voxel collision pull-in, asymmetric smoothing, pitch-driven lift, dismemberment framing. Modes: First, Third, OverShoulder.',files:['src/game/thirdperson.h','src/game/thirdperson.cpp']},
+
+  // Physics
+  physicsSys:{label:'Physics (Jolt)',tag:'cpu',desc:'Thin Jolt wrapper. Positions in voxel units. Debris bodies, player capsule, mob kinematic limbs, terrain collision meshes, radial impulse for explosions. Built with CROSS_PLATFORM_DETERMINISTIC.',files:['src/phys/physics.h','src/phys/physics.cpp'],children:['debrisSys','terrainMesh','bodyReg']},
+  debrisSys:{label:'Debris System',tag:'cpu',desc:'Full island lifecycle: destruction event → async readback → bounded flood fill → islands become rigidbodies (≤200). Sub-8 islands crumble. Bodies collide against localized marching-cubes terrain. Body burn, direct damage (explosions + laser), settle-back to CellOps.',files:['src/phys/debris.h','src/phys/debris.cpp']},
+  terrainMesh:{label:'Terrain Collision',tag:'cpu',desc:'Per-chunk marching-cubes static collision meshes, invalidated from dirty-flag snapshot.',files:['src/phys/marching_cubes.h','src/phys/marching_cubes.cpp']},
+  bodyReg:{label:'Body Registry',tag:'cpu',desc:'THE single definition of the debris | mob | avatar GPU slot walk. Builds all three parallel arrays (xforms, cube instances, micro-body draw) in one walk.',files:['src/game/bodyreg.h']},
+
+  // Audio
+  audioSys:{label:'Audio',tag:'cpu',desc:'Vendored binaural spatializer (xyzpan). Mono assets, meters + Z-up internally. Voxel-ray occlusion (broadband gain + low-pass from material traversal). Gait-driven footsteps.',files:['src/audio/'],children:['audioCues','audioDevice','audioOcclusion','audioSpatial']},
+  audioCues:{label:'Sound Cues',tag:'cpu',desc:'Game-facing API. Material → sound resolved once at load. Events: Footstep, Land, Impact, Break, MobSound (hurt/death/sever/idle/alert/attack), ambient loops.',files:['src/audio/cues.h','src/audio/cues.cpp']},
+  audioDevice:{label:'Device + Voices',tag:'cpu',desc:'miniaudio device wrapper. Voice pool with fire-and-forget + looping modes. Sound library management.',files:['src/audio/device.h','src/audio/voice.h','src/audio/library.h']},
+  audioOcclusion:{label:'Voxel Occlusion',tag:'cpu',desc:'Ray-traced through the voxel mirror. Per-material opacity accumulation → broadband duck + low-pass cutoff frequency.',files:['src/audio/occlusion.h','src/audio/occlusion.cpp']},
+  audioSpatial:{label:'3D Spatial (xyzpan)',tag:'cpu',desc:'Custom binaural DSP: distance pipeline, early reflections, FDN reverb, floor pipeline, chest pipeline, binaural pipeline, swarm mode.',files:['src/audio/xyzpan/']},
+
+  // GPU backend
+  gpuBackend:{label:'GPU / RHI',tag:'gpu',desc:'WGPU-shaped hardware abstraction (rhi.h). Vulkan-only since 2026-08-22. Dawn checkout stays for Tint (WGSL → SPIR-V). ~10 handle types: Buffer, Texture, ShaderModule, Pipeline, BindGroup, Queue, etc.',files:['src/gpu/'],children:['rhiSeam','vkBackend','passTable','shaderPipeline','context']},
+  rhiSeam:{label:'RHI Seam',tag:'gpu',desc:'The ONLY GPU API the engine sees. Thin namespace with Buffer/Texture/Pipeline/Queue/etc handles. All rendering and compute goes through this.',files:['src/gpu/rhi.h']},
+  vkBackend:{label:'Vulkan Backend',tag:'gpu',desc:'Instance/device creation, swapchain, function loader, VMA memory allocator, SPIR-V compilation via Tint, --vk-smoke pinned-hash cross-validation.',files:['src/gpu/rhi_vk.cpp','src/gpu/rhi_vulkan.cpp','src/gpu/vk_loader.cpp','src/gpu/vk_spirv.cpp']},
+  passTable:{label:'Pass Table',tag:'gpu',desc:'Declarative recording: every dispatch is a row in pass_table.def declaring pipeline + buffer accesses (read/write/atomic). The Vulkan barrier tracker generates vkCmdPipelineBarrier2 from last-access chains.',files:['src/sim/pass_table.h','src/sim/pass_table.def','src/gpu/vk_record.cpp']},
+  shaderPipeline:{label:'Shader Pipeline',tag:'gpu',desc:'All shaders are WGSL. LoadShader() prepends: generated world constants (from world.h) → tuning WGSL block → common.wgsl → specific shader. F5 hot-reload recompiles to SPIR-V via Tint.',files:['src/gpu/resources.cpp','assets/shaders/common.wgsl']},
+  context:{label:'GPU Context',tag:'gpu',desc:'Owns GPU instance/adapter/device/queue and window surface. Pipeline cache (SPIR-V disk cache + VkPipelineCache) eliminates 20-30s white screen on cold start.',files:['src/gpu/context.h','src/gpu/context.cpp']},
+
+  // Testing
+  testHarness:{label:'Selftest Harness',tag:'inv',desc:'Named gates with declared dependencies. --gate NAME runs one in ~5s; full suite ~50s. Two-pass determinism verification (run twice, compare hashes). Pinned hash: 7cfa2420.',files:['src/test/'],children:['testSim','testRender','testPhys','testMob','testPlayer','testSpell','testWorldIO']},
+  testSim:{label:'Sim Tests',tag:'inv',desc:'Determinism (2-run hash compare), settled chunk count (≤32), stain invariants, page-table roundtrip, particle reinsertion.',files:['src/test/selftest_sim.cpp']},
+  testRender:{label:'Render Tests',tag:'inv',desc:'Pinned-hash visual regression at specific camera positions.',files:['src/test/selftest_render.cpp']},
+  testPhys:{label:'Physics Tests',tag:'inv',desc:'Island detection, debris lifecycle, body damage, settle-back.',files:['src/test/selftest_phys.cpp']},
+  testMob:{label:'Mob Tests',tag:'inv',desc:'Gait speed, dismemberment states, animation pipeline, locomotion.',files:['src/test/selftest_mob.cpp']},
+  testPlayer:{label:'Player Tests',tag:'inv',desc:'Movement, collision, ledge grab, water mantle.',files:['src/test/selftest_player.cpp']},
+  testSpell:{label:'Spell Tests',tag:'inv',desc:'Glyph composition, spell VM execution.',files:['src/test/selftest_spell.cpp']},
+  testWorldIO:{label:'World I/O Tests',tag:'inv',desc:'Save/load round-trip, format validation.',files:['src/test/selftest_worldio.cpp']},
+
+  // Post-step
+  postStep:{label:'Post-step',tag:'cpu',desc:'CPU work after Jolt physics: debris post-step (island detection, body management), mob post-step (steering, animation), avatar post-step, collision push-out.',files:['src/main.cpp']},
+
+  // UI
+  uiOverlay:{label:'UI Overlay',tag:'cpu',desc:'ImGui debug panel + player-facing HUD: health bar, mana bar, body figure, spell readout, crosshair material, hotbar, ledge-grab state, FPS counter.',files:['src/ui/overlay.h','src/ui/overlay.cpp']},
+
+  // Worldgen
+  worldgen:{label:'Worldgen',tag:'gpu',desc:'Pure function of world coordinates + seed. Infinite hills, two cave bands, lava on deep cavern floors, sparse ruin POIs. Runs on GPU via worldgen.wgsl.',files:['assets/shaders/worldgen.wgsl']},
+};
+
+const ARCH_EDGES=[
+  // Top-level group connections (visible when collapsed)
+  ['frameLoop','worldStorage','voxel read/write'],
+  ['frameLoop','gpuBackend','dispatches'],
+  ['frameLoop','physicsSys','Jolt step'],
+  ['frameLoop','audioSys','sound events'],
+  ['gameSystems','frameLoop','input + ops'],
+  ['dataPipeline','frameLoop','GPU tables + WGSL consts'],
+  ['gpuBackend','worldStorage','barriers + buffers'],
+  ['worldStorage','worldgen','procgen fills'],
+  ['testHarness','frameLoop','2-run hash compare'],
+  ['physicsSys','worldStorage','terrain meshes'],
+
+  // Frame loop children
+  ['simTick','renderPass','shared voxel buffer'],
+  ['simTick','postStep','snapshot'],
+  ['postStep','gameSystems','transforms'],
+
+  // Sim tick internals
+  ['mutQueue','compact','marks dirty'],
+  ['explode','compact','marks dirty'],
+  ['compact','caLoop','dirty list'],
+  ['caLoop','particleSys','ejecta'],
+  ['particleSys','occupancy','claim writes'],
+  ['fluidSys','occupancy','grid writes'],
+  ['occupancy','readback','hash + counts'],
+
+  // World storage internals
+  ['pageTable','voxelBuf','address translation'],
+  ['streaming','chunkStore','RLE persist'],
+  ['streaming','worldgen','generate fills'],
+  ['farField','worldgen','far fill'],
+
+  // Game → sim connections
+  ['brush','mutQueue','BrushOp'],
+  ['spellSys','mutQueue','ops'],
+  ['debrisSys','mutQueue','CellOps'],
+  ['gameSystems','mutQueue','ops only'],
+  ['readback','gameSystems','CPU mirror'],
+
+  // Physics connections
+  ['mobSys','physicsSys','kinematic drive'],
+  ['avatar','physicsSys','kinematic drive'],
+  ['player','avatar','drives'],
+  ['debrisSys','readback','async fetch'],
+
+  // Render connections
+  ['renderPass','worldStorage','reads voxels'],
+  ['renderPass','physicsSys','body transforms'],
+
+  // Audio connections
+  ['audioCues','readback','KindAt mirror'],
+  ['mobSys','audioCues','mob sounds'],
+  ['player','audioCues','footstep events'],
+
+  // Shader pipeline
+  ['shaderPipeline','simTick','SPIR-V'],
+  ['shaderPipeline','renderPass','SPIR-V'],
+  ['dataPipeline','simTick','GPU tables'],
+  ['dataPipeline','renderPass','material colors'],
+];
+
+const ARCH_TAG_COLORS={gpu:'#4c9aff',cpu:'#f2a65a',xfer:'#c792ea',render:'#5ed3a5',inv:'#f2726f'};
+const ARCH_TAG_BG={gpu:'rgba(76,154,255,.14)',cpu:'rgba(242,166,90,.14)',xfer:'rgba(199,146,234,.14)',render:'rgba(94,211,165,.14)',inv:'rgba(242,111,107,.14)'};
+
+let archExpanded=new Set(['frameLoop']);
+let archMermaidReady=false;
+let archMermaidLoading=false;
+
+function archLoadMermaid(){
+  if(archMermaidReady||archMermaidLoading)return Promise.resolve();
+  archMermaidLoading=true;
+  return new Promise((resolve,reject)=>{
+    const s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
+    s.onload=()=>{
+      window.mermaid.initialize({
+        startOnLoad:false,
+        theme:'dark',
+        themeVariables:{
+          darkMode:true,
+          background:'#141922',
+          primaryColor:'#1f2733',
+          primaryBorderColor:'#2a3240',
+          primaryTextColor:'#d7dde6',
+          secondaryColor:'#1a2029',
+          secondaryBorderColor:'#2a3240',
+          tertiaryColor:'#0e1116',
+          lineColor:'#39445a',
+          textColor:'#d7dde6',
+          mainBkg:'#1f2733',
+          nodeBorder:'#39445a',
+          clusterBkg:'#141922',
+          clusterBorder:'#2a3240',
+          edgeLabelBackground:'#141922',
+          fontSize:'13px',
+        },
+        flowchart:{
+          curve:'basis',
+          padding:14,
+          nodeSpacing:30,
+          rankSpacing:40,
+          htmlLabels:true,
+          useMaxWidth:false,
+        },
+        securityLevel:'loose',
+      });
+      archMermaidReady=true;
+      archMermaidLoading=false;
+      resolve();
+    };
+    s.onerror=()=>{archMermaidLoading=false;reject(new Error('Failed to load mermaid'));};
+    document.head.appendChild(s);
+  });
+}
+
+function archBuildMermaid(){
+  const lines=['flowchart TB'];
+  const rendered=new Set();
+  const tagStyle={
+    gpu:'fill:#1a2e4a,stroke:#4c9aff,stroke-width:2px,color:#d7dde6',
+    cpu:'fill:#2a2014,stroke:#f2a65a,stroke-width:2px,color:#d7dde6',
+    xfer:'fill:#251a30,stroke:#c792ea,stroke-width:2px,color:#d7dde6',
+    render:'fill:#142a22,stroke:#5ed3a5,stroke-width:2px,color:#d7dde6',
+    inv:'fill:#2a1618,stroke:#f2726f,stroke-width:2px,color:#d7dde6',
+  };
+  const esc={'&':'and','"':"''",'<':'(','>':')'};
+
+  function emitNode(id,inSub){
+    if(rendered.has(id))return;
+    rendered.add(id);
+    const n=ARCH_NODES[id];
+    if(!n)return;
+    const hasKids=n.children&&n.children.length>0;
+    const isOpen=archExpanded.has(id);
+    const icon=hasKids?(isOpen?'v ':'+ '):'';
+    const lbl=(icon+n.label).replace(/[&"<>]/g,c=>esc[c]||c);
+
+    if(hasKids&&isOpen){
+      lines.push(`  subgraph ${id}["${lbl}"]`);
+      for(const kid of n.children)emitNode(kid,true);
+      lines.push('  end');
+      lines.push(`  style ${id} fill:#141922,stroke:${ARCH_TAG_COLORS[n.tag]||'#39445a'},stroke-width:2px,color:#d7dde6`);
+    }else{
+      lines.push(`  ${id}["${lbl}"]`);
+      lines.push(`  style ${id} ${tagStyle[n.tag]||tagStyle.cpu}`);
+    }
+  }
+
+  const topLevel=['frameLoop','gameSystems','worldStorage','dataPipeline','gpuBackend','physicsSys','audioSys','uiOverlay','testHarness','worldgen'];
+  for(const id of topLevel)emitNode(id,false);
+
+  for(const[from,to,label]of ARCH_EDGES){
+    const fromNode=ARCH_NODES[from], toNode=ARCH_NODES[to];
+    if(!fromNode||!toNode)continue;
+    const fromVis=rendered.has(from);
+    const toVis=rendered.has(to);
+    if(!fromVis||!toVis)continue;
+    if(label){
+      const safeLabel=label.replace(/[&"<>]/g,c=>esc[c]||c);
+      lines.push(`  ${from}-->|"${safeLabel}"|${to}`);
+    }else lines.push(`  ${from}-->${to}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function archRender(){
+  const container=document.getElementById('arch-graph');
+  if(!container)return;
+  try{
+    await archLoadMermaid();
+  }catch(e){
+    container.innerHTML='<div style="color:var(--dim);padding:24px;text-align:center">Could not load Mermaid.js — check network connection</div>';
+    return;
+  }
+  const def=archBuildMermaid();
+  const id='arch-svg-'+Date.now();
+  try{
+    const{svg}=await window.mermaid.render(id,def);
+    container.innerHTML=svg;
+    container.querySelectorAll('.node,.cluster').forEach(node=>{
+      node.style.cursor='pointer';
+      const nodeId=node.id?.replace(/^flowchart-/,'')?.replace(/-\d+$/,'')||
+                   node.id?.replace(/-\d+$/,'')||'';
+      node.addEventListener('click',e=>{
+        e.stopPropagation();
+        const match=nodeId.match(/^(?:flowchart-)?(\w+?)(?:-\d+)?$/);
+        const cleanId=match?match[1]:nodeId;
+        if(ARCH_NODES[cleanId])archNodeClick(cleanId);
+      });
+    });
+    // subgraph labels also get click handlers
+    container.querySelectorAll('.cluster').forEach(cluster=>{
+      const label=cluster.querySelector('.nodeLabel,.cluster-label');
+      const text=label?.textContent?.replace(/^[▶▼]\s*/,'').trim();
+      if(!text)return;
+      const matchId=Object.keys(ARCH_NODES).find(k=>ARCH_NODES[k].label===text);
+      if(matchId){
+        cluster.style.cursor='pointer';
+        cluster.addEventListener('click',e=>{
+          e.stopPropagation();
+          archNodeClick(matchId);
+        });
+      }
+    });
+  }catch(e){
+    container.innerHTML='<pre style="color:var(--red);padding:12px;font-size:11px">Diagram error: '+e.message+'</pre>';
+  }
+}
+
+window.archNodeClick=function(nodeId){
+  const n=ARCH_NODES[nodeId];
+  if(!n)return;
+  if(n.children&&n.children.length>0){
+    if(archExpanded.has(nodeId))archExpanded.delete(nodeId);
+    else archExpanded.add(nodeId);
+    archRender().then(()=>archShowDetail(nodeId));
+  }else{
+    archShowDetail(nodeId);
+  }
+};
+
+function archShowDetail(nodeId){
+  const panel=document.getElementById('arch-detail');
+  if(!panel)return;
+  const n=ARCH_NODES[nodeId];
+  if(!n){panel.classList.remove('open');return;}
+  const tc=ARCH_TAG_COLORS[n.tag]||'#8a94a6';
+  const tb=ARCH_TAG_BG[n.tag]||'rgba(138,148,166,.14)';
+  const tagNames={gpu:'GPU compute',cpu:'CPU',xfer:'CPU↔GPU transfer',render:'Rendering',inv:'Invariant'};
+  let html=`<button class="arch-detail-close" onclick="document.getElementById('arch-detail').classList.remove('open')">✕</button>`;
+  html+=`<h3>${n.label}</h3>`;
+  html+=`<span class="arch-dtag" style="background:${tb};color:${tc}">${tagNames[n.tag]||n.tag}</span>`;
+  html+=`<p>${n.desc}</p>`;
+  if(n.details)html+=n.details;
+  if(n.children&&n.children.length>0){
+    html+='<p style="margin-top:12px"><b style="color:var(--fg);font-size:12px">Sub-systems:</b></p><ul>';
+    for(const kid of n.children){
+      const k=ARCH_NODES[kid];
+      if(k)html+=`<li><span style="color:${ARCH_TAG_COLORS[k.tag]||'var(--fg)'};cursor:pointer" onclick="archNodeClick('${kid}')">${k.label}</span> — <span style="color:var(--faint)">${k.desc.split('.')[0]}</span></li>`;
+    }
+    html+='</ul>';
+  }
+  if(n.files&&n.files.length>0){
+    html+=`<div class="arch-files"><b>Key files</b>${n.files.join('<br>')}</div>`;
+  }
+  panel.innerHTML=html;
+  panel.classList.add('open');
+}
+
+function archCollapseAll(){archExpanded.clear();archRender();document.getElementById('arch-detail')?.classList.remove('open');}
+function archExpandAll(){for(const k in ARCH_NODES){if(ARCH_NODES[k].children)archExpanded.add(k);}archRender();}
+function archExpandLevel(depth){
+  archExpanded.clear();
+  const visit=(ids,d)=>{for(const id of ids){const n=ARCH_NODES[id];if(n?.children){if(d<depth){archExpanded.add(id);visit(n.children,d+1);}}}};
+  visit(['frameLoop','gameSystems','worldStorage','dataPipeline','gpuBackend','physicsSys','audioSys','testHarness'],0);
+  archRender();
+}
+
 const ENG_STAGES=[
   {key:'stream',tag:'xfer',label:'Toroidal streaming',
    desc:'Residency window follows the player — evict, load, or generate one plane at a time',
@@ -6625,6 +7043,33 @@ function renderEngine(){
       el('span',{},'RTX 3060 Ti')
     )
   ));
+
+  // Architecture diagram
+  wrap.appendChild(el('h2',{},'Architecture map'));
+  wrap.appendChild(el('p',{class:'note'},'Click any node to see its details. Click group nodes (▶) to expand/collapse sub-systems. Drag to pan.'));
+  const archControls=el('div',{class:'arch-controls'},
+    el('button',{onclick:()=>archCollapseAll()},'collapse all'),
+    el('button',{onclick:()=>archExpandLevel(1)},'level 1'),
+    el('button',{onclick:()=>archExpandLevel(2)},'level 2'),
+    el('button',{onclick:()=>archExpandAll()},'expand all'),
+    el('span',{class:'spacer'}),
+    el('span',{class:'arch-legend'},
+      el('span',{},el('i',{style:'background:#4c9aff'}),' GPU'),
+      el('span',{},el('i',{style:'background:#f2a65a'}),' CPU'),
+      el('span',{},el('i',{style:'background:#c792ea'}),' Transfer'),
+      el('span',{},el('i',{style:'background:#5ed3a5'}),' Render'),
+      el('span',{},el('i',{style:'background:#f2726f'}),' Invariant')
+    )
+  );
+  wrap.appendChild(archControls);
+  const archWrap=el('div',{class:'arch-graph-wrap'},
+    el('div',{class:'arch-graph-inner',id:'arch-graph'},
+      el('div',{style:'color:var(--dim);padding:40px;text-align:center'},'Loading architecture diagram...')
+    ),
+    el('div',{class:'arch-detail',id:'arch-detail'})
+  );
+  wrap.appendChild(archWrap);
+  setTimeout(archRender,0);
 
   // Pipeline flow
   wrap.appendChild(el('h2',{},'Per-tick pipeline'));

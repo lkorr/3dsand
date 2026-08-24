@@ -446,7 +446,15 @@ void Overlay::Draw(UIState& s) {
   // falls at 30 Hz — but the sun, both moons, the seasons and every
   // sun-driven reaction run at this multiple. Anything but 1x changes the
   // world hash, which the tooltip says out loud.
-  ImGui::SliderFloat("time speed", &s.timeScale, -10.0f, 100.0f, "%.1fx");
+  {
+    float t = std::cbrt(s.timeScale / 100.0f);
+    if (ImGui::SliderFloat("time speed", &t, -1.0f, 1.0f, "")) {
+      s.timeScale = t * t * t * 100.0f;
+      if (std::abs(s.timeScale) < 0.05f) s.timeScale = 0.0f;
+    }
+    ImGui::SameLine();
+    ImGui::Text("%.2fx", s.timeScale);
+  }
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
         "Speed of the CELESTIAL clock: the sun, both moons, the seasons, and\n"

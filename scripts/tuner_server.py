@@ -396,7 +396,8 @@ def run_build():
         _build = {"running": True, "ok": None, "log": "", "returncode": None}
     try:
         p = subprocess.run(BUILD_CMD, cwd=ROOT, capture_output=True,
-                           shell=False, timeout=1800)
+                           shell=False, timeout=1800,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
         out = _text(p.stdout) + _text(p.stderr)
         # The Dawn build log is enormous; keep the lines that name our own
         # sources plus anything that looks like a diagnostic, so the panel is
