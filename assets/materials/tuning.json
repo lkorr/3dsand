@@ -236,9 +236,9 @@
     "fluidGravity": 181.9,
     "fluidRestDensity": 8,
     "fluidEosPower": 3,
-    "fluidCohesion": 25,
-    "fluidAttractSame": 12,
-    "fluidAttractDiff": -25,
+    "fluidCohesion": 32.9,
+    "fluidAttractSame": 0,
+    "fluidAttractDiff": -1.08,
     "fluidViscosity": 0.5,
     "fluidDamping": 0,
     "fluidSplashRate": 1.5,
@@ -246,14 +246,14 @@
     "fluidSplashMaxDensity": 0.7,
     "fluidSplashLife": 1.1,
     "fluidSplashScaleIdx": 1,
-    "fluidFoamRate": 90.0,
-    "fluidFoamCrestRate": 120.0,
+    "fluidFoamRate": 90,
+    "fluidFoamCrestRate": 120,
     "fluidTrappedMin": 1.5,
-    "fluidTrappedMax": 11.0,
+    "fluidTrappedMax": 11,
     "fluidCrestMin": 0.25,
-    "fluidCrestMax": 2.0,
-    "fluidFoamEnergyMin": 8.0,
-    "fluidFoamEnergyMax": 260.0,
+    "fluidCrestMax": 2,
+    "fluidFoamEnergyMin": 8,
+    "fluidFoamEnergyMax": 260,
     "fluidFoamLife": 2.2,
     "fluidFoamLifeMin": 0.5,
     "fluidBubbleBuoyancy": 1.6,
@@ -265,7 +265,7 @@
     "fluidSettleEps": 0.9,
     "fluidWakeSpeed": 3.6,
     "fluidSettleTicks": 45,
-    "fluidStainRate": 8.0
+    "fluidStainRate": 8
   },
   "render": {
     "skyGradient": 1.4,
@@ -330,7 +330,7 @@
     "foamColor": [
       0.97,
       0.98,
-      1.0
+      1
     ],
     "foamColorVar": 0.18,
     "sunTint": [
@@ -566,7 +566,11 @@
       0.56,
       0.78
     ],
-    "galaxyNormal": [0.36, 0.52, -0.77],
+    "galaxyNormal": [
+      0.36,
+      0.52,
+      -0.77
+    ],
     "galaxyWidth": 0.17,
     "nebulaStrength": 0.4,
     "nebulaCool": [
@@ -597,7 +601,11 @@
       0.93,
       0.88
     ],
-    "moonMariaSeed": [4, 1, 9],
+    "moonMariaSeed": [
+      4,
+      1,
+      9
+    ],
     "moonGlow": 0.35,
     "moonEarthshine": 0.055,
     "moonLightColor": [
@@ -606,11 +614,23 @@
       1
     ],
     "moonLightIntensity": 0.16,
-    "moon2Color": [0.78, 0.8, 0.86],
-    "moon2MariaSeed": [-21, 13, 37],
+    "moon2Color": [
+      0.78,
+      0.8,
+      0.86
+    ],
+    "moon2MariaSeed": [
+      -21,
+      13,
+      37
+    ],
     "moon2Brightness": 0.72,
     "moon2LightIntensity": 0.055,
-    "moon2LightColor": [0.62, 0.62, 0.86],
+    "moon2LightColor": [
+      0.62,
+      0.62,
+      0.86
+    ],
     "eclipseDarkness": 0.93,
     "eclipseCurve": 3,
     "nightAmbSky": [
