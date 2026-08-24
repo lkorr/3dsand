@@ -146,7 +146,7 @@ enum class Pipe : uint8_t {
   FluidExciteDetect, FluidExciteScan, FluidExciteEmit,
   FluidPTick, FluidSettleJudge, FluidSettleScan, FluidSettleBin,
   FluidSettleCheck, FluidSettleCommit, FluidSettleKill,
-  FluidConsumeApply, FluidStainApply, FluidMirrorFold,
+  FluidConsumeApply, FluidStainApply, FluidMirrorFold, FluidCellClear,
   // Materializes a JITTER page (world.h's JITTER block): the one fill a
   // vkCmdFillBuffer cannot do, because the words vary per cell.
   PageFill,
@@ -221,7 +221,7 @@ enum class Cond : uint8_t {
 // (grid WAW against the next clear, particle RAW into the next mark) are
 // generated exactly like intra-table ones.
 enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill,
-                             Fluid, FluidSeam, FluidSettle, PageFill };
+                             FluidMap, Fluid, FluidSeam, FluidSettle, PageFill };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put

@@ -188,7 +188,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(0, T::ReadOnlyStorage),  // fluidParticles[page] (compact src)
         entry(1, T::Storage),          // fluidParticles[1-page] (working)
         entry(2, T::ReadOnlyStorage),  // fluidSpawnOps
-        entry(3, T::ReadOnlyStorage),  // fluidBlockMap (last substep's)
+        entry(3, T::Storage),          // fluidBlockMap (last substep's index
+                                       // half, read; stainApply writes the
+                                       // Y-occupancy half)
         entry(4, T::ReadOnlyStorage),  // fluidGrid (last substep's)
         entry(5, T::Storage),          // fluidArgsStage (FA_* words, atomic)
         entry(6, T::Storage),          // dirtyList (read; shared entry is RW)
@@ -653,6 +655,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidConsumeApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "consumeApply", "seamConsumeApply");
   fluidStainApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "stainApply", "seamStainApply");
   fluidMirrorFold_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "mirrorFold", "seamMirrorFold");
+  fluidCellClear_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "cellClear", "seamCellClear");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -669,7 +672,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidExciteScan_ || !fluidExciteEmit_ || !fluidPTick_ ||
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
       !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_ ||
-      !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_) {
+      !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_ ||
+      !fluidCellClear_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -857,6 +861,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidConsumeApply:   return fluidConsumeApply_;
     case P::FluidStainApply:     return fluidStainApply_;
     case P::FluidMirrorFold:     return fluidMirrorFold_;
+    case P::FluidCellClear:      return fluidCellClear_;
     default:                return step_;
   }
 }
@@ -1124,6 +1129,12 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
       fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);
   if (seamActive) {
     RecordTable(enc, pass::Table::FluidSeam, &cx);
+    // The chunk->block map is built ONCE here, not once per substep: max
+    // displacement is 2.7 cells/tick against `mark`'s 3-cell pad, so the map a
+    // substep would have rebuilt is the map it already has (plan §7 item 4,
+    // and the PT_FLUIDMAP block in pass_table.def). Recorded after the seam
+    // because exciteEmit and spawnAppend create particles it must cover.
+    RecordTable(enc, pass::Table::FluidMap, &cx);
     for (uint32_t s = 0; s < kFluidSubsteps; s++)
       RecordTable(enc, pass::Table::Fluid, &cx);
     RecordTable(enc, pass::Table::FluidSettle, &cx);

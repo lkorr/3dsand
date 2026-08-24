@@ -408,26 +408,48 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
 // conditions: every row is C_ALWAYS within the table, and whether the table
 // is recorded at all is a pure function of the CPU-owned particle count.
 //
-// The scratch grid is rebuilt from scratch every substep: fill zeroes the
-// chunk->block map, mark flags chunks under particle support (atomicOr — the
-// final map state is order-independent), alloc assigns block indices by a
-// single-workgroup scan in slot order (deterministic) and emits the node-pass
-// dispatch args, clear zeroes exactly the active blocks' accumulators.
-PASS(fluid_fill_blockMap, nullptr, PT_FLUID, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+// The node ACCUMULATORS are rebuilt every substep (fluidClear below). The
+// chunk->block MAP is not: it is built ONCE per tick, by PT_FLUIDMAP.
+//
+// ===================================================== PT_FLUIDMAP ========
+// The chunk -> node-block map, built ONCE PER TICK between the seam's front
+// half and the first substep (plan §7 item 4). fill zeroes the map, mark flags
+// chunks under particle support (atomicOr — the final map state is
+// order-independent), alloc assigns block indices by a single-workgroup scan in
+// slot order (deterministic) and emits the node-pass dispatch args.
+//
+// WHY ONCE IS ENOUGH, and what pays for it: a particle's velocity is CFL-capped
+// at FLUID_VMAX = 0.45 cell/substep, so it travels at most 2.7 cells in a whole
+// tick. `mark` pads its support by FLUID_MARK_PAD = 3 cells in every direction,
+// which covers that with room to spare, so a particle can never reach a chunk
+// this map does not already cover. (A particle whose chunk has no block simply
+// freezes for the substep — deterministic, mass-preserving, and the same
+// bounded degradation the kFluidBlocks budget already accepts — so the pad is
+// belt AND braces, not the only guard.)
+//
+// It must run AFTER the seam: exciteEmit and spawnAppend both create particles,
+// and the map has to cover them. It must run BEFORE the substeps for the
+// obvious reason. And the seam's FRONT half deliberately reads the map from
+// LAST tick (consumeApply addresses the CA's flags exactly as the CA wrote
+// them), which is why this is a table of its own rather than rows appended to
+// the seam.
+PASS(fluid_fill_blockMap, nullptr, PT_FLUIDMAP, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(FluidBlockMap)))
 // read-only in practice: `fluidParticles` is read_write for the module because
 // g2p writes it. mark only reads positions to flag chunks. The per-particle
 // extent is GPU-owned now (fluidArgs[FA_LIVE], the seam's count), so mark and
 // every other per-particle pass dispatches indirectly off fluidPDispatchArgs,
 // and each kernel re-bounds itself on the live count it reads from fluidArgs.
-PASS(fluidMark, "fluid(substep)", PT_FLUID, PIPE_FLUID_MARK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+PASS(fluidMark, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_MARK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticlesWrite) A(FluidBlockMap) R(FluidArgsStage) I(FluidPDispatchArgs)))
-PASS(fluidAlloc, "fluid(substep)", PT_FLUID, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+PASS(fluidAlloc, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(RW(FluidBlockMap) W(FluidBlockList) W(FluidArgsStage)))
 // Same staging-copy shape as argsStage -> dispatchArgs: the indirect-only
 // buffer is never bound in any bind group.
-PASS(copy_fluidArgs, nullptr, PT_FLUID, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+PASS(copy_fluidArgs, nullptr, PT_FLUIDMAP, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TR(FluidArgsStage) TW(FluidDispatchArgs)))
+
+// =========================================================== PT_FLUID =====
 PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(W(FluidGrid) I(FluidDispatchArgs)))
@@ -458,10 +480,19 @@ PASS(fluidP2g2, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G2, K_INDIRECT, IND_FLU
 // the world hash out of this system's blast radius.
 // read-only in practice: `fluidBlockList` is read_write for the module because
 // alloc writes it; the grid update only reads its block's chunk slot.
+// A(FluidBlockMap) is the Y-OCCUPANCY half (common.wgsl): a node that carries
+// mass lights its y level so the RENDERER can skip empty y slabs. Render-only
+// derived data, but the hazard is real — the next substep's p2g reads the index
+// half of the same buffer, and the renderer reads the mask half.
+// A(FluidArgsStage) is the FA_CLAMPED counter (the CFL-honesty probe): the
+// only fluid substep pass that WRITES the args buffer mid-substep. The next
+// consumer is the seam front of the NEXT tick (compactScan zeroes it) and the
+// bench readback; the hazard edge is real either way.
 PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
-          RW(FluidGrid) I(FluidDispatchArgs)))
+          RW(FluidGrid) A(FluidBlockMap) A(FluidArgsStage)
+          I(FluidDispatchArgs)))
 // Pure gather for the fluid itself: each thread writes only its own particle,
 // so g2p cannot race itself (the mark/apply split rule does not bite here).
 // The splash coupling adds two writes: fast free-surface particles append
@@ -499,27 +530,50 @@ PASS(seam_fill_excite, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE
      USES(TW(FluidExciteScratch)))
 PASS(seam_fill_settle, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(FluidSettleScratch)))
+// COMPACTION SIZING (plan §7 item 1). These two rows dispatched 1,024 fixed
+// workgroups — one thread per pool SLOT, all 262,144 of them — whether 100
+// particles existed or 40,000, which measured as a count-INDEPENDENT ~0.35 ms
+// of seam+settle at both 6k and 40k live. They now run off
+// fluidArgs[FA_ARGS_COMPACT] = ((live+255)/256, 1, 1), written by LAST tick's
+// excite scan next to the live count it is derived from, and staged here.
+// compactScan reads the same bound (liveSpans()) so it cannot consume a span
+// this dispatch never wrote.
+PASS(copy_fluidCompactArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 76,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(FluidArgsStage) TW(FluidPDispatchArgs)))
 // read-only in practice on FluidArgsStage: the count kernels atomicLoad the
 // live count; compactScan is the one that stores (and clears the per-tick
 // event counters).
-PASS(seam_compact_count, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_COUNT, K_COMPUTE, 1024,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(R(FluidParticlesRead) A(FluidArgsStage) W(FluidCompactScratch)))
+PASS(seam_compact_count, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_COUNT, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+     USES(R(FluidParticlesRead) A(FluidArgsStage) W(FluidCompactScratch)
+          I(FluidPDispatchArgs)))
 PASS(seam_compact_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(RW(FluidCompactScratch) A(FluidExciteScratch) A(FluidArgsStage)))
 // read-only in practice: `compactScratch` is read_write for the module
 // (compactCount/Scan write it); the scatter only reads counts and bases.
-PASS(seam_compact_scatter, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_SCATTER, K_COMPUTE, 1024,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+// Same indirect args as the count above — nothing between them rewrites
+// fluidPDispatchArgs, so one staging copy serves both.
+PASS(seam_compact_scatter, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_SCATTER, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(R(FluidParticlesRead) W(FluidParticlesWrite) R(FluidCompactScratch)
-          A(FluidArgsStage)))
+          A(FluidArgsStage) I(FluidPDispatchArgs)))
 PASS(seam_spawn, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_SPAWN, K_COMPUTE, D_FLUIDSPAWN,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_FLUIDSPAWN, 1,
      USES(U(TickUBO) R(FluidSpawnOps) W(FluidParticlesWrite)
           A(FluidExciteScratch)))
+// consumeApply's bound is the SURVIVOR count compactScan just published, so
+// its args are staged here rather than with the compaction pair above.
+PASS(copy_fluidConsumeArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 88,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(FluidArgsStage) TW(FluidPDispatchArgs)))
+// read-only in practice on FluidBlockMap: the module declares it read_write
+// because stainApply lights the Y-occupancy mask; consumeApply only reads the
+// INDEX half to address the cell the CA flagged.
 // Reactions that took excited fluid this tick (the CA's consume flags): the
 // whole cell bin dies before the substeps run. Addressed via LAST substep's
 // block map, exactly the addressing the CA used to set the flags.
-PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_COMPUTE, 4096,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) R(FluidBlockMap)
-          A(FluidCellScratch) A(FluidArgsStage) A(FluidExciteScratch)))
+          A(FluidCellScratch) A(FluidArgsStage) A(FluidExciteScratch)
+          I(FluidPDispatchArgs)))
+// read-only in practice on FluidBlockMap: read_write for the module (stainApply
+// writes the Y-occupancy mask); the wake probe only reads the index half.
 // C_CAACTIVE: detect runs over THIS tick's compacted dirty list; when the CA
 // proved the world settled the list was not rebuilt and there is nothing
 // disturbed to excite.
@@ -551,8 +605,14 @@ PASS(copy_fluidPArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 16,0,12, GRP_NON
 // The intent/flags scratch clears HERE, at the head of the settle phase:
 // the CA has already read last tick's intents and consumeApply has already
 // read this tick's flags, and particleTick refills the intents next.
-PASS(seam_fill_cellScratch, nullptr, PT_FLUIDSETTLE, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
-     USES(TW(FluidCellScratch)))
+// Was an 8 MiB whole-buffer FILL, every tick, forever — the buffer is sized by
+// the kFluidBlocks CEILING (256 blocks x 4096 cells x 2 words) while the lab
+// scenes measure 8-22 active blocks. Now a compute clear over the LAST
+// substep's active blocks (plan §7 item 1), which is also zero work when the
+// solver is asleep.
+PASS(seam_cell_clear, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_CELL_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
+     GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
+     USES(A(FluidCellScratch) I(FluidDispatchArgs)))
 // read-only in practice: `fluidParticles` is read_write for the module
 // (compaction/spawn/emit/kill write it); particleTick only reads state to
 // fold each particle's speed into its slot's maximum and scatter its
@@ -565,10 +625,15 @@ PASS(seam_particle_tick, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_PTICK, K_INDI
 // the LAST substep), applying the intents particleTick just scattered —
 // solid surfaces touched by excited fluid take its stain, the CA's
 // doStaining semantics on the particle side.
+// A(FluidBlockMap): the settled-liquid half of the Y-occupancy mask. This is
+// the one pass that already walks every active-block cell with the voxel word
+// in hand, and settled liquid contributes virtual mass to the isosurface, so
+// without it the march would skip the y levels a half-converted pool holds as
+// voxels.
 PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_INDIRECT, IND_FLUIDARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
-          I(FluidDispatchArgs)))
+          A(FluidBlockMap) I(FluidDispatchArgs)))
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidSettleScratch) A(FluidCalm)))
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
@@ -593,6 +658,8 @@ PASS(seam_settle_commit, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_COMMIT
 PASS(seam_settle_kill, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_KILL, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) A(FluidSettleScratch)
           A(FluidArgsStage) I(FluidPDispatchArgs)))
+// read-only in practice on FluidBlockMap: read_write for the module (stainApply
+// writes the Y-occupancy mask); the fold only reads the index half.
 // The swimming fold: excited-fluid eighths for the 27 CPU-mirror chunks,
 // packed for the snapshot readback (plan §6.5). Last so it reads the tick's
 // final node mass.

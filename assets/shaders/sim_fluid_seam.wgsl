@@ -59,7 +59,11 @@
 // Solver state from the LAST substep of the PREVIOUS tick: the block map and
 // node grid. Read-only here — the wake trigger samples node mass/velocity at
 // the settled/active interface, and exciteEmit seeds wake velocities from it.
-@group(1) @binding(3) var<storage, read> fluidBlockMapR : array<u32>;
+// read_write ATOMIC rather than read: stainApply lights the settled-liquid
+// half of the Y-occupancy mask (common.wgsl fbmYMaskIndex), and 256 threads
+// of one block share a chunk's mask word. The INDEX half is still read-only
+// in this module — every `bm` below is an atomicLoad of it.
+@group(1) @binding(3) var<storage, read_write> fluidBlockMapR : array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read> fluidGridR : array<i32>;
 // The FA_* word map (common.wgsl). Counters are atomics; the scans store the
 // authoritative live count and dispatch args.
@@ -120,12 +124,22 @@ const MARK_LIST_MASK : u32 = 0x1Fu;
 // solver: WGSL const-expressions fold IEEE-exactly, the kernel stays integer).
 // Settle/wake thresholds compare on the splash test's (v >> 8) scale so the
 // tuner's vox/s reads identically across all three.
-const SEAM_SETTLE8 : i32 =
-    i32(round(TUNE_FLUID_SETTLE_EPS * 65536.0 / 30.0)) >> 8u;
-const SEAM_SETTLE2 : i32 = SEAM_SETTLE8 * SEAM_SETTLE8;
-const SEAM_WAKE8 : i32 =
-    i32(round(TUNE_FLUID_WAKE_SPEED * 65536.0 / 30.0)) >> 8u;
-const SEAM_WAKE2 : i32 = SEAM_WAKE8 * SEAM_WAKE8;
+//
+// PRECISION (plan §5's SEAM_SETTLE8 fix): the threshold used to be truncated
+// to Q8.8 BEFORE squaring (>>8), which quantized the settleEps slider to
+// ~0.117 vox/s steps — non-monotone tuner behaviour right in the interesting
+// range. Truncate to Q12.4 instead (>>4), square, and shift the SQUARE down 8
+// so the compare stays in the measured side's exact (v >> 8)^2 units; the
+// slider now steps at ~0.0073 vox/s.
+// Overflow audit: LoadTuning clamps settleEps/wakeSpeed well under VMAX, but
+// audit at the absolute ceiling anyway — VMAX is 176947 Q16.16, so
+// (176947 >> 4)^2 = 11059^2 = 1.223e8 < 2^31. Fits i32 with 17x headroom.
+const SEAM_SETTLE4 : i32 =
+    i32(round(TUNE_FLUID_SETTLE_EPS * 65536.0 / 30.0)) >> 4u;
+const SEAM_SETTLE2 : i32 = (SEAM_SETTLE4 * SEAM_SETTLE4) >> 8u;
+const SEAM_WAKE4 : i32 =
+    i32(round(TUNE_FLUID_WAKE_SPEED * 65536.0 / 30.0)) >> 4u;
+const SEAM_WAKE2 : i32 = (SEAM_WAKE4 * SEAM_WAKE4) >> 8u;
 const SEAM_CALM_TICKS : u32 = u32(clamp(TUNE_FLUID_SETTLE_TICKS, 8, 600));
 // Hydrostatic compression per cell of depth, Q16: how much smaller than 1 the
 // seeded J gets per submerged cell. g/K with the /900 human-unit conversions
@@ -197,6 +211,14 @@ fn compactCount(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }
 
+// Spans that can hold a live particle. compactCount/compactScatter dispatch
+// exactly this many workgroups (fluidArgs[FA_ARGS_COMPACT], staged into
+// fluidPDispatchArgs), so compactScratch beyond it is STALE and this scan must
+// not read it — that is the whole contract of making those two rows indirect.
+fn liveSpans() -> u32 {
+  return (min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP) + 255u) / 256u;
+}
+
 @compute @workgroup_size(256)
 fn compactScan(@builtin(local_invocation_index) li : u32) {
   // 256 threads x (SPANS/256) spans each; thread 0 turns the partials into
@@ -204,8 +226,11 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
   // first seam pass of the tick, so last tick's values have already ridden
   // the snapshot readback out.
   let per = SPANS / 256u;
+  let spans = liveSpans();
   var n = 0u;
-  for (var s = li * per; s < (li + 1u) * per; s++) { n += compactScratch[s]; }
+  for (var s = li * per; s < (li + 1u) * per; s++) {
+    if (s < spans) { n += compactScratch[s]; }
+  }
   wgScan[li] = n;
   workgroupBarrier();
   if (li == 0u) {
@@ -216,6 +241,10 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
       sum += c;
     }
     atomicStore(&exciteScratch[EX_COMPACT_LIVE], sum);
+    // consumeApply's dispatch: one thread per SURVIVOR, not per pool slot.
+    atomicStore(&fluidArgs[FA_ARGS_CONSUME + 0u], (min(sum, FLUID_CAP) + 63u) / 64u);
+    atomicStore(&fluidArgs[FA_ARGS_CONSUME + 1u], 1u);
+    atomicStore(&fluidArgs[FA_ARGS_CONSUME + 2u], 1u);
     atomicStore(&fluidArgs[FA_DEAD], 0u);
     atomicStore(&fluidArgs[FA_SETTLED], 0u);
     atomicStore(&fluidArgs[FA_EXCITED], 0u);
@@ -225,10 +254,12 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_BINNED], 0u);
     atomicStore(&fluidArgs[FA_CONSUMED], 0u);
     atomicStore(&fluidArgs[FA_STAINED], 0u);
+    atomicStore(&fluidArgs[FA_CLAMPED], 0u);
   }
   workgroupBarrier();
   var base = wgScan[li];
   for (var s = li * per; s < (li + 1u) * per; s++) {
+    if (s >= spans) { break; }
     let c = compactScratch[s];
     compactScratch[SPANS + s] = base;
     base += c;
@@ -358,7 +389,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
         let n = c + d;
         let nwc = worldChunkOf(n);
         if (!chunkInWindow(nwc, T.origin)) { continue; }
-        let bm = fluidBlockMapR[chunkSlotIndex(nwc)];
+        let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(nwc)]);
         if (bm == 0u) { continue; }
         let nb = seamNodeBase(bm, n);
         if (fluidGridR[nb] < 16) { continue; }  // FLUID_MASS_MIN
@@ -477,6 +508,13 @@ fn exciteScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[4u], (live + 63u) / 64u);
     atomicStore(&fluidArgs[5u], 1u);
     atomicStore(&fluidArgs[6u], 1u);
+    // NEXT tick's compaction dispatch: one workgroup per 256-slot span that
+    // can hold a survivor. This is the tick's authoritative population, so it
+    // is the one place that can size the compaction — which is why the args
+    // are written here rather than by the compaction itself (plan §7 item 1).
+    atomicStore(&fluidArgs[FA_ARGS_COMPACT + 0u], (live + 255u) / 256u);
+    atomicStore(&fluidArgs[FA_ARGS_COMPACT + 1u], 1u);
+    atomicStore(&fluidArgs[FA_ARGS_COMPACT + 2u], 1u);
   }
   workgroupBarrier();
   // Per-span assignment for the fully-accepted / fully-refused spans (the
@@ -651,7 +689,7 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (!fpAlive(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!inWindow(cell, T.origin)) { return; }
-  let bm = fluidBlockMapR[chunkSlotIndex(worldChunkOf(cell))];
+  let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(worldChunkOf(cell))]);
   if (bm == 0u) { return; }
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -660,6 +698,26 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   atomicAdd(&fluidArgs[FA_DEAD], 1u);
   p.attr = 0u;
   fluidParticles[gid.x] = p;
+}
+
+// cellClear: zero the per-cell intent/flags scratch for the ACTIVE BLOCKS only.
+//
+// This replaces an 8 MiB vkCmdFillBuffer that ran every single tick, forever,
+// for a buffer sized by the kFluidBlocks CEILING (256) while the measured lab
+// scenes allocate 8-22 blocks (plan §7 item 1; the fill was 8 MiB, the real
+// working set is 250-700 KB). Dispatched off the node-pass indirect args of the
+// LAST substep — the same blocks:16-workgroups shape stainApply uses — so it is
+// zero work when the solver has no blocks, which is what "sleep" means here.
+//
+// Block indices past the current count keep whatever they last held: nothing
+// can address them, because every access resolves through the block map, whose
+// entries only ever name indices below the count.
+@compute @workgroup_size(256)
+fn cellClear(@builtin(workgroup_id) wg : vec3<u32>,
+             @builtin(local_invocation_index) li : u32) {
+  let cell = (wg.x >> 4u) * CHUNK_VOL + (wg.x & 15u) * 256u + li;
+  atomicStore(&fluidCellScratch[cell * 2u], 0u);
+  atomicStore(&fluidCellScratch[cell * 2u + 1u], 0u);
 }
 
 // ============================================================================
@@ -700,7 +758,7 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   let intent = (mat << 16u) | (sAmt << 3u) | sType;
 
   // Own cell: occupancy intent for the CA.
-  let bm = fluidBlockMapR[slot];
+  let bm = atomicLoad(&fluidBlockMapR[slot]);
   if (bm != 0u) {
     let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
     let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -721,7 +779,7 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
     let nk = materials[nmat].klass;
     if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
     let nwc = worldChunkOf(n);
-    let nbm = fluidBlockMapR[chunkSlotIndex(nwc)];
+    let nbm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(nwc)]);
     if (nbm == 0u) { continue; }  // outside particle support: no block, and
                                   // no contact that matters
     let nlo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
@@ -747,7 +805,6 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
   let intent = atomicLoad(&fluidCellScratch[(block * CHUNK_VOL + localIdx) * 2u]);
   let sType = intent & 0x7u;
   let sAmt = (intent >> 3u) & 0xFu;
-  if (sType == 0u || sAmt == 0u) { return; }
   let slot = fluidBlockList[block];
   let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
                      i32(slot / (NCHUNK * NCHUNK)));
@@ -759,6 +816,17 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
   if (idx == PT_NO_WORD) { return; }
   let w = voxels[idx];
   let nmat = voxMat(w);
+  // ---- Y-occupancy mask, settled-liquid half (common.wgsl) ----------------
+  // The renderer's isosurface takes VIRTUAL MASS from settled liquid voxels so
+  // the MPM surface meets voxel water instead of ending at a cliff. Those cells
+  // carry no node mass, so gridUpdate cannot see them, and without this the
+  // march would skip the y levels a half-converted pool still holds as voxels —
+  // a seam straight through the middle of it. This pass is the one that already
+  // walks every active-block cell with the voxel word in hand.
+  if (nmat != MAT_AIR && materials[nmat].klass == CLASS_LIQUID) {
+    atomicOr(&fluidBlockMapR[fbmYMaskIndex(slot)], fbmYBits(lo.y));
+  }
+  if (sType == 0u || sAmt == 0u) { return; }
   if (nmat == MAT_AIR) { return; }
   let nk = materials[nmat].klass;
   if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return; }
@@ -806,14 +874,33 @@ var<workgroup> ssPart : array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn settleScan(@builtin(local_invocation_index) li : u32) {
+  // TRUE SLEEP (plan §7 item 2). This scan and the solver's `alloc` are the
+  // only fluid passes whose cost does NOT come from an indirect arg — both are
+  // single-workgroup walks of all NUM_CHUNKS slots, so a world that poured once
+  // and settled kept paying them forever (the CPU-side fluidCount is monotone
+  // by design, so the TABLE keeps being recorded — that is the determinism
+  // contract, and the sanctioned way to make it free is exactly this).
+  // With no particles alive, no slot can have a calm counter to find: settleJudge
+  // resets a slot the moment its speed reads zero.
+  // (The early-out cannot `return` before the workgroupBarrier below — a
+  // storage read is non-uniform to the compiler, and a barrier in non-uniform
+  // control flow is a WGSL validation error. Skipping the WORK is enough.)
+  let asleep = atomicLoad(&fluidArgs[FA_LIVE]) == 0u;
   let span = NUM_CHUNKS / 256u;
   var n = 0u;
-  for (var s = li * span; s < (li + 1u) * span; s++) {
-    if (atomicLoad(&fluidCalm[s]) >= SEAM_CALM_TICKS) { n += 1u; }
+  if (!asleep) {
+    for (var s = li * span; s < (li + 1u) * span; s++) {
+      if (atomicLoad(&fluidCalm[s]) >= SEAM_CALM_TICKS) { n += 1u; }
+    }
   }
   ssPart[li] = n;
   workgroupBarrier();
   if (li != 0u) { return; }
+  if (asleep) {
+    atomicStore(&settleScratch[SP_COUNT], 0u);
+    atomicStore(&fluidArgs[FA_SETBLOCKS], 0u);
+    return;
+  }
   var picked = array<vec3<i32>, 16>();
   var count = 0u;
   for (var t = 0u; t < 256u && count < SETTLE_MAX; t++) {
@@ -1048,7 +1135,7 @@ fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
                                     i32(m / 9u));
   var bm = 0u;
   if (chunkInWindow(wc, T.origin)) {
-    bm = fluidBlockMapR[chunkSlotIndex(wc)];
+    bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(wc)]);
   }
   for (var wpos = li * 4u; wpos < li * 4u + 4u; wpos++) {
     var packed = 0u;

@@ -116,7 +116,10 @@ void World::Init(const rhi::Device& device) {
                                    U::Storage | U::CopySrc, "fluidParticlesB");
   fluidSpawnOps = CreateBuffer(device, kMaxFluidSpawnsPerTick * sizeof(FluidSpawnOp),
                                U::Storage | U::CopyDst, "fluidSpawnOps");
-  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+  // TWO kNumChunks arrays: [slot] = blockIdx+1, [kNumChunks + slot] = the
+  // chunk's 16-bit Y-OCCUPANCY mask (world.h). The whole-buffer Fill at the
+  // head of PT_FLUIDMAP clears both halves, which is what the mask needs.
+  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 2 * 4,
                                U::Storage | U::CopyDst, "fluidBlockMap");
   fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4,
                                 U::Storage | U::CopySrc, "fluidBlockList");
@@ -540,4 +543,75 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   return w.baseHeight +
          (vnoise(x, z, w.hillWavelength * kHScale, seed ^ 1u) * w.hillAmplitude) / 255 +
          (vnoise(x, z, w.detailWavelength * kHScale, seed ^ 2u) * w.detailAmplitude) / 255;
+}
+
+// ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ---------------
+// See the RenderParams block in world.h. Render-only DERIVED data: no sim
+// kernel and no sim decision reads either of these, so the readback latency
+// they ride is a picture question, never a determinism one.
+
+void World::NoteFluidSpawnBounds(const FluidSpawnOp* ops, uint32_t n,
+                                 uint32_t tick) {
+  if (n == 0) return;
+  IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX};
+  IVec3 hi{INT32_MIN, INT32_MIN, INT32_MIN};
+  for (uint32_t i = 0; i < n; i++) {
+    const IVec3 c{ops[i].px >> 16, ops[i].py >> 16, ops[i].pz >> 16};  // Q16.16
+    lo.x = std::min(lo.x, c.x); lo.y = std::min(lo.y, c.y); lo.z = std::min(lo.z, c.z);
+    hi.x = std::max(hi.x, c.x); hi.y = std::max(hi.y, c.y); hi.z = std::max(hi.z, c.z);
+  }
+  // Union with the box already held UNLESS it has expired: a pour that walks
+  // (the dev tool's brush) must not drag a stale tail across the world.
+  const bool live = spawnBoxHi_.x >= spawnBoxLo_.x &&
+                    tick - spawnBoxTick_ < kFluidSpawnBoundsTicks;
+  if (live) {
+    lo.x = std::min(lo.x, spawnBoxLo_.x); lo.y = std::min(lo.y, spawnBoxLo_.y);
+    lo.z = std::min(lo.z, spawnBoxLo_.z);
+    hi.x = std::max(hi.x, spawnBoxHi_.x); hi.y = std::max(hi.y, spawnBoxHi_.y);
+    hi.z = std::max(hi.z, spawnBoxHi_.z);
+  }
+  spawnBoxLo_ = lo;
+  spawnBoxHi_ = hi;
+  spawnBoxTick_ = tick;
+}
+
+bool World::FluidRenderBounds(uint32_t tick, IVec3& lo, IVec3& hi) const {
+  // No snapshot yet: hand back the whole window. The one thing this must never
+  // do is clip water the CPU cannot see.
+  if (!snap_.valid) {
+    lo = {origin_.x * (int)kChunk, origin_.y * (int)kChunk,
+          origin_.z * (int)kChunk};
+    hi = {lo.x + (int)kWorldN - 1, lo.y + (int)kWorldN - 1,
+          lo.z + (int)kWorldN - 1};
+    return true;
+  }
+  lo = {INT32_MAX, INT32_MAX, INT32_MAX};
+  hi = {INT32_MIN, INT32_MIN, INT32_MIN};
+  // The active block list: every chunk the solver allocated node storage for
+  // as of that snapshot — i.e. every chunk whose grid can hold fluid mass.
+  const uint32_t nb = std::min<uint32_t>(
+      snap_.fluidBlockCount, (uint32_t)snap_.fluidBlocks.size());
+  for (uint32_t i = 0; i < nb; i++) {
+    const IVec3 wc = SlotToWorldChunk(snap_.fluidBlocks[i]);
+    const IVec3 c0{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
+    lo.x = std::min(lo.x, c0.x); lo.y = std::min(lo.y, c0.y); lo.z = std::min(lo.z, c0.z);
+    hi.x = std::max(hi.x, c0.x + (int)kChunk - 1);
+    hi.y = std::max(hi.y, c0.y + (int)kChunk - 1);
+    hi.z = std::max(hi.z, c0.z + (int)kChunk - 1);
+  }
+  if (spawnBoxHi_.x >= spawnBoxLo_.x &&
+      tick - spawnBoxTick_ < kFluidSpawnBoundsTicks) {
+    lo.x = std::min(lo.x, spawnBoxLo_.x); lo.y = std::min(lo.y, spawnBoxLo_.y);
+    lo.z = std::min(lo.z, spawnBoxLo_.z);
+    hi.x = std::max(hi.x, spawnBoxHi_.x); hi.y = std::max(hi.y, spawnBoxHi_.y);
+    hi.z = std::max(hi.z, spawnBoxHi_.z);
+  }
+  if (hi.x < lo.x) {               // no blocks, no recent pour: nothing to draw
+    lo = {0, 0, 0};
+    hi = {-1, -1, -1};             // the canonical empty box the shader tests
+    return false;
+  }
+  lo.x -= kFluidRenderPadVox; lo.y -= kFluidRenderPadVox; lo.z -= kFluidRenderPadVox;
+  hi.x += kFluidRenderPadVox; hi.y += kFluidRenderPadVox; hi.z += kFluidRenderPadVox;
+  return true;
 }

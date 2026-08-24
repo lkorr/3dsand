@@ -74,7 +74,11 @@
 @group(1) @binding(2) var<storage, read_write> fluidBlockMap : array<atomic<u32>>;
 @group(1) @binding(3) var<storage, read_write> fluidBlockList : array<u32>;
 @group(1) @binding(4) var<storage, read_write> fluidGrid : array<atomic<i32>>;
-@group(1) @binding(5) var<storage, read_write> fluidArgs : array<u32>;
+// Atomic like the seam's view of the same buffer: gridUpdate counts VMAX clamp
+// engagements into FA_CLAMPED (plan §5 item 1's CFL-honesty probe), and an
+// atomicAdd needs the atomic type. alloc's scans store through it instead of
+// plain-assigning; same words, same values.
+@group(1) @binding(5) var<storage, read_write> fluidArgs : array<atomic<u32>>;
 // Splash coupling: g2p appends micro droplets into the ballistic particle
 // system's WRITE page (this tick's, which is next tick's read page — the fluid
 // substeps run after particleResolve). Same append idiom sim_particle.wgsl
@@ -107,6 +111,14 @@ const FLUID_VISCOSITY : i32 =                  // vox²/s -> Q16.16 cells²/tick
     i32(round(TUNE_FLUID_VISCOSITY * 65536.0 / 30.0));
 const FLUID_DAMPING : i32 =                    // fraction/s -> Q16.16 /tick
     i32(round(TUNE_FLUID_DAMPING * 65536.0 / 30.0));
+// Wall friction: fraction/s of TANGENTIAL velocity shed per second of solid
+// contact, applied per SUBSTEP in gridUpdate's separate BC (so it compounds to
+// the per-second rate over a tick of continuous contact). 0 = free-slip, the
+// water default; the knob exists for mud/goo authoring (per-material JSON is
+// plan §6.1's job). The kernel branch is compiled out entirely at 0 — mq() by
+// 1.0 is NOT the identity (it truncates 6 low bits), so a guard, not a blend.
+const FLUID_FRICTION : i32 =                   // fraction/s -> Q16 /substep
+    i32(round(TUNE_FLUID_FRICTION * 65536.0 / (30.0 * f32(FLUID_SUBSTEPS))));
 // Splash droplets (see the g2p emission block): rate is droplets/second per
 // eligible particle spread over the substeps, speed the eligibility threshold.
 const FLUID_SPLASH_CHANCE : i32 =              // per-substep probability, Q16
@@ -280,11 +292,24 @@ fn fluidSolid(c : vec3<i32>) -> bool {
 // spawn / excite passes maintain fluidArgs[FA_LIVE] — sim_fluid_seam.wgsl).
 // Spawning moved there too (spawnAppend): with settle deleting particles and
 // excite creating them on the GPU, no CPU-known base exists any more.
-fn liveTotal() -> u32 { return min(fluidArgs[FA_LIVE], FLUID_CAP); }
+fn liveTotal() -> u32 { return min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP); }
 
-// ---- mark: flag every chunk the particle's 3^3 node support touches ---------
+// ---- mark: flag every chunk the particle's node support can touch THIS TICK -
 // atomicOr of a constant is order-independent; the map is cleared by a Fill
-// row at the top of every substep.
+// row at the top of PT_FLUIDMAP, which runs ONCE per tick.
+//
+// THE PAD. The map used to be rebuilt before every substep, so marking the
+// instantaneous 3-cell node support was exact. Building it once per tick
+// (plan §7 item 4) means it must also cover where the particle will BE by the
+// last substep. Displacement is bounded by the CFL clamp: g2p advects
+// v / FLUID_SUBSTEPS per substep with |v| <= FLUID_VMAX (0.45 cell/substep x 6),
+// so a particle moves at most FLUID_VMAX = 2.7 cells over the whole tick,
+// whatever the pressure field does to it in between. 3 cells covers that.
+//
+// The padded span is [base-3, base+5] = 9 cells, and 9 <= CHUNK, so it still
+// touches at most 2 chunks per axis and the 8-corner loop is still exhaustive.
+const FLUID_MARK_PAD : i32 = 3;
+
 @compute @workgroup_size(64)
 fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
@@ -292,12 +317,15 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!inWindow(cell, T.origin)) { return; }  // frozen out-of-window
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
-  let lo = vec3<i32>(ax.base, ay.base, az.base);
-  // Node support spans cells [base, base+2]: at most 2 chunks per axis.
+  let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
+  let hi = vec3<i32>(ax.base, ay.base, az.base) +
+           vec3<i32>(2 + FLUID_MARK_PAD);
   for (var k = 0; k < 2; k++) {
     for (var j = 0; j < 2; j++) {
       for (var i = 0; i < 2; i++) {
-        let corner = lo + vec3<i32>(i * 2, j * 2, k * 2);
+        let corner = vec3<i32>(select(lo.x, hi.x, i == 1),
+                               select(lo.y, hi.y, j == 1),
+                               select(lo.z, hi.z, k == 1));
         let wc = worldChunkOf(corner);
         if (chunkInWindow(wc, T.origin)) {
           atomicOr(&fluidBlockMap[chunkSlotIndex(wc)], 1u);
@@ -319,10 +347,25 @@ var<workgroup> allocTotal : u32;
 
 @compute @workgroup_size(256)
 fn alloc(@builtin(local_invocation_index) li : u32) {
+  // TRUE SLEEP (plan §7 item 2). Every other row of this table dispatches off
+  // an indirect arg and so costs nothing with no particles; this one is a fixed
+  // single-workgroup walk of all NUM_CHUNKS slots (the seam's settleScan is the
+  // other). Whether the table is RECORDED stays a pure function of the
+  // CPU-owned monotone count — never a readback, that is the determinism trap
+  // in plan §7 — so a world that poured once and settled goes on recording
+  // these passes forever, and making them free is the only sanctioned fix.
+  // With no live particles `mark` wrote nothing, so the map is all zero and the
+  // scan below could only ever produce zero.
+  // (The early-out must not `return` before the workgroupBarriers below — a
+  // storage read is non-uniform to the compiler, and a barrier in non-uniform
+  // control flow is a WGSL validation error. Skipping the WORK is enough.)
+  let asleep = min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP) == 0u;
   let span = NUM_CHUNKS / 256u;   // 128 slots per thread
   var n = 0u;
-  for (var s = li * span; s < (li + 1u) * span; s++) {
-    if (atomicLoad(&fluidBlockMap[s]) != 0u) { n += 1u; }
+  if (!asleep) {
+    for (var s = li * span; s < (li + 1u) * span; s++) {
+      if (atomicLoad(&fluidBlockMap[s]) != 0u) { n += 1u; }
+    }
   }
   allocPartial[li] = n;
   workgroupBarrier();
@@ -335,12 +378,13 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
     }
     allocTotal = sum;
     let blocks = min(sum, FLUID_BLOCKS);
-    fluidArgs[0] = blocks * (CHUNK_VOL / 256u);  // 16 workgroups per block
-    fluidArgs[1] = 1u;
-    fluidArgs[2] = 1u;
-    fluidArgs[3] = blocks;
+    atomicStore(&fluidArgs[0], blocks * (CHUNK_VOL / 256u));  // 16 wg per block
+    atomicStore(&fluidArgs[1], 1u);
+    atomicStore(&fluidArgs[2], 1u);
+    atomicStore(&fluidArgs[3], blocks);
   }
   workgroupBarrier();
+  if (asleep) { return; }
   var idx = allocPartial[li];
   for (var s = li * span; s < (li + 1u) * span; s++) {
     if (atomicLoad(&fluidBlockMap[s]) == 0u) { continue; }
@@ -587,6 +631,12 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&fluidGrid[ni + 3u], 0);
     return;
   }
+  // This node carries mass: light its y level in the chunk's Y-occupancy mask
+  // (common.wgsl). Render-only derived data; atomicOr of a constant is
+  // order-independent, and the mask is cleared by the same fill that clears the
+  // index half of the map, once per tick.
+  atomicOr(&fluidBlockMap[fbmYMaskIndex(fluidBlockList[block])],
+           fbmYBits(i32((localIdx >> 4u) & 15u)));
   var v : vec3<i32>;
   for (var a = 0u; a < 3u; a++) {
     let mom = atomicLoad(&fluidGrid[ni + 1u + a]);
@@ -605,18 +655,72 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
 
+  // ---- separate BC with tangential preservation (plan §5 item 2) ----------
+  // Only the velocity component pointing INTO a solid is removed; tangential
+  // flow survives, which is what lets water sheet down a slope instead of
+  // gluing to it. The old code zeroed ALL components of any node whose own
+  // cell was solid — but a particle sliding down a ramp has in-solid nodes
+  // inside its 3^3 support (the top layer of the ramp itself), so it lost
+  // tangential velocity every substep and piled up mid-slope: reference
+  // checklist cause #2, the user's exact complaint.
+  //
+  // A node whose own cell is SOLID and which carries mass is a SURFACE node
+  // (deep-interior nodes get no particle support and exited at the mass gate
+  // above). Per axis:
+  //   * both neighbours solid  -> the axis runs PARALLEL to the exposed face
+  //     (e.g. x/z under a flat floor): pure tangential, KEEP — this is the
+  //     load-bearing case, the one the old unconditional v=0 destroyed;
+  //   * one side open          -> this is the face-normal axis: remove only
+  //     the component that points DEEPER into the solid; outward stays (that
+  //     is the EOS ejecting particles that pushed in — anti-crust);
+  //   * both sides open        -> a 1-cell wall: outward and through-flow are
+  //     indistinguishable, so zero the axis (the sticky choice is the one
+  //     that cannot tunnel water through thin geometry).
+  // For a NON-solid node the plain directional test is already correct: the
+  // into-solid direction IS the face normal of the wall the fluid touches.
+  let sxp = fluidSolid(c + vec3<i32>(1, 0, 0));
+  let sxn = fluidSolid(c - vec3<i32>(1, 0, 0));
+  let syp = fluidSolid(c + vec3<i32>(0, 1, 0));
+  let syn = fluidSolid(c - vec3<i32>(0, 1, 0));
+  let szp = fluidSolid(c + vec3<i32>(0, 0, 1));
+  let szn = fluidSolid(c - vec3<i32>(0, 0, 1));
+  var contact = false;
   if (fluidSolid(c)) {
-    // Node inside terrain: sticky. (The plan's separate+friction BC is a
-    // later refinement; embedded nodes must not carry momentum regardless.)
-    v = vec3<i32>(0, 0, 0);
+    contact = true;
+    if (!(sxp && sxn)) {
+      if ((sxp && v.x > 0) || (sxn && v.x < 0) || (!sxp && !sxn)) { v.x = 0; }
+    }
+    if (!(syp && syn)) {
+      if ((syp && v.y > 0) || (syn && v.y < 0) || (!syp && !syn)) { v.y = 0; }
+    }
+    if (!(szp && szn)) {
+      if ((szp && v.z > 0) || (szn && v.z < 0) || (!szp && !szn)) { v.z = 0; }
+    }
   } else {
-    // Separate BC: zero the component pointing into a solid neighbor.
-    if (v.x > 0 && fluidSolid(c + vec3<i32>(1, 0, 0))) { v.x = 0; }
-    if (v.x < 0 && fluidSolid(c - vec3<i32>(1, 0, 0))) { v.x = 0; }
-    if (v.y > 0 && fluidSolid(c + vec3<i32>(0, 1, 0))) { v.y = 0; }
-    if (v.y < 0 && fluidSolid(c - vec3<i32>(0, 1, 0))) { v.y = 0; }
-    if (v.z > 0 && fluidSolid(c + vec3<i32>(0, 0, 1))) { v.z = 0; }
-    if (v.z < 0 && fluidSolid(c - vec3<i32>(0, 0, 1))) { v.z = 0; }
+    if (v.x > 0 && sxp) { v.x = 0; contact = true; }
+    if (v.x < 0 && sxn) { v.x = 0; contact = true; }
+    if (v.y > 0 && syp) { v.y = 0; contact = true; }
+    if (v.y < 0 && syn) { v.y = 0; contact = true; }
+    if (v.z > 0 && szp) { v.z = 0; contact = true; }
+    if (v.z < 0 && szn) { v.z = 0; contact = true; }
+  }
+  // Optional wall friction on whatever survived the projection (the
+  // tangential part). Compiled out at the water default of 0 — see the
+  // FLUID_FRICTION const for why this must be a guard, not a blend.
+  if (FLUID_FRICTION > 0 && contact) {
+    let keep = FLUID_ONE - min(FLUID_FRICTION, FLUID_ONE);
+    v = vec3<i32>(mq(v.x, keep), mq(v.y, keep), mq(v.z, keep));
+  }
+  // CFL-honesty probe (plan §5 item 1): count node-substeps the VMAX clamp
+  // actually truncates. The clamp converts pressure work into silent energy
+  // loss, so in steady flow this must read ~0 — if it fires, stiffness or
+  // substeps are wrong and no amount of damping is the fix. This is the only
+  // place the clamp can engage: g2p's per-particle clamp gathers a convex
+  // combination of these already-clamped node velocities, so it cannot exceed
+  // VMAX except by rounding. Diagnostic only — nothing keys on it, and an
+  // atomic counter sum is order-independent (rule 1).
+  if (abs(v.x) > FLUID_VMAX || abs(v.y) > FLUID_VMAX || abs(v.z) > FLUID_VMAX) {
+    atomicAdd(&fluidArgs[FA_CLAMPED], 1u);
   }
   v.x = clamp(v.x, -FLUID_VMAX, FLUID_VMAX);
   v.y = clamp(v.y, -FLUID_VMAX, FLUID_VMAX);

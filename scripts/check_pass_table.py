@@ -114,6 +114,7 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_GRIDUP": "fluidGridUp_",
     "PIPE_FLUID_G2P": "fluidG2p_",
     # The excite/settle seam (sim_fluid_seam.wgsl).
+    "PIPE_FLUID_CELL_CLEAR": "fluidCellClear_",
     "PIPE_FLUID_COMPACT_COUNT": "fluidCompactCount_",
     "PIPE_FLUID_COMPACT_SCAN": "fluidCompactScan_",
     "PIPE_FLUID_COMPACT_SCATTER": "fluidCompactScatter_",

@@ -672,6 +672,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidAttractDiff", s.fluidAttractDiff, out, at);
     ReadF(*g, "fluidViscosity", s.fluidViscosity, out, at);
     ReadF(*g, "fluidDamping", s.fluidDamping, out, at);
+    ReadF(*g, "fluidFriction", s.fluidFriction, out, at);
     ReadF(*g, "fluidSplashRate", s.fluidSplashRate, out, at);
     ReadF(*g, "fluidSplashSpeed", s.fluidSplashSpeed, out, at);
     ReadF(*g, "fluidSplashMaxDensity", s.fluidSplashMaxDensity, out, at);
@@ -723,6 +724,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     clampWarnF(s.fluidAttractDiff, -7200.0f, 7200.0f, "fluidAttractDiff");
     clampWarnF(s.fluidViscosity, 0.0f, 240.0f, "fluidViscosity");     // 8 c²/t
     clampWarnF(s.fluidDamping, 0.0f, 20.0f, "fluidDamping");          // <0.9/tick
+    clampWarnF(s.fluidFriction, 0.0f, 20.0f, "fluidFriction");        // <0.9/tick
     clampWarnF(s.fluidSplashRate, 0.0f, 180.0f, "fluidSplashRate");   // <=1/substep
     clampWarnF(s.fluidSplashSpeed, 0.0f, 90.0f, "fluidSplashSpeed");  // < VMAX
     clampWarnF(s.fluidSplashMaxDensity, 0.0f, 4.0f, "fluidSplashMaxDensity");

@@ -197,6 +197,27 @@ The check exists because the sword spent a while lying at the character's feet
 while every other melee assertion passed — an edge that has come loose from the
 hand still moves and still carves. Do not baseline it away.
 
+## `fluid-react` — pre-existing since the WP1 fluid-lab merge (c4f4ba7)
+
+Recorded `"fail"` by the WP4 perf agent, 2026-08-24. It is NOT a WP4
+regression, and three independent board notes from that day say so before WP4
+started: agent-ea1608 ("post-baseline gate, MPM mass accounting, unrelated"),
+agent-fea2b6 ("still fails — pre-existing, not mine"), agent-085345 ("fluid-
+excite AND fluid-react fail identically with worldgen.wgsl reverted to HEAD ->
+pre-existing, arrived with c4f4ba7, neither is in baseline.json").
+
+The likely cause is on the record too, from the agent who landed WP1
+(agent-f65818): the WP1 branch PASSED this gate at pure `tuning_params.def`
+values, and the merge kept three of the user's tuner-session retunes
+(cohesion 32.9, attractSame 0, attractDiff −1.08) in `tuning.json`. So the gate
+is almost certainly tuning-sensitive arithmetic rather than broken plumbing —
+the failing line reports `world hash matches` and the mass it is unhappy about
+is the reaction-consumed share. That makes it WP3's problem (the seam), per
+`docs/PLAN_fluid_overhaul.md` §6 item 5, which already names it.
+
+It is entered here so the suite's exit code goes back to meaning "something
+NEW broke". Flip it to `"pass"` in the commit that fixes it.
+
 ## Updating
 
 After fixing a gate, run it alone, confirm it passes, and flip its entry to

@@ -390,15 +390,16 @@ TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
 // Units: stiffness/cohesion/attract in (vox/s)^2, gravity vox/s^2, rest
 // density particles/voxel, viscosity vox^2/s, damping fraction/s, splash rate
 // droplets/s, splash speed vox/s, splash life seconds.
-TP_F(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 5400.0f)
+TP_F(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 3600.0f)
 TP_F(sim, fluidGravity, TUNE_FLUID_GRAVITY, 98.1f)
 TP_F(sim, fluidRestDensity, TUNE_FLUID_REST_DENSITY, 8.0f)
 TP_I(sim, fluidEosPower, TUNE_FLUID_EOS_POWER, 4)
-TP_F(sim, fluidCohesion, TUNE_FLUID_COHESION, 90.0f)
-TP_F(sim, fluidAttractSame, TUNE_FLUID_ATTRACT_SAME, 45.0f)
-TP_F(sim, fluidAttractDiff, TUNE_FLUID_ATTRACT_DIFF, -90.0f)
-TP_F(sim, fluidViscosity, TUNE_FLUID_VISCOSITY, 1.5f)
+TP_F(sim, fluidCohesion, TUNE_FLUID_COHESION, 0.0f)
+TP_F(sim, fluidAttractSame, TUNE_FLUID_ATTRACT_SAME, 0.0f)
+TP_F(sim, fluidAttractDiff, TUNE_FLUID_ATTRACT_DIFF, 0.0f)
+TP_F(sim, fluidViscosity, TUNE_FLUID_VISCOSITY, 0.1f)
 TP_F(sim, fluidDamping, TUNE_FLUID_DAMPING, 0.0f)
+TP_F(sim, fluidFriction, TUNE_FLUID_FRICTION, 0.0f)
 // Splash coupling: fast free-surface particles shed micro droplets into the
 // ballistic particle system (sim_fluid.wgsl g2p).
 TP_F(sim, fluidSplashRate, TUNE_FLUID_SPLASH_RATE, 4.0f)

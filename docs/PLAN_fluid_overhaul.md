@@ -558,6 +558,233 @@ What the numbers say (the diagnosis, now measured):
 
 ---
 
+### WP4 results (measured 2026-08-24, RTX 3060 Ti, 1080p offscreen)
+
+`bash scripts/run.sh ./build/Release/sandvox.exe --fluid-bench all --json out.json`
+on the CURRENT `tuning.json` (the .def reconciliation plus the user's three
+retuned knobs — so the WP1 rows above, measured at pure .def and at old-live,
+are the right *shape* of baseline but not the same configuration).
+
+Provenance of the "before" numbers, exactly:
+`docs/bench/wp4_fluid_bench_baseline.json` is a run whose ONLY changes from the
+fork point were render-side, so its `fluid(substep)` / `fluidSeam` /
+`fluidSettle` / live curves ARE the unmodified fork point's, and its render avg
+(hill 25.08) reproduces the WP1 DEF row (25.83) to within noise. The per-pass
+RENDER split could not exist before the attribution probe was built, and that
+probe landed together with item 5a — so the "fluid march" before-column below
+already has 5a's AABB and tetrahedral normal in it and **understates the true
+starting point by ~0.7-1.0 ms per scene**. `docs/bench/wp4_fluid_bench_after.json`
+is the final tree.
+
+**The bench now attributes its own render time.** Every 16th tick it re-renders
+the same frame twice more: once with `fluidCount = 0` (which skips the fluid
+march wholesale) and once also without the droplet raster. That was the first
+thing WP4 did, and it immediately corrected §9's WP1 reading of "rendering
+dominates, scaling with fluid pixels on screen":
+
+| scene  | fluid march | droplet raster | world+sky |
+|--------|-------------|----------------|-----------|
+| basin  |  7.80 ms | 0.08 ms | 2.91 ms |
+| hill   | 20.07 ms | 0.28 ms | 4.15 ms |
+| faucet | 16.38 ms | 0.17 ms | 3.71 ms |
+| pool   | 13.28 ms | 0.24 ms | 3.72 ms |
+| slosh  | 12.34 ms | 0.04 ms | 3.77 ms |
+
+The droplets are free, the world+sky floor is a flat ~3-4 ms, and **the fluid
+isosurface march is the whole render cost** — and was the whole WP4
+opportunity: at 39,600 particles `hill` spent 20 ms of render against 5.5 ms of
+solver.
+
+#### Before -> after
+
+| scene       | fluid(substep) | seam+settle | fluid march | render avg | frame p50 |
+|-------------|----------------|-------------|-------------|------------|-----------|
+| basin       | 2.53 -> 2.09 | 0.29 -> 0.27 |  7.80 -> 2.88 | 11.8 -> 5.90 | 15.2 -> 9.36 |
+| hill        | 5.47 -> 4.69 | 0.40 -> 0.37 | 20.07 -> 9.52 | 25.8 -> 13.86 | 34.9 -> 21.86 |
+| hill0       | 5.56 -> 4.65 | 0.40 -> 0.37 | 19.88 -> 9.44 | 25.9 -> 13.73 | 34.9 -> 21.68 |
+| faucet      | 3.01 -> 2.46 | 0.30 -> 0.27 | 16.38 -> 7.67 | 19.3 -> 11.28 | 24.2 -> 15.57 |
+| pool        | 3.63 -> 3.03 | 0.34 -> 0.31 | 13.28 -> 6.39 | 17.7 -> 10.34 | 22.9 -> 14.65 |
+| slosh       | 1.79 -> 1.38 | 0.27 -> 0.23 | 12.34 -> 4.37 | 16.6 ->  8.16 | 20.1 -> 11.05 |
+| pool-settle | (new) 2.05 | 0.29 | 6.92 | 11.03 | 14.67 |
+
+Whole-frame p50 is **1.5-1.9x better in every scene**. Mass ledgers unchanged
+(see the `pool` note below). `pool-settle` is new — see item 2.
+
+#### Per item
+
+1. **Indirect-everything.** `seam_compact_count` / `seam_compact_scatter`
+   (1,024 fixed workgroups = all 262,144 pool slots) and `seam_consume_apply`
+   (4,096) now dispatch off new FA_* arg triples (19..21 written by
+   `exciteScan`, 22..24 by `compactScan`), and the 8 MiB `fluidCellScratch`
+   fill became a compute clear over active blocks. Worth **~0.03 ms/tick**, not
+   the ~0.35 the structure suggested, and the bench says why: **the lab scenes
+   allocate 8-22 node blocks, not the 256 the buffers are sized for**, so those
+   fixed dispatches were mostly launching threads that returned immediately.
+   What is left of seam+settle is per-dispatch/barrier overhead across ~21 rows.
+   Size any further work here against measured block counts first.
+2. **True sleep.** `alloc` and `settleScan` were the only fluid passes not
+   dispatched off an indirect arg — single-workgroup walks of all 32,768 chunk
+   slots, running on every tick of any world that had ever poured water, because
+   the CPU-side `fluidCount` is monotone. That monotonicity stays (recording
+   must be a pure function of tick-deterministic inputs, never of readback
+   timing — §7's opening paragraph), so both now early-out on `FA_LIVE == 0`.
+   **Idle cost with the fluid tables fully recorded and nothing alive: 0.0000
+   ms/tick median (below timer resolution).** Because nothing settles at stock
+   tuning, the bench gained a `pool-settle` run that applies the `fluid-excite`
+   gate's overrides through the F5 reload path; it converts 19,635 of 26,400
+   eighths back to voxels inside 500 ticks.
+3. **Solid-mask cache for `gridUpdate` — NOT IMPLEMENTED, and the measurement
+   is why.** §7 sized it at "~44 M voxel reads/tick at 256 blocks". Measured
+   block counts are 8-22 (hill peaks at 28 after item 4), and `gridUpdate`
+   already skips its 7 probes for any node below `FLUID_MASS_MIN`, so the real
+   figure on `hill` is ~1 M probes/tick, about 0.05 ms of a 4.7 ms substep
+   table. A bit-exact change with a real blast radius (per-block bitmask, build
+   pass, pass-table rows) for under 1% — deliberately left undone.
+4. **Block map once per tick** (`PT_FLUIDMAP`), `mark` padded by 3 cells against
+   the 2.7 cell/tick CFL bound. **14-24% off the substep table.** The padded set
+   is a superset of every substep's exact set and the extra chunks receive no
+   particle support, so nothing changes: `fluid-det`'s particle hash is
+   unchanged at `14650fb0739d0383` and every scene's liveEnd and ledger are
+   identical. Not free — the pad grew hill 22 -> 28 blocks and cost the renderer
+   1.26 ms until item 5c.
+5. **Render bounds.** Four changes, in order of what they bought:
+   * **5a, the AABB.** `RenderParams.fluidLo/fluidHi`, CPU-built from the
+     snapshot block list plus the tick's spawns, dilated 2 chunks. Rays that
+     miss pay one slab test; rays that hit march only [enter, exit]; the
+     thickness walk stops at the exit. It is also what makes fluid *sleep* on
+     the render side, since `fluidCount` never decays.
+   * **5b, the seam ring was 16 cells thick.** `fluidChunkActive` called a chunk
+     active when a FACE NEIGHBOUR had a block, so the march fine-stepped a whole
+     chunk of air for an isosurface that reaches 2 cells in. Split into a class
+     (block / ring / nothing) plus a per-cell shell test.
+   * **5c, the Y-occupancy mask.** `fluidBlockMap` doubles to 2*kNumChunks; the
+     second half is 16 bits per chunk, one per local y level, written by
+     `fluidGridUp` (node mass) and `seamStainApply` (settled liquid's virtual
+     mass). Gravity-fed fluid is a thin horizontal layer, so an empty y slab is
+     skipped on ONE buffer read instead of ~13 trilinear samples of 8 taps each.
+     Pays back item 4's pad and more (hill 12.17 -> 9.52).
+   * **5d, cheaper per-pixel work.** The chunk class was recomputed every
+     0.5-1.25 cells for an answer that changes every 16 (now held); the
+     thickness walk was 28 fixed samples feeding an exponential that is blind
+     past ~10 cells (now <=14, geometric); `fluidNormalAt` was 6 field samples =
+     48 buffer reads of central differences (now 4-tap tetrahedral = 32, same
+     smoothing radius via the 1/sqrt(3) factor).
+
+   **Target check:** §9 asks for <=2.5 ms at 1080p with fluid on screen. Reached
+   only by `basin` (2.88, close). `hill` at 9.52 ms is a 2.1x miss — but hill
+   fills most of a 1080p frame with water at 30-60 voxels' range, the
+   adversarial case rather than the typical one. "~0 with fluid off-screen" IS
+   met, by the AABB. What remains is the per-sample price of `fluidFieldAt` (8
+   trilinear taps, each a block-map resolve + grid read + page-table resolve +
+   voxel read); the next levers are hoisting the per-chunk resolves out of the
+   tap loop (~82% of samples have all 8 taps in one chunk) and a finer
+   (4³-brick) occupancy than the y mask.
+6. **Particle slimming — EVALUATED, NOT DONE.** The bench does not support it.
+   Compaction moves 128 B x live particles per tick: 5.1 MB/tick at hill's
+   39,600, roughly 0.02 ms of bandwidth on a 3060 Ti against a 4.7 ms substep
+   table. The count-INDEPENDENT part of seam+settle is ~0.27 ms and is
+   per-dispatch overhead across ~21 rows, not traffic — halving the particle
+   would not move it. The substep table's own scaling solves to 7.9e-5
+   ms/particle with a 1.3 ms fixed term (from basin 15,360 -> 2.09 ms and slosh
+   ~6,000 -> 1.38 ms), i.e. the per-particle cost is the 27-node P2G/G2P atomic
+   scatter, not the fetch. Slimming is still right for CAPACITY (105 MiB
+   resident, 12 of 32 words are zeroed reserves) — it is not a frame-time lever,
+   and it forecloses WP2's FLIP option. Revisit if WP2 pushes live counts past
+   ~150 k.
+
+#### Two findings that are not WP4's to fix
+
+* **`pool`'s mass ledger reads LEAK (26,400 = 6 standing + 26,341 carried) and
+  did so before any WP4 edit** — identical numbers on the unmodified fork point.
+  It is a BENCH-BOUNDS artifact, not a sim leak: water splashes over the pool's
+  10-high wall and lands on the slab outside `LabSceneBounds`, which is the box
+  the standing count sweeps. Plainly visible in
+  `screenshot_lab_pool-settle.bmp`. Widening the scene bounds fixes the
+  accounting.
+* **`fluid-react` fails and has since the WP1 merge (c4f4ba7).** Now recorded in
+  `tests/baseline.json`, with the attribution and three corroborating board
+  notes in `tests/BASELINE.md`. Not chased here: it is seam mass accounting,
+  i.e. WP3 §6 item 5, which already names it.
+
+---
+
+### WP2 results (measured 2026-08-24, RTX 3060 Ti, 1080p offscreen)
+
+`bash scripts/run.sh ./build/Release/sandvox.exe --fluid-bench all --json
+docs/bench/wp2_fluid_bench_after.json`, on top of WP4's tree. Before = the
+WP4-after block above (same harness, WP4 tree, pre-WP2 physics).
+
+**Defaults (the .def, tuning.json and tuning.h all agree now):**
+
+| knob | old | new | why |
+|---|---|---|---|
+| fluidStiffness | 5400 | **3600** | c = √3600 = 60 vox/s = 2 cells/tick = 0.33 cells/substep at 6 substeps — honest headroom under FLUID_VMAX 0.45. 5400 → 0.41, at the edge; live 11500 → 0.60, past it |
+| fluidGravity | 98.1 | 98.1 | already real (9.81 m/s² at 0.1 m voxels) |
+| fluidEosPower | 4 | 4 | unchanged |
+| fluidCohesion | 90 | **0** | zero-tension water: EOS floor exactly p ≥ 0 |
+| fluidAttractSame | 45 | **0** | sticky-ropes term, authoring-only now |
+| fluidAttractDiff | −90 | **0** | same |
+| fluidViscosity | 1.5 | **0.1** | references run 0.02–0.1 grid units; hill A/B at 0.5 was capture-identical (53.3% both), so the look picks |
+| fluidDamping | 0 | 0 | stays 0 (rule: fix explosions with stiffness/substeps, never damping) |
+| fluidFriction | — | **0 (new)** | tangential (1−friction) in the separate BC; 0 = free-slip water, the mud/goo knob |
+
+**Solver changes** (sim_fluid.wgsl): separate BC with tangential preservation
+in `gridUpdate` (in-solid surface nodes keep face-parallel components; only
+into-solid normal motion is removed; 1-cell walls zero the axis —
+anti-tunneling); `FA_CLAMPED` counts VMAX truncations per tick (§5 item 1's
+probe). Seam: `SEAM_SETTLE8/WAKE8` → `SETTLE4/WAKE4` (threshold quantization
+0.117 → 0.0073 vox/s, monotone slider; overflow audit in the const comment).
+The predictive wall spring (§5 item 2's escalation) was NOT needed — no
+crusting in any scene screenshot. Item 5 (FLIP) was NOT needed: the failure
+mode after items 1–4 is *excess* liveliness (pools churn above settleEps
+indefinitely), not dead water.
+
+| scene | frame p50 (WP4 → WP2) | fluid substep | fluid march | clamps/tick | tick-of-settle | end state |
+|---|---|---|---|---|---|---|
+| basin | 9.36 → 9.61 | 2.09 → 2.13 | 2.88 → 3.53 | **0** | never | 633 settled, rest churns |
+| hill | 21.86 → 20.54 | 4.69 → 4.57 | 9.52 → 9.38 | **0** | never | capture 53.3%, 0 settled |
+| hill0 | 21.68 → 20.60 | 4.65 → 4.61 | 9.44 → 9.54 | **0** | never | capture 53.3% (no trapdoor: nothing freezes mid-slope at eps 0.9) |
+| faucet | 15.57 → 14.78 | 2.46 → 2.23 | 7.67 → 7.69 | **0** | n/a | 500 settled under sustained pour |
+| pool | 14.65 → 14.05 | 3.03 → 3.13 | 6.39 → 5.92 | **0** | never | 0 settled — churns at stock |
+| slosh | 11.05 → 11.32 | 1.38 → 1.56 | 4.37 → 4.34 | **0** | never | 702 settled at the calm ends |
+| pool-settle | 14.67 → 14.26 | 2.05 → 2.53 | 6.92 → 6.69 | **0** | never (18,511 of 26,400 settled) | ledger EXACT now |
+
+What the numbers and screenshots say:
+
+- **The hill flows.** The pour sheets down the ramp as a connected film and
+  the catch basin (now carved 9 deep — the old slab-level basin could hold
+  only 22,528 of the 39,600 poured eighths, capping the capture metric at 57%
+  by geometry) fills to 53.3%. No mid-slope freeze at either excite mode —
+  the user's reported failure is gone. The remaining ~47% is a quasi-static
+  terraced pond ladder on the stepped treads plus the pour deck, in slow
+  recirculation with the plunge pool: a 1200-tick probe showed capture
+  *decreasing* 53.3 → 47.9% as plunge-churn backsplash transports mass back
+  up-ramp. The 85–90% capture target therefore waits on WP3: the plunge pool
+  never calms below settleEps 0.9 at damping 0, so it keeps splashing; once
+  settle criteria let basin water become voxels, the recirculation source
+  dies. (Raising settleEps toward the churn floor was deliberately NOT done
+  here — that re-opens the mid-slope-freeze trapdoor WP3 exists to close.)
+- **CFL honesty is measured, not asserted**: FA_CLAMPED reads 0 across all
+  7 runs × 400–1200 ticks. The VMAX clamp is now a genuine safety net.
+- **Settle happens at stock for genuinely calm water** (fluid-settle gate:
+  1280/1280 eighths converted, quiet at tick 121, at PURE stock — first time
+  ever; basin/faucet/slosh films settle mid-scene) but **churning pools do
+  not**: a stock pool (eps 0.9, damping 0, sealed-ish geometry) rings
+  indefinitely. tick-of-settle (full conversion) is still −1 everywhere at
+  stock; the pool-settle run (settle trio 6.0/24/0.9 via F5) converts 70%.
+- **Mass ledger EXACT in all runs** including pool-settle — WP4's "LEAK" was
+  confirmed as the audit-bounds artifact and fixed (the sweep now looks 12
+  cells beyond the scene walls for over-the-wall splash).
+- **Cost is unchanged** (within noise) — WP2 changed the physics regime, not
+  the price; WP4's 1.5–1.9× stands.
+- **fluid-excite override shrinkage** (the §5 success signal): 7 → 3. Gone:
+  stiffness 2400, cohesion 0, attractSame 0, attractDiff 0 (all stock now).
+  Stays: settleEps 6.0 / wakeSpeed 24.0 / damping 0.9 — a sealed drained
+  chamber genuinely rings (~18 vox/s measured at eps 3/wake 12/damping 0.45,
+  which FAILED); that trio is WP3's problem, not a solver defect.
+
+---
+
 ## 10. Handoff rules for implementing agents
 
 - Board-claim per WP (`bash scripts/board.sh claim`), one worktree per WP if

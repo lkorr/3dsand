@@ -451,6 +451,16 @@ struct RenderParams {
   // On its own row: a vec3 aligns to 16 bytes and cannot start mid-row.
   poleDir    : vec3f,
   _pdn3      : f32,
+  // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ----
+  // Inclusive world-voxel AABB of everything the fluid surface march can hit.
+  // Rays that miss it skip the march entirely; rays that hit march only the
+  // [enter, exit] span. fluidLo > fluidHi on any axis = no fluid at all, which
+  // is the post-settle idle state (see the RenderParams block in world.h — the
+  // CPU-side fluidCount is monotone, so this box is what actually sleeps).
+  fluidLo    : vec3<i32>,
+  _pfb0      : i32,
+  fluidHi    : vec3<i32>,
+  _pfb1      : i32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -799,6 +809,33 @@ const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // fluidGrid by this.
 const FLUID_GW        : u32 = 8u;
 
+// ---- fluid block map: the Y-OCCUPANCY half (world.h fluidBlockMap) ---------
+// The buffer is 2 * NUM_CHUNKS words. The first half is the chunk -> block
+// index map the solver builds. The second half is one 16-bit mask per chunk:
+// bit L set means "local y level L of this chunk can carry fluid density".
+//
+// It exists because `mark` pads the block set by FLUID_MARK_PAD cells so the
+// map can be built once per tick (plan §7 item 4) — which broke the renderer's
+// only test for "is there water here", namely "does this chunk have a block".
+// A gravity-fed fluid is a THIN HORIZONTAL LAYER inside a 16-cell chunk, so a
+// per-y-level bit is both the cheapest and the best-matched summary available:
+// the march skips a whole y slab on one buffer read instead of taking ~13
+// trilinear field samples (8 taps each) to discover it is air.
+//
+// Written by fluidGridUp (node mass) and seamStainApply (settled liquid, which
+// contributes virtual mass to the isosurface), cleared by the same whole-buffer
+// Fill that clears the index half. Render-only DERIVED data: no solver kernel
+// reads it, so it is not hashed and cannot move the sim.
+fn fbmYMaskIndex(slot : u32) -> u32 { return NUM_CHUNKS + slot; }
+// The bits a source at local y level L lights up. The B-spline support is 1.5
+// cells and the trilinear tap cube adds another half, so a source at L can
+// raise the field at L-2 .. L+2.
+fn fbmYBits(ly : i32) -> u32 {
+  let lo = u32(clamp(ly - 2, 0, 15));
+  let hi = u32(clamp(ly + 2, 0, 15));
+  return ((1u << (hi - lo + 1u)) - 1u) << lo;
+}
+
 // The fluid particle, 32 words / 128 B (power-of-two stride for coalesced
 // access; world.cpp sizes the two ping-pong buffers and the fluid-det gate
 // strides by this count). Words 0..17 are the solver state the kernels touch
@@ -870,7 +907,18 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // [15]    eighths binned by settle this tick (mass audits)
 // [16]    eighths consumed by CA reactions this tick (mass audits)
 // [17]    contact stains applied this tick (parity gates, telemetry)
-// [18..31] spare
+// [18]    node-substeps the FLUID_VMAX clamp truncated this tick (gridUpdate;
+//         the CFL-honesty probe — plan §5 item 1). ~0 in steady flow, or the
+//         stiffness/substep budget is wrong. Diagnostic only, never keyed on.
+// [19..21] COMPACTION dispatch args ((live+255)/256, 1, 1) — written by the
+//         excite scan alongside FA_LIVE, staged into fluidPDispatchArgs at the
+//         head of the seam. compactCount/compactScatter used to dispatch 1024
+//         fixed workgroups (all 262,144 pool slots) whatever the population was
+//         (plan §7 item 1).
+// [22..24] CONSUME dispatch args ((compactLive+63)/64, 1, 1) — written by the
+//         compaction scan, staged before consumeApply, which used to dispatch
+//         4,096 fixed workgroups.
+// [25..31] spare
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;
@@ -882,6 +930,11 @@ const FA_LASTSLOT  : u32 = 14u;
 const FA_BINNED    : u32 = 15u;
 const FA_CONSUMED  : u32 = 16u;
 const FA_STAINED   : u32 = 17u;
+const FA_CLAMPED   : u32 = 18u;
+// Byte offsets of the two arg triples are what pass_table.def's copy rows use;
+// keep the three in step (76 = 19*4, 88 = 22*4).
+const FA_ARGS_COMPACT : u32 = 19u;
+const FA_ARGS_CONSUME : u32 = 22u;
 
 // Must match FluidSpawnOp in world.h (32 bytes). mat carries the pour's brush
 // material into the particle's attr word (stainless, fullness 1).

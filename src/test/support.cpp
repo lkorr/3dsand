@@ -109,6 +109,17 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.poleDir[0] = sky.poleDir[0];
   rp.poleDir[1] = sky.poleDir[1];
   rp.poleDir[2] = sky.poleDir[2];
+  // MPM fluid render bounds (plan §7 item 5). The AABB is what actually makes
+  // the fluid march sleep: `fluidCount` is a MONOTONE estimate that never
+  // decays, so without this a world that once held water pays a screen-wide
+  // block-map march forever. An empty box (lo > hi) is the "no fluid" signal
+  // the shader tests, and it costs one slab test per ray.
+  {
+    IVec3 flo{0, 0, 0}, fhi{-1, -1, -1};
+    world.FluidRenderBounds(tick, flo, fhi);
+    rp.fluidLo[0] = flo.x; rp.fluidLo[1] = flo.y; rp.fluidLo[2] = flo.z;
+    rp.fluidHi[0] = fhi.x; rp.fluidHi[1] = fhi.y; rp.fluidHi[2] = fhi.z;
+  }
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both
@@ -199,9 +210,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   if (spawnCount > 0)
     ctx.queue.WriteBuffer(world.spawnOps, 0, spawns.data(),
                           spawnCount * sizeof(ParticleSpawn));
-  if (fluidSpawnCount > 0)
+  if (fluidSpawnCount > 0) {
     ctx.queue.WriteBuffer(world.fluidSpawnOps, 0, fluidSpawns.data(),
                           fluidSpawnCount * sizeof(FluidSpawnOp));
+    // Render-only: a fresh pour must be visible on the frame it lands, and the
+    // block list that normally bounds the fluid march is a few ticks behind.
+    world.NoteFluidSpawnBounds(fluidSpawns.data(), fluidSpawnCount, tick);
+  }
   if (particlesActive) {
     // the write page starts each tick empty; survivors + emissions repopulate
     uint32_t zero = 0;

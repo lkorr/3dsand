@@ -23,6 +23,7 @@ namespace {
 #define PT_LOADRESET  Table::LoadReset
 #define PT_HASHONLY   Table::HashOnly
 #define PT_FARFILL    Table::FarFill
+#define PT_FLUIDMAP   Table::FluidMap
 #define PT_FLUID      Table::Fluid
 #define PT_FLUIDSEAM  Table::FluidSeam
 #define PT_FLUIDSETTLE Table::FluidSettle
@@ -73,6 +74,7 @@ namespace {
 #define PIPE_FLUID_CONSUME_APPLY   Pipe::FluidConsumeApply
 #define PIPE_FLUID_STAIN_APPLY     Pipe::FluidStainApply
 #define PIPE_FLUID_MIRROR_FOLD     Pipe::FluidMirrorFold
+#define PIPE_FLUID_CELL_CLEAR      Pipe::FluidCellClear
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect

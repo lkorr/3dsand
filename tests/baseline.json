@@ -22,5 +22,6 @@
   "spells": "pass",
   "perf": "pass",
   "page-roundtrip": "pass",
-  "daylight-boundary": "pass"
+  "daylight-boundary": "pass",
+  "fluid-react": "fail"
 }

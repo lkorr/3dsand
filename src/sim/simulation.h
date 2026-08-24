@@ -278,7 +278,7 @@ class Simulation {
       fluidCompactScatter_, fluidExciteDetect_, fluidExciteScan_,
       fluidExciteEmit_, fluidPTick_, fluidSettleJudge_, fluidSettleScan_,
       fluidSettleBin_, fluidSettleCheck_, fluidSettleCommit_, fluidSettleKill_,
-      fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_;
+      fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
       microBodyDraw_, debugBoxDraw_, fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,

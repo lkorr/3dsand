@@ -946,9 +946,37 @@ struct RenderParams {
   // close that row, and the one below closes this one.
   float poleDir[3] = {0.0f, 1.0f, 0.0f};
   float pad_dn3 = 0.0f;
+
+  // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ---------
+  // Inclusive world-VOXEL AABB of everything the fluid surface march can
+  // possibly hit this frame. A ray that misses this box skips the march
+  // wholesale (that is what makes off-screen fluid free), and a ray that hits
+  // it marches only the [enter, exit] span instead of the whole view ray.
+  //
+  // DERIVED DATA, RENDER ONLY. It is unioned from the latest SNAPSHOT's active
+  // fluid block list — which is a few ticks latent — plus the CPU-known recent
+  // spawn positions, and then dilated by kFluidRenderPadVox. The dilation is
+  // what makes the latency safe: a particle moves at most FLUID_VMAX
+  // (2.7 cells) per tick, and `fluidChunkActive` in raymarch.wgsl reaches one
+  // chunk past an active block, so the pad covers both with room to spare.
+  //
+  // EMPTY BOX CONVENTION: fluidLo > fluidHi on any axis means "no fluid
+  // anywhere" and every ray misses. That is the post-settle idle state, and it
+  // is why `pool` costs nothing once the water is voxels again — the monotone
+  // CPU fluidCount does NOT decay, so this box is the only thing that can
+  // switch the march off. Before the first snapshot arrives the box is the
+  // whole residency window (conservative — never clip real water).
+  int32_t fluidLo[3] = {0, 0, 0};
+  int32_t pad_fb0 = 0;
+  int32_t fluidHi[3] = {-1, -1, -1};
+  int32_t pad_fb1 = 0;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
+// Dilation applied to the fluid render AABB, world voxels. Two chunks: one for
+// the snapshot's readback latency (>= 5 ticks of travel at the CFL ceiling),
+// one for `fluidChunkActive`'s face-neighbour reach.
+constexpr int kFluidRenderPadVox = 2 * (int)kChunk;
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9,
 // docs/PLAN_far_field_cascades.md) ----
@@ -1314,6 +1342,18 @@ class World {
   // lined up, would have tightened against ANOTHER world's dirty flags.
   void InvalidateSnapshot() { snap_.valid = false; }
 
+  // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ------------
+  // Record this tick's CPU-known spawn cells so a fresh pour is visible on the
+  // frame it lands, rather than when the block list gets back from the GPU a
+  // few ticks later. Render-only, and NOT an input to any sim decision.
+  void NoteFluidSpawnBounds(const FluidSpawnOp* ops, uint32_t n, uint32_t tick);
+  // Inclusive world-voxel AABB of everything the fluid surface march can hit,
+  // already dilated by kFluidRenderPadVox. Returns false when there is no
+  // fluid at all (the empty-box case the renderer turns into "skip"). Before
+  // the first snapshot arrives it reports the whole residency window: never
+  // clip water the CPU cannot yet see.
+  bool FluidRenderBounds(uint32_t tick, IVec3& lo, IVec3& hi) const;
+
   // Voxel word at cell from the mirror; kind Unknown outside mirror coverage.
   //
   // `classOf` is a COLLISION class table, not simply a copy of each material's
@@ -1391,7 +1431,13 @@ class World {
   // them) — the settled side of the fluid lives in the hashed world domain.
   rhi::Buffer fluidParticles[2]; // kFluidCap FluidParticle (128 B, common.wgsl)
   rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
-  rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
+  // 2 * kNumChunks u32. [slot] = 0 inactive, else blockIdx+1. [kNumChunks +
+  // slot] = the chunk's Y-OCCUPANCY MASK: bit L set when local y level L of
+  // that chunk can carry fluid density (MPM node mass or settled liquid,
+  // dilated +-2 for the kernel's reach). Render-only derived data - the
+  // solver never reads it - and it exists because `mark` pads the block set
+  // by 3 cells, so "has a block" stopped meaning "has water in it".
+  rhi::Buffer fluidBlockMap;
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
   rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
                                  // mom xyz, species mass x3, foam — FLUID_GW)
@@ -1462,6 +1508,15 @@ class World {
   int lastSlot_ = -1;
   WorldSnapshot snap_;
   IVec3 origin_{0, 0, 0};
+
+  // Recent CPU-side fluid spawn box (render bounds only — see
+  // NoteFluidSpawnBounds). Held for kFluidSpawnBoundsTicks so a pour is
+  // visible from the frame it lands until the snapshot's block list catches
+  // up; after that the block list is the better (tighter) answer.
+  static constexpr uint32_t kFluidSpawnBoundsTicks = 12;
+  IVec3 spawnBoxLo_{0, 0, 0};
+  IVec3 spawnBoxHi_{-1, -1, -1};
+  uint32_t spawnBoxTick_ = 0;
 
   std::vector<IVec3> fetchQueue_;
   std::unordered_map<uint64_t, uint8_t> fetchQueued_;   // dedup (packed key)
