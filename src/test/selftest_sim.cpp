@@ -982,11 +982,45 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   // look knob; the gate turns it up so the drain's END STATE is reachable in
   // a bounded run.
   t.sim.fluidDamping = 0.9f;
-  // WP2 shrank this override set (the plan's success signal): stock is now
-  // CFL-honest (stiffness 3600 -> c = 0.33 cells/substep) and zero-tension
-  // (cohesion/attract 0), so the stiffness-2400 override and the three
-  // attraction/cohesion overrides this gate used to need are simply stock.
-  // The settle trio above remains: a sealed chamber genuinely rings.
+  // Pin every sim.fluid* parameter to its tuning_params.def default so the
+  // gate is hermetic — its outcome must not depend on whatever the user last
+  // dragged in the tuner. WP2 shrank the explicit override set because the
+  // new defaults were what the gate wanted, but "simply stock" meant "whatever
+  // tuning.json says", and a hot-reloaded slider change broke the gate
+  // (BASELINE.md: cohesion 32.9, attractDiff -1.08 from a tuner session).
+  // The settle/damping/exciteMode overrides above remain at the gate's own
+  // values; everything else is pinned to the .def default.
+  t.sim.fluidStiffness = 14000.0f;
+  t.sim.fluidGravity = 900.0f;
+  t.sim.fluidRestDensity = 8.0f;
+  t.sim.fluidEosPower = 4;
+  t.sim.fluidCohesion = 0.0f;
+  t.sim.fluidAttractSame = 0.0f;
+  t.sim.fluidAttractDiff = 0.0f;
+  t.sim.fluidViscosity = 0.0f;
+  t.sim.fluidFriction = 0.0f;
+  t.sim.fluidSplashRate = 4.0f;
+  t.sim.fluidSplashSpeed = 18.0f;
+  t.sim.fluidSplashMaxDensity = 0.7f;
+  t.sim.fluidSplashLife = 1.1f;
+  t.sim.fluidSplashScaleIdx = 2;
+  t.sim.fluidFoamRate = 90.0f;
+  t.sim.fluidFoamCrestRate = 120.0f;
+  t.sim.fluidTrappedMin = 1.5f;
+  t.sim.fluidTrappedMax = 11.0f;
+  t.sim.fluidCrestMin = 0.25f;
+  t.sim.fluidCrestMax = 2.0f;
+  t.sim.fluidFoamEnergyMin = 8.0f;
+  t.sim.fluidFoamEnergyMax = 260.0f;
+  t.sim.fluidFoamLife = 2.2f;
+  t.sim.fluidFoamLifeMin = 0.5f;
+  t.sim.fluidBubbleBuoyancy = 1.6f;
+  t.sim.fluidFoamDrag = 0.72f;
+  t.sim.fluidBubbleDensity = 1.05f;
+  t.sim.fluidSprayDensity = 0.42f;
+  t.sim.fluidFoamScaleIdx = 3;
+  t.sim.fluidSettleTicks = 45;
+  t.sim.fluidStainRate = 8.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   // fluidDamping is a WGSL const (folded into the kernels at compile time —
@@ -1331,11 +1365,45 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   Tuning t = CurrentTuning();
   t.dayNight.freeze = 1;
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  // Pin every sim.fluid* parameter to its tuning_params.def default so this
+  // gate is hermetic — its outcome must not depend on the user's tuning.json.
+  // The gate's own overrides (exciteMode, damping, stiffness, settleEps,
+  // wakeSpeed) are applied on top; everything else is the .def default.
   t.sim.fluidExciteMode = 1;
   t.sim.fluidDamping = 0.9f;
   t.sim.fluidStiffness = 2400.0f;
   t.sim.fluidSettleEps = 6.0f;
   t.sim.fluidWakeSpeed = 24.0f;
+  t.sim.fluidGravity = 900.0f;
+  t.sim.fluidRestDensity = 8.0f;
+  t.sim.fluidEosPower = 4;
+  t.sim.fluidCohesion = 0.0f;
+  t.sim.fluidAttractSame = 0.0f;
+  t.sim.fluidAttractDiff = 0.0f;
+  t.sim.fluidViscosity = 0.0f;
+  t.sim.fluidFriction = 0.0f;
+  t.sim.fluidSplashRate = 4.0f;
+  t.sim.fluidSplashSpeed = 18.0f;
+  t.sim.fluidSplashMaxDensity = 0.7f;
+  t.sim.fluidSplashLife = 1.1f;
+  t.sim.fluidSplashScaleIdx = 2;
+  t.sim.fluidFoamRate = 90.0f;
+  t.sim.fluidFoamCrestRate = 120.0f;
+  t.sim.fluidTrappedMin = 1.5f;
+  t.sim.fluidTrappedMax = 11.0f;
+  t.sim.fluidCrestMin = 0.25f;
+  t.sim.fluidCrestMax = 2.0f;
+  t.sim.fluidFoamEnergyMin = 8.0f;
+  t.sim.fluidFoamEnergyMax = 260.0f;
+  t.sim.fluidFoamLife = 2.2f;
+  t.sim.fluidFoamLifeMin = 0.5f;
+  t.sim.fluidBubbleBuoyancy = 1.6f;
+  t.sim.fluidFoamDrag = 0.72f;
+  t.sim.fluidBubbleDensity = 1.05f;
+  t.sim.fluidSprayDensity = 0.42f;
+  t.sim.fluidFoamScaleIdx = 3;
+  t.sim.fluidSettleTicks = 45;
+  t.sim.fluidStainRate = 8.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   sim.ReloadShaders(ctx.device);

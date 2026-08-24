@@ -13,8 +13,8 @@
 // World constants. These are the SINGLE source of truth: the matching WGSL
 // consts are generated from them by ShaderConstantPrelude() (gpu/resources.cpp)
 // and prepended ahead of common.wgsl, so shaders cannot drift from C++.
-// 512^3 residency window = 32 m per edge at 6.25 cm voxels (doubled from 256
-// on 2026-08-19: the simulated world extends +-16 m around the player). The
+// 512^3 residency window = 51.2 m per edge at 10 cm voxels (doubled from 256
+// on 2026-08-19: the simulated world extends +-25.6 m around the player). The
 // voxel buffer is kVoxelCount u32 = 512 MiB — exactly the storage limit
 // context.cpp requests; growing this again means raising those limits AND
 // accepting 8x that memory. Must stay a power of two (all window addressing

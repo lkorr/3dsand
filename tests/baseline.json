@@ -23,5 +23,5 @@
   "perf": "pass",
   "page-roundtrip": "pass",
   "daylight-boundary": "pass",
-  "fluid-react": "fail"
+  "fluid-react": "pass"
 }

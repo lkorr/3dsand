@@ -1,10 +1,10 @@
 # ROADMAP: scale — smaller voxels, bigger sim, farther horizon
 
-Status: research summary, 2026-08-22. Written for the agent that picks this up
-**after the Vulkan port completes** (see `docs/PLAN_vulkan_port.md`). Nothing
-here is committed work; it is the distilled findings of a research session
-(codebase sweep + external research) plus napkin math the user has reviewed.
-Where this contradicts DESIGN.md, DESIGN.md wins until explicitly amended.
+Status: research summary, 2026-08-22; updated 2026-08-24. The Vulkan port is
+COMPLETE (phase 7 closed at `a5359a4`; Dawn removed 2026-08-22) and the
+software page table has LANDED (`src/sim/pagetable.cpp`, `d3dcb76`). Items
+below marked DONE are verified against the codebase. Where this contradicts
+DESIGN.md, DESIGN.md wins until explicitly amended.
 
 ## 0. Ground truth this was computed from (re-verify before acting)
 
@@ -24,9 +24,11 @@ Where this contradicts DESIGN.md, DESIGN.md wins until explicitly amended.
 
 ## 1. The one architectural decision: software page table, not hardware sparse
 
-`PLAN_vulkan_port.md` phase 7 as written uses `VK_KHR_sparse_binding`.
-**Recommendation (user-reviewed, plan doc not yet amended): rewrite phase 7
-around a software page table instead.** Evidence:
+**DONE.** The software page table landed as `src/sim/pagetable.cpp` (commit
+`d3dcb76`), with the JITTER sentinel at `f65aa2a` compressing buried bulk.
+`docs/PLAN_page_table.md` is the plan of record. Adversarial descent residency
+settled at 14,697 / 32,768 slots (-55% vs dense). Evidence that informed the
+decision:
 
 - NVIDIA `vkQueueBindSparse` measured ~41 µs/page at 730 pages degrading
   superlinearly to ~390 µs/page at 9,200; known regression since driver 555.x.
@@ -288,9 +290,10 @@ events** — puts the forest fire at 5 cm back inside budget.
 
 ## 5. Open measurements (cheap, do these first)
 
-1. **Uniform-chunk histogram in `--measure`** (~20 lines): how many "fully
-   full" chunks are single-word uniform vs mixed-material/stained. The last
-   unknown in the 2048³ memory budget — sizes the page pool.
+1. **~~Uniform-chunk histogram in `--measure`~~** — **DONE**
+   (`src/measure/measure.cpp:292`, "MEASUREMENT 1b: the UNIFORMITY histogram").
+   The finding (2,115 single-material chunks vs 41 whole-word uniform) directly
+   motivated the JITTER sentinel.
 2. Occupancy re-measure at the grown window before committing (the plan
    already stages this).
 3. Cell-mask win: `--measure` before/after on a scripted active scene.
@@ -299,21 +302,23 @@ events** — puts the forest fire at 5 cm back inside budget.
 
 ## 6. Sequencing and dependencies
 
+The Vulkan port is COMPLETE (`a5359a4`, 2026-08-22) and the software page
+table has LANDED (`d3dcb76` + JITTER `f65aa2a`). Settled-tick fixes also
+landed (§3.4, `2dd5073`). The remaining work:
+
 ```
-Vulkan port phases 3–6 (in flight)
-  └─ phase 7 REWRITTEN: software page table + sentinels + pool (§1)
-       └─ grow window to 2048³ (fresh measurements, §5.1-2 first)
-            └─ kVoxelMeters 0.10 → 0.05 (the one-time retune, §2)
-independent of the port (can run in worktrees NOW):
+DONE: Vulkan port (all phases), software page table (§1), --measure histogram (§5.1),
+      settled-tick fixes (§3.4), cell-level active masks BUILT AND REVERTED (§3.1)
+
+next:
+  grow window to 2048³ (fresh measurements, §5.2 first)
+       └─ kVoxelMeters 0.10 → 0.05 (the one-time retune, §2)
+independent (can run now):
   - bulk promotion policy (§3.2) — game/phys files only
-  - --measure histogram (§5.1)
   - near-field surface detail / subdiv-16 (§4) — WGSL + tuning only
-after port phase 3b lands (simulation.cpp / pass_table free up):
-  - cell-level active masks (§3.1)  ← do this one first; biggest single win
-  - then temporal rate LOD (§3.5)
-with phase 8:
-  - async compute overlap (§3.6), settled-tick fixes (§3.4)
-far-field extension (§4): independent, any time after render path exists
+  - temporal rate LOD (§3.5)
+  - async compute overlap (§3.6)
+far-field extension (§4): independent, any time
 ```
 
 Constraints that outrank everything here, restated so no optimization erodes

@@ -197,26 +197,34 @@ The check exists because the sword spent a while lying at the character's feet
 while every other melee assertion passed — an edge that has come loose from the
 hand still moves and still carves. Do not baseline it away.
 
-## `fluid-react` — pre-existing since the WP1 fluid-lab merge (c4f4ba7)
+## `fluid-react` — FIXED 2026-08-24
 
-Recorded `"fail"` by the WP4 perf agent, 2026-08-24. It is NOT a WP4
-regression, and three independent board notes from that day say so before WP4
-started: agent-ea1608 ("post-baseline gate, MPM mass accounting, unrelated"),
-agent-fea2b6 ("still fails — pre-existing, not mine"), agent-085345 ("fluid-
-excite AND fluid-react fail identically with worldgen.wgsl reverted to HEAD ->
-pre-existing, arrived with c4f4ba7, neither is in baseline.json").
+Was `"fail"` since the WP1 fluid-lab merge (c4f4ba7). The root cause was
+exactly what the diagnosis below predicted: the gate started from
+`CurrentTuning()` (the user's live tuning.json) and only pinned five of the
+~30 `sim.fluid*` params. The user's tuner session had dragged cohesion to 32.9
+and attractDiff to -1.08, which changed the fluid physics enough to shift the
+mass consumed by reactions below the gate's threshold.
 
-The likely cause is on the record too, from the agent who landed WP1
-(agent-f65818): the WP1 branch PASSED this gate at pure `tuning_params.def`
-values, and the merge kept three of the user's tuner-session retunes
-(cohesion 32.9, attractSame 0, attractDiff −1.08) in `tuning.json`. So the gate
-is almost certainly tuning-sensitive arithmetic rather than broken plumbing —
-the failing line reports `world hash matches` and the mass it is unhappy about
-is the reaction-consumed share. That makes it WP3's problem (the seam), per
-`docs/PLAN_fluid_overhaul.md` §6 item 5, which already names it.
+**Fix:** pin every `sim.fluid*` parameter in both `GateFluidReact` and
+`GateFluidExcite` to its `tuning_params.def` default, with the gate's own
+overrides (exciteMode, damping, stiffness, settleEps, wakeSpeed) applied on
+top. This makes the gates hermetic: their outcome depends only on the .def
+values and the gate's own authored overrides, never on the user's tuning.json.
+The same fix was applied to `GateFluidExcite` which had the identical weakness.
 
-It is entered here so the suite's exit code goes back to meaning "something
-NEW broke". Flip it to `"pass"` in the commit that fixes it.
+Gate result after fix: `fluid react: PASS (739 eighths consumed by reactions,
+plants 25 -> 123, 315 standing + 1650 live + 739 consumed of 2704 placed,
+world hash matches)`.
+
+Original diagnosis for the record: Recorded `"fail"` by the WP4 perf agent,
+2026-08-24. Three independent board notes confirmed it was pre-existing (not
+WP4): agent-ea1608, agent-fea2b6, agent-085345. The WP1 agent (agent-f65818)
+reported it passed at pure `tuning_params.def` values; the merge kept three
+user retunes (cohesion 32.9, attractSame 0, attractDiff -1.08) in
+`tuning.json`. The `fluid-stain` gate has the same structural weakness
+(unpinned fluid params) but is currently passing; it should be hardened the
+same way.
 
 ## Updating
 

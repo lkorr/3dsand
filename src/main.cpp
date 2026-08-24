@@ -1406,42 +1406,95 @@ int main(int argc, char** argv) {
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
+    if (a == "--help" || a == "-h") {
+      std::printf(
+          "sandvox — 3D falling-sand voxel engine\n\n"
+          "Usage: sandvox [options]\n\n"
+          "Selftest:\n"
+          "  --selftest            Run the headless selftest suite\n"
+          "  --gate <name>         Run one selftest gate (repeatable)\n"
+          "  --list                List available selftest gates\n"
+          "  --json <path>         Write selftest results as JSON\n"
+          "  --baseline <path>     Selftest baseline file\n\n"
+          "Shot / screenshot modes:\n"
+          "  --shot                Screenshot-only look iteration\n"
+          "  --shot-fluid          MPM fluid screenshot mode\n"
+          "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
+          "  --time <0..1>         Time of day for --shot (0=midnight, 0.5=noon)\n\n"
+          "Fluid lab:\n"
+          "  --lab [scene]         Windowed fluid lab (scene: basin|hill|faucet|pool|slosh)\n"
+          "  --fluid-bench [scene] Headless fluid timing harness (scene|all)\n\n"
+          "Harness / perf:\n"
+          "  --frames <N>          Run windowed game for N frames then exit\n"
+          "  --autofly             Enable autofly camera\n"
+          "  --autofly-hard        Adversarial autofly (diagonal + descent)\n"
+          "  --autofly-surface     Surface-following autofly\n"
+          "  --autofly-park        Surface autofly that stops (sleep discriminator)\n"
+          "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n\n"
+          "Residency:\n"
+          "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
+          "Vulkan / debug:\n"
+          "  --backend vulkan      Explicitly name the Vulkan backend\n"
+          "  --vk-info             Vulkan device + shader compile check (headless)\n"
+          "  --vk-smoke            Quiet 50-tick pinned hash comparison\n"
+          "  --vk-smoke-loud       Active 120-tick hash comparison (19 probes)\n"
+          "  --vk-validation       Enable VK_LAYER_KHRONOS_validation + sync\n"
+          "  --barriers=sledgehammer  Full barrier oracle (§6.2)\n"
+          "  --barriers=precise    Precise barriers (default)\n\n"
+          "Misc:\n"
+          "  --adapter low         Select low-power (iGPU) adapter\n"
+          "  --noaudio             Disable audio\n"
+          "  --telemetry           Enable telemetry\n"
+          "  --telemetry-port <N>  Telemetry port (default 8080)\n"
+          "  --help, -h            Show this help\n");
+      return 0;
+    }
     if (a == "--selftest") selftest = true;
     // `--gate <name>` (repeatable) runs ONE gate plus whatever it declares as a
     // dependency, in seconds rather than the ~70 s full run. `--list` names
     // them. This is what makes "is this failure mine?" a cheap question — see
     // the header comment in test/selftest.h.
-    if (a == "--gate" && i + 1 < argc) {
+    else if (a == "--gate") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--gate requires a gate name\n"); return 1; }
       selftest = true;
       stOpt.only.push_back(argv[++i]);
     }
-    if (a == "--list") {
+    else if (a == "--list") {
       selftest = true;
       stOpt.list = true;
     }
-    if (a == "--json" && i + 1 < argc) stOpt.jsonPath = argv[++i];
-    if (a == "--baseline" && i + 1 < argc) stOpt.baselinePath = argv[++i];
-    if (a == "--shot") shot = true;  // screenshots only (look iteration)
-    if (a == "--shot-fluid") shotFluid = true;  // MPM water look shots
+    else if (a == "--json") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--json requires a path\n"); return 1; }
+      stOpt.jsonPath = argv[++i];
+    }
+    else if (a == "--baseline") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--baseline requires a path\n"); return 1; }
+      stOpt.baselinePath = argv[++i];
+    }
+    else if (a == "--shot") shot = true;
+    else if (a == "--shot-fluid") shotFluid = true;
     // Fluid lab modes. The scene argument is optional (it must not start
     // with '-' or it is the next flag).
-    if (a == "--lab") {
+    else if (a == "--lab") {
       labFlag = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') labSceneName = argv[++i];
     }
-    if (a == "--fluid-bench") {
+    else if (a == "--fluid-bench") {
       fluidBench = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') fluidBenchScene = argv[++i];
     }
     // `--frames N` runs the WINDOWED game for N frames, fires one F5 shader
     // reload midway, and exits cleanly — the phase-4b D3 verification harness.
-    if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
-    if (a == "--autofly") g_autofly = true;
-    if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
-    if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
+    else if (a == "--frames") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--frames requires a count\n"); return 1; }
+      g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
+    }
+    else if (a == "--autofly") g_autofly = true;
+    else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
+    else if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
     // `--autofly-park` is --autofly-surface that STOPS (see ParkProbe): the
     // sleep-vs-transient discriminator for the active-chunk count.
-    if (a == "--autofly-park") {
+    else if (a == "--autofly-park") {
       g_autofly = true;
       g_autoflySurface = true;
       g_autoflyPark = true;
@@ -1450,7 +1503,7 @@ int main(int argc, char** argv) {
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
     // TimestampQuery device feature.
-    if (a == "--measure") measure = true;
+    else if (a == "--measure") measure = true;
     // `--residency paged|dense` selects the voxel buffer's residency
     // (docs/PLAN_page_table.md §6.2). Paged is the default; dense is the
     // identity-map oracle. ONE variable with a total order of values rather
@@ -1462,50 +1515,62 @@ int main(int argc, char** argv) {
     // live differential oracle the engine has, which makes it load-bearing
     // test infrastructure rather than a fallback — never selected
     // automatically, always available (§6.3).
-    if (a == "--residency" && i + 1 < argc) {
+    else if (a == "--residency") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--residency requires paged|dense\n"); return 1; }
       const std::string v = argv[++i];
       if (v == "paged") residencyPaged = true;
       else if (v == "dense") residencyPaged = false;
       else { std::fprintf(stderr, "--residency wants paged|dense, got '%s'\n",
                           v.c_str()); return 1; }
     }
-    if (a == "--shot-mob" && i + 1 < argc) shotMob = argv[++i];
-    if (a == "--noaudio") noAudio = true;
-    if (a == "--telemetry") telemetryEnabled = true;
-    if (a == "--telemetry-port" && i + 1 < argc) telemetryPort = (uint16_t)std::atoi(argv[++i]);
+    else if (a == "--shot-mob") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--shot-mob requires a mob def\n"); return 1; }
+      shotMob = argv[++i];
+    }
+    else if (a == "--noaudio") noAudio = true;
+    else if (a == "--telemetry") telemetryEnabled = true;
+    else if (a == "--telemetry-port") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--telemetry-port requires a port number\n"); return 1; }
+      telemetryPort = (uint16_t)std::atoi(argv[++i]);
+    }
     // `--time 0..1` sets the time of day for --shot: 0 = midnight, 0.25 =
     // sunrise, 0.5 = noon, 0.75 = sunset. Lets the sky be judged at any point
     // in the cycle without waiting for it.
-    if (a == "--time" && i + 1 < argc) {
+    else if (a == "--time") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--time requires a value (0..1)\n"); return 1; }
       g_shotTimeOfDay = std::fmod(std::atof(argv[++i]), 1.0);
       if (g_shotTimeOfDay < 0.0f) g_shotTimeOfDay += 1.0f;
     }
     // `--adapter low` picks the LowPower adapter (iGPU) so the selftest hash
     // can be compared across GPU vendors (DESIGN.md §14 risk 3).
-    if (a == "--adapter" && i + 1 < argc) lowPowerAdapter = std::string(argv[++i]) == "low";
+    else if (a == "--adapter") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--adapter requires a value\n"); return 1; }
+      lowPowerAdapter = std::string(argv[++i]) == "low";
+    }
     // `--vk-info` is the Vulkan port's phase-3a exit proof (src/gpu/vk_info.cpp):
     // create a VkDevice, print the capability record phase 7 needs, compile
     // every WGSL shader to SPIR-V through Tint, build every compute pipeline,
     // zero-init and submit one fenced command buffer. Headless, and it runs no
     // sim work — the only commands submitted are the zero-init fills.
-    if (a == "--vk-info") vkInfo = true;
+    else if (a == "--vk-info") vkInfo = true;
     // `--vk-smoke` runs a quiet 50-tick world and compares its hashes against
     // the PINNED sequence (src/gpu/vk_smoke.cpp). It used to compare Dawn
     // against Vulkan; with Dawn gone the pinned values ARE the reference, so
     // the regression power the cross-backend diff provided is preserved.
-    if (a == "--vk-smoke") vkSmoke = true;
+    else if (a == "--vk-smoke") vkSmoke = true;
     // `--vk-smoke-loud` does the same over 120 ticks of an ACTIVE world,
     // reaching everything a quiet world leaves dark — the brush/cell mutation
     // kernels, the explosion mark/apply split, the whole particle chain, the
     // readback ring, and a streaming walk that forces eviction and procgen
     // refill. 19 pinned probes.
-    if (a == "--vk-smoke-loud") vkSmokeLoud = true;
+    else if (a == "--vk-smoke-loud") vkSmokeLoud = true;
     // `--backend vulkan` names the only backend explicitly, so existing
     // invocations and scripts keep working. `--backend dawn` is REFUSED with
     // an explanation rather than quietly served by Vulkan: a run reported as
     // Dawn that was Vulkan all along is worse than no run — the same principle
     // that made phase 3b refuse `--backend vulkan` before it could honour it.
-    if (a == "--backend" && i + 1 < argc) {
+    else if (a == "--backend") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--backend requires a value\n"); return 2; }
       std::string b = argv[++i];
       if (b == "vulkan") {
         backend = rhi::BackendKind::Vulkan;
@@ -1525,11 +1590,16 @@ int main(int argc, char** argv) {
     // maximally-ordered execution of the same total order. Read §6.2 before
     // trusting a green run — it is WEAK at detecting a missing barrier and
     // STRONG at exonerating the barrier graph.
-    if (a == "--barriers=sledgehammer") sledgehammer = true;
-    if (a == "--barriers=precise") sledgehammer = false;
+    else if (a == "--barriers=sledgehammer") sledgehammer = true;
+    else if (a == "--barriers=precise") sledgehammer = false;
     // Turns on VK_LAYER_KHRONOS_validation with SYNCHRONIZATION validation —
     // the primary detector for a missing barrier (§6.2's detection ladder).
-    if (a == "--vk-validation") vkValidation = true;
+    else if (a == "--vk-validation") vkValidation = true;
+    else {
+      std::fprintf(stderr, "unrecognized argument: '%s'\n"
+                           "Run with --help for usage.\n", a.c_str());
+      return 3;
+    }
   }
 
   // Fluid-lab world mode, set ONCE before anything reads terrain: gates every
