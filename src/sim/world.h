@@ -1394,7 +1394,13 @@ class World {
   // them) — the settled side of the fluid lives in the hashed world domain.
   rhi::Buffer fluidParticles[2]; // kFluidCap FluidParticle (128 B, common.wgsl)
   rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
-  rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
+  // 2 * kNumChunks u32. [slot] = 0 inactive, else blockIdx+1. [kNumChunks +
+  // slot] = the chunk's Y-OCCUPANCY MASK: bit L set when local y level L of
+  // that chunk can carry fluid density (MPM node mass or settled liquid,
+  // dilated +-2 for the kernel's reach). Render-only derived data - the
+  // solver never reads it - and it exists because `mark` pads the block set
+  // by 3 cells, so "has a block" stopped meaning "has water in it".
+  rhi::Buffer fluidBlockMap;
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
   rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
                                  // mom xyz, species mass x3, foam — FLUID_GW)

@@ -59,7 +59,11 @@
 // Solver state from the LAST substep of the PREVIOUS tick: the block map and
 // node grid. Read-only here — the wake trigger samples node mass/velocity at
 // the settled/active interface, and exciteEmit seeds wake velocities from it.
-@group(1) @binding(3) var<storage, read> fluidBlockMapR : array<u32>;
+// read_write ATOMIC rather than read: stainApply lights the settled-liquid
+// half of the Y-occupancy mask (common.wgsl fbmYMaskIndex), and 256 threads
+// of one block share a chunk's mask word. The INDEX half is still read-only
+// in this module — every `bm` below is an atomicLoad of it.
+@group(1) @binding(3) var<storage, read_write> fluidBlockMapR : array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read> fluidGridR : array<i32>;
 // The FA_* word map (common.wgsl). Counters are atomics; the scans store the
 // authoritative live count and dispatch args.
@@ -374,7 +378,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
         let n = c + d;
         let nwc = worldChunkOf(n);
         if (!chunkInWindow(nwc, T.origin)) { continue; }
-        let bm = fluidBlockMapR[chunkSlotIndex(nwc)];
+        let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(nwc)]);
         if (bm == 0u) { continue; }
         let nb = seamNodeBase(bm, n);
         if (fluidGridR[nb] < 16) { continue; }  // FLUID_MASS_MIN
@@ -674,7 +678,7 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (!fpAlive(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!inWindow(cell, T.origin)) { return; }
-  let bm = fluidBlockMapR[chunkSlotIndex(worldChunkOf(cell))];
+  let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(worldChunkOf(cell))]);
   if (bm == 0u) { return; }
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -743,7 +747,7 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   let intent = (mat << 16u) | (sAmt << 3u) | sType;
 
   // Own cell: occupancy intent for the CA.
-  let bm = fluidBlockMapR[slot];
+  let bm = atomicLoad(&fluidBlockMapR[slot]);
   if (bm != 0u) {
     let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
     let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -764,7 +768,7 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
     let nk = materials[nmat].klass;
     if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
     let nwc = worldChunkOf(n);
-    let nbm = fluidBlockMapR[chunkSlotIndex(nwc)];
+    let nbm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(nwc)]);
     if (nbm == 0u) { continue; }  // outside particle support: no block, and
                                   // no contact that matters
     let nlo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
@@ -790,7 +794,6 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
   let intent = atomicLoad(&fluidCellScratch[(block * CHUNK_VOL + localIdx) * 2u]);
   let sType = intent & 0x7u;
   let sAmt = (intent >> 3u) & 0xFu;
-  if (sType == 0u || sAmt == 0u) { return; }
   let slot = fluidBlockList[block];
   let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
                      i32(slot / (NCHUNK * NCHUNK)));
@@ -802,6 +805,17 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
   if (idx == PT_NO_WORD) { return; }
   let w = voxels[idx];
   let nmat = voxMat(w);
+  // ---- Y-occupancy mask, settled-liquid half (common.wgsl) ----------------
+  // The renderer's isosurface takes VIRTUAL MASS from settled liquid voxels so
+  // the MPM surface meets voxel water instead of ending at a cliff. Those cells
+  // carry no node mass, so gridUpdate cannot see them, and without this the
+  // march would skip the y levels a half-converted pool still holds as voxels —
+  // a seam straight through the middle of it. This pass is the one that already
+  // walks every active-block cell with the voxel word in hand.
+  if (nmat != MAT_AIR && materials[nmat].klass == CLASS_LIQUID) {
+    atomicOr(&fluidBlockMapR[fbmYMaskIndex(slot)], fbmYBits(lo.y));
+  }
+  if (sType == 0u || sAmt == 0u) { return; }
   if (nmat == MAT_AIR) { return; }
   let nk = materials[nmat].klass;
   if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return; }
@@ -1110,7 +1124,7 @@ fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
                                     i32(m / 9u));
   var bm = 0u;
   if (chunkInWindow(wc, T.origin)) {
-    bm = fluidBlockMapR[chunkSlotIndex(wc)];
+    bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(wc)]);
   }
   for (var wpos = li * 4u; wpos < li * 4u + 4u; wpos++) {
     var packed = 0u;

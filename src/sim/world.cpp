@@ -103,7 +103,10 @@ void World::Init(const rhi::Device& device) {
                                    U::Storage | U::CopySrc, "fluidParticlesB");
   fluidSpawnOps = CreateBuffer(device, kMaxFluidSpawnsPerTick * sizeof(FluidSpawnOp),
                                U::Storage | U::CopyDst, "fluidSpawnOps");
-  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+  // TWO kNumChunks arrays: [slot] = blockIdx+1, [kNumChunks + slot] = the
+  // chunk's 16-bit Y-OCCUPANCY mask (world.h). The whole-buffer Fill at the
+  // head of PT_FLUIDMAP clears both halves, which is what the mask needs.
+  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 2 * 4,
                                U::Storage | U::CopyDst, "fluidBlockMap");
   fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4,
                                 U::Storage | U::CopySrc, "fluidBlockList");

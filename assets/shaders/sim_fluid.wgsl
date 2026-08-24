@@ -619,6 +619,12 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&fluidGrid[ni + 3u], 0);
     return;
   }
+  // This node carries mass: light its y level in the chunk's Y-occupancy mask
+  // (common.wgsl). Render-only derived data; atomicOr of a constant is
+  // order-independent, and the mask is cleared by the same fill that clears the
+  // index half of the map, once per tick.
+  atomicOr(&fluidBlockMap[fbmYMaskIndex(fluidBlockList[block])],
+           fbmYBits(i32((localIdx >> 4u) & 15u)));
   var v : vec3<i32>;
   for (var a = 0u; a < 3u; a++) {
     let mom = atomicLoad(&fluidGrid[ni + 1u + a]);

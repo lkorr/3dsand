@@ -4558,9 +4558,26 @@ const FLUID_SEAM_SHELL : i32 = 2;
 // step through a whole 16-cell chunk of air for a surface that can only reach
 // 2 cells into it. Over open scenes that ring is most of the marched volume:
 // a camera looking along a poured sheet crosses several ring chunks per ray.
+// Does this chunk hold anything the isosurface can be built from? A block
+// allocation is NOT the same question: `mark` pads the block set by
+// FLUID_MARK_PAD cells so the map can be built once per tick, so an allocated
+// block is routinely all air. The Y-occupancy mask (common.wgsl) is the answer,
+// and a zero mask means the block is empty.
+fn fluidChunkWater(wc : vec3<i32>) -> bool {
+  if (!chunkInWindow(wc, R.origin)) { return false; }
+  let slot = chunkSlotIndex(wc);
+  return fluidBlockMapR[slot] != 0u &&
+         fluidBlockMapR[fbmYMaskIndex(slot)] != 0u;
+}
+
+fn fluidYMaskOf(wc : vec3<i32>) -> u32 {
+  if (!chunkInWindow(wc, R.origin)) { return 0u; }
+  return fluidBlockMapR[fbmYMaskIndex(chunkSlotIndex(wc))];
+}
+
 fn fluidChunkClass(wc : vec3<i32>) -> u32 {
   if (!chunkInWindow(wc, R.origin)) { return 0u; }
-  if (fluidBlockMapR[chunkSlotIndex(wc)] != 0u) { return 1u; }
+  if (fluidChunkWater(wc)) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
   // fluidMassAt still returns non-zero density there (virtual mass from
   // voxel fullness).  If a face-neighbor IS active, the isosurface may
@@ -4569,11 +4586,20 @@ fn fluidChunkClass(wc : vec3<i32>) -> u32 {
     for (var s = -1; s <= 1; s += 2) {
       var nc = wc;
       nc[a] += s;
-      if (chunkInWindow(nc, R.origin)
-          && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return 2u; }
+      if (fluidChunkWater(nc)) { return 2u; }
     }
   }
   return 0u;
+}
+
+// t at which the ray leaves the 1-cell Y SLAB it is in. The fluid is
+// gravity-fed, so it lives in a thin horizontal layer inside a 16-cell chunk:
+// a y level with no bit in the mask is empty ACROSS THE WHOLE CHUNK, and a
+// near-horizontal ray can cross the entire chunk on one buffer read instead of
+// ~13 trilinear field samples (8 taps each) discovering it is air.
+fn fluidYExit(ro : vec3f, inv : vec3f, py : f32) -> f32 {
+  let plane = select(floor(py), floor(py) + 1.0, inv.y > 0.0);
+  return (plane - ro.y) * inv.y;
 }
 
 // Is cell c inside the seam shell — within FLUID_SEAM_SHELL cells of a face
@@ -4586,14 +4612,12 @@ fn fluidSeamShell(c : vec3<i32>) -> bool {
     if (lo[a] < FLUID_SEAM_SHELL) {
       var nc = wc;
       nc[a] -= 1;
-      if (chunkInWindow(nc, R.origin)
-          && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return true; }
+      if (fluidChunkWater(nc)) { return true; }
     }
     if (lo[a] >= i32(CHUNK) - FLUID_SEAM_SHELL) {
       var nc = wc;
       nc[a] += 1;
-      if (chunkInWindow(nc, R.origin)
-          && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return true; }
+      if (fluidChunkWater(nc)) { return true; }
     }
   }
   return false;
@@ -4606,7 +4630,10 @@ fn fluidSeamShell(c : vec3<i32>) -> bool {
 fn fluidCellMarched(c : vec3<i32>) -> bool {
   let wc = worldChunkOf(c);
   if (!chunkInWindow(wc, R.origin)) { return false; }
-  if (fluidBlockMapR[chunkSlotIndex(wc)] != 0u) { return true; }
+  if (fluidChunkWater(wc) &&
+      (fluidYMaskOf(wc) & (1u << u32(c.y & i32(CHUNK_MASK)))) != 0u) {
+    return true;
+  }
   return fluidSeamShell(c);
 }
 
@@ -4691,6 +4718,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     // about 13 times per chunk for an answer that could not have changed.
     var heldSlot : u32 = 0xFFFFFFFFu;
     var heldClass : u32 = 0u;
+    var heldYMask : u32 = 0u;
     // Step budget = worst case fine-marching straight down a full window
     // diagonal of solid fluid; the chunk skip means open scenes never get
     // close. A budget miss renders no surface for one frame of one pixel —
@@ -4699,14 +4727,27 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
-      let slot = chunkSlotIndex(worldChunkOf(c));
+      let wc = worldChunkOf(c);
+      let slot = chunkSlotIndex(wc);
       if (slot != heldSlot) {
         heldSlot = slot;
-        heldClass = fluidChunkClass(worldChunkOf(c));
+        heldClass = fluidChunkClass(wc);
+        heldYMask = fluidYMaskOf(wc);
       }
       if (heldClass == 0u) {
         tPrev = t;
         t = fluidChunkExit(ro, inv, c, t);
+        continue;
+      }
+      if (heldClass == 1u &&
+          (heldYMask & (1u << u32(c.y & i32(CHUNK_MASK)))) == 0u) {
+        // Empty y slab: skip to the next y level, or to the chunk exit for a
+        // near-horizontal ray (the mask is per-chunk, so it stops being an
+        // answer at the boundary). This is the fine-grained empty-space skip a
+        // 16-cell chunk classification cannot give.
+        tPrev = t;
+        t = max(min(fluidYExit(ro, inv, p.y),
+                    fluidChunkExit(ro, inv, c, t)), t + 0.25);
         continue;
       }
       if (heldClass == 2u && !fluidSeamShell(c)) {

@@ -188,7 +188,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(0, T::ReadOnlyStorage),  // fluidParticles[page] (compact src)
         entry(1, T::Storage),          // fluidParticles[1-page] (working)
         entry(2, T::ReadOnlyStorage),  // fluidSpawnOps
-        entry(3, T::ReadOnlyStorage),  // fluidBlockMap (last substep's)
+        entry(3, T::Storage),          // fluidBlockMap (last substep's index
+                                       // half, read; stainApply writes the
+                                       // Y-occupancy half)
         entry(4, T::ReadOnlyStorage),  // fluidGrid (last substep's)
         entry(5, T::Storage),          // fluidArgsStage (FA_* words, atomic)
         entry(6, T::Storage),          // dirtyList (read; shared entry is RW)

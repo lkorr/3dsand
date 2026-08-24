@@ -480,10 +480,14 @@ PASS(fluidP2g2, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G2, K_INDIRECT, IND_FLU
 // the world hash out of this system's blast radius.
 // read-only in practice: `fluidBlockList` is read_write for the module because
 // alloc writes it; the grid update only reads its block's chunk slot.
+// A(FluidBlockMap) is the Y-OCCUPANCY half (common.wgsl): a node that carries
+// mass lights its y level so the RENDERER can skip empty y slabs. Render-only
+// derived data, but the hazard is real — the next substep's p2g reads the index
+// half of the same buffer, and the renderer reads the mask half.
 PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
-          RW(FluidGrid) I(FluidDispatchArgs)))
+          RW(FluidGrid) A(FluidBlockMap) I(FluidDispatchArgs)))
 // Pure gather for the fluid itself: each thread writes only its own particle,
 // so g2p cannot race itself (the mark/apply split rule does not bite here).
 // The splash coupling adds two writes: fast free-surface particles append
@@ -553,6 +557,9 @@ PASS(seam_spawn, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_SPAWN, K_COMPUTE, D_FLUID
 // its args are staged here rather than with the compaction pair above.
 PASS(copy_fluidConsumeArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 88,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TR(FluidArgsStage) TW(FluidPDispatchArgs)))
+// read-only in practice on FluidBlockMap: the module declares it read_write
+// because stainApply lights the Y-occupancy mask; consumeApply only reads the
+// INDEX half to address the cell the CA flagged.
 // Reactions that took excited fluid this tick (the CA's consume flags): the
 // whole cell bin dies before the substeps run. Addressed via LAST substep's
 // block map, exactly the addressing the CA used to set the flags.
@@ -560,6 +567,8 @@ PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_
      USES(U(TickUBO) RW(FluidParticlesWrite) R(FluidBlockMap)
           A(FluidCellScratch) A(FluidArgsStage) A(FluidExciteScratch)
           I(FluidPDispatchArgs)))
+// read-only in practice on FluidBlockMap: read_write for the module (stainApply
+// writes the Y-occupancy mask); the wake probe only reads the index half.
 // C_CAACTIVE: detect runs over THIS tick's compacted dirty list; when the CA
 // proved the world settled the list was not rebuilt and there is nothing
 // disturbed to excite.
@@ -611,10 +620,15 @@ PASS(seam_particle_tick, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_PTICK, K_INDI
 // the LAST substep), applying the intents particleTick just scattered —
 // solid surfaces touched by excited fluid take its stain, the CA's
 // doStaining semantics on the particle side.
+// A(FluidBlockMap): the settled-liquid half of the Y-occupancy mask. This is
+// the one pass that already walks every active-block cell with the voxel word
+// in hand, and settled liquid contributes virtual mass to the isosurface, so
+// without it the march would skip the y levels a half-converted pool holds as
+// voxels.
 PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_INDIRECT, IND_FLUIDARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
-          I(FluidDispatchArgs)))
+          A(FluidBlockMap) I(FluidDispatchArgs)))
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidSettleScratch) A(FluidCalm)))
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
@@ -639,6 +653,8 @@ PASS(seam_settle_commit, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_COMMIT
 PASS(seam_settle_kill, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_KILL, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) A(FluidSettleScratch)
           A(FluidArgsStage) I(FluidPDispatchArgs)))
+// read-only in practice on FluidBlockMap: read_write for the module (stainApply
+// writes the Y-occupancy mask); the fold only reads the index half.
 // The swimming fold: excited-fluid eighths for the 27 CPU-mirror chunks,
 // packed for the snapshot readback (plan §6.5). Last so it reads the tick's
 // final node mass.

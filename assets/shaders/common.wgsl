@@ -809,6 +809,33 @@ const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // fluidGrid by this.
 const FLUID_GW        : u32 = 8u;
 
+// ---- fluid block map: the Y-OCCUPANCY half (world.h fluidBlockMap) ---------
+// The buffer is 2 * NUM_CHUNKS words. The first half is the chunk -> block
+// index map the solver builds. The second half is one 16-bit mask per chunk:
+// bit L set means "local y level L of this chunk can carry fluid density".
+//
+// It exists because `mark` pads the block set by FLUID_MARK_PAD cells so the
+// map can be built once per tick (plan §7 item 4) — which broke the renderer's
+// only test for "is there water here", namely "does this chunk have a block".
+// A gravity-fed fluid is a THIN HORIZONTAL LAYER inside a 16-cell chunk, so a
+// per-y-level bit is both the cheapest and the best-matched summary available:
+// the march skips a whole y slab on one buffer read instead of taking ~13
+// trilinear field samples (8 taps each) to discover it is air.
+//
+// Written by fluidGridUp (node mass) and seamStainApply (settled liquid, which
+// contributes virtual mass to the isosurface), cleared by the same whole-buffer
+// Fill that clears the index half. Render-only DERIVED data: no solver kernel
+// reads it, so it is not hashed and cannot move the sim.
+fn fbmYMaskIndex(slot : u32) -> u32 { return NUM_CHUNKS + slot; }
+// The bits a source at local y level L lights up. The B-spline support is 1.5
+// cells and the trilinear tap cube adds another half, so a source at L can
+// raise the field at L-2 .. L+2.
+fn fbmYBits(ly : i32) -> u32 {
+  let lo = u32(clamp(ly - 2, 0, 15));
+  let hi = u32(clamp(ly + 2, 0, 15));
+  return ((1u << (hi - lo + 1u)) - 1u) << lo;
+}
+
 // The fluid particle, 32 words / 128 B (power-of-two stride for coalesced
 // access; world.cpp sizes the two ping-pong buffers and the fluid-det gate
 // strides by this count). Words 0..17 are the solver state the kernels touch
