@@ -33,6 +33,17 @@ constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 32768
 constexpr uint32_t kChunkVol = kChunk * kChunk * kChunk;      // 4096
 constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
 
+// ---- the fluid lab's flat-slab worldgen mode (docs/PLAN_fluid_overhaul.md §4)
+// The `--lab` / `--fluid-bench` test world: solid stone for y <= kLabSlabY,
+// air above, no biomes/trees/caves/ponds/POIs/flora. It is a MODE TAP through
+// the normal worldgen path (TickParams.labMode guards genColumn in
+// worldgen.wgsl), not a fork of genChunk. This constant is the ground height
+// World::TerrainHeight returns in lab mode and the LAB_SLAB_Y the shader
+// prelude emits — one value, two consumers, or the player falls through the
+// slab they can see. Never set on any selftest/smoke path: the pinned world
+// hash 7cfa2420 is a labMode=0 fact.
+constexpr int32_t kLabSlabY = 127;
+
 // Material IDs (fixed by materials.json order — append there, never reorder).
 constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatGravel = 4, kMatWater = 5, kMatOil = 6, kMatSmoke = 7,
@@ -745,7 +756,12 @@ struct TickParams {
   // swimming sees particles the way it sees fullness voxels. vec3<i32> + pad
   // on the WGSL side.
   int32_t mirrorBase[3] = {0, 0, 0};
-  uint32_t padMb = 0;
+  // Fluid-lab worldgen mode (kLabSlabY above): 1 = genColumn generates the
+  // flat slab, 0 = normal terrain. Rides the tick input stream like dayPhase
+  // so every worldgen consumer (full gen, streamed genList, far cascades)
+  // sees one flag. Always 0 outside --lab/--fluid-bench; was the padMb pad
+  // word, so the layout (and the labMode=0 hash) is unchanged.
+  uint32_t labMode = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -1275,6 +1291,13 @@ class World {
 
   // Deterministic worldgen height — exact CPU mirror of worldgen.wgsl.
   static int TerrainHeight(int x, int z, uint32_t seed);
+
+  // Fluid-lab worldgen mode (kLabSlabY block above). A process-wide static
+  // because TerrainHeight is static and the flag must gate BOTH the CPU
+  // mirror and every TickParams.labMode write from one truth. Set exactly
+  // once, at startup, by --lab / --fluid-bench; nothing else may touch it.
+  static void SetLabWorld(bool on);
+  static bool LabWorld();
 
   rhi::Buffer voxels;      // the PHYSICAL PAGE POOL: PoolPages() * kChunkVol
                             // u32. Under --residency dense this is kNumChunks

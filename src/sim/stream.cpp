@@ -661,6 +661,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     tp.genCount = (uint32_t)genSlots.size();
     IVec3 o = world_->WindowOrigin();
     tp.origin[0] = o.x; tp.origin[1] = o.y; tp.origin[2] = o.z;
+    // Fluid-lab slab (world.h kLabSlabY): a lab window shift must refill with
+    // the SAME slab genColumn produced at startup, not default terrain.
+    tp.labMode = World::LabWorld() ? 1u : 0u;
     ctx_->queue.WriteBuffer(world_->tickUBO, 0, &tp, sizeof(tp));
 
     // ---- DEBUG-ONLY fence decomposition (SANDVOX_PT_DEBUG) ---------------

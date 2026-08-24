@@ -158,6 +158,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   tp.fluidExciteEnable =
       CurrentTuning().sim.fluidExciteMode != 0 ? 1u : 0u;
   tp.fluidSpawnCount = fluidSpawnCount;
+  // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except
+  // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList
+  // refills and far-cascade fills that ride this tick see the same world.
+  tp.labMode = World::LabWorld() ? 1u : 0u;
   if (fluidSplashMat) {
     for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
   }
@@ -524,6 +528,7 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   TickParams tp{0, seed, 0, 0};
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
+  tp.labMode = World::LabWorld() ? 1u : 0u;  // fluid-lab slab (world.h)
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (world.residency != World::Residency::Paged) {
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
@@ -576,6 +581,7 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       gp.seed = seed;
       gp.genCount = (uint32_t)batch.size();
       gp.origin[0] = wo.x; gp.origin[1] = wo.y; gp.origin[2] = wo.z;
+      gp.labMode = World::LabWorld() ? 1u : 0u;  // fluid-lab slab (world.h)
       ctx.queue.WriteBuffer(world.tickUBO, 0, &gp, sizeof(gp));
       rhi::CommandEncoder ge = ctx.device.CreateCommandEncoder();
       sim.EncodeGenList(ge, (uint32_t)batch.size());

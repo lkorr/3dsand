@@ -72,6 +72,11 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
 
+# Fluid-lab flat-slab height (world.h kLabSlabY -> prelude LAB_SLAB_Y).
+W_LABY="$(cpp_const kLabSlabY)"
+[ -n "$W_LABY" ] || {
+  echo "check_shaders: cannot parse kLabSlabY from $WORLD_H" >&2; exit 1; }
+
 # Software page table (docs/PLAN_page_table.md §2.2). Same rule as every other
 # world constant: world.h is the source, this script scrapes it. PT_EMPTY is
 # PT_SENTINEL_BIT | kMatAir and kMatAir is 0, so it needs no separate scrape —
@@ -143,6 +148,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_MASK : i32 = $((W_N - 1));" \
   "const NCHUNK_MASK : i32 = $((W_NCHUNK - 1));" \
   "const CELLOP_IF_AIR : u32 = ${W_IFAIR}u;" \
+  "const LAB_SLAB_Y : i32 = ${W_LABY};" \
   "const PT_SENTINEL_BIT : u32 = ${W_PTSENT}u;" \
   "const PT_JITTER_BIT : u32 = ${W_PTJIT}u;" \
   "const PT_MAT_MASK : u32 = ${W_PTMAT}u;" \
