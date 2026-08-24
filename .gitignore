@@ -19,6 +19,11 @@ screenshot_*.bmp
 screenshot_*.png
 .look/
 
+# Vulkan pipeline cache (driver ISA, regenerated on first run)
+sandvox_pipeline_cache.bin
+# Tint SPIR-V disk cache (regenerated on first run or shader change)
+shader_cache/
+
 # python bytecode + packaged tuner (rebuild: python scripts/build_tuner_exe.py)
 __pycache__/
 sandvox_tuner.exe
