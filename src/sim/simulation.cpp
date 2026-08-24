@@ -1127,6 +1127,12 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
       fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);
   if (seamActive) {
     RecordTable(enc, pass::Table::FluidSeam, &cx);
+    // The chunk->block map is built ONCE here, not once per substep: max
+    // displacement is 2.7 cells/tick against `mark`'s 3-cell pad, so the map a
+    // substep would have rebuilt is the map it already has (plan §7 item 4,
+    // and the PT_FLUIDMAP block in pass_table.def). Recorded after the seam
+    // because exciteEmit and spawnAppend create particles it must cover.
+    RecordTable(enc, pass::Table::FluidMap, &cx);
     for (uint32_t s = 0; s < kFluidSubsteps; s++)
       RecordTable(enc, pass::Table::Fluid, &cx);
     RecordTable(enc, pass::Table::FluidSettle, &cx);

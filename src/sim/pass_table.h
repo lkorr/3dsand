@@ -221,7 +221,7 @@ enum class Cond : uint8_t {
 // (grid WAW against the next clear, particle RAW into the next mark) are
 // generated exactly like intra-table ones.
 enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill,
-                             Fluid, FluidSeam, FluidSettle, PageFill };
+                             FluidMap, Fluid, FluidSeam, FluidSettle, PageFill };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put

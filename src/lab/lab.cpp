@@ -473,7 +473,12 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         for (const PassTimer::Stat& s : timer.Stats()) {
           const uint64_t d = s.totalNs - prevNs[s.name];
           prevNs[s.name] = s.totalNs;
-          passMs[s.name].push_back((double)d * 1e-6);
+          // A label only enters Stats() the first tick its pass is recorded, so
+          // without this pad its series is SHIFTED against the tick index and
+          // the per-tick views (the idle-cost median) read the wrong ticks.
+          std::vector<double>& v = passMs[s.name];
+          v.resize((size_t)st - 1, 0.0);
+          v.push_back((double)d * 1e-6);
         }
       }
       uint32_t fa[16] = {};

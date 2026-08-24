@@ -282,9 +282,22 @@ fn fluidSolid(c : vec3<i32>) -> bool {
 // excite creating them on the GPU, no CPU-known base exists any more.
 fn liveTotal() -> u32 { return min(fluidArgs[FA_LIVE], FLUID_CAP); }
 
-// ---- mark: flag every chunk the particle's 3^3 node support touches ---------
+// ---- mark: flag every chunk the particle's node support can touch THIS TICK -
 // atomicOr of a constant is order-independent; the map is cleared by a Fill
-// row at the top of every substep.
+// row at the top of PT_FLUIDMAP, which runs ONCE per tick.
+//
+// THE PAD. The map used to be rebuilt before every substep, so marking the
+// instantaneous 3-cell node support was exact. Building it once per tick
+// (plan §7 item 4) means it must also cover where the particle will BE by the
+// last substep. Displacement is bounded by the CFL clamp: g2p advects
+// v / FLUID_SUBSTEPS per substep with |v| <= FLUID_VMAX (0.45 cell/substep x 6),
+// so a particle moves at most FLUID_VMAX = 2.7 cells over the whole tick,
+// whatever the pressure field does to it in between. 3 cells covers that.
+//
+// The padded span is [base-3, base+5] = 9 cells, and 9 <= CHUNK, so it still
+// touches at most 2 chunks per axis and the 8-corner loop is still exhaustive.
+const FLUID_MARK_PAD : i32 = 3;
+
 @compute @workgroup_size(64)
 fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
@@ -292,12 +305,15 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!inWindow(cell, T.origin)) { return; }  // frozen out-of-window
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
-  let lo = vec3<i32>(ax.base, ay.base, az.base);
-  // Node support spans cells [base, base+2]: at most 2 chunks per axis.
+  let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
+  let hi = vec3<i32>(ax.base, ay.base, az.base) +
+           vec3<i32>(2 + FLUID_MARK_PAD);
   for (var k = 0; k < 2; k++) {
     for (var j = 0; j < 2; j++) {
       for (var i = 0; i < 2; i++) {
-        let corner = lo + vec3<i32>(i * 2, j * 2, k * 2);
+        let corner = vec3<i32>(select(lo.x, hi.x, i == 1),
+                               select(lo.y, hi.y, j == 1),
+                               select(lo.z, hi.z, k == 1));
         let wc = worldChunkOf(corner);
         if (chunkInWindow(wc, T.origin)) {
           atomicOr(&fluidBlockMap[chunkSlotIndex(wc)], 1u);

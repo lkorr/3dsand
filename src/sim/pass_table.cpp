@@ -23,6 +23,7 @@ namespace {
 #define PT_LOADRESET  Table::LoadReset
 #define PT_HASHONLY   Table::HashOnly
 #define PT_FARFILL    Table::FarFill
+#define PT_FLUIDMAP   Table::FluidMap
 #define PT_FLUID      Table::Fluid
 #define PT_FLUIDSEAM  Table::FluidSeam
 #define PT_FLUIDSETTLE Table::FluidSettle

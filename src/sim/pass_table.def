@@ -408,26 +408,48 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
 // conditions: every row is C_ALWAYS within the table, and whether the table
 // is recorded at all is a pure function of the CPU-owned particle count.
 //
-// The scratch grid is rebuilt from scratch every substep: fill zeroes the
-// chunk->block map, mark flags chunks under particle support (atomicOr — the
-// final map state is order-independent), alloc assigns block indices by a
-// single-workgroup scan in slot order (deterministic) and emits the node-pass
-// dispatch args, clear zeroes exactly the active blocks' accumulators.
-PASS(fluid_fill_blockMap, nullptr, PT_FLUID, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+// The node ACCUMULATORS are rebuilt every substep (fluidClear below). The
+// chunk->block MAP is not: it is built ONCE per tick, by PT_FLUIDMAP.
+//
+// ===================================================== PT_FLUIDMAP ========
+// The chunk -> node-block map, built ONCE PER TICK between the seam's front
+// half and the first substep (plan §7 item 4). fill zeroes the map, mark flags
+// chunks under particle support (atomicOr — the final map state is
+// order-independent), alloc assigns block indices by a single-workgroup scan in
+// slot order (deterministic) and emits the node-pass dispatch args.
+//
+// WHY ONCE IS ENOUGH, and what pays for it: a particle's velocity is CFL-capped
+// at FLUID_VMAX = 0.45 cell/substep, so it travels at most 2.7 cells in a whole
+// tick. `mark` pads its support by FLUID_MARK_PAD = 3 cells in every direction,
+// which covers that with room to spare, so a particle can never reach a chunk
+// this map does not already cover. (A particle whose chunk has no block simply
+// freezes for the substep — deterministic, mass-preserving, and the same
+// bounded degradation the kFluidBlocks budget already accepts — so the pad is
+// belt AND braces, not the only guard.)
+//
+// It must run AFTER the seam: exciteEmit and spawnAppend both create particles,
+// and the map has to cover them. It must run BEFORE the substeps for the
+// obvious reason. And the seam's FRONT half deliberately reads the map from
+// LAST tick (consumeApply addresses the CA's flags exactly as the CA wrote
+// them), which is why this is a table of its own rather than rows appended to
+// the seam.
+PASS(fluid_fill_blockMap, nullptr, PT_FLUIDMAP, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(FluidBlockMap)))
 // read-only in practice: `fluidParticles` is read_write for the module because
 // g2p writes it. mark only reads positions to flag chunks. The per-particle
 // extent is GPU-owned now (fluidArgs[FA_LIVE], the seam's count), so mark and
 // every other per-particle pass dispatches indirectly off fluidPDispatchArgs,
 // and each kernel re-bounds itself on the live count it reads from fluidArgs.
-PASS(fluidMark, "fluid(substep)", PT_FLUID, PIPE_FLUID_MARK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+PASS(fluidMark, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_MARK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticlesWrite) A(FluidBlockMap) R(FluidArgsStage) I(FluidPDispatchArgs)))
-PASS(fluidAlloc, "fluid(substep)", PT_FLUID, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
+PASS(fluidAlloc, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(RW(FluidBlockMap) W(FluidBlockList) W(FluidArgsStage)))
 // Same staging-copy shape as argsStage -> dispatchArgs: the indirect-only
 // buffer is never bound in any bind group.
-PASS(copy_fluidArgs, nullptr, PT_FLUID, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+PASS(copy_fluidArgs, nullptr, PT_FLUIDMAP, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TR(FluidArgsStage) TW(FluidDispatchArgs)))
+
+// =========================================================== PT_FLUID =====
 PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(W(FluidGrid) I(FluidDispatchArgs)))
