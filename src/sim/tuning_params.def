@@ -98,6 +98,8 @@ TP_F(render, starSparsity, TUNE_STAR_SPARSITY, 0.012f)
 TP_F(render, starTwinkle, TUNE_STAR_TWINKLE, 0.35f)
 TP_F(render, milkyWayStrength, TUNE_MILKYWAY_STRENGTH, 0.55f)
 TP_V3(render, milkyWayColor, TUNE_MILKYWAY_COLOR, 0.52f, 0.56f, 0.78f)
+TP_V3(render, galaxyNormal, TUNE_GALAXY_NORMAL, 0.36f, 0.52f, -0.77f)
+TP_F(render, galaxyWidth, TUNE_GALAXY_WIDTH, 0.17f)
 TP_F(render, nebulaStrength, TUNE_NEBULA_STRENGTH, 0.4f)
 TP_V3(render, nebulaCool, TUNE_NEBULA_COOL, 0.16f, 0.3f, 0.62f)
 TP_V3(render, nebulaWarm, TUNE_NEBULA_WARM, 0.55f, 0.2f, 0.38f)
@@ -106,14 +108,36 @@ TP_F(render, auroraHeight, TUNE_AURORA_HEIGHT, 900.0f)
 TP_V3(render, auroraLow, TUNE_AURORA_LOW, 0.1f, 0.85f, 0.45f)
 TP_V3(render, auroraHigh, TUNE_AURORA_HIGH, 0.65f, 0.2f, 0.85f)
 
-// ---- moon ----
-TP_F(render, moonRadius, TUNE_MOON_RADIUS, 0.03f)
+// ---- moons ----
+// NOTE there is no moon RADIUS here any more. Apparent size is now an output
+// of the orbit (dayNight.moonAngularRadius modulated by orbital distance,
+// arriving as R.moonAngRadius), because the eclipse test and the disc must
+// read ONE number for how big a moon is. A render-side radius knob would be a
+// second, diverging answer to that question.
 TP_F(render, moonBrightness, TUNE_MOON_BRIGHTNESS, 1.6f)
 TP_V3(render, moonColor, TUNE_MOON_COLOR, 0.92f, 0.93f, 0.88f)
+TP_V3(render, moonMariaSeed, TUNE_MOON_MARIA_SEED, 4.0f, 1.0f, 9.0f)
 TP_F(render, moonGlow, TUNE_MOON_GLOW, 0.35f)
 TP_F(render, moonEarthshine, TUNE_MOON_EARTHSHINE, 0.055f)
 TP_V3(render, moonLightColor, TUNE_MOON_LIGHT_COLOR, 0.55f, 0.68f, 1.0f)
 TP_F(render, moonLightIntensity, TUNE_MOON_LIGHT_INTENSITY, 0.16f)
+// Moon B: a smaller, colder, dimmer body. Only look lives here; where it is
+// and how big it appears come from its orbit.
+TP_V3(render, moon2Color, TUNE_MOON2_COLOR, 0.78f, 0.80f, 0.86f)
+TP_V3(render, moon2MariaSeed, TUNE_MOON2_MARIA_SEED, -21.0f, 13.0f, 37.0f)
+TP_F(render, moon2Brightness, TUNE_MOON2_BRIGHTNESS, 0.72f)
+TP_F(render, moon2LightIntensity, TUNE_MOON2_LIGHT_INTENSITY, 0.055f)
+TP_V3(render, moon2LightColor, TUNE_MOON2_LIGHT_COLOR, 0.62f, 0.62f, 0.86f)
+// How dark a TOTAL solar eclipse gets. 1 = full totality (the dome falls to
+// its night value); lower keeps some daylight so a total eclipse still reads
+// as daytime-gone-wrong rather than as night.
+TP_F(render, eclipseDarkness, TUNE_ECLIPSE_DARKNESS, 0.93f)
+// The perceptual falloff of that darkening against covered AREA. 3 (the old
+// hardcoded cube) keeps the world bright until the last sliver of sun goes,
+// which is how a real partial eclipse reads; 1 tracks the covered area
+// linearly and looks like an exposure slide. Mirrored in common.wgsl's
+// eclipseDayWeightP and raymarch.wgsl's eclipseDim — they MUST agree.
+TP_F(render, eclipseCurve, TUNE_ECLIPSE_CURVE, 3.0f)
 
 // ---- night ambient ----
 TP_V3(render, nightAmbSky, TUNE_NIGHT_AMB_SKY, 0.055f, 0.075f, 0.135f)
@@ -405,6 +429,18 @@ TP_F(sim, fluidFoamDrag, TUNE_FLUID_FOAM_DRAG, 0.72f)
 TP_F(sim, fluidBubbleDensity, TUNE_FLUID_BUBBLE_RHO, 1.05f)
 TP_F(sim, fluidSprayDensity, TUNE_FLUID_SPRAY_RHO, 0.42f)
 TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
+// ---- MLS-MPM settle / excite seam ----
+// The CA <-> particle handover. Units: settle/wake speeds vox/s, settle
+// window in ticks, stain rate chances/s. exciteMode is a switch: 0 = the CA
+// owns disturbed settled liquid (Phase-2 default, keeps the pinned world
+// hash), 1 = settled liquid with air below converts to MPM particles.
+// wakeSpeed defaults to 4x settleEps — that gap is the hysteresis that stops
+// blocks flickering between the two states.
+TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 0)
+TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 0.9f)
+TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 3.6f)
+TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 45)
+TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)

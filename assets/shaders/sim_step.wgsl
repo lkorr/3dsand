@@ -18,6 +18,17 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(5) var<uniform> P : PassParams;
 @group(0) @binding(11) var<storage, read>      reactions : array<Reaction>;
+// ---- MLS-MPM excited-fluid coupling (sim_fluid_seam.wgsl; DESIGN.md §5) ----
+// The solver's block map + node grid (LAST tick's final substep) and the
+// seam's per-cell intent/flags scratch. Read here so authored PAIR rules see
+// excited liquid as a real neighbour (fluidOccMat below); the one write is
+// the consume flag when such a rule fires. A world with no fluid has an
+// all-zero block map and none of this costs more than one load per air
+// neighbour of a reacting cell — and the pinned hash is the gate on "no
+// fluid means no behaviour change".
+@group(0) @binding(20) var<storage, read> fluidBlockMapS : array<u32>;
+@group(0) @binding(21) var<storage, read> fluidGridS : array<i32>;
+@group(0) @binding(22) var<storage, read_write> fluidCellScratch : array<atomic<u32>>;
 // read_write to match the shared layout entry (sim_compact writes it);
 // this shader only reads.
 @group(0) @binding(12) var<storage, read_write> dirtyList : array<u32>;
@@ -236,6 +247,34 @@ fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
   return true;
 }
 
+// Excited-fluid occupancy of an AIR cell: the material id the seam's intent
+// carries, or 0 when no meaningful fluid mass is there. One tick latent by
+// design (the seam wrote both after last tick's substeps), deterministic, and
+// gated on the block map so a fluid-free world pays one zero-load.
+fn fluidOccMat(n : vec3<i32>) -> u32 {
+  let wc = worldChunkOf(n);
+  if (!chunkInWindow(wc, T.origin)) { return 0u; }
+  let bm = fluidBlockMapS[chunkSlotIndex(wc)];
+  if (bm == 0u) { return 0u; }
+  let lo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
+  let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  if (fluidGridS[ci * FLUID_GW] < 1024) { return 0u; }  // < 1 particle mass
+  return atomicLoad(&fluidCellScratch[ci * 2u]) >> 16u;
+}
+
+// A rule fired against synthesized excited fluid and takes the neighbour:
+// flag the cell so the seam's consumeApply kills its particle bin this tick.
+// atomicOr — order-free, idempotent.
+fn flagFluidConsume(n : vec3<i32>) {
+  let wc = worldChunkOf(n);
+  if (!chunkInWindow(wc, T.origin)) { return; }
+  let bm = fluidBlockMapS[chunkSlotIndex(wc)];
+  if (bm == 0u) { return; }
+  let lo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
+  let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  atomicOr(&fluidCellScratch[ci * 2u + 1u], 1u);
+}
+
 fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
   if (rule.nbrClass != 0u && ((1u << nm.klass) & rule.nbrClass) == 0u) { return false; }
   if (rule.nbrMat != NBR_ANY) { return nmat == rule.nbrMat; }
@@ -408,16 +447,32 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if (!inBounds(n)) { continue; }
         let ni = voxWordIndex((n));
         let nw = voxWordAt((n));
-        let nmat = voxMat(nw);
-        if (nmat == MAT_AIR) { continue; }
+        var nmat = voxMat(nw);
+        // Excited-fluid synthesis: an air cell holding MPM particles reads
+        // as a liquid neighbour of the particles' material, so every
+        // authored PAIR rule works against excited water exactly as against
+        // a fullness voxel. Consumption crosses the seam through the flag —
+        // the particles die in consumeApply this same tick (plan §6.2).
+        var synthFluid = false;
+        if (nmat == MAT_AIR) {
+          nmat = fluidOccMat(n);
+          if (nmat == 0u) { continue; }
+          synthFluid = true;
+        }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
         keepAwake = keepAwake || !lightGated;
         if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           if (rule.prodNbr != PROD_KEEP) {
+            if (synthFluid) { flagFluidConsume(n); }
+            // For a synthesized neighbour ni is the air cell: a product
+            // writes into it (condensed stone, grown plant); prodNbr == 0
+            // rewrites air over air, harmless.
             if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
             else { voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
             markDirty(n);
-            flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
+            if (!synthFluid) {
+              flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
+            }
           }
           if (rule.prodSelf != PROD_KEEP) {
             if (rule.prodSelf == 0u) { voxStore(idx, 0u); }

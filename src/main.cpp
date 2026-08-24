@@ -727,6 +727,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
                     (int32_t)((hh >> 19) % 8192u) - 4096;
             op.vx = 0; op.vy = -19661; op.vz = 0;
             op.species = 0;
+            op.mat = splashMats[0];  // water: the particle's settled identity
             out.push_back(op);
           }
         }
@@ -1558,12 +1559,18 @@ int main(int argc, char** argv) {
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
   uint32_t lastExplosionTick = 0;
-  // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the CPU-owned particle
-  // count. The GPU never allocates fluid particles, so this is the single
-  // truth for every dispatch extent and the draw count. Not persisted: saves
-  // and worldgen drop the fluid (plan's force-settle-on-save policy, prototype
-  // version).
+  // MLS-MPM fluid (docs/PLAN_mpm_fluids.md): the CPU's CONSERVATIVE live
+  // estimate — the GPU owns the real count now (settle kills particles,
+  // excite births them; the seam's compaction maintains fluidArgs[FA_LIVE]).
+  // Refreshed from the snapshot readback each frame, bumped by spawns
+  // submitted since that snapshot's tick so a fresh pour never reads as
+  // empty. Drives record/skip, draw counts and the HUD only — every kernel
+  // re-bounds itself on the GPU count. Not persisted.
   uint32_t fluidCount = 0;
+  // Spawns submitted after the newest snapshot's tick: (tick, count) pairs,
+  // dropped once a snapshot at/after their tick arrives (the GPU count now
+  // includes them).
+  std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
   // Material id each MPM species splashes micro droplets as, recorded from the
   // pour's brush material (TickParams.fluidSplashMat). 0 until a species is
   // first poured — no pour, no droplets.
@@ -1571,6 +1578,13 @@ int main(int argc, char** argv) {
   // Last tick the MPM fluid was live: keeps the particle passes awake for the
   // splash droplets (see particlesActive below).
   uint32_t lastFluidTick = 0;
+  // Splash sound cue: fired once per snapshot tick that reports a burst of
+  // excitement, voiced through water's Impact slot (the Break precedent —
+  // audio is presentation-only and reads the same readback).
+  uint32_t lastFluidCueTick = 0;
+  uint32_t fluidCueMat = 0;
+  for (size_t i = 0; i < mats.size(); i++)
+    if (mats[i].name == "water") { fluidCueMat = (uint32_t)i; break; }
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -1962,7 +1976,8 @@ int main(int argc, char** argv) {
       tick = 0;
       grenades.clear();
       everExploded = false;
-      fluidCount = 0;  // MPM fluid does not survive a regen
+      fluidCount = 0;  // MPM fluid does not survive a regen (the worldgen
+      fluidPendingSpawns.clear();  // table zeroes the GPU count + calm state)
       debris.Reset();
       mobs.Reset();
       // The avatar's severed parts live in DebrisSystem and its live limbs are
@@ -1991,14 +2006,23 @@ int main(int argc, char** argv) {
         // transient state is cleared here.
         grenades.clear();
         everExploded = false;
-        fluidCount = 0;  // MPM fluid is not in the save format (prototype)
+        fluidCount = 0;  // MPM fluid is not in the save format: saves
+        fluidPendingSpawns.clear();  // force-settle (loadReset zeroes the
+                                     // GPU count + calm state)
         tpRig.Snap();
       }
     }
 
     // ---- player (per frame, against the latest one-tick-latent mirror) ----
     player.fly = ui.fly;
-    auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
+    // Excited MPM water folds into the liquid answer BEFORE the voxel
+    // mirror: swimming, buoyancy and the waterline frame work identically
+    // whichever representation the water happens to be in (plan §6.5). The
+    // >= 2 eighths floor keeps a lone stray droplet from reading as a pool.
+    auto kindAt = [&](IVec3 c) {
+      if (world.FluidEighthsAt(c) >= 2) return CellKind::Liquid;
+      return world.KindAt(c, classOf);
+    };
     // Dismemberment drives movement: the active AnimStateRule's speedScale and
     // the leg-liveness-derived jump scale come straight from the avatar, so
     // losing a leg slows the player down and losing both stops them jumping.
@@ -2346,7 +2370,15 @@ int main(int argc, char** argv) {
       std::vector<FluidSpawnOp> fluidSpawns;
       if (ui.clearFluid) {
         ui.clearFluid = false;
-        fluidCount = 0;  // spawns restart at slot 0; stale GPU data unreachable
+        // The count is GPU-owned now: zero the live word directly. Deferred
+        // queue writes drain at the head of the NEXT command buffer — this
+        // tick's — so the seam's compaction reads 0 and every particle is
+        // gone before the substeps run (the deferred-WriteBuffer ordering
+        // gotcha, used in the right direction for once).
+        uint32_t zero = 0;
+        ctx.queue.WriteBuffer(world.fluidArgsStage, 7 * 4, &zero, 4);
+        fluidCount = 0;
+        fluidPendingSpawns.clear();
       }
       if (ui.tool == UIState::kToolFluid && !ui.magicMode && mouseL) {
         const WorldSnapshot& fsnap = world.Snap();
@@ -2387,6 +2419,11 @@ int main(int argc, char** argv) {
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
                 op.species = fluidSpecies;
+                // The particle knows what it IS (attr word): settle writes
+                // this material back as voxels, splashes and staining key on
+                // it. The species table above is just the render/attraction
+                // grouping now.
+                op.mat = (uint32_t)ui.brushMaterial & 0xFFFu;
                 fluidSpawns.push_back(op);
               }
             }
@@ -2820,12 +2857,45 @@ int main(int argc, char** argv) {
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
       double t0 = NowSeconds();
+      // ---- the celestial clock (sim/world.h) -----------------------------
+      // Advanced exactly ONCE per sim tick, here, immediately before the
+      // submit that reads it. The dev overlay's time-speed slider scales it,
+      // and it feeds BOTH the rendered sky and TickParams.dayPhase — so
+      // cranking time makes the world react (freezing, melting, evaporation)
+      // instead of just racing the sun over a world that ignores it.
+      //
+      // The clock stays DISENGAGED until the slider first leaves 1.0x, at
+      // which point it adopts the current tick so the sky does not jump. While
+      // disengaged the celestial tick is the sim tick byte for byte, which is
+      // what makes every headless path (and the pinned hash) unaffected.
+      Celestial().SetScale(ui.timeScale, tick);
+      Celestial().Advance();
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat);
-      fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(), kFluidCap);
+      // Conservative estimate refresh: the newest snapshot's GPU-owned count
+      // plus every spawn batch it has not seen yet. Settles decay it (the
+      // snapshot count shrinks); excites grow it one snapshot late, which the
+      // seam's recording predicate covers (Simulation::EncodeTick).
+      if (!fluidSpawns.empty())
+        fluidPendingSpawns.push_back({tick, (uint32_t)fluidSpawns.size()});
+      {
+        const WorldSnapshot& fsn = world.Snap();
+        uint32_t pend = 0;
+        if (fsn.valid) {
+          std::erase_if(fluidPendingSpawns,
+                        [&](const std::pair<uint32_t, uint32_t>& p) {
+                          return p.first <= fsn.tick;
+                        });
+          for (const auto& p : fluidPendingSpawns) pend += p.second;
+          fluidCount = std::min(fsn.fluidLive + pend, kFluidCap);
+        } else {
+          fluidCount = std::min(fluidCount + (uint32_t)fluidSpawns.size(),
+                                kFluidCap);
+        }
+      }
       ui.fluidCount = fluidCount;
       double tSubmit1 = NowSeconds();
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
@@ -2957,6 +3027,30 @@ int main(int argc, char** argv) {
         for (const DebrisSystem::BreakEvent& be : debris.BreakEvents())
           audioCues.Break(be.material, be.posVoxel, be.sizeVoxels);
 
+        // A burst of MPM excitement (rock in a lake, floor carved under a
+        // pool) reads as an impact through the water material's existing
+        // slot — the Break precedent, driven from the same snapshot
+        // readback. Once per snapshot tick, positioned at the last exciting
+        // chunk's centre (coarse is fine for a splash).
+        {
+          const WorldSnapshot& fsn = world.Snap();
+          if (fsn.valid && fsn.tick != lastFluidCueTick &&
+              fsn.fluidExcitedEighths >= 64 && fluidCueMat != 0) {
+            lastFluidCueTick = fsn.tick;
+            uint32_t s = fsn.fluidLastSlot;
+            IVec3 sc{(int)(s % kNChunk), (int)((s / kNChunk) % kNChunk),
+                     (int)(s / (kNChunk * kNChunk))};
+            IVec3 o = fsn.windowOrigin;
+            int m = (int)kNChunk - 1;
+            IVec3 wc{o.x + ((sc.x - o.x) & m), o.y + ((sc.y - o.y) & m),
+                     o.z + ((sc.z - o.z) & m)};
+            Vec3 pos{wc.x * 16.0f + 8.0f, wc.y * 16.0f + 8.0f,
+                     wc.z * 16.0f + 8.0f};
+            audioCues.Impact(fluidCueMat, pos,
+                             std::min(fsn.fluidExcitedEighths / 64.0f, 8.0f));
+          }
+        }
+
         // Limbs that came off this frame. The creature's cry fires for every
         // sever; the wet CUT only for one made by a blade, because an
         // explosion that takes the same arm off did not saw through anything.
@@ -3030,6 +3124,20 @@ int main(int argc, char** argv) {
                         (float)ctx.width / (float)ctx.height, ui.shadows,
                         (float)now, fogSmooth, (float)ctx.height, tick,
                         fluidCount);
+
+      // Celestial readout for the panel. Recomputed rather than cached out of
+      // WriteRenderParams because the solve is a handful of trig calls once a
+      // frame — cheaper than the plumbing to carry it, and it cannot go stale.
+      {
+        const SkyState sky = SkyForTick(CurrentTuning(), tick);
+        ui.skyDayT = sky.dayT;
+        ui.skyYearT = sky.yearT;
+        ui.skyMoonPhase = sky.moonPhase;
+        ui.skyMoon2Phase = sky.moon2Phase;
+        ui.skySolarEclipse = sky.solarEclipse;
+        ui.skySunElevDeg =
+            std::asin(std::clamp(sky.sunDir[1], -1.0f, 1.0f)) * 57.2957795f;
+      }
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;

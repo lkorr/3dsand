@@ -412,6 +412,86 @@ forever. Sunlight can *drive* processes that consume something finite; it
 cannot be hooked to a rule that manufactures matter indefinitely. The failed
 attempt is documented in `reactions.json` so it is not tried a third time.
 
+### The sky is a solar system (2026-08-23; `sim/celestial.*`)
+
+Everything above still holds — the *clock* is what changed. Where the sun's
+position used to be a tilted great circle traced by a phase ramp, the planet
+now runs a **Keplerian orbit** around its star, spins on a tilted axis, and
+carries **two moons** on their own inclined, eccentric orbits. Seasons, lunar
+phase, the beat between the two moons, and eclipses are all *consequences* of
+that geometry rather than authored curves, which is the same "no closed-ended
+systems" argument §6 makes about materials: the orbital elements are
+`tuning.json` rows, so a different sky is a data edit.
+
+**The renderer barely changed.** `ComputeSky()` fills the same `SkyState` the
+sky shader already consumed, plus moon B and eclipse coverage; the starfield,
+galactic band, nebulae, aurora and the moon's maria/terminator code are
+untouched. What they receive is better numbers.
+
+Four properties are load-bearing:
+
+- **Pure function of the tick.** Every element is recomputed from epoch on
+  every call — Kepler's equation from a mean anomaly is O(1), so there is no
+  reason to integrate, and an integrator would make the sky an hour into a
+  session depend on the frame rate that got there. Kepler is solved by a
+  **fixed** six-step Newton iteration, never a convergence loop, for the same
+  reason the CA forbids scheduling-dependent outcomes: a trip count that
+  depends on the value is a way for two machines to disagree.
+- **The sim still reads only the integer phase.** `TickParams.dayPhase` is
+  unchanged, integer, and the only thing the CA sees. This file is float
+  throughout and cannot reach a voxel. The two agree because both are driven
+  by the same celestial tick.
+- **One number per fact.** A moon's apparent size comes from its orbit
+  (`dayNight.moonAngularRadius` scaled by distance) and the eclipse test and
+  the drawn disc read that same number. The old render-side `moonRadius` knob
+  was deleted rather than kept: two answers to "how big is the moon" is
+  exactly §3's unowned-diverging-representation trap, and here it would have
+  meant eclipses that do not line up with the discs you can see.
+- **`sunAzimuth` is a rotation of the OBSERVER, not of the clock.** Folding it
+  into the spin angle also rotates *time*: at 24° it moved noon 1.6 game-hours
+  off `dayT` 0.5 and silently desynchronised the visible sun from the phase
+  the reactions are gated on. It is applied as a yaw of the finished horizon
+  vector.
+
+**The `celestial` gate is the reason any of this is trustworthy**, because a
+screenshot cannot tell a real solve from a plausible-looking ramp. It asserts
+properties, each of which fails under a specific plausible bug: the solar
+*year* closes to 0.000° of accumulated azimuth (a sidereal/solar sign error
+overshoots by exactly two turns — the original bug, and locally invisible);
+the sun peaks at `dayT` 0.5 within the equation of time; the seasonal swing is
+2× the axial tilt and peaks at `90 - |lat - tilt|`; each moon hits its
+*authored synodic* period (8.00 and 9.00 days — dropping the synodic→sidereal
+conversion gives 8.7 and nobody notices for a week); the 8/9 phase pair does
+not repeat inside 72 days; eclipses occur but stay under 0.3% of samples; and
+a disengaged `CelestialClock` is bit-exactly the identity map. It also caught
+a unit bug on the first run — moon radii read as radians instead of degrees,
+a 97° moon that eclipsed the sun a third of the time.
+
+### The dev time-scale slider, and why it moves the sim
+
+The overlay's *time speed* slider scales a `CelestialClock` (`world.h`) that
+feeds **both** the rendered sky and `TickParams.dayPhase`. Scaling only the
+render would show a sun racing across a world that ignores it — useless for
+tuning weather, which is the reason to want the control at all. So at 100×
+water genuinely freezes and thaws while sand still falls at 30 Hz.
+
+That makes the world hash a function of the slider, deliberately. Two things
+keep it from touching rule 1:
+
+- The clock is an **exact rational counter** (`scaleNum/scaleDen` with the
+  remainder carried), never a float accumulator, so the integer path into
+  `dayPhase` is unbroken and reverse time is the exact mirror of forward time.
+- It is **disengaged until the slider first leaves 1.0×**, and while
+  disengaged `SimTick()` returns the sim tick byte for byte. Every headless
+  path — `--selftest`, `--shot`, `--frames`, every gate — is therefore
+  structurally unable to observe the feature, and the pinned hash `7cfa2420`
+  is unmoved.
+
+The day/night wake handshake compares against the clock's *previous* value
+rather than `tick - 1`: at 100× the clock jumps ~100 phase-ticks per sim tick,
+and comparing to `tick - 1` would test a phase the world never occupied and
+sail through several dawns without ever waking a chunk.
+
 ---
 
 ## 5. Particle System (voxels in flight)
@@ -431,25 +511,103 @@ Noita's "Bloody Zombies" technique, on GPU:
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
 
-### MLS-MPM liquid prototype (2026-08-22; `sim_fluid.wgsl`, docs/PLAN_mpm_fluids.md)
+### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 
-An EXPERIMENTAL second liquid representation, placeable side by side with the
-CA liquid so the two can be compared in-world before the plan's full rewrite
-is committed to. It is the plan's Phase 0+1 run inside the engine: the
-MLS-MPM core (Hu et al. 2018) ported to Q16.16 integer fixed point, P2G
-scattering through i32 `atomicAdd` (associative, so scheduling cannot move the
-sum), sparse 16³-node grid blocks allocated per substep over exactly the
-chunks that hold particles, terrain boundary conditions read live from the
-voxel buffer through `voxWordAt`, 6 substeps per tick.
+The EXCITED state of liquid: an MLS-MPM particle solver (plan Phases 0+1)
+plus the plan's §7 excite/settle SEAM (Phase 2, 2026-08-23) converting both
+ways between settled fullness voxels and particles. The MLS-MPM core (Hu et
+al. 2018) is ported to Q16.16 integer fixed point, P2G scattering through i32
+`atomicAdd` (associative, so scheduling cannot move the sum), sparse 16³-node
+grid blocks allocated per substep over exactly the chunks that hold
+particles, terrain boundary conditions read live from the voxel buffer
+through `voxWordAt`, 6 substeps per tick.
 
-Deliberately OUTSIDE the hashed sim domain: the fluid never writes a voxel,
-no CA kernel reads a fluid buffer, and the world hash is untouched by
-construction (the pinned determinism gate proves it stays 7cfa2420). The
-fluid's own bit-determinism — the plan's kill criterion — is gated separately
-by `fluid-det`, which runs a basin drop twice from worldgen and requires the
-entire particle buffer to hash identically. Passing on the RTX 3060 Ti, this
-is the first affirmative evidence for the plan's fixed-point-atomics bet;
-cross-vendor remains open exactly as it does for the CA itself.
+THE SEAM (`sim_fluid_seam.wgsl`) is the only fluid code that writes voxels,
+and it is INSIDE the hashed sim domain — deterministically. Per tick, around
+the solver substeps: a slot-order ping-pong COMPACTION removes dead particles
+and rebuilds the GPU-OWNED live count (`fluidArgsStage[7]` — settle kills and
+excite births mean no CPU count can be authoritative; per-particle passes
+dispatch indirectly); CPU spawn ops append; EXCITE converts disturbed settled
+liquid to particles (one per fullness eighth, jittered sub-cell lattice via
+`hash3`, hydrostatic pre-compression seeded into J from a per-column depth
+scan so a reawakened lake holds its own weight instead of jello-popping);
+after the substeps, SETTLE converts calm blocks back (per-slot max-speed
+calm counters, `sim.fluidSettleTicks` consecutive ticks under
+`sim.fluidSettleEps`, ≤16 non-adjacent blocks per tick, per-column
+segment-pooled bottom-up refill, all-or-nothing refusal per block — mass is
+EXACT integer eighths in both directions, and stains ride the particle's attr
+word round-trip). Excite triggers: (a) settled liquid with air below —
+gated by `sim.fluidExciteMode`, DEFAULT OFF until Phase 3 deletes the CA
+liquid movement (the CA still owns disturbed water, which is what keeps the
+pinned hash at 7cfa2420); (b) progressive wake — a grid node at an
+active/settled interface moving above `sim.fluidWakeSpeed` (4× the settle
+threshold: hysteresis) wakes the neighbouring settled cell, always on,
+hash-safe because it needs existing particles. Excite marks candidates in
+voxel scratch bits 19..23 (set by detect, consumed the same tick by emit —
+budget refusals restore the word), assigns emission offsets by a slot-order
+scan (never first-come atomics), and refuses whole slots past the
+`kFluidCap` budget — refused water simply stays settled and retries.
+Materialization: the seam never tests the page table (readback-timing state —
+a branch on it would be nondeterministic); instead excite writes only into
+this tick's dirty chunks (§3-covered) and settle only into ≥8-tick-calm
+fluid blocks, which the block-list snapshot readback has long since fed to
+`PageTable::UpdateFluidChunks`. `pageFaults == 0` on every gate is the
+tripwire.
+
+A world that never spawns fluid is byte-identical to one before this system
+existed (the pinned determinism gate proves 7cfa2420 stands). The fluid's own
+bit-determinism is gated by `fluid-det`, which now also audits the seam:
+twice-run particle-buffer + world-hash equality AND exact mass conservation
+(spawned eighths == live fullness + settled voxel eighths — the 2026-08-23
+run settles the whole 512-eighth pour back to basin voxels). Passing on the
+RTX 3060 Ti; cross-vendor remains open exactly as it does for the CA itself.
+
+Particles carry their IDENTITY in a packed attr word (32-word / 128 B struct,
+power-of-two stride): material id (settle writes it back; splash droplets and
+staining key on it), fullness eighths, and stain type/amount excited out of
+the voxel's stain bits. The species id (0..3) survives as the grid's
+mass-channel / render-colour grouping, derived from the material at excite
+time.
+
+ENVIRONMENT PARITY (Phase 2's §6 slice) runs through ONE per-cell bridge
+buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
+
+- REACTIONS: `doReactions` synthesizes an excited cell as a liquid neighbour
+  of the particles' material (last tick's block map + node mass + intent),
+  so authored PAIR rules — freezing, absorption, plants drinking — work
+  against excited water with zero new authoring surface. A rule that TAKES
+  the neighbour sets the cell's consume flag; the seam's `consumeApply`
+  kills the whole cell bin the same tick (consumption granularity is the
+  voxel-eighth, order-free, mass-exact — the fluid-react gate audits
+  standing + live + consumed == placed). Transitions that PRODUCE matter
+  write ordinary voxels into the (air) cell; every phase change crosses the
+  seam through the voxel form (plan §6.6).
+- CONTACT STAINING: `particleTick` scatters each particle's stain (carried
+  attr stain beats the material's authored one) onto solid/powder face
+  neighbours as intents; `stainApply` rolls `sim.fluidStainRate` per cell
+  and merges with the CA's rules. Settled water then WASHES foreign stains
+  exactly as CA water does — the fluid-stain gate observes both halves.
+- SWIMMING: `mirrorFold` packs excited-fluid eighths for the 27 CPU-mirror
+  chunks (one byte per cell, `TickParams.mirrorBase` = the readback's own
+  clamp) into the snapshot; `World::FluidEighthsAt` folds it into the
+  player's `kindAt` ahead of the voxel mirror, so `inLiquid`/submersion/the
+  waterline frame see particles as water. Zeroed whenever no fluid is live.
+- SOUND: a burst of excitement in one snapshot (>= 64 eighths) fires water's
+  Impact cue at the last exciting chunk's centre — the Break-event
+  precedent: presentation-only, driven from the readback, never in the
+  hashed domain.
+- RENDER SEAM: `fluidMassAt` (the one producer under the MPM isosurface)
+  takes max(particle mass, settled-liquid fullness x rest), so the
+  isosurface's boundary taps meet the voxel surface without a gap; the
+  back-to-front stack still prefers a nearer CA liquid interface.
+
+KNOWN LIMITS (Phase 2): excite converts non-viscous liquids only
+(moveEvery <= 1 — lava/blood stay CA until per-material fluid dynamics,
+plan Phase 7); splash droplets from STAINED water carry the material, not
+the carried stain; frontier neighbour-count scaling sees excited fluid as
+air; a sealed, undamped pool at stock stiffness can churn indefinitely
+(sim.fluidDamping defaults to 0 — the settle gates document the tuning that
+calms adversarial geometry, and Phase 7 owns the defaults).
 
 The solver (2026-08-22, second pass) follows grantkot's WebGPU MLS-MPM shape:
 P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter
@@ -497,26 +655,30 @@ SPLASH COUPLING — fast fluid particles at low density (spray, breaking
 crests) shed `PFLAG_MICRO` droplets into the ballistic particle system from
 `g2p` (bindings 6/7 of the fluid group are the particle write page + counts;
 the appends land after `particleResolve`, so droplets fly next tick). Each
-droplet carries the material its species was POURED as
-(`TickParams.fluidSplashMat`, recorded from the brush by the main loop) — so
-MPM blood spatters real stains through the existing claim-hash stain path and
-MPM water is pure sparkle. Emission is hash-keyed on particle state + tick
-(the fluid slot index is a stable identity — particles never die), bounded by
-rate/speed/density thresholds (`sim.fluidSplash*`), droplet lifetime, and
-`PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
+droplet carries the particle's OWN material (the attr word; the poured-species
+table is the fallback) — so MPM blood spatters real stains through the
+existing claim-hash stain path and MPM water is pure sparkle. Emission is
+hash-keyed on particle state + tick (the fluid slot index is a stable
+identity — assigned by the seam's deterministic slot-order compaction),
+bounded by rate/speed/density thresholds (`sim.fluidSplash*`), droplet
+lifetime, and `PARTICLE_CAP`. Live fluid holds `particlesActive` on (plus a
 droplet-lifetime tail) so the spray integrates without an explosion ever
 having happened.
 
 Usage: the `mpm` tool (Tab; hold LMB to pour, keys 1-4 pick the species, U
-clears). `--shot-fluid` is the look-iteration harness: worldgen, pour a pool
-+ a falling stream with the tool's own spawn shape, write
-`screenshot_fluid{,_top,_splash,_low}.bmp`. CPU-owned particle count (spawns
-are ops at CPU-known offsets; nothing ever allocates on the GPU), hard
-`kFluidCap` budget charged before emission, zero recorded work when no fluid
-exists. Not persisted: saves and worldgen drop it (the plan's
-force-settle-on-save, prototype grade). Excite/settle conversion against the
-CA grid — the plan's §7 seam — is deliberately NOT built here; that decision
-comes after the side-by-side comparison this prototype exists to enable.
+clears — which now zeroes the GPU-owned count directly). `--shot-fluid` is
+the look-iteration harness: worldgen, pour a pool + a falling stream with the
+tool's own spawn shape, write `screenshot_fluid{,_top,_splash,_low}.bmp`. The
+CPU keeps only a CONSERVATIVE live estimate (snapshot readback + spawns since
+— drives record/skip, the draw count and the HUD; every kernel re-bounds
+itself on the GPU count, and `vsFluid` collapses dead/stale slots). Hard
+`kFluidCap` budget charged before emission on the CPU and enforced exactly by
+the excite scan on the GPU; zero recorded work when no fluid exists and the
+excite mode is off. Not persisted: saves and worldgen drop the particles
+(they force-settle in spirit; the settle converter has usually already made
+them voxels, which DO persist normally). The CA liquid movement rules are
+still live — Phase 3 (deleting them, flipping `fluidExciteMode` default,
+re-baselining the pinned hash) is a separate, later step.
 
 ---
 

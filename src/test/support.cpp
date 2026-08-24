@@ -36,20 +36,19 @@ double NowSeconds() {
   return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Ticks per in-game day, from the tuning cycle length. Sim runs at 30 Hz.
-uint32_t TicksPerDay(const Tuning& t) {
-  int m = t.dayNight.cycleMinutes < 1 ? 1 : t.dayNight.cycleMinutes;
-  return (uint32_t)m * 60u * 30u;
-}
+// Ticks per in-game SOLAR day, from the tuning cycle length. Sim runs at 30 Hz.
+// The definition itself lives in tuning.h so sim/celestial.cpp can use it
+// without linking the render plumbing; this is the name the frame loop and the
+// gates already call.
+uint32_t TicksPerDay(const Tuning& t) { return TicksPerDayFromTuning(t); }
 
-// The sky for a given sim tick. Both the renderer and the sim's reaction gate
-// derive from this same tick-based phase, which is what keeps a sun-driven
-// reaction deterministic (CLAUDE.md rule 1).
+// The sky for a given sim tick — now a full Keplerian solve (sim/celestial.*)
+// rather than a phase ramp. `tick` is routed through the celestial clock, which
+// is DISENGAGED unless the dev overlay's time-speed slider has been moved: on
+// every headless path this is the identity map and the celestial tick IS the
+// sim tick, so the pinned world hash cannot move.
 SkyState SkyForTick(const Tuning& t, uint32_t tick) {
-  uint32_t tpd = TicksPerDay(t);
-  uint32_t phase = DayPhaseForTick(tick, tpd, t.dayNight.freeze != 0,
-                                   (uint32_t)t.dayNight.freezePhase);
-  return ComputeSkyState(t, phase, tpd ? tick / tpd : 0u);
+  return ComputeSky(t, Celestial().RenderTick(tick));
 }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
@@ -89,6 +88,25 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.sunUp = sky.sunUp;
   rp.moonPhase = sky.moonPhase;
   rp.starRot = sky.starRot;
+  // Moon B + eclipse geometry. All of it falls out of the orbital solve — the
+  // renderer is told where the bodies ARE and how big they look, and draws
+  // them; it decides nothing about the sky's state.
+  rp.moon2Dir[0] = sky.moon2Dir[0];
+  rp.moon2Dir[1] = sky.moon2Dir[1];
+  rp.moon2Dir[2] = sky.moon2Dir[2];
+  rp.moon2Phase = sky.moon2Phase;
+  rp.moonAngRadius = sky.moonAngRadius;
+  rp.moon2AngRadius = sky.moon2AngRadius;
+  rp.moonPhaseSign = sky.moonPhaseSign;
+  rp.moon2PhaseSign = sky.moon2PhaseSign;
+  rp.solarEclipse = sky.solarEclipse;
+  rp.lunarEclipse = sky.lunarEclipse;
+  rp.eclipseBody = sky.eclipseBody;
+  // The axis the starfield wheels about — derived from latitude, so the stars
+  // turn about the same pole the sun arcs around.
+  rp.poleDir[0] = sky.poleDir[0];
+  rp.poleDir[1] = sky.poleDir[1];
+  rp.poleDir[2] = sky.poleDir[2];
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both
@@ -113,35 +131,58 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
-                uint32_t fluidBase,
+                uint32_t fluidLive,
                 const uint32_t* fluidSplashMat) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
-  // MLS-MPM fluid prototype: budget is charged by the CALLER before emitting
-  // (rule 2 — emit-then-check overruns); this clamp is the belt to that brace.
+  // MLS-MPM fluid: `fluidLive` is the caller's CONSERVATIVE live estimate
+  // (snapshot count + spawns since — the GPU owns the real number). The spawn
+  // budget is charged by the CALLER before emitting (rule 2); this clamp is
+  // the belt to that brace, and the GPU excite scan enforces the cap exactly.
   uint32_t fluidSpawnCount = std::min((uint32_t)fluidSpawns.size(),
                                       kMaxFluidSpawnsPerTick);
-  fluidBase = std::min(fluidBase, kFluidCap);
-  if (fluidSpawnCount > kFluidCap - fluidBase)
-    fluidSpawnCount = kFluidCap - fluidBase;
+  fluidLive = std::min(fluidLive, kFluidCap);
+  if (fluidSpawnCount > kFluidCap - fluidLive)
+    fluidSpawnCount = kFluidCap - fluidLive;
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
   tp.farCount = farCount;  // far-field fills ride the tick submit (render-only)
-  tp.fluidBase = fluidBase;
+  // The disturbance-excite switch rides the tick input stream (the dayPhase
+  // precedent): tuning is read CPU-side, HERE, so replays and the twice-run
+  // determinism gates capture it and a per-gate SetCurrentTuning overrides it
+  // with no pipeline rebuild.
+  tp.fluidExciteEnable =
+      CurrentTuning().sim.fluidExciteMode != 0 ? 1u : 0u;
   tp.fluidSpawnCount = fluidSpawnCount;
   if (fluidSplashMat) {
     for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
   }
-  // Day phase for THIS tick. Derived from `tick` alone — the daylight-gated
-  // reactions read it, so anything frame-timed here would break determinism.
+  // Day phase for THIS tick. Derived from an INTEGER tick counter — the
+  // daylight-gated reactions read it, so anything frame-timed here would break
+  // determinism (CLAUDE.md rule 1).
+  //
+  // That counter is the celestial clock's, not the raw sim tick, and the
+  // difference is deliberate: the dev time-speed slider is meant to make the
+  // WORLD respond to accelerated time (water freezing, snow melting), not just
+  // to race the sun across a world that ignores it. The clock is an exact
+  // rational counter, so this stays integer end to end, and it is DISENGAGED
+  // unless the slider has been moved — on every headless path it returns
+  // `tick` unchanged and the pinned hash cannot move.
   const Tuning& dtun = CurrentTuning();
-  tp.dayPhase = DayPhaseForTick(tick, TicksPerDay(dtun),
+  const uint32_t celTick = Celestial().SimTick(tick);
+  tp.dayPhase = DayPhaseForTick(celTick, TicksPerDay(dtun),
                                 dtun.dayNight.freeze != 0,
                                 (uint32_t)dtun.dayNight.freezePhase);
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
+  // The mirror corner for the seam's fluid-occupancy fold: the SAME clamp
+  // EncodeReadbacks applies to the same input below, so the fold and the
+  // voxel mirror describe one cube.
+  IVec3 mb = world.MirrorBaseFor(
+      {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
+  tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
@@ -168,8 +209,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Derived from the tick, not from frame timing, so every machine wakes on
   // the same tick and the hash stays identical (CLAUDE.md rule 1).
+  //
+  // Compared on the PREVIOUS CELESTIAL tick, not the previous sim tick. Under
+  // the time-speed slider the clock can advance many day-phase ticks per sim
+  // tick — comparing against `tick - 1` would test a phase the world never
+  // saw, and at 100x the world would sail through several dawns without ever
+  // waking. `prevCel` is the clock's own previous value, so the switch is
+  // detected however far the clock jumped (a jump that skips a whole day still
+  // wakes exactly once, which is right: one wake re-dirties everything).
   if (tick > 0) {
-    uint32_t prevPhase = DayPhaseForTick(tick - 1, TicksPerDay(dtun),
+    const uint32_t prevCel = Celestial().PrevSimTick(tick);
+    uint32_t prevPhase = DayPhaseForTick(prevCel, TicksPerDay(dtun),
                                          dtun.dayNight.freeze != 0,
                                          (uint32_t)dtun.dayNight.freezePhase);
     bool wasDay = DaylightStrengthCpu(prevPhase) > 0;
@@ -280,6 +330,25 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.UpdateSpawnRing(spawnCells, expCenters, world);
   }
   {
+    // fluidChunks(N): every chunk the MLS-MPM seam may write a voxel into —
+    // the active block slots from the one-tick-latent snapshot readback plus
+    // this tick's CPU-known fluid spawn cells, dilated one ring inside
+    // UpdateFluidChunks. The settle converter's >= 8 calm-tick floor is what
+    // makes the readback latency safe (world.h fluid block).
+    const WorldSnapshot& sn = world.Snap();
+    std::vector<uint32_t> blockSlots;
+    if (sn.valid && sn.fluidBlockCount > 0) {
+      blockSlots.assign(sn.fluidBlocks.begin(),
+                        sn.fluidBlocks.begin() + sn.fluidBlockCount);
+    }
+    std::vector<IVec3> fluidCells;
+    fluidCells.reserve(fluidSpawnCount);
+    for (uint32_t i = 0; i < fluidSpawnCount; i++)
+      fluidCells.push_back({fluidSpawns[i].px >> 16, fluidSpawns[i].py >> 16,
+                            fluidSpawns[i].pz >> 16});
+    pt.UpdateFluidChunks(blockSlots, fluidCells, world);
+  }
+  {
     const WorldSnapshot& sn = world.Snap();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
     // Contributor (e), the particle flight shell — strictly AFTER the
@@ -313,7 +382,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // the safe direction and the list stays a plain "did anything arrive".
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
                                spawnCount > 0 || particlesActive ||
-                               fluidBase + fluidSpawnCount > 0);
+                               fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
     // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_).
@@ -345,7 +414,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.EncodePageFill(enc, jitterFills);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
-                 fluidBase + fluidSpawnCount, fluidSpawnCount);
+                 fluidLive + fluidSpawnCount, fluidSpawnCount);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the

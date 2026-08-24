@@ -80,6 +80,8 @@ SPEC = [
     ("render", "starTwinkle", "TUNE_STAR_TWINKLE", "f", 0.35),
     ("render", "milkyWayStrength", "TUNE_MILKYWAY_STRENGTH", "f", 0.55),
     ("render", "milkyWayColor", "TUNE_MILKYWAY_COLOR", "v3", [0.52, 0.56, 0.78]),
+    ("render", "galaxyNormal", "TUNE_GALAXY_NORMAL", "v3", [0.36, 0.52, -0.77]),
+    ("render", "galaxyWidth", "TUNE_GALAXY_WIDTH", "f", 0.17),
     ("render", "nebulaStrength", "TUNE_NEBULA_STRENGTH", "f", 0.4),
     ("render", "nebulaCool", "TUNE_NEBULA_COOL", "v3", [0.16, 0.3, 0.62]),
     ("render", "nebulaWarm", "TUNE_NEBULA_WARM", "v3", [0.55, 0.2, 0.38]),
@@ -88,14 +90,21 @@ SPEC = [
     ("render", "auroraLow", "TUNE_AURORA_LOW", "v3", [0.1, 0.85, 0.45]),
     ("render", "auroraHigh", "TUNE_AURORA_HIGH", "v3", [0.65, 0.2, 0.85]),
 
-    # moon
-    ("render", "moonRadius", "TUNE_MOON_RADIUS", "f", 0.03),
+    # moons
     ("render", "moonBrightness", "TUNE_MOON_BRIGHTNESS", "f", 1.6),
     ("render", "moonColor", "TUNE_MOON_COLOR", "v3", [0.92, 0.93, 0.88]),
+    ("render", "moonMariaSeed", "TUNE_MOON_MARIA_SEED", "v3", [4.0, 1.0, 9.0]),
     ("render", "moonGlow", "TUNE_MOON_GLOW", "f", 0.35),
     ("render", "moonEarthshine", "TUNE_MOON_EARTHSHINE", "f", 0.055),
     ("render", "moonLightColor", "TUNE_MOON_LIGHT_COLOR", "v3", [0.55, 0.68, 1.0]),
     ("render", "moonLightIntensity", "TUNE_MOON_LIGHT_INTENSITY", "f", 0.16),
+    ("render", "moon2Color", "TUNE_MOON2_COLOR", "v3", [0.78, 0.8, 0.86]),
+    ("render", "moon2MariaSeed", "TUNE_MOON2_MARIA_SEED", "v3", [-21.0, 13.0, 37.0]),
+    ("render", "moon2Brightness", "TUNE_MOON2_BRIGHTNESS", "f", 0.72),
+    ("render", "moon2LightIntensity", "TUNE_MOON2_LIGHT_INTENSITY", "f", 0.055),
+    ("render", "moon2LightColor", "TUNE_MOON2_LIGHT_COLOR", "v3", [0.62, 0.62, 0.86]),
+    ("render", "eclipseDarkness", "TUNE_ECLIPSE_DARKNESS", "f", 0.93),
+    ("render", "eclipseCurve", "TUNE_ECLIPSE_CURVE", "f", 3.0),
 
     # night ambient
     ("render", "nightAmbSky", "TUNE_NIGHT_AMB_SKY", "v3", [0.055, 0.075, 0.135]),
@@ -319,6 +328,13 @@ SPEC = [
     ("sim", "fluidBubbleDensity", "TUNE_FLUID_BUBBLE_RHO", "f", 1.05),
     ("sim", "fluidSprayDensity", "TUNE_FLUID_SPRAY_RHO", "f", 0.42),
     ("sim", "fluidFoamScaleIdx", "TUNE_FLUID_FOAM_SCALE_IDX", "u", 3),
+
+    # MLS-MPM settle / excite seam
+    ("sim", "fluidExciteMode", "TUNE_FLUID_EXCITE_MODE", "i", 0),
+    ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 0.9),
+    ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 3.6),
+    ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 45),
+    ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
 
     # worldgen (integer; needs a world regen to take effect)
     ("worldgen", "treeline", "TUNE_TREELINE", "i", 72),

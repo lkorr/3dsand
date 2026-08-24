@@ -85,6 +85,147 @@ inline uint32_t DayPhaseForTick(uint32_t tick, uint32_t ticksPerDay,
                     ticksPerDay) & kDayPhaseMask;
 }
 
+// ---- the celestial clock (dev time-scale) ------------------------------------
+// The sky is driven by a Keplerian orbital simulation (sim/celestial.h) whose
+// only input is a CELESTIAL TICK. Normally that is the sim tick, one for one.
+// The dev overlay's time-speed slider decouples them so the sun and moons can
+// be run fast, slow, or backwards without touching the sim rate.
+//
+// Two decisions here are worth defending, because the obvious versions of both
+// are wrong:
+//
+//   * IT IS AN INTEGER COUNTER, not a float accumulator. The SIM reads this
+//     clock too — the daylight-gated reactions (water freezing at night, snow
+//     melting in the sun) must respond to the accelerated time or cranking the
+//     slider shows a racing sun over a world that ignores it, which is worse
+//     than useless for tuning weather. Sim state therefore depends on this
+//     value, so it has to reach TickParams.dayPhase as a u32 derived from
+//     integers (CLAUDE.md rule 1). `scaleNum/scaleDen` is a rational multiplier
+//     and `rem` carries the exact remainder, so no float ever touches the path.
+//   * SCALE 1 IS BIT-IDENTICAL TO THE OLD BEHAVIOUR. At scaleNum == scaleDen
+//     the counter advances by exactly one per tick from zero, so `Ticks()`
+//     equals the sim tick and the pinned world hash cannot move. --selftest,
+//     --shot and every headless path leave the clock at its default and are
+//     structurally unable to observe this feature at all.
+//
+// Changing the scale away from 1 DOES change the world hash, and that is
+// intended and documented: it is a dev tool, and it advertises itself in the
+// overlay.
+struct CelestialClock {
+  // OFF by default, and this is the load-bearing part. While `engaged` is
+  // false the clock is not consulted at all: the celestial tick IS the sim
+  // tick, byte for byte, and every headless path (--selftest, --shot,
+  // --frames, every gate) is structurally unable to observe this feature.
+  // It is set true the first time the slider leaves 1.0x and stays true for
+  // the session, since by then the two clocks have genuinely diverged and
+  // silently snapping back to the sim tick would jump the sky.
+  bool engaged = false;
+
+  // Rational time multiplier, exact. den is never 0.
+  int64_t scaleNum = 1;
+  int64_t scaleDen = 1;
+  // Accumulated celestial ticks (signed: reverse time is allowed) and the
+  // exact fractional remainder, in units of 1/scaleDen.
+  int64_t ticks = 0;
+  int64_t rem = 0;
+  // The value `ticks` held before the last Advance(). At 100x the clock jumps
+  // ~100 day-phase ticks per sim tick, so "did daylight just switch on" cannot
+  // be answered against `ticks - 1` — that is a phase the world never
+  // occupied, and the day/night wake handshake would sail through several
+  // dawns without firing. This is the previous phase the world ACTUALLY saw.
+  int64_t prevTicks = 0;
+
+  // Set the multiplier from the UI's float. Quantised to 1/1024 so the counter
+  // stays exact; the slider's own step is coarser than that.
+  //
+  // `simTickNow` is the tick the clock adopts if this is the call that engages
+  // it — so the sky does not jump when the slider first moves.
+  void SetScale(float s, uint32_t simTickNow) {
+    const int64_t den = 1024;
+    double v = (double)s * (double)den;
+    if (v > 1e6) v = 1e6;
+    if (v < -1e6) v = -1e6;
+    const int64_t num = (int64_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
+    if (!engaged) {
+      if (num == den) return;  // still 1.0x: stay disengaged, stay identity
+      engaged = true;
+      ticks = (int64_t)simTickNow;
+      prevTicks = ticks;
+      rem = 0;
+    }
+    if (num == scaleNum && den == scaleDen) return;
+    // Re-base the remainder onto the new denominator so a mid-flight scale
+    // change does not jump the sky. Denominators are equal in practice; the
+    // general form is cheap and means the invariant holds regardless.
+    if (den != scaleDen && scaleDen != 0) rem = rem * den / scaleDen;
+    scaleNum = num;
+    scaleDen = den;
+  }
+
+  // Advance by one sim tick. A no-op while disengaged.
+  void Advance() {
+    if (!engaged || scaleDen <= 0) return;
+    prevTicks = ticks;
+    // One tick of scaled time, carried exactly: `acc` is the whole position in
+    // units of 1/scaleDen, so nothing is ever rounded away and the counter is
+    // identical whichever order the frames arrived in.
+    //
+    // Written as one accumulator rather than as a separate ticks/rem pair with
+    // a division per step, because the pair form is easy to get subtly wrong:
+    // an earlier version floor-divided `rem` after adding, which is correct in
+    // isolation but double-applied the carry whenever a scale change had left
+    // a remainder behind. This form has no carry to lose.
+    const int64_t acc = ticks * scaleDen + rem + scaleNum;
+    // Floor toward negative infinity so reverse time is the exact mirror of
+    // forward time rather than drifting by a tick per second.
+    int64_t q = acc / scaleDen;
+    int64_t r = acc % scaleDen;
+    if (r < 0) { q -= 1; r += scaleDen; }
+    ticks = q;
+    rem = r;
+  }
+
+  // The integer celestial tick the sim's day phase is derived from. Clamped
+  // non-negative: DayPhaseForTick takes a u32, and a negative clock would wrap
+  // into a phase that jumps. Reverse time still runs the RENDER sky backwards
+  // (RenderTick is a double and handles negatives exactly) — it just holds the
+  // sim's day phase at the epoch once it walks past it, which is the only
+  // sensible reading of "the reactions ran before the world began".
+  uint32_t SimTick(uint32_t simTick) const {
+    if (!engaged) return simTick;
+    return ticks <= 0 ? 0u : (uint32_t)ticks;
+  }
+
+  // The celestial tick the world occupied on the PREVIOUS sim tick. Used by
+  // the day/night wake handshake, which asks "did daylight switch between then
+  // and now" — a question `SimTick() - 1` answers wrongly at any scale but 1.
+  uint32_t PrevSimTick(uint32_t simTick) const {
+    if (!engaged) return simTick == 0 ? 0u : simTick - 1u;
+    return prevTicks <= 0 ? 0u : (uint32_t)prevTicks;
+  }
+
+  // The (possibly fractional, possibly negative) tick the RENDER sky uses.
+  double RenderTick(uint32_t simTick) const {
+    if (!engaged) return (double)simTick;
+    return (double)ticks + (scaleDen ? (double)rem / (double)scaleDen : 0.0);
+  }
+};
+
+// The one clock the game's sky and daylight-gated reactions run on.
+//
+// A global rather than a parameter threaded through SubmitTick/
+// WriteRenderParams, because it must reach ~15 call sites across the frame
+// loop, the shot paths and the selftest, and every one of them that DIDN'T
+// pass it would silently fall back to the sim tick — a divergence between what
+// you see and what the world does, which is precisely the failure this whole
+// subsystem is built to prevent. It is written only by the frame loop
+// (main.cpp), which advances it exactly once per sim tick.
+//
+// Every headless path (--selftest, --shot, --frames) leaves it at its default
+// identity scale and never calls Advance() out of step with the tick, so those
+// paths see celestialTick == tick and the pinned world hash is untouched.
+CelestialClock& Celestial();
+
 // Integer daylight strength for a phase: 0 at night, rising to 255 at noon.
 // EXACT mirror of daylightStrength() in common.wgsl — the CPU uses it to
 // decide which ticks need a wake-all, and the GPU uses it to gate reactions.
@@ -128,31 +269,43 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
 
-// ---- MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; side-by-side demo) ---
-// An EXPERIMENTAL second liquid representation living alongside the CA liquid:
-// GPU particles simulated by a fixed-point MLS-MPM solver (sim_fluid.wgsl).
-// Deliberately OUTSIDE the hashed sim domain in this prototype — the fluid
-// never writes a voxel, never touches dirty flags, and no CA kernel reads any
-// fluid buffer, so the world hash is untouched by construction. The fluid is
-// still bit-deterministic in its own right (integer-only math, integer-atomic
-// P2G scatter — addition is associative, so accumulation order cannot matter),
-// which the `fluid_det` selftest gate verifies twice-run. That is the plan's
-// Phase-0 determinism spike, run inside the engine.
+// ---- MLS-MPM fluid (docs/PLAN_mpm_fluids.md; excite/settle seam Phase 2) ----
+// The EXCITED state of liquid: GPU particles simulated by the fixed-point
+// MLS-MPM solver (sim_fluid.wgsl). Settled liquid stays voxels. The seam
+// (sim_fluid_seam.wgsl) converts both ways: excite turns disturbed settled
+// cells into particles (one per fullness eighth), settle bins calm particles
+// back into fullness voxels — exact integer mass accounting in both
+// directions. The seam DOES write voxels, deterministically, so the world
+// hash moves only when fluid converts; a world that never spawns fluid is
+// bit-identical to one before this system existed (the pinned determinism
+// hash is the gate on that claim).
 //
-// The particle COUNT is CPU-owned (main loop / selftest gate): particles are
-// only ever appended by the spawn kernel at CPU-known offsets and never die,
-// so every dispatch extent is a pure function of the op stream. Not persisted:
-// save/load and worldgen drop the fluid (count resets to 0), per the plan's
-// force-settle-on-save policy — acceptable for a comparison prototype.
+// The particle COUNT is GPU-OWNED (fluidArgsStage[7]): settle kills
+// particles and excite births them on the GPU, so no CPU-side count can be
+// authoritative. A deterministic ping-pong compaction at the head of each
+// fluid tick (slot-order scans, no atomicAdd slot assignment) removes the
+// corpses; per-particle passes dispatch indirectly. The CPU keeps a
+// CONSERVATIVE estimate from the async readback (world.Snap().fluidLive) for
+// record/skip and render decisions only. Not persisted: save/load and
+// worldgen drop the fluid, per the plan's force-settle-on-save policy.
 constexpr uint32_t kFluidCap = 262144;            // hard particle budget (rule 2)
 constexpr uint32_t kMaxFluidSpawnsPerTick = 4096; // spawn-op stream cap
 // Sparse scratch-grid blocks: one 16^3 node block per ACTIVE chunk slot,
 // allocated per substep by a deterministic scan. 256 blocks * 4096 nodes *
-// 16 B = 16 MiB, and bounds simultaneously-active fluid to 256 chunks.
+// 32 B = 32 MiB, and bounds simultaneously-active fluid to 256 chunks.
 constexpr uint32_t kFluidBlocks = 256;
 // MPM substeps per 30 Hz tick. CFL: |v| <= 0.45 cell/substep, so the fluid's
 // terminal speed is 0.45 * 6 = 2.7 cells/tick (~8.1 m/s at 0.10 m voxels).
 constexpr uint32_t kFluidSubsteps = 6;
+// FluidParticle stride in u32 words — must match the struct in common.wgsl
+// (32 words / 128 B, power-of-two for coalesced access).
+constexpr uint32_t kFluidParticleWords = 32;
+// Settle converts at most this many blocks per tick. Bounds the bin scratch
+// (kFluidSettleMax * kChunkVol * 2 words) and, with the adjacency exclusion
+// in the settle scan, guarantees no two concurrently-committing blocks can
+// read each other's writes. A lake's worth of calm blocks drains through
+// this in a few ticks; settle latency is invisible next to the calm window.
+constexpr uint32_t kFluidSettleMax = 16;
 
 // One CPU-authored fluid particle spawn (32 B) — must match FluidSpawnOp in
 // common.wgsl. Positions are ABSOLUTE world cells in Q16.16 fixed point
@@ -161,8 +314,10 @@ constexpr uint32_t kFluidSubsteps = 6;
 struct FluidSpawnOp {
   int32_t px, py, pz;   // position, fixed 16.16 world cells
   int32_t vx, vy, vz;   // velocity, fixed 16.16 cells/tick
-  uint32_t species = 0; // 0..3: which liquid this is (colour + attraction id)
-  uint32_t pad1 = 0;
+  uint32_t species = 0; // 0..3: grid species-mass slot (colour + attraction)
+  uint32_t mat = 0;     // material id for the particle's attr word — settle
+                        // writes this back as the voxel, splash droplets and
+                        // staining key on it
 };
 
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
@@ -561,16 +716,25 @@ struct TickParams {
   // Feeds voxel state through the daylight-gated reactions, so it is
   // determinism-critical: derived from `tick` only, never from frame timing.
   uint32_t dayPhase = 0;
-  // MLS-MPM fluid prototype: live particle count BEFORE this tick's spawns
-  // (also the append base the spawn kernel writes at), and this tick's spawn-op
-  // count. Both CPU-owned and pure functions of the op stream (see the fluid
-  // block above kFluidCap).
-  uint32_t fluidBase = 0;
+  // MLS-MPM fluid: the disturbance-excite switch (sim.fluidExciteMode read
+  // CPU-side each tick, the dayPhase precedent — tick input stream, so
+  // replays and determinism gates capture it) and this tick's spawn-op count.
+  // The live count is GPU-owned (fluidArgsStage[7]); see the fluid block
+  // above kFluidCap.
+  uint32_t fluidExciteEnable = 0;
   uint32_t fluidSpawnCount = 0;
   // Material id each MPM species splashes micro droplets as (0 = species never
   // poured -> no droplets). Recorded from the pour's brush material by the main
   // loop; vec4<u32> on the WGSL side, so keep this 16-byte aligned.
   uint32_t fluidSplashMat[4] = {0, 0, 0, 0};
+  // WORLD chunk coord of the 3x3x3 CPU-mirror corner (World::MirrorBaseFor of
+  // the player chunk — the SAME clamp EncodeReadbacks uses, or the fold and
+  // the voxel mirror would describe different cubes). The seam's mirrorFold
+  // kernel packs excited-fluid occupancy for exactly these 27 chunks so
+  // swimming sees particles the way it sees fullness voxels. vec3<i32> + pad
+  // on the WGSL side.
+  int32_t mirrorBase[3] = {0, 0, 0};
+  uint32_t padMb = 0;
 };
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
@@ -663,7 +827,56 @@ struct RenderParams {
   // Live MPM fluid particle count. 0 skips the fluid surface march entirely
   // (raymarch.wgsl), so a world with no fluid pays nothing for the feature.
   uint32_t fluidCount = 0;
-  uint32_t pad_dn1 = 0, pad_dn2 = 0;
+
+  // ---- the second moon + eclipses (celestial overhaul) ----
+  // Moon B rides its own Keplerian orbit with a 9-day synodic period against
+  // moon A's 8 — coprime, so the pair of phases does not repeat for 72 days.
+  // Everything here is a plain consequence of sim/celestial.cpp's geometry;
+  // none of it is authored per-frame.
+  //
+  // These two u32s complete the row that fluidCount starts, so the struct
+  // still ends on a whole std140 row. The three pads it used to carry are gone
+  // — spend padding before adding more (world.h's note on the bound-size
+  // validation above).
+  uint32_t eclipseBody = 0;   // 0 none, 1 moon A in front of the sun, 2 moon B
+  uint32_t pad_dn0 = 0;
+
+  float moon2Dir[3] = {0.0f, -1.0f, 0.0f};
+  float moon2Phase = 0.5f;
+  // Apparent angular radii, RADIANS, modulated by orbital distance — a moon
+  // at perigee is genuinely bigger. The tuner authors the base radius; this is
+  // what the shader must draw with, so the discs and the eclipse test can
+  // never disagree about how big a moon is.
+  float moonAngRadius = 0.03f;
+  float moon2AngRadius = 0.019f;
+  // Signed lit-limb orientation, +1 or -1. Without it a waxing and a waning
+  // crescent are the same picture and the terminator flips as the moon passes
+  // full.
+  float moonPhaseSign = 1.0f;
+  float moon2PhaseSign = 1.0f;
+
+  // Fraction of the SUN'S AREA currently occulted (circle-circle lens area),
+  // 0 = clear sky. Dims the disc, the sky and the key light together, so a
+  // partial eclipse is a partial dimming rather than a switch.
+  float solarEclipse = 0.0f;
+  // Fraction of moon B's disc hidden behind moon A. Render-only.
+  float lunarEclipse = 0.0f;
+  float pad_dn1 = 0.0f, pad_dn2 = 0.0f;
+
+  // The CELESTIAL POLE in the local horizon frame — the axis the starfield
+  // wheels about. It is an OUTPUT of latitude (the pole sits at elevation =
+  // latitude, due north), which is why there is no knob for it: the stars and
+  // the sun have to agree about where the axis is, and they only do if both
+  // read the same latitude. The shader used to rotate about a hardcoded
+  // vec3(0.28, 0.92, 0) — ~18 degrees off vertical toward the EAST, which is
+  // not where any pole is and ignored latitude entirely, so the starfield
+  // wheeled about one axis while the sun tracked another.
+  //
+  // Starts its OWN std140 row: a vec3 aligns to 16 bytes, so it cannot begin
+  // partway through the row solarEclipse opens. The two pads above are what
+  // close that row, and the one below closes this one.
+  float poleDir[3] = {0.0f, 1.0f, 0.0f};
+  float pad_dn3 = 0.0f;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
@@ -833,6 +1046,26 @@ struct WorldSnapshot {
   // which is what turns §2.4's structural claim into a measurement made on
   // every run rather than in a special configuration.
   uint32_t pageFaults = 0;
+  // ---- MLS-MPM fluid (seam) ----
+  // The GPU-owned live particle count and the fluidArgsStage event counters
+  // (the FA_* map in common.wgsl) as of this snapshot's tick. fluidLive is
+  // the CPU's ONLY view of the population — conservative for record/skip
+  // decisions, exact for the selftest's mass audits after a WaitIdle.
+  uint32_t fluidLive = 0;
+  uint32_t fluidSettledEighths = 0;   // event counter, that tick only
+  uint32_t fluidExcitedEighths = 0;   // event counter, that tick only
+  uint32_t fluidExciteRefused = 0;    // budget refusals, that tick only
+  uint32_t fluidLastSlot = 0;         // coarse position for the splash cue
+  // Active fluid block slots at capture (first fluidBlockCount entries of the
+  // block list). Feeds PageTable::UpdateFluidChunks so every chunk the seam
+  // may write is materialized — the settle converter's >= 8 calm-tick floor
+  // is what makes this latency safe.
+  uint32_t fluidBlockCount = 0;
+  std::vector<uint32_t> fluidBlocks;
+  // Excited-fluid eighths per mirror cell (27 x 4096 bytes, mirrorBase
+  // addressing — the same cube as `mirror`). Zeroed whenever no fluid is
+  // live, so a stale fold can never report ghost water.
+  std::vector<uint8_t> fluidMirror;
 };
 
 // One CPU-cached chunk of voxel data, fetched on demand through the async
@@ -854,6 +1087,38 @@ class World {
   bool EncodeReadbacks(const rhi::Device& device, const rhi::CommandEncoder& enc,
                        IVec3 playerChunkBase, uint32_t particleLivePage,
                        uint32_t tick);
+
+  // Excited-fluid eighths (0..8) at a world cell, from the snapshot's fluid
+  // mirror fold. 0 outside the 3x3x3 mirror, when no snapshot exists, or
+  // when no fluid is live — the same Unknown-is-conservative shape KindAt
+  // has, in the direction that never invents water.
+  uint32_t FluidEighthsAt(IVec3 cell) const {
+    if (!snap_.valid || snap_.fluidLive == 0 || snap_.fluidMirror.empty())
+      return 0;
+    IVec3 mc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+    IVec3 d{mc.x - snap_.mirrorBase.x, mc.y - snap_.mirrorBase.y,
+            mc.z - snap_.mirrorBase.z};
+    if (d.x < 0 || d.x > 2 || d.y < 0 || d.y > 2 || d.z < 0 || d.z > 2)
+      return 0;
+    size_t m = (size_t)((d.z * 3 + d.y) * 3 + d.x);
+    IVec3 lo{cell.x & 15, cell.y & 15, cell.z & 15};
+    return snap_.fluidMirror[m * kChunkVol +
+                             (size_t)((lo.z * 16 + lo.y) * 16 + lo.x)];
+  }
+
+  // The 3x3x3 mirror's clamped corner for a desired player-chunk corner.
+  // Shared by EncodeReadbacks and the tick's mirrorBase (TickParams) so the
+  // voxel mirror and the fluid-occupancy fold always describe the same cube.
+  IVec3 MirrorBaseFor(IVec3 playerChunkBase) const {
+    auto clampBase = [&](int v, int lo) {
+      if (v < lo) v = lo;
+      if (v > lo + (int)kNChunk - 3) v = lo + (int)kNChunk - 3;
+      return v;
+    };
+    return {clampBase(playerChunkBase.x, origin_.x),
+            clampBase(playerChunkBase.y, origin_.y),
+            clampBase(playerChunkBase.z, origin_.z)};
+  }
 
   // ---- toroidal residency window (DESIGN.md §3) ----
   // The resident cube covers world chunks [origin, origin+kNChunk) per axis;
@@ -1036,19 +1301,53 @@ class World {
   rhi::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   rhi::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
 
-  // ---- MLS-MPM fluid prototype (see the fluid block above kFluidCap) ----
-  // None of these is hashed, persisted or read by any CA kernel; fluidGrid,
-  // fluidBlockMap and fluidBlockList are per-substep scratch, cleared and
-  // rebuilt inside the tick. fluidParticles is the only carried state, and it
-  // is reconstructible from the op stream (deterministic solver + spawn ops).
-  rhi::Buffer fluidParticles;    // kFluidCap FluidParticle (72 B, see common.wgsl)
+  // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
+  // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,
+  // cleared and rebuilt inside the tick. fluidParticles[2] is the carried
+  // state: a ping-pong pair the seam's deterministic compaction copies
+  // between once per tick (read page_, write 1-page_, exactly the ballistic
+  // particles' parity convention), reconstructible from the op stream.
+  // The seam's converters write VOXELS (excite clears cells, settle fills
+  // them) — the settled side of the fluid lives in the hashed world domain.
+  rhi::Buffer fluidParticles[2]; // kFluidCap FluidParticle (128 B, common.wgsl)
   rhi::Buffer fluidSpawnOps;     // kMaxFluidSpawnsPerTick FluidSpawnOp
   rhi::Buffer fluidBlockMap;     // kNumChunks u32: 0 = inactive, else blockIdx+1
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
   rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
-                                 // mom xyz, species mass x3, pad — FLUID_GW)
-  rhi::Buffer fluidArgsStage;    // 4 u32: [0..2] node-pass dispatch args, [3] count
+                                 // mom xyz, species mass x3, foam — FLUID_GW)
+  rhi::Buffer fluidArgsStage;    // 16 u32 — the FA_* word map in common.wgsl:
+                                 // node args + live count + event counters
   rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
+  rhi::Buffer fluidPDispatchArgs; // 3 u32, indirect-only: per-particle passes
+                                  // + the seam's list-shaped dispatches (the
+                                  // seam re-copies between uses)
+  // Seam scratch (sim_fluid_seam.wgsl). All fill-cleared per fluid tick
+  // except fluidCalm, which persists (per-slot calm counters, cleared on
+  // worldgen/reset).
+  rhi::Buffer fluidExciteScratch; // [0..15] header, [16..16+N) per-slot counts,
+                                  // [16+N..16+2N) per-slot bases, then the
+                                  // slot list (N = kNumChunks)
+  rhi::Buffer fluidCalm;          // kNumChunks u32: consecutive calm ticks
+  rhi::Buffer fluidSettleScratch; // [0..N) per-slot max speed, [N..2N) settle
+                                  // marks (list idx | flags), [2N..2N+16]
+                                  // settle list header+slots, then bins:
+                                  // kFluidSettleMax * kChunkVol * 2 words
+  rhi::Buffer fluidCompactScratch; // per-256-span survivor counts + bases
+                                   // (kFluidCap/256 * 2 u32)
+  rhi::Buffer fluidMirror;        // 27 mirror chunks x 4096 cells, one byte
+                                  // of excited-fluid eighths per cell packed
+                                  // 4/word — the swimming query's view of the
+                                  // particles, folded by the seam's
+                                  // mirrorFold and read back with the
+                                  // snapshot (World::FluidEighthsAt)
+  rhi::Buffer fluidCellScratch;   // per active-block cell, 2 u32: [0] intent
+                                  // (mat<<16 | stainAmt<<3 | stainType,
+                                  // atomicMax by the seam's particleTick) and
+                                  // [1] flags (bit0 = a CA reaction consumed
+                                  // this cell's excited fluid, atomicOr by
+                                  // sim_step). The occupancy/consumption
+                                  // bridge between the CA and the particles;
+                                  // fill-cleared each fluid tick.
   rhi::Buffer debugBoxes;      // kMaxDebugBoxes DebugBox (collision overlay)
   rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
   rhi::Buffer bodyXforms;      // debris-body transforms (render)

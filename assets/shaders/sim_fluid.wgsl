@@ -71,7 +71,6 @@
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
 
 @group(1) @binding(0) var<storage, read_write> fluidParticles : array<FluidParticle>;
-@group(1) @binding(1) var<storage, read>       fluidSpawnOps : array<FluidSpawnOp>;
 @group(1) @binding(2) var<storage, read_write> fluidBlockMap : array<atomic<u32>>;
 @group(1) @binding(3) var<storage, read_write> fluidBlockList : array<u32>;
 @group(1) @binding(4) var<storage, read_write> fluidGrid : array<atomic<i32>>;
@@ -277,32 +276,11 @@ fn fluidSolid(c : vec3<i32>) -> bool {
   return k == CLASS_SOLID || k == CLASS_POWDER;
 }
 
-fn liveTotal() -> u32 { return min(T.fluidBase + T.fluidSpawnCount, FLUID_CAP); }
-
-// ---- spawn: CPU op stream -> particles, at CPU-known offsets ----------------
-// No atomics: the append base is T.fluidBase and the count is CPU-owned, so
-// slot assignment is a pure function of the op index (plan §5.1's "deletion/
-// compaction order likewise" concern does not arise — this prototype never
-// deletes).
-@compute @workgroup_size(64)
-fn spawn(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (gid.x >= T.fluidSpawnCount) { return; }
-  let slot = T.fluidBase + gid.x;
-  if (slot >= FLUID_CAP) { return; }  // CPU charges the budget; belt+braces
-  let op = fluidSpawnOps[gid.x];
-  var p : FluidParticle;
-  p.px = op.px; p.py = op.py; p.pz = op.pz;
-  p.vx = clamp(op.vx, -FLUID_VMAX, FLUID_VMAX);
-  p.vy = clamp(op.vy, -FLUID_VMAX, FLUID_VMAX);
-  p.vz = clamp(op.vz, -FLUID_VMAX, FLUID_VMAX);
-  p.c00 = 0; p.c01 = 0; p.c02 = 0;
-  p.c10 = 0; p.c11 = 0; p.c12 = 0;
-  p.c20 = 0; p.c21 = 0; p.c22 = 0;
-  p.j = FLUID_ONE;
-  p.species = op.species & 3u;
-  p.density = 0;
-  fluidParticles[slot] = p;
-}
+// The live particle population is GPU-OWNED now (the seam's compaction /
+// spawn / excite passes maintain fluidArgs[FA_LIVE] — sim_fluid_seam.wgsl).
+// Spawning moved there too (spawnAppend): with settle deleting particles and
+// excite creating them on the GPU, no CPU-known base exists any more.
+fn liveTotal() -> u32 { return min(fluidArgs[FA_LIVE], FLUID_CAP); }
 
 // ---- mark: flag every chunk the particle's 3^3 node support touches ---------
 // atomicOr of a constant is order-independent; the map is cleared by a Fill
@@ -507,6 +485,21 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var e = 1; e < clamp(TUNE_FLUID_EOS_POWER, 1, 7); e++) {
     pw = min(mq(pw, ratio), 1 << 22);     // ratio^power, capped at 64.0
   }
+  // Hydrostatic blend (seam O-4): a particle pre-compressed at excite time
+  // (J < 1, sim_fluid_seam.wgsl) contributes (1 - J) of extra ratio, so a
+  // reawakened deep column pushes back against its own weight from substep
+  // one instead of freefalling and jello-popping. Poured particles spawn at
+  // J = 1 (zero term) and g2p relaxes J toward 1, so the term self-retires
+  // as the real density gradient establishes.
+  //
+  // SYMMETRIC on purpose. The first version clamped at [0, ..] — J below 1
+  // added pressure, J above 1 added nothing — and that one-sided clamp
+  // RECTIFIED the tr(C) noise around J = 1 into net outward pressure: a
+  // sealed drained pool held ~0.45 cells/tick of churn indefinitely against
+  // 3%/tick damping, a perpetual-motion pump made of a clamp. Symmetric,
+  // J > 1 pulls back in (elastic tension) and the fluctuation averages to
+  // zero.
+  pw += clamp(FLUID_ONE - p.j, -FLUID_ONE / 2, FLUID_ONE / 2);
   var pr = mq(FLUID_STIFFNESS, clamp(pw - FLUID_ONE, -(1 << 16), 16 << 16));
   pr = max(pr, -FLUID_COHESION);
   // Species attraction: extra negative (pulling) pressure proportional to how
@@ -757,6 +750,13 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   let trc = p.c00 + p.c11 + p.c22;
   let f = clamp(FLUID_ONE + trc / FLUID_SUBSTEPS, 32768, 131072);
   p.j = clamp(((p.j >> 4u) * (f >> 4u)) >> 8u, FLUID_JMIN, FLUID_JMAX);
+  // Relax J toward 1 (~1.5%/substep, ~10-tick time constant). Two jobs: it
+  // retires the excite converter's hydrostatic pre-compression once the real
+  // density gradient carries the column, and it stops the tr(C) random walk
+  // from parking a resting particle's J at a clamp rail — which the p2g2
+  // hydrostatic blend would otherwise convert into permanent phantom
+  // pressure. Integer, symmetric, deterministic.
+  p.j += (FLUID_ONE - p.j) / 64;
 
   p.px += p.vx / FLUID_SUBSTEPS;
   p.py += p.vy / FLUID_SUBSTEPS;
@@ -772,19 +772,25 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   // material's authored stain (or nothing, if the material does not stain) —
   // so MPM water leaves wet marks and MPM blood leaves blood.
   //
-  // DETERMINISM. The fluid slot index IS a stable identity here (fluid
-  // particles are appended at CPU-known offsets and never die), so hashing
-  // (slot, tick, position) is state-keyed, not scheduling-keyed; the position
-  // term varies per substep, so one particle does not roll the same dice six
-  // times a tick. The droplet's own behaviour (claim hash on landing) keys on
-  // droplet state exactly like every other particle. The only scheduling
-  // freedom is WHICH pWrite slot the atomicAdd hands out, which nothing keys
-  // on (DESIGN.md §4) — same contract as explosion ejecta.
+  // DETERMINISM. The fluid slot index IS a stable identity here: slots are
+  // assigned by the seam's slot-order compaction and scans — pure functions
+  // of particle state — so hashing (slot, tick, position) is state-keyed,
+  // not scheduling-keyed; the position term varies per substep, so one
+  // particle does not roll the same dice six times a tick. The droplet's own
+  // behaviour (claim hash on landing) keys on droplet state exactly like
+  // every other particle. The only scheduling freedom is WHICH pWrite slot
+  // the atomicAdd hands out, which nothing keys on (DESIGN.md §4) — same
+  // contract as explosion ejecta.
   //
   // BOUNDED (rule 2): expected droplets = rate * eligible particles, eligible
   // requires sustained speed, droplets age out by FLUID_SPLASH_LIFE, and the
   // append drops on the floor at PARTICLE_CAP. A settled pool emits nothing.
-  let splashMat = T.fluidSplashMat[min(p.species, 3u)];
+  // The particle carries its own material now (attr word — excited water
+  // knows it is water, excited blood knows it is blood). fluidSplashMat is
+  // the legacy per-species table; attr wins when present so splash droplets
+  // and foam land-and-stain as the ACTUAL substance.
+  var splashMat = fpMat(p.attr);
+  if (splashMat == 0u) { splashMat = T.fluidSplashMat[min(p.species, 3u)]; }
   if (splashMat != 0u && FLUID_SPLASH_CHANCE > 0 &&
       p.density < FLUID_SPLASH_MAX_RHO) {
     // Speed² in Q16.16 (cells/tick)²: (v >> 8)² sums stay well inside i32
@@ -939,8 +945,9 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
 
         // Roll for an actual particle. Hashed on (slot, position, tick) for
         // the same reason the splash roll is: the fluid slot is a stable
-        // IDENTITY (particles are appended at CPU-known offsets and never
-        // die), so this is state-keyed, not scheduling-keyed. A distinct
+        // IDENTITY (assigned by the seam's deterministic slot-order
+        // compaction and scans), so this is state-keyed, not
+        // scheduling-keyed. A distinct
         // salt from the splash hash keeps foam and spray from firing on
         // exactly the same particles every time.
         let fh = pcg(0x9E3779B9u ^ gid.x ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^

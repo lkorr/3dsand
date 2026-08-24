@@ -767,6 +767,29 @@ struct Tuning {
     float fluidBubbleDensity = 1.05f; // above this x rest -> bubble
     float fluidSprayDensity = 0.42f;  // below this x rest -> spray
     int fluidFoamScaleIdx = 3;        // foam particle size (0=1/2 .. 3=1/6 vox)
+    // ---- MLS-MPM settle / excite seam: the CA <-> particle handover ----
+    int fluidExciteMode = 0;      // 0 = disturbance-excite off: the CA owns
+                                  // disturbed settled liquid (Phase-2 default,
+                                  // keeps the pinned world hash); 1 = settled
+                                  // liquid with air below converts to MPM
+                                  // particles
+    float fluidSettleEps = 0.9f;  // vox/s: a fluid block whose FASTEST
+                                  // particle stays below this counts as calm
+                                  // and may settle back into CA voxels
+    float fluidWakeSpeed = 3.6f;  // vox/s: grid-node speed at an active/
+                                  // settled interface above this excites the
+                                  // neighbouring settled liquid (progressive
+                                  // wake). Keep ~4x settleEps: the gap is the
+                                  // hysteresis
+    int fluidSettleTicks = 45;    // consecutive calm ticks before a block
+                                  // settles. The >= 8 floor is a HARD
+                                  // requirement: it covers the CPU-side
+                                  // page-materialization readback latency, so
+                                  // the settle converter never writes voxels
+                                  // into a chunk the mirror has not seen
+    float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
+                                  // stains an adjacent solid cell — the MPM
+                                  // counterpart of CA liquid staining
   } sim;
 
   // ---- day/night cycle ----
@@ -775,25 +798,75 @@ struct Tuning {
   // sunlight feed voxel state. cycleMinutes and the freeze controls therefore
   // change WHEN reactions fire — they are render-and-sim, and a change to them
   // changes the world hash. They are integers for the same reason.
+  // Since the celestial overhaul these are ORBITAL ELEMENTS, not a hand-drawn
+  // sun arc: sim/celestial.cpp solves Kepler's equation for the planet and
+  // both moons every frame and derives the sky from that geometry. Seasons,
+  // lunar phase, the 72-day beat between the two moons and eclipses are all
+  // consequences, so there is no knob for any of them — you change the orbit.
   struct DayNight {
-    int cycleMinutes = 20;      // real minutes for one full in-game day
+    int cycleMinutes = 20;      // real minutes for one full in-game SOLAR day
     int freeze = 0;             // 1 = pin the cycle at freezePhase
     int freezePhase = 32768;    // 0..65535, 0 = midnight, 32768 = noon
-    // Sun path. The sun rises in +X and sets in -X, tracking an arc whose peak
-    // elevation is set by `sunPeakElevation` (degrees) and whose orbital plane
-    // is tilted by `sunAzimuth` (degrees) — together these are latitude and
-    // season, and they are what decide how long shadows get at noon.
-    float sunPeakElevation = 58.0f;
+
+    // ---- the planet ----
+    // Axial tilt is the obliquity of the spin axis to the orbital plane, and
+    // it is the ENTIRE mechanism behind seasons: the same orbit seen through a
+    // tipped equator puts the sun higher in one half of the year than the
+    // other. Together with the observer's latitude it fixes noon elevation
+    // (90 - |lat - tilt| at the solstice) and day length — which is why it
+    // replaced the old `sunPeakElevation` clamp, a knob that set the sun's
+    // height while leaving day length wrong.
+    float axialTilt = 23.4f;        // degrees
+    float latitudeDeg = 42.0f;      // observer latitude, degrees north
+    float yearLengthDays = 96.0f;   // in-game days per orbit — the season rate
+    // Orbit shape. Near-circular by default: eccentricity mostly shows as the
+    // sun changing apparent size and as the equation of time, both subtle.
+    float orbitEccentricity = 0.017f;
+    float orbitArgPeriapsis = 283.0f;   // degrees — where in the year perihelion falls
+    float orbitMeanAnomaly0 = 0.0f;     // degrees — the epoch (tick 0) position
+    // Rotates the whole sky about the vertical, i.e. picks which way is east.
     float sunAzimuth = 24.0f;
+    // True angular RADIUS of the star as seen at a = 1, in degrees. The real
+    // sun is 0.266; larger reads better at game FOV and, since the eclipse
+    // test is pure geometry, directly sets how often a moon can cover it.
+    float sunAngularRadius = 0.30f;
+
     // How sharply day turns into night. This is the smoothed daylight weight
     // (R.sunUp) that crossfades the sky, ambient and key light; widening it
     // lengthens twilight.
     float twilightWidth = 0.22f;
-    // Moon orbit: lunarPeriodDays days per full phase cycle, inclined off the
-    // sun's plane so it is not simply opposite the sun.
+
+    // ---- moon A ----
+    // Periods are SYNODIC (new moon to new moon) because that is the cycle a
+    // player watches; celestial.cpp derives the sidereal period the orbit is
+    // actually integrated with. Authoring the sidereal period instead would
+    // make "an 8-day moon" mean an 8.7-day phase cycle.
     int lunarPeriodDays = 8;
-    float moonInclination = 18.0f;   // degrees off the solar plane
+    float moonInclination = 5.1f;    // degrees to the ecliptic — see below
+    float moonEccentricity = 0.055f;
+    float moonArgPeriapsis = 130.0f;
+    float moonNode = 0.0f;           // longitude of the ascending node, degrees
+    float moonMeanAnomaly0 = 40.0f;  // epoch position, degrees
+    // Angular radius in DEGREES at the orbit's mean distance.
+    float moonAngularRadius = 1.7f;
+
+    // ---- moon B ----
+    // 9 days against A's 8: coprime, so the pair of phases takes 72 days to
+    // repeat. Smaller, further out, and on a differently-oriented plane, so
+    // the two moons cross each other rather than travelling together.
+    int moon2PeriodDays = 9;
+    float moon2Inclination = 8.7f;
+    float moon2Eccentricity = 0.03f;
+    float moon2ArgPeriapsis = 20.0f;
+    float moon2Node = 95.0f;
+    float moon2MeanAnomaly0 = 200.0f;
+    float moon2AngularRadius = 1.05f;
+
     float starRotSpeed = 1.0f;       // multiplier on the star wheel rate
+
+    // Retained ONLY so an old tuning.json still loads without a warning storm.
+    // Nothing reads it; noon elevation is now an output of tilt + latitude.
+    float sunPeakElevation = 58.0f;
   } dayNight;
 
   // ---- weather: switches for the sun-driven reactions ----
@@ -924,6 +997,13 @@ struct Tuning {
     float starTwinkle = 0.35f;
     float milkyWayStrength = 0.55f;
     float milkyWayColor[3] = {0.52f, 0.56f, 0.78f};
+    // Pole of the galactic plane, in the STAR SPHERE's frame (it wheels with
+    // the stars). The band is drawn perpendicular to this, so rotating it
+    // moves the Milky Way across the constellations.
+    float galaxyNormal[3] = {0.36f, 0.52f, -0.77f};
+    // Half-width of the band in |cos| from that plane, before the fbm that
+    // ragged-edges it. Small values give a tight bright river.
+    float galaxyWidth = 0.17f;
     float nebulaStrength = 0.40f;
     float nebulaCool[3] = {0.16f, 0.30f, 0.62f};
     float nebulaWarm[3] = {0.55f, 0.20f, 0.38f};
@@ -933,14 +1013,37 @@ struct Tuning {
     float auroraLow[3] = {0.10f, 0.85f, 0.45f};
     float auroraHigh[3] = {0.65f, 0.20f, 0.85f};
 
-    // ---- moon ----
-    float moonRadius = 0.030f;      // angular radius, radians (~5x the real one)
+    // ---- moons ----
+    // NOTE: no moon RADIUS here. Apparent size is an output of the orbit
+    // (dayNight.moon*AngularRadius, modulated by orbital distance), because
+    // the disc and the eclipse test must read ONE number for how big a moon
+    // is. A render-side radius knob would be a second, diverging answer.
     float moonBrightness = 1.6f;
     float moonColor[3] = {0.92f, 0.93f, 0.88f};
+    // Offsets the fbm that carves this moon's maria and craters. Not a colour
+    // and not a position — it is the only thing making a moon a distinct rock
+    // rather than the same face drawn twice, so changing it rerolls the
+    // surface wholesale.
+    float moonMariaSeed[3] = {4.0f, 1.0f, 9.0f};
     float moonGlow = 0.35f;
     float moonEarthshine = 0.055f;
     float moonLightColor[3] = {0.55f, 0.68f, 1.0f};
     float moonLightIntensity = 0.16f;
+    // Moon B: a smaller, colder, dimmer body. Look only.
+    float moon2Color[3] = {0.78f, 0.80f, 0.86f};
+    float moon2MariaSeed[3] = {-21.0f, 13.0f, 37.0f};
+    float moon2Brightness = 0.72f;
+    float moon2LightIntensity = 0.055f;
+    float moon2LightColor[3] = {0.62f, 0.62f, 0.86f};
+    // How dark a TOTAL solar eclipse gets. 1 = the dome falls to its full
+    // night value; lower keeps some daylight so totality reads as
+    // daytime-gone-wrong rather than as night.
+    float eclipseDarkness = 0.93f;
+    // Perceptual exponent on covered AREA before that darkening applies. 3 is
+    // the old hardcoded cube: the world stays bright until the last sliver of
+    // sun goes, which is how a real partial eclipse reads. 1 tracks area
+    // linearly and looks like someone sliding the exposure down.
+    float eclipseCurve = 3.0f;
 
     // ---- night ambient ----
     float nightAmbSky[3] = {0.055f, 0.075f, 0.135f};
@@ -1416,20 +1519,20 @@ inline int BleedClumpVoxels(int radius) {
   }
 }
 
-// ---- day/night: celestial state for one tick --------------------------------
-// Everything the renderer needs about the sky at a given day phase. Derived
-// purely from the integer phase (and the lunar day count), so two machines at
-// the same tick compute the same sky — and, more importantly, the same
-// daylight weight that the sim's reactions are gated on.
-struct SkyState {
-  float sunDir[3];    // unit, toward the sun
-  float moonDir[3];   // unit, toward the moon
-  float dayT;         // 0..1, 0 = midnight
-  float sunUp;        // smoothed 0..1 daylight weight (drives all crossfades)
-  float moonPhase;    // 0 = new, 0.5 = full
-  float starRot;      // radians
-};
+// ---- day/night: the length of one day ---------------------------------------
+// Ticks in one SOLAR day, from the tuning cycle length. Sim runs at 30 Hz.
+//
+// This lives here rather than in test/support.cpp (where it used to) because
+// the orbital solver in sim/celestial.cpp needs it and does not link the
+// engine's render plumbing. Two copies of "how long is a day" would be a
+// silent way for the sky and the sim's reaction gate to disagree.
+inline uint32_t TicksPerDayFromTuning(const Tuning& t) {
+  int m = t.dayNight.cycleMinutes < 1 ? 1 : t.dayNight.cycleMinutes;
+  return (uint32_t)m * 60u * 30u;
+}
 
-// phase is the integer day phase (0..kDayPhaseMask); dayNumber counts elapsed
-// in-game days and drives the lunar phase. Both come from the tick.
-SkyState ComputeSkyState(const Tuning& t, uint32_t phase, uint32_t dayNumber);
+// SkyState and ComputeSky* now live in sim/celestial.h — the sky is driven by
+// a real Keplerian orbital simulation rather than a phase ramp, and that is a
+// large enough thing to own a file. Included here so every existing consumer
+// of tuning.h keeps seeing SkyState.
+#include "sim/celestial.h"

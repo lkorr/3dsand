@@ -165,6 +165,14 @@ class PageTable {
                        const std::vector<IVec3>& explosionCenters,
                        const World& world);
 
+  // Contributor for the MPM fluid seam (docs/PLAN_mpm_fluids.md §7). blockSlots
+  // are chunk SLOT indices from the one-tick-latent fluid block-list readback;
+  // spawnCells are this tick's CPU-known fluid spawn positions (world cells).
+  // The settle converter only fires after >= 8 calm ticks, so the readback
+  // latency is covered; the N26 ring covers sub-chunk drift since the snapshot.
+  void UpdateFluidChunks(const std::vector<uint32_t>& blockSlots,
+                         const std::vector<IVec3>& spawnCells, const World& world);
+
   // Step (2): tighten against an arriving snapshot, by INTERSECTION only.
   // `snapTick` is the tick the snapshot was stamped at; `encodeTick` the tick
   // being encoded. Skips entirely when the gap exceeds what the C(j) ring can
@@ -363,6 +371,11 @@ class PageTable {
   SlotSet scratch_;                       // dilation target, reused
   SlotSet opTargets_;                     // C(N) contributor (a), this tick
   SlotSet particleChunks_;                // C(N) contributor (b), carried
+  // C(N) contributor for the MPM fluid seam — chunks the excite/settle
+  // converters may write voxels into this tick; recomputed per call from the
+  // block-list readback + this tick's spawn cells, dilated one N26 ring to
+  // cover one tick of particle drift.
+  SlotSet fluidChunks_;
   SlotSet materialized_;                  // step (4)'s result, this tick
   // Contributor (d): the ACT SET of the slots Stream::FillSlots refilled
   // since the last Materialize — free surfaces and full-chunks-touching-air,

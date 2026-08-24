@@ -454,9 +454,17 @@
   .tsec>span{color:var(--dim);font-size:12px;line-height:1.5;max-width:78ch}
   .tsec.hidden{display:none}
   .trow{
-    display:grid;grid-template-columns:210px 1fr 96px 26px 150px 30px;gap:12px;align-items:center;
+    /* col 3 (number + unit) was 96px: a full-width input left no room for
+       units like "vox/s²", which clipped to nothing. 150px fits the widest
+       unit next to a usable number box. */
+    display:grid;grid-template-columns:210px 1fr 150px 26px 150px 30px;gap:12px;align-items:center;
     padding:5px 8px;border-radius:6px;
   }
+  /* number box + unit share the column: the box flexes, the unit never
+     shrinks or wraps — the unit is the part you need to read. */
+  .numwrap{display:flex;gap:6px;align-items:center;min-width:0}
+  .numwrap input.tnum{flex:1 1 56px;min-width:52px}
+  .numwrap .unit{flex:none;white-space:nowrap}
   .trow:hover{background:#1b222c}
   .trow.hidden{display:none}
   .trow.changed{background:#16202c}
@@ -2966,22 +2974,67 @@ function tuneRow(tab,pr,g){
       style:'display:flex;align-items:center;gap:7px'},chk,lbl));
     row.append(el('span',{}));   // no numeric box
   }else{
-    const rng=el('input',{type:'range',min:pr.min,max:pr.max,step:pr.step??'any'});
-    const num=el('input',{class:'tnum',type:'number',step:pr.step??'any'});
-    const write=v=>{
-      let x=roundStep(v,pr.step);
+    // log:true — the slider maps EXPONENTIALLY, so an equal nudge is an
+    // equal RATIO rather than an equal number of units. This is what makes a
+    // 0..43200 stiffness range usable: the whole 100..1000 region gets as
+    // much travel as 10k..43k, instead of living in the first three pixels.
+    //   * pr.lo sets the smallest positive value on the curve (defaults to
+    //     max/1000); the bottom slider position still snaps to pr.min
+    //     exactly, so 0 stays reachable on rows that allow it.
+    //   * signed rows (min < 0) get a symmetric curve with a dead-snap to 0
+    //     in the middle.
+    //   * slider-driven writes round to 3 significant digits instead of the
+    //     linear step (a fixed step is meaningless across decades); typed
+    //     values keep their precision.
+    const isLog=!!pr.log&&(pr.max??0)>0;
+    const signed=isLog&&(pr.min??0)<0;
+    const HI=signed?Math.max(Math.abs(pr.min),pr.max):pr.max;
+    const LO=isLog?(pr.lo??((pr.min>0?pr.min:0)||HI/1000)):0;
+    const R=1000,DEAD=signed?12:0;
+    const toVal=p=>{
+      if(!isLog)return p;
+      if(signed){
+        const a=Math.abs(p);
+        if(a<=DEAD)return 0;
+        const v=LO*Math.pow(HI/LO,(a-DEAD)/(R-DEAD));
+        return p<0?-v:v;
+      }
+      return p<=0?(pr.min??LO):LO*Math.pow(HI/LO,p/R);
+    };
+    const toPos=v=>{
+      if(!isLog)return v;
+      if(signed){
+        const a=Math.abs(v);
+        if(a<LO)return 0;
+        const p=DEAD+(R-DEAD)*Math.log(a/LO)/Math.log(HI/LO);
+        return Math.round(v<0?-p:p);
+      }
+      return v<=Math.max(pr.min??0,LO*1.0001)&&(pr.min??0)<LO?0:
+             Math.max(0,Math.round(R*Math.log(Math.max(v,LO)/LO)/Math.log(HI/LO)));
+    };
+    const sig3=x=>{
+      if(x===0)return 0;
+      const m=Math.pow(10,2-Math.floor(Math.log10(Math.abs(x))));
+      return Math.round(x*m)/m;
+    };
+    const rng=isLog
+      ?el('input',{type:'range',min:signed?-R:0,max:R,step:1})
+      :el('input',{type:'range',min:pr.min,max:pr.max,step:pr.step??'any'});
+    const num=el('input',{class:'tnum',type:'number',step:isLog?'any':(pr.step??'any')});
+    const write=(v,fromSlider)=>{
+      let x=isLog?(fromSlider?sig3(v):v):roundStep(v,pr.step);
       if(pr.int)x=Math.round(x);
       if(pr.min!=null)x=Math.max(pr.min,x);
       if(pr.max!=null)x=Math.min(pr.max,x);
       if(!isFinite(x))return;
       setTuned(g,pr.k,x);
-      rng.value=x;num.value=x;
+      rng.value=isLog?toPos(x):x;num.value=x;
       touchTune();mark();
     };
     const v0=(cur!=null?cur:(pr.min??0));
-    rng.value=v0;num.value=v0;
-    rng.addEventListener('input',()=>write(+rng.value));
-    num.addEventListener('change',()=>write(+num.value));
+    rng.value=isLog?toPos(v0):v0;num.value=v0;
+    rng.addEventListener('input',()=>write(toVal(+rng.value),true));
+    num.addEventListener('change',()=>write(+num.value,false));
     row.append(rng);
     const wrap=el('div',{style:'display:flex;gap:5px;align-items:center'},num);
     if(pr.u)wrap.append(el('span',{class:'unit'},pr.u));

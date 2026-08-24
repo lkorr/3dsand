@@ -257,7 +257,12 @@
     "fluidFoamDrag": 0.72,
     "fluidBubbleDensity": 1.05,
     "fluidSprayDensity": 0.42,
-    "fluidFoamScaleIdx": 3
+    "fluidFoamScaleIdx": 3,
+    "fluidExciteMode": 0,
+    "fluidSettleEps": 0.9,
+    "fluidWakeSpeed": 3.6,
+    "fluidSettleTicks": 45,
+    "fluidStainRate": 8.0
   },
   "render": {
     "skyGradient": 1.4,
@@ -558,6 +563,8 @@
       0.56,
       0.78
     ],
+    "galaxyNormal": [0.36, 0.52, -0.77],
+    "galaxyWidth": 0.17,
     "nebulaStrength": 0.4,
     "nebulaCool": [
       0.16,
@@ -581,13 +588,13 @@
       0.2,
       0.85
     ],
-    "moonRadius": 0.03,
     "moonBrightness": 1.6,
     "moonColor": [
       0.92,
       0.93,
       0.88
     ],
+    "moonMariaSeed": [4, 1, 9],
     "moonGlow": 0.35,
     "moonEarthshine": 0.055,
     "moonLightColor": [
@@ -596,6 +603,13 @@
       1
     ],
     "moonLightIntensity": 0.16,
+    "moon2Color": [0.78, 0.8, 0.86],
+    "moon2MariaSeed": [-21, 13, 37],
+    "moon2Brightness": 0.72,
+    "moon2LightIntensity": 0.055,
+    "moon2LightColor": [0.62, 0.62, 0.86],
+    "eclipseDarkness": 0.93,
+    "eclipseCurve": 3,
     "nightAmbSky": [
       0.055,
       0.075,
@@ -674,12 +688,30 @@
     "cycleMinutes": 6,
     "freeze": 0,
     "freezePhase": 32768,
-    "sunPeakElevation": 58,
     "sunAzimuth": 24,
     "twilightWidth": 0.22,
+    "starRotSpeed": 1,
+    "axialTilt": 23.4,
+    "latitudeDeg": 42,
+    "yearLengthDays": 96,
+    "orbitEccentricity": 0.017,
+    "orbitArgPeriapsis": 283,
+    "orbitMeanAnomaly0": 0,
+    "sunAngularRadius": 0.3,
     "lunarPeriodDays": 8,
-    "moonInclination": 18,
-    "starRotSpeed": 1
+    "moonInclination": 5.1,
+    "moonEccentricity": 0.055,
+    "moonArgPeriapsis": 130,
+    "moonNode": 0,
+    "moonMeanAnomaly0": 40,
+    "moonAngularRadius": 1.7,
+    "moon2PeriodDays": 9,
+    "moon2Inclination": 8.7,
+    "moon2Eccentricity": 0.03,
+    "moon2ArgPeriapsis": 20,
+    "moon2Node": 95,
+    "moon2MeanAnomaly0": 200,
+    "moon2AngularRadius": 1.05
   },
   "weather": {
     "waterFreezes": false,

@@ -46,8 +46,9 @@ const std::vector<Gate>& SpellGates();
 // missing from this list is a link-time-visible mistake (it never runs), which
 // is the failure mode we want rather than one that runs in an arbitrary slot.
 const char* const kOrder[] = {
-    "determinism", "sleep",       "pond-freeze",    "evaporation",
-    "blood-stain", "flung-liquid", "fluid-det",     "far-fog",  "far-downsample",
+    "celestial",   "determinism", "sleep",         "pond-freeze",    "evaporation",
+    "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
+    "fluid-excite", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "prefab",      "mob",         "settle-back",    "player-body",
