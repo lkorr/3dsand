@@ -1449,6 +1449,18 @@ int main(int argc, char** argv) {
   if (!noAudio) audioCues.Init(assetDir + "/sounds", mats);
 
   UIState ui;
+  {
+    const auto& fs = CurrentTuning().sim;
+    ui.fGravity     = fs.fluidGravity;
+    ui.fStiffness   = fs.fluidStiffness;
+    ui.fEosPower    = fs.fluidEosPower;
+    ui.fCohesion    = fs.fluidCohesion;
+    ui.fAttractSame = fs.fluidAttractSame;
+    ui.fAttractDiff = fs.fluidAttractDiff;
+    ui.fViscosity   = fs.fluidViscosity;
+    ui.fDamping     = fs.fluidDamping;
+    ui.fExciteMode  = fs.fluidExciteMode;
+  }
   for (auto& m : mats) {
     ui.materialNames.push_back(m.name);
     ui.materialColors.push_back(m.gpu.color0);
@@ -1572,13 +1584,6 @@ int main(int argc, char** argv) {
   // dropped once a snapshot at/after their tick arrives (the GPU count now
   // includes them).
   std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
-  // Material id each MPM species splashes micro droplets as, recorded from the
-  // pour's brush material (TickParams.fluidSplashMat). 0 until a species is
-  // first poured — no pour, no droplets.
-  uint32_t fluidSpeciesMat[4] = {0, 0, 0, 0};
-  // Last tick the MPM fluid was live: keeps the particle passes awake for the
-  // splash droplets (see particlesActive below).
-  uint32_t lastFluidTick = 0;
   // Splash sound cue: fired once per snapshot tick that reports a burst of
   // excitement, voiced through water's Impact slot (the Break precedent —
   // audio is presentation-only and reads the same readback).
@@ -1586,6 +1591,13 @@ int main(int argc, char** argv) {
   uint32_t fluidCueMat = 0;
   for (size_t i = 0; i < mats.size(); i++)
     if (mats[i].name == "water") { fluidCueMat = (uint32_t)i; break; }
+  // Material id each MPM species splashes micro droplets as, recorded from the
+  // pour's brush material (TickParams.fluidSplashMat). Species 0 defaults to
+  // water so the fluid tool pours water without an explicit key press.
+  uint32_t fluidSpeciesMat[4] = {fluidCueMat, 0, 0, 0};
+  // Last tick the MPM fluid was live: keeps the particle passes awake for the
+  // splash droplets (see particlesActive below).
+  uint32_t lastFluidTick = 0;
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -1748,8 +1760,11 @@ int main(int argc, char** argv) {
       grenades.push_back(g);
     }
     if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
-    if (captured && eTab.Pressed(key(GLFW_KEY_TAB)))
+    if (captured && eTab.Pressed(key(GLFW_KEY_TAB))) {
       ui.tool = (ui.tool + 1) % UIState::kToolCount;
+      if (ui.tool == UIState::kToolFluid && fluidCueMat != 0)
+        ui.brushMaterial = (int)fluidCueMat;
+    }
     if (captured && eM.Pressed(key(GLFW_KEY_M))) ui.spawnMob = true;
     if (captured && eB.Pressed(key(GLFW_KEY_B))) ui.placePrefab = true;
     if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
@@ -1850,6 +1865,18 @@ int main(int argc, char** argv) {
         for (const std::string& w : tune.warnings)
           std::fprintf(stderr, "tuning: %s\n", w.c_str());
         SetCurrentTuning(tune);
+        {
+          const auto& fs = tune.sim;
+          ui.fGravity     = fs.fluidGravity;
+          ui.fStiffness   = fs.fluidStiffness;
+          ui.fEosPower    = fs.fluidEosPower;
+          ui.fCohesion    = fs.fluidCohesion;
+          ui.fAttractSame = fs.fluidAttractSame;
+          ui.fAttractDiff = fs.fluidAttractDiff;
+          ui.fViscosity   = fs.fluidViscosity;
+          ui.fDamping     = fs.fluidDamping;
+          ui.fExciteMode  = fs.fluidExciteMode;
+        }
         avatarDefName = CurrentTuning().player.model;
         // Gore variance is drawn per mob at spawn, so mobs already standing in
         // the world hold profiles from the OLD tuning. Re-draw them here or an
@@ -3252,6 +3279,22 @@ int main(int argc, char** argv) {
       // to sit on top of the chrome, not the other way round.
       overlay.DrawHUD(ui);
       overlay.Draw(ui);
+
+      if (ui.fluidTuningDirty) {
+        ui.fluidTuningDirty = false;
+        Tuning t = CurrentTuning();
+        t.sim.fluidGravity     = ui.fGravity;
+        t.sim.fluidStiffness   = ui.fStiffness;
+        t.sim.fluidEosPower    = ui.fEosPower;
+        t.sim.fluidCohesion    = ui.fCohesion;
+        t.sim.fluidAttractSame = ui.fAttractSame;
+        t.sim.fluidAttractDiff = ui.fAttractDiff;
+        t.sim.fluidViscosity   = ui.fViscosity;
+        t.sim.fluidDamping     = ui.fDamping;
+        t.sim.fluidExciteMode  = ui.fExciteMode;
+        SetCurrentTuning(t);
+        sim.ReloadShaders(ctx.device);
+      }
 
       // grenades render as emissive sprite cubes (flash as the fuse runs out)
       std::vector<Sprite> sprv;

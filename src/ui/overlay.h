@@ -87,6 +87,19 @@ struct UIState {
   // clearFluid is a one-shot request consumed inside the tick loop.
   uint32_t fluidCount = 0;
   bool clearFluid = false;
+  // Live tuning copies — main.cpp seeds these from CurrentTuning().sim on
+  // startup.  The overlay draws sliders; main.cpp detects changes (via
+  // fluidTuningDirty) and writes them back + reloads shaders.
+  float fGravity = 98.1f;
+  float fStiffness = 5400.0f;
+  int   fEosPower = 4;
+  float fCohesion = 90.0f;
+  float fAttractSame = 45.0f;
+  float fAttractDiff = -90.0f;
+  float fViscosity = 1.5f;
+  float fDamping = 0.0f;
+  int   fExciteMode = 0;
+  bool  fluidTuningDirty = false;
 
   // hotbar (game/item.h): mirrored out of Inventory each frame for the HUD.
   // The overlay never owns inventory state — it only draws it.
