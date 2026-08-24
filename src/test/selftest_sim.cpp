@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -1139,10 +1140,285 @@ Status GateDaylightBoundary(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- celestial: the orbital simulation behind the sky --------------------
+//
+// A screenshot cannot tell a Keplerian solve from a phase ramp that happens to
+// look plausible, so this asserts the PROPERTIES that separate them. Each one
+// fails under a specific plausible bug rather than under "it looks wrong":
+//
+//  (a) The day closes. Sun elevation at t and at t + one solar day must match.
+//      Fails if the sidereal/solar distinction is inverted — the classic bug,
+//      and one that drifts a whole hour per game-year, i.e. invisibly at first.
+//  (b) Seasons exist and have the RIGHT AMPLITUDE. Noon elevation must swing
+//      by ~2x the axial tilt across the year, and peak at 90 - |lat - tilt|.
+//      A ramp with a tilt knob wired to nothing passes any "does it move"
+//      test; only the amplitude pins it to real geometry.
+//  (c) The moons hit their AUTHORED SYNODIC periods. celestial.cpp converts
+//      synodic -> sidereal before integrating; if that conversion is dropped
+//      an "8-day moon" runs at 8.7 days and nobody notices for a week.
+//  (d) The 8/9 periods are coprime: the PAIR of phases must not repeat inside
+//      72 days. This is the whole reason for the second moon's period choice.
+//  (e) Eclipses happen, and are RARE. Both halves matter: inclination wired to
+//      zero gives one a month, and a sign error in the node gives none ever.
+//  (f) Purity. The same tick must produce a bit-identical SkyState, and the
+//      solve must never produce a NaN — including at negative ticks, which the
+//      reverse-time slider generates.
+//  (g) The clock's identity property, which is what protects the pinned hash:
+//      a disengaged CelestialClock must return the sim tick unchanged.
+//
+// CPU-only: no GPU work, no world, runs in milliseconds.
+Status GateCelestial(Ctx& c, std::string& detail) {
+  (void)c;
+  const Tuning saved = CurrentTuning();
+  Tuning tun = saved;
+  tun.dayNight.freeze = 0;
+  SetCurrentTuning(tun);
+
+  const Tuning::DayNight& d = tun.dayNight;
+  const double tpd = (double)TicksPerDay(tun);
+  const double kRad = 57.2957795130823;
+  auto elevDeg = [&](const SkyState& s) {
+    return std::asin(std::max(-1.0f, std::min(1.0f, s.sunDir[1]))) * kRad;
+  };
+
+  std::string fail;
+  auto require = [&](bool cond, const char* what) {
+    if (!cond && fail.empty()) fail = what;
+  };
+
+  // (a) THE SOLAR DAY CLOSES ON ITSELF. This is the sidereal/solar test, and
+  // it is measured as the drift of the sun's AZIMUTH at a fixed time of day,
+  // not of its elevation.
+  //
+  // Elevation is the wrong probe and the first version of this test used it:
+  // one day of orbital motion legitimately moves the sun's declination (~1.5
+  // deg/day at the default 96-day year), and near the horizon the elevation
+  // response to that is amplified several-fold — 6 deg of perfectly correct
+  // seasonal drift, indistinguishable from the bug. AZIMUTH at a fixed hour is
+  // fixed by the ROTATION alone, so it isolates exactly the question being
+  // asked: if the sidereal and solar rates were swapped the sun would land
+  // ~3.75 deg further round the compass each day (a full turn per year) and
+  // this fails on day one.
+  auto azDeg = [&](const SkyState& s) {
+    return std::atan2((double)s.sunDir[0], (double)s.sunDir[2]) * kRad;
+  };
+  // The residual that survives is the EQUATION OF TIME: on a tilted, eccentric
+  // orbit the sun's right ascension does not advance uniformly, so apparent
+  // solar noon oscillates about mean solar noon across the year. That is real
+  // physics, it is bounded and PERIODIC (it returns to zero), and the test has
+  // to distinguish it from a rate error, which is unbounded and accumulates.
+  //
+  // So the assertion is on the ACCUMULATED drift over a whole year, not on the
+  // day-to-day step: sum the signed daily azimuth changes and require the
+  // total to come back to ~0. A sidereal/solar swap accumulates a full 360;
+  // the equation of time cancels to within a degree.
+  double dayCloseErr = 0.0, accum = 0.0;
+  const int closeDays = std::max(2, (int)d.yearLengthDays);
+  double aPrev = azDeg(ComputeSky(tun, 0.5 * tpd));
+  for (int k = 1; k <= closeDays; k++) {
+    const double a = azDeg(ComputeSky(tun, (k + 0.5) * tpd));
+    const double diff = std::fmod(a - aPrev + 540.0, 360.0) - 180.0;
+    accum += diff;
+    dayCloseErr = std::max(dayCloseErr, std::fabs(diff));
+    aPrev = a;
+  }
+  require(std::fabs(accum) < 2.0,
+          "the solar year does not close (sidereal/solar rate error)");
+  // The equation of time itself is bounded: on a 23.4-degree, e=0.017 orbit
+  // its full swing is about 30 minutes of hour angle = ~8 degrees, so no
+  // single day may step more than that. This catches a discontinuity (a
+  // wrapped angle, a branch cut) that the accumulated sum would cancel out.
+  require(dayCloseErr < 10.0, "apparent noon jumps by more than the equation of time allows");
+
+  // (a2) MEAN SOLAR NOON IS dayT == 0.5. This is the tie between the float sky
+  // and the sim's INTEGER day phase: DayPhaseForTick maps tick -> phase with
+  // 0x8000 = noon, daylightStrength() peaks there, and the reactions gated on
+  // it must fire when the sun the player can see is actually up. If the sun's
+  // peak drifted off 0.5, water would evaporate in the dark.
+  //
+  // Tolerance is 0.02 of a day (~17 min at the default cycle), which covers
+  // the equation of time (the apparent-vs-mean noon oscillation an eccentric
+  // tilted orbit genuinely has) and nothing else.
+  double worstNoon = 0.0;
+  for (int day = 0; day < 24; day++) {
+    double bestT = 0.0, bestE = -1e9;
+    for (int q = 0; q < 480; q++) {
+      const double frac = q / 480.0;
+      const double e = elevDeg(ComputeSky(tun, (day * 4 + frac) * tpd));
+      if (e > bestE) { bestE = e; bestT = frac; }
+    }
+    worstNoon = std::max(worstNoon, std::fabs(bestT - 0.5));
+  }
+  require(worstNoon < 0.02, "the sun does not peak at dayT 0.5 (sky and sim day phase disagree)");
+
+  // (b) seasons: amplitude and peak.
+  double noonLo = 1e9, noonHi = -1e9;
+  const int yearDays = (int)d.yearLengthDays;
+  for (int day = 0; day < yearDays; day++) {
+    // Sample the whole day and keep its maximum: "noon" drifts with the
+    // equation of time, so sampling at exactly 0.5 would measure that drift
+    // rather than the season.
+    double best = -1e9;
+    for (int q = 0; q < 24; q++)
+      best = std::max(best, elevDeg(ComputeSky(tun, (day + q / 24.0) * tpd)));
+    noonLo = std::min(noonLo, best);
+    noonHi = std::max(noonHi, best);
+  }
+  const double swing = noonHi - noonLo;
+  const double wantPeak = 90.0 - std::fabs((double)d.latitudeDeg -
+                                           (double)d.axialTilt);
+  require(std::fabs(swing - 2.0 * d.axialTilt) < 3.0,
+          "seasonal swing is not 2x the axial tilt");
+  require(std::fabs(noonHi - wantPeak) < 3.0,
+          "solstice noon elevation is not 90 - |lat - tilt|");
+
+  // (c) synodic periods. Count full moons (phase maxima at 0.5) over a long
+  // span and divide — robust to where in the cycle the epoch happens to fall.
+  // Detected as LOCAL MAXIMA of the phase, not as a threshold crossing. An
+  // inclined orbit never reaches exact opposition — moon A at 5.1 degrees tops
+  // out around phase 0.486, never 0.5 — so a "phase >= 0.4995" test finds no
+  // full moons at all and reports a period of zero. (It did, on the first run.)
+  auto synodic = [&](bool second) {
+    int fulls = 0;
+    double first = -1.0, last = -1.0;
+    float p0 = 0.0f, p1 = 0.0f;
+    const int span = 400;  // days
+    for (int k = 0; k < span * 240; k++) {
+      const double t = k * (tpd / 240.0);
+      const SkyState s = ComputeSky(tun, t);
+      const float p2 = second ? s.moon2Phase : s.moonPhase;
+      // A strict interior maximum, and only in the gibbous half — the phase
+      // curve has a matching minimum at new moon, and counting both would
+      // halve the reported period.
+      if (k >= 2 && p1 > p0 && p1 >= p2 && p1 > 0.40f) {
+        const double tf = (t - tpd / 240.0) / tpd;
+        if (first < 0.0) first = tf;
+        last = tf;
+        fulls++;
+      }
+      p0 = p1;
+      p1 = p2;
+    }
+    return fulls > 1 ? (last - first) / (fulls - 1) : 0.0;
+  };
+  const double synA = synodic(false), synB = synodic(true);
+  require(std::fabs(synA - (double)d.lunarPeriodDays) < 0.35,
+          "moon A does not hit its authored synodic period");
+  require(std::fabs(synB - (double)d.moon2PeriodDays) < 0.35,
+          "moon B does not hit its authored synodic period");
+
+  // (d) the phase PAIR must not repeat before the 72-day grand cycle. Compare
+  // day 0's pair against every later day; the closest match inside the cycle
+  // must be meaningfully far from an exact repeat.
+  const SkyState s0 = ComputeSky(tun, 0.0);
+  double nearestPair = 1e9;
+  int nearestDay = 0;
+  for (int day = 1; day < 71; day++) {
+    const SkyState s = ComputeSky(tun, day * tpd);
+    const double dp = std::fabs(s.moonPhase - s0.moonPhase) +
+                      std::fabs(s.moon2Phase - s0.moon2Phase);
+    if (dp < nearestPair) { nearestPair = dp; nearestDay = day; }
+  }
+  require(nearestPair > 0.02,
+          "the two moons' phase pair repeats inside 72 days (periods not coprime?)");
+
+  // (e) eclipses: they happen, and they are rare. Sampled every 4 ticks over
+  // 400 game-days, which is fine enough not to step over totality (a total
+  // eclipse lasts minutes of game time, i.e. hundreds of ticks).
+  long eclSamples = 0, samples = 0;
+  double maxCover = 0.0;
+  for (long k = 0; k < (long)(400.0 * tpd); k += 4) {
+    const SkyState s = ComputeSky(tun, (double)k);
+    if (s.solarEclipse > 0.0f) {
+      eclSamples++;
+      maxCover = std::max(maxCover, (double)s.solarEclipse);
+    }
+    samples++;
+  }
+  const double eclFrac = samples ? (double)eclSamples / (double)samples : 0.0;
+  // Rare, but not impossible: under 2% of all daylit time, and at least one
+  // grazing contact in 400 days. A zero here means the geometry never lines
+  // up — which is what a node/inclination sign error looks like.
+  require(eclSamples > 0, "no solar eclipse in 400 game-days (geometry never aligns)");
+  require(eclFrac < 0.02, "solar eclipses are not rare");
+
+  // (f) purity + finiteness, including negative ticks (reverse time).
+  bool pure = true, finite = true;
+  for (double t : {0.0, 1.0, 12345.0, 987654.0, -12345.0, -987654.5}) {
+    const SkyState a = ComputeSky(tun, t);
+    const SkyState b = ComputeSky(tun, t);
+    if (std::memcmp(&a, &b, sizeof(SkyState)) != 0) pure = false;
+    // Checked field by field rather than by walking the struct as an array of
+    // floats: SkyState holds a u32 (eclipseBody) and three nested BodyStates,
+    // so a flat reinterpret both reads padding and reads that u32 as a float,
+    // where a perfectly valid bit pattern can look like a NaN.
+    const float scalars[] = {
+        a.sunDir[0],   a.sunDir[1],   a.sunDir[2],
+        a.moonDir[0],  a.moonDir[1],  a.moonDir[2],
+        a.moon2Dir[0], a.moon2Dir[1], a.moon2Dir[2],
+        a.dayT,        a.sunUp,       a.starRot,
+        a.moonPhase,   a.moon2Phase,
+        a.moonAngRadius, a.moon2AngRadius,
+        a.moonPhaseSign, a.moon2PhaseSign,
+        a.solarEclipse, a.lunarEclipse, a.yearT,
+        a.sun.angRadius, a.moonA.angRadius, a.moonB.angRadius,
+        a.sun.dist,      a.moonA.dist,      a.moonB.dist,
+    };
+    for (float v : scalars) {
+      if (!std::isfinite(v)) finite = false;
+    }
+  }
+  require(pure, "ComputeSky is not a pure function of the tick");
+  require(finite, "ComputeSky produced a non-finite value");
+
+  // (g) the clock's identity property. THIS is what protects the pinned hash:
+  // a disengaged clock must hand back the sim tick untouched, and setting the
+  // scale to 1.0x must not engage it.
+  CelestialClock clk;
+  clk.SetScale(1.0f, 500u);
+  for (int i = 0; i < 10; i++) clk.Advance();
+  const bool identity = !clk.engaged && clk.SimTick(777u) == 777u &&
+                        clk.PrevSimTick(777u) == 776u &&
+                        clk.RenderTick(777u) == 777.0;
+  require(identity, "a disengaged CelestialClock is not the identity map");
+  // ...and once engaged it must be exact, including in reverse. At -1x from
+  // tick 1000, ten advances must land exactly on 990 with no remainder.
+  CelestialClock rev;
+  rev.SetScale(-1.0f, 1000u);
+  for (int i = 0; i < 10; i++) rev.Advance();
+  require(rev.engaged && rev.ticks == 990 && rev.rem == 0,
+          "reverse time is not the exact mirror of forward time");
+  // A fractional scale must not drift: 0.5x for 100 ticks is exactly 50.
+  CelestialClock half;
+  half.SetScale(0.5f, 0u);
+  for (int i = 0; i < 100; i++) half.Advance();
+  require(half.ticks == 50, "fractional time scale drifts");
+
+  SetCurrentTuning(saved);
+
+  char buf[700];
+  std::snprintf(buf, sizeof(buf),
+                "year closes to %.3f deg (max step %.2f); noon at dayT 0.5 +-%.4f; "
+                "season swing %.1f deg (tilt %.1f, "
+                "peak %.1f vs %.1f expected); synodic A %.2f / B %.2f days "
+                "(authored %d / %d); nearest phase-pair repeat day %d at "
+                "%.3f; eclipses %.4f%% of samples, max coverage %.2f; "
+                "pure=%d finite=%d clock=%d%s%s",
+                accum, dayCloseErr, worstNoon,
+                swing, (double)d.axialTilt, noonHi, wantPeak,
+                synA, synB, d.lunarPeriodDays, d.moon2PeriodDays,
+                nearestDay, nearestPair, eclFrac * 100.0, maxCover,
+                (int)pure, (int)finite, (int)identity,
+                fail.empty() ? "" : " -- FAILED: ", fail.c_str());
+  detail = buf;
+  return fail.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
   static const std::vector<Gate> g = {
+      {"celestial", "sim", {}, false, GateCelestial},
       {"determinism", "sim", {}, false, GateDeterminism},
       {"sleep", "sim", {}, false, GateSleep},
       {"pond-freeze", "sim", {}, false, GatePondFreeze},

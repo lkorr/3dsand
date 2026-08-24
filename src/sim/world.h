@@ -85,6 +85,147 @@ inline uint32_t DayPhaseForTick(uint32_t tick, uint32_t ticksPerDay,
                     ticksPerDay) & kDayPhaseMask;
 }
 
+// ---- the celestial clock (dev time-scale) ------------------------------------
+// The sky is driven by a Keplerian orbital simulation (sim/celestial.h) whose
+// only input is a CELESTIAL TICK. Normally that is the sim tick, one for one.
+// The dev overlay's time-speed slider decouples them so the sun and moons can
+// be run fast, slow, or backwards without touching the sim rate.
+//
+// Two decisions here are worth defending, because the obvious versions of both
+// are wrong:
+//
+//   * IT IS AN INTEGER COUNTER, not a float accumulator. The SIM reads this
+//     clock too — the daylight-gated reactions (water freezing at night, snow
+//     melting in the sun) must respond to the accelerated time or cranking the
+//     slider shows a racing sun over a world that ignores it, which is worse
+//     than useless for tuning weather. Sim state therefore depends on this
+//     value, so it has to reach TickParams.dayPhase as a u32 derived from
+//     integers (CLAUDE.md rule 1). `scaleNum/scaleDen` is a rational multiplier
+//     and `rem` carries the exact remainder, so no float ever touches the path.
+//   * SCALE 1 IS BIT-IDENTICAL TO THE OLD BEHAVIOUR. At scaleNum == scaleDen
+//     the counter advances by exactly one per tick from zero, so `Ticks()`
+//     equals the sim tick and the pinned world hash cannot move. --selftest,
+//     --shot and every headless path leave the clock at its default and are
+//     structurally unable to observe this feature at all.
+//
+// Changing the scale away from 1 DOES change the world hash, and that is
+// intended and documented: it is a dev tool, and it advertises itself in the
+// overlay.
+struct CelestialClock {
+  // OFF by default, and this is the load-bearing part. While `engaged` is
+  // false the clock is not consulted at all: the celestial tick IS the sim
+  // tick, byte for byte, and every headless path (--selftest, --shot,
+  // --frames, every gate) is structurally unable to observe this feature.
+  // It is set true the first time the slider leaves 1.0x and stays true for
+  // the session, since by then the two clocks have genuinely diverged and
+  // silently snapping back to the sim tick would jump the sky.
+  bool engaged = false;
+
+  // Rational time multiplier, exact. den is never 0.
+  int64_t scaleNum = 1;
+  int64_t scaleDen = 1;
+  // Accumulated celestial ticks (signed: reverse time is allowed) and the
+  // exact fractional remainder, in units of 1/scaleDen.
+  int64_t ticks = 0;
+  int64_t rem = 0;
+  // The value `ticks` held before the last Advance(). At 100x the clock jumps
+  // ~100 day-phase ticks per sim tick, so "did daylight just switch on" cannot
+  // be answered against `ticks - 1` — that is a phase the world never
+  // occupied, and the day/night wake handshake would sail through several
+  // dawns without firing. This is the previous phase the world ACTUALLY saw.
+  int64_t prevTicks = 0;
+
+  // Set the multiplier from the UI's float. Quantised to 1/1024 so the counter
+  // stays exact; the slider's own step is coarser than that.
+  //
+  // `simTickNow` is the tick the clock adopts if this is the call that engages
+  // it — so the sky does not jump when the slider first moves.
+  void SetScale(float s, uint32_t simTickNow) {
+    const int64_t den = 1024;
+    double v = (double)s * (double)den;
+    if (v > 1e6) v = 1e6;
+    if (v < -1e6) v = -1e6;
+    const int64_t num = (int64_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
+    if (!engaged) {
+      if (num == den) return;  // still 1.0x: stay disengaged, stay identity
+      engaged = true;
+      ticks = (int64_t)simTickNow;
+      prevTicks = ticks;
+      rem = 0;
+    }
+    if (num == scaleNum && den == scaleDen) return;
+    // Re-base the remainder onto the new denominator so a mid-flight scale
+    // change does not jump the sky. Denominators are equal in practice; the
+    // general form is cheap and means the invariant holds regardless.
+    if (den != scaleDen && scaleDen != 0) rem = rem * den / scaleDen;
+    scaleNum = num;
+    scaleDen = den;
+  }
+
+  // Advance by one sim tick. A no-op while disengaged.
+  void Advance() {
+    if (!engaged || scaleDen <= 0) return;
+    prevTicks = ticks;
+    // One tick of scaled time, carried exactly: `acc` is the whole position in
+    // units of 1/scaleDen, so nothing is ever rounded away and the counter is
+    // identical whichever order the frames arrived in.
+    //
+    // Written as one accumulator rather than as a separate ticks/rem pair with
+    // a division per step, because the pair form is easy to get subtly wrong:
+    // an earlier version floor-divided `rem` after adding, which is correct in
+    // isolation but double-applied the carry whenever a scale change had left
+    // a remainder behind. This form has no carry to lose.
+    const int64_t acc = ticks * scaleDen + rem + scaleNum;
+    // Floor toward negative infinity so reverse time is the exact mirror of
+    // forward time rather than drifting by a tick per second.
+    int64_t q = acc / scaleDen;
+    int64_t r = acc % scaleDen;
+    if (r < 0) { q -= 1; r += scaleDen; }
+    ticks = q;
+    rem = r;
+  }
+
+  // The integer celestial tick the sim's day phase is derived from. Clamped
+  // non-negative: DayPhaseForTick takes a u32, and a negative clock would wrap
+  // into a phase that jumps. Reverse time still runs the RENDER sky backwards
+  // (RenderTick is a double and handles negatives exactly) — it just holds the
+  // sim's day phase at the epoch once it walks past it, which is the only
+  // sensible reading of "the reactions ran before the world began".
+  uint32_t SimTick(uint32_t simTick) const {
+    if (!engaged) return simTick;
+    return ticks <= 0 ? 0u : (uint32_t)ticks;
+  }
+
+  // The celestial tick the world occupied on the PREVIOUS sim tick. Used by
+  // the day/night wake handshake, which asks "did daylight switch between then
+  // and now" — a question `SimTick() - 1` answers wrongly at any scale but 1.
+  uint32_t PrevSimTick(uint32_t simTick) const {
+    if (!engaged) return simTick == 0 ? 0u : simTick - 1u;
+    return prevTicks <= 0 ? 0u : (uint32_t)prevTicks;
+  }
+
+  // The (possibly fractional, possibly negative) tick the RENDER sky uses.
+  double RenderTick(uint32_t simTick) const {
+    if (!engaged) return (double)simTick;
+    return (double)ticks + (scaleDen ? (double)rem / (double)scaleDen : 0.0);
+  }
+};
+
+// The one clock the game's sky and daylight-gated reactions run on.
+//
+// A global rather than a parameter threaded through SubmitTick/
+// WriteRenderParams, because it must reach ~15 call sites across the frame
+// loop, the shot paths and the selftest, and every one of them that DIDN'T
+// pass it would silently fall back to the sim tick — a divergence between what
+// you see and what the world does, which is precisely the failure this whole
+// subsystem is built to prevent. It is written only by the frame loop
+// (main.cpp), which advances it exactly once per sim tick.
+//
+// Every headless path (--selftest, --shot, --frames) leaves it at its default
+// identity scale and never calls Advance() out of step with the tick, so those
+// paths see celestialTick == tick and the pinned world hash is untouched.
+CelestialClock& Celestial();
+
 // Integer daylight strength for a phase: 0 at night, rising to 255 at noon.
 // EXACT mirror of daylightStrength() in common.wgsl — the CPU uses it to
 // decide which ticks need a wake-all, and the GPU uses it to gate reactions.
@@ -631,7 +772,41 @@ struct RenderParams {
   // Live MPM fluid particle count. 0 skips the fluid surface march entirely
   // (raymarch.wgsl), so a world with no fluid pays nothing for the feature.
   uint32_t fluidCount = 0;
-  uint32_t pad_dn1 = 0, pad_dn2 = 0;
+
+  // ---- the second moon + eclipses (celestial overhaul) ----
+  // Moon B rides its own Keplerian orbit with a 9-day synodic period against
+  // moon A's 8 — coprime, so the pair of phases does not repeat for 72 days.
+  // Everything here is a plain consequence of sim/celestial.cpp's geometry;
+  // none of it is authored per-frame.
+  //
+  // These two u32s complete the row that fluidCount starts, so the struct
+  // still ends on a whole std140 row. The three pads it used to carry are gone
+  // — spend padding before adding more (world.h's note on the bound-size
+  // validation above).
+  uint32_t eclipseBody = 0;   // 0 none, 1 moon A in front of the sun, 2 moon B
+  uint32_t pad_dn0 = 0;
+
+  float moon2Dir[3] = {0.0f, -1.0f, 0.0f};
+  float moon2Phase = 0.5f;
+  // Apparent angular radii, RADIANS, modulated by orbital distance — a moon
+  // at perigee is genuinely bigger. The tuner authors the base radius; this is
+  // what the shader must draw with, so the discs and the eclipse test can
+  // never disagree about how big a moon is.
+  float moonAngRadius = 0.03f;
+  float moon2AngRadius = 0.019f;
+  // Signed lit-limb orientation, +1 or -1. Without it a waxing and a waning
+  // crescent are the same picture and the terminator flips as the moon passes
+  // full.
+  float moonPhaseSign = 1.0f;
+  float moon2PhaseSign = 1.0f;
+
+  // Fraction of the SUN'S AREA currently occulted (circle-circle lens area),
+  // 0 = clear sky. Dims the disc, the sky and the key light together, so a
+  // partial eclipse is a partial dimming rather than a switch.
+  float solarEclipse = 0.0f;
+  // Fraction of moon B's disc hidden behind moon A. Render-only.
+  float lunarEclipse = 0.0f;
+  float pad_dn1 = 0.0f, pad_dn2 = 0.0f;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

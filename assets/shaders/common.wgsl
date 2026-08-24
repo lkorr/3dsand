@@ -379,8 +379,31 @@ struct RenderParams {
   // Live MPM fluid particle count (0 = none anywhere, so the fluid surface
   // march in raymarch.wgsl is skipped wholesale — rule 2 for the render path).
   fluidCount : u32,
-  _pdn1      : u32,
-  _pdn2      : u32,
+  // ---- second moon + eclipses (must match RenderParams in world.h) ----
+  // Moon B is a real second body on its own Keplerian orbit (sim/celestial.*),
+  // 9-day synodic period against moon A's 8 — coprime, so the phase pair takes
+  // 72 days to repeat.
+  eclipseBody : u32,   // 0 none, 1 moon A in front of the sun, 2 moon B
+  _pdn0      : u32,
+  moon2Dir   : vec3f,  // unit vector toward moon B
+  moon2Phase : f32,    // 0 = new, 0.5 = full
+  // Apparent angular radii in RADIANS, modulated by orbital distance (perigee
+  // is genuinely bigger). The discs and the eclipse test read the same number
+  // so they cannot disagree about how large a moon is.
+  moonAngRadius  : f32,
+  moon2AngRadius : f32,
+  // +1/-1: which limb is lit. Without it waxing and waning are the same
+  // picture and the terminator flips as a moon passes full.
+  moonPhaseSign  : f32,
+  moon2PhaseSign : f32,
+  // Fraction of the SUN's area occulted right now (circle-circle lens area).
+  // 0 = clear. Dims the disc, the dome and the key light together, so a
+  // partial eclipse is a partial dimming rather than a switch.
+  solarEclipse : f32,
+  // Fraction of moon B's disc hidden behind moon A.
+  lunarEclipse : f32,
+  _pdn1      : f32,
+  _pdn2      : f32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -456,32 +479,77 @@ fn sunTransmittance(mass : f32) -> vec3f {
   return exp(-RAYLEIGH_RGB * mass * SUN_TRANSMIT_K * TUNE_SUN_REDDENING);
 }
 
-// Direct light: sun by day, moon by night. Returns colour x intensity;
-// callers multiply by their own N.L / shadow terms.
+// ---- how much light each body is actually giving ----------------------------
+// One place computes "how much moonlight is this body contributing", so the
+// key light, the ambient and the fog tint cannot disagree about which moon is
+// up. Falls to zero below the horizon and scales with the illuminated
+// fraction squared — a crescent gives far less than half a full moon's light,
+// which is why moonlit nights vary so much.
+fn moonContribP(mDir : vec3f, mPhase : f32, intensity : f32) -> f32 {
+  let up = smoothstep(-0.10, 0.18, mDir.y);
+  return up * intensity * (0.15 + 1.70 * mPhase * mPhase);
+}
+
+// Daylight weight AFTER an eclipse. R.solarEclipse is the fraction of the
+// sun's area a moon covers; the cube is the perceptual curve (a half-eclipsed
+// sun is barely dimmer to the eye — the collapse is in the last few percent).
+// Mirrors dayWeight()/eclipseDim() in raymarch.wgsl; the two MUST agree or the
+// world lights at a different brightness than the sky it stands under.
+fn eclipseDayWeightP(R : RenderParams) -> f32 {
+  let f = clamp(R.solarEclipse, 0.0, 1.0);
+  return R.sunUp * (1.0 - f * f * f * TUNE_ECLIPSE_DARKNESS);
+}
+
+// Direct light: sun by day, the brighter moon by night. Returns colour x
+// intensity; callers multiply by their own N.L / shadow terms.
 fn keyLightColorP(R : RenderParams) -> vec3f {
   let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
                TUNE_SUN_INTENSITY;
-  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
-  let moonCol = TUNE_MOON_LIGHT_COLOR * TUNE_MOON_LIGHT_INTENSITY * moonUp *
-                (0.15 + 1.70 * R.moonPhase * R.moonPhase);
-  return mix(moonCol, sunCol, R.sunUp);
+  // Two moons now. The BRIGHTER one is the key light (its direction is what
+  // casts the shadows, below); the other is folded into ambient rather than
+  // given a second shadowed lambert term, because two sets of soft shadows at
+  // moonlight levels costs a whole extra shadow march for something the eye
+  // cannot separate at these intensities.
+  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
+  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
+  let keyMoon = select(TUNE_MOON2_LIGHT_COLOR * b, TUNE_MOON_LIGHT_COLOR * a,
+                       a >= b);
+  return mix(keyMoon, sunCol, eclipseDayWeightP(R));
 }
 
 // Direction of the key light. A hard switch at sunUp = 0.5 rather than a
 // blend: a lerp between two directions would swing shadows wildly through
 // twilight, and at the crossover both lights are dim enough to hide the swap.
+//
+// The same argument picks BETWEEN the two moons — whichever is contributing
+// more light owns the shadows, and the swap happens where they are equal and
+// therefore each half as bright as the pair, which is the least visible moment
+// available. Note this uses the RAW sunUp, not the eclipse-dimmed weight: a
+// total eclipse must not swing every shadow in the world round to a moon
+// direction (they would be the same direction anyway, and the swing would be
+// the most visible thing on screen).
 fn keyLightDirP(R : RenderParams) -> vec3f {
-  return normalize(mix(R.moonDir, R.sunDir, step(0.5, R.sunUp)));
+  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
+  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
+  let moonDir = select(R.moon2Dir, R.moonDir, a >= b);
+  return normalize(mix(moonDir, R.sunDir, step(0.5, R.sunUp)));
 }
 
 // Two-tone hemisphere ambient (cool sky above, warm bounce below), scaled to
-// a dim blue moon/starlight version at night.
+// a dim blue moon/starlight version at night. Both moons contribute here —
+// the secondary one adds real fill on a night when they are both up, which is
+// the payoff for having two of them.
 fn ambientAtP(n : vec3f, R : RenderParams) -> vec3f {
   let base = mix(TUNE_AMB_GROUND, TUNE_AMB_SKY, n.y * 0.5 + 0.5);
   let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
-  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
-  let moonAmt = moonUp * (0.30 + 1.40 * R.moonPhase * R.moonPhase);
-  return mix(nightAmb * (0.45 + moonAmt), base, R.sunUp);
+  // Normalised against moon A's own intensity so the existing 0.30/1.40 ramp
+  // (tuned when there was one moon) still means the same thing when only A is
+  // up, and B can only ever ADD to it.
+  let inv = 1.0 / max(TUNE_MOON_LIGHT_INTENSITY, 1e-4);
+  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) * inv;
+  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
+  let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
+  return mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
 }
 
 // Reinhard-with-white-point applied to LUMINANCE then reapplied to the colour
@@ -514,10 +582,14 @@ fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   let dist = length(worldPos - R.camPos);
   let fog = 1.0 - exp(-dist * VOXEL_METERS * 0.0128);
   // cheap sky tint for fog, dimmed through the night like the real sky (a
-  // fixed day-blue tint here was a second source of midnight glow)
-  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
+  // fixed day-blue tint here was a second source of midnight glow). Both moons
+  // count, and an eclipse dims it with everything else.
+  let inv = 1.0 / max(TUNE_MOON_LIGHT_INTENSITY, 1e-4);
+  let moonLit =
+      (moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) +
+       moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY)) * inv;
   let fogTint = vec3f(0.55, 0.65, 0.85) *
-                mix(0.015 + 0.05 * moonUp * R.moonPhase, 1.0, R.sunUp);
+                mix(0.015 + 0.05 * moonLit, 1.0, eclipseDayWeightP(R));
   return mix(c, fogTint, fog);
 }
 

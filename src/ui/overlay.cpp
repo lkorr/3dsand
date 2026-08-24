@@ -440,6 +440,61 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   ImGui::Checkbox("shadows", &s.shadows);
 
+  // ---- celestial time -------------------------------------------------
+  // Scales the clock the SKY and the daylight-gated reactions both run on
+  // (sim/world.h CelestialClock). The sim tick rate is untouched — sand still
+  // falls at 30 Hz — but the sun, both moons, the seasons and every
+  // sun-driven reaction run at this multiple. Anything but 1x changes the
+  // world hash, which the tooltip says out loud.
+  ImGui::SliderFloat("time speed", &s.timeScale, -10.0f, 100.0f, "%.1fx");
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Speed of the CELESTIAL clock: the sun, both moons, the seasons, and\n"
+        "the daylight-gated reactions (water freezing at night, snow melting\n"
+        "in the sun) all run at this multiple. The simulation itself still\n"
+        "ticks at 30 Hz - sand does not fall faster.\n\n"
+        "0 freezes the sky, negative runs it backwards.\n\n"
+        "Anything but 1x changes the world hash on purpose. --selftest never\n"
+        "engages this clock, so the pinned hash is unaffected.");
+  if (ImGui::Button("1x")) s.timeScale = 1.0f;
+  ImGui::SameLine();
+  if (ImGui::Button("10x")) s.timeScale = 10.0f;
+  ImGui::SameLine();
+  if (ImGui::Button("100x")) s.timeScale = 100.0f;
+  ImGui::SameLine();
+  if (ImGui::Button("freeze")) s.timeScale = 0.0f;
+  ImGui::SameLine();
+  if (ImGui::Button("rev")) s.timeScale = -1.0f;
+  // Readout of what the orbital solve actually produced. Phases are shown as
+  // named quarters because "0.73" tells you nothing about what is in the sky.
+  {
+    auto phaseName = [](float p) {
+      if (p < 0.06f || p > 0.94f) return "new";
+      if (p < 0.19f) return "cresc";
+      if (p < 0.31f) return "quarter";
+      if (p < 0.44f) return "gibbous";
+      if (p < 0.56f) return "FULL";
+      if (p < 0.69f) return "gibbous";
+      if (p < 0.81f) return "quarter";
+      return "cresc";
+    };
+    const int hh = (int)(s.skyDayT * 24.0f) % 24;
+    const int mm = (int)(s.skyDayT * 1440.0f) % 60;
+    ImGui::TextDisabled("sky %02d:%02d  sun %+.0f\xc2\xb0  year %.0f%%",
+                        hh, mm, s.skySunElevDeg, s.skyYearT * 100.0f);
+    ImGui::TextDisabled("moon A %s (%.2f)   moon B %s (%.2f)",
+                        phaseName(s.skyMoonPhase), s.skyMoonPhase,
+                        phaseName(s.skyMoon2Phase), s.skyMoon2Phase);
+    if (s.skySolarEclipse > 0.995f) {
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                         "*** TOTAL SOLAR ECLIPSE ***");
+    } else if (s.skySolarEclipse > 0.0f) {
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                         "solar eclipse: %.0f%% covered",
+                         s.skySolarEclipse * 100.0f);
+    }
+  }
+
   ImGui::Checkbox("fly (V)", &s.fly);
   ImGui::Checkbox("collision boxes (F3)", &s.showCollisionBoxes);
   if (ImGui::IsItemHovered())

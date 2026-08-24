@@ -310,29 +310,57 @@ fn nightGlow(rd : vec3f) -> vec3f {
   return c;
 }
 
-// ---- the moon -------------------------------------------------------------
-// A real disc with a terminator, maria, and a soft glow. The phase is driven
-// from R.moonPhase so it waxes and wanes across in-game days.
-fn moonLayer(rd : vec3f) -> vec3f {
-  let cosAng = dot(rd, R.moonDir);
+// ---- the moons ------------------------------------------------------------
+// A real disc with a terminator, maria, and a soft glow. Since the celestial
+// overhaul there are TWO of them on independent Keplerian orbits, so this is
+// parameterised over the body rather than reading R.moonDir directly:
+//
+//   mDir     unit direction to the body (world space)
+//   mPhase   0 = new, 0.5 = full — the illuminated fraction, derived on the
+//            CPU from the real sun-moon-planet elongation angle
+//   mSign    +1/-1, which limb is lit. Waxing and waning are the same
+//            illuminated FRACTION and differ only in this; without it the
+//            terminator flips as a moon passes full and the disc appears to
+//            roll over.
+//   mRad     angular radius in radians, already modulated by orbital
+//            distance so perigee is genuinely larger
+//   mSeed    offsets the maria fbm so the two moons are not the same rock
+//   tint     per-body surface colour
+//   bright   brightness multiplier (moon B is a dimmer, greyer body)
+//
+// Everything about the phase geometry is shared — the CPU hands each body the
+// same three numbers and this draws them the same way.
+fn moonDisc(rd : vec3f, mDir : vec3f, mPhase : f32, mSign : f32, mRad : f32,
+            mSeed : vec3f, tint : vec3f, bright : f32) -> vec3f {
+  let cosAng = dot(rd, mDir);
+  // The glow falloff is tied to the disc size so a small moon does not carry a
+  // halo sized for a large one. 0.03 rad is the reference the exponent 220 was
+  // tuned against; mRad is now the ORBIT's apparent radius (dayNight.moon*
+  // AngularRadius, modulated by distance), not a separate render knob — the
+  // discs and the eclipse test must read one number or they disagree about how
+  // big a moon is.
+  let glowP = 220.0 * (0.03 / max(mRad, 1e-4));
   if (cosAng < 0.9) {
     // Far from the disc: only the broad glow, which is cheap.
-    let glow = pow(max(cosAng, 0.0), 220.0) * TUNE_MOON_GLOW;
-    return TUNE_MOON_COLOR * glow;
+    let glow = pow(max(cosAng, 0.0), glowP) * TUNE_MOON_GLOW;
+    return tint * glow * bright;
   }
   let ang = acos(clamp(cosAng, -1.0, 1.0));
-  let r = TUNE_MOON_RADIUS;
+  let r = max(mRad, 1e-4);
   var c = vec3f(0.0);
 
   // Broad halo around the disc.
-  c += TUNE_MOON_COLOR * pow(max(cosAng, 0.0), 220.0) * TUNE_MOON_GLOW;
+  c += tint * pow(max(cosAng, 0.0), glowP) * TUNE_MOON_GLOW * bright;
 
   if (ang < r * 1.6) {
     // Build a local frame on the disc so we can texture it and cut the phase.
+    // MUST match the frame PhaseOf() builds on the CPU (celestial.cpp), or the
+    // lit-limb sign is measured against a different +x and crescents point the
+    // wrong way.
     var upv = vec3f(0.0, 1.0, 0.0);
-    if (abs(R.moonDir.y) > 0.95) { upv = vec3f(1.0, 0.0, 0.0); }
-    let mx = normalize(cross(upv, R.moonDir));
-    let my = cross(R.moonDir, mx);
+    if (abs(mDir.y) > 0.95) { upv = vec3f(1.0, 0.0, 0.0); }
+    let mx = normalize(cross(upv, mDir));
+    let my = cross(mDir, mx);
     // Offset of this ray from disc centre, in disc radii.
     let off = vec2f(dot(rd, mx), dot(rd, my)) / r;
     let rr = length(off);
@@ -342,28 +370,45 @@ fn moonLayer(rd : vec3f) -> vec3f {
       let disc = 1.0 - smoothstep(1.0 - px * 1.5, 1.0 + px * 1.5, rr);
       // Surface: hemisphere normal, so maria and the terminator wrap.
       let z = sqrt(max(1.0 - rr * rr, 0.0));
-      let nrm = normalize(mx * off.x + my * off.y + R.moonDir * z);
-      // Maria: large dark basalt patches plus fine cratering.
-      let maria = fbm(nrm * 3.4 + vec3f(4.0, 1.0, 9.0), 4u);
-      let craters = fbm(nrm * 15.0, 3u);
+      let nrm = normalize(mx * off.x + my * off.y + mDir * z);
+      // Maria: large dark basalt patches plus fine cratering. mSeed is what
+      // makes the second moon a different rock rather than a copy.
+      let maria = fbm(nrm * 3.4 + mSeed, 4u);
+      let craters = fbm(nrm * 15.0 + mSeed * 0.31, 3u);
       var albedo = mix(0.55, 1.0, smoothstep(0.38, 0.72, maria));
       albedo *= 0.86 + 0.14 * craters;
       // PHASE: the terminator is the shadow of the moon's own sphere. Build
-      // the illumination direction from moonPhase (0 = new, 0.5 = full) and
+      // the illumination direction from mPhase (0 = new, 0.5 = full) and
       // light the hemisphere with it. Real lunar photometry is famously flat
       // (retroreflective regolith), so use a very wrapped diffuse rather than
       // Lambert or the disc looks like a shaded billiard ball.
-      let pa = (R.moonPhase - 0.5) * 6.2831853;
-      let lightDir = normalize(mx * sin(pa) + R.moonDir * cos(pa) * -1.0 +
+      let pa = (mPhase - 0.5) * 6.2831853;
+      let lightDir = normalize(mx * sin(pa) * mSign + mDir * cos(pa) * -1.0 +
                                my * 0.06);
       let ndl = dot(nrm, lightDir);
       let lit = smoothstep(-0.09, 0.09, ndl);
       // Earthshine: the dark limb is faintly visible, lit by planetshine.
       let earthshine = TUNE_MOON_EARTHSHINE * (1.0 - lit);
-      c += TUNE_MOON_COLOR * disc * albedo *
-           (lit * TUNE_MOON_BRIGHTNESS + earthshine);
+      c += tint * disc * albedo *
+           (lit * TUNE_MOON_BRIGHTNESS + earthshine) * bright;
     }
   }
+  return c;
+}
+
+// Both moons, in the right order. Moon B is given the LARGER semi-major axis
+// by celestial.cpp, so it is always the farther body — which means moon A
+// occults it and never the other way round. R.lunarEclipse is the fraction of
+// B's disc A currently covers; multiplying B down by it is the whole
+// moon-on-moon eclipse, and it is correct because A's own disc is drawn on top
+// at exactly the covering geometry.
+fn moonLayer(rd : vec3f) -> vec3f {
+  var c = moonDisc(rd, R.moon2Dir, R.moon2Phase, R.moon2PhaseSign,
+                   R.moon2AngRadius, vec3f(-21.0, 13.0, 37.0),
+                   TUNE_MOON2_COLOR, TUNE_MOON2_BRIGHTNESS) *
+          (1.0 - R.lunarEclipse);
+  c += moonDisc(rd, R.moonDir, R.moonPhase, R.moonPhaseSign, R.moonAngRadius,
+                vec3f(4.0, 1.0, 9.0), TUNE_MOON_COLOR, 1.0);
   return c;
 }
 
@@ -463,7 +508,18 @@ fn sunDisc(rd : vec3f) -> vec3f {
                    0.28 + 0.72 * pow(mu2, 0.62),
                    0.22 + 0.78 * pow(mu2, 0.74));
   let sunMass = airMass(R.sunDir.y);
-  return sunTransmittance(sunMass) * limb * disc * TUNE_SUN_DISC_GAIN * 40.0;
+  // ECLIPSE. R.solarEclipse is the fraction of the sun's AREA a moon covers
+  // right now (circle-circle lens area, computed from the real orbital
+  // geometry in celestial.cpp). Scaling the disc by the uncovered fraction is
+  // the physically correct thing: an annular eclipse leaves a bright ring and
+  // this leaves the corresponding brightness, and totality goes to zero.
+  //
+  // The occulting moon's own disc is drawn on top by moonLayer(), so the black
+  // bite out of the sun is a real body in front of it rather than a painted
+  // mask — which is why nothing here has to know WHICH moon it was.
+  let uncovered = clamp(1.0 - R.solarEclipse, 0.0, 1.0);
+  return sunTransmittance(sunMass) * limb * disc * TUNE_SUN_DISC_GAIN * 40.0 *
+         uncovered;
 }
 
 // ---- the three sky tiers -------------------------------------------------
@@ -481,9 +537,30 @@ fn sunDisc(rd : vec3f) -> vec3f {
 // Tier 2 — skyColorNoBodies(): airglow + stars, no sun/moon discs. For a
 //          primary ray that reached space where a mirrored sun would double up.
 // Tier 3 — skyColor(): everything. Background pixels only.
+// ---- eclipse weight -------------------------------------------------------
+// How much daylight an eclipse has taken away, 0..1. The sky is lit by the
+// sun's whole disc, so it dims by the covered AREA — but not linearly: a 50%
+// eclipse is barely noticeable to the eye in reality, and the last few percent
+// of coverage is where the light collapses. The cubic is that curve, and it is
+// the reason a partial eclipse reads as "slightly odd light" rather than as
+// someone turning the exposure down.
+fn eclipseDim() -> f32 {
+  let f = clamp(R.solarEclipse, 0.0, 1.0);
+  return f * f * f * TUNE_ECLIPSE_DARKNESS;
+}
+
+// The effective daylight weight during an eclipse. Everything that keyed off
+// R.sunUp — sky brightness, star fade, the moons' visibility — goes through
+// this instead, so totality brings the stars out and lifts the moons into a
+// daytime sky the same way real totality does. Without routing the STAR fade
+// through it too, a total eclipse would darken the dome and leave it blank.
+fn dayWeight() -> f32 {
+  return R.sunUp * (1.0 - eclipseDim());
+}
+
 fn skyAirglow(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
-  let dayW = R.sunUp;
+  let dayW = dayWeight();
   var c = daySky(rd) * dayW;
   if (dayW < 0.999) { c += nightGlow(rd) * (1.0 - dayW); }
   return max(c, vec3f(0.0));
@@ -491,7 +568,7 @@ fn skyAirglow(rdIn : vec3f) -> vec3f {
 
 fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
-  let dayW = R.sunUp;
+  let dayW = dayWeight();
   var c = skyAirglow(rd);
   // Stars fade out under daylight rather than popping off.
   if (dayW < 0.999) { c += starField(rd) * (1.0 - dayW); }
@@ -500,10 +577,16 @@ fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
 
 fn skyColor(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
-  let dayW = R.sunUp;
+  let dayW = dayWeight();
   var c = skyColorNoBodies(rd);
+  // The moons fade in as the sky darkens — including when it darkens because
+  // one of them is in front of the sun. During totality the occulter is at
+  // full strength, which is exactly what puts a black disc on the sun.
   if (dayW < 0.999) { c += moonLayer(rd) * (1.0 - dayW); }
-  if (dayW > 0.001) { c += sunDisc(rd) * dayW; }
+  // The sun disc uses the RAW sunUp, not dayWeight: the disc has its own
+  // eclipse term (its uncovered area), and dimming it twice would erase the
+  // bright ring of an annular eclipse and the diamond ring of a total one.
+  if (R.sunUp > 0.001) { c += sunDisc(rd) * R.sunUp; }
   return max(c, vec3f(0.0));
 }
 
@@ -525,17 +608,34 @@ fn keyLightColor() -> vec3f {
   // value per call is a real cost at this call frequency.
   let sunCol = sunTransmittance(airMass(R.sunDir.y)) * TUNE_SUN_COLOR *
                TUNE_SUN_INTENSITY;
-  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
-  let moonCol = TUNE_MOON_LIGHT_COLOR * TUNE_MOON_LIGHT_INTENSITY * moonUp *
-                (0.15 + 1.70 * R.moonPhase * R.moonPhase);
-  return mix(moonCol, sunCol, R.sunUp);
+  // TWO moons. The brighter contributor owns the key light; the other adds
+  // only ambient (see ambientAt). moonContribP/eclipseDayWeightP are the
+  // SHARED helpers from common.wgsl — they take scalars rather than the
+  // RenderParams struct, so the "inline it, don't pass R by value" argument
+  // above does not apply to them and the two copies cannot drift on the part
+  // that actually got complicated.
+  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
+  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
+  let moonCol = select(TUNE_MOON2_LIGHT_COLOR * b, TUNE_MOON_LIGHT_COLOR * a,
+                       a >= b);
+  // An eclipse takes the sun's light out of the world, not just off the sky.
+  return mix(moonCol, sunCol, eclipseDayWeightP(R));
 }
 
-// Direction of the key light — the sun by day, the moon by night. Shadows are
-// cast from whichever is dominant, so moonlit shadows point the right way.
-// MUST MATCH keyLightDirP (common.wgsl); inlined for the same reason as above.
+// Direction of the key light — the sun by day, the brighter moon by night.
+// Shadows are cast from whichever is dominant, so moonlit shadows point the
+// right way. MUST MATCH keyLightDirP (common.wgsl); inlined for the same
+// reason as above.
+//
+// Deliberately the RAW sunUp, not the eclipse-dimmed weight: a total eclipse
+// must not swing every shadow in the world round to a lunar direction. Both
+// bodies are in nearly the same place at totality anyway, so the swing would
+// buy nothing and would be the single most visible artefact on screen.
 fn keyLightDir() -> vec3f {
-  return normalize(mix(R.moonDir, R.sunDir, step(0.5, R.sunUp)));
+  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY);
+  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY);
+  let moonDir = select(R.moon2Dir, R.moonDir, a >= b);
+  return normalize(mix(moonDir, R.sunDir, step(0.5, R.sunUp)));
 }
 
 // Per-meter absorption scale applied to material opacity — trace() (media
@@ -1713,9 +1813,15 @@ fn ambientAt(n : vec3f) -> vec3f {
   // sits in per-hit shading loops (see keyLightColor).
   let base = mix(TUNE_AMB_GROUND, TUNE_AMB_SKY, n.y * 0.5 + 0.5);
   let nightAmb = mix(TUNE_NIGHT_AMB_GROUND, TUNE_NIGHT_AMB_SKY, n.y * 0.5 + 0.5);
-  let moonUp = smoothstep(-0.10, 0.18, R.moonDir.y);
-  let moonAmt = moonUp * (0.30 + 1.40 * R.moonPhase * R.moonPhase);
-  return mix(nightAmb * (0.45 + moonAmt), base, R.sunUp);
+  // Both moons fill here — the secondary one is real ambient on a night when
+  // they are both up, which is the payoff for having two. Normalised against
+  // moon A's own intensity so the 0.30/1.40 ramp (tuned when there was one
+  // moon) still means the same thing when only A is up.
+  let inv = 1.0 / max(TUNE_MOON_LIGHT_INTENSITY, 1e-4);
+  let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) * inv;
+  let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
+  let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
+  return mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
 }
 
 // ---- diffuse response ----

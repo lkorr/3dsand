@@ -88,14 +88,18 @@ SPEC = [
     ("render", "auroraLow", "TUNE_AURORA_LOW", "v3", [0.1, 0.85, 0.45]),
     ("render", "auroraHigh", "TUNE_AURORA_HIGH", "v3", [0.65, 0.2, 0.85]),
 
-    # moon
-    ("render", "moonRadius", "TUNE_MOON_RADIUS", "f", 0.03),
+    # moons
     ("render", "moonBrightness", "TUNE_MOON_BRIGHTNESS", "f", 1.6),
     ("render", "moonColor", "TUNE_MOON_COLOR", "v3", [0.92, 0.93, 0.88]),
     ("render", "moonGlow", "TUNE_MOON_GLOW", "f", 0.35),
     ("render", "moonEarthshine", "TUNE_MOON_EARTHSHINE", "f", 0.055),
     ("render", "moonLightColor", "TUNE_MOON_LIGHT_COLOR", "v3", [0.55, 0.68, 1.0]),
     ("render", "moonLightIntensity", "TUNE_MOON_LIGHT_INTENSITY", "f", 0.16),
+    ("render", "moon2Color", "TUNE_MOON2_COLOR", "v3", [0.78, 0.8, 0.86]),
+    ("render", "moon2Brightness", "TUNE_MOON2_BRIGHTNESS", "f", 0.72),
+    ("render", "moon2LightIntensity", "TUNE_MOON2_LIGHT_INTENSITY", "f", 0.055),
+    ("render", "moon2LightColor", "TUNE_MOON2_LIGHT_COLOR", "v3", [0.62, 0.62, 0.86]),
+    ("render", "eclipseDarkness", "TUNE_ECLIPSE_DARKNESS", "f", 0.93),
 
     # night ambient
     ("render", "nightAmbSky", "TUNE_NIGHT_AMB_SKY", "v3", [0.055, 0.075, 0.135]),

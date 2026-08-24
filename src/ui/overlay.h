@@ -40,6 +40,22 @@ struct UIState {
   bool stepOnce = false;
   bool shadows = true;
   bool fly = true;
+  // Celestial time multiplier: 1 = normal, 0 = frozen, negative = reverse,
+  // 100 = fast-forward. Drives the CelestialClock (sim/world.h), which feeds
+  // BOTH the rendered sky and the sim's integer day phase — so cranking it
+  // makes the world actually react (water freezes, snow melts) rather than
+  // just racing the sun across a world that ignores it.
+  //
+  // That means a value other than 1 CHANGES THE WORLD HASH, deliberately: it
+  // is a dev tool. The clock is disengaged until this first leaves 1.0, so no
+  // headless path can observe it and the pinned hash is safe.
+  float timeScale = 1.0f;
+  // Read back from the celestial solve for the panel readout (render-only).
+  float skyDayT = 0.5f;
+  float skyYearT = 0.0f;
+  float skyMoonPhase = 0.5f, skyMoon2Phase = 0.5f;
+  float skySolarEclipse = 0.0f;
+  float skySunElevDeg = 0.0f;
   // Collision-box debug overlay (F3). Draws one green oriented wireframe per
   // physics body — avatar and mob limbs, held items, rigidbody debris — using
   // the body's ACTUAL Jolt collider bounds rather than its art, so the two

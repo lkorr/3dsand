@@ -309,6 +309,7 @@ add_executable(sandvox
   src/sim/pass_table.cpp
   src/sim/materials.cpp
   src/sim/tuning.cpp
+  src/sim/celestial.cpp
   src/sim/voxload.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
@@ -415,6 +416,7 @@ add_executable(movement_test
   tests/movement_test.cpp
   src/game/player.cpp
   src/sim/tuning.cpp
+  src/sim/celestial.cpp
 )
 target_include_directories(movement_test PRIVATE src)
 target_compile_definitions(movement_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

@@ -412,6 +412,86 @@ forever. Sunlight can *drive* processes that consume something finite; it
 cannot be hooked to a rule that manufactures matter indefinitely. The failed
 attempt is documented in `reactions.json` so it is not tried a third time.
 
+### The sky is a solar system (2026-08-23; `sim/celestial.*`)
+
+Everything above still holds — the *clock* is what changed. Where the sun's
+position used to be a tilted great circle traced by a phase ramp, the planet
+now runs a **Keplerian orbit** around its star, spins on a tilted axis, and
+carries **two moons** on their own inclined, eccentric orbits. Seasons, lunar
+phase, the beat between the two moons, and eclipses are all *consequences* of
+that geometry rather than authored curves, which is the same "no closed-ended
+systems" argument §6 makes about materials: the orbital elements are
+`tuning.json` rows, so a different sky is a data edit.
+
+**The renderer barely changed.** `ComputeSky()` fills the same `SkyState` the
+sky shader already consumed, plus moon B and eclipse coverage; the starfield,
+galactic band, nebulae, aurora and the moon's maria/terminator code are
+untouched. What they receive is better numbers.
+
+Four properties are load-bearing:
+
+- **Pure function of the tick.** Every element is recomputed from epoch on
+  every call — Kepler's equation from a mean anomaly is O(1), so there is no
+  reason to integrate, and an integrator would make the sky an hour into a
+  session depend on the frame rate that got there. Kepler is solved by a
+  **fixed** six-step Newton iteration, never a convergence loop, for the same
+  reason the CA forbids scheduling-dependent outcomes: a trip count that
+  depends on the value is a way for two machines to disagree.
+- **The sim still reads only the integer phase.** `TickParams.dayPhase` is
+  unchanged, integer, and the only thing the CA sees. This file is float
+  throughout and cannot reach a voxel. The two agree because both are driven
+  by the same celestial tick.
+- **One number per fact.** A moon's apparent size comes from its orbit
+  (`dayNight.moonAngularRadius` scaled by distance) and the eclipse test and
+  the drawn disc read that same number. The old render-side `moonRadius` knob
+  was deleted rather than kept: two answers to "how big is the moon" is
+  exactly §3's unowned-diverging-representation trap, and here it would have
+  meant eclipses that do not line up with the discs you can see.
+- **`sunAzimuth` is a rotation of the OBSERVER, not of the clock.** Folding it
+  into the spin angle also rotates *time*: at 24° it moved noon 1.6 game-hours
+  off `dayT` 0.5 and silently desynchronised the visible sun from the phase
+  the reactions are gated on. It is applied as a yaw of the finished horizon
+  vector.
+
+**The `celestial` gate is the reason any of this is trustworthy**, because a
+screenshot cannot tell a real solve from a plausible-looking ramp. It asserts
+properties, each of which fails under a specific plausible bug: the solar
+*year* closes to 0.000° of accumulated azimuth (a sidereal/solar sign error
+overshoots by exactly two turns — the original bug, and locally invisible);
+the sun peaks at `dayT` 0.5 within the equation of time; the seasonal swing is
+2× the axial tilt and peaks at `90 - |lat - tilt|`; each moon hits its
+*authored synodic* period (8.00 and 9.00 days — dropping the synodic→sidereal
+conversion gives 8.7 and nobody notices for a week); the 8/9 phase pair does
+not repeat inside 72 days; eclipses occur but stay under 0.3% of samples; and
+a disengaged `CelestialClock` is bit-exactly the identity map. It also caught
+a unit bug on the first run — moon radii read as radians instead of degrees,
+a 97° moon that eclipsed the sun a third of the time.
+
+### The dev time-scale slider, and why it moves the sim
+
+The overlay's *time speed* slider scales a `CelestialClock` (`world.h`) that
+feeds **both** the rendered sky and `TickParams.dayPhase`. Scaling only the
+render would show a sun racing across a world that ignores it — useless for
+tuning weather, which is the reason to want the control at all. So at 100×
+water genuinely freezes and thaws while sand still falls at 30 Hz.
+
+That makes the world hash a function of the slider, deliberately. Two things
+keep it from touching rule 1:
+
+- The clock is an **exact rational counter** (`scaleNum/scaleDen` with the
+  remainder carried), never a float accumulator, so the integer path into
+  `dayPhase` is unbroken and reverse time is the exact mirror of forward time.
+- It is **disengaged until the slider first leaves 1.0×**, and while
+  disengaged `SimTick()` returns the sim tick byte for byte. Every headless
+  path — `--selftest`, `--shot`, `--frames`, every gate — is therefore
+  structurally unable to observe the feature, and the pinned hash `7cfa2420`
+  is unmoved.
+
+The day/night wake handshake compares against the clock's *previous* value
+rather than `tick - 1`: at 100× the clock jumps ~100 phase-ticks per sim tick,
+and comparing to `tick - 1` would test a phase the world never occupied and
+sail through several dawns without ever waking a chunk.
+
 ---
 
 ## 5. Particle System (voxels in flight)

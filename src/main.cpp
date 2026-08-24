@@ -2730,6 +2730,19 @@ int main(int argc, char** argv) {
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
       double t0 = NowSeconds();
+      // ---- the celestial clock (sim/world.h) -----------------------------
+      // Advanced exactly ONCE per sim tick, here, immediately before the
+      // submit that reads it. The dev overlay's time-speed slider scales it,
+      // and it feeds BOTH the rendered sky and TickParams.dayPhase — so
+      // cranking time makes the world react (freezing, melting, evaporation)
+      // instead of just racing the sun over a world that ignores it.
+      //
+      // The clock stays DISENGAGED until the slider first leaves 1.0x, at
+      // which point it adopts the current tick so the sky does not jump. While
+      // disengaged the celestial tick is the sim tick byte for byte, which is
+      // what makes every headless path (and the pinned hash) unaffected.
+      Celestial().SetScale(ui.timeScale, tick);
+      Celestial().Advance();
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
@@ -2940,6 +2953,20 @@ int main(int argc, char** argv) {
                         (float)ctx.width / (float)ctx.height, ui.shadows,
                         (float)now, fogSmooth, (float)ctx.height, tick,
                         fluidCount);
+
+      // Celestial readout for the panel. Recomputed rather than cached out of
+      // WriteRenderParams because the solve is a handful of trig calls once a
+      // frame — cheaper than the plumbing to carry it, and it cannot go stale.
+      {
+        const SkyState sky = SkyForTick(CurrentTuning(), tick);
+        ui.skyDayT = sky.dayT;
+        ui.skyYearT = sky.yearT;
+        ui.skyMoonPhase = sky.moonPhase;
+        ui.skyMoon2Phase = sky.moon2Phase;
+        ui.skySolarEclipse = sky.solarEclipse;
+        ui.skySunElevDeg =
+            std::asin(std::clamp(sky.sunDir[1], -1.0f, 1.0f)) * 57.2957795f;
+      }
 
       ui.fps = fpsSmooth;
       ui.frameMs = frameMsSmooth;

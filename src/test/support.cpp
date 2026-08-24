@@ -36,20 +36,19 @@ double NowSeconds() {
   return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Ticks per in-game day, from the tuning cycle length. Sim runs at 30 Hz.
-uint32_t TicksPerDay(const Tuning& t) {
-  int m = t.dayNight.cycleMinutes < 1 ? 1 : t.dayNight.cycleMinutes;
-  return (uint32_t)m * 60u * 30u;
-}
+// Ticks per in-game SOLAR day, from the tuning cycle length. Sim runs at 30 Hz.
+// The definition itself lives in tuning.h so sim/celestial.cpp can use it
+// without linking the render plumbing; this is the name the frame loop and the
+// gates already call.
+uint32_t TicksPerDay(const Tuning& t) { return TicksPerDayFromTuning(t); }
 
-// The sky for a given sim tick. Both the renderer and the sim's reaction gate
-// derive from this same tick-based phase, which is what keeps a sun-driven
-// reaction deterministic (CLAUDE.md rule 1).
+// The sky for a given sim tick — now a full Keplerian solve (sim/celestial.*)
+// rather than a phase ramp. `tick` is routed through the celestial clock, which
+// is DISENGAGED unless the dev overlay's time-speed slider has been moved: on
+// every headless path this is the identity map and the celestial tick IS the
+// sim tick, so the pinned world hash cannot move.
 SkyState SkyForTick(const Tuning& t, uint32_t tick) {
-  uint32_t tpd = TicksPerDay(t);
-  uint32_t phase = DayPhaseForTick(tick, tpd, t.dayNight.freeze != 0,
-                                   (uint32_t)t.dayNight.freezePhase);
-  return ComputeSkyState(t, phase, tpd ? tick / tpd : 0u);
+  return ComputeSky(t, Celestial().RenderTick(tick));
 }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
@@ -89,6 +88,20 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.sunUp = sky.sunUp;
   rp.moonPhase = sky.moonPhase;
   rp.starRot = sky.starRot;
+  // Moon B + eclipse geometry. All of it falls out of the orbital solve — the
+  // renderer is told where the bodies ARE and how big they look, and draws
+  // them; it decides nothing about the sky's state.
+  rp.moon2Dir[0] = sky.moon2Dir[0];
+  rp.moon2Dir[1] = sky.moon2Dir[1];
+  rp.moon2Dir[2] = sky.moon2Dir[2];
+  rp.moon2Phase = sky.moon2Phase;
+  rp.moonAngRadius = sky.moonAngRadius;
+  rp.moon2AngRadius = sky.moon2AngRadius;
+  rp.moonPhaseSign = sky.moonPhaseSign;
+  rp.moon2PhaseSign = sky.moon2PhaseSign;
+  rp.solarEclipse = sky.solarEclipse;
+  rp.lunarEclipse = sky.lunarEclipse;
+  rp.eclipseBody = sky.eclipseBody;
   rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both
@@ -134,10 +147,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   if (fluidSplashMat) {
     for (int i = 0; i < 4; i++) tp.fluidSplashMat[i] = fluidSplashMat[i];
   }
-  // Day phase for THIS tick. Derived from `tick` alone — the daylight-gated
-  // reactions read it, so anything frame-timed here would break determinism.
+  // Day phase for THIS tick. Derived from an INTEGER tick counter — the
+  // daylight-gated reactions read it, so anything frame-timed here would break
+  // determinism (CLAUDE.md rule 1).
+  //
+  // That counter is the celestial clock's, not the raw sim tick, and the
+  // difference is deliberate: the dev time-speed slider is meant to make the
+  // WORLD respond to accelerated time (water freezing, snow melting), not just
+  // to race the sun across a world that ignores it. The clock is an exact
+  // rational counter, so this stays integer end to end, and it is DISENGAGED
+  // unless the slider has been moved — on every headless path it returns
+  // `tick` unchanged and the pinned hash cannot move.
   const Tuning& dtun = CurrentTuning();
-  tp.dayPhase = DayPhaseForTick(tick, TicksPerDay(dtun),
+  const uint32_t celTick = Celestial().SimTick(tick);
+  tp.dayPhase = DayPhaseForTick(celTick, TicksPerDay(dtun),
                                 dtun.dayNight.freeze != 0,
                                 (uint32_t)dtun.dayNight.freezePhase);
   IVec3 wo = world.WindowOrigin();
@@ -168,8 +191,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Derived from the tick, not from frame timing, so every machine wakes on
   // the same tick and the hash stays identical (CLAUDE.md rule 1).
+  //
+  // Compared on the PREVIOUS CELESTIAL tick, not the previous sim tick. Under
+  // the time-speed slider the clock can advance many day-phase ticks per sim
+  // tick — comparing against `tick - 1` would test a phase the world never
+  // saw, and at 100x the world would sail through several dawns without ever
+  // waking. `prevCel` is the clock's own previous value, so the switch is
+  // detected however far the clock jumped (a jump that skips a whole day still
+  // wakes exactly once, which is right: one wake re-dirties everything).
   if (tick > 0) {
-    uint32_t prevPhase = DayPhaseForTick(tick - 1, TicksPerDay(dtun),
+    const uint32_t prevCel = Celestial().PrevSimTick(tick);
+    uint32_t prevPhase = DayPhaseForTick(prevCel, TicksPerDay(dtun),
                                          dtun.dayNight.freeze != 0,
                                          (uint32_t)dtun.dayNight.freezePhase);
     bool wasDay = DaylightStrengthCpu(prevPhase) > 0;

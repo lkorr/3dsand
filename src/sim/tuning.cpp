@@ -255,61 +255,13 @@ int ApplyVarianceI(int base, const Variance& v, uint32_t seed, uint32_t tick,
   return (int)r;
 }
 
-SkyState ComputeSkyState(const Tuning& t, uint32_t phase, uint32_t dayNumber) {
-  const auto& d = t.dayNight;
-  SkyState s{};
-  const float kPi = 3.14159265358979f;
-  const float deg = kPi / 180.0f;
-
-  // phase 0 = midnight, so the sun's hour angle is measured from straight
-  // down. At phase 0.25 (0x4000) it is on the eastern horizon, at 0.5 it is at
-  // peak elevation, at 0.75 on the western horizon.
-  float f = (float)(phase & kDayPhaseMask) / (float)kDayPhaseMax;
-  s.dayT = f;
-  float hour = (f - 0.5f) * 2.0f * kPi;   // -pi at midnight, 0 at noon
-
-  // Sun on a tilted great circle: elevation peaks at sunPeakElevation and the
-  // whole arc is rotated by sunAzimuth, which is what makes the sun rise in a
-  // consistent compass direction instead of straight overhead.
-  float peak = d.sunPeakElevation * deg;
-  float el = std::asin(std::sin(peak) * std::cos(hour));
-  // Azimuth sweeps east->west across the day.
-  float az = d.sunAzimuth * deg + std::atan2(std::sin(hour), std::cos(hour) * std::cos(peak));
-  s.sunDir[0] = std::cos(el) * std::sin(az);
-  s.sunDir[1] = std::sin(el);
-  s.sunDir[2] = std::cos(el) * std::cos(az);
-
-  // Daylight weight. Smoothstep over the twilight band around the horizon so
-  // the sky, ambient and key light all crossfade together rather than snapping
-  // at the geometric horizon. This is the RENDER-side daylight measure; the
-  // sim uses the integer daylightStrength() in common.wgsl, and they need only
-  // agree qualitatively (the sim's is the one that touches voxel state).
-  float w = d.twilightWidth > 0.0f ? d.twilightWidth : 0.22f;
-  float x = (s.sunDir[1] + w * 0.35f) / w;
-  x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  s.sunUp = x * x * (3.0f - 2.0f * x);
-
-  // Moon: roughly opposite the sun, drifting by one lunar period so the phase
-  // cycles, and inclined so it does not simply retrace the sun's arc.
-  float lunar = (float)(dayNumber % (uint32_t)(d.lunarPeriodDays < 1 ? 1 : d.lunarPeriodDays)) /
-                (float)(d.lunarPeriodDays < 1 ? 1 : d.lunarPeriodDays);
-  s.moonPhase = lunar;
-  // Moon hour angle lags the sun by the phase fraction — that lag IS the
-  // phase, physically: a full moon is opposite the sun and rises at sunset.
-  float mhour = hour + kPi + lunar * 2.0f * kPi;
-  float minc = d.moonInclination * deg;
-  float mel = std::asin(std::sin(peak) * std::cos(mhour) * std::cos(minc) +
-                        std::sin(minc) * 0.35f);
-  float maz = d.sunAzimuth * deg +
-              std::atan2(std::sin(mhour), std::cos(mhour) * std::cos(peak));
-  s.moonDir[0] = std::cos(mel) * std::sin(maz);
-  s.moonDir[1] = std::sin(mel);
-  s.moonDir[2] = std::cos(mel) * std::cos(maz);
-
-  // Stars wheel with the day, plus the accumulated whole days so the sky does
-  // not reset every dawn.
-  s.starRot = (f + (float)dayNumber) * 2.0f * kPi * d.starRotSpeed;
-  return s;
+// The one celestial clock (world.h CelestialClock). Function-local static so
+// it needs no initialisation order guarantee and no owner: it is dev-tool
+// state, written only by the frame loop, and DISENGAGED by default so every
+// headless path sees celestialTick == simTick exactly.
+CelestialClock& Celestial() {
+  static CelestialClock g_clock;
+  return g_clock;
 }
 
 bool LoadTuning(const std::string& path, Tuning& out) {
@@ -859,12 +811,32 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "cycleMinutes", d.cycleMinutes, out, at);
     ReadI(*g, "freeze", d.freeze, out, at);
     ReadI(*g, "freezePhase", d.freezePhase, out, at);
-    ReadF(*g, "sunPeakElevation", d.sunPeakElevation, out, at);
+    ReadF(*g, "sunPeakElevation", d.sunPeakElevation, out, at);  // legacy, unread
     ReadF(*g, "sunAzimuth", d.sunAzimuth, out, at);
     ReadF(*g, "twilightWidth", d.twilightWidth, out, at);
+    ReadF(*g, "starRotSpeed", d.starRotSpeed, out, at);
+    // ---- orbital elements (sim/celestial.cpp) ----
+    ReadF(*g, "axialTilt", d.axialTilt, out, at);
+    ReadF(*g, "latitudeDeg", d.latitudeDeg, out, at);
+    ReadF(*g, "yearLengthDays", d.yearLengthDays, out, at);
+    ReadF(*g, "orbitEccentricity", d.orbitEccentricity, out, at);
+    ReadF(*g, "orbitArgPeriapsis", d.orbitArgPeriapsis, out, at);
+    ReadF(*g, "orbitMeanAnomaly0", d.orbitMeanAnomaly0, out, at);
+    ReadF(*g, "sunAngularRadius", d.sunAngularRadius, out, at);
     ReadI(*g, "lunarPeriodDays", d.lunarPeriodDays, out, at);
     ReadF(*g, "moonInclination", d.moonInclination, out, at);
-    ReadF(*g, "starRotSpeed", d.starRotSpeed, out, at);
+    ReadF(*g, "moonEccentricity", d.moonEccentricity, out, at);
+    ReadF(*g, "moonArgPeriapsis", d.moonArgPeriapsis, out, at);
+    ReadF(*g, "moonNode", d.moonNode, out, at);
+    ReadF(*g, "moonMeanAnomaly0", d.moonMeanAnomaly0, out, at);
+    ReadF(*g, "moonAngularRadius", d.moonAngularRadius, out, at);
+    ReadI(*g, "moon2PeriodDays", d.moon2PeriodDays, out, at);
+    ReadF(*g, "moon2Inclination", d.moon2Inclination, out, at);
+    ReadF(*g, "moon2Eccentricity", d.moon2Eccentricity, out, at);
+    ReadF(*g, "moon2ArgPeriapsis", d.moon2ArgPeriapsis, out, at);
+    ReadF(*g, "moon2Node", d.moon2Node, out, at);
+    ReadF(*g, "moon2MeanAnomaly0", d.moon2MeanAnomaly0, out, at);
+    ReadF(*g, "moon2AngularRadius", d.moon2AngularRadius, out, at);
     // A zero-length day divides by zero in DayPhaseForTick and would freeze
     // the cycle at midnight; a negative one is meaningless.
     if (d.cycleMinutes < 1) {
@@ -875,6 +847,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("dayNight.lunarPeriodDays < 1; clamped to 1");
       d.lunarPeriodDays = 1;
     }
+    if (d.moon2PeriodDays < 1) {
+      out.warnings.push_back("dayNight.moon2PeriodDays < 1; clamped to 1");
+      d.moon2PeriodDays = 1;
+    }
     if (d.freezePhase < 0 || d.freezePhase > 65535) {
       out.warnings.push_back("dayNight.freezePhase outside 0..65535; wrapped");
       d.freezePhase = ((d.freezePhase % 65536) + 65536) % 65536;
@@ -882,6 +858,42 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (d.twilightWidth <= 0.0f) {
       out.warnings.push_back("dayNight.twilightWidth must be > 0; reset to 0.22");
       d.twilightWidth = 0.22f;
+    }
+    // ---- orbital sanity ----
+    // Kepler's equation is only solved for bound elliptical orbits, and the
+    // fixed-iteration Newton solver (celestial.cpp) is accurate well past 0.6
+    // but not near 1. A parabolic or hyperbolic element set here is a JSON
+    // typo, not a design choice, so clamp loudly rather than emit a sky that
+    // flies off.
+    auto clampEcc = [&](const char* name, float& e) {
+      if (e >= 0.0f && e <= 0.7f) return;
+      out.warnings.push_back(std::string("dayNight.") + name +
+                             " outside 0..0.7; clamped (orbits must stay bound)");
+      e = e < 0.0f ? 0.0f : 0.7f;
+    };
+    clampEcc("orbitEccentricity", d.orbitEccentricity);
+    clampEcc("moonEccentricity", d.moonEccentricity);
+    clampEcc("moon2Eccentricity", d.moon2Eccentricity);
+    if (d.yearLengthDays < 0.5f) {
+      out.warnings.push_back("dayNight.yearLengthDays < 0.5; clamped to 0.5");
+      d.yearLengthDays = 0.5f;
+    }
+    // The apparent radii feed the eclipse geometry directly. Zero would make
+    // eclipses impossible and a huge value would make one permanent, so bound
+    // both to something a sky can hold.
+    auto clampAng = [&](const char* name, float& r, float lo, float hi) {
+      if (r >= lo && r <= hi) return;
+      out.warnings.push_back(std::string("dayNight.") + name +
+                             " outside range; clamped");
+      r = r < lo ? lo : hi;
+    };
+    clampAng("sunAngularRadius", d.sunAngularRadius, 0.02f, 12.0f);
+    clampAng("moonAngularRadius", d.moonAngularRadius, 0.05f, 20.0f);
+    clampAng("moon2AngularRadius", d.moon2AngularRadius, 0.05f, 20.0f);
+    // Latitude past the poles is a wrapped angle, not an error the user meant.
+    if (d.latitudeDeg < -89.0f || d.latitudeDeg > 89.0f) {
+      out.warnings.push_back("dayNight.latitudeDeg outside +-89; clamped");
+      d.latitudeDeg = d.latitudeDeg < 0.0f ? -89.0f : 89.0f;
     }
   }
 
@@ -958,14 +970,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "auroraHeight", r.auroraHeight, out, at);
     ReadV3(*g, "auroraLow", r.auroraLow, out, at);
     ReadV3(*g, "auroraHigh", r.auroraHigh, out, at);
-    // moon
-    ReadF(*g, "moonRadius", r.moonRadius, out, at);
+    // moons
     ReadF(*g, "moonBrightness", r.moonBrightness, out, at);
     ReadV3(*g, "moonColor", r.moonColor, out, at);
     ReadF(*g, "moonGlow", r.moonGlow, out, at);
     ReadF(*g, "moonEarthshine", r.moonEarthshine, out, at);
     ReadV3(*g, "moonLightColor", r.moonLightColor, out, at);
     ReadF(*g, "moonLightIntensity", r.moonLightIntensity, out, at);
+    ReadV3(*g, "moon2Color", r.moon2Color, out, at);
+    ReadF(*g, "moon2Brightness", r.moon2Brightness, out, at);
+    ReadF(*g, "moon2LightIntensity", r.moon2LightIntensity, out, at);
+    ReadV3(*g, "moon2LightColor", r.moon2LightColor, out, at);
+    ReadF(*g, "eclipseDarkness", r.eclipseDarkness, out, at);
     // night ambient
     ReadV3(*g, "nightAmbSky", r.nightAmbSky, out, at);
     ReadV3(*g, "nightAmbGround", r.nightAmbGround, out, at);
@@ -1216,8 +1232,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       r.gamma = 2.2f;
     }
     // starSize divides in the star PSF, starDensity scales the direction grid,
-    // moonRadius divides when building the lunar disc frame, and skyMieG at
-    // exactly +-1 makes the Henyey-Greenstein denominator collapse.
+    // and skyMieG at exactly +-1 makes the Henyey-Greenstein denominator
+    // collapse.
     if (r.starSize <= 0.0f) {
       out.warnings.push_back("render.starSize must be > 0; reset to 0.85");
       r.starSize = 0.85f;
@@ -1230,9 +1246,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("render.starDensity < 1; clamped to 1");
       r.starDensity = 1.0f;
     }
-    if (r.moonRadius <= 0.0f) {
-      out.warnings.push_back("render.moonRadius must be > 0; reset to 0.03");
-      r.moonRadius = 0.03f;
+    // eclipseDarkness scales a subtraction from the daylight weight; past 1 it
+    // would drive the weight negative and the sky would light from below.
+    if (r.eclipseDarkness < 0.0f || r.eclipseDarkness > 1.0f) {
+      out.warnings.push_back("render.eclipseDarkness outside 0..1; clamped");
+      r.eclipseDarkness = r.eclipseDarkness < 0.0f ? 0.0f : 1.0f;
     }
     if (r.skyMieG <= -0.99f || r.skyMieG >= 0.99f) {
       out.warnings.push_back("render.skyMieG must be within (-0.99, 0.99); clamped");
