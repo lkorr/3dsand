@@ -266,6 +266,7 @@ SPEC = [
     ("render", "microSwaySpeed", "TUNE_MICRO_SWAY_SPEED", "f", 1.1),
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
+    ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
 
     # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),

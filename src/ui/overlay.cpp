@@ -492,11 +492,32 @@ void Overlay::Draw(UIState& s) {
     ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
   }
   if (s.tool == UIState::kToolFluid) {
-    ImGui::TextDisabled("hold LMB: pour experimental MLS-MPM liquid (compare "
-                        "with CA water)");
+    ImGui::TextDisabled("hold LMB: pour  1-4 species  U clear");
     ImGui::Text("mpm particles: %u / 262144", s.fluidCount);
     ImGui::SameLine();
     if (ImGui::Button("clear (U)")) s.clearFluid = true;
+
+    auto fslider = [&](const char* label, float* v, float lo, float hi) {
+      if (ImGui::SliderFloat(label, v, lo, hi, "%.2f"))
+        s.fluidTuningDirty = true;
+    };
+    ImGui::Separator();
+    fslider("gravity##f",     &s.fGravity,     0.0f, 400.0f);
+    fslider("stiffness##f",   &s.fStiffness,   10.0f, 20000.0f);
+    if (ImGui::SliderInt("EOS power##f", &s.fEosPower, 1, 7))
+      s.fluidTuningDirty = true;
+    fslider("cohesion##f",    &s.fCohesion,    0.0f, 200.0f);
+    fslider("attract same##f",&s.fAttractSame, -200.0f, 200.0f);
+    fslider("attract diff##f",&s.fAttractDiff, -200.0f, 200.0f);
+    fslider("viscosity##f",   &s.fViscosity,   0.0f, 20.0f);
+    fslider("damping##f",     &s.fDamping,     0.0f, 5.0f);
+    {
+      bool ex = s.fExciteMode != 0;
+      if (ImGui::Checkbox("excite mode##f", &ex)) {
+        s.fExciteMode = ex ? 1 : 0;
+        s.fluidTuningDirty = true;
+      }
+    }
   }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");

@@ -4275,7 +4275,20 @@ fn fluidGradientColor(base : vec3f, thickM : f32) -> vec3f {
 fn fluidChunkActive(c : vec3<i32>) -> bool {
   let wc = worldChunkOf(c);
   if (!chunkInWindow(wc, R.origin)) { return false; }
-  return fluidBlockMapR[chunkSlotIndex(wc)] != 0u;
+  if (fluidBlockMapR[chunkSlotIndex(wc)] != 0u) { return true; }
+  // A chunk with only settled CA water has no MPM block allocation, but
+  // fluidMassAt still returns non-zero density there (virtual mass from
+  // voxel fullness).  If a face-neighbor IS active, the isosurface may
+  // extend into this chunk and must not be clipped at the boundary.
+  for (var a = 0; a < 3; a++) {
+    for (var s = -1; s <= 1; s += 2) {
+      var nc = wc;
+      nc[a] += s;
+      if (chunkInWindow(nc, R.origin)
+          && fluidBlockMapR[chunkSlotIndex(nc)] != 0u) { return true; }
+    }
+  }
+  return false;
 }
 
 // t at which the ray leaves the CHUNK containing cell c — the chunk-stride
@@ -4918,74 +4931,46 @@ fn fs(in : VSOut) -> FSOut {
   // Everything the primary march resolved so far (bed, terrain, or sky, with
   // gas tint applied) is what sits BEHIND the water; shadeWater decides how
   // much of it survives the trip back up and what covers the rest.
+  //
+  // SEAM RULE: when MPM fluid is active, its isosurface extends over settled
+  // voxel water via the virtual-mass blend in fluidMassAt.  A non-viscous
+  // liquid cell inside that isosurface is already represented by the MPM
+  // surface, so shadeWater must NOT run for it — the two shading models have
+  // incompatible normals and the per-pixel fight is the strobing-squares
+  // artifact.  The MPM path (below) handles the shade instead.
   if (h.liqT > 0.0) {
     let lm = voxMat(voxWordAt(h.liqCell));
-    // Re-read defensively: a cell can have changed class between trace and
-    // shade only if the material table moved under us (hot reload), and a
-    // stale id would index the wrong absorption.
     if (lm != MAT_AIR && materials[lm].klass == CLASS_LIQUID) {
       let hitP = R.camPos + rd * h.liqT;
-      // Camera inside the liquid: the surface was entered at t~0 through no
-      // real face, and absorption applies to the entire view rather than to a
-      // bounded depth.
       let underwater = h.liqT < 0.05;
-      // Viscous liquids (blood) take their own surface model: no travelling
-      // ripples, a wet sheen that works on a lone droplet, and a
-      // moving-vs-pooled blend. See shadeViscous for why this is not
-      // shadeWater with different constants.
-      // SUBMERSION IS TESTED FIRST, ahead of the viscous split. The viscous
-      // model (shadeViscous) is a SURFACE model — a wet sheen on a droplet, a
-      // pooled-vs-moving blend — and it is the right answer for blood or oil
-      // seen from outside. It is the wrong answer for being INSIDE the stuff,
-      // where there is no surface in front of you at all.
-      //
-      // Ordering these the other way round is what sent submerged oil to the
-      // blood shader: oil satisfies isViscousLiquid (liquid, not opaque,
-      // moveEvery 2, opacity 235), so it never reached shadeSubmerged and a
-      // camera under the oil pool rendered as flat grey. Every liquid you can
-      // be inside now takes the submerged path, and submergedProfile derives
-      // its look from that liquid's own palette and opacity.
-      if (underwater) {
-        // ---- the eye is INSIDE the liquid ----
-        // A separate model, not shadeWater with a flag. From in here the
-        // medium covers the entire view, so there is no interface in front of
-        // anything, no Fresnel split to make, and no bounded depth to absorb
-        // over: it is volumetric for the whole ray. See shadeSubmerged.
-        //
-        // Aerial perspective is deliberately NOT applied afterwards. That term
-        // models haze in the AIR between eye and surface, and there is no such
-        // air — shadeSubmerged's own absorption is the distance cue, and
-        // fogging on top of it would double-count and wash the view to sky
-        // colour, which is exactly what hid the bed before.
-        //
-        // pathVox is how far the ray ran inside liquid. For a ray that exits
-        // to open sky it is the whole underwater stretch; for one that ends on
-        // a rock it is the distance to that rock.
-        // `sawSky` says the ray left the water and reached open sky rather
-        // than ending on a surface — that is the case that has to render
-        // Snell's window. A ray that ends on the bed never crossed the
-        // interface and must not get one.
+
+      // Does the MPM field already own this liquid cell?  True when the fluid
+      // march found a surface, the liquid is seam-eligible, AND an MPM block
+      // allocation exists at or adjacent to this cell's chunk (real particles
+      // have been there).  The block-map test is what stops a pure CA lake far
+      // from any MPM activity from being claimed — fluidFieldAt would read 1.0
+      // on any full water cell (via virtual mass), which would incorrectly
+      // suppress shadeWater's caustics and ripple normals.
+      let mpmOwned = mf.hit
+                     && materials[lm].moveEvery <= 1u
+                     && fluidChunkActive(h.liqCell);
+
+      if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit;
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
       } else if (isViscousLiquid(materials[lm])) {
-        // Seen from OUTSIDE: blood and oil take their own surface model — no
-        // travelling ripples, a wet sheen that works on a lone droplet, and a
-        // moving-vs-pooled blend. See shadeViscous for why this is not
-        // shadeWater with different constants.
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              underwater);
         color = applyAerial(color, rd, h.liqT);
-      } else {
+      } else if (!mpmOwned) {
         color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
-        // The water surface itself is at liqT, nearer than whatever is behind
-        // it, so aerial perspective applies from the SURFACE — otherwise a
-        // distant lake gets the fog of its own bed and reads too hazy.
         color = applyAerial(color, rd, h.liqT);
       }
+      // mpmOwned && !viscous && !underwater: the MPM path below will shade it.
     }
   }
 
@@ -5013,16 +4998,19 @@ fn fs(in : VSOut) -> FSOut {
   }
 
   // ---- MPM fluid surface ----
-  // Composited LAST in the back-to-front stack: everything above (terrain, CA
-  // water, ice, gas tint) is what sits behind the MPM surface, and shadeMpmFluid
-  // decides what survives the trip back out. The one ordering this simple
-  // stack concedes: a CA liquid interface NEARER than the MPM surface (looking
-  // at poured water THROUGH a lake) skips the MPM shade rather than layering
-  // wrongly over it — the two-liquid overlap is rare and the failure is an
-  // absence, not an artifact.
-  if (mf.hit && !(h.liqT > 0.05 && h.liqT < mf.t)) {
-    color = shadeMpmFluid(R.camPos, rd, mf, color);
-    if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
+  // The MPM isosurface encompasses both active particles AND settled voxel
+  // water (via fluidMassAt's virtual-mass blend).  The CA water block above
+  // already defers to the MPM path for seam-eligible cells inside the
+  // isosurface, so this path now runs unconditionally when the march hit —
+  // except for viscous liquids (blood, oil) genuinely nearer than the MPM
+  // surface, which the CA block still shaded.
+  if (mf.hit) {
+    let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
+                        && isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))]);
+    if (!viscousNearer) {
+      color = shadeMpmFluid(R.camPos, rd, mf, color);
+      if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
+    }
   }
 
   // NOTE: rising embers over lava were attempted here and REMOVED. The
