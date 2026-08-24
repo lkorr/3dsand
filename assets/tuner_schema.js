@@ -482,6 +482,7 @@ const TUNING_SCHEMA = [
       {k:'gamma', n:'gamma', d:'Output gamma. 2.2 is standard sRGB — change only if the display pipeline demands it.', min:1, max:3.2, step:0.01},
       {k:'primarySteps', n:'primary ray budget', d:'Max DDA steps for a camera ray. Lower is faster but clips distant geometry into the fog.', min:64, max:8192, step:64, int:true},
       {k:'farSteps', n:'cascade ray budget', d:'Max steps per LOD cascade level.', min:16, max:2048, step:16, int:true},
+      {k:'farShadowReach', n:'cascade shadow reach (m)', d:'How far a far-field sun shadow ray travels, in metres. Converted to a step count per cascade level, so the reach is the same distance at every level rather than scaling with cell size.', min:5, max:400, step:5},
     ],
   },
 

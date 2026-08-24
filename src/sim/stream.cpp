@@ -1,7 +1,9 @@
 #include "sim/stream.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "gpu/context.h"
@@ -30,6 +32,18 @@ constexpr size_t kEvictBatch = 256;   // staging bound: 4 MB per readback batch
 // (kEvictBatch * kChunkBytes), so this is a 64 MiB ceiling on a 512 MiB pool
 // budget, not a 64 MiB reservation.
 constexpr size_t kMaxPendingEvicts = 16;  // in-flight batches before we block
+
+// SANDVOX_PT_DEBUG attribution clock, matching pagetable.cpp's. Only read
+// inside a getenv guard.
+inline double PtNowMs() {
+  using namespace std::chrono;
+  return duration<double, std::milli>(steady_clock::now().time_since_epoch())
+      .count();
+}
+inline bool PtDbg() {
+  static const bool on = getenv("SANDVOX_PT_DEBUG") != nullptr;
+  return on;
+}
 }  // namespace
 
 // The persisted word is 32-bit, not 16. It was 16 while the low half was the
@@ -61,6 +75,74 @@ void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out) {
     out.push_back(run);
     out.push_back(w);
     i += run;
+  }
+}
+
+// The RLE of a SENTINEL chunk, without ever materializing its 4,096 words.
+//
+// Produces byte-identical output to synthesizing the chunk with SynthWordAt and
+// running RleEncodeChunk over it — that equality is the whole point, because it
+// is what keeps the save format unchanged (§4.2) and the round-trip lossless.
+// It is a fusion of those two loops, not a new encoding.
+//
+// The two sentinel shapes cost wildly different amounts, and separating them is
+// most of the win:
+//
+//   EMPTY / UNIFORM — every cell is the same word by definition, so the RLE is
+//   exactly one {kChunkVol, w} pair. The old path computed that one pair by
+//   calling SynthWordAt 4,096 times and then run-comparing 4,096 words. This
+//   returns it in two pushes.
+//
+//   JITTER — cells differ in the state nibble, so the run structure is real and
+//   the walk is unavoidable. It is done in ROW order so JitterRowSeed can hoist
+//   the y/z half of the hash out of the inner loop (see world.h), and the RLE
+//   run is extended in the same pass rather than over a staged 16 KiB buffer.
+//
+// Measured motivation: eviction synthesized 1.37 M sentinel chunks over one
+// --autofly-hard run — 31.6 s of synth plus 24.4 s of RLE, together 55% of the
+// paged frame cost, and the large majority of those chunks are the EMPTY/
+// UNIFORM shape that needs no loop at all.
+void RleEncodeSentinelChunk(uint32_t entry, IVec3 wc, uint32_t seed,
+                            std::vector<uint32_t>& out) {
+  out.clear();
+  const uint32_t mat = entry & kPtMatMask;
+  if ((entry & kPtJitterBit) == 0u) {
+    // One word everywhere. kPersistMask is applied for the same reason
+    // RleEncodeChunk applies it: the stamp byte does not persist. SynthWord
+    // already writes kStampNever, so this is a no-op in practice and is kept
+    // so the two encoders cannot drift.
+    out.push_back(kChunkVol);
+    out.push_back(SynthWord(entry) & kPersistMask);
+    return;
+  }
+  const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+            bz = wc.z * (int)kChunk;
+  const uint32_t stampBits = kStampNever << kStampShift;
+  uint32_t run = 0, cur = 0;
+  bool have = false;
+  for (int lz = 0; lz < (int)kChunk; lz++)
+    for (int ly = 0; ly < (int)kChunk; ly++) {
+      const uint32_t rowSeed = JitterRowSeed(by + ly, bz + lz, seed);
+      for (int lx = 0; lx < (int)kChunk; lx++) {
+        const uint32_t w =
+            (mat | (JitterStateInRow(rowSeed, bx + lx, seed) << 12) | stampBits) &
+            kPersistMask;
+        if (have && w == cur) {
+          run++;
+          continue;
+        }
+        if (have) {
+          out.push_back(run);
+          out.push_back(cur);
+        }
+        cur = w;
+        run = 1;
+        have = true;
+      }
+    }
+  if (have) {
+    out.push_back(run);
+    out.push_back(cur);
   }
 }
 
@@ -103,10 +185,13 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
                            (m.gpu.flags & kMatFlagOpaque) != 0)));
 }
 
-void Stream::Update(IVec3 playerChunk) {
+void Stream::Update(IVec3 playerChunk, uint32_t tick) {
+  lastTick_ = tick;
   // harvest evictions whose readback completed since last tick (non-blocking)
   while (!pending_.empty() && pending_.front().map.Ready())
     CompleteOldest(/*discard=*/false);
+  // harvest completed shift-demote batches (non-blocking; see HarvestDemotes)
+  HarvestDemotes(tick);
 
   // sticky modified set from the latest snapshot (slot-indexed, ~2 ticks
   // latent; see the accepted-race note in stream.h)
@@ -197,6 +282,7 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
   // (and modified_ reset) before the readback lands.
   std::vector<std::pair<uint32_t, PendingEvict::Item>> toSave;
   toSave.reserve(slots.size());
+  std::vector<uint32_t> sentRle;
   for (uint32_t s : slots) {
     bool worth = true;
     if (filter && snap.valid)
@@ -205,6 +291,44 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     // all-air and never modified => procgen reproduces it; don't store
     // (only trustable with a live snapshot — flushes store everything)
     uint8_t dropIfAir = filter && snap.valid && modified_[s] == 0;
+
+    // ---- SENTINEL SLOTS NEVER TOUCH THE GPU ------------------------------
+    //
+    // A sentinel slot's content IS its table entry — a kernel cannot write
+    // through a sentinel (that is a counted page fault), so every legitimate
+    // write path materializes first, which means the words a sentinel stands
+    // for are the synth pattern, always, unconditionally. There is nothing to
+    // copy and nothing to wait for.
+    //
+    // They used to ride the staging-batch machinery anyway, as zero-copy
+    // items — and a batch of 256 all-sentinel items still acquired a 4 MiB
+    // staging buffer, submitted a command buffer and eventually map-waited on
+    // the GPU timeline. Under sustained flight the leaving plane is ~95%
+    // sentinels, so that was ~4 pointless map-waits per shift, measured as
+    // the single largest block of paged frame time (118 s of map.Wait over
+    // one --autofly-hard run).
+    //
+    // Better still, an UNMODIFIED sentinel needs no store write at all, under
+    // exactly dropIfAir's trust conditions. Whatever the store holds for this
+    // chunk is already right: a store-hit slot became a sentinel only by
+    // Classify's exact-word test against the loaded bytes (store == synth ==
+    // content), a procgen slot has no store entry and genChunk reproduces its
+    // own deterministic output on re-entry, and a chunk changed SINCE either
+    // event cannot be an unmodified sentinel — the change either kept it
+    // resident or is >= the demote hysteresis old, far beyond modified_'s
+    // snapshot lag. Skipping the Put here is what keeps JITTER planes from
+    // bloating the store with per-cell RLE they never needed.
+    const uint64_t off0 = world_->PageOffsetOfSlot(s);
+    if (off0 == World::kNoPage) {
+      if (filter && snap.valid && modified_[s] == 0) continue;
+      const IVec3 wc = world_->SlotToWorldChunk(s);
+      RleEncodeSentinelChunk(world_->PageEntryOfSlot(s), wc, seed_, sentRle);
+      // A modified (or unfiltered-flush) sentinel is stored synchronously:
+      // pure CPU, ~4 us a chunk, and the store is current before FillSlots
+      // could possibly look this chunk up again.
+      store_.Put(wc, sentRle);
+      continue;
+    }
     toSave.push_back({s, {world_->SlotToWorldChunk(s), dropIfAir}});
   }
 
@@ -278,42 +402,48 @@ rhi::Buffer Stream::AcquireStaging() {
 
 void Stream::CompleteOldest(bool discard) {
   if (pending_.empty()) return;
+  const bool dbg = PtDbg();
+  const double t0 = dbg ? PtNowMs() : 0.0;
   PendingEvict p = std::move(pending_.front());
   pending_.pop_front();
   p.map.Wait();  // resolves the map
+  const double tWait = dbg ? PtNowMs() : 0.0;
+  double synthMs = 0.0, rleMs = 0.0;
+  uint32_t synthChunks = 0;
 
   if (p.map.Succeeded()) {
     if (!discard) {
       const uint8_t* ptr = (const uint8_t*)p.map.Data();
       if (ptr) {
-        std::vector<uint32_t> data(kChunkVol);
         std::vector<uint32_t> rle;
         for (size_t i = 0; i < p.items.size(); i++) {
           // A sentinel slot was never copied (§4.2's mandatory fast path): the
           // CPU already knows its whole content from the table entry, so the
-          // RLE is synthesized directly. RLE compresses a uniform chunk to a
-          // single {4096, w} pair anyway, so a sentinel chunk and a
+          // RLE is produced directly from it. RLE compresses a uniform chunk to
+          // a single {4096, w} pair anyway, so a sentinel chunk and a
           // materialized uniform chunk produce BYTE-IDENTICAL RLE — which is
           // what makes the save format need no change at all (§4.2).
           //
           // A JITTER sentinel does NOT compress to one RLE pair — its cells
-          // differ — so it is synthesized per cell here and then RLE-encoded
-          // like any ordinary chunk. The saved bytes are exactly what a
-          // materialized page would have produced, which is what keeps the save
-          // format unchanged and makes the round-trip lossless.
+          // differ — so its run structure is real. Both shapes go through
+          // RleEncodeSentinelChunk, which FUSES the synthesis into the run scan
+          // instead of materializing 4,096 words into a staging buffer first,
+          // and short-circuits the EMPTY/UNIFORM shape to two pushes. The saved
+          // bytes are exactly what a materialized page would have produced —
+          // the page-roundtrip gate asserts that equality against
+          // SynthWordAt + RleEncodeChunk directly.
           const uint32_t e = i < p.sentinel.size() ? p.sentinel[i] : 0u;
+          const double ts = dbg ? PtNowMs() : 0.0;
           if (e != 0u) {
-            const IVec3 wc = p.items[i].wc;
-            const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                      bz = wc.z * (int)kChunk;
-            for (uint32_t k = 0; k < kChunkVol; k++)
-              data[k] = SynthWordAt(e, bx + (int)(k % kChunk),
-                                    by + (int)((k / kChunk) % kChunk),
-                                    bz + (int)(k / (kChunk * kChunk)), seed_);
+            RleEncodeSentinelChunk(e, p.items[i].wc, seed_, rle);
+            if (dbg) { synthMs += PtNowMs() - ts; synthChunks++; }
           } else {
-            std::memcpy(data.data(), ptr + i * kChunkBytes, kChunkBytes);
+            // Straight off the mapped staging buffer: RleEncodeChunk only reads
+            // the words, so the intermediate 16 KiB copy this used to make was
+            // pure overhead. (The mapping stays alive until Unmap below.)
+            RleEncodeChunk((const uint32_t*)(ptr + i * kChunkBytes), rle);
+            if (dbg) rleMs += PtNowMs() - ts;
           }
-          RleEncodeChunk(data.data(), rle);
           bool air = rle.size() == 2 && rle[1] == 0;
           if (air && p.items[i].dropIfAir) continue;
           store_.Put(p.items[i].wc, rle);
@@ -329,6 +459,11 @@ void Stream::CompleteOldest(bool discard) {
     auto pc = pendingChunks_.find(World::PackChunkKey(it.wc));
     if (pc != pendingChunks_.end() && --pc->second == 0) pendingChunks_.erase(pc);
   }
+  if (dbg)
+    std::printf("[pt-time] evict harvest: %zu items total %.2f ms (wait %.2f, "
+                "synth %.2f/%u, rle %.2f)\n",
+                p.items.size(), PtNowMs() - t0, tWait - t0, synthMs,
+                synthChunks, rleMs);
 }
 
 void Stream::DrainEvictions(bool discard) {
@@ -391,7 +526,14 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // tightening in the same tick would intersect the refilled chunk's
       // NEIGHBOURS away and the CA frontier a stream-in creates would be
       // invisible to the mirror.
-      world_->pages->RefilledSlot(s);
+      //
+      // EXCEPT pure stainless sky (PT_EMPTY): nothing in it can act, so it
+      // creates no frontier — the act-set rule the gen branch applies below,
+      // in its cheapest form. A stained-air or unclassifiable chunk returns
+      // kNeedsPage and still wakes; a full UNIFORM/JITTER store hit is rare
+      // enough (doubled-back player) that it wakes conservatively rather than
+      // paying the neighbour test here without the occupancy buffer in hand.
+      if (entry != kPtEmpty) world_->pages->RefilledSlot(s);
       uint32_t occ = 0, blockers = 0, anyStain = 0;
       for (uint32_t w : data) {
         // OUTSIDE the air test, like sim_occupancy: a restored chunk can be
@@ -433,9 +575,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     if (world_->residency == World::Residency::Paged) {
       for (uint32_t gs : genSlots) world_->pages->EnsurePageForOverwrite(gs);
       world_->pages->FlushTableWrites(ctx_->queue);
-      // Same contributor (d) reasoning as the store-hit branch: genChunk's own
-      // in-kernel dirty write wakes the slot next tick.
-      for (uint32_t gs : genSlots) world_->pages->RefilledSlot(gs);
+      // Contributor (d) — the RefilledSlot calls — moved to AFTER the demote
+      // pass below, where the post-genChunk occupancy is in hand: only the
+      // slots that can ACT are declared, not the whole plane. See the act-set
+      // note at that site.
     }
     ctx_->queue.WriteBuffer(world_->genList, 0, genSlots.data(),
                             genSlots.size() * 4);
@@ -490,8 +633,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     // the eviction path already uses for exactly this reason, 4 MB of staging)
     // makes it one submit and one map per 256 chunks.
     if (world_->residency == World::Residency::Paged) {
-      uint32_t demoted = 0;
-      std::vector<uint32_t> vox(kEvictBatch * kChunkVol);
+      const bool dbg = PtDbg();
+      const double dT0 = dbg ? PtNowMs() : 0.0;
+      double occMs = 0.0;
 
       // ---- PREFILTER ON OCCUPANCY, so the voxel read is sized to the ANSWER --
       //
@@ -522,10 +666,93 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // here and only here: a zeroed entry fails the `nonAir != 0` test below,
       // so every slot falls through into `paged` and gets its words read. The
       // prefilter degrades to "test everything", never to "demote everything".
-      std::vector<uint32_t> occ(kNumChunks);
-      if (!rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->occupancy, 0,
-                                 occ.data(), (size_t)kNumChunks * 4, "genOcc"))
-        occ.assign(kNumChunks, 0);  // read failed: fall back to testing all
+      // ONE POOLED STAGING BUFFER, not a fresh allocation per shift.
+      // rhi::ReadbackBlocking creates a buffer, submits, waits the whole queue
+      // idle and maps, every single shift — and shifts land on consecutive
+      // frames under flight. Keeping the 128 KiB buffer alive across shifts
+      // removes the create/destroy; the copy+map is still queue-ordered behind
+      // genChunk's submit, which is the dependency that matters (reading early
+      // returns the PREVIOUS contents and would demote every generated chunk).
+      std::vector<uint32_t>& occ = genOccScratch_;
+      if (occ.size() != kNumChunks) occ.assign(kNumChunks, 0);
+      bool occValid = false;
+      const double occT0 = dbg ? PtNowMs() : 0.0;
+      if (!genOccStaging_)
+        genOccStaging_ = CreateBuffer(
+            ctx_->device, (uint64_t)kNumChunks * 4,
+            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "genOcc");
+      {
+        rhi::CommandEncoder oenc = ctx_->device.CreateCommandEncoder();
+        oenc.CopyTracked(pass::Buf::Occupancy, world_->occupancy, 0,
+                         genOccStaging_, 0, (uint64_t)kNumChunks * 4);
+        ctx_->queue.Submit(oenc.Finish());
+        rhi::MapTicket omap = rhi::MapReadDeferred(ctx_->device, genOccStaging_,
+                                                   0, (uint64_t)kNumChunks * 4);
+        omap.Wait();
+        occValid = omap.Succeeded() && omap.Data();
+        if (occValid)
+          std::memcpy(occ.data(), omap.Data(), (size_t)kNumChunks * 4);
+        else
+          std::fill(occ.begin(), occ.end(), 0u);  // failed: fall back to all
+        omap.Unmap();
+      }
+      if (dbg) occMs = PtNowMs() - occT0;
+
+      // ---- contributor (d), the ACT SET: wake only what can act -----------
+      //
+      // The blanket form of this — RefilledSlot for every slot of the plane —
+      // is what ran the mirror away: under --autofly-hard the plane is ~all
+      // JITTER-demotable stone, every slot of it hasMatter, so the whole
+      // plane plus its 26-ring (~3,072 chunks) materialized every shift on
+      // consecutive frames, against a free path on an 8-snapshot hysteresis.
+      // Measured twice as a FATAL pool exhaustion (32,148 and 31,691 of
+      // 32,768). Filtering by hasMatter cannot help: a buried stone chunk IS
+      // matter. The right question is not "does it hold matter" but "can any
+      // cell in it ACT" — and with the post-genChunk occupancy in hand the
+      // CPU can answer it per chunk:
+      //
+      //   - pure sky (nonAir == 0): nothing in it can move, and matter can
+      //     only ARRIVE from an acting neighbour, which is covered by that
+      //     neighbour's own ring (the DIRTY != HAS MATTER argument of
+      //     Materialize's bracketed half, verbatim);
+      //   - mixed (0 < nonAir < CHUNK_VOL): a free surface. Wakes.
+      //   - full (nonAir == CHUNK_VOL): cells can act only toward air, and a
+      //     CA write reaches <= 1 cell (rule 1), so a full chunk with NO air
+      //     anywhere in its 26-neighbourhood is inert — that is the buried
+      //     bulk, and it is exactly the JITTER win being protected here. Air
+      //     in any neighbour (a cave wall, the surface, a full sand column
+      //     under sky) wakes it. Out-of-window neighbours are inert by
+      //     definition (not simulated). Full-vs-full liquid gradients need no
+      //     wake of their own: the acting side writes the passive side's
+      //     boundary cell, whose chunk is in the actor's ring, and from then
+      //     on the written chunk is genuinely dirty and the recurrence
+      //     tracks it.
+      //
+      // A failed occupancy read flips the conservative direction here: for
+      // DEMOTION zeros are safe (test everything), for WAKING they would be
+      // silent voxel loss (wake nothing). So a failed read wakes the whole
+      // plane — the pre-act-set behaviour, degraded not broken.
+      for (uint32_t gs : genSlots) {
+        bool wake = true;
+        if (occValid) {
+          const uint32_t nonAir = occ[gs] & 0xFFFFu;
+          if (nonAir == 0u) continue;         // pure sky cannot act
+          wake = nonAir != kChunkVol;         // mixed: free surface
+          if (!wake) {
+            const IVec3 wc = world_->SlotToWorldChunk(gs);
+            for (int dz = -1; dz <= 1 && !wake; dz++)
+              for (int dy = -1; dy <= 1 && !wake; dy++)
+                for (int dx = -1; dx <= 1 && !wake; dx++) {
+                  if (!dx && !dy && !dz) continue;
+                  const IVec3 nc{wc.x + dx, wc.y + dy, wc.z + dz};
+                  if (!world_->ChunkInWindow(nc)) continue;
+                  if ((occ[World::SlotChunkIndex(nc)] & 0xFFFFu) != kChunkVol)
+                    wake = true;
+                }
+          }
+        }
+        if (wake) world_->pages->RefilledSlot(gs);
+      }
 
       // Collect the candidates: a sentinel slot has nothing to read and is
       // already in its demoted form; a PARTIALLY-full slot cannot demote.
@@ -577,39 +804,158 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         paged.push_back(gs);
       }
 
-      for (size_t off = 0; off < paged.size(); off += kEvictBatch) {
-        const size_t n = std::min(kEvictBatch, paged.size() - off);
-        rhi::Buffer staging = AcquireStaging();
-        rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
-        for (size_t i = 0; i < n; i++) {
-          // Tracked, like the eviction copy: every off-table voxels read goes
-          // through the barrier tracker rather than special-casing this one.
-          enc.CopyTracked(pass::Buf::Voxels, world_->voxels,
-                          world_->PageOffsetOfSlot(paged[off + i]), staging,
-                          i * kChunkBytes, kChunkBytes);
-        }
-        ctx_->queue.Submit(enc.Finish());
-        rhi::MapTicket map =
-            rhi::MapReadDeferred(ctx_->device, staging, 0, n * kChunkBytes);
-        map.Wait();
-        if (map.Succeeded() && map.Data()) {
-          std::memcpy(vox.data(), map.Data(), n * kChunkBytes);
-          map.Unmap();
-          for (size_t i = 0; i < n; i++) {
-            const uint32_t e = world_->pages->Classify(paged[off + i],
-                                                       vox.data() + i * kChunkVol);
-            if (e == PageTable::kNeedsPage) continue;
-            world_->pages->SetSentinel(paged[off + i], e);
-            demoted++;
-          }
-        } else {
-          map.Unmap();
-        }
-        stagingPool_.push_back(staging);
-      }
-      if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
+      // ---- ISSUE the copies now, CLASSIFY on a later frame's harvest -------
+      //
+      // The copies must be encoded here — queue order behind genChunk's submit
+      // is what guarantees they read post-gen data — but nothing about the
+      // DECISION is urgent: with residency at ~1.2k pages of a 32,768-page
+      // pool, a chunk that stays resident a few frames longer costs pages the
+      // pool has thirty-fold spare, while the map.Wait (5.5 s/run) and the
+      // JITTER word-verify (29.6 s/run) were the shift frame's two largest
+      // remaining stalls after the eviction fix. HarvestDemotes applies the
+      // staleness and identity guards at classify time.
+      std::vector<uint64_t> keys;
+      keys.reserve(paged.size());
+      for (uint32_t gs : paged)
+        keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
+      IssueDemoteCopies(paged, keys, lastTick_);
+      if (dbg)
+        std::printf("[pt-time] shift demote: gen=%zu cands=%zu issued "
+                    "total %.2f ms (occ %.2f)\n",
+                    genSlots.size(), paged.size(), PtNowMs() - dT0, occMs);
     }
   }
+}
+
+void Stream::DiscardDemotes() {
+  for (PendingDemote& d : demotes_) {
+    d.map.Wait();
+    d.map.Unmap();
+    stagingPool_.push_back(d.staging);
+  }
+  demotes_.clear();
+}
+
+void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
+                               const std::vector<uint64_t>& keys,
+                               uint32_t tick) {
+  // Backstop, not a throughput knob: 32 in-flight batches is 128 MiB of
+  // staging and far beyond the ~4-8 a saturated flight keeps queued. Hitting
+  // it means the GPU is pathologically behind; forcing the oldest batch
+  // through (Wait + harvest) is the bounded-memory answer, and the harvest's
+  // own retry logic keeps correctness.
+  constexpr size_t kMaxPendingDemotes = 32;
+  while (demotes_.size() >= kMaxPendingDemotes) {
+    demotes_.front().map.Wait();
+    HarvestDemotes(tick);
+  }
+  for (size_t off = 0; off < slots.size(); off += kEvictBatch) {
+    const size_t n = std::min(kEvictBatch, slots.size() - off);
+    PendingDemote d;
+    d.staging = AcquireStaging();
+    d.copyTick = tick;
+    d.slots.reserve(n);
+    d.keys.reserve(n);
+    d.copied.reserve(n);
+    rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t s = slots[off + i];
+      // A re-issued slot may have been demoted or evicted since it was first
+      // queued: no source page, no copy. The `copied` flag is what stops the
+      // harvest from ever classifying the stale staging bytes at that index —
+      // a garbage match against the exact-word rule is astronomically unlikely
+      // and still not a risk worth carrying on a hash-critical path.
+      const uint64_t srcOff = world_->PageOffsetOfSlot(s);
+      d.slots.push_back(s);
+      d.keys.push_back(keys[off + i]);
+      d.copied.push_back(srcOff != World::kNoPage);
+      if (srcOff != World::kNoPage)
+        enc.CopyTracked(pass::Buf::Voxels, world_->voxels, srcOff, d.staging,
+                        i * kChunkBytes, kChunkBytes);
+    }
+    ctx_->queue.Submit(enc.Finish());
+    d.map = rhi::MapReadDeferred(ctx_->device, d.staging, 0, n * kChunkBytes);
+    demotes_.push_back(std::move(d));
+  }
+}
+
+void Stream::HarvestDemotes(uint32_t tick) {
+  // THE STALENESS BOUND, and why kDemoteFreshTicks is a correctness constant
+  // rather than a tuning knob. The staging bytes are a snapshot at copyTick;
+  // classifying them later demotes on words that may have been overwritten
+  // since. The guard against that is `!cpuDirty.Has(slot)` — anything that
+  // writes a chunk puts it in the mirror within a tick (op targets directly,
+  // CA writes via the writer's membership + propagate, particle landings via
+  // the flight shell) — but cpuDirty is TIGHTENED over time: a chunk written
+  // after the copy, settled, and then confirmed clean by a POSTDATING
+  // snapshot leaves the mirror again, and from that point the stale bytes
+  // would pass every guard while missing the write.
+  //
+  // That exit takes a floor of ~5 ticks: >=1 tick for the write to land and
+  // settle, plus the readback ring's >=2-tick snapshot lag, plus the
+  // postdating requirement. A batch classified within 3 ticks of its copy is
+  // therefore strictly inside the window where any intervening write is STILL
+  // in the mirror and refuses the demote. Older batches are NOT trusted and
+  // NOT dropped — the surviving slots are re-copied fresh, which costs one
+  // more 4 MiB GPU copy and converges as soon as the GPU keeps up. Dropping
+  // them instead would leak resident pages until the slot scrolls out, which
+  // is bounded but is also how the pre-JITTER pool exhausted.
+  constexpr uint32_t kDemoteFreshTicks = 3;
+  const bool dbg = PtDbg();
+  uint32_t demoted = 0, retried = 0, harvested = 0;
+  while (!demotes_.empty() && demotes_.front().map.Ready()) {
+    PendingDemote d = std::move(demotes_.front());
+    demotes_.pop_front();
+    d.map.Wait();  // Ready() above: resolves without blocking
+    if (d.map.Succeeded() && d.map.Data()) {
+      harvested++;
+      if (demoteScratch_.size() < d.slots.size() * kChunkVol)
+        demoteScratch_.resize(d.slots.size() * kChunkVol);
+      // One sequential copy out of write-combined map memory; Classify then
+      // reads cached RAM. Reading the mapped pointer directly is legal but
+      // pays uncached-read cost per word.
+      std::memcpy(demoteScratch_.data(), d.map.Data(),
+                  d.slots.size() * kChunkBytes);
+      d.map.Unmap();
+      const bool fresh = tick >= d.copyTick && tick - d.copyTick <= kDemoteFreshTicks;
+      std::vector<uint32_t> retry;
+      std::vector<uint64_t> retryKeys;
+      for (size_t i = 0; i < d.slots.size(); i++) {
+        const uint32_t s = d.slots[i];
+        if (!d.copied[i]) continue;  // no bytes for this index: never classify
+        // Identity: the slot must still be the world chunk the bytes belong
+        // to. A later shift repurposes slots for different world chunks, and
+        // classifying chunk A's bytes into chunk B's table row is silent
+        // corruption of the worst kind.
+        if (World::PackChunkKey(world_->SlotToWorldChunk(s)) != d.keys[i])
+          continue;
+        if (world_->PageOffsetOfSlot(s) == World::kNoPage) continue;  // demoted already
+        if (!fresh) {
+          retry.push_back(s);
+          retryKeys.push_back(d.keys[i]);
+          continue;
+        }
+        if (world_->pages->CpuDirty().Has(s)) continue;  // written since the copy
+        const uint32_t e =
+            world_->pages->Classify(s, demoteScratch_.data() + i * kChunkVol);
+        if (e == PageTable::kNeedsPage) continue;
+        world_->pages->SetSentinel(s, e);
+        demoted++;
+      }
+      if (!retry.empty()) {
+        retried += (uint32_t)retry.size();
+        IssueDemoteCopies(retry, retryKeys, tick);
+      }
+    } else {
+      d.map.Unmap();
+    }
+    stagingPool_.push_back(d.staging);
+  }
+  if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
+  if (dbg && (harvested || retried))
+    std::printf("[pt-time] demote harvest: batches=%u demoted=%u retried=%u "
+                "queued=%zu\n",
+                harvested, demoted, retried, demotes_.size());
 }
 
 void Stream::FlushResident() {
@@ -622,6 +968,7 @@ void Stream::FlushResident() {
 void Stream::ReloadWindow(IVec3 origin) {
   // in-flight evictions belong to the world being replaced
   DrainEvictions(/*discard=*/true);
+  DiscardDemotes();  // same: old-world bytes must never classify the new one
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumChunks, 0);
   std::vector<uint32_t> slots(kNumChunks);

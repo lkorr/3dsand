@@ -336,6 +336,7 @@ TP_F(render, microSwayAmp, TUNE_MICRO_SWAY_AMP, 1.5f)
 TP_F(render, microSwaySpeed, TUNE_MICRO_SWAY_SPEED, 1.1f)
 TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096)
 TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
+TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
 
 // ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
 TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22)

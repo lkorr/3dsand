@@ -1224,6 +1224,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "microSwaySpeed", r.microSwaySpeed, out, at);
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
+    ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -1280,6 +1281,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.shadowSteps < 0) { r.shadowSteps = 0; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
     if (r.farSteps < 1) { r.farSteps = 1; }
+    // A zero/negative reach would clamp to the 8-step floor everywhere and
+    // silently drop far shadows; keep it positive.
+    if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }
   }
 
   if (const json* g = Find(j, "worldgen")) {

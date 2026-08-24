@@ -1,11 +1,22 @@
 #include "sim/pagetable.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked page fills
 #include "sim/tuning.h"      // TUNE_PART_MAX_VEL, for the spawn-ring radius
+
+namespace {
+// SANDVOX_PT_DEBUG attribution clock. Only ever read inside a getenv guard, so
+// a shipped run pays nothing beyond the branch.
+inline double PtNowMs() {
+  using namespace std::chrono;
+  return duration<double, std::milli>(steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
 
 // Global scope, matching world.h and sim/world.h's World — this type is a
 // peer of World, not a game-layer type.
@@ -94,6 +105,7 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   particleChunks_.Clear();
   fluidChunks_.Clear();
   opTargets_.Clear();
+  refilled_.Clear();
   shell_.Clear();
   shellSeed_.Clear();
   shellPending_ = false;
@@ -149,6 +161,7 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   particleChunks_.Clear();
   fluidChunks_.Clear();
   opTargets_.Clear();
+  refilled_.Clear();
   shell_.Clear();
   shellSeed_.Clear();
   shellPending_ = false;
@@ -313,14 +326,38 @@ uint32_t PageTable::Classify(uint32_t slot, const uint32_t* words) const {
   const uint32_t entry = kPtSentinelBit | kPtJitterBit | mat;
   const IVec3 wc = world_->SlotToWorldChunk(slot);
   const IVec3 base{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
-  for (uint32_t i = 0; i < kChunkVol; i++) {
-    const int lx = (int)(i % kChunk);
-    const int ly = (int)((i / kChunk) % kChunk);
-    const int lz = (int)(i / (kChunk * kChunk));
-    if (SynthWordAt(entry, base.x + lx, base.y + ly, base.z + lz, seed_) !=
-        words[i])
-      return kNeedsPage;
-  }
+  // ROW-ORDERED, and cheap-rejecting on the material FIRST. Two changes, both
+  // pure strength reduction over the flat SynthWordAt loop that was here:
+  //
+  //   - the material test is a mask compare, so a chunk that is not one
+  //     material at all (the overwhelmingly common refusal) is rejected
+  //     without ever hashing;
+  //   - the surviving JITTER verification walks rows, where Pcg(y) and the z
+  //     term are loop-invariant (JitterRowSeed), removing one of three PCG
+  //     rounds per cell.
+  //
+  // The ACCEPT condition is unchanged and still exact-word: every cell must
+  // equal what a JITTER sentinel synthesizes there, stamp included. See the
+  // stamp note above — this loop decides a promotion, so it may not relax.
+  //
+  // Measured: this test ran 1,024 times per window shift under --autofly-hard
+  // at ~25 us each, 36.6 s of the 130 s paged frame budget over one run — the
+  // single largest CPU item after eviction's synth+RLE.
+  const uint32_t wantMat = mat;
+  for (uint32_t i = 0; i < kChunkVol; i++)
+    if ((words[i] & kPtMatMask) != wantMat) return kNeedsPage;
+  const uint32_t stampBits = kStampNever << kStampShift;
+  uint32_t i = 0;
+  for (int lz = 0; lz < (int)kChunk; lz++)
+    for (int ly = 0; ly < (int)kChunk; ly++) {
+      const uint32_t rowSeed = JitterRowSeed(base.y + ly, base.z + lz, seed_);
+      for (int lx = 0; lx < (int)kChunk; lx++, i++) {
+        const uint32_t want =
+            wantMat | (JitterStateInRow(rowSeed, base.x + lx, seed_) << 12) |
+            stampBits;
+        if (words[i] != want) return kNeedsPage;
+      }
+    }
   return entry;
 }
 
@@ -532,11 +569,48 @@ void PageTable::WakeAll() {
 void PageTable::RefilledSlot(uint32_t slot) {
   refills_++;
   // Contributor (d): Stream::FillSlots writes dirty[0] AND dirty[1] for a
-  // store-hit slot. Its target was just written by streaming so it is
-  // materialized anyway, but it must still enter cpuDirty or a tightening in
-  // the same tick would intersect the refilled chunk's NEIGHBOURS away, and
-  // the CA frontier a stream-in creates would be invisible to the mirror.
-  cpuDirty_.Add(slot);
+  // store-hit or freshly generated slot. Its target was just written by
+  // streaming so it is materialized anyway, but it must still enter cpuDirty or
+  // a tightening would intersect the refilled chunk (and its NEIGHBOURS) away,
+  // and the CA frontier a stream-in creates would be invisible to the mirror.
+  //
+  // BUFFERED, NOT ADDED TO cpuDirty HERE — and this is the fix for a real page
+  // fault, not a tidiness point. The old code did `cpuDirty_.Add(slot)` from
+  // this function, which runs from Stream::FillSlots BETWEEN ticks, so the add
+  // landed BEFORE the next SubmitTick's TightenFromSnapshot — on the wrong
+  // side of step (2)'s intersection. Refilled slots are also not in the C(j)
+  // ring (only opTargets and particleChunks are), so a snapshot predating the
+  // refill has the slot clear in BOTH operands and tightens it straight out.
+  //
+  // What that cost, end to end: the slot leaves cpuDirty, so Materialize never
+  // allocates it a page and it stays a sentinel — but FillSlots already wrote
+  // dirty[0]/dirty[1] = 1 for it, so the CA dispatches on it anyway, voxStore
+  // hits PT_NO_WORD (common.wgsl) and the write is silently DROPPED. That is
+  // the streaming gate's 217 page faults. Dense never saw it (no sentinels
+  // exist) and SANDVOX_NO_JITTER=1 never saw it (the chunk fails UNIFORM
+  // classification and stays resident), which is exactly the differential the
+  // diagnosis used.
+  //
+  // Materialize consumes the buffer into cpuDirty AFTER the tightening (the
+  // (c)/(e) ordering rule: a union applied after an intersection cannot be
+  // undone by it) and records it in the C(j) ring so a LATER tightening
+  // rolling a pre-refill snapshot forward re-adds it. Both halves are needed;
+  // missing either loses the slot to an intersection.
+  //
+  // THE CALLER DECLARES ONLY THE ACT SET, and that narrowing is what makes
+  // the mirror an affordable home for this contributor at all: declaring the
+  // whole shift plane (1,024 slots, ~all JITTER-demotable stone under
+  // --autofly-hard, every one of it hasMatter) ran the carried, N26-dilated
+  // set away to a FATAL pool exhaustion, twice, in two different homes
+  // (32,148 in cpuDirty, 31,691 in the materialization set). A chunk that
+  // cannot act creates no frontier, so pure sky and air-isolated full bulk
+  // never enter — see the act-set note in Stream::FillSlots for the per-chunk
+  // rule and its soundness.
+  // Dense has no mirror to maintain — every slot is permanently resident and
+  // Materialize returns before the consuming union — so buffering here would
+  // grow a set nothing ever drains. cpuDirty is inert under dense by design.
+  if (!paged_) return;
+  refilled_.Add(slot);
 }
 
 void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
@@ -657,6 +731,8 @@ void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
 }
 
 void PageTable::Materialize(const rhi::Queue& queue) {
+  const bool matDbg = getenv("SANDVOX_PT_DEBUG") != nullptr;
+  const double matT0 = matDbg ? PtNowMs() : 0.0;
   // Step (1) of the normative definitions: propagate. Done here rather than in
   // BeginTick because opTargets_/particleChunks_ (= C(N)) are only complete
   // once the caller has declared this tick's ops.
@@ -674,10 +750,17 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   CEntry ce;
   ce.tick = tick_;
   ce.slots.reserve(opTargets_.Size() + particleChunks_.Size() +
-                   fluidChunks_.Size());
+                   fluidChunks_.Size() + refilled_.Size());
   for (uint32_t s : opTargets_.Members()) ce.slots.push_back(s);
   for (uint32_t s : particleChunks_.Members()) ce.slots.push_back(s);
   for (uint32_t s : fluidChunks_.Members()) ce.slots.push_back(s);
+  // Contributor (d) rides the C-ring too, and its absence here was half of
+  // the 217-fault bug: a snapshot stamped BEFORE the refill has the slot
+  // clear, the C(j) union is what re-adds CPU-decided contributions the
+  // snapshot never saw, and refills were the one CPU-decided contribution
+  // not recorded. A tightening rolling such a snapshot forward intersected
+  // the refill away however it entered the mirror.
+  for (uint32_t s : refilled_.Members()) ce.slots.push_back(s);
   cRing_.push_back(std::move(ce));
   while (cRing_.size() > kCRing) cRing_.pop_front();
 
@@ -691,6 +774,30 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   if (shellPending_) {
     cpuDirty_.UnionWith(shellSeed_);
     shellPending_ = false;
+  }
+
+  // Contributor (d), the REFILLED ACT SET — same placement and same fixed-
+  // point argument as the shell seed above: unioned AFTER step (1)'s
+  // propagate so it is not dilated in the tick it arrives, and AFTER the
+  // tightening (Materialize runs after TightenFromSnapshot by SubmitTick's
+  // ordering) so the intersection cannot undo it. The bracketed half below
+  // then materializes each member plus its 26-ring by its own rule — a mixed
+  // refill chunk is hasMatter, and a full-under-air JITTER chunk is hasMatter
+  // too (a non-air sentinel holds matter), so the ring covers every write the
+  // first tick of post-stream CA can make. From the next tick the recurrence
+  // owns it: the member is carried in cpuDirty, step (1) tracks its frontier,
+  // and the next postdating snapshot either confirms it (genuinely dirty, in
+  // both operands) or tightens it away (settled — the common case).
+  //
+  // What makes this affordable where the whole-plane version fatally was not:
+  // the CALLER (Stream::FillSlots) narrowed the set to chunks that can ACT —
+  // free surfaces and full-chunks-touching-air — before declaring them.
+  // Under --autofly-hard that is ~zero of a buried plane instead of all
+  // 1,024; the buried JITTER bulk never enters the mirror at all, which IS
+  // the sentinel's memory win being preserved.
+  if (!refilled_.Empty()) {
+    cpuDirty_.UnionWith(refilled_);
+    refilled_.Clear();
   }
 
   auto& t = world_->pageTableCpuMutable();
@@ -813,6 +920,9 @@ void PageTable::Materialize(const rhi::Queue& queue) {
     MarkTableDirty(s);
   }
   FlushTableWrites(queue);
+  if (matDbg)
+    std::printf("[pt-time] tick %u materialize: %.2f ms (set %zu)\n", tick_,
+                PtNowMs() - matT0, materialized_.Size());
 }
 
 void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
@@ -877,10 +987,44 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // which is every tick of a settled world — costs nothing beyond the
   // increments. The stain flag has already rejected the chunks it can; these
   // are the ones only the live words can decide.
-  for (uint32_t s : candidates) {
+  const bool ptDbg = getenv("SANDVOX_PT_DEBUG") != nullptr;
+  const double probeT0 = ptDbg ? PtNowMs() : 0.0;
+  uint32_t probesRun = 0;
+
+  // ---- ONE BATCHED READ FOR THE WHOLE CANDIDATE SET -----------------------
+  //
+  // See SetChunkProbe for the measurement that forced this shape: the per-slot
+  // form was a full device drain each, 198 ms for one tick's 804 candidates.
+  //
+  // The batch is CAPPED (kMaxFreeProbesPerTick), and the cap is back for a
+  // different reason than the one that made it harmful before. It used to
+  // bound reclamation below the allocation rate, which is a leak. Here it
+  // bounds the STAGING BYTES of a single read — 128 chunks is 2 MiB — while
+  // the candidates it defers are not lost: their zeroStreak_ is held AT the
+  // threshold, so they are re-offered on the very next tick rather than
+  // restarting their eight-snapshot wait. Reclamation is therefore still
+  // unbounded ACROSS ticks; only one tick's read is bounded.
+  std::vector<uint32_t> batch;
+  std::vector<bool> ok;
+  if (probeChunk_ && !candidates.empty()) {
+    const size_t n = std::min(candidates.size(), kMaxFreeProbesPerTick);
+    batch.assign(candidates.begin(), candidates.begin() + n);
+    if (freeProbe_.size() != (size_t)kChunkVol * n)
+      freeProbe_.assign((size_t)kChunkVol * n, 0);
+    ok = probeChunk_(batch, freeProbe_.data());
+    probesRun = (uint32_t)n;
+    // Deferred candidates keep their place in the queue: held one short of a
+    // re-increment so the next snapshot re-offers them immediately.
+    for (size_t i = n; i < candidates.size(); i++)
+      zeroStreak_[candidates[i]] = kPageFreeTicks - 1;
+    candidates.resize(n);
+  }
+
+  for (size_t ci = 0; ci < candidates.size(); ci++) {
+    const uint32_t s = candidates[ci];
     if (probeChunk_) {
-      if (freeProbe_.size() != kChunkVol) freeProbe_.assign(kChunkVol, 0);
-      if (!probeChunk_(s, freeProbe_.data())) continue;
+      if (ci >= ok.size() || !ok[ci]) continue;
+      const uint32_t* words = freeProbe_.data() + ci * (size_t)kChunkVol;
       // The free test is "every cell is STAINLESS AIR", NOT Classify's
       // exact-word rule, and the distinction is the difference between a
       // working demotion path and a permanent leak. Two passenger-bit classes
@@ -925,12 +1069,12 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
       // resident words bit-exactly.
       bool demotable = true;
       for (uint32_t i = 0; i < kChunkVol; i++)
-        if ((freeProbe_[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
+        if ((words[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
       if (!demotable) {
-        if (getenv("SANDVOX_PT_DEBUG")) {
+        if (ptDbg) {
           uint32_t w = 0, at = 0;
           for (uint32_t i = 0; i < kChunkVol; i++)
-            if ((freeProbe_[i] & kAirDemoteMask) != 0u) { w = freeProbe_[i]; at = i; break; }
+            if ((words[i] & kAirDemoteMask) != 0u) { w = words[i]; at = i; break; }
           std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
                       tick_, s, w, at);
         }
@@ -962,6 +1106,9 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     pagesInUse_--;
     pagesFreed_++;
   }
+  if (ptDbg && (probesRun || !candidates.empty()))
+    std::printf("[pt-time] tick %u freeprobe: cands=%zu probes=%u %.2f ms\n",
+                tick, candidates.size(), probesRun, PtNowMs() - probeT0);
 }
 
 void PageTable::RetirePages(uint32_t tick) {

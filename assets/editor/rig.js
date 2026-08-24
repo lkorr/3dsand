@@ -41,10 +41,12 @@ let sideEl = null, timelineEl = null;
 let clipWrap = null;          // renderClipLane()'s own container, see below
 
 let selectedPart = null;      // limb name, or null
+let selectedParts = new Set(); // shift-click multi-select (names)
 // Socket being dragged, by INDEX into sidecar.sockets, or null. Selecting a
 // socket takes the gizmo over from the joint anchor — both are "a point on a
 // part", so they share one gizmo rather than fighting over the viewport.
 let selectedSocket = null;
+const collapsedGroups = new Set();
 
 // --- limb library (assets/limbs/, see limblib.js) -------------------------
 //
@@ -703,9 +705,12 @@ function activeGrip() {
 // Mutating the sidecar invalidates the preview skeleton — rebuild it so the
 // preview never runs against a stale rig. This is the single choke point for
 // "the data changed", which is why every edit path calls it.
+let _touchTimer = 0;
 function touched() {
   ed.touchSidecar();
   rebuildSkeleton();
+  clearTimeout(_touchTimer);
+  _touchTimer = setTimeout(() => { ed.commitSidecarUndo(); }, 120);
 }
 
 /**
@@ -959,9 +964,11 @@ function moveInput(limb) {
     if (!d.x && !d.y && !d.z) return;
     const mi = ed.getModels().findIndex(m => m.name === limb.name);
     if (mi < 0) { toast(`no model named "${limb.name}"`, true); return; }
+    ed.pushMoveUndo([mi]);
     if (!ed.moveModel(mi, d)) return;
+    ed.finishMoveUndo([mi]);
     boxes.forEach(b => { b.value = '0'; });
-    touched();
+    rebuildSkeleton();
     bindGizmo();
     ed.invalidate();
     renderAllPanels();
@@ -1009,25 +1016,33 @@ function renderRigPanel() {
      row selects the model AND opens that limb's editor inline below it.
      They used to be two lists at opposite ends of the panel, which meant
      clicking a model did nothing visible and the limb had to be found again
-     further down. */
+     further down. Grouped by skeleton chain when a sidecar is present. */
   const list = el('div', { class: 'riglist' });
-  models.forEach((m, i) => {
+
+  function buildModelRow(m, i) {
     const limbHere = limbByName(m.name);
     const openHere = !!limbHere && limbHere.name === selectedPart;
+    const isSelected = selectedParts.has(m.name);
     const row = el('div', {
-      class: 'rigrow' + (i === ed.getActiveModel() ? ' on' : ''),
-      onclick: () => {
+      class: 'rigrow' + (i === ed.getActiveModel() ? ' on' : '')
+                       + (isSelected ? ' multi' : ''),
+      onclick: (ev) => {
+        if (ev.shiftKey) {
+          if (selectedParts.has(m.name)) selectedParts.delete(m.name);
+          else selectedParts.add(m.name);
+          ed.invalidate();
+          renderAllPanels();
+          return;
+        }
+        selectedParts.clear();
         ed.setActiveModel(i);
-        // Select the whole model so Ctrl+C / Del / fill work on it immediately.
         ed.setSelection({
           lo: [0, 0, 0],
           hi: [m.dim.x - 1, m.dim.y - 1, m.dim.z - 1],
           model: i,
         });
-        // Toggle the inline limb editor. A model with no limb entry still
-        // selects (for painting); "sync" in Limbs is what gives it an entry.
         selectedPart = (limbHere && !openHere) ? m.name : null;
-        selectedSocket = null;   // picking a limb drops a socket drag
+        selectedSocket = null;
         bindGizmo();
         ed.invalidate();
         renderAllPanels();
@@ -1038,7 +1053,6 @@ function renderRigPanel() {
     nm.addEventListener('change', () => {
       const old = m.name;
       if (!ed.renameModel(i, nm.value)) { nm.value = old; return; }
-      // Keep the limb entry and any parent references pointing at it.
       const l = limbByName(old);
       if (l) { l.name = m.name; touched(); }
       for (const o of limbs()) if (o.parent === old) { o.parent = m.name; touched(); }
@@ -1071,11 +1085,128 @@ function renderRigPanel() {
           renderAllPanels();
         },
       }, '✕'));
-    list.append(row);
-    // The limb editor lives directly under its own row — this is the merge of
-    // the old Models and Limbs lists.
-    if (openHere) list.append(limbBody(limbHere));
-  });
+    return { row, openHere, limbHere };
+  }
+
+  // Group models by skeleton chain when a sidecar with limbs is present.
+  const allLimbs = limbs();
+  const limbMap = new Map();
+  for (const l of allLimbs) limbMap.set(l.name, l);
+  const modelNames = new Set(models.map(m => m.name));
+
+  const spineNames = new Set();
+  if (allLimbs.length >= 2) {
+    const isSided = name => /\.[A-Z]*[LR]$/i.test(name);
+    const childrenOf = name =>
+      allLimbs.filter(l => l.parent === name && modelNames.has(l.name));
+    const roots = allLimbs.filter(l => !l.parent || !limbMap.has(l.parent));
+    function walkSpine(name) {
+      spineNames.add(name);
+      const kids = childrenOf(name);
+      // Continue along unsided children only (sided = branch).
+      const unsided = kids.filter(k => !isSided(k.name));
+      for (const k of unsided) walkSpine(k.name);
+    }
+    for (const r of roots) walkSpine(r.name);
+  }
+
+  function descendants(rootName) {
+    const result = [rootName];
+    const queue = [rootName];
+    while (queue.length) {
+      const p = queue.shift();
+      for (const l of allLimbs) {
+        if (l.parent === p && l.name !== rootName && modelNames.has(l.name)) {
+          result.push(l.name);
+          queue.push(l.name);
+        }
+      }
+    }
+    return result;
+  }
+
+  const groups = [];
+  const placed = new Set();
+  if (spineNames.size > 0) {
+    const bodyMembers = [];
+    for (const m of models)
+      if (spineNames.has(m.name)) bodyMembers.push(m.name);
+    if (bodyMembers.length) {
+      groups.push({ label: 'body', members: bodyMembers });
+      bodyMembers.forEach(n => placed.add(n));
+    }
+    for (const sn of spineNames) {
+      const branches = allLimbs.filter(l =>
+        l.parent === sn && modelNames.has(l.name) && !spineNames.has(l.name));
+      for (const br of branches) {
+        const chain = descendants(br.name);
+        let label = br.name;
+        const dot = label.indexOf('.');
+        if (dot > 0) {
+          const side = label.slice(dot);
+          const base = label.slice(0, dot).replace(/[UL]$/, '');
+          label = base + side;
+        }
+        groups.push({ label, members: chain });
+        chain.forEach(n => placed.add(n));
+      }
+    }
+  }
+  const ungrouped = models.filter(m => !placed.has(m.name)).map(m => m.name);
+  if (ungrouped.length) {
+    if (groups.length) groups.push({ label: 'other', members: ungrouped });
+    else ungrouped.forEach(n => placed.add(n));
+  }
+
+  const modelIndex = new Map();
+  models.forEach((m, i) => modelIndex.set(m.name, i));
+
+  if (groups.length >= 2) {
+    for (const g of groups) {
+      const collapsed = collapsedGroups.has(g.label);
+      const allNames = g.members;
+      const groupHead = el('div', {
+        class: 'riggroup' + (collapsed ? ' collapsed' : ''),
+        onclick: () => {
+          if (collapsed) collapsedGroups.delete(g.label);
+          else collapsedGroups.add(g.label);
+          renderAllPanels();
+        },
+      });
+      const arrow = el('span', { class: 'rigarrow' }, collapsed ? '▸' : '▾');
+      const selectAll = el('button', {
+        class: 'icon', title: 'shift-select all in this group',
+        onclick: e => {
+          e.stopPropagation();
+          const allIn = allNames.every(n => selectedParts.has(n));
+          for (const n of allNames) {
+            if (allIn) selectedParts.delete(n);
+            else selectedParts.add(n);
+          }
+          ed.invalidate();
+          renderAllPanels();
+        },
+      }, '☰');
+      groupHead.append(arrow, el('span', { class: 'rigglabel' }, g.label), selectAll);
+      list.append(groupHead);
+      if (!collapsed) {
+        for (const name of allNames) {
+          const idx = modelIndex.get(name);
+          if (idx === undefined) continue;
+          const { row, openHere, limbHere } = buildModelRow(models[idx], idx);
+          list.append(row);
+          if (openHere) list.append(limbBody(limbHere));
+        }
+      }
+    }
+  } else {
+    // No meaningful grouping — flat list as before.
+    models.forEach((m, i) => {
+      const { row, openHere, limbHere } = buildModelRow(m, i);
+      list.append(row);
+      if (openHere) list.append(limbBody(limbHere));
+    });
+  }
 
   const anyHidden = models.some(m => ed.isModelHidden(m.name)) || ed.anySolo();
   sideEl.append(
@@ -3249,6 +3380,7 @@ export function attach(opts) {
 /** The hooks editor.js consumes. */
 export const hooks = {
   selectedPart: () => selectedPart,
+  selectedParts: () => selectedParts,
   modelTransform,
   viewPlan,
   appendOnionInstances,
@@ -3260,9 +3392,10 @@ export const hooks = {
   // position until the part was reselected.
   onModelsChanged: () => { rebuildSkeleton(); bindGizmo(); renderAllPanels(); },
   onSidecarChanged: () => {
-    selectedPart = null; selectedSocket = null; activeTag = null; frameIndex = 0;
+    selectedPart = null; selectedParts.clear(); selectedSocket = null; activeTag = null; frameIndex = 0;
     activeClip = null; selectedKey = null; poseEdit = null;
     clipCursorMs = 0; clipPlaying = false; playing = false;
+    clearTimeout(_touchTimer); ed.discardSidecarUndo();
     rebuildSkeleton();
     bindGizmo(); renderAllPanels();
   },

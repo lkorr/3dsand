@@ -94,6 +94,25 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   // take their colour straight from the render tuning, jittered per particle so
   // a burst reads as many bubbles rather than one flat white mass.
   if ((p.payload & PPAY_FOAM) != 0u) {
+    // DISTANCE LOD: foam particles are micro (1/6 voxel at scale index 3) and
+    // cover less than a pixel past ~32 cells. Rasterizing sub-pixel cubes that
+    // are invisible against the raymarched surface wastes fill rate — over open
+    // water at surface level the particle count dominates the frame. Cull them
+    // past a fixed horizon and probabilistically thin them in the transition
+    // band so the pop-off is invisible. The raymarched foam field (grid word 7)
+    // still covers the far surface — this only gates the debris particles.
+    let d2 = dot(center - R.camPos, center - R.camPos);
+    let fadeBegin = 28.0 * 28.0;   // voxels^2: full density inside
+    let fadeEnd   = 48.0 * 48.0;   // voxels^2: fully culled outside
+    if (d2 > fadeEnd) { return clipped(); }
+    if (d2 > fadeBegin) {
+      // Probabilistic thin: hash the instance to a uniform [0,1) and keep the
+      // particle with probability that ramps linearly from 1 at fadeBegin to 0
+      // at fadeEnd. Stable per instance (no flicker).
+      let rnd = f32(pcg(inst * 2917u + 0x1234u) & 0xFFFFu) * (1.0 / 65536.0);
+      let keep = 1.0 - (d2 - fadeBegin) / (fadeEnd - fadeBegin);
+      if (rnd > keep) { return clipped(); }
+    }
     let j = f32((p.payload >> 12u) & 7u) * (1.0 / 7.0);
     albedo = TUNE_FOAM_COLOR * (1.0 - TUNE_FOAM_COLOR_VAR * j);
   }

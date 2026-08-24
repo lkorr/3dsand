@@ -32,6 +32,13 @@ struct GpuContext;
 inline constexpr uint32_t kPersistMask = 0xFF00FFFFu;  // everything but the stamp byte
 
 void RleEncodeChunk(const uint32_t* words, std::vector<uint32_t>& out);
+// The RLE a SENTINEL chunk would produce, computed without materializing its
+// 4,096 words. BYTE-IDENTICAL to synthesizing with SynthWordAt then calling
+// RleEncodeChunk — a fusion of those two loops, never a second encoding. That
+// equality is what keeps the save format unchanged (§4.2), and the
+// page-roundtrip selftest asserts it directly.
+void RleEncodeSentinelChunk(uint32_t entry, IVec3 wc, uint32_t seed,
+                            std::vector<uint32_t>& out);
 // out must hold kChunkVol words; returns false on malformed input.
 // Decoded voxels get kStampNever ("hasn't acted"): everything may move.
 bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out);
@@ -66,8 +73,14 @@ class Stream {
   // Recenter toward playerChunk: at most one 1-chunk shift per axis per call,
   // 2-chunk hysteresis. Call BETWEEN ticks only — a shift must complete before
   // the next tick sees the new origin. Also folds the latest snapshot's dirty
-  // flags into the sticky per-slot modified set.
-  void Update(IVec3 playerChunk);
+  // flags into the sticky per-slot modified set, and harvests completed
+  // shift-demote batches (see PendingDemote).
+  //
+  // `tick` is the sim tick about to be encoded. The demote harvest needs it
+  // for its staleness bound — a copied chunk may only be classified while the
+  // copy is provably younger than the mirror's write→settle→tighten-out
+  // latency (see HarvestDemotes) — so it must be the REAL tick, not 0.
+  void Update(IVec3 playerChunk, uint32_t tick);
 
   // CPU-known writes (brush, explosions) mark chunks modified immediately —
   // the dirty-flag snapshot is ticks latent and eviction can't wait for it.
@@ -87,6 +100,7 @@ class Stream {
   // explicit save must survive a regen; the next save overwrites it.
   void OnRegen() {
     DrainEvictions(/*discard=*/true);
+    DiscardDemotes();
     store_.Clear();
     modified_.assign(kNumChunks, 0);
   }
@@ -113,6 +127,21 @@ class Stream {
     // at eviction time and therefore had NO copy issued (§2.1a / §4.2). 0 means
     // a real copy landed in the staging buffer for that index.
     std::vector<uint32_t> sentinel;
+  };
+
+  // One in-flight SHIFT-DEMOTE batch: voxel copies of the entering plane's
+  // demote candidates, issued right after genChunk's submit (queue order makes
+  // the copy read post-gen data) but CLASSIFIED on a later frame's harvest —
+  // the map.Wait and the JITTER word-verify were the shift frame's two largest
+  // remaining stalls, and neither is needed synchronously: with residency at
+  // ~1.2k of a 32,768-page pool, demotion is allowed to lag by frames.
+  struct PendingDemote {
+    rhi::Buffer staging;
+    rhi::MapTicket map;
+    std::vector<uint32_t> slots;   // slot indices at copy time
+    std::vector<uint64_t> keys;    // PackChunkKey(world chunk) at copy time
+    std::vector<uint8_t> copied;   // a real copy landed for this index
+    uint32_t copyTick = 0;         // sim tick the copy was issued on
   };
 
   void ShiftAxis(int axis, int dir);
@@ -159,4 +188,30 @@ class Stream {
   std::deque<PendingEvict> pending_;
   std::vector<rhi::Buffer> stagingPool_;
   std::unordered_map<uint64_t, uint32_t> pendingChunks_;  // packed wc -> count
+  // The shift-demote occupancy prefilter's staging buffer and host copy, kept
+  // alive across shifts. Both were re-created per shift by rhi::ReadbackBlocking
+  // (a fresh 128 KiB buffer + a full queue drain), and shifts land on
+  // consecutive frames under flight.
+  rhi::Buffer genOccStaging_;
+  std::vector<uint32_t> genOccScratch_;
+
+  // ---- deferred shift-demote pipeline ----
+  // Issue copies for demote candidates (batched, deferred maps, no wait).
+  void IssueDemoteCopies(const std::vector<uint32_t>& slots,
+                         const std::vector<uint64_t>& keys, uint32_t tick);
+  // Classify+demote every COMPLETED batch; never blocks. Stale batches are
+  // re-copied rather than trusted (see the staleness note at the definition).
+  void HarvestDemotes(uint32_t tick);
+  // Throw away every queued demote batch, bytes and all. MANDATORY on regen /
+  // LoadWorld: the bytes belong to the REPLACED world, and while the identity
+  // key skips most of them, an EMPTY/UNIFORM classification is seed-blind — a
+  // same-coordinate chunk of the new world could demote on the old world's
+  // bytes and lose voxels.
+  void DiscardDemotes();
+  std::deque<PendingDemote> demotes_;
+  std::vector<uint32_t> demoteScratch_;  // mapped-memory bounce, reused
+  // The last tick Update() saw: FillSlots stamps demote copies with it.
+  // ReloadWindow runs before any Update, so its copies carry a stale tick and
+  // take the harvest's re-copy path — lazily correct, never wrong.
+  uint32_t lastTick_ = 0;
 };
