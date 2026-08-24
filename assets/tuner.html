@@ -311,24 +311,49 @@
   .arch-controls .arch-legend i{
     display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:middle;margin-right:3px;
   }
+  /* The graph and its detail panel are SIBLINGS in a flex row, not an overlay
+     on top of the graph: a floating panel covered the very nodes you were
+     comparing against, which is most of what the panel is for. Under
+     1200px there is no room for both, so the panel goes back to an overlay. */
   .arch-graph-wrap{
     position:relative;border:1px solid var(--line);border-radius:10px;
-    background:var(--bg2);overflow:hidden;min-height:300px;
+    background:var(--bg2);overflow:hidden;display:flex;align-items:stretch;
+    --arch-h:clamp(420px,66vh,900px);
+  }
+  .arch-graph-wrap.arch-fullscreen{
+    position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;
+    border-radius:0;border:none;--arch-h:100vh;
   }
   .arch-graph-inner{
-    overflow:auto;padding:16px;cursor:grab;user-select:none;
+    overflow:hidden;padding:16px;cursor:grab;user-select:none;
+    flex:1 1 auto;min-width:0;height:var(--arch-h);touch-action:none;
   }
   .arch-graph-inner:active{cursor:grabbing}
-  .arch-graph-inner svg{display:block;margin:0 auto}
+  .arch-graph-inner svg{display:block;transform-origin:0 0}
   .arch-graph-inner .node rect,
   .arch-graph-inner .node polygon,
   .arch-graph-inner .node circle{cursor:pointer;transition:filter .15s}
   .arch-graph-inner .node:hover rect,
-  .arch-graph-inner .node:hover polygon{filter:brightness(1.3)}
+  .arch-graph-inner .node:hover polygon{filter:brightness(1.35)}
+  .arch-graph-inner .cluster rect{cursor:pointer}
+  .arch-graph-inner .cluster:hover>rect{filter:brightness(1.25)}
+  /* Selection ring — the node you are reading about, findable after a pan. */
+  .arch-graph-inner .arch-sel>rect,
+  .arch-graph-inner .arch-sel>polygon{
+    stroke:#ffd479!important;stroke-width:3.5px!important;
+    filter:drop-shadow(0 0 7px rgba(255,212,121,.55));
+  }
+  .arch-graph-inner .arch-hit{fill:transparent;stroke:none;cursor:pointer}
+  /* Search dimming: matches keep full opacity, everything else recedes. */
+  .arch-graph-inner.arch-filtering .node,
+  .arch-graph-inner.arch-filtering .cluster{opacity:.18;transition:opacity .12s}
+  .arch-graph-inner.arch-filtering .arch-match{opacity:1}
+
   .arch-detail{
-    position:absolute;top:12px;right:12px;width:340px;max-height:calc(100% - 24px);
-    overflow-y:auto;background:var(--card);border:1px solid var(--line2);border-radius:10px;
-    padding:16px 18px;display:none;z-index:10;box-shadow:0 8px 32px rgba(0,0,0,.5);
+    flex:0 0 var(--arch-panel-w,400px);width:var(--arch-panel-w,400px);
+    height:var(--arch-h);overflow-y:auto;background:var(--card);
+    border-left:1px solid var(--line2);padding:16px 18px 28px;
+    display:none;position:relative;z-index:10;
   }
   .arch-detail.open{display:block}
   .arch-detail-close{
@@ -336,25 +361,140 @@
     font-size:16px;cursor:pointer;padding:4px;line-height:1;
   }
   .arch-detail-close:hover{color:var(--fg)}
-  .arch-detail h3{margin:0 0 4px;font-size:15px;color:var(--fg)}
+  .arch-detail h3{margin:0 32px 4px 0;font-size:15px;color:var(--fg)}
   .arch-detail .arch-dtag{
-    font:10px/1 var(--mono);padding:2px 7px;border-radius:4px;display:inline-block;margin:0 0 10px;
+    font:10px/1 var(--mono);padding:2px 7px;border-radius:4px;display:inline-block;margin:0 6px 10px 0;
     text-transform:uppercase;letter-spacing:.06em;
   }
-  .arch-detail p{font-size:13px;color:var(--dim);margin:8px 0;line-height:1.5}
+  .arch-detail p{font-size:13px;color:var(--dim);margin:8px 0;line-height:1.55}
   .arch-detail code{font:12px/1.4 var(--mono);background:var(--bg);padding:1px 5px;border-radius:3px;color:#a9c7ff}
   .arch-detail ul{font-size:13px;color:var(--dim);padding-left:18px;margin:6px 0}
   .arch-detail li{margin:4px 0}
-  .arch-detail .arch-files{margin:10px 0 0;padding:8px 10px;background:var(--bg);border-radius:6px;font:11px/1.6 var(--mono);color:var(--faint)}
-  .arch-detail .arch-files b{color:var(--dim);font-weight:600;display:block;margin-bottom:2px}
+  .arch-detail .arch-actions{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 10px}
+  .arch-detail .arch-actions button{
+    font:11px/1 var(--mono);padding:5px 9px;background:var(--card2);
+    border:1px solid var(--line);border-radius:5px;color:var(--dim);cursor:pointer;
+  }
+  .arch-detail .arch-actions button:hover{border-color:var(--acc);color:var(--fg);background:var(--card2)}
+  /* Pointer blocks — the part an agent actually consumes. Monospace, one
+     path per line, selectable, never truncated with an ellipsis. */
+  .arch-ptr{margin:10px 0 0;padding:8px 10px;background:var(--bg);border-radius:6px;border:1px solid var(--line)}
+  .arch-ptr>b{
+    color:var(--faint);font:10px/1 var(--mono);font-weight:600;display:block;
+    margin:0 0 5px;text-transform:uppercase;letter-spacing:.07em;
+  }
+  .arch-ptr .p{
+    font:11.5px/1.65 var(--mono);color:#a9c7ff;display:block;
+    word-break:break-all;cursor:pointer;
+  }
+  .arch-ptr .p:hover{color:#d7e6ff;text-decoration:underline}
+  .arch-ptr.sym .p{color:#9fe0c0}
+  .arch-ptr.cst .p{color:#e6cb84}
+  .arch-ptr.tst .p{color:#f2a6a4}
+  .arch-ptr .note{color:var(--faint);font:11px/1.6 var(--sans);display:block;margin-top:4px}
 
-  /* mermaid dark theme overrides */
-  .arch-graph-inner .edgePath path{stroke:var(--line2)!important;stroke-width:1.5px}
-  .arch-graph-inner .edgeLabel{background:var(--bg2)!important;color:var(--dim)!important;font-size:11px!important}
-  .arch-graph-inner .cluster rect{fill:var(--card)!important;stroke:var(--line)!important;rx:8!important}
-  .arch-graph-inner .cluster .nodeLabel{color:var(--faint)!important;font-weight:600!important}
-  .arch-graph-inner .node .nodeLabel{color:var(--fg)!important;font-size:12px!important}
-  .arch-graph-inner marker path{fill:var(--line2)!important;stroke:var(--line2)!important}
+  /* View controls live in the toolbar, NOT floating over the canvas: the
+     first group box starts at the canvas origin, and a floating button there
+     sat directly on top of its title. */
+  .arch-viewctl{display:flex;gap:4px;align-items:center}
+  .arch-viewctl button{
+    height:24px;min-width:26px;padding:0 8px;border-radius:5px;
+    border:1px solid var(--line);background:var(--card2);color:var(--dim);
+    font:11px/1 var(--mono);cursor:pointer;
+  }
+  .arch-viewctl button:hover{color:var(--fg);border-color:var(--acc)}
+  @media (max-width:1200px){
+    .arch-detail{
+      position:absolute;top:12px;right:12px;width:min(400px,calc(100% - 24px));
+      flex:none;height:auto;max-height:calc(100% - 24px);
+      border:1px solid var(--line2);border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,.55);
+    }
+  }
+
+  /* The flat module index under the diagram. It is NOT a duplicate of the
+     graph for convenience — it is the only part of this page a text-only
+     reader (an AI agent scraping the DOM) can consume, so it must carry
+     every pointer the panel shows. */
+  /* Fixed layout with explicit widths. Auto layout let the prose column win
+     and pushed the pointer column — the entire reason this table exists —
+     off the right edge behind a scrollbar nobody would find. */
+  .arch-index{width:100%;border-collapse:collapse;font-size:12.5px;margin:0 0 8px;table-layout:fixed}
+  .arch-index col.c-mod{width:13%}
+  .arch-index col.c-lay{width:5%}
+  .arch-index col.c-what{width:52%}
+  .arch-index col.c-ptr{width:30%}
+  .arch-index th{
+    position:sticky;top:0;background:#1c2430;color:var(--dim);text-align:left;
+    font:11px/1 var(--mono);text-transform:uppercase;letter-spacing:.06em;
+    padding:8px 10px;border-bottom:1px solid var(--line2);z-index:2;
+  }
+  /* white-space:normal is load-bearing: the materials table sets
+     `tbody td{white-space:nowrap}` globally, which turns every description
+     here into one long line that runs straight under the pointer column. */
+  .arch-index td{padding:7px 10px;border-bottom:1px solid #222a36;vertical-align:top;
+    color:var(--dim);white-space:normal;overflow-wrap:anywhere}
+  .arch-index tr:hover td{background:#1b2230}
+  .arch-index td.n{white-space:nowrap;color:var(--fg);font-weight:600;cursor:pointer}
+  .arch-index td.n:hover{color:var(--acc)}
+  .arch-index td.paths{font:11.5px/1.6 var(--mono);color:#a9c7ff;word-break:break-all}
+  .arch-index td.tg{white-space:nowrap;font:10px/1 var(--mono);text-transform:uppercase;letter-spacing:.05em}
+  .arch-index .lvl2 td.n{padding-left:26px;font-weight:400}
+
+  /* ---- the diagram itself: HTML boxes over one SVG edge layer ----
+     Boxes are divs so they can hold real wrapped text, take real hover
+     states, and be driven frame-by-frame during the expand animation.
+     Children paint ON TOP of their parent (z-index = depth), which is what
+     makes a click land on the innermost box with no hit-testing. */
+  .arch-stage{position:absolute;top:0;left:0;transform-origin:0 0}
+  .arch-edges{position:absolute;top:0;left:0;overflow:visible;pointer-events:none;z-index:1}
+  .arch-edges .ae{fill:none;stroke:#55637d;stroke-width:1.5px;opacity:.85}
+  .arch-edges .ae.hot{stroke:#ffd479;stroke-width:2.2px}
+  .arch-edges .ael{
+    fill:#ffd479;font:10.5px var(--mono);text-anchor:middle;
+    paint-order:stroke;stroke:#0e1116;stroke-width:4px;stroke-linejoin:round;
+  }
+  .arch-box{
+    position:absolute;top:0;left:0;box-sizing:border-box;
+    border:2px solid var(--line2);border-radius:10px;background:#1b222d;
+    cursor:pointer;overflow:hidden;user-select:none;
+    display:flex;flex-direction:column;justify-content:center;
+    padding:0 11px;
+  }
+  .arch-box .bhdr{display:flex;align-items:center;gap:6px;min-width:0}
+  .arch-box .bl{
+    font:600 12.5px/1.3 var(--sans);color:var(--fg);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .arch-box .cr{font:10px/1 var(--mono);color:var(--faint);flex:none}
+  .arch-box .cnt{
+    font:9.5px/1 var(--mono);color:var(--faint);background:rgba(255,255,255,.07);
+    border-radius:8px;padding:2px 5px;flex:none;margin-left:auto;
+  }
+  .arch-box .bp{
+    font:9.5px/1.35 var(--mono);color:var(--faint);opacity:.72;margin-top:3px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  /* A group is a container, so its content sits in the header strip and the
+     body stays clear for the children that will be drawn over it. */
+  .arch-box.grp.open{justify-content:flex-start;padding-top:7px;background:rgba(20,25,34,.92)}
+  .arch-box.grp.open .bp{display:none}
+  .arch-box.grp.open .bl{font-size:12px;letter-spacing:.02em}
+  .arch-box:hover{filter:brightness(1.25)}
+  .arch-box.sel{box-shadow:0 0 0 2px #ffd479,0 0 16px rgba(255,212,121,.35)}
+  .t-gpu{border-color:#4c9aff;background:#16273d}
+  .t-cpu{border-color:#f2a65a;background:#291f14}
+  .t-xfer{border-color:#c792ea;background:#23182e}
+  .t-render{border-color:#5ed3a5;background:#132720}
+  .t-inv{border-color:#f2726f;background:#281517}
+  .t-gpu.grp.open,.t-cpu.grp.open,.t-xfer.grp.open,
+  .t-render.grp.open,.t-inv.grp.open{background:rgba(17,21,29,.88)}
+  /* Search: hits go bright, the groups CONTAINING a hit stay lit so you can
+     see which family it lives in, everything else recedes. */
+  .arch-stage.arch-filtering .arch-box{opacity:.16;transition:opacity .14s}
+  .arch-stage.arch-filtering .arch-box.arch-anc{opacity:.85;border-color:#ffd479}
+  .arch-stage.arch-filtering .arch-box.arch-match{
+    opacity:1;box-shadow:0 0 0 2px #ffd479,0 0 18px rgba(255,212,121,.45);
+  }
 
   /* ---------- engine ---------- */
   .eng-bar{
@@ -370,12 +510,16 @@
     font:12px/1 var(--mono);color:var(--fg);background:var(--bg);
     border:1px solid var(--line);border-radius:6px;padding:7px 10px;width:190px;
   }
-  .eng-wrap{max-width:1080px}
+  /* Full window width. Structural blocks (diagram, tables, log) expand to
+     fill; only running PROSE keeps a measure, and a generous one — a
+     paragraph set across 2500px is unreadable, but 70ch on a 1440p monitor
+     left two thirds of the page empty. */
+  .eng-wrap{max-width:none;width:100%}
   .eng-wrap h2{
     margin:32px 0 4px;font-size:13px;letter-spacing:.09em;
     text-transform:uppercase;color:var(--faint);font-weight:600;
   }
-  .eng-wrap .note{color:var(--dim);font-size:14px;margin:0 0 18px;max-width:70ch}
+  .eng-wrap .note{color:var(--dim);font-size:14px;margin:0 0 18px;max-width:96ch}
   .eng-stage{
     border:1px solid var(--line);border-radius:10px;background:var(--card);
     margin-bottom:10px;overflow:hidden;
@@ -405,10 +549,10 @@
   }
   .eng-cost.live{color:var(--green);border-color:rgba(124,240,58,.4)}
   .eng-body{padding:2px 18px 20px 42px;border-top:1px solid var(--line)}
-  .eng-body p{margin:14px 0;color:var(--dim);max-width:74ch}
+  .eng-body p{margin:14px 0;color:var(--dim);max-width:96ch}
   .eng-body p strong{color:var(--fg);font-weight:600}
   .eng-body h4{margin:20px 0 6px;font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint)}
-  .eng-body ul{margin:10px 0;padding-left:20px;color:var(--dim);max-width:74ch}
+  .eng-body ul{margin:10px 0;padding-left:20px;color:var(--dim);max-width:96ch}
   .eng-body li{margin:5px 0}
   .eng-body code{font:12.5px/1.4 var(--mono);background:var(--bg);padding:2px 5px;border-radius:3px;color:#a9c7ff}
   .eng-body pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:12px 14px;overflow-x:auto;font:12px/1.6 var(--mono);color:var(--dim)}
@@ -3079,7 +3223,7 @@ function tuneRow(tab,pr,g){
     const rng=isLog
       ?el('input',{type:'range',min:signed?-R:0,max:R,step:1})
       :el('input',{type:'range',min:pr.min,max:pr.max,step:pr.step??'any'});
-    const num=el('input',{class:'tnum',type:'number',step:isLog?'any':(pr.step??'any')});
+    const num=el('input',{class:'tnum',type:'number',step:pr.step??'any'});
     const write=(v,fromSlider)=>{
       let x=isLog?(fromSlider?sig3(v):v):roundStep(v,pr.step);
       if(pr.int)x=Math.round(x);
@@ -6211,117 +6355,602 @@ document.addEventListener('keydown',e=>{
 
 /* ---- Interactive architecture diagram ---- */
 
+/* ---- The architecture map ------------------------------------------------
+ *
+ * This table is the tuner's answer to "where does X live in this repo", and it
+ * has TWO readers with different needs:
+ *
+ *   a HUMAN clicks a box and wants the one-paragraph mental model;
+ *   an AI AGENT scrapes the page (or the Module index table below the graph)
+ *   and wants exact, greppable pointers — paths, symbol names, constant
+ *   names, selftest gate names.
+ *
+ * So every node carries structured pointers rather than prose that mentions a
+ * filename in passing:
+ *
+ *   files  source files, repo-relative, exactly as they exist on disk
+ *   sym    entry-point symbols to grep for inside those files
+ *   cst    named constants, as `header  kName` — NEVER a restated value.
+ *          A constant's number rots the moment someone edits world.h; the
+ *          NAME is stable and is what you grep. (This page used to say
+ *          "256^3 window / 4096 chunks" long after kWorldN became 512.)
+ *   tst    selftest gate names — `sandvox.exe --selftest --gate <name>`
+ *   doc    design docs that own the deeper explanation
+ *   rule   which of CLAUDE.md's three inviolable rules governs this node
+ *
+ * MAINTENANCE: `files` entries are checked against the repo by
+ * scripts/check_invariants.py — a path that stops existing fails the check
+ * rather than silently misdirecting the next agent.
+ */
+
+const ARCH_RULES={
+  1:'Rule 1 — bit-deterministic simulation (integer-only sim math, stateless counter RNG, write reach <=1 cell).',
+  2:'Rule 2 — cost scales with activity, not world size (indirect dispatch over the compacted dirty list; everything sleeps).',
+  3:'Rule 3 — all mutations flow through MutationQueue (which is also the save format and the replay log).',
+};
+
 const ARCH_NODES={
-  // Top-level systems
-  frameLoop:{label:'Frame Loop',tag:'cpu',desc:'Fixed 30 Hz sim tick + uncapped render. CLI dispatch, --shot/--shot-mob harnesses.',files:['src/main.cpp'],children:['simTick','renderPass','postStep']},
+  // ---------------------------------------------------------------- frame
+  frameLoop:{label:'Frame Loop',tag:'cpu',
+    desc:'Fixed 30 Hz sim tick with an uncapped render on top: the accumulator may run several ticks or none per frame. Also owns CLI parsing and the headless harnesses (--shot, --shot-mob, --selftest, --measure, --frames).',
+    files:['src/main.cpp'],
+    sym:['main()','RunShots()','RunMobShot()','RunFluidShot()','UpdateGrenade()'],
+    cst:['world.h  kTickDt'],
+    details:'<b>Ordering inside one frame:</b><ul><li>input + camera</li><li>0..N fixed ticks — each: stream, upload ops, <code>Simulation::EncodeTick</code>, submit, Jolt step, post-step</li><li>readback pump (one tick latent)</li><li>render pass at display rate</li></ul><b>Headless flags:</b> <code>--shot</code>/<code>--shot-mob</code> screenshot harnesses, <code>--frames N</code> windowed then exit, <code>--autofly</code>/<code>--autofly-hard</code> scripted traversal for residency sizing, <code>--telemetry</code> feeds this very page.',
+    children:['simTick','postStep','renderPass']},
 
-  // Simulation
-  simTick:{label:'Simulation Tick',tag:'gpu',desc:'One 30 Hz tick: mutate → explode → compact → 54× CA → particles → fluid → occupancy → readback. All dispatches are indirect over the compacted dirty list — a settled world dispatches nothing.',files:['src/sim/simulation.h','src/sim/simulation.cpp'],children:['mutQueue','explode','compact','caLoop','particleSys','fluidSys','occupancy','readback']},
-  mutQueue:{label:'MutationQueue',tag:'gpu',desc:'The ONLY write path to the voxel grid. Every brush edit, explosion, island removal, and spell enters through typed ops uploaded per tick. The op stream is simultaneously the save format, replay log, and future network replication stream.',files:['src/sim/simulation.cpp','assets/shaders/sim_mutate.wgsl'],details:'<b>Op types:</b><ul><li><b>BrushOp</b> (32B, ≤64/tick) — paint/erase</li><li><b>CellOp</b> (8B, ≤65536/tick) — exact-cell writes</li><li><b>ExplosionOp</b> — ray-cast destruction</li><li><b>ParticleSpawn</b> — CPU-authored spawns</li><li><b>FluidSpawnOp</b> — MLS-MPM spawns</li></ul>'},
-  explode:{label:'Explosions',tag:'gpu',desc:'Two-pass (mark then apply): rays cast from blast center, DDA-traversing outward spending a hardness budget. Ejecta become particles. Cost O(r²) rays, volume O(r³).',files:['assets/shaders/sim_explode.wgsl'],details:'Radius hard-capped at 20 voxels (<code>kMaxExplosionRadius</code>). ≤8 per tick.'},
-  compact:{label:'Dirty Compaction',tag:'gpu',desc:'Scans 4096 per-chunk dirty flags into a dense index list + indirect dispatch args. This is what makes the whole engine scale — subsequent passes dispatch exactly one workgroup per dirty chunk.',files:['assets/shaders/sim_compact.wgsl']},
-  caLoop:{label:'CA — 54 Passes',tag:'gpu',desc:'The core simulation. 27 color phases × 2 gravity substeps = 54 indirect dispatches. Each processes one 6³-thread workgroup per dirty chunk. The 3×3×3 cell-coloring lattice guarantees provably disjoint writes — race-free, bit-deterministic, no atomics on voxel data.',files:['assets/shaders/sim_step.wgsl'],details:'<b>Per cell:</b><ul><li>Stamp check (prevents double-move)</li><li>Reactions (pair/decay/emit, substep 0 only)</li><li>Movement (powder/liquid/gas rules)</li><li>Density displacement (lighter fluids float)</li></ul>'},
-  particleSys:{label:'Particles',tag:'gpu',desc:'GPU ballistic voxels in flight: 24.8 fixed-point, sub-voxel DDA collision, atomicMax claim-based reinsertion. Double-buffered ring, ≤262,144 capacity.',files:['assets/shaders/sim_particle.wgsl'],details:'Pipeline: spawn → integrate (ballistic) → resolve (reinsertion + stain). Deterministic conflict via atomicMax priority.'},
-  fluidSys:{label:'MLS-MPM Fluid',tag:'gpu',desc:'Material Point Method fluid solver: Q16.16 fixed-point, density EOS pressure, per-species mass channels, excite/settle seam coupling to the CA grid.',files:['assets/shaders/sim_fluid.wgsl','assets/shaders/sim_fluid_seam.wgsl'],details:'Pipeline: spawn → mark blocks → alloc grid → P2G → grid update → G2P. Excite converts CA voxels to particles; settle converts back.'},
-  occupancy:{label:'Occupancy + Pick',tag:'gpu',desc:'Per-chunk non-air counts and ray-blocker counts for render skipping. World hash accumulation (every 15th tick). GPU picking ray for crosshair material query.',files:['assets/shaders/sim_occupancy.wgsl','assets/shaders/sim_pick.wgsl']},
-  readback:{label:'Async Readback',tag:'xfer',desc:'3-slot ring buffer, one tick latent. The CPU\'s only window into GPU state. 3×3×3 chunk mirror for player collision, dirty flags, hash, particle counts, support flags, on-demand fetches for island detection.',files:['src/sim/world.h'],details:'<b>Per-tick payload:</b><ul><li>27-chunk mirror (432 KB) → player collision</li><li>On-demand fetches (≤64 chunks) → islands, terrain meshing</li><li>Dirty flags (4 KB) → mesh invalidation</li><li>Hash + counts (<64 B) → determinism, HUD</li></ul>'},
+  postStep:{label:'Post-step',tag:'cpu',
+    desc:'The CPU work that must happen AFTER Jolt has stepped: island detection and body bookkeeping, mob steering + animation, avatar pose, and player push-out against freshly moved bodies.',
+    files:['src/main.cpp','src/phys/debris.cpp','src/game/mob.cpp','src/game/avatar.cpp'],
+    sym:['DebrisSystem::PostStep','MobSystem::PostStep','PlayerAvatar::PostStep','Player::ApplyPush'],
+    rule:3,
+    details:'Everything here that wants to change the world emits ops for the NEXT tick — nothing writes voxel memory directly (rule 3).'},
 
-  // World storage
-  worldStorage:{label:'World Storage',tag:'gpu',desc:'A 512³ toroidal residency window of 32³ = 32,768 chunk slots, each 16³ voxels. The buffer never shifts — moving the window recycles trailing slot planes in-place via bitmask wrapping.',files:['src/sim/world.h','src/sim/world.cpp'],children:['pageTable','voxelBuf','streaming','chunkStore','farField']},
-  pageTable:{label:'Page Table',tag:'gpu',desc:'Software page table: 32,768 u32 entries mapping chunk slots to physical pages or sentinels. Derived data — not hashed, not saved. Three sentinel types (EMPTY, UNIFORM, JITTER) compress buried bulk: measured 4,975 pages resident (77.7 MiB) vs 512 MiB dense.',files:['src/sim/pagetable.h','src/sim/pagetable.cpp'],details:'<b>Entry encoding:</b><ul><li>bit 31=0: RESIDENT → bits 0..30 = page index</li><li>PT_EMPTY = 0x80000000 (air)</li><li>UNIFORM(mat) = 0x80000000 | mat</li><li>JITTER(mat) = sentinel + worldgen variant</li></ul><b>Materialization:</b> CPU pre-allocates pages before dispatch based on cpuDirty. Pool exhaustion = fatal abort.'},
-  voxelBuf:{label:'Voxel Buffer',tag:'gpu',desc:'Physical page pool: PoolPages × 4096 u32 words. Indexed ONLY through the page table. 32-bit voxel word: material (12b) + state (4b) + stamp (3b) + free (5b) + stain (7b).',files:['src/sim/world.h','assets/shaders/common.wgsl'],details:'Access ONLY through <code>voxWordAt</code>/<code>voxStore</code> (WGSL) or <code>World::PageOffsetOfSlot</code> (C++). Any other subscript reads another chunk\'s memory.'},
-  streaming:{label:'Toroidal Streaming',tag:'xfer',desc:'Recenters the residency window one chunk per axis per tick with 2-chunk hysteresis. Evicts leaving planes asynchronously (RLE into ChunkStore), fills entering planes from store or procgen.',files:['src/sim/stream.h','src/sim/stream.cpp']},
-  chunkStore:{label:'ChunkStore',tag:'cpu',desc:'Region-file chunk persistence. World saved as a directory of region files (r_x_y_z.svr) with RLE-compressed chunks. Format SVM4 with material name validation.',files:['src/sim/chunkstore.h','src/sim/worldio.h']},
-  farField:{label:'Far-Field Cascades',tag:'render',desc:'8 nested toroidal 256³ volumes, 128 MiB total, ~4 km horizon. Render-only LOD — never read by sim, never hashed. Fills drain through worldgen at kFarListCap=4096 level-chunks/tick.',files:['src/sim/farfield.h','src/sim/farfield.cpp']},
+  // ------------------------------------------------------------ simulation
+  simTick:{label:'Simulation Tick',tag:'gpu',
+    desc:'One 30 Hz tick of GPU work, recorded by walking a declarative table rather than by hand-written encode calls. Every heavy pass is an indirect dispatch over the compacted dirty-chunk list, so a settled world dispatches nothing — and since v3.4 it does not even RECORD the rows.',
+    files:['src/sim/simulation.h','src/sim/simulation.cpp','src/sim/pass_table.def'],
+    sym:['Simulation::EncodeTick','Simulation::RecordTable','Simulation::NoteTickInputs'],
+    cst:['world.h  kFluidSubsteps','pass_table.h  Table::Tick'],
+    tst:['determinism','sleep'],
+    rule:2,
+    details:'<b>Recorded order (pass_table.def, PT_TICK rows):</b><ol><li>clears — dirtyOut, argsStage, claim, expMask, hash</li><li><code>mutate</code> + <code>mutateCells</code> — MutationQueue</li><li><code>explodeMark</code> / <code>explodeApply</code></li><li><code>particleSpawn</code></li><li><code>compact</code> -> dispatchArgs</li><li><code>ca</code> x54 (indirect)</li><li>particle args / integrate / resolve (indirect)</li><li><code>occupancyFull</code>+<code>pick</code> on hash ticks, else <code>compactNext</code>+<code>occupancyDirty</code></li><li><code>farDown</code></li></ol>Then, only while fluid is live: the seam table, <code>kFluidSubsteps</code> x the fluid table, the settle table.<br><br><b>The settled skip:</b> 54 indirect dispatches with (0,1,1) args cost 141.7 us/tick for provably zero work. <code>NoteTickInputs</code> maintains a CONSERVATIVE CPU mirror of "could anything dirty a chunk" — a wrong "active" costs 141 us, a wrong "idle" loses world state, so every uncertain case resolves to active.',
+    children:['mutQueue','explode','compact','caLoop','particleSys','fluidSys','occupancy','readback']},
 
-  // Materials & data
-  dataPipeline:{label:'Data Pipeline',tag:'cpu',desc:'All game content is data (JSON + tags), not code. Materials, reactions, tuning, prefabs, mobs, items, glyphs — all hot-reloadable. Compiled at load into flat GPU tables.',files:['src/sim/materials.h','src/sim/materials.cpp'],children:['materials','reactions','tuning','prefabs','mobDefs','itemDefs','glyphs']},
-  materials:{label:'Materials',tag:'cpu',desc:'4,096-slot material table. Each defines: class (solid/powder/liquid/gas), density, 3 color variants, emission, flags, reaction bucket, viscosity, opacity, hardness, stain behavior, sounds.',files:['assets/materials/materials.json','src/sim/materials.h'],details:'Resolved by name, not ID — IDs are file-local. Tags compose behaviors (e.g. "flammable", "organic"). MATF_MICRO flags trigger sub-voxel model substitution.'},
-  reactions:{label:'Reactions',tag:'cpu',desc:'Pair, decay, and emission rules with per-mille chances, tag matching, daylight conditions, neighbor-count scaling, weather gating. Growth must be subcritical (offspring/tick < 1).',files:['assets/materials/reactions.json']},
-  tuning:{label:'Tuning',tag:'cpu',desc:'168+ runtime-tunable parameters. F5 hot-reloads WGSL shader constants. Covers: player, camera, avatar, audio, physics, debris, gore, sim, dayNight, render, weather, MLS-MPM.',files:['assets/materials/tuning.json','src/sim/tuning.h','src/sim/tuning.cpp'],details:'Pipeline: row in <code>tuning_params.def</code> → decl in <code>tuning.h</code> → <code>Read*</code> in <code>LoadTuning</code> → default in <code>tuning.json</code> → row in <code>tuner_schema.js</code>.'},
-  prefabs:{label:'Prefabs',tag:'cpu',desc:'.vox files placed into the world as CellOps. Art palette is per-file (indices are NOT portable between files).',files:['assets/prefabs/','src/sim/voxload.h']},
-  mobDefs:{label:'Mob Definitions',tag:'cpu',desc:'Per-creature .vox art + .json sidecar defining: limbs (joints, HP, springs, edge), sockets, AnimSkeleton, skinScale/physScale, locomotion states.',files:['assets/mobs/']},
-  itemDefs:{label:'Items',tag:'cpu',desc:'Standalone .vox + .json assets. Grip transform, edge segment (melee), damage profile. Placed via EquipItem on the avatar rig.',files:['assets/items/']},
-  glyphs:{label:'Glyphs',tag:'cpu',desc:'Spell composition: Element (material), Form (Spray/Projectile), Modifier (Trail, TransmuteTo). Hot-reloads with R.',files:['assets/spells/glyphs.json']},
+  mutQueue:{label:'MutationQueue',tag:'gpu',
+    desc:'The ONLY write path to the voxel grid. Brush edits, spells, explosions, prefab stamping, debris settle-back and worldgen fills all become typed ops uploaded once per tick. The op stream is simultaneously the save format, the replay log and the future network stream.',
+    files:['src/sim/world.h','src/sim/simulation.cpp','assets/shaders/sim_mutate.wgsl'],
+    sym:['Simulation::EncodeTick','pass mutate','pass mutateCells'],
+    cst:['world.h  kMaxOpsPerTick','world.h  kMaxCellOpsPerTick','world.h  kMaxParticleSpawnsPerTick','world.h  kMaxFluidSpawnsPerTick','world.h  kCellOpIfAir'],
+    rule:3,
+    details:'<b>Op types:</b><ul><li><b>BrushOp</b> — paint/erase a shape, <code>kMaxOpsPerTick</code> per tick</li><li><b>CellOp</b> — exact-cell write, <code>kMaxCellOpsPerTick</code> per tick; bit 31 (<code>kCellOpIfAir</code>) makes it conditional and is never stored</li><li><b>ExplosionOp</b> — ray-cast destruction, <code>kMaxExplosionsPerTick</code></li><li><b>ParticleSpawn</b> / <b>FluidSpawnOp</b> — CPU-authored spawns</li></ul><b>Only sanctioned exceptions:</b> snapshot restores (worldgen fills, <code>LoadWorld</code>). Budgets are charged BEFORE emission and the op is refused if it does not fit — never truncated after the fact.'},
 
-  // Rendering
-  renderPass:{label:'Rendering',tag:'render',desc:'Raymarched — no meshing. The voxel grid is DDA-stepped directly, using occupancy flags for empty-space skipping. Sim buffers are already GPU-resident so rendering costs zero upload.',files:['src/sim/simulation.cpp'],children:['raymarch','drawParticles','drawBodies','drawMicro','drawFluid','drawSprites','drawDebug','sky']},
-  raymarch:{label:'Raymarch',tag:'render',desc:'Full-screen voxel terrain. Primary DDA through chunks + sun shadow ray. Water/liquid surface shading (Fresnel, traced reflections, Beer-Lambert absorption, caustics). Media accumulation (fire, smoke). Far-field cascade continuation. Micro-detail substitution.',files:['assets/shaders/raymarch.wgsl'],details:'<b>Measured (RTX 3060 Ti, 1080p):</b><ul><li>Shadows on: 2.66 ms (376 fps)</li><li>Shadows off: 1.41 ms (709 fps)</li></ul>Cost scales with screen pixels × traversal depth, not activity. No LOD.'},
-  drawParticles:{label:'Draw Particles',tag:'render',desc:'Instanced lit cubes for ballistic particles. Indirect draw from GPU particle count. Distance LOD (p50 13.6→10.6ms after LOD).',files:['assets/shaders/debris.wgsl']},
-  drawBodies:{label:'Draw Bodies',tag:'render',desc:'Instanced boxes for non-micro debris/body voxels, transformed by body quaternion.',files:['assets/shaders/debris.wgsl']},
-  drawMicro:{label:'Draw Micro Bodies',tag:'render',desc:'OBB rasterizer for high-res microvoxel mob limbs. Per-fragment DDA march inside the brick. CullMode::Front.',files:['assets/shaders/microbody.wgsl']},
-  drawFluid:{label:'Draw Fluid',tag:'render',desc:'MLS-MPM water surface: trilinear isosurface march with traced reflections and refractions, Beer-Lambert absorption, Fresnel.',files:['assets/shaders/raymarch.wgsl']},
-  drawSprites:{label:'Draw Sprites',tag:'render',desc:'CPU-authored markers and projectiles, ≤64.',files:['assets/shaders/debris.wgsl']},
-  drawDebug:{label:'Debug Boxes',tag:'render',desc:'Oriented wireframe boxes for collision-box overlay. Alpha blend, no depth test.',files:['assets/shaders/debug_lines.wgsl']},
-  sky:{label:'Sky & Celestial',tag:'render',desc:'Rayleigh + Mie scattering model with Kasten-Young air mass. Night sky: stars, galactic band, nebulae, aurora, moon phases/maria. Keplerian orbits for sun + two moons. Eclipses.',files:['src/sim/celestial.h','src/sim/celestial.cpp','assets/shaders/raymarch.wgsl']},
+  explode:{label:'Explosions',tag:'gpu',
+    desc:'Two-phase mark-then-apply. Rays cast from the blast centre DDA outward spending a hardness budget; the mark pass writes a mask, the apply pass consumes it. Two phases because a single pass would need a read neighbourhood wider than the one-cell write reach rule 1 allows.',
+    files:['assets/shaders/sim_explode.wgsl'],
+    sym:['explodeMark','explodeApply'],
+    cst:['world.h  kMaxExplosionRadius','world.h  kMaxExplosionsPerTick','world.h  kExplosionWg'],
+    rule:1,
+    details:'Cost is O(r^2) rays over an O(r^3) volume, which is why the radius is hard-capped rather than tuned. Ejecta become ballistic particles; bodies in range take direct damage through <code>DebrisSystem</code>.'},
 
-  // Game layer
-  gameSystems:{label:'Game Systems',tag:'cpu',desc:'Player, avatar, mobs, brush, spells, melee — all CPU-side. World writes go ONLY through MutationQueue. Physics through Jolt.',files:['src/game/'],children:['player','avatar','mobSys','brush','spellSys','melee','itemSys','camera','thirdPerson']},
-  player:{label:'Player',tag:'cpu',desc:'AABB character controller against 1-tick-latent voxel mirror. Walk/fly/swim, gravity, jump (coyote + buffer), step-up, submersion fraction, water-edge mantle, ledge grab (catch/dangle/shimmy/pull-up).',files:['src/game/player.h','src/game/player.cpp']},
-  avatar:{label:'Player Avatar',tag:'cpu',desc:'The player\'s visible, dismemberable body. A mob def ("wizard") driven by Player input instead of wander AI. Full animation runtime: clips, IK, gait, springs, dismemberment states, held-weapon pose, head-look IK.',files:['src/game/avatar.h','src/game/avatar.cpp']},
-  mobSys:{label:'Mob System',tag:'cpu',desc:'Up to 16 articulated multi-body mobs. Each has kinematic Jolt bodies per limb (flip to dynamic ragdoll on death). 4-stage locomotion: Sense → Intent (AI seam) → Steer → Drive.',files:['src/game/mob.h','src/game/mob.cpp'],details:'<ul><li>Animation: clips, IK, procedural gait, springs</li><li>Dismemberment: per-voxel carving, severing, bleeding, gore profiles</li><li>Locomotion states: stand, walk, crawl, prone (from sidecar)</li></ul>'},
-  brush:{label:'Brush',tag:'cpu',desc:'Converts GPU pick result + UI state into BrushOps (paint/erase). Emits through MutationQueue.',files:['src/game/brush.h','src/game/brush.cpp']},
-  spellSys:{label:'Spell System',tag:'cpu',desc:'Caster VM: ONLY output is op-stream emissions. Integer 24.8 fixed-point. Glyph types: Element, Form (Spray/Projectile), Modifier (Trail, TransmuteTo). Player-agnostic — mobs can cast too.',files:['src/game/spell.h','src/game/spell.cpp','src/game/caster.h']},
-  melee:{label:'Melee',tag:'cpu',desc:'Mouse-directed melee: Guard → Wind → Slash → Recover. The pose IS the hitbox — damage sweeps the blade\'s edge segment from last-tick to this-tick. Speed is damage.',files:['src/game/melee.h','src/game/melee.cpp']},
-  itemSys:{label:'Items',tag:'cpu',desc:'Standalone .vox + .json assets held via borrowed rig slot. Sword grip/edge/damage authored in the tuner.',files:['src/game/item.h']},
-  camera:{label:'Camera',tag:'cpu',desc:'FPS orientation (yaw, pitch, fovY). Provides Forward/Right/Up/FlatForward basis vectors.',files:['src/game/camera.h','src/game/camera.cpp']},
-  thirdPerson:{label:'Third-Person Rig',tag:'cpu',desc:'Orbit boom with voxel collision pull-in, asymmetric smoothing, pitch-driven lift, dismemberment framing. Modes: First, Third, OverShoulder.',files:['src/game/thirdperson.h','src/game/thirdperson.cpp']},
+  compact:{label:'Dirty Compaction',tag:'gpu',
+    desc:'Scans the per-chunk dirty flags into a dense index list plus indirect dispatch args. This one pass is what makes rule 2 true for everything downstream — the CA, occupancy and far-field passes each dispatch exactly one workgroup per dirty chunk and nothing for the rest of the world.',
+    files:['assets/shaders/sim_compact.wgsl','src/sim/pass_table.def'],
+    sym:['compact','compactNext'],
+    cst:['world.h  kNumChunks'],
+    tst:['sleep'],
+    rule:2,
+    details:'<code>compact</code> runs before the CA over this tick’s dirty-in flags; <code>compactNext</code> runs after it over the dirty-OUT flags the CA just wrote, so occupancy only revisits chunks that actually changed.'},
 
-  // Physics
-  physicsSys:{label:'Physics (Jolt)',tag:'cpu',desc:'Thin Jolt wrapper. Positions in voxel units. Debris bodies, player capsule, mob kinematic limbs, terrain collision meshes, radial impulse for explosions. Built with CROSS_PLATFORM_DETERMINISTIC.',files:['src/phys/physics.h','src/phys/physics.cpp'],children:['debrisSys','terrainMesh','bodyReg']},
-  debrisSys:{label:'Debris System',tag:'cpu',desc:'Full island lifecycle: destruction event → async readback → bounded flood fill → islands become rigidbodies (≤200). Sub-8 islands crumble. Bodies collide against localized marching-cubes terrain. Body burn, direct damage (explosions + laser), settle-back to CellOps.',files:['src/phys/debris.h','src/phys/debris.cpp']},
-  terrainMesh:{label:'Terrain Collision',tag:'cpu',desc:'Per-chunk marching-cubes static collision meshes, invalidated from dirty-flag snapshot.',files:['src/phys/marching_cubes.h','src/phys/marching_cubes.cpp']},
-  bodyReg:{label:'Body Registry',tag:'cpu',desc:'THE single definition of the debris | mob | avatar GPU slot walk. Builds all three parallel arrays (xforms, cube instances, micro-body draw) in one walk.',files:['src/game/bodyreg.h']},
+  caLoop:{label:'CA — 54 Passes',tag:'gpu',
+    desc:'The core simulation. 27 colour phases x 2 gravity substeps = 54 indirect dispatches, each one 6^3-thread workgroup per dirty chunk. The 3x3x3 cell-colouring lattice makes writes provably disjoint: race-free and bit-deterministic with no atomics on voxel data and no subgroup ops.',
+    files:['assets/shaders/sim_step.wgsl','assets/shaders/common.wgsl'],
+    sym:['pass ca (repeat 54)','voxWordAt','voxStore','hash3'],
+    cst:['world.h  kStampShift','world.h  kStampNever'],
+    tst:['determinism','sleep','evaporation'],
+    doc:['DESIGN.md'],
+    rule:1,
+    details:'<b>Per cell, in order:</b><ul><li>stamp check — the 3-bit tick stamp gates the substep and prevents a voxel moving twice in one tick</li><li>reactions — pair / decay / emit, substep 0 only</li><li>movement — powder, liquid and gas rules</li><li>density displacement — lighter fluids float</li></ul><b>The lattice is GLOBAL</b> (world coords, not chunk-local): chunk dispatch offsets by world chunk coord, or the colouring seams at chunk boundaries.<br><br><b>Reads are bounded too.</b> The lattice bounds WRITES to one cell; a multi-cell READ probe inside a sim kernel still breaks determinism. Use mark/apply if you need a wider neighbourhood.'},
 
-  // Audio
-  audioSys:{label:'Audio',tag:'cpu',desc:'Vendored binaural spatializer (xyzpan). Mono assets, meters + Z-up internally. Voxel-ray occlusion (broadband gain + low-pass from material traversal). Gait-driven footsteps.',files:['src/audio/'],children:['audioCues','audioDevice','audioOcclusion','audioSpatial']},
-  audioCues:{label:'Sound Cues',tag:'cpu',desc:'Game-facing API. Material → sound resolved once at load. Events: Footstep, Land, Impact, Break, MobSound (hurt/death/sever/idle/alert/attack), ambient loops.',files:['src/audio/cues.h','src/audio/cues.cpp']},
-  audioDevice:{label:'Device + Voices',tag:'cpu',desc:'miniaudio device wrapper. Voice pool with fire-and-forget + looping modes. Sound library management.',files:['src/audio/device.h','src/audio/voice.h','src/audio/library.h']},
-  audioOcclusion:{label:'Voxel Occlusion',tag:'cpu',desc:'Ray-traced through the voxel mirror. Per-material opacity accumulation → broadband duck + low-pass cutoff frequency.',files:['src/audio/occlusion.h','src/audio/occlusion.cpp']},
-  audioSpatial:{label:'3D Spatial (xyzpan)',tag:'cpu',desc:'Custom binaural DSP: distance pipeline, early reflections, FDN reverb, floor pipeline, chest pipeline, binaural pipeline, swarm mode.',files:['src/audio/xyzpan/']},
+  particleSys:{label:'Particles',tag:'gpu',
+    desc:'Ballistic voxels in flight, entirely GPU-side: 24.8 fixed-point position, sub-voxel DDA collision against the grid, and atomicMax claim-based reinsertion so two particles landing in one cell resolve by priority rather than by scheduling order.',
+    files:['assets/shaders/sim_particle.wgsl'],
+    sym:['particleSpawn','particleArgs1','particleIntegrate','particleArgs2','particleResolve'],
+    cst:['world.h  kParticleCap','world.h  kClaimSize','world.h  kPFlagAlive','world.h  kPFlagMicro'],
+    tst:['flung-liquid','blood-stain'],
+    rule:1,
+    details:'Double-buffered ring (integrate reads page A, writes page B) so no particle is read after it moves. The claim buffer is indexed by SLOT, not page — it is an identity, not an address.'},
 
-  // GPU backend
-  gpuBackend:{label:'GPU / RHI',tag:'gpu',desc:'WGPU-shaped hardware abstraction (rhi.h). Vulkan-only since 2026-08-22. Dawn checkout stays for Tint (WGSL → SPIR-V). ~10 handle types: Buffer, Texture, ShaderModule, Pipeline, BindGroup, Queue, etc.',files:['src/gpu/'],children:['rhiSeam','vkBackend','passTable','shaderPipeline','context']},
-  rhiSeam:{label:'RHI Seam',tag:'gpu',desc:'The ONLY GPU API the engine sees. Thin namespace with Buffer/Texture/Pipeline/Queue/etc handles. All rendering and compute goes through this.',files:['src/gpu/rhi.h']},
-  vkBackend:{label:'Vulkan Backend',tag:'gpu',desc:'Instance/device creation, swapchain, function loader, VMA memory allocator, SPIR-V compilation via Tint, --vk-smoke pinned-hash cross-validation.',files:['src/gpu/rhi_vk.cpp','src/gpu/rhi_vulkan.cpp','src/gpu/vk_loader.cpp','src/gpu/vk_spirv.cpp']},
-  passTable:{label:'Pass Table',tag:'gpu',desc:'Declarative recording: every dispatch is a row in pass_table.def declaring pipeline + buffer accesses (read/write/atomic). The Vulkan barrier tracker generates vkCmdPipelineBarrier2 from last-access chains.',files:['src/sim/pass_table.h','src/sim/pass_table.def','src/gpu/vk_record.cpp']},
-  shaderPipeline:{label:'Shader Pipeline',tag:'gpu',desc:'All shaders are WGSL. LoadShader() prepends: generated world constants (from world.h) → tuning WGSL block → common.wgsl → specific shader. F5 hot-reload recompiles to SPIR-V via Tint.',files:['src/gpu/resources.cpp','assets/shaders/common.wgsl']},
-  context:{label:'GPU Context',tag:'gpu',desc:'Owns GPU instance/adapter/device/queue and window surface. Pipeline cache (SPIR-V disk cache + VkPipelineCache) eliminates 20-30s white screen on cold start.',files:['src/gpu/context.h','src/gpu/context.cpp']},
+  fluidSys:{label:'MLS-MPM Fluid',tag:'gpu',
+    desc:'Material Point Method water solver in Q16.16 fixed point, with a density equation-of-state pressure term, per-species mass channels, and an excite/settle seam that converts CA voxels into MPM particles and back.',
+    files:['assets/shaders/sim_fluid.wgsl','assets/shaders/sim_fluid_seam.wgsl','src/sim/pass_table.def'],
+    cst:['world.h  kFluidCap','world.h  kFluidBlocks','world.h  kFluidSubsteps','world.h  kFluidSettleMax','world.h  kFluidParticleWords'],
+    tst:['fluid-det','fluid-settle','fluid-excite','fluid-stain','fluid-react'],
+    doc:['docs/PLAN_mpm_fluids.md'],
+    rule:1,
+    details:'<b>Pipeline:</b> spawn -> mark blocks -> alloc grid -> P2G -> grid update -> G2P, repeated <code>kFluidSubsteps</code> times inside one tick.<br><br><b>The one float exception:</b> the <code>sim.fluid*</code> tuning rows are authored in human units (vox/s^2, vox^2/s, seconds) and converted to Q16.16-per-tick integers by WGSL const-eval at the top of <code>sim_fluid.wgsl</code>. That is IEEE-exact at compile time, so the kernel itself stays integer and rule 1 holds.<br><br><code>fluidExciteMode</code> defaults OFF — turning it on changes the world hash.'},
 
-  // Testing
-  testHarness:{label:'Selftest Harness',tag:'inv',desc:'Named gates with declared dependencies. --gate NAME runs one in ~5s; full suite ~50s. Two-pass determinism verification (run twice, compare hashes). Pinned hash: 7cfa2420.',files:['src/test/'],children:['testSim','testRender','testPhys','testMob','testPlayer','testSpell','testWorldIO']},
-  testSim:{label:'Sim Tests',tag:'inv',desc:'Determinism (2-run hash compare), settled chunk count (≤32), stain invariants, page-table roundtrip, particle reinsertion.',files:['src/test/selftest_sim.cpp']},
-  testRender:{label:'Render Tests',tag:'inv',desc:'Pinned-hash visual regression at specific camera positions.',files:['src/test/selftest_render.cpp']},
-  testPhys:{label:'Physics Tests',tag:'inv',desc:'Island detection, debris lifecycle, body damage, settle-back.',files:['src/test/selftest_phys.cpp']},
-  testMob:{label:'Mob Tests',tag:'inv',desc:'Gait speed, dismemberment states, animation pipeline, locomotion.',files:['src/test/selftest_mob.cpp']},
-  testPlayer:{label:'Player Tests',tag:'inv',desc:'Movement, collision, ledge grab, water mantle.',files:['src/test/selftest_player.cpp']},
-  testSpell:{label:'Spell Tests',tag:'inv',desc:'Glyph composition, spell VM execution.',files:['src/test/selftest_spell.cpp']},
-  testWorldIO:{label:'World I/O Tests',tag:'inv',desc:'Save/load round-trip, format validation.',files:['src/test/selftest_worldio.cpp']},
+  occupancy:{label:'Occupancy, Hash + Pick',tag:'gpu',
+    desc:'Per-chunk non-air counts and ray-blocker counts that let the raymarcher skip empty space, the world-hash accumulation that rule 1 is verified against, and the single crosshair picking ray.',
+    files:['assets/shaders/sim_occupancy.wgsl','assets/shaders/sim_pick.wgsl'],
+    sym:['occupancyFull','occupancyDirty','pick_hash','pick_dirty'],
+    tst:['determinism'],
+    rule:1,
+    details:'Two variants by design: <code>occupancyFull</code> sweeps the whole window on a hash tick, <code>occupancyDirty</code> is an indirect dispatch over <code>compactNext</code>’s output on every other tick. The hash EXCLUDES the tick stamp and voxel bits 19..23, and those bits are stripped on save — hashed state must round-trip.'},
 
-  // Post-step
-  postStep:{label:'Post-step',tag:'cpu',desc:'CPU work after Jolt physics: debris post-step (island detection, body management), mob post-step (steering, animation), avatar post-step, collision push-out.',files:['src/main.cpp']},
+  readback:{label:'Async Readback',tag:'xfer',
+    desc:'A 3-slot ring, one tick latent, and the CPU’s only window into GPU state. If every slot is still in flight the copies are skipped for that tick rather than stalling — there is never a synchronous readback in the frame path.',
+    files:['src/sim/world.h','src/sim/world.cpp'],
+    sym:['World::EncodeReadbacks','World::Snap','World::KindAt','World::MirrorBaseFor','World::FluidEighthsAt'],
+    cst:['world.h  kSlots','world.h  WorldSnapshot'],
+    rule:3,
+    details:'<b>Per-tick payload:</b><ul><li>3x3x3 chunk voxel mirror -> player + mob collision</li><li>fluid-occupancy fold for the same 27 chunks</li><li>dirty flags -> terrain mesh invalidation</li><li>hash, particle counts, support flags -> determinism + HUD</li><li>on-demand chunk fetches -> island detection, collision meshing</li></ul><b>The mirror is TINY.</b> <code>KindAt</code> returns <code>Unknown</code> past ~48 voxels. Projectiles and mob ground probes must treat Unknown as PASSABLE (an invisible wall otherwise); the player treats it as solid. Keep total traffic under ~1 MB/tick.'},
 
-  // UI
-  uiOverlay:{label:'UI Overlay',tag:'cpu',desc:'ImGui debug panel + player-facing HUD: health bar, mana bar, body figure, spell readout, crosshair material, hotbar, ledge-grab state, FPS counter.',files:['src/ui/overlay.h','src/ui/overlay.cpp']},
+  // ------------------------------------------------------------- storage
+  worldStorage:{label:'World Storage',tag:'gpu',
+    desc:'A toroidal residency window of kNChunk^3 chunk slots into an unbounded world. The buffer never shifts: moving the window recycles the trailing plane of slots in place, because world chunk c lives in slot (c mod kNChunk) per axis — a bitmask, correct for negative coordinates too.',
+    files:['src/sim/world.h','src/sim/world.cpp'],
+    sym:['World::SetWindowOrigin','World::WindowOrigin','World::ChunkInWindow','World::PageOffsetOfSlot'],
+    cst:['world.h  kWorldN','world.h  kChunk','world.h  kNChunk','world.h  kNumChunks','world.h  kVoxelMeters'],
+    doc:['DESIGN.md','docs/ROADMAP_scale.md'],
+    details:'<b>World coords for logic, slot index for memory.</b> Neighbour access bounds-checks against the residency window (<code>inWindow</code>), never against a fixed 0..N.<br><br>Do not read the numbers off this page — grep the constants. <code>kWorldN</code> has already changed once (256 -> 512) and every derived figure written down in prose went stale with it.',
+    children:['pageTable','voxelBuf','streaming','chunkStore','farField']},
 
-  // Worldgen
-  worldgen:{label:'Worldgen',tag:'gpu',desc:'Pure function of world coordinates + seed. Infinite hills, two cave bands, lava on deep cavern floors, sparse ruin POIs. Runs on GPU via worldgen.wgsl.',files:['assets/shaders/worldgen.wgsl']},
+  pageTable:{label:'Page Table',tag:'gpu',
+    desc:'A software page table: one u32 per chunk slot holding either a physical page index or a sentinel. DERIVED DATA — not hashed, not saved, rebuilt on every load, stream-in and worldgen. Two different page assignments of the same logical world are the same world.',
+    files:['src/sim/pagetable.h','src/sim/pagetable.cpp'],
+    sym:['PageTable::DrainFills','PageTable::UpdateFluidChunks','SlotSet','voxWordAt','voxWordIndex','voxStore','World::PageOffsetOfSlot'],
+    cst:['world.h  kPoolPages','world.h  kPtSentinelBit','world.h  kPtEmpty','world.h  kPtJitterBit','world.h  kPtMatMask','world.h  kPtPageMask','world.h  kPtUnresident'],
+    tst:['page-roundtrip'],
+    doc:['docs/PLAN_page_table.md'],
+    details:'<b>Entry encoding:</b><ul><li>bit 31 = 0 — RESIDENT, bits 0..30 are the page index</li><li><code>kPtEmpty</code> — all air</li><li>UNIFORM(mat) — sentinel bit + material id</li><li>JITTER(mat) — plus <code>kPtJitterBit</code>: one material with worldgen’s positional palette variant, which is what actually compresses buried bulk (a stone chunk’s per-cell <code>% 3</code> variant makes it non-uniform)</li></ul><b>The hard rule:</b> address voxels ONLY through <code>voxWordAt</code>/<code>voxWordIndex</code>/<code>voxStore</code> (WGSL) or <code>World::PageOffsetOfSlot</code> (C++). Any other subscript reads another chunk’s memory.<br><br><b>An index used as IDENTITY</b> (hash key, RNG key, claim slot) is the SLOT index. Only a memory address is the PAGE index.<br><br>A GPU kernel cannot allocate, so the CPU pre-allocates every page the tick could write, from the conservative <code>cpuDirty</code> mirror. Pool exhaustion is a fatal abort, never a silent drop. Paged is the DEFAULT; <code>--residency dense</code> is the identity map and the only live differential oracle.'},
+
+  voxelBuf:{label:'Voxel Buffer',tag:'gpu',
+    desc:'The physical page pool: kPoolPages x kChunkVol u32 words, reachable only through the page table. One 32-bit word per voxel, and growing it is off the table — extra state goes in a sparse auxiliary layer keyed by chunk.',
+    files:['src/sim/world.h','assets/shaders/common.wgsl'],
+    sym:['voxMat','voxWordAt','voxStore'],
+    cst:['world.h  kChunkVol','world.h  kPoolPages','world.h  kStampShift','world.h  kStainAmtShift','world.h  kStainTypeShift','world.h  kFreeBits'],
+    rule:1,
+    details:'<b>Word layout — must agree in three places</b> (<code>common.wgsl</code> <code>voxMat</code>, <code>src/sim/world.h</code>, and the table in CLAUDE.md):<ul><li>0..11 material id (4096 slots)</li><li>12..15 state nibble — liquid fullness 1..8, else palette jitter</li><li>16..18 tick stamp, cycles 1..7, <code>kStampNever</code>=0 for every new voxel</li><li>19..23 FREE — scratch only, unless you widen the hash mask and <code>kPersistMask</code> together</li><li>24..27 stain amount 0..15</li><li>28..30 stain type — 0 clean, 1..7 palette slots</li><li>31 <code>kCellOpIfAir</code>, a transient CPU-&gt;GPU flag, never stored</li></ul>'},
+
+  streaming:{label:'Toroidal Streaming',tag:'xfer',
+    desc:'Recenters the residency window on the player, at most one chunk per axis per tick with 2-chunk hysteresis. Leaving planes are evicted asynchronously (RLE into the ChunkStore); entering planes are filled from the store, or generated on the GPU when the store misses.',
+    files:['src/sim/stream.h','src/sim/stream.cpp'],
+    sym:['Stream::Update','Stream::ShiftAxis','Stream::EvictSlots','Stream::FillSlots','Stream::DrainEvictions','Stream::HarvestDemotes'],
+    tst:['streaming','region-store'],
+    details:'Streaming cost is invisible standing still and dominates in flight — measure it with <code>--autofly</code> / <code>--autofly-hard</code>, never with a standing player. Blocking per-slot readbacks here once made a single window shift cost 105 ms; the fix was batching plus deferred free-probes.'},
+
+  chunkStore:{label:'ChunkStore',tag:'cpu',
+    desc:'Where evicted chunks go. Chunks are grouped into 16^3-chunk REGIONS; unbound it is pure RAM, bound to a directory it becomes a region-file store with lazy loads, Flush() writes, and LRU spill so a long journey streams to disk instead of growing without bound.',
+    files:['src/sim/chunkstore.h','src/sim/chunkstore.cpp','src/sim/worldio.h','src/sim/worldio.cpp','src/sim/bytestream.h'],
+    sym:['ChunkStore::Get','ChunkStore::Put','ChunkStore::Flush','SaveWorld','LoadWorld'],
+    cst:['chunkstore.h  kMaxRamRegions'],
+    tst:['save-load','save-entities','region-store'],
+    details:'A world is a directory of region files (<code>r_x_y_z.svr</code>) with RLE-compressed chunks, plus an entities sidecar. The RLE run word is 32-bit (<code>SVR2</code>) — the 16-bit v1 format silently dropped the stain bits, and hashed state must round-trip or a save/load changes the world hash.'},
+
+  farField:{label:'Far-Field Cascades',tag:'render',
+    desc:'kFarLevels nested toroidal kFarN^3 volumes around the residency window, each level’s cells twice as coarse and its box twice as wide. Render-only LOD: never read by the sim, never hashed, filled from worldgen on the GPU.',
+    files:['src/sim/farfield.h','src/sim/farfield.cpp','assets/shaders/worldgen.wgsl'],
+    sym:['FarField::Update','Simulation::EncodeFarFill','farDown'],
+    cst:['world.h  kFarN','world.h  kFarLevels','world.h  kFarShiftBase','world.h  kFarListCap','world.h  kFarSlotShift'],
+    tst:['far-fog','far-downsample'],
+    doc:['docs/PLAN_far_field_cascades.md'],
+    details:'<b>kFarN is the ONLY knob that changes far-field detail.</b> A level’s cell size and box extent are rigidly coupled, so px-per-cell = H / (kFarN * tan(fov/2)) — the distance cancels. Changing <code>kFarShiftBase</code> or <code>kFarLevels</code> renumbers the cascade and trades horizon against near coverage, but CANNOT make any distance look sharper (measured: 26 pixels of 2,073,600 differed).<br><br>Related trap: a shadow loop capped in CELLS ties its reach to cell size. The far-shadow 128-step cap was a latent 45x cliff.'},
+
+  worldgen:{label:'Worldgen',tag:'gpu',
+    desc:'A pure function of world coordinate + seed, evaluated on the GPU. Infinite hills, two cave bands, lava on deep cavern floors, sparse ruin POIs, and the positional palette variant that the JITTER page sentinel encodes.',
+    files:['assets/shaders/worldgen.wgsl','src/sim/simulation.cpp'],
+    sym:['Simulation::EncodeWorldgen','Simulation::EncodeGenList','Simulation::EncodePageFill'],
+    rule:1,
+    details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.'},
+
+  // ---------------------------------------------------------------- data
+  dataPipeline:{label:'Data Pipeline',tag:'cpu',
+    desc:'All game content is data — JSON plus tags — resolved by NAME at load and compiled into flat GPU tables. No closed-ended systems: behaviour is authored content, not a runtime-typed voxel field, and there is one authoring surface per kind.',
+    files:['src/sim/materials.h','src/sim/materials.cpp','assets/materials/'],
+    sym:['LoadAssets','BuildCollisionClasses','Simulation::UploadTables'],
+    doc:['DESIGN.md','docs/refs/perfect_voxel_engine.md'],
+    details:'<b>Hot reload:</b> R reloads materials, reactions, glyphs, mob defs and items; F5 reloads tuning and recompiles every WGSL shader. Kill a running <code>sandvox.exe</code> before editing <code>tuning.json</code> by hand — the app rewrites it on exit and a green selftest can end up having tested the old file.',
+    children:['materials','reactions','tuning','prefabs','mobDefs','itemDefs','glyphs','microDetail']},
+
+  materials:{label:'Materials',tag:'cpu',
+    desc:'A kMaterialSlots-entry table. Each material declares class (solid/powder/liquid/gas), density, three colour variants, emission, flags, reaction bucket, viscosity, opacity, hardness, stain behaviour and sounds.',
+    files:['assets/materials/materials.json','src/sim/materials.h','src/sim/materials.cpp'],
+    cst:['world.h  kMaterialSlots','world.h  kStainPaletteBase','world.h  kArtPaletteBaseGpu','world.h  kArtPaletteSlotsGpu'],
+    details:'<b>Resolved by name, never by id</b> — ids are file-local, and the top of the table is reserved: the last 8 slots are the stain palette and the 128 below those are the .vox ART palette. Tags compose behaviour (<code>flammable</code>, <code>organic</code>); shaders must not hardcode material ids.'},
+
+  reactions:{label:'Reactions',tag:'cpu',
+    desc:'Pair, decay and emission rules with per-mille chances, tag matching, daylight conditions, neighbour-count scaling and weather gating.',
+    files:['assets/materials/reactions.json','src/sim/materials.cpp','assets/shaders/sim_step.wgsl'],
+    tst:['evaporation','daylight-boundary','fluid-react'],
+    rule:2,
+    details:'<b>Growth must be subcritical</b> — expected offspring per tick &lt; 1, or the world never settles.<br><br><b>Light-gated rules must NOT keep their chunk awake.</b> A lit pond that holds itself awake all night never sleeps; instead the engine wakes the whole world when the day phase crosses a gate boundary (<code>Simulation::EncodeWakeAll</code>, driven from the tick-derived day phase only — never from frame timing).<br><br>Neighbour-count scaling is decay-only: a pair rule’s neighbour field already selects its partner.'},
+
+  tuning:{label:'Tuning',tag:'cpu',
+    desc:'Runtime-tunable parameters covering player, camera, avatar, audio, physics, debris, gore, sim, day/night, render, weather and MLS-MPM. F5 reloads the JSON and recompiles the WGSL constant block with it.',
+    files:['assets/materials/tuning.json','src/sim/tuning.h','src/sim/tuning.cpp','src/sim/tuning_params.def','assets/tuner_schema.js','scripts/gen_tuning_prelude.py'],
+    sym:['LoadTuning','CurrentTuning','SetCurrentTuning','TuningWgslBlock'],
+    rule:1,
+    details:'<b>Adding a knob touches five places, in order:</b><ol><li>a row in <code>src/sim/tuning_params.def</code> (NO trailing comments — the generator’s parser chokes)</li><li>a declaration in <code>src/sim/tuning.h</code></li><li>a <code>Read*</code> call in <code>LoadTuning</code></li><li>a default in <code>assets/materials/tuning.json</code></li><li>a row in <code>assets/tuner_schema.js</code></li></ol><b><code>sim.*</code> values are integer-only</b> (rule 1) — except the <code>sim.fluid*</code> rows, see MLS-MPM Fluid.<br><br>Per-instance variance is authored with <code>&lt;key&gt;Var</code> siblings, and never on <code>sim.*</code> or material rules.'},
+
+  prefabs:{label:'Prefabs',tag:'cpu',
+    desc:'.vox models stamped into the world as bounded batches of exact-cell ops, appended a few per tick with the remainder deferred — the same shape as DebrisSystem::PreTick.',
+    files:['assets/prefabs/','src/sim/voxload.h','src/sim/voxload.cpp','src/game/prefab.h','src/game/prefab.cpp'],
+    sym:['LoadVox','PrefabPlacer::PreTick'],
+    tst:['prefab'],
+    rule:3,
+    details:'Pending voxels are kept in WORLD coords and converted to slot indices only at drain time, because the residency window can shift mid-placement.<br><br><b>Art palette indices are FILE-LOCAL</b> — copying voxels between .vox files silently recolours them.'},
+
+  mobDefs:{label:'Mob Definitions',tag:'cpu',
+    desc:'Per-creature .vox art plus a .json sidecar: limbs (joints, HP, springs, edge segments), sockets, the AnimSkeleton, skinScale/physScale, and locomotion state rules.',
+    files:['assets/mobs/','src/game/mob.h','src/sim/voxload.h'],
+    sym:['MobDef','MobLimbDef','MobSocketDef','MobSystem::SetDefs'],
+    details:'Authored in the tuner’s Models tab. Sidecar keys are missing/missingAny plus a version "v"; locomotion "states" rules pick a clip ladder (stand / walk / crawl / prone) from which limbs survive. Regenerating a critter from a script clobbers editor-owned art.'},
+
+  itemDefs:{label:'Items',tag:'cpu',
+    desc:'Standalone .vox plus .json assets: grip transform, edge segment for melee, damage profile. Held through a borrowed rig socket on the avatar.',
+    files:['assets/items/','src/game/item.h'],
+    sym:['ItemDef','EquipItem'],
+    details:'<code>items.json</code> is BEHAVIOUR the engine switches on (kind, damage, reach, carveBonus); the per-asset sidecar is art and grip. The scene-to-engine rotation mapping is applied on read so art and hitbox rotate together.'},
+
+  glyphs:{label:'Glyphs',tag:'cpu',
+    desc:'Spell composition vocabulary: Element (a material by name), Form (Spray / Projectile) and Modifier (Trail, TransmuteTo). Hot-reloads with R.',
+    files:['assets/spells/glyphs.json','src/game/spell.h','src/game/spell.cpp'],
+    sym:['GlyphDef','GlyphLibrary','LoadGlyphs','SpellBudgets'],
+    tst:['spells'],
+    details:'A glyph names its material and the name resolves to a 12-bit id at load; an unresolvable name makes the engine REFUSE the file rather than silently pick air. Authored numbers are clamped against the engine’s own ceilings in <code>LoadGlyphs</code> — content cannot author an over-budget spell.'},
+
+  microDetail:{label:'Micro Detail',tag:'cpu',
+    desc:'Sub-voxel geometry with zero storage and zero sim cost. A material may declare a "micro" block; the world cell stays an ordinary voxel of that material and only the RAYMARCHER substitutes a finer subdiv^3 model when a primary ray lands on it.',
+    files:['src/sim/microvox.h','src/sim/microvox.cpp','assets/microvox/','scripts/gen_microvox.py'],
+    sym:['MicroSet','Simulation::UploadMicro'],
+    cst:['world.h  kMicroPoolWordsWorld','materials.h  MATF_MICRO','materials.h  MICROF_STRANDS'],
+    details:'The CA is untouched, the world hash is untouched, occupancy still counts the cell — the textbook case of derived data (guideline 2: prefer derived over stored). Tall grass uses <code>MICROF_STRANDS</code>: analytic per-strand blades with a ray-shear sway whose bend is clamped inside the cell.'},
+
+  // ------------------------------------------------------------- rendering
+  renderPass:{label:'Rendering',tag:'render',
+    desc:'Raymarched, with no meshing anywhere: the voxel grid is DDA-stepped directly using the occupancy counts for empty-space skipping. The sim buffers are already GPU-resident, so rendering costs zero upload.',
+    files:['src/sim/simulation.cpp','assets/shaders/raymarch.wgsl'],
+    sym:['Simulation::BeginRenderPass','Simulation::DrawWorld','Simulation::EnsureRenderPipelines'],
+    tst:['screenshots','far-fog'],
+    details:'Everything below composites through one shared reversed-Z depth attachment. Cost scales with screen pixels x traversal depth, NOT with world activity — the opposite of rule 2’s shape, which is why rendering is measured separately.',
+    children:['raymarch','sky','drawParticles','drawBodies','drawMicro','drawFluid','drawSprites','drawDebug']},
+
+  raymarch:{label:'Raymarch',tag:'render',
+    desc:'The full-screen terrain pass: primary DDA through chunks plus a sun shadow ray, liquid surface shading, media accumulation for fire and smoke, far-field cascade continuation, and micro-detail substitution.',
+    files:['assets/shaders/raymarch.wgsl','assets/shaders/common.wgsl'],
+    cst:['world.h  RenderParams'],
+    tst:['screenshots'],
+    details:'<b>RENDER_PATHS in <code>assets/tuner.html</code> must match the shader predicates in <code>common.wgsl</code></b> — they are two lists that have to agree.<br><br>Two traps live here. Routing NEAR shadows through the far cascade is ~48x SLOWER, because a fine ray terminates on its first blocker while a cascade ray must cross the whole reach. And per-channel Reinhard desaturates warm emissives to gold — tonemap luminance, not channels.'},
+
+  sky:{label:'Sky & Celestial',tag:'render',
+    desc:'A real orbital simulation, not a phase ramp: the planet orbits a star on a Keplerian ellipse, spins on a tilted axis and carries two moons on their own inclined ellipses. Seasons, lunar phase, the moon beat and eclipses are consequences of that geometry.',
+    files:['src/sim/celestial.h','src/sim/celestial.cpp','assets/shaders/raymarch.wgsl'],
+    sym:['ComputeSky','CelestialClock'],
+    cst:['world.h  kDayPhaseBits','world.h  kDaySunrise','world.h  kDayNoon','world.h  kDaySunset'],
+    tst:['daylight-boundary'],
+    details:'<code>ComputeSky</code> is a PURE FUNCTION of the tick, recomputed from epoch every call — no integrator, no accumulated drift, and the tuner’s time slider can scrub it freely. Rayleigh + Mie scattering with Kasten-Young air mass by day; stars, galactic band, nebulae, aurora and moon maria by night.<br><br>Two unit traps: the sidereal rate is solar MINUS orbital (a wrong sign overshoots the year by two turns and still looks fine day to day), and moon radii are in degrees, not radians. Fog and reflections must sample the SMOOTH sky tier or stars render through terrain.'},
+
+  drawParticles:{label:'Draw Particles',tag:'render',
+    desc:'Instanced lit cubes for ballistic particles, drawn indirectly from the GPU-owned particle count with distance LOD.',
+    files:['assets/shaders/debris.wgsl','src/sim/simulation.cpp'],
+    sym:['Simulation::DrawParticles'],
+    cst:['world.h  kParticleCap']},
+
+  drawBodies:{label:'Draw Bodies',tag:'render',
+    desc:'Instanced boxes for non-micro debris and body voxels, transformed by the body quaternion. Instances come from the one BodyRegistry walk.',
+    files:['assets/shaders/debris.wgsl','src/game/bodyreg.h','src/game/bodyreg.cpp'],
+    sym:['Simulation::DrawBodies','BodyRegistry'],
+    cst:['world.h  kMaxBodySlots']},
+
+  drawMicro:{label:'Draw Micro Bodies',tag:'render',
+    desc:'An OBB rasterizer for high-resolution microvoxel mob limbs — a per-fragment DDA march inside the brick, with front-face culling so the box is entered from outside.',
+    files:['assets/shaders/microbody.wgsl','src/sim/microbody.h','src/sim/microbody.cpp'],
+    sym:['Simulation::DrawMicroBodies','Simulation::UploadMicroBodies','MicroBodySet'],
+    cst:['world.h  kMicroBodyPoolWordsWorld','world.h  kMaxMicroBodyModels'],
+    details:'<b>Skin and collider resolutions are decoupled.</b> A mob def’s <code>skinScale</code> is the art pitch; <code>physScale</code> is a separate, coarser physics pitch derived from it by majority fill. The skin is authoritative, the collider is derived. Micro bodies are destructible by copy-on-write.'},
+
+  drawFluid:{label:'Draw Fluid',tag:'render',
+    desc:'The MLS-MPM water surface: a trilinear isosurface march with traced reflections and refractions, Beer-Lambert absorption and Fresnel.',
+    files:['assets/shaders/raymarch.wgsl','src/sim/simulation.cpp'],
+    sym:['Simulation::DrawFluid'],
+    tst:['fluid-settle']},
+
+  drawSprites:{label:'Draw Sprites',tag:'render',
+    desc:'CPU-authored markers and projectiles.',
+    files:['assets/shaders/debris.wgsl'],
+    sym:['Simulation::DrawSprites'],
+    cst:['world.h  kMaxSprites']},
+
+  drawDebug:{label:'Debug Boxes',tag:'render',
+    desc:'Oriented wireframe boxes for the collision-box overlay — alpha blended, no depth test, so a hitbox inside geometry is still visible.',
+    files:['assets/shaders/debug_lines.wgsl'],
+    sym:['Simulation::DrawDebugBoxes'],
+    cst:['world.h  kMaxDebugBoxes']},
+
+  // ------------------------------------------------------------ game layer
+  gameSystems:{label:'Game Systems',tag:'cpu',
+    desc:'Player, avatar, mobs, brush, spells, melee, camera — all CPU-side, all reading the one-tick-latent voxel mirror and writing the world only through MutationQueue ops. Rigid-body contact goes through Jolt.',
+    files:['src/game/'],
+    rule:3,
+    children:['player','avatar','mobSys','animRuntime','brush','spellSys','melee','itemSys','camera','thirdPerson','persistSys']},
+
+  player:{label:'Player',tag:'cpu',
+    desc:'An AABB character controller swept against the voxel mirror: walk, fly and swim, gravity, jump with coyote time and input buffering, step-up, submersion fraction, water-edge mantle and the ledge-grab ladder.',
+    files:['src/game/player.h','src/game/player.cpp'],
+    sym:['Player::Update','Player::ApplyPush','PlayerInput','Player::KindFn'],
+    tst:['player-walk','player-waterjump','player-ledgegrab','player-plants'],
+    details:'<b>Liquid state is a FRACTION, not a bool.</b> All-or-nothing drag made climbing out of water impossible at any impulse. And a swimmer’s feet dangle ~9 voxels under the surface, so a ledge test relative to the AABB refuses every real pool edge — the water-edge test uses the WATERLINE frame instead.<br><br>Unknown mirror cells are SOLID for the player (never fall through unloaded world) and PASSABLE for projectiles and mob probes.'},
+
+  avatar:{label:'Player Avatar',tag:'cpu',
+    desc:'The player’s visible, dismemberable body: a MobDef driven by player input instead of wander AI, with the full animation runtime — clips, IK, gait, springs, dismemberment states, held-weapon pose and head-look.',
+    files:['src/game/avatar.h','src/game/avatar.cpp'],
+    sym:['PlayerAvatar::Spawn','PlayerAvatar::PreTick','PlayerAvatar::PostStep','AvatarLocomotion','AvatarParts'],
+    tst:['player-body'],
+    details:'<b>Height comes from the player constants</b> — assert it in the generator, never restate it in a comment.<br><br>Two traps that cost real time: a mob gait infers body height from its own feet, and under a player driver that loop runs away (~9.5 vox/tick) — use the AABB sole as truth. And avatar limbs inside the player capsule shove the capsule via <code>PlayerPushOut</code>, so they need their own collision layer to split contacts from ray visibility.'},
+
+  mobSys:{label:'Mob System',tag:'cpu',
+    desc:'Articulated multi-body creatures, each limb a kinematic Jolt body that flips to a dynamic ragdoll on death. Locomotion is a four-stage split: Sense -> DecideIntent -> Steer -> Drive.',
+    files:['src/game/mob.h','src/game/mob.cpp'],
+    sym:['MobSystem::PreTick','MobSystem::PostStep','MobSystem::SetDefs','MobSystem::SenseGround','MobSystem::DecideIntent','MobSystem::Steer'],
+    cst:['world.h  kMaxBodySlots'],
+    details:'<b><code>DecideIntent</code> is the AI seam and <code>Steer</code> is the only writer of heading</b> — a new behaviour goes in DecideIntent and nowhere else.<br><br>Dismemberment carves per-voxel, severs limbs, bleeds and picks a gore profile; the surviving-limb set selects a locomotion state from the sidecar rules. Ground probes reach past the CPU mirror, and blocked-on-Unknown is an invisible wall — probe reach is per-axis.'},
+
+  animRuntime:{label:'Animation Runtime',tag:'cpu',
+    desc:'Layered skeletal animation shared by mobs and the avatar: clips, additive layers, IK, springs and procedural gait. A hard determinism boundary — everything here is CPU-float PRESENTATION state.',
+    files:['src/game/anim.h','src/game/anim.cpp','assets/editor/anim.js'],
+    sym:['AnimSkeleton','PlayClip','Pose'],
+    rule:1,
+    details:'Poses, IK, springs and gait phases are never hashed and never touch the grid. The only grid contact is the ordinary BrushOp/CellOp path in <code>mob.cpp</code> (blood, settle-back).<br><br><code>assets/editor/anim.js</code> is a PORT of <code>anim.cpp</code> for the browser editor — the two must stay in sync.<br><br>Trap collection: a Quat accumulator must start at ZERO, not identity (a default-constructed Quat is identity, which halved every clip in the game while weights still read correct); an additive clip deltas against REST, not frame 0 (referencing frame 0 makes a cyclic swing one-sided — the "zombie arms"); and if body travel per swing exceeds foot reach the stride budget is negative and feet ratchet backward forever, which no tuning fixes.'},
+
+  brush:{label:'Brush',tag:'cpu',
+    desc:'Turns the GPU pick result plus UI state into paint/erase ops. It has no other output.',
+    files:['src/game/brush.h','src/game/brush.cpp'],
+    sym:['Brush::BuildOp'],
+    cst:['world.h  kMaxOpsPerTick'],
+    rule:3},
+
+  spellSys:{label:'Spell System',tag:'cpu',
+    desc:'A caster VM whose ONLY output is op-stream emissions. Integer 24.8 fixed point, position-parameterized backfire, and player-agnostic — a mob can cast with the same code.',
+    files:['src/game/spell.h','src/game/spell.cpp','src/game/caster.h'],
+    sym:['Spell','GlyphLibrary','SpellBudgets','SpellReadout','BackfireKind','WardDef'],
+    tst:['spells'],
+    rule:3,
+    details:'Read the four theses at the top of <code>src/game/spell.h</code> before changing anything here. Note the fixed point is 24.8, NOT the sim’s integer discipline — spells are game layer, not CA.<br><br>Budgets are charged before emission; an over-budget spell is refused, never truncated mid-effect.'},
+
+  melee:{label:'Melee',tag:'cpu',
+    desc:'Mouse-directed swinging: Guard -> Wind -> Slash -> Recover. The pose IS the hitbox — damage sweeps the blade’s edge segment from last tick’s position to this tick’s, so speed is damage.',
+    files:['src/game/melee.h','src/game/melee.cpp'],
+    sym:['MeleeState::Update','SwingPhase','EdgeSweep','MeleeTuning']},
+
+  itemSys:{label:'Held Items',tag:'cpu',
+    desc:'The runtime side of items: a borrowed rig socket, grip transform, and the edge segment melee sweeps.',
+    files:['src/game/item.h','src/game/rigrender.h'],
+    sym:['ItemDef','EquipItem']},
+
+  camera:{label:'Camera',tag:'cpu',
+    desc:'FPS orientation (yaw, pitch, fovY) and the Forward / Right / Up / FlatForward basis every other system steers by.',
+    files:['src/game/camera.h','src/game/camera.cpp'],
+    sym:['Camera::ApplyMouse','Camera::Forward','Camera::FlatForward'],
+    details:'Rotations are Y-up, quaternions are (x,y,z,w), Euler order is X-&gt;Y-&gt;Z and heading 0 is +Z. <code>.vox</code> files are Z-up. Use <code>scripts/geometry.py</code> rather than deriving a conversion by hand.'},
+
+  thirdPerson:{label:'Third-Person Rig',tag:'cpu',
+    desc:'An orbit boom with voxel collision pull-in, asymmetric smoothing, pitch-driven lift and dismemberment framing.',
+    files:['src/game/thirdperson.h','src/game/thirdperson.cpp'],
+    sym:['ThirdPersonRig::Update','CameraMode']},
+
+  persistSys:{label:'Entity Persistence',tag:'cpu',
+    desc:'The ONE place entity systems register into the save format. Both the frame loop and the selftest build their EntityIO here, so a system persistable in one is persistable in both.',
+    files:['src/game/persist.h','src/game/persist.cpp','src/sim/worldio.h'],
+    sym:['MakeEntityIO','EntityIO','SaveState','LoadState'],
+    tst:['save-entities'],
+    details:'A system NOT registered here is structurally unable to persist — which is the audit finding this file closes. Extension path: give the system SaveState/LoadState and add it to <code>MakeEntityIO</code>.'},
+
+  // -------------------------------------------------------------- physics
+  physicsSys:{label:'Physics (Jolt)',tag:'cpu',
+    desc:'A thin Jolt wrapper with positions in VOXEL units. Debris bodies, the player capsule, mob kinematic limbs, terrain collision meshes and radial impulses. Built with CROSS_PLATFORM_DETERMINISTIC.',
+    files:['src/phys/physics.h','src/phys/physics.cpp','src/phys/lattice.h'],
+    sym:['Physics::Step','Physics::CreateDebrisBody','Physics::CreatePlayerBody','Physics::CreateTerrainMesh','Physics::RemoveBody','Physics::ApplyRadialImpulse'],
+    cst:['world.h  kVoxelMeters','world.h  kMaxBodySlots'],
+    details:'Jolt must be built with <code>USE_STATIC_MSVC_RUNTIME_LIBRARY=OFF</code> or you get 139 /MT-vs-/MD link errors.<br><br>All body teardown goes through <code>ReleaseBody</code> — nothing frees a Jolt body directly.',
+    children:['debrisSys','terrainMesh','bodyReg']},
+
+  debrisSys:{label:'Debris System',tag:'cpu',
+    desc:'The full island lifecycle: a destruction event schedules an async chunk fetch, a bounded flood fill finds disconnected islands, large islands become rigid bodies and small ones crumble to particles. Bodies burn, take direct damage, and settle back into the grid as ops.',
+    files:['src/phys/debris.h','src/phys/debris.cpp'],
+    sym:['DebrisSystem::PreTick','DebrisSystem::PostStep','DebrisSystem::DamageBodiesRadial','DebrisSystem::SettleBodies','DebrisSystem::ReleaseBody'],
+    cst:['world.h  kMaxBodySlots'],
+    tst:['debris','settle-back'],
+    rule:3,
+    details:'<b>Carving a LIVE limb has pose traps:</b> never re-read a kinematic limb’s transform mid-carve, a re-skin must shift <code>restOffset</code>/<code>anchorLimb</code>, and a hollowed limb’s centroid ends up inside the cavity.'},
+
+  terrainMesh:{label:'Terrain Collision',tag:'cpu',
+    desc:'Per-chunk marching-cubes static collision meshes, rebuilt only for chunks the dirty-flag snapshot says changed.',
+    files:['src/phys/marching_cubes.h','src/phys/marching_cubes.cpp','src/phys/mc_tables.h'],
+    sym:['PolygonizeChunk','McOccSet','McOccGet'],
+    rule:2},
+
+  bodyReg:{label:'Body Registry',tag:'cpu',
+    desc:'THE single definition of the debris | mob-limb | avatar GPU slot space. Debris takes slots [0,D), mob limbs stack after, avatar parts after those — and all three parallel arrays are built in ONE walk.',
+    files:['src/game/bodyreg.h','src/game/bodyreg.cpp'],
+    sym:['BodyRegistry'],
+    cst:['world.h  kMaxBodySlots'],
+    details:'One walk builds the transforms, the cube instances and the micro-body draw list, so the three can never disagree about which slot is whose — the alternative was three walks that had to stay in sync.'},
+
+  // ---------------------------------------------------------------- audio
+  audioSys:{label:'Audio',tag:'cpu',
+    desc:'A vendored binaural spatializer with voxel-ray occlusion. Assets are MONO; meters and Z-up internally. Headless runs are silent by construction.',
+    files:['src/audio/'],
+    children:['audioCues','audioDevice','audioOcclusion','audioSpatial']},
+
+  audioCues:{label:'Sound Cues',tag:'cpu',
+    desc:'The public, game-facing API — the only audio header the rest of the engine includes. Material-to-sound is resolved once at load, not per event.',
+    files:['src/audio/cues.h','src/audio/cues.cpp','src/audio/world.h','src/audio/world.cpp','assets/sound_schema.js'],
+    sym:['Cues::Footstep','Cues::Land','Cues::Impact','Cues::Break','Cues::MobSound','Cues::MobBleed','Cues::SetNightAmbience','Cues::kSlotPrefix'],
+    details:'<b>Sound slots are defined in TWO places that must agree:</b> <code>assets/sound_schema.js</code> (the only list) and <code>Cues::kSlotPrefix</code> in <code>src/audio/cues.cpp</code>.<br><br>Footsteps ride the GAIT PLANT, not a distance accumulator — events are queued because <code>PreTick</code> runs several times per frame. A sound SET is a folder of interchangeable takes and the engine picks one; <code>.trash/</code> is ignored, so moving a take there stops it immediately.'},
+
+  audioDevice:{label:'Device + Voices',tag:'cpu',
+    desc:'The miniaudio device wrapper, a voice pool with fire-and-forget and looping modes, and the sound library that owns decoded assets.',
+    files:['src/audio/device.h','src/audio/device.cpp','src/audio/voice.h','src/audio/voice.cpp','src/audio/library.h','src/audio/library.cpp'],
+    sym:['audio::Device','audio::Voice','audio::Library','audio::SoundSet']},
+
+  audioOcclusion:{label:'Voxel Occlusion',tag:'cpu',
+    desc:'A ray traced through the voxel mirror, accumulating per-material opacity into a broadband duck plus a low-pass cutoff.',
+    files:['src/audio/occlusion.h','src/audio/occlusion.cpp'],
+    sym:['ComputeOcclusion'],
+    details:'<b>The low-pass is load-bearing</b> — gain alone does not read as "through a wall". Unknown chunks must read as AIR, or every sound outside the mirror is muffled.'},
+
+  audioSpatial:{label:'3D Spatial (xyzpan)',tag:'cpu',
+    desc:'Vendored binaural DSP: distance pipeline, early reflections, FDN reverb, floor pipeline, chest pipeline, binaural pipeline and swarm mode.',
+    files:['src/audio/xyzpan/','src/audio/xyzpan/Engine.h','src/audio/xyzpan/src/Engine.cpp'],
+    sym:['xyzpan::Engine','BinauralPipeline','FDNReverb','SwarmMode'],
+    details:'Vendored from the audio_webgame project — treat it as a dependency, not as engine code to refactor.'},
+
+  // ----------------------------------------------------------- gpu backend
+  gpuBackend:{label:'GPU / RHI',tag:'gpu',
+    desc:'A WGPU-shaped hardware abstraction. Vulkan-only since 2026-08-22; the Dawn checkout survives solely for Tint, which compiles WGSL to SPIR-V at load and on F5.',
+    files:['src/gpu/'],
+    doc:['docs/PLAN_vulkan_port.md','docs/vulkan_barrier_graph.md','docs/vulkan_pass_map.md'],
+    children:['rhiSeam','vkBackend','passTable','shaderPipeline','context'],
+    details:'<code>--backend dawn</code> refuses with exit 2. <code>DAWN_ENABLE_*</code> must all stay OFF (turning one on re-declares ~156 translation units of Dawn engine); <code>TINT_BUILD_SPV_WRITER</code>/<code>SPV_READER</code> are forced ON independently.'},
+
+  rhiSeam:{label:'RHI Seam',tag:'gpu',
+    desc:'The ONLY GPU API the rest of the engine sees — about ten handle types (Buffer, Texture, ShaderModule, Pipeline, BindGroup, Queue, CommandEncoder, RenderPass...). Every draw and dispatch goes through it.',
+    files:['src/gpu/rhi.h','src/gpu/rhi.cpp','src/gpu/rhi_impl.h','src/gpu/rhi_record.h'],
+    sym:['rhi::Device','rhi::Buffer','rhi::Queue','rhi::CommandEncoder','rhi::ComputePipeline'],
+    details:'<b>Deferred WriteBuffer ordering trap:</b> uploads drain at the head of the NEXT command buffer. Upload BEFORE <code>CreateCommandEncoder</code>, and never gate a dispatch on a tick-UBO count you have not written yet.'},
+
+  vkBackend:{label:'Vulkan Backend',tag:'gpu',
+    desc:'Instance and device creation, swapchain, function loader, VMA allocator, SPIR-V compilation through Tint, and the --vk-smoke pinned-hash cross-validation harness.',
+    files:['src/gpu/rhi_vk.cpp','src/gpu/rhi_vk.h','src/gpu/rhi_vulkan.cpp','src/gpu/rhi_vulkan.h','src/gpu/vk_loader.cpp','src/gpu/vk_spirv.cpp','src/gpu/vk_vma.cpp','src/gpu/vk_smoke.cpp','src/gpu/vk_info.cpp'],
+    sym:['vk::LoadGlobal','vk::LoadInstance','vk::LoadDevice','spirv::Compile','vk_smoke.cpp'],
+    details:'<code>synchronization2</code> and <code>dynamicRendering</code> must be explicitly ENABLED even on Vulkan 1.3.<br><br><code>--vk-smoke-loud --vk-validation</code> runs 19 pinned hash probes with sync validation, and <b>a validation message FAILS the run</b>. Escalate to it only when <code>--gate determinism</code> has already said the world changed and you need to know WHERE.'},
+
+  passTable:{label:'Pass Table',tag:'gpu',
+    desc:'Every GPU command the sim records is a ROW declaring its pipeline, dispatch shape and buffer accesses. The Vulkan barrier tracker generates every vkCmdPipelineBarrier2 from those declared last-access chains — barriers are never hand-written at a call site.',
+    files:['src/sim/pass_table.def','src/sim/pass_table.h','src/sim/pass_table.cpp','src/gpu/vk_record.cpp','src/gpu/vk_record.h','scripts/check_pass_table.py'],
+    sym:['PASS()','pass::Table','pass::Buf','pass::Acc','Simulation::RecordTable'],
+    doc:['docs/vulkan_barrier_graph.md'],
+    rule:1,
+    details:'<b>An omitted READ means NO barrier for that hazard</b> — not a crash, but a race whose outcome depends on how one vendor schedules workgroups, i.e. a world hash that matches here and diverges on the next GPU.<br><br>Two mechanisms keep the table faithful: the recorder ITERATES it (the table cannot drift from the recording because it IS the recording), and <code>scripts/check_pass_table.py</code> diffs each row’s declared R/W set against the bindings its WGSL entry point actually touches. A tick-path edit that changes a kernel’s bindings updates this file in the SAME commit.'},
+
+  shaderPipeline:{label:'Shader Pipeline',tag:'gpu',
+    desc:'All shaders are WGSL. LoadShader prepends, in order: the world constants generated from world.h, the tuning constant block, common.wgsl, then the specific shader. F5 recompiles everything to SPIR-V through Tint.',
+    files:['src/gpu/resources.h','src/gpu/resources.cpp','assets/shaders/common.wgsl','scripts/check_shaders.sh'],
+    sym:['LoadShader','ShaderConstantPrelude','TuningWgslBlock','Simulation::ReloadShaders'],
+    details:'<b>World constants are GENERATED from <code>src/sim/world.h</code></b> by <code>ShaderConstantPrelude()</code> and must never be redeclared in WGSL.<br><br><code>target</code> is a reserved word in WGSL. A compile error keeps the OLD pipelines rather than leaving you with none. <code>bash scripts/check_shaders.sh</code> validates WGSL without a rebuild.'},
+
+  context:{label:'GPU Context',tag:'gpu',
+    desc:'Owns the instance, adapter, device, queue and window surface, plus the pipeline cache.',
+    files:['src/gpu/context.h','src/gpu/context.cpp'],
+    sym:['GpuContext::Init','GpuContext::Resize'],
+    details:'The pipeline cache (SPIR-V on disk plus a VkPipelineCache) is what removes the 20-30 s white screen on a cold start.'},
+
+  // ------------------------------------------------------------ verification
+  testHarness:{label:'Selftest Harness',tag:'inv',
+    desc:'Named gates with declared dependencies, topologically ordered. --gate NAME runs one in seconds instead of the ~50 s full suite. Determinism is verified by running the sim twice and comparing world hashes.',
+    files:['src/test/selftest.h','src/test/selftest.cpp','src/test/support.h','src/test/support.cpp','tests/baseline.json'],
+    sym:['selftest::Registry','selftest::kOrder','selftest::Gate','SimGates','RenderGates','PlayerGates','MobGates','BodyGates','WorldIoGates','SpellGates'],
+    doc:['tests/BASELINE.md','CLAUDE.md'],
+    rule:1,
+    details:'<b>Verification is a BUDGET, not a reflex.</b> Before every run, answer "what claim does this establish that is not already established?" — a tree that did not change does not need re-testing, and running a gate AND the suite that contains it is pure waste. Full acceptance is an END-OF-WORK event, run once.<br><br><code>tests/baseline.json</code> records the pinned determinism hash and which gates are already failing, so a new failure is a regression (exit 1) and a known one is not (exit 0).<br><br><b>Note:</b> <code>MobGates()</code> currently returns an EMPTY vector — <code>selftest_mob.cpp</code> builds a large gate body that is not registered, so no mob gate runs.',
+    children:['testSim','testRender','testPhys','testPlayer','testSpell','testWorldIO','testMob','checkers']},
+
+  testSim:{label:'Sim Gates',tag:'inv',
+    desc:'determinism, sleep, evaporation, blood-stain, flung-liquid, fluid-det, fluid-settle, fluid-excite, fluid-stain, fluid-react, prefab, page-roundtrip, daylight-boundary, perf (advisory).',
+    files:['src/test/selftest_sim.cpp'],
+    tst:['determinism','sleep','evaporation','blood-stain','flung-liquid','fluid-det','fluid-settle','fluid-excite','fluid-stain','fluid-react','prefab','page-roundtrip','daylight-boundary','perf'],
+    details:'<code>determinism</code> runs the sim twice and compares the final world hash against <code>determinismHash</code> in <code>tests/baseline.json</code>. <code>sleep</code> asserts the settled world holds only a handful of active chunks — the executable check on rule 2.<br><br>Rate comparisons prove nothing about a frontier rule: assert per-voxel INVARIANTS instead. A sweep must assert the invariant, not that every stain happens to be blood. And a burn fixture must OUTLAST the burn — a 9-voxel plate erodes past the dissolve floor mid-test.'},
+
+  testRender:{label:'Render Gates',tag:'inv',
+    desc:'far-fog, far-downsample, screenshots — pinned-value regression at fixed camera positions.',
+    files:['src/test/selftest_render.cpp'],
+    tst:['far-fog','far-downsample','screenshots']},
+
+  testPhys:{label:'Body Gates',tag:'inv',
+    desc:'debris, settle-back, player-body — island detection, the debris lifecycle, body damage and settling back into the grid.',
+    files:['src/test/selftest_phys.cpp'],
+    tst:['debris','settle-back','player-body']},
+
+  testPlayer:{label:'Player Gates',tag:'inv',
+    desc:'player-walk, player-waterjump, player-ledgegrab, player-plants.',
+    files:['src/test/selftest_player.cpp'],
+    tst:['player-walk','player-waterjump','player-ledgegrab','player-plants'],
+    details:'A green pose test can be measuring a sideways strafe on the wrong axis — check axis, heading and threshold before trusting one.'},
+
+  testSpell:{label:'Spell Gates',tag:'inv',
+    desc:'spells, streaming — glyph composition and spell VM execution, plus the residency-window shift.',
+    files:['src/test/selftest_spell.cpp'],
+    tst:['spells','streaming']},
+
+  testWorldIO:{label:'World I/O Gates',tag:'inv',
+    desc:'save-load, save-entities, region-store, streaming — save/load round-trip and region-file format validation.',
+    files:['src/test/selftest_worldio.cpp'],
+    tst:['save-load','save-entities','region-store','streaming']},
+
+  testMob:{label:'Mob Gates (unregistered)',tag:'inv',
+    desc:'A large gait / dismemberment / melee gate body exists in selftest_mob.cpp, but MobGates() returns an empty vector — none of it runs. Treat mob behaviour as UNCOVERED by the suite.',
+    files:['src/test/selftest_mob.cpp'],
+    sym:['MobGates']},
+
+  checkers:{label:'Static Checkers',tag:'inv',
+    desc:'The cheap checks that catch "two places must agree" bugs without a build or a GPU.',
+    files:['scripts/check_invariants.py','scripts/check_pass_table.py','scripts/check_shaders.sh','scripts/post_edit_check.sh'],
+    details:'<ul><li><code>python scripts/check_invariants.py</code> — every pair of lists that must agree</li><li><code>python scripts/check_pass_table.py</code> — pass-table R/W sets vs actual WGSL bindings</li><li><code>bash scripts/check_shaders.sh</code> — WGSL validity with no rebuild</li></ul>'},
+
+  // ------------------------------------------------------------------- ui
+  uiOverlay:{label:'UI Overlay',tag:'cpu',
+    desc:'The ImGui debug panel plus the player-facing HUD: health, mana, body figure, spell readout, crosshair material, hotbar, ledge state and the FPS counter.',
+    files:['src/ui/overlay.h','src/ui/overlay.cpp'],
+    sym:['UIState','Overlay::Draw'],
+    details:'<code>UIState</code> is the whole contract — <code>main.cpp</code> owns the values, the overlay only reads and edits them. The crosshair material comes from the <code>sim_pick</code> readback and is one tick latent; <code>hoverMat == 0</code> means the ray left the window.'},
+
+  // ---------------------------------------------------------------- tools
+  toolsSys:{label:'Tools & Telemetry',tag:'cpu',
+    desc:'Everything outside the game binary: this browser tuner, the voxel/rig editor, the localhost telemetry stream that feeds this page live, and the headless sizing harness.',
+    files:['assets/tuner.html','assets/editor/','scripts/'],
+    children:['tunerApp','voxelEditor','telemetrySys','measureSys']},
+
+  tunerApp:{label:'Tuner (this page)',tag:'cpu',
+    desc:'The browser editor for every JSON the engine reads — materials, reactions, tuning, items, sounds, spells — plus the Wiki, Notes and this Engine tab. Served by a small Python server or the packaged exe.',
+    files:['assets/tuner.html','assets/tuner_schema.js','assets/sound_schema.js','scripts/tuner_server.py','scripts/tuner_app.py','scripts/build_tuner_exe.py'],
+    details:'Run <code>./sandvox_tuner.exe</code> or <code>python scripts/tuner_server.py</code>. Its Build and Play buttons run build + selftest.<br><br>The exe only needs rebuilding when the PYTHON changes — HTML/JS edits are picked up on reload.'},
+
+  voxelEditor:{label:'Voxel + Rig Editor',tag:'cpu',
+    desc:'The three.js model editor inside the Models tab: voxel editing, the limb/parts rig panel, sockets and the animation timeline.',
+    files:['assets/editor/editor.js','assets/editor/rig.js','assets/editor/anim.js','docs/EDITOR_GUIDE.md'],
+    details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><code>anim.js</code> is a port of <code>src/game/anim.cpp</code> — keep them in sync.<br><br>The limb library saves and swaps parts between creatures through <code>assets/limbs/</code>, which is created on first save and needs the tuner server (a <code>file://</code> page cannot list it).'},
+
+  telemetrySys:{label:'Telemetry Stream',tag:'cpu',
+    desc:'A localhost-only WebSocket server streaming one JSON object per tick to this page. Zero cost when disabled.',
+    files:['src/telemetry.h','src/telemetry.cpp'],
+    sym:['Telemetry::Start','Telemetry::Broadcast','TelemetryStage'],
+    details:'Start the game with <code>--telemetry</code> (port via <code>--telemetry-port</code>, default 8080), then press <b>connect</b> in the bar at the top of this page.<br><br>Wire format: <code>{"tick":N,"stages":{"ca":{"ms":0.18},...}}</code>. <b>Stage keys match the <code>data-eng-stage</code> attributes below</b>, so adding a stage needs no page changes beyond a new block. The frame loop currently broadcasts <code>stream</code>, <code>submit</code>, <code>physics</code>, <code>post</code> per tick and <code>render</code> per frame.'},
+
+  measureSys:{label:'Measure Harness',tag:'cpu',
+    desc:'The --measure headless sizing run: occupancy histogram of the residency window plus per-compute-pass GPU timings in three activity scenarios.',
+    files:['src/measure/measure.h','src/measure/measure.cpp','src/gpu/passtimer.h','src/gpu/passtimer.cpp'],
+    sym:['sandvox::RunMeasure','PassTimer'],
+    details:'Measurement-only, and deliberately unreachable from the game or the selftest: <code>Simulation</code> holds a NULL <code>PassTimer*</code> by default, so both encode byte-identical command buffers whether or not the timer is compiled in.<br><br><b>Never launch <code>sandvox.exe</code> directly</b> — wrap every run in <code>bash scripts/run.sh</code>. Concurrent runs saturate the GPU and make every measured number garbage (the same gate has read 101, 14 and 127 ms).'},
 };
 
 const ARCH_EDGES=[
-  // Top-level group connections (visible when collapsed)
+  // Top-level (the shape you see collapsed)
   ['frameLoop','worldStorage','voxel read/write'],
   ['frameLoop','gpuBackend','dispatches'],
   ['frameLoop','physicsSys','Jolt step'],
   ['frameLoop','audioSys','sound events'],
+  ['frameLoop','uiOverlay','UIState'],
   ['gameSystems','frameLoop','input + ops'],
   ['dataPipeline','frameLoop','GPU tables + WGSL consts'],
   ['gpuBackend','worldStorage','barriers + buffers'],
   ['worldStorage','worldgen','procgen fills'],
   ['testHarness','frameLoop','2-run hash compare'],
   ['physicsSys','worldStorage','terrain meshes'],
+  ['toolsSys','dataPipeline','edits JSON'],
+  ['frameLoop','toolsSys','telemetry'],
 
-  // Frame loop children
+  // Frame loop internals
   ['simTick','renderPass','shared voxel buffer'],
   ['simTick','postStep','snapshot'],
   ['postStep','gameSystems','transforms'],
@@ -6333,202 +6962,864 @@ const ARCH_EDGES=[
   ['caLoop','particleSys','ejecta'],
   ['particleSys','occupancy','claim writes'],
   ['fluidSys','occupancy','grid writes'],
+  ['caLoop','fluidSys','excite'],
+  ['fluidSys','caLoop','settle'],
   ['occupancy','readback','hash + counts'],
 
   // World storage internals
   ['pageTable','voxelBuf','address translation'],
   ['streaming','chunkStore','RLE persist'],
   ['streaming','worldgen','generate fills'],
+  ['streaming','pageTable','materialize'],
   ['farField','worldgen','far fill'],
 
-  // Game → sim connections
+  // Data -> runtime
+  ['dataPipeline','simTick','GPU tables'],
+  ['dataPipeline','renderPass','material colours'],
+  ['tuning','shaderPipeline','WGSL consts'],
+  ['microDetail','raymarch','brick pool'],
+  ['mobDefs','mobSys','defs'],
+  ['glyphs','spellSys','library'],
+  ['itemDefs','itemSys','grip + edge'],
+
+  // Game -> sim (ops only)
   ['brush','mutQueue','BrushOp'],
   ['spellSys','mutQueue','ops'],
   ['debrisSys','mutQueue','CellOps'],
+  ['prefabs','mutQueue','CellOps'],
   ['gameSystems','mutQueue','ops only'],
   ['readback','gameSystems','CPU mirror'],
 
-  // Physics connections
+  // Physics
   ['mobSys','physicsSys','kinematic drive'],
   ['avatar','physicsSys','kinematic drive'],
   ['player','avatar','drives'],
+  ['animRuntime','mobSys','poses'],
+  ['animRuntime','avatar','poses'],
+  ['melee','debrisSys','edge sweep damage'],
   ['debrisSys','readback','async fetch'],
+  ['debrisSys','terrainMesh','collides against'],
+  ['bodyReg','drawBodies','instances'],
+  ['bodyReg','drawMicro','draw list'],
 
-  // Render connections
+  // Render
   ['renderPass','worldStorage','reads voxels'],
   ['renderPass','physicsSys','body transforms'],
+  ['farField','raymarch','cascade continuation'],
 
-  // Audio connections
+  // Audio
   ['audioCues','readback','KindAt mirror'],
+  ['audioCues','audioOcclusion','ray'],
+  ['audioCues','audioDevice','voices'],
+  ['audioDevice','audioSpatial','DSP'],
   ['mobSys','audioCues','mob sounds'],
   ['player','audioCues','footstep events'],
 
-  // Shader pipeline
+  // GPU backend
   ['shaderPipeline','simTick','SPIR-V'],
   ['shaderPipeline','renderPass','SPIR-V'],
-  ['dataPipeline','simTick','GPU tables'],
-  ['dataPipeline','renderPass','material colors'],
+  ['passTable','simTick','records + barriers'],
+  ['rhiSeam','vkBackend','implemented by'],
+  ['context','rhiSeam','device + queue'],
+
+  // Tools
+  ['telemetrySys','tunerApp','per-tick JSON'],
+  ['voxelEditor','mobDefs','authors'],
+  ['tunerApp','tuning','authors'],
 ];
 
 const ARCH_TAG_COLORS={gpu:'#4c9aff',cpu:'#f2a65a',xfer:'#c792ea',render:'#5ed3a5',inv:'#f2726f'};
 const ARCH_TAG_BG={gpu:'rgba(76,154,255,.14)',cpu:'rgba(242,166,90,.14)',xfer:'rgba(199,146,234,.14)',render:'rgba(94,211,165,.14)',inv:'rgba(242,111,107,.14)'};
+const ARCH_TAG_NAMES={gpu:'GPU compute',cpu:'CPU',xfer:'CPU↔GPU transfer',render:'Rendering',inv:'Verification'};
+// Roots are DERIVED (any node no group claims as a child), not listed here —
+// a hand-kept top-level list silently disagreed with the `children` arrays.
 
 let archExpanded=new Set(['frameLoop']);
-let archMermaidReady=false;
-let archMermaidLoading=false;
+let archSelected=null;
+let archQuery='';
 
-function archLoadMermaid(){
-  if(archMermaidReady||archMermaidLoading)return Promise.resolve();
-  archMermaidLoading=true;
-  return new Promise((resolve,reject)=>{
-    const s=document.createElement('script');
-    s.src='https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
-    s.onload=()=>{
-      window.mermaid.initialize({
-        startOnLoad:false,
-        theme:'dark',
-        themeVariables:{
-          darkMode:true,
-          background:'#141922',
-          primaryColor:'#1f2733',
-          primaryBorderColor:'#2a3240',
-          primaryTextColor:'#d7dde6',
-          secondaryColor:'#1a2029',
-          secondaryBorderColor:'#2a3240',
-          tertiaryColor:'#0e1116',
-          lineColor:'#39445a',
-          textColor:'#d7dde6',
-          mainBkg:'#1f2733',
-          nodeBorder:'#39445a',
-          clusterBkg:'#141922',
-          clusterBorder:'#2a3240',
-          edgeLabelBackground:'#141922',
-          fontSize:'13px',
-        },
-        flowchart:{
-          curve:'basis',
-          padding:14,
-          nodeSpacing:30,
-          rankSpacing:40,
-          htmlLabels:true,
-          useMaxWidth:false,
-        },
-        securityLevel:'loose',
-      });
-      archMermaidReady=true;
-      archMermaidLoading=false;
-      resolve();
-    };
-    s.onerror=()=>{archMermaidLoading=false;reject(new Error('Failed to load mermaid'));};
-    document.head.appendChild(s);
-  });
+/* ---- layout + rendering -------------------------------------------------
+ *
+ * This used to be Mermaid, and Mermaid could not do what this view needs.
+ * It re-runs dagre over the whole graph on every render, so:
+ *
+ *   - expanding one group RESHUFFLED everything, and the family boxes you
+ *     were orienting by jumped somewhere else (or off-screen);
+ *   - there was nothing to animate, because each render is a wholesale SVG
+ *     swap — the old diagram vanishes and a different one appears.
+ *
+ * So the layout is ours now: a CONTAINMENT layout, which is the shape the
+ * data actually has (every node has one parent). Two properties fall out of
+ * that and they are the whole point:
+ *
+ *   STABILITY. Siblings pack into rows in declaration order, always. Opening
+ *   a group grows that group's box; boxes before it do not move at all, and
+ *   boxes after it slide along the same row order. Nothing is ever removed
+ *   from the diagram to make room, so every family box stays on screen.
+ *
+ *   CONTINUITY. Because we compute the before and after rectangles ourselves,
+ *   we can interpolate between them: the group swells, and its children
+ *   unfold out of the spot it used to occupy. No page swap.
+ *
+ * It also drops the CDN dependency — the diagram now works offline, which the
+ * Mermaid version did not.
+ *
+ * Boxes are HTML divs (real text, real hover, trivial to animate); edges are
+ * one SVG layer underneath. Children are painted ON TOP of their parent, so a
+ * click lands on the innermost box with no hit-testing tricks.
+ */
+
+const ARCH_L={
+  LEAF_W:186, LEAF_H:54,   // a leaf box
+  HDR:32,                  // group title strip; children start below it
+  PAD:13,                  // group inner padding
+  NODESEP:26,              // between siblings in the same rank
+  RANKSEP:52,              // between ranks — room for the edge label
+  MIN_GW:210,              // a group is never narrower than this
+};
+
+// One parent per node: the first group that lists it. Roots are whatever no
+// group claims — derived, so adding a node to a `children` array is the only
+// thing needed to re-home it.
+function archParentMap(){
+  const p={};
+  for(const k in ARCH_NODES)for(const c of ARCH_NODES[k].children||[])if(!(c in p))p[c]=k;
+  return p;
+}
+let ARCH_PARENT=archParentMap();
+function archRoots(){return Object.keys(ARCH_NODES).filter(k=>!(k in ARCH_PARENT));}
+function archAncestors(id){
+  const out=[];let p=ARCH_PARENT[id];
+  while(p&&!out.includes(p)){out.push(p);p=ARCH_PARENT[p];}
+  return out;
 }
 
-function archBuildMermaid(){
-  const lines=['flowchart TB'];
-  const rendered=new Set();
-  const tagStyle={
-    gpu:'fill:#1a2e4a,stroke:#4c9aff,stroke-width:2px,color:#d7dde6',
-    cpu:'fill:#2a2014,stroke:#f2a65a,stroke-width:2px,color:#d7dde6',
-    xfer:'fill:#251a30,stroke:#c792ea,stroke-width:2px,color:#d7dde6',
-    render:'fill:#142a22,stroke:#5ed3a5,stroke-width:2px,color:#d7dde6',
-    inv:'fill:#2a1618,stroke:#f2726f,stroke-width:2px,color:#d7dde6',
-  };
-  const esc={'&':'and','"':"''",'<':'(','>':')'};
+/* Measure bottom-up: a group's size depends on its children's sizes.
+ *
+ * Each sibling set is laid out as a LAYERED FLOWCHART (the Sugiyama pipeline
+ * Mermaid's dagre uses), not a grid. A grid was tried and it was wrong: it put
+ * every node in a position that carried no meaning, so the arrows became
+ * spaghetti between arbitrary cells and the diagram stopped saying anything.
+ * Position has to encode flow — what feeds what — or there is no reason to
+ * draw a graph instead of a list.
+ *
+ *   1. lift edges to the sibling level (an edge from anything inside A to
+ *      anything inside B is an A -> B edge at this level)
+ *   2. break cycles so ranking terminates
+ *   3. rank by longest path — rank = "how many hops downstream am I"
+ *   4. order within each rank by barycentre sweeps, to cut crossings
+ *   5. place: centre each rank, wrap ranks too wide to fit
+ *
+ * The recursion is what Mermaid could not give us: the SAME algorithm runs
+ * inside every expanded group, so an opened subsystem is itself a little
+ * flowchart rather than a bag of boxes.
+ *
+ * STABILITY falls out of it. Ranks and within-rank order depend only on the
+ * EDGES, never on sizes — so expanding a group cannot re-rank or re-order
+ * anything. The opened group simply needs more room, and its neighbours slide
+ * to make it; every node keeps its place in the flow.
+ */
 
-  function emitNode(id,inSub){
-    if(rendered.has(id))return;
-    rendered.add(id);
-    const n=ARCH_NODES[id];
-    if(!n)return;
-    const hasKids=n.children&&n.children.length>0;
-    const isOpen=archExpanded.has(id);
-    const icon=hasKids?(isOpen?'v ':'+ '):'';
-    const lbl=(icon+n.label).replace(/[&"<>]/g,c=>esc[c]||c);
 
-    if(hasKids&&isOpen){
-      lines.push(`  subgraph ${id}["${lbl}"]`);
-      for(const kid of n.children)emitNode(kid,true);
-      lines.push('  end');
-      lines.push(`  style ${id} fill:#141922,stroke:${ARCH_TAG_COLORS[n.tag]||'#39445a'},stroke-width:2px,color:#d7dde6`);
-    }else{
-      lines.push(`  ${id}["${lbl}"]`);
-      lines.push(`  style ${id} ${tagStyle[n.tag]||tagStyle.cpu}`);
+// Edges used for RANKING: only those authored BETWEEN these exact siblings.
+//
+// Lifting hidden edges up to this level (gameSystems -> frameLoop standing in
+// for brush -> mutQueue, and so on) was tried and it wrecked the layout: the
+// synthetic edges chained nearly every root together, turning a five-rank
+// flowchart into a nine-rank column one node wide. Ranking follows the
+// AUTHORED structure only. The lifted edges are still DRAWN — archResolvedEdges
+// re-points them at the nearest visible ancestor — so no relationship is lost;
+// they simply do not get a vote on depth.
+function archSiblingEdges(ids){
+  const S=new Set(ids),seen=new Set(),out=[];
+  for(const[a,b]of ARCH_EDGES){
+    if(!S.has(a)||!S.has(b)||a===b)continue;
+    const k=a+'>'+b;
+    if(seen.has(k))continue;
+    seen.add(k);out.push([a,b]);
+  }
+  return out;
+}
+
+// Longest-path ranking. Back edges found by DFS are dropped from the ranking
+// (they still get DRAWN — they just must not decide depth, or a cycle would
+// rank forever).
+function archRanks(ids,edges){
+  const adj={},succ={},pred={};
+  for(const i of ids){adj[i]=[];succ[i]=[];pred[i]=[];}
+  for(const[u,v]of edges)adj[u].push(v);
+
+  const color={},back=new Set();
+  const dfs=u=>{
+    color[u]=1;
+    for(const v of adj[u]){
+      if(color[v]===1)back.add(u+'>'+v);
+      else if(!color[v])dfs(v);
     }
+    color[u]=2;
+  };
+  for(const i of ids)if(!color[i])dfs(i);
+
+  for(const[u,v]of edges){
+    if(back.has(u+'>'+v))continue;
+    succ[u].push(v);pred[v].push(u);
   }
 
-  const topLevel=['frameLoop','gameSystems','worldStorage','dataPipeline','gpuBackend','physicsSys','audioSys','uiOverlay','testHarness','worldgen'];
-  for(const id of topLevel)emitNode(id,false);
-
-  for(const[from,to,label]of ARCH_EDGES){
-    const fromNode=ARCH_NODES[from], toNode=ARCH_NODES[to];
-    if(!fromNode||!toNode)continue;
-    const fromVis=rendered.has(from);
-    const toVis=rendered.has(to);
-    if(!fromVis||!toVis)continue;
-    if(label){
-      const safeLabel=label.replace(/[&"<>]/g,c=>esc[c]||c);
-      lines.push(`  ${from}-->|"${safeLabel}"|${to}`);
-    }else lines.push(`  ${from}-->${to}`);
-  }
-
-  return lines.join('\n');
+  const rank={};
+  const calc=v=>{
+    if(rank[v]!==undefined)return rank[v];
+    rank[v]=0;                       // guard against any cycle we missed
+    let r=0;
+    for(const u of pred[v])r=Math.max(r,calc(u)+1);
+    return (rank[v]=r);
+  };
+  for(const i of ids)calc(i);
+  return {rank,succ,pred};
 }
 
-async function archRender(){
-  const container=document.getElementById('arch-graph');
-  if(!container)return;
-  try{
-    await archLoadMermaid();
-  }catch(e){
-    container.innerHTML='<div style="color:var(--dim);padding:24px;text-align:center">Could not load Mermaid.js — check network connection</div>';
+// Barycentre ordering: repeatedly sort each rank by the average position of
+// its neighbours in the adjacent rank. Four sweeps is the usual sweet spot.
+function archOrderLayers(ids,rank,succ,pred){
+  const layers=[];
+  for(const i of ids){(layers[rank[i]]=layers[rank[i]]||[]).push(i);}
+  for(let r=0;r<layers.length;r++)layers[r]=layers[r]||[];
+  const index=l=>{const m={};l.forEach((id,i)=>{m[id]=i;});return m;};
+  const sweep=(r,neighbours,ref)=>{
+    const at=index(ref);
+    layers[r]=layers[r]
+      .map((id,i)=>{
+        const ns=neighbours[id].filter(n=>at[n]!==undefined);
+        const b=ns.length?ns.reduce((a,n)=>a+at[n],0)/ns.length:i;
+        return {id,b,i};
+      })
+      .sort((a,b)=>a.b-b.b||a.i-b.i)
+      .map(o=>o.id);
+  };
+  for(let it=0;it<4;it++){
+    for(let r=1;r<layers.length;r++)sweep(r,pred,layers[r-1]);
+    for(let r=layers.length-2;r>=0;r--)sweep(r,succ,layers[r+1]);
+  }
+  return layers;
+}
+
+function archPlaceLayers(layers,sz){
+  // ONE ROW PER RANK, however wide it gets. Wrapping over-wide ranks was tried
+  // and it cost both of the things this layout exists for: a wrapped rank
+  // stops reading as a rank (the flowchart lies about what is parallel), and
+  // expanding a group would push its rank past the wrap threshold and shove a
+  // sibling onto a new row — the reshuffling we are here to avoid. Width is
+  // the fit control's problem, not the layout's.
+  const rows=layers.filter(l=>l.length).map(ids=>({
+    ids,
+    w:ids.reduce((a,id,i)=>a+(i?ARCH_L.NODESEP:0)+sz[id].w,0),
+  }));
+  if(!rows.length)return {w:ARCH_L.LEAF_W,h:ARCH_L.LEAF_H};
+  const W=Math.max(...rows.map(r=>r.w));
+  let y=0;
+  for(const r of rows){
+    let x=(W-r.w)/2,h=0;
+    for(const id of r.ids){sz[id].ox=x;x+=sz[id].w+ARCH_L.NODESEP;h=Math.max(h,sz[id].h);}
+    for(const id of r.ids)sz[id].oy=y+(h-sz[id].h)/2;   // centre in the band
+    y+=h+ARCH_L.RANKSEP;
+  }
+  return {w:W,h:Math.max(0,y-ARCH_L.RANKSEP)};
+}
+
+function archLayoutSiblings(ids,sz){
+  const edges=archSiblingEdges(ids);
+  const {rank,succ,pred}=archRanks(ids,edges);
+  return archPlaceLayers(archOrderLayers(ids,rank,succ,pred),sz);
+}
+
+function archMeasure(id,out){
+  const n=ARCH_NODES[id];
+  const kids=(archExpanded.has(id)&&n.children&&n.children.length)?n.children:null;
+  if(!kids){out[id]={w:ARCH_L.LEAF_W,h:ARCH_L.LEAF_H,open:false};return out[id];}
+
+  for(const k of kids)archMeasure(k,out);
+  const box=archLayoutSiblings(kids,out);
+  for(const k of kids){out[k].ox+=ARCH_L.PAD;out[k].oy+=ARCH_L.HDR+ARCH_L.PAD;}
+
+  out[id]={
+    w:Math.max(ARCH_L.MIN_GW,box.w+2*ARCH_L.PAD),
+    h:box.h+ARCH_L.HDR+2*ARCH_L.PAD,
+    open:true,
+  };
+  return out[id];
+}
+
+function archLayout(){
+  const m={},roots=archRoots();
+  for(const id of roots)archMeasure(id,m);
+  const box=archLayoutSiblings(roots,m);
+
+  const pos={};
+  const place=(id,px,py,depth)=>{
+    const b=m[id];
+    pos[id]={x:px,y:py,w:b.w,h:b.h,depth,open:b.open};
+    if(!b.open)return;
+    for(const k of ARCH_NODES[id].children)place(k,px+m[k].ox,py+m[k].oy,depth+1);
+  };
+  for(const id of roots)place(id,m[id].ox,m[id].oy,0);
+  return {pos,W:box.w,H:box.h};
+}
+
+/* ---- painting ---- */
+
+let archRects={};        // what is on screen right now, interpolated
+let archAnimHandle=0;
+let archAnimGuard=0;
+// The finisher of the in-flight transition, if any. A new paint force-settles
+// the previous one first, so two fast clicks cannot strand boxes mid-flight.
+let archPendingFinish=null;
+let archHot=null;        // hovered/selected node whose edges are lit
+let archLastLayout=null;
+
+function archStage(){return document.getElementById('arch-stage');}
+
+function archBoxHtml(id){
+  const n=ARCH_NODES[id];
+  const kids=n.children&&n.children.length?n.children.length:0;
+  const path=(n.files&&n.files[0])||'';
+  return `<div class="bhdr"><span class="cr">${kids?'▸':''}</span>`+
+         `<span class="bl">${n.label}</span>`+
+         (kids?`<span class="cnt">${kids}</span>`:'')+`</div>`+
+         (path?`<div class="bp">${path}</div>`:'');
+}
+
+function archEnsureBoxes(pos){
+  const stage=archStage();
+  if(!stage)return;
+  for(const id in pos){
+    let el=stage.querySelector(`.arch-box[data-arch-key="${id}"]`);
+    if(!el){
+      el=document.createElement('div');
+      el.className='arch-box';
+      el.dataset.archKey=id;
+      el.innerHTML=archBoxHtml(id);
+      el.addEventListener('click',e=>{
+        if(archDragMoved)return;   // a pan that ended over a box is not a click
+        e.stopPropagation();
+        archNodeClick(id);
+      });
+      el.addEventListener('mouseenter',()=>{archHot=id;archDrawEdges(archRects);});
+      el.addEventListener('mouseleave',()=>{archHot=archSelected;archDrawEdges(archRects);});
+      stage.appendChild(el);
+    }
+    const n=ARCH_NODES[id];
+    const open=pos[id].open;
+    el.className='arch-box t-'+n.tag+(open?' grp open':(n.children&&n.children.length?' grp':''))+
+                 (id===archSelected?' sel':'');
+    el.style.zIndex=String(10+pos[id].depth);
+    const cr=el.querySelector('.cr');
+    if(cr&&n.children&&n.children.length)cr.textContent=open?'▾':'▸';
+  }
+}
+
+// Where a box should come FROM when it first appears: out of whichever
+// ancestor was already on screen. That is what makes an expand read as the
+// parent unfolding rather than as new boxes blinking into existence.
+function archSpawnRect(id,pos){
+  for(const a of archAncestors(id)){
+    const r=archRects[a];
+    if(r)return {x:r.x+r.w/2-pos[id].w*0.3,y:r.y+r.h/2-pos[id].h*0.3,
+                 w:pos[id].w*0.6,h:pos[id].h*0.6,op:0};
+  }
+  const t=pos[id];
+  return {x:t.x,y:t.y,w:t.w,h:t.h,op:0};
+}
+function archDespawnRect(id,pos){
+  for(const a of archAncestors(id)){
+    const r=pos[a];
+    if(r)return {x:r.x+r.w/2,y:r.y+r.h/2,w:0,h:0,op:0};
+  }
+  const r=archRects[id];
+  return {x:r.x,y:r.y,w:r.w,h:r.h,op:0};
+}
+
+const archEase=t=>1-Math.pow(1-t,3);
+
+function archPaint(animate){
+  const stage=archStage();
+  if(!stage)return;
+  // Settle whatever was still moving before measuring against it.
+  if(archPendingFinish){const f=archPendingFinish;archPendingFinish=null;f();}
+  const L=archLayout();
+  archLastLayout=L;
+  archEnsureBoxes(L.pos);
+
+  const from={},to={};
+  for(const id in L.pos){
+    const t=L.pos[id];
+    to[id]={x:t.x,y:t.y,w:t.w,h:t.h,op:1};
+    from[id]=archRects[id]||archSpawnRect(id,L.pos);
+  }
+  const leaving=[];
+  for(const id in archRects){
+    if(id in L.pos)continue;
+    leaving.push(id);
+    from[id]=archRects[id];
+    to[id]=archDespawnRect(id,L.pos);
+  }
+
+  const apply=r=>{
+    for(const id in r){
+      const el=stage.querySelector(`.arch-box[data-arch-key="${id}"]`);
+      if(!el)continue;
+      const b=r[id];
+      el.style.transform=`translate(${b.x}px,${b.y}px)`;
+      el.style.width=b.w+'px';
+      el.style.height=b.h+'px';
+      el.style.opacity=String(b.op);
+    }
+    archDrawEdges(r);
+  };
+  let settled=false;
+  const finish=()=>{
+    if(settled)return;
+    settled=true;
+    cancelAnimationFrame(archAnimHandle);
+    clearTimeout(archAnimGuard);
+    if(archPendingFinish===finish)archPendingFinish=null;
+    for(const id of leaving){
+      stage.querySelector(`.arch-box[data-arch-key="${id}"]`)?.remove();
+      delete to[id];
+    }
+    archRects=to;
+    apply(archRects);
+  };
+
+  if(animate===false||!Object.keys(archRects).length){
+    for(const id of leaving)delete to[id];
+    for(const id in archRects)if(!(id in to))delete archRects[id];
+    archRects=to;
+    apply(archRects);
+    for(const id of leaving)stage.querySelector(`.arch-box[data-arch-key="${id}"]`)?.remove();
+    archSizeStage(L);
     return;
   }
-  const def=archBuildMermaid();
-  const id='arch-svg-'+Date.now();
-  try{
-    const{svg}=await window.mermaid.render(id,def);
-    container.innerHTML=svg;
-    container.querySelectorAll('.node,.cluster').forEach(node=>{
-      node.style.cursor='pointer';
-      const nodeId=node.id?.replace(/^flowchart-/,'')?.replace(/-\d+$/,'')||
-                   node.id?.replace(/-\d+$/,'')||'';
-      node.addEventListener('click',e=>{
-        e.stopPropagation();
-        const match=nodeId.match(/^(?:flowchart-)?(\w+?)(?:-\d+)?$/);
-        const cleanId=match?match[1]:nodeId;
-        if(ARCH_NODES[cleanId])archNodeClick(cleanId);
-      });
-    });
-    // subgraph labels also get click handlers
-    container.querySelectorAll('.cluster').forEach(cluster=>{
-      const label=cluster.querySelector('.nodeLabel,.cluster-label');
-      const text=label?.textContent?.replace(/^[▶▼]\s*/,'').trim();
-      if(!text)return;
-      const matchId=Object.keys(ARCH_NODES).find(k=>ARCH_NODES[k].label===text);
-      if(matchId){
-        cluster.style.cursor='pointer';
-        cluster.addEventListener('click',e=>{
-          e.stopPropagation();
-          archNodeClick(matchId);
-        });
-      }
-    });
-  }catch(e){
-    container.innerHTML='<pre style="color:var(--red);padding:12px;font-size:11px">Diagram error: '+e.message+'</pre>';
+
+  cancelAnimationFrame(archAnimHandle);
+  clearTimeout(archAnimGuard);
+  const t0=performance.now(),dur=340;
+  const step=now=>{
+    const k=archEase(Math.min(1,(now-t0)/dur));
+    const cur={};
+    for(const id in to){
+      const a=from[id],b=to[id];
+      cur[id]={x:a.x+(b.x-a.x)*k,y:a.y+(b.y-a.y)*k,
+               w:a.w+(b.w-a.w)*k,h:a.h+(b.h-a.h)*k,
+               op:a.op===undefined?1:a.op+((b.op===undefined?1:b.op)-a.op)*k};
+    }
+    for(const id of leaving){
+      const a=from[id],b=to[id];
+      cur[id]={x:a.x+(b.x-a.x)*k,y:a.y+(b.y-a.y)*k,
+               w:a.w+(b.w-a.w)*k,h:a.h+(b.h-a.h)*k,op:1-k};
+    }
+    archRects=cur;
+    apply(cur);
+    if(k<1)archAnimHandle=requestAnimationFrame(step);
+    else finish();
+  };
+  // Paint the START of the transition NOW. Boxes created a moment ago by
+  // archEnsureBoxes have no inline geometry yet, so without this they sit at
+  // 0,0 at their CSS default until the first frame lands — a visible flash in
+  // a normal tab, and a permanent one wherever rAF is throttled.
+  archRects=from;
+  apply(from);
+  archSizeStage(L);
+  archAnimHandle=requestAnimationFrame(step);
+  // requestAnimationFrame does not run in a background tab, and a transition
+  // that never completes leaves removed boxes on screen and every box parked
+  // at an interpolated size. So the TIMER owns completion and rAF only makes
+  // it pretty: whichever arrives first settles the layout, once.
+  archPendingFinish=finish;
+  archAnimGuard=setTimeout(finish,dur+80);
+}
+
+function archSizeStage(L){
+  const stage=archStage();
+  if(!stage)return;
+  stage.style.width=L.W+'px';
+  stage.style.height=L.H+'px';
+  const svg=stage.querySelector('.arch-edges');
+  if(svg){svg.setAttribute('width',L.W);svg.setAttribute('height',L.H);
+          svg.setAttribute('viewBox',`0 0 ${L.W} ${L.H}`);}
+}
+
+/* ---- edges ----
+ * An edge whose endpoint is hidden inside a collapsed group is re-pointed at
+ * the nearest VISIBLE ancestor, so collapsing never silently deletes a
+ * relationship — it summarises it. Edges that collapse onto themselves (both
+ * ends land in the same box, or one end is inside the other) are dropped,
+ * because a box pointing at itself says nothing.
+ */
+function archVisibleEnd(id,rects){
+  if(rects[id])return id;
+  for(const a of archAncestors(id))if(rects[a])return a;
+  return null;
+}
+
+function archResolvedEdges(rects){
+  const seen=new Set(),out=[];
+  for(const[a,b,label]of ARCH_EDGES){
+    const from=archVisibleEnd(a,rects),to=archVisibleEnd(b,rects);
+    if(!from||!to||from===to)continue;
+    if(archAncestors(from).includes(to)||archAncestors(to).includes(from))continue;
+    const key=from+'>'+to;
+    if(seen.has(key))continue;
+    seen.add(key);
+    out.push({from,to,label:(a===from&&b===to)?label:'',direct:(a===from&&b===to)});
   }
+  return out;
+}
+
+// Meet the border of a rect on the ray toward a point — so an edge starts at
+// the edge of the box rather than under it.
+function archAnchor(r,tx,ty){
+  const cx=r.x+r.w/2,cy=r.y+r.h/2;
+  const dx=tx-cx,dy=ty-cy;
+  if(!dx&&!dy)return{x:cx,y:cy};
+  const sx=r.w/2/Math.abs(dx||1e-6),sy=r.h/2/Math.abs(dy||1e-6);
+  const s=Math.min(sx,sy);
+  return {x:cx+dx*s,y:cy+dy*s};
+}
+
+function archDrawEdges(rects){
+  const stage=archStage();
+  const svg=stage&&stage.querySelector('.arch-edges');
+  if(!svg)return;
+  const hotSet=new Set();
+  if(archHot){
+    hotSet.add(archHot);
+    for(const a of archAncestors(archHot))hotSet.add(a);
+  }
+  // One <path> PER EDGE. They were concatenated into a single `d` for speed,
+  // which silently dropped every arrowhead but one: marker-end applies to the
+  // END of a path, and a path with 70 subpaths still has exactly one end. In a
+  // flow diagram the arrowheads are half the information.
+  let cold='';
+  const hot=[];
+  for(const e of archResolvedEdges(rects)){
+    const A=rects[e.from],B=rects[e.to];
+    if(!A||!B)continue;
+    const ac=({x:A.x+A.w/2,y:A.y+A.h/2}),bc=({x:B.x+B.w/2,y:B.y+B.h/2});
+    const p1=archAnchor(A,bc.x,bc.y),p2=archAnchor(B,ac.x,ac.y);
+    const vx=p2.x-p1.x,vy=p2.y-p1.y,len=Math.hypot(vx,vy)||1;
+    let path,mid;
+    if(vy>Math.abs(vx)*0.5){
+      // Downstream edge — the common case in a layered graph. Leave the
+      // source downward and enter the target downward, so the curve reads as
+      // flow along the ranks instead of as a rope slung between two boxes.
+      const k=Math.min(70,Math.max(18,vy*0.45));
+      const c1y=p1.y+k,c2y=p2.y-k;
+      path=`M${p1.x.toFixed(1)},${p1.y.toFixed(1)}C${p1.x.toFixed(1)},${c1y.toFixed(1)} `+
+           `${p2.x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+      mid={x:(p1.x+3*p1.x+3*p2.x+p2.x)/8,y:(p1.y+3*c1y+3*c2y+p2.y)/8};
+    }else{
+      // Sideways or back edge: bow it perpendicular so it stays clear of the
+      // ranks it is skipping past.
+      const bow=Math.min(52,len*0.2)*(vx<0?-1:1);
+      const cx=(p1.x+p2.x)/2-vy/len*bow,cy=(p1.y+p2.y)/2+vx/len*bow;
+      path=`M${p1.x.toFixed(1)},${p1.y.toFixed(1)}Q${cx.toFixed(1)},${cy.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+      mid={x:(p1.x+2*cx+p2.x)/4,y:(p1.y+2*cy+p2.y)/4};
+    }
+    const isHot=hotSet.has(e.from)||hotSet.has(e.to);
+    if(isHot)hot.push({path,e,mid});
+    else cold+=`<path class="ae" d="${path}" marker-end="url(#archArrow)"/>`;
+  }
+  let html=`<defs>
+      <marker id="archArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L8,4 L0,8 z" fill="#55637d"/></marker>
+      <marker id="archArrowHot" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+        <path d="M0,0 L8,4 L0,8 z" fill="#ffd479"/></marker>
+    </defs>`;
+  html+=cold;
+  for(const h of hot){
+    html+=`<path class="ae hot" d="${h.path}" marker-end="url(#archArrowHot)"/>`;
+    if(h.e.label)
+      html+=`<text class="ael" x="${h.mid.x.toFixed(1)}" y="${h.mid.y.toFixed(1)}">${h.e.label}</text>`;
+  }
+  svg.innerHTML=html;
+}
+
+/* ---- entry point ---- */
+
+function archRender(fit){
+  const container=document.getElementById('arch-graph');
+  if(!container)return;
+  if(!archStage()){
+    container.innerHTML='<div class="arch-stage" id="arch-stage">'+
+      '<svg class="arch-edges" xmlns="http://www.w3.org/2000/svg"></svg></div>';
+    archRects={};
+    archPaint(false);
+    archInitPanZoom();
+    archFit();
+    archHasFitted=true;
+    archApplyFilter();
+    return;
+  }
+  archPaint(true);
+  if(fit===true)setTimeout(archFit,360);   // after the unfold settles
+  archApplyFilter();
+}
+let archHasFitted=false;
+
+/* ---- search ---- */
+
+function archMatches(id,q){
+  const n=ARCH_NODES[id];
+  if(!n)return false;
+  const hay=[id,n.label,n.desc,(n.files||[]).join(' '),(n.sym||[]).join(' '),
+             (n.cst||[]).join(' '),(n.tst||[]).join(' ')].join(' ').toLowerCase();
+  return hay.includes(q);
+}
+
+// Breadcrumb, outermost first: "Frame Loop / Simulation Tick / MLS-MPM Fluid".
+function archTrail(id){
+  return archAncestors(id).reverse().concat(id).map(k=>ARCH_NODES[k].label).join(' / ');
+}
+
+function archApplyFilter(){
+  const stage=archStage();
+  if(!stage)return[];
+  const q=archQuery.trim().toLowerCase();
+  stage.classList.toggle('arch-filtering',!!q);
+  const hits=q?Object.keys(ARCH_NODES).filter(k=>archMatches(k,q)):[];
+
+  // Light up the CONTAINING groups too, not just the hit. Typing "mpm" should
+  // answer "which family is that in?", and a lone highlighted box three levels
+  // deep inside dimmed parents does not answer it.
+  const anc=new Set();
+  for(const h of hits)for(const a of archAncestors(h))anc.add(a);
+
+  stage.querySelectorAll('.arch-box').forEach(el=>{
+    const k=el.dataset.archKey;
+    el.classList.toggle('arch-match',!!q&&hits.includes(k));
+    el.classList.toggle('arch-anc',!!q&&anc.has(k)&&!hits.includes(k));
+  });
+
+  const out=document.getElementById('arch-search-count');
+  if(out){
+    if(!q)out.textContent='';
+    else if(!hits.length)out.textContent='no matches';
+    else{
+      const trails=hits.slice(0,3).map(archTrail);
+      out.textContent=`${hits.length} match${hits.length===1?'':'es'} — `+
+        trails.join(' · ')+(hits.length>3?` · +${hits.length-3} more`:'');
+    }
+  }
+  return hits;
+}
+
+function archSearch(v){
+  archQuery=v;
+  const hits=archApplyFilter();
+  // A match buried in a collapsed group is a match you cannot see.
+  if(archQuery.trim()){
+    let opened=false;
+    for(const h of hits)for(const p of archAncestors(h))
+      if(!archExpanded.has(p)){archExpanded.add(p);opened=true;}
+    if(opened){archRender();return;}
+  }
+  if(hits.length===1)archShowDetail(hits[0]);
+}
+
+/* ---- pan / zoom ---- */
+
+let archPanZoomState={scale:1,x:0,y:0};
+let archPanActive=false, archPanStart={x:0,y:0}, archPanOrigin={x:0,y:0};
+let archDragMoved=false;
+
+function archApplyTransform(){
+  const stage=archStage();
+  if(!stage)return;
+  stage.style.transform=`translate(${archPanZoomState.x}px,${archPanZoomState.y}px) scale(${archPanZoomState.scale})`;
+}
+
+function archInitPanZoom(){
+  const inner=document.getElementById('arch-graph');
+  if(!inner)return;
+  archApplyTransform();
+  if(inner._pzBound)return;
+  inner._pzBound=true;
+
+  let pid=-1;
+  inner.addEventListener('pointerdown',e=>{
+    if(e.button!==0)return;
+    archPanActive=true;archDragMoved=false;pid=e.pointerId;
+    archPanStart={x:e.clientX,y:e.clientY};
+    archPanOrigin={x:archPanZoomState.x,y:archPanZoomState.y};
+  });
+  inner.addEventListener('pointermove',e=>{
+    if(!archPanActive||e.pointerId!==pid)return;
+    const dx=e.clientX-archPanStart.x,dy=e.clientY-archPanStart.y;
+    if(!archDragMoved&&(Math.abs(dx)>4||Math.abs(dy)>4)){
+      archDragMoved=true;inner.setPointerCapture(e.pointerId);
+    }
+    if(archDragMoved){
+      archPanZoomState.x=archPanOrigin.x+dx;
+      archPanZoomState.y=archPanOrigin.y+dy;
+      archApplyTransform();
+    }
+  });
+  const endPan=e=>{
+    if(e.pointerId!==pid)return;
+    if(archDragMoved){
+      try{inner.releasePointerCapture(e.pointerId);}catch(_){}
+      // Clear AFTER the click that follows this pointerup, or a drag that
+      // ends over a box also opens that box.
+      setTimeout(()=>{archDragMoved=false;},0);
+    }
+    archPanActive=false;pid=-1;
+  };
+  inner.addEventListener('pointerup',endPan);
+  inner.addEventListener('pointercancel',endPan);
+  inner.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const r=inner.getBoundingClientRect();
+    const mx=e.clientX-r.left,my=e.clientY-r.top;
+    const ns=Math.min(4,Math.max(0.12,archPanZoomState.scale*(e.deltaY>0?0.9:1.1)));
+    const k=ns/archPanZoomState.scale;
+    archPanZoomState.x=mx-(mx-archPanZoomState.x)*k;
+    archPanZoomState.y=my-(my-archPanZoomState.y)*k;
+    archPanZoomState.scale=ns;
+    archApplyTransform();
+  },{passive:false});
+}
+
+function archZoomIn(){archPanZoomState.scale=Math.min(4,archPanZoomState.scale*1.25);archApplyTransform();}
+function archZoomOut(){archPanZoomState.scale=Math.max(0.12,archPanZoomState.scale*0.8);archApplyTransform();}
+
+function archFit(){
+  const inner=document.getElementById('arch-graph');
+  if(!inner||!archLastLayout)return;
+  const pad=22;
+  const w=Math.max(1,archLastLayout.W),h=Math.max(1,archLastLayout.H);
+  const aw=inner.clientWidth-pad*2,ah=inner.clientHeight-pad*2;
+  if(aw<=0||ah<=0)return;
+  // Floor the scale: a true fit of the fully expanded map is legible to
+  // nobody. Better to overflow and let the user pan.
+  const s=Math.min(Math.max(Math.min(aw/w,ah/h),0.34),1.35);
+  archPanZoomState.scale=s;
+  archPanZoomState.x=Math.max(pad,pad+(aw-w*s)/2);
+  archPanZoomState.y=pad;
+  archApplyTransform();
+}
+
+function archToggleFullscreen(){
+  const wrap=document.querySelector('.arch-graph-wrap');
+  if(!wrap)return;
+  wrap.classList.toggle('arch-fullscreen');
+  // The button lives in the toolbar now, outside `wrap` — look it up in the
+  // document, not in the element it used to be a child of.
+  const btn=document.querySelector('.arch-fs-btn');
+  const full=wrap.classList.contains('arch-fullscreen');
+  if(btn)btn.textContent=full?'✖':'⛶';
+  setTimeout(archFit,60);
 }
 
 window.archNodeClick=function(nodeId){
   const n=ARCH_NODES[nodeId];
   if(!n)return;
-  if(n.children&&n.children.length>0){
+  archSelected=nodeId;
+  archHot=nodeId;
+  // A group toggles AND shows its detail. Nothing here re-renders from
+  // scratch: archPaint diffs the two layouts and animates between them, so
+  // the box you clicked visibly unfolds in place.
+  if(n.children&&n.children.length){
     if(archExpanded.has(nodeId))archExpanded.delete(nodeId);
     else archExpanded.add(nodeId);
-    archRender().then(()=>archShowDetail(nodeId));
+    archShowDetail(nodeId);
+    archRender();
   }else{
     archShowDetail(nodeId);
+    archPaint(true);
   }
+  // Bring an off-screen target into view rather than leaving the user to
+  // hunt for the box the panel is describing.
+  archRevealSoon(nodeId);
+};
+
+// Nudge the view so `id` is on screen. Only pans when it has to, and never
+// changes zoom — a click should not silently rescale the whole map.
+let archRevealTimer=0;
+function archRevealSoon(id){
+  clearTimeout(archRevealTimer);
+  archRevealTimer=setTimeout(()=>{
+    const inner=document.getElementById('arch-graph');
+    const r=archRects[id];
+    if(!inner||!r)return;
+    const s=archPanZoomState.scale,m=26;
+    const vw=inner.clientWidth,vh=inner.clientHeight;
+    const x0=archPanZoomState.x+r.x*s, y0=archPanZoomState.y+r.y*s;
+    const x1=x0+r.w*s, y1=y0+r.h*s;
+    let dx=0,dy=0;
+    if(x0<m)dx=m-x0; else if(x1>vw-m)dx=Math.max(vw-m-x1,m-x0);
+    if(y0<m)dy=m-y0; else if(y1>vh-m)dy=Math.max(vh-m-y1,m-y0);
+    if(!dx&&!dy)return;
+    archPanZoomState.x+=dx;archPanZoomState.y+=dy;
+    archApplyTransform();
+  },380);
+}
+
+function archPtrBlock(cls,title,items,note){
+  if(!items||!items.length)return '';
+  const rows=items.map(p=>`<span class="p" title="click to copy" onclick="archCopy(this.textContent)">${p}</span>`).join('');
+  return `<div class="arch-ptr ${cls}"><b>${title}</b>${rows}`+
+         (note?`<span class="note">${note}</span>`:'')+`</div>`;
+}
+
+// Test hook: the interpolated rectangles currently on screen. Read-only, and
+// the only thing outside this IIFE that can see the animation state.
+window.__archRects=function(){return archRects;};
+window.__archLayout=function(){return archLastLayout;};
+
+window.archCopy=function(text){
+  if(navigator.clipboard)navigator.clipboard.writeText(text).catch(()=>{});
+};
+
+// The markdown an agent should be handed: pointers first, prose second.
+function archNodeMarkdown(id){
+  const n=ARCH_NODES[id];
+  if(!n)return '';
+  const L=[`### ${n.label}  (\`${id}\`, ${ARCH_TAG_NAMES[n.tag]||n.tag})`,'',n.desc,''];
+  if(n.rule)L.push(`- **Governing rule:** ${ARCH_RULES[n.rule]}`);
+  if(n.files?.length)L.push(`- **Files:** ${n.files.map(f=>'`'+f+'`').join(', ')}`);
+  if(n.sym?.length)L.push(`- **Symbols:** ${n.sym.map(f=>'`'+f+'`').join(', ')}`);
+  if(n.cst?.length)L.push(`- **Constants:** ${n.cst.map(f=>'`'+f+'`').join(', ')}`);
+  if(n.tst?.length)L.push(`- **Selftest gates:** ${n.tst.map(f=>'`--gate '+f+'`').join(', ')}`);
+  if(n.doc?.length)L.push(`- **Docs:** ${n.doc.map(f=>'`'+f+'`').join(', ')}`);
+  if(n.children?.length)L.push(`- **Sub-systems:** ${n.children.map(c=>ARCH_NODES[c]?.label||c).join(', ')}`);
+  if(n.details)L.push('',n.details.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim());
+  return L.join('\n')+'\n';
+}
+
+window.archCopyNode=function(id){archCopy(archNodeMarkdown(id));};
+
+window.archCopyAll=function(){
+  const seen=new Set();
+  const out=['# sandvox architecture map',
+             '',
+             'Generated from the Engine tab of assets/tuner.html. Paths are repo-relative.',
+             'Constants are given by NAME — look the value up in the header, never trust a',
+             'number transcribed into prose.','',
+             '## Inviolable rules','',
+             ...Object.keys(ARCH_RULES).map(k=>`${k}. ${ARCH_RULES[k]}`),''];
+  const walk=(ids,depth)=>{
+    for(const id of ids){
+      if(seen.has(id))continue;
+      seen.add(id);
+      out.push(archNodeMarkdown(id));
+      const n=ARCH_NODES[id];
+      if(n?.children)walk(n.children,depth+1);
+    }
+  };
+  walk(archRoots(),0);
+  walk(Object.keys(ARCH_NODES),0);   // anything not reachable from a top node
+  archCopy(out.join('\n'));
+  const b=document.getElementById('arch-copyall');
+  if(b){const t=b.textContent;b.textContent='copied ✓';setTimeout(()=>{b.textContent=t;},1400);}
 };
 
 function archShowDetail(nodeId){
@@ -6536,36 +7827,92 @@ function archShowDetail(nodeId){
   if(!panel)return;
   const n=ARCH_NODES[nodeId];
   if(!n){panel.classList.remove('open');return;}
+  archSelected=nodeId;
   const tc=ARCH_TAG_COLORS[n.tag]||'#8a94a6';
   const tb=ARCH_TAG_BG[n.tag]||'rgba(138,148,166,.14)';
-  const tagNames={gpu:'GPU compute',cpu:'CPU',xfer:'CPU↔GPU transfer',render:'Rendering',inv:'Invariant'};
-  let html=`<button class="arch-detail-close" onclick="document.getElementById('arch-detail').classList.remove('open')">✕</button>`;
+  const kids=n.children||[];
+  let html=`<button class="arch-detail-close" title="close" onclick="archCloseDetail()">✕</button>`;
   html+=`<h3>${n.label}</h3>`;
-  html+=`<span class="arch-dtag" style="background:${tb};color:${tc}">${tagNames[n.tag]||n.tag}</span>`;
+  html+=`<span class="arch-dtag" style="background:${tb};color:${tc}">${ARCH_TAG_NAMES[n.tag]||n.tag}</span>`;
+  html+=`<span class="arch-dtag" style="background:rgba(138,148,166,.10);color:var(--faint)">${nodeId}</span>`;
+  html+=`<div class="arch-actions">`;
+  if(kids.length)
+    html+=`<button onclick="archNodeClick('${nodeId}')">${archExpanded.has(nodeId)?'▾ collapse':'▸ expand'} (${kids.length})</button>`;
+  html+=`<button onclick="archCopyNode('${nodeId}')">copy as markdown</button></div>`;
   html+=`<p>${n.desc}</p>`;
   if(n.details)html+=n.details;
-  if(n.children&&n.children.length>0){
-    html+='<p style="margin-top:12px"><b style="color:var(--fg);font-size:12px">Sub-systems:</b></p><ul>';
-    for(const kid of n.children){
+  if(kids.length){
+    html+='<p style="margin-top:14px"><b style="color:var(--fg);font-size:12px">Sub-systems</b></p><ul>';
+    for(const kid of kids){
       const k=ARCH_NODES[kid];
-      if(k)html+=`<li><span style="color:${ARCH_TAG_COLORS[k.tag]||'var(--fg)'};cursor:pointer" onclick="archNodeClick('${kid}')">${k.label}</span> — <span style="color:var(--faint)">${k.desc.split('.')[0]}</span></li>`;
+      if(!k)continue;
+      html+=`<li><span style="color:${ARCH_TAG_COLORS[k.tag]||'var(--fg)'};cursor:pointer" onclick="archNodeClick('${kid}')">${k.label}</span>`+
+            ` — <span style="color:var(--faint)">${k.desc.split('. ')[0]}</span></li>`;
     }
     html+='</ul>';
   }
-  if(n.files&&n.files.length>0){
-    html+=`<div class="arch-files"><b>Key files</b>${n.files.join('<br>')}</div>`;
-  }
+  html+=archPtrBlock('','Files',n.files);
+  html+=archPtrBlock('sym','Symbols to grep',n.sym);
+  html+=archPtrBlock('cst','Constants',n.cst,
+        'Given by name on purpose — read the value out of the header, do not trust a transcribed number.');
+  html+=archPtrBlock('tst','Selftest gates',(n.tst||[]).map(g=>'sandvox.exe --selftest --gate '+g),
+        'Run under bash scripts/run.sh — concurrent runs poison every timing.');
+  html+=archPtrBlock('','Design docs',n.doc);
+  if(n.rule)html+=`<div class="arch-ptr"><b>Governing rule</b><span class="note" style="margin:0">${ARCH_RULES[n.rule]}</span></div>`;
   panel.innerHTML=html;
   panel.classList.add('open');
+  panel.scrollTop=0;
 }
 
-function archCollapseAll(){archExpanded.clear();archRender();document.getElementById('arch-detail')?.classList.remove('open');}
-function archExpandAll(){for(const k in ARCH_NODES){if(ARCH_NODES[k].children)archExpanded.add(k);}archRender();}
+window.archCloseDetail=function(){
+  document.getElementById('arch-detail')?.classList.remove('open');
+  archSelected=null;archHot=null;
+  document.querySelectorAll('#arch-graph .arch-box.sel').forEach(e=>e.classList.remove('sel'));
+  archDrawEdges(archRects);
+};
+
+/* ---- the flat module index ----
+ * The graph is for humans; this table is what a text-only reader gets, and
+ * it must carry the same pointers or the page lies to half its audience.
+ */
+function archBuildIndex(){
+  const rows=[];
+  const seen=new Set();
+  const emit=(id,depth)=>{
+    if(seen.has(id))return;
+    seen.add(id);
+    const n=ARCH_NODES[id];
+    if(!n)return;
+    const ptr=[]
+      .concat(n.files||[])
+      .concat((n.sym||[]).map(s=>s+'()'))
+      .concat(n.cst||[])
+      .concat((n.tst||[]).map(t=>'--gate '+t))
+      .concat(n.doc||[]);
+    rows.push(
+      `<tr class="${depth?'lvl2':''}">`+
+      `<td class="n" onclick="archNodeClick('${id}')">${n.label}</td>`+
+      `<td class="tg" style="color:${ARCH_TAG_COLORS[n.tag]}">${n.tag}</td>`+
+      `<td>${n.desc}</td>`+
+      `<td class="paths">${ptr.join('<br>')}</td></tr>`);
+    for(const c of n.children||[])emit(c,depth+1);
+  };
+  for(const id of archRoots())emit(id,0);
+  for(const id in ARCH_NODES)emit(id,0);
+  return '<colgroup><col class="c-mod"><col class="c-lay"><col class="c-what">'+
+         '<col class="c-ptr"></colgroup>'+
+         '<thead><tr><th>Module</th><th>Layer</th><th>What it is</th>'+
+         '<th>Files, symbols, constants, gates</th></tr></thead><tbody>'+
+         rows.join('')+'</tbody>';
+}
+
+function archCollapseAll(){archExpanded.clear();archRender(true);archCloseDetail();}
+function archExpandAll(){for(const k in ARCH_NODES){if(ARCH_NODES[k].children)archExpanded.add(k);}archRender(true);}
 function archExpandLevel(depth){
   archExpanded.clear();
   const visit=(ids,d)=>{for(const id of ids){const n=ARCH_NODES[id];if(n?.children){if(d<depth){archExpanded.add(id);visit(n.children,d+1);}}}};
-  visit(['frameLoop','gameSystems','worldStorage','dataPipeline','gpuBackend','physicsSys','audioSys','testHarness'],0);
-  archRender();
+  visit(archRoots(),0);
+  archRender(true);
 }
 
 const ENG_STAGES=[
@@ -6573,9 +7920,9 @@ const ENG_STAGES=[
    desc:'Residency window follows the player — evict, load, or generate one plane at a time',
    cost:'≤1 shift/axis',
    body:`<p>
-     The 256³ cube in GPU memory is a <strong>window</strong>, not the world.
+     The <code>kWorldN³</code> cube in GPU memory is a <strong>window</strong>, not the world.
      World coordinates are unbounded signed integers; world chunk <code>c</code>
-     lives in slot <code>c mod 16</code> per axis — a bitmask, since every size
+     lives in slot <code>c mod kNChunk</code> per axis — a bitmask, since every size
      is a power of two, correct for negative coordinates too. The buffer never
      shifts in memory: moving the window recycles the trailing plane of slots in
      place.
@@ -6631,7 +7978,7 @@ const ENG_STAGES=[
    </p></div>`},
 
   {key:'compact',tag:'gpu',label:'Dirty compaction',
-   desc:'Scans 4096 chunk flags into a dense list + indirect args',
+   desc:'Scans the per-chunk dirty flags into a dense list + indirect args',
    cost:'64 wg',
    body:`<p>
      The stage that makes the whole engine scale. It scans per-chunk dirty
@@ -6640,7 +7987,7 @@ const ENG_STAGES=[
      dispatches nothing.
    </p>
    <h4>Computation</h4>
-   <p><code>4096 / 64 = 64 workgroups</code> of 64 threads = 4,096 threads.
+   <p><code>kNumChunks / 64</code> workgroups of 64 threads, one thread per chunk slot.
      Fixed cost every tick — negligible.</p>
    <h4>Determinism note</h4>
    <p>List order is scheduling-dependent (<code>atomicAdd</code> append), but safe
@@ -6664,7 +8011,7 @@ const ENG_STAGES=[
 settled  (4 dirty):        ~46,700 thread-launches
 moderate (200 dirty):     ~2.3M
 heavy    (2000 dirty):    ~23.3M
-all      (4096 dirty):    ~47.8M</pre>
+all      (every chunk dirty)</pre>
    <h4>What each cell does</h4>
    <ul>
      <li><strong>Stamp check</strong> — prevents a voxel that already moved from acting again.</li>
@@ -6699,7 +8046,7 @@ at cap     ~524k thread-launches/tick</pre>`},
    body:`<p>
      Recomputes per-chunk occupancy — whether a chunk holds any voxels — used
      by the renderer for empty-space skipping and the CPU for collision routing.
-     Runs over the <em>compacted next-tick dirty list</em>, not all 4,096 chunks.
+     Runs over the <em>compacted next-tick dirty list</em>, not every chunk slot.
    </p>
    <p><code>sim_pick.wgsl</code> rides along as a single-thread dispatch for brush preview.</p>`},
 
@@ -6802,9 +8149,9 @@ const ENG_INVARIANTS=[
 
   {key:'sleep',tag:'inv',label:'Sleeping',
    desc:'Cost scales with activity, not world size',
-   cost:'4 / 4096 settled',
+   cost:'≤ 32 active',
    body:`<p>
-     "Sleeping is the product." A settled 256³ residency window simulates
+     "Sleeping is the product." A settled residency window simulates
      <strong>4 chunks</strong> — 0.1% of what's resident.
    </p>
    <h4>Mechanism</h4>
@@ -6816,14 +8163,19 @@ const ENG_INVARIANTS=[
    </p></div>`}
 ];
 
+// A RECORDED SNAPSHOT, not a live reading — and the pinned hash is the one
+// row here that has a machine-checked source of truth, so it names it rather
+// than restating a value that goes stale silently (this table claimed
+// 3dbdf3c1 long after tests/baseline.json said 7cfa2420).
 const ENG_BASELINE=[
-  ['determinism','PASS','hash 3dbdf3c1 over 200 ticks'],
+  ['determinism hash','7cfa2420','authoritative copy: <code>determinismHash</code> in <code>tests/baseline.json</code>'],
+  ['settled chunks','≤ 32','asserted by <code>--gate sleep</code>, out of <code>kNumChunks</code> slots'],
   ['sim (active)','0.25 ms/tick','brushes + explosions + particles'],
-  ['sim (settled)','0.746 ms/tick','includes full-world hash scan'],
-  ['sleep','4 / 4096','after 600 settle ticks, 0 particles'],
+  ['sim (settled)','0.746 ms/tick','includes the full-world hash scan on hash ticks'],
   ['render (shadows)','2.66 ms','376 fps @1080p'],
   ['render (no shadows)','1.41 ms','709 fps @1080p'],
-  ['tick budget','33.3 ms','30 Hz — sim uses ~0.8%'],
+  ['tick budget','33.3 ms','30 Hz'],
+  ['regenerate','<code>--selftest --json out.json</code>','and <code>--measure</code> for per-pass GPU timings'],
 ];
 
 let engSock=null,engDemoTimer=null,engLive=false;
@@ -7027,49 +8379,82 @@ function renderEngine(){
 
   const wrap=el('div',{class:'eng-wrap'});
 
-  // Header
+  // Header. Sizes are stated as CONSTANT NAMES, not as numbers: this block
+  // said "256³ / 4096 chunks" for as long as it took someone to notice that
+  // kWorldN had become 512, and a wrong number here is worse than no number.
   wrap.appendChild(el('div',{style:'padding:24px 0 16px;border-bottom:1px solid var(--line)'},
     el('h1',{style:'margin:0 0 6px;font-size:24px;letter-spacing:-.02em'},'Engine Architecture'),
     el('p',{class:'note',style:'margin:8px 0 0'},
-      'A 3D falling-sand voxel engine: a GPU-resident cellular automaton over a 256³ ',
+      'A 3D falling-sand voxel engine: a GPU-resident cellular automaton over a ',
       el('strong',{},'toroidal residency window'),
-      ' into an infinite streamed, procedurally generated world, raymarched directly from the simulation buffers. Expand any stage for its mechanism, computation counts, and limits.'),
+      ' into an infinite streamed, procedurally generated world, raymarched directly from the simulation buffers. ',
+      'Click any box in the map for its files, symbols, constants and selftest gates; the ',
+      el('strong',{},'Module index'),
+      ' below the map is the same content as plain text.'),
     el('div',{class:'eng-meta'},
-      el('span',{},'resident ',el('b',{},'256³'),' = 16.7M voxels, world ',el('b',{},'infinite')),
-      el('span',{},'chunks ',el('b',{},'4096'),' × 16³'),
+      el('span',{},'window ',el('b',{},'kWorldN³'),' voxels (world.h)'),
+      el('span',{},'chunks ',el('b',{},'kNumChunks'),' × kChunk³'),
+      el('span',{},'voxel ',el('b',{},'kVoxelMeters'),' m'),
       el('span',{},'tick ',el('b',{},'30 Hz')),
-      el('span',{},'sim ',el('b',{},'0.25 ms'),' active'),
-      el('span',{},'render ',el('b',{},'2.66 ms'),' @1080p'),
-      el('span',{},'RTX 3060 Ti')
+      el('span',{},'pinned hash ',el('b',{},'tests/baseline.json'))
     )
   ));
 
   // Architecture diagram
   wrap.appendChild(el('h2',{},'Architecture map'));
-  wrap.appendChild(el('p',{class:'note'},'Click any node to see its details. Click group nodes (▶) to expand/collapse sub-systems. Drag to pan.'));
+  wrap.appendChild(el('p',{class:'note'},
+    'Click a box to open its detail panel. Boxes marked ▸/▾ are groups — clicking one unfolds it in place; ',
+    'nothing else moves out of the way, so you keep your bearings. Drag to pan, scroll to zoom, ',
+    'hover a box to light up its connections, ⛶ for fullscreen, Esc to close.'));
   const archControls=el('div',{class:'arch-controls'},
     el('button',{onclick:()=>archCollapseAll()},'collapse all'),
     el('button',{onclick:()=>archExpandLevel(1)},'level 1'),
     el('button',{onclick:()=>archExpandLevel(2)},'level 2'),
     el('button',{onclick:()=>archExpandAll()},'expand all'),
+    el('input',{type:'search',id:'arch-search',placeholder:'search modules, files, symbols…',
+      spellcheck:'false',
+      style:'font:12px/1 var(--mono);background:var(--card);border:1px solid var(--line);'+
+            'border-radius:5px;color:var(--fg);padding:5px 9px;width:260px;margin-left:6px',
+      oninput(e){archSearch(e.target.value);}}),
+    el('span',{id:'arch-search-count',style:'font:11px/1 var(--mono);color:var(--faint)'}),
+    el('span',{class:'arch-viewctl'},
+      el('button',{onclick:archZoomIn,title:'Zoom in'},'+'),
+      el('button',{onclick:archZoomOut,title:'Zoom out'},'−'),
+      el('button',{onclick:archFit,title:'Fit the whole map in view'},'fit'),
+      el('button',{class:'arch-fs-btn',onclick:archToggleFullscreen,title:'Fullscreen (Esc to exit)'},'⛶')
+    ),
     el('span',{class:'spacer'}),
+    el('button',{id:'arch-copyall',onclick:()=>archCopyAll(),
+      title:'Copy the whole map — every module, path, symbol, constant and gate — as markdown'},
+      'copy map as markdown'),
     el('span',{class:'arch-legend'},
       el('span',{},el('i',{style:'background:#4c9aff'}),' GPU'),
       el('span',{},el('i',{style:'background:#f2a65a'}),' CPU'),
       el('span',{},el('i',{style:'background:#c792ea'}),' Transfer'),
       el('span',{},el('i',{style:'background:#5ed3a5'}),' Render'),
-      el('span',{},el('i',{style:'background:#f2726f'}),' Invariant')
+      el('span',{},el('i',{style:'background:#f2726f'}),' Verification')
     )
   );
   wrap.appendChild(archControls);
   const archWrap=el('div',{class:'arch-graph-wrap'},
-    el('div',{class:'arch-graph-inner',id:'arch-graph'},
-      el('div',{style:'color:var(--dim);padding:40px;text-align:center'},'Loading architecture diagram...')
-    ),
+    el('div',{class:'arch-graph-inner',id:'arch-graph'}),
     el('div',{class:'arch-detail',id:'arch-detail'})
   );
   wrap.appendChild(archWrap);
   setTimeout(archRender,0);
+
+  // Flat module index — the text-only view of the same data.
+  wrap.appendChild(el('h2',{},'Module index'));
+  wrap.appendChild(el('p',{class:'note'},
+    'Every node of the map above, flattened. This exists because an agent reading this page ',
+    'cannot click anything: the graph is for humans, this table is the machine-readable copy. ',
+    'Constants are named rather than valued on purpose — grep the header, do not trust a number ',
+    'transcribed into a web page.'));
+  const idxWrap=el('div',{class:'tablewrap',style:'max-height:560px;overflow-y:auto;overflow-x:hidden'});
+  const idxTbl=el('table',{class:'arch-index',style:'min-width:0'});
+  idxTbl.innerHTML=archBuildIndex();
+  idxWrap.appendChild(idxTbl);
+  wrap.appendChild(idxWrap);
 
   // Pipeline flow
   wrap.appendChild(el('h2',{},'Per-tick pipeline'));
@@ -7091,7 +8476,9 @@ function renderEngine(){
 
   // Measured baseline table
   wrap.appendChild(el('h2',{},'Measured baseline'));
-  wrap.appendChild(el('p',{class:'note'},'From --selftest on an RTX 3060 Ti. Live telemetry replaces these with running measurements.'));
+  wrap.appendChild(el('p',{class:'note'},'A recorded snapshot from --selftest on an RTX 3060 Ti — not a live reading. ',
+    'Connecting telemetry (top of this page) replaces the timings with running measurements. ',
+    'Any number measured while a second sandvox.exe was running is garbage: the same gate has read 101, 14 and 127 ms.'));
   const tbl=el('table',{class:'eng-body',style:'margin:0 0 20px'});
   tbl.innerHTML='<tr><th>Metric</th><th>Value</th><th>Notes</th></tr>'+
     ENG_BASELINE.map(([m,v,n])=>`<tr><td>${m}</td><td>${v}</td><td>${n}</td></tr>`).join('');
@@ -7152,7 +8539,20 @@ function renderEngine(){
 }
 
 window.addEventListener('resize',()=>{
-  if(activeTab==='engine')Object.keys(engHistory).forEach(engDrawSpark);
+  if(activeTab!=='engine')return;
+  Object.keys(engHistory).forEach(engDrawSpark);
+  // The graph is fitted to the viewport, so a resize invalidates the fit.
+  archFit();
+});
+
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape'||activeTab!=='engine')return;
+  // Fullscreen first, then the panel — one Esc should undo one thing.
+  const wrap=document.querySelector('.arch-graph-wrap.arch-fullscreen');
+  if(wrap){archToggleFullscreen();e.preventDefault();return;}
+  if(document.getElementById('arch-detail')?.classList.contains('open')){
+    archCloseDetail();e.preventDefault();
+  }
 });
 
 })();
