@@ -103,6 +103,11 @@ std::string ShaderConstantPrelude() {
   o << "const FAR_MASK : i32 = " << (kFarN - 1) << ";\n";
   o << "const FAR_NCHUNK_MASK : i32 = " << (kFarNChunk - 1) << ";\n";
   o << "const FAR_SHIFT_BASE : u32 = " << kFarShiftBase << "u;\n";
+  // Fluid-lab flat-slab ground height (world.h kLabSlabY): the y the lab
+  // worldgen mode fills up to, and the value World::TerrainHeight returns in
+  // lab mode. Emitted here so the shader guard and the CPU mirror share one
+  // number (docs/PLAN_fluid_overhaul.md §4).
+  o << "const LAB_SLAB_Y : i32 = " << kLabSlabY << ";\n";
   // Render-only: the sim never reads it, so voxel state stays integer and
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);

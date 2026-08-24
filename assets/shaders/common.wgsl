@@ -315,7 +315,10 @@ struct TickParams {
   // readback uses). The seam's mirrorFold packs excited-fluid occupancy for
   // these 27 chunks — the swimming query's view of the particles.
   mirrorBase : vec3<i32>,
-  padMb      : u32,
+  // Fluid-lab worldgen mode (world.h kLabSlabY): 1 = genColumn generates the
+  // flat stone slab, 0 = normal terrain. Rides the tick stream like dayPhase;
+  // always 0 outside --lab/--fluid-bench (it was the padMb pad word).
+  labMode    : u32,
 };
 
 // ---- day phase helpers (integer; sim-side) ----

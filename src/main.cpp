@@ -34,6 +34,7 @@
 #include "gpu/resources.h"
 #include "gpu/vk_info.h"
 #include "gpu/vk_smoke.h"
+#include "lab/lab.h"
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -1394,6 +1395,14 @@ int main(int argc, char** argv) {
   uint16_t telemetryPort = 8080;
   std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
+  // The fluid lab (docs/PLAN_fluid_overhaul.md §4): `--lab [scene]` runs the
+  // windowed game on the flat-slab lab world with the named scripted scene
+  // (default basin); `--fluid-bench [scene|hill0|all]` is the headless timing
+  // harness. Both flip World::SetLabWorld — the worldgen mode tap.
+  bool labFlag = false;
+  std::string labSceneName = "basin";
+  bool fluidBench = false;
+  std::string fluidBenchScene = "all";
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -1414,6 +1423,16 @@ int main(int argc, char** argv) {
     if (a == "--baseline" && i + 1 < argc) stOpt.baselinePath = argv[++i];
     if (a == "--shot") shot = true;  // screenshots only (look iteration)
     if (a == "--shot-fluid") shotFluid = true;  // MPM water look shots
+    // Fluid lab modes. The scene argument is optional (it must not start
+    // with '-' or it is the next flag).
+    if (a == "--lab") {
+      labFlag = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') labSceneName = argv[++i];
+    }
+    if (a == "--fluid-bench") {
+      fluidBench = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') fluidBenchScene = argv[++i];
+    }
     // `--frames N` runs the WINDOWED game for N frames, fires one F5 shader
     // reload midway, and exits cleanly — the phase-4b D3 verification harness.
     if (a == "--frames" && i + 1 < argc) g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
@@ -1513,6 +1532,18 @@ int main(int argc, char** argv) {
     if (a == "--vk-validation") vkValidation = true;
   }
 
+  // Fluid-lab world mode, set ONCE before anything reads terrain: gates every
+  // TickParams.labMode write and the CPU TerrainHeight mirror together.
+  // --selftest and the smokes never pass through here with it set, so the
+  // pinned hash 7cfa2420 stays a labMode=0 fact.
+  const int labScene = labFlag ? LabSceneFromName(labSceneName) : -1;
+  if (labFlag && labScene < 0) {
+    std::fprintf(stderr, "--lab: unknown scene '%s' (want basin|hill|faucet|"
+                 "pool|slosh)\n", labSceneName.c_str());
+    return 1;
+  }
+  if (labFlag || fluidBench) World::SetLabWorld(true);
+
   // --list is pure metadata: answering it before any device or asset init
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
@@ -1541,6 +1572,12 @@ int main(int argc, char** argv) {
     LoadTuning(assetDir + "/materials/tuning.json", tune);
     for (const std::string& w : tune.warnings)
       std::fprintf(stderr, "tuning: %s\n", w.c_str());
+    // The windowed lab always exercises the full excite/settle loop:
+    // fluidExciteMode is the one live CPU-read fluid knob (consumed per tick
+    // in EncodeTick's input stream), so this is a runtime force, not a file
+    // edit — tuning.json keeps the shipped default. --fluid-bench sets it
+    // per scene itself.
+    if (labScene >= 0) tune.sim.fluidExciteMode = 1;
     SetCurrentTuning(tune);
   }
   std::vector<MaterialDef> mats;
@@ -1603,7 +1640,7 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !measure && shotMob.empty()) {
+  if (!selftest && !shot && !measure && !fluidBench && shotMob.empty()) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -1611,8 +1648,11 @@ int main(int argc, char** argv) {
   }
 
   GpuContext ctx;
-  if (!ctx.Init(window, 1600, 900, lowPowerAdapter, /*wantTimestamps=*/measure,
-                backend, vkValidation, sledgehammer))
+  // Timestamps: --measure and --fluid-bench are the only modes that request
+  // the TimestampQuery device feature (per-pass GPU timings).
+  if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
+                /*wantTimestamps=*/measure || fluidBench, backend, vkValidation,
+                sledgehammer))
     return 1;
 
   Telemetry telemetry;
@@ -1675,6 +1715,9 @@ int main(int argc, char** argv) {
   if (measure) return RunMeasure(ctx, world, sim);
   if (shot) return RunShots(ctx, world, sim);
   if (shotFluid) return RunFluidShot(ctx, world, sim, mats);
+  if (fluidBench)
+    return RunFluidBench(ctx, world, sim, mats, fluidBenchScene,
+                         stOpt.jsonPath);
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);
   if (selftest) {
@@ -1751,6 +1794,19 @@ int main(int argc, char** argv) {
   for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
   int spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
   player.pos = Vec3{140, (float)(spawnH + 10), 140};
+  // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
+  // bench renders from, so what is judged live and what is measured headless
+  // are the same framing.
+  if (labScene >= 0) {
+    Vec3 labEye;
+    float labYaw = 0, labPitch = 0;
+    LabSceneCamera(labScene, labEye, labYaw, labPitch);
+    player.pos = labEye;
+    cam.yaw = labYaw;
+    cam.pitch = labPitch;
+    player.fly = true;
+    ui.fly = true;
+  }
   // seed the far-field cascades around spawn (coarsest first; the queue
   // drains at kFarListCap level-chunks per tick through SubmitTick)
   far.FullRefill({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
@@ -1768,7 +1824,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
@@ -1843,6 +1899,20 @@ int main(int argc, char** argv) {
   // Last tick the MPM fluid was live: keeps the particle passes awake for the
   // splash droplets (see particlesActive below).
   uint32_t lastFluidTick = 0;
+  // ---- fluid lab (lab/lab.h) ----
+  // labTick is the SCENE clock: 1-based from worldgen (or the last L reset),
+  // driving the build-op and pour schedules. Resetting it to 0 IS the scene
+  // reset — the next sim tick re-submits the build ops (which cover the whole
+  // scene volume, air included) and the pour replays identically, while the
+  // world outside the scene box is untouched (no re-worldgen).
+  uint32_t labTick = 0;
+  // tuning.json watcher (~4 Hz, lab only): mtime of the file content this
+  // process last LOADED (or wrote). A newer file on disk triggers the F5
+  // path; the ImGui writeback refuses to clobber anything newer than this.
+  const std::string labTuningPath = assetDir + "/materials/tuning.json";
+  int64_t labTuningMtime =
+      labScene >= 0 ? LabFileMtimeNs(labTuningPath) : -1;
+  double labWatchPoll = 0.0;
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
@@ -1914,6 +1984,22 @@ int main(int argc, char** argv) {
     glfwGetFramebufferSize(window, &fbw, &fbh);
     if (fbw > 0 && fbh > 0 && ((uint32_t)fbw != ctx.width || (uint32_t)fbh != ctx.height))
       ctx.Resize(fbw, fbh);
+
+    // ---- lab tuning watcher (plan §4.3) ----
+    // Poll tuning.json's mtime at ~4 Hz and run the existing F5 path on any
+    // change, so a tuner.html save reaches the running lab within a second
+    // (the sim.fluid* WGSL consts recompile through ReloadShaders exactly as
+    // a manual F5 would). The mtime is recorded HERE, before the reload runs,
+    // so a slow reload cannot re-trigger itself.
+    if (labScene >= 0 && now - labWatchPoll > 0.25) {
+      labWatchPoll = now;
+      const int64_t m = LabFileMtimeNs(labTuningPath);
+      if (m >= 0 && m != labTuningMtime) {
+        labTuningMtime = m;
+        std::printf("lab: tuning.json changed on disk — reloading (F5 path)\n");
+        ui.reloadShaders = true;
+      }
+    }
 
     // ---- input ----
     auto key = [&](int k) { return glfwGetKey(window, k) == GLFW_PRESS; };
@@ -2022,6 +2108,15 @@ int main(int argc, char** argv) {
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
     if (captured && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
+    // L (lab only) resets the scene: scene clock to zero + fluid cleared, so
+    // the next tick re-submits the build CellOps and the pour replays from
+    // its fixed schedule — an identical A/B run without regenerating the
+    // world (plan §4.2's reset key).
+    if (labScene >= 0 && captured && eL.Pressed(key(GLFW_KEY_L))) {
+      labTick = 0;
+      ui.clearFluid = true;
+      std::printf("lab: scene reset (%s)\n", LabSceneName(labScene));
+    }
     // C cycles first -> third -> over-shoulder. Snapping the rig on a change
     // stops the boom easing across the world when the mode flips.
     if (captured && eC.Pressed(key(GLFW_KEY_C))) {
@@ -2123,6 +2218,15 @@ int main(int argc, char** argv) {
         LoadTuning(assetDir + "/materials/tuning.json", tune);
         for (const std::string& w : tune.warnings)
           std::fprintf(stderr, "tuning: %s\n", w.c_str());
+        // Lab: the excite/settle loop stays on across reloads (the same
+        // runtime force the startup load applies — the file's shipped
+        // default is not the lab's default). Track the mtime we just
+        // consumed so the watcher and the ImGui writeback agree on what
+        // "newer on disk" means.
+        if (labScene >= 0) {
+          tune.sim.fluidExciteMode = 1;
+          labTuningMtime = LabFileMtimeNs(labTuningPath);
+        }
         SetCurrentTuning(tune);
         {
           const auto& fs = tune.sim;
@@ -2259,6 +2363,17 @@ int main(int argc, char** argv) {
       world.SetWindowOrigin({0, 0, 0});
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
       player.pos = Vec3{140, (float)(spawnH + 10), 140};
+      // Lab: a regen wipes the scene structure, so restart the scene clock
+      // (build ops re-land on the next tick) and return to the scene pose.
+      if (labScene >= 0) {
+        labTick = 0;
+        Vec3 labEye;
+        float labYaw = 0, labPitch = 0;
+        LabSceneCamera(labScene, labEye, labYaw, labPitch);
+        player.pos = labEye;
+        cam.yaw = labYaw;
+        cam.pitch = labPitch;
+      }
       player.viewYOffset = 0.0f;  // teleport: never smooth across it
       tick = 0;
       grenades.clear();
@@ -2557,6 +2672,10 @@ int main(int argc, char** argv) {
 
       // mob spawn (mob tool LMB, or M): drop the selected def at the picked
       // surface, feet on the last empty cell
+      // The lab is mob-free by design (plan §4.1): a wandering mob is exactly
+      // the confounding load the lab exists to exclude. Consume the request
+      // so it cannot latch across a mode where it would fire.
+      if (labScene >= 0) ui.spawnMob = false;
       if (ui.spawnMob) {
         ui.spawnMob = false;
         const WorldSnapshot& msnap = world.Snap();
@@ -2966,6 +3085,17 @@ int main(int argc, char** argv) {
       // (may add cell ops and particle spawns from shattered bodies)
       std::vector<CellOp> cellOps;
       debris.PreTick(tick, world, cellOps, spawns);
+      // ---- fluid lab scene driver (lab/lab.h) ----
+      // Advances the scene clock once per SIM tick (never per frame): the
+      // build CellOps land on scene tick 1 and the pour follows its fixed
+      // schedule, so a run — and every L-reset replay — is deterministic.
+      // Pour budget is charged against the live estimate before emission,
+      // the same rule as the mpm tool above.
+      if (labScene >= 0) {
+        labTick++;
+        LabSceneBuildOps(labScene, labTick, fluidCueMat, cellOps);
+        LabScenePour(labScene, labTick, fluidCount, fluidCueMat, fluidSpawns);
+      }
       // laser kerf into a body, deferred from the input block above so it can
       // reach `spawns` (a cut that severs the body sheds the loose bits)
       if (laserCut.body) {
@@ -3580,6 +3710,13 @@ int main(int argc, char** argv) {
         t.sim.fluidExciteMode  = ui.fExciteMode;
         SetCurrentTuning(t);
         sim.ReloadShaders(ctx.device);
+        // Lab only: an explicit ImGui edit is the ONE thing that may write
+        // tuning.json while the file watcher is live, and only when the file
+        // on disk is not newer than what this process last loaded — the
+        // running-app-clobbers-tuning-json gotcha, resolved as last-writer-
+        // wins with an mtime check (plan §4.3). Non-lab sessions keep the
+        // old behaviour: never write the file at all.
+        if (labScene >= 0) LabPatchTuningJson(labTuningPath, t, &labTuningMtime);
       }
 
       // grenades render as emissive sprite cubes (flash as the fuse runs out)

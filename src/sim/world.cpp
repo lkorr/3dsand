@@ -508,7 +508,16 @@ static int vnoise(int x, int z, int cs, uint32_t seed) {
 // Must stay bit-identical to baseHeight() in worldgen.wgsl, INCLUDING the
 // horizontal scale factor — kHScale here is that shader's HSCALE.
 static constexpr int kHScale = 1;
+// Fluid-lab flat-slab mode (world.h kLabSlabY). Process-wide, set once at
+// startup by --lab / --fluid-bench, mirrored to the GPU as TickParams.labMode.
+static bool sLabWorld = false;
+void World::SetLabWorld(bool on) { sLabWorld = on; }
+bool World::LabWorld() { return sLabWorld; }
 int World::TerrainHeight(int x, int z, uint32_t seed) {
+  // Lab slab: the same guard genColumn takes in worldgen.wgsl. Before the
+  // tuning reads on purpose — the lab surface must not move when worldgen
+  // knobs are tuned, or every scene's fixture heights drift.
+  if (sLabWorld) return kLabSlabY;
   // Amplitudes/wavelengths come from tuning.json so this cannot drift from the
   // shader when they are tuned: baseHeight() reads the same values through the
   // generated TUNE_* prelude. Integer math throughout, matching the shader

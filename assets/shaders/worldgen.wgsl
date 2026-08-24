@@ -1819,6 +1819,32 @@ struct Col {
 };
 
 fn genColumn(x : i32, z : i32, seed : u32) -> Col {
+  // ---- the fluid lab's flat slab (world.h kLabSlabY; PLAN_fluid_overhaul §4)
+  // One guard, HERE, covers every worldgen consumer — genChunk (full + list),
+  // genCell and with it the far cascades — because they all come through this
+  // column function. The Col it returns is chosen so genCellIn's existing
+  // gates suppress every feature without a second tap there:
+  //   inPoolFloor = true  -> plain stone body, no snow cap, no grass skin
+  //   inRim       = true  -> no caves, no trees, no undergrowth
+  //   pond = -1, fluid = air, shore off -> no water, no pond/shore life
+  // World::TerrainHeight takes the same branch on the CPU, so collision,
+  // spawns and mob probes see exactly this slab. T.labMode is 0 on every
+  // non-lab path, making this a dead branch for the pinned world hash.
+  if (T.labMode != 0u) {
+    var lab : Col;
+    lab.h = LAB_SLAB_Y;
+    lab.biome = 0u;
+    lab.pond = -1;
+    lab.pw = vec2<i32>(-1, -1);
+    lab.fluid = MAT_AIR;
+    lab.fluidTop = -1;
+    lab.inPoolFloor = true;
+    lab.inRim = true;
+    lab.shore.onShore = false;
+    lab.shore.past = 0;
+    lab.shore.surf = -1;
+    return lab;
+  }
   var h = baseHeight(x, z, seed);
   var fluidTop = -1;     // top of any standing fluid at this column
   var fluid = MAT_AIR;

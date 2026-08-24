@@ -680,6 +680,27 @@ them voxels, which DO persist normally). The CA liquid movement rules are
 still live — Phase 3 (deleting them, flipping `fluidExciteMode` default,
 re-baselining the pinned hash) is a separate, later step.
 
+**The fluid lab (2026-08-24; `src/lab/`, docs/PLAN_fluid_overhaul.md §4).**
+The dedicated place fluid is looked at, tuned and benchmarked. `--lab
+[basin|hill|faucet|pool|slosh]` runs the windowed game on a flat-slab world:
+`TickParams.labMode` (the old padMb pad word) guards `genColumn` in
+worldgen.wgsl — one branch covers full worldgen, streamed genList refills and
+the far cascades; `World::TerrainHeight` mirrors it CPU-side; `kLabSlabY`
+(world.h → prelude `LAB_SLAB_Y`) is the shared ground height. NOT a fork of
+genChunk, and always 0 outside lab modes, so the pinned hash is a labMode=0
+fact. Scenes are CellOp builds + `FluidSpawnOp` pours on fixed tick
+schedules (the mpm tool's spawn shape; budgets charged before emission); L
+re-runs the scene from the post-worldgen state without regenerating. The lab
+forces `sim.fluidExciteMode=1` at runtime, watches tuning.json's mtime (~4
+Hz) and applies changes through the F5 path; ImGui fluid-slider edits write
+back into tuning.json (text-surgical, lab mode only, refused when the file
+on disk is newer — last-writer-wins by mtime). `--fluid-bench
+[scene|hill0|all]` is the headless twin: fixed camera, passtimer per-pass
+GPU ms, frame percentiles, live/active-block curves, tick-of-settle and the
+FA_* mass ledger (eighths in == standing + carried, day phase pinned) as
+JSON + a per-scene screenshot. WP2–WP4 changes quote before/after from it;
+the 2026-08-24 baselines live in the plan's §9.
+
 ---
 
 ## 6. Material & Interaction Authoring (the moddable core)
