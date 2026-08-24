@@ -857,6 +857,14 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (voxStamp(w) == stampFor(T.tick, P.substep)) { return; }  // already acted this substep
 
   let m = materials[mat];
+  // Provably inert cell: no reaction bucket, no staining, and a SOLID class, so
+  // every branch below is skipped and nothing is written. Structurally a no-op
+  // — the three tests it folds are each still there underneath — but it is the
+  // SAME predicate worldgen's streaming wake refuses on (matCanAct, common.wgsl),
+  // and having one function stand for "this cell cannot act" is what keeps the
+  // two from drifting. If a future rule lets a plain solid do something, this
+  // return is where it breaks first, loudly, in the world hash.
+  if (!matCanAct(m)) { return; }
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).

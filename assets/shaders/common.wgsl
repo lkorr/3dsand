@@ -87,6 +87,37 @@ fn matWashes(m : Material) -> bool { return (m.stainPack & 0x80000000u) != 0u; }
 // can reject the overwhelmingly common "no" before doing any other work.
 fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
 
+// Can a cell of this material do ANYTHING on its own — move, react, or stain?
+//
+// This is the sleep predicate (CLAUDE.md rule 2) expressed once, and its two
+// callers are deliberately opposite ends of the same statement:
+//
+//   * sim_step's main() returns immediately when it is false. That return is a
+//     no-op refactor of what the kernel already did — a cell with no reaction
+//     bucket skips doReactions, a non-staining cell skips doStaining, and a
+//     SOLID then hits `if (m.klass == CLASS_SOLID) { return; }` having written
+//     nothing. Routing it through this one function is what makes the claim
+//     "this cell cannot act" a property of the code rather than of a reading.
+//   * worldgen's genChunk refuses to WAKE a chunk in which no cell satisfies
+//     it (the streaming wake). Because sim_step provably does nothing for such
+//     a chunk, dispatching it or not is bit-identical — which is why the world
+//     hash is the gate on that change.
+//
+// CONSERVATIVE DIRECTION: false must mean "provably inert". Every clause is
+// therefore the WIDEST reading of its half — any reaction bucket at all counts
+// (not "a bucket with an unconditional rule"), and every non-solid class counts
+// whether or not it has anywhere to go. Being woken and doing nothing costs one
+// tick; not being woken when you could have acted is frozen matter.
+//
+// NOT covered here, and not needing to be: a cell CHANGED BY A NEIGHBOUR. The
+// CA's write reach is <= 1 cell, so the actor is at most one cell away, its own
+// chunk satisfies this predicate, and markDirty marks every chunk that cell
+// borders. The passive side is woken by the actor, exactly as it is for every
+// other wake in the engine.
+fn matCanAct(m : Material) -> bool {
+  return m.klass != CLASS_SOLID || m.reactCount > 0u || matStains(m);
+}
+
 // Is this a VISCOUS liquid — blood, and anything authored like it?
 //
 // Render-side classification, and it is deliberately made of AUTHORED DATA

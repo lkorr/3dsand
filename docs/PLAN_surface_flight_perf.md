@@ -126,6 +126,103 @@ visible: ~0.2 fps — cost scales with how much world the camera can *see*.
 > overlapping the GPU. Part A items are now the honest targets again, against a ~9-10 ms
 > offscreen renderer.
 
+> **CORRECTION 4 (2026-08-24). The 550 active chunks are a settling transient that lasts
+> ~2,700 ticks, and it is LAVA. Narrowing the streaming wake by material is correct, is
+> bit-identical, and buys nothing.**
+>
+> Two questions were asked in order, and the first one's answer made the second one's
+> answer a foregone conclusion — which is the useful part of the record.
+>
+> **Q1: does the surface hold 550 active chunks because something never sleeps?** No.
+> `--autofly-park` (main.cpp) is `--autofly-surface` that flies 300 ticks out to
+> representative terrain and then STOPS DEAD — no forward motion, one frozen altitude
+> regime, so the window stops shifting entirely and the only thing left in the count is
+> what has not settled. Parked, with `SANDVOX_PARK_SETTLE=3000`:
+>
+> ```
+> t375  630     t975  363     t1575 193     t2175 114     t2775  46
+> t675  486     t1275 275     t1875 164     t2475  76     t3300  34
+> ```
+>
+> Monotonic decay to ~30, which is the `sleep` gate's ≤32 budget. So it settles — but the
+> half-life is ~700 ticks (23 s), not the ~1.5 ticks the "each shift wakes ~500, they
+> settle immediately" arithmetic assumed. The probe fetches the still-active chunks'
+> voxels through the ordinary on-demand fetch ring and histograms them against an
+> equal-sized idle control:
+>
+> ```
+> lava    active 97.1%   idle  4.2%      active-by-worldChunkY: -7:2 -6:17 -5:15
+> stone   active 100%    idle 90.5%
+> ```
+>
+> One band, world chunk Y −7..−3, which is `caveAt`'s deep-cavern lava (`worldgen.wgsl`,
+> `cv == 2`, `y <= f2 + 2 && m2 > 190`). Worldgen writes it as a **3-voxel FULL-fullness
+> slab on a noisy cavern floor**, so it spends ~90 s of sim time flowing out to rest, and
+> **every window shift regenerates it unsettled**. A ~550 steady state under sustained
+> flight is exactly what that looks like. Mid-flight the split is about half this lava
+> band and half surface ponds (water 53%, sand 40%, lilypad/kelp/reed).
+>
+> **The lever this exposes, which nobody has pulled:** worldgen could lay that lava down
+> already at rest. Placing it level and at a fullness the CA will not immediately move
+> would let those chunks sleep after one tick like the stone around them. Bounding how
+> long generated matter takes to settle is a worldgen-authoring question, not a CA one.
+>
+> **Q2: is `n > 0` too wide a streaming wake?** Yes as a predicate, no as an
+> optimisation. `genChunk` woke every generated chunk holding any matter; it now wakes
+> only chunks in which some cell satisfies `matCanAct` (`common.wgsl` — non-solid class,
+> or a reaction bucket, or staining). The same function is what `sim_step`'s `main()`
+> returns on, so a chunk that fails it is one where every thread of every colour pass
+> returns before writing: dispatching it and not dispatching it are bit-identical, and
+> `7cfa2420` held.
+>
+> The population is large and the win is zero:
+>
+> ```
+> all-inert chunks (matCanAct false everywhere)   active 3/177    idle 134/183
+> post-worldgen active chunks, all 32,768 slots, IDENTICAL BOTH WAYS:
+>   old (n > 0)   t2 254  t3 169  t4 159  t5 148
+>   new (canAct)  t2 254  t3 169  t4 159  t5 148
+> ```
+>
+> **73% of non-empty chunks are all-inert and 1.7% of ACTIVE ones are** — which is the
+> whole answer. The chunks the predicate declines to wake were already sleeping after
+> ONE tick; the steady state is made of chunks that genuinely can act, and no
+> conservative predicate can refuse those. What the transient costs is set by RESIDENCE
+> TIME, not by how many chunks are woken: ~320 inert chunks x 1 tick against ~500 lava
+> and pond chunks x hundreds.
+>
+> **Two measurement traps this walked into, both worth inheriting.**
+>
+> 1. **`activeChunks` cannot see a one-tick wake, so it is the wrong instrument for
+>    this question.** `World::EncodeDirtyCopy` copies `DirtyNext` — `dirtyOut`, "active
+>    NEXT tick" — so a chunk woken by `genChunk`, dispatched once, and found inert has
+>    already cleared by the time it is sampled. The two predicates therefore produce
+>    **bit-identical active-chunk counts by construction**, which is exactly what the
+>    deterministic post-worldgen arm above shows. The work the change removes is in
+>    `dirtyIn` (one tick of 54 dispatches per generated inert chunk, ~320 per shift at
+>    ~1 shift/12 ticks = ~6 us/tick amortised) and no metric in the harness reports it.
+> 2. **`--autofly-surface` at `--frames 600` is not a repeatable route.** Forward motion
+>    is `dt`-integrated, so a faster arm flies FURTHER and over different terrain; the
+>    altitude is pinned analytically for precisely this reason and the forward axis
+>    never was. Five interleaved pairs gave active-chunk means of 506/489/368/365/492
+>    (old) against 415/364/293/352/500 (new) — a spread wider than any effect being
+>    looked for, and an early 2-run pair out of that spread read as a confident −20%.
+>    Trust the deterministic arm; treat a single 600-frame p50 as +-15%.
+>
+> **The bound on this whole line of work, measured:** with `genChunk`'s wake disabled
+> entirely (`wgAct > 99999`, an experiment, not a shippable state) `--autofly-surface`
+> reads **active p50/p95/max 0 and frame p50 16.6 ms against 25.6 for the same-session
+> control**. So the streaming wake is worth roughly 9 ms of a ~25 ms surface frame —
+> and that is the CEILING on everything in this section — but every one of those chunks
+> CAN act, so the whole 9 ms is reachable only by making generated matter settle faster
+> (Q1's lever), never by refusing to wake it. (That run also freezes streamed-in matter,
+> so it is a bound, not a candidate.)
+>
+> The narrowed predicate is kept anyway: it is one compare per non-air cell in a loop
+> that already reads `materials[m]`, it makes the sleep rule one function instead of two
+> readings of it, and its population grows with the plane size the 5 cm / 2048³ target
+> implies. It is recorded here as measuring **zero** so it is not re-measured hopefully.
+
 **Diagnosis in one line:** the frame cost is dominated by the raymarcher, whose per-ray
 cost scales linearly with ray length through non-empty chunks and which has **no LOD
 anywhere inside the 512³ window**; streaming adds a second, smaller cost that is specific

@@ -2745,11 +2745,16 @@ fn farSurfaceMat(mat : u32, fine : vec3<i32>, shift : u32, seed : u32) -> u32 {
 
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgBlock : atomic<u32>;
+// Cells in this chunk that can ACT (matCanAct, common.wgsl). Third counter
+// rather than a reuse of wgCount because occupancy needs the total and the
+// wake needs this one, and they are different questions about the same sweep.
+var<workgroup> wgAct : atomic<u32>;
 
 fn genChunk(slot : u32, li : u32) {
   if (li == 0u) {
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
+    atomicStore(&wgAct, 0u);
   }
   workgroupBarrier();
 
@@ -2758,6 +2763,7 @@ fn genChunk(slot : u32, li : u32) {
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
   var count = 0u;
   var block = 0u;
+  var act = 0u;
   // COLUMN-MAJOR, and that is the whole point of the genColumn/genCellIn
   // split: the column half is evaluated ONCE per (x, z) and shared by the 16
   // cells stacked on it, instead of being recomputed by every one of them.
@@ -2783,12 +2789,15 @@ fn genChunk(slot : u32, li : u32) {
       let m = w & 0xFFFu;
       if (m != MAT_AIR) {
         count += 1u;
-        if (isRayBlocker(materials[m])) { block += 1u; }
+        let md = materials[m];
+        if (isRayBlocker(md)) { block += 1u; }
+        if (matCanAct(md)) { act += 1u; }
       }
     }
   }
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
+  atomicAdd(&wgAct, act);
   workgroupBarrier();
 
   if (li == 0u) {
@@ -2801,7 +2810,30 @@ fn genChunk(slot : u32, li : u32) {
     // path relies on exactly that — a generated sky chunk has to be demotable
     // on sight, without a readback.
     occupancy[slot] = packOcc(n, atomicLoad(&wgBlock));
-    if (n > 0u) {          // wake once; loose material settles, then sleeps
+    // ---- THE STREAMING WAKE (CLAUDE.md rule 2) -------------------------
+    //
+    // Wake once so loose material settles and then sleeps. The question is
+    // WHICH chunks that has to mean, and `n > 0` — "it holds any matter at
+    // all" — was far wider than the answer: buried stone and static plant
+    // dressing cannot act, and a streamed-in vertical plane is mostly buried
+    // stone. Every one of those was a workgroup in all 54 CA dispatches for a
+    // tick, in the regime (~550 active chunks under surface flight) where
+    // ROADMAP_scale.md §3.0's PER-CHUNK term is 96% of the CA cost.
+    //
+    // The predicate is `matCanAct` (common.wgsl), evaluated over the cells
+    // this loop already visited with the material this loop already read, so
+    // it costs one compare per non-air cell. It is the SAME function sim_step
+    // returns on, which is what makes the change bit-identical rather than
+    // merely plausible: a chunk where no cell can act is a chunk where every
+    // thread of every colour pass would return before writing anything, so
+    // dispatching it and not dispatching it produce the same voxels, the same
+    // dirty set, and the same world hash. `7cfa2420` is the gate.
+    //
+    // NOT a claim that nothing can ever happen there. A cave-in, a brush edit,
+    // an explosion or an acting neighbour all wake the chunk through the
+    // ordinary paths (markDirty reaches every bordering chunk, and mutations
+    // set both flags themselves). This only declines to wake it AT BIRTH.
+    if (atomicLoad(&wgAct) > 0u) {
       atomicStore(&dirtyIn[slot], 1u);
       atomicStore(&dirtyOut[slot], 1u);
     } else {

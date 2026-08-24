@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -100,6 +101,215 @@ std::vector<double> g_frameMsLow, g_frameMsHigh;
 // genChunk just generated with matter), so it needs its own reading.
 std::vector<double> g_activeChunks;
 double g_harnessRenderMs = 0.0;
+
+// ---- --autofly-park: the active-chunk DECAY probe ---------------------------
+//
+// `--autofly-surface` measures ~550 active chunks at p50 while `--autofly-hard`
+// measures 0, and those two numbers admit two very different explanations:
+//
+//   (a) a SETTLING TRANSIENT — a window shift wakes every chunk genChunk just
+//       generated with matter (worldgen.wgsl's `n > 0` wake), so at ~0.7
+//       shifts/tick x ~500 woken chunks the steady state is just the pipeline
+//       of chunks that have not settled YET, and nothing is wrong; or
+//   (b) a rule that NEVER SLEEPS in the surface biomes (the failure mode
+//       documented at doReactions' keepAwake note), which the `sleep` gate
+//       cannot see because it tests the origin-area world.
+//
+// The two are separated by removing the shifts: fly out to representative
+// surface terrain, then STOP DEAD and watch the count. Decays to ~0 => (a);
+// plateaus => (b), and the plateau is the prize. Parking also freezes the
+// altitude regime, because the low/high alternation is a 115-voxel hop that is
+// itself a 7-chunk vertical window shift.
+//
+// ANSWER (2026-08-24, SANDVOX_PARK_SETTLE=3000): (a), and the mechanism is
+// worth keeping the probe for. Parked, the count decays MONOTONICALLY 630 ->
+// ~30 over ~2,700 ticks — a half-life near 700 ticks, not the ~1.5 ticks the
+// arithmetic behind (a) assumed. 97% of the survivors at every point along
+// that curve contain LAVA, and they sit in one band, world chunk Y -7..-3,
+// which is `caveAt`'s deep-cavern lava (worldgen.wgsl, `cv == 2`). Worldgen
+// lays that lava down as a 3-voxel FULL slab on a noisy cavern floor, so it
+// spends ~90 seconds of sim time flowing out to rest — and every window shift
+// regenerates it. Under sustained flight it is therefore permanently mid-
+// settle, which is what a ~550 steady state with no rule at fault looks like.
+// Nothing here never sleeps; the settle is just far longer than one tick.
+bool g_autoflyPark = false;
+constexpr uint32_t kParkFlyTicks = 300;    // fly this far out, then stop
+// Settle window, in ticks, before the sample is taken. Overridable because the
+// whole question is "does this decay or plateau", and one duration cannot
+// answer it: SANDVOX_PARK_SETTLE=3000 is what separates a very slow settle from
+// a rule that never sleeps.
+uint32_t ParkSettleTicks() {
+  static const uint32_t v = [] {
+    const char* e = getenv("SANDVOX_PARK_SETTLE");
+    return e ? (uint32_t)std::max(50, atoi(e)) : 400u;
+  }();
+  return v;
+}
+bool g_parkPosSet = false;
+bool g_parkDone = false;  // dump printed: the run has nothing left to measure
+Vec3 g_parkPos{};
+// World chunks whose voxels were requested for a sample, split by whether they
+// were still ACTIVE at request time. The inactive arm is the control: a
+// material that is in every active chunk is only a suspect if it is NOT in
+// every chunk. Cleared between the two samples.
+std::vector<IVec3> g_parkActiveIds, g_parkIdleIds;
+
+// Where the active chunks are and what they are made of, at one instant.
+// Split out from the schedule below because the SAME question has to be asked
+// twice: once MID-FLIGHT (the regime the 550-chunk p50 came from) and once
+// after the park has settled.
+void ParkSampleRequest(World& world, const char* label) {
+  const WorldSnapshot& s = world.Snap();
+  constexpr uint32_t kArm = 190;  // 2 x 190 < 2 x kFetchPerTick x ticks-to-dump
+  g_parkActiveIds.clear();
+  g_parkIdleIds.clear();
+  std::map<int, uint32_t> yhist;
+  uint32_t emptyActive = 0, totalActive = 0;
+  for (uint32_t i = 0; i < kNumChunks; i++) {
+    if (!s.dirtyFlags[i]) continue;
+    totalActive++;
+    if (s.occupancy[i] == 0) emptyActive++;
+    yhist[world.SlotToWorldChunk(i).y]++;
+  }
+  std::printf("park[%s]: %u active, %u of them EMPTY (occupancy 0)\n", label,
+              totalActive, emptyActive);
+  std::printf("park[%s]: active-by-worldChunkY:", label);
+  for (auto& kv : yhist) std::printf(" %d:%u", kv.first, kv.second);
+  std::printf("\n");
+  // Sample both arms with a STRIDE, not the first N: slot index runs x fastest
+  // then y then z, so taking a prefix samples one z-slab of the window and
+  // nothing else.
+  auto sample = [&](bool wantActive, std::vector<IVec3>& arm) {
+    uint32_t pool = 0;
+    for (uint32_t i = 0; i < kNumChunks; i++) {
+      const bool act = s.dirtyFlags[i] != 0;
+      if (act != wantActive) continue;
+      // Control arm is non-empty chunks only - comparing against sky would
+      // make every material look enriched.
+      if (!act && s.occupancy[i] == 0) continue;
+      pool++;
+    }
+    const uint32_t stride = pool > kArm ? pool / kArm : 1u;
+    uint32_t seenN = 0;
+    for (uint32_t i = 0; i < kNumChunks && arm.size() < kArm; i++) {
+      const bool act = s.dirtyFlags[i] != 0;
+      if (act != wantActive) continue;
+      if (!act && s.occupancy[i] == 0) continue;
+      if ((seenN++ % stride) != 0) continue;
+      const IVec3 wc = world.SlotToWorldChunk(i);
+      world.RequestChunkFetch(wc);
+      arm.push_back(wc);
+    }
+  };
+  sample(true, g_parkActiveIds);
+  sample(false, g_parkIdleIds);
+}
+
+void ParkSampleReport(World& world, const std::vector<MaterialDef>& mats,
+                      const char* label) {
+  auto tally = [&](const std::vector<IVec3>& ids, std::vector<uint32_t>& out,
+                   uint32_t& got) {
+    out.assign(mats.size(), 0u);
+    got = 0;
+    for (const IVec3& wc : ids) {
+      const CachedChunk* cc = world.Cached(wc);
+      if (!cc || cc->voxels.size() != kChunkVol) continue;
+      got++;
+      std::vector<uint8_t> seen(mats.size() + 1, 0);
+      for (uint32_t w : cc->voxels) {
+        const uint32_t m = w & 0xFFFu;
+        if (m != 0) seen[m < mats.size() ? m : mats.size()] = 1;
+      }
+      for (size_t m = 1; m < mats.size(); m++) out[m] += seen[m];
+    }
+  };
+  std::vector<uint32_t> a, b;
+  uint32_t na = 0, nb = 0;
+  tally(g_parkActiveIds, a, na);
+  tally(g_parkIdleIds, b, nb);
+  // Does an ALL-INERT chunk (matCanAct false for every cell in it) even exist
+  // in this world? That is the population worldgen's narrowed wake predicate
+  // can decline to wake, and if it is empty the predicate cannot pay whatever
+  // else is true. Same three tests as matCanAct in common.wgsl, on the CPU
+  // copy of the same table.
+  auto inertOnly = [&](const std::vector<IVec3>& ids) {
+    uint32_t n = 0, tot = 0;
+    for (const IVec3& wc : ids) {
+      const CachedChunk* cc = world.Cached(wc);
+      if (!cc || cc->voxels.size() != kChunkVol) continue;
+      tot++;
+      bool anyAct = false, anyMatter = false;
+      for (uint32_t w : cc->voxels) {
+        const uint32_t mi = w & 0xFFFu;
+        if (mi == 0 || mi >= mats.size()) continue;
+        anyMatter = true;
+        const MaterialGpu& g = mats[mi].gpu;
+        if (g.klass != CLASS_SOLID || g.reactCount > 0 ||
+            (g.stainPack & 0x7u) != 0) { anyAct = true; break; }
+      }
+      if (anyMatter && !anyAct) n++;
+    }
+    return std::pair<uint32_t, uint32_t>(n, tot);
+  };
+  {
+    auto ia = inertOnly(g_parkActiveIds), ib = inertOnly(g_parkIdleIds);
+    std::printf("park[%s]: all-inert chunks (matCanAct false everywhere): "
+                "active %u/%u  idle %u/%u\n", label, ia.first, ia.second,
+                ib.first, ib.second);
+  }
+  std::printf("park[%s]: material presence over %u ACTIVE vs %u IDLE chunks "
+              "(pct of chunks containing the material)\n", label, na, nb);
+  struct Row { double act, idle; size_t id; };
+  std::vector<Row> rows;
+  for (size_t m = 1; m < mats.size(); m++) {
+    if (a[m] == 0 && b[m] == 0) continue;
+    rows.push_back({na ? 100.0 * a[m] / na : 0.0,
+                    nb ? 100.0 * b[m] / nb : 0.0, m});
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) {
+    return (x.act - x.idle) > (y.act - y.idle);
+  });
+  for (const Row& r : rows) {
+    if (r.act - r.idle < 1.0 && r.act < 20.0) continue;  // noise floor
+    std::printf("park[%s]:   %-20s id %3zu  active %5.1f%%   idle %5.1f%%   "
+                "delta %+6.1f\n", label, mats[r.id].name.c_str(), r.id, r.act,
+                r.idle, r.act - r.idle);
+  }
+}
+
+// One-shot per-tick body of the park probe. Prints the decay curve, then at a
+// fixed tick pulls the still-active chunks' voxels back through the ordinary
+// on-demand fetch ring (64/tick, no blocking readback in the frame path) and
+// histograms which materials they contain against an equal-sized control.
+void ParkProbe(World& world, const std::vector<MaterialDef>& mats, uint32_t tick) {
+  const WorldSnapshot& s = world.Snap();
+  if (!s.valid) return;
+  // THE DETERMINISTIC ARM. Everything else here is measured under flight, and
+  // flight is a bad differential: the route is dt-integrated, so two runs of
+  // the same command fly over different terrain and the active-chunk mean
+  // moves +-15% between them — larger than the effects being tested. The
+  // FIRST FEW TICKS have no such problem. The initial worldgen covers all
+  // 32,768 chunks at a fixed origin, so "how many chunks did the wake
+  // predicate wake" is one exact number that does not vary at all between
+  // runs. Any change to that predicate shows up here first, and cleanly.
+  if (tick <= 6u)
+    std::printf("park: postgen t%u active %u (snap t%u)\n", tick,
+                s.activeChunks, s.tick);
+  // MID-FLIGHT sample, taken while the window is still shifting: this is the
+  // regime the 550-chunk p50 was measured in, and it is the one that decides
+  // whether narrowing genChunk's wake predicate is worth anything.
+  if (tick == kParkFlyTicks - 120u) ParkSampleRequest(world, "fly");
+  if (tick == kParkFlyTicks - 80u) ParkSampleReport(world, mats, "fly");
+  const uint32_t fetchTick = kParkFlyTicks + ParkSettleTicks();
+  if (tick >= kParkFlyTicks && (tick % 25u) == 0u)
+    std::printf("park: t%u  active %u  (snap t%u)\n", tick, s.activeChunks,
+                s.tick);
+  if (tick == fetchTick) ParkSampleRequest(world, "parked");
+  if (tick == fetchTick + 40u) {
+    ParkSampleReport(world, mats, "parked");
+    g_parkDone = true;
+  }
+}
 
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
 //
@@ -1210,6 +1420,13 @@ int main(int argc, char** argv) {
     if (a == "--autofly") g_autofly = true;
     if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
     if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
+    // `--autofly-park` is --autofly-surface that STOPS (see ParkProbe): the
+    // sleep-vs-transient discriminator for the active-chunk count.
+    if (a == "--autofly-park") {
+      g_autofly = true;
+      g_autoflySurface = true;
+      g_autoflyPark = true;
+    }
     // `--measure` is the Vulkan-port sizing harness (src/measure/measure.cpp):
     // occupancy histogram of the residency window + per-compute-pass GPU
     // timings. Headless, off by default, and the ONLY thing that requests the
@@ -1656,6 +1873,9 @@ int main(int argc, char** argv) {
       }
       if (frameCounter >= g_harnessFrames) glfwSetWindowShouldClose(window, 1);
     }
+    // The park probe is tick-scheduled, so it decides its own end: --frames
+    // only has to be generous enough to reach it.
+    if (g_parkDone) glfwSetWindowShouldClose(window, 1);
     glfwPollEvents();
     double now = NowSeconds();
     float dt = (float)(now - lastTime);
@@ -1882,6 +2102,14 @@ int main(int argc, char** argv) {
         pin.up = false;
         pin.down = false;
         g_autoflySurfaceHigh = (phase == 1u);
+        // Park: hold ONE regime and stop the forward axis. The regime hop is
+        // 115 voxels, i.e. a 7-chunk vertical shift, so leaving it alternating
+        // would keep the streaming wake this probe exists to remove.
+        if (g_autoflyPark && tick >= kParkFlyTicks) {
+          pin.forward = 0.f;
+          pin.sprint = false;
+          g_autoflySurfaceHigh = false;
+        }
       }
     }
 
@@ -2109,6 +2337,20 @@ int main(int argc, char** argv) {
       player.pos.y = (float)gh + (g_autoflySurfaceHigh ? kAutoflySurfaceHighVox
                                                        : kAutoflySurfaceLowVox);
       player.vel.y = 0.0f;
+      // Park: latch the pose once and re-assign it every frame. Zeroing the
+      // input axis is not enough on its own — fly mode integrates velocity, so
+      // a coast of even a few voxels crosses a chunk boundary and shifts the
+      // window, which is precisely the stimulus under test.
+      if (g_autoflyPark && tick >= kParkFlyTicks) {
+        if (!g_parkPosSet) {
+          g_parkPos = player.pos;
+          g_parkPosSet = true;
+          std::printf("park: stopped at (%.1f, %.1f, %.1f) on tick %u\n",
+                      g_parkPos.x, g_parkPos.y, g_parkPos.z, tick);
+        }
+        player.pos = g_parkPos;
+        player.vel = Vec3{0, 0, 0};
+      }
     }
     ui.fly = player.fly;
 
@@ -2203,6 +2445,7 @@ int main(int argc, char** argv) {
       // so a fence that signalled during the previous tick's GPU work is
       // observed on the very next tick instead of a frame later.
       ctx.ProcessEvents();
+      if (g_autoflyPark) ParkProbe(world, mats, tick);
 
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
