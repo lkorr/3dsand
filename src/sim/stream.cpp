@@ -421,6 +421,26 @@ void Stream::CompleteOldest(bool discard) {
     if (!discard) {
       const uint8_t* ptr = (const uint8_t*)p.map.Data();
       if (ptr) {
+        // ---- BOUNCE THE BATCH OUT OF MAPPED MEMORY FIRST ------------------
+        //
+        // p.map.Data() is the PERSISTENTLY MAPPED staging allocation, which is
+        // write-combined host memory: sequential writes are fast, and reads are
+        // uncached and roughly an order of magnitude slower than RAM, with no
+        // prefetching to hide it. RleEncodeChunk is the worst possible consumer
+        // of that — a branchy word-at-a-time run scan, two dependent loads per
+        // word, 4,096 words a chunk.
+        //
+        // One sequential memcpy pulls the whole batch into cached RAM at
+        // streaming bandwidth and the encoder then runs on ordinary memory.
+        // HarvestDemotes beside it has always done this ("one sequential copy
+        // out of write-combined map memory; Classify then reads cached RAM");
+        // this path simply never did, and it is the more expensive of the two —
+        // measured at 4.4 ms per 256-chunk harvest under --autofly-surface,
+        // ~25% of the whole run, second only to the shift fence.
+        if (evictScratch_.size() < p.items.size() * kChunkVol)
+          evictScratch_.resize(p.items.size() * kChunkVol);
+        std::memcpy(evictScratch_.data(), ptr, p.items.size() * kChunkBytes);
+        ptr = (const uint8_t*)evictScratch_.data();
         std::vector<uint32_t> rle;
         for (size_t i = 0; i < p.items.size(); i++) {
           // A sentinel slot was never copied (§4.2's mandatory fast path): the
@@ -598,6 +618,30 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     IVec3 o = world_->WindowOrigin();
     tp.origin[0] = o.x; tp.origin[1] = o.y; tp.origin[2] = o.z;
     ctx_->queue.WriteBuffer(world_->tickUBO, 0, &tp, sizeof(tp));
+
+    // ---- DEBUG-ONLY fence decomposition (SANDVOX_PT_DEBUG) ---------------
+    // The occupancy map below waits on the fence of the LAST submit, which
+    // covers EVERY command buffer queued so far — the previous tick's
+    // SubmitTick, the frame's render, this shift's eviction copies — not just
+    // genChunk. So "occ 30 ms" does not say whether the GPU is busy with work
+    // that already existed or with the shift's own worldgen, and those two
+    // readings call for opposite fixes. Draining the backlog here first splits
+    // it: `pre` is what was already outstanding, `occ` is then genChunk + its
+    // copy alone. Gated because the drain is itself a stall.
+    double preMs = 0.0;
+    if (world_->residency == World::Residency::Paged && PtDbg()) {
+      if (!genOccStaging_)
+        genOccStaging_ = CreateBuffer(
+            ctx_->device, (uint64_t)kNumChunks * 4,
+            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "genOcc");
+      rhi::MapTicket pre =
+          rhi::MapReadDeferred(ctx_->device, genOccStaging_, 0, 4);
+      const double p0 = PtNowMs();
+      pre.Wait();
+      preMs = PtNowMs() - p0;
+      pre.Unmap();
+    }
+
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     sim_->EncodeGenList(enc, (uint32_t)genSlots.size());
     ctx_->queue.Submit(enc.Finish());
@@ -873,8 +917,8 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       IssueDemoteCopies(paged, keys, lastTick_);
       if (dbg)
         std::printf("[pt-time] shift demote: gen=%zu cands=%zu issued "
-                    "total %.2f ms (occ %.2f)\n",
-                    genSlots.size(), paged.size(), PtNowMs() - dT0, occMs);
+                    "total %.2f ms (pre %.2f, occ %.2f)\n",
+                    genSlots.size(), paged.size(), PtNowMs() - dT0, preMs, occMs);
     }
   }
 }

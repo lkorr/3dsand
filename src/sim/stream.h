@@ -210,6 +210,7 @@ class Stream {
   void DiscardDemotes();
   std::deque<PendingDemote> demotes_;
   std::vector<uint32_t> demoteScratch_;  // mapped-memory bounce, reused
+  std::vector<uint32_t> evictScratch_;   // same, for the eviction harvest
   // The last tick Update() saw: FillSlots stamps demote copies with it.
   // ReloadWindow runs before any Update, so its copies carry a stale tick and
   // take the harvest's re-copy path — lazily correct, never wrong.

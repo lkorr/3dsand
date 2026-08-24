@@ -558,6 +558,54 @@ const TREE_SCAN : i32 = 2;           // +-2 tiles, comfortably covers it
 // scattering pass — so a tree straddling a chunk border generates identically
 // from either chunk, and a chunk evicted and re-entered regrows the same tree.
 
+// ---- BOUNDS on the size table below, for treeAt's cheap rejects ------------
+//
+// These are NOT the rule. Every tile that survives them still goes through the
+// exact per-tile `reach` and `vtop` tests in treeAt, so a bound that is too
+// LOOSE costs a few wasted tile lookups and changes no output. A bound that is
+// too TIGHT shears canopies and MOVES THE WORLD HASH — so if the size table in
+// treeInfo grows a species or a dimension, these must be re-derived upward with
+// it. check_invariants.py asserts they still dominate the table.
+//
+// Why they exist, measured: treeAt ran its 25-tile scan for EVERY air cell
+// above ground, and each tile's treeInfo costs a biomeAt + a baseHeight + a
+// pondAt (~20 hashes) — all of it paid before the `y > vtop` test that rejects
+// it. A cell 300 voxels up in open sky therefore paid ~500 hashes to conclude
+// "no tree here". Under --autofly-surface that was the whole of genChunk's
+// 21 ms per window shift, which the paged streaming path then fences on
+// (docs/PLAN_surface_flight_perf.md B2).
+//
+// The jitter is `j = (hsh >> 12) % 5`, so every maximum below is at j = 4.
+const TREE_MAX_TRUNK_DM : i32 = 95 + 4 * 6;   // great oak, the tallest trunk
+const TREE_MAX_RAD_DM   : i32 = 42 + 4 * 3;   // great oak, the widest crown
+const TREE_BIRCH_RAD_DM : i32 = 22 + 4 * 2;   // birch: the one species whose
+                                              // gate adds a second radius
+const TREE_PINE_TRUNK_DM : i32 = 70 + 4 * 8;  // pine, the second-tallest
+// The widest horizontal `reach` any species can ask for. Birch wins it despite
+// its narrow crown, because its gate is `radius * 5/2 + 4` (a branch skeleton,
+// not a leaf ball).
+const TREE_MAX_REACH : i32 =
+    max(TREE_MAX_RAD_DM * VOX_PER_M / 10 + 2,
+        (TREE_BIRCH_RAD_DM * VOX_PER_M / 10) * 5 / 2 + 4);
+// The tallest a tree cell can sit ABOVE its own trunk's ground, per species —
+// `vtop - base` at maximum jitter. Taken as a max over species rather than by
+// summing the biggest of each dimension, which would be ~35% looser and stop
+// the sky short-circuit from firing at all.
+const TREE_MAX_ABOVE : i32 =
+    max(TREE_MAX_TRUNK_DM * VOX_PER_M / 10 + TREE_MAX_RAD_DM * VOX_PER_M / 10 + 2,
+        max((65 + 4 * 6) * VOX_PER_M / 10
+              + 2 * (TREE_BIRCH_RAD_DM * VOX_PER_M / 10) + 2,
+            TREE_PINE_TRUNK_DM * VOX_PER_M / 10
+              + (24 + 4 * 2) * VOX_PER_M / 10 + 2));
+// A trunk only exists below the treeline, and the terrain band caps its ground
+// independently, so the highest ground any trunk can stand on is the smaller of
+// the two. Above TREE_MAX_BASE + TREE_MAX_ABOVE there is no tree anywhere in
+// the world, at any seed — one compare replaces the whole scan.
+const TREE_MAX_BASE : i32 = min(TUNE_TREELINE - 1,
+                                TUNE_BASE_HEIGHT + TUNE_HILL_AMPLITUDE +
+                                    TUNE_DETAIL_AMPLITUDE);
+const TREE_MAX_TOP : i32 = TREE_MAX_BASE + TREE_MAX_ABOVE;
+
 // Per-tile tree descriptor, unpacked from one hash.
 struct Tree {
   present : bool,
@@ -570,24 +618,45 @@ struct Tree {
   rnd     : u32,   // spare bits for per-tree jitter
 };
 
-fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
-  var t : Tree;
-  t.present = false;
-  t.species = 0u; t.wx = 0; t.wz = 0; t.base = 0;
-  t.trunk = 0; t.radius = 0; t.rnd = 0u;
+// The HASH-ONLY half of treeInfo: WHERE the trunk stands, and nothing that
+// costs a noise lookup. Split out so treeAt can reject a tile on distance —
+// and then on ground height alone — before paying for the site's biome and
+// pond queries. One hash3 for the whole thing.
+struct TreeSite {
+  hsh : u32,
+  wx  : i32,
+  wz  : i32,
+};
 
-  let hsh = hash3(seed ^ 0x7BEE5u, bitcast<u32>(tx), bitcast<u32>(tz));
-  t.rnd = hsh;
+fn treeSite(tx : i32, tz : i32, seed : u32) -> TreeSite {
+  var s : TreeSite;
+  s.hsh = hash3(seed ^ 0x7BEE5u, bitcast<u32>(tx), bitcast<u32>(tz));
   // Trunk sits somewhere in the middle half of the tile — jittering the site
   // within the tile is what stops a forest from reading as a planted grid.
   let inset = TREE_TILE / 4;
   let span = u32(TREE_TILE / 2);
-  t.wx = tx * TREE_TILE + inset + i32((hsh >> 3u) % span);
-  t.wz = tz * TREE_TILE + inset + i32((hsh >> 9u) % span);
+  s.wx = tx * TREE_TILE + inset + i32((s.hsh >> 3u) % span);
+  s.wz = tz * TREE_TILE + inset + i32((s.hsh >> 9u) % span);
+  return s;
+}
 
+// The rest of treeInfo, given a site and the ground height AT that site.
+//
+// `base` is passed in rather than sampled here because treeAt has already had
+// to know it for its vertical reject, and baseHeight is eight hashes — sampling
+// it twice would be the most expensive thing this function does. It is the same
+// value either way (baseHeight is a pure function of the site), so the split
+// changes no output; treeInfo below is the unchanged one-shot form for the
+// callers that have no reject to do.
+fn treeInfoAt(s : TreeSite, base : i32, seed : u32) -> Tree {
+  var t : Tree;
+  t.present = false;
+  t.species = 0u; t.wx = s.wx; t.wz = s.wz; t.base = base;
+  t.trunk = 0; t.radius = 0; t.rnd = s.hsh;
+
+  let hsh = s.hsh;
   let biome = biomeAt(t.wx, t.wz, seed);
-  let h = baseHeight(t.wx, t.wz, seed);
-  t.base = h;
+  let h = base;
 
   // No trees on snowfields, in ponds, or over the selftest fixture sites.
   if (h >= TREELINE) { return t; }
@@ -644,6 +713,14 @@ fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
   t.radius = radDm * VOX_PER_M / 10;
   t.present = true;
   return t;
+}
+
+// The one-shot form, for callers with no reject of their own to do first
+// (undergrowthSite, treeCanopyAt). Identical to what this function was before
+// the site split.
+fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
+  let s = treeSite(tx, tz, seed);
+  return treeInfoAt(s, baseHeight(s.wx, s.wz, seed), seed);
 }
 
 // Integer sine on a 256-step circle, returning -256..256. Bhaskara-style
@@ -1155,11 +1232,38 @@ fn treeVine(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
 // ~4.5 m = 72 voxels) plus the trunk's in-tile jitter. First non-air wins —
 // order is by tile index, a fixed priority, never dispatch order (rule 1).
 fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  // ---- REJECT CHEAPEST-FIRST (see the TREE_MAX_* block) -------------------
+  //
+  // This function is called for EVERY air cell above ground, which in a
+  // streamed-in vertical slab means most of the chunk — the window is 512
+  // voxels tall and the terrain band is 54 of them. The rejects below are
+  // ordered by what they cost, and none of them decides anything: the exact
+  // `reach` and `vtop` tests further down are unchanged and still have the
+  // final say.
+  //
+  // 1. Above every canopy in the world -> one compare, no scan at all.
+  if (y > TREE_MAX_TOP) { return MAT_AIR; }
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
-      let t = treeInfo(tx + ox, tz + oz, seed);
+      // 2. Horizontal, on the trunk site alone (one hash). A +-2 tile's trunk
+      //    is at least 181 voxels away and TREE_MAX_REACH is 124, so the outer
+      //    ring of the scan is rejected outright and only ~4 of the 25 tiles
+      //    reach the noise queries below. TREE_SCAN stays 2 because the exact
+      //    per-species reach still decides; this only stops us PAYING for the
+      //    tiles it was always going to refuse.
+      let s = treeSite(tx + ox, tz + oz, seed);
+      if (abs(x - s.wx) > TREE_MAX_REACH || abs(z - s.wz) > TREE_MAX_REACH) {
+        continue;
+      }
+      // 3. Vertical, on baseHeight alone (eight hashes) — before biomeAt and
+      //    pondAt, which a tile only needs once a cell can actually be in it.
+      //    `y < sbase` is the exact test the loop already made; the upper one
+      //    is TREE_MAX_ABOVE's bound on the same `vtop` computed below.
+      let sbase = baseHeight(s.wx, s.wz, seed);
+      if (y < sbase || y > sbase + TREE_MAX_ABOVE) { continue; }
+      let t = treeInfoAt(s, sbase, seed);
       if (!t.present) { continue; }
       // cheap reject before the per-species shape test. Birch is a branching
       // skeleton, not a crown: its limbs reach r + r/2 and their twigs extend
