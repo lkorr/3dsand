@@ -472,8 +472,8 @@ per scene):
 - `pool`: after settling, the scene is bit-idle (see below).
 - Filaments/droplets read as water, not mucus, at 6 substeps/tick.
 
-Perf (provisional until WP1 records baselines — then replace these lines with
-measured before/after):
+Perf targets (WP1 baselines are MEASURED below, 2026-08-24 — quote before/after
+against that block; these remain the targets):
 - `pool` post-settle: fluid GPU time ≈ 0 ms (all indirect args zero); frame
   time equals the no-fluid lab baseline.
 - `faucet` steady-state at ~50–100k live particles: fluid sim+seam ≤ ~4 ms
@@ -489,6 +489,65 @@ Correctness (existing machinery):
 - `check_pass_table.py` + `check_invariants.py` green; `--vk-validation`
   clean smoke at each WP end (full acceptance is an end-of-work event, per
   CLAUDE.md — not per-edit).
+
+### WP1 baselines (measured 2026-08-24, RTX 3060 Ti, 1080p offscreen)
+
+`bash scripts/run.sh ./build/Release/sandvox.exe --fluid-bench all --json out.json`
+— per-pass GPU ms from passtimer (avg/p95 of per-tick deltas), render is
+WaitIdle-bracketed wall (no render-pass queries exist), frame = tick+render
+wall in the serialized harness. OLD = the pre-reconciliation live tuning.json
+(stiffness 11500, gravity 181.9, eosPower 3, cohesion 25, attractSame 12,
+attractDiff −25, viscosity 0.5, splashRate 1.5/idx 1 — preserved in the
+bench JSON and in `tuning_old_live_wp1.json` side file); DEF = the
+tuning_params.def defaults tuning.json now carries (5400 / 98.1 / 4 / 90 /
+45 / −90 / 1.5 / 4.0 / idx 2). hill0 = hill at exciteMode 0.
+
+| scene  | cfg | fluid(substep) avg/p95 | seam avg | settle avg | render avg | frame p50/p95 | live end/max | settled@ |
+|--------|-----|------------------------|----------|------------|------------|---------------|--------------|----------|
+| basin  | OLD | 2.55 / 2.92 | 0.17 | 0.12 | 10.97 | 15.3 / 16.4 | 15,300 / 15,360 | never |
+| basin  | DEF | 2.55 / 2.92 | 0.18 | 0.12 | 11.84 | 15.2 / 16.6 | 15,058 / 15,360 | never |
+| hill   | OLD | 5.40 / 6.42 | 0.24 | 0.16 | 26.78 | 36.6 / 39.2 | 39,282 / 39,600 | never |
+| hill   | DEF | 5.52 / 6.62 | 0.24 | 0.15 | 25.83 | 34.9 / 39.2 | 39,600 / 39,600 | never |
+| hill0  | OLD | 5.46 / 6.41 | 0.25 | 0.16 | 26.45 | 35.7 / 39.1 | 39,240 / 39,600 | never |
+| hill0  | DEF | 5.60 / 6.63 | 0.25 | 0.16 | 25.91 | 34.9 / 39.4 | 39,600 / 39,600 | never |
+| faucet | OLD | 3.00 / 5.15 | 0.18 | 0.12 | 19.04 | 24.0 / 26.9 | 33,096 / 33,096 | n/a |
+| faucet | DEF | 3.03 / 5.21 | 0.19 | 0.12 | 19.31 | 24.2 / 27.0 | 33,096 / 33,096 | n/a |
+| pool   | OLD | 3.79 / 4.44 | 0.20 | 0.14 | 17.49 | 22.9 / 27.4 | 26,400 / 26,400 | never |
+| pool   | DEF | 3.56 / 4.35 | 0.20 | 0.13 | 17.65 | 22.9 / 27.4 | 26,397 / 26,400 | never |
+| slosh  | OLD | 1.76 / 2.10 | 0.16 | 0.11 | 17.40 | 21.1 / 22.7 | 5,311 / 6,400 | never |
+| slosh  | DEF | 1.79 / 2.12 | 0.15 | 0.10 | 16.61 | 20.1 / 22.5 | 6,251 / 6,400 | never |
+
+What the numbers say (the diagnosis, now measured):
+
+- **Nothing settles. Anywhere.** Every scene ends its run (400–600 ticks =
+  13–20 s) with ~all mass still live — even `pool`, the sleep scene, sits at
+  26,397 of 26,400 live at tick 500, and basin's sealed dam-break churns at
+  15,300 live at tick 400. §1.2 item 1's "clamp-saturated churn" holds at
+  BOTH tunings: the fluid-excite gate's finding that stock stiffness sits at
+  the CFL edge is now a bench fact for every scene. Consequently
+  `tick-of-settle`, hill-vs-hill0 (the trapdoor A/B) and "pool post-settle
+  ≈ 0 ms" are all UNMEASURABLE until WP2 restores CFL honesty — the excite
+  trapdoor cannot even be reached when nothing ever settles.
+- **Solver cost scales with live count** (rule-2 behaviour on the substep
+  table itself): ~2.5 ms at 15 k → ~5.5 ms at 40 k particles, ≈ 0.13–0.17 ms
+  per 1k live per tick. The ≤4 ms @ 50–100 k target above therefore needs
+  roughly a 2–4× improvement (WP4 items 1/3/4/6).
+- **Seam + settle are count-independent** (~0.35–0.40 ms combined at 6 k and
+  at 40 k alike) — the fixed-size 262,144-slot/32,768-slot dispatches of
+  §1.3, measured. WP4 item 1's target is ≈ 0 at low counts.
+- **Rendering dominates the frame**: 11–27 ms of the 15–37 ms frame is the
+  render, scaling with fluid pixels on screen (basin 11 ms → hill 26 ms).
+  The ≤2.5 ms @ 1080p target is a ~10× ask — WP4 item 5 is not optional.
+- **Old-live vs .def-defaults is cost-neutral** (differences are within run
+  noise) — the reconciliation changed the look regime, not the price. The
+  parameter dead zone of §1.4 is real: 2× gravity + 2× stiffness moved no
+  timing needle because the VMAX clamp was already the binding constraint.
+- **Mass ledger EXACT in all 12 runs** (eighths in == standing + carried;
+  day phase pinned sunrise+1024 so evaporation cannot leak the audit).
+- Worldgen residency footnote: the lab slab worldgens at 89 resident pages
+  (1.4 MiB) vs 2,861 (44.7 MiB) for the default world — the flat world is
+  effectively free, so the frame is fluid + render and nothing else, which
+  was the point of WP1.
 
 ---
 

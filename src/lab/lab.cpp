@@ -211,12 +211,16 @@ void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
   Vec3 target{(float)CX, (float)G, (float)CZ};
   switch (scene) {
     case kLabBasin:  eye = {222, (float)(G + 30), 222}; break;
-    case kLabHill:   eye = {200, (float)(G + 34), 218};
-                     target = {236, (float)(G + 2), 256}; break;
+    // Hill: from above the catch basin looking back UP the ramp, so the
+    // stepped face, the deck pour and the basin are all in frame — the
+    // mid-slope freeze (or the sheet-down that replaces it) is THE thing
+    // this scene exists to show.
+    case kLabHill:   eye = {268, (float)(G + 38), 214};
+                     target = {224, (float)(G + 8), 256}; break;
     case kLabFaucet: eye = {224, (float)(G + 24), 224}; break;
     case kLabPool:   eye = {226, (float)(G + 22), 226}; break;
-    case kLabSlosh:  eye = {256, (float)(G + 24), 224};
-                     target = {256, (float)G, 256}; break;
+    case kLabSlosh:  eye = {256, (float)(G + 34), 212};
+                     target = {256, (float)G, 258}; break;
     default:         eye = {222, (float)(G + 30), 222}; break;
   }
   Vec3 d = target - eye;
