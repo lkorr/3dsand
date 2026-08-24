@@ -74,6 +74,58 @@ visible: ~0.2 fps — cost scales with how much world the camera can *see*.
 > volume it marches. And since the whole quiet-machine frame is ~10 ms, Part A's
 > remaining items should be judged against that, not against 46 ms.
 
+> **CORRECTION 3 (2026-08-24). B2 was two thirds `genChunk`, and the surface frame is
+> now GPU-bound.** Commits `0818548`, `74a2563`, `5eff6c4`, `b277641`.
+>
+> Correction 2 left B2 — the shift-demote `omap.Wait()` — as "the single highest-value
+> item left", measured at 39.5 ms of a 40 ms paged frame. That measurement is right and
+> the conclusion drawn from it was wrong, for a reason worth stating: **the fence is on
+> the whole queue**, so its cost says only "this much GPU work was outstanding", never
+> *what*. Draining the backlog immediately before `genChunk`'s submit splits it. The probe
+> is in `stream.cpp` under `SANDVOX_PT_DEBUG` (`pre` vs `occ`) and is worth keeping:
+>
+> ```
+> pre  mean  9.77 ms    backlog that already existed
+> occ  mean 20.76 ms    genChunk + its 128 KiB copy, alone
+> ```
+>
+> Two thirds of the "readback" was the shift's **own worldgen dispatch**. And the reason
+> `genChunk` cost 21 ms for 1,024 chunks was not worldgen being big, it was two loop
+> shapes:
+>
+> - **`treeAt` ran a 25-tile scan for every AIR CELL above ground**, and each tile's
+>   `treeInfo` costs a `biomeAt` + a `baseHeight` + a `pondAt` (~20 hashes) — all paid
+>   *before* the `y > vtop` test that throws the tile away. A cell 300 voxels up in open
+>   sky spent ~500 hashes concluding "no tree here", and open sky is most of a streamed-in
+>   vertical slab. Rejects are now ordered by cost (global `TREE_MAX_TOP` compare →
+>   hash-only trunk site → `baseHeight` alone), with the exact per-species tests unchanged
+>   underneath.
+> - **`genCell`'s first ninety lines contain no `y`.** `baseHeight`, the pool discs,
+>   `biomeAt`, `pondAt`, `shoreAt` are a pure function of `(x, z)`, and a chunk evaluated
+>   them 4,096 times for 256 distinct answers. Split into `genColumn`/`genCellIn`;
+>   `genChunk` walks column-major and evaluates the column once.
+>
+> `genChunk` 20.76 → **5.37 ms**. Whole-frame `--autofly-surface` p50 **57.1 → 25.3 ms**,
+> p99 151.2 → 62.0, frames over 100 ms **47 → 0**. Determinism `7cfa2420` throughout —
+> which is the real gate on both, since neither changes any arithmetic.
+>
+> **Two lessons for the next reader, both about measurement:**
+>
+> 1. **A fence tells you how much, never what.** Before optimising anything a stall is
+>    waiting on, drain the queue in front of it and measure the two halves separately.
+>    Three sessions treated this fence as a readback problem.
+> 2. **This harness is real-time-paced, so p50 has a feedback loop in it.** Faster frames
+>    accumulate fewer ticks per frame, and a frame with no tick is render-only and cheap —
+>    so p50 moves faster than the work removed. Debug runs (with the extra drain) and
+>    clean runs are *not* comparable to each other for this reason; compare clean to
+>    clean at the same `--frames`. The numbers above are all clean 600-frame runs.
+>
+> **Where the frame goes now:** render + CA. The paging path is `genChunk` (5.4 ms/shift)
+> plus fence serialisation, and CPU-side paging work has stopped mattering — the eviction
+> and demote wins below moved p99 and `max` but left p50 flat, because they were already
+> overlapping the GPU. Part A items are now the honest targets again, against a ~9-10 ms
+> offscreen renderer.
+
 **Diagnosis in one line:** the frame cost is dominated by the raymarcher, whose per-ray
 cost scales linearly with ray length through non-empty chunks and which has **no LOD
 anywhere inside the 512³ window**; streaming adds a second, smaller cost that is specific
@@ -275,7 +327,41 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
   time; low-skim p50 comparable to the landed descent p50 (~3 ms); no new faults; pool
   `inUse=` stable under sustained surface flight.
 
-### Where it actually stands (2026-08-23, quiet machine, after A1 + A5 + B5)
+### Where it actually stands (2026-08-24, quiet machine, after Correction 3)
+
+```
+--autofly-surface  paged   p50 25.3   p95 54.9   p99 62.0   max 78.0   >100ms 0
+                           low-skim p50 29.5     high-cruise p50 22.8
+--autofly-hard     paged   p50 3.0    p95 32.1   (no regression)
+genChunk per shift         5.37 ms    (was 20.76)
+demote candidates/shift    270        (was 850; 592 demote with no copy)
+chunks stored per shift    28         (was 397)
+store after streaming gate 5,177      (was 35,471)
+```
+
+Success criteria from Phase 0 are met: high-cruise is now the *cheaper* arm, and the
+altitude curve is gone. What is left in the surface frame is **render + CA**, not paging.
+
+Ranked, for whoever picks this up:
+
+1. **Part A (renderer).** A2's sub-chunk occupancy bitmask and A6's column-probe hoist,
+   against a ~9-10 ms offscreen budget. This is now the largest term.
+2. **The fence's remaining half** — CPU/GPU serialisation, not the readback. Removing it
+   recovers only the CPU work that cannot currently overlap on a shift frame, which the
+   measurements above suggest is single-digit ms. The act-set staleness argument in
+   `stream.cpp` is still the blocker and is still correct.
+3. **`treeAt` per-column hoist.** The tile *set* is column-invariant, so with `genChunk`
+   now column-major the surviving tiles could be resolved once per column instead of per
+   cell. Bounded by register pressure — the horizontal reject admits at most 3 tiles per
+   axis typically but 5 in the worst case, so a fixed cache needs an overflow path.
+
+**Housekeeping owed:** `check_invariants.py` should assert that `TREE_MAX_TRUNK_DM` /
+`TREE_MAX_RAD_DM` / `TREE_BIRCH_RAD_DM` / `TREE_MAX_ABOVE` in `worldgen.wgsl` still
+dominate the size table in `treeInfo` beside them — a bound that goes stale *downward*
+shears canopies and moves the world hash. Not added here only because another session had
+`check_invariants.py` checked out with uncommitted changes.
+
+### How it stood (2026-08-23, quiet machine, after A1 + A5 + B5)
 
 **Success criteria NOT met, and the reason is B2, not the renderer.**
 
