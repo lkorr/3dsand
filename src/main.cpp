@@ -3729,6 +3729,7 @@ int main(int argc, char** argv) {
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;
+      ui.totalChunks = kNumChunks;
       ui.voxelTotal = world.Snap().voxelTotal;
       ui.worldHash = world.Snap().worldHash;
       ui.mirrorValid = world.Snap().valid;

@@ -3083,6 +3083,12 @@ function renderTuning(){
 
   for(const tab of TUNING_SCHEMA){
     const rows=[];
+    // Deferred tabs batch changes behind an Apply button so the engine's
+    // 40-second shader recompile only fires once, not per slider tweak.
+    let applyBtn=null;
+    const touch=tab.deferred
+      ? ()=>{ if(applyBtn)applyBtn.disabled=false; }
+      : undefined;
     // A `sec` on a param opens a labelled band and every following row belongs
     // to it until the next `sec`. The divider tracks its own members so a
     // search that hides the whole band hides its heading too — a lone heading
@@ -3096,7 +3102,7 @@ function renderTuning(){
         rows.push(sec);
       }
       const g=paramGroup(tab,pr);
-      const row=tuneRow(tab,pr,g);
+      const row=tuneRow(tab,pr,g,touch);
       if(!matchesQuery(tab,pr,g,q))row.classList.add('hidden');
       else{
         shown++;
@@ -3134,13 +3140,29 @@ function renderTuning(){
     }
     const body=el('div',{class:'trows'});
     rows.forEach(r=>body.append(r));
+    if(tab.deferred){
+      const hasPending=tab.params.some(pr=>{
+        const g=paramGroup(tab,pr);
+        return !sameVal(getAt(tune,g,pr.k),getAt(tuneBase,g,pr.k));
+      });
+      applyBtn=el('button',{class:'primary',disabled:!hasPending,
+        style:'margin:8px 14px 12px auto;display:block;padding:8px 24px'},
+        'Apply');
+      applyBtn.addEventListener('click',async()=>{
+        touchTune();
+        await saveAll();
+        applyBtn.disabled=true;
+      });
+      body.append(applyBtn);
+    }
     det.append(body);
     host.append(det);
   }
   $('#tuneCount').textContent=shown+' shown'+(changed?' · '+changed+' changed':'');
 }
 
-function tuneRow(tab,pr,g){
+function tuneRow(tab,pr,g,touch){
+  touch=touch||touchTune;
   const cur=getAt(tune,g,pr.k);
   const base=getAt(tuneBase,g,pr.k);
   const row=el('div',{class:'trow'+(tab.determinism?' det':'')});
@@ -3150,7 +3172,7 @@ function tuneRow(tab,pr,g){
     paintHist();
   };
 
-  row.append(el('div',{class:'nm',title:pr.k},
+  row.append(el('div',{class:'nm',title:pr.d||pr.k},
     el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)));
 
   if(pr.type==='select'){
@@ -3165,12 +3187,12 @@ function tuneRow(tab,pr,g){
     sel.value=cur??pr.options[0]??'';
     sel.addEventListener('change',()=>{
       setTuned(g,pr.k,sel.value);
-      touchTune();mark();
+      touch();mark();
     });
     row.append(sel);
     row.append(el('span',{}));
   }else if(pr.type==='color'||pr.type==='vec3'){
-    row.append(vecEditor(pr,g,mark));
+    row.append(vecEditor(pr,g,mark,touch));
     row.append(el('span',{}));   // triples have no single numeric box
   }else if(pr.bool){
     // Booleans are a checkbox, not a 0..1 slider. The C++ reader (ReadB in
@@ -3184,7 +3206,7 @@ function tuneRow(tab,pr,g){
     chk.addEventListener('change',()=>{
       setTuned(g,pr.k,chk.checked);
       paint();
-      touchTune();mark();
+      touch();mark();
     });
     row.append(el('label',{class:'chk',
       style:'display:flex;align-items:center;gap:7px'},chk,lbl));
@@ -3245,7 +3267,7 @@ function tuneRow(tab,pr,g){
       if(!isFinite(x))return;
       setTuned(g,pr.k,x);
       rng.value=isLog?toPos(x):x;num.value=x;
-      touchTune();mark();
+      touch();mark();
     };
     const v0=(cur!=null?cur:(pr.min??0));
     rng.value=isLog?toPos(v0):v0;num.value=v0;
@@ -3285,7 +3307,7 @@ function tuneRow(tab,pr,g){
         title:label+': '+histText(val)+'  —  click to restore'},histText(val));
       b.addEventListener('click',()=>{
         setTuned(g,pr.k,structuredClone(val));
-        touchTune();renderTuning();
+        touch();renderTuning();
       });
       hist.append(b);
     };
@@ -3305,9 +3327,9 @@ function tuneRow(tab,pr,g){
       if(vb===undefined)delete (tune[g]||{})[VAR_KEY(pr.k)];
       else setTuned(g,VAR_KEY(pr.k),structuredClone(vb));
     }
-    if(base===undefined){touchTune();renderTuning();return;}
+    if(base===undefined){touch();renderTuning();return;}
     setTuned(g,pr.k,structuredClone(base));
-    touchTune();renderTuning();
+    touch();renderTuning();
   });
   row.append(rst);
 
@@ -3498,7 +3520,8 @@ function varEditor(tab,pr,g,onChange){
   return wrap;
 }
 
-function vecEditor(pr,g,mark){
+function vecEditor(pr,g,mark,touch){
+  touch=touch||touchTune;
   const wrap=el('div',{class:'vecwrap'});
   const cur=(getAt(tune,g,pr.k)||[0,0,0]).slice();
   if(pr.type==='color'){
@@ -3516,7 +3539,7 @@ function vecEditor(pr,g,mark){
         const c=(getAt(tune,g,pr.k)||[0,0,0]).slice();
         c[i]=+b.value;
         setTuned(g,pr.k,c);
-        pick.value=rgbToHex(c);setPv();touchTune();mark();
+        pick.value=rgbToHex(c);setPv();touch();mark();
       });
       return b;
     });
@@ -3527,7 +3550,7 @@ function vecEditor(pr,g,mark){
       const c=hexToRgb(pick.value).map(v=>+v.toFixed(3));
       setTuned(g,pr.k,c);
       boxes.forEach((b,i)=>b.value=c[i]);
-      setPv();touchTune();mark();
+      setPv();touch();mark();
     });
     setPv();
     wrap.append(pv,pick,...boxes);
@@ -3542,7 +3565,7 @@ function vecEditor(pr,g,mark){
         if(pr.max!=null)x=Math.min(pr.max,x);
         c[i]=roundStep(x,pr.step);
         b.value=c[i];
-        setTuned(g,pr.k,c);touchTune();mark();
+        setTuned(g,pr.k,c);touch();mark();
       });
       wrap.append(b);
     });
@@ -5832,7 +5855,7 @@ function wikiTuneGroup(tab){
       // The schema declares it but tuning.json does not carry it. Worth
       // showing rather than hiding: it means the file is behind the schema.
       rows.append(el('div',{class:'trow'},
-        el('div',{class:'nm',title:pr.k},el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)),
+        el('div',{class:'nm',title:pr.d||pr.k},el('span',{class:'dotc'}),el('span',{class:'txt'},pr.n)),
         el('div',{class:'wmiss',style:'grid-column:2/6'},
           'not present in tuning.json — the engine default is used'),
         el('div',{class:'thelp'},pr.d)));

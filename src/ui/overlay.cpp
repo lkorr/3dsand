@@ -300,7 +300,8 @@ void Overlay::Draw(UIState& s) {
   // frames while one in a hundred is visibly long.
   ImGui::Text("frame ms   p95 %.0f   p99 %.0f   worst %.0f",
               s.frameMsP95, s.frameMsP99, s.frameMsWorst);
-  ImGui::Text("tick %u   active chunks %u / 4096", s.tick, s.activeChunks);
+  ImGui::Text("tick %u   active chunks %u / %u", s.tick, s.activeChunks,
+              s.totalChunks);
   ImGui::Text("voxels %.2f M   particles %u   hash %08x %s", s.voxelTotal / 1e6,
               s.particleCount, s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
   ImGui::Text("debris bodies %u (%u awake)   mobs %u", s.bodyCount,

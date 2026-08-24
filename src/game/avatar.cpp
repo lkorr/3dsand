@@ -2137,7 +2137,7 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
   const Vec3 center = centerWorldVoxel;
 
   float excess = impactMs - pt.fallDamageSpeed;
-  float damage = excess * pt.fallDamageScale;
+  float damage = excess * excess * pt.fallDamageScale;
 
   bool lethal = impactMs >= pt.fallSplatSpeed ||
                 damage >= (float)TotalHealth();

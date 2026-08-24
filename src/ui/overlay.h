@@ -22,6 +22,11 @@ struct UIState {
   float tickCpuMs = 0;       // CPU encode+submit per tick
   uint32_t tick = 0;
   uint32_t activeChunks = 0;
+  // The denominator was the literal 4096 in the format string, and the window
+  // has been 32^3 = 32,768 chunks for a while. Carried as a field because this
+  // file sees only its own header and ImGui — a fresh literal would just be the
+  // same bug again, one window resize later.
+  uint32_t totalChunks = 0;
   uint64_t voxelTotal = 0;
   uint32_t worldHash = 0;
   uint32_t particleCount = 0;
