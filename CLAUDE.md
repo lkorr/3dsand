@@ -1,6 +1,6 @@
 # sandvox — working rules
 
-3D falling-sand voxel engine. GPU CA over a 256³ toroidal window into an infinite world, raymarched from sim buffers. C++20 / Vulkan / WGSL (Tint compiles to SPIR-V at load+F5). Vulkan-only since 2026-08-22; Dawn checkout stays for Tint only. **`DESIGN.md` is architecture truth** — read before changing a system, update in the same commit if contradicted.
+3D falling-sand voxel engine. GPU CA over a `kWorldN`³ toroidal window (512³ at time of writing — `src/sim/world.h` is the truth, it has already moved once) into an infinite world, raymarched from sim buffers. C++20 / Vulkan / WGSL (Tint compiles to SPIR-V at load+F5). Vulkan-only since 2026-08-22; Dawn checkout stays for Tint only. **`DESIGN.md` is architecture truth** — read before changing a system, update in the same commit if contradicted.
 
 ## Parallel sessions
 
