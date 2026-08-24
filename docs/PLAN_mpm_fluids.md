@@ -1,5 +1,10 @@
 # PLAN: MLS-MPM fluid rewrite
 
+**Status update 2026-08-24: `docs/PLAN_fluid_overhaul.md` is now the active
+work queue** — diagnosis of the goopy/clumpy look + perf strain, the fluid-lab
+test world, and the concrete path through this plan's Phases 3–7. This document
+remains the architecture of record for the hybrid design.
+
 **Status update 2026-08-22 (worktree mls-mpm-liquidsim): Phase 0 PASSED and a
 Phase-0+1 prototype is implemented** — `assets/shaders/sim_fluid.wgsl` +
 the `fluid-det` gate (twice-run particle-buffer hash equality on the RTX
