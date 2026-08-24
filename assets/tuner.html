@@ -454,9 +454,17 @@
   .tsec>span{color:var(--dim);font-size:12px;line-height:1.5;max-width:78ch}
   .tsec.hidden{display:none}
   .trow{
-    display:grid;grid-template-columns:210px 1fr 96px 26px 150px 30px;gap:12px;align-items:center;
+    /* col 3 (number + unit) was 96px: a full-width input left no room for
+       units like "vox/s²", which clipped to nothing. 150px fits the widest
+       unit next to a usable number box. */
+    display:grid;grid-template-columns:210px 1fr 150px 26px 150px 30px;gap:12px;align-items:center;
     padding:5px 8px;border-radius:6px;
   }
+  /* number box + unit share the column: the box flexes, the unit never
+     shrinks or wraps — the unit is the part you need to read. */
+  .numwrap{display:flex;gap:6px;align-items:center;min-width:0}
+  .numwrap input.tnum{flex:1 1 56px;min-width:52px}
+  .numwrap .unit{flex:none;white-space:nowrap}
   .trow:hover{background:#1b222c}
   .trow.hidden{display:none}
   .trow.changed{background:#16202c}
