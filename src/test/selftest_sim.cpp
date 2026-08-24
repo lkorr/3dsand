@@ -982,21 +982,11 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   // look knob; the gate turns it up so the drain's END STATE is reachable in
   // a bounded run.
   t.sim.fluidDamping = 0.9f;
-  // Softer water for the sealed chamber: stock stiffness (5400 (vox/s)² ->
-  // c ≈ 0.41 cells/substep) sits at the CFL edge, and a 3-deep pool's
-  // pressurized bottom tips it into sustained numerical churn that no
-  // damping can drain (measured: max particle speed pinned at ~0.42
-  // cells/tick for 280 ticks with zero external input). 2400 keeps the wave
-  // speed comfortably stable so the drained pool can actually calm.
-  t.sim.fluidStiffness = 2400.0f;
-  // Attraction/cohesion probe: the species-attraction terms subtract pressure
-  // in dense regions, which can limit-cycle (clump -> EOS spike -> eject ->
-  // re-clump) and keep a sealed pool fizzing above the calm threshold
-  // forever. Off for this gate — the seam under test is excite/settle, not
-  // the look of the water.
-  t.sim.fluidAttractSame = 0.0f;
-  t.sim.fluidAttractDiff = 0.0f;
-  t.sim.fluidCohesion = 0.0f;
+  // WP2 shrank this override set (the plan's success signal): stock is now
+  // CFL-honest (stiffness 3600 -> c = 0.33 cells/substep) and zero-tension
+  // (cohesion/attract 0), so the stiffness-2400 override and the three
+  // attraction/cohesion overrides this gate used to need are simply stock.
+  // The settle trio above remains: a sealed chamber genuinely rings.
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   // fluidDamping is a WGSL const (folded into the kernels at compile time —
