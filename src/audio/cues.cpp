@@ -21,6 +21,25 @@ constexpr unsigned kPreferredRate = 48000;
 // two genuinely separate hits are two sounds.
 constexpr double kMobVoiceMinGap = 0.12;
 
+// ---- material ambience ------------------------------------------------------
+// The 3x3x3 mirror is 48 voxels on a side. Sampling every 4th cell on each axis
+// makes one scan 1728 reads and gives each sample a 4^3 = 64-voxel footprint,
+// which is finer than any body of water that deserves its own sound bed.
+constexpr int kAmbienceStride = 4;
+// Below this many sampled cells there is no bed at all: a stride-4 sample is
+// 64 voxels, so 8 of them is roughly a 512-voxel puddle. A puddle is silent.
+constexpr int kAmbienceMinCells = 8;
+// ...and at this many the bed is at full gain. 96 samples is ~6000 voxels, a
+// pond that fills a good part of the mirror.
+constexpr float kAmbienceFullCells = 96.0f;
+// How often the scan runs. A bed is a slow thing; twice a second is already
+// faster than a walking player can change which lake they are next to.
+constexpr float kAmbienceScanSeconds = 0.5f;
+// Per-second easing rates for the loop's gain and position. Expressed as a
+// half-life so the behaviour does not change with frame rate.
+constexpr float kAmbienceGainHalflife = 0.5f;
+constexpr float kAmbiencePosHalflife = 0.9f;
+
 bool HasTag(const MaterialDef& m, const char* tag) {
   for (const std::string& t : m.tags)
     if (t == tag) return true;
@@ -185,6 +204,14 @@ void Cues::RebuildMaterialTable(const std::vector<MaterialDef>& mats) {
   impact_.assign(n, FootstepMapping{});
   break_.assign(n, FootstepMapping{});
   acoustics_.assign(n, MaterialAcoustics{});
+  // Ambience ownership is decided by the AUTHORED KEY, not by whether the set
+  // resolves. A material that names a set nobody has recorded yet must still
+  // be found by the probe: the wiring is what this table describes, and the
+  // missing .wav is an authoring state the tuner is there to fix. (The voice
+  // still checks lib_.Find before it tries to play anything.)
+  ambienceOwner_.assign(n, 0);
+  ambienceSet_.clear();
+  anyAmbience_ = false;
   lastVariant_.assign((size_t)std::max(1, lib_.Count()), -1);
 
   for (size_t i = 0; i < n; i++) {
@@ -235,6 +262,19 @@ void Cues::RebuildMaterialTable(const std::vector<MaterialDef>& mats) {
     const int bid = ResolveMaterialSlot(m, "break");
     break_[i].setId = bid;
     break_[i].gain = 1.0f;
+
+    const std::string& amb = m.Sound("ambience");
+    if (!amb.empty()) {
+      ambienceOwner_[i] = 1;
+      anyAmbience_ = true;
+      ambienceSet_[(uint32_t)i] =
+          amb.find('/') != std::string::npos
+              ? amb
+              : std::string(kSlotPrefix.at("ambience")) + "/" + amb;
+      if (lib_.Find(ambienceSet_[(uint32_t)i]) < 0)
+        warnings_.push_back("material \"" + m.name + "\": no sound set \"" +
+                            amb + "\" for slot ambience");
+    }
   }
 
   if ((int)lastVariant_.size() < lib_.Count()) lastVariant_.assign((size_t)lib_.Count(), -1);
@@ -287,6 +327,12 @@ void Cues::Update(float dt, const Vec3& listenerPosVox, float yaw, float pitch,
   // past the MobBleed calls) so "not seen" genuinely means "stopped bleeding"
   // and not "not reported yet".
   ReapBleeds();
+
+  // The automatic ambience bed. Driven from here rather than from main.cpp
+  // because everything it needs — the material table, the world, the listener
+  // — is already in hand at this call, and a caller that forgot to drive it
+  // would leave the loop stuck at wherever the player last was.
+  UpdateAmbience(dt, listenerPosVox, world);
 
   ListenerPose lp;
   lp.posVox = listenerPosVox;
@@ -562,6 +608,121 @@ void Cues::ReapBleeds() {
     }
     b.seen = false;   // cleared for the next frame; MobBleed sets it again
     ++it;
+  }
+}
+
+// ---- material ambience ------------------------------------------------------
+
+Cues::AmbienceProbe Cues::ProbeAmbience(const World& world,
+                                        const Vec3& listenerPosVox) const {
+  AmbienceProbe best;
+  if (!anyAmbience_) return best;
+  const WorldSnapshot& s = world.Snap();
+  if (!s.valid || s.mirror.size() < 27 * kChunkVol) return best;
+
+  // Per-material accumulators, indexed by the OWNER LIST rather than by
+  // material id: there are a handful of ambient materials in any project and
+  // this keeps the inner loop's write set tiny.
+  struct Acc { uint32_t mat = 0; int cells = 0; Vec3 sum{}; };
+  Acc acc[8];
+  int nAcc = 0;
+
+  for (int mz = 0; mz < 3; mz++)
+    for (int my = 0; my < 3; my++)
+      for (int mx = 0; mx < 3; mx++) {
+        const size_t base = (size_t)((mz * 3 + my) * 3 + mx) * kChunkVol;
+        const IVec3 cbase{(s.mirrorBase.x + mx) * (int)kChunk,
+                          (s.mirrorBase.y + my) * (int)kChunk,
+                          (s.mirrorBase.z + mz) * (int)kChunk};
+        for (int lz = 0; lz < (int)kChunk; lz += kAmbienceStride)
+          for (int ly = 0; ly < (int)kChunk; ly += kAmbienceStride)
+            for (int lx = 0; lx < (int)kChunk; lx += kAmbienceStride) {
+              const uint32_t mat =
+                  s.mirror[base + (size_t)((lz * (int)kChunk + ly) *
+                                               (int)kChunk + lx)] & 0xFFFu;
+              if (mat == 0 || mat >= ambienceOwner_.size()) continue;
+              if (!ambienceOwner_[mat]) continue;
+              int a = -1;
+              for (int i = 0; i < nAcc; i++)
+                if (acc[i].mat == mat) { a = i; break; }
+              if (a < 0) {
+                if (nAcc == 8) continue;  // more ambient materials than beds
+                a = nAcc++;
+                acc[a].mat = mat;
+              }
+              acc[a].cells++;
+              acc[a].sum += Vec3{(float)(cbase.x + lx) + 0.5f,
+                                 (float)(cbase.y + ly) + 0.5f,
+                                 (float)(cbase.z + lz) + 0.5f};
+            }
+      }
+
+  for (int i = 0; i < nAcc; i++) {
+    // Ties break toward the lower material id, for the same reason the break
+    // cue's dominant-material tally does: a report that flips between runs is
+    // a report nobody can debug.
+    if (acc[i].cells < kAmbienceMinCells) continue;
+    if (acc[i].cells < best.cells ||
+        (acc[i].cells == best.cells && acc[i].mat >= best.material))
+      continue;
+    best.material = acc[i].mat;
+    best.cells = acc[i].cells;
+    best.posVox = acc[i].sum * (1.0f / (float)acc[i].cells);
+    best.weight = std::clamp((float)acc[i].cells / kAmbienceFullCells, 0.0f, 1.0f);
+  }
+  (void)listenerPosVox;  // the mirror IS the "near the listener" filter
+  return best;
+}
+
+void Cues::UpdateAmbience(float dt, const Vec3& listenerPosVox, World* world) {
+  // The idle early-out. A project where no material binds an ambience set
+  // never touches the mirror, never allocates and never holds a voice.
+  if (!anyAmbience_) return;
+
+  ambScanTimer_ += dt;
+  if (world && ambScanTimer_ >= kAmbienceScanSeconds) {
+    ambScanTimer_ = 0.0f;
+    ambLast_ = ProbeAmbience(*world, listenerPosVox);
+  }
+
+  const Tuning::Audio& t = CurrentTuning().audio;
+  const AmbienceProbe& p = ambLast_;
+
+  // A different material won the scan: the old bed is not this one, so it
+  // stops rather than crossfading into a sound it never was.
+  if (ambHandle_ >= 0 && p.material != ambMat_) {
+    StopAmbience(ambHandle_);
+    ambHandle_ = -1;
+    ambGain_ = 0.0f;
+  }
+
+  if (p.material != 0 && ambHandle_ < 0) {
+    auto it = ambienceSet_.find(p.material);
+    if (it == ambienceSet_.end()) return;
+    // Start silent at the centroid and ease up, so a bed never snaps in.
+    ambPos_ = p.posVox;
+    ambGain_ = 0.0f;
+    ambHandle_ = StartAmbience(it->second, ambPos_, 0.0f, t.ambienceRadius);
+    if (ambHandle_ < 0) return;  // set not recorded yet: silent, and free
+    ambMat_ = p.material;
+  }
+  if (ambHandle_ < 0) return;
+
+  const float want = p.material == ambMat_ ? p.weight * t.ambienceVolume : 0.0f;
+  const float gk = 1.0f - std::exp2(-dt / std::max(0.01f, kAmbienceGainHalflife));
+  const float pk = 1.0f - std::exp2(-dt / std::max(0.01f, kAmbiencePosHalflife));
+  ambGain_ += (want - ambGain_) * gk;
+  if (p.material == ambMat_) ambPos_ += (p.posVox - ambPos_) * pk;
+  MoveAmbience(ambHandle_, ambPos_);
+  SetAmbienceGain(ambHandle_, ambGain_);
+
+  // Faded out (the water is gone, or the player walked away from it): release
+  // the voice so the loop pool is free rather than holding a silent one.
+  if (want <= 0.0f && ambGain_ < 0.004f) {
+    StopAmbience(ambHandle_);
+    ambHandle_ = -1;
+    ambMat_ = 0;
+    ambGain_ = 0.0f;
   }
 }
 

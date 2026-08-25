@@ -2733,21 +2733,120 @@ gate). `--noaudio` forces the same. A failed device init is never an error —
 the game runs silent. The selftest still asserts the *events* (`avatar
 footfalls`), which is the half that can break silently.
 
-### Built but not yet triggered
+### Impacts come from a Jolt contact listener (2026-08-24)
 
-`Cues::Impact()` and the ambience loop API (`StartAmbience`/`MoveAmbience`/
-`StopAmbience`) are implemented and tested, but nothing calls `Impact()`
-automatically yet: the debris system has no contact/landing event, and Physics
-exposes no velocity read-back. Wiring it needs a Jolt contact listener plus its
-own test — deliberately left as a hook rather than landed unverified.
+`Cues::Impact()` used to be the standing example of a cue nothing fired. It is
+now driven by a `JPH::ContactListener` on the physics system, and the shape of
+that wiring is the interesting part, because a contact listener is the easiest
+place in the engine to build a machine gun.
 
-`Cues::MobSound()` is likewise implemented, resolvable and bindable from the
-tuner, but no damage/death site calls it yet. The `idle`, `alert` and `attack`
-slots have no AI event to hang off at all. Each slot in
-`assets/sound_schema.js` states its own status in its `fires:` field, and the
-tuner shows it on the slot — so binding a sound to something nothing triggers
-tells you so at authoring time instead of leaving you wondering why it is
-silent.
+**`OnContactAdded`, never `OnContactPersisted`.** Jolt reports a manifold once
+when it first appears and then again every step while it lasts. The first is a
+LANDING; the second is a body resting. Listening only to the former is what
+makes a settled pile of debris cost literally zero — there is no "is it asleep"
+check anywhere, because a sleeping body generates no new manifolds.
+
+**Three bounds, and each one is load-bearing** (rule 2):
+
+| Bound | Where | What it stops |
+|---|---|---|
+| speed gate (`audio.impactMinSpeed`) | inside the listener, before the buffer | a rock rolling to rest touches down at cm/s; only a rock that FELL is a sound |
+| per-body gap (`audio.impactMinGap`) | `DebrisSystem::CollectImpacts` | one bounce is one thud, not one per contact face |
+| per-step cap, loudest kept | same | a wall blasted into thirty pieces lands them together; thirty simultaneous rock impacts is not a sound design |
+
+**The listener runs on Jolt's job threads**, which makes it the second piece of
+real concurrency here after the audio thread, and it inherits the same rule:
+it must never call `CurrentTuning()`, because F5 replaces that global
+wholesale. `Physics::Step` latches the gate into the listener from the game
+thread before handing control to Jolt. The buffer is mutex-guarded, which is
+cheap only because the speed gate runs *before* the lock.
+
+**The material is the surface STRUCK, not the striker** — a log landing on
+stone sounds like stone. `CollectImpacts` probes the voxel grid on both sides
+of the contact plane through the same chunk cache the body burn uses, and falls
+back to the other body's dominant material (cached per body, refreshed by
+`RecountBurn`) for a body-vs-body hit.
+
+**Your own body cannot fire one.** `Layers::AVATAR` and `Layers::PLAYER` are
+rejected by name in the listener, and a LIVE mob limb is filtered for free by
+ownership: limb bodies belong to `MobSystem`, so the handle never resolves in
+`bodies_`. A SEVERED limb has been `AdoptBody`'d by then and does start
+thudding, which is right.
+
+Reported, never voiced, here: `DebrisSystem::ImpactEvents()` mirrors
+`BreakEvents()` exactly, and `main.cpp` turns them into cues — so the physics
+layer still knows nothing about audio, and the headless path drains the queue
+without an audio device existing.
+
+### Creature voices: hurt and death (2026-08-24)
+
+`MobSystem::VoiceEvents()` is the same reporting shape as `SeverEvents()`, for
+the same reasons (the def index rides on the event because a killing blow
+despawns the mob before the frame drains it). `Hurt` is raised by
+`MobSystem::Damage` — the laser and melee path — and by `CarveLimb` on its
+SURVIVING return, which is what makes an explosion that only wounds a creature
+audible. A blow that severs deliberately says nothing there: `Sever()` already
+reports, and the sever cue falls back to the hurt set, so voicing both would
+double one blow. `Death` is raised in `Die()`, the single choke point every
+kill funnels through, positioned on the root limb's live transform rather than
+`mob.origin` (the spawn corner, which is the trap `Sever()` already documents).
+
+Hurt is de-duplicated per mob per drain window at the EVENT layer, on top of
+the audio layer's per-source `kMobVoiceMinGap`. The two are not the same guard:
+the wall-clock limiter cannot stop the queue itself from growing, and it is
+bypassed entirely on a machine with audio off. Bounding the event is the game
+layer's job; choosing not to play it is the audio layer's.
+
+### The ambience bed drives itself off the CPU mirror (2026-08-24)
+
+A material carrying an `"ambience"` slot (`water`, `lava`) gets a positioned
+loop automatically. `Cues::ProbeAmbience` subsamples the 3×3×3 voxel mirror on
+a stride-4 lattice — 1728 reads, at most twice a second, over memory that is
+already resident — and `UpdateAmbience` keeps ONE loop on the strongest result.
+
+- **Position is the CENTROID of the sampled cells**, not the nearest cell and
+  not the listener. This is the whole design decision: an emitter parked on the
+  player pans to nothing, while a centroid makes a shoreline swing left as you
+  walk along it. Eased, so the emitter drifts instead of jumping each scan.
+- **Gain is the sampled cell COUNT.** A puddle is under the floor and silent; a
+  pond that fills the mirror is at full gain. Also eased.
+- **Radius is one authored number** (`audio.ambienceRadius`): a bed is a bed,
+  and a body of water has no authored size.
+
+**Idle cost is a single bool.** If no material in the project binds an ambience
+set, `anyAmbience_` is false and nothing is scanned, ever. That check, not the
+scan's cheapness, is the rule-2 property.
+
+**Exactly one bed plays at a time**, and that is a deliberate ceiling rather
+than a limitation to fix later. Two lakes on opposite sides of the player is a
+CLUSTERING question — "is that one body of water or two" — and answering it
+would be a system, not a hook.
+
+The probe is split out of the voice so the selftest can assert it with no audio
+device (`--gate audio-ambience` builds a `Cues` and never calls `Init`).
+
+### Still not triggered: `idle`, `alert`, `attack`
+
+These three mob slots have **no AI event to hang off, and none can be invented
+from the audio side.** `MobSystem::DecideIntent` has no awareness of the player
+at all: its only sensor is a terrain probe (`GroundSense`), there is no target,
+no state enum, and no previous-state field to difference — the sole discrete
+transition in the whole behaviour layer is "just bumped a wall". And mobs never
+attack: the one `PlayClip("attack")` in the engine is a FLINCH on being hit.
+
+So `alert` needs the AI seam §"Mob steering: intent vs actuation" describes,
+`attack` needs a mob attack action to exist, and `idle` needs a per-mob timer
+and a notion of "unaware". Each says so in its own `fires:` field in
+`assets/sound_schema.js`, and the tuner shows it on the slot — so binding a
+sound to something nothing triggers tells you so at authoring time instead of
+leaving you wondering why it is silent.
+
+Each cue wired above landed with a gate (`src/test/selftest_audio.cpp`:
+`audio-impact`, `audio-mob-voice`, `audio-ambience`), asserting the EVENT and
+its idle counterpart — that a settled pile reports nothing, that a corpse says
+nothing more, that a dry world finds no water. Headless is silent, so the event
+layer is the only thing there is to test, and it is the half that breaks
+quietly.
 
 ## 13. Roadmap
 

@@ -85,6 +85,9 @@
       "density": 1000,
       "hardness": 4,
       "opacity": 90,
+      "sounds": {
+        "ambience": "water"
+      },
       "colors": [
         "#3a78e8",
         "#3570dc",
@@ -206,6 +209,9 @@
       "class": "liquid",
       "density": 2800,
       "hardness": 6,
+      "sounds": {
+        "ambience": "lava"
+      },
       "moveEvery": 3,
       "emission": 215,
       "opaque": true,

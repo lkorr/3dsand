@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <mutex>
 #include <unordered_map>
 
 #include <Jolt/Jolt.h>
@@ -16,6 +17,7 @@
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
 #include <Jolt/Physics/Body/AllowedDOFs.h>
@@ -149,6 +151,74 @@ struct Physics::LayerImpls {
   ObjPairFilter objPair;
 };
 
+// ---- contact reporting (audio; DESIGN.md §12b "Built but not yet triggered")
+//
+// THREADING. Jolt calls OnContactAdded from its narrow-phase JOB THREADS, in
+// parallel, during PhysicsSystem::Update. Everything this listener touches must
+// therefore be either immutable for the duration of the step (`minSpeedVox`,
+// latched by Step before Update) or under the lock. In particular it must NOT
+// call CurrentTuning(): F5 replaces that global wholesale, which is the same
+// hazard the audio thread has (DESIGN.md §12b threading contract).
+//
+// The mutex is not a hot path. The speed gate below runs BEFORE the lock and
+// rejects the overwhelming majority of contacts — a pile of debris settling
+// generates its contacts at millimetres per second — so the lock is taken only
+// for events that will actually be voiced, a few times a second at worst.
+struct Physics::ContactImpls final : public JPH::ContactListener {
+  // Hard ceiling per step. A wall blasted into thirty pieces lands them all on
+  // the same tick and there is no sound design in which thirty simultaneous
+  // rock impacts is better than the loudest few; the consumer sorts by energy
+  // and takes the top of them anyway. Dropping the tail here keeps the
+  // allocation bounded inside a job thread, which is the part that matters.
+  static constexpr size_t kMaxPerStep = 64;
+
+  std::mutex mu;
+  std::vector<ContactImpact> impacts;
+  float minSpeedVox = 0.0f;  // latched by Step; read-only during Update
+
+  ContactImpls() { impacts.reserve(kMaxPerStep); }
+
+  void OnContactAdded(const JPH::Body& b1, const JPH::Body& b2,
+                      const JPH::ContactManifold& m,
+                      JPH::ContactSettings&) override {
+    // YOUR OWN BODY MUST NOT FIRE DEBRIS IMPACTS. Layers::AVATAR exists
+    // precisely to split the player's limbs out of contact handling, and the
+    // player proxy is teleported onto the player every tick so its contacts
+    // are an artifact of that, not of anything landing.
+    const JPH::ObjectLayer l1 = b1.GetObjectLayer(), l2 = b2.GetObjectLayer();
+    for (JPH::ObjectLayer l : {l1, l2})
+      if (l == Layers::AVATAR || l == Layers::PLAYER) return;
+    // Something has to be moving. Two statics never reach here, but a
+    // static-vs-static pair would carry no speed anyway.
+    if (b1.IsStatic() && b2.IsStatic()) return;
+
+    const JPH::RVec3 p = m.GetWorldSpaceContactPointOn1(0);
+    const JPH::Vec3 v1 =
+        b1.IsStatic() ? JPH::Vec3::sZero() : b1.GetPointVelocity(p);
+    const JPH::Vec3 v2 =
+        b2.IsStatic() ? JPH::Vec3::sZero() : b2.GetPointVelocity(p);
+    // Magnitude, not signed closing speed: this is a manifold that did not
+    // exist last step, so the pair is approaching by construction, and taking
+    // the absolute value means a sign convention flip in a future Jolt cannot
+    // silently turn every impact off.
+    const float speedM = std::abs((v1 - v2).Dot(m.mWorldSpaceNormal));
+    const float speedVox = speedM / kVoxelMeters;
+    if (speedVox < minSpeedVox) return;
+
+    ContactImpact ci;
+    ci.bodyA = b1.IsStatic() ? 0 : FromBodyID(b1.GetID());
+    ci.bodyB = b2.IsStatic() ? 0 : FromBodyID(b2.GetID());
+    ci.posVoxel = Vec3{(float)p.GetX(), (float)p.GetY(), (float)p.GetZ()} *
+                  (1.0f / kVoxelMeters);
+    ci.normal = Vec3{m.mWorldSpaceNormal.GetX(), m.mWorldSpaceNormal.GetY(),
+                     m.mWorldSpaceNormal.GetZ()};
+    ci.speedVoxPerSec = speedVox;
+
+    std::lock_guard<std::mutex> lk(mu);
+    if (impacts.size() < kMaxPerStep) impacts.push_back(ci);
+  }
+};
+
 // Constraint bookkeeping: Jolt asserts if a constraint outlives either body,
 // so RemoveBody tears down attached joints first (byBody index).
 struct Physics::JointImpls {
@@ -178,20 +248,34 @@ bool Physics::Init() {
       JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, 2 /*threads*/);
   layers_ = std::make_unique<LayerImpls>();
   joints_ = std::make_unique<JointImpls>();
+  contacts_ = std::make_unique<ContactImpls>();
 
   system_ = std::make_unique<JPH::PhysicsSystem>();
   system_->Init(4096 /*max bodies*/, 0, 4096, 2048, layers_->bpInterface,
                 layers_->objVsBp, layers_->objPair);
+  system_->SetContactListener(contacts_.get());
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
   return true;
 }
 
 void Physics::Shutdown() {
   joints_.reset();  // constraint refs drop before the system that owns bodies
-  system_.reset();
+  system_.reset();  // ...and the system drops before the listener it points at
+  contacts_.reset();
   layers_.reset();
   jobs_.reset();
   tempAlloc_.reset();
+}
+
+const std::vector<Physics::ContactImpact>& Physics::ContactImpacts() const {
+  static const std::vector<ContactImpact> kNone;
+  return contacts_ ? contacts_->impacts : kNone;
+}
+
+void Physics::SetContactReportSpeed(float voxPerSec) {
+  // Below zero would report every resting contact in the world; a caller that
+  // wants the listener off passes a huge number, not a negative one.
+  if (contacts_) contacts_->minSpeedVox = std::max(0.0f, voxPerSec);
 }
 
 void Physics::Step(float dt) {
@@ -199,6 +283,11 @@ void Physics::Step(float dt) {
   // Gravity is re-applied here rather than only at Init so a tuning reload
   // takes effect without restarting the world.
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
+  // Contacts belong to the step that produced them: clear on the GAME THREAD
+  // before Update hands the buffer to the job threads, so a caller reading
+  // after Step sees exactly that step and nothing accumulates when nobody
+  // drains (a headless run never reads this at all).
+  if (contacts_) contacts_->impacts.clear();
   system_->Update(dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
                   jobs_.get());
 }

@@ -341,6 +341,7 @@ add_executable(sandvox
   src/test/selftest_mob.cpp
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp
+  src/test/selftest_audio.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp

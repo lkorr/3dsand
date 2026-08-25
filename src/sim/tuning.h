@@ -393,6 +393,20 @@ struct Tuning {
     // Physical impacts (debris, bodies).
     float impactVolume = 0.9f;
     float impactRadius = 30.0f;
+    // THE GATE. Contact speed (m/s) below which a landing is not a sound at
+    // all. This is the knob that makes a settling pile silent instead of a
+    // machine gun, and it is enforced inside the Jolt contact listener, so
+    // raising it is genuinely free — rejected contacts never become events.
+    // A rock rolling to rest touches down at centimetres per second; a rock
+    // that FELL arrives at several m/s, and the gap between them is wide.
+    float impactMinSpeed = 2.5f;
+    // Contact speed (m/s) that counts as a full-energy impact: gain tops out
+    // and pitch bottoms out here. Held above impactMinSpeed by the consumer.
+    float impactFullSpeed = 14.0f;
+    // Minimum seconds between two impacts from the SAME body. A tumbling rock
+    // generates a contact per bounce and per face; without this one fall is a
+    // clatter of six identical thuds.
+    float impactMinGap = 0.25f;
 
     // Something coming apart: terrain losing support and detaching as a
     // rigidbody, or being dug/blasted loose.
@@ -437,6 +451,13 @@ struct Tuning {
     // frame. On > off is required and enforced at load.
     float bleedOnThreshold = 0.35f;
     float bleedOffThreshold = 0.12f;
+
+    // The automatic material ambience bed: one positioned loop following the
+    // largest nearby body of a material that binds an "ambience" set (water,
+    // lava). Unlike the night bed this one IS a thing at a place — it pans and
+    // it occludes — so the radius is what decides how far a lake carries.
+    float ambienceVolume = 0.7f;
+    float ambienceRadius = 40.0f;
 
     // The night bed (assets/sounds/ambience/starlight). Rare by design.
     float nightVolume = 0.5f;

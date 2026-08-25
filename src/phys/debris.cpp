@@ -8,6 +8,7 @@
 #include "phys/marching_cubes.h"
 #include "sim/bytestream.h"
 #include "sim/rng.h"
+#include "sim/tuning.h"
 
 namespace {
 
@@ -58,6 +59,15 @@ constexpr uint32_t kBurnRebuildVoxels = 12;
 // Connectivity re-check after burning is O(n) per body; run it only when
 // enough matter has actually left to plausibly disconnect the remainder.
 constexpr uint32_t kShatterCheckVoxels = 6;
+
+// ---- impact cue budgets (DESIGN.md §12b) ------------------------------------
+// The fixed sim rate, which is also the rate PostStep runs at, so the per-body
+// impact gap authored in SECONDS can be expressed in PostStep counts without
+// threading a clock through eight call sites.
+constexpr float kSimTicksPerSecond = 30.0f;
+// At most this many impacts are VOICED per step, loudest first. See the
+// ImpactEvent comment in debris.h for why the cap picks rather than truncates.
+constexpr size_t kMaxImpactsPerStep = 4;
 
 // sim/rng.h — so burn rolls replay identically for a given
 // (body serial, tick, voxel, rule).
@@ -147,6 +157,11 @@ void DebrisSystem::RecountBurn(Body& b) const {
     if (matSelfActive_[m]) b.activeCount++;
     if (matHasPair_[m]) b.pairCount++;
   }
+  // Cached identity for the impact cue, refreshed here because this is already
+  // the one function every site that rewrites a body's voxel lattice calls —
+  // adoption, split, shatter fragment, damage, materials hot-reload. A body
+  // that burns down to mostly ash starts sounding like ash, which is right.
+  b.domMat = DominantMaterial(b.voxels);
 }
 
 void DebrisSystem::Reset() {
@@ -163,6 +178,8 @@ void DebrisSystem::Reset() {
   // after a regen or a LoadWorld would fire a burst of snaps at coordinates
   // that now mean something else entirely.
   breaks_.clear();
+  // Same reasoning for undrained impacts: the bodies that made them are gone.
+  impacts_.clear();
   instancesDirty_ = true;
   instanceCount_ = 0;
   // Body serials seed the burn RNG (Hash3(serial, tick, rule)), so a counter
@@ -468,30 +485,13 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     body.serial = nextSerial_++;
     RecountBurn(body);
 
-    // Audible break. The material is the piece's MOST COMMON one, not the
-    // first voxel's: an island is usually one substance, but a burnt stem
-    // carries a few ash voxels and a wall a few of whatever hit it, and
-    // picking voxel 0 would let that minority decide what the break sounds
-    // like. Counted over a small map rather than a full histogram because the
-    // voxel count here is already bounded by kMaxBodyVoxels.
-    {
-      std::unordered_map<uint32_t, uint32_t> tally;
-      for (const DebrisVoxel& v : body.voxels) tally[v.payload & 0xFFFu]++;
-      uint32_t domMat = 0, domCount = 0;
-      for (const auto& [mat, count] : tally) {
-        // Ties break toward the lower id for determinism of the REPORT: the
-        // hash never sees this, but an unstable pick would make the cue flip
-        // between runs and make a bug here hard to reproduce.
-        if (count > domCount || (count == domCount && mat < domMat)) {
-          domMat = mat;
-          domCount = count;
-        }
-      }
-      breaks_.push_back(BreakEvent{
-          Vec3{(float)origin.x + 0.5f * ex, (float)origin.y + 0.5f * ey,
-               (float)origin.z + 0.5f * ez},
-          domMat, (int32_t)body.voxels.size()});
-    }
+    // Audible break, and the body's identity for any later impact cue. Both
+    // use the piece's MOST COMMON material — see DominantMaterial.
+    body.domMat = DominantMaterial(body.voxels);
+    breaks_.push_back(BreakEvent{
+        Vec3{(float)origin.x + 0.5f * ex, (float)origin.y + 0.5f * ey,
+             (float)origin.z + 0.5f * ez},
+        body.domMat, (int32_t)body.voxels.size()});
 
     bodies_.push_back(std::move(body));
     instancesDirty_ = true;
@@ -1862,7 +1862,132 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   }
 }
 
+// The piece's MOST COMMON material, not the first voxel's: an island is
+// usually one substance, but a burnt stem carries a few ash voxels and a wall
+// a few of whatever hit it, and picking voxel 0 would let that minority decide
+// what the break or the impact sounds like. Counted over a small map rather
+// than a full histogram because the voxel count is bounded by the body cap.
+uint32_t DebrisSystem::DominantMaterial(const std::vector<DebrisVoxel>& voxels) {
+  std::unordered_map<uint32_t, uint32_t> tally;
+  for (const DebrisVoxel& v : voxels) tally[v.payload & 0xFFFu]++;
+  uint32_t domMat = 0, domCount = 0;
+  for (const auto& [mat, count] : tally) {
+    // Ties break toward the lower id for stability of the REPORT: the world
+    // hash never sees this, but an unstable pick would make the cue flip
+    // between runs and make a bug here hard to reproduce.
+    if (count > domCount || (count == domCount && mat < domMat)) {
+      domMat = mat;
+      domCount = count;
+    }
+  }
+  return domMat;
+}
+
+// Turn this step's Jolt contacts into audible impacts (DESIGN.md §12b).
+//
+// WHAT IS ALREADY FILTERED OUT BEFORE WE GET HERE. Physics' contact listener
+// only reports NEW manifolds (a landing, never a rest), only above the speed
+// gate, and never anything touching the player proxy or a Layers::AVATAR limb.
+// So a settled pile of debris and a walking player both cost zero here — which
+// is the CLAUDE.md rule 2 property this hook has to have.
+//
+// A LIVE MOB'S LIMB IS NOT DEBRIS, and gets dropped for free: limb bodies are
+// owned by MobSystem, so the handle lookup below misses and the contact is
+// discarded. A SEVERED limb has been AdoptBody'd into bodies_ by then, so it
+// does start thudding — which is exactly right.
+void DebrisSystem::CollectImpacts() {
+  const std::vector<Physics::ContactImpact>& raw = phys_->ContactImpacts();
+  if (raw.empty()) return;
+  const Tuning::Audio& ta = CurrentTuning().audio;
+  // Voxels/sec. The gate the listener already applied is the same number; this
+  // is the top of the ramp, and it must stay above the gate or every impact
+  // reports full energy.
+  const float fullVox = std::max(ta.impactFullSpeed, ta.impactMinSpeed + 0.1f) /
+                        kVoxelMeters;
+  const float minVox = ta.impactMinSpeed / kVoxelMeters;
+  const uint32_t gapSteps =
+      (uint32_t)std::max(1.0f, ta.impactMinGap * kSimTicksPerSecond);
+
+  // grid material at a world cell via the chunk cache, the same read the body
+  // burn uses. Chunks around live bodies are kept fetched by the terrain
+  // meshing, so a body landing on terrain almost always resolves; a miss reads
+  // as air and falls through to the body material below.
+  auto worldMatAt = [&](Vec3 p) -> uint32_t {
+    IVec3 c{ifloor(p.x), ifloor(p.y), ifloor(p.z)};
+    if (!world_->CellInWindow(c)) return 0u;
+    const CachedChunk* cc = world_->Cached(ChunkOfCell(c.x, c.y, c.z));
+    if (!cc || cc->voxels.size() != kChunkVol) return 0u;
+    uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+             lz = (uint32_t)(c.z & 15);
+    return cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFFu;
+  };
+  auto bodyIndexOf = [&](uint64_t h) -> size_t {
+    if (h == 0) return (size_t)-1;
+    for (size_t i = 0; i < bodies_.size(); i++)
+      if (bodies_[i].handle == h) return i;
+    return (size_t)-1;
+  };
+
+  // Candidates for this step, before the per-step cap.
+  std::vector<ImpactEvent> cand;
+  for (const Physics::ContactImpact& ci : raw) {
+    const size_t ia = bodyIndexOf(ci.bodyA), ib = bodyIndexOf(ci.bodyB);
+    if (ia == (size_t)-1 && ib == (size_t)-1) continue;  // neither is debris
+
+    // Per-body gap. Charged to every debris body in the contact, so a rock
+    // bouncing down a slope is one thud per bounce group rather than one per
+    // manifold, and two bodies clattering together do not each report it.
+    bool fresh = false;
+    for (size_t i : {ia, ib}) {
+      if (i == (size_t)-1) continue;
+      if (stepCount_ - bodies_[i].lastImpactStep < gapSteps &&
+          bodies_[i].lastImpactStep != 0)
+        continue;
+      fresh = true;
+    }
+    if (!fresh) continue;
+    for (size_t i : {ia, ib})
+      if (i != (size_t)-1) bodies_[i].lastImpactStep = stepCount_;
+
+    // WHAT WAS STRUCK decides the sound (sound_schema.js: "debris striking
+    // THIS material"), so probe the grid on both sides of the contact plane
+    // before falling back to the bodies. Two probes, because the contact point
+    // sits exactly on the surface and which side of the cell boundary it lands
+    // on is a rounding accident.
+    uint32_t mat = worldMatAt(ci.posVoxel + ci.normal * 0.6f);
+    if (mat == 0) mat = worldMatAt(ci.posVoxel - ci.normal * 0.6f);
+    if (mat == 0) mat = worldMatAt(ci.posVoxel);
+    // Body-vs-body, or terrain we could not read: the OTHER body's material,
+    // else our own. A limb hitting a boulder should sound like the boulder.
+    if (mat == 0 && ib != (size_t)-1 && ia != (size_t)-1)
+      mat = bodies_[ib].domMat;
+    if (mat == 0) mat = bodies_[ia != (size_t)-1 ? ia : ib].domMat;
+    if (mat == 0) continue;
+
+    const float k = std::clamp((ci.speedVoxPerSec - minVox) / (fullVox - minVox),
+                               0.0f, 1.0f);
+    cand.push_back(ImpactEvent{ci.posVoxel, mat, k});
+  }
+  if (cand.empty()) return;
+
+  // Loudest first, then take the cap. partial_sort rather than sort: the tail
+  // is discarded, so ordering it is work nobody reads.
+  const size_t keep = std::min(cand.size(), kMaxImpactsPerStep);
+  std::partial_sort(cand.begin(), cand.begin() + keep, cand.end(),
+                    [](const ImpactEvent& a, const ImpactEvent& b) {
+                      return a.energy > b.energy;
+                    });
+  impacts_.insert(impacts_.end(), cand.begin(), cand.begin() + keep);
+}
+
 void DebrisSystem::PostStep() {
+  stepCount_++;
+  // The gate the contact listener applies, refreshed from tuning every step so
+  // an F5 reload takes effect. Set here (game thread, between Updates) rather
+  // than inside Step: the Jolt job threads must never read CurrentTuning().
+  phys_->SetContactReportSpeed(CurrentTuning().audio.impactMinSpeed /
+                               kVoxelMeters);
+  CollectImpacts();
   IVec3 wo = world_->WindowOrigin();
   Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
            (float)(wo.z * (int)kChunk)};

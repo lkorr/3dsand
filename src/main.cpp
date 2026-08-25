@@ -3607,6 +3607,14 @@ int main(int argc, char** argv) {
         for (const DebrisSystem::BreakEvent& be : debris.BreakEvents())
           audioCues.Break(be.material, be.posVoxel, be.sizeVoxels);
 
+        // Debris that LANDED this frame, from the Jolt contact listener
+        // (DESIGN.md §12b). Same drain-outside-the-tick-loop reason as the
+        // breaks above; the material here is the surface that was STRUCK, and
+        // the speed gate / per-body gap / per-step cap that keep a collapsing
+        // wall from flooding the mixer all live in DebrisSystem.
+        for (const DebrisSystem::ImpactEvent& ie : debris.ImpactEvents())
+          audioCues.Impact(ie.material, ie.posVoxel, ie.energy);
+
         // A burst of MPM excitement (rock in a lake, floor carved under a
         // pool) reads as an impact through the water material's existing
         // slot — the Break precedent, driven from the same snapshot
@@ -3642,6 +3650,20 @@ int main(int argc, char** argv) {
           if (se.byBlade)
             audioCues.MobSound(md, audio::Cues::MobEvent::Dismember,
                                se.posVoxel, se.severity, se.mobId);
+        }
+
+        // Creatures hurt and killed this frame. Same shape as the severs
+        // above; the def index rides on the event because a killing blow
+        // despawns the mob before this drains. `mobId` is the rate-limiter
+        // key, which is what makes a burst of per-tick laser damage one cry.
+        for (const MobSystem::VoiceEvent& ve : mobs.VoiceEvents()) {
+          if (ve.defIndex < 0 || ve.defIndex >= (int)mobs.Defs().size()) continue;
+          const MobDef& md = mobs.Defs()[(size_t)ve.defIndex];
+          audioCues.MobSound(md,
+                             ve.kind == MobSystem::VoiceKind::Death
+                                 ? audio::Cues::MobEvent::Death
+                                 : audio::Cues::MobEvent::Hurt,
+                             ve.posVoxel, ve.intensity, ve.mobId);
         }
 
         // Wounds still pumping. Reported every frame while they bleed; the
@@ -3689,7 +3711,9 @@ int main(int argc, char** argv) {
       // Cleared unconditionally, like the footfalls: a queue that only drains
       // when audio happens to be on is a slow leak on a silent machine.
       debris.ClearBreakEvents();
+      debris.ClearImpactEvents();
       mobs.ClearSeverEvents();
+      mobs.ClearVoiceEvents();
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
