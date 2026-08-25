@@ -1074,7 +1074,7 @@ struct Tuning {
     // settled-powder entrainment. See kWindMode* in world.h for what each step
     // promises about rule 2 — 2 is deliberately NOT rule-2 clean yet and is
     // there to be looked at, not shipped.
-    int windMode = 0;
+    int windMode = 1;
     // Ballistic debris and spray: fraction of the gap between a particle's
     // velocity and the local wind that closes per SECOND, at a material's full
     // windResponse of 15. A drag law rather than a push, because drag is

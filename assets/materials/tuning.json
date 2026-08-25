@@ -279,7 +279,7 @@
     "fluidWakeSpeed": 24,
     "fluidSettleTicks": 24,
     "fluidStainRate": 8,
-    "windMode": 0,
+    "windMode": 1,
     "windDrag": 3,
     "windFluidGain": 0.35,
     "windFluidMass": 0.5,

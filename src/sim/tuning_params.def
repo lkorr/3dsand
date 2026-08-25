@@ -496,7 +496,7 @@ TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 // windMode is the gate and the only thing here that can move the world hash:
 // 0 off, 1 drift bias, 2 also settled-powder entrainment (kWindMode* in
 // world.h says what each promises about rule 2).
-TP_I(sim, windMode, TUNE_WIND_MODE, 0)
+TP_I(sim, windMode, TUNE_WIND_MODE, 1)
 TP_F(sim, windDrag, TUNE_WIND_DRAG, 3.0f)
 TP_F(sim, windFluidGain, TUNE_WIND_FLUID_GAIN, 0.35f)
 TP_F(sim, windFluidMass, TUNE_WIND_FLUID_MASS, 0.5f)

@@ -1,6 +1,7 @@
 # Wind — architecture decision record
 
-Date: 2026-08-25. Status: **decided; phases 1, 3 and 4 landed, 2 and 5 open.**
+Date: 2026-08-25. Status: **decided; phases 1, 3, 4 and the flip landed — wind
+is ON (`sim.windMode` = 1, hash `47dd1520`). Phases 2 and 5 open.**
 §10 records what phase 4 found; DESIGN.md §9b is the binding summary. This is
 the plan of
 record for the wind system; DESIGN.md gets its section when phase 1 lands (same
@@ -299,7 +300,7 @@ integral curves of the slope field). Toggle = in-game key + tuner bool.
 | 3 | Debris + MPM wind force; `windResponse`/`windFriction` authoring + packing | none while gated | **DONE** — packed into `flags` bits 8..15, since `MaterialGpu` has no spare word |
 | 4 | `windAtQ` + CA drift bias + entrainment, behind `sim.windMode=0` | none while gated | **DONE** — the `wind` gate: reversing the direction knob reverses the smoke, the settled bed is bitwise unmoved under drift, twice-run equality holds |
 | 2 | Primitive list + op plumbing (spell VM op, fan tag), cull mask, footprint wake (gated), viz shows primitives | none while gated | gust-bolt op visibly bends grass wake in viz. **Now also the prerequisite for switching entrainment on** — §10 |
-| 4b | Flip `sim.windMode` to 1 | rebaseline | smoke drifts, ≤32 chunks at rest still holds |
+| 4b | Flip `sim.windMode` to 1 | rebaseline | **DONE** — `882a30f3` → `47dd1520`; sleep still 0/32768 chunks active, dense reproduces the same hash, both smoke tables re-recorded with `worldgen` byte-identical |
 | 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline (with 4b or after) | fire columns loft smoke/embers; tornado lifts sand |
 
 Phases 3 and 4 landed together, and in that order, because §4.6 is wrong about

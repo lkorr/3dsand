@@ -2885,10 +2885,12 @@ Plan of record: **`docs/RESEARCH_wind.md`** — the decision record, the industr
 survey behind it, and the five-phase schedule. This section is the binding
 summary; that file is where the reasoning lives.
 
-**Phases 1, 3 and 4 have landed. Phase 2 (primitives) and phase 5 (updrafts,
-violent-wind excite) are not started.** Phase 4's gate ships at
-`sim.windMode = 0`, so the pinned world hash is unchanged and the flip is still
-its own commit.
+**Phases 1, 3 and 4 have landed and the gate is ON.** `sim.windMode` ships at
+**1**: the CA drift bias, the ballistic-particle drag and the MPM node force are
+live, and the pinned hash moved `882a30f3` -> `47dd1520` in a dedicated
+rebaseline commit. Mode 2 (settled-powder entrainment) is implemented but not a
+default — see below. Phase 2 (primitives) and phase 5 (updrafts, violent-wind
+excite) are not started.
 
 ### The decision, in one paragraph
 
@@ -3055,8 +3057,19 @@ whenever the knob is set to 2.
 | # | Scope | Hash risk |
 |---|---|---|
 | 2 | Primitive list + op plumbing (spell VM op, fan tag), per-chunk cull mask, footprint wake — **and the prerequisite for entrainment**, see above | none while gated |
-| 4b | Flip `sim.windMode` to 1 | **rebaseline** |
 | 5 | Per-chunk hot-material counts → updraft term; violent wind promoting voxels to particles; capes when cloth exists | rebaseline |
+
+Phase 4b, the flip, is **done**: `882a30f3` -> `47dd1520`. What the rebaseline
+established, beyond the sim being self-consistent: `sleep` still reports **0 of
+32,768 chunks active** after settling, so rule 2 survives — which it must, since
+the drift bias only reorders candidates a moving voxel was already going to try
+and cannot make a settled one move. `--residency dense` reproduces the same
+hash, so the new number is the world and not a paging artifact. Both `--vk-smoke`
+tables were re-recorded; `worldgen` is byte-identical in both, as it must be.
+The QUIET smoke scenario moved this time (it did not for the previous two
+liquid rebaselines), and that is correct rather than alarming: quiet is the
+first 50 ticks after worldgen, when terrain powders are still coming to rest,
+and matter in motion is exactly what the bias steers.
 
 ## 10. Networking (design now, build later)
 

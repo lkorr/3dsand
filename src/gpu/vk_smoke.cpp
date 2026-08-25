@@ -97,38 +97,45 @@ struct Pinned {
 
 constexpr Pinned kQuietPinned[] = {
     {0, 0xf97ba745},   // worldgen
-    {1, 0xd5c8944c},
-    {15, 0xf153ce74},
-    {30, 0x434268e6},
-    {50, 0xb3c643a2},  // the settled hash PLAN_vulkan_port.md's baseline
-                       // recorded independently
+    {1, 0xcfe240ba},
+    {15, 0xeb6d7ae2},
+    {30, 0x3d5c1554},
+    {50, 0xaddff010},  // was PLAN_vulkan_port.md's independently recorded
+                       // settled hash until the wind flip
 };
 
-// RE-RECORDED TWICE, both times for a sanctioned liquid rebaseline:
+// RE-RECORDED THREE TIMES, each for a sanctioned rebaseline:
 //   * WP5's flip of sim.fluidExciteMode to 1 (world hash 7b01cfd8 -> 58b27f33)
 //   * the LEVELLING pass (dc666ada -> 882a30f3): sim_step.wgsl gained the
 //     pressed-film and bridged-equalize lateral rules, sim.liquidMinFilm went
 //     back to 1, and the seam gained the surface-step excite trigger.
-// 18 of the 19 moved both times; `worldgen` is byte-identical, as it must be —
-// worldgen writes voxels and neither the CA nor the seam runs during it.
+//   * the WIND FLIP (882a30f3 -> 47dd1520): sim.windMode 0 -> 1, so the CA
+//     drift bias, the ballistic-particle drag and the MPM node force are live.
+// In all three, `worldgen` is byte-identical, as it must be — worldgen writes
+// voxels and neither the CA nor the seam runs during it. That one row is the
+// standing check that a rebaseline is a CONTENT change and not a codegen,
+// zero-init or binding change, which would move it too.
 //
-// The split between the two scenarios is the attribution, and it is worth
-// stating because "the hash moved" and "the sim broke" look alike in a diff:
-// the QUIET scenario is still 5/5 on its ORIGINAL pinned values through tick
-// 50, and that world contains worldgen's disc ponds and its authored lake. So
-// the world's own standing water does not excite itself, drain spontaneously,
-// re-level itself on load, or cost anything undisturbed — which is the single
-// most useful thing to know about a change to the liquid rules, and it survived
-// this one unchanged. Only the LOUD scenario moved, and that one paints a water
-// brush at (176,150,176) from tick 8 and detonates next to it — exactly the
-// water whose mover changed.
+// WHAT THE TWO SCENARIOS SEPARATE, and it says something different this time.
+// Through the first two rebaselines the QUIET scenario held its ORIGINAL values
+// while only LOUD moved, which was the useful fact about both: the world's own
+// standing water does not excite itself, drain, re-level on load or cost
+// anything undisturbed, so the change was confined to water somebody poured.
+//
+// The wind flip moves QUIET too, from tick 1, and that is correct rather than
+// alarming. Quiet is not a still world — it is the first 50 ticks after
+// worldgen, when the terrain's powders are still coming to rest, and matter
+// that is in motion is exactly what the drift bias steers. Settled matter is
+// untouched (the `wind` gate asserts a settled bed is bitwise unchanged), so
+// the right reading of "quiet moved" here is "worldgen's sand landed
+// somewhere slightly different", not "the world is no longer quiet".
 constexpr Pinned kLoudPinned[] = {
     {0, 0xf97ba745},   // worldgen — same seed, so identical to the quiet run
-    {15, 0xf4aa9969},  {30, 0x19ea8b65},  {45, 0x24b1daca},  {46, 0x49a5f92d},
-    {47, 0xe7862e4d},  {52, 0x53c3c98b},  {53, 0xea4494ee},  {60, 0x167ab7fb},
-    {75, 0xcc08b928},  {76, 0xfd36af68},  {84, 0x36ccad78},  {85, 0x624cffd5},
-    {86, 0xd5b19979},  {87, 0xb9dc3fb8},  {88, 0x71288da8},  {90, 0x2d44dc27},
-    {105, 0x94017df4}, {120, 0x54d810e7},
+    {15, 0x6e5ae540},  {30, 0xc43d5b9f},  {45, 0xc1eb81a6},  {46, 0x65f2c664},
+    {47, 0xafbdbf44},  {52, 0x6e97906c},  {53, 0x1e5da43e},  {60, 0x587b2f52},
+    {75, 0xa5fc06a0},  {76, 0xe1230b37},  {84, 0x940c4dda},  {85, 0x51eaceb0},
+    {86, 0x4c4d19b4},  {87, 0xcfacc307},  {88, 0xeffa8b66},  {90, 0xc984ea2e},
+    {105, 0x2e0cad43}, {120, 0x14008d2a},
 };
 
 // The loud scenario, verbatim from phase 3c: ops shaped to light up every
