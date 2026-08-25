@@ -15,6 +15,8 @@ bash scripts/board.sh note "<heads-up>"          # cross-cutting info
 
 Claim before editing: `world.h`, `common.wgsl`, `simulation.cpp`, `main.cpp`, `CLAUDE.md`, `DESIGN.md`, `assets/materials/`, `assets/spells/`, `assets/tuner*`. Re-check board before build/commit/selftest. Stale claims (hours old, untouched files) are abandoned — note and proceed. Also `ls --time-style=full-iso` hub files you depend on.
 
+**Engine map maintenance:** when you land or complete work, update `ARCH_NODES` in `assets/tuner.html` — add/remove `wip` fields, update `desc`/`details`, add new nodes if you created a new system. Keep the Development Status panel's recently-landed and planned lists current. Use only ASCII `'` for JS string delimiters (the file has curly `'` inside strings for typography — don't flatten those).
+
 ## Three inviolable rules
 
 ### 1. Bit-deterministic simulation
