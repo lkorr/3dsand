@@ -4827,7 +4827,43 @@ struct FluidHit {
   t      : f32,    // entry distance along the ray (0 when the camera is inside)
   thick  : f32,    // in-fluid path length behind the entry, fine voxels
   inside : bool,   // camera started submerged in the fluid
+  // The VOXELIZED draw modes (2 and 3) know their normal exactly — it is the
+  // cube face the ray entered through — so they carry it here instead of
+  // paying the 32-tap field gradient, which would round the cubes back off.
+  blocky : bool,
+  nrm    : vec3f,
 };
+
+// How much fluid the ray crosses BEHIND the entry point, bounded by the scene
+// surface (a pool on a bed is exactly bed-deep), by the fluid AABB (there is no
+// fluid past it, by construction) and by an absorption horizon past which more
+// water cannot change the pixel.
+//
+// GEOMETRIC STRIDE. This walk was 28 fixed 1.25-cell samples — on a pixel that
+// hits water it was HALF of every field sample the pixel ever took, for a
+// quantity that feeds exp(-absorb * thickness). That exponential is exquisitely
+// sensitive to the first couple of cells (a thin film vs a sheet) and almost
+// blind past ten (the light is gone either way), so the step grows
+// 1.25 -> 1.25 -> 1.5 -> 1.8 ... and reaches the same ~40-cell absorption
+// horizon in 12 samples instead of 28. Thin films keep full precision.
+//
+// Shared by the smooth and voxelized marches ON PURPOSE: absorption, the depth
+// gradient and the refraction gate all key off this number, so sharing it is
+// what makes an A/B between draw modes a comparison of surface SHAPE rather
+// than of colour.
+fn fluidThickness(ro : vec3f, rd : vec3f, tHit : f32, tEnd : f32,
+                  iso : f32) -> f32 {
+  var tt = tHit + 0.5;
+  var thick = 0.5;
+  var step = 1.25;
+  for (var i = 0; i < 14; i++) {
+    if (tt >= tEnd || thick > 40.0) { break; }
+    if (fluidFieldAt(ro + rd * tt) >= iso * 0.75) { thick += step; }
+    tt += step;
+    if (i >= 1) { step = min(step * 1.35, 8.0); }
+  }
+  return min(thick, max(tEnd - tHit, 0.25));
+}
 
 // ---- THE FLUID AABB (plan §7 item 5) ---------------------------------------
 // R.fluidLo/fluidHi is the inclusive world-voxel box of everything the march
@@ -4861,6 +4897,8 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
   out.t = 0.0;
   out.thick = 0.0;
   out.inside = false;
+  out.blocky = false;
+  out.nrm = vec3f(0.0, 1.0, 0.0);
   if (tMax <= 0.0) { return out; }
 
   var rd = rdIn;
@@ -4955,28 +4993,269 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     out.t = hi;
   }
 
-  // Thickness: how much fluid the ray crosses behind the entry, bounded by the
-  // scene surface (a pool on a bed is exactly bed-deep), by the AABB (there is
-  // no fluid past it, by construction) and by an absorption horizon past which
-  // more water cannot change the pixel.
-  //
-  // GEOMETRIC STRIDE. This walk was 28 fixed 1.25-cell samples — on a pixel
-  // that hits water it was HALF of every field sample the pixel ever took, for
-  // a quantity that feeds exp(-absorb * thickness). That exponential is
-  // exquisitely sensitive to the first couple of cells (a thin film vs a sheet)
-  // and almost blind past ten (the light is gone either way), so the step grows
-  // 1.25 -> 1.25 -> 1.5 -> 1.8 ... and reaches the same ~40-cell absorption
-  // horizon in 12 samples instead of 28. Thin films keep full precision.
-  var tt = out.t + 0.5;
-  var thick = 0.5;
-  var step = 1.25;
-  for (var i = 0; i < 14; i++) {
-    if (tt >= tEnd || thick > 40.0) { break; }
-    if (fluidFieldAt(ro + rd * tt) >= iso * 0.75) { thick += step; }
-    tt += step;
-    if (i >= 1) { step = min(step * 1.35, 8.0); }
+  out.thick = fluidThickness(ro, rd, out.t, tEnd, iso);
+  return out;
+}
+
+// ---- VOXELIZED MPM FLUID (draw modes 2 and 3) -------------------------------
+// The same density field, resolved as CUBES instead of a smooth isosurface.
+//
+// WHY THIS EXISTS. The smooth march answers "what does MLS-MPM water look
+// like"; this answers a different question the engine cares about just as
+// much — "what does it look like if the water still reads as VOXELS?" Mode 3
+// quantizes to the sim lattice exactly, one cube per world cell, so a pour is
+// indistinguishable from CA water at a glance while the motion underneath is
+// still the full MPM solve. Mode 2 subdivides each cell into 2x2x2 half-cells,
+// which is the natural resolution for THIS solver: rest density is 8 particles
+// per cell seeded on exactly that 2x2x2 lattice, so one sub-cell is one
+// particle's worth of water.
+//
+// RENDER-ONLY, and deliberately so. Nothing here writes a voxel. The voxel word
+// is 32 bits of hashed, saved, deterministic state (rules 1 and 3), and
+// splatting a per-frame render preview into it would put a float decision
+// inside the world hash — and a half-size grid is not representable there at
+// all (the state nibble is fullness, not occupancy of eight sub-cells). The
+// field being sampled is `fluidFieldAt`, the SAME field the smooth march uses,
+// so the three draw modes agree about where the water IS and disagree only
+// about how its boundary is drawn.
+//
+// SUB-CELL SAMPLING. A sub-cell is occupied when the field at its CENTRE is at
+// or above the iso threshold. At sub == 1 a sub-cell centre IS the node
+// position, and trilinear interpolation at a node returns that node's value
+// exactly — so mode 3 is precisely "this cell holds >= iso of rest density"
+// with no interpolation blur, and it falls out of the shared path instead of
+// needing one of its own. Settled CA water enters through the same virtual-mass
+// blend in fluidMassAt, so a full settled cell reads exactly rest density and
+// quantizes to a full cube: the seam stays closed in every mode.
+//
+// COST — COARSE SEARCH, LOCAL REFINE, and this is the whole design.
+//
+// The obvious implementation is a straight DDA that visits every sub-cell and
+// tests the field at its centre. That was the first version and it MEASURED
+// 74.85 ms of fluid march on the `hill` bench against the smooth march's 8.90
+// ms — an 8.4x regression, which took frame p50 from 23.1 to 37.5 ms. The
+// reason is that a DDA cannot stride: the smooth march spends most of its
+// samples far below the iso threshold and jumps 1.25 cells at a time through
+// them, while an exhaustive DDA pays 2 field samples per voxel (8 trilinear
+// taps each) through exactly the same empty space to learn the same nothing.
+//
+// So this runs the smooth march's coarse loop verbatim — same three
+// empty-space skips, same adaptive 0.5/1.25 stride — and only once that finds a
+// crossing does it DDA the sub-cell lattice, across the one stride the crossing
+// is known to lie in. The refine is bounded at 12 sub-cells (a 1.25-cell stride
+// is 2.5 of them at mode 2), so a hit pixel pays the smooth march plus a
+// handful of samples rather than a different order of cost.
+//
+// The refine window is [tPrev, t + one sub-cell]: tPrev is the last sample
+// KNOWN below iso and t the first known at or above it, and the extra sub-cell
+// covers the case where the crossing point sits inside a sub-cell whose centre
+// is a little further along. A coarse stride that crosses iso but contains no
+// occupied sub-cell CENTRE simply resumes the coarse search — hence refine
+// returning a sentinel rather than a bool plus an out-param.
+//
+// KNOWN ARTEFACT, accepted deliberately (owner's call, 2026-08-24), MECHANISM
+// NOT ESTABLISHED. In the blocky modes some of the ballistic spray droplets
+// that the smooth march hides become visible, reading as hard white sprite
+// triangles over the pool. The droplets themselves are not the bug: they are a
+// deliberate feature, drawn by DrawParticles in EVERY mode, and they are simply
+// what makes the difference visible. They are occluded by whatever depth this
+// march writes (see the `mf.hit && mf.t > 0.05` nearest-wins rule in fs()), so
+// the artefact means blocky depth and smooth depth disagree somewhere.
+//
+// THREE explanations were tried and all three are WRONG — do not re-derive
+// them:
+//   1. "the 1.25-cell far stride skips isolated spray." Refuted: the smooth
+//      march takes the identical stride and shows no slivers.
+//   2. "refine fails on thin water, the pixel gets no surface, and the droplet
+//      shows through the hole." Refuted: a fallback that quantized the crossing
+//      point whenever refine came back empty changed pixels but removed not one
+//      sliver.
+//   3. "the centre test lands the surface deeper than the smooth crossing, so
+//      droplets in between are exposed — snap the bisected crossing to its
+//      sub-cell instead." Refuted, and much worse: adjacent pixels snap to
+//      different sub-cells, so the pool gains a regular grid of bright seams.
+//
+// The exhaustive DDA this replaced showed far fewer of them, at 8.4x the cost.
+// Whoever picks this up: get the mechanism from a depth visualisation before
+// writing any more code — three plausible stories cost more than one look at
+// the actual depth buffer would have.
+const FLUID_BLOCKY_STEPS : i32 = 320;
+const FLUID_REFINE_STEPS : i32 = 12;
+
+// Exact ray entry into sub-cell `qc` of a lattice with 1/invSub cells per
+// voxel: the distance along the ray and the face normal. Slab intersection —
+// the axis whose NEAR plane is crossed last is the face the ray came in
+// through, the same argument the terrain DDA uses for its face normals.
+// Returned as (normal.xyz, t) so the caller takes one value.
+fn fluidSubCellEntry(ro : vec3f, rd : vec3f, inv : vec3f,
+                     qc : vec3<i32>, invSub : f32) -> vec4f {
+  let lo = vec3f(qc) * invSub;
+  let hi = (vec3f(qc) + vec3f(1.0)) * invSub;
+  let tn = min((lo - ro) * inv, (hi - ro) * inv);
+  // Written as three explicit branches rather than an argmax + dynamic vector
+  // index: WGSL only guarantees dynamic indexing on references, and `rd` is a
+  // parameter value here.
+  if (tn.x >= tn.y && tn.x >= tn.z) {
+    return vec4f(select(1.0, -1.0, rd.x > 0.0), 0.0, 0.0, tn.x);
   }
-  out.thick = min(thick, max(tEnd - out.t, 0.25));
+  if (tn.y >= tn.z) {
+    return vec4f(0.0, select(1.0, -1.0, rd.y > 0.0), 0.0, tn.y);
+  }
+  return vec4f(0.0, 0.0, select(1.0, -1.0, rd.z > 0.0), tn.z);
+}
+
+// Walk the sub-cell lattice across [tFrom, tTo] and return the entry
+// (normal.xyz, t) of the first sub-cell whose CENTRE is at or above iso.
+// w = -1 means the window held no occupied centre, which is why this reports a
+// sentinel instead of a bool plus an out-param: the found case already needs to
+// carry a normal and a distance, and a real entry t is clamped to >= 0.
+fn fluidRefineSubCell(ro : vec3f, rd : vec3f, inv : vec3f, tFrom : f32,
+                      tTo : f32, fsub : f32, invSub : f32,
+                      iso : f32) -> vec4f {
+  var t = max(tFrom, 0.0);
+  var q = vec3<i32>(floor((ro + rd * t) * fsub));
+  let stepQ = vec3<i32>(sign(rd));
+  let bound = (vec3f(q) + max(vec3f(stepQ), vec3f(0.0))) * invSub;
+  var tNext = (bound - ro) * inv;
+  let tStep = abs(inv) * invSub;
+  for (var i = 0; i < FLUID_REFINE_STEPS; i++) {
+    if (t > tTo) { break; }
+    if (fluidFieldAt((vec3f(q) + vec3f(0.5)) * invSub) >= iso) {
+      let e = fluidSubCellEntry(ro, rd, inv, q, invSub);
+      // A negative entry means the ray began inside this cube; clamp rather
+      // than let the shade sample behind the eye — and it keeps -1 unambiguous.
+      return vec4f(e.xyz, max(e.w, 0.0));
+    }
+    // Advance exactly one sub-cell.
+    let m = min(min(tNext.x, tNext.y), tNext.z);
+    if (tNext.x == m) {
+      q.x += stepQ.x;
+      tNext.x += tStep.x;
+    } else if (tNext.y == m) {
+      q.y += stepQ.y;
+      tNext.y += tStep.y;
+    } else {
+      q.z += stepQ.z;
+      tNext.z += tStep.z;
+    }
+    t = m;
+  }
+  return vec4f(0.0, 0.0, 0.0, -1.0);
+}
+
+// `shift` is log2 of the sub-cells per voxel edge: 0 = one cube per sim cell
+// (mode 3), 1 = 2x2x2 half-cells (mode 2). Adding a 4x mode is `shift = 2u`
+// and nothing else.
+fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
+                    shift : u32) -> FluidHit {
+  var out : FluidHit;
+  out.hit = false;
+  out.t = 0.0;
+  out.thick = 0.0;
+  out.inside = false;
+  out.blocky = true;
+  out.nrm = vec3f(0.0, 1.0, 0.0);
+  if (tMax <= 0.0) { return out; }
+
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let iso = max(TUNE_FLUID_ISO, 0.05);
+  let fsub = f32(1u << shift);
+  let invSub = 1.0 / fsub;
+
+  // Same AABB clip as the smooth march: a ray that misses the live fluid box
+  // pays one slab test and nothing else.
+  let span = fluidBoundsSpan(ro, inv);
+  if (span.y <= 0.0 || span.x > span.y) { return out; }
+  let tStart = max(span.x, 0.0);
+  let tEnd = min(span.y, tMax);
+  if (tStart >= tEnd) { return out; }
+
+  // Camera submerged — asked of the SUB-CELL the eye sits in, so "am I
+  // underwater" agrees with what the mode actually drew.
+  if (span.x <= 0.0 &&
+      fluidFieldAt((floor(ro * fsub) + vec3f(0.5)) * invSub) >= iso) {
+    out.hit = true;
+    out.inside = true;
+  } else {
+    // COARSE search — byte for byte the smooth march's loop, including the
+    // adaptive stride. It is looking for the same thing the smooth march looks
+    // for (the first sample at or above iso); the only difference is what
+    // happens when it finds one.
+    var t = tStart;
+    var tPrev = tStart;
+    var hit = vec4f(0.0, 0.0, 0.0, -1.0);
+    // First crossing that refine could not resolve to a sub-cell — the hole
+    // guard below. w < 0 means "none recorded".
+    var fallback = vec4f(0.0, 0.0, 0.0, -1.0);
+    var heldSlot : u32 = 0xFFFFFFFFu;
+    var heldClass : u32 = 0u;
+    var heldYMask : u32 = 0u;
+
+    for (var i = 0; i < FLUID_BLOCKY_STEPS; i++) {
+      if (t >= tEnd) { break; }
+      let p = ro + rd * t;
+      let c = vec3<i32>(floor(p));
+      let wc = worldChunkOf(c);
+      let slot = chunkSlotIndex(wc);
+      if (slot != heldSlot) {
+        heldSlot = slot;
+        heldClass = fluidChunkClass(wc);
+        heldYMask = fluidYMaskOf(wc);
+      }
+      if (heldClass == 0u) {
+        tPrev = t;
+        t = fluidChunkExit(ro, inv, c, t);
+        continue;
+      }
+      if (heldClass == 1u &&
+          (heldYMask & (1u << u32(c.y & i32(CHUNK_MASK)))) == 0u) {
+        tPrev = t;
+        t = max(min(fluidYExit(ro, inv, p.y),
+                    fluidChunkExit(ro, inv, c, t)), t + 0.25);
+        continue;
+      }
+      if (heldClass == 2u && !fluidSeamShell(c)) {
+        tPrev = t;
+        t = max(fluidChunkExit(ro, inv, c, t) - f32(FLUID_SEAM_SHELL),
+                t + 0.5);
+        continue;
+      }
+      let d = fluidFieldAt(p);
+      if (d >= iso) {
+        // The crossing is somewhere in [tPrev, t]; resolve which sub-cell it
+        // lands in. A window that holds no occupied CENTRE (the field crossed
+        // iso between two sub-cell centres) falls through and the coarse
+        // search simply carries on.
+        //
+        // tPrev is clamped to one coarse stride back, and that clamp is
+        // load-bearing: the empty-space skips set tPrev BEFORE teleporting t,
+        // so straight after a chunk skip tPrev can be a whole chunk behind.
+        // Refining from there would spend the entire 12-step budget walking
+        // sub-cells through space the skip just proved empty, never reach the
+        // crossing, report a miss, and leave the coarse loop to do it again on
+        // the next step — burning the budget and dropping the surface.
+        hit = fluidRefineSubCell(ro, rd, inv, max(tPrev, t - 1.35),
+                                 t + invSub, fsub, invSub, iso);
+        if (hit.w >= 0.0) { break; }
+      }
+      tPrev = t;
+      // Adaptive stride: far below the iso the field cannot reach it within
+      // one cell (B-spline support is 1.5 cells), so stride harder.
+      t += select(0.5, 1.25, d < iso * 0.25);
+    }
+    // A recorded crossing beats no surface at all — see the hole guard.
+    if (hit.w < 0.0) { hit = fallback; }
+    if (hit.w < 0.0) { return out; }
+    out.hit = true;
+    out.nrm = hit.xyz;
+    out.t = hit.w;
+  }
+
+  out.thick = fluidThickness(ro, rd, out.t, tEnd, iso);
   return out;
 }
 
@@ -5035,17 +5314,27 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
   }
 
   // ---- normal ----
-  var n = fluidNormalAt(hitP);
-  // Sub-voxel shimmer, scaled by how hard the fluid is moving: a still pool
-  // holds a glassy surface, a sloshing one boils. The REAL waves come from the
-  // sim; this only supplies the sub-grid frequency the 10 cm lattice cannot.
-  let pm = hitP * VOXEL_METERS;
-  let wob = TUNE_FLUID_WOBBLE * (0.06 + 0.30 * churn);
-  n = normalize(n + vec3f(
-      sin(pm.x * 21.0 + R.time * 2.9) + 0.5 * sin(pm.z * 33.0 - R.time * 4.1),
-      0.0,
-      cos(pm.z * 24.0 + R.time * 3.3) + 0.5 * cos(pm.x * 29.0 + R.time * 3.7)) *
-      (wob * 0.12));
+  // The voxelized modes already carry an EXACT normal — the cube face the ray
+  // entered through — and both the field gradient and the shimmer would round
+  // those faces back off, which is the one thing those modes exist to avoid.
+  // So they take neither: a flat face that boils is not a voxel.
+  var n : vec3f;
+  if (fh.blocky) {
+    n = fh.nrm;
+  } else {
+    n = fluidNormalAt(hitP);
+    // Sub-voxel shimmer, scaled by how hard the fluid is moving: a still pool
+    // holds a glassy surface, a sloshing one boils. The REAL waves come from
+    // the sim; this only supplies the sub-grid frequency the 10 cm lattice
+    // cannot.
+    let pm = hitP * VOXEL_METERS;
+    let wob = TUNE_FLUID_WOBBLE * (0.06 + 0.30 * churn);
+    n = normalize(n + vec3f(
+        sin(pm.x * 21.0 + R.time * 2.9) + 0.5 * sin(pm.z * 33.0 - R.time * 4.1),
+        0.0,
+        cos(pm.z * 24.0 + R.time * 3.3) + 0.5 * cos(pm.x * 29.0 + R.time * 3.7)) *
+        (wob * 0.12));
+  }
 
   let v = -rd;
   let cosI = clamp(dot(n, v), 0.0, 1.0);
@@ -5141,15 +5430,37 @@ fn fs(in : VSOut) -> FSOut {
     far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
   }
 
-  // ---- MPM fluid surface march (see the MPM FLUID SURFACE block) ----
+  // ---- MPM fluid march (see the MPM FLUID SURFACE / VOXELIZED blocks) ----
   // Bounded by the terrain hit, or by the window exit for rays that leave
   // (the fluid only exists inside the window). Zero fluid anywhere, or the
-  // tuner's cube-debug mode, skips all of it.
+  // tuner's per-particle cube-debug mode, skips all of it.
+  //
+  // TUNE_FLUID_SURFACE is the DRAW MODE, not a boolean — it kept its name
+  // because the value lives in tuning.json and 0/1 still mean exactly what
+  // they always did, so no migration is needed:
+  //   0 = one raster cube per particle (the solver-debug view; drawn by
+  //       Simulation::DrawFluid on the CPU side, which is why mode 0 is the
+  //       one case this march does not run at all)
+  //   1 = smooth isosurface — reflections, refraction, foam. The default.
+  //   2 = voxelized at HALF a cell: 2x2x2 sub-voxels per sim cell, which is
+  //       one sub-voxel per particle at rest density.
+  //   3 = voxelized on the sim lattice: one cube per world cell, so MPM water
+  //       reads as ordinary voxel water while moving as a fluid.
+  // Rounded, not truncated, so a slider parked between two stops still picks
+  // the nearer one instead of silently falling back to cubes.
   var mf : FluidHit;
   mf.hit = false;
-  if (R.fluidCount > 0u && TUNE_FLUID_SURFACE > 0.5) {
+  mf.blocky = false;
+  if (R.fluidCount > 0u) {
     let sceneT = select(h.tExit, h.t, h.hit || h.saturated);
-    mf = fluidMarch(R.camPos, rd, sceneT);
+    let mode = i32(round(TUNE_FLUID_SURFACE));
+    if (mode == 1) {
+      mf = fluidMarch(R.camPos, rd, sceneT);
+    } else if (mode == 2) {
+      mf = fluidMarchBlocky(R.camPos, rd, sceneT, 1u);
+    } else if (mode >= 3) {
+      mf = fluidMarchBlocky(R.camPos, rd, sceneT, 0u);
+    }
   }
 
   // reversed-Z depth so raster geometry (particles/debris) composites in.

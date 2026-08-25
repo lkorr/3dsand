@@ -66,9 +66,9 @@ TP_F(render, fluidStretch, TUNE_FLUID_STRETCH, 0.4f)
 TP_F(render, fluidDensityShade, TUNE_FLUID_DENSITY_SHADE, 0.45f)
 TP_F(render, fluidFoam, TUNE_FLUID_FOAM, 0.55f)
 // MPM fluid SURFACE rendering (raymarch.wgsl MPM FLUID SURFACE block):
-// surface 1/0 toggle, iso x rest density, smooth in voxels, clarity metres,
-// foamSpeed vox/s.
-TP_F(render, fluidSurface, TUNE_FLUID_SURFACE, 1.0f)
+// fluidSurface is a 0-3 DRAW MODE (see tuning.h), iso x rest density,
+// smooth in voxels, clarity metres, foamSpeed vox/s.
+TP_F(render, fluidSurface, TUNE_FLUID_SURFACE, 2.0f)
 TP_F(render, fluidIso, TUNE_FLUID_ISO, 0.30f)
 TP_F(render, fluidSmooth, TUNE_FLUID_SMOOTH, 1.3f)
 TP_F(render, fluidIor, TUNE_FLUID_IOR, 1.33f)

@@ -481,6 +481,30 @@
   .arch-box.grp.open .bl{font-size:12px;letter-spacing:.02em}
   .arch-box:hover{filter:brightness(1.25)}
   .arch-box.sel{box-shadow:0 0 0 2px #ffd479,0 0 16px rgba(255,212,121,.35)}
+  .arch-box .wip{
+    font:bold 9px/1 var(--mono);color:#1b222d;background:#fbbf24;
+    border-radius:4px;padding:1px 4px 2px;flex:none;margin-left:4px;
+    letter-spacing:.03em;animation:wipPulse 2.4s ease-in-out infinite;
+  }
+  @keyframes wipPulse{0%,100%{opacity:1}50%{opacity:.55}}
+  .arch-box.has-wip{border-style:dashed}
+  .eng-status-panel{margin:20px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .eng-status-panel h3{margin:0;padding:12px 16px;background:rgba(255,255,255,.04);
+    border-bottom:1px solid var(--line);font-size:14px;letter-spacing:-.01em}
+  .eng-status-panel .status-body{padding:0 16px 16px}
+  .eng-status-panel .status-section{margin-top:14px}
+  .eng-status-panel .status-section h4{margin:0 0 8px;font-size:12px;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--faint)}
+  .eng-status-item{display:flex;align-items:baseline;gap:8px;padding:5px 0;
+    border-bottom:1px solid rgba(255,255,255,.04);font-size:12.5px;line-height:1.5}
+  .eng-status-item:last-child{border-bottom:none}
+  .eng-status-item .badge{flex:none;font:bold 9px/1 var(--mono);border-radius:4px;padding:2px 6px}
+  .eng-status-item .badge.wip{background:#fbbf24;color:#1b222d}
+  .eng-status-item .badge.planned{background:#4c9aff;color:#fff}
+  .eng-status-item .badge.needed{background:#f2726f;color:#fff}
+  .eng-status-item .badge.done-recent{background:#5ed3a5;color:#1b222d}
+  .eng-status-item .lbl{color:var(--fg);font-weight:600}
+  .eng-status-item .desc{color:var(--dim)}
   .t-gpu{border-color:#4c9aff;background:#16273d}
   .t-cpu{border-color:#f2a65a;background:#291f14}
   .t-xfer{border-color:#c792ea;background:#23182e}
@@ -6457,7 +6481,8 @@ const ARCH_NODES={
 
   // ------------------------------------------------------------ simulation
   simTick:{label:'Simulation Tick',tag:'gpu',
-    desc:'One 30 Hz tick of GPU work, recorded by walking a declarative table rather than by hand-written encode calls. Every heavy pass is an indirect dispatch over the compacted dirty-chunk list, so a settled world dispatches nothing — and since v3.4 it does not even RECORD the rows.',
+    wip:'§3.2d: particlesActive timer defeats the settled skip — fix in progress on perf/ca-settled-particles',
+    desc:'One 30 Hz tick of GPU work, recorded by walking a declarative table rather than by hand-written encode calls. Every heavy pass is an indirect dispatch over the compacted dirty-chunk list, so a settled world dispatches nothing — and since v3.4 it does not even RECORD the rows. The settled skip itself landed at 141x (141.7 → 1.0 us/tick) but a 400-tick particle timer still holds it off.',
     files:['src/sim/simulation.h','src/sim/simulation.cpp','src/sim/pass_table.def'],
     sym:['Simulation::EncodeTick','Simulation::RecordTable','Simulation::NoteTickInputs'],
     cst:['world.h  kFluidSubsteps','pass_table.h  Table::Tick'],
@@ -6511,13 +6536,14 @@ const ARCH_NODES={
     details:'Double-buffered ring (integrate reads page A, writes page B) so no particle is read after it moves. The claim buffer is indexed by SLOT, not page — it is an identity, not an address.'},
 
   fluidSys:{label:'MLS-MPM Fluid',tag:'gpu',
-    desc:'Material Point Method water solver in Q16.16 fixed point, with a density equation-of-state pressure term, per-species mass channels, and an excite/settle seam that converts CA voxels into MPM particles and back.',
+    wip:'WP3: settle-refusal hysteresis + slope excite triggers — hill capture stuck at 53.3% by plunge-pool churn',
+    desc:'Material Point Method water solver in Q16.16 fixed point. WP2 landed separate BC with tangential preservation (mid-slope freeze gone), CFL-honest zero-tension defaults (stiffness 3600, viscosity 0.1), and calm-water settling. WP4 landed render AABB bounds, indirect seam dispatches off GPU counters, true sleep (idle fluid 0.0 ms), and a 1.5–1.9x whole-frame speedup in every lab scene.',
     files:['assets/shaders/sim_fluid.wgsl','assets/shaders/sim_fluid_seam.wgsl','src/sim/pass_table.def'],
     cst:['world.h  kFluidCap','world.h  kFluidBlocks','world.h  kFluidSubsteps','world.h  kFluidSettleMax','world.h  kFluidParticleWords'],
     tst:['fluid-det','fluid-settle','fluid-excite','fluid-stain','fluid-react'],
-    doc:['docs/PLAN_mpm_fluids.md'],
+    doc:['docs/PLAN_mpm_fluids.md','docs/PLAN_fluid_overhaul.md'],
     rule:1,
-    details:'<b>Pipeline:</b> spawn -> mark blocks -> alloc grid -> P2G -> grid update -> G2P, repeated <code>kFluidSubsteps</code> times inside one tick.<br><br><b>The one float exception:</b> the <code>sim.fluid*</code> tuning rows are authored in human units (vox/s^2, vox^2/s, seconds) and converted to Q16.16-per-tick integers by WGSL const-eval at the top of <code>sim_fluid.wgsl</code>. That is IEEE-exact at compile time, so the kernel itself stays integer and rule 1 holds.<br><br><code>fluidExciteMode</code> defaults OFF — turning it on changes the world hash.'},
+    details:'<b>Pipeline:</b> spawn -> mark blocks -> alloc grid -> P2G -> grid update -> G2P, repeated <code>kFluidSubsteps</code> times inside one tick.<br><br><b>The one float exception:</b> the <code>sim.fluid*</code> tuning rows are authored in human units (vox/s^2, vox^2/s, seconds) and converted to Q16.16-per-tick integers by WGSL const-eval at the top of <code>sim_fluid.wgsl</code>. That is IEEE-exact at compile time, so the kernel itself stays integer and rule 1 holds.<br><br><code>fluidExciteMode</code> defaults OFF — turning it on changes the world hash.<br><br><b>WP4 perf findings:</b> the fluid isosurface march was the entire render cost (20 ms of 25.8 on hill scene). Fix: world AABB in RenderParams, 2-cell seam shell, per-chunk Y-occupancy mask, geometric thickness walk, 4-tap tetrahedral normal. Block map now built once per tick (PT_FLUIDMAP), not per substep.<br><br><b>Next:</b> WP3 (seam hysteresis — slopes must excite, calm flow must settle), then WP5 (flip: delete CA liquid movement, rebaseline hash).'},
 
   occupancy:{label:'Occupancy, Hash + Pick',tag:'gpu',
     desc:'Per-chunk non-air counts and ray-blocker counts that let the raymarcher skip empty space, the world-hash accumulation that rule 1 is verified against, and the single crosshair picking ray.',
@@ -6578,20 +6604,28 @@ const ARCH_NODES={
     details:'A world is a directory of region files (<code>r_x_y_z.svr</code>) with RLE-compressed chunks, plus an entities sidecar. The RLE run word is 32-bit (<code>SVR2</code>) — the 16-bit v1 format silently dropped the stain bits, and hashed state must round-trip or a save/load changes the world hash.'},
 
   farField:{label:'Far-Field Cascades',tag:'render',
-    desc:'kFarLevels nested toroidal kFarN^3 volumes around the residency window, each level’s cells twice as coarse and its box twice as wide. Render-only LOD: never read by the sim, never hashed, filled from worldgen on the GPU.',
+    wip:'Bandwidth retune for larger windows after 2048³ scaling',
+    desc:'kFarLevels nested toroidal kFarN^3 volumes around the residency window, each level’s cells twice as coarse and its box twice as wide. Render-only LOD: never read by the sim, never hashed, filled from worldgen on the GPU. Edit persistence landed: player edits now survive cascade refills.',
     files:['src/sim/farfield.h','src/sim/farfield.cpp','assets/shaders/worldgen.wgsl'],
     sym:['FarField::Update','Simulation::EncodeFarFill','farDown'],
     cst:['world.h  kFarN','world.h  kFarLevels','world.h  kFarShiftBase','world.h  kFarListCap','world.h  kFarSlotShift'],
-    tst:['far-fog','far-downsample'],
+    tst:['far-fog','far-downsample','far-persist'],
     doc:['docs/PLAN_far_field_cascades.md'],
-    details:'<b>kFarN is the ONLY knob that changes far-field detail.</b> A level’s cell size and box extent are rigidly coupled, so px-per-cell = H / (kFarN * tan(fov/2)) — the distance cancels. Changing <code>kFarShiftBase</code> or <code>kFarLevels</code> renumbers the cascade and trades horizon against near coverage, but CANNOT make any distance look sharper (measured: 26 pixels of 2,073,600 differed).<br><br>Related trap: a shadow loop capped in CELLS ties its reach to cell size. The far-shadow 128-step cap was a latent 45x cliff.'},
+    children:['farEdits'],
+    details:'<b>kFarN is the ONLY knob that changes far-field detail.</b> A level’s cell size and box extent are rigidly coupled, so px-per-cell = H / (kFarN * tan(fov/2)) — the distance cancels. Changing <code>kFarShiftBase</code> or <code>kFarLevels</code> renumbers the cascade and trades horizon against near coverage, but CANNOT make any distance look sharper (measured: 26 pixels of 2,073,600 differed).<br><br>Related trap: a shadow loop capped in CELLS ties its reach to cell size. The far-shadow 128-step cap was a latent 45x cliff.<br><br><b>Edit persistence (f113e36):</b> the horizon no longer heals itself — a farPatch buffer carries compressed diffs that worldgen.wgsl applies after its pristine sweep.'},
+
+  farEdits:{label:'Far Edit Persistence',tag:'cpu',
+    desc:'A CPU edit index fed by the eviction harvest and rebuilt from world.svd on load. The farPatch buffer is applied inside worldgen.wgsl after the pristine sweep, so sieve refills no longer erase what the player dug on the horizon.',
+    files:['src/sim/faredits.h','src/sim/faredits.cpp','assets/shaders/worldgen.wgsl'],
+    cst:['world.h  kFarPatchCap'],
+    tst:['far-persist']},
 
   worldgen:{label:'Worldgen',tag:'gpu',
-    desc:'A pure function of world coordinate + seed, evaluated on the GPU. Infinite hills, two cave bands, lava on deep cavern floors, sparse ruin POIs, and the positional palette variant that the JITTER page sentinel encodes.',
+    desc:'A pure function of world coordinate + seed, evaluated on the GPU. Infinite hills, two cave bands, lava on deep cavern floors (placed AT REST via a flat magma table so streamed chunks sleep immediately instead of flowing for ~2700 ticks), sparse ruin POIs, and the positional palette variant that the JITTER page sentinel encodes.',
     files:['assets/shaders/worldgen.wgsl','src/sim/simulation.cpp'],
-    sym:['Simulation::EncodeWorldgen','Simulation::EncodeGenList','Simulation::EncodePageFill'],
+    sym:['Simulation::EncodeWorldgen','Simulation::EncodeGenList','Simulation::EncodePageFill','caveFill'],
     rule:1,
-    details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.'},
+    details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.<br><br><b>Lava at rest (12c187c):</b> <code>caveFill(y)</code> routes every carve: lava at/below <code>LAVA_LEVEL=-80</code>, air above. The lateral boundary is stone at every level, so the only lava/air interface is one flat plane. This cut active-chunk count under flight from 521 → 23 (p50) and pool high-water by 11%.'},
 
   // ---------------------------------------------------------------- data
   dataPipeline:{label:'Data Pipeline',tag:'cpu',
@@ -6637,6 +6671,7 @@ const ARCH_NODES={
     details:'Authored in the tuner’s Models tab. Sidecar keys are missing/missingAny plus a version "v"; locomotion "states" rules pick a clip ladder (stand / walk / crawl / prone) from which limbs survive. Regenerating a critter from a script clobbers editor-owned art.'},
 
   itemDefs:{label:'Items',tag:'cpu',
+    wip:'Tuner Items tab (sword grip/edge/damage authoring) + toggleable collision-box debug overlay',
     desc:'Standalone .vox plus .json assets: grip transform, edge segment for melee, damage profile. Held through a borrowed rig socket on the avatar.',
     files:['assets/items/','src/game/item.h'],
     sym:['ItemDef','EquipItem'],
@@ -6693,16 +6728,18 @@ const ARCH_NODES={
     cst:['world.h  kMaxBodySlots']},
 
   drawMicro:{label:'Draw Micro Bodies',tag:'render',
+    wip:'Skin/collider split phases 5–7: mob integration, limb refit, editor support',
     desc:'An OBB rasterizer for high-resolution microvoxel mob limbs — a per-fragment DDA march inside the brick, with front-face culling so the box is entered from outside.',
     files:['assets/shaders/microbody.wgsl','src/sim/microbody.h','src/sim/microbody.cpp'],
     sym:['Simulation::DrawMicroBodies','Simulation::UploadMicroBodies','MicroBodySet'],
     cst:['world.h  kMicroBodyPoolWordsWorld','world.h  kMaxMicroBodyModels'],
-    details:'<b>Skin and collider resolutions are decoupled.</b> A mob def’s <code>skinScale</code> is the art pitch; <code>physScale</code> is a separate, coarser physics pitch derived from it by majority fill. The skin is authoritative, the collider is derived. Micro bodies are destructible by copy-on-write.'},
+    details:'<b>Skin and collider resolutions are decoupled.</b> A mob def’s <code>skinScale</code> is the art pitch; <code>physScale</code> is a separate, coarser physics pitch derived from it by majority fill. The skin is authoritative, the collider is derived. Micro bodies are destructible by copy-on-write.<br><br><b>In progress:</b> field split + pool ceiling + dual-lattice carve landed (phases 1–3). Phases 5–7 remain: mob/limb integration, editor live preview, and docs update.'},
 
   drawFluid:{label:'Draw Fluid',tag:'render',
-    desc:'The MLS-MPM water surface: a trilinear isosurface march with traced reflections and refractions, Beer-Lambert absorption and Fresnel.',
+    desc:'The MLS-MPM water surface: a trilinear isosurface march with traced reflections and refractions, Beer-Lambert absorption and Fresnel. WP4 finding: the march was the whole render cost (20 ms of 25.8 on hill). Now bounded by the world AABB, 2-cell seam shell, per-chunk Y-occupancy mask, geometric thickness walk, and 4-tap tetrahedral normal.',
+    details:'<b>Four draw modes over ONE density field</b> (<code>render.fluidSurface</code>, MPM Fluid Look tab): 0 = one raster cube per particle (solver debug, the only mode drawn CPU-side by <code>DrawFluid</code>); 1 = the smooth isosurface; <b>2 = VOXELIZED at half a cell (2x2x2 sub-voxels per sim cell, one per particle at rest density) — THE DEFAULT</b>; 3 = VOXELIZED on the sim lattice, one cube per world cell. Mode 2 is the default because this is a voxel engine: water that reads as voxels is the house style, and the smooth Splash surface is the opt-in look.<br><br>The voxelized modes exist to answer a look question the smooth surface cannot — <i>what does MPM water look like if it still reads as VOXELS?</i> — and they are strictly <b>render-only</b>: nothing is written to the voxel buffer, because the voxel word is hashed and saved state (rules 1 and 3) and a half-size grid is not representable in it at all (the state nibble is fullness, not occupancy of eight sub-cells). They sample the SAME <code>fluidFieldAt</code> the isosurface marches, so the modes agree about where the water is and differ only in how the boundary is drawn. They share the empty-space skips and the thickness walk, take the surface threshold, and ignore smoothing and shimmer (both exist to round cubes off).',
     files:['assets/shaders/raymarch.wgsl','src/sim/simulation.cpp'],
-    sym:['Simulation::DrawFluid'],
+    sym:['Simulation::DrawFluid','fluidMarch','fluidMarchBlocky'],
     tst:['fluid-settle']},
 
   drawSprites:{label:'Draw Sprites',tag:'render',
@@ -6739,6 +6776,7 @@ const ARCH_NODES={
     details:'<b>Height comes from the player constants</b> — assert it in the generator, never restate it in a comment.<br><br>Two traps that cost real time: a mob gait infers body height from its own feet, and under a player driver that loop runs away (~9.5 vox/tick) — use the AABB sole as truth. And avatar limbs inside the player capsule shove the capsule via <code>PlayerPushOut</code>, so they need their own collision layer to split contacts from ray visibility.'},
 
   mobSys:{label:'Mob System',tag:'cpu',
+    wip:'M8 gap: DecideIntent has no player sensor — no target, no aggro state, mobs never attack',
     desc:'Articulated multi-body creatures, each limb a kinematic Jolt body that flips to a dynamic ragdoll on death. Locomotion is a four-stage split: Sense -> DecideIntent -> Steer -> Drive.',
     files:['src/game/mob.h','src/game/mob.cpp'],
     sym:['MobSystem::PreTick','MobSystem::PostStep','MobSystem::SetDefs','MobSystem::SenseGround','MobSystem::DecideIntent','MobSystem::Steer'],
@@ -6833,7 +6871,7 @@ const ARCH_NODES={
     children:['audioCues','audioDevice','audioOcclusion','audioSpatial']},
 
   audioCues:{label:'Sound Cues',tag:'cpu',
-    desc:'The public, game-facing API — the only audio header the rest of the engine includes. Material-to-sound is resolved once at load, not per event.',
+    desc:'The public, game-facing API — the only audio header the rest of the engine includes. Material-to-sound is resolved once at load, not per event. Now wired: impact sounds (body-on-body/terrain), mob hurt/death cries, and a material-driven ambience bed.',
     files:['src/audio/cues.h','src/audio/cues.cpp','src/audio/world.h','src/audio/world.cpp','assets/sound_schema.js'],
     sym:['Cues::Footstep','Cues::Land','Cues::Impact','Cues::Break','Cues::MobSound','Cues::MobBleed','Cues::SetNightAmbience','Cues::kSlotPrefix'],
     details:'<b>Sound slots are defined in TWO places that must agree:</b> <code>assets/sound_schema.js</code> (the only list) and <code>Cues::kSlotPrefix</code> in <code>src/audio/cues.cpp</code>.<br><br>Footsteps ride the GAIT PLANT, not a distance accumulator — events are queued because <code>PreTick</code> runs several times per frame. A sound SET is a folder of interchangeable takes and the engine picks one; <code>.trash/</code> is ignored, so moving a take there stops it immediately.'},
@@ -6890,10 +6928,10 @@ const ARCH_NODES={
     details:'<b>World constants are GENERATED from <code>src/sim/world.h</code></b> by <code>ShaderConstantPrelude()</code> and must never be redeclared in WGSL.<br><br><code>target</code> is a reserved word in WGSL. A compile error keeps the OLD pipelines rather than leaving you with none. <code>bash scripts/check_shaders.sh</code> validates WGSL without a rebuild.'},
 
   context:{label:'GPU Context',tag:'gpu',
-    desc:'Owns the instance, adapter, device, queue and window surface, plus the pipeline cache.',
+    desc:'Owns the instance, adapter, device, queue and window surface, plus the pipeline cache. The SPIR-V disk cache + VkPipelineCache (d598900) eliminated the 20–30 s white screen on a cold start.',
     files:['src/gpu/context.h','src/gpu/context.cpp'],
     sym:['GpuContext::Init','GpuContext::Resize'],
-    details:'The pipeline cache (SPIR-V on disk plus a VkPipelineCache) is what removes the 20-30 s white screen on a cold start.'},
+    details:'The pipeline cache (SPIR-V on disk plus a VkPipelineCache) is what removes the 20-30 s white screen on a cold start. Shaders are compiled to SPIR-V through Tint at load and on F5; the cache key is the WGSL source hash + the tuning constant block, so an F5 reload only recompiles what changed.'},
 
   // ------------------------------------------------------------ verification
   testHarness:{label:'Selftest Harness',tag:'inv',
@@ -6938,6 +6976,7 @@ const ARCH_NODES={
     tst:['save-load','save-entities','region-store','streaming']},
 
   testMob:{label:'Mob Gates (unregistered)',tag:'inv',
+    wip:'MobGates() returns empty — the gate body exists but is not registered, so no mob gate runs',
     desc:'A large gait / dismemberment / melee gate body exists in selftest_mob.cpp, but MobGates() returns an empty vector — none of it runs. Treat mob behaviour as UNCOVERED by the suite.',
     files:['src/test/selftest_mob.cpp'],
     sym:['MobGates']},
@@ -6949,16 +6988,16 @@ const ARCH_NODES={
 
   // ------------------------------------------------------------------- ui
   uiOverlay:{label:'UI Overlay',tag:'cpu',
-    desc:'The ImGui debug panel plus the player-facing HUD: health, mana, body figure, spell readout, crosshair material, hotbar, ledge state and the FPS counter.',
+    desc:'The ImGui debug panel plus the player-facing HUD: health, mana, body figure, spell readout, crosshair material, hotbar, ledge state, and the FPS counter with live p95/p99 frame-time percentiles (512-frame window, ~5–11 s).',
     files:['src/ui/overlay.h','src/ui/overlay.cpp'],
     sym:['UIState','Overlay::Draw'],
-    details:'<code>UIState</code> is the whole contract — <code>main.cpp</code> owns the values, the overlay only reads and edits them. The crosshair material comes from the <code>sim_pick</code> readback and is one tick latent; <code>hoverMat == 0</code> means the ray left the window.'},
+    details:'<code>UIState</code> is the whole contract — <code>main.cpp</code> owns the values, the overlay only reads and edits them. The crosshair material comes from the <code>sim_pick</code> readback and is one tick latent; <code>hoverMat == 0</code> means the ray left the window.<br><br><b>p95/p99 (9c23db8):</b> a 512-frame ring sorted on the 0.5 s boundary that already drives avg/worst. Over ~15–50 frames p99 IS the max, so 512 frames (~5–11 s) puts p99 at the ~6th worst frame — a useful intermediate between avg and worst.'},
 
   // ---------------------------------------------------------------- tools
   toolsSys:{label:'Tools & Telemetry',tag:'cpu',
     desc:'Everything outside the game binary: this browser tuner, the voxel/rig editor, the localhost telemetry stream that feeds this page live, and the headless sizing harness.',
     files:['assets/tuner.html','assets/editor/','scripts/'],
-    children:['tunerApp','voxelEditor','telemetrySys','measureSys']},
+    children:['tunerApp','voxelEditor','telemetrySys','measureSys','labHarness']},
 
   tunerApp:{label:'Tuner (this page)',tag:'cpu',
     desc:'The browser editor for every JSON the engine reads — materials, reactions, tuning, items, sounds, spells — plus the Wiki, Notes and this Engine tab. Served by a small Python server or the packaged exe.',
@@ -6966,6 +7005,7 @@ const ARCH_NODES={
     details:'Run <code>./sandvox_tuner.exe</code> or <code>python scripts/tuner_server.py</code>. Its Build and Play buttons run build + selftest.<br><br>The exe only needs rebuilding when the PYTHON changes — HTML/JS edits are picked up on reload.'},
 
   voxelEditor:{label:'Voxel + Rig Editor',tag:'cpu',
+    wip:'Undo, copy/paste, select-all, delete/fill selection, resize handles, click-limb-to-select + grip rotation editing',
     desc:'The three.js model editor inside the Models tab: voxel editing, the limb/parts rig panel, sockets and the animation timeline.',
     files:['assets/editor/editor.js','assets/editor/rig.js','assets/editor/anim.js','docs/EDITOR_GUIDE.md'],
     details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><code>anim.js</code> is a port of <code>src/game/anim.cpp</code> — keep them in sync.<br><br>The limb library saves and swaps parts between creatures through <code>assets/limbs/</code>, which is created on first save and needs the tuner server (a <code>file://</code> page cannot list it).'},
@@ -6981,6 +7021,12 @@ const ARCH_NODES={
     files:['src/measure/measure.h','src/measure/measure.cpp','src/gpu/passtimer.h','src/gpu/passtimer.cpp'],
     sym:['sandvox::RunMeasure','PassTimer'],
     details:'Measurement-only, and deliberately unreachable from the game or the selftest: <code>Simulation</code> holds a NULL <code>PassTimer*</code> by default, so both encode byte-identical command buffers whether or not the timer is compiled in.<br><br><b>Never launch <code>sandvox.exe</code> directly</b> — wrap every run in <code>bash scripts/run.sh</code>. Concurrent runs saturate the GPU and make every measured number garbage (the same gate has read 101, 14 and 127 ms).'},
+
+  labHarness:{label:'Fluid Lab',tag:'cpu',
+    desc:'The --lab mode: a flat-slab worldgen with 5 scripted scenes (basin, hill, faucet, pool, slosh), live tuning watcher with mtime-guarded writeback, and the --fluid-bench per-pass GPU timing harness with mass ledger and JSON output.',
+    files:['src/lab/lab.cpp'],
+    sym:['RunLab'],
+    details:'Activated by <code>--lab [scene]</code>. The tuner\'s Play dropdown can launch any scene. <code>--fluid-bench</code> adds per-pass GPU timing via PassTimer and writes a JSON report. The watcher auto-reloads tuning.json on disk mtime change, with an ImGui writeback guard so the app doesn\'t clobber edits.'},
 };
 
 const ARCH_EDGES=[
@@ -7075,6 +7121,13 @@ const ARCH_EDGES=[
   ['telemetrySys','tunerApp','per-tick JSON'],
   ['voxelEditor','mobDefs','authors'],
   ['tunerApp','tuning','authors'],
+  ['labHarness','fluidSys','bench scenes'],
+  ['labHarness','tuning','live watcher'],
+
+  // Far edit persistence
+  ['farEdits','farField','patch buffer'],
+  ['streaming','farEdits','eviction harvest'],
+  ['chunkStore','farEdits','load rebuild'],
 ];
 
 const ARCH_TAG_COLORS={gpu:'#4c9aff',cpu:'#f2a65a',xfer:'#c792ea',render:'#5ed3a5',inv:'#f2726f'};
@@ -7326,12 +7379,21 @@ let archLastLayout=null;
 
 function archStage(){return document.getElementById('arch-stage');}
 
+function archHasWip(id){
+  const n=ARCH_NODES[id];
+  if(!n)return false;
+  if(n.wip)return true;
+  for(const c of n.children||[])if(archHasWip(c))return true;
+  return false;
+}
+
 function archBoxHtml(id){
   const n=ARCH_NODES[id];
   const kids=n.children&&n.children.length?n.children.length:0;
   const path=(n.files&&n.files[0])||'';
+  const wipBadge=n.wip?'<span class="wip">!</span>':'';
   return `<div class="bhdr"><span class="cr">${kids?'▸':''}</span>`+
-         `<span class="bl">${n.label}</span>`+
+         `<span class="bl">${n.label}</span>`+wipBadge+
          (kids?`<span class="cnt">${kids}</span>`:'')+`</div>`+
          (path?`<div class="bp">${path}</div>`:'');
 }
@@ -7358,7 +7420,7 @@ function archEnsureBoxes(pos){
     const n=ARCH_NODES[id];
     const open=pos[id].open;
     el.className='arch-box t-'+n.tag+(open?' grp open':(n.children&&n.children.length?' grp':''))+
-                 (id===archSelected?' sel':'');
+                 (id===archSelected?' sel':'')+(archHasWip(id)?' has-wip':'');
     el.style.zIndex=String(10+pos[id].depth);
     const cr=el.querySelector('.cr');
     if(cr&&n.children&&n.children.length)cr.textContent=open?'▾':'▸';
@@ -7833,6 +7895,7 @@ function archNodeMarkdown(id){
   const n=ARCH_NODES[id];
   if(!n)return '';
   const L=[`### ${n.label}  (\`${id}\`, ${ARCH_TAG_NAMES[n.tag]||n.tag})`,'',n.desc,''];
+  if(n.wip)L.push(`- **! IN PROGRESS:** ${n.wip}`);
   if(n.rule)L.push(`- **Governing rule:** ${ARCH_RULES[n.rule]}`);
   if(n.files?.length)L.push(`- **Files:** ${n.files.map(f=>'`'+f+'`').join(', ')}`);
   if(n.sym?.length)L.push(`- **Symbols:** ${n.sym.map(f=>'`'+f+'`').join(', ')}`);
@@ -7888,6 +7951,7 @@ function archShowDetail(nodeId){
   if(kids.length)
     html+=`<button onclick="archNodeClick('${nodeId}')">${archExpanded.has(nodeId)?'▾ collapse':'▸ expand'} (${kids.length})</button>`;
   html+=`<button onclick="archCopyNode('${nodeId}')">copy as markdown</button></div>`;
+  if(n.wip)html+=`<div style="margin:8px 0 12px;padding:8px 12px;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.3);border-radius:6px;font-size:12px"><span style="font-weight:700;color:#fbbf24">! IN PROGRESS</span> <span style="color:var(--dim)">${n.wip}</span></div>`;
   html+=`<p>${n.desc}</p>`;
   if(n.details)html+=n.details;
   if(kids.length){
@@ -7938,9 +8002,10 @@ function archBuildIndex(){
       .concat(n.cst||[])
       .concat((n.tst||[]).map(t=>'--gate '+t))
       .concat(n.doc||[]);
+    const wipMark=n.wip?'<span style="font:bold 9px/1 var(--mono);color:#1b222d;background:#fbbf24;border-radius:3px;padding:1px 4px;margin-left:5px">!</span>':'';
     rows.push(
       `<tr class="${depth?'lvl2':''}">`+
-      `<td class="n" onclick="archNodeClick('${id}')">${n.label}</td>`+
+      `<td class="n" onclick="archNodeClick('${id}')">${n.label}${wipMark}</td>`+
       `<td class="tg" style="color:${ARCH_TAG_COLORS[n.tag]}">${n.tag}</td>`+
       `<td>${n.desc}</td>`+
       `<td class="paths">${ptr.join('<br>')}</td></tr>`);
@@ -8454,7 +8519,8 @@ function renderEngine(){
   wrap.appendChild(el('p',{class:'note'},
     'Click a box to open its detail panel. Boxes marked ▸/▾ are groups — clicking one unfolds it in place; ',
     'nothing else moves out of the way, so you keep your bearings. Drag to pan, scroll to zoom, ',
-    'hover a box to light up its connections, ⛶ for fullscreen, Esc to close.'));
+    'hover a box to light up its connections, ⛶ for fullscreen, Esc to close. ',
+    'Dashed borders with a yellow ',el('b',{style:'color:#fbbf24'},'!'),' badge mark systems with active in-progress work — see the Development Status section below.'));
   const archControls=el('div',{class:'arch-controls'},
     el('button',{onclick:()=>archCollapseAll()},'collapse all'),
     el('button',{onclick:()=>archExpandLevel(1)},'level 1'),
@@ -8481,7 +8547,8 @@ function renderEngine(){
       el('span',{},el('i',{style:'background:#f2a65a'}),' CPU'),
       el('span',{},el('i',{style:'background:#c792ea'}),' Transfer'),
       el('span',{},el('i',{style:'background:#5ed3a5'}),' Render'),
-      el('span',{},el('i',{style:'background:#f2726f'}),' Verification')
+      el('span',{},el('i',{style:'background:#f2726f'}),' Verification'),
+      el('span',{},el('span',{style:'font:bold 9px/1 var(--mono);color:#1b222d;background:#fbbf24;border-radius:3px;padding:1px 4px'}, '!'),' In Progress')
     )
   );
   wrap.appendChild(archControls);
@@ -8491,6 +8558,79 @@ function renderEngine(){
   );
   wrap.appendChild(archWrap);
   setTimeout(archRender,0);
+
+  // Development status panel
+  const statusPanel=el('div',{class:'eng-status-panel'});
+  statusPanel.appendChild(el('h3',{},'Development Status'));
+  const statusBody=el('div',{class:'status-body'});
+
+  // In-progress items from ARCH_NODES wip fields
+  const wipSec=el('div',{class:'status-section'});
+  wipSec.appendChild(el('h4',{},'In Progress'));
+  const wipItems=Object.entries(ARCH_NODES).filter(([,n])=>n.wip);
+  for(const[id,n]of wipItems){
+    const item=el('div',{class:'eng-status-item'});
+    item.appendChild(el('span',{class:'badge wip'},'!'));
+    const lbl=el('span',{class:'lbl',style:'cursor:pointer'});
+    lbl.textContent=n.label;
+    lbl.onclick=()=>archNodeClick(id);
+    item.appendChild(lbl);
+    item.appendChild(el('span',{class:'desc'},n.wip));
+    wipSec.appendChild(item);
+  }
+  statusBody.appendChild(wipSec);
+
+  // Recently landed
+  const recentSec=el('div',{class:'status-section'});
+  recentSec.appendChild(el('h4',{},'Recently Landed'));
+  const recentItems=[
+    {label:'Voxelized MPM fluid modes',desc:'MPM water drawn as cubes — half-cell (2x2x2 sub-voxels) or on the sim lattice; render-only, same density field'},
+    {label:'Far-field edit persistence',desc:'Horizon no longer heals itself — sieve refills carry player edits (f113e36)'},
+    {label:'Audio wiring',desc:'Impact sounds, mob hurt/death cries, material ambience bed (3569ccc)'},
+    {label:'MLS-MPM fluid WP2+WP4',desc:'Separate BC (mid-slope freeze gone), true sleep, render AABB, 1.5–1.9x frame perf (b219f43)'},
+    {label:'Fluid lab & bench',desc:'--lab mode with 5 scenes, live tuning watcher, --fluid-bench per-pass timing (c4f4ba7)'},
+    {label:'Lava at rest',desc:'Worldgen places deep-cavern lava settled — active chunks under flight 521 → 23 (12c187c)'},
+    {label:'CA settled skip',desc:'141.7 → 1.0 us/tick for a quiescent world — 141x improvement (2dd5073)'},
+    {label:'Pipeline cache',desc:'SPIR-V disk cache + VkPipelineCache eliminates the 20–30 s cold start (d598900)'},
+    {label:'Dev panel p95/p99',desc:'Live frame-time percentiles from a 512-frame ring (9c23db8)'},
+    {label:'CA phase-skip refutation',desc:'Measured and proved: per-colour-phase dispatch skipping is worth 0 us (3d78e4d)'},
+    {label:'Sub-chunk occupancy refutation',desc:'Built, measured, default-off — the mask pass costs more than it saves (6ad96ac)'},
+  ];
+  for(const r of recentItems){
+    const item=el('div',{class:'eng-status-item'});
+    item.appendChild(el('span',{class:'badge done-recent'},'✓'));
+    item.appendChild(el('span',{class:'lbl'},r.label));
+    item.appendChild(el('span',{class:'desc'},r.desc));
+    recentSec.appendChild(item);
+  }
+  statusBody.appendChild(recentSec);
+
+  // Planned / needed
+  const plannedSec=el('div',{class:'status-section'});
+  plannedSec.appendChild(el('h4',{},'Planned / Needed'));
+  const plannedItems=[
+    {label:'WP5: CA liquid flip',badge:'planned',desc:'Delete CA liquid movement rules, flip fluidExciteMode default ON, rebaseline hash — gated on WP3 + user sign-off'},
+    {label:'2048³ window + 5 cm voxels',badge:'planned',desc:'Grow kWorldN from 512 to 2048, retune kVoxelMeters 0.10 → 0.05 — needs occupancy re-measurement first'},
+    {label:'Near-field surface detail',badge:'planned',desc:'Apparent 3 mm voxels from rendering subdivision (subdiv-16) — WGSL + tuning only, no sim change'},
+    {label:'Temporal rate LOD',badge:'planned',desc:'Slow reactions dispatch every Nth tick — ~3–4x on big fires'},
+    {label:'Async compute overlap',badge:'planned',desc:'Sim overlaps render on a second queue (Vulkan port phase 8)'},
+    {label:'Mob AI: sensing + target layer',badge:'needed',desc:'DecideIntent has no player sensor — no target, no aggro state, mobs never attack. First M8 work package'},
+    {label:'Mob selftest gates',badge:'needed',desc:'MobGates() returns empty — the gate body exists but is not registered, so mob behaviour is uncovered'},
+    {label:'Cross-vendor determinism',badge:'needed',desc:'Only one GPU vendor tested (RTX 3060 Ti) — DESIGN.md risk #3 remains open, M9 blocker'},
+    {label:'Networking prototype (M9)',badge:'planned',desc:'Lockstep vs server-authoritative TBD based on cross-vendor determinism; headless build; 2–4 player LAN'},
+    {label:'GI / lighting',badge:'planned',desc:'Emissive materials feeding cheap GI (light propagation volumes) — deferred beyond M8'},
+    {label:'Temperature layer',badge:'planned',desc:'Sparse auxiliary layer keyed by chunk — heat propagation, melting, freezing'},
+  ];
+  for(const p of plannedItems){
+    const item=el('div',{class:'eng-status-item'});
+    item.appendChild(el('span',{class:'badge '+(p.badge||'planned')},p.badge==='needed'?'‼':'…'));
+    item.appendChild(el('span',{class:'lbl'},p.label));
+    item.appendChild(el('span',{class:'desc'},p.desc));
+    plannedSec.appendChild(item);
+  }
+  statusBody.appendChild(plannedSec);
+  statusPanel.appendChild(statusBody);
+  wrap.appendChild(statusPanel);
 
   // Flat module index — the text-only view of the same data.
   wrap.appendChild(el('h2',{},'Module index'));
@@ -8509,7 +8649,7 @@ function renderEngine(){
   wrap.appendChild(el('h2',{},'Per-tick pipeline'));
   wrap.appendChild(el('p',{class:'note'},'Every tick runs these stages in order. The ordering is load-bearing: mutations must land before compaction, and compaction must precede the CA passes.'));
   const flow=el('div',{class:'eng-flow'});
-  ['stream','mutate','explode','compact','54 × CA','particles','occupancy','readback','physics','render'].forEach((s,i)=>{
+  ['stream','mutate','explode','compact','54 × CA','particles','fluid seam','N × fluid','occupancy','readback','physics','render'].forEach((s,i)=>{
     if(i)flow.appendChild(el('i',{},'→'));
     flow.appendChild(el('span',{},s));
   });

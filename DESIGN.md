@@ -784,6 +784,72 @@ gains, foam amount/speed, shimmer, per-species colours. Depth is written at
 the fluid interface, so raster spray in front composites over it and debris
 behind it is covered.
 
+DRAW MODES — `render.fluidSurface` is a MODE, not a boolean, and it kept its
+name because 0 and 1 still mean what they always did (no `tuning.json`
+migration). `0` = one raster cube per particle, the solver-debug view and the
+only mode drawn CPU-side; `1` = the smooth isosurface above; **`2` = VOXELIZED
+at half a cell — the field quantized to a 2x2x2 sub-voxel lattice, which is one
+sub-voxel per particle at rest density, and THE DEFAULT**; `3` = VOXELIZED on
+the sim lattice, one cube per world cell. The voxelized modes exist to answer a
+look question the isosurface cannot — *what does MPM water look like if it
+still reads as VOXELS?* — and mode 3 in particular makes a pour
+indistinguishable from CA water at a glance while the motion underneath is
+still the full MPM solve.
+
+Mode 2 is the default because this is a voxel engine: water that reads as
+voxels is the house style, and the smooth Splash surface — which is the more
+expensive march *and* the one that visually disagrees with every other surface
+in the world — is the opt-in look rather than the assumed one. Half a cell, not
+a whole one, because it is the resolution the solver already works at (8
+particles per cell on a 2x2x2 lattice), so it is the finest quantization that
+carries real information rather than interpolation.
+
+They are strictly RENDER-ONLY: `fluidMarchBlocky` writes no voxel. The voxel
+word is hashed, saved, deterministic state (rules 1 and 3), a per-frame float
+occupancy decision has no business inside the world hash, and a half-size grid
+is not representable there at all — the state nibble is *fullness*, not
+occupancy of eight sub-cells. They sample the same `fluidFieldAt` the
+isosurface marches (settled water included, via the virtual-mass blend), so all
+three marched modes agree about where the water IS and differ only in how its
+boundary is drawn; a sub-cell is filled when the field at its CENTRE is at or
+above `fluidIso`, and at one sub-cell per voxel that centre IS the node, so
+mode 3 is exactly "this cell holds >= iso of rest density" with no
+interpolation blur. They inherit the three empty-space skips and the thickness
+walk unchanged (so absorption and the depth gradient are identical across
+modes, and an A/B compares surface SHAPE rather than colour), carry an exact
+cube-face normal instead of the 4-tap gradient, and skip smoothing and shimmer
+— both of which exist to round cubes off.
+
+COARSE SEARCH, LOCAL REFINE is the whole performance story, and it was learned
+the expensive way. The obvious implementation — a DDA that visits every
+sub-cell and tests the field at its centre — measured **74.85 ms** of fluid
+march on the `hill` bench against the smooth march's **8.90 ms**, an 8.4x
+regression, because a DDA cannot stride: it pays 2 field samples per voxel (8
+trilinear taps each) through exactly the empty space the smooth march crosses
+1.25 cells at a time. So `fluidMarchBlocky` runs the smooth march's coarse loop
+verbatim and only DDAs the sub-cell lattice across the single stride a crossing
+is known to lie in (`fluidRefineSubCell`, bounded at 12 sub-cells). The refine
+window is clamped to one stride back, which is load-bearing: the empty-space
+skips set `tPrev` BEFORE teleporting `t`, so an unclamped refine would spend its
+whole budget walking space the skip just proved empty.
+
+ACCEPTED ARTEFACT, MECHANISM NOT ESTABLISHED: in the blocky modes some of the
+ballistic spray droplets that the smooth march hides become visible, reading as
+hard white sprite triangles over the pool. The droplets are a deliberate feature
+drawn in every mode; they are what makes the difference visible, not the cause.
+Since they are occluded by the depth this march writes, blocky and smooth depth
+must disagree somewhere. Owner's call, 2026-08-24: ship it.
+
+Three explanations were tried and all three are refuted — they are recorded in
+the block comment above `fluidMarchBlocky` so nobody re-derives them: (1) the
+far stride skipping isolated spray (the smooth march takes the same stride and
+has no slivers); (2) refine failing and leaving a hole (a crossing-point
+fallback changed pixels and removed no slivers); (3) the centre test landing
+deeper than the smooth crossing (snapping the bisected crossing to its sub-cell
+made it far worse — a regular grid of bright seams, because adjacent pixels snap
+to different sub-cells). The exhaustive DDA showed far fewer, at 8.4x. Next
+person: read the depth buffer before writing code.
+
 SPLASH COUPLING — fast fluid particles at low density (spray, breaking
 crests) shed `PFLAG_MICRO` droplets into the ballistic particle system from
 `g2p` (bindings 6/7 of the fluid group are the particle write page + counts;

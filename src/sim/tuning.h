@@ -1048,7 +1048,20 @@ struct Tuning {
     // ---- MPM fluid SURFACE rendering (raymarch.wgsl MPM FLUID SURFACE) ----
     // The Splash-style water look: the solver's node grid marched as a smooth
     // isosurface with traced reflection/refraction. All render-only.
-    float fluidSurface = 1.0f;   // 1 = surface rendering, 0 = debug cubes
+    // DRAW MODE, not a boolean — it keeps the name because 0 and 1 still mean
+    // what they always did, so tuning.json needs no migration:
+    //   0 = one raster cube per particle (solver debug; DrawFluid, not the
+    //       raymarcher — this is the only mode that draws on the CPU side)
+    //   1 = smooth isosurface, the Splash look
+    //   2 = voxelized at half a cell (2x2x2 sub-voxels per sim cell, which is
+    //       one sub-voxel per particle at rest density). DEFAULT — the engine
+    //       is a voxel engine, so MPM water reads as voxels by default and the
+    //       smooth surface is the opt-in look
+    //   3 = voxelized on the sim lattice, one cube per world cell — MPM water
+    //       that reads as ordinary voxel water
+    // Modes 2 and 3 are RENDER-ONLY quantization of the same density field the
+    // isosurface marches; nothing is written to the voxel buffer (rules 1+3).
+    float fluidSurface = 2.0f;
     float fluidIso = 0.30f;      // isosurface threshold, fraction of rest
                                  // density. Lower = fatter, more merged fluid
     float fluidSmooth = 1.3f;    // normal-gradient baseline, voxels. Higher

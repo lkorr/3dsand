@@ -98,6 +98,7 @@ struct UIState {
   // clearFluid is a one-shot request consumed inside the tick loop.
   uint32_t fluidCount = 0;
   bool clearFluid = false;
+  int fluidSpecies = 0;
   // Live tuning copies — main.cpp seeds these from CurrentTuning() on
   // startup.  The overlay draws sliders; main.cpp detects changes (via
   // fluidTuningDirty) and writes them back + reloads shaders.

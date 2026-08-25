@@ -664,27 +664,23 @@ void Overlay::Draw(UIState& s) {
     ImGui::SetNextWindowPos(ImVec2(370, 12), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340, 600), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("MPM Fluid Tuning", &s.fluidWindowOpen)) {
-      auto fslider = [&](const char* label, float* v, float lo, float hi) {
+      if (ImGui::Button("Apply")) s.fluidTuningDirty = true;
+      ImGui::SameLine();
+      ImGui::TextDisabled("recompiles shaders");
+      ImGui::Separator();
+
+      auto fslider = [](const char* label, float* v, float lo, float hi) {
         ImGui::SliderFloat(label, v, lo, hi, "%.2f");
-        if (ImGui::IsItemDeactivatedAfterEdit())
-          s.fluidTuningDirty = true;
       };
-      auto islider = [&](const char* label, int* v, int lo, int hi) {
+      auto islider = [](const char* label, int* v, int lo, int hi) {
         ImGui::SliderInt(label, v, lo, hi);
-        if (ImGui::IsItemDeactivatedAfterEdit())
-          s.fluidTuningDirty = true;
       };
-      auto fcheck = [&](const char* label, int* v) {
+      auto fcheck = [](const char* label, int* v) {
         bool on = *v != 0;
-        if (ImGui::Checkbox(label, &on)) {
-          *v = on ? 1 : 0;
-          s.fluidTuningDirty = true;
-        }
+        if (ImGui::Checkbox(label, &on)) *v = on ? 1 : 0;
       };
-      auto fcolor = [&](const char* label, float col[3]) {
+      auto fcolor = [](const char* label, float col[3]) {
         ImGui::ColorEdit3(label, col, ImGuiColorEditFlags_Float);
-        if (ImGui::IsItemDeactivatedAfterEdit())
-          s.fluidTuningDirty = true;
       };
 
       if (ImGui::BeginTabBar("##fluidtabs")) {
@@ -737,7 +733,22 @@ void Overlay::Draw(UIState& s) {
         }
         if (ImGui::BeginTabItem("Look")) {
           if (ImGui::CollapsingHeader("Surface", ImGuiTreeNodeFlags_DefaultOpen)) {
-            fslider("surface mode##l",    &s.fSurface,  0.0f, 1.0f);
+            // Draw mode is a set of named stops, not a level, so it gets a
+            // combo rather than the 0-1 slider it used to be: a float slider
+            // parked at 1.4 is not any of the four modes. The underlying
+            // tuning value stays a float (tuning.json compatibility) — see
+            // Tuning::Render::fluidSurface for what each stop means.
+            {
+              const char* kDrawModes[] = {"cubes (per particle)",
+                                          "surface (smooth)",
+                                          "voxels - 1/2 cell",
+                                          "voxels - 1 cell"};
+              int mode = (int)(s.fSurface + 0.5f);
+              mode = mode < 0 ? 0 : (mode > 3 ? 3 : mode);
+              if (ImGui::Combo("draw mode##l", &mode, kDrawModes,
+                               IM_ARRAYSIZE(kDrawModes)))
+                s.fSurface = (float)mode;
+            }
             fslider("surface threshold##l",&s.fIso,     0.08f, 1.0f);
             fslider("smoothing##l",       &s.fSmooth,   0.4f, 3.0f);
             fslider("refraction index##l",&s.fIor,      1.01f, 2.0f);

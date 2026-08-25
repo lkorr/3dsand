@@ -2225,7 +2225,12 @@ int main(int argc, char** argv) {
     // than silently stealing its keys.
     if (!ui.magicMode) {
       for (int i = 0; i < 8; i++)
-        if (key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) ui.brushMaterial = i + 1;
+        if (key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) {
+          if (ui.tool == UIState::kToolFluid)
+            ui.fluidSpecies = i & 3;
+          else
+            ui.brushMaterial = i + 1;
+        }
     } else {
       // Pressing a number SPEAKS that glyph — it never casts. Edge-triggered:
       // a held key must not stutter the same word onto the stack.
@@ -3017,12 +3022,8 @@ int main(int argc, char** argv) {
           at = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
         }
         const int rr = std::min(std::max(ui.brushRadius / 2, 1), 3);
-        // Keys 1-4 pick the species (the same number row that picks the brush
-        // material — the mpm tool just reads the low bits of that selection).
-        const uint32_t fluidSpecies = (uint32_t)(ui.brushMaterial - 1) & 3u;
-        // This pour defines what the species IS — its splash droplets carry
-        // the brush material, so they stain (or not) as that material would.
-        fluidSpeciesMat[fluidSpecies] = (uint32_t)ui.brushMaterial & 0xFFFu;
+        const uint32_t fluidSpecies = (uint32_t)ui.fluidSpecies & 3u;
+        fluidSpeciesMat[fluidSpecies] = fluidCueMat;
         for (int z = -rr; z <= rr && fluidSpawns.size() < kMaxFluidSpawnsPerTick; z++)
           for (int y = -rr; y <= rr; y++)
             for (int x = -rr; x <= rr; x++) {
@@ -3046,11 +3047,7 @@ int main(int argc, char** argv) {
                         (int32_t)((h >> 19) % 8192u) - 4096;
                 op.vx = 0; op.vy = -19661; op.vz = 0;  // gentle -0.3 cells/tick
                 op.species = fluidSpecies;
-                // The particle knows what it IS (attr word): settle writes
-                // this material back as voxels, splashes and staining key on
-                // it. The species table above is just the render/attraction
-                // grouping now.
-                op.mat = (uint32_t)ui.brushMaterial & 0xFFFu;
+                op.mat = fluidCueMat;
                 fluidSpawns.push_back(op);
               }
             }
