@@ -264,9 +264,9 @@
     "fluidSprayDensity": 0.42,
     "fluidFoamScaleIdx": 3,
     "fluidExciteMode": 0,
-    "fluidSettleEps": 0.9,
-    "fluidWakeSpeed": 3.6,
-    "fluidSettleTicks": 45,
+    "fluidSettleEps": 6,
+    "fluidWakeSpeed": 24,
+    "fluidSettleTicks": 24,
     "fluidStainRate": 8
   },
   "render": {

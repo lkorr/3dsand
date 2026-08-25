@@ -257,6 +257,8 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_CONSUMED], 0u);
     atomicStore(&fluidArgs[FA_STAINED], 0u);
     atomicStore(&fluidArgs[FA_CLAMPED], 0u);
+    atomicStore(&fluidArgs[FA_SETREFUSED], 0u);
+    atomicStore(&fluidArgs[FA_SETUNSTABLE], 0u);
   }
   workgroupBarrier();
   var base = wgScan[li];
@@ -334,6 +336,112 @@ fn seamLiquid(mat : u32) -> bool {
   return m.klass == CLASS_LIQUID && m.moveEvery <= 1u;
 }
 
+// ---- the excite GEOMETRY, shared by detect and by settle's stability test ---
+//
+// WP3 item 2's "hysteresis by construction": settleCheck must refuse to settle
+// any column whose resulting cells would immediately satisfy an excite
+// trigger, so a settled configuration is excite-STABLE and the seam cannot
+// oscillate. That only holds if the two sides evaluate the SAME predicate, so
+// the predicate lives here, once, and both call it.
+//
+// The stability test runs regardless of T.fluidExciteEnable (the plan's
+// critical detail): the mid-slope freeze the user reported happens at
+// exciteMode 0, which is how `mpm`-tool water is placed. Refusing to freeze it
+// needs no excite path at all — the water simply stays particles until it
+// reaches a configuration that would not immediately want to move again.
+
+// How much liquid a cell holds, for the geometric tests: settled eighths from
+// the voxel word, or — for an air cell — the excited eighths the MPM node grid
+// carries there. That second arm is load-bearing. Without it a pool spanning
+// two chunks could never settle: the chunk that goes calm first sees its
+// neighbour's water as AIR (it is still particles, the voxel really is empty),
+// reads a full 8-eighth lateral gradient, and refuses forever. Same Q10-mass
+// -> whole-particles conversion mirrorFold uses.
+fn seamExcitedEighths(c : vec3<i32>) -> u32 {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, T.origin)) { return 0u; }
+  let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(wc)]);
+  if (bm == 0u) { return 0u; }
+  return u32(clamp(fluidGridR[seamNodeBase(bm, c)] >> 10u, 0, 8));
+}
+
+// A neighbour cell as the geometry sees it: .x = 1 if the cell BLOCKS flow
+// (solid, powder, an out-of-window cell, or a liquid this seam does not own),
+// .y = its liquid content in eighths (settled + excited). Blockers report 0
+// content and are simply skipped by every test below — water resting against
+// stone is stable, which is the whole point of a basin.
+fn seamNeighbourState(c : vec3<i32>) -> vec2<u32> {
+  if (!inWindow(c, T.origin)) { return vec2<u32>(1u, 0u); }
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
+  if (mat == MAT_AIR) { return vec2<u32>(0u, seamExcitedEighths(c)); }
+  if (seamLiquid(mat)) { return vec2<u32>(0u, voxState(w) + 1u); }
+  return vec2<u32>(1u, 0u);
+}
+
+// THE TRIGGER, over a cell that holds water and one of its lateral
+// neighbours: DIAGONAL FALL — the lateral neighbour is empty (no settled
+// water, no excited mass, not a blocker) and the cell BELOW that neighbour is
+// empty too. The water could fall diagonally, so it is not at rest.
+//
+// This is plan §6 item 1's trigger (b). It is the steep-slope case trigger (a)
+// structurally cannot see: on a slope there is terrain directly below, so
+// nothing "falls", but the cell diagonally down-slope is air even for a
+// ONE-VOXEL step (the neighbour's floor is one lower, so its cell at MY water
+// level and the cell under it are both air). That is the hill's stepped ramp,
+// and it is the user's reported mid-slope clump.
+//
+// DELIBERATE DEVIATION from plan §6 item 1, measured twice. The plan also
+// wanted trigger (c), "a lateral neighbour >= 2 eighths lower (air counts as
+// 0)". As an excite trigger that is defensible; as the settle-STABILITY test
+// it is fatal, and the two have to be one predicate or they oscillate against
+// each other. Two reasons it cannot be the stability test:
+//
+//   * A column's fullness is a count of PARTICLES, 8 to a full cell. A pool
+//     four eighths deep carries a couple of eighths of shot noise column to
+//     column, so a 2-eighth threshold sits UNDER the discretization's own
+//     noise floor. Measured on the fluid-settle gate at the owner's defaults:
+//     36 blocks picked, 36 refused as unstable, 0 settled, 1,280 eighths
+//     still live at tick 400.
+//   * Worse, it is not even a noise problem. settleColumn bottom-packs, so a
+//     deeper column's TOP cell is always beside a shallower column's empty
+//     cell at the same level. "Cell >= 2 with empty beside it" is therefore
+//     true at the surface of every pool that is not perfectly level to within
+//     one eighth — a condition no particle method reaches.
+//
+// AND IT IS ASKED ONLY AT THE BASE OF A COLUMN — the cell whose own below is
+// not this liquid. That restriction is the second measured lesson: asked at
+// every level, the test still refused 40 of 40 picks, because a deeper column's
+// TOP cell overhangs a shallower neighbour's empty one and the cell under THAT
+// is empty too. But an overhanging free surface is not perched water, it is
+// pool curvature, and the CA spreads it perfectly well (fullness 8 flows
+// sideways into air). What the CA cannot do is get water OFF A SLOPE, and that
+// is exactly a base cell with a diagonal void: the column is standing on a
+// ledge. Testing bases only makes the predicate mean "this body of water is
+// perched", which is the question WP3 is actually asking.
+//
+// It also restores the hysteresis-by-construction guarantee exactly: the
+// excite side applies the same base restriction, so
+// {cells excite would take} == {cells settle refuses to create}, and the seam
+// cannot oscillate. Draining a perched column still works, progressively — the
+// base converts to particles, the cells above lose their support, and trigger
+// (a) (air below) takes them on the following ticks, which is the mechanism
+// the seam already uses everywhere else.
+//
+// `nb`/`bel` are seamNeighbourState of the lateral cell and of the cell below
+// it. Pure function of the two states: no ordering, no randomness.
+fn seamLateralExcite(nb : vec2<u32>, bel : vec2<u32>) -> bool {
+  return nb.x == 0u && nb.y == 0u && bel.x == 0u && bel.y == 0u;
+}
+
+// The 4 lateral offsets, in a fixed order (no scheduling dependence).
+fn seamLateral(d : u32) -> vec3<i32> {
+  if (d == 0u) { return vec3<i32>(1, 0, 0); }
+  if (d == 1u) { return vec3<i32>(-1, 0, 0); }
+  if (d == 2u) { return vec3<i32>(0, 0, 1); }
+  return vec3<i32>(0, 0, -1);
+}
+
 // detect: one workgroup per dirty chunk (the CA's own indirect args), 16
 // cells per thread. A candidate cell gets its mark + depth written into its
 // OWN voxel word (bits 19..23 — the sanctioned scratch span) and its
@@ -378,6 +486,31 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       if (inWindow(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
         excite = true;
         byFall = true;
+      }
+      // Triggers (b) diagonal fall and (c) lateral pressure gradient (WP3
+      // item 1), the same predicate settleCheck refuses to settle INTO. These
+      // are what unstick water the CA has parked on a slope: trigger (a) is
+      // false there (the tread is solid) and the CA's own liquidEqualize
+      // makes the 1-eighth staircase a stable resting state.
+      // Base cells only — see the seamLateralExcite block. `below` is air here
+      // whenever trigger (a) already fired, so this only ever adds the case
+      // where the cell rests on TERRAIN with a lateral void beside it.
+      // Out-of-window below is solid and inert (the residency rule), so it is
+      // a base.
+      var onBase = true;
+      let bw = c + vec3<i32>(0, -1, 0);
+      if (inWindow(bw, T.origin)) {
+        onBase = !seamLiquid(voxMat(voxWordAt(bw)));
+      }
+      if (!excite && onBase) {
+        for (var d = 0u; d < 4u; d++) {
+          let n = c + seamLateral(d);
+          if (seamLateralExcite(seamNeighbourState(n),
+                                seamNeighbourState(n + vec3<i32>(0, -1, 0)))) {
+            excite = true;
+            break;
+          }
+        }
       }
     }
     // Trigger (b), always on: progressive wake. A face neighbor's grid node
@@ -854,6 +987,19 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
 
 // settleJudge: one thread per chunk slot. Speed 0 means "no particles here" —
 // the calm counter resets so a re-flooded chunk starts its window over.
+//
+// THE NEIGHBOURHOOD IS PART OF THE JUDGEMENT (WP3, the settle<->wake thrash).
+// Settle is a per-CHUNK decision; wake (the always-on excite trigger) is a
+// per-CELL one that fires on a face neighbour's grid-node speed. A chunk on the
+// edge of a churning pool is calm by its OWN particles, settles, and is woken
+// again on the next tick by the water next door — measured at the owner's
+// defaults as 3,833 eighths settled against 3,721 re-excited in one 400-tick
+// gate run, i.e. every eighth converting three times over and the pool never
+// quieting. A threshold gap cannot close that (the two thresholds measure
+// different quantities in different places); the geometry has to: do not
+// settle next to water energetic enough to wake you. A face neighbour with no
+// particles reads speed 0 and is quiet by definition, so a lone pool in still
+// air is unaffected.
 @compute @workgroup_size(256)
 fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
@@ -863,11 +1009,43 @@ fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
     atomicStore(&fluidCalm[slot], 0u);
     return;
   }
-  if (i32(sp - 1u) <= SEAM_SETTLE2) {
-    atomicAdd(&fluidCalm[slot], 1u);
-  } else {
-    atomicStore(&fluidCalm[slot], 0u);
+  if (i32(sp - 1u) > SEAM_SETTLE2) {
+    atomicStore(&fluidCalm[slot], 0u);   // this chunk's own water is moving
+    return;
   }
+  // The neighbourhood gate HOLDS the counter, it does not reset it. Those are
+  // different facts: "my water is moving" invalidates the window and has to
+  // start it over, but "the water next door is moving" only means the moment
+  // is wrong — a single transient spike three chunks along the pour should not
+  // cost a pool the 45 calm ticks it has already banked, or a busy scene never
+  // banks 45 in a row anywhere.
+  var quietAround = true;
+  {
+    // Face neighbours, in world-chunk space: the toroidal window makes slot
+    // adjacency world adjacency EXCEPT across the wrap plane, so this goes
+    // through worldChunkOf/chunkSlotIndex rather than adding 1 to the slot.
+    let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
+                       i32(slot / (NCHUNK * NCHUNK)));
+    let wc = slotToWorldChunk(sc, T.origin);
+    for (var f = 0u; f < 6u; f++) {
+      var d = vec3<i32>(0, 0, 0);
+      if (f == 0u) { d.x = 1; } else if (f == 1u) { d.x = -1; }
+      else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
+      else if (f == 4u) { d.z = 1; } else { d.z = -1; }
+      let n = wc + d;
+      if (!chunkInWindow(n, T.origin)) { continue; }
+      // The bar for the NEIGHBOUR is wakeSpeed, not settleEps: what breaks the
+      // loop is precisely "a neighbour energetic enough to wake me again", and
+      // that threshold is the wake trigger's own. Holding neighbours to
+      // settleEps as well was measured to be far too strict — 0 blocks picked
+      // in four of five bench scenes, i.e. no settling anywhere — while
+      // wakeSpeed leaves the thrash closed and lets a pool convert under a
+      // still-moving surface.
+      let nsp = atomicLoad(&settleScratch[SP_SPEED + chunkSlotIndex(n)]);
+      if (nsp != 0u && i32(nsp - 1u) > SEAM_WAKE2) { quietAround = false; break; }
+    }
+  }
+  if (quietAround) { atomicAdd(&fluidCalm[slot], 1u); }
 }
 
 // settleScan: pick up to SETTLE_MAX calm blocks, in slot order, with a greedy
@@ -985,9 +1163,29 @@ fn seamSupport(c : vec3<i32>) -> bool {
 // those cells, and the fluid-chunk N26 ring materialized them.
 // Returns false if the column is infeasible (content with no floor, content
 // past the spill ceiling, or trapped under a blocker).
+//
+// RECORDING (WP3 item 2). settleCheck is one workgroup of 256 threads over a
+// 16x16 block — exactly one thread per column — so the whole block's resulting
+// shape is computable inside one workgroup. `rec` makes the feasibility walk
+// also publish its per-level answer into workgroup memory, which is what lets
+// the stability test below compare a column against its IN-BLOCK lateral
+// neighbours' POST-settle fill rather than their pre-settle voxels (which are
+// air: the water is still particles). 24 levels x 4 bits + a blocked bitmask =
+// 4 words per column, 4 KiB per workgroup.
 const SETTLE_SPILL : i32 = 8;
+const SETTLE_LEVELS : i32 = 16 + SETTLE_SPILL;   // 24
+var<workgroup> wgFill : array<u32, 768>;   // [col*3 + y/8], nibble (y%8)*4
+var<workgroup> wgBlk : array<u32, 256>;    // bit y = level y blocks flow
+
+fn wgFillAt(col : u32, y : i32) -> u32 {
+  return (wgFill[col * 3u + u32(y) / 8u] >> ((u32(y) % 8u) * 4u)) & 0xFu;
+}
+fn wgBlockedAt(col : u32, y : i32) -> bool {
+  return (wgBlk[col] & (1u << u32(y))) != 0u;
+}
+
 fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
-                write : bool) -> bool {
+                write : bool, rec : bool, col : u32) -> bool {
   var floorOk = seamSupport(base + vec3<i32>(cx, -1, cz));
   var pool = 0u;         // eighths waiting to be placed in this segment
   var poolMatStain = 0u; // packed identity of the pooled content
@@ -1008,6 +1206,7 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       if (idx == PT_NO_WORD) { blocked = true; }
     }
     if (blocked) {
+      if (rec && y < SETTLE_LEVELS) { wgBlk[col] |= 1u << u32(y); }
       // Close the segment: everything pooled must have been placed.
       if (pool > 0u) { return false; }
       floorOk = true;  // content above rests on this blocker
@@ -1065,6 +1264,9 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     if (pool > 0u && !floorOk) { return false; }
     let place = min(pool, 8u);
     pool -= place;
+    if (rec && y < SETTLE_LEVELS) {
+      wgFill[col * 3u + u32(y) / 8u] |= place << ((u32(y) % 8u) * 4u);
+    }
     if (write && idx != PT_NO_WORD) {
       var nw = 0u;
       if (place > 0u) {
@@ -1093,21 +1295,145 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
 // settleCheck: one workgroup per settling block, one thread per column. Any
 // infeasible column refuses the WHOLE block (atomicOr) — mass is never
 // partially converted, so it can never be dropped or invented.
+//
+// TWO tests now, and the second is WP3's headline:
+//
+//   1. FEASIBILITY — the column walk fits (existing behaviour).
+//   2. EXCITE STABILITY — every cell the walk WOULD write must fail every
+//      geometric excite trigger (seamLateralExcite). A settled configuration
+//      that immediately satisfies a trigger is a one-tick oscillation at best
+//      and, at exciteMode 0 where nothing can re-excite it, is the user's
+//      reported mid-slope FREEZE: water converted to CA voxels exactly where
+//      it stalled on a hillside, in a staircase the CA's liquidEqualize=2 then
+//      holds as a stable equilibrium forever. Refusing it costs nothing —
+//      the water stays particles and keeps flowing — and it is bounded,
+//      because water that reaches flat ground does satisfy the test.
+//      This runs REGARDLESS of T.fluidExciteEnable, on purpose (plan §6 item
+//      2): the freeze it prevents happens at exciteMode 0.
+//
+// The stability test needs the POST-settle fill of the four lateral
+// neighbours. In-block neighbours are still particles, so their voxels read
+// air — the answer has to come from the walk, which is why every thread
+// publishes its column into workgroup memory and the test runs after a
+// barrier. Out-of-block neighbours are never concurrently settling (the scan's
+// adjacency exclusion), so their voxels ARE their post-settle state, and
+// seamNeighbourState adds the excited-particle arm for the water next door.
+// Any thread may find the block unstable, and the refusal has to be applied
+// once, by one thread, after everybody has voted. Workgroup atomicOr: 0/1,
+// associative, no CAS (rule 1).
+var<workgroup> wgBad : atomic<u32>;      // infeasible column
+var<workgroup> wgUnstable : atomic<u32>; // excite-unstable resulting cell
+
 @compute @workgroup_size(256)
 fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
                @builtin(local_invocation_index) li : u32) {
-  if (wg.x >= atomicLoad(&settleScratch[SP_COUNT])) { return; }
-  let ci = atomicLoad(&settleScratch[SP_LIST + wg.x]);
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  // Workgroup memory is not zero-initialised, and a column that refuses on
+  // feasibility returns early with its record half-written. Clear first.
+  // No early `return` anywhere in this function: every barrier below has to
+  // sit in control flow the compiler can see is uniform, and `wg.x < count`
+  // comes from a storage read (settleScan's note on the same hazard).
+  wgFill[li * 3u] = 0u;
+  wgFill[li * 3u + 1u] = 0u;
+  wgFill[li * 3u + 2u] = 0u;
+  wgBlk[li] = 0u;
+  if (li == 0u) { atomicStore(&wgBad, 0u); atomicStore(&wgUnstable, 0u); }
+  workgroupBarrier();
+
+  let live = wg.x < atomicLoad(&settleScratch[SP_COUNT]);
+  var ci = 0u;
+  var base = vec3<i32>(0, 0, 0);
+  if (live) {
+    ci = atomicLoad(&settleScratch[SP_LIST + wg.x]);
+    let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
+                                 ci / (NCHUNK * NCHUNK)));
+    base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  }
   let cx = i32(li & 15u);
   let cz = i32(li >> 4u);
-  if (!settleColumn(wg.x, base, cx, cz, false)) {
+  // ---- test 1: feasibility (and publish the resulting column) -------------
+  if (live && !settleColumn(wg.x, base, cx, cz, false, true, li)) {
+    atomicOr(&wgBad, 1u);
+  }
+  workgroupBarrier();   // every column's record is now readable
+
+  // ---- test 2: excite stability -------------------------------------------
+  // Skipped once the block is already doomed: the answer cannot change and
+  // the walk is the expensive part.
+  if (live && atomicLoad(&wgBad) == 0u) {
+    var unstable = false;
+    for (var y = 0; y < SETTLE_LEVELS && !unstable; y++) {
+      let full = wgFillAt(li, y);
+      if (full == 0u) { continue; }
+      // WHO OWNS SETTLED LIQUID decides how strict this is, and both arms are
+      // the same question — "will this configuration still move?".
+      //   exciteMode 1: the MPM owns it. Refuse anything excite would take
+      //     straight back, which is the full hysteresis guarantee.
+      //   exciteMode 0 (stock, and how the mpm dev tool places water): the CA
+      //     owns settled liquid, and the CA CAN move a perched cell — it
+      //     spreads laterally into air and takes down-diagonals — as long as
+      //     the cell holds at least 2 eighths (sim_step's `if (f >= 2u)` gate,
+      //     the CA's own lateral-spread threshold). Refusing those does not
+      //     prevent a freeze, it CAUSES one: a film thinner than the solver's
+      //     3-cell B-spline support gathers rho << rest, so its EOS pressure
+      //     is zero and the MPM cannot move it either. Measured on the hill
+      //     scene: a puddle on every single tread of the ramp, 49% of the pour,
+      //     inert as particles for the 440 ticks after the pour stopped.
+      //     Below 2 eighths the CA cannot spread it either, so that IS a
+      //     freeze and stays refused in both modes.
+      if (T.fluidExciteEnable == 0u && full >= 2u) { continue; }
+      // BASE cells only: the bottom of each contiguous body of water in this
+      // column (see seamLateralExcite). At y = 0 the cell below is outside the
+      // block, so it comes from the voxels/node grid like any other
+      // out-of-block probe.
+      if (y > 0) {
+        if (wgFillAt(li, y - 1) != 0u) { continue; }
+      } else if (seamNeighbourState(base + vec3<i32>(cx, -1, cz)).y != 0u) {
+        continue;
+      }
+      for (var d = 0u; d < 4u; d++) {
+        let off = seamLateral(d);
+        let nx = cx + off.x;
+        let nz = cz + off.z;
+        var nb : vec2<u32>;
+        var bel : vec2<u32>;
+        if (nx >= 0 && nx < 16 && nz >= 0 && nz < 16) {
+          // In-block: the neighbour column's POST-settle answer.
+          let ncol = u32(nz * 16 + nx);
+          nb = vec2<u32>(select(0u, 1u, wgBlockedAt(ncol, y)),
+                         wgFillAt(ncol, y));
+          if (y > 0) {
+            bel = vec2<u32>(select(0u, 1u, wgBlockedAt(ncol, y - 1)),
+                            wgFillAt(ncol, y - 1));
+          } else {
+            bel = seamNeighbourState(base + vec3<i32>(nx, -1, nz));
+          }
+        } else {
+          // Out of block: voxels + excited node mass, both already final.
+          nb = seamNeighbourState(base + vec3<i32>(nx, y, nz));
+          bel = seamNeighbourState(base + vec3<i32>(nx, y - 1, nz));
+        }
+        if (seamLateralExcite(nb, bel)) { unstable = true; break; }
+      }
+    }
+    if (unstable) { atomicOr(&wgUnstable, 1u); }
+  }
+  workgroupBarrier();
+
+  let infeasible = atomicLoad(&wgBad) != 0u;
+  let unstableBlk = atomicLoad(&wgUnstable) != 0u;
+  if (live && li == 0u && (infeasible || unstableBlk)) {
     atomicOr(&settleScratch[SP_MARK + ci], MARK_REFUSED);
-    // Refused blocks start their calm window over rather than re-running the
-    // full bin/check every tick against unchanging geometry (rule 2).
-    atomicStore(&fluidCalm[ci], 0u);
+    // Refused blocks HALVE their calm window rather than zeroing it (WP3 item
+    // 3). Zeroing made a geometrically-awkward pool re-run the full 45-tick
+    // bin/check/refuse cycle forever against unchanging geometry; halving
+    // keeps a real cooldown (rule 2) while still letting a block that only
+    // just missed retry soon.
+    atomicStore(&fluidCalm[ci], SEAM_CALM_TICKS / 2u);
+    // Two counters, because they are opposite diagnoses: INFEASIBLE means the
+    // column arithmetic did not fit (geometry/coverage), UNSTABLE means it fit
+    // and would have wanted to move again immediately (WP3's whole point).
+    if (infeasible) { atomicAdd(&fluidArgs[FA_SETREFUSED], 1u); }
+    else { atomicAdd(&fluidArgs[FA_SETUNSTABLE], 1u); }
   }
 }
 
@@ -1123,7 +1449,7 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
   let cx = i32(li & 15u);
   let cz = i32(li >> 4u);
-  settleColumn(wg.x, base, cx, cz, true);
+  settleColumn(wg.x, base, cx, cz, true, false, li);
   if (li == 0u) { atomicStore(&fluidCalm[ci], 0u); }
 }
 

@@ -406,11 +406,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // WP2 shrank the override set to the settle trio: stock is CFL-honest
       // and zero-tension now, so the gate's old stiffness/cohesion/attract
       // overrides are simply stock (keep this block mirroring the gate).
-      if (run.settleTuning) {
-        t.sim.fluidSettleEps = 6.0f;
-        t.sim.fluidWakeSpeed = 24.0f;
-        t.sim.fluidDamping = 0.9f;
-      }
+      // WP3 shrank it again: settleEps 6.0 and wakeSpeed 24.0 ARE stock now
+      // (the at-rest speed floor scales with gravity, and the owner's is 900),
+      // so this run differs from stock by ONE knob — the sealed-box damping.
+      if (run.settleTuning) t.sim.fluidDamping = 0.9f;
       SetCurrentTuning(t);
       // Recompile only when the compiled-in fluid consts actually change: a
       // reload is seconds of Tint, and every other run wants stock tuning.
@@ -454,6 +453,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     std::vector<uint32_t> liveCurve, blockCurve, clampCurve;
     uint64_t poured = 0, settledSum = 0, excitedSum = 0, deadSum = 0,
              binnedSum = 0, consumedSum = 0, emittedSum = 0, refusedSum = 0,
+             setRefusedSum = 0, setUnstableSum = 0, setBlocksSum = 0,
              clampedSum = 0;
     int tickOfSettle = -1;
     double idleFluidMs = -1.0;
@@ -503,6 +503,9 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       consumedSum += fa[16];
       emittedSum += fa[9];
       refusedSum += fa[12];
+      setBlocksSum += fa[13];     // FA_SETBLOCKS: blocks the scan picked
+      setRefusedSum += fa[25];    // FA_SETREFUSED: of those, infeasible
+      setUnstableSum += fa[26];   // FA_SETUNSTABLE: of those, excite-unstable
       if (tickOfSettle < 0 && pourEnd != ~0u && st > pourEnd + 2 &&
           fa[7] == 0 && fa[3] == 0)
         tickOfSettle = (int)st;
@@ -673,6 +676,22 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         (unsigned)std::count_if(clampCurve.begin(), clampCurve.end(),
                                 [](uint32_t c) { return c != 0; }),
         (unsigned)clampCurve.size());
+    // The SEAM FLOW (WP3). "nothing settled" has two opposite causes and this
+    // line separates them: `picked 0` means the water never went calm, while
+    // `picked N refused N` means it did and settleCheck turned it down (an
+    // infeasible column, or a resulting cell that would immediately satisfy an
+    // excite trigger). `settled` vs `re-excited` is the thrash meter — the two
+    // being close means every eighth is converting over and over.
+    std::printf("    seam flow: blocks picked %llu = %llu infeasible + %llu "
+                "unstable + %llu committed | eighths settled %llu re-excited "
+                "%llu binned %llu\n",
+                (unsigned long long)setBlocksSum,
+                (unsigned long long)setRefusedSum,
+                (unsigned long long)setUnstableSum,
+                (unsigned long long)(setBlocksSum - setRefusedSum -
+                                     setUnstableSum),
+                (unsigned long long)settledSum, (unsigned long long)excitedSum,
+                (unsigned long long)binnedSum);
     if (hasBasin)
       std::printf("    basin capture: %.1f%% (%llu of %llu eighths inside the "
                   "catch basin)\n",
@@ -767,7 +786,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
          << ", \"deadParticles\": " << deadSum
          << ", \"binned\": " << binnedSum << ", \"consumed\": " << consumedSum
          << ", \"emittedDroplets\": " << emittedSum
-         << ", \"exciteRefused\": " << refusedSum << "},\n";
+         << ", \"exciteRefused\": " << refusedSum
+         << ", \"settleBlocks\": " << setBlocksSum
+         << ", \"settleRefused\": " << setRefusedSum
+         << ", \"settleUnstable\": " << setUnstableSum << "},\n";
     json << "    \"liveMax\": "
          << *std::max_element(liveCurve.begin(), liveCurve.end())
          << ", \"liveEnd\": " << liveEst << ",\n";

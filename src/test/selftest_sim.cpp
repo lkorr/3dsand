@@ -777,6 +777,7 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
   int settledAt = -1;
   uint32_t basinEighths = 0;
   uint32_t settledSum = 0, deadSum = 0, excitedSum = 0, binnedSum = 0;
+  uint32_t pickedSum = 0, infeasibleSum = 0, unstableSum = 0;
   for (int run = 0; run < 2; run++) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
@@ -859,6 +860,9 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
     deadSum = 0;
     excitedSum = 0;
     binnedSum = 0;
+    pickedSum = 0;
+    infeasibleSum = 0;
+    unstableSum = 0;
     uint32_t lastCount = 0;
     std::map<uint64_t, uint32_t> prevCells;
     for (int i = 0; i < kMaxTicks; i++) {
@@ -874,15 +878,23 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
         // Per-tick: the FA event counters clear at the top of every fluid
         // tick, so mass-flow bookkeeping (settled/dead/excited sums — the
         // audit that localizes any leak) must not skip a tick.
-        uint32_t fa[16] = {};
+        uint32_t fa[32] = {};
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
-                              fa, 64, "settleArgs");
+                              fa, 128, "settleArgs");
         live = std::min(fa[7], kFluidCap);
         blocks = fa[3];
         settledSum += fa[10];
         deadSum += fa[8];
         excitedSum += fa[11];
         binnedSum += fa[15];
+        // WP3's settle diagnosis, and why this gate can now say WHY it failed
+        // rather than only that it did: blocks the scan picked, and how many
+        // settleCheck turned down for an infeasible column (FA_SETREFUSED)
+        // versus an excite-unstable result (FA_SETUNSTABLE). "0 settled" has
+        // two opposite causes and this separates them.
+        pickedSum += fa[13];
+        infeasibleSum += fa[25];
+        unstableSum += fa[26];
         liveEst = live;
         if (live == 0 && blocks == 0 && settledAt < 0) {
           settledAt = i;
@@ -937,9 +949,11 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
   std::printf(
       "fluid settle: %s (%u eighths poured -> %u settled voxel eighths, "
       "quiet at tick %d, %u live / %u blocks at end, flow: %u binned / "
-      "%u settled / %u died / %u re-excited, world hash %s)\n",
+      "%u settled / %u died / %u re-excited, picks: %u = %u infeasible + "
+      "%u unstable + %u committed, world hash %s)\n",
       ok ? "PASS" : "FAIL", spawned, basinEighths, settledAt, live, blocks,
-      binnedSum, settledSum, deadSum, excitedSum,
+      binnedSum, settledSum, deadSum, excitedSum, pickedSum, infeasibleSum,
+      unstableSum, pickedSum - infeasibleSum - unstableSum,
       det ? "matches" : "DIVERGED");
   detail = Format("%u poured, %u settled, quiet@%d, det %s", spawned,
                   basinEighths, settledAt, det ? "ok" : "DIVERGED");
@@ -968,25 +982,19 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   t.dayNight.freeze = 1;
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);  // both water sinks off
   t.sim.fluidExciteMode = 1;  // the disturbance trigger under test
-  // A drained sealed pool keeps a small persistent fountain near the hole
-  // (~1% of particles above 1 vox/s — solver-quality churn, not seam
-  // behaviour), and the calm judgement is a per-slot MAX. Relax the calm
-  // threshold for this gate so the bulk can settle around the outliers; the
-  // wake threshold scales with it to keep the hysteresis gap.
-  t.sim.fluidSettleEps = 6.0f;
-  t.sim.fluidWakeSpeed = 24.0f;
   // A SEALED box is adversarial for settling: with the default damping of 0
   // the drained pool rings between the walls indefinitely (measured: max
-  // particle speed still ~15 vox/s after 200 ticks, against a 0.9 vox/s calm
-  // threshold — nothing radiates out of a closed chamber). Real damping is a
-  // look knob; the gate turns it up so the drain's END STATE is reachable in
-  // a bounded run.
+  // particle speed still ~15 vox/s after 200 ticks — nothing radiates out of a
+  // closed chamber). Real damping is a look knob; the gate turns it up so the
+  // drain's END STATE is reachable in a bounded run.
   t.sim.fluidDamping = 0.9f;
-  // WP2 shrank this override set (the plan's success signal): stock is now
-  // CFL-honest (stiffness 3600 -> c = 0.33 cells/substep) and zero-tension
-  // (cohesion/attract 0), so the stiffness-2400 override and the three
-  // attraction/cohesion overrides this gate used to need are simply stock.
-  // The settle trio above remains: a sealed chamber genuinely rings.
+  // THE OVERRIDE SET, shrinking (the plan's success signal): 7 before WP2,
+  // 3 after it, 1 now. WP2 made stock CFL-honest and zero-tension, which
+  // retired the stiffness/cohesion/attract overrides. WP3 retired the settle
+  // trio's other two: settleEps 6.0 and wakeSpeed 24.0 ARE stock now, because
+  // the at-rest speed floor scales with gravity and the owner's is 900. Only
+  // damping is left, and it is a property of the SEALED geometry, not a
+  // defect in the defaults.
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   // fluidDamping is a WGSL const (folded into the kernels at compile time —
@@ -1188,10 +1196,11 @@ Status GateFluidStain(Ctx& c, std::string& detail) {
   t.dayNight.freeze = 1;
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
   t.sim.fluidExciteMode = 1;
-  t.sim.fluidDamping = 0.9f;      // the excite gate's sealed-box overrides
+  // The excite gate's sealed-box overrides. settleEps/wakeSpeed used to be
+  // here too and are stock now (WP3) — a sealed chamber still needs the
+  // damping and the softer stiffness.
+  t.sim.fluidDamping = 0.9f;
   t.sim.fluidStiffness = 2400.0f;
-  t.sim.fluidSettleEps = 6.0f;
-  t.sim.fluidWakeSpeed = 24.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   sim.ReloadShaders(ctx.device);
@@ -1332,10 +1341,8 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   t.dayNight.freeze = 1;
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
   t.sim.fluidExciteMode = 1;
-  t.sim.fluidDamping = 0.9f;
-  t.sim.fluidStiffness = 2400.0f;
-  t.sim.fluidSettleEps = 6.0f;
-  t.sim.fluidWakeSpeed = 24.0f;
+  t.sim.fluidDamping = 0.9f;      // sealed-box overrides; settleEps/wakeSpeed
+  t.sim.fluidStiffness = 2400.0f;  // are stock as of WP3
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   sim.ReloadShaders(ctx.device);

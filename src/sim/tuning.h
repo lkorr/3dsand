@@ -813,15 +813,28 @@ struct Tuning {
                                   // keeps the pinned world hash); 1 = settled
                                   // liquid with air below converts to MPM
                                   // particles
-    float fluidSettleEps = 0.9f;  // vox/s: a fluid block whose FASTEST
+    float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
                                   // particle stays below this counts as calm
-                                  // and may settle back into CA voxels
-    float fluidWakeSpeed = 3.6f;  // vox/s: grid-node speed at an active/
+                                  // and may settle back into CA voxels.
+                                  // SCALES WITH GRAVITY, and 0.9 was the value
+                                  // for 98.1: at rest a surface particle still
+                                  // gets a substep of free fall (gravity /
+                                  // substeps) before pressure answers it, so
+                                  // the at-rest speed floor of the solver is
+                                  // proportional to g. At the owner's 900 that
+                                  // floor is ~9x higher and 0.9 was simply
+                                  // unreachable — no pool settled anywhere, in
+                                  // any scene, at any tick (WP3 measurement).
+                                  // 6.0 = 0.2 cells/tick = 0.6 m/s: a drift,
+                                  // not a motion, and the excite-stability
+                                  // test in settleCheck is what actually
+                                  // guards the RESULT now.
+    float fluidWakeSpeed = 24.0f; // vox/s: grid-node speed at an active/
                                   // settled interface above this excites the
                                   // neighbouring settled liquid (progressive
                                   // wake). Keep ~4x settleEps: the gap is the
                                   // hysteresis
-    int fluidSettleTicks = 45;    // consecutive calm ticks before a block
+    int fluidSettleTicks = 24;    // consecutive calm ticks before a block
                                   // settles. The >= 8 floor is a HARD
                                   // requirement: it covers the CPU-side
                                   // page-materialization readback latency, so

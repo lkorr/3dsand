@@ -445,9 +445,9 @@ TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
 // wakeSpeed defaults to 4x settleEps — that gap is the hysteresis that stops
 // blocks flickering between the two states.
 TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 0)
-TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 0.9f)
-TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 3.6f)
-TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 45)
+TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
+TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
+TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----

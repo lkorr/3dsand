@@ -636,8 +636,14 @@ PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
           A(FluidBlockMap) I(FluidDispatchArgs)))
+// U(TickUBO): the calm judgement folds in the six FACE-NEIGHBOUR chunks'
+// speed maxima (a chunk on the edge of churning water settles by its own
+// particles and is woken again by the water next door — the settle<->wake
+// thrash WP3 measured). Slot adjacency is not world adjacency across the
+// toroidal window's wrap plane, so the neighbour walk goes through
+// slotToWorldChunk/chunkSlotIndex, which needs the origin.
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(A(FluidSettleScratch) A(FluidCalm)))
+     USES(U(TickUBO) A(FluidSettleScratch) A(FluidCalm)))
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidCalm) A(FluidSettleScratch) A(FluidArgsStage)))
 // read-only in practice: `fluidParticles` is read_write for the module;
@@ -651,9 +657,16 @@ PASS(seam_settle_bin, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_BIN, K_IN
 // write set (a too-wide barrier is pure cost; a too-narrow one is a race).
 // Any infeasible column refuses its whole block, which is what makes the
 // commit's writes all-or-nothing per block.
+// A(FluidBlockMap) R(FluidGrid): the second test — excite stability, WP3's
+// hysteresis-by-construction — asks what a lateral neighbour cell HOLDS, and
+// for the water next door that is still particles the answer is node mass, not
+// the (empty) voxel. Same block-map + Q10-mass read exciteDetect's wake probe
+// and mirrorFold already make. Read-only here; A() because the module binds
+// the map read_write for stainApply's Y-mask.
 PASS(seam_settle_check, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_CHECK, K_COMPUTE, 16,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
-          A(FluidSettleScratch) A(FluidCalm) A(FluidArgsStage)))
+          A(FluidSettleScratch) A(FluidCalm) A(FluidArgsStage)
+          A(FluidBlockMap) R(FluidGrid)))
 PASS(seam_settle_commit, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_COMMIT, K_COMPUTE, 16,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           A(FluidSettleScratch) A(FluidCalm) A(FluidArgsStage)))

@@ -938,7 +938,15 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // [22..24] CONSUME dispatch args ((compactLive+63)/64, 1, 1) — written by the
 //         compaction scan, staged before consumeApply, which used to dispatch
 //         4,096 fixed workgroups.
-// [25..31] spare
+// [25]    settle blocks REFUSED this tick (settleCheck: infeasible column or
+//         a resulting cell that would immediately satisfy an excite trigger —
+//         WP3's hysteresis-by-construction). Diagnostic: the number that says
+//         whether "nothing settled" means "never went calm" or "went calm and
+//         was refused", which are opposite bugs.
+// [26]    settle blocks refused as excite-UNSTABLE this tick (the resulting
+//         configuration would immediately satisfy an excite trigger). Split
+//         from [25] because the two are opposite diagnoses.
+// [27..31] spare
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;
@@ -951,6 +959,8 @@ const FA_BINNED    : u32 = 15u;
 const FA_CONSUMED  : u32 = 16u;
 const FA_STAINED   : u32 = 17u;
 const FA_CLAMPED   : u32 = 18u;
+const FA_SETREFUSED : u32 = 25u;
+const FA_SETUNSTABLE : u32 = 26u;
 // Byte offsets of the two arg triples are what pass_table.def's copy rows use;
 // keep the three in step (76 = 19*4, 88 = 22*4).
 const FA_ARGS_COMPACT : u32 = 19u;
