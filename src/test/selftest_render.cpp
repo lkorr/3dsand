@@ -15,6 +15,7 @@
 #include "game/brush.h"
 #include "game/camera.h"
 #include "gpu/resources.h"
+#include "sim/faredits.h"
 #include "sim/farfield.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -23,6 +24,51 @@ using namespace sandvox;
 
 namespace selftest {
 namespace {
+
+// ---- one packed material byte out of farVox -----------------------------
+// The far grid's own addressing (kFarN masks, chunk-major), mirroring
+// common.wgsl's farVoxByteIndex. SELFTEST ONLY — farVox carries CopySrc for
+// exactly this and the frame path stays readback-free (CLAUDE.md rule 3).
+// Shared by the three far gates so the index math has one definition; a second
+// copy is the "two places that must agree" bug this repo has a checker for.
+uint32_t FarVoxByte(GpuContext& ctx, World& world, uint32_t level, IVec3 cc) {
+  auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+  const uint32_t x = wrapv(cc.x), y = wrapv(cc.y), z = wrapv(cc.z);
+  const uint32_t ch = ((z >> 4) * kFarNChunk + (y >> 4)) * kFarNChunk + (x >> 4);
+  const uint32_t lo = ((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15);
+  const uint64_t bi =
+      (uint64_t)(level - 1) * kFarVox + (uint64_t)ch * kChunkVol + lo;
+  rhi::Buffer staging =
+      CreateBuffer(ctx.device, 4, rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                   "farVoxRead");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.farVox, bi & ~3ull, staging, 0, 4);
+  ctx.queue.Submit(enc.Finish());
+  uint32_t word = 0;
+  rhi::ReadBufferBlocking(ctx.device, staging, 0, &word, 4);
+  return (word >> ((bi & 3ull) * 8)) & 0xFFu;
+}
+
+// Fill every cascade level around `playerChunk` from scratch and wait for it.
+// This is the operation far-field edit persistence is about: it is what
+// startup, a teleport and LoadWorld all do, and before the patch pass it threw
+// away every edit the live downsample had put in the cascades.
+void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim,
+                     IVec3 playerChunk) {
+  FarField far;
+  far.Init(&world);
+  far.FullRefill(playerChunk);
+  uint32_t n;
+  while ((n = far.PrepareTick(ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = n;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, n);
+    ctx.queue.Submit(enc.Finish());
+  }
+  ctx.WaitIdle();
+}
 
 // ---- far-fog -----------------------------------------------------------
 Status GateFarFog(Ctx& c, std::string& detail) {
@@ -116,23 +162,7 @@ bool farDownOk = false;
   // 1.5 * cellsize - (cellsize/2 - offset) away per axis — radius 12 covers
   // it at the current 4-voxel cells (corner sample distance^2 = 108 < 144).
   const int farShift1 = (int)(1 + kFarShiftBase);
-  auto farByte = [&](IVec3 cc) {
-    // farVoxByteIndex(1, cc) on the FAR grid (kFarN masks, chunk-major)
-    auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
-    uint32_t x = wrapv(cc.x), y = wrapv(cc.y), z = wrapv(cc.z);
-    uint32_t ch = ((z >> 4) * kFarNChunk + (y >> 4)) * kFarNChunk + (x >> 4);
-    uint32_t lo = ((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15);
-    uint64_t bi = (uint64_t)ch * kChunkVol + lo;
-    rhi::Buffer staging = CreateBuffer(
-        ctx.device, 4, rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-        "farVoxRead");
-    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    enc.CopyBufferToBuffer(world.farVox, bi & ~3ull, staging, 0, 4);
-    ctx.queue.Submit(enc.Finish());
-    uint32_t word = 0;
-    rhi::ReadBufferBlocking(ctx.device, staging, 0, &word, (size_t)(4));
-    return (word >> ((bi & 3ull) * 8)) & 0xFFu;
-  };
+  auto farByte = [&](IVec3 cc) { return FarVoxByte(ctx, world, 1, cc); };
   auto scan = [&](uint32_t want) {
     uint32_t n = 0;
     for (int dz = -1; dz <= 1; dz++)
@@ -162,6 +192,118 @@ bool farDownOk = false;
 
   // Verdict: the flag the moved body already computed.
   return farDownOk ? Status::Pass : Status::Fail;
+}
+
+// ---- far-persist -------------------------------------------------------
+// Far-field EDIT PERSISTENCE (src/sim/faredits.h). `far-downsample` above
+// proves an edit reaches the cascades while its chunk is resident and dirty;
+// this proves it SURVIVES a cascade refill, which is what actually happens
+// when the player walks past a level's box edge and back, teleports, or
+// reloads the world.
+//
+// The gate is a two-armed differential inside one run, so it cannot pass
+// vacuously and cannot pass without the patch pass:
+//
+//   arm A (control): paint, ghost it into the cascades via `fardown`, then
+//     FullRefill with the edit index EMPTY. The sieve regenerates pristine
+//     procgen — open sky up here — so all 27 cells must read AIR. That arm is
+//     literally the bug: it is the behaviour every build had before this
+//     change, and it is asserted here so a future change that quietly stops
+//     refilling cannot make arm B pass for the wrong reason.
+//   arm B (the fix): hand the index the same chunks eviction would have handed
+//     it, FullRefill again, and the 27 cells must read the paint back.
+Status GateFarPersist(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  // Open air well above the hills and canopy, resident under the {0,0,0}
+  // window origin this section runs at, and clear of far-downsample's own
+  // paint site so the two gates cannot read each other's cells.
+  const IVec3 site{300, 200, 300};
+  const int shift1 = (int)(1 + kFarShiftBase);
+  const IVec3 cell0{site.x >> shift1, site.y >> shift1, site.z >> shift1};
+  // Radius 12 covers the sample points of the whole 3x3x3 level-1 cell block
+  // at the current 4-fine-voxel cells (corner sample distance^2 = 108 < 144) —
+  // the same sizing argument far-downsample makes.
+  const int kRadius = 12;
+  const IVec3 playerChunk{site.x >> 4, site.y >> 4, site.z >> 4};
+
+  auto scan = [&](uint32_t want) {
+    uint32_t n = 0;
+    for (int dz = -1; dz <= 1; dz++)
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+          if (FarVoxByte(ctx, world, 1,
+                         {cell0.x + dx, cell0.y + dy, cell0.z + dz}) == want)
+            n++;
+    return n;
+  };
+
+  // ---- paint, and let the live downsample carry it into the cascades ----
+  for (uint32_t t = 1; t <= 4; t++) {
+    std::vector<BrushOp> ops;
+    if (t == 1)
+      ops.push_back({site.x, site.y, site.z, kRadius, kMatGlass,
+                     1u /*overwrite*/, 0, 0});
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, {}, false, playerChunk,
+               false, false);
+  }
+  ctx.WaitIdle();
+  const uint32_t ghosted = scan(kMatGlass);
+
+  // ---- arm A: refill with an empty index -> the horizon heals itself ----
+  FarEdits& edits = c.stream.Edits();
+  // The harness's Stream may have evicted chunks in an earlier gate, and a
+  // stale index entry for THIS level chunk would patch the control arm. The
+  // index is derived and disposable by construction, so dropping it is legal
+  // (a real session rebuilds it from the store on load).
+  edits.Clear();
+  DrainFullRefill(ctx, world, sim, playerChunk);
+  const uint32_t healed = scan(kMatAir);
+
+  // ---- arm B: feed the index the way eviction does, then refill ---------
+  // Stream::CompleteOldest hands FarEdits the harvested words of every chunk
+  // it persists; here the words come straight off the GPU instead, because
+  // forcing a real window shift mid-suite would move the origin out from under
+  // every gate that follows. The chunks are exactly the ones that own the 27
+  // cells' sample voxels — a level-1 cell samples the fine voxel at
+  // (cell << shift) + half.
+  int lo[3] = {INT32_MAX, INT32_MAX, INT32_MAX};
+  int hi[3] = {INT32_MIN, INT32_MIN, INT32_MIN};
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) {
+        const int f[3] = {((cell0.x + dx) << shift1) + (1 << (shift1 - 1)),
+                          ((cell0.y + dy) << shift1) + (1 << (shift1 - 1)),
+                          ((cell0.z + dz) << shift1) + (1 << (shift1 - 1))};
+        for (int a = 0; a < 3; a++) {
+          lo[a] = std::min(lo[a], f[a] >> 4);
+          hi[a] = std::max(hi[a], f[a] >> 4);
+        }
+      }
+  std::vector<uint32_t> words(kChunkVol);
+  uint32_t noted = 0;
+  for (int cz = lo[2]; cz <= hi[2]; cz++)
+    for (int cy = lo[1]; cy <= hi[1]; cy++)
+      for (int cx = lo[0]; cx <= hi[0]; cx++) {
+        const IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) continue;
+        ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, words.data(),
+                       "farPersist");
+        edits.NoteChunk(wc, words.data());
+        noted++;
+      }
+  DrainFullRefill(ctx, world, sim, playerChunk);
+  const uint32_t kept = scan(kMatGlass);
+
+  const bool ok = ghosted == 27 && healed == 27 && kept == 27;
+  std::printf("far persist: %s (%u/27 cells downsampled, %u/27 back to air on a "
+              "refill with no index, %u/27 preserved from %u indexed chunks)\n",
+              ok ? "PASS" : "FAIL", ghosted, healed, kept, noted);
+  detail = Format("%u/27 ghosted, %u/27 healed, %u/27 preserved", ghosted,
+                  healed, kept);
+  return ok ? Status::Pass : Status::Fail;
 }
 
 // ---- screenshots -------------------------------------------------------
@@ -316,6 +458,7 @@ const std::vector<Gate>& RenderGates() {
   static const std::vector<Gate> g = {
       {"far-fog", "render", {}, false, GateFarFog},
       {"far-downsample", "render", {}, false, GateFarDownsample},
+      {"far-persist", "render", {}, false, GateFarPersist},
       // The only gate in this file that actually DRAWS: far-fog and
       // far-downsample exercise the far-field cascades through compute and a
       // one-word readback, and never touch the offscreen target.

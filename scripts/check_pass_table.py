@@ -170,6 +170,7 @@ BUF_TO_WGSL = {
     "FarOcc": {"farOcc"},
     "FarList": {"farList"},
     "FarUBO": {"F"},
+    "FarPatch": {"farPatch"},
     "PageTable": {"pageTable"},
     "PageFaults": {"pageFaults"},
     # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
@@ -226,7 +227,7 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 "pageTable", "pageFaults"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
-_FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty"}
+_FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}
 _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
                  "fluidBlockList", "fluidGrid", "fluidArgs",
                  # splash coupling: particle write page + counts (bindings 6/7)

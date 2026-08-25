@@ -317,10 +317,66 @@ becomes `farCount`; `RenderParams` spare `_p1` becomes `fogDensity`.
      (metres) into that level's cells, clamped [8, 128]. Verified load-bearing
      by A/B: restoring the fixed cap reproduced 451 ms.
 
-7. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
+7. **Edit persistence — IMPLEMENTED (2026-08-24).** Phase 2 made edits REACH
+   the far field; it did not make them SURVIVE there. `fardown` writes the
+   ghost from the live grid, and the sieve — the other producer of the same
+   cells — overwrites it with pristine procgen on every refill: an incoming
+   plane once the player crosses a level's box edge and comes back, a
+   `ResetLevel` on teleport, and the `FullRefill` that startup and `LoadWorld`
+   both run. So a crater healed itself at range, and a reloaded world's horizon
+   was the untouched hillside.
+   - **Does the engine already know which chunks were edited? YES** — that was
+     the first thing checked, and it decided the design. `Stream::EvictSlots`
+     skips any slot with `modified_[s] == 0` ("an unmodified chunk is already
+     reproducible"), so `ChunkStore` — the `world.svd/` region files — contains
+     *exactly* the chunks that diverged from procgen. No new dirty tracking was
+     needed; the existing persistence layer IS the oracle.
+   - **`src/sim/faredits.{h,cpp}`** — a CPU index keyed by (level, level-chunk)
+     holding the RAW MATERIAL at each cascade cell's sample voxel, populated
+     from the same eviction harvest that fills the store (both the readback
+     path and the sentinel fast path) and from store-hit refills, and rebuilt
+     wholesale by `RebuildFromStore` in `LoadWorld`. ~73 cells per edited 16³
+     chunk (64 at level 1, 8 at level 2, 1 at level 3, usually none above), 4
+     bytes each. Still derived and disposable — the region files are the source
+     of truth and nothing about the cascades is saved.
+   - **Why the index stores a raw material and not a finished byte.** The cell
+     rule is `farSurfaceMat(mat, ...)`, which needs `genCell`, which exists
+     only in WGSL. Handing the GPU the raw sample and letting the SAME function
+     decide the color is what makes a patched cell byte-identical to what
+     `fardown` would have written — the sieve↔downsample agreement invariant
+     extends to the patch for free instead of becoming a third rule to keep in
+     sync.
+   - **Applied inside `far`, not as a new pass.** `farPatch` (group 1 binding
+     5) is an (offset, count) header indexed by DISPATCH entry followed by a
+     payload of `(mat << 12) | cellIndex`; `FarField::PrepareTick` resolves each
+     queued SLOT to its world level chunk under this tick's origins (the mirror
+     of `farSlotToChunk` — resolving at enqueue time would name the chunk that
+     used to live there), looks it up, and appends. The kernel applies the run
+     after its pristine sweep behind one unconditional `storageBarrier()`; a
+     farVox word packs 4 cells consecutive in x *within* one level chunk, so
+     unlike `fardown` there is no cross-workgroup byte race. `farOcc` publishes
+     `sweepCount + patchNonAir` — deliberately conservative in the same
+     direction `fardown`'s `atomicMax` is.
+   - **Budget:** `kFarPatchCap` = 128 Ki words (512 KiB) per tick, charged
+     before emission; an entry that will not fit stays queued. A world with no
+     edits writes a zero-count header and dispatches identical work.
+   - **Resolution, stated honestly:** the sample rule is unchanged, so an edit
+     is representable at level k only if it moves a cell-center voxel — in
+     practice only if it is about as wide as a cell (0.4 m at level 1 out to
+     51 m at level 8). Majority/occupancy downsampling was rejected: the sieve
+     would need 2^3k `genCell` evaluations per cell, and any rule other than
+     center-sampling breaks the seam agreement. Table in DESIGN.md §9.
+   - **Gate:** selftest `far-persist`, a two-armed differential in one run —
+     paint, confirm 27/27 level-1 cells downsampled; `FullRefill` with an EMPTY
+     index and assert 27/27 back to AIR (that arm *is* the old behaviour, and
+     it is what stops the gate passing vacuously); feed the index the chunks
+     eviction would have fed it and `FullRefill` again, asserting 27/27
+     preserved. World hash bit-identical (the far field is bound in no sim
+     pipeline).
+8. **Later:** beam optimization (⅛-res depth prepass) if far-march cost ever
    shows in profiles — the strongest structural win per the survey (ESVO-style
    low-res conservative pre-pass; also lets near-field-occluded pixels skip
-   the far march entirely); cascade persistence alongside region files;
+   the far march entirely);
    ray-guided fill priority (GigaVoxels-style usage feedback through the
    existing async readback ring); water-surface flattening in the sieve
    (shoreline terrace rings come from the per-column water table, not the
@@ -328,10 +384,11 @@ becomes `farCount`; `RenderParams` spare `_p1` becomes `fogDensity`.
 
 ## 6. Known accepted limitations (phase 1)
 
-- Far terrain is *pristine procgen*: player edits are invisible beyond the
-  window until phase 2. The window edge can pop where recent edits meet the
-  cascade (16 m away, at the old draw distance — strictly better than the
-  current sky cut).
+- ~~Far terrain is *pristine procgen*: player edits are invisible beyond the
+  window until phase 2.~~ Closed by phase 2 (edits reach the cascades from the
+  live grid) and phase 7 (they survive a refill). The window edge can still pop
+  where recent edits meet the cascade, at the LOD resolution limit rather than
+  as a presence/absence change.
 - Center-sampling aliases the surface by ±half a coarse cell. Phase 3's dither
   breaks up the *seam lines between levels*; the terracing WITHIN a level is
   inherent to the representation and is not addressed (a blend band would mean

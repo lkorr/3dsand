@@ -49,6 +49,7 @@ const char* const kOrder[] = {
     "determinism", "sleep",       "evaporation",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
+    "far-persist",
     "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "prefab",      "settle-back",    "player-body", "ragdoll-joints",

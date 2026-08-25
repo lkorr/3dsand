@@ -170,6 +170,9 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // world it is classifying.
   if (world_->pages) world_->pages->SetWorldSeed(seed);
   world_->SetMirrorSeed(seed);
+  // Publish the far-field edit index so FarField can reach it through World
+  // (world.h's `farEdits`, forward-declared exactly like `pages`).
+  world_->farEdits = &farEdits_;
   modified_.assign(kNumChunks, 0);
 }
 
@@ -360,10 +363,21 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
       // the next iteration never reads the moved-from state. The trade is one
       // copy for one regrow, and the regrow is the cheaper half.
       store_.Put(wc, std::move(sentRle));
+      // ...and into the far-field edit index. A sentinel is ONE material
+      // everywhere (JITTER varies only the palette nibble, which the far field
+      // does not store), so its cascade samples need no words at all.
+      //
+      // Gated on modified_ and NOT on `filter`, unlike the store write above:
+      // FlushResident (the save path) passes filter=false and keeps the whole
+      // resident window, pristine chunks included, and those are re-derivable
+      // by the sieve. Indexing them would add ~73 no-op entries per chunk over
+      // 32,768 slots on every save, for nothing.
+      if (modified_[s] != 0)
+        farEdits_.NoteUniformChunk(wc, world_->PageEntryOfSlot(s) & kPtMatMask);
       sentRle.reserve(kChunkVol * 2);  // see the re-reserve in CompleteOldest
       continue;
     }
-    toSave.push_back({s, {world_->SlotToWorldChunk(s)}});
+    toSave.push_back({s, {world_->SlotToWorldChunk(s), modified_[s] != 0}});
   }
   // What the leaving plane actually costs: how many of its slots still need a
   // GPU copy and a store insert, against how many the re-derivability test
@@ -508,6 +522,17 @@ void Stream::CompleteOldest(bool discard) {
           // Both encoders clear() their `out` first, so the scratch buffer is
           // safe to move from inside the loop.
           store_.Put(p.items[i].wc, std::move(rle));
+          // The far-field edit index takes the SAME words, from the same
+          // harvest — this is the one place the CPU ever sees an edited
+          // chunk's content, and it is what lets a sieve refill put the
+          // player's crater back after the chunk has left the window.
+          if (p.items[i].edited) {
+            if (e != 0u)
+              farEdits_.NoteUniformChunk(p.items[i].wc, e & kPtMatMask);
+            else
+              farEdits_.NoteChunk(p.items[i].wc,
+                                  (const uint32_t*)(ptr + i * kChunkBytes));
+          }
           // RE-RESERVE AFTER THE MOVE, or the move costs more than the copy it
           // replaced. std::move leaves the scratch with NO CAPACITY, so the
           // next chunk regrows it geometrically from zero — ~13 reallocations
@@ -593,6 +618,11 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         ctx_->queue.WriteBuffer(world_->voxels, dstOff, data.data(), kChunkBytes);
       }
       world_->pages->FlushTableWrites(ctx_->queue);
+      // A store hit is a chunk the store thought worth keeping, and its words
+      // are decoded right here — cheaper than waiting for it to be evicted
+      // again, and it is what re-seeds the index for chunks that were only
+      // ever loaded from disk in this session.
+      farEdits_.NoteChunk(wc, data.data());
       // Contributor (d) to the CPU dirty mirror (§3.1a): the two dirty writes
       // below wake this slot on the next tick, in BOTH pages, decided by
       // streaming rather than by the tick loop. Its own chunk is materialized

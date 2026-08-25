@@ -18,7 +18,9 @@ Where this contradicts DESIGN.md, DESIGN.md wins until explicitly amended.
   indirect dispatches** and 95 µs full-world scans on hash ticks (rule-2
   violation, tracked in the port plan phase 3/8).
 - Far field: 8 levels × 16 MiB = 128 MiB, horizon ≈ 6.5 km, derived/disposable,
-  regenerates from seed on load (edits beyond the window don't persist there).
+  regenerates from **seed + persisted edits** (`src/sim/faredits.h`, 2026-08-24:
+  the sieve's refills no longer erase what the live downsample put there, and
+  `LoadWorld` rebuilds the edit index from the region files).
 - Saves refuse to load on any `kWorldN` or `kVoxelMeters` change (worldio.cpp
   checks the exact float bits). Changing either invalidates every save.
 
@@ -267,10 +269,12 @@ events** — puts the forest fire at 5 cm back inside budget.
   const) with a projected-size test; same rule principled-ly picks the far
   cascade level per distance (~1 px per cell).
 - **Far field**: +16 MiB per level per horizon-doubling (the 128 MiB ceiling
-  was a WebGPU limit that Vulkan deletes). Two gaps before pushing far:
-  cascade **edit persistence** (currently regenerates from seed — player edits
-  vanish from the horizon) and shift/fill bandwidth. `kFarShiftBase` retune
-  needed when the window grows (already noted in port plan).
+  was a WebGPU limit that Vulkan deletes). ~~Two gaps~~ one gap before pushing
+  far: cascade **edit persistence** landed 2026-08-24 (`src/sim/faredits.h`,
+  selftest `far-persist`; edits below a cascade cell are still invisible at
+  that level, which is LOD behaviour, not a gap). Remaining: shift/fill
+  bandwidth. `kFarShiftBase` retune needed when the window grows (already noted
+  in port plan).
 - **Optional, only if `--measure` says the far march is expensive**: box-splat
   far surface cells (instanced boxes + per-pixel slab/DDA — the micro-body
   OBB path already does exactly this shape) instead of marching 8 cascade

@@ -7,6 +7,7 @@
 
 #include "math3d.h"
 #include "sim/chunkstore.h"
+#include "sim/faredits.h"
 #include "sim/materials.h"
 #include "sim/world.h"
 
@@ -102,10 +103,14 @@ class Stream {
     DrainEvictions(/*discard=*/true);
     DiscardDemotes();
     store_.Clear();
+    farEdits_.Clear();
     modified_.assign(kNumChunks, 0);
   }
 
   ChunkStore& Store() { return store_; }
+  // The far-field edit index. LoadWorld rebuilds it from the store it just
+  // bound; nothing else outside Stream writes it.
+  FarEdits& Edits() { return farEdits_; }
   uint32_t ShiftCount() const { return shifts_; }
   size_t PendingEvictions() const { return pending_.size(); }
 
@@ -124,6 +129,13 @@ class Stream {
     // Nothing that reaches this struct is droppable.
     struct Item {
       IVec3 wc;
+      // Was this chunk MODIFIED, or is it here only because a save asked for
+      // every resident chunk (FlushResident's filter=false)? The far-field
+      // edit index (src/sim/faredits.h) wants the first kind and not the
+      // second: a pristine chunk's patch is a no-op on the GPU (the sieve
+      // would have produced the same byte) but 73 index entries per chunk on
+      // the CPU, and a save touches the whole 32,768-slot window.
+      bool edited = false;
     };
     std::vector<Item> items;
     // Parallel to `items`: the page-table entry of a slot that was a SENTINEL
@@ -186,6 +198,11 @@ class Stream {
   uint32_t seed_ = 0;
   uint32_t shifts_ = 0;
   ChunkStore store_;
+  // Fed by the same eviction path that fills store_, and reconstructible from
+  // it (FarEdits::RebuildFromStore). Owned here rather than by World because
+  // "which chunks diverged from procgen" is streaming's answer, not the
+  // renderer's; World just holds the pointer so FarField can reach it.
+  FarEdits farEdits_;
   std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
   std::deque<PendingEvict> pending_;

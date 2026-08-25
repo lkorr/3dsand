@@ -152,6 +152,46 @@ const std::vector<uint32_t>* ChunkStore::Get(IVec3 wc) {
   return &it->second.rle;
 }
 
+void ChunkStore::ForEachStored(const Visitor& fn) {
+  // RAM wins: a RAM entry is newer than the disk copy of the same chunk (the
+  // same rule EnsureLoaded applies), so it is visited first and the disk pass
+  // below skips keys already seen.
+  std::unordered_map<uint64_t, char> seen;
+  for (auto& [rkey, r] : regions_)
+    for (const auto& [ckey, e] : r.chunks) {
+      seen[ckey] = 1;
+      fn(e.wc, e.rle.data(), e.rle.size() / 2);
+    }
+  if (dir_.empty()) return;
+
+  std::error_code ec;
+  std::vector<uint32_t> rle;
+  for (const auto& de : fs::directory_iterator(dir_, ec)) {
+    if (!IsOurFile(de.path())) continue;
+    if (de.path().extension() != ".svr") continue;  // meta.svm is not a region
+    FILE* fp = std::fopen(de.path().string().c_str(), "rb");
+    if (!fp) continue;
+    uint32_t hdr[2] = {};
+    if (std::fread(hdr, 4, 2, fp) != 2 || hdr[0] != kRegionMagic) {
+      std::fclose(fp);
+      continue;
+    }
+    for (uint32_t c = 0; c < hdr[1]; c++) {
+      int32_t wc[3];
+      uint32_t pairs = 0;
+      if (std::fread(wc, 4, 3, fp) != 3 || std::fread(&pairs, 4, 1, fp) != 1 ||
+          pairs == 0 || pairs > kChunkVol)
+        break;
+      rle.resize((size_t)pairs * 2);
+      if (std::fread(rle.data(), 4, rle.size(), fp) != rle.size()) break;
+      const uint64_t key = World::PackChunkKey({wc[0], wc[1], wc[2]});
+      if (seen.count(key)) continue;
+      fn({wc[0], wc[1], wc[2]}, rle.data(), pairs);
+    }
+    std::fclose(fp);
+  }
+}
+
 bool ChunkStore::BindSave(const std::string& dir) {
   if (Bound()) return dir_ == dir;
   std::error_code ec;

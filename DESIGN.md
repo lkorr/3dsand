@@ -1903,7 +1903,67 @@ world hash.
   writes collide, so `farVox`/`farOcc` are atomic in both far kernels
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
   keeps it conservative: never falsely zero). Atomics are legal here precisely
-  because cascades carry no determinism requirement. Rays that leave the fine
+  because cascades carry no determinism requirement.
+  **Edits SURVIVE a cascade refill (edit persistence, 2026-08-24;
+  `src/sim/faredits.h`):** the downsample above is only half the story, because
+  the sieve is the other producer of the same cells and it knows nothing but
+  procgen. Every refill — an incoming plane after the player crossed a level's
+  box edge and came back, a `ResetLevel` on teleport, the `FullRefill` at
+  startup and after `LoadWorld` — used to overwrite the ghost with pristine
+  terrain, so a crater you dug and walked away from healed itself and a
+  reloaded world's horizon showed the hillside the save had faithfully
+  destroyed. `FarEdits` is the memory that survives it: a CPU index keyed by
+  (level, level-chunk) holding the RAW MATERIAL each cascade cell's sample
+  voxel carried the last time the CPU saw the chunk that owns it, fed by the
+  same eviction harvest that fills the `ChunkStore` (so it is populated exactly
+  for chunks that diverged from procgen, `Stream::modified_`) and reconstructed
+  from those region files by `FarEdits::RebuildFromStore` on load.
+  `FarField::PrepareTick` attaches each fill entry's patch list to the dispatch
+  (the `farPatch` buffer: an (offset, count) header per dispatch entry, then a
+  payload of `(mat << 12) | cellIndex`), and the same `far` workgroup applies
+  them right after its pristine sweep, behind one `storageBarrier()`. The patch
+  carries the raw material and NOT a finished byte, so `farSurfaceMat` — the
+  same function the sieve and the downsample call — still decides the color: a
+  patched cell is byte-identical to what `fardown` would have written for it,
+  which is what keeps their agreement invariant intact and keeps a region from
+  changing appearance as it flips between resident-and-downsampled and
+  refilled-and-patched. Budgeted like every other queue here: `kFarPatchCap`
+  words per tick, charged before emission, and an entry that will not fit stays
+  queued rather than being filled with half an edit. **Cascades stay DERIVED
+  and DISPOSABLE — they are simply derived from (seed + persisted edits) now
+  instead of from the seed alone.** Nothing about `farVox`/`farOcc` is saved,
+  nothing is authoritative, nothing is hashed, and a world with no edits
+  uploads a zero-count header and dispatches exactly the work it did before.
+  **What is representable, honestly.** The sample rule is unchanged and is the
+  resolution limit: a level-k cell is the ONE fine voxel at the center of the
+  2^(k + kFarShiftBase)-wide region it covers, so an edit shows up at level k
+  only if it moves a voxel that happens to be a cell center — in practice only
+  if its extent reaches a whole cell. Majority/occupancy downsampling was
+  rejected: the sieve would have to evaluate `genCell` 2^3k times per cell
+  (4096× at level 4, unbounded by level 8), and any rule other than
+  center-sampling breaks the sieve↔downsample agreement that keeps refilled
+  planes seamless against live chunks. At `kFarShiftBase = 1` and
+  `kVoxelMeters = 0.10` that gives (level: cell size, band it serves, smallest
+  edit it can show):
+
+  | level | cell | serves out to | smallest visible edit |
+  |---|---|---|---|
+  | 1 | 4 vox (0.4 m) | 51 m | ~0.4 m — a brush stroke |
+  | 2 | 8 vox (0.8 m) | 102 m | ~0.8 m — a doorway |
+  | 3 | 16 vox (1.6 m) | 205 m | ~1.6 m — a small crater |
+  | 4 | 32 vox (3.2 m) | 410 m | ~3 m — a room, a big blast |
+  | 5 | 64 vox (6.4 m) | 819 m | ~6 m — a tower, a quarry |
+  | 6–8 | 128–512 vox | 1.6–6.6 km | 13–51 m — terrain-scale work only |
+
+  So "dig a crater and see it from 60 m" (level 2, needs ~0.8 m) works and
+  "see a single dug voxel from 3 km" does not, and the second one is correct
+  LOD behaviour rather than a gap to close. The index grows only with edits
+  (~73 cells per edited 16³ chunk, 4 bytes each — a chunk contributes 64 cells
+  at level 1, 8 at level 2, 1 at level 3 and usually none above) and is
+  RAM-only; a `RebuildFromStore` over a world that was fully flushed by a save
+  over-indexes with pristine chunks, whose patches are exact no-ops on the GPU
+  because the sieve produces the same byte.
+  Rays that leave the fine
   march without a hit continue through the cascade boxes with the same
   occupancy-skipped DDA in level-cell units; t-ordering (each level starts at
   the previous box's exit) keeps coarse data from ever occluding fine data.
@@ -1963,13 +2023,14 @@ world hash.
   window is never fogged away) and eased over a few frames. Determinism is
   untouched by construction: cascades are derived render-only data — never
   read by the sim, never hashed, no MutationQueue involvement (the selftest's
-  `far downsample` gate proves the propagation works while the determinism
-  gate proves the hash is unmoved). Remaining limits: center-sampling terraces
-  the surface *within* a level (the dither only addresses the seams between
-  levels; a real blend would cost a second march per pixel), cascades
-  regenerate from seed on load rather than persisting, and an edit landing on
-  a hash tick (every 15th, which takes the whole-world occupancy path and
-  never compacts the dirty list) propagates one tick late. Coarse-level cave
+  `far-downsample` gate proves the propagation works, `far-persist` proves it
+  survives a refill, and the determinism gate proves the hash is unmoved).
+  Remaining limits: center-sampling terraces the surface *within* a level (the
+  dither only addresses the seams between levels; a real blend would cost a
+  second march per pixel), edits smaller than a cascade cell are invisible at
+  that level (the table above), and an edit landing on a hash tick (every 15th,
+  which takes the whole-world occupancy path and never compacts the dirty list)
+  propagates one tick late. Coarse-level cave
   suppression was assessed and rejected: `caveAt` carves enclosed column bands
   capped at `h - 10`, so caves never breach the surface and coarse center
   samples never land in a void — verified by rendering levels 4–6 with fog at

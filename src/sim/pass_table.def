@@ -390,9 +390,15 @@ PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K
 // row's full-word atomicStore). "They're both atomic" is not a reason to relax
 // the barrier: atomics guarantee per-operation atomicity, not visibility of one
 // dispatch's results to the next. barrier_graph §3.8/§7.8.
+//
+// FarPatch is uploaded by FarField::PrepareTick in the SAME tick, so its
+// transfer->compute RAW is as load-bearing as farList's: the header pairs are
+// indexed by dispatch entry and a stale one points the patch loop at another
+// entry's payload.
 PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
-     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarVox) A(FarOcc)))
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) R(FarPatch)
+          A(FarVox) A(FarOcc)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded
