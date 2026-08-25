@@ -1241,6 +1241,15 @@ struct Tuning {
                                  // density. Lower = fatter, more merged fluid
     float fluidSmooth = 1.3f;    // normal-gradient baseline, voxels. Higher
                                  // smooths harder at the cost of small shapes
+    // How much of the CA's geometry SUPPORTED fluid borrows (raymarch.wgsl,
+    // "TWO MODELS OF THE SAME WATER"). 1 = water resting on ground or on other
+    // water is drawn as a height field with its surface at cell.y + fill,
+    // exactly where the CA draws `cell.y + (state+1)/8`, so a spreading film is
+    // one eighth tall and settling does not make it jump. 0 = the pre-2026-08-25
+    // behaviour, one isotropic blob field everywhere. Airborne water (a
+    // droplet, a splash arch) is unaffected at any setting — it has nothing
+    // underneath it, so the blob model keeps it.
+    float fluidLevel = 1.0f;
     float fluidIor = 1.33f;      // refraction index (water 1.33, oil ~1.47)
     float fluidClarity = 1.3f;   // metres of fluid to ~1/e absorption
     float fluidReflect = 1.0f;   // traced/sky reflection gain

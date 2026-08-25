@@ -1006,6 +1006,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidSurface", r.fluidSurface, out, at);
     ReadF(*g, "fluidIso", r.fluidIso, out, at);
     ReadF(*g, "fluidSmooth", r.fluidSmooth, out, at);
+    ReadF(*g, "fluidLevel", r.fluidLevel, out, at);
     ReadF(*g, "fluidIor", r.fluidIor, out, at);
     ReadF(*g, "fluidClarity", r.fluidClarity, out, at);
     ReadF(*g, "fluidReflect", r.fluidReflect, out, at);

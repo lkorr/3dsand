@@ -320,6 +320,7 @@
     "fluidSurface": 2,
     "fluidIso": 0.3,
     "fluidSmooth": 1.3,
+    "fluidLevel": 1,
     "fluidIor": 1.33,
     "fluidClarity": 1.3,
     "fluidReflect": 1,

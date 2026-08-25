@@ -59,6 +59,7 @@ SPEC = [
     ("render", "fluidSurface", "TUNE_FLUID_SURFACE", "f", 2.0),
     ("render", "fluidIso", "TUNE_FLUID_ISO", "f", 0.3),
     ("render", "fluidSmooth", "TUNE_FLUID_SMOOTH", "f", 1.3),
+    ("render", "fluidLevel", "TUNE_FLUID_LEVEL", "f", 1.0),
     ("render", "fluidIor", "TUNE_FLUID_IOR", "f", 1.33),
     ("render", "fluidClarity", "TUNE_FLUID_CLARITY", "f", 1.3),
     ("render", "fluidReflect", "TUNE_FLUID_REFLECT", "f", 1.0),

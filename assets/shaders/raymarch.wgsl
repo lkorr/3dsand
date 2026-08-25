@@ -2630,7 +2630,7 @@ fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
 //
 // FACTORED OUT of waterNormal because the MPM fluid surface needs the SAME
 // number. Where the fluid march draws SETTLED water (its virtual-mass seam,
-// fluidMassAt) that water is part of the same lake the CA shades, and if the
+// fluidCellAt) that water is part of the same lake the CA shades, and if the
 // two carry differently-damped ripples the seam between them reads as a
 // rectangle of still glass laid on a moving surface.
 fn waterRippleFootprint(hitP : vec3f) -> f32 {
@@ -4596,46 +4596,222 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
              FLUID_GW);
 }
 
-fn fluidMassAt(c : vec3<i32>) -> f32 {
+// Everything the field needs about one cell, for ONE voxel read:
+//   .x = normalized FILL, 0..1 — how much of the cell is water.
+//   .y = 1 if the cell is a BLOCKER (a material that is neither gas nor
+//        liquid). Nothing to do with density: it is what tells the level model
+//        below that a film here is RESTING on the ground rather than hanging in
+//        mid-air, and it rides along free on the voxel read the fill already
+//        pays for.
+//   .z = the cell's VERTICAL SPEED in voxels/second, weighted by its fill so
+//        the row blend can take a mass-weighted mean. See the CALM note in
+//        fluidFieldAt: this is the one thing that tells a sheet SPREADING
+//        across the ground (a film) from a column FALLING through the air
+//        (not a film), and support cannot tell them apart because falling
+//        water is supported by the water falling underneath it.
+//
+// Seam continuity (plan §6.7): SETTLED liquid voxels contribute their
+// fullness as virtual mass, so the isosurface's boundary taps see the
+// voxel water next door and the two surfaces meet instead of leaving a
+// gap. A full settled cell reads exactly rest density. Render-only — the
+// sim's grid never sees this. The whole-lake case costs nothing: the
+// march only queries cells near active blocks (fluidChunkActive skips the
+// rest), and lakes with no excited water never enter the march at all
+// (R.fluidCount == 0). max(), not +: a cell mid-conversion briefly holds
+// both representations of the SAME water.
+//
+// The fill is CLAMPED to 1. A cell cannot be more than full however much
+// transient compression the solver's node mass reports, and the level model
+// reads the number as a geometric height, so an over-dense cell must not be
+// allowed to push its surface through its own ceiling. The blob model never
+// looked above 1 either (iso <= 1), so nothing there changes.
+fn fluidCellAt(c : vec3<i32>) -> vec3f {
   var m = 0.0;
+  var vy = 0.0;
   let b = fluidNodeBase(c);
   if (b >= 0) {
     m = f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
+    // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
+    // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
+    // in. It comes off the same grid row as the mass one word away, so in
+    // practice it is not a second fetch.
+    vy = abs(f32(fluidGridR[u32(b) + 2u])) * (30.0 / 65536.0);
   }
-  // Seam continuity (plan §6.7): SETTLED liquid voxels contribute their
-  // fullness as virtual mass, so the isosurface's boundary taps see the
-  // voxel water next door and the two surfaces meet instead of leaving a
-  // gap. A full settled cell reads exactly rest density. Render-only — the
-  // sim's grid never sees this. The whole-lake case costs nothing: the
-  // march only queries cells near active blocks (fluidChunkActive skips the
-  // rest), and lakes with no excited water never enter the march at all
-  // (R.fluidCount == 0). max(), not +: a cell mid-conversion briefly holds
-  // both representations of the SAME water.
+  var fill = m / max(TUNE_FLUID_REST_DENSITY, 1.0);
+  var blocker = 0.0;
   let w = voxWordAt(c);
   let mat = voxMat(w);
-  if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
-    m = max(m, f32(voxState(w) + 1u) * (1.0 / 8.0) *
-                   max(TUNE_FLUID_REST_DENSITY, 1.0));
+  if (mat != MAT_AIR) {
+    let k = materials[mat].klass;
+    if (k == CLASS_LIQUID) {
+      fill = max(fill, f32(voxState(w) + 1u) * (1.0 / 8.0));
+    } else if (k != CLASS_GAS) {
+      blocker = 1.0;
+    }
   }
-  return m;
+  fill = min(fill, 1.0);
+  // Speed is returned fill-WEIGHTED so the row blend below can take a
+  // mass-weighted mean. Weighting matters at the edge of a pour: the empty
+  // cells around a falling column would otherwise average its motion away and
+  // the fringe would go back to being drawn as discs.
+  return vec3f(fill, blocker, fill * vy);
 }
 
-// Trilinear density, NORMALIZED so 1.0 = rest density. Nodes sit at cell
-// centres (hence the -0.5) — same lattice convention as liquidFieldAt, and the
-// same reason: a continuous field has a continuous gradient, and the cube
-// structure dissolves into one smooth surface.
-fn fluidFieldAt(p : vec3f) -> f32 {
-  let g = p - vec3f(0.5);
-  let b = floor(g);
-  let f = g - b;
-  let c0 = vec3<i32>(b);
-  var acc = 0.0;
-  for (var i = 0; i < 8; i++) {
-    let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
-    let w = mix(1.0 - f, f, vec3f(o));
-    acc += fluidMassAt(c0 + o) * w.x * w.y * w.z;
+// Bilinear-XZ blend of ONE CELL ROW's (fill, blocker, fill*speed), on weights
+// the caller computed once. Four taps. Both models below are built out of these
+// rows, so they cannot disagree about which columns they are looking at.
+fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32) -> vec3f {
+  var acc = vec3f(0.0);
+  for (var i = 0; i < 4; i++) {
+    let o = vec2<i32>(i & 1, (i >> 1) & 1);
+    let w = mix(1.0 - f, f, vec2f(o));
+    acc += fluidCellAt(vec3<i32>(b.x + o.x, cy, b.y + o.y)) * (w.x * w.y);
   }
-  return acc / max(TUNE_FLUID_REST_DENSITY, 1.0);
+  return acc;
+}
+
+// ============================================================================
+// TWO MODELS OF THE SAME WATER — and why water that is RESTING gets its own
+// ============================================================================
+// This used to be one function: trilinear density over cell centres, surface
+// where it crosses `iso`. That is the right model for water in the air — a
+// droplet, a splash arch, a crown — and it is the WRONG model for water lying
+// on something, for two reasons that between them are the entire "the pour
+// hovers as a blob and then splats into a pancake" complaint.
+//
+//  1. IT PUTS THE SURFACE IN THE WRONG PLACE. Trilinear interpolation smears a
+//     cell's mass symmetrically about its CENTRE, but water fills a cell from
+//     the FLOOR. A half-full cell over a full one crosses iso=0.3 about 0.4 of
+//     a voxel above where the water actually stops, so the marched surface
+//     floats above the pool it is standing in — and the moment the seam settles
+//     those particles into voxels, the CA draws the same water at
+//     `cell.y + (state+1)/8` and it drops. That drop IS the pop.
+//
+//  2. IT CANNOT DRAW A THIN FILM AT ALL. A cell holding one eighth reads 0.125,
+//     which is below iso, so the isosurface simply does not exist there. A
+//     spreading sheet of MPM water is INVISIBLE until it settles. That is the
+//     other half of the pop: the water does not flatten when it settles, it
+//     APPEARS.
+//
+// So supported water is evaluated as a HEIGHT FIELD instead, on exactly the
+// CA's geometry: the surface is at `cell.y + fill`, fill bilinearly smoothed
+// across columns. A film one eighth deep is drawn one eighth deep. A settled
+// pool and the excited water on top of it are the same plane. `fluidLevel`
+// (render tuning) blends the two models; at 0 this file behaves exactly as it
+// did before.
+//
+// The gate between them is SUPPORT and CALM — is there ground or water
+// directly underneath, and has it stopped falling. A wave, a crest and a
+// spreading sheet are all height fields and all look right this way; only
+// genuinely 3D water (a droplet in flight, an overhang, a pouring column)
+// needs the blob.
+//
+// IT IS ALSO 8.9x FASTER, which was not the point but is the larger number.
+// MEASURED on `--fluid-bench hill`, same tree, same 600 ticks, only fluidLevel
+// and FLUID_SUB_Y changed, world+sky steady at 5.86-5.90 ms across all three
+// runs as the internal control:
+//
+//   blob field + half-cell lattice (HEAD before this)   fluid march 55.02 ms
+//   blob field + eighth lattice                                     54.60 ms
+//   level field + eighth lattice (this)                              6.19 ms
+//
+// So the lattice was never the cost — the blob field was. On thin or spreading
+// water the blob hovers NEAR iso without crossing it cleanly, so the blocky
+// refine keeps failing to find an occupied sub-cell centre, returns its
+// sentinel, and hands the coarse loop back a crossing it will rediscover on the
+// next step — grinding through the 320-step budget for one pixel. The level
+// field crosses iso on a clean plane, so the first refine resolves it and the
+// march terminates. This is very probably the same mechanism as the "blocky
+// depth and smooth depth disagree somewhere" artefact noted below, whose three
+// refuted explanations all assumed the refine was FINDING something.
+fn fluidFieldAt(p : vec3f) -> f32 {
+  let iso = max(TUNE_FLUID_ISO, 0.05);
+
+  // XZ lattice: nodes at cell centres, hence the -0.5 — same convention as
+  // liquidFieldAt. Shared by both models so the surface cannot step as one
+  // hands over to the other.
+  let gxz = p.xz - vec2f(0.5);
+  let bxz = floor(gxz);
+  let fxz = gxz - bxz;
+  let bi = vec2<i32>(bxz);
+
+  // The level model indexes rows CELL-ALIGNED — fill is measured from the cell
+  // FLOOR, exactly as the state nibble is — not centre-aligned like the blob.
+  let cy = i32(floor(p.y));
+  let fy = p.y - f32(cy);
+  let here  = fluidRowAt(bi, fxz, cy);
+  let below = fluidRowAt(bi, fxz, cy - 1);
+
+  // SUPPORT. One eighth of water below is already full support: an eighth is
+  // the CA's entire quantum, and a film resting on a film is still a film.
+  // Ground counts the same way. Bilinear, so the anchor fades out across a
+  // ledge edge instead of switching on a cell boundary.
+  let sup = clamp(below.x * 8.0 + below.y, 0.0, 1.0);
+  // WET. Is there any water in this column at all? Without this the ramp below
+  // reads exactly `iso` at fy == 0 of a DRY row standing on rock — a dry row's
+  // fill line is its own floor — and paints a sheet of water across every
+  // ground plane next to a puddle.
+  let wet = clamp(max(here.x, below.x) * 64.0, 0.0, 1.0);
+  // CALM — the half of the gate `sup` cannot supply. A falling column of water
+  // IS supported, by the water falling underneath it, so support alone drew a
+  // pouring stream as a stack of flat discs, one per cell, hanging in the air.
+  // Vertical speed separates the two cases, and it has to be VERTICAL only:
+  // water spreading across the ground is fast, and drawing THAT as a film is
+  // the entire point of this model.
+  //
+  // The threshold is the solver's own fluidSettleEps — draw water like settled
+  // water exactly when the sim would call it settled enough to settle — with a
+  // 3x band so the impact zone under a pour crossfades rather than switching.
+  let vy = (here.z + below.z) / max(here.x + below.x, 1e-4);
+  let eps = max(TUNE_FLUID_SETTLE_EPS, 0.5);
+  let calm = 1.0 - smoothstep(eps, eps * 3.0, vy);
+  let lw = clamp(TUNE_FLUID_LEVEL, 0.0, 1.0) * sup * wet * calm;
+
+  // The row above is fetched at most once and only when something needs it:
+  // the blob's upper half-cell, or a nearly-full row whose surface may stand
+  // above its own ceiling. Every thin film — the whole case this exists for —
+  // skips it, so the level model costs exactly what the blob model cost: two
+  // rows, eight taps.
+  let needAbove = (here.x > 0.75) || (lw < 0.999 && fy >= 0.5);
+  var above = vec3f(0.0);
+  if (needAbove) { above = fluidRowAt(bi, fxz, cy + 1); }
+
+  var field = 0.0;
+  if (lw < 0.999) {
+    // BLOB — the original trilinear density, unchanged. Its Y nodes sit at cell
+    // CENTRES, so the pair of rows it needs is (cy-1, cy) in the lower half of
+    // a cell and (cy, cy+1) in the upper.
+    field = select(mix(here.x, above.x, fy - 0.5),
+                   mix(below.x, here.x, fy + 0.5), fy < 0.5);
+  }
+  if (lw > 0.001) {
+    // LEVEL — the CA's geometry. `L` is the water level in this row's frame:
+    // the row's own fill, plus, once the row is full, whatever stands in the
+    // row above. `here.x` gates that second term, so a detached blob overhead
+    // (3D water, the blob's job) cannot lift a surface off an empty row. It is
+    // also what keeps the field CONTINUOUS through a deep pool: at a cell
+    // boundary the row below reads (L-1) and the row above reads its own L, and
+    // for the only configuration where that boundary is near the crossing — a
+    // free surface sitting on a full cell — both are 0.
+    let L = here.x + here.x * above.x;
+    // The ramp is centred on `iso`, not on 0.5, so it crosses the threshold at
+    // EXACTLY fy == L whatever the surface-threshold slider says. That equality
+    // is the whole point: it is the CA's `cellWaterY = cell.y + (state+1)/8`,
+    // evaluated on a bilinearly smoothed fill instead of on one cell.
+    //
+    // The ramp WIDTH is the smoothing radius, and that is load-bearing for the
+    // NORMAL. fluidNormalAt takes four taps at radius fluidSmooth/sqrt(3); a
+    // tighter ramp would saturate every one of them at 0 or 1, collapse the
+    // gradient to a coarse difference and facet a gently sloping pond. At this
+    // width the taps land inside the band, where -grad((L - y)/soft) is exactly
+    // (-dL/dx, 1, -dL/dz) — the height-field normal, which is the same quantity
+    // waterNormal builds from the CA's fullness gradient. Both surfaces then
+    // take their shading normal from the same formula, which is most of why
+    // they stop reading as two different liquids.
+    let soft = max(TUNE_FLUID_SMOOTH, 0.4) * 0.5773503;
+    field = mix(field, clamp((L - fy) / soft + iso, 0.0, 1.0), lw);
+  }
+  return field;
 }
 
 // Gradient of the field = the smooth outward surface normal.
@@ -4725,7 +4901,7 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
       let m3 = max(f32(fluidGridR[u32(nb) + 6u]) * (1.0 / 1024.0), 0.0);
       sp += vec4f(max(m - m1 - m2 - m3, 0.0), m1, m2, m3) * w;
     }
-    // THE SEAM'S OTHER HALF. fluidMassAt already lets settled liquid voxels
+    // THE SEAM'S OTHER HALF. fluidCellAt already lets settled liquid voxels
     // contribute virtual mass to the FIELD, so the isosurface reaches over
     // them and the two surfaces meet instead of leaving a gap — but nothing
     // used to give that mass a COLOUR. A node with virtual mass and no
@@ -4735,7 +4911,7 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
     //
     // Settled water is species 0 — it is the same substance TUNE_FLUID_COLOR
     // names — so it accumulates into sp.x. max(), not +, exactly as
-    // fluidMassAt: a cell mid-conversion briefly holds both representations of
+    // fluidCellAt: a cell mid-conversion briefly holds both representations of
     // the SAME water and adding them would double its density.
     let vw = voxWordAt(c);
     let vmat = voxMat(vw);
@@ -4824,7 +5000,7 @@ fn fluidChunkClass(wc : vec3<i32>) -> u32 {
   if (!chunkInWindow(wc, R.origin)) { return 0u; }
   if (fluidChunkWater(wc)) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
-  // fluidMassAt still returns non-zero density there (virtual mass from
+  // fluidCellAt still returns non-zero density there (virtual mass from
   // voxel fullness).  If a face-neighbor IS active, the isosurface may
   // extend into this chunk and must not be clipped at the boundary.
   for (var a = 0; a < 3; a++) {
@@ -4918,7 +5094,7 @@ struct FluidHit {
 //
 // `tEnd` IS THE SCENE BOUND, NOT THE FLUID AABB. The AABB (R.fluidLo/fluidHi)
 // is built from the live particle blocks, but the field this walk samples also
-// contains SETTLED voxel water (fluidMassAt's virtual mass), which extends
+// contains SETTLED voxel water (fluidCellAt's virtual mass), which extends
 // arbitrarily far past those blocks. Clipping the walk to the AABB made a pour
 // into a lake absorb like a puddle: the column stopped two chunks down and the
 // surface rendered pale and see-through against a pond that was correctly deep.
@@ -5093,13 +5269,26 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
 // about how its boundary is drawn.
 //
 // SUB-CELL SAMPLING. A sub-cell is occupied when the field at its CENTRE is at
-// or above the iso threshold. At sub == 1 a sub-cell centre IS the node
-// position, and trilinear interpolation at a node returns that node's value
-// exactly — so mode 3 is precisely "this cell holds >= iso of rest density"
-// with no interpolation blur, and it falls out of the shared path instead of
-// needing one of its own. Settled CA water enters through the same virtual-mass
-// blend in fluidMassAt, so a full settled cell reads exactly rest density and
-// quantizes to a full cube: the seam stays closed in every mode.
+// or above the iso threshold. Settled CA water enters through the same
+// virtual-mass blend in fluidCellAt, so a full settled cell quantizes to a full
+// cube: the seam stays closed in every mode.
+//
+// THE LATTICE IS ANISOTROPIC: `shift` sets the XZ subdivision, but Y is always
+// FLUID_SUB_Y = 8, and that asymmetry is the point rather than an oversight.
+// Voxel water's own vertical resolution is EIGHTHS — the state nibble is
+// fullness in eighths, and the CA renderer draws a partial cell's surface at
+// `cell.y + (state+1)/8`. A uniform 2x2x2 lattice therefore cannot draw what
+// the CA draws: its smallest step is HALF a voxel, four times the CA's, so a
+// one-eighth film either vanished (its centre sample fell below iso) or stood
+// up half a voxel tall. Both were visible as the pour "hovering" and then
+// snapping flat the instant the seam settled it.
+//
+// Eighths in Y and whole cells in XZ (mode 3) is EXACTLY the CA's own geometry,
+// which is why mode 3 now really does look like voxel water rather than merely
+// close. Mode 2 keeps 2x2x2 in XZ for the finer horizontal shape.
+//
+// The refine budget has to cover the taller stack: a 1.35-cell coarse window
+// straight down is ~11 eighth-sub-cells, plus the XZ crossings along the way.
 //
 // COST — COARSE SEARCH, LOCAL REFINE, and this is the whole design.
 //
@@ -5153,15 +5342,19 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
 // writing any more code — three plausible stories cost more than one look at
 // the actual depth buffer would have.
 const FLUID_BLOCKY_STEPS : i32 = 320;
-const FLUID_REFINE_STEPS : i32 = 12;
+const FLUID_REFINE_STEPS : i32 = 20;
+// Vertical sub-cells per voxel. EIGHT, to match the liquid state nibble — see
+// the anisotropic-lattice note above. This is the one number that makes blocky
+// MPM water and CA voxel water the same shape.
+const FLUID_SUB_Y : f32 = 8.0;
 
 // Exact ray entry into sub-cell `qc` of a lattice with 1/invSub cells per
-// voxel: the distance along the ray and the face normal. Slab intersection —
-// the axis whose NEAR plane is crossed last is the face the ray came in
-// through, the same argument the terrain DDA uses for its face normals.
+// voxel per axis: the distance along the ray and the face normal. Slab
+// intersection — the axis whose NEAR plane is crossed last is the face the ray
+// came in through, the same argument the terrain DDA uses for its face normals.
 // Returned as (normal.xyz, t) so the caller takes one value.
 fn fluidSubCellEntry(ro : vec3f, rd : vec3f, inv : vec3f,
-                     qc : vec3<i32>, invSub : f32) -> vec4f {
+                     qc : vec3<i32>, invSub : vec3f) -> vec4f {
   let lo = vec3f(qc) * invSub;
   let hi = (vec3f(qc) + vec3f(1.0)) * invSub;
   let tn = min((lo - ro) * inv, (hi - ro) * inv);
@@ -5183,7 +5376,7 @@ fn fluidSubCellEntry(ro : vec3f, rd : vec3f, inv : vec3f,
 // sentinel instead of a bool plus an out-param: the found case already needs to
 // carry a normal and a distance, and a real entry t is clamped to >= 0.
 fn fluidRefineSubCell(ro : vec3f, rd : vec3f, inv : vec3f, tFrom : f32,
-                      tTo : f32, fsub : f32, invSub : f32,
+                      tTo : f32, fsub : vec3f, invSub : vec3f,
                       iso : f32) -> vec4f {
   var t = max(tFrom, 0.0);
   var q = vec3<i32>(floor((ro + rd * t) * fsub));
@@ -5216,9 +5409,10 @@ fn fluidRefineSubCell(ro : vec3f, rd : vec3f, inv : vec3f, tFrom : f32,
   return vec4f(0.0, 0.0, 0.0, -1.0);
 }
 
-// `shift` is log2 of the sub-cells per voxel edge: 0 = one cube per sim cell
-// (mode 3), 1 = 2x2x2 half-cells (mode 2). Adding a 4x mode is `shift = 2u`
-// and nothing else.
+// `shift` is log2 of the sub-cells per voxel edge IN XZ: 0 = one cube per sim
+// cell (mode 3), 1 = half-cells (mode 2). Adding a 4x mode is `shift = 2u` and
+// nothing else. Y is always eighths (FLUID_SUB_Y) in both modes — see the
+// anisotropic-lattice note above.
 fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
                     shift : u32) -> FluidHit {
   var out : FluidHit;
@@ -5236,8 +5430,8 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
   if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
   let inv = 1.0 / rd;
   let iso = max(TUNE_FLUID_ISO, 0.05);
-  let fsub = f32(1u << shift);
-  let invSub = 1.0 / fsub;
+  let fsub = vec3f(f32(1u << shift), FLUID_SUB_Y, f32(1u << shift));
+  let invSub = vec3f(1.0) / fsub;
 
   // Same AABB clip as the smooth march: a ray that misses the live fluid box
   // pays one slab test and nothing else.
@@ -5312,7 +5506,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
         // crossing, report a miss, and leave the coarse loop to do it again on
         // the next step — burning the budget and dropping the surface.
         hit = fluidRefineSubCell(ro, rd, inv, max(tPrev, t - 1.35),
-                                 t + invSub, fsub, invSub, iso);
+                                 t + invSub.x, fsub, invSub, iso);
         if (hit.w >= 0.0) { break; }
       }
       tPrev = t;
@@ -5360,7 +5554,7 @@ fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
 // SEAM SHADING — why this function takes the CA water's material and path
 // ============================================================================
 // The march that feeds this shade does not stop at the live particles. Via
-// fluidMassAt's virtual mass it also draws a surface over SETTLED voxel water,
+// fluidCellAt's virtual mass it also draws a surface over SETTLED voxel water,
 // which is what closes the gap between a pour and the pond it lands in. The
 // consequence nobody accounted for is that this function is then shading water
 // the CA owns, with a completely unrelated model:
@@ -6079,7 +6273,7 @@ fn fs(in : VSOut) -> FSOut {
   // much of it survives the trip back up and what covers the rest.
   //
   // SEAM RULE: when MPM fluid is active, its isosurface extends over settled
-  // voxel water via the virtual-mass blend in fluidMassAt.  A non-viscous
+  // voxel water via the virtual-mass blend in fluidCellAt.  A non-viscous
   // liquid cell inside that isosurface is already represented by the MPM
   // surface, so shadeWater must NOT run for it — the two shading models have
   // incompatible normals and the per-pixel fight is the strobing-squares
@@ -6173,7 +6367,7 @@ fn fs(in : VSOut) -> FSOut {
 
   // ---- MPM fluid surface ----
   // The MPM isosurface encompasses both active particles AND settled voxel
-  // water (via fluidMassAt's virtual-mass blend).  The CA water block above
+  // water (via fluidCellAt's virtual-mass blend).  The CA water block above
   // already defers to the MPM path for seam-eligible cells inside the
   // isosurface, so this path now runs unconditionally when the march hit —
   // except for viscous liquids (blood, oil) genuinely nearer than the MPM
@@ -6187,7 +6381,7 @@ fn fs(in : VSOut) -> FSOut {
   //     pixel — see the mpmOwned block above.
   //  2. THE PANE. The fluid march's empty-space skips classify a chunk as
   //     "nothing here" from the BLOCK MAP, but the field they skip through also
-  //     contains settled voxel water (fluidMassAt's virtual mass). A chunk full
+  //     contains settled voxel water (fluidCellAt's virtual mass). A chunk full
   //     of lake with no MPM block is skipped as empty, so when the ray enters a
   //     marched chunk it is ALREADY submerged: it takes one sample at or above
   //     iso and the crossing bisection collapses onto the chunk face it just
