@@ -146,8 +146,8 @@ void World::Init(const rhi::Device& device) {
                            U::Storage | U::CopyDst, "fluidCalm");
   fluidSettleScratch = CreateBuffer(
       device,
-      (uint64_t)(2 * kNumChunks + 16 + 2 +
-                 kFluidSettleMax * kChunkVol * 2) * 4,
+      (uint64_t)(2 * kNumChunks + 16 + 2 + kFluidSettleMax * kChunkVol * 2 +
+                 kFluidSettleMax * 8) * 4,
       U::Storage | U::CopyDst, "fluidSettleScratch");
   fluidCompactScratch = CreateBuffer(device, (uint64_t)(kFluidCap / 256) * 2 * 4,
                                      U::Storage, "fluidCompactScratch");

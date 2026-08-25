@@ -207,24 +207,70 @@ const char* LabSceneName(int scene) {
   return (scene >= 0 && scene < kLabSceneCount) ? kSceneNames[scene] : "?";
 }
 
+// A camera that can actually SEE INTO a walled box, derived from its bounds
+// rather than guessed.
+//
+// Four of the five scenes used to be shot from a hand-picked eye that sat
+// BELOW or barely above the wall top (faucet's eye was at y = G+24 against a
+// box whose rim is G+26), so the near wall filled the frame and the water was
+// not visible at all — the bench screenshots for `basin`, `pool`, `faucet` and
+// `slosh` could not be used to judge anything, which is how a whole WP got
+// written with only `hill` as visual evidence.
+//
+// The constraint is one inequality. With the eye at horizontal distance D from
+// the centre of a box of half-footprint w and wall height h, the sightline to
+// the floor centre has slope H/D and the sightline grazing the NEAR rim has
+// slope h/(D - w). The floor is visible only when H/D > h/(D - w). Solving for
+// H with a 60% margin gives a camera that is correct for any box the lab grows
+// later, instead of a number that silently rots when a scene is resized.
+static void LabBoxViewCamera(const IVec3& lo, const IVec3& hi, Vec3& eye,
+                             Vec3& target) {
+  const float cx = 0.5f * (float)(lo.x + hi.x);
+  const float cz = 0.5f * (float)(lo.z + hi.z);
+  const float w = 0.5f * (float)std::max(hi.x - lo.x, hi.z - lo.z);
+  const float h = (float)(hi.y - lo.y);
+  const float D = 1.35f * w + 20.0f;         // stand-off, scaled to the box
+  const float H = 1.6f * D * h / (D - w);    // the inequality, with margin
+  const float k = D * 0.70710678f;           // on the -x/-z diagonal
+  eye = {cx - k, (float)lo.y + H, cz - k};
+  target = {cx, (float)lo.y + 2.0f, cz};     // just above the floor
+}
+
 void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
   // Eye + look target per scene; yaw/pitch derived (Camera convention:
   // yaw = atan2(dz, dx), the RunMobShot shape).
   // Eyes sit well above the wall tops so the interior — where the water is —
   // fills the frame rather than the outside of a stone box.
   Vec3 target{(float)CX, (float)G, (float)CZ};
+  IVec3 blo, bhi;
+  LabSceneBounds(scene, blo, bhi);
   switch (scene) {
-    case kLabBasin:  eye = {222, (float)(G + 30), 222}; break;
+    case kLabBasin:  LabBoxViewCamera(blo, bhi, eye, target); break;
     // Hill: from above the catch basin looking back UP the ramp, so the
     // stepped face, the deck pour and the basin are all in frame — the
     // mid-slope freeze (or the sheet-down that replaces it) is THE thing
     // this scene exists to show.
     case kLabHill:   eye = {268, (float)(G + 38), 214};
                      target = {224, (float)(G + 8), 256}; break;
-    case kLabFaucet: eye = {224, (float)(G + 24), 224}; break;
-    case kLabPool:   eye = {226, (float)(G + 22), 226}; break;
-    case kLabSlosh:  eye = {256, (float)(G + 34), 212};
-                     target = {256, (float)G, 258}; break;
+    case kLabFaucet: LabBoxViewCamera(blo, bhi, eye, target); break;
+    case kLabPool:   LabBoxViewCamera(blo, bhi, eye, target); break;
+    // Slosh is a long shallow trough (51 x 13), not a box. The generic
+    // diagonal eye does clear the rim, but it looks ALONG the trough, so the
+    // far half hides behind the near wall and a ~1-cell-deep sheet reads as
+    // nothing. Shoot it side-on instead: centred on the long axis, backed off
+    // across the SHORT one, which puts the whole end-to-end wave in frame.
+    // It also needs a STEEPER angle than the generic 1.6x margin: slosh's
+    // water is a ~1-cell sheet lying on the floor of a 15-tall trough, and
+    // clearing the rim by enough to see the floor CENTRE still leaves the near
+    // half of that sheet behind the near wall. 58/34 = 1.7 against a rim slope
+    // of 15/27.5 = 0.55, i.e. ~3x, which puts the whole floor in view.
+    case kLabSlosh: {
+      const float cx = 0.5f * (float)(blo.x + bhi.x);
+      const float cz = 0.5f * (float)(blo.z + bhi.z);
+      eye = {cx, (float)blo.y + 60.0f, cz - 34.0f};
+      target = {cx, (float)blo.y + 2.0f, cz};
+      break;
+    }
     default:         eye = {222, (float)(G + 30), 222}; break;
   }
   Vec3 d = target - eye;
@@ -406,11 +452,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // WP2 shrank the override set to the settle trio: stock is CFL-honest
       // and zero-tension now, so the gate's old stiffness/cohesion/attract
       // overrides are simply stock (keep this block mirroring the gate).
-      if (run.settleTuning) {
-        t.sim.fluidSettleEps = 6.0f;
-        t.sim.fluidWakeSpeed = 24.0f;
-        t.sim.fluidDamping = 0.9f;
-      }
+      // WP3 shrank it again: settleEps 6.0 and wakeSpeed 24.0 ARE stock now
+      // (the at-rest speed floor scales with gravity, and the owner's is 900),
+      // so this run differs from stock by ONE knob — the sealed-box damping.
+      if (run.settleTuning) t.sim.fluidDamping = 0.9f;
       SetCurrentTuning(t);
       // Recompile only when the compiled-in fluid consts actually change: a
       // reload is seconds of Tint, and every other run wants stock tuning.
@@ -454,6 +499,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     std::vector<uint32_t> liveCurve, blockCurve, clampCurve;
     uint64_t poured = 0, settledSum = 0, excitedSum = 0, deadSum = 0,
              binnedSum = 0, consumedSum = 0, emittedSum = 0, refusedSum = 0,
+             setRefusedSum = 0, setUnstableSum = 0, setBlocksSum = 0,
              clampedSum = 0;
     int tickOfSettle = -1;
     double idleFluidMs = -1.0;
@@ -503,6 +549,9 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       consumedSum += fa[16];
       emittedSum += fa[9];
       refusedSum += fa[12];
+      setBlocksSum += fa[13];     // FA_SETBLOCKS: blocks the scan picked
+      setRefusedSum += fa[25];    // FA_SETREFUSED: of those, infeasible
+      setUnstableSum += fa[26];   // FA_SETUNSTABLE: of those, excite-unstable
       if (tickOfSettle < 0 && pourEnd != ~0u && st > pourEnd + 2 &&
           fa[7] == 0 && fa[3] == 0)
         tickOfSettle = (int)st;
@@ -673,6 +722,22 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         (unsigned)std::count_if(clampCurve.begin(), clampCurve.end(),
                                 [](uint32_t c) { return c != 0; }),
         (unsigned)clampCurve.size());
+    // The SEAM FLOW (WP3). "nothing settled" has two opposite causes and this
+    // line separates them: `picked 0` means the water never went calm, while
+    // `picked N refused N` means it did and settleCheck turned it down (an
+    // infeasible column, or a resulting cell that would immediately satisfy an
+    // excite trigger). `settled` vs `re-excited` is the thrash meter — the two
+    // being close means every eighth is converting over and over.
+    std::printf("    seam flow: blocks picked %llu = %llu infeasible + %llu "
+                "unstable + %llu committed | eighths settled %llu re-excited "
+                "%llu binned %llu\n",
+                (unsigned long long)setBlocksSum,
+                (unsigned long long)setRefusedSum,
+                (unsigned long long)setUnstableSum,
+                (unsigned long long)(setBlocksSum - setRefusedSum -
+                                     setUnstableSum),
+                (unsigned long long)settledSum, (unsigned long long)excitedSum,
+                (unsigned long long)binnedSum);
     if (hasBasin)
       std::printf("    basin capture: %.1f%% (%llu of %llu eighths inside the "
                   "catch basin)\n",
@@ -767,7 +832,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
          << ", \"deadParticles\": " << deadSum
          << ", \"binned\": " << binnedSum << ", \"consumed\": " << consumedSum
          << ", \"emittedDroplets\": " << emittedSum
-         << ", \"exciteRefused\": " << refusedSum << "},\n";
+         << ", \"exciteRefused\": " << refusedSum
+         << ", \"settleBlocks\": " << setBlocksSum
+         << ", \"settleRefused\": " << setRefusedSum
+         << ", \"settleUnstable\": " << setUnstableSum << "},\n";
     json << "    \"liveMax\": "
          << *std::max_element(liveCurve.begin(), liveCurve.end())
          << ", \"liveEnd\": " << liveEst << ",\n";

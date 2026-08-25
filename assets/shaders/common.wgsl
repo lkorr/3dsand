@@ -800,7 +800,27 @@ fn microStainPriority(p : Particle) -> u32 {
 // debris.wgsl vsFluid.
 const FLUID_CAP       : u32 = 262144u;  // kFluidCap
 const FLUID_BLOCKS    : u32 = 256u;     // kFluidBlocks
-const FLUID_SUBSTEPS  : i32 = 6;        // kFluidSubsteps
+// MPM substeps per 30 Hz tick — the CFL BUDGET, and a tuning knob since WP3
+// (sim.fluidSubsteps; EncodeTick records the substep table this many times, so
+// the C++ side reads the same knob and world.h's kFluidSubsteps is only the
+// fallback default). Everything CFL-derived hangs off it, right here, so the
+// three numbers can never drift apart:
+//   FLUID_VMAX     0.45 cell/substep, expressed in cells/TICK (velocity is a
+//                  per-tick quantity everywhere in the solver; g2p advects
+//                  v/FLUID_SUBSTEPS). This is the fluid's terminal velocity.
+//   FLUID_MARK_PAD the block map is built once per tick, so `mark` must cover
+//                  a whole tick of travel: ceil(0.45 * substeps) cells.
+// The pseudo sound speed sqrt(stiffness)/30 must fit under 0.45 cells/substep
+// or the clamp starts eating pressure work as energy loss (plan §1.2 item 1),
+// which is the arithmetic behind the default: sqrt(14000)/13.5 = 8.7 -> 9.
+const FLUID_SUBSTEPS  : i32 = clamp(TUNE_FLUID_SUBSTEPS, 1, 32);
+const FLUID_VMAX      : i32 = i32(round(0.45 * f32(FLUID_SUBSTEPS) * 65536.0));
+// Capped at 7 so the padded span [base-pad, base+2+pad] stays <= CHUNK (16)
+// and `mark`'s 8-corner loop remains exhaustive over the chunks it touches.
+// The cap binds only past 15 substeps, where a particle at terminal velocity
+// can outrun the map and simply freezes for the substep — the same bounded,
+// deterministic degradation the kFluidBlocks budget already accepts.
+const FLUID_MARK_PAD  : i32 = min(i32(ceil(0.45 * f32(FLUID_SUBSTEPS))), 7);
 const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // Words per fluid grid node: [0] mass Q10, [1..3] momentum->velocity Q16.16,
 // [4..6] species 1..3 mass Q10, [7] foam field (persistent). Shared by the
@@ -918,7 +938,15 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // [22..24] CONSUME dispatch args ((compactLive+63)/64, 1, 1) — written by the
 //         compaction scan, staged before consumeApply, which used to dispatch
 //         4,096 fixed workgroups.
-// [25..31] spare
+// [25]    settle blocks REFUSED this tick (settleCheck: infeasible column or
+//         a resulting cell that would immediately satisfy an excite trigger —
+//         WP3's hysteresis-by-construction). Diagnostic: the number that says
+//         whether "nothing settled" means "never went calm" or "went calm and
+//         was refused", which are opposite bugs.
+// [26]    settle blocks refused as excite-UNSTABLE this tick (the resulting
+//         configuration would immediately satisfy an excite trigger). Split
+//         from [25] because the two are opposite diagnoses.
+// [27..31] spare
 const FA_LIVE      : u32 = 7u;
 const FA_DEAD      : u32 = 8u;
 const FA_EMITTED   : u32 = 9u;
@@ -931,6 +959,8 @@ const FA_BINNED    : u32 = 15u;
 const FA_CONSUMED  : u32 = 16u;
 const FA_STAINED   : u32 = 17u;
 const FA_CLAMPED   : u32 = 18u;
+const FA_SETREFUSED : u32 = 25u;
+const FA_SETUNSTABLE : u32 = 26u;
 // Byte offsets of the two arg triples are what pass_table.def's copy rows use;
 // keep the three in step (76 = 19*4, 88 = 22*4).
 const FA_ARGS_COMPACT : u32 = 19u;

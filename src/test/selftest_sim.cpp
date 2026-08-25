@@ -777,6 +777,7 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
   int settledAt = -1;
   uint32_t basinEighths = 0;
   uint32_t settledSum = 0, deadSum = 0, excitedSum = 0, binnedSum = 0;
+  uint32_t pickedSum = 0, infeasibleSum = 0, unstableSum = 0;
   for (int run = 0; run < 2; run++) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
@@ -859,6 +860,9 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
     deadSum = 0;
     excitedSum = 0;
     binnedSum = 0;
+    pickedSum = 0;
+    infeasibleSum = 0;
+    unstableSum = 0;
     uint32_t lastCount = 0;
     std::map<uint64_t, uint32_t> prevCells;
     for (int i = 0; i < kMaxTicks; i++) {
@@ -874,15 +878,23 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
         // Per-tick: the FA event counters clear at the top of every fluid
         // tick, so mass-flow bookkeeping (settled/dead/excited sums — the
         // audit that localizes any leak) must not skip a tick.
-        uint32_t fa[16] = {};
+        uint32_t fa[32] = {};
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
-                              fa, 64, "settleArgs");
+                              fa, 128, "settleArgs");
         live = std::min(fa[7], kFluidCap);
         blocks = fa[3];
         settledSum += fa[10];
         deadSum += fa[8];
         excitedSum += fa[11];
         binnedSum += fa[15];
+        // WP3's settle diagnosis, and why this gate can now say WHY it failed
+        // rather than only that it did: blocks the scan picked, and how many
+        // settleCheck turned down for an infeasible column (FA_SETREFUSED)
+        // versus an excite-unstable result (FA_SETUNSTABLE). "0 settled" has
+        // two opposite causes and this separates them.
+        pickedSum += fa[13];
+        infeasibleSum += fa[25];
+        unstableSum += fa[26];
         liveEst = live;
         if (live == 0 && blocks == 0 && settledAt < 0) {
           settledAt = i;
@@ -937,9 +949,11 @@ Status GateFluidSettle(Ctx& c, std::string& detail) {
   std::printf(
       "fluid settle: %s (%u eighths poured -> %u settled voxel eighths, "
       "quiet at tick %d, %u live / %u blocks at end, flow: %u binned / "
-      "%u settled / %u died / %u re-excited, world hash %s)\n",
+      "%u settled / %u died / %u re-excited, picks: %u = %u infeasible + "
+      "%u unstable + %u committed, world hash %s)\n",
       ok ? "PASS" : "FAIL", spawned, basinEighths, settledAt, live, blocks,
-      binnedSum, settledSum, deadSum, excitedSum,
+      binnedSum, settledSum, deadSum, excitedSum, pickedSum, infeasibleSum,
+      unstableSum, pickedSum - infeasibleSum - unstableSum,
       det ? "matches" : "DIVERGED");
   detail = Format("%u poured, %u settled, quiet@%d, det %s", spawned,
                   basinEighths, settledAt, det ? "ok" : "DIVERGED");
@@ -968,28 +982,30 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   t.dayNight.freeze = 1;
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);  // both water sinks off
   t.sim.fluidExciteMode = 1;  // the disturbance trigger under test
-  // A drained sealed pool keeps a small persistent fountain near the hole
-  // (~1% of particles above 1 vox/s — solver-quality churn, not seam
-  // behaviour), and the calm judgement is a per-slot MAX. Relax the calm
-  // threshold for this gate so the bulk can settle around the outliers; the
-  // wake threshold scales with it to keep the hysteresis gap.
-  t.sim.fluidSettleEps = 6.0f;
-  t.sim.fluidWakeSpeed = 24.0f;
   // A SEALED box is adversarial for settling: with the default damping of 0
   // the drained pool rings between the walls indefinitely (measured: max
-  // particle speed still ~15 vox/s after 200 ticks, against a 0.9 vox/s calm
-  // threshold — nothing radiates out of a closed chamber). Real damping is a
-  // look knob; the gate turns it up so the drain's END STATE is reachable in
-  // a bounded run.
+  // particle speed still ~15 vox/s after 200 ticks — nothing radiates out of a
+  // closed chamber). Real damping is a look knob; the gate turns it up so the
+  // drain's END STATE is reachable in a bounded run.
   t.sim.fluidDamping = 0.9f;
   // Pin every sim.fluid* parameter to its tuning_params.def default so the
   // gate is hermetic — its outcome must not depend on whatever the user last
-  // dragged in the tuner. WP2 shrank the explicit override set because the
-  // new defaults were what the gate wanted, but "simply stock" meant "whatever
-  // tuning.json says", and a hot-reloaded slider change broke the gate
-  // (BASELINE.md: cohesion 32.9, attractDiff -1.08 from a tuner session).
-  // The settle/damping/exciteMode overrides above remain at the gate's own
-  // values; everything else is pinned to the .def default.
+  // dragged in the tuner. "Simply stock" meant "whatever tuning.json says",
+  // and a hot-reloaded slider change broke the gate (BASELINE.md: cohesion
+  // 32.9, attractDiff -1.08 from a tuner session).
+  //
+  // PINNING IS NOT OVERRIDING, and the difference is the plan's success
+  // signal. THE OVERRIDE SET — parameters set to something OTHER than the
+  // default because the gate cannot pass at stock — is shrinking: 7 before
+  // WP2, 3 after it, 1 now. WP2 made stock CFL-honest and zero-tension, which
+  // retired the stiffness/cohesion/attract overrides; WP3 retired the settle
+  // trio's other two, because settleEps 6.0 and wakeSpeed 24.0 ARE stock now
+  // (the at-rest speed floor scales with gravity and the owner's is 900).
+  // Only fluidDamping above is left, and it is a property of the SEALED
+  // geometry — nothing radiates out of a closed box — not a defect in the
+  // defaults. Every line below is a pin at the .def value, not an override;
+  // if one of them starts disagreeing with tuning_params.def, that is the
+  // drift this block exists to catch.
   t.sim.fluidStiffness = 14000.0f;
   t.sim.fluidGravity = 900.0f;
   t.sim.fluidRestDensity = 8.0f;
@@ -1019,7 +1035,12 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   t.sim.fluidBubbleDensity = 1.05f;
   t.sim.fluidSprayDensity = 0.42f;
   t.sim.fluidFoamScaleIdx = 3;
-  t.sim.fluidSettleTicks = 45;
+  // WP3's knobs, pinned like the rest: the CFL substep budget, and the settle
+  // trio whose values the WP3 sweep re-derived at the owner's gravity.
+  t.sim.fluidSubsteps = 9;
+  t.sim.fluidSettleEps = 6.0f;
+  t.sim.fluidWakeSpeed = 24.0f;
+  t.sim.fluidSettleTicks = 24;
   t.sim.fluidStainRate = 8.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
@@ -1044,6 +1065,9 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   uint32_t excitedSum = 0, live = ~0u, blocks = ~0u, endEighths = 0;
   uint32_t compressed = 0, sampled = 0, liveEighths = 0;
   uint32_t setBlocksSum = 0;  // settle picks over the run (refusal-loop probe)
+  uint32_t infeasibleSum = 0, unstableSum = 0;  // and why they were refused
+  uint32_t exBinned = 0, exSettled = 0, exDied = 0;  // seam flow ledger
+  uint32_t endWide = 0;   // water voxels anywhere in the box, walls included
   int32_t endMaxS2 = -1;      // max (v>>8)^2 at end (never-calm probe)
   for (int run = 0; run < 2; run++) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -1089,16 +1113,26 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
       ctx.WaitIdle();
       ctx.ProcessEvents();
       if (i >= kCarveTick) {
-        uint32_t fa[16] = {};
+        uint32_t fa[32] = {};
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
-                              fa, 64, "exciteArgs");
+                              fa, 128, "exciteArgs");
         live = std::min(fa[7], kFluidCap);
         blocks = fa[3];
         excitedSum += fa[11];
         setBlocksSum += fa[13];
+        // WP3's refusal split (FA_SETREFUSED / FA_SETUNSTABLE): "picked but
+        // nothing settled" has two opposite causes and this is the only thing
+        // that can tell them apart.
+        infeasibleSum += fa[25];
+        unstableSum += fa[26];
+        // The seam flow ledger, which localises a mass discrepancy: binned
+        // != settled means the column walk dropped it, settled != the voxel
+        // sweep means the writes were lost.
+        exBinned += fa[15]; exSettled += fa[10]; exDied += fa[8];
         if (run == 1 && i % 40 == 0)
           std::printf("  excite t%d: live %u, blocks %u, excited+ %u, "
-                      "picks+ %u\n", i, live, blocks, fa[11], fa[13]);
+                      "picks+ %u (%u infeasible, %u unstable)\n",
+                      i, live, blocks, fa[11], fa[13], fa[25], fa[26]);
         // Exact one-tick-stale count; the exciteMode predicate keeps the
         // seam recording even at zero while the CA is active.
         liveEst = live;
@@ -1134,6 +1168,19 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
                             pbuf.size() * 4, "exciteEndV");
       endMaxS2 = 0;
       uint32_t fast = 0;
+      // THE AT-REST FLOOR PROBE (WP3 item 4, how the settle trio is derived).
+      // Report the residual speed BOTH ways: raw, and with the free-surface
+      // gravity bias stripped exactly as `seamRestVy` strips it in the shader.
+      // A weakly-compressible free surface carries one substep of gravity
+      // forever, so the RAW number is a property of `gravity/substeps` and
+      // tells you nothing about whether the water is moving; the STRIPPED one
+      // is the quantity `settleEps` is supposed to be compared against, and it
+      // is what makes the threshold mean the same thing at any gravity.
+      const int32_t gSub =
+          (int32_t)std::lround(t.sim.fluidGravity * 65536.0 / 900.0) /
+          std::max(1, t.sim.fluidSubsteps);
+      int32_t restMaxS2 = 0;
+      uint32_t restFast = 0;
       for (uint32_t k = 0; k < n; k++) {
         const int32_t* p = (const int32_t*)&pbuf[k * kFluidParticleWords];
         liveEighths += ((uint32_t)p[18] >> 12) & 0x7u;
@@ -1141,15 +1188,24 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
         int32_t s2 = sx * sx + sy * sy + sz * sz;
         if (s2 > 49) fast++;
         endMaxS2 = std::max(endMaxS2, s2);
+        int32_t ry = std::min(std::abs(p[4] + gSub), std::abs(p[4])) >> 8;
+        int32_t r2 = sx * sx + ry * ry + sz * sz;
+        if (r2 > 49) restFast++;
+        restMaxS2 = std::max(restMaxS2, r2);
       }
       if (run == 1)
-        std::printf("  end: %u live carrying %u eighths, %u above 0.9 vox/s\n",
-                    n, liveEighths, fast);
+        std::printf("  end: %u live carrying %u eighths; raw max %.2f vox/s "
+                    "(%u above 0.9), rest-frame max %.2f vox/s (%u above "
+                    "0.9), one substep of g = %.2f vox/s\n",
+                    n, liveEighths, std::sqrt((double)endMaxS2) * 30.0 / 256.0,
+                    fast, std::sqrt((double)restMaxS2) * 30.0 / 256.0, restFast,
+                    (double)(gSub >> 8) * 30.0 / 256.0);
     }
 
     // Mass audit over the whole sealed interior (both chambers): standing
     // water eighths at the end must equal the eighths placed at the start.
     endEighths = 0;
+    endWide = 0;
     std::vector<uint32_t> cbuf((size_t)kChunkVol);
     for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
       for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
@@ -1160,6 +1216,12 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
             int lx = (int)(i % 16) + cx2 * 16,
                 ly = (int)((i / 16) % 16) + cy * 16,
                 lz = (int)(i / 256) + cz2 * 16;
+            // WIDE sweep first: every water voxel anywhere in the box, walls
+            // included. If the interior audit comes up short but this does
+            // not, the mass was written somewhere the interior test does not
+            // look -- an audit-scope artifact, not a destroyed eighth.
+            if ((cbuf[i] & 0xFFFu) == waterId)
+              endWide += ((cbuf[i] >> 12) & 0xFu) + 1u;
             if (lx < px - RB + 2 || lx > px + RB - 2 || lz < pz - RB + 2 ||
                 lz > pz + RB - 2 || ly <= floorY || ly >= roofY)
               continue;
@@ -1185,14 +1247,18 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   bool resettled = endEighths > kWaterEighths * 3u / 4u && live < 800;
   bool det = worldHash[0] == worldHash[1];
   bool ok = excited && hydro && massOk && resettled && det;
+  std::printf("  seam flow: %u binned / %u settled / %u died; interior %u + "
+              "live %u = %u of %u (wide sweep %u)\n",
+              exBinned, exSettled, exDied, endEighths, liveEighths,
+              endEighths + liveEighths, kWaterEighths, endWide);
   std::printf(
       "fluid excite: %s (%u eighths excited over the drain, %u/%u sampled "
       "particles pre-compressed, %u standing + %u live eighths of %u, "
-      "%u live / %u blocks at end, %u settle picks, end max s2 %d, "
-      "world hash %s)\n",
+      "%u live / %u blocks at end, %u settle picks (%u infeasible, "
+      "%u unstable), end max s2 %d, world hash %s)\n",
       ok ? "PASS" : "FAIL", excitedSum, compressed, sampled, endEighths,
-      liveEighths, kWaterEighths, live, blocks, setBlocksSum, endMaxS2,
-      det ? "matches" : "DIVERGED");
+      liveEighths, kWaterEighths, live, blocks, setBlocksSum, infeasibleSum,
+      unstableSum, endMaxS2, det ? "matches" : "DIVERGED");
   detail = Format("%u excited, %u/%u compressed, mass %u+%u/%u, det %s",
                   excitedSum, compressed, sampled, endEighths, liveEighths,
                   kWaterEighths, det ? "ok" : "DIVERGED");
@@ -1222,10 +1288,11 @@ Status GateFluidStain(Ctx& c, std::string& detail) {
   t.dayNight.freeze = 1;
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
   t.sim.fluidExciteMode = 1;
-  t.sim.fluidDamping = 0.9f;      // the excite gate's sealed-box overrides
+  // The excite gate's sealed-box overrides. settleEps/wakeSpeed used to be
+  // here too and are stock now (WP3) — a sealed chamber still needs the
+  // damping and the softer stiffness.
+  t.sim.fluidDamping = 0.9f;
   t.sim.fluidStiffness = 2400.0f;
-  t.sim.fluidSettleEps = 6.0f;
-  t.sim.fluidWakeSpeed = 24.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   sim.ReloadShaders(ctx.device);
@@ -1367,13 +1434,14 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
   // Pin every sim.fluid* parameter to its tuning_params.def default so this
   // gate is hermetic — its outcome must not depend on the user's tuning.json.
-  // The gate's own overrides (exciteMode, damping, stiffness, settleEps,
-  // wakeSpeed) are applied on top; everything else is the .def default.
+  // Only THREE are real overrides now (exciteMode, damping, stiffness);
+  // settleEps and wakeSpeed became stock in WP3 and are pins like the rest.
   t.sim.fluidExciteMode = 1;
-  t.sim.fluidDamping = 0.9f;
-  t.sim.fluidStiffness = 2400.0f;
-  t.sim.fluidSettleEps = 6.0f;
-  t.sim.fluidWakeSpeed = 24.0f;
+  t.sim.fluidDamping = 0.9f;       // sealed box: nothing radiates out of it
+  t.sim.fluidStiffness = 2400.0f;  // softer than stock so the drain ends
+  t.sim.fluidSettleEps = 6.0f;     // == stock (WP3)
+  t.sim.fluidWakeSpeed = 24.0f;    // == stock (WP3)
+  t.sim.fluidSubsteps = 9;
   t.sim.fluidGravity = 900.0f;
   t.sim.fluidRestDensity = 8.0f;
   t.sim.fluidEosPower = 4;
@@ -1402,7 +1470,7 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   t.sim.fluidBubbleDensity = 1.05f;
   t.sim.fluidSprayDensity = 0.42f;
   t.sim.fluidFoamScaleIdx = 3;
-  t.sim.fluidSettleTicks = 45;
+  t.sim.fluidSettleTicks = 24;
   t.sim.fluidStainRate = 8.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);

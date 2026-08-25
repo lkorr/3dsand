@@ -729,6 +729,18 @@ struct Tuning {
     // exception to "sim.* is integer-only"). They do NOT touch the world hash
     // (the fluid never writes voxels) but they DO change the fluid_det gate's
     // particle hash, so re-run --selftest after changing defaults.
+    //
+    // fluidSubsteps is the CFL BUDGET, and the only knob that buys the
+    // stiffness above its legality. Everything downstream is derived from it
+    // at shader compile time (common.wgsl): FLUID_VMAX = 0.45*substeps
+    // cells/tick, FLUID_MARK_PAD = ceil(0.45*substeps) cells, and the
+    // per-substep divisors of gravity/viscosity/splash. It is also the whole
+    // per-tick price of the solver — the substep table is ~linear in it — so
+    // the look and the cost are one number here on purpose.
+    // 9 is sqrt(14000)/(30*0.45) rounded up: at 6 the sound speed did not fit
+    // and the VMAX clamp engaged on ~575 of 600 bench ticks, which is the
+    // "mushy under agitation" regime (plan §1.2 item 1).
+    int fluidSubsteps = 9;
     float fluidStiffness = 14000.0f;  // EOS stiffness, (vox/s)^2 — the square
                                      // of a pseudo speed of sound. CHOSEN BY
                                      // EYE in the fluid lab (2026-08-24) and
@@ -822,16 +834,50 @@ struct Tuning {
                                   // keeps the pinned world hash); 1 = settled
                                   // liquid with air below converts to MPM
                                   // particles
-    float fluidSettleEps = 0.9f;  // vox/s: a fluid block whose FASTEST
-                                  // particle stays below this counts as calm
-                                  // and may settle back into CA voxels
-    float fluidWakeSpeed = 3.6f;  // vox/s: grid-node speed at an active/
+    float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
+                                  // particle stays below this for
+                                  // settleTicks in a row counts as calm and
+                                  // may settle back into CA voxels.
+                                  // STILL SCALES WITH GRAVITY, and the reason
+                                  // is NOT the one an earlier WP3 revision
+                                  // gave. That revision blamed the solver's
+                                  // free-surface gravity bias (a surface node
+                                  // has no pressure, so it carries exactly
+                                  // gravity/substeps forever) and expected
+                                  // that stripping the bias — seamRestVy in
+                                  // sim_fluid_seam.wgsl — would let 0.9 come
+                                  // back and make the knob g-independent.
+                                  // Measured: it does not. The bias is only
+                                  // 3.3 vox/s at 900/9, and what actually
+                                  // sets the floor is the genuine turbulence
+                                  // of a 9x-gravity scene. Sweep on the lab
+                                  // basin, 400 ticks, eighths still live at
+                                  // the end (lower = more settled), with
+                                  // wakeSpeed held at 4x:
+                                  //   eps 0.9 -> 15,359   (nothing settles)
+                                  //   eps 2.7 ->  7,878
+                                  //   eps 4.0 ->  5,548
+                                  //   eps 6.0 ->  3,438
+                                  // and settle<->wake thrash falls the same
+                                  // way (re-excited/settled 100% -> 38%), so
+                                  // a LOWER threshold is worse on both axes,
+                                  // not a safer trade. 6.0 = 0.2 cells/tick =
+                                  // 0.6 m/s: a drift, not a motion. The
+                                  // excite-stability test in settleCheck is
+                                  // what guards the RESULT; this knob only
+                                  // decides when to ask it.
+    float fluidWakeSpeed = 24.0f; // vox/s: grid-node speed at an active/
                                   // settled interface above this excites the
                                   // neighbouring settled liquid (progressive
                                   // wake). Keep ~4x settleEps: the gap is the
                                   // hysteresis
-    int fluidSettleTicks = 45;    // consecutive calm ticks before a block
-                                  // settles. The >= 8 floor is a HARD
+    int fluidSettleTicks = 24;    // consecutive calm ticks before a block
+                                  // settles. 24 beats the old 45 by 2x on
+                                  // settled mass with the bias stripped too
+                                  // (lab hill at exciteMode 0: 2,131 standing
+                                  // eighths at 24 against 1,071 at 45), so
+                                  // this half of the trio is confirmed, not
+                                  // inherited. The >= 8 floor is a HARD
                                   // requirement: it covers the CPU-side
                                   // page-materialization readback latency, so
                                   // the settle converter never writes voxels

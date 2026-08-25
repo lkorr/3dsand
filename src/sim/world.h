@@ -316,9 +316,17 @@ constexpr uint32_t kMaxFluidSpawnsPerTick = 4096; // spawn-op stream cap
 // allocated per substep by a deterministic scan. 256 blocks * 4096 nodes *
 // 32 B = 32 MiB, and bounds simultaneously-active fluid to 256 chunks.
 constexpr uint32_t kFluidBlocks = 256;
-// MPM substeps per 30 Hz tick. CFL: |v| <= 0.45 cell/substep, so the fluid's
-// terminal speed is 0.45 * 6 = 2.7 cells/tick (~8.1 m/s at 0.10 m voxels).
-constexpr uint32_t kFluidSubsteps = 6;
+// MPM substeps per 30 Hz tick — the FALLBACK DEFAULT only. Since WP3 this is
+// the tuning knob `sim.fluidSubsteps`, because it is the CFL budget that makes
+// a chosen stiffness legal and, at the same time, the solver's whole per-tick
+// price. EncodeTick records the substep table CurrentTuning().sim.fluidSubsteps
+// times; the shader side derives FLUID_SUBSTEPS / FLUID_VMAX / FLUID_MARK_PAD
+// from the same knob in common.wgsl. This constant must equal the .def default
+// — scripts/check_invariants.py asserts the pair.
+// CFL: |v| <= 0.45 cell/substep, so the fluid's terminal speed is
+// 0.45 * substeps cells/tick (9 -> 4.05 cells/tick, ~12.2 m/s at 0.10 m
+// voxels).
+constexpr uint32_t kFluidSubsteps = 9;
 // FluidParticle stride in u32 words — must match the struct in common.wgsl
 // (32 words / 128 B, power-of-two for coalesced access).
 constexpr uint32_t kFluidParticleWords = 32;
@@ -1479,7 +1487,9 @@ class World {
   rhi::Buffer fluidSettleScratch; // [0..N) per-slot max speed, [N..2N) settle
                                   // marks (list idx | flags), [2N..2N+16]
                                   // settle list header+slots, then bins:
-                                  // kFluidSettleMax * kChunkVol * 2 words
+                                  // kFluidSettleMax * kChunkVol * 2 words,
+                                  // then the per-column excite-unstable mask:
+                                  // kFluidSettleMax * 8 words (256 columns)
   rhi::Buffer fluidCompactScratch; // per-256-span survivor counts + bases
                                    // (kFluidCap/256 * 2 u32)
   rhi::Buffer fluidMirror;        // 27 mirror chunks x 4096 cells, one byte

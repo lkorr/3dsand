@@ -197,65 +197,106 @@ The check exists because the sword spent a while lying at the character's feet
 while every other melee assertion passed — an edge that has come loose from the
 hand still moves and still carves. Do not baseline it away.
 
-## `fluid-react` — FIXED 2026-08-24
+## `fluid-det`, `fluid-settle` — CLOSED by WP3 (2026-08-24)
 
-Was `"fail"` since the WP1 fluid-lab merge (c4f4ba7). The root cause was
-exactly what the diagnosis below predicted: the gate started from
-`CurrentTuning()` (the user's live tuning.json) and only pinned five of the
-~30 `sim.fluid*` params. The user's tuner session had dragged cohesion to 32.9
-and attractDiff to -1.08, which changed the fluid physics enough to shift the
-mass consumed by reactions below the gate's threshold.
+These were recorded `"fail"` at `987c595` ("Fluid stock defaults: the owner's
+chosen fast-water look"), together with `fluid-excite` and `fluid-stain`, as
+deliberate collateral of a look choice. That commit named the repair itself —
+"the principled way to make this look legal is MORE SUBSTEPS (>=9 at this
+stiffness), not lower stiffness" — and WP3 did exactly that. Both are back to
+`"pass"`; this section is kept, per the removal condition it carried, to say
+what closed it rather than vanishing.
 
-**Fix:** pin every `sim.fluid*` parameter in both `GateFluidReact` and
-`GateFluidExcite` to its `tuning_params.def` default, with the gate's own
-overrides (exciteMode, damping, stiffness, settleEps, wakeSpeed) applied on
-top. This makes the gates hermetic: their outcome depends only on the .def
-values and the gate's own authored overrides, never on the user's tuning.json.
-The same fix was applied to `GateFluidExcite` which had the identical weakness.
+* `fluid-det` was never a determinism failure. Both runs always printed
+  `world hash matches`; what tripped was the `escaped` sanity assert — 77 of
+  512 particles flung out of the basin by a clamp-saturated 6-substep solver.
+  At 9 substeps: **0 escaped, 512 of 512 eighths settled, PASS.**
+* `fluid-settle` went from 0 settled / 1,280 live / 40 picks all refused to
+  **1,280 of 1,280 converted, quiet at tick 40, 0 live / 0 blocks, mass
+  exact.** Two things had to be true at once: the substep fix, and WP3's
+  free-surface gravity-bias strip (`seamRestVy`) — at 900 vox/s^2 one substep
+  of uncancelled gravity is 100 vox/s on every free surface, and since the
+  calm test is a MAX over the chunk, a single surface particle was vetoing
+  every pool in the engine.
 
-Gate result after fix: `fluid react: PASS (739 eighths consumed by reactions,
-plants 25 -> 123, 315 standing + 1650 live + 739 consumed of 2704 placed,
-world hash matches)`.
+`fluid-stain` is closed too, and it closed itself: the first full-suite run of
+the WP3 merge reported it `FIXED since baseline` without anyone touching it.
+Same cause as the other two — it asserts on contact staining, which needs
+water that actually settles — so it is back to `"pass"`.
 
-Original diagnosis for the record: Recorded `"fail"` by the WP4 perf agent,
-2026-08-24. Three independent board notes confirmed it was pre-existing (not
-WP4): agent-ea1608, agent-fea2b6, agent-085345. The WP1 agent (agent-f65818)
-reported it passed at pure `tuning_params.def` values; the merge kept three
-user retunes (cohesion 32.9, attractSame 0, attractDiff -1.08) in
-`tuning.json`. The `fluid-stain` gate has the same structural weakness
-(unpinned fluid params); it was passing when that was written and is now
-failing for the separate reason below.
+`fluid-excite` is the one that does NOT close. It keeps its own entry
+immediately below: it fails on main too, WP3 improved it 3.6x without reaching
+the threshold, and the honest repair is the fixture's rather than the seam's.
 
-## `fluid-det`, `fluid-settle`, `fluid-excite`, `fluid-stain` — the stock-defaults retune (2026-08-24)
+## `fluid-react` — FIXED, flipped to `"pass"` (WP3, 2026-08-24)
 
-**These four are INTENTIONAL and they are not yours.** Recorded `"fail"` at
-`987c595` ("Fluid stock defaults: the owner's chosen fast-water look"), whose
-own commit message says it outright:
+It was tuning-sensitive arithmetic, exactly as the note below predicted, and
+the fix was already on main before WP3 touched anything: commit 987c595 set
+`cohesion` 32.9 -> 0 and `attractSame`/`attractDiff` -> 0, which are the three
+tuner-session retunes the WP1 merge had carried into `tuning.json`. Measured
+2026-08-24 at main b231920 (739 consumed, plants 25 -> 123, 315 + 1650 + 739 =
+2704 EXACT) and on the WP3 branch (960 consumed, plants 25 -> 138, 407 + 1337 +
+960 = 2704 EXACT). Both PASS, both mass-exact, both hash-stable.
 
-> stiffness 3600 -> 14000, gravity 98.1 -> 900, viscosity 0.1 -> 0 [...] the
-> clamp now engages [...] nothing settles at stock, hill capture 53.3% ->
-> 48.6%, **and the fluid-det and fluid-settle gates now fail**. The principled
-> way to make this look legal is MORE SUBSTEPS (>=9 at this stiffness), not
-> lower stiffness -- handed to WP3 along with the settle criteria.
+So the entry had been stale since 987c595 and nobody re-ran it. The original
+diagnosis is kept below because it is the one that turned out to be right.
 
-`fluid-excite` and `fluid-stain` are collateral from the same retune (they
-assert on settling behaviour that no longer occurs at stock). Note that
-`tuning.h` / `tuner_schema.js` carry a do-not-revert marker: **the defaults are
-a deliberate look choice, so "fixing" the gates by lowering stiffness is the
-wrong repair.** The fix is WP3's substep/CFL work.
+> Recorded `"fail"` by the WP4 perf agent, 2026-08-24. It is NOT a WP4
+> regression, and three independent board notes from that day say so before WP4
+> started: agent-ea1608 ("post-baseline gate, MPM mass accounting, unrelated"),
+> agent-fea2b6 ("still fails — pre-existing, not mine"), agent-085345 ("fluid-
+> excite AND fluid-react fail identically with worldgen.wgsl reverted to HEAD ->
+> pre-existing, arrived with c4f4ba7, neither is in baseline.json").
+>
+> The likely cause is on the record too, from the agent who landed WP1
+> (agent-f65818): the WP1 branch PASSED this gate at pure `tuning_params.def`
+> values, and the merge kept three of the user's tuner-session retunes
+> (cohesion 32.9, attractSame 0, attractDiff −1.08) in `tuning.json`. So the
+> gate is almost certainly tuning-sensitive arithmetic rather than broken
+> plumbing.
 
-**Determinism is NOT implicated.** All four print `world hash matches`, and the
-golden hash `7cfa2420` is unmoved. What fails is a physical-behaviour
-assertion, not reproducibility.
+## `fluid-excite` — broken by the owner's fluid defaults (987c595), NOT by WP3
 
-Cost of not recording this: three separate agents independently re-derived
-"the fluid gates aren't mine" on 2026-08-24 — the exact attribution ritual this
-file exists to retire.
+**Verify before you inherit the blame: it fails on main.** Measured
+2026-08-24 at main b231920, `--gate fluid-excite`:
 
-**Removal condition:** when WP3 lands (`agent-f65818`'s claim covers
-`sim_fluid.wgsl`, `sim_fluid_seam.wgsl`, `selftest_sim.cpp`, `lab.cpp`), run
-these four alone and flip each back to `"pass"` in the same commit. Do not
-delete this section — rewrite it to say what closed it.
+    206 standing + 3850 live eighths of 4056, 2 settle picks   FAIL
+
+The gate drains a sealed double-shelled chamber through a carved 4x4 plug and
+asserts that MOST of the water (`> 3/4`) makes it back to settled voxels with
+`live < 800`. It cannot, at gravity 900: a sealed box has nowhere to radiate
+energy to, so the drained pool rings between its walls indefinitely, and the
+settle test is a MAX over a chunk's particles. Measured residual at the end of
+a 340-tick run, with the free-surface gravity bias stripped: **max 81.6 vox/s,
+716 of 3278 particles above 0.9 vox/s.** The gate's own `fluidDamping = 0.9`
+override exists to bound exactly this and is no longer enough at 9x gravity.
+
+WP3 improved it 3.6x and it still fails:
+
+| tree | standing | live | picks |
+|---|---|---|---|
+| main b231920 | 206 | 3850 | 2 |
+| WP3, block-granular veto | 373 | 3683 | 18 (4 inf, 14 unstable) |
+| WP3, column-granular veto | 747 | 3278 | 12 (4 inf, 8 unstable) |
+
+Ruled out, with the instrumentation that says so:
+* **Not the stability veto.** Disabling it outright still gives 759 standing
+  — the veto is worth ~1% here, not the missing 60%.
+* **Not mass written somewhere unaudited.** A WIDE sweep that counts water
+  voxels in the walls too reports the identical 747, so the ~31-eighth gap
+  between `standing + live` and the 4056 placed is not a mis-scoped audit. It
+  is not a seam leak either: the seam's own ledger balances
+  (2424 binned = 2094 settled + 330 left in refused columns, 2094 died). The
+  gap scales with settled VOLUME (0 at 373 standing, 38 at 759, 31 at 747),
+  which points at the gate's one-tick-stale `FA_LIVE` bound on the end-state
+  particle sweep rather than at destroyed water. Not chased further.
+* **Not reactions.** Every water-consuming rule in `reactions.json` needs
+  `needsSky` or a `tag:hot` neighbour; the chamber is sealed under a double
+  stone roof and the gate pins dim dawn.
+
+The honest fix is the gate's, not the seam's: either give the chamber somewhere
+to dissipate energy, or stop asserting near-total resettlement of a sealed box
+at 9x gravity. Left for whoever owns the sealed-box fixtures.
 
 ## Updating
 

@@ -390,6 +390,13 @@ TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
 // Units: stiffness/cohesion/attract in (vox/s)^2, gravity vox/s^2, rest
 // density particles/voxel, viscosity vox^2/s, damping fraction/s, splash rate
 // droplets/s, splash speed vox/s, splash life seconds.
+// fluidSubsteps is the CFL budget and pairs with stiffness: the pseudo sound
+// speed sqrt(stiffness) must fit under 0.45 cells/substep, so substeps >=
+// sqrt(stiffness)/(30*0.45). At the 14000 default that is 8.7 -> 9. It is
+// also the fluid's terminal velocity (VMAX = 0.45*substeps cells/tick) and
+// the solver's whole per-tick price, so it is the one dial where the look and
+// the cost are the same number.
+TP_I(sim, fluidSubsteps, TUNE_FLUID_SUBSTEPS, 9)
 TP_F(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 14000.0f)
 TP_F(sim, fluidGravity, TUNE_FLUID_GRAVITY, 900.0f)
 TP_F(sim, fluidRestDensity, TUNE_FLUID_REST_DENSITY, 8.0f)
@@ -438,9 +445,9 @@ TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
 // wakeSpeed defaults to 4x settleEps — that gap is the hysteresis that stops
 // blocks flickering between the two states.
 TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 0)
-TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 0.9f)
-TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 3.6f)
-TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 45)
+TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
+TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
+TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----

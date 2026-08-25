@@ -237,6 +237,7 @@
     "expMicroPerMille": 900,
     "expMicroLifeTicks": 40,
     "expMicroScaleIdx": 2,
+    "fluidSubsteps": 9,
     "fluidStiffness": 14000,
     "fluidGravity": 900,
     "fluidRestDensity": 8,
@@ -268,9 +269,9 @@
     "fluidSprayDensity": 0.42,
     "fluidFoamScaleIdx": 3,
     "fluidExciteMode": 0,
-    "fluidSettleEps": 0.9,
-    "fluidWakeSpeed": 3.6,
-    "fluidSettleTicks": 45,
+    "fluidSettleEps": 6,
+    "fluidWakeSpeed": 24,
+    "fluidSettleTicks": 24,
     "fluidStainRate": 8
   },
   "render": {

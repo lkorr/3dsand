@@ -297,6 +297,7 @@ SPEC = [
     ("sim", "expMicroScaleIdx", "TUNE_EXP_MICRO_SCALE_IDX", "u", 2),
 
     # MLS-MPM fluid, HUMAN units
+    ("sim", "fluidSubsteps", "TUNE_FLUID_SUBSTEPS", "i", 9),
     ("sim", "fluidStiffness", "TUNE_FLUID_STIFFNESS", "f", 14000.0),
     ("sim", "fluidGravity", "TUNE_FLUID_GRAVITY", "f", 900.0),
     ("sim", "fluidRestDensity", "TUNE_FLUID_REST_DENSITY", "f", 8.0),
@@ -332,9 +333,9 @@ SPEC = [
 
     # MLS-MPM settle / excite seam
     ("sim", "fluidExciteMode", "TUNE_FLUID_EXCITE_MODE", "i", 0),
-    ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 0.9),
-    ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 3.6),
-    ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 45),
+    ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 6.0),
+    ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
+    ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),
     ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
 
     # worldgen (integer; needs a world regen to take effect)
