@@ -210,6 +210,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     };
     tp.windGasScaleQ = scaleQ(wtun.sim.windGasScale);
     tp.windPartScaleQ = scaleQ(wtun.sim.windPartScale);
+    // The drag ramp reference, m/s -> Q16.16 world cells/s. Converted HERE and
+    // not in the shader for the WindQuantize reason above: metres are a knob
+    // unit, the sim only ever sees cells, and one boundary between them is one
+    // that cannot disagree with itself. LoadTuning floors the knob at 1 m/s,
+    // and the max() is the second belt — the kernel divides by this.
+    {
+      double cells = (double)wtun.sim.windDragRef / (double)kVoxelMeters;
+      double r = cells * 65536.0 + 0.5;
+      if (r > 2147483000.0) r = 2147483000.0;
+      tp.windDragRefQ = r < 65536.0 ? 65536 : (int32_t)r;
+    }
   }
   // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except
   // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList

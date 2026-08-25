@@ -1981,6 +1981,7 @@ int main(int argc, char** argv) {
     ui.fExciteMode       = fs.fluidExciteMode;
     ui.windGasScale      = fs.windGasScale;
     ui.windPartScale     = fs.windPartScale;
+    ui.windDragRef       = fs.windDragRef;
     ui.fSettleEps        = fs.fluidSettleEps;
     ui.fWakeSpeed        = fs.fluidWakeSpeed;
     ui.fSettleTicks      = fs.fluidSettleTicks;
@@ -2571,6 +2572,7 @@ int main(int argc, char** argv) {
           ui.fExciteMode       = fs.fluidExciteMode;
           ui.windGasScale      = fs.windGasScale;
           ui.windPartScale     = fs.windPartScale;
+          ui.windDragRef       = fs.windDragRef;
           ui.fSettleEps        = fs.fluidSettleEps;
           ui.fWakeSpeed        = fs.fluidWakeSpeed;
           ui.fSettleTicks      = fs.fluidSettleTicks;
@@ -4095,6 +4097,7 @@ int main(int argc, char** argv) {
         Tuning t = CurrentTuning();
         t.sim.windGasScale = ui.windGasScale;
         t.sim.windPartScale = ui.windPartScale;
+        t.sim.windDragRef = ui.windDragRef;
         SetCurrentTuning(t);
       }
 

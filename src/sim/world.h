@@ -832,7 +832,15 @@ struct TickParams {
   // pinned hash cannot move until someone moves a slider.
   int32_t windGasScaleQ = 256;    // the CA voxel tier: drift-bias probability
   int32_t windPartScaleQ = 256;   // the particle tier: debris, spray, MPM nodes
-  uint32_t _pwd2 = 0;
+  // RAMP REFERENCE for the drag-tier RATE (sim.windDragRef), Q16.16 world
+  // cells/s. The wind speed at which sim.windDrag applies in full; below it the
+  // rate scales linearly with the local wind, so CALM AIR IS BALLISTIC. See
+  // windDragRampQ in common.wgsl — this is the difference between a drag law
+  // and a universal air resistance, and the fixed rate it replaces made every
+  // particle in the world fall at a seventh of its old speed the moment wind
+  // switched on. On the tick stream with the two multipliers, and for the same
+  // reason: it exists to be dragged.
+  int32_t windDragRefQ = (int32_t)(40.0f / kVoxelMeters * 65536.0f + 0.5f);
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in

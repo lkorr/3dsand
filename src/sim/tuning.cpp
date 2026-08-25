@@ -720,6 +720,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "windEntrainRate", s.windEntrainRate, out, at);
     ReadF(*g, "windGasScale", s.windGasScale, out, at);
     ReadF(*g, "windPartScale", s.windPartScale, out, at);
+    ReadF(*g, "windDragRef", s.windDragRef, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -894,6 +895,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const float kScaleMax = (float)kWindScaleMax / (float)kWindScaleOne;
     clampWarnF(s.windGasScale, 0.0f, kScaleMax, "windGasScale");
     clampWarnF(s.windPartScale, 0.0f, kScaleMax, "windPartScale");
+    // The drag ramp reference. Floored well above zero because the kernel
+    // divides by it: windDragRampQ's `max(refQ >> 16, 1)` keeps the shader
+    // safe whatever arrives, but a reference of 0.1 m/s would saturate the
+    // ramp in dead calm and quietly restore the fixed-rate behaviour this
+    // replaces — which is a bug report about gravity, not about wind.
+    clampWarnF(s.windDragRef, 1.0f, 200.0f, "windDragRef");
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.

@@ -175,24 +175,42 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // drag term reading zero wind is not a no-op: it would drag every particle in
   // the world toward a standstill and quietly change the pinned hash. This is
   // the difference between "the field is off" and "the field is calm".
+  //
+  // ...and the RATE is ramped by the wind for the same reason one step in: a
+  // fixed rate says the still air of a calm day resists a falling ember as hard
+  // as a gale does. It does not, and modelling it that way is what made
+  // gravity look broken the day wind shipped (windDragRampQ, common.wgsl, has
+  // the numbers). Gravity is untouched above and stays untouched; what changes
+  // is how much air there is to fall through.
   if (T.windMode != WIND_MODE_OFF) {
     let resp = i32(matWindResponse(materials[p.payload & 0xFFFu]));
     // Almost every material is 0 (stone chips do not blow around), so the
     // common case is one comparison and no field evaluation at all.
     if (resp > 0) {
       let w = windAtScaledQ(startCell, T, T.windPartScaleQ);
-      // Micro spray gets the same law as a whole voxel. It is the same air, and
-      // droplets drifting downwind off a splash is most of what phase 3 buys.
-      let gx = w.x / PART_WIND_SCALE - p.vx;
-      let gy = w.y / PART_WIND_SCALE - p.vy;
-      let gz = w.z / PART_WIND_SCALE - p.vz;
-      // Two steps rather than one product: gap * resp * drag would leave i32 at
-      // the top of both knobs' ranges. Integer division truncates toward zero,
-      // which is symmetric — the asymmetry an arithmetic shift would introduce
-      // reads as a permanent drift down-axis (the mq() lesson).
-      p.vx += ((gx * resp) / 15) * PART_WIND_DRAG / 65536;
-      p.vy += ((gy * resp) / 15) * PART_WIND_DRAG / 65536;
-      p.vz += ((gz * resp) / 15) * PART_WIND_DRAG / 65536;
+      // 0 in calm air, and 0 at a 0x dev multiplier — the same statement, which
+      // is the point of ramping on the SCALED field. Tested before the gaps are
+      // formed so a becalmed world pays a max and a divide, not six.
+      let ramp = windDragRampQ(w, T);
+      if (ramp > 0) {
+        // The authored per-tick rate, thinned to the air actually present. Q16
+        // times Q16 over 65536 stays Q16; PART_WIND_DRAG is at most 65536 and
+        // ramp at most 65536, so the product is 2^32 >> 16 = 2^16. In range.
+        let rate = (PART_WIND_DRAG * ramp) / 65536;
+        // Micro spray gets the same law as a whole voxel. It is the same air,
+        // and droplets drifting downwind off a splash is most of what phase 3
+        // buys.
+        let gx = w.x / PART_WIND_SCALE - p.vx;
+        let gy = w.y / PART_WIND_SCALE - p.vy;
+        let gz = w.z / PART_WIND_SCALE - p.vz;
+        // Two steps rather than one product: gap * resp * drag would leave i32
+        // at the top of both knobs' ranges. Integer division truncates toward
+        // zero, which is symmetric — the asymmetry an arithmetic shift would
+        // introduce reads as a permanent drift down-axis (the mq() lesson).
+        p.vx += ((gx * resp) / 15) * rate / 65536;
+        p.vy += ((gy * resp) / 15) * rate / 65536;
+        p.vz += ((gz * resp) / 15) * rate / 65536;
+      }
     }
   }
 

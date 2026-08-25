@@ -302,11 +302,173 @@ Status GateWind(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================ THE GAS VERTICAL MODEL =========================
+// The `wind` gate above builds a chamber with a CEILING, so its smoke reaches
+// the roof in a few ticks and everything it measures after that is lateral
+// spread through the fallback chain. That is why it stayed green through the
+// entire period in which a freely-rising plume did not lean at all: a gas with
+// open sky above it took the unconditional step-1 rise every tick and never
+// reached a line of wind code. This gate is the one that can see that, and it
+// exists because the bug it covers shipped green once already.
+//
+// OPEN SHAFT, no roof. Two things are asserted, and they are exactly the two
+// design decisions in the model (sim_step.wgsl, THE GAS VERTICAL MODEL):
+//
+//   1. THE PLUME LEANS. Horizontal displacement against the wind-off run must
+//      be real and must follow the direction knob. This is the fix.
+//   2. THE CLIMB IS NOT PAID FOR. The lean is spent on an UP-diagonal, so a
+//      leaning plume must rise as fast as a still one. Had the horizontal share
+//      been taken out of the rise instead, this is the assertion that would
+//      fail - which is the whole reason it is written as a floor on height and
+//      not as a comment.
+struct GasResult {
+  uint32_t count = 0;
+  double x = 0.0, y = 0.0;   // smoke centroid, world cells
+};
+
+Status GateWindGas(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t smokeId = 0, stoneId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "smoke") smokeId = (uint32_t)i;
+    else if (c.mats[i].name == "stone") stoneId = (uint32_t)i;
+  }
+  if (!smokeId || !stoneId) {
+    detail = "need materials smoke and stone";
+    return Status::Fail;
+  }
+  if (c.mats[smokeId].windResponse == 0) {
+    detail = "smoke authors windResponse 0 - nothing here can measure anything";
+    return Status::Fail;
+  }
+
+  // A clear box: floor and side walls, OPEN AT THE TOP. Sized so a plume
+  // leaning at the saturated 45 degrees stays inside it for the whole run --
+  // a gas takes one move per SUBSTEP, so ~2 cells of rise a tick, and the lean
+  // can match that cell for cell.
+  const IVec3 wo = world.WindowOrigin();
+  const int bx = wo.x * (int)kChunk + 32;
+  const int by = wo.y * (int)kChunk + 96;
+  const int bz = wo.z * (int)kChunk + 64;
+  const int kW = 60, kD = 6, kH = 44, kTicks = 18;
+  const int x0 = bx, x1 = bx + kW - 1;
+  const int z0 = bz, z1 = bz + kD - 1;
+  const int yF = by, yT = by + kH;
+
+  std::vector<CellOp> build;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = yF; y <= yT; y++) {
+        // Floor and side walls; no roof, and the interior is cleared to air so
+        // the measurement cannot pick up whatever worldgen left here.
+        const bool wall = y == yF || x < x0 || x > x1 || z < z0 || z > z1;
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         wall ? (stoneId & 0xFFFu) : 0u});
+      }
+  // The puff: low and upwind, so it has the whole shaft to climb and the whole
+  // width to lean across before anything can clip it.
+  std::vector<CellOp> seed;
+  for (int z = z0 + 1; z <= z1 - 1; z++)
+    for (int y = yF + 2; y <= yF + 4; y++)
+      for (int x = bx + 24; x <= bx + 29; x++)
+        seed.push_back({World::SlotCellIndex({x, y, z}), smokeId & 0xFFFu});
+
+  auto run = [&](int mode, float dirDeg) -> GasResult {
+    Tuning t = CurrentTuning();
+    t.sim.windMode = mode;
+    t.wind.weatherAuto = false;   // an evolving field makes arms incomparable
+    t.wind.windDirDeg = dirDeg;
+    t.wind.windSpeed = 20.0f;     // past sim.windDriftSpeed: the lean saturates
+    // GUSTS TURNED DOWN, and not for convenience. The gust bands carry a
+    // vertical component (WINDQ_VERT, 0.18), and the model is ASYMMETRIC about
+    // it by design: `rise` is already at certainty in calm air, so an updraft
+    // cannot add height, while a downdraft subtracts it. A gusty field
+    // therefore lowers a plume slightly no matter how the horizontal share is
+    // spent -- at gustStrength 0.4 it costs ~2 cells over this run, which is
+    // the same order as the thing being measured. Quieting the gusts leaves
+    // the height difference reading ONE decision (up-diagonal vs flat step),
+    // which is what this assertion is for; the alternative costs ~half the
+    // climb, so the slack below is still nowhere near tight.
+    t.wind.gustStrength = 0.1f;
+    const Tuning saved = CurrentTuning();
+    SetCurrentTuning(t);
+
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const std::vector<CellOp> none;
+    uint32_t tick = 40000;
+    for (int i = 0; i < kTicks; i++) {
+      const std::vector<CellOp>& ops = i == 0 ? build : (i == 1 ? seed : none);
+      SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, ops, false,
+                 {wo.x + 2, wo.y + 6, wo.z + 4}, true, false);
+    }
+    ctx.WaitIdle();
+
+    GasResult r;
+    double xs = 0.0, ys = 0.0;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+      for (int cy = yF >> 4; cy <= (yT >> 4); cy++)
+        for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++) {
+          const uint32_t slot = World::SlotChunkIndex({cx, cy, cz});
+          ReadVoxelsSync(ctx, world, slot, 1, cbuf.data(), "gasVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != smokeId) continue;
+            r.count++;
+            xs += (double)((int)(k % 16) + cx * 16);
+            ys += (double)((int)((k / 16) % 16) + cy * 16);
+          }
+        }
+    if (r.count) { r.x = xs / r.count; r.y = ys / r.count; }
+    SetCurrentTuning(saved);
+    return r;
+  };
+
+  const GasResult off  = run((int)kWindModeOff,   90.0f);
+  const GasResult east = run((int)kWindModeDrift, 90.0f);
+  const GasResult west = run((int)kWindModeDrift, 270.0f);
+
+  const double dEast = east.x - off.x;
+  const double dWest = west.x - off.x;
+  // 1. The plume leans, and it leans the way the knob points. A cell is the
+  //    floor; the observed figures are many cells, so this fails loudly.
+  const bool leans = dEast > 1.0 && dWest < -1.0;
+  // 2. The lean was not bought out of the climb. Slack of two cells absorbs the
+  //    RNG spread and the gust field's own vertical component (WINDQ_VERT is
+  //    0.18, so a downward gust legitimately costs a little height); paying for
+  //    the drift out of the rise rate would cost far more than that, since at
+  //    this wind the lean is saturated and EVERY rise would have become a
+  //    sideways step.
+  const bool climbs = east.y > off.y - 2.0 && west.y > off.y - 2.0;
+  // 3. Mass. Smoke is not inert (it thins out), so this is a both-arms
+  //    comparison rather than a fixed count: the wind must not create or eat
+  //    smoke relative to the still run.
+  const bool massOk = east.count > 0 && off.count > 0 &&
+                      east.count * 2 > off.count && off.count * 2 > east.count;
+
+  detail = Format(
+      "plume leans %+.2f / %+.2f cells against mode 0 | climb %.2f vs %.2f "
+      "still (the lean is spent on an up-diagonal, so it must not cost height) "
+      "| smoke %u/%u/%u",
+      dEast, dWest, east.y, off.y, off.count, east.count, west.count);
+  if (!leans) detail += " -- a FREELY RISING plume did not follow the wind";
+  if (!climbs) detail += " -- the lean was paid for out of the climb rate";
+  if (!massOk) detail += " -- smoke count diverged from the still run";
+
+  const bool ok = leans && climbs && massOk;
+  std::printf("wind-gas: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WindGates() {
   static const std::vector<Gate> g = {
       {"wind", "sim", {}, false, GateWind},
+      {"wind-gas", "sim", {}, false, GateWindGas},
   };
   return g;
 }

@@ -568,6 +568,23 @@ void Overlay::Draw(UIState& s) {
         "Per-material response still applies, so heavy debris moves less than\n"
         "spray at the same multiplier. 0 pins the particle tier still.\n"
         "Changes the world hash. Deterministic, just a different world.");
+  if (ImGui::SliderFloat("wind fall onset", &s.windDragRef, 1.0f, 120.0f,
+                         "%.0f m/s"))
+    s.windTuningDirty = true;
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "How hard a wind it takes before falling debris feels the air.\n"
+        "Drag on a particle pulls its velocity toward the local wind on EVERY\n"
+        "axis, so a horizontal field drags the VERTICAL toward zero - that is\n"
+        "air resistance, and at a fixed rate it applies just as hard on a calm\n"
+        "day as in a gale. This is the wind speed at which sim.windDrag counts\n"
+        "in full; below it the RATE ramps down with the wind, so calm air is\n"
+        "ballistic and gravity is left alone.\n"
+        "Terminal fall against the 6 vox/tick ballistic cap, at the default\n"
+        "6 m/s weather: 120 -> 6.0 (no change), 40 -> 5.7, 20 -> 2.9,\n"
+        "6 -> 0.86 (debris drifts down like ash).\n"
+        "LOW makes ordinary weather floaty; HIGH means only a storm is felt.\n"
+        "Changes the world hash. Deterministic, just a different world.");
 
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
 

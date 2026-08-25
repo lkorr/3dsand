@@ -2888,7 +2888,51 @@ summary; that file is where the reasoning lives.
 **Phases 1, 3 and 4 have landed and the gate is ON.** `sim.windMode` ships at
 **1**: the CA drift bias, the ballistic-particle drag and the MPM node force are
 live, and the pinned hash moved `882a30f3` -> `47dd1520` in a dedicated
-rebaseline commit. Mode 2 (settled-powder entrainment) is implemented but not a
+rebaseline commit.
+
+**The gas vertical model (2026-08-25).** A gas used to rise *unconditionally* —
+step 1 of the movement tail was a bare `tryMove` straight up, returning on
+success — so a plume with open sky above it never reached a line of wind code
+and no drift bias could make smoke lean. Buoyancy is now a **probability that
+wind redistributes**, in 1024ths of a move attempt:
+
+    rise = 1024 - down          the move carries +1 Y
+    sink = (down - 1024) / 2    the move carries -1 Y
+    flat = the remainder        the move is horizontal only
+    lean = fh - up              a rising move ALSO carries a downwind step
+
+`down`/`up` are the vertical wind as a fraction of `sim.windDriftSpeed`, `fh`
+the horizontal one, both scaled by the material's authored `windResponse` and
+the dev multiplier. The horizontal share is spent on an **up-diagonal**, not a
+flat step, so a plume leans without slowing its climb — paying for drift out of
+the rise rate would make a 45-degree plume climb at half speed, which is not
+what a gas in a crosswind does. An updraft **straightens** rather than
+accelerates: `rise` is already at certainty in calm air, so the only way lift
+can read as more vertical is by cancelling the lean.
+
+Three consequences worth knowing:
+
+* **This one adds candidates.** The `sink` tier is a genuinely new move that no
+  gas could make before, so the "only reorders what it was already going to
+  try" argument does not cover it. The bound is argued directly instead: every
+  candidate is reach 1, every one goes through the ordinary `tryMove` (stamp
+  discipline, density test and `markDirty` untouched), and `canDisplace` is a
+  density comparison rather than a direction one, so downward motion needed no
+  change there.
+* **Calm air is bit-identical.** `gasIntent` returns `(0,1,0)` whenever wind is
+  off, the material does not respond, or `rise == 1024 && lean == 0` — the same
+  move step 1 would have made.
+* **The model is asymmetric about vertical gusts, by design.** An updraft
+  cannot push `rise` past certainty while a downdraft subtracts from it, so a
+  gusty field lowers a plume slightly. At the shipping weather that is a
+  fraction of a cell; the `wind-gas` gate quiets gusts precisely so its height
+  assertion reads one decision rather than this.
+
+Ambient weather is horizontal in the MEAN (`windAtQ` returns `y = 0` for it);
+the vertical component comes from the two gust bands at `WINDQ_VERT` = 0.18 of
+gust amplitude. So the `flat` and `sink` tiers are not reachable from ordinary
+weather — they need the `wind x voxels` dev multiplier, a lowered
+`sim.windDriftSpeed`, or phase 2's primitives. Mode 2 (settled-powder entrainment) is implemented but not a
 default — see below. Phase 2 (primitives) and phase 5 (updrafts, violent-wind
 excite) are not started.
 
@@ -3091,7 +3135,10 @@ Phase 4b, the flip, is **done**: `882a30f3` -> `47dd1520`. What the rebaseline
 established, beyond the sim being self-consistent: `sleep` still reports **0 of
 32,768 chunks active** after settling, so rule 2 survives — which it must, since
 the drift bias only reorders candidates a moving voxel was already going to try
-and cannot make a settled one move. `--residency dense` reproduces the same
+and cannot make a settled one move. (**Superseded in part** by the gas vertical
+model below: for a GAS, wind now adds candidates rather than only reordering
+them. The rule-2 half of the argument is unaffected — a settled gas is a
+contradiction in terms, and powders and liquids still only get the reordering.) `--residency dense` reproduces the same
 hash, so the new number is the world and not a paging artifact. Both `--vk-smoke`
 tables were re-recorded; `worldgen` is byte-identical in both, as it must be.
 The QUIET smoke scenario moved this time (it did not for the previous two

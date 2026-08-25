@@ -51,7 +51,7 @@ const std::vector<Gate>& SpellGates();
 const char* const kOrder[] = {
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
-    "evaporation", "wind",
+    "evaporation", "wind",      "wind-gas",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",

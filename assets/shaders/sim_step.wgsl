@@ -1260,9 +1260,17 @@ const WIND_ENTRAIN_CHANCE : i32 =
 // material actually responds to wind.
 const WIND_RNG_SALT : u32 = 0x5719u;
 
-fn windRnd(slotIdx : u32) -> u32 {
-  return hash3(T.seed ^ WIND_RNG_SALT, T.tick * 2u + P.substep, slotIdx);
+// Stream 0 is the drift bias / entrainment roll; stream 1 is the gas vertical
+// model below, which needs 30 independent bits of its own. Folding the stream
+// into the SALT rather than slicing more bits out of one word is the same
+// argument the salt itself rests on: "does it go downwind" and "does it rise
+// this tick" are different questions and must not be answerable from each
+// other. Stream 0 XORs zero, so every existing caller is bit-identical.
+fn windRndS(slotIdx : u32, stream : u32) -> u32 {
+  return hash3(T.seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
+               T.tick * 2u + P.substep, slotIdx);
 }
+fn windRnd(slotIdx : u32) -> u32 { return windRndS(slotIdx, 0u); }
 
 // Which of lateralDir's four codes points most nearly downwind. lateralDir is
 // 0:+x 1:+z 2:-x 3:-z, so this is the dominant horizontal axis and its sign.
@@ -1312,6 +1320,144 @@ fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
   }
   if (i32(windRnd(slotIdx) & 1023u) < p) { return windLateralCode(w); }
   return base;
+}
+
+// ==================== THE GAS VERTICAL MODEL (buoyancy vs wind) =============
+// A gas used to rise UNCONDITIONALLY — step 1 of the movement tail is a bare
+// tryMove straight up, and it returns on success. So for a plume with open sky
+// above it the wind code below never executed at all, and no amount of drift
+// bias could make smoke lean: the bias only ever reordered the FALLBACK
+// candidates, which a freely-rising column never reaches. That, and not a
+// tuning value, is why smoke went straight up in a gale.
+//
+// THE MODEL. Buoyancy is a PROBABILITY, and wind redistributes it. Everything
+// is in 1024ths of a move attempt:
+//
+//     rise = 1024 - down          the move carries +1 Y
+//     sink = (down - 1024) / 2    the move carries -1 Y
+//     flat = the remainder        the move is horizontal only
+//     lean = fh - up              a rising move ALSO carries a downwind step
+//
+// where `down`/`up` are the vertical wind as a fraction of the CA saturation
+// speed (sim.windDriftSpeed) and `fh` is the horizontal one, both scaled by the
+// material's authored response and the dev multiplier. Read off the ladder:
+//
+//     calm              1024 rise, 0 lean   -> straight up, every time
+//     slight crosswind  1024 rise, 102 lean -> 90% straight up, 10% up-diagonal
+//     half downdraft     512 rise, 512 flat -> half the rises become sideways
+//     full downdraft        0 rise, 1024 flat -> buoyancy cancelled, spreads flat
+//     2x downdraft          0 rise, 512 sink -> half its moves are DOWNWARD
+//
+// WHY THE LEAN IS A DIAGONAL and not a flat sideways step. Both spend the same
+// one move, but the diagonal spends it on +1 up AND +1 downwind, so a plume
+// leans without slowing its climb. Paying for drift out of the rise rate would
+// make a 45-degree plume climb at half speed, which is not what a gas in a
+// crosswind does — and the up-diagonals are candidates this kernel already
+// tries, so nothing about write reach changes.
+//
+// AN UPDRAFT straightens rather than accelerates: `rise` is already at
+// certainty in calm air and there is nothing above 1024, so the only way for
+// lift to read as MORE vertical is for it to cancel the lean. That is what
+// `fh - up` says, and it is the correct reading of "goes up relative to the
+// rest" once you notice that "up" was never the scarce thing.
+//
+// HONESTY ABOUT THE SAFETY ARGUMENT. The drift bias could claim it "only
+// reorders candidates the voxel was already going to try". This CANNOT: the
+// sink tier is a genuinely new move, downward, that no gas could make before.
+// So the bound is argued directly instead — every candidate is reach 1, every
+// one goes through the ordinary tryMove (so the stamp discipline, the density
+// test and markDirty are untouched), and a gas can only ever enter a cell
+// LIGHTER-than-air rejects, which is the same test that gated its lateral
+// spread. `canDisplace` is a density comparison, not a direction one, so
+// downward motion needed no change there.
+
+// Signed wind on one axis as a fraction of the CA saturation speed, in 1024ths,
+// scaled by the material's response and the dev multiplier. Clamped to +-3072
+// because 3x saturation is where the sink ramp reaches certainty.
+//
+// abs-then-shift-then-resign, NOT a bare arithmetic shift: >> on a negative i32
+// rounds toward -inf, and an asymmetric round here reads as a permanent drift
+// down-axis. That is the mq() lesson, and it is exactly the kind of bug a world
+// hash cannot tell you about.
+fn windAxisFrac(v : i32, resp : i32) -> i32 {
+  let lim = 3 * WIND_DRIFT_REF;
+  let a = min(abs(v), lim);
+  var f = ((a >> 10u) * 1024) / max(WIND_DRIFT_REF >> 10u, 1);   // 0..3072
+  f = (f * resp) / 15;
+  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
+    f = (f * T.windGasScaleQ) / WINDQ_SCALE_ONE;
+  }
+  f = min(f, 3072);
+  return select(f, -f, v < 0);
+}
+
+// Which lateral the horizontal share takes: downwind with probability `fh`,
+// uniform otherwise.
+//
+// NOT windLateralStart's ramp, and the difference matters. That cap
+// (sim.windDriftMax) exists because there the bias is the ONLY thing limiting
+// how much a voxel moves downwind, so letting it reach certainty turns smoke
+// into a conveyor belt. Here the AMOUNT is already metered by `lean` and
+// `flat` — capping the DIRECTION too would scatter a share the model has
+// already decided should go downwind, and a 10% southward lean would come out
+// only 6% southward. The uniform fallback is load-bearing at the other end: a
+// pure downdraft has no horizontal wind, `windLateralCode` would hand back a
+// fixed axis for a zero vector, and every gas in the world would spread the
+// same way. fh = 0 must mean "no opinion", which is what "equal chance in any
+// horizontal direction" asks for.
+fn gasLateralRot(w : vec3<i32>, fh : i32, base : u32, r : u32) -> u32 {
+  if (i32(r & 1023u) < fh) { return windLateralCode(w); }
+  return base;
+}
+
+struct GasIntent {
+  dir  : vec3<i32>,   // the primary candidate, relative to the cell
+  rise : bool,        // did the roll choose to go UP (see the fallback note)
+  rot  : u32,         // lateral rotation for the flat/sink fallback scan
+};
+
+// The one roll. Returns straight up — bit for bit what step 1 would have tried
+// — whenever wind is off, the material does not respond, or the air is calm,
+// so a windless world moves exactly as it did before this existed.
+fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasIntent {
+  var g : GasIntent;
+  g.dir = vec3<i32>(0, 1, 0);
+  g.rise = true;
+  g.rot = base;
+  if (T.windMode == WIND_MODE_OFF) { return g; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return g; }              // most materials: one compare
+  let w = windAtQ(c, T);
+  let fy = windAxisFrac(w.y, resp);
+  let fh = min(1024, max(abs(windAxisFrac(w.x, resp)),
+                         abs(windAxisFrac(w.z, resp))));
+  let down = max(0, -fy);
+  let up   = max(0,  fy);
+  let rise = clamp(1024 - down, 0, 1024);
+  let sink = clamp((down - 1024) / 2, 0, 1024);
+  let lean = clamp(fh - up, 0, 1024);
+  // Dead calm is rise=1024, lean=0 — the identity path, and it is checked
+  // rather than computed through so "there is no wind here" and "this cell
+  // moves as it always did" are one statement.
+  if (rise == 1024 && lean == 0) { return g; }
+  let r = windRndS(slotIdx, 1u);
+  let tier = i32(r & 1023u);
+  let leanRoll = i32((r >> 10u) & 1023u);
+  g.rot = gasLateralRot(w, fh, base, r >> 20u);
+  let d = lateralDir(g.rot);
+  if (tier < rise) {
+    // It rises. Straight up, or up AND downwind in the same move.
+    if (leanRoll < lean) { g.dir = vec3<i32>(d.x, 1, d.y); }
+    return g;
+  }
+  g.rise = false;
+  if (tier < 1024 - sink) {
+    g.dir = vec3<i32>(d.x, 0, d.y);         // buoyancy cancelled: spread flat
+    return g;
+  }
+  // Driven down, leaning downwind if there is also a crosswind.
+  g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
+  return g;
 }
 
 // Saltation: a settled grain of powder pulled loose by a wind that beats its
@@ -1465,6 +1611,29 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   let rising = m.klass == CLASS_GAS;
   let dy = select(-1, 1, rising);
+
+  // 0) GASES ONLY: buoyancy as a probability the wind redistributes. Placed in
+  //    FRONT of the chain rather than woven into it, because the chain is a
+  //    fallback ladder and this is a choice — and because putting it here makes
+  //    the no-wind case provable by inspection: gasIntent returns (0,1,0), the
+  //    tryMove below is the same one step 1 would have made, and step 1 is then
+  //    a dead branch that costs one bounds check. Nothing downstream changes.
+  if (rising) {
+    let g = gasIntent(c, m, slotIdx, rnd >> 10u);
+    if (tryMove(c, c + g.dir, w, m.density, true)) { return; }
+    // A move the wind chose can be blocked. If it wanted to go DOWN or SIDEWAYS
+    // and could not, exhaust the horizontal ring before falling through — the
+    // ordinary chain leads with "straight up", and letting a downdraft-pinned
+    // parcel rise on its first refusal would undo the downdraft against every
+    // ceiling and floor in the world. A rising intent needs no such guard: the
+    // chain it falls into already leads with exactly what it wanted.
+    if (!g.rise) {
+      for (var i = 0u; i < 4u; i++) {
+        let d = lateralDir(i + g.rot);
+        if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, true)) { return; }
+      }
+    }
+  }
 
   // 1) straight fall / rise
   if (tryMove(c, c + vec3<i32>(0, dy, 0), w, m.density, rising)) { return; }

@@ -793,7 +793,13 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     let expo = 65536 - phiQ(m, 0, FLUID_WIND_MASS);
     if (expo > 0) {
       let w = windAtScaledQ(c, T, T.windPartScaleQ);
-      let k = mq(FLUID_WIND_DRAG, mq(FLUID_WIND_GAIN, expo));
+      // Same rate ramp as the ballistic tier (windDragRampQ, common.wgsl), and
+      // it has to be the same one: these two drag laws share the "wind x
+      // particles" slider, so if only one of them vanished at 0x the slider
+      // would mean two different things depending on whether the droplet had
+      // been handed to the solver yet. Calm air drags spray toward nothing.
+      let k = mq(mq(FLUID_WIND_DRAG, windDragRampQ(w, T)),
+                 mq(FLUID_WIND_GAIN, expo));
       v.x += mq(w.x / FLUID_WIND_HZ - v.x, k);
       v.y += mq(w.y / FLUID_WIND_HZ - v.y, k);
       v.z += mq(w.z / FLUID_WIND_HZ - v.z, k);

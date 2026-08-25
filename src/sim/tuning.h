@@ -1137,6 +1137,20 @@ struct Tuning {
     // the tick input stream, captured by replays and the twice-run gate.
     float windGasScale = 1.0f;
     float windPartScale = 1.0f;
+    // ...and the third thing on that stream, which is not a multiplier: the
+    // wind speed (m/s) at which windDrag above applies IN FULL. Below it the
+    // drag RATE ramps linearly with the local wind, which is what keeps a calm
+    // day ballistic — a fixed rate is an atmosphere that resists a falling
+    // ember as hard when nothing is blowing as it does in a gale, and it made
+    // terminal fall 0.86 vox/tick against a 6 vox/tick cap the day wind
+    // shipped. Read the curve off windDragRampQ (common.wgsl): at the default
+    // 40 the 6 m/s weather falls at 5.7 vox/tick and only a named storm looks
+    // floaty; drop it to 20 and ordinary weather already halves the fall.
+    //
+    // Here rather than in tuning_params.def for the windGasScale reason — this
+    // is the knob you drag WHILE watching an explosion, and one that needs F5
+    // between each nudge cannot be judged by eye.
+    float windDragRef = 40.0f;
   } sim;
 
   // ---- day/night cycle ----

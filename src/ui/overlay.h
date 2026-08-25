@@ -99,6 +99,11 @@ struct UIState {
   // precisely so this path does not drag a shader reload along with it.
   float windGasScale = 1.0f;
   float windPartScale = 1.0f;
+  // Mirrors sim.windDragRef, on the same latch and the same stream. Not a
+  // multiplier: the wind speed (m/s) at which the drag rate reaches its
+  // authored strength, i.e. how hard a wind it takes before falling debris
+  // notices the air at all.
+  float windDragRef = 40.0f;
   bool windTuningDirty = false;
   int brushRadius = 4;
   int brushMaterial = 3;     // sand

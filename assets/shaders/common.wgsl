@@ -387,7 +387,9 @@ struct TickParams {
   // sliders: a knob you have to press F5 to see is a knob nobody drags.
   windGasScaleQ  : i32,   // CA voxel tier: scales the drift-bias PROBABILITY
   windPartScaleQ : i32,   // particle tier: scales the wind VELOCITY chased
-  _pwd2      : u32,
+  // Ramp reference for the drag-tier RATE, Q16.16 world cells/s — the wind
+  // speed at which sim.windDrag applies in full. See windDragRampQ below.
+  windDragRefQ   : i32,
 };
 
 // Must match kWindScaleOne / kWindScaleMax in src/sim/world.h.
@@ -921,6 +923,40 @@ fn windAtScaledQ(p : vec3<i32>, T : TickParams, scaleQ8 : i32) -> vec3<i32> {
   return vec3<i32>((w.x / WINDQ_SCALE_ONE) * scaleQ8,
                    (w.y / WINDQ_SCALE_ONE) * scaleQ8,
                    (w.z / WINDQ_SCALE_ONE) * scaleQ8);
+}
+
+// How much of a tier's authored drag RATE actually applies in the air at this
+// sample: Q16, 0 in dead calm and 65536 at T.windDragRefQ and above. One
+// definition, because both drag sites (sim_particle.wgsl, sim_fluid.wgsl) must
+// answer this the same way or "the wind is calm" would mean two things.
+//
+// WHY THE RATE RIDES THE WIND AT ALL. A drag law pulls velocity toward the
+// local air on EVERY axis, so with a horizontal field the vertical target is
+// zero and the term is pure air resistance: terminal fall = gravity/rate,
+// which at the authored windDrag 3 is 0.86 vox/tick against a ballistic cap of
+// 6. Turning wind on therefore made everything in the world fall at a seventh
+// of its old speed, and turning the dev multiplier to 0 made it WORSE (zero
+// field, undiminished rate = drag toward a standstill on all three axes).
+// That is not a tuning value, it is the wrong shape: real drag scales with
+// relative airspeed, and a fixed rate models an atmosphere that resists motion
+// just as hard when nothing is blowing.
+//
+// Ramping the rate by the wind magnitude puts ballistic flight back as the
+// LIMIT rather than as a special case: at the default 6 m/s weather the
+// terminal fall is 5.7 vox/tick (visually the old behaviour), at a 40 m/s
+// storm it is the 0.86 that a storm should mean. The dev multiplier falls out
+// for free, because the vector passed in is the SCALED field — at 0x the
+// magnitude is 0, the ramp is 0, and the whole term vanishes with no
+// `if (scale == 0)` anywhere.
+//
+// CHEBYSHEV, not a true length: the components reach ~2^26 in a storm and
+// squaring them leaves i32. Max-abs is within 1.7x, monotone, and exact.
+// The divide is by cells/s (refQ >> 16) so the Q16.16 numerator lands directly
+// in Q16 — full precision at a whisper, where a >>10 on both sides would
+// quantise the ramp into visible steps.
+fn windDragRampQ(w : vec3<i32>, T : TickParams) -> i32 {
+  let mag = max(max(abs(w.x), abs(w.y)), abs(w.z));
+  return min(65536, mag / max(T.windDragRefQ >> 16u, 1));
 }
 
 // Wind velocity -> foliage bend, in the units TUNE_MICRO_SWAY_AMP is authored

@@ -129,13 +129,25 @@ constexpr Pinned kQuietPinned[] = {
 // untouched (the `wind` gate asserts a settled bed is bitwise unchanged), so
 // the right reading of "quiet moved" here is "worldgen's sand landed
 // somewhere slightly different", not "the world is no longer quiet".
+// The DRAG RAMP (sim.windDragRef) moves every tick from 15, and the reading is
+// the same shape as the wind flip's above: the loud scenario detonates from the
+// first ticks, so ballistic debris is in flight throughout, and the drag law's
+// rate is exactly what changed. Worldgen matches BITWISE (f97ba745 unmoved),
+// which is the evidence that this is content and not a binding: the ramp lives
+// in two sim kernels and the CA was not touched at all.
+// The GAS VERTICAL MODEL moves the loud table from tick 52 and NOT before,
+// which is the localisation working exactly as this table is meant to: ticks
+// 15-47 are the terrain settling, which is powder, and powders are untouched
+// by the model. 52 is where the loud scenario's first fire puts smoke in the
+// air. The QUIET table does not move at all (5/5), because a quiet world grows
+// no gas. A change that had reached the CA generally would have shown at 15.
 constexpr Pinned kLoudPinned[] = {
     {0, 0xf97ba745},   // worldgen — same seed, so identical to the quiet run
-    {15, 0x6e5ae540},  {30, 0xc43d5b9f},  {45, 0xc1eb81a6},  {46, 0x65f2c664},
-    {47, 0xafbdbf44},  {52, 0x6e97906c},  {53, 0x1e5da43e},  {60, 0x587b2f52},
-    {75, 0xa5fc06a0},  {76, 0xe1230b37},  {84, 0x940c4dda},  {85, 0x51eaceb0},
-    {86, 0x4c4d19b4},  {87, 0xcfacc307},  {88, 0xeffa8b66},  {90, 0xc984ea2e},
-    {105, 0x2e0cad43}, {120, 0x14008d2a},
+    {15, 0xc0cac9cc},  {30, 0xdf26b3d5},  {45, 0x61307cdc},  {46, 0xb8dc4159},
+    {47, 0x9c0dc35f},  {52, 0x96d0e00c},  {53, 0x0f088b6a},  {60, 0x53750651},
+    {75, 0x47251d4c},  {76, 0xe08670f6},  {84, 0xc42a6f17},  {85, 0x26be6f11},
+    {86, 0xf0e69bc0},  {87, 0x27d0fee2},  {88, 0xccb16cb2},  {90, 0x3aa40820},
+    {105, 0xbd84ff0a}, {120, 0x3145fde8},
 };
 
 // The loud scenario, verbatim from phase 3c: ops shaped to light up every
