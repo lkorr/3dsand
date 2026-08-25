@@ -916,9 +916,10 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) { return true; }
   }
 
-  // 3) lateral: equalize into a same-liquid neighbor holding >= TUNE_LIQUID_
-  //    EQUALIZE less, split into air, step the LAST eighth off a riser
-  //    (filmStepAllowed), or whole-cell displace a lighter fluid. RNG order.
+  // 3) lateral: equalize into a same-liquid neighbor holding at least the
+  //    equalize threshold less, split into air, step the LAST eighth off a
+  //    riser (filmStepAllowed), or whole-cell displace a lighter fluid.
+  //    RNG order.
   //
   //    On TUNE_LIQUID_EQUALIZE, which PLAN §1.1 names as defect 2: it stays 2,
   //    and the reason is worth stating because "just lower it to 1" is the
