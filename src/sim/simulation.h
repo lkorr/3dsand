@@ -185,6 +185,15 @@ class Simulation {
   // depth testing off, so a collider is visible through whatever contains it.
   // `count` of 0 draws nothing at all — the overlay is free when it is off.
   void DrawDebugBoxes(const rhi::RenderPass& pass, uint32_t count);
+  // Wind slope-field overlay (docs/RESEARCH_wind.md §4.8, F4): one arrow per
+  // lattice point around the camera, oriented and coloured by `windAt` — the
+  // same field function the foliage sway samples. `arrows` is
+  // WindDebugArrowCount(tuning) (sim/wind.h); 0 draws nothing at all.
+  //
+  // Nothing is uploaded for this: the vertex shader derives every lattice
+  // point from its instance index and R.camPos, so there is no arrow buffer,
+  // no per-arrow CPU work, and no new bind group.
+  void DrawWindField(const rhi::RenderPass& pass, uint32_t arrows);
   void DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances);
   // Microvoxel bodies (PLAN §C): one 36-vertex OBB per entry in `insts`, drawn
   // between DrawBodies and DrawSprites. `insts` is the compacted (slot, model)
@@ -300,9 +309,9 @@ class Simulation {
       fluidSettleBin_, fluidSettleCheck_, fluidSettleCommit_, fluidSettleKill_,
       fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
-      microBodyDraw_, debugBoxDraw_, fluidDraw_;
+      microBodyDraw_, debugBoxDraw_, debugWindDraw_, fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
-      debugLineModule_;
+      debugLineModule_, debugWindModule_;
   rhi::TextureFormat targetFormat_ = rhi::TextureFormat::Undefined;
 
   rhi::Texture depthTex_;

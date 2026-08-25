@@ -867,20 +867,25 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     riseBase = f32(below);
     riseNorm = 1.0 / f32(below + 1 + above);
 
-    // Two incommensurate sine bands per axis: a slow whole-field breath plus a
-    // faster flutter, never periodic together. `gustPos` makes the phase drift
-    // across the field so a gust travels rather than the whole meadow rocking
-    // as one; `ph` is the per-plant scatter on top (the "not all synced" part).
-    // X leads and Z trails at ~60% amplitude, so the motion is an ellipse with
-    // a dominant axis — wind has a direction, jiggle does not.
+    // THE SHARED WIND FIELD. The two incommensurate bands, the travelling
+    // gust phase and the elliptical anisotropy all used to be built right
+    // here; they are now `windAt` in common.wgsl and this samples it (research
+    // doc §4.7, DESIGN.md §12 invariant 2). What changed in the LOOK is one
+    // thing: the ellipse's major axis was hardcoded to X and now follows the
+    // weather vector, so turning wind.windDirDeg turns the grass.
+    //
+    // `ph` is the per-column scatter — the "not all synced" part — and it is
+    // fed to the field as a phase offset exactly as it was before, because
+    // decorrelation is what makes a field read as wind rather than as one
+    // rocking object (Crysis / GPU Gems 3 ch.16).
     let ph = f32(colH & 1023u) * 0.006136;  // 0..2pi per column
-    let gustPos = f32(cell.x) * 0.11 + f32(cell.z) * 0.07;
-    let t = R.time * TUNE_MICRO_SWAY_SPEED;
-    let wx = sin(t + gustPos + ph) * 0.7 +
-             sin(t * 1.73 + gustPos * 0.5 + ph * 3.1) * 0.3;
-    let wz = sin(t * 0.83 + gustPos * 1.2 + ph + 2.1) * 0.45 +
-             sin(t * 2.19 + ph * 1.7) * 0.15;
-    swayVec = vec2f(wx, wz) * TUNE_MICRO_SWAY_AMP;
+    // R.time x microSwaySpeed, NOT the raw clock: microSwaySpeed is a
+    // foliage-local trim and defaults to 1.0, at which the grass and the debug
+    // arrow overlay are sampling the same field at the same phase.
+    let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, R);
+    let wvel = windMeanWS(ws) + windBandWS(ws, ws.b1) * WIND_BAND_W1
+                              + windBandWS(ws, ws.b2) * WIND_BAND_W2;
+    swayVec = windSway(wvel) * TUNE_MICRO_SWAY_AMP;
   }
 
   // Local ray, in SUB-VOXEL units (0..S). Working in sub-voxels rather than in
@@ -1080,18 +1085,23 @@ fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
   let totalH = f32(below + 1 + above);
   let rise0 = f32(below);
 
-  // The two wind bands, shared with traceMicro's field (same speeds, same
-  // travelling-gust phase) so brick plants and strand plants visibly live in
-  // the same wind. Kept as separate vectors here: each strand blends them
-  // with its own hash-drawn weights, which is what decorrelates neighbouring
-  // blades without costing extra transcendentals per strand.
+  // The shared wind field (common.wgsl `windAt`), sampled ONCE per cell and
+  // kept in its component parts. Brick plants and strand plants visibly live
+  // in the same wind because they are literally reading the same function —
+  // that is DESIGN.md §12 invariant 2, and it is also what makes the debug
+  // arrow overlay evidence about this grass rather than a picture of a
+  // different field.
+  //
+  // The parts stay separate because each strand blends the GUSTS with its own
+  // hash-drawn weights (below), which decorrelates neighbouring blades without
+  // costing extra transcendentals per strand. The MEAN is deliberately not
+  // re-weighted: every blade in the cell stands in the same average wind and
+  // they disagree only about the gusts.
   let ph = f32(colH & 1023u) * 0.006136;
-  let gustPos = f32(cell.x) * 0.11 + f32(cell.z) * 0.07;
-  let t = R.time * TUNE_MICRO_SWAY_SPEED;
-  let band1 = vec2f(sin(t + gustPos + ph),
-                    sin(t * 0.83 + gustPos * 1.2 + ph + 2.1) * 0.6);
-  let band2 = vec2f(sin(t * 1.73 + gustPos * 0.5 + ph * 3.1),
-                    sin(t * 2.19 + ph * 1.7) * 0.6);
+  let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, R);
+  let band1 = windSway(windBandWS(ws, ws.b1));
+  let band2 = windSway(windBandWS(ws, ws.b2));
+  let bandMean = windSway(windMeanWS(ws));
   // TUNE_MICRO_SWAY_AMP is authored in sub-voxels of a subdiv-8 cell; strands
   // work in cell units, hence the /8.
   let amp = TUNE_MICRO_SWAY_AMP * 0.125 * swayScale;
@@ -1112,10 +1122,12 @@ fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
              (vec2f(f32((hs >> 8u) & 15u), f32((hs >> 12u) & 15u)) - 7.5) *
                  0.008;
 
-    // Per-strand wind: an individual blend of the two shared bands. THIS line
-    // is "each strand is its own entity" — two blades in one cell disagree
-    // about the gust by their weights, not by living in different fields.
-    let wind = (band1 * (0.55 + 0.45 * f32((hs >> 16u) & 255u) / 255.0) +
+    // Per-strand wind: an individual blend of the two shared bands, plus the
+    // mean the whole cell shares. THIS line is "each strand is its own entity"
+    // — two blades in one cell disagree about the GUST by their weights, not
+    // by living in different fields, and they agree exactly about the average.
+    let wind = (bandMean +
+                band1 * (0.55 + 0.45 * f32((hs >> 16u) & 255u) / 255.0) +
                 band2 * (0.20 + 0.55 * f32((hs >> 24u) & 255u) / 255.0)) * amp;
 
     // Cantilever chord through this cell: exact curve points at the cell's

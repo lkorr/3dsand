@@ -2879,6 +2879,112 @@ world hash with a scale-2 critter walking through the scene.
 - Later: emissive materials feeding a cheap GI (light propagation volumes or
   per-chunk flood lighting), volumetrics for gases.
 
+## 9b. Wind (added 2026-08-25)
+
+Plan of record: **`docs/RESEARCH_wind.md`** — the decision record, the industry
+survey behind it, and the five-phase schedule. This section is the binding
+summary; that file is where the reasoning lives.
+
+**Phase 1 has landed (render-side). Phases 2–5 are not started.**
+
+### The decision, in one paragraph
+
+Wind is a **pure function, not a stored field**: `windAt(worldPos, t)`,
+evaluated on demand. It is composed of a deterministic CPU-computed weather
+vector that evolves chaotically over minutes, two travelling gust bands whose
+phase is a function of world position, an altitude ramp, and — in later phases
+— a derived updraft term and a bounded list of parametric **wind primitives**
+(fans, spell gusts) evaluated analytically like point lights. There is no
+per-chunk vector storage, no neighbour-constraint relaxation pass, and no
+resolution to choose: the function is continuous and costs only where it is
+sampled. Rejected: per-chunk stored vectors smoothed by a ±θ neighbour
+constraint — that is a per-tick pass over all 32,768 window chunk slots whether
+anything moves or not (rule 2), it is new authoritative state that must be
+saved, hashed or excluded, streamed and someday replicated, and what it
+converges to is a smooth low-frequency field, which an analytic function
+already *is*, for free, with no convergence latency. See RESEARCH_wind.md §3.
+
+### The field
+
+```
+windAt(p, t) = (weather(t) + gustBands(p, t)) * altRamp(p.y)
+             + updraft(heatBelow(p))     // phase 5
+             + Σ primitives_i(p, t)      // phase 2
+```
+
+Units are world **cells per second** (`kVoxelMeters` = 0.10, so cells/s = m/s ×
+10); the m/s knobs are converted once, on the CPU. The altitude ramp scales the
+whole field including the mean, because wind aloft is faster wind rather than
+the same wind with bigger gusts.
+
+`windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
+prepended to every shader, so the field is in scope everywhere without being
+copied anywhere. The evolving weather comes from **`WindWeather`
+(`src/sim/wind.h`)** — a pure function of (tuning, seed, tick) that holds no
+state and integrates nothing, so asking for tick 90,000 costs the same as tick
+1 and gives the same answer on every machine. Its three outputs ride
+`RenderParams` today and will also ride `TickParams` in phase 4 (the `dayPhase`
+precedent: CPU-computed inputs that replay and the determinism gates must
+capture belong on the tick input stream).
+
+### Invariants
+
+1. **Wind is a function. There is no stored wind field and no per-voxel wind
+   state, ever** — voxel bits 19–23 stay free.
+2. **One authoritative field implementation, in `common.wgsl`.** Every consumer
+   samples it; none builds its own bands. This is why the debug overlay is
+   evidence rather than decoration — it calls the same function the grass
+   calls, so it cannot draw a wind the world is not in. A C++ mirror, if one is
+   ever needed, gets a `check_invariants.py` entry.
+3. **The ambient field never wakes a chunk.** Primitives (phase 2) dirty-mark
+   only their own bounded, budget-charged footprint, through the mutation path.
+   This is the "light-gated rules never sleep" lesson applied ahead of time: a
+   condition that is always true must never call `keepAwake`.
+4. Wind bias applies only to voxels **already executing the movement tail**;
+   settled matter moves only via the entrainment threshold, inside awake
+   footprints (phase 4).
+5. Player and world wind exist **only as primitive ops on the input stream** —
+   no side-channel writes (rule 3's philosophy).
+6. Sim consumption is integer (`windAtQ`), gated by `sim.windMode`, and flipped
+   only in a dedicated rebaseline commit (phase 4).
+7. `windResponse` / `windFriction` are authored **material data** (JSON), never
+   hardcoded per material in a shader (phase 3).
+
+### What phase 1 shipped
+
+- `windSampleAt` / `windAt` / `windBandWS` / `windMeanWS` / `windSway` in
+  `common.wgsl`; `WindWeather` in `src/sim/wind.h`; a `windDir`/`windSpeed`/
+  `windGust` row on `RenderParams`.
+- **The two foliage sway sites rewired to sample it** — the brick sway and the
+  strand blades in `raymarch.wgsl`. The two travelling gust bands, their four
+  incommensurate rates and their world-position phase were *promoted out of*
+  that code, so the character is preserved deliberately. One thing changed in
+  the look: the elliptical anisotropy used to be hardcoded to "X leads, Z
+  trails" and is now a projection onto the weather vector, which is why turning
+  `wind.windDirDeg` now turns the grass. Per-column hash scatter and per-blade
+  band weights are untouched — that decorrelation is what makes a field read as
+  wind instead of as one rocking object.
+- **The debug slope-field overlay** (`assets/shaders/debug_wind.wgsl`,
+  `Simulation::DrawWindField`): an arrow per lattice point around the camera,
+  oriented and coloured by magnitude. **F4** in-game, `wind.dbgWindField` in the
+  tuner. Nothing is uploaded for it — the vertex shader derives each lattice
+  point from its instance index and `R.camPos` — and it is skipped entirely when
+  off rather than drawn transparent. It is a render draw, so it has no
+  `pass_table.def` row: that table describes the sim's *compute* recording.
+- The `wind.*` tuning group (Wind tab).
+
+**Phase 1 is hash-neutral by construction** and was verified so: it touches no
+sim kernel, and the pinned world hash is unchanged.
+
+### Phases remaining
+
+| # | Scope | Hash risk |
+|---|---|---|
+| 2 | Primitive list + op plumbing (spell VM op, fan tag), per-chunk cull mask, footprint wake | none while gated |
+| 3 | Debris + MPM wind force; `windResponse`/`windFriction` authoring and bit-packing | none (unhashed systems) |
+| 4 | `windAtQ` + CA drift bias + settled-powder entrainment, behind `sim.windMode=0`; then the flip | **rebaseline on flip** |
+| 5 | Per-chunk hot-material counts → updraft term; violent wind promoting voxels to particles; capes when cloth exists | rebaseline |
+
 ## 10. Networking (design now, build later)
 
 With the determinism discipline of §2/§4, **both** classic models are viable, and

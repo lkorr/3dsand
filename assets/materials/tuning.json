@@ -542,7 +542,7 @@
     "microLodDist": 40,
     "microMaxPerRay": 8,
     "microSwayAmp": 1.5,
-    "microSwaySpeed": 1.1,
+    "microSwaySpeed": 1.0,
     "primarySteps": 4096,
     "farSteps": 384,
     "farShadowReach": 60,
@@ -753,5 +753,18 @@
   "weather": {
     "waterFreezes": false,
     "iceMelts": false
+  },
+  "wind": {
+    "windSpeed": 6.0,
+    "windDirDeg": 45.0,
+    "gustStrength": 1.0,
+    "weatherAuto": true,
+    "gustWavelength": 4.8,
+    "gustSpeed": 1.1,
+    "altitudeGain": 0.6,
+    "altitudeRefY": 64.0,
+    "dbgWindField": false,
+    "dbgWindSpacing": 8.0,
+    "dbgWindRadius": 48.0
   }
 }

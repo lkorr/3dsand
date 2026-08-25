@@ -14,6 +14,7 @@
 
 #include "gpu/resources.h"
 #include "sim/farfield.h"
+#include "sim/wind.h"
 
 namespace sandvox {
 
@@ -127,6 +128,20 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // advances at the sim's rate on every machine and reproduces in a replay.
   rp.tick = tick;
   rp.seed = kDefaultSeed;
+  // Wind. The evolving half of the field (docs/RESEARCH_wind.md §4.2) — the
+  // rest of it is TUNE_* constants folded into the shader. Derived from the
+  // TICK, not from `time`, for the same reason the flipbook clock is: weather
+  // that advanced with wall time would run at a different rate per machine and
+  // would not reproduce in a replay. WindWeather is the only author of these,
+  // here and (phase 4) in TickParams, so the renderer and the CA cannot end up
+  // in different weather.
+  {
+    const WindState wind = WindWeather(tun, rp.seed, tick);
+    rp.windDir[0] = wind.dirX;
+    rp.windDir[1] = wind.dirZ;
+    rp.windSpeed = wind.speed;
+    rp.windGust = wind.gust;
+  }
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));

@@ -47,6 +47,7 @@
 #include "sim/tuning.h"
 #include "sim/stream.h"
 #include "sim/voxload.h"
+#include "sim/wind.h"
 #include "sim/world.h"
 #include "sim/worldio.h"
 #include "telemetry.h"
@@ -448,6 +449,13 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     rhi::RenderPass rp =
         sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
+    // Wind slope-field arrows, off unless wind.dbgWindField asks for them.
+    // Headless cannot press F4, and the overlay's whole job is to be LOOKED
+    // at — so the tuning bool is how a screenshot run reaches it, and the
+    // wind block below is what uses that.
+    sim.DrawWindField(rp, CurrentTuning().wind.dbgWindField
+                              ? WindDebugArrowCount(CurrentTuning())
+                              : 0u);
     rp.End();
     ctx.queue.Submit(enc.Finish());
     ctx.WaitIdle();
@@ -615,6 +623,54 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     int gh = World::TerrainHeight(336, 96, kDefaultSeed);
     render({296, (float)(gh + 16), 56}, 0.785f, -0.18f, "screenshot_tallgrass.bmp");
     render({322, (float)(gh + 6), 82}, 0.785f, 0.0f, "screenshot_tallgrass_eye.bmp");
+    // ---- WIND: the slope-field overlay, over this same stand ----
+    //
+    // Two frames, and the PAIR is the evidence — either alone proves nothing.
+    // Same eye, same tick, same sun, same grass. The ONLY difference between
+    // them is the wind direction:
+    //
+    //   _wind      arrows over the stand at the authored direction
+    //   _wind_rot  the same frame with windDirDeg turned 90 degrees
+    //
+    // What has to be visible in the second is that the ARROWS and the GRASS
+    // LEAN rotated TOGETHER. That is the whole phase-1 claim in one picture:
+    // the sway and the overlay are reading ONE field (windAt in common.wgsl),
+    // not two implementations that happen to agree today.
+    //
+    // It is shot HERE, inside the relocated window, rather than at the origin,
+    // because the meadow around spawn is flowers and single-cell tufts — the
+    // lean of a one-cell tuft is a couple of pixels. This is the only stand in
+    // the world tall enough for the comparison to be legible.
+    //
+    // weatherAuto is pinned OFF for both. Evolving weather would make the two
+    // frames incomparable: a difference between them could be the knob or
+    // could be the clock, and a shot that cannot separate those is not
+    // evidence of anything.
+    //
+    // BOTH directions are held well off the camera's own axis, and that is
+    // deliberate. An arrow aligned with the view ray carries no direction on
+    // screen and the shader fades it out (see the axial fade in
+    // debug_wind.wgsl), so a frame shot straight up-wind is a picture of a
+    // hole. The camera looks along yaw 45 degrees, so the pair is taken at 90
+    // and 180: one crossing left-to-right, one crossing the other way, 90
+    // degrees apart as the comparison requires and neither degenerate.
+    {
+      const Tuning saved = CurrentTuning();
+      Tuning tw = saved;
+      tw.wind.dbgWindField = true;
+      tw.wind.weatherAuto = false;
+      // The eye-level camera, backed off and lifted a little: low enough that
+      // individual blades still resolve, high enough that the arrow lattice
+      // fills the frame. Both things being compared have to be legible at once.
+      const Vec3 eye{318, (float)(gh + 8), 78};
+      tw.wind.windDirDeg = 90.0f;
+      SetCurrentTuning(tw);
+      render(eye, 0.785f, -0.08f, "screenshot_wind.bmp");
+      tw.wind.windDirDeg = 180.0f;
+      SetCurrentTuning(tw);
+      render(eye, 0.785f, -0.08f, "screenshot_wind_rot.bmp");
+      SetCurrentTuning(saved);
+    }
     world.SetWindowOrigin({0, 0, 0});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
@@ -1886,6 +1942,11 @@ int main(int argc, char** argv) {
   if (!noAudio) audioCues.Init(assetDir + "/sounds", mats);
 
   UIState ui;
+  // The wind overlay's authored initial state (F4 toggles from here). Seeded
+  // rather than defaulted so a tuning.json that asks for the arrows gets them
+  // without a keypress — which is what makes the overlay reachable from a
+  // headless run.
+  ui.showWindField = CurrentTuning().wind.dbgWindField;
   {
     const auto& fs = CurrentTuning().sim;
     ui.fGravity     = fs.fluidGravity;
@@ -2021,7 +2082,7 @@ int main(int argc, char** argv) {
   // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
   float lookSensNow = 1.0f;
 
-  KeyEdge eP, eN, eV, eF1, eF3, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
@@ -2290,6 +2351,11 @@ int main(int argc, char** argv) {
     if (eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
     if (eF3.Pressed(key(GLFW_KEY_F3)))
       ui.showCollisionBoxes = !ui.showCollisionBoxes;
+    // F4: the wind slope-field arrows (docs/RESEARCH_wind.md §4.8). Beside F3
+    // because the two are the same kind of thing — a debug view of something
+    // the world is doing invisibly — and free when off either way.
+    if (eF4.Pressed(key(GLFW_KEY_F4)))
+      ui.showWindField = !ui.showWindField;
     if (eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
     if (eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
@@ -2531,6 +2597,11 @@ int main(int argc, char** argv) {
           ui.fDensityShade = fr.fluidDensityShade;
         }
         avatarDefName = CurrentTuning().player.model;
+        // The wind overlay is reachable two ways and F5 is where they meet:
+        // the tuning bool is the authored state and F4 toggles from there, so
+        // reloading re-seeds the toggle rather than leaving the key and the
+        // file quietly disagreeing about whether the arrows are on.
+        ui.showWindField = CurrentTuning().wind.dbgWindField;
         // Gore variance is drawn per mob at spawn, so mobs already standing in
         // the world hold profiles from the OLD tuning. Re-draw them here or an
         // edit to the randomness controls appears to do nothing until the next
@@ -4256,6 +4327,13 @@ int main(int argc, char** argv) {
       sim.DrawMicroBodies(rp, microCount);
       sim.DrawSprites(rp, (uint32_t)sprv.size());
       sim.DrawDebugBoxes(rp, debugBoxCount);
+      // Wind arrows LAST of the world draws so they composite over everything
+      // they annotate. Nothing is uploaded for them — the count is the only
+      // CPU work, and at zero the draw is skipped outright (rule 2's shape,
+      // applied to a debug view: off is not "cheap", it is nothing).
+      sim.DrawWindField(rp, ui.showWindField
+                                ? WindDebugArrowCount(CurrentTuning())
+                                : 0u);
       overlay.Render(rp);
       rp.End();
       ctx.queue.Submit(enc.Finish());

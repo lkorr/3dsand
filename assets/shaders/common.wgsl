@@ -461,6 +461,18 @@ struct RenderParams {
   _pfb0      : i32,
   fluidHi    : vec3<i32>,
   _pfb1      : i32,
+  // ---- wind (docs/RESEARCH_wind.md §4.2 — must match RenderParams in
+  // world.h) ----
+  // The evolving half of the wind field: everything else about it is a TUNE_*
+  // constant, but the weather vector drifts over minutes and so has to ride a
+  // per-frame uniform. Resolved by ONE C++ function (WindWeather, sim/wind.h)
+  // so the automatic weather and the manual override cannot disagree, and so
+  // phase 4's TickParams copy has the same author.
+  //
+  // One whole std140 row: vec2f + 2 x f32.
+  windDir    : vec2f,  // unit XZ, pointing DOWNWIND
+  windSpeed  : f32,    // mean speed, world cells/s (m/s x 10)
+  windGust   : f32,    // gust band amplitude, world cells/s
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -668,6 +680,150 @@ fn projectView(rel : vec3f, R : RenderParams) -> vec4f {
   let vz = dot(rel, R.camFwd);
   return vec4f(vx / (R.tanHalfFov * R.aspect), vy / R.tanHalfFov, KNEAR, vz);
 }
+
+// ============================== WIND FIELD ==================================
+// docs/RESEARCH_wind.md is the plan of record; DESIGN.md §12 states the
+// invariants. Wind is a PURE FUNCTION of (world position, time). There is no
+// per-chunk vector, no per-voxel wind bits, no relaxation pass — and therefore
+// nothing to save, hash, stream, replicate or wake (invariant 1). The field
+// costs only where it is sampled, so an unsampled world pays nothing, which is
+// how a wind system obeys rule 2 without a sleep mechanism of its own.
+//
+// THIS IS THE ONE IMPLEMENTATION (invariant 2). Phase 1's consumers are the
+// two foliage sway sites in raymarch.wgsl and the arrow overlay in
+// debug_wind.wgsl; phases 2-5 add primitives, particle/MPM forces and an
+// integer `windAtQ` for the CA. A consumer that builds its own bands is a bug,
+// not an optimisation: the whole illusion is that everything is standing in
+// the SAME wind (Sucker Punch's "volume over accuracy" — one shared input,
+// sampled consistently, sells it, and no solver is needed). The debug overlay
+// is only evidence BECAUSE it calls the same function the grass does.
+//
+// UNITS. The field is a VELOCITY in world CELLS PER SECOND. kVoxelMeters is
+// 0.10, so cells/s = m/s x 10, and the m/s knobs are converted once on the CPU
+// (src/sim/wind.h). Positions are world voxels; `t` is seconds.
+//
+// COMPOSITION (research doc §4.1):
+//     windAt(p, t) = (mean + gustBands(p, t)) * altRamp(p.y)
+// The altitude ramp scales the WHOLE field, mean included, because wind aloft
+// is faster wind rather than the same wind with bigger gusts. §4.1's updraft
+// and primitive terms are phases 5 and 2; they add in here.
+
+// Gust bands are ANISOTROPIC about the wind direction: the along-wind
+// component gets the full band and the crosswind component 60% of it, so the
+// motion traces an ellipse with a dominant axis. That is what separates wind
+// from jiggle. It is also the one thing the sway code this was promoted from
+// had HARDCODED ("X leads, Z trails at ~60%") — here it is a projection onto
+// the weather vector instead, which is precisely why turning windDirDeg turns
+// the grass.
+const WIND_GUST_CROSS : f32 = 0.6;
+// The vertical band. Gust fronts have genuine updraft/downdraft structure, and
+// without it the debug arrow field is a flat sheet that says nothing about the
+// third dimension. Foliage ignores it — a blade bends sideways, not upward.
+const WIND_GUST_VERT : f32 = 0.18;
+// Band mix for a consumer with no opinion (brick sway, the debug field). The
+// strand path overrides these PER BLADE, and that per-blade disagreement is
+// what decorrelates neighbours; see the note at its call site.
+const WIND_BAND_W1 : f32 = 0.7;
+const WIND_BAND_W2 : f32 = 0.3;
+// Radians of gust phase per world cell travelled downwind: 2pi / wavelength,
+// with the wavelength authored in METRES. The guard keeps a wavelength typo
+// from producing an infinite spatial frequency (which aliases to noise).
+const WIND_GUST_K : f32 =
+    6.28318531 / max(TUNE_WIND_GUST_WAVELENGTH / VOXEL_METERS, 1.0);
+// Wind speed corresponding to the AUTHORED foliage bend amplitude
+// (TUNE_MICRO_SWAY_AMP, in sub-voxels). Sway is a displacement and wind is a
+// velocity, so something has to relate them; putting the reference here rather
+// than in a knob is deliberate — it is a calibration of the existing authored
+// amplitude, not a thing to tune. 120 cells/s = 12 m/s, chosen so the DEFAULT
+// windSpeed + gustStrength reproduce the peak bend the sway code shipped with.
+const WIND_SWAY_REF : f32 = 120.0;
+
+// One evaluation of the field, kept in its component parts. The parts exist
+// because the strand path must re-weight the GUSTS per blade without
+// re-weighting the MEAN (every blade stands in the same average wind, they
+// only disagree about the gusts) — and doing that through this struct is what
+// keeps it the same arithmetic as windAt() instead of a second field.
+struct WindSample {
+  along : vec2f,   // unit XZ, downwind
+  crossw: vec2f,   // unit XZ, 90 degrees to the left of `along`
+  mean  : vec2f,   // XZ mean wind, cells/s, altitude ramp applied
+  b1    : vec3f,   // band 1 as (along, cross, up), unit-ish amplitude
+  b2    : vec3f,   // band 2, same frame
+  amp   : f32,     // gust amplitude, cells/s, altitude ramp applied
+};
+
+// Altitude gain. altitudeGain is the fractional speed-up per 100 world voxels
+// (10 m) above altitudeRefY, so it is signed: below the reference the boundary
+// layer slows the wind down. Clamped at both ends because a knob is allowed to
+// be silly and a negative or exploding wind is not a look, it is a bug report.
+fn windAltRamp(y : f32) -> f32 {
+  return clamp(1.0 + TUNE_WIND_ALT_GAIN * (y - TUNE_WIND_ALT_REF_Y) * 0.01,
+               0.15, 4.0);
+}
+
+// `ph` is the consumer's per-instance phase scatter (per grass column, per
+// blade). It is a decorrelation offset, NOT part of the field: windAt passes
+// 0.0, which is what the debug overlay draws and what "the wind at this point"
+// means. Keeping it a parameter rather than baking a hash in here is what lets
+// the sway sites keep the exact scatter they were tuned with.
+fn windSampleAt(p : vec3f, t : f32, ph : f32, R : RenderParams) -> WindSample {
+  var s : WindSample;
+  // R.windDir is a unit XZ vector resolved on the CPU. WindWeather()
+  // (src/sim/wind.h) is its ONLY author — auto weather and the manual override
+  // come out of the same function, and phase 4's TickParams copy will too, so
+  // the sim and the renderer cannot end up in different weather.
+  let d = R.windDir;
+  s.along = d;
+  s.crossw = vec2f(-d.y, d.x);
+  let alt = windAltRamp(p.y);
+  s.mean = d * (R.windSpeed * alt);
+  s.amp = R.windGust * alt;
+  // Travelling gust phase: distance DOWNWIND, in radians. Phase as a function
+  // of world position is what makes a gust FRONT cross a meadow instead of the
+  // whole field breathing as one (Crysis / GPU Gems 3 ch.16, and the same
+  // trick the global colour lattice plays). Measuring it along `along` rather
+  // than on a fixed axis is what makes the fronts travel with the wind.
+  let gp = dot(p.xz, d) * WIND_GUST_K;
+  let tt = t * TUNE_WIND_GUST_SPEED;
+  // Two incommensurate bands: a slow whole-field breath plus a faster flutter,
+  // never periodic together. These four rates and the phase constants are the
+  // ones the sway code shipped with — they ARE the look, do not tidy them.
+  s.b1 = vec3f(sin(tt + gp + ph),
+               sin(tt * 0.83 + gp * 1.2 + ph + 2.1) * WIND_GUST_CROSS,
+               sin(tt * 1.31 + gp * 0.7 + ph * 2.3) * WIND_GUST_VERT);
+  s.b2 = vec3f(sin(tt * 1.73 + gp * 0.5 + ph * 3.1),
+               sin(tt * 2.19 + ph * 1.7) * WIND_GUST_CROSS,
+               sin(tt * 2.61 + gp * 0.3 + ph) * WIND_GUST_VERT);
+  return s;
+}
+
+// One band, rotated out of the (along, cross, up) frame into world space and
+// scaled to cells/s.
+fn windBandWS(s : WindSample, b : vec3f) -> vec3f {
+  let xz = s.along * b.x + s.crossw * b.y;
+  return vec3f(xz.x, b.z, xz.y) * s.amp;
+}
+
+// The mean, in world space. Kept separate from the bands for the reason in the
+// WindSample note above.
+fn windMeanWS(s : WindSample) -> vec3f {
+  return vec3f(s.mean.x, 0.0, s.mean.y);
+}
+
+// THE FIELD. Everything above exists so that this and the per-blade path are
+// the same arithmetic. Call this unless you need per-instance decorrelation.
+fn windAt(p : vec3f, t : f32, R : RenderParams) -> vec3f {
+  let s = windSampleAt(p, t, 0.0, R);
+  return windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
+                       + windBandWS(s, s.b2) * WIND_BAND_W2;
+}
+
+// Wind velocity -> foliage bend, in the units TUNE_MICRO_SWAY_AMP is authored
+// in. Dividing by a fixed reference (rather than normalising) is what keeps a
+// retuned windSpeed from throwing blades clean out of their own cell: the bend
+// stays proportional to the wind, and the authored amplitude stays the ceiling
+// it was tuned to be.
+fn windSway(v : vec3f) -> vec2f { return v.xz * (1.0 / WIND_SWAY_REF); }
 
 // ---- particles: voxels in flight (DESIGN.md §5) ----
 // All particle state is fixed-point integer (24.8, 1 voxel = 256): the

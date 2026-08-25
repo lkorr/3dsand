@@ -73,6 +73,14 @@ struct UIState {
   // disagreeing is visible rather than inferred. Off by default and free when
   // off (the draw is skipped at zero boxes).
   bool showCollisionBoxes = false;
+  // Wind slope-field overlay (F4). An arrow per lattice point around the
+  // camera, oriented and coloured by the SAME windAt() the grass sway samples
+  // (docs/RESEARCH_wind.md §4.8) — which is what makes it evidence rather than
+  // decoration. Seeded from wind.dbgWindField on startup and on every tuning
+  // reload, so it is reachable from a saved tuning.json and from headless
+  // screenshot runs, neither of which can press a key. Free when off: the draw
+  // is skipped outright.
+  bool showWindField = false;
   int brushRadius = 4;
   int brushMaterial = 3;     // sand
   bool reloadShaders = false;

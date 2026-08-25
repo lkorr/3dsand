@@ -599,9 +599,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mDebris = mod("debris.wgsl");
   rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
   rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
+  rhi::ShaderModule mDebugWind = mod("debug_wind.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mExplode || !mParticle || !mFluid || !mFluidSeam || !mRay || !mDebris ||
-      !mMicroBody || !mDebugLines) {
+      !mMicroBody || !mDebugLines || !mDebugWind) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -684,6 +685,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
+  debugWindModule_ = mDebugWind;
   targetFormat_ = rhi::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
 }
@@ -1342,6 +1344,31 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.cullMode = rhi::CullMode::None;
     d.depth = dsNone;
     debugBoxDraw_ = device_.CreateRenderPipeline(d);
+
+    // Wind slope-field arrows (docs/RESEARCH_wind.md §4.8). Same module story
+    // as the wireframes — its own file, the SAME pipeline layout, so no new
+    // bind group and (since it reads no storage buffer at all) nothing for
+    // pass_table.def either: that table describes the sim's COMPUTE recording,
+    // and a render draw is not in it.
+    //
+    // Where this differs from the boxes: it is DEPTH TESTED. A collider you
+    // cannot see through a wall is useless because the point is the collider
+    // inside the wall; an arrow field you can see through the ground is
+    // actively misleading, because "is the wind above or below this ridge"
+    // is exactly the question being asked. Writes stay off so arrows do not
+    // occlude each other or the world they annotate.
+    rhi::DepthState dsWind{};
+    dsWind.format = kDepthFormat;
+    dsWind.depthWriteEnabled = false;
+    dsWind.depthCompare = rhi::CompareFunction::GreaterEqual;  // reversed-Z
+
+    d.label = "debugWindDraw";
+    d.vertexModule = debugWindModule_;
+    d.vertexEntry = "vsArrow";
+    d.fragmentModule = debugWindModule_;
+    d.fragmentEntry = "fsArrow";
+    d.depth = dsWind;
+    debugWindDraw_ = device_.CreateRenderPipeline(d);
   }
   {
     // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
@@ -1425,6 +1452,17 @@ void Simulation::DrawDebugBoxes(const rhi::RenderPass& pass,
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // 12 edges x 6 vertices (two triangles per edge quad).
   pass.Draw(72, count);
+}
+
+void Simulation::DrawWindField(const rhi::RenderPass& pass, uint32_t arrows) {
+  if (arrows == 0) return;   // overlay off: costs nothing, not even a bind
+  pass.SetPipeline(debugWindDraw_);
+  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  // 3 segments (shaft + two head barbs) x 6 vertices (two triangles per
+  // segment quad). No vertex or instance buffer: the shader derives its
+  // lattice point from the instance index and R.camPos.
+  pass.Draw(18, arrows);
 }
 
 void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) {

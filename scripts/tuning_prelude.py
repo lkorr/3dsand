@@ -273,7 +273,7 @@ SPEC = [
     ("render", "microLodDist", "TUNE_MICRO_LOD_DIST", "f", 40.0),
     ("render", "microMaxPerRay", "TUNE_MICRO_MAX_PER_RAY", "i", 8),
     ("render", "microSwayAmp", "TUNE_MICRO_SWAY_AMP", "f", 1.5),
-    ("render", "microSwaySpeed", "TUNE_MICRO_SWAY_SPEED", "f", 1.1),
+    ("render", "microSwaySpeed", "TUNE_MICRO_SWAY_SPEED", "f", 1.0),
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
@@ -281,6 +281,14 @@ SPEC = [
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
+
+    # wind: the SHAPE of the field (docs/RESEARCH_wind.md, DESIGN.md 12)
+    ("wind", "gustWavelength", "TUNE_WIND_GUST_WAVELENGTH", "f", 4.8),
+    ("wind", "gustSpeed", "TUNE_WIND_GUST_SPEED", "f", 1.1),
+    ("wind", "altitudeGain", "TUNE_WIND_ALT_GAIN", "f", 0.6),
+    ("wind", "altitudeRefY", "TUNE_WIND_ALT_REF_Y", "f", 64.0),
+    ("wind", "dbgWindSpacing", "TUNE_WIND_DBG_SPACING", "f", 8.0),
+    ("wind", "dbgWindRadius", "TUNE_WIND_DBG_RADIUS", "f", 48.0),
 
     # sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1)
     ("sim", "partGravity", "TUNE_PART_GRAVITY", "i", 22),

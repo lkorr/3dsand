@@ -988,6 +988,63 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadB(*g, "iceMelts", w.iceMelts, out, at);
   }
 
+  // ---- wind (docs/RESEARCH_wind.md; the field itself is common.wgsl) ----
+  if (const json* g = Find(j, "wind")) {
+    auto& w = out.wind;
+    const std::string at = "wind";
+    ReadF(*g, "windSpeed", w.windSpeed, out, at);
+    ReadF(*g, "windDirDeg", w.windDirDeg, out, at);
+    ReadF(*g, "gustStrength", w.gustStrength, out, at);
+    ReadB(*g, "weatherAuto", w.weatherAuto, out, at);
+    ReadF(*g, "gustWavelength", w.gustWavelength, out, at);
+    ReadF(*g, "gustSpeed", w.gustSpeed, out, at);
+    ReadF(*g, "altitudeGain", w.altitudeGain, out, at);
+    ReadF(*g, "altitudeRefY", w.altitudeRefY, out, at);
+    ReadB(*g, "dbgWindField", w.dbgWindField, out, at);
+    ReadF(*g, "dbgWindSpacing", w.dbgWindSpacing, out, at);
+    ReadF(*g, "dbgWindRadius", w.dbgWindRadius, out, at);
+
+    // Clamps, in the order they can bite.
+    //
+    // A zero or negative gust wavelength is an infinite spatial frequency: the
+    // gust phase changes by more than pi between adjacent samples and the
+    // "field" aliases into per-cell noise. The shader has its own guard on
+    // this constant (WIND_GUST_K) because a shader compiled offline never
+    // passes through here at all.
+    if (w.gustWavelength < 0.25f) {
+      out.warnings.push_back("wind.gustWavelength below 0.25 m; clamped "
+                             "(shorter than a cell aliases into noise)");
+      w.gustWavelength = 0.25f;
+    }
+    if (w.windSpeed < 0.0f) {
+      out.warnings.push_back("wind.windSpeed negative; clamped to 0 — reverse "
+                             "the direction with windDirDeg, not the speed");
+      w.windSpeed = 0.0f;
+    }
+    if (w.gustStrength < 0.0f) {
+      out.warnings.push_back("wind.gustStrength negative; clamped to 0");
+      w.gustStrength = 0.0f;
+    }
+    if (w.gustSpeed < 0.0f) {
+      out.warnings.push_back("wind.gustSpeed negative; clamped to 0 (a frozen "
+                             "field, which is a legitimate thing to want)");
+      w.gustSpeed = 0.0f;
+    }
+    // The overlay's cost is cubic in radius/spacing, and the arrow count is
+    // computed identically on the CPU (for the instance count) and in the
+    // vertex shader (for the lattice). Clamping the INPUTS here is what keeps
+    // those two derivations agreeing about a silly value instead of one of
+    // them saturating and the other not.
+    if (w.dbgWindSpacing < 1.0f) {
+      out.warnings.push_back("wind.dbgWindSpacing below 1 voxel; clamped");
+      w.dbgWindSpacing = 1.0f;
+    }
+    if (w.dbgWindRadius < 0.0f) {
+      out.warnings.push_back("wind.dbgWindRadius negative; clamped to 0");
+      w.dbgWindRadius = 0.0f;
+    }
+  }
+
   if (const json* g = Find(j, "render")) {
     auto& r = out.render;
     const std::string at = "render";

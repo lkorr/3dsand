@@ -358,7 +358,7 @@ TP_F(render, gamma, TUNE_GAMMA, 2.2f)
 TP_F(render, microLodDist, TUNE_MICRO_LOD_DIST, 40.0f)
 TP_I(render, microMaxPerRay, TUNE_MICRO_MAX_PER_RAY, 8)
 TP_F(render, microSwayAmp, TUNE_MICRO_SWAY_AMP, 1.5f)
-TP_F(render, microSwaySpeed, TUNE_MICRO_SWAY_SPEED, 1.1f)
+TP_F(render, microSwaySpeed, TUNE_MICRO_SWAY_SPEED, 1.0f)
 TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096)
 TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
 TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
@@ -366,6 +366,21 @@ TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
+
+// ---- wind: the SHAPE of the field (docs/RESEARCH_wind.md, DESIGN.md 12) ----
+// These are the parts of windAt() that are authored once and const-folded into
+// every shader. The parts that EVOLVE (direction, speed, gust amplitude) are
+// not here — they come out of WindWeather() on the CPU and ride RenderParams,
+// because a compile-time constant cannot drift over minutes.
+// Human-unit floats, not sim.* integers: nothing here reaches the CA in phase
+// 1. Phase 4's windAtQ converts them at WGSL const-eval the way sim_fluid.wgsl
+// already does, so the kernel stays integer and the knobs stay in metres.
+TP_F(wind, gustWavelength, TUNE_WIND_GUST_WAVELENGTH, 4.8f)
+TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 1.1f)
+TP_F(wind, altitudeGain, TUNE_WIND_ALT_GAIN, 0.6f)
+TP_F(wind, altitudeRefY, TUNE_WIND_ALT_REF_Y, 64.0f)
+TP_F(wind, dbgWindSpacing, TUNE_WIND_DBG_SPACING, 8.0f)
+TP_F(wind, dbgWindRadius, TUNE_WIND_DBG_RADIUS, 48.0f)
 
 // ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
 TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22)

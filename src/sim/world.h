@@ -981,6 +981,25 @@ struct RenderParams {
   int32_t pad_fb0 = 0;
   int32_t fluidHi[3] = {-1, -1, -1};
   int32_t pad_fb1 = 0;
+
+  // ---- wind (docs/RESEARCH_wind.md §4.2 — must match RenderParams in
+  // common.wgsl) ----
+  // The one part of the wind field that is not a compile-time TUNE_* constant.
+  // Everything else about the field (gust wavelength, gust rate, the altitude
+  // ramp) is authored and const-folded into the shader; the WEATHER VECTOR
+  // evolves chaotically over minutes, so it has to ride a per-frame uniform.
+  //
+  // These are OUTPUTS of WindWeather() (sim/wind.h), which is the only author
+  // of them. That matters because the same function will fill the TickParams
+  // copy in phase 4: if the renderer and the CA ever computed their own
+  // weather, grass and smoke would blow different ways in the same frame.
+  //
+  // Units are world CELLS PER SECOND (m/s x 10 at kVoxelMeters 0.10) — the
+  // conversion from the m/s knobs happens once, on the CPU, in that function.
+  // One whole std140 row: two floats of direction plus two scalars.
+  float windDir[2] = {0.0f, 1.0f};  // unit XZ, pointing DOWNWIND
+  float windSpeed = 0.0f;           // mean speed, cells/s
+  float windGust = 0.0f;            // gust band amplitude, cells/s
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

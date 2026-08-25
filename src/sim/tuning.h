@@ -1166,6 +1166,89 @@ struct Tuning {
     bool iceMelts = true;
   } weather;
 
+  // ---- wind: the ambient field (docs/RESEARCH_wind.md, DESIGN.md §12) ----
+  //
+  // Wind is a PURE FUNCTION of (world position, time) — `windAt` in
+  // common.wgsl. Nothing here is stored per chunk or per voxel, so none of it
+  // is saved, hashed, streamed, or capable of waking a chunk. Read that as the
+  // reason the group is cheap: a knob here changes what a SAMPLE returns, and
+  // the world pays only where something samples.
+  //
+  // The group splits in two, and the split is not cosmetic:
+  //
+  //   * windSpeed / windDirDeg / gustStrength / weatherAuto are CPU-side. They
+  //     feed WindWeather() (sim/wind.h), whose three outputs ride RenderParams
+  //     to the shader each frame. They are here rather than in
+  //     tuning_params.def because a compile-time constant cannot drift over
+  //     minutes, which is exactly what weather has to do.
+  //   * gustWavelength / gustSpeed / altitudeGain / altitudeRefY / dbgWind*
+  //     ARE in tuning_params.def and const-fold into every shader (F5).
+  //
+  // Phase 1 is render-only: the two foliage sway sites and the debug overlay.
+  // The CA does not read wind until phase 4, which is gated behind
+  // sim.windMode and lands in its own rebaseline commit — so nothing in this
+  // group can move the world hash today, and nothing in it is integer-only.
+  struct Wind {
+    // ---- weather (CPU-side; resolved by WindWeather) ----
+    // Typical mean wind speed. Metres per second, converted to cells/s (x10 at
+    // kVoxelMeters 0.10) once, on the CPU. With weatherAuto on this is the
+    // CENTRE the weather varies around (roughly 0.25x..1.75x), not a ceiling.
+    // 6 m/s is a fresh breeze — grass visibly leaning and rippling.
+    float windSpeed = 6.0f;
+    // Direction the wind BLOWS TOWARD, degrees, using the engine's heading
+    // convention: 0 = +Z, increasing toward +X. Ignored while weatherAuto is
+    // on. This is the knob to turn to prove the field is real — arrows and
+    // grass must both swing to follow it.
+    float windDirDeg = 45.0f;
+    // Gust amplitude as a FRACTION of the mean speed, which is how gustiness
+    // actually behaves: a windier day has bigger gusts, not the same gusts on
+    // a faster mean. At 1.0 the wind ranges from roughly still to twice the
+    // mean; at 0 it is a dead steady breeze and the grass just leans.
+    float gustStrength = 1.0f;
+    // Let the weather evolve on its own (deterministic chaos keyed on the
+    // tick — see WindWeather). Off pins direction and speed to the two knobs
+    // above, which is what you want for inspecting the field or comparing
+    // screenshots: an evolving field makes two shots incomparable.
+    bool weatherAuto = true;
+
+    // ---- field shape (mirrored in tuning_params.def as TUNE_WIND_*) ----
+    // Distance between gust crests along the wind, metres. Short wavelengths
+    // read as a rippling meadow; long ones as slow rolling swells. 4.8 m
+    // reproduces the spatial frequency the sway code shipped with.
+    float gustWavelength = 4.8f;
+    // Rate of the gust bands. This is the field's clock, shared by every
+    // consumer — see the note on render.microSwaySpeed, which is now only a
+    // foliage-local trim on top of it.
+    float gustSpeed = 1.1f;
+    // Fractional wind speed-up per 100 world voxels (10 m) above altitudeRefY.
+    // SIGNED both ways: below the reference the boundary layer slows the wind,
+    // which is why a valley floor is calmer than the ridge above it. Clamped
+    // in the shader to [0.15x, 4x] so a silly value is still a look.
+    float altitudeGain = 0.6f;
+    // World Y the altitude ramp is measured from. 64 sits mid-terrain
+    // (worldgen's band is y32..y86), so ridges get a gain and basins a loss.
+    // Absolute Y rather than terrain-relative on purpose: terrain-relative
+    // needs a height query at every sample point, and absolute is what makes
+    // the field a pure function of position (research doc §8).
+    float altitudeRefY = 64.0f;
+
+    // ---- debug slope-field overlay (research doc §4.8) ----
+    // Initial state of the arrow overlay; F4 toggles it in-game. It is a
+    // tuning knob as well as a key so the field can be inspected from a saved
+    // tuning.json and from a headless screenshot run, neither of which can
+    // press a key. Costs exactly nothing when off — the draw is skipped, not
+    // drawn transparent.
+    bool dbgWindField = false;
+    // Spacing between arrow lattice points, world voxels. The lattice is
+    // snapped to this grid in WORLD space, so the arrows stay put as the
+    // camera moves instead of swimming with it.
+    float dbgWindSpacing = 8.0f;
+    // Radius of the arrow lattice around the camera, world voxels. Cost is
+    // cubic in radius/spacing, so this is the knob that decides whether the
+    // overlay is free or not: the default 48/8 is 13^3 = 2197 arrows.
+    float dbgWindRadius = 48.0f;
+  } wind;
+
   // ---- render: everything below is emitted as WGSL and F5-reloadable ----
   struct Render {
     // sky / sun
@@ -1623,9 +1706,15 @@ struct Tuning {
     // cell walls, and anything past that shears blade tips through the wall
     // where the nested DDA never marches them — they vanish, not clip.
     float microSwayAmp = 1.5f;
-    // Base wind frequency in rad/s. The shader derives its second flutter
-    // band from this (x1.73), so one knob moves the whole gait of the field.
-    float microSwaySpeed = 1.1f;
+    // FOLIAGE-LOCAL trim on the wind clock, applied on top of wind.gustSpeed.
+    // It used to be the band rate outright; since the wind rewrite the field
+    // itself owns that (windAt in common.wgsl, wind.gustSpeed), and this is a
+    // multiplier the two sway sites apply to the time they hand it. Default is
+    // 1.0 for a reason: at anything else, grass samples the field at a
+    // different phase than the debug arrow overlay draws, so the overlay stops
+    // being evidence about the grass. Move wind.gustSpeed instead unless you
+    // specifically want foliage running off the shared clock.
+    float microSwaySpeed = 1.0f;
 
     // budgets
     int primarySteps = 4096;
