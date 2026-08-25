@@ -148,6 +148,12 @@ const SEAM_WAKE4 : i32 =
     i32(round(TUNE_FLUID_WAKE_SPEED * 65536.0 / 30.0)) >> 4u;
 const SEAM_WAKE2 : i32 = (SEAM_WAKE4 * SEAM_WAKE4) >> 8u;
 const SEAM_CALM_TICKS : u32 = u32(clamp(TUNE_FLUID_SETTLE_TICKS, 8, 600));
+// The burst bound, in particles. See the block in exciteScan for the
+// measurement that sized them, and tuning.h for what each one means.
+const SEAM_EX_CEILING : u32 = u32(clamp(TUNE_FLUID_EXCITE_CEILING, 256, 262144));
+const SEAM_EX_RATE : u32 = u32(clamp(TUNE_FLUID_EXCITE_RATE, 64, 262144));
+// Excite's perch trigger, on the EXCITE side only (see exciteDetect).
+const SEAM_EX_PERCH : bool = TUNE_FLUID_EXCITE_PERCH != 0;
 
 // ---- the free-surface gravity bias, and why every speed test removes it ----
 // A weakly-compressible MPM free surface is NEVER at rest. Pressure comes from
@@ -288,6 +294,8 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_CLAMPED], 0u);
     atomicStore(&fluidArgs[FA_SETREFUSED], 0u);
     atomicStore(&fluidArgs[FA_SETUNSTABLE], 0u);
+    atomicStore(&fluidArgs[FA_EXSEEN], 0u);
+    atomicStore(&fluidArgs[FA_EXCANDID], 0u);
   }
   workgroupBarrier();
   var base = wgScan[li];
@@ -359,6 +367,13 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
 // Is this material a seam-eligible liquid? Non-viscous CLASS_LIQUID only:
 // lava/blood keep their authored CA movement (moveEvery > 1) until the fluid
 // gains per-material dynamics (plan Phase 7).
+//
+// NOT an ownership predicate, and the distinction matters now that the hybrid
+// is ratified (RESEARCH_water_architecture.md §7): ownership is by STATE, not
+// by material. The CA moves water that is SETTLED, the solver moves water that
+// is EXCITED, and a cell is in exactly one of those two representations at a
+// time — which is what makes two movers safe. This only says which materials
+// the seam is allowed to convert at all.
 fn seamLiquid(mat : u32) -> bool {
   if (mat == MAT_AIR) { return false; }
   let m = materials[mat];
@@ -504,6 +519,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     let w = voxels[idx];
     let mat = voxMat(w);
     if (!seamLiquid(mat)) { continue; }
+    atomicAdd(&fluidArgs[FA_EXSEEN], 1u);   // reach probe, see common.wgsl
 
     // Trigger (a), gated by the tick input stream: the cell would FALL — air
     // below. This is the disturbance trigger (carve, explosion, mutation);
@@ -526,12 +542,22 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       // where the cell rests on TERRAIN with a lateral void beside it.
       // Out-of-window below is solid and inert (the residency rule), so it is
       // a base.
+      //
+      // SEAM_EX_PERCH gates THIS SIDE ONLY. Since the CA's four liquid defects
+      // were fixed (merge a2e723e: partial descent, corner diagonals, the
+      // riser step) the CA drains a perched column by itself, so the perch
+      // trigger may now be redundant work — see the block in exciteScan for
+      // the A/B that decided it. settleCheck's stability veto keeps evaluating
+      // the FULL predicate no matter what this is set to, and that asymmetry
+      // is deliberate: settle refusing MORE than excite takes is safe (water
+      // stays particles a while longer), the reverse would let settle create a
+      // configuration excite immediately tears up again.
       var onBase = true;
       let bw = c + vec3<i32>(0, -1, 0);
       if (inWindow(bw, T.origin)) {
         onBase = !seamLiquid(voxMat(voxWordAt(bw)));
       }
-      if (!excite && onBase) {
+      if (!excite && onBase && SEAM_EX_PERCH) {
         for (var d = 0u; d < 4u; d++) {
           let n = c + seamLateral(d);
           if (seamLateralExcite(seamNeighbourState(n),
@@ -575,6 +601,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
     if (!excite) { continue; }
+    atomicAdd(&fluidArgs[FA_EXCANDID], 1u);
 
     // Depth to the free surface: contiguous same-liquid cells above, capped
     // at the 4-bit field. Computed HERE, against pre-write state — emit runs
@@ -630,7 +657,39 @@ fn exciteScan(@builtin(local_invocation_index) li : u32) {
   if (li == 0u) {
     let liveNow = atomicLoad(&exciteScratch[EX_COMPACT_LIVE]) +
                   min(T.fluidSpawnCount, FLUID_CAP);
-    exBudget = FLUID_CAP - min(liveNow, FLUID_CAP);
+    // ---- THE BURST BOUND (WP5) ------------------------------------------
+    // Two limits, both on EXCITE only. Explicit spawns are already in
+    // `liveNow` and are never refused here: the mpm tool and the lab pours
+    // must keep working next to a lake, and a shared budget would make the
+    // tool stop responding wherever there happens to be water.
+    //
+    //   * SEAM_EX_CEILING — the standing size of the excited region. Before
+    //     this existed the only bound was the pool, and the pool is ~6x the
+    //     playable particle count. Measured on the `worldlake` bench scene
+    //     (worldgen's authored 347,832-voxel lake, 5x5 shaft opened
+    //     underneath a body that is provably asleep first), on the FIXED CA,
+    //     with the ceiling lifted to the pool: 352 -> 1,916 -> ... ->
+    //     262,144 live, the ENTIRE pool, held there at ~70 ms/frame for the
+    //     rest of the run. That is the reported "it turns the whole lake into
+    //     fluid", and fixing the CA did not remove it — see tuning.h for why
+    //     (a draining CA leaves a transient gap under cells all over the
+    //     body, and trigger (a) is "air below").
+    //   * SEAM_EX_RATE — how fast it may get there, so the conversion ramps
+    //     over many ticks instead of landing on one frame, and settle gets
+    //     ticks in which to interleave.
+    //
+    // REFUSAL IS GRACEFUL, and that is a property of the ratified hybrid
+    // rather than of this code: refused water is still SETTLED water, and the
+    // CA moves settled water. So the bound degrades a drain's look, never its
+    // progress — at ceiling 4,000 the worldlake puncture refused 2,090 slots
+    // and still delivered 73,672 eighths to the chamber, 71,479 of them as
+    // settled voxels, against 70,743 for the CA with no seam at all. A
+    // refused slot also keeps its scratch bits and retries next tick.
+    //
+    // It stays deterministic for the reason the pool budget already was —
+    // acceptance is a monotone cutoff in SLOT order, never in arrival order.
+    let ceiling = min(SEAM_EX_CEILING, FLUID_CAP);
+    exBudget = min(ceiling - min(liveNow, ceiling), SEAM_EX_RATE);
     var listSum = 0u;
     var partSum = 0u;
     exCrossSerial = 256u;

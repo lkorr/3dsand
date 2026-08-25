@@ -333,6 +333,9 @@ SPEC = [
 
     # MLS-MPM settle / excite seam
     ("sim", "fluidExciteMode", "TUNE_FLUID_EXCITE_MODE", "i", 0),
+    ("sim", "fluidExciteCeiling", "TUNE_FLUID_EXCITE_CEILING", "i", 8000),
+    ("sim", "fluidExciteRate", "TUNE_FLUID_EXCITE_RATE", "i", 4096),
+    ("sim", "fluidExcitePerch", "TUNE_FLUID_EXCITE_PERCH", "i", 0),
     ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 6.0),
     ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
     ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),

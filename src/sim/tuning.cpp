@@ -700,6 +700,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidSprayDensity", s.fluidSprayDensity, out, at);
     ReadI(*g, "fluidFoamScaleIdx", s.fluidFoamScaleIdx, out, at);
     ReadI(*g, "fluidExciteMode", s.fluidExciteMode, out, at);
+    ReadI(*g, "fluidExciteCeiling", s.fluidExciteCeiling, out, at);
+    ReadI(*g, "fluidExciteRate", s.fluidExciteRate, out, at);
+    ReadI(*g, "fluidExcitePerch", s.fluidExcitePerch, out, at);
     ReadF(*g, "fluidSettleEps", s.fluidSettleEps, out, at);
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
     ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
@@ -796,6 +799,23 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (s.fluidExciteMode < 0 || s.fluidExciteMode > 1) {
       out.warnings.push_back("sim.fluidExciteMode out of 0..1; clamped");
       s.fluidExciteMode = s.fluidExciteMode < 0 ? 0 : 1;
+    }
+    // The burst bound. 256 is the floor rather than 0 because a ceiling of
+    // zero would silently turn excite off entirely — that is what
+    // fluidExciteMode is for, and two ways to spell "off" is one too many.
+    // The upper bound is the pool: a ceiling above kFluidCap is not a bound.
+    if (s.fluidExciteCeiling < 256 || s.fluidExciteCeiling > 262144) {
+      out.warnings.push_back("sim.fluidExciteCeiling out of 256..262144; "
+                             "clamped");
+      s.fluidExciteCeiling = s.fluidExciteCeiling < 256 ? 256 : 262144;
+    }
+    if (s.fluidExciteRate < 64 || s.fluidExciteRate > 262144) {
+      out.warnings.push_back("sim.fluidExciteRate out of 64..262144; clamped");
+      s.fluidExciteRate = s.fluidExciteRate < 64 ? 64 : 262144;
+    }
+    if (s.fluidExcitePerch < 0 || s.fluidExcitePerch > 1) {
+      out.warnings.push_back("sim.fluidExcitePerch out of 0..1; clamped");
+      s.fluidExcitePerch = s.fluidExcitePerch < 0 ? 0 : 1;
     }
     clampWarnF(s.fluidSettleEps, 0.05f, 20.0f, "fluidSettleEps");
     clampWarnF(s.fluidWakeSpeed, 0.1f, 50.0f, "fluidWakeSpeed");

@@ -565,15 +565,122 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     int excite;         // sim.fluidExciteMode for the run
     std::string tag;    // scene name, "hill0" (excite-0 A/B), "pool-settle"
     bool settleTuning = false;  // the fluid-excite gate's settle overrides
+    int ceiling = 0;    // sim.fluidExciteCeiling override (0 = shipped value)
+    int radius = 0;     // pond disc radius (0 = shipped value)
+    int perch = -1;     // sim.fluidExcitePerch override (-1 = shipped value)
   };
   std::vector<BenchRun> runs;
-  // `pond<N>` overrides the disc radius for the maximum-drainable-body sweep
-  // (plan §8's third instrumentation deliverable). The radius is scene state,
-  // not run state, so a sweep is one bench invocation per size.
-  if (sceneArg.rfind("pond", 0) == 0 && sceneArg.size() > 4 &&
-      std::isdigit((unsigned char)sceneArg[4])) {
-    LabSetPondRadius(std::atoi(sceneArg.c_str() + 4));
-    runs.push_back({kLabPond, 1, sceneArg});
+  // ---- the two WP5 sweeps ------------------------------------------------
+  // `pond<R>` sets the disc radius; `pond<R>-ceil<C>` also overrides
+  // sim.fluidExciteCeiling for that run (through the F5 reload path, since it
+  // is a compiled-in const). Together they answer the two questions the plan
+  // asks and one it does not:
+  //   * ceil sweep  — what does the burst bound cost, and where should it sit?
+  //   * radius sweep — the "maximum drainable body size". With a ceiling in
+  //     place the honest answer turns out not to be a size at all: frame cost
+  //     is flat in body size and what scales is drain TIME. The sweep is what
+  //     shows that, so it stays in the harness rather than in a paragraph.
+  // `<scene>-ceil<N>` works for ANY scene, not just the ponds: the ceiling is
+  // a shared resource with explicit pours, so a scene that spawns 39,600
+  // particles of its own leaves excite no headroom, and telling "the seam
+  // refused this water" apart from "the solver cannot move this water" needs
+  // the same scene run with the bound lifted.
+  // `-ex<0|1>` and `-perch<0|1>` join `-ceil<N>` as run suffixes, in any order
+  // and any combination: `pond68-ex0` is the CA-only reference arm and
+  // `pond68-perch0` is the trigger A/B's second arm, so a whole comparison is
+  // ONE binary invocation. Suffixes are the only per-run tuning the bench has,
+  // and they all go through the F5 reload path because sim.fluid* are WGSL
+  // compile-time consts.
+  auto parseRun = [&](const std::string& a, BenchRun& r) -> bool {
+    const size_t dash = a.find('-');
+    const std::string head = a.substr(0, dash);
+    int ceil = 0, perch = -1, ex = -1;
+    bool anySuffix = false;
+    for (size_t p = dash; p != std::string::npos; ) {
+      const size_t next = a.find('-', p + 1);
+      const std::string sfx = a.substr(p + 1, next == std::string::npos
+                                                  ? std::string::npos
+                                                  : next - p - 1);
+      if (sfx.rfind("ceil", 0) == 0) ceil = std::atoi(sfx.c_str() + 4);
+      else if (sfx.rfind("perch", 0) == 0) perch = std::atoi(sfx.c_str() + 5);
+      else if (sfx.rfind("ex", 0) == 0) ex = std::atoi(sfx.c_str() + 2);
+      else return false;
+      anySuffix = true;
+      p = next;
+    }
+    if (head.rfind("pond", 0) == 0) {
+      const std::string rad = head.substr(4);
+      if (!rad.empty() && !std::isdigit((unsigned char)rad[0])) return false;
+      r = {kLabPond, ex < 0 ? 1 : ex, a, false, ceil,
+           rad.empty() ? 0 : std::atoi(rad.c_str()), perch};
+      return true;
+    }
+    if (!anySuffix) return false;                  // plain name: normal path
+    const int s = head == "hill0" ? kLabHill : LabSceneFromName(head);
+    if (s < 0) return false;
+    const int base = head == "hill0" ? 0 : 1;
+    r = {s, ex < 0 ? base : ex, a, false, ceil, 0, perch};
+    return true;
+  };
+  BenchRun pondRun{};
+  if (sceneArg == "wp5") {
+    // The re-scoped WP5's whole decision set, on worldgen's SMALLEST real pond
+    // (r=68, 203,298 water voxels = 6.4x the particle pool), in one
+    // invocation. Order matters only for the reader:
+    //   ex0        — the CA alone, with its four defects fixed (merge a2e723e).
+    //                The reference every other arm is judged against.
+    //   ceil262144 — excite on, bound lifted to the pool. Reproduces the
+    //                reported "it turns the whole lake into fluid".
+    //   perch1 / perch0 — excite on, bounded, with and without the perch
+    //                trigger. This is the open design question: does a FIXED
+    //                CA still need excite to unstick perched water?
+    // `worldlake` repeats the first three on the REAL worldgen against its
+    // authored 347,832-voxel lake, because that is the scene the reported bug
+    // was measured on. `hill` carries the trigger A/B's other half: the pond
+    // is a flat body and the perch trigger was designed for a stepped ramp, so
+    // a pond that does not need it proves nothing on its own.
+    //
+    // Ordered so the compiled-in fluid consts change as few times as possible
+    // — each change is a full Tint recompile.
+    runs.push_back({kLabPond, 0, "pond68-ex0", false, 0, 68, -1});
+    runs.push_back({kLabWorldLake, 0, "worldlake-ex0", false, 0, 0, -1});
+    runs.push_back({kLabPond, 1, "pond68-perch1", false, 0, 68, 1});
+    runs.push_back({kLabWorldLake, 1, "worldlake-perch1", false, 0, 0, 1});
+    runs.push_back({kLabHill, 1, "hill-perch1", false, 0, 0, 1});
+    runs.push_back({kLabPond, 1, "pond68-perch0", false, 0, 68, 0});
+    runs.push_back({kLabWorldLake, 1, "worldlake-perch0", false, 0, 0, 0});
+    runs.push_back({kLabHill, 1, "hill-perch0", false, 0, 0, 0});
+    runs.push_back({kLabPond, 1, "pond68-ceil262144", false, 262144, 68, -1});
+    runs.push_back({kLabWorldLake, 1, "worldlake-ceil262144", false, 262144, 0,
+                    -1});
+  } else if (sceneArg == "wp5b") {
+    // Follow-up to `wp5`, and both halves exist because the first sweep came
+    // back CONFOUNDED in one place and UNDER-SAMPLED in another.
+    //
+    // The ceiling sweep, on `worldlake` rather than the pond: the pond never
+    // reaches the bound at all (0 slots refused even with the ceiling lifted
+    // to the whole pool), so it cannot price it. worldlake can — it saturates
+    // the pool without one.
+    //
+    // The hill arms carry ceil262144 because at the shipped 32,000 the hill
+    // pours 39,600 particles of its own and excite's budget is therefore
+    // exactly zero: `wp5` measured 6,161 vs 4,051 candidates and 0 vs 0
+    // emitted, which says nothing about the trigger. Lifting the ceiling is
+    // what makes the ramp arm a real A/B.
+    for (int c : {4000, 8000, 16000})
+      runs.push_back({kLabWorldLake, 1, "worldlake-ceil" + std::to_string(c),
+                      false, c, 0, -1});
+    runs.push_back({kLabHill, 1, "hill-ceil262144-perch1", false, 262144, 0, 1});
+    runs.push_back({kLabHill, 1, "hill-ceil262144-perch0", false, 262144, 0, 0});
+  } else if (sceneArg == "pondsweep") {
+    // One invocation, both sweeps, on a body that is already 4.5x the pool.
+    for (int c : {10000, 20000, 40000, 80000})
+      runs.push_back({kLabPond, 1, "pond24-ceil" + std::to_string(c), false, c,
+                      24});
+    for (int r : {16, 32, 48, 68})
+      runs.push_back({kLabPond, 1, "pond" + std::to_string(r), false, 0, r});
+  } else if (sceneArg != "pond" && parseRun(sceneArg, pondRun)) {
+    runs.push_back(pondRun);
   } else if (sceneArg.empty() || sceneArg == "all") {
     for (int s = 0; s < kLabSceneCount; s++) {
       runs.push_back({s, 1, LabSceneName(s)});
@@ -597,7 +704,9 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     if (s < 0) {
       std::fprintf(stderr,
                    "--fluid-bench: unknown scene '%s' (want basin|hill|hill0|"
-                   "faucet|pool|slosh|pond[N]|worldlake|pours|all)\n",
+                   "faucet|pool|slosh|pond[N]|worldlake|pours|all|wp5|"
+                   "pondsweep; any of these may carry -ceil<N> -perch<0|1> "
+                   "-ex<0|1>)\n",
                    sceneArg.c_str());
       return 1;
     }
@@ -642,6 +751,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
   for (size_t ri = 0; ri < runs.size(); ri++) {
     const BenchRun& run = runs[ri];
     const int scene = run.scene;
+    // BEFORE anything asks the scene how big it is: the pond's build volume,
+    // plug tick and run length are all derived from the radius, so a sweep
+    // that set it later would run each size on the previous size's schedule.
+    if (run.radius) LabSetPondRadius(run.radius);
     const uint32_t N = LabSceneBenchTicks(scene);
     const uint32_t pourEnd = LabScenePourEnd(scene);
 
@@ -670,11 +783,19 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // (the at-rest speed floor scales with gravity, and the owner's is 900),
       // so this run differs from stock by ONE knob — the sealed-box damping.
       if (run.settleTuning) t.sim.fluidDamping = 0.9f;
+      if (run.ceiling) t.sim.fluidExciteCeiling = run.ceiling;
+      if (run.perch >= 0) t.sim.fluidExcitePerch = run.perch;
+      if (run.radius) LabSetPondRadius(run.radius);
       SetCurrentTuning(t);
       // Recompile only when the compiled-in fluid consts actually change: a
       // reload is seconds of Tint, and every other run wants stock tuning.
       static bool shadersSettleTuned = false;
-      if (run.settleTuning != shadersSettleTuned) {
+      static int shadersCeiling = 0;
+      static int shadersPerch = -1;
+      if (run.settleTuning != shadersSettleTuned ||
+          run.ceiling != shadersCeiling || run.perch != shadersPerch) {
+        shadersCeiling = run.ceiling;
+        shadersPerch = run.perch;
         if (!sim.ReloadShaders(ctx.device)) {
           std::fprintf(stderr, "--fluid-bench: shader reload FAILED\n");
           return 1;
@@ -722,6 +843,22 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       return x >= basinLo.x && x <= basinHi.x && y >= basinLo.y &&
              y <= basinHi.y && z >= basinLo.z && z <= basinHi.z;
     };
+    // DRAIN COMPLETION, and it is the acceptance criterion the frame
+    // percentiles cannot express: how much of the body has actually reached
+    // the sealed chamber. A drain that is in budget because nothing is moving
+    // is not a drain. Counted as a subtotal of the same sweep — the chamber is
+    // inside the audit box already (LabSceneBounds reaches kPondChamberLo).
+    const bool hasChamber = scene == kLabPond || scene == kLabWorldLake;
+    const int chCx = scene == kLabPond ? CX : kLakeCX;
+    const int chCz = scene == kLabPond ? CZ : kLakeCZ;
+    const int chLo = scene == kLabPond ? kPondChamberLo : kLakeChamberLo;
+    const int chHi = scene == kLabPond ? kPondChamberTop : kLakeChamberTop;
+    auto inChamber = [&](int x, int y, int z) {
+      return y >= chLo && y <= chHi && x >= chCx - kChamberHalf &&
+             x <= chCx + kChamberHalf && z >= chCz - kChamberHalf &&
+             z <= chCz + kChamberHalf;
+    };
+    uint64_t chamberEighths = 0;
     auto sweepStanding = [&](uint64_t* basinOut) -> uint64_t {
       IVec3 lo, hi;
       LabSceneBounds(scene, lo, hi);
@@ -749,6 +886,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
                 const uint64_t e = ((cbuf[i] >> 12) & 0xFu) + 1u;
                 total += e;
                 if (basinOut && hasBasin && inBasin(x, y, z)) *basinOut += e;
+                if (hasChamber && inChamber(x, y, z)) chamberEighths += e;
               }
             }
           }
@@ -767,10 +905,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     std::map<std::string, uint64_t> prevNs;
     std::map<std::string, std::vector<double>> passMs;
     std::vector<uint32_t> liveCurve, blockCurve, clampCurve;
+    std::vector<uint32_t> seenCurve, candidCurve;
     uint64_t poured = 0, settledSum = 0, excitedSum = 0, deadSum = 0,
              binnedSum = 0, consumedSum = 0, emittedSum = 0, refusedSum = 0,
              setRefusedSum = 0, setUnstableSum = 0, setBlocksSum = 0,
-             clampedSum = 0;
+             clampedSum = 0, exSeenSum = 0, exCandidSum = 0;
     int tickOfSettle = -1;
     double idleFluidMs = -1.0;
     uint32_t idleFluidTicks = 0;
@@ -853,6 +992,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       emittedSum += fa[9];
       refusedSum += fa[12];
       setBlocksSum += fa[13];     // FA_SETBLOCKS: blocks the scan picked
+      seenCurve.push_back(fa[27]);
+      candidCurve.push_back(fa[28]);
+      exSeenSum += fa[27];        // FA_EXSEEN: settled liquid cells detect saw
+      exCandidSum += fa[28];      // FA_EXCANDID: of those, trigger-satisfying
       setRefusedSum += fa[25];    // FA_SETREFUSED: of those, infeasible
       setUnstableSum += fa[26];   // FA_SETUNSTABLE: of those, excite-unstable
       if (tickOfSettle < 0 && pourEnd != ~0u && st > pourEnd + 2 &&
@@ -919,6 +1062,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // freeze shows up directly as capture loss.
     uint64_t basinEighths = 0;
     uint64_t carriedEighths = 0;
+    // Excited water inside the chamber counts as drained too: at the moment
+    // the run stops, a particle three cells above the chamber floor has
+    // arrived by every meaning that matters, and whether it has settled yet is
+    // a settleTicks artifact rather than drain progress.
+    uint64_t chamberCarried = 0;
     if (liveEst > 0) {
       std::vector<uint32_t> pbuf((size_t)liveEst * kFluidParticleWords);
       rhi::ReadbackBlocking(ctx.device, ctx.queue,
@@ -928,11 +1076,13 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         const uint32_t* pw = pbuf.data() + (size_t)k * kFluidParticleWords;
         const uint32_t f = (pw[18] >> 12) & 0x7u;
         carriedEighths += f;
-        if (hasBasin && inBasin((int32_t)pw[0] >> 16, (int32_t)pw[1] >> 16,
-                                (int32_t)pw[2] >> 16))
-          basinEighths += f;
+        const int px = (int32_t)pw[0] >> 16, py = (int32_t)pw[1] >> 16,
+                  pz = (int32_t)pw[2] >> 16;
+        if (hasBasin && inBasin(px, py, pz)) basinEighths += f;
+        if (hasChamber && inChamber(px, py, pz)) chamberCarried += f;
       }
     }
+    chamberEighths = 0;   // the plug-tick sweep also ran through this counter
     const uint64_t standingEighths = sweepStanding(&basinEighths);
     // The pond scenes' ledger input is the body measured at the plug tick, not
     // a spawn count — they pour nothing.
@@ -1001,14 +1151,44 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // Frame percentiles over the DRAIN WINDOW only: the build ticks (tens of
       // thousands of CellOps each) and the idle settle window would otherwise
       // dominate a whole-run p50 and hide the thing being measured.
+      //
+      // And the IDLE window beside it, which is the counterfactual the drain
+      // number is meaningless without: the same camera, the same world, the
+      // same body of water — with it asleep. Everything above that line is
+      // what the fluid costs; everything under it is this scene's floor and no
+      // amount of seam work can touch it.
       if (frameMs.size() > plugTick) {
-        std::vector<double> drain(frameMs.begin() + (size_t)plugTick - 1,
+        const size_t buildEnd = (size_t)LabSceneBuildEndTick(scene);
+        std::vector<double> idle(frameMs.begin() + (ptrdiff_t)buildEnd,
+                                 frameMs.begin() + (ptrdiff_t)plugTick - 1);
+        std::vector<double> drain(frameMs.begin() + (ptrdiff_t)plugTick - 1,
                                   frameMs.end());
+        if (!idle.empty())
+          std::printf("    idle window frame ms:  p50 %.2f p95 %.2f "
+                      "(body asleep, same camera — the scene's floor)\n",
+                      Pct(idle, 0.50), Pct(idle, 0.95));
         std::printf("    drain window frame ms: p50 %.2f p95 %.2f p99 %.2f "
                     "max %.2f over %u ticks\n",
                     Pct(drain, 0.50), Pct(drain, 0.95), Pct(drain, 0.99),
                     *std::max_element(drain.begin(), drain.end()),
                     (unsigned)drain.size());
+      }
+      // DRAIN COMPLETION. Frame percentiles alone cannot tell "in budget
+      // because the drain is cheap" from "in budget because nothing moved":
+      // this is how much of the body has reached the sealed chamber by
+      // end-of-run, settled voxels plus particles already inside it.
+      if (hasChamber) {
+        const uint64_t arrived = chamberEighths + chamberCarried;
+        std::printf("    drain completion: %llu of %llu eighths in the chamber "
+                    "(%.2f%% of the body) = %llu settled + %llu still "
+                    "particles, over %u ticks after the plug\n",
+                    (unsigned long long)arrived,
+                    (unsigned long long)plugStanding,
+                    plugStanding ? 100.0 * (double)arrived /
+                                       (double)plugStanding
+                                 : 0.0,
+                    (unsigned long long)chamberEighths,
+                    (unsigned long long)chamberCarried, N - plugTick);
       }
     }
     // The CFL-honesty probe (plan §5 item 1): node-substeps the VMAX clamp
@@ -1024,6 +1204,54 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         (unsigned)std::count_if(clampCurve.begin(), clampCurve.end(),
                                 [](uint32_t c) { return c != 0; }),
         (unsigned)clampCurve.size());
+    // ---- THE DRAIN COLUMN (WP5) -------------------------------------------
+    // What the plug column actually looks like at end of run, bottom to top,
+    // as a run-length string: '.' air, '~' water (with its fullness digit),
+    // '#' anything solid. The reach probe says WHY nothing excited; this says
+    // WHAT the world looks like, and between them there is no room left to
+    // guess. Two columns: the one directly over the drain, and one 8 voxels
+    // out, which is where a lateral trigger would have to act.
+    if (plugTick != 0) {
+      const int cx = scene == kLabPond ? CX : kLakeCX;
+      const int cz = scene == kLabPond ? CZ : kLakeCZ;
+      IVec3 blo, bhi;
+      LabSceneBounds(scene, blo, bhi);
+      std::vector<uint32_t> cbuf((size_t)kChunkVol);
+      for (int probe = 0; probe < 2; probe++) {
+        const int px = cx + (probe ? 8 : 0);
+        std::string col;
+        int lastCy = INT32_MIN;
+        for (int y = blo.y; y <= bhi.y; y++) {
+          const int cy = y / 16;
+          if (cy != lastCy) {
+            ReadVoxelsSync(ctx, world,
+                           World::SlotChunkIndex({px / 16, cy, cz / 16}), 1,
+                           cbuf.data(), "benchCol");
+            lastCy = cy;
+          }
+          const uint32_t w =
+              cbuf[(size_t)(y % 16) * 16 + (size_t)(px % 16) +
+                   (size_t)(cz % 16) * 256];
+          const uint32_t m = w & 0xFFFu;
+          if (m == 0) col += '.';
+          else if (m == waterId) col += (char)('1' + ((w >> 12) & 0xFu));
+          else col += '#';
+        }
+        std::printf("    drain column x%+d (y %d..%d, bottom first): %s\n",
+                    probe ? 8 : 0, blo.y, bhi.y, col.c_str());
+      }
+    }
+    // The excite REACH probe (WP5). Deleting CA liquid movement made the seam
+    // the only thing that can move water, so "the pond did not drain" now has
+    // three causes that look identical from the outside and are fixed in three
+    // different places: the chunk never woke (seen == 0), no trigger matched
+    // (seen high, candidates 0), or the burst bound refused it (candidates
+    // high, refused high).
+    std::printf("    excite reach: cells seen %llu -> candidates %llu -> "
+                "emitted %llu eighths | slots refused %llu\n",
+                (unsigned long long)exSeenSum, (unsigned long long)exCandidSum,
+                (unsigned long long)excitedSum,
+                (unsigned long long)refusedSum);
     // The SEAM FLOW (WP3). "nothing settled" has two opposite causes and this
     // line separates them: `picked 0` means the water never went calm, while
     // `picked N refused N` means it did and settleCheck turned it down (an
@@ -1112,6 +1340,14 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
            << ", \"p95\": " << Pct(v, 0.95) << "}";
     }
     json << "},\n";
+    json << "    \"exciteReach\": {\"cellsSeen\": " << exSeenSum
+         << ", \"candidates\": " << exCandidSum << ", \"seenCurve\": [";
+    for (size_t i = 0; i < seenCurve.size(); i++)
+      json << (i ? "," : "") << seenCurve[i];
+    json << "], \"candidCurve\": [";
+    for (size_t i = 0; i < candidCurve.size(); i++)
+      json << (i ? "," : "") << candidCurve[i];
+    json << "]},\n";
     json << "    \"tickOfSettle\": " << tickOfSettle << ",\n";
     json << "    \"clampEngagements\": {\"total\": " << clampedSum
          << ", \"perTickMax\": "
@@ -1128,9 +1364,23 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
           frameMs.begin() +
               (size_t)std::min<uint32_t>(plugTick - 1, (uint32_t)frameMs.size()),
           frameMs.end());
-      json << "    \"burst\": {\"plugTick\": " << plugTick
+      std::vector<double> idleW(
+          frameMs.begin() + (ptrdiff_t)std::min<size_t>(
+                                LabSceneBuildEndTick(scene), frameMs.size()),
+          frameMs.begin() + (ptrdiff_t)std::min<size_t>(plugTick - 1,
+                                                        frameMs.size()));
+      json << "    \"idleFrameMs\": {\"p50\": " << Pct(idleW, 0.50)
+           << ", \"p95\": " << Pct(idleW, 0.95) << "},\n";
+      json << "    \"burst\": {\"exciteCeiling\": "
+           << CurrentTuning().sim.fluidExciteCeiling
+           << ", \"exciteRate\": " << CurrentTuning().sim.fluidExciteRate
+           << ", \"excitePerch\": " << CurrentTuning().sim.fluidExcitePerch
+           << ", \"exciteMode\": " << run.excite
+           << ", \"plugTick\": " << plugTick
            << ", \"bodyEighths\": " << plugStanding
            << ", \"pondRadius\": " << (scene == kLabPond ? sPondRadius : 0)
+           << ", \"chamberEighths\": " << chamberEighths
+           << ", \"chamberCarried\": " << chamberCarried
            << ", \"idleTicksBeforePlug\": " << idleTicksBeforePlug
            << ", \"liveAtPlug\": " << liveAtPlug
            << ", \"liveAtPlugPlus1\": " << liveAtPlugPlus1
