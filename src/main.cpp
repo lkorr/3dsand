@@ -1979,6 +1979,8 @@ int main(int argc, char** argv) {
     ui.fSprayDensity     = fs.fluidSprayDensity;
     ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
     ui.fExciteMode       = fs.fluidExciteMode;
+    ui.windGasScale      = fs.windGasScale;
+    ui.windPartScale     = fs.windPartScale;
     ui.fSettleEps        = fs.fluidSettleEps;
     ui.fWakeSpeed        = fs.fluidWakeSpeed;
     ui.fSettleTicks      = fs.fluidSettleTicks;
@@ -2567,6 +2569,8 @@ int main(int argc, char** argv) {
           ui.fSprayDensity     = fs.fluidSprayDensity;
           ui.fFoamScaleIdx     = fs.fluidFoamScaleIdx;
           ui.fExciteMode       = fs.fluidExciteMode;
+          ui.windGasScale      = fs.windGasScale;
+          ui.windPartScale     = fs.windPartScale;
           ui.fSettleEps        = fs.fluidSettleEps;
           ui.fWakeSpeed        = fs.fluidWakeSpeed;
           ui.fSettleTicks      = fs.fluidSettleTicks;
@@ -4079,6 +4083,20 @@ int main(int argc, char** argv) {
       // to sit on top of the chrome, not the other way round.
       overlay.DrawHUD(ui);
       overlay.Draw(ui);
+
+      // Wind force multipliers. Its OWN latch, and deliberately not folded
+      // into fluidTuningDirty below: that path ends in sim.ReloadShaders(),
+      // and these two knobs ride TickParams precisely so they do not need one.
+      // A slider that recompiled every shader on each frame of a drag would be
+      // unusable, which is the whole reason they are on the tick stream and
+      // not in tuning_params.def.
+      if (ui.windTuningDirty) {
+        ui.windTuningDirty = false;
+        Tuning t = CurrentTuning();
+        t.sim.windGasScale = ui.windGasScale;
+        t.sim.windPartScale = ui.windPartScale;
+        SetCurrentTuning(t);
+      }
 
       if (ui.fluidTuningDirty) {
         ui.fluidTuningDirty = false;

@@ -822,12 +822,30 @@ struct TickParams {
   int32_t windGustQ = 0;             // gust amplitude, Q16.16 world cells/s
   // The gate: sim.windMode, read CPU-side per tick (the fluidExciteMode
   // precedent, so a per-gate SetCurrentTuning moves it with no rebuild).
-  uint32_t windMode = 0;
-  // Pad to a 16-byte multiple. The UBO is created at sizeof(TickParams) and
-  // WGSL rounds a uniform struct's size up to its 16-byte alignment, so a
-  // short buffer is a validation failure, not a slow path.
-  uint32_t _pwd0 = 0, _pwd1 = 0, _pwd2 = 0;
+  uint32_t windMode = 1;
+  // DEV FORCE MULTIPLIERS, Q8 (256 = 1.0x), one per TIER — see kWindScaleOne.
+  // They ride the tick stream rather than being const-folded into the shaders
+  // like the rest of the wind coupling, which is the whole point: they are
+  // dev-panel sliders and a knob you have to press F5 to see is a knob nobody
+  // drags. Deterministic all the same (integers, on the input stream), and at
+  // the 1.0x default every consumer takes an exact-identity early-out, so the
+  // pinned hash cannot move until someone moves a slider.
+  int32_t windGasScaleQ = 256;    // the CA voxel tier: drift-bias probability
+  int32_t windPartScaleQ = 256;   // the particle tier: debris, spray, MPM nodes
+  uint32_t _pwd2 = 0;
 };
+
+// Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
+// assets/shaders/common.wgsl. Exactly 256 is the shipping value AND the
+// identity guard: every consumer compares against it and takes the untouched
+// path, so "the slider is at 1x" and "the sim is bit-identical to the pinned
+// hash" are the same statement rather than two that have to be argued.
+constexpr int32_t kWindScaleOne = 256;
+// 16x. High enough that the gas slider reaches certainty (every moving voxel
+// goes downwind) and debris is thrown at genuinely absurd speeds, which is what
+// a "what does drastic look like" control is for; bounded so the Q8 arithmetic
+// in the kernels stays inside i32 with room to spare.
+constexpr int32_t kWindScaleMax = 16 * kWindScaleOne;
 
 // sim.windMode ladder — must match WIND_MODE_* in assets/shaders/common.wgsl.
 //

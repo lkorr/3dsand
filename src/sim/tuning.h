@@ -1110,6 +1110,33 @@ struct Tuning {
     // per second. This is the bound (rule 2): entrainment is a rate, not a
     // certainty, so a dune creeps instead of exploding.
     float windEntrainRate = 6.0f;
+
+    // ---- dev force multipliers, one per TIER ----
+    // Not in tuning_params.def, and that is deliberate rather than an
+    // omission. That table is "the ONE table of SHADER-FACING tuning
+    // parameters" — rows that become const-folded WGSL constants and therefore
+    // need F5. These two ride TickParams as Q8 integers instead, because they
+    // exist to be DRAGGED: a slider you have to reload a shader to see is a
+    // slider nobody moves. (`sim.fluidExciteMode` carries a .def row it does
+    // not use and rides the tick stream anyway; that is the wart, not this.)
+    //
+    // WHY TWO, AND WHY THEY SCALE DIFFERENT QUANTITIES. The engine's own split
+    // (research doc §4.6) is CA tier vs particle tier, so the sliders are that
+    // split. What "more force" means is not the same on both sides:
+    //   * gas scales the CA drift-bias PROBABILITY, past its windDriftMax cap,
+    //     to certainty. Scaling the velocity there would die at ~2x, because
+    //     the bias ramp already saturates near the default weather — a control
+    //     that goes dead halfway is worse than none.
+    //   * particle scales the wind VELOCITY that debris, spray and MPM nodes
+    //     are dragged toward, which is what actually throws them further. It
+    //     is also the only way past the drag law's own ceiling, since a
+    //     particle cannot outrun the air however hard it is dragged.
+    // Both are 1.0 by default and every consumer takes an exact-identity
+    // early-out at exactly 1.0, so the pinned world hash cannot move until a
+    // slider does. Off 1.0 they are still fully deterministic — integers on
+    // the tick input stream, captured by replays and the twice-run gate.
+    float windGasScale = 1.0f;
+    float windPartScale = 1.0f;
   } sim;
 
   // ---- day/night cycle ----

@@ -198,6 +198,18 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.windSpeedQ = wq.speed;
     tp.windGustQ = wq.gust;
     tp.windMode = (uint32_t)wtun.sim.windMode;
+    // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
+    // for the WindQuantize reason — the rounding mode is part of what the sim
+    // sees, so it is written here rather than left to a compiler flag. At the
+    // 1.0x default this is exactly kWindScaleOne and every shader consumer
+    // takes its identity path, which is what keeps the pinned hash pinned.
+    auto scaleQ = [](float v) {
+      float c = v < 0.0f ? 0.0f : v;
+      int32_t q = (int32_t)(c * (float)kWindScaleOne + 0.5f);
+      return q > kWindScaleMax ? kWindScaleMax : q;
+    };
+    tp.windGasScaleQ = scaleQ(wtun.sim.windGasScale);
+    tp.windPartScaleQ = scaleQ(wtun.sim.windPartScale);
   }
   // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except
   // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList

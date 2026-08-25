@@ -81,6 +81,25 @@ struct UIState {
   // screenshot runs, neither of which can press a key. Free when off: the draw
   // is skipped outright.
   bool showWindField = false;
+  // ---- dev wind force multipliers, one per TIER ----
+  // Mirrors sim.windGasScale / sim.windPartScale. They ride TickParams as Q8
+  // integers rather than being const-folded into the shaders, which is what
+  // makes them draggable: moving one takes effect on the NEXT TICK, with no
+  // shader reload and no rebuild.
+  //
+  // They scale different quantities on purpose (see the long note in tuning.h):
+  // gas scales the CA drift-bias PROBABILITY past its cap to certainty,
+  // because scaling the velocity there dies at ~2x; particle scales the wind
+  // VELOCITY that debris, spray and MPM nodes chase, because that is the only
+  // way past the drag law's own ceiling.
+  //
+  // Both are determinism-critical: at exactly 1.0 the sim is bit-identical to
+  // the pinned hash, and off 1.0 it is a different but equally deterministic
+  // world. `windTuningDirty` is a SEPARATE latch from fluidTuningDirty
+  // precisely so this path does not drag a shader reload along with it.
+  float windGasScale = 1.0f;
+  float windPartScale = 1.0f;
+  bool windTuningDirty = false;
   int brushRadius = 4;
   int brushMaterial = 3;     // sand
   bool reloadShaders = false;

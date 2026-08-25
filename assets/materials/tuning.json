@@ -286,7 +286,9 @@
     "windDriftSpeed": 12,
     "windDriftMax": 0.5,
     "windEntrainSpeed": 2,
-    "windEntrainRate": 6
+    "windEntrainRate": 6,
+    "windGasScale": 1,
+    "windPartScale": 1
   },
   "render": {
     "skyGradient": 1.4,

@@ -381,10 +381,17 @@ struct TickParams {
   // CPU-side per tick, so a per-gate SetCurrentTuning moves it with no pipeline
   // rebuild.
   windMode   : u32,
-  _pwd0      : u32,
-  _pwd1      : u32,
+  // Dev force multipliers, Q8 (256 = 1x), ONE PER TIER — see windAtScaledQ and
+  // the drift-bias site in sim_step.wgsl. On the tick stream rather than
+  // const-folded like the rest of the wind coupling, because they are dev-panel
+  // sliders: a knob you have to press F5 to see is a knob nobody drags.
+  windGasScaleQ  : i32,   // CA voxel tier: scales the drift-bias PROBABILITY
+  windPartScaleQ : i32,   // particle tier: scales the wind VELOCITY chased
   _pwd2      : u32,
 };
+
+// Must match kWindScaleOne / kWindScaleMax in src/sim/world.h.
+const WINDQ_SCALE_ONE : i32 = 256;
 
 // sim.windMode ladder — must match kWindMode* in src/sim/world.h.
 const WIND_MODE_OFF     : u32 = 0u;
@@ -886,6 +893,34 @@ fn windAt(p : vec3f, t : f32, R : RenderParams) -> vec3f {
   let s = windSampleAt(p, t, 0.0, R);
   return windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
                        + windBandWS(s, s.b2) * WIND_BAND_W2;
+}
+
+// THE FIELD, scaled by a dev multiplier. Used by the PARTICLE TIER (ballistic
+// debris and spray in sim_particle.wgsl, MPM grid nodes in sim_fluid.wgsl),
+// where "more wind" straightforwardly means "a faster wind to be dragged
+// toward", so scaling the velocity is the whole story.
+//
+// The CA tier does NOT use this and the asymmetry is deliberate, not an
+// oversight: its drift bias is a PROBABILITY that saturates at windDriftMax
+// once the field passes windDriftSpeed, which the default weather already
+// nearly does. Scaling the velocity there would move the slider for about the
+// first 2x and then do nothing at all, and a control that goes dead halfway is
+// worse than no control. So sim_step scales the probability instead, past its
+// own cap, up to certainty. Two tiers, two quantities, one meaning: "how hard
+// does the wind push THIS".
+//
+// The == comparison is an exact-identity guard, not an optimisation. At the
+// shipping 1x it returns windAtQ untouched, so "the slider is at 1x" and "the
+// world hash is the pinned one" are the same statement. Scaling first and
+// multiplying second is required, not stylistic: the field is Q16.16 cells per
+// second and reaches ~2^26 in a storm, so the multiply has to come after the
+// divide or it leaves i32 at the top of the range.
+fn windAtScaledQ(p : vec3<i32>, T : TickParams, scaleQ8 : i32) -> vec3<i32> {
+  let w = windAtQ(p, T);
+  if (scaleQ8 == WINDQ_SCALE_ONE) { return w; }
+  return vec3<i32>((w.x / WINDQ_SCALE_ONE) * scaleQ8,
+                   (w.y / WINDQ_SCALE_ONE) * scaleQ8,
+                   (w.z / WINDQ_SCALE_ONE) * scaleQ8);
 }
 
 // Wind velocity -> foliage bend, in the units TUNE_MICRO_SWAY_AMP is authored

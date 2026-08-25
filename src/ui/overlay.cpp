@@ -534,6 +534,41 @@ void Overlay::Draw(UIState& s) {
         "Spacing and radius are on the Wind tab (F5 to apply).\n"
         "NOTE: F5 re-seeds this from wind.dbgWindField, so a reload turns it\n"
         "back off unless the tuning file asks for it.");
+
+  // ---- wind force multipliers, one per tier -------------------------------
+  // Live: these ride TickParams, so a drag lands on the next tick with no
+  // shader reload. Split by TIER because that is how the engine is split
+  // (research doc §4.6) — the CA steers what is already moving, the particle
+  // system carries the violence — and because they are the two things you want
+  // to A/B against each other. Pinning one to 0 while pushing the other is the
+  // fastest way to see which tier a given effect is actually coming from.
+  if (ImGui::SliderFloat("wind x voxels", &s.windGasScale, 0.0f, 16.0f, "%.2fx"))
+    s.windTuningDirty = true;
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Multiplies how hard the wind pushes CA VOXELS - smoke, steam, fire,\n"
+        "and falling powder. It scales the drift-bias PROBABILITY, not the\n"
+        "wind speed, and it is allowed past the sim.windDriftMax cap: at the\n"
+        "top of the range every moving gas voxel goes downwind first and smoke\n"
+        "stops looking like smoke and starts looking like a conveyor belt.\n"
+        "Scaling the speed instead would go dead at about 2x, because the bias\n"
+        "ramp already saturates near the default weather.\n"
+        "SETTLED voxels are untouched at any value - that is entrainment,\n"
+        "which is sim.windMode 2 and off. 0 pins the CA tier still.\n"
+        "Changes the world hash. Deterministic, just a different world.");
+  if (ImGui::SliderFloat("wind x particles", &s.windPartScale, 0.0f, 16.0f, "%.2fx"))
+    s.windTuningDirty = true;
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Multiplies how hard the wind pushes the PARTICLE tier - explosion\n"
+        "debris, blood and water spray, and MPM fluid surface nodes.\n"
+        "It scales the wind VELOCITY they are dragged toward, which is what\n"
+        "actually throws them further: the drag law means a particle can never\n"
+        "outrun the air, so a faster air is the only way past that ceiling.\n"
+        "Per-material response still applies, so heavy debris moves less than\n"
+        "spray at the same multiplier. 0 pins the particle tier still.\n"
+        "Changes the world hash. Deterministic, just a different world.");
+
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
 
   auto swatch = [&](int i) {

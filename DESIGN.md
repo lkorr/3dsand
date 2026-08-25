@@ -3027,6 +3027,34 @@ vs −11.41 cells against the gate-off run), the settled sand bed is **bitwise
 unchanged** under any drift-bias wind (invariant 4), the same script twice with
 wind on gives the same hash, and grain count is conserved.
 
+### Two dev force multipliers, one per tier
+
+`sim.windGasScale` and `sim.windPartScale` (dev-panel sliders, 0–16x, default
+1.0) multiply how hard the wind pushes each tier. They ride **TickParams as Q8
+integers** rather than being const-folded like the rest of the wind coupling,
+which is the point: a slider you have to press F5 to see is a slider nobody
+drags. Deterministic all the same — integers on the tick input stream — and at
+exactly 1.0 every consumer takes an exact-identity early-out, so "the sliders
+are at 1x" and "the pinned hash holds" are one statement rather than two.
+
+They scale **different quantities**, and that asymmetry is deliberate:
+
+- **gas** scales the CA drift-bias *probability*, past its `windDriftMax` cap,
+  up to certainty. Scaling the velocity there would move the slider for about
+  the first 2x and then do nothing, because the bias ramp already saturates
+  near the default weather — and a control that goes dead halfway is worse than
+  no control. At the top of the range every moving gas voxel tries downwind
+  first, and smoke reads as a conveyor belt.
+- **particle** scales the wind *velocity* that debris, spray and MPM nodes are
+  dragged toward. That is the only way past the drag law's own ceiling, since a
+  particle cannot outrun the air however hard it is dragged.
+
+Entrainment's threshold test deliberately reads the **raw** field through
+neither multiplier: that test asks whether the wind beats a material's authored
+friction, which is a property of the wind, and running a debug knob through a
+physical threshold would silently retune every material's saltation point.
+`sim.windEntrainSpeed` is the knob for that.
+
 ### Entrainment is implemented and is NOT ready to switch on
 
 `sim.windMode` is a ladder — 0 off, 1 drift, 2 also entrainment — and 2 is

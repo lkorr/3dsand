@@ -180,7 +180,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     // Almost every material is 0 (stone chips do not blow around), so the
     // common case is one comparison and no field evaluation at all.
     if (resp > 0) {
-      let w = windAtQ(startCell, T);
+      let w = windAtScaledQ(startCell, T, T.windPartScaleQ);
       // Micro spray gets the same law as a whole voxel. It is the same air, and
       // droplets drifting downwind off a splash is most of what phase 3 buys.
       let gx = w.x / PART_WIND_SCALE - p.vx;

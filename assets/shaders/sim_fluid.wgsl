@@ -792,7 +792,7 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     // majority in any standing body of water — pays a compare, not a sine.
     let expo = 65536 - phiQ(m, 0, FLUID_WIND_MASS);
     if (expo > 0) {
-      let w = windAtQ(c, T);
+      let w = windAtScaledQ(c, T, T.windPartScaleQ);
       let k = mq(FLUID_WIND_DRAG, mq(FLUID_WIND_GAIN, expo));
       v.x += mq(w.x / FLUID_WIND_HZ - v.x, k);
       v.y += mq(w.y / FLUID_WIND_HZ - v.y, k);

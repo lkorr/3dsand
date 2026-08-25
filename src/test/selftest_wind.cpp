@@ -66,6 +66,7 @@ struct WindArm {
   const char* label;
   int mode;         // sim.windMode
   float dirDeg;     // wind.windDirDeg — 0 = +Z, 90 = +X, 270 = -X
+  float gasScale = 1.0f;    // sim.windGasScale, the dev CA-tier multiplier
 };
 
 struct WindResult {
@@ -170,6 +171,7 @@ Status GateWind(Ctx& c, std::string& detail) {
     t.wind.windDirDeg = arm.dirDeg;
     t.wind.windSpeed = 20.0f;   // a storm: over sand's entrainment threshold
     t.wind.gustStrength = 0.4f;
+    t.sim.windGasScale = arm.gasScale;
     const Tuning saved = CurrentTuning();
     SetCurrentTuning(t);
 
@@ -215,6 +217,8 @@ Status GateWind(Ctx& c, std::string& detail) {
   const WindResult east = run({"drift +x", (int)kWindModeDrift, 90.0f});
   const WindResult west = run({"drift -x", (int)kWindModeDrift, 270.0f});
   const WindResult twice = run({"drift +x (repeat)", (int)kWindModeDrift, 90.0f});
+  // The dev force multiplier, CA tier. Same wind, same script, 8x the bias.
+  const WindResult hard = run({"drift +x x8", (int)kWindModeDrift, 90.0f, 8.0f});
 
   // 1. The gate is real: turning it on has to CHANGE something, or every other
   //    assertion here is satisfied vacuously by a field that returns zero.
@@ -238,6 +242,21 @@ Status GateWind(Ctx& c, std::string& detail) {
   //    saltating grain.
   const bool massOk = east.sandCount == off.sandCount &&
                       west.sandCount == off.sandCount;
+  // 6. The dev force multiplier, REPORTED AND NOT VOTED ON. The arm runs and
+  //    its number goes in the detail line beside the 1x number, which is where
+  //    anyone comparing them would look; it is deliberately not part of the
+  //    pass condition. Two reasons, and the first is enough: this threshold has
+  //    never been measured, and an assertion nobody has watched pass is a
+  //    coin-flip that turns the suite red on someone else's commit. The second
+  //    is that the bias saturates at certainty, so the knob-to-distance
+  //    relationship is not linear and any factor written here would rot.
+  //
+  //    The bed equality IS worth an eye even so — a multiplier that quietly
+  //    turned the drift bias into entrainment would be a far worse bug than one
+  //    that did nothing — so it is printed rather than dropped.
+  const double dHard = hard.smokeX - off.smokeX;
+  const bool hardBedHeld = hard.sandCells == off.sandCells &&
+                           hard.sandCount == off.sandCount;
 
   // ---- the opt-in entrainment arms (see the header) -----------------------
   bool creeps = true;
@@ -256,10 +275,12 @@ Status GateWind(Ctx& c, std::string& detail) {
 
   detail = Format(
       "smoke resp %u / sand friction %u | smoke drifts %+.2f / %+.2f cells "
-      "against mode 0 (x=%.2f) | settled bed %s under drift | grains %u/%u/%u "
+      "against mode 0 (x=%.2f); %+.2f at gasScale 8x (reported, not asserted) "
+      "| settled bed %s under drift, %s at 8x | grains %u/%u/%u "
       "| hash off %08x, on %08x, repeat %s | entrain %s",
-      smokeResp, sandFric, dEast, dWest, off.smokeX,
-      bedHeld ? "unmoved bitwise" : "MOVED", off.sandCount, east.sandCount,
+      smokeResp, sandFric, dEast, dWest, off.smokeX, dHard,
+      bedHeld ? "unmoved bitwise" : "MOVED",
+      hardBedHeld ? "unmoved" : "MOVED", off.sandCount, east.sandCount,
       west.sandCount, off.hash, east.hash, stable ? "identical" : "DIFFERS",
       ranEntrain
           ? Format("bed creeps %+.2f (maxX %+d), repeat %s", dune, duneMax,

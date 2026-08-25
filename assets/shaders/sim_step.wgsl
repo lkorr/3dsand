@@ -1292,7 +1292,24 @@ fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
   // voxel per substep.
   let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
              max(WIND_DRIFT_REF >> 10u, 1);            // 0..1024
-  let p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
+  var p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
+  // The dev force multiplier, applied to the PROBABILITY and AFTER the cap —
+  // not to the field, and the difference is the whole reason this tier scales
+  // a different quantity from the particle tier (windAtScaledQ says so at
+  // length). `frac` above saturates once the wind passes windDriftSpeed, which
+  // the default weather already nearly does, so a velocity multiplier here
+  // would move the slider for the first ~2x and then do nothing. Scaling `p`
+  // instead runs all the way to CERTAINTY: at the top of the range every moving
+  // gas voxel tries downwind first and smoke stops looking like smoke and
+  // starts looking like a conveyor belt, which is exactly the thing a "what
+  // does drastic look like" control exists to show.
+  //
+  // The == is an exact-identity guard, not an optimisation: at the shipping 1x
+  // this is arithmetically untouched, so "the slider is at 1x" and "the pinned
+  // hash holds" are one statement.
+  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
+    p = min((p * T.windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
+  }
   if (i32(windRnd(slotIdx) & 1023u) < p) { return windLateralCode(w); }
   return base;
 }
@@ -1313,6 +1330,12 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   let resp = i32(matWindResponse(m));
   if (resp == 0) { return false; }
   let thresh = i32(matWindFriction(m)) * WIND_ENTRAIN_REF;
+  // Raw field, NOT windAtScaledQ and not the gas multiplier either. Both dev
+  // sliders scale a tier's RESPONSE to the wind; this test is a property of
+  // the wind itself — whether it beats a material's authored friction — and
+  // running a debug multiplier through a physical threshold would make the
+  // slider silently retune every material's saltation point. The knob for
+  // that is sim.windEntrainSpeed, which is what it is for.
   let wv = windAtQ(c, T);
   var d = vec2<i32>(0, 0);
   // Only the horizontal axes are tested. A vertical component lifts nothing on

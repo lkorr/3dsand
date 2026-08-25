@@ -718,6 +718,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "windDriftMax", s.windDriftMax, out, at);
     ReadF(*g, "windEntrainSpeed", s.windEntrainSpeed, out, at);
     ReadF(*g, "windEntrainRate", s.windEntrainRate, out, at);
+    ReadF(*g, "windGasScale", s.windGasScale, out, at);
+    ReadF(*g, "windPartScale", s.windPartScale, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -886,6 +888,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // Rate, not certainty (rule 2). 30/s is one hop per tick, which is the
     // most the substep gate can deliver anyway.
     clampWarnF(s.windEntrainRate, 0.0f, 30.0f, "windEntrainRate");
+    // Dev force multipliers. The ceiling is the one the Q8 arithmetic in the
+    // kernels is sized for (kWindScaleMax); 0 is a legal "pin this tier still"
+    // and is genuinely useful, since it isolates one tier from the other.
+    const float kScaleMax = (float)kWindScaleMax / (float)kWindScaleOne;
+    clampWarnF(s.windGasScale, 0.0f, kScaleMax, "windGasScale");
+    clampWarnF(s.windPartScale, 0.0f, kScaleMax, "windPartScale");
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.
