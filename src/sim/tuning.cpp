@@ -411,6 +411,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "landFullSpeed", a.landFullSpeed, out, at);
     ReadF(*g, "impactVolume", a.impactVolume, out, at);
     ReadF(*g, "impactRadius", a.impactRadius, out, at);
+    ReadF(*g, "impactMinSpeed", a.impactMinSpeed, out, at);
+    ReadF(*g, "impactFullSpeed", a.impactFullSpeed, out, at);
+    ReadF(*g, "impactMinGap", a.impactMinGap, out, at);
     ReadF(*g, "breakVolume", a.breakVolume, out, at);
     ReadF(*g, "breakRadius", a.breakRadius, out, at);
     ReadF(*g, "breakPitchSemitones", a.breakPitchSemitones, out, at);
@@ -436,6 +439,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "bleedRadius", a.bleedRadius, out, at);
     ReadF(*g, "bleedOnThreshold", a.bleedOnThreshold, out, at);
     ReadF(*g, "bleedOffThreshold", a.bleedOffThreshold, out, at);
+    ReadF(*g, "ambienceVolume", a.ambienceVolume, out, at);
+    ReadF(*g, "ambienceRadius", a.ambienceRadius, out, at);
     ReadF(*g, "nightVolume", a.nightVolume, out, at);
     ReadF(*g, "nightRadius", a.nightRadius, out, at);
     ReadF(*g, "nightChance", a.nightChance, out, at);

@@ -224,6 +224,34 @@ class Physics {
   // The caller applies it through its own terrain sweeps.
   Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const;
 
+  // ---- contact reporting (audio; DESIGN.md §12b) --------------------------
+  //
+  // One NEW contact from the last Step. Jolt calls OnContactAdded only when a
+  // manifold first appears, which is exactly the LANDING moment — a body
+  // resting in a pile re-reports through OnContactPersisted, which this
+  // deliberately does not listen to, so a settled heap costs nothing.
+  //
+  // The list is filtered inside the listener before it is stored, because the
+  // filter is what bounds it (CLAUDE.md rule 2): contacts below the speed gate,
+  // and anything touching the PLAYER proxy or a PLAYER-AVATAR limb, never
+  // become entries. Bodies on Layers::AVATAR are excluded by name — your own
+  // body parts are permanently interpenetrated with your capsule and would
+  // otherwise machine-gun the mixer with your own footsteps.
+  //
+  // Cleared at the head of every Step, so a caller reads the step it just ran.
+  struct ContactImpact {
+    uint64_t bodyA = 0, bodyB = 0;  // 0 on a side that is static terrain
+    Vec3 posVoxel{};                // contact point, world voxels
+    Vec3 normal{};                  // unit, points from bodyA toward bodyB
+    float speedVoxPerSec = 0;       // |approach speed| along `normal`
+  };
+  const std::vector<ContactImpact>& ContactImpacts() const;
+  // Contacts slower than this are not reported at all. Set from the game
+  // thread; Step latches it into the listener before handing control to the
+  // Jolt job threads, which must never read a game-side global themselves
+  // (same contract as the audio thread — DESIGN.md §12b).
+  void SetContactReportSpeed(float voxPerSec);
+
   void RemoveBody(uint64_t handle);
   bool GetTransform(uint64_t handle, BodyTransform& out) const;
   bool IsActive(uint64_t handle) const;
@@ -263,6 +291,8 @@ class Physics {
   std::unique_ptr<JPH::PhysicsSystem> system_;
   struct LayerImpls;
   std::unique_ptr<LayerImpls> layers_;
+  struct ContactImpls;  // Jolt ContactListener + its bounded buffer
+  std::unique_ptr<ContactImpls> contacts_;
   std::vector<uint64_t> dynamicBodies_;  // handles of live debris bodies
   struct JointImpls;                     // Jolt constraint refs (impl detail)
   std::unique_ptr<JointImpls> joints_;

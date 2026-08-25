@@ -2099,6 +2099,14 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
         // non-fatal hit: flinch. This is the one wired trigger for now — it
         // exercises the whole clip layer (sample/blend/mask/blend-out).
         PlayClip(mob, def, "attack");
+        // ...and the creature says so. Intensity is the fraction of THIS
+        // limb's max hp removed, which is what the hurt slot documents: a
+        // scratch on a torso and a scratch on a finger are not the same event.
+        // A hit that severs deliberately says nothing here — Sever() already
+        // reports, and the sever cue falls back to the hurt set when a mob
+        // binds no sever take, so voicing both would double it.
+        PushVoice(mob, VoiceKind::Hurt, hitWorldVoxel,
+                  ld.hp > 0 ? amount / ld.hp : 1.0f);
       }
       return true;
     }
@@ -2626,6 +2634,14 @@ bool MobSystem::CarveLimb(Mob& mob, int limbIndex, World& world,
   if (limb.microModel >= 0)
     ReskinLimbMicro(mob, limb, def.skinScale, def.physScale);
   RebuildLimbBody(mob, limbIndex);
+  // The creature cries out — but only HERE, on the surviving path. Every
+  // route out of this function above went through Sever(), which reports its
+  // own event, and the sever cue falls back to the hurt set when nothing is
+  // bound; voicing both would double a single blow. `lost` is already the
+  // fraction of the limb's volume removed, so `lost * kCarveDamagePerVolume`
+  // is the fraction of its max hp — exactly what the hurt slot documents.
+  if (lost > 0.0f)
+    PushVoice(mob, VoiceKind::Hurt, limb.xf.pos, lost * kCarveDamagePerVolume);
   return true;
 }
 
@@ -2894,9 +2910,40 @@ void MobSystem::DetachLimb(Mob& mob, int limbIndex, bool adopt) {
   instancesDirty_ = true;
 }
 
+// De-duplicated per mob per drain window for Hurt: an explosion that carves
+// six limbs of one creature is one cry, not six overlapping copies of the same
+// sample. Death is not de-duplicated because Die() can only run once per mob.
+//
+// The AUDIO layer also rate-limits Hurt by wall clock (kMobVoiceMinGap), and
+// that is not the same guard: it cannot stop the queue itself from growing,
+// and it is bypassed entirely in headless runs where there is no audio at all.
+// Bounding the event is this layer's job (CLAUDE.md rule 2); choosing not to
+// play it is the audio layer's.
+void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
+                          float intensity) {
+  if (kind == VoiceKind::Hurt)
+    for (const VoiceEvent& v : voices_)
+      if (v.mobId == mob.id && v.kind == VoiceKind::Hurt) return;
+  voices_.push_back(VoiceEvent{posVoxel, mob.id, (int)mob.defIndex, kind,
+                               std::clamp(intensity, 0.0f, 1.0f)});
+}
+
 void MobSystem::Die(Mob& mob) {
   if (!mob.alive) return;
   mob.alive = false;
+  // The death cry, BEFORE the limb list is dismantled below — the root limb's
+  // live transform is where the creature actually is, and `mob.origin` is only
+  // the spawn corner (the trap called out in Sever()). Reported even if the
+  // mob binds no death take: the audio layer is what decides silence, and a
+  // test asserting "the engine noticed this creature died" needs the event to
+  // exist whether or not anyone recorded a sound for it.
+  {
+    Vec3 at = mob.origin;
+    const int rl = defs_[mob.defIndex].rootLimb;
+    if (rl >= 0 && rl < (int)mob.limbs.size() && mob.limbs[rl].body)
+      at = mob.limbs[rl].xf.pos;
+    PushVoice(mob, VoiceKind::Death, at, 1.0f);
+  }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
   // stay so the corpse hangs together until pieces get culled or settle
   for (size_t i = 0; i < mob.limbs.size(); i++) {

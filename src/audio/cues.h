@@ -157,6 +157,48 @@ class Cues {
   void SetAmbienceGain(int handle, float gain);
   void StopAmbience(int handle);
 
+  // ---- material ambience (the automatic driver for the loops above) -------
+  //
+  // WHAT DRIVES THE LOOP. A material carries an "ambience" slot naming a set
+  // (`{"ambience": "water"}`); this scans the CPU mirror for the largest body
+  // of any such material near the listener and keeps ONE positioned loop on
+  // it. The three quantities and where each comes from:
+  //
+  //   position  the CENTROID of the sampled cells, not the nearest cell and
+  //             not the player. A shoreline should pan toward the water as you
+  //             walk along it, and a nearest-cell emitter instead sticks to
+  //             your feet and pans to nothing. Eased, so the emitter drifts
+  //             rather than jumping each scan.
+  //   gain      the sampled cell COUNT, i.e. how much water is nearby. A
+  //             puddle is under the floor and silent; a lake is at full gain.
+  //             Also eased, so crossing a chunk boundary is not a step.
+  //   radius    audio.ambienceRadius. One number: the loop is a bed, and a
+  //             body of water does not have an authored size.
+  //
+  // WHAT IT DELIBERATELY DOES NOT DO. Exactly one loop is live at a time (the
+  // strongest material wins). Two lakes on opposite sides of the player is a
+  // CLUSTERING problem — "is that one body of water or two" — and inventing an
+  // answer to it here would be a system, not a hook.
+  //
+  // COST WHEN IDLE. If no material in the project binds an ambience set, this
+  // is one bool test per frame, forever. Otherwise it is a stride-4 subsample
+  // of the 3x3x3 mirror (1728 reads) at most twice a second, over memory that
+  // is already resident, with no allocation and no GPU work.
+  struct AmbienceProbe {
+    uint32_t material = 0;  // 0 = nothing ambient within the mirror
+    Vec3 posVox{};          // centroid of the sampled cells, world voxels
+    float weight = 0.0f;    // 0..1, sampled-cell count vs kAmbienceFullCells
+    int cells = 0;          // raw sampled-cell count, for tests and the panel
+  };
+  // The scan, split out from the voice so it can be asserted with no audio
+  // device: a headless run has no mixer but does have a world (DESIGN.md §12b
+  // "Headless is silent"). Needs only RebuildMaterialTable to have run.
+  AmbienceProbe ProbeAmbience(const World& world,
+                              const Vec3& listenerPosVox) const;
+  // False when no material binds an ambience set at all, which is the
+  // early-out that makes the whole feature free in a project without one.
+  bool AnyAmbienceMaterial() const { return anyAmbience_; }
+
   // ---- diagnostics --------------------------------------------------------
   int ActiveVoices() const { return enabled_ ? world_.ActiveVoices() : 0; }
   double CpuLoad() { return enabled_ ? world_.ConsumeCpuLoad() : 0.0; }
@@ -224,6 +266,23 @@ class Cues {
   };
   std::map<uint64_t, BleedLoop> bleeds_;
   void ReapBleeds();
+
+  // ---- material ambience --------------------------------------------------
+  void UpdateAmbience(float dt, const Vec3& listenerPosVox, World* world);
+  // Indexed by material id: does this material author an "ambience" slot. A
+  // flat byte table because it is tested once per sampled cell, 1728 times a
+  // scan, and a map lookup there would be the whole cost of the feature.
+  std::vector<uint8_t> ambienceOwner_;
+  // material id -> resolved full set name. Sparse: consulted once per scan,
+  // never per cell.
+  std::map<uint32_t, std::string> ambienceSet_;
+  bool anyAmbience_ = false;
+  int ambHandle_ = -1;
+  uint32_t ambMat_ = 0;     // material the live loop is following
+  float ambGain_ = 0.0f;    // eased toward the probe's weight
+  Vec3 ambPos_{};           // eased toward the probe's centroid
+  float ambScanTimer_ = 0.0f;
+  AmbienceProbe ambLast_{};
 
   // ---- night bed ----------------------------------------------------------
   int nightHandle_ = -1;

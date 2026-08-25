@@ -200,6 +200,30 @@ class DebrisSystem {
   const std::vector<BreakEvent>& BreakEvents() const { return breaks_; }
   void ClearBreakEvents() { breaks_.clear(); }
 
+  // ---- impact events ------------------------------------------------------
+  // One entry per debris body that STRUCK something hard enough to be heard
+  // this step. Same reporting shape as BreakEvent, and for the same reason:
+  // this layer resolves the material and the energy, main.cpp turns it into
+  // audio::Cues::Impact, and nothing here knows that audio exists.
+  //
+  // Three separate bounds keep a collapsing wall from machine-gunning the
+  // mixer (CLAUDE.md rule 2 — bound every emergent process):
+  //   1. Physics' contact listener drops anything below the speed gate, so a
+  //      settled pile reports nothing at all and costs nothing.
+  //   2. Per body: one impact per `impactMinGap` seconds. A tumbling rock
+  //      strikes four times in a bounce; it should be one thud, not four.
+  //   3. Per step: the loudest kMaxImpactsPerStep survive. Thirty pieces of a
+  //      blown wall landing together is not thirty sounds under any sound
+  //      design, and the voice pool would drop the tail anyway — better to
+  //      choose WHICH ones are dropped than to let arrival order decide.
+  struct ImpactEvent {
+    Vec3 posVoxel;      // contact point, world voxels
+    uint32_t material;  // the material STRUCK, resolved below
+    float energy;       // 0..1, mapped from approach speed
+  };
+  const std::vector<ImpactEvent>& ImpactEvents() const { return impacts_; }
+  void ClearImpactEvents() { impacts_.clear(); }
+
  private:
   struct Event {
     uint32_t tick;
@@ -241,6 +265,13 @@ class DebrisSystem {
     }
     uint32_t bleedMat = 0;       // nonzero => body bleeds when carved
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
+    // Impact cue bookkeeping. `domMat` is this body's most common material,
+    // cached because it is the fallback the impact cue reaches for when the
+    // struck side is another body rather than the grid, and recounting a
+    // 32k-voxel lattice per contact would not be free. Refreshed wherever the
+    // voxel list is rewritten (adoption, damage, shatter, load).
+    uint32_t domMat = 0;
+    uint32_t lastImpactStep = 0;  // rate limit, in PostStep counts (30 Hz)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
     uint16_t activeCount = 0;     // voxels with self-driven rules (decay/emit)
@@ -374,4 +405,19 @@ class DebrisSystem {
   // Drained by main.cpp each frame; bounded by the same per-tick body budget
   // that bounds island creation, so this cannot grow without limit.
   std::vector<BreakEvent> breaks_;
+  // Drained by main.cpp each frame. Bounded per STEP by kMaxImpactsPerStep and
+  // per body by the gap limiter, so a frame that ran four ticks can carry at
+  // most 4 * kMaxImpactsPerStep entries.
+  std::vector<ImpactEvent> impacts_;
+  // PostStep counter, i.e. sim ticks: the unit the per-body impact gap is
+  // measured in. Kept here rather than taking a tick parameter because every
+  // one of the eight PostStep call sites would otherwise have to be taught
+  // about a clock it does not need.
+  uint32_t stepCount_ = 0;
+  // Dominant material of a voxel lattice: the piece's MOST COMMON material,
+  // not the first voxel's. Shared by the break and impact cues — see the
+  // comment at the break site for why the first voxel is the wrong answer.
+  static uint32_t DominantMaterial(const std::vector<DebrisVoxel>& voxels);
+  // Turn this step's Jolt contacts into ImpactEvents. Called from PostStep.
+  void CollectImpacts();
 };

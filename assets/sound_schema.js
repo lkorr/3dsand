@@ -68,8 +68,8 @@ const SOUND_SCHEMA = {
        pitch:'down to −22% at full impact'},
 
       {k:'impact', n:'impact', prefix:'impacts',
-       d:'Debris or a thrown body striking this material.',
-       fires:'audio::Cues::Impact — src/audio/cues.cpp',
+       d:'Debris or a thrown body striking this material. The material named is the one that was STRUCK, read from the grid at the contact point — a log landing on stone sounds like stone.',
+       fires:'audio::Cues::Impact — from DebrisSystem::ImpactEvents(), a Jolt contact listener. Gated on contact speed (audio.impactMinSpeed), rate-limited per body (audio.impactMinGap) and capped per step, so a settling pile is silent. Also fired from the MPM fluid splash in main.cpp.',
        fallback:'the footstep set for this material, pitched and gained differently.',
        gain:'scales with impact energy',
        pitch:'heavier impact → lower'},
@@ -82,9 +82,11 @@ const SOUND_SCHEMA = {
        pitch:'centre set by piece size (twig high, log low), then a random ±breakPitchSemitones per event'},
 
       {k:'ambience', n:'ambience loop', prefix:'ambience',
-       d:'A positioned looping bed for a body of this material, e.g. a lava lake or a waterfall. Started per emitter with a radius, not per voxel.',
-       fires:'audio::Cues::StartAmbience — called by game code, not automatic',
-       fallback:'silent.'},
+       d:'A positioned looping bed for a body of this material, e.g. a lava lake or a waterfall. Automatic: the engine scans the CPU mirror around the player twice a second and keeps ONE loop on the largest nearby body of an ambience-bound material. Its position is the CENTROID of that body (so a shoreline pans toward the water as you walk along it), and its gain is how much of the material is nearby — a puddle is under the floor and silent, a lake is at full gain.',
+       fires:'audio::Cues::ProbeAmbience + UpdateAmbience — src/audio/cues.cpp, driven from Cues::Update. Only ONE bed plays at a time: two lakes on opposite sides of the player is a clustering problem the engine deliberately does not try to answer.',
+       fallback:'silent.',
+       gain:'audio.ambienceVolume, scaled by how much of the material is nearby',
+       radius:'audio.ambienceRadius'},
     ],
   },
 
@@ -101,14 +103,14 @@ const SOUND_SCHEMA = {
            'borrowing another’s voice is always wrong.',
     slots: [
       {k:'hurt', n:'takes damage', prefix:'mobs',
-       d:'Struck but still alive. Fires once per damage event, so a burst of hits should not fire a burst of voices — the engine rate-limits it.',
-       fires:'audio::Cues::MobSound(Hurt) — src/audio/cues.cpp',
+       d:'Struck but still alive. Fires once per damage event, so a burst of hits should not fire a burst of voices — the engine rate-limits it twice over: MobSystem emits at most one hurt per creature per tick, and the audio layer then enforces a minimum gap per source.',
+       fires:'audio::Cues::MobSound(Hurt) — from MobSystem::VoiceEvents(), raised by MobSystem::Damage (laser, melee) and by CarveLimb (explosions, blasts, the laser kerf) on the surviving path. A blow that severs says nothing here: the sever cue already speaks, and falls back to this set.',
        fallback:'silent.',
        gain:'scales with the fraction of max hp removed'},
 
       {k:'death', n:'dies', prefix:'mobs',
-       d:'The killing blow. Fired once, at the moment the mob is marked dead, before the ragdoll takes over.',
-       fires:'audio::Cues::MobSound(Death) — src/audio/cues.cpp',
+       d:'The killing blow. Fired once, at the moment the mob is marked dead, before the ragdoll takes over — positioned on the root limb’s live transform, not on the spawn corner.',
+       fires:'audio::Cues::MobSound(Death) — from MobSystem::VoiceEvents(), raised in MobSystem::Die(), which is the single choke point every kill funnels through.',
        fallback:'silent.'},
 
       {k:'sever', n:'limb severed', prefix:'mobs',
@@ -131,17 +133,17 @@ const SOUND_SCHEMA = {
 
       {k:'idle', n:'idle vocal', prefix:'mobs',
        d:'Occasional noise while alive and unaware. The cheapest way to make a world feel inhabited — and the fastest way to make it maddening, so keep the interval long.',
-       fires:'not wired yet — bind it and the set is ready when it is',
+       fires:'NOT WIRED. Needs a per-mob idle timer and a notion of “unaware”, neither of which exists: MobSystem::DecideIntent has no persistent state at all beyond a blocked-ahead counter.',
        fallback:'silent.'},
 
       {k:'alert', n:'notices you', prefix:'mobs',
        d:'The moment this mob acquires the player. Doubles as the player’s only warning, so it should be legible over distance.',
-       fires:'not wired yet — bind it and the set is ready when it is',
+       fires:'NOT WIRED, and not wireable today. Mobs have no awareness of the player whatsoever — DecideIntent’s only sensor is a terrain probe (GroundSense) and there is no target, no state enum and no previous-state field to difference. This needs the AI seam DESIGN.md §“Mob steering” describes, not an audio change.',
        fallback:'silent.'},
 
       {k:'attack', n:'attacks', prefix:'mobs',
        d:'The swing, lunge or shot itself.',
-       fires:'not wired yet — bind it and the set is ready when it is',
+       fires:'NOT WIRED. Mobs never attack: the one PlayClip(“attack”) in the engine is a FLINCH on being hit, not a swing. Needs a mob attack action to exist first.',
        fallback:'silent.'},
 
       {k:'step', n:'footstep', prefix:'footsteps',

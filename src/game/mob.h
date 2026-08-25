@@ -345,6 +345,31 @@ class MobSystem {
   const std::vector<SeverEvent>& SeverEvents() const { return severs_; }
   void ClearSeverEvents() { severs_.clear(); }
 
+  // ---- creature voices ----------------------------------------------------
+  // Everything a mob says that is NOT a sever, reported the same way and for
+  // the same reason: this system knows nothing about audio, and a killing blow
+  // can despawn the mob before the frame drains the list, so the def index
+  // travels on the event rather than being looked up afterwards.
+  //
+  // Sever keeps its own list because it carries a cause (`byBlade`) that
+  // nothing else needs, and because it already has a consumer.
+  //
+  // BOUNDED BY CONSTRUCTION. At most one entry per mob per kind per tick:
+  // Hurt de-duplicates on push (an explosion carving six limbs of one creature
+  // is one cry, not six), and Death can only fire once per mob because Die()
+  // early-outs on `alive`. The tick loop runs at most 4 times per frame, so a
+  // frame carries at most 4 * mobs entries even in a massacre.
+  enum class VoiceKind { Hurt, Death };
+  struct VoiceEvent {
+    Vec3 posVoxel;       // where the creature is, world voxels
+    uint64_t mobId = 0;  // rate-limiter key on the audio side
+    int defIndex = -1;   // index into Defs(); outlives the mob
+    VoiceKind kind = VoiceKind::Hurt;
+    float intensity = 1.0f;  // 0..1, fraction of the limb's max hp removed
+  };
+  const std::vector<VoiceEvent>& VoiceEvents() const { return voices_; }
+  void ClearVoiceEvents() { voices_.clear(); }
+
   // RAII: marks every Sever() reached inside its lifetime as a blade cut.
   // Scoped rather than a parameter because the melee sweep calls Damage() and
   // CarveLimbRadial(), each of which may sever internally several frames deep;
@@ -705,6 +730,13 @@ class MobSystem {
   // severing itself: a mob has a fixed limb count and kMaxMobs of them exist.
   std::vector<SeverEvent> severs_;
   std::vector<BleedSource> bleeds_;
+  std::vector<VoiceEvent> voices_;
+  // Push a creature voice, de-duplicating Hurt per mob per drain window (see
+  // VoiceEvent). Silently drops a mob with nothing bound is NOT this layer's
+  // job — the audio side already skips an unbound slot — but the dedup is,
+  // because it is a property of the EVENT, not of the sound.
+  void PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
+                 float intensity);
   // Set by BladeCutScope for the duration of the melee sweep, so Sever() can
   // record what caused it without every caller having to say.
   bool bladeCut_ = false;

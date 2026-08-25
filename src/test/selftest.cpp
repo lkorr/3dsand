@@ -31,6 +31,7 @@ const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
 const std::vector<Gate>& BodyGates();
+const std::vector<Gate>& AudioGates();
 const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& SpellGates();
 
@@ -52,6 +53,7 @@ const char* const kOrder[] = {
     "far-persist",
     "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
+    "audio-impact", "audio-mob-voice", "audio-ambience",
     "prefab",      "settle-back",    "player-body", "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
@@ -62,7 +64,7 @@ const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
     for (const auto* g : {&SimGates(), &RenderGates(), &PlayerGates(),
-                          &MobGates(), &BodyGates(), &WorldIoGates(),
+                          &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &SpellGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
