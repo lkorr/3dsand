@@ -715,41 +715,165 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
   return progress;
 }
 
+// ============================== LIQUID DESCENT ===============================
+// PLAN_fluid_overhaul.md §1.1 defect 3, and the single largest of the four.
+//
+// A liquid's descent set is the 9 cells of the layer below that the colour
+// lattice's 1-cell write reach allows: straight down, the 4 axis diagonals and
+// the 4 CORNERS. Before this the CA used 5 of those 9, and used them only as
+// WHOLE-CELL moves, which meant `canDisplace` refused any target already
+// holding the same liquid (equal density is not "lighter"). A partly filled
+// lower step was therefore an impassable wall to the water standing above it.
+//
+// DETERMINISM (rule 1). Corners cost nothing new: two acting cells in one pass
+// are >= 3 apart on EVERY axis, so their 3x3x3 write neighbourhoods are
+// disjoint whether a move is axis-aligned or not. Every read below is a
+// neighbour at Chebyshev distance 1, which is inside the guarantee (a read at
+// distance 2 is NOT — see the column-walk note on seesSky).
+//
+// TERMINATION (rule 2). Every descent moves >= 1 eighth exactly one level down,
+// so it strictly decreases the world's gravitational potential SUM(f * y),
+// which is a bounded integer. Descents alone can therefore never keep a chunk
+// awake forever; only the lateral rules need their own argument.
+
+// The four CORNER lateral directions — the diagonal complement of lateralDir().
+fn cornerDir(i : u32) -> vec2<i32> {
+  switch (i & 3u) {
+    case 0u: { return vec2<i32>( 1,  1); }
+    case 1u: { return vec2<i32>(-1,  1); }
+    case 2u: { return vec2<i32>(-1, -1); }
+    default: { return vec2<i32>( 1, -1); }
+  }
+}
+
+// Is `c` a WALL as far as a liquid is concerned? Solids and powders are; air,
+// gases and other liquids are not; unloaded space outside the residency window
+// is (DESIGN.md §3 — the sim's world edge is the window, and it is solid).
+fn liquidWall(c : vec3<i32>) -> bool {
+  if (!inBounds(c)) { return true; }
+  let wm = voxMat(voxWordAt(c));
+  if (wm == MAT_AIR) { return false; }
+  let k = materials[wm].klass;
+  return k == CLASS_SOLID || k == CLASS_POWDER;
+}
+
+// A corner descent must not squeeze through a SEALED DIAGONAL CRACK. Two walls
+// that meet at a corner leave a diagonal seam with no volume; letting water
+// through it would drain any box whose walls join, which is most of them. So a
+// corner counts as a path only when at least one of the two axis descents that
+// flank it is itself passable — the water goes AROUND the corner, never
+// through it.
+fn cornerDescentOpen(c : vec3<i32>, d : vec2<i32>) -> bool {
+  return !liquidWall(c + vec3<i32>(d.x, -1, 0)) ||
+         !liquidWall(c + vec3<i32>(0, -1, d.y));
+}
+
+// Move mass from `c` into `n`, one level below it. A same-liquid target takes a
+// PARTIAL transfer — exactly what stage 1 always did for the cell directly
+// below — and everything else goes through the whole-cell tryMove. Returns
+// whether anything moved. Mass-exact in both arms (transferLiquid and tryMove
+// are the only writers).
+fn tryDescend(c : vec3<i32>, n : vec3<i32>, w : u32, mat : u32, f : u32,
+              dens : i32) -> bool {
+  if (!inBounds(n)) { return false; }
+  let nw = voxWordAt(n);
+  if (voxMat(nw) == mat) {
+    let nf = voxState(nw) + 1u;
+    if (nf >= 8u) { return false; }
+    transferLiquid(c, n, mat, f, nf, min(f, 8u - nf));
+    return true;
+  }
+  return tryMove(c, n, w, dens, false);
+}
+
+// Read-only mirror of tryDescend, for canFlowAnywhere. These two MUST agree:
+// a predicate broader than the rule pins chunks awake forever (rule 2), one
+// narrower lets a cell sleep with work left.
+fn canDescend(c : vec3<i32>, n : vec3<i32>, mat : u32, dens : i32) -> bool {
+  if (!inBounds(n)) { return false; }
+  let nw = voxWordAt(n);
+  if (voxMat(nw) == mat) { return voxState(nw) + 1u < 8u; }
+  return canDisplace(dens, false, nw);
+}
+
+// ---- the last eighth: PLAN §1.1 defect 1, and its termination argument ------
+//
+// Lateral spread into air is repeated halving (8 -> 4 -> 2 -> 1) and stopped
+// dead at `f >= 2`, so every blob decayed into fullness-1 films that could
+// never move again. On the hill's stepped ramp that is fatal: a 2-cell tread's
+// INNER cell has terrain below it and terrain on both down-diagonals, so its
+// only exit is one lateral step to the tread's lip — which the halving rule
+// refuses to make once the cell is down to its last eighth.
+//
+// WHY THIS IS NOT SIMPLY "LET FULLNESS 1 SPREAD". A lone eighth allowed to
+// move sideways into air on FLAT ground is an unbounded random walk: it never
+// finds a resting state, its chunk never sleeps, and rule 2 is gone. There is
+// no reach-1 rule that can tell "one cell from the lip of a tread" from "one
+// cell from the middle of a floor" — that information is two cells away, and a
+// two-cell read is scheduling-dependent (the seesSky note). So the move has to
+// be justified by something the cell can actually see.
+//
+// WHAT IT CAN SEE: the STEP BEHIND IT. The condition is
+//
+//     the cell opposite the move is a wall, and the cell above THAT is not
+//
+// i.e. "I am standing at the foot of a riser exactly one voxel proud of my own
+// level" — which is precisely a terrace tread, and precisely where the water
+// wants to go on. The move is away from the riser, which on a terrace is
+// downhill.
+//
+// TERMINATION. After the step, the cell behind the film is the one it just
+// vacated: AIR, not a wall, so the same move cannot repeat. On flat open ground
+// there is no riser and the film never moves at all. Films therefore make at
+// most one step per riser they are standing against, and the world still
+// settles.
+//
+// THE ONE GEOMETRY THIS DOES NOT TERMINATE ON, stated because it is the honest
+// limit of the rule: two risers facing each other exactly 3 apart (walls, two
+// air cells between, both risers exactly one voxel tall) is symmetric, so a
+// film in it steps back and forth forever. No reach-1 predicate can break that
+// tie — the two cells have byte-identical neighbourhoods — and the `sleep` gate
+// is the arbiter for whether the generated world contains it. The "one voxel
+// tall" clause is what keeps the far more common case (a 2-wide slot between
+// two ordinary walls) out of the rule entirely.
+fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
+  let back = c - vec3<i32>(d.x, 0, d.y);
+  return liquidWall(back) && !liquidWall(back + vec3<i32>(0, 1, 0));
+}
+
 // Would stepLiquid() find anything to do for this cell? PURE READ — it makes
 // no writes at all, and every read is a face/diagonal neighbour (reach 1), so
 // it stays inside the colour lattice's guarantee exactly like the reaction
 // neighbour scans do.
 //
-// Exists so a viscous liquid on an off-tick can decide whether it is worth
-// staying awake for (see the moveEvery gate in main). The conditions below
-// MIRROR stepLiquid's three stages; if one drifts from the other the cost is a
-// pool that sleeps a tick early (and is woken by the next thing that touches
-// it) or one that stays awake without moving — not a correctness bug, but keep
-// them in step.
+// Exists for two callers now: a viscous liquid on an off-tick deciding whether
+// it is worth staying awake for (the moveEvery gate in main), and the SETTLED
+// path of stepLiquid — PLAN §1.1 defect 4, "a cell that found no move sleeps
+// and never retries". The conditions below MIRROR stepLiquid's stages one for
+// one; drift in the loose direction pins chunks awake forever (rule 2), drift
+// in the tight direction lets a cell sleep with work left, so keep them in
+// step. Same shape as the powder path's "nothing to do: cell settles".
 fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   let f = voxState(w) + 1u;
 
   // 1) down: a partial same-liquid cell to top up, or anything displaceable.
-  let below = c + vec3<i32>(0, -1, 0);
-  if (inBounds(below)) {
-    let bw = voxWordAt(below);
-    if (voxMat(bw) == mat) {
-      if (voxState(bw) + 1u < 8u) { return true; }
-    } else if (canDisplace(m.density, false, bw)) {
-      return true;
-    }
-  }
+  if (canDescend(c, c + vec3<i32>(0, -1, 0), mat, m.density)) { return true; }
 
-  // 2) the four down-diagonals.
+  // 2a) the four axis down-diagonals.
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
-    let n = c + vec3<i32>(d.x, -1, d.y);
-    if (!inBounds(n)) { continue; }
-    if (canDisplace(m.density, false, voxWordAt(n))) { return true; }
+    if (canDescend(c, c + vec3<i32>(d.x, -1, d.y), mat, m.density)) { return true; }
+  }
+  // 2b) the four corner down-diagonals, path-gated exactly as stepLiquid does.
+  for (var i = 0u; i < 4u; i++) {
+    let d = cornerDir(i);
+    if (!cornerDescentOpen(c, d)) { continue; }
+    if (canDescend(c, c + vec3<i32>(d.x, -1, d.y), mat, m.density)) { return true; }
   }
 
   // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
-  //    split into air, or displace something lighter.
+  //    split into air, step the last eighth off a riser, or displace something
+  //    lighter.
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
     let n = c + vec3<i32>(d.x, 0, d.y);
@@ -760,6 +884,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
       if (voxState(nw) + 1u + TUNE_LIQUID_EQUALIZE <= f) { return true; }
     } else if (nmat == MAT_AIR) {
       if (f >= 2u) { return true; }
+      if (filmStepAllowed(c, d) && canDisplace(m.density, false, nw)) { return true; }
     } else if (canDisplace(m.density, false, nw)) {
       return true;
     }
@@ -768,35 +893,52 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
 }
 
 // Mass-conserving liquid flow (fullness in eighths, DESIGN.md §4).
-fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : u32) {
+// Returns whether the cell moved any mass this substep; the caller uses that to
+// decide whether a settled cell still has a reason to stay awake (defect 4).
+fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : u32) -> bool {
   let f = voxState(w) + 1u;  // fullness 1..8
 
-  // 1) below: fill a partial same-liquid cell, else whole-cell move/swap
-  let below = c + vec3<i32>(0, -1, 0);
-  if (inBounds(below)) {
-    let bw = voxWordAt((below));
-    let bmat = voxMat(bw);
-    if (bmat == mat) {
-      let bf = voxState(bw) + 1u;
-      if (bf < 8u) {
-        transferLiquid(c, below, mat, f, bf, min(f, 8u - bf));
-        return;
-      }
-    } else if (tryMove(c, below, w, m.density, false)) {
-      return;  // air or a displaceable lighter fluid
-    }
-  }
+  // 1) straight down: top a partial same-liquid cell up, else move/swap whole.
+  if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) { return true; }
 
-  // 2) four down-diagonals, whole-cell only, RNG order
+  // 2a) the four AXIS down-diagonals, RNG order.
   let r = rnd >> 10u;
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
-    if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false)) { return; }
+    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) { return true; }
+  }
+  // 2b) the four CORNER down-diagonals, RNG order, after the axis ones (the
+  //     shorter path wins) and only where the corner is a real path and not a
+  //     sealed diagonal crack.
+  for (var i = 0u; i < 4u; i++) {
+    let d = cornerDir(i + r);
+    if (!cornerDescentOpen(c, d)) { continue; }
+    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) { return true; }
   }
 
-  // 3) lateral: equalize into a same-liquid neighbor holding >=2 less, split
-  //    into air (never below fullness 1 — thin films sit still and sleep),
-  //    or whole-cell displace a lighter fluid. RNG order.
+  // 3) lateral: equalize into a same-liquid neighbor holding at least the
+  //    equalize threshold less, split into air, step the LAST eighth off a
+  //    riser (filmStepAllowed), or whole-cell displace a lighter fluid.
+  //    RNG order.
+  //
+  //    On TUNE_LIQUID_EQUALIZE, which PLAN §1.1 names as defect 2: it stays 2,
+  //    and the reason is worth stating because "just lower it to 1" is the
+  //    obvious move and it does not work. `(f - nf) / 2u` is 0 when the
+  //    difference is exactly 1, so a threshold of 1 makes a cell permanently
+  //    "unstable", transfers nothing, and re-dirties its chunk forever. Forcing
+  //    the odd eighth across instead turns (k+1, k) into (k, k+1), which has
+  //    the SAME sum of squares — the diffusion's own Lyapunov function is flat
+  //    on that move — so the pair trades it back and forth and never rests. The
+  //    only tie-breaks available at reach 1 are position (a canonical direction
+  //    ratchets mass toward +x/+z and makes an ASCENDING wedge a stable state,
+  //    strictly worse) or the RNG (which oscillates). At eighth resolution
+  //    (k, k+1) IS the integer equilibrium of two same-height cells, so there
+  //    is nothing to fix there. The stable "1-eighth staircase" the plan is
+  //    actually complaining about is between cells at DIFFERENT heights, and
+  //    stage 2's new partial descent dissolves it outright: a cell one level
+  //    down that is not full now receives, with no threshold at all, because
+  //    moving mass downhill always strictly decreases SUM(f * y) and so can
+  //    never oscillate.
   let r2 = rnd >> 14u;
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r2);
@@ -808,18 +950,22 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
       let nf = voxState(nw) + 1u;
       if (nf + TUNE_LIQUID_EQUALIZE <= f) {
         transferLiquid(c, n, mat, f, nf, (f - nf) / 2u);
-        return;
+        return true;
       }
     } else if (nmat == MAT_AIR) {
       if (f >= 2u) {
         transferLiquid(c, n, mat, f, 0u, f / 2u);
-        return;
+        return true;
+      }
+      // the last eighth, off a one-voxel riser only — see filmStepAllowed
+      if (filmStepAllowed(c, d) && tryMove(c, n, w, m.density, false)) {
+        return true;
       }
     } else if (tryMove(c, n, w, m.density, false)) {
-      return;
+      return true;
     }
   }
-  // settled: no markDirty — a flat pool (all lateral diffs < 2) sleeps
+  return false;  // settled — the caller decides whether to stay awake
 }
 
 @compute @workgroup_size(6, 6, 6)
@@ -912,7 +1058,19 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   if (m.klass == CLASS_LIQUID) {
     // re-read: a reaction may have rewritten this cell's fullness
-    stepLiquid(c, idx, voxWordAt(c), mat, m, rnd);
+    let lw = voxWordAt(c);
+    if (!stepLiquid(c, idx, lw, mat, m, rnd)) {
+      // PLAN §1.1 defect 4. A cell that moved nothing this substep used to fall
+      // straight out with no markDirty, on the assumption that "found no move"
+      // means "settled". It does not always: the RNG-ordered scans return on
+      // the FIRST success, a neighbour may have taken the only exit earlier in
+      // the tick, and every stage can be refused for a reason that is gone next
+      // tick. So ask the mirror predicate, exactly as the viscous off-tick
+      // branch above does, and stay awake only while genuinely flow-unstable.
+      // A flat pool answers false and the chunk sleeps, which is the guarantee
+      // this line must not break (rule 2) — the `sleep` gate is its test.
+      if (canFlowAnywhere(c, lw, mat, m)) { markDirty(c); }
+    }
     return;
   }
 

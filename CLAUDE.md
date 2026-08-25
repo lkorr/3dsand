@@ -20,7 +20,7 @@ Claim before editing: `world.h`, `common.wgsl`, `simulation.cpp`, `main.cpp`, `C
 ## Three inviolable rules
 
 ### 1. Bit-deterministic simulation
-Same seed+tick+inputs → same world hash everywhere. Integer-only sim math (no f32 in CA). Stateless counter-based RNG: `hash3(seed,tick,cellIndex)`. No scheduling-dependent outcomes (no atomics-CAS, no subgroup ops). Write reach ≤1 cell. **Gate:** `--selftest` runs sim twice, compares hashes. Pinned hash: `7cfa2420`. If it moves, you broke the sim — stop and report.
+Same seed+tick+inputs → same world hash everywhere. Integer-only sim math (no f32 in CA). Stateless counter-based RNG: `hash3(seed,tick,cellIndex)`. No scheduling-dependent outcomes (no atomics-CAS, no subgroup ops). Write reach ≤1 cell. **Gate:** `--selftest` runs sim twice, compares hashes. Pinned hash: `7b01cfd8` (was `7cfa2420` before the CA liquid four-defect fix). If it moves, you broke the sim — stop and report.
 
 ### 2. Cost scales with activity, not world size
 Every system sleeps when idle. Dispatch over compacted dirty-chunk list via `DispatchWorkgroupsIndirect`, never full world. Chunks clear dirty flags and sleep when settled. Reaction growth must be subcritical (expected offspring/tick < 1). Selftest asserts ≤32 active chunks at rest. Bound every emergent process.
