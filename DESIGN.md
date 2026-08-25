@@ -574,14 +574,38 @@ mode 0 a base cell holding >= 2 eighths is exempt — that is the CA's own
 lateral-spread threshold (`sim_step`'s `if (f >= 2u)`), so the CA will move it
 and refusing would cause the freeze rather than prevent it.
 
-Settle's calm judgement also folds in the six FACE-NEIGHBOUR chunks' speed
-maxima, at the WAKE threshold: settle is per-chunk and wake is per-cell, so a
-chunk on the edge of churning water settled and was woken again the next tick
-(measured 3,833 eighths settled against 3,721 re-excited in one gate run). The
-neighbourhood HOLDS the calm counter rather than resetting it — "my water is
-moving" invalidates the window, "the water next door is" only means not yet.
-A refused block halves its counter instead of zeroing it, so an awkward pool
-gets a cooldown instead of re-running the whole window forever.
+THE VETO IS PER-COLUMN, NOT PER-BLOCK. Settle commits a 16³ block, and column
+feasibility is still all-or-nothing across it (partial conversion of a column
+is what would drop or invent mass). Excite-INSTABILITY is not: it is a property
+of one column, and refusing the block for it over-reaches badly. Measured on
+the sealed `fluid-excite` chamber, whose upper pool rests on an internal floor
+with a carved 4×4 drain plug: ~16 columns at the plug lip are genuinely perched
+and correctly vetoed, and they were refusing all 169 water columns of a flat
+pool every tick, forever. `settleCheck` now publishes a per-column bit
+(`SP_COLBAD`); `settleCommit` skips exactly those columns and `settleKill`
+spares exactly their particles, so refused water stays particles and the ledger
+balances column by column. The hysteresis guarantee survives the split: a
+refused neighbour column keeps its particles, so `seamNeighbourState` reads its
+excited eighths instead of its settled fill — nonzero either way, so the
+predicate cannot tell "settled" from "refused". A block that loses columns to
+the veto halves its calm counter, as a fully refused one does, so an awkward
+pool gets a cooldown instead of re-running the whole window forever.
+
+THE SOLVER'S FREE SURFACE IS NEVER AT REST, and every speed test in the seam
+corrects for it. Pressure comes from density ≥ rest, so the top layer of any
+pool has none, and `gridUpdate` adds `gravity / substeps` to it every substep
+with nothing to cancel it. Velocity is overwritten from the grid each substep
+(pure PIC+APIC), so it does not accumulate — it sits at exactly one substep of
+gravity forever, 3.3 vox/s at the shipped defaults. Because the calm judgement
+is a MAX over a chunk, one surface particle vetoed every pool in the engine,
+and the wake trigger fired on every settled cell touching any fluid node.
+`seamRestVy(vy) = min(|vy + gravity/substeps|, |vy|)` strips it in all three
+tests. The `min()` is forced, not defensive: `gridUpdate` applies the terrain
+BC *after* gravity, so a node resting on a floor reads exactly 0 while a
+free-surface node reads exactly `−gravity/substeps`, and only the min maps both
+to 0. This removes a systematic offset, NOT the threshold's dependence on
+gravity — `sim.fluidSettleEps` still has to clear the genuine turbulence of the
+scene, which scales with g (see `tuning.h` for the measured sweep).
 
 Excite marks candidates in
 voxel scratch bits 19..23 (set by detect, consumed the same tick by emit —
