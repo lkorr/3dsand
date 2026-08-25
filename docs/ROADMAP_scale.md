@@ -92,6 +92,11 @@ Pay it once; do not do 10→5 and later 5→2.5.
 > **[MEASURED 2026-08-22] The ranking below was written against a compute
 > anchor that is wrong by ~35x, and item 1 has since been built, measured, and
 > REVERTED as a net loss. Read §3.0 before acting on anything in this list.**
+>
+> **[MEASURED 2026-08-24] §3.0's 251 µs floor is ~2x high — it is 122–128 µs,
+> directly measured (§3.2a). Per-colour-phase dispatch skipping, the obvious
+> attack on that floor, is REFUTED (§3.2). The floor's remaining real lever is
+> §3.2d.**
 
 ### 3.0 The measured cost model (supersedes the §2 anchor)
 
@@ -184,6 +189,158 @@ moved.
 term dominates. That is a real regime for the 5 cm target, so this is
 "measured, not viable yet" rather than "wrong idea". The shader is recoverable
 from git history if so.
+
+### 3.2 was MEASURED AND REFUTED — per-colour-phase dispatch skipping
+
+**[MEASURED 2026-08-24, branch `perf/ca-phase-skip`. Nothing was built. Do not
+re-derive this.]**
+
+§3.0 ends by saying the fixed floor "is attacked only by ISSUING FEWER
+DISPATCHES" and proposes no way to do it. The obvious way is to generalise
+§3.4: a colour phase only has work if some dirty chunk holds a cell of that
+phase's colour, so skip iteration k when phase k's set is empty. **It does not
+work, and the reason is content, not engineering.**
+
+#### 3.2a The floor has MOVED — 122 µs/tick, not 251
+
+§3.0's floor was the *intercept* of a three-point least-squares fit. It is now
+measured directly: `SANDVOX_CA_FORCE=1` defeats §3.4's settled skip so a
+SETTLED world still records all 54 CA iterations with an indirect count of
+**zero**, making the `ca(...)` row the pure content-free cost;
+`SANDVOX_CA_REPEAT=n` truncates the loop to n so the per-dispatch cost is a
+SLOPE, not an intercept. Both knobs live on the branch (`simulation.cpp`,
+`vk_record.cpp`), are env-gated and default-off. RTX 3060 Ti, seed 1337,
+`--measure` scenario (c), 120 ticks:
+
+| CA iterations recorded | `ca(...)` µs/tick |
+|---|---|
+| 0 | 0.099 |
+| 6 | 17.819 |
+| 27 | 67.137 |
+| 54 | 122.502 / 128.099 (two runs) |
+
+Least squares: **2.25 µs per recorded empty dispatch, +3.0 µs fixed** → the
+full 54-iteration floor is **122–128 µs/tick, not 251**. §3.0's figure was
+~2× high because the intercept absorbed the per-chunk term's curvature. Every
+"floor share" percentage in §3.0 should be roughly halved. What did NOT change
+is the shape: the cost is paid per *recorded* dispatch, so it is a CPU
+record-time cost, which is why §3.4 had to be a CPU latch and why any successor
+must be one too.
+
+#### 3.2b The empty-phase fraction is ZERO in every real scenario
+
+`--measure` gained MEASUREMENT 3 (`SANDVOX_PHASE_HIST=1`): each tick it reads
+the dirty flags and every dirty chunk's voxels and asks, per colour c in 0..26,
+whether any cell of colour c passes `matCanAct` (common.wgsl:118 — the
+predicate `sim_step` itself early-outs on). This is measured on FRESH,
+UNDILATED state, so it is a strict upper bound on any implementable mechanism.
+
+| scenario | active chunks/tick | colours per dirty CHUNK | **empty phases / 27** |
+|---|---|---|---|
+| (b) ACTIVE | 3.0 | 19.61 | **0.000 (0.00%)** |
+| (a) SETTLING | 25.0 | 25.72 | **0.000 (0.00%)** |
+| (d) HEAVY | 44.0 | 20.45 | **0.021 (0.08%)** |
+| (e) MINIMAL — ONE grain | 0.7 | 7.52 | 18.44 (68.31%) |
+
+**The prior in §3.1 bug 2 was right.** A chunk is in the dirty list because
+`markDirty` wakes every chunk a written cell BORDERS, and a woken chunk is a
+16³ box of terrain: ONE dirty chunk already holds actionable cells of ~20 of
+the 27 colours, and the union over two or more saturates. Over 190 active ticks
+across the three real scenarios the union was empty at a colour **once**, on a
+single HEAVY tick.
+
+Scenario (e) MINIMAL was added specifically to give the idea its best possible
+case: one sand voxel released into empty sky 40 cells above the terrain, every
+40 ticks — a single acting cell in a dirty set of one or two nearly-all-air
+chunks. Nothing the engine can do is smaller. Even there, the 68% collapses as
+soon as the grain nears the ground (the distribution is `26 empty:30 ticks,
+14–15 empty:24 ticks, 0 empty:7 ticks` — 26 while falling through sky, ~14 once
+a terrain chunk is in the set).
+
+#### 3.2c Conservatism eats even the MINIMAL case
+
+The 68% is unreachable, because the decision is made on the CPU at record time
+from a readback that is at least a tick old. Two dilations are mandatory:
+
+1. **Movement.** Between the readback and the tick, cells move. The exact
+   write-target set of `sim_step.wgsl` (self + `tryMove` + `transferLiquid` +
+   `doReactions`' `faceDir` products) is 15 of the 27 offsets: self, the 6
+   faces, and the 8 vertical diagonals. Dilating one occupied colour by that
+   set gives 15 colours before anything else is considered — and there are TWO
+   gravity substeps per tick, so composing it with itself reaches all 27.
+2. **Dirty-set growth.** This is the killer, and it is §3.1's bug 2 restated at
+   colour granularity: a chunk *entering* the dirty list brings its ENTIRE
+   contents' colour set with it — terrain the previous tick's colour set never
+   mentioned. Any tick on which the dirty set grows must fall back to all-27.
+   Measured frequency of growth on dispatching ticks: **42/54 ACTIVE, 18/38
+   SETTLING, 45/97 HEAVY, 11/60 MINIMAL**.
+
+Plus §3.4's existing op/particle fallback, since ops, explosions and particle
+reinsertion place matter at arbitrary colours.
+
+Measured over only the ticks that actually dispatch work (so nothing here is
+double-counting §3.4's win):
+
+| scenario | movement dilation only | **+ dirty-set growth (sound)** |
+|---|---|---|
+| (b) ACTIVE | 0.00% | **0.00%** |
+| (a) SETTLING | 0.00% | **0.00%** |
+| (d) HEAVY | 0.00% | **0.00%** |
+| (e) MINIMAL | 22.22% (3 model VIOLATIONS) | **17.78%** |
+
+The ceiling on the whole idea is therefore `0.00% × 122 µs = 0 µs/tick` in
+every scenario except a single grain falling through empty sky, where it is
+`17.78% × 122 µs ≈ 22 µs` on 60 of 120 ticks — about 7% of that scenario's CA
+time, for a per-phase readback, a new buffer, a `pass_table.def` row, and a
+new class of hash bug.
+
+**And the model was still not sound.** The harness cross-checks its own
+prediction against the truth and counted **3 violations in 60 MINIMAL ticks**
+even with both fallbacks in place — ticks where real work appeared at a colour
+the model had proved empty. In a real implementation each one is a wrong world
+hash. A correct version needs strictly more conservatism than was modelled
+here, and the modelled version already wins nothing.
+
+**Do not revisit at 5 cm.** Halving the voxel size makes events cover MORE
+chunks, and a chunk's colour coverage is already saturated at 10 cm. This gets
+monotonically worse, not better — unlike §3.1, which is "measured, not viable
+yet".
+
+#### 3.2d The lever that IS there: §3.4 is being held off by a 400-tick timer
+
+The same instrumentation found a real one. In `--measure` scenario (b) ACTIVE,
+**66 of 120 ticks have a completely EMPTY dirty set, yet `CA skipped on 0/120`**
+— every one of those ticks records all 54 dispatches, the `compact` scan of
+32,768 dirty flags and the args staging copy, and dispatches zero workgroups.
+At the measured floor that is `66 × ~125 µs ≈ 8.3 ms` in a 120-tick window:
+**~17% of all CA GPU time in the ACTIVE scenario, spent on nothing, on ticks
+§3.4's mechanism was built to skip.**
+
+The blocker is `particlesActive`, which `main.cpp` computes as
+`everExploded && (tick - lastExplosionTick < 400 || Snap().particleCount > 0)`
+and `EncodeTick` folds into `inputsThisTick`, resetting `lastDirtyTick_` every
+tick and so preventing `settledProven_` from ever latching. **13.3 seconds of
+wall clock after every single explosion, the settled-tick skip is off.** The
+term is legitimately there — a particle rejoining the grid writes voxels and
+marks `dirtyOut`, and the CPU learns of it only via a snapshot — but 400 ticks
+is a blunt stand-in for "a snapshot old enough to be conclusive", which is
+exactly the invariant `NoteSnapshot(snapTick, activeChunks)` already implements
+via `snapTick >= lastDirtyTick_`.
+
+The shape of the fix (NOT built, NOT measured): keep `particlesActive` as-is
+for the particle passes — it must stay true or live particles stop simulating —
+but stop feeding the 400-tick timer into the CA-skip decision. Instead bump
+`lastDirtyTick_` on particle SPAWNS only, and require the clearing snapshot to
+show `particleCount == 0` as well as `activeChunks == 0`. Then "no spawns since
+snapTick, and that snapshot saw no particles and no dirty chunks" proves
+nothing can write voxels, on exactly the machinery §3.4 already has. It is
+hash-neutral by construction (a tick where nothing would be dispatched), so
+acceptance is bit-identical `7cfa2420`, and the trap to watch is the one-tick
+window between a resolve and the snapshot that reports it — a skip taken there
+does not corrupt the world, it processes the chunk a tick LATE, which moves the
+hash. HEAVY (23 empty ticks, 15 skips) and MINIMAL (59 empty, 56 skips) show
+the latch working when nothing holds it off, so the residual there is small;
+ACTIVE is where all the loss is.
 
 ---
 

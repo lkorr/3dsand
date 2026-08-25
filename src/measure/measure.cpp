@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <utility>
@@ -37,6 +38,7 @@
 #include "gpu/context.h"
 #include "gpu/passtimer.h"
 #include "gpu/resources.h"
+#include "sim/materials.h"
 #include "sim/pagetable.h"
 #include "sim/simulation.h"
 #include "sim/world.h"
@@ -423,6 +425,269 @@ struct Scenario {
   uint32_t ticks;
 };
 
+// ---------------------------------------------------------------------------
+// MEASUREMENT 3: PER-COLOUR-PHASE OCCUPANCY OF THE DIRTY SET.
+//
+// The question this exists to answer (ROADMAP_scale.md §3.0's open end): the
+// CA's 251 µs/tick floor is 54 RECORDED dispatches, and the only lever on it
+// is recording fewer. §3.4 already skips all 54 when the whole dirty set is
+// empty. Could a per-COLOUR version skip iteration k when no dirty chunk holds
+// a cell of colour k that can act?
+//
+// This measures the CEILING on that idea, and the ceiling only. For each
+// sampled tick it reads the dirty flags and the voxels of every dirty chunk,
+// and asks, per colour c in 0..26:
+//
+//   nonAir[c]  — any non-air cell of colour c anywhere in the dirty set?
+//                (the loosest conceivable skip predicate: even an oracle that
+//                 knew the future could not skip a phase that has matter it
+//                 might have to move.)
+//   canAct[c]  — any cell of colour c passing matCanAct() (common.wgsl:118),
+//                i.e. not a plain inert solid? This is the predicate sim_step
+//                itself uses to return early, and it is the tightest predicate
+//                a CHEAP per-phase mask could evaluate.
+//
+// Both are measured on FRESH, UNDILATED state — strictly better than anything
+// an implementable mechanism could use, since a CPU-side latch (which is what
+// §3.4 is, and what a per-phase version would have to be, because the 4.65 µs
+// is paid at RECORD time on the CPU) can only ever see a readback that is at
+// least one tick stale and must then be dilated for movement. So:
+//
+//     empty-phase fraction measured here  >=  any achievable win.
+//
+// Colour encoding matches simulation.cpp's passUBO fill exactly:
+//   c = (Z%3)*9 + (Y%3)*3 + (X%3), in WORLD cell coords (the lattice is
+//   global — CLAUDE.md's first critical invariant).
+struct PhaseHist {
+  uint64_t ticks = 0;          // sampled ticks with a non-empty dirty set
+  uint64_t settledTicks = 0;   // sampled ticks with an EMPTY dirty set
+  uint64_t emptyCanActSum = 0; // sum over ticks of #{c : canAct[c] == 0}
+  uint64_t emptyNonAirSum = 0; // sum over ticks of #{c : nonAir[c] == 0}
+  uint32_t minEmptyCanAct = 27, maxEmptyCanAct = 0;
+  uint64_t histEmptyCanAct[28] = {};  // how many ticks had exactly k empty
+  // Per-CHUNK diagnostic: how many of the 27 colours does ONE dirty chunk
+  // hold actionable cells of? This is the number that explains the result —
+  // if it saturates at 27 the whole idea is dead no matter how few chunks are
+  // dirty, because the union over chunks can only grow.
+  uint64_t chunks = 0;
+  uint64_t chunkColoursSum = 0;
+  uint32_t chunkColoursMin = 28, chunkColoursMax = 0;
+  uint64_t chunkAllAir = 0;  // dirty chunks that are entirely air (the §3.1
+                             // bug-2 case: dilated in by a neighbour)
+
+  // ---- what an IMPLEMENTABLE mechanism could prove --------------------------
+  // The 4.65/2.27 µs is paid when the dispatch is RECORDED, on the CPU, so a
+  // per-phase skip has to be a CPU latch like §3.4's — and the CPU's only view
+  // of colour occupancy is a readback that is at least one tick old. Between
+  // that readback and the tick being recorded, cells MOVE, so last tick's
+  // occupied-colour set must be DILATED by every offset the CA can write to
+  // before it can be trusted.
+  //
+  // The exact write-target set of sim_step.wgsl (self + tryMove + transferLiquid
+  // + doReactions' faceDir products) is 15 of the 27 offsets:
+  //     (0,0,0); the 6 faces; the 8 vertical diagonals (±1,±1,0)/(0,±1,±1).
+  // The 4 horizontal diagonals and the 8 corners are unreachable in one tick.
+  // Modelled at ONE tick of lag, which is the most optimistic lag the engine
+  // has. `staleUnsafe` counts ticks where the dilated set FAILED to cover the
+  // true set — it must stay 0 or the offset model above is wrong.
+  //
+  // Measured ONLY on ticks whose dirty set is non-empty, because a tick with an
+  // empty dirty set is already handled in full by §3.4 — counting those would
+  // credit this idea with the settled skip's existing win.
+  //
+  // TWO models, and the difference between them is the whole answer:
+  //   `staleEmptySum`     — colour dilation only.
+  //   `staleSoundSum`     — colour dilation AND the newly-dirtied-chunk
+  //                         fallback. `markDirty` wakes every chunk a written
+  //                         cell BORDERS, and a chunk entering the dirty list
+  //                         brings its ENTIRE contents' colour set with it —
+  //                         terrain that was nowhere in last tick's set. Last
+  //                         tick's colours therefore say nothing about it, so
+  //                         a correct latch must fall back to all-27 on any
+  //                         tick where the dirty set GREW. This is ROADMAP
+  //                         §3.1's bug 2, restated at colour granularity.
+  uint64_t staleTicks = 0, staleEmptySum = 0, staleUnsafe = 0;
+  uint64_t staleInputTicks = 0, staleSoundSum = 0, staleGrewTicks = 0;
+  uint32_t staleEmptyMax = 0;
+  bool prevValid = false;
+  bool prevAct[27] = {};
+  std::vector<uint8_t> prevDirty;
+
+  void Print(const char* label) const {
+    const uint64_t n = ticks + settledTicks;
+    std::printf("\n  --- MEASUREMENT 3: colour-phase occupancy — %s ---\n", label);
+    std::printf("    sampled ticks: %" PRIu64 " (%" PRIu64 " with a non-empty "
+                "dirty set, %" PRIu64 " settled)\n", n, ticks, settledTicks);
+    if (ticks == 0) {
+      std::printf("    no active ticks — nothing to say about phase skipping\n");
+      return;
+    }
+    std::printf("    dirty chunks sampled: %" PRIu64 "; of those %" PRIu64
+                " (%.1f%%) are ALL AIR\n", chunks, chunkAllAir,
+                chunks ? 100.0 * (double)chunkAllAir / (double)chunks : 0.0);
+    std::printf("    colours with actionable cells PER DIRTY CHUNK: "
+                "%.2f avg (min %u, max %u) of 27\n",
+                chunks ? (double)chunkColoursSum / (double)chunks : 0.0,
+                chunkColoursMin == 28 ? 0 : chunkColoursMin, chunkColoursMax);
+    std::printf("    EMPTY colour phases per ACTIVE tick (union over the whole "
+                "dirty set):\n");
+    std::printf("      by matCanAct : %.3f / 27  (%.2f%%)   min %u  max %u\n",
+                (double)emptyCanActSum / (double)ticks,
+                100.0 * (double)emptyCanActSum / (double)ticks / 27.0,
+                minEmptyCanAct == 27 && maxEmptyCanAct == 0 ? 0 : minEmptyCanAct,
+                maxEmptyCanAct);
+    std::printf("      by non-air   : %.3f / 27  (%.2f%%)\n",
+                (double)emptyNonAirSum / (double)ticks,
+                100.0 * (double)emptyNonAirSum / (double)ticks / 27.0);
+    std::printf("      distribution (empty-phase count -> ticks):");
+    bool any = false;
+    for (uint32_t k = 0; k <= 27; k++)
+      if (histEmptyCanAct[k]) {
+        std::printf(" %u:%" PRIu64, k, histEmptyCanAct[k]);
+        any = true;
+      }
+    if (!any) std::printf(" (none)");
+    std::printf("\n");
+    std::printf("    what a ONE-TICK-STALE CPU latch could prove empty, over "
+                "the %" PRIu64 " ticks\n    that DISPATCH work (i.e. "
+                "incremental over §3.4's settled skip):\n", staleTicks);
+    std::printf("      movement dilation only : %.3f / 27  (%.2f%%)  max %u   "
+                "[VIOLATIONS: %" PRIu64 "]\n",
+                staleTicks ? (double)staleEmptySum / (double)staleTicks : 0.0,
+                staleTicks ? 100.0 * (double)staleEmptySum / (double)staleTicks / 27.0
+                           : 0.0,
+                staleEmptyMax, staleUnsafe);
+    std::printf("      + newly-dirtied-chunk  : %.3f / 27  (%.2f%%)   <- THE "
+                "SOUND MODEL\n",
+                staleTicks ? (double)staleSoundSum / (double)staleTicks : 0.0,
+                staleTicks ? 100.0 * (double)staleSoundSum / (double)staleTicks / 27.0
+                           : 0.0);
+    std::printf("      surrendered: %" PRIu64 " ticks to the op/particle "
+                "fallback, %" PRIu64 " to dirty-set growth\n",
+                staleInputTicks, staleGrewTicks);
+  }
+};
+
+// One sample. Blocking readbacks; measurement harness only.
+void SamplePhaseOccupancy(GpuContext& ctx, World& world, Simulation& sim,
+                          const std::vector<MaterialDef>& mats, PhaseHist& h,
+                          bool inputsThisTick) {
+  static std::vector<uint32_t> flags;
+  static std::vector<uint32_t> chunk;
+  flags.assign(kNumChunks, 0);
+  chunk.resize(kChunkVol);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                        flags.data(), (size_t)kNumChunks * 4, "phaseDirtyRead");
+
+  // matCanAct, on the CPU, from the same compiled table the GPU is handed.
+  auto canAct = [&mats](uint32_t mat) {
+    if (mat >= mats.size()) return true;  // unknown id: assume it acts
+    const MaterialGpu& g = mats[mat].gpu;
+    return g.klass != CLASS_SOLID || g.reactCount > 0u || (g.stainPack & 0x7u) != 0u;
+  };
+
+  bool nonAir[27] = {}, act[27] = {};
+  uint64_t dirty = 0;
+  bool grew = false;  // did a chunk ENTER the dirty set since the last sample?
+  if (h.prevDirty.size() != kNumChunks) { h.prevDirty.assign(kNumChunks, 0); grew = true; }
+  for (uint32_t slot = 0; slot < kNumChunks; slot++) {
+    if (flags[slot] == 0) continue;
+    if (!h.prevDirty[slot]) grew = true;
+    dirty++;
+    ReadVoxelsSync(ctx, world, slot, 1, chunk.data(), "phaseVoxRead");
+    const IVec3 wc = world.SlotToWorldChunk(slot);
+    const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+              bz = wc.z * (int)kChunk;
+    // (X%3) for a whole chunk row is just (bx + lx) % 3; precompute the base
+    // residues once so the inner loop is three table lookups.
+    auto res = [](int b) { return ((b % 3) + 3) % 3; };
+    const int rx0 = res(bx), ry0 = res(by), rz0 = res(bz);
+    bool chunkAct[27] = {};
+    bool anyNonAir = false;
+    for (uint32_t k = 0; k < kChunkVol; k++) {
+      const uint32_t w = chunk[k];
+      const uint32_t mat = w & 0xFFFu;
+      if (mat == 0u) continue;  // MAT_AIR
+      anyNonAir = true;
+      const uint32_t lx = k % kChunk, ly = (k / kChunk) % kChunk,
+                     lz = k / (kChunk * kChunk);
+      const uint32_t c = (uint32_t)((rz0 + (int)lz) % 3) * 9u +
+                         (uint32_t)((ry0 + (int)ly) % 3) * 3u +
+                         (uint32_t)((rx0 + (int)lx) % 3);
+      nonAir[c] = true;
+      if (canAct(mat)) { act[c] = true; chunkAct[c] = true; }
+    }
+    uint32_t nc = 0;
+    for (uint32_t c = 0; c < 27; c++) nc += chunkAct[c] ? 1u : 0u;
+    h.chunks++;
+    h.chunkColoursSum += nc;
+    h.chunkColoursMin = std::min(h.chunkColoursMin, nc);
+    h.chunkColoursMax = std::max(h.chunkColoursMax, nc);
+    if (!anyNonAir) h.chunkAllAir++;
+  }
+
+  // The stale-latch model, evaluated against the truth we just computed.
+  // `inputsThisTick` is §3.4's own disjunction: a tick carrying mutation ops,
+  // explosions, spawns or live particles can put matter at ANY colour, so a
+  // correct latch must fall back to "all 27 active" exactly as the settled
+  // skip does. Without this fallback the model MIS-PREDICTS (staleUnsafe > 0),
+  // which in a real implementation is a wrong world hash.
+  //
+  // Counted only where it can pay: `dirty != 0` means the CA is dispatching
+  // real work this tick, so §3.4's whole-set skip cannot fire and anything
+  // proved here is INCREMENTAL. (Crediting the empty-dirty-set ticks would be
+  // double-counting the settled skip, which already takes all 54.)
+  if (h.prevValid && dirty != 0 && inputsThisTick) {
+    h.staleTicks++;
+    h.staleInputTicks++;
+    if (grew) h.staleGrewTicks++;
+  } else if (h.prevValid && dirty != 0) {
+    static const int kOff[15][3] = {
+        {0, 0, 0},  {1, 0, 0},  {-1, 0, 0}, {0, 1, 0},  {0, -1, 0},
+        {0, 0, 1},  {0, 0, -1}, {1, 1, 0},  {-1, 1, 0}, {1, -1, 0},
+        {-1, -1, 0}, {0, 1, 1}, {0, 1, -1}, {0, -1, 1}, {0, -1, -1}};
+    bool dil[27] = {};
+    for (uint32_t c = 0; c < 27; c++) {
+      if (!h.prevAct[c]) continue;
+      const int cx = (int)(c % 3), cy = (int)((c / 3) % 3), cz = (int)(c / 9);
+      for (const auto& o : kOff)
+        dil[(uint32_t)(((cz + o[2] + 3) % 3) * 9 + ((cy + o[1] + 3) % 3) * 3 +
+                       ((cx + o[0] + 3) % 3))] = true;
+    }
+    uint32_t se = 0;
+    bool unsafe = false;
+    for (uint32_t c = 0; c < 27; c++) {
+      if (!dil[c]) se++;
+      if (act[c] && !dil[c]) unsafe = true;  // the model missed real work
+    }
+    h.staleTicks++;
+    h.staleEmptySum += se;
+    h.staleEmptyMax = std::max(h.staleEmptyMax, se);
+    if (unsafe) h.staleUnsafe++;
+    // The SOUND model additionally surrenders every tick on which a chunk
+    // entered the dirty set — see the header comment: a new chunk's terrain is
+    // at colours last tick's set never mentioned.
+    if (grew) h.staleGrewTicks++;
+    else h.staleSoundSum += se;
+  }
+  std::memcpy(h.prevAct, act, sizeof(act));
+  for (uint32_t i = 0; i < kNumChunks; i++) h.prevDirty[i] = flags[i] ? 1u : 0u;
+  h.prevValid = true;
+
+  if (dirty == 0) { h.settledTicks++; return; }
+  uint32_t emptyAct = 0, emptyNon = 0;
+  for (uint32_t c = 0; c < 27; c++) {
+    if (!act[c]) emptyAct++;
+    if (!nonAir[c]) emptyNon++;
+  }
+  h.ticks++;
+  h.emptyCanActSum += emptyAct;
+  h.emptyNonAirSum += emptyNon;
+  h.minEmptyCanAct = std::min(h.minEmptyCanAct, emptyAct);
+  h.maxEmptyCanAct = std::max(h.maxEmptyCanAct, emptyAct);
+  h.histEmptyCanAct[emptyAct]++;
+}
+
 void PrintPassTable(const char* label, const PassTimer& timer, uint32_t ticks,
                     double wallMsPerTick, uint32_t passesPerTick,
                     uint64_t caSkips, double avgActive, uint32_t maxActive) {
@@ -470,7 +735,9 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
                      PassTimer& timer, uint32_t firstTick, uint32_t ticks,
                      bool withExplosions, uint32_t* passesPerTick,
                      uint64_t* caSkips, double* avgActive, uint32_t* maxActive,
-                     uint32_t heavyEvery = 0, int heavyRadius = 0) {
+                     uint32_t heavyEvery = 0, int heavyRadius = 0,
+                     PhaseHist* phase = nullptr,
+                     const std::vector<MaterialDef>* mats = nullptr) {
   double t0 = NowSeconds();
   uint32_t passes = 0;
   const uint64_t skips0 = sim.CaSkipCount();
@@ -523,6 +790,14 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
       activeMax = std::max(activeMax, sn.activeChunks);
       activeSamples++;
     }
+    // MEASUREMENT 3. Sampled AFTER the tick and its WaitIdle, so the dirty
+    // flags read are exactly the set the NEXT tick's CA will dispatch over —
+    // which is the set a per-phase skip decision would have to be made about.
+    // The blocking reads here dilate wall clock; they cannot touch the GPU
+    // pass timings, which is what the model is fitted to.
+    if (phase && mats)
+      SamplePhaseOccupancy(ctx, world, sim, *mats, *phase,
+                           !exps.empty() || withExplosions);
   }
   double dt = NowSeconds() - t0;
   if (passesPerTick) *passesPerTick = passes;
@@ -535,7 +810,8 @@ double RunTimedTicks(GpuContext& ctx, World& world, Simulation& sim,
 
 }  // namespace
 
-int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
+int RunMeasure(GpuContext& ctx, World& world, Simulation& sim,
+               const std::vector<MaterialDef>& mats) {
   SetHarnessSnapshotDrain(true);  // see test/support.h
   std::printf("=== sandvox --measure: Vulkan-port sizing ===\n");
   std::printf("timestamp queries: %s\n",
@@ -615,6 +891,16 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
 
   const uint32_t kPerScenario = 120;
 
+  // MEASUREMENT 3 accumulators, one per scenario. Opt-in via SANDVOX_PHASE_HIST=1
+  // because the per-tick blocking voxel reads it needs cost far more wall clock
+  // than the tick does — it must not silently slow the default sizing run.
+  const bool phaseHistOn = [] {
+    const char* e = std::getenv("SANDVOX_PHASE_HIST");
+    return e && e[0] == '1';
+  }();
+  PhaseHist phSettled, phActive, phSettling, phHeavy;
+  const std::vector<MaterialDef>* pm = phaseHistOn ? &mats : nullptr;
+
   // (c) SETTLED — measured first, because it is the state we are already in
   // and running the active scenario would destroy it.
   {
@@ -624,7 +910,7 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, kSettleTicks + 1,
                                 kPerScenario, false, &ppt, &skips, &avgAct,
-                                &maxAct);
+                                &maxAct, 0, 0, phaseHistOn ? &phSettled : nullptr, pm);
     PrintPassTable("(c) SETTLED world (no edits, chunks asleep)", timer,
                    kPerScenario, wall, ppt, skips, avgAct, maxAct);
   }
@@ -637,7 +923,8 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer,
                                 kSettleTicks + kPerScenario + 1, kPerScenario,
-                                true, &ppt, &skips, &avgAct, &maxAct);
+                                true, &ppt, &skips, &avgAct, &maxAct, 0, 0,
+                                phaseHistOn ? &phActive : nullptr, pm);
     PrintPassTable("(b) ACTIVE world (explosion every 20 ticks + particles)",
                    timer, kPerScenario, wall, ppt, skips, avgAct, maxAct);
   }
@@ -658,7 +945,8 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     uint64_t skips = 0;
     double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, 1, kPerScenario, false,
-                                &ppt, &skips, &avgAct, &maxAct);
+                                &ppt, &skips, &avgAct, &maxAct, 0, 0,
+                                phaseHistOn ? &phSettling : nullptr, pm);
     PrintPassTable("(a) SETTLING world (first ticks after worldgen)", timer,
                    kPerScenario, wall, ppt, skips, avgAct, maxAct);
   }
@@ -682,9 +970,82 @@ int RunMeasure(GpuContext& ctx, World& world, Simulation& sim) {
     uint64_t skips = 0;
     double avgAct = 0; uint32_t maxAct = 0;
     double wall = RunTimedTicks(ctx, world, sim, timer, 201, kPerScenario, false,
-                                &ppt, &skips, &avgAct, &maxAct, 4, 30);
+                                &ppt, &skips, &avgAct, &maxAct, 4, 30,
+                                phaseHistOn ? &phHeavy : nullptr, pm);
     PrintPassTable("(d) HEAVY world (r=30 blast every 4 ticks, walked)", timer,
                    kPerScenario, wall, ppt, skips, avgAct, maxAct);
+  }
+
+  // (e) MINIMAL — the SMALLEST event the engine can have, and therefore the
+  // best case the per-phase-skip hypothesis will ever get. ONE powder voxel
+  // released 40 cells above the terrain, every 40 ticks, into empty sky: a
+  // single acting cell, a dirty set of one or two chunks that are almost
+  // entirely air. If a per-colour skip cannot win here it cannot win anywhere,
+  // because every other scenario is this one plus more matter.
+  PhaseHist phMinimal;
+  {
+    // Any powder will do; sand by name so the scene is describable.
+    uint32_t sandId = 0;
+    for (uint32_t i = 0; i < (uint32_t)mats.size(); i++)
+      if (mats[i].name == "sand") { sandId = i; break; }
+    if (sandId == 0)
+      for (uint32_t i = 1; i < (uint32_t)mats.size(); i++)
+        if (mats[i].gpu.klass == CLASS_POWDER) { sandId = i; break; }
+
+    sim.SetPassTimer(nullptr);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    for (uint32_t t = 1; t <= 200; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false,
+                 {8, 3, 8}, true, false);
+    ctx.WaitIdle();
+    if (haveTimer) sim.SetPassTimer(&timer);
+    timer.ResetStats();
+
+    const int gx = 100, gz = 100;
+    const int gy = World::TerrainHeight(gx, gz, kDefaultSeed) + 40;
+    double t0 = NowSeconds();
+    uint32_t ppt = 0;
+    const uint64_t skips0 = sim.CaSkipCount();
+    uint64_t activeSum = 0;
+    uint32_t activeMax = 0, activeSamples = 0;
+    for (uint32_t i = 0; i < kPerScenario; i++) {
+      const uint32_t t = 401 + i;
+      std::vector<CellOp> cells;
+      if ((i % 40) == 0)
+        cells.push_back({World::SlotCellIndex({gx, gy, gz}), sandId & 0xFFFu});
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cells, false,
+                 {8, 3, 8}, true, false);
+      if (i == 0) ppt = timer.PassesThisBuffer() / 2;
+      ctx.WaitIdle();
+      timer.Collect(ctx);
+      const WorldSnapshot& sn = world.Snap();
+      if (sn.valid) {
+        activeSum += sn.activeChunks;
+        activeMax = std::max(activeMax, sn.activeChunks);
+        activeSamples++;
+      }
+      if (phaseHistOn)
+        SamplePhaseOccupancy(ctx, world, sim, mats, phMinimal, !cells.empty());
+    }
+    const double wall = (NowSeconds() - t0) / (double)kPerScenario;
+    PrintPassTable("(e) MINIMAL (one sand voxel dropped every 40 ticks)", timer,
+                   kPerScenario, wall, ppt, sim.CaSkipCount() - skips0,
+                   activeSamples ? (double)activeSum / (double)activeSamples : 0.0,
+                   activeMax);
+  }
+
+  if (phaseHistOn) {
+    std::printf("\n=== MEASUREMENT 3: per-colour-phase occupancy of the dirty "
+                "set ===\n");
+    std::printf("  Ceiling on per-phase CA dispatch skipping. See the comment on\n"
+                "  PhaseHist: these are FRESH, UNDILATED numbers, so they bound\n"
+                "  any implementable (stale, dilated) mechanism from above.\n");
+    phSettled.Print("(c) SETTLED");
+    phActive.Print("(b) ACTIVE");
+    phSettling.Print("(a) SETTLING");
+    phHeavy.Print("(d) HEAVY");
+    phMinimal.Print("(e) MINIMAL");
   }
 
   sim.SetPassTimer(nullptr);
