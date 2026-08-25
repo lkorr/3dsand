@@ -337,6 +337,7 @@ add_executable(sandvox
   src/test/selftest.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
+  src/test/selftest_wind.cpp
   src/test/selftest_render.cpp
   src/test/selftest_player.cpp
   src/test/selftest_phys.cpp

@@ -38,6 +38,59 @@ constexpr uint32_t kMatFlagMicro = 4;
 // that needs changing.
 constexpr uint32_t kMatFlagPassable = 8;
 
+// ---- wind coupling, packed into the SAME flags word ------------------------
+// docs/RESEARCH_wind.md §4.5, invariant 7. Bits 0..7 are the MATF_* booleans
+// above (4 used, 4 spare); bits 8..11 and 12..15 are two authored 4-bit
+// numbers; 16..31 are free.
+//
+// Packed rather than added as fields because MaterialGpu is exactly 64 bytes
+// with no spare word, and growing a struct every sim thread reads to buy eight
+// bits is the worse trade — the call stainPack already made. `flags`
+// specifically is safe because every reader on both sides of the language
+// boundary tests it with a MASK; not one compares the word whole.
+//
+// response: how hard the field pushes this material, 0 (wind does not touch it,
+//   and every consumer early-outs) to 15 (it goes where the air goes).
+// friction: the ENTRAINMENT threshold — how hard a per-axis wind must blow to
+//   pull a SETTLED grain loose. A different axis from response, not a scaling
+//   of it: snow lifts in a breeze and then flies far, wet sand needs a gale and
+//   then barely moves.
+//
+// Authored in materials.json as `"wind": {"response": n, "friction": n}`;
+// absent means DeriveWindResponse/DeriveWindFriction below pick a default from
+// density and class. Never hardcoded per material in a shader (invariant 7).
+constexpr uint32_t kMatWindRespShift = 8, kMatWindRespMask = 0xF;
+constexpr uint32_t kMatWindFricShift = 12, kMatWindFricMask = 0xF;
+constexpr uint32_t kMatWindMax = 15;
+
+// The default when a material authors no "wind" block, so that adding wind did
+// not mean editing 96 materials — and so that a NEW material is windy on the
+// day it is added rather than inert until someone remembers.
+//
+// Response goes as 1/density, which is what acceleration under a fixed drag
+// force does at a fixed voxel size. The constant is set so a gas saturates at
+// 15, dust and snow sit near the top, sand and gravel near the bottom, and
+// stone is a nudge. It is a STARTING POINT, not a law: real-world wind
+// susceptibility is area-over-mass, i.e. SIZE, and a uniform grid has erased
+// size — so iron filings and an iron bar are the same material here and only an
+// author can say which one this is. That is why the Powder Toy hand-tunes
+// `Advection` per element rather than computing it, and why this is a default
+// with an override rather than a formula.
+inline uint32_t DeriveWindResponse(int32_t density) {
+  int32_t d = density > 0 ? density : 1;
+  int32_t r = 4800 / d;
+  return (uint32_t)(r > (int32_t)kMatWindMax ? (int32_t)kMatWindMax : r);
+}
+// Friction rises with density: a settled snowflake lifts in a breeze, gravel
+// does not lift at all. Floored at 1 because 0 would mean the faintest
+// air movement entrains this material, and "wind never moves it" is what
+// response 0 says — two spellings of the same thing is one too many.
+inline uint32_t DeriveWindFriction(int32_t density) {
+  int32_t d = density > 0 ? density : 1;
+  int32_t f = 1 + d / 400;
+  return (uint32_t)(f > (int32_t)kMatWindMax ? (int32_t)kMatWindMax : f);
+}
+
 // GPU-side layout, 64 bytes — must match struct Material in common.wgsl.
 struct MaterialGpu {
   uint32_t klass;
@@ -220,6 +273,12 @@ struct MaterialDef {
   // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
   // gpu.stainPack; kept unpacked here for the tuner and the wiki.
   uint32_t absorbCapacity = 0;
+  // Unpacked mirrors of gpu.flags bits 8..15 (see kMatWind* above), kept for
+  // the tuner and the wiki the way absorbCapacity is — the packed word is the
+  // truth, these are for anything that wants to READ the value back without
+  // knowing the layout. Always populated, whether authored or derived.
+  uint32_t windResponse = 0;
+  uint32_t windFriction = 0;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

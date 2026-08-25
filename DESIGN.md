@@ -2885,7 +2885,10 @@ Plan of record: **`docs/RESEARCH_wind.md`** — the decision record, the industr
 survey behind it, and the five-phase schedule. This section is the binding
 summary; that file is where the reasoning lives.
 
-**Phase 1 has landed (render-side). Phases 2–5 are not started.**
+**Phases 1, 3 and 4 have landed. Phase 2 (primitives) and phase 5 (updrafts,
+violent-wind excite) are not started.** Phase 4's gate ships at
+`sim.windMode = 0`, so the pinned world hash is unchanged and the flip is still
+its own commit.
 
 ### The decision, in one paragraph
 
@@ -2976,13 +2979,83 @@ capture belong on the tick input stream).
 **Phase 1 is hash-neutral by construction** and was verified so: it touches no
 sim kernel, and the pinned world hash is unchanged.
 
+### What phases 3 and 4 shipped
+
+**`windAtQ`, the integer field** (`common.wgsl`, next to the f32 one). Every
+phase-3/4 consumer's output reaches the voxel grid — ballistic particles
+reinsert themselves as voxels, MPM settles back through the excite seam, the CA
+drift bias steers matter outright — so all of them read an integer
+transcription of `windAt`, not `windAt` itself: f32 `sin()` is not bit-identical
+between GPU vendors and the world hash is compared across machines. Q16.16
+throughout, BAM angles (65536 = one turn) so the gust phase's modular reduction
+is exact, and `windSinQ`, a parabola-plus-correction polynomial rather than a
+lookup table because a WGSL `const` array cannot be indexed dynamically and a
+`var<private>` one would be mutable state in a kernel that must not have any.
+The two evaluations sit adjacent in one file deliberately: they cannot share
+code across number systems, so proximity is the only thing keeping them from
+drifting apart. They agree to well under a percent, which is what "the sand
+blows the way the grass leans" needs; they are not, and need not be, the same
+number — the render clock is wall time and the sim clock is the tick.
+
+**Three consumers, one gate.** Ballistic debris and spray get a drag law at
+`sim_particle.wgsl`'s single gravity site; MPM gets one at the grid-node update,
+scaled by a low-mass exposure weight; the CA gets the drift bias and
+entrainment. Each tests `T.windMode` at its own call site rather than relying on
+`windAtQ` returning zero, because a drag term reading zero wind is not a no-op
+— it would drag everything to a standstill and move the hash.
+
+**§8's open question, answered: MPM wind acts on low-mass nodes only.** Wind on
+every node of a pond is a *current* — the body translates, the surface stays
+flat, and it reads as the lake being poured sideways. What wind does to water is
+act on the interface. Gating on node mass gets that free, because "how much
+fluid is around this node" is a number the solver has already computed.
+
+**`windResponse` / `windFriction`**, 0–15 each, authored in `materials.json` as
+`"wind": {...}` and packed into `MaterialGpu.flags` bits 8..15 — the struct is
+64 bytes with no spare word, and every existing reader of `flags` on both sides
+of the language boundary tests it with a mask, so a nibble in the high half is
+invisible to all of them. Absent means derived from density (~4800/density and
+1 + density/400). Derived defaults exist so a new material is windy the day it
+is added; the *authored* value is the truth, because real susceptibility is
+area-over-mass — SIZE — and a uniform grid has erased size.
+
+**The `wind` gate** (`src/test/selftest_wind.cpp`) tests sign and invariance,
+not magnitudes: reversing `windDirDeg` reverses the smoke's displacement (+28.96
+vs −11.41 cells against the gate-off run), the settled sand bed is **bitwise
+unchanged** under any drift-bias wind (invariant 4), the same script twice with
+wind on gives the same hash, and grain count is conserved.
+
+### Entrainment is implemented and is NOT ready to switch on
+
+`sim.windMode` is a ladder — 0 off, 1 drift, 2 also entrainment — and 2 is
+experimental with two defects that share one cause:
+
+- **Rule 2.** An exposed dune, once woken, re-marks its own chunks for as long
+  as the wind blows. The ambient field still cannot *wake* anything (invariant 3
+  holds), but it can keep something awake.
+- **The page table.** Entrainment is the first rule in the engine that makes
+  SETTLED matter move, and the materialization set
+  (`PLAN_page_table.md` §3.2) is derived from a mirror that is *tightened*
+  against a lagging snapshot. That tightening is sound under every pre-wind
+  rule, because a chunk of settled powder writes nothing — so dropping it, and
+  letting its empty neighbour's page retire, costs nothing. Now a grain steps
+  into a neighbour the CPU was told would never be written. Measured: 62 lost
+  voxels over two 160-tick runs, at the same ticks in both, so deterministic
+  rather than a race.
+
+Both want the same missing piece: **phase 2's wind primitives put the wind's
+footprint on the mutation path**, where it is an op target the CPU can see — one
+mechanism, two symptoms, which is a good sign it is the right mechanism. Until
+then mode 2 is a thing to look at (`SANDVOX_WIND_ENTRAIN=1` runs its gate arms,
+which pass on their own terms) rather than a thing to ship. `LoadTuning` warns
+whenever the knob is set to 2.
+
 ### Phases remaining
 
 | # | Scope | Hash risk |
 |---|---|---|
-| 2 | Primitive list + op plumbing (spell VM op, fan tag), per-chunk cull mask, footprint wake | none while gated |
-| 3 | Debris + MPM wind force; `windResponse`/`windFriction` authoring and bit-packing | none (unhashed systems) |
-| 4 | `windAtQ` + CA drift bias + settled-powder entrainment, behind `sim.windMode=0`; then the flip | **rebaseline on flip** |
+| 2 | Primitive list + op plumbing (spell VM op, fan tag), per-chunk cull mask, footprint wake — **and the prerequisite for entrainment**, see above | none while gated |
+| 4b | Flip `sim.windMode` to 1 | **rebaseline** |
 | 5 | Per-chunk hot-material counts → updraft term; violent wind promoting voxels to particles; capes when cloth exists | rebaseline |
 
 ## 10. Networking (design now, build later)

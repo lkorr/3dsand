@@ -710,6 +710,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
     ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
     ReadF(*g, "fluidStainRate", s.fluidStainRate, out, at);
+    ReadI(*g, "windMode", s.windMode, out, at);
+    ReadF(*g, "windDrag", s.windDrag, out, at);
+    ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
+    ReadF(*g, "windFluidMass", s.windFluidMass, out, at);
+    ReadF(*g, "windDriftSpeed", s.windDriftSpeed, out, at);
+    ReadF(*g, "windDriftMax", s.windDriftMax, out, at);
+    ReadF(*g, "windEntrainSpeed", s.windEntrainSpeed, out, at);
+    ReadF(*g, "windEntrainRate", s.windEntrainRate, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -838,6 +846,46 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       s.fluidSettleTicks = s.fluidSettleTicks < 8 ? 8 : 600;
     }
     clampWarnF(s.fluidStainRate, 0.0f, 30.0f, "fluidStainRate");
+    // Wind coupling. The gate first: an unknown mode must not fall through to
+    // "some wind", because the whole hash argument for shipping this is that
+    // mode 0 means literally no kernel reads the field.
+    if (s.windMode < (int)kWindModeOff || s.windMode > (int)kWindModeEntrain) {
+      out.warnings.push_back("sim.windMode out of 0..2; clamped");
+      s.windMode = s.windMode < (int)kWindModeOff ? (int)kWindModeOff
+                                                  : (int)kWindModeEntrain;
+    }
+    // Mode 2 is legal and it works — a bed of sand really does creep downwind
+    // — but it has two known defects that both trace to the same missing
+    // piece, and shipping a knob whose caveats live only in a design doc is
+    // how a caveat gets lost. See kWindModeEntrain in world.h.
+    if (s.windMode >= (int)kWindModeEntrain) {
+      out.warnings.push_back(
+          "sim.windMode 2 (entrainment) is EXPERIMENTAL: an exposed dune never "
+          "sleeps (rule 2), and moving settled powder writes into chunks the "
+          "page table was told would stay untouched (page faults = lost "
+          "voxels). Both need phase 2's wind primitives, which put the wind's "
+          "footprint on the mutation path where the CPU can see it.");
+    }
+    // The rest are const-eval'd into integers by the kernels that read them
+    // (sim_particle, sim_fluid, sim_step), so these bounds are the fixed-point
+    // bounds written in the human unit — the same discipline as the fluid rows
+    // above, and for the same reason: an out-of-range value wraps an i32
+    // mid-kernel rather than merely looking wrong.
+    clampWarnF(s.windDrag, 0.0f, 30.0f, "windDrag");
+    clampWarnF(s.windFluidGain, 0.0f, 4.0f, "windFluidGain");
+    // The floor is not 0: a zero mass band would make the taper divide by
+    // nothing, and "no node ever feels wind" is what windFluidGain 0 is for.
+    clampWarnF(s.windFluidMass, 0.02f, 4.0f, "windFluidMass");
+    // A drift reference speed of 0 would make every breath of air a full-bias
+    // gale, so the floor is a real wind rather than a nominal epsilon.
+    clampWarnF(s.windDriftSpeed, 0.5f, 200.0f, "windDriftSpeed");
+    // Capped below 1: at 1.0 a moving voxel ALWAYS tries downwind first, which
+    // removes the RNG order entirely and turns a gas into a conveyor belt.
+    clampWarnF(s.windDriftMax, 0.0f, 0.95f, "windDriftMax");
+    clampWarnF(s.windEntrainSpeed, 0.5f, 200.0f, "windEntrainSpeed");
+    // Rate, not certainty (rule 2). 30/s is one hop per tick, which is the
+    // most the substep gate can deliver anyway.
+    clampWarnF(s.windEntrainRate, 0.0f, 30.0f, "windEntrainRate");
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.

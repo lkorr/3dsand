@@ -806,7 +806,49 @@ struct TickParams {
   // sees one flag. Always 0 outside --lab/--fluid-bench; was the padMb pad
   // word, so the layout (and the labMode=0 hash) is unchanged.
   uint32_t labMode = 0;
+  // ---- wind, the SIM's copy (docs/RESEARCH_wind.md §4.2 — must match
+  // TickParams in common.wgsl) ----
+  // The same three weather numbers RenderParams carries, quantised to Q16.16 so
+  // the kernels that read them stay integer (rule 1), and produced by the SAME
+  // function on the same tick — WindWeather (sim/wind.h) is the only author of
+  // wind weather anywhere in the engine. Two authors would mean grass and smoke
+  // blowing different ways in one frame, which reads as a shader bug.
+  //
+  // On the tick input stream for the dayPhase reason: a replay reproduces the
+  // stream and the twice-run gate compares it, so anything the world hash can
+  // see has to arrive this way rather than be recomputed GPU-side.
+  int32_t windDirQ[2] = {0, 65536};  // unit XZ pointing DOWNWIND, Q16.16
+  int32_t windSpeedQ = 0;            // mean speed, Q16.16 world cells/s
+  int32_t windGustQ = 0;             // gust amplitude, Q16.16 world cells/s
+  // The gate: sim.windMode, read CPU-side per tick (the fluidExciteMode
+  // precedent, so a per-gate SetCurrentTuning moves it with no rebuild).
+  uint32_t windMode = 0;
+  // Pad to a 16-byte multiple. The UBO is created at sizeof(TickParams) and
+  // WGSL rounds a uniform struct's size up to its 16-byte alignment, so a
+  // short buffer is a validation failure, not a slow path.
+  uint32_t _pwd0 = 0, _pwd1 = 0, _pwd2 = 0;
 };
+
+// sim.windMode ladder — must match WIND_MODE_* in assets/shaders/common.wgsl.
+//
+// An ordered ladder rather than independent bools because the steps genuinely
+// nest, and because each one further out is a bigger promise about rule 2:
+//   0 OFF     — no sim kernel evaluates the field at all. The pinned world hash
+//               cannot move. This is the default and the shipping value until
+//               phase 4's dedicated rebaseline commit.
+//   1 DRIFT   — particles, MPM spray and the CA's drift bias are live. Rule-2
+//               clean by construction: every one of those only ever runs on
+//               matter that was ALREADY moving in an already-awake chunk, so
+//               the ambient field still cannot wake anything (invariant 3).
+//   2 ENTRAIN — settled powder can be pulled loose by a wind above its friction
+//               threshold. NOT rule-2 clean on its own: an exposed dune, once
+//               woken by anything, keeps re-marking itself for as long as the
+//               wind blows. It needs phase 2's bounded primitive footprints and
+//               a storm-wake budget (research doc §4.5, §8) before it can be a
+//               default. It is here so the saltation rule can be looked at.
+constexpr uint32_t kWindModeOff = 0;
+constexpr uint32_t kWindModeDrift = 1;
+constexpr uint32_t kWindModeEntrain = 2;
 
 // Must match struct Particle in common.wgsl (32 bytes). CPU-authored particle
 // spawns: debris-body fragments re-entering the world as ballistic voxels

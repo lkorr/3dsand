@@ -185,6 +185,35 @@ const FLUID_FOAM_GAIN : i32 = 26214;   // 0.4 per full-potential substep
 const FLUID_FOAM_DECAY : i32 = i32(round(65536.0 *
     exp(log(max(1.0 - 1.0 / max(TUNE_FLUID_FOAM_LIFE * 30.0, 2.0), 0.001)) /
         f32(FLUID_SUBSTEPS))));
+// ---- wind on the grid (docs/RESEARCH_wind.md §4.6, phase 3) ----------------
+// Same const-eval discipline as every row above: human units in tuning.json,
+// integers here, nothing but i32 in the kernel.
+//
+// Fraction of the gap between a node's velocity and the local wind closed per
+// SUBSTEP. Divided by the substep count for the same reason the gravity add is
+// — the knob is a per-second rate and must mean that at any substep budget.
+const FLUID_WIND_DRAG : i32 = i32(round(clamp(TUNE_WIND_DRAG, 0.0, 30.0) *
+    65536.0 / (30.0 * f32(FLUID_SUBSTEPS))));
+// How much of the field a fully exposed node feels, Q16.
+const FLUID_WIND_GAIN : i32 =
+    i32(round(clamp(TUNE_WIND_FLUID_GAIN, 0.0, 4.0) * 65536.0));
+// The exposure band, in the Q10 particle-masses word 0 is accumulated in
+// (p2g1 scatters `w >> 6`). A node buried in fluid at rest density carries
+// REST_DENSITY particle masses, which in Q10 is FLUID_REST_DENSITY >> 6; the
+// knob is a fraction of that. Wind fades to nothing as a node approaches it.
+//
+// THIS IS §8's OPEN QUESTION, ANSWERED: low-mass nodes only, not all of them.
+// Wind on every node of a pond is a CURRENT — the whole body translates, the
+// surface stays flat, and it looks like the lake is being poured sideways.
+// What wind actually does to water is act on the interface: it drags the skin,
+// it carries spray, and the body below follows only through the fluid's own
+// viscosity. Gating on node mass gets that for free, because "how much fluid
+// is around this node" is a number the solver has already computed.
+const FLUID_WIND_MASS : i32 = max(i32(round(
+    clamp(TUNE_WIND_FLUID_MASS, 0.02, 4.0) * f32(FLUID_REST_DENSITY >> 6u))), 1);
+// Q16.16 cells/s (windAtQ's unit) -> Q16.16 cells/tick.
+const FLUID_WIND_HZ : i32 = 30;
+
 // 0.5 cell in Q16.16 — the cell-center offset of the node lattice.
 const FLUID_HALF : i32 = 32768;
 // FLUID_VMAX (the CFL cap, 0.45 cell/substep expressed in cells/TICK) and
@@ -743,6 +772,33 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
+
+  // ---- wind (research doc §4.6) -------------------------------------------
+  // Per NODE, so the field varies across a splash for free — that is the whole
+  // reason this belongs here rather than as a per-particle or per-body force.
+  //
+  // Placed BEFORE the boundary conditions on purpose: wind blowing into a wall
+  // must be projected out by the same separate BC that projects gravity out,
+  // or a gust would push water through geometry it is resting against.
+  //
+  // Gated on T.windMode rather than on windAtQ's zero return, because this is a
+  // drag term: with a zero field it would still pull every node toward a
+  // standstill, which is not "no wind" but "infinite still air", and it would
+  // move the pinned hash through the settle seam.
+  if (T.windMode != WIND_MODE_OFF && FLUID_WIND_GAIN > 0) {
+    // Exposure: 1 for a node with almost nothing around it (spray, the top
+    // skin of a pool), falling to 0 as the node fills out to the mass band.
+    // Tested before the field is evaluated so a buried node — the great
+    // majority in any standing body of water — pays a compare, not a sine.
+    let expo = 65536 - phiQ(m, 0, FLUID_WIND_MASS);
+    if (expo > 0) {
+      let w = windAtQ(c, T);
+      let k = mq(FLUID_WIND_DRAG, mq(FLUID_WIND_GAIN, expo));
+      v.x += mq(w.x / FLUID_WIND_HZ - v.x, k);
+      v.y += mq(w.y / FLUID_WIND_HZ - v.y, k);
+      v.z += mq(w.z / FLUID_WIND_HZ - v.z, k);
+    }
+  }
 
   // ---- separate BC with tangential preservation (plan §5 item 2) ----------
   // Only the velocity component pointing INTO a solid is removed; tangential

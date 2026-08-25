@@ -171,6 +171,64 @@ inline WindState WindWeather(const Tuning& t, uint32_t seed, uint32_t tick) {
   return s;
 }
 
+// ---- the SIM's copy: the same weather, quantised (research doc §4.2) --------
+// windAtQ (common.wgsl) is integer end to end, so the three numbers it starts
+// from have to arrive as integers. This is that boundary, and it is the ONLY
+// place floats become the sim's wind: everything downstream of TickParams is
+// i32 arithmetic with an integer sine.
+//
+// DETERMINISM, honestly. WindWeather above calls std::sin/cos/atan2, and libm
+// is not bit-identical between platforms — so in principle two machines could
+// round a weather value to different Q16.16 integers and, once windMode is on,
+// diverge. Three things bound that, in order of how much they matter:
+//
+//   1. It is a per-TICK INPUT, not a per-cell computation. The engine already
+//      accepts CPU-float inputs that reach the grid: every debris ParticleSpawn
+//      comes out of Jolt, which is float by design, and those particles
+//      reinsert themselves as voxels. This is strictly better behaved than
+//      that — four scalars a tick, quantised.
+//   2. The quantisation is the guard. Two libm results have to straddle a
+//      1/65536 boundary to differ AFTER rounding, which needs them to disagree
+//      by more than ~2^-36 of the value; real implementations agree to ~1 ulp
+//      of a double.
+//   3. Every gate that compares hashes runs twice on ONE machine, so this
+//      cannot mask a real bug — it can only be a cross-machine surprise.
+//
+// If wind ever does desync across machines, the fix is known and contained:
+// make WindWeather integer end to end (draw the heading as a BAM angle, keep
+// the epoch lerp as a vector, normalise with the existing integer isqrt) and
+// derive the float outputs FROM the integers, with a check_invariants entry
+// pinning the C++ sine to windSinQ. That is a bigger change than phases 3-4
+// warrant on the evidence available, which is none.
+struct WindStateQ {
+  int32_t dirX = 0, dirZ = 65536;  // unit XZ downwind, Q16.16
+  int32_t speed = 0;               // world cells/s, Q16.16
+  int32_t gust = 0;                // world cells/s, Q16.16
+};
+
+inline WindStateQ WindQuantize(const WindState& s) {
+  // Round-half-away-from-zero by hand rather than through std::lround: the
+  // rounding MODE is part of the value the sim sees, and one written here is
+  // one that cannot be changed by a compiler flag.
+  auto q = [](float v) {
+    double x = (double)v * 65536.0;
+    double r = x >= 0.0 ? (x + 0.5) : (x - 0.5);
+    // A Q16.16 speed of 2^31 is 32,768 cells/s. The clamp is not expected to
+    // engage (LoadTuning bounds the knobs); it is here because an i32 that
+    // wraps produces a wind blowing the other way, which is a bug report about
+    // the shader.
+    if (r > 2147483000.0) r = 2147483000.0;
+    if (r < -2147483000.0) r = -2147483000.0;
+    return (int32_t)r;
+  };
+  WindStateQ o;
+  o.dirX = q(s.dirX);
+  o.dirZ = q(s.dirZ);
+  o.speed = q(s.speed);
+  o.gust = q(s.gust);
+  return o;
+}
+
 // ---- debug slope-field overlay (research doc §4.8) --------------------------
 // Arrow lattice points along one axis, from the two knobs. THIS FORMULA IS
 // MIRRORED in debug_wind.wgsl's vertex shader, which derives its lattice

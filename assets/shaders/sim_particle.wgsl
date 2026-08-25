@@ -25,6 +25,19 @@
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
+// ---- wind (docs/RESEARCH_wind.md §4.6, phase 3) -----------------------------
+// windAtQ speaks Q16.16 world cells per SECOND; particles speak Q24.8 cells per
+// TICK. 65536/256 = 256 fixed-point units and 30 ticks a second, so the divisor
+// is 256*30. A divisor rather than a multiply-shift because it is exact at both
+// ends and this runs once per particle per tick, not once per cell.
+const PART_WIND_SCALE : i32 = 7680;
+// Fraction of the gap between a particle's velocity and the local wind that
+// closes in ONE TICK at a material's full windResponse of 15, in Q16. Human
+// units in, integer out, at shader compile time — the sim_fluid.wgsl discipline
+// (IEEE-exact const folding, so the kernel stays integer and deterministic).
+const PART_WIND_DRAG : i32 =
+    i32(round(clamp(TUNE_WIND_DRAG, 0.0, 30.0) * 65536.0 / 30.0));
+
 // Blocks flight: solids, powders and liquids (splash = plop onto the surface).
 fn blocksParticle(c : vec3<i32>) -> bool {
   let w = voxWordAt(c);
@@ -145,6 +158,44 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // gravity + clamp
   p.vy -= PART_GRAVITY;
+
+  // ---- wind (research doc §4.6) -------------------------------------------
+  // The one force site in this kernel besides gravity, which is the point: a
+  // second place that touched velocity would be a second place to keep in step
+  // with the substep sampling below.
+  //
+  // A DRAG law, not a push: the particle accelerates toward the air it is in
+  // and stops when it gets there. That is what §4.6 means by "accelerates over
+  // time" — an ember lofted by a gust keeps gaining speed for as long as the
+  // gust outruns it — and it is also the bound (rule 2), because no amount of
+  // wind or knob can make debris travel faster than the air is moving. A force
+  // term with no velocity feedback has no such ceiling.
+  //
+  // The gate is tested HERE and not left to windAtQ's zero return, because a
+  // drag term reading zero wind is not a no-op: it would drag every particle in
+  // the world toward a standstill and quietly change the pinned hash. This is
+  // the difference between "the field is off" and "the field is calm".
+  if (T.windMode != WIND_MODE_OFF) {
+    let resp = i32(matWindResponse(materials[p.payload & 0xFFFu]));
+    // Almost every material is 0 (stone chips do not blow around), so the
+    // common case is one comparison and no field evaluation at all.
+    if (resp > 0) {
+      let w = windAtQ(startCell, T);
+      // Micro spray gets the same law as a whole voxel. It is the same air, and
+      // droplets drifting downwind off a splash is most of what phase 3 buys.
+      let gx = w.x / PART_WIND_SCALE - p.vx;
+      let gy = w.y / PART_WIND_SCALE - p.vy;
+      let gz = w.z / PART_WIND_SCALE - p.vz;
+      // Two steps rather than one product: gap * resp * drag would leave i32 at
+      // the top of both knobs' ranges. Integer division truncates toward zero,
+      // which is symmetric — the asymmetry an arithmetic shift would introduce
+      // reads as a permanent drift down-axis (the mq() lesson).
+      p.vx += ((gx * resp) / 15) * PART_WIND_DRAG / 65536;
+      p.vy += ((gy * resp) / 15) * PART_WIND_DRAG / 65536;
+      p.vz += ((gz * resp) / 15) * PART_WIND_DRAG / 65536;
+    }
+  }
+
   p.vx = clamp(p.vx, -PART_MAX_VEL, PART_MAX_VEL);
   p.vy = clamp(p.vy, -PART_MAX_VEL, PART_MAX_VEL);
   p.vz = clamp(p.vz, -PART_MAX_VEL, PART_MAX_VEL);

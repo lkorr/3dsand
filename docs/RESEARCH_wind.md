@@ -1,6 +1,8 @@
 # Wind — architecture decision record
 
-Date: 2026-08-25. Status: **decided, phase 1 not yet started.** This is the plan of
+Date: 2026-08-25. Status: **decided; phases 1, 3 and 4 landed, 2 and 5 open.**
+§10 records what phase 4 found; DESIGN.md §9b is the binding summary. This is
+the plan of
 record for the wind system; DESIGN.md gets its section when phase 1 lands (same
 commit). Owner: Luke. Research: two-agent sweep (industry + codebase), condensed
 in §2 — full citations inline.
@@ -293,18 +295,101 @@ integral curves of the slope field). Toggle = in-game key + tuner bool.
 
 | # | Scope | Hash risk | Acceptance |
 |---|---|---|---|
-| 1 | `windAt` f32 + weather state + sway/strands rewire + **debug slope-field viz + toggle** + `wind.*` knobs | none (render-only) | pinned hash unchanged; viz shows field; grass lean follows direction knob; screenshots |
-| 2 | Primitive list + op plumbing (spell VM op, fan tag), cull mask, footprint wake (gated), viz shows primitives | none while gated | gust-bolt op visibly bends grass wake in viz |
-| 3 | Debris + MPM wind force; `windResponse`/`windFriction` authoring + packing | none (unhashed systems) | embers/spray drift downwind; twice-run equality holds |
-| 4 | `windAtQ` + CA drift bias + entrainment, behind `sim.windMode=0`; then flip commit | rebaseline on flip | smoke drifts, dunes only in storms/footprints, ≤32 chunks at rest still holds |
-| 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline (with 4 or after) | fire columns loft smoke/embers; tornado lifts sand |
+| 1 | `windAt` f32 + weather state + sway/strands rewire + **debug slope-field viz + toggle** + `wind.*` knobs | none (render-only) | **DONE** — pinned hash unchanged; viz shows the field; grass lean follows the direction knob |
+| 3 | Debris + MPM wind force; `windResponse`/`windFriction` authoring + packing | none while gated | **DONE** — packed into `flags` bits 8..15, since `MaterialGpu` has no spare word |
+| 4 | `windAtQ` + CA drift bias + entrainment, behind `sim.windMode=0` | none while gated | **DONE** — the `wind` gate: reversing the direction knob reverses the smoke, the settled bed is bitwise unmoved under drift, twice-run equality holds |
+| 2 | Primitive list + op plumbing (spell VM op, fan tag), cull mask, footprint wake (gated), viz shows primitives | none while gated | gust-bolt op visibly bends grass wake in viz. **Now also the prerequisite for switching entrainment on** — §10 |
+| 4b | Flip `sim.windMode` to 1 | rebaseline | smoke drifts, ≤32 chunks at rest still holds |
+| 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline (with 4b or after) | fire columns loft smoke/embers; tornado lifts sand |
 
-## 8. Open questions
+Phases 3 and 4 landed together, and in that order, because §4.6 is wrong about
+one thing: it has the particle and MPM consumers reading the f32 `windAt`. They
+cannot. Both feed the voxel grid — particles reinsert as voxels, MPM settles
+back through the excite seam — so both are inside rule 1 and both need the
+integer field phase 4 was going to build. `windAtQ` therefore came first and all
+three consumers share it, which is also why phase 3 reads "none while gated"
+above rather than the "none (unhashed systems)" this document originally
+claimed. The gate is what makes it hash-neutral, not the systems being outside
+the hash.
 
-- MPM wind: all grid nodes vs low-mass-only (current lean: low-mass only).
+## 8. Future unification: ocean currents and rivers (planned, no phase yet)
+
+The architecture is medium-agnostic. Underwater, `currentAt` is `windAt` with a
+different term set: tides/large-scale circulation = the weather-state pattern at
+lower frequency; kelp = underwater grass (same MICROF_SWAY/strands path);
+swimmers/mobs/debris/MPM nodes take the force at the same sites; vortex
+primitive = whirlpool; the heat/updraft term = hydrothermal vents literally.
+The sleep law binds even harder in water: ambient current moves things IN the
+ocean, never the settled ocean voxels (the definitional settled system). Water
+that must genuinely move = a strong primitive exciting settled voxels into MPM
+through the existing seam (ceiling/budgets/mass-exact accounting already
+built) — the tornado path, wet. Rivers (none exist yet): flow direction is
+terrain-derived, and worldgen is analytic, so river current = function
+composition (downhill gradient of the same height field, or a generated channel
+spline evaluated like a JC4 wind tunnel) — zero storage. Bulk river transport
+stays fake (surface flow-map advection in the water shader + forces on
+everything in it; real transport only at rapids/waterfalls where water is
+excited anyway) — a truly-flowing river would keep its whole length awake,
+violating rule 2.
+
+**Binding consequences for earlier phases**: (a) the phase-2 primitive struct
+carries a medium mask (air/water/both) from day one so currents need no
+op-format change; (b) the field core (bands, ramps, primitive summation) is
+written as shared guts with `windAt`/`currentAt` as thin wrappers, not
+wind-specific.
+
+## 9. Open questions
+
+- ~~MPM wind: all grid nodes vs low-mass-only.~~ **ANSWERED (phase 3): low-mass
+  only.** Wind on every node of a pond is a *current* — the whole body
+  translates, the surface stays flat, and it reads as the lake being poured
+  sideways. Wind acts on the interface and the body follows through the fluid's
+  own viscosity. The node's own mass is the exposure test, and the solver has
+  already computed it, so the answer costs nothing.
 - Derived (memoryless) heat vs stored accumulator — decide after phase 5 look.
 - Altitude ramp reference: absolute world Y vs terrain-relative (lean: absolute
   Y, simplest and deterministic; terrain-relative needs a height query).
 - Water wave bands keyed off wind direction (render-only, cheap, do eventually).
 - Storm-wake budget shape for ambient dune drift (per-tick chunk cap, surface
   selection heuristic).
+
+## 10. What phase 4 found: entrainment needs phase 2 first
+
+§4.5 gates entrainment on "primitive footprints + budgeted storm wake only" and
+gives the reason as rule 2 — an exposed dune, once woken, keeps re-marking its
+own chunks for as long as the wind blows. That reason is right and it is not the
+only one.
+
+Entrainment is **the first rule in the engine that makes settled matter move**,
+and the page table's materialization set leans on the opposite. The set is
+`[ (cpuDirty n hasMatter) u N26(...) ] u N26(opTargets)`, and `cpuDirty` is
+TIGHTENED against a lagging snapshot (PLAN_page_table.md §3.2). Under every
+pre-wind rule that tightening is sound *because a chunk of settled powder writes
+nothing*: dropping it from the mirror, and letting its empty neighbour's page
+retire, costs nothing that can happen. Turn entrainment on and a grain steps
+into a neighbour the CPU was told would never be written — and the write is a
+lost voxel, not an error.
+
+Measured with the `wind` gate at `SANDVOX_WIND_ENTRAIN=1`: **62 faults across
+two 160-tick runs, at the same ticks in both**, so deterministic rather than a
+race. The test chamber's own bed creeps 22 cells downwind and conserves every
+grain; the losses are elsewhere in the world, where the same rule is mobilising
+terrain powders that had settled.
+
+The fix is the one phase 2 was already going to build. A wind primitive
+dirty-marks its own bounded footprint **through the mutation path**, which makes
+those chunks `opTargets` — CPU-known, materialized with their 26-ring, and
+charged against a budget before emission. One mechanism closes both holes, which
+is usually the sign of a real mechanism rather than a patch.
+
+So the ordering changed: **phase 2 is a prerequisite for switching entrainment
+on**, not merely the next feature. `sim.windMode = 2` ships implemented, warned
+about by `LoadTuning`, excluded from the default suite, and reachable in one
+environment variable by anyone who wants to look at it.
+
+There is a wider version of this worth stating, because it will be true again:
+the page table's soundness argument quietly rests on **"settled matter does not
+move"**, a property no rule had ever contradicted. Any future rule that makes
+resting voxels move without a CPU-visible cause — not just wind — lands in the
+same hole. The tell is a non-zero page-fault count with no obvious lost voxel
+near the thing you were testing.

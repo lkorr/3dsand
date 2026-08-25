@@ -184,6 +184,21 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   tp.fluidExciteEnable =
       CurrentTuning().sim.fluidExciteMode != 0 ? 1u : 0u;
   tp.fluidSpawnCount = fluidSpawnCount;
+  // Wind, the sim's copy (docs/RESEARCH_wind.md §4.2). Same tick, same seed and
+  // the same WindWeather call the renderer makes in WriteRenderParams above —
+  // one author, so the CA and the grass are in one weather. Quantised to
+  // Q16.16 here because everything downstream is integer (rule 1); the gate
+  // rides along beside it, read CPU-side per tick the way fluidExciteMode is,
+  // so a per-gate SetCurrentTuning moves it without a pipeline rebuild.
+  {
+    const Tuning& wtun = CurrentTuning();
+    const WindStateQ wq = WindQuantize(WindWeather(wtun, seed, tick));
+    tp.windDirQ[0] = wq.dirX;
+    tp.windDirQ[1] = wq.dirZ;
+    tp.windSpeedQ = wq.speed;
+    tp.windGustQ = wq.gust;
+    tp.windMode = (uint32_t)wtun.sim.windMode;
+  }
   // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except
   // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList
   // refills and far-cascade fills that ride this tick see the same world.

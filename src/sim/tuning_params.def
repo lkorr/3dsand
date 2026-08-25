@@ -372,9 +372,10 @@ TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
 // every shader. The parts that EVOLVE (direction, speed, gust amplitude) are
 // not here — they come out of WindWeather() on the CPU and ride RenderParams,
 // because a compile-time constant cannot drift over minutes.
-// Human-unit floats, not sim.* integers: nothing here reaches the CA in phase
-// 1. Phase 4's windAtQ converts them at WGSL const-eval the way sim_fluid.wgsl
-// already does, so the kernel stays integer and the knobs stay in metres.
+// Human-unit floats, not sim.* integers, and that is now load-bearing in both
+// directions: windAtQ (common.wgsl) const-evals these into integers exactly the
+// way sim_fluid.wgsl converts its own human-unit knobs, so the sim kernels that
+// read the field stay integer while the knobs stay in metres and seconds.
 TP_F(wind, gustWavelength, TUNE_WIND_GUST_WAVELENGTH, 4.8f)
 TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 1.1f)
 TP_F(wind, altitudeGain, TUNE_WIND_ALT_GAIN, 0.6f)
@@ -485,6 +486,24 @@ TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
 TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
+
+// ---- wind COUPLING: how hard the field pushes the sim (research doc §4.5/4.6)
+// The SHAPE of the field is the wind.* group far above; this is what the three
+// sim consumers do with it. Human-unit floats for the sim.fluid* reason and by
+// the same mechanism: every one is const-eval'd to an integer at the top of the
+// kernel that reads it, so nothing here puts an f32 in a sim kernel.
+// Speeds are m/s, rates are per-second, chances are probabilities.
+// windMode is the gate and the only thing here that can move the world hash:
+// 0 off, 1 drift bias, 2 also settled-powder entrainment (kWindMode* in
+// world.h says what each promises about rule 2).
+TP_I(sim, windMode, TUNE_WIND_MODE, 0)
+TP_F(sim, windDrag, TUNE_WIND_DRAG, 3.0f)
+TP_F(sim, windFluidGain, TUNE_WIND_FLUID_GAIN, 0.35f)
+TP_F(sim, windFluidMass, TUNE_WIND_FLUID_MASS, 0.5f)
+TP_F(sim, windDriftSpeed, TUNE_WIND_DRIFT_SPEED, 12.0f)
+TP_F(sim, windDriftMax, TUNE_WIND_DRIFT_MAX, 0.5f)
+TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 2.0f)
+TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)

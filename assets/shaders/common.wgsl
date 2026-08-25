@@ -38,6 +38,20 @@ const MATF_MICRO  : u32 = 4u;
 // explosions remove them, and the renderer draws them as solid geometry. Kept
 // here so the flag bits cannot drift from sim/materials.h (kMatFlagPassable).
 const MATF_PASSABLE : u32 = 8u;
+// ---- wind response, packed into the SAME word (docs/RESEARCH_wind.md §4.5) ----
+// `flags` bits 0..7 are the MATF_* booleans above (4 used, 4 spare); bits 8..15
+// are two 4-bit AUTHORED numbers, and 16..31 are still free.
+//
+// They live here rather than in two new fields because `MaterialGpu` is exactly
+// 64 bytes with no spare word, and growing a struct every sim thread reads to
+// buy eight bits is the worse trade — the same call `stainPack` made. Packing
+// into `flags` specifically is safe because every existing reader of it, on both
+// sides of the language boundary, tests it with a MASK (`(m.flags & MATF_x) !=
+// 0`); not one compares it whole, so a nibble in the high half is invisible to
+// all of them.
+const MATF_WIND_RESP_SHIFT : u32 = 8u;
+const MATF_WIND_FRIC_SHIFT : u32 = 12u;
+const MATF_WIND_NIBBLE     : u32 = 0xFu;
 
 struct Material {
   klass       : u32,
@@ -46,7 +60,7 @@ struct Material {
   color1      : u32,
   color2      : u32,
   emission    : u32,   // 0..255 glow strength (render + media)
-  flags       : u32,   // MATF_*
+  flags       : u32,   // MATF_* in bits 0..7, wind response/friction in 8..15
   tagMask     : u32,   // bit per tag (registry built at load from JSON)
   reactOffset : u32,   // bucket into the reactions[] array
   reactCount  : u32,
@@ -86,6 +100,33 @@ fn matWashes(m : Material) -> bool { return (m.stainPack & 0x80000000u) != 0u; }
 // Does this material stain what it touches at all? One comparison, so the sim
 // can reject the overwhelmingly common "no" before doing any other work.
 fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
+
+// ---- wind coupling, authored per material (invariant 7) --------------------
+// Both are 0..15 and both are AUTHORED in materials.json ("wind": {"response":
+// n, "friction": n}); materials.cpp derives a default from density when the
+// block is absent. Nothing about wind is keyed on a material id anywhere in any
+// shader, which is the whole content of invariant 7 — "iron filings blow around
+// and pebbles do not" has to be a line in a JSON file, not a branch in here.
+//
+// RESPONSE is how hard the field pushes this material: 0 = wind does not touch
+// it at all (and every consumer below early-outs on that, so the overwhelming
+// majority of materials pay one comparison), 15 = it goes where the air goes.
+// Physically this is acceleration per unit wind, i.e. ~1/density at a fixed
+// voxel size — but real-world susceptibility is area-over-mass, which is SIZE,
+// and a uniform grid has erased size. So the derived default is a starting
+// point and the authored value is the truth (the Powder Toy's `Advection` is
+// hand-tuned per element for exactly this reason).
+//
+// FRICTION is the entrainment threshold: how hard a per-axis wind has to blow
+// before a SETTLED grain of this material is pulled loose (§4.5, saltation).
+// It is a different axis from response, not a scaling of it — snow lifts in a
+// breeze and then flies far; wet sand needs a gale and then barely moves.
+fn matWindResponse(m : Material) -> u32 {
+  return (m.flags >> MATF_WIND_RESP_SHIFT) & MATF_WIND_NIBBLE;
+}
+fn matWindFriction(m : Material) -> u32 {
+  return (m.flags >> MATF_WIND_FRIC_SHIFT) & MATF_WIND_NIBBLE;
+}
 
 // Can a cell of this material do ANYTHING on its own — move, react, or stain?
 //
@@ -319,7 +360,36 @@ struct TickParams {
   // flat stone slab, 0 = normal terrain. Rides the tick stream like dayPhase;
   // always 0 outside --lab/--fluid-bench (it was the padMb pad word).
   labMode    : u32,
+  // ---- wind, the SIM's copy (docs/RESEARCH_wind.md §4.2; must match
+  // TickParams in world.h) ----
+  // The same three weather numbers RenderParams carries, quantised to Q16.16
+  // and authored by the SAME C++ function (WindWeather, sim/wind.h) on the same
+  // tick. One author is the point: if the renderer and the CA each derived
+  // their own weather, grass and smoke would blow different ways in the same
+  // frame and it would read as a shader bug.
+  //
+  // They ride the TICK INPUT STREAM rather than being recomputed on the GPU for
+  // the dayPhase reason — a replay reproduces the stream and the twice-run
+  // determinism gate compares it, so anything the world hash can see has to
+  // arrive this way.
+  windDirQ   : vec2<i32>,  // unit XZ pointing DOWNWIND, Q16.16
+  windSpeedQ : i32,        // mean speed, Q16.16 world cells/s
+  windGustQ  : i32,        // gust band amplitude, Q16.16 world cells/s
+  // The gate (sim.windMode; the fluidExciteMode precedent). 0 = no sim kernel
+  // reads wind and the pinned world hash cannot move; 1 = particles, MPM and
+  // the CA drift bias are live; 2 = also settled-powder entrainment. Read
+  // CPU-side per tick, so a per-gate SetCurrentTuning moves it with no pipeline
+  // rebuild.
+  windMode   : u32,
+  _pwd0      : u32,
+  _pwd1      : u32,
+  _pwd2      : u32,
 };
+
+// sim.windMode ladder — must match kWindMode* in src/sim/world.h.
+const WIND_MODE_OFF     : u32 = 0u;
+const WIND_MODE_DRIFT   : u32 = 1u;
+const WIND_MODE_ENTRAIN : u32 = 2u;
 
 // ---- day phase helpers (integer; sim-side) ----
 // 0 = midnight, 0x4000 = sunrise, 0x8000 = noon, 0xC000 = sunset.
@@ -824,6 +894,215 @@ fn windAt(p : vec3f, t : f32, R : RenderParams) -> vec3f {
 // stays proportional to the wind, and the authored amplitude stays the ceiling
 // it was tuned to be.
 fn windSway(v : vec3f) -> vec2f { return v.xz * (1.0 / WIND_SWAY_REF); }
+
+// ======================= THE FIELD, IN INTEGERS (windAtQ) ===================
+// docs/RESEARCH_wind.md §4.1. Everything above is f32 and is read by the
+// renderer, which is allowed to be approximate because it cannot write a voxel.
+// Everything BELOW is read by sim kernels whose output reaches the grid — the
+// ballistic particles reinsert themselves as voxels, MPM settles back through
+// the excite seam, and phase 4's drift bias steers the CA outright — so it obeys
+// rule 1: integer only, no f32 anywhere in the evaluation, sine included.
+//
+// WHY NOT JUST CALL windAt(). Because f32 `sin()` is not bit-identical between
+// GPU vendors (nor between drivers), and the world hash is compared across
+// machines. One ulp of disagreement in a gust would, over a few thousand ticks,
+// put a grain of sand in a different cell on two machines, and the pinned hash
+// exists to catch exactly that. This is the same reason sim_fluid.wgsl has
+// isqrtI() instead of sqrt().
+//
+// SAME FIELD, NOT A SECOND ONE (invariant 2). Every term below is the integer
+// transcription of the identically-named f32 term above: the same two bands, the
+// same four incommensurate rates, the same phase constants, the same anisotropy,
+// the same altitude ramp, the same 0.7/0.3 mix. It is transcribed rather than
+// shared because the two number systems cannot share code, and the ONLY defence
+// against them drifting apart is that they sit here, adjacent, in one file. If
+// you change a rate above, change it below in the same edit.
+//
+// AGREEMENT IS APPROXIMATE, AND THAT IS THE DESIGN. The integer field tracks the
+// float one to well under a percent, which is what "the sand blows the way the
+// grass leans" needs; it is not, and does not need to be, the same number. Two
+// deliberate, bounded divergences:
+//   * the gust CLOCK. windAt() is driven by R.time (wall seconds, so foliage
+//     animates smoothly between ticks); windAtQ is driven by T.tick. Tick debt
+//     makes those drift apart slowly over a session, so the crest the grass
+//     shows and the crest a grain feels are the same crest to within a fraction
+//     of a wavelength, not to the bit.
+//   * quantisation. The per-cell gust gradient is rounded to whole BAM units and
+//     wq() keeps 8 fractional bits, so the pattern is right and its last digit
+//     is not.
+//
+// UNITS. Q16.16 world cells per SECOND, matching windAt() exactly, so the two
+// can be compared directly by anyone debugging them. Each consumer converts to
+// its own per-tick/per-substep units at its own call site with a const factor.
+// Angles are BAM (binary angle measure): 65536 = one full turn = 2*pi. That is
+// what makes the modular reduction below exact — see windPhaseQ.
+
+// Q16.16 fixed-point multiply for the wind block. Eight bits of each operand's
+// fraction go before the multiply, which is what lets it take a storm-force
+// wind (Q16.16 of ~700 cells/s, 26 bits) against the 4x altitude ramp without
+// leaving i32 — a range sim_fluid's mq() staging cannot cover. The lost
+// precision is ~0.4% of a term, i.e. under a tenth of a degree of direction and
+// invisible in a field whose whole point is that it wanders.
+//
+// Computed on MAGNITUDES with the sign restored, for the reason mq() documents
+// at length: an arithmetic-shift truncation rounds toward -inf, which biases
+// every product slightly negative, and a field of such products reads as a
+// permanent drift toward -x/-z that no knob explains.
+fn wq(a : i32, b : i32) -> i32 {
+  let m = (abs(a) >> 8u) * (abs(b) >> 8u);
+  return select(m, -m, (a ^ b) < 0);
+}
+
+// Integer sine. Input: BAM (65536 = 2*pi), any i32, wrapped here. Output:
+// Q16.16 in [-65536, 65536].
+//
+// Two-term polynomial rather than a lookup table, because a table has to be
+// indexed dynamically and a WGSL `const` array cannot be; a `var<private>`
+// table would be mutable state in a kernel that must not have any. The shape is
+// the standard parabola-plus-correction: sin(pi*u) ~= 4u(1-|u|), then one
+// Newton-ish pass y += 0.225*(y|y| - y). Worst-case error ~0.1% of full scale,
+// which is a hundredth of the gust quantisation and therefore free.
+//
+// Every intermediate is bounded by construction: |x| <= 65536, and the peak of
+// x*(65536-|x|) is at |x| = 32768 where it is 2^30 — inside i32 with a bit to
+// spare, so no staging shift is needed and the sine keeps its full precision.
+fn windSinQ(a : i32) -> i32 {
+  // Fold to [-pi, pi): (a mod 2pi) - pi, so the parabola's symmetric form
+  // applies. The pi shift is undone by the negation at the end (sin(t-pi) =
+  // -sin(t)) rather than by a branch on the quadrant.
+  let x = ((a & 65535) - 32768) * 2;    // u in [-1, 1) as Q16.16
+  let ax = abs(x);
+  let par = (ax * (65536 - ax)) / 65536;
+  var y = 4 * select(par, -par, x < 0);
+  let ay = abs(y);
+  let sq = select((ay * ay) / 65536, -((ay * ay) / 65536), y < 0);
+  y = y + (14746 * (sq - y)) / 65536;   // 0.225 in Q16.16
+  return -y;
+}
+
+// Gust phase at a world cell, in BAM: the distance travelled DOWNWIND times the
+// spatial frequency, which is what makes a gust front cross a meadow instead of
+// the whole field breathing at once (windSampleAt's note; Crysis / GPU Gems 3).
+//
+// `k` is the frequency in BAM per cell, already scaled by the band's own gp
+// coefficient. Folding the coefficient into `k` rather than multiplying the
+// phase afterwards is REQUIRED, not tidier: the phase is reduced mod 2^16 here,
+// and (x mod m)*c is not (x*c) mod m unless c is 1. Getting that wrong shows up
+// as a gust pattern that jumps discontinuously every 65536 cells, which is a
+// long way from anywhere anyone tests.
+//
+// The reduction itself is exact because u32 arithmetic wraps mod 2^32 and
+// 65536 divides 2^32, so masking a wrapped product to 16 bits gives the true
+// product mod 65536 — including for negative world coordinates, whose two's
+// complement bit pattern is already their residue.
+fn windPhaseQ(p : vec3<i32>, d : vec2<i32>, k : i32) -> u32 {
+  let kx = (d.x * k) / 65536;
+  let kz = (d.y * k) / 65536;
+  return (u32(p.x) * u32(kx) + u32(p.z) * u32(kz)) & 65535u;
+}
+
+// Band clock, in BAM. `k` is BAM-per-tick in Q16 (so the slow bands keep their
+// rate instead of rounding to zero), and the u32 multiply's wrap at 2^32 IS the
+// modular reduction: 2^32 is exactly one turn in these units, so a session can
+// run for as long as it likes without the phase ever needing a fixup.
+fn windClockQ(tick : u32, k : u32) -> u32 { return (tick * k) >> 16u; }
+
+// Radians -> BAM, at const-eval only.
+const WINDQ_RAD : f32 = 65536.0 / 6.28318531;
+// Ticks -> BAM, Q16, per unit rate: one second is 30 ticks.
+const WINDQ_HZ : f32 = 4294967296.0 / (6.28318531 * 30.0);
+// The gust clock rate, clamped where it is READ rather than where it is
+// authored, because these constants are const-eval'd from tuning.json and a
+// hand-edited file must not be able to produce an out-of-range u32 conversion
+// (which is a shader compile error, i.e. a black screen, not a bad look).
+const WINDQ_RATE : f32 = clamp(TUNE_WIND_GUST_SPEED, 0.0, 64.0);
+// The six band rates of windSampleAt, transcribed. Do not tidy them: they are
+// deliberately incommensurate so the two bands never come back into phase.
+const WINDQ_T_100 : u32 = u32(WINDQ_RATE * 1.00 * WINDQ_HZ);
+const WINDQ_T_083 : u32 = u32(WINDQ_RATE * 0.83 * WINDQ_HZ);
+const WINDQ_T_131 : u32 = u32(WINDQ_RATE * 1.31 * WINDQ_HZ);
+const WINDQ_T_173 : u32 = u32(WINDQ_RATE * 1.73 * WINDQ_HZ);
+const WINDQ_T_219 : u32 = u32(WINDQ_RATE * 2.19 * WINDQ_HZ);
+const WINDQ_T_261 : u32 = u32(WINDQ_RATE * 2.61 * WINDQ_HZ);
+// Spatial frequency, BAM per cell travelled downwind = WIND_GUST_K in BAM.
+// Capped at 27000 so that the largest gp coefficient (1.2) still leaves
+// dirQ * k inside i32; the cap is ~10x above the tuner's shortest authorable
+// wavelength, so it never engages in practice.
+const WINDQ_K_BASE : i32 = min(
+    i32(round(65536.0 / max(TUNE_WIND_GUST_WAVELENGTH / VOXEL_METERS, 1.0))),
+    27000);
+const WINDQ_K_100 : i32 = WINDQ_K_BASE;
+const WINDQ_K_120 : i32 = i32(round(f32(WINDQ_K_BASE) * 1.2));
+const WINDQ_K_070 : i32 = i32(round(f32(WINDQ_K_BASE) * 0.7));
+const WINDQ_K_050 : i32 = i32(round(f32(WINDQ_K_BASE) * 0.5));
+const WINDQ_K_030 : i32 = i32(round(f32(WINDQ_K_BASE) * 0.3));
+// The 2.1-radian offset on band 1's cross component, in BAM.
+const WINDQ_PH_21 : i32 = i32(round(2.1 * WINDQ_RAD));
+// Anisotropy and band mix — WIND_GUST_CROSS / WIND_GUST_VERT / WIND_BAND_W1 /
+// WIND_BAND_W2 above, in Q16.16.
+const WINDQ_CROSS : i32 = i32(round(0.6 * 65536.0));
+const WINDQ_VERT  : i32 = i32(round(0.18 * 65536.0));
+const WINDQ_W1    : i32 = i32(round(0.7 * 65536.0));
+const WINDQ_W2    : i32 = i32(round(0.3 * 65536.0));
+// Altitude ramp, windAltRamp() in integers: 1.0 + gain * (y - refY) / 100,
+// clamped to the same [0.15x, 4x].
+const WINDQ_ALT_GAIN  : i32 = i32(round(TUNE_WIND_ALT_GAIN * 0.01 * 65536.0));
+const WINDQ_ALT_REF_Y : i32 = i32(round(TUNE_WIND_ALT_REF_Y));
+const WINDQ_ALT_MIN   : i32 = 9830;     // 0.15 in Q16.16
+const WINDQ_ALT_MAX   : i32 = 262144;   // 4.0
+
+// THE FIELD, for the sim. Q16.16 world cells per second at world cell `p`.
+//
+// Returns the ZERO vector when sim.windMode is off, which is what makes phase 1
+// through 4 hash-neutral by construction — but do NOT rely on that alone at a
+// call site: a drag term reading zero wind still drags. Every consumer gates on
+// T.windMode itself, and says so.
+//
+// COST. Six integer sines and ~30 multiplies, about 150 integer ops. That is
+// heavy next to a gravity add and cheap next to the neighbourhood loads the
+// callers already did; it is only ever paid inside the movement tail of an
+// already-awake chunk, and never at all with the gate off. If it ever profiles
+// hot in the CA, the contained fallback is research doc §3's per-chunk cache —
+// one evaluation per chunk per tick, the God of War shape — NOT a cheaper field.
+fn windAtQ(p : vec3<i32>, T : TickParams) -> vec3<i32> {
+  if (T.windMode == WIND_MODE_OFF) { return vec3<i32>(0, 0, 0); }
+  let alt = clamp(65536 + (p.y - WINDQ_ALT_REF_Y) * WINDQ_ALT_GAIN,
+                  WINDQ_ALT_MIN, WINDQ_ALT_MAX);
+  let d = T.windDirQ;                    // unit XZ, downwind, Q16.16
+  let cw = vec2<i32>(-d.y, d.x);         // 90 degrees to its left
+  let spd = wq(T.windSpeedQ, alt);
+  let amp = wq(T.windGustQ, alt);
+
+  // Band components in the (along, cross, up) frame. Five spatial phases and
+  // six clocks, exactly as windSampleAt builds them with ph = 0.
+  let b1a = windSinQ(i32(windPhaseQ(p, d, WINDQ_K_100) +
+                         windClockQ(T.tick, WINDQ_T_100)));
+  let b1c = wq(WINDQ_CROSS,
+               windSinQ(i32(windPhaseQ(p, d, WINDQ_K_120) +
+                            windClockQ(T.tick, WINDQ_T_083)) + WINDQ_PH_21));
+  let b1u = wq(WINDQ_VERT,
+               windSinQ(i32(windPhaseQ(p, d, WINDQ_K_070) +
+                            windClockQ(T.tick, WINDQ_T_131))));
+  let b2a = windSinQ(i32(windPhaseQ(p, d, WINDQ_K_050) +
+                         windClockQ(T.tick, WINDQ_T_173)));
+  let b2c = wq(WINDQ_CROSS, windSinQ(i32(windClockQ(T.tick, WINDQ_T_219))));
+  let b2u = wq(WINDQ_VERT,
+               windSinQ(i32(windPhaseQ(p, d, WINDQ_K_030) +
+                            windClockQ(T.tick, WINDQ_T_261))));
+
+  // Rotate each band out of that frame into world space and scale by the gust
+  // amplitude — windBandWS(), in integers.
+  let w1 = vec3<i32>(wq(amp, wq(d.x, b1a) + wq(cw.x, b1c)),
+                     wq(amp, b1u),
+                     wq(amp, wq(d.y, b1a) + wq(cw.y, b1c)));
+  let w2 = vec3<i32>(wq(amp, wq(d.x, b2a) + wq(cw.x, b2c)),
+                     wq(amp, b2u),
+                     wq(amp, wq(d.y, b2a) + wq(cw.y, b2c)));
+  // windMeanWS() + the 0.7/0.3 mix.
+  return vec3<i32>(wq(d.x, spd), 0, wq(d.y, spd)) +
+         vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
+         vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z));
+}
 
 // ---- particles: voxels in flight (DESIGN.md §5) ----
 // All particle state is fixed-point integer (24.8, 1 voxel = 256): the

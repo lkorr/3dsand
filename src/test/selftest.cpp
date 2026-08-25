@@ -28,6 +28,7 @@ namespace selftest {
 // Each domain file exposes its gates through one of these.
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
+const std::vector<Gate>& WindGates();
 const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
@@ -50,7 +51,7 @@ const std::vector<Gate>& SpellGates();
 const char* const kOrder[] = {
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
-    "evaporation",
+    "evaporation", "wind",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
@@ -66,7 +67,8 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&SimGates(), &CaGates(), &RenderGates(), &PlayerGates(),
+    for (const auto* g : {&SimGates(), &CaGates(), &WindGates(), &RenderGates(),
+                          &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &SpellGates()})
       pool.insert(pool.end(), g->begin(), g->end());

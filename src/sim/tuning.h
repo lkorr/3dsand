@@ -1060,6 +1060,56 @@ struct Tuning {
     float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
                                   // stains an adjacent solid cell — the MPM
                                   // counterpart of CA liquid staining
+
+    // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
+    // The SHAPE of the field is the `wind` group below; these are what the
+    // three SIM consumers do with what they sample. Human-unit floats, the
+    // sim.fluid* exception and by the same mechanism — each is const-eval'd to
+    // an integer at the top of the kernel that reads it, so no f32 ever
+    // reaches a sim kernel (rule 1).
+
+    // THE GATE, and the only knob in this file that can move the pinned world
+    // hash. 0 = no sim kernel evaluates wind at all; 1 = drift (particles, MPM
+    // spray, the CA's bias on matter that is already moving); 2 = also
+    // settled-powder entrainment. See kWindMode* in world.h for what each step
+    // promises about rule 2 — 2 is deliberately NOT rule-2 clean yet and is
+    // there to be looked at, not shipped.
+    int windMode = 0;
+    // Ballistic debris and spray: fraction of the gap between a particle's
+    // velocity and the local wind that closes per SECOND, at a material's full
+    // windResponse of 15. A drag law rather than a push, because drag is
+    // self-limiting — a particle accelerates toward the wind and then stops,
+    // so no gust can fling debris faster than the air is moving, whatever the
+    // knob says. That bound is why this can be a plain multiplier and does not
+    // need a budget.
+    float windDrag = 3.0f;
+    // MPM grid nodes: how much of the field a fully exposed node feels, as a
+    // fraction. Below 1 because a fluid surface is not a free particle — it is
+    // dragged by the air, not carried.
+    float windFluidGain = 0.35f;
+    // ...and which nodes count as exposed: node mass, as a fraction of the mass
+    // a node deep inside fluid at rest density carries. Wind fades to nothing
+    // as a node approaches this, so it acts on spray and the top skin of a pool
+    // and not on its body. Full-body wind on a pond reads as a CURRENT, which
+    // is a different phenomenon and the wrong one (research doc §8's open
+    // question, answered here in favour of low-mass-only).
+    float windFluidMass = 0.5f;
+    // CA drift bias: the wind speed at which a full-response material reaches
+    // the maximum bias probability, and that maximum. The bias only reorders
+    // the direction candidates a moving voxel already tries, so the cap is what
+    // keeps wind from becoming a second gravity — at 0.5 a gale still leaves an
+    // even chance of the ordinary random order, which is what keeps smoke
+    // looking like smoke rather than like a conveyor.
+    float windDriftSpeed = 12.0f;
+    float windDriftMax = 0.5f;
+    // Entrainment (windMode 2): the per-axis wind speed that just lifts a grain
+    // whose windFriction is 1; the threshold scales with the authored nibble,
+    // so friction 4 needs four times this. Bagnold's fluid threshold, authored.
+    float windEntrainSpeed = 2.0f;
+    // ...and how often a grain over that threshold actually hops, in chances
+    // per second. This is the bound (rule 2): entrainment is a rate, not a
+    // certainty, so a dune creeps instead of exploding.
+    float windEntrainRate = 6.0f;
   } sim;
 
   // ---- day/night cycle ----

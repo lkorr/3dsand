@@ -274,6 +274,37 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     // a solid for the CA, the brush, fire and the renderer. See kMatFlagPassable.
     if (m.value("passable", false)) d.gpu.flags |= kMatFlagPassable;
 
+    // ---- wind coupling (docs/RESEARCH_wind.md §4.5, invariant 7) ----
+    // Two 4-bit numbers in the high half of the same flags word — see
+    // kMatWind* in materials.h for why they are packed there. Absent means
+    // derived from density, so every material has a sane answer without 96
+    // edits, and a new material is windy the day it is added.
+    //
+    //   "wind": { "response": 0..15, "friction": 0..15 }
+    //
+    // Out of range is an ERROR rather than a clamp: these fields are four bits
+    // wide, so a 20 would wrap into its neighbour and silently make a material
+    // that blows away read as one that never entrains.
+    {
+      const json* wj = m.contains("wind") && m["wind"].is_object() ? &m["wind"]
+                                                                  : nullptr;
+      int resp = wj ? wj->value("response", (int)DeriveWindResponse(d.gpu.density))
+                    : (int)DeriveWindResponse(d.gpu.density);
+      int fric = wj ? wj->value("friction", (int)DeriveWindFriction(d.gpu.density))
+                    : (int)DeriveWindFriction(d.gpu.density);
+      if (resp < 0 || resp > (int)kMatWindMax || fric < 0 ||
+          fric > (int)kMatWindMax) {
+        errors += path + ": material \"" + d.name +
+                  "\": wind response/friction must be 0..15\n";
+        resp = resp < 0 ? 0 : (resp > (int)kMatWindMax ? (int)kMatWindMax : resp);
+        fric = fric < 0 ? 0 : (fric > (int)kMatWindMax ? (int)kMatWindMax : fric);
+      }
+      d.windResponse = (uint32_t)resp;
+      d.windFriction = (uint32_t)fric;
+      d.gpu.flags |= (d.windResponse & kMatWindRespMask) << kMatWindRespShift;
+      d.gpu.flags |= (d.windFriction & kMatWindFricMask) << kMatWindFricShift;
+    }
+
     auto colors = m.value("colors", std::vector<std::string>{});
     if (colors.size() != 3) {
       errors += path + ": material \"" + d.name + "\": need exactly 3 colors\n";

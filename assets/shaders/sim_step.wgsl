@@ -1201,6 +1201,139 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   return false;  // settled — the caller decides whether to stay awake
 }
 
+// ============================== WIND IN THE CA ==============================
+// docs/RESEARCH_wind.md §4.5, phase 4. This is the only part of the wind system
+// that writes voxels, and therefore the only part that can move the world hash.
+// It is behind T.windMode, which ships at 0 (kWindMode* in world.h).
+//
+// TWO MECHANISMS, and the split is Bagnold's: matter already in motion is
+// steered, matter at rest has to be picked up, and those need different
+// thresholds. The hysteresis that separates them is not written anywhere — it
+// falls out of the sleep machinery, because "already moving" and "settled" are
+// states this kernel already distinguishes by which stage a cell reaches.
+//
+//   * DRIFT BIAS reorders the direction candidates a MOVING voxel was going to
+//     try anyway. It cannot make a voxel move that would not have moved, it adds
+//     no write, and its reach is still <= 1 cell — so it changes what the world
+//     does without changing anything about how the world sleeps (invariant 3:
+//     the ambient field never wakes a chunk).
+//     Instantaneous advection, not acceleration, is the CORRECT model for a
+//     gas: a parcel of smoke has no inertia worth modelling at this scale, it
+//     goes where the air goes. The particle tier (sim_particle.wgsl) is where
+//     momentum lives, and §4.6 is explicit that the two tiers divide that way.
+//
+//   * ENTRAINMENT unlocks a move for a SETTLED grain when the wind on one axis
+//     beats that material's authored friction. That is saltation, and it is
+//     what makes a fan blow a sand pile flat. It is gated one step further out
+//     (WIND_MODE_ENTRAIN) because it is the one mechanism here that is not
+//     rule-2 clean on its own — see kWindModeEntrain in world.h.
+//
+// LIQUIDS ARE DELIBERATELY EXCLUDED from both. They move by mass transfer
+// through stepLiquid, not by the direction rotation these hook into, and what
+// wind does to standing water is drive surface waves and spray — a different
+// phenomenon, owned by the MPM node force (sim_fluid.wgsl) where a wave can
+// actually exist. Biasing eighths downwind would just make a pond flow uphill.
+
+// Wind speed at which the drift bias reaches its cap, Q16.16 world cells/s
+// (windAtQ's unit). Authored in m/s; converted at const-eval, so the kernel is
+// integer (the sim_fluid.wgsl discipline).
+const WIND_DRIFT_REF : i32 = i32(round(
+    clamp(TUNE_WIND_DRIFT_SPEED, 0.5, 200.0) * 65536.0 / VOXEL_METERS));
+// That cap, in 1024ths. Below 1024 by construction (LoadTuning clamps to 0.95):
+// at certainty the RNG order is gone entirely and a gas stops looking like a
+// gas and starts looking like a conveyor belt.
+const WIND_DRIFT_CAP : i32 = i32(round(clamp(TUNE_WIND_DRIFT_MAX, 0.0, 0.95) * 1024.0));
+// Per-axis wind that just lifts a settled grain of windFriction 1, same units.
+const WIND_ENTRAIN_REF : i32 = i32(round(
+    clamp(TUNE_WIND_ENTRAIN_SPEED, 0.5, 200.0) * 65536.0 / VOXEL_METERS));
+// ...and how often a grain over that threshold actually hops, in 1024ths per
+// TICK (the entrainment stage runs on substep 0 only, so this is per tick with
+// no substep division to keep in step). A rate, not a certainty: this is the
+// bound that makes a dune creep instead of detonate (rule 2).
+const WIND_ENTRAIN_CHANCE : i32 =
+    i32(round(clamp(TUNE_WIND_ENTRAIN_RATE, 0.0, 30.0) * 1024.0 / 30.0));
+// Distinct salt for the wind RNG stream. NOT a bit-slice of `rnd`: the movement
+// tail already spends bits 10.., 14.. and 18.. of that word on the direction
+// rotations these decisions sit next to, and correlating "does it go downwind"
+// with "which way did it pick" is exactly the kind of hidden coupling the
+// worldgen salt rule exists to forbid. One extra hash3, drawn only when a
+// material actually responds to wind.
+const WIND_RNG_SALT : u32 = 0x5719u;
+
+fn windRnd(slotIdx : u32) -> u32 {
+  return hash3(T.seed ^ WIND_RNG_SALT, T.tick * 2u + P.substep, slotIdx);
+}
+
+// Which of lateralDir's four codes points most nearly downwind. lateralDir is
+// 0:+x 1:+z 2:-x 3:-z, so this is the dominant horizontal axis and its sign.
+fn windLateralCode(w : vec3<i32>) -> u32 {
+  if (abs(w.x) >= abs(w.z)) { return select(2u, 0u, w.x > 0); }
+  return select(3u, 1u, w.z > 0);
+}
+
+// The starting index for a 4-direction lateral rotation, biased downwind.
+//
+// Returns `base` (the RNG's own offset) unchanged in every case where wind
+// should not apply, so the two call sites read as "the same rotation, sometimes
+// started somewhere else". That framing is the safety argument: no branch here
+// can add a move candidate, only reorder the four that were already going to be
+// tried, so tryMove's write reach and the stamp discipline are untouched.
+fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
+                    slotIdx : u32) -> u32 {
+  if (T.windMode == WIND_MODE_OFF) { return base; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return base; }          // most materials: one compare
+  let w = windAtQ(c, T);
+  let mag = max(abs(w.x), abs(w.z));
+  if (mag == 0) { return base; }
+  // Ramp to the cap over [0, WIND_DRIFT_REF], then scale by the authored
+  // response. Both operands are pre-scaled by 1024 before multiplying: a
+  // storm-force Q16.16 speed times 1024 leaves i32, and this runs per moving
+  // voxel per substep.
+  let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
+             max(WIND_DRIFT_REF >> 10u, 1);            // 0..1024
+  let p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
+  if (i32(windRnd(slotIdx) & 1023u) < p) { return windLateralCode(w); }
+  return base;
+}
+
+// Saltation: a settled grain of powder pulled loose by a wind that beats its
+// authored friction. Returns true if it moved (the caller is then done with
+// this cell, exactly as a successful tryMove leaves it).
+//
+// The threshold is PER AXIS, not on the magnitude, because that is what makes
+// friction behave like friction: a wind blowing diagonally has to beat the
+// threshold on the axis it is trying to push along, so a grain does not creep
+// sideways off a component too weak to move it.
+//
+// Two candidates, in the order a real grain takes them: slide along the surface
+// first, and only if that is blocked, hop UP and over the obstruction. Both are
+// ordinary tryMoves at reach 1.
+fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return false; }
+  let thresh = i32(matWindFriction(m)) * WIND_ENTRAIN_REF;
+  let wv = windAtQ(c, T);
+  var d = vec2<i32>(0, 0);
+  // Only the horizontal axes are tested. A vertical component lifts nothing on
+  // its own — a grain needs somewhere lateral to go, and an updraft that
+  // levitated powder in place would be a fountain, not saltation. It reaches
+  // the grain anyway, through the up-diagonal candidate below.
+  if (abs(wv.x) > thresh) { d.x = select(-1, 1, wv.x > 0); }
+  if (abs(wv.z) > thresh) { d.y = select(-1, 1, wv.z > 0); }
+  if (d.x == 0 && d.y == 0) { return false; }
+  // The rate gate. Drawn AFTER the threshold test so a becalmed dune costs a
+  // compare, and drawn at all so that a wind sitting just over the threshold
+  // moves a surface slowly rather than all at once.
+  if (i32((windRnd(slotIdx) >> 10u) & 1023u) >= WIND_ENTRAIN_CHANCE) {
+    return false;
+  }
+  if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w32, m.density, false)) {
+    return true;
+  }
+  return tryMove(c, c + vec3<i32>(d.x, 1, d.y), w32, m.density, false);
+}
+
 @compute @workgroup_size(6, 6, 6)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
@@ -1313,16 +1446,21 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // 1) straight fall / rise
   if (tryMove(c, c + vec3<i32>(0, dy, 0), w, m.density, rising)) { return; }
 
-  // 2) the four diagonal cells one step down (up for gas), RNG order
-  let r = rnd >> 10u;
+  // 2) the four diagonal cells one step down (up for gas), RNG order — started
+  //    DOWNWIND with a probability set by the wind and the material's authored
+  //    response (windLateralStart; no-op when the gate is off). The rotation
+  //    itself is unchanged: this only decides where it begins.
+  let r = windLateralStart(c, rnd >> 10u, m, slotIdx);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
     if (tryMove(c, c + vec3<i32>(d.x, dy, d.y), w, m.density, rising)) { return; }
   }
 
-  // 3) gases also spread laterally, RNG order
+  // 3) gases also spread laterally, RNG order — and this is the stage that
+  //    actually makes smoke stream downwind, since a gas that has already risen
+  //    as far as it can spends most of its life here.
   if (m.klass == CLASS_GAS) {
-    let r2 = rnd >> 14u;
+    let r2 = windLateralStart(c, rnd >> 14u, m, slotIdx);
     for (var i = 0u; i < 4u; i++) {
       let d = lateralDir(i + r2);
       if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, rising)) { return; }
@@ -1338,6 +1476,22 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       let d = lateralDir(i + (r3 >> 3u));
       if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, false)) { return; }
     }
+  }
+
+  // 5) entrainment: this grain has now failed every move its own weight can
+  //    justify, which is exactly the definition of SETTLED — so this is the one
+  //    place a wind is allowed to pick it up (invariant 4). Substep 0 only, the
+  //    same once-per-tick budget reactions and staining take, which is also
+  //    what lets WIND_ENTRAIN_CHANCE be a plain per-tick rate.
+  //
+  //    Reaching here at all means the chunk was already awake. The ambient
+  //    field cannot wake it (invariant 3) — but a grain that DOES hop marks its
+  //    chunk through the ordinary tryMove path and so keeps it awake, which is
+  //    why this step is gated one notch further out than the drift bias. See
+  //    kWindModeEntrain in world.h.
+  if (T.windMode >= WIND_MODE_ENTRAIN && P.substep == 0u &&
+      m.klass == CLASS_POWDER) {
+    if (windEntrain(c, w, m, slotIdx)) { return; }
   }
   // Nothing to do: cell settles. If the whole chunk settles, nothing marks it
   // dirty and it sleeps until a neighbor wakes it.

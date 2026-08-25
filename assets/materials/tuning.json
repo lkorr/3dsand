@@ -278,7 +278,15 @@
     "fluidSettleEps": 6,
     "fluidWakeSpeed": 24,
     "fluidSettleTicks": 24,
-    "fluidStainRate": 8
+    "fluidStainRate": 8,
+    "windMode": 0,
+    "windDrag": 3,
+    "windFluidGain": 0.35,
+    "windFluidMass": 0.5,
+    "windDriftSpeed": 12,
+    "windDriftMax": 0.5,
+    "windEntrainSpeed": 2,
+    "windEntrainRate": 6
   },
   "render": {
     "skyGradient": 1.4,
