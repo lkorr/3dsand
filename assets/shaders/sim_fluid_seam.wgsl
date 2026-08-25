@@ -116,6 +116,11 @@ const SP_COUNT : u32 = 2u * NUM_CHUNKS;            // settle list count
 const SP_LIST : u32 = 2u * NUM_CHUNKS + 1u;        // + list index (16)
 const SP_BINS : u32 = 2u * NUM_CHUNKS + 18u;       // + (listIdx*CHUNK_VOL+cell)*2
 const SETTLE_MAX : u32 = 16u;                      // kFluidSettleMax
+// Per-COLUMN excite-unstable mask: 256 columns per settling block, 8 words of
+// bits each. Feasibility refusal stays whole-block (see settleCheck), but
+// instability is a property of ONE column and is refused at that granularity.
+const SP_COLBAD : u32 = SP_BINS + SETTLE_MAX * CHUNK_VOL * 2u;  // + listIdx*8
+const SP_SCRATCH_WORDS : u32 = SP_COLBAD + SETTLE_MAX * 8u;
 const MARK_SETTLING : u32 = 0x80000000u;
 const MARK_REFUSED : u32 = 0x40000000u;
 const MARK_LIST_MASK : u32 = 0x1Fu;
@@ -1105,6 +1110,14 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
       picked[count] = sc;
       atomicStore(&settleScratch[SP_LIST + count], s);
       atomicStore(&settleScratch[SP_MARK + s], MARK_SETTLING | count);
+      // Belt-and-braces: `seam_fill_settle` already zeroes the whole scratch
+      // at the head of the seam, but settleCheck only ever ORs into this mask
+      // and a stale bit here silently strands a column's water as particles.
+      // Cheap (8 stores per pick, one thread) and it makes the OR-only
+      // contract locally sound rather than dependent on a distant pass row.
+      for (var q = 0u; q < 8u; q++) {
+        atomicStore(&settleScratch[SP_COLBAD + count * 8u + q], 0u);
+      }
       count += 1u;
     }
   }
@@ -1134,6 +1147,14 @@ fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>) {
   atomicMax(&settleScratch[b + 1u],
             (fpMat(p.attr) << 16u) | (fpStainAmt(p.attr) << 3u) |
             fpStainType(p.attr));
+}
+
+// Did the stability test refuse THIS column of this settling block? Shared by
+// settleCommit (do not write it) and settleKill (do not eat its particles) —
+// the two must read the identical bit or mass is dropped or invented.
+fn seamColumnRefused(listIdx : u32, col : u32) -> bool {
+  return (atomicLoad(&settleScratch[SP_COLBAD + listIdx * 8u + col / 32u]) &
+          (1u << (col % 32u))) != 0u;
 }
 
 // Support under a settling column: what water can rest on. Out-of-window is
@@ -1178,12 +1199,19 @@ const SETTLE_SPILL : i32 = 8;
 const SETTLE_LEVELS : i32 = 16 + SETTLE_SPILL;   // 24
 var<workgroup> wgFill : array<u32, 768>;   // [col*3 + y/8], nibble (y%8)*4
 var<workgroup> wgBlk : array<u32, 256>;    // bit y = level y blocks flow
+// bit y = level y is BYTE-IDENTICAL to the voxel already there: this settle
+// neither creates nor moves that water. See the stability test in settleCheck
+// for why that distinction decides whether the level may veto the block.
+var<workgroup> wgSame : array<u32, 256>;
 
 fn wgFillAt(col : u32, y : i32) -> u32 {
   return (wgFill[col * 3u + u32(y) / 8u] >> ((u32(y) % 8u) * 4u)) & 0xFu;
 }
 fn wgBlockedAt(col : u32, y : i32) -> bool {
   return (wgBlk[col] & (1u << u32(y))) != 0u;
+}
+fn wgSameAt(col : u32, y : i32) -> bool {
+  return (wgSame[col] & (1u << u32(y))) != 0u;
 }
 
 fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
@@ -1254,6 +1282,13 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
       idHere = max(idHere, (mat << 16u) | (voxStainAmt(w) << 3u) |
                             voxStainType(w));
     }
+    // An UNTOUCHED cell: nothing arrived from below (the pool was empty when
+    // the walk reached this level), nothing binned here, and the cell already
+    // holds water. The placement below is then min(existing, 8) == existing
+    // with poolMatStain == its own identity, i.e. `nw == w` and the walk
+    // rewrites the cell with itself. Recorded because the stability test must
+    // not veto a block for water this settle is not creating.
+    let untouched = pool == 0u && binned == 0u && existing > 0u;
     pool += binned + existing;
     poolMatStain = max(poolMatStain, idHere);
     // FA_SETTLED counts NET NEW eighths: re-placed existing water cancels
@@ -1268,6 +1303,7 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     pool -= place;
     if (rec && y < SETTLE_LEVELS) {
       wgFill[col * 3u + u32(y) / 8u] |= place << ((u32(y) % 8u) * 4u);
+      if (untouched) { wgSame[col] |= 1u << u32(y); }
     }
     if (write && idx != PT_NO_WORD) {
       var nw = 0u;
@@ -1338,6 +1374,7 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
   wgFill[li * 3u + 1u] = 0u;
   wgFill[li * 3u + 2u] = 0u;
   wgBlk[li] = 0u;
+  wgSame[li] = 0u;
   if (li == 0u) { atomicStore(&wgBad, 0u); atomicStore(&wgUnstable, 0u); }
   workgroupBarrier();
 
@@ -1366,6 +1403,18 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
     for (var y = 0; y < SETTLE_LEVELS && !unstable; y++) {
       let full = wgFillAt(li, y);
       if (full == 0u) { continue; }
+      // SCOPE: only cells this settle CREATES may veto it. Settle is
+      // all-or-nothing per 16x16x16 block, and the column walk rewrites every
+      // cell it passes — including standing water it merely re-places
+      // unchanged. Letting those vote made the veto over-reach badly: a block
+      // holding one perched pre-existing film refused to convert the NEW water
+      // everywhere else in it, forever, and refusing could never fix the film
+      // because the settle was not what put it there. Measured on the sealed
+      // fluid-excite chamber, whose drained floor is exactly this shape: 14 of
+      // 18 picks refused unstable, 3,683 of 4,056 eighths stranded as
+      // particles. The hysteresis guarantee is unaffected — it is a statement
+      // about the cells settle CREATES, and an untouched cell is not one.
+      if (wgSameAt(li, y)) { continue; }
       // WHO OWNS SETTLED LIQUID decides how strict this is, and both arms are
       // the same question — "will this configuration still move?".
       //   exciteMode 1: the MPM owns it. Refuse anything excite would take
@@ -1414,16 +1463,39 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
           nb = seamNeighbourState(base + vec3<i32>(nx, y, nz));
           bel = seamNeighbourState(base + vec3<i32>(nx, y - 1, nz));
         }
-        if (seamLateralExcite(nb, bel)) { unstable = true; break; }
+        if (seamLateralExcite(nb, bel)) {
+          unstable = true;
+          break;
+        }
       }
     }
-    if (unstable) { atomicOr(&wgUnstable, 1u); }
+    // PER-COLUMN refusal. Publishing the vote as a bit rather than folding it
+    // into the block verdict is what stops one perched column from vetoing
+    // the other 255: settleCommit skips exactly these columns and settleKill
+    // spares exactly their particles, so the refused water stays particles
+    // and the mass ledger still balances column by column.
+    if (unstable) {
+      atomicOr(&settleScratch[SP_COLBAD + wg.x * 8u + li / 32u],
+               1u << (li % 32u));
+      atomicOr(&wgUnstable, 1u);
+    }
   }
   workgroupBarrier();
 
   let infeasible = atomicLoad(&wgBad) != 0u;
   let unstableBlk = atomicLoad(&wgUnstable) != 0u;
-  if (live && li == 0u && (infeasible || unstableBlk)) {
+  // Only INFEASIBILITY refuses the whole block. Instability is now per-column
+  // (above), so an unstable block still commits every stable column it has;
+  // the counter is kept because "how much did the veto take" is the number
+  // WP3 diagnoses with.
+  if (live && li == 0u && unstableBlk && !infeasible) {
+    atomicAdd(&fluidArgs[FA_SETUNSTABLE], 1u);
+    // A block that lost columns to the veto has NOT finished converting, so
+    // it must not bank a fresh calm window against unchanged geometry
+    // (WP3 item 3's cooldown, same halving as a full refusal).
+    atomicStore(&fluidCalm[ci], SEAM_CALM_TICKS / 2u);
+  }
+  if (live && li == 0u && infeasible) {
     atomicOr(&settleScratch[SP_MARK + ci], MARK_REFUSED);
     // Refused blocks HALVE their calm window rather than zeroing it (WP3 item
     // 3). Zeroing made a geometrically-awkward pool re-run the full 45-tick
@@ -1434,8 +1506,7 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
     // Two counters, because they are opposite diagnoses: INFEASIBLE means the
     // column arithmetic did not fit (geometry/coverage), UNSTABLE means it fit
     // and would have wanted to move again immediately (WP3's whole point).
-    if (infeasible) { atomicAdd(&fluidArgs[FA_SETREFUSED], 1u); }
-    else { atomicAdd(&fluidArgs[FA_SETUNSTABLE], 1u); }
+    atomicAdd(&fluidArgs[FA_SETREFUSED], 1u);
   }
 }
 
@@ -1451,7 +1522,13 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
   let cx = i32(li & 15u);
   let cz = i32(li >> 4u);
-  settleColumn(wg.x, base, cx, cz, true, false, li);
+  // Columns the stability test refused keep their water as particles. Their
+  // bins are simply never drained and their voxels never written, which is
+  // why the ledger stays exact without any special case: settleKill spares
+  // the same particles by the same bit.
+  if (!seamColumnRefused(wg.x, li)) {
+    settleColumn(wg.x, base, cx, cz, true, false, li);
+  }
   if (li == 0u) { atomicStore(&fluidCalm[ci], 0u); }
 }
 
@@ -1496,6 +1573,10 @@ fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = chunkSlotIndex(worldChunkOf(cell));
   let mark = atomicLoad(&settleScratch[SP_MARK + slot]);
   if ((mark & MARK_SETTLING) == 0u || (mark & MARK_REFUSED) != 0u) { return; }
+  // Per-column veto: this particle's own column may have been refused while
+  // the rest of the block committed. Same bit settleCommit consulted.
+  let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
+  if (seamColumnRefused(mark & MARK_LIST_MASK, lo.z * CHUNK + lo.x)) { return; }
   p.attr = 0u;
   fluidParticles[gid.x] = p;
   atomicAdd(&fluidArgs[FA_DEAD], 1u);

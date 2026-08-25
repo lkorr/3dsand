@@ -1019,6 +1019,8 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   uint32_t compressed = 0, sampled = 0, liveEighths = 0;
   uint32_t setBlocksSum = 0;  // settle picks over the run (refusal-loop probe)
   uint32_t infeasibleSum = 0, unstableSum = 0;  // and why they were refused
+  uint32_t exBinned = 0, exSettled = 0, exDied = 0;  // seam flow ledger
+  uint32_t endWide = 0;   // water voxels anywhere in the box, walls included
   int32_t endMaxS2 = -1;      // max (v>>8)^2 at end (never-calm probe)
   for (int run = 0; run < 2; run++) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -1076,6 +1078,10 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
         // that can tell them apart.
         infeasibleSum += fa[25];
         unstableSum += fa[26];
+        // The seam flow ledger, which localises a mass discrepancy: binned
+        // != settled means the column walk dropped it, settled != the voxel
+        // sweep means the writes were lost.
+        exBinned += fa[15]; exSettled += fa[10]; exDied += fa[8];
         if (run == 1 && i % 40 == 0)
           std::printf("  excite t%d: live %u, blocks %u, excited+ %u, "
                       "picks+ %u (%u infeasible, %u unstable)\n",
@@ -1115,6 +1121,19 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
                             pbuf.size() * 4, "exciteEndV");
       endMaxS2 = 0;
       uint32_t fast = 0;
+      // THE AT-REST FLOOR PROBE (WP3 item 4, how the settle trio is derived).
+      // Report the residual speed BOTH ways: raw, and with the free-surface
+      // gravity bias stripped exactly as `seamRestVy` strips it in the shader.
+      // A weakly-compressible free surface carries one substep of gravity
+      // forever, so the RAW number is a property of `gravity/substeps` and
+      // tells you nothing about whether the water is moving; the STRIPPED one
+      // is the quantity `settleEps` is supposed to be compared against, and it
+      // is what makes the threshold mean the same thing at any gravity.
+      const int32_t gSub =
+          (int32_t)std::lround(t.sim.fluidGravity * 65536.0 / 900.0) /
+          std::max(1, t.sim.fluidSubsteps);
+      int32_t restMaxS2 = 0;
+      uint32_t restFast = 0;
       for (uint32_t k = 0; k < n; k++) {
         const int32_t* p = (const int32_t*)&pbuf[k * kFluidParticleWords];
         liveEighths += ((uint32_t)p[18] >> 12) & 0x7u;
@@ -1122,15 +1141,24 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
         int32_t s2 = sx * sx + sy * sy + sz * sz;
         if (s2 > 49) fast++;
         endMaxS2 = std::max(endMaxS2, s2);
+        int32_t ry = std::min(std::abs(p[4] + gSub), std::abs(p[4])) >> 8;
+        int32_t r2 = sx * sx + ry * ry + sz * sz;
+        if (r2 > 49) restFast++;
+        restMaxS2 = std::max(restMaxS2, r2);
       }
       if (run == 1)
-        std::printf("  end: %u live carrying %u eighths, %u above 0.9 vox/s\n",
-                    n, liveEighths, fast);
+        std::printf("  end: %u live carrying %u eighths; raw max %.2f vox/s "
+                    "(%u above 0.9), rest-frame max %.2f vox/s (%u above "
+                    "0.9), one substep of g = %.2f vox/s\n",
+                    n, liveEighths, std::sqrt((double)endMaxS2) * 30.0 / 256.0,
+                    fast, std::sqrt((double)restMaxS2) * 30.0 / 256.0, restFast,
+                    (double)(gSub >> 8) * 30.0 / 256.0);
     }
 
     // Mass audit over the whole sealed interior (both chambers): standing
     // water eighths at the end must equal the eighths placed at the start.
     endEighths = 0;
+    endWide = 0;
     std::vector<uint32_t> cbuf((size_t)kChunkVol);
     for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
       for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
@@ -1141,6 +1169,12 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
             int lx = (int)(i % 16) + cx2 * 16,
                 ly = (int)((i / 16) % 16) + cy * 16,
                 lz = (int)(i / 256) + cz2 * 16;
+            // WIDE sweep first: every water voxel anywhere in the box, walls
+            // included. If the interior audit comes up short but this does
+            // not, the mass was written somewhere the interior test does not
+            // look -- an audit-scope artifact, not a destroyed eighth.
+            if ((cbuf[i] & 0xFFFu) == waterId)
+              endWide += ((cbuf[i] >> 12) & 0xFu) + 1u;
             if (lx < px - RB + 2 || lx > px + RB - 2 || lz < pz - RB + 2 ||
                 lz > pz + RB - 2 || ly <= floorY || ly >= roofY)
               continue;
@@ -1166,6 +1200,10 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   bool resettled = endEighths > kWaterEighths * 3u / 4u && live < 800;
   bool det = worldHash[0] == worldHash[1];
   bool ok = excited && hydro && massOk && resettled && det;
+  std::printf("  seam flow: %u binned / %u settled / %u died; interior %u + "
+              "live %u = %u of %u (wide sweep %u)\n",
+              exBinned, exSettled, exDied, endEighths, liveEighths,
+              endEighths + liveEighths, kWaterEighths, endWide);
   std::printf(
       "fluid excite: %s (%u eighths excited over the drain, %u/%u sampled "
       "particles pre-compressed, %u standing + %u live eighths of %u, "
