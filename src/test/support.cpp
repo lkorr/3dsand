@@ -400,14 +400,23 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // `dirtiedNow` deliberately over-declares: farCount is render-only derived
   // data that cannot dirty a sim chunk, but it costs nothing to be wrong in
   // the safe direction and the list stays a plain "did anything arrive".
+  //
+  // particlesActive is NOT in the list (§3.2d). It says the particle PASSES are
+  // recorded, not that anything was written this tick; the ticks on which a
+  // particle can be created are exps/spawns/fluid, all of which are here, and
+  // the population already in flight is proven empty (or not) by the snapshot
+  // conjunct below. It used to be here, and it held the latch off for the whole
+  // 400-tick post-explosion window main.cpp keeps the pipeline alive for.
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
-                               spawnCount > 0 || particlesActive ||
+                               spawnCount > 0 ||
                                fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
-    // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_).
+    // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_),
+    // and shows nothing in flight — `resolve` is a dirty-writer whose target
+    // the CPU never chose, so activeChunks alone does not mean settled.
     const WorldSnapshot& sn = world.Snap();
-    if (sn.valid) sim.NoteSnapshot(sn.tick, sn.activeChunks);
+    if (sn.valid) sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
   }
 
   // THE genList UPLOAD MUST HAPPEN BEFORE THE ENCODER EXISTS, and this is a

@@ -1032,11 +1032,67 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
 //   (2) no CPU input has dirtied a chunk since S. Every such input is declared
 //       through NoteTickInputs / NoteWakeAll, which stamp lastDirtyTick_.
 //
-// Given both, dirtyIn stays empty for every tick after S+1: the CA is the only
-// thing that writes dirtyOut, an empty dirtyIn dispatches no CA workgroups, and
-// no workgroups write no dirty flags. The world is a fixed point, and it stays
-// one until a CPU input breaks it. That is the induction the skip rests on, and
-// it is why fact (2) must cover EVERY waking path rather than just brush ops.
+//   (3) that same snapshot reported ZERO live particles (§3.2d). The CA is NOT
+//       the only writer of dirtyOut: sim_particle's `resolve` reinserts a
+//       particle into the grid, which is a voxStore plus a markDirtyNext
+//       (sim_particle.wgsl:251,:274). So "the dirty set is empty" is only half
+//       of settled — the other half is "nothing is in flight that could refill
+//       it from the GPU side, at a location the CPU never chose".
+//
+// Given all three, dirtyIn stays empty for every tick after S+1: an empty
+// dirtyIn dispatches no CA workgroups and no workgroups write no dirty flags,
+// and an empty particle read page dispatches no integrate and no resolve. The
+// world is a fixed point, and it stays one until a CPU input breaks it. That is
+// the induction the skip rests on, and it is why facts (2) and (3) must cover
+// EVERY waking path rather than just brush ops.
+//
+// WHY (3) IS A SNAPSHOT CONJUNCT AND NOT A TIMER (§3.2d, the fix)
+//
+// Until 2026-08-24 (3) was carried by main.cpp's `particlesActive`, which is
+// `everExploded && (tick - lastExplosionTick < 400 || particleCount > 0)`, fed
+// into EncodeTick's `inputsThisTick`. That term re-stamped lastDirtyTick_ on
+// EVERY tick for 13.3 seconds of wall clock after any explosion, so
+// settledProven_ could never latch and the whole §3.4 mechanism was off. In
+// --measure's ACTIVE scenario, 66 of 120 ticks had a provably empty dirty set
+// and still recorded 54 indirect dispatches, the 32,768-flag compact scan and
+// the args staging copy: ~17% of that scenario's CA GPU time spent on nothing.
+// The 400-tick timer is a blunt stand-in for "a snapshot old enough to be
+// conclusive", which is exactly what snapTick >= lastDirtyTick_ already is.
+//
+// THE REINSERTION WINDOW, and why it is CLOSED rather than merely narrow. The
+// hazard to design against is the one-tick gap between a particle rejoining the
+// grid and the CPU learning of it: a skip taken in that gap does not corrupt
+// anything, it processes a dirty chunk one tick LATE, and the world hash moves.
+// It cannot happen here because the two conjuncts are read from ONE snapshot
+// word, captured at ONE point in the tick, downstream of the writer:
+//
+//   - within a tick the pass table records ... ca, particleIntegrate,
+//     particleResolve, occupancy ... and World::EncodeReadbacks is recorded
+//     after ALL of it. So the dirty flags in snapshot S already carry
+//     `resolve`'s markDirtyNext for tick S. A landing is never invisible to
+//     the snapshot that reports its own tick.
+//   - snapshot S's particleCount is counts[1 - page] (support.cpp passes
+//     `1 - sim.Page()` as particleLivePage), which is the count `integrate`
+//     built at S and `resolve` then consumed at S — the exact population
+//     resolve ran over. particleCount(S) == 0 therefore means resolve at S
+//     processed zero particles, and that the read page for S+1 is empty, so
+//     integrate at S+1 dispatches nothing and appends nothing. Zero is
+//     self-propagating, which is what makes it an induction base.
+//   - a particle that lands at S is still COUNTED at S (resolve clears its
+//     flags but never decrements counts), so the landing tick reports
+//     particleCount > 0 on top of activeChunks > 0. The conjunct errs one tick
+//     in the safe direction at exactly the moment that matters.
+//   - a particle spawned at S — explosion ejecta (sim_explode.wgsl:153,:175),
+//     a CPU shatter spawn (sim_particle.wgsl:97) — appends to the READ page and
+//     flies the same tick, so it too is inside counts[1-page] at S. MPM splash
+//     droplets append to the WRITE page (sim_fluid.wgsl:924,:1116) from tables
+//     recorded after PT_TICK, so they are also inside it. There is no spawn
+//     path whose product is invisible to the snapshot of its own tick.
+//
+// So the CPU is not predicting the future here; it is reading one consistent
+// end-of-tick state and propagating a fixed point forward. `particlesActive`
+// keeps gating the particle PASSES (it must — dropping it mid-flight strands
+// live particles), it just no longer speaks for the CA.
 //
 // The failure mode to design against is staleness, not logic: `valid` snapshots
 // arrive one tick latent at best and can lag when the readback ring saturates.
@@ -1070,14 +1126,24 @@ void Simulation::NoteWakeAll() {
   settledProven_ = false;
 }
 
-void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks) {
-  if (activeChunks != 0) {
+void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
+                              uint32_t particleCount) {
+  // Fact (3): voxels in flight are a GPU-side dirty-writer with no CPU-known
+  // target, so a non-empty particle population is "not settled" no matter what
+  // the dirty flags say. Tested first because it is the cheap disqualifier and
+  // because reading it as an ELSE of activeChunks would hide it.
+  //
+  // A stale non-zero count can only COST a skip, never license one. That is
+  // the safe direction, and it is bounded in practice: the counts are zeroed
+  // per tick while the particle pipeline runs, so the population genuinely
+  // reaches 0 a couple of ticks after the last particle dies and stays there.
+  if (activeChunks != 0 || particleCount != 0) {
     settledProven_ = false;
     return;
   }
-  // Zero active chunks. Conclusive only if nothing dirtied the world at or
-  // after the tick this snapshot was stamped at — an older snapshot describes
-  // a world that no longer exists.
+  // Zero active chunks and zero particles. Conclusive only if nothing dirtied
+  // the world at or after the tick this snapshot was stamped at — an older
+  // snapshot describes a world that no longer exists.
   if (snapTick >= lastDirtyTick_) settledProven_ = true;
 }
 
@@ -1101,28 +1167,34 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // actually carries means the ONE thing that can silently break the skip —
   // an undeclared op — cannot break it through the op path itself.
   //
-  // particlesActive is in the disjunction because a particle can rejoin the
-  // grid (sim_particle resolve writes voxels and marks dirtyOut), so a world
-  // with particles in flight is not settled even with no ops this tick.
+  // particlesActive is deliberately NOT in this disjunction (§3.2d). It is not
+  // an input at all — it is "the particle pipeline is recorded this tick", a
+  // flag main.cpp latches for 400 ticks after any explosion so that spent
+  // ejecta finishes its arc. Every tick on which a particle can be CREATED is
+  // already listed here (expCount for ejecta, spawnCount for shatter fragments,
+  // fluidCount/fluidSpawnCount for MPM splash), and the population that already
+  // exists is covered by NoteSnapshot's particleCount conjunct, which is exact
+  // rather than a timer. Putting it here re-stamped lastDirtyTick_ every tick
+  // for 13.3 s after every explosion and disabled the whole skip.
   const bool inputsThisTick = opsCount > 0 || expCount > 0 || cellCount > 0 ||
-                              spawnCount > 0 || particlesActive ||
+                              spawnCount > 0 ||
                               fluidCount > 0 || fluidSpawnCount > 0;
   if (inputsThisTick) {
     lastDirtyTick_ = curTick_;
     settledProven_ = false;
   }
   cx.caActive = !settledProven_;
-  // MEASUREMENT-ONLY (branch perf/ca-phase-skip). SANDVOX_CA_FORCE=1 defeats
-  // the §3.4 settled skip so that a SETTLED world still records all 54 CA
-  // iterations with an indirect count of zero — i.e. the CA row's GPU time
-  // becomes the pure content-free dispatch floor, directly measured rather
-  // than least-squares-extrapolated. Hash-neutral (it only ADDS no-op work).
+  // MEASUREMENT / TEST ONLY (SetCaForced, SANDVOX_CA_FORCE=1): record the CA
+  // rows unconditionally. On a settled tick that means 54 indirect dispatches
+  // with an indirect count of ZERO — no invocation, no write, so the world hash
+  // is bit-identical, which is precisely what makes it a usable oracle for the
+  // `ca-skip` gate and a direct read of the content-free dispatch floor.
   {
-    static const bool kForceCa = [] {
+    static const bool kForceCaEnv = [] {
       const char* e = std::getenv("SANDVOX_CA_FORCE");
       return e && e[0] == '1';
     }();
-    if (kForceCa) cx.caActive = true;
+    if (caForced_ || kForceCaEnv) cx.caActive = true;
   }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;

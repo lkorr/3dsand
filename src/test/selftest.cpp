@@ -27,6 +27,7 @@ namespace selftest {
 
 // Each domain file exposes its gates through one of these.
 const std::vector<Gate>& SimGates();
+const std::vector<Gate>& CaGates();
 const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
@@ -47,7 +48,7 @@ const std::vector<Gate>& SpellGates();
 // missing from this list is a link-time-visible mistake (it never runs), which
 // is the failure mode we want rather than one that runs in an arbitrary slot.
 const char* const kOrder[] = {
-    "determinism", "sleep",       "evaporation",
+    "determinism", "sleep",       "ca-skip",     "evaporation",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
@@ -63,7 +64,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&SimGates(), &RenderGates(), &PlayerGates(),
+    for (const auto* g : {&SimGates(), &CaGates(), &RenderGates(), &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &SpellGates()})
       pool.insert(pool.end(), g->begin(), g->end());
