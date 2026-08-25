@@ -1560,37 +1560,41 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     var cellOp = 0.0;   // this cell's opacity (per-cell, not first-material)
     var cellTint = vec3f(0.0);
     var cellFire = 0.0; // this cell's flicker-weighted emission
-    var cellLiq = 0.0;  // fullness if this cell is a translucent liquid
-    var cellTS = 0.0;   // 1 if this cell is a translucent SOLID (ice, glass)
+    var cellLiq = 0.0;
+    var cellTS = 0.0;
+    var cellWaterY = 0.0;
     if (mat != MAT_AIR) {
       let k = materials[mat].klass;
       // gases and translucent liquids are participating media; OPAQUE liquids
       // (lava, molten glass) read as surfaces
       if (k == CLASS_GAS ||
           (k == CLASS_LIQUID && (materials[mat].flags & MATF_OPAQUE) == 0u)) {
-        if (wantMedia) {
-          // liquids weight by fullness so a 1/8 film tints far less than a
-          // full cell; gases count whole
-          weight = select(1.0, f32(voxState(w) + 1u) / 8.0, k == CLASS_LIQUID);
+        // Partial-fill geometry: settled liquid fills from the bottom.
+        // The air gap above the fill line must not contribute media or
+        // record a liquid interface — a ray that never descends to waterY
+        // passes through as air.
+        var liqInAir = false;
+        if (k == CLASS_LIQUID) {
+          cellWaterY = f32(cell.y) + f32(voxState(w) + 1u) / 8.0;
+          if (cellWaterY < f32(cell.y) + 1.0 - 1e-4) {
+            let entryY = ro.y + rd.y * tCur;
+            if (entryY > cellWaterY + 1e-4 && rd.y >= -1e-6) {
+              liqInAir = true;
+            }
+          }
+        }
+        if (wantMedia && !liqInAir) {
+          weight = 1.0;
           cellOp = f32(materials[mat].opacity) / 255.0;
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
           if (out.mediaMat == 0u) {
             out.mediaMat = mat;
-            out.mediaSurf = weight;
+            out.mediaSurf = select(1.0, f32(voxState(w) + 1u) / 8.0,
+                                   k == CLASS_LIQUID);
           }
-          // First liquid crossing: remember the interface so fs() can shade a
-          // real surface there. Recorded per-CLASS (not per-material) because
-          // only liquids get the Fresnel/refraction treatment — a gas has no
-          // interface to reflect off.
           if (k == CLASS_LIQUID) {
-            cellLiq = weight;
-            if (out.liqT == 0.0) {
-              out.liqT = tCur;
-              out.liqCell = cell;
-              out.liqAxis = axis;
-              out.liqSgn = sign(rd[axis]);
-            }
+            cellLiq = 1.0;
           }
           // emissive media (fire): per-cell spatio-temporal flicker so each
           // flame voxel pulses on its own phase instead of the whole plume
@@ -1704,7 +1708,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       }
     }
 
-    // DDA step; accumulate the segment the ray spent inside this cell
+    // Save pre-step state for deferred liquid-interface recording.
+    let marchCell = cell;
+    let marchAxis = axis;
     let tPrev = tCur;
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
       cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
@@ -1714,9 +1720,49 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
     }
     let segRaw = tCur - tPrev;
-    out.liqPath += segRaw * cellLiq;   // depth travelled in liquid (Beer-Lambert)
-    out.tsPath += segRaw * cellTS;     // depth travelled in ice/glass (ditto)
-    let seg = segRaw * weight;
+    // Geometric water-surface clipping for partial liquid cells.
+    // waterFrac = fraction of the segment the ray spends BELOW cellWaterY.
+    // Full cells: waterFrac stays 1.0 (no clip). The geometric model
+    // replaces the old fullness-as-density scaling: the water volume is at
+    // full density, and only the submerged portion of the segment counts.
+    var waterFrac = 1.0;
+    if (cellLiq > 0.0) {
+      let wy = cellWaterY;
+      let y0 = ro.y + rd.y * tPrev;
+      let y1 = ro.y + rd.y * tCur;
+      if (wy < f32(marchCell.y) + 1.0 - 1e-4) {
+        if (y0 >= wy && y1 >= wy) {
+          waterFrac = 0.0;
+        } else if (y0 >= wy || y1 >= wy) {
+          if (abs(rd.y) > 1e-6 && segRaw > 1e-6) {
+            let tCross = clamp((wy - ro.y) / rd.y, tPrev, tCur);
+            waterFrac = select((tCross - tPrev) / segRaw,
+                               (tCur - tCross) / segRaw,
+                               y0 >= wy);
+          }
+        }
+      }
+      // Deferred liquid-interface recording: only record liqT once the
+      // segment confirms the ray actually entered water in this cell.
+      if (out.liqT == 0.0 && waterFrac > 0.0) {
+        if (wy < f32(marchCell.y) + 1.0 - 1e-4 && y0 > wy + 1e-4) {
+          // Entered above the fractional water surface — the interface is
+          // at the Y plane where the ray descends to waterY.
+          out.liqT = clamp((wy - ro.y) / rd.y, tPrev, tCur);
+          out.liqCell = marchCell;
+          out.liqAxis = 1;
+          out.liqSgn = -1.0;
+        } else {
+          out.liqT = tPrev;
+          out.liqCell = marchCell;
+          out.liqAxis = marchAxis;
+          out.liqSgn = sign(rd[marchAxis]);
+        }
+      }
+    }
+    out.liqPath += segRaw * cellLiq * waterFrac;
+    out.tsPath += segRaw * cellTS;
+    let seg = segRaw * weight * select(1.0, waterFrac, cellLiq > 0.0);
     if (seg > 0.0 && cellOp > 0.0) {
       // fire is dimmed by the media already crossed in front of it, so flames
       // deep inside their own smoke fade out instead of x-raying the plume
