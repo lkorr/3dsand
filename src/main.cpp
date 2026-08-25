@@ -912,8 +912,30 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
 // above (refraction/absorption/bed), and mid-splash (foam, crown, droplets).
 // Exists because the water look can otherwise only be judged by hand-pouring
 // in a live session.
+// `pond` switches this to the SEAM scene (--shot-fluid-pond): the same pour,
+// but aimed into a GENERATED pond so the MPM isosurface has to live on top of
+// a deep body of SETTLED CA water. That interaction is the one --shot-fluid
+// cannot show — it pours onto dry terrain, where every water pixel is MPM and
+// the seam never has to agree with anything — and it is where the seam's
+// render defects live (flat chunk-sized colour patches, thickness that stops
+// at the fluid AABB, ownership flipping tick to tick).
 int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
-                 const std::vector<MaterialDef>& mats) {
+                 const std::vector<MaterialDef>& mats, bool pond) {
+  // Generated pond centre + radius for kDefaultSeed (pondAt's tile hash) — the
+  // same site --shot's pond block uses, for the same reason: no generated pond
+  // falls inside the origin window, so the window has to move onto it or the
+  // lake shades through the far-field cascade as a flat blue disc.
+  const int kPx = 258, kPz = -235, kR = 109;
+  if (pond) {
+    // THE FLUID AABB ONLY EXISTS IF THE SNAPSHOT DOES. FluidRenderBounds builds
+    // R.fluidLo/fluidHi from the snapshot's active block list and hands back the
+    // WHOLE WINDOW when no snapshot has landed (support.h: headless harnesses
+    // submit and pump in lockstep, so they never land one). A whole-window box
+    // clips nothing — which would hide the exact defect this scene exists to
+    // photograph. Drain it so the shot sees the box the game sees.
+    SetHarnessSnapshotDrain(true);
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+  }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
@@ -924,8 +946,13 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
   for (size_t i = 0; i < mats.size(); i++)
     if (mats[i].name == "water") { splashMats[0] = (uint32_t)i; break; }
 
-  const int cx = 108, cz = 108;
-  const int h = World::TerrainHeight(cx, cz, kDefaultSeed);
+  // Pour target. On dry terrain that is the ground under the pour; over the
+  // pond it is the RIM height, because TerrainHeight in the middle of a bowl
+  // reports the carved floor and everything derived from it (pour height,
+  // camera) would end up underground.
+  const int cx = pond ? kPx : 108, cz = pond ? kPz : 108;
+  const int h = World::TerrainHeight(pond ? kPx + kR + 22 : cx,
+                                     pond ? kPz + kR + 22 : cz, kDefaultSeed);
   uint32_t fluidCount = 0;
 
   // One tick of pour: a sphere of cells above `at`, 8 particles per cell on
@@ -1011,6 +1038,43 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
         WriteBmpFile(path, pixels, W, H))
       std::printf("wrote %s\n", path);
   };
+
+  // ---- the SEAM scene: MPM water poured into settled CA water --------------
+  // Four frames of the SAME camera, so the only thing that changes between
+  // them is how much MPM fluid is in the pond. That is what makes this a
+  // diagnostic rather than a gallery: frame 1 is the CA-only reference, and
+  // any part of frames 2-4 that does not match it outside the splash is a
+  // seam defect, not a water look.
+  if (pond) {
+    // Let the generated pond's CA water find its surface first.
+    step(60, 0, 0);
+    // Off the -x/-z shore looking back across the middle, low enough that the
+    // pour, the far shore and a long stretch of settled surface are all in
+    // frame at a grazing angle — the angle at which a thickness or Fresnel
+    // discontinuity is most visible.
+    const float ex = (float)(kPx - 46), ez = (float)(kPz - 46);
+    render({ex, (float)(h + 7), ez}, 0.785f, -0.12f,
+           "screenshot_seam_before.bmp");
+    // Straight down over the pour: the framing that shows CHUNK-shaped colour
+    // patches for what they are, because chunk boundaries are axis-aligned in
+    // this projection.
+    render({(float)kPx, (float)(h + 46), (float)(kPz + 8)}, -1.571f, -1.15f,
+           "screenshot_seam_before_top.bmp");
+    step(34, 3, 22);        // pour into the middle of the pond
+    render({ex, (float)(h + 7), ez}, 0.785f, -0.12f, "screenshot_seam_pour.bmp");
+    render({(float)kPx, (float)(h + 46), (float)(kPz + 8)}, -1.571f, -1.15f,
+           "screenshot_seam_pour_top.bmp");
+    // Stop pouring and let the excited water hand itself back to the CA. The
+    // reported "breaks until the fluid settles" state is this one.
+    step(30, 0, 0);
+    render({ex, (float)(h + 7), ez}, 0.785f, -0.12f,
+           "screenshot_seam_settle.bmp");
+    render({(float)kPx, (float)(h + 46), (float)(kPz + 8)}, -1.571f, -1.15f,
+           "screenshot_seam_settle_top.bmp");
+    std::printf("--shot-fluid-pond: %u particles, water level ~%d\n", fluidCount,
+                h - 2);
+    return ctx.ReportVkValidation("--shot-fluid-pond") > 0 ? 1 : 0;
+  }
 
   // Fill a pool (~55k particles), let it slosh down but not to glass...
   step(70, 3, 12);
@@ -1395,6 +1459,11 @@ int main(int argc, char** argv) {
   uint16_t telemetryPort = 8080;
   std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
+  // --shot-fluid-pond: the same harness aimed into a generated pond, so the
+  // MPM isosurface has to share the frame with deep SETTLED water. Separate
+  // process rather than an extra block in --shot-fluid because the scene moves
+  // the residency window and regenerates the world.
+  bool shotFluidPond = false;
   // The fluid lab (docs/PLAN_fluid_overhaul.md §4): `--lab [scene]` runs the
   // windowed game on the flat-slab lab world with the named scripted scene
   // (default basin); `--fluid-bench [scene|hill0|all]` is the headless timing
@@ -1419,6 +1488,8 @@ int main(int argc, char** argv) {
           "Shot / screenshot modes:\n"
           "  --shot                Screenshot-only look iteration\n"
           "  --shot-fluid          MPM fluid screenshot mode\n"
+          "  --shot-fluid-pond     MPM fluid poured into a generated pond\n"
+          "                        (the MPM/settled-water seam)\n"
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
           "  --time <0..1>         Time of day for --shot (0=midnight, 0.5=noon)\n\n"
           "Fluid lab:\n"
@@ -1473,6 +1544,7 @@ int main(int argc, char** argv) {
     }
     else if (a == "--shot") shot = true;
     else if (a == "--shot-fluid") shotFluid = true;
+    else if (a == "--shot-fluid-pond") shotFluidPond = true;
     // Fluid lab modes. The scene argument is optional (it must not start
     // with '-' or it is the next flag).
     else if (a == "--lab") {
@@ -1790,7 +1862,8 @@ int main(int argc, char** argv) {
 
   if (measure) return RunMeasure(ctx, world, sim, mats);
   if (shot) return RunShots(ctx, world, sim);
-  if (shotFluid) return RunFluidShot(ctx, world, sim, mats);
+  if (shotFluid || shotFluidPond)
+    return RunFluidShot(ctx, world, sim, mats, shotFluidPond);
   if (fluidBench)
     return RunFluidBench(ctx, world, sim, mats, fluidBenchScene,
                          stOpt.jsonPath);

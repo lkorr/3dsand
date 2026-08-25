@@ -798,7 +798,9 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
 - RENDER SEAM: `fluidMassAt` (the one producer under the MPM isosurface)
   takes max(particle mass, settled-liquid fullness x rest), so the
   isosurface's boundary taps meet the voxel surface without a gap; the
-  back-to-front stack still prefers a nearer CA liquid interface.
+  back-to-front stack still prefers a nearer CA liquid interface. Making the
+  two LOOK like one body is a separate problem — see "The render seam: one
+  lake, two representations" under the MPM fluid surface below.
 
 KNOWN LIMITS (Phase 2): excite converts non-viscous liquids only
 (moveEvery <= 1 — lava/blood stay CA until per-material fluid dynamics,
@@ -904,6 +906,74 @@ Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
 gains, foam amount/speed, shimmer, per-species colours. Depth is written at
 the fluid interface, so raster spray in front composites over it and debris
 behind it is covered.
+
+THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
+blend above lets the isosurface reach over SETTLED voxel water, which closes the
+geometric gap — and hands this shade a body of water the CA owns, described by
+completely unrelated coefficients (`waterAbsorb`/`waterScatter`, flat, versus
+`(1.06 - depth-ramped species albedo)/clarity` with a lit squared-albedo
+in-scatter). Measured over 2.5 m of pond that is (60,120,130) against
+(142,159,177). So exciting one chunk of a lake used to REPAINT it: a
+chunk-aligned rectangle of flat pale blue with a black rim, flickering as blocks
+were allocated and freed. Repro: `--shot-fluid-pond`, which pours into a
+generated pond and shoots a CA-only reference frame from the same camera.
+
+The rule is that the shade must CONVERGE on the CA water's, continuously, as the
+column it is looking through becomes settled water — never pick one model. Four
+quantities carry the blend, all keyed off measurements the renderer already had:
+
+- `caPath` = `RayHit.liqPath`, the settled liquid the PRIMARY ray crossed
+  (bed-bounded, free). The column is `max(fh.thick, caPath)` and its settled
+  share drives `caFrac`, which is SATURATING (`smoothstep(0.05, 0.55, ...)`) —
+  the two coefficient sets describe the same substance, so a four-voxel excited
+  film on a 26-voxel pond is a lake, not 15% fluid.
+- absorption, in-scatter and the caustic web (`waterCaustics`, factored out of
+  `shadeWater`) blend by `caFrac`; the CA branch derives non-water liquids
+  exactly as `shadeWater` does, so a pour into an oil pond blends toward oil.
+- TRACED REFRACTION FADES OUT by `caFrac`, and that is correctness, not thrift:
+  `shadeSecondaryHit` carries no shadow or AO term, so a bed seen through the
+  refracted ray came back brighter than the same bed two pixels away through the
+  CA surface. It also removes a secondary march from every lake pixel — the
+  `pond68` bench's fluid march went 1.63 -> 1.18 ms.
+- `rippleSlope` (with `shadeWater`'s own screen-space damping, factored out as
+  `waterRippleFootprint`) is added to the fluid normal for surfaces that are
+  settled water or are live particles floating STILL on a settled column. A
+  settled MPM slab has an exactly constant normal, so the whole slab sits at one
+  specular angle and glints as a single sheet where the lake around it sparkles.
+- CHURN FOAM GETS A THRESHOLD over a settled column. `churn` is linear in speed
+  from zero, so a lake circulating at 3-4 vox/s wore a constant ~0.08 of foam
+  across the whole excited footprint — a warm-white wash in a perfect rectangle,
+  and the LAST thing standing after every colour term already matched to 2/255.
+  A jet still ploughing in clears the threshold and keeps its whitewater; the
+  simulated foam FIELD is never thresholded, because it is a real decaying
+  quantity that has already earned its value.
+
+ONE LIQUID INTERFACE PER PIXEL, and `caShadedLiquid` is the single flag that
+enforces it. It replaced two independent tests that had to agree and did not:
+- `fluidCellMarched` (deleted) asked whether the CA's liquid cell is inside the
+  march's SAMPLING region, when the shade needed to know which interface is
+  NEAREST. The Y-occupancy mask only has bits where node mass lives, so under a
+  pour the CA's first liquid cell sits below the lowest marked slab, the test
+  said "not marched", and `shadeWater` and `shadeMpmFluid` both painted a water
+  surface on the same pixel. Ownership is now `mf.t <= h.liqT + 1` (one cell of
+  slack: the iso crossing and the fullness plane are two definitions of one
+  waterline).
+- THE PANE. The march's empty-space skips classify chunks from the BLOCK MAP,
+  but the field they skip through also holds settled water. A lake chunk with no
+  block is skipped as empty, so the ray enters the next marched chunk ALREADY
+  submerged, samples at or above iso, and the crossing bisection collapses onto
+  the chunk face — a vertical pane of glass standing in the pond, with Fresnel
+  and a glint on it, metres under the real surface. A ray that crossed a water
+  surface first cannot meet another interface behind it, which `caShadedLiquid`
+  already records.
+
+Two smaller repairs in the same pass: `fluidSampleAt` gained the virtual-mass
+term (settled water accumulates into species 0), without which a node carrying
+only settled mass divided by the species floor and shaded BLACK — the dark rim
+around every marched region that touched a pond; and the thickness walk is now
+bounded by the SCENE, not by `fluidLo/fluidHi`, because the settled water in the
+field extends arbitrarily far past the live particle blocks and clipping there
+made a pour into a lake absorb like a puddle.
 
 DRAW MODES — `render.fluidSurface` is a MODE, not a boolean, and it kept its
 name because 0 and 1 still mean what they always did (no `tuning.json`

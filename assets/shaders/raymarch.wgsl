@@ -2609,6 +2609,91 @@ fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
   return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
 }
 
+// PER-WAVE DISTANCE DAMPING (the analytic stand-in for normal-map mipping).
+// One pixel far across a lake covers many wavelengths, so the ripples inside it
+// should average toward flat; without damping, distant water aliases into
+// crawling speckle — full-amplitude slope at a collapsed sampling rate, exactly
+// the undersampling a mip chain exists to fix.
+//
+// The footprint estimate must be the SCREEN-SPACE one, not raw distance. Raw
+// distance is a radial function about the camera, and multiplying the ripple
+// field by it stamps that radial function onto the water: the waves visibly
+// bend into concentric rings centred on the viewer, which moves with the camera
+// and is far worse than the aliasing it fixes. Grazing angle is the other half
+// of it — a surface seen edge-on has a footprint stretched along the view
+// direction no matter how near it is.
+//
+// R.viewPx is the render height in pixels, so tanHalfFov*2/viewPx is the
+// vertical angle one pixel subtends — the same quantity a mip LOD is chosen
+// from. Hardcoding a resolution here would make the water's apparent
+// choppiness change with window size.
+//
+// FACTORED OUT of waterNormal because the MPM fluid surface needs the SAME
+// number. Where the fluid march draws SETTLED water (its virtual-mass seam,
+// fluidMassAt) that water is part of the same lake the CA shades, and if the
+// two carry differently-damped ripples the seam between them reads as a
+// rectangle of still glass laid on a moving surface.
+fn waterRippleFootprint(hitP : vec3f) -> f32 {
+  let toEye = R.camPos - hitP;
+  let distM = length(toEye) * VOXEL_METERS;
+  // |cos| between the view ray and the surface normal-ish up axis: small at
+  // grazing incidence, where the footprint blows up.
+  let graze = max(abs(normalize(toEye).y), 0.06);
+  return distM * (R.tanHalfFov * 2.0 / max(R.viewPx, 1.0)) / graze;
+}
+
+// ---- caustics ----
+// Sunlight refracting through the wave surface focuses into the bright shifting
+// web everyone recognises on a lake bed, and its absence is a strong "this is
+// fake" cue even when the absorption is right.
+//
+// Proper caustics need photon transport; the standard real-time cheat is that
+// the caustic intensity tracks the CONVERGENCE of the refracted rays, and for a
+// small-slope surface that convergence is the curvature of the wave height
+// field. Sampling the ripple slope at two nearby points and taking the
+// difference gives that curvature for a couple of extra ALU ops and no new data.
+//
+// Projected along the SUN direction, not straight down, so the pattern shifts
+// across the bed with the sun's angle instead of being pinned under the waves
+// that cast it.
+//
+// Returns a MULTIPLIER for the bed colour, not an addition. Caustics are a
+// redistribution of the sunlight already landing on the bed, so they scale what
+// is there: bright sand goes brighter, dark stone stays dark. Adding a constant
+// instead lights up the water itself, which reads as glowing blobs floating in
+// the volume rather than light playing over a surface.
+//
+// Shared by shadeWater and the MPM fluid's seam path so a lake whose surface is
+// half CA and half marched isosurface throws ONE caustic web across its bed.
+fn waterCaustics(hitP : vec3f, rd : vec3f, pathVox : f32, depthM : f32) -> f32 {
+  // where on the surface the sunlight entering this bed point came from
+  let bedP = hitP + rd * pathVox;
+  let kdc = keyLightDir();
+  let drift = kdc.xz / max(kdc.y, 0.25) * (depthM / VOXEL_METERS);
+  let cp = (vec2f(bedP.x, bedP.z) - drift) * VOXEL_METERS;
+  // Difference over a WIDE baseline and damp out the short bands. Caustic webs
+  // come from the long swell — a crest metres across is what has the focal
+  // length to reach the bed. Differencing at the scale of the 22 cm chop
+  // instead samples curvature that focuses far below any real bed and renders
+  // as a fine dotted grid of per-pixel noise, not a caustic. Passing a
+  // footprint of 0.5 m mutes every band under ~0.6 m, leaving the 2.6 m and
+  // 1.7 m swell to drive the pattern.
+  let e = 0.22;    // metres — finite-difference baseline for curvature
+  let cf = 0.5;    // metres — band damping footprint
+  let s0 = rippleSlope(cp, R.time, cf);
+  let sx = rippleSlope(cp + vec2f(e, 0.0), R.time, cf);
+  let sz = rippleSlope(cp + vec2f(0.0, e), R.time, cf);
+  // divergence of the slope field = Laplacian of the height field. Negative
+  // curvature (a wave crest acting as a converging lens) is the bright case.
+  let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
+  // Focusing strength grows with depth (longer lever arm from surface to bed)
+  // then saturates — deep water's caustics wash out as the light scatters, and
+  // unbounded growth would blow the bed out to white.
+  let focus = clamp(depthM * 1.5, 0.0, 1.4);
+  let caustic = max(-curv, 0.0) * focus;
+  return 1.0 + min(caustic * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
+}
+
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
   // Side/bottom faces of a liquid volume keep their flat voxel normal: the
@@ -2630,35 +2715,11 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 
   // Ripples on top of the macro slope, in world metres.
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
-  // PER-WAVE DISTANCE DAMPING (the analytic stand-in for normal-map mipping).
-  // One pixel far across a lake covers many wavelengths, so the ripples inside
-  // it should average toward flat; without damping, distant water aliases into
-  // crawling speckle — full-amplitude slope at a collapsed sampling rate,
-  // exactly the undersampling a mip chain exists to fix.
-  //
-  // The footprint estimate must be the SCREEN-SPACE one, not raw distance.
-  // Raw distance is a radial function about the camera, and multiplying the
-  // ripple field by it stamps that radial function onto the water: the waves
-  // visibly bend into concentric rings centred on the viewer, which moves with
-  // the camera and is far worse than the aliasing it fixes. Grazing angle is
-  // the other half of it — a surface seen edge-on has a footprint stretched
-  // along the view direction no matter how near it is.
-  let toEye = R.camPos - hitP;
-  let distM = length(toEye) * VOXEL_METERS;
-  // |cos| between the view ray and the surface normal-ish up axis: small at
-  // grazing incidence, where the footprint blows up.
-  let graze = max(abs(normalize(toEye).y), 0.06);
-  // Footprint width in metres ~ distance * pixel angular size / graze.
-  // R.viewPx is the render height in pixels, so tanHalfFov*2/viewPx is the
-  // vertical angle one pixel subtends — the same quantity a mip LOD is chosen
-  // from. Hardcoding a resolution here would make the water's apparent
-  // choppiness change with window size.
-  let footM = distM * (R.tanHalfFov * 2.0 / max(R.viewPx, 1.0)) / graze;
   // Damping is applied PER WAVE against its own wavelength inside
   // rippleSlope() — a 2.6 m swell stays visible long after 0.4 m chop has
   // averaged out, which is what gives distance a sense of scale. `gain` here
-  // is just the footprint handed down.
-  let gain = footM;
+  // is just the footprint handed down (see waterRippleFootprint).
+  let gain = waterRippleFootprint(hitP);
   // Ripple slope is metres-of-height per metre — same units as `slope` above
   // (voxels per voxel), so they add directly.
   //
@@ -3485,37 +3546,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // the waves that cast it.
   var lit = sceneBehind;
   if (!underwater && depthM > 0.02) {
-    // where on the surface the sunlight entering this bed point came from
-    let bedP = hitP + rd * (pathVox);
-    let kdc = keyLightDir();
-    let drift = kdc.xz / max(kdc.y, 0.25) * (depthM / VOXEL_METERS);
-    let cp = (vec2f(bedP.x, bedP.z) - drift) * VOXEL_METERS;
-    // Difference over a WIDE baseline and damp out the short bands. Caustic
-    // webs come from the long swell — a crest metres across is what has the
-    // focal length to reach the bed. Differencing at the scale of the 22 cm
-    // chop instead samples curvature that focuses far below any real bed and
-    // renders as a fine dotted grid of per-pixel noise, not a caustic.
-    // Passing a footprint of 0.5 m mutes every band under ~0.6 m, leaving the
-    // 2.6 m and 1.7 m swell to drive the pattern.
-    let e = 0.22;    // metres — finite-difference baseline for curvature
-    let cf = 0.5;    // metres — band damping footprint
-    let s0 = rippleSlope(cp, R.time, cf);
-    let sx = rippleSlope(cp + vec2f(e, 0.0), R.time, cf);
-    let sz = rippleSlope(cp + vec2f(0.0, e), R.time, cf);
-    // divergence of the slope field = Laplacian of the height field. Negative
-    // curvature (a wave crest acting as a converging lens) is the bright case.
-    let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
-    // Focusing strength grows with depth (longer lever arm from surface to
-    // bed) then saturates — deep water's caustics wash out as the light
-    // scatters, and unbounded growth would blow the bed out to white.
-    let focus = clamp(depthM * 1.5, 0.0, 1.4);
-    let caustic = max(-curv, 0.0) * focus;
-    // MULTIPLICATIVE on the bed, not additive. Caustics are a redistribution
-    // of the sunlight already landing on the bed, so they scale what is there:
-    // bright sand goes brighter, dark stone stays dark. Adding a constant
-    // instead lights up the water itself, which reads as glowing blobs
-    // floating in the volume rather than light playing over a surface.
-    lit *= 1.0 + min(caustic * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
+    lit *= waterCaustics(hitP, rd, pathVox, depthM);
   }
 
   // What comes back up: the bed (plus its caustics), filtered by the water
@@ -4648,6 +4679,13 @@ struct FluidSample {
   vel  : vec3f,
   col  : vec3f,
   foam : f32,
+  // Share of the sampled density that is SETTLED voxel water rather than live
+  // MPM particles: 0 = all particles, 1 = the march is drawing a surface over
+  // water the CA owns. See the SEAM SHADING block below — this is the weight
+  // that decides how much of the shade comes from the fluid's own look and how
+  // much from the CA water's, and it is the only thing that stops the marched
+  // region reading as a chunk-shaped patch of a different liquid.
+  settled : f32,
 };
 
 fn fluidSampleAt(p : vec3f) -> FluidSample {
@@ -4655,7 +4693,8 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
   let b = floor(g);
   let f = g - b;
   let c0 = vec3<i32>(b);
-  var mass = 0.0;
+  var mass = 0.0;      // live MPM particle mass
+  var vmass = 0.0;     // virtual mass contributed by settled voxel water
   var vel = vec3f(0.0);
   var sp = vec4f(0.0);
   var foam = 0.0;
@@ -4663,31 +4702,62 @@ fn fluidSampleAt(p : vec3f) -> FluidSample {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
     let wv = mix(1.0 - f, f, vec3f(o));
     let w = wv.x * wv.y * wv.z;
-    let nb = fluidNodeBase(c0 + o);
-    if (nb < 0) { continue; }
-    let m = f32(fluidGridR[u32(nb)]) * (1.0 / 1024.0);
-    if (m <= 0.0) { continue; }
-    mass += w * m;
-    // Word 7 = the foam field, Q16 saturated at 1.0. Trilinear like the rest,
-    // so the foam has a continuous gradient and does not show the node lattice.
-    foam += w * clamp(f32(fluidGridR[u32(nb) + 7u]) * (1.0 / 65536.0), 0.0, 1.0);
-    // words 1..3 hold node VELOCITY after the last grid update, Q16.16
-    // cells/tick; weight by mass so near-empty nodes cannot swing the average.
-    vel += vec3f(f32(fluidGridR[u32(nb) + 1u]),
-                 f32(fluidGridR[u32(nb) + 2u]),
-                 f32(fluidGridR[u32(nb) + 3u])) * (w * m * (1.0 / 65536.0));
-    let m1 = max(f32(fluidGridR[u32(nb) + 4u]) * (1.0 / 1024.0), 0.0);
-    let m2 = max(f32(fluidGridR[u32(nb) + 5u]) * (1.0 / 1024.0), 0.0);
-    let m3 = max(f32(fluidGridR[u32(nb) + 6u]) * (1.0 / 1024.0), 0.0);
-    sp += vec4f(max(m - m1 - m2 - m3, 0.0), m1, m2, m3) * w;
+    let c = c0 + o;
+    let nb = fluidNodeBase(c);
+    var m = 0.0;
+    if (nb >= 0) {
+      m = f32(fluidGridR[u32(nb)]) * (1.0 / 1024.0);
+    }
+    if (m > 0.0) {
+      mass += w * m;
+      // Word 7 = the foam field, Q16 saturated at 1.0. Trilinear like the rest,
+      // so the foam has a continuous gradient and does not show the node
+      // lattice.
+      foam += w * clamp(f32(fluidGridR[u32(nb) + 7u]) * (1.0 / 65536.0),
+                        0.0, 1.0);
+      // words 1..3 hold node VELOCITY after the last grid update, Q16.16
+      // cells/tick; weight by mass so near-empty nodes cannot swing the average.
+      vel += vec3f(f32(fluidGridR[u32(nb) + 1u]),
+                   f32(fluidGridR[u32(nb) + 2u]),
+                   f32(fluidGridR[u32(nb) + 3u])) * (w * m * (1.0 / 65536.0));
+      let m1 = max(f32(fluidGridR[u32(nb) + 4u]) * (1.0 / 1024.0), 0.0);
+      let m2 = max(f32(fluidGridR[u32(nb) + 5u]) * (1.0 / 1024.0), 0.0);
+      let m3 = max(f32(fluidGridR[u32(nb) + 6u]) * (1.0 / 1024.0), 0.0);
+      sp += vec4f(max(m - m1 - m2 - m3, 0.0), m1, m2, m3) * w;
+    }
+    // THE SEAM'S OTHER HALF. fluidMassAt already lets settled liquid voxels
+    // contribute virtual mass to the FIELD, so the isosurface reaches over
+    // them and the two surfaces meet instead of leaving a gap — but nothing
+    // used to give that mass a COLOUR. A node with virtual mass and no
+    // particles fell through the `continue` above, left `sp` at zero, and the
+    // species blend divided by its 1e-4 floor: the shade came back BLACK.
+    // That is the dark rim around every marched region that touches a pond.
+    //
+    // Settled water is species 0 — it is the same substance TUNE_FLUID_COLOR
+    // names — so it accumulates into sp.x. max(), not +, exactly as
+    // fluidMassAt: a cell mid-conversion briefly holds both representations of
+    // the SAME water and adding them would double its density.
+    let vw = voxWordAt(c);
+    let vmat = voxMat(vw);
+    if (vmat != MAT_AIR && materials[vmat].klass == CLASS_LIQUID) {
+      let full = f32(voxState(vw) + 1u) * (1.0 / 8.0) *
+                 max(TUNE_FLUID_REST_DENSITY, 1.0);
+      let extra = max(full - m, 0.0);
+      vmass += w * extra;
+      sp.x += w * extra;
+    }
   }
   var out : FluidSample;
+  // Velocity and foam are weighted by PARTICLE mass alone — settled water is
+  // by definition not moving and not aerated, so a surface drawn mostly over
+  // it gets no churn foam and no wobble, which is what it should look like.
   out.vel = vec3f(0.0);
   if (mass > 1e-4) { out.vel = vel * (30.0 / mass); }   // cells/tick -> vox/s
   let tot = max(sp.x + sp.y + sp.z + sp.w, 1e-4);
   out.col = (TUNE_FLUID_COLOR * sp.x + TUNE_FLUID_COLOR1 * sp.y +
              TUNE_FLUID_COLOR2 * sp.z + TUNE_FLUID_COLOR3 * sp.w) / tot;
   out.foam = clamp(foam, 0.0, 1.0);
+  out.settled = vmass / max(mass + vmass, 1e-4);
   return out;
 }
 
@@ -4798,19 +4868,13 @@ fn fluidSeamShell(c : vec3<i32>) -> bool {
   return false;
 }
 
-// The region the march actually samples: c's own chunk owns a block, or c is
-// in the seam shell. The `mpmOwned` test in fs() must use THIS and not the
-// chunk class, or a settled cell the march never visits would have its
-// shadeWater suppressed and render as nothing.
-fn fluidCellMarched(c : vec3<i32>) -> bool {
-  let wc = worldChunkOf(c);
-  if (!chunkInWindow(wc, R.origin)) { return false; }
-  if (fluidChunkWater(wc) &&
-      (fluidYMaskOf(wc) & (1u << u32(c.y & i32(CHUNK_MASK)))) != 0u) {
-    return true;
-  }
-  return fluidSeamShell(c);
-}
+// NOTE: `fluidCellMarched` lived here — "is cell c inside the region the march
+// actually samples", used by fs() to decide whether the MPM surface owned a CA
+// liquid cell. It is GONE, deliberately: it answered a question about the
+// MARCH's sampling region when the shade needed one about the PIXEL's nearest
+// interface, and the two disagree wherever the Y-occupancy mask stops above the
+// CA waterline — which is every pour into a pond. See the `mpmOwned` /
+// `caShadedLiquid` block in fs(). `mf.hit` is already the per-pixel answer.
 
 // t at which the ray leaves the CHUNK containing cell c — the chunk-stride
 // skip for empty space. `inv` is the caller's precomputed 1/rd.
@@ -4851,6 +4915,15 @@ struct FluidHit {
 // gradient and the refraction gate all key off this number, so sharing it is
 // what makes an A/B between draw modes a comparison of surface SHAPE rather
 // than of colour.
+//
+// `tEnd` IS THE SCENE BOUND, NOT THE FLUID AABB. The AABB (R.fluidLo/fluidHi)
+// is built from the live particle blocks, but the field this walk samples also
+// contains SETTLED voxel water (fluidMassAt's virtual mass), which extends
+// arbitrarily far past those blocks. Clipping the walk to the AABB made a pour
+// into a lake absorb like a puddle: the column stopped two chunks down and the
+// surface rendered pale and see-through against a pond that was correctly deep.
+// Cost is unchanged — the walk was already bounded by 14 samples and the
+// 40-cell absorption horizon, not by the box.
 fn fluidThickness(ro : vec3f, rd : vec3f, tHit : f32, tEnd : f32,
                   iso : f32) -> f32 {
   var tt = tHit + 0.5;
@@ -4993,7 +5066,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     out.t = hi;
   }
 
-  out.thick = fluidThickness(ro, rd, out.t, tEnd, iso);
+  out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
   return out;
 }
 
@@ -5255,7 +5328,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
     out.t = hit.w;
   }
 
-  out.thick = fluidThickness(ro, rd, out.t, tEnd, iso);
+  out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
   return out;
 }
 
@@ -5263,22 +5336,67 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 // the surface and the bed swim when the water sloshes — the one effect a
 // background-copy approximation can never give. Misses fall back to the
 // straight-ray scene (thin films) or the sky (rays bent upward).
-fn traceRefraction(p : vec3f, rdr : vec3f, fallback : vec3f) -> vec3f {
+//
+// `waterVox` is how much of this ray's path is inside the liquid — the column
+// length the caller measured. AERIAL PERSPECTIVE IS AIR, and the submerged
+// stretch of a refracted ray is not air: it is water, whose attenuation the
+// caller applies afterwards as Beer-Lambert. Fogging it as well is the exact
+// double-count the primary path's `if (h.liqT <= 0.0)` guard exists to avoid —
+// and it is what washed a deep pond's bed out to sky grey the moment an MPM
+// surface was drawn over it, while the CA-shaded half of the same pond stayed
+// saturated. Only the part of the path BEYOND the column gets fogged, so a thin
+// film on dry rock (column ~1 voxel, bed metres away) is unchanged.
+fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
+                   fallback : vec3f) -> vec3f {
   let h = trace(p, rdr, TUNE_REFLECTION_STEPS, false);
   if (!h.hit) {
     if (rdr.y > 0.05) { return reflectionSky(rdr); }
     return fallback;
   }
-  return applyAerial(shadeSecondaryHit(h), rdr, h.t);
+  return applyAerial(shadeSecondaryHit(h), rdr, max(h.t - waterVox, 0.0));
 }
 
-// The full water shade. sceneBehind is what the primary march resolved along
-// the straight ray (bed / terrain / sky, already lit); shadeWater's role model,
-// rebuilt for a field surface: field-gradient normals instead of column
-// heights, velocity-driven foam instead of authored ripples, and species
-// colours instead of a material palette.
-fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
-                 sceneBehind : vec3f) -> vec3f {
+// ============================================================================
+// SEAM SHADING — why this function takes the CA water's material and path
+// ============================================================================
+// The march that feeds this shade does not stop at the live particles. Via
+// fluidMassAt's virtual mass it also draws a surface over SETTLED voxel water,
+// which is what closes the gap between a pour and the pond it lands in. The
+// consequence nobody accounted for is that this function is then shading water
+// the CA owns, with a completely unrelated model:
+//
+//     CA water  : absorb = TUNE_WATER_ABSORB  (1.85, 0.42, 0.20) per metre
+//                 in-scatter = TUNE_WATER_SCATTER (0.045, 0.16, 0.20), flat
+//     MPM fluid : absorb = (1.06 - depth-ramped species albedo) / clarity
+//                 in-scatter = that albedo, squared and lit
+//
+// At 2.6 m of pond those two disagree by roughly (60,120,130) against
+// (142,159,177) — measured, not estimated. So the instant a pour excites one
+// chunk of a lake, the marched region of that lake changed representation and
+// therefore CHANGED COLOUR, in a hard chunk-aligned rectangle that flickered as
+// blocks were allocated and freed. That is the whole reported bug.
+//
+// THE FIX IS NOT TO PICK ONE MODEL. It is to notice that the two coefficients
+// describe the same column, so the column's absorption is the PATH-WEIGHTED
+// MIX of them:
+//
+//   * `caPath` is how much settled CA liquid the primary ray actually crossed
+//     behind this surface (RayHit.liqPath — already measured, bed-bounded, and
+//     free);
+//   * the column behind the surface is at least that long, so its length is
+//     max(fh.thick, caPath) and the settled SHARE of it is caPath/that;
+//   * blend absorption, in-scatter, caustics and ripples by that share.
+//
+// At share 1 (a surface drawn over a lake) this reproduces shadeWater's body
+// term exactly, so the ownership boundary is invisible. At share 0 (a pour in
+// mid-air, or a sheet on dry rock) every term collapses to the authored MPM
+// look, unchanged — which is what keeps --shot-fluid the picture it was.
+//
+// `caMat` is MAT_AIR when the ray crossed no CA liquid, and non-water liquids
+// derive their coefficients here the same way shadeWater derives them, so an
+// MPM pour into an oil pond blends toward OIL rather than toward water.
+fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
+                 caPath : f32, sceneBehind : vec3f) -> vec3f {
   let hitP = ro + rd * fh.t;
   // Colour/velocity sampled half a cell INTO the body so a grazing entry does
   // not read the empty half of the boundary cells.
@@ -5286,25 +5404,60 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
   let speed = length(s.vel);                        // vox/s
   let churn = clamp(speed / max(TUNE_FLUID_FOAM_SPEED, 1.0), 0.0, 1.0);
 
+  // ---- the column, and how much of it the CA owns ----
+  // The march's own thickness walk stops at the absorption horizon; the CA's
+  // path stops at the bed. Whichever is longer is the honest column length,
+  // and taking the max also repairs the case where the fluid march found only
+  // a thin excited film floating on water metres deep.
+  let caLen = select(0.0, max(caPath, 0.0), caMat != MAT_AIR);
+  let colVox = max(fh.thick, caLen);
+  // SATURATING, not linear. The two coefficient sets describe the SAME
+  // substance, so their disagreement is a modelling artefact, not a property of
+  // the water — and a linear share lets a four-voxel excited film on a 26-voxel
+  // pond keep a fifth of the MPM in-scatter, which is enough to read as a
+  // brighter rectangle laid over the lake (measured: the settled region came
+  // back ~1.4x the surrounding pond). Once most of the column is settled the
+  // answer is simply "this is a lake, shade it like one". The low end is left
+  // alone so a thick MPM body standing in a shallow puddle still shades as MPM
+  // fluid, and caLen == 0 is still exactly the authored look.
+  let caFrac = smoothstep(0.05, 0.55, caLen / max(colVox, 0.5));
+
   // ---- absorption + body (shared by the submerged and surface paths) ----
   // Beer-Lambert per channel, coefficients derived from the species albedo:
   // what the fluid does NOT reflect it absorbs, at a rate set by the clarity
   // knob (metres to roughly 1/e). The body term is the light the water itself
   // scatters back — it replaces the absorbed fraction so deep water goes to
   // the fluid's colour, never to black.
-  let thickM = fh.thick * VOXEL_METERS;
+  let thickM = colVox * VOXEL_METERS;
   let clar = max(TUNE_FLUID_CLARITY, 0.05);
   // The depth-ramped colour, not the raw species albedo, is what drives the
   // absorption — see the DEPTH GRADIENT block. This is the whole gradient:
   // a thin film absorbs like the shallow tint, a deep body like the deep one.
   let gcol = fluidGradientColor(s.col, thickM);
-  let absorb = (vec3f(1.06) - gcol) * (1.0 / clar);
-  let trans = exp(-absorb * thickM);
+  var absorb = (vec3f(1.06) - gcol) * (1.0 / clar);
   // Squaring the albedo into the scatter tint is what keeps deep water
   // SATURATED: single-scatter with a flat albedo washes toward the light's
   // own (near-white) colour, and the pool read as grey milk.
-  let body = gcol * mix(gcol, vec3f(1.0), 0.25) *
+  var body = gcol * mix(gcol, vec3f(1.0), 0.25) *
              (ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.85 + keyLightColor() * 0.35);
+  if (caFrac > 0.001) {
+    // The CA water's own coefficients, derived exactly as shadeWater derives
+    // them — including its non-water branch, so an oil or acid pool keeps its
+    // substance instead of being repainted as water by whatever fell in it.
+    let cm = materials[caMat];
+    let isWater = (cm.tagMask != 0u) && (f32(cm.opacity) / 255.0 < 0.45);
+    var caAbsorb = WATER_ABSORB;
+    var caScatter = WATER_SCATTER;
+    if (!isWater) {
+      let base = (unpackColor(cm.color0) + unpackColor(cm.color1)) * 0.5;
+      let k = (f32(cm.opacity) / 255.0) * 9.0;
+      caAbsorb = (vec3f(1.0) - base) * k + vec3f(0.05);
+      caScatter = base * 0.22;
+    }
+    absorb = mix(absorb, caAbsorb, caFrac);
+    body = mix(body, caScatter, caFrac);
+  }
+  let trans = exp(-absorb * thickM);
 
   if (fh.inside) {
     // Submerged: volumetric only — no interface, no Fresnel split. The
@@ -5336,6 +5489,42 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
         (wob * 0.12));
   }
 
+  // ---- a still surface on a lake still belongs to the lake ----
+  // The shape half of the seam the colour blend above fixes. Two ways in:
+  //
+  //   * s.settled — the surface here IS settled voxel water the march drew over
+  //     (the seam ring). Obviously the lake's.
+  //   * caFrac * calm — the surface is live MPM particles, but they are FLOATING
+  //     ON a settled column and they have stopped moving. That is a raft of
+  //     lake water that happens to be represented as particles this tick, and
+  //     the same wind is blowing over it.
+  //
+  // Why it matters more than it sounds: a settled MPM slab has an EXACTLY
+  // constant normal — (0,1,0) on every top face in the voxelized modes, and
+  // near enough in the smooth one — so the whole slab sits at one specular
+  // angle and the sun glint comes back as a single uniform sheet instead of the
+  // sparkle the rippled CA lake around it breaks into. That reads as a
+  // chunk-shaped patch of brighter water even when every colour term already
+  // agrees; it was worth ~25/255 across the excited footprint.
+  //
+  // `calm` is what keeps this off the authored MPM look: a pour, a splash or
+  // any sheet with real speed in it takes its shape from the solver, and wind
+  // chop has no business on it. On dry ground caFrac is 0, so --shot-fluid is
+  // untouched either way.
+  //
+  // Same rippleSlope and same screen-space damping as waterNormal
+  // (waterRippleFootprint), so the two surfaces carry ONE wave field across the
+  // boundary rather than two that merely resemble each other. Up-facing only,
+  // exactly as waterNormal restricts it: the wave field describes a top
+  // surface, and tilting a wall with it pushes the normal into the terrain.
+  let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
+  let rippleW = clamp(max(s.settled, caFrac * calm), 0.0, 1.0);
+  if (rippleW > 0.01 && n.y > 0.25) {
+    let slope = rippleSlope(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time,
+                            waterRippleFootprint(hitP)) * rippleW;
+    n = normalize(n + vec3f(-slope.x, 0.0, -slope.y));
+  }
+
   let v = -rd;
   let cosI = clamp(dot(n, v), 0.0, 1.0);
 
@@ -5343,21 +5532,46 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
   let ior = max(TUNE_FLUID_IOR, 1.01);
   let f0 = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0));
   var fres = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
-  // A film thinner than a couple of cells is not a coherent mirror.
-  fres *= clamp(fh.thick * 0.65, 0.3, 1.0);
+  // A film thinner than a couple of cells is not a coherent mirror. Measured on
+  // the COLUMN, not on the march's own thickness: a one-cell excited film on a
+  // deep lake is the surface of that lake and reflects like one.
+  fres *= clamp(colVox * 0.65, 0.3, 1.0);
 
   // ---- refraction ----
+  // Faded out over a settled column, and this is a CORRECTNESS fix, not a
+  // saving. shadeWater does not trace a refracted ray at all — its bed is
+  // whatever the PRIMARY march resolved, with that march's shadows and ambient
+  // occlusion on it. traceRefraction's bed comes from shadeSecondaryHit, which
+  // has neither, so a pond bottom sampled through the MPM surface came back
+  // brighter than the identical bottom sampled two pixels away through the CA
+  // surface, and the boundary between them was a visible step with no colour
+  // shift to explain it. Over a lake the two must agree, so over a lake this
+  // takes the CA's answer. Free bonus: no secondary march on lake pixels.
+  //
+  // A pour on dry rock keeps the full traced refraction (caFrac == 0) — the
+  // bent shore and the swimming bed are the whole point of it there.
   let refr = refract(rd, n, 1.0 / ior);
   var behind = sceneBehind;
-  if (fh.thick > 0.75 && length(refr) > 0.5) {
-    behind = traceRefraction(hitP + refr * 0.75, refr, sceneBehind);
+  let refrW = 1.0 - caFrac;
+  if (colVox > 0.75 && refrW > 0.02 && length(refr) > 0.5) {
+    behind = mix(sceneBehind,
+                 traceRefraction(hitP + refr * 0.75, refr, colVox, sceneBehind),
+                 refrW);
+  }
+  // The bed under a settled column gets the CA's caustic web, faded in by the
+  // same settled share the absorption uses. Without it the marched patch of a
+  // lake is the one rectangle of bed with no light playing on it — as loud a
+  // seam as the colour was, and free to fix because both surfaces now agree
+  // about the wave field that casts it (waterCaustics / rippleSlope).
+  if (caFrac > 0.001 && thickM > 0.02) {
+    behind *= mix(1.0, waterCaustics(hitP, rd, colVox, thickM), caFrac);
   }
   var refracted = behind * trans + body * (1.0 - trans);
 
   // ---- reflection ----
   var reflection : vec3f;
   if (TUNE_FLUID_REFLECT > 0.01 && n.y > 0.25 &&
-      fres > TUNE_REFLECTION_CUTOFF && fh.thick > 1.0) {
+      fres > TUNE_REFLECTION_CUTOFF && colVox > 1.0) {
     // A real traced bounce — the shore, the tower, the debris beside the pool.
     reflection = traceReflection(hitP, n, rd);
   } else {
@@ -5391,8 +5605,25 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit,
   // They are combined by max(), not added: both are already "how white is
   // this", and summing them double-counts a breaking crest (which scores high
   // on both) into flat white paint.
+  // ...and CHURN NEEDS A THRESHOLD ONCE IT IS FLOATING ON A LAKE. `churn` is
+  // linear in speed from zero, so any drift at all whitens the surface a
+  // little. On a free sheet that is the intent — it is the zero-latency
+  // stand-in "for thin fast sheets that never live long enough to build a
+  // field", per the note above. A raft of excited water sitting on a pond is
+  // the opposite case: it has had every tick it needs to build a field, and its
+  // field says there is no foam here. Left linear, a lake circulating at three
+  // or four voxels a second came back with a constant ~0.08 of foam across the
+  // whole excited footprint — a uniform warm-white wash in a perfect
+  // chunk-shaped rectangle, and the last of the reported "plain blue chunk"
+  // after every colour term already matched to within 2/255 (measured).
+  //
+  // So over a settled column the churn term has to earn it: nothing below about
+  // a third of the foam speed, full by four fifths. A jet still ploughing into
+  // the pond clears that easily and keeps its whitewater. caFrac == 0 (a pour
+  // on dry rock) is the authored curve, untouched.
   let fieldFoam = s.foam * max(TUNE_FLUID_FOAM_FIELD, 0.0);
-  var foam = TUNE_FLUID_FOAM * max(churn, fieldFoam);
+  let churnFoam = mix(churn, smoothstep(0.35, 0.80, churn), caFrac);
+  var foam = TUNE_FLUID_FOAM * max(churnFoam, fieldFoam);
   if (foam > 0.003) {
     // Animated fbm break-up so it reads as bubbles and streaks being dragged
     // along rather than as white paint. Scaled by the texture knob: at 0 the
@@ -5853,40 +6084,65 @@ fn fs(in : VSOut) -> FSOut {
   // surface, so shadeWater must NOT run for it — the two shading models have
   // incompatible normals and the per-pixel fight is the strobing-squares
   // artifact.  The MPM path (below) handles the shade instead.
+  //
+  // Did a CA liquid path already put an interface on this pixel?  ONE liquid
+  // interface per pixel is the invariant, and the MPM block below reads this
+  // rather than re-deriving the answer from its own test — two independent
+  // tests for one fact is what let a whole excited footprint get shaded twice.
+  var caShadedLiquid = false;
   if (h.liqT > 0.0) {
     let lm = voxMat(voxWordAt(h.liqCell));
     if (lm != MAT_AIR && materials[lm].klass == CLASS_LIQUID) {
       let hitP = R.camPos + rd * h.liqT;
       let underwater = h.liqT < 0.05;
 
-      // Does the MPM field already own this liquid cell?  True when the fluid
-      // march found a surface, the liquid is seam-eligible, AND an MPM block
-      // allocation exists at or adjacent to this cell's chunk (real particles
-      // have been there).  The block-map test is what stops a pure CA lake far
-      // from any MPM activity from being claimed — fluidFieldAt would read 1.0
-      // on any full water cell (via virtual mass), which would incorrectly
-      // suppress shadeWater's caustics and ripple normals.
-      // fluidCellMarched, not the chunk class: the march only samples a ring
-      // chunk's 2-cell seam shell, so claiming the whole ring would suppress
-      // shadeWater on cells no MPM surface was ever drawn for.
+      // Does the MPM surface own this pixel?  EXACTLY ONE of the two water
+      // paths may shade a pixel, and the rule is NEAREST WINS — the same rule
+      // the depth write uses a hundred lines up.
+      //
+      // This used to ask `fluidCellMarched(h.liqCell)`: is the CA's liquid cell
+      // inside the region the fluid march samples?  That is a different
+      // question, and getting a different answer is a DOUBLE SHADE. The march's
+      // per-chunk Y-occupancy mask only has bits where node mass lives, so
+      // where a pour has excited the top of a pond the CA's first liquid cell
+      // sits a few voxels BELOW the lowest marked slab: the test says "not
+      // marched", shadeWater runs and paints a full water surface, and then the
+      // MPM path runs on top of that and paints a second one over it. The pond
+      // came back uniformly ~25/255 brighter inside the excited footprint than
+      // the identical bed outside it (measured against the CA-only control
+      // frame) — a chunk-shaped bright patch with no black rim and no colour
+      // shift to explain it, which is why it survived the colour fix.
+      //
+      // mf.hit is already per-pixel and already false for a lake nowhere near
+      // MPM activity (the march never samples an unmarked chunk), so the cell
+      // test bought nothing that `mf.hit` did not already say — it only
+      // disagreed with it. What remains is the depth comparison, with one cell
+      // of slack because the isosurface's iso crossing and the CA's fullness
+      // plane are two definitions of the same waterline and land about that far
+      // apart. `caShadedLiquid` below carries the answer to the MPM path, so
+      // the two cannot drift back out of agreement the way two independent
+      // tests did.
       let mpmOwned = mf.hit
                      && materials[lm].moveEvery <= 1u
-                     && fluidCellMarched(h.liqCell);
+                     && (mf.inside || mf.t <= h.liqT + 1.0);
 
       if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit;
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
+        caShadedLiquid = true;
       } else if (isViscousLiquid(materials[lm])) {
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              underwater);
         color = applyAerial(color, rd, h.liqT);
+        caShadedLiquid = true;
       } else if (!mpmOwned) {
         color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
+        caShadedLiquid = true;
       }
       // mpmOwned && !viscous && !underwater: the MPM path below will shade it.
     }
@@ -5922,11 +6178,44 @@ fn fs(in : VSOut) -> FSOut {
   // isosurface, so this path now runs unconditionally when the march hit —
   // except for viscous liquids (blood, oil) genuinely nearer than the MPM
   // surface, which the CA block still shaded.
-  if (mf.hit) {
+  // ---- THE PANE GUARD --------------------------------------------------------
+  // `caShadedLiquid` is the whole gate. It is true exactly when a CA liquid path
+  // already drew this pixel's interface, and that covers two distinct failures
+  // at once:
+  //
+  //  1. DOUBLE SHADE. Two water surfaces painted over each other on the same
+  //     pixel — see the mpmOwned block above.
+  //  2. THE PANE. The fluid march's empty-space skips classify a chunk as
+  //     "nothing here" from the BLOCK MAP, but the field they skip through also
+  //     contains settled voxel water (fluidMassAt's virtual mass). A chunk full
+  //     of lake with no MPM block is skipped as empty, so when the ray enters a
+  //     marched chunk it is ALREADY submerged: it takes one sample at or above
+  //     iso and the crossing bisection collapses onto the chunk face it just
+  //     came through. The march reports an interface on a CHUNK BOUNDARY PLANE
+  //     and this shade draws it — a vertical pane of glass standing in the pond,
+  //     Fresnel and specular glint and all, tens of voxels under the real
+  //     surface. It cannot be a real interface: the ray was inside water before
+  //     it got there, which is precisely what caShadedLiquid records.
+  if (mf.hit && !caShadedLiquid) {
+    let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(h.liqCell)), h.liqT > 0.0);
     let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
                         && isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))]);
     if (!viscousNearer) {
-      color = shadeMpmFluid(R.camPos, rd, mf, color);
+      // The SETTLED water this surface is standing on (see the SEAM SHADING
+      // block above shadeMpmFluid). Only a non-viscous CA liquid the primary
+      // ray actually crossed counts: h.liqPath is the length it measured, and
+      // it is what turns a pour into a lake from a pale blue chunk into the
+      // lake's own colour. A viscous liquid nearer the eye already took the
+      // pixel above, and one FURTHER than the fluid surface is behind it, so
+      // its column does belong to this shade.
+      var caMat = MAT_AIR;
+      var caPath = 0.0;
+      if (caMatRaw != MAT_AIR && materials[caMatRaw].klass == CLASS_LIQUID &&
+          !isViscousLiquid(materials[caMatRaw])) {
+        caMat = caMatRaw;
+        caPath = h.liqPath;
+      }
+      color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color);
       if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
     }
   }
