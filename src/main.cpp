@@ -1782,7 +1782,7 @@ int main(int argc, char** argv) {
   FarField far;
   far.Init(&world);
 
-  if (measure) return RunMeasure(ctx, world, sim);
+  if (measure) return RunMeasure(ctx, world, sim, mats);
   if (shot) return RunShots(ctx, world, sim);
   if (shotFluid) return RunFluidShot(ctx, world, sim, mats);
   if (fluidBench)

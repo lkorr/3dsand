@@ -8,6 +8,7 @@
 #include "gpu/vk_record.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "sim/world.h"  // kExplosionWg, kNumChunks (pass::kPassStride is in pass_table.h)
 
@@ -486,7 +487,20 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     f.CmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 
     const bool caLoop = r.dyn == pass::Dyn::Ca;
-    for (uint32_t k = 0; k < r.repeat; k++) {
+    // MEASUREMENT-ONLY (ROADMAP_scale §3.x investigation, branch
+    // perf/ca-phase-skip). SANDVOX_CA_REPEAT=<n> truncates the CA row's 54
+    // iterations to n so the per-recorded-dispatch cost can be read off a
+    // SLOPE instead of a three-point least-squares fit. It BREAKS the colour
+    // lattice and therefore the world hash — never set it outside --measure.
+    uint32_t reps = r.repeat;
+    if (caLoop) {
+      static const uint32_t kCaRepeatOverride = [] {
+        const char* e = std::getenv("SANDVOX_CA_REPEAT");
+        return e ? (uint32_t)std::atoi(e) : 0xFFFFFFFFu;
+      }();
+      if (kCaRepeatOverride != 0xFFFFFFFFu) reps = kCaRepeatOverride;
+    }
+    for (uint32_t k = 0; k < reps; k++) {
       // The barrier goes BEFORE the dispatch, every iteration. For the CA row
       // that means 54 ApplyUses calls: the first emits the dispatchArgs
       // TRANSFER_WRITE->INDIRECT_COMMAND_READ plus the voxels/dirtyOut/support

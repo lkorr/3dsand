@@ -1112,6 +1112,18 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
     settledProven_ = false;
   }
   cx.caActive = !settledProven_;
+  // MEASUREMENT-ONLY (branch perf/ca-phase-skip). SANDVOX_CA_FORCE=1 defeats
+  // the §3.4 settled skip so that a SETTLED world still records all 54 CA
+  // iterations with an indirect count of zero — i.e. the CA row's GPU time
+  // becomes the pure content-free dispatch floor, directly measured rather
+  // than least-squares-extrapolated. Hash-neutral (it only ADDS no-op work).
+  {
+    static const bool kForceCa = [] {
+      const char* e = std::getenv("SANDVOX_CA_FORCE");
+      return e && e[0] == '1';
+    }();
+    if (kForceCa) cx.caActive = true;
+  }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
 
