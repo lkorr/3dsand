@@ -207,24 +207,59 @@ const char* LabSceneName(int scene) {
   return (scene >= 0 && scene < kLabSceneCount) ? kSceneNames[scene] : "?";
 }
 
+// A camera that can actually SEE INTO a walled box, derived from its bounds
+// rather than guessed.
+//
+// Four of the five scenes used to be shot from a hand-picked eye that sat
+// BELOW or barely above the wall top (faucet's eye was at y = G+24 against a
+// box whose rim is G+26), so the near wall filled the frame and the water was
+// not visible at all — the bench screenshots for `basin`, `pool`, `faucet` and
+// `slosh` could not be used to judge anything, which is how a whole WP got
+// written with only `hill` as visual evidence.
+//
+// The constraint is one inequality. With the eye at horizontal distance D from
+// the centre of a box of half-footprint w and wall height h, the sightline to
+// the floor centre has slope H/D and the sightline grazing the NEAR rim has
+// slope h/(D - w). The floor is visible only when H/D > h/(D - w). Solving for
+// H with a 60% margin gives a camera that is correct for any box the lab grows
+// later, instead of a number that silently rots when a scene is resized.
+static void LabBoxViewCamera(const IVec3& lo, const IVec3& hi, Vec3& eye,
+                             Vec3& target) {
+  const float cx = 0.5f * (float)(lo.x + hi.x);
+  const float cz = 0.5f * (float)(lo.z + hi.z);
+  const float w = 0.5f * (float)std::max(hi.x - lo.x, hi.z - lo.z);
+  const float h = (float)(hi.y - lo.y);
+  const float D = 1.35f * w + 20.0f;         // stand-off, scaled to the box
+  const float H = 1.6f * D * h / (D - w);    // the inequality, with margin
+  const float k = D * 0.70710678f;           // on the -x/-z diagonal
+  eye = {cx - k, (float)lo.y + H, cz - k};
+  target = {cx, (float)lo.y + 2.0f, cz};     // just above the floor
+}
+
 void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
   // Eye + look target per scene; yaw/pitch derived (Camera convention:
   // yaw = atan2(dz, dx), the RunMobShot shape).
   // Eyes sit well above the wall tops so the interior — where the water is —
   // fills the frame rather than the outside of a stone box.
   Vec3 target{(float)CX, (float)G, (float)CZ};
+  IVec3 blo, bhi;
+  LabSceneBounds(scene, blo, bhi);
   switch (scene) {
-    case kLabBasin:  eye = {222, (float)(G + 30), 222}; break;
+    case kLabBasin:  LabBoxViewCamera(blo, bhi, eye, target); break;
     // Hill: from above the catch basin looking back UP the ramp, so the
     // stepped face, the deck pour and the basin are all in frame — the
     // mid-slope freeze (or the sheet-down that replaces it) is THE thing
     // this scene exists to show.
     case kLabHill:   eye = {268, (float)(G + 38), 214};
                      target = {224, (float)(G + 8), 256}; break;
-    case kLabFaucet: eye = {224, (float)(G + 24), 224}; break;
-    case kLabPool:   eye = {226, (float)(G + 22), 226}; break;
-    case kLabSlosh:  eye = {256, (float)(G + 34), 212};
-                     target = {256, (float)G, 258}; break;
+    case kLabFaucet: LabBoxViewCamera(blo, bhi, eye, target); break;
+    case kLabPool:   LabBoxViewCamera(blo, bhi, eye, target); break;
+    // Slosh is a long shallow trough, not a box: the generic view works, but
+    // aim along the trough's LONG axis so the wave that runs end to end is the
+    // thing in frame.
+    case kLabSlosh:  LabBoxViewCamera(blo, bhi, eye, target);
+                     eye.z = (float)(blo.z + bhi.z) * 0.5f - 34.0f;
+                     break;
     default:         eye = {222, (float)(G + 30), 222}; break;
   }
   Vec3 d = target - eye;
