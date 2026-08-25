@@ -508,6 +508,19 @@ Noita's "Bloody Zombies" technique, on GPU:
   water voxels eject as particles).
 - Capacity: ring buffer, ~1–4M particles. Overflow policy: oldest cosmetic
   particles reinsert immediately instead of flying.
+- **Reinsertion is the one dirty-writer the CPU cannot predict**, and that makes
+  the live particle count a load-bearing *sim* quantity, not just a HUD number.
+  `resolve` writes a voxel and marks a chunk dirty at a location chosen on the
+  GPU, so "no CPU inputs this tick" does not imply "no work next tick" while
+  anything is in flight. The CA's settled-tick skip (ROADMAP_scale.md §3.4,
+  §3.2d) therefore requires its licensing snapshot to report **both**
+  `activeChunks == 0` and `particleCount == 0`, and the page table's flight
+  shell uses the same off condition (`PageTable::ApplyParticleShell`). Both are
+  sound only because the snapshot's particle count is captured downstream of
+  `resolve` in the same tick — a landing is never invisible to the snapshot of
+  its own tick, and a particle that lands is still counted on the tick it lands.
+  **A new GPU-side particle source must land inside that count**, or both
+  mechanisms will reason a world settled while matter is still moving.
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
 
@@ -2460,6 +2473,13 @@ Targets (mid-range desktop GPU, e.g. RTX 3060-class):
 - 30 Hz sim / 60+ FPS render, resident cube ≈ 512³ voxels (~268 MB device memory).
 - Sim cost must scale with **activity, not world size**: a fully settled world costs
   ~zero (hierarchical dirty tree returns nothing to dispatch).
+  - **"Costs nothing" has to include the RECORDING, not just the dispatch.** 54
+    indirect dispatches whose args say `(0,1,1)` still cost ~2.25 µs each on the
+    CPU, and the settled world was paying 137 µs/tick for provably zero
+    invocations until `Cond::CaActive` stopped recording them (§3.4). The
+    corollary bit twice: any CPU term that says "not settled" must be EVIDENCE,
+    never a timer — a 400-tick post-explosion timer disabled that skip for 13.3
+    seconds after every blast (ROADMAP_scale.md §3.2d).
 - Per-tick CPU↔GPU traffic: metadata mirror + collider-region readbacks + mutation
   uploads, target < 1 MB/tick, always batched, always async (one tick latent).
 - Instrument from day one: dirty-chunk count, particles alive, sim/render GPU ms,

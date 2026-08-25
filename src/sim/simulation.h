@@ -134,10 +134,18 @@ class Simulation {
   // `dirtiedNow` is true if this tick has ANY input that marks a chunk: ops,
   // explosions, cell ops, spawns, streaming refills, a wake-all, a load.
   void NoteTickInputs(uint32_t tick, bool dirtiedNow);
-  // Feed an arriving snapshot. `activeChunks` is its dirty-flag count and
-  // `snapTick` the tick it was stamped at. Only a snapshot showing ZERO active
-  // chunks, stamped at or after the last dirtying tick, can license a skip.
-  void NoteSnapshot(uint32_t snapTick, uint32_t activeChunks);
+  // Feed an arriving snapshot. `activeChunks` is its dirty-flag count,
+  // `particleCount` its live voxels-in-flight count and `snapTick` the tick it
+  // was stamped at. Only a snapshot showing ZERO active chunks AND ZERO
+  // particles, stamped at or after the last dirtying tick, can license a skip.
+  //
+  // The particle conjunct is §3.2d: it is what lets the CA latch ignore
+  // `particlesActive` (a 400-tick wall-clock timer in main.cpp) and reason from
+  // the same evidence the rest of §3.4 uses. Both counts come off the SAME
+  // snapshot word, captured at the same point in the tick, which is what makes
+  // the reinsertion window closed rather than merely narrow — see the .cpp.
+  void NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
+                    uint32_t particleCount);
   // Everything that wakes chunks outside the op path funnels here, so a caller
   // that forgets one keeps the CA running rather than silently losing it.
   // Stamps the current tick — NOT a forever-dirty sentinel; see the .cpp for
@@ -147,6 +155,18 @@ class Simulation {
   // gates only — nothing in the sim may branch on this.
   bool CaSkipped() const { return caSkipped_; }
   uint64_t CaSkipCount() const { return caSkipCount_; }
+  // MEASUREMENT / TEST ONLY: force the CA rows to be recorded every tick, i.e.
+  // defeat the §3.4 skip. Two uses, both of which need it to be a switch rather
+  // than an #ifdef:
+  //   - the `ca-skip` gate runs one scripted explosion twice, skip-on and
+  //     skip-off, and asserts the per-tick hash sequences are IDENTICAL. That
+  //     differential is the only test that can catch "a chunk was processed one
+  //     tick late", which a single-run hash cannot.
+  //   - --measure reads the content-free dispatch floor off a settled world.
+  // Forcing can only ADD work whose indirect count is zero, so it is
+  // hash-neutral by the same argument the skip itself is (see the .cpp).
+  // Also settable process-wide with SANDVOX_CA_FORCE=1.
+  void SetCaForced(bool on) { caForced_ = on; }
 
   // Render pass with the shared depth target (raymarch writes frag_depth,
   // raster geometry depth-tests against it). Caller draws UI into same pass.
@@ -317,4 +337,5 @@ class Simulation {
   bool settledProven_ = false;  // a fresh snapshot showed 0 active chunks
   bool caSkipped_ = false;      // last EncodeTick omitted the CA rows
   uint64_t caSkipCount_ = 0;    // how many ticks skipped (measurement only)
+  bool caForced_ = false;       // SetCaForced / SANDVOX_CA_FORCE (test only)
 };
