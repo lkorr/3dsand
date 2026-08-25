@@ -909,6 +909,22 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
   return (mat & 0xFFFu) | ((fullness & 0x7u) << 12u) |
          ((stainType & 0x7u) << 15u) | ((stainAmt & 0xFu) << 18u);
 }
+// ORIGIN (bit 22): set by exciteEmit, clear on everything spawnAppend makes.
+//
+// It exists because sim.fluidExciteCeiling means "the standing size of the
+// EXCITED region" and was being charged against the whole pool, spawns
+// included. A pour is a spawn, spawns are never refused, and the lab's own
+// basin scene runs 15,360 particles — so the moment anything poured, `live`
+// sat above the 8,000 ceiling and excite's budget was zero from then on.
+// Measured on `--fluid-bench basin` before this bit existed: 479 excite
+// candidates, 0 eighths emitted, every slot refused, for all 400 ticks. That is
+// the reported "water pouring down a waterfall never turns into MPM" — the
+// waterfall was competing for headroom against the pour that made it.
+// Charging the ceiling against excited-origin particles only restores the
+// meaning the tuner documents; the POOL is still bounded, separately, by
+// FLUID_CAP.
+const FP_EXCITED : u32 = 1u << 22u;
+fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 
 // ---- fluidArgsStage word map (32 u32) --------------------------------------
 // [0..3]  node-pass dispatch args + active block count (alloc, per substep)

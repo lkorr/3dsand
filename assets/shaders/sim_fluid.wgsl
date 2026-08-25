@@ -209,6 +209,11 @@ const FLUID_JMAX : i32 = 91750;
 // momentum-to-velocity division would amplify noise on a node that cannot
 // influence any particle meaningfully anyway.
 const FLUID_MASS_MIN : i32 = 16;
+// Settled-liquid static mass, as a Q8 fraction of rest density (sim.
+// fluidSettledMass; see the seedSettledMass block in clearGrid). 0 compiles the
+// whole mechanism out and restores WP4's pass-through behaviour exactly.
+const FLUID_SETTLED_Q8 : i32 =
+    i32(round(clamp(TUNE_FLUID_SETTLED_MASS, 0.0, 2.0) * 256.0));
 // Gravity, EOS (stiffness / rest density / power / cohesion), the species
 // attraction pair, viscosity and damping all come from tuning (sim.* —
 // integer, F5-reloadable, the "fluid" rows of tuning_params.def). LoadTuning
@@ -286,8 +291,9 @@ fn nodeWordBase(bm : u32, nc : vec3<i32>) -> u32 {
 }
 
 // Terrain for the grid boundary condition: solids and powders block; CA
-// liquids and gases do not (the two liquid systems pass through each other in
-// this side-by-side prototype). Out-of-window is solid and inert.
+// liquids and gases do not. A settled liquid is NOT a wall — it is a fluid, and
+// the way it stops a particle is by weighing something, which is what
+// seedSettledMass below gives it. Out-of-window is solid and inert.
 fn fluidSolid(c : vec3<i32>) -> bool {
   if (!inWindow(c, T.origin)) { return true; }
   let mat = voxMat(voxWordAt(c));
@@ -427,11 +433,86 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
 @compute @workgroup_size(256)
 fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
              @builtin(local_invocation_index) li : u32) {
-  let node = wg.x * 256u + li;   // wg.x spans blocks*16, so node < blocks*4096
+  let block = wg.x >> 4u;                        // same addressing as gridUpdate
+  let localIdx = (wg.x & 15u) * 256u + li;
+  let node = block * CHUNK_VOL + localIdx;       // == wg.x * 256 + li
   let b = node * FLUID_GW;
   for (var w = 0u; w < 7u; w++) {
     atomicStore(&fluidGrid[b + w], 0);
   }
+
+  // ---- SETTLED LIQUID AS STATIC MASS (sim.fluidSettledMass) ---------------
+  //
+  // THE HOLE THIS FILLS. Up to WP4 the solver could not see settled water at
+  // all: fluidSolid() blocks only solids and powders, and a fullness voxel
+  // scatters nothing into the grid because it has no particles. So the two
+  // representations passed straight through each other, and every symptom of
+  // that is a bug someone eventually reports:
+  //   * MPM water poured onto a basin filled to the rim fell to the FLOOR. The
+  //     basin was, to the solver, an empty box.
+  //   * A pool that settles chunk by chunk (settle is a per-block decision, so
+  //     a body spanning four chunks converts in four steps) sprayed: the moment
+  //     one chunk became voxels its neighbours' particles lost the density that
+  //     was holding them up, read rho far below rest on that side, and were
+  //     pushed into the hole by the pressure of the water behind them.
+  // Both are the same missing term, and neither is fixable on the seam side —
+  // no amount of excite/settle tuning can make a body of water support
+  // something the solver does not know is there.
+  //
+  // THE TREATMENT is the standard static-boundary one (Akinci-style boundary
+  // mass in SPH, prescribed-mass nodes in MPM): a settled cell seeds its node
+  // with `fullness/8 * restDensity` of mass carrying ZERO momentum, BEFORE p2g
+  // runs. Everything follows from where that lands in the pipeline:
+  //   * p2g2 gathers it into rho, so a particle above a full pool sees rest
+  //     density below it and gets real EOS pressure — it floats, and a plunging
+  //     jet is ejected back out instead of tunnelling to the bed;
+  //   * gridUpdate divides momentum by TOTAL mass, so an impacting jet is
+  //     diluted against static mass — that is the drag a still pool applies,
+  //     and it is what stops the settle-time collapse;
+  //   * it is NOT a prescribed-zero-velocity boundary, on purpose. Leaving the
+  //     node velocity as (real momentum / total mass) is what keeps the seam's
+  //     WAKE trigger alive: at the impact point real momentum still dominates,
+  //     so the splash excites the water it lands on, while a node deep in a
+  //     still pool reads ~0 and does not. A crater, not a converted lake.
+  //
+  // DETERMINISM. Voxels do not change during the substeps (the CA and the seam
+  // both run outside PT_FLUID), one thread owns one node, integer throughout,
+  // and the value is a pure function of the cell's word — rule 1 holds by the
+  // same argument gridUpdate's BC probe already makes.
+  //
+  // WHY IT IS SEEDED EVERY SUBSTEP rather than cached: word 0 is cleared every
+  // substep and the only accumulator that survives the clear is the foam field
+  // (word 7). Re-reading one voxel per node is the cheaper half of that trade
+  // against widening FLUID_GW off its power-of-two stride.
+  //
+  // Scope note: this seeds where BLOCKS exist, i.e. within FLUID_MARK_PAD of a
+  // live particle. Settled water further away than that is water no particle
+  // can reach this tick, so it needs no representation here.
+  if (FLUID_SETTLED_Q8 <= 0) { return; }
+  let slot = fluidBlockList[block];
+  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
+                     i32(slot / (NCHUNK * NCHUNK)));
+  let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
+                     i32(localIdx >> 8u));
+  // Node nc sits at the CENTRE of cell nc (see axisOf / the dpos terms in p2g),
+  // so "this node's cell" is an identity, not an approximation.
+  let c = slotToWorldChunk(sc, T.origin) * i32(CHUNK) + lo;
+  if (!inWindow(c, T.origin)) { return; }
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
+  if (mat == MAT_AIR) { return; }
+  if (materials[mat].klass != CLASS_LIQUID) { return; }
+  // A full cell is `rest` in Q16.16, i.e. rest >> 6 in the grid's Q10 mass.
+  // Bounds: rest <= 32<<16, so (rest>>6)*8/8 <= 32768 and the Q8 scale (<= 512)
+  // keeps the product under 2^24.
+  let full = FLUID_REST_DENSITY >> 6u;
+  let vm = (((full * i32(voxState(w) + 1u)) / 8) * FLUID_SETTLED_Q8) >> 8u;
+  if (vm <= 0) { return; }
+  atomicStore(&fluidGrid[b + 0u], vm);
+  // Species accounting must match p2g1's, or the same-species attraction terms
+  // would read this water as "some other fluid" pressing against itself.
+  let sp = (mat - 1u) & 3u;
+  if (sp != 0u) { atomicStore(&fluidGrid[b + 3u + sp], vm); }
 }
 
 // ---- p2g1: scatter mass, momentum and species mass --------------------------

@@ -458,9 +458,18 @@ PASS(copy_fluidArgs, nullptr, PT_FLUIDMAP, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, 
      USES(TR(FluidArgsStage) TW(FluidDispatchArgs)))
 
 // =========================================================== PT_FLUID =====
+// clearGrid is no longer only a clear: it also SEEDS each node with the static
+// mass of the settled liquid voxel it sits in (sim.fluidSettledMass), which is
+// what makes voxel water hold particle water up. That reads the voxel field and
+// the block list, exactly as gridUpdate's BC probe does, so it declares the
+// same set — omitting them would leave the seeding unbarriered against the
+// seam's voxel writes earlier in the tick.
+// read-only in practice: `fluidBlockList` is written by alloc; the seeding only
+// reads it, to turn a block index back into the chunk slot it was assigned.
 PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_FLUIDARGS,0,0,
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(W(FluidGrid) I(FluidDispatchArgs)))
+     USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
+          W(FluidGrid) I(FluidDispatchArgs)))
 // P2G's scatter is the plan's §5.1 bet made real: i32 atomicAdd accumulation,
 // associative, so the sum cannot depend on scheduling. The fill->mark->alloc
 // chain above already ordered the map; the barrier p2g1 needs is the

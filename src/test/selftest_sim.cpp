@@ -1265,6 +1265,257 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-onwater -------------------------------------------------------
+// PARTICLE WATER MEETS SETTLED WATER — the one question none of the five lab
+// pour scenes can ask, because every one of them pours into an EMPTY basin.
+//
+// Up to WP4 the answer was "they ignore each other". sim_fluid.wgsl's
+// fluidSolid() blocks solids and powders only, and a fullness voxel scatters
+// nothing into the node grid because it has no particles, so MPM water poured
+// onto a basin filled to the rim fell straight to the BED as if the basin were
+// empty. sim.fluidSettledMass is the fix: a settled cell seeds its node with
+// fullness/8 * restDensity of zero-velocity mass, so the pool has density and
+// the pour floats on it.
+//
+// THE ASSERTION IS A DIFFERENTIAL, not an absolute depth, and that is what
+// makes it hard to fool. A sealed box, a bed of stone, eight full layers of
+// SETTLED water above it, and a burst of particles dropped in from the air
+// pocket at the top. The gate runs the same pour TWICE — once with
+// fluidSettledMass 0 (WP4's pass-through, the control) and once at the shipped
+// 1.0 — and requires that the pool measurably holds the pour UP.
+//
+// An absolute threshold was tried first and is the wrong instrument: this is a
+// weakly-compressible solver, the jet arrives near its own CFL ceiling, and the
+// static boundary cannot be shoved aside the way real water would be, so a fast
+// pour legitimately punches a deep crater before pressure throws it back. What
+// must never happen — and what WP4 did every time — is the pour reaching the
+// BED as though the basin were empty. The control arm measures exactly that, in
+// the same geometry, on the same build.
+//
+// exciteMode is pinned OFF, and note what that does NOT switch off: the seam's
+// WAKE trigger is unconditional (sim_fluid_seam.wgsl exciteDetect — only the
+// fall and perch triggers are behind fluidExciteEnable), because a disturbance
+// reaching settled water has to be able to propagate whatever mode the world is
+// in. So the pour can still excite the pool it lands on, and the CONTROL ARM
+// shows why that mattered so much: with no boundary mass the pour falls THROUGH
+// the pool, every cell it passes has a fast node face-adjacent to it, and the
+// wake cascades down the whole column — the measured control converts 8,136 of
+// the box's 8,144 eighths, i.e. the entire basin, which is the reported "a
+// waterfall turns the whole lake into fluid". The shipped arm converts ~1,300:
+// a crater at the point of impact, which is what a splash should do.
+//
+// SECOND ASSERTION, and it is the sharper one: the pool must still BE a pool
+// afterwards. `peakLive` bounds how much of the box was ever particles at once.
+//
+// (The control arm's deepest-particle reading lands below the bed — a fully
+// converted, over-pressured sealed box leaks particles through a 2-cell shell.
+// That is a pre-existing containment weakness under pathological pressure, the
+// same one the fluid-excite gate's double shell exists to keep out of ITS
+// audit; here it is only the control, whose mass is deliberately not audited.)
+Status GateFluidOnWater(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  Tuning t = CurrentTuning();
+  t.dayNight.freeze = 1;
+  t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);  // both water sinks off
+  t.sim.fluidExciteMode = 0;   // see the header: the pool must stay settled
+  t.sim.fluidSubsteps = 9;
+  t.sim.fluidStiffness = 14000.0f;
+  t.sim.fluidGravity = 900.0f;
+  t.sim.fluidRestDensity = 8.0f;
+  t.sim.fluidEosPower = 4;
+  t.sim.fluidCohesion = 0.0f;
+  t.sim.fluidViscosity = 0.0f;
+  t.sim.fluidDamping = 0.0f;
+  t.sim.fluidFriction = 0.0f;
+  Tuning saved = CurrentTuning();
+
+  // Box: interior x,z in [-5,5] around (96,·,96), double stone shell. Bed at
+  // bedY, settled water bedY+1 .. bedY+8 (8 full layers), air above it, roof.
+  const int px = 96, pz = 96, RB = 7;
+  const int bedY = 110, roofY = 127;
+  const int waterTop = bedY + 8;      // 118: last settled layer
+  const int pourY = 124;              // the air pocket, 6 cells clear of it
+  const int kPourTick = 4, kMaxTicks = 150;
+  const int kIn = RB - 2;             // interior half-extent (5)
+  const uint32_t kSettledEighths = (uint32_t)((2 * kIn + 1) * (2 * kIn + 1)) * 8u * 8u;
+
+  uint32_t worldHash[2] = {0, 0};
+  uint32_t poured = 0, live = 0, liveEighths = 0, endEighths = 0;
+  int minParticleY = 1 << 30;     // deepest particle seen after the pour lands
+  int minSampleTick = -1;
+  // run 0 = the CONTROL (fluidSettledMass 0, i.e. WP4's pass-through);
+  // runs 1 and 2 = the shipped 1.0, twice, so the hash comparison still has
+  // two matching arms to compare.
+  int controlMinY = 1 << 30;
+  uint32_t peakLive = 0, controlPeakLive = 0;
+  for (int run = 0; run < 3; run++) {
+    t.sim.fluidSettledMass = run == 0 ? 0.0f : 1.0f;
+    SetCurrentTuning(t);
+    // sim.fluid* are WGSL consts folded in at compile time (the human-unit
+    // exception in CLAUDE.md), so the arm switch is a shader reload — the F5
+    // path, used here for the reason F5 exists.
+    sim.ReloadShaders(ctx.device);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> box;
+    auto put = [&](int x, int y, int z, uint32_t m, uint32_t state = 0) {
+      box.push_back({World::SlotCellIndex({x, y, z}),
+                     (m & 0xFFFu) | (state << 12)});
+    };
+    for (int y = bedY - 1; y <= roofY + 1; y++)
+      for (int z = -RB; z <= RB; z++)
+        for (int x = -RB; x <= RB; x++) {
+          const bool shell = x <= -RB + 1 || x >= RB - 1 || z <= -RB + 1 ||
+                             z >= RB - 1 || y <= bedY || y >= roofY;
+          if (shell) put(px + x, y, pz + z, kMatStone);
+          else if (y <= waterTop) put(px + x, y, pz + z, waterId, 7u);
+          else put(px + x, y, pz + z, kMatAir);
+        }
+
+    // The pour: a 5x5x2 block of cells' worth of particles at the 2x2x2
+    // sub-cell lattice, the same seeding exciteEmit uses, dropped with a
+    // downward kick so they arrive with real momentum rather than drifting on.
+    std::vector<FluidSpawnOp> pour;
+    for (int y = 0; y < 2; y++)
+      for (int z = -2; z <= 2; z++)
+        for (int x = -2; x <= 2; x++)
+          for (int k = 0; k < 8; k++) {
+            FluidSpawnOp op{};
+            op.px = ((px + x) << 16) + ((k & 1) ? 49152 : 16384);
+            op.py = ((pourY + y) << 16) + ((k & 2) ? 49152 : 16384);
+            op.pz = ((pz + z) << 16) + ((k & 4) ? 49152 : 16384);
+            op.vx = 0;
+            op.vy = -65536;   // 1 cell/tick down = 30 vox/s
+            op.vz = 0;
+            op.species = 0;
+            op.mat = waterId;
+            pour.push_back(op);
+          }
+    poured = (uint32_t)pour.size();
+
+    uint32_t ft = 50000;
+    uint32_t liveEst = 0;
+    minParticleY = 1 << 30;
+    peakLive = 0;
+    for (int i = 0; i < kMaxTicks; i++) {
+      std::vector<CellOp> cops;
+      if (i == 0) cops = box;
+      std::vector<FluidSpawnOp> sp;
+      if (i == kPourTick) sp = pour;
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {}, cops, false,
+                 {6, 7, 6}, false, false, {}, 0, sp, liveEst);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      if (i < kPourTick) { liveEst = 0; continue; }
+      uint32_t fa[32] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                            128, "onWaterArgs");
+      live = std::min(fa[7], kFluidCap);
+      liveEst = live;
+      peakLive = std::max(peakLive, live);
+      // The depth probe. Sampled from the tick the pour has had time to reach
+      // the surface (a 6-cell fall at 1 cell/tick plus gravity) to the end.
+      if (i >= kPourTick + 10 && live > 0) {
+        uint32_t n = std::min(live, kFluidCap);
+        std::vector<uint32_t> pbuf((size_t)n * kFluidParticleWords);
+        rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                              world.fluidParticles[sim.Page()], 0, pbuf.data(),
+                              pbuf.size() * 4, "onWaterP");
+        uint32_t alive = 0, belowBed = 0;
+        int tickMin = 1 << 30;
+        for (uint32_t k = 0; k < n; k++) {
+          const uint32_t* p = &pbuf[k * kFluidParticleWords];
+          if (((p[18] & 0xFFFu) == 0u) || (((p[18] >> 12) & 0x7u) == 0u))
+            continue;  // fpAlive
+          alive++;
+          const int y = (int)((int32_t)p[1] >> 16);
+          if (y < bedY) belowBed++;
+          if (y < tickMin) tickMin = y;
+          if (y < minParticleY) { minParticleY = y; minSampleTick = i; }
+        }
+        if (i % 30 == 0)
+          std::printf("  on-water arm%d t%d: live %u alive %u minY %d "
+                      "belowBed %u\n",
+                      run, i, live, alive, tickMin, belowBed);
+      }
+    }
+    if (run == 0) {
+      controlMinY = minParticleY;
+      controlPeakLive = peakLive;
+      continue;
+    }
+    worldHash[run - 1] = HashWorldNow(ctx, world, sim, kDefaultSeed);
+
+    liveEighths = 0;
+    if (live > 0) {
+      uint32_t n = std::min(live, kFluidCap);
+      std::vector<uint32_t> pbuf((size_t)n * kFluidParticleWords);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                            world.fluidParticles[sim.Page()], 0, pbuf.data(),
+                            pbuf.size() * 4, "onWaterEnd");
+      for (uint32_t k = 0; k < n; k++)
+        liveEighths += (pbuf[k * kFluidParticleWords + 18] >> 12) & 0x7u;
+    }
+
+    // Standing water over the sealed interior, for the mass audit.
+    endEighths = 0;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cy = (bedY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+      for (int cz2 = (pz - RB) / 16; cz2 <= (pz + RB) / 16; cz2++)
+        for (int cx2 = (px - RB) / 16; cx2 <= (px + RB) / 16; cx2++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx2, cy, cz2}), 1,
+                         cbuf.data(), "onWaterVox");
+          for (uint32_t j = 0; j < kChunkVol; j++)
+            if ((cbuf[j] & 0xFFFu) == waterId)
+              endEighths += ((cbuf[j] >> 12) & 0xFu) + 1u;
+        }
+  }
+  SetCurrentTuning(saved);
+  sim.ReloadShaders(ctx.device);
+
+  // TWO conditions on the depth, and they fail for different reasons.
+  //   * `held`   — the pool must hold the pour measurably higher than no pool
+  //     at all. This is the mechanism test, and the control arm supplies its
+  //     own reference on this build, this GPU, this tuning.
+  //   * `offBed` — and it must not reach the bed. The control arm lands ON the
+  //     bed, so this is the user-visible statement: water poured into a full
+  //     basin does not end up underneath it.
+  const int kFloor = bedY + 2;
+  const uint32_t kTotal = kSettledEighths + poured;
+  bool held = minParticleY > controlMinY;
+  bool offBed = minParticleY >= kFloor;
+  // The pool must survive as a pool: less than half the box may ever be
+  // particles at once. Measured 1,274 of 8,144 here, against a control of
+  // 8,136 — the whole basin.
+  bool stayedPool = peakLive * 2u < kTotal;
+  bool massOk = endEighths + liveEighths == kTotal;
+  bool det = worldHash[0] == worldHash[1];
+  bool ok = held && offBed && stayedPool && massOk && det;
+  std::printf(
+      "fluid on-water: %s (%u particles poured onto %u settled eighths; "
+      "deepest particle y %d at t%d vs control (settledMass 0) y %d, bed %d, "
+      "floor %d; peak live %u vs control %u of %u total; %u standing + %u live "
+      "= %u of %u; world hash %s)\n",
+      ok ? "PASS" : "FAIL", poured, kSettledEighths, minParticleY,
+      minSampleTick, controlMinY, bedY, kFloor, peakLive, controlPeakLive,
+      kTotal, endEighths, liveEighths, endEighths + liveEighths, kTotal,
+      det ? "matches" : "DIVERGED");
+  detail =
+      Format("deepest y %d vs control %d (bed %d), peak live %u vs %u of %u, "
+             "mass %u+%u/%u, det %s",
+             minParticleY, controlMinY, bedY, peakLive, controlPeakLive, kTotal,
+             endEighths, liveEighths, kTotal, det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- fluid-stain ---------------------------------------------------------
 // Staining parity across the seam (plan §6.2, task 4a): water voxels placed
 // CARRYING a foreign stain (type 3 — "blood-water") are excited, drain
@@ -1964,6 +2215,7 @@ const std::vector<Gate>& SimGates() {
       {"fluid-det", "sim", {}, false, GateFluidDet},
       {"fluid-settle", "sim", {}, false, GateFluidSettle},
       {"fluid-excite", "sim", {}, false, GateFluidExcite},
+      {"fluid-onwater", "sim", {}, false, GateFluidOnWater},
       {"fluid-stain", "sim", {}, false, GateFluidStain},
       {"fluid-react", "sim", {}, false, GateFluidReact},
       {"prefab", "sim", {}, false, GatePrefab},
