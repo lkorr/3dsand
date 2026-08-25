@@ -522,6 +522,18 @@ void Overlay::Draw(UIState& s) {
         "cyan = mob limbs, yellow = loose debris.\n"
         "Drawn THROUGH walls on purpose - the reason to look at a collider is\n"
         "usually that something is on top of it.");
+  ImGui::Checkbox("wind field (F4)", &s.showWindField);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "The ambient wind, drawn as an arrow per lattice point around you.\n"
+        "Colour is speed, cool to hot. It samples the SAME windAt() the grass\n"
+        "sway does, so what the arrows show is what the foliage is standing\n"
+        "in - turn the Wind tab's direction knob and both must swing together.\n"
+        "Arrows pointing at or away from you fade out: one aimed down the view\n"
+        "ray cannot show its direction anyway, so the hole is honest.\n"
+        "Spacing and radius are on the Wind tab (F5 to apply).\n"
+        "NOTE: F5 re-seeds this from wind.dbgWindField, so a reload turns it\n"
+        "back off unless the tuning file asks for it.");
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
 
   auto swatch = [&](int i) {
