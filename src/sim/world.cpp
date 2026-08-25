@@ -182,6 +182,12 @@ void World::Init(const rhi::Device& device) {
                         U::Storage, "farOcc");
   farList = CreateBuffer(device, kFarListCap * 4, U::Storage | U::CopyDst, "farList");
   farUBO = CreateBuffer(device, sizeof(FarParams), U::Uniform | U::CopyDst, "farUBO");
+  // Edit patches for the cascade fill. The header half is rewritten by every
+  // PrepareTick that dispatches fills (2 u32 per entry, <= 32 KiB), so the
+  // kernel never reads an uninitialized count — this buffer deliberately does
+  // NOT lean on zero-initialized allocation the way farVox does.
+  farPatch = CreateBuffer(device, (uint64_t)kFarPatchWords * 4,
+                          U::Storage | U::CopyDst, "farPatch");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");

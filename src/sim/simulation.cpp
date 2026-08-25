@@ -294,7 +294,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   {
     // far-field cascade fill + downsample: slim sim group 0 (`far` statically
     // uses only materials + TickParams; `fardown` adds voxels) + far buffers
-    // as group 1. 4 storage entries in slim + 4 here = 8, well under Dawn's
+    // as group 1. 4 storage entries in slim + 5 here = 9, well under Dawn's
     // 16-per-stage layout limit.
     auto entry = [](uint32_t binding, rhi::BufferBindingType type) {
       rhi::BindGroupLayoutEntry e{};
@@ -310,6 +310,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(2, T::ReadOnlyStorage),  // farList
         entry(3, T::Uniform),          // FarParams
         entry(4, T::ReadOnlyStorage),  // dirtyList (phase-2 downsample work set)
+        entry(5, T::ReadOnlyStorage),  // farPatch (cascade edit persistence)
     };
     farBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -431,6 +432,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(2, world_->farList),
         b(3, world_->farUBO),
         b(4, world_->dirtyList),
+        b(5, world_->farPatch),
     };
     farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
   }
@@ -793,6 +795,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarOcc:         return world_->farOcc;
     case B::FarList:        return world_->farList;
     case B::FarUBO:         return world_->farUBO;
+    case B::FarPatch:       return world_->farPatch;
     case B::PageTable:      return world_->pageTable;
     case B::PageFaults:     return world_->pageFaults;
     case B::FluidParticlesRead:  return world_->fluidParticles[page_];

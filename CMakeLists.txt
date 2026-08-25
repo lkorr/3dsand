@@ -307,6 +307,7 @@ add_executable(sandvox
   src/sim/worldio.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp
+  src/sim/faredits.cpp
   src/sim/chunkstore.cpp
   src/sim/simulation.cpp
   src/sim/pass_table.cpp

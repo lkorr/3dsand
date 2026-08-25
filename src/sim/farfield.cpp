@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <vector>
 
+#include "sim/faredits.h"
+
 namespace {
 constexpr int kHyst = 2;  // level-chunk hysteresis, same feel as Stream
 // Player fine-chunk coord -> this level's chunk coord (arithmetic shift =
@@ -108,16 +110,64 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
     uboDirty_ = false;
   }
   if (queue_.empty()) return 0;
-  uint32_t count = (uint32_t)std::min(queue_.size(), (size_t)kFarListCap);
-  std::vector<uint32_t> list(count);
-  for (uint32_t i = 0; i < count; i++) {
-    list[i] = queue_.front();
+  const uint32_t cap = (uint32_t)std::min(queue_.size(), (size_t)kFarListCap);
+  std::vector<uint32_t> list;
+  list.reserve(cap);
+  patchHeader_.clear();
+  patchPayload_.clear();
+
+  FarEdits* edits = world_->farEdits;
+  for (uint32_t i = 0; i < cap; i++) {
+    const uint32_t packed = queue_.front();
+    const uint32_t k = packed >> kFarSlotShift;        // 0-based level index
+    const uint32_t slot = packed & kFarSlotMask;
+
+    // ---- this entry's edit patches (far-field edit persistence) ----------
+    // The queue names SLOTS, so the world level chunk resident in that slot is
+    // resolved here under the SAME origins the kernel will read this tick —
+    // the mirror of common.wgsl's farSlotToChunk. Resolving it any earlier
+    // (at enqueue time) would name the chunk that used to live there.
+    const std::vector<uint32_t>* patch = nullptr;
+    if (edits && !edits->Empty()) {
+      const int m = (int)kFarNChunk - 1;
+      const IVec3 sc{(int)(slot % kFarNChunk),
+                     (int)((slot / kFarNChunk) % kFarNChunk),
+                     (int)(slot / (kFarNChunk * kFarNChunk))};
+      const IVec3 o = origins_[k];
+      const IVec3 lc{o.x + ((sc.x - o.x) & m), o.y + ((sc.y - o.y) & m),
+                     o.z + ((sc.z - o.z) & m)};
+      patch = edits->Lookup(k + 1, lc);
+    }
+    const uint32_t n = patch ? (uint32_t)patch->size() : 0u;
+    // BUDGET BEFORE EMISSION (CLAUDE.md's rule for every other queue here): an
+    // entry that will not fit stays queued rather than being filled with a
+    // truncated patch, which would leave the horizon showing half an edit and
+    // no record that it did. One entry can hold at most kChunkVol = 4096
+    // words, far under the cap, so this can never deadlock.
+    if (patchPayload_.size() + n > kFarPatchCap) break;
+
+    patchHeader_.push_back((uint32_t)patchPayload_.size());
+    patchHeader_.push_back(n);
+    if (n) patchPayload_.insert(patchPayload_.end(), patch->begin(), patch->end());
+
+    list.push_back(packed);
     queue_.pop_front();
     // The dispatch is encoded in THIS tick's submit, so the entry counts as
     // filled from here on — SafeRadiusMeters is read on the render path of the
     // same frame, one submit behind at worst.
-    pending_[list[i] >> kFarSlotShift]--;
+    pending_[k]--;
   }
+  const uint32_t count = (uint32_t)list.size();
+  if (count == 0) return 0;   // first entry alone blew the budget: cannot happen
   queue.WriteBuffer(world_->farList, 0, list.data(), count * 4);
+  // The header is written for EVERY dispatched entry, always — the kernel
+  // indexes it by dispatch index and a stale pair points the patch loop at
+  // another entry's payload. 8 bytes per entry, so <= 32 KiB in the fullest
+  // tick a full refill can produce, and zero bytes in a tick with no fills.
+  queue.WriteBuffer(world_->farPatch, 0, patchHeader_.data(), count * 8);
+  if (!patchPayload_.empty())
+    queue.WriteBuffer(world_->farPatch, (uint64_t)kFarPatchBase * 4,
+                      patchPayload_.data(), patchPayload_.size() * 4);
+  lastPatchWords_ = (uint32_t)patchPayload_.size();
   return count;
 }

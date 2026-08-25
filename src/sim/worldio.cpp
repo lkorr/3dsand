@@ -284,6 +284,24 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
   // ignored entirely — grid-only callers keep their exact old behaviour.
   if (entities) LoadEntities(path, *entities);
 
+  // ---- far-field EDIT PERSISTENCE across a load (src/sim/faredits.h) -------
+  // Everything above restores the SIMULATED world; the cascades are rebuilt
+  // from scratch by FarField::FullRefill right after this returns, and the
+  // sieve only knows procgen. Without this rebuild a reloaded world's horizon
+  // is the pristine hillside again — every crater, tower and blast the save
+  // faithfully kept is invisible past the residency window until the player
+  // happens to walk each chunk back into it.
+  //
+  // O(store), once, off the frame path. The index is DERIVED: this is the
+  // reconstruction, which is exactly why nothing about the cascades has to be
+  // saved (DESIGN.md §9).
+  {
+    const size_t n = stream.Edits().RebuildFromStore(store);
+    std::printf("far-field edit index: %zu stored chunks -> %zu cells in %zu "
+                "level chunks\n",
+                n, stream.Edits().Cells(), stream.Edits().LevelChunks());
+  }
+
   std::printf("loaded %s (%zu chunks in RAM after window fill)\n", path.c_str(),
               stream.Store().Count());
   return true;

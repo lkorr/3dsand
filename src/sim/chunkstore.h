@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +56,20 @@ class ChunkStore {
   bool BindLoad(const std::string& dir);
   // Write every dirty region. False if any write failed.
   bool Flush(size_t* regionsOut = nullptr, uint64_t* bytesOut = nullptr);
+
+  // Visit every stored chunk exactly once — RAM first, then whatever else is
+  // on disk under a bound directory. `rle`/`pairs` are the chunk's encoded
+  // words; the pointer is valid only for the duration of the callback.
+  //
+  // DELIBERATELY DOES NOT GO THROUGH Get(): a full walk of a large save would
+  // pull every region into RAM and then LRU-spill it straight back out, which
+  // is both slow and a write amplification on a read-only traversal. Disk
+  // regions are streamed with their own FILE handle and never enter regions_.
+  //
+  // For rebuilding DERIVED indexes over the persisted world (the far-field
+  // edit index — see FarEdits::RebuildFromStore). O(store); load-time only.
+  using Visitor = std::function<void(IVec3 wc, const uint32_t* rle, size_t pairs)>;
+  void ForEachStored(const Visitor& fn);
 
  private:
   struct Region {

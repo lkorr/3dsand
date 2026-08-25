@@ -305,6 +305,7 @@ int RunVkInfo(bool lowPower) {
       entry(2, T::ReadOnlyStorage),  // farList
       entry(3, T::Uniform),          // FarParams
       entry(4, T::ReadOnlyStorage),  // dirtyList
+      entry(5, T::ReadOnlyStorage),  // farPatch
   };
 
   std::printf("\n=== descriptor set layouts + pipeline layouts ===\n");

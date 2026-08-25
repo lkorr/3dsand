@@ -1063,6 +1063,28 @@ static_assert(((uint64_t)(kFarLevels - 1) << kFarSlotShift) < (1ull << 32),
               "fill-queue packing (level-1)<<kFarSlotShift | slot must fit u32");
 constexpr uint32_t kFarListCap = 4096;  // fill dispatches per tick (level-chunks)
 
+// ---- cascade EDIT PATCHES (far-field edit persistence; src/sim/faredits.h) --
+// The sieve fills a level chunk from pristine procgen, which used to un-do the
+// live downsample every time a plane came back in or the world reloaded. Each
+// farList entry now carries a patch range: cells the CPU's FarEdits index says
+// the player changed, applied by the same `far` workgroup right after its
+// pristine sweep.
+//
+// Layout of the farPatch buffer, in u32:
+//   [0, 2*kFarListCap)                  per-fill-entry (payloadOffset, count)
+//   [kFarPatchBase, kFarPatchBase+cap)  payload: (mat << 12) | cellIndex
+// The header is indexed by the DISPATCH index (wg.x), not by slot, so it lines
+// up with farList entry-for-entry.
+constexpr uint32_t kFarPatchBase = kFarListCap * 2;
+// Payload ceiling per tick. 128 Ki entries = 512 KiB of upload in the worst
+// tick, which keeps the fill path inside the same CPU->GPU budget the mutation
+// queue lives under (CLAUDE.md rule 3's <1 MB/tick). A level chunk holds
+// kChunkVol = 4096 cells, so ONE entry can never exceed the cap and PrepareTick
+// can simply stop popping when the budget is spent — the leftover entries stay
+// queued and land next tick, exactly like the fill queue's own cap.
+constexpr uint32_t kFarPatchCap = 1u << 17;
+constexpr uint32_t kFarPatchWords = kFarPatchBase + kFarPatchCap;
+
 // ---- cascade geometry, derived in ONE place ----
 // Level k (1-based) holds kFarN cells per axis of 2^(k + kFarShiftBase) fine
 // voxels, so its box edge is kFarN << (k + kFarShiftBase) fine voxels. Every
@@ -1487,6 +1509,14 @@ class World {
   rhi::Buffer farOcc;   // kFarLevels x kNumChunks u32 non-air counts
   rhi::Buffer farList;  // kFarListCap entries: (level-1)<<kFarSlotShift | slot
   rhi::Buffer farUBO;   // FarParams
+  rhi::Buffer farPatch; // per-fill edit patches (kFarPatch* above)
+
+  // The CPU's far-field edit index (src/sim/faredits.h), owned by Stream —
+  // it is fed by the same eviction path that fills the ChunkStore, and that
+  // store is its reconstruction source. Forward-declared exactly like `pages`
+  // so world.h stays free of the streaming headers. Null before Stream::Init,
+  // and null-checked by FarField (a fill with no index is the old behavior).
+  class FarEdits* farEdits = nullptr;
 
  private:
   struct Slot {

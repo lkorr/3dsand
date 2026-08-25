@@ -3068,14 +3068,25 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 @group(1) @binding(2) var<storage, read> farList : array<u32>;
 @group(1) @binding(3) var<uniform> F : FarParams;
 @group(1) @binding(4) var<storage, read> farDirty : array<u32>;
+// Cascade EDIT PATCHES (world.h kFarPatch*, src/sim/faredits.h). Header pairs
+// (payload offset, count) indexed by DISPATCH entry, then the payload:
+// (mat << 12) | cellIndexInLevelChunk. See the patch block in `far`.
+@group(1) @binding(5) var<storage, read> farPatch : array<u32>;
 
 var<workgroup> wgFarCount : atomic<u32>;
+// Non-air cells contributed by the patch pass. Kept apart from wgFarCount
+// because the two are answers to different questions and only their SUM is
+// safe to publish (see the farOcc note at the bottom of `far`).
+var<workgroup> wgFarPatchNZ : atomic<u32>;
 
 @compute @workgroup_size(64)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
        @builtin(local_invocation_index) li : u32) {
   if (wg.x >= T.farCount) { return; }
-  if (li == 0u) { atomicStore(&wgFarCount, 0u); }
+  if (li == 0u) {
+    atomicStore(&wgFarCount, 0u);
+    atomicStore(&wgFarPatchNZ, 0u);
+  }
   workgroupBarrier();
 
   let packed = farList[wg.x];
@@ -3110,10 +3121,67 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&farVox[wordBase + wi], word);
   }
   atomicAdd(&wgFarCount, count);
+  // ---- THE EDIT PATCH (far-field edit persistence) ---------------------
+  //
+  // The sweep above is PRISTINE PROCGEN, and that is the whole problem this
+  // block exists to fix: `fardown` writes the player's edits into these same
+  // cells from the live grid, and every refill of this level chunk — an
+  // incoming plane after the player walked out and back, a teleport, a world
+  // load — used to erase them. FarField::PrepareTick now hands each fill entry
+  // the cells its CPU-side index (src/sim/faredits.h) knows were edited, taken
+  // from the persisted chunk store, and they are re-applied here.
+  //
+  // SAME RULE, SAME FUNCTION. The patch carries only the RAW MATERIAL at the
+  // cell's sample voxel; the surface-skin recolor is `farSurfaceMat`, exactly
+  // as in the sweep above and in `fardown`. That is what makes a patched cell
+  // byte-identical to what the live downsample would have written, so a region
+  // that flips between "resident and downsampled" and "refilled and patched"
+  // does not change appearance, and the sieve/downsample boundary agreement
+  // the `far-downsample` gate protects still holds.
+  //
+  // The barrier is UNCONDITIONAL and sits outside the loop: the sweep's
+  // whole-word atomicStores must land before the byte-granular read-modify-
+  // writes below, and a control barrier may not sit in non-uniform control
+  // flow (the counts come from a storage buffer, so a guarded barrier would
+  // fail WGSL's uniformity analysis).
+  //
+  // No cross-workgroup race, unlike `fardown`: a farVox word packs 4 cells
+  // that are consecutive in x WITHIN this level chunk, so every byte of every
+  // word this workgroup touches belongs to this workgroup alone.
+  storageBarrier();
+  let pOff = farPatch[wg.x * 2u];
+  let pCnt = farPatch[wg.x * 2u + 1u];
+  var pnz = 0u;
+  for (var pi = li; pi < pCnt; pi += 64u) {
+    let e = farPatch[FAR_PATCH_BASE + pOff + pi];
+    let ci = e & 0xFFFu;                       // cell index in this level chunk
+    let pmat = (e >> 12u) & 0xFFFu;            // raw material at the sample voxel
+    let pl = vec3<i32>(vec3<u32>(ci % CHUNK, (ci / CHUNK) % CHUNK,
+                                 ci / (CHUNK * CHUNK)));
+    let pcc = base + pl;
+    let pfine = (pcc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
+    var byteV = 0u;
+    if (pmat != MAT_AIR && materials[pmat].klass != CLASS_GAS) {
+      byteV = min(farSurfaceMat(pmat, pfine, shift, T.seed), 255u);
+      pnz += 1u;
+    }
+    let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
+    let bsh = (bi & 3u) * 8u;
+    atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+    atomicOr(&farVox[bi >> 2u], byteV << bsh);
+  }
+  atomicAdd(&wgFarPatchNZ, pnz);
   workgroupBarrier();
   if (li == 0u) {
+    // farOcc only ever gates EMPTY-SPACE SKIPPING, so it must never be too
+    // small and may be too large: an over-count costs one marched level chunk,
+    // an under-count hides real terrain (the same conservative direction
+    // `fardown`'s atomicMax takes). The sum double-counts a patched cell that
+    // was already non-air in the sweep and ignores a patch that cleared one —
+    // both land on the safe side.
     atomicStore(&farOcc[(level - 1u) * FAR_NUM_CHUNKS + slot],
-                atomicLoad(&wgFarCount));
+                min(atomicLoad(&wgFarCount) + atomicLoad(&wgFarPatchNZ),
+                    CHUNK_VOL));
   }
 }
 

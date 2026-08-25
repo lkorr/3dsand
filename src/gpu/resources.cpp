@@ -111,6 +111,10 @@ std::string ShaderConstantPrelude() {
   o << "const FAR_MASK : i32 = " << (kFarN - 1) << ";\n";
   o << "const FAR_NCHUNK_MASK : i32 = " << (kFarNChunk - 1) << ";\n";
   o << "const FAR_SHIFT_BASE : u32 = " << kFarShiftBase << "u;\n";
+  // Cascade edit patches (world.h's kFarPatch* block): the farPatch buffer is
+  // a (offset, count) header indexed by dispatch entry, then a payload of
+  // (mat << 12) | cellIndex words starting here.
+  o << "const FAR_PATCH_BASE : u32 = " << kFarPatchBase << "u;\n";
   // Fluid-lab flat-slab ground height (world.h kLabSlabY): the y the lab
   // worldgen mode fills up to, and the value World::TerrainHeight returns in
   // lab mode. Emitted here so the shader guard and the CPU mirror share one

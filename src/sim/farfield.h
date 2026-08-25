@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <deque>
+#include <vector>
 
 #include "math3d.h"
 #include "sim/world.h"
@@ -12,10 +13,20 @@
 // Stream), enqueues incoming planes for GPU fill, and drains the queue at
 // kFarListCap level-chunks per tick through worldgen.wgsl `far`.
 //
-// Derived data only: no readbacks, no persistence, no sim interaction, not
-// hashed. Fill entries name SLOTS; the kernel maps slot -> world level-chunk
-// under the origins uploaded the same tick, so a backlogged entry always
-// fills whatever is currently resident in that slot — never stale space.
+// Derived data only: no readbacks, no sim interaction, not hashed. Fill
+// entries name SLOTS; the kernel maps slot -> world level-chunk under the
+// origins uploaded the same tick, so a backlogged entry always fills whatever
+// is currently resident in that slot — never stale space.
+//
+// EDIT PERSISTENCE (src/sim/faredits.h). The cascades are still DERIVED and
+// DISPOSABLE, but they are no longer derived from the seed alone: they are
+// derived from (seed + persisted edits). The sieve regenerates pristine
+// terrain, and PrepareTick hands each fill entry the cells the CPU's FarEdits
+// index says the player changed, which the same `far` workgroup re-applies.
+// Without it every refill — an incoming plane, a teleport, a world load —
+// healed the horizon back to procgen and the player's crater vanished.
+// FarEdits itself reconstructs from the ChunkStore region files, so nothing
+// here is authoritative and nothing here is saved.
 class FarField {
  public:
   void Init(World* world) { world_ = world; }
@@ -25,10 +36,15 @@ class FarField {
   // entirely stale (teleport, load) resets and refills wholesale.
   void Update(IVec3 playerChunk);
 
-  // Pop up to kFarListCap queued fills, upload farList (+ farUBO when origins
-  // changed), and return the dispatch count for this tick's
-  // TickParams.farCount / EncodeFarFill.
+  // Pop up to kFarListCap queued fills, upload farList + farPatch (+ farUBO
+  // when origins changed), and return the dispatch count for this tick's
+  // TickParams.farCount / EncodeFarFill. May pop FEWER than kFarListCap when
+  // this tick's patch payload budget (kFarPatchCap) is spent — the rest stay
+  // queued, exactly as they do when the dispatch cap is the binding one.
   uint32_t PrepareTick(const rhi::Queue& queue);
+
+  // Patch words uploaded by the last PrepareTick (diagnostics / selftest).
+  uint32_t LastPatchWords() const { return lastPatchWords_; }
 
   // Re-derive every origin around the player and refill all levels, coarsest
   // first so a horizon exists immediately (startup, load, regen).
@@ -68,4 +84,9 @@ class FarField {
   // as PrepareTick pops.
   uint32_t pending_[kFarLevels] = {};
   bool uboDirty_ = true;
+  // Reused across ticks so a fill-heavy frame does not reallocate: the header
+  // is 2 u32 per dispatched entry, the payload is the concatenated patch runs.
+  std::vector<uint32_t> patchHeader_;
+  std::vector<uint32_t> patchPayload_;
+  uint32_t lastPatchWords_ = 0;
 };
