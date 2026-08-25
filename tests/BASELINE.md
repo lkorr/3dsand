@@ -223,8 +223,39 @@ WP4): agent-ea1608, agent-fea2b6, agent-085345. The WP1 agent (agent-f65818)
 reported it passed at pure `tuning_params.def` values; the merge kept three
 user retunes (cohesion 32.9, attractSame 0, attractDiff -1.08) in
 `tuning.json`. The `fluid-stain` gate has the same structural weakness
-(unpinned fluid params) but is currently passing; it should be hardened the
-same way.
+(unpinned fluid params); it was passing when that was written and is now
+failing for the separate reason below.
+
+## `fluid-det`, `fluid-settle`, `fluid-excite`, `fluid-stain` — the stock-defaults retune (2026-08-24)
+
+**These four are INTENTIONAL and they are not yours.** Recorded `"fail"` at
+`987c595` ("Fluid stock defaults: the owner's chosen fast-water look"), whose
+own commit message says it outright:
+
+> stiffness 3600 -> 14000, gravity 98.1 -> 900, viscosity 0.1 -> 0 [...] the
+> clamp now engages [...] nothing settles at stock, hill capture 53.3% ->
+> 48.6%, **and the fluid-det and fluid-settle gates now fail**. The principled
+> way to make this look legal is MORE SUBSTEPS (>=9 at this stiffness), not
+> lower stiffness -- handed to WP3 along with the settle criteria.
+
+`fluid-excite` and `fluid-stain` are collateral from the same retune (they
+assert on settling behaviour that no longer occurs at stock). Note that
+`tuning.h` / `tuner_schema.js` carry a do-not-revert marker: **the defaults are
+a deliberate look choice, so "fixing" the gates by lowering stiffness is the
+wrong repair.** The fix is WP3's substep/CFL work.
+
+**Determinism is NOT implicated.** All four print `world hash matches`, and the
+golden hash `7cfa2420` is unmoved. What fails is a physical-behaviour
+assertion, not reproducibility.
+
+Cost of not recording this: three separate agents independently re-derived
+"the fluid gates aren't mine" on 2026-08-24 — the exact attribution ritual this
+file exists to retire.
+
+**Removal condition:** when WP3 lands (`agent-f65818`'s claim covers
+`sim_fluid.wgsl`, `sim_fluid_seam.wgsl`, `selftest_sim.cpp`, `lab.cpp`), run
+these four alone and flip each back to `"pass"` in the same commit. Do not
+delete this section — rewrite it to say what closed it.
 
 ## Updating
 

@@ -3291,6 +3291,26 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
   streaming both axes + depth, points of interest. *Exit: endless explorable world.*
 - **M8 — It's a game (vertical slice)**: enemies, health, a handful of spells built
   on projectile tags, alchemy v1 (reactions + status effects as content), death loop.
+
+  > **The gap, named precisely (2026-08-24).** M8's parts all exist — mobs with
+  > a steering layer (§"Mob steering"), avatar health + respawn, the spell VM,
+  > melee, items — and yet there is no game, because **`MobSystem` has no player
+  > awareness at all.** `DecideIntent`'s only sensor is a terrain probe: there
+  > is no target, no aggro state enum, and no previous-state field to difference
+  > against. **Mobs never attack.** The single `PlayClip("attack")` in the tree
+  > is a flinch played on *being hit*, not an attack the mob decides to make.
+  >
+  > This was found from an unexpected direction: the audio pass tried to wire
+  > the `idle` / `alert` / `attack` sound slots and discovered there is no event
+  > to hang them on (§12b). Those slots' `fires:` fields now record exactly what
+  > is missing, so the gap is visible at authoring time in the tuner instead of
+  > reading as a silent bug.
+  >
+  > So M8's first work package is a **sensing + target layer** on the intent
+  > side of the sense/intent/steer/drive split — not more content. `DecideIntent`
+  > is the seam and it is already the only place that decides; adding a target
+  > and a state enum there is where the `alert`/`attack` events, and the fight,
+  > both come from.
 - **M9 — It's online (prototype)**: choose lockstep vs. server-authoritative (§10)
   based on measured determinism (per-tick hashes across two GPU vendors) and
   bandwidth data; headless build, 2–4 player LAN test. *Everything before this was
