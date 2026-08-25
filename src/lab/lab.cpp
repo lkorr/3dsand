@@ -254,12 +254,23 @@ void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
                      target = {224, (float)(G + 8), 256}; break;
     case kLabFaucet: LabBoxViewCamera(blo, bhi, eye, target); break;
     case kLabPool:   LabBoxViewCamera(blo, bhi, eye, target); break;
-    // Slosh is a long shallow trough, not a box: the generic view works, but
-    // aim along the trough's LONG axis so the wave that runs end to end is the
-    // thing in frame.
-    case kLabSlosh:  LabBoxViewCamera(blo, bhi, eye, target);
-                     eye.z = (float)(blo.z + bhi.z) * 0.5f - 34.0f;
-                     break;
+    // Slosh is a long shallow trough (51 x 13), not a box. The generic
+    // diagonal eye does clear the rim, but it looks ALONG the trough, so the
+    // far half hides behind the near wall and a ~1-cell-deep sheet reads as
+    // nothing. Shoot it side-on instead: centred on the long axis, backed off
+    // across the SHORT one, which puts the whole end-to-end wave in frame.
+    // It also needs a STEEPER angle than the generic 1.6x margin: slosh's
+    // water is a ~1-cell sheet lying on the floor of a 15-tall trough, and
+    // clearing the rim by enough to see the floor CENTRE still leaves the near
+    // half of that sheet behind the near wall. 58/34 = 1.7 against a rim slope
+    // of 15/27.5 = 0.55, i.e. ~3x, which puts the whole floor in view.
+    case kLabSlosh: {
+      const float cx = 0.5f * (float)(blo.x + bhi.x);
+      const float cz = 0.5f * (float)(blo.z + bhi.z);
+      eye = {cx, (float)blo.y + 60.0f, cz - 34.0f};
+      target = {cx, (float)blo.y + 2.0f, cz};
+      break;
+    }
     default:         eye = {222, (float)(G + 30), 222}; break;
   }
   Vec3 d = target - eye;
