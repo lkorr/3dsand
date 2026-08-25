@@ -212,8 +212,15 @@ measured directly: `SANDVOX_CA_FORCE=1` defeats §3.4's settled skip so a
 SETTLED world still records all 54 CA iterations with an indirect count of
 **zero**, making the `ca(...)` row the pure content-free cost;
 `SANDVOX_CA_REPEAT=n` truncates the loop to n so the per-dispatch cost is a
-SLOPE, not an intercept. Both knobs live on the branch (`simulation.cpp`,
-`vk_record.cpp`), are env-gated and default-off. RTX 3060 Ti, seed 1337,
+SLOPE, not an intercept.
+
+**Only `SANDVOX_CA_FORCE` survived the merge to main** (`simulation.cpp`,
+env-gated, default-off, hash-neutral — it only ADDS no-op work).
+`SANDVOX_CA_REPEAT` was DELETED from `vk_record.cpp`: truncating the CA loop
+breaks the colour lattice and therefore the world hash, and a live switch for
+that in the hot record loop is not a thing rule 1 tolerates sitting in main.
+The numbers below stand; to re-measure the slope, recover the knob from branch
+`perf/ca-phase-skip` and delete it again afterwards. RTX 3060 Ti, seed 1337,
 `--measure` scenario (c), 120 ticks:
 
 | CA iterations recorded | `ca(...)` µs/tick |
