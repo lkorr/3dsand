@@ -33,8 +33,59 @@ constexpr int CX = 256, CZ = 256;
 // Per-tick pour ceiling in CELLS (8 particles each; kMaxFluidSpawnsPerTick /8).
 constexpr uint32_t kPourCellsPerTick = kMaxFluidSpawnsPerTick / 8;  // 512
 
-const char* kSceneNames[kLabSceneCount] = {"basin", "hill", "faucet", "pool",
-                                           "slosh"};
+const char* kSceneNames[kLabSceneCount] = {"basin", "hill",  "faucet",
+                                           "pool",  "slosh", "pond",
+                                           "worldlake"};
+
+// ---- the pond scenes (WP5) -------------------------------------------------
+// Sized from worldgen.wgsl, not from what fits: pondInfo picks a radius in
+// TUNE_POND_RADIUS_MIN .. +SPAN (68..127) and pondAt carves a parabolic bowl
+// TUNE_POND_DEPTH_RIM..TUNE_POND_DEPTH (3..26) deep. The water volume of the
+// SMALLEST such pond is
+//     integral over the disc of (3 + 23*(1 - d^2/r^2)) = 14.5*pi*r^2
+// = 210,600 voxels at r = 68. That is 1,684,800 eighths against a particle
+// pool of 262,144 — the smallest thing worldgen calls a pond is 6.4x
+// everything the solver can hold at once, and the largest is 22x. Every
+// number in WP5 is decided against that ratio, which is exactly why none of
+// the five pour scenes above could see the bug.
+constexpr int kPondDepth = 26;     // TUNE_POND_DEPTH
+constexpr int kPondDepthRim = 3;   // TUNE_POND_DEPTH_RIM
+int sPondRadius = 68;              // TUNE_POND_RADIUS_MIN
+
+// Bowl floor for a column d^2 from the centre of a radius-r pond, relative to
+// the waterline. The worldgen expression verbatim (integer, same truncation).
+int PondFloorBelowSurface(int d2, int r) {
+  return kPondDepthRim +
+         ((r * r - d2) * (kPondDepth - kPondDepthRim)) / (r * r);
+}
+
+// The drain, shared shape for both pond scenes: a 5x5 shaft from just under
+// the water down into a sealed chamber with room for a real fraction of the
+// body. Sealed on purpose — an open drain empties into cave systems and the
+// mass ledger stops being an audit.
+constexpr int kDrainHalf = 2;          // 5x5 shaft
+constexpr int kChamberHalf = 20;       // 40x40 interior
+constexpr int kChamberH = 20;          // 20 tall -> 32,000 voxels of capacity
+
+// `pond` lives on the slab: waterline is the slab's top row, so the pond is
+// flush with the ground exactly as worldgen's is.
+constexpr int kPondSurf = G - 1;                         // 127
+constexpr int kPondChamberTop = kPondSurf - kPondDepth - 12;   // 89
+constexpr int kPondChamberLo = kPondChamberTop - kChamberH + 1;
+
+// `worldlake` uses the authored lake in worldgen.wgsl genColumn: a disc at
+// (420,420) of radius 68 whose terrain is flattened to poolY = 44 and filled
+// to poolY + 24 = 68. ~348,600 water voxels (a cylinder, not a bowl — bigger
+// than any generated pond of the same radius). It is authored rather than
+// hash-placed, so it is at a KNOWN address in every seed, which is what makes
+// the main-world arm of this measurement a scripted, repeatable run instead
+// of a description of somebody flying around.
+constexpr int kLakeCX = 420, kLakeCZ = 420;
+constexpr int kLakeR = 68;
+constexpr int kLakeFloor = 44;        // poolY: terrain top inside the disc
+constexpr int kLakeSurf = 68;         // poolY + 24
+constexpr int kLakeChamberTop = 31;
+constexpr int kLakeChamberLo = kLakeChamberTop - kChamberH + 1;   // 12
 
 // The hill ramp: solid up to `G + 19 - drop(x)` for ramp x-offsets 0..31.
 // (dx*3)/5 steps 1 voxel down every 1-2 columns — a stepped ~31 deg slope,
@@ -44,11 +95,25 @@ constexpr int kHillRampX0 = 216;  // first ramp column
 constexpr int kHillRampX1 = 247;  // last ramp column (drop 18 -> surface G+1)
 int HillDrop(int x) { return ((x - kHillRampX0) * 3) / 5; }
 
-// Scene material at a world cell, or ~0u for "outside this scene's volume".
+// Scene material at a world cell, or ~0u for "outside this scene's volume"
+// (no CellOp is emitted at all — the cell keeps whatever worldgen put there).
 // One function per scene keeps the build list and the reset trivially the
 // same thing: LabSceneBuildOps just walks the volume and asks this.
-uint32_t SceneMatAt(int scene, int x, int y, int z) {
+uint32_t SceneMatAt(int scene, int x, int y, int z, uint32_t waterMat) {
   switch (scene) {
+    case kLabPond: {
+      const int r = sPondRadius;
+      const int dx = x - CX, dz = z - CZ;
+      const int d2 = dx * dx + dz * dz;
+      if (d2 > r * r) return ~0u;   // outside the disc: plain slab, untouched
+      const int floorY = kPondSurf - PondFloorBelowSurface(d2, r);
+      if (y <= floorY) return kMatStone;
+      if (y <= kPondSurf) return waterMat;
+      return kMatAir;
+    }
+    // worldlake builds NOTHING: worldgen already made the lake. The only
+    // scripted geometry is the plug (LabScenePlugOps).
+    case kLabWorldLake: return ~0u;
     case kLabBasin: {
       // Walled 24x24 box, walls 2 thick, 16 high. Interior [244,267]^2.
       if (y > G + 15) return kMatAir;
@@ -102,6 +167,26 @@ uint32_t SceneMatAt(int scene, int x, int y, int z) {
     }
   }
   return kMatAir;
+}
+
+// The volume LabSceneBuildOps enumerates. For the five pour scenes it IS the
+// scene bounds (unchanged behaviour). The pond scenes keep the two apart: the
+// mass-audit bounds have to reach down to the drain chamber, but enumerating
+// a 90-tall box over a 141-wide disc would be 1.8 M cells of which 97% are
+// untouched slab.
+void SceneBuildBox(int scene, IVec3& lo, IVec3& hi) {
+  if (scene == kLabPond) {
+    const int r = sPondRadius;
+    lo = {CX - r, kPondSurf - kPondDepth, CZ - r};
+    hi = {CX + r, G + 2, CZ + r};
+    return;
+  }
+  if (scene == kLabWorldLake) {   // worldgen builds it; nothing to enumerate
+    lo = {0, 0, 0};
+    hi = {-1, -1, -1};
+    return;
+  }
+  LabSceneBounds(scene, lo, hi);
 }
 
 // One cell's 8 spawn particles on the half-cell lattice with deterministic
@@ -271,6 +356,23 @@ void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
       target = {cx, (float)blo.y + 2.0f, cz};
       break;
     }
+    // The pond scenes have no walls to clear — the body is flush with the
+    // ground — so the constraint is different: stand off far enough that the
+    // whole disc is in frame, high enough that the surface reads as a surface
+    // and not as a horizon line. 1.5r back on the diagonal at 0.9r up is
+    // ~31 deg, which shows the far shore, the near shore and the drain
+    // dimple at once.
+    case kLabPond:
+    case kLabWorldLake: {
+      const float r = (float)(scene == kLabPond ? sPondRadius : kLakeR);
+      const float cx = (float)(scene == kLabPond ? CX : kLakeCX);
+      const float cz = (float)(scene == kLabPond ? CZ : kLakeCZ);
+      const float surf = (float)(scene == kLabPond ? kPondSurf : kLakeSurf);
+      const float k = 1.5f * r * 0.70710678f;
+      eye = {cx - k, surf + 0.9f * r, cz - k};
+      target = {cx, surf - 4.0f, cz};
+      break;
+    }
     default:         eye = {222, (float)(G + 30), 222}; break;
   }
   Vec3 d = target - eye;
@@ -279,19 +381,90 @@ void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
   pitch = std::atan2(d.y, flat);
 }
 
-void LabSceneBuildOps(int scene, uint32_t sceneTick, uint32_t /*waterMat*/,
+void LabSceneBuildOps(int scene, uint32_t sceneTick, uint32_t waterMat,
                       std::vector<CellOp>& out) {
-  // The whole build lands on scene tick 1: every scene volume is well under
-  // kMaxCellOpsPerTick (largest is hill at 57,400 of 65,536 — the carved
-  // catch basin added 10 y layers).
-  if (sceneTick != 1) return;
   IVec3 lo, hi;
-  LabSceneBounds(scene, lo, hi);
-  for (int y = lo.y; y <= hi.y; y++)
-    for (int z = lo.z; z <= hi.z; z++)
-      for (int x = lo.x; x <= hi.x; x++)
+  SceneBuildBox(scene, lo, hi);
+  if (hi.x < lo.x) return;                       // scene builds nothing
+  const uint64_t nx = (uint64_t)(hi.x - lo.x + 1);
+  const uint64_t nz = (uint64_t)(hi.z - lo.z + 1);
+  const uint64_t total = nx * nz * (uint64_t)(hi.y - lo.y + 1);
+  // The tick's slice of the volume, in a fixed enumeration order. Slicing on
+  // the RAW cell index rather than on emitted ops keeps the schedule a pure
+  // function of the box: a tick emits at most kMaxCellOpsPerTick, and which
+  // cells land on which tick cannot drift when SceneMatAt changes.
+  const uint64_t first = (uint64_t)(sceneTick - 1) * kMaxCellOpsPerTick;
+  if (sceneTick < 1 || first >= total) return;
+  const uint64_t last = std::min(first + kMaxCellOpsPerTick, total);
+  for (uint64_t i = first; i < last; i++) {
+    const int x = lo.x + (int)(i % nx);
+    const int z = lo.z + (int)((i / nx) % nz);
+    const int y = lo.y + (int)(i / (nx * nz));
+    const uint32_t m = SceneMatAt(scene, x, y, z, waterMat);
+    if (m == ~0u) continue;
+    // Liquids are born FULL. sim_mutate's brush path does this itself
+    // (LIQ_FULL_STATE), but a CellOp carries the whole word, and a state
+    // nibble of 0 is fullness 1 — a pond built that way would be an eighth of
+    // a pond and would collapse into films on the first tick.
+    uint32_t word = m & 0xFFFu;
+    if (m == waterMat) word |= 7u << 12;
+    out.push_back({World::SlotCellIndex({x, y, z}), word});
+  }
+}
+
+uint32_t LabSceneBuildEndTick(int scene) {
+  IVec3 lo, hi;
+  SceneBuildBox(scene, lo, hi);
+  if (hi.x < lo.x) return 0;
+  const uint64_t total = (uint64_t)(hi.x - lo.x + 1) *
+                         (uint64_t)(hi.y - lo.y + 1) *
+                         (uint64_t)(hi.z - lo.z + 1);
+  return (uint32_t)((total + kMaxCellOpsPerTick - 1) / kMaxCellOpsPerTick);
+}
+
+uint32_t LabScenePlugTick(int scene) {
+  // Late enough that the body is provably ASLEEP first: the build finishes,
+  // the CA (or, after the flip, nothing) settles it, and the bench records a
+  // stretch of zero live particles and zero active blocks. Without that
+  // stretch "the pond burst" and "the pond never settled" are the same curve.
+  if (scene == kLabPond) return LabSceneBuildEndTick(scene) + 60;
+  if (scene == kLabWorldLake) return 60;
+  return 0;
+}
+
+void LabScenePlugOps(int scene, std::vector<CellOp>& out) {
+  if (scene != kLabPond && scene != kLabWorldLake) return;
+  const bool pond = scene == kLabPond;
+  const int cx = pond ? CX : kLakeCX;
+  const int cz = pond ? CZ : kLakeCZ;
+  // Shaft: from the cell just under the body's floor down to the chamber.
+  const int shaftTop = pond ? kPondSurf - kPondDepthRim -
+                                  (kPondDepth - kPondDepthRim)   // bowl centre
+                            : kLakeFloor;
+  const int chamberTop = pond ? kPondChamberTop : kLakeChamberTop;
+  const int chamberLo = pond ? kPondChamberLo : kLakeChamberLo;
+  for (int y = chamberTop + 1; y <= shaftTop; y++)
+    for (int z = cz - kDrainHalf; z <= cz + kDrainHalf; z++)
+      for (int x = cx - kDrainHalf; x <= cx + kDrainHalf; x++)
+        out.push_back({World::SlotCellIndex({x, y, z}), kMatAir});
+  // Chamber, with a one-voxel stone shell. The shell matters on `worldlake`,
+  // where the surrounding rock is real terrain and can already be holed by a
+  // cave: an open drain would empty the lake into the cave system and the
+  // mass ledger would stop being an audit of the seam.
+  for (int y = chamberLo - 1; y <= chamberTop + 1; y++)
+    for (int z = cz - kChamberHalf - 1; z <= cz + kChamberHalf + 1; z++)
+      for (int x = cx - kChamberHalf - 1; x <= cx + kChamberHalf + 1; x++) {
+        const bool interior = y >= chamberLo && y <= chamberTop &&
+                              x >= cx - kChamberHalf && x <= cx + kChamberHalf &&
+                              z >= cz - kChamberHalf && z <= cz + kChamberHalf;
+        // The shaft punches through the shell's roof.
+        const bool underShaft = y == chamberTop + 1 &&
+                                x >= cx - kDrainHalf && x <= cx + kDrainHalf &&
+                                z >= cz - kDrainHalf && z <= cz + kDrainHalf;
+        if (underShaft) continue;   // already air, emitted above
         out.push_back({World::SlotCellIndex({x, y, z}),
-                       SceneMatAt(scene, x, y, z) & 0xFFFu});
+                       interior ? kMatAir : kMatStone});
+      }
 }
 
 void LabScenePour(int scene, uint32_t sceneTick, uint32_t liveEstimate,
@@ -327,6 +500,11 @@ uint32_t LabScenePourEnd(int scene) {
     case kLabFaucet: return ~0u;   // never stops
     case kLabPool:   return 109;
     case kLabSlosh:  return 6;     // 800 cells / 512 per tick from tick 5
+    // The pond scenes pour nothing. Their "input" is the standing body, and
+    // the event that matters is the plug — so that is what the tick-of-settle
+    // detector must run after.
+    case kLabPond:
+    case kLabWorldLake: return LabScenePlugTick(scene);
   }
   return 0;
 }
@@ -338,6 +516,11 @@ uint32_t LabSceneBenchTicks(int scene) {
     case kLabFaucet: return 600;
     case kLabPool:   return 500;
     case kLabSlosh:  return 500;
+    // Build + a settle window + 400 ticks (13 s) of drain. The burst is over
+    // in one tick; what takes time is finding out whether the seam gets back
+    // to a bounded live count or stays pinned at the pool ceiling.
+    case kLabPond:   return LabScenePlugTick(kLabPond) + 400;
+    case kLabWorldLake: return LabScenePlugTick(kLabWorldLake) + 400;
   }
   return 400;
 }
@@ -349,10 +532,28 @@ void LabSceneBounds(int scene, IVec3& lo, IVec3& hi) {
     case kLabFaucet: lo = {244, G, 244}; hi = {267, G + 26, 267}; return;
     case kLabPool:   lo = {246, G, 246}; hi = {265, G + 24, 265}; return;
     case kLabSlosh:  lo = {230, G, 249}; hi = {281, G + 15, 262}; return;
+    // The audit box has to contain the drain chamber as well as the body:
+    // "where did the water go" is the whole question these scenes ask, and a
+    // sweep that stops at the bowl floor answers it LEAK every time.
+    case kLabPond: {
+      const int r = sPondRadius;
+      lo = {CX - r - 2, kPondChamberLo - 2, CZ - r - 2};
+      hi = {CX + r + 2, G + 2, CZ + r + 2};
+      return;
+    }
+    case kLabWorldLake:
+      lo = {kLakeCX - kLakeR - 4, kLakeChamberLo - 2, kLakeCZ - kLakeR - 4};
+      hi = {kLakeCX + kLakeR + 4, kLakeSurf + 4, kLakeCZ + kLakeR + 4};
+      return;
   }
   lo = {0, 0, 0};
   hi = {0, 0, 0};
 }
+
+void LabSetPondRadius(int r) { sPondRadius = std::max(4, std::min(127, r)); }
+int LabPondRadius() { return sPondRadius; }
+
+bool LabSceneUsesLabWorld(int scene) { return scene != kLabWorldLake; }
 
 // ---- --fluid-bench ---------------------------------------------------------
 
@@ -366,7 +567,14 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     bool settleTuning = false;  // the fluid-excite gate's settle overrides
   };
   std::vector<BenchRun> runs;
-  if (sceneArg.empty() || sceneArg == "all") {
+  // `pond<N>` overrides the disc radius for the maximum-drainable-body sweep
+  // (plan §8's third instrumentation deliverable). The radius is scene state,
+  // not run state, so a sweep is one bench invocation per size.
+  if (sceneArg.rfind("pond", 0) == 0 && sceneArg.size() > 4 &&
+      std::isdigit((unsigned char)sceneArg[4])) {
+    LabSetPondRadius(std::atoi(sceneArg.c_str() + 4));
+    runs.push_back({kLabPond, 1, sceneArg});
+  } else if (sceneArg.empty() || sceneArg == "all") {
     for (int s = 0; s < kLabSceneCount; s++) {
       runs.push_back({s, 1, LabSceneName(s)});
       // The hill A/B at exciteMode 0 reproduces the reported mid-slope
@@ -378,12 +586,18 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     runs.push_back({kLabHill, 0, "hill0"});
   } else if (sceneArg == "pool-settle") {
     runs.push_back({kLabPool, 1, "pool-settle", true});
+  } else if (sceneArg == "pours") {   // the five pre-WP5 pour scenes only
+    for (int s = 0; s <= kLabSlosh; s++) {
+      runs.push_back({s, 1, LabSceneName(s)});
+      if (s == kLabHill) runs.push_back({s, 0, "hill0"});
+    }
+    runs.push_back({kLabPool, 1, "pool-settle", true});
   } else {
     int s = LabSceneFromName(sceneArg);
     if (s < 0) {
       std::fprintf(stderr,
                    "--fluid-bench: unknown scene '%s' (want basin|hill|hill0|"
-                   "faucet|pool|slosh|all)\n",
+                   "faucet|pool|slosh|pond[N]|worldlake|pours|all)\n",
                    sceneArg.c_str());
       return 1;
     }
@@ -470,6 +684,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     }
 
     sim.SetPassTimer(nullptr);  // a timed worldgen would dangle its queries
+    // `worldlake` is the MAIN-WORLD arm and must see real terrain: the flat
+    // slab has no lake. SetLabWorld gates both the shader's worldgen tap and
+    // the CPU TerrainHeight mirror, so it has to move before the worldgen
+    // submit and stay put for the whole run.
+    World::SetLabWorld(LabSceneUsesLabWorld(scene));
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     if (haveTimer) {
@@ -483,7 +702,58 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     Camera cam;
     cam.yaw = yaw;
     cam.pitch = pitch;
-    const IVec3 pc{CX / (int)kChunk, G / (int)kChunk, CZ / (int)kChunk};
+    // The CPU mirror follows this chunk; it must sit on the body being
+    // measured or the mirror-fed paths (and the streaming wake) look at the
+    // wrong half of the world.
+    const IVec3 pc =
+        scene == kLabWorldLake
+            ? IVec3{kLakeCX / (int)kChunk, kLakeSurf / (int)kChunk,
+                    kLakeCZ / (int)kChunk}
+            : IVec3{CX / (int)kChunk, G / (int)kChunk, CZ / (int)kChunk};
+
+    // ---- the standing-water sweep, hoisted -------------------------------
+    // Used twice on the pond scenes: once at the plug tick to establish what
+    // the body actually WAS (they pour nothing, so there is no spawn count to
+    // audit against), and once at the end. `basinOut` is the hill scene's
+    // catch-basin subtotal; null everywhere else.
+    const bool hasBasin = scene == kLabHill;
+    const IVec3 basinLo{248, G - 9, 248}, basinHi{269, G + 7, 263};
+    auto inBasin = [&](int x, int y, int z) {
+      return x >= basinLo.x && x <= basinHi.x && y >= basinLo.y &&
+             y <= basinHi.y && z >= basinLo.z && z <= basinHi.z;
+    };
+    auto sweepStanding = [&](uint64_t* basinOut) -> uint64_t {
+      IVec3 lo, hi;
+      LabSceneBounds(scene, lo, hi);
+      // AUDIT-ONLY widening: splash carries over a scene's walls and settles
+      // on the slab outside the build volume — WP4 recorded pool's ledger as
+      // LEAK for exactly this (53 eighths on the slab past the sweep). The
+      // scene geometry still builds from the tight bounds; only the mass
+      // audit looks wider.
+      lo.x -= 12; lo.z -= 12; hi.x += 12; hi.z += 12;
+      uint64_t total = 0;
+      std::vector<uint32_t> cbuf((size_t)kChunkVol);
+      for (int cy = lo.y / 16; cy <= hi.y / 16; cy++)
+        for (int cz = lo.z / 16; cz <= hi.z / 16; cz++)
+          for (int cx = lo.x / 16; cx <= hi.x / 16; cx++) {
+            ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                           cbuf.data(), "benchVox");
+            for (uint32_t i = 0; i < kChunkVol; i++) {
+              const int x = (int)(i % 16) + cx * 16,
+                        y = (int)((i / 16) % 16) + cy * 16,
+                        z = (int)(i / 256) + cz * 16;
+              if (x < lo.x || x > hi.x || y < lo.y || y > hi.y || z < lo.z ||
+                  z > hi.z)
+                continue;
+              if ((cbuf[i] & 0xFFFu) == waterId) {
+                const uint64_t e = ((cbuf[i] >> 12) & 0xFu) + 1u;
+                total += e;
+                if (basinOut && hasBasin && inBasin(x, y, z)) *basinOut += e;
+              }
+            }
+          }
+      return total;
+    };
 
     // Per-tick series. renderMs is the whole offscreen frame; the three
     // attribution series below are the WP4 render breakdown (plan §7 item 5).
@@ -507,10 +777,29 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     uint32_t liveEst = 0;
     uint32_t tick = 0;
 
+    const uint32_t plugTick = LabScenePlugTick(scene);
+    // The pond scenes' ledger input. Measured, not counted: the body is
+    // standing water placed by CellOps, and the tick before the plug is the
+    // only moment at which "how much water was there" has an unambiguous
+    // answer.
+    uint64_t plugStanding = 0;
+    uint32_t liveAtPlug = 0, livePeakAfterPlug = 0, peakTickAfterPlug = 0;
+    uint32_t liveAtPlugPlus1 = 0;
+    uint32_t idleTicksBeforePlug = 0;
+
     for (uint32_t st = 1; st <= N; st++) {
       const double f0 = NowSeconds();
       std::vector<CellOp> cops;
       LabSceneBuildOps(scene, st, waterId, cops);
+      if (plugTick != 0 && st == plugTick) {
+        plugStanding = sweepStanding(nullptr);
+        std::printf("    [t%u] plug pulled: %llu eighths standing (%llu water "
+                    "voxels), %u live particles, %u idle ticks first\n",
+                    st, (unsigned long long)plugStanding,
+                    (unsigned long long)(plugStanding / 8), liveEst,
+                    idleTicksBeforePlug);
+        LabScenePlugOps(scene, cops);
+      }
       std::vector<FluidSpawnOp> fs;
       LabScenePour(scene, st, liveEst, waterId, fs);
       SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, cops, false,
@@ -539,6 +828,20 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
                             128, "benchArgs");
       liveEst = std::min(fa[7], kFluidCap);  // exact after the WaitIdle
       liveCurve.push_back(liveEst);
+      // ---- the excite-burst meter (WP5, Risk B) ---------------------------
+      // The reported bug is a ONE-TICK spike, so a p50 and an end-state cannot
+      // see it and neither can `liveMax` alone once the scene also pours. What
+      // says "the whole lake converted at once" is the jump across the plug
+      // tick and how many ticks the peak took to arrive.
+      if (plugTick != 0) {
+        if (st < plugTick && liveEst == 0 && fa[3] == 0) idleTicksBeforePlug++;
+        if (st == plugTick) liveAtPlug = liveEst;
+        if (st == plugTick + 1) liveAtPlugPlus1 = liveEst;
+        if (st >= plugTick && liveEst > livePeakAfterPlug) {
+          livePeakAfterPlug = liveEst;
+          peakTickAfterPlug = st - plugTick;
+        }
+      }
       blockCurve.push_back(fa[3]);
       clampCurve.push_back(fa[18]);  // FA_CLAMPED: VMAX truncations this tick
       clampedSum += fa[18];
@@ -614,12 +917,6 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // standing water voxels plus particles still swimming there. This is the
     // quantitative form of "the water sheets down and arrives": mid-slope
     // freeze shows up directly as capture loss.
-    const bool hasBasin = scene == kLabHill;
-    const IVec3 basinLo{248, G - 9, 248}, basinHi{269, G + 7, 263};
-    auto inBasin = [&](int x, int y, int z) {
-      return x >= basinLo.x && x <= basinHi.x && y >= basinLo.y &&
-             y <= basinHi.y && z >= basinLo.z && z <= basinHi.z;
-    };
     uint64_t basinEighths = 0;
     uint64_t carriedEighths = 0;
     if (liveEst > 0) {
@@ -636,37 +933,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
           basinEighths += f;
       }
     }
-    uint64_t standingEighths = 0;
-    {
-      IVec3 lo, hi;
-      LabSceneBounds(scene, lo, hi);
-      // AUDIT-ONLY widening: splash carries over a scene's walls and settles
-      // on the slab outside the build volume — WP4 recorded pool's ledger as
-      // LEAK for exactly this (53 eighths on the slab past the sweep). The
-      // scene geometry still builds from the tight bounds; only the mass
-      // audit looks wider.
-      lo.x -= 12; lo.z -= 12; hi.x += 12; hi.z += 12;
-      std::vector<uint32_t> cbuf((size_t)kChunkVol);
-      for (int cy = lo.y / 16; cy <= hi.y / 16; cy++)
-        for (int cz = lo.z / 16; cz <= hi.z / 16; cz++)
-          for (int cx = lo.x / 16; cx <= hi.x / 16; cx++) {
-            ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
-                           cbuf.data(), "benchVox");
-            for (uint32_t i = 0; i < kChunkVol; i++) {
-              const int x = (int)(i % 16) + cx * 16,
-                        y = (int)((i / 16) % 16) + cy * 16,
-                        z = (int)(i / 256) + cz * 16;
-              if (x < lo.x || x > hi.x || y < lo.y || y > hi.y || z < lo.z ||
-                  z > hi.z)
-                continue;
-              if ((cbuf[i] & 0xFFFu) == waterId) {
-                const uint64_t e = ((cbuf[i] >> 12) & 0xFu) + 1u;
-                standingEighths += e;
-                if (hasBasin && inBasin(x, y, z)) basinEighths += e;
-              }
-            }
-          }
-    }
+    const uint64_t standingEighths = sweepStanding(&basinEighths);
+    // The pond scenes' ledger input is the body measured at the plug tick, not
+    // a spawn count — they pour nothing.
+    if (plugTick != 0) poured = plugStanding;
     const bool massExact = standingEighths + carriedEighths == poured;
     const double basinCapture =
         (hasBasin && poured) ? (double)basinEighths / (double)poured : -1.0;
@@ -709,6 +979,38 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         tickOfSettle, massExact ? "EXACT" : "LEAK",
         (unsigned long long)poured, (unsigned long long)standingEighths,
         (unsigned long long)carriedEighths);
+    // ---- THE EXCITE BURST (WP5 Risk B) ------------------------------------
+    // The user-visible bug in one line: how much of a still body converted to
+    // particles when the plug came out, how fast, and whether it hit the pool
+    // ceiling. `+1t` against `peak` is the whole diagnosis — a peak reached on
+    // the tick after the disturbance is a burst; a peak reached 200 ticks
+    // later is a drain.
+    if (plugTick != 0) {
+      const uint64_t bodyVox = plugStanding / 8;
+      std::printf(
+          "    excite burst: body %llu vox (%llu eighths) | live at plug %u -> "
+          "+1t %u -> peak %u at +%ut (%.1f%% of pool, %.1f%% of body) | frame "
+          "at peak p99 %.2f ms\n",
+          (unsigned long long)bodyVox, (unsigned long long)plugStanding,
+          liveAtPlug, liveAtPlugPlus1, livePeakAfterPlug, peakTickAfterPlug,
+          100.0 * (double)livePeakAfterPlug / (double)kFluidCap,
+          plugStanding ? 100.0 * (double)livePeakAfterPlug /
+                             (double)plugStanding
+                       : 0.0,
+          Pct(frameMs, 0.99));
+      // Frame percentiles over the DRAIN WINDOW only: the build ticks (tens of
+      // thousands of CellOps each) and the idle settle window would otherwise
+      // dominate a whole-run p50 and hide the thing being measured.
+      if (frameMs.size() > plugTick) {
+        std::vector<double> drain(frameMs.begin() + (size_t)plugTick - 1,
+                                  frameMs.end());
+        std::printf("    drain window frame ms: p50 %.2f p95 %.2f p99 %.2f "
+                    "max %.2f over %u ticks\n",
+                    Pct(drain, 0.50), Pct(drain, 0.95), Pct(drain, 0.99),
+                    *std::max_element(drain.begin(), drain.end()),
+                    (unsigned)drain.size());
+      }
+    }
     // The CFL-honesty probe (plan §5 item 1): node-substeps the VMAX clamp
     // truncated. Near-zero in steady flow is the acceptance; a persistent
     // count means the stiffness/substep budget is dishonest again.
@@ -821,6 +1123,26 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
                           [](uint32_t c) { return c != 0; })
          << "},\n";
     json << "    \"basinCapture\": " << basinCapture << ",\n";
+    if (plugTick != 0) {
+      std::vector<double> drain(
+          frameMs.begin() +
+              (size_t)std::min<uint32_t>(plugTick - 1, (uint32_t)frameMs.size()),
+          frameMs.end());
+      json << "    \"burst\": {\"plugTick\": " << plugTick
+           << ", \"bodyEighths\": " << plugStanding
+           << ", \"pondRadius\": " << (scene == kLabPond ? sPondRadius : 0)
+           << ", \"idleTicksBeforePlug\": " << idleTicksBeforePlug
+           << ", \"liveAtPlug\": " << liveAtPlug
+           << ", \"liveAtPlugPlus1\": " << liveAtPlugPlus1
+           << ", \"livePeak\": " << livePeakAfterPlug
+           << ", \"peakAtTicksAfterPlug\": " << peakTickAfterPlug
+           << ", \"drainFrameMs\": {\"p50\": " << Pct(drain, 0.50)
+           << ", \"p95\": " << Pct(drain, 0.95)
+           << ", \"p99\": " << Pct(drain, 0.99) << ", \"max\": "
+           << (drain.empty() ? 0.0
+                             : *std::max_element(drain.begin(), drain.end()))
+           << "}},\n";
+    }
     json << "    \"idleFluidMs\": " << idleFluidMs
          << ", \"idleFluidTicks\": " << idleFluidTicks << ",\n";
     json << "    \"massLedger\": {\"pouredEighths\": " << poured

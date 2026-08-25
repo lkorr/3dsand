@@ -40,23 +40,61 @@ enum LabScene {
   kLabFaucet,      // sustained pour: budget pressure, settle churn
   kLabPool,        // pour then still: the sleep scene
   kLabSlosh,       // channel wave: inertia/liveliness A/B
+  // ---- WP5's two scenes. Everything above pours PARTICLES into an authored
+  // box holding at most ~40,000 of them; none of them can reproduce the
+  // user-reported excite burst, because that bug is about SETTLED water —
+  // a still body many times the particle pool's size, disturbed from below.
+  kLabPond,        // worldgen-sized still bowl + a plug pulled underneath
+  kLabWorldLake,   // the SAME experiment on the real worldgen (labMode 0)
   kLabSceneCount,
 };
 
-// Name <-> id ("basin", "hill", "faucet", "pool", "slosh"). -1 if unknown.
+// Name <-> id ("basin", "hill", "faucet", "pool", "slosh", "pond",
+// "worldlake"). -1 if unknown.
 int LabSceneFromName(const std::string& name);
 const char* LabSceneName(int scene);
+
+// The pond scene's disc radius, in voxels. Worldgen's own range is
+// TUNE_POND_RADIUS_MIN..+SPAN = 68..127 (worldgen.wgsl pondInfo), and the
+// default here is the SMALL end of that — the point of the scene is that even
+// worldgen's smallest pond is ~210,000 water voxels, 6.4x the whole particle
+// pool. Settable so the "maximum drainable body size" sweep (plan §8) is one
+// bench argument (`--fluid-bench pond48`) rather than a rebuild.
+void LabSetPondRadius(int r);
+int LabPondRadius();
+
+// Does this scene run on the flat lab slab (true) or on the real worldgen
+// (false)? Only kLabWorldLake answers false — it is the main-world arm of the
+// pond measurement, and it must see actual terrain, caves and the authored
+// lake at (420,420).
+bool LabSceneUsesLabWorld(int scene);
 
 // Fixed per-scene camera/spawn pose (fly enabled in the windowed lab).
 void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch);
 
-// CellOps for scene tick `sceneTick` (1-based; the whole build lands on tick
-// 1 — every scene volume fits one kMaxCellOpsPerTick budget). The list covers
-// the scene's ENTIRE bounding volume, air cells included, which is what makes
-// re-submitting it the reset: every cell the scene (or its water) could have
-// touched is restored to the post-worldgen-plus-build state.
+// CellOps for scene tick `sceneTick` (1-based). The list covers the scene's
+// ENTIRE build volume, air cells included, which is what makes re-submitting
+// it the reset: every cell the scene (or its water) could have touched is
+// restored to the post-worldgen-plus-build state.
+//
+// The volume is enumerated in a fixed linear order and sliced
+// kMaxCellOpsPerTick per scene tick, so a build larger than one tick's op
+// budget simply takes more ticks. Every scene through `slosh` fits one slice
+// and still lands wholly on tick 1 (the largest, hill, is 57,400 of 65,536);
+// `pond` at r=68 is 563,430 cells and takes 9.
 void LabSceneBuildOps(int scene, uint32_t sceneTick, uint32_t waterMat,
                       std::vector<CellOp>& out);
+
+// Scene tick the build finishes on (the last tick LabSceneBuildOps emits
+// anything for). 1 for every pour scene.
+uint32_t LabSceneBuildEndTick(int scene);
+
+// The disturbance: the scene tick on which the plug is pulled (0 = this scene
+// has no plug), and the CellOps that pull it. For `pond` / `worldlake` this is
+// the whole experiment — a shaft and a sealed chamber carved out from under a
+// still body of water, i.e. "dig a hole under a pond".
+uint32_t LabScenePlugTick(int scene);
+void LabScenePlugOps(int scene, std::vector<CellOp>& out);
 
 // This scene tick's pour, as FluidSpawnOps. Budget charged BEFORE emission
 // (rule 2): a cell whose 8 particles do not fit under kFluidCap against
