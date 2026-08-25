@@ -199,11 +199,196 @@ Status GateCaSkip(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ca-slope ------------------------------------------------------------
+//
+// THE FOUNDING COMPLAINT, as a gate: *"on a hill it'll clump and settle on the
+// hill instead of flowing down."*
+//
+// No existing test measures that. `--fluid-bench hill0` is the closest, and it
+// cannot: WP3's settle veto refuses to convert perched water, so on the hill
+// scene ~95% of the mass stays MLS-MPM particles and the CA never receives it
+// (measured at cb1b4b9: 2,131 of 39,600 eighths standing). To ask whether the
+// CELLULAR AUTOMATON can carry water down a slope you have to hand the water to
+// the CA and nothing else, which is what this does — no particles, no seam, no
+// solver, just voxel water on a stepped stone ramp.
+//
+// THE GEOMETRY IS THE POINT. Treads are TWO cells wide with a one-voxel riser,
+// the dominant shape of the lab hill's ~31 deg ramp (HillDrop steps 1 voxel
+// every 1-2 columns). A 2-wide tread is the exact case the old rules could not
+// drain: the tread's INNER cell has stone below it and stone on both
+// down-diagonals, so its only exit is one lateral step to the lip — which the
+// old `f >= 2` gate refuses the moment the cell is down to its last eighth, and
+// lateral spread is repeated halving, so every cell reaches its last eighth.
+//
+// THREE THINGS ARE ASSERTED, and the third is as load-bearing as the first:
+//   1. MASS is exact — eighths in == eighths out. Every path through the
+//      liquid rules moves eighths through transferLiquid/tryMove or it is a
+//      leak, and a "drained" ramp that lost its water is not a pass.
+//   2. The water ARRIVES: >= 90% of the poured eighths end in the catch basin.
+//   3. The box goes IDLE — every chunk of the structure asleep. Mobility that
+//      costs the sleep guarantee is not a fix, it is CLAUDE.md rule 2 traded
+//      for a screenshot, so the drain and the sleep are one verdict.
+Status GateCaSlope(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  // Pin DIM DAWN, for the reason the fluid-settle gate records: freezing needs
+  // night and evaporation needs minLight 120, so both authored water sinks are
+  // off and the mass audit is exact. A roof does NOT substitute — `seesSky`
+  // probes one cell up and water is not a ray blocker, so a stacked column
+  // sees sky through its own surface.
+  Tuning dawn = CurrentTuning();
+  dawn.dayNight.freeze = 1;
+  dawn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(dawn);
+
+  // Same neighbourhood the flung-liquid and fluid-settle gates use: known to
+  // sit inside the residency window with nothing else going on around it.
+  const int px = 96, py = 120, pz = 96;
+  const int kTreads = 8;     // 2-wide treads, one voxel of drop each
+  const int kDeck = 4;       // deck length in x — the pour lands here
+  const int kW = 6;          // channel interior width in z
+  const int kPit = 4;        // catch basin depth below the last tread
+  const int kBasin = 8;      // catch basin length in x
+  const int kTicks = 400;
+
+  const int rampX0 = px + kDeck;
+  const int basinX0 = rampX0 + 2 * kTreads;
+  const int basinX1 = basinX0 + kBasin - 1;
+  const int pitFloor = py - 1 - kTreads - kPit;
+  const int floorY = pitFloor - 2;          // 2 cells of stone under the pit
+  const int roofY = py + 6;
+  const int x0 = px - 2, x1 = basinX1 + 2;
+  const int z0 = pz - 2, z1 = pz + kW + 1;
+
+  // The solid top of the column at x, or `floorY - 1` for the open pit floor.
+  auto columnTop = [&](int x, int z) -> int {
+    if (z < pz || z >= pz + kW) return roofY;          // channel side walls
+    if (x < px) return roofY;                          // back wall
+    if (x > basinX1) return roofY;                     // far wall
+    if (x < rampX0) return py;                         // pour deck
+    if (x < basinX0) return py - 1 - (x - rampX0) / 2; // the stepped ramp
+    return pitFloor;                                   // catch basin floor
+  };
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // ---- build: stone where the structure is, AIR everywhere else in the box,
+  // so the chamber is clean whatever worldgen put here. A roof over the whole
+  // thing keeps anything falling from above out of the audit.
+  std::vector<CellOp> build;
+  for (int z = z0; z <= z1; z++)
+    for (int x = x0; x <= x1; x++) {
+      const int top = columnTop(x, z);
+      for (int y = floorY; y <= roofY + 1; y++) {
+        const bool solid = y <= top || y >= roofY;
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         solid ? (uint32_t)kMatStone : 0u});
+      }
+    }
+
+  // ---- the pour: full water cells standing on the deck. Liquids carry
+  // fullness in the state nibble, and 7 is "8 eighths" (LIQ_FULL_STATE).
+  std::vector<CellOp> pour;
+  for (int y = py + 1; y <= py + 4; y++)
+    for (int z = pz; z < pz + kW; z++)
+      for (int x = px; x < px + kDeck; x++)
+        pour.push_back({World::SlotCellIndex({x, y, z}),
+                        (waterId & 0xFFFu) | (7u << 12)});
+  const uint32_t poured = (uint32_t)pour.size() * 8u;
+
+  // The chunks the structure occupies — the idle check is LOCAL, because the
+  // rest of the generated world is still settling from worldgen at these tick
+  // counts and would swamp a global count.
+  std::vector<uint32_t> boxChunks;
+  for (int cz = z0 >> 4; cz <= (z1 >> 4); cz++)
+    for (int cy = floorY >> 4; cy <= ((roofY + 1) >> 4); cy++)
+      for (int cx = x0 >> 4; cx <= (x1 >> 4); cx++)
+        boxChunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+
+  uint32_t t = 30000;
+  int quietAt = -1;
+  uint32_t activeInBox = 0;
+  for (int i = 0; i < kTicks; i++) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
+               i == 0   ? build
+               : i == 2 ? pour
+                        : std::vector<CellOp>{},
+               false, {6, 7, 6}, false, false);
+    if (i >= 10 && i % 10 == 0) {
+      ctx.WaitIdle();
+      std::vector<uint32_t> flags(kNumChunks, 0);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                            flags.data(), kNumChunks * 4, "slopeActive");
+      activeInBox = 0;
+      for (uint32_t ci : boxChunks)
+        if (flags[ci] != 0) activeInBox++;
+      if (activeInBox == 0 && quietAt < 0) quietAt = i;
+    }
+  }
+  ctx.WaitIdle();
+
+  // ---- where did the water end up? ----------------------------------------
+  uint64_t deckE = 0, rampE = 0, basinE = 0, elseE = 0;
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cz = z0 >> 4; cz <= (z1 >> 4); cz++)
+      for (int cy = floorY >> 4; cy <= ((roofY + 1) >> 4); cy++)
+        for (int cx = x0 >> 4; cx <= (x1 >> 4); cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         cbuf.data(), "slopeVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != waterId) continue;
+            const int x = (int)(k % 16) + cx * 16,
+                      y = (int)((k / 16) % 16) + cy * 16,
+                      z = (int)(k / 256) + cz * 16;
+            if (x < x0 || x > x1 || y < floorY || y > roofY + 1 || z < z0 ||
+                z > z1)
+              continue;
+            const uint64_t e = ((cbuf[k] >> 12) & 0xFu) + 1u;
+            if (x >= basinX0) basinE += e;
+            else if (x >= rampX0) rampE += e;
+            else if (x >= px) deckE += e;
+            else elseE += e;
+          }
+        }
+  }
+  SetCurrentTuning(saved);
+
+  const uint64_t total = deckE + rampE + basinE + elseE;
+  const bool massOk = total == poured;
+  const double drain = poured ? (double)basinE / (double)poured : 0.0;
+  const bool drainOk = drain >= 0.90;
+  const bool idleOk = activeInBox == 0;
+  const bool ok = massOk && drainOk && idleOk;
+
+  detail = Format(
+      "%llu eighths poured on the deck, %.1f%% reached the basin (%llu basin / "
+      "%llu ramp / %llu deck / %llu outside), mass %s, %u of %zu structure "
+      "chunks awake at tick %d (quiet from %d)",
+      (unsigned long long)poured, drain * 100.0,
+      (unsigned long long)basinE, (unsigned long long)rampE,
+      (unsigned long long)deckE, (unsigned long long)elseE,
+      massOk ? "EXACT" : "LEAK", activeInBox, boxChunks.size(), kTicks,
+      quietAt);
+  std::printf("ca-slope: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& CaGates() {
   static const std::vector<Gate> g = {
       {"ca-skip", "sim", {}, false, GateCaSkip},
+      {"ca-slope", "sim", {}, false, GateCaSlope},
   };
   return g;
 }

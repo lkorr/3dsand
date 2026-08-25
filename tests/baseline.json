@@ -4,6 +4,7 @@
   "determinismHash": "7cfa2420",
   "determinism": "pass",
   "sleep": "pass",
+  "ca-slope": "pass",
   "evaporation": "pass",
   "blood-stain": "pass",
   "flung-liquid": "pass",

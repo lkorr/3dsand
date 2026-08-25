@@ -48,7 +48,7 @@ const std::vector<Gate>& SpellGates();
 // missing from this list is a link-time-visible mistake (it never runs), which
 // is the failure mode we want rather than one that runs in an arbitrary slot.
 const char* const kOrder[] = {
-    "determinism", "sleep",       "ca-skip",     "evaporation",
+    "determinism", "sleep",       "ca-skip",     "ca-slope",    "evaporation",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
