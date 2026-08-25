@@ -298,6 +298,73 @@ The honest fix is the gate's, not the seam's: either give the chamber somewhere
 to dissipate energy, or stop asserting near-total resettlement of a sealed box
 at 9x gravity. Left for whoever owns the sealed-box fixtures.
 
+## `ca-slope-hybrid` — a settle mass leak, proportional to settle commits
+
+Recorded 2026-08-25 with WP5's flip of `sim.fluidExciteMode` to 1. The gate is
+new in the same commit, so this entry is the finding rather than a regression
+report: `ca-slope-hybrid` runs merge a2e723e's ramp script with BOTH movers
+live, and its first run found a mass leak in the seam's settle path.
+
+    768 eighths poured on the deck
+    end state: 1 basin + 36 deck standing, 586 carried by 586 particles
+    145 eighths UNACCOUNTED
+    seam over the run: 955 excited -> 955 emitted, 369 settled, 369 dead,
+                       0 refused, 0 eaten by reactions
+    the ledger is exact until tick 170, then parts by 18 and grows to 145
+
+WHAT IT IS NOT, each ruled out by measurement rather than by argument:
+
+* **Not excite.** `FA_EXCITED == FA_EMITTED` exactly (955 == 955) and
+  `FA_SETTLED == FA_DEAD` exactly (369 == 369). Both converters balance their
+  own books; the eighths leave the VOXEL grid without either of them recording
+  that it took them.
+* **Not reactions.** `FA_CONSUMED` is 0 for the whole run, and the gate pins
+  dim dawn so evaporation and freezing are both off.
+* **Not a mis-scoped audit.** Excited water is ballistic in a way CA water
+  never is, so the sweep was widened by 12 cells in x/z and 8 in y past the
+  structure — the classic failure mode, and the one WP4 hit on the lab `pool`
+  scene. It finds nothing: `elseE` is 0.
+* **Not the CA.** The `ca-slope` arm runs the identical script with excite
+  pinned off and reports mass EXACT, 95.3% in the basin, box asleep.
+* **Not introduced by the flip.** The gate sets `exciteMode` itself, so its
+  verdict does not depend on the shipped default. The same seam code at
+  a2e723e fails it too.
+
+WHAT IT IS: the leak scales with SETTLE ACTIVITY. Run with the perch trigger
+on — which re-excites almost everything settle produces — settle commits 8
+eighths over 400 ticks and the leak is 6. With it off, settle commits 369 and
+the leak is 145. That is ~0.4 eighths lost per settle commit either way, and it
+localizes the bug to `settleColumn` / `settleApply` in `sim_fluid_seam.wgsl`.
+Not root-caused further: the obvious candidate, two vertically adjacent blocks
+racing on the SPILL cells, is explicitly guarded by the adjacency exclusion.
+
+Why it is not visible elsewhere: the large-body scenes barely settle at all.
+`--fluid-bench pond68` commits 3 settle blocks over 469 ticks and
+`worldlake` 18 over 460, and both report mass EXACT. It takes a small sealed
+box that settles and re-excites continuously to accumulate a visible loss.
+
+The gate stays RED on purpose. It is the thing that will verify the fix, and
+its acceptance (mass exact, >=90% arriving, box asleep) is the right one — the
+seam should meet it.
+
+## `fluid-react` — no ledger term for SETTLED water eaten by reactions
+
+Pre-existing at a2e723e, whose merge message names it: "fluid-react left red:
+gate blind spot (no settled-consumption ledger term)". Recorded here at WP5
+because the entry was missing while the gate was already failing, which is the
+one state this file must not be in.
+
+    430 standing + 874 live + 1228 consumed of 2704 placed -> 172 unaccounted
+
+`FA_CONSUMED` counts excited neighbours killed by `consumeApply`. `doReactions`
+in `sim_step.wgsl` also overwrites SETTLED water, and nothing counts that, so
+the gate's ledger is short by however much of the consumption happened on the
+CA side of the seam. Verified independent of WP5: it fails identically at
+`exciteMode` 0.
+
+The fix needs a counter inside `doReactions`, which is in `sim_step.wgsl` —
+out of scope for the WP5 branch by explicit instruction. Queued.
+
 ## Updating
 
 After fixing a gate, run it alone, confirm it passes, and flip its entry to

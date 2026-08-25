@@ -585,10 +585,14 @@ PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_
 // C_CAACTIVE: detect runs over THIS tick's compacted dirty list; when the CA
 // proved the world settled the list was not rebuilt and there is nothing
 // disturbed to excite.
+// A(FluidArgsStage): the WP5 excite-REACH probe (FA_EXSEEN / FA_EXCANDID).
+// Diagnostic counters, but they are still atomics into a buffer half the fluid
+// pipeline reads, so the row declares them like any other access — an omitted
+// read here is an invisible cross-vendor hazard, not a missing statistic.
 PASS(seam_excite_detect, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_DETECT, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_CAACTIVE, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) R(DirtyList)
           R(FluidBlockMap) R(FluidGrid) A(FluidExciteScratch)
-          I(DispatchArgs)))
+          A(FluidArgsStage) I(DispatchArgs)))
 PASS(seam_excite_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) A(FluidExciteScratch) A(FluidArgsStage)))
 // The emit dispatch is list-shaped (one workgroup per candidate slot):

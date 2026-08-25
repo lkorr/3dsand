@@ -961,6 +961,14 @@ const FA_STAINED   : u32 = 17u;
 const FA_CLAMPED   : u32 = 18u;
 const FA_SETREFUSED : u32 = 25u;
 const FA_SETUNSTABLE : u32 = 26u;
+// WP5 excite-reach probe. "Nothing excited" has three completely different
+// causes and only these two words tell them apart: SEEN counts settled
+// seam-liquid cells exciteDetect actually LOOKED at (zero means the chunk was
+// never in the dirty list — a WAKE problem), CANDID counts the ones that
+// satisfied a trigger (SEEN high, CANDID zero means a TRIGGER problem).
+// FA_REFUSED then covers the third case, the budget.
+const FA_EXSEEN    : u32 = 27u;
+const FA_EXCANDID  : u32 = 28u;
 // Byte offsets of the two arg triples are what pass_table.def's copy rows use;
 // keep the three in step (76 = 19*4, 88 = 22*4).
 const FA_ARGS_COMPACT : u32 = 19u;

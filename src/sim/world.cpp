@@ -139,9 +139,18 @@ void World::Init(const rhi::Device& device) {
   // Seam scratch (layouts documented at the members in world.h). The excite
   // scratch is 16 header words + counts + bases + the slot list; the settle
   // scratch is speed maxima + marks + the settle list + the bins.
+  // CopySrc is not decoration: pass_table's `copy_exciteArgs` row stages the
+  // emit dispatch's args OUT of this buffer's header (TR(FluidExciteScratch)
+  // -> TW(FluidPDispatchArgs)), so it is a transfer SOURCE. Missing since the
+  // seam landed and invisible until now, because --vk-smoke's two scenarios
+  // never had live fluid and PT_FLUIDSEAM is only recorded when they do;
+  // WP5's flip of sim.fluidExciteMode is what finally gave the smoke water to
+  // excite, and validation answered immediately with 10x
+  // VUID-vkCmdCopyBuffer-srcBuffer-00118.
   fluidExciteScratch = CreateBuffer(device,
                                     (uint64_t)(16 + 3 * kNumChunks) * 4,
-                                    U::Storage | U::CopyDst, "fluidExciteScratch");
+                                    U::Storage | U::CopySrc | U::CopyDst,
+                                    "fluidExciteScratch");
   fluidCalm = CreateBuffer(device, (uint64_t)kNumChunks * 4,
                            U::Storage | U::CopyDst, "fluidCalm");
   fluidSettleScratch = CreateBuffer(

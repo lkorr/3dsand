@@ -1422,8 +1422,8 @@ int main(int argc, char** argv) {
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
           "  --time <0..1>         Time of day for --shot (0=midnight, 0.5=noon)\n\n"
           "Fluid lab:\n"
-          "  --lab [scene]         Windowed fluid lab (scene: basin|hill|faucet|pool|slosh)\n"
-          "  --fluid-bench [scene] Headless fluid timing harness (scene|all)\n\n"
+          "  --lab [scene]         Windowed fluid lab (basin|hill|faucet|pool|slosh|pond|worldlake)\n"
+          "  --fluid-bench [scene] Headless fluid timing harness (scene|pond<N>|pours|all)\n\n"
           "Harness / perf:\n"
           "  --frames <N>          Run windowed game for N frames then exit\n"
           "  --autofly             Enable autofly camera\n"
@@ -1609,10 +1609,16 @@ int main(int argc, char** argv) {
   const int labScene = labFlag ? LabSceneFromName(labSceneName) : -1;
   if (labFlag && labScene < 0) {
     std::fprintf(stderr, "--lab: unknown scene '%s' (want basin|hill|faucet|"
-                 "pool|slosh)\n", labSceneName.c_str());
+                 "pool|slosh|pond|worldlake)\n", labSceneName.c_str());
     return 1;
   }
-  if (labFlag || fluidBench) World::SetLabWorld(true);
+  // `worldlake` is the one lab scene that runs on the REAL worldgen — it is
+  // the main-world arm of the pond measurement and its water is worldgen's
+  // authored lake, not a scripted box. --fluid-bench re-decides this per run
+  // (it may mix lab and world scenes in one invocation); this is the windowed
+  // path's answer.
+  if (labFlag) World::SetLabWorld(LabSceneUsesLabWorld(labScene));
+  else if (fluidBench) World::SetLabWorld(true);
 
   // --list is pure metadata: answering it before any device or asset init
   // means an agent can ask "what gates exist" without a GPU or a built world.
@@ -3297,6 +3303,10 @@ int main(int argc, char** argv) {
       if (labScene >= 0) {
         labTick++;
         LabSceneBuildOps(labScene, labTick, fluidCueMat, cellOps);
+        // The pond scenes' whole experiment: a still body, then a plug pulled
+        // from under it. Same op stream as the build, so L replays it.
+        if (LabScenePlugTick(labScene) == labTick)
+          LabScenePlugOps(labScene, cellOps);
         LabScenePour(labScene, labTick, fluidCount, fluidCueMat, fluidSpawns);
       }
       // laser kerf into a body, deferred from the input block above so it can

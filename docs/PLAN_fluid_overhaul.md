@@ -445,18 +445,71 @@ run.sh always, check tasklist, measure twice.)
 
 ---
 
-## 8. WP5 — Phase 3 of the plan of record (the flip)
+## 8. WP5 — the flip (RE-SCOPED; the deletion is REJECTED)
 
-Only after WP1–WP4 are green and the user has visually signed off the lab
-scenes: delete the CA liquid movement rules (`stepLiquid`'s move branches,
-`canFlowAnywhere`'s liquid arm), flip `sim.fluidExciteMode` default to 1,
-rebaseline the pinned world hash 7cfa2420 (this is THE hash-moving commit —
-its own change, nothing else in it), re-baseline affected gates, update
-DESIGN.md §4/§5 in the same commit, mark this plan and the relevant sections
-of PLAN_mpm_fluids.md historical. Persistence stays as designed (saves
-force-settle; excite reconstructs on disturbance). PLAN_mpm_fluids.md Phases
-4–7 (occupancy/mirror integration, rigid coupling, audio, content) continue
-after, unchanged.
+**Status: LANDED 2026-08-25.** World hash 7b01cfd8 -> 58b27f33.
+
+### 8.0 What this section used to say, and why it is wrong
+
+> Only after WP1-WP4 are green and the user has visually signed off the lab
+> scenes: delete the CA liquid movement rules (`stepLiquid`'s move branches,
+> `canFlowAnywhere`'s liquid arm), flip `sim.fluidExciteMode` default to 1,
+> rebaseline the pinned world hash 7cfa2420 (this is THE hash-moving commit -
+> its own change, nothing else in it), re-baseline affected gates, update
+> DESIGN.md 4/5 in the same commit, mark this plan and the relevant sections
+> of PLAN_mpm_fluids.md historical.
+
+**THE DELETION IS REJECTED.** `docs/RESEARCH_water_architecture.md` 7 records
+the reasoning and merge a2e723e records the code. In one line: MPM-only bulk
+transport is dead on arithmetic - a 10x10x2 m lake is ~1.6M particles ~= 126
+ms/tick, and that ceiling belongs to the METHOD, not to this implementation.
+The four defects that made the CA look like a dead end were rules bugs, and
+fixing them was the cheapest win in this document:
+
+* `if (f >= 2u)` - a fullness-1 cell could never spread laterally
+* `liquidEqualize = 2` - a 1-eighth staircase was a stable equilibrium
+* whole-cell down-diagonals, 4 directions, no corners
+* the settled path never re-marked its chunk, so it slept and never retried
+
+The ratified architecture is the HYBRID: **the CA owns supported bulk water,
+the MPM owns water with momentum**, split by STATE rather than by material.
+The `ca-slope` gate holds the CA half at 95.3% of a pour arriving down a
+stepped ramp with the box asleep.
+
+What SURVIVED from the original wording is the flip itself, its bound, and the
+narrowing of the excite predicate.
+
+### 8.1 What landed
+
+1. **Two bench scenes the old lab could not express** (`pond`, `worldlake`),
+   sized from worldgen's own `pondAt` / the authored lake rather than from what
+   fits in a box, with a plug-pull event and frame p95/p99 over the DRAIN
+   WINDOW. `--fluid-bench wp5` / `wp5b` are the sweeps; a DRAIN COMPLETION line
+   (eighths delivered to a sealed chamber) is the criterion frame time cannot
+   express. `--fluid-bench <scene>-ceil<N>-perch<0|1>-ex<0|1>` parameterizes a
+   run, so an A/B is one binary invocation.
+2. **The burst bound**: `sim.fluidExciteCeiling` (8,000 particles) and
+   `sim.fluidExciteRate` (4,096/tick). Sized by measurement - see 9's WP5
+   block. Refusal is graceful for free, because refused water is still settled
+   water and the CA moves settled water.
+3. **`sim.fluidExciteMode` = 1**, its own commit, with the rebaseline, the
+   affected gate baselines and the smoke probes.
+4. **`sim.fluidExcitePerch` = 0**, measured, not assumed: with the CA fixed the
+   perch trigger contributes byte-identical candidate counts on both large
+   water scenes, and on a sealed ramp it prevents water from ever settling.
+5. **`ca-slope-hybrid`**, a new gate: merge a2e723e's ramp script with BOTH
+   movers live. It is RED, and it found a real settle mass leak - see
+   `tests/BASELINE.md`.
+
+### 8.2 What is left
+
+* The settle mass leak `ca-slope-hybrid` found (~0.4 eighths per settle
+  commit, in `settleColumn`/`settleApply`). Diagnosed, not fixed.
+* `fluid-react`'s missing settled-consumption ledger term. The counter belongs
+  inside `doReactions` in `sim_step.wgsl`, which this branch was instructed
+  not to touch.
+* Persistence stays as designed (saves force-settle; excite reconstructs on
+  disturbance). PLAN_mpm_fluids.md Phases 4-7 continue after, unchanged.
 
 ---
 
@@ -997,6 +1050,101 @@ Acceptance (this tree): full `--selftest` **PASS**, determinism **7cfa2420**,
 differential on determinism + the three fluid gates: identical hashes and
 identical numbers. `check_invariants.py`, `check_pass_table.py`,
 `check_shaders.sh`: all OK.
+
+---
+
+### WP5 results (2026-08-25) — the flip, re-scoped
+
+Branch `worktree-wp5-fluid-flip` off a2e723e. World hash **7b01cfd8 ->
+58b27f33**, twice-run equality holding, and the same hash on both residencies.
+The deletion half of the WP is REJECTED (see 8.0). All frame numbers are the
+DRAIN WINDOW (400 ticks after the plug), not whole-run.
+
+**The pond puncture, `pond68` — worldgen's SMALLEST disc pond, r=68, 203,298
+water voxels = 1,626,384 eighths = 6.4x the whole particle pool.** Built, let
+go provably asleep (68 idle ticks, zero live particles AND zero active blocks),
+then a 5x5 shaft opened into a sealed 40x40x20 chamber.
+
+    arm                      p50    p95    p99   live peak   drained   mass
+    ex0 (CA alone)          10.28  10.88  11.25         0     6,320   EXACT
+    excite, ceiling 8,000   14.51  15.63  16.03     5,700     6,336   EXACT
+    excite, ceiling 262,144 14.56  15.62  16.00     5,700     6,336   EXACT
+
+The pond never reaches ANY ceiling (0 slots refused even with the bound lifted
+to the pool), so it cannot price the bound - which is why `worldlake` exists.
+
+**The lake puncture, `worldlake` — the REAL worldgen, labMode 0, against
+genColumn's authored lake at (420,420): 347,832 water voxels.** This is the
+scene the reported bug lives on.
+
+    ceiling      p50    p95    p99   live peak    at   drained  of which settled
+    CA only     15.00  15.87  17.12         0      -    70,743     70,743
+      4,000     23.43  24.93  26.21     4,000   +78t    73,672     71,479
+      8,000     25.05  27.13  28.60     8,000   +46t    72,996     69,937
+     16,000     27.10  28.82  29.86    16,000  +105t    74,572     70,195
+     32,000     33.23  34.80  36.22    32,000   +24t    75,599     70,145
+    262,144     69.34  72.28  73.74   262,144   +91t   102,402     82,991
+
+Mass EXACT in every row. Three findings, in order of how much they change the
+design:
+
+1. **Fixing the CA did NOT dissolve the burst.** With the bound lifted the lake
+   still converts the entire 262,144-particle pool and holds ~70 ms/frame to
+   end of run. The mechanism is not an excite bug: a DRAINING CA leaves a
+   transient gap under cells all over the body, and trigger (a) is "air below"
+   - 169,616 candidates over 400 ticks from a hole 25 cells wide.
+2. **Drain throughput is FLAT from 4k to 32k**, and ~97% of what arrives
+   arrives as SETTLED voxels. The CA is doing the transport in every bounded
+   row; the seam is a splash at the hole. So the ceiling costs COVERAGE, never
+   progress, and refusal is graceful with no fallback machinery: at ceiling
+   4,000 the run refused 2,090 slots and still out-delivered the CA-only arm.
+3. **There is no maximum drainable body size, only a drain TIME.** 400 ticks
+   moves 2.5-2.7% of a 347,832-voxel lake either way. What the ceiling buys is
+   how much of it you can SEE moving.
+
+Shipped: `sim.fluidExciteCeiling` = **8,000** - the cheapest value that still
+clears the largest peak any scene reaches unforced (pond68's own 5,700), so it
+never clips a body that was not going to burst. `sim.fluidExciteRate` = 4,096,
+non-binding at that ceiling (the lake ramps at ~174/tick), kept as the guard
+for a blast that exposes thousands of cells at once with the ceiling raised.
+
+**The trigger question (b)/(c), answered by measurement.** perch 1 vs 0,
+everything else equal:
+
+    scene       candidates      emitted        outcome
+    pond68      1,150 / 1,150   7,729 / 7,729  byte-identical
+    worldlake   169,616 / same  35,158 / same  byte-identical, p50 33.23/33.13
+    hill        1,461 / 1,064   1,953 / 1,619  basin capture 50.9% / 51.7%
+
+Identical on both settled-water scenes; on the ramp it is a fraction of a point
+and in the WRONG direction. It costs 24% of seam time (fluidSeam 0.230 ->
+0.174 ms on pond68). And the decisive one, from `ca-slope-hybrid`: with the
+perch trigger ON, settle commits **8** eighths over 400 ticks; with it off,
+**369**. It takes back everything settle produces - the settle<->wake thrash,
+arriving through the trigger rather than the wake speed. Shipped OFF. The code
+stays behind a knob because `settleCheck`'s veto must keep evaluating the full
+predicate.
+
+WARNING for anyone re-running this: the FIRST hill A/B was confounded and read
+6,161 vs 4,051 candidates with 0 emitted on both arms. At the shipped ceiling
+the hill pours 39,600 particles of its own, so excite's budget is exactly zero.
+`wp5b` reruns it at `-ceil262144`.
+
+**Gates.** `ca-slope` (CA alone) PASS at 95.3%, mass exact, box asleep.
+`ca-slope-hybrid` (NEW, both movers live) **RED**: it found a settle mass leak,
+~0.4 eighths per settle commit, invisible on the large-body scenes because they
+barely settle (pond68 commits 3 blocks in 469 ticks, worldlake 18 in 460, both
+EXACT). Ruled out: excite (excited == emitted exactly), reactions (consumed ==
+0), audit bounds (a 12-cell widened sweep finds nothing), and the CA (the
+excite-off arm is exact). `fluid-react` red and attributed, pre-existing.
+Full attribution for both in `tests/BASELINE.md`.
+
+**Attribution of the hash move.** `--vk-smoke` QUIET is still 5/5 on its
+ORIGINAL pinned values through tick 50, and that world contains worldgen's disc
+ponds and its authored lake - so the world's own standing water does not excite
+itself, drain spontaneously, or cost anything undisturbed. Only `--vk-smoke-
+loud` moved (18/19; `worldgen` byte-identical), and that scenario paints water
+at (176,150,176) from tick 8.
 
 ---
 

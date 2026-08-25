@@ -1,10 +1,11 @@
 {
   "_about": "Which gates already fail, so a run can tell you what is YOURS. See tests/BASELINE.md for why each one is here and how to update it.",
-  "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; fluid rows re-recorded 2026-08-24 at the 987c595 stock defaults",
-  "determinismHash": "7b01cfd8",
+  "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; fluid rows re-recorded 2026-08-24 at the 987c595 stock defaults; determinismHash, ca-slope-hybrid and fluid-react re-recorded 2026-08-25 at WP5's sim.fluidExciteMode flip",
+  "determinismHash": "58b27f33",
   "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
+  "ca-slope-hybrid": "fail",
   "evaporation": "pass",
   "blood-stain": "pass",
   "flung-liquid": "pass",
@@ -31,5 +32,5 @@
   "perf": "pass",
   "page-roundtrip": "pass",
   "daylight-boundary": "pass",
-  "fluid-react": "pass"
+  "fluid-react": "fail"
 }

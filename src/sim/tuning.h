@@ -834,6 +834,98 @@ struct Tuning {
                                   // keeps the pinned world hash); 1 = settled
                                   // liquid with air below converts to MPM
                                   // particles
+    // ---- THE BURST BOUND (WP5) ----
+    // Excite is a per-cell trigger with no notion of "only wake what the
+    // disturbance can reach", and it emits one particle per eighth of
+    // fullness. It is easy to assume the CA liquid fix (merge a2e723e) removed
+    // the need for it — dig under a pond and only the water actually falling
+    // through the hole should excite. MEASURED, it does not, and the reason is
+    // worth keeping: while the CA is draining a body, its partial descent
+    // leaves a transient gap under a cell all over the body, not only at the
+    // hole. Trigger (a) is "air below", so it fires on every one of them.
+    //
+    // `--fluid-bench wp5`, `worldlake` (worldgen's authored 347,832-voxel lake
+    // at (420,420), a 5x5 shaft opened underneath it once the body is provably
+    // asleep), fixed CA, exciteMode 1, ceiling lifted to the pool:
+    //   live 352 -> 1,916 (+1t) -> 262,144 (+91t) = the ENTIRE pool, held
+    //   there to end of run. Frame p50 69.34  p95 72.28  p99 73.74 ms.
+    // That is still the reported "it turns the whole lake into fluid".
+    //
+    // Both knobs are in PARTICLES (8 per water voxel), and both apply ONLY to
+    // excite — never to explicit spawns. Pouring water with the mpm tool is
+    // something the player asked for; a lake converting itself is not, and the
+    // two must not share a budget or the tool stops working next to water.
+    int fluidExciteCeiling = 8000;   // most excited particles the seam will
+                                     // hold at once = 1,000 water voxels in
+                                     // motion, a 10-voxel cube. `--fluid-bench
+                                     // wp5b`, worldlake, same puncture, and
+                                     // the last column is the acceptance
+                                     // criterion frame time cannot express —
+                                     // eighths that reached the sealed chamber
+                                     // in the 400 ticks after the plug:
+                                     //  ceiling   p50    p95    p99   drained
+                                     //   CA only 15.00  15.87  17.12   70,743
+                                     //    4,000  23.43  24.93  26.21   73,672
+                                     //    8,000  25.05  27.13  28.60   72,996
+                                     //   16,000  27.10  28.82  29.86   74,572
+                                     //   32,000  33.23  34.80  36.22   75,599
+                                     //  262,144  69.34  72.28  73.74  102,402
+                                     // Drain THROUGHPUT is flat from 4k to 32k
+                                     // — the CA is doing the transport in all
+                                     // of them (71,479 of the 73,672 at 4,000
+                                     // arrived as settled voxels). So the
+                                     // ceiling buys nothing but COVERAGE: how
+                                     // much of the body is visibly in motion.
+                                     // 8,000 is the cheapest value that still
+                                     // clears the largest peak any scene
+                                     // reaches unforced (the pond's own 5,700),
+                                     // so it never clips a body that was not
+                                     // going to burst anyway. It is a LOOK
+                                     // knob above that — raise it for a wider
+                                     // churn at ~1.2 ms of frame per 4,000
+    int fluidExciteRate = 4096;      // most particles converted per TICK. Does
+                                     // not bind at any shipped ceiling (the
+                                     // worldlake ramp to 8,000 takes 46 ticks,
+                                     // ~174/tick); it is the guard for the case
+                                     // the ceiling cannot cover — a blast that
+                                     // exposes thousands of cells at once with
+                                     // the ceiling raised. Deliberately equal
+                                     // to kMaxFluidSpawnsPerTick: the seam may
+                                     // not convert world water faster than the
+                                     // MutationQueue can pour it
+    int fluidExcitePerch = 0;        // 1 = excite also takes water PERCHED on
+                                     // terrain (a base cell with a diagonal
+                                     // void beside it), not only water with
+                                     // air directly below.
+                                     //
+                                     // OFF, and that is a measured reversal of
+                                     // WP3's expectation. The trigger was for
+                                     // water the CA had parked on a slope, and
+                                     // the CA no longer parks water on slopes.
+                                     // `--fluid-bench wp5` / `wp5b`, perch 1 vs
+                                     // 0, everything else equal:
+                                     //   pond68     candidates 1,150 vs 1,150
+                                     //   worldlake  candidates 169,616 vs
+                                     //              169,616, emitted 35,158 vs
+                                     //              35,158, p50 33.23 vs 33.13
+                                     //   hill       basin capture 50.9% vs
+                                     //              51.7% (ceiling lifted, so
+                                     //              excite is actually live)
+                                     // Byte-identical on both settled-water
+                                     // scenes; on the ramp it is a fraction of
+                                     // a point and in the WRONG direction. It
+                                     // costs 24% of seam time (fluidSeam 0.230
+                                     // -> 0.174 ms on pond68) for nothing.
+                                     //
+                                     // EXCITE SIDE ONLY. settleCheck's
+                                     // stability veto evaluates the full
+                                     // predicate whatever this says, because
+                                     // settle refusing MORE than excite takes
+                                     // is the safe direction of the hysteresis
+                                     // — water stays particles a while longer —
+                                     // and the reverse lets settle create a
+                                     // configuration excite immediately tears
+                                     // up again
     float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
                                   // particle stays below this for
                                   // settleTicks in a row counts as calm and

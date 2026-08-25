@@ -444,7 +444,15 @@ TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
 // hash), 1 = settled liquid with air below converts to MPM particles.
 // wakeSpeed defaults to 4x settleEps — that gap is the hysteresis that stops
 // blocks flickering between the two states.
-TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 0)
+// exciteCeiling / exciteRate are the WP5 burst bound, in PARTICLES (8 per
+// water voxel). The ceiling is how much of the world's water the seam will
+// ever have live at once; the rate is how fast it may get there. Neither
+// applies to explicit spawns (the mpm tool, the lab pours) — pouring water is
+// something the player did, a lake exciting itself is not.
+TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 1)
+TP_I(sim, fluidExciteCeiling, TUNE_FLUID_EXCITE_CEILING, 8000)
+TP_I(sim, fluidExciteRate, TUNE_FLUID_EXCITE_RATE, 4096)
+TP_I(sim, fluidExcitePerch, TUNE_FLUID_EXCITE_PERCH, 0)
 TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
 TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
