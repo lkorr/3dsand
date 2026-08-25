@@ -287,6 +287,42 @@ SSBO lists of chunk indices.
   4-direction descent, and a settled path that never re-marked its chunk) are
   fixed rather than routed around; the `ca-slope` gate holds the result at
   95.3% of a pour arriving down a stepped ramp with the box asleep.
+- **LEVELLING is a separate problem from FLOWING, and needed two more rules**
+  (2026-08-25). `ca-slope` asks whether water gets down a hill; it says nothing
+  about the shape water rests in once it is somewhere flat, and the shape was a
+  DOME. Lateral spread into air is halving so only the rim ever touches air, and
+  `liquidEqualize` is 2 so no adjacent pair on a slope of one eighth per cell is
+  ever unstable — `(8,7,6,5,4,3,2,1)` was a stable resting state. A splash on a
+  pond therefore relaxed in place into a mound instead of dispersing, which is
+  visible now that b799a58 draws partial cells at fullness height. Two rules,
+  both in `sim_step.wgsl` with their termination arguments in full:
+  - **`filmPressed`** — a film too thin to split moves WHOLE into an air
+    neighbour when another lateral neighbour is thick enough to split. This
+    frees the rim, and the dome then unwinds from the outside in. It is neutral
+    in `SUM(f*f)`, so the gate is chosen to make it terminate: the cell it
+    vacates is a face neighbour of the cell that justified the move, which can
+    therefore split into the hole, and splitting strictly decreases `SUM(f*f)`.
+  - **`bridgeLevel`** — a cell may equalize between TWO OF ITS OWN lateral
+    neighbours. Write reach is unchanged (both are one cell away — the same
+    licence `tryMove` spends on self and one neighbour), but the pair straddles
+    the mediator, so on a slope of one eighth per cell it differs by 2 and the
+    ordinary equalize threshold bites. It is an ordinary equalize, so it
+    inherits the `SUM(f*f)` termination argument with nothing new to prove.
+    Requiring the mediator to be this same liquid is what makes it physical
+    (pressure crosses a connected body of water) and what removes the need for a
+    diagonal crack check.
+  - `sim.liquidMinFilm` is back to **1**, so the resting film is the thinnest
+    representable and one placed voxel spreads to eight cells of one eighth.
+  - **The limit, stated because it is irreducible at reach 1**: the joint
+    fixpoint is a surface sloping one eighth per TWO cells. Halving that again
+    needs a look 4 cells wide, and a mediator can only bridge cells inside its
+    own write reach. A genuinely level wide surface needs a global pressure
+    solve (the MPM has one) or a mark/apply flux pass
+    (`RESEARCH_water_architecture.md` option B).
+  - Gates: `ca-level-one` (one placed voxel → 8 cells of one eighth, no slack),
+    `ca-level` (216 eighths → 135 wetted columns, one cell deep, ≤4 eighths
+    anywhere; was 57 columns and 6 eighths), `ca-level-pond` (the reported case:
+    the same blob on standing water).
 - **Gas**: inverse powder (up, then up-diagonals, then lateral), plus decay chance.
 - **Solid**: doesn't move; participates in reactions and structural checks only.
 - **Density displacement**: a mover entering a cell occupied by a less-dense
@@ -672,16 +708,41 @@ are one hole with three faces.
   rows and the barrier between them means every stability probe in the tick
   reads pre-commit voxels, identically on every device. `basin` settle commits
   over 400 ticks: 7 → 12.
-- **LIQUID HAS A MINIMUM FILM** (`sim.liquidMinFilm`, default 2 eighths).
-  Lateral spread into air is repeated halving and had no floor, so one placed
-  water voxel ran 8 → (4,4) → … → eight cells of ONE eighth: eight times the
-  footprint placed, an eighth as deep, and since the fullness-proportional
-  render landed that reads as a splash rather than a voxel of water. A split
-  now requires `f >= 2 × minFilm` so BOTH halves clear the floor. Same-liquid
-  equalize is untouched (ponds still level) and descent is untouched (water
-  still runs downhill at any fullness); a film too thin to split still steps
-  off a one-voxel riser whole, which is what keeps terrace treads draining.
-  `hill` basin capture is unmoved at 51.6% / 52.5% (excite on / off).
+- **LIQUID HAS A MINIMUM FILM** (`sim.liquidMinFilm`), a split floor: a cell
+  splits into air only when `f >= 2 × minFilm`, so both halves clear it.
+  Same-liquid equalize is untouched (ponds still level) and descent is untouched
+  (water still runs downhill at any fullness); a film too thin to split still
+  steps off a one-voxel riser whole, which keeps terrace treads draining.
+  `hill` basin capture is unmoved by the floor at 51.6% / 52.5% (excite on/off).
+  It shipped at 2 to stop one placed voxel becoming eight cells of one eighth,
+  and went **back to 1** on 2026-08-25 when the owner asked for the opposite —
+  the flattest state an eighth-quantised lattice can hold is exactly one eighth
+  per wetted cell. See "LEVELLING is a separate problem from FLOWING" in §4 for
+  the two rules that landed with it; the cost of 1 is that a one-eighth film is
+  below the solver's density support, so the thinner the resting film the more
+  water the CA owns outright — which is why the excite seam grew a surface-step
+  trigger in the same change.
+- **THE SURFACE-STEP EXCITE TRIGGER** (`sim.fluidExciteStep`, default 2 cells).
+  A splash landing on a pond satisfies none of the other triggers: there is
+  water directly below it rather than air (not (a)), the cell below its lateral
+  neighbour is that same water rather than a void (not (b)), and until something
+  is already moving nearby there are no fast nodes to wake off. So it stayed CA,
+  and the CA has no momentum — it relaxed in place into a mound. Trigger (d)
+  takes a free-surface cell whose own water surface stands `exciteStep` whole
+  CELLS above the surface in a lateral neighbour's column. Measured in cells
+  between two water surfaces, not in eighths between two cells: plan §6's
+  eighth-level trigger (c) was rejected twice because a settled column carries a
+  couple of eighths of shot noise and bottom-packing puts a deeper column's top
+  cell beside a shallower one's empty cell, so any eighth threshold is true at
+  the surface of every pool that is not perfectly level. It also only looks over
+  WATER (the neighbour column must hold liquid), so a puddle spreading across
+  dry ground never fires it — this is a lakebed trigger, not a spill one. It is
+  excite-side only, like `fluidExcitePerch`, and that is the unsafe direction of
+  the hysteresis asymmetry; what holds it in practice is that the CA flattens a
+  2-cell step by itself, so the configuration does not persist for the two sides
+  to fight over. Measured on `ca-level-pond`: with the trigger off the seam
+  NEVER fires on a splashed pond (0 excited); at 2 it converts 454 eighths and
+  settles all 454 back, mass exact, box asleep 60 ticks later.
 
 SETTLE IS EXCITE-STABLE BY CONSTRUCTION (WP3, plan §6 item 2). `settleCheck`
 runs a second test after column feasibility: every cell the walk would write

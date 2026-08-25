@@ -49,7 +49,8 @@ const std::vector<Gate>& SpellGates();
 // is the failure mode we want rather than one that runs in an arbitrary slot.
 const char* const kOrder[] = {
     "determinism", "sleep",       "ca-skip",     "ca-slope",
-    "ca-slope-hybrid", "evaporation",
+    "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
+    "evaporation",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",

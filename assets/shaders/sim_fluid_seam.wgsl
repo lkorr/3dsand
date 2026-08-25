@@ -157,6 +157,13 @@ const SEAM_EX_CEILING : u32 = u32(clamp(TUNE_FLUID_EXCITE_CEILING, 256, 262144))
 const SEAM_EX_RATE : u32 = u32(clamp(TUNE_FLUID_EXCITE_RATE, 64, 262144));
 // Excite's perch trigger, on the EXCITE side only (see exciteDetect).
 const SEAM_EX_PERCH : bool = TUNE_FLUID_EXCITE_PERCH != 0;
+// Excite's SURFACE-DISTURBANCE trigger, also excite-side only: how many whole
+// cells a body of water must stand proud of the water beside it before the
+// solver takes it. 0 disables. SEAM_EX_STEP_SCAN bounds both column walks, so
+// the cost is O(depth) per free-surface cell of a DIRTY chunk and a sleeping
+// pool pays nothing at all.
+const SEAM_EX_STEP : i32 = clamp(TUNE_FLUID_EXCITE_STEP, 0, 8);
+const SEAM_EX_STEP_SCAN : i32 = 8;
 // The fullness at which the CA can still spread a cell sideways into air —
 // sim_step.wgsl's LIQ_SPLIT_MIN, restated here because settleCheck's mode-0
 // exemption is precisely the question "can the CA move this one itself?".
@@ -511,6 +518,69 @@ fn seamLateral(d : u32) -> vec3<i32> {
   return vec3<i32>(0, 0, -1);
 }
 
+// ---- trigger (d): a SURFACE STANDING PROUD of the water beside it ----------
+//
+// The disturbance trigger the other three structurally cannot see. Drop a
+// splash onto a pond and every existing trigger says "at rest": there is water
+// directly below it (not (a)), the cell below its lateral neighbour is that same
+// water rather than a void (not (b)), and until something is already moving
+// nearby there are no fast nodes to wake off (not the wake trigger). So the
+// splash stayed CA, and the CA has no momentum — it relaxed in place into a
+// mound instead of falling in and throwing a wave. That is the owner's report,
+// and the mound half of it is fixed in sim_step.wgsl (filmPressed); this is the
+// half that makes the disturbance actually move like water.
+//
+// THE MEASURE IS A WHOLE-CELL STEP IN THE SURFACE, AND THAT IS THE DESIGN.
+// Plan §6's trigger (c) measured the same idea in EIGHTHS against the
+// neighbouring cell and was rejected twice for reasons that all still apply (see
+// seamLateralExcite): a settled column carries a couple of eighths of shot noise,
+// and bottom packing puts a deeper column's top cell beside a shallower one's
+// EMPTY cell, so any eighth-level threshold is true at the surface of every pool
+// that is not perfectly level — a state no particle method reaches. A step
+// measured between the two WATER SURFACES is above that noise floor by
+// construction: two columns whose contents differ by a few eighths have surfaces
+// in the same cell or one apart, and never two.
+//
+// AND IT ONLY LOOKS OVER WATER. `seamSurfaceDrop` returns -1 both for a blocker
+// (a bank: water resting against stone is stable, the basin case) and for a
+// column with no water within reach (dry ground). So a puddle spreading across a
+// floor never fires it, however proud it stands — this is a LAKEBED disturbance
+// trigger, not a spill one, and keeping the spill on the CA is what stops the
+// two systems fighting over the same water.
+//
+// DETERMINISM. This walks a column up to SEAM_EX_STEP_SCAN cells down, which is
+// a read far outside the 1-cell reach the CA is held to — and it is legal HERE
+// for the reason stated at exciteDetect: this pass's only voxel write is bits
+// 19..23 of a cell's OWN word, every read below consumes bits 0..17, and the
+// node grid is read-only for the whole pass. The outcome is a pure function of
+// pre-seam state. The same walk inside sim_step.wgsl would be the scheduling
+// bug the seesSky block documents.
+//
+// How far DOWN from `n` the water surface in that column sits, capped by the
+// scan. 0 means the neighbour is water at this very level (a flat surface, the
+// common answer and a one-iteration exit). -1 means "not a pool": a blocker on
+// the way down, or nothing but air within reach.
+fn seamSurfaceDrop(n : vec3<i32>) -> i32 {
+  for (var d = 0; d <= SEAM_EX_STEP_SCAN; d++) {
+    let s = seamNeighbourState(n - vec3<i32>(0, d, 0));
+    if (s.x != 0u) { return -1; }   // bank, ledge, roof — not a water surface
+    if (s.y != 0u) { return d; }    // the neighbour's surface, d cells down
+  }
+  return -1;                        // air all the way: dry, not a lakebed
+}
+
+// Does this cell stand at least SEAM_EX_STEP whole cells above the water beside
+// it? Asked only of FREE-SURFACE cells (see the call site), which both bounds
+// the cost to one column per cell-column per tick and makes the conversion
+// progressive: the top of a splash goes to the solver first, the layer under it
+// becomes the new top and follows on the next tick.
+fn seamSurfaceStep(c : vec3<i32>) -> bool {
+  for (var d = 0u; d < 4u; d++) {
+    if (seamSurfaceDrop(c + seamLateral(d)) >= SEAM_EX_STEP) { return true; }
+  }
+  return false;
+}
+
 // detect: one workgroup per dirty chunk (the CA's own indirect args), 16
 // cells per thread. A candidate cell gets its mark + depth written into its
 // OWN voxel word (bits 19..23 — the sanctioned scratch span) and its
@@ -591,6 +661,21 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
             break;
           }
         }
+      }
+
+      // Trigger (d), the SURFACE DISTURBANCE — see the seamSurfaceStep block.
+      // FREE-SURFACE cells only: a cell with more of its own liquid on top of it
+      // is not a surface, and asking there would both cost a column walk per
+      // submerged cell and convert a splash in one burst instead of peeling it
+      // a layer at a time. `onBase` is deliberately NOT required — a splash
+      // sitting on a pool is the case, and its base cell is water by definition.
+      if (!excite && SEAM_EX_STEP > 0) {
+        let above = c + vec3<i32>(0, 1, 0);
+        var atSurface = true;
+        if (inWindow(above, T.origin)) {
+          atSurface = voxMat(voxWordAt(above)) != mat;
+        }
+        if (atSurface && seamSurfaceStep(c)) { excite = true; }
       }
     }
     // Trigger (b), always on: progressive wake. A face neighbor's grid node
@@ -1573,6 +1658,13 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
       //     as a literal 2 was correct only while minFilm was 1 — if these two
       //     drift, mode 0 exempts cells the CA has since stopped being able to
       //     spread, and the exemption starts causing the freeze it prevents.
+      //     Since filmPressed (sim_step.wgsl) the CA can ALSO move a cell under
+      //     the floor, when a thicker neighbour is pressing on it. This stays on
+      //     the split threshold anyway: that extra move is geometry-dependent
+      //     and this test has to be conservative in the direction that refuses
+      //     the settle, which merely leaves the water as particles a while
+      //     longer. Exempting more than the CA can certainly move is the arm
+      //     that freezes.
       if (T.fluidExciteEnable == 0u && full >= SEAM_CA_SPREAD_MIN) { continue; }
       // BASE cells only: the bottom of each contiguous body of water in this
       // column (see seamLateralExcite). At y = 0 the cell below is outside the

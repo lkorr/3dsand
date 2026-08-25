@@ -347,6 +347,26 @@ The gate stays RED on purpose. It is the thing that will verify the fix, and
 its acceptance (mass exact, >=90% arriving, box asleep) is the right one — the
 seam should meet it.
 
+**Re-measured 2026-08-25 at the levelling pass** (`filmPressed` + `bridgeLevel`
+in `sim_step.wgsl`, `sim.liquidMinFilm` back to 1, the seam's surface-step
+excite trigger), because the number moved and the number moving is not the same
+thing as the bug moving:
+
+    768 poured; 24 deck standing, 613 carried by 613 particles
+    131 UNACCOUNTED
+    seam: 804 excited -> 804 emitted, 191 settled, 191 dead, 625 binned
+    ledger first parts at tick 290 by 24
+
+Fewer settle commits (369 -> 191) and a smaller leak (145 -> 131), so the loss
+per settle commit went 0.4 -> 0.69. That is the SAME bug being driven
+differently, not a worse one: the levelling rules change the shape the water
+arrives in, so which columns are feasible and how many commit changes with it,
+and a per-commit average taken over two different column populations is not a
+like-for-like comparison. Both diagnostic equalities still hold exactly
+(`FA_EXCITED == FA_EMITTED`, `FA_SETTLED == FA_DEAD`), `FA_CONSUMED` is still 0,
+and the `ca-slope` CA-only arm is still mass EXACT — so the leak is still on the
+settle path and still nowhere else.
+
 ## `fluid-react` — no ledger term for SETTLED water eaten by reactions
 
 Pre-existing at a2e723e, whose merge message names it: "fluid-react left red:

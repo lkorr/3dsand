@@ -505,6 +505,289 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ca-level ------------------------------------------------------------
+//
+// THE SECOND COMPLAINT, as a gate: *"if I add a splash of water onto a pond it
+// doesn't propagate, it just sits on top and creates an elevated mound instead
+// of dispersing and trying to be as flat as possible."*
+//
+// `ca-slope` asks whether water gets DOWN a hill. This asks what shape it comes
+// to rest in once it is somewhere flat, which turns out to be a different
+// question with a different answer. The old rules settled a blob into a CONE:
+// lateral spread is repeated halving so only the rim ever touches air, the
+// same-liquid EQUALIZE branch only fires at a difference of `liquidEqualize`
+// (2), and therefore a surface sloping by exactly ONE eighth per cell has no
+// unstable pair anywhere in it and no way to advance. (8,7,6,5,4,3,2,1) was a
+// stable resting state. On a pond that is a mound sitting on the surface that
+// never disperses, and since b799a58 draws partial cells at fullness height it
+// is a mound you can see.
+//
+// So the assertion is the SHAPE AT REST, and the numbers are chosen to have one
+// obvious right answer rather than to be a tolerance:
+//
+//   1. MASS is exact, as always.
+//   2. STACKING — no column of the puddle holds water in more cells than the
+//      arm allows. A dome is by definition taller than a level puddle of the
+//      same mass, and on a floor big enough to hold the flat answer, a level
+//      puddle is exactly ONE cell deep.
+//   3. PEAK — the deepest column, in eighths. The flat answer for 216 eighths
+//      spread over a floor with room for 216 cells is one eighth per wetted
+//      column. Two is the slack (a 2 with only 1s around it is a legal resting
+//      state — the pair differs by one, which is the integer equilibrium).
+//   4. IDLE — the box sleeps. A rule that levels water by never settling is
+//      rule 2 traded for a screenshot, exactly as in ca-slope, and the
+//      termination argument in sim_step.wgsl's filmPressed block is what this
+//      line tests.
+//
+// THE POND ARM is the reported case literally: the same blob dropped on standing
+// water, where descent is refused (the cells below are already full) so lateral
+// levelling is the ONLY mechanism available. It runs at the shipped exciteMode,
+// so it also covers the seam's surface-step trigger not leaving the pool
+// churning — the water goes to the solver, splashes, and must come back and go
+// quiet.
+//
+// THE HONEST LIMIT, stated because the gate is built to avoid it. `filmPressed`
+// frees the RIM, and the dome then unwinds from the outside in. Where there is
+// no rim — a basin filled wall to wall, so the surface has no air to advance
+// into — the equalize threshold is again the only lateral rule and a slope-1
+// surface is again stable. That is bounded by the basin's width and is the
+// plateau problem in its irreducible form: moving one eighth from the middle of
+// a ramp to its end is neutral in SUM(f*f) at every step, so no reach-1 rule can
+// make it strictly downhill. Every real splash has a rim, which is why this
+// gate's floor is wider than the puddle.
+struct LevelArm {
+  int exciteMode;
+  int pondLayers;      // full water cells laid over the whole floor first
+  int blob;            // splash edge, in full water cells
+  uint64_t maxPeak;    // deepest column allowed, in eighths
+  uint32_t maxLayers;  // most cells of water allowed in one column
+};
+
+Status RunCaLevel(Ctx& c, std::string& detail, const LevelArm& arm) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  // Dim dawn, for the reason ca-slope records: freezing and evaporation are the
+  // two authored sinks that would make the mass audit inexact.
+  Tuning dawn = CurrentTuning();
+  dawn.dayNight.freeze = 1;
+  dawn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  dawn.sim.fluidExciteMode = arm.exciteMode;
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(dawn);
+
+  const int px = 96, py = 120, pz = 96;
+  const int kHalf = 14;                 // interior half-width in x and z
+  const int kBlob = arm.blob;
+  const int kTicks = 700;
+  const int floorY = py;                // solid floor; water rests at floorY+1
+  const int roofY = py + 12;
+  const int x0 = px - kHalf, x1 = px + kHalf;
+  const int z0 = pz - kHalf, z1 = pz + kHalf;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // A sealed box: stone floor, stone walls, stone roof, air inside. Wide enough
+  // that the level answer (one eighth per wetted cell) fits with room to spare —
+  // see THE HONEST LIMIT above, a puddle that reaches the wall stops levelling.
+  std::vector<CellOp> build;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = floorY; y <= roofY; y++) {
+        const bool wall = x < x0 || x > x1 || z < z0 || z > z1;
+        const bool solid = wall || y <= floorY || y >= roofY;
+        build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
+      }
+
+  // The pond, if this arm has one: full cells wall to wall.
+  std::vector<CellOp> pond;
+  for (int L = 0; L < arm.pondLayers; L++)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++)
+        pond.push_back({World::SlotCellIndex({x, floorY + 1 + L, z}),
+                        (waterId & 0xFFFu) | (7u << 12)});
+
+  // The splash: a solid cube of full water, standing on the surface (or on the
+  // floor) so it has to disperse LATERALLY. Dropping it from height would test
+  // descent, which ca-slope already covers.
+  std::vector<CellOp> blob;
+  const int by = floorY + 1 + arm.pondLayers;
+  for (int y = by; y < by + kBlob; y++)
+    for (int z = pz - kBlob / 2; z <= pz + kBlob / 2; z++)
+      for (int x = px - kBlob / 2; x <= px + kBlob / 2; x++)
+        blob.push_back({World::SlotCellIndex({x, y, z}),
+                        (waterId & 0xFFFu) | (7u << 12)});
+  const uint64_t placed = ((uint64_t)pond.size() + blob.size()) * 8u;
+
+  std::vector<uint32_t> boxChunks;
+  for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+    for (int cy = floorY >> 4; cy <= (roofY >> 4); cy++)
+      for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++)
+        boxChunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+
+  uint32_t t = 41000;
+  int quietAt = -1;
+  uint32_t activeInBox = 0;
+  uint64_t sumSettled = 0, sumExcited = 0;
+  for (int i = 0; i < kTicks; i++) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
+               i == 0   ? build
+               : i == 2 ? pond
+               : i == 4 ? blob
+                        : std::vector<CellOp>{},
+               false, {6, 7, 6}, false, false);
+    {
+      uint32_t fa[32] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                            sizeof(fa), "levelTickArgs");
+      sumSettled += fa[10];
+      sumExcited += fa[11];
+    }
+    if (i >= 20 && i % 10 == 0) {
+      ctx.WaitIdle();
+      std::vector<uint32_t> flags(kNumChunks, 0);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                            flags.data(), kNumChunks * 4, "levelActive");
+      activeInBox = 0;
+      for (uint32_t ci : boxChunks)
+        if (flags[ci] != 0) activeInBox++;
+      if (activeInBox == 0 && quietAt < 0) quietAt = i;
+      else if (activeInBox != 0) quietAt = -1;
+    }
+  }
+  ctx.WaitIdle();
+
+  // ---- the resting shape, per COLUMN --------------------------------------
+  // Eighths and occupied cells for every (x,z) of the interior. The profile
+  // histogram is what makes a failure readable: a dome reports a spread of
+  // fullnesses, a level puddle reports one bucket.
+  const int span = x1 - x0 + 1;
+  std::vector<uint32_t> colE((size_t)span * span, 0), colN((size_t)span * span, 0);
+  uint64_t standing = 0;
+  uint32_t profile[9] = {};
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+      for (int cy = floorY >> 4; cy <= (roofY >> 4); cy++)
+        for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         cbuf.data(), "levelVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != waterId) continue;
+            const int x = (int)(k % 16) + cx * 16,
+                      y = (int)((k / 16) % 16) + cy * 16,
+                      z = (int)(k / 256) + cz * 16;
+            if (x < x0 || x > x1 || z < z0 || z > z1) continue;
+            if (y <= floorY || y >= roofY) continue;
+            const uint32_t e = ((cbuf[k] >> 12) & 0xFu) + 1u;
+            standing += e;
+            profile[e]++;
+            const size_t ci = (size_t)(z - z0) * span + (x - x0);
+            colE[ci] += e;
+            colN[ci]++;
+          }
+        }
+  }
+
+  // Water still in flight as particles (the pond arm's seam can hold some).
+  uint64_t liveE = 0;
+  uint32_t liveCount = 0;
+  {
+    uint32_t fa[16] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa, 64,
+                          "levelArgs");
+    liveCount = std::min(fa[7], kFluidCap);
+    if (liveCount > 0) {
+      std::vector<uint32_t> pbuf((size_t)liveCount * kFluidParticleWords);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                            world.fluidParticles[sim.Page()], 0, pbuf.data(),
+                            pbuf.size() * 4, "levelParts");
+      for (uint32_t k = 0; k < liveCount; k++)
+        liveE += (pbuf[(size_t)k * kFluidParticleWords + 18] >> 12) & 0x7u;
+    }
+  }
+  SetCurrentTuning(saved);
+
+  uint64_t peak = 0;
+  uint32_t layers = 0, wetted = 0;
+  for (size_t i = 0; i < colE.size(); i++) {
+    if (colE[i] == 0) continue;
+    wetted++;
+    if (colE[i] > peak) peak = colE[i];
+    if (colN[i] > layers) layers = colN[i];
+  }
+
+  const bool massOk = standing + liveE == placed;
+  const bool peakOk = peak <= arm.maxPeak;
+  const bool layersOk = layers <= arm.maxLayers;
+  const bool idleOk = activeInBox == 0;
+  const bool ok = massOk && peakOk && layersOk && idleOk;
+
+  detail = Format(
+      "%llu eighths placed (%d pond layers + a %d^3 blob), at rest over %u "
+      "wetted columns: deepest %llu eighths (allow %llu), tallest %u cells "
+      "(allow %u), fullness profile 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u 8:%u, "
+      "mass %s (standing %llu + %llu in %u particles), seam %llu excited / %llu "
+      "settled, %u of %zu box chunks awake at tick %d (quiet from %d)",
+      (unsigned long long)placed, arm.pondLayers, kBlob, wetted,
+      (unsigned long long)peak, (unsigned long long)arm.maxPeak, layers,
+      arm.maxLayers, profile[1], profile[2], profile[3], profile[4], profile[5],
+      profile[6], profile[7], profile[8], massOk ? "EXACT" : "LEAK",
+      (unsigned long long)standing, (unsigned long long)liveE, liveCount,
+      (unsigned long long)sumExcited, (unsigned long long)sumSettled,
+      activeInBox, boxChunks.size(), kTicks, quietAt);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// THE ALLOWANCES ARE MEASURED, not aspirational, and the arithmetic in
+// sim_step.wgsl's bridgeLevel block says why they cannot all be 1: a reach-1
+// rule set cannot flatten a wide shallow surface past a slope of one eighth per
+// two cells, so a 216-eighth puddle keeps a residual swell in the middle. What
+// these arms assert is that the swell does not GROW. Numbers taken at the commit
+// that landed filmPressed + bridgeLevel; the same script on the rules before it
+// reported, for reference, 57 wetted columns at 6 eighths deep with 31 cells at
+// 4 or more (dry), and a surface film peaking at 5 eighths with 17 cells at 4 or
+// more (pond).
+Status GateCaLevelOne(Ctx& c, std::string& detail) {
+  // THE OWNER'S LITERAL TEST: "if I use the smallest brush and place water on a
+  // flat plane I want it to keep spreading until every single voxel is the
+  // smallest height possible." One full cell is 8 eighths, so the answer is 8
+  // cells of one eighth and nothing deeper — this arm allows NO slack, because
+  // at this size there is no dome for the slope limit to hide in.
+  const Status s = RunCaLevel(c, detail, {0, 0, 1, 1, 1});
+  std::printf("ca-level-one: %s (%s)\n", s == Status::Pass ? "PASS" : "FAIL",
+              detail.c_str());
+  return s;
+}
+
+Status GateCaLevel(Ctx& c, std::string& detail) {
+  // Dry floor, CA alone, 27 full cells. One cell deep everywhere — the
+  // no-stacking assertion is the "not a mound" one — with the residual swell
+  // bounded at half a voxel.
+  const Status s = RunCaLevel(c, detail, {0, 0, 3, 4, 1});
+  std::printf("ca-level: %s (%s)\n", s == Status::Pass ? "PASS" : "FAIL",
+              detail.c_str());
+  return s;
+}
+
+Status GateCaLevelPond(Ctx& c, std::string& detail) {
+  // The reported case: the same blob on two full layers of standing water, at
+  // the shipped exciteMode so the seam's surface-step trigger is live. Two full
+  // cells is 16 eighths, so the allowance is 16 plus the film's own swell, and
+  // the layer count is what says the splash did not stay a lump on the surface.
+  const Status s = RunCaLevel(c, detail, {1, 2, 3, 20, 3});
+  std::printf("ca-level-pond: %s (%s)\n", s == Status::Pass ? "PASS" : "FAIL",
+              detail.c_str());
+  return s;
+}
+
 Status GateCaSlope(Ctx& c, std::string& detail) {
   const Status s = RunCaSlope(c, detail, {0, 0.90, true});
   std::printf("ca-slope: %s (%s)\n", s == Status::Pass ? "PASS" : "FAIL",
@@ -526,6 +809,9 @@ const std::vector<Gate>& CaGates() {
       {"ca-skip", "sim", {}, false, GateCaSkip},
       {"ca-slope", "sim", {}, false, GateCaSlope},
       {"ca-slope-hybrid", "sim", {}, false, GateCaSlopeHybrid},
+      {"ca-level-one", "sim", {}, false, GateCaLevelOne},
+      {"ca-level", "sim", {}, false, GateCaLevel},
+      {"ca-level-pond", "sim", {}, false, GateCaLevelPond},
   };
   return g;
 }

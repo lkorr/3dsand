@@ -724,7 +724,7 @@ struct Tuning {
     // the footprint of a placement shrinks by the same factor.
     // 1 is the old behaviour bit-for-bit. Same-liquid EQUALIZE is untouched, so
     // ponds still level; this gates only the leading edge advancing into air.
-    int liquidMinFilm = 2;
+    int liquidMinFilm = 1;
     int wanderHopMask = 7;       // critter hop chance = 1/(mask+1) per tick
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
@@ -938,6 +938,54 @@ struct Tuning {
                                      // and the reverse lets settle create a
                                      // configuration excite immediately tears
                                      // up again
+    int fluidExciteStep = 2;         // SURFACE DISTURBANCE, in whole cells.
+                                     // A settled liquid cell whose own water
+                                     // surface stands this many cells or more
+                                     // above the water surface in a lateral
+                                     // neighbour's column is a SPLASH sitting
+                                     // on a pool, and goes to the solver so it
+                                     // falls with momentum and throws a wave,
+                                     // instead of relaxing in place as a mound.
+                                     // 0 disables the trigger.
+                                     //
+                                     // Measured in CELLS against the surface,
+                                     // not in eighths against the neighbouring
+                                     // cell, and that is the whole design. The
+                                     // eighth-level version is trigger (c) from
+                                     // plan §6, which was measured twice and
+                                     // rejected both times: a settled pool
+                                     // carries a couple of eighths of shot
+                                     // noise column to column, and bottom
+                                     // packing puts a deeper column's top cell
+                                     // beside a shallower one's empty cell, so
+                                     // "2 eighths lower" is true at the surface
+                                     // of every pool that is not perfectly
+                                     // level. A whole-cell step in the SURFACE
+                                     // is above that noise floor by
+                                     // construction: two columns that differ by
+                                     // a few eighths have surfaces in the same
+                                     // cell or one apart, never two.
+                                     //
+                                     // The trigger only looks over WATER — the
+                                     // neighbour column must itself hold liquid
+                                     // — so a puddle spreading across dry
+                                     // ground never fires it. It is a lakebed
+                                     // disturbance trigger, not a spill one.
+                                     //
+                                     // EXCITE SIDE ONLY, like fluidExcitePerch
+                                     // above, and this is the UNSAFE direction
+                                     // of that asymmetry: settle can in
+                                     // principle rebuild a 2-cell step that
+                                     // excite then tears up again. What makes
+                                     // it hold in practice is that the CA
+                                     // flattens such a step by itself (partial
+                                     // descent takes it straight down), so the
+                                     // configuration does not persist for
+                                     // either side to fight over, and the calm
+                                     // window throttles settle retries
+                                     // regardless. If a pool is ever seen
+                                     // churning at rest, set this to 0 first —
+                                     // that is the differential.
     // ---- settled liquid as MPM boundary mass ------------------------------
     // WP4 shipped the two representations passing straight THROUGH each other:
     // sim_fluid.wgsl's fluidSolid() blocks solids and powders only, and a

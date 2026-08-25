@@ -704,6 +704,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "fluidExciteCeiling", s.fluidExciteCeiling, out, at);
     ReadI(*g, "fluidExciteRate", s.fluidExciteRate, out, at);
     ReadI(*g, "fluidExcitePerch", s.fluidExcitePerch, out, at);
+    ReadI(*g, "fluidExciteStep", s.fluidExciteStep, out, at);
     ReadF(*g, "fluidSettledMass", s.fluidSettledMass, out, at);
     ReadF(*g, "fluidSettleEps", s.fluidSettleEps, out, at);
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
@@ -818,6 +819,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (s.fluidExcitePerch < 0 || s.fluidExcitePerch > 1) {
       out.warnings.push_back("sim.fluidExcitePerch out of 0..1; clamped");
       s.fluidExcitePerch = s.fluidExcitePerch < 0 ? 0 : 1;
+    }
+    // 8 is the seam's own surface scan depth (SEAM_EX_STEP_SCAN); a step it
+    // cannot see is a trigger that never fires, so the knob stops there.
+    if (s.fluidExciteStep < 0 || s.fluidExciteStep > 8) {
+      out.warnings.push_back("sim.fluidExciteStep out of 0..8 (0 = off); "
+                             "clamped");
+      s.fluidExciteStep = s.fluidExciteStep < 0 ? 0 : 8;
     }
     // The WGSL side folds this to a Q8 scale (sim_fluid.wgsl
     // FLUID_SETTLED_Q8); past ~2 the static boundary out-pressures the fluid

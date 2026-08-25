@@ -104,25 +104,31 @@ constexpr Pinned kQuietPinned[] = {
                        // recorded independently
 };
 
-// RE-RECORDED at WP5's flip of sim.fluidExciteMode to 1 (world hash 7b01cfd8
-// -> 58b27f33). 18 of the 19 moved; `worldgen` is byte-identical, as it must
-// be — worldgen writes voxels and the seam does not run.
+// RE-RECORDED TWICE, both times for a sanctioned liquid rebaseline:
+//   * WP5's flip of sim.fluidExciteMode to 1 (world hash 7b01cfd8 -> 58b27f33)
+//   * the LEVELLING pass (dc666ada -> 882a30f3): sim_step.wgsl gained the
+//     pressed-film and bridged-equalize lateral rules, sim.liquidMinFilm went
+//     back to 1, and the seam gained the surface-step excite trigger.
+// 18 of the 19 moved both times; `worldgen` is byte-identical, as it must be —
+// worldgen writes voxels and neither the CA nor the seam runs during it.
 //
 // The split between the two scenarios is the attribution, and it is worth
 // stating because "the hash moved" and "the sim broke" look alike in a diff:
 // the QUIET scenario is still 5/5 on its ORIGINAL pinned values through tick
 // 50, and that world contains worldgen's disc ponds and its authored lake. So
 // the world's own standing water does not excite itself, drain spontaneously,
-// or cost anything undisturbed. Only the LOUD scenario moved, and that one
-// paints a water brush at (176,150,176) from tick 8 and detonates next to it —
-// exactly the water whose mover changed.
+// re-level itself on load, or cost anything undisturbed — which is the single
+// most useful thing to know about a change to the liquid rules, and it survived
+// this one unchanged. Only the LOUD scenario moved, and that one paints a water
+// brush at (176,150,176) from tick 8 and detonates next to it — exactly the
+// water whose mover changed.
 constexpr Pinned kLoudPinned[] = {
     {0, 0xf97ba745},   // worldgen — same seed, so identical to the quiet run
-    {15, 0x2f81fec3},  {30, 0xe6906e15},  {45, 0x177f5d53},  {46, 0x0c5310f2},
-    {47, 0xe7185db5},  {52, 0x7a52938a},  {53, 0x8f081e5a},  {60, 0x7873a1a7},
-    {75, 0x549a7d60},  {76, 0x8210dcd6},  {84, 0x8c621066},  {85, 0xfea40fea},
-    {86, 0x518f1266},  {87, 0xb880adb6},  {88, 0x76816030},  {90, 0x74583271},
-    {105, 0x4f24dd50}, {120, 0x4321fd68},
+    {15, 0xf4aa9969},  {30, 0x19ea8b65},  {45, 0x24b1daca},  {46, 0x49a5f92d},
+    {47, 0xe7862e4d},  {52, 0x53c3c98b},  {53, 0xea4494ee},  {60, 0x167ab7fb},
+    {75, 0xcc08b928},  {76, 0xfd36af68},  {84, 0x36ccad78},  {85, 0x624cffd5},
+    {86, 0xd5b19979},  {87, 0xb9dc3fb8},  {88, 0x71288da8},  {90, 0x2d44dc27},
+    {105, 0x94017df4}, {120, 0x54d810e7},
 };
 
 // The loud scenario, verbatim from phase 3c: ops shaped to light up every

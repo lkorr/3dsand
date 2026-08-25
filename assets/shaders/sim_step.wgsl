@@ -865,12 +865,187 @@ fn canDescend(c : vec3<i32>, n : vec3<i32>, mat : u32, dens : i32) -> bool {
 //
 // minFilm 1 reproduces the old `f >= 2` bit-for-bit, which is what makes this
 // an A/B rather than a one-way change.
+//
+// ---- AND THE OWNER PUT IT BACK TO 1 (2026-08-25) ----------------------------
+// The paragraph above is still an accurate description of what the floor does;
+// the taste call it rests on was overruled, and the reasoning is worth keeping
+// because the two halves of this file now pull in opposite directions.
+//
+// The ask: "if I use the smallest brush and place water on a flat plane I want
+// it to keep spreading until every single voxel is the smallest height
+// possible." That is minFilm 1 by definition — the flattest state a lattice
+// quantised in eighths can represent is every wetted cell holding exactly one
+// eighth. At minFilm 2 the same water rests two to three eighths deep over half
+// the footprint, which is a lower, wider version of the same mound.
+//
+// It is a knob, not a decision: minFilm 2 is one edit away and everything below
+// (filmPressed included) is written against LIQ_SPLIT_MIN rather than against a
+// literal, so both settings behave consistently. What DOES change with it is the
+// thin-film handoff to the solver — a 1-eighth film gathers rho far below rest
+// inside the MPM's 3-cell support (RESEARCH_water_architecture.md), so the
+// thinner the resting film, the more water the CA owns outright. That is the
+// real cost of 1, and it is the reason the excite seam grew a surface-step
+// trigger in the same change: disturbed water goes to the solver on purpose
+// instead of being left to the CA by accident.
 const LIQ_MIN_FILM : u32 = clamp(TUNE_LIQUID_MIN_FILM, 1u, 4u);
 const LIQ_SPLIT_MIN : u32 = 2u * LIQ_MIN_FILM;
 
 fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
   let back = c - vec3<i32>(d.x, 0, d.y);
   return liquidWall(back) && !liquidWall(back + vec3<i32>(0, 1, 0));
+}
+
+// ---- the PRESSED FILM: why a puddle went DOMED instead of flat --------------
+//
+// The rule above frees a film standing against a riser. This one frees the rim
+// of a puddle, and it is what makes the resting shape actually LEVEL.
+//
+// THE DEFECT. Lateral spread into air is halving, and the same-liquid EQUALIZE
+// branch only fires at a difference of TUNE_LIQUID_EQUALIZE (2). Put those
+// together and a slope of exactly ONE eighth per cell is a STABLE state: no
+// adjacent pair differs by 2 so nothing equalizes, and only the RIM touches air
+// so nothing splits. A blob dropped on flat ground therefore relaxes into a
+// CONE — 8 in the middle, 7 around that, ... 1 at the rim — and stops there
+// forever. Dropped on a pond (where descent is refused because the water below
+// is already full) that cone is a mound of water sitting proud of the surface
+// that never disperses, which is exactly what the owner reported. It was
+// invisible while liquid drew as full cubes and became obvious at b799a58,
+// which draws a partial cell at fullness height.
+//
+// PLAN_fluid_overhaul.md §1.1 defect 2 names `liquidEqualize = 2` for this, and
+// the long note in stepLiquid explains why lowering it to 1 cannot work: a
+// difference of 1 transfers `(f - nf) / 2u` == 0 eighths, and forcing the odd
+// eighth across instead is flat in the diffusion's own Lyapunov function, so the
+// pair trades it back and forth forever. That analysis is right about the PAIR
+// and wrong about the CHAIN — (8,7,6,5,4,3,2,1) has no unstable pair in it and
+// is still a dome. The dome is not held up by the equalize threshold; it is held
+// up by the RIM, which cannot move at all: a lone eighth may not split (that
+// would leave nothing behind) and has no neighbour two lower to equalize with,
+// so the footprint can never grow and the cone behind it has nowhere to go.
+// Free the rim and the whole thing unwinds from the outside in.
+//
+// THE RULE. A cell too thin to split moves its WHOLE content one step into air
+// when some OTHER lateral neighbour is thick enough to split — "there is water
+// pressing behind me and there is room in front of me".
+//
+// TERMINATION (rule 2), and the gate is chosen for this and not for taste.
+// SUM(f*f) is the lateral rules' Lyapunov function: splitting strictly
+// decreases it (2 -> (1,1) is 4 -> 2), equalizing strictly decreases it, and
+// descent strictly decreases SUM(f*y) instead. This move is NEUTRAL in both — it
+// only relocates a film — so on its own it could cycle forever, which is the
+// exact objection that kept the last eighth pinned in place.
+//
+// The gate is what forbids the cycle. The cell the film VACATES becomes air, and
+// it is a face neighbour of the cell that justified the move, which by the gate
+// holds >= LIQ_SPLIT_MIN. That cell can therefore split into the hole, and
+// splitting strictly decreases SUM(f*f). So: SUM(f*f) is non-increasing and
+// bounded below, hence eventually constant; over any stretch where it is
+// constant no split and no equalize happens; but every advance in that stretch
+// hands the neighbour behind it a split it can take. Contradiction — there are
+// only finitely many advances. A puddle whose cells all hold the same amount has
+// no cell at or over the split floor at all, so it makes no advance, finds
+// nothing else to do, and sleeps. That level state is what this exists to reach.
+//
+// `nf >= LIQ_SPLIT_MIN` and not the more natural `nf > f` IS that argument: a
+// neighbour merely thicker than the film can still be too thin to split into the
+// hole the film leaves, and at minFilm > 1 that gap is where the proof (and the
+// settling) breaks.
+fn filmPressed(c : vec3<i32>, mat : u32) -> bool {
+  for (var i = 0u; i < 4u; i++) {
+    let d = lateralDir(i);
+    let n = c + vec3<i32>(d.x, 0, d.y);
+    if (!inBounds(n)) { continue; }
+    let nw = voxWordAt(n);
+    if (voxMat(nw) != mat) { continue; }
+    if (voxState(nw) + 1u >= LIQ_SPLIT_MIN) { return true; }
+  }
+  return false;
+}
+
+// ---- the BRIDGED EQUALIZE: reaching past a cell that cannot itself move -----
+//
+// filmPressed frees the rim; this is what drains the CORE behind it, and the two
+// together are what actually lower a mound rather than merely widening it.
+//
+// WHAT IS LEFT AFTER filmPressed, measured on the ca-level gate: 216 eighths
+// dropped on a flat floor rest over 113 cells with the profile
+// 1:59 2:23 3:17 4:10 5:4 — an apron of single eighths around a core still five
+// eighths deep. The apron is the trap. A cell holding 1 with 1s around it cannot
+// split (nothing to halve), cannot equalize (its neighbours are equal) and is
+// not pressed (no neighbour over the split floor), so once the frontier has run
+// one cell ahead of the core the core is SEALED OFF from the only thing that was
+// draining it. Every pairwise rule is blind here: adjacent cells differ by
+// exactly one eighth all the way down the slope, which is the integer
+// equilibrium of a PAIR and nothing like the equilibrium of a surface.
+//
+// THE MOVE. A cell may transfer between TWO OF ITS OWN LATERAL NEIGHBOURS. Both
+// are one cell away, so the write reach is unchanged and the colour lattice's
+// disjointness argument is untouched — this is the same licence tryMove has
+// always used, spent on a pair of neighbours instead of on self and one
+// neighbour. What it buys is a look at a distance the direct rules do not have:
+// two cells that straddle a mediator are 2 apart (opposite laterals) or diagonal
+// (perpendicular ones), and on a slope of one eighth per cell they differ by
+// exactly 2 — which is the ordinary equalize threshold. The dome is therefore
+// unstable again, from the inside.
+//
+// It is physically the right picture as well as a convenient one: the mediator
+// is WATER. Pressure crosses a connected body of water; it does not have to be
+// carried cell by cell. Requiring the middle cell to hold this same liquid is
+// what keeps that true, and it also means the diagonal case needs no
+// crack-check — the path between two perpendicular neighbours runs through the
+// mediator, which is water by construction (compare cornerDescentOpen, which
+// exists precisely because a corner descent has no such guarantee).
+//
+// TERMINATION (rule 2) IS FREE, which is the reason this rule is worth having
+// and the diff-1 rules are not. It is an ordinary equalize — it moves
+// (fa - fb) / 2 eighths from the fuller cell to the emptier one across a gap of
+// at least TUNE_LIQUID_EQUALIZE — so it strictly decreases SUM(f*f) exactly as
+// the direct branch does. No new Lyapunov argument, no new risk: the same
+// bounded integer that already forbids the lateral rules from cycling forbids
+// this one.
+//
+// THE REMAINING LIMIT, since this is the last rung reach-1 can climb. The joint
+// fixpoint is now "no two cells within a mediated hop differ by 2", i.e. a
+// surface may still slope by one eighth per TWO cells instead of per cell — half
+// the dome, not no dome. Going further needs a look 4 cells wide, and a mediator
+// can only bridge cells that are both inside ITS write reach, so 2 is the end of
+// the line for this shape of rule. A genuinely level surface needs what a level
+// surface physically is: a global pressure solve (the MPM owns that) or a
+// mark/apply pass over a flux field (docs/RESEARCH_water_architecture.md option
+// B). Both are architecture, not a rule tweak.
+//
+// `apply` rather than a mirrored read-only twin, deliberately: the settled path
+// and the moving path MUST agree or a chunk either pins awake forever or sleeps
+// with work left (see canFlowAnywhere), and the cheapest way to guarantee that
+// is to have one function and one scan order. The scan is also NOT rng-rotated,
+// unlike every other lateral scan here: the read-only mirror makes no roll, so
+// rotating would let the two disagree about WHICH pair is available.
+fn bridgeLevel(c : vec3<i32>, mat : u32, apply : bool) -> bool {
+  // The four laterals' fullness, 0 meaning "not this liquid" (air, a wall,
+  // another material, out of window). Gathered before any write, so the pair the
+  // scan picks is a function of pre-move state.
+  var fl = array<u32, 4>(0u, 0u, 0u, 0u);
+  for (var i = 0u; i < 4u; i++) {
+    let d = lateralDir(i);
+    let n = c + vec3<i32>(d.x, 0, d.y);
+    if (!inBounds(n)) { continue; }
+    let nw = voxWordAt(n);
+    if (voxMat(nw) == mat) { fl[i] = voxState(nw) + 1u; }
+  }
+  for (var ia = 0u; ia < 4u; ia++) {
+    if (fl[ia] == 0u) { continue; }
+    for (var ib = 0u; ib < 4u; ib++) {
+      if (ib == ia || fl[ib] == 0u) { continue; }
+      if (fl[ib] + TUNE_LIQUID_EQUALIZE > fl[ia]) { continue; }
+      if (!apply) { return true; }
+      let da = lateralDir(ia);
+      let db = lateralDir(ib);
+      transferLiquid(c + vec3<i32>(da.x, 0, da.y), c + vec3<i32>(db.x, 0, db.y),
+                     mat, fl[ia], fl[ib], (fl[ia] - fl[ib]) / 2u);
+      return true;
+    }
+  }
+  return false;
 }
 
 // Would stepLiquid() find anything to do for this cell? PURE READ — it makes
@@ -904,8 +1079,11 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   }
 
   // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
-  //    split into air, step the last eighth off a riser, or displace something
-  //    lighter.
+  //    split into air, step a film off a riser or out from under the water
+  //    pressing on it, or displace something lighter.
+  // Hoisted out of the direction loop: it does not depend on `d`, and it is only
+  // ever asked of a cell too thin to split.
+  let pressed = f < LIQ_SPLIT_MIN && filmPressed(c, mat);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
     let n = c + vec3<i32>(d.x, 0, d.y);
@@ -916,12 +1094,15 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
       if (voxState(nw) + 1u + TUNE_LIQUID_EQUALIZE <= f) { return true; }
     } else if (nmat == MAT_AIR) {
       if (f >= LIQ_SPLIT_MIN) { return true; }
-      if (filmStepAllowed(c, d) && canDisplace(m.density, false, nw)) { return true; }
+      if ((pressed || filmStepAllowed(c, d)) &&
+          canDisplace(m.density, false, nw)) { return true; }
     } else if (canDisplace(m.density, false, nw)) {
       return true;
     }
   }
-  return false;
+  // 4) last resort: level two of the neighbours THROUGH this cell. Same scan and
+  //    same predicate as the moving path — one function, so they cannot drift.
+  return bridgeLevel(c, mat, false);
 }
 
 // Mass-conserving liquid flow (fullness in eighths, DESIGN.md §4).
@@ -972,6 +1153,9 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   //    moving mass downhill always strictly decreases SUM(f * y) and so can
   //    never oscillate.
   let r2 = rnd >> 14u;
+  // See filmPressed: a film under pressure may advance even though it is too
+  // thin to split. Hoisted for the same reason the mirror hoists it.
+  let pressed = f < LIQ_SPLIT_MIN && filmPressed(c, mat);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r2);
     let n = c + vec3<i32>(d.x, 0, d.y);
@@ -990,20 +1174,30 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
         transferLiquid(c, n, mat, f, 0u, f / 2u);
         return true;
       }
-      // Too thin to split: the whole film steps, off a one-voxel riser only.
-      // At minFilm 1 that is the last eighth and nothing else, exactly as
-      // before; above it the same rule carries a 2-3 eighth film off a terrace
-      // tread WHOLE instead of halving it into something thinner still, which
-      // is the behaviour the floor exists to prevent. filmStepAllowed's
-      // termination argument does not depend on f: the cell it vacates is air,
-      // so the move cannot repeat against the same riser.
-      if (filmStepAllowed(c, d) && tryMove(c, n, w, m.density, false)) {
+      // Too thin to split: the whole film steps. Two justifications, both
+      // reach-1 and both with their own termination argument (see the blocks
+      // on filmStepAllowed and filmPressed):
+      //   * it is standing against a one-voxel riser — the terrace tread case,
+      //     and the cell it vacates is air so the move cannot repeat; or
+      //   * water thick enough to split is pressing on it from behind, so
+      //     advancing hands that neighbour a split and the puddle levels.
+      // The second is what dissolves a dome; without it the rim is frozen and
+      // the cone behind it is a stable resting shape.
+      if ((pressed || filmStepAllowed(c, d)) &&
+          tryMove(c, n, w, m.density, false)) {
         return true;
       }
     } else if (tryMove(c, n, w, m.density, false)) {
       return true;
     }
   }
+
+  // 4) nothing this cell can do with its OWN mass — but it may still be the
+  //    bridge two of its neighbours need. See the bridgeLevel block: this is
+  //    what drains a mound whose rim has already run away from it, and it is an
+  //    ordinary equalize (SUM(f*f) strictly down), just reaching one cell
+  //    further.
+  if (bridgeLevel(c, mat, true)) { return true; }
   return false;  // settled — the caller decides whether to stay awake
 }
 

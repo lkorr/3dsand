@@ -376,7 +376,7 @@ TP_U(sim, ejectLiquid, TUNE_EJECT_LIQUID, 500)
 TP_U(sim, ejectPowder, TUNE_EJECT_POWDER, 350)
 TP_U(sim, ejectGas, TUNE_EJECT_GAS, 0)
 TP_U(sim, liquidEqualize, TUNE_LIQUID_EQUALIZE, 2)
-TP_U(sim, liquidMinFilm, TUNE_LIQUID_MIN_FILM, 2)
+TP_U(sim, liquidMinFilm, TUNE_LIQUID_MIN_FILM, 1)
 TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900)
 TP_U(sim, expMicroLifeTicks, TUNE_EXP_MICRO_LIFE, 40)
@@ -454,6 +454,12 @@ TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 1)
 TP_I(sim, fluidExciteCeiling, TUNE_FLUID_EXCITE_CEILING, 8000)
 TP_I(sim, fluidExciteRate, TUNE_FLUID_EXCITE_RATE, 4096)
 TP_I(sim, fluidExcitePerch, TUNE_FLUID_EXCITE_PERCH, 0)
+// exciteStep is the SURFACE-DISTURBANCE trigger, in whole cells: a body of
+// water whose surface stands this many cells proud of the water surface beside
+// it is a splash, not a pool, and goes to the solver so it lands with momentum
+// instead of relaxing in place. 0 disables it. Measured against the water
+// surface, so it is immune to the eighth-level shot noise a settle leaves.
+TP_I(sim, fluidExciteStep, TUNE_FLUID_EXCITE_STEP, 2)
 // How much of a SETTLED liquid cell's content the MPM grid carries as static
 // mass, as a fraction of rest density (1.0 = a full voxel reads exactly rest).
 // 0 restores the WP4 behaviour where the two representations pass through each
