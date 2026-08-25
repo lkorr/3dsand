@@ -268,7 +268,7 @@
     "fluidBubbleDensity": 1.05,
     "fluidSprayDensity": 0.42,
     "fluidFoamScaleIdx": 3,
-    "fluidExciteMode": 0,
+    "fluidExciteMode": 1,
     "fluidExciteCeiling": 8000,
     "fluidExciteRate": 4096,
     "fluidExcitePerch": 0,

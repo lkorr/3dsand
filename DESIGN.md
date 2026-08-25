@@ -273,6 +273,20 @@ SSBO lists of chunk indices.
   nibble); a cell flows into a lateral neighbor holding ≥ 2 eighths less, RNG on
   ties. Mass-conserving, settles flat, no oscillation. Viscosity is cheap: lava
   uses quarters and only updates every 3rd tick.
+- **THE CA IS THE BULK-TRANSPORT TIER, and that is a ratified decision**
+  (2026-08-25; `docs/RESEARCH_water_architecture.md` §7, merge a2e723e). The
+  open question was whether these liquid rules should be DELETED in favour of
+  MPM-only transport. They should not: an MPM-only 10×10×2 m lake is ~1.6M
+  particles ≈ 126 ms/tick, and that ceiling belongs to the method, not to the
+  implementation. So ownership is split BY STATE, not by material —
+  **the CA moves water that is SETTLED, the solver moves water that has
+  MOMENTUM**, and a cell is in exactly one of the two representations at a
+  time, which is what makes two movers safe. The four defects that made the CA
+  look like a dead end (a fullness-1 cell that could never spread, a
+  `liquidEqualize` staircase that was a stable equilibrium, whole-cell
+  4-direction descent, and a settled path that never re-marked its chunk) are
+  fixed rather than routed around; the `ca-slope` gate holds the result at
+  95.3% of a pour arriving down a stepped ramp with the box asleep.
 - **Gas**: inverse powder (up, then up-diagonals, then lateral), plus decay chance.
 - **Solid**: doesn't move; participates in reactions and structural checks only.
 - **Density displacement**: a mover entering a cell occupied by a less-dense
@@ -556,18 +570,60 @@ calm counters, `sim.fluidSettleTicks` consecutive ticks under
 segment-pooled bottom-up refill, all-or-nothing refusal per block — mass is
 EXACT integer eighths in both directions, and stains ride the particle's attr
 word round-trip). Excite triggers: (a) settled liquid with air below —
-gated by `sim.fluidExciteMode`, DEFAULT OFF until Phase 3 deletes the CA
-liquid movement (the CA still owns disturbed water, which is what keeps the
-pinned hash at 7cfa2420); (b) progressive wake — a grid node at an
-active/settled interface moving above `sim.fluidWakeSpeed` (4× the settle
-threshold: hysteresis) wakes the neighbouring settled cell, always on,
-hash-safe because it needs existing particles; (c) DIAGONAL FALL (WP3) — a
-settled cell resting on terrain with an EMPTY lateral neighbour whose own
-below-cell is also empty, i.e. the water is perched on a ledge and could fall
-diagonally. Gated by `sim.fluidExciteMode` like (a). This is the trigger (a)
-structurally cannot see: on a slope there is terrain directly below, so
-nothing "falls", yet the cell diagonally down-slope is air even for a
-one-voxel step.
+gated by `sim.fluidExciteMode`, **DEFAULT ON since WP5** (2026-08-25); (b)
+progressive wake — a grid node at an active/settled interface moving above
+`sim.fluidWakeSpeed` (4× the settle threshold: hysteresis) wakes the
+neighbouring settled cell, always on, hash-safe because it needs existing
+particles; (c) DIAGONAL FALL (WP3) — a settled cell resting on terrain with an
+EMPTY lateral neighbour whose own below-cell is also empty, i.e. the water is
+perched on a ledge and could fall diagonally. **Default OFF since WP5**
+(`sim.fluidExcitePerch`), on the EXCITE side only — see below.
+
+**WP5: THE FLIP, AND WHAT IT COSTS** (2026-08-25; world hash 7b01cfd8 →
+58b27f33). `sim.fluidExciteMode` ships at 1, so world water responds to being
+dug under. The plan's other half — deleting the CA's liquid movement — was
+REJECTED; see §4's movement rules and `RESEARCH_water_architecture.md` §7.
+Three things had to land with the flip:
+
+- **THE BURST IS BOUNDED** (`sim.fluidExciteCeiling`, default 8,000
+  particles; `sim.fluidExciteRate`, 4,096/tick). Excite is a per-cell trigger
+  with no notion of "only wake what the disturbance can reach". Fixing the CA
+  did NOT remove that, and the reason is worth remembering: while the CA
+  drains a body, its partial descent leaves a transient gap under cells all
+  over the body, so trigger (a) — "air below" — fires far beyond the hole. On
+  the `worldlake` bench scene (worldgen's authored 347,832-voxel lake, 5×5
+  shaft opened under a body that is provably asleep first) with the ceiling
+  lifted to the pool: 352 → 1,916 → … → 262,144 live, the whole pool, held at
+  ~70 ms/frame to end of run. That is the reported "it turns the whole lake
+  into fluid".
+- **REFUSAL IS GRACEFUL, and it is a property of the hybrid rather than of any
+  fallback code.** Refused water is still SETTLED water, and the CA moves
+  settled water. So the ceiling costs COVERAGE — how much of a body is
+  visibly in motion — and not drain progress: measured on that same puncture,
+  eighths delivered to the sealed chamber in 400 ticks are 73,672 / 72,996 /
+  74,572 / 75,599 at ceilings 4k / 8k / 16k / 32k against 70,743 for the CA
+  with no seam at all, i.e. FLAT, while frame p95 runs 24.9 / 27.1 / 28.8 /
+  34.8 ms. The ceiling is a look knob above the point where it stops clipping
+  bodies that were never going to burst.
+- **THE PERCH TRIGGER IS OFF**, and that is a measured reversal of WP3's
+  expectation, not a preference. It existed to unstick water the CA had parked
+  on a slope, and the CA no longer parks water on slopes: with it on vs off,
+  `pond68` produces 1,150 vs 1,150 excite candidates and `worldlake` 169,616
+  vs 169,616 — byte-identical — for 24% more seam time. Worse, on the sealed
+  ramp of the `ca-slope-hybrid` gate it prevents water from ever SETTLING (8
+  settle commits over 400 ticks with it on, 369 with it off): anything settle
+  produces, the perch trigger immediately takes back. That is the settle↔wake
+  thrash WP3 warned about, arriving through the trigger rather than the wake
+  speed. It stays behind a knob rather than being deleted because
+  `settleCheck`'s stability veto must keep evaluating the FULL predicate —
+  settle refusing more than excite takes is the safe direction of the
+  hysteresis; the reverse oscillates.
+
+KNOWN RED, recorded rather than fixed: `ca-slope-hybrid` finds a mass leak in
+the SETTLE path (~0.4 eighths per settle commit) that is invisible on
+large-body scenes because they barely settle. It is not excite (excited ==
+emitted exactly), not reactions (consumed == 0), not an audit-bounds artifact,
+and not the CA (the excite-off arm is exact). See `tests/BASELINE.md`.
 
 SETTLE IS EXCITE-STABLE BY CONSTRUCTION (WP3, plan §6 item 2). `settleCheck`
 runs a second test after column feasibility: every cell the walk would write
@@ -582,8 +638,14 @@ water stands on, not about its surface: asked at every level it is true of
 every pool that is not level to one eighth, since the column walk bottom-packs
 and a deeper column's top cell always overhangs a shallower neighbour's empty
 one. The excite side applies the identical base restriction, so {cells excite
-takes} == {cells settle refuses to create} and the pair cannot oscillate. At
-mode 0 a base cell holding >= 2 eighths is exempt — that is the CA's own
+takes} ⊆ {cells settle refuses to create} and the pair cannot oscillate. That
+is a SUBSET, not an equality, since WP5 turned `sim.fluidExcitePerch` off: the
+veto keeps evaluating the full predicate while excite no longer acts on the
+perch arm of it, and the asymmetry is deliberately in that direction only.
+Settle refusing MORE than excite takes is safe — the water stays particles a
+while longer. The reverse would let settle create a configuration excite
+immediately tears up again. At mode 0 a base cell holding >= 2 eighths is
+exempt — that is the CA's own
 lateral-spread threshold (`sim_step`'s `if (f >= 2u)`), so the CA will move it
 and refusing would cause the freeze rather than prevent it.
 

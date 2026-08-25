@@ -449,7 +449,7 @@ TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
 // ever have live at once; the rate is how fast it may get there. Neither
 // applies to explicit spawns (the mpm tool, the lab pours) — pouring water is
 // something the player did, a lake exciting itself is not.
-TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 0)
+TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 1)
 TP_I(sim, fluidExciteCeiling, TUNE_FLUID_EXCITE_CEILING, 8000)
 TP_I(sim, fluidExciteRate, TUNE_FLUID_EXCITE_RATE, 4096)
 TP_I(sim, fluidExcitePerch, TUNE_FLUID_EXCITE_PERCH, 0)

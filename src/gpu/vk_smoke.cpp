@@ -104,13 +104,25 @@ constexpr Pinned kQuietPinned[] = {
                        // recorded independently
 };
 
+// RE-RECORDED at WP5's flip of sim.fluidExciteMode to 1 (world hash 7b01cfd8
+// -> 58b27f33). 18 of the 19 moved; `worldgen` is byte-identical, as it must
+// be — worldgen writes voxels and the seam does not run.
+//
+// The split between the two scenarios is the attribution, and it is worth
+// stating because "the hash moved" and "the sim broke" look alike in a diff:
+// the QUIET scenario is still 5/5 on its ORIGINAL pinned values through tick
+// 50, and that world contains worldgen's disc ponds and its authored lake. So
+// the world's own standing water does not excite itself, drain spontaneously,
+// or cost anything undisturbed. Only the LOUD scenario moved, and that one
+// paints a water brush at (176,150,176) from tick 8 and detonates next to it —
+// exactly the water whose mover changed.
 constexpr Pinned kLoudPinned[] = {
     {0, 0xf97ba745},   // worldgen — same seed, so identical to the quiet run
-    {15, 0x958d2cd1},  {30, 0x9d6c5841},  {45, 0x896e2082},  {46, 0x5436693c},
-    {47, 0x22ec46d9},  {52, 0xc50f2236},  {53, 0x663bc868},  {60, 0xf4fd73c6},
-    {75, 0x3c954bbf},  {76, 0x20fd330a},  {84, 0x95a876da},  {85, 0x4850717a},
-    {86, 0x38802cbb},  {87, 0x250cd625},  {88, 0x1a9022a2},  {90, 0x2fe6536b},
-    {105, 0x16c239c7}, {120, 0xcb036bd1},
+    {15, 0x2f81fec3},  {30, 0xe6906e15},  {45, 0x177f5d53},  {46, 0x0c5310f2},
+    {47, 0xe7185db5},  {52, 0x7a52938a},  {53, 0x8f081e5a},  {60, 0x7873a1a7},
+    {75, 0x549a7d60},  {76, 0x8210dcd6},  {84, 0x8c621066},  {85, 0xfea40fea},
+    {86, 0x518f1266},  {87, 0xb880adb6},  {88, 0x76816030},  {90, 0x74583271},
+    {105, 0x4f24dd50}, {120, 0x4321fd68},
 };
 
 // The loud scenario, verbatim from phase 3c: ops shaped to light up every
