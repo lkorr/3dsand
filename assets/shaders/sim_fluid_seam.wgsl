@@ -143,6 +143,30 @@ const SEAM_WAKE4 : i32 =
     i32(round(TUNE_FLUID_WAKE_SPEED * 65536.0 / 30.0)) >> 4u;
 const SEAM_WAKE2 : i32 = (SEAM_WAKE4 * SEAM_WAKE4) >> 8u;
 const SEAM_CALM_TICKS : u32 = u32(clamp(TUNE_FLUID_SETTLE_TICKS, 8, 600));
+
+// ---- the free-surface gravity bias, and why every speed test removes it ----
+// A weakly-compressible MPM free surface is NEVER at rest. Pressure comes from
+// density >= rest, so the top layer of any pool has none, and gridUpdate adds
+// FLUID_GRAVITY / FLUID_SUBSTEPS to it every substep with nothing to cancel it.
+// Velocity is overwritten from the grid each substep (pure PIC+APIC), so it
+// does not accumulate — it sits at exactly one substep of gravity, forever.
+// At the owner's 900 vox/s^2 and 9 substeps that is 3.33 cells/tick = 100
+// vox/s, and the calm judgement is a MAX over the chunk, so ONE surface
+// particle vetoed every pool in the engine. Measured: the fluid-excite gate's
+// drained chamber ended at max 90 vox/s after 320 ticks of 0.9/s damping —
+// damping cannot touch it, because the grid regenerates it every substep.
+//
+// So every speed test here reads the SMALLER of |v| and |v + one substep of
+// gravity|. Taking the min rather than always correcting is what makes it safe
+// on the other half of the surface: a node the BC has already zeroed (resting
+// on a floor) is genuinely at rest at v = 0, and blindly adding gravity back
+// would make IT read 100 vox/s instead. Both readings of "at rest" map to 0,
+// and a genuinely falling particle keeps all but one substep of its speed.
+// The bias was also why settleEps had to be re-scaled with gravity at all;
+// with it gone the threshold means the same thing at any g.
+const SEAM_GRAV_SUB : i32 =
+    i32(round(TUNE_FLUID_GRAVITY * 65536.0 / 900.0)) / FLUID_SUBSTEPS;
+fn seamRestVy(vy : i32) -> i32 { return min(abs(vy + SEAM_GRAV_SUB), abs(vy)); }
 // Hydrostatic compression per cell of depth, Q16: how much smaller than 1 the
 // seeded J gets per submerged cell. g/K with the /900 human-unit conversions
 // cancelling; clamped so even a pathological tuning cannot invert J.
@@ -531,8 +555,13 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
         if (bm == 0u) { continue; }
         let nb = seamNodeBase(bm, n);
         if (fluidGridR[nb] < 16) { continue; }  // FLUID_MASS_MIN
+        // Same free-surface gravity strip as the calm measure. Without it the
+        // node just above any settled pool reads a full substep of gravity —
+        // 100 vox/s at the owner's defaults, four times wakeSpeed — so the
+        // wake trigger fired on every settled cell touching any fluid node,
+        // permanently. That is the other half of the settle<->wake thrash.
         let vx = fluidGridR[nb + 1u] >> 8u;
-        let vy = fluidGridR[nb + 2u] >> 8u;
+        let vy = seamRestVy(fluidGridR[nb + 2u]) >> 8u;
         let vz = fluidGridR[nb + 3u] >> 8u;
         if (vx * vx + vy * vy + vz * vz >= SEAM_WAKE2) {
           excite = true;
@@ -878,7 +907,8 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!inWindow(cell, T.origin)) { return; }
   let slot = chunkSlotIndex(worldChunkOf(cell));
-  let sx = p.vx >> 8u; let sy = p.vy >> 8u; let sz = p.vz >> 8u;
+  // seamRestVy: strip the free-surface gravity bias (see the const block).
+  let sx = p.vx >> 8u; let sy = seamRestVy(p.vy) >> 8u; let sz = p.vz >> 8u;
   let s2 = u32(sx * sx + sy * sy + sz * sz);
   atomicMax(&settleScratch[SP_SPEED + slot], s2 + 1u);
 
@@ -988,18 +1018,22 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
 // settleJudge: one thread per chunk slot. Speed 0 means "no particles here" —
 // the calm counter resets so a re-flooded chunk starts its window over.
 //
-// THE NEIGHBOURHOOD IS PART OF THE JUDGEMENT (WP3, the settle<->wake thrash).
-// Settle is a per-CHUNK decision; wake (the always-on excite trigger) is a
-// per-CELL one that fires on a face neighbour's grid-node speed. A chunk on the
-// edge of a churning pool is calm by its OWN particles, settles, and is woken
-// again on the next tick by the water next door — measured at the owner's
-// defaults as 3,833 eighths settled against 3,721 re-excited in one 400-tick
-// gate run, i.e. every eighth converting three times over and the pool never
-// quieting. A threshold gap cannot close that (the two thresholds measure
-// different quantities in different places); the geometry has to: do not
-// settle next to water energetic enough to wake you. A face neighbour with no
-// particles reads speed 0 and is quiet by definition, so a lone pool in still
-// air is unaffected.
+// A NOTE ON THE THRASH THIS DOES NOT NEED TO HANDLE. Settle is a per-CHUNK
+// decision and wake is a per-CELL one, so an earlier WP3 revision also
+// required the six face-neighbour chunks to be quiet before a block could
+// bank a calm tick — a chunk on the edge of churning water was settling and
+// being woken again the next tick, measured at 3,833 eighths settled against
+// 3,721 re-excited in one 400-tick gate run.
+//
+// That neighbourhood gate is GONE, because the thrash was not what it looked
+// like: the wake trigger was reading the free-surface gravity bias (see
+// SEAM_GRAV_SUB) as 100 vox/s of motion on every node above every settled
+// pool, so it fired permanently and unconditionally. Stripping the bias
+// removes the cause; the gate only removed the symptom, and it removed a great
+// deal of legitimate settling with it (0 blocks picked in four of five bench
+// scenes, and the sealed fluid-excite chamber never converting at all).
+// Re-excitation is measured, not assumed — FA_EXCITED against FA_SETTLED, the
+// `re-excited` column of --fluid-bench's seam-flow line.
 @compute @workgroup_size(256)
 fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
@@ -1009,43 +1043,11 @@ fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
     atomicStore(&fluidCalm[slot], 0u);
     return;
   }
-  if (i32(sp - 1u) > SEAM_SETTLE2) {
-    atomicStore(&fluidCalm[slot], 0u);   // this chunk's own water is moving
-    return;
+  if (i32(sp - 1u) <= SEAM_SETTLE2) {
+    atomicAdd(&fluidCalm[slot], 1u);
+  } else {
+    atomicStore(&fluidCalm[slot], 0u);
   }
-  // The neighbourhood gate HOLDS the counter, it does not reset it. Those are
-  // different facts: "my water is moving" invalidates the window and has to
-  // start it over, but "the water next door is moving" only means the moment
-  // is wrong — a single transient spike three chunks along the pour should not
-  // cost a pool the 45 calm ticks it has already banked, or a busy scene never
-  // banks 45 in a row anywhere.
-  var quietAround = true;
-  {
-    // Face neighbours, in world-chunk space: the toroidal window makes slot
-    // adjacency world adjacency EXCEPT across the wrap plane, so this goes
-    // through worldChunkOf/chunkSlotIndex rather than adding 1 to the slot.
-    let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                       i32(slot / (NCHUNK * NCHUNK)));
-    let wc = slotToWorldChunk(sc, T.origin);
-    for (var f = 0u; f < 6u; f++) {
-      var d = vec3<i32>(0, 0, 0);
-      if (f == 0u) { d.x = 1; } else if (f == 1u) { d.x = -1; }
-      else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
-      else if (f == 4u) { d.z = 1; } else { d.z = -1; }
-      let n = wc + d;
-      if (!chunkInWindow(n, T.origin)) { continue; }
-      // The bar for the NEIGHBOUR is wakeSpeed, not settleEps: what breaks the
-      // loop is precisely "a neighbour energetic enough to wake me again", and
-      // that threshold is the wake trigger's own. Holding neighbours to
-      // settleEps as well was measured to be far too strict — 0 blocks picked
-      // in four of five bench scenes, i.e. no settling anywhere — while
-      // wakeSpeed leaves the thrash closed and lets a pool convert under a
-      // still-moving surface.
-      let nsp = atomicLoad(&settleScratch[SP_SPEED + chunkSlotIndex(n)]);
-      if (nsp != 0u && i32(nsp - 1u) > SEAM_WAKE2) { quietAround = false; break; }
-    }
-  }
-  if (quietAround) { atomicAdd(&fluidCalm[slot], 1u); }
 }
 
 // settleScan: pick up to SETTLE_MAX calm blocks, in slot order, with a greedy

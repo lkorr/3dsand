@@ -548,7 +548,42 @@ liquid movement (the CA still owns disturbed water, which is what keeps the
 pinned hash at 7cfa2420); (b) progressive wake — a grid node at an
 active/settled interface moving above `sim.fluidWakeSpeed` (4× the settle
 threshold: hysteresis) wakes the neighbouring settled cell, always on,
-hash-safe because it needs existing particles. Excite marks candidates in
+hash-safe because it needs existing particles; (c) DIAGONAL FALL (WP3) — a
+settled cell resting on terrain with an EMPTY lateral neighbour whose own
+below-cell is also empty, i.e. the water is perched on a ledge and could fall
+diagonally. Gated by `sim.fluidExciteMode` like (a). This is the trigger (a)
+structurally cannot see: on a slope there is terrain directly below, so
+nothing "falls", yet the cell diagonally down-slope is air even for a
+one-voxel step.
+
+SETTLE IS EXCITE-STABLE BY CONSTRUCTION (WP3, plan §6 item 2). `settleCheck`
+runs a second test after column feasibility: every cell the walk would write
+must FAIL the geometric excite triggers, so a settled configuration can never
+immediately satisfy one. It runs regardless of `sim.fluidExciteMode`, which is
+the point — the reported "water clumps and settles on the hill instead of
+flowing down" happens at mode 0, where nothing can re-excite it and the CA's
+`liquidEqualize` then holds the staircase as a stable equilibrium forever. The
+test is asked only at the BASE of each water column (the cell whose own below
+is not this liquid), because "perched" is a statement about the ledge a body of
+water stands on, not about its surface: asked at every level it is true of
+every pool that is not level to one eighth, since the column walk bottom-packs
+and a deeper column's top cell always overhangs a shallower neighbour's empty
+one. The excite side applies the identical base restriction, so {cells excite
+takes} == {cells settle refuses to create} and the pair cannot oscillate. At
+mode 0 a base cell holding >= 2 eighths is exempt — that is the CA's own
+lateral-spread threshold (`sim_step`'s `if (f >= 2u)`), so the CA will move it
+and refusing would cause the freeze rather than prevent it.
+
+Settle's calm judgement also folds in the six FACE-NEIGHBOUR chunks' speed
+maxima, at the WAKE threshold: settle is per-chunk and wake is per-cell, so a
+chunk on the edge of churning water settled and was woken again the next tick
+(measured 3,833 eighths settled against 3,721 re-excited in one gate run). The
+neighbourhood HOLDS the calm counter rather than resetting it — "my water is
+moving" invalidates the window, "the water next door is" only means not yet.
+A refused block halves its counter instead of zeroing it, so an awkward pool
+gets a cooldown instead of re-running the whole window forever.
+
+Excite marks candidates in
 voxel scratch bits 19..23 (set by detect, consumed the same tick by emit —
 budget refusals restore the word), assigns emission offsets by a slot-order
 scan (never first-come atomics), and refuses whole slots past the
@@ -614,6 +649,27 @@ the carried stain; frontier neighbour-count scaling sees excited fluid as
 air; a sealed, undamped pool at stock stiffness can churn indefinitely
 (sim.fluidDamping defaults to 0 — the settle gates document the tuning that
 calms adversarial geometry, and Phase 7 owns the defaults).
+
+THIN FILMS ARE INERT IN BOTH REPRESENTATIONS (WP3 measurement, the open one).
+A film shallower than about one cell gathers rho well below rest across the
+solver's 3-cell B-spline support, so its EOS pressure is zero-clamped and the
+MPM has no lateral driving force at all: it sits where it lands. The CA cannot
+move it either below 2 eighths (`stepLiquid`'s lateral-spread gate). The hill
+bench scene shows this directly — 440 ticks after the pour stops, a puddle
+rests on every tread of the ramp and the catch-basin capture sticks at 51%.
+Settling those puddles is NOT the fix (that is exactly the mid-slope freeze),
+and the seam correctly refuses them; the fix is solver-side (a sub-rest
+pressure floor, or Clavet near-pressure) or WP5's CA deletion. `--fluid-bench`
+prints the split as `seam flow: ... N unstable`, which is how it was located.
+
+SUBSTEPS ARE THE CFL BUDGET AND A TUNING KNOB (`sim.fluidSubsteps`, WP3).
+`FLUID_VMAX` (0.45 cell/substep, expressed in cells/tick — also the fluid's
+terminal velocity) and `FLUID_MARK_PAD` are DERIVED from it in common.wgsl, and
+`EncodeTick` records the substep table that many times. The pseudo sound speed
+sqrt(stiffness)/30 must fit under 0.45 cells/substep or the clamp converts
+pressure work into silent energy loss — the "mushy under agitation" regime. At
+the shipped stiffness of 14000 that is 8.7, hence the default of 9; at the
+previous 6 the clamp engaged on ~575 of 600 bench ticks in every scene.
 
 The solver (2026-08-22, second pass) follows grantkot's WebGPU MLS-MPM shape:
 P2G is split into a mass/momentum scatter (`p2g1`) and a stress scatter

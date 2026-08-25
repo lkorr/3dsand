@@ -636,14 +636,8 @@ PASS(seam_stain_apply, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_STAIN_APPLY, K_
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) A(DirtyOut)
           R(FluidBlockList) A(FluidCellScratch) A(FluidArgsStage)
           A(FluidBlockMap) I(FluidDispatchArgs)))
-// U(TickUBO): the calm judgement folds in the six FACE-NEIGHBOUR chunks'
-// speed maxima (a chunk on the edge of churning water settles by its own
-// particles and is woken again by the water next door — the settle<->wake
-// thrash WP3 measured). Slot adjacency is not world adjacency across the
-// toroidal window's wrap plane, so the neighbour walk goes through
-// slotToWorldChunk/chunkSlotIndex, which needs the origin.
 PASS(seam_settle_judge, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_JUDGE, K_COMPUTE, 128,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
-     USES(U(TickUBO) A(FluidSettleScratch) A(FluidCalm)))
+     USES(A(FluidSettleScratch) A(FluidCalm)))
 PASS(seam_settle_scan, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(A(FluidCalm) A(FluidSettleScratch) A(FluidArgsStage)))
 // read-only in practice: `fluidParticles` is read_write for the module;

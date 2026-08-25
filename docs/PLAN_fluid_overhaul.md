@@ -785,6 +785,147 @@ What the numbers and screenshots say:
 
 ---
 
+### WP3 results (measured 2026-08-24, RTX 3060 Ti, 1080p offscreen)
+
+`bash scripts/run.sh ./build/Release/sandvox.exe --fluid-bench all --json
+docs/bench/wp3_after.json`. **Before = `docs/bench/wp3_before.json`, the fork
+point at the OWNER'S NEW DEFAULTS (commit 987c595, stiffness 14000 / gravity
+900).** The WP2 block above was measured at 3600 / 98.1 and is a different
+configuration — do not diff against it.
+
+#### The substep verdict (§6's enabling change)
+
+987c595 handed WP3 the question "more substeps or less stiffness". More
+substeps, and it is not close. `sim.fluidSubsteps` is now a tuning knob
+(default 9 = ceil(sqrt(14000)/13.5)); `FLUID_VMAX` and `FLUID_MARK_PAD` derive
+from it, and `EncodeTick` records the substep table that many times.
+
+| scene | clamp engagements 6 -> 9 substeps | frame p50 | substep table |
+|---|---|---|---|
+| basin  |  6,617,517 ->   590,308 (-91%) | 11.49 -> 13.10 | 2.63 -> 4.56 |
+| hill   | 15,844,997 -> 2,025,963 (-87%) | 20.56 -> 22.38 | 4.26 -> 6.30 |
+| faucet | 25,779,213 -> 3,526,505 (-86%) | 16.80 -> 18.55 | 1.93 -> 3.57 |
+| pool   | 10,793,663 -> 1,356,961 (-87%) | 14.78 -> 15.59 | 2.73 -> 4.03 |
+| slosh  |  2,462,964 ->   388,172 (-84%) | 13.46 -> 13.07 | 1.77 -> 2.50 |
+
++5..14% whole-frame, and it is what makes the owner's stiffness legal. The
+residual clamp is ADVECTIVE, not acoustic: at gravity 900 a 40-voxel drop wants
+8.9 cells/tick against a VMAX of 4.05, so the clamp is now acting as the
+terminal velocity that 9x gravity implies. Unclamping that needs ~20 substeps
+(3x the solver cost); 9 is the sound-speed-honest budget and the knob is there
+if the owner wants to buy more.
+
+#### End state
+
+| scene | frame p50 | fluid substep | seam+settle | fluid march | clamps | picks (infeasible/unstable/committed) | settled | capture |
+|---|---|---|---|---|---|---|---|---|
+| basin  | 14.26 | 4.95 | 0.37 | 3.64 |   441,926 | 0 (0/0/0)    |     0 | - |
+| hill   | 24.52 | 6.79 | 0.43 | 9.87 | 2,019,793 | 2 (0/0/2)    |   710 | 51.1% |
+| hill0  | 24.57 | 6.84 | 0.42 | 9.69 | 2,019,793 | 2 (0/0/2)    |   710 | 51.1% |
+| faucet | 20.35 | 4.05 | 0.34 | 9.18 | 3,526,505 | 0 (0/0/0)    |     0 | - |
+| pool   | 17.08 | 4.32 | 0.34 | 6.36 | 1,356,961 | 0 (0/0/0)    |     0 | - |
+| slosh  | 14.38 | 2.54 | 0.29 | 5.25 |   270,352 | 10 (0/0/10)  | 4,057 | - |
+| pool-settle | 16.88 | 4.31 | 0.35 | 6.86 | 794,140 | 0 (0/0/0) |    0 | - |
+
+Mass ledger EXACT in all 7 runs. `tick-of-settle` is still -1 everywhere (no
+scene reaches ZERO live particles inside its run) — see the thin-film finding.
+
+**The frame times in this table are ~8-13% high and the seam is cost-neutral.**
+The proof is inside the table: `faucet`, `pool` and `pool-settle` have
+BYTE-IDENTICAL clamp counts across the substeps-9 and final runs, i.e. those
+simulations are bit-identical, yet their substep tables read 3.57 -> 4.05,
+4.03 -> 4.32 and 4.08 -> 4.31 ms. `tasklist` during the final run showed seven
+`MSBuild.exe` and two `cl.exe` from a concurrent session. Quote the
+substeps-9 column for cost, this one for behaviour.
+
+#### Per item
+
+1. **New excite triggers.** (b) diagonal fall landed, gated by
+   `fluidExciteEnable`. (c) the lateral pressure gradient did NOT — see item 2;
+   it cannot be the stability test and the two must be one predicate.
+2. **Hysteresis by construction — the headline.** `settleCheck` refuses any
+   block whose resulting cells would satisfy a geometric excite trigger,
+   regardless of `exciteMode`. Three measured iterations to get the predicate
+   right, all recorded in `seamLateralExcite`'s comment:
+   * the plan's ">= 2 eighths lower": **36 of 36 picks refused, 0 settled.**
+     Fullness is a PARTICLE COUNT, so 2 eighths is under the discretization's
+     own shot noise — and worse, the column walk bottom-packs, so a deeper
+     column's top cell is beside a shallower one's empty cell at the surface of
+     every pool that is not level to one eighth.
+   * diagonal-fall at every level: **still 40 of 40.** Same overhang.
+   * diagonal-fall at the BASE of each water column: **0 refused, everything
+     real settles.** "Perched" is about the ledge a body of water stands on.
+   The excite side applies the identical base restriction, so {cells excite
+   takes} == {cells settle refuses to create}, exactly. At `exciteMode` 0 a
+   base cell holding >= 2 eighths is exempt: that is the CA's own
+   lateral-spread gate, so the CA will move it and refusing would CAUSE the
+   freeze rather than prevent it.
+   Working, and visible in the numbers: the eps-30 probe picked the hill's
+   tread puddles and refused **15 of 24 as unstable** — those are precisely the
+   mid-slope perched films that, before WP3, became CA voxels and stayed.
+3. **Refusal halves the calm counter** instead of zeroing it. Done.
+4. **Settle trio retuned**: settleEps 0.9 -> **6.0**, wakeSpeed 3.6 -> **24.0**,
+   settleTicks 45 -> **24**. The solver's at-rest speed floor is proportional to
+   gravity (a free-surface node takes gravity/substeps every substep before
+   pressure answers it) and 0.9 was calibrated at 98.1; at 900 nothing settled
+   anywhere, in any scene, at any tick. settleTicks 24 doubled the settled mass
+   on hill (353 -> 710) and moved the fluid-settle gate's quiet tick 61 -> 40.
+   Also new here: `settleJudge` folds in the six face-neighbour chunks' speed
+   maxima at the WAKE threshold, and HOLDS the calm counter rather than
+   resetting it. Settle is per-chunk, wake is per-cell, so a chunk on the edge
+   of churning water settled and was woken again next tick — 3,833 eighths
+   settled against 3,721 re-excited in one gate run, every eighth converting
+   three times over.
+5. **THE PLUNGE-CHURN / CAPTURE PROBLEM IS NOT CHURN, AND IS NOT THE SEAM'S.**
+   Capture moved 48.6% -> 51.1% and stopped, identically at exciteMode 0 and 1
+   and under every settle rule tried. `screenshot_lab_hill.bmp` says why: 440
+   ticks after the pour stops, the ramp holds **a puddle on every single
+   tread** — static, not recirculating (capture is stable across runs, where
+   WP2 measured it DECREASING). A film shallower than about one cell gathers
+   rho far below rest across the solver's 3-cell B-spline support, so its EOS
+   pressure is zero-clamped and **the MPM has no lateral driving force at
+   all**. The CA cannot move it either below 2 eighths. Settling it is exactly
+   the mid-slope freeze, so the seam correctly refuses. This is a SOLVER gap
+   (WP2's file) or WP5's: a sub-rest pressure floor, Clavet near-pressure, or
+   deleting the CA's liquid rules and giving films to the MPM properly. An eps
+   30 probe (1 cell/tick — visibly moving water) raised capture to 51.3%,
+   confirming no settle threshold reaches it.
+6. **fluid-det and fluid-settle are green at stock.**
+   * `fluid-det`'s failure was **NOT nondeterminism** — the particle hash and
+     world hash matched across both runs on the failing tree. It was the
+     `escaped` sanity assert: 77 of 512 particles left the basin, because at
+     6 substeps the clamp-saturated solver flung them. The substep change fixed
+     it outright: **0 escaped, 384 of 512 eighths settled, PASS.**
+   * `fluid-settle`: 0 settled / 1,280 live / 40 picks all refused ->
+     **1,280 of 1,280 converted, quiet at tick 40, 0 live / 0 blocks, 4 picks
+     4 committed, 0 re-excited, mass exact, world hash matches.**
+7. **`fluid-react` stays baselined.** Not chased: the seam-side mass accounting
+   is now instrumented (FA_SETREFUSED / FA_SETUNSTABLE) but the gate's own
+   ~2,700-of-2,704 shortfall was not reproduced or attributed inside this WP's
+   budget, and it is a reaction/consumption path rather than the settle path
+   WP3 rebuilt.
+
+**fluid-excite override set: 3 -> 1** (the §5 success signal, continuing).
+Gone: settleEps 6.0 and wakeSpeed 24.0, which ARE stock now. Left: the sealed
+box's `fluidDamping 0.9`, which is a property of the geometry, not a defect in
+the defaults. `fluid-stain` and `fluid-react` lose the same two.
+
+New diagnostics, and every diagnosis above came from them: `FA_SETREFUSED`
+(word 25, infeasible) and `FA_SETUNSTABLE` (word 26, excite-unstable), printed
+by `--fluid-bench` as a `seam flow:` line and by the fluid-settle gate as
+`picks: N = A infeasible + B unstable + C committed`. "0 settled" has two
+opposite causes — never went calm, or went calm and was refused — and there was
+previously no way to tell them apart.
+
+Screenshot verdicts: only `hill` has a camera outside-and-above its geometry;
+`basin`, `pool`, `faucet` and `slosh` are shot from outside a walled box whose
+near wall hides the water, so those four cannot be visually judged from the
+bench camera at all (worth fixing in the lab). `hill` reads correctly: the
+water sheets as a connected film, the carved catch basin is filled and flat,
+and the terraced tread puddles are the finding in item 5.
+
+---
+
 ## 10. Handoff rules for implementing agents
 
 - Board-claim per WP (`bash scripts/board.sh claim`), one worktree per WP if
@@ -798,7 +939,7 @@ What the numbers and screenshots say:
   knobs follow the 5-place TUNE_* pipeline; sim.fluid* stays in the
   human-unit-floats-const-eval exception lane.
 - Known-failing on main as of 2026-08-24: `fluid-react` (board note,
-  post-baseline gate). Attribute failures against clean HEAD before blaming
+  post-baseline gate; still baselined after WP3 — see the WP3 block item 7). Attribute failures against clean HEAD before blaming
   your diff (standing repo lesson).
 - Every landed WP updates DESIGN.md in the same commit where behavior
   changed, and appends measured numbers to §9 of this doc.

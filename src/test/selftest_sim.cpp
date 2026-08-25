@@ -1018,6 +1018,7 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   uint32_t excitedSum = 0, live = ~0u, blocks = ~0u, endEighths = 0;
   uint32_t compressed = 0, sampled = 0, liveEighths = 0;
   uint32_t setBlocksSum = 0;  // settle picks over the run (refusal-loop probe)
+  uint32_t infeasibleSum = 0, unstableSum = 0;  // and why they were refused
   int32_t endMaxS2 = -1;      // max (v>>8)^2 at end (never-calm probe)
   for (int run = 0; run < 2; run++) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -1063,16 +1064,22 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
       ctx.WaitIdle();
       ctx.ProcessEvents();
       if (i >= kCarveTick) {
-        uint32_t fa[16] = {};
+        uint32_t fa[32] = {};
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
-                              fa, 64, "exciteArgs");
+                              fa, 128, "exciteArgs");
         live = std::min(fa[7], kFluidCap);
         blocks = fa[3];
         excitedSum += fa[11];
         setBlocksSum += fa[13];
+        // WP3's refusal split (FA_SETREFUSED / FA_SETUNSTABLE): "picked but
+        // nothing settled" has two opposite causes and this is the only thing
+        // that can tell them apart.
+        infeasibleSum += fa[25];
+        unstableSum += fa[26];
         if (run == 1 && i % 40 == 0)
           std::printf("  excite t%d: live %u, blocks %u, excited+ %u, "
-                      "picks+ %u\n", i, live, blocks, fa[11], fa[13]);
+                      "picks+ %u (%u infeasible, %u unstable)\n",
+                      i, live, blocks, fa[11], fa[13], fa[25], fa[26]);
         // Exact one-tick-stale count; the exciteMode predicate keeps the
         // seam recording even at zero while the CA is active.
         liveEst = live;
@@ -1162,11 +1169,11 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   std::printf(
       "fluid excite: %s (%u eighths excited over the drain, %u/%u sampled "
       "particles pre-compressed, %u standing + %u live eighths of %u, "
-      "%u live / %u blocks at end, %u settle picks, end max s2 %d, "
-      "world hash %s)\n",
+      "%u live / %u blocks at end, %u settle picks (%u infeasible, "
+      "%u unstable), end max s2 %d, world hash %s)\n",
       ok ? "PASS" : "FAIL", excitedSum, compressed, sampled, endEighths,
-      liveEighths, kWaterEighths, live, blocks, setBlocksSum, endMaxS2,
-      det ? "matches" : "DIVERGED");
+      liveEighths, kWaterEighths, live, blocks, setBlocksSum, infeasibleSum,
+      unstableSum, endMaxS2, det ? "matches" : "DIVERGED");
   detail = Format("%u excited, %u/%u compressed, mass %u+%u/%u, det %s",
                   excitedSum, compressed, sampled, endEighths, liveEighths,
                   kWaterEighths, det ? "ok" : "DIVERGED");
