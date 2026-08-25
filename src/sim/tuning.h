@@ -713,6 +713,18 @@ struct Tuning {
     int ejectPowder = 350;
     int ejectGas = 0;
     int liquidEqualize = 2;      // eighths a neighbor must be emptier to flow
+    // MINIMUM FILM, in eighths. Lateral spread into AIR is repeated halving,
+    // and with no floor the halving runs all the way down: one placed water
+    // voxel (8 eighths) becomes 8 cells of ONE eighth each, i.e. a puddle
+    // eight times the footprint it was placed with and an eighth as deep.
+    // Since the renderer draws liquid at fullness-proportional height that is
+    // exactly what "I cannot place a single voxel of water, it always splashes"
+    // looks like. A cell may now only split into air if BOTH halves land at or
+    // above this, so the equilibrium film is minFilm..2*minFilm-1 eighths and
+    // the footprint of a placement shrinks by the same factor.
+    // 1 is the old behaviour bit-for-bit. Same-liquid EQUALIZE is untouched, so
+    // ponds still level; this gates only the leading edge advancing into air.
+    int liquidMinFilm = 2;
     int wanderHopMask = 7;       // critter hop chance = 1/(mask+1) per tick
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
@@ -926,6 +938,29 @@ struct Tuning {
                                      // and the reverse lets settle create a
                                      // configuration excite immediately tears
                                      // up again
+    // ---- settled liquid as MPM boundary mass ------------------------------
+    // WP4 shipped the two representations passing straight THROUGH each other:
+    // sim_fluid.wgsl's fluidSolid() blocks solids and powders only, and a
+    // settled water voxel contributes no node mass, so an MPM waterfall poured
+    // onto a full basin fell to the floor as if the basin were empty and the
+    // basin never noticed. The same hole is why a partly-settled pool sprays:
+    // the instant one chunk converts to voxels its neighbours lose the density
+    // that was holding them up and collapse sideways into it.
+    //
+    // This is the fix, and it is the standard static-boundary treatment: a
+    // settled liquid cell seeds its node with `fullness/8 * restDensity` of
+    // ZERO-VELOCITY mass before P2G runs. Pressure then supports particles on
+    // the pool surface (they float instead of tunnelling), and the momentum
+    // divide in gridUpdate dilutes an impacting jet against static mass, which
+    // is the drag a real pool applies. Deliberately NOT a prescribed-zero
+    // boundary: leaving the node velocity as (real momentum / total mass) is
+    // what keeps the WAKE trigger alive at the impact point — a splash still
+    // excites the water it lands on, it just no longer excites the whole lake.
+    //
+    // 1.0 = a full voxel reads exactly rest density. 0 restores WP4 exactly and
+    // is the live A/B oracle for anything this changed. Above ~1 the boundary
+    // over-pressurises and ejects particles off the surface.
+    float fluidSettledMass = 1.0f;
     float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
                                   // particle stays below this for
                                   // settleTicks in a row counts as calm and

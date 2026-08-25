@@ -664,6 +664,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "ejectPowder", s.ejectPowder, out, at);
     ReadI(*g, "ejectGas", s.ejectGas, out, at);
     ReadI(*g, "liquidEqualize", s.liquidEqualize, out, at);
+    ReadI(*g, "liquidMinFilm", s.liquidMinFilm, out, at);
     ReadI(*g, "wanderHopMask", s.wanderHopMask, out, at);
     ReadI(*g, "expMicroPerMille", s.expMicroPerMille, out, at);
     ReadI(*g, "expMicroLifeTicks", s.expMicroLifeTicks, out, at);
@@ -703,6 +704,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "fluidExciteCeiling", s.fluidExciteCeiling, out, at);
     ReadI(*g, "fluidExciteRate", s.fluidExciteRate, out, at);
     ReadI(*g, "fluidExcitePerch", s.fluidExcitePerch, out, at);
+    ReadF(*g, "fluidSettledMass", s.fluidSettledMass, out, at);
     ReadF(*g, "fluidSettleEps", s.fluidSettleEps, out, at);
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
     ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
@@ -817,6 +819,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("sim.fluidExcitePerch out of 0..1; clamped");
       s.fluidExcitePerch = s.fluidExcitePerch < 0 ? 0 : 1;
     }
+    // The WGSL side folds this to a Q8 scale (sim_fluid.wgsl
+    // FLUID_SETTLED_Q8); past ~2 the static boundary out-pressures the fluid
+    // and fires particles off a still pool.
+    clampWarnF(s.fluidSettledMass, 0.0f, 2.0f, "fluidSettledMass");
     clampWarnF(s.fluidSettleEps, 0.05f, 20.0f, "fluidSettleEps");
     clampWarnF(s.fluidWakeSpeed, 0.1f, 50.0f, "fluidWakeSpeed");
     if (s.fluidSettleTicks < 8 || s.fluidSettleTicks > 600) {
@@ -851,6 +857,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "sim.liquidEqualize < 1 would let liquids spread forever and never "
           "sleep; clamped to 1");
       s.liquidEqualize = 1;
+    }
+    // 1 is "no floor" — the pre-WP5 halving, kept reachable as the A/B oracle.
+    // The upper bound is 4 because the rule needs f >= 2*minFilm to split at
+    // all, and a cell holds 8: past 4 no cell could ever spread into air and
+    // water would stop advancing across a flat floor entirely.
+    if (s.liquidMinFilm < 1 || s.liquidMinFilm > 4) {
+      out.warnings.push_back(
+          "sim.liquidMinFilm outside 1..4 (4 is the largest floor a cell can "
+          "split and still leave both halves at it); clamped");
+      s.liquidMinFilm = s.liquidMinFilm < 1 ? 1 : 4;
     }
     auto clampMille = [&](const char* name, int& v) {
       if (v < 0 || v > 1000) {

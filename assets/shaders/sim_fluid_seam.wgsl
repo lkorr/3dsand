@@ -22,7 +22,8 @@
 //   PT_FLUID x kFluidSubsteps (sim_fluid.wgsl, unchanged shape)
 //   PT_FLUID_SETTLE (after the substeps):
 //     particleTick (per-slot speed maxima) -> settleJudge (calm counters)
-//     -> settleScan (pick <= kFluidSettleMax non-adjacent calm blocks)
+//     -> settleScan (pick <= kFluidSettleMax calm blocks, no two sharing a
+//        chunk column within one chunk in y)
 //     -> settleBin (per-cell eighths + stain) -> settleCheck (column
 //     feasibility, all-or-nothing per block) -> settleCommit (voxels written)
 //     -> settleKill (particles die; next tick's compaction removes them)
@@ -104,6 +105,8 @@ const SPANS : u32 = FLUID_CAP / 256u;         // compaction spans
 const EX_LIST_COUNT : u32 = 0u;   // candidate slots (accepted AND refused)
 const EX_EMITTED : u32 = 1u;      // accepted particle total this tick
 const EX_COMPACT_LIVE : u32 = 2u; // survivors after compaction (spawn base)
+const EX_EXCITED_LIVE : u32 = 3u; // of those, EXCITE-origin (FP_EXCITED) — the
+                                  // population the ceiling actually bounds
 const EX_ARGS : u32 = 4u;         // [4..6] emit dispatch args (listCount,1,1)
 const EX_COUNTS : u32 = 16u;                       // + slot
 const EX_BASES : u32 = 16u + NUM_CHUNKS;           // + slot
@@ -154,6 +157,11 @@ const SEAM_EX_CEILING : u32 = u32(clamp(TUNE_FLUID_EXCITE_CEILING, 256, 262144))
 const SEAM_EX_RATE : u32 = u32(clamp(TUNE_FLUID_EXCITE_RATE, 64, 262144));
 // Excite's perch trigger, on the EXCITE side only (see exciteDetect).
 const SEAM_EX_PERCH : bool = TUNE_FLUID_EXCITE_PERCH != 0;
+// The fullness at which the CA can still spread a cell sideways into air —
+// sim_step.wgsl's LIQ_SPLIT_MIN, restated here because settleCheck's mode-0
+// exemption is precisely the question "can the CA move this one itself?".
+// Derived from the same knob, so the two cannot drift.
+const SEAM_CA_SPREAD_MIN : u32 = 2u * clamp(TUNE_LIQUID_MIN_FILM, 1u, 4u);
 
 // ---- the free-surface gravity bias, and why every speed test removes it ----
 // A weakly-compressible MPM free surface is NEVER at rest. Pressure comes from
@@ -231,6 +239,11 @@ fn seamLive(p : FluidParticle, idx : u32, bound : u32) -> bool {
 // ============================================================================
 
 var<workgroup> wgScan : array<u32, 256>;
+// The same reduction over EXCITE-ORIGIN survivors, riding along in the pass
+// that already touches every particle. Its total is what exciteScan charges the
+// ceiling against (see FP_EXCITED in common.wgsl); it never feeds a slot
+// assignment, so it needs no prefix, only a sum.
+var<workgroup> wgScanEx : array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn compactCount(@builtin(workgroup_id) wg : vec3<u32>,
@@ -238,13 +251,20 @@ fn compactCount(@builtin(workgroup_id) wg : vec3<u32>,
   let bound = min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP);
   let idx = wg.x * 256u + li;
   var live = 0u;
-  if (idx < bound && fpAlive(fluidSrc[idx].attr)) { live = 1u; }
+  var exLive = 0u;
+  if (idx < bound && fpAlive(fluidSrc[idx].attr)) {
+    live = 1u;
+    if (fpExcited(fluidSrc[idx].attr)) { exLive = 1u; }
+  }
   wgScan[li] = live;
+  wgScanEx[li] = exLive;
   workgroupBarrier();
   if (li == 0u) {
     var n = 0u;
-    for (var t = 0u; t < 256u; t++) { n += wgScan[t]; }
+    var ne = 0u;
+    for (var t = 0u; t < 256u; t++) { n += wgScan[t]; ne += wgScanEx[t]; }
     compactScratch[wg.x] = n;
+    compactScratch[2u * SPANS + wg.x] = ne;
   }
 }
 
@@ -265,19 +285,24 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
   let per = SPANS / 256u;
   let spans = liveSpans();
   var n = 0u;
+  var ne = 0u;
   for (var s = li * per; s < (li + 1u) * per; s++) {
-    if (s < spans) { n += compactScratch[s]; }
+    if (s < spans) { n += compactScratch[s]; ne += compactScratch[2u * SPANS + s]; }
   }
   wgScan[li] = n;
+  wgScanEx[li] = ne;
   workgroupBarrier();
   if (li == 0u) {
     var sum = 0u;
+    var sumEx = 0u;
     for (var t = 0u; t < 256u; t++) {
       let c = wgScan[t];
       wgScan[t] = sum;
       sum += c;
+      sumEx += wgScanEx[t];
     }
     atomicStore(&exciteScratch[EX_COMPACT_LIVE], sum);
+    atomicStore(&exciteScratch[EX_EXCITED_LIVE], sumEx);
     // consumeApply's dispatch: one thread per SURVIVOR, not per pool slot.
     atomicStore(&fluidArgs[FA_ARGS_CONSUME + 0u], (min(sum, FLUID_CAP) + 63u) / 64u);
     atomicStore(&fluidArgs[FA_ARGS_CONSUME + 1u], 1u);
@@ -688,8 +713,27 @@ fn exciteScan(@builtin(local_invocation_index) li : u32) {
     //
     // It stays deterministic for the reason the pool budget already was —
     // acceptance is a monotone cutoff in SLOT order, never in arrival order.
+    //
+    // THE CEILING IS CHARGED AGAINST EXCITED PARTICLES ONLY (FP_EXCITED,
+    // common.wgsl). It used to be charged against `liveNow`, which is every
+    // particle in the pool — including the spawns the paragraph above says are
+    // exempt. So the exemption was a fiction: a pour did not get REFUSED, it
+    // simply consumed the whole ceiling and left excite with a budget of
+    // literally zero, permanently, for as long as its water stayed live. On
+    // `--fluid-bench basin` (15,360 poured against the 8,000 ceiling) that read
+    // 479 candidates -> 0 emitted, 100% refused, and it is why CA water falling
+    // past a running pour never converted.
+    //
+    // TWO limits now, and they mean different things:
+    //   * ceilRoom — headroom under the excited-region ceiling, the WP5 bound
+    //     that stops a lake converting itself wholesale;
+    //   * poolRoom — headroom in the PARTICLE POOL, which spawns do share,
+    //     because two particles cannot occupy one slot whatever their origin.
     let ceiling = min(SEAM_EX_CEILING, FLUID_CAP);
-    exBudget = min(ceiling - min(liveNow, ceiling), SEAM_EX_RATE);
+    let excitedNow = atomicLoad(&exciteScratch[EX_EXCITED_LIVE]);
+    let ceilRoom = ceiling - min(excitedNow, ceiling);
+    let poolRoom = FLUID_CAP - min(liveNow, FLUID_CAP);
+    exBudget = min(min(ceilRoom, poolRoom), SEAM_EX_RATE);
     var listSum = 0u;
     var partSum = 0u;
     exCrossSerial = 256u;
@@ -880,7 +924,10 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
       p.j = j0;
       p.species = (mat - 1u) & 3u;
       p.density = 0;
-      p.attr = fpPack(mat, 1u, stainT, stainA);
+      // FP_EXCITED: this particle came out of a voxel, so it counts against
+      // sim.fluidExciteCeiling for as long as it lives. spawnAppend does not
+      // set it — see the budget block in exciteScan.
+      p.attr = fpPack(mat, 1u, stainT, stainA) | FP_EXCITED;
       p.birthTick = T.tick;
       p._r0 = 0; p._r1 = 0; p._r2 = 0; p._r3 = 0;
       p._r4 = 0; p._r5 = 0; p._r6 = 0; p._r7 = 0;
@@ -1115,10 +1162,33 @@ fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 
 // settleScan: pick up to SETTLE_MAX calm blocks, in slot order, with a greedy
-// adjacency exclusion — no two picked blocks within one chunk of each other
-// (wrapped slot distance, conservative), so concurrently-committing blocks
-// can never read cells another block is writing. One workgroup; the serial
-// part touches only spans that contain candidates.
+// exclusion that keeps concurrently-committing blocks off each other's cells.
+// One workgroup; the serial part touches only spans that contain candidates.
+//
+// THE EXCLUSION IS A COLUMN RULE, NOT A 3x3x3 ONE, and the difference is
+// visible to the player. It used to refuse any pick within one chunk in ANY
+// direction, which meant a pool spanning four chunks — the fluid lab's own
+// 20x20 basin is exactly that, 2x2 chunks — could never settle more than one of
+// them per tick. That is the reported "one quadrant of the basin stabilises
+// first, then the rest in discrete steps": not a physics artefact at all, just
+// four mutually-adjacent blocks taking turns.
+//
+// What the exclusion actually has to prevent is one committing block WRITING a
+// cell another is reading or writing, and settleColumn is a column walk: for a
+// given (cx, cz) it touches only (cx, y, cz) for y in 0..16+SETTLE_SPILL. So
+// its write set is its own chunk plus the bottom SETTLE_SPILL rows of the chunk
+// DIRECTLY ABOVE, and nothing lateral. Two blocks conflict iff they share an
+// (x, z) chunk column and are within one chunk in y.
+//
+// The lateral READS are safe for a different reason: settleCheck's stability
+// test probes out-of-block neighbours, but check and commit are separate pass
+// rows, so the recorder puts a barrier between them and every check in the tick
+// completes before any commit writes. Co-settling lateral neighbours therefore
+// all read the same pre-commit voxels — well-defined, and identical on every
+// device (rule 1). The cost is that two quadrants settling together each see
+// the other as air and are a little likelier to vote their shared boundary
+// column unstable; those columns keep their water as particles and retry next
+// tick, which is the same graceful path a refusal always took.
 var<workgroup> ssPart : array<u32, 256>;
 
 @compute @workgroup_size(256)
@@ -1163,7 +1233,9 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
         let d = abs(sc - picked[q]);
         let m = i32(NCHUNK);
         let dw = min(d, vec3<i32>(m) - d);   // wrapped slot distance
-        if (dw.x <= 1 && dw.y <= 1 && dw.z <= 1) { clash = true; break; }
+        // Same chunk column, within one chunk vertically: their column walks
+        // (own chunk + SETTLE_SPILL rows above) would overlap.
+        if (dw.x == 0 && dw.z == 0 && dw.y <= 1) { clash = true; break; }
       }
       if (clash) { continue; }
       picked[count] = sc;
@@ -1241,8 +1313,8 @@ fn seamSupport(c : vec3<i32>) -> bool {
 // of any real pool carries 1-2 eighths per column past its own top — without
 // the spill every pick refused and the pool deadlocked as particles forever
 // (measured: 66/66 refusals on a fully calm pool). Writing above is safe:
-// the adjacency exclusion means no concurrently-settling block can touch
-// those cells, and the fluid-chunk N26 ring materialized them.
+// the column exclusion means no concurrently-settling block can touch those
+// cells (it is sized to exactly this spill), and the fluid-chunk N26 ring materialized them.
 // Returns false if the column is infeasible (content with no floor, content
 // past the spill ceiling, or trapped under a blocker).
 //
@@ -1412,9 +1484,14 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
 // neighbours. In-block neighbours are still particles, so their voxels read
 // air — the answer has to come from the walk, which is why every thread
 // publishes its column into workgroup memory and the test runs after a
-// barrier. Out-of-block neighbours are never concurrently settling (the scan's
-// adjacency exclusion), so their voxels ARE their post-settle state, and
-// seamNeighbourState adds the excited-particle arm for the water next door.
+// barrier. Out-of-block neighbours come from the voxels instead, and the
+// check/commit pass barrier is what makes that well-defined: every settleCheck
+// in the tick runs before any settleCommit writes, so a lateral neighbour that
+// is itself settling this tick reads as its PRE-settle state to everybody, the
+// same way on every device (rule 1). seamNeighbourState's excited-particle arm
+// covers exactly that case — the neighbour's water is still particles, so it
+// answers from node mass rather than from the (empty) voxel, which is why a
+// co-settling neighbour is not simply read as air.
 // Any thread may find the block unstable, and the refusal has to be applied
 // once, by one thread, after everybody has voted. Workgroup atomicOr: 0/1,
 // associative, no CAS (rule 1).
@@ -1490,7 +1567,13 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
       //     inert as particles for the 440 ticks after the pour stopped.
       //     Below 2 eighths the CA cannot spread it either, so that IS a
       //     freeze and stays refused in both modes.
-      if (T.fluidExciteEnable == 0u && full >= 2u) { continue; }
+      //     The threshold is the CA's OWN one and must track it: sim_step
+      //     splits into air at `f >= 2 * sim.liquidMinFilm` (LIQ_SPLIT_MIN),
+      //     so that is what "the CA can still move this" means. Restating it
+      //     as a literal 2 was correct only while minFilm was 1 — if these two
+      //     drift, mode 0 exempts cells the CA has since stopped being able to
+      //     spread, and the exemption starts causing the freeze it prevents.
+      if (T.fluidExciteEnable == 0u && full >= SEAM_CA_SPREAD_MIN) { continue; }
       // BASE cells only: the bottom of each contiguous body of water in this
       // column (see seamLateralExcite). At y = 0 the cell below is outside the
       // block, so it comes from the voxels/node grid like any other

@@ -158,7 +158,12 @@ void World::Init(const rhi::Device& device) {
       (uint64_t)(2 * kNumChunks + 16 + 2 + kFluidSettleMax * kChunkVol * 2 +
                  kFluidSettleMax * 8) * 4,
       U::Storage | U::CopyDst, "fluidSettleScratch");
-  fluidCompactScratch = CreateBuffer(device, (uint64_t)(kFluidCap / 256) * 2 * 4,
+  // THREE arrays of one word per 256-particle compaction span, not two:
+  // [0..SPANS) survivors, [SPANS..2*SPANS) their exclusive bases, and
+  // [2*SPANS..3*SPANS) the EXCITE-ORIGIN survivors among them — the population
+  // sim.fluidExciteCeiling is charged against (sim_fluid_seam.wgsl compactCount
+  // / the budget block in exciteScan).
+  fluidCompactScratch = CreateBuffer(device, (uint64_t)(kFluidCap / 256) * 3 * 4,
                                      U::Storage, "fluidCompactScratch");
   fluidCellScratch = CreateBuffer(
       device, (uint64_t)kFluidBlocks * kChunkVol * 2 * 4,

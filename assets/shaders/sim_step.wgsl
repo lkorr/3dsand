@@ -836,6 +836,38 @@ fn canDescend(c : vec3<i32>, n : vec3<i32>, mat : u32, dens : i32) -> bool {
 // is the arbiter for whether the generated world contains it. The "one voxel
 // tall" clause is what keeps the far more common case (a 2-wide slot between
 // two ordinary walls) out of the rule entirely.
+// ---- the MINIMUM FILM, and why the halving needed a floor -------------------
+//
+// The rule above says a lone eighth may not wander. This one says how the
+// halving is allowed to GET to a lone eighth, and the answer used to be "all
+// the way": `f >= 2` let any cell split f/2 into an empty neighbour with no
+// floor at all, so one placed water voxel ran 8 -> (4,4) -> (2,2,2,2) ->
+// (1,1,1,1,1,1,1,1) and came to rest as EIGHT cells one eighth deep. The mass
+// is exactly right and the shape is absurd: eight times the footprint the
+// player placed, an eighth as tall, and since b799a58 draws liquid at
+// fullness-proportional height that reads on screen as a splash rather than a
+// voxel of water. It is also the worst possible input to the MPM side — a
+// 1-eighth film gathers rho far below rest inside the solver's 3-cell support,
+// so its EOS pressure is zero and excite converts it into particles that
+// cannot move (the thin-film gap, RESEARCH_water_architecture.md).
+//
+// The floor is stated on BOTH halves, not just the source: a split is allowed
+// only when `f >= 2 * minFilm`, so the cell keeps `f - f/2 >= minFilm` and the
+// neighbour receives `f/2 >= minFilm`. That makes the equilibrium film
+// minFilm..2*minFilm-1 eighths and shrinks a placement's footprint by minFilm.
+//
+// WHAT IT DOES NOT TOUCH, deliberately: the same-liquid EQUALIZE branch. That
+// one moves mass between two cells that already hold water, which is what
+// levels a pond, and gating it on a film thickness would leave real pools
+// permanently stepped. Only the leading edge advancing into AIR is floored —
+// and descent (stages 1 and 2) is untouched too, so water still runs downhill
+// at any fullness and a spill on a slope behaves exactly as before.
+//
+// minFilm 1 reproduces the old `f >= 2` bit-for-bit, which is what makes this
+// an A/B rather than a one-way change.
+const LIQ_MIN_FILM : u32 = clamp(TUNE_LIQUID_MIN_FILM, 1u, 4u);
+const LIQ_SPLIT_MIN : u32 = 2u * LIQ_MIN_FILM;
+
 fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
   let back = c - vec3<i32>(d.x, 0, d.y);
   return liquidWall(back) && !liquidWall(back + vec3<i32>(0, 1, 0));
@@ -883,7 +915,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
     if (nmat == mat) {
       if (voxState(nw) + 1u + TUNE_LIQUID_EQUALIZE <= f) { return true; }
     } else if (nmat == MAT_AIR) {
-      if (f >= 2u) { return true; }
+      if (f >= LIQ_SPLIT_MIN) { return true; }
       if (filmStepAllowed(c, d) && canDisplace(m.density, false, nw)) { return true; }
     } else if (canDisplace(m.density, false, nw)) {
       return true;
@@ -953,11 +985,18 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
         return true;
       }
     } else if (nmat == MAT_AIR) {
-      if (f >= 2u) {
+      // Split only if BOTH halves clear the film floor — see LIQ_MIN_FILM.
+      if (f >= LIQ_SPLIT_MIN) {
         transferLiquid(c, n, mat, f, 0u, f / 2u);
         return true;
       }
-      // the last eighth, off a one-voxel riser only — see filmStepAllowed
+      // Too thin to split: the whole film steps, off a one-voxel riser only.
+      // At minFilm 1 that is the last eighth and nothing else, exactly as
+      // before; above it the same rule carries a 2-3 eighth film off a terrace
+      // tread WHOLE instead of halving it into something thinner still, which
+      // is the behaviour the floor exists to prevent. filmStepAllowed's
+      // termination argument does not depend on f: the cell it vacates is air,
+      // so the move cannot repeat against the same riser.
       if (filmStepAllowed(c, d) && tryMove(c, n, w, m.density, false)) {
         return true;
       }

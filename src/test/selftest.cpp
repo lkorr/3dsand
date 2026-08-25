@@ -51,7 +51,7 @@ const char* const kOrder[] = {
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "evaporation",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
-    "fluid-excite", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
+    "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
     "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",

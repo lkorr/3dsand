@@ -566,7 +566,7 @@ liquid to particles (one per fullness eighth, jittered sub-cell lattice via
 scan so a reawakened lake holds its own weight instead of jello-popping);
 after the substeps, SETTLE converts calm blocks back (per-slot max-speed
 calm counters, `sim.fluidSettleTicks` consecutive ticks under
-`sim.fluidSettleEps`, ≤16 non-adjacent blocks per tick, per-column
+`sim.fluidSettleEps`, ≤16 blocks per tick with a COLUMN exclusion, per-column
 segment-pooled bottom-up refill, all-or-nothing refusal per block — mass is
 EXACT integer eighths in both directions, and stains ride the particle's attr
 word round-trip). Excite triggers: (a) settled liquid with air below —
@@ -625,6 +625,64 @@ large-body scenes because they barely settle. It is not excite (excited ==
 emitted exactly), not reactions (consumed == 0), not an audit-bounds artifact,
 and not the CA (the excite-off arm is exact). See `tests/BASELINE.md`.
 
+**WP5b: THE FOUR THINGS THE FLIP EXPOSED** (2026-08-25; world hash
+58b27f33 → dc666ada). Playing WP5 turned up four defects, and three of them
+are one hole with three faces.
+
+- **SETTLED LIQUID NOW HAS MASS IN THE SOLVER** (`sim.fluidSettledMass`,
+  default 1.0). Until now `fluidSolid()` blocked solids and powders only and a
+  fullness voxel scattered nothing into the node grid, so the two
+  representations passed straight THROUGH each other: MPM water poured onto a
+  basin filled to the rim fell to the BED. `clearGrid` now seeds every node
+  inside a settled liquid cell with `fullness/8 × restDensity` of
+  zero-velocity mass before P2G, which is the standard static-boundary
+  treatment. Pressure then holds the pour up; the momentum divide in
+  `gridUpdate` dilutes an impacting jet against static mass, which is a still
+  pool's drag. It is deliberately NOT a prescribed-zero-velocity boundary —
+  leaving node velocity as (real momentum / total mass) is what keeps the WAKE
+  trigger alive at the point of impact, so a splash still excites the water it
+  lands on. New `fluid-onwater` gate, which runs the same pour at
+  `fluidSettledMass` 0 and 1 on the same build: the control converts 8,136 of
+  the box's 8,144 eighths — the entire basin — and leaks particles out through
+  the shell; the shipped arm peaks at 1,274 (a crater), craters 2 cells into an
+  8-deep pool, and is fully back to settled voxels with exact mass.
+  Second-order effects, both measured on `--fluid-bench basin`: settling is no
+  longer self-disrupting (a chunk converting no longer drops the density that
+  was holding its neighbours up), so `fluid(substep)` falls 4.26 → 1.44 ms and
+  frame p50 14.4 → 5.8 ms, and wake candidates over 400 ticks fall 479 → 7
+  because a still pool's nodes now read still.
+- **THE EXCITE CEILING WAS BEING CHARGED AGAINST SPAWNS.**
+  `sim.fluidExciteCeiling` documents itself as the standing size of the
+  EXCITED region and explicitly exempts explicit spawns — but the budget
+  subtracted the whole live pool, spawns included. A pour is a spawn, so the
+  exemption was a fiction: any pour larger than the ceiling zeroed excite's
+  budget permanently. Measured on `basin` (15,360 poured against an 8,000
+  ceiling): 479 candidates, **0 emitted, 100% refused, for all 400 ticks** —
+  the reported "water falling past a waterfall never becomes MPM". Excited
+  particles now carry `FP_EXCITED` (attr bit 22), the compaction counts them,
+  and the ceiling is charged against that; the pool is still bounded
+  separately by `kFluidCap`. Same scene after: 0 slots refused.
+- **THE SETTLE EXCLUSION IS A COLUMN RULE.** It used to refuse any pick within
+  one chunk in ANY direction, so a pool spanning 2×2 chunks — the fluid lab's
+  own 20×20 basin — could settle only one of them per tick, which is the
+  reported "one quadrant stabilises first, then the rest in discrete steps".
+  A column walk touches only its own (x, z) column, so the write hazard is
+  exactly "same chunk column, within one chunk in y"; lateral neighbours may
+  settle together because `settleCheck` and `settleCommit` are separate pass
+  rows and the barrier between them means every stability probe in the tick
+  reads pre-commit voxels, identically on every device. `basin` settle commits
+  over 400 ticks: 7 → 12.
+- **LIQUID HAS A MINIMUM FILM** (`sim.liquidMinFilm`, default 2 eighths).
+  Lateral spread into air is repeated halving and had no floor, so one placed
+  water voxel ran 8 → (4,4) → … → eight cells of ONE eighth: eight times the
+  footprint placed, an eighth as deep, and since the fullness-proportional
+  render landed that reads as a splash rather than a voxel of water. A split
+  now requires `f >= 2 × minFilm` so BOTH halves clear the floor. Same-liquid
+  equalize is untouched (ponds still level) and descent is untouched (water
+  still runs downhill at any fullness); a film too thin to split still steps
+  off a one-voxel riser whole, which is what keeps terrace treads draining.
+  `hill` basin capture is unmoved at 51.6% / 52.5% (excite on / off).
+
 SETTLE IS EXCITE-STABLE BY CONSTRUCTION (WP3, plan §6 item 2). `settleCheck`
 runs a second test after column feasibility: every cell the walk would write
 must FAIL the geometric excite triggers, so a settled configuration can never
@@ -646,7 +704,8 @@ Settle refusing MORE than excite takes is safe — the water stays particles a
 while longer. The reverse would let settle create a configuration excite
 immediately tears up again. At mode 0 a base cell holding >= 2 eighths is
 exempt — that is the CA's own
-lateral-spread threshold (`sim_step`'s `if (f >= 2u)`), so the CA will move it
+lateral-spread threshold (`sim_step`'s `LIQ_SPLIT_MIN`, i.e.
+2 × `sim.liquidMinFilm`), so the CA will move it
 and refusing would cause the freeze rather than prevent it.
 
 THE VETO IS PER-COLUMN, NOT PER-BLOCK. Settle commits a 16³ block, and column

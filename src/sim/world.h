@@ -331,9 +331,12 @@ constexpr uint32_t kFluidSubsteps = 9;
 // (32 words / 128 B, power-of-two for coalesced access).
 constexpr uint32_t kFluidParticleWords = 32;
 // Settle converts at most this many blocks per tick. Bounds the bin scratch
-// (kFluidSettleMax * kChunkVol * 2 words) and, with the adjacency exclusion
-// in the settle scan, guarantees no two concurrently-committing blocks can
-// read each other's writes. A lake's worth of calm blocks drains through
+// (kFluidSettleMax * kChunkVol * 2 words) and, with the COLUMN exclusion in
+// the settle scan (same chunk column, within one chunk in y — the exact reach
+// of a column walk's spill), guarantees no two concurrently-committing blocks
+// can read each other's writes. Lateral neighbours may settle together: their
+// column walks are disjoint, and the check/commit pass barrier means every
+// stability probe reads pre-commit voxels. A lake's worth of calm blocks drains through
 // this in a few ticks; settle latency is invisible next to the calm window.
 constexpr uint32_t kFluidSettleMax = 16;
 
