@@ -219,18 +219,29 @@ fn vnoise(x : i32, z : i32, cs : i32, seed : u32) -> i32 {
 }
 
 // ---- world scale ----
-// One voxel is VOXEL_METERS = 6.25 cm: 16 voxels to the metre, and the player
-// capsule is 27 voxels tall. The original desert worldgen was written as if a
-// voxel were about a metre, so every feature came out as a tabletop model of
-// itself — 4 m hills, a 2 m "lake", 0.9 m ruins, knee-high trees.
+// One voxel is VOXEL_METERS = 10 cm, so 10 voxels to the metre and a 17-voxel
+// player capsule. The original desert worldgen assumed a voxel was about a
+// metre, so every feature came out a tabletop model of itself — 4 m hills, a
+// 2 m "lake", 0.9 m ruins, knee-high trees.
 //
 // HORIZONTAL features scale by HSCALE. X/Z stream infinitely, so widening them
 // costs nothing but noise-cell size: a lake becomes a lake, a biome becomes a
 // region you walk across rather than step over.
 //
-// VERTICAL relief deliberately does NOT scale with it. The residency window is
-// 256 voxels = 16 m tall and does not stream in Y (caves already run from y-24
-// to the surface), so height is a hard budget, not a free parameter.
+// VERTICAL relief does not scale with HSCALE — by choice, not by force. This
+// comment used to say the window was 16 m tall and did not stream in Y. Both
+// halves are false now: kWorldN is 512 (51.2 m), and Stream::ShiftAxis handles
+// `axis == 1` with no Y clamp, so the window follows the player up and down.
+//
+// What 51.2 m still bounds is how much of a tall feature is SIM-LIVE at once.
+// A 300 m cliff is legal — its far half renders from the cascades — but a sand
+// slide only runs inside the resident band, and descending it is one window
+// shift per 51.2 m (measure with --autofly-hard, not a standing player).
+//
+// So the y32..y86 band below is a leftover of the old rule. Widening it needs
+// three re-checks the old budget made moot: page residency (a mountain's
+// interior is JITTER(mat) and free, its SURFACE is not), the settle budget on
+// the new slopes, and cascade fill cost once levels 6-8 have something to show.
 //
 // Third scale pass: the first cut was tabletop-tiny, the second (HSCALE=2,
 // ~3x hills) overshot. Halved back down — everything EXCEPT the trees, which
