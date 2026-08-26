@@ -530,39 +530,356 @@ static int fmodp(int a, int b) {
   int m = a % b;
   return m < 0 ? m + b : m;
 }
-static int vnoise(int x, int z, int cs, uint32_t seed) {
-  int gx = fdiv(x, cs), gz = fdiv(z, cs);
-  int fx = fmodp(x, cs), fz = fmodp(z, cs);
-  int h00 = (int)(hash3(seed, (uint32_t)gx, (uint32_t)gz) & 0xFFu);
-  int h10 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)gz) & 0xFFu);
-  int h01 = (int)(hash3(seed, (uint32_t)gx, (uint32_t)(gz + 1)) & 0xFFu);
-  int h11 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)(gz + 1)) & 0xFFu);
-  int v0 = h00 * (cs - fx) + h10 * fx;
-  int v1 = h01 * (cs - fx) + h11 * fx;
-  return (v0 * (cs - fz) + v1 * fz) / (cs * cs);
+// The legacy 0..255 vnoise is NOT mirrored any more. Its only CPU caller was
+// TerrainHeight, and the terrain octaves moved to vnoise2d below; the fourteen
+// call sites it still has in the shader are all decorative fields (flower
+// clumps, undergrowth masks) that no CPU path asks about.
+//
+// WGSL's `select(a, b, cond)` spelled the same way, so the mirrored bodies
+// below can be read side by side with the shader's.
+static int select(int a, int b, bool c) { return c ? b : a; }
+static const Tuning::Worldgen& WG() { return CurrentTuning().worldgen; }
+
+// MIRROR-BEGIN noise
+// The Q14 value noise of worldgen.wgsl, mirrored line for line. Read that
+// file's block for why 14 bits and why the cell is a log2 shift; the one thing
+// worth repeating HERE is the reason this can be written twice at all:
+//
+//   `>>` ON A NEGATIVE SIGNED INTEGER IS ARITHMETIC IN BOTH LANGUAGES.
+//   WGSL sign-extends by definition; C++20 (P0907) fixed signed integers as
+//   two's complement and `>>` as floor-division by a power of two. So
+//   `x >> csl` is the same value on both sides at every negative coordinate,
+//   which is what lets it replace fdiv(), and `x & mask` replace fmodp().
+//   That is the single place where these two languages could have disagreed,
+//   and they do not.
+//
+// scripts/check_invariants.py compares the normalised token streams of the two
+// blocks tagged `noise` below, so an edit to one that is not made to the other
+// fails at edit time rather than as a player falling through visible ground.
+struct N2 {
+  int n;
+  int dx;
+  int dz;
+};
+static int vsmooth(int t) {
+  int t2 = (t * t) >> 15;
+  int t3 = (t2 * t) >> 15;
+  return 3 * t2 - 2 * t3;
 }
-// Must stay bit-identical to baseHeight() in worldgen.wgsl, INCLUDING the
-// horizontal scale factor — kHScale here is that shader's HSCALE.
-static constexpr int kHScale = 1;
+static int vsmoothd(int t) {
+  return (6 * t * (32768 - t)) >> 15;
+}
+static int q15frac(int f, uint32_t csl) {
+  if (csl <= 15u) { return f << (15u - csl); }
+  return f >> (csl - 15u);
+}
+static int vbilerp(int c00, int c10, int c01, int c11, int sx, int sz) {
+  int a = c00 + (((c10 - c00) * sx) >> 15);
+  int b = c01 + (((c11 - c01) * sx) >> 15);
+  return a + (((b - a) * sz) >> 15);
+}
+static N2 vnoise2d(int x, int z, uint32_t csl, uint32_t seed) {
+  int gx = x >> csl;
+  int gz = z >> csl;
+  int mask = (int)((1u << csl) - 1u);
+  int tx = q15frac(x & mask, csl);
+  int tz = q15frac(z & mask, csl);
+  int c00 = (int)(hash3(seed, (uint32_t)(gx), (uint32_t)(gz)) & 0x3FFFu);
+  int c10 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)(gz)) & 0x3FFFu);
+  int c01 = (int)(hash3(seed, (uint32_t)(gx), (uint32_t)(gz + 1)) & 0x3FFFu);
+  int c11 = (int)(hash3(seed, (uint32_t)(gx + 1), (uint32_t)(gz + 1)) & 0x3FFFu);
+  int sx = vsmooth(tx);
+  int sz = vsmooth(tz);
+  N2 o;
+  o.n = vbilerp(c00, c10, c01, c11, sx, sz);
+  int ga = c10 - c00;
+  int gb = c11 - c01;
+  o.dx = ((ga + (((gb - ga) * sz) >> 15)) * vsmoothd(tx)) >> 15;
+  int ha = c01 - c00;
+  int hb = c11 - c10;
+  o.dz = ((ha + (((hb - ha) * sx) >> 15)) * vsmoothd(tz)) >> 15;
+  return o;
+}
+[[maybe_unused]] static int isin16(int a) {
+  int p = a & 65535;
+  int half = p & 32767;
+  int y = (4 * half * (32768 - half)) >> 15;
+  int r = (y * (25395 + ((7373 * y) >> 15))) >> 15;
+  if (p >= 32768) { return -r; }
+  return r;
+}
+[[maybe_unused]] static int vnoise3(int x, int y, int z, uint32_t cxl,
+                                    uint32_t cyl, uint32_t seed) {
+  int gx = x >> cxl;
+  int gz = z >> cxl;
+  int gy = y >> cyl;
+  int mxz = (int)((1u << cxl) - 1u);
+  int my = (int)((1u << cyl) - 1u);
+  int sx = vsmooth(q15frac(x & mxz, cxl));
+  int sz = vsmooth(q15frac(z & mxz, cxl));
+  int sy = vsmooth(q15frac(y & my, cyl));
+  uint32_t pz0 = pcg((uint32_t)(gz));
+  uint32_t pz1 = pcg((uint32_t)(gz + 1));
+  uint32_t i00 = pcg((uint32_t)(gx) ^ pz0);
+  uint32_t i10 = pcg((uint32_t)(gx + 1) ^ pz0);
+  uint32_t i01 = pcg((uint32_t)(gx) ^ pz1);
+  uint32_t i11 = pcg((uint32_t)(gx + 1) ^ pz1);
+  uint32_t s0 = seed ^ ((uint32_t)(gy) * 2654435769u);
+  uint32_t s1 = seed ^ ((uint32_t)(gy + 1) * 2654435769u);
+  int v0 = vbilerp((int)(pcg(s0 ^ i00) & 0x3FFFu), (int)(pcg(s0 ^ i10) & 0x3FFFu),
+                   (int)(pcg(s0 ^ i01) & 0x3FFFu), (int)(pcg(s0 ^ i11) & 0x3FFFu),
+                   sx, sz);
+  int v1 = vbilerp((int)(pcg(s1 ^ i00) & 0x3FFFu), (int)(pcg(s1 ^ i10) & 0x3FFFu),
+                   (int)(pcg(s1 ^ i01) & 0x3FFFu), (int)(pcg(s1 ^ i11) & 0x3FFFu),
+                   sx, sz);
+  return v0 + (((v1 - v0) * sy) >> 15);
+}
+// MIRROR-END noise
+
+// The shader's vec2<i32>, so pondAt can be mirrored with the same shape.
+// Outside the mirrored region: WGSL gets this type from the language.
+struct IV2 {
+  int x;
+  int y;
+};
+static IV2 iv2(int a, int b) { IV2 v; v.x = a; v.y = b; return v; }
+
+// MIRROR-BEGIN height
+// The height chain, mirrored. Everything here is a pure function of (x, z,
+// seed) and of the worldgen tuning; nothing reads a material id, which is what
+// keeps it comparable token-for-token against the shader. The declarations are
+// in the SHADER'S order, because check_invariants.py concatenates the tagged
+// blocks in file order and compares the streams.
+//
+// `WG().foo` on this side is `TUNE_FOO` on the shader's — check_invariants.py
+// derives that mapping from sim/tuning_params.def rather than hardcoding it, so
+// a renamed knob keeps the check honest instead of silencing it.
+struct Land {
+  int h;
+  int slope;
+};
+static Land landAt(int x, int z, uint32_t seed) {
+  N2 a = vnoise2d(x, z, WG().hillLog2, seed ^ 1u);
+  N2 b = vnoise2d(x, z, WG().detailLog2, seed ^ 2u);
+  Land l;
+  l.h = WG().baseHeight + ((a.n * WG().hillAmplitude) >> 14)
+                        + ((b.n * WG().detailAmplitude) >> 14);
+  int gx = ((a.dx * WG().hillAmplitude) >> (6u + WG().hillLog2))
+         + ((b.dx * WG().detailAmplitude) >> (6u + WG().detailLog2));
+  int gz = ((a.dz * WG().hillAmplitude) >> (6u + WG().hillLog2))
+         + ((b.dz * WG().detailAmplitude) >> (6u + WG().detailLog2));
+  l.slope = std::abs(gx) + std::abs(gz);
+  return l;
+}
+static int baseHeight(int x, int z, uint32_t seed) {
+  return landAt(x, z, seed).h;
+}
+struct Pond {
+  bool present;
+  int cx;
+  int cz;
+  int r;
+  int surf;
+};
+static Pond pondInfo(int pt, int pz, uint32_t seed) {
+  Pond p;
+  p.present = false; p.cx = 0; p.cz = 0; p.r = 0; p.surf = -1;
+  uint32_t rh = hash3(seed ^ 0xB0A7u, (uint32_t)(pt), (uint32_t)(pz));
+  if (rh % (uint32_t)WG().pondChance != 0u) { return p; }
+  int r = WG().pondRadiusMin + (int)((rh >> 4u) % (uint32_t)WG().pondRadiusSpan);
+  int maxR = WG().pondRadiusMin + (int)(WG().pondRadiusSpan) - 1;
+  int inset = maxR + 4;
+  uint32_t span = (uint32_t)(std::max(WG().pondTile - 2 * inset, 1));
+  if (WG().pondTile - 2 * inset < 1) { return p; }
+  int cx = pt * WG().pondTile + inset + (int)((rh >> 9u) % span);
+  int cz = pz * WG().pondTile + inset + (int)((rh >> 17u) % span);
+  if (cx >= -44 && cx <= 264 && cz >= -44 && cz <= 264) { return p; }
+  int q1x = cx - 420; int q1z = cz - 420;
+  int q2x = cx - 260; int q2z = cz - 300;
+  int q3x = cx - 220; int q3z = cz - 520;
+  if (q1x * q1x + q1z * q1z < 128 * 128) { return p; }
+  if (q2x * q2x + q2z * q2z < 128 * 128) { return p; }
+  if (q3x * q3x + q3z * q3z < 128 * 128) { return p; }
+  Land c = landAt(cx, cz, seed);
+  if (c.slope > WG().pondMaxSlope) { return p; }
+  p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.surf = c.h;
+  return p;
+}
+static int bermLift(int h, int surf, int past) {
+  int bw = WG().pondBermWidth;
+  int core = std::max(bw / 4, 2);
+  if (past < core) { return std::max(h, surf + WG().pondBerm); }
+  int span = std::max(bw - core, 1);
+  int t = span - (past - core);
+  if (t <= 0) { return h; }
+  return std::max(h, h + ((surf + WG().pondBerm - h) * t) / span);
+}
+static IV2 pondAt(int x, int z, uint32_t seed) {
+  IV2 none = iv2(-1, -1);
+  Pond p = pondInfo(fdiv(x, WG().pondTile), fdiv(z, WG().pondTile), seed);
+  if (!p.present) { return none; }
+  int dx = x - p.cx;
+  int dz = z - p.cz;
+  int d2 = dx * dx + dz * dz;
+  if (d2 > p.r * p.r) { return none; }
+  int surf = p.surf;
+  int depth = WG().pondDepthRim +
+              ((p.r * p.r - d2) * (WG().pondDepth - WG().pondDepthRim)) / (p.r * p.r);
+  return iv2(surf - depth, surf);
+}
+struct Shore {
+  bool onShore;
+  int past;
+  int surf;
+};
+static Shore pondNear(int x, int z, uint32_t seed) {
+  Shore s;
+  s.onShore = false; s.past = 0; s.surf = -1;
+
+  int band = std::max(WG().shoreBand, WG().pondBermWidth);
+  if (band <= 0) { return s; }
+
+  int pt = fdiv(x, WG().pondTile);
+  int pz = fdiv(z, WG().pondTile);
+  int lx = fmodp(x, WG().pondTile);
+  int lz = fmodp(z, WG().pondTile);
+  int sx = select(select(0, 1, lx >= WG().pondTile - band), -1, lx < band);
+  int sz = select(select(0, 1, lz >= WG().pondTile - band), -1, lz < band);
+
+  int best = 0x7FFFFFFF;
+  Pond bestP;
+  bestP.present = false; bestP.cx = 0; bestP.cz = 0; bestP.r = 0; bestP.surf = -1;
+  for (int iz = 0; iz < 2; iz++) {
+    int oz = select(0, sz, iz == 1);
+    if (iz == 1 && sz == 0) { continue; }
+    for (int ix = 0; ix < 2; ix++) {
+      int ox = select(0, sx, ix == 1);
+      if (ix == 1 && sx == 0) { continue; }
+      Pond p = pondInfo(pt + ox, pz + oz, seed);
+      if (!p.present) { continue; }
+      int dx = x - p.cx;
+      int dz = z - p.cz;
+      int d2 = dx * dx + dz * dz;
+      if (d2 <= p.r * p.r) { return s; }
+      int outer = p.r + band;
+      if (d2 > outer * outer) { continue; }
+      if (d2 < best) { best = d2; bestP = p; }
+    }
+  }
+  if (!bestP.present) { return s; }
+
+  int lo = 0;
+  int hi = band;
+  for (int i = 0; i < 8; i++) {
+    if (lo >= hi) { break; }
+    int mid = (lo + hi) / 2;
+    int rr = bestP.r + mid;
+    if (best <= rr * rr) { hi = mid; } else { lo = mid + 1; }
+  }
+  s.onShore = true;
+  s.past = std::max(lo - 1, 0);
+  s.surf = bestP.surf;
+  return s;
+}
+// MIRROR-END height
+
 // Fluid-lab flat-slab mode (world.h kLabSlabY). Process-wide, set once at
 // startup by --lab / --fluid-bench, mirrored to the GPU as TickParams.labMode.
 static bool sLabWorld = false;
 void World::SetLabWorld(bool on) { sLabWorld = on; }
 bool World::LabWorld() { return sLabWorld; }
+
+// MIRROR-BEGIN landheight
+// THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
+//
+//     World::TerrainHeight(x, z, seed)  ==  genColumn(x, z, seed).h,  exactly,
+//     for all inputs.
+//
+// Not "the topmost solid voxel" — that includes canopy, ruin walls, grass tufts
+// and the arena deck, and it cannot be mirrored cheaply (a tree tile scan in a
+// tick path). Every one of this function's ~30 callers is asking where the
+// GROUND is so it can stand something on it, and this is that.
+//
+// This is the ONE function on the CPU side that the shader's landColumn is not
+// token-compared against — it branches on a process-wide bool where the shader
+// branches on a uniform, and it discards the fields the CPU has no use for.
+// check_invariants.py instead compares the two blocks' INTEGER LITERALS as a
+// multiset, which is the drift that actually happens here: the deleted
+// surfHeightAt was a copy of exactly this arithmetic and it had already gone
+// stale. The `terrain` gate's pass C1 is the per-voxel proof.
+//
+// COST: ~25 hash3 (two octaves, one pond tile, one pond centre, up to four
+// neighbour tiles, one more centre). That is fine at O(1) per frame — spawn
+// placement, fixture anchoring, a mob ground probe. NEVER call it in a
+// per-voxel loop; the GPU has genColumn for that and it is hoisted per column.
 int World::TerrainHeight(int x, int z, uint32_t seed) {
-  // Lab slab: the same guard genColumn takes in worldgen.wgsl. Before the
+  // Lab slab: the same guard landColumn takes in worldgen.wgsl. Before the
   // tuning reads on purpose — the lab surface must not move when worldgen
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
-  // Amplitudes/wavelengths come from tuning.json so this cannot drift from the
-  // shader when they are tuned: baseHeight() reads the same values through the
-  // generated TUNE_* prelude. Integer math throughout, matching the shader
-  // exactly — this feeds terrain collision, so a mismatch is a player falling
-  // through the ground they can see.
-  const auto& w = CurrentTuning().worldgen;
-  return w.baseHeight +
-         (vnoise(x, z, w.hillWavelength * kHScale, seed ^ 1u) * w.hillAmplitude) / 255 +
-         (vnoise(x, z, w.detailWavelength * kHScale, seed ^ 2u) * w.detailAmplitude) / 255;
+  int h = baseHeight(x, z, seed);
+  // Authored origin-area set pieces, at their absolute world coordinates.
+  const int poolY = 44;
+  int pdx = x - 420; int pdz = z - 420;
+  int pd2 = pdx * pdx + pdz * pdz;
+  if (pd2 < 68 * 68) {
+    h = poolY;
+  } else if (pd2 < 80 * 80) {
+    h = std::max(h, poolY + 26);
+  }
+  int odx = x - 260; int odz = z - 300;
+  int od2 = odx * odx + odz * odz;
+  if (od2 < 32 * 32) {
+    h = poolY + 6;
+  } else if (od2 < 42 * 42) {
+    h = std::max(h, poolY + 26);
+  }
+  int ldx = x - 220; int ldz = z - 520;
+  int ld2 = ldx * ldx + ldz * ldz;
+  if (ld2 < 24 * 24) {
+    h = poolY + 2;
+  } else if (ld2 < 34 * 34) {
+    h = std::max(h, poolY + 22);
+  }
+  const bool inRim = pd2 < 80 * 80 || od2 < 42 * 42 || ld2 < 34 * 34;
+  // Disc ponds: carve the bowl inside, raise the berm outside.
+  IV2 pw = pondAt(x, z, seed);
+  if (pw.y >= 0) {
+    h = std::min(h, pw.x);
+  } else if (!inRim) {
+    Shore near = pondNear(x, z, seed);
+    if (near.onShore && near.past < WG().pondBermWidth) {
+      h = bermLift(h, near.surf, near.past);
+    }
+  }
+  return h;
+}
+// MIRROR-END landheight
+
+// The same branch landColumn takes, reported instead of applied. Kept adjacent
+// to TerrainHeight on purpose: if one grows a case the other has to, and the
+// `terrain` gate's berm assertion is only meaningful while they agree.
+World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
+  PondQuery q{false, false, 0, -1};
+  if (sLabWorld) return q;
+  const int pdx = x - 420, pdz = z - 420;
+  const int odx = x - 260, odz = z - 300;
+  const int ldx = x - 220, ldz = z - 520;
+  const bool inRim = pdx * pdx + pdz * pdz < 80 * 80 ||
+                     odx * odx + odz * odz < 42 * 42 ||
+                     ldx * ldx + ldz * ldz < 34 * 34;
+  const IV2 pw = pondAt(x, z, seed);
+  if (pw.y >= 0) {
+    q.inDisc = true;
+    q.surf = pw.y;
+    return q;
+  }
+  if (inRim) return q;
+  const Shore near = pondNear(x, z, seed);
+  q.near = near.onShore;
+  q.past = near.past;
+  q.surf = near.surf;
+  return q;
 }
 
 // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ---------------

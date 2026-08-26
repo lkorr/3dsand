@@ -39,7 +39,7 @@ for (int run = 0; run < 2; run++) {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   for (uint32_t t = 1; t <= kTicks; t++) {
-    SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t),
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t, kDefaultSeed),
                SelftestExps(t, kDefaultSeed), {}, true, {8, 3, 8}, false,
                SelftestParticlesActive(t));
     hashes[run].push_back(ReadHashSync(ctx, world));
@@ -96,6 +96,15 @@ if (!goldenOk) {
                   goldenNote.c_str());
 
   // Verdict: self-consistent AND simulating the recorded world.
+  //
+  // Those two are different failures and only one of them is rebaselinable.
+  // `deterministic` is the twice-run comparison -- the invariant this gate
+  // exists to protect, and never something a baseline edit may excuse.
+  // `goldenOk` is a PINNED VALUE. A run that is self-consistent but simulates a
+  // different world than the one recorded is exactly the case --rebaseline is
+  // for, so say so rather than reporting an undifferentiated FAIL that the
+  // rebaseline path then refuses to act on.
+  if (deterministic && !goldenOk) MarkPinnedOnly();
   return (deterministic && goldenOk) ? Status::Pass : Status::Fail;
 }
 
@@ -2001,12 +2010,41 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
     ctx.WaitIdle();
   }
 
-  // Paint into provably-empty sky, well above any terrain. The window origin
-  // is in CHUNK units; +24 chunks of Y from the origin is 384 voxels up.
+  // ---- FIND the empty sky; do not assume where it is ----------------------
+  //
+  // This used to be `origin.y + 24 chunks` on the theory that 384 voxels up is
+  // above any terrain. It is not a theory this gate can hold: `page-roundtrip`
+  // runs AFTER `streaming`, which flies the player out past x = 600, so the
+  // window has moved and the "provably empty" column sits in open procedural
+  // terrain that neither this file nor the constant knows the height of. Any
+  // better constant has the same defect — it would be a second, unowned copy of
+  // the terrain band, and the terrain overhaul moves that band by an order of
+  // magnitude.
+  //
+  // So ask the page table, which already knows: walk DOWN the chunk column from
+  // the top of the window for the first EMPTY sentinel. That is what "empty sky"
+  // means, stated as the property instead of as a coordinate. Failing when the
+  // whole column has none is itself a new and meaningful assertion — a residency
+  // window with no empty chunk anywhere above the player is a page-pool problem
+  // this gate would otherwise have painted over.
   const IVec3 o = world.WindowOrigin();
-  const IVec3 sky{(o.x + (int)kNChunk / 2) * (int)kChunk + 8,
-                  (o.y + 24) * (int)kChunk + 8,
-                  (o.z + (int)kNChunk / 2) * (int)kChunk + 8};
+  const int scx = o.x + (int)kNChunk / 2;
+  const int scz = o.z + (int)kNChunk / 2;
+  int skyCy = -1;
+  for (int cy = o.y + (int)kNChunk - 1; cy >= o.y; cy--) {
+    const uint32_t s = World::SlotChunkIndex({scx, cy, scz});
+    if (world.PageEntryOfSlot(s) == kPtEmpty) { skyCy = cy; break; }
+  }
+  if (skyCy < 0) {
+    detail = Format(
+        "no EMPTY chunk anywhere in the column above (%d,%d): the residency "
+        "window has no open sky to paint into, which is a page-pool or "
+        "worldgen-height problem, not a paging one",
+        scx, scz);
+    return Status::Fail;
+  }
+  const IVec3 sky{scx * (int)kChunk + 8, skyCy * (int)kChunk + 8,
+                  scz * (int)kChunk + 8};
   const uint32_t skySlot =
       World::SlotChunkIndex({sky.x >> 4, sky.y >> 4, sky.z >> 4});
 

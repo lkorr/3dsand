@@ -68,3 +68,68 @@ comparison after the scale pass uses the same command.
 | C · scale pass | ~0 change to high water (§3.3's claim: interiors are sentinels) | high water climbs materially → the octave ladder's slope is too steep and is buying surface area, not relief. Lower it before going further. |
 | F · 3D caves | **the real exposure.** A single carved cell anywhere in a 16³ chunk destroys its `JITTER` sentinel and costs a real page | high water approaches the pool → the cave province mask is not selective enough. This is why the mask exists. |
 | C, E | `--frames 400` p50 rises with cascade fill cost (levels 6–8 finally have something to draw) | no headless gate can see this; §7.1's far per-column hoist is the lever if it does. |
+
+---
+
+## After package B (foundations), 2026-08-26
+
+Same machine, same commands, same `scripts/run.sh` discipline. Package B is
+prerequisite plumbing — new noise primitives, three column hoists, a height
+contract, perched tarns — so it is not supposed to move the *world* much. It
+moves the *cost* a great deal, which is the point of the hoists.
+
+### `--frames 400`, standing at spawn
+
+| | stock HEAD | after B | |
+|---|---:|---:|---|
+| whole-frame p50 | 41.6 ms | **19.5 ms** | −53% |
+| whole-frame p95 | 134.4 ms | **21.9 ms** | −84% |
+| whole-frame p99 | 140.0 ms | **23.1 ms** | −83% |
+| frames > 33 ms | 262 (77.1%) | **1 (0.3%)** | |
+| avg render+present | 23.80 ms | 17.77 ms | |
+| page pool high water | 12,177 (37.2%) | 13,399 (40.9%) | +10% |
+| window shifts | 25 | 26 | |
+
+p50 is now within 3 ms of the 16.7 ms vsync floor, i.e. standing at spawn is no
+longer GPU-bound. The three hoists are where it comes from: `caveAt` out of the
+per-cell path (a buried column was evaluating the identical six-sample band
+geometry 16 times), `treeAt`'s 25-tile scan reduced to a per-column candidate
+set, and the `far` cascade sieve made column-major — 256 columns per level chunk
+instead of 4,096, twice over, since `farSurfaceMat` was rebuilding the column a
+second time for the skin lookup.
+
+**The +10% on high water is worth watching, not acting on.** It is the tarn
+radii growing (48..79 from a first cut at 24..47, forced up by the angle of
+repose — see below) plus `World::TerrainHeight` finally including the pond bowl
+carve. It is not the octave ladder, which has not landed yet; package C's
+prediction of ~0 change is still untested and is measured against **13,399**
+now, not against 12,177.
+
+### `--frames 1200 --autofly-hard`
+
+**Not re-run.** Package B does not change residency policy, the sentinel set, or
+the fill path — only how many times per column the same answers are computed.
+The `--frames 400` arm above already shows the residency direction. The
+adversarial arm is what package C and package F must be judged against, and
+13,631 is still the number to beat.
+
+### Two rule-2 traps this package turned up
+
+Both were found by `ca-skip` — "the world never reaches a quiet tick" — sixty
+lines of output away from anything that mentions terrain, which is exactly why
+the `terrain` gate's pass D now names the material keeping a chunk awake.
+
+1. **A pond bowl is steepest at its rim.** The parabolic bowl falls
+   `2*(pondDepth - pondDepthRim)/r` voxels per column there, and the bed it lays
+   is SAND. Shrinking the radii to 24 (as the plan asked) against an unchanged
+   26-voxel depth put that at 1.9 voxels/column against an angle of repose of
+   exactly 1.0 — a permanent avalanche. `LoadTuning` now bounds `pondDepth`
+   against `pondRadiusMin`, and a swimmable tarn therefore needs `r >= 46`.
+2. **Snow is a powder and the authored rims never suppressed it.** Trees, shore
+   life and caves all stop at the pool rims; snow did not, which was invisible
+   for as long as no ridge happened to stand next to a pool. Put one there and
+   snow generates on the lava pool's rim ring, slides down its inner face onto
+   the lava two voxels below, and `snow + tag:hot -> water` lights a front that
+   `water + tag:hot -> steam` and `steam -> water` sustain forever. It also
+   accounted for all 19 page faults the standalone gate was reporting — moving
+   matter writing through sentinels, PLAN_page_table.md risk 1.

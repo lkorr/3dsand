@@ -1617,10 +1617,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "treeline", w.treeline, out, at);
     ReadI(*g, "baseHeight", w.baseHeight, out, at);
     ReadI(*g, "hillAmplitude", w.hillAmplitude, out, at);
-    ReadI(*g, "hillWavelength", w.hillWavelength, out, at);
+    ReadI(*g, "hillLog2", w.hillLog2, out, at);
     ReadI(*g, "detailAmplitude", w.detailAmplitude, out, at);
-    ReadI(*g, "detailWavelength", w.detailWavelength, out, at);
-    ReadI(*g, "biomeScale", w.biomeScale, out, at);
+    ReadI(*g, "detailLog2", w.detailLog2, out, at);
+    ReadI(*g, "biomeLog2", w.biomeLog2, out, at);
     ReadI(*g, "desertThreshold", w.desertThreshold, out, at);
     ReadI(*g, "pineThreshold", w.pineThreshold, out, at);
     ReadI(*g, "meadowThreshold", w.meadowThreshold, out, at);
@@ -1634,6 +1634,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "pondChance", w.pondChance, out, at);
     ReadI(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
     ReadI(*g, "pondRadiusSpan", w.pondRadiusSpan, out, at);
+    ReadI(*g, "pondMaxSlope", w.pondMaxSlope, out, at);
+    ReadI(*g, "pondBerm", w.pondBerm, out, at);
+    ReadI(*g, "pondBermWidth", w.pondBermWidth, out, at);
     ReadI(*g, "pondDepth", w.pondDepth, out, at);
     ReadI(*g, "pondDepthRim", w.pondDepthRim, out, at);
     ReadI(*g, "lilyChance", w.lilyChance, out, at);
@@ -1682,10 +1685,29 @@ bool LoadTuning(const std::string& path, Tuning& out) {
         v = lo;
       }
     };
-    atLeast("hillWavelength", w.hillWavelength, 1);
-    atLeast("detailWavelength", w.detailWavelength, 1);
-    atLeast("biomeScale", w.biomeScale, 1);
-    atLeast("treeTile", w.treeTile, 8);
+    // Noise cells are LOG2 EXPONENTS, and both ends of the range are real
+    // limits rather than paranoia. Below 3 the lattice is finer than the
+    // smoothstep can resolve (q15frac loses every low bit); above 15 the Q15
+    // fraction shifts DOWN instead of up and the field goes blocky. The old
+    // 2901-voxel overflow ceiling on vnoise is gone with the divides — a
+    // vnoise2d cell is a shift, so there is no cs^2 to overflow.
+    auto log2Range = [&](const char* name, int& v) {
+      if (v < 3 || v > 15) {
+        out.warnings.push_back(std::string("worldgen.") + name +
+                               " is a LOG2 exponent and must be 3..15; clamped");
+        v = v < 3 ? 3 : 15;
+      }
+    };
+    log2Range("hillLog2", w.hillLog2);
+    log2Range("detailLog2", w.detailLog2);
+    log2Range("biomeLog2", w.biomeLog2);
+    // treeCandsInto keeps at most TREE_CAND_MAX = 9 candidate tiles per column,
+    // and that 9 is DERIVED: a site sits in the middle half of its tile, so the
+    // tiles whose sites can reach within TREE_MAX_REACH (124) of a column span
+    // 319 voxels of tile origin, i.e. ceil(319/treeTile) + 1 per axis. At 112
+    // that is 3 per axis and 9 total; below it a tenth candidate exists and
+    // would be silently dropped — a canopy that vanishes on one column.
+    atLeast("treeTile", w.treeTile, 112);
     atLeast("pondTile", w.pondTile, 8);
     atLeast("pondChance", w.pondChance, 1);
     atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
@@ -1705,6 +1727,27 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "worldgen.pondDepth > 34 would breach the cave layer and drain the "
           "pond; clamped to 34");
       w.pondDepth = 34;
+    }
+    atLeast("pondMaxSlope", w.pondMaxSlope, 0);
+    // THE REPOSE PAIRING. The bowl is parabolic, so it is steepest at the rim,
+    // where it falls 2*(pondDepth - pondDepthRim)/r voxels per column -- and the
+    // bed laid on that face is SAND. This CA's angle of repose is exactly 1
+    // voxel per column (sim_step.wgsl slides a powder into any free
+    // down-diagonal), so above that the tarn is a permanent avalanche and the
+    // chunk never sleeps (CLAUDE.md rule 2). It does not fail here or in the
+    // pond: it fails as `ca-skip` reporting the world is never quiet, two gates
+    // and a hundred lines of output away. Bound against the SMALLEST radius the
+    // tuning can roll, because that is the steepest bowl it can produce.
+    const int reposeDepth = w.pondDepthRim + w.pondRadiusMin / 2;
+    if (w.pondDepth > reposeDepth) {
+      out.warnings.push_back(
+          "worldgen.pondDepth " + std::to_string(w.pondDepth) +
+          " exceeds the angle of repose for pondRadiusMin " +
+          std::to_string(w.pondRadiusMin) +
+          " -- the sand bed on the bowl wall would avalanche forever; clamped "
+          "to " + std::to_string(reposeDepth) +
+          " (raise pondRadiusMin instead if you want a deeper tarn)");
+      w.pondDepth = reposeDepth;
     }
     // Shoreline knobs. Every "chance" is a modulo divisor (zero is a
     // div-by-zero in the shader); the band has two ceilings of its own.
@@ -1738,6 +1781,20 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "2x2 tile scan; clamped");
       w.shoreBand = w.pondTile / 2 - 1;
       if (w.shoreBand < 0) w.shoreBand = 0;
+    }
+    // The berm. `pondBermWidth` shares pondNear's scan band with `shoreBand`,
+    // so it takes the same 8-step-bisection and half-a-tile ceilings; and the
+    // berm must stay under shoreLift or it suppresses the very marsh fringe it
+    // is supposed to stand behind (see the shore block in genColumn).
+    atLeast("pondBerm", w.pondBerm, 0);
+    atLeast("pondBermWidth", w.pondBermWidth, 1);
+    if (w.pondBermWidth > 255) w.pondBermWidth = 255;
+    if (w.pondBermWidth > w.pondTile / 2 - 1)
+      w.pondBermWidth = std::max(1, w.pondTile / 2 - 1);
+    if (w.pondBerm >= w.shoreLift && w.shoreBand > 0) {
+      out.warnings.push_back(
+          "worldgen.pondBerm >= shoreLift: the berm stands the bank above the "
+          "waterline test, so no column near a pond can be a shore");
     }
     // The mud ring lives inside the band; a wider one would just be clipped
     // silently, which reads as "shoreMudWidth stopped doing anything".

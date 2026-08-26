@@ -139,7 +139,7 @@ void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
 
 // The scripted mutation stream the determinism gate hashes over. A pure
 // function of tick, so both runs of the twice-run comparison see the same ops.
-std::vector<BrushOp> SelftestOps(uint32_t tick);
+std::vector<BrushOp> SelftestOps(uint32_t tick, uint32_t seed);
 std::vector<ExplosionOp> SelftestExps(uint32_t tick, uint32_t seed);
 bool SelftestParticlesActive(uint32_t tick);
 

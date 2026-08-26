@@ -2085,7 +2085,7 @@ int main(int argc, char** argv) {
       ctx.WaitIdle();
       for (uint32_t tick = 1; tick <= kSweepTicks; tick++) {
         SubmitTick(ctx, world, sim, tick, kDefaultSeed,
-                   SelftestOps(tick), SelftestExps(tick, kDefaultSeed), {},
+                   SelftestOps(tick, kDefaultSeed), SelftestExps(tick, kDefaultSeed), {},
                    tick == kSweepTicks, {8, 3, 8}, false,
                    SelftestParticlesActive(tick));
       }

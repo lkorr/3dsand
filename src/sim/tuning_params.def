@@ -509,10 +509,14 @@ TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f)
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)
 TP_I(worldgen, baseHeight, TUNE_BASE_HEIGHT, 32)
 TP_I(worldgen, hillAmplitude, TUNE_HILL_AMPLITUDE, 42)
-TP_I(worldgen, hillWavelength, TUNE_HILL_WAVELENGTH, 64)
+// Noise cell sizes are LOG2 EXPONENTS, not voxel counts. That is what makes
+// vnoise2d divide-free (fdiv becomes >>, fmodp becomes &), and it is the reason
+// the terrain rewrite is CHEAPER than what it replaced rather than the other way
+// round. 6 = 64 voxels, 4 = 16, 9 = 512. LoadTuning clamps them to 3..15.
+TP_U(worldgen, hillLog2, TUNE_HILL_LOG2, 6)
 TP_I(worldgen, detailAmplitude, TUNE_DETAIL_AMPLITUDE, 12)
-TP_I(worldgen, detailWavelength, TUNE_DETAIL_WAVELENGTH, 16)
-TP_I(worldgen, biomeScale, TUNE_BIOME_SCALE, 384)
+TP_U(worldgen, detailLog2, TUNE_DETAIL_LOG2, 4)
+TP_U(worldgen, biomeLog2, TUNE_BIOME_LOG2, 9)
 TP_U(worldgen, desertThreshold, TUNE_DESERT_THRESHOLD, 214)
 TP_U(worldgen, pineThreshold, TUNE_PINE_THRESHOLD, 176)
 TP_U(worldgen, meadowThreshold, TUNE_MEADOW_THRESHOLD, 92)
@@ -524,8 +528,33 @@ TP_U(worldgen, treeChanceDesert, TUNE_TREE_CHANCE_DESERT, 6)
 TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
 TP_I(worldgen, pondTile, TUNE_POND_TILE, 448)
 TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
-TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 68)
-TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 60)
+// Radii SHRANK with the perched-tarn change (68..127 -> 48..79). A pond whose
+// waterline comes from its own centre and is contained by a forced berm is a
+// TARN, and a 10 m one reads right where a 25 m one reads as a failed lake.
+// The big water is package D's job.
+//
+// The FLOOR on the minimum is not taste, it is the angle of repose. The bowl's
+// steepest point is its rim, falling 2*(pondDepth - pondDepthRim)/r per column,
+// and the bed laid on it is SAND. Above 1 voxel/column that sand avalanches
+// forever and the chunk never sleeps, so a swimmable 26-voxel bowl needs
+// r >= 2*(26-3) = 46. LoadTuning enforces the pairing; 24 was tried and it is
+// what made the world stop settling.
+TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 48)
+TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 32)
+// Steepest ground a tarn may sit on, as |dh/dx| + |dh/dz| in Q8 (256 = 45
+// degrees = the CA's angle of repose). A tarn is PERCHED: on a slope the
+// centre-derived waterline sits under the uphill rim, the bowl cuts a cliff
+// into the hillside, and the sand bed goes down that cliff's inside face.
+// 0 disables tarns entirely, which is a legal thing to want.
+TP_I(worldgen, pondMaxSlope, TUNE_POND_MAX_SLOPE, 256)
+// The berm: how far ABOVE the waterline the annulus just outside the disc is
+// forced, and over how many voxels that lift ramps back to natural ground. The
+// first is what makes containment structural rather than a rim-sampling density
+// (see the perched-tarn block in worldgen.wgsl); the second is only ever a look
+// knob. Keep pondBerm comfortably under worldgen.shoreLift or the berm
+// suppresses the marsh fringe that is supposed to stand on it.
+TP_I(worldgen, pondBerm, TUNE_POND_BERM, 5)
+TP_I(worldgen, pondBermWidth, TUNE_POND_BERM_WIDTH, 14)
 // Bowl depth in VOXELS at the pond centre, tapering to pondDepthRim at the
 // edge. At kVoxelMeters 0.10 the player capsule is 17 voxels tall, so the old
 // 8-voxel centre depth was 0.8 m — ankle deep, and it made "swim in a pond"

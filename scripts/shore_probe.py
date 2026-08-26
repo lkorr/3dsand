@@ -58,8 +58,11 @@ def fmodp(a, b):
 T = json.load(open(os.path.join(ROOT, "assets", "materials", "tuning.json"),
                    encoding="utf-8"))["worldgen"]
 BASE_H = T["baseHeight"]
-HILL_WL, HILL_AMP = T["hillWavelength"], T["hillAmplitude"]
-DET_WL, DET_AMP = T["detailWavelength"], T["detailAmplitude"]
+# Noise cells are LOG2 EXPONENTS since the vnoise2d rewrite; this script
+# still models the legacy linear vnoise, so expand them back to sizes. It is
+# an approximation of the real field either way (different interpolant).
+HILL_WL, HILL_AMP = 1 << T["hillLog2"], T["hillAmplitude"]
+DET_WL, DET_AMP = 1 << T["detailLog2"], T["detailAmplitude"]
 TREELINE = T["treeline"]
 POND_TILE, PC = T["pondTile"], T["pondChance"]
 RMIN, RSPAN = T["pondRadiusMin"], T["pondRadiusSpan"]

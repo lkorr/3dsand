@@ -1604,8 +1604,31 @@ class World {
   // bodies move through them while staying ordinary solids everywhere else.
   CellKind KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const;
 
-  // Deterministic worldgen height — exact CPU mirror of worldgen.wgsl.
+  // THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
+  //
+  //     World::TerrainHeight(x, z, seed)  ==  genColumn(x, z, seed).h,
+  //     exactly, for all inputs.
+  //
+  // The GROUND — terrain octaves, authored pool floors and rims, the pond bowl
+  // carve, the tarn berm. NOT "the topmost solid voxel", which would include
+  // canopy, ruin walls, grass tufts and the arena deck and could not be
+  // mirrored cheaply. ~25 hash3 per call: fine at O(1)/frame (spawn placement,
+  // fixture anchoring, a mob ground probe), never in a per-voxel loop.
   static int TerrainHeight(int x, int z, uint32_t seed);
+
+  // The tarn a column stands in or beside. Exists so the `terrain` gate can
+  // assert the BERM INVARIANT — every column in the berm core is above its
+  // pond's waterline — which is what replaced pondSurface's 24-sample rim
+  // minimum with a structural guarantee. Reports `near` only where landColumn
+  // would actually apply the berm, so a passing assertion means exactly what
+  // the shader promises and nothing looser.
+  struct PondQuery {
+    bool inDisc;   // this column is under a tarn's water
+    bool near;     // outside a disc but inside the berm/shore scan band
+    int past;      // voxels beyond that disc's rim (0 = first column outside)
+    int surf;      // that tarn's water surface Y
+  };
+  static PondQuery PondNearColumn(int x, int z, uint32_t seed);
 
   // Fluid-lab worldgen mode (kLabSlabY block above). A process-wide static
   // because TerrainHeight is static and the flag must gate BOTH the CPU

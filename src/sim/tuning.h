@@ -1872,15 +1872,27 @@ struct Tuning {
   struct Worldgen {
     int treeline = 72;
     int baseHeight = 32;
-    int hillAmplitude = 42, hillWavelength = 64;
-    int detailAmplitude = 12, detailWavelength = 16;
-    int biomeScale = 384;
+    // Noise cells are LOG2 EXPONENTS (6 = 64 voxels, 4 = 16, 9 = 512), which is
+    // what lets vnoise2d replace fdiv/fmodp with >> and & — see the Q14 noise
+    // block in worldgen.wgsl. LoadTuning clamps all three to 3..15.
+    int hillAmplitude = 42, hillLog2 = 6;
+    int detailAmplitude = 12, detailLog2 = 4;
+    int biomeLog2 = 9;
     int desertThreshold = 214, pineThreshold = 176, meadowThreshold = 92;
     int treeTile = 144;
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
-    int pondTile = 448, pondChance = 4, pondRadiusMin = 68, pondRadiusSpan = 60;
+    int pondTile = 448, pondChance = 4, pondRadiusMin = 48, pondRadiusSpan = 32;
+    // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the
+    // CA's angle of repose). A bowl cut into a slope lays its sand bed on a
+    // wall and never settles.
+    int pondMaxSlope = 256;
+    // The tarn berm: the annulus just outside the disc is forced to
+    // (waterline + pondBerm) and ramps back to natural ground over
+    // pondBermWidth voxels. This is what makes pond containment STRUCTURAL —
+    // the rim-sampling density it replaced was already stale at these radii.
+    int pondBerm = 5, pondBermWidth = 14;
     // Bowl depth in VOXELS: pondDepth at the centre, pondDepthRim at the edge.
     // At kVoxelMeters 0.10 the player is 17 voxels tall, so a pond has to reach
     // roughly 20 before you can actually submerge in one — the previous

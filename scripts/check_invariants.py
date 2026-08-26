@@ -35,6 +35,13 @@ Checks:
      longer exists is a confident lie, and nothing else catches it -- the page
      renders exactly as well either way.
 
+  6. WORLDGEN MIRROR  assets/shaders/worldgen.wgsl  <->  src/sim/world.cpp
+     The terrain math is written twice -- once in WGSL for the GPU, once in C++
+     so the CPU can answer "where is the ground". A divergence is a player
+     falling through ground they can see, at some seeds, in some places. Both
+     sides bracket the shared code with `// MIRROR-BEGIN <tag>` and the token
+     streams are compared. See check_worldgen_mirror for what each tag means.
+
 Run standalone, or via the PostToolUse hook in .claude/settings.json, which
 passes the edited file so only the relevant checks run.
 
@@ -565,7 +572,150 @@ def check_tick_counts():
                     f"recorder's RecordCtx -- same silent-skip failure")
 
 
+# ------------------------------------------------------------- worldgen mirror
+# worldgen.wgsl's terrain math is written TWICE: once in WGSL for the GPU and
+# once in C++ (world.cpp) so the CPU can answer "where is the ground" for spawn
+# placement, fixture anchoring and mob probes. A divergence between them is a
+# player falling through ground they can see -- at some seeds, in some places,
+# silently. Until now the only thing enforcing it was a comment saying "keep in
+# sync", and the file had already proved that insufficient: the deleted
+# surfHeightAt was a third copy of the same arithmetic and had drifted.
+#
+# Both sides bracket the shared code with `// MIRROR-BEGIN <tag>` ...
+# `// MIRROR-END <tag>`. Blocks with the same tag concatenate IN FILE ORDER, so
+# the C++ declarations are deliberately written in the shader's order.
+#
+# Two comparisons, because the two halves differ in how mechanically alike they
+# can be:
+#
+#   `noise` / `height` -- FULL TOKEN STREAM. Language noise (declaration
+#     keywords, type annotations, casts, `;` and `,`) is normalised away and
+#     what is left is the arithmetic: identifiers, literals, operators and
+#     parentheses. Parens are deliberately KEPT, because `(a+b)*c` vs `a+(b*c)`
+#     is exactly the drift worth catching.
+#
+#   `landheight` -- INTEGER LITERALS ONLY, as a multiset. World::TerrainHeight
+#     branches on a process-wide bool where the shader branches on a uniform and
+#     discards the fields the CPU has no use for, so its token stream cannot
+#     match. What CAN'T differ is the authored geometry -- pool centres, radii,
+#     deck heights. That is the drift that actually happened here.
+#
+# The TUNE_* <-> tuning-member mapping is read out of sim/tuning_params.def
+# rather than hardcoded, so renaming a knob keeps this check honest instead of
+# silencing it.
+MIRROR_RE = re.compile(
+    r"^\s*//\s*MIRROR-BEGIN\s+(\w+)\s*$(.*?)^\s*//\s*MIRROR-END\s+\1\s*$",
+    re.M | re.S)
+
+# WGSL spellings that have no counterpart token on the C++ side, and vice versa.
+_WGSL_DROP = (r"\b(?:let|var|fn|i32|u32|f32|bool"
+              r"|N2|Land|Pond|Shore|LandCol|CaveBands|TreeCands)\b")
+_CPP_DROP = (r"\b(?:static|inline|const|int|uint32_t|int32_t|unsigned|bool"
+             r"|N2|Land|Pond|Shore|IV2)\b")
+
+
+def _mirror_blocks(text, tag):
+    return [m.group(2) for m in MIRROR_RE.finditer(text) if m.group(1) == tag]
+
+
+def _decomment(src):
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", src)
+
+
+def _tune_map():
+    """TUNE_FOO -> the tuning.h member name it stands for."""
+    out = {}
+    for m in re.finditer(r"^TP_[FIUB]?\w*\((\w+),\s*(\w+),\s*(TUNE_[A-Z0-9_]+),",
+                         read("src/sim/tuning_params.def"), re.M):
+        out[m.group(3)] = m.group(2)
+    return out
+
+
+def _normalise(src, wgsl, tunes):
+    src = _decomment(src)
+    if wgsl:
+        # TUNE_* and the file's own aliases for them become the member name.
+        for name, member in tunes.items():
+            src = re.sub(r"\b" + name + r"\b", member, src)
+        src = src.replace("POND_TILE", "pondTile")
+        src = re.sub(r"bitcast<[iu]32>", " ", src)
+        # Return types go before vec2<i32> becomes a constructor name, or a
+        # `-> vec2<i32>` would survive as a call to iv2.
+        src = re.sub(r"->\s*(?:vec2<i32>|\w+)", " ", src)
+        src = src.replace("vec2<i32>", "iv2")
+        src = re.sub(_WGSL_DROP, " ", src)
+    else:
+        src = re.sub(r"\[\[\w+\]\]", " ", src)                # [[maybe_unused]]
+        src = re.sub(r"\bWG\(\)\.(\w+)", r"\1", src)          # WG().pondTile
+        src = re.sub(r"\((?:int|uint32_t|int32_t|unsigned)\)", " ", src)
+        src = src.replace("std::", "")
+        src = re.sub(_CPP_DROP, " ", src)
+    # Numeric suffixes and case-insensitive hex.
+    src = re.sub(r"\b(0[xX][0-9a-fA-F]+)[uU]?\b", lambda m: m.group(1).lower(), src)
+    src = re.sub(r"\b(\d+)[uUiIfF]?\b", r"\1", src)
+    toks = re.findall(r"[A-Za-z_]\w*|0x[0-9a-f]+|\d+|[^\s]", src)
+    return [t for t in toks if t not in (";", ",", ":")]
+
+
+def check_worldgen_mirror():
+    wgsl, cpp = read("assets/shaders/worldgen.wgsl"), read("src/sim/world.cpp")
+    if not wgsl or not cpp:
+        return
+    checked.append("worldgen mirror")
+    tunes = _tune_map()
+
+    for tag in ("noise", "height"):
+        a = _mirror_blocks(wgsl, tag)
+        b = _mirror_blocks(cpp, tag)
+        if not a or not b:
+            problems.append(
+                f"worldgen mirror: no `MIRROR-BEGIN {tag}` block in "
+                f"{'worldgen.wgsl' if not a else 'world.cpp'} -- the CPU/GPU "
+                f"terrain mirror is unenforced")
+            continue
+        ta = _normalise("\n".join(a), True, tunes)
+        tb = _normalise("\n".join(b), False, tunes)
+        if ta == tb:
+            continue
+        # Report the first divergence with a window of context; a raw
+        # "they differ" is useless on a 400-token stream.
+        i = 0
+        while i < min(len(ta), len(tb)) and ta[i] == tb[i]:
+            i += 1
+        lo = max(0, i - 6)
+        problems.append(
+            f"worldgen mirror `{tag}`: worldgen.wgsl and world.cpp diverge at "
+            f"token {i} (of {len(ta)}/{len(tb)}).\n"
+            f"      wgsl: ...{' '.join(ta[lo:i + 8])}\n"
+            f"      cpp : ...{' '.join(tb[lo:i + 8])}")
+
+    # landheight: the authored geometry, by integer literal.
+    a, b = _mirror_blocks(wgsl, "landheight"), _mirror_blocks(cpp, "landheight")
+    if not a or not b:
+        problems.append("worldgen mirror: no `MIRROR-BEGIN landheight` block in "
+                        "worldgen.wgsl or world.cpp")
+        return
+    def lits(src, wgsl_side):
+        return {int(t) for t in _normalise(src, wgsl_side, tunes) if t.isdigit()}
+    # CONTAINMENT, not equality, and the direction is the point. The shader
+    # legitimately carries constants the CPU has no use for (fluid surface
+    # heights, the sentinel inits), so wgsl-only literals are fine. A literal the
+    # CPU has and the shader does NOT is the failure that actually happens here:
+    # the shader's authored geometry moved and the hand-written copy did not
+    # follow -- exactly how the deleted surfHeightAt went stale. The opposite
+    # direction, a rule added to landColumn and never mirrored, is what the
+    # `terrain` gate's per-voxel pass C1 exists to catch.
+    stale = sorted(lits("\n".join(b), False) - lits("\n".join(a), True))
+    if stale:
+        problems.append(
+            "worldgen mirror `landheight`: World::TerrainHeight (world.cpp) "
+            "uses authored constants that landColumn (worldgen.wgsl) no longer "
+            f"has: {stale}. The shader moved and the CPU copy did not.")
+
+
 ALL = {
+    "worldgen": check_worldgen_mirror,
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
@@ -590,6 +740,8 @@ RELEVANT = {
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim"],
+    "src/sim/world.cpp": ["worldgen"],
+    "assets/shaders/worldgen.wgsl": ["worldgen"],
     "src/sim/simulation.cpp": ["counts"],
     "src/gpu/rhi_record.h": ["counts"],
     "src/gpu/vk_record.h": ["counts"],

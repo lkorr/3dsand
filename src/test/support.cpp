@@ -833,30 +833,44 @@ uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim, uint32_t s
   return ReadHashSync(ctx, world);
 }
 
-std::vector<BrushOp> SelftestOps(uint32_t tick) {
+// EVERY Y HERE IS A HEIGHT ABOVE THE GROUND, never an absolute one, and that is
+// load-bearing rather than tidy. These ops are what the determinism hash and the
+// smoke probes are computed over: a sand column falling onto terrain, a pour
+// landing on the platform, fire reaching a surface, a seed on soil. Written as
+// absolute Y they were silently anchored to a 5.4 m terrain band — the moment
+// the datum moves (the terrain overhaul raises it by ~200 voxels) every one of
+// them is either buried in rock or dropped from the sky into a chunk that is not
+// resident, and the failure surfaces as a hash change with no cause.
+//
+// World::TerrainHeight is genColumn's `h` exactly (the height contract in
+// DESIGN.md), so `+ kDelta` means what it reads as: that many voxels of clear
+// air above the ground the brush is aimed at.
+std::vector<BrushOp> SelftestOps(uint32_t tick, uint32_t seed) {
   std::vector<BrushOp> ops;
+  auto ground = [&](int x, int z) { return World::TerrainHeight(x, z, seed); };
   if (tick >= 5 && tick < 150) {
-    ops.push_back({100, 170, 100, 6, kMatSand, 0, 0, 0});
-    ops.push_back({176, 150, 176, 5, kMatWater, 0, 0, 0});
+    ops.push_back({100, ground(100, 100) + 110, 100, 6, kMatSand, 0, 0, 0});
+    ops.push_back({176, ground(176, 176) + 90, 176, 5, kMatWater, 0, 0, 0});
   }
   if (tick >= 30 && tick < 90) {
-    ops.push_back({64, 60, 72, 4, kMatSmoke, 0, 0, 0});
+    ops.push_back({64, ground(64, 72) + 6, 72, 4, kMatSmoke, 0, 0, 0});
   }
   // reaction-system coverage: lava boiling the pool, fire on the wood
   // platform, seeds germinating — all feed the determinism hash check
   if (tick >= 40 && tick < 100) {
-    ops.push_back({176, 120, 150, 4, kMatLava, 0, 0, 0});
+    ops.push_back({176, ground(176, 150) + 60, 150, 4, kMatLava, 0, 0, 0});
   }
   if (tick >= 60 && tick < 120) {
-    ops.push_back({110, 80, 110, 3, kMatFire, 0, 0, 0});
+    ops.push_back({110, ground(110, 110) + 20, 110, 3, kMatFire, 0, 0, 0});
   }
   if (tick >= 10 && tick < 16) {
-    ops.push_back({150, 90, 128, 2, kMatSeed, 0, 0, 0});
+    ops.push_back({150, ground(128, 128) + 30, 128, 2, kMatSeed, 0, 0, 0});
   }
   // melt-mode coverage (laser, PLAN §C1): catches the falling sand column in
-  // a mode-2 brush — molten-glass conversion feeds the determinism hash
+  // a mode-2 brush — molten-glass conversion feeds the determinism hash. Four
+  // under the sand source, so it cuts the column rather than its origin.
   if (tick >= 70 && tick < 100) {
-    ops.push_back({100, 166, 100, 3, 0, 2u, 0, 0});
+    ops.push_back({100, ground(100, 100) + 106, 100, 3, 0, 2u, 0, 0});
   }
   return ops;
 }

@@ -42,13 +42,13 @@ bool saveOk = false;
   ctx.WaitIdle();
   uint32_t t = 3000;
   for (int i = 0; i < 100; i++)
-    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i), {}, {}, false,
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i, kDefaultSeed), {}, {}, false,
                {8, 3, 8}, false, false);
   ctx.WaitIdle();
   uint32_t h1 = HashWorldNow(ctx, world, sim, kDefaultSeed);
   bool saved = SaveWorld(ctx, world, stream, kPath, c.mats);
   for (int i = 100; i < 150; i++)
-    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i), {}, {}, false,
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, SelftestOps(i, kDefaultSeed), {}, {}, false,
                {8, 3, 8}, false, false);
   ctx.WaitIdle();
   uint32_t hDiverged = HashWorldNow(ctx, world, sim, kDefaultSeed);
@@ -463,7 +463,14 @@ bool streamOk = false;
     std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
     Player p2;
     p2.fly = true;
-    p2.pos = Vec3{140.5f, 110.0f, 140.5f};  // above the tallest hills (~90)
+    // ABOVE THE GROUND, not at an absolute Y. The comment here used to say
+    // "above the tallest hills (~90)", which was a second, unowned copy of the
+    // terrain band — and the terrain overhaul moves that band. 26 voxels of
+    // clearance is more than the flight loop needs and is measured from the
+    // height contract, so it stays true at any datum.
+    p2.pos = Vec3{140.5f,
+                  (float)(World::TerrainHeight(140, 140, kDefaultSeed) + 26),
+                  140.5f};
     auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
     PlayerInput in{};
     in.forward = 1.0f;

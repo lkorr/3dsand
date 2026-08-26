@@ -1417,7 +1417,41 @@ must be re-run to re-baseline. Everything outside `sim` is render- or CPU-side
 and provably cannot perturb the hash — verified by changing sky colour and
 exposure and watching the hash stay at `a0d20705`.
 
-`World::TerrainHeight` (the CPU mirror of `baseHeight()`) reads the same
+##### The height contract (2026-08-26)
+
+> `World::TerrainHeight(x, z, seed)` ≡ `genColumn(x, z, seed).h`, **exactly**, for
+> all inputs.
+
+The CPU mirror is not "roughly the terrain" and it is not "the topmost solid
+voxel". It is the **ground**: the terrain octaves, the authored pool floors and
+rims, the pond bowl carve, and the tarn berm — everything `landColumn()` in
+`worldgen.wgsl` applies to `h`, in that order. Literal topmost-solid would
+include canopy, ruin walls, grass tufts and the arena deck, and it cannot be
+mirrored cheaply (it needs `treeAt`'s tile scan in a tick path); every one of
+TerrainHeight's ~30 callers is asking where the ground is so it can stand
+something on it.
+
+Two things are deliberately **outside** the contract. The **arena** levels its
+footprint as a material override in `genCellIn`, not as a change to `Col.h` —
+folding it in would double-apply it and move cave depth and tree bases under its
+footprint; `farSurfaceMat` is the one consumer that wants the levelled deck and
+applies it locally. And the **fluid lab slab** is taken by both sides as an early
+branch, so the lab surface does not move when worldgen knobs are tuned.
+
+Enforcement is threefold and none of it is a comment: `scripts/check_invariants.py`
+token-compares the `MIRROR-BEGIN noise` / `MIRROR-BEGIN height` blocks in
+`worldgen.wgsl` and `world.cpp`, and compares the `landheight` blocks' authored
+constants; the `terrain` gate's pass C1 compares CPU and GPU **per voxel** over
+9,409 columns of pristine procgen. The cost is ~25 `hash3` per call, which is
+fine at O(1) per frame (spawn placement, fixture anchoring, a mob ground probe)
+and is forbidden in a per-voxel loop — the GPU has `genColumn` for that, hoisted
+once per column.
+
+There used to be a fourth height function, `surfHeightAt`, which hand-copied
+this arithmetic for the far-field skin lookup and had already drifted (it never
+took the lab branch). It is gone; `farSurfaceMat` takes the column.
+
+`World::TerrainHeight` reads the same
 `worldgen` values as the shader, so tuning terrain cannot desync collision from
 the terrain you can see. `scripts/tuning_prelude.py` supplies the same constants
 to `check_shaders.sh`, and is **generated** from `src/sim/tuning_params.def` —

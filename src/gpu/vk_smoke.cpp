@@ -194,13 +194,25 @@ PinnedTable LoadPinned(const char* jsonKey, const Pinned* fallback, size_t fallb
 // condition the quiet world leaves dark, and to keep them OVERLAPPING (a tick
 // with ops AND particles AND a hash tick is where a missing barrier between two
 // conditional rows would show).
-std::vector<BrushOp> LoudOps(uint32_t tick) {
+// Terrain-relative, for the reason spelled out over SelftestOps in
+// test/support.cpp: an absolute Y here is silently anchored to whatever terrain
+// band happened to exist when it was written, and the smoke scenario stops
+// exercising anything the moment the datum moves. This is the SECOND,
+// independent copy of that scenario (vk_smoke deliberately does not link the
+// selftest harness), so both had to move together.
+std::vector<BrushOp> LoudOps(uint32_t tick, uint32_t seed) {
   std::vector<BrushOp> ops;
-  if (tick >= 3 && tick < 100) ops.push_back({100, 170, 100, 6, kMatSand, 0, 0, 0});
-  if (tick >= 8 && tick < 90) ops.push_back({176, 150, 176, 5, kMatWater, 0, 0, 0});
-  if (tick >= 40 && tick < 100) ops.push_back({176, 120, 150, 4, kMatLava, 0, 0, 0});
-  if (tick >= 60 && tick < 110) ops.push_back({110, 80, 110, 3, kMatFire, 0, 0, 0});
-  if (tick >= 70 && tick < 100) ops.push_back({100, 166, 100, 3, 0, 2u, 0, 0});
+  auto ground = [&](int x, int z) { return World::TerrainHeight(x, z, seed); };
+  if (tick >= 3 && tick < 100)
+    ops.push_back({100, ground(100, 100) + 110, 100, 6, kMatSand, 0, 0, 0});
+  if (tick >= 8 && tick < 90)
+    ops.push_back({176, ground(176, 176) + 90, 176, 5, kMatWater, 0, 0, 0});
+  if (tick >= 40 && tick < 100)
+    ops.push_back({176, ground(176, 150) + 60, 150, 4, kMatLava, 0, 0, 0});
+  if (tick >= 60 && tick < 110)
+    ops.push_back({110, ground(110, 110) + 20, 110, 3, kMatFire, 0, 0, 0});
+  if (tick >= 70 && tick < 100)
+    ops.push_back({100, ground(100, 100) + 106, 100, 3, 0, 2u, 0, 0});
   return ops;
 }
 
@@ -309,7 +321,7 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
     std::vector<CellOp> cells;
     bool particles = false;
     if (loud) {
-      ops = LoudOps(tick);
+      ops = LoudOps(tick, kDefaultSeed);
       exps = LoudExps(tick, kDefaultSeed);
       cells = LoudCells(tick, wo);
       particles = LoudParticlesActive(tick);

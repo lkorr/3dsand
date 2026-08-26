@@ -265,7 +265,12 @@ void RebaselineSelftest(const std::string& path,
   // is the second token.
   std::string newHash;
   for (const Result& r : results) {
-    if (r.name == "determinism" && r.status == Status::Pass) {
+    // Pass OR pinnedOnly. pinnedOnly means the twice-run comparison was
+    // IDENTICAL and only the golden pin differs -- which is precisely the run
+    // whose hash we are here to record. Requiring Pass made this function
+    // unreachable in the only case it exists for.
+    if (r.name == "determinism" &&
+        (r.status == Status::Pass || r.pinnedOnly)) {
       // Parse "hash XXXXXXXX ..." from the detail
       size_t p = r.detail.find("hash ");
       if (p != std::string::npos) {
@@ -300,7 +305,13 @@ void RebaselineSelftest(const std::string& path,
   int changed = 0;
   for (const Result& r : results) {
     if (r.status == Status::Skip) continue;
-    const char* newVal = r.status == Status::Pass ? "pass" : "fail";
+    // A pinnedOnly failure records as PASS, and it has to: the write above just
+    // updated the pin that made it fail, so it will pass on the next run.
+    // Recording "fail" would enter it in the known-failing set and mask the
+    // very regression the gate exists to catch — a rebaseline that quietly
+    // disarms `determinism` is worse than one that refuses.
+    const char* newVal =
+        (r.status == Status::Pass || r.pinnedOnly) ? "pass" : "fail";
     std::string oldVal;
     if (!ReplaceJsonValue(text, r.name, newVal, &oldVal)) continue;
     if (oldVal != newVal) {
@@ -346,10 +357,15 @@ void RebaselineSelftest(const std::string& path,
 
 // Values the CURRENT gate has recorded, drained by Run() when it returns.
 std::vector<std::pair<std::string, std::string>> g_observed;
+bool g_pinnedOnly = false;
 
 void RecordObserved(const char* key, const std::string& value) {
   g_observed.emplace_back(key, value);
 }
+
+// See Result::pinnedOnly. A gate calls this after it has proved its own
+// invariant still holds and found that only the RECORDED value differs.
+void MarkPinnedOnly() { g_pinnedOnly = true; }
 
 void RecordObserved(const char* key, double value) {
   // Integers as integers: a threshold reading "1364" is diffable in a way that
@@ -495,11 +511,14 @@ int Run(Ctx& c, const Options& opt) {
       double t0 = NowSeconds();
       std::string detail;
       g_observed.clear();
+      g_pinnedOnly = false;
       r.status = g->fn(c, detail);
       r.seconds = NowSeconds() - t0;
       r.detail = detail;
       r.observed = std::move(g_observed);
       g_observed.clear();
+      r.pinnedOnly = g_pinnedOnly;
+      g_pinnedOnly = false;
     }
     outcome[r.name] = r.status;
     results.push_back(std::move(r));
@@ -511,11 +530,18 @@ int Run(Ctx& c, const Options& opt) {
   // Verdict. A gate already failing in the baseline is reported but does not
   // turn the run red — that is the whole point: an agent sees at a glance
   // whether it introduced a failure or inherited one.
-  std::vector<std::string> regressions, fixed, inherited;
+  std::vector<std::string> regressions, fixed, inherited, pinnedMoved;
   for (const Result& r : results) {
     const Gate* g = Find(r.name);
     if (g && g->advisory) continue;
     bool wasFailing = known.count(r.name) && known[r.name];
+    // A gate that failed ONLY because its pinned value moved is not a
+    // regression to a run that was invoked to move it. Outside --rebaseline it
+    // still is one: `--selftest` must go red when the world changes under you.
+    if (r.status == Status::Fail && r.pinnedOnly && opt.rebaseline) {
+      pinnedMoved.push_back(r.name);
+      continue;
+    }
     if (r.status == Status::Fail && !wasFailing) regressions.push_back(r.name);
     if (r.status == Status::Fail && wasFailing) inherited.push_back(r.name);
     if (r.status == Status::Pass && wasFailing) fixed.push_back(r.name);
@@ -567,6 +593,16 @@ int Run(Ctx& c, const Options& opt) {
                 hw, kPoolPages, 100.0 * (double)hw / (double)kPoolPages,
                 (double)hw * kChunkVol * 4.0 / (1024.0 * 1024.0),
                 (double)kPoolPages * kChunkVol * 4.0 / (1024.0 * 1024.0));
+  }
+
+  if (!pinnedMoved.empty()) {
+    std::printf("\nPINNED VALUES MOVED (%zu): ", pinnedMoved.size());
+    for (size_t i = 0; i < pinnedMoved.size(); i++)
+      std::printf("%s%s", pinnedMoved[i].c_str(),
+                  i + 1 < pinnedMoved.size() ? ", " : "");
+    std::printf("\n  each of these verified its own invariant and differs from "
+                "the baseline only in a RECORDED value, which is what this run "
+                "was invoked to update.\n");
   }
 
   if (!regressions.empty() || vkMsgs > 0 || pageFaults != 0) {

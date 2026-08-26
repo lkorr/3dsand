@@ -109,6 +109,25 @@ struct Result {
   // Values are STRINGS because the baseline scanner only accepts quoted
   // values — see LoadBaseline. Numbers go in as "1364", not 1364.
   std::vector<std::pair<std::string, std::string>> observed;
+
+  // "This gate failed ONLY because a PINNED VALUE moved, and the property the
+  // gate actually tests still holds."
+  //
+  // The distinction exists because --rebaseline could not otherwise do the one
+  // job CLAUDE.md advertises it for. It refuses to run when anything regressed
+  // -- correctly, since you must not be able to rebaseline away a real failure
+  // -- but a world hash that moved IS a regression by that rule, so the path
+  // for "a behavioural change intentionally moved the hash" refused itself and
+  // the only way through was to hand-edit tests/baseline.json.
+  //
+  // A gate may set this ONLY when it has independently verified the invariant
+  // it exists to protect. `determinism` sets it when the twice-run comparison
+  // is IDENTICAL and only the golden pin differs: the sim is provably
+  // self-consistent, it simply simulates a different world than the one
+  // recorded. It does NOT set it when the two runs diverge -- that is a real
+  // determinism failure and rebaselining it would be exactly the crime the
+  // refusal exists to prevent.
+  bool pinnedOnly = false;
 };
 
 // A gate: a name, the gates it needs run first, and the body.
@@ -188,6 +207,11 @@ double BaselineNumber(const char* key, double fallback);
 // widening it to serve the two gates that report numbers is the worse trade.
 void RecordObserved(const char* key, const std::string& value);
 void RecordObserved(const char* key, double value);
+
+// See Result::pinnedOnly. Call from a gate that has verified its own invariant
+// and found only the RECORDED value different -- it is what lets --rebaseline
+// update a pinned value without letting it paper over a real failure.
+void MarkPinnedOnly();
 
 // Run the selected gates. Returns a process exit code: 0 when every gate that
 // ran either passed or was already failing in the baseline.

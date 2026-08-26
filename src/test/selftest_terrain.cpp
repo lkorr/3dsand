@@ -171,8 +171,59 @@ struct PassAOut {
   double slopeP999 = 0;
   int rampMax = 0;
   int localRelief = 0;   // max surface range over a window-wide (512 vox) span
+  int pondCols = 0;      // columns sampled inside a tarn
+  int bermCols = 0;      // columns sampled in a tarn's berm core
   std::string why;
 };
+
+// A6 — THE BERM INVARIANT, which is what pond containment IS now.
+//
+// The formulation this replaced set the waterline to `min(24 rim samples) - 2`
+// and hoped the minimum was a good enough estimate; its own comment justified 24
+// directions for "the largest (r=36) pond" while tuning had taken the radius to
+// 127. Containment was a SAMPLING DENSITY dressed as an invariant, and the honest
+// test of it would have been a 512-direction sweep — expensive, and still only
+// evidence.
+//
+// The waterline now comes from the pond's own CENTRE column and the annulus
+// outside the disc is FORCED to (surface + pondBerm), so containment is a
+// property of the height function and the test is a statement of it:
+//
+//     inside a disc      -> the ground is BELOW the waterline (a bowl exists)
+//     in the berm core   -> the ground is AT OR ABOVE waterline + pondBerm
+//
+// Two comparisons per sampled column, no rim sweep, and it holds at every seed
+// and every radius rather than at the ones somebody checked.
+bool CheckPondColumn(int x, int z, int h, uint32_t seed, PassAOut& o) {
+  const auto& w = CurrentTuning().worldgen;
+  const World::PondQuery q = World::PondNearColumn(x, z, seed);
+  if (q.inDisc) {
+    o.pondCols++;
+    if (h >= q.surf) {
+      o.ok = false;
+      o.why += Format("%spond column (%d,%d): ground y%d is not below its own "
+                      "waterline y%d — the bowl was not carved",
+                      o.why.empty() ? "" : "; ", x, z, h, q.surf);
+      return false;
+    }
+    return true;
+  }
+  // The core is the flat part of the berm — the wall the water cannot cross.
+  // Outside it the lift ramps back to natural ground on purpose, so only the
+  // core carries the guarantee. bermLift() in worldgen.wgsl defines it.
+  const int core = std::max(w.pondBermWidth / 4, 2);
+  if (!q.near || q.past >= core) return true;
+  o.bermCols++;
+  if (h < q.surf + w.pondBerm) {
+    o.ok = false;
+    o.why += Format("%sberm column (%d,%d) at %d past the rim: ground y%d is "
+                    "under waterline y%d + berm %d — this tarn leaks",
+                    o.why.empty() ? "" : "; ", x, z, q.past, h, q.surf,
+                    w.pondBerm);
+    return false;
+  }
+  return true;
+}
 
 PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   PassAOut o;
@@ -185,9 +236,36 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   std::vector<int> hs;
   hs.reserve(((2 * kAnalyticHalf / kAnalyticStep) + 1) *
              ((2 * kAnalyticHalf / kAnalyticStep) + 1));
+  // Columns the coarse grid found inside a tarn; A6's directed sweep walks out
+  // from a bounded number of them so the berm core (2-3 voxels wide) is actually
+  // sampled rather than stepped over by a 16-voxel stride.
+  std::vector<std::pair<int, int>> inPond;
   for (int dz = -kAnalyticHalf; dz <= kAnalyticHalf; dz += kAnalyticStep)
-    for (int dx = -kAnalyticHalf; dx <= kAnalyticHalf; dx += kAnalyticStep)
-      hs.push_back(World::TerrainHeight(cx + dx, cz + dz, seed));
+    for (int dx = -kAnalyticHalf; dx <= kAnalyticHalf; dx += kAnalyticStep) {
+      const int x = cx + dx, z = cz + dz;
+      const int h = World::TerrainHeight(x, z, seed);
+      hs.push_back(h);
+      CheckPondColumn(x, z, h, seed, o);
+      if (inPond.size() < 24 && World::PondNearColumn(x, z, seed).inDisc)
+        inPond.push_back({x, z});
+    }
+
+  // A6's directed half: from each recorded interior column walk out along +x
+  // until the disc ends, then check every column of the berm core. Bounded by
+  // construction — 24 probes of at most (maxR + bermWidth) steps.
+  {
+    const auto& w = CurrentTuning().worldgen;
+    const int reach = w.pondRadiusMin + w.pondRadiusSpan + w.pondBermWidth + 4;
+    for (auto [px, pz] : inPond) {
+      for (int i = 0; i <= reach; i++) {
+        const int x = px + i;
+        const int h = World::TerrainHeight(x, pz, seed);
+        if (!CheckPondColumn(x, pz, h, seed, o)) break;
+        const World::PondQuery q = World::PondNearColumn(x, pz, seed);
+        if (!q.inDisc && (!q.near || q.past >= w.pondBermWidth)) break;
+      }
+    }
+  }
 
   o.hMin = *std::min_element(hs.begin(), hs.end());
   o.hMax = *std::max_element(hs.begin(), hs.end());
@@ -241,7 +319,9 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
       for (int i = -kAnalyticHalf; i <= kAnalyticHalf; i++) {
         const int x = alongX ? cx + i : cx + off;
         const int z = alongX ? cz + off : cz + i;
-        line.push_back(World::TerrainHeight(x, z, seed));
+        const int h = World::TerrainHeight(x, z, seed);
+        line.push_back(h);
+        CheckPondColumn(x, z, h, seed, o);   // A6, on the fine lattice
       }
       for (size_t i = 1; i < line.size(); i++)
         d.push_back(std::abs(line[i] - line[i - 1]));
@@ -299,50 +379,41 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
     }
   }
 
-  // A7 — noise-cell overflow guard. vnoise's numerator is 255*cs^2 and it
-  // crosses 2^31 at cs = 2901 voxels (290 m). Above that the C++ mirror (UB)
-  // and WGSL (defined wraparound) diverge differently, which is a CPU/GPU
-  // desync that no gate before C1 could see and that check_invariants.py does
-  // not cover. Only the tuning-driven cells are checkable from here; a
-  // wavelength hardcoded inside a shader octave is C1's problem.
+  // A7 — noise-cell range guard. The old form of this checked 255*cs^2 against
+  // 2^31, because the legacy vnoise multiplied by cs^2 and crossed INT32_MAX at
+  // a 2901-voxel cell — an overflow that is UB in C++ and defined wraparound in
+  // WGSL, i.e. a silent, seed-dependent CPU/GPU desync. The terrain octaves
+  // moved to vnoise2d, whose cell is a LOG2 SHIFT: there is no cs^2 left to
+  // overflow, and the failure mode became a range one instead. Below 3 the
+  // Q15 in-cell fraction has no bits left; above 15 q15frac shifts DOWN and the
+  // field goes blocky. LoadTuning clamps to that window; this asserts the clamp
+  // is actually reaching these three knobs.
   {
     const auto& w = CurrentTuning().worldgen;
-    const struct { const char* name; int cs; } cells[] = {
-        {"hillWavelength", w.hillWavelength},
-        {"detailWavelength", w.detailWavelength},
-        {"biomeScale", w.biomeScale},
+    const struct { const char* name; int log2; } cells[] = {
+        {"hillLog2", w.hillLog2},
+        {"detailLog2", w.detailLog2},
+        {"biomeLog2", w.biomeLog2},
     };
     for (const auto& c : cells) {
-      const double num = 255.0 * (double)c.cs * (double)c.cs;
-      if (num > 2147483647.0) {
+      if (c.log2 < 3 || c.log2 > 15) {
         o.ok = false;
-        o.why += Format("%sworldgen.%s = %d overflows vnoise (255*cs^2 = %.0f "
-                        "> 2^31; ceiling is cs = 2901)",
-                        o.why.empty() ? "" : "; ", c.name, c.cs, num);
+        o.why += Format("%sworldgen.%s = %d is outside vnoise2d's 3..15 log2 "
+                        "window (LoadTuning is supposed to clamp it)",
+                        o.why.empty() ? "" : "; ", c.name, c.log2);
       }
     }
   }
-
-  // A6 — THE DENSE POND-RIM SWEEP IS DELIBERATELY ABSENT.
-  //
-  // The invariant is real and it is already stale: pondSurface justifies its 24
-  // rim samples for "the largest (r=36) pond", and tuning gives r up to 127 —
-  // one sample every 33 voxels of arc against a -2 margin and a 12-voxel detail
-  // octave. But checking it needs a CPU mirror of pondInfo/pondSurface, and the
-  // pond machinery is being replaced outright: the surface comes from the
-  // CENTRE column and the annulus is FORCED above it by a berm, at which point
-  // the guarantee is structural and the check is a two-line assertion on the
-  // berm rather than a 512-sample sweep against a sampling density. Writing the
-  // mirror now to delete it next is waste. The assertion lands with the berm.
 
   if (log)
     *log = Format(
         "surface y%d..y%d (mean %.0f, p5 %.0f, p95 %.0f, relief %d vox = %.1f m)"
         " | local relief over 512 vox: %d (window is %u) | adjacent step max %d "
-        "p99.9 %.0f | spawn-transect max step %d",
+        "p99.9 %.0f | spawn-transect max step %d | tarns: %d bowl cols, %d berm "
+        "cols checked",
         o.hMin, o.hMax, o.hMean, o.hP5, o.hP95, o.hMax - o.hMin,
         (double)(o.hMax - o.hMin) * kVoxelMeters, o.localRelief, kWorldN,
-        o.slopeMax, o.slopeP999, o.rampMax);
+        o.slopeMax, o.slopeP999, o.rampMax, o.pondCols, o.bermCols);
   return o;
 }
 
@@ -702,18 +773,59 @@ Status GateTerrain(Ctx& c, std::string& detail) {
   // the two-second version of the same question so a bad fill rule is caught
   // before anyone spends a minute finding out.
   uint32_t awake = 0;
+  std::string awakeAt;
   {
     for (uint32_t t = 2; t < 122; t++)
       SubmitTick(ctx, world, sim, t, seed, {}, {}, {}, false, {0, 0, 0},
                  t == 121, false);
     ctx.WaitIdle();
     ctx.ProcessEvents();
-    awake = ReadActiveChunksSync(ctx, world, sim);
+    // WHERE, not just how many. A count alone sends you guessing at which fill
+    // rule is the avalanche; the world coords plus the mirror's ground height
+    // there name the feature in one line. `ca-skip` needs this number to be
+    // ZERO (its skip latch waits for an empty dirty set), so a "small" residue
+    // here is a gate failure sixty lines of output away.
+    std::vector<uint32_t> flags(kNumChunks, 0);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                          flags.data(), kNumChunks * 4, "terrainActive");
+    const IVec3 org = world.WindowOrigin();
+    int shown = 0;
+    for (uint32_t i = 0; i < kNumChunks; i++) {
+      if (flags[i] == 0) continue;
+      awake++;
+      if (shown++ >= 6) continue;
+      const int lx = (int)(i % kNChunk);
+      const int ly = (int)((i / kNChunk) % kNChunk);
+      const int lz = (int)(i / (kNChunk * kNChunk));
+      const int wx = (org.x + lx) * (int)kChunk, wy = (org.y + ly) * (int)kChunk,
+                wz = (org.z + lz) * (int)kChunk;
+      // ...and WHAT. A chunk coordinate still leaves you guessing which fill
+      // rule is the avalanche; the dominant material in it names the rule.
+      // One readback per reported chunk, at most six, only when something is
+      // still moving — free in the passing case, which is the whole point.
+      std::vector<uint32_t> vox(kChunkVol, 0);
+      ReadVoxelsSync(ctx, world, i, 1, vox.data(), "terrainAwake");
+      std::map<uint32_t, int> hist;
+      for (uint32_t w : vox)
+        if ((w & 0xFFFu) != 0) hist[w & 0xFFFu]++;
+      std::vector<std::pair<int, uint32_t>> by;
+      for (auto& kv : hist) by.push_back({kv.second, kv.first});
+      std::sort(by.rbegin(), by.rend());
+      awakeAt += Format(" (%d,%d,%d h%d:", wx, wy, wz,
+                        World::TerrainHeight(wx + 8, wz + 8, seed));
+      for (size_t k = 0; k < by.size() && k < 5; k++)
+        awakeAt += Format(" %s x%d",
+                          by[k].second < c.mats.size()
+                              ? c.mats[by[k].second].name.c_str() : "?",
+                          by[k].first);
+      awakeAt += ")";
+    }
   }
   const int dCap = (int)BaselineNumber("terrain.settleProxyMax", 400);
   const bool dOk = (int)awake <= dCap;
   std::printf("terrain: pass D %u chunks still awake after 120 ticks "
-              "(cap %d; `sleep` is the real gate)\n", awake, dCap);
+              "(cap %d; `sleep` is the real gate)%s\n", awake, dCap,
+              awakeAt.c_str());
 
   // WHAT THIS GATE MEASURED, for --rebaseline. These are the numbers a terrain
   // change is judged by, and recording them means a scale pass is a JSON diff

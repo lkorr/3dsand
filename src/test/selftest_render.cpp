@@ -80,13 +80,13 @@ Status GateFarFog(Ctx& c, std::string& detail) {
 SubmitWorldgen(ctx, world, sim, kDefaultSeed);
 ctx.WaitIdle();
 for (uint32_t t = 1; t <= 60; t++)  // warm up with heavy activity
-  SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t),
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t, kDefaultSeed),
              SelftestExps(t, kDefaultSeed), {}, false, {8, 3, 8}, false,
              SelftestParticlesActive(t));
 ctx.WaitIdle();
 double t0 = NowSeconds();
 for (uint32_t t = 61; t <= 160; t++)
-  SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t),
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t, kDefaultSeed),
              SelftestExps(t, kDefaultSeed), {}, false, {8, 3, 8}, false,
              SelftestParticlesActive(t));
 ctx.WaitIdle();
@@ -386,7 +386,11 @@ grab("screenshot.bmp");
   // Well above the canopy on purpose. At tree height a single trunk in front
   // of the lens fills the frame and the shot shows no far field at all —
   // which is exactly what happened when worldgen grew taller trees.
-  Vec3 farEye{140, 220, 140};
+  // ABOVE THE GROUND, not at an absolute Y: the datum moves with the terrain
+  // overhaul and a literal 220 puts this camera underground the moment it does.
+  // ~160 voxels clears TREE_MAX_ABOVE's crown reach at this column.
+  Vec3 farEye{140, (float)(World::TerrainHeight(140, 140, kDefaultSeed) + 160),
+              140};
   WriteRenderParams(ctx.queue, world, farEye, farCam, (float)W / H, true, 0);
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   rhi::RenderPass rp =
