@@ -6268,6 +6268,20 @@ fn fs(in : VSOut) -> FSOut {
     // here as well would double-count it and wash the lake bed out to sky
     // color, which is exactly the haze that hides the bottom.
     if (h.liqT <= 0.0) { color = applyAerial(color, rd, h.t); }
+
+    // ---- dirty-voxel debug highlight (dev panel toggle) ----
+    if ((R.flags & 2u) != 0u) {
+      let stamp = voxStamp(h.word);
+      let s0 = stampFor(R.tick, 0u);
+      let s1 = stampFor(R.tick, 1u);
+      if (stamp == s0 || stamp == s1) {
+        let ed = min(uv, 1.0 - uv);
+        let me = min(ed.x, ed.y);
+        if (me < 0.08) {
+          color = vec3f(1.0, 0.05, 0.05);
+        }
+      }
+    }
   }
 
   // ---- gas tint along the ray ----

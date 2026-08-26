@@ -83,7 +83,51 @@ already established?"** If there is no answer, skip it. Sessions here have spent
    the world change". `--vk-smoke-loud` (~40 s) answers "WHERE did it change" —
    it has per-tick probes. `SANDVOX_PT_DEBUG=1 --vk-smoke-loud` with
    `SANDVOX_PT_DIGEST=<tick>` answers "WHICH CHUNK" — dump and diff, do not
-   guess. Escalate in that order; do not start at the top.
+   guess. Escalate in that order; do not start at the top. If the number STILL
+   has no cause attached at the end of that ladder, the next step is a code
+   change to the reporter, not another run — see rule 6.
+6. **A bare count is not a measurement. When a failure reports only a number —
+   "58 page faults", "108 chunks awake", "0 / 220 skipped" — do NOT start
+   turning features off one at a time. A/B elimination buys ONE hypothesis per
+   run. Adding attribution to the reporter buys all of them at once.**
+
+   This is rules 1–5 applied to DIAGNOSIS instead of to confirmation, and it is
+   the one the budget framing above does not otherwise catch: each elimination
+   run genuinely does "establish a claim not already established", so every one
+   of them passes the test at the top of this section individually while the
+   sequence is indefensible. There are always more hypotheses than you think.
+
+   Measured, package C of the terrain overhaul: 58 page faults took ~14
+   elimination runs (ponds off, shores off, ruins off, caves off, the sediment
+   wedge off, evaporation off, the MPM seam off, three bowl geometries) and
+   arrived nowhere. Making `voxStore` record the WORD it dropped and the CHUNK
+   that refused it took 4 runs and printed the whole answer on one line:
+   `stone (id 1, word 0x11002001: stain 1/1) | refusing chunks
+   (368,192,192)..(368,192,192), entry 0xc0000001` — a pond's water staining the
+   rock behind its bank into a chunk still held as a JITTER sentinel.
+
+   **Record at the point of FAILURE, not at the point of refusal.** The first
+   version of that probe reported from `voxWordIndex`, which `sim_fluid_seam`
+   calls to ask "is this cell writable?" and correctly treats `PT_NO_WORD` as
+   "blocked" — so it named a chunk layer with nothing to do with the lost
+   voxels and cost two more runs. A refusal is not a fault; only a dropped
+   STORE is.
+
+   The instruments this bought are permanent and are the ones to reach for
+   first: `voxStore`'s three spare `pageFaults` words (lost word + refusing
+   chunk span), and the `terrain` gate's pass D, which now diffs the awake
+   chunks over 20 further ticks and reports which FIELD moved (material /
+   fullness / stain / stamp only) plus each awake chunk's depth below ground.
+   "0 material, 0 stain, 13 stamp-only" is a different bug from "4 material",
+   and neither is "13 voxels changed".
+7. **A `--gate X` subset is not a small `--selftest`.** Gates share one `World`
+   and several depend on state an earlier gate left behind — `kOrder` in
+   `src/test/selftest.cpp` says so in as many words, and the ordering note in
+   `selftest.h` says why. A differential measured as a
+   subset and compared against a full-suite number is not a differential: the
+   same `sedSlope=0` arm reported `settle-back` PASS under `--gate settle-back`
+   and FAIL under `--selftest`, which cost a wrong conclusion and two runs to
+   undo. Run both arms at the same scope, or neither.
 
 **Full acceptance is an END-OF-WORK event, run ONCE**, on the tree you intend to
 ship. Use `--suite acceptance` (one process, one command):

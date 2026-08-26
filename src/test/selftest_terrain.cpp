@@ -171,6 +171,8 @@ struct PassAOut {
   double slopeP999 = 0;
   int rampMax = 0;
   int localRelief = 0;   // max surface range over a window-wide (512 vox) span
+  int farMin = 0, farMax = 0;   // relief out where the home ramp is fully spent
+  int boxMin = 0, boxMax = 0;   // surface range over pass C's readback box ONLY
   int pondCols = 0;      // columns sampled inside a tarn
   int bermCols = 0;      // columns sampled in a tarn's berm core
   std::string why;
@@ -345,16 +347,23 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
     }
   }
 
-  // A4 — ramp continuity across the spawn-region boundary. Today the spawn
-  // clearing only suppresses FLORA, so this measures nothing and reports the
-  // ambient slope. It goes live with the terrain flattening: a fade applied
-  // over too short a distance shows up here as a step that dwarfs the ambient
-  // one, and the whole point is that the fade width is READ off this number
-  // rather than guessed. Walk out from the origin along +x, +z and both
-  // diagonals, since a Chebyshev-shaped region has its steepest boundary on
-  // the axes and its longest on the diagonal.
+  // A4 — ramp continuity across the spawn-region boundary, and the only look
+  // this gate gets at the world OUTSIDE the calm home area. A fade applied over
+  // too short a distance shows up here as a step that dwarfs the ambient one,
+  // and the whole point is that the fade width is READ off this number rather
+  // than guessed. Walk out from the origin along +x, +z and both diagonals,
+  // since a Chebyshev-shaped region has its steepest boundary on the axes and
+  // its longest on the diagonal.
+  //
+  // The transects also carry the FAR RELIEF, which the ±1024 grid above cannot
+  // see: with a 320-voxel calm radius and a 2048-voxel fade, the grid's own
+  // corners are still only ~45% of the way to full amplitude, so its
+  // "relief" number is a property of the ramp rather than of the terrain. These
+  // run to 3072 and are fully ramped over most of that.
   {
     int worst = 0;
+    o.farMin = INT32_MAX;
+    o.farMax = INT32_MIN;
     for (int t = 0; t < 4; t++) {
       const int sx = (t == 0 || t == 2 || t == 3) ? 1 : 0;
       const int sz = (t == 1 || t == 2) ? 1 : (t == 3 ? -1 : 0);
@@ -362,10 +371,28 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
       for (int i = 1; i <= 3072; i++) {
         const int h = World::TerrainHeight(i * sx, i * sz, seed);
         worst = std::max(worst, std::abs(h - prev));
+        o.farMin = std::min(o.farMin, h);
+        o.farMax = std::max(o.farMax, h);
         prev = h;
       }
     }
     o.rampMax = worst;
+  }
+
+  // The surface range over pass C's readback box, and ONLY that box. Pass C
+  // reads one contiguous X run per (cy, cz), so its cost is linear in the cy
+  // band it has to cover — and with 200 m of relief the WORLD's hMin..hMax is
+  // an order of magnitude wider than the 96-voxel box it actually reads. Using
+  // the global range there cost 150 readbacks for a box that needs 40.
+  {
+    o.boxMin = INT32_MAX;
+    o.boxMax = INT32_MIN;
+    for (int z = kVoxLo; z <= kVoxHi; z++)
+      for (int x = kVoxLo; x <= kVoxHi; x++) {
+        const int h = World::TerrainHeight(x, z, seed);
+        o.boxMin = std::min(o.boxMin, h);
+        o.boxMax = std::max(o.boxMax, h);
+      }
   }
 
   // A5 — treeline bracketing.
@@ -408,11 +435,14 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   if (log)
     *log = Format(
         "surface y%d..y%d (mean %.0f, p5 %.0f, p95 %.0f, relief %d vox = %.1f m)"
+        " | far transects y%d..y%d (%.1f m) | pass-C box y%d..y%d"
         " | local relief over 512 vox: %d (window is %u) | adjacent step max %d "
         "p99.9 %.0f | spawn-transect max step %d | tarns: %d bowl cols, %d berm "
         "cols checked",
         o.hMin, o.hMax, o.hMean, o.hP5, o.hP95, o.hMax - o.hMin,
-        (double)(o.hMax - o.hMin) * kVoxelMeters, o.localRelief, kWorldN,
+        (double)(o.hMax - o.hMin) * kVoxelMeters, o.farMin, o.farMax,
+        (double)(o.farMax - o.farMin) * kVoxelMeters, o.boxMin, o.boxMax,
+        o.localRelief, kWorldN,
         o.slopeMax, o.slopeP999, o.rampMax, o.pondCols, o.bermCols);
   return o;
 }
@@ -556,9 +586,9 @@ PassCOut PassC(GpuContext& ctx, World& world,
   // plus headroom for the fixture-clearance check above it and a little below
   // for the liquid check. Pass B independently validated that the mirror is in
   // the right neighbourhood, so narrowing to it is not circular.
-  const int cyLo = std::max(org.y, (a.hMin - 8) >> 4);
+  const int cyLo = std::max(org.y, (a.boxMin - 8) >> 4);
   const int cyHi =
-      std::min(org.y + (int)kNChunk - 1, (a.hMax + kClearAbove + 8) >> 4);
+      std::min(org.y + (int)kNChunk - 1, (a.boxMax + kClearAbove + 8) >> 4);
   const int cxLo = kVoxLo >> 4, cxHi = kVoxHi >> 4;
   const int czLo = kVoxLo >> 4, czHi = kVoxHi >> 4;
   const int runLen = cxHi - cxLo + 1;
@@ -789,16 +819,48 @@ Status GateTerrain(Ctx& c, std::string& detail) {
     rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
                           flags.data(), kNumChunks * 4, "terrainActive");
     const IVec3 org = world.WindowOrigin();
+    // Report the SHALLOWEST awake chunks, not the first six in slot order.
+    // Slot order is lz-major, so "the first six" is a scan line through the
+    // window and says nothing; the chunks worth naming are the ones nearest the
+    // surface, because that is where every worldgen fill rule puts matter.
+    std::vector<std::pair<int, uint32_t>> awakeByDepth;
+    for (uint32_t i = 0; i < kNumChunks; i++) {
+      if (flags[i] == 0) continue;
+      const IVec3 wc = world.SlotToWorldChunk(i);
+      const int gh = World::TerrainHeight(wc.x * (int)kChunk + 8,
+                                          wc.z * (int)kChunk + 8, seed);
+      awakeByDepth.push_back({std::abs((gh >> 4) - wc.y), i});
+    }
+    std::sort(awakeByDepth.begin(), awakeByDepth.end());
+    std::vector<uint8_t> pick(kNumChunks, 0);
+    for (size_t k = 0; k < awakeByDepth.size() && k < 6; k++)
+      pick[awakeByDepth[k].second] = 1;
+    int deepest = awakeByDepth.empty() ? 0 : awakeByDepth.back().first;
     int shown = 0;
+    // WHERE IN THE COLUMN, over ALL of them. Six named chunks tell you what is
+    // moving; this tells you whether the thing that is moving is the SURFACE or
+    // something buried, which is a different bug entirely and the one that
+    // wastes the most time when it is not visible. Buckets are relative to the
+    // ground: at or above it, the first chunk under it, and deeper.
+    int atSurface = 0, justUnder = 0, buried = 0, aloft = 0;
     for (uint32_t i = 0; i < kNumChunks; i++) {
       if (flags[i] == 0) continue;
       awake++;
-      if (shown++ >= 6) continue;
       const int lx = (int)(i % kNChunk);
       const int ly = (int)((i / kNChunk) % kNChunk);
       const int lz = (int)(i / (kNChunk * kNChunk));
       const int wx = (org.x + lx) * (int)kChunk, wy = (org.y + ly) * (int)kChunk,
                 wz = (org.z + lz) * (int)kChunk;
+      {
+        const int gh = World::TerrainHeight(wx + 8, wz + 8, seed);
+        const int d = (gh >> 4) - (wy >> 4);       // chunks below the ground
+        if (d < 0) aloft++;
+        else if (d == 0) atSurface++;
+        else if (d == 1) justUnder++;
+        else buried++;
+      }
+      if (!pick[i]) continue;
+      shown++;
       // ...and WHAT. A chunk coordinate still leaves you guessing which fill
       // rule is the avalanche; the dominant material in it names the rule.
       // One readback per reported chunk, at most six, only when something is
@@ -811,14 +873,144 @@ Status GateTerrain(Ctx& c, std::string& detail) {
       std::vector<std::pair<int, uint32_t>> by;
       for (auto& kv : hist) by.push_back({kv.second, kv.first});
       std::sort(by.rbegin(), by.rend());
-      awakeAt += Format(" (%d,%d,%d h%d:", wx, wy, wz,
-                        World::TerrainHeight(wx + 8, wz + 8, seed));
+      // The page-table entry, because "stone x4096" from a SENTINEL slot is not
+      // a reading of anything: ReadVoxelsSync resolves a slot to a page, and a
+      // sentinel has none, so the words come back from whatever page was last
+      // recycled into that offset. A chunk reported as full of stone that is
+      // actually an EMPTY sentinel sends you looking for an avalanche in solid
+      // rock, which is exactly the hour this line exists to save.
+      awakeAt += Format(" (%d,%d,%d h%d pt%s:", wx, wy, wz,
+                        World::TerrainHeight(wx + 8, wz + 8, seed),
+                        world.PageOffsetOfSlot(i) == World::kNoPage
+                            ? "SENTINEL" : "page");
       for (size_t k = 0; k < by.size() && k < 5; k++)
         awakeAt += Format(" %s x%d",
                           by[k].second < c.mats.size()
                               ? c.mats[by[k].second].name.c_str() : "?",
                           by[k].first);
       awakeAt += ")";
+    }
+    // ---- WHAT IS ACTUALLY MOVING ----
+    // A material histogram of an awake chunk says what is IN it, which is not
+    // the same question and sends you looking in the wrong place: every chunk
+    // around a tarn is mostly water and stone whether the water is flowing or
+    // the sand is. So tick 20 more and DIFF: the materials whose counts change
+    // are the ones still in motion, and that is a one-line answer instead of an
+    // afternoon of turning worldgen features off one at a time.
+    if (awake) {
+      std::map<uint32_t, std::vector<uint32_t>> before;
+      for (size_t k = 0; k < awakeByDepth.size() && k < 12; k++) {
+        const uint32_t s = awakeByDepth[k].second;
+        before[s].assign(kChunkVol, 0);
+        ReadVoxelsSync(ctx, world, s, 1, before[s].data(), "terrainMove0");
+      }
+      for (uint32_t t = 122; t < 142; t++)
+        SubmitTick(ctx, world, sim, t, seed, {}, {}, {}, false, {0, 0, 0},
+                   t == 141, false);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      std::map<uint32_t, int> delta;   // material -> |net change| over the set
+      int moved = 0, matChanged = 0, stateChanged = 0, stainChanged = 0;
+      std::map<uint32_t, int> touched;   // material of a word that changed in place
+      for (auto& kv : before) {
+        std::vector<uint32_t> now(kChunkVol, 0);
+        ReadVoxelsSync(ctx, world, kv.first, 1, now.data(), "terrainMove1");
+        for (size_t v = 0; v < kChunkVol; v++) {
+          // THE WHOLE WORD, not just the material. A pond soaking into its own
+          // sand bed changes the stain nibble and the liquid's fullness and
+          // nothing else, so a material-only diff reports "nothing changed"
+          // for a chunk that is very much still working — which is exactly the
+          // wrong answer when the question is "why is this awake".
+          if (kv.second[v] == now[v]) continue;
+          const uint32_t a = kv.second[v] & 0xFFFu, b = now[v] & 0xFFFu;
+          moved++;
+          // WHICH FIELD moved, not just how many words did. A pond soaking into
+          // its bed, a grain creeping down a slope and a stamp churning all read
+          // as "N words changed"; they are three different bugs and the fix for
+          // one is not the fix for another.
+          if (a != b) matChanged++;
+          if (((kv.second[v] >> 12) & 0xF) != ((now[v] >> 12) & 0xF)) stateChanged++;
+          if ((kv.second[v] & 0x7F000000u) != (now[v] & 0x7F000000u)) stainChanged++;
+          if (a == b) { delta[a] += 0; touched[a]++; }
+          delta[a]--;
+          delta[b]++;
+        }
+      }
+      std::string what;
+      for (auto& kv : touched) {
+        const char* nm = kv.first < c.mats.size() ? c.mats[kv.first].name.c_str()
+                                                  : "?";
+        what += Format(" %s~%d", nm, kv.second);
+      }
+      for (auto& kv : delta) {
+        if (kv.second == 0) continue;
+        what += Format(" %s%+d",
+                       kv.first == 0 ? "air"
+                       : kv.first < c.mats.size() ? c.mats[kv.first].name.c_str()
+                                                  : "?",
+                       kv.second);
+      }
+      // ---- WHERE THE LOST VOXELS GO ----
+      // A page fault is a sim kernel writing into a chunk that is still a
+      // SENTINEL, and write reach is one cell — so the faulting chunk is always
+      // a face neighbour of an awake one. Naming which neighbour, and which
+      // sentinel it is, turns "58 voxels were lost somewhere" into a direction:
+      // a fall into EMPTY sky underneath a water body is a leak, a write into
+      // UNIFORM rock beside it is something else entirely.
+      std::string faults;
+      int nsent = 0;
+      for (auto& kv : before) {
+        const IVec3 wc = world.SlotToWorldChunk(kv.first);
+        static const IVec3 dirs[6] = {{1,0,0},{-1,0,0},{0,1,0},
+                                      {0,-1,0},{0,0,1},{0,0,-1}};
+        for (const IVec3& d : dirs) {
+          const IVec3 n{wc.x + d.x, wc.y + d.y, wc.z + d.z};
+          const uint32_t e =
+              world.PageEntryOfSlot(World::SlotChunkIndex(n));
+          if ((e & kPtSentinelBit) == 0u) continue;
+          nsent++;
+          if (nsent > 4) continue;
+          const uint32_t m = e & kPtMatMask;
+          // ...and WHAT SITS ON THE FACE. Write reach is one cell, so only the
+          // 256 voxels of the awake chunk touching this sentinel can fault into
+          // it. Their materials name the rule.
+          std::map<uint32_t, int> face;
+          for (int b = 0; b < 16; b++)
+            for (int a = 0; a < 16; a++) {
+              int lx = a, ly = b, lz = a;
+              if (d.x != 0) { lx = d.x > 0 ? 15 : 0; ly = a; lz = b; }
+              else if (d.y != 0) { ly = d.y > 0 ? 15 : 0; lx = a; lz = b; }
+              else { lz = d.z > 0 ? 15 : 0; lx = a; ly = b; }
+              const uint32_t w =
+                  kv.second[(size_t)((lz * 16 + ly) * 16 + lx)] & 0xFFFu;
+              if (w) face[w]++;
+            }
+          std::string faceStr;
+          for (auto& fk : face)
+            faceStr += Format(" %s x%d",
+                              fk.first < c.mats.size()
+                                  ? c.mats[fk.first].name.c_str() : "?",
+                              fk.second);
+          faults += Format(" [%d,%d,%d %+d%+d%+d -> %s; face:%s]", wc.x * 16,
+                           wc.y * 16, wc.z * 16, d.x, d.y, d.z,
+                           m == 0 ? "EMPTY"
+                           : m < c.mats.size()
+                               ? Format("%s%s", c.mats[m].name.c_str(),
+                                        (e & kPtJitterBit) ? "/jitter" : "")
+                                     .c_str()
+                               : "?",
+                           faceStr.empty() ? " (empty)" : faceStr.c_str());
+        }
+      }
+      awakeAt = Format(" | %d aloft, %d at the surface, %d one chunk under, "
+                       "%d buried deeper (deepest %d chunks off the ground)"
+                       " | over 20 more ticks %d voxels changed (%d material,"
+                       " %d fullness/jitter, %d stain):%s"
+                       " | %d sentinel neighbours:%s%s",
+                       aloft, atSurface, justUnder, buried, deepest, moved,
+                       matChanged, stateChanged, stainChanged,
+                       what.empty() ? " nothing" : what.c_str(), nsent,
+                       faults.c_str(), awakeAt.c_str());
     }
   }
   const int dCap = (int)BaselineNumber("terrain.settleProxyMax", 400);
@@ -838,6 +1030,7 @@ Status GateTerrain(Ctx& c, std::string& detail) {
   RecordObserved("terrain.slopeMaxObserved", a.slopeMax);
   RecordObserved("terrain.rampMaxObserved", a.rampMax);
   RecordObserved("terrain.localReliefObserved", a.localRelief);
+  RecordObserved("terrain.farReliefObserved", a.farMax - a.farMin);
   RecordObserved("terrain.settleProxyObserved", (double)awake);
 
   const bool ok = a.ok && bOk && cc.ok && dOk;

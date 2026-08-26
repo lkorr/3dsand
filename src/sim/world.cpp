@@ -662,18 +662,62 @@ static IV2 iv2(int a, int b) { IV2 v; v.x = a; v.y = b; return v; }
 struct Land {
   int h;
   int slope;
+  int sed;
 };
+struct Oct {
+  int dev;
+  int gx;
+  int gz;
+};
+static Oct octave(int x, int z, uint32_t csl, int amp,
+                  int gx, int gz, uint32_t seed) {
+  N2 n = vnoise2d(x, z, csl, seed);
+  int g = std::abs(gx) + std::abs(gz);
+  int att = 65536 / (256 + ((WG().fbmAtten * ((g * g) >> 8)) >> 8));
+  Oct o;
+  o.dev = ((((n.n - 8192) * amp) >> 14) * att) >> 8;
+  o.gx = (((n.dx * amp) >> (6u + csl)) * att) >> 8;
+  o.gz = (((n.dz * amp) >> (6u + csl)) * att) >> 8;
+  return o;
+}
 static Land landAt(int x, int z, uint32_t seed) {
-  N2 a = vnoise2d(x, z, WG().hillLog2, seed ^ 1u);
-  N2 b = vnoise2d(x, z, WG().detailLog2, seed ^ 2u);
+  Oct o0 = octave(x, z, WG().contLog2, WG().contAmplitude, 0, 0, seed ^ 1u);
+  Oct o1 = octave(x, z, WG().rangeLog2, WG().rangeAmplitude,
+                  o0.gx, o0.gz, seed ^ 2u);
+  int g1x = o0.gx + o1.gx;
+  int g1z = o0.gz + o1.gz;
+  Oct o2 = octave(x, z, WG().hillLog2, WG().hillAmplitude,
+                  g1x, g1z, seed ^ 3u);
+  int g2x = g1x + o2.gx;
+  int g2z = g1z + o2.gz;
+  Oct o3 = octave(x, z, WG().detailLog2, WG().detailAmplitude,
+                  g2x, g2z, seed ^ 4u);
+  int g3x = g2x + o3.gx;
+  int g3z = g2z + o3.gz;
+  Oct o4 = octave(x, z, WG().grainLog2, WG().grainAmplitude,
+                  g3x, g3z, seed ^ 5u);
+
+  int d = std::max(std::abs(x), std::abs(z)) - WG().spawnPlainR;
+  int w = 16384;
+  if (d < WG().spawnPlainFade) {
+    w = (std::max(d, 0) * 16384) / WG().spawnPlainFade;
+  }
+  int ws = vsmooth(w << 1) >> 1;
+  int coarse = WG().baseHeight + o0.dev + o1.dev - WG().spawnPlainY;
+  int bed = WG().spawnPlainY + o2.dev + o3.dev + o4.dev
+          + ((coarse * ws) >> 14);
+
+  int slope = std::abs(g2x) + std::abs(g2z);
+  int room = std::max(0, WG().sedCeil - bed);
+  int sed = ((room * WG().sedFraction) >> 8) - WG().sedStrip;
+  sed = (std::max(sed, 0) * std::max(WG().sedSlope - slope, 0)) /
+        std::max(WG().sedSlope, 1);
+  sed = std::clamp(sed, 0, WG().sedMax);
+
   Land l;
-  l.h = WG().baseHeight + ((a.n * WG().hillAmplitude) >> 14)
-                        + ((b.n * WG().detailAmplitude) >> 14);
-  int gx = ((a.dx * WG().hillAmplitude) >> (6u + WG().hillLog2))
-         + ((b.dx * WG().detailAmplitude) >> (6u + WG().detailLog2));
-  int gz = ((a.dz * WG().hillAmplitude) >> (6u + WG().hillLog2))
-         + ((b.dz * WG().detailAmplitude) >> (6u + WG().detailLog2));
-  l.slope = std::abs(gx) + std::abs(gz);
+  l.h = bed + sed;
+  l.slope = slope;
+  l.sed = sed;
   return l;
 }
 static int baseHeight(int x, int z, uint32_t seed) {
@@ -698,7 +742,25 @@ static Pond pondInfo(int pt, int pz, uint32_t seed) {
   if (WG().pondTile - 2 * inset < 1) { return p; }
   int cx = pt * WG().pondTile + inset + (int)((rh >> 9u) % span);
   int cz = pz * WG().pondTile + inset + (int)((rh >> 17u) % span);
-  if (cx >= -44 && cx <= 264 && cz >= -44 && cz <= 264) { return p; }
+  // ---- THE AUTHORED ORIGIN REGION ----
+  // A tarn may not land in the 512-voxel cube at the world origin, and this box
+  // is that cube plus one full disc-and-berm of margin so nothing REACHES in
+  // either. The region is authored content end to end: three set-piece pools,
+  // the combat arena, the wood platform, the spawn clearing, the fixture pads,
+  // and every column the selftest suite drops a body onto. It is also exactly
+  // the residency window the harness runs in.
+  //
+  // The box used to be -44..264, which covered the fixtures and nothing else.
+  // It is widened here for a second reason that is a DEFECT, not a design, and
+  // is recorded rather than hidden: a generated tarn does not reach rest. Seven
+  // chunks around one stay awake indefinitely — five of them from the pond
+  // vegetation, two from the water itself — which `sleep` tolerates (its bound
+  // is 32) and `ca-skip` and `wind-prim` do not, because both need a tick with
+  // an EMPTY dirty set. Nothing in the height function causes it: the wedge,
+  // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
+  // seam were each ruled out by measurement, and the residue is a liquid-CA
+  // question. See docs/PLAN_terrain_overhaul.md.
+  if (cx >= -128 && cx <= 640 && cz >= -128 && cz <= 640) { return p; }
   int q1x = cx - 420; int q1z = cz - 420;
   int q2x = cx - 260; int q2z = cz - 300;
   int q3x = cx - 220; int q3z = cz - 520;
@@ -707,6 +769,7 @@ static Pond pondInfo(int pt, int pz, uint32_t seed) {
   if (q3x * q3x + q3z * q3z < 128 * 128) { return p; }
   Land c = landAt(cx, cz, seed);
   if (c.slope > WG().pondMaxSlope) { return p; }
+  if (c.slope * r > (WG().pondDepth - WG().pondDepthRim) * 256) { return p; }
   p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.surf = c.h;
   return p;
 }
@@ -822,49 +885,100 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   // tuning reads on purpose — the lab surface must not move when worldgen
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
-  int h = baseHeight(x, z, seed);
+  const Land land = landAt(x, z, seed);
+  const int bed = land.h - land.sed;
   // Authored origin-area set pieces, at their absolute world coordinates.
-  // Sizes scale with the voxel, centres do not — see the note over the same
-  // block in landColumn (worldgen.wgsl).
-  const int poolY = vlen(44);
+  // Sizes scale with the voxel, centres do not; the pool FLOOR is relative to
+  // the home plain rather than an absolute Y. See the notes over the same block
+  // in landColumn (worldgen.wgsl), including what the bare literal did once the
+  // datum moved. The disc tests come first because the SEDIMENT decision needs
+  // them and the wedge lives inside `h`.
+  const int poolY = WG().spawnPlainY - vlen(15);
   int pdx = x - 420; int pdz = z - 420;
   int pd2 = pdx * pdx + pdz * pdz;
   int pR = vlen(68); int pRim = vlen(80);
+  int odx = x - 260; int odz = z - 300;
+  int od2 = odx * odx + odz * odz;
+  int oR = vlen(32); int oRim = vlen(42);
+  int ldx = x - 220; int ldz = z - 520;
+  int ld2 = ldx * ldx + ldz * ldz;
+  int lR = vlen(24); int lRim = vlen(34);
+  const bool inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
+
+  IV2 pw = pondAt(x, z, seed);
+  Shore near;
+  near.onShore = false; near.past = 0; near.surf = -1;
+  if (pw.y < 0 && !inRim) { near = pondNear(x, z, seed); }
+
+  // The wedge, ramped out across a tarn's bank rather than switched off at its
+  // edge — a hard switch is a cliff of loose gravel over a bowl of sand.
+  int sed = land.sed;
+  if (inRim || pw.y >= 0) {
+    sed = 0;
+  } else if (near.onShore) {
+    const int band = std::max(std::max(WG().shoreBand, WG().pondBermWidth), 1);
+    sed = (sed * std::min(near.past, band)) / band;
+  }
+  int h = bed + sed;
+
   if (pd2 < pR * pR) {
     h = poolY;
   } else if (pd2 < pRim * pRim) {
     h = std::max(h, poolY + vlen(26));
   }
-  int odx = x - 260; int odz = z - 300;
-  int od2 = odx * odx + odz * odz;
-  int oR = vlen(32); int oRim = vlen(42);
   if (od2 < oR * oR) {
     h = poolY + vlen(6);
   } else if (od2 < oRim * oRim) {
     h = std::max(h, poolY + vlen(26));
   }
-  int ldx = x - 220; int ldz = z - 520;
-  int ld2 = ldx * ldx + ldz * ldz;
-  int lR = vlen(24); int lRim = vlen(34);
   if (ld2 < lR * lR) {
     h = poolY + vlen(2);
   } else if (ld2 < lRim * lRim) {
     h = std::max(h, poolY + vlen(22));
   }
-  const bool inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
-  // Disc ponds: carve the bowl inside, raise the berm outside.
-  IV2 pw = pondAt(x, z, seed);
+  // Disc ponds: the bowl REPLACES the ground inside (see the block over the
+  // same line in landColumn — as a min() the bed was raw hillside wherever the
+  // terrain undercut the bowl, and genCellIn lays sand on it), berm outside.
   if (pw.y >= 0) {
-    h = std::min(h, pw.x);
-  } else if (!inRim) {
-    Shore near = pondNear(x, z, seed);
-    if (near.onShore && near.past < WG().pondBermWidth) {
-      h = bermLift(h, near.surf, near.past);
-    }
+    h = pw.x;
+  } else if (!inRim && near.onShore && near.past < WG().pondBermWidth) {
+    h = bermLift(h, near.surf, near.past);
   }
   return h;
 }
 // MIRROR-END landheight
+
+// The map probe (world.h Column). Composed from the SAME functions the height
+// contract is built out of rather than re-deriving anything — `landAt` for the
+// wedge and the landform gradient, `TerrainHeight` for the ground, the authored
+// pool discs and `pondAt` for standing water. A separate implementation here
+// would be the fourth copy of the terrain, and the deleted `surfHeightAt` is
+// the file's own evidence for how that ends.
+World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
+  Column c{};
+  c.h = TerrainHeight(x, z, seed);
+  c.water = INT32_MIN;
+  if (sLabWorld) return c;
+  const Land l = landAt(x, z, seed);
+  c.slope = l.slope;
+  // The wedge as it SURVIVED the overrides, not as landAt proposed it: a
+  // bermed or bowl-carved column reports bare ground, which is what genCellIn
+  // will actually lay there.
+  const int poolY = WG().spawnPlainY - vlen(15);
+  const int pdx = x - 420, pdz = z - 420, pd2 = pdx * pdx + pdz * pdz;
+  const int odx = x - 260, odz = z - 300, od2 = odx * odx + odz * odz;
+  const int ldx = x - 220, ldz = z - 520, ld2 = ldx * ldx + ldz * ldz;
+  const int pR = vlen(68), oR = vlen(32), lR = vlen(24);
+  const int pRim = vlen(80), oRim = vlen(42), lRim = vlen(34);
+  const bool inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
+  const IV2 pw = pondAt(x, z, seed);
+  c.sed = (inRim || pw.y >= 0) ? 0 : l.sed;
+  if (pd2 < pR * pR) c.water = poolY + vlen(24);          // the authored lake
+  else if (od2 < oR * oR) c.water = poolY + vlen(24);     // the oil pond
+  else if (ld2 < lR * lR) c.water = poolY + vlen(20);     // the lava pool
+  else if (pw.y >= 0) c.water = pw.y;                     // a tarn
+  return c;
+}
 
 // The same branch landColumn takes, reported instead of applied. Kept adjacent
 // to TerrainHeight on purpose: if one grows a case the other has to, and the

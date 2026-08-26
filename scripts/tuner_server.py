@@ -31,6 +31,7 @@ happens in this process rather than in the page:
   POST /api/build             cmake --build ... --target sandvox
   POST /api/play              launch build/Release/sandvox.exe (body {mode,scene}:
                               "game", or "lab" = fluid testing world --lab <scene>)
+  GET  /api/heightmap?...     terrain map from `sandvox --heightmap` (binary)
   GET  /api/status            build state + whether the exe is running
 
 Usage:
@@ -65,6 +66,9 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
     hardcoded whitelist keyed by the request's {mode, scene} (game, or the
     --lab fluid scenes). Both shell=False. No request TEXT ever reaches a
     command line — the body selects between fixed argument lists.
+  - /api/heightmap is the one route that puts request NUMBERS on a command
+    line, and they are integers parsed with int(float(...)) and clamped before
+    they get there, so nothing but digits can reach argv. shell=False as well.
 Anyone exposing this beyond localhost is opting into arbitrary local builds.
 """
 import argparse
@@ -384,6 +388,9 @@ EXE = os.path.join(ROOT, "build", "Release", "sandvox.exe")
 # handles the build POST and the status GETs on different threads.
 _lock = threading.Lock()
 _build = {"running": False, "ok": None, "log": "", "returncode": None}
+# Serialises /api/heightmap: a slider drag queues a dozen requests and there is
+# no point running a dozen copies of the exporter.
+_hm_lock = threading.Lock()
 _play_procs = []
 
 
@@ -489,6 +496,65 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, f.read(), ctype)
 
     # ---- routes ----
+    # ---- the terrain map ---------------------------------------------------
+    #
+    # Runs `sandvox --heightmap` and hands the bytes straight back. That mode is
+    # a GPU-FREE EARLY EXIT — it answers before GpuContext exists, reads only
+    # tuning.json, and takes ~150 ms for a 384x384 map — which is why this route
+    # does NOT go through scripts/run.sh. The run mutex exists because
+    # concurrent processes saturate the GPU and poison every measured number
+    # (CLAUDE.md); a mode that never opens a device cannot do either, and taking
+    # the machine-global build lock on every slider drag would serialise the
+    # tuner against builds and make the map hang for minutes.
+    #
+    # ONE AT A TIME anyway, through the same lock the build uses for its state:
+    # a drag can queue a dozen requests and there is no point running twelve
+    # copies. The client debounces as well; this is the backstop.
+    def _heightmap(self):
+        q = self._query()
+        def num(name, dflt):
+            try:
+                return int(float(q.get(name, [dflt])[0]))
+            except (TypeError, ValueError):
+                return dflt
+        cx, cz = num("cx", 0), num("cz", 0)
+        span, res = num("span", 8192), num("res", 384)
+        seed = num("seed", 1337)
+        # Clamped here as well as in the engine: this route is reachable from a
+        # page, and the engine's clamp is the second line of defence, not the
+        # first.
+        res = max(8, min(res, 1024))
+        span = max(res, min(span, 1 << 22))
+        out = os.path.join(ROOT, "build", "tuner_heightmap.bin")
+        cmd = [EXE, "--heightmap", "%d,%d,%d,%d,%d" % (cx, cz, span, res, seed),
+               "--heightmap-out", out]
+        if not os.path.isfile(EXE):
+            return self._json(503, {"ok": False,
+                                    "error": "build/Release/sandvox.exe not built yet "
+                                             "— press Build"})
+        with _hm_lock:
+            try:
+                r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                                   timeout=120,
+                                   creationflags=getattr(subprocess,
+                                                         "CREATE_NO_WINDOW", 0))
+            except Exception as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            if r.returncode != 0:
+                return self._json(500, {"ok": False,
+                                        "error": (r.stderr or r.stdout or "")[-2000:]})
+            try:
+                with open(out, "rb") as f:
+                    blob = f.read()
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(blob)
+
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/":
@@ -614,6 +680,9 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, encoding="utf-8") as f:
                 return self._json(200, {"ok": True, "name": name,
                                         "text": f.read()})
+
+        if p == "/api/heightmap":
+            return self._heightmap()
 
         if p == "/api/status":
             with _lock:

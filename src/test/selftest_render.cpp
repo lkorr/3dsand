@@ -154,8 +154,11 @@ Status GateFarDownsample(Ctx& c, std::string& detail) {
 bool farDownOk = false;
 {
   // The window origin is {0,0,0} in this section, so the paint site is
-  // resident; (140, 200, 140) is open air well above the hills and canopy.
-  const IVec3 c{140, 200, 140};
+  // resident. The height is TERRAIN-RELATIVE: y200 was open sky when the
+  // band was y32..y86 and is underground now, and the gate reported that
+  // as "0/27 level-1 cells air before the edit". 190 clears the tallest
+  // canopy (TREE_MAX_ABOVE ~175 voxels at metre-true tree scale).
+  const IVec3 c{140, FixtureY(140, 140, kDefaultSeed, 190, 64), 140};
   // One level-1 cell spans 2^(1+kFarShiftBase) fine voxels, sampled at its
   // center. The brush radius below must cover the sample points of the full
   // 3x3x3 cell block around the paint: the farthest one sits
@@ -220,7 +223,7 @@ Status GateFarPersist(Ctx& c, std::string& detail) {
   // Open air well above the hills and canopy, resident under the {0,0,0}
   // window origin this section runs at, and clear of far-downsample's own
   // paint site so the two gates cannot read each other's cells.
-  const IVec3 site{300, 200, 300};
+  const IVec3 site{300, FixtureY(300, 300, kDefaultSeed, 190, 64), 300};
   const int shift1 = (int)(1 + kFarShiftBase);
   const IVec3 cell0{site.x >> shift1, site.y >> shift1, site.z >> shift1};
   // Radius 12 covers the sample points of the whole 3x3x3 level-1 cell block

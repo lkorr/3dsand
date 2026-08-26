@@ -58,7 +58,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
                        float fogDensity, float viewPx, uint32_t tick,
-                       uint32_t fluidCount, float frameFrac) {
+                       uint32_t fluidCount, float frameFrac,
+                       uint32_t extraFlags) {
   RenderParams rp{};
   rp.fluidCount = fluidCount;  // 0 skips the MPM fluid surface march entirely
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
@@ -69,7 +70,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.tanHalfFov = std::tan(CurrentTuning().camera.fovY * 0.5f);
   rp.aspect = aspect;
   rp.time = time;
-  rp.flags = shadows ? 1u : 0u;
+  rp.flags = (shadows ? 1u : 0u) | extraFlags;
   // ~41 deg elevation: low enough that terrain and canopy cast readable
   // shadows (near field AND the far-field cascade shadow march), high enough
   // that valleys aren't pits. The old 0.78 y put the sun ~52 deg up and
@@ -777,6 +778,29 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
 }
 
 // (Body render plumbing lives in game/bodyreg.h — see the note in support.h.)
+
+// See support.h for why no gate may write an absolute Y.
+int FixtureY(int x, int z, uint32_t seed, int above, int pad) {
+  return FixtureYOver(x, z, x, z, seed, above, pad);
+}
+
+int FixtureYOver(int x0, int z0, int x1, int z1, uint32_t seed, int above,
+                 int pad) {
+  // A coarse 5x5 sample of the footprint. TerrainHeight is ~25 hash3 and this
+  // runs once per fixture, so the cost is nothing; sampling the CORNERS ONLY
+  // would miss a ridge crossing the middle of a wide slab.
+  int h = INT32_MIN;
+  const int nx = std::max(x1 - x0, 0), nz = std::max(z1 - z0, 0);
+  for (int j = 0; j <= 4; j++)
+    for (int i = 0; i <= 4; i++)
+      h = std::max(h, World::TerrainHeight(x0 + nx * i / 4, z0 + nz * j / 4,
+                                           seed));
+  const int y = h + above;
+  // Clamped against the window, not against a constant: a fixture built
+  // outside residency reads as air to every kernel and the gate fails as
+  // "nothing landed" rather than as "your fixture is off the map".
+  return std::min(y, (int)kWorldN - pad);
+}
 
 bool WriteBmpFile(const std::string& path, const std::vector<uint8_t>& rgba,
               uint32_t w, uint32_t h) {

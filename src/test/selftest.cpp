@@ -571,13 +571,43 @@ int Run(Ctx& c, const Options& opt) {
   // from a structural claim into a measurement made on every run. Non-zero
   // means some chunk a kernel wrote was not materialized before its dispatch,
   // which is risk 1 and is always a bug.
-  uint32_t pageFaults = 0;
+  uint32_t pageFaults[4] = {0, 0, 0, 0};
   rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.pageFaults, 0,
-                        &pageFaults, 4, "pageFaults");
-  std::printf("page faults over the suite: %u%s\n", pageFaults,
-              pageFaults == 0 ? " (a sentinel write is a lost voxel: 0 is the"
-                                " only acceptable value)"
-                              : "  *** SENTINEL WRITES LOST VOXELS ***");
+                        pageFaults, 16, "pageFaults");
+  // WHAT WAS LOST AND WHERE, from voxStore's three spare words: [2] the widest
+  // word it dropped, [1]/[3] the highest and lowest refusing chunk slot.
+  //
+  // The count on its own names nothing. Finding the 58 faults this reporting
+  // was written for cost a day of turning worldgen features off one at a time —
+  // ponds, shores, ruins, caves, the sediment wedge, evaporation, the MPM seam
+  // — because "58 voxels went missing somewhere" is compatible with all of
+  // them. The word decoded to `stone, stain wet/1` and the span to a single
+  // chunk, and that is the whole answer in one line: a pond's water staining
+  // the rock behind its bank, into a chunk still held as a JITTER sentinel.
+  std::string lost;
+  if (pageFaults[0]) {
+    const uint32_t m = pageFaults[2] & 0xFFFu;
+    const char* nm = m == 0 ? "air"
+                     : m < c.mats.size() ? c.mats[m].name.c_str() : "?";
+    lost += Format(" | lost %s (id %u, word 0x%08x: state %u stamp %u"
+                   " stain %u/%u)", nm, m, pageFaults[2],
+                   (pageFaults[2] >> 12) & 0xF, (pageFaults[2] >> 16) & 0x7,
+                   (pageFaults[2] >> 24) & 0xF, (pageFaults[2] >> 28) & 0x7);
+    if (pageFaults[1] != 0) {
+      const uint32_t hi = pageFaults[1] - 1, lo = 0xFFFFFFFFu - pageFaults[3];
+      const IVec3 a = c.world.SlotToWorldChunk(lo);
+      const IVec3 b = c.world.SlotToWorldChunk(hi);
+      lost += Format(" | refusing chunks (%d,%d,%d)..(%d,%d,%d), entries"
+                     " 0x%08x/0x%08x", a.x * 16, a.y * 16, a.z * 16, b.x * 16,
+                     b.y * 16, b.z * 16, c.world.PageEntryOfSlot(lo),
+                     c.world.PageEntryOfSlot(hi));
+    }
+  }
+  std::printf("page faults over the suite: %u%s%s\n", pageFaults[0],
+              pageFaults[0] == 0 ? " (a sentinel write is a lost voxel: 0 is the"
+                                   " only acceptable value)"
+                                 : "  *** SENTINEL WRITES LOST VOXELS ***",
+              lost.c_str());
 
   // Pool high-water over the WHOLE suite. Under §3.8's fatal-exhaustion policy
   // kPoolPages is safety-critical rather than advisory, and §3.8 requires the
@@ -605,7 +635,7 @@ int Run(Ctx& c, const Options& opt) {
                 "was invoked to update.\n");
   }
 
-  if (!regressions.empty() || vkMsgs > 0 || pageFaults != 0) {
+  if (!regressions.empty() || vkMsgs > 0 || pageFaults[0] != 0) {
     if (!regressions.empty()) {
       std::printf("\nREGRESSIONS (%zu): ", regressions.size());
       for (size_t i = 0; i < regressions.size(); i++)
@@ -615,10 +645,10 @@ int Run(Ctx& c, const Options& opt) {
     if (vkMsgs > 0)
       std::printf("\nvulkan validation reported %zu message%s (see above)",
                   vkMsgs, vkMsgs == 1 ? "" : "s");
-    if (pageFaults != 0)
+    if (pageFaults[0] != 0)
       std::printf("\n%u page fault%s: a sim kernel wrote through a sentinel and"
                   " the voxel was LOST (PLAN_page_table.md risk 1)",
-                  pageFaults, pageFaults == 1 ? "" : "s");
+                  pageFaults[0], pageFaults[0] == 1 ? "" : "s");
     if (opt.rebaseline) {
       std::printf("\n*** REFUSING to rebaseline: the run has errors ***\n");
     }

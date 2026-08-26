@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <string>
@@ -1489,6 +1490,110 @@ Vec3 LaserMuzzle(const Player& player, const Camera& cam) {
          cam.Up() * 0.5f;
 }
 
+// ---- --heightmap: the tuner's terrain map --------------------------------
+//
+// A res x res grid of World::TerrainColumn over a `span`-voxel square centred
+// on (cx, cz), written as a small binary the browser decodes with a DataView.
+// Binary rather than JSON because a 384x384 map is 147k columns and the JSON
+// for it is ~4 MB of text to parse on every slider drag; this is 1.2 MB of
+// bytes with no parse at all.
+//
+// LAYOUT (all little-endian, which every platform this runs on is):
+//   0  u32  magic 'SVHM'                16  i32 cx
+//   4  u32  version (1)                 20  i32 cz
+//   8  u32  res                         24  u32 seed
+//   12 u32  span (voxels)               28  i32 voxelsPerMetre
+//   32 i32  hMin   36 i32 hMax          40 i32 seaHint (spawnPlainY)
+//   44 u32  reserved
+//   48 .. res*res * 8 bytes: i32 h, i16 water (h - water, clamped, or -32768
+//          for dry), u8 sed, u8 slope (Q8 clamped to 255)
+//
+// `water` is stored as a DEPTH relative to the ground rather than an absolute
+// Y so it fits in 16 bits at any datum — the mistake the rest of this overhaul
+// spent a day undoing, made once, deliberately, where it is bounded.
+int WriteHeightmap(const std::string& spec, const std::string& outPath) {
+  int cx = 0, cz = 0, span = 4096, res = 256;
+  unsigned seed = kDefaultSeed;
+  {
+    std::vector<long> v;
+    const char* p = spec.c_str();
+    while (*p) {
+      char* end = nullptr;
+      long n = std::strtol(p, &end, 10);
+      if (end == p) break;
+      v.push_back(n);
+      p = end;
+      while (*p == ',' || *p == ' ') p++;
+    }
+    if (v.size() < 4) {
+      std::fprintf(stderr, "--heightmap wants cx,cz,span,res[,seed], got '%s'\n",
+                   spec.c_str());
+      return 1;
+    }
+    cx = (int)v[0]; cz = (int)v[1]; span = (int)v[2]; res = (int)v[3];
+    if (v.size() >= 5) seed = (unsigned)v[4];
+  }
+  // Bounds, because this is reachable from a browser: a res of 4096 is 16.7M
+  // columns at ~25 hash3 each and would hang the tuner rather than fail it.
+  if (res < 8) res = 8;
+  if (res > 1024) res = 1024;
+  if (span < res) span = res;                   // never finer than one voxel
+  if (span > 1 << 22) span = 1 << 22;
+
+  std::vector<uint8_t> buf((size_t)48 + (size_t)res * res * 8);
+  auto put32 = [&](size_t off, uint32_t v) {
+    buf[off] = (uint8_t)v; buf[off + 1] = (uint8_t)(v >> 8);
+    buf[off + 2] = (uint8_t)(v >> 16); buf[off + 3] = (uint8_t)(v >> 24);
+  };
+  int hMin = INT32_MAX, hMax = INT32_MIN;
+  const double step = (double)span / (double)res;
+  for (int j = 0; j < res; j++) {
+    const int wz = cz - span / 2 + (int)(((double)j + 0.5) * step);
+    for (int i = 0; i < res; i++) {
+      const int wx = cx - span / 2 + (int)(((double)i + 0.5) * step);
+      const World::Column col = World::TerrainColumn(wx, wz, seed);
+      hMin = std::min(hMin, col.h);
+      hMax = std::max(hMax, col.h);
+      const size_t o = 48 + ((size_t)j * res + i) * 8;
+      put32(o, (uint32_t)col.h);
+      int depth = col.water == INT32_MIN ? -32768
+                                         : std::clamp(col.water - col.h, -32767, 32767);
+      buf[o + 4] = (uint8_t)(depth & 0xFF);
+      buf[o + 5] = (uint8_t)((depth >> 8) & 0xFF);
+      buf[o + 6] = (uint8_t)std::clamp(col.sed, 0, 255);
+      buf[o + 7] = (uint8_t)std::clamp(col.slope, 0, 255);
+    }
+  }
+  put32(0, 0x4D485653u);   // 'SVHM' little-endian
+  put32(4, 1);
+  put32(8, (uint32_t)res);
+  put32(12, (uint32_t)span);
+  put32(16, (uint32_t)cx);
+  put32(20, (uint32_t)cz);
+  put32(24, seed);
+  put32(28, (uint32_t)kVoxelsPerMetre);
+  put32(32, (uint32_t)hMin);
+  put32(36, (uint32_t)hMax);
+  put32(40, (uint32_t)CurrentTuning().worldgen.spawnPlainY);
+  put32(44, 0);
+
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(outPath).parent_path(), ec);
+  std::ofstream f(outPath, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "--heightmap: cannot write %s\n", outPath.c_str());
+    return 1;
+  }
+  f.write((const char*)buf.data(), (std::streamsize)buf.size());
+  f.close();
+  std::printf("heightmap: %dx%d over %d voxels (%.1f m) at (%d,%d) seed %u, "
+              "y%d..y%d -> %s\n",
+              res, res, span, (double)span * kVoxelMeters, cx, cz, seed, hMin,
+              hMax, outPath.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1539,6 +1644,10 @@ int main(int argc, char** argv) {
   std::string labSceneName = "basin";
   bool fluidBench = false;
   std::string fluidBenchScene = "all";
+  // --heightmap cx,cz,span,res[,seed] — the tuner's terrain map. See the
+  // dispatch below for why this is a GPU-free early exit.
+  std::string heightmapArgs;
+  std::string heightmapOut = "build/heightmap.bin";
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -1754,6 +1863,18 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--sweep-gate requires a gate name\n"); return 1; }
       sweepGate = argv[++i];
     }
+    else if (a == "--heightmap") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr,
+                     "--heightmap wants cx,cz,span,res[,seed]\n");
+        return 1;
+      }
+      heightmapArgs = argv[++i];
+    }
+    else if (a == "--heightmap-out") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--heightmap-out wants a path\n"); return 1; }
+      heightmapOut = argv[++i];
+    }
     else {
       std::fprintf(stderr, "unrecognized argument: '%s'\n"
                            "Run with --help for usage.\n", a.c_str());
@@ -1782,6 +1903,25 @@ int main(int argc, char** argv) {
   // --list is pure metadata: answering it before any device or asset init
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
+
+  // --heightmap: render a grid of World::TerrainColumn to a file and exit.
+  //
+  // NO GPU, NO ASSETS, NO WINDOW — it answers before GpuContext exists, which
+  // is what makes it cheap enough for the tuner to call on every slider drag.
+  // All it needs is tuning.json, which it reads fresh, so the map it draws is
+  // the world the CURRENT worldgen parameters describe.
+  //
+  // It is the same World::TerrainHeight the game collides against, on purpose:
+  // a JS reimplementation in the tuner would be a third copy of the octave
+  // ladder with nothing enforcing it against the other two (see the note over
+  // World::Column). The cost is a process launch per map, ~100 ms.
+  if (!heightmapArgs.empty()) {
+    Tuning tune;
+    std::string tuneErrs;
+    LoadTuning(AssetDir() + "/materials/tuning.json", tune);
+    SetCurrentTuning(tune);
+    return WriteHeightmap(heightmapArgs, heightmapOut);
+  }
 
   // --vk-info answers before any GpuContext exists: it builds its own device
   // to print the capability record, so it must not race the engine's for the
@@ -2270,7 +2410,7 @@ int main(int argc, char** argv) {
   // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
   float lookSensNow = 1.0f;
 
-  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
@@ -2545,6 +2685,8 @@ int main(int argc, char** argv) {
     if (eF4.Pressed(key(GLFW_KEY_F4)))
       ui.showWindField = !ui.showWindField;
     if (eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
+    if (eF6.Pressed(key(GLFW_KEY_F6)))
+      ui.showDirtyChunks = !ui.showDirtyChunks;
     if (eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
@@ -4209,7 +4351,8 @@ int main(int argc, char** argv) {
                         (float)ctx.width / (float)ctx.height, ui.shadows,
                         (float)now, fogSmooth, (float)ctx.height, tick,
                         fluidCount,
-                        (float)(accumulator / kTickDt));
+                        (float)(accumulator / kTickDt),
+                        ui.showDirtyVoxels ? 2u : 0u);
 
       // Celestial readout for the panel. Recomputed rather than cached out of
       // WriteRenderParams because the solve is a handful of trig calls once a
@@ -4505,10 +4648,9 @@ int main(int argc, char** argv) {
                               sprv.size() * sizeof(Sprite));
       }
 
-      uint32_t debugBoxCount = 0;
+      static std::vector<DebugBox> dbg;
+      dbg.clear();
       if (ui.showCollisionBoxes) {
-        static std::vector<DebugBox> dbg;
-        dbg.clear();
         avatar.AppendDebugBoxes(dbg, kMaxDebugBoxes, 0xC000FF40u);
         mobs.AppendDebugBoxes(dbg, kMaxDebugBoxes, 0xC0FFFF40u);
         {
@@ -4552,11 +4694,30 @@ int main(int argc, char** argv) {
             }
           }
         }
-        if (!dbg.empty()) {
-          debugBoxCount = (uint32_t)dbg.size();
-          ctx.queue.WriteBuffer(world.debugBoxes, 0, dbg.data(),
-                                dbg.size() * sizeof(DebugBox));
+      }
+      if (ui.showDirtyChunks) {
+        const WorldSnapshot& dsnap = world.Snap();
+        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumChunks) {
+          constexpr float h = (float)kChunk * 0.5f;
+          for (uint32_t i = 0; i < kNumChunks && dbg.size() < kMaxDebugBoxes; i++) {
+            if (!dsnap.dirtyFlags[i]) continue;
+            IVec3 wc = world.SlotToWorldChunk(i);
+            DebugBox b{};
+            b.pos[0] = (float)(wc.x * (int)kChunk) + h;
+            b.pos[1] = (float)(wc.y * (int)kChunk) + h;
+            b.pos[2] = (float)(wc.z * (int)kChunk) + h;
+            b.half[0] = h; b.half[1] = h; b.half[2] = h;
+            b.quat[3] = 1.0f;
+            b.color = 0xC000FF00u;
+            dbg.push_back(b);
+          }
         }
+      }
+      uint32_t debugBoxCount = 0;
+      if (!dbg.empty()) {
+        debugBoxCount = (uint32_t)dbg.size();
+        ctx.queue.WriteBuffer(world.debugBoxes, 0, dbg.data(),
+                              dbg.size() * sizeof(DebugBox));
       }
 
       // rigid bodies: debris takes slots [0, D), mob limbs stack after —

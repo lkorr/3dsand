@@ -133,3 +133,78 @@ the `terrain` gate's pass D now names the material keeping a chunk awake.
    `water + tag:hot -> steam` and `steam -> water` sustain forever. It also
    accounted for all 19 page faults the standalone gate was reporting — moving
    matter writing through sentinels, PLAN_page_table.md risk 1.
+
+---
+
+## After package C (the scale pass), 2026-08-26
+
+Same machine, same commands, same `scripts/run.sh` discipline. This is the
+package the residency argument was staked on, so both arms were re-run.
+
+### `--frames 1200 --autofly-hard` — the residency arm
+
+| | stock HEAD | after C | |
+|---|---:|---:|---|
+| **page pool high water** | **13,631 (41.6%)** | **16,168 (49.3%)** | **+18.6%** |
+| pages in use at exit | 1,024 | 2,016 | |
+| window shifts | 652 | 402 | |
+| whole-frame p50 / p95 / p99 | 22.4 / 38.0 / 58.8 | 3.1 / 33.1 / 43.4 | |
+| frames > 33 ms | 107 (9.4%) | 58 (5.1%) | |
+| active chunks | 0 | p50 0, max 1 | |
+
+**§3.3 predicted ~0 and got +18.6%, and the reason is nameable rather than
+mysterious: this is not a purely proportional scale pass.** A proportional one
+adds only interior volume, which is `JITTER(stone)` sentinel and free. The
+**sediment wedge** adds a dirt-over-gravel-over-stone boundary that runs through
+the whole subsurface, and a chunk containing that boundary is not uniform, so it
+cannot be a sentinel and costs a real page. The octave ladder itself behaves as
+predicted — the descent gets *faster* (p50 22.4 → 3.1 ms), not more expensive.
+
+49.3% of the pool with the wedge on. **That is the number package F budgets
+against**, and it is why the cave province mask is not optional: a single carved
+cell anywhere in a 16³ chunk destroys its sentinel too, and F would be spending
+from 49% rather than from 41%.
+
+`--sweep worldgen.sedSlope=0,96` turns the wedge off and on if the margin ever
+needs buying back.
+
+### `--frames 400`, standing at spawn
+
+| | after B | after C | |
+|---|---:|---:|---|
+| whole-frame p50 | 19.5 ms | **27.8 ms** | +42% |
+| whole-frame p95 | 21.9 ms | 30.6 ms | |
+| whole-frame p99 | 23.1 ms | 39.4 ms | |
+| frames > 33 ms | 1 (0.3%) | 7 (2.1%) | |
+| avg render+present | 17.77 ms | 22.15 ms | |
+| page pool high water | 13,399 | 10,038 | −25% |
+| window shifts | 26 | 15 | |
+
+**This is the cost the plan's own table predicted for this package** — "p50 rises
+with cascade fill cost (levels 6–8 finally have something to draw)". Before the
+scale pass the entire vertical extent of the world was one tenth of a single
+level-8 cell, so the outer cascades drew a flat plane; they are drawing terrain
+now. §7.1's far per-column hoist is already spent, so the next lever if this
+matters is the cascade fill itself.
+
+The −25% on high water at spawn is the same wedge cutting the other way: the
+spawn window is mostly *surface*, and the calm home area is flatter than the old
+two-octave terrain was.
+
+### What the `terrain` gate measures now
+
+| key | before | after |
+|---|---:|---:|
+| `terrain.reliefVox` (±1024 grid) | 56 | 208 |
+| `terrain.surfaceMinY` / `MaxY` | 28 / 84 | 70 / 278 |
+| `terrain.farReliefObserved` (±3072 transects) | — | **958 (95.8 m)** |
+| `terrain.slopeMaxObserved` | 22 | 35 |
+| `terrain.localReliefObserved` (over 512 vox) | 53 | 129 |
+| settle proxy @120 ticks | 0 | 0 |
+
+The ±1024 grid under-reports on purpose: with a 320-voxel calm radius and a
+2048-voxel fade its own corners are still only ~45% of the way to full
+amplitude, so its "relief" is a property of the ramp. `farReliefObserved` walks
+3,072 voxels out along four headings and is the honest number.
+
+World hash `92ceabaa` → `03e5267f`.

@@ -892,6 +892,12 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!inWindow(cell, T.origin)) { return; }
+  if (fluidSolid(cell)) {
+    p.attr = 0u;
+    fluidParticles[gid.x] = p;
+    atomicAdd(&fluidArgs[FA_DEAD], 1u);
+    return;
+  }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
   var v = vec3<i32>(0, 0, 0);
@@ -1013,9 +1019,32 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   // pressure. Integer, symmetric, deterministic.
   p.j += (FLUID_ONE - p.j) / 64;
 
+  // ---- advect with solid back-projection ------------------------------------
+  // The grid BC projects velocity at individual nodes, but the B-spline
+  // weighted average across 27 nodes can still net INTO a solid when the
+  // kernel straddles the surface.  Without this, particles that cross into a
+  // solid cell cascade through geometry one substep at a time.  Try all three
+  // axes at once; on hit, revert and re-try per axis so tangential flow along
+  // surfaces is preserved (water sheeting down a slope keeps its lateral v).
+  let oldPx = p.px; let oldPy = p.py; let oldPz = p.pz;
   p.px += p.vx / FLUID_SUBSTEPS;
   p.py += p.vy / FLUID_SUBSTEPS;
   p.pz += p.vz / FLUID_SUBSTEPS;
+  if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+    p.px = oldPx; p.py = oldPy; p.pz = oldPz;
+    p.px += p.vx / FLUID_SUBSTEPS;
+    if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+      p.px = oldPx; p.vx = 0;
+    }
+    p.py += p.vy / FLUID_SUBSTEPS;
+    if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+      p.py = oldPy; p.vy = 0;
+    }
+    p.pz += p.vz / FLUID_SUBSTEPS;
+    if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+      p.pz = oldPz; p.vz = 0;
+    }
+  }
   fluidParticles[gid.x] = p;
 
   // ---- splash: fast free-surface particles shed micro droplets --------------

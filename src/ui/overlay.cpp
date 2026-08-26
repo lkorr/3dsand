@@ -537,6 +537,12 @@ void Overlay::Draw(UIState& s) {
         "cyan = mob limbs, yellow = loose debris.\n"
         "Drawn THROUGH walls on purpose - the reason to look at a collider is\n"
         "usually that something is on top of it.");
+  ImGui::Checkbox("active voxels", &s.showDirtyVoxels);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Red wireframe on every voxel that MOVED this tick (has a fresh\n"
+        "stamp). Shows exactly which cells are triggering a chunk's dirty\n"
+        "flag. Combine with F6 (dirty chunks) to see cause and effect.");
   ImGui::Checkbox("wind field (F4)", &s.showWindField);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(

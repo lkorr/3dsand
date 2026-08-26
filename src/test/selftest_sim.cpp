@@ -260,8 +260,14 @@ bool evapOk = false;
   // water voxels on a stone shelf, spaced 3 apart so none touches another
   // (spacing matters — two adjacent droplets would each count a water
   // neighbour and drop toward the gate).
-  const int px = 80, py = 120, pz = 96, R = 8, kDepth = 3;
+  const int px = 80, pz = 96, R = 8, kDepth = 3;
   const int dx = 120, kDrops = 12;
+  // Terrain-relative, over the WHOLE footprint the pond and the droplet
+  // shelf occupy: at a literal y120 this pond was inside bedrock after the
+  // datum moved, which reads as "no evaporation in 2500 noon ticks"
+  // because `needsSky` is false 200 voxels down, not as a buried fixture.
+  const int py = FixtureYOver(px - R - 1, pz - R - 1,
+                              dx + kDrops * 3, pz + R + 1, kDefaultSeed, 8);
   std::vector<CellOp> scene;
   auto put = [&](int x, int y, int z, int m) {
     uint32_t state = (m == wi) ? 7u : 0u;  // liquids are born full
@@ -505,18 +511,48 @@ bool fullOk = false;
   // A stone slab in open air, and blood particles dropped onto it — the
   // same coordinates and window the stain test uses, which are known to sit
   // inside the residency window with nothing else going on around them.
-  const int px = 96, py = 120, pz = 96;
+  // Terrain-relative: at a literal y120 the slab and the drops above it
+  // were both inside the hillside after the datum moved, and the gate
+  // reported it as "0 blood voxels landed".
+  const int px = 96, pz = 96;
+  const int py = FixtureY(px, pz, kDefaultSeed, 24);
+  // The PLAYER CHUNK below has to follow the slab. It was a literal {6, 7, 6}
+  // (y112..127), which was fine while the terrain band was y32..y86 and is 100
+  // voxels under the fixture now — and the player chunk is what centres the
+  // 3x3x3 CPU mirror and the particle materialization ring, so a stale one
+  // reads as "nothing landed" rather than as a mis-aimed harness.
+  // A WELL, not a bare plate. The assertion is that a particle rejoining the
+  // grid is born at FULL fullness, and on an open plate 25 drops sheet out over
+  // 49 cells within the 40 ticks and the maximum reads 5/7 — a pass that
+  // depended on the drops happening to pile up. One voxel of rim makes the
+  // pooling structural: 25 drops into a 5x5 well is one full cell each.
   std::vector<CellOp> slab;
   for (int z = -3; z <= 3; z++)
-    for (int x = -3; x <= 3; x++)
+    for (int x = -3; x <= 3; x++) {
       slab.push_back({World::SlotCellIndex({px + x, py, pz + z}),
                       (uint32_t)(matId("stone") & 0xFFF)});
+      if (std::abs(x) == 3 || std::abs(z) == 3)
+        for (int wy = 1; wy <= 5; wy++)
+          slab.push_back({World::SlotCellIndex({px + x, py + wy, pz + z}),
+                          (uint32_t)(matId("stone") & 0xFFF)});
+    }
 
   std::vector<ParticleSpawn> drops;
   for (int i = 0; i < 25 && bloodMat > 0; i++) {
     ParticleSpawn s{};
+    // ONE DROP PER CELL over the 5x5 floor of the well, and it has to stay that
+    // way: stacking 25 drops into a 3x3 does not pile them three deep, it lands
+    // them in the same cells and reads 2/7 — worse than the open plate this
+    // replaced. The WELL is what fixes the original 5/7, not the packing: 25
+    // full voxels in 25 cells with a wall around them have nowhere to flow, so
+    // "born full" survives the 40 ticks the gate waits.
     s.px = (px - 2 + (i % 5)) * 256 + 128;
-    s.py = (py + 6) * 256 + 128;
+    // DROPPED FROM INSIDE THE WELL, two voxels up, not six. sim.windMode is 1,
+    // so a particle in flight takes wind drag — over six voxels of fall that is
+    // enough lateral drift to put some of the 25 drops on the rim or outside
+    // it, and the gate then measures a sheet spreading on a plate instead of
+    // the thing it asserts. The fall still exercises the deposit path.
+    s.py = (py + 3) * 256 + 128;
     s.pz = (pz - 2 + (i / 5)) * 256 + 128;
     s.vx = 0; s.vy = -128; s.vz = 0;
     s.payload = (uint32_t)bloodMat;  // state nibble deliberately left 0
@@ -526,7 +562,7 @@ bool fullOk = false;
   uint32_t ft = 20000;
   for (int i = 0; i < 40; i++) {
     SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {},
-               i == 0 ? slab : std::vector<CellOp>{}, false, {6, 7, 6},
+               i == 0 ? slab : std::vector<CellOp>{}, false, {6, py >> 4, 6},
                /*wantReadback=*/false, /*particlesActive=*/true,
                i == 1 ? drops : std::vector<ParticleSpawn>{});
     ctx.WaitIdle();
@@ -1874,7 +1910,11 @@ bool prefabOk = false;
   pf.models.push_back(std::move(pm));
 
   PrefabPlacer placer;
-  IVec3 lo{100, 150, 100}, hi;
+  // Terrain-relative, and the COUNT BOX below follows it: a fixed box that
+  // now contains a hillside counts the hillside, which is how "110,592
+  // voxels placed" was reported as 257,391 landed.
+  IVec3 lo{100, FixtureYOver(100, 100, 147, 147, kDefaultSeed, 40, 96), 100},
+      hi;
   placer.Place(pf, lo, 0, true, mats, lo, hi);
   uint32_t t = 4000;
   int drainTicks = 0;
@@ -1895,7 +1935,7 @@ bool prefabOk = false;
     allFresh = true;
     stone = 0;
     for (int cz = 100 >> 4; cz <= 147 >> 4; cz++)
-      for (int cy = 150 >> 4; cy <= 197 >> 4; cy++)
+      for (int cy = lo.y >> 4; cy <= (lo.y + 47) >> 4; cy++)
         for (int cx = 100 >> 4; cx <= 147 >> 4; cx++) {
           const CachedChunk* cc = world.Cached({cx, cy, cz});
           if (!cc || cc->version < placedTick) {

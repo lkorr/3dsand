@@ -2304,33 +2304,6 @@ fn voxWordAtEntry(e : u32, c : vec3<i32>) -> u32 {
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
 }
 
-// The ONLY way to obtain a WRITABLE word index. Returns PT_NO_WORD for a
-// sentinel chunk — which is a BUG at every sim call site, because §3
-// guarantees every chunk a kernel may write is materialized before dispatch.
-//
-// This is the invariant the whole phase rests on, and it is a SHAPE rather
-// than a rule to remember: there is no writable accessor that takes a
-// sentinel. The write accessor takes a physical word index, and the only way
-// to get one is a function that returns a distinguished no-word value.
-fn voxWordIndex(c : vec3<i32>) -> u32 {
-  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
-  let e = pageTable[chunkIndexOf(s)];
-  if ((e & PT_SENTINEL_BIT) != 0u) { return PT_NO_WORD; }
-  let lo = s % CHUNK;
-  return e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
-}
-
-// Word index within a chunk-linear path: the page base for a slot plus a local
-// offset. Returns PT_NO_WORD for a sentinel, same contract as voxWordIndex.
-// This is the entry point for the three chunk-linear sites — sim_occupancy's
-// two whole-chunk sweeps and worldgen's genChunk — which already have the
-// chunk index in hand and want the resolve hoisted out of their inner loop.
-fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
-  let e = pageTable[chunkSlot];
-  if ((e & PT_SENTINEL_BIT) != 0u) { return PT_NO_WORD; }
-  return e * CHUNK_VOL + localIdx;
-}
-
 // The chunk-linear READ: the word at (chunkSlot, localIdx), synthesized when
 // the chunk is a sentinel. A branch rather than a select, because select
 // evaluates both arms and voxels[PT_NO_WORD] is an out-of-bounds subscript.
@@ -2373,6 +2346,54 @@ fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
 // which is exactly the access the render path should have.
 // >>>PAGE_TABLE_WRITE_BEGIN<<<
 
+// The ONLY way to obtain a WRITABLE word index. Returns PT_NO_WORD for a
+// sentinel chunk — which is a BUG at every sim call site, because §3
+// guarantees every chunk a kernel may write is materialized before dispatch.
+//
+// This is the invariant the whole phase rests on, and it is a SHAPE rather
+// than a rule to remember: there is no writable accessor that takes a
+// sentinel. The write accessor takes a physical word index, and the only way
+// to get one is a function that returns a distinguished no-word value.
+//
+// IT LIVES IN THE WRITE HALF, with `pageFaults` in scope, so that the resolver
+// can record WHICH CHUNK refused the write. Nothing read-only ever needed it —
+// raymarch.wgsl reads through voxWordAt/voxWordAtEntry — and a fault COUNT with
+// no location is most of a day of turning worldgen features off one at a time
+// to find out where 58 lost voxels came from. Ask it once, in the one function
+// that knows.
+// The slot the last resolve looked at, carried from the resolver to voxStore.
+// `private` is per-invocation and the two calls are adjacent in the same
+// invocation (`voxStore(voxWordIndex(c), w)`), so this is exact.
+//
+// IT IS RECORDED AT THE STORE, NOT AT THE RESOLVE, and that distinction is the
+// whole point. A resolver refusal is not a fault: sim_fluid_seam asks
+// voxWordIndex whether a cell is writable and treats PT_NO_WORD as "blocked",
+// which is correct behaviour and happens constantly. Reporting the refusal
+// location instead of the STORE location named a chunk layer that had nothing
+// to do with the 58 lost voxels, which is worse than reporting nothing.
+var<private> gPtSlot : u32 = 0xFFFFFFFFu;
+
+fn voxWordIndex(c : vec3<i32>) -> u32 {
+  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
+  let slot = chunkIndexOf(s);
+  let e = pageTable[slot];
+  if ((e & PT_SENTINEL_BIT) != 0u) { gPtSlot = slot; return PT_NO_WORD; }
+  let lo = s % CHUNK;
+  return e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+}
+
+// Word index within a chunk-linear path: the page base for a slot plus a local
+// offset. Returns PT_NO_WORD for a sentinel, same contract as voxWordIndex.
+// This is the entry point for the three chunk-linear sites — sim_occupancy's
+// two whole-chunk sweeps and worldgen's genChunk — which already have the
+// chunk index in hand and want the resolve hoisted out of their inner loop.
+fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
+  let e = pageTable[chunkSlot];
+  if ((e & PT_SENTINEL_BIT) != 0u) { gPtSlot = chunkSlot; return PT_NO_WORD; }
+  return e * CHUNK_VOL + localIdx;
+}
+
+
 // Every sim write goes through this. A sentinel write is a NO-OP and is ALWAYS
 // counted — the counter is unconditional, permanently bound, and every gate
 // asserts it is zero (§5.1, user decision). The cost in a correct build is a
@@ -2388,6 +2409,14 @@ fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
 fn voxStore(idx : u32, w : u32) {
   if (idx == PT_NO_WORD) {
     atomicAdd(&pageFaults[0], 1u);
+    // WHICH MATERIAL WAS LOST, as a 96-bit bitmask across the three spare words
+    // `pageFaults` already allocated. The counter alone says "58 voxels went
+    // missing somewhere" and sends you turning worldgen features off one at a
+    // time; the material names the rule in one run. Ids at or above 96 fold
+    // into the top bank, which is flagged rather than hidden.
+    atomicMax(&pageFaults[2], w);
+    atomicMax(&pageFaults[1], gPtSlot + 1u);
+    atomicMax(&pageFaults[3], 0xFFFFFFFFu - gPtSlot);   // == min, reported as one
     return;
   }
   voxels[idx] = w;

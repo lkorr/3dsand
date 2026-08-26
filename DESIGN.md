@@ -1417,6 +1417,75 @@ must be re-run to re-baseline. Everything outside `sim` is render- or CPU-side
 and provably cannot perturb the hash — verified by changing sky colour and
 exposure and watching the hash stay at `a0d20705`.
 
+##### The terrain: an attenuated octave ladder (2026-08-26, overhaul package C)
+
+The height function is five octaves of Q14 value noise, lacunarity 4,
+persistence 1/4, so **every rung has the same amplitude-to-wavelength ratio of
+0.5**. That uniformity is the design, not a coincidence: slope is what the CA
+cares about — its angle of repose is exactly 1 voxel per column — and a ladder
+whose rungs all share an A/W adds detail without adding slope.
+
+| octave | cell | amplitude | |
+|---|---:|---:|---|
+| continental | 2048 vox / 204.8 m | 1024 / 102.4 m | faded out near the origin |
+| range | 512 / 51.2 m | 256 / 25.6 m | faded out near the origin |
+| hill | 128 / 12.8 m | 64 / 6.4 m | live everywhere |
+| detail | 32 / 3.2 m | 16 / 1.6 m | live everywhere |
+| grain | 8 / 0.8 m | 4 / 0.4 m | live everywhere |
+
+Every octave is a **centred deviation** (`n - 8192`), so `worldgen.baseHeight`
+is the world's *mean* height rather than its floor and there is as much room
+below the datum for sea basins as above it for mountains. Measured over a 3,072
+voxel transect from the origin: **y-351 .. y+607**, i.e. ~96 m of relief where
+the pre-overhaul world had 5.4 m.
+
+**Derivative attenuation is a rule-2 mechanism, not a look knob.** Each octave
+is divided by `1 + fbmAtten·|g|²` against the gradient accumulated from the
+octaves coarser than it (iq's trick). Without it the ladder sums five 0.5 slopes
+into 2.5 and puts *the entire world* above the angle of repose, where nothing
+loose can ever come to rest. With it the field saturates near slope 1.2 on
+ridges and goes genuinely flat in valleys.
+
+**The calm home area** fades only the two coarse octaves toward the world
+origin, over `spawnPlainFade` past a Chebyshev radius of `spawnPlainR`. Fading
+the whole deviation would pin spawn to a mathematically exact plane 64 m across
+— which is not "calm", it is a dinner plate, and it would make the `terrain`
+gate's per-voxel pass a test of a constant. The fade *width* is load-bearing: a
+ramp of magnitude A over width W adds slope up to 1.5·A/W, so squeezing 640
+voxels of coarse relief into a 300-voxel fade builds a cliff at exactly the
+boundary. Pass A4 measures it; read that number rather than guessing it.
+
+**The sediment wedge** is what makes the relief mean something to the sim rather
+than only to the eye: low flat ground carries metres of loose dirt over gravel,
+ridges carry bare rock. Thickness is
+`(sedCeil − ground)·sedFraction/256 − sedStrip`, slope-gated and clamped to
+`sedMax`, which stays under `caveBands`' 40-voxel shell so a cavern cannot
+undercut it.
+
+Dirt and gravel are **powders**, so the gate is the safety property. Two things
+about it are not obvious and both were measured:
+
+* It reads the **landform** gradient — accumulated through the hill octave, not
+  the full one. `d(slope)/dcolumn` for an octave is ~`6·amp/cell²`, which for
+  the *grain* octave is 96 Q8: the entire gate range in one column, turning a
+  24-voxel wedge into a 24-voxel cliff wherever the fine noise crosses the
+  threshold. Gated on the landform it thins over ~32 columns instead. 108
+  chunks still awake at tick 120 became 8.
+* With a **solid** grass skin at `y == h` the topmost grain sits at `h−1`, so it
+  has a free down-diagonal exactly where a neighbouring column is 3+ voxels
+  lower — which is the ground the gate has already taken the wedge to zero on.
+
+`worldgen.sedSlope = 0` turns the wedge off, which makes
+`--sweep worldgen.sedSlope=0,96` a one-invocation proof that the knob reaches
+the kernel.
+
+**Tree sizes are metre-true again.** `VOX_PER_M` in `worldgen.wgsl` was a
+hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h`
+moved to `kVoxelMeters = 0.10`. For that whole interval every tree in the game
+was 1.6× the metre size its own table documents (the "11.9 m" great oak was 19 m
+of trunk). It reads `VOXELS_PER_M` from the prelude now, so the table's metres
+are true at any voxel size.
+
 ##### The height contract (2026-08-26)
 
 > `World::TerrainHeight(x, z, seed)` ≡ `genColumn(x, z, seed).h`, **exactly**, for

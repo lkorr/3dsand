@@ -383,7 +383,18 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
   // residency window, never to a literal world position.
   const IVec3 wo = world.WindowOrigin();
   const int bx = wo.x * (int)kChunk + 64;
-  const int by = wo.y * (int)kChunk + 144;   // a different shelf from `wind`
+  // Terrain-relative, and LOW. A literal +144 put the whole chamber inside the
+  // hillside once the datum moved, which reads as "the fan did not WAKE a
+  // sleeping bed" rather than as a buried fixture.
+  //
+  // +40 rather than something generous, and the reason is measured: this gate's
+  // fan speeds are tuned against the AMBIENT field at the chamber's altitude,
+  // and lifting the chamber to +200 left `reverses` at -0.12 cells where it
+  // needs to see a real reversal. Wind is a function of position (windAt in
+  // common.wgsl); a fixture that measures wind may not move in Y for free.
+  const int by = FixtureYOver(wo.x * (int)kChunk + 64, wo.z * (int)kChunk + 64,
+                              wo.x * (int)kChunk + 64 + 48,
+                              wo.z * (int)kChunk + 64 + 6, kDefaultSeed, 40);
   const int bz = wo.z * (int)kChunk + 64;
   // LOW on purpose: 6 cells of headroom, not 10. A gas rises, and in a taller
   // box the smoke witness below spends the whole run pinned to the ceiling
@@ -591,14 +602,16 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
       "| smoke drifts %+.2f cells (unlicensed fan %+.2f) "
       "| ASLEEP chamber, no smoke: %u chunks awake (0 with no fan), bed "
       "creeps %+.2f "
-      "| grains %u/%u/%u | wake %u of %u chunks (%u without the licence) "
+      "| grains %u/%u/%u (dry %u vs %u) "
+      "| wake %u of %u chunks (%u without the licence) "
       "| hash none %08x, fan %08x, repeat %s",
       dEast, mEast, dWest, quietHeld ? "unmoved bitwise" : "MOVED",
       quietBlows ? "blowing" : "STILL",
       east.smokeX - none.smokeX, quiet.smokeX - none.smokeX, dry.wakeActive,
       dDry,
       none.sandCount, east.sandCount,
-      west.sandCount, east.wakeMax, budget, quiet.wakeMax, none.hash, east.hash,
+      west.sandCount, dry.sandCount, dryNone.sandCount,
+      east.wakeMax, budget, quiet.wakeMax, none.hash, east.hash,
       stable ? "identical" : "DIFFERS");
 
   if (!creeps) detail += " -- a licensed fan did not move the settled bed";

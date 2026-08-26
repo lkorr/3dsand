@@ -1647,6 +1647,28 @@ class World {
   };
   static PondQuery PondNearColumn(int x, int z, uint32_t seed);
 
+  // ---- THE MAP PROBE (assets/tuner.html, Worldgen tab) ---------------------
+  //
+  // Everything a picture of the terrain needs, from ONE evaluation of the
+  // column instead of three. `--heightmap` renders a res x res grid of these
+  // and the tuner draws it, which is how worldgen tuning stopped being "edit
+  // a number, regen the world, fly somewhere, look".
+  //
+  // IT IS THE SAME CODE THE GAME USES, deliberately. A JavaScript
+  // reimplementation of the octave ladder in the tuner would be a THIRD copy
+  // of the height function beside the shader and this mirror, with nothing
+  // enforcing it — and the whole reason `check_invariants.py` compares the two
+  // that already exist is that the third one (the deleted `surfHeightAt`) had
+  // silently gone stale. So the map costs a process launch and is exact,
+  // rather than being instant and a guess.
+  struct Column {
+    int h;        // ground, the height contract
+    int slope;    // landform gradient, Q8 (256 = the CA's angle of repose)
+    int sed;      // loose wedge thickness inside h
+    int water;    // standing-water surface Y, or INT32_MIN for none
+  };
+  static Column TerrainColumn(int x, int z, uint32_t seed);
+
   // Fluid-lab worldgen mode (kLabSlabY block above). A process-wide static
   // because TerrainHeight is static and the flag must gate BOTH the CPU
   // mirror and every TickParams.labMode write from one truth. Set exactly

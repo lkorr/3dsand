@@ -51,7 +51,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        float fogDensity = kFarFogDensity,
                        float viewPx = 1080.0f, uint32_t tick = 0,
                        uint32_t fluidCount = 0,
-                       float frameFrac = 0.0f);
+                       float frameFrac = 0.0f,
+                       uint32_t extraFlags = 0);
 
 // Encode + submit one sim tick. `particlesActive` must be derived only from
 // tick-deterministic inputs (explosion history + a settled particle count),
@@ -114,6 +115,28 @@ bool HarnessSnapshotDrain();
 
 bool WriteBmpFile(const std::string& path, const std::vector<uint8_t>& rgba,
                   uint32_t w, uint32_t h);
+
+// ---- FIXTURE ANCHORING: never write an absolute Y in a gate ----------------
+//
+// A gate that builds a slab, a pond or a prefab at a literal height is pinned
+// to whatever the terrain band happened to be the day it was written. Package B
+// converted the paint/blast sites; package C moved the datum from y32..y86 to
+// ~y200 and found eight more — a "pond" and a "stone slab in open air" buried
+// in bedrock, a 48^3 cube counted against a box that now contains a hillside,
+// and two cascade sites at y200 that used to be sky. Every one of them failed
+// as something else: no evaporation, no blood landing, 257,391 voxels where
+// 110,592 were placed.
+//
+// So: ask the terrain. `above` is the clearance in voxels, measured from the
+// GROUND (the height contract — World::TerrainHeight ≡ genColumn.h), and the
+// result is clamped to leave `pad` voxels of window above it so a fixture near
+// the top of the band cannot be built outside residency.
+//
+// The MAX over a footprint, not the centre column, when the fixture is wide:
+// a flat slab laid at the centre height has its uphill half buried.
+int FixtureY(int x, int z, uint32_t seed, int above, int pad = 32);
+int FixtureYOver(int x0, int z0, int x1, int z1, uint32_t seed, int above,
+                 int pad = 32);
 
 // Blocking readbacks. The selftest's synchronous hash read is the one
 // sanctioned exception to the no-sync-readback rule (CLAUDE.md).

@@ -1876,13 +1876,44 @@ struct Tuning {
     // the Q8 slope) are untouched, because a probability and a gradient do not
     // have a length in them.
     int refVoxelsPerMetre = 10;
-    int treeline = 72;
-    int baseHeight = 32;
-    // Noise cells are LOG2 EXPONENTS (6 = 64 voxels, 4 = 16, 9 = 512), which is
-    // what lets vnoise2d replace fdiv/fmodp with >> and & — see the Q14 noise
-    // block in worldgen.wgsl. LoadTuning clamps all three to 3..15.
-    int hillAmplitude = 42, hillLog2 = 6;
-    int detailAmplitude = 12, detailLog2 = 4;
+    int treeline = 228;
+    // The world DATUM. Every octave below is a CENTRED deviation, so terrain
+    // sits at baseHeight on average and spans +- half the summed amplitudes.
+    int baseHeight = 200;
+    // THE OCTAVE LADDER: five rungs, lacunarity 4, persistence 1/4, so every
+    // rung has the same amplitude/wavelength ratio of 0.5 and detail is added
+    // without adding slope. Amplitudes are the FULL swing in voxels (the field
+    // spans +-amp/2); half-ranges sum to 682 voxels = 68 m each way.
+    //
+    // Noise cells are LOG2 EXPONENTS (11 = 2048 voxels, 3 = 8), which is what
+    // lets vnoise2d replace fdiv/fmodp with >> and & — see the Q14 noise block
+    // in worldgen.wgsl. LoadTuning clamps every one of them to 3..15.
+    int contAmplitude = 1024, contLog2 = 11;
+    int rangeAmplitude = 256, rangeLog2 = 9;
+    int hillAmplitude = 64, hillLog2 = 7;
+    int detailAmplitude = 16, detailLog2 = 5;
+    int grainAmplitude = 4, grainLog2 = 3;
+    // iq's derivative attenuation, Q8: each octave is scaled by
+    // 1/(1 + fbmAtten*|g|^2/256) against the gradient accumulated above it.
+    // 0 is plain fBm (five 0.5 slopes summing to 2.5, i.e. the whole world
+    // above the CA's angle of repose); 256 is the textbook form. This is a
+    // rule-2 mechanism, not a look knob.
+    int fbmAtten = 256;
+    // The calm home area: the two COARSE octaves fade toward the world origin
+    // so spawn is rolling country at spawnPlainY instead of a random point on
+    // a mountainside. The three fine octaves stay live, which is what makes it
+    // calm rather than flat. spawnPlainFade is load-bearing — a short fade
+    // builds a cliff at exactly the boundary; the `terrain` gate's A4 measures
+    // it.
+    int spawnPlainY = 200, spawnPlainR = 320, spawnPlainFade = 2048;
+    // The sediment wedge: low flat ground carries loose dirt over gravel,
+    // ridges carry none. thickness = (sedCeil - ground)*sedFraction/256 -
+    // sedStrip, slope-gated and clamped to sedMax. Dirt and gravel are
+    // POWDERS, so sedSlope is a rule-2 knob — ship it conservative and raise it
+    // under `--gate sleep`. sedMax must stay under caveBands' 40-voxel shell or
+    // a cavern breaches the wedge from below; LoadTuning enforces that.
+    int sedCeil = 264, sedFraction = 64, sedStrip = 6;
+    int sedSlope = 96, sedMax = 32, sedTopsoil = 4;
     int biomeLog2 = 9;
     int desertThreshold = 214, pineThreshold = 176, meadowThreshold = 92;
     int treeTile = 144;
@@ -1893,7 +1924,7 @@ struct Tuning {
     // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the
     // CA's angle of repose). A bowl cut into a slope lays its sand bed on a
     // wall and never settles.
-    int pondMaxSlope = 256;
+    int pondMaxSlope = 96;
     // The tarn berm: the annulus just outside the disc is forced to
     // (waterline + pondBerm) and ramps back to natural ground over
     // pondBermWidth voxels. This is what makes pond containment STRUCTURAL —

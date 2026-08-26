@@ -513,16 +513,80 @@ TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f)
 // Bump this row instead if you ever re-author the group at the new scale.
 // (The shader's own hardcoded lengths scale off VOXELS_PER_M / this.)
 TP_I(worldgen, refVoxelsPerMetre, TUNE_REF_VOXELS_PER_METRE, 10)
-TP_I(worldgen, treeline, TUNE_TREELINE, 72)
-TP_I(worldgen, baseHeight, TUNE_BASE_HEIGHT, 32)
-TP_I(worldgen, hillAmplitude, TUNE_HILL_AMPLITUDE, 42)
-// Noise cell sizes are LOG2 EXPONENTS, not voxel counts. That is what makes
-// vnoise2d divide-free (fdiv becomes >>, fmodp becomes &), and it is the reason
-// the terrain rewrite is CHEAPER than what it replaced rather than the other way
-// round. 6 = 64 voxels, 4 = 16, 9 = 512. LoadTuning clamps them to 3..15.
-TP_U(worldgen, hillLog2, TUNE_HILL_LOG2, 6)
-TP_I(worldgen, detailAmplitude, TUNE_DETAIL_AMPLITUDE, 12)
-TP_U(worldgen, detailLog2, TUNE_DETAIL_LOG2, 4)
+TP_I(worldgen, treeline, TUNE_TREELINE, 228)
+// The world DATUM: the mean of the octave ladder below, since every octave is a
+// CENTRED deviation (n - 8192) rather than a 0..amp lump. So terrain sits at
+// baseHeight on average and spans baseHeight +- (sum of amplitudes)/2.
+TP_I(worldgen, baseHeight, TUNE_BASE_HEIGHT, 200)
+// ---- THE OCTAVE LADDER (package C) ----------------------------------------
+// Five octaves, lacunarity 4, persistence 1/4, so every rung has the SAME
+// amplitude-to-wavelength ratio of 0.5. That uniformity is the point: slope is
+// what the CA cares about (its angle of repose is exactly 1 voxel/column), and
+// a ladder whose rungs all have the same A/W adds detail without adding slope.
+// Half-ranges sum to (1024+256+64+16+4)/2 = 682 voxels = 68 m each way.
+//
+// Amplitudes are the FULL swing in voxels; the field spans +-amp/2.
+// Cell sizes are LOG2 EXPONENTS, not voxel counts. That is what makes vnoise2d
+// divide-free (fdiv becomes >>, fmodp becomes &), and it is the reason the
+// terrain rewrite is CHEAPER than what it replaced rather than the other way
+// round. 11 = 2048 voxels = 204.8 m, 3 = 8 voxels. LoadTuning clamps 3..15.
+TP_I(worldgen, contAmplitude, TUNE_CONT_AMPLITUDE, 1024)
+TP_U(worldgen, contLog2, TUNE_CONT_LOG2, 11)
+TP_I(worldgen, rangeAmplitude, TUNE_RANGE_AMPLITUDE, 256)
+TP_U(worldgen, rangeLog2, TUNE_RANGE_LOG2, 9)
+TP_I(worldgen, hillAmplitude, TUNE_HILL_AMPLITUDE, 64)
+TP_U(worldgen, hillLog2, TUNE_HILL_LOG2, 7)
+TP_I(worldgen, detailAmplitude, TUNE_DETAIL_AMPLITUDE, 16)
+TP_U(worldgen, detailLog2, TUNE_DETAIL_LOG2, 5)
+TP_I(worldgen, grainAmplitude, TUNE_GRAIN_AMPLITUDE, 4)
+TP_U(worldgen, grainLog2, TUNE_GRAIN_LOG2, 3)
+// iq's DERIVATIVE ATTENUATION, Q8. Each octave is scaled by
+// 1/(1 + atten*|g|^2/256) where g is the gradient accumulated from the octaves
+// coarser than it. 0 turns it off (plain fBm, which piles five 0.5 slopes into
+// a 2.5 slope and puts the whole world above repose); 256 is the textbook
+// form. THIS IS THE RULE-2 MECHANISM, NOT A LOOK KNOB: it is what makes the
+// field saturate near slope 1.2 on ridges and go genuinely flat in valleys
+// instead of summing to a uniformly steep corrugation.
+TP_I(worldgen, fbmAtten, TUNE_FBM_ATTEN, 256)
+// ---- the calm home area ----------------------------------------------------
+// The two COARSE octaves (contAmplitude, rangeAmplitude) fade out toward the
+// world origin, so spawn is rolling country at spawnPlainY rather than a
+// random point on a 100 m mountainside. The three fine octaves stay live at
+// full amplitude, which is why the home area is CALM and not a dinner plate.
+//
+// spawnPlainR is the Chebyshev radius held flat; spawnPlainFade is how far
+// past it the coarse octaves ramp back to full. THE FADE WIDTH IS
+// LOAD-BEARING: a ramp of magnitude A over width W adds slope up to 1.5*A/W,
+// so 640 voxels of coarse relief over a 300-voxel fade builds a 3.2-slope wall
+// at exactly the boundary -- an avalanche generator and a page-residency wall
+// built by the test fixture. The `terrain` gate's pass A4 measures it; read
+// that number, do not guess it.
+TP_I(worldgen, spawnPlainY, TUNE_SPAWN_PLAIN_Y, 200)
+TP_I(worldgen, spawnPlainR, TUNE_SPAWN_PLAIN_R, 320)
+TP_I(worldgen, spawnPlainFade, TUNE_SPAWN_PLAIN_FADE, 2048)
+// ---- the sediment wedge ----------------------------------------------------
+// What makes 200 m of relief mean something to the SIM rather than only to the
+// eye: low, flat ground carries metres of loose dirt over gravel, ridges carry
+// none. Thickness is (sedCeil - ground) * sedFraction/256 - sedStrip, gated by
+// slope and clamped to sedMax.
+//
+// THE SLOPE GATE IS NOT A LOOK KNOB EITHER. Dirt and gravel are POWDERS, and
+// sim_step.wgsl slides a powder into any free down-diagonal. With a solid
+// grass skin at y == h the topmost powder is at h-1, so it is exposed exactly
+// when a neighbouring column's ground is 3+ voxels lower. Ship sedSlope
+// conservative and raise it under `--gate sleep`; at 0 the feature is off,
+// which makes `--sweep worldgen.sedSlope=0,96,256` the one-invocation proof
+// that the knob reaches the kernel.
+//
+// sedMax must stay under caveBands' 40-voxel shell (`c1 = min(..., h - 40)`)
+// or a near-surface cavern breaches the wedge from below and drops the whole
+// column of powder into it. LoadTuning enforces that pairing.
+TP_I(worldgen, sedCeil, TUNE_SED_CEIL, 264)
+TP_I(worldgen, sedFraction, TUNE_SED_FRACTION, 64)
+TP_I(worldgen, sedStrip, TUNE_SED_STRIP, 6)
+TP_I(worldgen, sedSlope, TUNE_SED_SLOPE, 96)
+TP_I(worldgen, sedMax, TUNE_SED_MAX, 32)
+TP_I(worldgen, sedTopsoil, TUNE_SED_TOPSOIL, 4)
 TP_U(worldgen, biomeLog2, TUNE_BIOME_LOG2, 9)
 TP_U(worldgen, desertThreshold, TUNE_DESERT_THRESHOLD, 214)
 TP_U(worldgen, pineThreshold, TUNE_PINE_THRESHOLD, 176)
@@ -553,7 +617,7 @@ TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 32)
 // centre-derived waterline sits under the uphill rim, the bowl cuts a cliff
 // into the hillside, and the sand bed goes down that cliff's inside face.
 // 0 disables tarns entirely, which is a legal thing to want.
-TP_I(worldgen, pondMaxSlope, TUNE_POND_MAX_SLOPE, 256)
+TP_I(worldgen, pondMaxSlope, TUNE_POND_MAX_SLOPE, 96)
 // The berm: how far ABOVE the waterline the annulus just outside the disc is
 // forced, and over how many voxels that lift ramps back to natural ground. The
 // first is what makes containment structural rather than a rim-sampling density

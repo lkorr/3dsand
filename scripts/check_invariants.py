@@ -609,9 +609,9 @@ MIRROR_RE = re.compile(
 
 # WGSL spellings that have no counterpart token on the C++ side, and vice versa.
 _WGSL_DROP = (r"\b(?:let|var|fn|i32|u32|f32|bool"
-              r"|N2|Land|Pond|Shore|LandCol|CaveBands|TreeCands)\b")
+              r"|N2|Oct|Land|Pond|Shore|LandCol|CaveBands|TreeCands)\b")
 _CPP_DROP = (r"\b(?:static|inline|const|int|uint32_t|int32_t|unsigned|bool"
-             r"|N2|Land|Pond|Shore|IV2)\b")
+             r"|N2|Oct|Land|Pond|Shore|IV2)\b")
 
 
 def _mirror_blocks(text, tag):

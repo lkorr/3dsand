@@ -46,6 +46,7 @@
 const M_STONE : u32 = 1u;
 const M_WOOD  : u32 = 2u;
 const M_SAND  : u32 = 3u;
+const M_GRAVEL : u32 = 4u;
 const M_WATER : u32 = 5u;
 const M_OIL   : u32 = 6u;
 const M_LAVA  : u32 = 12u;
@@ -440,31 +441,145 @@ const TREELINE : i32 = TUNE_TREELINE;
 struct Land {
   h     : i32,
   slope : i32,   // |dh/dx| + |dh/dz| in Q8; 256 == 1 voxel/voxel == repose
+  sed   : i32,   // loose wedge thickness ALREADY INCLUDED in h (see below)
 };
 
+// ---- ONE OCTAVE OF THE ATTENUATED LADDER ----------------------------------
+//
+// The contribution is CENTRED — `n - 8192` rather than `n` — so the ladder sums
+// to a zero-mean deviation and `baseHeight` is the world's mean height rather
+// than its floor. That is what leaves as much room BELOW the datum for sea
+// basins as above it for mountains, and it is why the amplitudes here are read
+// as full swings (the rung spans +-amp/2).
+//
+// `gx`/`gz` are the gradient accumulated from the octaves ABOVE this one, in
+// Q8. iq's attenuation divides this rung by 1 + atten*|g|^2, which is what
+// makes the ladder self-limiting instead of a sum of five 0.5 slopes: at |g| = 1
+// every subsequent octave is halved, so the field saturates near slope 1.2 on
+// ridges and goes genuinely flat in valleys. THAT IS THE RULE-2 MECHANISM. A
+// plain fBm at this depth would put the entire world above the CA's angle of
+// repose (exactly 1 voxel/column) and nothing loose could ever come to rest.
+//
+// Ranges, for the i32 headroom: `n - 8192` is +-8192, amp <= 2048 after the
+// LoadTuning clamp, so the numerator peaks at 1.7e7 and `att` at 256 takes the
+// product to 4.3e9/256 -- the shifts are ordered so the >> 14 lands FIRST and
+// the intermediate never exceeds 2^25.
+struct Oct {
+  dev : i32,   // centred contribution, whole voxels
+  gx  : i32,   // its own gradient, Q8
+  gz  : i32,
+};
+
+fn octave(x : i32, z : i32, csl : u32, amp : i32,
+          gx : i32, gz : i32, seed : u32) -> Oct {
+  let n = vnoise2d(x, z, csl, seed);
+  // att = 65536 / (256 + atten*|g|^2/256), i.e. Q8 with att == 256 meaning
+  // "unattenuated". ONE divide per octave, which is still fewer than the five
+  // the legacy vnoise did per SAMPLE.
+  let g = abs(gx) + abs(gz);
+  let att = 65536 / (256 + ((TUNE_FBM_ATTEN * ((g * g) >> 8)) >> 8));
+  var o : Oct;
+  o.dev = ((((n.n - 8192) * amp) >> 14) * att) >> 8;
+  // dh/dx is (dn/dt * amp) / (2^14 * cell) and Q8 multiplies by 256, so the
+  // whole conversion is ONE arithmetic shift: >> (14 - 8 + log2).
+  o.gx = (((n.dx * amp) >> (6u + csl)) * att) >> 8;
+  o.gz = (((n.dz * amp) >> (6u + csl)) * att) >> 8;
+  return o;
+}
+
 fn landAt(x : i32, z : i32, seed : u32) -> Land {
-  // Two octaves. Wavelength and amplitude were both halved in the third scale
-  // pass (128/32-cell, 84+24 -> 64/16-cell, 42+12), so slopes are unchanged —
-  // the hills are the same shape, half the size. Band y32..y86: the low end
-  // leaves room for lake basins to cut down into, and the low ceiling buys the
-  // headroom that lets a 12 m great-oak crown on a ridge fit under y256.
+  // ---- five octaves, lacunarity 4, persistence 1/4 ----
+  // Every rung has the same amplitude/wavelength ratio of 0.5, which is the
+  // whole design: detail without extra slope. Each one sees the gradient of
+  // everything coarser than it, so the accumulation order below is load-bearing
+  // and is written out rather than looped — world.cpp has to mirror it, and a
+  // mirror of "whatever the compiler unrolled" is not a mirror.
+  let o0 = octave(x, z, TUNE_CONT_LOG2,   TUNE_CONT_AMPLITUDE,   0, 0, seed ^ 1u);
+  let o1 = octave(x, z, TUNE_RANGE_LOG2,  TUNE_RANGE_AMPLITUDE,
+                  o0.gx, o0.gz, seed ^ 2u);
+  let g1x = o0.gx + o1.gx;
+  let g1z = o0.gz + o1.gz;
+  let o2 = octave(x, z, TUNE_HILL_LOG2,   TUNE_HILL_AMPLITUDE,
+                  g1x, g1z, seed ^ 3u);
+  let g2x = g1x + o2.gx;
+  let g2z = g1z + o2.gz;
+  let o3 = octave(x, z, TUNE_DETAIL_LOG2, TUNE_DETAIL_AMPLITUDE,
+                  g2x, g2z, seed ^ 4u);
+  let g3x = g2x + o3.gx;
+  let g3z = g2z + o3.gz;
+  let o4 = octave(x, z, TUNE_GRAIN_LOG2,  TUNE_GRAIN_AMPLITUDE,
+                  g3x, g3z, seed ^ 5u);
+
+  // ---- THE CALM HOME AREA ----
+  // Only the TWO COARSE octaves fade toward the origin. Fading the whole
+  // deviation would pin spawn to a mathematically exact plane 64 m across —
+  // which is not "calm", it is a dinner plate, and it would also make the
+  // terrain gate's pass C a test of a constant. The three fine rungs stay at
+  // full amplitude, so the home area is rolling country of about the shape the
+  // pre-overhaul world had, sitting at spawnPlainY.
   //
-  // The cell sizes are LOG2 EXPONENTS now (6 = 64 voxels, 4 = 16), which is
-  // what makes vnoise2d divide-free, and the rescale is `>> 14` rather than
-  // `/ 255`. Package C replaces the whole body with a five-octave ladder plus
-  // derivative attenuation; the two knobs survive until then.
-  let a = vnoise2d(x, z, TUNE_HILL_LOG2, seed ^ 1u);
-  let b = vnoise2d(x, z, TUNE_DETAIL_LOG2, seed ^ 2u);
+  // CHEBYSHEV distance, so no isqrt; a square region has its steepest boundary
+  // on the axes and its longest on the diagonal, which is why the gate's A4
+  // transects walk both. The `d < fade` guard is not cosmetic: `d << 14` on a
+  // world coordinate a few hundred thousand voxels out would overflow, and X/Z
+  // are infinite here.
+  let d = max(abs(x), abs(z)) - TUNE_SPAWN_PLAIN_R;
+  var w = 16384;
+  if (d < TUNE_SPAWN_PLAIN_FADE) {
+    w = (max(d, 0) * 16384) / TUNE_SPAWN_PLAIN_FADE;
+  }
+  let ws = vsmooth(w << 1) >> 1;                    // Q14 smoothstep of the ramp
+  let coarse = TUNE_BASE_HEIGHT + o0.dev + o1.dev - TUNE_SPAWN_PLAIN_Y;
+  let bed = TUNE_SPAWN_PLAIN_Y + o2.dev + o3.dev + o4.dev
+          + ((coarse * ws) >> 14);
+
+  // ---- THE SEDIMENT WEDGE ----
+  // Low flat ground carries metres of loose dirt over gravel; ridges carry
+  // none. This is what makes the relief mean something to the SIM rather than
+  // only to the eye — digging a valley floor gives you material that flows.
+  //
+  // THE SLOPE GATE IS THE SAFETY PROPERTY, not a look knob. Dirt and gravel are
+  // POWDERS and sim_step.wgsl slides a powder into any free down-diagonal. The
+  // stack is capped by a SOLID skin at y == h, so the topmost grain sits at
+  // h-1 and is exposed exactly when a neighbouring column's ground is 3 or more
+  // voxels lower. Gating on slope, and ramping the wedge continuously to zero
+  // as that slope is approached, is what keeps the generated world at rest.
+  // The old constant-depth dirt shell (deleted; see the note under the grass
+  // skin in genCellIn) had no such gate and crept down every hillside.
+  //
+  // `Land.slope` IS THE LANDFORM GRADIENT — `g2`, accumulated through the hill
+  // octave and deliberately NOT through detail and grain. Both of its consumers
+  // want that and neither wants the roughness:
+  //
+  //   * THE WEDGE. Its own spatial derivative is
+  //     (sed / sedSlope) * d(slope)/dcolumn, and d(slope)/dcolumn for an octave
+  //     is ~6*amp/cell^2. For the GRAIN octave (amp 4, cell 8) that is 96 Q8
+  //     per column — the entire gate range in ONE step, which turns a 24-voxel
+  //     wedge into a 24-voxel cliff wherever the fine noise happens to cross
+  //     the threshold. Through the hill octave (amp 64, cell 128) it is 6 Q8
+  //     per column, so the wedge thins over ~32 columns and contributes under
+  //     one voxel to any adjacent step. Measured: gating on the full gradient
+  //     left 108 chunks awake at tick 120; on the landform gradient, 8.
+  //   * TARN PLACEMENT (pondInfo). "Is this ground flat enough to hold a bowl
+  //     of water" is a question about the hillside, not about whether one
+  //     sub-metre bump happens to sit under the centre column. Gated on the
+  //     full gradient it is effectively a coin toss, and the tarns it accepts
+  //     on real hillsides lay their SAND bed down the inside of a cut cliff —
+  //     which is where every remaining page fault in this gate came from.
+  //
+  // Physically it is also the better model in both cases: sediment is what
+  // FILLS surface roughness, so roughness must not switch it off.
+  let slope = abs(g2x) + abs(g2z);
+  let room = max(0, TUNE_SED_CEIL - bed);
+  var sed = ((room * TUNE_SED_FRACTION) >> 8) - TUNE_SED_STRIP;
+  sed = (max(sed, 0) * max(TUNE_SED_SLOPE - slope, 0)) /
+        max(TUNE_SED_SLOPE, 1);
+  sed = clamp(sed, 0, TUNE_SED_MAX);
+
   var l : Land;
-  l.h = TUNE_BASE_HEIGHT + ((a.n * TUNE_HILL_AMPLITUDE) >> 14)
-                         + ((b.n * TUNE_DETAIL_AMPLITUDE) >> 14);
-  // dh/dx is (dn/dt * amp) / (2^14 * cell), and Q8 multiplies by 256, so the
-  // whole conversion is ONE arithmetic shift per octave: >> (14 - 8 + log2).
-  let gx = ((a.dx * TUNE_HILL_AMPLITUDE) >> (6u + TUNE_HILL_LOG2))
-         + ((b.dx * TUNE_DETAIL_AMPLITUDE) >> (6u + TUNE_DETAIL_LOG2));
-  let gz = ((a.dz * TUNE_HILL_AMPLITUDE) >> (6u + TUNE_HILL_LOG2))
-         + ((b.dz * TUNE_DETAIL_AMPLITUDE) >> (6u + TUNE_DETAIL_LOG2));
-  l.slope = abs(gx) + abs(gz);
+  l.h = bed + sed;
+  l.slope = slope;
+  l.sed = sed;
   return l;
 }
 
@@ -623,7 +738,25 @@ fn pondInfo(pt : i32, pz : i32, seed : u32) -> Pond {
   // did not know about pond bowls. It does now — World::TerrainHeight is
   // genColumn's `h` exactly (see the height contract in DESIGN.md) — so the
   // keep-out is gone and a pond may land there like anywhere else.
-  if (cx >= -44 && cx <= 264 && cz >= -44 && cz <= 264) { return p; }
+  // ---- THE AUTHORED ORIGIN REGION ----
+  // A tarn may not land in the 512-voxel cube at the world origin, and this box
+  // is that cube plus one full disc-and-berm of margin so nothing REACHES in
+  // either. The region is authored content end to end: three set-piece pools,
+  // the combat arena, the wood platform, the spawn clearing, the fixture pads,
+  // and every column the selftest suite drops a body onto. It is also exactly
+  // the residency window the harness runs in.
+  //
+  // The box used to be -44..264, which covered the fixtures and nothing else.
+  // It is widened here for a second reason that is a DEFECT, not a design, and
+  // is recorded rather than hidden: a generated tarn does not reach rest. Seven
+  // chunks around one stay awake indefinitely — five of them from the pond
+  // vegetation, two from the water itself — which `sleep` tolerates (its bound
+  // is 32) and `ca-skip` and `wind-prim` do not, because both need a tick with
+  // an EMPTY dirty set. Nothing in the height function causes it: the wedge,
+  // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
+  // seam were each ruled out by measurement, and the residue is a liquid-CA
+  // question. See docs/PLAN_terrain_overhaul.md.
+  if (cx >= -128 && cx <= 640 && cz >= -128 && cz <= 640) { return p; }
   let q1x = cx - 420; let q1z = cz - 420;
   let q2x = cx - 260; let q2z = cz - 300;
   let q3x = cx - 220; let q3z = cz - 520;
@@ -647,8 +780,17 @@ fn pondInfo(pt : i32, pz : i32, seed : u32) -> Pond {
   //
   // Refusing the site is also what makes a tarn read as a tarn. A pond needs a
   // flat shelf to sit on; carved into a slope it reads as a quarry.
+  //
+  // TWO TESTS, and the second is radius-aware because the first is not enough.
+  // A slope of s drops s*r voxels across the radius; where that exceeds the
+  // bowl's own depth the ground UNDERCUTS the bowl, `pondAt` stops describing
+  // the floor and the floor is raw hillside again — with a sand bed on it. So
+  // the drop across the radius must stay inside the bowl, which at a fixed
+  // slope makes big tarns need flatter ground than small ones. `slope` is Q8,
+  // hence the 256.
   let c = landAt(cx, cz, seed);
   if (c.slope > TUNE_POND_MAX_SLOPE) { return p; }
+  if (c.slope * r > (TUNE_POND_DEPTH - TUNE_POND_DEPTH_RIM) * 256) { return p; }
   p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.surf = c.h;
   return p;
 }
@@ -803,21 +945,25 @@ fn pondNear(x : i32, z : i32, seed : u32) -> Shore {
 // MIRROR-END height
 
 // ---- trees ----
-// SCALE: one voxel is VOXEL_METERS = 6.25 cm, so there are 16 voxels to the
-// metre and the player capsule is 27 voxels tall. Every dimension below is
-// therefore written as METRES * VOX_PER_M, never as a bare voxel count — the
-// first cut of this system used bare counts and produced 10-voxel "oaks" that
-// were 60 cm tall, i.e. knee-high shrubs. If you tune these, tune the metres.
+// SCALE: every dimension below is written as DECIMETRES and converted with
+// `* VOX_PER_M / 10`, never as a bare voxel count — the first cut of this
+// system used bare counts and produced 10-voxel "oaks" that were 60 cm tall,
+// i.e. knee-high shrubs. If you tune these, tune the metres.
 //
-// Heights are held to roughly half real scale (a 12 m oak would be 190 voxels)
-// because the residency window is 256 voxels tall and does not stream in Y:
-// terrain tops out at y86, and a great oak there already pushes its crown
-// against the window ceiling; anything taller is beheaded. Crown radius,
-// being horizontal, is free to be generous.
-// These dimensions survived the third scale pass untouched — the world
-// halved around the trees, per the "trees were the one thing at a good size"
-// verdict. Their METRE sizes are the spec; don't scale them with HSCALE.
-const VOX_PER_M : i32 = 16;
+// VOX_PER_M IS THE WORLD'S OWN VOXELS-PER-METRE and nothing else. It was a
+// hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when
+// world.h moved to kVoxelMeters = 0.10. For that whole interval every tree in
+// the game was 1.6x the metre size its own table documents: the "11.9 m" great
+// oak was 190 voxels of trunk, i.e. 19 m, and TREE_MAX_ABOVE was 278 voxels
+// (18 chunks), which is where the terrain gate's `chunkColSlack` of 20 came
+// from. Reading it from the prelude constant makes the table's metres true
+// again and makes them STAY true at any voxel size.
+//
+// The old comment justified the mismatch as "half real scale, because the
+// window is 256 voxels tall and does not stream in Y". Both halves of that are
+// false now — kWorldN is 512 and Stream::ShiftAxis handles axis 1 — so the
+// constraint it was trading against does not exist.
+const VOX_PER_M : i32 = VOXELS_PER_M;
 
 // Placement is per TREE_TILE XZ tile: hash the tile, and it either holds one
 // tree or none. The tile has to be at least as wide as a canopy or trees
@@ -875,13 +1021,19 @@ const TREE_MAX_ABOVE : i32 =
               + 2 * (TREE_BIRCH_RAD_DM * VOX_PER_M / 10) + 2,
             TREE_PINE_TRUNK_DM * VOX_PER_M / 10
               + (24 + 4 * 2) * VOX_PER_M / 10 + 2));
-// A trunk only exists below the treeline, and the terrain band caps its ground
-// independently, so the highest ground any trunk can stand on is the smaller of
-// the two. Above TREE_MAX_BASE + TREE_MAX_ABOVE there is no tree anywhere in
-// the world, at any seed — one compare replaces the whole scan.
-const TREE_MAX_BASE : i32 = min(TUNE_TREELINE - 1,
-                                TUNE_BASE_HEIGHT + TUNE_HILL_AMPLITUDE +
-                                    TUNE_DETAIL_AMPLITUDE);
+// A trunk only exists below the treeline (treeInfoAt returns `present = false`
+// at or above it), so that is the highest ground any trunk can stand on and
+// above TREE_MAX_BASE + TREE_MAX_ABOVE there is no tree anywhere in the world,
+// at any seed — one compare replaces the whole scan.
+//
+// This USED to also min() against `baseHeight + hillAmplitude +
+// detailAmplitude`, the top of the terrain band. Package C's octave ladder has
+// no such closed-form ceiling (five centred octaves plus a sediment wedge), and
+// a bound that is too TIGHT shears canopies and moves the world hash. The
+// treeline alone is correct at any relief, and it is the tighter of the two
+// anyway in every configuration the ladder can produce. The hoisted path does
+// not use this at all — `cands.top` is strictly tighter still.
+const TREE_MAX_BASE : i32 = TUNE_TREELINE - 1;
 const TREE_MAX_TOP : i32 = TREE_MAX_BASE + TREE_MAX_ABOVE;
 
 // Per-tile tree descriptor, unpacked from one hash.
@@ -2224,6 +2376,7 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
 // evaluate one isolated cell.
 struct Col {
   h           : i32,         // ground height, after pool and pond carving
+  sed         : i32,         // loose wedge thickness at this column, 0 if none
   biome       : u32,
   pond        : i32,         // disc-pond water surface Y, or -1
   pw          : vec2<i32>,   // pondAt's (bowl floor, surface)
@@ -2259,6 +2412,7 @@ struct Col {
 // never be called in a per-voxel loop on either side.
 struct LandCol {
   h           : i32,         // GROUND. The contract above.
+  sed         : i32,         // loose wedge thickness INSIDE h, 0 where overridden
   pond        : i32,         // disc-pond water surface Y, or -1
   pw          : vec2<i32>,   // pondAt's (bowl floor, surface)
   fluid       : u32,         // standing fluid material at this column
@@ -2281,11 +2435,28 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
   // rather than through a second copy of the constant.
   if (T.labMode != 0u) {
     L.h = LAB_SLAB_Y;
+    L.sed = 0;
     L.inPoolFloor = true;
     L.inRim = true;
     return L;
   }
-  var h = baseHeight(x, z, seed);
+  // THE SEDIMENT WEDGE IS DECIDED BEFORE THE HEIGHT IS COMPOSED, which is why
+  // the disc tests below run before anything is added to `bed` rather than
+  // interleaved with it as they used to be.
+  //
+  // `land.h` is `bed + land.sed` and every authored override here either
+  // REPLACES the height (a pool floor, a bowl carve) or LIFTS it (a rim, a
+  // berm). A lift is a deliberate STEP against the neighbouring column, and a
+  // step is exactly where a powder wedge avalanches — so the wedge has to be
+  // gone from those columns, and gone from `h` too, not merely relabelled.
+  //
+  // AND IT HAS TO RAMP OUT, not switch off. Zeroing 24 voxels of sediment at
+  // the edge of a pond band builds a 24-voxel cliff there, which is worse than
+  // the thing it was avoiding. Measured: this block as a hard switch left 108
+  // chunks awake at tick 120 against 7 with the wedge disabled entirely, all of
+  // them tarn banks and the rock under them.
+  let land = landAt(x, z, seed);
+  let bed = land.h - land.sed;
 
   // ---- authored origin-area set pieces (absolute world coords) ----
   // Halved in the third scale pass (radii 136/64/48 -> 68/32/24): a swimmable
@@ -2304,31 +2475,66 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
   // origin region keeps its coordinates and simply occupies less ground at a
   // finer voxel; everything in it stays in the same place relative to
   // everything else.
-  let poolY = vlen(44);
+  // THE POOL FLOOR IS RELATIVE TO THE HOME PLAIN, not an absolute Y, and that
+  // is the line the datum move would otherwise have broken worst. It was a bare
+  // `vlen(44)` back when the terrain band was y32..y86; with the datum at y200
+  // the same literal put a 15 m crater with vertical walls at (420,420),
+  // reported by the `terrain` gate as a 143-voxel adjacent step and by the page
+  // table as 58 lost voxels' worth of matter avalanching down the inside of it.
+  //
+  // 15 below the plain, with a rim forced 26 above the floor, reproduces the
+  // relationship the old numbers had against the old band (floor 15 under the
+  // mean, rim 11 over it) at any datum.
+  let poolY = TUNE_SPAWN_PLAIN_Y - vlen(15);
   // Water lake at (420,420), ~8.5 m across
   let pdx = x - 420; let pdz = z - 420;
   let pd2 = pdx * pdx + pdz * pdz;
   let pR = vlen(68); let pRim = vlen(80);
+  // Oil pond at (260,300), ~4 m across
+  let odx = x - 260; let odz = z - 300;
+  let od2 = odx * odx + odz * odz;
+  let oR = vlen(32); let oRim = vlen(42);
+  // Lava pool at (220,520), ~3 m across
+  let ldx = x - 220; let ldz = z - 520;
+  let ld2 = ldx * ldx + ldz * ldz;
+  let lR = vlen(24); let lRim = vlen(34);
+  L.inPoolFloor = pd2 < pR * pR || od2 < oR * oR || ld2 < lR * lR;
+  L.inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
+
+  // ---- disc ponds, queried before the height is composed ----
+  // pondInfo's keep-out list excludes the pool areas, so a disc never overlaps
+  // a rim; the fluidTop<0 check below is belt-and-braces. `pondNear` is the one
+  // scan that serves BOTH the berm and the marsh fringe (genColumn narrows the
+  // same answer), and it is skipped inside a disc or an authored rim, where
+  // there is nothing outside to be near.
+  L.pw = pondAt(x, z, seed);
+  if (L.pw.y < 0 && !L.inRim) { L.near = pondNear(x, z, seed); }
+
+  // ---- the wedge, after everything that has to suppress it ----
+  // The pond band ramps rather than switches, over the same width `pondNear`
+  // scans, so the wedge thins to nothing as it reaches the water instead of
+  // ending in a wall of loose gravel above a bowl full of sand.
+  var sed = land.sed;
+  if (L.inRim || L.pw.y >= 0) {
+    sed = 0;
+  } else if (L.near.onShore) {
+    let band = max(max(TUNE_SHORE_BAND, TUNE_POND_BERM_WIDTH), 1);
+    sed = (sed * min(L.near.past, band)) / band;
+  }
+  var h = bed + sed;
+
   if (pd2 < pR * pR) {
     h = poolY;
     L.fluid = M_WATER; L.fluidTop = poolY + vlen(24);
   } else if (pd2 < pRim * pRim) {
     h = max(h, poolY + vlen(26));    // containment rim
   }
-  // Oil pond at (260,300), ~4 m across
-  let odx = x - 260; let odz = z - 300;
-  let od2 = odx * odx + odz * odz;
-  let oR = vlen(32); let oRim = vlen(42);
   if (od2 < oR * oR) {
     h = poolY + vlen(6);
     L.fluid = M_OIL; L.fluidTop = poolY + vlen(24);
   } else if (od2 < oRim * oRim) {
     h = max(h, poolY + vlen(26));
   }
-  // Lava pool at (220,520), ~3 m across
-  let ldx = x - 220; let ldz = z - 520;
-  let ld2 = ldx * ldx + ldz * ldz;
-  let lR = vlen(24); let lRim = vlen(34);
   if (ld2 < lR * lR) {
     h = poolY + vlen(2);
     L.fluid = M_LAVA; L.fluidTop = poolY + vlen(20);
@@ -2336,27 +2542,36 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
     h = max(h, poolY + vlen(22));
   }
 
-  L.inPoolFloor = pd2 < pR * pR || od2 < oR * oR || ld2 < lR * lR;
-  L.inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
-
-  // ---- disc ponds: carve the bowl inside, raise the berm outside ----
-  // pondInfo's keep-out list excludes the pool areas, so a disc never overlaps
-  // a rim; the fluidTop<0 check is belt-and-braces.
-  L.pw = pondAt(x, z, seed);
+  // ---- carve the bowl inside a disc, raise the berm outside ----
   if (L.pw.y >= 0) {
     L.pond = L.pw.y;
-    h = min(h, L.pw.x);                  // carve the bowl into the terrain
+    // THE BOWL REPLACES THE TERRAIN, it does not merely cut into it, and that
+    // is the difference between a bounded bed and an avalanche. As `min(h,
+    // floor)` the bowl described the floor only where the natural ground was
+    // higher; wherever the hillside or the grain octave dipped below it, the
+    // bed was raw terrain again — at whatever slope the noise happened to have
+    // — and genCellIn lays SAND on the top three voxels of it. Powder on
+    // arbitrary ground is the rule-2 failure that reports itself as `ca-skip`
+    // finding the world never quiet, and as page faults when the grains slide
+    // into a chunk that is still a sentinel.
+    //
+    // Assigned, the floor is exactly pondAt's parabola, whose steepest point is
+    // its rim at 2*(pondDepth - pondDepthRim)/r — a number LoadTuning already
+    // bounds under the angle of repose. So the bed is safe by construction at
+    // every seed and every radius, the way the authored pool floors have always
+    // been (`h = poolY`).
+    //
+    // On sloping ground this fills the downhill half as well as cutting the
+    // uphill one, which is what a dammed tarn IS; pondInfo's radius-aware gate
+    // above is what keeps the fill from becoming a wall.
+    h = L.pw.x;
     if (L.fluidTop < 0) { L.fluid = M_WATER; L.fluidTop = L.pw.y; }
-  } else if (!L.inRim) {
-    // Outside every disc: one scan for the berm AND the marsh fringe. The berm
-    // is unconditional (it is what contains the water — see the perched-tarn
-    // block), the fringe is genColumn's narrowing of the same answer.
-    L.near = pondNear(x, z, seed);
-    if (L.near.onShore && L.near.past < TUNE_POND_BERM_WIDTH) {
-      h = bermLift(h, L.near.surf, L.near.past);
-    }
+  } else if (!L.inRim && L.near.onShore &&
+             L.near.past < TUNE_POND_BERM_WIDTH) {
+    h = bermLift(h, L.near.surf, L.near.past);
   }
   L.h = h;
+  L.sed = sed;
   return L;
 }
 // MIRROR-END landheight
@@ -2383,6 +2598,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   if (T.labMode != 0u) {
     var lab : Col;
     lab.h = LAB_SLAB_Y;
+    lab.sed = 0;
     lab.biome = 0u;
     lab.pond = -1;
     lab.pw = vec2<i32>(-1, -1);
@@ -2439,6 +2655,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
 
   var col : Col;
   col.h = h;
+  col.sed = L.sed;
   col.biome = biome;
   col.pond = L.pond;
   col.pw = L.pw;
@@ -2476,6 +2693,7 @@ fn genCellIn(col : Col,
              trees : ptr<function, TreeCands>, treeValid : bool,
              x : i32, y : i32, z : i32, seed : u32) -> u32 {
   let h = col.h;
+  let sed = col.sed;
   let biome = col.biome;
   let pond = col.pond;
   let pw = col.pw;
@@ -2527,13 +2745,37 @@ fn genCellIn(col : Col,
       mat = M_SHORE_MUD;
     } else if (y == h) {
       mat = M_GRASS;                       // forest floor: one grass skin (SOLID)
+    } else if (y > h - sed && !onFixturePad(x, z)) {
+      // NOT ON A FIXTURE PAD. The pad keeps its authored loose SAND cap on
+      // purpose ("avalanches into repose piles"), but the four voxels under it
+      // have to stay solid: `settle-back` drops a body four voxels above the pad
+      // and waits for it to sleep, and a body resting on a stack that can creep
+      // all the way down never does. This is a MATERIAL-only exclusion — `h` is
+      // untouched, so World::TerrainHeight needs no matching branch and the
+      // height contract is unaffected.
+      // ---- THE SEDIMENT WEDGE: topsoil over gravel over bedrock ----
+      //
+      // This is the block whose earlier form was a bug, and the difference is
+      // one gate. The old version laid a CONSTANT 3-4 voxel dirt shell under
+      // the grass everywhere, on ground of any steepness; `dirt` is a POWDER,
+      // so on every slope it avalanched out from under its own skin, the whole
+      // surface crept, and chunks never slept. It was deleted, and the comment
+      // that replaced it said "no loose layer under the grass", full stop.
+      //
+      // What makes it safe now is that `sed` is SLOPE-GATED in landAt and ramps
+      // continuously to zero as the ground approaches the angle of repose. With
+      // a solid skin at y == h the topmost grain is at h-1, so it has a free
+      // down-diagonal only where a neighbouring column's ground is 3+ voxels
+      // lower — which is precisely the ground the gate has already taken the
+      // wedge to zero on. `worldgen.sedSlope` is the knob and 0 turns the
+      // feature off; `--gate sleep` is what proves the setting.
+      //
+      // Topsoil first because that is the order a soil profile has, and because
+      // gravel is what you want to hit when you dig a valley floor for
+      // something that flows.
+      if (y > h - 1 - TUNE_SED_TOPSOIL) { mat = M_DIRT; }
+      else { mat = M_GRAVEL; }
     } else {
-      // NOTE: no loose-dirt layer under the grass. `dirt` is a powder, and a
-      // 3-4 voxel powder shell under a solid skin avalanches out from under the
-      // grass on every slope the moment the world wakes — the whole surface
-      // creeps and chunks never sleep. Stone directly under the skin keeps the
-      // forest floor static; digging still exposes stone, and the `rubble`
-      // field turns grass into dirt when it IS broken.
       mat = M_STONE;
     }
     // depth is real now (no bedrock): caves carve the stone body, with lava

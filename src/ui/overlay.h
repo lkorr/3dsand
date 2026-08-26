@@ -73,6 +73,8 @@ struct UIState {
   // disagreeing is visible rather than inferred. Off by default and free when
   // off (the draw is skipped at zero boxes).
   bool showCollisionBoxes = false;
+  bool showDirtyChunks = false;
+  bool showDirtyVoxels = false;
   // Wind slope-field overlay (F4). An arrow per lattice point around the
   // camera, oriented and coloured by the SAME windAt() the grass sway samples
   // (docs/RESEARCH_wind.md §4.8) — which is what makes it evidence rather than

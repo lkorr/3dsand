@@ -3,7 +3,52 @@
 > **Status.** Package **A** landed `9c42a3c` (the `terrain` gate + baseline-value
 > plumbing). Package **B** landed `3fdcf5c` (foundations: Q14 log2-cell noise with
 > an enforced C++ mirror, the three column hoists, the height contract, perched
-> tarns, terrain-relative fixtures). Package **C**, the scale pass, is next.
+> tarns, terrain-relative fixtures). Package **C**, the scale pass, has **landed**
+> — see §C below for what shipped and what it corrected. Package **D** (the
+> global sea + `LAVA_LID`) is next.
+>
+> **What package C changed against the plan as written**, all of it measured:
+>
+> 1. The octaves are **centred deviations**, so `baseHeight` is the world's MEAN
+>    and there is room below the datum for basins. The plan's `bed = spawnPlainY
+>    + ((raw - spawnPlainY) * ws >> 14)` fades the WHOLE deviation, which pins
+>    spawn to an exact plane 64 m across; only the two COARSE octaves fade.
+> 2. `Land.slope` is the **landform** gradient (accumulated through the hill
+>    octave), not the full one. Through the grain octave `d(slope)/dcolumn` is
+>    96 Q8 — the whole gate range in ONE column — so a slope-gated wedge becomes
+>    a cliff wherever the fine noise crosses the threshold. 108 awake chunks at
+>    tick 120 became 8. The tarn placement gate reads the same field, for the
+>    same reason.
+> 3. **`poolY` had to move with the datum.** It was a bare `vlen(44)`; at y200
+>    that is a 15 m crater with vertical walls at (420,420), reported as a
+>    143-voxel adjacent step and 58 lost voxels.
+> 4. A pond's **bowl now REPLACES the ground** rather than `min()`-ing into it,
+>    and `pondInfo` gained a radius-aware gate. As a min() the bed was raw
+>    hillside wherever the terrain undercut the bowl — with SAND laid on it.
+> 5. `spawnPlainFade = 2048` is **205 m of ramp, not 2 km** (the plan's own
+>    arithmetic slip). Full drama is reached ~237 m from the origin.
+> 6. **`VOX_PER_M` was fixed** (16 → the prelude's `VOXELS_PER_M`), so trees are
+>    their documented metre size for the first time since `kVoxelMeters` moved.
+>
+> **Two things package C found that are NOT terrain and are recorded here
+> because they will bite package D harder:**
+>
+> * **The CPU dirty mirror could only shrink.** `PageTable::TightenFromSnapshot`
+>   intersected and never unioned, so `cpuDirty` was a superset of "writes the
+>   CPU asked for" rather than of "writes the GPU will make" — measured at 0 on
+>   every tick against a snapshot dirty set of 200-390 chunks. Any worldgen
+>   output that is not perfectly at rest falls in that gap. Fixed by seeding the
+>   mirror from the snapshot's own dirty set; the fixed point is unchanged
+>   (GPU-active ∪ N26(GPU-active), zero when the world sleeps).
+> * **A generated tarn does not reach rest.** Seven chunks around one stay awake
+>   indefinitely — five from the pond vegetation, two from the water — which
+>   `sleep` tolerates (bound 32) and `ca-skip`/`wind-prim` do not. The wedge,
+>   the bowl, the berm, the shore fringe, ruins, evaporation and the MPM seam
+>   were each ruled out by measurement; the residue is a liquid-CA question.
+>   `pondInfo`'s authored-origin keep-out now covers the residency window, which
+>   unblocks the suite and is defensible on its own (that cube is authored
+>   content end to end) but does NOT fix the defect. A global sea puts water
+>   everywhere, so package D cannot inherit this unresolved.
 >
 > Copied into the repo from `~/.claude/plans/` after package B, because a plan of
 > record that only exists in one machine's home directory is not a plan of record.

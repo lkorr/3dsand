@@ -545,7 +545,36 @@ void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
       for (uint32_t s : e.slots) snap.Add(s);
 
   const size_t before = cpuDirty_.Size();
+  // ---- THE MIRROR HAS TO BE ABLE TO GROW ----------------------------------
+  //
+  // The intersection below is the TIGHTNESS argument and it is right: both
+  // operands are supersets of dirtyIn(M), so their intersection is too. What it
+  // is not is a way to LEARN. Every other contributor (opTargets, particles,
+  // fluid, refills, the flight shell) is something the CPU itself caused, so a
+  // mirror that starts empty and can only shrink is a superset of "writes the
+  // CPU asked for" — not of "writes the GPU will make".
+  //
+  // Those differ whenever the GPU is running activity the CPU never declared,
+  // and the loudest source of that is WORLDGEN: a generated world that is not
+  // perfectly at rest wakes hundreds of chunks the CPU has no record of.
+  // Measured on the `terrain` gate after the scale pass: `cpuDirty=0` on every
+  // tick against a snapshot dirty set of 200-390 chunks, for the whole 120-tick
+  // settle. Nothing outside worldgen's own residency was materialized, and the
+  // one write that crossed into a chunk worldgen had left as a JITTER(stone)
+  // sentinel — a tarn's water staining the rock behind its bank, `water`'s
+  // stain rule at 260 per-mille — was dropped 58 times and never landed,
+  // because a lost write leaves the chunk uniform, so it is never made
+  // non-uniform, so it is never materialized. A closed loop.
+  //
+  // `snap` IS dirtyFlags(S) rolled forward to M and unioned with the C-ring, so
+  // it is exactly the superset this needs and it is already computed. Unioning
+  // it in makes the mirror what its name says. It cannot dilate without bound:
+  // the next tick's tightening intersects against the next snapshot, so the
+  // fixed point is (GPU-active) u N26(GPU-active) — the same shape the particle
+  // flight shell already settles at, and zero when the world is asleep, which
+  // is the state rule 2 keeps it in.
   cpuDirty_.IntersectWith(snap);
+  cpuDirty_.UnionWith(snap);
   if (getenv("SANDVOX_PT_DEBUG"))
     std::printf("[pt] tick %u tighten from snap %u (%u rolls): %zu -> %zu "
                 "(snap set %zu)\n",

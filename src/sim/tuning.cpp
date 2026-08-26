@@ -1671,10 +1671,33 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     };
     ReadWgLen(*g, "treeline", w.treeline, out, at);
     ReadWgLen(*g, "baseHeight", w.baseHeight, out, at);
+    // The octave ladder. Amplitudes are LENGTHS and cells are LOG2 CELLS, so a
+    // voxel-size change moves both together and the A/W ratio — the only thing
+    // the CA's angle of repose cares about — is invariant by construction.
+    ReadWgLen(*g, "contAmplitude", w.contAmplitude, out, at);
+    ReadWgCellLog2(*g, "contLog2", w.contLog2, out, at);
+    ReadWgLen(*g, "rangeAmplitude", w.rangeAmplitude, out, at);
+    ReadWgCellLog2(*g, "rangeLog2", w.rangeLog2, out, at);
     ReadWgLen(*g, "hillAmplitude", w.hillAmplitude, out, at);
     ReadWgCellLog2(*g, "hillLog2", w.hillLog2, out, at);
     ReadWgLen(*g, "detailAmplitude", w.detailAmplitude, out, at);
     ReadWgCellLog2(*g, "detailLog2", w.detailLog2, out, at);
+    ReadWgLen(*g, "grainAmplitude", w.grainAmplitude, out, at);
+    ReadWgCellLog2(*g, "grainLog2", w.grainLog2, out, at);
+    // A GRADIENT IS DIMENSIONLESS and so is the attenuation strength that
+    // divides by one — no scaling, at any voxel size. Same reason pondMaxSlope
+    // and sedSlope below are counts.
+    ReadWgCount(*g, "fbmAtten", w.fbmAtten, out, at);
+    ReadWgLen(*g, "spawnPlainY", w.spawnPlainY, out, at);
+    ReadWgLen(*g, "spawnPlainR", w.spawnPlainR, out, at);
+    ReadWgLen(*g, "spawnPlainFade", w.spawnPlainFade, out, at);
+    ReadWgLen(*g, "sedCeil", w.sedCeil, out, at);
+    // sedFraction is a Q8 RATIO of two heights, so it too is dimensionless.
+    ReadWgCount(*g, "sedFraction", w.sedFraction, out, at);
+    ReadWgLen(*g, "sedStrip", w.sedStrip, out, at);
+    ReadWgCount(*g, "sedSlope", w.sedSlope, out, at);
+    ReadWgLen(*g, "sedMax", w.sedMax, out, at);
+    ReadWgLen(*g, "sedTopsoil", w.sedTopsoil, out, at);
     ReadWgCellLog2(*g, "biomeLog2", w.biomeLog2, out, at);
     ReadWgCount(*g, "desertThreshold", w.desertThreshold, out, at);
     ReadWgCount(*g, "pineThreshold", w.pineThreshold, out, at);
@@ -1753,9 +1776,62 @@ bool LoadTuning(const std::string& path, Tuning& out) {
         v = v < 3 ? 3 : 15;
       }
     };
+    log2Range("contLog2", w.contLog2);
+    log2Range("rangeLog2", w.rangeLog2);
     log2Range("hillLog2", w.hillLog2);
     log2Range("detailLog2", w.detailLog2);
+    log2Range("grainLog2", w.grainLog2);
     log2Range("biomeLog2", w.biomeLog2);
+    // ---- the octave ladder's own bounds ---------------------------------
+    // Amplitudes are FULL swings and the field is centred, so a negative one is
+    // meaningless rather than mirror-flipping.
+    for (auto* a : {&w.contAmplitude, &w.rangeAmplitude, &w.hillAmplitude,
+                    &w.detailAmplitude, &w.grainAmplitude}) {
+      if (*a < 0) { *a = 0; }
+    }
+    // fbmAtten multiplies |g|^2 (which reaches ~2^20 in Q8 on the steepest
+    // ridge) before the divide; above 256 that product starts eating the i32
+    // headroom for no further flattening, and the plan's ceiling is 256.
+    if (w.fbmAtten < 0 || w.fbmAtten > 256) {
+      out.warnings.push_back(
+          "worldgen.fbmAtten is a Q8 strength and must be 0..256 (0 = plain "
+          "fBm, 256 = iq's 1/(1+|g|^2)); clamped");
+      w.fbmAtten = w.fbmAtten < 0 ? 0 : 256;
+    }
+    // A fade of 0 would divide by zero in landAt and, worse, would make the
+    // home area's boundary a STEP of the full coarse relief — the exact cliff
+    // the `terrain` gate's A4 exists to catch. 1 is legal and means "no home
+    // area" only in the limit; the useful floor is a real distance.
+    atLeast("spawnPlainFade", w.spawnPlainFade, 1);
+    if (w.spawnPlainR < 0) { w.spawnPlainR = 0; }
+    // ---- the sediment wedge ---------------------------------------------
+    // sedSlope 0 is the OFF switch (max(0, 0 - slope) is 0 everywhere), which
+    // is what makes --sweep worldgen.sedSlope=0,96 a one-invocation proof that
+    // the knob reaches the kernel. Negatives are the same thing spelled wrong.
+    if (w.sedSlope < 0) { w.sedSlope = 0; }
+    if (w.sedFraction < 0) { w.sedFraction = 0; }
+    if (w.sedStrip < 0) { w.sedStrip = 0; }
+    if (w.sedMax < 0) { w.sedMax = 0; }
+    if (w.sedTopsoil < 0) { w.sedTopsoil = 0; }
+    // THE CAVE SHELL. caveBands caps the near-surface cavern ceiling at h - 40
+    // (a shader literal scaled by vlen), so a wedge thicker than that would be
+    // undercut by a cavern and drop a column of loose powder into it — matter
+    // in motion at generation time, i.e. a rule-2 failure that reports itself
+    // as `ca-skip` finding the world never quiet, three gates away.
+    {
+      const int shell = scaleLen(36);
+      if (w.sedMax > shell) {
+        out.warnings.push_back(
+            "worldgen.sedMax " + std::to_string(w.sedMax) + " reaches into "
+            "caveBands' " + std::to_string(scaleLen(40)) + "-voxel cave shell; "
+            "clamped to " + std::to_string(shell));
+        w.sedMax = shell;
+      }
+    }
+    // The topsoil layer cannot be thicker than the wedge that holds it; past
+    // that the `gravel` half of the stack simply never appears, which is a
+    // silently different world rather than an error.
+    if (w.sedTopsoil > w.sedMax) { w.sedTopsoil = w.sedMax; }
     // treeCandsInto keeps at most TREE_CAND_MAX = 9 candidate tiles per column,
     // and that 9 is DERIVED: a site sits in the middle half of its tile, so the
     // tiles whose sites can reach within TREE_MAX_REACH (124) of a column span
