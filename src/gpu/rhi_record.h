@@ -35,6 +35,10 @@ struct TableCtx {
   uint32_t farCount = 0;
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
+  // Chunk slots this tick's wind primitives want dirty-marked
+  // (docs/RESEARCH_wind.md §4.3). Zero on every tick of a world with no fan in
+  // it, which is what skips the windWake row entirely.
+  uint32_t windWakeCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged (PLAN_page_table.md §3.5c).

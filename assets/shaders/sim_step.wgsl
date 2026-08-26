@@ -1224,9 +1224,13 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
 //
 //   * ENTRAINMENT unlocks a move for a SETTLED grain when the wind on one axis
 //     beats that material's authored friction. That is saltation, and it is
-//     what makes a fan blow a sand pile flat. It is gated one step further out
-//     (WIND_MODE_ENTRAIN) because it is the one mechanism here that is not
-//     rule-2 clean on its own — see kWindModeEntrain in world.h.
+//     what makes a fan blow a sand pile flat. It needs a LICENCE, because it is
+//     the one mechanism here that is not rule-2 clean on its own and the one
+//     rule in the engine that makes resting matter move — which is a property
+//     the page table's materialization set quietly depends on NOT happening
+//     (RESEARCH_wind.md §10). The licence is a wind primitive's declared,
+//     budgeted, CPU-known footprint; the global WIND_MODE_ENTRAIN is the same
+//     rule with the licence removed, and it ships off. See the call site.
 //
 // LIQUIDS ARE DELIBERATELY EXCLUDED from both. They move by mass transfer
 // through stepLiquid, not by the direction rotation these hook into, and what
@@ -1679,10 +1683,29 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   //    Reaching here at all means the chunk was already awake. The ambient
   //    field cannot wake it (invariant 3) — but a grain that DOES hop marks its
   //    chunk through the ordinary tryMove path and so keeps it awake, which is
-  //    why this step is gated one notch further out than the drift bias. See
-  //    kWindModeEntrain in world.h.
-  if (T.windMode >= WIND_MODE_ENTRAIN && P.substep == 0u &&
-      m.klass == CLASS_POWDER) {
+  //    why the LICENCE below is required rather than assumed.
+  //
+  //    TWO WAYS TO HOLD THAT LICENCE, and the difference between them is the
+  //    whole of RESEARCH_wind.md §10:
+  //
+  //      * inside a wind PRIMITIVE that declared kWindPrimEntrain. Its
+  //        footprint was dirty-marked through the mutation path this tick, so
+  //        those chunks are CPU-known, materialized with their 26-ring, and
+  //        charged against a per-tick budget BEFORE the dispatch that writes
+  //        them. This is the shipping path, and it is the one that makes a fan
+  //        blow a sand pile flat without losing grains.
+  //      * sim.windMode >= 2, which is the same rule with no footprint and no
+  //        budget: ANY settled powder anywhere may be pulled loose by the
+  //        ambient field. It is not rule-2 clean and it is not page-table safe
+  //        (62 reproducible faults over two 160-tick runs), so it ships off and
+  //        exists to be looked at. See kWindModeEntrain in world.h.
+  //
+  //    Order matters for cost, not for correctness: the mode compare is free
+  //    and the footprint test walks the primitive list, so the cheap one goes
+  //    first and a world with no primitives never reaches the loop.
+  if (T.windMode >= WIND_MODE_DRIFT && P.substep == 0u &&
+      m.klass == CLASS_POWDER &&
+      (T.windMode >= WIND_MODE_ENTRAIN || windPrimEntrainsQ(c, T))) {
     if (windEntrain(c, w, m, slotIdx)) { return; }
   }
   // Nothing to do: cell settles. If the whole chunk settles, nothing marks it

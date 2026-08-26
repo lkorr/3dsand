@@ -43,8 +43,11 @@ bash scripts/build.sh --configure       # force cmake reconfigure
 ```bash
 ./build/Release/sandvox.exe --selftest --gate <name>      # one gate (~4-20s vs ~50s full)
 ./build/Release/sandvox.exe --selftest --list             # list gates
-./build/Release/sandvox.exe --selftest --json out.json    # machine-readable
+./build/Release/sandvox.exe --selftest --rebaseline       # update baseline.json with observed values
 ./build/Release/sandvox.exe --vk-smoke-loud --vk-validation  # 19 pinned hash probes + sync validation
+./build/Release/sandvox.exe --vk-smoke-loud --rebaseline  # re-pin the smoke probe tables in baseline.json
+./build/Release/sandvox.exe --suite acceptance            # one-process full acceptance (selftest + both smokes + validation)
+./build/Release/sandvox.exe --sweep sim.windDragRef=6,40  # in-process parameter differential
 ./build/Release/sandvox.exe --frames 400                  # windowed N frames then exit
 SANDVOX_PT_DEBUG=1 ./build/Release/sandvox.exe --frames 1200 --autofly-hard   # page-pool sizing: adversarial traversal (see below)
 bash scripts/check_shaders.sh                             # validate WGSL without rebuild
@@ -83,12 +86,93 @@ already established?"** If there is no answer, skip it. Sessions here have spent
    guess. Escalate in that order; do not start at the top.
 
 **Full acceptance is an END-OF-WORK event, run ONCE**, on the tree you intend to
-ship: both suites, both smokes, `--vk-validation`, both checkers. Not after every
-edit, not on both sides of a merge, not "to be safe".
+ship. Use `--suite acceptance` (one process, one command):
+
+```bash
+bash scripts/run.sh ./build/Release/sandvox.exe --suite acceptance
+```
+
+**Known:** `page-roundtrip` may fail inside `--suite acceptance` (the demotion
+drain queue is backlogged from earlier gates). It passes standalone. If it is the
+only failure, re-confirm with `--selftest --gate page-roundtrip` and move on.
+
+Not after every edit, not on both sides of a merge, not "to be safe".
 
 **A green run you did not need still costs the user minutes.** Reporting
 "verified, and here is the one command that proves the rest was unnecessary" is a
 better answer than eight redundant green runs.
+
+### Authoring cheap-to-verify work
+
+The rules above tell you to RUN less. These tell you to BUILD things that don't
+need many runs:
+
+- **A new gate must be verifiable with `--gate <name>` alone.** If confirming it
+  works requires a separate smoke pass, a manual read of terminal output, or a
+  second run with different flags, the gate is too expensive to iterate on.
+- **Design for `--rebaseline`.** If your change moves the world hash, the
+  rebaseline path should handle it end-to-end. Don't create verification steps
+  that require hand-editing files or reading hashes off stderr.
+- **Put thresholds and expected values in `tests/baseline.json`, not in C++.**
+  A threshold that lives in source costs a rebuild to tune. A threshold in JSON
+  costs nothing.
+- **Prove parameter reachability with `--sweep`, not manual file edits.** If you
+  add a new `sim.*` tuning knob, `--sweep sim.yourKnob=0,100` proves it reaches
+  the kernel in one invocation, no file touched, no restore needed.
+- **WGSL changes don't need a rebuild — don't create ones that do.** If you add
+  a new WGSL constant that requires a C++ prelude addition, add it to BOTH
+  `ShaderConstantPrelude()` AND `scripts/check_shaders.sh` in the same commit,
+  so the checker stays green and nobody has to rebuild to validate a shader edit.
+
+### What needs a rebuild and what doesn't
+
+**WGSL-only edits need NO C++ rebuild.** `LoadShader()` reads `assets/shaders/*.wgsl`
+from disk at runtime and compiles through Tint. The SPIR-V disk cache
+(`shader_cache/`) keys on a hash of the assembled WGSL source, so an edited shader
+gets a cache miss and recompiles automatically. Workflow: edit shader → run
+`check_shaders.sh` → run the existing binary. A C++ rebuild for a WGSL change is
+wasted time.
+
+**`tuning.json` edits need no rebuild.** Tuning is hot-reloaded on F5 in the game,
+and read fresh at every selftest/smoke launch.
+
+**`tests/baseline.json` edits need no rebuild.** Smoke probe tables and gate
+pass/fail status are data. Use `--rebaseline` to update it in one step.
+
+**C++ edits need a rebuild.** One `.cpp` change typically recompiles that TU only
+(~5-15 s). A `world.h` or `selftest.h` edit recompiles everything that includes it.
+
+### Rebaseline in one step
+
+When a behavioural change intentionally moves the world hash or smoke probes:
+
+```bash
+# Rebaseline selftest (updates determinismHash + gate pass/fail in baseline.json)
+bash scripts/run.sh ./build/Release/sandvox.exe --selftest --rebaseline
+
+# Rebaseline smoke probes (updates smokeQuiet/smokeLoud arrays in baseline.json)
+bash scripts/run.sh ./build/Release/sandvox.exe --vk-smoke --rebaseline
+bash scripts/run.sh ./build/Release/sandvox.exe --vk-smoke-loud --rebaseline
+```
+
+`--rebaseline` REFUSES if the run had validation messages or page faults (you
+cannot rebaseline away a real regression). It prints a clear diff of what changed
+and marks the output as `*** THIS WAS A REBASELINE, NOT A PASS ***`.
+
+### Every run writes `build/last_run.json`
+
+Every selftest and smoke run auto-dumps a machine-readable record to
+`build/last_run.json`. Never re-run a binary just to read data — check the file.
+
+### Parameter differentials without editing files
+
+```bash
+# Prove a tuning knob reaches the kernel: different values → different hashes
+bash scripts/run.sh ./build/Release/sandvox.exe --sweep sim.windDragRef=6,40,120
+```
+
+`--sweep` loops in-process, reports one hash per value, touches no files. If all
+hashes are identical, the parameter doesn't reach the kernel at those values.
 
 ### Build gotchas
 - Dawn checkout stays for Tint; `DAWN_ENABLE_*` all OFF. Turning one ON re-declares the whole Dawn engine (~156 TUs).

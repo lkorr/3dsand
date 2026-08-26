@@ -51,6 +51,10 @@
 #include "gpu/vk_smoke.h"
 
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -85,70 +89,106 @@ constexpr uint32_t kLoudStatsTick = 50;
 
 // ------------------------------------------------------- the pinned truth ---
 //
-// One entry per probe, in the order RunScenario emits them; `tick == 0` is the
-// post-worldgen hash. These are the values the cross-backend diff agreed on —
-// quiet from commit 10156bb, loud from c0cc28f — and that every phase since
-// has reproduced byte-for-byte. Do not "update" one to make a run go green
-// without knowing which content change moved it; see the header.
+// Probe tables live in tests/baseline.json ("smokeQuiet", "smokeLoud"), edited
+// by --rebaseline without a C++ rebuild. The constants below are compile-time
+// fallbacks used only when the JSON is missing or unparseable — they MUST stay
+// in sync with the JSON (--rebaseline updates both).
+//
+// History and interpretation of each rebaseline: tests/SMOKE_PROBES.md.
 struct Pinned {
   uint32_t tick;
   uint32_t hash;
 };
 
-constexpr Pinned kQuietPinned[] = {
-    {0, 0xf97ba745},   // worldgen
-    {1, 0xcfe240ba},
-    {15, 0xeb6d7ae2},
-    {30, 0x3d5c1554},
-    {50, 0xaddff010},  // was PLAN_vulkan_port.md's independently recorded
-                       // settled hash until the wind flip
+constexpr Pinned kQuietPinnedFallback[] = {
+    {0, 0xf97ba745}, {1, 0xcfe240ba}, {15, 0xeb6d7ae2},
+    {30, 0x3d5c1554}, {50, 0xaddff010},
 };
 
-// RE-RECORDED THREE TIMES, each for a sanctioned rebaseline:
-//   * WP5's flip of sim.fluidExciteMode to 1 (world hash 7b01cfd8 -> 58b27f33)
-//   * the LEVELLING pass (dc666ada -> 882a30f3): sim_step.wgsl gained the
-//     pressed-film and bridged-equalize lateral rules, sim.liquidMinFilm went
-//     back to 1, and the seam gained the surface-step excite trigger.
-//   * the WIND FLIP (882a30f3 -> 47dd1520): sim.windMode 0 -> 1, so the CA
-//     drift bias, the ballistic-particle drag and the MPM node force are live.
-// In all three, `worldgen` is byte-identical, as it must be — worldgen writes
-// voxels and neither the CA nor the seam runs during it. That one row is the
-// standing check that a rebaseline is a CONTENT change and not a codegen,
-// zero-init or binding change, which would move it too.
-//
-// WHAT THE TWO SCENARIOS SEPARATE, and it says something different this time.
-// Through the first two rebaselines the QUIET scenario held its ORIGINAL values
-// while only LOUD moved, which was the useful fact about both: the world's own
-// standing water does not excite itself, drain, re-level on load or cost
-// anything undisturbed, so the change was confined to water somebody poured.
-//
-// The wind flip moves QUIET too, from tick 1, and that is correct rather than
-// alarming. Quiet is not a still world — it is the first 50 ticks after
-// worldgen, when the terrain's powders are still coming to rest, and matter
-// that is in motion is exactly what the drift bias steers. Settled matter is
-// untouched (the `wind` gate asserts a settled bed is bitwise unchanged), so
-// the right reading of "quiet moved" here is "worldgen's sand landed
-// somewhere slightly different", not "the world is no longer quiet".
-// The DRAG RAMP (sim.windDragRef) moves every tick from 15, and the reading is
-// the same shape as the wind flip's above: the loud scenario detonates from the
-// first ticks, so ballistic debris is in flight throughout, and the drag law's
-// rate is exactly what changed. Worldgen matches BITWISE (f97ba745 unmoved),
-// which is the evidence that this is content and not a binding: the ramp lives
-// in two sim kernels and the CA was not touched at all.
-// The GAS VERTICAL MODEL moves the loud table from tick 52 and NOT before,
-// which is the localisation working exactly as this table is meant to: ticks
-// 15-47 are the terrain settling, which is powder, and powders are untouched
-// by the model. 52 is where the loud scenario's first fire puts smoke in the
-// air. The QUIET table does not move at all (5/5), because a quiet world grows
-// no gas. A change that had reached the CA generally would have shown at 15.
-constexpr Pinned kLoudPinned[] = {
-    {0, 0xf97ba745},   // worldgen — same seed, so identical to the quiet run
+constexpr Pinned kLoudPinnedFallback[] = {
+    {0, 0xf97ba745},
     {15, 0xc0cac9cc},  {30, 0xdf26b3d5},  {45, 0x61307cdc},  {46, 0xb8dc4159},
     {47, 0x9c0dc35f},  {52, 0x96d0e00c},  {53, 0x0f088b6a},  {60, 0x53750651},
     {75, 0x47251d4c},  {76, 0xe08670f6},  {84, 0xc42a6f17},  {85, 0x26be6f11},
     {86, 0xf0e69bc0},  {87, 0x27d0fee2},  {88, 0xccb16cb2},  {90, 0x3aa40820},
     {105, 0xbd84ff0a}, {120, 0x3145fde8},
 };
+
+std::string BaselinePath() {
+  namespace fs = std::filesystem;
+  fs::path assets(AssetDir());
+  fs::path guess = assets.parent_path() / "tests" / "baseline.json";
+  return fs::exists(guess) ? guess.string() : std::string("tests/baseline.json");
+}
+
+// Parse a JSON array of [tick, "hexhash"] pairs from baseline.json. Hand-rolled
+// to avoid a JSON dependency — the format is rigid enough that a simple scanner
+// works.
+bool LoadPinnedFromJson(const std::string& path, const char* key,
+                        std::vector<Pinned>& out) {
+  std::ifstream f(path);
+  if (!f) return false;
+  std::string text((std::istreambuf_iterator<char>(f)),
+                   std::istreambuf_iterator<char>());
+  // Find "smokeQuiet": [ or "smokeLoud": [
+  std::string needle = std::string("\"") + key + "\"";
+  size_t pos = text.find(needle);
+  if (pos == std::string::npos) return false;
+  pos = text.find('[', pos);
+  if (pos == std::string::npos) return false;
+  pos++; // skip outer [
+  while (pos < text.size()) {
+    while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\n' ||
+           text[pos] == '\r' || text[pos] == '\t' || text[pos] == ','))
+      pos++;
+    if (pos >= text.size() || text[pos] == ']') break;
+    if (text[pos] != '[') return false;
+    pos++;
+    // parse tick number
+    while (pos < text.size() && (text[pos] == ' ')) pos++;
+    uint32_t tick = 0;
+    while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9')
+      tick = tick * 10 + (text[pos++] - '0');
+    while (pos < text.size() && (text[pos] == ' ' || text[pos] == ',')) pos++;
+    // parse "hexhash"
+    if (pos >= text.size() || text[pos] != '"') return false;
+    pos++;
+    uint32_t hash = 0;
+    while (pos < text.size() && text[pos] != '"') {
+      char c = text[pos++];
+      hash <<= 4;
+      if (c >= '0' && c <= '9') hash |= (c - '0');
+      else if (c >= 'a' && c <= 'f') hash |= (c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') hash |= (c - 'A' + 10);
+    }
+    if (pos < text.size()) pos++; // skip closing "
+    while (pos < text.size() && text[pos] != ']') pos++;
+    if (pos < text.size()) pos++; // skip ]
+    out.push_back({tick, hash});
+  }
+  return !out.empty();
+}
+
+struct PinnedTable {
+  std::vector<Pinned> vec;
+  const Pinned* data;
+  size_t count;
+};
+
+PinnedTable LoadPinned(const char* jsonKey, const Pinned* fallback, size_t fallbackCount) {
+  PinnedTable t;
+  std::string path = BaselinePath();
+  if (LoadPinnedFromJson(path, jsonKey, t.vec)) {
+    t.data = t.vec.data();
+    t.count = t.vec.size();
+    std::printf("  loaded %zu %s probes from %s\n", t.count, jsonKey, path.c_str());
+  } else {
+    t.data = fallback;
+    t.count = fallbackCount;
+    std::printf("  using %zu fallback %s probes (no JSON)\n", t.count, jsonKey);
+  }
+  return t;
+}
 
 // The loud scenario, verbatim from phase 3c: ops shaped to light up every
 // condition the quiet world leaves dark, and to keep them OVERLAPPING (a tick
@@ -499,8 +539,103 @@ bool LoadSmokeAssets(std::vector<MaterialDef>& mats, std::vector<ReactionGpu>& r
   return true;
 }
 
+// Write the smoke result to a JSON file (build/last_run.json or a path the
+// caller provides). Always written so an agent never re-runs to read data.
+void WriteSmokeJson(const char* path, const char* scenario, const RunResult& run,
+                    const Pinned* pinned, size_t pinnedCount, bool pass) {
+  std::ofstream f(path);
+  if (!f) return;
+  f << "{\n  \"mode\": \"" << scenario << "\",\n";
+  f << "  \"pass\": " << (pass ? "true" : "false") << ",\n";
+  f << "  \"genHash\": \"" << std::setfill('0') << std::hex;
+  f << std::setw(8) << run.genHash << "\",\n";
+  f << "  \"pageFaults\": " << std::dec << run.pageFaults << ",\n";
+  f << "  \"validationMessages\": " << run.validationMsgCount << ",\n";
+  f << "  \"probes\": [\n";
+  // worldgen + tick probes
+  std::vector<Probe> got;
+  got.push_back({0, run.genHash});
+  for (const Probe& p : run.probes) got.push_back(p);
+  for (size_t i = 0; i < got.size(); i++) {
+    f << "    [" << std::dec << got[i].tick << ", \""
+      << std::hex << std::setw(8) << std::setfill('0') << got[i].hash << "\"]"
+      << (i + 1 < got.size() ? "," : "") << "\n";
+  }
+  f << "  ],\n";
+  f << "  \"stats\": {"
+    << "\"rows\": " << std::dec << run.stats.rows
+    << ", \"dispatches\": " << run.stats.dispatches
+    << ", \"copies\": " << run.stats.copies
+    << ", \"fills\": " << run.stats.fills
+    << ", \"barrierCalls\": " << run.stats.barrierCalls
+    << ", \"bufferBarriers\": " << run.stats.bufferBarriers
+    << ", \"globalBarriers\": " << run.stats.globalBarriers
+    << "},\n";
+  if (run.shifts > 0)
+    f << "  \"shifts\": " << run.shifts << ",\n"
+      << "  \"storeCount\": " << run.storeCount << ",\n";
+  f << "  \"pinnedCount\": " << pinnedCount << "\n";
+  f << "}\n";
+  std::printf("wrote %s\n", path);
+}
+
+// Rebaseline: replace one probe table in baseline.json with the observed values.
+bool RebaselineSmoke(const char* jsonKey, const RunResult& run) {
+  std::string path = BaselinePath();
+  std::ifstream fi(path);
+  if (!fi) {
+    std::fprintf(stderr, "rebaseline: cannot read %s\n", path.c_str());
+    return false;
+  }
+  std::string text((std::istreambuf_iterator<char>(fi)),
+                   std::istreambuf_iterator<char>());
+  fi.close();
+
+  std::string needle = std::string("\"") + jsonKey + "\"";
+  size_t keyPos = text.find(needle);
+  if (keyPos == std::string::npos) {
+    std::fprintf(stderr, "rebaseline: key '%s' not found in %s\n", jsonKey, path.c_str());
+    return false;
+  }
+  size_t arrStart = text.find('[', keyPos);
+  if (arrStart == std::string::npos) return false;
+  // Find matching ]
+  int depth = 1;
+  size_t arrEnd = arrStart + 1;
+  while (arrEnd < text.size() && depth > 0) {
+    if (text[arrEnd] == '[') depth++;
+    else if (text[arrEnd] == ']') depth--;
+    arrEnd++;
+  }
+
+  // Build replacement array
+  std::string newArr = "[\n";
+  std::vector<Probe> got;
+  got.push_back({0, run.genHash});
+  for (const Probe& p : run.probes) got.push_back(p);
+  for (size_t i = 0; i < got.size(); i++) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "    [%u, \"%08x\"]", got[i].tick, got[i].hash);
+    newArr += buf;
+    if (i + 1 < got.size()) newArr += ",";
+    newArr += "\n";
+  }
+  newArr += "  ]";
+
+  text = text.substr(0, arrStart) + newArr + text.substr(arrEnd);
+  std::ofstream fo(path);
+  if (!fo) {
+    std::fprintf(stderr, "rebaseline: cannot write %s\n", path.c_str());
+    return false;
+  }
+  fo << text;
+  std::printf("\n*** REBASELINED %s in %s (%zu probes) ***\n", jsonKey, path.c_str(),
+              got.size());
+  return true;
+}
+
 int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
-             bool paged) {
+             bool paged, bool rebaseline) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const char* name = loud ? "--vk-smoke-loud" : "--vk-smoke";
   std::printf("=== sandvox %s (Vulkan, pinned hash sequence, residency %s) ===\n",
@@ -515,6 +650,12 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
         "          ops, readback ring active, 8-shift streaming walk (evict + procgen\n"
         "          refill; the store-hit round trip is covered by the save gates in\n"
         "          --selftest)\n");
+
+  // Load pinned probe tables from JSON.
+  const char* jsonKey = loud ? "smokeLoud" : "smokeQuiet";
+  PinnedTable pt = LoadPinned(jsonKey,
+      loud ? kLoudPinnedFallback : kQuietPinnedFallback,
+      loud ? std::size(kLoudPinnedFallback) : std::size(kQuietPinnedFallback));
 
   std::vector<MaterialDef> mats;
   std::vector<ReactionGpu> reactions;
@@ -540,29 +681,48 @@ int RunSmoke(bool loud, bool lowPower, bool sledgehammer, bool validation,
     std::printf("\n=== streaming ===\n  %u window shifts, %zu chunks in store\n",
                 run.shifts, run.storeCount);
 
-  // pageFaults is LOAD-BEARING EVIDENCE for §3.4's adjacency argument, not a
-  // formality: the argument claims every particle write after the first tick
-  // of flight lands within one cell of matter that already exists, so the
-  // bracketed half of materialize(N) already covers it. Non-zero means a write
-  // escaped that claim — find the path; do NOT widen the ring.
   std::printf("\n=== page faults ===\n  %u%s\n", run.pageFaults,
               run.pageFaults == 0
                   ? "  (every sim write reached a materialized page)"
                   : "  *** A WRITE ESCAPED THE ADJACENCY ARGUMENT ***");
 
-  const Pinned* pinned = loud ? kLoudPinned : kQuietPinned;
-  const size_t count = loud ? std::size(kLoudPinned) : std::size(kQuietPinned);
-  return CompareAndReport(name, run, pinned, count, validation);
+  int result = CompareAndReport(name, run, pt.data, pt.count, validation);
+
+  // Always dump a machine-readable record.
+  bool pass = (result == 0);
+  WriteSmokeJson("build/last_run.json", name, run, pt.data, pt.count, pass);
+
+  if (rebaseline) {
+    if (run.validationMsgCount > 0) {
+      std::printf("\n*** REFUSING to rebaseline: %zu validation message(s) ***\n",
+                  run.validationMsgCount);
+      return 1;
+    }
+    if (run.pageFaults > 0) {
+      std::printf("\n*** REFUSING to rebaseline: %u page fault(s) ***\n",
+                  run.pageFaults);
+      return 1;
+    }
+    if (!RebaselineSmoke(jsonKey, run)) return 1;
+    std::printf("*** THIS WAS A REBASELINE, NOT A PASS. ***\n");
+    return 0;
+  }
+
+  return result;
 }
 
 }  // namespace
 
-int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation, bool paged) {
-  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation, paged);
+int RunVkSmoke(bool lowPower, bool sledgehammer, bool validation, bool paged,
+               bool rebaseline) {
+  return RunSmoke(/*loud=*/false, lowPower, sledgehammer, validation, paged,
+                  rebaseline);
 }
 
-int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation, bool paged) {
-  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation, paged);
+int RunVkSmokeLoud(bool lowPower, bool sledgehammer, bool validation, bool paged,
+                   bool rebaseline) {
+  return RunSmoke(/*loud=*/true, lowPower, sledgehammer, validation, paged,
+                  rebaseline);
 }
 
 }  // namespace sandvox

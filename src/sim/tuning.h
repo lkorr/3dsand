@@ -1151,6 +1151,20 @@ struct Tuning {
     // is the knob you drag WHILE watching an explosion, and one that needs F5
     // between each nudge cannot be judged by eye.
     float windDragRef = 40.0f;
+    // ---- the wind primitive wake budget (docs/RESEARCH_wind.md §4.3) ----
+    // Chunks a tick may WAKE across every wind primitive holding the
+    // entrainment licence. This is the rule-2 budget for the whole feature and
+    // the one number that decides whether a fan is free.
+    //
+    // It is a BUDGET, not a switch: primitives are served in list order and
+    // once it is spent the rest are refused (and counted — a silently trimmed
+    // footprint would read as "entrainment is flaky"). A refused primitive
+    // still blows; it just cannot pick settled matter up this tick.
+    //
+    // Here rather than in tuning_params.def for the windGasScale reason: it is
+    // read CPU-side per tick, so a gate can set it with no shader reload.
+    // Clamped to kWindWakeCap, which is the TickParams array it fills.
+    int windWakeChunks = 96;
   } sim;
 
   // ---- day/night cycle ----
@@ -1956,6 +1970,11 @@ std::string TuningWgslBlock(const Tuning& t);
 // systems; replaced wholesale on reload.
 const Tuning& CurrentTuning();
 void SetCurrentTuning(const Tuning& t);
+
+// Set a sim.* field by name (e.g. "windDragRef"). Returns false if the name
+// is unknown. For --sweep: lets you test parameter reachability without editing
+// tuning.json. Handles both int and float sim fields.
+bool SetSimField(Tuning& t, const std::string& name, float value);
 
 // ---- gore: adding to a wound's whole-voxel budget ---------------------------
 // One helper for every site that grows a bleed budget (mob damage, limb carve,

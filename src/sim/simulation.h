@@ -89,10 +89,14 @@ class Simulation {
   // record while either is non-zero OR the disturbance-excite tuning mode is
   // on with an active CA (excite can birth particles from a world that has
   // none). All three inputs are tick-deterministic.
+  // `windWakeCount` is the number of chunk slots this tick's wind primitives
+  // want dirty-marked (TickParams.windWake). Zero on every tick of a world
+  // with no fan in it, which is what skips the row entirely.
   void EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                   bool hashEnable, uint32_t expCount, bool particlesActive,
                   uint32_t cellCount, uint32_t spawnCount = 0,
-                  uint32_t fluidCount = 0, uint32_t fluidSpawnCount = 0);
+                  uint32_t fluidCount = 0, uint32_t fluidSpawnCount = 0,
+                  uint32_t windWakeCount = 0);
 
   // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
   //
@@ -296,6 +300,9 @@ class Simulation {
       fluidSeamPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
+  // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
+  // docs/RESEARCH_wind.md §4.3.
+  rhi::ComputePipeline windWake_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;

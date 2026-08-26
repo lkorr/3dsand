@@ -1,6 +1,6 @@
 {
-  "_about": "Which gates already fail, so a run can tell you what is YOURS. See tests/BASELINE.md for why each one is here and how to update it.",
-  "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; fluid rows re-recorded 2026-08-24 at the 987c595 stock defaults; determinismHash, ca-slope-hybrid and fluid-react re-recorded 2026-08-25 at WP5's sim.fluidExciteMode flip; determinismHash re-recorded again 2026-08-25 for WP5b (settled-liquid MPM boundary mass, excite ceiling accounting, settle column exclusion, sim.liquidMinFilm); and again 2026-08-25 for the LEVELLING pass (sim_step filmPressed + bridgeLevel, sim.liquidMinFilm back to 1, seam surface-step excite trigger); and again 2026-08-25 for the WIND FLIP (sim.windMode 0 -> 1, so the CA drift bias, the particle drag and the MPM node force are live); and again 2026-08-25 for the DRAG RAMP (sim.windDragRef: the particle/MPM drag RATE now scales with the local wind magnitude instead of being fixed, so calm air is ballistic again — the fixed rate was air resistance in disguise and cut terminal fall from 6 to 0.86 vox/tick the moment wind switched on); and again 2026-08-25 for the GAS VERTICAL MODEL (buoyancy is now a probability wind redistributes -- rise/flat/sink tiers plus an up-diagonal lean -- so a freely rising plume leans instead of ignoring the wind entirely)",
+  "_about": "Pinned hashes and known gate failures. Machine-editable by --rebaseline. History in tests/BASELINE.md.",
+  "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; last re-recorded 2026-08-25 for the GAS VERTICAL MODEL (buoyancy as a redistributable probability)",
   "determinismHash": "b717a33d",
   "determinism": "pass",
   "sleep": "pass",
@@ -33,5 +33,37 @@
   "page-roundtrip": "pass",
   "daylight-boundary": "pass",
   "wind": "pass",
-  "fluid-react": "fail"
+  "fluid-react": "fail",
+
+  "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
+
+  "smokeQuiet": [
+    [0, "f97ba745"],
+    [1, "cfe240ba"],
+    [15, "eb6d7ae2"],
+    [30, "3d5c1554"],
+    [50, "addff010"]
+  ],
+
+  "smokeLoud": [
+    [0, "f97ba745"],
+    [15, "c0cac9cc"],
+    [30, "df26b3d5"],
+    [45, "61307cdc"],
+    [46, "b8dc4159"],
+    [47, "9c0dc35f"],
+    [52, "96d0e00c"],
+    [53, "0f088b6a"],
+    [60, "53750651"],
+    [75, "47251d4c"],
+    [76, "e08670f6"],
+    [84, "c42a6f17"],
+    [85, "26be6f11"],
+    [86, "f0e69bc0"],
+    [87, "27d0fee2"],
+    [88, "ccb16cb2"],
+    [90, "3aa40820"],
+    [105, "bd84ff0a"],
+    [120, "3145fde8"]
+  ]
 }

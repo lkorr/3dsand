@@ -6,6 +6,7 @@
 #include "math3d.h"
 #include "sim/materials.h"
 #include "sim/world.h"
+#include "sim/windprim.h"
 
 // The spell system: a caster VM whose ONLY output is op-stream emissions
 // (DESIGN.md §8). Four properties are structural — everything else here is
@@ -96,6 +97,36 @@ enum class SpellModifier : uint8_t {
   None = 0,
   Trail,
   TransmuteTo,
+  // GUST — emits a wind primitive where the spell resolves
+  // (docs/RESEARCH_wind.md §4.3). The one glyph that changes the AIR rather
+  // than the matter, and the reason wind is a gameplay tool rather than
+  // weather: it goes through the ordinary op stream like everything else here,
+  // so a replay and a future network stream carry it for free (thesis 1).
+  //
+  // Position-parameterized like every other effect, which means backfire is
+  // free: a fatal gust goes off in the caster's own chest and blows the
+  // caster's own sand pile across the room.
+  Gust,
+};
+
+// The wind primitive a glyph authors, read from the glyph's "wind" block.
+// CONTENT, not a knob: a modder writes a hurricane by editing glyphs.json, and
+// no material id or engine constant is hardcoded on the way (DESIGN.md §6).
+struct GlyphWind {
+  bool has = false;
+  uint32_t kind = kWindPrimCone;   // "cone" | "burst" | "vortex"
+  float speedMs = 20.0f;           // core speed, m/s (WindPrimAim converts)
+  int32_t radius = 6;              // world cells across
+  int32_t reach = 32;              // world cells along the axis
+  int32_t ttlTicks = 45;           // hard lifetime bound (rule 2)
+  float swirl = 0.0f;              // vortex tangential share of `speed`
+  float rise = 0.0f;               // vortex axial share of `speed`
+  // Whether this gust may pull SETTLED powder loose inside its footprint.
+  // Off by default and deliberately expensive-sounding: it is the flag that
+  // spends the per-tick chunk wake budget, and a decorative puff has no
+  // business rearranging terrain. A gust that carries it is the thing that
+  // makes "blow that sand pile away" a spell.
+  bool entrain = false;
 };
 
 // How a backfired spell of this element kills its caster. Thematic only — the
@@ -128,6 +159,7 @@ struct GlyphDef {
 
   // modifier
   SpellModifier modifier = SpellModifier::None;
+  GlyphWind wind;
   int32_t radius = 1;
   int32_t voxelBudget = 64;      // hard VOLUME budget for trail (rule 2)
   // Lay a mark every Nth voxel of travel. Named for what it does rather than
@@ -402,6 +434,12 @@ struct SpellEmission {
   std::vector<BrushOp> ops;
   std::vector<ExplosionOp> explosions;
   std::vector<ParticleSpawn> spawns;
+  // Wind primitives this spell wants to exist (docs/RESEARCH_wind.md §4.3).
+  // The VM never touches WindPrims() itself — it reports the intent here and
+  // the owner splices it on, exactly as it does for every other stream. That
+  // is thesis 1 applied to air: there is no path from spell code into the wind
+  // system, and there must never be one.
+  std::vector<WindPrim> winds;
   // Set when the effect should carve the caster's own body (a Fatal cast).
   // The VM cannot do this itself without reaching into the avatar/mob systems
   // (thesis 4), so it reports the intent and the owner performs it.

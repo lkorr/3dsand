@@ -129,6 +129,10 @@ enum class Pipe : uint8_t {
   None,
   Worldgen, WorldgenList,
   Mutate, MutateCells,
+  // The wind primitive footprint wake (sim_mutate.wgsl `windWake`): the only
+  // kernel in the engine that dirty-marks a chunk without writing a voxel.
+  // See docs/RESEARCH_wind.md §4.3 and the note at the entry point.
+  WindWake,
   Compact, CompactNext,
   Step,
   Occupancy, OccupancyDirty,
@@ -199,6 +203,10 @@ enum class Cond : uint8_t {
   // of worldgen, and under §3.8's fatal policy an abort at startup.
   DenseWorldgen,
   FluidSpawn, // fluidSpawnCount > 0 (MLS-MPM spawn row in PT_TICK)
+  // windWakeCount > 0: at least one wind primitive holds the entrainment
+  // licence and its footprint has chunks with matter in them. Zero on every
+  // tick of a world with no fans in it, which is what makes the feature free.
+  WindWake,
   // The CA loop and its compaction/staging setup, suppressed when the CPU can
   // PROVE the dirty set is empty (ROADMAP_scale.md §3.4, Simulation::
   // NoteTickInputs). A settled world otherwise records 54 indirect dispatches
@@ -242,6 +250,7 @@ enum class DispatchSel : uint32_t {
   IndDispatchArgs,   // indirect: world.dispatchArgs @ 0
   IndPDispatchArgs,  // indirect: world.pDispatchArgs @ 0
   // ---- MLS-MPM fluid ----
+  WindWakeSel,       // (windWakeCount + 63)/64
   FluidSpawnSel,     // (fluidSpawnCount + 63)/64
   IndFluidArgs,      // indirect: world.fluidDispatchArgs @ 0
   IndFluidPArgs,     // indirect: world.fluidPDispatchArgs @ 0 — the seam's

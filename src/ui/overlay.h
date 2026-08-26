@@ -105,6 +105,24 @@ struct UIState {
   // notices the air at all.
   float windDragRef = 40.0f;
   bool windTuningDirty = false;
+  // ---- placing a wind PRIMITIVE by hand (docs/RESEARCH_wind.md §4.3) ------
+  // The dev-panel producer, and the reason it exists is that the gameplay
+  // producers are content: a fan is a spell glyph or a prefab tag, and neither
+  // is a good way to answer "what does a 30 m/s cone actually do to that
+  // dune?". These three are the request; main.cpp turns them into a WindPrim
+  // and puts it on the same stream a spell uses, so nothing here is a side
+  // channel into the wind system.
+  //
+  // The fan is anchored where the camera is LOOKING and aimed along the view
+  // ray, which is the only placement that needs no extra UI and is also what a
+  // player-facing "place object" would do.
+  bool placeWindFan = false;      // one-shot: consumed by the frame loop
+  bool clearWindFans = false;     // one-shot: retire every dev-placed fan
+  float windFanSpeed = 25.0f;     // m/s at the core
+  int windFanRadius = 8;          // world cells across
+  int windFanReach = 48;          // world cells along the axis
+  int windFanKind = 0;            // 0 cone, 1 burst, 2 vortex
+  bool windFanEntrain = true;     // may it pull SETTLED powder loose
   int brushRadius = 4;
   int brushMaterial = 3;     // sand
   bool reloadShaders = false;
@@ -269,6 +287,14 @@ struct UIState {
   int spellOutcome = -1;          // last CastOutcome, -1 = none yet
   int liveProjectiles = 0;
   int spellOpsDropped = 0;        // ops the reservation could not fit (§F)
+  // ---- wind primitives (docs/RESEARCH_wind.md §4.3) ----
+  // Fans, spell gusts and tornadoes currently alive, and the ones the world
+  // list (32) had no room for. The refusal is SHOWN rather than swallowed for
+  // the spellOpsDropped reason: "my gust sometimes does nothing" is miserable
+  // to diagnose from silence, and the cap is a rule-2 budget rather than a bug.
+  int windPrims = 0;
+  int windPrimsDropped = 0;
+  int windWakeChunks = 0;   // chunks the primitives woke last tick
   // slot -> glyph id, for the bound-key strip. Empty string = unbound slot.
   std::vector<std::string> glyphSlots;
 };

@@ -150,6 +150,12 @@ while [ $((W_FARN << W_FARSHIFT)) -lt "$W_N" ]; do W_FARSHIFT=$((W_FARSHIFT + 1)
 # Fill-queue packing + cascade geometry (world.h kFarSlotShift/kFarSlotMask,
 # kWindowHalfExtentMeters, kFarCellVox(1)) — derived exactly as world.h derives
 # them, since the constexpr lambdas cannot be scraped as literals.
+# Far-field patch buffer base (world.h kFarPatchBase = kFarListCap * 2).
+W_FARLISTCAP="$(cpp_const kFarListCap)"
+[ -n "$W_FARLISTCAP" ] || {
+  echo "check_shaders: cannot parse kFarListCap from $WORLD_H" >&2; exit 1; }
+W_FARPATCHBASE=$((W_FARLISTCAP * 2))
+
 W_FARNUM=$((W_FARNCHUNK * W_FARNCHUNK * W_FARNCHUNK))
 W_FARSLOTSHIFT=0
 while [ $((1 << W_FARSLOTSHIFT)) -lt "$W_FARNUM" ]; do W_FARSLOTSHIFT=$((W_FARSLOTSHIFT + 1)); done
@@ -196,6 +202,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const FAR_VOX : u32 = $((W_FARN * W_FARN * W_FARN))u;" \
   "const FAR_MASK : i32 = $((W_FARN - 1));" \
   "const FAR_NCHUNK_MASK : i32 = $((W_FARNCHUNK - 1));" \
+  "const FAR_PATCH_BASE : u32 = ${W_FARPATCHBASE}u;" \
   "const FAR_SHIFT_BASE : u32 = ${W_FARSHIFT}u;" \
   "const FAR_SLOT_SHIFT : u32 = ${W_FARSLOTSHIFT}u;" \
   "const FAR_SLOT_MASK : u32 = ${W_FARSLOTMASK}u;" \

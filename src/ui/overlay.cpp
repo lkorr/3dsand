@@ -15,6 +15,7 @@
 // The ImGui_ImplWGPU_* half was deleted with Dawn (2026-08-22).
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
+#include "sim/world.h"   // kWindPrimCap for the primitive panel
 
 bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
                    rhi::TextureFormat format) {
@@ -419,6 +420,20 @@ void Overlay::Draw(UIState& s) {
     ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d ops dropped",
                        s.spellOpsDropped);
   }
+  // Wind primitives. Shown next to the projectile count because they are the
+  // same kind of thing: a bounded population of live effects the player made,
+  // each one costing until it expires. `wake` is the rule-2 number — the chunks
+  // those primitives are holding awake so they can move settled matter, against
+  // the sim.windWakeChunks budget.
+  if (s.windPrims > 0 || s.windPrimsDropped > 0) {
+    ImGui::Text("wind primitives %d (wake %d chunks)", s.windPrims,
+                s.windWakeChunks);
+    if (s.windPrimsDropped > 0) {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d refused (cap)",
+                         s.windPrimsDropped);
+    }
+  }
   ImGui::Separator();
 
   // ---- hotbar + melee (game/item.h, game/melee.h) ---------------------------
@@ -585,6 +600,45 @@ void Overlay::Draw(UIState& s) {
         "6 -> 0.86 (debris drifts down like ash).\n"
         "LOW makes ordinary weather floaty; HIGH means only a storm is felt.\n"
         "Changes the world hash. Deterministic, just a different world.");
+
+  // ---- place a wind primitive (docs/RESEARCH_wind.md §4.3) ---------------
+  // The button that turns wind from weather into a tool you can point at
+  // something. It emits the SAME parametric object a `gust` spell emits, on
+  // the same list, through the same budget — there is no dev-only wind path.
+  if (ImGui::TreeNode("wind primitives (fans / gusts / vortices)")) {
+    ImGui::TextDisabled("%d live, waking %d chunks", s.windPrims,
+                        s.windWakeChunks);
+    const char* kinds[] = {"cone (fan / jet)", "burst (blast or vacuum)",
+                           "vortex (tornado)"};
+    ImGui::Combo("kind", &s.windFanKind, kinds, 3);
+    ImGui::SliderFloat("speed", &s.windFanSpeed, -40.0f, 40.0f, "%.0f m/s");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "Core speed at the mouth. NEGATIVE is legal and useful: it turns a\n"
+          "burst into a vacuum and a cone into a draw.");
+    ImGui::SliderInt("radius", &s.windFanRadius, 1, 64);
+    ImGui::SliderInt("reach", &s.windFanReach, 1, 128);
+    ImGui::Checkbox("may move SETTLED powder", &s.windFanEntrain);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "The entrainment licence. OFF, a fan only steers what is already\n"
+          "moving - smoke, spray, falling sand - and costs nothing when the\n"
+          "world around it is asleep.\n"
+          "ON, it may pull RESTING powder loose inside its footprint, which is\n"
+          "what blows a dune flat. That costs: the primitive dirty-marks its\n"
+          "own footprint every tick so those chunks are simulated at all, and\n"
+          "the chunks are charged against sim.windWakeChunks. It is per\n"
+          "primitive rather than global because the global version is not\n"
+          "page-table safe - see sim.windMode 2.");
+    if (ImGui::Button("place where I'm looking")) s.placeWindFan = true;
+    ImGui::SameLine();
+    if (ImGui::Button("clear all")) s.clearWindFans = true;
+    if (s.windPrimsDropped > 0)
+      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                         "%d refused (world cap is %d)", s.windPrimsDropped,
+                         (int)kWindPrimCap);
+    ImGui::TreePop();
+  }
 
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
 

@@ -95,6 +95,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::DenseWorldgen: return cx.denseWorldgen;
     case pass::Cond::FarCount:  return cx.farCount > 0;
     case pass::Cond::FluidSpawn: return cx.fluidSpawnCount > 0;
+    case pass::Cond::WindWake:  return cx.windWakeCount > 0;
     case pass::Cond::CaActive:  return cx.caActive;
   }
   return false;
@@ -112,6 +113,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::Chunks64: return kNumChunks / 64;
     case pass::DispatchSel::GenCount: return cx.genCount;
     case pass::DispatchSel::FarCount: return cx.farCount;
+    case pass::DispatchSel::WindWakeSel: return (cx.windWakeCount + 63) / 64;
     case pass::DispatchSel::FluidSpawnSel: return (cx.fluidSpawnCount + 63) / 64;
     default:                          return v;
   }

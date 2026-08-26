@@ -1,7 +1,8 @@
 # Wind — architecture decision record
 
-Date: 2026-08-25. Status: **decided; phases 1, 3, 4 and the flip landed — wind
-is ON (`sim.windMode` = 1, hash `47dd1520`). Phases 2 and 5 open.**
+Date: 2026-08-25. Status: **decided; phases 1, 2, 3, 4 and the flip landed —
+wind is ON (`sim.windMode` = 1) and PRIMITIVES ARE IN, which is what makes wind
+a gameplay tool and what makes entrainment safe. Phases 5 and 6 open.**
 §10 records what phase 4 found; DESIGN.md §9b is the binding summary. This is
 the plan of
 record for the wind system; DESIGN.md gets its section when phase 1 lands (same
@@ -299,9 +300,10 @@ integral curves of the slope field). Toggle = in-game key + tuner bool.
 | 1 | `windAt` f32 + weather state + sway/strands rewire + **debug slope-field viz + toggle** + `wind.*` knobs | none (render-only) | **DONE** — pinned hash unchanged; viz shows the field; grass lean follows the direction knob |
 | 3 | Debris + MPM wind force; `windResponse`/`windFriction` authoring + packing | none while gated | **DONE** — packed into `flags` bits 8..15, since `MaterialGpu` has no spare word |
 | 4 | `windAtQ` + CA drift bias + entrainment, behind `sim.windMode=0` | none while gated | **DONE** — the `wind` gate: reversing the direction knob reverses the smoke, the settled bed is bitwise unmoved under drift, twice-run equality holds |
-| 2 | Primitive list + op plumbing (spell VM op, fan tag), cull mask, footprint wake (gated), viz shows primitives | none while gated | gust-bolt op visibly bends grass wake in viz. **Now also the prerequisite for switching entrainment on** — §10 |
+| 2 | Primitive list + op plumbing (spell VM op, dev placement), footprint wake, viz shows primitives | none (empty list is an exact identity) | **DONE 2026-08-26** — the `wind-prim` gate: a licensed fan creeps a settled bed 12.65 cells downwind in a chamber that is ASLEEP, waking 10 chunks and losing no grains, with the suite's page-fault counter at 0. An unlicensed fan blows smoke and leaves the bed bitwise unmoved |
 | 4b | Flip `sim.windMode` to 1 | rebaseline | **DONE** — `882a30f3` → `47dd1520`; sleep still 0/32768 chunks active, dense reproduces the same hash, both smoke tables re-recorded with `worldgen` byte-identical |
-| 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline (with 4b or after) | fire columns loft smoke/embers; tornado lifts sand |
+| 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline | fire columns loft smoke/embers; tornado lifts sand |
+| 6 | Draft volumes: local coarse relaxation so a room vents through its openings (§11) | rebaseline | smoke in a room with a door and a window finds the exits |
 
 Phases 3 and 4 landed together, and in that order, because §4.6 is wrong about
 one thing: it has the particle and MPM consumers reading the f32 `windAt`. They
@@ -388,9 +390,196 @@ on**, not merely the next feature. `sim.windMode = 2` ships implemented, warned
 about by `LoadTuning`, excluded from the default suite, and reachable in one
 environment variable by anyone who wants to look at it.
 
+**RESOLVED 2026-08-26 by §12.** Entrainment is on, per primitive, and the
+`wind-prim` gate runs in the default suite with the fault counter at zero. Mode
+2 — the same rule with the licence removed — is still not a default and is not
+expected to become one; the shipping way to blow a dune flat is to point
+something at it.
+
 There is a wider version of this worth stating, because it will be true again:
 the page table's soundness argument quietly rests on **"settled matter does not
 move"**, a property no rule had ever contradicted. Any future rule that makes
 resting voxels move without a CPU-visible cause — not just wind — lands in the
 same hole. The tell is a non-zero page-fault count with no obvious lost voxel
 near the thing you were testing.
+
+## 11. Drafts through openings (planned "phase 6": the local refinement volume)
+
+Owner requirement (2026-08-25): a room with a door and a window should carry a
+draft; smoke inside should find the exits. This is the first requirement the
+pure function CANNOT satisfy — the answer depends on geometry — and it is the
+planned use of §3's contained fallback (the GoW shape): a **draft volume**,
+small, local, coarse, sleeping.
+
+- Grid at ~4-voxel cells (fine enough to tell a door from a wall), 64–128 vox
+  on a side ⇒ 4k–32k cells ≈ GoW's entire shipped wind sim. Solid cells come
+  from the EXISTING sub-chunk occupancy bitmasks (`world.h` occupancy +
+  kSubOccStride) — the walls mask is already maintained.
+- Boundary seeded from ambient `windAtQ`; a fixed handful of damped Jacobi
+  relaxation iterations, solids blocking ⇒ flow threads door→window (The
+  Powder Toy's air sim, in 3D, locally). Phase-5 heat counts as a pressure
+  source (TPT `HotAir`) make burning rooms vent with no ambient wind.
+- Smoke consumption reuses the phase-4 drift-bias plumbing: sample the draft
+  volume where covered, ambient elsewhere. No new CA rule.
+- Determinism: TICK-cadence updates (never frame), fixed iterations,
+  fixed-point, ping-pong (no atomics), deterministic inputs only (occupancy +
+  `windAtQ` + heat counts), written between dispatches (dispatch-invariant,
+  the `pageTable` rule), anchor rides TickParams (`mirrorBase` precedent).
+- Rule 2: volume exists only while active gas is nearby; sleeps to zero cost.
+  Bounded concurrent-volume count, budget-charged like primitives.
+- Cost: ~32k cells × ~8 iterations every ~8 ticks ⇒ microseconds on GPU,
+  zero CPU. Update cadence is a knob; drafts do not need 30 Hz.
+- Ordering: after phase 2 (reuses footprint/budget machinery; §10's
+  CPU-visibility lesson applies), paired naturally with phase 5 (heat).
+
+## 12. What phase 2 shipped (2026-08-26)
+
+### The object
+
+`src/sim/windprim.h` / `.cpp`. A primitive is ~48 bytes: position, unit axis
+(Q16.16), core strength (Q16.16 cells/s), radius, axial reach, a vortex swirl
+and rise share, a kind, flags, a spawn tick, a TTL and an opaque owner handle.
+The GPU form is three `vec4<i32>` rows; the ceilings and the encoding live in
+`world.h` next to `TickParams`, because they are the GPU layout.
+
+Three kinds — `cone` (fans, gust bolts, wind walls), `burst` (blast fronts, and
+a **vacuum** at negative strength), `vortex` (tornadoes; whirlpools when the
+medium mask says water). They span the requirements rather than enumerate
+shapes, and anything else is these summed, which is the point of making them
+additive rather than exclusive.
+
+**No square root anywhere.** The radial profile is quadratic in `r^2`, the axial
+one linear in the dot product, and the burst takes its DIRECTION from the offset
+vector itself rather than normalising it. That is what keeps a primitive
+affordable inside the CA's movement tail. It has one honest consequence: a burst
+has no wind at its exact centre, which is true of a blast anyway — there is no
+preferred outward direction at a stagnation point.
+
+### Where they live, and why that was the whole cost saving
+
+**In `TickParams` and `RenderParams`**, not a storage buffer. 32 x 48 bytes of
+per-tick CPU-authored configuration is what a uniform is for, and the
+consequence is that the entire feature costs **no new binding, no new barrier
+and no new dispatch** — except the wake kernel, which is a genuinely new thing
+to do. A storage buffer would have meant a new binding in BOTH group-0 layouts
+(`common.wgsl` is prepended to every shader, so one identifier cannot carry two
+binding numbers), a new pass-table row set, a new barrier class, and the same
+again on the render side.
+
+The render copy is what makes §4.7 and §4.8 free: the sway sites and the arrow
+overlay sum the same list, so the grass leans in a fan's blast and the arrows
+show the fan, with nothing wiring foliage to fans. Invariant 2, still holding.
+
+**Zero primitives is an exact identity.** `windPrimCount == 0` early-outs in
+`windPrimAt`, `windPrimAtQ` and `windPrimEntrainsQ`, and the union AABB is
+shipped empty (`lo > hi`, the fluid-render-box convention) so a sample outside
+every footprint rejects in four compares. The pinned hash did not move.
+
+### Movement is analytic, and resolved on the CPU
+
+§4.3 said "moving primitives are analytic in time". The refinement phase 2
+makes is that the evaluation happens ONCE PER TICK ON THE CPU, not per sample on
+the GPU: `origin + vel * (tick - spawnTick)` is 32 evaluations rather than
+millions, and the shader is handed a primitive that is already where it is. The
+same pass applies the lifetime envelope (attack/release), because a 40 m/s gust
+that switches on between two ticks reads as smoke teleporting — the CA's drift
+bias is a probability, not a force, so it has no inertia to smooth the step.
+
+### The footprint wake — §10's fix, built
+
+`sim_mutate.wgsl` gains a third entry point, `windWake`, and it is the only
+thing in the engine that dirty-marks a chunk without writing a voxel. The CPU
+side (`WindPrimSystem::BuildWake`) does the work that makes it safe:
+
+1. only primitives holding `kWindPrimEntrain` produce a wake at all, so a
+   decorative gust is free;
+2. the footprint is the primitive's SWEPT box, not `pos ± max(radius, reach)` —
+   a 36-cell fan declares a 36x16x16 box rather than a 72-cube;
+3. it is filtered against the snapshot's per-slot occupancy, which is what turns
+   a fan's footprint from "a box" into "the surface it is aimed at" (the
+   snapshot is one tick latent, which is the safe direction: a chunk that just
+   gained matter is already dirty from the op that put it there);
+4. it is charged against `sim.windWakeChunks` before emission, and refusals are
+   counted rather than hidden;
+5. and the SAME list is handed to `PageTable::AddOpTarget`, so those chunks are
+   materialized with their 26-ring before the command buffer exists.
+
+Step 5 is the one that matters. A grain that hops into a neighbouring chunk hops
+into one the CPU had already declared writable, so the tightening argument the
+page table rests on is repaired rather than worked around.
+
+The licence is bounded at SPAWN, not trimmed at wake time: a primitive whose
+footprint exceeds `kWindWakeMaxChunks` (512 chunks) is refused the flag and
+still blows. Trimming would leave entrainment working in an arbitrary corner of
+the blast, which is worse than not working, and it would also leave the wake
+SCAN unbounded — a 512-cell vortex would walk 274,625 chunk slots a tick to
+discover that most of them are sky.
+
+### The entrainment gate, restated
+
+`sim_step.wgsl`'s step 5 now reads
+
+    windMode >= DRIFT && substep 0 && powder &&
+        (windMode >= ENTRAIN || windPrimEntrainsQ(cell))
+
+so the licence is per primitive and per cell. `windPrimEntrainsQ` is a separate,
+cheaper question than "what is the wind here" — being inside is a yes/no, and
+asking the full evaluator would pay for a weight nobody reads.
+
+### Producers
+
+- **`gust`**, a modifier glyph in `assets/spells/glyphs.json` with a `wind`
+  block (`kind`, `speed`, `radius`, `reach`, `ticks`, `swirl`, `rise`,
+  `entrain`). It emits through `SpellEmission` like every other spell effect,
+  which means it is position-parameterized and a FATAL gust goes off in the
+  caster's own chest for free (spell.h thesis 2). Repetition amplifies SPEED,
+  not size: widening the footprint would multiply the wake cost eightfold for
+  one extra word. A `duststorm` conjoined example ships with it.
+- **The dev panel**, which can place one where the camera is looking, with the
+  kind/speed/radius/reach/licence exposed. It goes through the same
+  `WindPrims().Spawn()`; there is no dev-only path into the wind system, which
+  is what makes what you see there the same thing a spell produces.
+
+Both are refused rather than silently displacing something when the world list
+is full, and the refusal is shown in the HUD next to the projectile count.
+
+### The gate
+
+`wind-prim`, in the default suite. A sealed chamber with a settled sand bed on
+the floor and — in most arms — a smoke blob as a witness. It asserts: a licensed
+fan creeps the bed +12.65 cells downwind and reversing it reverses the creep; an
+UNLICENSED fan visibly blows the smoke (+8.79 cells) and leaves the bed BITWISE
+unmoved; in a chamber with NO smoke, so genuinely asleep, the fan wakes 10 chunks
+and the bed still creeps by the same amount — which is the wake proving itself
+rather than riding on the smoke keeping the CA alive; grain count is conserved
+across every arm; twice-run equality holds; the wake stays inside its budget;
+and the suite's page-fault counter is 0.
+
+Note what the gate does NOT need: the `wind` gate above it writes one
+`kCellOpIfAir` per chamber chunk per tick purely to keep the chunks awake. This
+one has no scaffolding at all. That difference IS the feature.
+
+### One bug worth recording, because its shape recurs
+
+The wake did nothing at first, silently. The per-tick counts cross THREE
+hand-written structs on their way to the recorder —
+`Simulation::RecordCtx` → `rhi::TableCtx` → the recorder's own `RecordCtx` —
+and one copy was missing, so the row's condition read a default zero and the row
+was never recorded. No error, no validation message, a green build, a green
+selftest, and a CPU cheerfully shipping a correct 10-slot wake list every tick
+to a kernel that never ran.
+
+`scripts/check_invariants.py` now has a `counts` check that compares all three
+structs field-by-field and asserts both copy sites exist. It was negative-tested
+in both directions.
+
+### What is deliberately NOT here
+
+- **The per-chunk cull mask** (§4.3). With a cap of 32 and a union-AABB reject
+  that costs four compares, the loop is only ever entered near a primitive. A
+  cull-mask pass would be a new dispatch and a new buffer to save what is
+  already cheap; if profiling ever disagrees, the mask is still the answer.
+- **A fan as a placed OBJECT.** The primitive, the op path, the owner handle and
+  `RetireOwner` are all in place, so a prefab/material tag that registers one on
+  place and retires it on break is a small content-side addition rather than an
+  engine change. It waits on there being a fan to place.

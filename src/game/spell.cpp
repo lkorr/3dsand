@@ -167,6 +167,7 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
       const std::string m = g.value("modifier", std::string());
       if (m == "trail") d.modifier = SpellModifier::Trail;
       else if (m == "transmute_to") d.modifier = SpellModifier::TransmuteTo;
+      else if (m == "gust") d.modifier = SpellModifier::Gust;
       else {
         errors += "glyphs: \"" + d.id + "\" has unknown modifier \"" + m + "\"\n";
         return false;
@@ -176,6 +177,49 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
       d.voxelBudget =
           ClampI(g.value("voxelBudget", 64), 1, out.budgets.maxTrailVoxels);
       d.everyTicks = ClampI(g.value("everyTicks", 1), 1, 60);
+      // ---- the "wind" block (docs/RESEARCH_wind.md §4.3) ----
+      // Present only on a gust glyph, and REQUIRED there: a gust with no wind
+      // block is a word that does nothing, which the language's "every
+      // sequence does something" rule forbids. A loud load error, never a
+      // silent default — the same treatment an unresolvable material name gets.
+      if (g.contains("wind")) {
+        const json& w = g["wind"];
+        GlyphWind gw;
+        gw.has = true;
+        const std::string k = w.value("kind", std::string("cone"));
+        if (k == "cone") gw.kind = kWindPrimCone;
+        else if (k == "burst") gw.kind = kWindPrimBurst;
+        else if (k == "vortex") gw.kind = kWindPrimVortex;
+        else {
+          errors += "glyphs: \"" + d.id + "\" has unknown wind kind \"" + k +
+                    "\" (cone | burst | vortex)\n";
+          return false;
+        }
+        // Clamped against the engine ceilings the primitive system enforces
+        // anyway, so a silly file is a clamp rather than a primitive that gets
+        // quietly refused at spawn time.
+        //
+        // m/s, and the ceiling is the primitive system's own cap expressed in
+        // the authoring unit — 400 cells/s at kVoxelMeters 0.10. A negative
+        // speed is legal and useful: it turns a burst into a vacuum and a cone
+        // into a draw.
+        const float maxMs = (float)kWindPrimMaxSpeed * kVoxelMeters;
+        gw.speedMs = (float)w.value("speed", 20.0);
+        if (gw.speedMs > maxMs) gw.speedMs = maxMs;
+        if (gw.speedMs < -maxMs) gw.speedMs = -maxMs;
+        gw.radius = ClampI(w.value("radius", 6), 1, kWindPrimMaxExtent);
+        gw.reach = ClampI(w.value("reach", 32), 1, kWindPrimMaxExtent);
+        gw.ttlTicks = ClampI(w.value("ticks", 45), 1,
+                             out.budgets.maxLifetimeTicks);
+        gw.swirl = (float)w.value("swirl", 0.0);
+        gw.rise = (float)w.value("rise", 0.0);
+        gw.entrain = w.value("entrain", false);
+        d.wind = gw;
+      } else if (d.modifier == SpellModifier::Gust) {
+        errors += "glyphs: \"" + d.id +
+                  "\" is a gust but has no \"wind\" block\n";
+        return false;
+      }
     } else {
       errors += "glyphs: \"" + d.id + "\" has unknown type \"" + type + "\"\n";
       return false;
@@ -503,6 +547,56 @@ void ApplySpellEffect(const GlyphLibrary& lib, const Spell& spell,
     out.ops.push_back({cx, cy, cz, ClampI(scaled(r), 1, 8), spell.element,
                        1u /*overwrite*/, 0, 0});
     didTransmute = true;
+  }
+
+  // GUST — the glyph that changes the AIR (docs/RESEARCH_wind.md §4.3).
+  //
+  // Everything else here moves matter; this puts a wind primitive in the world
+  // and lets the wind system move whatever is standing in it. That is the
+  // whole shape of the feature: no spell code knows what sand is, and no CA
+  // rule knows what a spell is — they meet at a 48-byte parametric object.
+  //
+  // Emitted from inside ApplySpellEffect, like the spray, so a FATAL gust goes
+  // off in the caster's own chest and blows their own pile across the room.
+  // Backfire costs nothing to support because the effect is position- and
+  // direction-parameterized (thesis 2).
+  for (size_t mi = 0; mi < spell.modifiers.size(); mi++) {
+    int gi = spell.modifiers[mi];
+    if (gi < 0 || gi >= (int)lib.glyphs.size()) continue;
+    const GlyphDef& g = lib.glyphs[gi];
+    if (g.modifier != SpellModifier::Gust || !g.wind.has) continue;
+
+    // Direction: the aim, renormalized (dirFx need not be unit). A dead-zero
+    // aim is possible on a self-cast at the caster's own centre, and
+    // WindPrimAim turns that into +Y rather than a NaN axis.
+    Vec3 dir{SpellFxToFloat(dirFx.x), SpellFxToFloat(dirFx.y),
+             SpellFxToFloat(dirFx.z)};
+
+    // REPETITION AMPLIFIES, and it buys SPEED rather than size. "gust gust" is
+    // twice as hard a wind through the same opening, not a gust twice as wide:
+    // widening it would multiply the footprint's chunk-wake cost by eight for
+    // a doubling of the word, and the language's promise is "twice as much of
+    // the thing", which for wind is how hard it blows. Strength is capped by
+    // the primitive system anyway, so an absurd amplification saturates rather
+    // than overflowing.
+    const int32_t mul = spell.ModifierScale(mi);
+    const float speed = g.wind.speedMs * (float)mul *
+                        ((float)strengthMille / 1000.0f);
+
+    WindPrim p{};
+    p.x = cx;
+    p.y = cy;
+    p.z = cz;
+    p.kind = g.wind.kind;
+    p.radius = g.wind.radius;
+    p.reach = g.wind.reach;
+    p.ttl = (uint32_t)g.wind.ttlTicks;
+    p.swirlQ = (int32_t)(g.wind.swirl * 65536.0f);
+    p.riseQ = (int32_t)(g.wind.rise * 65536.0f);
+    p.flags = kWindPrimAir;
+    if (g.wind.entrain) p.flags |= kWindPrimEntrain;
+    WindPrimAim(p, dir, speed);
+    out.winds.push_back(p);
   }
 
   // SPRAY — the default form, and the reason a one-word spell is a real spell.

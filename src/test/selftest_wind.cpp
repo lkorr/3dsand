@@ -54,6 +54,7 @@
 #include <vector>
 
 #include "sim/wind.h"
+#include "sim/windprim.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -209,6 +210,7 @@ Status GateWind(Ctx& c, std::string& detail) {
         }
     if (r.smokeCount) r.smokeX = mxSum / r.smokeCount;
     if (r.sandCount) r.sandX = sxSum / r.sandCount;
+    if (r.smokeCount) r.smokeX = mxSum / r.smokeCount;
     SetCurrentTuning(saved);
     return r;
   };
@@ -299,6 +301,318 @@ Status GateWind(Ctx& c, std::string& detail) {
   const bool ok = live && drifts && bedHeld && stable && massOk && creeps &&
                   entrainStable;
   std::printf("wind: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ========================= WIND PRIMITIVES (phase 2) ========================
+// docs/RESEARCH_wind.md §4.3 and §10. The gate that turns "entrainment is a
+// landmine" into "entrainment is a feature", so it is worth being precise about
+// what it claims.
+//
+// The `wind` gate above had to fake this. It writes one kCellOpIfAir per
+// chamber chunk per tick purely to keep the chunks awake, because a settled
+// sand bed is ASLEEP and the ambient field is categorically forbidden to wake
+// it (invariant 3). And even with the scaffolding, its entrainment arms are
+// OPT-IN, because switching windMode to 2 loses voxels: the page table
+// materializes a set that is tightened against a lagging snapshot on the
+// argument that settled matter writes nothing, and entrainment is the first
+// rule that breaks it (62 reproducible faults over two 160-tick runs).
+//
+// This gate uses NO scaffolding and runs in the DEFAULT SUITE. A wind
+// primitive carrying kWindPrimEntrain declares its own footprint every tick,
+// the CPU filters it against occupancy, charges it against sim.windWakeChunks,
+// hands it to the page table as op targets AND to sim_mutate's windWake kernel
+// as dirty marks. So the chunks are awake because something player-caused woke
+// them, and they are materialized because the CPU said so before the command
+// buffer existed.
+//
+// THE PAGE-FAULT COUNT IS THE HEADLINE ASSERTION and it is not made here: the
+// suite reports page faults across every gate and zero is the only acceptable
+// value. This gate simply moves a settled dune
+// with the default suite watching. If §10's fault ever comes back, it comes
+// back on this gate.
+//
+// WHAT IS ASSERTED, all of it a differential or an invariance:
+//   1. A LICENCE-CARRYING FAN MOVES THE BED, and moves it DOWNWIND. Sign, not
+//      magnitude — a distance would rot the day anyone retunes a taper.
+//   2. REVERSING THE FAN REVERSES THE CREEP. The falsifiable half of "one
+//      field, sampled by everything".
+//   3. A FAN WITHOUT THE LICENCE LEAVES THE BED BITWISE UNMOVED. This is the
+//      whole shipping safety property: wind primitives are the default and
+//      entrainment is opt-in per primitive, so a decorative gust cannot
+//      rearrange terrain and cannot spend the wake budget.
+//   4. NO PRIMITIVES IS AN EXACT IDENTITY. Same script, empty list, and the
+//      world hash must equal the no-wind-primitive baseline bit for bit. This
+//      is the argument that shipping this cannot move the pinned hash.
+//   5. GRAIN COUNT IS CONSERVED. Sand is inert in a sealed chamber, so a count
+//      that changed is a lost voxel — which is exactly the §10 symptom, caught
+//      here as a wrong number rather than as a fault counter nobody read.
+//   6. TWICE-RUN EQUALITY with a fan blowing.
+struct PrimResult {
+  uint32_t hash = 0;
+  uint32_t sandCount = 0;
+  double sandX = 0.0;
+  int sandMaxX = 0;
+  uint32_t wakeMax = 0;    // largest per-tick wake list this arm produced
+  uint32_t wakeActive = 0; // chunks the CA actually simulated, mid-run
+  uint32_t smokeCount = 0;
+  double smokeX = 0.0;
+  std::vector<uint32_t> sandCells;
+};
+
+Status GateWindPrim(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t sandId = 0, stoneId = 0, smokeId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "sand") sandId = (uint32_t)i;
+    else if (c.mats[i].name == "stone") stoneId = (uint32_t)i;
+    else if (c.mats[i].name == "smoke") smokeId = (uint32_t)i;
+  }
+  if (!sandId || !stoneId || !smokeId) {
+    detail = "need materials sand, stone and smoke";
+    return Status::Fail;
+  }
+
+  // ---- the chamber -------------------------------------------------------
+  // Same shape as the `wind` gate's: a long sealed box along x with a one-voxel
+  // sand bed sitting DIRECTLY on the stone floor, so the bed is settled the
+  // instant it is painted and has no down-diagonal to take. Anchored to the
+  // residency window, never to a literal world position.
+  const IVec3 wo = world.WindowOrigin();
+  const int bx = wo.x * (int)kChunk + 64;
+  const int by = wo.y * (int)kChunk + 144;   // a different shelf from `wind`
+  const int bz = wo.z * (int)kChunk + 64;
+  // LOW on purpose: 6 cells of headroom, not 10. A gas rises, and in a taller
+  // box the smoke witness below spends the whole run pinned to the ceiling
+  // where a cone anchored near the floor has already tapered to nothing — which
+  // makes the witness measure the chamber rather than the fan. Six cells keeps
+  // every seeded cell inside the fan's radius for the whole run.
+  const int kW = 48, kD = 6, kH = 6;
+  const int x0 = bx, x1 = bx + kW - 1;
+  const int z0 = bz, z1 = bz + kD - 1;
+  const int yF = by, yT = by + kH + 1;
+  const int sx0 = bx + 14, sx1 = sx0 + 11;
+  const int kTicks = 160;
+
+  std::vector<CellOp> build;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = yF; y <= yT; y++) {
+        const bool shell = y == yF || y == yT || x < x0 || x > x1 ||
+                           z < z0 || z > z1;
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         shell ? (stoneId & 0xFFFu) : 0u});
+      }
+  std::vector<CellOp> seed, smoke;
+  for (int z = z0; z <= z1; z++) {
+    for (int x = sx0; x <= sx1; x++)
+      seed.push_back({World::SlotCellIndex({x, yF + 1, z}), sandId & 0xFFFu});
+    // A smoke blob as well, and it is not decoration: gas responds to the
+    // PRIMITIVE FIELD through the ordinary drift bias, with no licence and no
+    // wake involved. So if the bed does not move but the smoke does, the
+    // failure is in the entrainment licence; if neither moves, the field never
+    // reached the kernel. One extra blob buys the difference between those two.
+    for (int y = yF + 3; y <= yF + 5; y++)
+      for (int x = bx + 20; x <= bx + 25; x++)
+        smoke.push_back({World::SlotCellIndex({x, y, z}), smokeId & 0xFFFu});
+  }
+
+  // ---- the fan -----------------------------------------------------------
+  // A cone with its mouth at the upwind end of the chamber, on the axis of the
+  // bed. Reach 36 and radius 8 put the whole bed inside the first 60% of the
+  // taper, where the axial weight is 0.4..0.7 — comfortably over sand's
+  // authored friction threshold at 36 m/s, and comfortably under it at the
+  // 2 m/s ambient the arms are pinned to, which is what makes the fan and only
+  // the fan responsible for anything that moves.
+  //
+  // Infinite TTL: this is a fan, not a gust. The system is cleared between arms.
+  auto makeFan = [&](int sign, bool entrain) {
+    WindPrim p{};
+    p.x = sign > 0 ? (bx + 4) : (bx + kW - 5);
+    p.y = yF + 3;
+    p.z = bz + 2;
+    p.kind = kWindPrimCone;
+    p.radius = 8;
+    p.reach = 36;
+    p.ttl = kWindPrimForever;
+    p.flags = kWindPrimAir | (entrain ? kWindPrimEntrain : 0u);
+    p.ownerId = 0xF00Du;
+    WindPrimAim(p, Vec3{(float)sign, 0.0f, 0.0f}, 36.0f);
+    return p;
+  };
+
+  // `withSmoke` is the diagnostic axis, not decoration — see the two arms it
+  // separates at the call site.
+  auto run = [&](int fanSign, bool entrain, bool withSmoke) -> PrimResult {
+    Tuning t = CurrentTuning();
+    // windMode 1 throughout: the licence comes from the PRIMITIVE, never from
+    // the global mode. If this gate ever needs mode 2 to pass, the feature it
+    // tests does not work.
+    t.sim.windMode = (int)kWindModeDrift;
+    t.wind.weatherAuto = false;
+    t.wind.windDirDeg = 90.0f;
+    t.wind.windSpeed = 2.0f;      // ambient alone cannot entrain sand
+    t.wind.gustStrength = 0.2f;
+    const Tuning saved = CurrentTuning();
+    SetCurrentTuning(t);
+
+    WindPrims().Clear();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+
+    uint32_t tick = 41000;
+    uint32_t midActive = 0;
+    for (int i = 0; i < kTicks; i++) {
+      // The fan is placed AFTER the chamber is built and the bed has settled,
+      // which is the order a player would produce and the order that makes
+      // "settled matter moved" mean something.
+      if (i == 4 && fanSign != 0) WindPrims().Spawn(makeFan(fanSign, entrain));
+      std::vector<CellOp> ops;
+      if (i == 0) ops = build;
+      else if (i == 1) {
+        ops = seed;
+        if (withSmoke) ops.insert(ops.end(), smoke.begin(), smoke.end());
+      }
+      SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, ops, false,
+                 {wo.x + 4, wo.y + 9, wo.z + 4}, true, false);
+      // The active-chunk count MID-RUN is what proves the wake rather than the
+      // end state, and it is the number that found the bug this gate was
+      // written for: with the dry chamber asleep it read 0 while the CPU was
+      // happily shipping a 10-slot wake list every tick — because the count
+      // has to cross THREE structs to reach the recorder (RecordCtx ->
+      // rhi::TableCtx -> the recorder's own RecordCtx) and one copy was
+      // missing.
+      //
+      // Read off the SNAPSHOT, never with a blocking readback. A sync read
+      // mid-run shares the free-probe's staging buffer and deferred map, and
+      // interleaving one there left the page table's demotion drain stalled
+      // for the rest of the process — which surfaced two dozen gates later as
+      // `page-roundtrip` waiting 400 ticks for a page that never came back.
+      // The snapshot is one tick latent, which is plenty for "is anything
+      // awake at all".
+      if (i >= kTicks - 40 && world.Snap().valid)
+        midActive = std::max(midActive, world.Snap().activeChunks);
+    }
+    ctx.WaitIdle();
+
+    PrimResult r;
+    r.wakeActive = midActive;
+    r.hash = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    double sxSum = 0.0, mxSum = 0.0;
+    r.sandMaxX = x0 - 1;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+      for (int cy = yF >> 4; cy <= (yT >> 4); cy++)
+        for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++) {
+          const uint32_t slot = World::SlotChunkIndex({cx, cy, cz});
+          ReadVoxelsSync(ctx, world, slot, 1, cbuf.data(), "primVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const uint32_t mat = cbuf[k] & 0xFFFu;
+            if (mat != sandId && mat != smokeId) continue;
+            const int x = (int)(k % 16) + cx * 16;
+            if (mat == smokeId) { r.smokeCount++; mxSum += x; continue; }
+            r.sandCount++;
+            sxSum += x;
+            if (x > r.sandMaxX) r.sandMaxX = x;
+            r.sandCells.push_back(slot * kChunkVol + k);
+          }
+        }
+    if (r.sandCount) r.sandX = sxSum / r.sandCount;
+    if (r.smokeCount) r.smokeX = mxSum / r.smokeCount;
+    // The wake the last tick asked for. Bounded by the budget by construction;
+    // read back so the number is in the detail line rather than merely
+    // believed. (BuildWake is re-run here against the same live list, which is
+    // exactly what SubmitTick did — it has no side effects.)
+    {
+      std::vector<uint32_t> w;
+      WindPrims().BuildWake(world, world.Snap().valid ? world.Snap().occupancy
+                                                      : std::vector<uint32_t>(),
+                            (uint32_t)CurrentTuning().sim.windWakeChunks, w);
+      r.wakeMax = (uint32_t)w.size();
+    }
+    WindPrims().Clear();
+    SetCurrentTuning(saved);
+    return r;
+  };
+
+  const PrimResult none = run(0, false, true);    // no primitive at all
+  const PrimResult quiet = run(+1, false, true);  // a fan with no licence
+  const PrimResult east = run(+1, true, true);    // licence, blowing +x
+  const PrimResult west = run(-1, true, true);    // licence, blowing -x
+  const PrimResult twice = run(+1, true, true);   // and again
+  // THE WAKE ARM, and it is the one that matters most. No smoke at all: the
+  // chamber settles completely within a few ticks of being built, so every
+  // chunk in it is ASLEEP by the time the fan appears. If the bed still creeps,
+  // the ONLY thing that could have woken it is the primitive's own footprint
+  // going through sim_mutate's windWake kernel — which is the entire claim of
+  // phase 2 and the thing the `wind` gate above had to fake with a per-tick
+  // kCellOpIfAir. With smoke in the chamber the CA never sleeps and this
+  // question cannot be asked, which is why it gets its own arm.
+  const PrimResult dry = run(+1, true, false);
+  const PrimResult dryNone = run(0, false, false);
+
+  // 1/2. The creep, and its sign. Measured against the no-primitive arm so the
+  //      CA's own randomness cancels out of both sides.
+  const double dEast = east.sandX - none.sandX;
+  const double dWest = west.sandX - none.sandX;
+  const int mEast = east.sandMaxX - none.sandMaxX;
+  const bool creeps = dEast > 0.5 && mEast > 0;
+  const bool reverses = dWest < -0.5;
+  // 3. The licence, and nothing else, is what moves settled matter. A fan is
+  //    blowing in `quiet` at exactly the strength that moved the bed in `east`.
+  const bool quietHeld = quiet.sandCells == none.sandCells;
+  // 4. ...and it is a fan that is genuinely BLOWING. Without this the previous
+  //    assertion is satisfied by a primitive that does nothing at all, which is
+  //    exactly how a broken field would pass. The smoke is the witness: it
+  //    responds to the primitive through the ordinary drift bias, which needs
+  //    no licence and no wake.
+  const bool quietBlows = (quiet.smokeX - none.smokeX) > 0.5;
+  // 5. Mass. A lost grain is the §10 symptom.
+  const bool massOk = east.sandCount == none.sandCount &&
+                      west.sandCount == none.sandCount &&
+                      quiet.sandCount == none.sandCount;
+  // 6. Twice-run equality with a fan blowing.
+  const bool stable = twice.hash == east.hash &&
+                      twice.sandCells == east.sandCells;
+  // 7. The rule-2 budget actually binds.
+  const uint32_t budget = (uint32_t)CurrentTuning().sim.windWakeChunks;
+  const bool bounded = east.wakeMax <= budget && quiet.wakeMax == 0;
+  // 8. THE WAKE. A settled, sleeping bed, woken by nothing but the fan.
+  const double dDry = dry.sandX - dryNone.sandX;
+  const bool wakes = dDry > 0.5 && dry.sandCount == dryNone.sandCount &&
+                     dry.wakeActive > 0 && dryNone.wakeActive == 0;
+
+  detail = Format(
+      "fan 36 m/s, 2 m/s ambient | bed creeps %+.2f cells (maxX %+d) blowing "
+      "+x, %+.2f blowing -x | fan WITHOUT the entrain licence: bed %s, air %s "
+      "| smoke drifts %+.2f cells (unlicensed fan %+.2f) "
+      "| ASLEEP chamber, no smoke: %u chunks awake (0 with no fan), bed "
+      "creeps %+.2f "
+      "| grains %u/%u/%u | wake %u of %u chunks (%u without the licence) "
+      "| hash none %08x, fan %08x, repeat %s",
+      dEast, mEast, dWest, quietHeld ? "unmoved bitwise" : "MOVED",
+      quietBlows ? "blowing" : "STILL",
+      east.smokeX - none.smokeX, quiet.smokeX - none.smokeX, dry.wakeActive,
+      dDry,
+      none.sandCount, east.sandCount,
+      west.sandCount, east.wakeMax, budget, quiet.wakeMax, none.hash, east.hash,
+      stable ? "identical" : "DIFFERS");
+
+  if (!creeps) detail += " -- a licensed fan did not move the settled bed";
+  if (!reverses) detail += " -- reversing the fan did not reverse the creep";
+  if (!quietHeld) detail += " -- an unlicensed fan moved settled powder";
+  if (!quietBlows) detail += " -- the unlicensed fan did not blow at all (the primitive field is not reaching the CA)";
+  if (!massOk) detail += " -- grain count changed (a lost voxel: see §10)";
+  if (!stable) detail += " -- twice-run equality failed with a fan blowing";
+  if (!bounded) detail += " -- the wake budget did not bind";
+  if (!wakes) detail += " -- the fan did not WAKE a sleeping bed (the footprint wake is not reaching the CA)";
+
+  const bool ok = creeps && reverses && quietHeld && quietBlows && massOk &&
+                  stable && bounded && wakes;
+  std::printf("wind-prim: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -469,6 +783,7 @@ const std::vector<Gate>& WindGates() {
   static const std::vector<Gate> g = {
       {"wind", "sim", {}, false, GateWind},
       {"wind-gas", "sim", {}, false, GateWindGas},
+      {"wind-prim", "sim", {}, false, GateWindPrim},
   };
   return g;
 }

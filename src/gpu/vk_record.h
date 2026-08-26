@@ -77,6 +77,7 @@ struct RecordCtx {
   uint32_t farCount = 0;
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
+  uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is

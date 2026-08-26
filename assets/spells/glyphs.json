@@ -71,6 +71,22 @@
       "desc": "Lays the spell's element behind the projectile. voxelBudget is a hard VOLUME budget (an op of radius r costs (2r+1)^3), not an op count, so a fat trail costs proportionally more; when it runs out the trail stops and the projectile dies. That bound is what stops a trail spell pinning chunks awake. radius 0 = one voxel per mark: at 48 voxels/tick a radius-1 mark costs 27 voxels, so anything wider spends the whole budget within a tick or two and reads as a blob rather than a trail."
     },
     {
+      "id": "gust",
+      "type": "modifier",
+      "modifier": "gust",
+      "mana": 5,
+      "desc": "Moves the AIR rather than the matter. Where the spell resolves, a wind primitive is placed — a parametric jet with a position, an axis, a strength and a lifetime — and the wind system does the rest: smoke streams, spray is thrown, foliage leans, and inside the footprint SETTLED powder can be pulled loose (see wind.entrain). Nothing here knows what sand is and no sim rule knows what a spell is; they meet at the primitive. Repeating it doubles the SPEED, not the size — twice as hard a wind through the same opening — because widening the footprint would multiply the chunk-wake cost eightfold for one extra word. Bare 'gust' blows from your hand; 'gust projectile' throws a bolt that gusts where it lands; a fatal 'gust' goes off in your own chest.",
+      "wind": {
+        "comment": "kind: cone (a jet: fans, gust bolts, wind walls) | burst (radial push, or a vacuum at negative speed) | vortex (swirl about the axis, with swirl/rise as the tangential and axial shares). speed is m/s. radius and reach are world cells. ticks is the hard lifetime bound (rule 2). entrain grants the licence to pull SETTLED powder loose inside the footprint, which is what spends the per-tick chunk wake budget — leave it off for a decorative puff.",
+        "kind": "cone",
+        "speed": 26,
+        "radius": 7,
+        "reach": 36,
+        "ticks": 40,
+        "entrain": true
+      }
+    },
+    {
       "id": "transmute",
       "type": "modifier",
       "modifier": "transmute_to",
@@ -87,6 +103,11 @@
         "id": "firebolt",
         "glyphs": ["lava", "trail", "projectile"],
         "desc": "The worked example: a lava bolt that leaves a burning wake."
+      },
+      {
+        "id": "duststorm",
+        "glyphs": ["sand", "gust", "gust", "projectile"],
+        "desc": "A sand bolt that lands and then blows the landing flat: the spray puts matter down, the doubled gust pulls it and whatever else is loose downwind."
       },
       {
         "id": "acid_lance",

@@ -90,6 +90,7 @@ PIPE_TO_MEMBER = {
     "PIPE_PAGEFILL": "pageFill_",
     "PIPE_MUTATE": "mutate_",
     "PIPE_MUTATE_CELLS": "mutateCells_",
+    "PIPE_WIND_WAKE": "windWake_",
     "PIPE_COMPACT": "compact_",
     "PIPE_COMPACT_NEXT": "compactNext_",
     "PIPE_STEP": "step_",

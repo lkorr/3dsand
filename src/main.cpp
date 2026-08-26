@@ -48,6 +48,7 @@
 #include "sim/stream.h"
 #include "sim/voxload.h"
 #include "sim/wind.h"
+#include "sim/windprim.h"
 #include "sim/world.h"
 #include "sim/worldio.h"
 #include "telemetry.h"
@@ -63,6 +64,11 @@
 using namespace sandvox;
 
 namespace {
+// Owner handle for wind primitives placed from the DEV PANEL, so "clear all"
+// retires those and nothing else. A spell's gust owns itself (the casterId) and
+// expires on its own TTL; the panel has no business reaching into gameplay.
+constexpr uint64_t kDevFanOwner = 0xDEFA11Au;
+
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
@@ -1490,6 +1496,10 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
+  bool rebaseline = false;  // --rebaseline: write observed values into baseline.json
+  bool suiteAcceptance = false;  // --suite acceptance: one-process full acceptance
+  std::string sweepParam;   // --sweep sim.X=a,b,c
+  std::string sweepGate;    // --sweep-gate (default: determinism)
   // PAGED IS THE DEFAULT (2026-08-23, user decision): 4,975 resident pages =
   // 77.7 MiB against 512 MiB dense, both residency suites green at the phase-7
   // close. `--residency dense` stays available as the identity map and the
@@ -1540,7 +1550,11 @@ int main(int argc, char** argv) {
           "  --gate <name>         Run one selftest gate (repeatable)\n"
           "  --list                List available selftest gates\n"
           "  --json <path>         Write selftest results as JSON\n"
-          "  --baseline <path>     Selftest baseline file\n\n"
+          "  --baseline <path>     Selftest baseline file\n"
+          "  --rebaseline          Write observed values into baseline.json\n"
+          "  --suite acceptance    One-process selftest + both smokes + validation\n"
+          "  --sweep sim.X=a,b,c   In-process parameter sweep (hash per value)\n"
+          "  --sweep-gate <name>   Gate for --sweep (default: determinism)\n\n"
           "Shot / screenshot modes:\n"
           "  --shot                Screenshot-only look iteration\n"
           "  --shot-fluid          MPM fluid screenshot mode\n"
@@ -1723,6 +1737,22 @@ int main(int argc, char** argv) {
     // Turns on VK_LAYER_KHRONOS_validation with SYNCHRONIZATION validation —
     // the primary detector for a missing barrier (§6.2's detection ladder).
     else if (a == "--vk-validation") vkValidation = true;
+    else if (a == "--rebaseline") rebaseline = true;
+    else if (a == "--suite") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--suite requires a name\n"); return 1; }
+      std::string s = argv[++i];
+      if (s == "acceptance") suiteAcceptance = true;
+      else { std::fprintf(stderr, "--suite wants 'acceptance', got '%s'\n", s.c_str()); return 1; }
+    }
+    else if (a == "--sweep") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--sweep requires param=val1,val2,...\n"); return 1; }
+      sweepParam = argv[++i];
+      selftest = true;
+    }
+    else if (a == "--sweep-gate") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--sweep-gate requires a gate name\n"); return 1; }
+      sweepGate = argv[++i];
+    }
     else {
       std::fprintf(stderr, "unrecognized argument: '%s'\n"
                            "Run with --help for usage.\n", a.c_str());
@@ -1757,16 +1787,96 @@ int main(int argc, char** argv) {
   // adapter.
   if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
+  // --suite acceptance: one process, all measurements. The expensive part of a
+  // run is Vulkan device creation + SPIR-V compilation + worldgen. This
+  // amortizes that cost across selftest + both smokes in one invocation.
+  if (suiteAcceptance) {
+    double t0 = NowSeconds();
+    std::printf("=== sandvox --suite acceptance ===\n");
+    int failures = 0;
+
+    // Smokes first (they build their own GpuContext).
+    std::printf("\n--- vk-smoke (quiet) ---\n");
+    int r1 = sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation,
+                                 true, rebaseline);
+    if (r1 != 0) failures++;
+
+    std::printf("\n--- vk-smoke-loud ---\n");
+    int r2 = sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation,
+                                     true, rebaseline);
+    if (r2 != 0) failures++;
+
+    // Selftest (paged, the default — builds its own GpuContext further down,
+    // but --suite shortcuts past the asset load below). We need to do the same
+    // setup the normal selftest path does.
+    {
+      std::printf("\n--- selftest (paged) ---\n");
+      std::string ad = AssetDir();
+      Tuning tune;
+      LoadTuning(ad + "/materials/tuning.json", tune);
+      SetCurrentTuning(tune);
+      std::vector<MaterialDef> m;
+      std::vector<ReactionGpu> rx;
+      std::string errs;
+      if (!LoadAssets(ad + "/materials/materials.json",
+                      ad + "/materials/reactions.json", m, rx, errs)) {
+        std::fprintf(stderr, "asset load failed:\n%s\n", errs.c_str());
+        return 1;
+      }
+      MicroSet mic;
+      { std::string ml; LoadMicroVox(ad + "/materials/materials.json", ad, m, mic, ml); }
+      GpuContext stCtx;
+      if (!stCtx.Init(nullptr, 1600, 900, lowPowerAdapter, false, backend,
+                      vkValidation, sledgehammer))
+        return 1;
+      World stWorld;
+      stWorld.residency = World::Residency::Paged;
+      stWorld.Init(stCtx.device);
+      Simulation stSim;
+      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, ad + "/shaders"))
+        return 1;
+      Physics stPhys; stPhys.Init();
+      DebrisSystem stDebris; stDebris.Init(&stPhys, &stWorld, m, rx);
+      MobSystem stMobs; stMobs.Init(&stPhys, &stWorld, &stDebris, m);
+      MicroBodySet stMbSet;
+      stDebris.SetMicroSet(&stMbSet);
+      stMobs.SetMicroSet(&stMbSet);
+      {
+        std::vector<MobDef> defs;
+        std::string ml;
+        LoadMobDefs(ad + "/mobs", m, defs, stMbSet, ml);
+        ItemLibrary stItems;
+        std::string ie;
+        LoadItems(ad + "/items", m.size(), stMbSet, stItems, ie);
+        stSim.UploadMicroBodies(stCtx.queue, stMbSet);
+        stMobs.SetDefs(std::move(defs));
+        Stream stStream;
+        stStream.Init(&stCtx, &stWorld, &stSim, kDefaultSeed);
+        stStream.OnMaterialsReloaded(m);
+        selftest::Options so;
+        if (rebaseline) so.rebaseline = true;
+        selftest::Ctx sc{stCtx, stWorld, stSim, m, stPhys, stDebris, stMobs, stStream, stItems};
+        int r3 = selftest::Run(sc, so);
+        if (r3 != 0) failures++;
+      }
+    }
+
+    double elapsed = NowSeconds() - t0;
+    std::printf("\n=== suite acceptance %s (%.1fs) ===\n",
+                failures == 0 ? "PASS" : "FAIL", elapsed);
+    return failures == 0 ? 0 : 1;
+  }
+
   // Every mode below — the 23 selftest gates, --shot/--shot-mob, --measure and
   // the windowed game (swapchain + imgui_impl_vulkan) — runs on Vulkan, the
   // only backend. The smokes build their own GpuContext, so they run here
   // before the game's asset load.
   if (vkSmoke)
     return sandvox::RunVkSmoke(lowPowerAdapter, sledgehammer, vkValidation,
-                               residencyPaged);
+                               residencyPaged, rebaseline);
   if (vkSmokeLoud)
     return sandvox::RunVkSmokeLoud(lowPowerAdapter, sledgehammer, vkValidation,
-                                   residencyPaged);
+                                   residencyPaged, rebaseline);
 
   std::string assetDir = AssetDir();
   // Tuning first: LoadShader() bakes these into every shader's constant
@@ -1925,6 +2035,80 @@ int main(int argc, char** argv) {
                          stOpt.jsonPath);
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);
+  if (rebaseline) stOpt.rebaseline = true;
+
+  // --sweep sim.X=a,b,c [--sweep-gate <gate>]: run the determinism check at
+  // each value, in-process, without touching any files. Proves a tuning knob
+  // reaches the kernel (different values → different hashes).
+  if (!sweepParam.empty()) {
+    // Parse "sim.windDragRef=6,40,120" → field "windDragRef", values [6,40,120]
+    size_t dot = sweepParam.find('.');
+    size_t eq = sweepParam.find('=');
+    if (dot == std::string::npos || eq == std::string::npos || eq <= dot) {
+      std::fprintf(stderr, "--sweep wants sim.field=val1,val2,...\n");
+      return 1;
+    }
+    std::string field = sweepParam.substr(dot + 1, eq - dot - 1);
+    std::string valStr = sweepParam.substr(eq + 1);
+    std::vector<float> vals;
+    {
+      size_t p = 0;
+      while (p < valStr.size()) {
+        size_t c = valStr.find(',', p);
+        if (c == std::string::npos) c = valStr.size();
+        vals.push_back(std::stof(valStr.substr(p, c - p)));
+        p = c + 1;
+      }
+    }
+    if (vals.empty()) { std::fprintf(stderr, "--sweep: no values\n"); return 1; }
+
+    Tuning baseTuning = CurrentTuning();
+    if (!SetSimField(baseTuning, field, vals[0])) {
+      std::fprintf(stderr, "--sweep: unknown sim field '%s'\n", field.c_str());
+      return 1;
+    }
+
+    std::string gate = sweepGate.empty() ? "determinism" : sweepGate;
+    constexpr int kSweepTicks = 100;
+    std::printf("=== sweep sim.%s over %zu values, gate %s, %d ticks ===\n",
+                field.c_str(), vals.size(), gate.c_str(), kSweepTicks);
+
+    SetHarnessSnapshotDrain(true);
+    std::vector<uint32_t> hashes;
+    for (size_t vi = 0; vi < vals.size(); vi++) {
+      Tuning t = baseTuning;
+      SetSimField(t, field, vals[vi]);
+      SetCurrentTuning(t);
+      sim.ReloadShaders(ctx.device);
+      SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      ctx.WaitIdle();
+      for (uint32_t tick = 1; tick <= kSweepTicks; tick++) {
+        SubmitTick(ctx, world, sim, tick, kDefaultSeed,
+                   SelftestOps(tick), SelftestExps(tick, kDefaultSeed), {},
+                   tick == kSweepTicks, {8, 3, 8}, false,
+                   SelftestParticlesActive(tick));
+      }
+      uint32_t h = ReadHashSync(ctx, world);
+      hashes.push_back(h);
+      std::printf("  sim.%s = %.4g  →  hash %08x\n", field.c_str(), vals[vi], h);
+    }
+    SetCurrentTuning(baseTuning);
+
+    bool allSame = true;
+    for (size_t i = 1; i < hashes.size(); i++)
+      if (hashes[i] != hashes[0]) allSame = false;
+    if (allSame) {
+      std::printf("\n*** ALL HASHES IDENTICAL — the parameter does not reach "
+                  "the kernel at these values ***\n");
+    } else {
+      // Count distinct hashes
+      std::unordered_set<uint32_t> unique(hashes.begin(), hashes.end());
+      std::printf("\n  parameter REACHES the kernel (%zu distinct hash%s)\n",
+                  unique.size(), unique.size() == 1 ? "" : "es");
+    }
+    return 0;
+  }
+
   if (selftest) {
     if (stOpt.list) return selftest::List();
     selftest::Ctx sc{ctx, world, sim, mats, phys, debris, mobs, stream, items};
@@ -3435,6 +3619,75 @@ int main(int argc, char** argv) {
         // (island checks, body damage, mob carving, impulse), not a second one.
         spellExps = std::move(emit.explosions);
         for (const ParticleSpawn& p : emit.spawns) spawns.push_back(p);
+        // WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3). The VM reported the
+        // intent; this is the owner splicing it on, exactly as it does for
+        // brush ops and particle spawns above. `spawnTick` is stamped HERE and
+        // not in the VM, because a primitive's whole motion and lifetime are
+        // f(t - spawnTick) and the tick a spell resolves on is the caller's
+        // fact, not the VM's.
+        //
+        // Spawn() refuses when the world list is full (32) rather than evicting
+        // someone's fan, and the refusal is COUNTED for the same reason the op
+        // overflow above is: "my gust sometimes does nothing" is miserable to
+        // diagnose from silence.
+        for (WindPrim w : emit.winds) {
+          w.spawnTick = tick;
+          w.ownerId = 0x9134A5EEu;   // the same casterId the projectile carries
+          if (!WindPrims().Spawn(w)) ui.windPrimsDropped++;
+        }
+
+        // ---- the dev-panel producer (docs/RESEARCH_wind.md §4.3) ------------
+        // A placed fan, from the same panel the wind multipliers live on. It
+        // exists because the gameplay producers are CONTENT — a gust is a glyph
+        // in glyphs.json, a fan will be a prefab tag — and neither is a good way
+        // to answer "what does a 30 m/s cone actually do to that dune?".
+        //
+        // It goes through WindPrims().Spawn() like everything else. There is no
+        // dev-only path into the wind system, which is what makes what you see
+        // here the same thing a spell would produce.
+        //
+        // ANCHORED IN FRONT OF THE CAMERA, aimed along the view ray, with an
+        // INFINITE TTL: that is what makes it a fan rather than a gust, and it
+        // is why "clear all" exists next to it. A fan holding its footprint
+        // awake forever is a rule-2 leak if you cannot retire it.
+        if (ui.placeWindFan) {
+          ui.placeWindFan = false;
+          const Vec3 fwd = cam.Forward();
+          const Vec3 at = player.EyePos() + fwd * 2.0f;
+          WindPrim w{};
+          w.x = ifloor(at.x);
+          w.y = ifloor(at.y);
+          w.z = ifloor(at.z);
+          w.kind = ui.windFanKind == 1   ? kWindPrimBurst
+                   : ui.windFanKind == 2 ? kWindPrimVortex
+                                         : kWindPrimCone;
+          w.radius = ui.windFanRadius;
+          w.reach = ui.windFanReach;
+          w.ttl = kWindPrimForever;
+          w.spawnTick = tick;
+          w.ownerId = kDevFanOwner;
+          w.flags = kWindPrimAir |
+                    (ui.windFanEntrain ? kWindPrimEntrain : 0u);
+          // A vortex with no swirl is a cone with extra steps, so the two
+          // shares are given here rather than left to the panel: 1.0 of the
+          // core speed tangentially and 0.5 axially is a tornado that both
+          // spins and lifts. They are the primitive's parameters, not knobs
+          // anyone has asked for yet.
+          if (w.kind == kWindPrimVortex) {
+            w.swirlQ = 65536;
+            w.riseQ = 32768;
+          }
+          WindPrimAim(w, fwd, ui.windFanSpeed);
+          if (!WindPrims().Spawn(w)) ui.windPrimsDropped++;
+        }
+        if (ui.clearWindFans) {
+          ui.clearWindFans = false;
+          // Only the dev-placed ones: a spell's gust owns itself and expires on
+          // its own TTL, and clearing it from here would be the panel reaching
+          // into gameplay.
+          WindPrims().RetireOwner(kDevFanOwner);
+          ui.windPrimsDropped = 0;
+        }
       }
 
       // support-loss flags from the sim (burnt stems, undermined slabs) feed
@@ -4034,6 +4287,11 @@ int main(int argc, char** argv) {
       ui.spellVerdict = caster.readout.verdict;
       ui.spellOutcome = (int)caster.lastOutcome;
       ui.liveProjectiles = spells.LiveCount();
+      // Wind primitives: what is alive and what it costs (§4.3). `windPrims`
+      // is the population; `windWakeChunks` is the rule-2 number — the chunks
+      // those primitives are holding awake so they can move settled matter.
+      ui.windPrims = (int)WindPrims().Count();
+      ui.windWakeChunks = (int)WindPrims().LastWakeCount();
       ui.glyphSlots.clear();
       for (int i = 0; i < kGlyphSlots; i++) {
         int gi = caster.inventory.At(i);

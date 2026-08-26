@@ -51,7 +51,7 @@ const std::vector<Gate>& SpellGates();
 const char* const kOrder[] = {
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
-    "evaporation", "wind",      "wind-gas",
+    "evaporation", "wind",      "wind-gas",   "wind-prim",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
@@ -227,6 +227,79 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
   std::printf("wrote %s\n", path.c_str());
 }
 
+void RebaselineSelftest(const std::string& path,
+                        const std::vector<Result>& results) {
+  // Read the determinism gate's observed hash from its detail string.
+  // The determinism gate's detail is "hash <hex> (N ticks, ...)" — the hash
+  // is the second token.
+  std::string newHash;
+  for (const Result& r : results) {
+    if (r.name == "determinism" && r.status == Status::Pass) {
+      // Parse "hash XXXXXXXX ..." from the detail
+      size_t p = r.detail.find("hash ");
+      if (p != std::string::npos) {
+        p += 5;
+        size_t e = r.detail.find(' ', p);
+        if (e == std::string::npos) e = r.detail.size();
+        newHash = r.detail.substr(p, e - p);
+      }
+    }
+  }
+
+  // Read baseline, replace values
+  std::ifstream fi(path);
+  if (!fi) {
+    std::fprintf(stderr, "rebaseline: cannot read %s\n", path.c_str());
+    return;
+  }
+  std::string text((std::istreambuf_iterator<char>(fi)),
+                   std::istreambuf_iterator<char>());
+  fi.close();
+
+  // Update determinismHash if we have a new one
+  if (!newHash.empty() && newHash != g_goldenHash) {
+    std::string oldKey = "\"determinismHash\": \"" + g_goldenHash + "\"";
+    std::string newKey = "\"determinismHash\": \"" + newHash + "\"";
+    size_t p = text.find(oldKey);
+    if (p != std::string::npos)
+      text = text.substr(0, p) + newKey + text.substr(p + oldKey.size());
+    std::printf("\n*** determinismHash: %s -> %s ***\n", g_goldenHash.c_str(),
+                newHash.c_str());
+  }
+
+  // Update gate pass/fail status
+  int changed = 0;
+  for (const Result& r : results) {
+    if (r.status == Status::Skip) continue;
+    const char* newVal = r.status == Status::Pass ? "pass" : "fail";
+    // Find "gatename": "pass"|"fail" and replace the value
+    std::string keyPat = "\"" + r.name + "\"";
+    size_t p = text.find(keyPat);
+    if (p == std::string::npos) continue;
+    size_t colon = text.find(':', p + keyPat.size());
+    if (colon == std::string::npos) continue;
+    size_t q1 = text.find('"', colon + 1);
+    if (q1 == std::string::npos) continue;
+    size_t q2 = text.find('"', q1 + 1);
+    if (q2 == std::string::npos) continue;
+    std::string oldVal = text.substr(q1 + 1, q2 - q1 - 1);
+    if (oldVal != newVal) {
+      text = text.substr(0, q1 + 1) + newVal + text.substr(q2);
+      std::printf("  %s: %s -> %s\n", r.name.c_str(), oldVal.c_str(), newVal);
+      changed++;
+    }
+  }
+
+  std::ofstream fo(path);
+  if (!fo) {
+    std::fprintf(stderr, "rebaseline: cannot write %s\n", path.c_str());
+    return;
+  }
+  fo << text;
+  std::printf("\n*** REBASELINED %s (%d gate%s changed) ***\n", path.c_str(),
+              changed, changed == 1 ? "" : "s");
+}
+
 }  // namespace
 
 const std::string& GoldenDeterminismHash() { return g_goldenHash; }
@@ -349,6 +422,7 @@ int Run(Ctx& c, const Options& opt) {
   }
 
   if (!opt.jsonPath.empty()) WriteJson(opt.jsonPath, results);
+  WriteJson("build/last_run.json", results);
 
   // Verdict. A gate already failing in the baseline is reported but does not
   // turn the run red — that is the whole point: an agent sees at a glance
@@ -425,9 +499,18 @@ int Run(Ctx& c, const Options& opt) {
       std::printf("\n%u page fault%s: a sim kernel wrote through a sentinel and"
                   " the voxel was LOST (PLAN_page_table.md risk 1)",
                   pageFaults, pageFaults == 1 ? "" : "s");
+    if (opt.rebaseline) {
+      std::printf("\n*** REFUSING to rebaseline: the run has errors ***\n");
+    }
     std::printf("\n=== selftest FAIL ===\n");
     return 1;
   }
+
+  if (opt.rebaseline) {
+    RebaselineSelftest(bpath, results);
+    std::printf("*** THIS WAS A REBASELINE, NOT A PASS. ***\n");
+  }
+
   std::printf("=== selftest PASS === (%zu known failure%s carried)\n",
               inherited.size(), inherited.size() == 1 ? "" : "s");
   return 0;

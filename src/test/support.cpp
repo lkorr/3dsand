@@ -11,10 +11,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 #include "gpu/resources.h"
 #include "sim/farfield.h"
 #include "sim/wind.h"
+#include "sim/windprim.h"
 
 namespace sandvox {
 
@@ -142,6 +144,22 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     rp.windSpeed = wind.speed;
     rp.windGust = wind.gust;
   }
+  // WIND PRIMITIVES (§4.3). The SAME resolved list SubmitTick shipped to the
+  // sim this tick — WindPrims() is advanced there and read here, which is what
+  // makes the grass lean in a fan's blast and the debug arrows agree with the
+  // smoke. Copied rather than shared because the sim and render bind groups
+  // deliberately have no buffer in common.
+  {
+    const WindPrimSystem& wp = WindPrims();
+    const uint32_t n = std::min(wp.Count(), kWindPrimCap);
+    rp.windPrimCount = n;
+    const IVec3 lo = wp.BoundsLo(), hi = wp.BoundsHi();
+    rp.windPrimLo[0] = lo.x; rp.windPrimLo[1] = lo.y; rp.windPrimLo[2] = lo.z;
+    rp.windPrimHi[0] = hi.x; rp.windPrimHi[1] = hi.y; rp.windPrimHi[2] = hi.z;
+    for (uint32_t i = 0; i < n; i++)
+      std::memcpy(&rp.windPrims[i * kWindPrimWords], wp.Resolved()[i].w,
+                  kWindPrimWords * sizeof(int32_t));
+  }
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
@@ -221,6 +239,45 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       if (r > 2147483000.0) r = 2147483000.0;
       tp.windDragRefQ = r < 65536.0 ? 65536 : (int32_t)r;
     }
+  }
+  // ---- WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3) ------------------------
+  //
+  // Advanced HERE, in the one function the game loop, --shot and every gate go
+  // through, for the reason this file exists at all: a second call site that
+  // resolved the list at a different tick would ship the sim a fan that is
+  // somewhere the renderer does not draw it, and that reads as a shader bug.
+  // Everything downstream — the render copy in WriteRenderParams, the wake
+  // list below, the page-table footprint declaration after BeginTick — reads
+  // what this call produced.
+  //
+  // An EMPTY list writes count 0 and the empty AABB, and every shader consumer
+  // takes an exact-identity early-out on that, so a world with no fans in it is
+  // bit-identical to one built before wind primitives existed.
+  std::vector<uint32_t> windWake;
+  {
+    WindPrimSystem& wp = WindPrims();
+    wp.Tick(tick);
+    const uint32_t n = std::min(wp.Count(), kWindPrimCap);
+    tp.windPrimCount = n;
+    const IVec3 lo = wp.BoundsLo(), hi = wp.BoundsHi();
+    tp.windPrimLo[0] = lo.x; tp.windPrimLo[1] = lo.y; tp.windPrimLo[2] = lo.z;
+    tp.windPrimHi[0] = hi.x; tp.windPrimHi[1] = hi.y; tp.windPrimHi[2] = hi.z;
+    for (uint32_t i = 0; i < n; i++)
+      std::memcpy(&tp.windPrims[i * kWindPrimWords], wp.Resolved()[i].w,
+                  kWindPrimWords * sizeof(int32_t));
+
+    // THE FOOTPRINT WAKE (§10). Only primitives holding the entrainment
+    // licence produce one, and the snapshot's occupancy filters out the sky —
+    // so a decorative gust costs nothing and a fan aimed at a dune wakes the
+    // dune. The budget is charged here, before emission, and the refusals are
+    // counted rather than hidden.
+    const WorldSnapshot& sn = world.Snap();
+    static const std::vector<uint32_t> kNoOcc;
+    wp.BuildWake(world, sn.valid ? sn.occupancy : kNoOcc,
+                 (uint32_t)std::max(0, CurrentTuning().sim.windWakeChunks),
+                 windWake);
+    tp.windWakeCount = (uint32_t)windWake.size();
+    for (size_t i = 0; i < windWake.size(); i++) tp.windWake[i] = windWake[i];
   }
   // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except
   // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList
@@ -390,6 +447,18 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.AddOpBox({e.x, e.y, e.z}, kMaxExplosionRadius, world);  // EXP_BOX
   for (uint32_t i = 0; i < cellCount; i++)
     pt.AddOpTarget(cells[i].cellIdx / kChunkVol);  // already a slot chunk index
+  // THE WHOLE POINT OF THE FOOTPRINT WAKE (docs/RESEARCH_wind.md §10). The
+  // chunks a wind primitive is about to dirty-mark are declared as OP TARGETS,
+  // in the same breath and from the same list, so they are materialized with
+  // their 26-ring before the command buffer exists.
+  //
+  // This is what repairs the page table's soundness argument. `cpuDirty` is
+  // tightened against a lagging snapshot, and that tightening is only sound
+  // because settled matter writes nothing — entrainment is the first rule that
+  // makes resting voxels move, and switching it on without this lost 62 voxels
+  // to page faults across two 160-tick runs. A grain that hops into a
+  // neighbouring chunk now hops into one the CPU already said could be written.
+  for (uint32_t slot : windWake) pt.AddOpTarget(slot);
   {
     std::vector<IVec3> spawnCells, expCenters;
     spawnCells.reserve(spawnCount);
@@ -460,8 +529,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // the population already in flight is proven empty (or not) by the snapshot
   // conjunct below. It used to be here, and it held the latch off for the whole
   // 400-tick post-explosion window main.cpp keeps the pipeline alive for.
+  //
+  // windWake is in the list because it IS a chunk-dirtying input: a settled
+  // world with a fan pointed at a dune would otherwise prove itself idle and
+  // skip the CA rows the wake had just made necessary, and the fan would mark
+  // chunks nothing then simulated.
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
-                               spawnCount > 0 ||
+                               spawnCount > 0 || !windWake.empty() ||
                                fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
@@ -496,7 +570,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.EncodePageFill(enc, jitterFills);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
-                 fluidLive + fluidSpawnCount, fluidSpawnCount);
+                 fluidLive + fluidSpawnCount, fluidSpawnCount,
+                 (uint32_t)windWake.size());
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the

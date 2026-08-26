@@ -616,6 +616,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   farDown_ = MakeComputePipeline(device, farPL_, mWorldgen, "fardown", "farDown");
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
   mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells");
+  // The wind primitive footprint wake — same module, third entry point. It
+  // needs only dirtyIn/dirtyOut and TickParams, all of which simPL_ already
+  // binds, so a fan costs no new binding and no new layout.
+  windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake");
   compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact");
   compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext");
   step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step");
@@ -666,7 +670,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // there — but on Vulkan a null pipeline would make the recorder silently
   // skip the row, which is a wrong SIM, not a crash. Fail the build instead.
   if (!worldgen_ || !worldgenList_ || !pageFill_ || !farFill_ || !farDown_ || !mutate_ ||
-      !mutateCells_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !mutateCells_ || !windWake_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
@@ -734,6 +738,7 @@ struct RecordCtx {
   uint32_t farCount = 0;
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
+  uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced
@@ -827,6 +832,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::PageFill:       return pageFill_;
     case P::Mutate:         return mutate_;
     case P::MutateCells:    return mutateCells_;
+    case P::WindWake:       return windWake_;
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
@@ -900,6 +906,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.farCount = cx.farCount;
   tc.fluidCount = cx.fluidCount;
   tc.fluidSpawnCount = cx.fluidSpawnCount;
+  tc.windWakeCount = cx.windWakeCount;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -1152,7 +1159,8 @@ void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
 void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
                             uint32_t cellCount, uint32_t spawnCount,
-                            uint32_t fluidCount, uint32_t fluidSpawnCount) {
+                            uint32_t fluidCount, uint32_t fluidSpawnCount,
+                            uint32_t windWakeCount) {
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
@@ -1160,6 +1168,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.spawnCount = spawnCount;
   cx.fluidCount = fluidCount;
   cx.fluidSpawnCount = fluidSpawnCount;
+  cx.windWakeCount = windWakeCount;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
 
@@ -1178,8 +1187,13 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // exists is covered by NoteSnapshot's particleCount conjunct, which is exact
   // rather than a timer. Putting it here re-stamped lastDirtyTick_ every tick
   // for 13.3 s after every explosion and disabled the whole skip.
+  // windWakeCount belongs in this disjunction for exactly the reason the
+  // backstop exists: a wind primitive's wake IS a chunk-dirtying input, and a
+  // settled world with a fan pointed at a dune would otherwise prove itself
+  // idle and skip the CA rows the wake had just made necessary — the fan would
+  // mark chunks nothing then simulated.
   const bool inputsThisTick = opsCount > 0 || expCount > 0 || cellCount > 0 ||
-                              spawnCount > 0 ||
+                              spawnCount > 0 || windWakeCount > 0 ||
                               fluidCount > 0 || fluidSpawnCount > 0;
   if (inputsThisTick) {
     lastDirtyTick_ = curTick_;

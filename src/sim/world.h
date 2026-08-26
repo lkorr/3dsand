@@ -765,6 +765,65 @@ constexpr uint32_t kMaxMicroBodyModels = 256;
 // A micro body's model has no micro model when its slot maps here.
 constexpr uint32_t kMicroBodyNoModel = 0xFFFFFFFFu;
 
+// ---- WIND PRIMITIVE ceilings and encoding (src/sim/windprim.h owns the
+// system; these live here because they are the GPU LAYOUT, which is world.h's
+// job — must match WIND_PRIM_* / WPRIM_* in assets/shaders/common.wgsl) ----
+//
+// Live primitives world-wide. Every one is summed at every wind sample inside
+// the union AABB, so this is a per-sample cost as much as a memory one. 32 is
+// far more than a scene needs and keeps the worst-case inner loop comparable
+// to windAtQ's own ~150 integer ops.
+constexpr uint32_t kWindPrimCap = 32;
+// i32 words per resolved primitive: 3 x vec4<i32>.
+constexpr uint32_t kWindPrimWords = 12;
+// kWindPrimCap * kWindPrimWords, written as a LITERAL on purpose.
+// scripts/check_invariants.py's `params` check parses a C++ array dimension as
+// a bare identifier bound to an integer literal; an expression makes it fail to
+// parse the field and SKIP the whole TickParams comparison silently — which is
+// exactly the class of failure that check exists to catch. The static_assert
+// below is what keeps the literal honest.
+constexpr uint32_t kWindPrimScalars = 384;
+static_assert(kWindPrimScalars == kWindPrimCap * kWindPrimWords,
+              "kWindPrimScalars must equal kWindPrimCap * kWindPrimWords");
+// Chunks a tick may WAKE across all primitives — the rule-2 budget, and the
+// one number that decides whether a fan is free. 128 chunks is the scale of a
+// small explosion, refreshed per tick; a primitive that does not fit is
+// refused rather than silently trimmed.
+constexpr uint32_t kWindWakeCap = 128;
+// Largest radius / axial reach a primitive may declare, world cells (51 m).
+// Load-bearing twice: it bounds the footprint the wake budget is spent on, and
+// it bounds every intermediate in the integer field evaluation (see the
+// overflow argument above windPrimAtQ in common.wgsl).
+constexpr int32_t kWindPrimMaxExtent = 512;
+// Largest strength, world cells/s (40 m/s). Caps the summed field at 32x that,
+// which is what keeps the Q16.16 accumulator inside i32.
+constexpr int32_t kWindPrimMaxSpeed = 400;
+// TTL sentinel: a fan blows until something removes it.
+constexpr uint32_t kWindPrimForever = 0xFFFFFFFFu;
+
+// Primitive kinds — must match WPRIM_* in common.wgsl. Three shapes, chosen
+// because they span what the requirements ask for: a directed jet (fans,
+// gusts, wind walls), an omnidirectional push or pull (blast fronts, vacuums),
+// and a swirl about an axis (tornado, whirlpool). Anything else is these
+// composed, which is the point of making them summable.
+constexpr uint32_t kWindPrimCone = 0;
+constexpr uint32_t kWindPrimBurst = 1;
+constexpr uint32_t kWindPrimVortex = 2;
+
+// Primitive flags — must match WPRIM_F_* in common.wgsl.
+//
+// The MEDIUM MASK is carried from day one on purpose (RESEARCH_wind.md §8):
+// the field core is medium-agnostic and an ocean current or a whirlpool is the
+// same primitive with a different mask. Deciding it later would mean an
+// op-format change after the format is already a save format.
+constexpr uint32_t kWindPrimAir = 1u << 0;
+constexpr uint32_t kWindPrimWater = 1u << 1;
+// THE ENTRAINMENT LICENCE. Inside this primitive's footprint, settled powder
+// whose authored friction the wind beats may be pulled loose. Off by default:
+// it is the flag that costs chunk wakes, and a decorative gust has no business
+// rearranging the terrain it blows past.
+constexpr uint32_t kWindPrimEntrain = 1u << 2;
+
 // Must match TickParams in common.wgsl.
 struct TickParams {
   uint32_t tick;
@@ -841,6 +900,46 @@ struct TickParams {
   // switched on. On the tick stream with the two multipliers, and for the same
   // reason: it exists to be dragged.
   int32_t windDragRefQ = (int32_t)(40.0f / kVoxelMeters * 65536.0f + 0.5f);
+
+  // ---- WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3; src/sim/windprim.h) ----
+  //
+  // The player-facing half of the wind system: fans, spell gusts, tornadoes —
+  // a bounded list of parametric objects evaluated analytically at any sample
+  // point, exactly the way a point light is. Everything above this line is the
+  // ambient field, which is scenery; this is the part that is a tool.
+  //
+  // WHY THEY RIDE THE UNIFORM AND NOT A STORAGE BUFFER. The list is at most
+  // 32 x 48 bytes of per-tick CPU-authored configuration, which is what a
+  // uniform is for. Putting it in a storage buffer would mean a new binding in
+  // BOTH group-0 layouts (common.wgsl is prepended to every shader, so one
+  // identifier cannot carry two binding numbers), a new pass_table row set, a
+  // new barrier class, and the same again on the render side — for 1.5 KiB
+  // that changes once a tick. As it is, the whole feature costs no new
+  // binding, no new barrier and no new dispatch except the wake below.
+  //
+  // ZERO PRIMITIVES IS AN EXACT IDENTITY. windPrimCount == 0 makes every
+  // consumer take an untouched early-out, so the pinned world hash cannot move
+  // until someone actually puts a fan in the world. `windPrimLo > windPrimHi`
+  // is the empty-box convention (the fluid render AABB's), and it is the
+  // whole-loop reject for samples outside every footprint.
+  uint32_t windPrimCount = 0;
+  // Chunk slots this tick's primitives want awake — see the wake note in
+  // windprim.h. Consumed by sim_mutate.wgsl's `windWake` entry point, which is
+  // the ONLY thing in the engine that dirty-marks a chunk without writing a
+  // voxel, and which exists so that entrainment's writes land in chunks the
+  // CPU declared before the command buffer was built.
+  uint32_t windWakeCount = 0;
+  uint32_t pad_wp0 = 0, pad_wp1 = 0;
+  int32_t windPrimLo[3] = {1, 1, 1};   // union AABB of every live primitive,
+  int32_t pad_wp2 = 0;                 // inclusive world cells (lo > hi = none)
+  int32_t windPrimHi[3] = {0, 0, 0};
+  int32_t pad_wp3 = 0;
+  // kWindPrimCap primitives x kWindPrimWords i32 words. Declared WGSL-side as
+  // array<vec4<i32>, 3 * WIND_PRIM_CAP>, which is the same bytes: std140
+  // strides a uniform array to 16 B, so three rows per primitive is the
+  // densest legal packing and windPrimLoad is the only decoder.
+  int32_t windPrims[kWindPrimScalars] = {};
+  uint32_t windWake[kWindWakeCap] = {};
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -1068,6 +1167,29 @@ struct RenderParams {
   float windDir[2] = {0.0f, 1.0f};  // unit XZ, pointing DOWNWIND
   float windSpeed = 0.0f;           // mean speed, cells/s
   float windGust = 0.0f;            // gust band amplitude, cells/s
+
+  // ---- wind primitives, the RENDER copy (docs/RESEARCH_wind.md §4.3) ------
+  // The SAME resolved list TickParams carries, in the same encoding, written
+  // from the same WindPrimSystem in the same frame. It is duplicated rather
+  // than shared because the sim and the render bind groups deliberately have
+  // no buffer in common (the arrow only ever points sim -> render), and 1.5 KiB
+  // a frame is a cheaper price than a shared binding.
+  //
+  // THIS IS WHY THE GRASS LEANS IN A FAN'S BLAST without anyone wiring grass
+  // to fans: raymarch.wgsl's sway samples windAt(), windAt() sums the
+  // primitives, and the debug overlay samples the identical function. A
+  // visualiser or a foliage path with its own idea of where the gusts are
+  // would be a picture of a different wind (invariant 2).
+  //
+  // No fluidLo-style pad games needed: windGust ends a whole row, and the
+  // array's own 16-byte stride starts the next one.
+  uint32_t windPrimCount = 0;
+  uint32_t pad_wpr0 = 0, pad_wpr1 = 0, pad_wpr2 = 0;
+  int32_t windPrimLo[3] = {1, 1, 1};
+  int32_t pad_wpr3 = 0;
+  int32_t windPrimHi[3] = {0, 0, 0};
+  int32_t pad_wpr4 = 0;
+  int32_t windPrims[kWindPrimScalars] = {};
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

@@ -473,6 +473,98 @@ def check_fluid_substeps():
             f"the knob's default must agree")
 
 
+# ------------------------------------------------------ wind primitive layout
+def check_wind_prims():
+    """world.h's wind primitive ceilings must match common.wgsl's constants.
+
+    The layout itself is covered by check_gpu_structs (a mismatched cap makes
+    TickParams a different size and fails there). This catches the OTHER half:
+    the shader loops `i < min(count, WIND_PRIM_CAP)` and strides by
+    WIND_PRIM_ROWS, so a cap raised in world.h alone would leave the extra
+    primitives silently unread -- a fan that exists and does nothing, with a
+    green build, a green selftest and an unmoved hash.
+    """
+    wh = read("src/sim/world.h")
+    cw = read("assets/shaders/common.wgsl")
+    if not wh or not cw:
+        return
+    pairs = [("kWindPrimCap", "WIND_PRIM_CAP"),
+             ("kWindPrimWords", None)]
+    m = re.search(r"constexpr\s+uint32_t\s+kWindPrimCap\s*=\s*(\d+)", wh)
+    g = re.search(r"const\s+WIND_PRIM_CAP\s*:\s*u32\s*=\s*(\d+)u", cw)
+    r = re.search(r"const\s+WIND_PRIM_ROWS\s*:\s*u32\s*=\s*(\d+)u", cw)
+    w = re.search(r"constexpr\s+uint32_t\s+kWindPrimWords\s*=\s*(\d+)", wh)
+    if not (m and g and r and w):
+        return
+    checked.append("wind primitives")
+    if m.group(1) != g.group(1):
+        problems.append(
+            f"world.h kWindPrimCap = {m.group(1)} but common.wgsl "
+            f"WIND_PRIM_CAP = {g.group(1)} -- the shader would read a "
+            f"different number of primitives than the CPU uploads")
+    if int(r.group(1)) * 4 != int(w.group(1)):
+        problems.append(
+            f"common.wgsl WIND_PRIM_ROWS = {r.group(1)} (x4 scalars per row) "
+            f"but world.h kWindPrimWords = {w.group(1)} -- the shader would "
+            f"stride past the primitive it is decoding")
+
+
+# ------------------------------------------- the three per-tick count structs
+def check_tick_counts():
+    """The tick's counts cross THREE structs; all three must carry every field.
+
+    Simulation::RecordCtx (sim/simulation.cpp) -> rhi::TableCtx
+    (gpu/rhi_record.h) -> Recorder's RecordCtx (gpu/vk_record.h). Every pass
+    row's condition and dispatch extent is resolved from the LAST one, and the
+    two copies in between are hand-written field-by-field.
+
+    Miss one copy and the failure is silent in the worst way: the row's
+    condition reads a default-zero count, the row is never recorded, and there
+    is no error anywhere -- the feature simply does nothing. That is exactly
+    what happened to windWakeCount (a wind primitive shipped a wake list every
+    tick and no chunk ever woke), which is why this check exists.
+    """
+    sim = read("src/sim/simulation.cpp")
+    rec = read("src/gpu/rhi_record.h")
+    vkr = read("gpu/vk_record.h") or read("src/gpu/vk_record.h")
+    if not (sim and rec and vkr):
+        return
+    def fields(text, name, keyword="struct"):
+        body = _struct_body(_strip_comments(text), name, keyword)
+        if body is None:
+            return None
+        return {m.group(1) for m in
+                re.finditer("(?:uint32_t|bool)[ ]+([A-Za-z_][A-Za-z0-9_]*)[ ]*=", body)}
+    a = fields(sim, "RecordCtx")
+    b = fields(rec, "TableCtx")
+    c = fields(vkr, "RecordCtx")
+    if a is None or b is None or c is None:
+        return
+    checked.append("tick count structs")
+    for name, other, where in (("rhi::TableCtx", b, "src/gpu/rhi_record.h"),
+                               ("the recorder's RecordCtx", c,
+                                "src/gpu/vk_record.h")):
+        missing = sorted(a - other)
+        if missing:
+            problems.append(
+                f"{', '.join(missing)} is in Simulation::RecordCtx but not in "
+                f"{name} ({where}) -- the count never reaches the recorder, so "
+                f"every pass row conditioned on it is silently NEVER RECORDED")
+    # And the copies themselves, which are what actually move the values.
+    for f in sorted(a & b & c):
+        if f"tc.{f} = cx.{f};" not in sim:
+            problems.append(
+                f"Simulation::RecordTable never copies {f} into rhi::TableCtx "
+                f"-- the recorder sees the default, not this tick's value")
+    vk = read("src/gpu/rhi_vk.cpp")
+    if vk:
+        for f in sorted(a & b & c):
+            if f"cxv.{f} = cx.{f};" not in vk:
+                problems.append(
+                    f"rhi_vk.cpp never copies {f} from rhi::TableCtx into the "
+                    f"recorder's RecordCtx -- same silent-skip failure")
+
+
 ALL = {
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
@@ -481,6 +573,8 @@ ALL = {
     "world": check_world_consts,
     "arch": check_arch_paths,
     "params": check_gpu_structs,
+    "windprim": check_wind_prims,
+    "counts": check_tick_counts,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -495,7 +589,12 @@ RELEVANT = {
     "src/sim/materials.cpp": ["render"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
-    "src/sim/world.h": ["world", "params", "substeps"],
+    "src/sim/world.h": ["world", "params", "substeps", "windprim"],
+    "src/sim/simulation.cpp": ["counts"],
+    "src/gpu/rhi_record.h": ["counts"],
+    "src/gpu/vk_record.h": ["counts"],
+    "src/gpu/rhi_vk.cpp": ["counts"],
+    "src/sim/pass_table.def": ["counts"],
 }
 
 if __name__ == "__main__":
@@ -509,7 +608,7 @@ if __name__ == "__main__":
                 if norm.endswith(key):
                     run += checks
             if norm.endswith(".wgsl"):
-                run += ["tuning", "world", "params"]
+                run += ["tuning", "world", "params", "windprim"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

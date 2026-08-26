@@ -128,6 +128,18 @@ PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUT
 PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_COMPUTE, D_CELLS,1,1, GRP_SIM,       DYN_ZERO, C_CELLS, 1,
      USES(U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)
           R(PageTable) A(PageFaults)))
+// WIND PRIMITIVE FOOTPRINT WAKE (docs/RESEARCH_wind.md §4.3, §10). Sets the
+// dirty flag on the chunks a fan/gust/tornado declared this tick, so a SETTLED
+// dune under one of them is simulated at all. It writes no voxel and reads no
+// voxel: the whole row is two atomic stores per listed chunk.
+//
+// Placed HERE, after the mutation rows and before `compact`, because the
+// compaction is what turns dirty flags into this tick's dispatch list — a wake
+// recorded after it would take effect one tick late, which reads as a fan with
+// lag. The two atomic uses are what generate the barrier against compact's
+// read of DirtyIn.
+PASS(windWake, "prep(mutate+explode+compact)", PT_TICK, PIPE_WIND_WAKE, K_COMPUTE, D_WINDWAKE,1,1, GRP_SIM, DYN_ZERO, C_WINDWAKE, 1,
+     USES(U(TickUBO) A(DirtyIn) A(DirtyOut)))
 // mark reads the neighborhood, apply writes it. The two-phase split is what
 // makes the explosion kernel race-free (CLAUDE.md build gotchas); it only works
 // if the barrier between them exists, which under Dawn was free.

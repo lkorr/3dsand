@@ -314,6 +314,9 @@ add_executable(sandvox
   src/sim/materials.cpp
   src/sim/tuning.cpp
   src/sim/celestial.cpp
+  # Wind primitives: fans / spell gusts / vortices as op-stream parametric
+  # objects (docs/RESEARCH_wind.md §4.3).
+  src/sim/windprim.cpp
   src/sim/voxload.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp

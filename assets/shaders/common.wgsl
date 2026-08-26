@@ -390,6 +390,26 @@ struct TickParams {
   // Ramp reference for the drag-tier RATE, Q16.16 world cells/s — the wind
   // speed at which sim.windDrag applies in full. See windDragRampQ below.
   windDragRefQ   : i32,
+  // ---- WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3; src/sim/windprim.h) ----
+  // Fans, spell gusts, tornadoes: a bounded list of parametric objects summed
+  // analytically at every sample, like point lights. See the long note on the
+  // C++ side of this struct for why they ride the uniform (no new binding, no
+  // new barrier) and why a count of zero is an exact identity.
+  windPrimCount : u32,
+  windWakeCount : u32,   // chunk slots to dirty-mark — sim_mutate's windWake
+  padWp0 : u32,
+  padWp1 : u32,
+  windPrimLo : vec3<i32>,   // union AABB, inclusive world cells; the whole-loop
+  padWp2 : i32,             // early-out. lo > hi means "no primitives".
+  windPrimHi : vec3<i32>,
+  padWp3 : i32,
+  // WIND_PRIM_CAP primitives x 3 rows. The literal 96 is deliberate: this file
+  // and world.h are compared by scripts/check_invariants.py on TOTAL SIZE, so a
+  // cap changed on one side and not the other fails the check rather than
+  // silently reading zeros. Keep 96 = 3 * kWindPrimCap.
+  windPrims : array<vec4<i32>, 96>,
+  // kWindWakeCap slots, four to a std140 row.
+  windWake : array<vec4<u32>, 32>,
 };
 
 // Must match kWindScaleOne / kWindScaleMax in src/sim/world.h.
@@ -399,6 +419,18 @@ const WINDQ_SCALE_ONE : i32 = 256;
 const WIND_MODE_OFF     : u32 = 0u;
 const WIND_MODE_DRIFT   : u32 = 1u;
 const WIND_MODE_ENTRAIN : u32 = 2u;
+
+// ---- wind primitive encoding — must match src/sim/world.h ------------------
+const WIND_PRIM_CAP  : u32 = 32u;
+const WIND_PRIM_ROWS : u32 = 3u;    // vec4<i32> rows per primitive
+const WPRIM_CONE   : u32 = 0u;
+const WPRIM_BURST  : u32 = 1u;
+const WPRIM_VORTEX : u32 = 2u;
+const WPRIM_KIND_MASK : u32 = 0xFu;
+const WPRIM_F_SHIFT   : u32 = 4u;
+const WPRIM_F_AIR     : u32 = 1u;
+const WPRIM_F_WATER   : u32 = 2u;
+const WPRIM_F_ENTRAIN : u32 = 4u;
 
 // ---- day phase helpers (integer; sim-side) ----
 // 0 = midnight, 0x4000 = sunrise, 0x8000 = noon, 0xC000 = sunset.
@@ -552,6 +584,20 @@ struct RenderParams {
   windDir    : vec2f,  // unit XZ, pointing DOWNWIND
   windSpeed  : f32,    // mean speed, world cells/s (m/s x 10)
   windGust   : f32,    // gust band amplitude, world cells/s
+  // ---- wind primitives, the RENDER copy (§4.3) ---------------------------
+  // The same resolved list TickParams carries, in the same encoding, from the
+  // same WindPrimSystem in the same frame — which is why the grass leans in a
+  // fan's blast with nothing wiring grass to fans, and why the debug arrows
+  // are evidence rather than decoration (invariant 2: ONE field function).
+  windPrimCount : u32,
+  _pwpr0 : u32,
+  _pwpr1 : u32,
+  _pwpr2 : u32,
+  windPrimLo : vec3<i32>,
+  _pwpr3 : i32,
+  windPrimHi : vec3<i32>,
+  _pwpr4 : i32,
+  windPrims : array<vec4<i32>, 96>,   // 3 * WIND_PRIM_CAP — see TickParams
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -889,12 +935,115 @@ fn windMeanWS(s : WindSample) -> vec3f {
   return vec3f(s.mean.x, 0.0, s.mean.y);
 }
 
+// ====================== WIND PRIMITIVES (research doc §4.3) =================
+// Fans, spell gusts, tornadoes. A primitive is ~48 bytes of parameters summed
+// ANALYTICALLY at the sample point, exactly the way a point light is: no
+// lattice, no resolution to pick, nothing stored per voxel or per chunk. The
+// whole list rides the uniform, so a scene with none of them costs one compare.
+//
+// THREE SHAPES, and they are summable, which is what stops the set from having
+// to grow: a directed jet (fan / gust bolt / wind wall), an omnidirectional
+// push or pull (blast front / vacuum), and a swirl about an axis (tornado /
+// whirlpool). A moving primitive is not animated here — its position was
+// resolved on the CPU this tick from `origin + vel * age`, so the shader sees
+// where it IS and never has to know when it started.
+//
+// PROFILES. Radial falloff is QUADRATIC in the distance from the axis
+// (1 - r²/R²) and axial falloff is LINEAR (1 - a/L). Quadratic radially
+// because it costs no square root — r² is what the dot products already give —
+// and because a soft-shouldered jet reads better than a hard-edged one. The
+// integer transcription below relies on that choice: there is no isqrt
+// anywhere in the primitive path, which is what keeps it affordable in the CA's
+// inner loop.
+//
+// THE BURST HAS NO WIND AT ITS EXACT CENTRE, and that is honest rather than a
+// bug: `v = d * k` takes its direction from the offset itself (again, no square
+// root), so the magnitude rises from zero at the origin, peaks partway out and
+// tapers to nothing at the rim. A blast centre genuinely has no preferred
+// outward direction, and one cell of stagnation is invisible next to the shell.
+
+// Vortex inflow as a fraction of the tangential swirl. A tornado that only
+// span would never gather anything into itself; one that only sucked would be
+// a drain. 0.30 is the ratio that makes debris spiral IN rather than orbit or
+// fall straight down, and it is a constant rather than a knob because it is a
+// property of the shape, not of a particular tornado.
+const WPRIM_INFLOW : f32 = 0.30;
+const WPRIM_INFLOW_Q8 : i32 = 77;   // the same 0.30, Q8, for the integer path
+
+// One primitive's contribution at a float sample point, world cells/s.
+// TRANSCRIBED from — and by — the integer evaluator windPrimEvalQ below; the
+// two are adjacent for the reason windAt and windAtQ are, and the same standing
+// obligation applies: change a profile in one, change it in the other in the
+// same edit. Float here rather than a conversion of the integer answer because
+// a blade of grass sits at a fractional position and quantising it to whole
+// cells makes a fan's rim band visibly across a meadow.
+fn windPrimEvalF(p : vec3f, w0 : vec4<i32>, w1 : vec4<i32>,
+                 w2 : vec4<i32>) -> vec3f {
+  let kind = u32(w0.w) & WPRIM_KIND_MASK;
+  let pos = vec3f(f32(w0.x), f32(w0.y), f32(w0.z));
+  let dir = vec3f(f32(w1.x), f32(w1.y), f32(w1.z)) * (1.0 / 65536.0);
+  let s = f32(w1.w) * (1.0 / 65536.0);      // cells/s, envelope already applied
+  let rad = max(f32(w2.x), 1.0);
+  let len = max(f32(w2.y), 1.0);
+  let swirl = f32(w2.z) * (1.0 / 65536.0);
+  let rise = f32(w2.w) * (1.0 / 65536.0);
+
+  let d = p - pos;
+  let d2 = dot(d, d);
+  let rr = rad * rad;
+
+  if (kind == WPRIM_BURST) {
+    if (d2 > rr) { return vec3f(0.0); }
+    return d * ((s / rad) * (1.0 - d2 / rr));
+  }
+
+  let ax = dot(d, dir);
+  let r2 = max(0.0, d2 - ax * ax);
+  if (r2 > rr) { return vec3f(0.0); }
+  let radW = 1.0 - r2 / rr;
+
+  if (kind == WPRIM_VORTEX) {
+    if (abs(ax) > len) { return vec3f(0.0); }
+    let axW = 1.0 - abs(ax) / len;
+    let perp = d - dir * ax;              // radial offset from the axis
+    let tang = cross(dir, perp);          // same length as perp, 90 deg round
+    let g = (s / rad) * radW * axW;
+    return (tang * swirl - perp * WPRIM_INFLOW) * g +
+           dir * (rise * s * radW * axW);
+  }
+
+  // WPRIM_CONE: a jet, live only in front of the mouth.
+  if (ax < 0.0 || ax > len) { return vec3f(0.0); }
+  return dir * (s * radW * (1.0 - ax / len));
+}
+
+// The primitive sum at a point, world cells/s. Zero primitives is one compare;
+// a point outside every footprint is four.
+fn windPrimAt(p : vec3f, R : RenderParams) -> vec3f {
+  if (R.windPrimCount == 0u) { return vec3f(0.0); }
+  // The UNION AABB reject. Without it every sample in the world would run the
+  // per-primitive test 32 times to discover it is nowhere near any of them;
+  // with it, the loop is paid only where a primitive actually is. `lo > hi` is
+  // the empty convention, so this also covers a count that outran the list.
+  let pi = vec3<i32>(floor(p));
+  if (any(pi < R.windPrimLo) || any(pi > R.windPrimHi)) { return vec3f(0.0); }
+  var acc = vec3f(0.0);
+  let n = min(R.windPrimCount, WIND_PRIM_CAP);
+  for (var i = 0u; i < n; i = i + 1u) {
+    let b = i * WIND_PRIM_ROWS;
+    acc += windPrimEvalF(p, R.windPrims[b], R.windPrims[b + 1u],
+                         R.windPrims[b + 2u]);
+  }
+  return acc;
+}
+
 // THE FIELD. Everything above exists so that this and the per-blade path are
 // the same arithmetic. Call this unless you need per-instance decorrelation.
 fn windAt(p : vec3f, t : f32, R : RenderParams) -> vec3f {
   let s = windSampleAt(p, t, 0.0, R);
   return windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
-                       + windBandWS(s, s.b2) * WIND_BAND_W2;
+                       + windBandWS(s, s.b2) * WIND_BAND_W2
+                       + windPrimAt(p, R);
 }
 
 // THE FIELD, scaled by a dev multiplier. Used by the PARTICLE TIER (ballistic
@@ -1122,6 +1271,155 @@ const WINDQ_ALT_REF_Y : i32 = i32(round(TUNE_WIND_ALT_REF_Y));
 const WINDQ_ALT_MIN   : i32 = 9830;     // 0.15 in Q16.16
 const WINDQ_ALT_MAX   : i32 = 262144;   // 4.0
 
+// ---- wind primitives, in integers (research doc §4.3) ----------------------
+// The transcription of windPrimEvalF above. Same three shapes, same profiles,
+// same constants — and, like windAtQ against windAt, it is transcribed rather
+// than shared because the two number systems cannot share code, and the only
+// defence against drift is that they sit in one file with this note between
+// them. If you change a profile up there, change it here in the same edit.
+//
+// OVERFLOW, which is the whole difficulty and is bounded by construction:
+//   * the Chebyshev reject caps |d| at max(radius, reach) + 1 <= 513, so
+//     d2 <= 3 * 513^2 and every dot product stays under 2^27.
+//   * radial/axial weights are carried in Q10 (1024 = 1.0), never Q16.16, so
+//     `r2 * 1024` cannot leave i32 for any legal radius.
+//   * the burst and vortex scale by `strength / radius` BEFORE multiplying by
+//     an offset that is itself bounded by the radius. The radius cancels, so
+//     the product is bounded by the strength however the two are chosen — that
+//     cancellation is why there is no clamp in the inner loop.
+//   * strength is capped CPU-side at kWindPrimMaxSpeed (400 cells/s, 2^24.6)
+//     and the list at 32, so the accumulated sum cannot leave i32 either.
+//
+// PRECISION. The burst/vortex per-cell gradient is formed as
+// (strength/radius / 64) * (weight / 16) rather than the more obvious
+// (.../1024) * weight, which is the same scale with four more bits kept — the
+// obvious form silently truncates a weak, wide burst to nothing.
+fn windPrimEvalQ(p : vec3<i32>, w0 : vec4<i32>, w1 : vec4<i32>,
+                 w2 : vec4<i32>) -> vec3<i32> {
+  let rad = max(w2.x, 1);
+  let len = max(w2.y, 1);
+  let d = p - w0.xyz;
+  // Chebyshev reject before anything is squared: this is what bounds every
+  // intermediate below, so it must come first and must use the LARGER extent.
+  let ext = max(rad, len) + 1;
+  if (max(max(abs(d.x), abs(d.y)), abs(d.z)) > ext) { return vec3<i32>(0); }
+
+  let kind = u32(w0.w) & WPRIM_KIND_MASK;
+  let dir = w1.xyz;                        // Q16.16 unit axis
+  let sQ = w1.w;                           // Q16.16 cells/s, envelope applied
+  let d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+  let rr = rad * rad;
+
+  if (kind == WPRIM_BURST) {
+    if (d2 > rr) { return vec3<i32>(0); }
+    let t10 = 1024 - (d2 * 1024) / rr;               // 0..1024
+    let perQ = sQ / rad;                             // Q16.16 per cell
+    let tapQ = (perQ / 64) * (t10 / 16);             // = perQ * t10 / 1024
+    return d * tapQ;                                 // |d| <= rad, so <= sQ
+  }
+
+  let ax = (d.x * dir.x + d.y * dir.y + d.z * dir.z) / 65536;   // cells
+  let r2 = max(0, d2 - ax * ax);
+  if (r2 > rr) { return vec3<i32>(0); }
+  let rad10 = 1024 - (r2 * 1024) / rr;
+
+  if (kind == WPRIM_VORTEX) {
+    if (abs(ax) > len) { return vec3<i32>(0); }
+    let ax10 = 1024 - (abs(ax) * 1024) / len;
+    let g10 = (rad10 * ax10) / 1024;
+    // Radial offset from the axis, and the tangent 90 degrees round it. Both
+    // in whole cells and both bounded by the radius, which is what lets them
+    // be multiplied by the per-cell gradient without a clamp.
+    let along = vec3<i32>((dir.x * ax) / 65536, (dir.y * ax) / 65536,
+                          (dir.z * ax) / 65536);
+    let perp = d - along;
+    let tang = vec3<i32>((dir.y * perp.z - dir.z * perp.y) / 65536,
+                         (dir.z * perp.x - dir.x * perp.z) / 65536,
+                         (dir.x * perp.y - dir.y * perp.x) / 65536);
+    let sw = w2.z >> 8u;                             // swirl, Q8
+    let mix = vec3<i32>((tang.x * sw - perp.x * WPRIM_INFLOW_Q8) / 256,
+                        (tang.y * sw - perp.y * WPRIM_INFLOW_Q8) / 256,
+                        (tang.z * sw - perp.z * WPRIM_INFLOW_Q8) / 256);
+    let perQ = sQ / rad;
+    let gQ = (perQ / 64) * (g10 / 16);
+    // Axial lift: a share of the full strength, not of the per-cell gradient,
+    // because a tornado lofts at its own speed rather than in proportion to
+    // how far out you stand.
+    let liftQ = (wq(w2.w, sQ) / 1024) * g10;
+    return mix * gQ + vec3<i32>(wq(dir.x, liftQ), wq(dir.y, liftQ),
+                                wq(dir.z, liftQ));
+  }
+
+  // WPRIM_CONE.
+  if (ax < 0 || ax > len) { return vec3<i32>(0); }
+  let ax10 = 1024 - (ax * 1024) / len;
+  let w10 = (rad10 * ax10) / 1024;
+  let sw = (sQ / 1024) * w10;
+  return vec3<i32>(wq(dir.x, sw), wq(dir.y, sw), wq(dir.z, sw));
+}
+
+// The primitive sum at a world cell, Q16.16 cells/s. Zero primitives is one
+// compare, which is what makes this hash-neutral until someone places a fan.
+fn windPrimAtQ(p : vec3<i32>, T : TickParams) -> vec3<i32> {
+  if (T.windPrimCount == 0u) { return vec3<i32>(0); }
+  if (any(p < T.windPrimLo) || any(p > T.windPrimHi)) { return vec3<i32>(0); }
+  var acc = vec3<i32>(0);
+  let n = min(T.windPrimCount, WIND_PRIM_CAP);
+  for (var i = 0u; i < n; i = i + 1u) {
+    let b = i * WIND_PRIM_ROWS;
+    acc += windPrimEvalQ(p, T.windPrims[b], T.windPrims[b + 1u],
+                         T.windPrims[b + 2u]);
+  }
+  return acc;
+}
+
+// IS THIS CELL INSIDE A PRIMITIVE THAT LICENSES ENTRAINMENT (invariant 4)?
+//
+// This is the gate that makes settled powder movable, and it is deliberately a
+// SEPARATE, cheaper question than "what is the wind here". Entrainment is the
+// one rule in the engine that makes resting matter move, and the page table's
+// materialization set is only sound because resting matter writes nothing
+// (RESEARCH_wind.md §10 — switching it on globally lost 62 voxels to page
+// faults). A cell may therefore be entrained only where a primitive DECLARED
+// its footprint this tick, because declaring it is what put the chunk in
+// `opTargets` and got its page materialized before the dispatch that writes it.
+//
+// The test is the primitive's own geometry with the profiles left out: being
+// inside is a yes/no, and asking the full evaluator would pay for three
+// multiplies of a weight nobody reads.
+fn windPrimEntrainsQ(p : vec3<i32>, T : TickParams) -> bool {
+  if (T.windPrimCount == 0u) { return false; }
+  if (any(p < T.windPrimLo) || any(p > T.windPrimHi)) { return false; }
+  let n = min(T.windPrimCount, WIND_PRIM_CAP);
+  for (var i = 0u; i < n; i = i + 1u) {
+    let b = i * WIND_PRIM_ROWS;
+    let w0 = T.windPrims[b];
+    if (((u32(w0.w) >> WPRIM_F_SHIFT) & WPRIM_F_ENTRAIN) == 0u) { continue; }
+    let w2 = T.windPrims[b + 2u];
+    let rad = max(w2.x, 1);
+    let len = max(w2.y, 1);
+    let d = p - w0.xyz;
+    let ext = max(rad, len) + 1;
+    if (max(max(abs(d.x), abs(d.y)), abs(d.z)) > ext) { continue; }
+    let d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+    let rr = rad * rad;
+    let kind = u32(w0.w) & WPRIM_KIND_MASK;
+    if (kind == WPRIM_BURST) {
+      if (d2 <= rr) { return true; }
+      continue;
+    }
+    let dir = T.windPrims[b + 1u].xyz;
+    let ax = (d.x * dir.x + d.y * dir.y + d.z * dir.z) / 65536;
+    if (max(0, d2 - ax * ax) > rr) { continue; }
+    if (kind == WPRIM_VORTEX) {
+      if (abs(ax) <= len) { return true; }
+      continue;
+    }
+    if (ax >= 0 && ax <= len) { return true; }
+  }
+  return false;
+}
+
 // THE FIELD, for the sim. Q16.16 world cells per second at world cell `p`.
 //
 // Returns the ZERO vector when sim.windMode is off, which is what makes phase 1
@@ -1169,10 +1467,15 @@ fn windAtQ(p : vec3<i32>, T : TickParams) -> vec3<i32> {
   let w2 = vec3<i32>(wq(amp, wq(d.x, b2a) + wq(cw.x, b2c)),
                      wq(amp, b2u),
                      wq(amp, wq(d.y, b2a) + wq(cw.y, b2c)));
-  // windMeanWS() + the 0.7/0.3 mix.
+  // windMeanWS() + the 0.7/0.3 mix, then the primitive sum. The primitives are
+  // ADDED to the ambient field rather than replacing it, which is what makes a
+  // fan feel like it is blowing INTO weather instead of switching the weather
+  // off inside a box — and it is why a gust bolt fired downwind carries further
+  // than one fired upwind with no code saying so.
   return vec3<i32>(wq(d.x, spd), 0, wq(d.y, spd)) +
          vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
-         vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z));
+         vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z)) +
+         windPrimAtQ(p, T);
 }
 
 // ---- particles: voxels in flight (DESIGN.md §5) ----

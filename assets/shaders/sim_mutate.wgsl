@@ -120,3 +120,49 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   let l = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
   markBoth(slotToWorldChunk(sc, T.origin) * i32(CHUNK) + l);
 }
+
+// ---- WIND PRIMITIVE FOOTPRINT WAKE (docs/RESEARCH_wind.md §4.3, §10) -------
+//
+// The one thing in the engine that dirty-marks a chunk WITHOUT writing a voxel,
+// and the reason phase 2 had to land before entrainment could be switched on.
+//
+// A settled sand dune is asleep. Its chunk carries no dirty flag, it is not in
+// the compacted dispatch list, and no CA invocation ever visits it — so a fan
+// pointed at it would do nothing at all, however hard it blew. Something has to
+// wake the footprint, and the ambient field is categorically not allowed to
+// (invariant 3: an exposed dune under a steady breeze would re-mark its own
+// chunks for as long as the weather held, which is rule 2 with the sign
+// flipped).
+//
+// A PRIMITIVE can, because it is bounded and player-caused. The CPU resolves
+// the footprint (WindPrimSystem::BuildWake), filters it against the snapshot's
+// occupancy so a cube of sky costs nothing, charges it against a per-tick chunk
+// budget, and ships the surviving SLOT indices in TickParams. This kernel is
+// the last step: set the flag.
+//
+// WHY THAT ORDER IS THE WHOLE POINT. The same CPU pass that fills this list
+// also declares those chunks to the page table as op targets, so they are
+// materialized WITH THEIR 26-RING before the command buffer is built. The page
+// table's materialization set is tightened against a lagging snapshot on the
+// argument that settled matter writes nothing — entrainment breaks that
+// argument, and this is what repairs it: by the time a grain steps into a
+// neighbouring chunk, the CPU had already said that chunk could be written.
+// Without it the write lands on a sentinel and the voxel is simply lost (62
+// reproducible faults over two 160-tick runs; §10).
+//
+// Both flags, exactly as markBoth sets them: dirtyIn so the chunk simulates
+// THIS tick (the compaction runs after this kernel), dirtyOut so it is
+// re-checked next tick even if nothing moved. Idempotent stores, never atomic
+// arithmetic, so the order two invocations land in cannot matter.
+//
+// Dispatch: ceil(windWakeCount / 64) workgroups of 64. Zero primitives with the
+// entrainment licence means zero count means the row is not recorded at all.
+@compute @workgroup_size(64)
+fn windWake(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= T.windWakeCount) { return; }
+  // The list is four slots to a std140 row (world.h TickParams).
+  let slot = T.windWake[gid.x / 4u][gid.x % 4u];
+  if (slot >= NCHUNK * NCHUNK * NCHUNK) { return; }
+  atomicStore(&dirtyIn[slot], 1u);
+  atomicStore(&dirtyOut[slot], 1u);
+}

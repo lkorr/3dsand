@@ -197,6 +197,78 @@ void EmitV3(std::ostringstream& o, const char* name, const float v[3]) {
 const Tuning& CurrentTuning() { return g_current; }
 void SetCurrentTuning(const Tuning& t) { g_current = t; }
 
+bool SetSimField(Tuning& t, const std::string& name, float value) {
+  auto& s = t.sim;
+  // Integer sim fields
+  struct IntEntry { const char* n; int Tuning::Sim::*p; };
+  static const IntEntry iFields[] = {
+    {"partGravity", &Tuning::Sim::partGravity},
+    {"partMaxVel", &Tuning::Sim::partMaxVel},
+    {"airDensity", &Tuning::Sim::airDensity},
+    {"falloffPerCell", &Tuning::Sim::falloffPerCell},
+    {"ejectSolid", &Tuning::Sim::ejectSolid},
+    {"ejectLiquid", &Tuning::Sim::ejectLiquid},
+    {"ejectPowder", &Tuning::Sim::ejectPowder},
+    {"ejectGas", &Tuning::Sim::ejectGas},
+    {"liquidEqualize", &Tuning::Sim::liquidEqualize},
+    {"liquidMinFilm", &Tuning::Sim::liquidMinFilm},
+    {"wanderHopMask", &Tuning::Sim::wanderHopMask},
+    {"expMicroPerMille", &Tuning::Sim::expMicroPerMille},
+    {"expMicroLifeTicks", &Tuning::Sim::expMicroLifeTicks},
+    {"expMicroScaleIdx", &Tuning::Sim::expMicroScaleIdx},
+    {"fluidEosPower", &Tuning::Sim::fluidEosPower},
+    {"fluidExciteMode", &Tuning::Sim::fluidExciteMode},
+    {"fluidExciteCeiling", &Tuning::Sim::fluidExciteCeiling},
+    {"fluidExciteRate", &Tuning::Sim::fluidExciteRate},
+    {"fluidExcitePerch", &Tuning::Sim::fluidExcitePerch},
+    {"fluidExciteStep", &Tuning::Sim::fluidExciteStep},
+    {"fluidSettleTicks", &Tuning::Sim::fluidSettleTicks},
+    {"fluidSplashScaleIdx", &Tuning::Sim::fluidSplashScaleIdx},
+    {"fluidFoamScaleIdx", &Tuning::Sim::fluidFoamScaleIdx},
+    {"windMode", &Tuning::Sim::windMode},
+  };
+  for (const auto& e : iFields) {
+    if (name == e.n) { s.*(e.p) = (int)value; return true; }
+  }
+  // Float sim fields
+  struct FloatEntry { const char* n; float Tuning::Sim::*p; };
+  static const FloatEntry fFields[] = {
+    {"fluidGravity", &Tuning::Sim::fluidGravity},
+    {"fluidStiffness", &Tuning::Sim::fluidStiffness},
+    {"fluidRestDensity", &Tuning::Sim::fluidRestDensity},
+    {"fluidCohesion", &Tuning::Sim::fluidCohesion},
+    {"fluidViscosity", &Tuning::Sim::fluidViscosity},
+    {"fluidDamping", &Tuning::Sim::fluidDamping},
+    {"fluidFriction", &Tuning::Sim::fluidFriction},
+    {"fluidSplashRate", &Tuning::Sim::fluidSplashRate},
+    {"fluidSplashSpeed", &Tuning::Sim::fluidSplashSpeed},
+    {"fluidSplashMaxDensity", &Tuning::Sim::fluidSplashMaxDensity},
+    {"fluidSplashLife", &Tuning::Sim::fluidSplashLife},
+    {"fluidFoamRate", &Tuning::Sim::fluidFoamRate},
+    {"fluidFoamCrestRate", &Tuning::Sim::fluidFoamCrestRate},
+    {"fluidSettledMass", &Tuning::Sim::fluidSettledMass},
+    {"fluidSettleEps", &Tuning::Sim::fluidSettleEps},
+    {"fluidWakeSpeed", &Tuning::Sim::fluidWakeSpeed},
+    {"fluidStainRate", &Tuning::Sim::fluidStainRate},
+    {"windDrag", &Tuning::Sim::windDrag},
+    {"windFluidGain", &Tuning::Sim::windFluidGain},
+    {"windFluidMass", &Tuning::Sim::windFluidMass},
+    {"windDriftSpeed", &Tuning::Sim::windDriftSpeed},
+    {"windDriftMax", &Tuning::Sim::windDriftMax},
+    {"windEntrainSpeed", &Tuning::Sim::windEntrainSpeed},
+    {"windEntrainRate", &Tuning::Sim::windEntrainRate},
+    {"windGasScale", &Tuning::Sim::windGasScale},
+    {"windPartScale", &Tuning::Sim::windPartScale},
+    {"windDragRef", &Tuning::Sim::windDragRef},
+    {"fluidAttractSame", &Tuning::Sim::fluidAttractSame},
+    {"fluidAttractDiff", &Tuning::Sim::fluidAttractDiff},
+  };
+  for (const auto& e : fFields) {
+    if (name == e.n) { s.*(e.p) = value; return true; }
+  }
+  return false;
+}
+
 // ---- variance draws ------------------------------------------------------
 // Hash from sim/rng.h: the draw is a pure function of (seed, tick, index), so
 // it is identical on every machine and a replay reproduces it. Never seed this
@@ -721,6 +793,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "windGasScale", s.windGasScale, out, at);
     ReadF(*g, "windPartScale", s.windPartScale, out, at);
     ReadF(*g, "windDragRef", s.windDragRef, out, at);
+    ReadI(*g, "windWakeChunks", s.windWakeChunks, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -901,6 +974,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // ramp in dead calm and quietly restore the fixed-rate behaviour this
     // replaces — which is a bug report about gravity, not about wind.
     clampWarnF(s.windDragRef, 1.0f, 200.0f, "windDragRef");
+    // The wake budget cannot exceed the TickParams array it is copied into;
+    // 0 is a legal "no primitive may wake anything", which is the switch that
+    // turns entrainment off without turning the fans off.
+    if (s.windWakeChunks < 0 || s.windWakeChunks > (int)kWindWakeCap) {
+      out.warnings.push_back("sim.windWakeChunks out of 0..128; clamped");
+      s.windWakeChunks = s.windWakeChunks < 0 ? 0 : (int)kWindWakeCap;
+    }
     // Both of these are packed into bit fields in Particle.flags; an
     // out-of-range value would wrap into the neighbouring field rather than
     // merely looking wrong, so clamp instead of trusting the file.

@@ -131,6 +131,7 @@ struct Options {
   std::string jsonPath;           // --json PATH
   std::string baselinePath;       // --baseline PATH
   bool list = false;              // --list
+  bool rebaseline = false;        // --rebaseline
 };
 
 // The GOLDEN world hash, read from tests/baseline.json's "determinismHash" key,

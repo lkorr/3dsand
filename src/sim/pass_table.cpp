@@ -34,6 +34,7 @@ namespace {
 #define PIPE_WORLDGEN_LIST   Pipe::WorldgenList
 #define PIPE_MUTATE          Pipe::Mutate
 #define PIPE_MUTATE_CELLS    Pipe::MutateCells
+#define PIPE_WIND_WAKE       Pipe::WindWake
 #define PIPE_COMPACT         Pipe::Compact
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
@@ -104,8 +105,10 @@ namespace {
 #define C_DENSEWG   Cond::DenseWorldgen
 #define C_FARCOUNT  Cond::FarCount
 #define C_FLUIDSPAWN Cond::FluidSpawn
+#define C_WINDWAKE  Cond::WindWake
 #define C_CAACTIVE  Cond::CaActive
 
+#define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
 #define D_CELLS     (uint32_t)DispatchSel::Cells
 #define D_EXP       (uint32_t)DispatchSel::Exp
