@@ -714,8 +714,61 @@ def check_worldgen_mirror():
             f"has: {stale}. The shader moved and the CPU copy did not.")
 
 
+# --------------------------------------------------- worldgen length units
+# Every `worldgen` tuning row is authored at refVoxelsPerMetre voxels/metre and
+# LoadTuning rescales it to the live kVoxelMeters -- but only if it declared
+# what KIND of quantity it is. A distance must be scaled, a noise cell (a log2
+# exponent) must be shifted, a probability or a 0..255 threshold or a Q8 gradient
+# must be left alone, and getting that wrong is invisible: the world simply
+# stops meaning the same thing at a different voxel size, in one feature.
+#
+# So the worldgen block of LoadTuning may not use the unit-less ReadI/ReadU at
+# all. This is not style -- it is what makes "add a row" a decision rather than a
+# default, which matters because package C of the terrain overhaul adds ~45 of
+# them. The one exception is refVoxelsPerMetre itself, which IS the scale.
+WG_READERS = ("ReadWgLen", "ReadWgCellLog2", "ReadWgPerLen", "ReadWgCount")
+
+
+def check_worldgen_units():
+    tuning, table = read("src/sim/tuning.cpp"), read("src/sim/tuning_params.def")
+    if not tuning or not table:
+        return
+    m = re.search(r'if \(const json\* g = Find\(j, "worldgen"\)\) \{(.*?)\n    // These divide',
+                  tuning, re.S)
+    if not m:
+        problems.append("worldgen units: could not find LoadTuning's worldgen "
+                        "block (check this regex against tuning.cpp)")
+        return
+    checked.append("worldgen length units")
+    body = _decomment(m.group(1))
+
+    for name in re.findall(r'\bReadI\(\*g, "(\w+)"', body) + \
+                re.findall(r'\bReadU\(\*g, "(\w+)"', body):
+        if name == "refVoxelsPerMetre":
+            continue
+        problems.append(
+            f"worldgen.{name} is read with a unit-less ReadI/ReadU. Every row in "
+            f"this group must declare whether it is a length, a noise-cell log2, "
+            f"a per-length rate or a pure count -- use one of {WG_READERS}, or "
+            f"the row silently means something different at a different voxel "
+            f"size (src/sim/world.h kVoxelsPerMetre)")
+
+    # And every row in the table must actually be read, or it is dead.
+    rows = {m2.group(1) for m2 in
+            re.finditer(r"^TP_[IUF]\(worldgen,\s*(\w+),", table, re.M)}
+    got = set()
+    for fn in WG_READERS + ("ReadI", "ReadU"):
+        got |= set(re.findall(rf'\b{fn}\(\*g, "(\w+)"', body))
+    for name in sorted(rows - got):
+        problems.append(
+            f"worldgen.{name} is a row in tuning_params.def but LoadTuning never "
+            f"reads it -- it will silently hold its tuning.h default and ignore "
+            f"tuning.json")
+
+
 ALL = {
     "worldgen": check_worldgen_mirror,
+    "wgunits": check_worldgen_units,
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
@@ -731,9 +784,9 @@ ALL = {
 RELEVANT = {
     "assets/sound_schema.js": ["sound"],
     "src/audio/cues.cpp": ["sound"],
-    "src/sim/tuning.cpp": ["tuning"],
+    "src/sim/tuning.cpp": ["tuning", "wgunits"],
     "src/sim/tuning.h": ["tuning"],
-    "src/sim/tuning_params.def": ["tuning", "substeps"],
+    "src/sim/tuning_params.def": ["tuning", "substeps", "wgunits"],
     "scripts/tuning_prelude.py": ["tuning"],
     "assets/tuner.html": ["render", "arch"],
     "src/sim/materials.cpp": ["render"],

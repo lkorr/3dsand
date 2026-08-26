@@ -1870,6 +1870,12 @@ struct Tuning {
 
   // ---- worldgen (integer; regenerating the world is required to see edits) ----
   struct Worldgen {
+    // The scale every LENGTH below is authored at. LoadTuning multiplies those
+    // rows by kVoxelsPerMetre / this, so the group means the same physical
+    // world at any voxel size. Dimensionless rows (chances, 0..255 thresholds,
+    // the Q8 slope) are untouched, because a probability and a gradient do not
+    // have a length in them.
+    int refVoxelsPerMetre = 10;
     int treeline = 72;
     int baseHeight = 32;
     // Noise cells are LOG2 EXPONENTS (6 = 64 voxels, 4 = 16, 9 = 512), which is

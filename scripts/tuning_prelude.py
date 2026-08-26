@@ -362,6 +362,7 @@ SPEC = [
     ("sim", "windEntrainRate", "TUNE_WIND_ENTRAIN_RATE", "f", 6.0),
 
     # worldgen (integer; needs a world regen to take effect)
+    ("worldgen", "refVoxelsPerMetre", "TUNE_REF_VOXELS_PER_METRE", "i", 10),
     ("worldgen", "treeline", "TUNE_TREELINE", "i", 72),
     ("worldgen", "baseHeight", "TUNE_BASE_HEIGHT", "i", 32),
     ("worldgen", "hillAmplitude", "TUNE_HILL_AMPLITUDE", "i", 42),

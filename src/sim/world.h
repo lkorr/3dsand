@@ -27,6 +27,23 @@ constexpr uint32_t kWorldN = 512;
 // it here and here only — shaders pick it up automatically.
 // Note: at the same kWorldN, smaller voxels shrink the world's physical size.
 constexpr float kVoxelMeters = 0.10f;
+
+// Voxels per metre — the integer reciprocal of the line above, DERIVED and
+// never restated. worldgen.wgsl carried a hand-written `VOX_PER_M = 16` while
+// the world ran at 10, which silently made every tree 1.6x the metre size its
+// own size table documents; nothing could catch that, because the two numbers
+// had no mechanical relationship. Emitted into WGSL as VOXELS_PER_M by
+// ShaderConstantPrelude().
+//
+// THIS IS THE KNOB FOR A VOXEL-SIZE EXPERIMENT. Change kVoxelMeters, rebuild,
+// and every length in worldgen follows: the tuning rows are authored at
+// worldgen.refVoxelsPerMetre and LoadTuning rescales them, and the shader's own
+// hardcoded lengths scale off VOXELS_PER_M / TUNE_REF_VOXELS_PER_METRE. What
+// does NOT follow, and is the real cost of halving: kWorldN is a fixed voxel
+// count, so the sim-live band halves in metres unless you double it (8x
+// memory), and surface area — which is what the page pool is charged for —
+// goes as the square.
+constexpr int kVoxelsPerMetre = (int)(1.0f / kVoxelMeters + 0.5f);
 constexpr uint32_t kChunk = 16;
 constexpr uint32_t kNChunk = kWorldN / kChunk;          // 32
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 32768

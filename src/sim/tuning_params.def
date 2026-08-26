@@ -506,6 +506,13 @@ TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 2.0f)
 TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
+// EVERY LENGTH IN THIS GROUP IS AUTHORED AT refVoxelsPerMetre VOXELS PER METRE,
+// and LoadTuning rescales it to whatever world.h's kVoxelMeters actually is. So
+// these numbers are read as "voxels at 10 per metre", i.e. decimetres, and a
+// voxel-size experiment is one edit to kVoxelMeters rather than 24 edits here.
+// Bump this row instead if you ever re-author the group at the new scale.
+// (The shader's own hardcoded lengths scale off VOXELS_PER_M / this.)
+TP_I(worldgen, refVoxelsPerMetre, TUNE_REF_VOXELS_PER_METRE, 10)
 TP_I(worldgen, treeline, TUNE_TREELINE, 72)
 TP_I(worldgen, baseHeight, TUNE_BASE_HEIGHT, 32)
 TP_I(worldgen, hillAmplitude, TUNE_HILL_AMPLITUDE, 42)

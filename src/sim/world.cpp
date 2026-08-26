@@ -539,6 +539,11 @@ static int fmodp(int a, int b) {
 // below can be read side by side with the shader's.
 static int select(int a, int b, bool c) { return c ? b : a; }
 static const Tuning::Worldgen& WG() { return CurrentTuning().worldgen; }
+// worldgen.wgsl's vlen(): the shader's hardcoded LENGTHS scaled from the
+// reference voxel size to the live one. The tuning ROWS were already rescaled
+// by LoadTuning, so this covers only what is written literally in the shader —
+// which on this side of the mirror is the authored set-piece geometry.
+static int vlen(int v) { return (v * kVoxelsPerMetre) / WG().refVoxelsPerMetre; }
 
 // MIRROR-BEGIN noise
 // The Q14 value noise of worldgen.wgsl, mirrored line for line. Read that
@@ -819,29 +824,34 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   if (sLabWorld) return kLabSlabY;
   int h = baseHeight(x, z, seed);
   // Authored origin-area set pieces, at their absolute world coordinates.
-  const int poolY = 44;
+  // Sizes scale with the voxel, centres do not — see the note over the same
+  // block in landColumn (worldgen.wgsl).
+  const int poolY = vlen(44);
   int pdx = x - 420; int pdz = z - 420;
   int pd2 = pdx * pdx + pdz * pdz;
-  if (pd2 < 68 * 68) {
+  int pR = vlen(68); int pRim = vlen(80);
+  if (pd2 < pR * pR) {
     h = poolY;
-  } else if (pd2 < 80 * 80) {
-    h = std::max(h, poolY + 26);
+  } else if (pd2 < pRim * pRim) {
+    h = std::max(h, poolY + vlen(26));
   }
   int odx = x - 260; int odz = z - 300;
   int od2 = odx * odx + odz * odz;
-  if (od2 < 32 * 32) {
-    h = poolY + 6;
-  } else if (od2 < 42 * 42) {
-    h = std::max(h, poolY + 26);
+  int oR = vlen(32); int oRim = vlen(42);
+  if (od2 < oR * oR) {
+    h = poolY + vlen(6);
+  } else if (od2 < oRim * oRim) {
+    h = std::max(h, poolY + vlen(26));
   }
   int ldx = x - 220; int ldz = z - 520;
   int ld2 = ldx * ldx + ldz * ldz;
-  if (ld2 < 24 * 24) {
-    h = poolY + 2;
-  } else if (ld2 < 34 * 34) {
-    h = std::max(h, poolY + 22);
+  int lR = vlen(24); int lRim = vlen(34);
+  if (ld2 < lR * lR) {
+    h = poolY + vlen(2);
+  } else if (ld2 < lRim * lRim) {
+    h = std::max(h, poolY + vlen(22));
   }
-  const bool inRim = pd2 < 80 * 80 || od2 < 42 * 42 || ld2 < 34 * 34;
+  const bool inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
   // Disc ponds: carve the bowl inside, raise the berm outside.
   IV2 pw = pondAt(x, z, seed);
   if (pw.y >= 0) {
@@ -865,9 +875,10 @@ World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
   const int pdx = x - 420, pdz = z - 420;
   const int odx = x - 260, odz = z - 300;
   const int ldx = x - 220, ldz = z - 520;
-  const bool inRim = pdx * pdx + pdz * pdz < 80 * 80 ||
-                     odx * odx + odz * odz < 42 * 42 ||
-                     ldx * ldx + ldz * ldz < 34 * 34;
+  const int pRim = vlen(80), oRim = vlen(42), lRim = vlen(34);
+  const bool inRim = pdx * pdx + pdz * pdz < pRim * pRim ||
+                     odx * odx + odz * odz < oRim * oRim ||
+                     ldx * ldx + ldz * ldz < lRim * lRim;
   const IV2 pw = pondAt(x, z, seed);
   if (pw.y >= 0) {
     q.inDisc = true;

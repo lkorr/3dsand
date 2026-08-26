@@ -114,12 +114,30 @@ const M_WILDROSE  : u32 = 69u;
 // materials.json, recompute after any append lands ahead of this one.
 const M_TALLGRASS      : u32 = 95u;
 const M_TALLGRASS_HEAD : u32 = 96u;
+// ---- THE VOXEL-SIZE SCALE --------------------------------------------------
+//
+// VOXELS_PER_M is emitted from world.h's kVoxelsPerMetre (the integer
+// reciprocal of kVoxelMeters); TUNE_REF_VOXELS_PER_METRE is the scale the
+// worldgen TUNING ROWS are authored at, and LoadTuning has already rescaled
+// those. What is left is the lengths hardcoded HERE — cave band depths, the
+// magma table, tile pitches, the authored set pieces — and `vlen()` is how they
+// follow. Multiply first, divide second, so the shipped case (num == den) is
+// exact and this whole mechanism is bit-identical to the literals it replaced.
+//
+// A LENGTH gets vlen(). A count, a probability, a 0..255 noise threshold and a
+// GRADIENT do not — a gradient is dimensionless, which is why the angle of
+// repose is 1 voxel/column at every voxel size and why pondMaxSlope needs no
+// scaling anywhere.
+const VLEN_NUM : i32 = VOXELS_PER_M;
+const VLEN_DEN : i32 = TUNE_REF_VOXELS_PER_METRE;
+fn vlen(v : i32) -> i32 { return (v * VLEN_NUM) / VLEN_DEN; }
+
 // Tallest a meadow flower can be, in CELLS — must be >= the largest value
 // flowerHeight() can return (now tall grass, 4 + 4 = 8; foxglove reaches 5).
 // It bounds the Y range the stalk branch scans, so an under-count silently
 // beheads the tall species and an over-count just costs a few wasted
 // evaluations per column.
-const FLOWER_MAX_H : i32 = 8;
+const FLOWER_MAX_H : i32 = (8 * VLEN_NUM) / VLEN_DEN;
 // ---- shoreline: the wet fringe outside a pond (materials.json ids 81..87) ----
 // Placed by the shore-cover block in genCell against shoreAt(). Like the vine
 // block above, these landed at ids other than the ones reserved for them
@@ -182,7 +200,7 @@ const UG_LITTER_EDGE_CHANCE : u32 = 11u;  // thinner, past the crown rim
 // Mushrooms ring the BOLE. Radius in voxels (a great oak's ring is wider, via
 // the per-tree jitter added at the call site); the inner d2 > 9 keeps them off
 // the trunk cells themselves.
-const UG_SHROOM_RING : i32 = 11;
+const UG_SHROOM_RING : i32 = (11 * VLEN_NUM) / VLEN_DEN;
 const UG_SHROOM_BASE_CHANCE : u32 = 3u;
 
 // Biomes, from the low-frequency biome field (see biomeAt).
@@ -399,6 +417,7 @@ fn vnoise3(x : i32, y : i32, z : i32, cxl : u32, cyl : u32, seed : u32) -> i32 {
 // ~3x hills) overshot. Halved back down — everything EXCEPT the trees, which
 // keep their metre-true sizes (TREE_* / treeInfo below are untouched).
 const HSCALE : i32 = 1;
+
 
 // Snow/treeline. Terrain spans y32..y86, so this sits in the top ~quarter of
 // the range: high ridges go bare and white, everything below is forest. It was
@@ -1627,7 +1646,7 @@ fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
 // recursion). The scan is +-1 tile rather than the trees' +-2 because a cactus
 // is narrow: the widest thing here is a saguaro with both arms out, ~1.1 m of
 // half-width, against a 2.5 m tile. See CACTUS_SCAN.
-const CACTUS_TILE : i32 = 40;    // 2.5 m between cactus sites
+const CACTUS_TILE : i32 = (40 * VLEN_NUM) / VLEN_DEN;   // 2.5 m between sites
 // How many tiles out to search. A cactus can overhang its own tile by
 // (arm reach + in-tile jitter) = ~18 + 20 = 38 voxels, which is inside one
 // tile, so +-1 covers it. Deliberately NOT the trees' +-2: this scan runs for
@@ -2125,7 +2144,7 @@ fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
 //     This is also the honest cost of the rule: the magma table is at the same
 //     height everywhere, which you could notice by comparing two distant
 //     caverns. A basin-local level is not computable here at any price.
-const LAVA_LEVEL : i32 = -80;
+const LAVA_LEVEL : i32 = (-80 * VLEN_NUM) / VLEN_DEN;
 
 // What a carved cell is filled with. The one place the magma table is applied.
 fn caveFill(y : i32) -> i32 {
@@ -2162,18 +2181,19 @@ fn caveBands(x : i32, z : i32, h : i32, seed : u32) -> CaveBands {
   // Cell sizes are log2 exponents (5 = 32 voxels, 4 = 16); the masks are shifted
   // back to the 0..255 band the two THRESHOLD knobs are authored in.
   b.on1 = (vnoise2d(x, z, 5u, seed ^ 5u).n >> 6) > i32(TUNE_CAVE_THRESHOLD1);
-  b.f1 = h - 40 - ((vnoise2d(x, z, 5u, seed ^ 6u).n * 60) >> 14);
-  b.c1 = min(b.f1 + 10 + ((vnoise2d(x, z, 4u, seed ^ 7u).n * 20) >> 14), h - 40);
+  b.f1 = h - vlen(40) - ((vnoise2d(x, z, 5u, seed ^ 6u).n * vlen(60)) >> 14);
+  b.c1 = min(b.f1 + vlen(10) + ((vnoise2d(x, z, 4u, seed ^ 7u).n * vlen(20)) >> 14),
+             h - vlen(40));
   // band 2: deep caverns at absolute depth (streamed depth is real terrain)
   b.on2 = (vnoise2d(x + 7717, z - 4177, 6u, seed ^ 8u).n >> 6) >
           i32(TUNE_CAVE_THRESHOLD2);
-  b.f2 = -40 - ((vnoise2d(x, z, 5u, seed ^ 9u).n * 70) >> 14);
-  b.c2 = b.f2 + 12 + ((vnoise2d(x, z, 4u, seed ^ 10u).n * 26) >> 14);
+  b.f2 = -vlen(40) - ((vnoise2d(x, z, 5u, seed ^ 9u).n * vlen(70)) >> 14);
+  b.c2 = b.f2 + vlen(12) + ((vnoise2d(x, z, 4u, seed ^ 10u).n * vlen(26)) >> 14);
   // No `m2 > 190` lava test here any more: gating the fill on the cavern
   // MASK put a vertical lava wall against open air wherever m2 crossed 190,
   // which is a flow the moment the world ticks. Depth is the only thing the
   // fill may depend on.
-  b.top2 = h - 40;
+  b.top2 = h - vlen(40);
   return b;
 }
 
@@ -2273,37 +2293,51 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
   // too would leave water too shallow to submerge in. Floor/surface heights
   // anchor to POOL_Y, and they sit outside the spawn clearing so they don't
   // disturb the fixtures.
-  let poolY = 44;
+  // SIZES scale with the voxel, CENTRES do not, and the split is deliberate.
+  // A radius and a depth are lengths: unscaled, the lake would be 3.4 m across
+  // at 20 voxels/m, and poolY would sit under terrain that HAD scaled — the
+  // pools would be buried, which is the loudest possible way for a voxel-size
+  // experiment to go wrong. The centres are POSITIONS in an origin-area content
+  // region whose other inhabitants — the selftest fixture columns at (60,60),
+  // (100,100), (140,140) — are absolute literals in a dozen files. Scaling one
+  // and not the other would pull the set pieces off the fixtures. So the whole
+  // origin region keeps its coordinates and simply occupies less ground at a
+  // finer voxel; everything in it stays in the same place relative to
+  // everything else.
+  let poolY = vlen(44);
   // Water lake at (420,420), ~8.5 m across
   let pdx = x - 420; let pdz = z - 420;
   let pd2 = pdx * pdx + pdz * pdz;
-  if (pd2 < 68 * 68) {
+  let pR = vlen(68); let pRim = vlen(80);
+  if (pd2 < pR * pR) {
     h = poolY;
-    L.fluid = M_WATER; L.fluidTop = poolY + 24;
-  } else if (pd2 < 80 * 80) {
-    h = max(h, poolY + 26);    // containment rim
+    L.fluid = M_WATER; L.fluidTop = poolY + vlen(24);
+  } else if (pd2 < pRim * pRim) {
+    h = max(h, poolY + vlen(26));    // containment rim
   }
   // Oil pond at (260,300), ~4 m across
   let odx = x - 260; let odz = z - 300;
   let od2 = odx * odx + odz * odz;
-  if (od2 < 32 * 32) {
-    h = poolY + 6;
-    L.fluid = M_OIL; L.fluidTop = poolY + 24;
-  } else if (od2 < 42 * 42) {
-    h = max(h, poolY + 26);
+  let oR = vlen(32); let oRim = vlen(42);
+  if (od2 < oR * oR) {
+    h = poolY + vlen(6);
+    L.fluid = M_OIL; L.fluidTop = poolY + vlen(24);
+  } else if (od2 < oRim * oRim) {
+    h = max(h, poolY + vlen(26));
   }
   // Lava pool at (220,520), ~3 m across
   let ldx = x - 220; let ldz = z - 520;
   let ld2 = ldx * ldx + ldz * ldz;
-  if (ld2 < 24 * 24) {
-    h = poolY + 2;
-    L.fluid = M_LAVA; L.fluidTop = poolY + 20;
-  } else if (ld2 < 34 * 34) {
-    h = max(h, poolY + 22);
+  let lR = vlen(24); let lRim = vlen(34);
+  if (ld2 < lR * lR) {
+    h = poolY + vlen(2);
+    L.fluid = M_LAVA; L.fluidTop = poolY + vlen(20);
+  } else if (ld2 < lRim * lRim) {
+    h = max(h, poolY + vlen(22));
   }
 
-  L.inPoolFloor = pd2 < 68 * 68 || od2 < 32 * 32 || ld2 < 24 * 24;
-  L.inRim = pd2 < 80 * 80 || od2 < 42 * 42 || ld2 < 34 * 34;
+  L.inPoolFloor = pd2 < pR * pR || od2 < oR * oR || ld2 < lR * lR;
+  L.inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
 
   // ---- disc ponds: carve the bowl inside, raise the berm outside ----
   // pondInfo's keep-out list excludes the pool areas, so a disc never overlaps

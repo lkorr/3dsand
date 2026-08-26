@@ -879,6 +879,7 @@ const TUNING_SCHEMA = [
       {k:'hillLog2', n:'hill size (log2)', d:'Broad-hill noise cell as a power of two: 6 = 64 voxels. A LOG2 exponent, not a size — that is what makes the terrain noise divide-free.', min:3, max:15, step:1, int:true, u:'log2'},
       {k:'detailAmplitude', n:'detail height', d:'Amplitude of the fine relief octave.', min:0, max:100, step:1, int:true, u:'vox'},
       {k:'detailLog2', n:'detail size (log2)', d:'Fine-relief noise cell as a power of two: 4 = 16 voxels.', min:3, max:15, step:1, int:true, u:'log2'},
+      {k:'refVoxelsPerMetre', n:'authored at (vox/m)', d:'The voxel scale every LENGTH in this group is authored at. LoadTuning rescales those rows to whatever world.h kVoxelMeters actually is, so a voxel-size experiment is one C++ edit rather than 24 edits here. Chances, 0..255 thresholds and Q8 gradients are NOT scaled - a probability and a slope have no length in them. Only change this if you re-author the whole group at a new scale.', min:1, max:100, step:1, int:true, u:'vox/m'},
       {k:'treeline', n:'snow line', d:'Height above which terrain goes bare and snowy.', min:0, max:250, step:1, int:true, u:'vox'},
       {k:'biomeLog2', n:'biome size (log2)', d:'Biome cell as a power of two: 9 = 512 voxels. Keep it many tree-tiles wide, or a "meadow" holds one bush and the world reads as per-tree noise.', min:5, max:15, step:1, int:true, u:'log2'},
       {k:'desertThreshold', n:'desert threshold', d:'Biome noise above this becomes desert. Higher = rarer desert.', min:0, max:255, step:1, int:true},

@@ -124,6 +124,13 @@ std::string ShaderConstantPrelude() {
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);
   o << "const VOXEL_METERS : f32 = " << kVoxelMeters << ";\n";
+  // The same number as an INTEGER reciprocal, for the sim/worldgen side. It has
+  // to be integer and it has to come from here: everything worldgen authors in
+  // metres (the whole tree and cactus size table) converts through it, and the
+  // hand-written duplicate this replaces had drifted to 16 against a world
+  // running at 10 — every tree 1.6x its documented size, with nothing able to
+  // notice. See world.h kVoxelsPerMetre.
+  o << "const VOXELS_PER_M : i32 = " << kVoxelsPerMetre << ";\n";
   // The residency window's half-extent in metres (world.h's
   // kWindowHalfExtentMeters). The in-window LOD handoff clamps against this:
   // beyond it there are no fine voxels to march anyway, so a handoff distance

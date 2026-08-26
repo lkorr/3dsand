@@ -672,6 +672,7 @@
     "starSparsity": 0.012
   },
   "worldgen": {
+    "refVoxelsPerMetre": 10,
     "treeline": 72,
     "baseHeight": 32,
     "hillAmplitude": 42,

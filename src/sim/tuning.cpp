@@ -1614,69 +1614,124 @@ bool LoadTuning(const std::string& path, Tuning& out) {
   if (const json* g = Find(j, "worldgen")) {
     auto& w = out.worldgen;
     const std::string at = "worldgen";
-    ReadI(*g, "treeline", w.treeline, out, at);
-    ReadI(*g, "baseHeight", w.baseHeight, out, at);
-    ReadI(*g, "hillAmplitude", w.hillAmplitude, out, at);
-    ReadI(*g, "hillLog2", w.hillLog2, out, at);
-    ReadI(*g, "detailAmplitude", w.detailAmplitude, out, at);
-    ReadI(*g, "detailLog2", w.detailLog2, out, at);
-    ReadI(*g, "biomeLog2", w.biomeLog2, out, at);
-    ReadI(*g, "desertThreshold", w.desertThreshold, out, at);
-    ReadI(*g, "pineThreshold", w.pineThreshold, out, at);
-    ReadI(*g, "meadowThreshold", w.meadowThreshold, out, at);
-    ReadI(*g, "treeTile", w.treeTile, out, at);
-    ReadI(*g, "treeChanceForest", w.treeChanceForest, out, at);
-    ReadI(*g, "treeChancePine", w.treeChancePine, out, at);
-    ReadI(*g, "treeChanceMeadow", w.treeChanceMeadow, out, at);
-    ReadI(*g, "treeChanceDesert", w.treeChanceDesert, out, at);
-    ReadI(*g, "autumnFraction", w.autumnFraction, out, at);
-    ReadI(*g, "pondTile", w.pondTile, out, at);
-    ReadI(*g, "pondChance", w.pondChance, out, at);
-    ReadI(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
-    ReadI(*g, "pondRadiusSpan", w.pondRadiusSpan, out, at);
-    ReadI(*g, "pondMaxSlope", w.pondMaxSlope, out, at);
-    ReadI(*g, "pondBerm", w.pondBerm, out, at);
-    ReadI(*g, "pondBermWidth", w.pondBermWidth, out, at);
-    ReadI(*g, "pondDepth", w.pondDepth, out, at);
-    ReadI(*g, "pondDepthRim", w.pondDepthRim, out, at);
-    ReadI(*g, "lilyChance", w.lilyChance, out, at);
-    ReadI(*g, "lilyFlowerChance", w.lilyFlowerChance, out, at);
-    ReadI(*g, "reedChance", w.reedChance, out, at);
-    ReadI(*g, "reedHeight", w.reedHeight, out, at);
-    ReadI(*g, "kelpChance", w.kelpChance, out, at);
-    ReadI(*g, "kelpHeight", w.kelpHeight, out, at);
-    ReadI(*g, "shoreBand", w.shoreBand, out, at);
-    ReadI(*g, "shoreMudWidth", w.shoreMudWidth, out, at);
-    ReadI(*g, "shoreLift", w.shoreLift, out, at);
-    ReadI(*g, "shoreCattailChance", w.shoreCattailChance, out, at);
-    ReadI(*g, "shoreCattailReach", w.shoreCattailReach, out, at);
-    ReadI(*g, "shoreCattailHeight", w.shoreCattailHeight, out, at);
-    ReadI(*g, "shoreSedgeChance", w.shoreSedgeChance, out, at);
-    ReadI(*g, "shoreHorsetailChance", w.shoreHorsetailChance, out, at);
-    ReadI(*g, "shoreHorsetailHeight", w.shoreHorsetailHeight, out, at);
-    ReadI(*g, "shoreIrisChance", w.shoreIrisChance, out, at);
-    ReadI(*g, "shoreMossChance", w.shoreMossChance, out, at);
-    ReadI(*g, "vineChance", w.vineChance, out, at);
-    ReadI(*g, "vineLenMin", w.vineLenMin, out, at);
-    ReadI(*g, "vineLenSpan", w.vineLenSpan, out, at);
-    ReadI(*g, "creeperFlowerChance", w.creeperFlowerChance, out, at);
-    ReadI(*g, "mossChance", w.mossChance, out, at);
-    ReadI(*g, "mossLenMin", w.mossLenMin, out, at);
-    ReadI(*g, "mossLenSpan", w.mossLenSpan, out, at);
-    ReadI(*g, "ivyChance", w.ivyChance, out, at);
-    ReadI(*g, "ivyTwist", w.ivyTwist, out, at);
-    ReadI(*g, "wallIvyDensity", w.wallIvyDensity, out, at);
-    ReadI(*g, "cactusChance", w.cactusChance, out, at);
-    ReadI(*g, "saguaroFraction", w.saguaroFraction, out, at);
-    ReadI(*g, "tussockChance", w.tussockChance, out, at);
-    ReadI(*g, "scrubChance", w.scrubChance, out, at);
-    ReadI(*g, "desertPatch", w.desertPatch, out, at);
-    ReadI(*g, "heathChance", w.heathChance, out, at);
-    ReadI(*g, "heathPatch", w.heathPatch, out, at);
-    ReadI(*g, "alpineChance", w.alpineChance, out, at);
-    ReadI(*g, "ruinChance", w.ruinChance, out, at);
-    ReadI(*g, "caveThreshold1", w.caveThreshold1, out, at);
-    ReadI(*g, "caveThreshold2", w.caveThreshold2, out, at);
+    // ---- THE VOXEL-SIZE SCALE -------------------------------------------
+    //
+    // Every LENGTH in this group is authored at `refVoxelsPerMetre` voxels to
+    // the metre and rescaled here to whatever world.h's kVoxelMeters actually
+    // is. That is what makes a voxel-size experiment ONE edit (kVoxelMeters,
+    // then rebuild) instead of a hunt through 24 tuning rows and 15 shader
+    // literals for the ones that happened to be distances.
+    //
+    // FOUR UNITS, and every row must pick one — check_invariants.py fails a
+    // plain ReadI/ReadU in this block precisely so a row added later (package C
+    // adds ~45) cannot quietly default to the wrong one:
+    //
+    //   ReadWgLen       a distance in voxels          -> x scale
+    //   ReadWgCellLog2  a noise cell, as log2 voxels  -> + log2(scale)
+    //   ReadWgPerLen    something PER voxel of travel -> / scale
+    //   ReadWgCount     a probability, a 0..255 noise threshold, a percentage,
+    //                   a Q8 GRADIENT -> untouched. A gradient is dimensionless
+    //                   and so is the angle of repose, which is why pondMaxSlope
+    //                   and package C's sedSlope need no scaling at all.
+    //
+    // Read the scale FIRST: everything below depends on it.
+    ReadI(*g, "refVoxelsPerMetre", w.refVoxelsPerMetre, out, at);
+    if (w.refVoxelsPerMetre < 1) {
+      out.warnings.push_back("worldgen.refVoxelsPerMetre < 1; clamped to 1");
+      w.refVoxelsPerMetre = 1;
+    }
+    // Rational, applied as (v * num) / den so the common case num == den is
+    // EXACT and this whole mechanism is a no-op at the shipped scale — which is
+    // the only reason it could be introduced without moving the world hash.
+    const int vpmNum = kVoxelsPerMetre, vpmDen = w.refVoxelsPerMetre;
+    const auto scaleLen = [&](int v) { return (v * vpmNum) / vpmDen; };
+    // log2 of the ratio, rounded. Only exact for power-of-two ratios, which is
+    // what a voxel-size experiment actually does (10 -> 20 -> 40).
+    int cellShift = 0;
+    for (int r = vpmNum; r > vpmDen; r /= 2) cellShift++;
+    for (int r = vpmDen; r > vpmNum; r /= 2) cellShift--;
+    const auto ReadWgLen = [&](const json& o, const char* k, int& v,
+                               Tuning& t, const std::string& a) {
+      ReadI(o, k, v, t, a);
+      v = scaleLen(v);
+    };
+    const auto ReadWgCellLog2 = [&](const json& o, const char* k, int& v,
+                                    Tuning& t, const std::string& a) {
+      ReadI(o, k, v, t, a);
+      v += cellShift;
+    };
+    const auto ReadWgPerLen = [&](const json& o, const char* k, int& v,
+                                  Tuning& t, const std::string& a) {
+      ReadI(o, k, v, t, a);
+      v = (v * vpmDen) / vpmNum;
+    };
+    const auto ReadWgCount = [&](const json& o, const char* k, int& v,
+                                 Tuning& t, const std::string& a) {
+      ReadI(o, k, v, t, a);
+    };
+    ReadWgLen(*g, "treeline", w.treeline, out, at);
+    ReadWgLen(*g, "baseHeight", w.baseHeight, out, at);
+    ReadWgLen(*g, "hillAmplitude", w.hillAmplitude, out, at);
+    ReadWgCellLog2(*g, "hillLog2", w.hillLog2, out, at);
+    ReadWgLen(*g, "detailAmplitude", w.detailAmplitude, out, at);
+    ReadWgCellLog2(*g, "detailLog2", w.detailLog2, out, at);
+    ReadWgCellLog2(*g, "biomeLog2", w.biomeLog2, out, at);
+    ReadWgCount(*g, "desertThreshold", w.desertThreshold, out, at);
+    ReadWgCount(*g, "pineThreshold", w.pineThreshold, out, at);
+    ReadWgCount(*g, "meadowThreshold", w.meadowThreshold, out, at);
+    ReadWgLen(*g, "treeTile", w.treeTile, out, at);
+    ReadWgCount(*g, "treeChanceForest", w.treeChanceForest, out, at);
+    ReadWgCount(*g, "treeChancePine", w.treeChancePine, out, at);
+    ReadWgCount(*g, "treeChanceMeadow", w.treeChanceMeadow, out, at);
+    ReadWgCount(*g, "treeChanceDesert", w.treeChanceDesert, out, at);
+    ReadWgCount(*g, "autumnFraction", w.autumnFraction, out, at);
+    ReadWgLen(*g, "pondTile", w.pondTile, out, at);
+    ReadWgCount(*g, "pondChance", w.pondChance, out, at);
+    ReadWgLen(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
+    ReadWgLen(*g, "pondRadiusSpan", w.pondRadiusSpan, out, at);
+    ReadWgCount(*g, "pondMaxSlope", w.pondMaxSlope, out, at);
+    ReadWgLen(*g, "pondBerm", w.pondBerm, out, at);
+    ReadWgLen(*g, "pondBermWidth", w.pondBermWidth, out, at);
+    ReadWgLen(*g, "pondDepth", w.pondDepth, out, at);
+    ReadWgLen(*g, "pondDepthRim", w.pondDepthRim, out, at);
+    ReadWgCount(*g, "lilyChance", w.lilyChance, out, at);
+    ReadWgCount(*g, "lilyFlowerChance", w.lilyFlowerChance, out, at);
+    ReadWgCount(*g, "reedChance", w.reedChance, out, at);
+    ReadWgLen(*g, "reedHeight", w.reedHeight, out, at);
+    ReadWgCount(*g, "kelpChance", w.kelpChance, out, at);
+    ReadWgLen(*g, "kelpHeight", w.kelpHeight, out, at);
+    ReadWgLen(*g, "shoreBand", w.shoreBand, out, at);
+    ReadWgLen(*g, "shoreMudWidth", w.shoreMudWidth, out, at);
+    ReadWgLen(*g, "shoreLift", w.shoreLift, out, at);
+    ReadWgCount(*g, "shoreCattailChance", w.shoreCattailChance, out, at);
+    ReadWgLen(*g, "shoreCattailReach", w.shoreCattailReach, out, at);
+    ReadWgLen(*g, "shoreCattailHeight", w.shoreCattailHeight, out, at);
+    ReadWgCount(*g, "shoreSedgeChance", w.shoreSedgeChance, out, at);
+    ReadWgCount(*g, "shoreHorsetailChance", w.shoreHorsetailChance, out, at);
+    ReadWgLen(*g, "shoreHorsetailHeight", w.shoreHorsetailHeight, out, at);
+    ReadWgCount(*g, "shoreIrisChance", w.shoreIrisChance, out, at);
+    ReadWgCount(*g, "shoreMossChance", w.shoreMossChance, out, at);
+    ReadWgCount(*g, "vineChance", w.vineChance, out, at);
+    ReadWgLen(*g, "vineLenMin", w.vineLenMin, out, at);
+    ReadWgLen(*g, "vineLenSpan", w.vineLenSpan, out, at);
+    ReadWgCount(*g, "creeperFlowerChance", w.creeperFlowerChance, out, at);
+    ReadWgCount(*g, "mossChance", w.mossChance, out, at);
+    ReadWgLen(*g, "mossLenMin", w.mossLenMin, out, at);
+    ReadWgLen(*g, "mossLenSpan", w.mossLenSpan, out, at);
+    ReadWgCount(*g, "ivyChance", w.ivyChance, out, at);
+    ReadWgPerLen(*g, "ivyTwist", w.ivyTwist, out, at);
+    ReadWgCount(*g, "wallIvyDensity", w.wallIvyDensity, out, at);
+    ReadWgCount(*g, "cactusChance", w.cactusChance, out, at);
+    ReadWgCount(*g, "saguaroFraction", w.saguaroFraction, out, at);
+    ReadWgCount(*g, "tussockChance", w.tussockChance, out, at);
+    ReadWgCount(*g, "scrubChance", w.scrubChance, out, at);
+    ReadWgCount(*g, "desertPatch", w.desertPatch, out, at);
+    ReadWgCount(*g, "heathChance", w.heathChance, out, at);
+    ReadWgCount(*g, "heathPatch", w.heathPatch, out, at);
+    ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
+    ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
+    ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
+    ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // These divide or modulo in worldgen.wgsl; zero is a hang or a div-by-zero.
     auto atLeast = [&](const char* name, int& v, int lo) {
       if (v < lo) {
@@ -1707,7 +1762,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // 319 voxels of tile origin, i.e. ceil(319/treeTile) + 1 per axis. At 112
     // that is 3 per axis and 9 total; below it a tenth candidate exists and
     // would be silently dropped — a canopy that vanishes on one column.
-    atLeast("treeTile", w.treeTile, 112);
+    atLeast("treeTile", w.treeTile, scaleLen(112));
     atLeast("pondTile", w.pondTile, 8);
     atLeast("pondChance", w.pondChance, 1);
     atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
@@ -1722,11 +1777,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // breaches a tunnel, the pond drains into the cave network, and the world
     // never settles — which shows up as a sleep-gate failure a long way from
     // this file. 34 keeps a margin under the 40.
-    if (w.pondDepth > 34) {
+    // 34 is a LENGTH (the cave layer starts 40 under the surface), so it moves
+    // with the voxel scale exactly like the row it bounds.
+    if (w.pondDepth > scaleLen(34)) {
       out.warnings.push_back(
-          "worldgen.pondDepth > 34 would breach the cave layer and drain the "
-          "pond; clamped to 34");
-      w.pondDepth = 34;
+          "worldgen.pondDepth > " + std::to_string(scaleLen(34)) +
+          " would breach the cave layer and drain the pond; clamped");
+      w.pondDepth = scaleLen(34);
     }
     atLeast("pondMaxSlope", w.pondMaxSlope, 0);
     // THE REPOSE PAIRING. The bowl is parabolic, so it is steepest at the rim,
@@ -1763,9 +1820,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     atLeast("shoreMossChance", w.shoreMossChance, 1);
     // shoreAt() resolves the distance past the rim by 8 steps of bisection over
     // [0, shoreBand], which is exact only while the band fits in 2^8.
+    // NOT scaled, and that is the point: 255 is 2^8 - 1, an ALGORITHM limit on
+    // pondNear's 8-step bisection, not a distance. It is therefore the one
+    // ceiling that gets TIGHTER in physical terms as voxels shrink — at 40
+    // voxels/m a 6.4 m shore band is the most the bisection can resolve, and
+    // widening it needs a ninth step rather than a bigger number here.
     if (w.shoreBand > 255) {
       out.warnings.push_back(
-          "worldgen.shoreBand > 255 exceeds shoreAt's 8-step bisection; "
+          "worldgen.shoreBand > 255 exceeds pondNear's 8-step bisection; "
           "clamped to 255");
       w.shoreBand = 255;
     }
