@@ -187,11 +187,11 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     // Almost every material is 0 (stone chips do not blow around), so the
     // common case is one comparison and no field evaluation at all.
     if (resp > 0) {
-      let w = windAtScaledQ(startCell, T, T.windPartScaleQ);
+      let w = windAtScaledQ(startCell, &T, T.windPartScaleQ);
       // 0 in calm air, and 0 at a 0x dev multiplier — the same statement, which
       // is the point of ramping on the SCALED field. Tested before the gaps are
       // formed so a becalmed world pays a max and a divide, not six.
-      let ramp = windDragRampQ(w, T);
+      let ramp = windDragRampQ(w, &T);
       if (ramp > 0) {
         // The authored per-tick rate, thinned to the air actually present. Q16
         // times Q16 over 65536 stays Q16; PART_WIND_DRAG is at most 65536 and

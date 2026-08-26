@@ -3137,6 +3137,26 @@ Because the render copy is the same list, **the grass leans in a fan's blast
 with nothing wiring foliage to fans**, and the F4 arrow overlay shows primitives
 for free: all three sample one function (invariant 2).
 
+**The price of riding the uniform: those two structs must be passed BY POINTER,
+never by value.** This is not style, it is the condition under which the choice
+above is affordable at all. Shipped by value, wind primitives cost the game
+**220.1 ms/frame p50 against 20.3 ms by pointer — a 10.8x collapse, with zero
+primitives alive** (measured 2026-08-26, RTX 3060 Ti, `--frames 400`). The cause
+is not the struct's size and not the loop, which never runs at count 0: it is
+that `windPrimAt` **dynamically indexes** `windPrims[b]`. A by-value uniform read
+only at static offsets is scalarised away after inlining — which is why the old
+~400-byte `RenderParams` was passed by value for a year at no cost. A dynamic
+index has no static offset to fold, so the driver must materialise all 1936
+bytes in scratch memory per call, and in the raymarcher's per-micro-detail-cell
+sway path that is thousands of 1.9 KiB spills per pixel. Occupancy dies with it.
+So every function that indexes the list takes `ptr<uniform, T>`, and so does
+every function that calls one — a single `*R` anywhere in that chain reinstates
+the copy. By pointer the cost is genuinely nil: 8 primitives force-evaluated at
+every micro-detail cell in the world with the AABB reject disabled measures
+20.5 ms against 20.3 ms idle. Note that **no headless gate can catch this** —
+they measure the sim, and this is a render-occupancy cliff; the same family as
+the far-shadow 45x and cascade-shadow 48x regressions.
+
 **Movement is analytic in time, resolved on the CPU.** A travelling gust's
 position is `origin + vel * (tick - spawnTick)`, evaluated once per tick for the
 whole list rather than millions of times per sample; the GPU never mutates a

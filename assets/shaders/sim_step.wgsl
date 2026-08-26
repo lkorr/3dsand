@@ -1295,7 +1295,7 @@ fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
   if (T.windMode == WIND_MODE_OFF) { return base; }
   let resp = i32(matWindResponse(m));
   if (resp == 0) { return base; }          // most materials: one compare
-  let w = windAtQ(c, T);
+  let w = windAtQ(c, &T);
   let mag = max(abs(w.x), abs(w.z));
   if (mag == 0) { return base; }
   // Ramp to the cap over [0, WIND_DRIFT_REF], then scale by the authored
@@ -1431,7 +1431,7 @@ fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasInten
   if (T.windMode == WIND_MODE_OFF) { return g; }
   let resp = i32(matWindResponse(m));
   if (resp == 0) { return g; }              // most materials: one compare
-  let w = windAtQ(c, T);
+  let w = windAtQ(c, &T);
   let fy = windAxisFrac(w.y, resp);
   let fh = min(1024, max(abs(windAxisFrac(w.x, resp)),
                          abs(windAxisFrac(w.z, resp))));
@@ -1486,7 +1486,7 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   // running a debug multiplier through a physical threshold would make the
   // slider silently retune every material's saltation point. The knob for
   // that is sim.windEntrainSpeed, which is what it is for.
-  let wv = windAtQ(c, T);
+  let wv = windAtQ(c, &T);
   var d = vec2<i32>(0, 0);
   // Only the horizontal axes are tested. A vertical component lifts nothing on
   // its own — a grain needs somewhere lateral to go, and an updraft that
@@ -1705,7 +1705,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   //    first and a world with no primitives never reaches the loop.
   if (T.windMode >= WIND_MODE_DRIFT && P.substep == 0u &&
       m.klass == CLASS_POWDER &&
-      (T.windMode >= WIND_MODE_ENTRAIN || windPrimEntrainsQ(c, T))) {
+      (T.windMode >= WIND_MODE_ENTRAIN || windPrimEntrainsQ(c, &T))) {
     if (windEntrain(c, w, m, slotIdx)) { return; }
   }
   // Nothing to do: cell settles. If the whole chunk settles, nothing marks it

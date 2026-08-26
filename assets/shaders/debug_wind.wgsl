@@ -102,7 +102,7 @@ fn vsArrow(@builtin(vertex_index) vi : u32,
   // ---- THE FIELD ---------------------------------------------------------
   // R.time raw: this is the field itself, not foliage, so no microSwaySpeed
   // trim. At its default of 1.0 the grass is sampling the same phase.
-  let w = windAt(p, R.time, R);
+  let w = windAt(p, R.time, &R);
   let speed = length(w);
   let mag01 = clamp(speed / WIND_DBG_FULL_SCALE, 0.0, 1.0);
   if (speed < 1e-3) {

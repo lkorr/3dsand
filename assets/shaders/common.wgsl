@@ -505,6 +505,37 @@ struct BrushOp {
   _p0 : u32, _p1 : u32,
 };
 
+// ===== WIND UNIFORMS ARE PASSED BY POINTER, NOT BY VALUE ====================
+// MEASURED, 2026-08-26, RTX 3060 Ti: passing these two structs BY VALUE into
+// the wind functions cost the game 220.1 ms/frame p50 against 23.6 ms with the
+// calls removed. A 9.3x collapse, in a world with ZERO wind primitives alive.
+//
+// The mechanism, because the naive reading of it is wrong. The cost is NOT the
+// struct being big, and it is NOT the loop: with zero primitives the loop never
+// runs and the function returns on its first compare. It is that windPrimAt
+// DYNAMICALLY INDEXES `windPrims[b]` on a BY-VALUE COPY. A by-value uniform
+// whose members are only ever read at STATIC offsets gets scalarised by the
+// driver after inlining and the copy evaporates — which is why the ~400-byte
+// RenderParams was passed by value here for a year at no cost, and why
+// windSampleAt (scalars only) is still free. A dynamic index has no static
+// offset to fold, so the compiler must materialise the whole 1936-byte struct
+// in SCRATCH MEMORY (VRAM-backed spill) at every call, then index that. In the
+// raymarcher's per-micro-detail-cell sway path that is thousands of 1.9 KB
+// spills per pixel, and occupancy dies with it.
+//
+// THE RULE, therefore: any function that indexes windPrims / windWake takes the
+// uniform as `ptr<uniform, T>` and dereferences it, and so does every function
+// that CALLS one — a `*R` at any point in that chain reinstates the copy and
+// the whole 9.3x with it. Tint compiles uniform pointer parameters to direct
+// OpAccessChains into the uniform block: no copy, no scratch, and the
+// count == 0 early-out becomes one constant-cache scalar load.
+//
+// This is the same family as the far-shadow 45x and cascade-shadow 48x cliffs
+// (see CLAUDE.md): a small-looking change in a raymarcher inner loop that
+// destroys occupancy. Cheapest check that it has not come back is one run of
+//   bash scripts/run.sh ./build/Release/sandvox.exe --frames 400
+// and reading the `whole-frame ms p50` line — the headless gates measure the
+// SIM and cannot see a render-occupancy regression at all.
 struct RenderParams {
   camPos     : vec3f,  tanHalfFov : f32,
   camRight   : vec3f,  aspect     : f32,
@@ -891,18 +922,21 @@ fn windAltRamp(y : f32) -> f32 {
 // 0.0, which is what the debug overlay draws and what "the wind at this point"
 // means. Keeping it a parameter rather than baking a hash in here is what lets
 // the sway sites keep the exact scatter they were tuned with.
-fn windSampleAt(p : vec3f, t : f32, ph : f32, R : RenderParams) -> WindSample {
+// THE UNIFORM ARRIVES BY POINTER, NOT BY VALUE, AND THAT IS LOAD-BEARING.
+// See the WIND UNIFORMS ARE PASSED BY POINTER note above RenderParams.
+fn windSampleAt(p : vec3f, t : f32, ph : f32,
+                R : ptr<uniform, RenderParams>) -> WindSample {
   var s : WindSample;
   // R.windDir is a unit XZ vector resolved on the CPU. WindWeather()
   // (src/sim/wind.h) is its ONLY author — auto weather and the manual override
   // come out of the same function, and phase 4's TickParams copy will too, so
   // the sim and the renderer cannot end up in different weather.
-  let d = R.windDir;
+  let d = (*R).windDir;
   s.along = d;
   s.crossw = vec2f(-d.y, d.x);
   let alt = windAltRamp(p.y);
-  s.mean = d * (R.windSpeed * alt);
-  s.amp = R.windGust * alt;
+  s.mean = d * ((*R).windSpeed * alt);
+  s.amp = (*R).windGust * alt;
   // Travelling gust phase: distance DOWNWIND, in radians. Phase as a function
   // of world position is what makes a gust FRONT cross a meadow instead of the
   // whole field breathing as one (Crysis / GPU Gems 3 ch.16, and the same
@@ -1019,27 +1053,29 @@ fn windPrimEvalF(p : vec3f, w0 : vec4<i32>, w1 : vec4<i32>,
 
 // The primitive sum at a point, world cells/s. Zero primitives is one compare;
 // a point outside every footprint is four.
-fn windPrimAt(p : vec3f, R : RenderParams) -> vec3f {
-  if (R.windPrimCount == 0u) { return vec3f(0.0); }
+fn windPrimAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if ((*R).windPrimCount == 0u) { return vec3f(0.0); }
   // The UNION AABB reject. Without it every sample in the world would run the
   // per-primitive test 32 times to discover it is nowhere near any of them;
   // with it, the loop is paid only where a primitive actually is. `lo > hi` is
   // the empty convention, so this also covers a count that outran the list.
   let pi = vec3<i32>(floor(p));
-  if (any(pi < R.windPrimLo) || any(pi > R.windPrimHi)) { return vec3f(0.0); }
+  if (any(pi < (*R).windPrimLo) || any(pi > (*R).windPrimHi)) {
+    return vec3f(0.0);
+  }
   var acc = vec3f(0.0);
-  let n = min(R.windPrimCount, WIND_PRIM_CAP);
+  let n = min((*R).windPrimCount, WIND_PRIM_CAP);
   for (var i = 0u; i < n; i = i + 1u) {
     let b = i * WIND_PRIM_ROWS;
-    acc += windPrimEvalF(p, R.windPrims[b], R.windPrims[b + 1u],
-                         R.windPrims[b + 2u]);
+    acc += windPrimEvalF(p, (*R).windPrims[b], (*R).windPrims[b + 1u],
+                         (*R).windPrims[b + 2u]);
   }
   return acc;
 }
 
 // THE FIELD. Everything above exists so that this and the per-blade path are
 // the same arithmetic. Call this unless you need per-instance decorrelation.
-fn windAt(p : vec3f, t : f32, R : RenderParams) -> vec3f {
+fn windAt(p : vec3f, t : f32, R : ptr<uniform, RenderParams>) -> vec3f {
   let s = windSampleAt(p, t, 0.0, R);
   return windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
                        + windBandWS(s, s.b2) * WIND_BAND_W2
@@ -1066,7 +1102,8 @@ fn windAt(p : vec3f, t : f32, R : RenderParams) -> vec3f {
 // multiplying second is required, not stylistic: the field is Q16.16 cells per
 // second and reaches ~2^26 in a storm, so the multiply has to come after the
 // divide or it leaves i32 at the top of the range.
-fn windAtScaledQ(p : vec3<i32>, T : TickParams, scaleQ8 : i32) -> vec3<i32> {
+fn windAtScaledQ(p : vec3<i32>, T : ptr<uniform, TickParams>,
+                 scaleQ8 : i32) -> vec3<i32> {
   let w = windAtQ(p, T);
   if (scaleQ8 == WINDQ_SCALE_ONE) { return w; }
   return vec3<i32>((w.x / WINDQ_SCALE_ONE) * scaleQ8,
@@ -1103,9 +1140,9 @@ fn windAtScaledQ(p : vec3<i32>, T : TickParams, scaleQ8 : i32) -> vec3<i32> {
 // The divide is by cells/s (refQ >> 16) so the Q16.16 numerator lands directly
 // in Q16 — full precision at a whisper, where a >>10 on both sides would
 // quantise the ramp into visible steps.
-fn windDragRampQ(w : vec3<i32>, T : TickParams) -> i32 {
+fn windDragRampQ(w : vec3<i32>, T : ptr<uniform, TickParams>) -> i32 {
   let mag = max(max(abs(w.x), abs(w.y)), abs(w.z));
-  return min(65536, mag / max(T.windDragRefQ >> 16u, 1));
+  return min(65536, mag / max((*T).windDragRefQ >> 16u, 1));
 }
 
 // Wind velocity -> foliage bend, in the units TUNE_MICRO_SWAY_AMP is authored
@@ -1360,15 +1397,17 @@ fn windPrimEvalQ(p : vec3<i32>, w0 : vec4<i32>, w1 : vec4<i32>,
 
 // The primitive sum at a world cell, Q16.16 cells/s. Zero primitives is one
 // compare, which is what makes this hash-neutral until someone places a fan.
-fn windPrimAtQ(p : vec3<i32>, T : TickParams) -> vec3<i32> {
-  if (T.windPrimCount == 0u) { return vec3<i32>(0); }
-  if (any(p < T.windPrimLo) || any(p > T.windPrimHi)) { return vec3<i32>(0); }
+fn windPrimAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if ((*T).windPrimCount == 0u) { return vec3<i32>(0); }
+  if (any(p < (*T).windPrimLo) || any(p > (*T).windPrimHi)) {
+    return vec3<i32>(0);
+  }
   var acc = vec3<i32>(0);
-  let n = min(T.windPrimCount, WIND_PRIM_CAP);
+  let n = min((*T).windPrimCount, WIND_PRIM_CAP);
   for (var i = 0u; i < n; i = i + 1u) {
     let b = i * WIND_PRIM_ROWS;
-    acc += windPrimEvalQ(p, T.windPrims[b], T.windPrims[b + 1u],
-                         T.windPrims[b + 2u]);
+    acc += windPrimEvalQ(p, (*T).windPrims[b], (*T).windPrims[b + 1u],
+                         (*T).windPrims[b + 2u]);
   }
   return acc;
 }
@@ -1387,15 +1426,15 @@ fn windPrimAtQ(p : vec3<i32>, T : TickParams) -> vec3<i32> {
 // The test is the primitive's own geometry with the profiles left out: being
 // inside is a yes/no, and asking the full evaluator would pay for three
 // multiplies of a weight nobody reads.
-fn windPrimEntrainsQ(p : vec3<i32>, T : TickParams) -> bool {
-  if (T.windPrimCount == 0u) { return false; }
-  if (any(p < T.windPrimLo) || any(p > T.windPrimHi)) { return false; }
-  let n = min(T.windPrimCount, WIND_PRIM_CAP);
+fn windPrimEntrainsQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> bool {
+  if ((*T).windPrimCount == 0u) { return false; }
+  if (any(p < (*T).windPrimLo) || any(p > (*T).windPrimHi)) { return false; }
+  let n = min((*T).windPrimCount, WIND_PRIM_CAP);
   for (var i = 0u; i < n; i = i + 1u) {
     let b = i * WIND_PRIM_ROWS;
-    let w0 = T.windPrims[b];
+    let w0 = (*T).windPrims[b];
     if (((u32(w0.w) >> WPRIM_F_SHIFT) & WPRIM_F_ENTRAIN) == 0u) { continue; }
-    let w2 = T.windPrims[b + 2u];
+    let w2 = (*T).windPrims[b + 2u];
     let rad = max(w2.x, 1);
     let len = max(w2.y, 1);
     let d = p - w0.xyz;
@@ -1408,7 +1447,7 @@ fn windPrimEntrainsQ(p : vec3<i32>, T : TickParams) -> bool {
       if (d2 <= rr) { return true; }
       continue;
     }
-    let dir = T.windPrims[b + 1u].xyz;
+    let dir = (*T).windPrims[b + 1u].xyz;
     let ax = (d.x * dir.x + d.y * dir.y + d.z * dir.z) / 65536;
     if (max(0, d2 - ax * ax) > rr) { continue; }
     if (kind == WPRIM_VORTEX) {
@@ -1433,31 +1472,32 @@ fn windPrimEntrainsQ(p : vec3<i32>, T : TickParams) -> bool {
 // already-awake chunk, and never at all with the gate off. If it ever profiles
 // hot in the CA, the contained fallback is research doc §3's per-chunk cache —
 // one evaluation per chunk per tick, the God of War shape — NOT a cheaper field.
-fn windAtQ(p : vec3<i32>, T : TickParams) -> vec3<i32> {
-  if (T.windMode == WIND_MODE_OFF) { return vec3<i32>(0, 0, 0); }
+fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if ((*T).windMode == WIND_MODE_OFF) { return vec3<i32>(0, 0, 0); }
   let alt = clamp(65536 + (p.y - WINDQ_ALT_REF_Y) * WINDQ_ALT_GAIN,
                   WINDQ_ALT_MIN, WINDQ_ALT_MAX);
-  let d = T.windDirQ;                    // unit XZ, downwind, Q16.16
+  let d = (*T).windDirQ;                 // unit XZ, downwind, Q16.16
   let cw = vec2<i32>(-d.y, d.x);         // 90 degrees to its left
-  let spd = wq(T.windSpeedQ, alt);
-  let amp = wq(T.windGustQ, alt);
+  let spd = wq((*T).windSpeedQ, alt);
+  let amp = wq((*T).windGustQ, alt);
 
   // Band components in the (along, cross, up) frame. Five spatial phases and
   // six clocks, exactly as windSampleAt builds them with ph = 0.
+  let tick = (*T).tick;
   let b1a = windSinQ(i32(windPhaseQ(p, d, WINDQ_K_100) +
-                         windClockQ(T.tick, WINDQ_T_100)));
+                         windClockQ(tick, WINDQ_T_100)));
   let b1c = wq(WINDQ_CROSS,
                windSinQ(i32(windPhaseQ(p, d, WINDQ_K_120) +
-                            windClockQ(T.tick, WINDQ_T_083)) + WINDQ_PH_21));
+                            windClockQ(tick, WINDQ_T_083)) + WINDQ_PH_21));
   let b1u = wq(WINDQ_VERT,
                windSinQ(i32(windPhaseQ(p, d, WINDQ_K_070) +
-                            windClockQ(T.tick, WINDQ_T_131))));
+                            windClockQ(tick, WINDQ_T_131))));
   let b2a = windSinQ(i32(windPhaseQ(p, d, WINDQ_K_050) +
-                         windClockQ(T.tick, WINDQ_T_173)));
-  let b2c = wq(WINDQ_CROSS, windSinQ(i32(windClockQ(T.tick, WINDQ_T_219))));
+                         windClockQ(tick, WINDQ_T_173)));
+  let b2c = wq(WINDQ_CROSS, windSinQ(i32(windClockQ(tick, WINDQ_T_219))));
   let b2u = wq(WINDQ_VERT,
                windSinQ(i32(windPhaseQ(p, d, WINDQ_K_030) +
-                            windClockQ(T.tick, WINDQ_T_261))));
+                            windClockQ(tick, WINDQ_T_261))));
 
   // Rotate each band out of that frame into world space and scale by the gust
   // amplitude — windBandWS(), in integers.

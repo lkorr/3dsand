@@ -882,13 +882,13 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
     // R.time x microSwaySpeed, NOT the raw clock: microSwaySpeed is a
     // foliage-local trim and defaults to 1.0, at which the grass and the debug
     // arrow overlay are sampling the same field at the same phase.
-    let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, R);
+    let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, &R);
     // The primitive sum (fans, gusts, tornadoes) rides with the MEAN rather
     // than with the bands: a fan is a steady push at this cell, not an
     // oscillation, and it must not be re-weighted per blade the way a gust is.
     // Adding it here is the whole of "the grass leans in a fan's blast" —
     // nothing wires foliage to fans, they simply sample the same field.
-    let wvel = windMeanWS(ws) + windPrimAt(vec3f(cell), R)
+    let wvel = windMeanWS(ws) + windPrimAt(vec3f(cell), &R)
                               + windBandWS(ws, ws.b1) * WIND_BAND_W1
                               + windBandWS(ws, ws.b2) * WIND_BAND_W2;
     swayVec = windSway(wvel) * TUNE_MICRO_SWAY_AMP;
@@ -1104,14 +1104,14 @@ fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
   // re-weighted: every blade in the cell stands in the same average wind and
   // they disagree only about the gusts.
   let ph = f32(colH & 1023u) * 0.006136;
-  let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, R);
+  let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, &R);
   let band1 = windSway(windBandWS(ws, ws.b1));
   let band2 = windSway(windBandWS(ws, ws.b2));
   // The mean, plus the wind primitives (fans/gusts/tornadoes) — with the mean
   // for the same reason as the brick path above: a primitive is a steady push
   // on the whole cell, and the per-strand re-weighting below applies to the
   // GUSTS only. One `windPrimAt` per column, not per blade.
-  let bandMean = windSway(windMeanWS(ws) + windPrimAt(vec3f(cell), R));
+  let bandMean = windSway(windMeanWS(ws) + windPrimAt(vec3f(cell), &R));
   // TUNE_MICRO_SWAY_AMP is authored in sub-voxels of a subdiv-8 cell; strands
   // work in cell units, hence the /8.
   let amp = TUNE_MICRO_SWAY_AMP * 0.125 * swayScale;
