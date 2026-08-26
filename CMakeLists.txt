@@ -338,6 +338,7 @@ add_executable(sandvox
   # different domains stop conflicting in one 6k-line file. See test/selftest.h.
   src/test/support.cpp
   src/test/selftest.cpp
+  src/test/selftest_terrain.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
   src/test/selftest_wind.cpp

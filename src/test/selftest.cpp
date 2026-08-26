@@ -26,6 +26,7 @@ using namespace sandvox;
 namespace selftest {
 
 // Each domain file exposes its gates through one of these.
+const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
 const std::vector<Gate>& WindGates();
@@ -49,6 +50,12 @@ const std::vector<Gate>& SpellGates();
 // missing from this list is a link-time-visible mistake (it never runs), which
 // is the failure mode we want rather than one that runs in an arbitrary slot.
 const char* const kOrder[] = {
+    // FIRST, and deliberately. `terrain` measures pristine worldgen at the
+    // origin and asserts the CPU height mirror against the GPU's voxels — the
+    // property every later gate's fixture placement silently assumes. It also
+    // has to run before anything moves the window, and it leaves the origin
+    // exactly where `determinism` (which does not set it) needs it.
+    "terrain",
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
@@ -67,7 +74,8 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&SimGates(), &CaGates(), &WindGates(), &RenderGates(),
+    for (const auto* g : {&TerrainGates(),
+                          &SimGates(), &CaGates(), &WindGates(), &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &SpellGates()})
@@ -146,20 +154,22 @@ std::vector<const Gate*> Plan(const std::vector<std::string>& only) {
   return plan;
 }
 
-// The golden world hash from the baseline, or empty when the key is absent.
-// File-scope because the determinism gate lives in another TU and gates take no
-// options argument; Run() sets it before the first gate runs.
-std::string g_goldenHash;
+// Every non-pass/fail value from the baseline, keyed by name — the golden world
+// hash is just the first inhabitant. File-scope because gates live in other TUs
+// and take no options argument; Run() sets it before the first gate runs.
+std::unordered_map<std::string, std::string> g_baselineVals;
 
 // Baseline: gate name -> was it failing at the recorded commit. Hand-editable
 // JSON, deliberately a flat object so a human can read a diff of it.
 //
-// Also picks up "determinismHash", whose value is a hex world hash rather than
-// "pass"/"fail" — the same flat string->string shape, so the scanner below
-// needs no new syntax, only a second place to put the value.
+// Also picks up every value that is NOT "pass"/"fail" — "determinismHash", and
+// any threshold a gate pins — into g_baselineVals. Same flat string->string
+// shape, so the scanner below needs no new syntax, only a second place to put
+// the value. Keys starting with '_' are prose (`_about`, `_smoke_about`) and
+// are kept out of the map so nothing can accidentally read one as a threshold.
 std::unordered_map<std::string, bool> LoadBaseline(const std::string& path) {
   std::unordered_map<std::string, bool> known;
-  g_goldenHash.clear();
+  g_baselineVals.clear();
   std::ifstream f(path);
   if (!f) return known;
   std::string text((std::istreambuf_iterator<char>(f)),
@@ -191,7 +201,7 @@ std::unordered_map<std::string, bool> LoadBaseline(const std::string& path) {
     if (ve == std::string::npos) break;
     std::string val = text.substr(p + 1, ve - p - 1);
     if (val == "fail" || val == "pass") known[key] = (val == "fail");
-    else if (key == "determinismHash") g_goldenHash = val;
+    else if (!key.empty() && key[0] != '_') g_baselineVals[key] = val;
     i = ve + 1;
   }
   return known;
@@ -227,6 +237,27 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
   std::printf("wrote %s\n", path.c_str());
 }
 
+// Replace the quoted value of `"key": "..."` in place, leaving comments, key
+// order and prose untouched. Returns false when the key is absent — which is
+// SILENT AND DELIBERATE for gate verdicts (the baseline records only gates
+// worth pinning), but means a gate's new observed key must be seeded into the
+// file by hand once or --rebaseline will appear to work and write nothing.
+bool ReplaceJsonValue(std::string& text, const std::string& key,
+                      const std::string& val, std::string* oldOut) {
+  const std::string keyPat = "\"" + key + "\"";
+  size_t p = text.find(keyPat);
+  if (p == std::string::npos) return false;
+  size_t colon = text.find(':', p + keyPat.size());
+  if (colon == std::string::npos) return false;
+  size_t q1 = text.find('"', colon + 1);
+  if (q1 == std::string::npos) return false;
+  size_t q2 = text.find('"', q1 + 1);
+  if (q2 == std::string::npos) return false;
+  if (oldOut) *oldOut = text.substr(q1 + 1, q2 - q1 - 1);
+  text = text.substr(0, q1 + 1) + val + text.substr(q2);
+  return true;
+}
+
 void RebaselineSelftest(const std::string& path,
                         const std::vector<Result>& results) {
   // Read the determinism gate's observed hash from its detail string.
@@ -257,14 +288,12 @@ void RebaselineSelftest(const std::string& path,
   fi.close();
 
   // Update determinismHash if we have a new one
-  if (!newHash.empty() && newHash != g_goldenHash) {
-    std::string oldKey = "\"determinismHash\": \"" + g_goldenHash + "\"";
-    std::string newKey = "\"determinismHash\": \"" + newHash + "\"";
-    size_t p = text.find(oldKey);
-    if (p != std::string::npos)
-      text = text.substr(0, p) + newKey + text.substr(p + oldKey.size());
-    std::printf("\n*** determinismHash: %s -> %s ***\n", g_goldenHash.c_str(),
-                newHash.c_str());
+  const std::string oldHash = GoldenDeterminismHash();
+  if (!newHash.empty() && newHash != oldHash) {
+    std::string was;
+    if (ReplaceJsonValue(text, "determinismHash", newHash, &was))
+      std::printf("\n*** determinismHash: %s -> %s ***\n", was.c_str(),
+                  newHash.c_str());
   }
 
   // Update gate pass/fail status
@@ -272,23 +301,36 @@ void RebaselineSelftest(const std::string& path,
   for (const Result& r : results) {
     if (r.status == Status::Skip) continue;
     const char* newVal = r.status == Status::Pass ? "pass" : "fail";
-    // Find "gatename": "pass"|"fail" and replace the value
-    std::string keyPat = "\"" + r.name + "\"";
-    size_t p = text.find(keyPat);
-    if (p == std::string::npos) continue;
-    size_t colon = text.find(':', p + keyPat.size());
-    if (colon == std::string::npos) continue;
-    size_t q1 = text.find('"', colon + 1);
-    if (q1 == std::string::npos) continue;
-    size_t q2 = text.find('"', q1 + 1);
-    if (q2 == std::string::npos) continue;
-    std::string oldVal = text.substr(q1 + 1, q2 - q1 - 1);
+    std::string oldVal;
+    if (!ReplaceJsonValue(text, r.name, newVal, &oldVal)) continue;
     if (oldVal != newVal) {
-      text = text.substr(0, q1 + 1) + newVal + text.substr(q2);
       std::printf("  %s: %s -> %s\n", r.name.c_str(), oldVal.c_str(), newVal);
       changed++;
     }
   }
+
+  // Update measured values (Result::observed). These are what make a threshold
+  // tunable without a rebuild — but only for keys that already exist in the
+  // file, so a gate that adds one must seed it there by hand once. Say so out
+  // loud rather than dropping it silently, because a value that never lands is
+  // indistinguishable from a value that never moved.
+  int vals = 0;
+  for (const Result& r : results) {
+    for (const auto& kv : r.observed) {
+      std::string oldVal;
+      if (!ReplaceJsonValue(text, kv.first, kv.second, &oldVal)) {
+        std::printf("  %s: NOT IN BASELINE (add \"%s\": \"%s\" by hand)\n",
+                    kv.first.c_str(), kv.first.c_str(), kv.second.c_str());
+        continue;
+      }
+      if (oldVal != kv.second) {
+        std::printf("  %s: %s -> %s\n", kv.first.c_str(), oldVal.c_str(),
+                    kv.second.c_str());
+        vals++;
+      }
+    }
+  }
+  changed += vals;
 
   std::ofstream fo(path);
   if (!fo) {
@@ -302,7 +344,46 @@ void RebaselineSelftest(const std::string& path,
 
 }  // namespace
 
-const std::string& GoldenDeterminismHash() { return g_goldenHash; }
+// Values the CURRENT gate has recorded, drained by Run() when it returns.
+std::vector<std::pair<std::string, std::string>> g_observed;
+
+void RecordObserved(const char* key, const std::string& value) {
+  g_observed.emplace_back(key, value);
+}
+
+void RecordObserved(const char* key, double value) {
+  // Integers as integers: a threshold reading "1364" is diffable in a way that
+  // "1364.000000" is not, and every value pinned so far is a count or a voxel.
+  char buf[64];
+  if (value == (double)(long long)value)
+    std::snprintf(buf, sizeof buf, "%lld", (long long)value);
+  else
+    std::snprintf(buf, sizeof buf, "%.3f", value);
+  g_observed.emplace_back(key, buf);
+}
+
+const std::string* BaselineValue(const char* key) {
+  auto it = g_baselineVals.find(key);
+  return it == g_baselineVals.end() ? nullptr : &it->second;
+}
+
+double BaselineNumber(const char* key, double fallback) {
+  const std::string* v = BaselineValue(key);
+  if (!v || v->empty()) return fallback;
+  try {
+    size_t used = 0;
+    const double d = std::stod(*v, &used);
+    return used == 0 ? fallback : d;
+  } catch (...) {
+    return fallback;
+  }
+}
+
+const std::string& GoldenDeterminismHash() {
+  static const std::string kEmpty;
+  const std::string* v = BaselineValue("determinismHash");
+  return v ? *v : kEmpty;
+}
 
 void Ctx::Grab(const char* path) {
   rhi::Buffer shot =
@@ -413,9 +494,12 @@ int Run(Ctx& c, const Options& opt) {
       // and the JSON. Timing is printed here since no gate measured itself.
       double t0 = NowSeconds();
       std::string detail;
+      g_observed.clear();
       r.status = g->fn(c, detail);
       r.seconds = NowSeconds() - t0;
       r.detail = detail;
+      r.observed = std::move(g_observed);
+      g_observed.clear();
     }
     outcome[r.name] = r.status;
     results.push_back(std::move(r));

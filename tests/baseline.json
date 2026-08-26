@@ -34,6 +34,21 @@
   "daylight-boundary": "pass",
   "wind": "pass",
   "fluid-react": "fail",
+  "terrain": "pass",
+
+  "_terrain_about": "Thresholds and measurements for the `terrain` gate. The *Max/*Slack/*Margin keys are BOUNDS the gate fails against and are hand-tuned; the *Observed keys are what the last run measured and are written by --rebaseline. Retuning a bound is a JSON edit, not a rebuild.",
+  "terrain.windowMargin": "48",
+  "terrain.slopeMax": "64",
+  "terrain.chunkColSlack": "20",
+  "terrain.chunkColBadMax": "0",
+  "terrain.settleProxyMax": "400",
+  "terrain.reliefVox": "52",
+  "terrain.surfaceMinY": "32",
+  "terrain.surfaceMaxY": "84",
+  "terrain.slopeMaxObserved": "2",
+  "terrain.rampMaxObserved": "2",
+  "terrain.localReliefObserved": "50",
+  "terrain.settleProxyObserved": "0",
 
   "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
 

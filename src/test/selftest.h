@@ -94,6 +94,21 @@ struct Result {
   Status status = Status::Skip;
   std::string detail;   // the human-readable parenthetical
   double seconds = 0.0;
+
+  // MEASURED VALUES THIS RUN, for `--rebaseline` to write back into
+  // tests/baseline.json as `"key": "value"` pairs.
+  //
+  // CLAUDE.md says thresholds belong in baseline.json rather than in C++,
+  // because a threshold in source costs a rebuild to tune and a threshold in
+  // JSON costs nothing. Until this existed, nothing implemented that: the
+  // baseline held pass/fail plus one hash, and every numeric bound in the
+  // suite was a literal in a .cpp. A gate that measures something continuous
+  // (terrain relief, slope, resident pages) pushes it here, reads its own
+  // bound back through BaselineValue(), and becomes tunable without a compile.
+  //
+  // Values are STRINGS because the baseline scanner only accepts quoted
+  // values — see LoadBaseline. Numbers go in as "1364", not 1364.
+  std::vector<std::pair<std::string, std::string>> observed;
 };
 
 // A gate: a name, the gates it needs run first, and the body.
@@ -150,6 +165,29 @@ struct Options {
 // reports the hash and passes, exactly as it did before, so a checkout without
 // the key still works.
 const std::string& GoldenDeterminismHash();
+
+// Any non-pass/fail value from tests/baseline.json, or nullptr when absent.
+// `determinismHash` is one of these; GoldenDeterminismHash() is a wrapper.
+//
+// A gate reads its own thresholds through this so they can be retuned by
+// editing JSON instead of by rebuilding, and writes the values it measured
+// back through Result::observed so `--rebaseline` records them in one step.
+// ABSENT MUST BE HANDLED: a checkout without the key has to still work, so
+// treat nullptr as "not pinned — report, do not fail", exactly as the
+// determinism gate treats an empty golden hash.
+const std::string* BaselineValue(const char* key);
+
+// Same, parsed as a number, with a fallback when the key is absent or garbage.
+double BaselineNumber(const char* key, double fallback);
+
+// A gate records a value it MEASURED, for --rebaseline to write back. The
+// harness drains these into Result::observed when the gate returns.
+//
+// A free function rather than a field on Ctx or an extra gate argument: the
+// gate signature is shared by 44 gates across 11 translation units, and
+// widening it to serve the two gates that report numbers is the worse trade.
+void RecordObserved(const char* key, const std::string& value);
+void RecordObserved(const char* key, double value);
 
 // Run the selected gates. Returns a process exit code: 0 when every gate that
 // ran either passed or was already failing in the baseline.

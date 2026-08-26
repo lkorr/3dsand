@@ -43,6 +43,7 @@
 #include "sim/materials.h"
 #include "sim/microbody.h"
 #include "sim/microvox.h"
+#include "sim/pagetable.h"  // PagesHighWater for the --frames pool-margin line
 #include "sim/simulation.h"
 #include "sim/tuning.h"
 #include "sim/stream.h"
@@ -4671,6 +4672,23 @@ int main(int argc, char** argv) {
                   apct(0.50), apct(0.95), g_activeChunks.back(), mean,
                   floorUs + perChunkUs, floorUs, perChunkUs,
                   100.0 * floorUs / (floorUs + perChunkUs));
+    }
+    // PAGE POOL HIGH WATER — and this harness is the only honest place to read
+    // it. kPoolPages exhaustion is a fatal abort, not a degradation, so the
+    // margin has to be a tracked number; but the selftest harness's window is
+    // sky-heavy and under-reports by ~2x, and SANDVOX_PT_DEBUG's `inUse=` trace
+    // is per-tick spam rather than a summary. `--frames N --autofly-hard` is
+    // the adversarial traversal CLAUDE.md names for pool sizing, and until now
+    // it printed everything about a run EXCEPT the number it exists to measure.
+    // pagesHighWater_ is monotonic and never reset, so this covers the whole
+    // run regardless of where the peak fell.
+    if (world.residency == World::Residency::Paged && world.pages) {
+      const uint32_t hw = world.pages->PagesHighWater();
+      std::printf("--frames harness: page pool high water %u of %u (%.1f%%, "
+                  "%.1f MiB) | in use at exit %u | %u window shifts\n",
+                  hw, kPoolPages, 100.0 * (double)hw / (double)kPoolPages,
+                  (double)hw * kChunkVol * 4.0 / (1024.0 * 1024.0),
+                  world.pages->PagesInUse(), stream.ShiftCount());
     }
     // Per-regime arms (see g_frameMsLow/High). The HIGH number is the one the
     // altitude work is judged on; the LOW one is the canopy/meadow skim.
