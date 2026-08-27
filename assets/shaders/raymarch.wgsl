@@ -34,6 +34,7 @@
 // are ordered before this submit, so there is no concurrent access to race.
 @group(0) @binding(10) var<storage, read> fluidBlockMapR : array<u32>;
 @group(0) @binding(11) var<storage, read> fluidGridR : array<i32>;
+@group(0) @binding(12) var<storage, read> dirtyViz : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -6271,14 +6272,17 @@ fn fs(in : VSOut) -> FSOut {
 
     // ---- dirty-voxel debug highlight (dev panel toggle) ----
     if ((R.flags & 2u) != 0u) {
-      let stamp = voxStamp(h.word);
-      let s0 = stampFor(R.tick, 0u);
-      let s1 = stampFor(R.tick, 1u);
-      if (stamp == s0 || stamp == s1) {
-        let ed = min(uv, 1.0 - uv);
-        let me = min(ed.x, ed.y);
-        if (me < 0.08) {
-          color = vec3f(1.0, 0.05, 0.05);
+      let chSlot = chunkSlotIndex(worldChunkOf(h.cell));
+      if (dirtyViz[chSlot] != 0u) {
+        let stamp = voxStamp(h.word);
+        let s0 = stampFor(R.tick, 0u);
+        let s1 = stampFor(R.tick, 1u);
+        if (stamp == s0 || stamp == s1) {
+          let ed = min(uv, 1.0 - uv);
+          let me = min(ed.x, ed.y);
+          if (me < 0.08) {
+            color = vec3f(1.0, 0.05, 0.05);
+          }
         }
       }
     }

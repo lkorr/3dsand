@@ -248,6 +248,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // directly, zero upload. ReadOnly: the arrow points sim -> render.
         entry(10, T::ReadOnlyStorage, S::Fragment),              // fluidBlockMap
         entry(11, T::ReadOnlyStorage, S::Fragment),              // fluidGrid
+        entry(12, T::ReadOnlyStorage, S::Fragment),              // dirtyViz
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -412,6 +413,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(9, world_->pageTable),
         b(10, world_->fluidBlockMap),
         b(11, world_->fluidGrid),
+        b(12, world_->dirtyViz),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }

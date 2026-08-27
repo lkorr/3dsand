@@ -84,6 +84,7 @@ void World::Init(const rhi::Device& device) {
   opsBuf = CreateBuffer(device, kMaxOpsPerTick * sizeof(BrushOp),
                         U::Storage | U::CopyDst, "brushOps");
   renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
+  dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
   pick = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst, "pick");
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");

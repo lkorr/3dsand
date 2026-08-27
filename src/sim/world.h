@@ -1710,6 +1710,7 @@ class World {
   rhi::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
   rhi::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
   rhi::Buffer renderUBO;   // RenderParams
+  rhi::Buffer dirtyViz;    // kNumChunks u32, CPU-uploaded snapshot for debug overlay
   rhi::Buffer pick;        // 8 u32
 
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
