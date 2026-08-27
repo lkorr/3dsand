@@ -1998,6 +1998,16 @@ struct Tuning {
     int alpineChance = 40;
     int ruinChance = 5;
     int caveThreshold1 = 150, caveThreshold2 = 148;
+    // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
+    // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
+    // Worldgen tab's voxel view writes. Applied through the MutationQueue to
+    // every chunk worldgen produces, so it survives streaming and composes with
+    // any seed.
+    //
+    // EMPTY BY DEFAULT, and no gate may set it: a layer moves the world hash by
+    // construction (it puts voxels in the world), so a shipped default would
+    // silently re-pin every determinism number in tests/baseline.json.
+    std::string editLayer;
   } worldgen;
 
   // Values that failed validation, for the overlay / console. Empty on success.

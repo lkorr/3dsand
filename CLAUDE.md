@@ -53,7 +53,19 @@ SANDVOX_PT_DEBUG=1 ./build/Release/sandvox.exe --frames 1200 --autofly-hard   # 
 bash scripts/check_shaders.sh                             # validate WGSL without rebuild
 python scripts/check_invariants.py                        # "two places must agree" checks
 python scripts/check_pass_table.py                        # pass table vs WGSL bindings
+bash scripts/check_worldview.sh                           # tuner voxel view in real headless Chrome
+./build/Release/sandvox.exe --voxdump 0,1008,0,64,64,64,1 # one box of real voxels to a file
+./build/Release/sandvox.exe --voxserve                    # region server (the tuner drives this)
 ```
+
+`--voxdump`/`--voxserve` (`src/tools/voxregion.h`) are the tuner's voxel terrain
+view: they run the real GPU worldgen and read a box back, so the Worldgen tab
+draws actual cells instead of a column map. `--voxserve` is a stdin request loop
+because device+SPIR-V boot is ~3 s and a region is ~8 ms; `tuner_server.py` keeps
+one alive and takes the run mutex **per request**, never for the process
+lifetime. Anything C++ can assert lives in `--selftest --gate voxregion`;
+`check_worldview.sh` covers the browser half (WebGL2, the worker, meshing, a
+pixel readback, an edit, an undo) that C++ cannot see.
 
 `--vk-validation` enables sync validation; **a validation message FAILS the run**. `tests/baseline.json` records known-failing gates (exit 0); new failures are regressions (exit 1). `--backend dawn` refuses with exit 2.
 
@@ -238,7 +250,10 @@ hashes are identical, the parameter doesn't reach the kernel at those values.
 | `src/audio/` | `cues.*` = public API (game events). Vendored `xyzpan/` spatializer. Mono assets, meters+Z-up internally |
 | `assets/shaders/` | `common.wgsl` prepended to all shaders by `LoadShader` |
 | `assets/materials/` | `tuning.json` (F5 hot-reload), materials+reactions JSON (R hot-reload) |
+| `src/tools/` | `voxregion.*` = `--voxdump`/`--voxserve`, real voxels for the tuner's terrain view |
 | `assets/tuner.html`+`tuner_schema.js` | browser editor for JSONs, Wiki, Audio, Notes tabs |
+| `assets/worldview.js` | the Worldgen tab's voxel terrain viewer + editor (WebGL2, worker mesher, LOD) |
+| `assets/worldedits/` | authored `.svedit` layers, applied by `worldgen.editLayer` |
 | `assets/sound_schema.js` | only list of sound slots; must match `Cues::kSlotPrefix` in `audio/cues.cpp` |
 | `assets/spells/glyphs.json` | glyph content, materials by name, hot-reloads with R |
 | `assets/prefabs/`, `assets/mobs/` | `.vox` art + mob `.json` sidecars |

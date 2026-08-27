@@ -954,6 +954,7 @@ const TUNING_SCHEMA = [
       {k:'ruinChance', n:'ruin rarity', d:'One in this many ruin tiles gets a stone ruin.', min:1, max:32, step:1, int:true},
       {k:'caveThreshold1', n:'shallow cave rarity', d:'Cave noise must exceed this for a near-surface cavern. Higher = rarer caves.', min:0, max:255, step:1, int:true},
       {k:'caveThreshold2', n:'deep cave rarity', d:'Same, for the deep cavern band where lava pools form.', min:0, max:255, step:1, int:true},
+      {k:'editLayer', n:'edit layer', type:'text', placeholder:'(none)', d:'Names assets/worldedits/<name>.svedit — the hand-built voxel patch saved from the Voxels view above. The engine applies it through the mutation queue to every chunk it generates, including streaming refills, so it survives flying away and composes with any seed. Leave empty for pristine worldgen. Note that ANY layer moves the world hash, which is why the shipped default is empty.'},
     ],
   },
 ];

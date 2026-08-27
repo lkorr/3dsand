@@ -32,6 +32,13 @@ happens in this process rather than in the page:
   POST /api/play              launch build/Release/sandvox.exe (body {mode,scene}:
                               "game", or "lab" = fluid testing world --lab <scene>)
   GET  /api/heightmap?...     terrain map from `sandvox --heightmap` (binary)
+  GET  /api/voxregion?...     a BOX OF REAL VOXELS from `sandvox --voxserve`
+  GET  /api/voxpalette        the compiled material table the viewer colours with
+  POST /api/voxreload         re-read tuning.json + shaders in the voxel server
+  GET  /api/worldedits        list assets/worldedits/*.svedit
+  GET  /api/worldedit?name=   read one edit layer (binary 'SVED')
+  POST /api/worldedit?name=   write one edit layer
+  POST /api/worldedit/delete  delete one edit layer
   GET  /api/status            build state + whether the exe is running
 
 Usage:
@@ -72,11 +79,15 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
 Anyone exposing this beyond localhost is opting into arbitrary local builds.
 """
 import argparse
+import gzip
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -398,6 +409,246 @@ def _text(s):
     return s if isinstance(s, str) else s.decode("utf-8", "replace")
 
 
+# ===========================================================================
+# THE VOXEL SERVER — real voxels for the Worldgen tab's terrain view.
+# ===========================================================================
+#
+# /api/heightmap runs a fresh process per map and that is fine, because
+# --heightmap is a GPU-free early exit that costs ~150 ms. --voxserve is the
+# opposite: it needs a Vulkan device, the SPIR-V compile and the material table
+# (genCell is WGSL), which is ~3 s of boot for ~8 ms of work. A viewer that
+# streams regions as the camera moves would spend its entire life booting.
+#
+# So ONE process, kept alive, driven over stdin. See src/tools/voxregion.h for
+# the protocol and why the payload goes to a file rather than down the pipe.
+VOXCACHE = os.path.join(ROOT, "build", "voxcache")
+VOXTMP = os.path.join(ROOT, "build", "voxtmp")
+# Bound on the on-disk cache. A region is ~100 KB gzipped, so this is ~200 MB
+# worst case and typically far less.
+VOXCACHE_MAX = 2000
+
+WORLDEDIT_DIR = os.path.join(ASSETS, "worldedits")
+WORLDEDIT_EXT = ".svedit"
+
+# ---- the machine-global run mutex, in Python -------------------------------
+#
+# CLAUDE.md: every sandvox.exe launch goes through scripts/run.sh, which is a
+# `mkdir C:/sv-build-lock` mutex shared with build.sh — concurrent GPU
+# processes throttle the machine and poison every measured number.
+#
+# A persistent server cannot hold that lock for its whole life: it would block
+# every build in every worktree for the length of a tuner session. But it also
+# must not generate a region WHILE another agent is measuring. So the lock is
+# taken around the ~10 ms of work and released, which is the same exclusion
+# run.sh provides with none of the starvation. The boot is covered too — that
+# is the expensive part.
+#
+# Mirrors run.sh exactly, including the 10-minute stale sweep, because two
+# implementations of one mutex that disagree about staleness is not a mutex.
+RUNLOCK_DIR = "C:/sv-build-lock"
+RUNLOCK_STALE_SEC = 600
+
+
+class RunLock:
+    """Context manager over the same directory mutex scripts/run.sh uses."""
+
+    def __init__(self, who, timeout=180.0):
+        self.who = who
+        self.timeout = timeout
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                ts = 0
+                try:
+                    with open(os.path.join(RUNLOCK_DIR, "ts")) as f:
+                        ts = int(f.read().strip() or 0)
+                except OSError:
+                    ts = None
+                if ts is not None and ts and time.time() - ts > RUNLOCK_STALE_SEC:
+                    shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
+            except OSError:
+                pass
+            try:
+                os.mkdir(RUNLOCK_DIR)
+            except FileExistsError:
+                if time.time() > deadline:
+                    raise TimeoutError("build/run lock held for >%ds" % self.timeout)
+                time.sleep(0.05)
+                continue
+            except OSError as e:
+                raise
+            for name, val in (("pid", str(os.getpid())),
+                              ("who", "tuner:" + self.who),
+                              ("ts", str(int(time.time())))):
+                try:
+                    with open(os.path.join(RUNLOCK_DIR, name), "w") as f:
+                        f.write(val)
+                except OSError:
+                    pass
+            return self
+
+    def __exit__(self, *exc):
+        shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
+        return False
+
+
+class VoxServe:
+    """The one --voxserve subprocess, and the request lock in front of it.
+
+    Single-threaded by construction: the protocol is one line in, one ack line
+    out, so two concurrent requests would interleave and each would read the
+    other's ack. ThreadingHTTPServer means that is not hypothetical — a viewer
+    streaming a ring of regions issues them in parallel.
+    """
+
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.err = None
+
+    def _spawn(self):
+        if not os.path.isfile(EXE):
+            raise RuntimeError("build/Release/sandvox.exe not built yet — press Build")
+        os.makedirs(VOXTMP, exist_ok=True)
+        # The boot is the expensive, GPU-heavy part, so it holds the run mutex.
+        with RunLock("voxserve-boot"):
+            p = subprocess.Popen(
+                [EXE, "--voxserve"], cwd=ROOT,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # Skip the boot log; the protocol starts at the READY line.
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    p.kill()
+                    raise RuntimeError("voxserve died during boot")
+                if line.startswith("VOXSERVE READY"):
+                    break
+        self.proc = p
+
+    def _ensure(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self.proc = None
+        self._spawn()
+
+    def command(self, line, hold_lock=True):
+        """Send one command, return (ok, payload_bytes_or_message).
+
+        `hold_lock=False` is for commands that touch no GPU (PING), so a
+        liveness check does not queue behind somebody's build.
+        """
+        with self.lock:
+            self._ensure()
+            def _round_trip():
+                self.proc.stdin.write(line + "\n")
+                self.proc.stdin.flush()
+                while True:
+                    ack = self.proc.stdout.readline()
+                    if not ack:
+                        raise RuntimeError("voxserve died")
+                    ack = ack.strip()
+                    if ack.startswith("OK ") or ack.startswith("ERR "):
+                        return ack
+                    # Anything else is engine chatter; the protocol tolerates it
+                    # rather than breaking, because a stray printf in a shader
+                    # reload path should not take the viewer down.
+            try:
+                if hold_lock:
+                    with RunLock("voxserve"):
+                        ack = _round_trip()
+                else:
+                    ack = _round_trip()
+            except Exception as e:
+                # A dead server is recoverable: the next request respawns it.
+                try:
+                    if self.proc:
+                        self.proc.kill()
+                except Exception:
+                    pass
+                self.proc = None
+                return False, str(e)
+            if ack.startswith("ERR "):
+                return False, ack[4:]
+            return True, ack[3:]
+
+    def stop(self):
+        with self.lock:
+            p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            try:
+                p.stdin.write("QUIT\n")
+                p.stdin.flush()
+                p.wait(timeout=3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+
+_voxserve = VoxServe()
+
+
+def _world_signature():
+    """What the generated world depends on, as a short hex string.
+
+    The cache key has to move when the world does, and the world is a function
+    of tuning.json (worldgen's octave ladder, pond/tree/cave parameters — most
+    of them WGSL consts) and of materials.json (the ids the words carry). Hashed
+    by CONTENT, not mtime: a tuner restart should not throw away a cache, and an
+    edit that reverts a file should hit the entries it had before.
+    """
+    h = hashlib.sha1()
+    for path in (WRITABLE["tuning"], WRITABLE["materials"]):
+        try:
+            with open(path, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            h.update(b"?")
+    return h.hexdigest()[:16]
+
+
+def _voxcache_sweep():
+    """Trim the cache to VOXCACHE_MAX files, oldest-accessed first."""
+    try:
+        names = os.listdir(VOXCACHE)
+    except OSError:
+        return
+    if len(names) <= VOXCACHE_MAX:
+        return
+    entries = []
+    for n in names:
+        p = os.path.join(VOXCACHE, n)
+        try:
+            entries.append((os.path.getmtime(p), p))
+        except OSError:
+            pass
+    entries.sort()
+    for _, p in entries[:len(entries) - VOXCACHE_MAX]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _worldedit_path(name):
+    """assets/worldedits/<name>.svedit, or None if the name is not a bare name.
+
+    Same discipline as _note_path: the request carries a NAME, never a path, and
+    anything that is not a plain safe filename is refused before it is joined.
+    """
+    if not name or len(name) > 64:
+        return None
+    ok = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ")
+    if any(c not in ok for c in name):
+        return None
+    return os.path.join(WORLDEDIT_DIR, name + WORLDEDIT_EXT)
+
+
 def run_build():
     """Run the build, capturing output. Errors are reported, never raised."""
     global _build
@@ -555,6 +806,106 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(blob)
 
+    # ---- the voxel view ----------------------------------------------------
+    def _send_blob(self, blob, gz=False):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        if gz:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(blob)
+
+    def _voxregion(self):
+        q = self._query()
+
+        def num(name, dflt):
+            try:
+                return int(float(q.get(name, [dflt])[0]))
+            except (TypeError, ValueError):
+                return dflt
+
+        ox, oy, oz = num("ox", 0), num("oy", 1008), num("oz", 0)
+        nx, ny, nz = num("nx", 64), num("ny", 64), num("nz", 64)
+        lod, seed = num("lod", 1), num("seed", 1337)
+        # Refused rather than clamped, for the reason BuildVoxRegion refuses:
+        # a viewer that silently got a different box would place the mesh at the
+        # origin it asked for and the seam would look like a worldgen bug.
+        if lod not in (1, 2, 4, 8, 16):
+            return self._json(400, {"ok": False, "error": "lod must be 1/2/4/8/16"})
+        for v in (nx, ny, nz):
+            if v < 1 or v > 128:
+                return self._json(400, {"ok": False,
+                                        "error": "sample counts must be 1..128"})
+        for v in (ox, oy, oz):
+            if v % 16:
+                return self._json(400, {"ok": False,
+                                        "error": "box origin must be a multiple of 16"})
+
+        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s" % (
+            ox, oy, oz, nx, ny, nz, lod, seed, _world_signature())
+        ).encode()).hexdigest()
+        cached = os.path.join(VOXCACHE, key + ".gz")
+        want_gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+        if os.path.isfile(cached):
+            try:
+                with open(cached, "rb") as f:
+                    blob = f.read()
+                os.utime(cached, None)          # LRU: the sweep sorts on mtime
+                if want_gz:
+                    return self._send_blob(blob, gz=True)
+                return self._send_blob(gzip.decompress(blob))
+            except OSError:
+                pass
+
+        os.makedirs(VOXTMP, exist_ok=True)
+        os.makedirs(VOXCACHE, exist_ok=True)
+        raw = os.path.join(VOXTMP, key + ".bin")
+        cmd = "REGION %d %d %d %d %d %d %d %d %s" % (
+            ox, oy, oz, nx, ny, nz, lod, seed, raw.replace("\\", "/"))
+        try:
+            ok, msg = _voxserve.command(cmd)
+        except Exception as e:
+            return self._json(503, {"ok": False, "error": str(e)})
+        if not ok:
+            return self._json(500, {"ok": False, "error": msg})
+        try:
+            with open(raw, "rb") as f:
+                blob = f.read()
+            os.remove(raw)
+        except OSError as e:
+            return self._json(500, {"ok": False, "error": str(e)})
+        # Gzip is worth it here and not a reflex: a 64^3 region is ~1.1 MB of
+        # words and ~90 KB gzipped, because the state nibble's palette jitter
+        # makes the run-length coding in the file itself nearly useless on
+        # solid rock. Cached in the compressed form, since that is what almost
+        # every response sends.
+        packed = gzip.compress(blob, 6)
+        try:
+            with open(cached, "wb") as f:
+                f.write(packed)
+            _voxcache_sweep()
+        except OSError:
+            pass
+        if want_gz:
+            return self._send_blob(packed, gz=True)
+        return self._send_blob(blob)
+
+    def _voxpalette(self):
+        out = os.path.join(VOXTMP, "palette.json")
+        os.makedirs(VOXTMP, exist_ok=True)
+        # PALETTE touches no GPU, so it does not queue behind a build.
+        ok, msg = _voxserve.command("PALETTE " + out.replace("\\", "/"),
+                                    hold_lock=False)
+        if not ok:
+            return self._json(503, {"ok": False, "error": msg})
+        try:
+            with open(out, "rb") as f:
+                return self._send(200, f.read(), "application/json")
+        except OSError as e:
+            return self._json(500, {"ok": False, "error": str(e)})
+
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/":
@@ -683,6 +1034,31 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == "/api/heightmap":
             return self._heightmap()
+        if p == "/api/voxregion":
+            return self._voxregion()
+        if p == "/api/voxpalette":
+            return self._voxpalette()
+        if p == "/api/worldedits":
+            names = []
+            try:
+                for n in sorted(os.listdir(WORLDEDIT_DIR)):
+                    if n.endswith(WORLDEDIT_EXT):
+                        full = os.path.join(WORLDEDIT_DIR, n)
+                        names.append({"name": n[:-len(WORLDEDIT_EXT)],
+                                      "bytes": os.path.getsize(full),
+                                      "mtime": int(os.path.getmtime(full))})
+            except OSError:
+                pass
+            return self._json(200, {"ok": True, "layers": names})
+        if p == "/api/worldedit":
+            name = (self._query().get("name") or [""])[0]
+            path = _worldedit_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad layer name"})
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "no such layer"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), "application/octet-stream")
 
         if p == "/api/status":
             with _lock:
@@ -928,10 +1304,59 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(500, {"ok": False, "error": repr(e)})
             return self._json(200, {"ok": True})
 
+        # ---- the voxel view ----
+        if p == "/api/voxreload":
+            # Worldgen's tuning values are WGSL consts baked at pipeline build,
+            # so a live server keeps answering with the parameters it booted on
+            # until this runs. The tab sends it after every save — the same
+            # save-then-render order the 2D map has always used, for the same
+            # reason.
+            ok, msg = _voxserve.command("RELOAD")
+            if not ok:
+                return self._json(503, {"ok": False, "error": msg})
+            return self._json(200, {"ok": True, "signature": _world_signature()})
+
+        if p == "/api/worldedit":
+            name = (self._query().get("name") or [""])[0]
+            path = _worldedit_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad layer name"})
+            blob = self._raw()
+            if len(blob) < 32 or blob[:4] != b"SVED":
+                return self._json(400, {"ok": False, "error": "not an SVED layer"})
+            try:
+                os.makedirs(WORLDEDIT_DIR, exist_ok=True)
+                # Write-then-rename: a half-written edit layer is a world the
+                # engine will refuse to load, and the tuner autosaves.
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                os.replace(tmp, path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "bytes": len(blob)})
+
+        if p == "/api/worldedit/delete":
+            name = (self._body().get("name") or "")
+            path = _worldedit_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad layer name"})
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True})
+
         if p == "/api/build":
             with _lock:
                 if _build["running"]:
                     return self._json(409, {"ok": False, "error": "build already running"})
+            # The voxel server holds an open handle on sandvox.exe, and a link
+            # step against a running image is the LNK1104 build.sh kills stale
+            # instances to prevent. It respawns on the next region request, so
+            # this costs a boot and buys a build that works.
+            _voxserve.stop()
             threading.Thread(target=run_build, daemon=True).start()
             return self._json(200, {"ok": True, "started": True})
 

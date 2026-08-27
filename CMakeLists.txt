@@ -305,6 +305,7 @@ add_executable(sandvox
   src/sim/world.cpp
   src/sim/pagetable.cpp
   src/sim/worldio.cpp
+  src/sim/worldedit.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp
   src/sim/faredits.cpp
@@ -336,8 +337,13 @@ add_executable(sandvox
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
   # different domains stop conflicting in one 6k-line file. See test/selftest.h.
+  # --voxdump / --voxserve: the tuner's voxel-accurate terrain view. Sits with
+  # support.cpp because it drives the same worldgen/readback plumbing the gates
+  # do, not because it is a test.
+  src/tools/voxregion.cpp
   src/test/support.cpp
   src/test/selftest.cpp
+  src/test/selftest_voxregion.cpp
   src/test/selftest_terrain.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp

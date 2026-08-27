@@ -3364,6 +3364,122 @@ liquid rebaselines), and that is correct rather than alarming: quiet is the
 first 50 ticks after worldgen, when terrain powders are still coming to rest,
 and matter in motion is exactly what the bias steers.
 
+## 9c. The terrain viewer and the edit layer (added 2026-08-27)
+
+Two things live here: a way to LOOK at generated terrain per voxel, and a way to
+CHANGE it that composes with worldgen instead of replacing it.
+
+### 9c.1 Why the column map was not enough
+
+`--heightmap` renders a grid of `World::TerrainColumn` — ground height, slope,
+sediment depth, water depth per (x, z) — and the tuner's Worldgen tab drew it.
+Its 3D mode extruded that same grid into one heightfield mesh, which is why it
+read as a single continuous sheet: it had exactly the information a column field
+has. A cave, an overhang, a tree, the floor of a pond and a single voxel are all
+things that are *not* functions of (x, z), so none of them could ever appear.
+
+The world's real content is `genCell` in `worldgen.wgsl`, and genCell runs on the
+GPU. So the viewer needs actual voxels off the actual device.
+
+### 9c.2 The region server (`src/tools/voxregion.h`)
+
+`--voxserve` boots the engine headless and answers region requests on stdin
+until told to quit; `--voxdump` is one request through the same path. A request
+is a chunk-aligned box plus a `lod`, and it returns an `SVVX` binary: RLE over
+the engine's own 32-bit voxel words.
+
+Three properties matter and each is a deliberate cost:
+
+* **It generates only the chunks the box covers.** `EncodeGenList` already took
+  a slot list (the streamer's primitive), so a 64³ region is 64 chunk dispatches
+  rather than the window's 32,768. Cost tracks the box, which is rule 2 applied
+  to a tool. A 64³ region is ~8 ms once the process is warm.
+* **It is a server because boot is ~3 s and a region is ~8 ms.** A viewer that
+  streams as the camera moves cannot pay device creation and SPIR-V compilation
+  per box. The tuner keeps one process and takes the machine-global run mutex
+  around each request rather than for the process lifetime — a persistent holder
+  would block every build in every worktree for a whole session.
+* **`lod > 1` is a MAJORITY over the block, per chunk.** 16 divides every
+  supported lod so a chunk's cells never straddle a sample. Point sampling was
+  the obvious alternative and it deletes exactly what you zoom out to see: a
+  one-voxel cave roof, a trunk, a shoreline.
+
+Regions are never held at full resolution CPU-side — a lod-16 box spans 512³
+voxels (512 MiB of words) and yields 128 KiB of samples, downsampled per chunk
+as each is read back.
+
+### 9c.3 Geometry and material are separate (`assets/worldview.js`)
+
+The browser's mesher merges on ONE bit — "is this face exposed" — and carries no
+colour at all. Each region uploads its cells as an `R16UI` 3D texture and the
+fragment shader reads the cell just inside the face and looks the colour up in a
+palette texture.
+
+This is the load-bearing decision. A conventional coloured-quad greedy mesher
+merges almost nothing here, because worldgen's palette jitter gives every
+adjacent stone cell a different variant: a 64³ region of plain rock becomes ~25k
+unmergeable quads. Merging on exposure alone makes a flat plain a handful of
+quads whatever it is made of — measured 2.6k quads per region against ~25k — and
+the material stays exact per voxel, jitter included. The same texture pays for
+per-fragment ambient occlusion (which therefore survives the merging, unlike
+baked vertex AO) and for the voxel edge lines that fade in when cells are big
+enough on screen to be worth outlining.
+
+Four LOD shells of 64³-sample regions at lod 1/2/4/8; a coarse region is skipped
+when it lies entirely inside a finer level's coverage, which is exact because
+every extent is a power-of-two multiple of the last. Past the last shell the
+column map draws the horizon — the one thing a heightfield is strictly better
+at, since it covers kilometres for one fetch.
+
+Region seams are meshed with the six neighbour face slabs when they exist, and a
+region is re-meshed when a neighbour arrives. A missing neighbour reads as
+solid, so the transient artifact is a hole that fills itself rather than a
+z-fighting double face that does not.
+
+### 9c.4 The edit layer (`src/sim/worldedit.h`)
+
+Brush strokes and selection operations write a sparse, chunk-keyed patch of
+world cell → voxel word, saved to `assets/worldedits/<name>.svedit` and named by
+`worldgen.editLayer`.
+
+It is deliberately none of the three things it could have been:
+
+* not a **ChunkStore save** (`world.svd/`), which is a live world pinned to one
+  seed and one history and cannot compose with a worldgen change — and the whole
+  premise of the Worldgen tab is that you are still moving the sliders;
+* not **FarEdits**, which is derived, disposable cascade state;
+* not a **second writer into the voxel buffer**. It emits `CellOp`s and they go
+  through the MutationQueue like every other mutation (rule 3), which is what
+  keeps it inside the save/replay/network stream for free and is why application
+  is deferred by a tick rather than folded into `genChunk`.
+
+Chunks are queued at the point of generation — startup worldgen queues the
+window, `Stream::FillSlots` queues each refilled slot — and paid out on the
+ordinary per-tick op stream. The streaming re-queue is not optional and fails
+the same way the far-field sieve does without `FarEdits`: `genChunk` overwrites
+a refilled slot with pristine procgen, so an edit would heal itself the moment
+you flew far enough for its chunk to scroll out and back.
+
+A queued chunk that has scrolled out by the time it drains is DROPPED, not
+clamped: a cell index is window-relative, so applying one for a non-resident
+chunk punches a hole in whatever now owns that slot.
+
+**Any layer moves the world hash**, because it puts voxels in the world. That is
+why `worldgen.editLayer` ships empty and no gate sets it.
+
+### 9c.5 Verification
+
+`--selftest --gate voxregion` asserts the data: a lod-1 dump is bit-identical to
+a direct `ReadVoxelsSync` of the same voxels (stamp excluded), lod 4 invents no
+material the fine box lacks and keeps its fullness, malformed requests are
+refused rather than clamped, and a `.svedit` written as bytes and read through
+the real loader lands on the cell index it names — then goes through a real tick
+and reads back as the material it asked for.
+
+`bash scripts/check_worldview.sh` covers the half that C++ cannot see: real
+Chrome, real WebGL2, the real worker, `/api/voxregion` over HTTP, greedy
+meshing, LOD shells, a pixel readback, a raycast, an edit and an undo.
+
 ## 10. Networking (design now, build later)
 
 With the determinism discipline of §2/§4, **both** classic models are viable, and

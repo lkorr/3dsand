@@ -1755,6 +1755,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
+    // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
+    // and a value with a separator in it would reach outside that directory.
+    ReadStr(*g, "editLayer", w.editLayer, out, at);
+    if (w.editLayer.find_first_of("/\\:") != std::string::npos) {
+      out.warnings.push_back("worldgen.editLayer must be a bare layer name; ignored");
+      w.editLayer.clear();
+    }
     // These divide or modulo in worldgen.wgsl; zero is a hang or a div-by-zero.
     auto atLeast = [&](const char* name, int& v, int lo) {
       if (v < lo) {

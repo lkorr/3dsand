@@ -88,6 +88,9 @@ struct RecordCtx {
   // is the whole of a settled tick's CA cost. Defaults TRUE so a caller that
   // never sets it records the CA exactly as before — the safe direction.
   bool caActive = true;
+  // True only while the per-voxel activity overlay is on. Gates the ActVoxViz
+  // write so the debug buffer costs nothing when the dev toggle is off.
+  bool vizActive = false;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one

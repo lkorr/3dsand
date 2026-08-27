@@ -52,9 +52,11 @@
 #include "sim/wind.h"
 #include "sim/windprim.h"
 #include "sim/world.h"
+#include "sim/worldedit.h"
 #include "sim/worldio.h"
 #include "telemetry.h"
 #include "test/selftest.h"
+#include "tools/voxregion.h"  // --voxdump / --voxserve, the tuner's voxel view
 #include "measure/measure.h"
 #include "test/support.h"
 #include "ui/overlay.h"
@@ -1648,6 +1650,10 @@ int main(int argc, char** argv) {
   // dispatch below for why this is a GPU-free early exit.
   std::string heightmapArgs;
   std::string heightmapOut = "build/heightmap.bin";
+  // --voxdump ox,oy,oz,nx,ny,nz,lod[,seed] / --voxserve (tools/voxregion.h)
+  std::string voxdumpArgs;
+  std::string voxdumpOut = "build/voxregion.bin";
+  bool voxserve = false;
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -1875,6 +1881,21 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--heightmap-out wants a path\n"); return 1; }
       heightmapOut = argv[++i];
     }
+    // --voxdump / --voxserve: REAL VOXELS for the tuner's terrain viewer.
+    // Unlike --heightmap these need a GPU (genCell is WGSL), so they answer
+    // after device init — see tools/voxregion.h for why one is a server.
+    else if (a == "--voxdump") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "--voxdump wants ox,oy,oz,nx,ny,nz,lod[,seed]\n");
+        return 1;
+      }
+      voxdumpArgs = argv[++i];
+    }
+    else if (a == "--voxdump-out") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--voxdump-out wants a path\n"); return 1; }
+      voxdumpOut = argv[++i];
+    }
+    else if (a == "--voxserve") voxserve = true;
     else {
       std::fprintf(stderr, "unrecognized argument: '%s'\n"
                            "Run with --help for usage.\n", a.c_str());
@@ -2035,6 +2056,11 @@ int main(int argc, char** argv) {
     if (labScene >= 0) tune.sim.fluidExciteMode = 1;
     SetCurrentTuning(tune);
   }
+  // The authored edit layer named by worldgen.editLayer. Read here, before any
+  // world exists, so the very first SubmitWorldgen already queues it — a layer
+  // loaded after worldgen would not appear until something happened to
+  // regenerate the chunks it lives in.
+  LoadWorldEditLayerFromTuning(assetDir);
   std::vector<MaterialDef> mats;
   std::vector<ReactionGpu> reactions;
   std::string errors;
@@ -2095,7 +2121,8 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !measure && !fluidBench && shotMob.empty()) {
+  if (!selftest && !shot && !measure && !fluidBench && shotMob.empty() &&
+      voxdumpArgs.empty() && !voxserve) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -2168,6 +2195,13 @@ int main(int argc, char** argv) {
   far.Init(&world);
 
   if (measure) return RunMeasure(ctx, world, sim, mats);
+  // The voxel-region modes answer here: after the device, shaders and material
+  // table exist (genCell is WGSL and the palette is the COMPILED table), and
+  // before anything spawns a player, a mob or a physics world — none of which a
+  // terrain dump has any use for.
+  if (!voxdumpArgs.empty())
+    return RunVoxDump(ctx, world, sim, mats, voxdumpArgs, voxdumpOut);
+  if (voxserve) return RunVoxServe(ctx, world, sim, mats);
   if (shot) return RunShots(ctx, world, sim);
   if (shotFluid || shotFluidPond)
     return RunFluidShot(ctx, world, sim, mats, shotFluidPond);
@@ -2948,6 +2982,11 @@ int main(int argc, char** argv) {
         // tuning.json. The materials block is the next statement, so this
         // lands in the right order: tuning is live before LoadAssets reads it.
         ui.reloadMaterials = true;
+        // F5 re-reads tuning, so it re-reads which layer is named and what is
+        // in it. Re-queued against the CURRENT window, so an edit saved from
+        // the tuner appears on the next keypress instead of the next restart.
+        LoadWorldEditLayerFromTuning(assetDir);
+        WorldEditLayer().QueueWindow(world);
       }
       std::printf("reloading shaders... %s\n",
                   sim.ReloadShaders(ctx.device) ? "ok" : "FAILED (kept old)");
@@ -4073,6 +4112,16 @@ int main(int argc, char** argv) {
       // what makes every headless path (and the pinned hash) unaffected.
       Celestial().SetScale(ui.timeScale, tick);
       Celestial().Advance();
+      // ---- the authored edit layer (sim/worldedit.h) ----------------------
+      // Whatever worldgen produced this tick — startup, a window shift, a
+      // regen — the layer's chunks were queued at the point of generation and
+      // are paid out here, on the ordinary CellOp stream, bounded by the same
+      // per-tick cap everything else on that stream respects. Rule 3: this is
+      // the ONLY place the layer touches the world, and it touches it through
+      // the queue.
+      if (WorldEditLayer().HasPending() && cellOps.size() < kMaxCellOpsPerTick)
+        WorldEditLayer().Drain(world, cellOps,
+                               kMaxCellOpsPerTick - (uint32_t)cellOps.size());
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,

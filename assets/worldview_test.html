@@ -1,0 +1,139 @@
+<!doctype html>
+<!-- Headless harness for worldview.js. Loaded by scripts/check_worldview.sh
+     through Chrome; it drives a real WebGL2 context, a real worker and the real
+     /api/voxregion route, then prints a verdict into #out for --dump-dom.
+
+     It is a harness and not a gate: the engine's own gates cover the DATA
+     (src/test/selftest_terrain.cpp `voxregion`). What cannot be asserted from
+     C++ is whether the browser half decodes, meshes, uploads and DRAWS it, and
+     that is exactly what this checks — including reading pixels back, because
+     "no exception was thrown" is not the same as "something appeared". -->
+<meta charset="utf-8">
+<title>worldview harness</title>
+<body style="background:#111;color:#ddd;font:12px monospace">
+<canvas id="cv" width="640" height="400" style="width:640px;height:400px"></canvas>
+<pre id="out">running</pre>
+<script src="worldview.js"></script>
+<script>
+var log = [], fail = 0;
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; }
+function done(){
+  document.getElementById('out').textContent =
+    log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
+  document.title = fail ? 'FAIL' : 'OK';
+}
+(async function(){
+  try {
+    var cv = document.getElementById('cv');
+    var wv = new WorldView(cv, {seaY: 1024});
+    say(true, 'WebGL2 context + programs built');
+
+    var r = await fetch('/api/voxpalette');
+    if(!r.ok) throw new Error('palette HTTP ' + r.status);
+    var pal = await r.json();
+    wv.loadPalette(pal);
+    say(pal.materials.length > 50, 'palette: ' + pal.materials.length + ' materials, air=' +
+        pal.materials[0].name + ', chunk=' + pal.chunk);
+
+    // Park the camera at the datum and let the streamer run. Everything below
+    // is the real path: fetch -> worker decode -> worker greedy mesh -> upload.
+    // Camera from the query string so one harness serves both jobs: the pass/
+    // fail run wants a cheap two-shell view, a screenshot wants altitude and
+    // all four levels.
+    var Q = new URLSearchParams(location.search);
+    var num = function (k, d) { var v = parseFloat(Q.get(k)); return isFinite(v) ? v : d; };
+    wv.seed = num('seed', 1337);
+    wv.cam.mode = 'fly';
+    wv.cam.pos = [num('x', 32), num('y', 1080), num('z', -40)];
+    wv.cam.yaw = num('yaw', 0); wv.cam.pitch = num('pitch', -0.5);
+    wv.view.levels = num('levels', 2);
+    wv.view.showRegions = Q.get('lod') === '1';
+
+    // update() only — NOT render(). Under SwiftShader a 1400x900 frame with
+    // per-fragment AO is ~2 s, and rendering once per poll turned a 20 s
+    // streaming wait into a timeout. Streaming does not need a frame; the one
+    // render that matters happens after the loop.
+    var t0 = performance.now();
+    var meshed = 0, want = num('want', 8);
+    while (performance.now() - t0 < 60000) {
+      wv.update();
+      meshed = 0;
+      var busy = 0;
+      wv.regions.forEach(function(rg){
+        if (rg.op && rg.op.count) meshed++;
+        if (rg.meshing || rg.dirty) busy++;
+      });
+      if (meshed >= want && busy === 0 && wv.inflight === 0 && wv.queue.length === 0) break;
+      // THE POLL IS A FETCH, DELIBERATELY, and this is the whole reason the
+      // harness works under Chrome's --virtual-time-budget. Virtual time
+      // fast-forwards setTimeout to zero, so a `setTimeout(40)` poll spins
+      // thousands of times and burns a 90-second budget in under a second of
+      // real work — measured: 2 regions streamed out of 53, every later check
+      // failing for want of data. Virtual time PAUSES while a network fetch is
+      // outstanding, so polling through one makes each iteration cost real
+      // time and lets the workers actually finish.
+      await fetch('/api/status').catch(function(){});
+    }
+    say(wv.regions.size > 0, 'streamed ' + wv.regions.size + ' regions (' +
+        (wv.stats.bytes/1048576).toFixed(2) + ' MiB)');
+    say(meshed > 0, meshed + ' regions meshed to geometry');
+    // RENDER BEFORE ASKING WHAT WAS DRAWN. stats.quads is filled by render(),
+    // and the streaming loop above deliberately does not render — so checking
+    // it first reported "0 quads in 0 draw calls" over a frame that was about
+    // to draw 50,000.
+    wv.render();
+    say(wv.stats.quads > 100, wv.stats.quads.toLocaleString() + ' quads drawn' +
+        ' in ' + wv.stats.draws + ' draw calls');
+
+    // Levels present? The whole point of the LOD shell is that both exist.
+    var lv = {};
+    wv.regions.forEach(function(rg){ lv[rg.level] = (lv[rg.level]||0) + 1; });
+    say(Object.keys(lv).length >= 2, 'levels resident: ' + JSON.stringify(lv));
+
+    // Did anything actually land on screen?
+    wv.render();
+    var gl = wv.gl;
+    var px = new Uint8Array(cv.width * cv.height * 4);
+    gl.readPixels(0, 0, cv.width, cv.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    var lit = 0, bg = 0;
+    for (var i = 0; i < px.length; i += 4) {
+      if (px[i] > 24 || px[i+1] > 26 || px[i+2] > 30) lit++; else bg++;
+    }
+    say(lit > cv.width * cv.height * 0.05,
+        'framebuffer: ' + (100*lit/(lit+bg)).toFixed(1) + '% non-background pixels');
+
+    // Picking, which the editor depends on for every single operation. Cast
+    // from the middle of the resident level-0 shell rather than from the
+    // camera: a screenshot camera can legitimately be over a chasm, and a
+    // check that depends on where you happened to point is not a check.
+    var e0 = wv.camEye();
+    var probe = [Math.floor(e0[0]/64)*64 + 32, 0, Math.floor(e0[2]/64)*64 + 32];
+    var top = Math.floor(e0[1]/64)*64 + 96;
+    var hit = wv.raycast(probe[0], top, probe[2], 0, -1, 0, 400, false);
+    say(!!hit, 'raycast down the centre column hit ' +
+        (hit ? (pal.materials[hit.mat].name + ' at y' + hit.vox[1]) : 'nothing'));
+
+    // Edit -> undo round trip through the real apply path.
+    if (hit) {
+      var target = [hit.vox[0], hit.vox[1] + 1, hit.vox[2]];
+      var before = wv.cellAtWorld(target[0], target[1], target[2], 0);
+      var n = wv.apply([[target[0], target[1], target[2], wv.wordFor(2, target[0], target[1], target[2])]], 'test');
+      var after = wv.cellAtWorld(target[0], target[1], target[2], 0);
+      say(n === 1 && (after & 0xFFF) === 2, 'edit wrote material 2 (was ' + (before & 0xFFF) + ')');
+      say(wv.edit.count() === 1, 'edit layer holds ' + wv.edit.count() + ' voxel');
+      var buf = wv.edit.serialize(1337);
+      var L2 = new WorldViewEditLayer();
+      var info = L2.deserialize(buf);
+      say(L2.count() === 1 && info.seed === 1337,
+          '.svedit round trip: ' + buf.byteLength + ' bytes, ' + L2.count() + ' voxel, seed ' + info.seed);
+      wv.undo();
+      var undone = wv.cellAtWorld(target[0], target[1], target[2], 0);
+      say(undone === before, 'undo restored the original word');
+    }
+  } catch (e) {
+    say(false, 'threw: ' + (e && e.stack || e));
+  }
+  done();
+})();
+</script>
+</body>

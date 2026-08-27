@@ -11,6 +11,7 @@
 #include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked eviction copy
 #include "sim/simulation.h"
+#include "sim/worldedit.h"   // the authored layer re-applies on every refill
 
 namespace {
 constexpr uint64_t kChunkBytes = kChunkVol * 4;
@@ -747,6 +748,16 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     sim_->EncodeGenList(enc, (uint32_t)genSlots.size());
     ctx_->queue.Submit(enc.Finish());
+
+    // genChunk has just overwritten these slots with PRISTINE procgen, which
+    // un-does the authored edit layer exactly the way the far-field sieve
+    // un-does a crater (see faredits.h). Re-queue every refilled chunk the
+    // layer touches; the ops go out through the MutationQueue on the following
+    // ticks. Cheap when there is no layer — QueueChunk returns on an empty map
+    // before it hashes anything.
+    if (!sandvox::WorldEditLayer().Empty())
+      for (uint32_t gs : genSlots)
+        sandvox::WorldEditLayer().QueueChunk(world_->SlotToWorldChunk(gs));
 
     // ---- and DEMOTE the result (§3.5c's compaction, on the streaming path) --
     //

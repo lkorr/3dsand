@@ -16,6 +16,7 @@
 #include "gpu/resources.h"
 #include "sim/farfield.h"
 #include "sim/wind.h"
+#include "sim/worldedit.h"
 #include "sim/windprim.h"
 
 namespace sandvox {
@@ -673,6 +674,11 @@ void SetHarnessSnapshotDrain(bool on) { g_harnessSnapshotDrain = on; }
 bool HarnessSnapshotDrain() { return g_harnessSnapshotDrain; }
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
+  // The authored edit layer patches whatever worldgen produces, so a fresh
+  // world re-queues every edited chunk the window contains. Queue only — the
+  // ops go out through the MutationQueue on the ticks that follow (rule 3), not
+  // by writing voxels from here.
+  WorldEditLayer().QueueWindow(world);
   // The held snapshot describes the OLD world; scenes and gates also restart
   // their tick counters, which can make its stamp read as newer than the new
   // world's early ticks. See World::InvalidateSnapshot. Measured on --shot's

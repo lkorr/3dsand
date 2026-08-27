@@ -36,6 +36,7 @@ const std::vector<Gate>& MobGates();
 const std::vector<Gate>& BodyGates();
 const std::vector<Gate>& AudioGates();
 const std::vector<Gate>& WorldIoGates();
+const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
@@ -68,6 +69,12 @@ const char* const kOrder[] = {
     "prefab",      "settle-back",    "player-body", "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
+    // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
+    // the residency window and resets the page table, which is the state every
+    // other gate's fixture placement assumes. It restores both before it
+    // returns, but running it early would make any bug in that restore look
+    // like a failure somewhere else (CLAUDE.md rule 7).
+    "voxregion",
     "perf",
 };
 
@@ -78,6 +85,7 @@ const std::vector<Gate>& Registry() {
                           &SimGates(), &CaGates(), &WindGates(), &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
+                          &VoxRegionGates(),
                           &SpellGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 

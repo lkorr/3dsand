@@ -410,6 +410,13 @@ struct TickParams {
   windPrims : array<vec4<i32>, 96>,
   // kWindWakeCap slots, four to a std140 row.
   windWake : array<vec4<u32>, 32>,
+  // Nonzero while the per-voxel activity overlay is on. THE THIRD HALF of the
+  // same field: it was added to the C++ TickParams and to the pass table's
+  // VizActive condition without ever reaching this struct, so the sizes
+  // disagreed (2224 vs 2240) and check_invariants.py failed. A shorter WGSL
+  // struct does not error — the shader simply cannot see the field — which is
+  // why that checker compares total size rather than trusting the declaration.
+  vizActive : u32,
 };
 
 // Must match kWindScaleOne / kWindScaleMax in src/sim/world.h.

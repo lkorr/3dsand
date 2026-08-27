@@ -644,8 +644,36 @@
   }
   #wgCanvas{display:block;width:100%;height:auto;cursor:grab;image-rendering:auto}
   #wgCanvas.drag{cursor:grabbing}
-  #wg3DCanvas{display:none;width:100%;height:auto;cursor:grab}
-  #wg3DCanvas.drag{cursor:grabbing}
+  #wvCanvas{display:none;width:100%;height:72vh;min-height:420px;outline:none;
+            cursor:crosshair;touch-action:none}
+  #wvCanvas.look{cursor:move}
+  /* ---- the voxel view's own furniture ---- */
+  .wvbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .wvbar .grp{display:flex;gap:3px;align-items:center;background:var(--card);
+              border:1px solid var(--line);border-radius:8px;padding:3px 5px}
+  .wvbar button.on{background:var(--acc);color:#06080b;border-color:var(--acc)}
+  .wvstat{
+    position:absolute;right:10px;bottom:10px;background:rgba(8,10,13,.82);
+    border:1px solid var(--line);border-radius:7px;padding:6px 10px;
+    font-family:var(--mono);font-size:11px;color:var(--dim);
+    pointer-events:none;white-space:pre;line-height:1.5;
+  }
+  .wvhelp{
+    position:absolute;left:10px;top:10px;background:rgba(8,10,13,.82);
+    border:1px solid var(--line);border-radius:7px;padding:7px 10px;
+    font-size:11px;color:var(--dim);pointer-events:none;line-height:1.7;max-width:280px;
+  }
+  .wvpal{display:grid;grid-template-columns:repeat(auto-fill,minmax(74px,1fr));
+         gap:4px;max-height:220px;overflow:auto;padding:2px}
+  .wvpal button{display:flex;align-items:center;gap:5px;font-size:11px;padding:3px 5px;
+                overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wvpal button.on{outline:2px solid var(--acc)}
+  .wvpal i{display:inline-block;width:12px;height:12px;border-radius:2px;flex:0 0 auto;
+           border:1px solid rgba(255,255,255,.25)}
+  .wvsec{margin:12px 0 6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+         color:var(--dim);border-top:1px solid var(--line);padding-top:10px}
+  .wvrow{display:flex;gap:6px;align-items:center;margin:4px 0;flex-wrap:wrap;font-size:12px}
+  .wvrow label{color:var(--dim);font-size:11.5px}
   .wgread{
     position:absolute;left:10px;bottom:10px;background:rgba(8,10,13,.82);
     border:1px solid var(--line);border-radius:7px;padding:6px 10px;
@@ -1609,28 +1637,149 @@
           <option>448</option><option>640</option>
         </select>
       </label>
-      <button id="wg3DToggle" title="Switch to 3D terrain view">3D</button>
-      <label class="hint" id="wg3DExagLabel" style="display:none">vert
-        <input id="wg3DExag" type="range" min="0.5" max="15" step="0.5" value="3"
-               style="width:70px;margin-left:4px;vertical-align:middle">
-        <span id="wg3DExagVal">3</span>x
-      </label>
+      <button id="wvToggle" title="Switch to the voxel world view">&#9635; Voxels</button>
       <span class="spacer"></span>
       <span class="hint" id="wgStatus"></span>
     </div>
+
+    <!-- THE VOXEL VIEW's own toolbar. Separate from the map's because they are
+         separate instruments: the map is a 2D picture of a column field with a
+         zoom, this flies a camera through real cells and edits them. Sharing a
+         toolbar meant every control had to be explained twice. -->
+    <div class="wvbar" id="wvBar" style="display:none">
+      <div class="grp">
+        <button id="wvCamFly" class="on" title="Fly: RMB looks, WASD moves, QE up/down">Fly</button>
+        <button id="wvCamOrbit" title="Orbit a point: RMB orbits, MMB pans">Orbit</button>
+        <button id="wvGoSurface" title="Drop the camera to the ground under it">&#8595; Ground</button>
+        <button id="wvGoOrigin" title="Back to the world origin">&#8982; Origin</button>
+      </div>
+      <div class="grp">
+        <label class="hint">tool</label>
+        <button class="wvTool on" data-tool="none" title="Look only — no edits">Look</button>
+        <button class="wvTool" data-tool="brush" title="Paint the selected material">Paint</button>
+        <button class="wvTool" data-tool="erase" title="Remove voxels">Erase</button>
+        <button class="wvTool" data-tool="box" title="Drag a box selection">Box</button>
+        <button class="wvTool" data-tool="picker" title="Eyedropper: adopt the material under the cursor">Pick</button>
+        <button class="wvTool" data-tool="measure" title="Distance between two voxels">Measure</button>
+      </div>
+      <div class="grp">
+        <label class="hint">shade</label>
+        <select id="wvMode">
+          <option value="material">material</option>
+          <option value="class">class (solid/powder/liquid/gas)</option>
+          <option value="height">height ramp</option>
+        </select>
+      </div>
+      <div class="grp">
+        <button id="wvChunks" title="The engine's 16-voxel chunk lattice">Chunks</button>
+        <button id="wvRegions" title="Streamed region boxes, coloured by LOD">LOD</button>
+        <button id="wvFluids" class="on" title="Draw liquids and gases">Fluids</button>
+        <button id="wvFar" class="on" title="Heightfield horizon past the last voxel level">Horizon</button>
+        <button id="wvAO" class="on" title="Ambient occlusion">AO</button>
+        <button id="wvGrid" class="on" title="Voxel edge lines (fade in when cells are big enough to see)">Cells</button>
+      </div>
+      <span class="spacer"></span>
+      <span class="hint" id="wvStatus"></span>
+    </div>
+
     <div class="wgwrap">
       <div class="wgmap">
         <canvas id="wgCanvas" width="900" height="900"></canvas>
-        <canvas id="wg3DCanvas" width="900" height="900"></canvas>
+        <canvas id="wvCanvas"></canvas>
         <div class="wgread" id="wgRead">drag to pan &middot; wheel to zoom</div>
         <div class="wglegend" id="wgLegend"></div>
+        <div class="wvhelp" id="wvHelp" style="display:none"></div>
+        <div class="wvstat" id="wvStat" style="display:none"></div>
       </div>
       <div class="wgside">
         <div class="applybar" style="margin:0 0 10px">
-          <b>Live.</b> Moving a slider writes <code>tuning.json</code> and redraws the
-          map from the engine. In-game, worldgen changes need a fresh world
-          (regen / new seed) &mdash; the map does not.
+          <b>Live.</b> Moving a slider writes <code>tuning.json</code> and redraws
+          from the engine. In-game, worldgen changes need a fresh world
+          (regen / new seed) &mdash; this does not.
         </div>
+
+        <!-- EDITOR PANEL. Hidden with the 2D map, because none of it applies to
+             a column field: there is no voxel to paint in a heightmap. -->
+        <div id="wvSide" style="display:none">
+          <div class="wvsec">Brush</div>
+          <div class="wvrow">
+            <label>radius</label>
+            <input id="wvRadius" type="range" min="0" max="24" step="1" value="3"
+                   style="width:130px">
+            <span id="wvRadiusVal" class="hint">3</span>
+            <span class="hint">&middot; shift+wheel</span>
+            <select id="wvShape">
+              <option value="sphere">sphere</option>
+              <option value="cube">cube</option>
+            </select>
+            <select id="wvPaintMode" title="Replace anything, or only fill air">
+              <option value="replace">replace</option>
+              <option value="air-only">air only</option>
+            </select>
+          </div>
+          <div class="wvrow"><label>material</label>
+            <input id="wvMatFilter" placeholder="filter&hellip;" style="flex:1 1 120px">
+            <span class="hint" id="wvMatName">stone</span>
+          </div>
+          <div class="wvpal" id="wvPalette"></div>
+
+          <div class="wvsec">Selection</div>
+          <div class="wvrow" id="wvSelInfo"><span class="hint">Drag with the Box tool.</span></div>
+          <div class="wvrow">
+            <button id="wvSelFill">Fill</button>
+            <button id="wvSelClear">Delete</button>
+            <button id="wvSelHollow">Hollow</button>
+            <button id="wvSelReplace" title="Replace the material under the cursor with the brush material, inside the box">Replace</button>
+            <button id="wvSelCopy">Copy</button>
+            <button id="wvSelPaste" title="Paste at the hovered voxel">Paste</button>
+          </div>
+          <div class="wvrow">
+            <label>nudge</label>
+            <button class="wvNudge" data-ax="0" data-d="-1">&minus;X</button>
+            <button class="wvNudge" data-ax="0" data-d="1">+X</button>
+            <button class="wvNudge" data-ax="1" data-d="-1">&minus;Y</button>
+            <button class="wvNudge" data-ax="1" data-d="1">+Y</button>
+            <button class="wvNudge" data-ax="2" data-d="-1">&minus;Z</button>
+            <button class="wvNudge" data-ax="2" data-d="1">+Z</button>
+            <input id="wvNudgeN" type="number" value="1" min="1" max="256" style="width:58px">
+          </div>
+
+          <div class="wvsec">Slice &amp; isolate</div>
+          <div class="wvrow">
+            <button id="wvSliceOn" title="Hide everything past a plane, to look inside a hill">Slice</button>
+            <select id="wvSliceAxis"><option value="0">X</option>
+              <option value="1" selected>Y</option><option value="2">Z</option></select>
+            <input id="wvSlicePos" type="range" min="-512" max="512" step="16" value="0"
+                   style="width:150px">
+            <span class="hint" id="wvSlicePosVal">0</span>
+          </div>
+          <div class="wvrow">
+            <label>isolate</label>
+            <select id="wvIsolate"><option value="-1">(everything)</option></select>
+          </div>
+
+          <div class="wvsec">Edit layer</div>
+          <div class="wvrow">
+            <select id="wvLayerPick" style="flex:1 1 130px"><option value="">(new layer)</option></select>
+            <input id="wvLayerName" placeholder="layer name" style="flex:1 1 120px">
+          </div>
+          <div class="wvrow">
+            <button id="wvLayerSave">Save</button>
+            <button id="wvLayerLoad">Load</button>
+            <button id="wvLayerNew">Clear</button>
+            <button id="wvUndo" title="Ctrl+Z">Undo</button>
+            <button id="wvRedo" title="Ctrl+Shift+Z">Redo</button>
+          </div>
+          <div class="wvrow"><span class="hint" id="wvLayerInfo">no edits</span></div>
+          <div class="applybar" style="margin:8px 0 0">
+            Edits are a LAYER over worldgen, not a saved world. The engine applies
+            <code>assets/worldedits/*.svedit</code> after generating a chunk and on
+            every stream-in, so an edit survives flying away and composes with any
+            seed. Set <code>worldgen.editLayer</code> in <code>tuning.json</code> to
+            the layer name to make the game load it.
+          </div>
+        </div>
+
         <div id="wgParams"></div>
       </div>
     </div>
@@ -1737,6 +1886,10 @@
 
 <script src="tuner_schema.js"></script>
 <script src="sound_schema.js"></script>
+<!-- The voxel terrain viewer/editor. Its own file because it is a renderer with
+     a worker, a streamer and an edit model, and inlining ~1,200 lines of that
+     into the page would bury every other tab's code. -->
+<script src="worldview.js"></script>
 <script>
 'use strict';
 /* ================= state ================= */
@@ -2121,6 +2274,20 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     if((mat&&rx)||['tuning','worldgen','models','wiki','notes','engine'].includes(activeTab))renderAll();
   });
 });
+// DEEP LINK: ?tab=worldgen&voxels=1 opens a tab, and optionally drops straight
+// into the voxel view. It exists so the view is REACHABLE WITHOUT A CLICK —
+// scripts/check_worldview.sh drives the real page through it, and "does the tab
+// still work" is otherwise only answerable by a human with a mouse.
+function tunerDeepLink(){
+  const q=new URLSearchParams(location.search);
+  const tab=q.get('tab');
+  if(tab){
+    const b=document.querySelector('nav.tabs button[data-tab="'+tab+'"]');
+    if(b)b.click();
+  }
+  if(q.get('voxels')==='1'&&typeof wvToggle==='function'&&!wvOn)wvToggle();
+}
+
 function gotoReactions(filter){
   $('#rxFilter').value=filter;
   document.querySelector('nav.tabs button[data-tab=reactions]').click();
@@ -3314,6 +3481,20 @@ function tuneRow(tab,pr,g,touch){
     });
     row.append(sel);
     row.append(el('span',{}));
+  }else if(pr.type==='text'){
+    // A free string. There is exactly one so far (worldgen.editLayer, which
+    // names a file the tuner itself writes) and a `select` cannot serve it —
+    // the valid values are whatever is in assets/worldedits/ right now, which
+    // a static schema cannot know.
+    const inp=el('input',{type:'text',class:'cell',spellcheck:'false',
+                          placeholder:pr.placeholder||''});
+    inp.value=cur??'';
+    inp.addEventListener('change',()=>{
+      setTuned(g,pr.k,inp.value.trim());
+      touch();mark();
+    });
+    row.append(inp);
+    row.append(el('span',{}));
   }else if(pr.type==='color'||pr.type==='vec3'){
     row.append(vecEditor(pr,g,mark,touch));
     row.append(el('span',{}));   // triples have no single numeric box
@@ -4058,7 +4239,10 @@ function wgPaint(){
     (D.span/D.res).toFixed(1)+' vox/px  ·  y'+D.hMin+'..y'+D.hMax+
     ' ('+wgFmtM(D.hMax-D.hMin)+' of relief here)';
   wgLegendPaint(mode,lo,hi);
-  if(wg3DOn){wg3DBuild();wg3DRender();}
+  // The column field just changed, so the voxel view's horizon layer is stale.
+  // Only the horizon: the cells themselves come from the engine's own worldgen
+  // and are invalidated by the RELOAD path, not by a repaint of this map.
+  if(wvOn) wvPushFar();
 }
 
 function wgLegendPaint(mode,lo,hi){
@@ -4092,7 +4276,17 @@ async function wgFetch(){
     // Save FIRST: the exporter is another process and reads tuning.json off
     // disk. Without this the map is always one edit behind and the knob you
     // just moved looks like it does nothing.
-    if(server&&dirty.tune)await serverSave();
+    if(server&&dirty.tune){
+      await serverSave();
+      // The VOXEL server is a LONG-LIVED process, so saving is not enough for
+      // it: worldgen's tuning values are WGSL consts baked into pipelines at
+      // compile time. RELOAD re-reads the file and rebuilds them, and every
+      // region already streamed describes the world before the edit.
+      if(wv){
+        try{ await fetch('/api/voxreload',{method:'POST'}); }catch(e){}
+        wv.invalidate();
+      }
+    }
     const res=parseInt($('#wgRes').value,10)||320;
     const seed=parseInt($('#wgSeed').value,10)||0;
     const q='cx='+Math.round(wgView.cx)+'&cz='+Math.round(wgView.cz)+
@@ -4181,202 +4375,450 @@ function wgWire(){
   });
   $('#wgMode').addEventListener('change',wgPaint);
   $('#wgRes').addEventListener('change',function(){wgRefresh(0);});
-  $('#wgSeed').addEventListener('change',function(){wgRefresh(0);});
-  $('#wg3DToggle').addEventListener('click',wg3DToggle);
+  $('#wgSeed').addEventListener('change',function(){
+    if(wv) wv.invalidate(parseInt(this.value,10)||1337);
+    wgRefresh(0);
+  });
+  $('#wvToggle').addEventListener('click',wvToggle);
 }
 
-/* ================= worldgen 3D view ================= */
-var wg3DOn=false;
-var wg3D={gl:null,prog:null,vao:null,vbo:null,ibo:null,cnt:0,
-  uMVP:null,uLight:null,built:false,wired:false,
-  cam:{az:0.6,el:0.7,dist:1.5,tx:0,ty:0,tz:0}};
-function wg3DMat(){return new Float32Array(16);}
-function wg3DMul(a,b){
-  var o=wg3DMat();
-  for(var c=0;c<4;c++)for(var r=0;r<4;r++){
-    var s=0;for(var k=0;k<4;k++)s+=a[r+k*4]*b[k+c*4];o[r+c*4]=s;}
-  return o;
+/* ================= the voxel world view =================
+   The old block here built ONE heightfield mesh out of the column map and
+   orbited it. That is what made the 3D view "one large section": it was the
+   2D map extruded, so it had exactly the 2D map's information and could not
+   show a cave, a tree, an overhang or a voxel.
+
+   This wires assets/worldview.js instead, which streams REAL CELLS from
+   `sandvox --voxserve`. Everything below is glue: toolbar state, the material
+   palette, the edit-layer files, and the readouts. The renderer, the streamer,
+   the mesher and the edit model all live in worldview.js.
+
+   The heightfield did not die — it became the HORIZON. wgData is handed to the
+   view as the far layer, so the two representations are one picture: cells
+   near you, columns past the last LOD shell. */
+var wv = null, wvOn = false, wvRaf = 0, wvLast = 0, wvPalReady = false;
+
+function wvMatName(id){
+  if(!wv || !wv.pal) return String(id);
+  var m = wv.pal.materials[id];
+  return m ? m.name : ('#' + id);
 }
-function wg3DPersp(fov,asp,zn,zf){
-  var f=1/Math.tan(fov/2),d=1/(zn-zf),m=wg3DMat();
-  m[0]=f/asp;m[5]=f;m[10]=(zf+zn)*d;m[11]=-1;m[14]=2*zf*zn*d;return m;
+
+// The far layer reuses the 2D map's colour choices on purpose: two ramps for
+// one terrain is how a viewer starts lying to you about where the treeline is.
+function wvFarColour(D, k, treeline){
+  var lo = D.sea - 720, hi = D.sea + 900;
+  var h = D.h[k], c;
+  var mode = $('#wgMode').value;
+  if(mode === 'biome'){
+    if(h >= treeline) c = [232,238,246];
+    else if(D.sed[k] >= 8) c = [120,96,64];
+    else if(D.sed[k] > 0) c = [110,140,84];
+    else c = [132,132,120];
+  } else if(mode === 'slope'){
+    var q = D.slope[k], t = Math.min(q/256,1);
+    c = [40+215*t, q>=255?40:150-110*t, q>=255?40:120-90*t];
+  } else if(mode === 'sed'){
+    var t2 = Math.min(D.sed[k]/32,1);
+    c = D.sed[k] === 0 ? [48,52,58] : [44+150*t2, 40+112*t2, 36+52*t2];
+  } else {
+    c = wgRamp((h-lo)/(hi-lo));
+  }
+  if(D.water[k] !== -32768 && mode !== 'slope' && mode !== 'sed'){
+    var tw = Math.min(Math.max(0,D.water[k])/40,1);
+    c = [c[0]*0.18+(36-16*tw), c[1]*0.18+(88-30*tw), c[2]*0.18+(150-30*tw)];
+  }
+  return c;
 }
-function wg3DLookAt(ex,ey,ez,cx,cy,cz){
-  var m=wg3DMat();
-  var zx=ex-cx,zy=ey-cy,zz=ez-cz;
-  var zl=Math.sqrt(zx*zx+zy*zy+zz*zz);
-  if(zl<1e-10){m[0]=m[5]=m[10]=m[15]=1;return m;}
-  zx/=zl;zy/=zl;zz/=zl;
-  var xl=Math.sqrt(zz*zz+zx*zx);
-  if(xl<1e-10){m[0]=m[5]=m[10]=m[15]=1;return m;}
-  var xx=zz/xl,xz=-zx/xl;
-  var yx=-zy*zx/xl,yy=xl,yz=-zy*zz/xl;
-  m[0]=xx;m[1]=yx;m[2]=zx;
-  m[4]=0;m[5]=yy;m[6]=zy;
-  m[8]=xz;m[9]=yz;m[10]=zz;
-  m[12]=-(xx*ex+xz*ez);
-  m[13]=-(yx*ex+yy*ey+yz*ez);
-  m[14]=-(zx*ex+zy*ey+zz*ez);
-  m[15]=1;return m;
+
+function wvPushFar(){
+  if(!wv || !wgData || !wv.view.showFar) return;
+  var treeline = (tune && tune.worldgen && tune.worldgen.treeline) || 228;
+  try{ wv.setFarHeightfield(wgData, wvFarColour, treeline); }catch(e){}
 }
-function wg3DInit(){
-  var cv=$('#wg3DCanvas');if(!cv)return false;
-  var gl=cv.getContext('webgl2',{antialias:true,alpha:false});
-  if(!gl)return false;
-  wg3D.gl=gl;
-  function sh(t,s){var o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o;}
-  var vs=sh(gl.VERTEX_SHADER,
-    '#version 300 es\nuniform mat4 uMVP;\nin vec3 aPos;in vec3 aCol;in vec3 aNrm;\n'+
-    'out vec3 vCol;out vec3 vNrm;\nvoid main(){gl_Position=uMVP*vec4(aPos,1);vCol=aCol;vNrm=aNrm;}\n');
-  var fs=sh(gl.FRAGMENT_SHADER,
-    '#version 300 es\nprecision mediump float;\nuniform vec3 uL;\n'+
-    'in vec3 vCol;in vec3 vNrm;out vec4 oC;\n'+
-    'void main(){float d=max(dot(normalize(vNrm),uL),0.0);oC=vec4(vCol*(0.35+0.65*d),1);}\n');
-  var p=gl.createProgram();
-  gl.attachShader(p,vs);gl.attachShader(p,fs);
-  gl.bindAttribLocation(p,0,'aPos');gl.bindAttribLocation(p,1,'aCol');gl.bindAttribLocation(p,2,'aNrm');
-  gl.linkProgram(p);
-  wg3D.prog=p;wg3D.uMVP=gl.getUniformLocation(p,'uMVP');wg3D.uLight=gl.getUniformLocation(p,'uL');
-  gl.enable(gl.DEPTH_TEST);gl.clearColor(0.043,0.051,0.063,1);
+
+function wvEnsure(){
+  if(wv) return wv;
+  var cv = $('#wvCanvas');
+  wv = new WorldView(cv, {seaY: (tune && tune.worldgen && tune.worldgen.spawnPlainY) || 1024});
+  wv.onError = function(msg){
+    var s = $('#wvStatus'); if(s) s.textContent = 'region failed: ' + msg;
+  };
+  wv.onHover = wvPaintReadout;
+  wv.onToolChange = wvSyncTool;
+  wv.onEdit = wvSyncLayer;
+  wvWireControls();
+  return wv;
+}
+
+async function wvLoadPalette(){
+  if(wvPalReady) return true;
+  var r = await fetch('/api/voxpalette');
+  if(!r.ok){
+    var msg = 'HTTP ' + r.status;
+    try{ msg = (await r.json()).error || msg; }catch(e){}
+    throw new Error(msg);
+  }
+  var pal = await r.json();
+  wv.loadPalette(pal);
+  wvPalReady = true;
+  wvBuildPalette('');
+  wvBuildIsolate();
   return true;
 }
-function wg3DBuild(){
-  if(!wgData||!wg3D.gl)return;
-  var gl=wg3D.gl,D=wgData,res=D.res;
-  var mode=$('#wgMode').value;
-  var lo=D.sea-720,hi=D.sea+900;
-  var exag=parseFloat($('#wg3DExag').value)||3;
-  var treeline=(tune&&tune.worldgen&&tune.worldgen.treeline)||228;
-  var hScale=exag/D.span;
-  var V=new Float32Array(res*res*9);
-  for(var j=0;j<res;j++)for(var i=0;i<res;i++){
-    var k=j*res+i,vi=k*9;
-    V[vi]=i/(res-1)-0.5;
-    V[vi+1]=(D.h[k]-D.sea)*hScale;
-    V[vi+2]=j/(res-1)-0.5;
-    var h=D.h[k],r,g,b;
-    if(mode==='slope'){var q=D.slope[k],t=Math.min(q/256,1);
-      r=40+215*t;g=q>=255?40:150-110*t;b=q>=255?40:120-90*t;
-    }else if(mode==='sed'){var t2=Math.min(D.sed[k]/32,1);
-      r=44+150*t2;g=40+112*t2;b=36+52*t2;if(D.sed[k]===0){r=48;g=52;b=58;}
-    }else if(mode==='biome'){
-      if(h>=treeline){r=232;g=238;b=246;}
-      else if(D.sed[k]>=8){r=120;g=96;b=64;}
-      else if(D.sed[k]>0){r=110;g=140;b=84;}
-      else{r=132;g=132;b=120;}
-    }else{var c=wgRamp((h-lo)/(hi-lo));r=c[0];g=c[1];b=c[2];}
-    if(D.water[k]!==-32768&&mode!=='slope'&&mode!=='sed'){
-      var tw=Math.min(Math.max(0,D.water[k])/40,1);
-      r=r*0.18+(36-16*tw);g=g*0.18+(88-30*tw);b=b*0.18+(150-30*tw);
+
+function wvBuildPalette(filter){
+  var host = $('#wvPalette'); if(!host || !wv || !wv.pal) return;
+  host.innerHTML = '';
+  var f = (filter || '').toLowerCase();
+  var mats = wv.pal.materials.filter(function(m){
+    return m.id !== 0 && (!f || m.name.indexOf(f) >= 0);
+  });
+  for(const m of mats){
+    var b = el('button', {'data-mat': String(m.id),
+      title: m.name + '  ·  id ' + m.id + '  ·  class ' +
+             ['solid','powder','liquid','gas'][m.class] +
+             '  ·  density ' + m.density},
+      el('i', {style: 'background:' + m.colors[0]}), m.name);
+    if(m.id === wv.tool.material) b.className = 'on';
+    b.addEventListener('click', function(){
+      wv.tool.material = parseInt(this.getAttribute('data-mat'), 10);
+      wvSyncTool();
+    });
+    host.append(b);
+  }
+}
+
+function wvBuildIsolate(){
+  var s = $('#wvIsolate'); if(!s || !wv || !wv.pal) return;
+  s.innerHTML = '';
+  s.append(el('option', {value: '-1'}, '(everything)'));
+  for(const m of wv.pal.materials){
+    if(m.id === 0) continue;
+    s.append(el('option', {value: String(m.id)}, m.name));
+  }
+}
+
+function wvSyncTool(){
+  if(!wv) return;
+  document.querySelectorAll('.wvTool').forEach(function(b){
+    b.className = b.getAttribute('data-tool') === wv.tool.name ? 'wvTool on' : 'wvTool';
+  });
+  var r = $('#wvRadius'); if(r) r.value = wv.tool.radius;
+  var rv = $('#wvRadiusVal'); if(rv) rv.textContent = wv.tool.radius;
+  var mn = $('#wvMatName'); if(mn) mn.textContent = wvMatName(wv.tool.material);
+  document.querySelectorAll('#wvPalette button').forEach(function(b){
+    b.className = parseInt(b.getAttribute('data-mat'),10) === wv.tool.material ? 'on' : '';
+  });
+  var si = $('#wvSelInfo');
+  if(si){
+    var b = wv.selBox();
+    si.innerHTML = '';
+    if(!b) si.append(el('span',{class:'hint'},'Drag with the Box tool.'));
+    else si.append(el('span',{class:'hint'},
+      (b[3]-b[0]+1)+' x '+(b[4]-b[1]+1)+' x '+(b[5]-b[2]+1)+' = '+
+      wv.selVolume().toLocaleString()+' voxels  ·  ('+b[0]+','+b[1]+','+b[2]+')'));
+  }
+  if(wv.tool.measure && wv.tool.measure.a && wv.tool.measure.b){
+    var m = wv.tool.measure;
+    var d = Math.hypot(m.b[0]-m.a[0], m.b[1]-m.a[1], m.b[2]-m.a[2]);
+    var s = $('#wvStatus');
+    if(s) s.textContent = 'measure: ' + d.toFixed(1) + ' vox  ·  ' +
+      (d * ((wv.pal && wv.pal.voxelMeters) || 0.1)).toFixed(2) + ' m';
+  }
+}
+
+function wvSyncLayer(){
+  var i = $('#wvLayerInfo'); if(!i || !wv) return;
+  var n = wv.edit.count();
+  i.textContent = n ? (n.toLocaleString() + ' voxels in ' + wv.edit.chunks.size +
+                       ' chunks' + (wv.edit.dirty ? ' · unsaved' : '')) : 'no edits';
+}
+
+function wvPaintReadout(hit){
+  var box = $('#wvStat'); if(!box || !wv) return;
+  var eye = wv.camEye();
+  var vpm = (wv.pal && wv.pal.voxelMeters) || 0.1;
+  var s = 'eye  ' + eye.map(function(v){return Math.round(v);}).join('  ') + '\n';
+  if(hit){
+    s += 'cell ' + hit.vox.join('  ') + '   ' + wvMatName(hit.mat) + '\n';
+    s += 'state ' + hit.state + '   chunk ' +
+         (hit.vox[0]>>4) + ',' + (hit.vox[1]>>4) + ',' + (hit.vox[2]>>4) + '\n';
+  } else {
+    s += 'cell  —  (nothing under the cursor)\n\n';
+  }
+  s += wv.stats.regions + ' regions  ' +
+       (wv.stats.quads/1000).toFixed(1) + 'k quads  ' +
+       (wv.stats.bytes/1048576).toFixed(1) + ' MiB fetched';
+  box.textContent = s;
+}
+
+// A STILL PICTURE COSTS NOTHING. The viewer shares one GPU with the engine, and
+// this tab is often left open next to a running game or a measured harness — so
+// a redraw only happens when something actually moved. The signature is every
+// input the frame depends on; when it has not changed there is nothing a new
+// frame could show.
+function wvSig(){
+  var c = wv.cam, e = wv.camEye(), v = wv.view, t = wv.tool;
+  return e[0].toFixed(2)+','+e[1].toFixed(2)+','+e[2].toFixed(2)+','+
+         c.yaw.toFixed(4)+','+c.pitch.toFixed(4)+','+c.dist.toFixed(2)+','+
+         wv.regions.size+','+wv.stats.fetches+','+wv.editRev+','+
+         v.mode+v.ao+v.grid+v.showChunks+v.showRegions+v.showFluids+v.showFar+
+         v.isolate+v.sliceEnabled+v.slicePos+v.sliceAxis+','+
+         t.name+t.radius+','+(wv.hover?wv.hover.vox.join('.'):'-')+','+
+         (t.sel?JSON.stringify(t.sel):'-');
+}
+
+function wvFrame(now){
+  wvRaf = requestAnimationFrame(wvFrame);
+  if(!wvOn || !wv) return;
+  var dt = Math.min(0.1, (now - wvLast) / 1000 || 0);
+  wvLast = now;
+  wv.step(dt);
+  wv.update();
+  var sig = wvSig();
+  if(sig !== wvFrame.sig){
+    wvFrame.sig = sig;
+    wv.render();
+    wvPaintReadout(wv.hover);
+  }
+}
+
+async function wvToggle(){
+  wvOn = !wvOn;
+  $('#wgCanvas').style.display = wvOn ? 'none' : 'block';
+  $('#wvCanvas').style.display = wvOn ? 'block' : 'none';
+  $('#wgRead').style.display = wvOn ? 'none' : 'block';
+  $('#wgLegend').style.display = wvOn ? 'none' : 'block';
+  $('#wvBar').style.display = wvOn ? 'flex' : 'none';
+  $('#wvSide').style.display = wvOn ? 'block' : 'none';
+  $('#wvStat').style.display = wvOn ? 'block' : 'none';
+  $('#wvHelp').style.display = wvOn ? 'block' : 'none';
+  $('#wvToggle').textContent = wvOn ? '▦ Map' : '▣ Voxels';
+  $('#wvToggle').title = wvOn ? 'Back to the 2D column map' : 'Switch to the voxel world view';
+  if(!wvOn) return;
+  $('#wvHelp').innerHTML =
+    '<b>RMB</b> look &middot; <b>WASD/QE</b> fly &middot; <b>Shift</b> fast<br>' +
+    '<b>MMB</b> pan &middot; <b>wheel</b> forward &middot; <b>shift+wheel</b> brush size<br>' +
+    '<b>LMB</b> uses the active tool &middot; <b>Ctrl+Z</b> undo';
+  try{
+    wvEnsure();
+  }catch(e){
+    wvOn = false;
+    $('#wvStatus').textContent = String(e.message || e);
+    $('#wgCanvas').style.display = 'block';
+    $('#wvCanvas').style.display = 'none';
+    return;
+  }
+  var st = $('#wvStatus');
+  st.textContent = 'starting the voxel server…';
+  try{
+    // Save first, for the reason the 2D map saves first: the voxel server is a
+    // SEPARATE PROCESS that reads tuning.json off disk, and worldgen's values
+    // are WGSL consts baked into its pipelines. Without the save + RELOAD it
+    // would answer with whatever the world looked like when it booted.
+    if(server && dirty.tune) await serverSave();
+    await wvLoadPalette();
+    st.textContent = '';
+  }catch(e){
+    st.textContent = 'voxel view unavailable: ' + (e.message || e);
+  }
+  // Park the camera where the map is looking, at the ground.
+  wv.seed = parseInt($('#wgSeed').value, 10) || 1337;
+  var y = wgData ? (wgData.h[(wgData.res>>1)*wgData.res + (wgData.res>>1)] + 40)
+                 : ((tune && tune.worldgen && tune.worldgen.spawnPlainY) || 1024) + 40;
+  wv.cam.mode = 'fly';
+  wv.cam.pos = [wgView.cx, y, wgView.cz - 60];
+  wv.cam.yaw = 0; wv.cam.pitch = -0.35;
+  wv.cam.target = [wgView.cx, y - 30, wgView.cz];
+  wvPushFar();
+  wvSyncTool(); wvSyncLayer(); wvRefreshLayers();
+  if(!wvRaf) wvRaf = requestAnimationFrame(wvFrame);
+}
+
+// The ground under the camera, from the column map when we have one — the one
+// question a heightfield answers better than a voxel stream, so it answers it.
+function wvDropToGround(){
+  if(!wv) return;
+  var e = wv.camEye();
+  var y = null;
+  if(wgData){
+    var fx = (e[0] - (wgData.cx - wgData.span/2)) / wgData.span;
+    var fz = (e[2] - (wgData.cz - wgData.span/2)) / wgData.span;
+    if(fx >= 0 && fx < 1 && fz >= 0 && fz < 1){
+      var i = Math.floor(fx*wgData.res), j = Math.floor(fz*wgData.res);
+      y = wgData.h[j*wgData.res + i] + 24;
     }
-    V[vi+3]=Math.max(0,Math.min(255,r))/255;
-    V[vi+4]=Math.max(0,Math.min(255,g))/255;
-    V[vi+5]=Math.max(0,Math.min(255,b))/255;
   }
-  var sp=1/(res-1);
-  for(var j2=0;j2<res;j2++)for(var i2=0;i2<res;i2++){
-    var kk=j2*res+i2,vi2=kk*9;
-    var yl=i2>0?V[(kk-1)*9+1]:V[vi2+1];
-    var yr=i2<res-1?V[(kk+1)*9+1]:V[vi2+1];
-    var yd=j2>0?V[(kk-res)*9+1]:V[vi2+1];
-    var yu=j2<res-1?V[(kk+res)*9+1]:V[vi2+1];
-    var nx=-(yr-yl)/(2*sp),nz=-(yu-yd)/(2*sp),ny=1;
-    var nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
-    V[vi2+6]=nx/nl;V[vi2+7]=ny/nl;V[vi2+8]=nz/nl;
-  }
-  if(!wg3D.vao)wg3D.vao=gl.createVertexArray();
-  gl.bindVertexArray(wg3D.vao);
-  if(!wg3D.vbo)wg3D.vbo=gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER,wg3D.vbo);
-  gl.bufferData(gl.ARRAY_BUFFER,V,gl.DYNAMIC_DRAW);
-  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,36,0);
-  gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,36,12);
-  gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,36,24);
-  var N=(res-1)*(res-1)*6,I=new Uint32Array(N),ptr=0;
-  for(var jj=0;jj<res-1;jj++)for(var qi=0;qi<res-1;qi++){
-    var a=jj*res+qi;I[ptr++]=a;I[ptr++]=a+res;I[ptr++]=a+1;
-    I[ptr++]=a+1;I[ptr++]=a+res;I[ptr++]=a+res+1;
-  }
-  if(!wg3D.ibo)wg3D.ibo=gl.createBuffer();
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,wg3D.ibo);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,I,gl.DYNAMIC_DRAW);
-  wg3D.cnt=N;gl.bindVertexArray(null);wg3D.built=true;
-}
-function wg3DRender(){
-  if(!wg3D.gl||!wg3D.built)return;
-  var gl=wg3D.gl,cv=$('#wg3DCanvas'),c=wg3D.cam;
-  var dpr=window.devicePixelRatio||1;
-  var dw=Math.round(cv.clientWidth*dpr),dh=Math.round(cv.clientHeight*dpr);
-  if(cv.width!==dw||cv.height!==dh){cv.width=dw;cv.height=dh;}
-  gl.viewport(0,0,dw,dh);
-  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-  gl.useProgram(wg3D.prog);
-  var ex=c.tx+c.dist*Math.cos(c.el)*Math.sin(c.az);
-  var ey=c.ty+c.dist*Math.sin(c.el);
-  var ez=c.tz+c.dist*Math.cos(c.el)*Math.cos(c.az);
-  var mvp=wg3DMul(wg3DPersp(Math.PI/4,dw/dh,0.01,10),
-                   wg3DLookAt(ex,ey,ez,c.tx,c.ty,c.tz));
-  gl.uniformMatrix4fv(wg3D.uMVP,false,mvp);
-  var lx=-0.5,ly=0.7,lz=-0.5;
-  var ll=Math.sqrt(lx*lx+ly*ly+lz*lz);
-  gl.uniform3f(wg3D.uLight,lx/ll,ly/ll,lz/ll);
-  gl.bindVertexArray(wg3D.vao);
-  gl.drawElements(gl.TRIANGLES,wg3D.cnt,gl.UNSIGNED_INT,0);
-  gl.bindVertexArray(null);
-}
-function wg3DToggle(){
-  wg3DOn=!wg3DOn;
-  $('#wgCanvas').style.display=wg3DOn?'none':'block';
-  $('#wg3DCanvas').style.display=wg3DOn?'block':'none';
-  $('#wg3DToggle').textContent=wg3DOn?'2D':'3D';
-  $('#wg3DToggle').title=wg3DOn?'Switch to 2D map':'Switch to 3D terrain';
-  var exLbl=$('#wg3DExagLabel');if(exLbl)exLbl.style.display=wg3DOn?'':'none';
-  var rd=$('#wgRead');
-  if(rd)rd.textContent=wg3DOn?'drag to orbit · right-drag to pan · wheel to zoom':'drag to pan · wheel to zoom';
-  if(wg3DOn){
-    if(!wg3D.gl&&!wg3DInit())return;
-    wg3DWire();
-    if(wgData){wg3DBuild();wg3DRender();}
-  }
-}
-function wg3DWire(){
-  if(wg3D.wired)return;wg3D.wired=true;
-  var cv=$('#wg3DCanvas'),drag=null;
-  cv.addEventListener('contextmenu',function(e){e.preventDefault();});
-  cv.addEventListener('pointerdown',function(e){
-    drag={x:e.clientX,y:e.clientY,az:wg3D.cam.az,el:wg3D.cam.el,
-          tx:wg3D.cam.tx,tz:wg3D.cam.tz,btn:e.button};
-    cv.setPointerCapture(e.pointerId);cv.classList.add('drag');e.preventDefault();
-  });
-  cv.addEventListener('pointerup',function(e){
-    drag=null;cv.classList.remove('drag');
-    try{cv.releasePointerCapture(e.pointerId);}catch(err){}
-  });
-  cv.addEventListener('pointermove',function(e){
-    if(!drag)return;
-    var dx=e.clientX-drag.x,dy=e.clientY-drag.y,c=wg3D.cam;
-    if(drag.btn===2||e.shiftKey){
-      var s=c.dist*0.0015;
-      var ca=Math.cos(c.az),sa=Math.sin(c.az);
-      c.tx=drag.tx+(-dx*ca-dy*sa)*s;
-      c.tz=drag.tz+(dx*sa-dy*ca)*s;
-    }else{
-      c.az=drag.az-dx*0.005;
-      c.el=Math.max(0.05,Math.min(1.5,drag.el+dy*0.005));
+  if(y === null){
+    // Otherwise probe the cells we already hold, straight down.
+    for(var k = 0; k < 400; k++){
+      var v = wv.cellAtWorld(Math.floor(e[0]), Math.floor(e[1]) - k, Math.floor(e[2]), 0);
+      if(v > 0){ y = Math.floor(e[1]) - k + 24; break; }
     }
-    wg3DRender();
-  });
-  cv.addEventListener('wheel',function(e){
-    e.preventDefault();
-    wg3D.cam.dist*=e.deltaY>0?1.1:0.9;
-    wg3D.cam.dist=Math.max(0.1,Math.min(5,wg3D.cam.dist));
-    wg3DRender();
-  },{passive:false});
-  $('#wg3DExag').addEventListener('input',function(){
-    $('#wg3DExagVal').textContent=this.value;
-    if(wgData){wg3DBuild();wg3DRender();}
-  });
+  }
+  if(y === null) return;
+  if(wv.cam.mode === 'fly') wv.cam.pos[1] = y;
+  else wv.cam.target[1] = y - 20;
 }
+
+var wvWired = false;
+function wvWireControls(){
+  if(wvWired) return; wvWired = true;
+  var on = function(id, ev, fn){ var e = $(id); if(e) e.addEventListener(ev, fn); };
+  var flip = function(id, key, after){
+    on(id, 'click', function(){
+      wv.view[key] = !wv.view[key];
+      this.className = wv.view[key] ? 'on' : '';
+      if(after) after();
+    });
+  };
+  on('#wvCamFly','click',function(){
+    wv.cam.mode = 'fly';
+    var e = wv.camEye(); wv.cam.pos = e;
+    this.className='on'; $('#wvCamOrbit').className='';
+  });
+  on('#wvCamOrbit','click',function(){
+    var e = wv.camEye(), f = wv.camForward();
+    wv.cam.target = [e[0]+f[0]*wv.cam.dist, e[1]+f[1]*wv.cam.dist, e[2]+f[2]*wv.cam.dist];
+    wv.cam.mode = 'orbit';
+    this.className='on'; $('#wvCamFly').className='';
+  });
+  on('#wvGoSurface','click', wvDropToGround);
+  on('#wvGoOrigin','click', function(){
+    var y = ((tune && tune.worldgen && tune.worldgen.spawnPlainY) || 1024) + 40;
+    wv.cam.pos = [0, y, -60]; wv.cam.target = [0, y-30, 0];
+    wv.cam.yaw = 0; wv.cam.pitch = -0.35;
+  });
+  document.querySelectorAll('.wvTool').forEach(function(b){
+    b.addEventListener('click', function(){
+      wv.tool.name = this.getAttribute('data-tool');
+      $('#wvCanvas').style.cursor = wv.tool.name === 'none' ? 'default' : 'crosshair';
+      wvSyncTool();
+    });
+  });
+  on('#wvMode','change',function(){ wv.view.mode = this.value; });
+  flip('#wvChunks','showChunks');
+  flip('#wvRegions','showRegions');
+  flip('#wvFluids','showFluids');
+  flip('#wvFar','showFar', wvPushFar);
+  on('#wvAO','click',function(){
+    wv.view.ao = wv.view.ao > 0 ? 0 : 1; this.className = wv.view.ao ? 'on' : '';
+  });
+  on('#wvGrid','click',function(){
+    wv.view.grid = wv.view.grid > 0 ? 0 : 1; this.className = wv.view.grid ? 'on' : '';
+  });
+  on('#wvRadius','input',function(){ wv.tool.radius = parseInt(this.value,10); wvSyncTool(); });
+  on('#wvShape','change',function(){ wv.tool.shape = this.value; });
+  on('#wvPaintMode','change',function(){ wv.tool.mode = this.value; });
+  on('#wvMatFilter','input',function(){ wvBuildPalette(this.value); });
+  on('#wvSelFill','click',function(){ wv.fillSelection(wv.tool.material); wvSyncLayer(); });
+  on('#wvSelClear','click',function(){ wv.fillSelection(0); wvSyncLayer(); });
+  on('#wvSelHollow','click',function(){ wv.hollowSelection(); wvSyncLayer(); });
+  on('#wvSelReplace','click',function(){
+    var from = wv.hover ? wv.hover.mat : 0;
+    wv.replaceInSelection(from, wv.tool.material);
+    wvSyncLayer();
+  });
+  on('#wvSelCopy','click',function(){
+    var c = wv.copySelection();
+    $('#wvStatus').textContent = c ? ('copied ' + c.w+'x'+c.h+'x'+c.d) : 'nothing selected';
+  });
+  on('#wvSelPaste','click',function(){
+    if(!wv.hover){ $('#wvStatus').textContent = 'hover a voxel to paste at'; return; }
+    var n = wv.pasteAt(wv.hover.vox[0], wv.hover.vox[1], wv.hover.vox[2], true);
+    $('#wvStatus').textContent = 'pasted ' + n + ' voxels';
+    wvSyncLayer();
+  });
+  document.querySelectorAll('.wvNudge').forEach(function(b){
+    b.addEventListener('click', function(){
+      var ax = parseInt(this.getAttribute('data-ax'),10);
+      var d = parseInt(this.getAttribute('data-d'),10) *
+              (parseInt($('#wvNudgeN').value,10) || 1);
+      var v = [0,0,0]; v[ax] = d;
+      wv.moveSelection(v[0], v[1], v[2]);
+      wvSyncTool(); wvSyncLayer();
+    });
+  });
+  on('#wvSliceOn','click',function(){
+    wv.view.sliceEnabled = !wv.view.sliceEnabled;
+    this.className = wv.view.sliceEnabled ? 'on' : '';
+    if(wv.view.sliceEnabled){
+      var e = wv.camEye();
+      var p = $('#wvSlicePos');
+      var base = Math.round(e[wv.view.sliceAxis] / 16) * 16;
+      p.min = base - 512; p.max = base + 512; p.value = base;
+      wv.view.slicePos = base;
+      $('#wvSlicePosVal').textContent = base;
+    }
+  });
+  on('#wvSliceAxis','change',function(){ wv.view.sliceAxis = parseInt(this.value,10); });
+  on('#wvSlicePos','input',function(){
+    wv.view.slicePos = parseInt(this.value,10);
+    $('#wvSlicePosVal').textContent = this.value;
+  });
+  on('#wvIsolate','change',function(){ wv.view.isolate = parseInt(this.value,10); });
+  on('#wvUndo','click',function(){ wv.undo(); wvSyncLayer(); });
+  on('#wvRedo','click',function(){ wv.redo(); wvSyncLayer(); });
+  on('#wvLayerNew','click',function(){
+    if(wv.edit.count() && !confirm('Discard ' + wv.edit.count() + ' edited voxels?')) return;
+    wv.edit.clear();
+    wv.invalidate();                     // re-fetch: the regions hold the edits
+    wvSyncLayer();
+  });
+  on('#wvLayerSave','click', wvSaveLayer);
+  on('#wvLayerLoad','click', wvLoadLayer);
+}
+
+async function wvRefreshLayers(){
+  try{
+    var r = await fetch('/api/worldedits');
+    if(!r.ok) return;
+    var j = await r.json();
+    var s = $('#wvLayerPick'); if(!s) return;
+    var cur = s.value;
+    s.innerHTML = '';
+    s.append(el('option',{value:''},'(new layer)'));
+    for(const L of (j.layers||[]))
+      s.append(el('option',{value:L.name}, L.name + '  (' + L.bytes + ' B)'));
+    s.value = cur;
+  }catch(e){}
+}
+
+async function wvSaveLayer(){
+  var name = ($('#wvLayerName').value || $('#wvLayerPick').value || '').trim();
+  if(!name){ $('#wvStatus').textContent = 'name the layer first'; return; }
+  var buf = wv.edit.serialize(wv.seed);
+  var r = await fetch('/api/worldedit?name=' + encodeURIComponent(name), {
+    method: 'POST', body: buf,
+    headers: {'Content-Type': 'application/octet-stream'}
+  });
+  var j = await r.json().catch(function(){ return {}; });
+  if(!r.ok){ $('#wvStatus').textContent = 'save failed: ' + (j.error||r.status); return; }
+  wv.edit.dirty = false;
+  wv.edit.name = name;
+  $('#wvStatus').textContent = 'saved ' + name + ' (' + j.bytes + ' B)';
+  wvRefreshLayers();
+  wvSyncLayer();
+}
+
+async function wvLoadLayer(){
+  var name = ($('#wvLayerPick').value || '').trim();
+  if(!name){ $('#wvStatus').textContent = 'pick a layer'; return; }
+  var r = await fetch('/api/worldedit?name=' + encodeURIComponent(name));
+  if(!r.ok){ $('#wvStatus').textContent = 'load failed'; return; }
+  var buf = await r.arrayBuffer();
+  try{ wv.edit.deserialize(buf); }
+  catch(e){ $('#wvStatus').textContent = String(e.message||e); return; }
+  $('#wvLayerName').value = name;
+  wv.edit.name = name;
+  // Regions already resident were composited against the OLD layer, so they
+  // are wrong now. Dropping them is the honest cheap fix.
+  wv.invalidate();
+  wvSyncLayer();
+  $('#wvStatus').textContent = 'loaded ' + name;
+}
+
 
 function renderWorldgen(){
   wgWire();
@@ -7258,8 +7700,19 @@ const ARCH_NODES={
     sym:['Simulation::EncodeWorldgen','Simulation::EncodeGenList','Simulation::EncodePageFill','caveFill','landColumn','colHeightAt','World::TerrainHeight','vnoise2d','caveBands','treeCandsInto'],
     doc:['DESIGN.md','docs/RESEARCH_worldgen.md'],
     rule:1,
+    children:['voxView'],
     wip:'Terrain overhaul packages D-H: a global sea level with a LAVA_LID, domain-warped mountain ranges, 3D caves behind a province mask, and the fixed-compass climate.',
     details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.<br><br><b>THE HEIGHT CONTRACT:</b> <code>World::TerrainHeight(x,z,seed)</code> &equiv; <code>genColumn(x,z,seed).h</code>, exactly. The GROUND — octaves, authored pool floors and rims, the pond bowl carve, the tarn berm — not the topmost solid voxel, which would include canopy and ruin walls and cannot be mirrored cheaply. <code>surfHeightAt</code> was a fourth height function that hand-copied this and had already drifted; it is gone. <code>check_invariants.py</code> token-compares the <code>MIRROR-BEGIN</code> blocks in the shader and in world.cpp, and the <code>terrain</code> gate&rsquo;s pass C1 compares CPU and GPU per voxel.<br><br><b>Q14 noise:</b> <code>vnoise2d</code> takes its cell as a LOG2 SHIFT, so <code>fdiv</code> becomes <code>&gt;&gt;</code> and <code>fmodp</code> becomes <code>&amp;</code> — zero integer divides where the legacy <code>vnoise</code> did five, and 14 bits of value instead of 8 (at a 1024-voxel amplitude an 8-bit LSB is a FOUR-VOXEL terrace). The legacy noise stays for the 14 decorative fields that call it. <code>&gt;&gt;</code> on a negative signed int is arithmetic in WGSL and in C++20 alike — that is the one place the two languages could have diverged.<br><br><b>Column hoists:</b> cave bands and tree candidates are pure in (x,z) and are computed once per column in <code>genChunk</code>, not once per cell. A buried column was recomputing <code>caveAt</code> 16 times (~93% of a buried chunk&rsquo;s worldgen cost), and <code>treeAt</code>&rsquo;s world-wide <code>TREE_MAX_TOP</code> reject became <code>cands.top</code>, a correct LOCAL ceiling that survives a wider terrain band. The <code>far</code> cascade sieve is column-major too: one thread owns one z row and four x, so 256 columns replace 4096.<br><br><b>Lava at rest (12c187c):</b> <code>caveFill(y)</code> routes every carve: lava at/below <code>LAVA_LEVEL=-80</code>, air above. The lateral boundary is stone at every level, so the only lava/air interface is one flat plane. This cut active-chunk count under flight from 521 → 23 (p50) and pool high-water by 11%.<br><br><b>Perched tarns:</b> a pond&rsquo;s waterline comes from its own CENTRE column and the annulus outside the disc is FORCED to <code>surf + pondBerm</code>, so containment is STRUCTURAL rather than a rim-sampling density — and 192 hashes per pond OR shore column become 8. Two rule-2 traps came with it, both reported by <code>ca-skip</code> rather than by anything near worldgen: the parabolic bowl is steepest at its rim, so <code>pondDepth</code> is now clamped against <code>pondRadiusMin</code> or the sand bed sits over the angle of repose and avalanches forever; and snow is a POWDER, so the authored pool rims now suppress it (<code>!inRim</code>) or it slides onto the lava and <code>snow + tag:hot &rarr; water</code> lights a front that never goes out.<br><br><b>THE OCTAVE LADDER (package C):</b> five rungs, lacunarity 4, persistence 1/4, so every rung has the SAME amplitude/wavelength ratio of 0.5 — detail without extra slope. Octaves are CENTRED deviations, which is what makes <code>baseHeight</code> the world&rsquo;s MEAN and leaves as much room below the datum for basins as above it for mountains. iq&rsquo;s derivative attenuation divides each rung by <code>1 + fbmAtten*|g|&sup2;</code> against the gradient accumulated above it: that is a rule-2 mechanism, not a look knob, because plain fBm sums five 0.5 slopes into 2.5 and puts the entire world above the CA&rsquo;s angle of repose.<br><br><b>The calm home area</b> fades only the two COARSE octaves toward the origin — fading the whole deviation would pin spawn to an exact plane 64 m across. The fade WIDTH is load-bearing: a ramp of magnitude A over width W adds slope up to 1.5&middot;A/W, and the <code>terrain</code> gate&rsquo;s pass A4 measures it so nobody has to guess.<br><br><b>The sediment wedge</b> puts metres of dirt over gravel on low flat ground and none on ridges. Both powders, so its slope gate reads the LANDFORM gradient (through the hill octave) rather than the full one: d(slope)/dcolumn for the grain octave is 96 Q8 — the whole gate range in ONE step — which turns a 24-voxel wedge into a 24-voxel cliff. Gated on the landform instead, 108 chunks still awake at tick 120 became 8.<br><br><b>Trees are metre-true again:</b> <code>VOX_PER_M</code> was a hardcoded 16, correct when a voxel was 6.25 cm and left behind when the world moved to 10 cm. Every tree was 1.6&times; its own table&rsquo;s documented size for that whole interval.'},
+
+  voxView:{label:'Voxel View + Edit Layer',tag:'cpu',
+    desc:'The Worldgen tab’s voxel-accurate terrain viewer and its WorldEdit-style editor. Streams real cells out of a headless `--voxserve` process, draws them in WebGL2, and writes hand edits into an authored .svedit layer the engine applies through the mutation queue.',
+    files:['src/tools/voxregion.cpp','src/sim/worldedit.cpp','assets/worldview.js',
+           'scripts/tuner_server.py','src/test/selftest_voxregion.cpp'],
+    sym:['BuildVoxRegion','RunVoxServe','VoxPaletteJson','WorldEdits::Drain',
+         'WorldEdits::QueueChunk','LoadWorldEditLayerFromTuning'],
+    doc:['DESIGN.md §9c'],
+    rule:3,
+    details:'<b>Why it exists:</b> the old Worldgen view drew a COLUMN MAP (one height, slope, sediment and water depth per x,z) and its “3D” mode extruded that same grid — so it could never show a cave, an overhang, a tree, a pond floor or a voxel, because none of those are functions of (x,z). The world’s content is <code>genCell</code>, and genCell is WGSL.<br><br><b>The region server:</b> <code>--voxserve</code> boots once (~3 s of device + SPIR-V + assets) and answers chunk-aligned box requests on stdin in ~8 ms each, generating ONLY the chunks the box covers through <code>EncodeGenList</code> — 64 dispatches for a 64³ region, not the window’s 32,768 (rule 2). The tuner takes the machine-global run mutex per REQUEST, not for the process lifetime, or a tuner session would block every build in every worktree. <code>--voxdump</code> is the same path, once, from a shell.<br><br><b>Geometry and material are separate, and that is the whole trick.</b> A conventional coloured-quad greedy mesher merges nothing here: worldgen’s palette jitter gives every adjacent stone cell a different variant, so a 64³ region of plain rock is ~25k unmergeable quads. Instead each region uploads its cells as an <code>R16UI</code> 3D texture, the mesher merges on ONE bit (is this face exposed), and the fragment shader reads the cell just inside the face and looks the colour up in a palette texture. Measured 2.6k quads per region instead of ~25k, with the material still exact per voxel — and the same texture pays for per-fragment AO (which therefore survives the merging) and the voxel edge lines.<br><br><b>LOD:</b> four shells of 64³-sample regions at lod 1/2/4/8. A coarse region is skipped when it lies wholly inside a finer level’s box — exact, because every extent is a power-of-two multiple of the last. Past the last shell the column map draws the horizon, which is the one job a heightfield is strictly better at. <code>lod &gt; 1</code> is a MAJORITY over the block, not a point sample: point sampling deletes a one-voxel cave roof, a trunk and a shoreline, which is exactly what you zoomed out to see.<br><br><b>Seams:</b> the mesher is handed the six neighbour face slabs and a region re-meshes when a neighbour lands. A missing neighbour reads as SOLID, so the transient is a hole that fills itself rather than a z-fighting double face that does not.<br><br><b>The edit layer</b> is a sparse chunk-keyed patch, saved to <code>assets/worldedits/&lt;name&gt;.svedit</code> and named by <code>worldgen.editLayer</code>. Deliberately not a ChunkStore save (pinned to one seed and one history, cannot compose with a slider you are still moving), not FarEdits (derived, disposable), and not a second writer into the voxel buffer — it emits CellOps through the MutationQueue like everything else (rule 3). Chunks are queued at the point of generation, including in <code>Stream::FillSlots</code>: <code>genChunk</code> overwrites a refilled slot with pristine procgen, so without the streaming re-queue an edit heals itself the moment its chunk scrolls out and back — the same failure FarEdits exists to fix for the cascades. A queued chunk that has scrolled out by drain time is DROPPED, never clamped, because a cell index is window-relative.<br><br><b>ANY layer moves the world hash</b>, so <code>editLayer</code> ships empty and no gate sets it.<br><br><b>Verify:</b> <code>--selftest --gate voxregion</code> for the data (lod-1 dump bit-identical to a direct readback, lod-4 invents nothing, bad requests refused not clamped, a .svedit round-tripped as BYTES through the real loader and then applied through a real tick and read back); <code>bash scripts/check_worldview.sh</code> for the browser half (real Chrome, WebGL2, the worker, HTTP, meshing, a pixel readback, a raycast, an edit and an undo).'},
 
   // ---------------------------------------------------------------- data
   dataPipeline:{label:'Data Pipeline',tag:'cpu',
@@ -9236,6 +9689,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'Voxel terrain viewer + edit layer',desc:'The Worldgen tab shows the world&rsquo;s actual CELLS, not a column map: <code>--voxserve</code> boots the engine headless once and streams chunk-aligned regions of real <code>genCell</code> output in ~8 ms each, generating only the chunks a box covers rather than the window&rsquo;s 32,768. The browser meshes them merging on ONE bit — is this face exposed — and carries no colour at all; each region uploads its cells as an R16UI 3D texture and the fragment shader reads the cell behind the face. That is the load-bearing decision: worldgen&rsquo;s palette jitter gives every adjacent stone cell a different variant, so a conventional coloured-quad greedy mesher merges nothing and a 64³ region of plain rock is ~25k unmergeable quads — against 2.6k this way, with the material still exact per voxel and per-fragment AO that survives the merging. Four LOD shells at lod 1/2/4/8 with the old column map kept as the horizon past the last one. On top of it a WorldEdit-style editor: brush, box select, fill/replace/hollow/copy/paste/nudge, slice planes, material isolate and undo, writing an authored <code>.svedit</code> layer that the engine applies through the MutationQueue after worldgen AND on every streaming refill — so an edit survives flying away and composes with any seed. Gate <code>voxregion</code> + <code>scripts/check_worldview.sh</code>'},
     {label:'Terrain scale pass (overhaul package C)',desc:'The world went from 5.4 m of relief to ~115 m over a kilometre, and the datum from y32 to y200. Five octaves at a uniform amplitude/wavelength ratio of 0.5 with iq&rsquo;s derivative attenuation — which is what keeps the sum self-limiting instead of stacking five 0.5 slopes into 2.5 and putting the whole world above the angle of repose. A calm home area fades only the two coarse rungs toward the origin, so spawn is rolling country rather than a random point on a mountainside OR a dinner plate. A slope-gated sediment wedge lays dirt over gravel on low flat ground: its gate reads the LANDFORM gradient, because through the grain octave the slope crosses the whole gate range in one column and the wedge becomes a cliff. Trees are metre-true again (VOX_PER_M was 16 against a 10-voxel metre, so every tree was 1.6&times; its documented size). A tuner Worldgen tab draws the map from the engine&rsquo;s own height function with every knob beside it'},
     {label:'The CPU dirty mirror can grow',desc:'PageTable::TightenFromSnapshot could only ever INTERSECT, so the mirror was a superset of &ldquo;writes the CPU asked for&rdquo; and not of &ldquo;writes the GPU will make&rdquo;. Worldgen output that is not perfectly at rest is exactly that difference: measured at cpuDirty=0 on every tick against a snapshot dirty set of 200-390 chunks, with a pond&rsquo;s water staining the rock behind its bank into a chunk still held as a JITTER sentinel — 58 lost voxels in a closed loop, since a dropped write leaves the chunk uniform so it is never materialized. The snapshot&rsquo;s own dirty set now seeds the mirror; the fixed point is still GPU-active plus one ring, and zero when the world sleeps'},
     {label:'Page faults name their cause',desc:'voxStore records the WORD it dropped and the chunk that refused it, so &ldquo;58 voxels went missing somewhere&rdquo; decodes to &ldquo;stone, stain wet/1, one chunk&rdquo; in one line instead of a day of turning worldgen features off one at a time'},
@@ -9441,6 +9895,7 @@ try{
 // file, a syntax error) the Models pane would sit empty with no explanation.
 // This runs after it and only speaks up when nothing registered.
 window.addEventListener('load',()=>{
+  try{ tunerDeepLink(); }catch(e){ console.error('deep link failed', e); }
   setTimeout(()=>{
     const s=document.querySelector('#view-models');
     if(!modelsApi&&s&&!s.childElementCount){

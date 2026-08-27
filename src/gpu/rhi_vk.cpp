@@ -725,6 +725,12 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   // the "two structs that must agree" failure this bridge exists to avoid.
   cxv.denseWorldgen = cx.denseWorldgen;
   cxv.caActive = cx.caActive;
+  // ...and vizActive was the next one to go missing, the same way, one commit
+  // later: the Cond::VizActive case was added to the recorder without the
+  // field, so the tree did not compile — and adding only the field would have
+  // left the overlay permanently off with nothing to see. Three structs, one
+  // value; all three or none.
+  cxv.vizActive = cx.vizActive;
   e->rec->RecordTable(which, cxv);
 }
 
