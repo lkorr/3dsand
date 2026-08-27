@@ -1611,6 +1611,16 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           cellOp = f32(materials[mat].opacity) / 255.0;
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
+          if ((R.flags & 2u) != 0u) {
+            let gs = chunkSlotIndex(worldChunkOf(cell));
+            if (dirtyViz[gs] != 0u) {
+              let st = voxStamp(w);
+              if (st == stampFor(R.tick, 0u) || st == stampFor(R.tick, 1u)) {
+                cellTint = vec3f(1.0, 0.05, 0.05);
+                cellOp = 1.0;
+              }
+            }
+          }
           if (out.mediaMat == 0u) {
             out.mediaMat = mat;
             out.mediaSurf = select(1.0, f32(voxState(w) + 1u) / 8.0,
