@@ -554,7 +554,7 @@
     "microLodDist": 40,
     "microMaxPerRay": 8,
     "microSwayAmp": 1.5,
-    "microSwaySpeed": 1.0,
+    "microSwaySpeed": 1,
     "primarySteps": 4096,
     "farSteps": 384,
     "farShadowReach": 60,
@@ -674,10 +674,10 @@
   "worldgen": {
     "refVoxelsPerMetre": 10,
     "treeline": 228,
-    "baseHeight": 200,
-    "contAmplitude": 1024,
+    "baseHeight": 0,
+    "contAmplitude": 2048,
     "contLog2": 11,
-    "rangeAmplitude": 256,
+    "rangeAmplitude": 736,
     "rangeLog2": 9,
     "hillAmplitude": 64,
     "hillLog2": 7,
@@ -787,16 +787,16 @@
     "iceMelts": false
   },
   "wind": {
-    "windSpeed": 6.0,
-    "windDirDeg": 45.0,
-    "gustStrength": 1.0,
+    "windSpeed": 6,
+    "windDirDeg": 45,
+    "gustStrength": 1,
     "weatherAuto": true,
     "gustWavelength": 4.8,
     "gustSpeed": 1.1,
     "altitudeGain": 0.6,
-    "altitudeRefY": 64.0,
+    "altitudeRefY": 64,
     "dbgWindField": false,
-    "dbgWindSpacing": 8.0,
-    "dbgWindRadius": 48.0
+    "dbgWindSpacing": 8,
+    "dbgWindRadius": 48
   }
 }

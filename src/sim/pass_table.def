@@ -114,6 +114,8 @@ PASS(fill_expMask, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NON
      USES(TW(ExpMask)))
 PASS(fill_hash, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_HASH, 1,
      USES(TW(Hash)))
+PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_VIZACTIVE, 1,
+     USES(TW(ActVoxViz)))
 
 // ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
 // D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
@@ -205,7 +207,7 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
-          R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch)))
+          R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)))
 
 // ---- phase 4: particles ---------------------------------------------------
 // Runs after the CA so flights see settled ground. Grid writes land in

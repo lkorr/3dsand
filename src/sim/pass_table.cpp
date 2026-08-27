@@ -107,6 +107,7 @@ namespace {
 #define C_FLUIDSPAWN Cond::FluidSpawn
 #define C_WINDWAKE  Cond::WindWake
 #define C_CAACTIVE  Cond::CaActive
+#define C_VIZACTIVE Cond::VizActive
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops

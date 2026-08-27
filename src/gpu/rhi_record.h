@@ -46,6 +46,7 @@ struct TableCtx {
   // False ONLY when the CPU can prove the dirty set is empty, dropping compact
   // + the args copy + all 54 CA iterations (ROADMAP_scale.md §3.4).
   bool caActive = true;
+  bool vizActive = false;
 };
 
 // The live resources a table row resolves against, as SEAM handles. The

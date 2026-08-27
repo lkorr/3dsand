@@ -4077,7 +4077,8 @@ int main(int argc, char** argv) {
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
-                 spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat);
+                 spawns, farCount, fluidSpawns, fluidCount, fluidSpeciesMat,
+                 ui.showDirtyVoxels);
       // Conservative estimate refresh: the newest snapshot's GPU-owned count
       // plus every spawn batch it has not seen yet. Settles decay it (the
       // snapshot count shrinks); excites grow it one snapshot late, which the
@@ -4358,7 +4359,7 @@ int main(int argc, char** argv) {
         if (ds.valid && ds.dirtyFlags.size() == kNumChunks) {
           static std::vector<uint32_t> df(kNumChunks);
           for (uint32_t i = 0; i < kNumChunks; i++)
-            df[i] = ds.dirtyFlags[i];
+            df[i] = ds.dirtyFlags[i] ? ds.tick : 0u;
           ctx.queue.WriteBuffer(world.dirtyViz, 0, df.data(),
                                 kNumChunks * sizeof(uint32_t));
         }

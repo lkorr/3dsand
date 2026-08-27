@@ -14,6 +14,8 @@ constexpr uint64_t kChunkBytes = kChunkVol * 4;                 // 16 KB
 constexpr uint64_t kMirrorBytes = 27 * kChunkBytes;             // 432 KB
 constexpr uint64_t kDirtyOff = kMirrorBytes;
 constexpr uint64_t kDirtyBytes = kNumChunks * 4;
+constexpr uint64_t kActVoxVizWords = (uint64_t)kPoolPages * kChunkVol / 32;
+constexpr uint64_t kActVoxVizBytes = kActVoxVizWords * sizeof(uint32_t);
 constexpr uint64_t kOccOff = kDirtyOff + kDirtyBytes;
 // The COUNT half of the occupancy buffer — the only half the snapshot ring
 // carries. The sub-chunk bitmask that follows it on the GPU is render-only and
@@ -85,6 +87,7 @@ void World::Init(const rhi::Device& device) {
                         U::Storage | U::CopyDst, "brushOps");
   renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
   dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
+  actVoxViz = CreateBuffer(device, kActVoxVizBytes, U::Storage | U::CopyDst, "actVoxViz");
   pick = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst, "pick");
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");

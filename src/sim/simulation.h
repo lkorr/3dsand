@@ -96,7 +96,7 @@ class Simulation {
                   bool hashEnable, uint32_t expCount, bool particlesActive,
                   uint32_t cellCount, uint32_t spawnCount = 0,
                   uint32_t fluidCount = 0, uint32_t fluidSpawnCount = 0,
-                  uint32_t windWakeCount = 0);
+                  uint32_t windWakeCount = 0, bool vizActive = false);
 
   // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
   //

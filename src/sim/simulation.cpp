@@ -132,6 +132,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(20, T::ReadOnlyStorage), // fluidBlockMap
         entry(21, T::ReadOnlyStorage), // fluidGrid
         entry(22, T::Storage),         // fluidCellScratch
+        entry(23, T::Storage),         // actVoxViz (per-voxel debug overlay)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -249,6 +250,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(10, T::ReadOnlyStorage, S::Fragment),              // fluidBlockMap
         entry(11, T::ReadOnlyStorage, S::Fragment),              // fluidGrid
         entry(12, T::ReadOnlyStorage, S::Fragment),              // dirtyViz
+        entry(13, T::ReadOnlyStorage, S::Fragment),  // actVoxViz
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -358,6 +360,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(20, world_->fluidBlockMap),
         b(21, world_->fluidGrid),
         b(22, world_->fluidCellScratch),
+        b(23, world_->actVoxViz),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -414,6 +417,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(10, world_->fluidBlockMap),
         b(11, world_->fluidGrid),
         b(12, world_->dirtyViz),
+        b(13, world_->actVoxViz),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -749,6 +753,7 @@ struct RecordCtx {
   // False ONLY when the CPU can prove the dirty set is empty (§3.4). Mirrors
   // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
   bool caActive = true;
+  bool vizActive = false;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -822,6 +827,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FluidCompactScratch: return world_->fluidCompactScratch;
     case B::FluidCellScratch:    return world_->fluidCellScratch;
     case B::FluidMirror:         return world_->fluidMirror;
+    case B::ActVoxViz:           return world_->actVoxViz;
     default:                return world_->voxels;
   }
 }
@@ -913,6 +919,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
   tc.caActive = cx.caActive;
+  tc.vizActive = cx.vizActive;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -1162,7 +1169,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
                             uint32_t cellCount, uint32_t spawnCount,
                             uint32_t fluidCount, uint32_t fluidSpawnCount,
-                            uint32_t windWakeCount) {
+                            uint32_t windWakeCount, bool vizActive) {
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
@@ -1173,6 +1180,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.windWakeCount = windWakeCount;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
+  cx.vizActive = vizActive;
 
   // §3.4. The counts are re-tested here as a BACKSTOP, not as the primary
   // signal: NoteTickInputs is the declaration and a caller that forgets it

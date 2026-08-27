@@ -101,6 +101,7 @@ enum class Buf : uint8_t {
   FluidCompactScratch,
   FluidCellScratch,
   FluidMirror,
+  ActVoxViz,
   kCount,
 };
 
@@ -219,6 +220,7 @@ enum class Cond : uint8_t {
   // The proof obligation is entirely on the CPU mirror being CONSERVATIVE:
   // wrong-active costs microseconds, wrong-idle loses world state.
   CaActive,
+  VizActive,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.

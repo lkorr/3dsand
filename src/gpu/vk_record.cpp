@@ -97,6 +97,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::FluidSpawn: return cx.fluidSpawnCount > 0;
     case pass::Cond::WindWake:  return cx.windWakeCount > 0;
     case pass::Cond::CaActive:  return cx.caActive;
+    case pass::Cond::VizActive:  return cx.vizActive;
   }
   return false;
 }

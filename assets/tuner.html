@@ -644,6 +644,8 @@
   }
   #wgCanvas{display:block;width:100%;height:auto;cursor:grab;image-rendering:auto}
   #wgCanvas.drag{cursor:grabbing}
+  #wg3DCanvas{display:none;width:100%;height:auto;cursor:grab}
+  #wg3DCanvas.drag{cursor:grabbing}
   .wgread{
     position:absolute;left:10px;bottom:10px;background:rgba(8,10,13,.82);
     border:1px solid var(--line);border-radius:7px;padding:6px 10px;
@@ -1607,12 +1609,19 @@
           <option>448</option><option>640</option>
         </select>
       </label>
+      <button id="wg3DToggle" title="Switch to 3D terrain view">3D</button>
+      <label class="hint" id="wg3DExagLabel" style="display:none">vert
+        <input id="wg3DExag" type="range" min="0.5" max="15" step="0.5" value="3"
+               style="width:70px;margin-left:4px;vertical-align:middle">
+        <span id="wg3DExagVal">3</span>x
+      </label>
       <span class="spacer"></span>
       <span class="hint" id="wgStatus"></span>
     </div>
     <div class="wgwrap">
       <div class="wgmap">
         <canvas id="wgCanvas" width="900" height="900"></canvas>
+        <canvas id="wg3DCanvas" width="900" height="900"></canvas>
         <div class="wgread" id="wgRead">drag to pan &middot; wheel to zoom</div>
         <div class="wglegend" id="wgLegend"></div>
       </div>
@@ -4049,6 +4058,7 @@ function wgPaint(){
     (D.span/D.res).toFixed(1)+' vox/px  ·  y'+D.hMin+'..y'+D.hMax+
     ' ('+wgFmtM(D.hMax-D.hMin)+' of relief here)';
   wgLegendPaint(mode,lo,hi);
+  if(wg3DOn){wg3DBuild();wg3DRender();}
 }
 
 function wgLegendPaint(mode,lo,hi){
@@ -4172,6 +4182,200 @@ function wgWire(){
   $('#wgMode').addEventListener('change',wgPaint);
   $('#wgRes').addEventListener('change',function(){wgRefresh(0);});
   $('#wgSeed').addEventListener('change',function(){wgRefresh(0);});
+  $('#wg3DToggle').addEventListener('click',wg3DToggle);
+}
+
+/* ================= worldgen 3D view ================= */
+var wg3DOn=false;
+var wg3D={gl:null,prog:null,vao:null,vbo:null,ibo:null,cnt:0,
+  uMVP:null,uLight:null,built:false,wired:false,
+  cam:{az:0.6,el:0.7,dist:1.5,tx:0,ty:0,tz:0}};
+function wg3DMat(){return new Float32Array(16);}
+function wg3DMul(a,b){
+  var o=wg3DMat();
+  for(var c=0;c<4;c++)for(var r=0;r<4;r++){
+    var s=0;for(var k=0;k<4;k++)s+=a[r+k*4]*b[k+c*4];o[r+c*4]=s;}
+  return o;
+}
+function wg3DPersp(fov,asp,zn,zf){
+  var f=1/Math.tan(fov/2),d=1/(zn-zf),m=wg3DMat();
+  m[0]=f/asp;m[5]=f;m[10]=(zf+zn)*d;m[11]=-1;m[14]=2*zf*zn*d;return m;
+}
+function wg3DLookAt(ex,ey,ez,cx,cy,cz){
+  var m=wg3DMat();
+  var zx=ex-cx,zy=ey-cy,zz=ez-cz;
+  var zl=Math.sqrt(zx*zx+zy*zy+zz*zz);
+  if(zl<1e-10){m[0]=m[5]=m[10]=m[15]=1;return m;}
+  zx/=zl;zy/=zl;zz/=zl;
+  var xl=Math.sqrt(zz*zz+zx*zx);
+  if(xl<1e-10){m[0]=m[5]=m[10]=m[15]=1;return m;}
+  var xx=zz/xl,xz=-zx/xl;
+  var yx=-zy*zx/xl,yy=xl,yz=-zy*zz/xl;
+  m[0]=xx;m[1]=yx;m[2]=zx;
+  m[4]=0;m[5]=yy;m[6]=zy;
+  m[8]=xz;m[9]=yz;m[10]=zz;
+  m[12]=-(xx*ex+xz*ez);
+  m[13]=-(yx*ex+yy*ey+yz*ez);
+  m[14]=-(zx*ex+zy*ey+zz*ez);
+  m[15]=1;return m;
+}
+function wg3DInit(){
+  var cv=$('#wg3DCanvas');if(!cv)return false;
+  var gl=cv.getContext('webgl2',{antialias:true,alpha:false});
+  if(!gl)return false;
+  wg3D.gl=gl;
+  function sh(t,s){var o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o;}
+  var vs=sh(gl.VERTEX_SHADER,
+    '#version 300 es\nuniform mat4 uMVP;\nin vec3 aPos;in vec3 aCol;in vec3 aNrm;\n'+
+    'out vec3 vCol;out vec3 vNrm;\nvoid main(){gl_Position=uMVP*vec4(aPos,1);vCol=aCol;vNrm=aNrm;}\n');
+  var fs=sh(gl.FRAGMENT_SHADER,
+    '#version 300 es\nprecision mediump float;\nuniform vec3 uL;\n'+
+    'in vec3 vCol;in vec3 vNrm;out vec4 oC;\n'+
+    'void main(){float d=max(dot(normalize(vNrm),uL),0.0);oC=vec4(vCol*(0.35+0.65*d),1);}\n');
+  var p=gl.createProgram();
+  gl.attachShader(p,vs);gl.attachShader(p,fs);
+  gl.bindAttribLocation(p,0,'aPos');gl.bindAttribLocation(p,1,'aCol');gl.bindAttribLocation(p,2,'aNrm');
+  gl.linkProgram(p);
+  wg3D.prog=p;wg3D.uMVP=gl.getUniformLocation(p,'uMVP');wg3D.uLight=gl.getUniformLocation(p,'uL');
+  gl.enable(gl.DEPTH_TEST);gl.clearColor(0.043,0.051,0.063,1);
+  return true;
+}
+function wg3DBuild(){
+  if(!wgData||!wg3D.gl)return;
+  var gl=wg3D.gl,D=wgData,res=D.res;
+  var mode=$('#wgMode').value;
+  var lo=D.sea-720,hi=D.sea+900;
+  var exag=parseFloat($('#wg3DExag').value)||3;
+  var treeline=(tune&&tune.worldgen&&tune.worldgen.treeline)||228;
+  var hScale=exag/D.span;
+  var V=new Float32Array(res*res*9);
+  for(var j=0;j<res;j++)for(var i=0;i<res;i++){
+    var k=j*res+i,vi=k*9;
+    V[vi]=i/(res-1)-0.5;
+    V[vi+1]=(D.h[k]-D.sea)*hScale;
+    V[vi+2]=j/(res-1)-0.5;
+    var h=D.h[k],r,g,b;
+    if(mode==='slope'){var q=D.slope[k],t=Math.min(q/256,1);
+      r=40+215*t;g=q>=255?40:150-110*t;b=q>=255?40:120-90*t;
+    }else if(mode==='sed'){var t2=Math.min(D.sed[k]/32,1);
+      r=44+150*t2;g=40+112*t2;b=36+52*t2;if(D.sed[k]===0){r=48;g=52;b=58;}
+    }else if(mode==='biome'){
+      if(h>=treeline){r=232;g=238;b=246;}
+      else if(D.sed[k]>=8){r=120;g=96;b=64;}
+      else if(D.sed[k]>0){r=110;g=140;b=84;}
+      else{r=132;g=132;b=120;}
+    }else{var c=wgRamp((h-lo)/(hi-lo));r=c[0];g=c[1];b=c[2];}
+    if(D.water[k]!==-32768&&mode!=='slope'&&mode!=='sed'){
+      var tw=Math.min(Math.max(0,D.water[k])/40,1);
+      r=r*0.18+(36-16*tw);g=g*0.18+(88-30*tw);b=b*0.18+(150-30*tw);
+    }
+    V[vi+3]=Math.max(0,Math.min(255,r))/255;
+    V[vi+4]=Math.max(0,Math.min(255,g))/255;
+    V[vi+5]=Math.max(0,Math.min(255,b))/255;
+  }
+  var sp=1/(res-1);
+  for(var j2=0;j2<res;j2++)for(var i2=0;i2<res;i2++){
+    var kk=j2*res+i2,vi2=kk*9;
+    var yl=i2>0?V[(kk-1)*9+1]:V[vi2+1];
+    var yr=i2<res-1?V[(kk+1)*9+1]:V[vi2+1];
+    var yd=j2>0?V[(kk-res)*9+1]:V[vi2+1];
+    var yu=j2<res-1?V[(kk+res)*9+1]:V[vi2+1];
+    var nx=-(yr-yl)/(2*sp),nz=-(yu-yd)/(2*sp),ny=1;
+    var nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
+    V[vi2+6]=nx/nl;V[vi2+7]=ny/nl;V[vi2+8]=nz/nl;
+  }
+  if(!wg3D.vao)wg3D.vao=gl.createVertexArray();
+  gl.bindVertexArray(wg3D.vao);
+  if(!wg3D.vbo)wg3D.vbo=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,wg3D.vbo);
+  gl.bufferData(gl.ARRAY_BUFFER,V,gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,36,0);
+  gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,36,12);
+  gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,36,24);
+  var N=(res-1)*(res-1)*6,I=new Uint32Array(N),ptr=0;
+  for(var jj=0;jj<res-1;jj++)for(var qi=0;qi<res-1;qi++){
+    var a=jj*res+qi;I[ptr++]=a;I[ptr++]=a+res;I[ptr++]=a+1;
+    I[ptr++]=a+1;I[ptr++]=a+res;I[ptr++]=a+res+1;
+  }
+  if(!wg3D.ibo)wg3D.ibo=gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,wg3D.ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,I,gl.DYNAMIC_DRAW);
+  wg3D.cnt=N;gl.bindVertexArray(null);wg3D.built=true;
+}
+function wg3DRender(){
+  if(!wg3D.gl||!wg3D.built)return;
+  var gl=wg3D.gl,cv=$('#wg3DCanvas'),c=wg3D.cam;
+  var dpr=window.devicePixelRatio||1;
+  var dw=Math.round(cv.clientWidth*dpr),dh=Math.round(cv.clientHeight*dpr);
+  if(cv.width!==dw||cv.height!==dh){cv.width=dw;cv.height=dh;}
+  gl.viewport(0,0,dw,dh);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(wg3D.prog);
+  var ex=c.tx+c.dist*Math.cos(c.el)*Math.sin(c.az);
+  var ey=c.ty+c.dist*Math.sin(c.el);
+  var ez=c.tz+c.dist*Math.cos(c.el)*Math.cos(c.az);
+  var mvp=wg3DMul(wg3DPersp(Math.PI/4,dw/dh,0.01,10),
+                   wg3DLookAt(ex,ey,ez,c.tx,c.ty,c.tz));
+  gl.uniformMatrix4fv(wg3D.uMVP,false,mvp);
+  var lx=-0.5,ly=0.7,lz=-0.5;
+  var ll=Math.sqrt(lx*lx+ly*ly+lz*lz);
+  gl.uniform3f(wg3D.uLight,lx/ll,ly/ll,lz/ll);
+  gl.bindVertexArray(wg3D.vao);
+  gl.drawElements(gl.TRIANGLES,wg3D.cnt,gl.UNSIGNED_INT,0);
+  gl.bindVertexArray(null);
+}
+function wg3DToggle(){
+  wg3DOn=!wg3DOn;
+  $('#wgCanvas').style.display=wg3DOn?'none':'block';
+  $('#wg3DCanvas').style.display=wg3DOn?'block':'none';
+  $('#wg3DToggle').textContent=wg3DOn?'2D':'3D';
+  $('#wg3DToggle').title=wg3DOn?'Switch to 2D map':'Switch to 3D terrain';
+  var exLbl=$('#wg3DExagLabel');if(exLbl)exLbl.style.display=wg3DOn?'':'none';
+  var rd=$('#wgRead');
+  if(rd)rd.textContent=wg3DOn?'drag to orbit · right-drag to pan · wheel to zoom':'drag to pan · wheel to zoom';
+  if(wg3DOn){
+    if(!wg3D.gl&&!wg3DInit())return;
+    wg3DWire();
+    if(wgData){wg3DBuild();wg3DRender();}
+  }
+}
+function wg3DWire(){
+  if(wg3D.wired)return;wg3D.wired=true;
+  var cv=$('#wg3DCanvas'),drag=null;
+  cv.addEventListener('contextmenu',function(e){e.preventDefault();});
+  cv.addEventListener('pointerdown',function(e){
+    drag={x:e.clientX,y:e.clientY,az:wg3D.cam.az,el:wg3D.cam.el,
+          tx:wg3D.cam.tx,tz:wg3D.cam.tz,btn:e.button};
+    cv.setPointerCapture(e.pointerId);cv.classList.add('drag');e.preventDefault();
+  });
+  cv.addEventListener('pointerup',function(e){
+    drag=null;cv.classList.remove('drag');
+    try{cv.releasePointerCapture(e.pointerId);}catch(err){}
+  });
+  cv.addEventListener('pointermove',function(e){
+    if(!drag)return;
+    var dx=e.clientX-drag.x,dy=e.clientY-drag.y,c=wg3D.cam;
+    if(drag.btn===2||e.shiftKey){
+      var s=c.dist*0.0015;
+      var ca=Math.cos(c.az),sa=Math.sin(c.az);
+      c.tx=drag.tx+(-dx*ca-dy*sa)*s;
+      c.tz=drag.tz+(dx*sa-dy*ca)*s;
+    }else{
+      c.az=drag.az-dx*0.005;
+      c.el=Math.max(0.05,Math.min(1.5,drag.el+dy*0.005));
+    }
+    wg3DRender();
+  });
+  cv.addEventListener('wheel',function(e){
+    e.preventDefault();
+    wg3D.cam.dist*=e.deltaY>0?1.1:0.9;
+    wg3D.cam.dist=Math.max(0.1,Math.min(5,wg3D.cam.dist));
+    wg3DRender();
+  },{passive:false});
+  $('#wg3DExag').addEventListener('input',function(){
+    $('#wg3DExagVal').textContent=this.value;
+    if(wgData){wg3DBuild();wg3DRender();}
+  });
 }
 
 function renderWorldgen(){

@@ -179,7 +179,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
                 uint32_t fluidLive,
-                const uint32_t* fluidSplashMat) {
+                const uint32_t* fluidSplashMat,
+                bool vizActive) {
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
@@ -311,6 +312,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   IVec3 mb = world.MirrorBaseFor(
       {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
   tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
+  tp.vizActive = vizActive ? 1u : 0u;
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
@@ -572,7 +574,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
                  fluidLive + fluidSpawnCount, fluidSpawnCount,
-                 (uint32_t)windWake.size());
+                 (uint32_t)windWake.size(), vizActive);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the

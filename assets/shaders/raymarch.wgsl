@@ -1613,9 +1613,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
                       unpackColor(materials[mat].color1)) * 0.5;
           if ((R.flags & 2u) != 0u) {
             let gs = chunkSlotIndex(worldChunkOf(cell));
-            if (dirtyViz[gs] != 0u) {
+            let snapTick = dirtyViz[gs];
+            if (snapTick != 0u) {
               let st = voxStamp(w);
-              if (st == stampFor(R.tick, 0u) || st == stampFor(R.tick, 1u)) {
+              if (st == stampFor(snapTick, 0u) || st == stampFor(snapTick, 1u)) {
                 cellTint = vec3f(1.0, 0.05, 0.05);
                 cellOp = 1.0;
               }
@@ -6283,11 +6284,10 @@ fn fs(in : VSOut) -> FSOut {
     // ---- dirty-voxel debug highlight (dev panel toggle) ----
     if ((R.flags & 2u) != 0u) {
       let chSlot = chunkSlotIndex(worldChunkOf(h.cell));
-      if (dirtyViz[chSlot] != 0u) {
+      let snapTick = dirtyViz[chSlot];
+      if (snapTick != 0u) {
         let stamp = voxStamp(h.word);
-        let s0 = stampFor(R.tick, 0u);
-        let s1 = stampFor(R.tick, 1u);
-        if (stamp == s0 || stamp == s1) {
+        if (stamp == stampFor(snapTick, 0u) || stamp == stampFor(snapTick, 1u)) {
           let ed = min(uv, 1.0 - uv);
           let me = min(ed.x, ed.y);
           if (me < 0.08) {

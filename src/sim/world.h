@@ -957,6 +957,7 @@ struct TickParams {
   // densest legal packing and windPrimLoad is the only decoder.
   int32_t windPrims[kWindPrimScalars] = {};
   uint32_t windWake[kWindWakeCap] = {};
+  uint32_t vizActive = 0;   // debug: CA writes per-voxel activity bits when nonzero
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -1711,6 +1712,7 @@ class World {
   rhi::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
   rhi::Buffer renderUBO;   // RenderParams
   rhi::Buffer dirtyViz;    // kNumChunks u32, CPU-uploaded snapshot for debug overlay
+  rhi::Buffer actVoxViz;   // per-voxel activity bits (packed u32), debug overlay
   rhi::Buffer pick;        // 8 u32
 
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
