@@ -1983,6 +1983,130 @@ bool LoadTuning(const std::string& path, Tuning& out) {
   return true;
 }
 
+// ---- worldgen defaults, for the tuner's "Reset terrain" button -------------
+//
+// THE ONLY COPY OF THESE VALUES IS tuning.h. A defaults table in
+// tuner_schema.js was the obvious alternative and it is the one thing that file
+// deliberately does not carry (see the note over `tuneBase` in tuner.html): a
+// stale min/max there is a cosmetic slider bug, but a stale DEFAULT is a wrong
+// number written into tuning.json, which is a different world. So the button
+// asks the engine, and this is what answers.
+//
+// A DEFAULT-CONSTRUCTED Tuning, never passed through LoadTuning, and that is
+// load-bearing. Every length in this group is authored at
+// `refVoxelsPerMetre` and rescaled by LoadTuning to whatever kVoxelMeters
+// currently is; emitting a LOADED struct would write already-scaled numbers
+// back into the file and double-scale them on the next read. The member
+// initializers are the authored values, which is exactly what belongs in JSON.
+//
+// The key list mirrors the reader above one-for-one, and
+// scripts/check_invariants.py fails the build if the two ever disagree — a
+// parameter added to LoadTuning and forgotten here would silently not reset.
+std::string WorldgenDefaultsJson() {
+  const Tuning def{};
+  const auto& w = def.worldgen;
+  std::ostringstream o;
+  bool first = true;
+  // One key per line at a two-space indent, so the output drops straight
+  // into assets/materials/tuning.json shape and diffs cleanly against it.
+  const auto sep = [&]() {
+    o << (first ? "\n    " : ",\n    ");
+    first = false;
+  };
+  const auto n = [&](const char* k, int v) {
+    sep();
+    o << '"' << k << "\": " << v;
+  };
+  const auto s = [&](const char* k, const std::string& v) {
+    sep();
+    o << '"' << k << "\": \"" << v << '"';
+  };
+  o << "{\n  \"worldgen\": {";
+  n("refVoxelsPerMetre", w.refVoxelsPerMetre);
+  n("treeline", w.treeline);
+  n("baseHeight", w.baseHeight);
+  n("contAmplitude", w.contAmplitude);
+  n("contLog2", w.contLog2);
+  n("rangeAmplitude", w.rangeAmplitude);
+  n("rangeLog2", w.rangeLog2);
+  n("hillAmplitude", w.hillAmplitude);
+  n("hillLog2", w.hillLog2);
+  n("detailAmplitude", w.detailAmplitude);
+  n("detailLog2", w.detailLog2);
+  n("grainAmplitude", w.grainAmplitude);
+  n("grainLog2", w.grainLog2);
+  n("fbmAtten", w.fbmAtten);
+  n("spawnPlainY", w.spawnPlainY);
+  n("spawnPlainR", w.spawnPlainR);
+  n("spawnPlainFade", w.spawnPlainFade);
+  n("sedCeil", w.sedCeil);
+  n("sedFraction", w.sedFraction);
+  n("sedStrip", w.sedStrip);
+  n("sedSlope", w.sedSlope);
+  n("sedMax", w.sedMax);
+  n("sedTopsoil", w.sedTopsoil);
+  n("biomeLog2", w.biomeLog2);
+  n("desertThreshold", w.desertThreshold);
+  n("pineThreshold", w.pineThreshold);
+  n("meadowThreshold", w.meadowThreshold);
+  n("treeTile", w.treeTile);
+  n("treeChanceForest", w.treeChanceForest);
+  n("treeChancePine", w.treeChancePine);
+  n("treeChanceMeadow", w.treeChanceMeadow);
+  n("treeChanceDesert", w.treeChanceDesert);
+  n("autumnFraction", w.autumnFraction);
+  n("pondTile", w.pondTile);
+  n("pondChance", w.pondChance);
+  n("pondRadiusMin", w.pondRadiusMin);
+  n("pondRadiusSpan", w.pondRadiusSpan);
+  n("pondMaxSlope", w.pondMaxSlope);
+  n("pondBerm", w.pondBerm);
+  n("pondBermWidth", w.pondBermWidth);
+  n("pondDepth", w.pondDepth);
+  n("pondDepthRim", w.pondDepthRim);
+  n("lilyChance", w.lilyChance);
+  n("lilyFlowerChance", w.lilyFlowerChance);
+  n("reedChance", w.reedChance);
+  n("reedHeight", w.reedHeight);
+  n("kelpChance", w.kelpChance);
+  n("kelpHeight", w.kelpHeight);
+  n("shoreBand", w.shoreBand);
+  n("shoreMudWidth", w.shoreMudWidth);
+  n("shoreLift", w.shoreLift);
+  n("shoreCattailChance", w.shoreCattailChance);
+  n("shoreCattailReach", w.shoreCattailReach);
+  n("shoreCattailHeight", w.shoreCattailHeight);
+  n("shoreSedgeChance", w.shoreSedgeChance);
+  n("shoreHorsetailChance", w.shoreHorsetailChance);
+  n("shoreHorsetailHeight", w.shoreHorsetailHeight);
+  n("shoreIrisChance", w.shoreIrisChance);
+  n("shoreMossChance", w.shoreMossChance);
+  n("vineChance", w.vineChance);
+  n("vineLenMin", w.vineLenMin);
+  n("vineLenSpan", w.vineLenSpan);
+  n("creeperFlowerChance", w.creeperFlowerChance);
+  n("mossChance", w.mossChance);
+  n("mossLenMin", w.mossLenMin);
+  n("mossLenSpan", w.mossLenSpan);
+  n("ivyChance", w.ivyChance);
+  n("ivyTwist", w.ivyTwist);
+  n("wallIvyDensity", w.wallIvyDensity);
+  n("cactusChance", w.cactusChance);
+  n("saguaroFraction", w.saguaroFraction);
+  n("tussockChance", w.tussockChance);
+  n("scrubChance", w.scrubChance);
+  n("desertPatch", w.desertPatch);
+  n("heathChance", w.heathChance);
+  n("heathPatch", w.heathPatch);
+  n("alpineChance", w.alpineChance);
+  n("ruinChance", w.ruinChance);
+  n("caveThreshold1", w.caveThreshold1);
+  n("caveThreshold2", w.caveThreshold2);
+  s("editLayer", w.editLayer);
+  o << "\n  }\n}\n";
+  return o.str();
+}
+
 std::string TuningWgslBlock(const Tuning& t) {
   std::ostringstream o;
   o << "// GENERATED from assets/materials/tuning.json by TuningWgslBlock() —\n"

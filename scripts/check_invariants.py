@@ -766,9 +766,53 @@ def check_worldgen_units():
             f"tuning.json")
 
 
+def check_worldgen_defaults():
+    """LoadTuning's worldgen reader <-> WorldgenDefaultsJson().
+
+    The tuner's "Reset terrain" button applies whatever WorldgenDefaultsJson()
+    emits. A parameter added to the reader and forgotten in the emitter would
+    silently NOT reset -- the button would look like it worked and leave one
+    slider on an experimental value, which is the worst possible failure for a
+    control whose entire job is "put it back". Neither side has any reason to
+    notice, so this is what notices.
+    """
+    tuning = read("src/sim/tuning.cpp")
+    if not tuning:
+        return
+    m = re.search(r'if \(const json\* g = Find\(j, "worldgen"\)\) \{(.*?)\n    // These divide',
+                  tuning, re.S)
+    d = re.search(r'std::string WorldgenDefaultsJson\(\) \{(.*?)\n\}', tuning, re.S)
+    if not m or not d:
+        problems.append("worldgen defaults: could not find LoadTuning's worldgen "
+                        "block or WorldgenDefaultsJson (check these regexes "
+                        "against tuning.cpp)")
+        return
+    checked.append("worldgen defaults")
+    reader = _decomment(m.group(1))
+    dumper = _decomment(d.group(1))
+
+    want = []
+    for fn in WG_READERS + ("ReadI", "ReadU", "ReadStr"):
+        want += re.findall(r'\b%s\(\*g, "(\w+)"' % fn, reader)
+    got = set(re.findall(r'\b[ns]\("(\w+)"', dumper))
+
+    for name in want:
+        if name not in got:
+            problems.append(
+                f"worldgen.{name} is read by LoadTuning but not emitted by "
+                f"WorldgenDefaultsJson -- the tuner's Reset terrain button "
+                f"would leave it alone instead of restoring it")
+    for name in sorted(got - set(want)):
+        problems.append(
+            f"WorldgenDefaultsJson emits worldgen.{name}, which LoadTuning "
+            f"never reads -- either the reader lost a row or the key is a typo, "
+            f"and a reset would write a value the engine ignores")
+
+
 ALL = {
     "worldgen": check_worldgen_mirror,
     "wgunits": check_worldgen_units,
+    "wgdefaults": check_worldgen_defaults,
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
@@ -784,7 +828,7 @@ ALL = {
 RELEVANT = {
     "assets/sound_schema.js": ["sound"],
     "src/audio/cues.cpp": ["sound"],
-    "src/sim/tuning.cpp": ["tuning", "wgunits"],
+    "src/sim/tuning.cpp": ["tuning", "wgunits", "wgdefaults"],
     "src/sim/tuning.h": ["tuning"],
     "src/sim/tuning_params.def": ["tuning", "substeps", "wgunits"],
     "scripts/tuning_prelude.py": ["tuning"],

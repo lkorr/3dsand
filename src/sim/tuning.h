@@ -2025,6 +2025,13 @@ bool LoadTuning(const std::string& path, Tuning& out);
 // reference these names rather than literals.
 std::string TuningWgslBlock(const Tuning& t);
 
+// The `worldgen` group as the engine's own compiled-in defaults, as JSON — what
+// `--dump-tuning-defaults` writes and what the tuner's "Reset terrain" button
+// applies. Emitted from a DEFAULT-CONSTRUCTED Tuning, so the lengths are the
+// authored values LoadTuning would rescale, not already-rescaled ones. See the
+// note over the definition.
+std::string WorldgenDefaultsJson();
+
 // Process-wide current tuning. Read by the shader prelude and by the CPU-side
 // systems; replaced wholesale on reload.
 const Tuning& CurrentTuning();

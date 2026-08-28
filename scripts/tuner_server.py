@@ -34,6 +34,7 @@ happens in this process rather than in the page:
   GET  /api/heightmap?...     terrain map from `sandvox --heightmap` (binary)
   GET  /api/voxregion?...     a BOX OF REAL VOXELS from `sandvox --voxserve`
   GET  /api/voxpalette        the compiled material table the viewer colours with
+  GET  /api/tuning-defaults   worldgen's COMPILED-IN defaults, from the engine
   POST /api/voxreload         re-read tuning.json + shaders in the voxel server
   GET  /api/worldedits        list assets/worldedits/*.svedit
   GET  /api/worldedit?name=   read one edit layer (binary 'SVED')
@@ -892,6 +893,44 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_blob(packed, gz=True)
         return self._send_blob(blob)
 
+    # ---- worldgen defaults -------------------------------------------------
+    #
+    # Runs `sandvox --dump-tuning-defaults`, which is a GPU-free, asset-free,
+    # tuning.json-free early exit — so like /api/heightmap it does NOT take the
+    # run mutex. There is no device to contend for.
+    #
+    # Cached on the EXE's mtime: the defaults are compiled in, so they can only
+    # change when the binary does, and the tuner asks for them every time the
+    # Worldgen tab renders.
+    _defaults_cache = {"mtime": None, "body": None}
+
+    def _tuning_defaults(self):
+        if not os.path.isfile(EXE):
+            return self._json(503, {"ok": False,
+                                    "error": "build/Release/sandvox.exe not built yet "
+                                             "— press Build"})
+        mtime = os.path.getmtime(EXE)
+        c = Handler._defaults_cache
+        if c["mtime"] == mtime and c["body"]:
+            return self._send(200, c["body"], "application/json")
+        out = os.path.join(ROOT, "build", "tuning_defaults.json")
+        try:
+            r = subprocess.run([EXE, "--dump-tuning-defaults", out],
+                               cwd=ROOT, capture_output=True, text=True, timeout=60,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            return self._json(500, {"ok": False, "error": str(e)})
+        if r.returncode != 0:
+            return self._json(500, {"ok": False,
+                                    "error": (r.stderr or r.stdout or "")[-2000:]})
+        try:
+            with open(out, "rb") as f:
+                body = f.read()
+        except OSError as e:
+            return self._json(500, {"ok": False, "error": str(e)})
+        c["mtime"], c["body"] = mtime, body
+        return self._send(200, body, "application/json")
+
     def _voxpalette(self):
         out = os.path.join(VOXTMP, "palette.json")
         os.makedirs(VOXTMP, exist_ok=True)
@@ -1038,6 +1077,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._voxregion()
         if p == "/api/voxpalette":
             return self._voxpalette()
+        if p == "/api/tuning-defaults":
+            return self._tuning_defaults()
         if p == "/api/worldedits":
             names = []
             try:

@@ -1638,6 +1638,9 @@
         </select>
       </label>
       <button id="wvToggle" title="Switch to the voxel world view">&#9635; Voxels</button>
+      <span class="tabsep"></span>
+      <button id="wgResetDefaults"
+              title="Put every terrain slider back to the engine's compiled-in default. The values come from the engine itself (--dump-tuning-defaults), not from a copy in this page.">&#8634; Reset terrain</button>
       <span class="spacer"></span>
       <span class="hint" id="wgStatus"></span>
     </div>
@@ -4380,6 +4383,74 @@ function wgWire(){
     wgRefresh(0);
   });
   $('#wvToggle').addEventListener('click',wvToggle);
+  $('#wgResetDefaults').addEventListener('click',wgResetToDefaults);
+}
+
+/* ---- reset the terrain sliders to the ENGINE's defaults ------------------
+   Not to tuneBase. The Tuning tab's existing reset reverts to the file as it
+   was LOADED, and tuneBase is refreshed on every save — so once you have saved
+   an experiment it has nothing left to revert to. "Default" here means the
+   compiled-in values in src/sim/tuning.h.
+
+   The numbers therefore come from the ENGINE, over /api/tuning-defaults, and
+   not from a table in this page. That is the one thing tuner_schema.js
+   deliberately does not carry: a stale min/max there is a cosmetic slider bug,
+   but a stale DEFAULT would write a wrong number into tuning.json, which is a
+   different world. See WorldgenDefaultsJson() in src/sim/tuning.cpp. */
+let wgDefaults=null;
+
+async function wgResetToDefaults(){
+  const st=$('#wgStatus');
+  if(!tune){if(st)st.textContent='no tuning.json loaded';return;}
+  if(!server){
+    if(st)st.textContent='reset needs the tuner server (python scripts/tuner_server.py)';
+    return;
+  }
+  try{
+    if(!wgDefaults){
+      if(st)st.textContent='asking the engine for defaults…';
+      const r=await fetch('/api/tuning-defaults');
+      if(!r.ok){
+        let m='HTTP '+r.status;
+        try{m=(await r.json()).error||m;}catch(e){}
+        throw new Error(m);
+      }
+      wgDefaults=(await r.json()).worldgen||{};
+    }
+  }catch(e){
+    if(st)st.textContent='reset failed: '+(e.message||e);
+    return;
+  }
+  // Only the SLIDERS, which is what was asked for. editLayer is a text row
+  // naming a file you authored, not a terrain parameter — wiping it would
+  // silently unload your edits, which is not what a "reset the terrain" button
+  // should do.
+  const tab=(typeof TUNING_SCHEMA!=='undefined')
+    ? TUNING_SCHEMA.find(t=>t.id==='worldgen') : null;
+  if(!tab){if(st)st.textContent='no worldgen schema';return;}
+  const changed=[];
+  for(const pr of tab.params){
+    if(pr.type==='text')continue;
+    const g=paramGroup(tab,pr);
+    const d=wgDefaults[pr.k];
+    if(d===undefined)continue;              // engine does not own this row
+    if(sameVal(getAt(tune,g,pr.k),d))continue;
+    setTuned(g,pr.k,structuredClone(d));
+    changed.push(pr.n||pr.k);
+  }
+  if(!changed.length){
+    if(st)st.textContent='already at defaults';
+    toast('worldgen already at the engine defaults');
+    return;
+  }
+  touchTune();
+  renderWorldgen();
+  if(st)st.textContent='';
+  toast('reset '+changed.length+' terrain parameter'+(changed.length===1?'':'s'));
+  // Save-then-render, the same order every other path in this tab uses: the map
+  // and the voxel view are separate PROCESSES reading tuning.json off disk, so
+  // a reset that only changed this page's copy would redraw the old world.
+  wgRefresh(0);
 }
 
 /* ================= the voxel world view =================

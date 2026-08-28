@@ -1654,6 +1654,7 @@ int main(int argc, char** argv) {
   std::string voxdumpArgs;
   std::string voxdumpOut = "build/voxregion.bin";
   bool voxserve = false;
+  std::string dumpDefaultsOut;   // --dump-tuning-defaults <path>
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -1896,6 +1897,17 @@ int main(int argc, char** argv) {
       voxdumpOut = argv[++i];
     }
     else if (a == "--voxserve") voxserve = true;
+    // --dump-tuning-defaults <path>: the worldgen group's compiled-in defaults
+    // as JSON, for the tuner's "Reset terrain" button. Reads NOTHING — not
+    // tuning.json, not a device — because the whole point is the values before
+    // any file has had a say.
+    else if (a == "--dump-tuning-defaults") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "--dump-tuning-defaults wants a path\n");
+        return 1;
+      }
+      dumpDefaultsOut = argv[++i];
+    }
     else {
       std::fprintf(stderr, "unrecognized argument: '%s'\n"
                            "Run with --help for usage.\n", a.c_str());
@@ -1924,6 +1936,31 @@ int main(int argc, char** argv) {
   // --list is pure metadata: answering it before any device or asset init
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
+
+  // --dump-tuning-defaults: the worldgen group's COMPILED-IN defaults as JSON,
+  // for the tuner's "Reset terrain" button.
+  //
+  // Answers before tuning.json is read, deliberately — and that is the whole
+  // mode. Loading the file first would hand back whatever the file already
+  // says, which is the one answer a reset button must never give. No device, no
+  // assets either, so it costs a process launch and nothing else.
+  if (!dumpDefaultsOut.empty()) {
+    const std::string js = WorldgenDefaultsJson();
+    std::error_code ec;
+    const std::filesystem::path p(dumpDefaultsOut);
+    if (p.has_parent_path())
+      std::filesystem::create_directories(p.parent_path(), ec);
+    std::ofstream f(dumpDefaultsOut, std::ios::binary);
+    if (!f) {
+      std::fprintf(stderr, "--dump-tuning-defaults: cannot write %s\n",
+                   dumpDefaultsOut.c_str());
+      return 1;
+    }
+    f.write(js.data(), (std::streamsize)js.size());
+    std::printf("worldgen defaults -> %s (%zu bytes)\n",
+                dumpDefaultsOut.c_str(), js.size());
+    return 0;
+  }
 
   // --heightmap: render a grid of World::TerrainColumn to a file and exit.
   //
