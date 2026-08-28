@@ -232,6 +232,94 @@ struct MobDef {
   }
 };
 
+// ---- per-voxel body reactivity (docs/PLAN_body_reactivity.md) --------------
+//
+// A creature is not "on fire": individual voxels of it are. The STATE that
+// takes lives here rather than on MobSystem::Limb, because a limb is not the
+// only thing that burns — PlayerAvatar::Part is the same thing under a
+// different driver (the avatar IS a MobDef; see avatar.h), and a dropped item
+// and a corpse are DebrisSystem bodies. The player must burn exactly as an NPC
+// does, and the only way to be sure of that is for there to be one
+// implementation, not two that happen to agree.
+//
+// So: the state is here, and the PASS is MobSystem::BurnOneLimb, which takes a
+// BurnLimbView over whatever struct the caller owns.
+struct BodyBurnState {
+  // Dense neighbour index over the limb's bounding box: entry = lattice index
+  // + 1, 0 = empty. Allocated the first time something reactive comes near and
+  // released when the front goes cold, because rule 2 applies to a new
+  // population exactly as it does to chunks — a creature that is not burning
+  // must cost zero, and one that is burning must cost in proportion to how much
+  // of it is alight, never to how many voxels it has.
+  //
+  // DERIVED and disposable; the sparse lattice stays authoritative. Reusing the
+  // GPU brick as this index is tempting (it IS dense) and is wrong: the brick
+  // is render-only derived data, and reading it back for sim purposes is the
+  // first step toward the unowned-diverging-representation failure.
+  IVec3 min{}, dims{};
+  std::vector<uint32_t> idx;
+  // Cells whose material carries a decay/emit rule — the voxels actually
+  // alight. Spread is pushed OUTWARD from these to their six lattice
+  // neighbours, never pulled by scanning candidates, which is what keeps the
+  // cost on the front instead of on the volume. Fire lives on a SURFACE, so
+  // this is a 2D front over a 3D body.
+  std::vector<uint32_t> front;
+  // Voxels burnt away since the last collider rebuild. That rebuild is the most
+  // expensive single operation in the feature, so it is batched hard.
+  uint32_t removed = 0;
+  // Consecutive ticks with an empty front, so a body walking in and out of a
+  // campfire does not rebuild its index every other tick.
+  uint32_t quiet = 0;
+  bool Burning() const { return !front.empty(); }
+};
+
+// One limb or part, described in the terms the burn pass needs.
+//
+// Pointers rather than a base class: MobSystem::Limb and PlayerAvatar::Part are
+// independent structs owned by different systems and neither is going to grow a
+// vtable for this. Exactly one of `skin`/`coll` is the AUTHORITATIVE lattice —
+// a body with a finer skin derives its collider from the skin by majority-fill,
+// so burning the collider would be writing to derived data and the next
+// re-derive would silently undo it.
+struct BurnLimbView {
+  std::vector<PrefabVoxel>* skin = nullptr;  // skinScale units, int16
+  std::vector<DebrisVoxel>* coll = nullptr;  // physScale units, int8
+  uint32_t scale = 1;                        // lattice units per world voxel
+  const BodyTransform* xf = nullptr;         // pose as the ANIMATION left it
+  IVec3 size{};                              // collider extents, physScale units
+  uint32_t physScale = 1;
+  int* microModel = nullptr;   // null / -1 = cube path, no brick to poke
+  bool* carved = nullptr;      // latched when the brick becomes copy-on-write
+  int* flipbook = nullptr;     // cleared on first damage; a frame swap heals
+  BodyBurnState* burn = nullptr;
+
+  size_t Size() const { return skin ? skin->size() : coll->size(); }
+  IVec3 At(size_t i) const {
+    return skin ? IVec3{(*skin)[i].x, (*skin)[i].y, (*skin)[i].z}
+                : IVec3{(*coll)[i].x, (*coll)[i].y, (*coll)[i].z};
+  }
+  uint32_t Mat(size_t i) const {
+    return skin ? (uint32_t)((*skin)[i].material & 0xFFFu)
+                : (uint32_t)((*coll)[i].payload & 0xFFFu);
+  }
+  // Rewrite a voxel's material, keeping a cosmetic variant and ZEROING the art
+  // slot. The art zero is not tidiness: microbody.wgsl lets a nonzero art
+  // colour override the material colour (a creature is one material all over
+  // and painted per voxel), so a charred voxel that kept its slot goes on being
+  // painted robe-purple — charring would be invisible on exactly the painted
+  // surfaces it matters most on.
+  void Set(size_t i, uint32_t mat, uint32_t variant) const {
+    const uint16_t w = (uint16_t)((mat & 0xFFFu) | ((variant & 3u) << 12));
+    if (skin) {
+      (*skin)[i].material = w;
+      (*skin)[i].color = 0;
+    } else {
+      (*coll)[i].payload = w;
+      (*coll)[i].color = 0;
+    }
+  }
+};
+
 // Loads assets/mobs/*.vox + matching .json sidecars. Appends problems to log;
 // defs that fail validation are skipped. Limb models of defs with "skinScale" > 1
 // are packed into `micro` (which the caller uploads); `micro` is CLEARED first,
@@ -241,14 +329,24 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
 
 class MobSystem {
  public:
+  // `reactions` is the compiled reaction table. MobSystem needs it for the
+  // same reason DebrisSystem does: limb voxels are CPU state no CA pass
+  // touches, so per-voxel burning and dissolution run the authored table on
+  // this side (sim/reactcpu.h holds the half that must not diverge).
   void Init(Physics* phys, World* world, DebrisSystem* debris,
-            const std::vector<MaterialDef>& mats);
+            const std::vector<MaterialDef>& mats,
+            const std::vector<ReactionGpu>& reactions);
   // Carving a micro limb clones its brick copy-on-write out of the SAME pool the
   // renderer uploads, so the owner hands it over once at startup (as it already
   // does for DebrisSystem). Not owned. Without it, micro limbs still take real
   // damage — they just cannot show it.
   void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
-  void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
+  void OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
+                           const std::vector<ReactionGpu>& reactions);
+  // This tick's integer day phase, so a day/night-gated reaction behaves the
+  // same on a limb as it does in the grid. Unset means night; see the same
+  // setter on DebrisSystem.
+  void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
   void Reset();                                      // world regen
@@ -266,7 +364,14 @@ class MobSystem {
   // drain here too — Sever is called from damage handling all over the frame,
   // and emitting hundreds of particles from inside it would both bypass the
   // per-tick budget and put spawn order at the mercy of hit order.
+  //
+  // `cellOps` receives the grid half of per-voxel burning: a burning limb voxel
+  // emits REAL fire into the world as a fill-air-only op, exactly as burning
+  // debris does. That is the whole "a mob on fire runs into a bush and the bush
+  // catches" mechanic, and it needs no mechanism of its own — the fire it emits
+  // is an ordinary fire voxel that spreads by ordinary CA rules.
   void PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
+               std::vector<CellOp>& cellOps,
                std::vector<ParticleSpawn>& spawns);
   // After Physics::Step: refresh limb transforms from Jolt.
   void PostStep();
@@ -472,6 +577,63 @@ class MobSystem {
   // would silently measure nothing on exactly the rigs carving matters most on.
   uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
   uint32_t LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const;
+  // ---- per-voxel burning introspection ---------------------------------------
+  // How many voxels of this limb are currently ALIGHT (carry a decay/emit rule).
+  // This is the size of the active front, and it is the number the burn gate
+  // asserts on: "an idle mob in a settled world does zero burn work" is
+  // literally "this is 0 and stays 0", and "a lone hot voxel gutters out" is
+  // "this went to 0 without the limb losing matter".
+  uint32_t LimbBurningCount(uint64_t mobId, int limbIndex) const;
+  // How many of this limb's voxels are of material `mat`. The differential the
+  // burn gate is built on — flesh charring is a MATERIAL transition, so
+  // "cooked, then burnt" is visible as counts moving between slots rather than
+  // as a state nobody can see.
+  uint32_t LimbMaterialCount(uint64_t mobId, int limbIndex, uint32_t mat) const;
+  // Set fire to up to `count` of a limb's SURFACE voxels and return how many
+  // took. The product is resolved from the reaction table (the first rule whose
+  // product is tag:hot), so a material with no path to burning — bone, steel —
+  // simply refuses, with no list of exceptions to maintain.
+  //
+  // This is the direct-ignition entry point a fire spell or a thrown torch
+  // wants; the ordinary route into burning is contact with something hot in the
+  // world, which needs no call at all.
+  // `onlyMat` restricts the choice to voxels of one material (0 = any), which
+  // is what lets a caller say "light the CLOTH" on a limb whose surface is part
+  // robe and part skin.
+  uint32_t IgniteLimb(uint64_t mobId, int limbIndex, uint32_t count,
+                      uint32_t onlyMat = 0);
+
+  // ---- the burn pass, for a limb this system does NOT own -------------------
+  //
+  // PlayerAvatar drives its own rig out of PlayerAvatar::Part, and the player
+  // has to burn exactly as an NPC does. These three are how it gets that
+  // without a second implementation: MobSystem owns the compiled reaction
+  // mirror (one table, built once on materials reload) and runs the pass over
+  // whatever lattice the caller points at.
+  //
+  // The caller keeps what is genuinely its own — how a part that burnt through
+  // is severed, how hp falls, how its collider is rebuilt — because those
+  // differ between a mob and the player and always will.
+  //
+  // Returns true if anything changed. `frontBudget`/`opsBudget` are in/out and
+  // shared across every body burning this tick (rule 2: bound the process, not
+  // each participant).
+  bool BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey, World& world,
+                   std::vector<CellOp>& cellOps, uint32_t& frontBudget,
+                   uint32_t& opsBudget);
+  uint32_t IgniteOneLimb(BurnLimbView& v, uint32_t count, uint32_t onlyMat);
+  // True once the reaction mirror has been built. A caller with no tables must
+  // not burn: it would silently do nothing rather than fail.
+  bool BurnTablesReady() const { return !reactions_.empty() && !matGpu_.empty(); }
+  // Release a body's burn index and front. Static because the ordinary reason
+  // to call it — the lattice just compacted, so every index in it moved — is
+  // the caller's business, not this system's.
+  static void DropBurnIndex(BodyBurnState& st);
+  // Return a copy-on-write brick to the shared pool. Public because the avatar
+  // allocates parts out of the SAME pool through IgniteOneLimb/BurnOneLimb and
+  // must not leak them — the pool is a hard ceiling and exhausting it is a
+  // fatal abort (sim/microbody.h). No-op on a shared model.
+  void ReleaseOwnedBrick(int& model, bool& owned);
   // World position of one of a limb's SURVIVING voxels — the `n`th, wrapped.
   // Deliberately not the centroid: once a carve has hollowed a limb, its
   // centroid is in the cavity, and a tool aimed there eats nothing. Anything
@@ -548,6 +710,10 @@ class MobSystem {
     // FRACTION of the limb rather than an absolute count. A carve that removes
     // half a scale-4 arm and half a scale-1 arm should read as the same injury.
     uint32_t voxelsAtSpawn = 0;
+
+    // Per-voxel burning / dissolution. Shared with PlayerAvatar::Part — see
+    // BodyBurnState above for why the state is not declared here.
+    BodyBurnState burn;
   };
   // Per-mob gore profile: the entity-scoped variance draws, resolved ONCE when
   // the mob is created and then held for its whole life. Every mob that is made
@@ -666,6 +832,56 @@ class MobSystem {
                              std::vector<ParticleSpawn>& spawns) const;
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY) const;
 
+  // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------
+  //
+  // The limb twin of DebrisSystem::BurnBodies, and deliberately NOT that
+  // function generalized. BurnBodies is driven by a rotating CURSOR over the
+  // whole voxel list, which is correct for a 200-voxel plank and does not
+  // survive contact with a 31,456-voxel torso — one mina is fifteen times
+  // kBurnScanPerTick all by herself. This pass is driven by an ACTIVE FRONT
+  // instead: fire lives on a surface, so the burning set of a limb is a 2D
+  // front over a 3D volume and its cost is bounded by that, not by the volume.
+  //
+  // Same RULES, different driver. Both evaluate the authored reaction table
+  // through sim/reactcpu.h, so a chance authored once behaves the same on a
+  // limb, on the severed version of that limb, and in the grid.
+  void BurnLimbs(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                 std::vector<ParticleSpawn>& spawns);
+  // The view onto one of this system's own limbs, so the mob driver and the
+  // avatar driver hand BurnOneLimb the same shape.
+  BurnLimbView ViewOf(Mob& mob, Limb& limb);
+  // Build the dense neighbour index over a limb's current lattice and seed the
+  // front from whatever is already alight. O(voxels + boundingBox), paid once
+  // when something reactive first comes near the limb.
+  void BuildBurnIndex(BurnLimbView& v);
+  // Compact the voxels this tick's burning removed out of the lattice, and
+  // (only past the batched threshold, or when `force`) re-derive the collider,
+  // rebuild the Jolt body and re-check connectivity. Returns false when the
+  // limb did not survive — severed or the mob died — in which case neither
+  // `mob` nor `limb` may be touched again.
+  //
+  // Every reader of a limb's lattice must run this first: between ticks the
+  // burn leaves the sparse arrays holding material-0 tombstones, and a carve or
+  // a sever that read them would count burnt-away matter as still present.
+  bool FlushBurn(Mob& mob, int limbIndex, World& world,
+                 std::vector<ParticleSpawn>& spawns, bool force);
+  // Drop unflushed tombstones from a limb's lattices WITHOUT the collider
+  // rebuild FlushBurn does. For the paths that are about to hand the lattice to
+  // somebody else (sever, death -> DebrisSystem::AdoptBody) and have no World
+  // to rebuild against. The collider stays fractionally fat until the debris
+  // side rebuilds it, which is the same lag body burning already accepts — but
+  // a material-0 voxel must never leave this system.
+  void StripBurnTombstones(Limb& limb);
+  // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and CarveLimb
+  // flushes before it reads the lattice. Without this the two call each other.
+  bool inBurnFlush_ = false;
+  // The material a voxel of `mat` becomes when it catches: the product of the
+  // first rule in its bucket whose product carries tag:hot. 0 = cannot burn.
+  // Resolved from the table at load, so no material id is ever named in code.
+  uint32_t IgnitedForm(uint32_t mat) const {
+    return mat < ignitedForm_.size() ? ignitedForm_[mat] : 0u;
+  }
+
   // ---- locomotion: sense -> intent -> steer -> drive -------------------------
   // Four stages, deliberately separated so an AI layer can be dropped in at
   // exactly one of them without disturbing the others. Today's "wander and
@@ -716,6 +932,38 @@ class MobSystem {
   MicroBodySet* microSet_ = nullptr;  // shared brick pool; see SetMicroSet
   std::vector<float> densityOf_;
   std::vector<uint32_t> classOf_;
+  // ---- burn tables, rebuilt on materials hot-reload --------------------------
+  // Data-driven, exactly as DebrisSystem's are: no material id is hardcoded
+  // anywhere in the burn path, so "flesh chars" and "cloth catches easily" stay
+  // facts about assets/materials/*.json and not about this file.
+  std::vector<MaterialGpu> matGpu_;
+  std::vector<ReactionGpu> reactions_;
+  std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
+  std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
+  std::vector<uint8_t> matHot_;         // carries tag:hot
+  // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound
+  // half of the world coupling and it is what makes acid work with no
+  // acid-specific code: `acid + tag:dissolvable -> neighborBecomes air` is
+  // already authored, skin/cloth/leather are already `dissolvable`, so a limb
+  // standing in acid dissolves because the grid's rule is evaluated FROM the
+  // grid cell onto the limb voxel — the same direction the GPU evaluates it.
+  std::vector<uint8_t> matRewritesNbr_;
+  // ...and the NARROWER question the wake gate asks: could that rewrite land on
+  // a BODY? Narrower because the gate is what decides whether a limb allocates
+  // its dense index at all, and `matRewritesNbr_` is far too generous for that
+  // job — `grass + tag:soil -> grass` rewrites a neighbour, grass is under
+  // every mob in the world, and gating on it would hold a dense index open for
+  // every limb of every creature standing on a lawn, forever. That is precisely
+  // the permanent per-limb allocation rule 2 forbids.
+  //
+  // "Could land on a body" is answered from the table, not from a list: every
+  // material a creature is made of carries `dissolvable`, so a rule qualifies
+  // if its neighbour predicate can match something dissolvable. tag:soil cannot;
+  // tag:dissolvable can.
+  std::vector<uint8_t> matAttacksBody_;
+  // mat -> what it becomes when it catches (see IgnitedForm).
+  std::vector<uint32_t> ignitedForm_;
+  uint32_t dayPhase_ = 0;
   std::vector<MobDef> defs_;
   std::vector<Mob> mobs_;
   uint64_t nextId_ = 1;
@@ -760,6 +1008,28 @@ class MobSystem {
   // severs. This is what makes "shoot the arm until it falls off" work through
   // pure geometry, without an hp bar deciding it.
   static constexpr float kLimbCollapseFraction = 0.25f;
+  // ---- per-voxel burning -----------------------------------------------------
+  // Front voxels examined per tick across EVERY limb of EVERY mob. A fully
+  // engulfed mob's front is a few hundred to ~2000 voxels, so this covers
+  // several burning creatures at full rate and degrades to round-robin past
+  // that rather than to a frame spike (rule 2: bound every emergent process).
+  static constexpr uint32_t kBurnFrontPerTick = 6000;
+  // Fire/ash ops all burning limbs together may push into the grid per tick.
+  static constexpr uint32_t kBurnOpsPerTick = 96;
+  // World cells ONE limb's ignition scan may look at. A limb's world AABB is
+  // order 128 cells; this is the guard against a pathological pose, not a
+  // budget anything normal comes near.
+  static constexpr uint32_t kBurnScanCells = 4096;
+  // Voxels a limb may burn away before its collider is re-derived and its Jolt
+  // body rebuilt: max(floor, voxels >> shift). The FRACTION is the point — 12
+  // voxels out of a 62-voxel dummy arm is a real shape change, 12 out of a 31k
+  // mina torso is invisible, and rebuilding Jolt every tick for the second case
+  // is what would make burning mobs the most expensive thing in the game.
+  static constexpr uint32_t kBurnRebuildFloor = 12;
+  static constexpr uint32_t kBurnRebuildShift = 6;
+  // Ticks a cold limb keeps its dense index before releasing it, so a limb
+  // walking through a campfire does not rebuild the index every other tick.
+  static constexpr uint32_t kBurnIndexGrace = 30;
   // Carve damage per voxel removed, as a fraction of the limb's authored
   // volume: losing all of a limb's matter costs this multiple of its full hp.
   // > 1 so a limb that is being visibly minced dies a little before it is

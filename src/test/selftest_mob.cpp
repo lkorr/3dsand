@@ -21,6 +21,7 @@
 #include "game/player.h"
 #include "gpu/resources.h"
 #include "sim/microbody.h"
+#include "sim/reactcpu.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -74,9 +75,9 @@ bool mobOk = false;
     uint32_t t = 6000;
     auto mobTick = [&](std::vector<BrushOp> ops) {
       std::vector<ParticleSpawn> spawns;
-      mobs.PreTick(t + 1, world, ops, spawns);
-      debris.QueueSupportEvents(world.Snap());
       std::vector<CellOp> cellOps;
+      mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
       debris.PreTick(t + 1, world, cellOps, spawns);
       ++t;
       SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
@@ -770,7 +771,7 @@ bool mobOk = false;
         debris.Reset();
         const MobDef& wd = mobs.Defs()[wizDef];
         PlayerAvatar avatar;
-        avatar.Init(&phys, &world, &debris, mats);
+        avatar.Init(&phys, &world, &debris, mats, &mobs);
         avatar.SetDefs(&mobs.Defs(), avDefName);
 
         int h2 = World::TerrainHeight(140, 140, kDefaultSeed);
@@ -791,9 +792,9 @@ bool mobOk = false;
         auto avTick = [&]() {
           std::vector<BrushOp> ops;
           std::vector<ParticleSpawn> spawns;
-          avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, spawns);
-          debris.QueueSupportEvents(world.Snap());
           std::vector<CellOp> cellOps;
+          avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+          debris.QueueSupportEvents(world.Snap());
           debris.PreTick(t + 1, world, cellOps, spawns);
           ++t;
           SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps,
@@ -1712,10 +1713,502 @@ bool mobOk = false;
   return mobOk ? Status::Pass : Status::Fail;
 }
 
+// ---- mob-burn: per-voxel body reactivity ---------------------------------
+// docs/PLAN_body_reactivity.md. A mob is not "on fire": individual voxels of it
+// are, cloth catches far more readily than flesh, flesh chars through a chain
+// of materials, and a limb in acid dissolves through the same front with a
+// different source.
+//
+// Six claims, ordered by how much each would cost if it broke silently. A and F
+// are the two no amount of looking at the screen would catch.
+Status GateMobBurn(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  MobSystem& mobs = c.mobs;
+  DebrisSystem& debris = c.debris;
+  const std::vector<MaterialDef>& mats = c.mats;
+  bool ok = true;
+
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mFire = matId("fire"), mAcid = matId("acid"),
+                 mCloth = matId("robe_cloth"),
+                 mClothBurn = matId("cloth_burning"),
+                 mClothChar = matId("cloth_charred"), mSkin = matId("skin"),
+                 mCooked = matId("flesh_cooked"),
+                 mCharred = matId("flesh_charred"),
+                 mBurning = matId("flesh_burning");
+  if (!mFire || !mAcid || !mCloth || !mSkin || !mCooked || !mBurning) {
+    detail = "body-reactivity materials missing from materials.json";
+    return Status::Fail;
+  }
+
+  // ---- A. the neighbour-count ramp reaches the CPU mirror -------------------
+  // THE assertion of the whole feature, and the one nothing else stands in for.
+  // `scaleByNeighbors` is what makes a lone hot voxel gutter out while a wide
+  // front races, and the CPU side of the reaction table ignored `cond` entirely
+  // until sim/reactcpu.h — so an authored minCount silently did nothing on the
+  // one population it was written for. Asserted twice: on the arithmetic, and
+  // on what the author actually WROTE, because a correct ramp applied to a rule
+  // that lost its minCount in authoring is the same bug in a different hat.
+  {
+    ReactionGpu r{};
+    r.chance = 100;
+    r.nbrMat = kNbrAny;
+    r.cond = kScaleEnable | ((3u - 1u) << kScaleMinShift) |
+             (((uint32_t)(4.0f * (float)kScaleMulUnit + 0.5f) - kScaleMulUnit)
+              << kScaleMulShift);
+    const bool gate = ReactScaledChance(r, 0) == 0 &&
+                      ReactScaledChance(r, 1) == 0 &&
+                      ReactScaledChance(r, 2) == 0 && ReactScaledChance(r, 3) > 0;
+    const bool ramp =
+        ReactScaledChance(r, 6) == 400 && ReactScaledChance(r, 3) == 220;
+    ReactionGpu plain{};
+    plain.chance = 100;
+    const bool unscaled = ReactScaledChance(plain, 0) == 100;
+
+    // ...and the authored rule: flesh must not be ignitable below three hot
+    // faces. If somebody softens this, the differential in B stops meaning
+    // anything, and this line is what says so.
+    uint32_t authoredMin = 0;
+    const MaterialGpu& cg = mats[mCooked].gpu;
+    for (uint32_t i = 0; i < cg.reactCount; i++) {
+      const ReactionGpu& rr = c.reactions[cg.reactOffset + i];
+      if ((rr.prodSelf & 0xFFFu) == mBurning && ReactScaleArmed(rr))
+        authoredMin = ((rr.cond >> kScaleMinShift) & kScaleMinMask) + 1u;
+    }
+    const bool a = gate && ramp && unscaled && authoredMin >= 3;
+    std::printf(
+        "  burn ramp: %s (gate %d ramp %d plain %d, authored minCount %u)\n",
+        a ? "PASS" : "FAIL", gate ? 1 : 0, ramp ? 1 : 0, unscaled ? 1 : 0,
+        authoredMin);
+    // Attribution, not elimination: if the authored rule is not where this
+    // expects it, print the bucket rather than leave the next reader guessing
+    // which of "wrong id", "wrong offset" and "rule dropped at load" it was.
+    if (!a) {
+      std::printf("    flesh_cooked id %u bucket %u+%u -> flesh_burning id %u, "
+                  "table %zu\n",
+                  mCooked, cg.reactOffset, cg.reactCount, mBurning,
+                  c.reactions.size());
+      for (uint32_t i = 0; i < cg.reactCount; i++) {
+        const ReactionGpu& rr = c.reactions[cg.reactOffset + i];
+        std::printf("    rule %u: kind %u prodSelf %u cond 0x%08x\n", i,
+                    rr.packed & 3u, rr.prodSelf & 0xFFFu, rr.cond);
+      }
+    }
+    ok = ok && a;
+  }
+
+  int wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == "wizard") wizDef = (int)i;
+  if (wizDef < 0) {
+    detail = "no wizard def (the fixture: robe_cloth over skin on one rig)";
+    return Status::Fail;
+  }
+  const int nLimbs = (int)mobs.Defs()[wizDef].limbs.size();
+  const int rootLimb = mobs.Defs()[wizDef].rootLimb;
+
+  // Whole-creature material census. Per-limb counts are the honest unit, but
+  // the interesting facts are about the CREATURE, and which limb the fire
+  // happened to reach first is not a property worth pinning a test to.
+  auto census = [&](uint64_t id, uint32_t mat) {
+    uint32_t n = 0;
+    for (int li = 0; li < nLimbs; li++) n += mobs.LimbMaterialCount(id, li, mat);
+    return n;
+  };
+  auto burning = [&](uint64_t id) {
+    uint32_t n = 0;
+    for (int li = 0; li < nLimbs; li++) n += mobs.LimbBurningCount(id, li);
+    return n;
+  };
+
+  uint32_t t = 12000;
+  uint32_t mobFireOps = 0;
+  // The residency window follows this. It is set per fixture rather than left
+  // at the origin because a mob outside the window DESPAWNS: with the window at
+  // chunk y 0 and the wizard standing at terrain height, every census below
+  // read zero and every assertion failed for a reason that had nothing to do
+  // with burning (CLAUDE.md: anchor a fixture, never write an absolute Y).
+  IVec3 pchunk{10, 0, 10};
+  // One tick of the real thing. `soakMat` fills the mob's own box every tick (a
+  // sustained blaze, or a bath of acid). The ops the MOB emitted are counted
+  // BEFORE the fixture adds its own, so "the limb emitted fire into the grid"
+  // cannot be satisfied by the fixture's own writes.
+  auto burnTick = [&](uint64_t id, uint32_t soakMat, int soakUp) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+    for (const CellOp& op : cellOps)
+      if ((op.word & 0xFFFu) == mFire) mobFireOps++;
+    if (soakMat) {
+      const Vec3 at = mobs.LimbVoxelPos(id, rootLimb, 0);
+      const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+      for (int dy = -8; dy <= soakUp; dy++)
+        for (int dz = -3; dz <= 3; dz++)
+          for (int dx = -3; dx <= 3; dx++) {
+            const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+            if (!world.CellInWindow(cc)) continue;
+            if (cellOps.size() >= kMaxCellOpsPerTick) break;
+            cellOps.push_back({World::SlotCellIndex(cc),
+                               PackVoxNew(soakMat, 7u) | kCellOpIfAir});
+          }
+    }
+    debris.QueueSupportEvents(world.Snap());
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
+               pchunk, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    debris.PostStep();
+    mobs.PostStep();
+  };
+
+  // ---- D. an idle mob in a settled world does zero burn work ---------------
+  // Rule 2, stated for a new population. It runs FIRST, on a clean world,
+  // because it is the one claim a fire lit earlier would make untestable.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int h = World::TerrainHeight(170, 170, kDefaultSeed);
+    pchunk = IVec3{170 / 16, h / 16, 170 / 16};
+    const uint64_t id = mobs.Spawn(wizDef, {170, h + 1, 170});
+    if (id) {
+      const uint32_t cloth0 = census(id, mCloth), skin0 = census(id, mSkin);
+      const uint32_t fireOps0 = mobFireOps;
+      for (int i = 0; i < 30; i++) burnTick(id, 0, 0);
+      const uint32_t idleFront = burning(id);
+      const uint32_t idleOps = mobFireOps - fireOps0;
+      const bool idle = idleFront == 0 && idleOps == 0 &&
+                        census(id, mCloth) == cloth0 &&
+                        census(id, mSkin) == skin0;
+      std::printf("  idle mob: %s (front %u, ops %u, cloth %u, skin %u)\n",
+                  idle ? "PASS" : "FAIL", idleFront, idleOps, cloth0, skin0);
+                  std::fflush(stdout);
+      ok = ok && idle;
+    } else {
+      std::printf("  idle mob: FAIL (spawn refused)\n");
+      ok = false;
+    }
+    mobs.Reset();
+  }
+
+  // ---- B + C + F. cloth vs flesh in a real fire ----------------------------
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int h = World::TerrainHeight(200, 200, kDefaultSeed);
+    pchunk = IVec3{200 / 16, h / 16, 200 / 16};
+    const uint64_t id = mobs.Spawn(wizDef, {200, h + 1, 200});
+    if (!id) {
+      detail = "spawn refused";
+      return Status::Fail;
+    }
+    const uint32_t cloth0 = census(id, mCloth), skin0 = census(id, mSkin);
+    const uint32_t fireOps0 = mobFireOps;
+    for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto the ground
+
+    // SAMPLED EVERY TICK, not read at the end. A wizard held in a bonfire for
+    // five seconds burns to death, at which point the mob is gone and every
+    // census reads zero — so an end-state comparison reports "cloth 100%, skin
+    // 100%" and proves nothing. What "cloth catches more readily" actually
+    // means is a RATE, so the measurement is the tick each material first
+    // halved on, taken while the creature is still there to measure.
+    const int kBlaze = 150, kNever = 1 << 20;
+    int clothHalf = kNever, skinHalf = kNever, aliveTicks = 0;
+    uint32_t peakFront = 0, peakAlight = 0, peakCharred = 0;
+    uint32_t lastCloth = cloth0, lastSkin = skin0;
+    for (int i = 0; i < kBlaze; i++) {
+      burnTick(id, mFire, 18);
+      const uint32_t cl = census(id, mCloth), sk = census(id, mSkin);
+      const uint32_t alight = census(id, mClothBurn) + census(id, mBurning);
+      const uint32_t charred = census(id, mClothChar) + census(id, mCooked) +
+                               census(id, mCharred);
+      if (cl + sk + alight + charred == 0) break;  // creature consumed
+      aliveTicks = i + 1;
+      lastCloth = cl;
+      lastSkin = sk;
+      peakFront = std::max(peakFront, burning(id));
+      peakAlight = std::max(peakAlight, alight);
+      peakCharred = std::max(peakCharred, charred);
+      if (clothHalf == kNever && cloth0 && cl * 2 < cloth0) clothHalf = i;
+      if (skinHalf == kNever && skin0 && sk * 2 < skin0) skinHalf = i;
+    }
+    const uint32_t emitted = mobFireOps - fireOps0;
+
+    // B: cloth goes first, and by a margin. Both the halving order and the
+    // remaining fractions are asserted — the order alone would pass on a rig
+    // where nothing burned at all and both stayed at "never".
+    const float clothLost =
+        cloth0 ? (float)(cloth0 - lastCloth) / (float)cloth0 : 0.0f;
+    const float skinLost =
+        skin0 ? (float)(skin0 - lastSkin) / (float)skin0 : 0.0f;
+    const bool bOk = cloth0 > 0 && skin0 > 0 && clothHalf < kNever &&
+                     clothHalf < skinHalf && clothLost > skinLost;
+    std::printf(
+        "  cloth vs flesh: %s (cloth halved at t+%d, skin at t+%s; %.0f%% vs "
+        "%.0f%% gone after %d ticks)\n",
+        bOk ? "PASS" : "FAIL", clothHalf,
+        skinHalf == kNever ? "never" : std::to_string(skinHalf).c_str(),
+        clothLost * 100.0f, skinLost * 100.0f, aliveTicks);
+    ok = ok && bOk;
+
+    // The chain is MATERIAL identity, so a state that never appears is a state
+    // that does not exist. Charring being invisible on painted surfaces is a
+    // real failure mode (a nonzero art slot overrides the material colour), and
+    // these counts are what would still show the transition happened.
+    const bool chainOk = peakAlight > 0 && peakCharred > 0;
+    std::printf("  burn chain: %s (peak %u alight, peak %u cooked/charred)\n",
+                chainOk ? "PASS" : "FAIL", peakAlight, peakCharred);
+                std::fflush(stdout);
+    ok = ok && chainOk;
+
+    // C: the grid half. A burning mob that emits no fire cannot light the bush
+    // it runs into, which is the whole reason this lives in the CA rather than
+    // as a status effect on the creature.
+    const bool cOk = emitted > 5;
+    std::printf("  fire into grid: %s (%u fire ops emitted by limbs)\n",
+                cOk ? "PASS" : "FAIL", emitted);
+                std::fflush(stdout);
+    ok = ok && cOk;
+
+    // F: it TERMINATES. Take the fire away and the front must reach zero. A
+    // burn that sustains itself is rule 2 broken — the mob would never settle,
+    // and neither would the chunks it walks through.
+    uint32_t settleTicks = 0;
+    for (int i = 0; i < 400; i++) {
+      burnTick(id, 0, 0);
+      settleTicks++;
+      if (burning(id) == 0) break;
+    }
+    const uint32_t finalFront = burning(id);
+    // The mob may already have burned to death, in which case the front is
+    // trivially zero — say so, so a vacuous pass is visible rather than
+    // comforting. The corpse's own termination is subtest G's business.
+    const bool fOk = finalFront == 0;
+    std::printf(
+        "  burn terminates: %s (peak front %u -> %u after %u ticks, %s)\n",
+        fOk ? "PASS" : "FAIL", peakFront, finalFront, settleTicks,
+        aliveTicks >= kBlaze ? "creature survived" : "creature was consumed");
+    ok = ok && fOk;
+    mobs.Reset();
+    debris.Reset();
+  }
+
+  // ---- G. a SEVERED burning limb keeps burning, and so does a corpse -------
+  // DebrisSystem::BurnBodies refused micro bodies outright until this package,
+  // for two reasons that had both expired: the copy-on-write brick pool shipped
+  // (so a per-body edit is visible) and the pass now divides body-local
+  // coordinates by the lattice scale instead of mapping them straight onto
+  // world cells. Every limb of every rig with skinScale > 1 becomes a micro
+  // body the instant it is severed or its owner dies — so while that skip was
+  // in place, cutting off a burning arm put the fire out, and a corpse could
+  // lie in a bonfire indefinitely. Counted on the authoritative lattice
+  // (TotalBodyVoxels), because a micro body emits no cube instances to count.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int h = World::TerrainHeight(260, 260, kDefaultSeed);
+    pchunk = IVec3{260 / 16, h / 16, 260 / 16};
+    const uint64_t id = mobs.Spawn(wizDef, {260, h + 1, 260});
+    uint32_t adopted = 0, before = 0, after = 0, bodies = 0;
+    if (id) {
+      for (int i = 0; i < 12; i++) burnTick(id, 0, 0);
+      // Light the whole creature, then kill it: the corpse hands every limb to
+      // DebrisSystem, fire and all.
+      for (int li = 0; li < nLimbs; li++) mobs.IgniteLimb(id, li, 40);
+      for (int i = 0; i < 30; i++) burnTick(id, mFire, 18);
+      // Severing the ROOT limb is death (Sever routes root/vital to Die), which
+      // is the path that hands every limb to DebrisSystem.
+      mobs.Sever(id, rootLimb);
+      for (int i = 0; i < 3; i++) burnTick(0, 0, 0);
+      adopted = debris.BodyCount();
+      before = debris.TotalBodyVoxels();
+      for (int i = 0; i < 120; i++) burnTick(0, 0, 0);
+      after = debris.TotalBodyVoxels();
+      bodies = debris.BodyCount();
+    }
+    const bool gOk = adopted > 0 && before > 0 && after < before;
+    std::printf("  corpse burns: %s (%u bodies adopted, %u -> %u voxels, %u "
+                "bodies left)\n",
+                gOk ? "PASS" : "FAIL", adopted, before, after, bodies);
+                std::fflush(stdout);
+    ok = ok && gOk;
+    mobs.Reset();
+    debris.Reset();
+  }
+
+  // ---- E. acid dissolves a limb (package C: same front, different source) --
+  // Nothing acid-specific was written for this. `acid + tag:dissolvable ->
+  // neighborBecomes air` is an old rule, skin/cloth/leather are already
+  // `dissolvable`, and the burn pass evaluates a WORLD neighbour's rules onto
+  // the limb — the same direction the GPU evaluates them. If this fails, that
+  // inbound half is gone and acid quietly stops touching creatures at all.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int h = World::TerrainHeight(230, 230, kDefaultSeed);
+    pchunk = IVec3{230 / 16, h / 16, 230 / 16};
+    const uint64_t id = mobs.Spawn(wizDef, {230, h + 1, 230});
+    uint32_t before = 0, after = 0;
+    if (id) {
+      for (int i = 0; i < 10; i++) burnTick(id, 0, 0);
+      for (int li = 0; li < nLimbs; li++) before += mobs.LimbVoxelCount(id, li);
+      for (int i = 0; i < 120; i++) burnTick(id, mAcid, 4);
+      for (int li = 0; li < nLimbs; li++) after += mobs.LimbVoxelCount(id, li);
+    }
+    const bool eOk = id != 0 && before > 0 && after < before;
+    std::printf("  acid dissolves: %s (%u -> %u collider voxels)\n",
+                eOk ? "PASS" : "FAIL", before, after);
+                std::fflush(stdout);
+    ok = ok && eOk;
+    mobs.Reset();
+    debris.Reset();
+  }
+
+  // ---- H. THE PLAYER burns, by the same rules and the same code -----------
+  // The avatar is a MobDef with a different driver, and it keeps its own rig in
+  // PlayerAvatar::Part rather than MobSystem::Limb — so "mobs burn" does not
+  // imply "you burn", and the two could drift apart in exactly the way that is
+  // invisible until someone notices they are immune to their own fireball.
+  // They cannot drift here because there is one pass (MobSystem::BurnOneLimb)
+  // and PlayerAvatar drives it; this asserts that the wiring is live.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    // The def the GAME actually uses, never a hardcoded name: a test pinned to
+    // the old one would keep passing against a character nobody plays.
+    const std::string avDefName = kAvatarDefName;
+    int avDef = -1;
+    for (size_t i = 0; i < mobs.Defs().size(); i++)
+      if (mobs.Defs()[i].name == avDefName) avDef = (int)i;
+    const int h = World::TerrainHeight(300, 300, kDefaultSeed);
+    pchunk = IVec3{300 / 16, h / 16, 300 / 16};
+    PlayerAvatar avatar;
+    avatar.Init(&c.phys, &world, &debris, mats, &mobs);
+    if (avDef >= 0) avatar.SetDefs(&mobs.Defs(), avDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{300.5f, (float)(h + 2) + Player::kHalfY, 300.5f};
+    const bool spawned = avDef >= 0 && avatar.Spawn(pl, 0.0f);
+    const int nParts = spawned ? (int)mobs.Defs()[avDef].limbs.size() : 0;
+    auto avCensus = [&](uint32_t mat) {
+      uint32_t n = 0;
+      for (int i = 0; i < nParts; i++) n += avatar.PartMaterialCount(i, mat);
+      return n;
+    };
+    auto avBurning = [&]() {
+      uint32_t n = 0;
+      for (int i = 0; i < nParts; i++) n += avatar.PartBurningCount(i);
+      return n;
+    };
+    uint32_t avFireOps = 0;
+    auto avTick = [&](uint32_t soakMat) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+      for (const CellOp& op : cellOps)
+        if ((op.word & 0xFFFu) == mFire) avFireOps++;
+      if (soakMat) {
+        const IVec3 b{300, h + 1, 300};
+        for (int dy = -2; dy <= 18; dy++)
+          for (int dz = -3; dz <= 3; dz++)
+            for (int dx = -3; dx <= 3; dx++) {
+              const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+              if (!world.CellInWindow(cc)) continue;
+              if (cellOps.size() >= kMaxCellOpsPerTick) break;
+              cellOps.push_back({World::SlotCellIndex(cc),
+                                 PackVoxNew(soakMat, 7u) | kCellOpIfAir});
+            }
+      }
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(t + 1, world, cellOps, spawns);
+      ++t;
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
+                 pchunk, true, false, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      c.phys.Step(kTickDt);
+      debris.PostStep();
+      avatar.PostStep();
+    };
+
+    uint32_t idleFront = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
+    float clothLost = 0;
+    if (spawned) {
+      for (int i = 0; i < 10; i++) avTick(0);
+      idleFront = avBurning();            // an idle player must cost nothing
+      cloth0 = avCensus(mCloth);
+      uint32_t lastCloth = cloth0;
+      for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
+        avTick(mFire);
+        const uint32_t cl = avCensus(mCloth);
+        if (cl) lastCloth = cl;
+        peakAlight = std::max(peakAlight,
+                              avCensus(mClothBurn) + avCensus(mBurning));
+        peakChar = std::max(peakChar, avCensus(mClothChar) + avCensus(mCooked) +
+                                          avCensus(mCharred));
+      }
+      clothLost = cloth0 ? (float)(cloth0 - lastCloth) / (float)cloth0 : 0.0f;
+    }
+    const bool hOk = spawned && idleFront == 0 && cloth0 > 0 &&
+                     clothLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
+                     avFireOps > 0;
+    uint32_t indexed = 0;
+    for (int i = 0; i < nParts; i++) indexed += avatar.PartBurnIndexCells(i);
+    // `indexed cells` is the number that localizes a failure here: 0 means the
+    // pass never even saw anything reactive next to the player (a CPU-mirror
+    // problem), non-zero with nothing alight means it saw and did not react (a
+    // rules problem). They have completely different causes.
+    std::printf("  player burns: %s (idle front %u, cloth %u -> %.0f%% gone, "
+                "peak %u alight / %u charred, %u fire ops; %d parts, %u bodies,"
+                " %u indexed cells)\n",
+                hOk ? "PASS" : "FAIL", idleFront, cloth0, clothLost * 100.0f,
+                peakAlight, peakChar, avFireOps, nParts,
+                avatar.LimbBodyCount(), indexed);
+                std::fflush(stdout);
+    ok = ok && hOk;
+    avatar.Despawn();
+    mobs.Reset();
+    debris.Reset();
+  }
+
+  // Leave the world as this gate found it: the fires and acid above are real
+  // grid state, and the gates after this one place fixtures by absolute
+  // coordinate (CLAUDE.md rule 7).
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  detail = Format("%u fire ops from limbs", mobFireOps);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
-  static const std::vector<Gate> g = {};
+  static const std::vector<Gate> g = {
+      // Per-voxel body reactivity. No render: every claim is a count.
+      {"mob-burn", "mob", {}, false, GateMobBurn, /*needsRender=*/false},
+  };
   return g;
 }
 

@@ -2229,6 +2229,121 @@
           "swayScale": 1.0
         }
       }
+    },
+    {
+      "//": "BODY REACTIVITY (docs/PLAN_body_reactivity.md). Burn state is encoded as MATERIAL IDENTITY -- skin -> flesh_cooked -> flesh_burning -> flesh_charred -> ash -- rather than as a side table or a spare bit. The micro-body voxel is 16 bits and fully spent (8 material + 8 art colour), and there is nothing to widen; encoding the state as a material instead needs zero engine change, renders correctly for free because each stage authors its own colour and emission, and keeps the behaviour in JSON where DESIGN.md §6 wants it. SEARED, not burning: a creature can be cooked without being destroyed, which is the readability win wounds already argue for.",
+      "id": "flesh_cooked",
+      "class": "solid",
+      "density": 1000,
+      "hardness": 7,
+      "rubble": "blood",
+      "colors": [
+        "#a86a4a",
+        "#96593d",
+        "#b87a58"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Flesh actively on fire. tag:hot is the whole point: this voxel is now a heat SOURCE, so it ignites the flesh next to it, lights the grass the mob is standing in, and boils water -- through the ordinary reaction table, with no mob-specific fire code anywhere.",
+      "id": "flesh_burning",
+      "class": "solid",
+      "density": 900,
+      "hardness": 4,
+      "rubble": "ash",
+      "emission": 170,
+      "colors": [
+        "#c2431f",
+        "#9c3315",
+        "#d95c28"
+      ],
+      "tags": [
+        "hot",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Burnt-through flesh: spent fuel, and STRUCTURALLY WEAK. hardness 3 against skin's 8 means a charred limb shatters under a blow a healthy one shrugs off -- emergent, out of the material table, with no damage multiplier to author. Deliberately NOT tagged flammable: it re-ignites only through its own high-minCount rule, so a burnt corpse does not smoulder forever.",
+      "id": "flesh_charred",
+      "class": "solid",
+      "density": 620,
+      "hardness": 3,
+      "rubble": "ash",
+      "colors": [
+        "#3a2f2a",
+        "#2c2320",
+        "#4a3c34"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Cloth alight. Shared by every fabric (robe_cloth/trim/shadow) and by leather, so the burn character is authored ONCE and a new fabric inherits it by naming this as its product.",
+      "id": "cloth_burning",
+      "class": "solid",
+      "density": 300,
+      "hardness": 2,
+      "rubble": "ash",
+      "emission": 200,
+      "colors": [
+        "#ff8a2a",
+        "#e05c15",
+        "#ffb347"
+      ],
+      "tags": [
+        "hot",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "What is left of a garment that burned: holes, and scorched rag around them. Low hardness for the same reason flesh_charred has it.",
+      "id": "cloth_charred",
+      "class": "solid",
+      "density": 260,
+      "hardness": 2,
+      "rubble": "ash",
+      "colors": [
+        "#2e2a2a",
+        "#232020",
+        "#3d3736"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Hair burns first, fast, and leaves nothing -- the visual read of 'that caught, briefly and violently' for one material and three rules.",
+      "id": "hair_burning",
+      "class": "solid",
+      "density": 260,
+      "hardness": 1,
+      "rubble": "ash",
+      "emission": 220,
+      "colors": [
+        "#ffc04a",
+        "#ff8a2a",
+        "#ffe08a"
+      ],
+      "tags": [
+        "hot",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

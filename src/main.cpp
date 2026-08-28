@@ -1214,9 +1214,9 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   auto mobTick = [&]() {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
-    mobs.PreTick(t + 1, world, ops, spawns);
-    debris.QueueSupportEvents(world.Snap());
     std::vector<CellOp> cellOps;
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+    debris.QueueSupportEvents(world.Snap());
     debris.PreTick(t + 1, world, cellOps, spawns);
     ++t;
     SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
@@ -2036,7 +2036,7 @@ int main(int argc, char** argv) {
         return 1;
       Physics stPhys; stPhys.Init();
       DebrisSystem stDebris; stDebris.Init(&stPhys, &stWorld, m, rx);
-      MobSystem stMobs; stMobs.Init(&stPhys, &stWorld, &stDebris, m);
+      MobSystem stMobs; stMobs.Init(&stPhys, &stWorld, &stDebris, m, rx);
       MicroBodySet stMbSet;
       stDebris.SetMicroSet(&stMbSet);
       stMobs.SetMicroSet(&stMbSet);
@@ -2054,7 +2054,8 @@ int main(int argc, char** argv) {
         stStream.OnMaterialsReloaded(m);
         selftest::Options so;
         if (rebaseline) so.rebaseline = true;
-        selftest::Ctx sc{stCtx, stWorld, stSim, m, stPhys, stDebris, stMobs, stStream, stItems};
+        selftest::Ctx sc{stCtx,  stWorld, stSim,  m,       rx,
+                         stPhys, stDebris, stMobs, stStream, stItems};
         int r3 = selftest::Run(sc, so);
         if (r3 != 0) failures++;
       }
@@ -2190,7 +2191,7 @@ int main(int argc, char** argv) {
   DebrisSystem debris;
   debris.Init(&phys, &world, mats, reactions);
   MobSystem mobs;
-  mobs.Init(&phys, &world, &debris, mats);
+  mobs.Init(&phys, &world, &debris, mats, reactions);
   // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
   // straight after: they are per-DEF art, shared by every instance. The set
   // persists past load because the sphere spawner packs 2x-detail ball models
@@ -2323,7 +2324,8 @@ int main(int argc, char** argv) {
 
   if (selftest) {
     if (stOpt.list) return selftest::List();
-    selftest::Ctx sc{ctx, world, sim, mats, phys, debris, mobs, stream, items};
+    selftest::Ctx sc{ctx,   world,  sim,    mats,  reactions,
+                     phys,  debris, mobs,   stream, items};
     return selftest::Run(sc, stOpt);
   }
 
@@ -2429,7 +2431,7 @@ int main(int argc, char** argv) {
   // the player character is data, not code.  F5 re-reads it.
   std::string avatarDefName = CurrentTuning().player.model;
   PlayerAvatar avatar;
-  avatar.Init(&phys, &world, &debris, mats);
+  avatar.Init(&phys, &world, &debris, mats, &mobs);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
   ThirdPersonRig tpRig;
   CameraMode camMode = CameraMode::First;
@@ -3080,7 +3082,7 @@ int main(int argc, char** argv) {
         // mob defs too (tuning dummy.json live is the test loop); live mobs
         // reference the old defs by index, so they respawn fresh
         mobs.Reset();
-        mobs.OnMaterialsReloaded(mats);
+        mobs.OnMaterialsReloaded(mats, reactions);
         std::vector<MobDef> mobDefs;
         std::string mlog;
         // rebuild the shared micro pool from scratch: model indices die here,
@@ -3646,10 +3648,20 @@ int main(int argc, char** argv) {
       // its 4096-op budget are global, so a single list is what keeps the two
       // systems honest about the shared limit.
       std::vector<ParticleSpawn> spawns;
+      // Declared here rather than beside debris.PreTick because per-voxel limb
+      // burning emits REAL fire voxels into the grid, and mobs run first.
+      std::vector<CellOp> cellOps;
+
+      // The day phase both body-burn passes gate their reactions on, taken
+      // from the ONE function that also puts it on TickParams — see
+      // sim/reactcpu.h for why the CPU has to agree with the GPU here.
+      mobs.SetDayPhase(DayPhaseNow(tick));
+      debris.SetDayPhase(DayPhaseNow(tick));
 
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
-      // bleeding ops — must run before debris.PreTick consumes the anchors
-      mobs.PreTick(tick, world, ops, spawns);
+      // bleeding ops, per-voxel burning — must run before debris.PreTick
+      // consumes the anchors
+      mobs.PreTick(tick, world, ops, cellOps, spawns);
 
       // ---- player avatar ----
       // Same slot in the tick order as mobs, and for the same reason: it
@@ -3736,6 +3748,7 @@ int main(int argc, char** argv) {
         }
         if (avatar.Spawned())
           avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
+                         cellOps,
                          spawns);
         // Dead avatar: hold the corpse for respawnDelay, then rebuild it.
         // The parts are already DebrisSystem's by then, so the corpse stays
@@ -3914,7 +3927,6 @@ int main(int argc, char** argv) {
       debris.QueueSupportEvents(world.Snap());
       // island detection results + body burn + terrain collision upkeep
       // (may add cell ops and particle spawns from shattered bodies)
-      std::vector<CellOp> cellOps;
       debris.PreTick(tick, world, cellOps, spawns);
       // ---- fluid lab scene driver (lab/lab.h) ----
       // Advances the scene clock once per SIM tick (never per frame): the
@@ -4823,11 +4835,10 @@ int main(int argc, char** argv) {
       // Damaged micro bodies edited their bricks (copy-on-write) this tick, so
       // the shared pool has to reach the GPU before the march reads it. One
       // upload per tick regardless of how many bodies were hit — the flag is
-      // set by every edit and cleared here.
-      if (debris.MicroDirty()) {
-        sim.UploadMicroBodies(ctx.queue, mbSet);
-        mbSet.dirty = false;
-      }
+      // set by every edit and cleared by UploadMicroBodies itself, which also
+      // sends only the WORD RANGES that changed (per-voxel burning dirties the
+      // pool every tick, and the whole pool is 4 MiB).
+      if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
       BodyRegistry bodyReg(debris, mobs, &avatar);
       if (bodyReg.AnyInstancesDirty()) {
         std::vector<BodyVoxInst> inst;

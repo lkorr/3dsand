@@ -51,6 +51,10 @@ struct Ctx {
   World& world;
   Simulation& sim;
   const std::vector<MaterialDef>& mats;
+  // The COMPILED reaction table. A gate that asserts on authored behaviour
+  // ("flesh needs three hot faces") has to be able to read what the author
+  // actually wrote, or it is really only asserting on its own fixture.
+  const std::vector<ReactionGpu>& reactions;
   Physics& phys;
   DebrisSystem& debris;
   MobSystem& mobs;

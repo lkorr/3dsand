@@ -43,6 +43,16 @@ double NowSeconds();
 uint32_t TicksPerDay(const Tuning& t);
 SkyState SkyForTick(const Tuning& t, uint32_t tick);
 
+// The integer day phase for `tick`, EXACTLY as SubmitTick puts it on
+// TickParams.dayPhase (celestial clock, freeze override and all).
+//
+// Exposed because the CPU reaction mirror (sim/reactcpu.h) has to gate a
+// day/night-conditioned rule on the same value the GPU does, and the systems
+// that run it -- DebrisSystem::BurnBodies, MobSystem::BurnLimbs -- run BEFORE
+// SubmitTick in the tick order. Restating the expression at the second call
+// site is the ordinary way for two places to stop agreeing.
+uint32_t DayPhaseNow(uint32_t tick);
+
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
 void WriteRenderParams(const rhi::Queue& queue, const World& world,

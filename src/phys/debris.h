@@ -146,6 +146,10 @@ class DebrisSystem {
   // Micro bodies must allocate out of the same set the renderer uploads, so
   // the owner hands it over once at startup. Not owned.
   void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
+  // This tick's integer day phase, so a day/night-gated reaction behaves the
+  // same on a body as it does in the grid (sim/reactcpu.h). Set it wherever the
+  // tick's dayPhase is already computed; leaving it unset means night.
+  void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
 
   // Once per tick AFTER Physics::Step: refresh transforms, cull fallen /
   // excess bodies.
@@ -163,6 +167,19 @@ class DebrisSystem {
   void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const;
   uint32_t InstanceCount() const { return instanceCount_; }
   uint32_t BodyCount() const { return (uint32_t)bodies_.size(); }
+  // Voxels across every body, counted on each one's AUTHORITATIVE lattice.
+  //
+  // The obvious alternative — counting the cube instances BuildInstances emits
+  // — measures nothing at all on a micro body, which emits none: it renders as
+  // one OBB with a brick marched inside it. So a test that watched instance
+  // counts to see a corpse burn away would watch a number that was zero before
+  // the fire started (the burn subtests in selftest_mob.cpp).
+  uint32_t TotalBodyVoxels() const {
+    uint32_t n = 0;
+    for (const Body& b : bodies_)
+      n += (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size() : b.voxels.size());
+    return n;
+  }
   // Physics handle of body `i`. Damage rebuilds a body's collider, which
   // REPLACES its handle, so anything holding one across a damage call (the
   // selftest's repeated laser kerf) must re-read it here. 0 if out of range.
@@ -386,6 +403,13 @@ class DebrisSystem {
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // material has decay/emit rules
   std::vector<uint8_t> matHasPair_;     // material has pair rules
+  std::vector<uint8_t> matHasScaled_;   // material has scaleByNeighbors rules
+  // Integer day phase for the current tick, mirroring TickParams.dayPhase, so
+  // the CPU reaction mirror can evaluate a rule's day/night gate exactly as
+  // sim_step.wgsl does (sim/reactcpu.h). 0 (deep night) until the owner sets
+  // it; every headless harness leaves it there, and no authored body rule is
+  // phase-gated today, so that default changes nothing it can reach.
+  uint32_t dayPhase_ = 0;
   uint32_t nextSerial_ = 1;
   std::deque<Event> events_;
   // support-loss plumbing: flagged chunks wait here until the event queue has

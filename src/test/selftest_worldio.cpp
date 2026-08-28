@@ -100,7 +100,7 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
   // A local avatar, like the avatar gate: Ctx carries no avatar, and the gate
   // must exercise the AVTR section against the same def the game wears.
   PlayerAvatar avatar;
-  avatar.Init(&phys, &world, &debris, c.mats);
+  avatar.Init(&phys, &world, &debris, c.mats, &c.mobs);
   avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
   Player pl;
   pl.fly = false;
@@ -112,11 +112,11 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
   auto entTick = [&]() {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
-    mobs.PreTick(t + 1, world, ops, spawns);
-    if (avatar.Spawned())
-      avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, spawns);
-    debris.QueueSupportEvents(world.Snap());
     std::vector<CellOp> cellOps;
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+    if (avatar.Spawned())
+      avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+    debris.QueueSupportEvents(world.Snap());
     debris.PreTick(t + 1, world, cellOps, spawns);
     ++t;
     SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,

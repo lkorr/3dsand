@@ -100,8 +100,13 @@ class PlayerAvatar {
   // contents, so every MobDef* into it (including def_) dangles afterwards.
   // Re-publishing despawns first, which is also what stops a reload from
   // leaving limb bodies pointing at a freed def.
+  // `mobs` supplies the burn pass and the compiled reaction mirror behind it.
+  // The avatar borrows both rather than keeping its own, for the same reason it
+  // already borrows MobSystem's def list: there is one authored reaction table,
+  // and the player must not burn by a second reading of it. May be null — the
+  // avatar simply does not burn then, which is what the older harnesses want.
   void Init(Physics* phys, World* world, DebrisSystem* debris,
-            const std::vector<MaterialDef>& mats);
+            const std::vector<MaterialDef>& mats, MobSystem* mobs = nullptr);
   // Rebuild the per-material density table after a materials reload (R).
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
   // Points the avatar at a def by name. Safe to call repeatedly (hot reload):
@@ -125,9 +130,32 @@ class PlayerAvatar {
   // in third person the body turns toward its motion and only snaps to the
   // camera when the player aims. main.cpp owns that policy and passes the
   // result in.
+  //
+  // `cellOps` receives the grid half of per-voxel burning: a burning part emits
+  // real fire into the world, so a player who is alight sets the grass they run
+  // through on fire exactly as a burning NPC does.
   void PreTick(uint32_t tick, const Player& player, float heading, float dt,
                World& world, std::vector<BrushOp>& ops,
+               std::vector<CellOp>& cellOps,
                std::vector<ParticleSpawn>& spawns);
+  // Set fire to up to `count` of a part's surface voxels; returns how many took.
+  // The avatar twin of MobSystem::IgniteLimb — same resolution of "what does
+  // this material become when it catches", out of the same table.
+  uint32_t IgnitePart(int partIndex, uint32_t count, uint32_t onlyMat = 0);
+  // Voxels of `part` currently alight, for the burn gate and the debug overlay.
+  uint32_t PartBurningCount(int part) const {
+    return part >= 0 && part < (int)parts.size()
+               ? (uint32_t)parts[part].burn.front.size()
+               : 0u;
+  }
+  uint32_t PartMaterialCount(int part, uint32_t mat) const;
+  // Cells in a part's dense burn index; 0 = the index does not exist, i.e.
+  // nothing reactive has come near it. Diagnostic.
+  uint32_t PartBurnIndexCells(int part) const {
+    return part >= 0 && part < (int)parts.size()
+               ? (uint32_t)parts[part].burn.idx.size()
+               : 0u;
+  }
   // After Physics::Step: refresh limb transforms from Jolt.
   void PostStep();
 
@@ -425,10 +453,40 @@ class PlayerAvatar {
     Vec3 gushDir{0, 1, 0};
     uint64_t holdBody = 0;
     float holdSeconds = 0;
+    // ---- per-voxel burning / dissolution ----------------------------------
+    // docs/PLAN_body_reactivity.md. The player character burns through the SAME
+    // pass a mob does (MobSystem::BurnOneLimb over a BurnLimbView), because
+    // "the avatar is a MobDef with a different driver" has to hold for fire as
+    // well as for animation — two implementations that agree today are two that
+    // disagree after the next tuning edit.
+    BodyBurnState burn;
+    // Latched when this part's brick becomes a copy-on-write clone, so the
+    // teardown paths know to return it to the pool. The avatar never owned a
+    // private brick before: it had no per-voxel damage path at all.
+    bool burnOwnsBrick = false;
   };
 
   void DetachPart(int index, bool adopt);
   void Die();
+
+  // ---- per-voxel burning ----------------------------------------------------
+  // Drive MobSystem's burn pass over every live part, then this system's own
+  // flush. The pass is shared; the flush is not, and cannot be: how a part
+  // burnt through comes off, and what losing matter costs in hp, are the
+  // avatar's own rules.
+  void BurnParts(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
+  // Compact the material-0 tombstones the burn left, re-derive the collider
+  // from the authoritative lattice, charge hp for what was lost, and sever a
+  // part burnt below the point of still being one. Returns false if the part
+  // came off (or the avatar died), in which case `parts` has been reshaped and
+  // the caller must not touch that index again.
+  bool FlushPartBurn(int index);
+  // Drop unflushed tombstones without the re-derive FlushPartBurn does, for the
+  // paths that are about to hand the lattice to DebrisSystem.
+  void StripPartTombstones(Part& p);
+  // The view the shared pass takes over one of our parts.
+  BurnLimbView ViewOfPart(Part& p);
+  MobSystem* mobs_ = nullptr;
 
   // Damage state read from a save (LoadState), applied at the end of the next
   // Spawn() — the rig it applies to only exists once Spawn has built it.

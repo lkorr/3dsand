@@ -76,9 +76,40 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
     set.pool[base + idx / 2] |=
         (uint32_t)MicroVox((uint8_t)mat, v.color) << ((idx % 2) * 16);
   }
+  set.MarkPool(base, base + (uint32_t)words);
 }
 
 }  // namespace
+
+void MicroBodySet::MarkPool(uint32_t lo, uint32_t hi) {
+  dirty = true;
+  if (poolDirtyAll || hi <= lo) return;
+  for (auto& r : dirtyRanges) {
+    // Merge when the new span overlaps, abuts, or sits within the slack gap of
+    // an existing one. Scanning all of them (<= 24) rather than only the last
+    // matters: a tick that burns two limbs alternates between two blocks, and
+    // a last-only merge would open a fresh range on every alternation.
+    if (lo <= r.second + kDirtyMergeGap && r.first <= hi + kDirtyMergeGap) {
+      r.first = std::min(r.first, lo);
+      r.second = std::max(r.second, hi);
+      return;
+    }
+  }
+  if (dirtyRanges.size() >= kMaxDirtyRanges) {
+    // Too fragmented to track: fall back to the whole pool. Slower, never
+    // wrong — see the header comment.
+    dirtyRanges.clear();
+    poolDirtyAll = true;
+    return;
+  }
+  dirtyRanges.push_back({lo, hi});
+}
+
+void MicroBodySet::ClearDirty() {
+  dirty = false;
+  poolDirtyAll = false;
+  dirtyRanges.clear();
+}
 
 std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
                                        const std::vector<uint32_t>& artColors,
@@ -179,7 +210,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   set.owned.resize(set.models.size(), 0);
   set.blockWords.resize(set.models.size(), 0);
   set.blockWords.back() = (uint32_t)words;
-  set.dirty = true;
+  set.MarkPool(base, base + (uint32_t)words);
   return (int)set.models.size() - 1;
 }
 
@@ -223,7 +254,7 @@ int MicroBodyOwn(MicroBodySet& set, uint32_t model) {
   dst.base = base;
   set.owned[slot] = 1;
   set.blockWords[slot] = (uint32_t)words;
-  set.dirty = true;
+  set.MarkPool(base, base + (uint32_t)words);
   return (int)slot;
 }
 
@@ -262,10 +293,42 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
   // attached (blockWords is unchanged), so repeated carving of one body never
   // touches the allocator and the free at teardown returns the whole block.
   m.dims = (uint32_t)dims.x | ((uint32_t)dims.y << 10) | ((uint32_t)dims.z << 20);
-  WriteBrick(set, m.base, dims, voxels, mn);
+  WriteBrick(set, m.base, dims, voxels, mn);  // marks the block dirty
   originShift = mn;
   set.dirty = true;
   return true;
+}
+
+bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                   uint8_t mat, uint8_t art) {
+  if (model >= set.models.size()) return false;
+  // OWNED only. A shared model backs every instance of its def, so poking one
+  // would char every wizard in the world at once — the same reason
+  // MicroBodyEdit refuses, and the reason the burn path calls MicroBodyOwn
+  // before its first write exactly as the carve path does.
+  if (model >= set.owned.size() || !set.owned[model]) return false;
+  const MicroBodyModelGpu& m = set.models[model];
+  const int dx = (int)(m.dims & 1023), dy = (int)((m.dims >> 10) & 1023),
+            dz = (int)((m.dims >> 20) & 1023);
+  if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return false;
+
+  const size_t idx = ((size_t)z * dy + y) * dx + x;
+  const uint32_t w = m.base + (uint32_t)(idx / 2);
+  if (w >= set.pool.size()) return false;
+  const uint32_t shift = (uint32_t)(idx % 2) * 16u;
+  uint32_t word = set.pool[w];
+  word &= ~(0xFFFFu << shift);
+  word |= (uint32_t)MicroVox(mat, art) << shift;
+  if (word == set.pool[w]) return true;  // already that value: no upload debt
+  set.pool[w] = word;
+  set.MarkPool(w, w + 1);
+  return true;
+}
+
+IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model) {
+  if (model >= set.models.size()) return IVec3{0, 0, 0};
+  const uint32_t d = set.models[model].dims;
+  return IVec3{(int)(d & 1023), (int)((d >> 10) & 1023), (int)((d >> 20) & 1023)};
 }
 
 void MicroBodyFree(MicroBodySet& set, uint32_t model) {

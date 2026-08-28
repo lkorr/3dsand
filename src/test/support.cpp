@@ -46,6 +46,13 @@ double NowSeconds() {
 // gates already call.
 uint32_t TicksPerDay(const Tuning& t) { return TicksPerDayFromTuning(t); }
 
+uint32_t DayPhaseNow(uint32_t tick) {
+  const Tuning& t = CurrentTuning();
+  return DayPhaseForTick(Celestial().SimTick(tick), TicksPerDay(t),
+                         t.dayNight.freeze != 0,
+                         (uint32_t)t.dayNight.freezePhase);
+}
+
 // The sky for a given sim tick — now a full Keplerian solve (sim/celestial.*)
 // rather than a phase ramp. `tick` is routed through the celestial clock, which
 // is DISENGAGED unless the dev overlay's time-speed slider has been moved: on
@@ -300,11 +307,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // rational counter, so this stays integer end to end, and it is DISENGAGED
   // unless the slider has been moved — on every headless path it returns
   // `tick` unchanged and the pinned hash cannot move.
-  const Tuning& dtun = CurrentTuning();
-  const uint32_t celTick = Celestial().SimTick(tick);
-  tp.dayPhase = DayPhaseForTick(celTick, TicksPerDay(dtun),
-                                dtun.dayNight.freeze != 0,
-                                (uint32_t)dtun.dayNight.freezePhase);
+  tp.dayPhase = DayPhaseNow(tick);
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
   // The mirror corner for the seam's fluid-occupancy fold: the SAME clamp
@@ -353,6 +356,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // detected however far the clock jumped (a jump that skips a whole day still
   // wakes exactly once, which is right: one wake re-dirties everything).
   if (tick > 0) {
+    const Tuning& dtun = CurrentTuning();
     const uint32_t prevCel = Celestial().PrevSimTick(tick);
     uint32_t prevPhase = DayPhaseForTick(prevCel, TicksPerDay(dtun),
                                          dtun.dayNight.freeze != 0,

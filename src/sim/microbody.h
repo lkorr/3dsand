@@ -110,6 +110,42 @@ struct MicroBodySet {
   // per tick rather than one per edit is rule 2 applied to PCIe traffic.
   bool dirty = false;
 
+  // ---- incremental pool upload ---------------------------------------------
+  //
+  // `dirty` above means "something changed, re-upload" and the MODEL TABLE
+  // takes it literally: the table is kMaxMicroBodyModels * 16 bytes, small
+  // enough that sending all of it is the right answer.
+  //
+  // The POOL is not. It is 4 MiB, and Simulation::UploadMicroBodies used to
+  // write ALL of it on any dirty. That was free while the only thing that
+  // dirtied it was a carve — a rare event — and it becomes a 4 MiB/tick PCIe
+  // write the moment a body burns per voxel, against a documented budget of
+  // < 1 MB/tick (DESIGN.md §11). So every pool write records the WORD RANGE it
+  // touched and the upload sends only those ranges.
+  //
+  // Ranges are coalesced greedily (a burning limb's pokes all land inside one
+  // model's block, so they merge into one span) and CAPPED: past
+  // kMaxDirtyRanges the set gives up and asks for a whole-pool write. That
+  // fallback is what makes correctness independent of how well the merge went
+  // — a missed range would be a stale brick on screen, and the failure mode of
+  // a coalescing heuristic must never be "wrong", only "slower".
+  static constexpr size_t kMaxDirtyRanges = 24;
+  // Words this far apart are merged into one range rather than kept separate:
+  // one 2 KiB write beats two writes plus a range slot, and the slack is only
+  // ever re-sending words that did not change.
+  static constexpr uint32_t kDirtyMergeGap = 512;
+  std::vector<std::pair<uint32_t, uint32_t>> dirtyRanges;  // [lo, hi) words
+  // Starts TRUE so a freshly constructed set publishes its whole pool once.
+  // Every hot reload replaces the set wholesale (`mbSet = MicroBodySet{}`), so
+  // this is also what makes a reload re-send everything without the reload path
+  // having to know the range machinery exists.
+  bool poolDirtyAll = true;
+
+  // Record that pool words [lo, hi) were written. Also sets `dirty`.
+  void MarkPool(uint32_t lo, uint32_t hi);
+  // Called by the uploader once the GPU copy has been issued.
+  void ClearDirty();
+
   // ---- art palette ----
   // Skin colours from every loaded prefab, merged, indexed from
   // kArtPaletteBase (sim/voxload.h). It rides here rather than on any one
@@ -174,6 +210,27 @@ int MicroBodyOwn(MicroBodySet& set, uint32_t model);
 // re-pack does not fit; `model` must be owned (MicroBodyOwn first).
 bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
                    const std::vector<PrefabVoxel>& voxels, IVec3& originShift);
+
+// Rewrites ONE micro voxel of an OWNED model in place: material id + art slot,
+// nothing else. Coordinates are BRICK-LOCAL, i.e. [0, dims) in the frame the
+// fragment shader marches — the frame MicroBodyEdit last rebased the payload
+// to, NOT the caller's original lattice.
+//
+// This is the sibling MicroBodyEdit cannot be. Edit re-derives the tight box,
+// rebases the origin, re-packs the whole payload and may reallocate the block,
+// which is right for a CARVE (the shape changed) and catastrophic for a STATE
+// change (the shape did not change — one voxel's material did). A per-voxel
+// burn does the latter every tick, and doing it through Edit would re-pack a
+// 15.7k-word torso to char a single voxel.
+//
+// Removal goes through here too — poke material 0 — so the shrinking re-pack
+// can be deferred and batched exactly the way the collider rebuild already is.
+// Returns false if the model is not owned or the coordinate is outside dims.
+bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                   uint8_t mat, uint8_t art);
+
+// A model's brick dimensions in micro voxels; {0,0,0} for an invalid index.
+IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model);
 
 // Returns an owned model's words to the free list and retires its record.
 // Safe (no-op) on shared models and on kMicroBodyNoModel, so body teardown can

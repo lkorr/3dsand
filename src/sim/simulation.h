@@ -33,7 +33,10 @@ class Simulation {
   void UploadMicro(const rhi::Queue& queue, const MicroSet& micro);
   // Re-upload the dynamic micro-BODY model table + brick pool (mob defs load /
   // hot reload — sim/microbody.h). Render-only, same doctrine as UploadMicro.
-  void UploadMicroBodies(const rhi::Queue& queue, const MicroBodySet& set);
+  // Non-const: the set carries its own dirty-range bookkeeping and this is the
+  // only thing that may clear it, so "uploaded" and "no longer dirty" cannot
+  // drift apart at a call site that forgot the second half.
+  void UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set);
   // Publish the ART palette: per-voxel skin colours from loaded prefabs, which
   // are NOT material colours (a creature is one material all over and painted
   // per voxel — sim/voxload.h). They live in reserved material-table entries

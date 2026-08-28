@@ -595,6 +595,192 @@
     },
     {
       "note": "-------- NOT IMPLEMENTED: overnight dew on foliage --------\nA night-time \"leaves emit steam upward\" rule was tried twice and REMOVED both\ntimes. Recording it here so it is not re-attempted a third time.\n\nAttempt 1 — plain emit. doReactions() set keepAwake as soon as an emit rule\nfound an adjacent air cell, before rolling its chance, so every leaf with air\nabove it pinned its chunk awake all night: 292/32768 chunks active after 2900\nsettle ticks, against a budget of 32 (CLAUDE.md rule 2).\n\nAttempt 2 — after making light-gated rules skip keepAwake (that change was\nkept; it is correct and the other gated rules need it). Still 250 chunks\nawake, now as a permanent steam plume: every canopy leaf is a SOURCE, the\nsteam it emits is a gas that moves every tick and re-dirties its chunk, and\nemission outpaces steam's decay. Awake chunks were a vertical column at fixed\nx,z — a plume, not a settling neighbourhood.\n\nThe lesson is rule 2's: a permanent emitter has no terminus, so no chance\nvalue makes it settle. Dew needs a FINITE source — e.g. a dew material that\nleaves deposit once and consume, or a decay on something that runs out.\nLeft out rather than shipped breaking the sleep guarantee."
+    },
+    {
+      "note": "-------- BODIES: per-voxel burning (docs/PLAN_body_reactivity.md) --------"
+    },
+    {
+      "note": "These materials only ever exist as MOB and ITEM geometry, so until now they were tagged flammable and had no rules at all: a creature could stand in a bonfire forever. Nothing below is mob-specific. MobSystem::BurnLimbs and DebrisSystem::BurnBodies run this same authored table over body voxels through the CPU mirror in sim/reactcpu.h, so a burning limb, a severed burning arm, a dropped burning staff and a robe_cloth voxel that settled into the grid all behave identically."
+    },
+    {
+      "note": "THE SHAPE OF THE MECHANIC. Cloth catches from ONE hot neighbour at about 8x flesh's rate; flesh does not catch at all until THREE of its six faces are hot. That is authored as a decay rule with scaleByNeighbors, because a pair rule's neighbour fields are already spoken for by its partner. The minCount is the load-bearing number: it is what makes a lone ember on a shoulder gutter out while a wide burning front races, i.e. the difference between 'the mob is on fire' as a boolean and fire as a front with a width."
+    },
+    {
+      "note": "CLOTH: catches from a single hot face and is CONSUMED, leaving holes and scorched rag. All three robe materials share one burning state so the burn character is authored once and a new fabric inherits it by naming cloth_burning as its product."
+    },
+    {
+      "self": "robe_cloth",
+      "neighbor": "tag:hot",
+      "chance": 200,
+      "selfBecomes": "cloth_burning"
+    },
+    {
+      "self": "robe_trim",
+      "neighbor": "tag:hot",
+      "chance": 200,
+      "selfBecomes": "cloth_burning"
+    },
+    {
+      "self": "robe_shadow",
+      "neighbor": "tag:hot",
+      "chance": 200,
+      "selfBecomes": "cloth_burning"
+    },
+    {
+      "note": "Leather is fabric that resists: the same burning state at one eighth the catch rate. The whole 'a leather jerkin buys you seconds a robe does not' mechanic is this one number."
+    },
+    {
+      "self": "leather",
+      "neighbor": "tag:hot",
+      "chance": 25,
+      "selfBecomes": "cloth_burning"
+    },
+    {
+      "self": "grip_leather",
+      "neighbor": "tag:hot",
+      "chance": 25,
+      "selfBecomes": "cloth_burning"
+    },
+    {
+      "note": "Douse FIRST, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick, and a voxel that spent its tick licking flame upward should not also consume itself. Total decay 39 per-mille is about 26 ticks (0.9 s) per cloth voxel, so a robe burns away over seconds instead of vanishing in one frame."
+    },
+    {
+      "self": "cloth_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 450,
+      "selfBecomes": "cloth_charred"
+    },
+    {
+      "self": "cloth_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 120
+    },
+    {
+      "self": "cloth_burning",
+      "decay": true,
+      "chance": 22,
+      "becomes": "air"
+    },
+    {
+      "self": "cloth_burning",
+      "decay": true,
+      "chance": 12,
+      "becomes": "cloth_charred"
+    },
+    {
+      "self": "cloth_burning",
+      "decay": true,
+      "chance": 5,
+      "becomes": "ash"
+    },
+    {
+      "note": "Charred rag is spent fuel: three hot faces to relight, so a burnt-out garment does not smoulder its wearer to death after the fire is over."
+    },
+    {
+      "self": "cloth_charred",
+      "decay": true,
+      "chance": 10,
+      "becomes": "cloth_burning",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 3,
+        "scaleMax": 3.0
+      }
+    },
+    {
+      "note": "HAIR: catches almost on contact and is gone in about 4 ticks. One material and three rules, and it is the clearest single read that a character is on fire."
+    },
+    {
+      "self": "hair_white",
+      "neighbor": "tag:hot",
+      "chance": 600,
+      "selfBecomes": "hair_burning"
+    },
+    {
+      "self": "hair_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 600,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "hair_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 200
+    },
+    {
+      "self": "hair_burning",
+      "decay": true,
+      "chance": 180,
+      "becomes": "air"
+    },
+    {
+      "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below."
+    },
+    {
+      "note": "minCount 3 is deliberate and provable: a lone burning voxel plus the single fire cell it emits reach 2, so one ignited voxel cannot restart itself no matter how the dice fall. Three simultaneously hot faces means a real fire -- or burning cloth lying against the skin, which is exactly how a clothing layer is supposed to kill you."
+    },
+    {
+      "self": "skin",
+      "neighbor": "tag:hot",
+      "chance": 90,
+      "selfBecomes": "flesh_cooked"
+    },
+    {
+      "self": "flesh_cooked",
+      "decay": true,
+      "chance": 40,
+      "becomes": "flesh_burning",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 3,
+        "scaleMax": 4.0
+      }
+    },
+    {
+      "note": "Burning flesh ALWAYS CHARS IN PLACE: charred is a solid, so the limb keeps its shape and reads as burnt instead of eaten away. That is what leaves a recognisable blackened corpse -- and, where a limb burned through, bone, which has no fire rules at all and therefore survives by construction.\n\nDISABLED: an 8-per-mille 'flesh_burning decay -> ash' branch used to run alongside the char branch, so a body slowly shed ash voxels into the grid as it burned. Turned off by request; its 8 per-mille was folded into the char branch below (42 -> 50) so the burn takes exactly as long as before, it just no longer sheds matter. Re-enable by splitting the 50 back into 42 char + 8 ash."
+    },
+    {
+      "self": "flesh_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 500,
+      "selfBecomes": "flesh_charred"
+    },
+    {
+      "self": "flesh_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 70
+    },
+    {
+      "self": "flesh_burning",
+      "decay": true,
+      "chance": 50,
+      "becomes": "flesh_charred"
+    },
+    {
+      "note": "Charred flesh relights only under a full four-face front, which in practice means lava or a sustained blaze. Without that floor a burnt corpse is a permanent low-grade emitter and its chunk never sleeps (CLAUDE.md rule 2)."
+    },
+    {
+      "self": "flesh_charred",
+      "decay": true,
+      "chance": 8,
+      "becomes": "flesh_burning",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 4,
+        "scaleMax": 2.0
+      }
+    },
+    {
+      "note": "A dropped wooden staff is a debris body with a micro brick and BurnBodies runs this table over it, so 'fire lights the item you dropped' costs exactly this one rule."
+    },
+    {
+      "self": "staff_wood",
+      "neighbor": "tag:hot",
+      "chance": 16,
+      "selfBecomes": "ember"
     }
   ]
 }

@@ -88,10 +88,11 @@ int FindModelIndex(const Prefab& p, const std::string& name) {
 }  // namespace
 
 void PlayerAvatar::Init(Physics* phys, World* world, DebrisSystem* debris,
-                        const std::vector<MaterialDef>& mats) {
+                        const std::vector<MaterialDef>& mats, MobSystem* mobs) {
   phys_ = phys;
   world_ = world;
   debris_ = debris;
+  mobs_ = mobs;
   OnMaterialsReloaded(mats);
 }
 
@@ -642,6 +643,11 @@ void PlayerAvatar::Despawn() {
       // holdBody is the SAME handle already handed to DebrisSystem, so it is
       // not ours to remove — AdoptBody transferred ownership.
       if (p.body) phys_->RemoveBody(p.body);
+      // A part that burned owns a private brick out of the shared pool; the
+      // pool is a hard ceiling, so dropping the rig without returning it leaks
+      // words nothing will ever reclaim.
+      if (mobs_) mobs_->ReleaseOwnedBrick(p.microModel, p.burnOwnsBrick);
+      MobSystem::DropBurnIndex(p.burn);
       p.joint = 0;
       p.body = 0;
       p.holdBody = 0;
@@ -1597,9 +1603,15 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
 
 void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
                            float dt, World& world, std::vector<BrushOp>& ops,
+                           std::vector<CellOp>& cellOps,
                            std::vector<ParticleSpawn>& spawns) {
   if (!spawned_ || !def_) return;
   const MobDef& def = *def_;
+  // Per-voxel burning and dissolution, once per TICK — never per frame. The
+  // pass writes fire into the hashed grid, so running it off the render clock
+  // would make the world a function of frame rate.
+  BurnParts(tick, world, cellOps);
+  if (!spawned_ || !def_) return;  // burnt to death: nothing left to drive
 
   // Drain particles authored since the last tick (dismemberment bursts). Same
   // reasoning as MobSystem: Sever() is reached from damage handling at several
@@ -2236,6 +2248,178 @@ bool PlayerAvatar::SeverByName(const std::string& name) {
   return true;
 }
 
+// ---- per-voxel burning: the avatar's half --------------------------------
+//
+// docs/PLAN_body_reactivity.md. The PASS is MobSystem::BurnOneLimb and is not
+// duplicated here — the player has to catch fire, char and dissolve exactly as
+// an NPC does, and one implementation is the only way to be sure of that. What
+// is genuinely the avatar's own is what happens AFTER: how hp falls when matter
+// is lost, and how a part burnt through comes off.
+
+void PlayerAvatar::StripPartTombstones(Part& p) {
+  if (p.burn.removed == 0) return;
+  p.skinVoxels.erase(
+      std::remove_if(p.skinVoxels.begin(), p.skinVoxels.end(),
+                     [](const PrefabVoxel& v) { return (v.material & 0xFFFu) == 0; }),
+      p.skinVoxels.end());
+  p.voxels.erase(
+      std::remove_if(p.voxels.begin(), p.voxels.end(),
+                     [](const DebrisVoxel& v) { return (v.payload & 0xFFFu) == 0; }),
+      p.voxels.end());
+  p.burn.removed = 0;
+  MobSystem::DropBurnIndex(p.burn);
+  instancesDirty_ = true;
+}
+
+BurnLimbView PlayerAvatar::ViewOfPart(Part& p) {
+  const bool fine = p.HasFineSkin();
+  BurnLimbView v;
+  v.skin = fine ? &p.skinVoxels : nullptr;
+  v.coll = fine ? nullptr : &p.voxels;
+  v.scale = fine ? (def_ ? def_->skinScale : 1u) : (def_ ? def_->physScale : 1u);
+  v.xf = &p.xf;
+  v.size = p.size;
+  v.physScale = def_ ? def_->physScale : 1u;
+  v.microModel = &p.microModel;
+  v.carved = &p.burnOwnsBrick;
+  v.flipbook = nullptr;  // the avatar has no flipbooks to invalidate
+  v.burn = &p.burn;
+  return v;
+}
+
+uint32_t PlayerAvatar::PartMaterialCount(int part, uint32_t mat) const {
+  if (part < 0 || part >= (int)parts.size()) return 0;
+  const Part& p = parts[part];
+  uint32_t n = 0;
+  if (p.HasFineSkin()) {
+    for (const PrefabVoxel& v : p.skinVoxels)
+      if ((v.material & 0xFFFu) == (mat & 0xFFFu)) n++;
+  } else {
+    for (const DebrisVoxel& v : p.voxels)
+      if ((v.payload & 0xFFFu) == (mat & 0xFFFu)) n++;
+  }
+  return n;
+}
+
+uint32_t PlayerAvatar::IgnitePart(int partIndex, uint32_t count,
+                                  uint32_t onlyMat) {
+  if (!mobs_ || !spawned_ || partIndex < 0 || partIndex >= (int)parts.size())
+    return 0;
+  if (!parts[partIndex].body) return 0;
+  BurnLimbView v = ViewOfPart(parts[partIndex]);
+  const uint32_t lit = mobs_->IgniteOneLimb(v, count, onlyMat);
+  if (lit) instancesDirty_ = true;
+  return lit;
+}
+
+bool PlayerAvatar::FlushPartBurn(int index) {
+  Part& p = parts[index];
+  if (p.burn.removed == 0) return true;
+  const bool fine = p.HasFineSkin();
+  const uint32_t before =
+      (uint32_t)(fine ? p.skinVoxels.size() : p.voxels.size());
+  // Scale the threshold with the part, exactly as the mob side does: a dozen
+  // voxels out of a hand is a real shape change, a dozen out of a torso is
+  // invisible, and re-deriving a collider every tick for the second case is
+  // what would make a burning player the most expensive thing on screen.
+  const uint32_t threshold = std::max<uint32_t>(12u, before >> 6);
+  if (p.burn.removed < threshold) return true;
+  p.burn.removed = 0;
+
+  // Compact the tombstones out of the AUTHORITATIVE lattice, then re-derive the
+  // collider from it. Data flows skin -> collider and never the other way.
+  if (fine) {
+    p.skinVoxels.erase(
+        std::remove_if(
+            p.skinVoxels.begin(), p.skinVoxels.end(),
+            [](const PrefabVoxel& v) { return (v.material & 0xFFFu) == 0; }),
+        p.skinVoxels.end());
+    const uint32_t ratio =
+        std::max(1u, (def_ ? def_->skinScale : 1u) /
+                         std::max(1u, def_ ? def_->physScale : 1u));
+    bool overflow = false;
+    p.voxels = DownsampleSkin(p.skinVoxels, ratio, &overflow);
+  } else {
+    p.voxels.erase(
+        std::remove_if(p.voxels.begin(), p.voxels.end(),
+                       [](const DebrisVoxel& v) { return (v.payload & 0xFFFu) == 0; }),
+        p.voxels.end());
+  }
+  const uint32_t after =
+      (uint32_t)(fine ? p.skinVoxels.size() : p.voxels.size());
+  instancesDirty_ = true;
+  // The lattice compacted, so every entry in the burn index moved. Drop it; the
+  // next tick rebuilds it and re-seeds the front from whatever is still alight,
+  // so the fire survives the rebuild without the index having to.
+  MobSystem::DropBurnIndex(p.burn);
+
+  // The brick is NOT re-packed here, deliberately. The per-voxel pokes already
+  // made the burn visible; a re-pack would only shrink the OBB, and it rebases
+  // the payload's origin — which on a RIG means moving restOffset and
+  // anchorLimb with it or the art crawls off the bone (mob.cpp
+  // ReskinLimbMicro). Not worth that hazard for an OBB a few voxels too big.
+
+  // Losing matter hurts, in proportion to how much of the part it was — the
+  // same rule carving already uses, so burning a limb off and cutting one off
+  // cost the same. `voxelsAtSpawn` does not exist on a Part, so the fraction is
+  // measured against what was there before this flush; over many flushes that
+  // integrates to the same total.
+  if (before > 0 && after < before) {
+    const float lost = (float)(before - after) / (float)before;
+    p.hp -= lost * std::max(1.0f, limbs_[index].hp) * 1.5f;
+  }
+  // Burnt past the point of still being a limb: it comes off. Geometry decides,
+  // not an hp threshold — the same route to dismemberment carving takes.
+  if (p.hp <= 0.0f || p.voxels.size() < 4) {
+    Sever(index);
+    return false;
+  }
+  return true;
+}
+
+void PlayerAvatar::BurnParts(uint32_t tick, World& world,
+                             std::vector<CellOp>& cellOps) {
+  if (!mobs_ || !spawned_ || !alive_ || !mobs_->BurnTablesReady()) return;
+
+  // A TERRAIN ANCHOR around the body, exactly as MobSystem::PreTick registers
+  // for every live limb. Not cosmetic, and not really about terrain collision:
+  // it is what keeps the chunks around the body FETCHED AND REFRESHED in the
+  // CPU mirror (DebrisSystem::ManageTerrain), and the burn pass reads that
+  // mirror to find out whether it is standing in a fire.
+  //
+  // Without it the player did not burn while mobs did, and the reason was
+  // invisible from either end: the ground probe fetches the chunk under the
+  // feet ONCE, `World::Cached` then keeps returning that first copy forever,
+  // and a bonfire lit around the body afterwards never appears in it. Mobs were
+  // only ever reading live data because their anchor forced the refresh.
+  if (debris_ && def_) {
+    const Vec3 ws = def_->worldSize;
+    const float r = 0.5f * std::sqrt(ws.x * ws.x + ws.y * ws.y + ws.z * ws.z);
+    debris_->AddTerrainAnchor(origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f,
+                                             ws.z * 0.5f},
+                              r);
+  }
+  // A separate budget from the mob pass's, and deliberately: the player is one
+  // creature out of up to sixteen, and sharing one pool would let a crowd of
+  // burning NPCs starve the fire on the character the camera is pointed at.
+  uint32_t frontBudget = 4096;
+  uint32_t opsBudget = 48;
+  // Counter-based RNG, no float term — a part's world position is a Jolt float
+  // and keying a roll on it would put physics float state into a hashed grid
+  // write (PLAN §5). The avatar has no mob id, so the stream is keyed on the
+  // part index alone; it is one creature, and it cannot collide with itself.
+  for (int i = 0; i < (int)parts.size() && frontBudget; i++) {
+    if (!parts[i].body || !PartAlive(i)) continue;
+    BurnLimbView v = ViewOfPart(parts[i]);
+    const uint32_t key = 0xA5A5A5A5u + (uint32_t)i * 2654435761u;
+    if (mobs_->BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget))
+      instancesDirty_ = true;
+    // May sever the part or kill the avatar, after which `parts` has been
+    // reshaped and nothing below may touch it.
+    if (parts[i].burn.removed && !FlushPartBurn(i)) return;
+  }
+}
+
 void PlayerAvatar::Sever(int partIndex) {
   if (!def_ || !spawned_) return;
   const MobDef& def = *def_;
@@ -2288,6 +2472,9 @@ void PlayerAvatar::Sever(int partIndex) {
 void PlayerAvatar::DetachPart(int index, bool adopt) {
   Part& p = parts[index];
   if (!p.body) return;
+  // The lattice is about to leave this system, and a material-0 tombstone from
+  // an unflushed burn must not go with it.
+  StripPartTombstones(p);
   if (p.joint) {
     phys_->DestroyJoint(p.joint);
     p.joint = 0;
@@ -2311,7 +2498,11 @@ void PlayerAvatar::DetachPart(int index, bool adopt) {
     p.holdSeconds = kSeverHoldSeconds;
   } else if (phys_) {
     phys_->RemoveBody(p.body);
+    // Nobody is adopting the brick, so this system still owns it.
+    if (mobs_) mobs_->ReleaseOwnedBrick(p.microModel, p.burnOwnsBrick);
   }
+  p.burnOwnsBrick = false;  // adopted: DebrisSystem frees it with the body
+  MobSystem::DropBurnIndex(p.burn);
   p.body = 0;
   instancesDirty_ = true;
 }
@@ -2326,9 +2517,13 @@ void PlayerAvatar::Die() {
   for (size_t i = 0; i < parts.size(); i++) {
     Part& p = parts[i];
     if (!p.body) continue;
+    // Same reason as DetachPart: no tombstone may travel to DebrisSystem.
+    StripPartTombstones(p);
     debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
                        def.physScale, std::move(p.skinVoxels), def.bleedMat);
     p.skinVoxels.clear();
+    p.burnOwnsBrick = false;  // the body owns the brick now
+    MobSystem::DropBurnIndex(p.burn);
     phys_->SetBodyKinematic(p.body, false);
     phys_->ClearCollisionGroup(p.body);
     // The corpse is debris now, not the player's body — it collides normally.

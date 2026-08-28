@@ -54,7 +54,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   mbInstBuf_ = CreateBuffer(device, sizeof(MicroBodyInstGpu) * kMaxBodySlots,
                             rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                             "microBodyInsts");
-  UploadMicroBodies(queue, MicroBodySet{});
+  // Zero-init: publish an empty table so a model index that arrives before any
+  // real upload cannot read whatever the buffer happened to hold.
+  MicroBodySet emptySet;
+  UploadMicroBodies(queue, emptySet);
 
   // 27 color-phase slices x 2 gravity substeps (54 total)
   {
@@ -568,20 +571,39 @@ void Simulation::UploadMicro(const rhi::Queue& queue, const MicroSet& micro) {
   }
 }
 
-void Simulation::UploadMicroBodies(const rhi::Queue& queue,
-                                   const MicroBodySet& set) {
+void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
   // Fixed-size GPU buffers: pad the table so a shrinking reload cannot leave a
   // stale model behind a still-live index, and never write past the ceiling.
+  // The whole table is 16 bytes x kMaxMicroBodyModels — small enough that
+  // tracking which records moved would cost more than the write.
   std::vector<MicroBodyModelGpu> table = set.models;
   if (table.size() > kMaxMicroBodyModels) table.resize(kMaxMicroBodyModels);
   table.resize(kMaxMicroBodyModels, MicroBodyModelGpu{kMicroBodyNoModel, 0, 1, 0});
   queue.WriteBuffer(mbModelBuf_, 0, table.data(),
                     table.size() * sizeof(MicroBodyModelGpu));
 
-  if (!set.pool.empty()) {
-    size_t words = std::min<size_t>(set.pool.size(), kMicroBodyPoolWordsWorld);
-    queue.WriteBuffer(mbPoolBuf_, 0, set.pool.data(), words * 4);
+  // The POOL is 4 MiB and is sent by RANGE (MicroBodySet::MarkPool). Writing
+  // all of it on any dirty was correct and free while only a carve dirtied it;
+  // per-voxel body burning dirties it every tick, and 4 MiB/tick is four times
+  // the whole CPU->GPU budget (DESIGN.md §11) for what is usually a handful of
+  // changed words.
+  const size_t poolWords =
+      std::min<size_t>(set.pool.size(), kMicroBodyPoolWordsWorld);
+  if (poolWords) {
+    if (set.poolDirtyAll) {
+      // Whole-pool: first publish, hot reload, or the ranges overflowed.
+      queue.WriteBuffer(mbPoolBuf_, 0, set.pool.data(), poolWords * 4);
+    } else {
+      for (const auto& r : set.dirtyRanges) {
+        const size_t lo = std::min<size_t>(r.first, poolWords);
+        const size_t hi = std::min<size_t>(r.second, poolWords);
+        if (hi <= lo) continue;
+        queue.WriteBuffer(mbPoolBuf_, lo * 4, set.pool.data() + lo,
+                          (hi - lo) * 4);
+      }
+    }
   }
+  set.ClearDirty();
 
   // The skin's art colours ride the same upload the bricks do: they are
   // published together or a painted brick indexes colours that are not there

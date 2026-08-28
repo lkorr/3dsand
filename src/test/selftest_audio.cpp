@@ -189,8 +189,8 @@ Status GateAudioMobVoice(Ctx& c, std::string& detail) {
   auto tick = [&]() {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
-    mobs.PreTick(t + 1, world, ops, spawns);
     std::vector<CellOp> cellOps;
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
     debris.PreTick(t + 1, world, cellOps, spawns);
     ++t;
     SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,

@@ -40,6 +40,12 @@ inline bool AppendVoxInsts(std::vector<BodyVoxInst>& out, uint32_t slot,
                            const std::vector<DebrisVoxel>& voxels) {
   for (const DebrisVoxel& v : voxels) {
     if (out.size() >= kMaxBodyVoxInstances) return false;
+    // Material 0 is AIR, and a lattice can legitimately hold one: per-voxel
+    // burning tombstones a voxel it consumed and defers the compaction to its
+    // batched flush (game/mob.cpp), so between flushes the array carries holes.
+    // Drawing them would put a black cube where the fire just was — the cube
+    // path's equivalent of the brick poke the micro path gets for free.
+    if ((v.payload & 0xFFFu) == 0) continue;
     // Art colour rides in bits 28..31, clamped to the 4 bits this path has
     // (debris.h). `v.color` is a .vox palette SLOT, so it is rebased to a
     // 1-based art index first; 0 stays 0, leaving an unpainted voxel
