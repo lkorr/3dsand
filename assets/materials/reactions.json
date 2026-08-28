@@ -642,7 +642,7 @@
       "selfBecomes": "cloth_burning"
     },
     {
-      "note": "Douse FIRST, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick, and a voxel that spent its tick licking flame upward should not also consume itself. Total decay 39 per-mille is about 26 ticks (0.9 s) per cloth voxel, so a robe burns away over seconds instead of vanishing in one frame."
+      "note": "Douse FIRST, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick, and a voxel that spent its tick licking flame upward should not also consume itself. Total decay 39 per-mille is about 26 ticks (0.9 s) per cloth voxel, so a robe burns away over seconds instead of vanishing in one frame.\n\nThe ash branch is deliberately 15x rarer than it first shipped (5 -> 0.33 per-mille): a burning robe is a lot of voxels and at 5 per-mille it buried the wearer's feet in ash. Its old share went to the 'becomes air' branch so the 39 per-mille total -- and therefore the burn DURATION -- is unchanged; only the fraction of cloth that survives as matter moved. Ash from a garment is now a scatter, not a pile."
     },
     {
       "self": "cloth_burning",
@@ -659,7 +659,7 @@
     {
       "self": "cloth_burning",
       "decay": true,
-      "chance": 22,
+      "chance": 26.67,
       "becomes": "air"
     },
     {
@@ -671,7 +671,7 @@
     {
       "self": "cloth_burning",
       "decay": true,
-      "chance": 5,
+      "chance": 0.33,
       "becomes": "ash"
     },
     {
@@ -739,7 +739,7 @@
       }
     },
     {
-      "note": "Burning flesh ALWAYS CHARS IN PLACE: charred is a solid, so the limb keeps its shape and reads as burnt instead of eaten away. That is what leaves a recognisable blackened corpse -- and, where a limb burned through, bone, which has no fire rules at all and therefore survives by construction.\n\nDISABLED: an 8-per-mille 'flesh_burning decay -> ash' branch used to run alongside the char branch, so a body slowly shed ash voxels into the grid as it burned. Turned off by request; its 8 per-mille was folded into the char branch below (42 -> 50) so the burn takes exactly as long as before, it just no longer sheds matter. Re-enable by splitting the 50 back into 42 char + 8 ash."
+      "note": "Burning flesh almost always CHARS IN PLACE rather than disappearing: charred is a solid, so the limb keeps its shape and reads as burnt instead of eaten away. That is what leaves a recognisable blackened corpse -- and, where a limb burned through, bone, which has no fire rules at all and therefore survives by construction.\n\nThe ash branch takes the same 15x cut as cloth's above (8 -> 0.53 per-mille) and for the same reason, with its old share folded into the char branch so the 50 per-mille total and the burn duration are unchanged. Burning bodies still shed ash, just rarely enough that it reads as soot rather than as the body dissolving into a heap."
     },
     {
       "self": "flesh_burning",
@@ -756,8 +756,14 @@
     {
       "self": "flesh_burning",
       "decay": true,
-      "chance": 50,
+      "chance": 49.47,
       "becomes": "flesh_charred"
+    },
+    {
+      "self": "flesh_burning",
+      "decay": true,
+      "chance": 0.53,
+      "becomes": "ash"
     },
     {
       "note": "Charred flesh relights only under a full four-face front, which in practice means lava or a sustained blaze. Without that floor a burnt corpse is a permanent low-grade emitter and its chunk never sleeps (CLAUDE.md rule 2)."
