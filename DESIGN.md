@@ -3836,6 +3836,127 @@ and reads back as the material it asked for.
 Chrome, real WebGL2, the real worker, `/api/voxregion` over HTTP, greedy
 meshing, LOD shells, a pixel readback, a raycast, an edit and an undo.
 
+## 8b. The character screen (added 2026-08-29)
+
+The screen the armour, weapon, pickup and spell-acquisition systems land into.
+`I` opens it; `Esc` closes it before it does anything else. Three regions over a
+dimmed but **still running** world:
+
+* **left** — a LIVE avatar portrait with armour slots flanking it, sheath and
+  quick slots beneath, and a `CHARACTER`/`HEALTH` toggle that swaps the same
+  frame between equipment and an injury inspector.
+* **top right** — the arsenal: every glyph the player owns, and the ten bound
+  slots that **are** the magic-mode number row.
+* **bottom right** — the pack (4x8) and the hotbar row, with drag between all of
+  them.
+
+The sim keeps running while it is open. This is WoW, not single-player
+Minecraft: the engine is real-time and the MutationQueue is a future network
+stream (§10), so a pause would be a lie the moment a second player existed.
+
+### The portrait is the avatar, not a picture of one
+
+`src/main.cpp` renders a **second camera** at the player's own rig into a
+320x448 offscreen target once per frame while the screen is open, and ImGui
+samples it. That is the whole reason the panel needs no portrait art and no
+paper-doll layer: the avatar is one live copy-on-write micro-voxel body, so
+missing voxels, char/cook material transitions (§6), severed limbs (§7),
+dismemberment poses and whatever is in its hand all appear **for free**, and
+nothing in the UI knows about any of them. Cost is ~2 draw calls over ~18 OBB
+instances, no shadows, no raymarch — the honest cost is the second submit.
+
+Three things about it are load-bearing and were each learned the hard way:
+
+* **`world.renderUBO` is ONE buffer**, so two cameras cannot share a command
+  buffer. Each pass writes its own params and is submitted separately; queue
+  writes drain at the head of the next command buffer, which is exactly what
+  makes that work. The main camera is re-written after the portrait submits.
+* **The instance lists are shared too.** In first person the body is hidden and
+  the arms are not (§8), so the portrait re-uploads with an empty hide mask,
+  draws, and hands the real mask back — the same write-then-submit pattern one
+  level down.
+* **A sampled render target needs a layout.** `vk::Image::sampled` (set from
+  `TextureUsage::TextureBinding`) makes the recorder leave it in
+  `SHADER_READ_ONLY_OPTIMAL` at `Finish()`, exactly as `presentable` does for
+  the swapchain. Without it the attachment ends the pass in
+  `COLOR_ATTACHMENT_OPTIMAL` and ImGui's descriptor describes a layout the image
+  is not in.
+
+The portrait's light is a **fixed studio sun** independent of the world clock:
+`--shot-mob`'s own comment says why — midnight is the worst possible light for a
+silhouette, and a character sheet that goes unreadable at night is one you
+cannot use half the time.
+
+### Equipment is a slot TABLE, and the table is the schema
+
+`src/game/equipment.h` holds `EquipSlots()`: one row per slot, each naming the
+`ItemKind`s it accepts. That table **is** the armour system's schema. Armour
+content does not exist yet, so every armour row accepts nothing and says so —
+`MoveResult::WrongKind` carries the sentence the tooltip shows. The day
+`ItemKind::ArmorHead` exists, the change is one row, not a branch.
+
+Two rows accept something today (sheath and the quick slots take
+`ItemKind::Melee`), which is what proves the move/validate/persist pipe end to
+end with the one item the game has. A move is always a **swap**, never an
+overwrite, and validates BOTH ends — so no mis-drop can destroy an item.
+
+Sheathing is **data only**: the slot holds a weapon, it does not draw it on the
+avatar's back. The visual is a `sheath_back` socket in the rig plus a matching
+grip context on the item — `ItemGrip`'s context map (`game/item.h`) already
+anticipates exactly that, so it is content, not code.
+
+### Mirror in, intent out
+
+`ui/inventory_ui.cpp` is a drawing function. It reads `UIState`'s mirrors and
+writes `UIState`'s one-shot intent latches; it never touches an `Inventory`, an
+`Equipment`, a `GlyphInventory` or the avatar. `main.cpp` consumes the latch,
+calls the real method, and next frame's mirror shows the result. The one address
+both sides speak is `KitRef` (`game/kitref.h`) — a dependency-free header
+precisely so the UI can name a slot without pulling the item system in, and so
+there is one definition rather than two that must agree.
+
+Binding a glyph in the arsenal rewires the live number row, because the panel
+and the keys read one mirror.
+
+### Everything crosses by NAME
+
+Item and glyph slots hold indices into `ItemLibrary::items` /
+`GlyphLibrary::glyphs`, both **file-order dependent** and renumbered by any edit
+to `items.json` or `glyphs.json`. So every crossing — the `R` hot reload, the
+`PLYR` save section — snapshots names and re-resolves them. A name that no
+longer resolves empties the slot with a log line: content legitimately
+disappears between saves, and that is the contract, not a failure.
+
+This closed two live bugs as well as preventing new ones: the hot-reload path
+carried a comment promising the hotbar was "re-validated below" and there was no
+such code, and `GrantAllAndBind` threw away the player's spell bindings on every
+`R`.
+
+### Persistence: `entities.sve` section `PLYR` v1
+
+Registered in `game/persist.cpp` beside `DBRS`/`MOBS`/`AVTR`. A bundle of
+references rather than a system with its own `SaveState`, because no single
+object owns all of it — the hotbar predates the pack and the caster is
+deliberately separate from the player. Length-prefixed strings with explicit
+counts, so a build whose `kItemSlots` or `Bag::kSlots` has changed reads an older
+file correctly instead of walking off the end. A truncated or unknown-version
+payload is REFUSED, not half-applied.
+
+### Verification
+
+`--gate player-kit` (`src/test/selftest_playerkit.cpp`) is CPU-only and builds
+its own two-item / three-glyph fixtures, so it asserts on the RULES rather than
+on today's content: the refusal matrix in both directions, swap-never-overwrite,
+binding by ownership, name re-resolution across a simulated library reorder, and
+a `PLYR` round trip compared **by name**. It runs in milliseconds and needs no
+GPU, which is what makes it the whole iteration loop for the equipment model.
+
+`--shot-inventory` runs the windowed game, damages the avatar on a fixed
+schedule and writes two frames — `screenshot_inventory.bmp` (gear) and
+`screenshot_inventory_health.bmp` (inspector). The screen's job is to be looked
+at, so the harness that judges it produces a picture; it prints the image's
+pixel sum, because "wrote the file" is true of an all-black rectangle too.
+
 ## 10. Networking (design now, build later)
 
 With the determinism discipline of §2/§4, **both** classic models are viable, and

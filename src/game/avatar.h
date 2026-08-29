@@ -265,6 +265,30 @@ class PlayerAvatar : public Mob {
   float PartHpMax(int part) const {
     return part >= 0 && part < (int)limbDefs_.size() ? limbDefs_[part].hp : 0.0f;
   }
+  // ---- how much of a part is still THERE ----------------------------------
+  // hp answers "how hurt is this limb"; these answer "how much of it is left",
+  // and they are genuinely different questions the moment carving exists — a
+  // laser can bore a limb hollow without ever driving its hp to zero, and a
+  // blast can shave hp off a limb that has lost no geometry at all. The
+  // character panel's inspect view reports the ratio, so "62% intact" is a
+  // measurement of the actual voxels rather than a restatement of the hp bar.
+  //
+  // COUNTED ON THE LATTICE `voxelsAtSpawn` WAS COUNTED ON — the SKIN whenever
+  // the limb has one, the collider otherwise. Mob::CarveLimbRadial says why in
+  // as many words: the two lattices differ by (skinScale/physScale)^3, so
+  // mixing them scales the fraction by that factor. Measured, on mina
+  // (skinScale 8, physScale 4): an untouched limb reported "12% intact",
+  // which is 1/8 — the ratio, not the damage.
+  uint32_t PartVoxelCount(int part) const {
+    if (part < 0 || part >= (int)limbs_.size()) return 0u;
+    const MobLimb& l = limbs_[part];
+    return (uint32_t)(l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
+  }
+  uint32_t PartVoxelsAtSpawn(int part) const {
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].voxelsAtSpawn
+                                                 : 0u;
+  }
+
   // Actively losing blood: either an arterial gush from a fresh stump or an
   // ordinary wound still owing whole voxels of blood.
   bool PartBleeding(int part) const {

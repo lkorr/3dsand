@@ -969,6 +969,22 @@ void Recorder::Finish() {
     if (e.first->presentable && e.first->layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
       TransitionImage(e.first, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+    // SAMPLED images get the same treatment for the same reason: the reader is
+    // outside this recording (ImGui's own descriptor, for the character
+    // panel's avatar portrait), so the layout it will be read in has to be
+    // established here as the last image operation. Without it the attachment
+    // ends the pass in COLOR_ATTACHMENT_OPTIMAL and the sampling descriptor
+    // describes a layout the image is not in — which validation catches as
+    // "expects SHADER_READ_ONLY_OPTIMAL, current layout is UNDEFINED".
+    //
+    // dst is FRAGMENT_SHADER/SHADER_READ rather than ALL_COMMANDS: unlike a
+    // present (whose visibility comes from a queue semaphore) this really is
+    // read by a later shader, so the barrier has a genuine destination.
+    else if (e.first->sampled &&
+             e.first->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+      TransitionImage(e.first, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
   }
   FlushPendingImages();
 

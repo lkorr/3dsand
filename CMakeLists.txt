@@ -359,6 +359,7 @@ add_executable(sandvox
   src/test/selftest_mob.cpp
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp
+  src/test/selftest_playerkit.cpp
   src/test/selftest_audio.cpp
   src/audio/device.cpp
   src/audio/library.cpp
@@ -385,6 +386,11 @@ add_executable(sandvox
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
   src/ui/overlay.cpp
+  # The character screen (I): the panel armour, pickups and spell acquisition
+  # land into. theme.cpp owns the ImGui style + the pixel-art chrome atlas;
+  # inventory_ui.cpp is a pure drawing function over UIState.
+  src/ui/theme.cpp
+  src/ui/inventory_ui.cpp
   src/telemetry.cpp
 )
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`

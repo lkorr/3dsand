@@ -39,6 +39,7 @@ const std::vector<Gate>& AudioGates();
 const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
+const std::vector<Gate>& PlayerKitGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -57,6 +58,12 @@ const char* const kOrder[] = {
     // property every later gate's fixture placement silently assumes. It also
     // has to run before anything moves the window, and it leaves the origin
     // exactly where `determinism` (which does not set it) needs it.
+    // FIRST OF ALL, and it costs nothing to put it there: `player-kit` is
+    // pure CPU with its own fixtures — no world, no GPU, no assets — so it can
+    // neither disturb the pristine worldgen `terrain` needs nor be disturbed
+    // by anything. Running it before the expensive gates also means a broken
+    // equipment model is reported in the first second of a full run.
+    "player-kit",
     "terrain",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
@@ -99,7 +106,7 @@ const std::vector<Gate>& Registry() {
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates()})
+                          &SpellGates(), &PlayerKitGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

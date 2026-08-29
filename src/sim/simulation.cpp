@@ -1355,6 +1355,16 @@ void Simulation::EnsureDepth(uint32_t width, uint32_t height) {
   depthView_ = depthTex_.CreateView();
 }
 
+void Simulation::EnsureAuxDepth(uint32_t width, uint32_t height) {
+  if (auxDepthView_ && auxDepthW_ == width && auxDepthH_ == height) return;
+  auxDepthW_ = width;
+  auxDepthH_ = height;
+  auxDepthTex_ =
+      device_.CreateTexture({width, height, 1}, kDepthFormat,
+                            rhi::TextureUsage::RenderAttachment, "depthAux");
+  auxDepthView_ = auxDepthTex_.CreateView();
+}
+
 void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   if (format == targetFormat_) return;
   targetFormat_ = format;
@@ -1512,6 +1522,31 @@ rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,
   d.color.clearValue[3] = 1.0;
   d.hasDepth = true;
   d.depth.view = depthView_;
+  d.depth.loadOp = rhi::LoadOp::Clear;
+  d.depth.storeOp = rhi::StoreOp::Store;
+  d.depth.clearValue = 0.0f;  // reversed-Z: clear to far
+  return enc.BeginRenderPass(d);
+}
+
+rhi::RenderPass Simulation::BeginAuxRenderPass(const rhi::CommandEncoder& enc,
+                                               const rhi::TextureView& target,
+                                               rhi::TextureFormat format,
+                                               uint32_t width, uint32_t height,
+                                               const float clear[4]) {
+  EnsureRenderPipelines(format);
+  EnsureAuxDepth(width, height);
+
+  rhi::RenderPassDesc d{};
+  d.label = "aux";
+  d.color.view = target;
+  d.color.loadOp = rhi::LoadOp::Clear;
+  d.color.storeOp = rhi::StoreOp::Store;
+  d.color.clearValue[0] = clear[0];
+  d.color.clearValue[1] = clear[1];
+  d.color.clearValue[2] = clear[2];
+  d.color.clearValue[3] = clear[3];
+  d.hasDepth = true;
+  d.depth.view = auxDepthView_;
   d.depth.loadOp = rhi::LoadOp::Clear;
   d.depth.storeOp = rhi::StoreOp::Store;
   d.depth.clearValue = 0.0f;  // reversed-Z: clear to far

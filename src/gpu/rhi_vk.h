@@ -59,5 +59,18 @@ TextureView WrapSwapchainImage(vk::Image* img);
 // because ImGui's render backend takes it directly.
 VkCommandBuffer NativeCmd(const RenderPass& p);
 
+// The VkImageView behind a seam TextureView, for the same ONE consumer and the
+// same reason as NativeCmd: src/ui/overlay.cpp hands it to
+// ImGui_ImplVulkan_AddTexture, which takes a native handle directly. Used by
+// the character panel's live avatar portrait, which is rendered offscreen
+// through the ordinary seam and then SAMPLED by ImGui.
+//
+// Deliberately NOT a general texture-binding path: rhi::BindGroupEntry still
+// holds only buffers and there is still no CreateSampler on the seam, because
+// nothing inside the engine samples a texture. Widening the seam for one UI
+// image would be a large change to serve a consumer that already has a
+// sanctioned exception.
+VkImageView NativeImageView(const TextureView& v);
+
 }  // namespace vkr
 }  // namespace rhi
