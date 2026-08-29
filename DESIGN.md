@@ -2299,16 +2299,37 @@ Which def the player wears is one string — `avatarDefName` in `main.cpp`, whic
 the selftest's avatar block reads too, so swapping characters cannot leave the
 test pinned to the old one.
 
-**One schema, two drivers.** The avatar is an ordinary `MobDef`: same `.vox` +
-sidecar format, same loader, same `AnimSkeleton` runtime. It therefore
-inherits clips, masks, two-bone IK, the gait state machine, springs and — the
-reason it is worth doing this way — the `states` dismemberment table, at zero
-marginal cost. What it does *not* inherit is `MobSystem`'s driver: `PlayerAvatar`
-takes its position and facing from `Player` instead of the wander drive.
-Expressing this as "a mob the player possesses" would have meant threading
-input through the wander drive, the despawn sweep and `kMaxMobs`; a separate
-driver costs one file and leaves `MobSystem` untouched. Anything an animator
-authors for a mob works on the player and vice versa.
+**THE AVATAR IS A MOB — one class, two drivers (2026-08-29 refactor).**
+`class Mob` (`game/mob.h`) is the per-creature entity: the unified `MobLimb`
+list, the animation state, and ONE implementation of every body mechanic —
+damage, severing, dying, per-voxel carving (with connectivity splits and
+collapse-severing), burning/dissolution, bleeding (gore-variance profile,
+gouts, drip spray), item holding, kinematic pose submit and render appends.
+`PlayerAvatar` **derives from `Mob`** and NPCs are plain `Mob` records driven
+by `MobSystem`'s sense→intent→steer→drive stages. A chemical reaction, blast
+or blade that works on an NPC works on the player through the same code by
+construction; before the refactor the avatar kept parallel copies that had
+already drifted (its explosion damage was an hp-only approximation with no
+real carving, its burn flush never rebuilt the collider, its bleeding lacked
+the variance profile and drip spray).
+
+What the avatar does differently is confined to two seams. The DRIVER:
+`PlayerAvatar::PreTick` takes position and facing from `Player` (plus its own
+gait, ledge-hang arm IK, head look, weapon-arm pose and footfall events) where
+`MobSystem::PreTick` runs the AI stages — everything else in the two PreTicks
+is the same `Mob` upkeep calls. And the EXPLICIT-EXCEPTION virtuals on `Mob`:
+`AvatarLayer()` (limbs ride the AVATAR physics layer), `OnBodyReleasedToWorld`
+(strip that layer when a part becomes debris), `DropLimbListOnDeath` (the HUD
+keeps per-part hp through the death screen) and `MarkInstancesDirty` (own
+render slot range). Adding avatar behaviour anywhere else in shared mechanics
+is the bug this shape exists to make impossible.
+
+Item holding is BASE-CLASS scaffolding: `Mob::EquipItem` borrows a rig slot
+exactly as the avatar always did, so a mob wields a sword through the identical
+path (`MobSystem::EquipItem(mobId, ...)` is the id-keyed wrapper; mob combat
+needs only an AI that calls it). Each creature owns a per-instance copy of its
+skeleton and limb defs (`skel_`/`limbDefs_`) so an item slot can append to any
+rig without growing the shared def.
 
 **Damage is the same path as everything else.** A laser crossing a joint
 anchor severs that part; the piece is handed to `DebrisSystem::AdoptBody` with
@@ -2316,8 +2337,11 @@ its `MicroBodyRef`, so it keeps its microvoxel detail and is then culled, burnt
 and settled by the ordinary debris rules with no avatar-specific code. Bleeding
 goes out as `BrushOp`s and `ParticleSpawn`s on the shared per-tick budget, i.e.
 through the MutationQueue like every other world edit (rule 3). Every field in
-`PlayerAvatar` is CPU-float presentation state and never touches the hashed
-grid (rule 1) — `--selftest` determinism is unchanged with an avatar standing.
+`Mob`/`PlayerAvatar` is CPU-float presentation state and never touches the
+hashed grid (rule 1) — `--selftest` determinism is unchanged with an avatar
+standing, and the refactor kept the NPC pose/bleed timing byte-compatible
+(`SubmitPose(writeXf=false)` preserves the PostStep-lagged transforms the mob
+bleed positions always read).
 
 **Your own body must not push you** (`Layers::AVATAR`). The avatar's limbs are
 drawn *around* the player's capsule proxy — `origin_` is derived from

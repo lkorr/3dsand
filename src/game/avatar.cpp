@@ -79,12 +79,6 @@ ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
   return s;
 }
 
-int FindModelIndex(const Prefab& p, const std::string& name) {
-  for (size_t i = 0; i < p.models.size(); i++)
-    if (p.models[i].name == name) return (int)i;
-  return -1;
-}
-
 }  // namespace
 
 void PlayerAvatar::Init(Physics* phys, World* world, DebrisSystem* debris,
@@ -92,24 +86,15 @@ void PlayerAvatar::Init(Physics* phys, World* world, DebrisSystem* debris,
   phys_ = phys;
   world_ = world;
   debris_ = debris;
-  mobs_ = mobs;
+  sys_ = mobs;
   OnMaterialsReloaded(mats);
 }
 
 void PlayerAvatar::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
-  // Indexed exactly as MobSystem's table is — no leading air slot. The two
-  // feed the same Physics::CreateDebrisBodyXf, so a different convention here
-  // would silently give the avatar every material's mass off by one.
-  densityOf_.clear();
-  classOf_.clear();
-  for (const MaterialDef& m : mats) {
-    densityOf_.push_back((float)m.gpu.density);
-    // Collision class, not raw klass: passable vegetation reads as gas so the
-    // avatar's foot probe passes through reeds and kelp rather than planting
-    // on them (sim/materials.h kMatFlagPassable).
-    classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
-                                                        : m.gpu.klass);
-  }
+  // The density/class tables live on MobSystem now (Mob::DensityOf/ClassOf):
+  // ONE table shared by every creature, so the avatar cannot get a material's
+  // mass off by one against a mob's. Kept for call-site compatibility.
+  (void)mats;
 }
 
 void PlayerAvatar::SetDefs(const std::vector<MobDef>* defs,
@@ -121,9 +106,13 @@ void PlayerAvatar::SetDefs(const std::vector<MobDef>* defs,
   defs_ = defs;
   defName_ = defName;
   def_ = nullptr;
+  defIndex_ = -1;  // rides on sever/voice events; -1 is guarded by consumers
   if (!defs_) return;
-  for (const MobDef& d : *defs_)
-    if (d.name == defName_) def_ = &d;
+  for (size_t i = 0; i < defs_->size(); i++)
+    if ((*defs_)[i].name == defName_) {
+      def_ = &(*defs_)[i];
+      defIndex_ = (int)i;
+    }
   ResolveParts();
 }
 
@@ -131,7 +120,7 @@ void PlayerAvatar::ResolveParts() {
   parts_ = AvatarParts{};
   if (!def_) {
     skel_ = AnimSkeleton{};
-    limbs_.clear();
+    limbDefs_.clear();
     return;
   }
   // Re-seed the owned rig from the (possibly hot-reloaded) def. This runs
@@ -140,7 +129,7 @@ void PlayerAvatar::ResolveParts() {
   // re-appends the slot. Doing it in both places keeps "the owned rig always
   // matches the current def" true no matter which entry point ran last.
   skel_ = def_->skel;
-  limbs_ = def_->limbs;
+  limbDefs_ = def_->limbs;
   heldSlot_ = -1;
   heldItem_.clear();
   const AnimSkeleton& sk = skel_;
@@ -158,7 +147,7 @@ void PlayerAvatar::ResolveParts() {
   parts_.legUL = sk.FindPart("legU.L");
   parts_.legUR = sk.FindPart("legU.R");
   parts_.staff = sk.FindPart("staff");
-  // Same reasoning as the parts above, for the clips the per-tick locomotion
+  // Same reasoning as the limbs_ above, for the clips the per-tick locomotion
   // path selects between.
   locoClips_.idle = sk.FindClip("idle");
   locoClips_.walk = sk.FindClip("walk");
@@ -176,254 +165,6 @@ void PlayerAvatar::ResolveParts() {
 // THE ENTITY <-> SLOT SYNC SEAM. Everything that makes a held item behave like
 // a limb happens here and nowhere else; see the note in avatar.h.
 
-bool PlayerAvatar::EquipItem(const ItemDef* item, const char* context) {
-  if (!def_ || !phys_) return false;
-
-  // Unequip first, always — including on a re-equip, so swapping weapons goes
-  // through exactly one code path instead of a "replace in place" variant that
-  // would have to duplicate the joint and body teardown.
-  if (heldSlot_ >= 0) {
-    Part& old = parts[heldSlot_];
-    if (old.joint) phys_->DestroyJoint(old.joint);
-    if (old.body) phys_->RemoveBody(old.body);
-    // The slot is appended last, so popping it keeps parts/skel_/limbs_
-    // index-parallel with no renumbering. Anything holding a part index across
-    // an equip would be broken by a mid-vector erase; this cannot be.
-    parts.pop_back();
-    skel_.parts.pop_back();
-    limbs_.pop_back();
-    if ((int)hidden_.size() > heldSlot_) hidden_.pop_back();
-    anim_.partAlive.resize(skel_.parts.size());
-    anim_.springs.resize(skel_.parts.size());
-    heldSlot_ = -1;
-    heldItem_.clear();
-    heldPartIndex_ = -1;
-    heldPart_.clear();
-    instancesDirty_ = true;
-  }
-  if (!item) return true;
-  if (!spawned_) return false;
-
-  const int si = def_->FindSocket(context);
-  if (si < 0) return false;              // no such socket: loud, per avatar.h
-  const MobSocketDef& sock = def_->sockets[si];
-  const ItemGrip* grip = item->Grip(context);
-  if (!grip) return false;               // item cannot be held this way
-  if (sock.partIndex < 0 || sock.partIndex >= (int)parts.size()) return false;
-  if (!PartAlive(sock.partIndex)) return false;   // no hand, no grip
-
-  // ---- the borrowed slot --------------------------------------------------
-  const int slot = (int)parts.size();
-  parts.push_back(Part{});
-  limbs_.push_back(MobLimbDef{});
-  skel_.parts.push_back(AnimPart{});
-  hidden_.push_back(0);
-
-  MobLimbDef& ld = limbs_[slot];
-  ld.name = "item:" + item->name;
-  ld.parent = sock.part;
-  ld.joint = Physics::JointType::Fixed;   // a grip does not hinge
-  ld.hp = item->hp;
-  ld.severable = item->severable;
-  ld.vital = false;                       // losing your sword is not fatal
-  ld.tag = "item";
-  ld.severImpactSpeed = item->severImpactSpeed;
-  ld.hasSpring = item->hasSpring;
-  ld.spring = item->spring;
-  ld.hasEdge = item->hasEdge;
-  ld.edgeFrom = item->edgeFrom;
-  ld.edgeTo = item->edgeTo;
-  ld.edgeHalfWidth = item->edgeHalfWidth;
-  ld.microModel = item->microModel;
-
-  AnimPart& ap = skel_.parts[slot];
-  ap.name = ld.name;
-  ap.parent = sock.partIndex;
-  ap.tag = ld.tag;
-  ap.hasSpring = ld.hasSpring;
-  ap.spring = ld.spring;
-
-  // ---- SOCKET x GRIP, composed forward ------------------------------------
-  //
-  // The socket is a point in the HAND's own frame; the grip is how the item
-  // sits once placed there. Translation applies BEFORE rotation (item.h), so
-  // the item's local offset is rotated into the socket frame rather than added
-  // after it — getting that order backwards puts the pommel where the tip
-  // should be and looks like a bad grip constant.
-  //
-  // NOT the inverse form (Inverse(grip) x socket) VR rigs use: that solves for
-  // a hand pose given a fixed grip, which is not the question here.
-  const Part& hand = parts[sock.partIndex];
-  const Quat q = QuatMul(sock.rotation, grip->rotation);
-  ap.rest.rot = q;
-  // The slot's rest position, relative to the hand part, is the socket offset
-  // measured from the hand's own model corner.
-  const Vec3 socketLocal = sock.offset - hand.restOffset;
-
-  // ---- put the HILT BOX on the socket -------------------------------------
-  //
-  // The socket is the centre of the hand's authored limb box; the hilt is the
-  // centre of the item's authored hilt box (item.h ItemHilt). Aligning the two
-  // is the whole placement, and both sides come from the LIMB/ART definitions
-  // rather than from a collider or a hand-tuned constant — so re-authoring
-  // either one keeps the sword in the fist instead of silently sliding it out.
-  //
-  // Subtracted, not added: the hilt centre is measured from the ITEM's origin,
-  // and what we need is where to put that origin so the hilt lands on the
-  // socket. Rotated first, because the item is placed rotated.
-  //
-  // WITHOUT a hilt box this falls back to translation alone, which is how the
-  // sword used to be placed — and which was wrong by 2.5 world voxels against
-  // a fist 1 voxel wide, so the blade hung outboard and low. `translation` now
-  // means a residual nudge on top of a correct alignment, and is zero for a
-  // well-authored item.
-  // `gripLocal` is the vector, IN THE ITEM'S OWN FRAME, from the item's origin
-  // to the point the fist closes on. With a hilt box that is the hilt centre
-  // (plus any residual nudge); without one it degrades to the bare translation,
-  // which is the arrangement that shipped the bug.
-  const Vec3 gripLocal =
-      item->hilt.has ? item->hilt.center - grip->translation
-                     : (grip->translation * -1.0f);
-  // REST.POS IS THE ANCHOR, exactly as it is for every other part.
-  //
-  // This is the convention the whole rig runs on and the item must not be the
-  // exception: AnimFlatten chains rest.pos parent-to-child, the drive loop
-  // recovers the body corner with `anchorW - Rotate(rot, anchorLimb)`, and
-  // WeaponEdge/DetachPart go the other way with `xf.pos + Rotate(q,
-  // anchorLimb)`. Placing the item's ORIGIN here instead — the intuitive
-  // reading, since the grip is expressed from the origin — silently redefines
-  // anchorLimb for this one part and every one of those call sites then
-  // disagrees with it by the grip vector, rotated by the animated hand. That
-  // reads as the blade wandering during a swing rather than as a fixed offset,
-  // which is why it does not look like a placement bug at all.
-  ap.rest.pos = socketLocal;
-  ap.anchorLocal = sock.offset;
-
-  Part& p = parts[slot];
-  p.hp = item->hp;
-  p.size = item->size;
-  p.microModel = item->microModel;
-  const float inv = 1.0f / (float)(item->scale ? item->scale : 1);
-  // restOffset MEANS THE MODEL'S MIN CORNER, in the part's own frame — that is
-  // the contract every other part in this file keeps (see the note above
-  // Spawn, and mob.cpp's limb.restOffset), and it is what the kinematic drive
-  // loop assumes when it does `pos = anchorW - Rotate(rot, anchorLimb)`.
-  //
-  // It used to be set to ap.rest.pos here, which is a completely different
-  // quantity: the item's ORIGIN measured relative to the HAND. Mixing the two
-  // spaces made anchorLimb meaningless, and the drive loop then placed the
-  // sword body several voxels from the fist every tick — the "sword lying at
-  // the character's feet" symptom, which survived fixing the grip offset
-  // because the two bugs are independent.
-  p.restOffset = Vec3{(float)item->offset.x, (float)item->offset.y,
-                      (float)item->offset.z} * inv;
-  // anchorLimb: the anchor measured from this part's own min corner, in the
-  // part's own frame — the identical relationship `anchor - restOffset` states
-  // for a limb. Here the anchor sits `gripLocal` from the item's ORIGIN, and
-  // restOffset is that origin's offset to the corner, so the two compose.
-  // Set BEFORE the body is created, because the initial placement below runs
-  // the same two steps the drive loop does and needs this term.
-  p.anchorLimb = gripLocal - p.restOffset;
-  p.voxels.reserve(item->voxels.size());
-  for (const PrefabVoxel& v : item->voxels) {
-    uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-    p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
-                        (uint16_t)(v.material | (variant << 12))});
-  }
-
-  // Body at the composed pose, on the avatar layer like every other part (your
-  // own sword must not shove you any more than your own elbow may).
-  //
-  // The body sits at the item's MIN CORNER, not at its anchor — the same place
-  // Spawn puts a limb's body.
-  BodyTransform bxf{};
-  const Quat handQ{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2],
-                   hand.xf.quat[3]};
-  const Quat worldQ = QuatMul(handQ, q);
-  // Same two steps the drive loop takes, in the same order, so the pose on the
-  // equip frame matches the pose on every frame after it: reach the anchor
-  // through the hand, then back off to the corner the collider is built around.
-  // Doing only the first step leaves the body one anchor-offset out for one
-  // tick, which is a visible pop as the sword snaps into the fist.
-  bxf.pos = hand.xf.pos + QuatRotate(handQ, ap.rest.pos) -
-            QuatRotate(worldQ, p.anchorLimb);
-  bxf.quat[0] = q.x; bxf.quat[1] = q.y; bxf.quat[2] = q.z; bxf.quat[3] = q.w;
-  p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, densityOf_, true, inv);
-  if (p.body == 0) {
-    parts.pop_back();
-    skel_.parts.pop_back();
-    limbs_.pop_back();
-    hidden_.pop_back();
-    return false;
-  }
-  phys_->SetBodyKinematic(p.body, true);
-  phys_->SetBodyAvatarLayer(p.body, true);
-
-  // THE GRIP POINT IN THE BODY'S OWN FRAME.
-  //
-  // Everything above is in the item's AUTHORED frame, where the origin is the
-  // model's corner. Jolt does not keep that frame: a compound shape is
-  // RE-CENTRED on its centre of mass, so the body position GetTransform hands
-  // back is the middle of the blade, not the corner — the sword's local bounds
-  // run about -5.2..+5.8 rather than 0..11. That recentring is the reason
-  // every offset derived against the authored corner came out wrong.
-  //
-  // So ask the shape where its own corner ended up and rebase the grip point
-  // on it, rather than modelling Jolt's recentring here (which would be a
-  // second source of truth for it). Same reasoning the collision-box overlay
-  // uses: read the shape that exists, not the one we meant to build.
-  {
-    Vec3 clo, chi;
-    if (phys_->GetLocalBounds(p.body, clo, chi)) gripBody_ = clo + gripLocal;
-    else gripBody_ = gripLocal;
-    // Place it once, right now, by the SAME expression the drive loop uses —
-    // so the equip frame and every frame after it agree and the sword does not
-    // pop into position on the first tick.
-    const Vec3 socketW = hand.xf.pos + QuatRotate(handQ, ap.rest.pos);
-    bxf.pos = socketW - QuatRotate(worldQ, gripBody_);
-    float bq[4] = {q.x, q.y, q.z, q.w};
-    phys_->MoveKinematicBody(p.body, bxf.pos, bq, 0.0f);
-  }
-
-  p.xf = bxf;
-  p.anchorRoot = sock.offset;
-  p.joint = phys_->CreateJoint(hand.body, p.body, JointDescFor(ld, p.xf.pos));
-
-  // The new body must not collide with the rest of the avatar, exactly as
-  // Spawn arranges for the limbs — a sword resting against the thigh would
-  // otherwise fight the solver every tick.
-  {
-    std::vector<uint64_t> handles;
-    for (const Part& q2 : parts)
-      if (q2.body) handles.push_back(q2.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
-
-  anim_.partAlive.resize(skel_.parts.size(), 1);
-  anim_.springs.resize(skel_.parts.size(), SpringState{});
-  heldSlot_ = slot;
-  heldItem_ = item->name;
-  // The weapon-arm IK derives the arm from the held part's parent, so these
-  // stay in step with the slot rather than being a second source of truth.
-  heldPartIndex_ = slot;
-  heldPart_ = ld.name;
-  instancesDirty_ = true;
-  return true;
-}
-
-void PlayerAvatar::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
-                                 float weight) {
-  weaponHand_ = handOffset;
-  // bladeDir/bladeUp are accepted but NOT applied to the held part: the blade
-  // keeps its grip angle and only the ARM is driven (see the weapon-arm block
-  // in UpdateAnimation). They are kept in the signature because the caller
-  // computes them anyway for the HUD, and because a weapon that genuinely does
-  // re-aim in the hand — a levelled spear, a raised shield — would want them.
-  if (bladeDir.len() > 1e-4f) weaponDir_ = bladeDir.normalized();
-  if (bladeUp.len() > 1e-4f) weaponUp_ = bladeUp.normalized();
-  weaponWeight_ = weight < 0 ? 0 : (weight > 1 ? 1 : weight);
-}
-
 void PlayerAvatar::SetLook(float yawRel, float pitch) {
   const auto& a = CurrentTuning().avatar;
   const float kDeg = 3.14159265f / 180.0f;
@@ -438,34 +179,7 @@ void PlayerAvatar::SetLook(float yawRel, float pitch) {
 }
 
 uint64_t PlayerAvatar::PartBody(int part) const {
-  return (part >= 0 && part < (int)parts.size()) ? parts[part].body : 0;
-}
-
-bool PlayerAvatar::OwnsBody(uint64_t bodyHandle) const {
-  if (!bodyHandle) return false;
-  for (const Part& p : parts)
-    if (p.body == bodyHandle) return true;
-  return false;
-}
-
-bool PlayerAvatar::WeaponEdge(Vec3& outBase, Vec3& outTip,
-                              float& outHalfWidth) const {
-  if (!def_ || heldPartIndex_ < 0) return false;
-  if (heldPartIndex_ >= (int)limbs_.size()) return false;
-  const MobLimbDef& ld = limbs_[heldPartIndex_];
-  if (!ld.hasEdge) return false;
-  if (!PartAlive(heldPartIndex_)) return false;   // severed: nothing to cut with
-  const Part& p = parts[heldPartIndex_];
-  if (!p.body) return false;
-  // The part's body transform sits at the model's MIN CORNER (restOffset in
-  // Spawn), and the authored edge is measured from that same corner — so the
-  // composition is direct, with no anchor rebasing. Reading the LIVE transform
-  // is the point: the hitbox is wherever the renderer just drew the blade.
-  Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
-  outBase = p.xf.pos + QuatRotate(q, ld.edgeFrom);
-  outTip = p.xf.pos + QuatRotate(q, ld.edgeTo);
-  outHalfWidth = ld.edgeHalfWidth;
-  return true;
+  return (part >= 0 && part < (int)limbs_.size()) ? limbs_[part].body : 0;
 }
 
 int PlayerAvatar::PartIndex(const std::string& name) const {
@@ -473,7 +187,7 @@ int PlayerAvatar::PartIndex(const std::string& name) const {
 }
 
 bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
-  if (spawned_ || !def_ || !phys_) return false;
+  if (spawned_ || !def_ || !phys_ || !sys_) return false;
   const MobDef& def = *def_;
   if (def.limbs.empty()) return false;
 
@@ -481,13 +195,10 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   // x/z, feet at the bottom of the box. Everything downstream derives from
   // origin_, so this one expression is where "the art lines up with the
   // collision box" is decided.
-  origin_ = Vec3{player.pos.x - def.worldSize.x * 0.5f,
-                 player.pos.y - Player::kHalfY,
-                 player.pos.z - def.worldSize.z * 0.5f};
+  const Vec3 at{player.pos.x - def.worldSize.x * 0.5f,
+                player.pos.y - Player::kHalfY,
+                player.pos.z - def.worldSize.z * 0.5f};
   heading_ = headingRad;
-  bodyY_ = origin_.y;
-  bodyUp_ = Vec3{0, 1, 0};
-  footInit_ = false;
   alive_ = true;
   // A respawn must not inherit the corpse's last glance: the goal is refreshed
   // from the camera on the next tick anyway, but the SMOOTHED value would ease
@@ -495,130 +206,21 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   // shoulder for a tenth of a second.
   lookYaw_ = lookYawGoal_ = 0;
   lookPitch_ = lookPitchGoal_ = 0;
+  // The player's own gore character, drawn by the SAME entity-variance roll a
+  // mob gets at spawn — one gore pipeline (the point of this refactor).
+  gore_ = MakeGoreProfile(id_);
 
-  // The rig this instance animates is a COPY of the def's (see avatar.h): a
-  // held item borrows a slot by APPENDING a part, and the shared def must not
-  // grow one. Reset here so a respawn never inherits the last life's sword.
-  skel_ = def.skel;
-  limbs_ = def.limbs;
-  heldSlot_ = -1;
-  heldItem_.clear();
-  heldPartIndex_ = -1;
-  heldPart_.clear();
-
-  parts.assign(def.limbs.size(), Part{});
-  // SKIN -> WORLD for positions authored in .vox units; the collider is built
-  // at 1/physScale because that is the lattice p.voxels live on (mob.h).
-  const float inv = 1.0f / (float)def.skinScale;
-  const float physInv = 1.0f / (float)std::max(1u, def.physScale);
-  const uint32_t ratio =
-      std::max(1u, def.skinScale / std::max(1u, def.physScale));
-
-  for (size_t i = 0; i < def.limbs.size(); i++) {
-    const MobLimbDef& ld = def.limbs[i];
-    int mi = FindModelIndex(def.prefab, ld.name);
-    if (mi < 0) continue;
-    const PrefabModel& model = def.prefab.models[mi];
-    Part& p = parts[i];
-    p.hp = ld.hp;
-    p.microModel = ld.microModel;
-    p.restOffset = Vec3{(float)model.offset.x, (float)model.offset.y,
-                        (float)model.offset.z} * inv;
-    if (ratio > 1) {
-      // Fine skin: the art is the skin lattice and the collider is DERIVED
-      // from it by majority-fill, exactly as MobSystem::Spawn does.
-      p.skinVoxels.reserve(model.voxels.size());
-      for (const PrefabVoxel& v : model.voxels) {
-        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-        p.skinVoxels.push_back(
-            {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12))});
-      }
-      bool overflow = false;
-      p.voxels = DownsampleSkin(p.skinVoxels, ratio, &overflow);
-      p.size = IVec3{(model.size.x + (int)ratio - 1) / (int)ratio,
-                     (model.size.y + (int)ratio - 1) / (int)ratio,
-                     (model.size.z + (int)ratio - 1) / (int)ratio};
-    } else {
-      p.size = model.size;
-      p.voxels.reserve(model.voxels.size());
-      for (const PrefabVoxel& v : model.voxels) {
-        uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-        p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
-                            (uint16_t)(v.material | (variant << 12))});
-      }
-    }
-    Vec3 o = origin_ + p.restOffset;
-    BodyTransform bxf{};
-    bxf.pos = o;
-    bxf.quat[3] = 1;
-    p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, densityOf_, true, physInv);
-    if (p.body == 0) {
-      for (Part& q : parts)
-        if (q.body) phys_->RemoveBody(q.body);
-      parts.clear();
-      return false;
-    }
-    phys_->SetBodyKinematic(p.body, true);
-    // YOUR OWN BODY MUST NOT PUSH YOU. These limbs live inside the player's
-    // capsule proxy by construction (origin_ above), so on the normal dynamic
-    // layer they are permanently interpenetrated with it: the solver fights a
-    // contact it can never resolve, and PlayerPushOut reads a large ejection
-    // vector whose direction swings with the gait. That is what made walking
-    // forward drift backwards and diagonally. The AVATAR layer is identical
-    // in every other respect and stays visible to rays, so laser hits and
-    // dismemberment are unchanged.
-    phys_->SetBodyAvatarLayer(p.body, true);
-    p.xf.pos = o;
-    p.xf.quat[3] = 1;
-  }
-
-  // Joints, after every body exists. Anchors come from the RIG
-  // (skel.parts[i].anchorLocal), already resolved and already converted
-  // micro -> world at load — re-deriving them here would be a second
-  // implementation of the same rule, and the two disagreeing shows up as
-  // limbs pivoting off-joint.
-  for (size_t i = 0; i < def.limbs.size(); i++) {
-    const MobLimbDef& ld = def.limbs[i];
-    if ((int)i == def.rootLimb) continue;
-    int pi = -1;
-    for (size_t k = 0; k < def.limbs.size(); k++)
-      if (def.limbs[k].name == ld.parent) pi = (int)k;
-    if (pi < 0 || !parts[i].body || !parts[pi].body) continue;
-    Vec3 anchor = def.skel.parts[i].anchorLocal;
-    parts[i].anchorRoot = anchor;
-    parts[i].anchorLimb = anchor - parts[i].restOffset;
-    parts[i].joint = phys_->CreateJoint(parts[pi].body, parts[i].body,
-                                        JointDescFor(ld, origin_ + anchor));
-  }
-  {
-    std::vector<uint64_t> handles;
-    for (const Part& p : parts)
-      if (p.body) handles.push_back(p.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
-  if (def.rootLimb >= 0 && def.rootLimb < (int)parts.size()) {
-    Part& root = parts[def.rootLimb];
-    root.anchorRoot = def.skel.parts[def.rootLimb].anchorLocal;
-    root.anchorLimb = root.anchorRoot - root.restOffset;
-  }
-
-  anim_ = AnimState{};
-  anim_.partAlive.assign(def.limbs.size(), 1);
-  anim_.springs.assign(def.limbs.size(), SpringState{});
-  anim_.feet.assign(def.skel.chains.size(), FootState{});
-  for (size_t c = 0; c < def.skel.chains.size(); c++) {
-    const IkChain& ch = def.skel.chains[c];
-    float len = 0;
-    for (size_t k = 1; k < ch.parts.size(); k++)
-      len += def.skel.parts[ch.parts[k]].rest.pos.len();
-    anim_.feet[c].legLength = len > 0.01f ? len : 1.0f;
-    // Only LEG chains schedule footsteps. The arm chains exist so gameplay can
-    // place a hand, and a gait that tried to walk on them would plant the
-    // wizard's palms on the ground every stride.
-    anim_.feet[c].valid = ch.tag == "leg";
-  }
-  anim_.lastPos = origin_;
-  hidden_.assign(def.limbs.size(), 0);
+  // THE one rig-construction path (Mob::BuildRig) — identical to a mob spawn,
+  // including the owned skel_/limbDefs_ copies an item slot appends to. The
+  // avatar-layer flag on every body rides the AvatarLayer() override.
+  if (!BuildRig(def, at)) return false;
+  // Only LEG chains schedule footsteps — the arm chains exist so gameplay can
+  // place a hand, and a gait that tried to walk on them would plant the
+  // wizard's palms on the ground every stride. The avatar's gait keys on this
+  // flag from the first frame (unlike the NPC gait, which lazily plants), so
+  // it is set here rather than in the shared BuildRig.
+  for (size_t ci = 0; ci < skel_.chains.size(); ci++)
+    anim_.feet[ci].valid = skel_.chains[ci].tag == "leg";
   spawned_ = true;
   instancesDirty_ = true;
 
@@ -627,33 +229,21 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   // the fresh rig built above is what it applies to. One-shot — an ordinary
   // respawn later in the session must come back whole.
   if (restore_.valid && restore_.defName == defName_) {
-    const size_t n = std::min(restore_.parts.size(), parts.size());
-    for (size_t i = 0; i < n; i++) parts[i].hp = restore_.parts[i].hp;
+    const size_t n = std::min(restore_.parts.size(), limbs_.size());
+    for (size_t i = 0; i < n; i++) limbs_[i].hp = restore_.parts[i].hp;
     for (size_t i = 0; i < n; i++)
-      if (!restore_.parts[i].alive && parts[i].body) DetachPart((int)i, false);
+      if (!restore_.parts[i].alive && limbs_[i].body) DetachLimb((int)i, false);
   }
   restore_.valid = false;
   return true;
 }
 
 void PlayerAvatar::Despawn() {
-  if (phys_) {
-    for (Part& p : parts) {
-      if (p.joint) phys_->DestroyJoint(p.joint);
-      // holdBody is the SAME handle already handed to DebrisSystem, so it is
-      // not ours to remove — AdoptBody transferred ownership.
-      if (p.body) phys_->RemoveBody(p.body);
-      // A part that burned owns a private brick out of the shared pool; the
-      // pool is a hard ceiling, so dropping the rig without returning it leaks
-      // words nothing will ever reclaim.
-      if (mobs_) mobs_->ReleaseOwnedBrick(p.microModel, p.burnOwnsBrick);
-      MobSystem::DropBurnIndex(p.burn);
-      p.joint = 0;
-      p.body = 0;
-      p.holdBody = 0;
-    }
-  }
-  parts.clear();
+  // Shared teardown (Mob::ReleaseRig): joints, bodies, owned bricks, burn
+  // indices, and any in-flight severed holds — the identical path a mob takes
+  // on reset/despawn, so neither side can forget the brick return.
+  if (phys_) ReleaseRig();
+  limbs_.clear();
   anim_ = AnimState{};
   pendingSpawns_.clear();
   spawned_ = false;
@@ -666,37 +256,8 @@ void PlayerAvatar::SetHiddenParts(const std::vector<uint8_t>& hidden) {
       std::equal(hidden_.begin(), hidden_.end(), hidden.begin()))
     return;                       // no change: don't force an instance rebuild
   hidden_ = hidden;
-  hidden_.resize(parts.size(), 0);
+  hidden_.resize(limbs_.size(), 0);
   instancesDirty_ = true;
-}
-
-void PlayerAvatar::PlayClip(const std::string& name) {
-  if (!def_) return;
-  PlayClipIndex(skel_.FindClip(name));
-}
-
-void PlayerAvatar::PlayClipIndex(int ci) {
-  if (!def_) return;
-  if (ci < 0 || ci >= (int)skel_.clips.size()) return;
-  for (ClipInstance& inst : anim_.clips)
-    if (inst.clip == ci && !inst.stopping) {
-      // ALREADY PLAYING: leave it alone. This used to rewind to timeMs = 0,
-      // which is right for a one-shot you re-trigger (cast, land) but fatal for
-      // the locomotion clips, because PreTick calls PlayClip("walk") EVERY
-      // TICK to keep it alive. Rewinding every tick pinned the clip at t=0
-      // forever: the arms sat frozen on the first keyframe — held out in front,
-      // never swinging — which is exactly the "zombie arms" look. A looping
-      // clip that is already running needs no retrigger at all.
-      if (!skel_.clips[ci].loop) {
-        inst.timeMs = 0;
-        inst.ageMs = 0;   // a re-triggered one-shot replays its blend-in too
-      }
-      return;
-    }
-  ClipInstance inst;
-  inst.clip = ci;
-  inst.weight = 1.0f;
-  anim_.clips.push_back(inst);
 }
 
 // ---- locomotion coupling ----------------------------------------------------
@@ -740,34 +301,6 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
 }
 
 // ---- animation --------------------------------------------------------------
-
-bool PlayerAvatar::GroundHeightAt(World& world, int wx, int wz, int yFrom,
-                                  int& outY, uint32_t* outMat) const {
-  // Scans down through the chunk cache, requesting a fetch for a missing
-  // chunk. Bounded to one column per foot per tick (rule 2). Same probe
-  // MobSystem uses — solids and powders carry weight, liquids and gases do
-  // not, so the wizard wades through blood rather than walking on it.
-  for (int y = yFrom; y > yFrom - 24; y--) {
-    IVec3 cell{wx, y, wz};
-    if (!world.CellInWindow(cell)) return false;
-    IVec3 wc{wx >> 4, y >> 4, wz >> 4};
-    const CachedChunk* cc = world.Cached(wc);
-    if (!cc || cc->voxels.size() != kChunkVol) {
-      world.RequestChunkFetch(wc);
-      return false;
-    }
-    uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(y & 15),
-             lz = (uint32_t)(wz & 15);
-    uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
-    if (mat != 0 && mat < classOf_.size() &&
-        (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER)) {
-      outY = y + 1;
-      if (outMat != nullptr) *outMat = mat;
-      return true;
-    }
-  }
-  return false;
-}
 
 void PlayerAvatar::UpdateGait(float dt, World& world) {
   const AnimSkeleton& sk = skel_;
@@ -1150,7 +683,7 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   AnimSampleAndBlend(sk, st, dt);
 
   // pelvis bob / sway / spine counter-rotation, suppressed while an authored
-  // clip owns the pose (a crawl keys the same parts these drive)
+  // clip owns the pose (a crawl keys the same limbs_ these drive)
   if (g.present && !clipOwnsPose && def_->rootLimb >= 0 &&
       def_->rootLimb < (int)sk.parts.size()) {
     Transform& root = st.local[def_->rootLimb];
@@ -1523,7 +1056,7 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       for (const MobSocketDef& sock : def_->sockets) {
         if (sock.partIndex < 0) continue;
         if (sock.partIndex == ch.effector) {
-          sockLocal = sock.offset - parts[sock.partIndex].restOffset;
+          sockLocal = sock.offset - limbs_[sock.partIndex].restOffset;
           found = true;
           mirrored = false;
           break;
@@ -1537,7 +1070,7 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
         if (found) continue;
         for (const IkChain& other : sk.chains) {
           if (other.tag == "arm" && other.effector == sock.partIndex) {
-            sockLocal = sock.offset - parts[sock.partIndex].restOffset;
+            sockLocal = sock.offset - limbs_[sock.partIndex].restOffset;
             found = true;
             mirrored = true;
             break;
@@ -1610,38 +1143,15 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
-  BurnParts(tick, world, cellOps);
+  BurnParts(tick, world, cellOps, spawns);
   if (!spawned_ || !def_) return;  // burnt to death: nothing left to drive
 
-  // Drain particles authored since the last tick (dismemberment bursts). Same
-  // reasoning as MobSystem: Sever() is reached from damage handling at several
-  // points in the frame, and appending straight to the caller's list from
-  // there would need it threaded through every one of those paths.
-  for (const ParticleSpawn& s : pendingSpawns_) {
-    if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
-    if (!world.CellInWindow({s.px >> 8, s.py >> 8, s.pz >> 8})) continue;
-    spawns.push_back(s);
-  }
-  pendingSpawns_.clear();
-
-  // Severed pieces tick down their hold before going dynamic, wherever the
-  // avatar is in its life: a piece left kinematic and unowned would never
-  // sleep (rule 2).
-  for (Part& p : parts) {
-    if (!p.holdBody) continue;
-    p.holdSeconds -= dt;
-    if (p.holdSeconds > 0) continue;
-    p.holdSeconds = 0;
-    phys_->SetBodyKinematic(p.holdBody, false);
-    // A severed part must collide with the body it came off again: the
-    // DisableCollisionsAmong group suppressed those contacts forever.
-    phys_->ClearCollisionGroup(p.holdBody);
-    // It also stops being "you". Back on the normal dynamic layer it can bump
-    // the player like any other debris — the avatar-layer exemption is only
-    // for limbs still attached and still living inside the player's capsule.
-    phys_->SetBodyAvatarLayer(p.holdBody, false);
-    p.holdBody = 0;
-  }
+  // Shared per-tick body upkeep (Mob) — identical to what MobSystem::PreTick
+  // runs for every NPC: drain gore authored outside the tick, and tick the
+  // severed holds down (the avatar-layer strip on release happens in the
+  // OnBodyReleasedToWorld override).
+  DrainPendingSpawns(world, spawns);
+  TickSeveredHolds(dt);
 
   if (alive_) {
     // The body follows the PLAYER, which is the whole difference from a mob.
@@ -1818,181 +1328,20 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
                       : moving ? (running ? locoClips_.run : locoClips_.walk)
                                : locoClips_.idle);
 
-    // ---- submit kinematic targets ----
-    Quat yaw = AxisAngle({0, 1, 0}, heading_);
-    Quat tilt = QuatFromTo({0, 1, 0}, bodyUp_);
-    Quat bodyRot = Mul(tilt, yaw);
-    Vec3 pivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
-    Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
-    for (size_t i = 0; i < parts.size(); i++) {
-      Part& p = parts[i];
-      if (!p.body) continue;
-      if (p.holdSeconds > 0) continue;   // severed, holding its last pose
-      Quat local = i < anim_.model.size() ? anim_.model[i].rot : Quat{};
-      Vec3 modelPos = i < anim_.model.size() ? anim_.model[i].pos : Vec3{};
-      Quat rot = QuatNormalize(Mul(bodyRot, local));
-      // modelPos is already in prefab coordinates: AnimFlatten starts from the
-      // root's rest.pos which IS rootAnchor, so every part's model pos already
-      // contains the root offset. Adding rootAnchor again shifts the entire rig
-      // by (pivot) from the player — invisible on a mob (nothing external tracks
-      // mob.origin), but on the avatar the camera sits at player.pos and the
-      // body must be there too. Using modelPos directly cancels the offset.
-      Vec3 anchorW =
-          bodyOrigin + pivot + Rotate(bodyRot, modelPos - pivot);
-      Vec3 pos = anchorW - Rotate(rot, p.anchorLimb);
-      float q[4] = {rot.x, rot.y, rot.z, rot.w};
-      phys_->MoveKinematicBody(p.body, pos, q, dt);
-      p.xf.pos = pos;
-      p.xf.quat[0] = rot.x; p.xf.quat[1] = rot.y;
-      p.xf.quat[2] = rot.z; p.xf.quat[3] = rot.w;
-    }
-
-    // ---- THE HELD ITEM: HILT ONTO THE HAND ---------------------------------
-    //
-    // Placed directly, from the hand's just-computed world transform, rather
-    // than through the anchorLimb/restOffset pair every other part uses. Those
-    // two fields describe a JOINT BETWEEN LIMBS OF ONE PREFAB — they are
-    // measured in prefab-local space against the model's own corner, and they
-    // are the right tool for a forearm hanging off an elbow. An item is not
-    // that: it is a foreign object with its own origin whose entire
-    // relationship to the rig is "this point of me sits at that point of the
-    // hand". Stated that way it is one rotate and one subtract, and there is
-    // no convention left to get subtly wrong.
-    //
-    // (Getting it wrong through the generic path is what put the sword at the
-    // character's feet: the two frames differ by the model corner AND by
-    // Jolt's centre-of-mass recentring, and an offset that absorbs both is a
-    // magic number nobody can check.)
-    if (heldSlot_ >= 0 && heldSlot_ < (int)parts.size()) {
-      Part& item = parts[heldSlot_];
-      const int handIdx = skel_.parts[heldSlot_].parent;
-      if (item.body && item.holdSeconds <= 0 && handIdx >= 0 &&
-          handIdx < (int)parts.size() && parts[handIdx].body) {
-        const Part& hand = parts[handIdx];
-        const Quat handQ{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2],
-                         hand.xf.quat[3]};
-        // The socket, in world space: a point in the hand's own frame, carried
-        // by whatever pose the hand is in this tick.
-        const Vec3 socketW =
-            hand.xf.pos + Rotate(handQ, skel_.parts[heldSlot_].rest.pos);
-        // The item's orientation is the hand's, composed with the authored
-        // grip rotation — so the blade keeps its angle in the fist through a
-        // swing instead of being re-aimed (melee.h's rule).
-        const Quat itemQ =
-            QuatNormalize(Mul(handQ, skel_.parts[heldSlot_].rest.rot));
-        // Put the grip point on the socket. gripBody_ is already in the item's
-        // BODY frame, so this needs no corner or recentring correction.
-        const Vec3 pos = socketW - Rotate(itemQ, gripBody_);
-        float q[4] = {itemQ.x, itemQ.y, itemQ.z, itemQ.w};
-        phys_->MoveKinematicBody(item.body, pos, q, dt);
-        item.xf.pos = pos;
-        item.xf.quat[0] = q[0]; item.xf.quat[1] = q[1];
-        item.xf.quat[2] = q[2]; item.xf.quat[3] = q[3];
-      }
-    }
+    // ---- submit kinematic targets (shared Mob path, held item included) ----
+    // writeXf=true: the held-item placement and the camera read the hand's
+    // FRESH pose this tick (see Mob::SubmitPose).
+    SubmitPose(dt, /*writeXf=*/true);
   }
 
-  // ---- bleeding: same decaying wound budget and bounded ops as mobs ----
-  if (def.bleedMat != 0) {
-    const auto& gore = CurrentTuning().gore;
-    const Quat bodyRotNow = AxisAngle({0, 1, 0}, heading_);
-    const Vec3 bodyOriginNow{origin_.x, bodyY_, origin_.z};
-    int bleedOps = 0;
-    for (size_t li = 0; li < parts.size(); li++) {
-      Part& p = parts[li];
-      Quat lq{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
-
-      if (p.gushTicks > 0) {
-        int decay = std::max(1, gore.severDecayTicks);
-        // Triangular weighting so severSpray is the droplet COUNT released
-        // over the window, not a rate to be multiplied out. Front-loaded: the
-        // first ticks after the cut throw the bulk and the tail thins, which
-        // is what reads as arterial rather than as a running tap.
-        float frac = (float)p.gushTicks / (float)decay;
-        int want = (int)std::lround(2.0f * (float)gore.severSpray * frac /
-                                    (float)decay);
-        Vec3 sOrigin = p.body ? p.xf.pos + Rotate(lq, p.gushLocal)
-                              : bodyOriginNow + Rotate(bodyRotNow, p.anchorRoot);
-        Vec3 axis = p.body ? Rotate(lq, p.gushDir)
-                           : Rotate(bodyRotNow, p.gushDir);
-        for (int k = 0; k < want; k++) {
-          if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
-          uint32_t h = Hash3((uint32_t)id_ * 2654435761u + (uint32_t)li, tick,
-                             (uint32_t)k * 0x9E3779B9u);
-          float cone = gore.severSprayCone;
-          Vec3 dir{axis.x + SignedUnit(h) * cone,
-                   axis.y + SignedUnit(Pcg(h ^ 0x51A17u)) * cone,
-                   axis.z + SignedUnit(Pcg(h ^ 0xB0011u)) * cone};
-          float sp = gore.severSpraySpeed *
-                     (0.75f + 0.5f * (float)(Pcg(h ^ 0x1234u) & 0xFFFFu) / 65535.0f);
-          if (sp < 0.0f) sp = 0.0f;
-          int life = std::clamp(gore.microLifeTicks, 1, 255);
-          if (!world.CellInWindow({ifloor(sOrigin.x), ifloor(sOrigin.y),
-                                   ifloor(sOrigin.z)}))
-            break;
-          spawns.push_back(MakeDroplet(sOrigin, dir * sp, def.bleedMat, true,
-                                       life, gore.microScale));
-        }
-        p.gushTicks--;
-      }
-
-      if (p.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
-      // Charge before emitting, shrinking the clump to what the wound can still
-      // afford — same rule 2 reasoning as the mob path (mob.cpp).
-      int clumpR = gore.bleedClumpRadius;
-      while (clumpR > 0 && (float)BleedClumpVoxels(clumpR) > p.bleedBudget)
-        clumpR--;
-      // Drip period, tunable — same rule as the mob path (mob.cpp). Modulo,
-      // not a mask, because the tuner offers every period and not just powers
-      // of two; the divisor is clamped >= 1 at load.
-      if (tick % (uint32_t)std::max(1, gore.bleedDripTicks) != 0) continue;
-      Vec3 w = p.body ? p.xf.pos + Rotate(lq, p.woundLocal)
-                      : bodyOriginNow + Rotate(bodyRotNow, p.anchorRoot);
-      // Clump size as a brush radius, debited by the sphere volume it paints —
-      // same rule and same reasoning as the mob drip (mob.cpp).
-      ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
-                     def.bleedMat, 0, 0, 0});
-      p.bleedBudget -= (float)BleedClumpVoxels(clumpR);
-      bleedOps++;
-    }
-  }
-}
-
-void PlayerAvatar::PostStep() {
-  for (Part& p : parts)
-    if (p.body) phys_->GetTransform(p.body, p.xf);
+  // ---- bleeding: THE mob bleed drive (Mob::BleedTick) — decaying wound
+  // budgets, dismemberment gouts, gore-profile variance and drip spray, under
+  // the avatar's own per-tick op counter ----
+  int bleedOps = 0;
+  BleedTick(tick, world, ops, spawns, bleedOps);
 }
 
 // ---- damage -----------------------------------------------------------------
-
-bool PlayerAvatar::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
-                          float impactSpeed) {
-  if (!def_ || !spawned_) return false;
-  for (size_t i = 0; i < parts.size(); i++) {
-    Part& p = parts[i];
-    if (p.body != bodyHandle) continue;
-    const MobDef& def = *def_;
-    const MobLimbDef& ld = limbs_[i];
-    Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
-    // a beam crossing the joint anchor severs outright
-    if ((int)i != def.rootLimb && p.joint) {
-      Vec3 anchorW = p.xf.pos + Rotate(q, p.anchorLimb);
-      if ((hitWorldVoxel - anchorW).len() < 1.75f) {
-        Sever((int)i);
-        return true;
-      }
-    }
-    bool impactSevers =
-        ld.severImpactSpeed > 0 && impactSpeed >= ld.severImpactSpeed;
-    p.hp -= amount;
-    p.woundLocal = RotateInv(q, hitWorldVoxel - p.xf.pos);
-    p.bleedBudget = AddBleedBudget(p.bleedBudget, amount * def.bleedPerDamage);
-    if (p.hp <= 0 || impactSevers) Sever((int)i);
-    else PlayClip("attack");
-    return true;
-  }
-  return false;
-}
 
 // ---- health, as the caster VM sees it (game/spell.h) ------------------------
 //
@@ -2003,8 +1352,8 @@ bool PlayerAvatar::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
 int32_t PlayerAvatar::TotalHealth() const {
   if (!spawned_ || !alive_) return 0;
   float sum = 0;
-  for (size_t i = 0; i < parts.size(); i++)
-    if (PartAlive((int)i) && parts[i].hp > 0) sum += parts[i].hp;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (PartAlive((int)i) && limbs_[i].hp > 0) sum += limbs_[i].hp;
   return sum <= 0 ? 0 : (int32_t)sum;
 }
 
@@ -2016,14 +1365,14 @@ int32_t PlayerAvatar::HealthMax() const {
   // silently rescaling itself to the smaller body.
   if (!def_) return 0;
   float sum = 0;
-  for (const MobLimbDef& ld : limbs_)
+  for (const MobLimbDef& ld : limbDefs_)
     if (ld.hp > 0) sum += ld.hp;
   return sum <= 0 ? 0 : (int32_t)sum;
 }
 
 void PlayerAvatar::SpendHealth(int32_t amount) {
   if (!spawned_ || !alive_ || amount <= 0) return;
-  // Spread the cost across live parts in proportion to what each still has,
+  // Spread the cost across live limbs_ in proportion to what each still has,
   // rather than draining the first one to zero — otherwise a mana overdraw
   // deterministically severs whichever limb happens to sort first, which reads
   // as a bug rather than as a cost.
@@ -2037,18 +1386,18 @@ void PlayerAvatar::SpendHealth(int32_t amount) {
     return;
   }
   const float frac = (float)amount / (float)total;
-  // Collect first: Sever() mutates `parts` (it detaches children too), so
+  // Collect first: Sever() mutates `limbs_` (it detaches children too), so
   // deciding everything against the pre-carve state and acting afterwards is
   // what keeps this from walking a list that reshapes underneath it.
   std::vector<int> severed;
-  for (size_t i = 0; i < parts.size(); i++) {
-    if (!PartAlive((int)i) || parts[i].hp <= 0) continue;
-    parts[i].hp -= parts[i].hp * frac;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    if (!PartAlive((int)i) || limbs_[i].hp <= 0) continue;
+    limbs_[i].hp -= limbs_[i].hp * frac;
     // Bleeding from the strain of the overcast, through the ordinary budget.
     if (def_)
-      parts[i].bleedBudget = AddBleedBudget(parts[i].bleedBudget,
+      limbs_[i].bleedBudget = AddBleedBudget(limbs_[i].bleedBudget,
                                             6.0f * frac * def_->bleedPerDamage);
-    if (parts[i].hp <= 0.0f) severed.push_back((int)i);
+    if (limbs_[i].hp <= 0.0f) severed.push_back((int)i);
   }
   for (int i : severed)
     if (PartAlive(i)) Sever(i);
@@ -2068,11 +1417,11 @@ void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
   // the sever — ragdoll, gore spray, debris adoption, settle-back — is the
   // existing pipeline with no spell-specific code.
   std::vector<int> hits;
-  for (size_t i = 0; i < parts.size(); i++) {
-    if (!PartAlive((int)i) || !parts[i].body) continue;
-    const MobLimbDef& ld = limbs_[i];
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    if (!PartAlive((int)i) || !limbs_[i].body) continue;
+    const MobLimbDef& ld = limbDefs_[i];
     if ((int)i == def_->rootLimb || ld.vital || !ld.severable) continue;
-    if ((parts[i].xf.pos - atWorldVoxel).len() <= radiusVox + 2.0f)
+    if ((limbs_[i].xf.pos - atWorldVoxel).len() <= radiusVox + 2.0f)
       hits.push_back((int)i);
   }
   for (int i : hits)
@@ -2083,54 +1432,13 @@ void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
 void PlayerAvatar::CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                World& world,
                                std::vector<ParticleSpawn>& spawns) {
-  (void)world;
-  (void)spawns;
-  if (!spawned_ || !def_ || !alive_ || radiusVoxels <= 0.0f) return;
-  const MobDef& def = *def_;
-  const float physInv =
-      1.0f / (float)std::max(1u, def.physScale);
-
-  // Collect which parts to damage FIRST: Sever() mutates parts and can
-  // cascade to children, so deciding everything against the pre-damage state
-  // and acting afterwards avoids walking a list that reshapes underneath us.
-  struct Hit {
-    int index;
-    float dist;
-    float fraction;  // 0 at centre, 1 at edge
-  };
-  std::vector<Hit> hits;
-  for (size_t i = 0; i < parts.size(); i++) {
-    if (!PartAlive((int)i) || !parts[i].body) continue;
-    const Part& p = parts[i];
-    float r = 0.5f * Vec3{(float)p.size.x, (float)p.size.y,
-                          (float)p.size.z}.len() * physInv;
-    float dist = (p.xf.pos - centerWorldVoxel).len();
-    if (dist > radiusVoxels + r + 2.0f) continue;
-    float t = dist / std::max(1.0f, radiusVoxels);
-    if (t > 1.0f) t = 1.0f;
-    hits.push_back({(int)i, dist, t});
-  }
-  if (hits.empty()) return;
-
-  // Damage falls off quadratically from the centre: full damage at the core,
-  // zero at the rim. The base damage is the authored limb hp so a dead-centre
-  // blast on a full-health part severs it outright.
-  std::vector<int> severed;
-  for (const Hit& h : hits) {
-    Part& p = parts[h.index];
-    const MobLimbDef& ld = limbs_[h.index];
-    float strength = (1.0f - h.fraction * h.fraction);
-    float damage = ld.hp * strength;
-    p.hp -= damage;
-    Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
-    p.woundLocal = RotateInv(q, centerWorldVoxel - p.xf.pos);
-    if (def.bleedMat)
-      p.bleedBudget = AddBleedBudget(p.bleedBudget,
-                                     damage * def.bleedPerDamage);
-    if (p.hp <= 0.0f) severed.push_back(h.index);
-  }
-  for (int i : severed)
-    if (PartAlive(i)) Sever(i);
+  // Real per-voxel carving through the shared Mob path: the blast takes
+  // actual voxels out of the player's body exactly as it does an NPC's —
+  // ejected gobbets, connectivity splits, collapse-severing and all. This
+  // replaces the old avatar-only hp approximation (the drift this refactor
+  // exists to end).
+  if (!spawned_) return;
+  CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
 }
 
 void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
@@ -2158,15 +1466,15 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
     // --- splat: carve voxels out of the body, sever some limbs, die ---
 
     // CarveRadial blows chunks out of every live limb like an explosion would:
-    // voxels get ejected as particles, parts losing >75% of volume collapse.
+    // voxels get ejected as particles, limbs_ losing >75% of volume collapse.
     float carveRadius = 4.0f + impactMs * 0.1f;
     CarveRadial(center, carveRadius, world, spawns);
 
     // Sever roughly half the remaining severable limbs at random.
     std::vector<int> severable;
-    for (size_t i = 0; i < parts.size(); i++) {
-      if (!PartAlive((int)i) || !parts[i].body) continue;
-      const MobLimbDef& ld = limbs_[i];
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (!PartAlive((int)i) || !limbs_[i].body) continue;
+      const MobLimbDef& ld = limbDefs_[i];
       if ((int)i == def.rootLimb || ld.vital || !ld.severable) continue;
       severable.push_back((int)i);
     }
@@ -2176,7 +1484,7 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
       int i = severable[j];
       if (PartAlive(i)) {
         Sever(i);
-        if (parts[i].holdBody) parts[i].holdSeconds = 0.0f;
+        if (limbs_[i].holdBody) limbs_[i].holdSeconds = 0.0f;
       }
     }
     Die();
@@ -2226,17 +1534,17 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
   // --- sub-lethal impact: proportional damage, bleed on legs ---
   SpendHealth((int32_t)std::lround(damage));
   if (def.bleedMat != 0) {
-    for (size_t i = 0; i < parts.size(); i++) {
-      if (!PartAlive((int)i) || !parts[i].body) continue;
-      const MobLimbDef& ld = limbs_[i];
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (!PartAlive((int)i) || !limbs_[i].body) continue;
+      const MobLimbDef& ld = limbDefs_[i];
       if (ld.name.find("leg") == std::string::npos &&
           ld.name.find("foot") == std::string::npos)
         continue;
-      parts[i].bleedBudget =
-          AddBleedBudget(parts[i].bleedBudget, damage * 0.3f * def.bleedPerDamage);
-      Quat q{parts[i].xf.quat[0], parts[i].xf.quat[1],
-             parts[i].xf.quat[2], parts[i].xf.quat[3]};
-      parts[i].woundLocal = RotateInv(q, center - parts[i].xf.pos);
+      limbs_[i].bleedBudget =
+          AddBleedBudget(limbs_[i].bleedBudget, damage * 0.3f * def.bleedPerDamage);
+      Quat q{limbs_[i].xf.quat[0], limbs_[i].xf.quat[1],
+             limbs_[i].xf.quat[2], limbs_[i].xf.quat[3]};
+      limbs_[i].woundLocal = RotateInv(q, center - limbs_[i].xf.pos);
     }
   }
 }
@@ -2256,40 +1564,9 @@ bool PlayerAvatar::SeverByName(const std::string& name) {
 // is genuinely the avatar's own is what happens AFTER: how hp falls when matter
 // is lost, and how a part burnt through comes off.
 
-void PlayerAvatar::StripPartTombstones(Part& p) {
-  if (p.burn.removed == 0) return;
-  p.skinVoxels.erase(
-      std::remove_if(p.skinVoxels.begin(), p.skinVoxels.end(),
-                     [](const PrefabVoxel& v) { return (v.material & 0xFFFu) == 0; }),
-      p.skinVoxels.end());
-  p.voxels.erase(
-      std::remove_if(p.voxels.begin(), p.voxels.end(),
-                     [](const DebrisVoxel& v) { return (v.payload & 0xFFFu) == 0; }),
-      p.voxels.end());
-  p.burn.removed = 0;
-  MobSystem::DropBurnIndex(p.burn);
-  instancesDirty_ = true;
-}
-
-BurnLimbView PlayerAvatar::ViewOfPart(Part& p) {
-  const bool fine = p.HasFineSkin();
-  BurnLimbView v;
-  v.skin = fine ? &p.skinVoxels : nullptr;
-  v.coll = fine ? nullptr : &p.voxels;
-  v.scale = fine ? (def_ ? def_->skinScale : 1u) : (def_ ? def_->physScale : 1u);
-  v.xf = &p.xf;
-  v.size = p.size;
-  v.physScale = def_ ? def_->physScale : 1u;
-  v.microModel = &p.microModel;
-  v.carved = &p.burnOwnsBrick;
-  v.flipbook = nullptr;  // the avatar has no flipbooks to invalidate
-  v.burn = &p.burn;
-  return v;
-}
-
 uint32_t PlayerAvatar::PartMaterialCount(int part, uint32_t mat) const {
-  if (part < 0 || part >= (int)parts.size()) return 0;
-  const Part& p = parts[part];
+  if (part < 0 || part >= (int)limbs_.size()) return 0;
+  const MobLimb& p = limbs_[part];
   uint32_t n = 0;
   if (p.HasFineSkin()) {
     for (const PrefabVoxel& v : p.skinVoxels)
@@ -2303,235 +1580,29 @@ uint32_t PlayerAvatar::PartMaterialCount(int part, uint32_t mat) const {
 
 uint32_t PlayerAvatar::IgnitePart(int partIndex, uint32_t count,
                                   uint32_t onlyMat) {
-  if (!mobs_ || !spawned_ || partIndex < 0 || partIndex >= (int)parts.size())
-    return 0;
-  if (!parts[partIndex].body) return 0;
-  BurnLimbView v = ViewOfPart(parts[partIndex]);
-  const uint32_t lit = mobs_->IgniteOneLimb(v, count, onlyMat);
-  if (lit) instancesDirty_ = true;
-  return lit;
-}
-
-bool PlayerAvatar::FlushPartBurn(int index) {
-  Part& p = parts[index];
-  if (p.burn.removed == 0) return true;
-  const bool fine = p.HasFineSkin();
-  const uint32_t before =
-      (uint32_t)(fine ? p.skinVoxels.size() : p.voxels.size());
-  // Scale the threshold with the part, exactly as the mob side does: a dozen
-  // voxels out of a hand is a real shape change, a dozen out of a torso is
-  // invisible, and re-deriving a collider every tick for the second case is
-  // what would make a burning player the most expensive thing on screen.
-  const uint32_t threshold = std::max<uint32_t>(12u, before >> 6);
-  if (p.burn.removed < threshold) return true;
-  p.burn.removed = 0;
-
-  // Compact the tombstones out of the AUTHORITATIVE lattice, then re-derive the
-  // collider from it. Data flows skin -> collider and never the other way.
-  if (fine) {
-    p.skinVoxels.erase(
-        std::remove_if(
-            p.skinVoxels.begin(), p.skinVoxels.end(),
-            [](const PrefabVoxel& v) { return (v.material & 0xFFFu) == 0; }),
-        p.skinVoxels.end());
-    const uint32_t ratio =
-        std::max(1u, (def_ ? def_->skinScale : 1u) /
-                         std::max(1u, def_ ? def_->physScale : 1u));
-    bool overflow = false;
-    p.voxels = DownsampleSkin(p.skinVoxels, ratio, &overflow);
-  } else {
-    p.voxels.erase(
-        std::remove_if(p.voxels.begin(), p.voxels.end(),
-                       [](const DebrisVoxel& v) { return (v.payload & 0xFFFu) == 0; }),
-        p.voxels.end());
-  }
-  const uint32_t after =
-      (uint32_t)(fine ? p.skinVoxels.size() : p.voxels.size());
-  instancesDirty_ = true;
-  // The lattice compacted, so every entry in the burn index moved. Drop it; the
-  // next tick rebuilds it and re-seeds the front from whatever is still alight,
-  // so the fire survives the rebuild without the index having to.
-  MobSystem::DropBurnIndex(p.burn);
-
-  // The brick is NOT re-packed here, deliberately. The per-voxel pokes already
-  // made the burn visible; a re-pack would only shrink the OBB, and it rebases
-  // the payload's origin — which on a RIG means moving restOffset and
-  // anchorLimb with it or the art crawls off the bone (mob.cpp
-  // ReskinLimbMicro). Not worth that hazard for an OBB a few voxels too big.
-
-  // Losing matter hurts, in proportion to how much of the part it was — the
-  // same rule carving already uses, so burning a limb off and cutting one off
-  // cost the same. `voxelsAtSpawn` does not exist on a Part, so the fraction is
-  // measured against what was there before this flush; over many flushes that
-  // integrates to the same total.
-  if (before > 0 && after < before) {
-    const float lost = (float)(before - after) / (float)before;
-    p.hp -= lost * std::max(1.0f, limbs_[index].hp) * 1.5f;
-  }
-  // Burnt past the point of still being a limb: it comes off. Geometry decides,
-  // not an hp threshold — the same route to dismemberment carving takes.
-  if (p.hp <= 0.0f || p.voxels.size() < 4) {
-    Sever(index);
-    return false;
-  }
-  return true;
+  // Thin wrapper over Mob::Ignite — same resolution of "what does this
+  // material become when it catches", out of the same table as any creature.
+  if (!spawned_) return 0;
+  return Ignite(partIndex, count, onlyMat);
 }
 
 void PlayerAvatar::BurnParts(uint32_t tick, World& world,
-                             std::vector<CellOp>& cellOps) {
-  if (!mobs_ || !spawned_ || !alive_ || !mobs_->BurnTablesReady()) return;
-
-  // A TERRAIN ANCHOR around the body, exactly as MobSystem::PreTick registers
-  // for every live limb. Not cosmetic, and not really about terrain collision:
-  // it is what keeps the chunks around the body FETCHED AND REFRESHED in the
-  // CPU mirror (DebrisSystem::ManageTerrain), and the burn pass reads that
-  // mirror to find out whether it is standing in a fire.
-  //
-  // Without it the player did not burn while mobs did, and the reason was
-  // invisible from either end: the ground probe fetches the chunk under the
-  // feet ONCE, `World::Cached` then keeps returning that first copy forever,
-  // and a bonfire lit around the body afterwards never appears in it. Mobs were
-  // only ever reading live data because their anchor forced the refresh.
-  if (debris_ && def_) {
-    const Vec3 ws = def_->worldSize;
-    const float r = 0.5f * std::sqrt(ws.x * ws.x + ws.y * ws.y + ws.z * ws.z);
-    debris_->AddTerrainAnchor(origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f,
-                                             ws.z * 0.5f},
-                              r);
-  }
-  // A separate budget from the mob pass's, and deliberately: the player is one
-  // creature out of up to sixteen, and sharing one pool would let a crowd of
-  // burning NPCs starve the fire on the character the camera is pointed at.
+                             std::vector<CellOp>& cellOps,
+                             std::vector<ParticleSpawn>& spawns) {
+  if (!sys_ || !spawned_ || !alive_ || !sys_->BurnTablesReady()) return;
+  // A terrain anchor around the body keeps the chunks under it FETCHED AND
+  // REFRESHED in the CPU mirror; the burn pass reads that mirror to find out
+  // whether it is standing in a fire. Without it the player did not burn
+  // while mobs did (see Mob::RegisterTerrainAnchor).
+  RegisterTerrainAnchor();
+  // A separate budget from the mob pass's, and deliberately: the player is
+  // one creature out of up to sixteen, and sharing one pool would let a crowd
+  // of burning NPCs starve the fire on the character the camera is pointed
+  // at. The PASS underneath (Mob::BurnTick -> MobSystem::BurnOneLimb) is the
+  // shared one.
   uint32_t frontBudget = 4096;
   uint32_t opsBudget = 48;
-  // Counter-based RNG, no float term — a part's world position is a Jolt float
-  // and keying a roll on it would put physics float state into a hashed grid
-  // write (PLAN §5). The avatar has no mob id, so the stream is keyed on the
-  // part index alone; it is one creature, and it cannot collide with itself.
-  for (int i = 0; i < (int)parts.size() && frontBudget; i++) {
-    if (!parts[i].body || !PartAlive(i)) continue;
-    BurnLimbView v = ViewOfPart(parts[i]);
-    const uint32_t key = 0xA5A5A5A5u + (uint32_t)i * 2654435761u;
-    if (mobs_->BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget))
-      instancesDirty_ = true;
-    // May sever the part or kill the avatar, after which `parts` has been
-    // reshaped and nothing below may touch it.
-    if (parts[i].burn.removed && !FlushPartBurn(i)) return;
-  }
-}
-
-void PlayerAvatar::Sever(int partIndex) {
-  if (!def_ || !spawned_) return;
-  const MobDef& def = *def_;
-  if (partIndex < 0 || partIndex >= (int)parts.size()) return;
-  const MobLimbDef& ld = limbs_[partIndex];
-  if (partIndex == def.rootLimb || ld.vital || !ld.severable) {
-    Die();
-    return;
-  }
-  // The cut point in WORLD space, captured BEFORE DetachPart: the joint anchor
-  // expressed through the severed part's own live transform. Using the
-  // rest-pose `origin_ + anchorRoot` instead would ignore both the heading and
-  // the animated body height, putting the spray under the avatar's feet and on
-  // its mirrored side.
-  const Part& cut = parts[partIndex];
-  Quat cq{cut.xf.quat[0], cut.xf.quat[1], cut.xf.quat[2], cut.xf.quat[3]};
-  Vec3 anchorW = cut.body ? cut.xf.pos + Rotate(cq, cut.anchorLimb)
-                          : origin_ + cut.anchorRoot;
-
-  DetachPart(partIndex, true);
-
-  // the stump bleeds: wound at the joint on the PARENT side
-  for (size_t k = 0; k < limbs_.size(); k++) {
-    if (limbs_[k].name != ld.parent) continue;
-    Part& parent = parts[k];
-    Quat q{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
-           parent.xf.quat[3]};
-    const auto& gore = CurrentTuning().gore;
-    parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
-    parent.bleedBudget =
-        AddBleedBudget(parent.bleedBudget, gore.severStumpBudget);
-    parent.gushTicks = std::max(1, gore.severDecayTicks);
-    parent.gushLocal = parent.woundLocal;
-    // Spray along the stump: from the parent's centre out through the wound,
-    // so a cut arm sprays away from the torso instead of into it.
-    Vec3 out = anchorW - parent.xf.pos;
-    float len = out.len();
-    out = len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0};
-    // Tilt upward — a horizontal jet mostly misses the world and the droplets
-    // expire in mid-air with nothing stained.
-    out.y += 0.5f;
-    len = out.len();
-    parent.gushDir =
-        RotateInv(q, len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0});
-    break;
-  }
-  instancesDirty_ = true;
-}
-
-void PlayerAvatar::DetachPart(int index, bool adopt) {
-  Part& p = parts[index];
-  if (!p.body) return;
-  // The lattice is about to leave this system, and a material-0 tombstone from
-  // an unflushed burn must not go with it.
-  StripPartTombstones(p);
-  if (p.joint) {
-    phys_->DestroyJoint(p.joint);
-    p.joint = 0;
-  }
-  // Children are orphaned too: their joints attach to this part and die with
-  // it. A severed forearm must take the hand (and the staff) with it.
-  const MobDef& def = *def_;
-  for (size_t k = 0; k < limbs_.size(); k++)
-    if (limbs_[k].parent == limbs_[index].name && parts[k].body)
-      DetachPart((int)k, adopt);
-
-  if (index < (int)anim_.partAlive.size())
-    anim_.partAlive[index] = 0;   // gait stops scheduling it, IK weight -> 0
-  if (adopt) {
-    // Hand the micro description over with the body — that is what keeps a
-    // severed microvoxel limb detailed as ordinary debris.
-    debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
-                       def.physScale, std::move(p.skinVoxels), def.bleedMat);
-    p.skinVoxels.clear();
-    p.holdBody = p.body;
-    p.holdSeconds = kSeverHoldSeconds;
-  } else if (phys_) {
-    phys_->RemoveBody(p.body);
-    // Nobody is adopting the brick, so this system still owns it.
-    if (mobs_) mobs_->ReleaseOwnedBrick(p.microModel, p.burnOwnsBrick);
-  }
-  p.burnOwnsBrick = false;  // adopted: DebrisSystem frees it with the body
-  MobSystem::DropBurnIndex(p.burn);
-  p.body = 0;
-  instancesDirty_ = true;
-}
-
-void PlayerAvatar::Die() {
-  if (!alive_) return;
-  alive_ = false;
-  // Ragdoll: every remaining part goes dynamic and becomes ordinary debris, so
-  // culling, terrain upkeep and settle-back all apply with no avatar-specific
-  // code. Joints are kept, so the corpse stays articulated as it falls.
-  const MobDef& def = *def_;
-  for (size_t i = 0; i < parts.size(); i++) {
-    Part& p = parts[i];
-    if (!p.body) continue;
-    // Same reason as DetachPart: no tombstone may travel to DebrisSystem.
-    StripPartTombstones(p);
-    debris_->AdoptBody(p.body, p.voxels, p.xf, p.MicroRef(def.skinScale),
-                       def.physScale, std::move(p.skinVoxels), def.bleedMat);
-    p.skinVoxels.clear();
-    p.burnOwnsBrick = false;  // the body owns the brick now
-    MobSystem::DropBurnIndex(p.burn);
-    phys_->SetBodyKinematic(p.body, false);
-    phys_->ClearCollisionGroup(p.body);
-    // The corpse is debris now, not the player's body — it collides normally.
-    phys_->SetBodyAvatarLayer(p.body, false);
-    p.body = 0;
-    p.joint = 0;
-  }
-  instancesDirty_ = true;
+  BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
 }
 
 void PlayerAvatar::Revive(const Player& player, float heading) {
@@ -2549,13 +1620,13 @@ void PlayerAvatar::SaveState(std::vector<uint8_t>& out) const {
   w.U32(present ? 1u : 0u);
   if (!present) return;
   w.Str(defName_);
-  // Only the DEF's parts: a borrowed item slot past them is inventory, not
+  // Only the DEF's limbs_: a borrowed item slot past them is inventory, not
   // body, and is re-equipped through EquipItem rather than persisted here.
-  const size_t n = std::min(parts.size(), def_->limbs.size());
+  const size_t n = std::min(limbs_.size(), def_->limbs.size());
   w.U32((uint32_t)n);
   for (size_t i = 0; i < n; i++) {
-    w.Pod((uint8_t)(parts[i].body ? 1 : 0));
-    w.F32(parts[i].hp);
+    w.Pod((uint8_t)(limbs_[i].body ? 1 : 0));
+    w.F32(limbs_[i].hp);
   }
 }
 
@@ -2589,16 +1660,16 @@ bool PlayerAvatar::LoadState(const uint8_t* data, size_t len,
 
 bool PlayerAvatar::PartWorldTransform(int part, Vec3& outPos,
                                       Quat& outRot) const {
-  if (part < 0 || part >= (int)parts.size() || !parts[part].body) return false;
-  const Part& p = parts[part];
+  if (part < 0 || part >= (int)limbs_.size() || !limbs_[part].body) return false;
+  const MobLimb& p = limbs_[part];
   outPos = p.xf.pos;
   outRot = Quat{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
   return true;
 }
 
 bool PlayerAvatar::PartAnchorWorld(int part, Vec3& out) const {
-  if (part < 0 || part >= (int)parts.size()) return false;
-  const Part& p = parts[part];
+  if (part < 0 || part >= (int)limbs_.size()) return false;
+  const MobLimb& p = limbs_[part];
   if (!p.body) return false;
   Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
   out = p.xf.pos + Rotate(q, p.anchorLimb);
@@ -2607,14 +1678,7 @@ bool PlayerAvatar::PartAnchorWorld(int part, Vec3& out) const {
 
 int PlayerAvatar::LivePartCount() const {
   int n = 0;
-  for (const Part& p : parts)
-    if (p.body) n++;
-  return n;
-}
-
-uint32_t PlayerAvatar::LimbBodyCount() const {
-  uint32_t n = 0;
-  for (const Part& p : parts)
+  for (const MobLimb& p : limbs_)
     if (p.body) n++;
   return n;
 }
@@ -2625,65 +1689,17 @@ uint32_t PlayerAvatar::LimbBodyCount() const {
 // a transform lands in is the slot the instance records. This mirrors
 // MobSystem's contract exactly.
 
-void PlayerAvatar::AppendInstances(std::vector<BodyVoxInst>& out,
-                                   uint32_t slotBase) {
-  uint32_t slot = slotBase;
-  for (size_t i = 0; i < parts.size(); i++) {
-    const Part& p = parts[i];
-    if (!p.body) continue;
-    if (slot >= kMaxBodySlots) break;
-    // Micro parts render through the OBB/brick-march pass, so they must not
-    // also emit cube instances — that would draw them twice, at the wrong
-    // size. The slot is still consumed: slots are shared between the passes.
-    if (p.microModel >= 0) {
-      slot++;
-      continue;
-    }
-    if (i < hidden_.size() && hidden_[i]) {
-      slot++;
-      continue;
-    }
-    rigrender::AppendVoxInsts(out, slot, p.voxels);
-    slot++;
-  }
-  instancesDirty_ = false;
-}
-
-void PlayerAvatar::AppendXforms(std::vector<BodyXformGpu>& out) const {
-  for (const Part& p : parts) {
-    if (!p.body) continue;
-    if (out.size() >= kMaxBodySlots) return;
-    rigrender::AppendXform(out, p.xf);
-  }
-}
-
 
 // ---- collision-box debug overlay (world.h DebugBox) -------------------------
 //
 // Draws the individual sub-shapes of each compound collider rather than one
 // big AABB per body. See rigrender::AppendDebugBoxesFor for why these come
 // from the Jolt shape rather than from the voxels that built it.
-void PlayerAvatar::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
-                                   uint32_t color) const {
-  if (!phys_) return;
-  static std::vector<SubShapeBox> subs;
-  for (const Part& p : parts) {
-    if (!p.body) continue;
-    if (out.size() >= limit) return;
-    rigrender::AppendDebugBoxesFor(out, *phys_, p.body, p.xf, limit, color,
-                                   subs);
-  }
-}
 
-void PlayerAvatar::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
-                                    uint32_t slotBase) const {
-  uint32_t slot = slotBase;
-  for (size_t i = 0; i < parts.size(); i++) {
-    const Part& p = parts[i];
-    if (!p.body) continue;
-    if (slot >= kMaxBodySlots) return;
-    if (p.microModel >= 0 && !(i < hidden_.size() && hidden_[i]))
-      out.push_back({slot, (uint32_t)p.microModel, 0, 0});
-    slot++;
-  }
+// A body leaving the rig for the world stops being "you": back on the normal
+// dynamic layer it can bump the player like any other debris — the avatar-
+// layer exemption is only for parts still attached and still living inside
+// the player's capsule.
+void PlayerAvatar::OnBodyReleasedToWorld(uint64_t bodyHandle) {
+  if (phys_) phys_->SetBodyAvatarLayer(bodyHandle, false);
 }

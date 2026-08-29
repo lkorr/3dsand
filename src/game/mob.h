@@ -327,6 +327,337 @@ struct BurnLimbView {
 bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                  std::vector<MobDef>& out, MicroBodySet& micro, std::string& log);
 
+// Per-creature gore profile: the entity-scoped variance draws, resolved ONCE
+// when the creature is created and then held for its whole life — one NPC can
+// be a heavy bleeder from spawn to corpse while its neighbour bleeds normally,
+// and the PLAYER draws one too (the avatar is a Mob; see class Mob below).
+// Values are absolute (already multiplied by the whole-wound gain).
+struct GoreProfile {
+  float bleedSprayPerDrip = 0;
+  float bleedSpraySpeed = 0, bleedSprayCone = 0;
+  int severSpray = 0, severDecayTicks = 1;
+  float severSpraySpeed = 0, severSprayCone = 0;
+  int severVoxels = 0;
+  float severVoxelSpeed = 0;
+  int microLifeTicks = 1;
+  float bleedGain = 1.0f;   // kept for display/debug; already folded in above
+};
+
+// One rig part of a live creature — a limb, or a borrowed item slot. ONE
+// struct for mobs and the avatar: it used to be MobSystem::Limb and
+// PlayerAvatar::Part, two runtime spellings of the same idea that had already
+// drifted (the avatar's copy lacked flipbooks; its `burnOwnsBrick` was
+// `carved` under another name). Everything positional is in WORLD voxels;
+// `voxels` is the COLLIDER lattice (physScale units, int8), `skinVoxels` the
+// SKIN lattice (skinScale units, int16, empty when the two coincide).
+struct MobLimb {
+  uint64_t body = 0;         // 0 = severed or never spawned
+  uint64_t joint = 0;        // to parent
+  float hp = 0;
+  std::vector<DebrisVoxel> voxels;
+  IVec3 size{};
+  std::vector<PrefabVoxel> skinVoxels;
+  bool HasFineSkin() const { return !skinVoxels.empty(); }
+  int microModel = -1;       // -1 = cube path
+  // Takes the SKIN scale: a MicroBodyRef is a render description.
+  MicroBodyRef MicroRef(uint32_t skinScale) const {
+    return microModel < 0 ? MicroBodyRef{}
+                          : MicroBodyRef{(uint32_t)microModel, skinScale};
+  }
+  Vec3 restOffset{};         // limb min corner from creature min corner (rest)
+  Vec3 anchorRoot{};         // joint anchor from creature min corner (rest)
+  Vec3 anchorLimb{};         // joint anchor in limb-local coords
+  BodyTransform xf{};
+  float bleedBudget = 0;
+  Vec3 woundLocal{};
+  // Dismemberment gout: counts DOWN from gore.severDecayTicks, emission
+  // proportional to it, so the burst is front-loaded and tails off. Lives on
+  // the PARENT limb (the stump), not on the piece that came off.
+  int gushTicks = 0;
+  Vec3 gushLocal{};
+  Vec3 gushDir{0, 1, 0};
+  // A severed part is handed to DebrisSystem immediately but holds its last
+  // animated pose KINEMATICALLY for a beat before flipping dynamic.
+  uint64_t holdBody = 0;
+  float holdSeconds = 0;
+  // Flipbook: >=0 selects an alternate .vox model's voxels for RENDERING only.
+  int flipbookModel = -1;
+  std::vector<std::vector<DebrisVoxel>> frameVoxels;
+  // Latched the first time this limb loses a voxel (carve OR burn): its micro
+  // model is a copy-on-write clone this limb OWNS and must free
+  // (ReleaseLimbMicro), and its flipbooks are disabled.
+  bool carved = false;
+  // Voxel count the limb was authored with, so damage is a FRACTION of it.
+  uint32_t voxelsAtSpawn = 0;
+  // Per-voxel burning / dissolution (see BodyBurnState above).
+  BodyBurnState burn;
+};
+
+class MobSystem;
+struct ItemDef;
+
+// ============================================================================
+// ONE CREATURE. The base class of every articulated body in the game: NPCs
+// are plain Mobs driven by MobSystem's AI stages, and the PLAYER AVATAR is a
+// subclass driven by player input (game/avatar.h).
+//
+// THE RULE (the reason this class exists): every body MECHANIC — damage,
+// severing, dying, per-voxel carving, burning/dissolving, bleeding, item
+// holding, rendering — has exactly ONE implementation, here. Anything that
+// applies to a mob applies to the player by default; the avatar's differences
+// are EXPLICIT overrides of the small virtual seam below, not parallel copies.
+// Two implementations that agree today are two that disagree after the next
+// tuning change — that is how the avatar's old copy of this code rotted.
+//
+// What is NOT here is the DRIVER: who decides where the body goes. MobSystem
+// senses/steers/drives NPCs and owns their lifecycle (spawn caps, despawn,
+// husk removal); the avatar follows the Player. One schema, one mechanics
+// implementation, two drivers.
+//
+// DETERMINISM (CLAUDE.md rule 1): everything here is CPU-float presentation
+// state, never hashed. Grid contact — blood, fire, gore particles — travels
+// through the BrushOp/CellOp/ParticleSpawn streams like every other mutation,
+// and every RNG draw that reaches those streams is counter-based (id, tick,
+// index), never keyed on a Jolt float.
+class Mob {
+ public:
+  Mob() = default;
+  virtual ~Mob() = default;
+  Mob(Mob&&) = default;
+  Mob& operator=(Mob&&) = default;
+  Mob(const Mob&) = delete;
+  Mob& operator=(const Mob&) = delete;
+
+  uint64_t Id() const { return id_; }
+  bool Alive() const { return alive_; }
+  const MobDef* Def() const { return def_; }
+  Vec3 Origin() const { return origin_; }
+  float BodyY() const { return bodyY_; }
+  // Rig size INCLUDING a borrowed item slot (limbDefs_ tracks limbs_).
+  int LimbCount() const { return (int)limbDefs_.size(); }
+  const MobLimbDef& LimbDefAt(int i) const { return limbDefs_[i]; }
+
+  // ---- damage / dismemberment (shared; see MobSystem for the id-keyed API) --
+  // Damage a limb by physics body handle. Returns true if the handle belonged
+  // to one of this creature's limbs. Severs / kills at 0 hp; a hit past the
+  // limb's severImpactSpeed severs regardless of remaining hp; a hit crossing
+  // a joint anchor severs outright.
+  bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
+              float impactSpeed = 0.0f);
+  // Detach a limb now. Root/vital kills instead.
+  void Sever(int limbIndex);
+  void Die();
+  // Per-voxel carving: remove real voxels from a live limb (docs/DESIGN.md §7).
+  bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
+                       float radiusVoxels, bool ragged, bool eject, World& world,
+                       std::vector<ParticleSpawn>& spawns);
+  // Every live limb of THIS creature within the blast — the explosion path.
+  void CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
+                      std::vector<ParticleSpawn>& spawns);
+
+  // ---- per-voxel burning ----------------------------------------------------
+  // Set fire to up to `count` of a limb's surface voxels; returns how many took.
+  uint32_t Ignite(int limbIndex, uint32_t count, uint32_t onlyMat = 0);
+  // One tick of burning across this creature's limbs. Budgets are in/out and
+  // may be shared across creatures (MobSystem) or private (the avatar).
+  void BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
+                uint32_t& opsBudget);
+
+  // ---- per-tick body upkeep (called by the driver) --------------------------
+  void TickSeveredHolds(float dt);
+  void DrainPendingSpawns(World& world, std::vector<ParticleSpawn>& spawns);
+  // Bleeding: decaying wound budgets, dismemberment gouts, bounded ops.
+  // `bleedOps` is the shared per-tick drip budget counter.
+  void BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
+                 std::vector<ParticleSpawn>& spawns, int& bleedOps);
+  // Model-space pose -> world, submit kinematic targets to Jolt. `writeXf`
+  // also stores the submitted pose into limb.xf immediately — the avatar needs
+  // that (its held-item placement reads the hand's fresh pose this tick); the
+  // NPC path deliberately keeps xf as PostStep left it so its bleed positions
+  // are unchanged by the refactor.
+  void SubmitPose(float dt, bool writeXf);
+  void PostStep();
+  // Keeps the chunks around the body fetched+refreshed in the CPU mirror; the
+  // burn pass reads that mirror to find out whether it is standing in a fire.
+  void RegisterTerrainAnchor();
+  void PlayClip(const std::string& name);
+  void PlayClipIndex(int ci);
+
+  // ---- holding an item (THE ENTITY<->SLOT SYNC SEAM; see game/avatar.h) ----
+  // Equipping BORROWS A RIG SLOT: the item's geometry fills a real MobLimb
+  // parented to the socket's limb — animated, severable, droppable, carvable,
+  // with no "is this an item" branch downstream. Lives on the BASE class so a
+  // mob can hold a sword exactly as the player does (mob combat scaffolding).
+  bool EquipItem(const ItemDef* item, const char* context = "held_right");
+  const std::string& HeldItem() const { return heldItem_; }
+  int HeldSlot() const { return heldSlot_; }
+  // The held weapon's cutting edge in WORLD voxels, from its live transform.
+  bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const;
+  // Is this Jolt body one of this creature's own parts?
+  bool OwnsBody(uint64_t bodyHandle) const;
+  // Swing pose, pushed in by the driver. Presentation only; consumed by the
+  // driver's own animation pass.
+  void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp, float weight);
+
+  // ---- render plumbing (per creature; MobSystem chains these over its list) -
+  // The Append* walks MUST visit slots in the same order: the slot a transform
+  // lands in is the slot the instance records. Each returns the next slot.
+  uint32_t AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
+  void AppendXforms(std::vector<BodyXformGpu>& out) const;
+  uint32_t AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
+                            uint32_t slotBase) const;
+  void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
+                        uint32_t color) const;
+  uint32_t LimbBodyCount() const;
+
+  bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
+                      uint32_t* outMat = nullptr) const;
+
+  // Release a body's burn index and front (lattice compacted / rig torn down).
+  static void DropBurnIndex(BodyBurnState& st);
+  // Draw the entity-scoped gore variance for one creature id.
+  static GoreProfile MakeGoreProfile(uint64_t id);
+
+ protected:
+  // ---- THE EXPLICIT-EXCEPTION SEAM ------------------------------------------
+  // Everything the avatar does differently from an NPC goes through one of
+  // these. Adding avatar behaviour anywhere else in the shared mechanics is
+  // the bug this class was built to make impossible.
+  //
+  // Limbs of the player's body live on the AVATAR physics layer (they sit
+  // inside the player capsule and must not push it — see avatar.cpp Spawn).
+  virtual bool AvatarLayer() const { return false; }
+  // A body leaving this rig for the world (severed-hold release, death
+  // ragdoll). The avatar strips its avatar-layer exemption here.
+  virtual void OnBodyReleasedToWorld(uint64_t /*bodyHandle*/) {}
+  // NPC husks drop their limb list at death (PreTick reaps them); the avatar
+  // keeps it so the HUD's per-part readout survives the death screen.
+  virtual bool DropLimbListOnDeath() const { return true; }
+  // Whose instance list went stale: MobSystem's shared one, or the avatar's.
+  virtual void MarkInstancesDirty();
+  // Per-limb render suppression (first-person hides the body, keeps the arms).
+  bool LimbHidden(int i) const {
+    return i >= 0 && i < (int)hidden_.size() && hidden_[i] != 0;
+  }
+  bool LimbAlive(int i) const {
+    return i >= 0 && i < (int)anim_.partAlive.size() && anim_.partAlive[i] != 0;
+  }
+
+  // Build limbs/bodies/joints/anim state from the def at `origin` (min corner,
+  // world voxels). Seeds the per-instance rig copy (skel_/limbDefs_). False =
+  // physics refused a body; everything created so far is torn down.
+  bool BuildRig(const MobDef& def, Vec3 origin);
+
+  // ---- carving internals (docs/DESIGN.md §7) --------------------------------
+  using LimbCarveKeep = std::function<bool(int, int, int)>;
+  using LimbCarveFactory = std::function<LimbCarveKeep(float)>;
+  bool CarveLimb(int limbIndex, World& world,
+                 std::vector<ParticleSpawn>& spawns, bool eject,
+                 const LimbCarveFactory& carveAt);
+  bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
+  bool RebuildLimbBody(int limbIndex);
+  void EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
+                          std::vector<DebrisVoxel> part, World& world,
+                          std::vector<ParticleSpawn>& spawns);
+  void LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
+                             const std::vector<DebrisVoxel>& voxels, World& world,
+                             std::vector<ParticleSpawn>& spawns) const;
+  void ReleaseLimbMicro(MobLimb& limb);
+  void DetachLimb(int limbIndex, bool adopt);
+  // Tear down every body/joint/brick this rig still owns (despawn, reset).
+  void ReleaseRig();
+
+  // ---- burn internals -------------------------------------------------------
+  BurnLimbView ViewOf(MobLimb& limb);
+  bool FlushBurn(int limbIndex, World& world,
+                 std::vector<ParticleSpawn>& spawns, bool force);
+  void StripBurnTombstones(MobLimb& limb);
+
+  // Shared services, borrowed from MobSystem (burn tables, micro pool,
+  // material tables, event sinks). Never null on a spawned creature.
+  MicroBodySet* MicroSet() const;
+  const std::vector<float>& DensityOf() const;
+  const std::vector<uint32_t>& ClassOf() const;
+
+  MobSystem* sys_ = nullptr;
+  Physics* phys_ = nullptr;
+  World* world_ = nullptr;
+  DebrisSystem* debris_ = nullptr;
+
+  uint64_t id_ = 0;
+  int defIndex_ = -1;          // into MobSystem's def list (events, persistence)
+  const MobDef* def_ = nullptr;
+  bool alive_ = true;
+  GoreProfile gore_;           // this creature's own bleed character
+
+  // ---- steering: intent vs actuation (NPC driver state; the avatar writes
+  // heading_ directly from the camera and ignores the rest) ------------------
+  // `heading_` is where the BODY actually points — the only thing the pose,
+  // the gait and MobFacing ever read. Nothing outside MobSystem::Steer (or the
+  // avatar's driver) may write it; behaviours write desiredHeading_ and the
+  // gap closes at a bounded rate.
+  float heading_ = 0;
+  float desiredHeading_ = 0;
+  float turnVel_ = 0;
+  float driveScale_ = 1.0f;
+  uint32_t blockedTicks_ = 0;
+  float phase_ = 0;            // walk cycle (legacy swing fallback)
+  uint32_t lastTurnTick_ = 0;
+
+  Vec3 origin_{};              // prefab min corner, world voxels
+  std::vector<MobLimb> limbs_;
+  AnimState anim_;             // float presentation state (never hashed)
+  float speedNow_ = 0;         // measured planar speed, voxels/sec
+  Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
+  float bodyY_ = 0;            // prefab MIN CORNER height (same frame as origin_.y)
+  float restSoleY_ = 0;        // rest sole height above the min corner
+  bool footInit_ = false;
+
+  // The rig this instance actually animates: a COPY of def_->skel/limbs,
+  // owned per creature, because a held ITEM borrows a real rig slot by
+  // APPENDING a part — the shared def must not grow a sword every time
+  // somebody picks one up. `limbs_`, `skel_.parts` and `limbDefs_` stay
+  // index-parallel, which several loops depend on.
+  AnimSkeleton skel_;
+  std::vector<MobLimbDef> limbDefs_;
+  std::vector<uint8_t> hidden_;      // per-limb render suppression
+
+  // Held item state — ONE piece of entity<->slot sync, kept only in EquipItem.
+  int heldSlot_ = -1;
+  std::string heldItem_;
+  std::string heldPart_;
+  int heldPartIndex_ = -1;
+  Vec3 gripBody_{};            // grip point in the item's BODY frame
+  // Swing pose pushed in by the driver (SetWeaponPose). Pure presentation.
+  Vec3 weaponHand_{}, weaponDir_{0, 1, 0}, weaponUp_{0, 0, 1};
+  float weaponWeight_ = 0;
+
+  // Particles authored outside the tick (Sever is reached from damage handling
+  // all over the frame); drained by the driver's PreTick.
+  std::vector<ParticleSpawn> pendingSpawns_;
+  // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and
+  // CarveLimb flushes before it reads the lattice.
+  bool inBurnFlush_ = false;
+
+  // how long a severed piece holds its last animated pose before ragdolling
+  static constexpr float kSeverHoldSeconds = 0.25f;
+  // A carved chunk needs this many voxels to become its own rigidbody.
+  static constexpr uint32_t kMinFragmentVoxels = 4;
+  // Fragments one carve may spawn (rule 2: bound every emergent process).
+  static constexpr uint32_t kMaxCarveFragments = 3;
+  // Below this fraction of its authored volume a limb severs.
+  static constexpr float kLimbCollapseFraction = 0.25f;
+  // Carve damage per voxel removed, as a fraction of the limb's volume.
+  static constexpr float kCarveDamagePerVolume = 1.5f;
+  // Voxels a limb may burn away before its collider is re-derived:
+  // max(floor, voxels >> shift).
+  static constexpr uint32_t kBurnRebuildFloor = 12;
+  static constexpr uint32_t kBurnRebuildShift = 6;
+
+  friend class MobSystem;
+};
+
 class MobSystem {
  public:
   // `reactions` is the compiled reaction table. MobSystem needs it for the
@@ -353,6 +684,14 @@ class MobSystem {
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail.
   uint64_t Spawn(int defIndex, IVec3 atVoxel);
+  // The live creature record, or null. The Mob API (damage, carve, ignite,
+  // equip...) is the per-creature surface; the id-keyed wrappers below remain
+  // for callers that only hold a body handle or an id.
+  Mob* FindMobById(uint64_t id);
+  // Mob combat scaffolding: hand any creature an item, exactly as the player
+  // equips one (the implementation is Mob::EquipItem, shared with the avatar).
+  bool EquipItem(uint64_t mobId, const ItemDef* item,
+                 const char* context = "held_right");
 
   // Once per tick BEFORE debris.PreTick: kinematic walk drive, terrain
   // anchors, bleeding (bounded BrushOps into `ops`), despawn out-of-window.
@@ -529,7 +868,7 @@ class MobSystem {
   // (ids are session-local), so a test that saved one id needs this to find
   // the reincarnation.
   uint64_t MobIdAt(uint32_t i) const {
-    return i < mobs_.size() ? mobs_[i].id : 0;
+    return i < mobs_.size() ? mobs_[i].Id() : 0;
   }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
@@ -625,15 +964,6 @@ class MobSystem {
   // True once the reaction mirror has been built. A caller with no tables must
   // not burn: it would silently do nothing rather than fail.
   bool BurnTablesReady() const { return !reactions_.empty() && !matGpu_.empty(); }
-  // Release a body's burn index and front. Static because the ordinary reason
-  // to call it — the lattice just compacted, so every index in it moved — is
-  // the caller's business, not this system's.
-  static void DropBurnIndex(BodyBurnState& st);
-  // Return a copy-on-write brick to the shared pool. Public because the avatar
-  // allocates parts out of the SAME pool through IgniteOneLimb/BurnOneLimb and
-  // must not leak them — the pool is a hard ceiling and exhausting it is a
-  // fatal abort (sim/microbody.h). No-op on a shared model.
-  void ReleaseOwnedBrick(int& model, bool& owned);
   // World position of one of a limb's SURVIVING voxels — the `n`th, wrapped.
   // Deliberately not the centroid: once a carve has hollowed a limb, its
   // centroid is in the cavity, and a tool aimed there eats nothing. Anything
@@ -642,196 +972,6 @@ class MobSystem {
   Vec3 LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const;
 
  private:
-  struct Limb {
-    uint64_t body = 0;         // 0 = severed or never spawned
-    uint64_t joint = 0;        // to parent
-    float hp = 0;
-    // The COLLIDER lattice, in `MobDef::physScale` units per world voxel —
-    // int8, which is the bound physScale is chosen to satisfy. `size` is in the
-    // same units. Everything positional below is in WORLD voxels.
-    std::vector<DebrisVoxel> voxels;
-    IVec3 size{};
-    // The SKIN lattice, in `MobDef::skinScale` units per world voxel. int16,
-    // and the source the brick is packed from — so this is what the player
-    // actually sees, and what a carve must edit.
-    //
-    // Empty when skinScale == physScale: the two lattices coincide and
-    // `voxels` is the whole story, exactly as before the split. Every existing
-    // def stays on that path and pays nothing.
-    std::vector<PrefabVoxel> skinVoxels;
-    bool HasFineSkin() const { return !skinVoxels.empty(); }
-    int microModel = -1;       // copy of MobLimbDef::microModel, -1 = cube path
-    // What this limb's body needs to keep rendering as microvoxels once it is
-    // no longer a limb — handed to DebrisSystem::AdoptBody on sever/death.
-    // Takes the SKIN scale: MicroBodyRef is a render description, and the brick
-    // it points at was packed on the skin lattice.
-    MicroBodyRef MicroRef(uint32_t skinScale) const {
-      return microModel < 0 ? MicroBodyRef{}
-                            : MicroBodyRef{(uint32_t)microModel, skinScale};
-    }
-    Vec3 restOffset{};         // limb min corner from mob min corner (rest)
-    Vec3 anchorRoot{};         // joint anchor from mob min corner (rest)
-    Vec3 anchorLimb{};         // joint anchor in limb-local coords
-    BodyTransform xf{};
-    float bleedBudget = 0;
-    Vec3 woundLocal{};
-    // Dismemberment gout, drained over several ticks by PreTick. `gushTicks`
-    // counts DOWN from gore.severDecayTicks, and emission is proportional to
-    // it, so the burst is front-loaded and tails off by itself — that decay is
-    // what makes a cut read as arterial rather than as a running tap.
-    //
-    // It lives on the PARENT limb (the stump), not on the piece that came off:
-    // the severed limb is debris the moment it detaches, and a detached limb
-    // that kept bleeding would trail spray from a body MobSystem no longer
-    // owns or tracks.
-    int gushTicks = 0;
-    Vec3 gushLocal{};          // wound point, parent-limb local
-    Vec3 gushDir{0, 1, 0};     // outward spray axis, parent-limb local
-    // A severed part is handed to DebrisSystem immediately (counts, rendering
-    // and terrain upkeep all move over on the same frame) but holds its last
-    // animated pose KINEMATICALLY for a beat before flipping dynamic — cutting
-    // straight to ragdoll on the hit frame reads as a teleport. `body` is
-    // cleared at once so the mob no longer owns it; `holdBody` is the handle
-    // the countdown still has to flip.
-    uint64_t holdBody = 0;
-    float holdSeconds = 0;
-    // Flipbook: >=0 selects an alternate .vox model's voxels for RENDERING
-    // only (the Jolt shape stays the rest model — a frame swap must not
-    // rebuild collision every 100 ms). Instances rebuild on frame change.
-    int flipbookModel = -1;
-    std::vector<std::vector<DebrisVoxel>> frameVoxels;  // per .vox model index
-    // Per-voxel carving state. `carved` latches the first time this limb loses
-    // a voxel; from then on its micro model is a copy-on-write clone this limb
-    // OWNS and must free (ReleaseLimbMicro), and its flipbooks are disabled —
-    // a frame swap re-points rendering at an intact authored model, which would
-    // silently heal the wounds the player just carved.
-    bool carved = false;
-    // Voxel count the limb was authored with, so damage can be expressed as a
-    // FRACTION of the limb rather than an absolute count. A carve that removes
-    // half a scale-4 arm and half a scale-1 arm should read as the same injury.
-    uint32_t voxelsAtSpawn = 0;
-
-    // Per-voxel burning / dissolution. Shared with PlayerAvatar::Part — see
-    // BodyBurnState above for why the state is not declared here.
-    BodyBurnState burn;
-  };
-  // Per-mob gore profile: the entity-scoped variance draws, resolved ONCE when
-  // the mob is created and then held for its whole life. Every mob that is made
-  // gets its own, so one NPC can be a heavy bleeder from spawn to corpse while
-  // its neighbour bleeds normally.
-  //
-  // Resolved at spawn rather than re-drawn at each use for two reasons: the
-  // draw is only stable if nothing about it varies per call site, and holding
-  // it means a mid-session tuning reload does not change the character of mobs
-  // already standing in the world (RefreshGoreProfiles re-rolls them on demand).
-  // Values are absolute (already multiplied by the whole-wound gain), so the
-  // spray sites just read them.
-  struct GoreProfile {
-    float bleedSprayPerDrip = 0;
-    float bleedSpraySpeed = 0, bleedSprayCone = 0;
-    int severSpray = 0, severDecayTicks = 1;
-    float severSpraySpeed = 0, severSprayCone = 0;
-    int severVoxels = 0;
-    float severVoxelSpeed = 0;
-    int microLifeTicks = 1;
-    float bleedGain = 1.0f;   // kept for display/debug; already folded in above
-  };
-  // Draws the entity-scoped variance for one mob id against the current tuning.
-  static GoreProfile MakeGoreProfile(uint64_t mobId);
-
-  struct Mob {
-    uint64_t id = 0;
-    int defIndex = 0;
-    bool alive = true;
-    GoreProfile gore;          // this mob's own bleed character
-    // ---- steering: intent vs actuation ------------------------------------
-    // `heading` is where the BODY actually points and is the only thing the
-    // pose, the gait and MobFacing ever read. `desiredHeading` is where the
-    // mob WANTS to point. Nothing outside MobSystem::Steer may write `heading`
-    // — the whole reason a mob can move at a free angle with a believable turn
-    // is that the two are separate and the gap is closed at a bounded rate.
-    //
-    // A behaviour layer (chase, flee, patrol, strafe) is expressed purely as
-    // "set desiredHeading and driveScale this tick"; it cannot teleport the
-    // facing even if it wants to, so no future AI can reintroduce the snap.
-    float heading = 0;         // radians about +Y, body facing (actuation)
-    float desiredHeading = 0;  // radians about +Y, steering target (intent)
-    float turnVel = 0;         // current yaw rate, rad/s (ramped by turnAccel)
-    // What the intent layer asked for this tick, 0..1 of def.speed. Reset to
-    // the default each tick by the intent step, so a behaviour that stops
-    // writing it does not leave the mob sprinting forever.
-    float driveScale = 1.0f;
-    // Ticks the mob has been unable to make forward progress. Wander uses it
-    // to widen its avoidance turn rather than re-picking the same blocked
-    // direction; a mob wedged in a corner needs to escalate, not oscillate.
-    uint32_t blockedTicks = 0;
-    float phase = 0;           // walk cycle
-    Vec3 origin{};             // mob prefab min corner, world voxels
-    uint32_t lastTurnTick = 0;
-    std::vector<Limb> limbs;
-    AnimState anim;            // float presentation state (never hashed)
-    float speedNow = 0;        // measured planar speed, voxels/sec
-    Vec3 bodyUp{0, 1, 0};      // foot-plane normal (slope tilt)
-    // Prefab MIN CORNER height, in world voxels — the same frame as origin.y,
-    // because that is what both the Jolt submit and the IK inverse consume.
-    // The gait derives it from the foot plane; it is NOT a hip height.
-    float bodyY = 0;
-    // Rest height of the effector (sole) above the prefab min corner, measured
-    // from the rig at spawn. This is what converts the gait's hip-frame
-    // `rideHeight` into the min-corner frame bodyY is expressed in: standing at
-    // the authored rest pose puts the sole exactly on the foot plane.
-    float restSoleY = 0;
-    bool footInit = false;
-  };
-
-  void Die(Mob& mob);          // ragdoll: limbs go dynamic, adopt into debris
-  void DetachLimb(Mob& mob, int limbIndex, bool adopt);
-
-  // ---- carving internals -----------------------------------------------------
-  // A carve volume, expressed once and evaluated per lattice. The factory is
-  // handed a lattice scale (units per world voxel) and returns the keep-test in
-  // THAT lattice's coordinates — so a limb with a fine skin carves the same
-  // world-space volume out of both its skin and its collider without the
-  // caller describing the shape twice. Mirrors DebrisSystem::CarveFactory.
-  using LimbCarveKeep = std::function<bool(int, int, int)>;
-  using LimbCarveFactory = std::function<LimbCarveKeep(float)>;
-  // Shared carve core, the live-limb twin of DebrisSystem::DamageBody: erase
-  // the voxels the predicate rejects, re-skin, rebuild the collider, and hand
-  // any piece the carve disconnected to DebrisSystem as ordinary debris.
-  // Returns false when the limb was destroyed outright (severed or the mob
-  // died), in which case `mob` may no longer be alive and the caller must not
-  // touch the limb again.
-  bool CarveLimb(Mob& mob, int limbIndex, World& world,
-                 std::vector<ParticleSpawn>& spawns, bool eject,
-                 const LimbCarveFactory& carveAt);
-  // Re-skin a carved limb: clone-on-first-carve, rewrite the brick from the
-  // surviving voxels, shift the transform so the art stays on the collider, and
-  // shift restOffset/anchorLimb with it so the RIG follows too — the difference
-  // from the debris version, whose bodies answer to nobody. False = pool full
-  // (limb keeps a stale skin but is really carved).
-  // Re-pack a carved limb's brick. Takes BOTH lattices: the brick and the
-  // origin shift are skin-side, the re-derived collider is phys-side.
-  bool ReskinLimbMicro(Mob& mob, Limb& limb, uint32_t skinScale,
-                       uint32_t physScale);
-  // Rebuild a carved limb's Jolt body and re-create its joint to its parent.
-  // A collider rebuild REPLACES the handle, so the joint must be rebuilt or the
-  // limb falls off; children's joints anchor to this body and are rebuilt too.
-  bool RebuildLimbBody(Mob& mob, int limbIndex);
-  // Return a carved limb's owned micro brick to the pool. Must be called on
-  // every path that stops the mob owning the limb (sever, death, despawn,
-  // reset) or the pool leaks words nothing reclaims.
-  void ReleaseLimbMicro(Limb& limb);
-  // Hand one disconnected chunk of a limb to DebrisSystem as a free body, with
-  // its own COW brick. Falls back to particles when a body or brick can't be
-  // made, exactly as ShatterBody does.
-  void EmitCarvedFragment(Mob& mob, const Limb& src, uint32_t physScale,
-                          std::vector<DebrisVoxel> part, World& world,
-                          std::vector<ParticleSpawn>& spawns);
-  void LimbVoxelsToParticles(const Limb& limb, uint32_t physScale,
-                             const std::vector<DebrisVoxel>& voxels, World& world,
-                             std::vector<ParticleSpawn>& spawns) const;
-  bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY) const;
-
   // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------
   //
   // The limb twin of DebrisSystem::BurnBodies, and deliberately NOT that
@@ -845,36 +985,15 @@ class MobSystem {
   // Same RULES, different driver. Both evaluate the authored reaction table
   // through sim/reactcpu.h, so a chance authored once behaves the same on a
   // limb, on the severed version of that limb, and in the grid.
+  //
+  // The per-creature half lives on Mob (BurnTick/FlushBurn); this is the NPC
+  // driver looping it over mobs_ under the shared budgets.
   void BurnLimbs(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                  std::vector<ParticleSpawn>& spawns);
-  // The view onto one of this system's own limbs, so the mob driver and the
-  // avatar driver hand BurnOneLimb the same shape.
-  BurnLimbView ViewOf(Mob& mob, Limb& limb);
   // Build the dense neighbour index over a limb's current lattice and seed the
   // front from whatever is already alight. O(voxels + boundingBox), paid once
   // when something reactive first comes near the limb.
   void BuildBurnIndex(BurnLimbView& v);
-  // Compact the voxels this tick's burning removed out of the lattice, and
-  // (only past the batched threshold, or when `force`) re-derive the collider,
-  // rebuild the Jolt body and re-check connectivity. Returns false when the
-  // limb did not survive — severed or the mob died — in which case neither
-  // `mob` nor `limb` may be touched again.
-  //
-  // Every reader of a limb's lattice must run this first: between ticks the
-  // burn leaves the sparse arrays holding material-0 tombstones, and a carve or
-  // a sever that read them would count burnt-away matter as still present.
-  bool FlushBurn(Mob& mob, int limbIndex, World& world,
-                 std::vector<ParticleSpawn>& spawns, bool force);
-  // Drop unflushed tombstones from a limb's lattices WITHOUT the collider
-  // rebuild FlushBurn does. For the paths that are about to hand the lattice to
-  // somebody else (sever, death -> DebrisSystem::AdoptBody) and have no World
-  // to rebuild against. The collider stays fractionally fat until the debris
-  // side rebuilds it, which is the same lag body burning already accepts — but
-  // a material-0 voxel must never leave this system.
-  void StripBurnTombstones(Limb& limb);
-  // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and CarveLimb
-  // flushes before it reads the lattice. Without this the two call each other.
-  bool inBurnFlush_ = false;
   // The material a voxel of `mat` becomes when it catches: the product of the
   // first rule in its bucket whose product carries tag:hot. 0 = cannot burn.
   // Resolved from the table at load, so no material id is ever named in code.
@@ -924,7 +1043,6 @@ class MobSystem {
   // model-space pose in mob.anim.model. Pure float, no grid contact.
   void UpdateAnimation(Mob& mob, const MobDef& def, World& world, float dt);
   void UpdateGait(Mob& mob, const MobDef& def, World& world, float dt);
-  void PlayClip(Mob& mob, const MobDef& def, const std::string& name);
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;
@@ -993,26 +1111,13 @@ class MobSystem {
 
   static constexpr uint32_t kMaxMobs = 16;
   // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)
-  // how long a severed piece holds its last animated pose before ragdolling
-  static constexpr float kSeverHoldSeconds = 0.25f;
-  // ---- carving ---------------------------------------------------------------
-  // A carved chunk needs this many voxels to become its own rigidbody; smaller
-  // pieces spray as particles. Deliberately lower than the debris island floor
-  // (8): flesh comes off in gobbets, and a severed finger IS the interesting
-  // object even though a 4-voxel rock chip is not.
-  static constexpr uint32_t kMinFragmentVoxels = 4;
-  // Fragments one carve may spawn, so a point-blank blast on a crowd cannot
-  // flood the body table (rule 2: bound every emergent process).
-  static constexpr uint32_t kMaxCarveFragments = 3;
-  // Below this fraction of its authored volume a limb is no longer a limb: it
-  // severs. This is what makes "shoot the arm until it falls off" work through
-  // pure geometry, without an hp bar deciding it.
-  static constexpr float kLimbCollapseFraction = 0.25f;
   // ---- per-voxel burning -----------------------------------------------------
   // Front voxels examined per tick across EVERY limb of EVERY mob. A fully
   // engulfed mob's front is a few hundred to ~2000 voxels, so this covers
   // several burning creatures at full rate and degrades to round-robin past
   // that rather than to a frame spike (rule 2: bound every emergent process).
+  // The avatar deliberately burns under its OWN budget (avatar.cpp BurnParts):
+  // a crowd of burning NPCs must not starve the fire on the player character.
   static constexpr uint32_t kBurnFrontPerTick = 6000;
   // Fire/ash ops all burning limbs together may push into the grid per tick.
   static constexpr uint32_t kBurnOpsPerTick = 96;
@@ -1020,19 +1125,12 @@ class MobSystem {
   // order 128 cells; this is the guard against a pathological pose, not a
   // budget anything normal comes near.
   static constexpr uint32_t kBurnScanCells = 4096;
-  // Voxels a limb may burn away before its collider is re-derived and its Jolt
-  // body rebuilt: max(floor, voxels >> shift). The FRACTION is the point — 12
-  // voxels out of a 62-voxel dummy arm is a real shape change, 12 out of a 31k
-  // mina torso is invisible, and rebuilding Jolt every tick for the second case
-  // is what would make burning mobs the most expensive thing in the game.
-  static constexpr uint32_t kBurnRebuildFloor = 12;
-  static constexpr uint32_t kBurnRebuildShift = 6;
   // Ticks a cold limb keeps its dense index before releasing it, so a limb
   // walking through a campfire does not rebuild the index every other tick.
   static constexpr uint32_t kBurnIndexGrace = 30;
-  // Carve damage per voxel removed, as a fraction of the limb's authored
-  // volume: losing all of a limb's matter costs this multiple of its full hp.
-  // > 1 so a limb that is being visibly minced dies a little before it is
-  // wholly gone, which reads better than a limb hanging on at one voxel.
-  static constexpr float kCarveDamagePerVolume = 1.5f;
+
+  // Mob's shared mechanics reach this system's services (burn tables, micro
+  // pool, event sinks, material tables) through this friendship — the same
+  // seam the avatar used to reach BurnOneLimb through, made symmetrical.
+  friend class Mob;
 };

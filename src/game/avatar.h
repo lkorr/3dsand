@@ -15,25 +15,29 @@
 
 // The PLAYER AVATAR: a visible, dismemberable body for the player.
 //
-// WHY THIS IS NOT A MOB. The avatar reuses the mob DATA format (assets/mobs/
-// wizard.{vox,json}) and the whole animation runtime in anim.h — clips, IK,
-// gait, springs and, most importantly, the AnimStateRule dismemberment
-// locomotion table. What it does not reuse is MobSystem's DRIVER: a mob picks
-// its own heading and wanders, whereas the avatar's position and facing come
-// from Player (which is itself driven by input and by the voxel sweeps in
-// player.cpp). Trying to express that as "a mob the player possesses" would
-// mean threading player input through the wander drive, the despawn sweep and
-// kMaxMobs; keeping the driver separate costs one file and leaves MobSystem
-// completely untouched.
+// THE AVATAR IS A MOB. PlayerAvatar derives from Mob (game/mob.h) and inherits
+// every body MECHANIC from it — damage, severing, dying, per-voxel carving,
+// burning/dissolution, bleeding, item holding, rendering. A chemical reaction,
+// a blast or a blade that works on an NPC works on the player by the same
+// single implementation, with no second copy to drift.
 //
-// So: one schema, two drivers. Everything an animator authors for a mob works
-// on the avatar and vice versa.
+// What this class adds is the DRIVER and the player-only surface:
+//   - position and facing come from Player (input + the voxel sweeps in
+//     player.cpp), not from MobSystem's sense/steer/drive AI;
+//   - its own animation pass (gait tuned for a player-driven body, ledge-hang
+//     arm IK, head look, weapon-arm IK, footfall events);
+//   - the health API the caster VM spends (TotalHealth/SpendHealth);
+//   - fall/impact damage driven by Player::impactDeltaV;
+//   - first-person part hiding, camera transforms, persistence ('AVTR').
+//
+// Everything else it does differently is an EXPLICIT override of Mob's
+// virtual seam (AvatarLayer, OnBodyReleasedToWorld, DropLimbListOnDeath,
+// MarkInstancesDirty) — never a parallel copy of shared mechanics.
 //
 // DETERMINISM (CLAUDE.md rule 1). Every field here is CPU-float PRESENTATION
-// state, exactly like MobSystem's: poses, springs, camera offsets and the
-// ragdoll are never hashed and never touch the grid. The only grid contact is
-// bleeding, which travels through the same BrushOp/ParticleSpawn queues mobs
-// use, so it lands via the MutationQueue like every other world edit (rule 3).
+// state, exactly like Mob's: poses, springs, camera offsets and the ragdoll
+// are never hashed and never touch the grid. The only grid contact travels
+// through the same BrushOp/CellOp/ParticleSpawn queues mobs use (rule 3).
 //
 // COST WHEN IDLE (rule 2). One avatar exists, its limbs are kinematic, and a
 // standing player runs the same pose pipeline a standing mob does. Severed
@@ -55,14 +59,9 @@ struct AvatarParts {
   int staff = -1;
 };
 
-// Locomotion clip indices, resolved once per def load. These four are looked up
-// on the per-tick path (PreTick picks which to play and which to retire, and
-// PreTick runs four times a frame), and AnimSkeleton::FindClip is a linear scan
-// comparing std::string — so resolving them by name every tick meant a few
-// hundred string compares a frame to answer a question whose answer only
-// changes when the skeleton is replaced. Re-resolved in ResolveParts alongside
-// AvatarParts, for the same reason: a hot reload swaps the skeleton, and a
-// stale index would point at whatever clip now sits in that slot.
+// Locomotion clip indices, resolved once per def load. These are looked up on
+// the per-tick path (PreTick runs four times a frame) and FindClip is a linear
+// string scan — see the note at ResolveParts.
 struct AvatarLocoClips {
   int idle = -1, walk = -1, run = -1, fall = -1, hang = -1;
 };
@@ -89,31 +88,27 @@ struct AvatarLocomotion {
   bool alive = true;
 };
 
-class PlayerAvatar {
+class PlayerAvatar : public Mob {
  public:
-  // `defs` is MobSystem's loaded def list; the avatar picks `defName` out of it
-  // rather than loading its own copy, so a hot reload (R) rebuilds both at
-  // once and the micro-body pool stays a single shared allocation.
-  //
-  // LIFETIME: `defs` must outlive the avatar, and MUST be re-published through
-  // SetDefs after any MobSystem::SetDefs — that call replaces the vector's
-  // contents, so every MobDef* into it (including def_) dangles afterwards.
-  // Re-publishing despawns first, which is also what stops a reload from
-  // leaving limb bodies pointing at a freed def.
-  // `mobs` supplies the burn pass and the compiled reaction mirror behind it.
-  // The avatar borrows both rather than keeping its own, for the same reason it
-  // already borrows MobSystem's def list: there is one authored reaction table,
-  // and the player must not burn by a second reading of it. May be null — the
-  // avatar simply does not burn then, which is what the older harnesses want.
+  PlayerAvatar() { id_ = 0x5A11EDU; }  // stable seed for gore variance
+
+  // `mobs` is the shared-services system (Mob::sys_): the def list, the one
+  // compiled reaction table, the micro brick pool and the event sinks. The
+  // avatar borrows all of it rather than keeping copies — the player must not
+  // burn by a second reading of the reaction table. Required for a spawned
+  // avatar; the default exists only for legacy call sites.
   void Init(Physics* phys, World* world, DebrisSystem* debris,
             const std::vector<MaterialDef>& mats, MobSystem* mobs = nullptr);
-  // Rebuild the per-material density table after a materials reload (R).
+  // Material tables now live on MobSystem; kept for call-site compatibility.
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats);
   // Points the avatar at a def by name. Safe to call repeatedly (hot reload):
   // despawns first, so limb bodies never leak across a reload.
+  //
+  // LIFETIME: `defs` must outlive the avatar, and MUST be re-published after
+  // any MobSystem::SetDefs — that call replaces the vector's contents, so
+  // every MobDef* into it (including def_) dangles afterwards.
   void SetDefs(const std::vector<MobDef>* defs, const std::string& defName);
   bool HasDef() const { return def_ != nullptr; }
-  const MobDef* Def() const { return def_; }
 
   // Creates the limb bodies at the player's current position. No-op if already
   // spawned. Returns false if the def is missing or physics refused a body.
@@ -123,63 +118,45 @@ class PlayerAvatar {
 
   // Once per tick, BEFORE Physics::Step and debris.PreTick — mirrors the
   // ordering MobSystem::PreTick relies on. Drives the rig from the player's
-  // state, submits kinematic limb targets, and appends bleeding to `ops` /
-  // `spawns` exactly as mobs do.
+  // state (THE driver seam — this is what replaces MobSystem's AI stages),
+  // submits kinematic limb targets, and runs the shared Mob body upkeep
+  // (burning, bleeding, severed holds) exactly as MobSystem does for NPCs.
   //
   // `heading` is the direction the BODY faces, which is not the camera yaw:
-  // in third person the body turns toward its motion and only snaps to the
-  // camera when the player aims. main.cpp owns that policy and passes the
-  // result in.
-  //
-  // `cellOps` receives the grid half of per-voxel burning: a burning part emits
-  // real fire into the world, so a player who is alight sets the grass they run
-  // through on fire exactly as a burning NPC does.
+  // main.cpp owns that policy and passes the result in.
   void PreTick(uint32_t tick, const Player& player, float heading, float dt,
                World& world, std::vector<BrushOp>& ops,
                std::vector<CellOp>& cellOps,
                std::vector<ParticleSpawn>& spawns);
-  // Set fire to up to `count` of a part's surface voxels; returns how many took.
-  // The avatar twin of MobSystem::IgniteLimb — same resolution of "what does
-  // this material become when it catches", out of the same table.
+  // Set fire to up to `count` of a part's surface voxels; returns how many
+  // took. Thin wrapper over Mob::Ignite, kept for API stability.
   uint32_t IgnitePart(int partIndex, uint32_t count, uint32_t onlyMat = 0);
   // Voxels of `part` currently alight, for the burn gate and the debug overlay.
   uint32_t PartBurningCount(int part) const {
-    return part >= 0 && part < (int)parts.size()
-               ? (uint32_t)parts[part].burn.front.size()
+    return part >= 0 && part < (int)limbs_.size()
+               ? (uint32_t)limbs_[part].burn.front.size()
                : 0u;
   }
   uint32_t PartMaterialCount(int part, uint32_t mat) const;
   // Cells in a part's dense burn index; 0 = the index does not exist, i.e.
   // nothing reactive has come near it. Diagnostic.
   uint32_t PartBurnIndexCells(int part) const {
-    return part >= 0 && part < (int)parts.size()
-               ? (uint32_t)parts[part].burn.idx.size()
+    return part >= 0 && part < (int)limbs_.size()
+               ? (uint32_t)limbs_[part].burn.idx.size()
                : 0u;
   }
-  // After Physics::Step: refresh limb transforms from Jolt.
-  void PostStep();
 
   // ---- head look ------------------------------------------------------------
   // Where the character is LOOKING, as an offset from where the body is
-  // FACING. Pushed in once per tick by main.cpp before PreTick, same division
-  // of labour as heading and the weapon pose: main.cpp owns the policy (it is
-  // the thing that knows the camera), the avatar owns the rig.
-  //
-  // `yawRel` is camera yaw minus body heading, radians, already wrapped to
-  // (-pi, pi]; `pitch` is the camera pitch, radians, positive up. Both are
-  // CLAMPED here against the neck limits in tuning.json rather than trusted:
-  // main.cpp's turn policy uses the same limit to decide when the BODY has to
-  // start turning, and a rig that silently over-rotates when those two
-  // disagree is a much worse failure than a head that stops at its stop.
+  // FACING. Pushed in once per tick by main.cpp before PreTick. `yawRel` is
+  // camera yaw minus body heading, radians, wrapped to (-pi, pi]; `pitch` is
+  // camera pitch, radians, positive up. Both are CLAMPED here against the
+  // neck limits in tuning.json rather than trusted.
   void SetLook(float yawRel, float pitch);
 
   // ---- footfall events (presentation only) --------------------------------
   // A foot touching down, produced by the gait's own plant moment rather than
-  // by a distance accumulator — so a step sounds exactly when the art shows
-  // the foot land, at whatever cadence the gait chose, and a leg lost to
-  // dismemberment simply stops producing them.
-  //
-  // These QUEUE rather than fire directly because PreTick runs inside the
+  // by a distance accumulator. These QUEUE because PreTick runs inside the
   // fixed-tick loop (up to 4 ticks per frame): the consumer drains them once
   // per frame. Presentation only — nothing here may feed back into the sim.
   struct Footfall {
@@ -193,62 +170,13 @@ class PlayerAvatar {
   const std::vector<Footfall>& Footfalls() const { return footfalls_; }
   void ClearFootfalls() { footfalls_.clear(); }
 
-  // ---- held weapon / melee (game/melee.h) ---------------------------------
-  // The swing pose, pushed in once per tick by main.cpp before PreTick. The
-  // avatar does NOT own the swing state machine and does not read input: it is
-  // told where the weapon hand should be and which way the blade points, and
-  // it aims the arm chain there. Same division as heading — main.cpp owns the
-  // policy, the avatar owns the rig.
-  //
-  // `handOffset` is relative to the weapon shoulder, in world voxels, in WORLD
-  // space (the caller built it from the camera basis). `weight` fades the
-  // whole thing against the ordinary animation pose, so sheathing eases out
-  // instead of snapping.
-  void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
-                     float weight);
-  // ---- holding an item ----------------------------------------------------
-  //
-  // THE ENTITY<->SLOT SYNC SEAM, and deliberately the only one. Equipping
-  // BORROWS A RIG SLOT: the item's own geometry fills a real Part parented to
-  // the socket's limb, so while worn it is a rig part in every respect —
-  // animated, rendered, severable with the arm that holds it, droppable as
-  // debris, carvable per voxel. Nothing downstream needs an "is this an item"
-  // branch, which is precisely why the item is not welded on as a special case.
-  //
-  // Placement composes SOCKET x GRIP, forward: the rig says where the fist
-  // closes (MobDef::sockets), the item says how it sits in that fist
-  // (ItemDef::grip). Pass nullptr to unequip.
-  //
-  // Returns false and changes nothing if the item cannot be held — no such
-  // socket, or the item declares no grip for this context. Both are content
-  // bugs that must be loud: the silent alternative parks the blade at the
-  // wearer's origin, which reads as a physics glitch rather than missing JSON.
-  bool EquipItem(const ItemDef* item, const char* context = "held_right");
-  const std::string& HeldItem() const { return heldItem_; }
-  // The rig slot the held item occupies, or -1. Exposed so the melee damage
-  // path can exclude it from its own sweep.
-  int HeldSlot() const { return heldSlot_; }
-
-  // The held weapon's cutting edge in WORLD voxels, from the part's authored
-  // `edge` block through its live transform. False when nothing is held, the
-  // part is severed, or the def declares no edge. This is what the melee
-  // damage sweep carves along — reading it from the same transform the
-  // renderer draws means the hitbox cannot drift from the visible blade.
-  bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const;
-
-  // Is this Jolt body one of the avatar's own parts? A held weapon starts
-  // inside its wielder's hand and sweeps across their front, so the melee
-  // sweep would otherwise carve the arm holding it on every guard.
-  bool OwnsBody(uint64_t bodyHandle) const;
+  // (EquipItem / HeldItem / HeldSlot / WeaponEdge / OwnsBody / SetWeaponPose
+  // are inherited from Mob — item holding is base-class scaffolding now, so a
+  // mob can wield a sword through the identical path.)
 
   // ---- damage / dismemberment ----
-  // Same contract as MobSystem::Damage: returns true if the handle was one of
-  // the avatar's limbs. A hit crossing a joint anchor, or one past the limb's
-  // severImpactSpeed, takes the part off.
-  bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
-              float impactSpeed = 0.0f);
-  // Detach a part now. A vital part (head/torso) kills the avatar instead.
-  void Sever(int partIndex);
+  // Damage(bodyHandle, ...) and Sever(limbIndex) are inherited from Mob:
+  // the player takes hits through the same code as any creature.
   // Debug/testing: sever by authored part name. Returns false on an unknown
   // name or an already-severed part.
   bool SeverByName(const std::string& name);
@@ -256,150 +184,105 @@ class PlayerAvatar {
 
   // ---- health, as the caster VM sees it (game/spell.h) --------------------
   // The player has no single hp field, and deliberately gains none here:
-  // health effectively lives on the per-part hp below, so the spell system
-  // reads and spends THAT rather than inventing a parallel number that would
-  // immediately drift from the visible damage state.
-  //
-  // Health is the summed hp of every LIVE part, rounded to an integer because
-  // the caster VM is integer throughout (thesis 3 in spell.h).
+  // health IS the summed per-part hp the dismemberment system maintains,
+  // rounded to an integer because the caster VM is integer throughout.
   int32_t TotalHealth() const;
   // The authored total across every limb — the HUD bar's denominator. Health
-  // NEVER regenerates, so this is a ceiling the player only moves away from;
-  // it is deliberately not lowered by severing, so a lost limb reads as a
-  // permanently short bar rather than as a full one on a smaller body.
+  // NEVER regenerates; deliberately not lowered by severing, so a lost limb
+  // reads as a permanently short bar.
   int32_t HealthMax() const;
   // Spend health across live parts, proportionally to what each still has.
-  // Distributing rather than draining one part keeps a mana overdraw from
-  // arbitrarily severing whichever limb happens to be first in the list.
   // Parts driven to zero are severed through the ordinary Sever() path, so an
   // overcast dismembers you with no new gore code.
   void SpendHealth(int32_t amount);
-  // Kill the caster spectacularly at `atWorldVoxel`: carve every part within
-  // `radiusVox` and then Die(). Used by a FATAL overcast, whose thematic
-  // flavour comes entirely from the spell's own effect payload running at the
-  // caster (spell.h thesis 2) — this is only the body's half of it, and it
-  // reuses CarveLimbRadial + the existing gore pipeline rather than adding any.
+  // Kill the caster spectacularly at `atWorldVoxel` (FATAL overcast).
   void SelfDestruct(Vec3 atWorldVoxel, float radiusVox, World& world,
                     std::vector<ParticleSpawn>& spawns);
-  // Explosion damage to the avatar's body: every live part within the blast
-  // takes hp damage that falls off with distance, bleeds from the wound, and
-  // severs when hp reaches zero. Same call shape as MobSystem::CarveMobsRadial
-  // so the explosion loop in main.cpp treats the avatar and mobs identically.
+  // Explosion damage to the avatar's body. Same call shape as
+  // MobSystem::CarveMobsRadial so the explosion loop in main.cpp treats the
+  // avatar and mobs identically — and since the refactor it IS the same code:
+  // real per-voxel carving via Mob::CarveRadialAll, not an hp approximation.
   void CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                    std::vector<ParticleSpawn>& spawns);
 
   // Impact damage, driven by Player::impactDeltaV — the velocity a collision
-  // sweep refused. Covers falls and horizontal wall slams with one path, since
-  // both are "the body was moving this fast and then abruptly was not".
-  // Below the onset threshold nothing happens; between onset and splat,
-  // proportional hp drain plus bleeding; at or above splat speed the body is
-  // carved open, roughly half the severable limbs come off, and it explodes.
-  //
-  // `centerWorldVoxel` is the blast origin in WORLD voxel coords — the player
-  // AABB centre, which is mid-torso. Not origin_/bodyY_: those are the min
-  // CORNER of the body box at the feet, and centring a 7-voxel blast there
-  // puts it half a body off in x/z and a full half-height low.
+  // sweep refused. Covers falls and horizontal wall slams with one path.
+  // `centerWorldVoxel` is the player AABB centre (mid-torso), NOT origin_.
   void ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel, uint32_t tick,
                        World& world, std::vector<BrushOp>& ops,
                        std::vector<ParticleSpawn>& spawns);
 
   // ---- persistence (sim/worldio.h, entities.sve section 'AVTR') -----------
-  // The avatar is a mob def driven by the player, so it persists like a mob:
-  // per-part hp and sever state, def by NAME. Parts carry no lattices in v1 —
-  // the avatar has no per-voxel carve path (attached parts are always the
-  // def's authored art; see the note in SelfDestruct), so the lattices are
-  // fully re-derived by Spawn(). When avatar carving arrives, bump the version
-  // and add them, mirroring the MOBS section.
-  //
-  // LoadState runs while the avatar is despawned (the load reset), so it only
-  // RECORDS the state; the next Spawn() applies it to the fresh rig and clears
-  // it. A dead avatar is saved as absent: its corpse is debris ('DBRS'), and
-  // the player respawns whole.
+  // Per-part hp and sever state, def by NAME. LoadState runs while the avatar
+  // is despawned, so it only RECORDS the state; the next Spawn() applies it.
+  // A dead avatar is saved as absent: its corpse is debris ('DBRS').
   static constexpr uint32_t kSaveVersion = 1;
   void SaveState(std::vector<uint8_t>& out) const;
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
   void ClearPendingRestore() { restore_.valid = false; }
 
   bool IsAlive() const { return alive_; }
-  bool PartAlive(int i) const {
-    return i >= 0 && i < (int)anim_.partAlive.size() && anim_.partAlive[i];
-  }
+  bool PartAlive(int i) const { return LimbAlive(i); }
   const AvatarParts& Parts() const { return parts_; }
   // What movement and the camera should do about the current damage state.
   AvatarLocomotion Locomotion() const;
 
-  // Model-space pose of a part (the same frame anim_.model is in), or identity
-  // when the part is gone. The camera uses this to ride the head.
+  // Model-space pose of a part, or identity when the part is gone. The camera
+  // uses this to ride the head.
   bool PartWorldTransform(int part, Vec3& outPos, Quat& outRot) const;
   // World position of a part's joint anchor — where the camera boom pivots and
   // where a first-person eye sits.
   bool PartAnchorWorld(int part, Vec3& out) const;
 
-  // ---- render plumbing (identical slot walk to MobSystem's) ----
+  // ---- render plumbing ----
+  // Inherited from Mob (identical slot walk to MobSystem's), except that the
+  // avatar owns its instance-dirty flag: shadow AppendInstances to clear it.
   bool InstancesDirty() const { return instancesDirty_; }
-  void AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
-  void AppendXforms(std::vector<BodyXformGpu>& out) const;
-  void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
-                        uint32_t slotBase) const;
-  uint32_t LimbBodyCount() const;
+  uint32_t AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase) {
+    const uint32_t next = Mob::AppendInstances(out, slotBase);
+    instancesDirty_ = false;
+    return next;
+  }
   // Parts to SKIP when drawing — first person hides the body but keeps the
-  // arms, so the wizard can see their own hands and staff. Empty in third
-  // person. Set by main.cpp from the camera mode.
+  // arms. Empty in third person. Set by main.cpp from the camera mode.
   void SetHiddenParts(const std::vector<uint8_t>& hidden);
-  // Total parts on the live rig, INCLUDING a borrowed item slot. Callers
-  // building a per-part array (the first-person hide list) must size against
-  // this rather than the def's limb count, which does not know about items.
-  int PartCount() const { return (int)parts.size(); }
-  // Collision-box debug overlay (world.h DebugBox, the dev panel's "collision
-  // boxes" toggle). One oriented wireframe per LIVE part body, read from the
-  // body's actual Jolt collider via Physics::GetLocalBounds — not from the
-  // part's art, so a collider that has drifted from the model it represents
-  // shows up as exactly that. Appends; stops at `limit` total.
-  void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
-                        uint32_t color) const;
+  // Total parts on the live rig, INCLUDING a borrowed item slot.
+  int PartCount() const { return (int)limbs_.size(); }
 
   // introspection (overlay / selftest)
-  // Jolt body of a part, or 0 when it is severed or never spawned. Mirrors
-  // MobSystem::LimbBody so a test can reach the same handle the damage paths
-  // are handed.
+  // Jolt body of a part, or 0 when it is severed or never spawned.
   uint64_t PartBody(int part) const;
   int PartIndex(const std::string& name) const;
   int LivePartCount() const;
   // ---- per-part condition, for the HUD body readout -----------------------
-  // The HUD shows damage per LIMB rather than one summed bar, so it needs the
-  // same three facts the gore code works in: how much hp the part has left,
-  // what it started with, and whether it is currently losing blood. All three
-  // are reads of state that already exists — nothing here is computed for the
-  // benefit of the UI, so the figure cannot drift from the body it describes.
-  //
   // `part` indexes the same array PartAlive/PartBody take, which INCLUDES the
-  // borrowed item slot past the def's limb count; those slots report 0 hp and
-  // an empty name.
+  // borrowed item slot past the def's limb count.
   float PartHp(int part) const {
-    return part >= 0 && part < (int)parts.size() ? parts[part].hp : 0.0f;
+    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].hp : 0.0f;
   }
   // Authored ceiling for one part (MobLimbDef::hp), the denominator of the
   // damage tint. Like HealthMax() it is never lowered by damage.
   float PartHpMax(int part) const {
-    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].hp : 0.0f;
+    return part >= 0 && part < (int)limbDefs_.size() ? limbDefs_[part].hp : 0.0f;
   }
-  // Actively losing blood: either an arterial gush from a fresh stump
-  // (gushTicks) or an ordinary wound still owing whole voxels of blood
-  // (bleedBudget >= 1, the same threshold the bleed drive in PreTick uses).
+  // Actively losing blood: either an arterial gush from a fresh stump or an
+  // ordinary wound still owing whole voxels of blood.
   bool PartBleeding(int part) const {
-    if (part < 0 || part >= (int)parts.size()) return false;
-    return parts[part].gushTicks > 0 || parts[part].bleedBudget >= 1.0f;
+    if (part < 0 || part >= (int)limbs_.size()) return false;
+    return limbs_[part].gushTicks > 0 || limbs_[part].bleedBudget >= 1.0f;
   }
-  // Authored name / tag ("head", "arm", "leg", "spine", ...) of a limb, or ""
-  // for a borrowed item slot. The HUD lays the figure out by TAG so it works
-  // for any humanoid rig rather than only for mina's part names.
+  // Authored name / tag ("head", "arm", ...) of a limb, or "" for a borrowed
+  // item slot. The HUD lays the figure out by TAG so it works for any
+  // humanoid rig rather than only for one rig's part names.
   const char* PartName(int part) const {
-    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].name.c_str()
-                                                  : "";
+    return part >= 0 && part < (int)limbDefs_.size()
+               ? limbDefs_[part].name.c_str()
+               : "";
   }
   const char* PartTag(int part) const {
-    return part >= 0 && part < (int)limbs_.size() ? limbs_[part].tag.c_str()
-                                                  : "";
+    return part >= 0 && part < (int)limbDefs_.size()
+               ? limbDefs_[part].tag.c_str()
+               : "";
   }
   int ActiveClips() const { return (int)anim_.clips.size(); }
   // Measured planar speed in world voxels/sec (presentation/diagnostics only).
@@ -417,77 +300,29 @@ class PlayerAvatar {
   const char* ActiveClipName(int i) const {
     if (!def_ || i < 0 || i >= (int)anim_.clips.size()) return "?";
     int c = anim_.clips[i].clip;
-    if (c < 0 || c >= (int)def_->skel.clips.size()) return "?";
-    return def_->skel.clips[c].name.c_str();
+    if (c < 0 || c >= (int)skel_.clips.size()) return "?";
+    return skel_.clips[c].name.c_str();
   }
   int LocoState() const { return anim_.locoState; }
-  Vec3 Origin() const { return origin_; }
-  float BodyY() const { return bodyY_; }
+
+ protected:
+  // ---- THE EXPLICIT EXCEPTIONS (Mob's virtual seam) -------------------------
+  // The player's limbs live on the AVATAR physics layer: they sit inside the
+  // player capsule by construction, and on the normal layer the solver fights
+  // an unresolvable contact whose ejection vector swings with the gait — the
+  // "walking forward drifts backwards" bug. The layer is identical in every
+  // other respect and stays visible to rays.
+  bool AvatarLayer() const override { return true; }
+  // A body leaving the rig for the world stops being "you": back on the
+  // normal layer it can bump the player like any other debris.
+  void OnBodyReleasedToWorld(uint64_t bodyHandle) override;
+  // Keep the limb list on death so the HUD's per-part readout survives the
+  // death screen; Despawn/Revive tears it down instead of the husk sweep.
+  bool DropLimbListOnDeath() const override { return false; }
+  // The avatar renders through its own slot range with its own dirty flag.
+  void MarkInstancesDirty() override { instancesDirty_ = true; }
 
  private:
-  struct Part {
-    uint64_t body = 0;
-    uint64_t joint = 0;
-    float hp = 0;
-    std::vector<DebrisVoxel> voxels;   // COLLIDER units (MobDef::physScale)
-    // The SKIN lattice (MobDef::skinScale), int16 — the brick source, and what
-    // travels to DebrisSystem on sever so a severed part keeps its detail.
-    // Empty when the two lattices coincide (mob.h Limb::skinVoxels).
-    std::vector<PrefabVoxel> skinVoxels;
-    bool HasFineSkin() const { return !skinVoxels.empty(); }
-    IVec3 size{};
-    int microModel = -1;
-    // Takes the SKIN scale: a MicroBodyRef is a render description.
-    MicroBodyRef MicroRef(uint32_t skinScale) const {
-      return microModel < 0 ? MicroBodyRef{}
-                            : MicroBodyRef{(uint32_t)microModel, skinScale};
-    }
-    Vec3 restOffset{};
-    Vec3 anchorRoot{};
-    Vec3 anchorLimb{};
-    BodyTransform xf{};
-    float bleedBudget = 0;
-    Vec3 woundLocal{};
-    int gushTicks = 0;
-    Vec3 gushLocal{};
-    Vec3 gushDir{0, 1, 0};
-    uint64_t holdBody = 0;
-    float holdSeconds = 0;
-    // ---- per-voxel burning / dissolution ----------------------------------
-    // docs/PLAN_body_reactivity.md. The player character burns through the SAME
-    // pass a mob does (MobSystem::BurnOneLimb over a BurnLimbView), because
-    // "the avatar is a MobDef with a different driver" has to hold for fire as
-    // well as for animation — two implementations that agree today are two that
-    // disagree after the next tuning edit.
-    BodyBurnState burn;
-    // Latched when this part's brick becomes a copy-on-write clone, so the
-    // teardown paths know to return it to the pool. The avatar never owned a
-    // private brick before: it had no per-voxel damage path at all.
-    bool burnOwnsBrick = false;
-  };
-
-  void DetachPart(int index, bool adopt);
-  void Die();
-
-  // ---- per-voxel burning ----------------------------------------------------
-  // Drive MobSystem's burn pass over every live part, then this system's own
-  // flush. The pass is shared; the flush is not, and cannot be: how a part
-  // burnt through comes off, and what losing matter costs in hp, are the
-  // avatar's own rules.
-  void BurnParts(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
-  // Compact the material-0 tombstones the burn left, re-derive the collider
-  // from the authoritative lattice, charge hp for what was lost, and sever a
-  // part burnt below the point of still being one. Returns false if the part
-  // came off (or the avatar died), in which case `parts` has been reshaped and
-  // the caller must not touch that index again.
-  bool FlushPartBurn(int index);
-  // Drop unflushed tombstones without the re-derive FlushPartBurn does, for the
-  // paths that are about to hand the lattice to DebrisSystem.
-  void StripPartTombstones(Part& p);
-  // The view the shared pass takes over one of our parts.
-  BurnLimbView ViewOfPart(Part& p);
-  MobSystem* mobs_ = nullptr;
-
   // Damage state read from a save (LoadState), applied at the end of the next
   // Spawn() — the rig it applies to only exists once Spawn has built it.
   struct SavedState {
@@ -500,137 +335,62 @@ class PlayerAvatar {
     std::vector<P> parts;
   };
   SavedState restore_;
-  void PlayClip(const std::string& name);
-  // Same, for a clip index the caller has ALREADY resolved. The locomotion
-  // path runs every tick and had just computed these indices to decide which
-  // clips to retire, then threw them away and re-scanned the clip list by
-  // string — see the call site in PreTick.
-  void PlayClipIndex(int ci);
-  // `grounded` comes from the player's own collision sweep. The gait is a
-  // WALKING system — it only means anything when there is a floor under the
-  // feet — so it is a parameter here rather than something UpdateAnimation
-  // infers, and the airborne pose is handled explicitly (see UpdateAirPose).
-  //
-  // `playerVel` is the player's TRUE velocity (world voxels/sec). It is passed
-  // in rather than differenced from origin_ because the player moves once per
-  // FRAME while this runs 0..4 times per frame — so a position delta over
-  // kTickDt measures the wrong interval every frame and reads zero on the
-  // second tick of a double-tick frame. See the note at the top of
-  // UpdateAnimation; that mismeasurement was the source of the limb jitter.
+
+  // ---- the PLAYER DRIVER's animation pass ----------------------------------
+  // These are the avatar's own: a player-driven body needs its gait fed by
+  // the player's true velocity and grounded state, ledge-hang arm IK, head
+  // look and the weapon arm. The MECHANICS underneath (clips, IK solver,
+  // springs, dismemberment states) are the shared anim runtime.
   void UpdateAnimation(float dt, World& world, bool grounded,
                        const Vec3& playerVel);
   void UpdateGait(float dt, World& world);
   // Airborne leg pose: relaxes the legs toward their rest hang instead of
   // leaving IK chasing a stale world-space foot plant.
   void UpdateAirPose(float dt);
-  // `outMat` receives the material id of the supporting voxel — the probe
-  // already reads it to decide what carries weight, so returning it costs
-  // nothing and is what lets a footstep know which surface it landed on.
-  bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
-                      uint32_t* outMat = nullptr) const;
   void ResolveParts();
+  // Per-voxel burning under the avatar's PRIVATE budget — a crowd of burning
+  // NPCs must not starve the fire on the player character.
+  void BurnParts(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                 std::vector<ParticleSpawn>& spawns);
 
-  Physics* phys_ = nullptr;
-  World* world_ = nullptr;
-  DebrisSystem* debris_ = nullptr;
-  std::vector<float> densityOf_;   // material id -> density, for collider mass
-  std::vector<uint32_t> classOf_;  // material id -> class, for the ground probe
   const std::vector<MobDef>* defs_ = nullptr;
-  const MobDef* def_ = nullptr;
   std::string defName_ = "wizard";
 
-  std::vector<Part> parts;
   AvatarParts parts_;
   AvatarLocoClips locoClips_;
-  AnimState anim_;
   bool spawned_ = false;
-  bool alive_ = true;
   bool instancesDirty_ = false;
-  std::vector<uint8_t> hidden_;      // per-part render suppression
-  std::vector<ParticleSpawn> pendingSpawns_;
   std::vector<Footfall> footfalls_;  // drained once per frame by the caller
 
-  Vec3 origin_{};                    // prefab min corner, world voxels
-  float heading_ = 0;
-  float bodyY_ = 0;
-  Vec3 bodyUp_{0, 1, 0};
-  float speedNow_ = 0;
-  bool footInit_ = false;
+  bool footfallInit_ = false;
   // How strongly the leg IK is applied, 0..1. Eased rather than switched: on
   // bumpy ground `grounded` is genuinely ragged, and gating the IK on it as a
   // bool made the legs and arms snap between the IK pose and the rest hang on
-  // every bump — the "arms shoot straight up going uphill" tweaking. See the
-  // note in UpdateAnimation.
+  // every bump. See the note in UpdateAnimation.
   float gaitWeight_ = 0.0f;
   bool wasGrounded_ = true;
-  // Was the support a LEDGE HANG last tick? Losing that support (a drop, or
-  // the arm boost) must not fire the "jump" clip — the arms are already up in
-  // the hang pose and the flourish reads as a spasm on release.
+  // Was the support a LEDGE HANG last tick? Losing that support must not fire
+  // the "jump" clip — the arms are already up in the hang pose.
   bool wasHanging_ = false;
-  // ---- ledge-hang arm IK (see the block after the weapon arm) ----
+  // ---- ledge-hang arm IK ----
   // Mirrored out of Player each PreTick so UpdateAnimation (whose signature
   // deliberately stays player-free) can pin the palms to the held lip.
   bool hangActive_ = false;
   IVec3 hangLipW_{};        // the held lip voxel, world
   Vec3 hangDirW_{1, 0, 0};  // horizontal facing at grab time, toward the wall
   float hangIkWeight_ = 0.0f;  // faded like gaitWeight_, never a hard switch
-  // Seconds spent continuously off the ground. `grounded` flickers false for a
-  // tick at a time crossing bumpy terrain, and the air-state clips used to fire
-  // on that raw edge — retriggering the arms-up `jump` one-shot on every bump.
-  // This debounces it; see the note in PreTick.
+  // Seconds spent continuously off the ground; debounces the flickering
+  // `grounded` bit so air-state clips fire once per real takeoff.
   float airOffTime_ = 0.0f;
   // Downward speed on the last airborne tick, voxels/sec. Sampled while still
   // falling because the collision sweep zeroes vel.y before `grounded` flips.
   float lastFallSpeed_ = 0;
   bool running_ = false;
   float airTime_ = 0;
-  uint64_t id_ = 0x5A11EDU;          // stable seed for gore variance
-  // ---- the rig this instance actually animates ----------------------------
-  //
-  // A COPY of def_->skel plus def_->limbs, owned per instance, because a held
-  // ITEM borrows a real rig slot: equipping appends a part, and the shared def
-  // must not grow a sword every time somebody picks one up. Everything that
-  // used to read def_->skel / def_->limbs reads these instead, so an item slot
-  // is indistinguishable from a limb to the animation runtime, the IK, the
-  // renderer and the damage path — which is the entire point of the borrowed
-  // slot, and what preserves severing, dropping and per-voxel carving for free.
-  //
-  // Rebuilt from the def on spawn and on hot reload; `parts`, `skel_.parts`
-  // and `limbs_` stay index-parallel, which several loops depend on.
-  AnimSkeleton skel_;
-  std::vector<MobLimbDef> limbs_;
-  const AnimSkeleton& Skel() const { return skel_; }
-
-  // The equipped item's slot, or -1. This is the ONE piece of entity<->slot
-  // state; keeping the sync in EquipItem alone is what stops the two views of
-  // "what is in the hand" from drifting.
-  int heldSlot_ = -1;
-  std::string heldItem_;
-
-  // Held weapon + swing pose, pushed in by main.cpp (SetWeaponPose). Pure
-  // presentation, like everything else here.
-  std::string heldPart_;
-  int heldPartIndex_ = -1;
-  // Where the fist closes on the held item, in that item's BODY frame (i.e.
-  // after Jolt's centre-of-mass recentring, so it can be used directly against
-  // a live body transform). Set by EquipItem; meaningless when heldSlot_ < 0.
-  //
-  // This exists because the held slot is placed DIRECTLY from the hand's live
-  // transform rather than through the anchorLimb/restOffset pair the rig's
-  // other parts use. Those fields describe a joint between two limbs of one
-  // prefab; an item is a foreign object whose only relationship to the rig is
-  // "this point of me sits at that point of the hand", and saying that in one
-  // subtraction is both shorter and impossible to get subtly wrong.
-  Vec3 gripBody_{};
-  Vec3 weaponHand_{}, weaponDir_{0, 1, 0}, weaponUp_{0, 0, 1};
-  float weaponWeight_ = 0;
 
   // Head look: the goal set by SetLook, and the smoothed value the rig is
   // actually posed at. Two of them so the head EASES onto the mouse rather
   // than stepping with it — the same reason the body yaw has a half-life.
   float lookYawGoal_ = 0, lookPitchGoal_ = 0;
   float lookYaw_ = 0, lookPitch_ = 0;
-
-  static constexpr float kSeverHoldSeconds = 0.25f;
-  // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)
 };
