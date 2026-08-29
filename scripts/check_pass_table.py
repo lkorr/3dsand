@@ -228,6 +228,7 @@ _SIM_GROUP0 = {
     "worldHash", "pick", "R", "reactions", "dirtyList", "args", "cellOps",
     "supportOut", "genList", "pageFillList", "pageTable", "pageFaults",
     "fluidBlockMapS", "fluidGridS", "fluidCellScratch",
+    "actVoxViz",
     # The water-body drain ledger, binding 24 (docs/PLAN_water_master.md M2).
     "waterBodyState",
 }

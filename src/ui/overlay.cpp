@@ -540,9 +540,9 @@ void Overlay::Draw(UIState& s) {
   ImGui::Checkbox("active voxels", &s.showDirtyVoxels);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
-        "Red wireframe on every voxel that MOVED this tick (has a fresh\n"
-        "stamp). Shows exactly which cells are triggering a chunk's dirty\n"
-        "flag. Combine with F6 (dirty chunks) to see cause and effect.");
+        "Red wireframe on every voxel the CA wrote this tick. Filled\n"
+        "GPU-side so there is no snapshot lag or stamp aliasing.\n"
+        "Combine with F6 (dirty chunks) to see cause and effect.");
   ImGui::Checkbox("wind field (F4)", &s.showWindField);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(

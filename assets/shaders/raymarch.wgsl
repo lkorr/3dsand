@@ -35,6 +35,11 @@
 @group(0) @binding(10) var<storage, read> fluidBlockMapR : array<u32>;
 @group(0) @binding(11) var<storage, read> fluidGridR : array<i32>;
 @group(0) @binding(12) var<storage, read> dirtyViz : array<u32>;
+@group(0) @binding(13) var<storage, read> actVoxViz : array<u32>;
+
+fn isVoxActive(idx : u32) -> bool {
+  return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
+}
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -1626,11 +1631,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
           if ((R.flags & 2u) != 0u) {
-            let gs = chunkSlotIndex(worldChunkOf(cell));
-            let snapTick = dirtyViz[gs];
-            if (snapTick != 0u) {
-              let st = voxStamp(w);
-              if (st == stampFor(snapTick, 0u) || st == stampFor(snapTick, 1u)) {
+            let gs = vec3<u32>(cell & vec3<i32>(WORLD_MASK));
+            let ge = pageTable[chunkIndexOf(gs)];
+            if ((ge & PT_SENTINEL_BIT) == 0u) {
+              let glo = gs % CHUNK;
+              let gi = ge * CHUNK_VOL + (glo.z * CHUNK + glo.y) * CHUNK + glo.x;
+              if (isVoxActive(gi)) {
                 cellTint = vec3f(1.0, 0.05, 0.05);
                 cellOp = 1.0;
               }
@@ -6323,13 +6329,14 @@ fn fs(in : VSOut) -> FSOut {
     // color, which is exactly the haze that hides the bottom.
     if (h.liqT <= 0.0) { color = applyAerial(color, rd, h.t); }
 
-    // ---- dirty-voxel debug highlight (dev panel toggle) ----
+    // ---- active-voxel debug highlight (dev panel toggle) ----
     if ((R.flags & 2u) != 0u) {
-      let chSlot = chunkSlotIndex(worldChunkOf(h.cell));
-      let snapTick = dirtyViz[chSlot];
-      if (snapTick != 0u) {
-        let stamp = voxStamp(h.word);
-        if (stamp == stampFor(snapTick, 0u) || stamp == stampFor(snapTick, 1u)) {
+      let avs = vec3<u32>(h.cell & vec3<i32>(WORLD_MASK));
+      let ave = pageTable[chunkIndexOf(avs)];
+      if ((ave & PT_SENTINEL_BIT) == 0u) {
+        let avlo = avs % CHUNK;
+        let avi = ave * CHUNK_VOL + (avlo.z * CHUNK + avlo.y) * CHUNK + avlo.x;
+        if (isVoxActive(avi)) {
           let ed = min(uv, 1.0 - uv);
           let me = min(ed.x, ed.y);
           if (me < 0.08) {

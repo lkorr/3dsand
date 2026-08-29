@@ -4452,16 +4452,8 @@ int main(int argc, char** argv) {
                         fluidCount,
                         (float)(accumulator / kTickDt),
                         ui.showDirtyVoxels ? 2u : 0u);
-      if (ui.showDirtyVoxels) {
-        const WorldSnapshot& ds = world.Snap();
-        if (ds.valid && ds.dirtyFlags.size() == kNumChunks) {
-          static std::vector<uint32_t> df(kNumChunks);
-          for (uint32_t i = 0; i < kNumChunks; i++)
-            df[i] = ds.dirtyFlags[i] ? ds.tick : 0u;
-          ctx.queue.WriteBuffer(world.dirtyViz, 0, df.data(),
-                                kNumChunks * sizeof(uint32_t));
-        }
-      }
+      // actVoxViz is filled GPU-side by sim_step.wgsl when vizActive is set;
+      // the old CPU dirtyViz upload (stamp-comparison) is no longer needed.
 
       // Celestial readout for the panel. Recomputed rather than cached out of
       // WriteRenderParams because the solve is a handful of trig calls once a
