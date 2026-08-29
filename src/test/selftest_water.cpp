@@ -57,6 +57,7 @@
 #include <vector>
 
 #include "sim/waterbody.h"
+#include "sim/currentprim.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -1178,6 +1179,308 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
 
 }  // namespace
 
+
+// ============================================================================
+// `--gate current` - the acceptance gate for docs/PLAN_water_master.md M4,
+// component 8 (the current field).
+//
+// TWO PASSES, and they answer the two questions that are genuinely separate:
+//
+//   P - THE PROFILES ARE THE PROFILES. Pure arithmetic against CurrentAtCpu,
+//       no GPU and no world. The whole design rests on one asymmetry - a
+//       vortex that falls off as Gamma/2*pi*r and REACHES, against a sink that
+//       falls off as 1/r^2 and does not - because that asymmetry is why real
+//       whirlpools look enormous while the actual suction is a small throat.
+//       If the two profiles were swapped, or if either had silently become the
+//       other under an integer truncation, the field would still look busy in
+//       a screenshot and would be wrong in the one way that matters. This pass
+//       also asserts the two things a pure function must do: exactly zero
+//       outside the union AABB, and exactly zero once the decay window closes
+//       (a funnel standing open in still water is plan component 8's named
+//       failure).
+//
+//   S - THE SIM ARM'S OFF SWITCH, in THREE arms, for pass D's reason: two arms
+//       cannot tell "mode 1 changed the world" from "arm 1 inherited something
+//       arm 2 did not". Mode 0 / mode 1 / mode 0 over an identical fluid pour
+//       with an identical whirlpool standing in it.
+//
+//       Unlike pass D, arm 2 is REQUIRED TO DIFFER. Pass D proves an off
+//       switch; this proves an off switch AND that the knob reaches the kernel,
+//       which is the half `--sweep` cannot establish in a world with no
+//       primitives in it (M1's note on "ALL HASHES IDENTICAL" is about exactly
+//       that ambiguity). arm1 == arm3 != arm2 is the only passing shape.
+Status GateCurrent(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  const Tuning base = CurrentTuning();
+  std::vector<std::string> fails;
+  auto fail = [&](const std::string& m) { fails.push_back(m); };
+
+  // ------------------------------------------------------------------ pass P
+  // A whirlpool and a drain throat, placed nowhere in particular: this pass
+  // never touches a voxel, so the world is irrelevant to it.
+  const int kR = 64;            // vortex radius, cells
+  const int kCx = 200, kCy = 100, kCz = 200;
+  double vortRatio = 0.0, sinkRatio = 0.0, tangCos = 1.0;
+  {
+    CurrentPrims().Clear();
+    CurrentPrim v;
+    v.kind = kCurrentPrimVortex;
+    v.flags = kCurrentPrimSim;
+    v.x = kCx; v.y = kCy; v.z = kCz;
+    v.radius = kR;
+    v.reach = kR;
+    v.swirlQ = 1 << 16;
+    v.decayTicks = kCurrentPrimForever;
+    v.spawnTick = 0;
+    v.seenTick = 0;
+    v.ownerId = 0x7E57u;
+    CurrentPrimAim(v, Vec3{0.0f, -1.0f, 0.0f}, 4.0f);
+    if (!CurrentPrims().Spawn(v)) fail("pass P: the vortex would not spawn");
+    // Past the attack ramp, so the envelope is 1 and the profile is the
+    // profile rather than a sixth of it.
+    CurrentPrims().Tick(64);
+
+    auto speedAt = [&](float dx) {
+      const Vec3 f = CurrentAtCpu(Vec3{(float)kCx + dx, (float)kCy, (float)kCz});
+      return (double)std::sqrt(f.x * f.x + f.y * f.y + f.z * f.z);
+    };
+    // THE VORTEX FALLS OFF AS 1/r. Sampled at r and 2r on the mid-plane, where
+    // the axial weight is identical, so the only thing that differs is the
+    // radius. The radial weight (1 - r^2/R^2) is divided out by comparing
+    // against the closed form rather than against a bare 2.
+    const float r1 = 12.0f, r2 = 24.0f;
+    const double s1 = speedAt(r1), s2 = speedAt(r2);
+    const double w1 = 1.0 - (double)(r1 * r1) / (double)(kR * kR);
+    const double w2 = 1.0 - (double)(r2 * r2) / (double)(kR * kR);
+    const double want = (double)(r2 / r1) * (w1 / w2);
+    vortRatio = s2 > 0.0 ? s1 / s2 : 0.0;
+    if (s2 <= 0.0 || std::abs(vortRatio - want) > 0.06 * want) {
+      fail(Format("pass P: the vortex is not a 1/r field. speed(%.0f)/"
+                  "speed(%.0f) = %.3f, the Gamma/2*pi*r form wants %.3f",
+                  r1, r2, vortRatio, want));
+    }
+    // AND IT IS TANGENTIAL. A vortex whose velocity points along the radius is
+    // a sink wearing a vortex's name, and every consumer would still work.
+    Vec3 swirlA{0.0f, 0.0f, 0.0f};
+    {
+      const Vec3 f =
+          CurrentAtCpu(Vec3{(float)kCx + r1, (float)kCy, (float)kCz});
+      swirlA = f;
+      const double m = std::sqrt(f.x * f.x + f.y * f.y + f.z * f.z);
+      tangCos = m > 0.0 ? std::abs((double)f.x / m) : 1.0;   // radial share
+      if (m <= 0.0 || tangCos > 0.30)
+        fail(Format("pass P: the vortex is not tangential - the radial share "
+                    "of its velocity at r=%.0f is %.2f", (double)r1, tangCos));
+    }
+    // CHIRALITY IS REAL. The same primitive with the opposite swirl must give
+    // the opposite tangential direction, or every drain in the world spins the
+    // same way whatever the hash says.
+    {
+      CurrentPrims().Clear();
+      CurrentPrim w = v;
+      w.swirlQ = -(1 << 16);
+      CurrentPrims().Spawn(w);
+      CurrentPrims().Tick(64);
+      const Vec3 b =
+          CurrentAtCpu(Vec3{(float)kCx + r1, (float)kCy, (float)kCz});
+      if (!(swirlA.z * b.z < 0.0f))
+        fail("pass P: reversing swirl did not reverse the tangential flow - "
+             "chirality is not reaching the field");
+    }
+
+    // THE SINK FALLS OFF AS 1/r^2, AND POINTS IN. Same two radii, same radial
+    // weight division, so this compares directly against the vortex number
+    // above: 1/r^2 against 1/r is the asymmetry the whole look rests on.
+    CurrentPrims().Clear();
+    CurrentPrim k;
+    k.kind = kCurrentPrimSink;
+    k.flags = kCurrentPrimSim;
+    k.x = kCx; k.y = kCy; k.z = kCz;
+    k.radius = kR;
+    k.reach = kR;
+    k.decayTicks = kCurrentPrimForever;
+    k.spawnTick = 0;
+    k.seenTick = 0;
+    k.ownerId = 0x7E58u;
+    CurrentPrimAim(k, Vec3{0.0f, -1.0f, 0.0f}, 4.0f);
+    CurrentPrims().Spawn(k);
+    CurrentPrims().Tick(64);
+    const double k1 = speedAt(r1), k2 = speedAt(r2);
+    const double kwant = (double)(r2 * r2) / (double)(r1 * r1) * (w1 / w2);
+    sinkRatio = k2 > 0.0 ? k1 / k2 : 0.0;
+    if (k2 <= 0.0 || std::abs(sinkRatio - kwant) > 0.06 * kwant) {
+      fail(Format("pass P: the sink is not a 1/r^2 field. speed(%.0f)/"
+                  "speed(%.0f) = %.3f, wanted %.3f",
+                  (double)r1, (double)r2, sinkRatio, kwant));
+    }
+    {
+      const Vec3 f =
+          CurrentAtCpu(Vec3{(float)kCx + r1, (float)kCy, (float)kCz});
+      if (!(f.x < 0.0f))
+        fail("pass P: the sink does not point INWARD - it is a source");
+    }
+    // ZERO OUTSIDE THE UNION AABB. Not "small": the reject is an early-out and
+    // a field that leaks past its own declared box would make every consumer's
+    // cost unbounded and the arrow overlay a lie.
+    {
+      const Vec3 f = CurrentAtCpu(
+          Vec3{(float)(kCx + kR + 8), (float)kCy, (float)kCz});
+      if (f.x != 0.0f || f.y != 0.0f || f.z != 0.0f)
+        fail("pass P: the field is non-zero outside its own union AABB");
+    }
+    // GAMMA DECAYS WHEN FLOW STOPS. Component 8 names the alternative outright
+    // - a funnel standing open in still water - so this asserts the envelope
+    // reaches exactly zero and that Tick() then drops the primitive entirely.
+    {
+      CurrentPrims().Clear();
+      CurrentPrim d = v;
+      d.decayTicks = 30;
+      d.spawnTick = 0;
+      d.seenTick = 0;
+      CurrentPrims().Spawn(d);
+      CurrentPrims().Tick(29);
+      const Vec3 mid =
+          CurrentAtCpu(Vec3{(float)kCx + r1, (float)kCy, (float)kCz});
+      const double mm = std::sqrt(mid.x * mid.x + mid.y * mid.y + mid.z * mid.z);
+      CurrentPrims().Tick(30);
+      const Vec3 dead =
+          CurrentAtCpu(Vec3{(float)kCx + r1, (float)kCy, (float)kCz});
+      if (!(mm > 0.0))
+        fail("pass P: the vortex was already dead one tick before its decay "
+             "window closed - the envelope is not a ramp");
+      if (CurrentPrims().Count() != 0 || dead.x != 0.0f || dead.z != 0.0f)
+        fail(Format("pass P: a vortex survived its decay window (%u primitives "
+                    "still live) - a funnel would stand open in still water",
+                    CurrentPrims().Count()));
+    }
+    CurrentPrims().Clear();
+  }
+
+  // ------------------------------------------------------------------ pass S
+  // THE SIM ARM, three arms. An identical pour into an identical stone basin
+  // with an identical whirlpool standing in it; only sim.currentMode differs.
+  uint32_t hOff = 0, hOn = 0, hOff2 = 0;
+  uint32_t pouredParts = 0;
+  {
+    uint32_t waterId = 0;
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "water") waterId = (uint32_t)i;
+    if (waterId == 0) {
+      detail = "no 'water' material";
+      return Status::Fail;
+    }
+    const IVec3 o = world.WindowOrigin();
+    const int px = o.x * (int)kChunk + 100, pz = o.z * (int)kChunk + 100;
+    const int py = World::TerrainHeight(px, pz, kDefaultSeed) + 4;
+    const int Rb = 5, Hb = 12;
+
+    auto arm = [&](int mode) {
+      Tuning a = base;
+      a.sim.currentMode = mode;
+      // The seeders must not add anything of their own, or the three arms
+      // would differ by which streams the window happened to hold.
+      a.sim.currentStreamScale = 0.0f;
+      SetCurrentTuning(a);
+      SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+      c.ctx.WaitIdle();
+
+      CurrentPrims().Clear();
+      CurrentPrim v;
+      v.kind = kCurrentPrimVortex;
+      v.flags = kCurrentPrimSim;
+      v.x = px; v.y = py + 4; v.z = pz;
+      v.radius = 24;
+      v.reach = 24;
+      v.swirlQ = 1 << 16;
+      v.decayTicks = kCurrentPrimForever;
+      v.spawnTick = 0;
+      v.seenTick = 0;
+      v.ownerId = 0x7E59u;
+      CurrentPrimAim(v, Vec3{0.0f, -1.0f, 0.0f}, 8.0f);
+      CurrentPrims().Spawn(v);
+
+      std::vector<CellOp> basin;
+      for (int z = -Rb - 1; z <= Rb + 1; z++)
+        for (int x = -Rb - 1; x <= Rb + 1; x++) {
+          basin.push_back({World::SlotCellIndex({px + x, py - 1, pz + z}),
+                           (uint32_t)kMatStone});
+          const bool rim = (x < -Rb || x > Rb || z < -Rb || z > Rb);
+          for (int y = 0; y < Hb; y++)
+            basin.push_back({World::SlotCellIndex({px + x, py + y, pz + z}),
+                             rim ? (uint32_t)kMatStone : 0u});
+        }
+      // A deterministic pour: a pure function of the index, so all three arms
+      // see byte-identical ops (the twice-run comparison's precondition).
+      std::vector<FluidSpawnOp> pour;
+      for (int cz = -3; cz < 3; cz++)
+        for (int cy = 0; cy < 3; cy++)
+          for (int cx = -3; cx < 3; cx++)
+            for (int s = 0; s < 4; s++) {
+              const uint32_t h =
+                  ((uint32_t)pour.size() * 6271u + 12345u) * 747796405u +
+                  2891336453u;
+              FluidSpawnOp op{};
+              op.px = ((px + cx) << 16) + ((s & 1) ? 49152 : 16384) +
+                      (int32_t)(h % 8192u) - 4096;
+              op.py = ((py + 6 + cy) << 16) + 32768;
+              op.pz = ((pz + cz) << 16) + ((s & 2) ? 49152 : 16384) +
+                      (int32_t)((h >> 13) % 8192u) - 4096;
+              op.mat = waterId;
+              pour.push_back(op);
+            }
+      pouredParts = (uint32_t)pour.size();
+      uint32_t live = 0;
+      for (uint32_t i = 0, k = 40000; i < 70; i++, k++) {
+        std::vector<FluidSpawnOp> fs;
+        if (i == 1) fs = pour;
+        SubmitTick(c.ctx, c.world, c.sim, k, kDefaultSeed, {}, {},
+                   i == 0 ? basin : std::vector<CellOp>{}, false,
+                   world.WindowOrigin(), false, false, {}, 0, fs, live);
+        live += (uint32_t)fs.size();
+        c.ctx.ProcessEvents();
+      }
+      return HashWorldNow(c.ctx, world, c.sim, kDefaultSeed);
+    };
+    hOff = arm(0);
+    hOn = arm(1);
+    hOff2 = arm(0);
+    if (hOff != hOff2) {
+      fail(Format("pass S is not measuring the off switch: the SAME mode-0 "
+                  "script hashed %08x the first time and %08x the third, so "
+                  "the fixture carries state between arms (mode 1 hashed %08x "
+                  "in between). Fix the fixture, not the feature",
+                  hOff, hOff2, hOn));
+    } else if (hOff == hOn) {
+      fail(Format("sim.currentMode does not reach the kernel: mode 0 and mode "
+                  "1 both hash %08x over a %u-particle pour standing inside a "
+                  "vortex. The off switch is vacuous and so is any claim about "
+                  "it", hOff, pouredParts));
+    }
+  }
+
+  // Leave the world and the tuning the way the ordering in selftest.h assumes.
+  CurrentPrims().Clear();
+  SetCurrentTuning(base);
+  SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  detail = Format(
+      "profiles: vortex 1/r ratio %.2f, sink 1/r^2 ratio %.2f, radial share of "
+      "the swirl %.2f; sim arm mode0/mode1/mode0 = %08x / %08x / %08x over a "
+      "%u-particle pour",
+      vortRatio, sinkRatio, tangCos, hOff, hOn, hOff2, pouredParts);
+  if (!fails.empty()) {
+    std::string all;
+    for (size_t i = 0; i < fails.size(); i++) {
+      if (i) all += "; ";
+      all += fails[i];
+    }
+    detail = all + " | " + detail;
+    return Status::Fail;
+  }
+  return Status::Pass;
+}
+
 const std::vector<Gate>& WaterGates() {
   static const std::vector<Gate> g = {
       // Depends on `terrain`: that gate is what establishes pristine worldgen at
@@ -1186,6 +1489,10 @@ const std::vector<Gate>& WaterGates() {
       // on. Running standalone without it would test a curve against a world
       // nobody had checked.
       {"waterbody", "sim", {"terrain"}, false, GateWaterBody},
+      // The current field (M4 component 8). Depends on nothing another
+      // gate leaves behind: pass P is pure arithmetic and pass S
+      // rebuilds the world itself for each of its three arms.
+      {"current", "sim", {}, false, GateCurrent},
   };
   return g;
 }

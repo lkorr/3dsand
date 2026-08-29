@@ -247,6 +247,26 @@ struct WaterBodyDesc {
   IVec3 lo{0, 0, 0}, hi{-1, -1, -1};
 };
 
+// THE HOLE HINT (component 8's drain seeder, docs/PLAN_water_master.md M4).
+//
+// Where the MUTATION that armed this body's drain window happened, and on which
+// tick. It is deliberately NOT the ledger's hole (`WBS_HOLEKEY`): that is a GPU
+// fact derived from a level the GPU owns, and the only way the CPU could learn
+// it is a readback arriving on a schedule set by fence retirement — which is
+// M1's §1.1 correction 2, and would put scheduling inside the input of a field
+// a sim kernel reads.
+//
+// What the CPU knows on the TICK INPUT STREAM is the dig, and a dig is where
+// the hole is. So this is exact in the case that matters (a player boring a
+// shaft), approximate in the case that does not (which of several digs the
+// ledger picked as deepest), and free.
+struct WaterBodyHole {
+  bool valid = false;
+  uint32_t basinId = 0;
+  int32_t x = 0, y = 0, z = 0;
+  uint32_t tick = 0;   // the tick the mutation arrived on
+};
+
 // ---- component 2, the analytic half ---------------------------------------
 //
 // THE CONTAINER CURVE: cell count at each height, its prefix sum, and a binary
@@ -366,8 +386,19 @@ class WaterBodySystem {
   // it is what tells the CPU whether a shave can fire this tick, which is what
   // decides whether the footprint has to be declared to the page table. It is
   // NOT part of any decision about which bodies exist.
+  //
+  // `editCell` is the world cell of that mutation (meaningless when
+  // `worldEdited` is false). It is recorded per body as the hole hint component
+  // 8's drain seeder reads — see WaterBodyHole above. Defaulted so a caller
+  // that has no cell to offer still compiles into the M3 behaviour exactly.
   void Tick(const World& world, uint32_t seed, uint32_t tick, int mode,
-            int testDrain, int drainMax, bool worldEdited);
+            int testDrain, int drainMax, bool worldEdited,
+            IVec3 editCell = IVec3{0, 0, 0});
+
+  // The live hole hint for a basin, or an invalid record. Expires with the same
+  // hot window the drain latch uses, so a swirl cannot outlive the dig that
+  // caused it by more than the drain could have.
+  WaterBodyHole HoleHint(uint32_t basinId) const;
 
   const std::vector<WaterBasin>& Basins() const { return basins_; }
   const std::vector<WaterBodyDesc>& Bodies() const { return bodies_; }
@@ -413,6 +444,12 @@ class WaterBodySystem {
   std::vector<WaterBasinCurve> curves_;   // parallel to basins_
   std::vector<WaterBodyDesc> bodies_;     // parallel to basins_
   std::vector<uint32_t> chunkBody_;
+  // Keyed by basinId, NOT parallel to bodies_ — a window rebuild renumbers the
+  // descriptors and a hint that followed an index would jump between lakes.
+  // Kept OUT of WaterBodyDesc on purpose: the descriptor is what gate pass G
+  // recomputes from voxels and asserts equality on, and a field recording
+  // "which tick a dig happened" is not recomputable from a world state.
+  std::vector<WaterBodyHole> holeHints_;
   WaterBodyGpu gpu_;
   IVec3 builtOrigin_{1 << 30, 1 << 30, 1 << 30};
   uint32_t builtSeed_ = 0;

@@ -405,6 +405,52 @@ grab("screenshot.bmp");
   grab("screenshot_far.bmp");
 }
 
+// ---- the WATER arm of the render benchmark (PLAN_water_master.md M4) -------
+// A 1080p frame that is MOSTLY WATER, which neither arm above is: the elevated
+// pass looks down at forest and the grazing pass puts the lake a few dozen
+// pixels wide on the horizon. Component 9's whole cost model is "O(water
+// pixels), not O(volume)", and component 8 adds a per-water-pixel field
+// evaluation plus four more for the foam convergence — so a frame with almost
+// no water in it cannot judge either.
+//
+// It is REPORTED, not asserted, exactly like the grazing arm and for the same
+// reason: bestFrameMs is a MIN feeding the perf gate's < 16 ms assertion, and
+// folding a deliberately expensive view into it would make that assertion read
+// as if it covered this one.
+//
+// The camera is derived from worldgen rather than written down. The two --shot
+// water cameras carried literal y values from before the terrain overhaul moved
+// spawnPlainY to 200 and had been rendering from inside solid rock ever since;
+// a benchmark that silently starts measuring the inside of a rock reports a
+// wonderful number.
+{
+  const World::Column lakeCol = World::TerrainColumn(420, 420, kDefaultSeed);
+  const float surf =
+      (float)(lakeCol.water != INT32_MIN ? lakeCol.water : lakeCol.h);
+  Camera wCam;
+  wCam.yaw = 0.785f;
+  wCam.pitch = -0.04f;
+  Vec3 wEye{386, surf + 2.5f, 386};
+  for (int pass = 0; pass < 2; pass++) {
+    bool wShadows = pass == 0;
+    ctx.WaitIdle();
+    double w0 = NowSeconds();
+    for (int i = 0; i < 60; i++) {
+      WriteRenderParams(ctx.queue, world, wEye, wCam, (float)W / H, wShadows, 0);
+      rhi::CommandEncoder wenc = ctx.device.CreateCommandEncoder();
+      rhi::RenderPass wrp =
+          sim.BeginRenderPass(wenc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(wrp);
+      wrp.End();
+      ctx.queue.Submit(wenc.Finish());
+    }
+    ctx.WaitIdle();
+    double wms = (NowSeconds() - w0) * 1000.0 / 60.0;
+    std::printf("render 1080p water %s: %.2f ms/frame (%.0f fps)\n",
+                wShadows ? "shadows on " : "shadows off", wms, 1000.0 / wms);
+  }
+}
+
 // ground-level view (phase 4): eye height on the terrain, horizon in frame.
 // This is the player's actual experience of the distance work — the elevated
 // shots can look fine while the first-person seam/fog/shading is still

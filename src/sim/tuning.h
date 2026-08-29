@@ -1263,6 +1263,62 @@ struct Tuning {
     // read CPU-side per tick, so a gate can set it with no shader reload.
     // Clamped to kWindWakeCap, which is the TickParams array it fills.
     int windWakeChunks = 96;
+
+    // ---- THE CURRENT FIELD (docs/PLAN_water_master.md component 8) --------
+    //
+    // ALL OF THESE ARE CPU-SIDE, and that is not the windGasScale exception —
+    // it is what this system's shape makes correct. The shader never reads a
+    // current knob: `CurrentPrimSystem` resolves the knobs into PRIMITIVES on
+    // the CPU once a tick and ships the resolved list, exactly the way
+    // `WindPrimSystem` does. A TUNE_CURRENT_* constant would be a second,
+    // never-read copy of a number, and the one thing this repo's tuning
+    // pipeline is designed to prevent is two places that must agree.
+    //
+    // The wave knobs are the opposite case — raymarch.wgsl evaluates the
+    // Gerstner sum itself — so those ARE .def rows, in the `water` group.
+    //
+    // THE OFF SWITCH. `currentMode` 0 must be bit-identical to a build without
+    // this feature, and it is by construction: currentAtQ returns the zero
+    // vector before reading anything else, so no sim kernel can see the field.
+    // The RENDER arm does not consult it (a renderer cannot write a voxel), so
+    // the look ships on with the hash pinned.
+    //   0 = no sim kernel evaluates the current field
+    //   1 = MPM fluid particles are dragged by it
+    int currentMode = 0;
+    // Base circulation of a drain's whirlpool, m^2/s. Gamma, the quantity that
+    // is actually conserved: v_theta = Gamma / (2 pi r), so this fixes how far
+    // the swirl reaches, not how fast the throat is. 22 m^2/s is the figure the
+    // plan's own excite-radius arithmetic is written against.
+    float currentVortexGamma = 22.0f;
+    // Seconds a whirlpool takes to wind down after the flow stops. Plan
+    // component 8: "Gamma must decay when flow stops. Otherwise any funnel
+    // effect stands open in still water, which is instantly and obviously
+    // wrong." This is that number, and 0 would be the bug.
+    float currentVortexDecay = 3.0f;
+    // How far a whirlpool reaches, world cells. Separate from Gamma because
+    // circulation sets the STRENGTH and this sets the FOOTPRINT — and the
+    // footprint is what the shader's AABB reject and the per-sample cost are
+    // paid against.
+    int currentVortexRadius = 40;
+    // Peak inflow speed at a drain's throat, m/s. The sink term is violent and
+    // only a couple of voxels wide at any realistic discharge; that asymmetry
+    // against the vortex is why real whirlpools look enormous while the actual
+    // suction is a small hole.
+    float currentSinkSpeed = 3.0f;
+    // Chezy coefficient for the stream arm: v = scale * sqrt(slope * depth),
+    // depth in metres. 0 disables the stream arm entirely.
+    float currentStreamScale = 1.2f;
+    // Landform slope below which standing water is a POND, not a stream, Q8
+    // (256 = one voxel per voxel = the angle of repose). Read against
+    // World::Column::slope, which is `Land.slope` — the HILL-octave gradient,
+    // deliberately not the fine one. See the trap note over SeedStreams.
+    int currentStreamMinSlope = 24;
+    // How fast an MPM node closes the gap to the local current, per second.
+    // The ONE current knob a shader reads (sim_fluid.wgsl const-evals it), and
+    // it is a DRAG rather than a push for windDrag's reason: a drag law is
+    // self-limiting, so no whirlpool and no knob value can fling water faster
+    // than the field says it is moving. Only consulted when currentMode is 1.
+    float currentDrag = 6.0f;
   } sim;
 
   // ---- day/night cycle ----
@@ -1683,6 +1739,52 @@ struct Tuning {
     float glintIntensity = 0.85f;
     float glintPowerNear = 180.0f, glintPowerFar = 900.0f;
     float foamDepth = 0.42f, foamStrength = 0.55f;
+
+    // ---- SURFACE WAVES (docs/PLAN_water_master.md component 9) -----------
+    //
+    // Render-side, not `sim.*`, and the boundary is absolute: a render wave can
+    // never push anything. The body's LEVEL (sim) and its DISPLACEMENT (render)
+    // stay strictly separate and the CA never sees the displacement. The moment
+    // a wave height feeds back so a boat bobs, a render field has become
+    // authoritative for sim (design guideline #3).
+    //
+    // THE ONE THAT MATTERS. `waveDispersion` mixes between one speed for every
+    // octave (0) and the real relation w^2 = g k tanh(k h) (1). At 0 the
+    // surface reads as a scrolling texture; at 1 the 8 m swell runs 4x faster
+    // than the 0.5 m chop in 2.6 m of water and SLOWS as it reaches a bank,
+    // which is shoaling, and it costs nothing but the choice of constant.
+    // It exists as a knob because it is also the honest A/B for that claim.
+    float waveDispersion = 1.0f;
+    // Gerstner crest sharpening, 0..1. Sinusoids have round crests and round
+    // troughs; real gravity waves have sharp crests and flat troughs, and this
+    // is the term that produces the difference.
+    float waveSteepness = 0.55f;
+    // Depth in METRES below which wave amplitude fades to nothing. Sum-of-waves
+    // does not reflect off a bank and shallow water damps chop anyway, so the
+    // cheap fix is also the physically right one.
+    float waveShoreDepth = 0.45f;
+    // How hard the current field advects the wave phase — the wave is evaluated
+    // at `position - current * t`, so the Doppler stretch downstream is what
+    // makes a surface look like it is GOING somewhere. 0 pins the waves to the
+    // world and the flow stops reading as flow.
+    float waveFlowScale = 1.0f;
+    // Foam on the current field's CONVERGENCE lines. `threshold` is the
+    // convergence (1/s) at which foam starts and `gain` how fast it saturates.
+    float waveFoamThreshold = 0.12f, waveFoamGain = 3.0f;
+    // Impact ripples: ring expansion speed (m/s), amplitude e-fold time
+    // (seconds) and the wavelength of the ring train (metres).
+    float waveImpactSpeed = 1.8f, waveImpactDecay = 2.5f;
+    float waveImpactLen = 0.70f;
+    // ---- the current-field arrow overlay (plan component 8) -------------
+    // A clone of the wind overlay's two knobs, at a water scale: currents are
+    // metres per second where wind is tens, so the lattice is tighter and the
+    // reach shorter. `dbgCurrentField` is a bool for the dbgWindField reason —
+    // a knob as well as a key, so the overlay is reachable from a saved
+    // tuning.json and from a headless screenshot run, neither of which can
+    // press anything.
+    bool dbgCurrentField = false;
+    float dbgCurrentSpacing = 6.0f;
+    float dbgCurrentRadius = 40.0f;
 
     // translucent solids — ice, glass (shadeTranslucent in raymarch.wgsl).
     // A solid is translucent when its authored `opacity` is < 255; these

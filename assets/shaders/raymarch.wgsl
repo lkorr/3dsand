@@ -2536,7 +2536,66 @@ const RIPPLE_BANDS : i32 = 5;
 // Each wave is faded out once the footprint approaches its wavelength (i.e.
 // once it can no longer be sampled), which is per-band mip selection done
 // analytically. Pass 0 to disable damping.
-fn rippleSlope(pWorldM : vec2f, t : f32, footM : f32) -> vec2f {
+// ---- SURFACE WAVES (docs/PLAN_water_master.md component 9) -----------------
+//
+// THE ONE EXPENSIVE MISTAKE, named in the plan and avoided here by
+// construction: this is evaluated where a ray HITS the water surface, never
+// per sample through the volume. The perf audit identified the raymarch media
+// march as what collapsed the frame rate during fires; the cost of this field
+// is O(water pixels), not O(volume). Every call site below is a surface hit.
+//
+// THE RENDER/SIM BOUNDARY IS ABSOLUTE. A render wave can never push anything.
+// The body's LEVEL is sim (the ledger owns it) and its DISPLACEMENT is render
+// (this file owns it), and the CA never sees the displacement. The moment a
+// wave height is fed back so a boat bobs, a render field has become
+// authoritative for sim — design guideline #3, and the reason this returns a
+// SLOPE for a normal rather than a height anyone could sample.
+//
+// gravity in m/s^2, for the dispersion relation below.
+const WAVE_G : f32 = 9.81;
+// Depth a wave sees when nobody has measured one (the caustic path, which is
+// looking at the bed from above and does not have a column to probe). 8 m is
+// deep against every band here, so tanh(kh) is 1 and the relation degenerates
+// to the deep-water case — which is what "no depth information" should mean.
+const WAVE_DEEP_H : f32 = 8.0;
+
+// THE FULL FIELD: a Gerstner sum with per-octave speed from the dispersion
+// relation, advected by the current field, faded at the shore.
+//
+// w^2 = g*k*tanh(k*h)      k = 2*pi/lambda, h = local depth
+//   deep    (h >> lambda):  tanh -> 1     => c = sqrt(g*lambda/2*pi)
+//   shallow (h << lambda):  tanh(kh)~kh   => c = sqrt(g*h), lambda cancels
+//
+// THIS IS THE HIGHEST-LEVERAGE CONSTANT CHOICE IN THE RENDER TIER AND IT COSTS
+// NOTHING. If every octave scrolls at one speed the surface reads as a moving
+// texture. At `pondDepth` 26 (2.6 m) the spread across the bands worth
+// rendering is 4x — 0.88 m/s at 0.5 m against 3.48 m/s at 8 m. And because `h`
+// is the LOCAL depth the same term pays twice: approaching a bank at 0.3 m the
+// long swell slows to 1.70 m/s while the short chop barely changes, which is
+// shoaling. TUNE_WAVE_DISPERSION mixes between the two so the claim is an A/B
+// rather than an assertion.
+//
+// WHAT THIS IS NOT. A sum of fixed-direction waves does not REFRACT: the
+// crests do not physically turn to run parallel to the shore, they only slow
+// and steepen there. Amplitude shoaling (Green's law) is included because it
+// falls out of the same term; directional refraction would need the wave
+// vectors to be functions of position, which is a different field.
+//
+// `flowMS` is the current at this point in METRES per second. The wave phase
+// is evaluated at `position - current*t`, so the pattern drifts and stretches
+// downstream — which is what makes a flowing surface look like it is going
+// somewhere rather than like a texture scrolling over still water.
+fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
+             flowMS : vec2f) -> vec2f {
+  // Shore fade. A sum of sinusoids cannot reflect off a bank, and shallow
+  // water damps chop anyway, so the cheap fix is also the physically right
+  // one. Without it the waves march straight through the shoreline.
+  let shore = smoothstep(0.0, max(TUNE_WAVE_SHORE_DEPTH, 1e-3), depthM);
+  if (shore <= 0.0) { return vec2f(0.0); }
+  // Advected sample point — component 8 feeding component 9, and ~free.
+  let pAdv = pWorldM - flowMS * (t * TUNE_WAVE_FLOW_SCALE);
+  var num = vec2f(0.0);   // d(height)/d(position), the plain sinusoid part
+  var sharp = 0.0;        // the Gerstner denominator: 1 - sum(Q*k*A*sin)
   var slope = vec2f(0.0);
   // len in metres, amp in metres of height. Four octaves is enough to read as
   // water; the two short ones carry the glint sparkle, the two long ones give
@@ -2563,17 +2622,75 @@ fn rippleSlope(pWorldM : vec2f, t : f32, footM : f32) -> vec2f {
   for (var i = 0; i < RIPPLE_BANDS; i++) {
     let w = waves[i];
     let k = 6.28318 / w.len;                 // angular wavenumber
-    let amp = w.amp * TUNE_RIPPLE_AMP_SCALE;
-    let spd = w.speed * TUNE_RIPPLE_SPEED_SCALE;
-    let phase = dot(pWorldM, w.dir) * k + t * spd * k;
+    var amp = w.amp * TUNE_RIPPLE_AMP_SCALE * shore;
+    // ---- per-octave speed ----
+    // FLAT arm: the authored per-band speed this shader shipped with, so
+    // TUNE_WAVE_DISPERSION = 0 reproduces the old look exactly and the knob is
+    // a real before/after rather than a claim.
+    let omegaFlat = w.speed * k;
+    // DISPERSED arm: the relation. tanh saturates, so a deep body costs the
+    // same as a shallow one and no branch is needed.
+    let th = tanh(clamp(k * depthM, 1e-3, 20.0));
+    let omegaDisp = sqrt(WAVE_G * k * th);
+    let omega = mix(omegaFlat, omegaDisp, TUNE_WAVE_DISPERSION) *
+                TUNE_RIPPLE_SPEED_SCALE;
+    // SHOALING GAIN (Green's law, A ~ (c_deep/c)^(1/2)). Falls out of the same
+    // tanh already computed: a wave slowing as it climbs a bank piles its
+    // energy into height. Capped, because Green's law diverges at h -> 0 and
+    // the shore fade above is what actually ends the wave there.
+    amp *= mix(1.0, clamp(inverseSqrt(max(th, 0.02)), 1.0, 1.8),
+               TUNE_WAVE_DISPERSION);
+    let phase = dot(pAdv, w.dir) * k + t * omega;
     // Per-band fade: full amplitude while the footprint is comfortably under
     // half a wavelength (Nyquist), gone by the time it exceeds it.
     var band = 1.0;
     if (footM > 0.0) { band = 1.0 - smoothstep(w.len * 0.28, w.len * 0.85, footM); }
     // d/dp of (amp * sin(phase)) = amp * k * cos(phase) * dir
-    slope += w.dir * (amp * k * cos(phase)) * band;
+    num += w.dir * (amp * k * cos(phase)) * band;
+    // GERSTNER SHARPENING. A Gerstner wave displaces the surface horizontally
+    // toward its crests, so the normal picks up a 1/(1 - sum(Q*k*A*sin))
+    // denominator: crests get sharp, troughs get flat. That asymmetry is the
+    // difference between "sine waves" and "water" and it is two extra ALU ops.
+    sharp += TUNE_WAVE_STEEPNESS * amp * k * sin(phase) * band;
+  }
+  // Clamped well away from zero: a steepness knob turned past the point where
+  // the wave would fold over on itself must saturate, not divide by nothing.
+  slope = num / max(1.0 - sharp, 0.35);
+  // ---- impact ripples ----
+  // A ripple is the memory of an event, so this is the one part of the field
+  // that reads state — a BOUNDED ring, evaluated as a pure function of
+  // (eventList, t). See kWaveImpactCap and the note over WaveImpactRing.
+  if (R.waveImpactCount > 0u) {
+    let ik = 6.28318 / max(TUNE_WAVE_IMPACT_LEN, 0.05);
+    let n = min(R.waveImpactCount, WAVE_IMPACT_CAP);
+    for (var i = 0u; i < n; i = i + 1u) {
+      let e = R.waveImpacts[i];
+      if (e.w <= 0.0) { continue; }
+      let age = t - e.z;
+      if (age < 0.0 || age > TUNE_WAVE_IMPACT_DECAY * 3.0) { continue; }
+      // Ring radius grows linearly; the crest train rides it and the whole
+      // thing decays exponentially. Amplitude also falls as 1/sqrt(r), which
+      // is energy spreading round a growing circle, not an art choice.
+      let d = pWorldM - vec2f(e.x, e.y) * VOXEL_METERS;
+      let r = length(d);
+      if (r < 1e-4) { continue; }
+      let ringR = age * TUNE_WAVE_IMPACT_SPEED;
+      let widthM = max(TUNE_WAVE_IMPACT_LEN, 0.05) * 1.5;
+      let env = exp(-age / max(TUNE_WAVE_IMPACT_DECAY, 0.05)) *
+                exp(-((r - ringR) * (r - ringR)) / (widthM * widthM)) *
+                inverseSqrt(max(r, 0.25));
+      if (env < 1e-4) { continue; }
+      slope += (d / r) * (e.w * shore * ik * env * cos(ik * (r - ringR)));
+    }
   }
   return slope;
+}
+
+// The deep, still-water case, for callers with no column to probe and no flow
+// to advect by — the caustic path. Kept as its own name so those call sites
+// read as what they are rather than as waveSlope with two magic arguments.
+fn rippleSlope(pWorldM : vec2f, t : f32, footM : f32) -> vec2f {
+  return waveSlope(pWorldM, t, footM, WAVE_DEEP_H, vec2f(0.0));
 }
 
 // ---- surface normal ----
@@ -2607,6 +2724,32 @@ fn liquidColumn(c : vec3<i32>, mat : u32) -> f32 {
     if (f < 0.999) { break; }
   }
   return h;
+}
+
+// LOCAL DEPTH of the water under a surface cell, in METRES.
+//
+// Component 9's dispersion relation needs `h`, and `h` is what makes the same
+// tanh term pay twice — per-octave speed AND shoaling toward a bank. The plan
+// says "the descriptor provides both", and for a governed body it does; but the
+// renderer must also be right on the 95% of water that is not governed (a
+// puddle, a flooded cellar, the CA's own transient), so this measures it.
+//
+// A GEOMETRIC PROBE, not a linear one: 8 taps at increasing stride reach 26
+// voxels (2.6 m, exactly `pondDepth`) with 1-voxel resolution where it matters.
+// Resolution near the surface is what the shore fade and the shoaling gain are
+// sensitive to; resolution at 2 m is not, because tanh has already saturated.
+// A linear 26-tap probe would spend 18 extra taps buying nothing.
+fn waterDepthM(cell : vec3<i32>, mat : u32) -> f32 {
+  var d = 0;
+  var step = 1;
+  for (var i = 0; i < 8; i++) {
+    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0), mat) <= 0.0) {
+      break;
+    }
+    d += step;
+    if (i >= 2) { step = step * 2; }
+  }
+  return f32(d + 1) * VOXEL_METERS;
 }
 
 // ---- how OPEN is this body of water? ----
@@ -2761,7 +2904,15 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   // no travelling waves at all and keeps the macro slope from the column
   // gradient, so it reads as a still bead of water. A lake keeps the full
   // field. Everything between crosses over smoothly.
-  slope += rippleSlope(pm, R.time, gain) * waterOpenness(cell, mat);
+  //
+  // DEPTH and FLOW are what turn the ripple field into component 9's wave
+  // field: depth sets each octave's speed and its shoaling, and the current
+  // advects the phase so a drifting surface reads as drifting. Both are
+  // measured HERE, at the surface hit, and nowhere else in the march.
+  let depthM = waterDepthM(cell, mat);
+  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
+  slope += waveSlope(pm, R.time, gain, depthM, flowMS) *
+           waterOpenness(cell, mat);
 
   return normalize(vec3f(-slope.x, 1.0, -slope.y));
 }
@@ -3658,14 +3809,25 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // color step it replaces.
   if (upFacing && !underwater) {
     let shallow = 1.0 - smoothstep(0.0, TUNE_FOAM_DEPTH, depthM);
-    if (shallow > 0.0) {
+    // FOAM ON CONVERGENCE LINES (plan component 9). Surface water piles up
+    // where the flow converges — the inflow line of a drain, the seam where a
+    // jet's outward spread meets the bank — and that is where the froth
+    // collects. The current field is ANALYTIC, so its divergence is available
+    // without storing anything: currentConvergeAt is four evaluations of a
+    // function that early-outs to one compare where there is no current, so a
+    // still lake pays nothing for this.
+    let conv = currentConvergeAt(hitP, &R) * VOXEL_METERS;   // per second
+    let flowFoam = clamp((conv - TUNE_WAVE_FOAM_THRESHOLD) * TUNE_WAVE_FOAM_GAIN,
+                         0.0, 1.0);
+    let amount = max(shallow, flowFoam);
+    if (amount > 0.0) {
       let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
       // reuse the ripple field as the foam mask so foam moves with the waves
       // (undamped: foam is a shoreline feature, always near the camera, and
       // damping it would dissolve the far shore's foam line)
       let s = rippleSlope(pm, R.time, 0.0);
       let mask = smoothstep(0.010, 0.055, length(s));
-      color = mix(color, vec3f(0.92, 0.95, 0.97), shallow * mask * TUNE_FOAM_STRENGTH);
+      color = mix(color, vec3f(0.92, 0.95, 0.97), amount * mask * TUNE_FOAM_STRENGTH);
     }
   }
 

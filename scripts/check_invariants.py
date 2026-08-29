@@ -516,6 +516,49 @@ def check_wind_prims():
             f"stride past the primitive it is decoding")
 
 
+def check_current_prims():
+    """world.h's current-primitive ceilings must match common.wgsl's constants.
+
+    The same check check_wind_prims makes, for the same reason and against the
+    same failure: the shader loops `i < min(count, CURRENT_PRIM_CAP)` and
+    strides by CURRENT_PRIM_ROWS, so a cap raised in world.h alone would leave
+    the extra primitives silently unread -- a whirlpool that exists and does
+    nothing, with a green build, a green selftest and an unmoved hash.
+
+    The impact ring is here too: kWaveImpactCap sizes a RenderParams array that
+    the shader iterates against WAVE_IMPACT_CAP, and a shader cap larger than
+    the C++ one reads uninitialised uniform tail as ripple events.
+    """
+    wh = read("src/sim/world.h")
+    cw = read("assets/shaders/common.wgsl")
+    if not wh or not cw:
+        return
+    m = re.search(r"constexpr\s+uint32_t\s+kCurrentPrimCap\s*=\s*(\d+)", wh)
+    g = re.search(r"const\s+CURRENT_PRIM_CAP\s*:\s*u32\s*=\s*(\d+)u", cw)
+    r = re.search(r"const\s+CURRENT_PRIM_ROWS\s*:\s*u32\s*=\s*(\d+)u", cw)
+    w = re.search(r"constexpr\s+uint32_t\s+kCurrentPrimWords\s*=\s*(\d+)", wh)
+    iw = re.search(r"constexpr\s+uint32_t\s+kWaveImpactCap\s*=\s*(\d+)", wh)
+    ig = re.search(r"const\s+WAVE_IMPACT_CAP\s*:\s*u32\s*=\s*(\d+)u", cw)
+    if not (m and g and r and w and iw and ig):
+        return
+    checked.append("current primitives")
+    if m.group(1) != g.group(1):
+        problems.append(
+            f"world.h kCurrentPrimCap = {m.group(1)} but common.wgsl "
+            f"CURRENT_PRIM_CAP = {g.group(1)} -- the shader would read a "
+            f"different number of primitives than the CPU uploads")
+    if int(r.group(1)) * 4 != int(w.group(1)):
+        problems.append(
+            f"common.wgsl CURRENT_PRIM_ROWS = {r.group(1)} (x4 scalars per "
+            f"row) but world.h kCurrentPrimWords = {w.group(1)} -- the shader "
+            f"would stride past the primitive it is decoding")
+    if iw.group(1) != ig.group(1):
+        problems.append(
+            f"world.h kWaveImpactCap = {iw.group(1)} but common.wgsl "
+            f"WAVE_IMPACT_CAP = {ig.group(1)} -- the wave shader would read "
+            f"past the impacts the CPU wrote")
+
+
 # ------------------------------------------- the three per-tick count structs
 def check_tick_counts():
     """The tick's counts cross THREE structs; all three must carry every field.
@@ -821,6 +864,7 @@ ALL = {
     "arch": check_arch_paths,
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
+    "curprim": check_current_prims,
     "counts": check_tick_counts,
 }
 
@@ -836,7 +880,8 @@ RELEVANT = {
     "src/sim/materials.cpp": ["render"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
-    "src/sim/world.h": ["world", "params", "substeps", "windprim"],
+    "src/sim/world.h": ["world", "params", "substeps", "windprim",
+                        "curprim"],
     "src/sim/world.cpp": ["worldgen"],
     "assets/shaders/worldgen.wgsl": ["worldgen"],
     "src/sim/simulation.cpp": ["counts"],
@@ -857,7 +902,8 @@ if __name__ == "__main__":
                 if norm.endswith(key):
                     run += checks
             if norm.endswith(".wgsl"):
-                run += ["tuning", "world", "params", "windprim"]
+                run += ["tuning", "world", "params", "windprim",
+                        "curprim"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

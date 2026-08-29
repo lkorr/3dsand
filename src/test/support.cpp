@@ -19,6 +19,7 @@
 #include "sim/worldedit.h"
 #include "sim/waterbody.h"
 #include "sim/windprim.h"
+#include "sim/currentprim.h"
 
 namespace sandvox {
 
@@ -169,6 +170,41 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     for (uint32_t i = 0; i < n; i++)
       std::memcpy(&rp.windPrims[i * kWindPrimWords], wp.Resolved()[i].w,
                   kWindPrimWords * sizeof(int32_t));
+  }
+  // THE CURRENT FIELD, the render copy (plan component 8). The SAME resolved
+  // list SubmitTick shipped to the sim this tick — CurrentPrims() is advanced
+  // there and read here, exactly as WindPrims() is, which is what makes the
+  // surface waves drift the way the arrow overlay says they should.
+  //
+  // `currentRenderOn` is NOT sim.currentMode. The render arm is always live
+  // because a renderer cannot write a voxel; the sim arm is the gated one. That
+  // asymmetry is the whole shape of M4 — see DESIGN.md §9c.
+  {
+    const CurrentPrimSystem& cp = CurrentPrims();
+    const uint32_t n = std::min(cp.Count(), kCurrentPrimCap);
+    rp.currentRenderOn = 1u;
+    rp.currentPrimCount = n;
+    const IVec3 lo = cp.BoundsLo(), hi = cp.BoundsHi();
+    rp.currentPrimLo[0] = lo.x; rp.currentPrimLo[1] = lo.y;
+    rp.currentPrimLo[2] = lo.z;
+    rp.currentPrimHi[0] = hi.x; rp.currentPrimHi[1] = hi.y;
+    rp.currentPrimHi[2] = hi.z;
+    for (uint32_t i = 0; i < n; i++)
+      std::memcpy(&rp.currentPrims[i * kCurrentPrimWords],
+                  cp.Resolved()[i].w, kCurrentPrimWords * sizeof(int32_t));
+  }
+  // Component 9's impact ring. Bounded by construction and render-only: no sim
+  // kernel reads it, it is not hashed and it is not saved.
+  {
+    const WaveImpactRing& wi = WaveImpacts();
+    const uint32_t n = std::min(wi.Count(), kWaveImpactCap);
+    rp.waveImpactCount = n;
+    for (uint32_t i = 0; i < n; i++) {
+      rp.waveImpacts[i * 4 + 0] = wi.Data()[i].x;
+      rp.waveImpacts[i * 4 + 1] = wi.Data()[i].z;
+      rp.waveImpacts[i * 4 + 2] = wi.Data()[i].t0;
+      rp.waveImpacts[i * 4 + 3] = wi.Data()[i].amp;
+    }
   }
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
@@ -327,23 +363,44 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // still tick-deterministic: the labelling is a pure function of (seed,
     // window) and only changes when one of those moves.
     bool worldEdited = false;
+    // WHERE the edit was, for component 8's drain seeder (the hole hint). The
+    // FIRST qualifying mutation wins rather than the last, which is arbitrary
+    // but has to be one of the two and has to be stated: whichever it is, it
+    // must be a pure function of the tick's op list, because a swirl seeded
+    // from a scheduling-dependent choice would be rule 1 through the back door.
+    IVec3 editCell{0, 0, 0};
     {
       const std::vector<uint32_t>& lbl = wb.ChunkBody();
-      auto touch = [&](IVec3 wc) {
+      auto touch = [&](IVec3 wc, IVec3 cell) {
         if (worldEdited || !world.ChunkInWindow(wc)) return;
-        if (lbl.size() == kNumChunks && lbl[World::SlotChunkIndex(wc)] != 0)
+        if (lbl.size() == kNumChunks && lbl[World::SlotChunkIndex(wc)] != 0) {
           worldEdited = true;
+          editCell = cell;
+        }
       };
       for (uint32_t i = 0; i < cellCount && !worldEdited; i++) {
         const uint32_t slot = cells[i].cellIdx / kChunkVol;
-        if (slot < kNumChunks && lbl.size() == kNumChunks && lbl[slot] != 0)
+        if (slot < kNumChunks && lbl.size() == kNumChunks && lbl[slot] != 0) {
           worldEdited = true;
+          // The op carries a SLOT-linear index, so the world position comes
+          // back through the window (SlotToWorldChunk) plus the in-chunk
+          // offset. A slot index is a memory address, not an identity — see
+          // the page-table rule in CLAUDE.md — and reading it as one is what
+          // would put the swirl in another chunk's lake.
+          const uint32_t loc = cells[i].cellIdx % kChunkVol;
+          const IVec3 wc = world.SlotToWorldChunk(slot);
+          editCell = {wc.x * (int)kChunk + (int)(loc % kChunk),
+                      wc.y * (int)kChunk + (int)((loc / kChunk) % kChunk),
+                      wc.z * (int)kChunk + (int)(loc / (kChunk * kChunk))};
+        }
       }
-      for (const BrushOp& o : ops) touch({o.x >> 4, o.y >> 4, o.z >> 4});
-      for (const ExplosionOp& e : exps) touch({e.x >> 4, e.y >> 4, e.z >> 4});
+      for (const BrushOp& o : ops)
+        touch({o.x >> 4, o.y >> 4, o.z >> 4}, {o.x, o.y, o.z});
+      for (const ExplosionOp& e : exps)
+        touch({e.x >> 4, e.y >> 4, e.z >> 4}, {e.x, e.y, e.z});
     }
     wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
-            wt.sim.drainMaxEighthsPerTick, worldEdited);
+            wt.sim.drainMaxEighthsPerTick, worldEdited, editCell);
     const WaterBodyGpu& g = wb.Gpu();
     waterGpu = &g;
     tp.waterBodyMode = (uint32_t)wt.sim.waterBodyMode;
@@ -388,6 +445,40 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       tp.waterBodies[i] = g.bodies[i];
     for (size_t i = 0; i < g.chunks.size() && i < kWaterChunkCap; i++)
       tp.waterChunks[i] = g.chunks[i];
+  }
+
+  // ---- THE CURRENT FIELD (plan component 8) --------------------------------
+  //
+  // Advanced HERE, after the water bodies, for two reasons that are both about
+  // one instant: the drain seeder reads the descriptors this tick's
+  // WaterBodySystem::Tick just produced, and the render copy in
+  // WriteRenderParams reads what THIS call resolved. A second call site that
+  // resolved at a different tick would ship the sim a whirlpool the renderer
+  // draws somewhere else, which reads as a shader bug.
+  //
+  // An EMPTY list writes count 0 and the empty AABB, and every consumer takes
+  // an exact-identity early-out on that — so a world with no drains and no
+  // streams is bit-identical to one built before this system existed.
+  {
+    const Tuning& ct = CurrentTuning();
+    CurrentPrimSystem& cp = CurrentPrims();
+    // Seeds first, resolve second. Both seeders only ever assert primitives
+    // whose parameters are a pure function of the tick input stream — see the
+    // authority note at the top of sim/currentprim.h.
+    cp.SeedStreams(world, seed, tick);
+    cp.SeedDrains(WaterBodies(), seed, tick);
+    cp.Tick(tick);
+    const uint32_t n = std::min(cp.Count(), kCurrentPrimCap);
+    tp.currentMode = (uint32_t)ct.sim.currentMode;
+    tp.currentPrimCount = n;
+    const IVec3 lo = cp.BoundsLo(), hi = cp.BoundsHi();
+    tp.currentPrimLo[0] = lo.x; tp.currentPrimLo[1] = lo.y;
+    tp.currentPrimLo[2] = lo.z;
+    tp.currentPrimHi[0] = hi.x; tp.currentPrimHi[1] = hi.y;
+    tp.currentPrimHi[2] = hi.z;
+    for (uint32_t i = 0; i < n; i++)
+      std::memcpy(&tp.currentPrims[i * kCurrentPrimWords],
+                  cp.Resolved()[i].w, kCurrentPrimWords * sizeof(int32_t));
   }
 
   // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except

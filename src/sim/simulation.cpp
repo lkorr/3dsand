@@ -649,10 +649,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
   rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
   rhi::ShaderModule mDebugWind = mod("debug_wind.wgsl");
+  rhi::ShaderModule mDebugCur = mod("debug_current.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
-      !mMicroBody || !mDebugLines || !mDebugWind) {
+      !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -753,6 +754,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
   debugWindModule_ = mDebugWind;
+  debugCurModule_ = mDebugCur;
   targetFormat_ = rhi::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
 }
@@ -1473,6 +1475,16 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.fragmentEntry = "fsArrow";
     d.depth = dsWind;
     debugWindDraw_ = device_.CreateRenderPipeline(d);
+
+    // The CURRENT field's arrows (water plan component 8). Same pipeline
+    // state, same depth rule, same argument for it — a different field.
+    d.label = "debugCurrentDraw";
+    d.vertexModule = debugCurModule_;
+    d.vertexEntry = "vsCurArrow";
+    d.fragmentModule = debugCurModule_;
+    d.fragmentEntry = "fsCurArrow";
+    d.depth = dsWind;
+    debugCurrentDraw_ = device_.CreateRenderPipeline(d);
   }
   {
     // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
@@ -1566,6 +1578,15 @@ void Simulation::DrawWindField(const rhi::RenderPass& pass, uint32_t arrows) {
   // 3 segments (shaft + two head barbs) x 6 vertices (two triangles per
   // segment quad). No vertex or instance buffer: the shader derives its
   // lattice point from the instance index and R.camPos.
+  pass.Draw(18, arrows);
+}
+
+void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
+                                  uint32_t arrows) {
+  if (arrows == 0) return;   // overlay off: costs nothing, not even a bind
+  pass.SetPipeline(debugCurrentDraw_);
+  pass.SetBindGroup(0, renderBG_);
+  pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(18, arrows);
 }
 

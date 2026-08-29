@@ -65,6 +65,11 @@ const char* const kOrder[] = {
     // after, and it regenerates on the way out so `determinism` (which
     // regenerates anyway) finds exactly what `terrain` left.
     "waterbody",
+    // The current field (M4). Right after `waterbody` because it is the same
+    // chain, and because pass S rebuilds the world for each of its three
+    // arms - which makes it a poor neighbour for anything that wanted the
+    // world left alone. It restores pristine worldgen on the way out.
+    "current",
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
     "evaporation", "wind",      "wind-gas",   "wind-prim",

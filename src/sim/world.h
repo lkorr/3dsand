@@ -902,6 +902,52 @@ constexpr uint32_t kWindPrimWater = 1u << 1;
 // rearranging the terrain it blows past.
 constexpr uint32_t kWindPrimEntrain = 1u << 2;
 
+// ---- CURRENT PRIMITIVE ceilings and encoding (docs/PLAN_water_master.md
+// component 8; src/sim/currentprim.h owns the system) ----
+//
+// Here rather than in currentprim.h for the wind-primitive reason: these are
+// the GPU LAYOUT, and world.h is where a layout a shader must agree with is
+// stated. Must match CURRENT_PRIM_* / CPRIM_* in assets/shaders/common.wgsl.
+//
+// 32 is the same cap wind carries, and for the same argument: every live
+// primitive is summed at every sample inside the union AABB, so this is a
+// per-sample cost as much as a memory one. A whirlpool per drain plus a stream
+// per river reach in the residency window is a handful.
+constexpr uint32_t kCurrentPrimCap = 32;
+constexpr uint32_t kCurrentPrimWords = 12;   // 3 x vec4<i32>
+// kCurrentPrimCap * kCurrentPrimWords, written as a LITERAL for exactly the
+// reason kWindPrimScalars is — check_invariants.py's `params` check parses a
+// C++ array dimension as a bare identifier bound to an integer literal, and an
+// expression makes it SKIP the whole struct comparison silently.
+constexpr uint32_t kCurrentPrimScalars = 384;
+static_assert(kCurrentPrimScalars == kCurrentPrimCap * kCurrentPrimWords,
+              "kCurrentPrimScalars must equal cap * words");
+// Largest radius / axial reach, world cells. Bounds every intermediate in the
+// integer evaluation (see the overflow argument above currentPrimEvalQ).
+constexpr int32_t kCurrentPrimMaxExtent = 512;
+// Largest core speed, world cells/s (20 m/s). A whirlpool's throat at 20 m/s is
+// already faster than anything in this engine swims; the cap is what keeps the
+// Q16.16 accumulator inside i32 across a full list.
+constexpr int32_t kCurrentPrimMaxSpeed = 200;
+
+// Primitive kinds — must match CPRIM_* in common.wgsl.
+constexpr uint32_t kCurrentPrimSink = 0;
+constexpr uint32_t kCurrentPrimSource = 1;
+constexpr uint32_t kCurrentPrimVortex = 2;
+constexpr uint32_t kCurrentPrimStream = 3;
+// THE SIM LICENCE. Set only on primitives whose parameters are a pure function
+// of the tick input stream; currentAtQ skips every primitive without it, so a
+// primitive seeded from anything the CPU learned asynchronously can reach the
+// renderer and the player and never the hashed world. See the authority note
+// over currentAtQ in common.wgsl.
+constexpr uint32_t kCurrentPrimSim = 1u << 0;
+
+// Impact-ripple ring size (component 9) — must match WAVE_IMPACT_CAP in
+// common.wgsl. Sixteen is a second and a half of splashes at a plausible rate,
+// and the ring is what makes "a ripple is the memory of an event" bounded by
+// construction instead of a growing list.
+constexpr uint32_t kWaveImpactCap = 16;
+
 // Must match TickParams in common.wgsl.
 struct TickParams {
   uint32_t tick;
@@ -1094,6 +1140,29 @@ struct TickParams {
   int32_t waterBodies[kWaterBodyScalars] = {};
   // (bodyIndex << 16) | chunkSlot, four to a std140 row.
   uint32_t waterChunks[kWaterChunkCap] = {};
+
+  // ---- THE CURRENT FIELD, the SIM's copy (plan component 8;
+  // src/sim/currentprim.h; must match TickParams in common.wgsl) ----
+  //
+  // A structural clone of the wind primitive block above — same cap, same
+  // three-row packing, same union AABB, same float/integer transcription pair.
+  // It rides the uniform for the same reasons: no new binding, no new barrier,
+  // no new dispatch, and a count of zero is an exact identity.
+  //
+  // MODE 0 IS THE SHIPPING DEFAULT AND IS BIT-IDENTICAL. currentAtQ returns
+  // zero on `currentMode == 0` before it reads anything else, so no sim kernel
+  // can see this block and the pinned world hash cannot move. The RENDER arm
+  // ships on regardless (RenderParams::currentRenderOn), because a renderer
+  // cannot write a voxel — that split is what makes M4 visible without moving
+  // the hash. See DESIGN.md §9c.
+  uint32_t currentMode = 0;
+  uint32_t currentPrimCount = 0;
+  uint32_t padCp0 = 0, padCp1 = 0;
+  int32_t currentPrimLo[3] = {1, 1, 1};   // union AABB, inclusive world cells
+  int32_t padCp2 = 0;                     // (lo > hi = no primitives)
+  int32_t currentPrimHi[3] = {0, 0, 0};
+  int32_t padCp3 = 0;
+  int32_t currentPrims[kCurrentPrimScalars] = {};
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -1344,6 +1413,32 @@ struct RenderParams {
   int32_t windPrimHi[3] = {0, 0, 0};
   int32_t pad_wpr4 = 0;
   int32_t windPrims[kWindPrimScalars] = {};
+
+  // ---- the current field, the RENDER copy (plan component 8) -------------
+  // The SAME resolved list TickParams carries, from the same
+  // CurrentPrimSystem in the same frame — the windPrims argument exactly, and
+  // it is what makes the surface waves drift with the flow, the arrow overlay
+  // agree with the player's drift, and the foam sit on real convergence lines.
+  //
+  // `currentRenderOn` is its OWN gate rather than a copy of `currentMode`,
+  // and the asymmetry is the milestone: the render arm ships ON and the sim
+  // arm ships OFF, because a render field cannot write a voxel and a sim field
+  // moves the pinned hash.
+  uint32_t currentRenderOn = 0;
+  uint32_t currentPrimCount = 0;
+  uint32_t pad_cpr0 = 0, pad_cpr1 = 0;
+  int32_t currentPrimLo[3] = {1, 1, 1};
+  int32_t pad_cpr2 = 0;
+  int32_t currentPrimHi[3] = {0, 0, 0};
+  int32_t pad_cpr3 = 0;
+  int32_t currentPrims[kCurrentPrimScalars] = {};
+  // ---- component 9: the impact-ripple ring -------------------------------
+  // (x, z) world voxels, `t0` the R.time value the impact landed at, `amp` its
+  // strength in metres of initial crest. amp <= 0 is a dead slot. Bounded by
+  // construction — see kWaveImpactCap.
+  uint32_t waveImpactCount = 0;
+  uint32_t pad_wi0 = 0, pad_wi1 = 0, pad_wi2 = 0;
+  float waveImpacts[kWaveImpactCap * 4] = {};
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

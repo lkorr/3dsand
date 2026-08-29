@@ -203,6 +203,8 @@ class Simulation {
   // point from its instance index and R.camPos, so there is no arrow buffer,
   // no per-arrow CPU work, and no new bind group.
   void DrawWindField(const rhi::RenderPass& pass, uint32_t arrows);
+  // The current field's arrows (docs/PLAN_water_master.md component 8).
+  void DrawCurrentField(const rhi::RenderPass& pass, uint32_t arrows);
   void DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances);
   // Microvoxel bodies (PLAN §C): one 36-vertex OBB per entry in `insts`, drawn
   // between DrawBodies and DrawSprites. `insts` is the compacted (slot, model)
@@ -325,9 +327,10 @@ class Simulation {
       fluidSettleBin_, fluidSettleCheck_, fluidSettleCommit_, fluidSettleKill_,
       fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_,
-      microBodyDraw_, debugBoxDraw_, debugWindDraw_, fluidDraw_;
+      microBodyDraw_, debugBoxDraw_, debugWindDraw_, debugCurrentDraw_,
+      fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
-      debugLineModule_, debugWindModule_;
+      debugLineModule_, debugWindModule_, debugCurModule_;
   rhi::TextureFormat targetFormat_ = rhi::TextureFormat::Undefined;
 
   rhi::Texture depthTex_;

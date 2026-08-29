@@ -546,6 +546,142 @@ throughput measurement**: 35,381 eighths through a real 7×7 orifice in 90 ticks
 * **Gate passes B and F are still absent**, for §7's unchanged reasons.
 
 
+
+### 1.4 M4 — LANDED 2026-08-29
+
+Components 8 (the current field, both arms) and 9 (surface waves), plus
+`--gate current`, plus a water arm on the render benchmark. New files:
+`src/sim/currentprim.{h,cpp}`, `assets/shaders/debug_current.wgsl`. Touched:
+`common.wgsl` (the field, both evaluators, `currentPrims` in BOTH `TickParams`
+and `RenderParams`, the impact ring), `raymarch.wgsl` (`waveSlope`,
+`waterDepthM`, convergence foam), `sim_fluid.wgsl` (the one sim consumer),
+`world.h`, `waterbody.{h,cpp}` (the hole hint), `player.cpp`, `simulation.*`,
+`support.cpp`, `main.cpp`, `check_invariants.py` (a `curprim` check).
+DESIGN.md §9d. Twelve knobs: eight `sim.current*`, nine `render.wave*`, three
+`render.dbgCurrent*` — see §8 below and DESIGN.md §9d.7 for why all but one of
+the current ones are CPU-side rather than `.def` rows.
+
+**Hash: UNMOVED at the shipping default, and the reachability half is proved in
+the same invocation.**
+
+```
+--gate determinism   ->  adfcbce8 over 200 ticks, matches baseline
+--gate current       ->  sim arm mode0/mode1/mode0 = e6444b9d / bb2f73ae / e6444b9d
+```
+
+That second line is the load-bearing one and it is a stronger statement than M1's
+or M3's. Those milestones could only show "the knob changes nothing", which
+`--sweep` reports as *"ALL HASHES IDENTICAL — the parameter does not reach the
+kernel at these values"* and which cannot distinguish a working off switch from a
+knob that was never wired. Pass S runs an identical 432-particle pour into an
+identical stone basin with an identical whirlpool standing in it, three times:
+
+* `arm1 == arm3` — the fixture carries nothing between arms, so this pass is
+  measuring the off switch and not pass ordering.
+* `arm2 != arm1` — **`sim.currentMode` genuinely reaches the kernel.** The off
+  switch is not vacuous, and neither is the claim that mode 0 is bit-identical.
+
+`--sweep sim.currentMode=0,1` was NOT run, and should not be: it would report
+"identical" on a harness world with no current primitives in it, which is the
+ambiguous answer pass S exists to replace.
+
+#### The profiles are asserted, not eyeballed
+
+`--gate current` pass P, pure arithmetic against `CurrentAtCpu`, no GPU:
+
+| check | measured | wanted |
+|---|---|---|
+| vortex `speed(12)/speed(24)` | **2.25** | 2.25 (`Gamma/2*pi*r` with the radial weight divided out) |
+| sink `speed(12)/speed(24)` | **4.49** | 4.49 (`1/r^2`, same division) |
+| radial share of the swirl at r=12 | **0.21** | 0.22 (`CPRIM_INFLOW`) |
+| field 8 cells outside the union AABB | **exactly 0** | exactly 0 |
+| primitives alive one tick past the decay window | **0** | 0 |
+
+The first two rows ARE the design: 1/r against 1/r^2 is why a whirlpool looks
+enormous while the suction is a small throat, and a build with the two swapped
+would still look busy in a screenshot. The last row is component 8's named
+failure — a funnel standing open in still water — asserted rather than hoped for.
+
+#### Frame cost: measured, and §9 risk 5 did not happen
+
+Plan §9 ranks `ptr<uniform, T>` on the current primitives as risk 5, a known 10x
+with a known fix. The rule was followed from the first line written (every
+accessor takes `ptr<uniform, RenderParams>` / `ptr<uniform, TickParams>` and so
+does every caller), and the measurement says so.
+
+The render benchmark gained a **water arm** — a 1080p frame that is mostly water,
+which neither existing arm is (the elevated pass looks down at forest, the
+grazing pass puts the lake a few dozen pixels wide). Both arms below are the SAME
+BINARY; the only difference is which `raymarch.wgsl` is on disk, which is a legal
+A/B because `LoadShader` reads from disk at runtime and the SPIR-V cache keys on
+content hash. One pair of runs, no matrix:
+
+| arm | before (HEAD raymarch) | after (M4 raymarch) |
+|---|---|---|
+| **render 1080p water, shadows on** | 6.30 ms | **6.24 ms** |
+| **render 1080p water, shadows off** | 6.18 ms | **6.26 ms** |
+| render 1080p ground, shadows on | 7.43 ms | 7.62 ms |
+| render 1080p ground, shadows off | 7.57 ms | 7.61 ms |
+| render 1080p elevated, shadows off | 6.29 ms | 6.30 ms |
+
+**Within noise on every arm, on a frame that is mostly water.** For scale: the
+wind field's uniform-spill mistake cost 220 ms against 23 ms. If §9 risk 5 had
+been made, this table would not be close.
+
+One number in the before run is not a measurement and is recorded so nobody
+reads it as one: `render 1080p shadows on: 508.60 ms`. That is the first timed
+pass after a shader-content change, i.e. a SPIR-V cache miss compiled inside the
+timing loop. Every other arm in the same run is clean.
+
+#### The look, and a screenshot bug found on the way
+
+Four shots, at the authored lake (420,420), surface y=209:
+
+| file | what it shows |
+|---|---|
+| `screenshot_water.bmp` | grazing, eye 2.5 vox over the surface. Fresnel reflection of the far bank, wave crests fanning with visible per-octave scale, footprint damping toward the horizon |
+| `screenshot_water_down.bmp` | 40° down over the middle. Depth absorption, caustics on the bed, and the shore fade — the surface goes glassy in the shallows and carries the swell in the deep |
+| `screenshot_water_flow.bmp` | the same camera with a whirlpool in the lake. Crest lines SPIRAL: the wave phase is evaluated at `position - current*t`, so flow reads as flow. Foam sits on the convergence line at the core |
+| `screenshot_water_current.bmp` | the same frame with the arrow overlay on. Tangential arrows, no view-axis streaking (the axial-fade and near-plane-cull lessons hold), colour ramp saturating at 4 m/s |
+
+**Both `--shot` water cameras had been rendering the inside of a rock, and had
+been for as long as the terrain overhaul has been landed.** They carried literal
+y values of 80 and 88 from when `spawnPlainY` was 44; it is 200 now and the lake
+surface is at 209, so both shots were a flat grey rectangle. Nothing catches
+that — the shot is written, the run is green, and a picture of nothing looks
+exactly as authoritative as a picture of something. Both cameras now ask
+`World::TerrainColumn(420,420).water` instead, as does the new benchmark arm.
+
+#### What M4 did NOT do
+
+* **`sim.currentMode` ships at 0.** The evidence says the sim arm works and costs
+  nothing at the default; whether to ship it ON is an owner decision and a
+  rebaseline commit, exactly as `sim.windMode` was. It is OFF.
+* **No wind-stress primitive.** §8 lists it as optional — a surface layer
+  downwind with a return flow beneath, driven by the existing `windAt`. One extra
+  kind with a depth-dependent sign, not built.
+* **No source seeder.** `CPRIM_SOURCE` exists and evaluates; nothing places one.
+  The natural author is M3's jet where it LANDS, and the landing point is a GPU
+  fact — the same authority problem the drain seeder solves by asking about the
+  dig instead, which has no equivalent here.
+* **The stream arm places nothing in the shipped world.** It is correct and it is
+  gated on the landform slope; the authored pools and `pondAt`'s tarns are
+  flat-floored basins, so no probe passes. There is no worldgen yet that makes
+  standing water on a hillside. The arm was built because §8 says it is
+  independent of everything else, and it is.
+* **The drain seeder is keyed to the DIG, not to the ledger's hole.** The CPU
+  cannot see `WBS_HOLEKEY` or `WBS_EMIT` without a readback, and a readback in
+  the input of a field a kernel reads is §1.1 correction 2 all over again. So the
+  swirl sits where the mutation was and decays `sim.currentVortexDecay` after
+  digging stops — exact for a player boring a shaft, approximate about which of
+  several holes the ledger called deepest.
+* **Waves do not refract.** Per-octave speed and shoaling amplitude fall out of
+  `tanh(kh)`; directional refraction would need position-dependent wave vectors.
+* **`CurrentAtCpu` is a third transcription of the four profiles**, named as one
+  in DESIGN.md §9d.4 and in its own header. Two would have been better; zero was
+  not available, because the player is CPU physics.
+
+
 ---
 
 ## 2. The substrate that already exists
@@ -1273,7 +1409,7 @@ LOOK CHAIN    8 (stream arm + evaluator) ──► 9 ──► 8 (drain seeders,
 | **M1 — skeleton** ✅ **LANDED 2026-08-28** | 1, **2's analytic half**, 5's structure, the gate, the off switch | Nothing behavioural. Descriptor recomputes to +0.00% on both container kinds; off switch bit-identical. See §1.1. | **Identical**, measured: `--sweep sim.waterBodyMode=0,1` → one hash |
 | **M2 — the drain works** ✅ **LANDED 2026-08-29** | 3, 4, the GPU reduce, and the quiescence fix of §1.1 correction 2 | A lake drains by arithmetic, driven by the `sim.waterBodyTestDrain` tap. Conservation exact at **+0 eighths** over 869,580 drained; the shave produces **0 excite candidates** against 10.9 M cells inspected. See §1.2. | **Identical**, measured: mode 0 / mode 1 / mode 0 all `af008434` |
 | **M3 — it is a feature** ✅ **LANDED 2026-08-29** | 6, 7 | A hole is a real orifice: Q = Cd·A·√(2gh), one evaluation of h feeding both the jet and the debit, MPM out of the throat. 35,381 eighths through a real hole at −37 residual; the shell is 14,468 cells against the ball’s ~33,000. See §1.3. | **Does NOT move** — `sim.waterBodyMode` is 0 by default and §8 requires mode 0 to be bit-identical, so no row is recorded. This row was wrong. |
-| **M4 — it looks alive** | 8 (full), 9 | Current, vortices, flowing surface, foam. | 9 must not move it; 8's sim arm will |
+| **M4 — it looks alive** ✅ **LANDED 2026-08-29** | 8 (full), 9 | Current, vortices, flowing surface, foam, an arrow overlay. Profiles asserted by ratio (vortex 1/r = 2.25, sink 1/r² = 4.49); a mostly-water 1080p frame is 6.30 → 6.24 ms. See §1.4. | **Does NOT move** — `sim.currentMode` ships at 0 and `currentAtQ` returns zero before reading anything. The RENDER arm ships on, because a renderer cannot write a voxel. |
 | **M5 — completeness** | 10, 2's sweep | Player-dug basins participate. | Moves |
 
 **M1 and M2 are the whole architectural risk and neither changes the world hash.**

@@ -171,6 +171,7 @@ void WaterBodySystem::Reset() {
   straddles_ = 0;
   outOfWindow_ = 0;
   drainHotUntil_ = 0;
+  holeHints_.clear();
   gpu_.bodies.clear();
   gpu_.chunks.clear();
   gpu_.bodyCount = 0;
@@ -535,12 +536,50 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
 
 void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
                            int mode, int testDrain, int drainMax,
-                           bool worldEdited) {
+                           bool worldEdited, IVec3 editCell) {
   mode_ = mode;
   // The hot latch (see waterbody.h). Set from the tick input stream only, so a
   // replay reproduces it and the twice-run determinism gate compares it.
   if (mode != 0 && drainMax > 0 && worldEdited)
     drainHotUntil_ = tick + kWaterDrainHotTicks;
+  // THE HOLE HINT (component 8's drain seeder). Recorded from the same tick-
+  // stream signal on the same tick, against LAST tick's labelling — which is
+  // the labelling the caller's own `worldEdited` test used, so the two cannot
+  // disagree about which body was dug into. Expired on the same window the
+  // latch runs on: a swirl must not outlive the dig by longer than the drain
+  // could have.
+  if (mode != 0) {
+    holeHints_.erase(
+        std::remove_if(holeHints_.begin(), holeHints_.end(),
+                       [&](const WaterBodyHole& h) {
+                         return tick >= h.tick + kWaterDrainHotTicks;
+                       }),
+        holeHints_.end());
+    if (worldEdited && chunkBody_.size() == kNumChunks &&
+        world.ChunkInWindow({editCell.x >> 4, editCell.y >> 4,
+                             editCell.z >> 4})) {
+      const uint32_t slot = World::SlotChunkIndex(
+          {editCell.x >> 4, editCell.y >> 4, editCell.z >> 4});
+      const uint32_t bi = slot < kNumChunks ? chunkBody_[slot] : 0u;
+      if (bi != 0 && bi - 1 < bodies_.size()) {
+        WaterBodyHole h;
+        h.valid = true;
+        h.basinId = bodies_[bi - 1].basinId;
+        h.x = editCell.x;
+        h.y = editCell.y;
+        h.z = editCell.z;
+        h.tick = tick;
+        bool found = false;
+        for (WaterBodyHole& e : holeHints_) {
+          if (e.basinId != h.basinId) continue;
+          e = h;
+          found = true;
+          break;
+        }
+        if (!found) holeHints_.push_back(h);
+      }
+    }
+  }
   if (mode == 0) {
     // THE OFF SWITCH, and it is an early-out rather than a flag consulted
     // later. Nothing is built, nothing is labelled, nothing is classified — so
@@ -599,6 +638,12 @@ uint32_t WaterBodySystem::ProposedCount() const {
   for (const auto& d : bodies_)
     if (d.state == WaterBodyState::Proposed) n++;
   return n;
+}
+
+WaterBodyHole WaterBodySystem::HoleHint(uint32_t basinId) const {
+  for (const WaterBodyHole& h : holeHints_)
+    if (h.basinId == basinId) return h;
+  return WaterBodyHole{};
 }
 
 const WaterBodyDesc* WaterBodySystem::Find(uint32_t basinId) const {

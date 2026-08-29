@@ -51,6 +51,7 @@
 #include "sim/voxload.h"
 #include "sim/wind.h"
 #include "sim/windprim.h"
+#include "sim/currentprim.h"
 #include "sim/world.h"
 #include "sim/worldedit.h"
 #include "sim/worldio.h"
@@ -466,6 +467,11 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     sim.DrawWindField(rp, CurrentTuning().wind.dbgWindField
                               ? WindDebugArrowCount(CurrentTuning())
                               : 0u);
+    // The CURRENT field's arrows, reached the same way and for the same
+    // reason (water plan component 8).
+    sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
+                                 ? CurrentDebugArrowCount()
+                                 : 0u);
     rp.End();
     ctx.queue.Submit(enc.Finish());
     ctx.WaitIdle();
@@ -525,10 +531,74 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // silhouette can't be judged from the general shots — it needs a single
   // specimen against the sky. Birch at (75,506), ground y=53, trunk 113.
   render({75 - 115, 53 + 85, 506 - 115}, 0.785f, -0.18f, "screenshot_birch.bmp");
-  render({372, 80, 372}, 0.785f, -0.30f, "screenshot_water.bmp");
-  // Standing over the middle looking down: the low-Fresnel angle, where
-  // refraction, per-channel depth absorption and the visible bed carry it.
-  render({420, 88, 452}, -1.571f, -0.75f, "screenshot_water_down.bmp");
+  // THE SURFACE HEIGHT IS ASKED FOR, NOT WRITTEN DOWN, and that is a fix
+  // rather than a tidy-up. Both of these cameras carried literal y values (80
+  // and 88) from before the terrain overhaul moved `spawnPlainY` to 200: the
+  // lake's surface is at y=209 on this tree, so both shots were rendering from
+  // ~120 voxels inside solid rock and had been a flat grey rectangle for as
+  // long as that. A screenshot nobody can tell is broken is worse than no
+  // screenshot, and the only durable fix is to derive the number from the same
+  // worldgen the water comes out of.
+  {
+    const World::Column lakeCol = World::TerrainColumn(420, 420, kDefaultSeed);
+    const float surf = (float)(lakeCol.water != INT32_MIN ? lakeCol.water
+                                                          : lakeCol.h);
+    render({386, surf + 2.5f, 386}, 0.785f, -0.04f, "screenshot_water.bmp");
+    // Standing over the middle looking down: the low-Fresnel angle, where
+    // refraction, per-channel depth absorption and the visible bed carry it.
+    render({420, surf + 24.0f, 462}, -1.571f, -0.70f,
+           "screenshot_water_down.bmp");
+
+    // ---- the current field and the waves it drives (plan components 8+9) ---
+    // The shipped world has no drain in it, so without this the two things M4
+    // built would go unreviewed in every screenshot run: a still lake looks
+    // exactly the same whether or not a current field exists. So put a
+    // whirlpool in the lake and shoot it twice — once bare, so the FLOW is
+    // judged on the water (advected wave phase, foam on the convergence line),
+    // and once with the arrow overlay on, which is the only picture that can
+    // show the field is the shape it claims to be.
+    //
+    // The primitives are spawned directly rather than seeded from a drain
+    // because --shot never ticks the sim: there is no dig, no ledger and no
+    // hole here, and a screenshot path that had to drain a lake first would be
+    // a different program.
+    {
+      const Tuning shotBase = CurrentTuning();
+      CurrentPrims().Clear();
+      CurrentPrim v;
+      v.kind = kCurrentPrimVortex;
+      v.x = 420; v.y = (int)surf; v.z = 420;
+      v.radius = 44;
+      v.reach = 30;
+      v.swirlQ = 1 << 16;
+      v.decayTicks = kCurrentPrimForever;
+      v.ownerId = 1;
+      CurrentPrimAim(v, Vec3{0.0f, -1.0f, 0.0f},
+                     CurrentGammaToCoreMs(shotBase.sim.currentVortexGamma, 44));
+      CurrentPrims().Spawn(v);
+      CurrentPrim k;
+      k.kind = kCurrentPrimSink;
+      k.x = 420; k.y = (int)surf - 8; k.z = 420;
+      k.radius = 16;
+      k.reach = 16;
+      k.decayTicks = kCurrentPrimForever;
+      k.ownerId = 2;
+      CurrentPrimAim(k, Vec3{0.0f, -1.0f, 0.0f}, shotBase.sim.currentSinkSpeed);
+      CurrentPrims().Spawn(k);
+      // Past the attack ramp, so the shot shows the field at full strength
+      // rather than at a sixth of it.
+      CurrentPrims().Tick(64);
+      render({420, surf + 24.0f, 462}, -1.571f, -0.70f,
+             "screenshot_water_flow.bmp");
+      Tuning arrowT = shotBase;
+      arrowT.render.dbgCurrentField = true;
+      SetCurrentTuning(arrowT);
+      render({420, surf + 24.0f, 462}, -1.571f, -0.70f,
+             "screenshot_water_current.bmp");
+      SetCurrentTuning(shotBase);
+      CurrentPrims().Clear();
+    }
+  }
   // ---- SUBMERGED shots: the camera is INSIDE the lake ----
   // These are the only views that exercise shadeSubmerged (god rays, silt,
   // Snell's window, and the caustic web painted on the bed), and none of the
@@ -3209,7 +3279,30 @@ int main(int argc, char** argv) {
       player.jumpScale = couple ? loco.jumpScale : 1.0f;
       player.canJump = couple ? loco.canJump : true;
     }
-    player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(), kindAt);
+    // ---- component 9: impact ripples -------------------------------------
+    // The event source, and it is a RISING EDGE rather than a per-frame test:
+    // an impact happens once. Sampled around player.Update because the entry
+    // speed is what sizes the splash and it is gone a frame later.
+    //
+    // Render-only, bounded by the ring, and it is deliberately NOT an audio
+    // cue's twin — a cue fires on the same event but through a different
+    // system, and coupling them would make one of them the other's trigger.
+    {
+      static bool wasInLiquid = false;
+      const float enterSpeed = -player.vel.y;
+      player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(),
+                    kindAt);
+      if (player.inLiquid && !wasInLiquid && enterSpeed > 2.0f) {
+        // Crest height in metres, from the entry speed, capped: a splash from
+        // a great fall is bigger, but not without limit — an unbounded
+        // amplitude here would tilt the surface normal past the shore and the
+        // whole lake would go black (the ripple steepness note in
+        // raymarch.wgsl is the same trap).
+        const float amp = std::min(0.02f + enterSpeed * 0.004f, 0.12f);
+        WaveImpacts().Add(player.pos.x, player.pos.z, (float)now, amp);
+      }
+      wasInLiquid = player.inLiquid;
+    }
     // --autofly-surface altitude pin. Held analytically against the worldgen
     // heightfield rather than flown, so the measured quantity (ray length
     // through unskipped chunks) depends only on the tick schedule — see the
@@ -4883,6 +4976,9 @@ int main(int argc, char** argv) {
       sim.DrawWindField(rp, ui.showWindField
                                 ? WindDebugArrowCount(CurrentTuning())
                                 : 0u);
+      sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
+                                   ? CurrentDebugArrowCount()
+                                   : 0u);
       overlay.Render(rp);
       rp.End();
       ctx.queue.Submit(enc.Finish());

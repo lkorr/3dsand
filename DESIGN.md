@@ -3705,7 +3705,8 @@ reserved, and `T.waterBodyCount` 0 makes component 7's loop a zero-trip.
 
 ### 5b.6 What is NOT here
 
-The current field and surface waves (M4), and dug-basin discovery (M5).
+Dug-basin discovery (M5). The current field and surface waves landed at M4 — see
+§9d.
 `sim.waterBodyTestDrain` survives from M2 as a development tap of a known size in
 eighths per tick, 0 in every shipped world — it exists so the ledger and the shave
 could be proved exact before there was a hole to be exact about, and pass A still
@@ -3719,6 +3720,285 @@ hot-window footprint declaration above.
 Two gate passes are absent and deliberately so: **B** (split scheduling) needs
 component 10's union-find sweep, and **F** (determinism mid-drain) needs a second
 in-process world to compare against. Both would be assertions against zero today.
+
+## 9d. The current field, and surface waves (added 2026-08-29)
+
+`docs/PLAN_water_master.md` components 8 and 9 (milestone M4, "it looks alive").
+Read §9b (Wind) first: this is a deliberate clone of that system and every
+structural decision here is inherited rather than re-argued.
+
+M1-M3 made a still lake a NAME and a drain a real hole (§5b). None of that is
+visible: a governed lake and an ungoverned one look identical, and so does a
+lake with a hole in it until the jet reaches the frame. M4 is the part you can
+see -- flow, whirlpools, waves that move like water -- and it is the part with
+the least architectural risk, because **the current field owns no mass**.
+
+### 9d.1 The current field is the wind field, applied to water
+
+`src/sim/currentprim.{h,cpp}`, `currentPrims` in BOTH `TickParams` and
+`RenderParams`, `currentPrimEvalF` / `currentPrimEvalQ` in `common.wgsl`.
+
+The cloning is the design, not an accident of authorship. Water flow is the same
+KIND of object as wind: a bounded list of parametric shapes summed analytically
+at a sample point, like point lights. So it gets the same cap (32), the same
+three-row `vec4<i32>` packing, the same union-AABB whole-loop reject, the same
+float/integer transcription pair sitting adjacent in one file, and the same
+`ptr<uniform, T>` rule. Inventing a second shape for it would have meant a second
+set of overflow arguments to get wrong.
+
+**Four primitives, and the set is closed because they are SUMMABLE.**
+
+| Kind | Field | What it is for |
+|---|---|---|
+| `CPRIM_SINK` | `1/r^2` radial in, clamped at a core radius | A drain's throat |
+| `CPRIM_SOURCE` | `1/r^2` radial out | A river mouth, a jet dissipating into a basin |
+| `CPRIM_VORTEX` | `Gamma/2*pi*r` tangential about an axis, plus a 22% inflow share | The whirlpool |
+| `CPRIM_STREAM` | uniform along an axis | A reach of river, from the bed gradient |
+
+**Superposition only. No neighbour coupling, no stored field, no relaxation.**
+The behaviour that motivated the field -- a river running into a pool and
+dissipating outward -- is what a point SOURCE does for free under superposition.
+Implementing it as real vector diffusion would mean stored state, a solver,
+per-tick cost, determinism exposure and a system that does not sleep.
+Superposition of sources, sinks and vortices is a real solution of Laplace's
+equation, not a hack: incompressible irrotational flow away from boundaries is
+approximately what pond water does.
+
+**The sink/vortex asymmetry is the whole look.** The sink is `1/r^2` and is only
+a couple of voxels wide at any realistic discharge; the vortex is `Gamma/2*pi*r`
+and reaches far. That is why real whirlpools look enormous while the actual
+suction is a small throat: the visible danger is the tangential term, the
+lethality is the sink. `--gate current` pass P asserts both profiles by ratio
+rather than by eye, because a field with the two swapped would still look busy in
+a screenshot and would be wrong in the one way that matters.
+
+**There is one square root, and the wind block has none.** `windPrimEvalQ` gets
+away without one because every wind profile is quadratic in the distance
+(`1 - r^2/R^2`), which `r^2` already gives. `Gamma/2*pi*r` and `1/r^2` are both
+about the true radius, and faking them with `r^2` would give a whirlpool the
+SINK's falloff -- i.e. delete the "reaches far" property the vortex exists for.
+So `curISqrt` is paid once per primitive per sample, and sink, source and vortex
+all consume the same radius.
+
+### 9d.2 The authority line, which wind did not need
+
+A wind primitive is authored by an op, so its parameters are trivially a pure
+function of the tick input stream. A water current wants to be seeded from things
+the CPU can only learn ASYNCHRONOUSLY -- most obviously whether the GPU ledger's
+`WBS_EMIT` is non-zero this tick, which arrives (if at all) through a readback
+scheduled by fence retirement. That is exactly the hazard §5b.4 and
+`PLAN_water_master.md` §1.1 correction 2 name: "seeded when the CPU got around to
+noticing" is a scheduling-dependent outcome, and it becomes a rule-1 violation the
+moment a kernel reads it.
+
+So every primitive carries `kCurrentPrimSim`, and it is set ONLY when the
+primitive's parameters are a pure function of (seed, window, tuning, tick).
+`currentAtQ` skips primitives without the licence; `currentAt` sums all of them.
+A render field cannot write a voxel, so the split costs nothing.
+
+**The drain seeder is where this bites, and the answer is that the CPU asks a
+different question.** It cannot see the hole the ledger picked. What it CAN see,
+on the tick stream, is the MUTATION that made the hole -- holes appear when
+someone digs or explodes, and every one of those arrives through the mutation
+queue. `WaterBodySystem::HoleHint` records that cell against the body whose chunk
+it landed in, and the sink and the vortex sit there. Exact in the case that
+matters (a player boring a shaft), approximate in the case that does not (which
+of several digs the ledger called deepest), and free.
+
+**Gamma and chirality come from `hash3` of the hole position.** This is
+physically legitimate rather than a fudge: a real bathtub vortex is not created by
+the drain, it is residual ambient circulation being concentrated as fluid moves
+inward. `Gamma` is conserved, so `v_theta = Gamma/2*pi*r` blows up as `r` shrinks
+-- the swirl is an INITIAL CONDITION. Drawing it from the position means not every
+drain in the world spins the same way, which is the giveaway a single constant
+would produce.
+
+**Gamma decays when flow stops** (`sim.currentVortexDecay`, 3 s). A primitive
+carries `spawnTick` for its attack ramp and `seenTick` for its release ramp, so a
+seeder can re-assert a live whirlpool every tick without restarting its attack,
+and the tick the digging stops the swirl starts winding down. Without this a
+funnel stands open in still water, which is instantly and obviously wrong; the
+gate asserts the envelope reaches exactly zero and that the primitive is then
+dropped.
+
+### 9d.3 The stream arm, and the slope trap it walks past
+
+`CurrentPrimSystem::SeedStreams`. Manning/Chezy: `v = C * sqrt(slope * depth)`,
+direction from the bed gradient. Genuinely independent of components 1-7 -- no
+descriptor needed, and it would work in a world where the ledger did not exist.
+
+`World::Column::slope` IS `Land.slope`, which `worldgen.wgsl:550` states is `g2`:
+accumulated through the HILL octave and deliberately not through detail and
+grain, because `d(slope)/dcolumn` through the grain octave is 96 Q8 -- the whole
+of a gate's range in ONE column. A current built on the fine gradient is
+per-voxel noise. So the MAGNITUDE reads that field directly.
+
+The DIRECTION needs a signed gradient, which `slope` (an absolute sum) does not
+carry and which is not exposed -- the signed `g2` pair lives inside the block
+`check_invariants.py` token-compares against the shader, and widening it would be
+a change to the mirror rather than to this system. So the direction is a central
+difference of the ground height over a +-32 voxel baseline, which is the same
+low-pass by another route: over that span the grain octave (cell 8 voxels,
+amplitude 4) can contribute at most 0.06 voxel/voxel, where a +-1 difference --
+the actual trap -- would give it 2.0.
+
+The probe is scheduled by the WINDOW, not by the tick: the answer is a pure
+function of (seed, window, tuning) and cannot change between window moves, so
+re-probing every tick would be ~1,600 terrain hashes for a result already on the
+list.
+
+### 9d.4 The consumers, and the third transcription
+
+* **Render surface advection** -- component 9 evaluates wave phase at
+  `position - current*t`. This is what makes flow read as flow.
+* **Foam on convergence lines** -- `currentConvergeAt`, a central difference of
+  the field. Four evaluations of a function that early-outs to one compare
+  outside the AABB, so a still lake pays nothing. Deliberately NOT a symbolic
+  divergence: that would be a THIRD transcription of every profile with nothing
+  checking it.
+* **MPM particle drag** (`sim_fluid.wgsl`, `FLUID_CURRENT_DRAG`) -- the ONLY sim
+  consumer, and the only current knob a shader reads. Gated on
+  `T.currentMode` rather than on a zero field, for the same reason the wind block
+  beside it is: a drag term with a zero field still pulls every node toward a
+  standstill, which is not "no current" but "infinite still water", and it would
+  move the pinned hash through the settle seam. Unlike wind there is no exposure
+  test -- air touches the skin of a body of water, a current runs through it.
+* **The player** (`player.cpp`, in the `inLiquid` block) -- a drag toward the
+  local flow scaled by SUBMERSION, which that file already computes as a
+  fraction. Vertical included, deliberately: the downward limb of a drain's
+  vortex is the dangerous part.
+
+That last one needs `CurrentAtCpu`, and **it is a third transcription of the four
+profiles, named as one.** `common.wgsl` carries the float evaluator (the
+renderer) and the integer evaluator (the sim), adjacent, with a standing
+obligation between them. The CPU copy exists because the player is CPU physics
+and the alternatives were to push the player from a field the renderer draws
+differently, or not to push the player at all -- and "the current does not move
+you" is the difference between a whirlpool and a painting of one. It is bounded
+as a copy in the way that matters: it reads the RESOLVED rows, so the envelope,
+the cap, the AABB and the packing are shared code and only the four formulae are
+transcribed.
+
+### 9d.5 Surface waves are render-only, and the boundary is absolute
+
+`waveSlope` in `raymarch.wgsl`. A Gerstner sum evaluated where a ray HITS the
+water surface -- never per sample through the volume. That is the one expensive
+mistake the plan names: the perf audit identified the raymarch media march as
+what collapsed the frame rate during fires, and this field's cost is O(water
+pixels), not O(volume).
+
+**A render wave can never push anything.** The body's LEVEL is sim (the ledger
+owns it) and its DISPLACEMENT is render, and the CA never sees the displacement.
+The moment a wave height is fed back so a boat bobs, a render field has become
+authoritative for sim (design guideline #3). `waveSlope` returns a SLOPE for a
+normal rather than a height anyone could sample, which is what keeps that honest.
+
+**Per-octave speed from the local depth is the highest-leverage constant choice
+in the whole render tier, and it costs nothing but the choice.**
+
+```
+w^2 = g*k*tanh(k*h)      k = 2*pi/lambda, h = local depth
+  deep    (h >> lambda):  tanh -> 1     => c = sqrt(g*lambda/2*pi)
+  shallow (h << lambda):  tanh(kh)~kh   => c = sqrt(g*h), lambda cancels
+```
+
+If every octave scrolls at one speed the surface reads as a moving texture. At
+`pondDepth` 26 (2.6 m) the spread across the bands worth rendering is 4x -- 0.88
+m/s at 0.5 m against 3.48 m/s at 8 m. And because `h` is the LOCAL depth the same
+`tanh` pays a second time: approaching a bank at 0.3 m the long swell slows to
+1.70 m/s while the short chop barely changes, which is shoaling. Green's-law
+amplitude gain rides the same term. `render.waveDispersion` mixes between the two
+regimes, and at 0 it reproduces the per-band speeds this shader shipped with
+exactly -- so the claim is an A/B rather than an assertion.
+
+**What this is NOT.** A sum of fixed-direction waves does not REFRACT: the crests
+do not physically turn to run parallel to the shore, they only slow and steepen
+there. Directional refraction would need the wave vectors to be functions of
+position, which is a different field.
+
+Depth is measured, not assumed: `waterDepthM` is a geometric probe, 8 taps at
+increasing stride reaching 26 voxels with 1-voxel resolution near the surface.
+The descriptor could supply it for a governed body, but the renderer has to be
+right on the 95% of water that is not governed -- a puddle, a flooded cellar, the
+CA's own transient.
+
+Amplitude fades to zero below `render.waveShoreDepth`: a sum of sinusoids cannot
+reflect off a bank and shallow water damps chop anyway, so the cheap fix is also
+the physically right one. Without it the waves march straight through a
+shoreline.
+
+**Impact ripples are the one part that reads state**, because a ripple is the
+memory of an event. A BOUNDED ring of 16 recent impacts (`WaveImpactRing`), each
+drawn as an analytic expanding ring with amplitude decay and a `1/sqrt(r)` spread
+-- a pure function of `(eventList, t)`, the `windAt()` idiom. The upgrade path (a
+per-body 2D wave-equation texture) is stored state plus a solver; the plan says
+DO NOT START THERE, and this does not. The event source is the rising edge of the
+player entering liquid, sized by entry speed.
+
+### 9d.6 The off switch, and why the look ships with the hash pinned
+
+`sim.currentMode` is **0** by default and `currentAtQ` returns the zero vector
+before reading anything else, so no sim kernel can see the field.
+`RenderParams::currentRenderOn` is its own word rather than a copy of that mode,
+and it ships **on** -- because a renderer cannot write a voxel. That asymmetry is
+the whole shape of M4: the look is visible and the pinned world hash cannot move.
+
+`--gate current` proves both halves in one invocation, in THREE arms
+(mode 0 / mode 1 / mode 0) over an identical fluid pour with an identical
+whirlpool standing in it. Two arms cannot tell "mode 1 changed the world" from
+"arm 1 inherited something arm 2 did not". Unlike `--gate waterbody` pass D, arm
+2 is REQUIRED TO DIFFER: pass D proves an off switch, this proves an off switch
+AND that the knob reaches the kernel, which is the half `--sweep` cannot
+establish in a world with no primitives in it.
+
+### 9d.7 Knobs
+
+Every current knob except one is CPU-side, and that is what this system's shape
+makes correct rather than an exception: the shader reads resolved PRIMITIVES, so
+a `TUNE_CURRENT_*` constant would be a second, never-read copy of a number.
+`sim.currentDrag` is the exception, because `sim_fluid.wgsl` const-evals it.
+
+`sim.currentMode`, `sim.currentVortexGamma` (m^2/s), `sim.currentVortexDecay`
+(s), `sim.currentVortexRadius` (cells), `sim.currentSinkSpeed` (m/s),
+`sim.currentStreamScale`, `sim.currentStreamMinSlope` (Q8), `sim.currentDrag`
+(/s).
+
+The wave knobs are RENDER-side and are `.def` rows, because `raymarch.wgsl`
+evaluates the Gerstner sum itself: `render.waveDispersion`, `waveSteepness`,
+`waveShoreDepth`, `waveFlowScale`, `waveFoamThreshold`, `waveFoamGain`,
+`waveImpactSpeed`, `waveImpactDecay`, `waveImpactLen`, plus the arrow overlay's
+`dbgCurrentField` / `dbgCurrentSpacing` / `dbgCurrentRadius`.
+
+### 9d.8 The arrow overlay
+
+`assets/shaders/debug_current.wgsl`, a clone of `debug_wind.wgsl`. It has to be a
+clone: the arrow geometry, the axial fade and the near-plane cull are three bugs
+already paid for once (see the notes in that file), and re-deriving them for a
+second field would pay for them again. What differs is one line -- it samples
+`currentAt`, the SAME function the waves advect with and the foam reads its
+convergence from -- and the ramp's full-scale speed, 4 m/s rather than wind's
+24 m/s, because at a wind scale every current in the world is one shade of blue.
+
+It is only EVIDENCE because it is the identical function. A visualiser with its
+own copy of the field would be a picture of a different current, agreeing with the
+world only until someone edited one of the two, and it would be exactly as
+convincing while wrong.
+
+### 9d.9 What is NOT here
+
+* **No wind-stress term.** Plan component 8 lists it as optional (a surface layer
+  downwind with a return flow beneath, driven by the existing `windAt`). It is one
+  extra primitive kind with a depth-dependent sign and it is not built.
+* **No source seeder.** `CPRIM_SOURCE` exists and evaluates; nothing places one
+  yet. The natural author is M3's jet where it lands, which needs the impact
+  point, which is a GPU fact.
+* **No refraction**, per §9d.5.
+* **The stream arm places nothing in the shipped world**, because the authored
+  pools and `pondAt`'s tarns are flat-floored basins and the slope gate refuses
+  them. The arm is correct and will fire on standing water over a real hillside;
+  there is not yet any worldgen that makes such water.
+* **`sim.currentMode` ships at 0.** Flipping it is an owner decision and a
+  rebaseline commit, exactly as `sim.windMode` was.
 
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)
 
