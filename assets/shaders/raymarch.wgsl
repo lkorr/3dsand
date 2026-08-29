@@ -35,6 +35,11 @@
 @group(0) @binding(10) var<storage, read> fluidBlockMapR : array<u32>;
 @group(0) @binding(11) var<storage, read> fluidGridR : array<i32>;
 @group(0) @binding(12) var<storage, read> dirtyViz : array<u32>;
+@group(0) @binding(13) var<storage, read> actVoxViz : array<u32>;
+
+fn isVoxActive(idx : u32) -> bool {
+  return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
+}
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -661,6 +666,12 @@ const MEDIA_ABSORB : f32 = TUNE_MEDIA_ABSORB;
 // Optical depth past which the background is invisible (exp(-6) ~ 0.25%):
 // stop marching instead of walking the rest of a smoke plume voxel-by-voxel.
 const MEDIA_TAU_MAX : f32 = TUNE_MEDIA_TAU_MAX;
+// Optical depth at which a gas is HALF opaque: ln(2). Not a taste value — it is
+// the definition of the median depth of a volume, which is the depth a volume
+// gets to report to the raster passes (see Hit.gasHalfT and the MEDIA DEPTH
+// block in fs()). At fire's authored opacity 150/255 this is ~1.8 voxels of
+// flame; at smoke's 70/255, ~4.
+const MEDIA_HALF_TAU : f32 = 0.6931472;
 
 struct Hit {
   hit      : bool,
@@ -680,6 +691,13 @@ struct Hit {
   mediaSurf: f32,     // fullness (0..1) of the first media cell — surface term
   fireGlow : f32,     // flicker- and transmittance-weighted emissive path
   fireMat  : u32,     // first emissive media material (palette for the ramp)
+  // Where the GAS in front of the ray becomes half-opaque, or 0 if it never
+  // does. This is the volume's best single depth: raster geometry beyond it is
+  // more hidden by the plume than visible through it, and geometry in front of
+  // it is untouched. See the MEDIA DEPTH block in fs() for why a volume needs a
+  // depth at all. Liquids are excluded — they have a real interface (liqT) and
+  // already report it.
+  gasHalfT : f32,
 
   // ---- water surface (see shadeWater) ----
   // A translucent liquid is BOTH a surface and a volume. The media fields above
@@ -1225,6 +1243,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.mediaSurf = 0.0;
   out.fireGlow = 0.0;
   out.fireMat = 0u;
+  out.gasHalfT = 0.0;
   out.liqT = 0.0;
   out.liqCell = vec3<i32>(0);
   out.liqAxis = 1;
@@ -1612,11 +1631,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
           if ((R.flags & 2u) != 0u) {
-            let gs = chunkSlotIndex(worldChunkOf(cell));
-            let snapTick = dirtyViz[gs];
-            if (snapTick != 0u) {
-              let st = voxStamp(w);
-              if (st == stampFor(snapTick, 0u) || st == stampFor(snapTick, 1u)) {
+            let gs = vec3<u32>(cell & vec3<i32>(WORLD_MASK));
+            let ge = pageTable[chunkIndexOf(gs)];
+            if ((ge & PT_SENTINEL_BIT) == 0u) {
+              let glo = gs % CHUNK;
+              let gi = ge * CHUNK_VOL + (glo.z * CHUNK + glo.y) * CHUNK + glo.x;
+              if (isVoxActive(gi)) {
                 cellTint = vec3f(1.0, 0.05, 0.05);
                 cellOp = 1.0;
               }
@@ -1807,7 +1827,14 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       let dTau = seg * cellOp;
       out.mediaTau += dTau;
       out.mediaTint += cellTint * dTau;
-      if (cellLiq == 0.0) { gasTau += dTau; }
+      if (cellLiq == 0.0) {
+        gasTau += dTau;
+        // First crossing of half opacity: latched once, never revised.
+        if (out.gasHalfT == 0.0 &&
+            gasTau * VOXEL_METERS * MEDIA_ABSORB > MEDIA_HALF_TAU) {
+          out.gasHalfT = tCur;
+        }
+      }
     }
     // Media early-out: fs() will mix the background in at exp(-tau); once
     // that is ~0 the rest of the march (often hundreds of per-voxel steps
@@ -5944,13 +5971,28 @@ fn fs(in : VSOut) -> FSOut {
   // to pick a side: putting it at the interface is right, because that is
   // where the pixel's reflection and specular come from.
   //
-  // KNOWN LIMIT — thin gas. Fire and smoke that never reach the saturation
-  // early-out still write far-plane depth, so debris inside a WISPY plume is
-  // not occluded by it. That is deliberate: a thin plume is genuinely
-  // see-through, and writing depth at its first cell would hard-CLIP any body
-  // standing in smoke instead of letting it show through — a worse artifact
-  // than the one it fixes. Dense plumes already resolve via `saturated`.
-  // Doing better needs order-independent transparency, not a depth tweak.
+  // ---- GAS: THE MEDIAN DEPTH, NOT THE FIRST CELL ----
+  // Gas used to report depth ONLY when the march saturated (optical depth 6,
+  // i.e. 99.75% opaque). Everything short of that wrote the depth of the SOLID
+  // BEHIND the plume, so a mob, a debris chunk or a dropped item drew straight
+  // over any flame in front of it: burning bodies had their own fire painted
+  // behind them, and fire NEVER composited in front of a rigidbody at any
+  // distance, which reads as the flames being stuck to the far side of the
+  // world. That is the failure this replaces.
+  //
+  // The old note here rejected "write depth at the plume's first cell" — and it
+  // was right to: at the first cell a single wisp of smoke hard-CLIPS a body
+  // standing behind it, which is worse than the bug. But first-cell and
+  // saturation are not the only choices. `gasHalfT` is where the gas crossed
+  // HALF opacity, which is the honest single depth for a volume:
+  //   - a wisp never reaches it, so gasHalfT stays 0 and nothing changes;
+  //   - real flame reaches it in ~2 cells, and geometry BEHIND that point is
+  //     more hidden than shown, so the plume covering it is the better answer;
+  //   - geometry IN FRONT of it still wins the reversed-Z test and draws over
+  //     the fire, which is the half this must not break.
+  // Depth is one value per pixel, so a volume has to pick a side; the median is
+  // the side that is wrong least often. Ordering geometry INSIDE a plume still
+  // needs order-independent transparency.
   var tDepth = -1.0;
   if (h.hit || h.saturated) {
     tDepth = h.t;
@@ -5969,6 +6011,12 @@ fn fs(in : VSOut) -> FSOut {
   // draws over it — which is exactly what a splash should do.
   if (mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
     tDepth = mf.t;
+  }
+  // Half-opaque gas: same nearest-wins rule as the two interfaces above, and
+  // the same "> 0.05" skip for a camera already inside the plume — there is no
+  // covering volume in front of you when you are standing in it.
+  if (h.gasHalfT > 0.05 && (tDepth < 0.0 || h.gasHalfT < tDepth)) {
+    tDepth = h.gasHalfT;
   }
   var depth = 0.0;  // sky = far
   if (tDepth >= 0.0) {
@@ -6281,13 +6329,14 @@ fn fs(in : VSOut) -> FSOut {
     // color, which is exactly the haze that hides the bottom.
     if (h.liqT <= 0.0) { color = applyAerial(color, rd, h.t); }
 
-    // ---- dirty-voxel debug highlight (dev panel toggle) ----
+    // ---- active-voxel debug highlight (dev panel toggle) ----
     if ((R.flags & 2u) != 0u) {
-      let chSlot = chunkSlotIndex(worldChunkOf(h.cell));
-      let snapTick = dirtyViz[chSlot];
-      if (snapTick != 0u) {
-        let stamp = voxStamp(h.word);
-        if (stamp == stampFor(snapTick, 0u) || stamp == stampFor(snapTick, 1u)) {
+      let avs = vec3<u32>(h.cell & vec3<i32>(WORLD_MASK));
+      let ave = pageTable[chunkIndexOf(avs)];
+      if ((ave & PT_SENTINEL_BIT) == 0u) {
+        let avlo = avs % CHUNK;
+        let avi = ave * CHUNK_VOL + (avlo.z * CHUNK + avlo.y) * CHUNK + avlo.x;
+        if (isVoxActive(avi)) {
           let ed = min(uv, 1.0 - uv);
           let me = min(ed.x, ed.y);
           if (me < 0.08) {

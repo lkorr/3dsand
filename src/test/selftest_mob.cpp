@@ -2006,6 +2006,114 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     debris.Reset();
   }
 
+  // ---- H. FIRE EATS BEFORE IT TAKES, AND WHAT IT LEAVES IS CHAR -----------
+  // Subtest F asserts the burn FRONT reaches zero, and that is a different
+  // claim: the front is a list of cells in the burn INDEX, and every carve
+  // throws the index away. Both of the bugs pinned here made F pass.
+  //
+  //   1. The front hit zero because the index had been dropped, not because
+  //      anything stopped burning. The cheap gate at the top of BurnOneLimb
+  //      ("nothing hot nearby and an empty front") then refused to rebuild it,
+  //      so the body's cloth_burning / flesh_burning voxels never rolled their
+  //      decay again: a character left permanently sheathed in flame that had
+  //      nothing left to burn. Only a MATERIAL census sees this, which is why
+  //      that is what is asserted, and why it is taken over the DEBRIS too --
+  //      a corpse is bodies, not limbs, and a mob-only census goes quiet the
+  //      moment the mob does.
+  //
+  //   2. Carve damage was charged CUMULATIVELY (Mob::CarveLimb): `at0 -
+  //      nowCount` is everything the limb has EVER lost, so N carves cost
+  //      N(N+1)/2. Burning flushes every max(12, n>>6) voxels removed, so a
+  //      burning limb carves dozens of times and reached hp 0 having lost about
+  //      14% of its volume. Every fire dismembered.
+  //
+  // The second claim is stated as an INVARIANT rather than as "the creature
+  // survives", because a wizard whose whole robe burns is authored to die (see
+  // the clothing-layer note in reactions.json) and a fixture tuned to keep it
+  // alive would be testing the fixture. What must never happen is a limb
+  // leaving while it is still mostly there: the geometric floor is
+  // kLimbCollapseFraction (25% left) and the hp floor at
+  // kCarveDamagePerVolume 1.5 is 33% left, so 50% is a bound both routes clear
+  // comfortably and the cumulative bug (86% left) misses by a mile.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int h = World::TerrainHeight(230, 230, kDefaultSeed);
+    pchunk = IVec3{230 / 16, h / 16, 230 / 16};
+    const uint64_t id = mobs.Spawn(wizDef, {230, h + 1, 230});
+    if (!id) {
+      detail = "spawn refused";
+      return Status::Fail;
+    }
+    for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto the ground
+
+    // NO WORLD FIRE. The soak box the other subtests use keeps relighting the
+    // body, and a non-empty `scanHot` means the cheap gate never runs at all --
+    // the index is rebuilt every tick and the frozen-material case cannot
+    // occur. Igniting a patch and then leaving the creature alone is the whole
+    // point: this is the "you walked out of the fire" case.
+    int armLimb = -1;
+    for (int li = 0; li < nLimbs; li++)
+      if (mobs.Defs()[wizDef].limbs[li].name == "armU.L") armLimb = li;
+    const uint32_t lit =
+        armLimb >= 0 ? mobs.IgniteLimb(id, armLimb, 60u, mCloth) : 0u;
+
+    auto alightOnMob = [&]() {
+      return mobs.IsAlive(id) ? census(id, mClothBurn) + census(id, mBurning)
+                              : 0u;
+    };
+    auto alightInWorld = [&]() {
+      return alightOnMob() + debris.TotalBodyMaterial(mClothBurn) +
+             debris.TotalBodyMaterial(mBurning);
+    };
+
+    // THE INVARIANT IS MEASURED WHERE IT HAPPENS. Inferring "a limb came off
+    // while it was still mostly there" from outside cannot be made to work:
+    // Die() detaches every limb at once, DetachLimb cascades to a limb's
+    // children (so a healthy forearm "comes off" whenever its upper arm does),
+    // and a limb can lose half of itself to a connectivity split inside the
+    // same tick it is cut. Three attempts at an external metric each measured
+    // one of those instead of the claim. MobSystem records it at the cut.
+    mobs.ClearSeverStats();
+    uint32_t peakAlight = 0;
+    int deathTick = -1;
+    for (int i = 0; i < 630; i++) {
+      burnTick(id, 0, 0);
+      peakAlight = std::max(peakAlight, alightInWorld());
+      if (deathTick < 0 && !mobs.IsAlive(id)) deathTick = i;
+    }
+    const bool died = deathTick >= 0;
+    const float worstSever = mobs.WorstSeverFraction();
+    const std::string worstName = mobs.WorstSeverLimb();
+
+    const uint32_t stillAlight = alightInWorld();
+    const uint32_t charred =
+        (mobs.IsAlive(id) ? census(id, mClothChar) + census(id, mCharred) : 0u) +
+        debris.TotalBodyMaterial(mClothChar) + debris.TotalBodyMaterial(mCharred);
+
+    const bool wasLit = lit > 0 && peakAlight > 0;
+    const bool out = stillAlight == 0;      // claim 1: nothing still burning
+    const bool charOk = charred > 0;        // it charred rather than vanishing
+    const bool ate = worstSever <= 0.5f;    // claim 2: fire eats before it takes
+    const bool hOk = wasLit && out && charOk && ate;
+    std::printf(
+        "  burn leaves char: %s (%u lit, peak %u alight -> %u after 630 quiet "
+        "ticks, %u charred; worst sever %s at %.0f%% of spawn volume, floor "
+        "50%%; %s)\n",
+        hOk ? "PASS" : "FAIL", lit, peakAlight, stillAlight, charred,
+        worstSever < 0.0f ? "(nothing severed)" : worstName.c_str(),
+        worstSever < 0.0f ? 0.0f : worstSever * 100.0f,
+        died ? ("creature died at t+" + std::to_string(deathTick)).c_str()
+             : "creature survived");
+    std::fflush(stdout);
+    ok = ok && hOk;
+    mobs.Reset();
+    debris.Reset();
+  }
+
+
   // ---- G. a SEVERED burning limb keeps burning, and so does a corpse -------
   // DebrisSystem::BurnBodies refused micro bodies outright until this package,
   // for two reasons that had both expired: the copy-on-write brick pool shipped
@@ -2152,26 +2260,36 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       avatar.PostStep();
     };
 
-    uint32_t idleFront = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
-    float clothLost = 0;
+    // WHAT "BURNS" MEANS DEPENDS ON WHAT THE AVATAR IS MADE OF, and this
+    // subtest must not assume the player is dressed. `human`, the stock base
+    // body, is ONE material (flesh) everywhere with its colours in an art layer
+    // — a cloth census on it is legitimately 0, and asserting cloth here would
+    // fail a perfectly correct rig for the crime of wearing nothing. The claim
+    // this subtest owns is narrower than it looks: that the avatar's OWN BODY
+    // is wired into the same burn pass mobs use. So it measures the body mass
+    // the rig actually has, cloth plus flesh. The cloth-goes-FIRST ordering is
+    // a separate claim and is asserted on the wizard above, which wears a robe.
+    uint32_t idleFront = 0, body0 = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
+    float bodyLost = 0;
     if (spawned) {
       for (int i = 0; i < 10; i++) avTick(0);
       idleFront = avBurning();            // an idle player must cost nothing
       cloth0 = avCensus(mCloth);
-      uint32_t lastCloth = cloth0;
+      body0 = cloth0 + avCensus(mSkin);
+      uint32_t lastBody = body0;
       for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
         avTick(mFire);
-        const uint32_t cl = avCensus(mCloth);
-        if (cl) lastCloth = cl;
+        const uint32_t bd = avCensus(mCloth) + avCensus(mSkin);
+        if (bd) lastBody = bd;
         peakAlight = std::max(peakAlight,
                               avCensus(mClothBurn) + avCensus(mBurning));
         peakChar = std::max(peakChar, avCensus(mClothChar) + avCensus(mCooked) +
                                           avCensus(mCharred));
       }
-      clothLost = cloth0 ? (float)(cloth0 - lastCloth) / (float)cloth0 : 0.0f;
+      bodyLost = body0 ? (float)(body0 - lastBody) / (float)body0 : 0.0f;
     }
-    const bool hOk = spawned && idleFront == 0 && cloth0 > 0 &&
-                     clothLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
+    const bool hOk = spawned && idleFront == 0 && body0 > 0 &&
+                     bodyLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
                      avFireOps > 0;
     uint32_t indexed = 0;
     for (int i = 0; i < nParts; i++) indexed += avatar.PartBurnIndexCells(i);
@@ -2179,11 +2297,11 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // pass never even saw anything reactive next to the player (a CPU-mirror
     // problem), non-zero with nothing alight means it saw and did not react (a
     // rules problem). They have completely different causes.
-    std::printf("  player burns: %s (idle front %u, cloth %u -> %.0f%% gone, "
-                "peak %u alight / %u charred, %u fire ops; %d parts, %u bodies,"
-                " %u indexed cells)\n",
-                hOk ? "PASS" : "FAIL", idleFront, cloth0, clothLost * 100.0f,
-                peakAlight, peakChar, avFireOps, nParts,
+    std::printf("  player burns: %s (idle front %u, body %u of which cloth %u "
+                "-> %.0f%% gone, peak %u alight / %u charred, %u fire ops; "
+                "%d parts, %u bodies, %u indexed cells)\n",
+                hOk ? "PASS" : "FAIL", idleFront, body0, cloth0,
+                bodyLost * 100.0f, peakAlight, peakChar, avFireOps, nParts,
                 avatar.LimbBodyCount(), indexed);
                 std::fflush(stdout);
     ok = ok && hOk;

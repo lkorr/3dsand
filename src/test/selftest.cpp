@@ -78,7 +78,7 @@ const char* const kOrder[] = {
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
-    "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
+    "screenshots", "fire-depth", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
     "prefab",      "settle-back",    "player-body", "ragdoll-joints",

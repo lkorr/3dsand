@@ -61,6 +61,34 @@ let libErr = '';
 let libOpen = true;           // the section is expanded
 let libFilter = '';           // name/tag search box
 
+// --- the OTHER CREATURES shelf -------------------------------------------
+//
+// The saved library answers "wear the arm I put aside earlier". This answers
+// the question you actually have while drawing the fifth character: "what does
+// THAT one's arm look like on this one?" — and it needs no curation step at
+// all, because every mob file on disk is already a bag of the same named
+// .vox models plus the same limbs[] sidecar a library part is (see limblib.js;
+// a saved part is literally a mob file one rung down the hierarchy).
+//
+// So this is the same shelf over a different index: `crParts` is a flat list of
+// every limb of every OTHER creature, and swapping one in runs the identical
+// limblib code path — partFromPrefab on the foreign document, then the same
+// graft. The only thing this file adds is the catalogue and the tag filter.
+//
+// `null` = not scanned yet, `[]` = scanned and nothing found. Entries are
+// {path, from, root, tag, limbs:[{name,tag}], dim} — one per candidate ROOT
+// limb, i.e. one per thing you could swap in.
+let crParts = null;
+let crErr = '';
+let crFilter = '';
+let crSameTagOnly = true;     // "only limbs of this type", the default question
+// 'saved' = assets/limbs/, 'creatures' = every other mob file.
+let libSource = 'saved';
+// path -> {prefab, palette} for creature .vox files already read. A mob .vox is
+// tens of KB and the point of the shelf is trying several in a row, so the
+// second look at a creature must not re-parse it.
+const crVoxCache = new Map();
+
 // --- held-item preview ----------------------------------------------------
 //
 // WHY THE ITEM IS LOADED HERE AT ALL. The rig says only WHERE the fist closes;
@@ -364,8 +392,30 @@ async function loadLimbFromLibrary(name, replace) {
     } catch { /* a bare .vox is legal — it arrives unrigged */ }
     part = LIB.readPart(vox, meta);
   } catch (e) { return toast('limb load failed: ' + (e.message || e), true); }
-  if (!part.prefab.models.length) return toast(name + ' has no models', true);
+  wearPart(part, name, replace);
+}
 
+/**
+ * Graft an already-parsed part onto the creature. Shared by both shelves: a
+ * library part and a limb lifted straight out of another mob file are the same
+ * object by the time they get here (see readPart / partFromCreature), and the
+ * skeleton surgery below is the part that must not be written twice.
+ *
+ * `part` is {prefab, palette, root, limbs}; `label` is what to call it in the
+ * toast; `replace` is a limb name to swap out (its subtree goes with it), or
+ * null to ADD the part under the selected limb.
+ */
+function wearPart(part, label, replace) {
+  if (!part.prefab.models.length) return toast(label + ' has no models', true);
+  // ONE undo step for the whole swap. The graft is structural and the skeleton
+  // surgery around it is a sidecar edit; recorded separately, Ctrl+Z would put
+  // the old models back under a sidecar that has already forgotten them.
+  ed.beginStructural();
+  try { wearPartInner(part, label, replace); }
+  finally { ed.endStructural(replace ? `swap ${label}` : `add ${label}`); }
+}
+
+function wearPartInner(part, label, replace) {
   const L = limbs();
   const old = replace ? limbByName(replace) : null;
   // WHERE IT LANDS. Replacing: the joint of the limb going away. Adding: the
@@ -427,8 +477,138 @@ async function loadLimbFromLibrary(name, replace) {
   touched();
   bindGizmo();
   ed.invalidate();
-  toast(`${replace ? 'swapped in' : 'added'} ${name}`);
+  toast(`${replace ? 'swapped in' : 'added'} ${label}`);
   renderAllPanels();
+}
+
+/* --- the other-creature shelf: catalogue and lift -------------------------
+ *
+ * A creature file IS a limb library — it just has not been told so. Everything
+ * below turns `mobs/asha.vox` + `mobs/asha.json` into the same {prefab,
+ * palette, root, limbs} object `LIB.readPart` produces for a saved part, so
+ * `wearPart` above cannot tell the two apart.
+ */
+
+/** The .vox+.json of one creature, parsed once and kept. */
+async function creatureDoc(path) {
+  if (crVoxCache.has(path)) return crVoxCache.get(path);
+  const rv = await fetch('/api/model?path=' + encodeURIComponent(path),
+                         { cache: 'no-store' });
+  if (!rv.ok) throw new Error(path + ' ' + rv.status);
+  const parsed = VOX.readVox(await rv.arrayBuffer());
+  if (!parsed.prefab) throw new Error(path + ' has no models');
+  const out = { prefab: parsed.prefab, palette: parsed.palette };
+  crVoxCache.set(path, out);
+  return out;
+}
+
+const sidecarPathOf = p => p.replace(/\.vox$/i, '.json');
+
+/**
+ * Scan every OTHER creature for limbs that could be worn here.
+ *
+ * Only the .json sidecars are read: they carry the whole limb tree (name,
+ * parent, tag) and are a couple of KB each, whereas the .vox is the art. So
+ * the shelf lists instantly and a file is only parsed when you actually swap
+ * one of its limbs in.
+ *
+ * A "part" here is a limb WITH ITS DESCENDANTS, which is the only unit that
+ * makes sense to move: lifting an upper arm and leaving the forearm behind
+ * would strand it parented to a limb that no longer exists on either creature.
+ * Every limb is offered as a root, so you can take a whole arm or just a hand.
+ */
+async function refreshCreatures() {
+  // A rescan means "the files may have moved on", and the open creature's own
+  // entry is the one that actually does: save it and the disk copy this cache
+  // holds is a version of the character that no longer exists anywhere.
+  crVoxCache.clear();
+  try {
+    const r = await fetch('/api/models', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    // mobs/ and models/ only. microvox/ and items/ have no skeletons, and
+    // listing thirty plants that can never be swapped in is noise.
+    //
+    // THE OPEN CREATURE IS INCLUDED, deliberately. It was excluded at first on
+    // the reasoning that swapping a limb for itself does nothing — which is
+    // true only until you have already swapped it OUT. At that moment the file
+    // on disk is the only place the original arm still exists, and leaving it
+    // off the shelf means the one limb you most want back is the one limb the
+    // list refuses to show. It is marked `self` and sorted first, because
+    // "put it back" is the likeliest reason to be reading this list at all.
+    const voxes = (j.files || []).filter(f =>
+      (f.dir === 'mobs' || f.dir === 'models') &&
+      f.name.toLowerCase().endsWith('.vox'));
+    const jsons = new Set((j.files || []).map(f => f.path));
+
+    const out = [];
+    await Promise.all(voxes.map(async f => {
+      const sp = sidecarPathOf(f.path);
+      if (!jsons.has(sp)) return;         // no sidecar = no limbs to speak of
+      let meta;
+      try {
+        const rj = await fetch('/api/model?path=' + encodeURIComponent(sp),
+                               { cache: 'no-store' });
+        if (!rj.ok) return;
+        meta = JSON.parse(await rj.text());
+      } catch { return; }
+      const ls = Array.isArray(meta.limbs) ? meta.limbs : [];
+      if (!ls.length) return;
+      const from = f.name.replace(/\.vox$/i, '');
+      for (const l of ls) {
+        if (!l || !l.name) continue;
+        const kin = LIB.subtreeNames(ls, l.name);
+        out.push({
+          path: f.path, from, root: l.name, tag: l.tag || '',
+          limbs: kin.map(n => {
+            const e = ls.find(x => x.name === n);
+            return { name: n, tag: (e && e.tag) || '' };
+          }),
+        });
+      }
+    }));
+    // Grouped by creature, then in the file's own limb order within it, so the
+    // list reads like the rigs it came from rather than one alphabetical mush.
+    // The open creature's own saved copy sorts to the front — see above.
+    const here = ed.getDocPath();
+    out.sort((a, b) => (a.path === here ? 0 : 1) - (b.path === here ? 0 : 1) ||
+                       a.from.localeCompare(b.from));
+    crParts = out;
+    crErr = '';
+  } catch (e) {
+    crParts = null;
+    crErr = 'needs the tuner server (python scripts/tuner_server.py) — ' +
+            'a file:// page cannot read the other creatures';
+  }
+}
+
+/** Lift `root` (and its descendants) out of `path` and wear it here. */
+async function loadLimbFromCreature(entry, replace) {
+  let part;
+  try {
+    const src = await creatureDoc(entry.path);
+    const sp = sidecarPathOf(entry.path);
+    const rj = await fetch('/api/model?path=' + encodeURIComponent(sp),
+                           { cache: 'no-store' });
+    if (!rj.ok) throw new Error(sp + ' ' + rj.status);
+    const meta = JSON.parse(await rj.text());
+    // partFromPrefab is the SAVE half of the library, run against a document
+    // that happens not to be open. That is the whole trick: it already rebases
+    // offsets onto the part's own min corner and converts the prefab `anchor`
+    // to the `anchorLocal` a swap needs, which is exactly the coordinate work
+    // that would otherwise have to be written a second time here (and is the
+    // bug that parks a swapped arm a torso-width out in the air).
+    const built = LIB.partFromPrefab({ models: src.prefab.models },
+                                     meta.limbs || [], entry.root,
+                                     { from: entry.from });
+    part = {
+      prefab: built.prefab, palette: src.palette,
+      root: built.json.root, limbs: built.json.limbs, meta: built.json.meta,
+    };
+  } catch (e) {
+    return toast('limb lift failed: ' + (e.message || e), true);
+  }
+  wearPart(part, `${entry.from} › ${entry.root}`, replace);
 }
 
 /* --- held-item preview: PLACEMENT ----------------------------------------
@@ -740,8 +920,18 @@ function upscale2x() {
     : isItem ? `, scale goes ${scl} → ${scl * 2} (same world size, finer detail)`
     : '';
   if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' + scaleNote +
-      '. This clears the undo history.')) return;
-  if (!ed.upscaleDoc()) return;          // toasts its own reason on failure
+      '.')) return;
+  // Geometry and sidecar are two halves of ONE edit — undoing the doubled
+  // grids while the anchors stayed doubled would detach every joint from the
+  // art by exactly a factor of two.
+  ed.beginStructural();
+  let ok = false;
+  try { ok = upscale2xInner(s, scl, isItem); }
+  finally { ed.endStructural('2× detail', ok); }
+}
+
+function upscale2xInner(s, scl, isItem) {
+  if (!ed.upscaleDoc()) return false;    // toasts its own reason on failure
   for (const l of limbs())
     if (Array.isArray(l.anchor) && l.anchor.length === 3)
       l.anchor = l.anchor.map(v => v * 2);
@@ -786,6 +976,7 @@ function upscale2x() {
     : isItem
       ? ` — scale ${scl * 2}: same world size, ${scl * 2}× voxel density`
       : ' — the model is twice the resolution (and twice the world size)'));
+  return true;
 }
 
 function growSize2x() {
@@ -1052,19 +1243,38 @@ function renderRigPanel() {
     nm.addEventListener('click', e => e.stopPropagation());
     nm.addEventListener('change', () => {
       const old = m.name;
-      if (!ed.renameModel(i, nm.value)) { nm.value = old; return; }
-      const l = limbByName(old);
-      if (l) { l.name = m.name; touched(); }
-      for (const o of limbs()) if (o.parent === old) { o.parent = m.name; touched(); }
+      // The model name and every sidecar reference to it move together, so
+      // they are one undo step: a rename that came back on the model but not
+      // on its limb entry would orphan the limb (mob.cpp joins them by name
+      // and by nothing else).
+      ed.beginStructural();
+      let ok = false;
+      try {
+        if (!ed.renameModel(i, nm.value)) { nm.value = old; return; }
+        const l = limbByName(old);
+        if (l) { l.name = m.name; touched(); }
+        for (const o of limbs()) if (o.parent === old) { o.parent = m.name; touched(); }
+        ok = true;
+      } finally { ed.endStructural(`rename ${old}`, ok); }
       renderAllPanels();
     });
     row.append(
       dimInput(m, i),
       nm,
+      // The title FLIPS when lit, like the hide button next to it. A control
+      // whose tooltip still says "solo" while it is already soloing does not
+      // tell you it is also the way back.
       el('button', {
         class: 'icon' + (ed.isModelSolo(m.name) ? ' on' : ''),
-        title: 'solo — show only this limb (and any other soloed)',
-        onclick: e => { e.stopPropagation(); ed.toggleModelSolo(m.name); renderAllPanels(); },
+        title: ed.isModelSolo(m.name)
+          ? 'soloed — click to show the whole body again ' +
+            '(shift-click to drop just this one from the solo)'
+          : 'solo — show only this limb (shift-click to add it to the solo)',
+        onclick: e => {
+          e.stopPropagation();
+          ed.toggleModelSolo(m.name, e.shiftKey);
+          renderAllPanels();
+        },
       }, 'S'),
       el('button', {
         class: 'icon' + (ed.isModelHidden(m.name) ? ' on' : ''),
@@ -1494,6 +1704,7 @@ function limbBody(limb) {
  * absent control reads as a broken feature.
  */
 function renderLibrary() {
+  const onCreatures = libSource === 'creatures';
   const hdr = el('div', { class: 'righdr' }, 'Limb library',
     el('span', { class: 'spacer' }),
     el('button', {
@@ -1501,11 +1712,43 @@ function renderLibrary() {
       onclick: () => { libOpen = !libOpen; renderAllPanels(); },
     }, libOpen ? '▾' : '▸'),
     el('button', {
-      class: 'icon', title: 'rescan assets/limbs/',
-      onclick: async () => { await refreshLibrary(); renderAllPanels(); },
+      class: 'icon',
+      title: onCreatures ? 'rescan the other creatures' : 'rescan assets/limbs/',
+      onclick: async () => {
+        if (onCreatures) { crVoxCache.clear(); await refreshCreatures(); }
+        else await refreshLibrary();
+        renderAllPanels();
+      },
     }, '↻'));
   sideEl.append(hdr);
   if (!libOpen) return;
+
+  /* --- where the parts come from ---
+     Two shelves, one set of verbs. Saved parts are the curated ones; the other
+     creatures are every arm you have ever drawn, with no curation step — which
+     is the one you want when the question is "what would HER arm look like on
+     him?" rather than "fetch the arm I put aside". */
+  const srcRow = el('div', { class: 'rigbtns' });
+  const srcBtn = (id, label, title) => el('button', {
+    class: 'small' + (libSource === id ? ' on' : ''), title,
+    onclick: () => {
+      if (libSource === id) return;
+      libSource = id;
+      // First visit to the creature shelf scans lazily: the sidecars are only
+      // worth reading if you actually open it.
+      if (id === 'creatures' && crParts === null && !crErr)
+        refreshCreatures().then(renderAllPanels);
+      renderAllPanels();
+    },
+  }, label);
+  srcRow.append(
+    srcBtn('saved', 'saved parts', 'parts you have saved to assets/limbs/'),
+    srcBtn('creatures', 'other creatures',
+           'limbs lifted straight out of the other mob files — nothing to ' +
+           'save first'));
+  sideEl.append(srcRow);
+
+  if (onCreatures) return renderCreatureShelf();
 
   /* --- save the selected limb --- */
   const sel = selectedPart ? limbByName(selectedPart) : null;
@@ -1552,6 +1795,112 @@ function renderLibrary() {
   }
   sideEl.append(listEl);
   renderLibraryList(listEl);
+}
+
+/* ---- the other-creature shelf -------------------------------------------
+ *
+ * Same two verbs as the saved shelf (swap / add) over a different catalogue,
+ * so nothing new has to be learned. What it adds is the TAG FILTER, on by
+ * default: the question this shelf answers is "show me the other arms", and a
+ * flat list of every limb of every creature — fifteen per mob, five mobs — is
+ * not that list. The filter is a checkbox rather than a hidden rule, because a
+ * limb with no tag, or one you want to graft somewhere unlike it, still has to
+ * be reachable.
+ */
+function renderCreatureShelf() {
+  if (crErr) return sideEl.append(el('div', { class: 'rignote' }, crErr));
+  if (crParts === null)
+    return sideEl.append(el('div', { class: 'rignote' }, 'scanning creatures…'));
+
+  const sel = selectedPart ? limbByName(selectedPart) : null;
+  const selTag = (sel && sel.tag) || '';
+
+  if (!sel)
+    sideEl.append(el('div', { class: 'rignote' },
+      'Select a limb in the list above — the shelf then offers the same kind ' +
+      'of limb from every other creature, and swapping one in lands its joint ' +
+      'on the one it replaces.'));
+
+  const opts = el('div', { class: 'rigf' });
+  if (selTag) {
+    const cb = el('input', { type: 'checkbox' });
+    cb.checked = crSameTagOnly;
+    cb.addEventListener('change', () => {
+      crSameTagOnly = cb.checked; renderAllPanels();
+    });
+    opts.append(el('span', {}, 'only "' + selTag + '"'), cb,
+      el('i', {}, 'limbs tagged the same as the one you have selected'));
+  }
+  const box = el('input', { class: 'cell riglibsearch', value: crFilter,
+                            placeholder: 'filter by creature, limb or tag' });
+  const listEl = el('div', { class: 'riglist' });
+  box.addEventListener('input', () => {
+    crFilter = box.value;
+    // Shelf only: a full renderAllPanels() rebuilds this input and blurs it on
+    // every keystroke (the same trap the saved shelf's filter documents).
+    renderCreatureList(listEl, sel, selTag);
+  });
+  if (selTag) sideEl.append(opts);
+  sideEl.append(el('div', { class: 'rigf' }, box), listEl);
+  renderCreatureList(listEl, sel, selTag);
+}
+
+function renderCreatureList(host, sel, selTag) {
+  host.innerHTML = '';
+  const here = ed.getDocPath();
+  const q = crFilter.trim().toLowerCase();
+  const tagFilter = crSameTagOnly && selTag;
+  const shown = (crParts || [])
+    .filter(p => !tagFilter || p.tag === selTag)
+    .filter(p => !q || p.from.toLowerCase().includes(q) ||
+                 p.root.toLowerCase().includes(q) ||
+                 p.limbs.some(l => (l.tag || '').toLowerCase().includes(q)));
+
+  if (!shown.length)
+    return host.append(el('div', { class: 'rignote' },
+      tagFilter ? `no other creature has a limb tagged "${selTag}" — ` +
+                  'untick the filter to see every limb'
+                : 'nothing matches'));
+
+  let lastFrom = null;
+  for (const p of shown) {
+    const self = p.path === here;
+    // One heading per creature: the list is "whose arm", and repeating the
+    // creature name on fifteen consecutive rows would crowd out the limb name.
+    if (p.from !== lastFrom) {
+      lastFrom = p.from;
+      host.append(el('div', { class: 'riggroup', style: 'cursor:default' },
+        el('span', { class: 'rigglabel' },
+           self ? p.from + ' — as last saved' : p.from)));
+    }
+    const tags = [...new Set(p.limbs.map(l => l.tag).filter(Boolean))];
+    const meta = (p.limbs.length > 1 ? `${p.limbs.length} limbs` : '1 limb') +
+      (tags.length ? ' · ' + tags.join(' ') : '') +
+      // Say it on the row too: the heading scrolls away, and "swap in the disk
+      // copy" and "swap in another creature's" are different enough edits that
+      // guessing from position would be a mistake worth making loudly.
+      (self ? ' · from the saved file' : '');
+    host.append(el('div', { class: 'rigrow riglib' },
+      el('div', { class: 'riglibtext' },
+        el('span', { class: 'riglibname' }, p.root),
+        el('span', { class: 'riglibmeta', title: meta + '\nfrom ' + p.path },
+           meta)),
+      el('button', {
+        class: 'small', disabled: !sel,
+        title: sel ? `replace "${sel.name}" (and its descendants) with ` +
+                     `${p.from}'s ${p.root} — the incoming joint lands on the ` +
+                     'old one\'s, so the skeleton keeps working'
+                   : 'select the limb to replace, above',
+        onclick: () => loadLimbFromCreature(p, sel.name),
+      }, 'swap'),
+      el('button', {
+        class: 'small', disabled: !sel,
+        title: sel ? `attach ${p.from}'s ${p.root} as a new child of ` +
+                     `"${sel.name}"`
+                   : 'select the parent limb, above',
+        onclick: () => loadLimbFromCreature(p, null),
+      }, 'add')));
+  }
 }
 
 function renderLibraryList(host) {
@@ -3404,5 +3753,12 @@ export const hooks = {
   // Another session (or another tab) may have saved a limb since this page
   // loaded; rescanning on tab entry is what keeps the shelf from going stale
   // without making the user find the ↻ button.
-  onActivate: () => { refreshLibrary().then(renderAllPanels); },
+  // The creature shelf is only rescanned if it has already been looked at
+  // once: its first scan reads one sidecar per mob file, and paying that on
+  // every tab entry for a shelf nobody opened is the sort of cost that gets
+  // blamed on the tab being slow.
+  onActivate: () => {
+    refreshLibrary().then(renderAllPanels);
+    if (crParts !== null) refreshCreatures().then(renderAllPanels);
+  },
 };
