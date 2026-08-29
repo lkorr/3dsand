@@ -205,8 +205,44 @@ class DebrisSystem {
     return i < bodies_.size() ? bodies_[i].handle : 0;
   }
   uint32_t ActiveBodyCount() const;
+  // Per-body identity, for a test that has to say WHICH body is left rather
+  // than how many. "1 still a body" is the same bare count as "1 awake": the
+  // useful question is whether it is the body the test made (same size, same
+  // place) or one that appeared from somewhere else, and those have completely
+  // different fixes.
+  Vec3 BodyPosition(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].xf.pos : Vec3{};
+  }
+  uint32_t BodyVoxelCount(uint32_t i) const {
+    if (i >= bodies_.size()) return 0;
+    const Body& b = bodies_[i];
+    return (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size() : b.voxels.size());
+  }
+  bool BodyActive(uint32_t i) const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
+
+  // ---- why a body did not sleep (CLAUDE.md rule 6) ------------------------
+  //
+  // "N bodies awake" is a bare count, and it is exactly the shape of number
+  // that rule 6 says not to bisect: the `debris` and `settle-back` gates were
+  // handed over as known-failing with a paragraph of ruled-out hypotheses and
+  // no cause, after the terrain overhaul spent a dozen elimination runs on
+  // them. A body cannot sleep through a terrain patch rebuilding under it —
+  // ManageTerrain wakes everything within 24 voxels whenever a chunk's
+  // collision SURFACE changes, and SettleBodies needs 60 CONSECUTIVE inactive
+  // ticks — so record the wake WHERE IT HAPPENS, name the chunk that did it,
+  // and the question stops needing a bisect. Two counters and an IVec3; no
+  // allocation, no readback, nothing that costs anything when nothing wakes.
+  struct SettleProbe {
+    uint32_t terrainWakes = 0;      // ManageTerrain: collision surface moved
+    uint32_t blastWakes = 0;        // PreTick: an island event fired
+    uint32_t lastWakeTick = 0;      // the most recent of either
+    IVec3 lastWakeChunk{};          // ...and the chunk whose mesh changed
+    uint32_t maxInactiveTicks = 0;  // longest quiet run ANY body managed
+  };
+  const SettleProbe& Settle() const { return settle_; }
+  void ResetSettleProbe() { settle_ = SettleProbe{}; }
 
   // ---- persistence (sim/worldio.h, entities.sve section 'DBRS') -----------
   // Everything a body IS travels: collider + skin lattices, transform, scales,
@@ -444,6 +480,7 @@ class DebrisSystem {
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
+  SettleProbe settle_{};
   // Drained by main.cpp each frame; bounded by the same per-tick body budget
   // that bounds island creation, so this cannot grow without limit.
   std::vector<BreakEvent> breaks_;

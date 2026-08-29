@@ -1835,6 +1835,26 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   // read zero and every assertion failed for a reason that had nothing to do
   // with burning (CLAUDE.md: anchor a fixture, never write an absolute Y).
   IVec3 pchunk{10, 0, 10};
+
+  // ...AND NEVER AN ABSOLUTE X OR Z EITHER, which is the other half of the same
+  // rule and cost this gate a long-standing in-suite failure.
+  //
+  // The Y was anchored; the columns were literals (170, 200, 230, 260). Those
+  // sit comfortably inside the window when the gate runs ALONE, because the
+  // origin is still {0,0,0}. In a full run `streaming` has already walked the
+  // player out and left the origin ~20 chunks along x — so every fixture landed
+  // OUTSIDE the residency window, where world writes are dropped and reactions
+  // never run. The symptom was a whole gate of zeroes (0 alight, 0 fire ops,
+  // 0 indexed cells) that passed perfectly on its own: exactly the trap
+  // selftest.h's ordering note describes, in the file that already quoted it.
+  //
+  // `inset` keeps the original spacing, so the fixtures stay as far apart from
+  // each other as they were — they must not share terrain, and one of them
+  // lights a sustained blaze.
+  const IVec3 wOrg = world.WindowOrigin();
+  auto fixture = [&](int inset) {
+    return IVec3{wOrg.x * (int)kChunk + inset, 0, wOrg.z * (int)kChunk + inset};
+  };
   // One tick of the real thing. `soakMat` fills the mob's own box every tick (a
   // sustained blaze, or a bath of acid). The ops the MOB emitted are counted
   // BEFORE the fixture adds its own, so "the limb emitted fire into the grid"
@@ -1879,9 +1899,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(170, 170, kDefaultSeed);
-    pchunk = IVec3{170 / 16, h / 16, 170 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {170, h + 1, 170});
+    const IVec3 site = fixture(170);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     if (id) {
       const uint32_t cloth0 = census(id, mCloth), skin0 = census(id, mSkin);
       const uint32_t fireOps0 = mobFireOps;
@@ -1908,9 +1929,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(200, 200, kDefaultSeed);
-    pchunk = IVec3{200 / 16, h / 16, 200 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {200, h + 1, 200});
+    const IVec3 site = fixture(200);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     if (!id) {
       detail = "spawn refused";
       return Status::Fail;
@@ -2040,9 +2062,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(230, 230, kDefaultSeed);
-    pchunk = IVec3{230 / 16, h / 16, 230 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {230, h + 1, 230});
+    const IVec3 site = fixture(230);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     if (!id) {
       detail = "spawn refused";
       return Status::Fail;
@@ -2129,9 +2152,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(260, 260, kDefaultSeed);
-    pchunk = IVec3{260 / 16, h / 16, 260 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {260, h + 1, 260});
+    const IVec3 site = fixture(260);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     uint32_t adopted = 0, before = 0, after = 0, bodies = 0;
     if (id) {
       for (int i = 0; i < 12; i++) burnTick(id, 0, 0);
@@ -2170,9 +2194,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(230, 230, kDefaultSeed);
-    pchunk = IVec3{230 / 16, h / 16, 230 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {230, h + 1, 230});
+    const IVec3 site = fixture(230);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     uint32_t before = 0, after = 0;
     if (id) {
       for (int i = 0; i < 10; i++) burnTick(id, 0, 0);
@@ -2207,15 +2232,17 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     int avDef = -1;
     for (size_t i = 0; i < mobs.Defs().size(); i++)
       if (mobs.Defs()[i].name == avDefName) avDef = (int)i;
-    const int h = World::TerrainHeight(300, 300, kDefaultSeed);
-    pchunk = IVec3{300 / 16, h / 16, 300 / 16};
+    const IVec3 site = fixture(300);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
     PlayerAvatar avatar;
     avatar.Init(&c.phys, &world, &debris, mats, &mobs);
     if (avDef >= 0) avatar.SetDefs(&mobs.Defs(), avDefName);
     Player pl;
     pl.fly = false;
     pl.grounded = true;
-    pl.pos = Vec3{300.5f, (float)(h + 2) + Player::kHalfY, 300.5f};
+    pl.pos = Vec3{(float)site.x + 0.5f, (float)(h + 2) + Player::kHalfY,
+                  (float)site.z + 0.5f};
     const bool spawned = avDef >= 0 && avatar.Spawn(pl, 0.0f);
     const int nParts = spawned ? (int)mobs.Defs()[avDef].limbs.size() : 0;
     auto avCensus = [&](uint32_t mat) {
@@ -2237,7 +2264,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       for (const CellOp& op : cellOps)
         if ((op.word & 0xFFFu) == mFire) avFireOps++;
       if (soakMat) {
-        const IVec3 b{300, h + 1, 300};
+        const IVec3 b{site.x, h + 1, site.z};
         for (int dy = -2; dy <= 18; dy++)
           for (int dz = -3; dz <= 3; dz++)
             for (int dx = -3; dx <= 3; dx++) {

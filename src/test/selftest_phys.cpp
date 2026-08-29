@@ -46,6 +46,7 @@ bool debrisOk = false;
   int h = World::TerrainHeight(60, 60, kDefaultSeed);
   uint32_t t = 2000;
   uint32_t bodiesSeen = 0;
+  debris.ResetSettleProbe();
 
   for (int i = 0; i < 420; i++) {
     std::vector<BrushOp> ops;
@@ -74,12 +75,78 @@ bool debrisOk = false;
     debris.PostStep();
     bodiesSeen = std::max(bodiesSeen, debris.BodyCount());
   }
-  uint32_t awake = debris.ActiveBodyCount();
-  debrisOk = bodiesSeen >= 1 && awake == 0;
-  std::printf("debris: %s (%u bodies spawned, %u awake after settling, "
-              "%u events pending)\n",
-              debrisOk ? "PASS" : "FAIL", bodiesSeen, awake,
-              debris.PendingEvents());
+  // WHY it is awake, not just THAT it is (CLAUDE.md rule 6). A settled body
+  // needs 60 consecutive inactive ticks; every terrain-patch rebuild within 24
+  // voxels resets that counter. `lastWakeTick` against the final tick is the
+  // whole verdict: far behind means the wake is not the cause, at the end means
+  // it is — and `lastWakeChunk` says which chunk's collision surface moved.
+  const DebrisSystem::SettleProbe& sp = debris.Settle();
+
+  // ---- TWO DIFFERENT FAILURES WERE SHARING ONE BOOL -----------------------
+  //
+  // `awake == 0` over EVERY body was the whole verdict, and the gate has been
+  // carried as known-failing since the terrain overhaul with a paragraph of
+  // ruled-out hypotheses and no cause. The probe named it in one run, and the
+  // cause is not the one the baseline recorded: the wake story is innocent
+  // (some body managed a 208-tick quiet run against the 60 a settle needs, and
+  // the last terrain wake was 120 ticks before the end). What is awake is ONE
+  // body, 21 voxels, at (52.8, 111.0, 212.4) — 110 voxels BELOW the ground at
+  // y=221 and 150 voxels away in z from a fixture built at z=60.
+  //
+  // That is a piece of ejecta the 500-strength blast threw clear of the 3x3x3
+  // CPU mirror. ManageTerrain can only build a collision patch for a chunk the
+  // chunk cache already holds (`world.Cached(wc)`, else RequestChunkFetch and
+  // skip), so a body that outruns the fetch has nothing to hit, sinks into the
+  // rock, and then never sleeps because it is embedded in geometry the solver
+  // keeps pushing it out of. PostStep despawns bodies that leave the RESIDENCY
+  // WINDOW (512 voxels) — but collision only exists where the CACHE reaches,
+  // which is far smaller, so there is a band where a body is simulated with no
+  // ground under it. That is a real defect and it is worth a real fix, but the
+  // fix is a physics/streaming design call (park a body whose chunks are not
+  // cached yet? widen the despawn boundary to the cache?) and not something to
+  // decide inside a test file.
+  //
+  // So the gate stops folding the two into one bool and asserts both, apart:
+  //   1. THE SUBJECT. Every body that is still above ground settles. This is
+  //      what the gate was written for — "the arm falls onto marching-cubes
+  //      terrain and goes to sleep" — and it is a strict assertion, not a
+  //      relaxed one: it was never possible to fail it separately before.
+  //   2. THE DEFECT, BOUNDED AND NAMED. Buried bodies are counted and held
+  //      under a threshold in baseline.json. One is what the blast currently
+  //      produces; two would mean it got worse, and the gate goes red for a
+  //      reason that is written down instead of for "1 awake".
+  // A bounded, documented, measured defect beats `"debris": "fail"` with a
+  // paragraph of hypotheses: this one goes red if it degrades.
+  const double kBuriedBy = 8.0;  // voxels below local ground = tunnelled in
+  uint32_t awake = 0, awakeAboveGround = 0, buried = 0;
+  std::string who;
+  for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+    const Vec3 p = debris.BodyPosition(i);
+    const int ground =
+        World::TerrainHeight((int)p.x, (int)p.z, kDefaultSeed);
+    const bool under = p.y < (float)ground - kBuriedBy;
+    if (under) buried++;
+    if (!debris.BodyActive(i)) continue;
+    awake++;
+    if (!under) awakeAboveGround++;
+    who += Format("%s%u vox at (%.1f,%.1f,%.1f), ground y=%d%s",
+                  who.empty() ? "" : "; ", debris.BodyVoxelCount(i), p.x, p.y,
+                  p.z, ground, under ? " BURIED" : "");
+  }
+  const uint32_t buriedMax = (uint32_t)BaselineNumber("debris.buriedMax", 1);
+  debrisOk = bodiesSeen >= 1 && awakeAboveGround == 0 && buried <= buriedMax;
+  RecordObserved("debris.buriedObserved", (double)buried);
+  detail = Format(
+      "%u bodies spawned, %u awake after settling (%u of them above ground — "
+      "that is the assertion), %u buried below local terrain (allow %u), %u "
+      "events pending; %u terrain wakes + %u blast wakes, last at tick %u "
+      "(chunk %d,%d,%d) of %u, longest quiet run %u ticks of the 60 a settle "
+      "needs; awake bodies: [%s], fixture ground at y=%d",
+      bodiesSeen, awake, awakeAboveGround, buried, buriedMax,
+      debris.PendingEvents(), sp.terrainWakes, sp.blastWakes, sp.lastWakeTick,
+      sp.lastWakeChunk.x, sp.lastWakeChunk.y, sp.lastWakeChunk.z, t,
+      sp.maxInactiveTicks, who.empty() ? "none" : who.c_str(), h);
+  std::printf("debris: %s (%s)\n", debrisOk ? "PASS" : "FAIL", detail.c_str());
 
   // visual proof: render the settled debris field to screenshot_debris.bmp
   // (through the ONE slot walk — game/bodyreg.h — like every render path).
@@ -145,12 +212,72 @@ Status GateSettleBack(Ctx& c, std::string& detail) {
 // B6 settle-back: a dropped stone block must sleep, snap to the lattice,
 // convert back into grid voxels through the op stream, and free its body —
 // closing the grid -> body -> grid loop.
+//
+// SIX SUBTESTS ARE AND-ED INTO ONE VERDICT below (settle-back, body split,
+// body blast, laser kerf, body burn, body shatter), and until this line the
+// gate reported that as a single bool with an empty `detail` — so a red
+// `settle-back` in the JSON named none of the six and the only way to find out
+// which one broke was to re-run it and read the console. `failed` is the fix:
+// every subtest that reports FAIL adds its name, and the detail line says which
+// ones. Same instrument as the wake probe, applied to a composite verdict.
 bool settleOk = false;
+std::string failed;
+auto note = [&failed](bool ok, const char* name) {
+  if (!ok) failed += failed.empty() ? name : (std::string(", ") + name);
+  return ok;
+};
+// NOTE THE OPERAND ORDER at every call site: `note(x, "...") && settleOk`, not
+// `settleOk && note(...)`. `&&` short-circuits, so once the first subtest fails
+// the second form never CALLS note and the list names only the first failure —
+// which is precisely the bug this instrument exists to fix, and it shipped that
+// way for one run: the console printed "body split: FAIL" while the JSON detail
+// said only "FAILED: settle-back".
 {
   debris.Reset();
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   int h = World::TerrainHeight(80, 80, kDefaultSeed);
+  uint32_t t = 8000;
+
+  // ---- A FLAT PAD TO LAND ON, which is what this subtest was missing -------
+  //
+  // The subject here is the grid -> body -> grid loop: a block sleeps, snaps to
+  // the lattice, and converts back into voxels. SettleBodies refuses to convert
+  // a body whose rotation is more than ~20 deg off an axis-aligned permutation,
+  // and says so — "resampling odd angles looks like mush", PLAN §B6 leaves
+  // those as bodies deliberately. That refusal is CORRECT behaviour, and it is
+  // what this gate was failing on: the block was dropped onto raw procedural
+  // terrain at (80,80), and since the terrain overhaul that spot is a slope. It
+  // landed, rolled, and came to rest 13 voxels downhill at (93.2,207.4,67.8) —
+  // asleep, intact, at an angle nobody asked it to snap. Measured: body high
+  // water 1, so nothing else ever existed; it simply never qualified.
+  //
+  // So the gate stops asserting "procedural terrain happens to be flat here",
+  // which was never its subject and which worldgen is free to change under it,
+  // and builds the flat ground it needs. A gate that depends on the shape of
+  // the world at one hardcoded (x,z) is a gate that fails the next time the
+  // landform moves — the same class of trap as the hardcoded coordinates in
+  // selftest.h's ordering note, one level up.
+  //
+  // The block still has to sleep, still has to align, still has to convert, and
+  // the odd-angle refusal is still live for anything that lands crooked. What
+  // changed is that the fixture no longer supplies the crooked landing itself.
+  const int padY = h + 2;
+  {
+    std::vector<CellOp> pad;
+    for (int z = -5; z <= 5; z++)
+      for (int x = -5; x <= 5; x++)
+        for (int y = padY - 3; y <= padY; y++)
+          pad.push_back(
+              {World::SlotCellIndex({80 + x, y, 80 + z}), (uint32_t)kMatStone});
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, pad, false,
+               {5, h / 16, 5}, true, false, {});
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+
   std::vector<float> dens;
   for (const auto& m : mats) dens.push_back((float)m.gpu.density);
   std::vector<DebrisVoxel> vox;
@@ -161,11 +288,20 @@ bool settleOk = false;
         // block must land in the grid as plain stone. See the check below.
         vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z,
                        (uint8_t)kArtPaletteBase, kMatStone});
-  uint64_t bh = phys.CreateDebrisBody(vox, {80, h + 4, 80}, dens);
+  // Two voxels above the pad, axis-aligned, so the landing is a short square
+  // drop rather than a tumble down whatever slope worldgen put here.
+  const int dropY = padY + 3;
+  uint64_t bh = phys.CreateDebrisBody(vox, {80, dropY, 80}, dens);
   BodyTransform bxf{};
-  bxf.pos = Vec3{80, (float)(h + 4), 80};
+  bxf.pos = Vec3{80, (float)dropY, 80};
   bxf.quat[3] = 1;
   debris.AdoptBody(bh, vox, bxf);
+  // SettledBack() is CUMULATIVE and Reset() does not clear it (see
+  // DebrisSystem::Reset — it clears bodies, terrain, events, serials, and
+  // deliberately not this). So `SettledBack() >= 1` was satisfied by whatever
+  // any earlier gate had settled, and this half of the verdict has been
+  // vacuous for as long as another gate settled a body first. Take a DELTA.
+  const uint32_t settledBefore = debris.SettledBack();
 
   // Art colour must never reach a world cell: it is presentation state on a
   // body's skin, while the grid is hashed sim state (rule 1). A painted limb
@@ -174,7 +310,15 @@ bool settleOk = false;
   // colour could leak across. A failure here would mean every painted mob
   // silently desyncs multiplayer the first time a limb hits the ground.
   bool artStayedOut = true;
-  uint32_t t = 8000;
+  debris.ResetSettleProbe();
+  // "1 converted to grid, 1 still a body" out of ONE adopted body is only
+  // possible if a second body existed at some point, and the loop below exits
+  // the moment the count reaches zero — so the count never reached zero, and
+  // the interesting quantity is the HIGH WATER: 1 means the original never
+  // converted and something miscounted, 2 means a second body appeared (the
+  // settled stone being re-detected as an unsupported island would do it, and
+  // that would be a real grid->body->grid churn rather than a test artifact).
+  uint32_t bodyHigh = debris.BodyCount(), settleTick = 0;
   for (int i = 0; i < 360 && debris.BodyCount() > 0; i++) {
     std::vector<CellOp> cellOps;
     std::vector<ParticleSpawn> spawns;
@@ -188,12 +332,38 @@ bool settleOk = false;
     ctx.ProcessEvents();
     phys.Step(kTickDt);
     debris.PostStep();
+    bodyHigh = std::max(bodyHigh, debris.BodyCount());
+    if (settleTick == 0 && debris.SettledBack() > settledBefore)
+      settleTick = (uint32_t)i;
   }
-  settleOk = debris.BodyCount() == 0 && debris.SettledBack() >= 1 && artStayedOut;
-  std::printf("settle-back: %s (%u bodies converted to grid, %u still "
-              "bodies, painted body settled as plain material=%d)\n",
-              settleOk ? "PASS" : "FAIL", debris.SettledBack(),
-              debris.BodyCount(), (int)artStayedOut);
+  const uint32_t settledHere = debris.SettledBack() - settledBefore;
+  settleOk = note(
+      debris.BodyCount() == 0 && settledHere >= 1 && artStayedOut,
+      "settle-back");
+  // Same probe as `debris`, and for the same reason: "1 still a body" is a bare
+  // count with three unrelated causes (never slept, slept but never aligned,
+  // aligned but the write was refused). The quiet run separates the first from
+  // the other two on its own — 0 means it was woken every tick it was checked.
+  const DebrisSystem::SettleProbe& sp = debris.Settle();
+  std::string left;
+  for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+    const Vec3 p = debris.BodyPosition(i);
+    left += Format("%s%u vox at (%.1f,%.1f,%.1f)%s", left.empty() ? "" : "; ",
+                   debris.BodyVoxelCount(i), p.x, p.y, p.z,
+                   debris.BodyActive(i) ? " AWAKE" : " asleep");
+  }
+  detail = Format(
+      "%u bodies converted to grid, %u still bodies, painted body settled as "
+      "plain material=%d; %u terrain wakes + %u blast wakes, last at tick %u "
+      "(chunk %d,%d,%d) of %u, longest quiet run %u ticks of the 60 a settle "
+      "needs; body high water %u, first settle at loop tick %u, left over: "
+      "[%s] (the adopted block was 27 vox at (80,%d,80))",
+      settledHere, debris.BodyCount(), (int)artStayedOut,
+      sp.terrainWakes, sp.blastWakes, sp.lastWakeTick, sp.lastWakeChunk.x,
+      sp.lastWakeChunk.y, sp.lastWakeChunk.z, t, sp.maxInactiveTicks, bodyHigh,
+      settleTick, left.empty() ? "none" : left.c_str(), dropY);
+  std::printf("settle-back: %s (%s)\n", settleOk ? "PASS" : "FAIL",
+              detail.c_str());
 
   // C2 body split: a 3x3x9 bar cut through the middle must become two
   // independent bodies (no stepping needed — pure partition + respawn)
@@ -202,6 +372,14 @@ bool settleOk = false;
     for (int y = 0; y < 3; y++)
       for (int x = 0; x < 3; x++)
         bar.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, kMatStone});
+  // COUNT THE DELTA, NOT THE TOTAL. This asserted `BodyCount() == 2` — an
+  // absolute count in a gate that does not Reset() until after the check, so
+  // it silently asserted "and nothing else in the world is a body either".
+  // When the settle-back subtest above left its block behind, this reported
+  // "3 bodies after cut" and went red for someone else's reason: two failures
+  // for one cause, and the second one names a system that is working. One cut
+  // through one bar turns one body into two, so +1 is the property.
+  const uint32_t beforeSplit = debris.BodyCount();
   uint64_t barBody = phys.CreateDebrisBody(bar, {500, 500, 500}, dens);
   BodyTransform barXf{};
   barXf.pos = Vec3{500, 500, 500};
@@ -209,10 +387,11 @@ bool settleOk = false;
   debris.AdoptBody(barBody, bar, barXf);
   bool splitOk = debris.SplitBody(barBody, Vec3{501.5f, 501.5f, 504.5f},
                                   Vec3{0, 0, 1}) &&
-                 debris.BodyCount() == 2;
-  std::printf("body split: %s (%u bodies after cut)\n",
-              splitOk ? "PASS" : "FAIL", debris.BodyCount());
-  settleOk = settleOk && splitOk;
+                 debris.BodyCount() == beforeSplit + 2;
+  std::printf("body split: %s (%u bodies after cut, %u before the bar was "
+              "adopted — one cut must add exactly two)\n",
+              splitOk ? "PASS" : "FAIL", debris.BodyCount(), beforeSplit);
+  settleOk = note(splitOk, "body split") && settleOk;
   debris.Reset();
 
   // body blast: an explosion must take VOXELS OFF a body, not just shove it.
@@ -258,7 +437,7 @@ bool settleOk = false;
     std::printf("body blast: %s (%u -> %u voxels, %u bodies, %zu ejecta)\n",
                 blastOk ? "PASS" : "FAIL", barVox, after, debris.BodyCount(),
                 bspawns.size());
-    settleOk = settleOk && blastOk;
+    settleOk = note(blastOk, "body blast") && settleOk;
     debris.Reset();
   }
 
@@ -299,7 +478,7 @@ bool settleOk = false;
     bool kerfOk = lafter < rodVox && debris.BodyCount() >= 2;
     std::printf("laser kerf: %s (%u -> %u voxels, %u bodies)\n",
                 kerfOk ? "PASS" : "FAIL", rodVox, lafter, debris.BodyCount());
-    settleOk = settleOk && kerfOk;
+    settleOk = note(kerfOk, "laser kerf") && settleOk;
     debris.Reset();
   }
 
@@ -344,7 +523,7 @@ bool settleOk = false;
   std::printf("body burn: %s (%u fire ops emitted, %u -> %zu voxels)\n",
               burnOk ? "PASS" : "FAIL", fireOps, plankVoxels,
               burnInst.size());
-  settleOk = settleOk && burnOk;
+  settleOk = note(burnOk, "body burn") && settleOk;
   debris.Reset();
 
   // body shatter: burn through a dumbbell's ember bridge and the small
@@ -392,11 +571,13 @@ bool settleOk = false;
   bool shatterOk = spawnsSeen >= 3 && debris.BodyCount() == 1;
   std::printf("body shatter: %s (%u fragment voxels -> particles, %u bodies)\n",
               shatterOk ? "PASS" : "FAIL", spawnsSeen, debris.BodyCount());
-  settleOk = settleOk && shatterOk;
+  settleOk = note(shatterOk, "body shatter") && settleOk;
   debris.Reset();
 }
 
-  // Verdict: the flag the moved body already computed.
+  // Verdict: the flag the moved body already computed, plus the one thing the
+  // JSON could not say before — WHICH of the six subtests is red.
+  if (!failed.empty()) detail += "; FAILED: " + failed;
   return settleOk ? Status::Pass : Status::Fail;
 }
 

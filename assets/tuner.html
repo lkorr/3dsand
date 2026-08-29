@@ -8069,7 +8069,8 @@ const ARCH_NODES={
     cst:['world.h  kMaxBodySlots'],
     tst:['debris','settle-back'],
     rule:3,
-    details:'<b>Carving a LIVE limb has pose traps:</b> never re-read a kinematic limb’s transform mid-carve, a re-skin must shift <code>restOffset</code>/<code>anchorLimb</code>, and a hollowed limb’s centroid ends up inside the cavity.'},
+    wip:'A body thrown clear of the 3x3x3 CPU mirror has no collision to hit and sinks into the terrain. ManageTerrain can only build a patch for a chunk the cache already holds; PostStep only despawns bodies that leave the 512-voxel residency window. Between those two boundaries a body is simulated against ground that does not exist, tunnels in, and then never sleeps because the solver keeps depenetrating it. Bounded and measured by the <code>debris</code> gate (debris.buriedMax in tests/baseline.json, currently 1); the fix is a design call between parking a body whose chunks are not cached yet and moving the despawn boundary out to the cache.',
+    details:'<b>Carving a LIVE limb has pose traps:</b> never re-read a kinematic limb’s transform mid-carve, a re-skin must shift <code>restOffset</code>/<code>anchorLimb</code>, and a hollowed limb’s centroid ends up inside the cavity.<br><br><b>Settling back refuses odd angles on purpose</b> (<code>kAlignCos</code>, ~20&deg;): resampling a body that came to rest crooked looks like mush, so PLAN &sect;B6 leaves it a body. A test that drops a block onto raw procedural terrain is therefore testing the shape of worldgen rather than the grid&rarr;body&rarr;grid loop — the <code>settle-back</code> gate builds its own flat pad for exactly that reason.'},
 
   terrainMesh:{label:'Terrain Collision',tag:'cpu',
     desc:'Per-chunk marching-cubes static collision meshes, rebuilt only for chunks the dirty-flag snapshot says changed.',

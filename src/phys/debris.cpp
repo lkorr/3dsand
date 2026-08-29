@@ -588,6 +588,8 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       // terrain under the blast changed: sleeping debris nearby must re-check
       Vec3 c{(float)(e.lo.x + e.hi.x) * 0.5f, (float)(e.lo.y + e.hi.y) * 0.5f,
              (float)(e.lo.z + e.hi.z) * 0.5f};
+      settle_.blastWakes++;
+      settle_.lastWakeTick = tick;
       phys_->WakeNear(c, (float)kMaxRegionCells);
     } else if ((events_.size() > 1 && tick > events_.front().tick + 120) ||
                tick > events_.front().tick + 300) {
@@ -667,7 +669,10 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
       b.inactiveTicks = 0;
       continue;
     }
-    if (++b.inactiveTicks < kSettleAfterTicks) continue;
+    ++b.inactiveTicks;
+    settle_.maxInactiveTicks =
+        std::max(settle_.maxInactiveTicks, b.inactiveTicks);
+    if (b.inactiveTicks < kSettleAfterTicks) continue;
     if (b.inactiveTicks % 30 != 0) continue;  // re-test alignment cheaply
 
     // rotation -> 3x3, then the nearest signed permutation. Reject when any
@@ -2033,6 +2038,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     t.builtVersion = cc->version;
     t.meshHash = h;
     // ground under sleeping debris may have moved: let them re-settle
+    settle_.terrainWakes++;
+    settle_.lastWakeTick = tick;
+    settle_.lastWakeChunk = wc;
     phys_->WakeNear(Vec3{(float)origin.x + 8, (float)origin.y + 8,
                          (float)origin.z + 8},
                     24.0f);
@@ -2247,6 +2255,10 @@ uint32_t DebrisSystem::ActiveBodyCount() const {
   for (const Body& b : bodies_)
     if (phys_->IsActive(b.handle)) n++;
   return n;
+}
+
+bool DebrisSystem::BodyActive(uint32_t i) const {
+  return i < bodies_.size() && phys_->IsActive(bodies_[i].handle);
 }
 
 // ---- persistence (entities.sve section 'DBRS') ------------------------------
