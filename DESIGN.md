@@ -3566,13 +3566,155 @@ so the mechanism should not be there, but the CA re-levels on the chunks the
 shave woke and "should" is not a measurement — so `--gate waterbody` runs a
 quiet window and a draining window of equal length and reports both counts.
 
-### 5b.5 What is NOT here
+### 5b.5 M3: the discharge law and the local excite (added 2026-08-29)
 
-The discharge law and local excite at the hole (M3), the current field and
-surface waves (M4), and dug-basin discovery (M5). The drain source at M2 is
-`sim.waterBodyTestDrain`, a development tap of a known size in eighths per tick,
-0 in every shipped world — it exists so the ledger and the shave could be proved
-exact before there was a hole to be exact about.
+M2 left the only drain source a development tap. M3 replaces it with a HOLE:
+components 6 (the discharge law) and 7 (local excite at the throat). This is the
+milestone where the feature becomes a feature.
+
+**The law, and the one rule that makes it safe.** A hole under a body of water
+is an orifice and the body behind it is a head:
+
+```
+h = level - hole.y            (integer, voxels)
+v = sqrt(2 g h)               (integer sqrt; no f32 in the kernel)
+Q = Cd * A * v * 8            (eighths/tick; A is the orifice's cell count)
+```
+
+> **ONE evaluation of `h` produces BOTH the emitted particle momentum and the
+> ledger debit.** They are computed together in `wbLedger` and published as two
+> ledger words (`WBS_EMIT`, `WBS_JETV`) that `wbDrain` reads. There is no second
+> rule anywhere that could disagree with the first — emit by one and decrement by
+> another and the pair is a mass pump under every edge case.
+
+`sim.drainCd` and `sim.drainGravity` are human-unit floats in the sanctioned
+`sim.fluid*` lane, const-eval'd to fixed point at the top of
+`sim_waterbody.wgsl`; `sim.drainMaxEighthsPerTick` and `sim.drainExciteRadius`
+are integers. Same five-place `TUNE_*` pipeline as everything else.
+
+**The FLUID_VMAX trap, made structural.** `spawnAppend` clamps spawn velocity to
+±`FLUID_VMAX` (0.45 cell/substep), and a Torricelli velocity under real head
+exceeds it — at `pondDepth` 26 the exit speed is 7.1 m/s. The clamp is correct
+and stays. So `h` is capped at `DRAIN_H_MAX = vmax² / 2g` *before* Q is computed,
+which makes the momentum asked for equal the momentum granted by construction.
+At the shipped 9 substeps that cap is `h ≤ 8` voxels and the jet leaves at
+exactly `FLUID_VMAX` (measured: `WBS_JETV` = 262144 Q16.16 = 4.0 cells/tick).
+
+**Where the hole comes from.** `wbHole` runs LAST in the water-body row block,
+one thread per (x,z) column of a listed chunk, and it returns immediately unless
+the chunk is dirty or holds an MPM block — the chunk-dirty path, because holes
+appear when someone digs and digging is a mutation. The predicate is the
+**water/void interface**: a cell holding the body's liquid whose cell below is
+air. That set is empty in an intact basin by construction, it is exactly the
+shaft mouth when someone bores through, and it tracks the mouth downward as the
+shaft empties, which is the head growing.
+
+> The first version took "any air cell with air below" and found the FLOOR OF THE
+> CAVERN the shaft opened into: A = 473 for a 5×5 shaft, because the chamber
+> under it was 25 cells across. `A` is then not an orifice and Q is an arbitrary
+> rate. The gate caught it as a −66,773-eighth conservation failure.
+
+The lowest candidate wins by `atomicMin` over a key packing (y, x, z), so the
+answer is order-independent (integer min is associative; the `atomicCAS` ban is
+about the other kind). Two copies of the record, CURRENT and NEXT: the scan
+reports into the NEXT half and the ledger promotes it next tick — §3.3's "never
+read a tally in the pass that writes it", at pass granularity. A hole outlives
+its last sighting by `WB_HOLE_TTL` = 8 ticks, which is what makes *plugging* a
+hole stop the drain rather than a timer the drain depends on.
+
+**Emission goes through the existing seam, and nothing new.** The jet is
+`FluidSpawnOp`s consumed by `spawnAppend`, which already charges the pool budget
+and refuses past `FLUID_CAP`. What is new is only who FILLS them: the CPU cannot
+author these ops, because `h` comes from a level the GPU owns. So the CPU
+RESERVES a block of `kWaterDrainOpsPerBody` (512) slots per proposed body,
+immediately after this tick's real pours, and `wbDrain` fills every slot — live
+while the hole flows, DEAD (`mat` 0, which `fpAlive` already rejects) after it. A
+slot the pass skipped would keep a stale particle that compaction counts as live.
+`FA_SPAWNDEAD` counts the dead tail so a conservation gate can subtract it from
+`FA_LIVE` and see the real in-flight mass.
+
+The reservation is rule 2 charged BEFORE emission, on the CPU, deterministically:
+the ledger refuses the discharge outright to any body without a block
+(`b < T.waterDrainBodies`), so a granted eighth always has a particle behind it.
+And when the per-tick cap binds — it does; the analytic Q at a 7×7 orifice is 941
+eighths/tick against the 512 cap — the debit is what was WRITTEN, never the
+analytic Q (§3.2).
+
+**Component 7 is a SHELL, not a ball.** A draining hole hands a region around
+itself to the solver while the rest of the body stays a number; the trigger lives
+in `exciteDetect` (trigger (e)) so it inherits `sim.fluidExciteCeiling` and
+`sim.fluidExciteRate` unchanged, and `waterBodyState` moved into the SLIM bind
+group so the seam can read it. The region is the free-surface annulus at the
+body's level out to `sim.drainExciteRadius` plus a narrow throat column over the
+hole — not a solid hemisphere, which at the r ≈ 25 a real vortex implies is
+~33,000 particles against a ~40,000 largest-measured scene (plan §9 item 2, and
+the mitigation was UNMEASURED there). Measured at radius 6: **14,468 cells
+converted cumulatively over a 90-tick drain, 161/tick**, against a standing
+ceiling of 8,000. The shell only fires while `WBS_EMIT > 0`, so a plugged hole
+does not leave an excite source standing open over still water.
+
+**§9's ranked-first risk is REOPENED, and this time the mechanism is there.** M2
+measured the surface shave producing 0 excite candidates against 10.9 M cells
+inspected — the shave removes from the TOP, so it creates no air-below. A real
+jet at a real throat is a different question and the answer is different:
+
+```
+exciteDetect LOOKED AT   5,897,839 settled liquid cells   (90 draining ticks)
+excite CANDIDATES           51,346                        (570.5 / tick)
+```
+
+That is the same order as WP5's own 169,616 over 400 ticks (424/tick) on
+`worldlake`. It is BOUNDED rather than absent — the ceiling and rate hold it, and
+refusal is graceful because refused water is still settled water and the CA moves
+settled water. `--gate waterbody` carries a 3,000/tick bound in
+`tests/baseline.json`, ~5× the measured value, so a regression into an unbounded
+burst fails and the normal case does not.
+
+**Pass H, and why its identity is not pass A's.** Pass A's sum is about the LAKE,
+where the only movers are the shave and the tap and both report what they
+granted, so it closes at exactly +0. Pass H punches a 7×7 shaft into a sealed
+29×29×18 chamber and the water does not leave the WORLD, it leaves the lake:
+
+```
+boxVoxelEighths(t) + inFlightMpm(t) - debit(t)  ==  boxVoxelEighths(0)
+```
+
+Two arms. **H1** turns the excite seam and the splash coupling off, so only the
+discharge and the shave can move an eighth: **35,381 eighths drained through a
+real hole, residual −37 (0.10%)**. **H2** is the shipped configuration with the
+shell live: 26,476 drained, residual −305. `capped` is 0 in both, so the shave
+was never short and the ledger debited what it granted every tick — the residual
+is entirely downstream of the ledger, in a churning MPM pool where the CA's
+thin-film handling, the sun/water evaporation rule and the always-on wake trigger
+all act on water the water-body system no longer owns. The bound is an assertion
+that the discharge is not a PUMP, not a claim that a churning pool is lossless.
+
+**The known M3 cost, named rather than discovered.** The shave makes RESTING
+voxels move, so its footprint has to be declared to the page table before the
+command buffer exists — and the CPU cannot ask whether a hole exists. What it can
+see is the thing that MAKES holes, so any world mutation opens a 900-tick window
+(`kWaterDrainHotTicks`) during which a governed body declares its footprint.
+Outside that window a still lake declares nothing and materializes nothing, which
+is M2's zero-idle-cost property kept. Inside it, a body materializes its WHOLE
+footprint rather than the two Y layers the shave can write; narrowing that needs
+the CPU to know the live level, which is exactly what M2 moved onto the GPU.
+
+**`sim.waterBodyMode` is still 0 by default, so the pinned world hash does not
+move at M3 either.** Every row's condition is false at mode 0, no op block is
+reserved, and `T.waterBodyCount` 0 makes component 7's loop a zero-trip.
+
+### 5b.6 What is NOT here
+
+The current field and surface waves (M4), and dug-basin discovery (M5).
+`sim.waterBodyTestDrain` survives from M2 as a development tap of a known size in
+eighths per tick, 0 in every shipped world — it exists so the ledger and the shave
+could be proved exact before there was a hole to be exact about, and pass A still
+uses it for the one identity that closes at +0.
+
+M3's own gaps: ONE hole per body (the descriptor has room for a list; the ledger
+carries the deepest), no re-audit of an adopted body whose voxels changed under
+it, no wall holes with lateral jets (the exit velocity is straight down), and the
+hot-window footprint declaration above.
 
 Two gate passes are absent and deliberately so: **B** (split scheduling) needs
 component 10's union-find sweep, and **F** (determinism mid-drain) needs a second

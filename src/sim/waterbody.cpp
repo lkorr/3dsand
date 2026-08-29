@@ -170,10 +170,12 @@ void WaterBodySystem::Reset() {
   builtSeed_ = 0;
   straddles_ = 0;
   outOfWindow_ = 0;
+  drainHotUntil_ = 0;
   gpu_.bodies.clear();
   gpu_.chunks.clear();
   gpu_.bodyCount = 0;
   gpu_.writesThisTick = false;
+  gpu_.drainArmed = false;
 }
 
 void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
@@ -458,11 +460,12 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
 // PageTable::UpdateSpawnRing is: a carried set is a set that can be stale, and
 // a stale entry here is a shave aimed at a chunk the page table was never told
 // about. Everything it reads is a pure function of the tick.
-void WaterBodySystem::BuildGpu(int testDrain) {
+void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
   gpu_.bodies.assign(kWaterBodyScalars, 0);
   gpu_.chunks.clear();
   gpu_.bodyCount = 0;
   gpu_.writesThisTick = false;
+  gpu_.drainArmed = false;
 
   // Slot order, not registry order: the GPU indexes by slot and the ledger it
   // carries belongs to whatever body held that slot last tick.
@@ -508,12 +511,36 @@ void WaterBodySystem::BuildGpu(int testDrain) {
   // still lake declares no op targets, materializes no pages and wakes no
   // chunks, so `--gate waterbody` pass E is a property of the design and not of
   // a threshold.
-  gpu_.writesThisTick = testDrain > 0 && !gpu_.chunks.empty();
+  // M3 replaces "is the test tap open" with "is the test tap open OR could a
+  // real hole be draining", and the second half is the mutation latch above:
+  // holes appear when someone digs, digging is a mutation op, and a mutation op
+  // is on the tick input stream. Still exact in the direction that matters —
+  // with no drain and no edit this is false, so a still lake declares no op
+  // targets, materializes no pages and wakes no chunks.
+  gpu_.drainArmed = drainMax > 0 && tick < drainHotUntil_ &&
+                    !gpu_.chunks.empty();
+  // THE FOOTPRINT OUTLIVES THE ARM, by a grace window, and that is not
+  // belt-and-braces. When the hot window expires the ledger stops GRANTING (the
+  // op block is gone, so `b < T.waterDrainBodies` refuses), but it can still be
+  // carrying up to one tick's emission as an outstanding debit — and the shave
+  // pays that off over the ticks AFTER the arm dropped. A shave whose chunks are
+  // no longer declared writes into a JITTER sentinel, which is a lost eighth
+  // reported as a page fault. 64 ticks is two orders more than a <=512-eighth
+  // debit needs against a 14,493-cell surface.
+  gpu_.writesThisTick =
+      (testDrain > 0 && !gpu_.chunks.empty()) || gpu_.drainArmed ||
+      (drainMax > 0 && tick < drainHotUntil_ + kWaterDrainSettleTicks &&
+       !gpu_.chunks.empty());
 }
 
 void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
-                           int mode, int testDrain) {
+                           int mode, int testDrain, int drainMax,
+                           bool worldEdited) {
   mode_ = mode;
+  // The hot latch (see waterbody.h). Set from the tick input stream only, so a
+  // replay reproduces it and the twice-run determinism gate compares it.
+  if (mode != 0 && drainMax > 0 && worldEdited)
+    drainHotUntil_ = tick + kWaterDrainHotTicks;
   if (mode == 0) {
     // THE OFF SWITCH, and it is an early-out rather than a flag consulted
     // later. Nothing is built, nothing is labelled, nothing is classified — so
@@ -525,6 +552,7 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     gpu_.chunks.clear();
     gpu_.bodyCount = 0;
     gpu_.writesThisTick = false;
+    gpu_.drainArmed = false;
     return;
   }
   if (chunkBody_.size() != kNumChunks) chunkBody_.assign(kNumChunks, 0u);
@@ -563,7 +591,7 @@ void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
     }
   }
   Classify(world, tick);
-  BuildGpu(testDrain);
+  BuildGpu(tick, testDrain, drainMax);
 }
 
 uint32_t WaterBodySystem::ProposedCount() const {

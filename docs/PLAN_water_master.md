@@ -291,6 +291,261 @@ a real shave on a real adopted body, which is the thing §9 is about.
   comparison belongs to M3, against the §1 baseline table.
 
 
+### 1.3 M3 — LANDED 2026-08-29
+
+Components 6 (the discharge law) and 7 (local excite at the throat), plus
+`--gate waterbody` pass H, plus the `--fluid-bench` `-wb<0|1>` arm and the `wp5c`
+sweep. `assets/shaders/sim_waterbody.wgsl` (+2 entry points: `wbDrain`,
+`wbHole`), `sim_fluid_seam.wgsl` (excite trigger (e), `FA_SPAWNDEAD`),
+`common.wgsl` (the ledger word map moved here — a second module reads it now),
+2 new `PT_TICK` rows, `waterBodyState` widened 16 → 24 words, `fluidSpawnOps`
+bound read_write at simBGL_ 25 and `waterBodyState` added to the SLIM group.
+DESIGN.md §5b.5. Four knobs: `sim.drainMaxEighthsPerTick`,
+`sim.drainExciteRadius` (integer lane), `sim.drainCd`, `sim.drainGravity`
+(human-unit float lane, const-eval'd).
+
+**Hash: UNMOVED, and that is a correction to §6's milestone table.** That table
+says M3 "Moves — its own commit, `--rebaseline`". It does not, and the reason is
+structural rather than lucky: §8 fixes `sim.waterBodyMode` at **0** and calls
+mode 0 bit-identical to today, so at the shipping default no water-body row is
+recorded, no op block is reserved, and component 7's body loop is a zero-trip.
+The rebaseline path was exercised end to end anyway and had nothing to write.
+
+```
+--gate waterbody D    ->  af008434 / af008434 / af008434   (mode 0 / 1 / 0)
+--selftest            ->  fluid-react + mob-burn, the SAME two the main
+                          checkout's own binary reports; determinism green
+--suite acceptance    ->  fluid-react + page-roundtrip + mob-burn, the SAME
+                          three the main checkout reports under the same flag
+--vk-smoke-loud       ->  2/19 pinned probes match, and EVERY hash is
+                          byte-identical to what the main checkout's binary
+                          produces on the same command
+```
+
+That last line is the load-bearing one and it is worth reading twice. The smoke's
+pinned table is STALE on main — 17 of its 19 probes already disagree there — so
+"the smoke fails" carries no information on its own. What does carry information
+is that this tree's 19 hashes equal main's 19 hashes exactly, which is the
+strongest available statement that M3 changes no world content. The same is true
+of `page-roundtrip`: it passes standalone AND with `terrain`/`waterbody`/
+`streaming` in front of it, and it fails under `--suite acceptance` on the main
+checkout too. Three failures, three controls, none of them M3's.
+
+#### The drain is a hole now, and it conserves
+
+`--gate waterbody` pass H punches a 7×7 shaft through the authored lake's floor
+into a sealed 29×29×18 chamber — the same puncture `--fluid-bench wp5` uses —
+and lets the discharge law drain it for 90 ticks, then settles for 90 more. The
+identity is **not** pass A's, and the difference is the milestone: pass A's sum
+is about the LAKE and closes at exactly +0 because only the shave and the tap
+move anything. Here the water does not leave the world, it leaves the lake, and
+some of it is in flight:
+
+```
+boxVoxelEighths(t) + inFlightMpm(t) - debit(t)  ==  boxVoxelEighths(0)
+```
+
+| arm | drained | residual | in flight | shell | `capped` |
+|---|---|---|---|---|---|
+| **H1** excite + splash OFF | **35,381 eighths** | **−37 (0.10%)** | 40,342 | — | **0** |
+| **H2** shipped (shell r6) | 26,476 eighths | −305 | 31,890 | 14,468 cells | **0** |
+
+`capped` 0 in both arms is the load-bearing number: the shave was never short, so
+the ledger debited what it GRANTED every tick and the residual is entirely
+downstream of the ledger — a churning MPM pool where the CA's thin-film handling,
+the sun/water evaporation rule and the always-on wake trigger all act on water
+this system no longer owns. The bound in `tests/baseline.json` is an assertion
+that the discharge is not a PUMP, not a claim that a churning pool is lossless.
+
+Other numbers from the same single invocation: **0 page faults** across both
+drains, `WBS_JETV` = 262144 Q16.16 = **4.0 cells/tick, exactly `FLUID_VMAX`**
+(the head cap working — see below), pass A still **+0 eighths** over 869,580
+drained, pass E still **0 awake chunks**, pass C still **0 state flips**.
+
+#### §9's ranked-first risk, REOPENED — and this time it is real
+
+M2 measured the surface shave producing **0** excite candidates against 10.9 M
+cells inspected, and the reasoning held: the shave removes from the TOP so it
+creates no air-below. A real jet at a real throat is a different question and the
+answer is different. Over the 90 draining ticks of pass H's H2 arm, at the
+shipped `sim.fluidExciteMode` 1:
+
+```
+exciteDetect LOOKED AT   5,897,839 settled liquid cells   (~65,500/tick)
+excite CANDIDATES           51,346                        (570.5/tick)
+```
+
+Both halves reported, for M2's reason: a bare 0 is unattributable and `seen` is
+what separates "the mechanism is not there" from "the detector never ran". Here
+`seen` says the detector ran hard and **the mechanism IS there** — 570.5/tick is
+the same order as WP5's own 169,616 over 400 ticks (424/tick) on `worldlake`.
+
+It is BOUNDED rather than absent, and that is the whole answer: the standing size
+is held by `sim.fluidExciteCeiling` (8,000) and the ramp by
+`sim.fluidExciteRate`, and refusal is graceful because refused water is still
+settled water and the CA moves settled water. The gate carries a 3,000/tick bound
+(~5× measured) so a regression into an unbounded burst fails while the normal
+case does not.
+
+#### Component 7's shell, measured — plan §9 item 2 was UNMEASURED
+
+The plan's own words: *"The stated mitigation is unmeasured: excite a SHELL —
+the surface annulus plus the throat column — rather than a solid ball. Measure
+the shell before committing to the ball."* Measured, at `sim.drainExciteRadius`
+6:
+
+| | cells converted | note |
+|---|---|---|
+| shell (annulus + throat), cumulative over 90 ticks | **14,468** | 161/tick |
+| solid ball at r ≈ 25 (the plan's own figure) | ~33,000 | **at once**, against a ~40,000 envelope |
+
+The two numbers are not the same kind: 14,468 is FLOW through the seam over 90
+ticks, ~33,000 is a STANDING population. The standing size here is whatever
+`sim.fluidExciteCeiling` allows (8,000), and the ceiling was never the binding
+constraint in this scene. The shell is affordable; the ball is not, and the
+`waterbodyShellCellMax` bound is what stops a radius change from quietly
+reintroducing it.
+
+#### Four things worth not undoing
+
+1. **The hole predicate is the WATER/VOID INTERFACE, not "a void under the
+   lake".** The first version took any air cell with air below and found the
+   FLOOR OF THE CAVERN the shaft opened into — A = 473 for a 5×5 shaft, because
+   the chamber under it was 25 cells across. `A` is then not an orifice at all
+   and `Q = Cd·A·√(2gh)` is an arbitrary rate. Pass H caught it as a −66,773
+   eighth failure; the corrected predicate (a cell holding the body's liquid
+   whose cell below is air) took the same fixture to −37. The right set is empty
+   in an intact basin by construction, is exactly the shaft mouth when someone
+   bores through, and TRACKS the mouth down as the shaft empties — which is the
+   head growing, which is what Torricelli is about.
+
+2. **The head cap is what keeps the single-evaluation rule true.** §6's first
+   trap is that `spawnAppend` clamps to `FLUID_VMAX`, so the momentum asked for
+   is not the momentum granted. Capping `h` at `vmax²/2g` BEFORE computing Q
+   makes them equal by construction, and the measurement confirms it: the jet
+   leaves at exactly `FLUID_VMAX`, never clamped.
+
+3. **The CPU reserves the op block; the GPU fills it.** `spawnAppend` reads a
+   CPU-sized stream and the discharge cannot size itself, because `h` is derived
+   from a level the GPU owns. So rule 2's "charge the budget before emission"
+   stays on the CPU (a fixed block per proposed body) and the ledger REFUSES the
+   discharge to any body without one. Every slot in the block is written every
+   tick — live while flowing, dead (`mat` 0) after — because a skipped slot keeps
+   a stale particle that compaction counts as live. `FA_SPAWNDEAD` counts the
+   dead tail so a conservation gate can subtract it from `FA_LIVE`.
+
+4. **The reservation ARMS on a mutation that touched a LABELLED chunk, and
+   disarms.** Arming on any mutation anywhere kept the op block permanently
+   reserved, which keeps `fluidSpawnCount` non-zero, which keeps the entire
+   fluid pipeline recorded on ticks nothing is happening — measured on the bench
+   at 5.10 → 7.02 ms p50 for a lake with no hole in it, with the scene's idle
+   window going from 68 ticks to 0. The FOOTPRINT declaration outlives the arm
+   by `kWaterDrainSettleTicks` (64), because the ledger can be carrying up to one
+   tick's granted emission as a debit when the window closes and a shave into an
+   undeclared chunk is a lost eighth reported as a page fault.
+
+5. **`SubmitWorldgen` now resets the ledger, on both sides.** A descriptor is a
+   description of a world (the `InvalidateSnapshot` argument), and the ledger is
+   GPU-CARRIED state: a fresh worldgen refills the lake to its authored height
+   while a surviving record goes on shaving at the old level against a hole that
+   was filled in. Pass H found this immediately because it rebuilds the world
+   between its two arms.
+
+#### The bench numbers, against §1's baseline table
+
+`sim.waterBodyMode` is 0 in the shipped world and therefore 0 in `wp5`/`wp5b`, so
+those two sweeps measure that M3 did NOT move the shipped configuration — which
+is a claim worth making and is not the throughput claim. The throughput claim
+needs the feature ON, so the bench gained a `-wb<0|1>` run suffix (joining
+`-ceil<N>`, `-perch<0|1>`, `-ex<0|1>`) and a `wp5c` sweep that pairs each scene's
+CA-only reference with its water-body arm in ONE invocation:
+
+```bash
+bash scripts/run.sh ./build/Release/sandvox.exe --fluid-bench wp5c
+```
+
+**And the honest answer is that the harness cannot make the claim, for two
+reasons neither of which is M3.** This is written out rather than summarised
+because §1 says *"These are your before/after harness. Do not build new ones."*
+and the next agent will read that sentence too.
+
+| scene | arm | frame p50 | p95 | p99 | drained (eighths) | idle ticks before plug |
+|---|---|---|---|---|---|---|
+| pond68 | `-ex0` (CA alone) | **5.24** | 6.54 | 7.55 | **6,320** | 68 |
+| pond68 | `-ex0-wb1` (water bodies ON) | **5.26** | 6.93 | 8.79 | **6,320** | 68 |
+| worldlake | `-ex0` | 2.19 | 6.22 | 8.72 | 0 | 59 |
+| worldlake | `-ex0-wb1` | 2.18 | 6.94 | 8.51 | 0 | 59 |
+| worldlake | `-perch1-wb1` | 2.18 | 7.16 | 8.98 | 0 | 59 |
+
+**1. `worldlake` builds NO WATER on this tree, and it is not M3's doing.** Every
+arm reports `plug pulled: 0 eighths standing (0 water voxels)`. Verified against
+the main checkout's own binary at `7709408`, which reports the same thing:
+
+```bash
+# from the main checkout, not this worktree
+bash scripts/run.sh ./build/Release/sandvox.exe --fluid-bench worldlake-ex0
+  -> [t60] plug pulled: 0 eighths standing (0 water voxels)
+```
+
+So the three `worldlake` rows of §1's baseline table are currently
+unreproducible by anyone, and finding out why belongs to whoever owns the lab
+scene (the authored lake is at (420,420); the terrain overhaul moved a great
+deal underneath that number). **§1's `pond68` rows still reproduce:** the CA-only
+arm drains **6,320 eighths**, exactly the figure in the table. Its `p50` does
+not — 5.24 against the table's 10.28 — because the tree has roughly halved frame
+cost since WP5 measured it. A stale `p50` in that table is a fact worth carrying
+forward.
+
+**2. The lab's `pond68` is not a body this system can adopt.** It is a SCRIPTED
+disc built out of `CellOp`s on the flat lab slab (`SceneMatAt`, `kLabPond`),
+while the registry knows exactly two kinds of basin: the three authored pools
+and `pondAt`'s tarns. So the lake in that scene is never labelled, never
+proposed, never adopted, and the `-wb1` arm drains **the same 6,320 eighths by
+the same CA**. The two `pond68` rows above are therefore an A/A, and what they
+measure is the one thing they CAN measure honestly:
+
+> **Turning the feature on costs +0.02 ms p50 (5.24 → 5.26) on a scene it does
+> not govern, and the scene still reports its full 68 idle ticks before the
+> plug.** Cost scales with activity, not with the world containing a lake.
+
+That second clause was NOT free and is worth recording. The first version armed
+the discharge's spawn-op reservation on ANY world mutation, which a lab scene
+that builds itself out of cell ops satisfies on every tick of its build — so the
+block stayed reserved, `fluidSpawnCount` stayed non-zero, the whole fluid
+pipeline stayed recorded, and the same A/A measured **5.10 → 7.02 ms p50** with
+`0 idle ticks first` instead of 68. The fix is to arm only on a mutation that
+touched a chunk the system LABELLED. That is rule 2 exactly, and the bench is
+what caught it.
+
+**What would make the claim measurable.** The `-wb<0|1>` run suffix now exists
+and works (it is what produced the rows above), so the missing piece is a bench
+scene whose lake the registry adopts. The cheapest route is to repair
+`worldlake` — it uses the real worldgen against authored pool 0, which is the
+same basin `--gate waterbody` adopts and drains. Until then, **pass H is the
+throughput measurement**: 35,381 eighths through a real 7×7 orifice in 90 ticks
+(393/tick sustained, against the CA-only `pond68` arm's 6,320 over 400 ticks =
+15.8/tick), at 0 page faults and −37 eighths of residual.
+
+#### What M3 did NOT do
+
+* **One hole per body.** The descriptor has room for a list; the ledger carries
+  the DEEPEST candidate (greatest head) and treats the rest as part of the same
+  orifice through the area count. Two genuinely separate holes in one lake drain
+  as one.
+* **No lateral jets.** The exit velocity is straight down. A hole in a wall is
+  detected (the predicate is about the cell below, and a wall hole's water does
+  have air under it) but its jet leaves vertically.
+* **No re-audit of an adopted body.** M2 named this and M3 did not close it: a
+  body whose voxels change underneath it carries a stale `volume`, which bounds
+  the discharge through `held = VOLUME - DRAINED`.
+* **The hot-window footprint is the whole footprint.** Any world mutation opens a
+  900-tick window in which a governed body declares all of its chunks as page-
+  table op targets, rather than the two Y layers the shave can write. Narrowing
+  it needs the CPU to know the live level, which is exactly what M2 moved onto
+  the GPU. Idle cost outside the window is still exactly zero.
+* **Gate passes B and F are still absent**, for §7's unchanged reasons.
+
+
 ---
 
 ## 2. The substrate that already exists
@@ -1017,7 +1272,7 @@ LOOK CHAIN    8 (stream arm + evaluator) ──► 9 ──► 8 (drain seeders,
 |---|---|---|---|
 | **M1 — skeleton** ✅ **LANDED 2026-08-28** | 1, **2's analytic half**, 5's structure, the gate, the off switch | Nothing behavioural. Descriptor recomputes to +0.00% on both container kinds; off switch bit-identical. See §1.1. | **Identical**, measured: `--sweep sim.waterBodyMode=0,1` → one hash |
 | **M2 — the drain works** ✅ **LANDED 2026-08-29** | 3, 4, the GPU reduce, and the quiescence fix of §1.1 correction 2 | A lake drains by arithmetic, driven by the `sim.waterBodyTestDrain` tap. Conservation exact at **+0 eighths** over 869,580 drained; the shave produces **0 excite candidates** against 10.9 M cells inspected. See §1.2. | **Identical**, measured: mode 0 / mode 1 / mode 0 all `af008434` |
-| **M3 — it is a feature** | 6, 7 | Real holes, real jets, real throat. Quote `--fluid-bench wp5`/`wp5b` against the §1 baseline. | Moves — its own commit, `--rebaseline` |
+| **M3 — it is a feature** ✅ **LANDED 2026-08-29** | 6, 7 | A hole is a real orifice: Q = Cd·A·√(2gh), one evaluation of h feeding both the jet and the debit, MPM out of the throat. 35,381 eighths through a real hole at −37 residual; the shell is 14,468 cells against the ball’s ~33,000. See §1.3. | **Does NOT move** — `sim.waterBodyMode` is 0 by default and §8 requires mode 0 to be bit-identical, so no row is recorded. This row was wrong. |
 | **M4 — it looks alive** | 8 (full), 9 | Current, vortices, flowing surface, foam. | 9 must not move it; 8's sim arm will |
 | **M5 — completeness** | 10, 2's sweep | Player-dug basins participate. | Moves |
 

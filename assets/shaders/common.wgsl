@@ -433,7 +433,19 @@ struct TickParams {
   waterTestDrain  : i32,   // eighths/tick/body, TEST-ONLY source (M2)
   waterQuietTicks : i32,   // sim.waterBodyQuietTicks
   waterMinVolume  : i32,   // sim.waterBodyMinVolume, EIGHTHS
+  // M3 (components 6 + 7). The discharge emits through the CPU-sized
+  // spawnAppend stream, so the CPU reserves a contiguous op block per body and
+  // wbDrain fills it; `waterDrainMax` is the per-hole per-tick bound (rule 2)
+  // and `waterExciteRadius` is component 7's v1 radius, 0 = no shell.
+  waterDrainSpawnBase : u32,
+  waterDrainBodies    : u32,
+  waterDrainMax       : i32,
+  waterExciteRadius   : i32,
   padWb0 : u32,            // see the alignment arithmetic in world.h
+  padWb1 : u32,
+  padWb2 : u32,
+  padWb3 : u32,
+  padWb4 : u32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
   // windPrims' 96: this file and world.h are compared on TOTAL SIZE by
   // scripts/check_invariants.py, so a cap changed on one side and not the other
@@ -442,6 +454,110 @@ struct TickParams {
   // WATER_CHUNK_CAP entries, four to a std140 row.
   waterChunks : array<vec4<u32>, 128>,
 };
+
+// ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------
+//
+// Must match kWaterBodyStateWords in src/sim/world.h and the WBS_* reader in
+// src/test/selftest_water.cpp. It lives HERE rather than in sim_waterbody.wgsl
+// because from M3 a second module reads it: sim_fluid_seam.wgsl's exciteDetect
+// asks whether a settled cell is inside a draining hole's excite SHELL
+// (component 7), and a word map transcribed into two shaders is a
+// two-places-must-agree bug with nothing checking it.
+//
+// Twenty-four words is more than the state needs, and that is deliberate: plan
+// §7 asks for attribution words BEFORE they are needed, because "conservation
+// failed by 37" with nothing attached is the bare count CLAUDE.md rule 6 says
+// costs a dozen elimination runs to un-ask.
+const WBS_STATE     : u32 = 0u;   // WB_* below
+const WBS_LEVEL     : u32 = 1u;   // world Y of the free surface
+const WBS_AREA      : u32 = 2u;   // surface cells the ledger paces against
+const WBS_DEBIT     : u32 = 3u;   // eighths owed but not yet off the voxels
+const WBS_SHAVED    : u32 = 4u;   // what LAST tick's shave actually removed
+const WBS_SEEN      : u32 = 5u;   // free-surface cells that shave saw
+const WBS_ATLEVEL   : u32 = 6u;   // of those, how many sat at exactly LEVEL
+const WBS_STEPS     : u32 = 7u;   // published: whole eighths per surface cell
+const WBS_FRAC      : u32 = 8u;   // published: dither numerator, in [0, area)
+const WBS_DRAINED   : u32 = 9u;   // cumulative eighths that left forever
+const WBS_VOLUME    : u32 = 10u;  // the reduce's voxel-eighth sum at adoption
+const WBS_QUIET     : u32 = 11u;  // consecutive undisturbed ticks
+const WBS_RSUM      : u32 = 12u;  // reduce scratch: running eighth sum
+const WBS_RDIRTY    : u32 = 13u;  // quiescence scratch: disturbed chunks
+const WBS_CAPPED    : u32 = 14u;  // attribution: eighths the cells did not have
+const WBS_ADOPTTICK : u32 = 15u;  // attribution: the tick adoption happened on
+// ---- M3: the hole record (component 6) ------------------------------------
+// Two copies of the hole, CURRENT and NEXT, because plan section 3.3 is not
+// optional: the scan that finds a hole must not be the pass that spends it.
+// wbHole accumulates into the *N words this tick; the ledger promotes them next
+// tick.
+const WBS_HOLEKEY   : u32 = 16u;  // packed hole cell in use (WB_HOLE_NONE = none)
+const WBS_HOLEAREA  : u32 = 17u;  // orifice A: cells at the hole's own level
+const WBS_HOLEKEYN  : u32 = 18u;  // this tick's scan, atomicMin target
+const WBS_HOLEAREAN : u32 = 19u;  // this tick's scan, count at WBS_HOLEKEY's y
+// TICKS THE HOLE SURVIVES WITHOUT BEING RE-SEEN. A hole is found on the
+// chunk-dirty path (holes appear when someone digs), and a hole that is
+// actively draining keeps its own chunk hot — the jet's MPM block and the CA
+// re-levelling above it both report. So this is what makes a PLUGGED hole stop
+// draining rather than a timer the drain depends on, and it is what bounds the
+// process (rule 2): nothing can keep emitting into a world gone quiet around it.
+const WBS_HOLETTL   : u32 = 20u;
+// PUBLISHED BY THE LEDGER, CONSUMED BY wbDrain. `emit` is the eighths granted
+// this tick after every cap; `jetv` is the exit speed from the SAME evaluation
+// of h. One evaluation, two consumers — that is plan section 6's whole rule,
+// and the reason these are ledger words rather than two recomputations.
+const WBS_EMIT      : u32 = 21u;
+const WBS_JETV      : u32 = 22u;  // Q16.16 cells/tick, downward
+// COMPONENT 7's measurement, cumulative while the body stays adopted: cells the
+// drain shell handed to the solver. Plan section 9 item 2 ranks the shell's
+// particle budget as the second-most-likely way this work fails and calls the
+// mitigation UNMEASURED — this word is the measurement, and it is cumulative
+// rather than per-tick so a gate reading it once still sees the whole window.
+const WBS_EXSHELL   : u32 = 23u;
+
+// The ladder, GPU side. Candidate -> Measuring -> Adopted, and Releasing is the
+// way out. Measuring is its own state rather than a flag because the reduce is
+// a WHOLE-FOOTPRINT pass and must run exactly once per adoption: a body that
+// re-measured every tick would be the O(volume)-per-tick cost this design
+// exists to delete.
+const WB_CANDIDATE : i32 = 0;
+const WB_MEASURING : i32 = 1;
+const WB_ADOPTED   : i32 = 2;
+const WB_RELEASING : i32 = 3;
+
+// CPU-sent per-body flags (TickParams.waterBodies row 1, word 3).
+const WBF_PROPOSE : i32 = 1;   // the CPU's deterministic tests all passed
+const WBF_RELEASE : i32 = 2;   // an EXIT test failed; hand this body back
+
+// "No hole." atomicMin's identity, and deliberately i32-positive so the packed
+// key ordering below is a plain integer compare.
+const WB_HOLE_NONE : i32 = 0x7FFFFFFF;
+// How many ticks a hole outlives its last sighting. 8 is a quarter second:
+// long enough that a tick where the throat chunk happened to go clean does not
+// stutter the jet, short enough that plugging a hole stops the drain visibly.
+const WB_HOLE_TTL : i32 = 8;
+// The hole key packs (y, x, z) so that a plain atomicMin picks the LOWEST cell
+// — the deepest escape point, i.e. the greatest head — and, among cells at that
+// depth, one specific winner by position. Order-independent and therefore
+// legal: integer min is associative and commutative, so which thread arrives
+// first cannot change the answer (the atomicCAS ban is about the other kind).
+//
+//   bits 22..30  y - floorY + WB_HOLE_YBIAS, 0..511
+//   bits 11..21  x - cx + 1024, 0..2047
+//   bits  0..10  z - cz + 1024, 0..2047
+//
+// The bias lets a hole be cut BELOW the analytic basin floor (a shaft driven
+// under a lake is exactly that) without the key going negative.
+const WB_HOLE_YBIAS : i32 = 8;
+fn wbHoleKey(dy : i32, dx : i32, dz : i32) -> i32 {
+  let y = clamp(dy + WB_HOLE_YBIAS, 0, 511);
+  let x = clamp(dx + 1024, 0, 2047);
+  let z = clamp(dz + 1024, 0, 2047);
+  return (y << 22u) | (x << 11u) | z;
+}
+fn wbHoleY(key : i32, floorY : i32) -> i32 {
+  return floorY + ((key >> 22u) & 511) - WB_HOLE_YBIAS;
+}
+fn wbHoleX(key : i32, cx : i32) -> i32 { return cx + ((key >> 11u) & 2047) - 1024; }
+fn wbHoleZ(key : i32, cz : i32) -> i32 { return cz + (key & 2047) - 1024; }
 
 // Must match kWindScaleOne / kWindScaleMax in src/sim/world.h.
 const WINDQ_SCALE_ONE : i32 = 256;
@@ -1865,6 +1981,13 @@ const FA_SETUNSTABLE : u32 = 26u;
 // FA_REFUSED then covers the third case, the budget.
 const FA_EXSEEN    : u32 = 27u;
 const FA_EXCANDID  : u32 = 28u;
+// DEAD SPAWN OPS this tick. The water-body discharge (M3, component 6) fills a
+// CPU-RESERVED op block, and every slot in the block is written every tick —
+// live while the hole is flowing, dead (mat 0) after it. A dead op still
+// occupies a pool slot for one tick, so FA_LIVE counts it; this is what lets a
+// conservation gate subtract it and read the real in-flight mass. Without it
+// the only honest number would need a full pool scan.
+const FA_SPAWNDEAD : u32 = 29u;
 // Byte offsets of the two arg triples are what pass_table.def's copy rows use;
 // keep the three in step (76 = 19*4, 88 = 22*4).
 const FA_ARGS_COMPACT : u32 = 19u;

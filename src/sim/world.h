@@ -848,7 +848,26 @@ constexpr uint32_t kWaterChunkCap = 512;
 // removed live here and not on the CPU, because the only honest source for
 // "what was shaved" is a GPU atomic and reading it back would put fence
 // retirement — i.e. scheduling — inside a voxel write's control path (rule 1).
-constexpr uint32_t kWaterBodyStateWords = 16;
+// M3 widened it from 16 to 24: the hole record (component 6) and the drain's
+// published emission are ledger state for the same reason the debit is — they
+// are derived from a level the GPU owns, and the discharge law's single
+// evaluation of `h` has to reach the op writer without a round trip through the
+// CPU. The four attribution words plan §7 asked for BEFORE they were needed are
+// still there and are still spare.
+constexpr uint32_t kWaterBodyStateWords = 24;
+// DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
+// existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
+// RESERVES a contiguous block per body it proposes and the GPU fills it. This
+// is the rule-2 bound on the jet: a hole can never emit more than this many
+// eighths in one tick whatever the head, `sim.drainMaxEighthsPerTick` clamps
+// against it, and the ledger debits by what was ACTUALLY written into the block
+// (discipline 3.2) rather than by the analytic Q.
+//
+// 512 eighths/tick is 64 voxels/tick, ~2.9x the CA-only baseline's 177
+// eighths/tick on `worldlake` (PLAN_water_master.md §1) — enough headroom for
+// the milestone's throughput claim, and 16 KiB of upload per body per tick,
+// which is inside the <1 MB/tick CPU->GPU budget with three orders to spare.
+constexpr uint32_t kWaterDrainOpsPerBody = 512;
 // Largest radius / axial reach a primitive may declare, world cells (51 m).
 // Load-bearing twice: it bounds the footprint the wake budget is spent on, and
 // it bounds every intermediate in the integer field evaluation (see the
@@ -1036,13 +1055,39 @@ struct TickParams {
   // (the windMode precedent).
   int32_t waterQuietTicks = 0;    // sim.waterBodyQuietTicks
   int32_t waterMinVolume = 0;     // sim.waterBodyMinVolume, EIGHTHS
-  // ONE pad word, and the count is arithmetic rather than taste: `windWake`
+  // ---- M3: the discharge law (component 6) and the local excite (7) --------
+  //
+  // THE OP-BLOCK RESERVATION. `spawnAppend` reads a CPU-sized stream, so the
+  // discharge cannot allocate its own slots: the CPU reserves
+  // `waterDrainBodies * kWaterDrainOpsPerBody` ops starting at
+  // `waterDrainSpawnBase` (immediately after this tick's real CPU pours) and
+  // sim_waterbody.wgsl's wbDrain fills every one of them — with a live op while
+  // the discharge lasts and a DEAD op (mat 0) after it, because a slot the pass
+  // skipped would still be counted live and would hold whatever two ticks ago
+  // left there. Both numbers are pure functions of (seed, window, tuning), so
+  // they ride the tick stream like every other water field.
+  uint32_t waterDrainSpawnBase = 0;
+  uint32_t waterDrainBodies = 0;
+  // sim.drainMaxEighthsPerTick — the per-hole per-tick emission bound (rule 2,
+  // and plan §6's second named trap). Clamped to kWaterDrainOpsPerBody CPU-side
+  // so the ledger can never publish an emission the op block cannot hold.
+  int32_t waterDrainMax = 0;
+  // sim.drainExciteRadius — component 7's v1 knob, world cells. 0 disables the
+  // shell entirely and is an exact identity (no cell can satisfy the trigger).
+  int32_t waterExciteRadius = 0;
+  // FIVE pad words, and the count is arithmetic rather than taste: `windWake`
   // ends 16-byte aligned, `vizActive` puts us 4 B past that, and std140 will
   // align `waterBodies` (an array of vec4) to 16. So the header between them
-  // must be 4 + 7*4 = 32 B or the two structs disagree in SIZE, which is the
-  // one thing check_invariants.py compares — see vizActive's own note above for
-  // what that failure looked like the last time.
+  // must be 4 + 15*4 = 64 B or the two structs disagree — and they disagree
+  // SILENTLY, because C++ packs an int32_t array at 4-byte alignment while the
+  // shader's std140 rounds up to the next vec4, which slides every descriptor
+  // by two scalars. check_invariants.py compares the shapes and is the only
+  // thing that catches it; see vizActive's own note above for the last time.
   uint32_t padWb0 = 0;
+  uint32_t padWb1 = 0;
+  uint32_t padWb2 = 0;
+  uint32_t padWb3 = 0;
+  uint32_t padWb4 = 0;
   // kWaterBodyCap bodies x kWaterBodyWords i32 words, declared WGSL-side as
   // array<vec4<i32>, 128> — the same bytes, since std140 strides a uniform
   // array to 16 B. sim_waterbody.wgsl's wbGeom/wbSeed are the only decoders.

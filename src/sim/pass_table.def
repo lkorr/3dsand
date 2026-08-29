@@ -240,6 +240,20 @@ PASS(waterQuiet, "waterBody", PT_TICK, PIPE_WATER_QUIET, K_COMPUTE, D_WATERCHUNK
 // body rather than an out-of-bounds atomic.
 PASS(waterLedger, "waterBody", PT_TICK, PIPE_WATER_LEDGER, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
      USES(U(TickUBO) A(WaterBodyState)))
+// ---- M3: THE DISCHARGE, EMITTED (component 6) ---------------------------
+// One thread per RESERVED spawn-op slot, filling the block the CPU charged
+// before the command buffer existed. W(FluidSpawnOps) is the row that matters:
+// this is the ONLY GPU writer of that buffer, `seam_spawn` in PT_FLUIDSEAM is
+// the reader, and PT_FLUIDSEAM is recorded after PT_TICK — so the barrier
+// between the two is derived rather than assumed. Omit the W and the jet is a
+// race whose symptom is missing water on some drivers and not others.
+//
+// It reads nothing of the world: the head, the discharge and the exit speed
+// were evaluated ONCE in the ledger row above and published into
+// waterBodyState (plan §6's single-evaluation rule). There is no second rule
+// here to disagree with the first.
+PASS(waterDrain, "waterBody", PT_TICK, PIPE_WATER_DRAIN, K_COMPUTE, D_WATERDRAIN,1,1, GRP_SIM, DYN_ZERO, C_WATERDRAIN, 1,
+     USES(U(TickUBO) A(WaterBodyState) W(FluidSpawnOps)))
 // The ONE whole-footprint pass, and it runs on the single tick a body spends in
 // WB_MEASURING.
 // read-only in practice: `voxels` is read_write for the module because wbShave
@@ -255,6 +269,23 @@ PASS(waterReduce, "waterBody", PT_TICK, PIPE_WATER_REDUCE, K_COMPUTE, D_WATERCHU
 // that probe stays at zero.
 PASS(waterShave, "waterBody", PT_TICK, PIPE_WATER_SHAVE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
      USES(U(TickUBO) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)
+          A(WaterBodyState)))
+// ---- M3: HOLE DETECTION (component 6's trigger) -------------------------
+// LAST, and after the shave on purpose: it reports into the *N half of the
+// hole record and the ledger promotes that NEXT tick (plan §3.3 — never read a
+// tally in the pass that writes it), so running it here means the level it
+// tests against is the one this tick actually settled on.
+//
+// R(DirtyIn) + R(FluidBlockMap) are not incidental, they are the ENTIRE cost
+// model: this pass returns immediately on a listed chunk the CA did not mark
+// and the MPM has no block in, which is every chunk of a still lake. Holes
+// appear when someone digs, and digging dirties a chunk.
+// read-only in practice: `voxels` is read_write for the module because wbShave
+// and wbDrain write (voxels / the op stream); wbHole only asks whether a cell
+// and the cell under it are air. Declaring it a read is what keeps the CA loop
+// from taking 54 extra WAW barriers for a pass that writes nothing.
+PASS(waterHole, "waterBody", PT_TICK, PIPE_WATER_HOLE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) R(Voxels) R(DirtyIn) R(FluidBlockMap) R(PageTable)
           A(WaterBodyState)))
 
 // ---- phase 4: particles ---------------------------------------------------
@@ -634,9 +665,15 @@ PASS(seam_compact_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_SCAN, K_CO
 PASS(seam_compact_scatter, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_COMPACT_SCATTER, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(R(FluidParticlesRead) W(FluidParticlesWrite) R(FluidCompactScratch)
           A(FluidArgsStage) I(FluidPDispatchArgs)))
+// A(FluidArgsStage): M3's FA_SPAWNDEAD counter. The water-body discharge fills a
+// CPU-RESERVED op block whose tail is dead this tick, and a dead op still holds a
+// pool slot FA_LIVE counts — so the count is what lets a conservation gate read
+// the real in-flight mass without scanning the pool. A diagnostic counter, but it
+// is still an atomic into a buffer half the fluid pipeline reads, so the row
+// declares it like any other access.
 PASS(seam_spawn, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_SPAWN, K_COMPUTE, D_FLUIDSPAWN,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_FLUIDSPAWN, 1,
      USES(U(TickUBO) R(FluidSpawnOps) W(FluidParticlesWrite)
-          A(FluidExciteScratch)))
+          A(FluidExciteScratch) A(FluidArgsStage)))
 // consumeApply's bound is the SURVIVOR count compactScan just published, so
 // its args are staged here rather than with the compaction pair above.
 PASS(copy_fluidConsumeArgs, nullptr, PT_FLUIDSEAM, PIPE_NONE, K_COPY, 88,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
@@ -660,10 +697,16 @@ PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_
 // Diagnostic counters, but they are still atomics into a buffer half the fluid
 // pipeline reads, so the row declares them like any other access — an omitted
 // read here is an invisible cross-vendor hazard, not a missing statistic.
+// A(WaterBodyState): COMPONENT 7's drain shell (PLAN_water_master.md M3). The
+// trigger reads a draining hole's position, level and granted discharge out of
+// the ledger the water-body rows wrote earlier in the same tick, and adds the
+// cells it converts into WBS_EXSHELL — the measurement plan §9 item 2 calls
+// for. It is a cross-TABLE hazard (PT_TICK writes, PT_FLUIDSEAM reads), which
+// is exactly the kind an undeclared access makes invisible.
 PASS(seam_excite_detect, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_DETECT, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_CAACTIVE, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) R(DirtyList)
           R(FluidBlockMap) R(FluidGrid) A(FluidExciteScratch)
-          A(FluidArgsStage) I(DispatchArgs)))
+          A(FluidArgsStage) A(WaterBodyState) I(DispatchArgs)))
 PASS(seam_excite_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) A(FluidExciteScratch) A(FluidArgsStage)))
 // The emit dispatch is list-shaped (one workgroup per candidate slot):

@@ -84,8 +84,12 @@ struct VoxelTruth {
 // a slot's words are wherever its page is (or nowhere at all, for a sentinel —
 // which ReadVoxelsSync synthesizes). This is the fifth site named in
 // PLAN_page_table.md §2.1a and the gate has no business being the sixth.
+// `yLo`/`yHi` override the descriptor's own water AABB. Pass H needs that: the
+// conservation box for a REAL drain has to contain the shaft and the chamber
+// the jet lands in, or the water that left the lake correctly reads as a leak.
 VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
-                      uint32_t matId) {
+                      uint32_t matId, int yLoOverride = 0,
+                      int yHiOverride = -1) {
   VoxelTruth t;
   World& world = c.world;
   std::vector<uint32_t> chunk(kChunkVol);
@@ -96,7 +100,8 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
   // surface" is a question about the cell ABOVE it. Without the extra layer the
   // topmost water would be classified by reading a chunk that was never fetched
   // and every surface cell would be misjudged at once.
-  const int y0 = d.lo.y, y1 = d.hi.y;
+  const int y0 = yHiOverride >= yLoOverride ? yLoOverride : d.lo.y;
+  const int y1 = yHiOverride >= yLoOverride ? yHiOverride : d.hi.y;
   std::vector<uint8_t> full;   // per (x,z,y) of the AABB: eighths, 0 = not ours
   const int nx = d.hi.x - d.lo.x + 1;
   const int nz = d.hi.z - d.lo.z + 1;
@@ -170,7 +175,26 @@ enum : uint32_t {
   WBS_STATE = 0, WBS_LEVEL, WBS_AREA, WBS_DEBIT, WBS_SHAVED, WBS_SEEN,
   WBS_ATLEVEL, WBS_STEPS, WBS_FRAC, WBS_DRAINED, WBS_VOLUME, WBS_QUIET,
   WBS_RSUM, WBS_RDIRTY, WBS_CAPPED, WBS_ADOPTTICK,
+  // M3, components 6 + 7 (the hole record and the published discharge). The
+  // `_W` suffix is only to keep two of them from colliding with this file's
+  // own locals; the word map itself lives in common.wgsl now, because from M3
+  // the excite/settle seam reads it too.
+  WBS_HOLEKEY_W, WBS_HOLEAREA, WBS_HOLEKEYN_W, WBS_HOLEAREAN_W, WBS_HOLETTL_W,
+  WBS_EMIT, WBS_JETV, WBS_EXSHELL,
 };
+// THE PASS-H FIXTURE. A 5x5 shaft through the lake floor into a sealed
+// 25x25x16 chamber — the same puncture `--fluid-bench wp5` uses, and for the
+// same reason: a shaft on its own fills in three ticks and the hole stops
+// being a hole, which would make the pass a measurement of a puddle.
+constexpr int kShaftDepth = 6;
+constexpr int kChamberH = 18;
+constexpr int kChamberR = 14;      // half-extent, so 29x29 in plan
+constexpr int kShaftR = 3;         // half-extent, so a 7x7 orifice
+// 7x7 rather than 5x5 so the analytic Q (Cd*A*sqrt(2gh) = 0.6*49*4*8 = 941
+// eighths/tick at the capped head) EXCEEDS sim.drainMaxEighthsPerTick. Plan
+// section 6 trap 2 is about what happens when that bound binds, and a fixture
+// that never reaches it would not test the thing.
+constexpr uint32_t kDrainWindow = 90;
 enum : int32_t {
   WB_CANDIDATE = 0, WB_MEASURING = 1, WB_ADOPTED = 2, WB_RELEASING = 3,
 };
@@ -812,6 +836,246 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           (unsigned long long)quietCandid, drainTicks, candMax));
   }
 
+
+  // =========================================================== pass H (M3)
+  //
+  // THE REAL DRAIN. Components 6 and 7: a hole is punched in the lake floor,
+  // the discharge law computes Q = Cd*A*sqrt(2gh) from the head the GPU ledger
+  // owns, that ONE evaluation of `h` produces both the jet's momentum and the
+  // ledger's debit, and the water arrives in a sealed chamber as MPM particles.
+  // Everything pass A asserts about the test tap, this asserts about a feature.
+  //
+  // THE IDENTITY IS DIFFERENT, and the difference is the milestone. Pass A's
+  // sum is about the LAKE, so `drained` is a term: eighths that left the body
+  // forever. Here the water does not leave the WORLD, it leaves the lake and
+  // lands 30 voxels lower, and some of it is in flight as particles when the
+  // window closes. So the box is drawn around the lake AND the chamber, and:
+  //
+  //     boxVoxelEighths(t) + inFlightMpm(t) - debit(t)  ==  boxVoxelEighths(0)
+  //
+  // Every term is measured, none inferred. `debit` is the ledger's own
+  // legitimate divergence (eighths owed but not yet shaved) and it is the same
+  // stored field pass A uses; `inFlightMpm` is the live particle count minus
+  // the dead tail of the reserved op block (FA_SPAWNDEAD), because a particle
+  // carries exactly one eighth and a dead slot carries none.
+  //
+  // TWO ARMS, and the strict one is first. H1 turns the excite seam and the
+  // splash coupling OFF: nothing but the discharge and the shave can move an
+  // eighth, so the identity is an EQUALITY and any drift is a mass pump. H2 is
+  // the shipped configuration with component 7's shell live, where the splash
+  // coupling genuinely converts a little water into stain-carrying micro
+  // droplets the voxel sweep cannot see; that arm is bounded by a baseline
+  // number and REPORTED, exactly as M2 bounded its excite slack.
+  struct DrainArm {
+    const char* name;
+    int exciteMode;
+    int shellRadius;
+    float splash;
+    bool strict;
+  };
+  const DrainArm arms[2] = {
+      {"H1 ledger-only", 0, 0, 0.0f, true},
+      {"H2 shipped", t.sim.fluidExciteMode, t.sim.drainExciteRadius,
+       t.sim.fluidSplashRate, false},
+  };
+  // BY VALUE. `lake` and `desc` point into WaterBodySystem's own vectors, and
+  // this pass calls Reset() between arms — a descriptor is a description of a
+  // world, and the world is rebuilt here. Holding the pointers across that is a
+  // use-after-free whose symptom would be a plausible-looking wrong basin.
+  const WaterBasin lakeGeo = *lake;
+  const WaterBodyDesc lakeDesc = *desc;
+  std::string holeNote = "pass H did not run (an earlier pass failed)";
+  int64_t shellCells = 0, hEmit1 = 0, hErr1 = 0;
+  for (int ai = 0; ai < 2 && ok; ai++) {
+    const DrainArm& arm = arms[ai];
+    // A FRESH WORLD PER ARM. The previous arm carved a chamber and filled it;
+    // starting the second on that is the same "the pass that perturbs the world
+    // owes the cleanup" hazard pass D's third arm exists to catch, except here
+    // it would silently change the head rather than the hash.
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    Tuning ht = t;
+    ht.sim.fluidExciteMode = arm.exciteMode;
+    ht.sim.drainExciteRadius = arm.shellRadius;
+    ht.sim.fluidSplashRate = arm.splash;
+    ht.sim.waterBodyTestDrain = 0;   // the DISCHARGE is the source now
+    SetCurrentTuning(ht);
+    tick = RunQuietTicks(c, tick, 130);
+
+    const WaterBodyDesc* hd = WaterBodies().Find(1);
+    if (!hd || hd->gpuSlot >= kWaterBodyCap) {
+      fail(Format("pass %s: the authored lake is not proposed", arm.name));
+      break;
+    }
+    const uint32_t hSlot = hd->gpuSlot;
+    {
+      const LedgerView lv0 = ReadLedger(c);
+      if (lv0.At(hSlot, WBS_STATE) != WB_ADOPTED) {
+        fail(Format("pass %s: the lake is %s, not adopted, before the punch",
+                    arm.name, LedgerStateName(lv0.At(hSlot, WBS_STATE))));
+        break;
+      }
+    }
+
+    // ---- the punch, and the chamber it drains into ----------------------
+    const int hFloorY = lakeGeo.floorY;
+    const int chTop = hFloorY - kShaftDepth;         // chamber roof
+    const int chBot = chTop - kChamberH;             // chamber floor
+    std::vector<CellOp> punch;
+    for (int y = chBot; y <= hFloorY; y++) {
+      const bool inShaft = y > chTop;
+      const int half = inShaft ? kShaftR : kChamberR;
+      for (int z = lakeGeo.cz - half; z <= lakeGeo.cz + half; z++)
+        for (int x = lakeGeo.cx - half; x <= lakeGeo.cx + half; x++) {
+          const bool wall = !inShaft && (y == chBot ||
+                                         std::abs(x - lakeGeo.cx) == kChamberR ||
+                                         std::abs(z - lakeGeo.cz) == kChamberR);
+          punch.push_back({World::SlotCellIndex({x, y, z}),
+                           wall ? (uint32_t)kMatStone : 0u});
+        }
+    }
+    // The box every conservation number below is measured over. It contains
+    // the lake, the shaft and the chamber, so water that legitimately LEFT the
+    // lake is still inside the sum.
+    const int boxLo = chBot, boxHi = lakeGeo.surfY;
+    const VoxelTruth h0 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
+    uint32_t pfBefore[4] = {0, 0, 0, 0};
+    ReadPageFaultsSync(c.ctx, world, pfBefore);
+
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, punch, false,
+               c.world.WindowOrigin(), true, false);
+    c.ctx.ProcessEvents();
+    tick++;
+
+    uint64_t seen = 0, cand = 0;
+    uint32_t samples = 0;
+    tick = RunQuietTicks(c, tick, kDrainWindow, &seen, &cand, &samples);
+    // SETTLE, with the hole still open: the jet is still in flight and the
+    // ledger still owes a debit the shave has not taken. Measuring before this
+    // would charge the difference to the feature.
+    tick = RunQuietTicks(c, tick, 90);
+
+    const VoxelTruth h1 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
+    const LedgerView lv = ReadLedger(c);
+    uint32_t fa[32] = {};
+    ReadFluidArgsSync(c.ctx, world, fa);
+    // ONE EIGHTH PER PARTICLE (every seam-born particle carries fullness 1),
+    // minus the dead tail of this tick's reserved discharge block.
+    const int64_t inFlight = (int64_t)fa[7] - (int64_t)std::min(fa[29], fa[7]);
+    const int64_t debitNow = lv.At(hSlot, WBS_DEBIT);
+    const int64_t drainedNow = lv.At(hSlot, WBS_DRAINED);
+    const int64_t err =
+        (int64_t)h1.eighths + inFlight - debitNow - (int64_t)h0.eighths;
+    uint32_t pfAfter[4] = {0, 0, 0, 0};
+    ReadPageFaultsSync(c.ctx, world, pfAfter);
+
+    if (ai == 0) {
+      hEmit1 = drainedNow;
+      hErr1 = err;
+      RecordObserved("waterbodyDrainH1Eighths", (double)drainedNow);
+      RecordObserved("waterbodyDrainH1ErrEighths", (double)err);
+    } else {
+      shellCells = lv.At(hSlot, WBS_EXSHELL);
+      RecordObserved("waterbodyShellCells", (double)shellCells);
+      RecordObserved("waterbodyDrainH2Eighths", (double)drainedNow);
+      RecordObserved("waterbodyDrainH2ErrEighths", (double)err);
+      RecordObserved("waterbodyDrainExciteCandPerTick",
+                     (double)cand / (double)kDrainWindow);
+      holeNote = Format(
+          "DRAIN(real hole, %u ticks) H1 %lld eighths err %+lld | H2 %lld "
+          "eighths err %+lld, shell %lld cells @r%d, excite %llu cand / %llu "
+          "seen over %u snaps (%.1f cand/tick), level %d, hole area %d, jet "
+          "v %d Q16.16, in flight %lld, %u live / %u dead ops",
+          kDrainWindow, (long long)hEmit1, (long long)hErr1,
+          (long long)drainedNow, (long long)err, (long long)shellCells,
+          arm.shellRadius, (unsigned long long)cand, (unsigned long long)seen,
+          samples, (double)cand / (double)kDrainWindow,
+          lv.At(hSlot, WBS_LEVEL), lv.At(hSlot, WBS_HOLEAREA),
+          lv.At(hSlot, WBS_JETV), (long long)inFlight, fa[7], fa[29]);
+    }
+
+    // WHY NEITHER ARM IS A STRICT EQUALITY, and it is worth being exact about
+    // because pass A's IS one. Pass A's identity is about the LAKE and its
+    // ledger: the only movers are the shave and the tap, both of which report
+    // what they granted, so it closes at +0 and any drift is a mass pump.
+    //
+    // This identity is about a BOX containing a violent, churning MPM pool, and
+    // the box has downstream physics in it that the water-body system does not
+    // own and must not pretend to: the CA's thin-film handling of water sheeting
+    // down a shaft wall, the sun/water evaporation rule on any cell that ends up
+    // exposed, and the wake trigger converting CA water near the jet. Measured
+    // at -37 eighths against 35,381 drained and 40,342 in flight (0.09%), all of
+    // it downstream of the ledger — `capped` is 0, so the shave was never short
+    // and the debit followed what it granted, every tick.
+    //
+    // So the bound is small and it lives in JSON: it is an assertion that the
+    // discharge is not a PUMP, not a claim that a churning pool is lossless.
+    const int64_t slack = (int64_t)BaselineNumber(
+        arm.strict ? "waterbodyDrainSlackStrictEighths"
+                   : "waterbodyDrainSlackEighths",
+        arm.strict ? 256.0 : 4096.0);
+    if (err < -slack || err > slack)
+      fail(Format(
+          "CONSERVATION (pass %s): basin %u slot %u is off by %+lld eighths. "
+          "box %llu -> %llu (%+lld), in flight %lld (live %u, dead ops %u), "
+          "ledger drained %lld, outstanding debit %lld, capped %d, level %d, "
+          "hole area %d, %u page faults",
+          arm.name, lakeDesc.basinId, hSlot, (long long)err,
+          (unsigned long long)h0.eighths, (unsigned long long)h1.eighths,
+          (long long)((int64_t)h1.eighths - (int64_t)h0.eighths),
+          (long long)inFlight, fa[7], fa[29], (long long)drainedNow,
+          (long long)debitNow, lv.At(hSlot, WBS_CAPPED),
+          lv.At(hSlot, WBS_LEVEL), lv.At(hSlot, WBS_HOLEAREA),
+          pfAfter[0] - pfBefore[0]));
+    // A conserving drain that never drained is a green light meaning nothing —
+    // the same guard pass A carries, and it is what would catch a hole detector
+    // that never fired or an op block that was never reserved.
+    if (drainedNow <= 0)
+      fail(Format("pass %s: the discharge emitted 0 eighths — the hole was "
+                  "never detected (hole key %d, area %d, ttl %d, level %d, "
+                  "floor %d)",
+                  arm.name, lv.At(hSlot, WBS_HOLEKEY_W),
+                  lv.At(hSlot, WBS_HOLEAREA), lv.At(hSlot, WBS_HOLETTL_W),
+                  lv.At(hSlot, WBS_LEVEL), hFloorY));
+    if (pfAfter[0] != pfBefore[0])
+      fail(Format("pass %s: %u page faults during the drain (lost word "
+                  "0x%08x) — the shave wrote into a sentinel chunk",
+                  arm.name, pfAfter[0] - pfBefore[0], pfAfter[2]));
+    // COMPONENT 7's BUDGET, plan section 9 item 2. The shell mitigation was
+    // UNMEASURED in the plan; this is the measurement, and it is asserted
+    // rather than only printed so a future radius change cannot quietly
+    // reintroduce the solid ball's ~33,000 particles against a ~40,000
+    // envelope.
+    if (ai == 1) {
+      const double shellMax = BaselineNumber("waterbodyShellCellMax", 20000.0);
+      if ((double)shellCells > shellMax)
+        fail(Format("component 7's shell converted %lld cells at radius %d, "
+                    "over the budget of %.0f — that is the solid-ball cost "
+                    "plan section 9 item 2 says must not be paid",
+                    (long long)shellCells, arm.shellRadius, shellMax));
+      // Plan section 9 item 1, REOPENED by M3: a real jet at the throat can
+      // feed the excite detector the way WP5's draining CA did (169,616
+      // candidates / 400 ticks on worldlake). Both halves are reported because
+      // a bare 0 is unattributable — `seen` is what separates "the mechanism is
+      // not there" from "the detector never ran".
+      const double perTickH = (double)cand / (double)kDrainWindow;
+      const double candMaxH =
+          BaselineNumber("waterbodyDrainExciteCandPerTickMax", 3000.0);
+      if (perTickH > candMaxH)
+        fail(Format("the real drain feeds the excite detector: %llu candidates "
+                    "over %u ticks (%.1f/tick) against %llu cells seen, budget "
+                    "%.0f/tick — this is plan section 9's ranked-first risk, "
+                    "reopened at the throat",
+                    (unsigned long long)cand, kDrainWindow, perTickH,
+                    (unsigned long long)seen, candMaxH));
+    }
+    // Leave the world settled and pristine for pass D, which hashes it.
+    SetCurrentTuning(t);
+    WaterBodies().Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    tick = RunQuietTicks(c, tick, 60);
+  }
+
   // ------------------------------------------------------------------ pass D
   // THE OFF SWITCH, and it is the whole argument for landing M1 and M2 without
   // a rebaseline. An identical 40-tick mutation script from an identical world
@@ -900,12 +1164,13 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       (long long)tarnColumnCells, basinCount, bowlCount, proposedNow,
       LedgerStateName(lakeState), lakeSlot, lakeVolume, reduceErrPct,
       levelBefore, lakeArea,
-      (unsigned long long)desc->volumeEighths,
-      (unsigned long long)truth.eighths, volErrPct, desc->surfaceArea,
+      (unsigned long long)lakeDesc.volumeEighths,
+      (unsigned long long)truth.eighths, volErrPct, lakeDesc.surfaceArea,
       truth.surfaceCells, areaErrPct, truth.surfaceMaxY - truth.surfaceMinY,
       bowlNote.c_str(), drainNote.c_str(),
       truth.chunks + bowlTruth.chunks, awake, flips, hashOff, hashOn);
   detail += Format(" (mode 0 again %08x)", hashOff2);
+  detail += " | " + holeNote;
   detail += notes;
   std::printf("waterbody: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;

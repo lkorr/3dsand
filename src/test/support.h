@@ -168,6 +168,12 @@ void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out);
 // refusing chunk span, not just the count. A shave that landed in a sentinel
 // chunk shows up here and nowhere else.
 void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]);
+// The fluid seam's FA_* word map (common.wgsl), 32 u32. `--gate waterbody`
+// pass H needs FA_LIVE and EX_COMPACT_LIVE's successor: the IN-FLIGHT MPM
+// MASS is a real term of the conservation sum once a drain emits particles
+// and component 7 excites a shell, and a gate that cannot see it reports a
+// leak that is sitting in the particle pool.
+void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
 // THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).

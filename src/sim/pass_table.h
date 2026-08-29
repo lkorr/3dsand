@@ -164,7 +164,7 @@ enum class Pipe : uint8_t {
   // Water bodies (sim_waterbody.wgsl). Four entry points, recorded in this
   // order inside one PT_TICK pass group — the order is load-bearing and the
   // shader's header says why.
-  WaterQuiet, WaterLedger, WaterReduce, WaterShave,
+  WaterQuiet, WaterLedger, WaterReduce, WaterShave, WaterDrain, WaterHole,
   FarFill, FarDown,
 };
 
@@ -235,6 +235,7 @@ enum class Cond : uint8_t {
   // what makes `sim.waterBodyMode = 0` an EXACT identity rather than merely a
   // cheap path — nothing is recorded, so the pinned hash cannot move.
   WaterBody,
+  WaterDrain, // waterDrainBodies > 0 (the reserved spawn-op block, M3)
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -275,6 +276,10 @@ enum class DispatchSel : uint32_t {
   // ---- water bodies ----
   WaterChunks,       // waterChunkCount — one WORKGROUP per listed chunk
   WaterChunks64,     // (waterChunkCount + 63) / 64 — one THREAD per chunk
+  // One THREAD per RESERVED drain spawn-op slot. Every slot in the block has
+  // to be written every tick it exists — a slot the pass skipped keeps a
+  // stale particle that spawnAppend would hand back to the pool as live.
+  WaterDrainSel,     // (waterDrainBodies * kWaterDrainOpsPerBody + 63) / 64
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

@@ -118,6 +118,9 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_CELL_CLEAR": "fluidCellClear_",
     # Water bodies (docs/PLAN_water_master.md M2; sim_waterbody.wgsl).
     "PIPE_WATER_QUIET": "waterQuiet_",
+    # M3, components 6 + 7 (the discharge law and its hole detector).
+    "PIPE_WATER_DRAIN": "waterDrain_",
+    "PIPE_WATER_HOLE": "waterHole_",
     "PIPE_WATER_LEDGER": "waterLedger_",
     "PIPE_WATER_REDUCE": "waterReduce_",
     "PIPE_WATER_SHAVE": "waterShave_",
@@ -185,7 +188,11 @@ BUF_TO_WGSL = {
     # compaction binds the READ page as `fluidSrc`.
     "FluidParticlesRead": {"fluidSrc"},
     "FluidParticlesWrite": {"fluidParticles", "fluid"},
-    "FluidSpawnOps": {"fluidSpawnOps"},
+    # `waterSpawnOps` is the SAME buffer under sim_waterbody.wgsl's own name:
+    # the discharge (M3, component 6) fills the CPU-reserved op block at
+    # binding 25 of simBGL_ that seam_spawn then reads at binding 2 of the
+    # seam group. Two names, one buffer, one hazard the table must see.
+    "FluidSpawnOps": {"fluidSpawnOps", "waterSpawnOps"},
     "FluidBlockMap": {"fluidBlockMap", "fluidBlockMapR", "fluidBlockMapS"},
     "FluidBlockList": {"fluidBlockList"},
     "FluidGrid": {"fluidGrid", "fluidGridR", "fluidGridS"},
@@ -230,13 +237,18 @@ _SIM_GROUP0 = {
     "fluidBlockMapS", "fluidGridS", "fluidCellScratch",
     # The water-body drain ledger, binding 24 (docs/PLAN_water_master.md M2).
     "waterBodyState",
+    # The discharge's emission seam, binding 25 (M3).
+    "waterSpawnOps",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
 # across modules that share common.wgsl, so pageTable/pageFaults keep the
 # same numbers here that they have in simBGL_ (PLAN_page_table.md §5.2).
+# waterBodyState is in the SLIM group as of M3: component 7 puts the drain
+# shell trigger inside the excite/settle seam, which runs on this layout, and
+# binding 24 has to name the same buffer in every module that declares it.
 _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
-                "pageTable", "pageFaults"}
+                "pageTable", "pageFaults", "waterBodyState"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}

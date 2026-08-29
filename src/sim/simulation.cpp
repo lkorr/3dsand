@@ -141,6 +141,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // and reading that back would put fence retirement inside a voxel
         // write's control path — see sim_waterbody.wgsl's header.
         entry(24, T::Storage),         // waterBodyState (atomic i32 ledger)
+        // The discharge's emission seam (M3, component 6): sim_waterbody.wgsl
+        // fills the CPU-reserved spawn-op block, because the head `h` it is
+        // derived from is a level the GPU owns. Bound read_write HERE and
+        // read-only in the fluid/seam groups, which is exactly what the pass
+        // table's W(FluidSpawnOps) -> R(FluidSpawnOps) barrier is for.
+        entry(25, T::Storage),         // fluidSpawnOps (drain writes)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -156,6 +162,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(4, T::Uniform),          // TickParams
         entry(17, T::ReadOnlyStorage), // pageTable
         entry(18, T::Storage),         // pageFaults
+        // COMPONENT 7 put the water-body ledger in the SLIM group: the
+        // excite/settle seam runs on this layout and its drain-shell trigger
+        // asks a draining hole where it is. Binding 24 has to be the same
+        // buffer in every module that names it, so it is added here rather
+        // than given a seam-group entry of its own.
+        entry(24, T::Storage),         // waterBodyState (atomic i32 ledger)
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -370,6 +382,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(22, world_->fluidCellScratch),
         b(23, world_->actVoxViz),
         b(24, world_->waterBodyState),
+        b(25, world_->fluidSpawnOps),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -381,6 +394,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(4, world_->tickUBO),
         b(17, world_->pageTable),
         b(18, world_->pageFaults),
+        b(24, world_->waterBodyState),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -708,6 +722,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   waterLedger_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbLedger", "waterLedger");
   waterReduce_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbReduce", "waterReduce");
   waterShave_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbShave", "waterShave");
+  waterDrain_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbDrain", "waterDrain");
+  waterHole_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbHole", "waterHole");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -725,7 +741,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
       !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_ ||
       !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_ ||
-      !fluidCellClear_ || !waterQuiet_ || !waterLedger_ || !waterReduce_ ||
+      !fluidCellClear_ || !waterDrain_ || !waterHole_ ||
+      !waterQuiet_ || !waterLedger_ || !waterReduce_ ||
       !waterShave_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
@@ -790,6 +807,7 @@ struct RecordCtx {
   // sim.waterBodyMode 0, which is what makes C_WATERBODY false and leaves the
   // whole subsystem unrecorded.
   uint32_t waterChunkCount = 0;
+  uint32_t waterDrainBodies = 0;   // reserved drain op blocks (M3)
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced
@@ -925,6 +943,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::WaterLedger:    return waterLedger_;
     case P::WaterReduce:    return waterReduce_;
     case P::WaterShave:     return waterShave_;
+    case P::WaterDrain:     return waterDrain_;
+    case P::WaterHole:      return waterHole_;
     case P::FluidSettleCommit:   return fluidSettleCommit_;
     case P::FluidSettleKill:     return fluidSettleKill_;
     case P::FluidConsumeApply:   return fluidConsumeApply_;
@@ -966,6 +986,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.fluidSpawnCount = cx.fluidSpawnCount;
   tc.windWakeCount = cx.windWakeCount;
   tc.waterChunkCount = cx.waterChunkCount;
+  tc.waterDrainBodies = cx.waterDrainBodies;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -1221,7 +1242,8 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             uint32_t cellCount, uint32_t spawnCount,
                             uint32_t fluidCount, uint32_t fluidSpawnCount,
                             uint32_t windWakeCount, bool vizActive,
-                            uint32_t waterChunkCount) {
+                            uint32_t waterChunkCount,
+                            uint32_t waterDrainBodies) {
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
@@ -1233,6 +1255,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // Water bodies (docs/PLAN_water_master.md M2). Zero at sim.waterBodyMode 0,
   // which is what makes C_WATERBODY false and the whole subsystem unrecorded.
   cx.waterChunkCount = waterChunkCount;
+  // M3: the reserved discharge op blocks. C_WATERDRAIN, and zero whenever
+  // the feature is off or nothing is proposed.
+  cx.waterDrainBodies = waterDrainBodies;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
   cx.vizActive = vizActive;

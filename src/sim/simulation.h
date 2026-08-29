@@ -100,7 +100,8 @@ class Simulation {
                   uint32_t cellCount, uint32_t spawnCount = 0,
                   uint32_t fluidCount = 0, uint32_t fluidSpawnCount = 0,
                   uint32_t windWakeCount = 0, bool vizActive = false,
-                  uint32_t waterChunkCount = 0);
+                  uint32_t waterChunkCount = 0,
+                  uint32_t waterDrainBodies = 0);
 
   // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
   //
@@ -314,6 +315,7 @@ class Simulation {
   // Water bodies (sim_waterbody.wgsl): quiescence probe, drain ledger,
   // adoption reduce, surface shave — docs/PLAN_water_master.md components 3-5.
   rhi::ComputePipeline waterQuiet_, waterLedger_, waterReduce_, waterShave_;
+  rhi::ComputePipeline waterDrain_, waterHole_;   // M3, components 6 + 7
   rhi::ComputePipeline fluidSpawn_, fluidMark_, fluidAlloc_, fluidClear_,
       fluidP2g_, fluidP2g2_, fluidGridUp_, fluidG2p_;
   // The excite/settle seam (sim_fluid_seam.wgsl).

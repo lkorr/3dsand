@@ -306,10 +306,44 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // that leaves both counts at zero, so every pass row's condition is false,
   // nothing is recorded, and the pinned world hash cannot see any of it.
   const WaterBodyGpu* waterGpu = nullptr;
+  uint32_t drainBodies = 0;
   {
     const Tuning& wt = CurrentTuning();
     WaterBodySystem& wb = WaterBodies();
-    wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain);
+    // `worldEdited` is the mutation latch component 6 needs (waterbody.h's
+    // drainHotUntil_): holes appear when someone digs, and every dig arrives
+    // through the mutation queue, so this is the CPU-visible, tick-stream
+    // signal that a hole MIGHT now exist.
+    //
+    // NARROWED TO A LABELLED CHUNK, and the narrowing is worth 1.9 ms. Arming on
+    // ANY mutation anywhere means a lab scene that builds itself out of cell ops
+    // arms every lake in the window for 30 s, which keeps the discharge's
+    // spawn-op block reserved, which keeps the whole fluid pipeline recorded on
+    // ticks nothing is happening: measured 5.10 -> 7.02 ms p50 on `pond68` and
+    // "0 idle ticks first" where the scene otherwise reports 68. So a mutation
+    // only arms a body whose OWN chunks it touched.
+    //
+    // `ChunkBody()` here is LAST tick's labelling — deliberately, and it is
+    // still tick-deterministic: the labelling is a pure function of (seed,
+    // window) and only changes when one of those moves.
+    bool worldEdited = false;
+    {
+      const std::vector<uint32_t>& lbl = wb.ChunkBody();
+      auto touch = [&](IVec3 wc) {
+        if (worldEdited || !world.ChunkInWindow(wc)) return;
+        if (lbl.size() == kNumChunks && lbl[World::SlotChunkIndex(wc)] != 0)
+          worldEdited = true;
+      };
+      for (uint32_t i = 0; i < cellCount && !worldEdited; i++) {
+        const uint32_t slot = cells[i].cellIdx / kChunkVol;
+        if (slot < kNumChunks && lbl.size() == kNumChunks && lbl[slot] != 0)
+          worldEdited = true;
+      }
+      for (const BrushOp& o : ops) touch({o.x >> 4, o.y >> 4, o.z >> 4});
+      for (const ExplosionOp& e : exps) touch({e.x >> 4, e.y >> 4, e.z >> 4});
+    }
+    wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
+            wt.sim.drainMaxEighthsPerTick, worldEdited);
     const WaterBodyGpu& g = wb.Gpu();
     waterGpu = &g;
     tp.waterBodyMode = (uint32_t)wt.sim.waterBodyMode;
@@ -318,6 +352,38 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.waterTestDrain = wt.sim.waterBodyTestDrain;
     tp.waterQuietTicks = wt.sim.waterBodyQuietTicks;
     tp.waterMinVolume = wt.sim.waterBodyMinVolume;
+    // ---- M3: RESERVE THE DISCHARGE'S OP BLOCK (component 6) --------------
+    //
+    // `spawnAppend` reads a CPU-sized op stream, and the discharge cannot size
+    // itself: the head `h` comes from a level the GPU owns. So the CPU does the
+    // one thing it can do deterministically — CHARGE THE BUDGET BEFORE EMISSION
+    // (rule 2) — by reserving a fixed block per proposed body immediately after
+    // this tick's real pours, and sim_waterbody.wgsl's wbDrain fills every slot
+    // in it. The ledger refuses the discharge outright to any body that did not
+    // get a block (`b < T.waterDrainBodies`), so a granted eighth always has a
+    // particle behind it and plan §3.2 holds by construction.
+    //
+    // Zero at sim.waterBodyMode 0, zero at sim.drainMaxEighthsPerTick 0, and
+    // zero whenever nothing is proposed — so the shipped world reserves nothing,
+    // the discharge row is not recorded, and the pinned hash cannot see it.
+    const uint32_t drainRoom =
+        fluidSpawnCount < kMaxFluidSpawnsPerTick
+            ? (kMaxFluidSpawnsPerTick - fluidSpawnCount) / kWaterDrainOpsPerBody
+            : 0u;
+    // GATED ON THE MUTATION LATCH, not merely on the knob. The block is filled
+    // every tick it exists, so a standing reservation keeps fluidSpawnCount
+    // non-zero forever, keeps the whole fluid seam recorded, and costs a lake
+    // nobody has touched real milliseconds — see WaterBodyGpu::drainArmed.
+    if (g.drainArmed) drainBodies = std::min(g.bodyCount, drainRoom);
+    tp.waterDrainSpawnBase = fluidSpawnCount;
+    tp.waterDrainBodies = drainBodies;
+    tp.waterDrainMax = wt.sim.drainMaxEighthsPerTick;
+    tp.waterExciteRadius = wt.sim.drainExciteRadius;
+    // The total the seam dispatches over: real pours, then the reserved block.
+    // Written AFTER tp.fluidSpawnCount's own assignment above on purpose — the
+    // WriteBuffer below still uploads only the CPU half, because the GPU owns
+    // the rest of the range.
+    tp.fluidSpawnCount = fluidSpawnCount + drainBodies * kWaterDrainOpsPerBody;
     for (size_t i = 0; i < g.bodies.size() && i < kWaterBodyScalars; i++)
       tp.waterBodies[i] = g.bodies[i];
     for (size_t i = 0; i < g.chunks.size() && i < kWaterChunkCap; i++)
@@ -600,6 +666,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
                                spawnCount > 0 || !windWake.empty() ||
                                (waterGpu && waterGpu->writesThisTick) ||
+                               drainBodies > 0 ||
                                fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
@@ -632,11 +699,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // page (the recorder derives the COMPUTE->COMPUTE barrier from the W(Voxels)
   // in the pageFill row against the tick's first RW(Voxels)).
   sim.EncodePageFill(enc, jitterFills);
+  // The seam's spawn dispatch covers the CPU pours AND the reserved drain
+  // block, so both counts carry the total; `waterDrainBodies` is what sizes the
+  // discharge row itself and what the ledger's rule-2 refusal compares against.
+  const uint32_t fluidSpawnTotal =
+      fluidSpawnCount + drainBodies * kWaterDrainOpsPerBody;
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
-                 fluidLive + fluidSpawnCount, fluidSpawnCount,
+                 fluidLive + fluidSpawnTotal, fluidSpawnTotal,
                  (uint32_t)windWake.size(), vizActive,
-                 waterGpu ? (uint32_t)waterGpu->chunks.size() : 0u);
+                 waterGpu ? (uint32_t)waterGpu->chunks.size() : 0u,
+                 drainBodies);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the
@@ -740,6 +813,20 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // ops go out through the MutationQueue on the ticks that follow (rule 3), not
   // by writing voxels from here.
   WorldEditLayer().QueueWindow(world);
+  // THE WATER-BODY LEDGER DESCRIBES A WORLD THAT NO LONGER EXISTS. Same
+  // argument as InvalidateSnapshot below and the same failure shape: the ledger
+  // is GPU-carried state (level, volume, debit, hole), a fresh worldgen refills
+  // the lake to its authored height, and a descriptor that survived would go on
+  // shaving at the old level against a hole that was filled in. Derived data is
+  // reconstructible and DISPOSABLE (plan section 3.1) — so dispose of it, on
+  // both sides: the CPU registry and the GPU record.
+  WaterBodies().Reset();
+  {
+    static const std::vector<int32_t> kZero(
+        (size_t)kWaterBodyCap * kWaterBodyStateWords, 0);
+    ctx.queue.WriteBuffer(world.waterBodyState, 0, kZero.data(),
+                          kZero.size() * sizeof(int32_t));
+  }
   // The held snapshot describes the OLD world; scenes and gates also restart
   // their tick counters, which can make its stamp read as newer than the new
   // world's early ticks. See World::InvalidateSnapshot. Measured on --shot's
@@ -996,6 +1083,11 @@ void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.waterBodyState, 0, out,
                         (size_t)kWaterBodyCap * kWaterBodyStateWords * 4,
                         "waterLedgerRead");
+}
+
+void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, out32,
+                        32 * 4, "fluidArgsRead");
 }
 
 void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {

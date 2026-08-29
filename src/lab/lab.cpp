@@ -568,6 +568,12 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     int ceiling = 0;    // sim.fluidExciteCeiling override (0 = shipped value)
     int radius = 0;     // pond disc radius (0 = shipped value)
     int perch = -1;     // sim.fluidExcitePerch override (-1 = shipped value)
+    // sim.waterBodyMode override (-1 = shipped 0). The M3 arm: with it at 1
+    // the puncture is drained by the water-body ledger's discharge law
+    // instead of by the CA propagating pressure through the whole body, and
+    // `-wb1` against the same scene's `-ex0` row is exactly the comparison
+    // PLAN_water_master.md §1's baseline table is for.
+    int water = -1;
   };
   std::vector<BenchRun> runs;
   // ---- the two WP5 sweeps ------------------------------------------------
@@ -594,7 +600,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
   auto parseRun = [&](const std::string& a, BenchRun& r) -> bool {
     const size_t dash = a.find('-');
     const std::string head = a.substr(0, dash);
-    int ceil = 0, perch = -1, ex = -1;
+    int ceil = 0, perch = -1, ex = -1, wb = -1;
     bool anySuffix = false;
     for (size_t p = dash; p != std::string::npos; ) {
       const size_t next = a.find('-', p + 1);
@@ -603,6 +609,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
                                                   : next - p - 1);
       if (sfx.rfind("ceil", 0) == 0) ceil = std::atoi(sfx.c_str() + 4);
       else if (sfx.rfind("perch", 0) == 0) perch = std::atoi(sfx.c_str() + 5);
+      else if (sfx.rfind("wb", 0) == 0) wb = std::atoi(sfx.c_str() + 2);
       else if (sfx.rfind("ex", 0) == 0) ex = std::atoi(sfx.c_str() + 2);
       else return false;
       anySuffix = true;
@@ -612,14 +619,14 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       const std::string rad = head.substr(4);
       if (!rad.empty() && !std::isdigit((unsigned char)rad[0])) return false;
       r = {kLabPond, ex < 0 ? 1 : ex, a, false, ceil,
-           rad.empty() ? 0 : std::atoi(rad.c_str()), perch};
+           rad.empty() ? 0 : std::atoi(rad.c_str()), perch, wb};
       return true;
     }
     if (!anySuffix) return false;                  // plain name: normal path
     const int s = head == "hill0" ? kLabHill : LabSceneFromName(head);
     if (s < 0) return false;
     const int base = head == "hill0" ? 0 : 1;
-    r = {s, ex < 0 ? base : ex, a, false, ceil, 0, perch};
+    r = {s, ex < 0 ? base : ex, a, false, ceil, 0, perch, wb};
     return true;
   };
   BenchRun pondRun{};
@@ -672,6 +679,18 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
                       false, c, 0, -1});
     runs.push_back({kLabHill, 1, "hill-ceil262144-perch1", false, 262144, 0, 1});
     runs.push_back({kLabHill, 1, "hill-ceil262144-perch0", false, 262144, 0, 0});
+  } else if (sceneArg == "wp5c") {
+    // THE M3 ARM (docs/PLAN_water_master.md 1.3). The same two puncture scenes
+    // WP5 measured, with the water-body ledger governing the lake instead of
+    // the CA propagating pressure through it. Each pair is
+    // {CA-only reference, water-body drain} on ONE scene in ONE invocation, so
+    // the throughput and the frame cost are read off the same run rather than
+    // against a table written on another day.
+    runs.push_back({kLabPond, 0, "pond68-ex0", false, 0, 68, -1, 0});
+    runs.push_back({kLabPond, 0, "pond68-ex0-wb1", false, 0, 68, -1, 1});
+    runs.push_back({kLabWorldLake, 0, "worldlake-ex0", false, 0, 0, -1, 0});
+    runs.push_back({kLabWorldLake, 0, "worldlake-ex0-wb1", false, 0, 0, -1, 1});
+    runs.push_back({kLabWorldLake, 1, "worldlake-perch1-wb1", false, 0, 0, 1, 1});
   } else if (sceneArg == "pondsweep") {
     // One invocation, both sweeps, on a body that is already 4.5x the pool.
     for (int c : {10000, 20000, 40000, 80000})
@@ -705,8 +724,8 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       std::fprintf(stderr,
                    "--fluid-bench: unknown scene '%s' (want basin|hill|hill0|"
                    "faucet|pool|slosh|pond[N]|worldlake|pours|all|wp5|"
-                   "pondsweep; any of these may carry -ceil<N> -perch<0|1> "
-                   "-ex<0|1>)\n",
+                   "pondsweep|wp5c; any of these may carry -ceil<N> -perch<0|1> "
+                   "-ex<0|1> -wb<0|1>)\n",
                    sceneArg.c_str());
       return 1;
     }
@@ -785,6 +804,9 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       if (run.settleTuning) t.sim.fluidDamping = 0.9f;
       if (run.ceiling) t.sim.fluidExciteCeiling = run.ceiling;
       if (run.perch >= 0) t.sim.fluidExcitePerch = run.perch;
+      // The M3 arm. sim.waterBodyMode is a CPU-read knob (no recompile), so
+      // it does not join the shader-reload triple below.
+      if (run.water >= 0) t.sim.waterBodyMode = run.water;
       if (run.radius) LabSetPondRadius(run.radius);
       SetCurrentTuning(t);
       // Recompile only when the compiled-in fluid consts actually change: a

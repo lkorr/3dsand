@@ -119,6 +119,14 @@ namespace sandvox {
 // refused, or lost the chunk budget.
 constexpr uint32_t kNoGpuSlot = 0xFFFFFFFFu;
 
+// Ticks a world mutation keeps a governed body's footprint declared to the page
+// table — see `drainHotUntil_` below for the whole argument. 900 = 30 s.
+constexpr uint32_t kWaterDrainHotTicks = 900;
+// Extra ticks the FOOTPRINT stays declared after the hot window closes, so a
+// debit the ledger granted on its last armed tick can still be shaved into
+// declared chunks. See BuildGpu.
+constexpr uint32_t kWaterDrainSettleTicks = 64;
+
 // How a basin's floor is shaped. Two kinds cover every body worldgen makes,
 // and both are closed forms; a third kind is what component 10's union-find
 // sweep will produce for dug terrain.
@@ -316,6 +324,18 @@ struct WaterBodyGpu {
   // declared the way entrainment's are, or the writes land in JITTER sentinels
   // and voxStore counts page faults instead of draining a lake.
   bool writesThisTick = false;
+  // COULD A HOLE BE DRAINING THIS TICK — the same mutation latch, exposed
+  // separately because it gates a different thing: whether the CPU reserves the
+  // discharge's spawn-op block at all.
+  //
+  // It has to be gated, and the measurement is why. The block is filled every
+  // tick it exists, live ops or dead, so a standing reservation keeps
+  // `fluidSpawnCount` non-zero forever — which keeps the whole PT_FLUIDSEAM
+  // table recorded, keeps the lab's "idle ticks before the plug" at 0 and cost
+  // 5.18 -> 6.69 ms p50 on `pond68` and 2.14 -> 3.64 on `worldlake` for a lake
+  // with no hole in it. That is rule 2 with the sign flipped: cost that scales
+  // with the world containing a lake rather than with anything happening to it.
+  bool drainArmed = false;
 };
 
 // ---- the system ------------------------------------------------------------
@@ -347,7 +367,7 @@ class WaterBodySystem {
   // decides whether the footprint has to be declared to the page table. It is
   // NOT part of any decision about which bodies exist.
   void Tick(const World& world, uint32_t seed, uint32_t tick, int mode,
-            int testDrain);
+            int testDrain, int drainMax, bool worldEdited);
 
   const std::vector<WaterBasin>& Basins() const { return basins_; }
   const std::vector<WaterBodyDesc>& Bodies() const { return bodies_; }
@@ -387,7 +407,7 @@ class WaterBodySystem {
  private:
   void Relabel(const World& world);
   void Classify(const World& world, uint32_t tick);
-  void BuildGpu(int testDrain);
+  void BuildGpu(uint32_t tick, int testDrain, int drainMax);
 
   std::vector<WaterBasin> basins_;
   std::vector<WaterBasinCurve> curves_;   // parallel to basins_
@@ -399,6 +419,32 @@ class WaterBodySystem {
   uint32_t straddles_ = 0;
   uint32_t outOfWindow_ = 0;
   int mode_ = 0;
+  // THE DRAIN HOT WINDOW (M3). A discharge makes the shave fire, the shave
+  // writes RESTING voxels, and a write into a chunk the page table was never
+  // told about is a lost eighth reported as a page fault. So the footprint has
+  // to be declared as an op target BEFORE the command buffer exists — and the
+  // CPU cannot ask whether a hole exists, because a hole is a GPU fact derived
+  // from a level the GPU owns.
+  //
+  // What the CPU CAN see is the thing that MAKES holes: a mutation. Holes
+  // appear when someone digs or explodes, and every one of those arrives
+  // through the mutation queue on the tick input stream. So any edit at all
+  // opens a window during which a governed body declares its footprint, and
+  // outside that window a still lake declares nothing and materializes nothing
+  // — M2's zero-idle-cost property, kept.
+  //
+  // It is a LATCH, not a per-tick test, for the reason the frame-local-value
+  // gotcha records: the drain outlives the dig by minutes, and a footprint
+  // declared only on the tick of the dig would fault on every tick after it.
+  // 900 ticks is 30 s, comfortably longer than a bounded drain and bounded by
+  // construction (rule 2) rather than by hoping the world goes quiet.
+  //
+  // KNOWN M3 COST, named rather than discovered: inside the window a governed
+  // body materializes its whole footprint, not just the two Y layers the shave
+  // can write. Narrowing it to the band needs the CPU to know the live level,
+  // which is exactly what M2 moved onto the GPU. See PLAN_water_master.md
+  // §1.3's open items.
+  uint32_t drainHotUntil_ = 0;
 };
 
 // THE live system, a global for exactly the reason WindPrims() is one: it has

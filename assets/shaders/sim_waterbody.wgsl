@@ -1,6 +1,9 @@
-// sim_waterbody.wgsl — THE DRAIN LEDGER (component 3) and THE SURFACE SHAVE
-// (component 4) of docs/PLAN_water_master.md, plus the per-body adoption reduce
-// component 1 deferred. Milestone M2.
+// sim_waterbody.wgsl — THE DRAIN LEDGER (component 3), THE SURFACE SHAVE
+// (component 4), THE DISCHARGE LAW (component 6) and its hole detector, from
+// docs/PLAN_water_master.md, plus the per-body adoption reduce component 1
+// deferred. Milestones M2 and M3. (Component 7, the local excite at the throat,
+// lives in sim_fluid_seam.wgsl's exciteDetect so it inherits the seam's
+// existing ceiling and rate — see trigger (e) there.)
 //
 // ---- THE ONE-PARAGRAPH VERSION --------------------------------------------
 //
@@ -33,13 +36,18 @@
 // World::Snap(). Quiescence is now measured HERE, from `dirtyIn` and the MPM
 // block map — the hashed world's own state, on the tick, every time.
 //
-// ---- THE FOUR PASSES, AND WHY THAT ORDER -----------------------------------
+// ---- THE SIX PASSES, AND WHY THAT ORDER ------------------------------------
 //
 //   wbQuiet   one thread per listed chunk. Was this chunk disturbed this tick?
-//   wbLedger  one thread per body. The whole state machine and all arithmetic.
+//   wbLedger  one thread per body. The whole state machine and all arithmetic,
+//             including the ONE evaluation of the head `h` that component 6's
+//             single-evaluation rule turns on.
+//   wbDrain   one thread per reserved spawn-op slot. Writes the jet.
 //   wbReduce  one workgroup per listed chunk. Sums a candidate's voxel eighths.
 //   wbShave   one workgroup per listed chunk. Takes eighths off the free
 //             surface and REPORTS what it took.
+//   wbHole    one workgroup per listed chunk, and only where something HAPPENED.
+//             Finds the water/void interface and reports it for NEXT tick.
 //
 // The ledger runs BEFORE the shave, so it consumes LAST tick's shave report and
 // publishes THIS tick's instruction — plan §3.3's "never read a tally in the
@@ -51,6 +59,11 @@
 // ---- THE INVARIANT THIS FILE EXISTS TO KEEP --------------------------------
 //
 //     voxelEighths(t) + drained(t) - debit(t)  ==  voxelEighths(0)
+//
+// (From M3 the jet's eighths land somewhere else in the world rather than
+// vanishing, so `--gate waterbody` pass H states the same thing over a BOX that
+// contains both the lake and where the water went, with the in-flight MPM mass
+// as an explicit term. Same discipline, wider bracket.)
 //
 // `drained` is what left the body forever; `debit` is what has been taken from
 // the ledger but is still sitting in the voxels because no shave has removed it
@@ -78,43 +91,73 @@
 // `fluidBlockMap` is already binding 2 of the fluid group.
 @group(0) @binding(20) var<storage, read> fluidBlockMapS : array<u32>;
 @group(0) @binding(24) var<storage, read_write> waterBodyState : array<atomic<i32>>;
+// THE DISCHARGE'S EMISSION SEAM (component 6, M3). The same op stream the mpm
+// tool and the lab pours use, and deliberately nothing new: `spawnAppend`
+// already charges the pool budget, refuses past FLUID_CAP and clamps to
+// FLUID_VMAX. What is new is only WHO fills it — the CPU cannot author these
+// ops because the head `h` is derived from a level the GPU owns, and a jet
+// emitted by one rule while the lake decrements by another is a mass pump under
+// every edge case (plan §6's single-evaluation rule).
+//
+// The CPU reserves the block (T.waterDrainSpawnBase, T.waterDrainBodies), so
+// rule 2's "charge the budget BEFORE emission" is still charged on the CPU and
+// still charged before anything is written.
+@group(0) @binding(25) var<storage, read_write> waterSpawnOps : array<FluidSpawnOp>;
 
-// ---- the GPU-owned ledger, one record per body -----------------------------
-// Must match kWaterBodyStateWords in src/sim/world.h and the WBS_* reader in
-// src/test/selftest_water.cpp. Sixteen words is four more than the state needs,
-// and that is deliberate: plan §7 asks for attribution words BEFORE they are
-// needed, because "conservation failed by 37" with nothing attached is the bare
-// count CLAUDE.md rule 6 says costs a dozen elimination runs to un-ask.
-const WBS_STATE     : u32 = 0u;   // WB_* below
-const WBS_LEVEL     : u32 = 1u;   // world Y of the free surface
-const WBS_AREA      : u32 = 2u;   // surface cells the ledger paces against
-const WBS_DEBIT     : u32 = 3u;   // eighths owed but not yet off the voxels
-const WBS_SHAVED    : u32 = 4u;   // what LAST tick's shave actually removed
-const WBS_SEEN      : u32 = 5u;   // free-surface cells that shave saw
-const WBS_ATLEVEL   : u32 = 6u;   // of those, how many sat at exactly LEVEL
-const WBS_STEPS     : u32 = 7u;   // published: whole eighths per surface cell
-const WBS_FRAC      : u32 = 8u;   // published: dither numerator, in [0, area)
-const WBS_DRAINED   : u32 = 9u;   // cumulative eighths that left forever
-const WBS_VOLUME    : u32 = 10u;  // the reduce's voxel-eighth sum at adoption
-const WBS_QUIET     : u32 = 11u;  // consecutive undisturbed ticks
-const WBS_RSUM      : u32 = 12u;  // reduce scratch: running eighth sum
-const WBS_RDIRTY    : u32 = 13u;  // quiescence scratch: disturbed chunks
-const WBS_CAPPED    : u32 = 14u;  // attribution: eighths the cells did not have
-const WBS_ADOPTTICK : u32 = 15u;  // attribution: the tick adoption happened on
+// ---- human-unit tuning -> per-tick fixed point (the sim.fluid* lane) -------
+//
+// Q = Cd * A * sqrt(2 g h). Two of those three are physical quantities, so they
+// are human-unit floats in tuning.json and they are converted HERE, once, at
+// shader compile time: WGSL const-expressions are folded by Tint under IEEE
+// rules, so the same tuning.json produces the same integers on every machine
+// and the kernel below is integer-only (rule 1). Exactly the discipline
+// sim_fluid.wgsl's const block states, for exactly the same reason.
+//
+// 30 Hz tick; internal units are cells and ticks, so a vox/s^2 gravity divides
+// by 900 to become cells/tick^2.
+const DRAIN_TWO_G : i32 =            // 2g, Q16.16 cells/tick^2
+    i32(round(2.0 * TUNE_DRAIN_GRAVITY * 65536.0 / 900.0));
+const DRAIN_CD_Q16 : i32 = i32(round(TUNE_DRAIN_CD * 65536.0));
+// THE HEAD CAP, and it is plan §6's FIRST named trap made structural.
+// `spawnAppend` clamps velocity to +-FLUID_VMAX (0.45 cell/substep), and a
+// Torricelli velocity under real head exceeds it: at pondDepth 26 = 2.6 m the
+// exit speed is 7.1 m/s. The clamp is correct and stays. But then the momentum
+// asked for is not the momentum granted, and the ledger would be debiting
+// against a Q the water never carried. So `h` is capped BEFORE Q is computed —
+// v(hMax) is exactly FLUID_VMAX — and the two can no longer disagree.
+//
+//     v = sqrt(2 g h)  <=  vmax   <=>   h <= vmax^2 / (2 g)
+//
+// The alternative (accept the clamp and spread the flow over more particles at
+// legal speed) is more physical and more work; what is not allowed is letting
+// them diverge silently.
+const DRAIN_VMAX_C : f32 = f32(FLUID_VMAX) / 65536.0;      // cells/tick
+const DRAIN_G_C : f32 = TUNE_DRAIN_GRAVITY / 900.0;        // cells/tick^2
+const DRAIN_H_MAX : i32 =
+    max(1, i32(floor(DRAIN_VMAX_C * DRAIN_VMAX_C / (2.0 * max(DRAIN_G_C, 1e-6)))));
 
-// The ladder, GPU side. Candidate -> Measuring -> Adopted, and Releasing is the
-// way out. Measuring is its own state rather than a flag because the reduce is
-// a WHOLE-FOOTPRINT pass and must run exactly once per adoption: a body that
-// re-measured every tick would be the O(volume)-per-tick cost this design
-// exists to delete.
-const WB_CANDIDATE : i32 = 0;
-const WB_MEASURING : i32 = 1;
-const WB_ADOPTED   : i32 = 2;
-const WB_RELEASING : i32 = 3;
+// Integer square root, Newton, exact over u32 and bit-identical everywhere.
+// No sqrt(): this feeds a jet VELOCITY and a flow RATE that a mass ledger is
+// compared against, and an f32 that rounds 4489.0 to 4488.9999 is a different
+// world on a different driver (rule 1). Bounded to 24 iterations, which is
+// several more than the u32 range needs.
+fn wbIsqrt(n : u32) -> u32 {
+  if (n == 0u) { return 0u; }
+  var x = n;
+  var y = (x + 1u) / 2u;
+  for (var i = 0; i < 24; i++) {
+    if (y >= x) { break; }
+    x = y;
+    y = (x + n / x) / 2u;
+  }
+  return x;
+}
 
-// CPU-sent per-body flags (TickParams.waterBodies row 1, word 3).
-const WBF_PROPOSE : i32 = 1;   // the CPU's deterministic tests all passed
-const WBF_RELEASE : i32 = 2;   // an EXIT test failed; hand this body back
+// The ledger's WORD MAP and the hole packing live in common.wgsl now, not
+// here: from M3 a SECOND module reads them (sim_fluid_seam.wgsl's drain-shell
+// trigger, component 7), and a word map transcribed into two shaders is the
+// classic two-places-must-agree bug with no checker behind it. See the
+// WBS_*/WB_*/wbHole* block in common.wgsl.
 
 fn wbBase(b : u32) -> u32 { return b * WATERBODY_STATE_WORDS; }
 fn wbGet(b : u32, w : u32) -> i32 { return atomicLoad(&waterBodyState[wbBase(b) + w]); }
@@ -302,6 +345,19 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     wbSet(b, WBS_STEPS, 0);
     wbSet(b, WBS_FRAC, 0);
     wbSet(b, WBS_ADOPTTICK, i32(T.tick));
+    // The hole record starts EMPTY, not stale. A body re-adopted after a
+    // release must rediscover its holes from the voxels — the descriptor is a
+    // cache of aggregates over the world (plan §3.1) and a hole is a fact about
+    // the world, so carrying one across an adoption would be the same class of
+    // error as carrying a level.
+    wbSet(b, WBS_HOLEKEY, WB_HOLE_NONE);
+    wbSet(b, WBS_HOLEKEYN, WB_HOLE_NONE);
+    wbSet(b, WBS_HOLEAREA, 0);
+    wbSet(b, WBS_HOLEAREAN, 0);
+    wbSet(b, WBS_HOLETTL, 0);
+    wbSet(b, WBS_EMIT, 0);
+    wbSet(b, WBS_JETV, 0);
+    wbSet(b, WBS_EXSHELL, 0);
     wbSet(b, WBS_STATE, WB_ADOPTED);
     return;
   }
@@ -356,6 +412,93 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     debit = debit + take;
     wbSet(b, WBS_DRAINED, wbGet(b, WBS_DRAINED) + take);
   }
+
+  // ==========================================================================
+  // (1b) THE DISCHARGE LAW — component 6. THE drain source from M3 on.
+  // ==========================================================================
+  //
+  // PROMOTE LAST TICK'S SCAN. wbHole ran at the END of last tick's row block
+  // and accumulated into the *N words; this is the only reader and the only
+  // clearer, so a sighting can never be counted twice (plan §3.3, at pass
+  // granularity, exactly as `shaved` above).
+  let holeKeyN = wbGet(b, WBS_HOLEKEYN);
+  let holeAreaN = wbGet(b, WBS_HOLEAREAN);
+  var holeKey = wbGet(b, WBS_HOLEKEY);
+  var holeArea = wbGet(b, WBS_HOLEAREA);
+  var holeTtl = wbGet(b, WBS_HOLETTL);
+  if (holeKeyN != WB_HOLE_NONE) {
+    // `holeAreaN` counted cells at the PREVIOUS key's height, so it is only the
+    // orifice of the hole we are about to keep. When the deepest escape point
+    // moves (the shaft was driven another cell down) the area re-seeds at 1 and
+    // the next scan measures it — an under-measured A slows the drain by a tick
+    // and cannot lose an eighth, because the debit is what was emitted.
+    let sameY = (holeKeyN >> 22) == (holeKey >> 22);
+    holeArea = select(1, max(holeAreaN, 1), sameY && holeKey != WB_HOLE_NONE);
+    holeKey = holeKeyN;
+    holeTtl = WB_HOLE_TTL;
+  } else {
+    holeTtl = max(holeTtl - 1, 0);
+    if (holeTtl == 0) { holeKey = WB_HOLE_NONE; holeArea = 0; }
+  }
+  wbSet(b, WBS_HOLEKEYN, WB_HOLE_NONE);   // armed for THIS tick's scan
+  wbSet(b, WBS_HOLEAREAN, 0);
+  wbSet(b, WBS_HOLEKEY, holeKey);
+  wbSet(b, WBS_HOLEAREA, holeArea);
+  wbSet(b, WBS_HOLETTL, holeTtl);
+
+  var emit = 0;
+  var jetv = 0;
+  // `b < T.waterDrainBodies` is rule 2 charged BEFORE emission: the CPU
+  // reserved this body a block of WATER_DRAIN_OPS spawn slots or it did not,
+  // and a body without a block is REFUSED the discharge outright rather than
+  // granted eighths no particle can carry. Refusal costs only realism — the
+  // water is still there and the CA still moves it.
+  if (st == WB_ADOPTED && holeKey != WB_HOLE_NONE && T.waterDrainMax > 0 &&
+      b < T.waterDrainBodies) {
+    let holeY = wbHoleY(holeKey, floorY);
+    // ---- THE SINGLE EVALUATION OF h ---------------------------------------
+    // Everything below — the exit speed the particles carry and the eighths the
+    // ledger owes — comes from this one line. Capped at DRAIN_H_MAX so the
+    // momentum asked for is the momentum spawnAppend grants (see the const
+    // block's note on plan §6 trap 1).
+    let h = clamp(level - holeY, 0, DRAIN_H_MAX);
+    if (h > 0) {
+      // v = sqrt(2 g h). DRAIN_TWO_G is Q16.16, so DRAIN_TWO_G * h is v^2 in
+      // Q16.16 (cells/tick)^2 and its integer square root is v in Q8 — the
+      // half-shift is what keeps the whole computation inside i32 without a
+      // 64-bit intermediate. Overflow: DRAIN_TWO_G <= 2*4000/900*65536 = 5.8e5
+      // at the tuning clamp, times DRAIN_H_MAX (<= 8 at the shipped substep
+      // budget, <= 128 at 32 substeps) = 7.5e7, comfortably inside i32.
+      let vQ8 = i32(wbIsqrt(u32(DRAIN_TWO_G * h)));
+      jetv = min(vQ8 << 8, FLUID_VMAX);
+      // Q = Cd * A * v, in cells^3/tick, x8 to reach eighths.
+      //   cdv (Q8) = Cd * v      <= 1.0 * 4.05 cells/tick -> ~1037
+      //   q        = cdv * A * 8 / 256 = cdv * A / 32
+      // A is a cell count bounded by the basin's surface (14,493 for the
+      // harness lake), so the product tops out near 1.5e7.
+      let cdv = (DRAIN_CD_Q16 * vQ8) >> 16;
+      var q = (cdv * max(holeArea, 1)) / 32;
+      // THE PER-HOLE PER-TICK BOUND (rule 2, plan §6 trap 2). Two caps and the
+      // op block is the harder of them: granting more than WATER_DRAIN_OPS
+      // would be a debit with no particle behind it.
+      q = min(q, T.waterDrainMax);
+      q = min(q, i32(WATER_DRAIN_OPS));
+      // Never owe more than the body physically holds, for the reason the test
+      // tap has the same clamp: a debit no shave can pay marches the level down
+      // through the basin floor.
+      let held = wbGet(b, WBS_VOLUME) - wbGet(b, WBS_DRAINED);
+      emit = clamp(q, 0, max(held, 0));
+      debit = debit + emit;
+      wbSet(b, WBS_DRAINED, wbGet(b, WBS_DRAINED) + emit);
+    }
+  }
+  // Published for wbDrain, which writes exactly `emit` live ops and fills the
+  // rest of the block with dead ones. That equality is what makes "debit what
+  // was GRANTED" (plan §3.2) true by construction here rather than by audit:
+  // the number the ledger owes and the number of particles that exist are the
+  // same integer, read from the same word, in the same tick.
+  wbSet(b, WBS_EMIT, emit);
+  wbSet(b, WBS_JETV, jetv);
 
   if (debit < 0) { debit = 0; }   // cannot happen; the shave only takes what it was told
 
@@ -539,5 +682,174 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
       atomicAdd(&waterBodyState[wbBase(b) + WBS_CAPPED], want - take);
     }
     break;   // one surface cell per column per tick — see the header
+  }
+}
+
+// ============================================================================
+// THE DISCHARGE, EMITTED — component 6's other half. One thread per RESERVED
+// spawn-op slot.
+//
+// WHY A THREAD PER SLOT rather than a loop in the ledger: every slot in the
+// block must be written every tick it exists. A slot the pass skipped keeps
+// whatever a previous tick left in it and `spawnAppend` would hand that stale
+// particle back to the pool as live — the same class of bug as a carried
+// descriptor, and invisible until a lake spat two-tick-old water. So the block
+// is exhaustively filled: `emit` live ops, then dead ones (mat 0, which
+// spawnAppend writes as a dead particle for compaction to drop next tick).
+//
+// THE SINGLE-EVALUATION RULE IS KEPT BY CONSTRUCTION. This pass does not
+// recompute h, Q or v. It reads WBS_EMIT and WBS_JETV, which the ledger wrote
+// from one evaluation, in the pass before this one. There is no second rule to
+// disagree with the first.
+// ============================================================================
+@compute @workgroup_size(64)
+fn wbDrain(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let total = T.waterDrainBodies * WATER_DRAIN_OPS;
+  if (gid.x >= total) { return; }
+  let b = gid.x / WATER_DRAIN_OPS;
+  let k = i32(gid.x % WATER_DRAIN_OPS);
+  let slot = T.waterDrainSpawnBase + gid.x;
+
+  var op : FluidSpawnOp;
+  op.px = 0; op.py = 0; op.pz = 0;
+  op.vx = 0; op.vy = 0; op.vz = 0;
+  op.species = 0u;
+  op.mat = 0u;                       // DEAD: spawnAppend writes a dead particle
+
+  if (b < T.waterBodyCount && b < WATERBODY_CAP) {
+    let emit = wbGet(b, WBS_EMIT);
+    let st = wbGet(b, WBS_STATE);
+    if (st == WB_ADOPTED && k < emit) {
+      let g = wbGeom(b);
+      let seed = wbSeed(b);
+      let key = wbGet(b, WBS_HOLEKEY);
+      let area = max(wbGet(b, WBS_HOLEAREA), 1);
+      let hx = wbHoleX(key, g.x);
+      let hz = wbHoleZ(key, g.y);
+      let hy = wbHoleY(key, seed.x);
+      // SPREAD OVER THE ORIFICE. All `emit` particles born in one cell would be
+      // an over-packed node the EOS ejects rather than a jet; the hole is `area`
+      // cells wide, so scatter across a square of that side. hash3 keyed on
+      // (seed, tick, slot) — the slot is this thread's own index, a pure
+      // function of the dispatch shape and not of arrival order (rule 1).
+      let hr = i32(wbIsqrt(u32(area))) / 2;
+      let h0 = hash3(T.seed, T.tick, u32(0x5EA1u) ^ gid.x);
+      let h1 = pcg(h0);
+      var ox = 0;
+      var oz = 0;
+      if (hr > 0) {
+        let span = u32(2 * hr + 1);
+        ox = i32(h0 % span) - hr;
+        oz = i32((h0 >> 8u) % span) - hr;
+      }
+      let c = vec3<i32>(hx + ox, hy, hz + oz);
+      // Q16.16 world cells, jittered inside the cell so the P2G scatter sees a
+      // spread of positions rather than `emit` coincident particles.
+      op.px = (c.x << 16) + 8192 + i32(h1 & 0xBFFFu);
+      op.py = (c.y << 16) + 8192 + i32((h1 >> 14u) & 0xBFFFu);
+      op.pz = (c.z << 16) + 8192 + i32(pcg(h1) & 0xBFFFu);
+      // The exit velocity, DOWNWARD. Bounded by DRAIN_H_MAX to be inside
+      // FLUID_VMAX, so spawnAppend's clamp is a belt-and-braces no-op here and
+      // the momentum granted is the momentum the head paid for.
+      op.vy = -wbGet(b, WBS_JETV);
+      op.mat = u32(g.w);
+      op.species = (u32(g.w) - 1u) & 3u;   // the exciteEmit convention
+    }
+  }
+  waterSpawnOps[slot] = op;
+}
+
+// ============================================================================
+// HOLE DETECTION — component 6's trigger. One workgroup per listed chunk, one
+// thread per (x,z) COLUMN.
+//
+// A HOLE IS AN AIR CELL UNDER THE WATERLINE WITH AIR UNDER IT: inside the
+// body's footprint, at or below the body's level, and with nothing beneath it
+// to hold water up. In an intact basin that set is EMPTY by construction — a
+// tarn's bowl replaces the ground, so every column inside the disc is stone up
+// to the floor and water from there to the level. It becomes non-empty exactly
+// when someone digs, explodes or bores through, which is what plan §6 means by
+// "detect on the chunk-dirty path".
+//
+// AND THAT IS LITERALLY THE GATE: this pass does nothing at all on a chunk the
+// CA did not mark and the MPM has no block in. A still lake with no hole in it
+// runs `dirtyIn[slot] == 0` for every listed chunk and returns, so component 6
+// costs the same zero at rest that components 3 and 4 do (pass E).
+//
+// THE LOWEST CANDIDATE WINS, by atomicMin over a key that packs (y, x, z) — the
+// deepest escape point is the greatest head, and integer min is order-free so
+// two threads racing cannot change which cell that is.
+// ============================================================================
+@compute @workgroup_size(16, 1, 16)
+fn wbHole(@builtin(workgroup_id) wg : vec3<u32>,
+          @builtin(local_invocation_id) li : vec3<u32>) {
+  if (wg.x >= T.waterChunkCount) { return; }
+  let e = wbChunkEntry(wg.x);
+  let b = e >> 16u;
+  let slot = e & 0xFFFFu;
+  if (b >= T.waterBodyCount) { return; }
+  if (T.waterDrainMax <= 0) { return; }
+  let st = wbGet(b, WBS_STATE);
+  if (st != WB_ADOPTED) { return; }
+  // THE CHUNK-DIRTY PATH. `dirtyIn` is the CA's own answer to "was this chunk
+  // disturbed this tick" and the block map is the MPM's; between them they
+  // cover the dig that opens a hole and the jet that keeps one open. A chunk
+  // that is neither is a chunk nothing has happened in, and rescanning it would
+  // be the O(volume)-per-tick cost this whole design exists to delete.
+  if (dirtyIn[slot] == 0u && fluidBlockMapS[slot] == 0u) { return; }
+
+  let g = wbGeom(b);
+  let seed = wbSeed(b);
+  let level = wbGet(b, WBS_LEVEL);
+  let curKey = wbGet(b, WBS_HOLEKEY);
+  let wc = wbSlotWorldChunk(slot);
+  let x = wc.x * i32(CHUNK) + i32(li.x);
+  let z = wc.z * i32(CHUNK) + i32(li.z);
+  let dx = x - g.x;
+  let dz = z - g.y;
+  if (dx * dx + dz * dz > g.z) { return; }
+
+  let cyLo = wc.y * i32(CHUNK);
+  let y0 = max(cyLo, seed.x - WB_HOLE_YBIAS);
+  let y1 = min(cyLo + i32(CHUNK) - 1, level);
+  if (y1 < y0) { return; }
+
+  // The current hole's height, for the ORIFICE AREA count. Measuring A at the
+  // height the ledger is actually using is what makes `Q = Cd*A*sqrt(2gh)` an
+  // orifice equation rather than an arbitrary rate: a 5x5 shaft twenty cells
+  // deep has an area of 25, not 500.
+  var curY = -0x40000000;
+  if (curKey != WB_HOLE_NONE) { curY = wbHoleY(curKey, seed.x); }
+
+  var found = false;
+  for (var y = y0; y <= y1; y++) {
+    // THE PREDICATE IS THE WATER/VOID INTERFACE, not "a void under the lake",
+    // and the difference is the whole orifice equation. The first version of
+    // this pass took any air cell with air below it, which finds the FLOOR OF
+    // THE CAVERN the shaft opens into — measured on `--gate waterbody` pass H
+    // as A = 473 for a 5x5 shaft, because the chamber under it is 25 cells
+    // across. `A` is then not an orifice at all and Q is an arbitrary rate.
+    //
+    // What water escapes THROUGH is the cell where the body's own liquid has
+    // nothing under it. That set is EMPTY in an intact basin by construction
+    // (every column inside the disc is stone to the floor and water above it),
+    // it is exactly the 5x5 shaft mouth when someone bores through, and it
+    // TRACKS the mouth down as the shaft empties — which is the head growing,
+    // which is what Torricelli is about.
+    let c = vec3<i32>(x, y, z);
+    if (i32(voxMat(voxWordAt(c))) != g.w) { continue; }
+    if (voxMat(voxWordAt(c + vec3<i32>(0, -1, 0))) != MAT_AIR) { continue; }
+    // The HOLE is the void the water is standing over, one cell down.
+    let hy = y - 1;
+    if (hy == curY) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_HOLEAREAN], 1);
+    }
+    if (!found) {
+      // Lowest in this column only: the cells above it are the same shaft, and
+      // one atomicMin per column per tick is the bound on this pass.
+      atomicMin(&waterBodyState[wbBase(b) + WBS_HOLEKEYN],
+                wbHoleKey(hy - seed.x, dx, dz));
+      found = true;
+    }
   }
 }

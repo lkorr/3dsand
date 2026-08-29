@@ -80,6 +80,8 @@ namespace {
 #define PIPE_WATER_LEDGER    Pipe::WaterLedger
 #define PIPE_WATER_REDUCE    Pipe::WaterReduce
 #define PIPE_WATER_SHAVE     Pipe::WaterShave
+#define PIPE_WATER_DRAIN     Pipe::WaterDrain
+#define PIPE_WATER_HOLE      Pipe::WaterHole
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -113,6 +115,7 @@ namespace {
 #define C_CAACTIVE  Cond::CaActive
 #define C_VIZACTIVE Cond::VizActive
 #define C_WATERBODY Cond::WaterBody
+#define C_WATERDRAIN Cond::WaterDrain
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
@@ -131,6 +134,7 @@ namespace {
 #define IND_FLUIDPARGS    (uint32_t)DispatchSel::IndFluidPArgs
 #define D_WATERCHUNKS     (uint32_t)DispatchSel::WaterChunks
 #define D_WATERCHUNKS64   (uint32_t)DispatchSel::WaterChunks64
+#define D_WATERDRAIN      (uint32_t)DispatchSel::WaterDrainSel
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

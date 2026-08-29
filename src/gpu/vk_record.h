@@ -82,6 +82,10 @@ struct RecordCtx {
   // Zero whenever sim.waterBodyMode is 0, which is what makes the off switch an
   // exact identity: no row is recorded at all.
   uint32_t waterChunkCount = 0;
+  // Reserved drain spawn-op BLOCKS this tick (M3, component 6). Zero at
+  // sim.waterBodyMode 0 and whenever no body is proposed, so the discharge
+  // row is not recorded and the shipped world cannot see it.
+  uint32_t waterDrainBodies = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is

@@ -362,6 +362,12 @@ SPEC = [
     ("sim", "waterBodyQuietTicks", "TUNE_WATER_BODY_QUIET_TICKS", "i", 30),
     ("sim", "waterBodyMaxCount", "TUNE_WATER_BODY_MAX_COUNT", "i", 64),
     ("sim", "waterBodyTestDrain", "TUNE_WATER_BODY_TEST_DRAIN", "i", 0),
+
+    # THE DISCHARGE LAW (component 6, M3)
+    ("sim", "drainMaxEighthsPerTick", "TUNE_DRAIN_MAX_EIGHTHS", "i", 512),
+    ("sim", "drainExciteRadius", "TUNE_DRAIN_EXCITE_RADIUS", "i", 6),
+    ("sim", "drainCd", "TUNE_DRAIN_CD", "f", 0.6),
+    ("sim", "drainGravity", "TUNE_DRAIN_GRAVITY", "f", 900.0),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
     ("sim", "windDrag", "TUNE_WIND_DRAG", "f", 3.0),
     ("sim", "windFluidGain", "TUNE_WIND_FLUID_GAIN", "f", 0.35),

@@ -233,6 +233,8 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"waterBodyQuietTicks", &Tuning::Sim::waterBodyQuietTicks},
     {"waterBodyMaxCount", &Tuning::Sim::waterBodyMaxCount},
     {"waterBodyTestDrain", &Tuning::Sim::waterBodyTestDrain},
+    {"drainMaxEighthsPerTick", &Tuning::Sim::drainMaxEighthsPerTick},
+    {"drainExciteRadius", &Tuning::Sim::drainExciteRadius},
     {"windMode", &Tuning::Sim::windMode},
   };
   for (const auto& e : iFields) {
@@ -258,6 +260,8 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"fluidSettleEps", &Tuning::Sim::fluidSettleEps},
     {"fluidWakeSpeed", &Tuning::Sim::fluidWakeSpeed},
     {"fluidStainRate", &Tuning::Sim::fluidStainRate},
+    {"drainCd", &Tuning::Sim::drainCd},
+    {"drainGravity", &Tuning::Sim::drainGravity},
     {"windDrag", &Tuning::Sim::windDrag},
     {"windFluidGain", &Tuning::Sim::windFluidGain},
     {"windFluidMass", &Tuning::Sim::windFluidMass},
@@ -798,6 +802,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "waterBodyQuietTicks", s.waterBodyQuietTicks, out, at);
     ReadI(*g, "waterBodyMaxCount", s.waterBodyMaxCount, out, at);
     ReadI(*g, "waterBodyTestDrain", s.waterBodyTestDrain, out, at);
+    ReadI(*g, "drainMaxEighthsPerTick", s.drainMaxEighthsPerTick, out, at);
+    ReadI(*g, "drainExciteRadius", s.drainExciteRadius, out, at);
+    ReadF(*g, "drainCd", s.drainCd, out, at);
+    ReadF(*g, "drainGravity", s.drainGravity, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
     ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
@@ -985,6 +993,32 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       s.fluidSettleTicks = s.fluidSettleTicks < 8 ? 8 : 600;
     }
     clampWarnF(s.fluidStainRate, 0.0f, 30.0f, "fluidStainRate");
+    // ---- the discharge law (component 6) -------------------------------
+    // The rate cap is the rule-2 bound on the jet AND the size of the spawn-op
+    // block the CPU reserves, so it is clamped to kWaterDrainOpsPerBody here
+    // rather than in the kernel: an emission the block cannot hold would be a
+    // debit with no particle behind it, which is exactly the mass pump plan §6
+    // forbids. 0 turns the discharge off with no other effect.
+    if (s.drainMaxEighthsPerTick < 0 ||
+        s.drainMaxEighthsPerTick > (int)kWaterDrainOpsPerBody) {
+      out.warnings.push_back("sim.drainMaxEighthsPerTick out of 0..512; clamped");
+      s.drainMaxEighthsPerTick =
+          s.drainMaxEighthsPerTick < 0 ? 0 : (int)kWaterDrainOpsPerBody;
+    }
+    // Component 7's shell radius. Bounded because the shell is a DISC of cells
+    // at the free surface plus a column: at r the surface term is ~pi*r^2 cells
+    // of up to 8 eighths each, and plan §9 item 2 is that a violent drain's
+    // solid-ball excite is ~33,000 particles against a ~40,000 envelope. 32
+    // caps the disc at ~3,200 cells, which the 8,000 excite ceiling refuses
+    // gracefully rather than converting the pool.
+    if (s.drainExciteRadius < 0 || s.drainExciteRadius > 32) {
+      out.warnings.push_back("sim.drainExciteRadius out of 0..32; clamped");
+      s.drainExciteRadius = s.drainExciteRadius < 0 ? 0 : 32;
+    }
+    // Cd above 1 is not a discharge coefficient, it is a mass source. The
+    // gravity bound is the fluid lane's, for the same fixed-point reason.
+    clampWarnF(s.drainCd, 0.0f, 1.0f, "drainCd");
+    clampWarnF(s.drainGravity, 0.0f, 4000.0f, "drainGravity");
     // Wind coupling. The gate first: an unknown mode must not fall through to
     // "some wind", because the whole hash argument for shipping this is that
     // mode 0 means literally no kernel reads the field.

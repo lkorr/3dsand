@@ -508,6 +508,20 @@ TP_I(sim, waterBodyQuietTicks, TUNE_WATER_BODY_QUIET_TICKS, 30)
 TP_I(sim, waterBodyMaxCount, TUNE_WATER_BODY_MAX_COUNT, 64)
 TP_I(sim, waterBodyTestDrain, TUNE_WATER_BODY_TEST_DRAIN, 0)
 
+// ---- THE DISCHARGE LAW (component 6, M3) ----
+// A hole under a body of water is an orifice: Q = Cd * A * sqrt(2 g h). The
+// RATE knob is integer (rule 1) and it is the rule-2 bound on the jet — the
+// ledger debits by what the op block actually emitted, never by the analytic Q,
+// so lowering it slows a drain and can never lose an eighth. The two PHYSICAL
+// quantities are human-unit floats in the sanctioned sim.fluid* lane: they are
+// const-eval'd to fixed point at the top of sim_waterbody.wgsl by Tint under
+// IEEE-exact rules, so the kernel stays integer and bit-deterministic.
+// drainExciteRadius is component 7's v1 shell radius; 0 is an exact identity.
+TP_I(sim, drainMaxEighthsPerTick, TUNE_DRAIN_MAX_EIGHTHS, 512)
+TP_I(sim, drainExciteRadius, TUNE_DRAIN_EXCITE_RADIUS, 6)
+TP_F(sim, drainCd, TUNE_DRAIN_CD, 0.6f)
+TP_F(sim, drainGravity, TUNE_DRAIN_GRAVITY, 900.0f)
+
 // ---- wind COUPLING: how hard the field pushes the sim (research doc §4.5/4.6)
 // The SHAPE of the field is the wind.* group far above; this is what the three
 // sim consumers do with it. Human-unit floats for the sim.fluid* reason and by

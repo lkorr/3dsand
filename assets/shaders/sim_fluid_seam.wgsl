@@ -51,6 +51,17 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
+// THE WATER-BODY LEDGER, read-only apart from one attribution counter
+// (WBS_EXSHELL). COMPONENT 7 of docs/PLAN_water_master.md lives on the other
+// side of this binding: a draining hole publishes its position, its head and
+// its granted discharge into `waterBodyState`, and exciteDetect below asks
+// whether a settled cell is inside that hole's excite SHELL.
+//
+// It is bound into the SLIM group rather than given a seam-group entry because
+// binding 24 has to mean the same buffer here as it does in sim_waterbody.wgsl
+// and sim_step.wgsl — the same "one identifier cannot carry two binding numbers
+// across modules that share common.wgsl" rule fluidBlockMapS is named for.
+@group(0) @binding(24) var<storage, read_write> waterBodyState : array<atomic<i32>>;
 
 // The ping-pong pair: src is LAST tick's particles (read only — the tick's
 // working buffer is dst, which every later pass and the solver substeps use).
@@ -328,6 +339,7 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_SETUNSTABLE], 0u);
     atomicStore(&fluidArgs[FA_EXSEEN], 0u);
     atomicStore(&fluidArgs[FA_EXCANDID], 0u);
+    atomicStore(&fluidArgs[FA_SPAWNDEAD], 0u);
   }
   workgroupBarrier();
   var base = wgScan[li];
@@ -370,6 +382,13 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = atomicLoad(&exciteScratch[EX_COMPACT_LIVE]) + gid.x;
   if (slot >= FLUID_CAP) { return; }  // CPU charges the budget; belt+braces
   let op = fluidSpawnOps[gid.x];
+  // A mat-0 op is DEAD BY DESIGN, not a bug: the water-body discharge fills a
+  // reserved block whose tail is unused this tick, and a slot the pass skipped
+  // would keep a stale particle that compaction would count as live. fpPack's
+  // alive test is `mat != 0`, so writing the op through unchanged already
+  // produces a dead particle — this only COUNTS them, so a conservation gate
+  // can subtract the block's tail from FA_LIVE and see the real in-flight mass.
+  if (op.mat == 0u) { atomicAdd(&fluidArgs[FA_SPAWNDEAD], 1u); }
   var p : FluidParticle;
   p.px = op.px; p.py = op.py; p.pz = op.pz;
   // The CFL cap is derived from the substep knob (common.wgsl), so a spawn op
@@ -581,6 +600,66 @@ fn seamSurfaceStep(c : vec3<i32>) -> bool {
   return false;
 }
 
+// ---- trigger (e): THE DRAIN SHELL — component 7 ---------------------------
+//
+// Water at a violent throat is genuinely moving at ~7 m/s and no painted
+// surface sells that as still water. So a draining hole hands a REGION around
+// itself to the solver while the other ~95% of the body stays a number. That
+// asymmetry is the whole design: plan §5's "jurisdiction is LOCAL" — releasing
+// the entire lake because someone poked a hole in it throws away the win at
+// exactly the moment it matters — and this predicate is where LOCAL is defined.
+//
+// A SHELL, NOT A BALL, and this is the plan's one unmeasured mitigation made
+// concrete. §9 item 2: a solid hemisphere at the r ~ 25 a real vortex implies is
+// ~33,000 particles against a ~40,000 largest-measured scene. What is actually
+// worth simulating is the free surface (where the funnel dip is visible) and the
+// throat column (where the water is fast). The interior of a funnel is water
+// nobody can look at — the same principle as the skin/collider resolution split.
+// So:
+//
+//   * the SURFACE ANNULUS — the two cells at the body's level, out to
+//     sim.drainExciteRadius. This is the dip.
+//   * the THROAT COLUMN — a narrow shaft over the hole, from the hole up to the
+//     level. This is the jet's own water.
+//
+// `WBS_EXSHELL` counts what this actually converts, cumulatively, so the
+// mitigation stops being unmeasured (`--gate waterbody` reports it).
+//
+// COST. The loop is over LIVE BODIES (1..3 in any real window, capped at
+// WATERBODY_CAP) and it is reached only for a settled liquid cell that failed
+// every cheaper trigger; the radius knob at 0 makes it an exact identity, which
+// is what lets the whole component be switched off without a rebuild.
+fn seamDrainShellHit(c : vec3<i32>, mat : u32) -> bool {
+  let r = T.waterExciteRadius;
+  if (r <= 0) { return false; }
+  let n = min(T.waterBodyCount, WATERBODY_CAP);
+  for (var b = 0u; b < n; b++) {
+    let base = b * WATERBODY_STATE_WORDS;
+    if (atomicLoad(&waterBodyState[base + WBS_STATE]) != WB_ADOPTED) { continue; }
+    // ONLY A DRAINING HOLE. `emit` is the eighths the ledger granted this tick;
+    // zero means the hole is plugged, capped out or was never there, and a
+    // shell standing open over still water would be a permanent excite source —
+    // exactly the "light-gated rules never sleep" failure this engine already
+    // paid for once.
+    if (atomicLoad(&waterBodyState[base + WBS_EMIT]) <= 0) { continue; }
+    let key = atomicLoad(&waterBodyState[base + WBS_HOLEKEY]);
+    if (key == WB_HOLE_NONE) { continue; }
+    let g = T.waterBodies[b * 2u];
+    if (mat != u32(g.w)) { continue; }          // not this body's liquid
+    let seed = T.waterBodies[b * 2u + 1u];
+    let level = atomicLoad(&waterBodyState[base + WBS_LEVEL]);
+    let hy = wbHoleY(key, seed.x);
+    if (c.y > level || c.y < hy) { continue; }
+    let dx = c.x - wbHoleX(key, g.x);
+    let dz = c.z - wbHoleZ(key, g.y);
+    let d2 = dx * dx + dz * dz;
+    if (c.y >= level - 1 && d2 <= r * r) { return true; }   // surface annulus
+    let tr = max(r / 4, 1);
+    if (d2 <= tr * tr) { return true; }                     // throat column
+  }
+  return false;
+}
+
 // detect: one workgroup per dirty chunk (the CA's own indirect args), 16
 // cells per thread. A candidate cell gets its mark + depth written into its
 // OWN voxel word (bits 19..23 — the sanctioned scratch span) and its
@@ -678,6 +757,28 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
         if (atSurface && seamSurfaceStep(c)) { excite = true; }
       }
     }
+    // Trigger (e), THE DRAIN SHELL (component 7). Deliberately OUTSIDE the
+    // `fluidExciteEnable` gate above: that switch is the global
+    // disturbance-excite policy, and a hole with water coming out of it is not
+    // a policy question — a drain should make a jet whether or not settled
+    // water elsewhere is allowed to wake itself. Its own switch is
+    // sim.drainExciteRadius, and 0 makes seamDrainShellHit an exact identity.
+    var byShell = false;
+    if (!excite && seamDrainShellHit(c, mat)) {
+      excite = true;
+      byShell = true;
+      // The measurement plan §9 item 2 calls for. Cumulative per body while it
+      // stays adopted, so one read at the end of a gate window sees the whole
+      // shell rather than whatever the last tick happened to do.
+      for (var b = 0u; b < min(T.waterBodyCount, WATERBODY_CAP); b++) {
+        let base = b * WATERBODY_STATE_WORDS;
+        if (atomicLoad(&waterBodyState[base + WBS_STATE]) != WB_ADOPTED) { continue; }
+        if (u32(T.waterBodies[b * 2u].w) != mat) { continue; }
+        atomicAdd(&waterBodyState[base + WBS_EXSHELL], 1);
+        break;
+      }
+    }
+
     // Trigger (b), always on: progressive wake. A face neighbor's grid node
     // (last substep of last tick) carries real mass moving above the wake
     // threshold — the disturbance in the active region has reached this
@@ -726,7 +827,12 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // the surrounding flow re-accelerates a rest-seeded particle through P2G
     // within a substep anyway).
     var depth = 0u;
-    if (byFall) {
+    // Shell cells get the hydrostatic pre-compression too, and for the reason
+    // the fall case does: a throat column is deep water, and reawakening it at
+    // J = 1 is exactly the "every drained lake bounces like jelly" the
+    // pre-compression exists to stop (plan §7 O-4). It is a PRESSURE seed, not a
+    // velocity one, so the settle/excite pair stays strictly dissipative.
+    if (byFall || byShell) {
       for (var d = 1; d <= 15; d++) {
         let a = c + vec3<i32>(0, d, 0);
         if (!inWindow(a, T.origin) || voxMat(voxWordAt(a)) != mat) { break; }

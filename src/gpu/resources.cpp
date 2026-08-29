@@ -105,6 +105,7 @@ std::string ShaderConstantPrelude() {
   o << "const WATERBODY_WORDS : u32 = " << kWaterBodyWords << "u;\n";
   o << "const WATERBODY_STATE_WORDS : u32 = " << kWaterBodyStateWords << "u;\n";
   o << "const WATER_CHUNK_CAP : u32 = " << kWaterChunkCap << "u;\n";
+  o << "const WATER_DRAIN_OPS : u32 = " << kWaterDrainOpsPerBody << "u;\n";
   // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
   // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
   // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).

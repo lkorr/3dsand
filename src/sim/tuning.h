@@ -1134,6 +1134,31 @@ struct Tuning {
     // being the only drain source rather than of a threshold.
     int waterBodyTestDrain = 0;
 
+    // ---- THE DISCHARGE LAW (component 6) and THE LOCAL EXCITE (7), M3 ----
+    //
+    // A hole is an orifice and a lake behind it is a head: Q = Cd*A*sqrt(2 g h).
+    // ONE evaluation of `h` (in sim_waterbody.wgsl's wbLedger) produces both the
+    // emitted particle momentum and the ledger debit — emit by one rule and
+    // decrement by another and the pair is a mass pump under every edge case.
+    //
+    // THE BOUND, eighths per hole per tick, and it is rule 2 rather than taste:
+    // the CPU reserves exactly kWaterDrainOpsPerBody spawn-op slots per body, so
+    // this is clamped to that and the ledger can never publish an emission the
+    // op block cannot hold. When the cap binds, the debit is what was ACTUALLY
+    // written (discipline 3.2) — capping slows a drain, it cannot lose an eighth.
+    int drainMaxEighthsPerTick = 512;
+    // COMPONENT 7's v1 radius, world cells. The shell is the free-surface disc
+    // at the body's level plus the throat column over the hole — NOT a solid
+    // ball: plan §9 ranks the ball's ~33,000 particles against a ~40,000
+    // measured envelope as the second-most-likely way this work fails. 0
+    // disables the shell and is an exact identity (no cell can satisfy it).
+    int drainExciteRadius = 6;
+    // The two PHYSICAL quantities, human-unit floats in the sanctioned
+    // sim.fluid* lane — const-eval'd to fixed point at the top of
+    // sim_waterbody.wgsl, so the kernel stays integer (rule 1).
+    float drainCd = 0.6f;        // orifice discharge coefficient
+    float drainGravity = 900.0f; // vox/s^2; should match sim.fluidGravity
+
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
     // The SHAPE of the field is the `wind` group below; these are what the
     // three SIM consumers do with what they sample. Human-unit floats, the
