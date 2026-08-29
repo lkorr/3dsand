@@ -958,8 +958,15 @@
   /* ---------- models: rig panel + timeline ---------- */
   .edmain{display:flex;gap:0;align-items:stretch}
   .edmain .edviewport{flex:1;min-width:220px}
+  /* 420, not 380. The panel is a two-column form (a ~104px label gutter and a
+     field) with a hint column after it, and at 380 the fields won that fight:
+     the model rows clipped limb names to 104px, and the hints — see .rigf>i —
+     were left so little room they rendered one letter per line. Everything in
+     here is now wrap-tolerant, so this is a comfort default rather than a
+     minimum; the grip still drags it either way. Keep in step with the
+     double-click reset in editor.js buildSideGrip(). */
   .edside{
-    width:380px;flex:none;overflow-y:auto;overflow-x:hidden;
+    width:420px;flex:none;overflow-y:auto;overflow-x:hidden;
     max-height:calc(100vh - 340px);
     background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;
   }
@@ -983,12 +990,20 @@
      page from blue-highlighting the panel text. */
   body.edresizing{cursor:col-resize;user-select:none}
   body.edresizing .edcanvas{pointer-events:none}
+  /* A section header carries a variable number of buttons — the Models one
+     grows a "show all" the moment anything is hidden or soloed. Without the
+     wrap those five buttons had nowhere to go but narrower, and a flex button
+     that cannot shrink its padding shrinks its TEXT box instead: "show all"
+     broke to "show / all", "2× detail" to "2× / detail", and the header
+     silently became two ragged rows of half-words. Wrap the ROW and forbid
+     wrapping inside a button, so overflow costs a tidy second line. */
   .righdr{
-    display:flex;align-items:center;gap:8px;margin:10px 0 6px;
+    display:flex;align-items:center;gap:8px;margin:10px 0 6px;flex-wrap:wrap;
     color:var(--dim);font-family:var(--mono);font-size:11.5px;
     text-transform:uppercase;letter-spacing:.6px;
     border-bottom:1px solid var(--line);padding-bottom:4px;
   }
+  .righdr button{white-space:nowrap;flex:none}
   .righdr:first-child{margin-top:0}
   .riglist{display:flex;flex-direction:column;gap:2px}
   .riggroup{
@@ -1028,9 +1043,26 @@
   .rigrow input.cell.id{flex:1;min-width:0;width:0}
   .rigdot{width:6px;height:6px;border-radius:50%;background:var(--amber);flex:none}
   .rigbody{padding:4px 4px 10px 10px;border-left:2px solid var(--line2);margin:2px 0 6px}
-  .rigf{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:12px}
+  .rigf{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:12px;
+    flex-wrap:wrap}
   .rigf>span{color:var(--dim);min-width:104px;flex:none}
-  .rigf>i{color:var(--faint);font-size:10.5px;font-style:normal;flex:1}
+  /* The hint gets a LINE OF ITS OWN, indented to the field column — the same
+     110px (104 label + 6 gap) the .rigerr message below already uses, so the
+     two kinds of sub-text align.
+
+     It used to be `flex:1`, i.e. the only stretchy thing in the row, which
+     meant it absorbed every shortfall. On an `anchor` or `move` row the three
+     52px vector boxes leave it about 30px, and 30px of a 10.5px font is one
+     character: "joint position in prefab coords" rendered as a vertical column
+     of single letters down the right edge of the panel, and pushed the panel's
+     scrollWidth past its box. Widening the panel only moves where that starts
+     — a row can always be one control longer — so the hint stops competing for
+     the row instead. */
+  .rigf>i{color:var(--faint);font-size:10.5px;font-style:normal;line-height:1.4;
+    flex:1 1 100%;min-width:0;margin-left:110px}
+  /* ...except a live readout, which means nothing away from the slider it
+     reports on. It is short by construction, so it can stay in the row. */
+  .rigf>i#gaitReadout{flex:0 1 auto;margin-left:0}
   .rigf input.num{width:64px}
   .rigf input[type=range]{flex:1;accent-color:var(--acc)}
   .rigvec{display:flex;gap:3px}
@@ -8195,7 +8227,7 @@ const ARCH_NODES={
     wip:'Undo, copy/paste, select-all, delete/fill selection, resize handles, click-limb-to-select + grip rotation editing',
     desc:'The three.js model editor inside the Models tab: voxel editing, the limb/parts rig panel, sockets and the animation timeline.',
     files:['assets/editor/editor.js','assets/editor/rig.js','assets/editor/anim.js','docs/EDITOR_GUIDE.md'],
-    details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><code>anim.js</code> is a port of <code>src/game/anim.cpp</code> — keep them in sync.<br><br>The limb library saves and swaps parts between creatures through <code>assets/limbs/</code>, which is created on first save and needs the tuner server (a <code>file://</code> page cannot list it).'},
+    details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><code>anim.js</code> is a port of <code>src/game/anim.cpp</code> — keep them in sync.<br><br>The limb shelf has TWO sources and one pair of verbs (swap / add). <b>Saved parts</b> are the ones you put in <code>assets/limbs/</code>, created on first save. <b>Other creatures</b> needs no curation at all: it lists every limb of every other mob file, filtered by default to the tag of the limb you have selected, and lifts one straight out — a creature file is already a limb library, being the same named <code>.vox</code> models plus the same <code>limbs[]</code> sidecar one rung up the hierarchy. Both run the same <code>limblib.js</code> code path, so the incoming joint lands on the outgoing one either way. Both need the tuner server (a <code>file://</code> page cannot list assets).<br><br><b>Solo</b> (the <code>S</code> on a model row) is exclusive and self-cancelling: clicking a lit <code>S</code> always brings the whole body back. Shift-click accumulates, for comparing two limbs.'},
 
   telemetrySys:{label:'Telemetry Stream',tag:'cpu',
     desc:'A localhost-only WebSocket server streaming one JSON object per tick to this page. Zero cost when disabled.',

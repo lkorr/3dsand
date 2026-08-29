@@ -1600,9 +1600,35 @@ function warnIfEditingHidden(name) {
     'still paint into it. Turn on Whole [W] or pick another model.', true);
 }
 
-export function toggleModelSolo(name) {
-  if (soloModels.has(name)) soloModels.delete(name);
-  else { soloModels.add(name); hiddenModels.delete(name); }
+/**
+ * Solo `name`. EXCLUSIVE and SELF-CANCELLING by default: soloing replaces the
+ * whole solo set, and soloing something already soloed clears it, so one click
+ * on a lit S always brings the whole body back.
+ *
+ * It used to be purely additive, which is the version that reads as broken:
+ * solo an arm, solo a hand to compare, then click either one off and you are
+ * still looking at a single limb with nothing on screen explaining why. The
+ * number of clicks needed to undo a solo was the number you had accumulated,
+ * and the only control that actually restored the body was "show all" in the
+ * panel header — which is not where you soloed from and only appears once
+ * something is already hidden.
+ *
+ * Additive is still reachable (`add`, wired to shift-click) because comparing
+ * two limbs side by side is the reason multi-solo existed. Clearing is still
+ * all-or-nothing there: shift-clicking the last soloed limb off empties the set
+ * the same way, since "no limb is soloed" and "every limb is soloed" mean the
+ * same picture.
+ */
+export function toggleModelSolo(name, add = false) {
+  const was = soloModels.has(name);
+  if (add) {
+    if (was) soloModels.delete(name); else soloModels.add(name);
+  } else {
+    // Replace, don't accumulate. A second click on the same limb lands here
+    // with `was` true and leaves the set empty — the whole body is back.
+    soloModels = new Set(was ? [] : [name]);
+  }
+  if (!was) hiddenModels.delete(name);
   // Solo hides everything NOT soloed, so it can bury the active model just as
   // hide can — same gap, same warning (see warnIfEditingHidden).
   const act = doc?.models[activeModel];
@@ -3627,8 +3653,10 @@ function buildSideGrip() {
     grip.addEventListener('pointercancel', up);
   });
 
+  // Reset to the CSS default in tuner.html (.edside width), not to some other
+  // number: "reset" that lands somewhere the panel has never been is not one.
   grip.addEventListener('dblclick', () => {
-    setSideW(320, grip.parentElement?.getBoundingClientRect().width || 0);
+    setSideW(420, grip.parentElement?.getBoundingClientRect().width || 0);
     try { localStorage.removeItem(kSideWKey); } catch (_) { /* private mode */ }
   });
 
@@ -4068,6 +4096,10 @@ export const getActiveModel = () => activeModel;
 export const getModels = () => (doc ? doc.models : []);
 /** File stem of the open document — a saved limb records where it came from. */
 export const getDocName = () => docName;
+/** Server-relative path of the open document ("mobs/asha.vox"), '' if unsaved.
+ *  The creature shelf lists every OTHER creature, and identity is the path:
+ *  two files can share a stem across models/ and mobs/. */
+export const getDocPath = () => docPath || '';
 export const getSelection = () => selection;
 export const getSidecar = () => sidecar;
 export const getMaterials = () => materials;
