@@ -2370,6 +2370,52 @@ ticks rather than once because the failure was *animated* — a single sample ca
 land on a frame where the limb swing happens to cancel. With the layer
 assignment removed that assertion reads ~19 voxels/tick.
 
+**THE EXEMPTION IS PART OF THE HANDLE, and every new handle must re-apply it.**
+The layer lives on a Jolt body, and three paths mint bodies for a live avatar:
+`BuildRig`, `EquipItem` and — the one that was missed — `RebuildLimbBody`.
+Every carve rebuilds a limb's collider, which REPLACES its handle, so the first
+bite of acid, fire, laser or blast put that limb back on `MOVING`, inside the
+capsule, and `PlayerPushOut` resumed shoving the player in a direction that
+swung with the gait. `EmitCarvedFragment` had the same shape: a gobbet is born
+inside the capsule, so it takes the avatar layer too and keeps it (a lump of
+you that has stopped colliding with you is invisible; one that ejects you is
+not).
+
+**A corpse is not a severed limb and does not get released.** `DetachLimb`
+strips the exemption only after `kSeverHoldSeconds`, by which time the piece
+has swung clear. `Die()` has no such beat — every limb goes dynamic at once, in
+the standing pose, entirely inside the proxy — so handing that to `MOVING` is a
+dozen unresolvable penetrations and the solver fires the whole ragdoll out of
+the capsule. `Mob::Die` therefore does **not** call `OnBodyReleasedToWorld`; the
+corpse keeps the exemption for good and keels over where it stood.
+
+**Damage from carving is INCREMENTAL** (`Mob::CarveLimb`). `voxelsAtSpawn` is
+fixed, so `at0 - nowCount` is everything the limb has ever lost; charging that
+on every carve makes N carves cost N(N+1)/2. Rare carves hid it — burning
+exposed it, because `FlushBurn` expresses itself as a carve every
+`max(12, n>>6)` voxels removed, so a burning limb carves dozens of times and
+reached hp 0 having lost ~14% of itself. `MobLimb::voxelsCharged` holds the
+previous numerator; the denominator stays `at0`.
+
+**A straggler may not inherit a limb.** The connectivity split after a carve
+gives the limb's identity to the component nearest the joint anchor — correct
+between two real pieces, and wrong for a single loose voxel that is merely
+*nearer* than the mass (the tie-break only fired on an exact distance tie,
+which never happens). Burning is a machine for producing that voxel: it eats
+holes, and holes strand specks. A wizard's head, 82% of its skin still there,
+was handed to a ONE-voxel component and then severed by
+`voxels.size() < kMinFragmentVoxels`; the head is vital, so the creature died.
+Only a component that could still BE the limb — `kMinFragmentVoxels` and
+`kLimbCollapseFraction` of the pre-split count — may now inherit it.
+
+`MobSystem::WorstSeverFraction()` records how much of a limb was still there
+when it came off, at the cut. That is the number that separates the two ways a
+limb can leave — it ran out (small) versus something took it while it was still
+a limb (large) — and it cannot be sampled from outside: `Die()` detaches every
+limb at once, `DetachLimb` cascades to children, and a limb can lose half of
+itself to a split inside the tick it is cut. The `mob-burn` gate's
+"burn leaves char" asserts on it.
+
 **Dismemberment drives movement.** `AvatarLocomotion` is the single place the
 damage state is turned into gameplay: `speedScale` comes from the matched
 `AnimStateRule`, while `jumpScale`/`canJump` are derived from *leg liveness*
@@ -2966,6 +3012,31 @@ scaled uniformly, so all three parametrizations share one `t`. Get this wrong by
 normalizing and micro bodies punch through terrain or sink into it. Hardware
 `GreaterEqual` testing then composites them against the world, particles, cubes
 and sprites with no sorting anywhere.
+
+**A VOLUME NEEDS A DEPTH TOO, and it is the MEDIAN one.** The raymarcher runs
+first and the raster passes draw on top of the depth it wrote. Gas is not a
+surface — `trace()` accumulates it and keeps marching — so a pixel full of fire
+reported the depth of the SOLID BEHIND the flame, or the far plane for a ray
+that crossed the plume into sky. Every mob, debris chunk and dropped item
+therefore passed the depth test against fire it was genuinely behind and drew
+straight over it: fire never composited in front of a rigidbody at any distance
+or density, and a burning creature had its own flames painted behind it.
+
+Writing depth at the plume's FIRST cell is worse than the bug — a single wisp of
+smoke would then hard-clip a body standing behind it. `Hit.gasHalfT` is the
+point where the accumulated GAS crosses half opacity (`MEDIA_HALF_TAU`, ln 2;
+~1.8 cells at fire's authored opacity 150/255, ~4 at smoke's 70/255), which is
+the honest single depth for a volume: a wisp never reaches it and nothing
+changes, geometry beyond it is more hidden than shown, and geometry in FRONT of
+it still wins the reversed-Z test and draws over the flame. Liquids are excluded
+— they have a real interface (`liqT`) and already report it. Ordering geometry
+*inside* a plume still needs order-independent transparency.
+
+Gated by `--selftest --gate fire-depth`, which renders a stone block behind a
+fire slab and the same block in front of it and compares both against the flame
+alone: **56 px vs 93,433 px**. Both arms are the claim — a first-cell depth
+would also pass the "behind" half while wrecking the "front" half, so an arm
+that only checks the fix is not a test.
 
 **Routing.** Body render slots are shared: a slot with a micro model draws here
 and contributes NO cube instances (drawing both would double-draw at the wrong

@@ -180,6 +180,24 @@ class DebrisSystem {
       n += (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size() : b.voxels.size());
     return n;
   }
+  // Voxels of ONE material across every body, on the same authoritative
+  // lattice TotalBodyVoxels counts. "Is anything in the world still on fire"
+  // is a question about MATERIAL, and after a creature dies its limbs are
+  // bodies here rather than limbs on a mob — so a burn test that only censused
+  // the mob would go quiet the moment the mob did.
+  uint32_t TotalBodyMaterial(uint32_t mat) const {
+    uint32_t n = 0;
+    for (const Body& b : bodies_) {
+      if (b.HasFineSkin()) {
+        for (const PrefabVoxel& v : b.skinVoxels)
+          if ((v.material & 0xFFFu) == (mat & 0xFFFu)) n++;
+      } else {
+        for (const DebrisVoxel& v : b.voxels)
+          if ((v.payload & 0xFFFu) == (mat & 0xFFFu)) n++;
+      }
+    }
+    return n;
+  }
   // Physics handle of body `i`. Damage rebuilds a body's collider, which
   // REPLACES its handle, so anything holding one across a damage call (the
   // selftest's repeated laser kerf) must re-read it here. 0 if out of range.

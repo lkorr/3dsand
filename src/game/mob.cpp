@@ -1158,6 +1158,7 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
     // measured against the same denominator that shrinks.
     limb.voxelsAtSpawn = (uint32_t)(limb.HasFineSkin() ? limb.skinVoxels.size()
                                                        : limb.voxels.size());
+    limb.voxelsCharged = limb.voxelsAtSpawn;  // nothing lost, nothing charged
     // The body origin is the limb's min corner in WORLD voxels; the collider
     // is built at pitch 1/physScale so its collider-unit local coordinates land
     // in the right physical place. Not an integer cell any more at scale>1,
@@ -2470,6 +2471,10 @@ void Mob::DropBurnIndex(BodyBurnState& st) {
   std::vector<uint32_t>().swap(st.front);
   st.dims = IVec3{0, 0, 0};
   st.quiet = 0;
+  // `st.alight` deliberately SURVIVES. Everything above is an index INTO a
+  // lattice that just changed shape; the flag is a fact ABOUT the lattice, and
+  // it is the only thing that will make BurnOneLimb rebuild this index once the
+  // world fire that started the burn has gone out (see BodyBurnState).
 }
 
 BurnLimbView Mob::ViewOf(MobLimb& limb) {
@@ -2531,6 +2536,11 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
         (uint32_t)(((size_t)(p.z - mn.z) * dims.y + (p.y - mn.y)) * dims.x +
                    (p.x - mn.x)));
   }
+  // This sweep is the ONLY authority that may CLEAR `alight`: it is the one
+  // place that looks at every voxel of the limb rather than at a candidate set.
+  // The flag exists so that the cheap gate in BurnOneLimb keeps rebuilding this
+  // index until the sweep says the fire really is out (see BodyBurnState).
+  st.alight = !st.front.empty();
 }
 
 void Mob::ReleaseLimbMicro(MobLimb& limb) {
@@ -2654,6 +2664,19 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   phys_->RemoveBody(limb.body);
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
+  // ...and the AVATAR-LAYER EXEMPTION, which is part of "every reference to the
+  // old handle" exactly as much as the joints above are. A new handle starts on
+  // the plain MOVING layer, and a still-attached avatar limb on MOVING is back
+  // inside the player's own capsule proxy, where the solver sees a contact it
+  // can never resolve and PlayerPushOut sums a depenetration vector whose
+  // direction swings with the gait (Layers::AVATAR, phys/physics.cpp).
+  //
+  // That is the whole "acid eats a bite out of me and I start flying off
+  // upwards at an angle" bug, and it was reachable from every damage source
+  // there is: acid, fire, laser and blast all end in a carve, and every carve
+  // rebuilds the collider. Your own body must not push you — including after it
+  // has been rebuilt.
+  if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
 
   if (limb.joint) {
     phys_->DestroyJoint(limb.joint);
@@ -2741,6 +2764,16 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
     LimbVoxelsToParticles(src, physScale, part, world, spawns);
     return;
   }
+  // A gobbet of the AVATAR is born INSIDE the player's capsule proxy — the
+  // carve that made it happened on a limb that lives there. On the plain MOVING
+  // layer that is an instant deep penetration against the proxy, and
+  // PlayerPushOut turns it into a shove; a spray of them is the player skating
+  // off sideways every time acid takes a bite. Same rule as the limb it came
+  // off (Layers::AVATAR): your own body may not push you, and neither may the
+  // pieces of it. Unlike a severed limb this never converts back — a fist-sized
+  // lump of you that has stopped colliding with you is invisible, and it is
+  // still fully collidable with the world.
+  if (AvatarLayer()) phys_->SetBodyAvatarLayer(h, true);
   // Push it off the wound so it visibly leaves the body rather than resting in
   // the cavity it came from.
   Vec3 away = xf.pos - src.xf.pos;
@@ -2838,7 +2871,25 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // and mixing the two would scale every wound by (skinScale/physScale)^3.
   const uint32_t nowCount =
       (uint32_t)(fine ? limb.skinVoxels.size() : limb.voxels.size());
-  const uint32_t lostCount = at0 > nowCount ? at0 - nowCount : 0u;
+  // THE LOSS IS INCREMENTAL; THE DENOMINATOR IS NOT.
+  //
+  // `voxelsAtSpawn` never moves, so `at0 - nowCount` is everything this limb
+  // has EVER lost. Charging that to hp on every carve makes the damage from N
+  // equal carves grow as N(N+1)/2 instead of N — the second bite costs twice
+  // what it should, the tenth costs ten times.
+  //
+  // Nothing noticed while carves were rare (one blade, one blast). BURNING is
+  // what exposed it: FlushBurn expresses itself as a carve and fires every
+  // max(12, n>>6) voxels removed, so a limb on fire carves itself dozens of
+  // times, and at kCarveDamagePerVolume 1.5 it reached hp 0 having lost about
+  // 14% of its volume. Every burning limb dismembered, and the torso reaching 0
+  // is a vital limb, so Sever() called Die() — a creature that caught fire came
+  // apart instead of charring. The fraction is still measured against `at0`
+  // (that is what makes a wound read the same on any rig); only the numerator
+  // becomes the delta since the last charge.
+  const uint32_t prevCount = std::max(1u, limb.voxelsCharged);
+  const uint32_t lostCount = prevCount > nowCount ? prevCount - nowCount : 0u;
+  limb.voxelsCharged = nowCount;
   const float lost = (float)lostCount / (float)at0;
   limb.hp -= lost * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
   if (def.bleedMat) {
@@ -2929,13 +2980,50 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // conversion the loader's skinScale one at the top of the file is easiest
       // to confuse with; they run in opposite directions on different data.)
       Vec3 aMicro = limb.anchorLimb * (float)std::max(1u, def.physScale);
+      // Which components are big enough to still be this limb (see the
+      // straggler note in the loop below). Both floors are the ones the limb is
+      // about to be judged by anyway: kMinFragmentVoxels is "too few voxels to
+      // be a body" and kLimbCollapseFraction is "too little left to be a limb",
+      // measured here against what was present BEFORE the split.
+      const uint32_t keepFloor = std::max(
+          kMinFragmentVoxels, (uint32_t)(kLimbCollapseFraction * (float)n));
+      std::vector<uint8_t> eligible(compSize.size(), 0);
+      bool anyEligible = false;
+      for (size_t c = 0; c < compSize.size(); c++)
+        if (compSize[c] >= keepFloor) { eligible[c] = 1; anyEligible = true; }
+      // Nothing survives the split intact: fall back to plain nearest-wins so
+      // the limb still picks up SOMETHING, and let the collapse test below do
+      // what it was always going to do to it.
+      if (!anyEligible) eligible.assign(compSize.size(), 1);
       uint32_t keepComp = 0;
       float best = 1e30f;
       for (uint32_t i = 0; i < n; i++) {
         const DebrisVoxel& v = limb.voxels[i];
         float d2 = (Vec3{(float)v.x, (float)v.y, (float)v.z} - aMicro).len();
-        // Ties broken toward the bigger component, so a lone voxel sitting on
-        // the anchor cannot inherit the limb.
+        // A STRAGGLER MAY NOT INHERIT THE LIMB.
+        //
+        // Nearest-to-the-anchor is the right rule between two real pieces of a
+        // limb — the one still joined to the creature keeps its identity, and
+        // the big carved-off haunch does not steal the leg's rig slot. But it
+        // was applied to every component including single loose voxels, and
+        // the tie-break below only ever fires on an EXACT distance tie, which
+        // never happens. One voxel merely NEARER than the mass won outright.
+        //
+        // Burning is a machine for producing that voxel: it eats holes, and
+        // holes strand specks. Measured on a wizard's head lit for 23 ticks —
+        // 940 collider voxels, 82% of its skin still there, hp 16.5/22 — the
+        // split handed the limb to a ONE-voxel component, the other 771 left
+        // as fragments, and `voxels.size() < kMinFragmentVoxels` then severed
+        // it. The head is vital, so the creature died. That is the "a burning
+        // body dismembers instead of charring" bug, and no amount of tuning the
+        // burn rates could have reached it.
+        //
+        // The rule now: only a component that could still BE this limb may
+        // inherit it — the same two floors that decide whether the limb
+        // survives at all, applied one step earlier. If nothing qualifies the
+        // limb genuinely is dust, and the collapse test below severs it as
+        // before.
+        if (!eligible[comp[i]]) continue;
         if (d2 < best || (d2 == best && compSize[comp[i]] > compSize[keepComp])) {
           best = d2;
           keepComp = (uint32_t)comp[i];
@@ -2997,6 +3085,13 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       }
     }
   }
+
+  // Re-sync the charged count: a connectivity split above threw mass away
+  // AFTER the hp charge was computed, and that mass left as its own body or as
+  // particles rather than as a wound. Leaving it uncharged here would bill it
+  // to the NEXT carve, which is the same off-by-a-history error in slower form.
+  limb.voxelsCharged =
+      (uint32_t)(fine ? limb.skinVoxels.size() : limb.voxels.size());
 
   // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
   // collider must be built from the voxels in their FINAL frame.
@@ -3301,7 +3396,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         }
   }
 
-  if (scanHot.empty() && st.front.empty()) {
+  // `st.alight`, not just `st.front`, is what "this limb is still on fire"
+  // means. The front is a list of cells in the index box, so DropBurnIndex has
+  // to throw it away with the box — and burning drops the index constantly,
+  // because every FlushBurn expresses itself as a carve and every carve
+  // compacts the lattice the index points into.
+  //
+  // Testing the front alone therefore said "not alight" on the tick after each
+  // flush, and if the world fire had gone out by then this early-out ran, the
+  // index was never rebuilt, and the limb's flesh_burning / cloth_burning
+  // voxels never rolled their decay again. The character was left permanently
+  // sheathed in flame that had nothing left to burn instead of settling to the
+  // charred materials the table already authors for it.
+  if (scanHot.empty() && st.front.empty() && !st.alight) {
     // Nothing alight, nothing nearby: this limb costs exactly the walk
     // above and nothing else. The index is kept for a short grace period so
     // a limb stepping in and out of a campfire does not rebuild it every
@@ -3598,6 +3705,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const uint32_t m = v.Mat(e - 1);
     if (m && m < matSelfActive_.size() && matSelfActive_[m]) st.front.push_back(c);
   }
+  // Only the CANDIDATES were re-tested, so an empty front here does not by
+  // itself mean the limb is out — a budget-starved tick or a fire on the far
+  // side of the same limb leaves alight cells that were never candidates. The
+  // authority on "is anything on this limb still burning" is the full material
+  // sweep in BuildBurnIndex, which is exactly what runs once the index is next
+  // rebuilt; until then a non-empty front is the only positive evidence there
+  // is, and it may only ADD to the flag, never clear it.
+  if (!st.front.empty()) st.alight = true;
   return changed;
 }
 
@@ -3761,6 +3876,27 @@ void Mob::Sever(int limbIndex) {
   // limbDefs_, not def.limbs: a borrowed item slot severs like any limb (the
   // sword is cut out of the hand), and its def row only exists on the copy.
   const MobLimbDef& ld = limbDefs_[limbIndex];
+  // HOW MUCH OF THE LIMB WAS STILL THERE WHEN IT CAME OFF.
+  //
+  // The one number that separates the two ways a limb can leave: it ran out of
+  // matter (small fraction — geometry, kLimbCollapseFraction), or something
+  // took it while it was still a limb (large fraction — a damage rule, or the
+  // connectivity split handing its identity to a straggler). Both of those
+  // bugs shipped, both looked identical from outside as "a limb came off", and
+  // the fraction names them apart on sight. Recorded here because this is the
+  // only instant it is knowable: a heartbeat later the limb is debris and, if
+  // it was vital, the whole limb list is gone.
+  if (sys_) {
+    const MobLimb& L = limbs_[limbIndex];
+    const uint32_t at0 = L.voxelsAtSpawn;
+    const uint32_t now =
+        (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size());
+    const float frac = at0 ? (float)now / (float)at0 : 0.0f;
+    if (frac > sys_->worstSeverFrac_) {
+      sys_->worstSeverFrac_ = frac;
+      sys_->worstSeverLimb_ = ld.name;
+    }
+  }
   if (limbIndex == def.rootLimb || ld.vital || !ld.severable) {
     Die();
   } else {
@@ -3976,9 +4112,20 @@ void Mob::Die() {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(def_->skinScale), def_->physScale,
                        std::move(limb.skinVoxels), def_->bleedMat);
-    // Leaving this rig for the world: the avatar strips its player-layer
-    // exemption here so the corpse collides with the player normally.
-    OnBodyReleasedToWorld(limb.body);
+    // NOTE THE ABSENT OnBodyReleasedToWorld. A limb that is SEVERED gets its
+    // avatar-layer exemption stripped, but only after kSeverHoldSeconds
+    // (TickSeveredHolds) — by then it has swung clear of the capsule it grew
+    // out of. A corpse has no such beat: on death EVERY limb goes dynamic at
+    // once, in the pose it was standing in, i.e. entirely inside the player's
+    // capsule proxy. Handing those to the plain MOVING layer in the same frame
+    // hands Jolt a dozen deep, unresolvable penetrations against the proxy and
+    // the solver does the only thing it can — it fires the whole ragdoll out of
+    // the capsule in whatever direction the overlap resolved. That is the "I
+    // died and my body went FLYING" bug; it should keel over.
+    //
+    // So the corpse keeps the exemption for good. The cost is that you can walk
+    // through your own remains after respawning, which nobody can see; the
+    // alternative is a launch nobody can miss.
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     limb.body = 0;
@@ -4103,6 +4250,7 @@ bool MobSystem::IsAlive(uint64_t mobId) const {
     if (mob.id_ == mobId) return mob.alive_;
   return false;
 }
+
 
 Vec3 MobSystem::MobOrigin(uint64_t mobId) const {
   for (const Mob& mob : mobs_)

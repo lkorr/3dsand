@@ -270,7 +270,16 @@ struct BodyBurnState {
   // Consecutive ticks with an empty front, so a body walking in and out of a
   // campfire does not rebuild its index every other tick.
   uint32_t quiet = 0;
-  bool Burning() const { return !front.empty(); }
+  // "This limb still carries burning matter", and the ONE piece of burn state
+  // that SURVIVES DropBurnIndex. `front` cannot: its entries are cells of the
+  // index box that was just thrown away. Every carve drops the index (the
+  // lattice compacted underneath it) and burning carves constantly, so without
+  // this the cheap gate at the top of BurnOneLimb — "nothing hot nearby and an
+  // empty front, so exit" — fired on the tick after the last flush and the
+  // limb's flesh_burning voxels never rolled their decay again. That is a
+  // character left permanently coated in flame that has nothing left to burn.
+  bool alight = false;
+  bool Burning() const { return !front.empty() || alight; }
 };
 
 // One limb or part, described in the terms the burn pass needs.
@@ -389,6 +398,11 @@ struct MobLimb {
   bool carved = false;
   // Voxel count the limb was authored with, so damage is a FRACTION of it.
   uint32_t voxelsAtSpawn = 0;
+  // Voxel count the last carve already CHARGED to hp. `voxelsAtSpawn` is the
+  // denominator of the fraction; this is the previous numerator, and without it
+  // every carve re-charges everything the limb has ever lost — see the
+  // incremental-loss note in Mob::CarveLimb.
+  uint32_t voxelsCharged = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
 };
@@ -872,6 +886,25 @@ class MobSystem {
   }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
+
+  // THE MOST INTACT LIMB ANY SEVER HAS TAKEN since the last clear, as a
+  // fraction of that limb's spawn volume, with its name. -1 = nothing severed.
+  //
+  // A limb is supposed to come off because it RAN OUT: the geometric floor is
+  // kLimbCollapseFraction (25% left) and the hp floor at
+  // kCarveDamagePerVolume 1.5 is 33% left. So a sever recorded well above
+  // those is by construction not a limb that was eaten — it is a damage rule
+  // over-charging, or the connectivity split giving the limb's identity to a
+  // fragment. Both of those shipped, and from outside both read only as "a
+  // limb came off". Sampling from a test is impossible without this: the
+  // instant is one tick wide, and if the limb was vital the whole limb list is
+  // gone by the time anyone could look.
+  float WorstSeverFraction() const { return worstSeverFrac_; }
+  const std::string& WorstSeverLimb() const { return worstSeverLimb_; }
+  void ClearSeverStats() {
+    worstSeverFrac_ = -1.0f;
+    worstSeverLimb_.clear();
+  }
   Vec3 MobOrigin(uint64_t mobId) const;
   // The mob's facing direction — the SAME `fwd` the kinematic walk translates
   // along and the same yaw the limb submit applies, so a test written against
@@ -1095,6 +1128,10 @@ class MobSystem {
   // Drained by main.cpp each frame. Bounded by the same limits that bound
   // severing itself: a mob has a fixed limb count and kMaxMobs of them exist.
   std::vector<SeverEvent> severs_;
+  // See WorstSeverFraction. Written by Mob::Sever, cleared only on request —
+  // this is a high-water mark over a whole test, not a per-tick event queue.
+  float worstSeverFrac_ = -1.0f;
+  std::string worstSeverLimb_;
   std::vector<BleedSource> bleeds_;
   std::vector<VoiceEvent> voices_;
   // Push a creature voice, de-duplicating Hurt per mob per drain window (see
