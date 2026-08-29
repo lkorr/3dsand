@@ -352,6 +352,16 @@ SPEC = [
     ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
     ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),
     ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
+
+    # WATER BODIES (docs/PLAN_water_master.md, M1)
+    ("sim", "waterBodyMode", "TUNE_WATER_BODY_MODE", "i", 0),
+    ("sim", "waterBodyMinVolume", "TUNE_WATER_BODY_MIN_VOLUME", "i", 65536),
+    ("sim", "waterBodyExitVolume", "TUNE_WATER_BODY_EXIT_VOLUME", "i", 32768),
+    ("sim", "waterBodySpreadEnter", "TUNE_WATER_BODY_SPREAD_ENTER", "i", 1),
+    ("sim", "waterBodySpreadExit", "TUNE_WATER_BODY_SPREAD_EXIT", "i", 4),
+    ("sim", "waterBodyQuietTicks", "TUNE_WATER_BODY_QUIET_TICKS", "i", 30),
+    ("sim", "waterBodyMaxCount", "TUNE_WATER_BODY_MAX_COUNT", "i", 64),
+    ("sim", "waterBodyTestDrain", "TUNE_WATER_BODY_TEST_DRAIN", "i", 0),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
     ("sim", "windDrag", "TUNE_WIND_DRAG", "f", 3.0),
     ("sim", "windFluidGain", "TUNE_WIND_FLUID_GAIN", "f", 0.35),

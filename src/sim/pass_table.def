@@ -209,6 +209,54 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)))
 
+// ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
+//
+// The drain ledger and the surface shave. Recorded AFTER the CA and before the
+// particles for the same reason the seam is recorded after the CA: these are
+// post-CA writers, their voxel writes are next tick's business, and they mark
+// DirtyOut exactly the way sim_particle's resolve does.
+//
+// THE ROW ORDER IS LOAD-BEARING and sim_waterbody.wgsl's header is the argument
+// for it: quiet measures, the ledger consumes LAST tick's shave report and
+// publishes THIS tick's instruction, the reduce fills the accumulators the
+// ledger just armed, and the shave acts and reports. Reordering them silently
+// changes the cadence from mark/apply to read-your-own-write.
+//
+// C_WATERBODY is `waterChunkCount > 0`, which is 0 whenever sim.waterBodyMode
+// is 0 — so the off switch is "no row is recorded", and the pinned world hash
+// cannot move at the shipping default. That is the whole reason M1 and M2 could
+// land without a rebaseline.
+//
+// R(DirtyIn): quiescence reads THIS tick's dirty set — the CA's own answer to
+// "was this chunk disturbed", which is what replaced M1's snapshot read and the
+// rule-1 hazard that came with it (DESIGN.md §5b.4).
+PASS(waterQuiet, "waterBody", PT_TICK, PIPE_WATER_QUIET, K_COMPUTE, D_WATERCHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) R(DirtyIn) R(FluidBlockMap) A(WaterBodyState)))
+// Pure arithmetic on the ledger: one thread per body, no voxel, no chunk.
+// ONE workgroup of 64 threads covers kWaterBodyCap bodies exactly. That
+// coupling is why the shader tests `b >= WATERBODY_CAP` from the prelude
+// rather than trusting the extent: raise the cap past 64 and this literal is
+// the second place to change, and the guard is what makes the miss a missing
+// body rather than an out-of-bounds atomic.
+PASS(waterLedger, "waterBody", PT_TICK, PIPE_WATER_LEDGER, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) A(WaterBodyState)))
+// The ONE whole-footprint pass, and it runs on the single tick a body spends in
+// WB_MEASURING.
+// read-only in practice: `voxels` is read_write for the module because wbShave
+// writes it. wbReduce only sums fullness — adoption reads the voxel sum INTO
+// the ledger and writes nothing back (plan §3.1: the voxels are authoritative,
+// the descriptor is a cache of aggregates over them).
+PASS(waterReduce, "waterBody", PT_TICK, PIPE_WATER_REDUCE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) R(Voxels) R(PageTable) A(WaterBodyState)))
+// The only voxel WRITER in the subsystem. A(PageFaults) because it goes through
+// voxStore, which is the engine's one write seam and the probe that names a
+// dropped word and the chunk that refused it — the shave's chunks are declared
+// as op targets CPU-side (support.cpp, the windWake precedent) precisely so
+// that probe stays at zero.
+PASS(waterShave, "waterBody", PT_TICK, PIPE_WATER_SHAVE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
+     USES(U(TickUBO) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)
+          A(WaterBodyState)))
+
 // ---- phase 4: particles ---------------------------------------------------
 // Runs after the CA so flights see settled ground. Grid writes land in
 // dirtyOut, which the occupancy update below already covers.

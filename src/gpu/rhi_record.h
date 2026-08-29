@@ -39,6 +39,10 @@ struct TableCtx {
   // (docs/RESEARCH_wind.md §4.3). Zero on every tick of a world with no fan in
   // it, which is what skips the windWake row entirely.
   uint32_t windWakeCount = 0;
+  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
+  // Zero whenever sim.waterBodyMode is 0 — the off switch is "no row is
+  // recorded", which is what keeps it an exact identity.
+  uint32_t waterChunkCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged (PLAN_page_table.md §3.5c).

@@ -3364,6 +3364,196 @@ liquid rebaselines), and that is correct rather than alarming: quiet is the
 first 50 ticks after worldgen, when terrain powders are still coming to rest,
 and matter in motion is exactly what the bias steers.
 
+## 5b. Water bodies — a still lake as a NAME (added 2026-08-28)
+
+`docs/PLAN_water_master.md` is the plan of record; `src/sim/waterbody.{h,cpp}`
+plus `assets/shaders/sim_waterbody.wgsl` are the code; `--gate waterbody` is the
+acceptance gate. **M1 (the registry) and M2 (the drain ledger and the surface
+shave) are landed, and neither moves the pinned world hash.** What follows
+describes what exists, and says plainly what does not.
+
+### 5b.1 The problem, in one number
+
+Draining a default pond through a 1-voxel hole takes ~39 minutes of game time,
+and over that period the CA propagates pressure through ~87,000 cells for
+~70,000 ticks to move water that a level and an area could account for with two
+integers. §4's CA is the right model for water that is DOING something; it is a
+very expensive way to hold water that is merely THERE.
+
+So: give a still body of water a name and a small record of aggregates — its
+free-surface level, that surface's cell count, its total volume in eighths, and
+a ledger of what has been taken out but not yet taken off the top. Then draining
+is arithmetic on the record, at O(1) per body per tick regardless of volume.
+
+### 5b.2 What M1 actually is
+
+A CPU-side registry, and at M1 nothing else: no GPU pass, no buffer, no
+binding, no `pass_table.def` row, no `TickParams` field. (M2 adds all five —
+see §5b.4. What survives unchanged is everything below.) `sim.waterBodyMode` is 0 by default
+and mode 0 is an immediate early-out, so the subsystem costs one branch per tick
+and **cannot move the pinned world hash at either value** — measured, not
+argued: `--sweep sim.waterBodyMode=0,1` reports one hash, and the gate runs the
+same 40-tick mutation script at both modes and compares.
+
+Three pieces:
+
+* **The basin registry.** A container is a pure function of (seed, tuning),
+  because the terrain overhaul made a tarn's bowl REPLACE the ground rather than
+  `min()` into it — so `pondAt` is an exact integer parabola and the three
+  authored pools are exact flat-floored cylinders. `World::PondTile` and
+  `World::AuthoredPoolList` publish what `world.cpp` already knows; nothing is
+  re-derived, because a fourth copy of the terrain is how the deleted
+  `surfHeightAt` went stale.
+* **The container curve** (component 2, analytic half). Cell count per height,
+  its prefix sum in eighths, and a binary search of that prefix sum.
+  `crossSectionD2` algebraically INVERTS `pondAt` — `floor(a/b) >= m` is exactly
+  `a >= m*b` for non-negative integers — so there is no resampling and no
+  floating point. Cells, never columns: counting columns would silently
+  reimplement the single-span-per-column assumption that got heightfields
+  rejected.
+* **The jurisdiction ladder** (component 5's structure). Below spill, over a
+  volume threshold, quiescent for K ticks, no straddling chunks. Enter and exit
+  thresholds are distinct and `LoadTuning` FORCES the gap, because a body parked
+  on one shared threshold changes representation every tick and every change is
+  a seam crossing where mass can be lost.
+
+Chunk labelling is a sparse aux layer keyed by chunk (guideline #2), not four
+bits stolen from the voxel word. A chunk holding two basins at two levels is a
+STRADDLE and both bodies are refused — falling back to the CA is a safe
+degradation and the detection is one branch.
+
+### 5b.3 What it measured
+
+The analytic curve reproduces the world **exactly**, on both container kinds:
+
+| check | analytic | voxels / columns | error |
+|---|---|---|---|
+| authored lake volume | 2,782,656 eighths | 2,782,656 | +0.00% |
+| authored lake surface | 14,493 cells | 14,493 | +0.00% |
+| tarn r54 bowl (level walk vs column walk) | 128,214 cells | 128,214 | +0.00% |
+| settled surface spread | 0 vox | — | — |
+
+The bowl is checked against `World::TerrainHeight` per column rather than
+against voxels, and that is a deliberate limitation with a reason:
+`pondInfo`'s keep-out box is the 768-voxel square at the origin, which is
+exactly the residency window the harness runs in, so **no tarn is ever resident
+during the gate**. Sweeping one would mean moving the window, which is what
+`voxregion` does and why that gate must run last. The column walk is
+transitively grounded in real voxels by the `terrain` gate's pass C, which runs
+immediately before.
+
+### 5b.4 M2: the drain ledger, the surface shave, and the authority split
+
+**M2 is landed and it is where the feature acquires behaviour.** Four GPU passes
+(`assets/shaders/sim_waterbody.wgsl`), one GPU-owned state buffer
+(`world.waterBodyState`, 4 KiB), one new binding and one new tuning knob.
+`sim.waterBodyMode` is still 0 by default and mode 0 still records no pass at
+all, so the pinned world hash is untouched.
+
+**The arithmetic, in one line.** Fullness is eighths, so lowering a body's
+surface by one eighth costs exactly `area` eighths, where `area` is its
+free-surface cell count. A drain therefore adds to ONE integer, and when that
+integer reaches `area` a single flat pass takes one eighth off every surface
+cell. Integer against integer; no scaling and no rounding anywhere.
+
+**The four passes, and the order is load-bearing:**
+
+| pass | shape | what it does |
+|---|---|---|
+| `wbQuiet` | one thread per listed chunk | was this chunk disturbed this tick? |
+| `wbLedger` | one thread per body | the whole state machine and all arithmetic |
+| `wbReduce` | one workgroup per listed chunk | sums a candidate's voxel eighths |
+| `wbShave` | one workgroup per listed chunk | takes eighths off the free surface, and REPORTS what it took |
+
+The ledger runs BEFORE the shave, so it consumes *last* tick's shave report and
+publishes *this* tick's instruction — the engine's mark/apply cadence, with the
+recorder's generated barriers making the ordering a fact rather than a hope.
+
+#### The authority split, and why the ledger is GPU-owned
+
+This is the decision M2 turns on, and it is forced by plan §3.2's master rule:
+**debit what was granted, never what was demanded.** The only honest source for
+"what the shave actually removed" is an atomic the shave increments. A CPU-side
+ledger would have to read that atomic back — so how far a lake had dropped would
+depend on when a fence retired, and that decides a voxel write. That is rule 1
+broken through the back door, and no determinism gate that runs twice in one
+process with the same fence cadence would catch it.
+
+So authority is SPLIT rather than moved:
+
+* **The CPU decides what is a pure function of (seed, window, tuning)** — basin
+  geometry, chunk labelling, straddles, residency, the spill elevation, the
+  volume thresholds and their hysteresis. It PROPOSES bodies.
+  `WaterBodyState::Proposed` does not mean "governed"; it means "no objection".
+* **The GPU decides everything that depends on what the world is DOING.**
+  Quiescence is measured from `dirtyIn` and the MPM block map — the hashed
+  world's own state — and the Candidate → Measuring → Adopted ladder, the level,
+  the area and the ledger all live in `waterBodyState`.
+
+**That closes the M1 hazard** this section used to end with: the quiescence term
+read `World::Snap()`. Nothing in `waterbody.cpp` reads a snapshot now, and
+nothing in it may start to — the payload it builds gates a voxel write.
+
+#### Three things that are cheap because of how they are shaped
+
+* **The band is two Y values.** The shave only considers cells at `level` and
+  `level-1`, so a listed chunk whose Y span misses the band returns after three
+  scalar loads. A body's full footprint can be listed once and the dispatch
+  still only does work where the water is. One thread owns one (x,z) COLUMN and
+  writes at most one cell in it, so the pass is lattice-safe by construction —
+  reach 0 for the write, reach 1 for the read directly above, no mark/apply.
+* **`area` is MEASURED, not predicted.** The shave counts the surface cells it
+  saw and the ledger uses that count next tick; the analytic curve seeds only
+  the first one. So component 2's table is genuinely a schedule and not an
+  authority, and the GPU needs no copy of it.
+* **Idle cost is zero, not small.** No shave fires when nothing drains, and the
+  CPU declares the footprint to the page table only when one can
+  (`WaterBodyGpu::writesThisTick`). A named lake wakes no chunk and materializes
+  no page. This is the wind-primitive wake's lesson repeated: `cpuDirty`'s
+  tightening against a lagging snapshot is only sound because settled matter
+  writes nothing, and the shave is the second rule in this engine to make
+  resting voxels move.
+
+#### The invariant, and the gate
+
+```
+voxelEighths(t) + drained(t) - debit(t)  ==  voxelEighths(0)
+```
+
+`drained` is what left the body forever; `debit` is what has been taken from the
+ledger but is still sitting in the voxels because no shave has removed it yet.
+That second term is plan §3.3's legitimate divergence and it is a STORED field,
+never implied — a gate that forgot it would report a leak of up to one
+eighth-step that does not exist. `--gate waterbody` pass A asserts it as integer
+equality and names the body, the term and the delta when it fails.
+
+Release is mass-exact in both directions for the same reason: a released body
+keeps shaving, and stops accepting new debit, until the ledger is square.
+Dropping the descriptor with a debit outstanding would hand the CA a lake
+holding water nobody owns — it would invent water.
+
+#### The measured numbers
+
+`docs/PLAN_water_master.md` §1.2 carries them. The one worth repeating here is
+plan §9's ranked-first risk: WP5 measured 169,616 excite candidates over 400
+ticks on `worldlake` from a *draining CA* leaving transient gaps under cells,
+enough to convert the whole 262,144-particle pool. The shave takes from the TOP
+so the mechanism should not be there, but the CA re-levels on the chunks the
+shave woke and "should" is not a measurement — so `--gate waterbody` runs a
+quiet window and a draining window of equal length and reports both counts.
+
+### 5b.5 What is NOT here
+
+The discharge law and local excite at the hole (M3), the current field and
+surface waves (M4), and dug-basin discovery (M5). The drain source at M2 is
+`sim.waterBodyTestDrain`, a development tap of a known size in eighths per tick,
+0 in every shipped world — it exists so the ledger and the shave could be proved
+exact before there was a hole to be exact about.
+
+Two gate passes are absent and deliberately so: **B** (split scheduling) needs
+component 10's union-find sweep, and **F** (determinism mid-drain) needs a second
+in-process world to compare against. Both would be assertions against zero today.
+
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)
 
 Two things live here: a way to LOOK at generated terrain per voxel, and a way to

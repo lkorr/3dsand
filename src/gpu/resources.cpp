@@ -97,6 +97,14 @@ std::string ShaderConstantPrelude() {
   // microbody fragment march bounds-checks its brick fetches against.
   o << "const MICRO_BODY_POOL_WORDS : u32 = " << kMicroBodyPoolWordsWorld << "u;\n";
   o << "const MATERIAL_SLOTS : u32 = " << kMaterialSlots << "u;\n";
+  // Water bodies (docs/PLAN_water_master.md; sim_waterbody.wgsl). The caps that
+  // size the TickParams arrays and the GPU ledger buffer, generated here for
+  // the same reason every other layout constant is: a shader that redeclared
+  // them would be a second place the cap has to be changed.
+  o << "const WATERBODY_CAP : u32 = " << kWaterBodyCap << "u;\n";
+  o << "const WATERBODY_WORDS : u32 = " << kWaterBodyWords << "u;\n";
+  o << "const WATERBODY_STATE_WORDS : u32 = " << kWaterBodyStateWords << "u;\n";
+  o << "const WATER_CHUNK_CAP : u32 = " << kWaterChunkCap << "u;\n";
   // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
   // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
   // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).

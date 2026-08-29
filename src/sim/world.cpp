@@ -89,6 +89,12 @@ void World::Init(const rhi::Device& device) {
   dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
   actVoxViz = CreateBuffer(device, kActVoxVizBytes, U::Storage | U::CopyDst, "actVoxViz");
   pick = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst, "pick");
+  // The water-body ledger (world.h's block above). 4 KiB of GPU-owned state,
+  // zeroed here and by EncodeLoadReset: a descriptor is a description of a
+  // world, and a stale one after a worldgen/load reads as a fresh one.
+  waterBodyState = CreateBuffer(
+      device, (uint64_t)kWaterBodyCap * kWaterBodyStateWords * 4,
+      U::Storage | U::CopySrc | U::CopyDst, "waterBodyState");
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");
   particles[1] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesB");
@@ -431,6 +437,8 @@ void World::KickReadback() {
               snap_.fluidExcitedEighths = fa[11];
               snap_.fluidExciteRefused = fa[12];
               snap_.fluidLastSlot = fa[14];
+              snap_.fluidExciteSeen = fa[27];        // FA_EXSEEN
+              snap_.fluidExciteCandidates = fa[28];  // FA_EXCANDID
               snap_.fluidBlockCount = std::min(fa[3], kFluidBlocks);
               std::memcpy(snap_.fluidBlocks.data(), p + kFluidBlocksOff,
                           kFluidBlocksBytes);
@@ -1009,6 +1017,46 @@ World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
   q.past = near.past;
   q.surf = near.surf;
   return q;
+}
+
+// ---- the basin registry's source (world.h PondDisc / AuthoredPool) ---------
+//
+// Thin publishers, on purpose. Every literal and every gate below already
+// exists above — `pondInfo` inside the token-compared MIRROR block, the pool
+// discs inside TerrainHeight — and these hand them out rather than restating
+// them. A basin registry that re-derived the tile hash would be the fourth copy
+// of the terrain (see the accessor comment in world.h).
+
+World::PondDisc World::PondTile(int tileX, int tileZ, uint32_t seed) {
+  PondDisc d;
+  // The lab slab has no ponds at all: genColumn's labMode branch returns
+  // pond = -1 for every column, so a registry that reported one would describe
+  // water the world does not contain.
+  if (sLabWorld) return d;
+  const Pond p = pondInfo(tileX, tileZ, seed);
+  if (!p.present) return d;
+  d.present = true;
+  d.cx = p.cx;
+  d.cz = p.cz;
+  d.r = p.r;
+  d.surf = p.surf;
+  return d;
+}
+
+int World::PondTileSize() { return WG().pondTile; }
+
+void World::AuthoredPoolList(AuthoredPool out[kAuthoredPools]) {
+  // The same three discs TerrainHeight overrides `h` for, with the same
+  // vlen()-scaled radii and the same poolY datum. Water occupies (floorY,
+  // waterY], which is genCellIn's `fluidTop >= 0 && y <= fluidTop` branch taken
+  // after the `y <= h` terrain branch has already claimed the floor.
+  const int poolY = WG().spawnPlainY - vlen(15);
+  out[0] = {420, 420, vlen(68), poolY,            poolY + vlen(24),
+            poolY + vlen(26), "water"};
+  out[1] = {260, 300, vlen(32), poolY + vlen(6),  poolY + vlen(24),
+            poolY + vlen(26), "oil"};
+  out[2] = {220, 520, vlen(24), poolY + vlen(2),  poolY + vlen(20),
+            poolY + vlen(22), "lava"};
 }
 
 // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ---------------

@@ -98,6 +98,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::WindWake:  return cx.windWakeCount > 0;
     case pass::Cond::CaActive:  return cx.caActive;
     case pass::Cond::VizActive:  return cx.vizActive;
+    case pass::Cond::WaterBody:  return cx.waterChunkCount > 0;
   }
   return false;
 }
@@ -116,6 +117,10 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::FarCount: return cx.farCount;
     case pass::DispatchSel::WindWakeSel: return (cx.windWakeCount + 63) / 64;
     case pass::DispatchSel::FluidSpawnSel: return (cx.fluidSpawnCount + 63) / 64;
+    // One WORKGROUP per listed chunk (the reduce and the shave walk a
+    // chunk's columns); one THREAD per listed chunk for the quiescence probe.
+    case pass::DispatchSel::WaterChunks:   return cx.waterChunkCount;
+    case pass::DispatchSel::WaterChunks64: return (cx.waterChunkCount + 63) / 64;
     default:                          return v;
   }
 }

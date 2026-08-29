@@ -102,6 +102,11 @@ enum class Buf : uint8_t {
   FluidCellScratch,
   FluidMirror,
   ActVoxViz,
+  // The water-body drain ledger (docs/PLAN_water_master.md M2). GPU-OWNED
+  // state: the level, the debit, the adoption verdict. Written by every one of
+  // the four sim_waterbody.wgsl entry points and read by nothing else on the
+  // tick path, which is what lets it be one buffer with one barrier class.
+  WaterBodyState,
   kCount,
 };
 
@@ -156,6 +161,10 @@ enum class Pipe : uint8_t {
   // Materializes a JITTER page (world.h's JITTER block): the one fill a
   // vkCmdFillBuffer cannot do, because the words vary per cell.
   PageFill,
+  // Water bodies (sim_waterbody.wgsl). Four entry points, recorded in this
+  // order inside one PT_TICK pass group — the order is load-bearing and the
+  // shader's header says why.
+  WaterQuiet, WaterLedger, WaterReduce, WaterShave,
   FarFill, FarDown,
 };
 
@@ -221,6 +230,11 @@ enum class Cond : uint8_t {
   // wrong-active costs microseconds, wrong-idle loses world state.
   CaActive,
   VizActive,
+  // waterChunkCount > 0: at least one water body is proposed AND
+  // sim.waterBodyMode is 1. Zero on every tick of a shipped world, which is
+  // what makes `sim.waterBodyMode = 0` an EXACT identity rather than merely a
+  // cheap path — nothing is recorded, so the pinned hash cannot move.
+  WaterBody,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -258,6 +272,9 @@ enum class DispatchSel : uint32_t {
   IndFluidPArgs,     // indirect: world.fluidPDispatchArgs @ 0 — the seam's
                      // per-particle passes and its list-shaped dispatches
                      // (the seam re-copies the buffer between uses)
+  // ---- water bodies ----
+  WaterChunks,       // waterChunkCount — one WORKGROUP per listed chunk
+  WaterChunks64,     // (waterChunkCount + 63) / 64 — one THREAD per chunk
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

@@ -318,6 +318,10 @@ add_executable(sandvox
   # Wind primitives: fans / spell gusts / vortices as op-stream parametric
   # objects (docs/RESEARCH_wind.md §4.3).
   src/sim/windprim.cpp
+  # Water bodies: the basin registry, container curve and jurisdiction ladder
+  # a still lake needs before draining it can be arithmetic
+  # (docs/PLAN_water_master.md).
+  src/sim/waterbody.cpp
   src/sim/voxload.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
@@ -348,6 +352,7 @@ add_executable(sandvox
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
   src/test/selftest_wind.cpp
+  src/test/selftest_water.cpp
   src/test/selftest_render.cpp
   src/test/selftest_player.cpp
   src/test/selftest_phys.cpp
@@ -416,6 +421,27 @@ target_link_libraries(sandvox PRIVATE
 
 # Run from any cwd: bake the asset dir absolute path for dev builds.
 target_compile_definitions(sandvox PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
+
+# ---------------------------------------------------------------------------
+# DEBUG INFO IN RELEASE. Not optional, and not a debugging convenience.
+#
+# The crash handler (src/crash.cpp) calls SymFromAddr on every frame, which
+# needs a .pdb. Release built without one, so every dump in crash.log was
+# seventeen bare hex addresses — and because the module base is ASLR'd, they
+# could not even be compared between two runs of the SAME binary. Six identical
+# crashes over seven minutes on 2026-08-27 produced exactly zero information
+# about which function faulted; the only fact recoverable from them was that
+# RIP - frame[0] was the same constant each time.
+#
+# /Zi costs nothing at runtime: it emits a side-car .pdb and does not change
+# code generation. /DEBUG makes the linker write it, and /OPT:REF /OPT:ICF
+# restore the folding that /DEBUG otherwise disables — without those two the
+# binary grows and the "Release" build stops being one.
+if(MSVC)
+  target_compile_options(sandvox PRIVATE $<$<CONFIG:Release>:/Zi>)
+  target_link_options(sandvox PRIVATE
+    $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+endif()
 
 # ---------------------------------------------------------------------------
 # movement_test — CPU-only player controller harness (no GPU, no window).

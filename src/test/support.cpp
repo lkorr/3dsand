@@ -17,6 +17,7 @@
 #include "sim/farfield.h"
 #include "sim/wind.h"
 #include "sim/worldedit.h"
+#include "sim/waterbody.h"
 #include "sim/windprim.h"
 
 namespace sandvox {
@@ -289,6 +290,40 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.windWakeCount = (uint32_t)windWake.size();
     for (size_t i = 0; i < windWake.size(); i++) tp.windWake[i] = windWake[i];
   }
+  // WATER BODIES (docs/PLAN_water_master.md M1; sim/waterbody.h). Advanced
+  // HERE, from the one place the game and every harness go through, for exactly
+  // the reason WindPrims() is: a path that forgot to advance it would describe a
+  // world with no lakes in it while every other path had them.
+  //
+  // From M2 it WRITES INTO `tp`: geometry, thresholds and a chunk list, all of
+  // them pure functions of (seed, window, tuning). That is the whole shape of
+  // the fix M1 flagged — the quiescence term used to read the async snapshot,
+  // and a shave gated on "when the CPU got around to noticing" is rule 1 broken
+  // through the back door. Quiescence and adoption are GPU-side now
+  // (sim_waterbody.wgsl); what rides this stream cannot see a fence.
+  //
+  // `sim.waterBodyMode` is 0 by default and mode 0 is an immediate early-out
+  // that leaves both counts at zero, so every pass row's condition is false,
+  // nothing is recorded, and the pinned world hash cannot see any of it.
+  const WaterBodyGpu* waterGpu = nullptr;
+  {
+    const Tuning& wt = CurrentTuning();
+    WaterBodySystem& wb = WaterBodies();
+    wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain);
+    const WaterBodyGpu& g = wb.Gpu();
+    waterGpu = &g;
+    tp.waterBodyMode = (uint32_t)wt.sim.waterBodyMode;
+    tp.waterBodyCount = g.bodyCount;
+    tp.waterChunkCount = (uint32_t)g.chunks.size();
+    tp.waterTestDrain = wt.sim.waterBodyTestDrain;
+    tp.waterQuietTicks = wt.sim.waterBodyQuietTicks;
+    tp.waterMinVolume = wt.sim.waterBodyMinVolume;
+    for (size_t i = 0; i < g.bodies.size() && i < kWaterBodyScalars; i++)
+      tp.waterBodies[i] = g.bodies[i];
+    for (size_t i = 0; i < g.chunks.size() && i < kWaterChunkCap; i++)
+      tp.waterChunks[i] = g.chunks[i];
+  }
+
   // Fluid-lab flat-slab worldgen (world.h kLabSlabY): 0 everywhere except
   // --lab/--fluid-bench. Set on EVERY TickParams write so streamed genList
   // refills and far-cascade fills that ride this tick see the same world.
@@ -467,6 +502,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // to page faults across two 160-tick runs. A grain that hops into a
   // neighbouring chunk now hops into one the CPU already said could be written.
   for (uint32_t slot : windWake) pt.AddOpTarget(slot);
+  // THE SAME REPAIR, FOR THE SURFACE SHAVE (docs/PLAN_water_master.md M2). The
+  // shave is the second rule in this engine to make RESTING voxels move, and
+  // the paragraph above is exactly why that matters: cpuDirty's tightening
+  // against a lagging snapshot is only sound because settled matter writes
+  // nothing. Entrainment broke that and lost 62 voxels; a shave into a JITTER
+  // sentinel would lose a lake one eighth at a time and report it as page
+  // faults rather than as a leak.
+  //
+  // Declared ONLY when a shave can actually fire this tick (`writesThisTick`),
+  // so a still lake materializes no pages at all — the residency cost of the
+  // feature at rest is zero, not small.
+  if (waterGpu && waterGpu->writesThisTick) {
+    for (uint32_t e : waterGpu->chunks) pt.AddOpTarget(e & 0xFFFFu);
+  }
   {
     std::vector<IVec3> spawnCells, expCenters;
     spawnCells.reserve(spawnCount);
@@ -542,8 +591,15 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // world with a fan pointed at a dune would otherwise prove itself idle and
   // skip the CA rows the wake had just made necessary, and the fan would mark
   // chunks nothing then simulated.
+  //
+  // The water shave is in the list for the windWake reason and only when it can
+  // fire: it dirty-marks chunks, so a settled world with a draining lake would
+  // otherwise prove itself idle and skip the CA rows the shave had just made
+  // necessary. A merely LABELLED lake is not an input — it writes nothing —
+  // which is what keeps the settled-tick skip alive at sim.waterBodyMode 1.
   sim.NoteTickInputs(tick, !ops.empty() || !exps.empty() || cellCount > 0 ||
                                spawnCount > 0 || !windWake.empty() ||
+                               (waterGpu && waterGpu->writesThisTick) ||
                                fluidLive + fluidSpawnCount > 0);
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
@@ -579,7 +635,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
                  fluidLive + fluidSpawnCount, fluidSpawnCount,
-                 (uint32_t)windWake.size(), vizActive);
+                 (uint32_t)windWake.size(), vizActive,
+                 waterGpu ? (uint32_t)waterGpu->chunks.size() : 0u);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the
@@ -933,6 +990,17 @@ bool SelftestParticlesActive(uint32_t tick) { return tick >= kSelftestFirstExp; 
 void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.particleCounts, 0, out, 8,
                         "countsRead");
+}
+
+void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.waterBodyState, 0, out,
+                        (size_t)kWaterBodyCap * kWaterBodyStateWords * 4,
+                        "waterLedgerRead");
+}
+
+void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.pageFaults, 0, out, 16,
+                        "pageFaultRead");
 }
 
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {

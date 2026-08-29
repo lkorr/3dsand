@@ -30,6 +30,7 @@ const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
 const std::vector<Gate>& WindGates();
+const std::vector<Gate>& WaterGates();
 const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
@@ -57,6 +58,13 @@ const char* const kOrder[] = {
     // has to run before anything moves the window, and it leaves the origin
     // exactly where `determinism` (which does not set it) needs it.
     "terrain",
+    // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
+    // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
+    // the authored lake at (420,420) has to be resident for that to mean
+    // anything — so it runs before `streaming` shifts the window rather than
+    // after, and it regenerates on the way out so `determinism` (which
+    // regenerates anyway) finds exactly what `terrain` left.
+    "waterbody",
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
@@ -86,7 +94,8 @@ const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
     for (const auto* g : {&TerrainGates(),
-                          &SimGates(), &CaGates(), &WindGates(), &RenderGates(),
+                          &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
+                          &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),

@@ -807,6 +807,48 @@ static_assert(kWindPrimScalars == kWindPrimCap * kWindPrimWords,
 // small explosion, refreshed per tick; a primitive that does not fit is
 // refused rather than silently trimmed.
 constexpr uint32_t kWindWakeCap = 128;
+
+// ---- WATER BODIES (docs/PLAN_water_master.md; src/sim/waterbody.h) --------
+// Live still-water descriptors world-wide, and the rule-2 bound on the whole
+// subsystem. Here rather than in waterbody.h for the wind-primitive reason:
+// from M2 this sizes a TickParams array and a per-body state buffer, which
+// makes it a GPU LAYOUT, and world.h is where a layout a shader must agree with
+// is stated. `sim.waterBodyMaxCount` clamps against it, so LoadTuning can see it
+// without taking a dependency on the water subsystem's own header.
+//
+// 64 is generous: a residency window is 51 m across and holds a handful of
+// tarns. At the cap the smallest candidate is refused, and an unadopted body is
+// simply simulated the way it is today.
+constexpr uint32_t kWaterBodyCap = 64;
+// i32 words per body in the TickParams descriptor array — the CPU->GPU half,
+// rewritten every tick. Two vec4<i32> rows: the basin geometry the shave tests
+// a cell against, plus the seed values the ledger adopts with. See
+// WATERBODY_* in assets/shaders/sim_waterbody.wgsl for the field order; that
+// file is the only decoder.
+constexpr uint32_t kWaterBodyWords = 8;
+// kWaterBodyCap * kWaterBodyWords, written as a LITERAL for the kWindPrimScalars
+// reason: check_invariants.py's `params` check parses a C++ array dimension as a
+// bare identifier bound to an integer literal, and an expression makes it SKIP
+// the whole TickParams comparison silently. The static_assert keeps it honest.
+constexpr uint32_t kWaterBodyScalars = 512;
+static_assert(kWaterBodyScalars == kWaterBodyCap * kWaterBodyWords,
+              "kWaterBodyScalars must equal kWaterBodyCap * kWaterBodyWords");
+// Chunk-list entries a tick may declare across every live body, packed
+// `(bodyIndex << 16) | chunkSlot`. The dispatch extent of the quiescence probe,
+// the adoption reduce and the surface shave, and therefore the rule-2 bound on
+// all three: a body whose footprint does not fit is not listed, which means
+// "simulated the way it is today".
+//
+// 512 covers the harness's authored lake (r=68 -> ~69 chunk columns x 2 layers)
+// with room for a second body. It is a CEILING, not a per-tick cost: the list is
+// empty at sim.waterBodyMode 0 and holds only the bodies the CPU proposed.
+constexpr uint32_t kWaterChunkCap = 512;
+// u32 words per body in the GPU-OWNED ledger buffer (world.waterBodyState).
+// The level, the debit and everything derived from what the shave actually
+// removed live here and not on the CPU, because the only honest source for
+// "what was shaved" is a GPU atomic and reading it back would put fence
+// retirement — i.e. scheduling — inside a voxel write's control path (rule 1).
+constexpr uint32_t kWaterBodyStateWords = 16;
 // Largest radius / axial reach a primitive may declare, world cells (51 m).
 // Load-bearing twice: it bounds the footprint the wake budget is spent on, and
 // it bounds every intermediate in the integer field evaluation (see the
@@ -958,6 +1000,55 @@ struct TickParams {
   int32_t windPrims[kWindPrimScalars] = {};
   uint32_t windWake[kWindWakeCap] = {};
   uint32_t vizActive = 0;   // debug: CA writes per-voxel activity bits when nonzero
+
+  // ---- WATER BODIES (docs/PLAN_water_master.md M2; src/sim/waterbody.h) ----
+  //
+  // THE WHOLE CPU->GPU SURFACE of the drain ledger, and it rides the tick input
+  // stream for the dayPhase/windMode reason: a replay reproduces the stream and
+  // the twice-run determinism gate compares it, so anything the world hash can
+  // see arrives this way rather than being recomputed from something the CPU
+  // merely happened to know.
+  //
+  // It is also the fix for the M1 hazard (waterbody.h's note, DESIGN.md §5b.4).
+  // At M1 the jurisdiction ladder's quiescence term read World::Snap(), the
+  // ASYNC readback, which arrives on a schedule set by fence retirement. That
+  // was harmless while the verdict was advisory; from M2 adoption gates a voxel
+  // write, so the verdict had to stop being a function of when the CPU noticed.
+  // What the CPU sends now is only what is a pure function of (seed, window,
+  // tuning): basin geometry, the chunk list, the thresholds. QUIESCENCE AND
+  // ADOPTION ARE DECIDED ON THE GPU, from the hashed world, in
+  // sim_waterbody.wgsl — see the note over `waterBodyState` below.
+  //
+  // MODE 0 IS AN EXACT IDENTITY. `waterBodyMode` 0 means the CPU writes count 0
+  // here, every pass row's condition is false and nothing is recorded, so the
+  // pinned world hash cannot move. Same shape as windPrimCount == 0.
+  uint32_t waterBodyMode = 0;
+  uint32_t waterBodyCount = 0;    // live descriptors in `waterBodies`
+  uint32_t waterChunkCount = 0;   // entries in `waterChunks`
+  // TEST-ONLY DRAIN SOURCE, eighths per tick per adopted body. M2 has no
+  // discharge law yet (component 6 is M3), so this is what gives the ledger
+  // something to be exact about, and it is what `--gate waterbody` pass A
+  // conserves across. Integer, on the tick stream, 0 by default — a shipped
+  // world never sees it.
+  int32_t waterTestDrain = 0;
+  // The jurisdiction thresholds the GPU ladder compares against, forwarded from
+  // tuning so a per-gate SetCurrentTuning moves them with no pipeline rebuild
+  // (the windMode precedent).
+  int32_t waterQuietTicks = 0;    // sim.waterBodyQuietTicks
+  int32_t waterMinVolume = 0;     // sim.waterBodyMinVolume, EIGHTHS
+  // ONE pad word, and the count is arithmetic rather than taste: `windWake`
+  // ends 16-byte aligned, `vizActive` puts us 4 B past that, and std140 will
+  // align `waterBodies` (an array of vec4) to 16. So the header between them
+  // must be 4 + 7*4 = 32 B or the two structs disagree in SIZE, which is the
+  // one thing check_invariants.py compares — see vizActive's own note above for
+  // what that failure looked like the last time.
+  uint32_t padWb0 = 0;
+  // kWaterBodyCap bodies x kWaterBodyWords i32 words, declared WGSL-side as
+  // array<vec4<i32>, 128> — the same bytes, since std140 strides a uniform
+  // array to 16 B. sim_waterbody.wgsl's wbGeom/wbSeed are the only decoders.
+  int32_t waterBodies[kWaterBodyScalars] = {};
+  // (bodyIndex << 16) | chunkSlot, four to a std140 row.
+  uint32_t waterChunks[kWaterChunkCap] = {};
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -1412,6 +1503,18 @@ struct WorldSnapshot {
   uint32_t fluidSettledEighths = 0;   // event counter, that tick only
   uint32_t fluidExcitedEighths = 0;   // event counter, that tick only
   uint32_t fluidExciteRefused = 0;    // budget refusals, that tick only
+  // THE WP5 EXCITE-REACH PROBE (fluidArgs FA_EXSEEN / FA_EXCANDID), that tick
+  // only. Already in the readback's 128 bytes; surfaced here because plan §9's
+  // ranked-first risk is measured in exactly this number.
+  //
+  // WP5 measured 169,616 candidates over 400 ticks on `worldlake` from a
+  // DRAINING CA leaving transient gaps under cells — enough to convert the
+  // whole 262,144-particle pool and hold ~70 ms frames. The surface shave
+  // removes from the TOP so it should create no air-below, but the CA
+  // re-levelling behind it might, and "should" is not a measurement. Summing
+  // these two across a drain is what turns that into one.
+  uint32_t fluidExciteSeen = 0;       // settled liquid cells detect looked at
+  uint32_t fluidExciteCandidates = 0; // of those, trigger-satisfying
   uint32_t fluidLastSlot = 0;         // coarse position for the splash cue
   // Active fluid block slots at capture (first fluidBlockCount entries of the
   // block list). Feeds PageTable::UpdateFluidChunks so every chunk the seam
@@ -1670,6 +1773,51 @@ class World {
   };
   static Column TerrainColumn(int x, int z, uint32_t seed);
 
+  // ---- THE BASIN REGISTRY'S SOURCE (docs/PLAN_water_master.md component 2) --
+  //
+  // A body of water needs a CONTAINER before it can have an area-per-height
+  // curve, and worldgen already knows every container it made: a tarn is
+  // `pondInfo`'s disc and the three set pieces are authored literals. Both are
+  // stated exactly once, in world.cpp, inside the block check_invariants.py
+  // token-compares against the shader. These two accessors publish them.
+  //
+  // The alternative — sim/waterbody.cpp re-deriving the tile hash, the inset,
+  // the keep-out boxes and the slope gates — would be the FOURTH copy of the
+  // terrain, and the deleted `surfHeightAt` is this file's own evidence for how
+  // that ends: it was a copy of TerrainHeight's arithmetic and it had already
+  // gone stale before anyone noticed.
+
+  // The analytic tarn belonging to one pond TILE, or `present = false` where
+  // the tile rolled no pond, lost the slope gate, or landed in the authored
+  // origin keep-out. A disc never leaves its own tile (pondInfo's inset), so
+  // scanning the tiles a box touches finds every tarn that can reach into it.
+  struct PondDisc {
+    bool present = false;
+    int cx = 0, cz = 0;  // centre, world cells
+    int r = 0;           // radius, world cells
+    int surf = -1;       // water surface Y
+  };
+  static PondDisc PondTile(int tileX, int tileZ, uint32_t seed);
+  // Tile pitch in world cells (worldgen.pondTile). Exposed so a caller can turn
+  // a box into a tile range without taking a dependency on the tuning struct.
+  static int PondTileSize();
+
+  // The three authored pools at the world origin — the lake, the oil pond and
+  // the lava pool of `--fluid-bench wp5`'s pond68 scene. Flat floors, vertical
+  // walls, a fixed fill level: the degenerate case of a container curve, and
+  // the one every bench scene in docs/PLAN_fluid_overhaul.md §8 measures.
+  //
+  // `mat` is the material NAME, resolved by the consumer (design guideline #4).
+  struct AuthoredPool {
+    int cx, cz, r;     // disc, world cells (a column is inside iff d2 < r*r)
+    int floorY;        // the flat floor
+    int waterY;        // the fill level; water occupies (floorY, waterY]
+    int rimY;          // the containment rim outside the disc = spill elevation
+    const char* mat;   // "water", "oil", "lava"
+  };
+  static constexpr int kAuthoredPools = 3;
+  static void AuthoredPoolList(AuthoredPool out[kAuthoredPools]);
+
   // Fluid-lab worldgen mode (kLabSlabY block above). A process-wide static
   // because TerrainHeight is static and the flag must gate BOTH the CPU
   // mirror and every TickParams.labMode write from one truth. Set exactly
@@ -1714,6 +1862,23 @@ class World {
   rhi::Buffer dirtyViz;    // kNumChunks u32, CPU-uploaded snapshot for debug overlay
   rhi::Buffer actVoxViz;   // per-voxel activity bits (packed u32), debug overlay
   rhi::Buffer pick;        // 8 u32
+
+  // ---- the water-body ledger (docs/PLAN_water_master.md components 3-5) ----
+  // kWaterBodyCap * kWaterBodyStateWords u32 (4 KiB). GPU-OWNED, and that is
+  // the load-bearing property rather than an implementation detail:
+  //
+  //   * The ledger debits by what the shave ACTUALLY removed (plan §3.2), and
+  //     the only honest source for that is an atomic the shave increments.
+  //     Reading it back to the CPU would put fence retirement inside the
+  //     control path of a voxel write, which is rule 1 through the back door.
+  //   * So `level`, `debit`, `area` and the adoption verdict all live here.
+  //     The CPU sends geometry and thresholds; it is told nothing back except
+  //     by a gate doing a blocking read, which no frame path does.
+  //
+  // Derived data like the page table: not hashed, not saved, rebuilt from the
+  // voxels by the adoption reduce. CopySrc for `--gate waterbody`'s conservation
+  // audit; CopyDst so a reset can zero it.
+  rhi::Buffer waterBodyState;
 
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
   rhi::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered

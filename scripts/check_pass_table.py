@@ -116,6 +116,11 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_G2P": "fluidG2p_",
     # The excite/settle seam (sim_fluid_seam.wgsl).
     "PIPE_FLUID_CELL_CLEAR": "fluidCellClear_",
+    # Water bodies (docs/PLAN_water_master.md M2; sim_waterbody.wgsl).
+    "PIPE_WATER_QUIET": "waterQuiet_",
+    "PIPE_WATER_LEDGER": "waterLedger_",
+    "PIPE_WATER_REDUCE": "waterReduce_",
+    "PIPE_WATER_SHAVE": "waterShave_",
     "PIPE_FLUID_COMPACT_COUNT": "fluidCompactCount_",
     "PIPE_FLUID_COMPACT_SCAN": "fluidCompactScan_",
     "PIPE_FLUID_COMPACT_SCATTER": "fluidCompactScatter_",
@@ -191,6 +196,10 @@ BUF_TO_WGSL = {
     "FluidCompactScratch": {"compactScratch"},
     "FluidCellScratch": {"fluidCellScratch"},
     "FluidMirror": {"fluidMirror"},
+    # Per-voxel activity overlay (sim_step.wgsl, dev toggle).
+    "ActVoxViz": {"actVoxViz"},
+    # The water-body drain ledger, GPU-owned (sim_waterbody.wgsl).
+    "WaterBodyState": {"waterBodyState"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -219,6 +228,8 @@ _SIM_GROUP0 = {
     "worldHash", "pick", "R", "reactions", "dirtyList", "args", "cellOps",
     "supportOut", "genList", "pageFillList", "pageTable", "pageFaults",
     "fluidBlockMapS", "fluidGridS", "fluidCellScratch",
+    # The water-body drain ledger, binding 24 (docs/PLAN_water_master.md M2).
+    "waterBodyState",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

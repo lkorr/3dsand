@@ -78,6 +78,10 @@ struct RecordCtx {
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
+  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
+  // Zero whenever sim.waterBodyMode is 0, which is what makes the off switch an
+  // exact identity: no row is recorded at all.
+  uint32_t waterChunkCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is

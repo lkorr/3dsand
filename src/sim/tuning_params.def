@@ -487,6 +487,27 @@ TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
+// ---- WATER BODIES (docs/PLAN_water_master.md, M1) ----
+// A still lake gets a NAME and a small record of aggregates, so that from M2
+// draining it is arithmetic on that record instead of pressure propagating cell
+// by cell through 87,000 voxels. Every knob here is integer (rule 1); the
+// physical quantities components 6 and 8 need are floats and land with them.
+// waterBodyMode is the off switch and it is 0: at 0 nothing is built, nothing
+// is labelled, nothing is classified, so `--sweep sim.waterBodyMode=0,1` is one
+// hash and this whole subsystem cannot move the pinned world.
+// Volumes are EIGHTHS (the CA's state nibble is eighths, so the ledger is too).
+// The enter/exit pairs are deliberately far apart: a body parked on one
+// threshold would flip representation every tick, and every flip is a seam
+// crossing where mass can be lost.
+TP_I(sim, waterBodyMode, TUNE_WATER_BODY_MODE, 0)
+TP_I(sim, waterBodyMinVolume, TUNE_WATER_BODY_MIN_VOLUME, 65536)
+TP_I(sim, waterBodyExitVolume, TUNE_WATER_BODY_EXIT_VOLUME, 32768)
+TP_I(sim, waterBodySpreadEnter, TUNE_WATER_BODY_SPREAD_ENTER, 1)
+TP_I(sim, waterBodySpreadExit, TUNE_WATER_BODY_SPREAD_EXIT, 4)
+TP_I(sim, waterBodyQuietTicks, TUNE_WATER_BODY_QUIET_TICKS, 30)
+TP_I(sim, waterBodyMaxCount, TUNE_WATER_BODY_MAX_COUNT, 64)
+TP_I(sim, waterBodyTestDrain, TUNE_WATER_BODY_TEST_DRAIN, 0)
+
 // ---- wind COUPLING: how hard the field pushes the sim (research doc §4.5/4.6)
 // The SHAPE of the field is the wind.* group far above; this is what the three
 // sim consumers do with it. Human-unit floats for the sim.fluid* reason and by

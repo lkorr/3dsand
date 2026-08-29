@@ -149,6 +149,18 @@ W_MBSHIFT="$(sed -n 's/.*constexpr[a-z0-9_ ]* kMicroBodyPoolWordsWorld = 1u << \
   echo "check_shaders: cannot parse kMicroBodyPoolWordsWorld from $WORLD_H" >&2; exit 1; }
 W_MBPOOL=$((1 << W_MBSHIFT))
 
+# Water bodies (docs/PLAN_water_master.md M2). Plain literals in world.h, so a
+# straight scrape — same rule as everything else here: world.h is the source.
+W_WBCAP="$(cpp_const kWaterBodyCap)"
+W_WBWORDS="$(cpp_const kWaterBodyWords)"
+W_WBSTATE="$(cpp_const kWaterBodyStateWords)"
+W_WCHUNKCAP="$(cpp_const kWaterChunkCap)"
+if [ -z "$W_WBCAP" ] || [ -z "$W_WBWORDS" ] || [ -z "$W_WBSTATE" ] \
+   || [ -z "$W_WCHUNKCAP" ]; then
+  echo "check_shaders: cannot parse kWaterBody*/kWaterChunkCap from $WORLD_H" >&2
+  exit 1
+fi
+
 # far-field grid (decoupled from the window — see world.h kFarN/kFarShiftBase)
 W_FARN="$(cpp_const kFarN)"
 [ -n "$W_FARN" ] || { echo "check_shaders: cannot parse kFarN from $WORLD_H" >&2; exit 1; }
@@ -204,6 +216,10 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
   "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
   "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \
+  "const WATERBODY_CAP : u32 = ${W_WBCAP}u;" \
+  "const WATERBODY_WORDS : u32 = ${W_WBWORDS}u;" \
+  "const WATERBODY_STATE_WORDS : u32 = ${W_WBSTATE}u;" \
+  "const WATER_CHUNK_CAP : u32 = ${W_WCHUNKCAP}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
   "const FAR_N : u32 = ${W_FARN}u;" \
   "const FAR_NCHUNK : u32 = ${W_FARNCHUNK}u;" \

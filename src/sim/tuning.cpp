@@ -225,6 +225,14 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"fluidSettleTicks", &Tuning::Sim::fluidSettleTicks},
     {"fluidSplashScaleIdx", &Tuning::Sim::fluidSplashScaleIdx},
     {"fluidFoamScaleIdx", &Tuning::Sim::fluidFoamScaleIdx},
+    {"waterBodyMode", &Tuning::Sim::waterBodyMode},
+    {"waterBodyMinVolume", &Tuning::Sim::waterBodyMinVolume},
+    {"waterBodyExitVolume", &Tuning::Sim::waterBodyExitVolume},
+    {"waterBodySpreadEnter", &Tuning::Sim::waterBodySpreadEnter},
+    {"waterBodySpreadExit", &Tuning::Sim::waterBodySpreadExit},
+    {"waterBodyQuietTicks", &Tuning::Sim::waterBodyQuietTicks},
+    {"waterBodyMaxCount", &Tuning::Sim::waterBodyMaxCount},
+    {"waterBodyTestDrain", &Tuning::Sim::waterBodyTestDrain},
     {"windMode", &Tuning::Sim::windMode},
   };
   for (const auto& e : iFields) {
@@ -782,6 +790,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
     ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
     ReadF(*g, "fluidStainRate", s.fluidStainRate, out, at);
+    ReadI(*g, "waterBodyMode", s.waterBodyMode, out, at);
+    ReadI(*g, "waterBodyMinVolume", s.waterBodyMinVolume, out, at);
+    ReadI(*g, "waterBodyExitVolume", s.waterBodyExitVolume, out, at);
+    ReadI(*g, "waterBodySpreadEnter", s.waterBodySpreadEnter, out, at);
+    ReadI(*g, "waterBodySpreadExit", s.waterBodySpreadExit, out, at);
+    ReadI(*g, "waterBodyQuietTicks", s.waterBodyQuietTicks, out, at);
+    ReadI(*g, "waterBodyMaxCount", s.waterBodyMaxCount, out, at);
+    ReadI(*g, "waterBodyTestDrain", s.waterBodyTestDrain, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
     ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
@@ -903,6 +919,53 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (s.fluidExcitePerch < 0 || s.fluidExcitePerch > 1) {
       out.warnings.push_back("sim.fluidExcitePerch out of 0..1; clamped");
       s.fluidExcitePerch = s.fluidExcitePerch < 0 ? 0 : 1;
+    }
+    // ---- water bodies (docs/PLAN_water_master.md) ----
+    if (s.waterBodyMode < 0 || s.waterBodyMode > 1) {
+      out.warnings.push_back("sim.waterBodyMode out of 0..1; clamped");
+      s.waterBodyMode = s.waterBodyMode < 0 ? 0 : 1;
+    }
+    if (s.waterBodyMinVolume < 0) {
+      out.warnings.push_back("sim.waterBodyMinVolume negative; clamped to 0");
+      s.waterBodyMinVolume = 0;
+    }
+    if (s.waterBodyExitVolume < 0) {
+      out.warnings.push_back("sim.waterBodyExitVolume negative; clamped to 0");
+      s.waterBodyExitVolume = 0;
+    }
+    // HYSTERESIS IS NOT OPTIONAL, so it is enforced here rather than trusted to
+    // the author. An exit threshold at or above the enter threshold is not a
+    // narrow gap, it is a body that adopts and releases on alternating ticks —
+    // and every one of those transitions is a seam crossing where mass can be
+    // lost (PLAN_water_master.md §5). Halving is the shipped ratio.
+    if (s.waterBodyExitVolume >= s.waterBodyMinVolume &&
+        s.waterBodyMinVolume > 0) {
+      out.warnings.push_back(
+          "sim.waterBodyExitVolume must be BELOW sim.waterBodyMinVolume "
+          "(hysteresis); set to half the enter threshold");
+      s.waterBodyExitVolume = s.waterBodyMinVolume / 2;
+    }
+    if (s.waterBodySpreadEnter < 0 || s.waterBodySpreadEnter > 64) {
+      out.warnings.push_back("sim.waterBodySpreadEnter out of 0..64; clamped");
+      s.waterBodySpreadEnter = s.waterBodySpreadEnter < 0 ? 0 : 64;
+    }
+    if (s.waterBodySpreadExit <= s.waterBodySpreadEnter) {
+      out.warnings.push_back(
+          "sim.waterBodySpreadExit must be ABOVE sim.waterBodySpreadEnter "
+          "(hysteresis); set to enter + 3");
+      s.waterBodySpreadExit = s.waterBodySpreadEnter + 3;
+    }
+    if (s.waterBodyQuietTicks < 0 || s.waterBodyQuietTicks > 3600) {
+      out.warnings.push_back("sim.waterBodyQuietTicks out of 0..3600; clamped");
+      s.waterBodyQuietTicks = s.waterBodyQuietTicks < 0 ? 0 : 3600;
+    }
+    // kWaterBodyCap (sim/waterbody.h) is the hard ceiling: from M2 the
+    // descriptor array is a GPU layout, and a count past its end is not a
+    // tuning mistake, it is an out-of-bounds write.
+    if (s.waterBodyMaxCount < 0 || s.waterBodyMaxCount > (int)kWaterBodyCap) {
+      out.warnings.push_back("sim.waterBodyMaxCount out of 0..64; clamped");
+      s.waterBodyMaxCount =
+          s.waterBodyMaxCount < 0 ? 0 : (int)kWaterBodyCap;
     }
     // 8 is the seam's own surface scan depth (SEAM_EX_STEP_SCAN); a step it
     // cannot see is a trigger that never fires, so the knob stops there.

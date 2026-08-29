@@ -155,6 +155,19 @@ uint32_t ReadHashSync(GpuContext& ctx, World& world);
 uint32_t HashWorldNow(GpuContext& ctx, World& world, Simulation& sim,
                       uint32_t seed);
 void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]);
+// The whole water-body ledger (kWaterBodyCap * kWaterBodyStateWords i32) —
+// docs/PLAN_water_master.md M2. The ledger is GPU-owned on purpose, so this is
+// the ONLY way a gate can see the level, the debit or the adoption verdict.
+//
+// Blocking, and therefore for use OUTSIDE a tick loop only: a blocking readback
+// inside one dilates the page-table snapshot cadence, which is how a streaming
+// run once acquired 217 page faults that had nothing to do with the feature
+// under test.
+void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out);
+// The page-fault counter (world.pageFaults[0..3]): the dropped word and the
+// refusing chunk span, not just the count. A shave that landed in a sentinel
+// chunk shows up here and nowhere else.
+void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
 // THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).

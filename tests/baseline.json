@@ -35,6 +35,15 @@
   "wind": "pass",
   "fluid-react": "pass",
   "terrain": "pass",
+  "waterbody": "pass",
+
+  "_waterbody_about": "Thresholds for the `waterbody` gate (docs/PLAN_water_master.md M1). The *TolPct and *Max keys are BOUNDS the gate fails against; the gate also records what it MEASURED through --rebaseline (waterbodyVolErrPct, waterbodyAreaErrPct, waterbodyBowlColumnErrPct, waterbodySurfaceSpread, waterbodyAwakeChunks). As of the M1 landing every measured error is EXACTLY 0.00% — the analytic container curve reproduces the authored lake's 2,782,656 eighths and 14,493 surface cells cell for cell, and the parabolic bowl's level-walk matches its column-walk at 128,214 cells on a real r54 tarn. The tolerance is 2% rather than 0 because the WORLD is not obliged to stay that way: pond life replaces water cells with kelp and reeds, and a ruin or a cave could intrude. A non-zero number here is not automatically a bug, but it IS a number that wants explaining before M2's ledger is built on the curve.",
+  "waterbodyVolTolPct": "2.0",
+  "waterbodyAreaTolPct": "2.0",
+  "waterbodyAwakeMax": "32",
+  "waterbodyDrainTicks": "60",
+  "waterbodyExciteSlackEighths": "0",
+  "waterbodyExciteCandidPerTickMax": "400",
 
   "_bodies_about": "debris and settle-back are KNOWN-FAILING as of the terrain scale pass (package C), and this is a handover, not a verdict. Both are bodies that never sleep, and the mechanism is understood: DebrisSystem::BuildTerrainPatches calls phys_->WakeNear(radius 24) whenever the collision mesh HASH changes, while SettleBodies needs 60 CONSECUTIVE inactive ticks — so any terrain within 24 voxels that moves even once per 60 ticks pins a body awake forever. What is NOT the cause, each ruled out by measurement: determinism (the mirror agrees with the GPU over 9,409 columns), rule 2 (the terrain gate reports 0 awake chunks at tick 120 and sleep is green), page faults (0 over the suite), and the sediment wedge (the same two gates fail with worldgen.sedSlope=0). Delete these two lines the moment they pass; a known failure that outlives its cause is worse than a red gate.",
   "_terrain_about": "Thresholds and measurements for the `terrain` gate. The *Max/*Slack/*Margin keys are BOUNDS the gate fails against and are hand-tuned; the *Observed keys are what the last run measured and are written by --rebaseline. Retuning a bound is a JSON edit, not a rebuild.",

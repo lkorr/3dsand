@@ -1061,6 +1061,79 @@ struct Tuning {
                                   // stains an adjacent solid cell — the MPM
                                   // counterpart of CA liquid staining
 
+    // ---- water bodies (docs/PLAN_water_master.md; src/sim/waterbody.h) ----
+    //
+    // A still lake gets a NAME and a record of aggregates — level, surface cell
+    // count, volume in eighths, a drain ledger — so that draining it becomes
+    // arithmetic on that record instead of pressure propagating cell by cell
+    // through 87,000 voxels. At M1 the record exists and does nothing; the
+    // ledger and the surface shave that spend it arrive with M2.
+    //
+    // Every value here is an integer (rule 1). Components 6 and 8 need genuinely
+    // physical quantities (a discharge coefficient, a circulation) and those go
+    // in the sanctioned human-unit float lane beside sim.fluid*, with them.
+
+    // THE OFF SWITCH, and the reason this subsystem could land at all. At 0
+    // nothing is built, nothing is labelled and nothing is classified, so
+    // `--sweep sim.waterBodyMode=0,1` reports one hash and the pinned world is
+    // provably untouched. It stays 0 until a milestone that moves the hash
+    // arrives with its own rebaseline commit.
+    int waterBodyMode = 0;
+
+    // ENTER / EXIT VOLUME, in EIGHTHS (the CA's state nibble is eighths, so the
+    // whole ledger is). Small ponds are cheap to simulate honestly AND the
+    // level model's error is relatively largest there, so this threshold is a
+    // correctness argument before it is a performance one.
+    //
+    // The default admits a body of ~8,192 whole voxels — well under the
+    // smallest natural tarn (~87,000 voxels at radius 48) and well over any
+    // puddle. The exit sits at HALF the enter value, and the gap is the point:
+    // a body oscillating across one shared threshold would change
+    // representation every tick, and every change is a seam crossing where mass
+    // can be lost.
+    int waterBodyMinVolume = 65536;
+    int waterBodyExitVolume = 32768;
+
+    // SURFACE HEIGHT SPREAD, whole voxels — the error term of the entire model.
+    // A stream down a hillside is ONE connected component with a 200-voxel head
+    // difference between its ends: connectivity is a topological fact, an
+    // equipotential surface is a hydrostatic one, and the two coincide only at
+    // equilibrium. Anything over the enter threshold is a stream and belongs
+    // entirely to the CA/MPM.
+    //
+    // At M1 this is structural rather than measured: only closed analytic
+    // basins are registered, and a stream has no basin, so nothing with a real
+    // spread can reach the ladder. `--gate waterbody` measures the true spread
+    // from voxels and asserts it against these. The runtime measurement lands
+    // with M2's GPU reduce, which is the pass that can see a whole lake.
+    int waterBodySpreadEnter = 1;
+    int waterBodySpreadExit = 4;
+
+    // How long every enter test must hold before adoption. Ticks — 30 is one
+    // second. A body still sloshing has a surface that is not an equipotential,
+    // and adopting it would freeze that transient into a `level`.
+    int waterBodyQuietTicks = 30;
+
+    // Rule 2's bound on the whole feature. At the cap the SMALLEST candidate is
+    // refused, and refusal is a safe degradation: unadopted means "simulated the
+    // way it is today", never "lost". Hard-capped at kWaterBodyCap (waterbody.h)
+    // because the descriptor array's size is a GPU layout from M2 onward.
+    int waterBodyMaxCount = 64;
+
+    // THE M2 TEST TAP, eighths per tick per governed body. M2 lands the ledger
+    // and the shave but not the discharge law (component 6 is M3), so this is
+    // what gives the ledger something to be exact ABOUT: it opens a hole of a
+    // known size in every governed lake and `--gate waterbody` pass A conserves
+    // across it.
+    //
+    // 0 in every shipped world, and 0 is load-bearing twice over: it is what
+    // keeps the surface shave from ever firing (so a labelled lake still
+    // sleeps, pass E) and it is what tells SubmitTick not to declare the
+    // footprint to the page table (so a labelled lake materializes no pages).
+    // Idle cost is zero rather than small, and that is a property of this knob
+    // being the only drain source rather than of a threshold.
+    int waterBodyTestDrain = 0;
+
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
     // The SHAPE of the field is the `wind` group below; these are what the
     // three SIM consumers do with what they sample. Human-unit floats, the

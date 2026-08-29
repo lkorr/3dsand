@@ -136,6 +136,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(21, T::ReadOnlyStorage), // fluidGrid
         entry(22, T::Storage),         // fluidCellScratch
         entry(23, T::Storage),         // actVoxViz (per-voxel debug overlay)
+        // The water-body drain ledger (docs/PLAN_water_master.md M2). GPU-owned
+        // because the ledger must debit by what the shave ATOMICALLY reported,
+        // and reading that back would put fence retirement inside a voxel
+        // write's control path — see sim_waterbody.wgsl's header.
+        entry(24, T::Storage),         // waterBodyState (atomic i32 ledger)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -364,6 +369,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(21, world_->fluidGrid),
         b(22, world_->fluidCellScratch),
         b(23, world_->actVoxViz),
+        b(24, world_->waterBodyState),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -623,13 +629,15 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mParticle = mod("sim_particle.wgsl");
   rhi::ShaderModule mFluid = mod("sim_fluid.wgsl");
   rhi::ShaderModule mFluidSeam = mod("sim_fluid_seam.wgsl");
+  rhi::ShaderModule mWaterBody = mod("sim_waterbody.wgsl");
   rhi::ShaderModule mRay = mod("raymarch.wgsl");
   rhi::ShaderModule mDebris = mod("debris.wgsl");
   rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
   rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
   rhi::ShaderModule mDebugWind = mod("debug_wind.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
-      !mExplode || !mParticle || !mFluid || !mFluidSeam || !mRay || !mDebris ||
+      !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
+      !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind) {
     if (err) *err = "shader file read failure";
     return false;
@@ -692,6 +700,15 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   fluidMirrorFold_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "mirrorFold", "seamMirrorFold");
   fluidCellClear_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "cellClear", "seamCellClear");
 
+  // Water bodies (docs/PLAN_water_master.md M2). On simPL_ like the CA:
+  // everything the shave needs to write a voxel — voxels, dirtyOut,
+  // pageTable, pageFaults, TickParams — is already in that layout, and the
+  // ledger buffer is one added binding rather than a new group.
+  waterQuiet_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbQuiet", "waterQuiet");
+  waterLedger_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbLedger", "waterLedger");
+  waterReduce_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbReduce", "waterReduce");
+  waterShave_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbShave", "waterShave");
+
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
   // async error scope and always returns a valid handle, so this check is free
@@ -708,7 +725,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidSettleJudge_ || !fluidSettleScan_ || !fluidSettleBin_ ||
       !fluidSettleCheck_ || !fluidSettleCommit_ || !fluidSettleKill_ ||
       !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_ ||
-      !fluidCellClear_) {
+      !fluidCellClear_ || !waterQuiet_ || !waterLedger_ || !waterReduce_ ||
+      !waterShave_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -850,6 +868,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FluidCellScratch:    return world_->fluidCellScratch;
     case B::FluidMirror:         return world_->fluidMirror;
     case B::ActVoxViz:           return world_->actVoxViz;
+    case B::WaterBodyState:      return world_->waterBodyState;
     default:                return world_->voxels;
   }
 }
@@ -897,6 +916,10 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidSettleScan:     return fluidSettleScan_;
     case P::FluidSettleBin:      return fluidSettleBin_;
     case P::FluidSettleCheck:    return fluidSettleCheck_;
+    case P::WaterQuiet:     return waterQuiet_;
+    case P::WaterLedger:    return waterLedger_;
+    case P::WaterReduce:    return waterReduce_;
+    case P::WaterShave:     return waterShave_;
     case P::FluidSettleCommit:   return fluidSettleCommit_;
     case P::FluidSettleKill:     return fluidSettleKill_;
     case P::FluidConsumeApply:   return fluidConsumeApply_;
@@ -937,6 +960,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.fluidCount = cx.fluidCount;
   tc.fluidSpawnCount = cx.fluidSpawnCount;
   tc.windWakeCount = cx.windWakeCount;
+  tc.waterChunkCount = cx.waterChunkCount;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -1191,7 +1215,8 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             bool hashEnable, uint32_t expCount, bool particlesActive,
                             uint32_t cellCount, uint32_t spawnCount,
                             uint32_t fluidCount, uint32_t fluidSpawnCount,
-                            uint32_t windWakeCount, bool vizActive) {
+                            uint32_t windWakeCount, bool vizActive,
+                            uint32_t waterChunkCount) {
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
@@ -1200,6 +1225,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.fluidCount = fluidCount;
   cx.fluidSpawnCount = fluidSpawnCount;
   cx.windWakeCount = windWakeCount;
+  // Water bodies (docs/PLAN_water_master.md M2). Zero at sim.waterBodyMode 0,
+  // which is what makes C_WATERBODY false and the whole subsystem unrecorded.
+  cx.waterChunkCount = waterChunkCount;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
   cx.vizActive = vizActive;

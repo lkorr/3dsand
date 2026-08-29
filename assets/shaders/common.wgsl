@@ -417,6 +417,30 @@ struct TickParams {
   // struct does not error — the shader simply cannot see the field — which is
   // why that checker compares total size rather than trusting the declaration.
   vizActive : u32,
+  // ---- WATER BODIES (docs/PLAN_water_master.md M2; must match TickParams in
+  // src/sim/world.h) ----
+  // The CPU sends geometry and thresholds ONLY. Quiescence and adoption are
+  // decided GPU-side in sim_waterbody.wgsl, because the M1 ladder read the
+  // async snapshot and "adopted when the CPU got around to noticing" is a
+  // scheduling-dependent outcome the moment adoption gates a voxel write
+  // (rule 1). See the long note on the C++ side of this struct.
+  //
+  // waterBodyMode 0 => waterBodyCount and waterChunkCount are 0, every pass row
+  // is skipped, and the pinned world hash cannot move.
+  waterBodyMode   : u32,
+  waterBodyCount  : u32,
+  waterChunkCount : u32,
+  waterTestDrain  : i32,   // eighths/tick/body, TEST-ONLY source (M2)
+  waterQuietTicks : i32,   // sim.waterBodyQuietTicks
+  waterMinVolume  : i32,   // sim.waterBodyMinVolume, EIGHTHS
+  padWb0 : u32,            // see the alignment arithmetic in world.h
+  // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
+  // windPrims' 96: this file and world.h are compared on TOTAL SIZE by
+  // scripts/check_invariants.py, so a cap changed on one side and not the other
+  // fails the check rather than silently reading zeros.
+  waterBodies : array<vec4<i32>, 128>,
+  // WATER_CHUNK_CAP entries, four to a std140 row.
+  waterChunks : array<vec4<u32>, 128>,
 };
 
 // Must match kWindScaleOne / kWindScaleMax in src/sim/world.h.
