@@ -64,7 +64,7 @@ const TUNING_SCHEMA = [
     apply: 'cpu',
     blurb: 'Movement feel. Everything is stated in metres and m/s and converted to voxels at use, so these keep their meaning if the voxel size changes.',
     params: [
-      {k:'model', n:'player model', d:'Which mob def to use as the player avatar. Change takes effect on F5 (tuning reload).', type:'select', options:['mina','asha','wizard']},
+      {k:'model', n:'player model', d:'Which mob def to use as the player avatar. Change takes effect on F5 (tuning reload). <b>human</b> is the stock base body — one material (flesh) everywhere, painted per voxel, with only a pair of shorts on it, so the armour system has a clean surface to equip onto. The others are finished characters with their clothing welded into the geometry.', type:'select', options:['human','mina','asha','wizard']},
       {k:'walkSpeed', n:'walk speed', d:'Base ground speed. Quake is ~5.5, Minecraft ~4.3.', min:0.5, max:20, step:0.05, u:'m/s'},
       {k:'sprintSpeed', n:'sprint speed', d:'Speed while holding shift on the ground.', min:0.5, max:30, step:0.05, u:'m/s'},
       {k:'gravity', n:'gravity', d:'Fall acceleration. 9.81 is real gravity, which reads as floaty next to most shooters — raise it for snappier falls.', min:0, max:40, step:0.05, u:'m/s²'},

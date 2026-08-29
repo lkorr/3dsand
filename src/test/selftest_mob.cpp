@@ -2260,26 +2260,36 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       avatar.PostStep();
     };
 
-    uint32_t idleFront = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
-    float clothLost = 0;
+    // WHAT "BURNS" MEANS DEPENDS ON WHAT THE AVATAR IS MADE OF, and this
+    // subtest must not assume the player is dressed. `human`, the stock base
+    // body, is ONE material (flesh) everywhere with its colours in an art layer
+    // — a cloth census on it is legitimately 0, and asserting cloth here would
+    // fail a perfectly correct rig for the crime of wearing nothing. The claim
+    // this subtest owns is narrower than it looks: that the avatar's OWN BODY
+    // is wired into the same burn pass mobs use. So it measures the body mass
+    // the rig actually has, cloth plus flesh. The cloth-goes-FIRST ordering is
+    // a separate claim and is asserted on the wizard above, which wears a robe.
+    uint32_t idleFront = 0, body0 = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
+    float bodyLost = 0;
     if (spawned) {
       for (int i = 0; i < 10; i++) avTick(0);
       idleFront = avBurning();            // an idle player must cost nothing
       cloth0 = avCensus(mCloth);
-      uint32_t lastCloth = cloth0;
+      body0 = cloth0 + avCensus(mSkin);
+      uint32_t lastBody = body0;
       for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
         avTick(mFire);
-        const uint32_t cl = avCensus(mCloth);
-        if (cl) lastCloth = cl;
+        const uint32_t bd = avCensus(mCloth) + avCensus(mSkin);
+        if (bd) lastBody = bd;
         peakAlight = std::max(peakAlight,
                               avCensus(mClothBurn) + avCensus(mBurning));
         peakChar = std::max(peakChar, avCensus(mClothChar) + avCensus(mCooked) +
                                           avCensus(mCharred));
       }
-      clothLost = cloth0 ? (float)(cloth0 - lastCloth) / (float)cloth0 : 0.0f;
+      bodyLost = body0 ? (float)(body0 - lastBody) / (float)body0 : 0.0f;
     }
-    const bool hOk = spawned && idleFront == 0 && cloth0 > 0 &&
-                     clothLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
+    const bool hOk = spawned && idleFront == 0 && body0 > 0 &&
+                     bodyLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
                      avFireOps > 0;
     uint32_t indexed = 0;
     for (int i = 0; i < nParts; i++) indexed += avatar.PartBurnIndexCells(i);
@@ -2287,11 +2297,11 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // pass never even saw anything reactive next to the player (a CPU-mirror
     // problem), non-zero with nothing alight means it saw and did not react (a
     // rules problem). They have completely different causes.
-    std::printf("  player burns: %s (idle front %u, cloth %u -> %.0f%% gone, "
-                "peak %u alight / %u charred, %u fire ops; %d parts, %u bodies,"
-                " %u indexed cells)\n",
-                hOk ? "PASS" : "FAIL", idleFront, cloth0, clothLost * 100.0f,
-                peakAlight, peakChar, avFireOps, nParts,
+    std::printf("  player burns: %s (idle front %u, body %u of which cloth %u "
+                "-> %.0f%% gone, peak %u alight / %u charred, %u fire ops; "
+                "%d parts, %u bodies, %u indexed cells)\n",
+                hOk ? "PASS" : "FAIL", idleFront, body0, cloth0,
+                bodyLost * 100.0f, peakAlight, peakChar, avFireOps, nParts,
                 avatar.LimbBodyCount(), indexed);
                 std::fflush(stdout);
     ok = ok && hOk;

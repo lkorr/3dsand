@@ -598,7 +598,13 @@ Status GateRagdollJoints(Ctx& c, std::string& detail) {
   // an assertion that spends 90 ticks of physics to read a load-time constant
   // is a slow way to test nothing extra.
   int ballJoints = 0, badBone = 0, wideCone = 0, waistChecked = 0;
+  int hipsRigs = 0, hipsRigsSeen = 0;
   for (const MobDef& def : c.mobs.Defs()) {
+    const bool hipsRooted = def.rootLimb >= 0 &&
+                           def.rootLimb < (int)def.limbs.size() &&
+                           def.limbs[def.rootLimb].name == "hips";
+    if (hipsRooted) hipsRigs++;
+    int waistHere = 0;
     for (size_t i = 0; i < def.limbs.size(); i++) {
       const MobLimbDef& ld = def.limbs[i];
       if ((int)i == def.rootLimb || ld.joint != Physics::JointType::Ball) continue;
@@ -613,26 +619,32 @@ Status GateRagdollJoints(Ctx& c, std::string& detail) {
       // means the bone was derived from the wrong pair of boxes.
       if (ld.parent == "hips") {
         waistChecked++;
+        waistHere++;
         const bool up = ld.name == "torso";
         if (up ? ld.boneAxis.y < 0.7f : ld.boneAxis.y > -0.7f) badBone++;
       }
     }
+    if (hipsRooted && waistHere > 0) hipsRigsSeen++;
   }
-  // 9 = 3 humanoid rigs (wizard, asha, mina) x {torso, legU.L, legU.R}. A
-  // count, not just a per-limb loop, because the loop passes vacuously if the
-  // rigs ever stop naming their root "hips" — and the waist is the joint the
-  // whole change is about, so "we checked nothing" must not read as PASS.
+  // COVERAGE, NOT A CENSUS. The per-limb loop passes vacuously if the rigs ever
+  // stop naming their root "hips", and the waist is the joint this whole gate
+  // is about, so "we checked nothing" must not read as PASS. But the guard used
+  // to be the literal 9 — 3 humanoid rigs x {torso, legU.L, legU.R} — which
+  // made adding a FOURTH correct humanoid to assets/mobs a FAILURE of the
+  // ragdoll gate, reported as a joint bug with 0 bad axes and 0 wide cones next
+  // to it. So the demand is now the actual claim: every hips-rooted rig on disk
+  // contributed at least one waist joint to the checks above.
   const bool wiredOk = ballJoints > 0 && badBone == 0 && wideCone == 0 &&
-                       waistChecked == 9;
+                       hipsRigs > 0 && hipsRigsSeen == hipsRigs;
 
   const bool ok = heldOk && restFrameOk && teethOk && wiredOk;
   detail = Format(
       "cone %.0f deg: held to %.0f, built pre-bent %.0f held to %.0f, "
       "unlimited reached %.0f; %d ball joints wired (%d bad bone axis, "
-      "%d over 90 deg, %d waist joints)",
+      "%d over 90 deg, %d waist joints over %d/%d hips-rooted rigs)",
       cone / kDeg, limited.first / kDeg, preBent.second / kDeg,
       preBent.first / kDeg, free.first / kDeg, ballJoints, badBone, wideCone,
-      waistChecked);
+      waistChecked, hipsRigsSeen, hipsRigs);
   std::printf("ragdoll joints: %s (%s)\n", ok ? "PASS" : "FAIL",
               detail.c_str());
   return ok ? Status::Pass : Status::Fail;
