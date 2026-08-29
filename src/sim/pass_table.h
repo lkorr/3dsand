@@ -165,6 +165,8 @@ enum class Pipe : uint8_t {
   // order inside one PT_TICK pass group — the order is load-bearing and the
   // shader's header says why.
   WaterQuiet, WaterLedger, WaterReduce, WaterShave, WaterDrain, WaterHole,
+  // M5: the scheduled container sweep and its split labelling.
+  WaterSweep, WaterSplit,
   FarFill, FarDown,
 };
 
@@ -236,6 +238,11 @@ enum class Cond : uint8_t {
   // cheap path — nothing is recorded, so the pinned hash cannot move.
   WaterBody,
   WaterDrain, // waterDrainBodies > 0 (the reserved spawn-op block, M3)
+  // M5: waterSweepSlot < kWaterBodyCap. The CPU schedules AT MOST ONE
+  // basin's re-derive per tick, and only for a basin someone has dug in —
+  // so on every tick of every world where nobody has touched the water,
+  // neither sweep row is recorded and the cost is exactly zero (rule 2).
+  WaterSweep,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.

@@ -100,6 +100,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::VizActive:  return cx.vizActive;
     case pass::Cond::WaterBody:  return cx.waterChunkCount > 0;
     case pass::Cond::WaterDrain: return cx.waterDrainBodies > 0;
+    case pass::Cond::WaterSweep: return cx.waterSweepSlot < kWaterBodyCap;
   }
   return false;
 }

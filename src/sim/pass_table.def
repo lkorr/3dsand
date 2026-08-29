@@ -287,6 +287,32 @@ PASS(waterShave, "waterBody", PT_TICK, PIPE_WATER_SHAVE, K_COMPUTE, D_WATERCHUNK
 PASS(waterHole, "waterBody", PT_TICK, PIPE_WATER_HOLE, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERBODY, 1,
      USES(U(TickUBO) R(Voxels) R(DirtyIn) R(FluidBlockMap) R(PageTable)
           A(WaterBodyState)))
+// ---- M5: THE SCHEDULED CONTAINER SWEEP (components 2 case 2 + 10) --------
+// LAST in the block, and after the hole scan for the reason the hole scan is
+// after the shave: the level these two measure against is the one this tick
+// actually settled on, and their outputs are read NEXT tick by the ledger
+// (plan section 3.3 at pass granularity).
+//
+// C_WATERSWEEP, not C_WATERBODY: at most ONE basin re-derives per tick, and
+// only a basin someone has dug into is ever scheduled. A still lake records
+// neither row, which is what keeps `--gate waterbody` pass E's zero-at-rest a
+// property of the design rather than of a threshold.
+//
+// read-only in practice: `voxels` is read_write for the module because wbShave
+// and wbDrain write (voxels / the op stream); wbSweep only asks what material a
+// cell holds. It writes nothing at all outside its own region of
+// waterBodyState — no A(DirtyOut), no A(PageFaults), because it stores no
+// voxel. Declaring it a read is what keeps the CA loop from taking 54 extra WAW
+// barriers for a pass that writes nothing.
+PASS(waterSweep, "waterBody", PT_TICK, PIPE_WATER_SWEEP, K_COMPUTE, D_WATERCHUNKS,1,1, GRP_SIM, DYN_ZERO, C_WATERSWEEP, 1,
+     USES(U(TickUBO) R(Voxels) R(PageTable) A(WaterBodyState)))
+// ONE workgroup. The label propagation is a fixpoint over workgroup memory
+// with barriers between its read and write phases — deterministic without
+// atomicCAS, which rule 1 bans. It reads the openness bitmap wbSweep just
+// wrote, so the A->A barrier the recorder derives between these two rows is
+// load-bearing rather than incidental.
+PASS(waterSplit, "waterBody", PT_TICK, PIPE_WATER_SPLIT, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_WATERSWEEP, 1,
+     USES(U(TickUBO) A(WaterBodyState)))
 
 // ---- phase 4: particles ---------------------------------------------------
 // Runs after the CA so flights see settled ground. Grid writes land in

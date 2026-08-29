@@ -441,9 +441,12 @@ struct TickParams {
   waterDrainBodies    : u32,
   waterDrainMax       : i32,
   waterExciteRadius   : i32,
-  padWb0 : u32,            // see the alignment arithmetic in world.h
-  padWb1 : u32,
-  padWb2 : u32,
+  // M5: the scheduled re-derive. Both are pure functions of the tick — see the
+  // note in world.h and plan section 3.4. WATERBODY_CAP means "nothing is
+  // scheduled", which is every tick of a lake nobody has dug into.
+  waterSweepSlot  : u32,
+  waterSweepLevel : i32,
+  padWb2 : u32,            // see the alignment arithmetic in world.h
   padWb3 : u32,
   padWb4 : u32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
@@ -451,8 +454,9 @@ struct TickParams {
   // scripts/check_invariants.py, so a cap changed on one side and not the other
   // fails the check rather than silently reading zeros.
   waterBodies : array<vec4<i32>, 128>,
-  // WATER_CHUNK_CAP entries, four to a std140 row.
-  waterChunks : array<vec4<u32>, 128>,
+  // WATER_CHUNK_CAP entries, four to a std140 row. 256 rows = 1024 entries;
+  // M5 doubled it because a dug basin lists its split child's footprint too.
+  waterChunks : array<vec4<u32>, 256>,
   // ---- THE CURRENT FIELD, the SIM's copy (docs/PLAN_water_master.md
   // component 8; src/sim/currentprim.h; must match TickParams in world.h) ----
   //
@@ -538,6 +542,26 @@ const WBS_JETV      : u32 = 22u;  // Q16.16 cells/tick, downward
 // mitigation UNMEASURED — this word is the measurement, and it is cumulative
 // rather than per-tick so a gate reading it once still sees the whole window.
 const WBS_EXSHELL   : u32 = 23u;
+// ---- M5: the re-audit (component 10) --------------------------------------
+// ARMED by the ledger on the first level of each sweep cycle, CONSUMED by it on
+// the next tick after wbReduce has refilled WBS_RSUM. This is the fix for the
+// leftover M2 named and M3 did not close: a body adopted once carries the
+// volume it had at adoption, and someone who digs into it makes that number a
+// lie — which bounds the discharge through `held = VOLUME - DRAINED` and stops
+// a lake draining that has plenty left.
+//
+// It refreshes VOLUME ONLY, as `rsum + drained`, so `held` becomes the measured
+// voxel sum while WBS_DRAINED — the cumulative term `--gate waterbody` passes A
+// and H balance their identity on — is not touched. A re-audit that reset
+// DRAINED would look exactly like a leak to both of them.
+const WBS_REAUDIT   : u32 = 24u;
+const WBS_AUDITTICK : u32 = 25u;  // attribution: the last re-audit's tick
+// The RESOLVED sweep level for this tick, published by the ledger and read by
+// wbSweep and wbSplit. See kWaterSweepLive in world.h for why it is published
+// rather than recomputed. WB_SWEEP_NONE means nothing sweeps this tick.
+const WBS_SWEEPY    : u32 = 26u;
+const WB_SWEEP_LIVE : i32 = -0x7FFFFFFF;
+const WB_SWEEP_NONE : i32 = -0x40000001;
 
 // The ladder, GPU side. Candidate -> Measuring -> Adopted, and Releasing is the
 // way out. Measuring is its own state rather than a flag because the reduce is
@@ -552,6 +576,137 @@ const WB_RELEASING : i32 = 3;
 // CPU-sent per-body flags (TickParams.waterBodies row 1, word 3).
 const WBF_PROPOSE : i32 = 1;   // the CPU's deterministic tests all passed
 const WBF_RELEASE : i32 = 2;   // an EXIT test failed; hand this body back
+// M5: which component of a SPLIT basin this body governs, in bits 2..3. A body
+// with component 0 and a basin with no split map is exactly what M2/M3/M4
+// shipped — the map reads all-zero, every cell answers component 0, and the
+// footprint test collapses to the disc test it always was. That is why M5's
+// split machinery is an exact identity on a lake nobody has dug into.
+const WBF_COMP_SHIFT : u32 = 2u;
+const WBF_COMP_MASK  : i32 = 3;
+// M5: the body is a SPLIT CHILD. Carried separately from the component index
+// because "component 0" is also what an unsplit parent answers, and the ledger
+// needs to tell "I am the original body" from "I am the second pool that
+// appeared when the level fell past a partition" — a child with no cells is a
+// candidate that never adopts, and that must not be reported as a body the CPU
+// refused.
+const WBF_CHILD : i32 = 16;
+// M5: a child's PARENT slot, in bits 8..15. Carried so the ledger can arm a
+// child's re-audit on the same cycle boundary as its parent's — two pools that
+// re-measured on different ticks would report a `held` sum that briefly does
+// not add up to the water in the basin, and a conservation gate has no way to
+// tell that apart from a leak.
+const WBF_PARENT_SHIFT : u32 = 8u;
+const WBF_PARENT_MASK  : i32 = 255;
+// "No split found." atomicMax's identity, and deliberately far below any legal
+// world Y so the first disconnected level found always wins.
+const WB_SPLIT_NONE : i32 = -0x40000000;
+
+// ============================================================================
+// M5 — THE MEASURED CONTAINER CURVE AND THE SPLIT MAP (plan components 2 case
+// 2 and 10). Word map for the region of `waterBodyState` past the ledger.
+//
+// Must match kWaterCurve*/kWaterSplit*/kWaterSweep* in src/sim/world.h and the
+// SW_* reader in src/test/selftest_water.cpp.
+//
+// WHY THIS IS DERIVED DATA AND NOT AN AUTHORITY. Plan section 3.2: the surface
+// shave counts what it ACTUALLY removed and debits that, so nothing here can
+// ever become a mass number. area(y) paces a descent, the spill elevation gates
+// a jurisdiction test, the split map picks which pool a cell belongs to. An
+// approximate or few-ticks-stale table costs pace and picks a slightly wrong
+// moment to split. It cannot lose an eighth, and that is the property that lets
+// the sweep be scheduled at all.
+// ============================================================================
+// WATER_SPLIT_GRID / _CELLS / _WORDS, WATER_CURVE_MAXY / _WORDS,
+// WATER_SWEEP_HEADER, WATER_CURVE_BASE and WATER_SCRATCH_BASE are GENERATED
+// from world.h by ShaderConstantPrelude — the engine's standing rule that a
+// world constant a shader must agree with is never restated in WGSL. Only the
+// FIELD NAMES below are this file's, because a word map is a protocol rather
+// than a size.
+// ---- header ----
+// The area table's floor. Stored rather than re-derived from TickParams so a
+// reader (the gate, the ledger) can interpret the table without also knowing
+// which tick wrote it.
+const SW_FLOORY   : u32 = 0u;
+// How many Y entries the table actually covers, and whether the basin was
+// deeper than WATER_CURVE_MAXY and got truncated. Reported, not hidden: an
+// approximation nobody can see is an approximation nobody can bound.
+const SW_SPANY    : u32 = 1u;
+const SW_TRUNC    : u32 = 2u;
+// OUTPUT 2 of the sweep: the SPILL ELEVATION — the lowest world Y at which the
+// basin's rim is open to the outside. atomicMin target, so WB_HOLE_NONE is the
+// identity. Above it the container curve is meaningless because the body is not
+// a body, it is a flow (plan component 5's first enter test).
+const SW_SPILLY   : u32 = 3u;
+// OUTPUT 3 of the sweep: the SPLIT ELEVATION — the highest level at which the
+// basin's wet region is disconnected, i.e. the merge tree's first merge going
+// up and therefore the first split going down. WB_HOLE_NONE means "no split
+// found in any level scanned so far".
+const SW_SPLITY   : u32 = 4u;
+// Components found at the level the ACTIVE map describes, and which level that
+// is. The active map is written only when the swept level equals the body's own
+// live level, because that is the only level a footprint test ever asks about.
+const SW_COMPS    : u32 = 5u;
+const SW_MAPY     : u32 = 6u;
+// Bumped every time the active map CHANGES. The ledger watches it and re-audits
+// the body's volume when it moves — that is component 10's whole trigger, and
+// it is tick-deterministic because the sweep that bumps it is.
+const SW_MAPGEN   : u32 = 7u;
+// THE ACCUMULATORS' "NEXT" HALF, and it is plan section 3.3 at cycle
+// granularity rather than tick granularity.
+//
+// SW_SPILLY and SW_SPLITY are atomic reductions over EVERY LEVEL of the basin,
+// and a sweep visits one level per scheduled tick — so the reduction is only
+// meaningful once a whole cycle has been walked. Accumulated in place they were
+// worse than useless: a reader between the cycle's reset and its end sees the
+// maximum over however many levels happened to have been scanned, which for a
+// draining lake is "roughly the live level" and looks exactly like a correct
+// answer. Measured on the first version of `--gate waterbody` pass B as a split
+// elevation of 188 against a partition whose top is at 205.
+//
+// So the sweep accumulates into the *N words and the cycle boundary PROMOTES
+// them, which makes SW_SPILLY/SW_SPLITY the result of the last COMPLETE pass
+// over the basin and nothing else.
+const SW_SPILLYN  : u32 = 8u;
+const SW_SPLITYN  : u32 = 9u;
+// area(y): WATER_CURVE_MAXY entries, cells at y = SW_FLOORY + 1 + i. CELLS, not
+// columns (plan section 2) — a cave, an overhang or a flooded tunnel under the
+// lake is counted, and counting columns would silently reimplement the
+// single-span assumption that got heightfields rejected.
+const SW_AREA0    : u32 = WATER_SWEEP_HEADER;
+// The split map: 2 bits per grid cell, WATER_SPLIT_WORDS words.
+const SW_SPLIT0   : u32 = WATER_SWEEP_HEADER + WATER_CURVE_MAXY;
+// "This grid cell holds no water at the mapped level." Distinct from component
+// 0 so a blocked cell cannot silently enlarge the parent's footprint.
+const WB_COMP_NONE : u32 = 3u;
+// Smallest component the split will name, in GRID CELLS. Below this a
+// "component" is an artefact of the downsample — the two or three cells
+// where the disc's edge clips a grid cell — and naming it costs a whole
+// descriptor and hands the parent a pool with no water in it. 8 grid cells
+// is ~72 columns at the harness lake's step of 3.
+const WB_SPLIT_MIN_CELLS : u32 = 8u;
+// Most whole eighths one tick's shave may take off a surface cell: one whole
+// voxel. See the note at the `steps` computation in sim_waterbody.wgsl.
+const WB_MAX_STEPS : i32 = 8;
+
+fn wbCurveBase(b : u32) -> u32 { return WATER_CURVE_BASE + b * WATER_CURVE_WORDS; }
+// The basin's column AABB -> grid step. Derived from the geometry the CPU
+// already sends (the disc bound) rather than sent as its own field, so the two
+// cannot disagree: one number, one owner.
+fn wbGridStep(radius : i32) -> i32 {
+  return max(1, (2 * radius + 1 + i32(WATER_SPLIT_GRID) - 1) /
+                    i32(WATER_SPLIT_GRID));
+}
+// World column -> grid cell index, or WATER_SPLIT_CELLS when outside the grid.
+fn wbGridIndex(x : i32, z : i32, cx : i32, cz : i32, radius : i32) -> u32 {
+  let step = wbGridStep(radius);
+  let gx = (x - (cx - radius)) / step;
+  let gz = (z - (cz - radius)) / step;
+  if (gx < 0 || gz < 0 || gx >= i32(WATER_SPLIT_GRID) ||
+      gz >= i32(WATER_SPLIT_GRID)) {
+    return WATER_SPLIT_CELLS;
+  }
+  return u32(gz) * WATER_SPLIT_GRID + u32(gx);
+}
 
 // "No hole." atomicMin's identity, and deliberately i32-positive so the packed
 // key ordering below is a plain integer compare.

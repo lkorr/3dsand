@@ -725,6 +725,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   waterShave_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbShave", "waterShave");
   waterDrain_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbDrain", "waterDrain");
   waterHole_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbHole", "waterHole");
+  // M5: the scheduled container sweep (components 2 case 2 + 10).
+  waterSweep_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSweep", "waterSweep");
+  waterSplit_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSplit", "waterSplit");
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
@@ -744,7 +747,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !fluidConsumeApply_ || !fluidStainApply_ || !fluidMirrorFold_ ||
       !fluidCellClear_ || !waterDrain_ || !waterHole_ ||
       !waterQuiet_ || !waterLedger_ || !waterReduce_ ||
-      !waterShave_) {
+      !waterShave_ || !waterSweep_ || !waterSplit_) {
     if (err) *err = "compute pipeline creation failed (see stderr for the shader)";
     return false;
   }
@@ -810,6 +813,10 @@ struct RecordCtx {
   // whole subsystem unrecorded.
   uint32_t waterChunkCount = 0;
   uint32_t waterDrainBodies = 0;   // reserved drain op blocks (M3)
+  // M5: which body's container curve re-derives this tick, or kWaterBodyCap
+  // for "none" — which is every tick of a basin nobody has dug into, and is
+  // what leaves both sweep rows unrecorded (C_WATERSWEEP).
+  uint32_t waterSweepSlot = kWaterBodyCap;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced
@@ -947,6 +954,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::WaterShave:     return waterShave_;
     case P::WaterDrain:     return waterDrain_;
     case P::WaterHole:      return waterHole_;
+    case P::WaterSweep:     return waterSweep_;
+    case P::WaterSplit:     return waterSplit_;
     case P::FluidSettleCommit:   return fluidSettleCommit_;
     case P::FluidSettleKill:     return fluidSettleKill_;
     case P::FluidConsumeApply:   return fluidConsumeApply_;
@@ -989,6 +998,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.windWakeCount = cx.windWakeCount;
   tc.waterChunkCount = cx.waterChunkCount;
   tc.waterDrainBodies = cx.waterDrainBodies;
+  tc.waterSweepSlot = cx.waterSweepSlot;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -1245,7 +1255,8 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             uint32_t fluidCount, uint32_t fluidSpawnCount,
                             uint32_t windWakeCount, bool vizActive,
                             uint32_t waterChunkCount,
-                            uint32_t waterDrainBodies) {
+                            uint32_t waterDrainBodies,
+                            uint32_t waterSweepSlot) {
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
@@ -1260,6 +1271,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // M3: the reserved discharge op blocks. C_WATERDRAIN, and zero whenever
   // the feature is off or nothing is proposed.
   cx.waterDrainBodies = waterDrainBodies;
+  // M5: the scheduled re-derive. C_WATERSWEEP, and kWaterBodyCap ("none")
+  // on every tick of a basin nobody has dug into.
+  cx.waterSweepSlot = waterSweepSlot;
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
   cx.vizActive = vizActive;

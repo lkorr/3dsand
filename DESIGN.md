@@ -3392,9 +3392,12 @@ and matter in motion is exactly what the bias steers.
 
 `docs/PLAN_water_master.md` is the plan of record; `src/sim/waterbody.{h,cpp}`
 plus `assets/shaders/sim_waterbody.wgsl` are the code; `--gate waterbody` is the
-acceptance gate. **M1 (the registry) and M2 (the drain ledger and the surface
-shave) are landed, and neither moves the pinned world hash.** What follows
-describes what exists, and says plainly what does not.
+acceptance gate. **M1-M5 are all landed — the registry, the drain ledger and the
+surface shave, the discharge law and the local excite, the current field and
+waves (§9d), and the container sweep that lets a basin the player dug into
+re-derive itself and split. None of them moves the pinned world hash**, because
+`sim.waterBodyMode` ships at 0 and mode 0 records no pass row at all. What
+follows describes what exists, and says plainly what does not (§5b.7).
 
 ### 5b.1 The problem, in one number
 
@@ -3703,23 +3706,135 @@ the CPU to know the live level, which is exactly what M2 moved onto the GPU.
 move at M3 either.** Every row's condition is false at mode 0, no op block is
 reserved, and `T.waterBodyCount` 0 makes component 7's loop a zero-trip.
 
-### 5b.6 What is NOT here
+### 5b.6 M5: the container sweep, and a lake that splits itself (added 2026-08-29)
 
-Dug-basin discovery (M5). The current field and surface waves landed at M4 — see
-§9d.
+`docs/PLAN_water_master.md` components 2 (case 2) and 10 — the last milestone.
+M1-M4 governed the basins WORLDGEN makes, which are closed forms: a tarn is an
+integer parabola and an authored pool is a flat-floored cylinder, so their
+area-per-height tables are free and exact. M5 is what happens when the player
+takes a shovel to one.
+
+**The four outputs of one sweep.** Plan §2 asks for a height-ordered union-find
+sweep producing `area(y)`, the spill elevation, the split elevations and the
+split children — one pass, four answers, because the merge tree of a basin read
+downward IS its split schedule. Here:
+
+| output | pass | word | how |
+|---|---|---|---|
+| `area(y)` | `wbSweep` | `SW_AREA0..` | `atomicAdd` per CONTAINER cell (air or the body's liquid) at the swept level, inside the disc |
+| spill elevation | `wbSweep` | `SW_SPILLY` | `atomicMin` over the ring one cell OUTSIDE the disc — water leaves a basin over its rim, and the rim is not in the basin |
+| split elevations | `wbSplit` | `SW_SPLITY` | `atomicMax` over every level whose wet region is disconnected |
+| split children | `wbSplit` | `SW_SPLIT0..` | a 2-bit component index per grid cell |
+
+Both accumulate over a whole CYCLE — one level per scheduled tick — so the two
+reductions are published through a current/next pair (`SW_SPILLYN`,
+`SW_SPLITYN`) promoted at the cycle boundary. Accumulated in place they were
+worse than useless: a reader mid-cycle sees the maximum over however many levels
+happened to have been walked, which for a draining lake is "roughly the live
+level" and looks exactly like a correct answer.
+
+**It is a kernel, and that is a rule-1 decision rather than a performance one.**
+Plan §2 allows an async `voxregion` readback as a second choice. It is not
+available here: the table decides which pool a cell belongs to and therefore
+which cells the shave takes an eighth off, so a table whose ARRIVAL is set by
+fence retirement puts scheduling inside a voxel write's control path — §5b.4's
+hazard through a different door, and one that two runs in a single process
+cannot catch because they share a fence cadence. So the sweep is a compute pass,
+its outputs are consumed by compute passes, and the CPU's entire contribution is
+a SCHEDULE: which body, which level, both pure functions of the tick.
+
+**No union-find, and no atomicCAS.** Classical connected-component labelling
+wants path compression, which wants `atomicCAS`, which rule 1 bans outright
+because a CAS loop's outcome depends on which thread arrived first. Min-label
+propagation reaches the same fixpoint without it (integer `min` is associative
+and commutative, so the fixpoint is unique), and running it inside ONE workgroup
+— read phase into registers, `workgroupBarrier()`, write phase into cells this
+invocation alone owns — makes the whole thing a pure function of the input
+bitmap. It costs one under-occupied workgroup on a pass that runs once per
+scheduled tick. Every barrier sits in uniform control flow and every early-out
+that depends on a storage read is a FLAG rather than a `return`, because WGSL
+treats a storage load as possibly non-uniform and rejects the alternative.
+
+**The connectivity grid is a downsample, and the direction of its error is
+chosen.** Labelling runs on a `kWaterSplitGrid` squared grid laid over the
+basin's column AABB (one grid cell is about 3 columns for the harness lake), and
+a grid cell counts as OPEN if ANY of its columns is. That is the LIBERAL
+direction on purpose: it can only ever UNDER-split — report one pool where there
+are two — and under-splitting is the status quo, which the CA already handles.
+OVER-splitting would strand water in a puddle nobody drains, and that is the
+direction that is not safe. Components smaller than `WB_SPLIT_MIN_CELLS` grid
+cells are folded back into the parent for the same reason: at the top of a disc
+the circle's edge clips two or three cells, and ranking components by grid index
+alone once handed the parent that speck and the child the entire lake.
+
+**A split is not new arithmetic.** Nothing divides anybody's water. The map
+changes which cells each body OWNS and the existing ladder does the rest: the
+child's adoption reduce measures its own voxels, the parent's re-audit
+re-measures what is left, and both are voxel sums — so `held(parent) +
+held(child)` equals the parent's pre-split content BY MEASUREMENT rather than by
+a division that could round. §5's "both directions must be mass-exact" reused
+instead of re-derived. `--gate waterbody` pass B measures it at **+0 eighths**.
+
+**The re-audit closes M2's named leftover.** A body adopted once carried the
+volume it had at adoption; anyone who dug into it made that number a lie, and it
+bounds the discharge through `held = VOLUME - DRAINED`. On the first level of
+each sweep cycle the ledger arms `WBS_REAUDIT`, the adoption reduce refills
+`WBS_RSUM`, and the next tick writes
+
+    VOLUME := RSUM + DRAINED - DEBIT
+
+The form is the correctness argument: the standing invariant is `voxels == held
++ debit`, so folding the debit in is what keeps it true. `DRAINED` and `DEBIT`
+are untouched, because they are the cumulative terms passes A and H balance
+their identity on and a re-audit that reset either would read as a leak of
+everything the body had ever drained. The arm and the consume are two ticks
+apart for plan §3.3's reason applied inside one kernel: written as a single flag
+it fired on the tick it was armed, read the sum it had just zeroed, and set
+`held` to zero — which refuses every drain.
+
+**Discovery is a latch on the tick stream.** A mutation landing in a chunk the
+registry LABELLED marks that basin's curve dirty for `kWaterDrainHotTicks`. A
+dirty basin, and only a dirty basin, proposes a split child and takes a slot in
+the sweep rotation. Everything else proposes nothing and records neither sweep
+row, so a world nobody has dug in pays exactly what it paid at M4.
+
+**Where it all lives.** The sweep's outputs sit past the end of the ledger in the
+SAME buffer (`waterBodyState`, world.h's `kWaterCurveBase` block) rather than in
+a buffer of their own — a deliberate refusal to add a binding, since every
+accumulator the sweep needs (`atomicAdd`, `atomicMin`, `atomicOr`) is a
+sanctioned order-free atomic and the buffer is already an `A(WaterBodyState)` row
+in every water pass.
+
+### 5b.7 What is NOT here
+
 `sim.waterBodyTestDrain` survives from M2 as a development tap of a known size in
 eighths per tick, 0 in every shipped world — it exists so the ledger and the shave
 could be proved exact before there was a hole to be exact about, and pass A still
 uses it for the one identity that closes at +0.
 
-M3's own gaps: ONE hole per body (the descriptor has room for a list; the ledger
-carries the deepest), no re-audit of an adopted body whose voxels changed under
-it, no wall holes with lateral jets (the exit velocity is straight down), and the
-hot-window footprint declaration above.
+M3's own gaps, still open: ONE hole per body (the descriptor has room for a list;
+the ledger carries the deepest), no wall holes with lateral jets (the exit
+velocity is straight down), and the hot-window footprint declaration above.
 
-Two gate passes are absent and deliberately so: **B** (split scheduling) needs
-component 10's union-find sweep, and **F** (determinism mid-drain) needs a second
-in-process world to compare against. Both would be assertions against zero today.
+M5's own, and the first is the one worth knowing before building on this:
+
+* **An outstanding debit is not divided across a split.** The parent keeps all of
+  it and pays it out of the part it kept. Mass stays EXACT — the identity is over
+  both bodies and neither `DRAINED` nor `DEBIT` moves — but the pacing is wrong:
+  a body carrying a large debit when its footprint halves descends at twice the
+  rate it should. `WB_MAX_STEPS` bounds the damage to one voxel per tick (rule 2)
+  and at every shipped rate the debit is under one eighth-step anyway, so this is
+  reachable only by a development tap sized past the surface it drains. The exact
+  fix is a proportional transfer at the child's adoption, which needs both
+  bodies' reduces on one tick.
+* **The split names at most three components**, and a basin with more leaves the
+  extras with the parent — the same safe degradation every refusal here takes.
+* **A basin the player digs from NOTHING is still not a basin.** The registry
+  knows exactly two kinds, the authored pools and `pondAt`'s tarns, and M5
+  re-derives the container of a basin the player MODIFIED. A hole dug in flat
+  ground that fills with water is a CA pond, as it was before.
+* **The container curve is not persisted and not saved**, like every other
+  derived structure in this design. A window rebuild re-derives it.
 
 ## 9d. The current field, and surface waves (added 2026-08-29)
 

@@ -121,6 +121,8 @@ PIPE_TO_MEMBER = {
     # M3, components 6 + 7 (the discharge law and its hole detector).
     "PIPE_WATER_DRAIN": "waterDrain_",
     "PIPE_WATER_HOLE": "waterHole_",
+    "PIPE_WATER_SWEEP": "waterSweep_",
+    "PIPE_WATER_SPLIT": "waterSplit_",
     "PIPE_WATER_LEDGER": "waterLedger_",
     "PIPE_WATER_REDUCE": "waterReduce_",
     "PIPE_WATER_SHAVE": "waterShave_",

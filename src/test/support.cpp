@@ -409,6 +409,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.waterTestDrain = wt.sim.waterBodyTestDrain;
     tp.waterQuietTicks = wt.sim.waterBodyQuietTicks;
     tp.waterMinVolume = wt.sim.waterBodyMinVolume;
+    // M5: the scheduled container re-derive (components 2 case 2 + 10). Both
+    // fields are pure functions of the tick — see WaterBodySystem::BuildGpu —
+    // and `kWaterBodyCap` here means "nothing sweeps", which is the state of
+    // every basin nobody has dug into and is what leaves both sweep pass rows
+    // unrecorded.
+    tp.waterSweepSlot = g.sweepSlot;
+    tp.waterSweepLevel = g.sweepLevel;
     // ---- M3: RESERVE THE DISCHARGE'S OP BLOCK (component 6) --------------
     //
     // `spawnAppend` reads a CPU-sized op stream, and the discharge cannot size
@@ -800,7 +807,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                  fluidLive + fluidSpawnTotal, fluidSpawnTotal,
                  (uint32_t)windWake.size(), vizActive,
                  waterGpu ? (uint32_t)waterGpu->chunks.size() : 0u,
-                 drainBodies);
+                 drainBodies,
+                 waterGpu ? waterGpu->sweepSlot : kWaterBodyCap);
   sim.EncodeFarFill(enc, farCount);
   // PAGED RESIDENCY MAKES THE SNAPSHOT LOAD-BEARING, so the harness must ask
   // for one even when the caller did not. §3.2 step (2)'s intersection is the
@@ -913,8 +921,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // both sides: the CPU registry and the GPU record.
   WaterBodies().Reset();
   {
-    static const std::vector<int32_t> kZero(
-        (size_t)kWaterBodyCap * kWaterBodyStateWords, 0);
+    static const std::vector<int32_t> kZero((size_t)kWaterBodyStateTotalWords,
+                                            0);
     ctx.queue.WriteBuffer(world.waterBodyState, 0, kZero.data(),
                           kZero.size() * sizeof(int32_t));
   }
@@ -1170,9 +1178,14 @@ void ReadCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
                         "countsRead");
 }
 
+// The WHOLE buffer, ledger and sweep outputs alike (kWaterBodyStateTotalWords).
+// One readback rather than two because M5's gate passes B and G compare a
+// ledger word against a curve word in the same breath — a body's live level
+// against the split elevation the sweep found for it — and two reads taken a
+// tick apart would let a scheduled re-derive land between them.
 void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.waterBodyState, 0, out,
-                        (size_t)kWaterBodyCap * kWaterBodyStateWords * 4,
+                        (size_t)kWaterBodyStateTotalWords * 4,
                         "waterLedgerRead");
 }
 

@@ -82,6 +82,8 @@ namespace {
 #define PIPE_WATER_SHAVE     Pipe::WaterShave
 #define PIPE_WATER_DRAIN     Pipe::WaterDrain
 #define PIPE_WATER_HOLE      Pipe::WaterHole
+#define PIPE_WATER_SWEEP     Pipe::WaterSweep
+#define PIPE_WATER_SPLIT     Pipe::WaterSplit
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -116,6 +118,7 @@ namespace {
 #define C_VIZACTIVE Cond::VizActive
 #define C_WATERBODY Cond::WaterBody
 #define C_WATERDRAIN Cond::WaterDrain
+#define C_WATERSWEEP Cond::WaterSweep
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops

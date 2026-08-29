@@ -1,7 +1,17 @@
 # MASTER PLAN: cheap large-water — bodies, drains, currents, vortices
 
-> **Status: design of record for the water-bodies work, written 2026-08-28 from
-> an owner design session. Nothing implemented.** This document supersedes
+> **Status: BUILT. M1-M5 all landed 2026-08-28/29 and none of them moves the
+> pinned world hash** — `sim.waterBodyMode` ships at 0 and mode 0 records no GPU
+> pass row at all, so turning the feature on is a tuning change and turning it
+> off is an exact identity. Read §1.1-§1.5 for what each milestone measured; the
+> component sections below are the design those milestones were built from and
+> are unchanged except where a §1.x block says otherwise.
+>
+> **What remains open** is listed at the end of §1.5. The §5 conveyor (sleeping
+> rivers) is a NAMED NON-GOAL and stays one: it is a real component, it is not in
+> this plan, and it should be built from its own document.
+>
+> This document supersedes
 > `docs/PLAN_water_bodies.md` as the thing to implement from: it keeps that
 > document's architecture, corrects five things in it, and reorganises the work
 > around what each piece actually buys. `PLAN_water_bodies.md` stays as the
@@ -91,6 +101,50 @@ RTX 3060 Ti):
 | worldlake | CA alone | 15.00 | 17.12 | 70,743 | EXACT |
 | worldlake | hybrid, ceiling 8,000 | 25.05 | 28.60 | 72,996 | EXACT |
 | worldlake | hybrid, ceiling 262,144 | 69.34 | 73.74 | 102,402 | EXACT |
+
+> **`worldlake` was UNREPRODUCIBLE from the terrain overhaul until 2026-08-29,
+> and the frame-cost column above is stale.** M3 found the scene standing up
+> **0 water voxels** on this tree and on the main checkout's own binary, which
+> made the three rows above claims nobody could check (§1.3). The cause was
+> found at M5 and it was small: `src/lab/lab.cpp` hard-coded the authored lake's
+> elevation — `kLakeFloor 44`, `kLakeSurf 68`, `kLakeChamberTop 31` — from when
+> `spawnPlainY` was 44. It is 200 now, so the lake floor is **185** and the
+> surface **209**, and every consumer of those literals (the mass-audit box, the
+> plug shaft, the sealed chamber, the CPU-mirror chunk, the camera) was pointed
+> at solid rock 141 voxels under the water. Exactly the class of staleness M4
+> found in both `--shot` water cameras. The fix reads
+> `World::AuthoredPoolList(...)[0]` fresh instead of restating the number —
+> which is how `--gate waterbody` had been reaching the same lake all along.
+>
+> All three arms now report `plug pulled: 2782656 eighths standing (347832 water
+> voxels)`, **the plan's 347,832 figure to the voxel**. Re-measured in ONE
+> invocation (`--fluid-bench wp5c`), mass EXACT on every arm:
+>
+> | scene | arm | p50 | p95 | p99 | drained (eighths) | idle ticks before plug |
+> |---|---|---|---|---|---|---|
+> | pond68 | `-ex0` (CA alone) | 8.66 | 9.32 | 11.37 | 6,320 | 68 |
+> | pond68 | `-ex0-wb1` | 8.70 | 9.52 | 16.67 | 6,320 | 68 |
+> | worldlake | `-ex0` | 22.81 | 24.46 | 36.06 | **71,269** | 59 |
+> | worldlake | `-ex0-wb1` | 23.94 | 25.97 | 33.41 | **71,269** | 59 |
+> | worldlake | `-perch1-wb1` | 30.62 | 32.86 | 33.49 | **77,698** | 59 |
+>
+> **Read the frame-cost column carefully.** `worldlake` at 22.8 ms p50 is not a
+> regression against §1.3's 2.19 ms: that camera was framing y 129 over empty
+> sky, so `world+sky` was nearly free. It now looks at real terrain and a real
+> lake. Any `worldlake` frame number written between the terrain overhaul and
+> this fix is measuring a different PICTURE, not a different solver.
+>
+> **And the `-wb1` arms are still an A/A, for M3's unchanged reason.** Both
+> `worldlake` arms drain the identical 71,269 eighths, because this bench drains
+> by PUNCTURE into a sealed chamber whose ~33,600 cells bound the transfer at
+> 2.56% of a 347,832-voxel lake over 400 ticks — the CA does that transport
+> either way and `sim.waterBodyTestDrain` is 0 here. What the pair honestly
+> measures is the cost of the feature being ON in a scene it governs: **+1.1 ms
+> p50 and the scene still reports its full 59 idle ticks before the plug.** The
+> throughput claim §1 asks for still belongs to `--gate waterbody` pass H, which
+> is a real orifice rather than a chamber-bounded transfer: **35,381 eighths in
+> 90 ticks (393/tick) against the CA-only `pond68` arm's 6,320 over 400 (15.8/
+> tick)**, at 0 page faults and −37 eighths of residual.
 
 **Success = drain MORE than those rows while costing LESS.** WP5's finding was
 that drain throughput is flat from 4k to 32k particles and ~97% of what arrives
@@ -477,7 +531,14 @@ and the next agent will read that sentence too.
 | worldlake | `-ex0-wb1` | 2.18 | 6.94 | 8.51 | 0 | 59 |
 | worldlake | `-perch1-wb1` | 2.18 | 7.16 | 8.98 | 0 | 59 |
 
-**1. `worldlake` builds NO WATER on this tree, and it is not M3's doing.** Every
+**1. `worldlake` builds NO WATER on this tree, and it is not M3's doing.**
+> **REPAIRED AT M5 (2026-08-29).** The cause was a stale elevation literal in
+> `src/lab/lab.cpp`, not worldgen. See the correction block under §1's baseline
+> table for the diagnosis and the re-measured numbers; the frame-cost rows in
+> the table just above are measuring an empty-sky camera and should not be
+> carried forward.
+
+Every
 arm reports `plug pulled: 0 eighths standing (0 water voxels)`. Verified against
 the main checkout's own binary at `7709408`, which reports the same thing:
 
@@ -681,6 +742,166 @@ exactly as authoritative as a picture of something. Both cameras now ask
   in DESIGN.md §9d.4 and in its own header. Two would have been better; zero was
   not available, because the player is CPU physics.
 
+
+
+### 1.5 M5 — LANDED 2026-08-29
+
+Components 10 and 2's case-2 sweep, plus `--gate waterbody` passes **B** and
+**F** — the two the gate has been missing since M2 — plus the `worldlake` bench
+repair quoted in §1 above. Two new WGSL entry points (`wbSweep`, `wbSplit`), two
+new `PT_TICK` rows under a new `C_WATERSWEEP` condition, `waterBodyState` widened
+from 4 KiB to 61 KiB (the ledger 24 → 27 words, plus a per-body sweep block and a
+shared scratch region past the end of it), `kWaterChunkCap` 512 → 1024,
+`TickParams.waterSweepSlot`/`waterSweepLevel` taken out of the existing pad
+words. DESIGN.md §5b.6/§5b.7. **No new tuning knobs** — the schedule is a
+constant, not a dial.
+
+**Hash: UNMOVED, and every M2/M3 number is byte-identical.** One `--gate
+waterbody` invocation establishes the whole of it:
+
+```
+pass D          ->  af008434 / af008434 / af008434   (mode 0 / 1 / 0)
+pass A          ->  +0 eighths over 869,580 drained, 0 capped, 0 page faults
+pass H1/H2      ->  35,381 / -37   and   26,476 / -305, shell 14,468 @r6
+pass H2 excite  ->  51,346 cand / 5,897,839 seen (570.5/tick)
+pass E          ->  0 awake chunks;  pass C -> 0 state flips in 200 ticks
+pass K/K2       ->  31 curve levels round-trip; tarn r54 128,214 == 128,214
+```
+
+Those are M2's and M3's published figures to the digit. That is the strongest
+available statement that M5 changes nothing about the world it did not mean to:
+the sweep is scheduled only for a basin a mutation has touched, and no shipped
+world has one.
+
+#### Pass B — the split, and the four outputs against a known bowl
+
+The fixture drains the authored lake ~6 voxels, then raises a nine-column stone
+partition from its floor to y=205, THROUGH the free surface. That order is the
+fixture (see below). One invocation, five assertions:
+
+| what | measured | wanted | which plan output |
+|---|---|---|---|
+| split elevation | **205** | 205 (the partition's top) | §2 output 3, the merge tree |
+| components at the live level | **2** | 2 | §2 output 4 |
+| adopted descriptors over one basin | **2** | 2 | component 10 |
+| `held(parent) + held(child)` | **943,427 + 942,418 = 1,885,845** | 1,885,845 voxel eighths, **+0** | §5, mass-exact both directions |
+| `area(y)` above the wall | **14,493** | 14,493 by an independent lattice walk | §2 output 1 |
+| `area(y)` through the wall | **13,278** | 13,278 (the disc minus the wall) | §2 output 1 |
+| spill elevation | **none** | none — the rim is intact | §2 output 2 |
+
+The two `area(y)` rows are the pair that matters and they are deliberately
+different numbers from one table: one of them says the sweep RAN, both of them
+together say the sweep SAW THE TERRAIN THE PLAYER SHAPED. A curve that had
+quietly kept reporting the analytic disc would pass the first and fail the
+second. The split-elevation row is likewise the only check on the merge tree,
+which nothing else in the suite touches.
+
+The mass row is the milestone's headline and it is worth being precise about why
+it is exact rather than close: **nothing divides anybody's water.** The split map
+changes which cells each body OWNS; the child's adoption reduce measures its own
+voxels and the parent's re-audit re-measures what is left. Both are voxel sums,
+so the two halves sum to the parent by MEASUREMENT and not by an integer
+division that could round. §5's "both directions must be mass-exact" reused
+rather than re-derived.
+
+#### Pass F — determinism, mid-drain
+
+```
+mid-drain (45 ticks after the punch)   d2c2b2c5 / d2c2b2c5
+end       (90 ticks after the punch)   06003b31 / 06003b31
+```
+
+Two arms, not three, and the asymmetry with passes D and S is deliberate: those
+compare a feature ON against OFF, so a third arm is what separates "the feature
+moved the world" from "arm 1 inherited state arm 2 did not". Here both arms are
+the SAME configuration and each rebuilds the world itself — the only question is
+whether one script produces one world. Both arms run at the same FIXED tick base
+(`hash3` keys on the tick, so a second arm at t+900 is a different world by
+construction and not a determinism failure), and there are TWO checkpoints
+because a single end-of-run comparison cannot say WHEN two runs diverged, and
+this pass exists to point at a schedule.
+
+**This pass could not have existed before M5 and has to exist now.** Until this
+milestone nothing in the water system was spread over ticks: the ledger ran every
+tick, the shave ran every tick, the reduce ran once. M5 introduces the first
+scheduled work in the subsystem, and a schedule is exactly the thing that can be
+written two ways that look identical and are not.
+
+#### Four things that went wrong, and what each one teaches
+
+1. **The five-edits trap, paid in full.** A new `TickParams` count crosses THREE
+   structs — `simulation.cpp`'s anonymous `RecordCtx`, `rhi_record.h`'s
+   `TableCtx`, and `vk_record.h`'s own `RecordCtx` — with a copy at each hop.
+   The third copy was missed. The symptom was not a crash or a validation error:
+   the condition evaluated against a default-initialised field, both sweep rows
+   were silently never recorded, and the gate reported a container curve of all
+   zeros. The recorded gotcha says five edits; it is worth restating that the
+   FAILURE MODE is a pass that quietly does not exist.
+2. **A gate that reads a buffer must be sized from the buffer's constant.**
+   Widening `waterBodyState` and `ReadWaterLedgerSync` without widening the
+   gate's own vector took the process out with an empty `crash.log` and zero gate
+   output — which reads exactly like a GPU hang. One constant, one owner:
+   `kWaterBodyStateTotalWords`.
+3. **Arm and consume cannot be the same invocation.** Plan §3.3 is stated about
+   PASSES, and the re-audit broke it INSIDE one: written as a single flag it
+   fired on the tick it was armed, read the sum it had just zeroed, and set
+   `VOLUME = 0 + DRAINED` — so `held` was zero, which REFUSES every drain. The
+   lake stopped draining and the gate reported a level that never moved. Staged
+   over two ticks (2 = "the reduce is filling it", 1 = "ready to spend") it is
+   correct, and the form of the write is load-bearing too: `RSUM + DRAINED −
+   DEBIT`, not `RSUM + DRAINED`, because the standing invariant is `voxels ==
+   held + debit`.
+4. **A cycle-long reduction cannot be read mid-cycle.** `SW_SPILLY`/`SW_SPLITY`
+   accumulate over one level per scheduled tick, so accumulating them in place
+   meant a reader saw the maximum over however many levels had been walked —
+   which for a draining lake is "roughly the live level" and looks exactly like a
+   correct answer. Measured as a split elevation of 188 against a partition top
+   of 205. They are now a current/next pair promoted at the cycle boundary, which
+   is §3.3 at cycle granularity.
+
+Two more, both about the FIXTURE rather than the code, and both worth keeping:
+
+* **Ranking split components by grid index alone hands the parent a speck.** At
+  the top of a disc the circle's edge clips two or three grid cells; that scrap
+  had the lowest index, became "component 0", and the child inherited the entire
+  lake. Components are now SIZED and anything under `WB_SPLIT_MIN_CELLS` folds
+  back into the parent.
+* **Build the partition AFTER the drain, not before.** Draining past a submerged
+  wall looks like the natural script and does not work: the far side SPILLS OVER
+  the partition and settles exactly AT its top, permanently trickling, so the
+  second descriptor never clears its quiescence window. Draining first and then
+  raising the wall through the free surface reaches the configuration a real
+  draining lake reaches on its own — §2's "any bowl with an uneven floor becomes
+  two puddles as the level falls past the high point between them" — by
+  construction instead of by a race.
+
+#### What M5 did NOT do — and what is open at the end of the plan
+
+* **An outstanding debit is not divided across a split.** The parent keeps all of
+  it and pays it out of the part it kept. Mass stays EXACT (the identity is over
+  both bodies; neither `DRAINED` nor `DEBIT` moves) but the pacing is wrong — a
+  body whose footprint halves descends at twice the rate it should.
+  `WB_MAX_STEPS` bounds it to one voxel per tick (rule 2), and at every shipped
+  rate the debit is under one eighth-step anyway, so it is reachable only through
+  a development tap sized past the surface it drains. The exact fix is a
+  proportional transfer at the child's adoption and it needs both bodies'
+  reduces on one tick.
+* **A basin dug from FLAT GROUND is still not a basin.** The registry knows two
+  kinds — the authored pools and `pondAt`'s tarns — and component 10 as built
+  re-derives the container of a basin the player MODIFIED, which is what §10
+  scopes it to ("a mutation touched a rim chunk of a LABELLED basin"). A hole dug
+  in a meadow that fills with rain is a CA pond, exactly as before.
+* **At most three components per basin**, and the extras stay with the parent.
+* **The connectivity grid is a downsample** (48² over the basin's column AABB,
+  ~3 columns a cell for the harness lake). A partition thinner than 2·step−1
+  columns can be missed. The error direction is chosen: OPEN if ANY column is
+  open, so it can only UNDER-split, and under-splitting is the status quo.
+* **M3's leftovers that M5 did not touch:** one hole per body, no lateral jets,
+  and the hot-window footprint declaration. M3's third leftover — no re-audit of
+  an adopted body — is CLOSED.
+* **The §5 conveyor (sleeping rivers) stays a named non-goal.** M4's leftovers
+  (no wind-stress primitive, no source seeder, no wave refraction, and
+  `sim.currentMode` shipping at 0) also stand.
 
 ---
 
@@ -1410,7 +1631,7 @@ LOOK CHAIN    8 (stream arm + evaluator) ──► 9 ──► 8 (drain seeders,
 | **M2 — the drain works** ✅ **LANDED 2026-08-29** | 3, 4, the GPU reduce, and the quiescence fix of §1.1 correction 2 | A lake drains by arithmetic, driven by the `sim.waterBodyTestDrain` tap. Conservation exact at **+0 eighths** over 869,580 drained; the shave produces **0 excite candidates** against 10.9 M cells inspected. See §1.2. | **Identical**, measured: mode 0 / mode 1 / mode 0 all `af008434` |
 | **M3 — it is a feature** ✅ **LANDED 2026-08-29** | 6, 7 | A hole is a real orifice: Q = Cd·A·√(2gh), one evaluation of h feeding both the jet and the debit, MPM out of the throat. 35,381 eighths through a real hole at −37 residual; the shell is 14,468 cells against the ball’s ~33,000. See §1.3. | **Does NOT move** — `sim.waterBodyMode` is 0 by default and §8 requires mode 0 to be bit-identical, so no row is recorded. This row was wrong. |
 | **M4 — it looks alive** ✅ **LANDED 2026-08-29** | 8 (full), 9 | Current, vortices, flowing surface, foam, an arrow overlay. Profiles asserted by ratio (vortex 1/r = 2.25, sink 1/r² = 4.49); a mostly-water 1080p frame is 6.30 → 6.24 ms. See §1.4. | **Does NOT move** — `sim.currentMode` ships at 0 and `currentAtQ` returns zero before reading anything. The RENDER arm ships on, because a renderer cannot write a voxel. |
-| **M5 — completeness** | 10, 2's sweep | Player-dug basins participate. | Moves |
+| **M5 — completeness** ✅ **LANDED 2026-08-29** | 10, 2's sweep | A basin the player dug into re-derives its own container and SPLITS itself: split elevation 205 against a known partition top of 205, two descriptors, 943,427 + 942,418 = 1,885,845 eighths against 1,885,845 real (**+0**), measured `area(y)` matching an independent lattice walk above and through the wall. Gate passes B and F land with it. See §1.5. | **Does NOT move** — `sim.waterBodyMode` is 0 by default and no sweep row is recorded. This row was wrong, for M3's reason. |
 
 **M1 and M2 are the whole architectural risk and neither changes the world hash.**
 M3 is where it becomes a feature. M4 is the fun. M5 is completeness.
@@ -1433,11 +1654,11 @@ manual terminal reading, no second run with different flags. Thresholds live in
 | Pass | Asserts | Catches |
 |---|---|---|
 | **A — conservation** | `Σ(voxel eighths) + Σ(ledger remainders) + Σ(in-flight MPM mass)` invariant across a full drain | Every mistake in components 3, 4, 6, 7. The primary pass. |
-| **B — split scheduling** | A pond with a known interior high point drains past a partition elevation; exactly two descriptors appear at the predicted level, volumes summing to the parent's | Component 2's merge tree, component 10 |
+| **B — split scheduling** ✅ | A pond with a known interior high point drains past a partition elevation; exactly two descriptors appear at the predicted level, volumes summing to the parent's. Also asserts `area(y)` against an independent lattice walk both above and through the partition, and the spill elevation against an intact rim — the sweep's other two outputs | Component 2's merge tree, component 10 |
 | **C — hysteresis** | A body parked at the size threshold, 200 ticks: descriptor does not flap, mass is flat | Component 5's thresholds |
 | **D — off switch** | `sim.waterBodyMode=0` reproduces the pinned hash exactly | Landed at M1, kept forever |
 | **E — idle cost** | A large pooled lake keeps active chunks at rest under the existing ≤32 assertion | Component 4's chunk waking. **If a labelled body cannot sleep, the feature is a regression regardless of what it enables.** |
-| **F — determinism** | Same seed, two runs, drain in progress at the compare tick | A re-derive scheduled on CPU convenience (discipline 3.4) |
+| **F — determinism** ✅ | Same seed, two runs from the same fresh worldgen at the same FIXED tick base, hashed mid-drain and again after | A re-derive scheduled on CPU convenience (discipline 3.4) |
 | **G — recompute equality** | Recompute every descriptor from voxels, assert equality with the live one | Label corruption, bad merges, bad splits, ledger drift — all at once |
 
 **Instrument at the point of failure, not the point of refusal.** Per CLAUDE.md
