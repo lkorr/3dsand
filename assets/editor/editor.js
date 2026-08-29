@@ -362,9 +362,145 @@ function endStroke() {
   stroke = null;
 }
 
-// Structural edits (add/remove/reorder models) renumber model indices and
-// grid sizes, so the quad-format log cannot survive them.
-function clearUndo() { undoStack = []; redoStack = []; stroke = null; _sidecarBefore = null; }
+function clearUndo() {
+  undoStack = []; redoStack = []; stroke = null; _sidecarBefore = null;
+  _structDepth = 0; _structBefore = null;
+}
+
+/* ---- structural undo -----------------------------------------------------
+
+   A STRUCTURAL edit is one that adds, removes or renumbers MODELS: add,
+   duplicate, delete, split-to-model, the 2×/÷2 resamples, and the limb
+   library's graft. Every one of them used to call clearUndo() and throw the
+   entire history away, for the reason at the top of this file: the voxel log
+   addresses cells by MODEL INDEX, and a splice renumbers every model after it.
+
+   That reasoning is right about the log and wrong about the conclusion. The
+   log does not have to SURVIVE the renumbering — it only has to be correct
+   once the structural entry sitting above it has been undone. Undo is strictly
+   LIFO, so a full before/after snapshot of the model list restores exactly the
+   indices those older entries were written against, and the history below a
+   structural edit becomes valid again the moment that edit is taken back.
+
+   Two things a transaction must do beyond snapshotting:
+
+   - COLLAPSE what happened inside it. splitSelectionToModel runs its erase
+     through applyOps so the extraction is one operation, which pushes a voxel
+     entry; left in the stack it would be a second Ctrl+Z that re-erases the
+     voxels the first one just restored. Everything pushed between begin and
+     end is already described by the after-snapshot, so it is dropped.
+
+   - NEST. A limb swap is a graft PLUS sidecar surgery either side of it
+     (rig.js removes the doomed limbs before and pushes the incoming ones
+     after). An entry pushed inside graftModels alone would snapshot the
+     sidecar mid-operation and undo to a skeleton that never existed, so
+     rig.js opens the transaction around the whole thing and the graft's own
+     begin/end become a no-op depth count.
+
+   What a snapshot deliberately does NOT restore is the ART PALETTE. It is
+   append-only (vox.js ArtPalette allocates dense from the top and never
+   frees), so every index a restored grid holds was allocated before the
+   snapshot and is still there: leaving it alone is always correct and only
+   leaks unused swatches. Truncating it back is the unsafe option — a paint
+   stroke made after the graft can hold a slot allocated after it, and redoing
+   that stroke would then resolve a colour that no longer exists. */
+
+// ~74 KB per snapshot for a humanoid (dense grids + colour layer), so this is
+// a couple of MB at the ceiling. A resampled 2× document is 8× that; the cap
+// is on the COUNT because that is the number a user can reason about.
+const kMaxStructUndo = 30;
+let _structDepth = 0, _structBefore = null, _structMark = 0;
+
+function snapshotStructure() {
+  return {
+    active: activeModel,
+    models: doc.models.map(m => ({
+      name: m.name, offset: { ...m.offset }, dim: { ...m.dim },
+      data: new Uint8Array(m.grid.data),
+      color: m.grid.color ? new Uint8Array(m.grid.color) : null,
+    })),
+    // The sidecar rides along because a structural edit almost always moves it
+    // too (a deleted model's limb entry, a grafted part's anchors), and the two
+    // have to come back together or the skeleton refers to models that are gone.
+    sidecar: sidecar ? JSON.stringify(sidecar) : null,
+  };
+}
+
+function applyStructureSnapshot(s, label, which) {
+  doc.models = s.models.map(p => {
+    const g = makeGrid(p.dim);
+    g.data.set(p.data);
+    if (p.color) gridColorLayer(g).set(p.color);
+    return { name: p.name, offset: { ...p.offset }, dim: { ...p.dim }, grid: g };
+  });
+  // Replaced IN PLACE, not reassigned: rig.js holds the object it got from
+  // getSidecar() and would go on editing the old one (the same rule
+  // applySidecarSnapshot follows, for the same reason).
+  if (s.sidecar !== null && sidecar) {
+    const restored = JSON.parse(s.sidecar);
+    Object.keys(sidecar).forEach(k => delete sidecar[k]);
+    Object.assign(sidecar, restored);
+  }
+  // reboundDoc() for `doc.size` ALONE, which is stored derived state: whole
+  // mode edits against it and tightenPrefab hands it to the .vox writer, so a
+  // stale one outlives the undo and gets SAVED. Restoring the models is not
+  // enough — the first version of this left a creature reading 4x20x3 after an
+  // undo back to 4x17x3.
+  //
+  // It cannot also shift anything: every mutation path ends in reboundDoc(),
+  // so a snapshot is always of an already-rebased document and the min corner
+  // it finds is 0.
+  reboundDoc();
+  setSelection(null);
+  setActiveModel(s.active);
+  needsRebuild = true;
+  if (initialised) { updateResizeHandles(); updateMirrorPlane(); }
+  // The heavier of the two hooks: models AND sidecar moved, so rig.js has to
+  // rebuild its skeleton and drop selections that may name a limb that is gone.
+  hooks.onSidecarChanged?.();
+  hooks.onModelsChanged?.();
+  hooks.toast(`${which} ${label}`);
+}
+
+/** Open a structural transaction. Safe to nest; only the outermost snapshots. */
+function beginStructural() {
+  if (_structDepth++ > 0 || !doc) return;
+  commitSidecarUndo();          // flush anything pending from BEFORE this edit
+  _structMark = undoStack.length;
+  _structBefore = snapshotStructure();
+}
+
+/** Close it. `ok` false = the edit refused itself; record nothing. */
+function endStructural(label, ok = true) {
+  if (_structDepth > 0) _structDepth--;
+  if (_structDepth > 0 || !_structBefore) return;
+  const before = _structBefore;
+  _structBefore = null;
+  // The snapshot pair already carries the sidecar, so a separate entry for it
+  // would be a second Ctrl+Z undoing half of one edit.
+  discardSidecarUndo();
+  if (!ok || !doc) return;
+  undoStack.length = _structMark;               // collapse (see above)
+  undoStack.push({ type: 'structure',
+                   data: { label, before, after: snapshotStructure() } });
+  redoStack.length = 0;
+  let n = 0;
+  for (const e of undoStack) if (e.type === 'structure') n++;
+  // Oldest-first eviction: dropping a PREFIX of the stack keeps every entry
+  // that remains valid, because undo only ever walks back from the top.
+  while (n > kMaxStructUndo && undoStack.length)
+    if (undoStack.shift().type === 'structure') n--;
+}
+
+/** Run `fn` as one undoable structural edit. Returns whatever `fn` returns;
+ *  a `false` return is taken as "refused", the convention these ops use. */
+function structuralEdit(label, fn) {
+  beginStructural();
+  let r;
+  try { r = fn(); } catch (e) { endStructural(label, false); throw e; }
+  endStructural(label, r !== false);
+  return r;
+}
 
 function undoVoxel(s) {
   for (let i = s.length - kOpStride; i >= 0; i -= kOpStride) {
@@ -460,6 +596,8 @@ function dispatchUndo(e) {
   else if (e.type === 'grow') applyGrowSnapshot(e.data, 'before');
   else if (e.type === 'move') applyMoveEntry(e.data, 'before');
   else if (e.type === 'sidecar') applySidecarSnapshot(e.data.before);
+  else if (e.type === 'structure')
+    applyStructureSnapshot(e.data.before, e.data.label, 'undo');
 }
 function dispatchRedo(e) {
   if (e.type === 'voxel') redoVoxel(e.data);
@@ -467,6 +605,8 @@ function dispatchRedo(e) {
   else if (e.type === 'grow') applyGrowSnapshot(e.data, 'after');
   else if (e.type === 'move') applyMoveEntry(e.data, 'after');
   else if (e.type === 'sidecar') applySidecarSnapshot(e.data.after);
+  else if (e.type === 'structure')
+    applyStructureSnapshot(e.data.after, e.data.label, 'redo');
 }
 
 function undo() {
@@ -844,34 +984,40 @@ function uniqueModelName(base) {
 
 function addModel(dx, dy, dz, name) {
   if (!doc) return;
-  const dim = {
-    x: Math.max(1, Math.min(MAX_EDIT_DIM, dx | 0)),
-    y: Math.max(1, Math.min(MAX_EDIT_DIM, dy | 0)),
-    z: Math.max(1, Math.min(MAX_EDIT_DIM, dz | 0)),
-  };
-  doc.models.push({
-    name: uniqueModelName(name || 'model'),
-    offset: { x: 0, y: 0, z: 0 }, dim, grid: makeGrid(dim),
+  structuralEdit('add model', () => {
+    const dim = {
+      x: Math.max(1, Math.min(MAX_EDIT_DIM, dx | 0)),
+      y: Math.max(1, Math.min(MAX_EDIT_DIM, dy | 0)),
+      z: Math.max(1, Math.min(MAX_EDIT_DIM, dz | 0)),
+    };
+    doc.models.push({
+      name: uniqueModelName(name || 'model'),
+      offset: { x: 0, y: 0, z: 0 }, dim, grid: makeGrid(dim),
+    });
+    reboundDoc();
+    setActiveModel(doc.models.length - 1);
+    markDirty();
   });
-  clearUndo();
-  reboundDoc();
-  setActiveModel(doc.models.length - 1);
-  markDirty();
 }
 
 function duplicateModel(i) {
   if (!doc || !doc.models[i]) return;
-  const s = doc.models[i];
-  const g = makeGrid(s.dim);
-  g.data.set(s.grid.data);
-  doc.models.splice(i + 1, 0, {
-    name: uniqueModelName(s.name || 'model'),
-    offset: { ...s.offset }, dim: { ...s.dim }, grid: g,
+  structuralEdit('duplicate model', () => {
+    const s = doc.models[i];
+    const g = makeGrid(s.dim);
+    g.data.set(s.grid.data);
+    // The colour layer too. Copying only `data` duplicated the geometry and
+    // silently dropped every painted voxel's art index, so the copy came back
+    // in flat material colours.
+    if (s.grid.color) gridColorLayer(g).set(s.grid.color);
+    doc.models.splice(i + 1, 0, {     // the splice renumbers models after i
+      name: uniqueModelName(s.name || 'model'),
+      offset: { ...s.offset }, dim: { ...s.dim }, grid: g,
+    });
+    reboundDoc();
+    setActiveModel(i + 1);
+    markDirty();
   });
-  clearUndo();                 // the splice renumbered models after i
-  reboundDoc();
-  setActiveModel(i + 1);
-  markDirty();
 }
 
 function removeModel(i) {
@@ -879,12 +1025,13 @@ function removeModel(i) {
     hooks.toast('a file needs at least one model', true);
     return;
   }
-  renameVisibility(doc.models[i].name, null);
-  doc.models.splice(i, 1);
-  clearUndo();                 // the splice renumbered models after i
-  reboundDoc();
-  setActiveModel(Math.min(i, doc.models.length - 1));
-  markDirty();
+  structuralEdit('delete model', () => {
+    renameVisibility(doc.models[i].name, null);
+    doc.models.splice(i, 1);   // the splice renumbers models after i
+    reboundDoc();
+    setActiveModel(Math.min(i, doc.models.length - 1));
+    markDirty();
+  });
 }
 
 /**
@@ -916,6 +1063,11 @@ function removeModel(i) {
  */
 function graftModels(parts, at, srcPalette, replace) {
   if (!doc || !parts.length) return [];
+  // Usually a no-op depth count: the limb shelf opens the transaction around
+  // the whole swap, because the sidecar surgery either side of this belongs in
+  // the same undo step. Kept so a direct caller is still undoable.
+  beginStructural();
+  try {
   // Source art index -> our index. Cached per graft: a limb is thousands of
   // voxels over a handful of distinct colours.
   const remap = new Map();
@@ -954,8 +1106,6 @@ function graftModels(parts, at, srcPalette, replace) {
     });
     added.push(p.name);
   }
-  clearUndo();                 // model indices moved; the flat op log encodes them
-
   // reboundDoc() keeps the prefab's min corner at 0, so a part grafted at a
   // negative offset slides EVERY model — and anchors are not models, so they
   // do not slide with them. Same trap moveModel documents; here the caller
@@ -973,6 +1123,7 @@ function graftModels(parts, at, srcPalette, replace) {
   markDirty();
   hooks.onModelsChanged?.();
   return { added, shift };
+  } finally { endStructural('graft limb'); }
 }
 
 function renameModel(i, name) {
@@ -1003,8 +1154,12 @@ function renameModel(i, name) {
  */
 function splitSelectionToModel(name) {
   if (!doc || !selection) { hooks.toast('make a box selection first', true); return false; }
+  if (!doc.models[selection.model]) return false;
+  return structuralEdit('split to model', () => splitSelectionToModelInner(name));
+}
+
+function splitSelectionToModelInner(name) {
   const src = doc.models[selection.model];
-  if (!src) return false;
   // applyOps below erases from the ACTIVE model; the selection's coordinates
   // are local to the model it was made on, so they must be the same model.
   if (activeModel !== selection.model) setActiveModel(selection.model);
@@ -1050,9 +1205,9 @@ function splitSelectionToModel(name) {
     offset: { x: src.offset.x + mn[0], y: src.offset.y + mn[1], z: src.offset.z + mn[2] },
     dim, grid: g,
   });
-  // Undoing just the erase would leave the voxels duplicated into the new
-  // part; the split is structural, so it takes the whole log with it.
-  clearUndo();
+  // The erase above went through applyOps and pushed its own voxel entry.
+  // Undoing just that would leave the voxels duplicated into the new part, so
+  // the transaction collapses it into the one structural step (endStructural).
   reboundDoc();
   setSelection(null);
   setActiveModel(doc.models.length - 1);
@@ -1066,8 +1221,9 @@ function splitSelectionToModel(name) {
  * every offset doubles, so the prefab keeps its exact shape at twice the
  * grid density. This is the geometry half of "add micro detail to an
  * existing mob" — rig.js doubles the sidecar (anchors, clip pos keys) and
- * bumps `scale` so the creature keeps its world size. Not undoable (every
- * grid is reallocated), which the caller warns about.
+ * bumps `scale` so the creature keeps its world size. rig.js opens one
+ * transaction around both halves, so Ctrl+Z takes back the geometry and the
+ * sidecar together.
  */
 function upscaleDoc() {
   if (!doc) return false;
@@ -1078,6 +1234,7 @@ function upscaleDoc() {
       return false;
     }
   }
+  beginStructural();
   for (const m of doc.models) {
     const nd = { x: m.dim.x * 2, y: m.dim.y * 2, z: m.dim.z * 2 };
     const g = makeGrid(nd);
@@ -1103,13 +1260,13 @@ function upscaleDoc() {
     m.grid = g;
     m.offset = { x: m.offset.x * 2, y: m.offset.y * 2, z: m.offset.z * 2 };
   }
-  clearUndo();
   setSelection(null);
   reboundDoc();
   grid = doc.models[activeModel].grid;
   markDirty();
   if (initialised) { frameCamera(); updateMirrorPlane(); needsRebuild = true; }
   hooks.onModelsChanged?.();
+  endStructural('2× detail');
   return true;
 }
 
@@ -1121,6 +1278,7 @@ function downscaleDoc() {
       return false;
     }
   }
+  beginStructural();
   for (const m of doc.models) {
     const nd = {
       x: Math.max(1, Math.floor(m.dim.x / 2)),
@@ -1167,13 +1325,13 @@ function downscaleDoc() {
       z: Math.round(m.offset.z / 2),
     };
   }
-  clearUndo();
   setSelection(null);
   reboundDoc();
   grid = doc.models[activeModel].grid;
   markDirty();
   if (initialised) { frameCamera(); updateMirrorPlane(); needsRebuild = true; }
   hooks.onModelsChanged?.();
+  endStructural('÷2 detail');
   return true;
 }
 
@@ -1190,7 +1348,7 @@ function newModel(dx, dy, dz, name = 'untitled') {
   activeModel = 0;
   grid = doc.models[0].grid;
   docPath = null; docName = name; sidecar = null; sidecarPath = null;
-  undoStack = []; redoStack = []; stroke = null;
+  clearUndo();               // also resets any open structural transaction
   setSelection(null);
   // Art indices are document-scoped, so a new document starts with an empty
   // palette; keeping the old one would leave indices resolving to colours from
@@ -3785,7 +3943,7 @@ async function openPath(path) {
     grid = doc.models[0].grid;
     docPath = path;
     docName = path.split('/').pop().replace(/\.vox$/i, '');
-    undoStack = []; redoStack = []; stroke = null;
+    clearUndo();             // also resets any open structural transaction
     setSelection(null);
     // Recover the document's art colours from its own RGBA chunk. This has to
     // happen before anything renders: the grids came back holding art INDICES,
@@ -4161,7 +4319,11 @@ function finishMoveUndo(indices) {
 
 export { setActiveModel, addModel, duplicateModel, removeModel, renameModel,
          splitSelectionToModel, upscaleDoc, downscaleDoc, markDirty, moveModel,
-         growModel, setSelection, graftModels, pushMoveUndo, finishMoveUndo };
+         growModel, setSelection, graftModels, pushMoveUndo, finishMoveUndo,
+         // rig.js owns edits that are HALF structural and half sidecar (a limb
+         // swap, a 2× resample). Both halves have to land in one undo step, so
+         // it opens the transaction rather than each half opening its own.
+         beginStructural, endStructural };
 
 /** The document's art palette, so a limb saved out of it can carry its
  *  colours (grid.color holds INDICES into this and nothing else). */

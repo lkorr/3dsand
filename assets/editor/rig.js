@@ -407,7 +407,15 @@ async function loadLimbFromLibrary(name, replace) {
  */
 function wearPart(part, label, replace) {
   if (!part.prefab.models.length) return toast(label + ' has no models', true);
+  // ONE undo step for the whole swap. The graft is structural and the skeleton
+  // surgery around it is a sidecar edit; recorded separately, Ctrl+Z would put
+  // the old models back under a sidecar that has already forgotten them.
+  ed.beginStructural();
+  try { wearPartInner(part, label, replace); }
+  finally { ed.endStructural(replace ? `swap ${label}` : `add ${label}`); }
+}
 
+function wearPartInner(part, label, replace) {
   const L = limbs();
   const old = replace ? limbByName(replace) : null;
   // WHERE IT LANDS. Replacing: the joint of the limb going away. Adding: the
@@ -510,16 +518,27 @@ const sidecarPathOf = p => p.replace(/\.vox$/i, '.json');
  * Every limb is offered as a root, so you can take a whole arm or just a hand.
  */
 async function refreshCreatures() {
+  // A rescan means "the files may have moved on", and the open creature's own
+  // entry is the one that actually does: save it and the disk copy this cache
+  // holds is a version of the character that no longer exists anywhere.
+  crVoxCache.clear();
   try {
     const r = await fetch('/api/models', { cache: 'no-store' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
-    const here = ed.getDocPath();
     // mobs/ and models/ only. microvox/ and items/ have no skeletons, and
     // listing thirty plants that can never be swapped in is noise.
+    //
+    // THE OPEN CREATURE IS INCLUDED, deliberately. It was excluded at first on
+    // the reasoning that swapping a limb for itself does nothing — which is
+    // true only until you have already swapped it OUT. At that moment the file
+    // on disk is the only place the original arm still exists, and leaving it
+    // off the shelf means the one limb you most want back is the one limb the
+    // list refuses to show. It is marked `self` and sorted first, because
+    // "put it back" is the likeliest reason to be reading this list at all.
     const voxes = (j.files || []).filter(f =>
       (f.dir === 'mobs' || f.dir === 'models') &&
-      f.name.toLowerCase().endsWith('.vox') && f.path !== here);
+      f.name.toLowerCase().endsWith('.vox'));
     const jsons = new Set((j.files || []).map(f => f.path));
 
     const out = [];
@@ -550,7 +569,10 @@ async function refreshCreatures() {
     }));
     // Grouped by creature, then in the file's own limb order within it, so the
     // list reads like the rigs it came from rather than one alphabetical mush.
-    out.sort((a, b) => a.from.localeCompare(b.from));
+    // The open creature's own saved copy sorts to the front — see above.
+    const here = ed.getDocPath();
+    out.sort((a, b) => (a.path === here ? 0 : 1) - (b.path === here ? 0 : 1) ||
+                       a.from.localeCompare(b.from));
     crParts = out;
     crErr = '';
   } catch (e) {
@@ -898,8 +920,18 @@ function upscale2x() {
     : isItem ? `, scale goes ${scl} → ${scl * 2} (same world size, finer detail)`
     : '';
   if (!confirm('Upscale 2×? Every voxel becomes a 2×2×2 block' + scaleNote +
-      '. This clears the undo history.')) return;
-  if (!ed.upscaleDoc()) return;          // toasts its own reason on failure
+      '.')) return;
+  // Geometry and sidecar are two halves of ONE edit — undoing the doubled
+  // grids while the anchors stayed doubled would detach every joint from the
+  // art by exactly a factor of two.
+  ed.beginStructural();
+  let ok = false;
+  try { ok = upscale2xInner(s, scl, isItem); }
+  finally { ed.endStructural('2× detail', ok); }
+}
+
+function upscale2xInner(s, scl, isItem) {
+  if (!ed.upscaleDoc()) return false;    // toasts its own reason on failure
   for (const l of limbs())
     if (Array.isArray(l.anchor) && l.anchor.length === 3)
       l.anchor = l.anchor.map(v => v * 2);
@@ -944,6 +976,7 @@ function upscale2x() {
     : isItem
       ? ` — scale ${scl * 2}: same world size, ${scl * 2}× voxel density`
       : ' — the model is twice the resolution (and twice the world size)'));
+  return true;
 }
 
 function growSize2x() {
@@ -1210,10 +1243,19 @@ function renderRigPanel() {
     nm.addEventListener('click', e => e.stopPropagation());
     nm.addEventListener('change', () => {
       const old = m.name;
-      if (!ed.renameModel(i, nm.value)) { nm.value = old; return; }
-      const l = limbByName(old);
-      if (l) { l.name = m.name; touched(); }
-      for (const o of limbs()) if (o.parent === old) { o.parent = m.name; touched(); }
+      // The model name and every sidecar reference to it move together, so
+      // they are one undo step: a rename that came back on the model but not
+      // on its limb entry would orphan the limb (mob.cpp joins them by name
+      // and by nothing else).
+      ed.beginStructural();
+      let ok = false;
+      try {
+        if (!ed.renameModel(i, nm.value)) { nm.value = old; return; }
+        const l = limbByName(old);
+        if (l) { l.name = m.name; touched(); }
+        for (const o of limbs()) if (o.parent === old) { o.parent = m.name; touched(); }
+        ok = true;
+      } finally { ed.endStructural(`rename ${old}`, ok); }
       renderAllPanels();
     });
     row.append(
@@ -1808,10 +1850,7 @@ function renderCreatureList(host, sel, selTag) {
   const here = ed.getDocPath();
   const q = crFilter.trim().toLowerCase();
   const tagFilter = crSameTagOnly && selTag;
-  // `here` is re-checked at render rather than trusted from the scan: opening
-  // another file does not rescan, and offering the open creature its own limbs
-  // back is a swap that does nothing and looks like a bug.
-  const shown = (crParts || []).filter(p => p.path !== here)
+  const shown = (crParts || [])
     .filter(p => !tagFilter || p.tag === selTag)
     .filter(p => !q || p.from.toLowerCase().includes(q) ||
                  p.root.toLowerCase().includes(q) ||
@@ -1825,16 +1864,22 @@ function renderCreatureList(host, sel, selTag) {
 
   let lastFrom = null;
   for (const p of shown) {
+    const self = p.path === here;
     // One heading per creature: the list is "whose arm", and repeating the
     // creature name on fifteen consecutive rows would crowd out the limb name.
     if (p.from !== lastFrom) {
       lastFrom = p.from;
       host.append(el('div', { class: 'riggroup', style: 'cursor:default' },
-        el('span', { class: 'rigglabel' }, p.from)));
+        el('span', { class: 'rigglabel' },
+           self ? p.from + ' — as last saved' : p.from)));
     }
     const tags = [...new Set(p.limbs.map(l => l.tag).filter(Boolean))];
     const meta = (p.limbs.length > 1 ? `${p.limbs.length} limbs` : '1 limb') +
-      (tags.length ? ' · ' + tags.join(' ') : '');
+      (tags.length ? ' · ' + tags.join(' ') : '') +
+      // Say it on the row too: the heading scrolls away, and "swap in the disk
+      // copy" and "swap in another creature's" are different enough edits that
+      // guessing from position would be a mistake worth making loudly.
+      (self ? ' · from the saved file' : '');
     host.append(el('div', { class: 'rigrow riglib' },
       el('div', { class: 'riglibtext' },
         el('span', { class: 'riglibname' }, p.root),
