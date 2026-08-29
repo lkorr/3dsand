@@ -785,6 +785,11 @@ struct RecordCtx {
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   uint32_t windWakeCount = 0;    // wind primitive footprint chunks this tick
+  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
+  // Mirrors rhi::TableCtx / vk_record.h, like every field here. Zero at
+  // sim.waterBodyMode 0, which is what makes C_WATERBODY false and leaves the
+  // whole subsystem unrecorded.
+  uint32_t waterChunkCount = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced

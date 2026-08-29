@@ -212,7 +212,8 @@ const char* LedgerStateName(int32_t st) {
 // on the candidate count and is reported as one.
 uint32_t RunQuietTicks(Ctx& c, uint32_t first, uint32_t n,
                        uint64_t* exciteSeen = nullptr,
-                       uint64_t* exciteCandid = nullptr) {
+                       uint64_t* exciteCandid = nullptr,
+                       uint32_t* samples = nullptr) {
   uint32_t lastSnap = 0xFFFFFFFFu;
   for (uint32_t i = 0; i < n; i++) {
     // NO FlipPage HERE. SubmitTick already flips (support.cpp), and a second
@@ -229,6 +230,7 @@ uint32_t RunQuietTicks(Ctx& c, uint32_t first, uint32_t n,
       lastSnap = sn.tick;
       if (exciteSeen) *exciteSeen += sn.fluidExciteSeen;
       if (exciteCandid) *exciteCandid += sn.fluidExciteCandidates;
+      if (samples) (*samples)++;
     }
   }
   return first + n;
@@ -672,8 +674,9 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   int64_t consV0 = 0, consV1 = 0;
   int64_t consDrained = 0, consDebit = 0, consCapped = 0, consErr = 0;
   int32_t levelBefore = lakeLevel, levelAfter = lakeLevel;
-  uint32_t drainTicks = 0, drainPf = 0;
+  uint32_t drainTicks = 0, drainPf = 0, awakeAfterDrainOut = 0;
   uint64_t quietSeen = 0, quietCandid = 0, drainSeen = 0, drainCandid = 0;
+  uint32_t quietSamples = 0, drainSamples = 0;
   int64_t exciteSlack = 0;
   bool ranDrain = false;
   if (ok && lakeSlot < kWaterBodyCap && truth.read && truth.eighths > 0) {
@@ -685,7 +688,8 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // about what a bare count costs. The excite seam is at its SHIPPED setting
     // for both arms — measuring the risk in a configuration nobody ships would
     // measure nothing.
-    tick = RunQuietTicks(c, tick, drainTicks, &quietSeen, &quietCandid);
+    tick = RunQuietTicks(c, tick, drainTicks, &quietSeen, &quietCandid,
+                         &quietSamples);
 
     // ---- A + X, draining arm ---------------------------------------------
     Tuning dr = t;
@@ -696,7 +700,8 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // the opening balance is the world the drain actually starts from.
     const VoxelTruth before = SweepBasin(c, *lake, *desc, matId);
     consV0 = (int64_t)before.eighths;
-    tick = RunQuietTicks(c, tick, drainTicks, &drainSeen, &drainCandid);
+    tick = RunQuietTicks(c, tick, drainTicks, &drainSeen, &drainCandid,
+                         &drainSamples);
     SetCurrentTuning(t);
     // One settling tick with the tap shut, so the last shave's report has been
     // consumed by the ledger. Without it `debit` still carries eighths the
@@ -754,11 +759,37 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
                   drainPf, pf2[2], pf2[1] ? pf2[1] - 1u : 0u,
                   pf2[3] ? 0xFFFFFFFFu - pf2[3] : 0u));
 
+    // LEAVE THE WORLD SETTLED. The drain woke every surface chunk of the lake
+    // and the CA is mid-relevel behind it; handing that to pass D's hash
+    // identity is what made the FIRST of its arms disagree with the other two
+    // (401bbd76 against af008434 twice). The pass that perturbs the world is
+    // the pass that owes the cleanup — CLAUDE.md rule 7's "gates share one
+    // World", applied inside a gate.
+    tick = RunQuietTicks(c, tick, 60);
+    const uint32_t awakeAfterDrain = ReadActiveChunksSync(c.ctx, world, c.sim);
+    RecordObserved("waterbodyAwakeAfterDrain", (double)awakeAfterDrain);
+    awakeAfterDrainOut = awakeAfterDrain;
+    if ((double)awakeAfterDrain > awakeMax)
+      fail(Format("%u chunks still awake 60 ticks after the drain stopped, "
+                  "over the budget of %.0f — a drained lake does not settle",
+                  awakeAfterDrain, awakeMax));
+
     RecordObserved("waterbodyDrainedEighths", (double)consDrained);
     RecordObserved("waterbodyConsErrEighths", (double)consErr);
     RecordObserved("waterbodyLevelDrop", (double)(levelBefore - levelAfter));
     RecordObserved("waterbodyExciteCandidQuiet", (double)quietCandid);
     RecordObserved("waterbodyExciteCandidDrain", (double)drainCandid);
+    RecordObserved("waterbodyExciteSeenDrain", (double)drainSeen);
+    // A zero candidate count means one of two very different things: the shave
+    // creates no air-below (the result plan §9 hopes for), or the detector
+    // never ran. `seen` is what tells them apart -- it counts cells the
+    // detector LOOKED AT -- and a run that cannot tell them apart has measured
+    // nothing.
+    if (drainSeen == 0 && drainSamples > 0)
+      notes += Format(" -- note: exciteDetect saw 0 settled liquid cells over "
+                      "%u draining snapshots at sim.fluidExciteMode %d, so the "
+                      "candidate count is a statement about the DETECTOR, not "
+                      "about the shave", drainSamples, t.sim.fluidExciteMode);
 
     // ---- X, the verdict ---------------------------------------------------
     // Plan §9 ranks this the most likely way the whole feature fails: WP5 saw a
@@ -782,44 +813,55 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   }
 
   // ------------------------------------------------------------------ pass D
-  // THE OFF SWITCH, and it is the whole argument for landing M1 on its own.
-  // Two runs of an identical script from an identical world, one at mode 0 and
-  // one at mode 1, must hash the same. Not "should" — this milestone's entire
-  // claim is that it cannot move the world, and a claim that costs one
-  // in-process differential to check has no excuse to be an assertion.
-  uint32_t hashOff = 0, hashOn = 0;
+  // THE OFF SWITCH, and it is the whole argument for landing M1 and M2 without
+  // a rebaseline. An identical 40-tick mutation script from an identical world
+  // must hash the same at sim.waterBodyMode 0 and 1.
+  //
+  // THREE ARMS, NOT TWO, and the third one is the whole point. This pass runs
+  // LAST, after pass A has drained a lake and left the world in a state the
+  // preceding passes did not. CLAUDE.md rule 7 is about gates sharing one
+  // World; the same hazard exists WITHIN a gate, and a two-arm comparison
+  // cannot tell "mode 1 changed the world" from "arm 1 inherited something arm
+  // 2 did not". Running mode 0 again at the end separates them in one
+  // invocation:
+  //
+  //     arm1 != arm3  ->  the world entering this pass was not clean. The
+  //                       finding is about pass ordering, not the off switch.
+  //     arm1 == arm3 != arm2  ->  the off switch is genuinely broken, which is
+  //                       a rebaseline-blocking regression.
+  //
+  // That is the "add attribution to the reporter rather than A/B-eliminate"
+  // rule applied to a gate: one run prints which of the two it is.
+  uint32_t hashOff = 0, hashOn = 0, hashOff2 = 0;
   {
-    Tuning off = base;
-    off.sim.waterBodyMode = 0;
-    SetCurrentTuning(off);
-    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
-    uint32_t k = 1;
-    for (uint32_t i = 0; i < 40; i++) {
-      SubmitTick(c.ctx, c.world, c.sim, k, kDefaultSeed,
-                 SelftestOps(k, kDefaultSeed), {}, {}, false,
-                 world.WindowOrigin(), true, false);
-      c.ctx.ProcessEvents();   // SubmitTick owns the page flip - see above
-      k++;
-    }
-    hashOff = HashWorldNow(c.ctx, world, c.sim, kDefaultSeed);
-
-    Tuning on = base;
-    on.sim.waterBodyMode = 1;
-    SetCurrentTuning(on);
-    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
-    k = 1;
-    for (uint32_t i = 0; i < 40; i++) {
-      SubmitTick(c.ctx, c.world, c.sim, k, kDefaultSeed,
-                 SelftestOps(k, kDefaultSeed), {}, {}, false,
-                 world.WindowOrigin(), true, false);
-      c.ctx.ProcessEvents();   // SubmitTick owns the page flip - see above
-      k++;
-    }
-    hashOn = HashWorldNow(c.ctx, world, c.sim, kDefaultSeed);
-    if (hashOff != hashOn)
-      fail(Format("the off switch is not an identity: mode 0 hashes %08x, "
-                  "mode 1 hashes %08x",
+    auto arm = [&](int mode) {
+      Tuning a = base;
+      a.sim.waterBodyMode = mode;
+      SetCurrentTuning(a);
+      SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+      for (uint32_t i = 0, k = 1; i < 40; i++, k++) {
+        SubmitTick(c.ctx, c.world, c.sim, k, kDefaultSeed,
+                   SelftestOps(k, kDefaultSeed), {}, {}, false,
+                   world.WindowOrigin(), true, false);
+        c.ctx.ProcessEvents();   // SubmitTick owns the page flip
+      }
+      return HashWorldNow(c.ctx, world, c.sim, kDefaultSeed);
+    };
+    hashOff = arm(0);
+    hashOn = arm(1);
+    hashOff2 = arm(0);
+    if (hashOff != hashOff2) {
+      fail(Format(
+          "pass D is not measuring the off switch: the SAME mode-0 script "
+          "hashed %08x the first time and %08x the third, so the world "
+          "entering this pass carries state from an earlier pass (mode 1 "
+          "hashed %08x in between). Fix the ordering, not the feature",
+          hashOff, hashOff2, hashOn));
+    } else if (hashOff != hashOn) {
+      fail(Format("the off switch is not an identity: mode 0 hashes %08x "
+                  "(twice), mode 1 hashes %08x",
                   hashOff, hashOn));
+    }
   }
 
   // Leave the world the way the ordering in selftest.h assumes it: pristine
@@ -834,14 +876,18 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     drainNote = Format(
         "DRAIN %u ticks @ %d eighths/tick: voxels %lld -> %lld (%+lld), "
         "drained %lld, debit %lld, capped %lld, level %d -> %d, area %d, "
-        "CONSERVATION %+lld eighths | excite candidates %llu drain vs %llu "
-        "quiet (%.1f/tick) | %u page faults",
+        "CONSERVATION %+lld eighths | excite drain %llu cand / %llu seen over "
+        "%u snaps, quiet %llu cand / %llu seen over %u snaps (%.1f cand/tick) "
+        "| %u page faults",
         drainTicks, (int)std::max<uint32_t>(lakeArea, 1u), (long long)consV0,
         (long long)consV1, (long long)(consV1 - consV0), (long long)consDrained,
         (long long)consDebit, (long long)consCapped, levelBefore, levelAfter,
         lakeArea, (long long)consErr, (unsigned long long)drainCandid,
-        (unsigned long long)quietCandid,
+        (unsigned long long)drainSeen, drainSamples,
+        (unsigned long long)quietCandid, (unsigned long long)quietSeen,
+        quietSamples,
         drainTicks ? (double)drainCandid / (double)drainTicks : 0.0, drainPf);
+    drainNote += Format(", %u awake 60 ticks later", awakeAfterDrainOut);
   }
   detail = Format(
       "curve %u levels, round-trips | bowl r%u %lld/%lld cells level/column "
@@ -859,6 +905,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       truth.surfaceCells, areaErrPct, truth.surfaceMaxY - truth.surfaceMinY,
       bowlNote.c_str(), drainNote.c_str(),
       truth.chunks + bowlTruth.chunks, awake, flips, hashOff, hashOn);
+  detail += Format(" (mode 0 again %08x)", hashOff2);
   detail += notes;
   std::printf("waterbody: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;

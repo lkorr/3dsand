@@ -176,6 +176,121 @@ proves per-voxel immediately beforehand. Any M2 pass that needs a real bowl's
 VOXELS has to move the window, which is what `voxregion` does and why that gate
 runs last (rule 7).
 
+### 1.2 M2 — LANDED 2026-08-29
+
+Components 3 (the drain ledger) and 4 (the surface shave), plus the per-body GPU
+reduce component 1 deferred, plus the fix for §1.1's quiescence hazard.
+`assets/shaders/sim_waterbody.wgsl` (4 entry points), `world.waterBodyState`
+(4 KiB, simBGL_ binding 24), 4 `PT_TICK` rows under a new `C_WATERBODY`
+condition, `TickParams.waterBodies`/`waterChunks`, `sim.waterBodyTestDrain`.
+DESIGN.md §5b.4.
+
+**Hash: unmoved, and measured three ways in one invocation.** `--gate waterbody`
+pass D now runs THREE arms — mode 0, mode 1, mode 0 again — because this pass
+runs after a drain and a two-arm comparison cannot tell "mode 1 changed the
+world" from "arm 1 inherited something arm 2 did not":
+
+```
+--gate waterbody pass D  ->  af008434 / af008434 / af008434
+```
+
+That third arm earned itself immediately. The first version of M2's gate
+reported `401bbd76 / af008434` and read exactly like a broken off switch. It was
+not: pass A had left ~243 lake chunks freshly dirtied and the CA mid-relevel, and
+the FIRST arm absorbed it. The three-arm form printed `401bbd76 / af008434 /
+af008434` and named the real fault in one run — **the pass that perturbs the
+world is the pass that owes the cleanup**, which is CLAUDE.md rule 7's "gates
+share one `World`" applied *inside* a gate. Pass A now settles the world before
+pass D hashes it, and asserts it settled (0 awake, 60 ticks later).
+
+#### The ledger is exact, and the drain is real
+
+| check | value |
+|---|---|
+| GPU adoption reduce vs the CPU voxel sweep | 2,782,656 / 2,782,656 eighths, **+0.0000%** |
+| drain: 60 ticks at 14,493 eighths/tick (one eighth-step) | voxels 2,782,656 → 1,913,076 (**−869,580**) |
+| ledger `drained` | 869,580 (= 60 × 14,493, exactly) |
+| outstanding `debit` at rest | 0 |
+| `capped` (eighths the cells did not have) | 0 |
+| free surface | y209 → y202 (7 voxels, 31% of the lake) |
+| **conservation `voxels + drained − debit − start`** | **+0 eighths** |
+| page faults over the drain | 0 |
+| awake chunks 60 ticks after the drain stopped | 0 |
+| descriptor state flips, 200 ticks on the threshold | 0 |
+
+`--gate waterbody` alone establishes every row above; there is no second
+invocation and nothing to read off stderr.
+
+#### §9's ranked-first risk, measured rather than argued
+
+Plan §9 item 1 is that the shave feeds the excite detector the way WP5's
+draining CA did — 169,616 candidates over 400 ticks on `worldlake`, enough to
+convert the whole 262,144-particle pool. Over the 60 draining ticks, at the
+shipped `sim.fluidExciteMode` 1:
+
+```
+exciteDetect LOOKED AT   10,855,257 settled liquid cells  (~180,900/tick)
+excite CANDIDATES                 0
+```
+
+Both halves are load-bearing, and the first version of this probe reported only
+the second. `0 candidates` alone is unattributable — it means either "the shave
+creates no air-below" or "the detector never ran", and those are opposite
+conclusions. `seen` is what separates them, and 10.9 M cells inspected says the
+detector ran hard and found nothing. **The mechanism is not there:** excite
+trigger (a) is *air below*, the shave removes from the TOP, and the CA
+re-levelling behind it on the woken chunks does not produce one either. The gate
+carries the `seen == 0` case as an explicit note so a future run cannot quietly
+report a meaningless zero.
+
+The control window (60 quiet ticks, same world) reports `0 seen / 0 candidates`
+— the seam is not recorded at all when the world is settled, which is rule 2
+working, not a gap in the measurement.
+
+`--fluid-bench wp5b` was NOT re-run for this number and should not be. That
+bench drains by PUNCTURE, so what it measures is the CA's candidate production,
+which is WP5's already-published baseline and is unchanged by this milestone —
+`sim.waterBodyTestDrain` is 0 there, so no shave fires. The number above is from
+a real shave on a real adopted body, which is the thing §9 is about.
+
+#### Three design notes worth not undoing
+
+1. **The ledger is GPU-owned, and that was forced rather than chosen.** §3.2 says
+   debit what was GRANTED; the only honest source for that is an atomic the
+   shave increments; reading it back would put fence retirement inside a voxel
+   write's control path. So authority is SPLIT: the CPU decides only what is a
+   pure function of (seed, window, tuning) and PROPOSES, and the GPU measures
+   quiescence from `dirtyIn` + the MPM block map and owns the ladder, the level,
+   the area and the ledger. That is also what closes §1.1's correction 2.
+
+2. **`area` is MEASURED, not predicted.** The shave counts the surface cells it
+   saw and the ledger uses that count next tick; the analytic curve seeds only
+   the first one. So §3.2's "a schedule, not an authority" is literally true —
+   the GPU holds no copy of the container curve at all — and the 0-eighth
+   conservation result does not depend on the curve being right.
+
+3. **The band is two Y values.** The shave considers `level` and `level-1` only,
+   so a listed chunk that misses the band returns after three scalar loads. A
+   body's whole footprint is listed once and the dispatch still only works where
+   the water is. One thread owns one (x,z) COLUMN and writes at most one cell in
+   it: reach 0 write, reach 1 read, lattice-safe with no mark/apply.
+
+#### What M2 did NOT do
+
+* No discharge law and no local excite — those are M3, and until then the only
+  drain source is `sim.waterBodyTestDrain`, 0 in every shipped world.
+* No re-audit of an adopted body. The reduce runs ONCE, on the single tick a
+  body spends in `WB_MEASURING`. A body whose voxels change underneath it
+  (someone digs) carries a stale `volume`; that is M3's problem and it is named
+  here so it is not discovered as a surprise.
+* Gate passes B (split scheduling) and F (determinism mid-drain) are still
+  absent, for §7's reason: B needs component 10's union-find sweep and F needs a
+  second in-process world. Both would be assertions against zero today.
+* `--fluid-bench wp5`/`wp5b` throughput was not re-measured. M2's drain is a
+  test tap, not a hole, so there is no throughput claim to make yet — that
+  comparison belongs to M3, against the §1 baseline table.
+
+
 ---
 
 ## 2. The substrate that already exists
@@ -901,7 +1016,7 @@ LOOK CHAIN    8 (stream arm + evaluator) ──► 9 ──► 8 (drain seeders,
 | Milestone | Components | What it gains | Hash |
 |---|---|---|---|
 | **M1 — skeleton** ✅ **LANDED 2026-08-28** | 1, **2's analytic half**, 5's structure, the gate, the off switch | Nothing behavioural. Descriptor recomputes to +0.00% on both container kinds; off switch bit-identical. See §1.1. | **Identical**, measured: `--sweep sim.waterBodyMode=0,1` → one hash |
-| **M2 — the drain works** | 3, 4, the GPU reduce, and the quiescence fix of §1.1 correction 2 | A lake drains in O(1), driven by a test-only debit. **This is the whole architectural risk.** | Identical at mode 0 |
+| **M2 — the drain works** ✅ **LANDED 2026-08-29** | 3, 4, the GPU reduce, and the quiescence fix of §1.1 correction 2 | A lake drains by arithmetic, driven by the `sim.waterBodyTestDrain` tap. Conservation exact at **+0 eighths** over 869,580 drained; the shave produces **0 excite candidates** against 10.9 M cells inspected. See §1.2. | **Identical**, measured: mode 0 / mode 1 / mode 0 all `af008434` |
 | **M3 — it is a feature** | 6, 7 | Real holes, real jets, real throat. Quote `--fluid-bench wp5`/`wp5b` against the §1 baseline. | Moves — its own commit, `--rebaseline` |
 | **M4 — it looks alive** | 8 (full), 9 | Current, vortices, flowing surface, foam. | 9 must not move it; 8's sim arm will |
 | **M5 — completeness** | 10, 2's sweep | Player-dug basins participate. | Moves |
@@ -992,7 +1107,7 @@ Wave knobs are render-side, not `sim.*`.
 
 ## 9. Risks, ranked
 
-1. **Component 4 feeding the excite detector.** WP5 measured 169,616 excite
+1. ~~**Component 4 feeding the excite detector.**~~ **MEASURED AT M2 AND IT IS NOT THERE: 0 candidates against 10,855,257 settled liquid cells inspected over 60 draining ticks (§1.2).** The reasoning below is why, and it held — but the instrumentation is what settled it, and the `seen` half of that pair is what makes the zero mean anything. Left in place because M3's real jets reopen the question at the throat, where the mechanism genuinely does exist. WP5 measured 169,616 excite
    candidates over 400 ticks on `worldlake` from a *draining CA* leaving transient
    gaps under cells — enough to convert the entire particle pool and hold ~70 ms
    frames. If the shave or the CA re-levelling after it reproduces that, this
