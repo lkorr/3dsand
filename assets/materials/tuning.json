@@ -10,7 +10,7 @@
     "jumpSpeed": 5.25,
     "swimUp": 17.5,
     "swimDown": 7.5,
-    "maxFall": 30,
+    "maxFall": 53.5,
     "fallDamageSpeed": 8,
     "fallSplatSpeed": 25,
     "fallDamageScale": 0.75,

@@ -1884,6 +1884,35 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
 int main(int argc, char** argv) {
   InstallCrashHandler();
 
+  // --crash-test: fault on purpose, so the crash REPORTER is verifiable.
+  // The handler is the one piece of code whose correctness cannot be observed
+  // during normal operation — it only ever runs when something else has already
+  // gone wrong, which is the worst moment to discover that its stack walk is
+  // broken. Six real dumps on 2026-08-27 were unusable and nobody knew until
+  // they were needed. One flag, no GPU, no window, ~0.2 s: run it after any
+  // edit to crash.cpp and read crash.log.
+  //
+  // Deliberately a NULL READ, matching the historical 0xC0000005 signature, so
+  // what the log prints here is directly comparable to a real dump.
+  // `--crash-test[=null|abort|throw]` picks WHICH fatal path to take, because
+  // they reach the reporter through four different mechanisms and only the
+  // first is an SEH exception. abort() in particular is the page pool's
+  // documented exhaustion path, and it used to write nothing at all.
+  for (int i = 1; i < argc; i++) {
+    std::string a = argv[i];
+    if (a.rfind("--crash-test", 0) != 0) continue;
+    const std::string kind =
+        a.size() > 12 && a[12] == '=' ? a.substr(13) : "null";
+    std::fprintf(stderr, "--crash-test=%s: failing on purpose\n", kind.c_str());
+    if (kind == "abort") {
+      std::fprintf(stderr, "FATAL: pretend page pool exhausted\n");
+      std::abort();
+    }
+    if (kind == "throw") throw std::runtime_error("crash-test uncaught throw");
+    volatile int* p = nullptr;
+    return *p;
+  }
+
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
