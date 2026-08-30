@@ -1525,6 +1525,17 @@ Four consequences worth stating, because each one is a rule:
 - **No second implementation.** There is deliberately no C++ or WGSL copy of
   the SDF/clump/shading logic. What the Trees tab shows is byte-for-byte what
   worldgen places, because it is the same function.
+- **Nothing is added to a tree after the bake.** The atlas is the WHOLE tree.
+  The cutover initially kept worldgen's implicit decoration — `treeVineFrom`,
+  a closed-form predicate that draped vine curtains and Spanish-moss beards
+  from the canopy underside and spiralled ivy ropes up the bole — and that
+  quietly broke the bullet above: the tab showed a tree, the world showed a
+  tree wearing something the author never saw and could not preview. It is
+  gone (2026-08-30), along with its nine `worldgen.*` tuning rows. A
+  decoration that belongs on a tree is authored in `treegen.js`, where it is
+  visible while it is being made. The `vine_hang` / `creeper_flower` /
+  `moss_hang` MATERIALS still exist for the brush; nothing generates them.
+  Wall ivy on the arena and ruins is unrelated and unchanged.
 - **Editing a species moves the world hash.** The atlas is engine input exactly
   like `tuning.json`. Re-bake, then one `--selftest --rebaseline`. The
   `tree-atlas` gate pins the atlas bytes separately, so the hash diff has a

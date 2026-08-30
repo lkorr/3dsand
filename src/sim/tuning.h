@@ -2115,20 +2115,11 @@ struct Tuning {
     int shoreHorsetailChance = 10, shoreHorsetailHeight = 9;
     int shoreIrisChance = 34;
     int shoreMossChance = 3;         // 1-in-N wet stone faces wear moss
-    // Vines, climbers and hanging moss. Same shape as the pond vegetation and
-    // for the same reason: a 1-in-N roll per candidate COLUMN (never per cell,
-    // or the strands come out dashed), placing inert solids once at
-    // generation. Nothing here grows, so a settled forest still sleeps.
-    // The geometry is derived implicitly from the tree that hosts it — the
-    // canopy underside is solved in closed form from the crown parameters, so
-    // a strand costs one integer sqrt and no extra world scan.
-    int vineChance = 26;             // 1-in-N canopy columns carry a strand
-    int vineLenMin = 10, vineLenSpan = 26;   // strand length, voxels
-    int creeperFlowerChance = 9;     // 1-in-N strands are a flowering creeper
-    int mossChance = 14;             // 1-in-N columns carry a moss beard
-    int mossLenMin = 4, mossLenSpan = 9;
-    int ivyChance = 2;               // 1-in-N bole-shell cells grow ivy
-    int ivyTwist = 5;                // ivy rope spiral, 1/16 turn per voxel
+    // Tree vines, hanging moss and trunk ivy USED TO BE TUNED HERE. They were
+    // implicit decoration worldgen drew on top of a tree, which is exactly the
+    // kind of divergence the .svtree bake exists to end: the tuner's Trees tab
+    // is the only tree authoring surface now, so a decoration is either baked
+    // into the atlas or it does not exist. Wall ivy is not tree decoration.
     int wallIvyDensity = 3;          // 1..8, arena + ruin stone-wall coverage
     // ---- desert / pine highland / alpine ground cover ----
     // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent

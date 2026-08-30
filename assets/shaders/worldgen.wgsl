@@ -89,7 +89,7 @@ const M_SCRUB        : u32 = 73u;   // creosote/sage: passable
 const M_TUSSOCK      : u32 = 74u;   // dry bunchgrass: passable
 const M_HEATH        : u32 = 75u;   // huckleberry/juniper: passable
 const M_CUSHION      : u32 = 76u;   // alpine cushion / lichen crust: passable
-// ---- vines / climbers / hanging moss (materials.json ids 77..80) ----
+// ---- climbers (materials.json ids 77..80) ----
 // These numbers are ARRAY POSITIONS in materials.json (id == index + 1), and
 // they are not the ids this block was authored against: it was reserved 70..76
 // and landed at 77..80 because another agent's block committed in between.
@@ -97,9 +97,10 @@ const M_CUSHION      : u32 = 76u;   // alpine cushion / lichen crust: passable
 // positions, never from what was reserved:
 //   python -c "import json;[print(i+1,m['id']) for i,m in
 //              enumerate(json.load(open('assets/materials/materials.json'))['materials'])]"
-const M_VINE_HANG      : u32 = 77u;
-const M_CREEPER_FLOWER : u32 = 78u;
-const M_MOSS_HANG      : u32 = 79u;
+// vine_hang (77), creeper_flower (78) and moss_hang (79) still EXIST as
+// materials — the brush and the micro models are unchanged — but worldgen no
+// longer places any of them: see the note where treeVineFrom used to be. Ivy is
+// the one climber still generated, and only on arena and ruin WALLS.
 const M_IVY            : u32 = 80u;
 // ---- meadow wildflowers (materials.json ids 65..69) ----
 // Five micro-model species that vary by CLUMP, not per cell: see the ground
@@ -1328,7 +1329,6 @@ struct TreeCand {
   base   : i32,   // ground at the trunk; local y 0 sits at base + 1
   ny     : i32,   // variant height, for the vertical bound
   vtop   : i32,   // highest world y this tree can occupy
-  rnd    : u32,   // per-tree jitter (vines, moss)
   colOff : u32,   // this column's run list in the atlas
   colCnt : u32,
   leafSw : u32,   // autumn substitution: 0 = none, else the species' word offset
@@ -1379,8 +1379,8 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
       if (abs(x - t.wx) > t.reach || abs(z - t.wz) > t.reach) { continue; }
 
       // The column lookup, hoisted. A tree whose baked grid has nothing in this
-      // column is not a candidate at all — no voxels, and no vine either, since
-      // every strand hangs from something this column holds.
+      // column is not a candidate at all: the atlas is the whole tree, so an
+      // empty column can contribute nothing.
       let l = treeLocalXZ(t, x - t.wx, z - t.wz);
       let nx = i32(treeAtlas[t.varOff + TA_V_NX]);
       let nz = i32(treeAtlas[t.varOff + TA_V_NZ]);
@@ -1398,7 +1398,6 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
       // cells with y > h, so a row at y == base could never be reached and
       // baking one would waste a layer of every variant.
       e.vtop = t.base + 1 + e.ny;
-      e.rnd = t.rnd;
       e.colOff = treeAtlas[ci];
       e.colCnt = cnt;
       e.leafSw = select(0u,
@@ -1444,110 +1443,26 @@ fn treeCellFrom(c : TreeCand, y : i32) -> u32 {
   return MAT_AIR;
 }
 
-// ---- hanging vines, moss beards and trunk ivy (implicit, per-cell) ---------
+// NO IMPLICIT DECORATION HANGS OFF A TREE. There used to be a per-cell
+// `treeVineFrom` here that draped vine curtains and Spanish-moss beards from
+// the canopy underside and spiralled ivy ropes up the bole, all as closed-form
+// predicates on top of the baked runs. It is gone on purpose: the .svtree atlas
+// is now the WHOLE tree, so what the tuner's Trees tab renders is exactly what
+// the world grows, with nothing added behind the author's back. A decoration
+// that belongs on a tree belongs in treegen.js, where it can be seen while it
+// is being authored. (`ivy` the material survives — the arena and ruin walls
+// place it, and that is a wall, not a tree.)
 //
-// THE PROBLEM THIS SOLVES. A vine is the one plant whose real-world form is a
-// PATH: it starts somewhere and travels. Worldgen has no turtle to walk it, so
-// a vine cannot be grown; it has to be a CLOSED-FORM PREDICATE that every cell
-// along the strand independently agrees on. The trick is that a hanging vine
-// has exactly one degree of freedom: the column it hangs in. Fix the column and
-// the strand is determined by two numbers — where it starts, and how far it
-// falls — both pure functions of (column, tree).
-//
-// WHERE IT STARTS used to be an analytic inverse of each species' crown test —
-// solving the ellipsoid for its lowest y, with a separate branch for the pine
-// cone and an admission that birch had no closed form at all and so got no
-// vines. The atlas deletes all of that: the canopy underside in this column is
-// the START OF ITS FIRST RUN, which the hoist already fetched. It is exact for
-// every species, including the ones whose crowns have no closed form, and it
-// costs one already-loaded word.
-//
-// Rule 2: everything here is INERT, placed once. A growing vine would keep
-// every forest chunk awake forever. `vine` (material 22) is the REACTIVE garden
-// vine and is deliberately NOT what this places.
-fn treeVineFrom(c : TreeCand, x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  let dy = y - c.base - 1;
-  if (dy < 0) { return MAT_AIR; }
-  // The lowest voxel this tree puts in this column. A column whose first run
-  // starts at 0 is the BOLE (or its root flare): there is no canopy overhead to
-  // hang from, but it is exactly where ivy climbs.
-  let under = i32((treeAtlas[c.colOff] >> 16u) & 0x1FFu);
-
-  if (under > 0) {
-    // ---- 1. curtain vines under the canopy ----
-    // One hash per COLUMN (not per cell): the column either hosts a strand or
-    // it does not, and every cell of that strand reads the same roll. A
-    // per-cell roll would give dashed vines. The salt is distinct per feature,
-    // never a bit-slice of a shared hash — slices of one hash correlate.
-    let hv = hash3(seed ^ 0x71E5u, bitcast<u32>(x), bitcast<u32>(z));
-    if ((hv % TUNE_VINE_CHANCE) == 0u) {
-      // Strand length, jittered per column so the curtain has a ragged hem
-      // instead of a machine-cut edge — the single most obvious tell that a
-      // procedural vine is procedural.
-      let len = TUNE_VINE_LEN_MIN + i32((hv >> 7u) % u32(max(TUNE_VINE_LEN_SPAN, 1)));
-      // The strand starts INSIDE the foliage by one cell so there is no visible
-      // gap between leaf and vine, and runs down from there. Never to the
-      // ground: a vine that touches down reads as a pillar and, worse, is
-      // something the player walks into where they expected floor.
-      if (dy <= under && dy > under - len && dy > 2) {
-        // A minority of strands flower. Gated on the SAME column roll, so a
-        // blossom can only appear on a column that actually grew a vine.
-        if (((hv >> 17u) % TUNE_CREEPER_FLOWER_CHANCE) == 0u &&
-            ((dy + i32(hv >> 24u)) % 7) == 0) {
-          return M_CREEPER_FLOWER;
-        }
-        return M_VINE_HANG;
-      }
-    }
-    // ---- 2. moss beards ----
-    // Spanish-moss style: a short fuzzy skirt off the canopy underside rather
-    // than a full strand, which is what makes an old forest read as damp rather
-    // than merely green.
-    let hm = hash3(seed ^ 0x3055u, bitcast<u32>(x), bitcast<u32>(z));
-    if ((hm % TUNE_MOSS_CHANCE) == 0u) {
-      let mlen = TUNE_MOSS_LEN_MIN + i32((hm >> 9u) % u32(max(TUNE_MOSS_LEN_SPAN, 1)));
-      if (dy <= under && dy > under - mlen && dy > 2) { return M_MOSS_HANG; }
-    }
-    return MAT_AIR;
-  }
-
-  // ---- 3. ivy climbing the bole ----
-  // Reaches only columns the tree occupies from the ground up — the bole and
-  // its root flare — and only ABOVE whatever the trunk itself fills, so it
-  // sheathes the bark instead of replacing it. Angular gating by an isin() lobe
-  // makes it climb in a couple of ropes up one side rather than uniformly.
-  let boleTop = under + i32((treeAtlas[c.colOff] >> 25u) & 0x7Fu);
-  if (dy < boleTop || dy > (c.ny * 3) / 4) { return MAT_AIR; }
-  let dx = x - c.wx;
-  let dz = z - c.wz;
-  if (abs(dx) + abs(dz) > 6) { return MAT_AIR; }
-  // Which side of the trunk, as a 256-step angle, from the sign-corrected
-  // octant — cheap and integer, no atan needed: the ivy only has to pick a
-  // consistent side, not a precise bearing.
-  let ang = (dx * 32) / max(abs(dx) + abs(dz), 1) + select(128, 0, dx >= 0);
-  let phase = (i32(c.rnd >> 11u) & 255) + dy * TUNE_IVY_TWIST / 16;
-  let off = ((ang - phase) & 127) - 64;
-  let hi = hash3(seed ^ 0x1E9Au, bitcast<u32>(x), bitcast<u32>(z));
-  if (abs(off) < 26 && (hi % TUNE_IVY_CHANCE) == 0u) { return M_IVY; }
-  return MAT_AIR;
-}
-
 // The y-dependent half. Order is by tile index, a fixed priority, never
 // dispatch order (rule 1) — candidates were appended in that order, so first
 // non-air still wins the same tile it always did.
-fn treeFromCands(c : ptr<function, TreeCands>, x : i32, y : i32, z : i32,
-                 seed : u32) -> u32 {
+fn treeFromCands(c : ptr<function, TreeCands>, y : i32) -> u32 {
   if (y > (*c).top) { return MAT_AIR; }
   for (var i = 0; i < (*c).n; i++) {
     let e = (*c).t[i];
     if (y < e.base || y > e.vtop) { continue; }
     let m = treeCellFrom(e, y);
     if (m != MAT_AIR) { return m; }
-    // Vines/moss/ivy fill cells the tree itself left EMPTY, so they are tested
-    // second and can never displace bark or foliage. No extra scan: the same
-    // candidate, the same already-loaded column, one more predicate.
-    let vm = treeVineFrom(e, x, y, z, seed);
-    if (vm != MAT_AIR) { return vm; }
   }
   return MAT_AIR;
 }
@@ -1563,7 +1478,7 @@ fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
   if (y > treeMaxTop()) { return MAT_AIR; }
   var c : TreeCands;
   treeCandsInto(&c, x, z, seed);
-  return treeFromCands(&c, x, y, z, seed);
+  return treeFromCands(&c, y);
 }
 
 // ---- cacti: the desert's implicit tall shape --------------------------------
@@ -2681,7 +2596,7 @@ fn genCellIn(col : Col,
   // (a tree rooted on a pool rim would drop leaves into the pool).
   if (mat == MAT_AIR && !inRim && y > h && h < TREELINE && pond < 0) {
     var tm = MAT_AIR;
-    if (treeValid) { tm = treeFromCands(trees, x, y, z, seed); }
+    if (treeValid) { tm = treeFromCands(trees, y); }
     else { tm = treeAt(x, y, z, seed); }
     if (tm != MAT_AIR) { mat = tm; }
   }
