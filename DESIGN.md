@@ -1525,6 +1525,17 @@ Four consequences worth stating, because each one is a rule:
 - **No second implementation.** There is deliberately no C++ or WGSL copy of
   the SDF/clump/shading logic. What the Trees tab shows is byte-for-byte what
   worldgen places, because it is the same function.
+- **Nothing is added to a tree after the bake.** The atlas is the WHOLE tree.
+  The cutover initially kept worldgen's implicit decoration — `treeVineFrom`,
+  a closed-form predicate that draped vine curtains and Spanish-moss beards
+  from the canopy underside and spiralled ivy ropes up the bole — and that
+  quietly broke the bullet above: the tab showed a tree, the world showed a
+  tree wearing something the author never saw and could not preview. It is
+  gone (2026-08-30), along with its nine `worldgen.*` tuning rows. A
+  decoration that belongs on a tree is authored in `treegen.js`, where it is
+  visible while it is being made. The `vine_hang` / `creeper_flower` /
+  `moss_hang` MATERIALS still exist for the brush; nothing generates them.
+  Wall ivy on the arena and ruins is unrelated and unchanged.
 - **Editing a species moves the world hash.** The atlas is engine input exactly
   like `tuning.json`. Re-bake, then one `--selftest --rebaseline`. The
   `tree-atlas` gate pins the atlas bytes separately, so the hash diff has a
@@ -1541,6 +1552,31 @@ The per-cell cost went DOWN: a candidate is now dropped at hoist time unless the
 tree's baked grid has something in this exact column, so `treeFromCands`
 typically runs zero or one iterations, and each one is a short scan of a
 column-RLE run list rather than fifteen segment-distance tests.
+
+**The clump primitive is a knob, not a constant** (2026-08-30). A crown built
+out of one shape can only ever be a pile of that shape, which is what made every
+early crown here read as a bunch of grapes. `foliage.clumpShape` picks among
+four — blob, plate (squashed along its axis: the tiered spray of a cedar),
+spray (stretched along it and thin across: a leafy shoot, not a ball), and cone
+(a spruce sprig) — and `foliage.clumpAxis` decides whether that axis is world-up
+or the twig the lobe grows on. All four are the same spheroid field measured in
+the clump's own frame, so they cost the same, they smooth-min to each other, and
+a crown may mix them. `foliage.hollow` eats the core out of every lobe: a real
+crown is a surface, and on an oak 0.7 is visually identical from outside for
+**half** the leaf voxels (54,771 → 26,354).
+
+Defaults are `clumpShape 0 / clumpAxis 0 / hollow 0`, and the field pass keeps a
+separate loop for exactly that case. Not laziness — the general loop computes
+the same spheroid but *reassociates* the arithmetic, and a float that
+reassociates moves a voxel, which moves the atlas, which moves the world hash.
+An opt-in knob must not re-bake ten species.
+
+The tab grew a **quad view** to go with it: four seeds at once, one per
+quadrant, under one orbit camera, because a shape knob is judged on a stand and
+not on a specimen. It is four WorldView regions at four origins rather than one
+composited grid — a 2x2 of great oaks in a single array is 32M cells of which
+the trees are an eighth, and both the array and its 3D texture would pay for the
+empty seven. Save, Bake and Export still act on the first tree.
 
 ##### The height contract (2026-08-26)
 
@@ -2647,13 +2683,19 @@ world hash.
   path. Adopt once bodies carry their voxel payloads (M6).
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
-  toroidal kFarN³ (256³) volumes centered on the player, one material byte per
+  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one material byte per
   cell. The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
-  cascade distances scale with the window at constant memory (128 MiB total at
-  kFarLevels = 8; outermost half-extent = 256× the window radius ≈ 4 km at the
-  512³ window and 6.25 cm voxels). Levels are filled on the GPU by sampling `genCell()` at stride
+  cascade distances scale with the window at constant memory (1024 MiB total at
+  kFarLevels = 8 and kFarN = 512, measured with `SANDVOX_GPUMEM=1`; outermost
+  half-extent = 256× the window radius = 6553.6 m at the 512³ window and 10 cm
+  voxels, asserted by the `far-fog` gate). kFarN went 256 → 512 on 2026-08-29
+  to halve the apparent cascade block from ~6 px to ~3 px: because a cascade
+  cell is POINT-SAMPLED at its centre voxel, cell size is also the size of the
+  smallest authored structure that survives the horizon, which is the LOD's
+  worst case and the one player-built content lands in.
+  Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
   level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field

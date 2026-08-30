@@ -246,17 +246,47 @@ export function defaultParams() {
 
     // ---- foliage -----------------------------------------------------------
     foliage: {
-      /** Lowest branch level that grows leaf clumps. Setting this to `levels`
-       *  keeps foliage at the extremities, which is what makes a tree read as
-       *  branch structure rather than as a green ball. */
+      /** Lowest branch level that grows leaf clumps. `levels` is the RECURSION
+       *  DEPTH and makeStem recurses while `level + 1 < levels`, so the
+       *  deepest stem that exists is `levels - 1` — set this to that for
+       *  foliage at the extremities only, and to `levels` for a bare tree.
+       *  Anything higher is the same bare tree. */
       startLevel: 2,
       clumpsPerStem: 3,
       /** Where along the stem clumps begin, 0..1. High = tip tufts only. */
       tipBias: 0.45,
       radius: 0.55,                   // metres
       radiusV: 0.18,
-      /** >1 flattens the clump into a needle plate (spruce, cedar);
-       *  <1 makes it a hanging teardrop. */
+      /** THE CLUMP PRIMITIVE. A crown built out of one shape can only ever be
+       *  a pile of that shape, which is why every early tree here read as a
+       *  bunch of grapes. All four are the same spheroid field measured in the
+       *  clump's own frame (see `clumpAxis`), so they cost the same and weld
+       *  to each other the same way:
+       *    0 blob   — a lobe. Broadleaf mass; what a beech or an oak is made of.
+       *    1 plate  — squashed ALONG the axis into a disc. With the axis
+       *               upright this is the layered, tiered spray of a cedar or
+       *               a mature pine; the gaps between the tiers are the read.
+       *    2 spray  — stretched along the axis and thin across: a leafy SHOOT
+       *               rather than a ball. Birch and willow whips, and the way
+       *               to get "lots of leaves" without any blob at all.
+       *    3 cone   — fat at the base, tapering to a point up the axis. A
+       *               spruce/fir sprig, and the only shape with a direction
+       *               you can see. */
+      clumpShape: 0,
+      /** What the clump's own axis IS: 0 = world up (lobes are oriented the
+       *  same way everywhere, which is what a canopy tier wants), 1 = the
+       *  direction of the twig it grows on (which is what a shoot wants).
+       *  Only shapes 1-3 have a visible axis; a blob is a blob either way. */
+      clumpAxis: 0,
+      /** Eat the CORE out of every lobe, 0..1. 0 is solid; 0.7 leaves a shell
+       *  of leaves three deep over an empty middle. A crown is a surface — the
+       *  inside of a real one is bare twig and shade — so this is the cheapest
+       *  way to trade green mass for leaf COUNT, and it deletes voxels the
+       *  player could never see from outside. */
+      hollow: 0,
+      /** Extent along the clump's axis, as a multiple of the radius. For a
+       *  blob >1 is a vertical egg and <1 a squashed bun; for a plate it is
+       *  how THIN the disc is; for a spray and a cone, how long. */
       elongation: 0.65,
       /** Downward offset of the clump from its stem, as a fraction of radius.
        *  What makes a eucalypt's foliage hang off the branch. */
@@ -636,8 +666,16 @@ function growStem(S, P, spec) {
                              frandS(ph, 0x35, i)]);
       const c = add(at.p, scale(off, rad * 0.35));
       c[1] -= rad * F.droop;
+      // The clump's own axis, resolved HERE and not in the field pass: it is
+      // the one thing a lobe needs from the skeleton, and the skeleton is not
+      // in scope down there. `clumpAxis` 0 keeps every lobe upright (a canopy
+      // tier), 1 lays it along the twig it grows on (a shoot).
+      const align = clamp(F.clumpAxis, 0, 1);
+      const axis = align > 0
+          ? normalize(lerp3([0, 1, 0], dirAlong(pts, t), align))
+          : [0, 1, 0];
       S.clumps.push({ c: c, r: rad, elong: Math.max(0.15, F.elongation),
-                      h: hashN(ph, 0x36, i) });
+                      a: axis, h: hashN(ph, 0x36, i) });
     }
   }
 }
@@ -684,6 +722,19 @@ function sdRoundCone(px, py, pz, a, b, r1, r2) {
   if (Math.sign(z) * a2 * z2 > k) return Math.sqrt(x2 + z2) * il2 - r2;
   if (Math.sign(y) * a2 * y2 < k) return Math.sqrt(x2 + y2) * il2 - r1;
   return (Math.sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+
+/* The clump primitive, as two numbers. Every shape is the same spheroid field
+ * measured in the clump's own frame — `alongScale` multiplies the radius up the
+ * clump axis, `acrossScale` perpendicular to it — so a crown may mix shapes and
+ * they still smooth-min into one surface. Shape 3 (cone) reads `alongScale` as
+ * its length and does its own taper. */
+function alongScale(shape, elong) {
+  const e = Math.max(0.15, elong);
+  return shape === 1 ? 1 / e : e;   // 1 = plate: SQUASHED along the axis
+}
+function acrossScale(shape) {
+  return shape === 2 ? 0.45 : 1;    // 2 = spray: thin across, a shoot not a ball
 }
 
 /** Polynomial smooth-min. The weld between neighbouring leaf clumps: without
@@ -760,7 +811,25 @@ export function generateTree(params, seed, opts) {
       grow(st.pts[i], st.rads[i] + P.barkNoise + 1);
     }
   }
-  for (const c of S.clumps) grow(c.c, c.r * Math.max(1, 1 / c.elong) + 1);
+  // The isotropic half-extent a clump can reach, for the grid bound.
+  //
+  // PRE-EXISTING, AND LEFT ALONE ON PURPOSE: the default arm's reciprocal is
+  // backwards. A clump reaches `r * elong` along its axis, not `r / elong`, so
+  // this over-pads a broadleaf (elong 0.65 -> 1.54r of empty margin, which also
+  // inflates the species' `reach` and therefore the nine-candidate bound) and
+  // CLIPS a conifer (elong 1.9 needs 1.9r and gets r). Correcting it changes
+  // the grid of every committed species, which re-bakes ten atlases and moves
+  // the world hash — a change that deserves its own commit, not a ride-along on
+  // an opt-in knob. The new shapes get the right bound because nothing is baked
+  // against the wrong one yet.
+  const fShape = Math.max(0, Math.min(3, P.foliage.clumpShape | 0));
+  const fAxis = clamp(P.foliage.clumpAxis, 0, 1);
+  for (const c of S.clumps) {
+    const iso = (fShape === 0 && fAxis === 0)
+        ? c.r * Math.max(1, 1 / c.elong)
+        : c.r * Math.max(alongScale(fShape, c.elong), acrossScale(fShape));
+    grow(c.c, iso + 1);
+  }
 
   // LOCAL Y 0 IS THE TRUNK BASE. Not "the lowest voxel the tree happens to
   // reach" — the CONTRACT, because the engine plants local y 0 on the first air
@@ -892,6 +961,9 @@ export function generateTree(params, seed, opts) {
   const density = clamp(F.density, 0.05, 1);
   const nscale = Math.max(0.6, F.noiseScale);
   const sminK = Math.max(0, F.sminK);
+  const shape = Math.max(0, Math.min(3, F.clumpShape | 0));
+  const axisAmt = clamp(F.clumpAxis, 0, 1);
+  const hollow = clamp(F.hollow, 0, 1);
 
   if (clumps.length) {
     const N = nx * ny * nz;
@@ -902,38 +974,109 @@ export function generateTree(params, seed, opts) {
     // trunk, and the trunk has no leaves).
     let cx0 = nx, cx1 = -1, cy0 = ny, cy1 = -1, cz0 = nz, cz1 = -1;
 
+    // THE DEFAULT SHAPE KEEPS ITS OWN LOOP, and that is deliberate rather than
+    // lazy. The general loop below computes the same spheroid for shape 0 with
+    // an upright axis, but it REASSOCIATES the arithmetic (a dot product and a
+    // Pythagorean subtraction instead of one scaled component), and a float
+    // that reassociates moves a voxel, which moves the baked atlas, which moves
+    // the WORLD HASH. Adding an opt-in knob must not re-bake ten species.
+    //
+    // (Known and left alone for the same reason: `ry` below should be
+    // `(r + sminK) * elong` — the weld skirt reaches `elong` times further
+    // along the long axis than across it — so an elongated lobe has its two
+    // poles clipped by a voxel or two. The general path gets this right.)
+    const simple = (shape === 0 && axisAmt === 0);
     for (let ci = 0; ci < clumps.length; ci++) {
       const c = clumps[ci];
-      const ry = c.r * Math.max(1, c.elong) + sminK + 1;
-      const rxz = c.r + sminK + 1;
       const invE = 1 / Math.max(0.15, c.elong);
-      const x0 = Math.max(0, Math.floor(c.c[0] - rxz) + gx);
-      const x1 = Math.min(nx - 1, Math.ceil(c.c[0] + rxz) + gx);
+      let ry, rxz, ex, ez;
+      if (simple) {
+        ry = c.r * Math.max(1, c.elong) + sminK + 1;
+        rxz = c.r + sminK + 1;
+        ex = rxz; ez = rxz;
+      } else {
+        // The exact support function of an axis-aligned spheroid: the extent
+        // along world axis i is |a_i| of the long half-extent plus the
+        // perpendicular share of the short one. A conservative cube of
+        // max(ha,hc) would work and would also scan ~4x the cells for a spray.
+        const ha = (c.r + sminK) * alongScale(shape, c.elong) + 1;
+        const hc = (c.r + sminK) * acrossScale(shape) + 1;
+        const a = c.a;
+        ex = Math.abs(a[0]) * ha + Math.sqrt(Math.max(0, 1 - a[0] * a[0])) * hc;
+        ry = Math.abs(a[1]) * ha + Math.sqrt(Math.max(0, 1 - a[1] * a[1])) * hc;
+        ez = Math.abs(a[2]) * ha + Math.sqrt(Math.max(0, 1 - a[2] * a[2])) * hc;
+        rxz = Math.max(ex, ez);
+      }
+      const x0 = Math.max(0, Math.floor(c.c[0] - ex) + gx);
+      const x1 = Math.min(nx - 1, Math.ceil(c.c[0] + ex) + gx);
       const y0 = Math.max(0, Math.floor(c.c[1] - ry) + gy);
       const y1 = Math.min(ny - 1, Math.ceil(c.c[1] + ry) + gy);
-      const z0 = Math.max(0, Math.floor(c.c[2] - rxz) + gz);
-      const z1 = Math.min(nz - 1, Math.ceil(c.c[2] + rxz) + gz);
+      const z0 = Math.max(0, Math.floor(c.c[2] - ez) + gz);
+      const z1 = Math.min(nz - 1, Math.ceil(c.c[2] + ez) + gz);
       if (x1 < x0 || y1 < y0 || z1 < z0) continue;
       if (x0 < cx0) cx0 = x0; if (x1 > cx1) cx1 = x1;
       if (y0 < cy0) cy0 = y0; if (y1 > cy1) cy1 = y1;
       if (z0 < cz0) cz0 = z0; if (z1 > cz1) cz1 = z1;
 
+      if (simple) {
+        for (let z = z0; z <= z1; z++) {
+          const dz = z - gz + 0.5 - c.c[2];
+          for (let y = y0; y <= y1; y++) {
+            const dy = (y - gy + 0.5 - c.c[1]) * invE;
+            const base = (z * ny + y) * nx;
+            const q = dy * dy + dz * dz;
+            for (let x = x0; x <= x1; x++) {
+              const dx = x - gx + 0.5 - c.c[0];
+              const d = Math.sqrt(dx * dx + q) - c.r;
+              if (d > sminK) continue;
+              const i = base + x;
+              const prev = dfield[i];
+              // Ownership goes to the NEAREST lobe (a hard min), while the
+              // field itself is the WELDED surface (a smooth min). Using the
+              // smooth value for ownership would make the shading normal
+              // wander across the weld, which is exactly the seam the weld
+              // exists to hide.
+              if (d < prev) owner[i] = ci;
+              dfield[i] = prev >= 1e8 ? d : smin(prev, d, sminK);
+            }
+          }
+        }
+        continue;
+      }
+
+      const ax = c.a[0], ay = c.a[1], az = c.a[2];
+      const along = alongScale(shape, c.elong);
+      const across = acrossScale(shape);
       for (let z = z0; z <= z1; z++) {
         const dz = z - gz + 0.5 - c.c[2];
         for (let y = y0; y <= y1; y++) {
-          const dy = (y - gy + 0.5 - c.c[1]) * invE;
+          const dy = y - gy + 0.5 - c.c[1];
           const base = (z * ny + y) * nx;
-          const q = dy * dy + dz * dz;
+          const pu = dy * ay + dz * az;      // the x term is added per cell
+          const pq = dy * dy + dz * dz;
           for (let x = x0; x <= x1; x++) {
             const dx = x - gx + 0.5 - c.c[0];
-            const d = Math.sqrt(dx * dx + q) - c.r;
+            // Split into ALONG the clump axis and ACROSS it. Everything the
+            // four shapes differ by is a function of those two numbers, so one
+            // loop covers all of them and they weld to each other for free.
+            const u = pu + dx * ax;
+            const v = Math.sqrt(Math.max(0, pq + dx * dx - u * u));
+            let d;
+            if (shape === 3) {
+              // CONE: fat at -ha, a point at +ha. The only clump with a
+              // direction you can see, which is why it needs the axis.
+              const ha = c.r * along;
+              const t = clamp((u + ha) / (2 * ha), 0, 1);
+              const dr = v - c.r * (1 - t);
+              const du = u < -ha ? (-ha - u) : (u > ha ? u - ha : 0);
+              d = du > 0 ? Math.hypot(Math.max(dr, 0), du) : dr;
+            } else {
+              const su = u / along, sv = v / across;
+              d = Math.sqrt(su * su + sv * sv) - c.r;
+            }
             if (d > sminK) continue;
             const i = base + x;
             const prev = dfield[i];
-            // Ownership goes to the NEAREST lobe (a hard min), while the field
-            // itself is the WELDED surface (a smooth min). Using the smooth
-            // value for ownership would make the shading normal wander across
-            // the weld, which is exactly the seam the weld exists to hide.
             if (d < prev) owner[i] = ci;
             dfield[i] = prev >= 1e8 ? d : smin(prev, d, sminK);
           }
@@ -962,6 +1105,15 @@ export function generateTree(params, seed, opts) {
           const n = vnoise(wx, wy, wz, nscale, 0x1EAF);
           if (n > density + (1 - rim) * (1 - density)) continue;
 
+          // How deep inside the lobe: 0 at the surface, 1 at the core.
+          const depth = clamp(-d / Math.max(1, oc.r), 0, 1);
+          // HOLLOW. A real crown is a surface — the inside is bare twig and
+          // shade — so eating the core is free detail: the voxels this drops
+          // are the ones no ray from outside could reach. At 0 the compare is
+          // `depth > 1`, which `clamp` has already made impossible, so the
+          // default path is untouched.
+          if (depth > 1 - hollow) continue;
+
           // ---- the shading bake ------------------------------------------
           // The Rundlett trick: shade a leaf voxel by a normal that is part
           // "which way does my own lobe face" and part "which way does the
@@ -973,8 +1125,6 @@ export function generateTree(params, seed, opts) {
           const ncan = normalize([wx - canopy[0], wy - canopy[1], wz - canopy[2]]);
           const nn = normalize(lerp3(nc, ncan, shadeMix));
           const lit = nn[0] * SUN[0] + nn[1] * SUN[1] + nn[2] * SUN[2];
-          // How deep inside the lobe: 0 at the surface, 1 at the core.
-          const depth = clamp(-d / Math.max(1, oc.r), 0, 1);
           const shade = 0.5 + 0.5 * lit - depthShade * depth;
           const tier = shade < 0.34 ? 0 : (shade > 0.70 ? 2 : 1);
           const jit = hashN(x, y, z, 0x1EA5) % 3;
@@ -1209,8 +1359,12 @@ export function bakeAtlas(params, seeds) {
   // The autumn ramp is named in the header but appears in no voxel, so it has
   // to be interned HERE, before the table is serialised — a name added after
   // the byte length is computed lands outside the file.
+  // `< P.levels`, NOT `<=`. makeStem recurses while `level + 1 < P.levels`, so
+  // the DEEPEST stem that exists is level `levels - 1` and a startLevel of
+  // `levels` already means no clump is ever attached. The `<=` here declared an
+  // autumn ramp for a tree with no leaves to turn.
   const turns = (P.autumnChance | 0) > 0 &&
-                P.foliage.clumpsPerStem > 0 && P.foliage.startLevel <= P.levels;
+                P.foliage.clumpsPerStem > 0 && P.foliage.startLevel < P.levels;
   if (turns) P.autumnLeaf.forEach(pal);
 
   // ---- name table ----------------------------------------------------------
@@ -1291,7 +1445,8 @@ export function bakeAtlas(params, seeds) {
   // paints this over the terrain skin instead. The mid entry of the leaf ramp,
   // by name; 0 for a species with no foliage at all (the dead tree), which the
   // far field then simply does not paint.
-  const canopyName = (P.foliage.clumpsPerStem > 0 && P.foliage.startLevel <= P.levels)
+  // Same off-by-one as `turns` above: the deepest stem level is `levels - 1`.
+  const canopyName = (P.foliage.clumpsPerStem > 0 && P.foliage.startLevel < P.levels)
       ? P.leaf[1] : null;
   out[20] = canopyName ? (names.indexOf(canopyName) + 1) : 0;
   out[21] = Math.max(0, Math.min(255, PL.shade | 0));

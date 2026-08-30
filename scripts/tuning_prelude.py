@@ -428,15 +428,6 @@ SPEC = [
     ("worldgen", "kelpHeight", "TUNE_KELP_HEIGHT", "i", 10),
 
     # vines / climbers / hanging moss (worldgen agent B)
-    ("worldgen", "vineChance", "TUNE_VINE_CHANCE", "u", 26),
-    ("worldgen", "vineLenMin", "TUNE_VINE_LEN_MIN", "i", 10),
-    ("worldgen", "vineLenSpan", "TUNE_VINE_LEN_SPAN", "i", 26),
-    ("worldgen", "creeperFlowerChance", "TUNE_CREEPER_FLOWER_CHANCE", "u", 9),
-    ("worldgen", "mossChance", "TUNE_MOSS_CHANCE", "u", 14),
-    ("worldgen", "mossLenMin", "TUNE_MOSS_LEN_MIN", "i", 4),
-    ("worldgen", "mossLenSpan", "TUNE_MOSS_LEN_SPAN", "i", 9),
-    ("worldgen", "ivyChance", "TUNE_IVY_CHANCE", "u", 2),
-    ("worldgen", "ivyTwist", "TUNE_IVY_TWIST", "i", 5),
     ("worldgen", "wallIvyDensity", "TUNE_WALL_IVY_DENSITY", "u", 3),
 
     # shoreline: the wet fringe outside a pond

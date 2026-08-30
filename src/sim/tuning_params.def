@@ -682,34 +682,13 @@ TP_I(worldgen, reedHeight, TUNE_REED_HEIGHT, 16)
 TP_U(worldgen, kelpChance, TUNE_KELP_CHANCE, 120)
 TP_I(worldgen, kelpHeight, TUNE_KELP_HEIGHT, 10)
 // ---- vines / climbers / hanging moss (worldgen agent B) ----
-// A hanging vine is a CURTAIN under a canopy: one roll per COLUMN decides
-// whether that column hosts a strand, and the strand then runs from the canopy
-// underside down by a jittered length. 1-in-N over the canopy footprint, so a
-// small number here furs the whole forest — 26 puts a strand every ~5 voxels
-// of canopy, which reads as a draped tree rather than as a hanging curtain
-// wall. Great oaks halve it (they are the ancient ones).
-TP_U(worldgen, vineChance, TUNE_VINE_CHANCE, 26)
-// Strand length in voxels, min + a 0..span jitter. The jitter is what gives
-// the curtain a ragged hem instead of a machine-cut edge; keep the span
-// comparable to the min or every strand ends at visibly the same height.
-TP_I(worldgen, vineLenMin, TUNE_VINE_LEN_MIN, 10)
-TP_I(worldgen, vineLenSpan, TUNE_VINE_LEN_SPAN, 26)
-// 1-in-N vine strands are a FLOWERING creeper, which then blooms every 7th
-// cell down its length. Gated on the same column roll as the vine, so a
-// blossom can only ever appear on a column that actually grew one.
-TP_U(worldgen, creeperFlowerChance, TUNE_CREEPER_FLOWER_CHANCE, 9)
-// Spanish-moss beards on the great oaks and birches: 1-in-N columns, and a
-// short length, because moss is a fuzz on the structure rather than a strand
-// hanging off it. Longer than ~14 and it stops reading as moss.
-TP_U(worldgen, mossChance, TUNE_MOSS_CHANCE, 14)
-TP_I(worldgen, mossLenMin, TUNE_MOSS_LEN_MIN, 4)
-TP_I(worldgen, mossLenSpan, TUNE_MOSS_LEN_SPAN, 9)
-// Ivy climbing a trunk: 1-in-N of the cells on the bole's outer shell, gated
-// to a couple of angular ropes rather than sheathing the trunk.
-TP_U(worldgen, ivyChance, TUNE_IVY_CHANCE, 2)
-// How fast the ivy ropes spiral around the bole, in 1/16 of a 256-step turn
-// per voxel of height. 0 = straight vertical stripes.
-TP_I(worldgen, ivyTwist, TUNE_IVY_TWIST, 5)
+// The nine rows that used to live here — vineChance, vineLenMin/Span,
+// creeperFlowerChance, mossChance, mossLenMin/Span, ivyChance, ivyTwist —
+// tuned worldgen's implicit tree decoration, which no longer exists: a tree is
+// the baked .svtree atlas and nothing else, so anything hanging off one is
+// authored in treegen.js, not dialled in here. The MATERIALS survive; only the
+// generator did not. Wall ivy below is unrelated and stays.
+//
 // Ivy coverage on the ARENA and RUIN stone walls, 1..8. Higher is denser;
 // coverage always falls off toward the top of the wall so the coping stays
 // clear and the creeper reads as having climbed rather than been painted.

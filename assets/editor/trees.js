@@ -31,9 +31,11 @@ let wv = null;             // WorldView
 let params = null;         // the species being edited
 let speciesName = '';
 let seed = 0;
+let quad = false;          // show four seeds at once, one per quadrant
 let dirty = false;
 let genTimer = 0;
-let lastResult = null;
+let lastResult = null;     // the SUBJECT tree — what Save/Bake/Export act on
+let placed = [];           // {res, tx, tz, origin} per tree currently in view
 let els = {};
 
 /* ---------------------------------------------------------------------------
@@ -130,7 +132,10 @@ const GLOBAL_ROWS = [
    d: 'Per-tree jitter on the height. What makes two oaks in a stand not the ' +
       'same oak.'},
   {k: 'levels', n: 'branch levels', min: 1, max: 4, step: 1, int: true,
-   d: 'Recursion depth. 0 is the trunk; 3 is trunk + boughs + branches + twigs.'},
+   retunes: true,
+   d: 'Recursion depth. 0 is the trunk; 3 is trunk + boughs + branches + ' +
+      'twigs. The deepest branch that exists is one BELOW this, which is what ' +
+      '`lowest leafy level` is bounded against.'},
   {k: 'baseSize', n: 'bare trunk', min: 0, max: 0.9, step: 0.01,
    d: 'Fraction of the trunk carrying no branches at all. A forest tree ' +
       'self-prunes its lower limbs; a field oak does not.'},
@@ -198,11 +203,38 @@ const LEVEL_ROWS = [
 ];
 
 const FOLIAGE_ROWS = [
-  {k: 'startLevel', n: 'lowest leafy level', min: 0, max: 9, step: 1, int: true,
-   d: 'The lowest branch level that grows leaf clumps. Setting it to the last ' +
-      'level keeps foliage at the extremities, which is what makes a tree ' +
-      'read as branch structure rather than a green ball. Set it above ' +
-      '`levels` for a dead tree.'},
+  // maxOf, because a fixed max here is a slider most of whose travel does
+  // nothing. `levels` is the RECURSION DEPTH and the deepest stem that exists
+  // is levels-1, so on a 3-level tree everything from 3 up is the same bare
+  // trunk — six of the ten stops on the old 0..9 range were "no leaves", which
+  // reads exactly like a broken control.
+  {k: 'startLevel', n: 'lowest leafy level', min: 0, step: 1, int: true,
+   max: 4, maxOf: (p) => Math.max(0, p.levels | 0),
+   d: 'The lowest branch level that grows leaf clumps. The deepest branch a ' +
+      'tree HAS is one below `branch levels`, so that value keeps foliage at ' +
+      'the extremities — which is what makes a tree read as branch structure ' +
+      'rather than a green ball. This slider stops one past it, and that last ' +
+      'stop is a bare tree with no leaves at all.'},
+  {k: 'clumpShape', n: 'clump shape', min: 0, max: 3, step: 1, int: true,
+   d: 'What ONE lobe of foliage is. A crown built from a single primitive can ' +
+      'only ever be a pile of that primitive, which is what makes a tree read ' +
+      'as a bunch of grapes. 0 blob — a round lobe, broadleaf mass. ' +
+      '1 plate — squashed along its axis into a disc: with an upright axis ' +
+      'this is the tiered spray of a cedar or an old pine, and the gaps ' +
+      'between tiers are the read. 2 spray — stretched along the axis and ' +
+      'thin across, a leafy SHOOT rather than a ball; the way to get a lot of ' +
+      'leaves with no blob anywhere. 3 cone — fat at the base tapering to a ' +
+      'point, a spruce sprig. All four weld to each other, so mixing species ' +
+      'in a stand costs nothing.'},
+  {k: 'clumpAxis', n: 'clump follows twig', min: 0, max: 1, step: 0.05,
+   d: 'What the clump’s axis IS. 0 points every lobe straight up (a canopy ' +
+      'tier); 1 lays it along the twig it grows on (a shoot off a branch). ' +
+      'Only shapes 1-3 have a visible axis — a blob is a blob either way.'},
+  {k: 'hollow', n: 'hollow core', min: 0, max: 0.95, step: 0.05,
+   d: 'Eat the CORE out of every lobe. A real crown is a surface: the inside ' +
+      'is bare twig and shade, and no ray from outside ever reaches it. 0.7 ' +
+      'leaves a shell of leaves a few voxels deep, which is far more leaf ' +
+      'EDGE per voxel spent — and it deletes voxels the player cannot see.'},
   {k: 'clumpsPerStem', n: 'clumps per stem', min: 0, max: 6, step: 0.1,
    d: 'FRACTIONAL on purpose: the tip count is set by the branching, which is ' +
       'chosen for the silhouette, so the clump count has to be tunable ' +
@@ -284,58 +316,128 @@ function setPath(obj, path, v) {
 /* ===========================================================================
  * generation, debounced
  * ======================================================================== */
+/* Local palette index -> engine material id, so the viewer colours the tree
+ * with the SAME table the game does. Resolved by name, exactly as the C++
+ * loader does at engine load, so an unknown material shows up here first. */
+function toViewerCells(res, missing) {
+  const mats = (H && H.materials && H.materials()) || [];
+  const idOf = new Map();
+  mats.forEach((m, i) => idOf.set(m.id, i + 1));
+  const remap = new Uint16Array(res.names.length + 1);
+  res.names.forEach((n, i) => {
+    const id = idOf.get(n);
+    if (id === undefined && missing.indexOf(n) < 0) missing.push(n);
+    remap[i + 1] = id || 0;
+  });
+  const cells = new Uint16Array(res.cells.length);
+  for (let i = 0; i < cells.length; i++) {
+    const w = res.cells[i];
+    cells[i] = w ? ((remap[w & 0xFFF] & 0xFFF) | (w & 0xF000)) : 0;
+  }
+  return cells;
+}
+
+/* QUAD VIEW: four seeds at once, in one scene.
+ *
+ * WHY IT IS FOUR REGIONS AND NOT ONE COMPOSITED GRID. The obvious build is a
+ * 2x2 array with the four trees stamped into it, and it is the wrong one: a
+ * quad of great oaks is (2*231)^2 * 150 = 32M cells of which the trees occupy
+ * about an eighth, and both the Uint16Array and its R16UI texture pay for the
+ * empty seven. WorldView already draws many regions at many origins — that is
+ * what streaming IS — so handing it four grids costs four trees.
+ *
+ * WHY IT IS seed..seed+3 AND NOT A FRESH RANDOM ROLL. The whole point of the
+ * seed box is that a tree you like can be found again; a set you cannot
+ * reproduce is a screenshot, not a tool. Stepping the seed box by one rolls the
+ * whole quad, which is the re-roll button without being a second control. */
+const QUAD_GAP = 4;   // voxels of clear air between two trees' boxes
+
+function layoutQuad(results) {
+  let span = 1, high = 1;
+  for (const r of results) {
+    span = Math.max(span, r.dim.x, r.dim.z);
+    high = Math.max(high, r.dim.y);
+  }
+  const pitch = span + QUAD_GAP;
+  // Aligned by ANCHOR, not by box corner: the trunks land on an exact square,
+  // so the four are comparable even when one variant grew a wider crown.
+  return results.map((r, i) => ({
+    res: r,
+    tx: (i & 1) * pitch,
+    tz: (i >> 1) * pitch,
+    origin: [(i & 1) * pitch - r.anchor.x, 0, (i >> 1) * pitch - r.anchor.z]
+  }));
+}
+
 function regenerate(now) {
   clearTimeout(genTimer);
   const run = () => {
     const t0 = performance.now();
-    let res;
+    const seeds = quad ? [seed, seed + 1, seed + 2, seed + 3] : [seed];
+    let results;
     try {
-      res = TG.generateTree(params, seed);
+      results = seeds.map(s => TG.generateTree(params, s));
     } catch (e) {
       els.stats.textContent = 'generate failed: ' + (e && e.message || e);
       console.error(e);
       return;
     }
-    lastResult = res;
-    // Local palette index -> engine material id, so the viewer colours the tree
-    // with the SAME table the game does. Resolved by name, exactly as the C++
-    // loader does at engine load, so an unknown material shows up here first.
-    const mats = (H && H.materials && H.materials()) || [];
-    const idOf = new Map();
-    mats.forEach((m, i) => idOf.set(m.id, i + 1));
-    const remap = new Uint16Array(res.names.length + 1);
-    const missing = [];
-    res.names.forEach((n, i) => {
-      const id = idOf.get(n);
-      if (id === undefined) missing.push(n);
-      remap[i + 1] = id || 0;
-    });
-    const cells = new Uint16Array(res.cells.length);
-    for (let i = 0; i < cells.length; i++) {
-      const w = res.cells[i];
-      cells[i] = w ? ((remap[w & 0xFFF] & 0xFFF) | (w & 0xF000)) : 0;
-    }
+    // The FIRST tree stays the subject: Save, Bake and Export .vox all read
+    // `lastResult`, and none of them should change meaning because a preview
+    // toggle is on.
+    lastResult = results[0];
+    placed = layoutQuad(results);
 
+    const missing = [];
     if (wv) {
-      wv.setLocalRegion(cells, res.dim.x, res.dim.y, res.dim.z, [0, 0, 0]);
+      wv.setLocalRegions(placed.map(p => ({
+        cells: toViewerCells(p.res, missing),
+        nx: p.res.dim.x, ny: p.res.dim.y, nz: p.res.dim.z, origin: p.origin
+      })));
+      let span = 1, high = 1, wide = 0;
+      for (const p of placed) {
+        span = Math.max(span, p.res.dim.x, p.res.dim.z);
+        high = Math.max(high, p.res.dim.y);
+        wide = Math.max(wide, p.tx, p.tz);
+      }
       wv.cam.mode = 'orbit';
-      wv.cam.target = [res.dim.x / 2, res.dim.y * 0.45, res.dim.z / 2];
+      wv.cam.target = [wide / 2, high * 0.45, wide / 2];
       if (!wv._treeFramed) {
-        wv.cam.dist = Math.max(res.dim.x, res.dim.y, res.dim.z) * 1.5;
+        wv.cam.dist = Math.max(wide + span, high) * 1.5;
         wv.cam.yaw = 0.7; wv.cam.pitch = -0.25;
         wv._treeFramed = true;
       }
-      drawSkeleton(res);
+      drawSkeleton();
+    } else {
+      results.forEach(r => toViewerCells(r, missing));
     }
-    const m = res.meta;
+
+    const m = lastResult.meta;
+    let wood = 0, leaf = 0;
+    for (const p of placed) { wood += p.res.meta.woodCount; leaf += p.res.meta.leafCount; }
+    const truncated = placed.some(p => p.res.meta.truncated);
+    const clipped = placed.some(p => p.res.meta.clipped);
+    // A CANOPY THAT CAME OUT EMPTY NAMES ITSELF. "the leaves vanished and I do
+    // not know which slider did it" was the actual report; the two ways to get
+    // there are a startLevel past the deepest branch and a clumpsPerStem of 0,
+    // and neither is visible in a voxel count of zero.
+    const deepest = (params.levels | 0) - 1;
+    const bald = leaf === 0 && params.foliage.clumpsPerStem > 0
+        ? (params.foliage.startLevel > deepest
+            ? ' · <span class="warn">NO FOLIAGE: lowest leafy level ' +
+              params.foliage.startLevel + ' is past the deepest branch (' +
+              deepest + ' at ' + params.levels + ' levels)</span>'
+            : ' · <span class="warn">NO FOLIAGE</span>')
+        : '';
     els.stats.innerHTML =
-      `<b>${res.dim.x}×${res.dim.y}×${res.dim.z}</b> · ` +
-      `${(m.woodCount + m.leafCount).toLocaleString()} voxels ` +
-      `(${m.woodCount.toLocaleString()} wood, ${m.leafCount.toLocaleString()} leaf) · ` +
+      (quad ? `<b>quad</b> seeds ${seeds.join(', ')} · ` : '') +
+      `<b>${lastResult.dim.x}×${lastResult.dim.y}×${lastResult.dim.z}</b> · ` +
+      `${(wood + leaf).toLocaleString()} voxels ` +
+      `(${wood.toLocaleString()} wood, ${leaf.toLocaleString()} leaf) · ` +
       `${m.stems} stems, ${m.clumps} clumps · reach ${m.reachXZ}, ` +
-      `above ${m.above} · ${Math.round(performance.now() - t0)} ms` +
-      (m.truncated ? ' · <span class="warn">TRUNCATED (hit the stem/clump cap)</span>' : '') +
-      (m.clipped ? ' · <span class="warn">CLIPPED (over ' + TG.MAX_DIM + ' voxels on an axis)</span>' : '') +
+      `above ${m.above} · ${Math.round(performance.now() - t0)} ms` + bald +
+      (truncated ? ' · <span class="warn">TRUNCATED (hit the stem/clump cap)</span>' : '') +
+      (clipped ? ' · <span class="warn">CLIPPED (over ' + TG.MAX_DIM + ' voxels on an axis)</span>' : '') +
       (missing.length ? ' · <span class="warn">materials.json has no ' +
         missing.join(', ') + '</span>' : '');
   };
@@ -346,20 +448,27 @@ function regenerate(now) {
  * through WorldView's own line layer. Worth having because a tree that looks
  * wrong is usually wrong in the SKELETON — a branch angle, a split, a tropism —
  * and the voxels hide it. */
-function drawSkeleton(res) {
+function drawSkeleton() {
   if (!wv) return;
   if (!els.skeleton.checked) { wv.onOverlay = null; return; }
-  const gx = res.anchor.x, gz = res.anchor.z;
-  const stems = res.skeleton.stems;
+  // Every tree currently laid out, not just the subject — a quad with one
+  // skeleton in it looks like three trees failed to draw one.
+  const set = placed.map(p => ({
+    // A stem point is anchor-relative, and the region's origin already backs
+    // the anchor out, so the trunk lands exactly on (tx, tz).
+    gx: p.tx, gz: p.tz, stems: p.res.skeleton.stems
+  }));
   wv.onOverlay = (push) => {
-    for (const st of stems) {
-      const c = st.level === 0 ? [1, 0.75, 0.2, 1]
-              : st.level === 1 ? [0.4, 0.85, 1, 1]
-              : [0.75, 0.45, 1, 1];
-      for (let i = 0; i + 1 < st.pts.length; i++) {
-        const a = st.pts[i], b = st.pts[i + 1];
-        push(a[0] + gx + 0.5, a[1] + 0.5, a[2] + gz + 0.5,
-             b[0] + gx + 0.5, b[1] + 0.5, b[2] + gz + 0.5, c);
+    for (const t of set) {
+      for (const st of t.stems) {
+        const c = st.level === 0 ? [1, 0.75, 0.2, 1]
+                : st.level === 1 ? [0.4, 0.85, 1, 1]
+                : [0.75, 0.45, 1, 1];
+        for (let i = 0; i + 1 < st.pts.length; i++) {
+          const a = st.pts[i], b = st.pts[i + 1];
+          push(a[0] + t.gx + 0.5, a[1] + 0.5, a[2] + t.gz + 0.5,
+               b[0] + t.gx + 0.5, b[1] + 0.5, b[2] + t.gz + 0.5, c);
+        }
       }
     }
   };
@@ -384,16 +493,23 @@ function row(container, r, base, prefix) {
                            step: String(r.step), min: String(r.min), max: String(r.max)});
   const rng = el('input', {type: 'range', class: 'tgrng', value: String(cur),
                            step: String(r.step), min: String(r.min), max: String(r.max)});
+  // A row may bound itself against another parameter (`startLevel` cannot
+  // usefully exceed `levels`). Resolved on every read, never captured, for the
+  // same reason `base` is a path and not an object: undo replaces `params`.
+  const maxOf = () => (r.maxOf ? r.maxOf(params) : r.max);
   const commit = (v, key) => {
     let x = parseFloat(v);
     if (!isFinite(x)) return;
-    x = Math.min(r.max, Math.max(r.min, x));
+    x = Math.min(maxOf(), Math.max(r.min, x));
     if (r.int) x = Math.round(x);
     if (x === getPath(params, path)) return;  // a drag that landed on the same step
     snapshot(key);
     setPath(params, path, x);
     num.value = String(x); rng.value = String(x);
     markDirty();
+    // A row that other rows are bounded BY has to move them too, or the
+    // dependent slider keeps a travel that no longer exists.
+    if (r.retunes) refreshWidgets();
     regenerate(false);
   };
   // The RANGE coalesces under the control's own path; the NUMBER box commits
@@ -404,7 +520,12 @@ function row(container, r, base, prefix) {
   const line = el('div', {class: 'tgrow', title: r.d || ''},
                   el('label', {}, r.n), rng, num);
   container.append(line);
-  const set = (v) => { num.value = String(v); rng.value = String(v); };
+  const set = (v) => {
+    const mx = String(maxOf());
+    num.max = mx; rng.max = mx;
+    num.value = String(v); rng.value = String(v);
+  };
+  set(cur);
   widgets.push(() => set(getPath(params, path)));
   return {set: set};
 }
@@ -655,6 +776,7 @@ export function attach(hooks) {
   els.seed = el('input', {type: 'number', class: 'tgnum', value: '0',
                           style: 'width:56px', min: '0', max: '9999'});
   els.skeleton = el('input', {type: 'checkbox'});
+  els.quad = el('input', {type: 'checkbox'});
   els.undo = el('button', {title: 'Undo the last parameter change (Ctrl+Z)'}, '↶');
   els.redo = el('button', {title: 'Redo (Ctrl+Shift+Z)'}, '↷');
   els.stats = el('div', {class: 'tgstats'}, 'loading…');
@@ -679,7 +801,15 @@ export function attach(hooks) {
     regenerate(true);
   });
   els.skeleton.addEventListener('change', () => {
-    if (lastResult) drawSkeleton(lastResult);
+    if (lastResult) drawSkeleton();
+  });
+  els.quad.addEventListener('change', () => {
+    quad = els.quad.checked;
+    // The scene it framed for is not the scene it is about to draw: one tree
+    // and a 2x2 stand want completely different camera distances, and keeping
+    // the old one puts the quad off the bottom of the canvas.
+    if (wv) wv._treeFramed = false;
+    regenerate(true);
   });
   els.undo.addEventListener('click', undo);
   els.redo.addEventListener('click', redo);
@@ -707,6 +837,13 @@ export function attach(hooks) {
          els.species, els.save, els.saveAs),
       el('div', {class: 'tgbar'}, els.bake, els.vox, els.undo, els.redo,
          el('span', {class: 'hint'}, 'seed'), els.seed,
+         el('label', {class: 'hint',
+                      style: 'display:flex;align-items:center;gap:4px',
+                      title: 'Show four seeds at once — this seed and the ' +
+                             'next three — one per quadrant, under one ' +
+                             'camera. Step the seed box to re-roll the set. ' +
+                             'Save, Bake and Export still act on the first.'},
+            els.quad, 'quad'),
          el('label', {class: 'hint',
                       style: 'display:flex;align-items:center;gap:4px'},
             els.skeleton, 'skeleton')),

@@ -86,7 +86,7 @@
     }
   ],
   "foliage": {
-    "startLevel": 9,
+    "startLevel": 3,
     "clumpsPerStem": 0,
     "tipBias": 0.45,
     "radius": 0.1,

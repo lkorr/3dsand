@@ -3,7 +3,7 @@
   "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; last re-recorded 2026-08-25 for the GAS VERTICAL MODEL (buoyancy as a redistributable probability)",
   "_treeAtlas_about": "tree-atlas gate. treeAtlasHash is FNV-1a over the uploaded atlas buffer (assets/trees/*.svtree, remapped to engine material ids). It moves when a species is re-baked -- which also moves determinismHash, so this is what names WHICH asset did it instead of leaving a world-hash diff with no cause attached. Re-bake with node scripts/bake_trees.mjs, then --selftest --rebaseline.",
   "treeAtlasHash": "a359d57915a7cad2",
-  "determinismHash": "5d7f90c1",
+  "determinismHash": "97c458a3",
   "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
@@ -76,107 +76,35 @@
   "terrain.rampMaxObserved": "34",
   "terrain.localReliefObserved": "129",
   "terrain.farReliefObserved": "958",
-  "terrain.settleProxyObserved": "5",
+  "terrain.settleProxyObserved": "3",
 
   "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
   "smokeQuiet": [
-    [
-      0,
-      "ca13765b"
-    ],
-    [
-      1,
-      "6383f892"
-    ],
-    [
-      15,
-      "e8f0ca03"
-    ],
-    [
-      30,
-      "a2bc2ab8"
-    ],
-    [
-      50,
-      "ef522e11"
-    ]
+    [0, "2078f530"],
+    [1, "78ee5bf2"],
+    [15, "58e47d2d"],
+    [30, "d385d9aa"],
+    [50, "cb59d210"]
   ],
   "smokeLoud": [
-    [
-      0,
-      "ca13765b"
-    ],
-    [
-      15,
-      "1a68b2c1"
-    ],
-    [
-      30,
-      "a7dff9cb"
-    ],
-    [
-      45,
-      "bf89e89a"
-    ],
-    [
-      46,
-      "7a5fb96f"
-    ],
-    [
-      47,
-      "ff2dc826"
-    ],
-    [
-      52,
-      "19ac9eb7"
-    ],
-    [
-      53,
-      "0496cc68"
-    ],
-    [
-      60,
-      "c0608934"
-    ],
-    [
-      75,
-      "bd1db6a4"
-    ],
-    [
-      76,
-      "1e7f4ed8"
-    ],
-    [
-      84,
-      "dc57b30e"
-    ],
-    [
-      85,
-      "b886f0e4"
-    ],
-    [
-      86,
-      "c604af06"
-    ],
-    [
-      87,
-      "3782028b"
-    ],
-    [
-      88,
-      "78af800a"
-    ],
-    [
-      90,
-      "b5aea4df"
-    ],
-    [
-      105,
-      "aab34535"
-    ],
-    [
-      120,
-      "ec7c8296"
-    ]
+    [0, "2078f530"],
+    [15, "8a5c65eb"],
+    [30, "b547c3b9"],
+    [45, "be24dfe9"],
+    [46, "500e1526"],
+    [47, "e5b6767e"],
+    [52, "dd4ef660"],
+    [53, "acd361f6"],
+    [60, "a9cde69b"],
+    [75, "7cdb5424"],
+    [76, "9b002683"],
+    [84, "157dd777"],
+    [85, "72a3e30d"],
+    [86, "38e1217a"],
+    [87, "3259094b"],
+    [88, "c958c230"],
+    [90, "89a3f6af"],
+    [105, "16682950"],
+    [120, "d2006053"]
   ]
 }
