@@ -1484,7 +1484,63 @@ hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h
 moved to `kVoxelMeters = 0.10`. For that whole interval every tree in the game
 was 1.6× the metre size its own table documents (the "11.9 m" great oak was 19 m
 of trunk). It reads `VOXELS_PER_M` from the prelude now, so the table's metres
-are true at any voxel size.
+are true at any voxel size. (Trees themselves no longer read it at all — their
+sizes are metres in `assets/trees/*.json` and voxels in the baked atlas. The
+cacti still do.)
+
+##### Trees: a BAKED ATLAS, and one voxelizer (2026-08-29)
+
+> **The editor is the only voxelizer. `assets/editor/treegen.js` produces every
+> tree voxel in the game; the engine samples what it baked and knows nothing
+> about how a tree is built.**
+
+Worldgen is a pure per-cell function: `genChunk` answers for one voxel with no
+memory of its neighbours and no way to walk a turtle. So every tree the engine
+grew was an IMPLICIT SHAPE re-derived per cell — a hash-eroded ellipsoid for
+oak, a diamond cone for pine, a hand-unrolled five-limb skeleton for birch.
+That is the ceiling of the technique and it is why the forest read as lollipops.
+
+The pipeline now is:
+
+| stage | artefact | owner |
+|---|---|---|
+| author | `assets/trees/<species>.json` | the tuner's **Trees** tab |
+| voxelize | in memory | `assets/editor/treegen.js` |
+| bake | `assets/trees/<species>.svtree` | `scripts/bake_trees.mjs`, or the tab's Bake button |
+| load | one GPU storage buffer | `src/sim/treeatlas.{h,cpp}` |
+| place | voxels | `worldgen.wgsl` `treeCandsInto` / `treeCellFrom` |
+
+The generator is Weber & Penn 1995 reduced to the parameters that earn a
+slider: a recursive stem skeleton under a crown-envelope curve (`shape`),
+stamped as round-cone SDFs, with smooth-min'd ellipsoid leaf CLUMPS at the
+outer stems. The clumps are the visual thesis — foliage lives in lobes around
+branch tips, never in one canopy-sized ball — and a **shading bake** (a mix of
+the clump-sphere normal and the whole-canopy normal, plus depth into the clump)
+gives those lobes readable form at zero engine cost, because it resolves to a
+choice among a three-material shade ramp (`leaves_dark` / `leaves` /
+`leaves_lit`, and the bark and needle equivalents).
+
+Four consequences worth stating, because each one is a rule:
+
+- **No second implementation.** There is deliberately no C++ or WGSL copy of
+  the SDF/clump/shading logic. What the Trees tab shows is byte-for-byte what
+  worldgen places, because it is the same function.
+- **Editing a species moves the world hash.** The atlas is engine input exactly
+  like `tuning.json`. Re-bake, then one `--selftest --rebaseline`. The
+  `tree-atlas` gate pins the atlas bytes separately, so the hash diff has a
+  cause attached.
+- **Authored by name, resolved at load.** A `.svtree` carries a material NAME
+  table and its runs hold local palette indices; the loader maps them to engine
+  ids. Renumbering `materials.json` cannot silently recolour a forest.
+- **Placement rides in the species file.** Biome weights, a per-species
+  altitude band and treeline, a slope gate and the canopy shade the forest
+  floor reads all live in `<species>.json` and are lifted into the atlas
+  directory. Adding a tree touches one file.
+
+The per-cell cost went DOWN: a candidate is now dropped at hoist time unless the
+tree's baked grid has something in this exact column, so `treeFromCands`
+typically runs zero or one iterations, and each one is a short scan of a
+column-RLE run list rather than fifteen segment-distance tests.
 
 ##### The height contract (2026-08-26)
 

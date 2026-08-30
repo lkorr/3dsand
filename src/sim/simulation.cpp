@@ -16,12 +16,28 @@ using pass::kPassStride;
 bool Simulation::Init(const rhi::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
                       const std::vector<ReactionGpu>& reactions,
-                      const MicroSet& micro,
+                      const MicroSet& micro, const TreeAtlas& trees,
                       const std::string& shaderDir) {
   world_ = &world;
   device_ = device;
   shaderDir_ = shaderDir;
   rhi::Queue queue = device.GetQueue();
+
+  // The baked tree atlas. Sized to what the assets actually hold rather than to
+  // a ceiling constant: it is load-time asset data, it never grows, and the
+  // buffer is created BEFORE the bind groups below because it is one of their
+  // entries. A world with no .svtree files still gets a valid (header-only)
+  // buffer -- a zero-length storage binding is not legal, and "no trees" has to
+  // be a world rather than a crash.
+  treeAtlasWords_ = std::max<size_t>(trees.words.size(), treeatlas::kHeaderWords);
+  treeAtlasBuf_ = CreateBuffer(device, (uint64_t)treeAtlasWords_ * 4,
+                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                               "treeAtlas");
+  {
+    std::vector<uint32_t> pad = trees.words;
+    pad.resize(treeAtlasWords_, 0u);
+    queue.WriteBuffer(treeAtlasBuf_, 0, pad.data(), pad.size() * 4);
+  }
 
   materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
@@ -147,6 +163,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // read-only in the fluid/seam groups, which is exactly what the pass
         // table's W(FluidSpawnOps) -> R(FluidSpawnOps) barrier is for.
         entry(25, T::Storage),         // fluidSpawnOps (drain writes)
+        // The baked tree atlas (src/sim/treeatlas.h). Read-only asset data
+        // uploaded once, like `materials` at binding 3 — worldgen samples it
+        // per cell instead of evaluating implicit tree shapes. Binding 26 in
+        // BOTH this layout and simSlimBGL_ for the same reason 17/18 are: one
+        // WGSL identifier cannot carry two binding numbers across modules that
+        // share common.wgsl, and the far-cascade pipelines (farPL_, on the slim
+        // group) call genCell and therefore call the tree sampler.
+        entry(26, T::ReadOnlyStorage), // treeAtlas
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -168,6 +192,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // buffer in every module that names it, so it is added here rather
         // than given a seam-group entry of its own.
         entry(24, T::Storage),         // waterBodyState (atomic i32 ledger)
+        // Same binding number as in simBGL_ above; `fardown`/`far` build on
+        // this layout and both reach genCell -> treeAt.
+        entry(26, T::ReadOnlyStorage), // treeAtlas
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -383,6 +410,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(23, world_->actVoxViz),
         b(24, world_->waterBodyState),
         b(25, world_->fluidSpawnOps),
+        b(26, treeAtlasBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -395,6 +423,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(17, world_->pageTable),
         b(18, world_->pageFaults),
         b(24, world_->waterBodyState),
+        b(26, treeAtlasBuf_),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -892,6 +921,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FluidMirror:         return world_->fluidMirror;
     case B::ActVoxViz:           return world_->actVoxViz;
     case B::WaterBodyState:      return world_->waterBodyState;
+    case B::TreeAtlas:           return treeAtlasBuf_;
     default:                return world_->voxels;
   }
 }

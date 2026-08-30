@@ -27,6 +27,7 @@ namespace selftest {
 
 // Each domain file exposes its gates through one of these.
 const std::vector<Gate>& TerrainGates();
+const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
 const std::vector<Gate>& WindGates();
@@ -64,6 +65,11 @@ const char* const kOrder[] = {
     // by anything. Running it before the expensive gates also means a broken
     // equipment model is reported in the first second of a full run.
     "player-kit",
+    // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
+    // off disk and asserts on the bytes. No world, no GPU, no state left
+    // behind -- and when the atlas is wrong every gate after it is measuring a
+    // forest nobody authored, so it belongs before them rather than after.
+    "tree-atlas",
     "terrain",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
@@ -106,7 +112,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(),
                           &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

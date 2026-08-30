@@ -35,6 +35,11 @@ Checks:
      longer exists is a confident lie, and nothing else catches it -- the page
      renders exactly as well either way.
 
+  6b. TREE ATLAS      src/sim/treeatlas.h  <->  worldgen.wgsl TA_* offsets
+     One buffer, three directories, hand-written word offsets on both sides and
+     no generator between them. A field added to the C++ side without the WGSL
+     offset makes the shader read the next species' variant pointer.
+
   6. WORLDGEN MIRROR  assets/shaders/worldgen.wgsl  <->  src/sim/world.cpp
      The terrain math is written twice -- once in WGSL for the GPU, once in C++
      so the CPU can answer "where is the ground". A divergence is a player
@@ -809,8 +814,106 @@ def check_worldgen_defaults():
             f"and a reset would write a value the engine ignores")
 
 
+
+# ------------------------------------------------- the baked tree atlas layout
+# src/sim/treeatlas.h  <->  the TA_* constants in assets/shaders/worldgen.wgsl
+#
+# The atlas is ONE buffer with three directories in it, written by C++ and read
+# by WGSL through hand-written word offsets on both sides. There is no generator
+# and no struct: a field added to the species directory in the header without
+# the matching TA_S_* bump makes the shader read the NEXT species' variant
+# pointer, and what comes out is a forest of trees built from other trees'
+# columns -- plausible-looking garbage, at some seeds, in some places. Nothing
+# else in the repo looks at both files.
+TA_PREFIX = {"kH": "TA_H_", "kS": "TA_S_", "kV": "TA_V_"}
+TA_SKIP = {"kHMagic", "kHVersion", "kHBiomeCount", "kHTotalWords",
+           "kSFlags", "kVRuns", "kVReach", "kVAbove",
+           "kVCrownY", "kVCrownR"}
+# C++ camelCase enumerator -> the WGSL name, where they are not a plain
+# upper-snake transliteration.
+TA_ALIAS = {
+    "kHSpeciesCount": "TA_H_SPECIES_COUNT", "kHMaxReach": "TA_H_MAX_REACH",
+    "kHMaxAbove": "TA_H_MAX_ABOVE", "kHBiomeTable": "TA_H_BIOME_TABLE",
+    "kHSpeciesDir": "TA_H_SPECIES_DIR",
+    "kSVariantDir": "TA_S_VARIANT_DIR", "kSVariantCount": "TA_S_VARIANT_CNT",
+    "kSReach": "TA_S_REACH", "kSAbove": "TA_S_ABOVE", "kSCrownY": "TA_S_CROWN_Y",
+    "kSCrownR": "TA_S_CROWN_R", "kSMinY": "TA_S_MIN_Y", "kSMaxY": "TA_S_MAX_Y",
+    "kSMaxSlope": "TA_S_MAX_SLOPE", "kSSparsity": "TA_S_SPARSITY",
+    "kSCanopyMat": "TA_S_CANOPY_MAT", "kSShade": "TA_S_SHADE",
+    "kSAutumnChance": "TA_S_AUTUMN", "kSLeaf0": "TA_S_LEAF0",
+    "kSAutumn0": "TA_S_AUTUMN0",
+    "kVNx": "TA_V_NX", "kVNy": "TA_V_NY", "kVNz": "TA_V_NZ",
+    "kVAnchorX": "TA_V_ANCHORX", "kVAnchorZ": "TA_V_ANCHORZ",
+    "kVColumns": "TA_V_COLUMNS",
+}
+
+
+def check_tree_atlas():
+    hdr, wgsl = read("src/sim/treeatlas.h"), read("assets/shaders/worldgen.wgsl")
+    if not hdr or not wgsl:
+        return
+    checked.append("tree atlas layout")
+
+    # C++ side: every `enum : int { ... }` body in the header, flattened.
+    cpp = {}
+    for body in re.findall(r"enum\s*:\s*int\s*\{(.*?)\}", hdr, re.S):
+        nxt = 0
+        for tok in re.findall(r"(\w+)\s*(?:=\s*(\d+))?", _decomment(body)):
+            name, val = tok
+            if not name:
+                continue
+            nxt = int(val) if val else nxt
+            cpp[name] = nxt
+            nxt += 1
+    for k in ("kSpeciesWords", "kVariantWords", "kHeaderWords", "kBiomeCount",
+              "kFileHeaderWords"):
+        m = re.search(rf"constexpr int {k} = (\d+);", hdr)
+        if m:
+            cpp[k] = int(m.group(1))
+
+    # WGSL side.
+    wg = {m.group(1): int(m.group(2))
+          for m in re.finditer(r"const\s+(TA_\w+)\s*:\s*u32\s*=\s*(\d+)u", wgsl)}
+
+    for name, val in sorted(cpp.items()):
+        if name in TA_SKIP or not any(name.startswith(p) for p in TA_PREFIX):
+            continue
+        want = TA_ALIAS.get(name)
+        if not want:
+            continue
+        if want not in wg:
+            problems.append(
+                f"tree atlas: treeatlas.h declares {name} = {val} but "
+                f"worldgen.wgsl has no `{want}` -- the shader cannot read a "
+                f"field it has no offset for")
+        elif wg[want] != val:
+            problems.append(
+                f"tree atlas: {name} = {val} in treeatlas.h but {want} = "
+                f"{wg[want]} in worldgen.wgsl. The shader would read the wrong "
+                f"word of the directory, which is a forest built from other "
+                f"trees' columns")
+
+    for a, b in (("kSpeciesWords", "TA_SPECIES_WORDS"),
+                 ("kVariantWords", "TA_VARIANT_WORDS")):
+        if a in cpp and b in wg and cpp[a] != wg[b]:
+            problems.append(
+                f"tree atlas: {a} = {cpp[a]} in treeatlas.h but {b} = {wg[b]} "
+                f"in worldgen.wgsl -- every directory entry after the first "
+                f"would be read at the wrong stride")
+
+    # The .svtree header width is written by JS and read by C++, and neither
+    # would notice a mismatch until a real file failed to parse.
+    js = read("assets/editor/treegen.js")
+    if js:
+        m = re.search(r"const HEADER_WORDS = (\d+);", js)
+        if m and "kFileHeaderWords" in cpp and int(m.group(1)) != cpp["kFileHeaderWords"]:
+            problems.append(
+                f"tree atlas: treegen.js writes a {m.group(1)}-word .svtree "
+                f"header, treeatlas.h reads {cpp['kFileHeaderWords']}")
+
 ALL = {
     "worldgen": check_worldgen_mirror,
+    "treeatlas": check_tree_atlas,
     "wgunits": check_worldgen_units,
     "wgdefaults": check_worldgen_defaults,
     "sound": check_sound_slots,
@@ -838,7 +941,9 @@ RELEVANT = {
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim"],
     "src/sim/world.cpp": ["worldgen"],
-    "assets/shaders/worldgen.wgsl": ["worldgen"],
+    "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
+    "src/sim/treeatlas.h": ["treeatlas"],
+    "assets/editor/treegen.js": ["treeatlas"],
     "src/sim/simulation.cpp": ["counts"],
     "src/gpu/rhi_record.h": ["counts"],
     "src/gpu/vk_record.h": ["counts"],

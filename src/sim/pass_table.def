@@ -360,7 +360,7 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable)))
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas)))
 
 // (The MLS-MPM spawn row moved into PT_FLUIDSEAM: with settle deleting
 // particles and excite creating them GPU-side, appends go through the seam's
@@ -405,7 +405,7 @@ PASS(wg_fill_fluidBlockMap, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_
 // resets regardless of how the voxels get written.
 PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
      USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults)))
+          R(PageTable) A(PageFaults) R(TreeAtlas)))
 
 // ========================================================== PT_GENLIST =====
 // Simulation::EncodeGenList — its own encoder, submitted MID-FRAME between
@@ -418,7 +418,7 @@ PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, 
 PASS(worldgenList, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
      GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
      USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults)))
+          R(PageTable) A(PageFaults) R(TreeAtlas)))
 
 // ========================================================= PT_PAGEFILL =====
 // PageTable::DrainFills — materializes the JITTER pages of ONE tick, recorded
@@ -491,7 +491,7 @@ PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K
 PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) R(FarPatch)
-          A(FarVox) A(FarOcc)))
+          A(FarVox) A(FarOcc) R(TreeAtlas)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded

@@ -143,6 +143,7 @@ void Overlay::BeginFrame() {
 // pools get one bar each and the cost is shown as drain off the right end of
 // whichever pool will pay it.
 void Overlay::DrawHUD(const UIState& s) {
+  ImGui::PushFont(ui::FontSmall());
   ImDrawList* d = ImGui::GetForegroundDrawList();
   const ImVec2 disp = ImGui::GetIO().DisplaySize;
 
@@ -207,6 +208,7 @@ void Overlay::DrawHUD(const UIState& s) {
     d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);
     d->AddText(tp, IM_COL32(255, 70, 60, 255), dead);
   }
+  ImGui::PopFont();
 }
 
 // ---- the body-condition stick figure ----------------------------------------
@@ -343,7 +345,9 @@ void Overlay::Draw(UIState& s) {
   // stays reachable on top of it — F1 is not supposed to become unavailable
   // just because a menu is up.
   if (s.inventoryOpen) {
+    ImGui::PushFont(ui::FontLarge());
     DrawInventoryScreen(s);
+    ImGui::PopFont();
   } else {
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     ImVec2 c = ImGui::GetIO().DisplaySize;
@@ -353,6 +357,8 @@ void Overlay::Draw(UIState& s) {
   }
 
   if (!s.visible) return;
+
+  ImGui::PushFont(ui::FontSmall());
 
   ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
@@ -978,6 +984,8 @@ void Overlay::Draw(UIState& s) {
     }
     ImGui::End();
   }
+
+  ImGui::PopFont();
 }
 
 void Overlay::Render(const rhi::RenderPass& pass) {
